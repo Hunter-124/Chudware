@@ -73,6 +73,10 @@ struct Palette {
     float selectionHighlight[4] = {0.176f,0.831f,0.749f, 0.22f};
     float hoverHighlight[4]     = {0.176f,0.831f,0.749f, 0.40f};
 
+    // ---- C18 sketch mode ----
+    float sketchUnder[4]   = {0.337f,0.612f,0.960f, 1};   // under-defined entity (SW-style blue)
+    float sketchGrid[4]    = {0.520f,0.560f,0.620f, 0.18f}; // faint sketch grid lines
+
     // ---- status ----
     float statusOk[4]   = {0.176f,0.831f,0.749f, 1};   // same as accent
     float statusWarn[4] = {0.953f,0.761f,0.420f, 1};   // amber

@@ -57,6 +57,46 @@ def _ping(_params: dict, _emit: EmitFn) -> dict:
     return {"pong": True, "protocol": 2, "sim": True}
 
 
+# ── C19: result overlay packaging (best-effort; never fails the solve) ─────────
+
+def _static_overlay_path(study, mesh, result, material):
+    """Build the surface SCLR/DISP overlay AICM for a static result. Returns path or None.
+
+    Needs a STEP surface to tessellate (study['step_path']); skips silently if absent or if
+    packaging fails so a missing overlay never aborts a successful solve.
+    """
+    step_path = study.get("step_path")
+    if not step_path or not Path(step_path).exists():
+        return None
+    try:
+        from engine.sim import overlay
+        yield_mpa = float(material.get("yield_mpa", 250.0))
+        return overlay.static_overlay(
+            step_path, mesh.points, result.von_mises, result.disp_magnitude,
+            result.displacement, yield_mpa, result.summary)
+    except Exception as e:  # noqa: BLE001
+        log.warning("static overlay packaging failed: %s", e)
+        return None
+
+
+def _modal_overlay_path(study, mesh, result, mode_index):
+    step_path = study.get("step_path")
+    if not step_path or not Path(step_path).exists():
+        return None
+    try:
+        import numpy as np
+        from engine.sim import overlay
+        shapes = getattr(result, "mode_shapes", None)
+        if shapes is None:
+            return None
+        shp = np.asarray(shapes)[mode_index]
+        freq = float(result.freqs_hz[mode_index])
+        return overlay.modal_overlay(step_path, mesh.points, shp, freq)
+    except Exception as e:  # noqa: BLE001
+        log.warning("modal overlay packaging failed: %s", e)
+        return None
+
+
 def _sim_mesh(params: dict, emit: EmitFn) -> dict:
     from engine.sim.mesher import mesh_step
 
@@ -166,13 +206,21 @@ def _sim_run_static(params: dict, emit: EmitFn) -> dict:
     out_npz = Path(mesh.mesh_path).with_suffix(".static.npz")
     result.save_npz(str(out_npz))
 
-    return {
+    out = {
         "results_npz": str(out_npz),
         "summary": result.summary,
         "solver_notes": result.solver_notes,
         "n_dof": result.n_dof,
         "solve_time_s": result.solve_time_s,
     }
+
+    # ── C19: result overlay (surface SCLR von_mises/displacement_mag/fos + DISP) ──
+    emit({"kind": "sim_progress", "job_id": job_id,
+          "stage": "post", "pct": 90, "text": "Packing result overlay"})
+    overlay = _static_overlay_path(study, mesh, result, material)
+    if overlay:
+        out["overlay_aicm"] = overlay
+    return out
 
 
 def _sim_run_modal(params: dict, emit: EmitFn) -> dict:
@@ -234,12 +282,17 @@ def _sim_run_modal(params: dict, emit: EmitFn) -> dict:
     out_npz = Path(mesh.mesh_path).with_suffix(".modal.npz")
     result.save_npz(str(out_npz))
 
-    return {
+    out = {
         "freqs_hz": result.freqs_hz.tolist(),
         "results_npz": str(out_npz),
         "n_dof": result.n_dof,
         "solve_time_s": result.solve_time_s,
     }
+    # C19: overlay for the first (lowest) mode shape.
+    overlay = _modal_overlay_path(study, mesh, result, 0)
+    if overlay:
+        out["overlay_aicm"] = overlay
+    return out
 
 
 def _sim_run_flow(params: dict, emit: EmitFn) -> dict:
@@ -297,7 +350,7 @@ def _sim_run_flow(params: dict, emit: EmitFn) -> dict:
             return [_maybe_tolist(i) for i in v]
         return v
 
-    return {
+    out = {
         "drag_n": float(result.drag_n),
         "lift_n": float(result.lift_n),
         "cd": float(result.cd),
@@ -306,6 +359,27 @@ def _sim_run_flow(params: dict, emit: EmitFn) -> dict:
         "diverged": bool(result.diverged),
         "trace": [{"step": s, "drag": d} for s, d in result.trace],
     }
+
+    # ── C19: result overlays — streamline LINS + colormap slice PNGs ──
+    emit({"kind": "sim_progress", "job_id": job_id,
+          "stage": "post", "pct": 95, "text": "Packing flow overlays"})
+    try:
+        from engine.sim import overlay
+        from engine.doc import tessellate as tess
+        sl_chunk = overlay.streamlines_chunk(result.streamline_points, result.streamline_speeds)
+        if sl_chunk is not None:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".aicm", delete=False) as tf:
+                lines_path = tf.name
+            # LINS-only AICM (no body): write_aicm tolerates a body-less file via extra_chunks.
+            tess.write_aicm_file(lines_path, [], extra_chunks=[sl_chunk])
+            out["lines_aicm"] = lines_path
+        out["slice_pngs"] = overlay.slice_pngs(
+            result.slices, result.slice_transforms, speed_mps)
+    except Exception as e:  # noqa: BLE001
+        log.warning("flow overlay packaging failed: %s", e)
+
+    return out
 
 
 def _sim_cancel(params: dict, _emit: EmitFn) -> dict:

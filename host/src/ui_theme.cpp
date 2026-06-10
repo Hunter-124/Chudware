@@ -69,6 +69,9 @@ static void fillDark(Palette& p) {
     // selection
     set4(p.selectionHighlight, 0.176f,0.831f,0.749f, 0.22f);
     set4(p.hoverHighlight,     0.176f,0.831f,0.749f, 0.40f);
+    // C18 sketch mode
+    set4(p.sketchUnder, 0.337f,0.612f,0.960f, 1);
+    set4(p.sketchGrid,  0.520f,0.560f,0.620f, 0.18f);
     // status
     set4(p.statusOk,   0.176f,0.831f,0.749f, 1);
     set4(p.statusWarn, 0.953f,0.761f,0.420f, 1);
@@ -165,6 +168,9 @@ static void fillLight(Palette& p) {
     // selection
     set4(p.selectionHighlight, 0.000f,0.471f,0.843f, 0.18f);
     set4(p.hoverHighlight,     0.000f,0.471f,0.843f, 0.35f);
+    // C18 sketch mode (SW blue under-defined, darker grid on the light studio)
+    set4(p.sketchUnder, 0.000f,0.471f,0.843f, 1);
+    set4(p.sketchGrid,  0.420f,0.447f,0.502f, 0.22f);
     // status
     set4(p.statusOk,   0.039f,0.573f,0.176f, 1);    // #0A9230 green
     set4(p.statusWarn, 0.784f,0.549f,0.000f, 1);    // #C88C00 amber

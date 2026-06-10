@@ -16,8 +16,9 @@ public:
     using EventFn = std::function<void(const nlohmann::json&)>;
 
     // Resolve python exe + repo/cwd from env (AI_CAD_PYTHON, AI_CAD_REPO) or the
-    // %APPDATA%/AI-CAD defaults, then spawn `python -m engine.worker`.
-    bool start(std::string& err);
+    // %APPDATA%/AI-CAD defaults, then spawn `python -m <module>`. The default module is the
+    // doc worker; C19 spawns a second instance with module="engine.sim.worker".
+    bool start(std::string& err, const std::string& module = "engine.worker");
     bool started() const { return running_; }
     void stop();
 

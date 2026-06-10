@@ -35,7 +35,7 @@ std::string win32Error(DWORD code) {
 
 WorkerClient::~WorkerClient() { stop(); }
 
-bool WorkerClient::start(std::string& err) {
+bool WorkerClient::start(std::string& err, const std::string& module) {
     // Resolve via the shared bootstrap logic so the worker, runtimeReady(), and the GUI
     // all agree on which python + app dir to use.
     std::string python = runtimePython();
@@ -70,7 +70,7 @@ bool WorkerClient::start(std::string& err) {
     si.hStdOutput = outWr;
     si.hStdError = GetStdHandle(STD_ERROR_HANDLE);  // worker diagnostics -> host console
 
-    std::wstring cmd = L"\"" + widen(python) + L"\" -m engine.worker";
+    std::wstring cmd = L"\"" + widen(python) + L"\" -m " + widen(module);
     std::wstring cwd = widen(repo);
     std::vector<wchar_t> cmdbuf(cmd.begin(), cmd.end());
     cmdbuf.push_back(0);

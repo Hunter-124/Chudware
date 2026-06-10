@@ -6,16 +6,24 @@
 
 #include "viewport_panel.h"
 
+#include "legend.h"
+
 #include "../core/app_state.h"
 
 #include "../renderer.h"
 #include "../render/id_pass.h"
 #include "../render/overlays.h"
 
+#include "sketch_mode.h"   // C18
+
 namespace ui {
 
 void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     Renderer& renderer = *st.renderer;
+    // C18: while a sketch is being edited the camera locks normal to the sketch plane and the
+    // sketch tools own the mouse (no orbit, no topology picking).
+    auto* sketch = static_cast<ui::SketchMode*>(st.sketchMode);
+    const bool inSketch = sketch && sketch->active();
 
     // ---------- Viewport ----------
     if (st.showViewport) {
@@ -72,6 +80,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         int vw = (int)avail.x > 64 ? (int)avail.x : 64;
         int vh = (int)avail.y > 64 ? (int)avail.y : 64;
         renderer.resize(vw, vh);
+        // C18: hard-lock the camera normal to the sketch plane while editing a sketch.
+        if (inSketch) { float ly, lp; if (sketch->cameraLock(ly, lp)) { st.yaw = ly; st.pitch = lp; } }
         renderer.renderOrbit(st.yaw, st.pitch, st.zoom);
 
         // ---- topology picking (C15): id pass + overlay highlights drawn over the shaded view ----
@@ -94,7 +104,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         ImVec2 vr0 = ImGui::GetItemRectMin(), vr1 = ImGui::GetItemRectMax();
         const bool imgHovered = ImGui::IsItemHovered();
         if (imgHovered) {
-            if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            // C18: no orbit while sketching (camera is plane-locked); wheel still zooms.
+            if (!inSketch && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
                 st.yaw += io.MouseDelta.x * 0.4f;
                 st.pitch += io.MouseDelta.y * 0.4f;
                 st.pitch = st.pitch > 89 ? 89 : (st.pitch < -89 ? -89 : st.pitch);
@@ -105,8 +116,13 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
         }
 
+        // ---- C18: sketch overlay owns the mouse while a sketch is being edited ----
+        if (inSketch) {
+            sketch->drawOverlay(st, io, vr0, vr1, vw, vh, imgHovered);
+        }
+
         // ---- hover + click selection (once per frame; only while a doc mesh is loaded) ----
-        if (picking) {
+        if (picking && !inSketch) {
             if (imgHovered && !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
                 int px = (int)(io.MousePos.x - vr0.x);
                 int py = (int)(io.MousePos.y - vr0.y);
@@ -186,6 +202,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             vdl->AddText(mf, fs, ImVec2(p0.x + 10, p0.y + 5),
                          overlayTxt, st.modelInfo.c_str());
         }
+        // ---- C19: result colormap legend (bottom-right) ----
+        ui::drawLegend(st, vdl, vr0, vr1);
         }  // end overlay colors scope
     }
     ImGui::End();

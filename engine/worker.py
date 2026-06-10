@@ -200,6 +200,64 @@ def _doc_resolve_pick(params: dict, _emit: EmitFn) -> dict:
         int(params["body_id"]), params["kind"], int(params["topo_id"]))
 
 
+# ============================================================== C19 doc-side sim bridge handlers
+#
+# Produce sim INPUTS from the live doc session (the sim worker is a separate process that only
+# sees files + study JSON). doc_export_step -> STEP of the last-good bodies; doc_face_points ->
+# a sampled surface point cloud for a face selector (fea_static FaceSet). See engine/sim/bridge.py.
+
+
+def _doc_export_step(params: dict, _emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    from engine.sim import bridge
+    s = docsess.get_session(params["doc_id"])
+    return {"path": bridge.export_step(s, params["path"])}
+
+
+def _doc_face_points(params: dict, _emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    from engine.sim import bridge
+    s = docsess.get_session(params["doc_id"])
+    return bridge.face_points(s, params["selector"], int(params.get("max_n", 400)))
+
+
+# =========================================================================== C18 sketch methods
+#
+# Sketch-mode interaction (worker_rpc.md §2 sketch_*). Thin adapters onto engine.doc.session, which
+# warm-starts engine.doc.sketch_solver (C10). sketch_drag is transient (no revision bump);
+# sketch_drag_commit/sketch_exit return the ops-response (rebuild). Structured error envelope.
+
+
+def _sketch_enter(params: dict, _emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.sketch_enter(s, params["sketch"])
+
+
+def _sketch_solve(params: dict, _emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.sketch_solve(s, params["sketch"])
+
+
+def _sketch_drag(params: dict, _emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.sketch_drag(s, params["sketch"], params["handle"], params["xy"])
+
+
+def _sketch_drag_commit(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.sketch_drag_commit(s, params["sketch"], emit=_doc_emit(emit))
+
+
+def _sketch_exit(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.sketch_exit(s, params["sketch"], emit=_doc_emit(emit))
+
+
 # =========================================================================== eval_* RPC (C12)
 #
 # Per reports.md §C12: nine handlers over the active document's bodies. Field handlers tessellate
@@ -394,6 +452,12 @@ _METHODS = {
     "doc_tree": _doc_tree,
     "doc_rebuild": _doc_rebuild,
     "doc_resolve_pick": _doc_resolve_pick,
+    # Sketch mode (C18)
+    "sketch_enter": _sketch_enter,
+    "sketch_solve": _sketch_solve,
+    "sketch_drag": _sketch_drag,
+    "sketch_drag_commit": _sketch_drag_commit,
+    "sketch_exit": _sketch_exit,
     # Evaluate (C12)
     "eval_mass": _eval_mass,
     "eval_measure": _eval_measure,
@@ -404,14 +468,25 @@ _METHODS = {
     "eval_draft": _eval_draft,
     "eval_thickness": _eval_thickness,
     "eval_curvature": _eval_curvature,
+    # C19 doc-side sim bridge
+    "doc_export_step": _doc_export_step,
+    "doc_face_points": _doc_face_points,
 }
+
+# C21 formats (import_file / export_file) register with the same (params, emit) convention.
+from engine.doc import formats as _formats  # noqa: E402
+
+_METHODS.update(_formats.WORKER_METHODS)
 
 # Methods that emit the structured error envelope {code, message, detail} on failure.
 _STRUCTURED_ERROR_METHODS = {
     "doc_new", "doc_open", "doc_save", "doc_close", "doc_list", "doc_apply_ops",
     "doc_undo", "doc_redo", "doc_tree", "doc_rebuild", "doc_resolve_pick",
+    "sketch_enter", "sketch_solve", "sketch_drag", "sketch_drag_commit", "sketch_exit",
     "eval_mass", "eval_measure", "eval_section_props", "eval_interference", "eval_check",
     "eval_symmetry", "eval_draft", "eval_thickness", "eval_curvature",
+    "doc_export_step", "doc_face_points",  # C19
+    "import_file", "export_file",  # C21
 }
 
 

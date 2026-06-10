@@ -7,6 +7,7 @@
 #include "status_bar.h"
 
 #include "../core/app_state.h"
+#include "sketch_mode.h"   // C18
 
 namespace ui {
 
@@ -39,6 +40,18 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     ImGui::Dummy(ImVec2(dr * 2 + 8, 0));
     ImGui::SameLine();
     ImGui::TextColored(sc, "%s", st.status.c_str());
+    // C18: while editing a sketch, show "Under/Fully/Over Defined + DOF" tinted by status.
+    if (auto* sk = static_cast<ui::SketchMode*>(st.sketchMode)) {
+        if (sk->active()) {
+            std::string sl = sk->statusLine();
+            if (!sl.empty()) {
+                ImGui::SameLine();
+                const float* role = sl.rfind("Over", 0) == 0 ? pal.statusErr
+                                  : sl.rfind("Fully", 0) == 0 ? pal.statusOk : pal.sketchUnder;
+                ImGui::TextColored(ImVec4(role[0], role[1], role[2], 1), "|  %s", sl.c_str());
+            }
+        }
+    }
     if (busy && !st.livePhase.empty()) {
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text,

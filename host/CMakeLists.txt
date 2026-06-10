@@ -65,6 +65,15 @@ add_executable(AI-CAD
   src/ui/property_manager.cpp
   src/ui/pm_forms.cpp
   # --- end C17 ---
+  # --- C18: sketch mode UI ---
+  src/ui/sketch_mode.cpp
+  # --- end C18 ---
+  # --- C19: simulation + flow + evaluate UI ---
+  src/core/sim_client.cpp
+  src/ui/sim_panel.cpp
+  src/ui/legend.cpp
+  src/ui/evaluate_dialogs.cpp
+  # --- end C19 ---
   src/worker_client.cpp
   src/bootstrap.cpp
   src/ui_theme.cpp

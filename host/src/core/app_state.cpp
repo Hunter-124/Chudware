@@ -341,15 +341,41 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err) {
     if (doc.bodies.empty()) { err = "AICM has no bodies"; return false; }
 
     // Shaded view: render each body with its AICM color (camera bounds come from here).
+    // C19: attach any SCLR / DISP overlay arrays so the renderer can colormap + deform.
     std::vector<Renderer::PartMesh> pms;
     for (const auto& b : doc.bodies) {
         if (b.pos.empty()) continue;
         Renderer::PartMesh pm;
         pm.mesh = meshFromBody(b);
         pm.color[0] = b.color[0]; pm.color[1] = b.color[1]; pm.color[2] = b.color[2];
+        // First scalar field for this body (von Mises / |u| / thickness / …).
+        for (const auto& sc : doc.scalars) {
+            if (sc.body_id == b.body_id && sc.values.size() == b.n_verts) {
+                pm.scalar = sc.values;
+                pm.scalarMin = sc.vmin;
+                pm.scalarMax = sc.vmax;
+                break;
+            }
+        }
+        // First displacement field for this body (FEA deformed shape).
+        for (const auto& df : doc.displacements) {
+            if (df.body_id == b.body_id && df.vec.size() == (size_t)b.n_verts * 3) {
+                pm.disp = df.vec;
+                pm.dispScaleHint = df.scale_hint;
+                break;
+            }
+        }
         pms.push_back(std::move(pm));
     }
     if (!pms.empty()) renderer->setMeshes(pms);
+
+    // C19: surface overlay presence for the simulation panel's result controls.
+    docMeshHasScalar = false;
+    docMeshHasDisp = false;
+    for (const auto& pm : pms) {
+        if (!pm.scalar.empty()) docMeshHasScalar = true;
+        if (!pm.disp.empty()) { docMeshHasDisp = true; dispScaleHint = pm.dispScaleHint; }
+    }
 
     if (!idPass->setDoc(doc, err)) return false;
     if (!overlays->setDoc(doc, err)) return false;

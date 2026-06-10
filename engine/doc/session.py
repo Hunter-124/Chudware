@@ -60,6 +60,9 @@ class DocSession:
     last_result: Optional[CompileResult] = None
     # extra zip entries to preserve on resave (stepplus forward-compat), entry->bytes
     extra_entries: dict[str, bytes] = field(default_factory=dict)
+    # C18 — active-sketch interaction state (one sketch edited at a time, SolidWorks-style).
+    # Populated by sketch_enter, warm-started across solve/drag, cleared by sketch_exit.
+    active_sketch: Optional["_SketchState"] = None
 
     # -- snapshot helpers -------------------------------------------------
 
@@ -214,7 +217,8 @@ def _tree(session: DocSession) -> dict:
 
 
 def _doc_status(session: DocSession, result: CompileResult) -> dict:
-    return {"active_sketch": None, "mates": None}
+    st = session.active_sketch
+    return {"active_sketch": st.last_overall_status if st else None, "mates": None}
 
 
 def _ops_response(session: DocSession, result: CompileResult,
@@ -260,8 +264,37 @@ def apply_ops(session: DocSession, base_revision: int | None, ops: list[dict],
     session.revision += 1
     session.dirty = True
 
+    # A feature that profiles a sketch region reads regions from the sketch compiler's
+    # context side-channel (ctx.datums['_sketch_regions'], C09). A *cache-hit* sketch does not
+    # repopulate that side-channel, so an extrude/revolve added after an unchanged sketch would
+    # see "sketch not compiled". When this batch introduces such a consumer, force a clean
+    # recompile so the upstream sketch re-registers its regions. (Targeted: ordinary edits keep
+    # the cache so the C17 cache-assert still holds.)
+    if _batch_consumes_sketch_region(ops):
+        session.compile_cache.clear()
+
     result = _rebuild(session, emit)
     return _ops_response(session, result, id_map)
+
+
+def _batch_consumes_sketch_region(ops: list[dict]) -> bool:
+    """True if any add/edit op carries a region selector in its refs (extrude/revolve/sweep/loft)."""
+    def _has_region(obj) -> bool:
+        if isinstance(obj, dict):
+            if obj.get("kind") == "region":
+                return True
+            return any(_has_region(v) for v in obj.values())
+        if isinstance(obj, list):
+            return any(_has_region(v) for v in obj)
+        return False
+
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        if op.get("op") in ("add_feature", "edit_feature"):
+            if _has_region(op.get("feature") or op.get("refs") or {}):
+                return True
+    return False
 
 
 def rebuild(session: DocSession, emit: EmitFn | None = None) -> dict:
@@ -387,3 +420,283 @@ def _body_owner(result: CompileResult, bo) -> str:
     for v in owners.values():
         counts[v] = counts.get(v, 0) + 1
     return max(counts, key=counts.get)
+
+
+# =========================================================================== C18 sketch mode
+#
+# Per-session active-sketch interaction (worker_rpc.md §2 sketch_*, doc_schema.md §3). One sketch
+# is "entered" at a time (SolidWorks behaviour). sketch_enter resolves the sketch plane, builds the
+# equation env, warm-solves via engine.doc.sketch_solver (reports.md §C10), and returns solved
+# coords + per-entity statuses + DOF + a 16-float row-major plane_frame mapping sketch (u,v,0) to
+# world. sketch_drag is TRANSIENT (no revision bump, warm-started). sketch_drag_commit persists the
+# solved coords as ONE undoable sketch_edit_entity batch. sketch_exit clears state and rebuilds.
+
+
+@dataclass
+class _SketchState:
+    sketch_fid: str
+    solve_state: Any = None                      # sketch_solver.SolveState (warm start)
+    last_entities: dict = field(default_factory=dict)   # eid -> solved param dict
+    last_statuses: dict = field(default_factory=dict)   # eid -> under|full|over
+    last_overall_status: Optional[str] = None    # under|full|over (doc_status.active_sketch)
+    plane_frame: list = field(default_factory=list)     # 16 floats, row-major
+
+
+def _find_sketch_feature(session: DocSession, sketch_fid: str) -> dict:
+    for f in session.doc.get("features", []):
+        if f.get("id") == sketch_fid:
+            if f.get("type") != "sketch":
+                raise OpError("invalid_op", f"feature '{sketch_fid}' is not a sketch",
+                              {"reason": "not a sketch"})
+            return f
+    raise OpError("invalid_op", f"no sketch feature '{sketch_fid}'", {"reason": "unknown sketch"})
+
+
+def _equations_env(session: DocSession) -> dict:
+    """Resolved global equation env (expression dims look up here). Empty on equation error."""
+    from engine.doc.equations import evaluate_globals, EquationError
+    globs = session.doc.get("equations", {}).get("globals", []) or []
+    try:
+        return evaluate_globals(globs)
+    except EquationError:
+        return {}
+
+
+def _resolve_sketch_plane(session: DocSession, sketch_feat: dict, result: CompileResult):
+    """Resolve the sketch's refs.plane to a build123d Plane using the compiler's resolver.
+
+    Builds a CompileContext carrying the reserved datums, any datum-feature datums (re-resolved
+    from the doc), and the last compiled bodies, then calls sketch._resolve_plane_ref. Face
+    selectors resolve against the last solid body (same path the compiler uses on rebuild).
+    """
+    from engine.doc.features import sketch as sketch_mod
+    from engine.doc.features.base import CompileContext, get_compiler
+    from engine.doc.features.datum import reserved_datums
+
+    plane_ref = sketch_feat.get("refs", {}).get("plane")
+    if plane_ref is None:
+        raise OpError("invalid_op", "sketch has no refs.plane", {"reason": "no plane"})
+
+    env = result.equations_env or {}
+    datums = reserved_datums()
+    bodies = [bo.shape for bo in result.bodies]
+
+    # Re-resolve upstream datum features so datum-feature plane refs work (offset/midplane etc.).
+    for f in session.doc.get("features", []):
+        if f.get("id") == sketch_feat.get("id"):
+            break
+        if f.get("type") in ("plane", "axis", "point", "csys") and not f.get("suppressed"):
+            comp = get_compiler(f["type"])
+            if comp is None:
+                continue
+            try:
+                ctx = CompileContext(equations_env=env, bodies=bodies, datums=datums)
+                out = comp(f, ctx)
+                if out.datum is not None:
+                    datums[f["id"]] = out.datum
+            except Exception:  # noqa: BLE001
+                pass
+
+    ctx = CompileContext(equations_env=env, bodies=bodies, datums=datums)
+    try:
+        return sketch_mod._resolve_plane_ref(plane_ref, ctx)
+    except Exception as exc:  # noqa: BLE001
+        raise OpError("invalid_op", f"could not resolve sketch plane: {exc}",
+                      {"reason": "plane resolve failed"})
+
+
+def _plane_frame(plane) -> list:
+    """16-float row-major matrix mapping sketch (u,v,0,1) -> world. Columns: x_dir, y_dir, z_dir,
+    origin. (Matches build123d Plane.from_local_coords; OCP Transformation is 1-indexed.)"""
+    t = plane.location.wrapped.Transformation()
+    # 3x4 affine rows; append [0,0,0,1] for a homogeneous 4x4.
+    rows = [[float(t.Value(i + 1, j + 1)) for j in range(4)] for i in range(3)]
+    rows.append([0.0, 0.0, 0.0, 1.0])
+    return [v for row in rows for v in row]
+
+
+def _overall_status(statuses: dict, dof: int, conflicting: list) -> str:
+    if conflicting or any(s == "over" for s in statuses.values()):
+        return "over"
+    if dof <= 0:
+        return "full"
+    return "under"
+
+
+def _solve_active(session: DocSession, sketch_feat: dict, warm) -> dict:
+    """Solve the active sketch and pack the sketch_enter/solve result dict (minus plane_frame)."""
+    from engine.doc.sketch_solver import solve_sketch
+    env = _equations_env(session)
+    params = sketch_feat.get("params", {}) or {}
+    sol = solve_sketch(params, env, warm=warm)
+    # entities list: solved coords carrying ids (host renders these directly)
+    entities = []
+    for eid, coords in sol.entities.items():
+        rec = dict(coords)
+        rec["id"] = eid
+        # carry construction flag through for host rendering
+        for e in params.get("entities", []):
+            if e.get("id") == eid:
+                rec["construction"] = bool(e.get("construction", False))
+                break
+        entities.append(rec)
+    return {
+        "_state": sol.state,
+        "entities": entities,
+        "entity_map": dict(sol.entities),
+        "statuses": dict(sol.statuses),
+        "dof": int(sol.dof),
+        "conflicting": list(sol.conflicting),
+        "redundant": list(sol.redundant),
+    }
+
+
+def sketch_enter(session: DocSession, sketch_fid: str) -> dict:
+    """Enter sketch-edit mode: resolve plane, solve, store warm state. (worker_rpc.md sketch_enter)"""
+    feat = _find_sketch_feature(session, sketch_fid)
+    result = _ensure_built(session)
+    plane = _resolve_sketch_plane(session, feat, result)
+    frame = _plane_frame(plane)
+
+    packed = _solve_active(session, feat, warm=None)
+    st = _SketchState(sketch_fid=sketch_fid)
+    st.solve_state = packed["_state"]
+    st.last_entities = packed["entity_map"]
+    st.last_statuses = packed["statuses"]
+    st.last_overall_status = _overall_status(packed["statuses"], packed["dof"], packed["conflicting"])
+    st.plane_frame = frame
+    session.active_sketch = st
+
+    return {
+        "entities": packed["entities"],
+        "statuses": packed["statuses"],
+        "dof": packed["dof"],
+        "plane_frame": frame,
+        "status": st.last_overall_status,
+        "conflicting": packed["conflicting"],
+    }
+
+
+def sketch_solve(session: DocSession, sketch_fid: str) -> dict:
+    """Re-solve the active sketch (e.g. after a dim edit) and refresh warm state."""
+    feat = _find_sketch_feature(session, sketch_fid)
+    st = session.active_sketch
+    warm = st.solve_state if (st and st.sketch_fid == sketch_fid) else None
+    packed = _solve_active(session, feat, warm=warm)
+    if st is None or st.sketch_fid != sketch_fid:
+        result = _ensure_built(session)
+        plane = _resolve_sketch_plane(session, feat, result)
+        st = _SketchState(sketch_fid=sketch_fid, plane_frame=_plane_frame(plane))
+        session.active_sketch = st
+    st.solve_state = packed["_state"]
+    st.last_entities = packed["entity_map"]
+    st.last_statuses = packed["statuses"]
+    st.last_overall_status = _overall_status(packed["statuses"], packed["dof"], packed["conflicting"])
+    return {
+        "entities": packed["entities"],
+        "statuses": packed["statuses"],
+        "dof": packed["dof"],
+        "plane_frame": st.plane_frame,
+        "status": st.last_overall_status,
+        "conflicting": packed["conflicting"],
+    }
+
+
+def sketch_drag(session: DocSession, sketch_fid: str, handle: str, xy) -> dict:
+    """Transient warm-started drag (worker_rpc.md sketch_drag). NO revision bump, NO commit."""
+    from engine.doc.sketch_solver import drag as _drag
+    feat = _find_sketch_feature(session, sketch_fid)
+    st = session.active_sketch
+    if st is None or st.sketch_fid != sketch_fid or st.solve_state is None:
+        # Not entered (or stale) — enter implicitly so drag is still serviceable.
+        sketch_enter(session, sketch_fid)
+        st = session.active_sketch
+    env = _equations_env(session)
+    params = feat.get("params", {}) or {}
+    target = (float(xy[0]), float(xy[1]))
+    res = _drag(st.solve_state, handle, target, params, env)
+    # Pack entities with ids + construction flags for the host.
+    entities = []
+    for eid, coords in res["entities"].items():
+        rec = dict(coords)
+        rec["id"] = eid
+        for e in params.get("entities", []):
+            if e.get("id") == eid:
+                rec["construction"] = bool(e.get("construction", False))
+                break
+        entities.append(rec)
+    # Remember the dragged coords so commit can persist them (transient; no warm-state churn).
+    st.last_entities = dict(res["entities"])
+    st.last_statuses = dict(res.get("statuses", {}))
+    return {"entities": entities, "statuses": res.get("statuses", {})}
+
+
+def sketch_drag_commit(session: DocSession, sketch_fid: str,
+                       emit: EmitFn | None = None) -> dict:
+    """Persist the last dragged/solved coords as ONE undoable sketch_edit_entity batch.
+
+    Builds a sketch_edit_entity op per entity from the last transient drag result and routes it
+    through the normal apply_ops path (revision bump + rebuild + undo snapshot).
+    """
+    feat = _find_sketch_feature(session, sketch_fid)
+    st = session.active_sketch
+    coords = st.last_entities if (st and st.sketch_fid == sketch_fid) else None
+    if not coords:
+        # Nothing dragged — re-solve and persist solved positions (idempotent commit).
+        packed = _solve_active(session, feat, warm=(st.solve_state if st else None))
+        coords = packed["entity_map"]
+
+    ops = []
+    for eid, c in coords.items():
+        patch = {k: v for k, v in c.items() if k != "type"}
+        ops.append({"op": "sketch_edit_entity", "sketch": sketch_fid, "id": eid, "params": patch})
+
+    resp = apply_ops(session, None, ops, emit=emit)
+    # Re-solve so warm state matches the freshly persisted document.
+    if session.active_sketch is not None and session.active_sketch.sketch_fid == sketch_fid:
+        try:
+            sketch_solve(session, sketch_fid)
+            resp["rebuild"]["doc_status"] = _doc_status(session, session.last_result)
+        except Exception:  # noqa: BLE001
+            pass
+    return resp
+
+
+def _persist_solved_coords(session: DocSession, feat: dict, coords: dict) -> bool:
+    """Write solved entity coords into the document IN PLACE if they differ from stored. Returns
+    True if anything changed (so the caller bumps the revision). No undo snapshot of its own —
+    used by sketch_exit, which folds the persist into its rebuild as the last-solved positions
+    (doc_schema.md §3.4)."""
+    if not coords:
+        return False
+    changed = False
+    for ent in feat.get("params", {}).get("entities", []):
+        c = coords.get(ent["id"])
+        if not c:
+            continue
+        for k, v in c.items():
+            if k == "type":
+                continue
+            if ent.get(k) != v:
+                ent[k] = v
+                changed = True
+    return changed
+
+
+def sketch_exit(session: DocSession, sketch_fid: str, emit: EmitFn | None = None) -> dict:
+    """Leave sketch-edit mode: persist last-solved coords, clear state, rebuild downstream.
+
+    The document stores the *last solved* entity positions (doc_schema.md §3.4); a dim edit while
+    in the sketch re-solves but doesn't itself rewrite stored coords, so exit bakes the active
+    solve's coords in (as one undoable batch with the rebuild) before leaving."""
+    st = session.active_sketch
+    feat = _find_sketch_feature(session, sketch_fid)
+    if st is not None and st.sketch_fid == sketch_fid and st.last_entities:
+        session._push_undo()
+        if _persist_solved_coords(session, feat, st.last_entities):
+            session.revision += 1
+            session.dirty = True
+        else:
+            session.undo_stack.pop()  # nothing changed — don't leave a no-op undo step
+    session.active_sketch = None
+    return rebuild(session, emit=emit)

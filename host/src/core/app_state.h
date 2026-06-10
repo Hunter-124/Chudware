@@ -308,6 +308,27 @@ struct AppState {
     // Opaque pointer so app_state.h stays free of the ui/property_manager.h include (kept GL-light).
     void* propertyManager = nullptr;   // ui::PropertyManager* (owned by run_gui)
 
+    // ---- C19: simulation + result-overlay UI state ----
+    void* simClient = nullptr;         // core::SimClient* (owned by run_gui; opaque to stay light)
+    void* simPanel = nullptr;          // ui::SimPanel* (owned by run_gui)
+    bool showSimPanel = false;         // Simulation dock visibility
+    bool colormapOn = false;           // result colormap toggle (mirrors renderer state)
+    bool docMeshHasScalar = false;     // the loaded overlay carries a per-vertex scalar
+    bool docMeshHasDisp = false;       // the loaded overlay carries a displacement field
+    float dispScaleHint = 1.0f;        // suggested deform multiplier from the last overlay
+    std::string legendTitle, legendUnits;  // legend widget labels for the active scalar
+    bool legendOn = false;             // draw the viewport legend overlay
+    float legendMin = 0.0f, legendMax = 1.0f;
+    bool wantFea = false;       // C19: AI_CAD_SHOT=fea scripted static-study scenario
+    bool feaShotDone = false;   // guard so the fea scenario runs exactly once
+    bool wantEvalMass = false;  // C19: AI_CAD_SHOT=evalmass mass-properties window
+    bool evalMassShotDone = false;
+
+    // ---- SketchMode (C18) — in-sketch tools/overlay; opaque like the PropertyManager ----
+    void* sketchMode = nullptr;        // ui::SketchMode* (owned by run_gui)
+    bool wantSketch = false;           // AI_CAD_SHOT=sketch scripted flow
+    bool sketchShotDone = false;       // guard so the sketch scenario runs once per shot
+
     // ---- screenshot-mode flags (set from AI_CAD_SHOT in run_gui) ----
     bool wantSettings = false, wantChat = false, wantAssembly = false, wantPlan = false;
     bool wantPick   = false;  // C15: load box.aicm, simulate a center pick, print + screenshot

@@ -48,6 +48,12 @@
 #include "ui/widgets/ribbon.h"
 #include "ui/ribbon_def.h"
 #include "ui/property_manager.h"
+#include "ui/sketch_mode.h"   // C18
+// --- C19: simulation + flow + evaluate UI ---
+#include "core/sim_client.h"
+#include "ui/sim_panel.h"
+#include "ui/evaluate_dialogs.h"
+// --- end C19 ---
 
 int run_gui(const char* screenshotPath) {
     const bool shot = screenshotPath != nullptr;
@@ -135,11 +141,30 @@ int run_gui(const char* screenshotPath) {
     ui::PropertyManager propertyManager;
     st.propertyManager = &propertyManager;
 
+    // C19: SimClient (worker #2) + Simulation panel + Evaluate dialogs — owned here.
+    core::SimClient simClient;
+    st.simClient = &simClient;
+    ui::SimPanel simPanel;
+    st.simPanel = &simPanel;
+    ui::EvaluateDialogs evaluateDialogs;
+
+    // C18: SketchMode — owned here, borrowed via st.sketchMode (opaque void*).
+    ui::SketchMode sketchMode;
+    st.sketchMode = &sketchMode;
+
     // C17: ribbon dispatcher — replaces C14's default printf handler. A ribbon command opens the
     // matching PM form (occupying the tree dock slot); commands without a form log a stub line so
     // they remain observable until later cards wire them.
-    ui::setRibbonCallback([&st, &propertyManager](const char* cmd_id) {
+    // C18: sketch-tab commands (sketch_new / sk_* / smart_dim / sketch_exit) route to SketchMode
+    // first so the sketch experience takes priority over any PM form for those ids.
+    ui::setRibbonCallback([&st, &propertyManager, &sketchMode, &simPanel,
+                           &evaluateDialogs](const char* cmd_id) {
+        if (sketchMode.onRibbonCommand(st, cmd_id)) return;       // C18 sketch tool handled
         if (propertyManager.openForCommand(st, cmd_id)) return;  // form opened
+        // C19: Simulation tab -> sim panel; Evaluate tab -> evaluate dialogs.
+        std::string cmd(cmd_id);
+        if (cmd.rfind("sim_", 0) == 0 && simPanel.handleCommand(st, cmd)) return;
+        if (cmd.rfind("eval_", 0) == 0 && evaluateDialogs.handleCommand(st, cmd)) return;
         std::printf("[ribbon] %s (no PM form)\n", cmd_id);
         std::fflush(stdout);
         st.addLog(std::string("[ribbon] ") + cmd_id + " (no PM form yet)");
@@ -244,8 +269,14 @@ int run_gui(const char* screenshotPath) {
     st.wantRibbon = shot && shotMode && std::strcmp(shotMode, "ribbon") == 0;
     st.wantTree = shot && shotMode && std::strcmp(shotMode, "tree") == 0;
     st.wantM1 = shot && shotMode && std::strcmp(shotMode, "m1") == 0;  // C17 integration scenario
-    std::fprintf(stderr, "startup: shot=%d shotMode=%s wantM1=%d workerStarted=%d\n",
-                 (int)shot, shotMode ? shotMode : "(null)", (int)st.wantM1, (int)st.workerStarted);
+    st.wantSketch = shot && shotMode && std::strcmp(shotMode, "sketch") == 0;  // C18 sketch flow
+    if (st.wantSketch) { st.showRibbon = true; st.ribbonTab = 1; }  // Sketch tab forward
+    st.wantFea = shot && shotMode && std::strcmp(shotMode, "fea") == 0;       // C19 static study
+    st.wantEvalMass = shot && shotMode && std::strcmp(shotMode, "evalmass") == 0;  // C19 mass props
+    if (st.wantFea) { st.showRibbon = true; st.ribbonTab = 3; st.showSimPanel = true; }
+    std::fprintf(stderr, "startup: shot=%d shotMode=%s wantM1=%d wantSketch=%d workerStarted=%d\n",
+                 (int)shot, shotMode ? shotMode : "(null)", (int)st.wantM1, (int)st.wantSketch,
+                 (int)st.workerStarted);
     std::fflush(stderr);
     // ribbon shot: show Features tab
     if (st.wantRibbon) { st.showRibbon = true; st.ribbonTab = 0; }
@@ -399,6 +430,8 @@ int run_gui(const char* screenshotPath) {
     // to this path (a per-step screenshot) and clears it. Lives across frames (the step machine
     // sets it, the capture consumes it).
     std::string m1Capture;
+    // C18 sketch scenario: same per-step capture mechanism, separate path slot.
+    std::string sketchCapture;
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
@@ -837,6 +870,261 @@ int run_gui(const char* screenshotPath) {
             }
         }
 
+        // ---------- C18 sketch scenario (AI_CAD_SHOT=sketch) ----------
+        // new part -> sketch on plane.top -> corner rect (ops + h/v + fix + 2 dims) -> sketch_enter
+        // -> screenshot (entities + status) -> drag a corner + commit -> set width 80->100 -> shot
+        // -> exit -> extrude the region depth 10 -> shot of the solid. Per-step captures use the
+        // same backbuffer-write mechanism as m1 (sketchCapture).
+        static int  skStep = 0, skSettle = 0;
+        static std::string skSavePath, skFid;
+        static std::string skL0, skL1, skL2, skL3, skWidthCid;
+        // Hold the scenario for a few frames so the dockspace builds + docks the panels before the
+        // first (step-0) capture; otherwise the first screenshot lands before the layout exists.
+        if (st.wantSketch && st.workerStarted && !st.sketchShotDone && st.frame >= 5) {
+            auto* sk = static_cast<ui::SketchMode*>(st.sketchMode);
+            static bool skDirReady = false;
+            if (!skDirReady) {
+                skDirReady = true;
+                const char* repo = std::getenv("AI_CAD_REPO");
+                std::string base = repo ? std::string(repo) : std::string(".");
+                skSavePath = base + "\\scratch\\sketch_shots";
+            }
+            auto applyOne = [&](const nlohmann::json& op) -> core::OpsResponse {
+                return st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+            };
+            const int kSettle = 4;
+            if (skSettle > 0) { --skSettle; }
+            else if (sketchCapture.empty()) {
+                std::string err;
+                switch (skStep) {
+                    case 0: {  // new part + sketch + rect (entities/relations/dims) + enter
+                        if (!st.docMirror.newPart(st.worker, err)) {
+                            std::printf("sketch: new_part FAILED: %s\n", err.c_str()); std::fflush(stdout);
+                            st.sketchShotDone = true; break;
+                        }
+                        auto r = applyOne({{"op","add_feature"},{"feature",{
+                            {"type","sketch"},{"name","Sketch1"},
+                            {"refs",{{"plane","plane.top"}}},
+                            {"params",{{"entities",nlohmann::json::array()},
+                                       {"constraints",nlohmann::json::array()}}}}}});
+                        skFid = (r.id_map.is_object() && r.id_map.contains("$0")) ? r.id_map["$0"].get<std::string>() : "f1";
+                        // four rect lines, chaining coincident corners via real ids
+                        auto addLine = [&](double x1,double y1,double x2,double y2,bool horiz,const std::string& prev)->std::string{
+                            nlohmann::json cs = nlohmann::json::array();
+                            cs.push_back({{"type",horiz?"horizontal":"vertical"},{"refs",{"$self"}}});
+                            if (!prev.empty()) cs.push_back({{"type","coincident"},{"refs",{prev+".p2","$self.p1"}}});
+                            auto rr = applyOne({{"op","sketch_add_entity"},{"sketch",skFid},
+                                {"entity",{{"type","line"},{"p1",{x1,y1}},{"p2",{x2,y2}}}},{"constraints",cs}});
+                            return (rr.id_map.is_object() && rr.id_map.contains("$0")) ? rr.id_map["$0"].get<std::string>() : "";
+                        };
+                        skL0 = addLine(0,0,80,0,true,"");
+                        skL1 = addLine(80,0,80,40,false,skL0);
+                        skL2 = addLine(80,40,0,40,true,skL1);
+                        skL3 = addLine(0,40,0,0,false,skL2);
+                        applyOne({{"op","sketch_add_constraint"},{"sketch",skFid},
+                            {"constraint",{{"type","coincident"},{"refs",{skL3+".p2",skL0+".p1"}}}}});
+                        applyOne({{"op","sketch_add_constraint"},{"sketch",skFid},
+                            {"constraint",{{"type","fix"},{"refs",{skL0+".p1"}}}}});
+                        applyOne({{"op","sketch_add_constraint"},{"sketch",skFid},
+                            {"constraint",{{"type","distance"},{"refs",{skL0+".p1",skL0+".p2"}},
+                                           {"value",{{"value",80.0},{"expr",nullptr}}}}}});
+                        auto rH = applyOne({{"op","sketch_add_constraint"},{"sketch",skFid},
+                            {"constraint",{{"type","distance"},{"refs",{skL1+".p1",skL1+".p2"}},
+                                           {"value",{{"value",40.0},{"expr",nullptr}}}}}});
+                        skWidthCid = (rH.id_map.is_object() && rH.id_map.contains("$0")) ? "" : "";
+                        // find the width constraint id by scanning the sketch params (it's the
+                        // distance on skL0). We re-read the tree to locate it.
+                        {
+                            const auto& tr = st.docMirror.tree();
+                            if (tr.contains("features"))
+                              for (auto& f : tr["features"])
+                                if (f.value("id",std::string())==skFid && f.contains("params"))
+                                  for (auto& c : f["params"].value("constraints",nlohmann::json::array()))
+                                    if (c.value("type",std::string())=="distance" && c.contains("refs") &&
+                                        c["refs"].size()==2 && c["refs"][0].get<std::string>()==skL0+".p1")
+                                      skWidthCid = c.value("id",std::string());
+                        }
+                        if (sk) sk->enterForFeature(st, skFid);
+                        st.zoom = 1.0f;
+                        std::printf("sketch: new sketch %s rect built (width_cid=%s) entered; status=%s\n",
+                                    skFid.c_str(), skWidthCid.c_str(), sk ? sk->statusLine().c_str() : "?");
+                        std::fflush(stdout);
+                        sketchCapture = skSavePath + "\\sketch_01_enter.png"; skSettle = kSettle;
+                        break;
+                    }
+                    case 1: {  // drag a corner + commit, then set width 80 -> 100
+                        nlohmann::json dres;
+                        nlohmann::json dragP = {{"doc_id",st.docMirror.docId()},{"sketch",skFid},
+                            {"handle",skL1+".p2"},{"xy",nlohmann::json::array({85.0,45.0})}};
+                        st.worker.call("sketch_drag", dragP, dres, err);
+                        nlohmann::json cres;
+                        nlohmann::json cP = {{"doc_id",st.docMirror.docId()},{"sketch",skFid}};
+                        st.worker.call("sketch_drag_commit", cP, cres, err);
+                        // resync mirror (commit bumped the revision) then set the width dim
+                        std::string serr; st.docMirror.resolvePick(st.worker, 1, "body", 1, serr);
+                        if (!skWidthCid.empty())
+                            st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                                {{"op","sketch_set_dim"},{"sketch",skFid},{"id",skWidthCid},{"value",100.0}}}));
+                        nlohmann::json sres;
+                        st.worker.call("sketch_solve", {{"doc_id",st.docMirror.docId()},{"sketch",skFid}}, sres, err);
+                        if (sk) sk->enterForFeature(st, skFid);  // refresh overlay entities/status
+                        std::printf("sketch: drag+commit, width 80->100, re-solved; status=%s dof=%d\n",
+                                    sk ? sk->statusLine().c_str() : "?", sres.value("dof",-1));
+                        std::fflush(stdout);
+                        sketchCapture = skSavePath + "\\sketch_02_dim.png"; skSettle = kSettle;
+                        break;
+                    }
+                    case 2: {  // exit + extrude region depth 10
+                        if (sk) sk->exitSketch(st, /*keep=*/true);
+                        std::string serr; st.docMirror.resolvePick(st.worker, 1, "body", 1, serr);
+                        nlohmann::json region = {{"kind","region"},{"sketch",skFid},
+                            {"centroid",nlohmann::json::array({50.0,20.0})},{"hint_index",0}};
+                        auto r = applyOne({{"op","add_feature"},{"feature",{
+                            {"type","extrude"},{"name","Boss-Extrude1"},
+                            {"params",{{"depth",{{"value",10.0},{"expr",nullptr}}},{"end","blind"},{"mode","boss"}}},
+                            {"refs",{{"profile",nlohmann::json::array({region})}}}}}});
+                        if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+                        bool exok = false;
+                        if (r.feature_status.is_array() && !r.feature_status.empty())
+                            exok = r.feature_status.back().value("ok",false);
+                        st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
+                        std::printf("sketch: exit + extrude region depth 10 ok=%d\n", (int)exok);
+                        std::fflush(stdout);
+                        sketchCapture = skSavePath + "\\sketch_03_solid.png"; skSettle = kSettle;
+                        break;
+                    }
+                    default:
+                        st.sketchShotDone = true;
+                        std::printf("sketch: scenario complete\n"); std::fflush(stdout);
+                        break;
+                }
+                if (skStep <= 2) ++skStep;
+            }
+        }
+
+        // ---------- C19 FEA scenario (AI_CAD_SHOT=fea) ----------
+        // new part -> box 60x40x10 -> static study: fix the -X end face, 100 N -Z on the +X end,
+        // steel (index 0), density 0.4 -> wait for completion (cap ~90 s) -> von Mises colormap.
+        static int feaStep = 0, feaSettle = 0, feaWaitFrames = 0;
+        if (st.wantFea && st.workerStarted && !st.feaShotDone) {
+            auto* sim = static_cast<core::SimClient*>(st.simClient);
+            simPanel.tick(st);  // pump the panel so completion lands while we wait
+            if (feaSettle > 0) { --feaSettle; }
+            else switch (feaStep) {
+                case 0: {  // New part + box
+                    std::string err;
+                    st.docMirror.newPart(st.worker, err);
+                    nlohmann::json ops = nlohmann::json::array();
+                    ops.push_back({{"op","add_feature"},{"feature",{
+                        {"type","box"},{"name","Box1"},{"params",{
+                            {"length",{{"value",60.0},{"expr",nullptr}}},
+                            {"width", {{"value",40.0},{"expr",nullptr}}},
+                            {"height",{{"value",10.0},{"expr",nullptr}}}},
+                        },{"centered",true}}}});
+                    auto r = st.docMirror.applyOps(st.worker, ops);
+                    if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+                    std::printf("fea: box ok=%d rev=%d\n", (int)r.ok, r.revision);
+                    std::fflush(stdout);
+                    st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
+                    feaSettle = 3; ++feaStep; break;
+                }
+                case 1: {  // Static study + resolved fixture/load faces (-X end / +X end)
+                    simPanel.handleCommand(st, "sim_new_static");
+                    {
+                        int steelIdx = simPanel.materialIndexByKey("steel_1018");
+                        simPanel.configureActive(0.4f, steelIdx >= 0 ? steelIdx : 0);
+                    }
+                    auto faceAtExtremeX = [&](bool wantMax) -> nlohmann::json {
+                        nlohmann::json best; double bestC = wantMax ? -1e30 : 1e30;
+                        for (int tid = 1; tid <= 12; ++tid) {
+                            std::string se;
+                            std::string s = st.docMirror.resolvePick(st.worker, 1, "face", tid, se);
+                            if (s.empty()) continue;
+                            try {
+                                auto o = nlohmann::json::parse(s);
+                                if (!o.contains("centroid")) continue;
+                                double cx = o["centroid"][0].get<double>();
+                                if ((wantMax && cx > bestC) || (!wantMax && cx < bestC)) { bestC = cx; best = o; }
+                            } catch (...) {}
+                        }
+                        return best;
+                    };
+                    nlohmann::json fixFace = faceAtExtremeX(false);
+                    nlohmann::json loadFace = faceAtExtremeX(true);
+                    // Inject the resolved selectors via the selection -> well capture path.
+                    st.selection.clear();
+                    { core::SelItem it; it.selector = fixFace.dump(); it.pending_resolve = false;
+                      st.selection.mutableItems().push_back(it); }
+                    simPanel.handleCommand(st, "sim_fixture");
+                    st.selection.clear();
+                    { core::SelItem it; it.selector = loadFace.dump(); it.pending_resolve = false;
+                      st.selection.mutableItems().push_back(it); }
+                    simPanel.handleCommand(st, "sim_load_force");
+                    st.selection.clear();
+                    std::printf("fea: faces fixCx=%.1f loadCx=%.1f\n",
+                                fixFace.contains("centroid") ? fixFace["centroid"][0].get<double>() : 0.0,
+                                loadFace.contains("centroid") ? loadFace["centroid"][0].get<double>() : 0.0);
+                    std::fflush(stdout);
+                    feaSettle = 2; ++feaStep; break;
+                }
+                case 2: {  // Run
+                    simPanel.handleCommand(st, "sim_run");
+                    std::printf("fea: study launched (density 0.4, steel, 100 N)\n");
+                    std::fflush(stdout);
+                    feaWaitFrames = 0; ++feaStep; break;
+                }
+                case 3: {  // Wait for completion (cap ~90 s)
+                    ++feaWaitFrames;
+                    if (st.colormapOn || feaWaitFrames > 5400) {
+                        std::printf("fea: result ready colormap=%d legend=%d (%d frames)\n",
+                                    (int)st.colormapOn, (int)st.legendOn, feaWaitFrames);
+                        std::fflush(stdout);
+                        ++feaStep;
+                    }
+                    break;
+                }
+                default:
+                    st.feaShotDone = true;
+                    std::printf("fea: scenario complete\n");
+                    std::fflush(stdout);
+                    break;
+            }
+            (void)sim;
+        }
+
+        // ---------- C19 evalmass scenario (AI_CAD_SHOT=evalmass) ----------
+        static int evalStep = 0, evalSettle = 0;
+        if (st.wantEvalMass && st.workerStarted && !st.evalMassShotDone) {
+            if (evalSettle > 0) { --evalSettle; }
+            else switch (evalStep) {
+                case 0: {
+                    std::string err;
+                    st.docMirror.newPart(st.worker, err);
+                    nlohmann::json ops = nlohmann::json::array();
+                    ops.push_back({{"op","add_feature"},{"feature",{
+                        {"type","box"},{"name","Box1"},{"params",{
+                            {"length",{{"value",50.0},{"expr",nullptr}}},
+                            {"width", {{"value",30.0},{"expr",nullptr}}},
+                            {"height",{{"value",20.0},{"expr",nullptr}}}},
+                        },{"centered",true}}}});
+                    auto r = st.docMirror.applyOps(st.worker, ops);
+                    if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+                    st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
+                    std::printf("evalmass: box ok=%d\n", (int)r.ok); std::fflush(stdout);
+                    evalSettle = 3; ++evalStep; break;
+                }
+                case 1: {
+                    evaluateDialogs.handleCommand(st, "eval_mass_props");
+                    std::printf("evalmass: mass properties window opened\n"); std::fflush(stdout);
+                    ++evalStep; break;
+                }
+                default:
+                    st.evalMassShotDone = true;
+                    std::printf("evalmass: scenario complete\n"); std::fflush(stdout);
+                    break;
+            }
+        }
+
         bool busy = st.job.running.load();
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -909,6 +1197,11 @@ int run_gui(const char* screenshotPath) {
         ui::drawViewportPanel(st, io, busy);
         ui::drawConsolePanel(st);
 
+        // ---------- C19: simulation panel + evaluate dialogs ----------
+        simPanel.tick(st);          // drain SimClient progress + completion (loads overlays)
+        simPanel.draw(st);
+        evaluateDialogs.draw(st);
+
         // ---------- C15 pick-shot driver: simulate a center-screen pick ----------
         // The viewport panel rendered the id buffer for this frame's camera; pick its center,
         // apply the selection (highlight shows from the next frame), and print the PickHit once
@@ -973,6 +1266,66 @@ int run_gui(const char* screenshotPath) {
             continue;
         }
 
+        // C18 sketch scenario: identical per-step capture mechanism.
+        if (st.wantSketch) {
+            ++st.frame;
+            if (!sketchCapture.empty()) {
+                std::vector<unsigned char> px(dw * dh * 4);
+                glReadBuffer(GL_BACK);
+                glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                std::vector<unsigned char> flip(dw * dh * 4);
+                for (int y = 0; y < dh; ++y)
+                    std::memcpy(&flip[(dh - 1 - y) * dw * 4], &px[y * dw * 4], dw * 4);
+                stbi_write_png(sketchCapture.c_str(), dw, dh, 4, flip.data(), dw * 4);
+                std::printf("sketch screenshot -> %s (%dx%d)\n", sketchCapture.c_str(), dw, dh);
+                std::fflush(stdout);
+                if (sketchCapture.find("sketch_03_solid") != std::string::npos && screenshotPath)
+                    stbi_write_png(screenshotPath, dw, dh, 4, flip.data(), dw * 4);
+                sketchCapture.clear();
+            }
+            if (st.sketchShotDone) { glfwSwapBuffers(win); break; }
+            glfwSwapBuffers(win);
+            continue;
+        }
+
+        // C19 fea/evalmass shots: drive the async scenario across frames; capture once it's done.
+        if (st.wantFea) {
+            ++st.frame;
+            if (st.feaShotDone) {
+                std::vector<unsigned char> px(dw * dh * 4);
+                glReadBuffer(GL_BACK);
+                glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                std::vector<unsigned char> flip(dw * dh * 4);
+                for (int y = 0; y < dh; ++y)
+                    std::memcpy(&flip[(dh - 1 - y) * dw * 4], &px[y * dw * 4], dw * 4);
+                if (screenshotPath) stbi_write_png(screenshotPath, dw, dh, 4, flip.data(), dw * 4);
+                std::printf("fea screenshot -> %s (%dx%d)\n",
+                            screenshotPath ? screenshotPath : "(none)", dw, dh);
+                std::fflush(stdout);
+                glfwSwapBuffers(win); break;
+            }
+            glfwSwapBuffers(win);
+            continue;
+        }
+        if (st.wantEvalMass) {
+            ++st.frame;
+            if (st.evalMassShotDone && st.frame > 6) {
+                std::vector<unsigned char> px(dw * dh * 4);
+                glReadBuffer(GL_BACK);
+                glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                std::vector<unsigned char> flip(dw * dh * 4);
+                for (int y = 0; y < dh; ++y)
+                    std::memcpy(&flip[(dh - 1 - y) * dw * 4], &px[y * dw * 4], dw * 4);
+                if (screenshotPath) stbi_write_png(screenshotPath, dw, dh, 4, flip.data(), dw * 4);
+                std::printf("evalmass screenshot -> %s (%dx%d)\n",
+                            screenshotPath ? screenshotPath : "(none)", dw, dh);
+                std::fflush(stdout);
+                glfwSwapBuffers(win); break;
+            }
+            glfwSwapBuffers(win);
+            continue;
+        }
+
         // tree shot needs extra frames for the tree to repaint after async doc load
         // wantTree but !treeShotDone: keep waiting (up to 30 frames) for the worker to start
         // wantTree and treeShotDone: take the screenshot at frame 10 (tree has repainted)
@@ -994,6 +1347,7 @@ int run_gui(const char* screenshotPath) {
     freeChatTextures(st.chat);  // release iteration thumbnails while the GL context is still live
     ui::freeIcons();            // C14: release atlas textures while GL context is still live
     st.worker.stop();
+    simClient.stop();  // C19: shut down the second worker process
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

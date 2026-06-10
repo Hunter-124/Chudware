@@ -1,5 +1,27 @@
 # Landed-card integration notes (orchestrator log)
 
+## C18 sketch UI + C19 sim/eval UI + C21 formats (wave A, combined commit)
+- Worker now also serves: sketch_enter/solve/drag/drag_commit/exit (C18; session.py holds
+  _SketchState w/ warm solver state; drag transient, commit = one undoable batch; exit persists
+  solved coords + rebuilds; cache-clear hook _batch_consumes_sketch_region in apply_ops so
+  region-consuming features see a cache-hit sketch's regions), doc_export_step + doc_face_points
+  (C19, engine/sim/bridge.py), import_file/export_file (C21 via _METHODS.update).
+- ui/sketch_mode: ImGui draw-list overlay projected via CameraXform (no new GL); tools
+  line/rect/circle/center-arc/slot + Smart Dimension (pmParseDim, =expr) + auto-relations
+  (coincident snap 6px, h/v 5deg); status bar shows defined-state + DOF; AI_CAD_SHOT=sketch.
+  Stubs left for C24: trim/extend/offset/convert/mirror/pattern tools, polygon/spline/ellipse.
+  DocMirror resync after sketch commits uses a throwaway resolvePick — C24 should add resync().
+- Renderer scalar pass (C19): PartMesh gained scalar/disp arrays; setColormapMode/setDeformScale/
+  scalarRange; 256x1 jet LUT, aScalar attr; legend widget ui/legend.cpp. core/sim_client = 2nd
+  WorkerClient(module="engine.sim.worker") lazy+restart. ui/sim_panel (Static/Modal/Flow studies,
+  material combo from materials.json, SelectorWell fixtures/loads -> doc_face_points, run ->
+  progress -> overlay_aicm -> colormap+legend+summary); ui/evaluate_dialogs (mass/measure/
+  interference/draft/thickness/curvature/check/section). engine/sim/overlay.py packages results
+  (nearest-node volume->surface SCLR/DISP; turbo slice PNGs; LINS streamlines).
+  NOT wired: textured slice quads in viewport, eval_perf, zebra (deferred notes in dialogs).
+- AI_CAD_SHOT modes now: sketch, fea, evalmass, m1, tree, pick, ribbon (+legacy). All exit 0.
+- WorkerClient::start(err, module="engine.worker") — second param new (C19).
+
 Terse API facts future dispatch prompts need. Updated as cards land. Full reports live in the
 session transcripts; commit messages carry verification evidence.
 

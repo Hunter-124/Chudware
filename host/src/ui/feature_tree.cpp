@@ -11,6 +11,7 @@
 
 #include "feature_tree.h"
 #include "icons.h"
+#include "sketch_mode.h"   // C18 (Edit Sketch context entry)
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
@@ -115,6 +116,15 @@ static bool featureRow(const std::string& fid, const std::string& name, const ch
 
     // Context menu
     if (ImGui::BeginPopupContextItem(("##ctx_" + fid).c_str())) {
+        // C18: sketch features get an "Edit Sketch" entry that enters sketch mode (camera lock +
+        // tools). iconName == "sketch" identifies the row's feature type (see featureIcon()).
+        bool isSketch = iconName && std::strcmp(iconName, "sketch") == 0;
+        if (isSketch) {
+            if (ImGui::MenuItem("Edit Sketch")) {
+                auto* sk = static_cast<ui::SketchMode*>(st.sketchMode);
+                if (sk) sk->enterForFeature(st, fid);
+            }
+        }
         // Edit callback (C17 wires this)
         if (editCallback) {
             if (ImGui::MenuItem("Edit")) editCallback(fid);

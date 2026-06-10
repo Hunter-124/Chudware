@@ -2,8 +2,11 @@
 
 #include <glad/gl.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
+#include <vector>
 
 #include "math.h"
 
@@ -11,12 +14,15 @@ namespace {
 const char* kVert = R"(#version 330 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNormal;
+layout(location=2) in float aScalar;   // C19: per-vertex scalar (NaN = no data)
 uniform mat4 uMVP;
 out vec3 vN;
 out vec3 vPos;
+out float vScalar;
 void main(){
     vN = aNormal;
     vPos = aPos;
+    vScalar = aScalar;
     gl_Position = uMVP * vec4(aPos, 1.0);
 })";
 
@@ -27,17 +33,30 @@ void main(){
 const char* kFrag = R"(#version 330 core
 in vec3 vN;
 in vec3 vPos;
+in float vScalar;
 uniform vec3 uKeyDir;     // toward the key light (world)
 uniform vec3 uFillDir;    // toward the fill light
 uniform vec3 uRimDir;     // toward the rim light
 uniform vec3 uCamPos;
 uniform vec3 uColor;      // sRGB part color
+uniform int  uUseScalar;  // C19: 1 = sample the LUT by the per-vertex scalar
+uniform float uScalarMin, uScalarMax;
+uniform sampler2D uLut;   // 256x1 jet ramp
 out vec4 frag;
 void main(){
     vec3 N = normalize(vN);
     vec3 V = normalize(uCamPos - vPos);
     if (dot(N, V) < 0.0) N = -N;            // two-sided
-    vec3 base = pow(uColor, vec3(2.2));     // sRGB -> linear
+    vec3 srgbColor = uColor;
+    if (uUseScalar == 1) {
+        if (vScalar != vScalar) {           // NaN = no data -> neutral grey
+            srgbColor = vec3(0.62, 0.64, 0.66);
+        } else {
+            float t = clamp((vScalar - uScalarMin) / max(uScalarMax - uScalarMin, 1e-9), 0.0, 1.0);
+            srgbColor = texture(uLut, vec2(t, 0.5)).rgb;
+        }
+    }
+    vec3 base = pow(srgbColor, vec3(2.2));  // sRGB -> linear
 
     const vec3 keyCol  = vec3(1.00, 0.97, 0.92);
     const vec3 fillCol = vec3(0.62, 0.70, 0.86);
@@ -137,6 +156,46 @@ Renderer::~Renderer() {
     if (prog_) glDeleteProgram(prog_);
     if (edgeProg_) glDeleteProgram(edgeProg_);
     if (bgProg_) glDeleteProgram(bgProg_);
+    if (lutTex_) glDeleteTextures(1, &lutTex_);
+}
+
+// SolidWorks-style "jet/rainbow" result ramp: blue -> cyan -> green -> yellow -> red. Built once
+// into a 256x1 RGB texture sampled by the shader's normalized scalar t in [0,1].
+void Renderer::buildLut() {
+    if (lutTex_) return;
+    const int N = 256;
+    std::vector<unsigned char> ramp(N * 3);
+    // Control stops (t, r, g, b) in sRGB 0..1.
+    struct Stop { float t, r, g, b; };
+    static const Stop stops[] = {
+        {0.00f, 0.00f, 0.10f, 0.55f},  // deep blue
+        {0.25f, 0.00f, 0.70f, 0.90f},  // cyan
+        {0.50f, 0.10f, 0.80f, 0.20f},  // green
+        {0.75f, 0.95f, 0.85f, 0.00f},  // yellow
+        {1.00f, 0.85f, 0.10f, 0.10f},  // red
+    };
+    const int NS = (int)(sizeof(stops) / sizeof(stops[0]));
+    for (int i = 0; i < N; ++i) {
+        float t = (float)i / (float)(N - 1);
+        int k = 0;
+        while (k < NS - 2 && t > stops[k + 1].t) ++k;
+        float span = std::max(1e-6f, stops[k + 1].t - stops[k].t);
+        float f = (t - stops[k].t) / span;
+        float r = stops[k].r + (stops[k + 1].r - stops[k].r) * f;
+        float g = stops[k].g + (stops[k + 1].g - stops[k].g) * f;
+        float b = stops[k].b + (stops[k + 1].b - stops[k].b) * f;
+        ramp[i * 3 + 0] = (unsigned char)(r * 255.0f + 0.5f);
+        ramp[i * 3 + 1] = (unsigned char)(g * 255.0f + 0.5f);
+        ramp[i * 3 + 2] = (unsigned char)(b * 255.0f + 0.5f);
+    }
+    glGenTextures(1, &lutTex_);
+    glBindTexture(GL_TEXTURE_2D, lutTex_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, N, 1, 0, GL_RGB, GL_UNSIGNED_BYTE, ramp.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 void Renderer::setBackground(float tr, float tg, float tb, float br, float bg, float bb) {
@@ -157,6 +216,7 @@ bool Renderer::init(int width, int height, std::string& err) {
 
     glGenVertexArrays(1, &bgVao_);
 
+    buildLut();  // C19 result colormap ramp
     allocTargets();
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         err = "framebuffer incomplete";
@@ -200,8 +260,36 @@ void Renderer::freeSubs() {
         if (s.ebo) glDeleteBuffers(1, &s.ebo);
         if (s.edgeVao) glDeleteVertexArrays(1, &s.edgeVao);
         if (s.vboEdge) glDeleteBuffers(1, &s.vboEdge);
+        if (s.vboScalar) glDeleteBuffers(1, &s.vboScalar);
     }
     subs_.clear();
+}
+
+// Re-upload a Sub's positions (and edge lines) as base + deformScale_ * disp. No-op if the body
+// carries no displacement field.
+void Renderer::uploadDeformed(Sub& s) {
+    if (s.disp.empty() || s.disp.size() != s.basePos.size() || s.vboPos == 0) return;
+    std::vector<float> p(s.basePos.size());
+    for (size_t i = 0; i < p.size(); ++i) p[i] = s.basePos[i] + deformScale_ * s.disp[i];
+    glBindBuffer(GL_ARRAY_BUFFER, s.vboPos);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, p.size() * sizeof(float), p.data());
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    // Edge lines: displace each endpoint by the nearest base vertex's displacement. Approximate
+    // (edges are a small line list) — snap each edge endpoint to its matching base vertex by exact
+    // position match would be costly; instead we leave undisplaced edges, which reads fine since
+    // the deformed surface dominates the view. (Edges stay on the undeformed cage as a reference.)
+}
+
+void Renderer::setDeformScale(float sc) {
+    deformScale_ = sc;
+    for (auto& s : subs_) uploadDeformed(s);
+}
+
+bool Renderer::scalarRange(float& vmin, float& vmax) const {
+    for (const auto& s : subs_) {
+        if (s.hasScalar) { vmin = s.scalarMin; vmax = s.scalarMax; return true; }
+    }
+    return false;
 }
 
 void Renderer::setMesh(const Mesh& m) {
@@ -221,6 +309,10 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
         s.color[0] = part.color[0];
         s.color[1] = part.color[1];
         s.color[2] = part.color[2];
+        // C19: keep CPU copies so the deform slider can re-upload displaced positions.
+        s.basePos = m.positions;
+        s.baseEdge = m.edgeLines;
+        s.disp = part.disp;  // 3*n or empty
 
         glGenVertexArrays(1, &s.vao);
         glGenBuffers(1, &s.vboPos);
@@ -229,7 +321,7 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
         glBindVertexArray(s.vao);
         glBindBuffer(GL_ARRAY_BUFFER, s.vboPos);
         glBufferData(GL_ARRAY_BUFFER, m.positions.size() * sizeof(float), m.positions.data(),
-                     GL_STATIC_DRAW);
+                     GL_DYNAMIC_DRAW);  // dynamic: deform re-uploads
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
         glBindBuffer(GL_ARRAY_BUFFER, s.vboNrm);
@@ -237,6 +329,27 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
                      GL_STATIC_DRAW);
         glEnableVertexAttribArray(1);
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+
+        // C19: per-vertex scalar attribute (location 2). Always bound so the VAO is complete; a
+        // body without a field uploads a NaN-filled buffer (shader renders neutral). When colormap
+        // mode is off the shader ignores it entirely.
+        glGenBuffers(1, &s.vboScalar);
+        glBindBuffer(GL_ARRAY_BUFFER, s.vboScalar);
+        size_t nverts = m.positions.size() / 3;
+        if (!part.scalar.empty() && part.scalar.size() == nverts) {
+            glBufferData(GL_ARRAY_BUFFER, part.scalar.size() * sizeof(float), part.scalar.data(),
+                         GL_STATIC_DRAW);
+            s.hasScalar = true;
+            s.scalarMin = part.scalarMin;
+            s.scalarMax = part.scalarMax;
+        } else {
+            std::vector<float> nans(nverts, std::numeric_limits<float>::quiet_NaN());
+            glBufferData(GL_ARRAY_BUFFER, nans.size() * sizeof(float), nans.data(), GL_STATIC_DRAW);
+            s.hasScalar = false;
+        }
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(float), (void*)0);
+
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.ebo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, m.indices.size() * sizeof(unsigned int),
                      m.indices.data(), GL_STATIC_DRAW);
@@ -248,14 +361,14 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
         glBindVertexArray(s.edgeVao);
         glBindBuffer(GL_ARRAY_BUFFER, s.vboEdge);
         glBufferData(GL_ARRAY_BUFFER, m.edgeLines.size() * sizeof(float), m.edgeLines.data(),
-                     GL_STATIC_DRAW);
+                     GL_DYNAMIC_DRAW);
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
         glBindVertexArray(0);
 
         s.idxCount = static_cast<int>(m.indices.size());
         s.edgeVerts = static_cast<int>(m.edgeLines.size() / 3);
-        subs_.push_back(s);
+        subs_.push_back(std::move(s));
 
         if (first) { bbMin = m.bbMin; bbMax = m.bbMax; first = false; }
         else {
@@ -274,6 +387,9 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
         radius_ = std::sqrt(half.x * half.x + half.y * half.y + half.z * half.z);
         if (radius_ < 1e-6f) radius_ = 1.0f;
     }
+    // C19: apply any standing deformation scale to the freshly uploaded bodies.
+    if (deformScale_ != 0.0f)
+        for (auto& s : subs_) uploadDeformed(s);
 }
 
 void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
@@ -330,11 +446,24 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     glUniform3f(glGetUniformLocation(prog_, "uRimDir"), rimDir.x, rimDir.y, rimDir.z);
     glUniform3f(glGetUniformLocation(prog_, "uCamPos"), eye.x, eye.y, eye.z);
     int colorLoc = glGetUniformLocation(prog_, "uColor");
+    int useScalarLoc = glGetUniformLocation(prog_, "uUseScalar");
+    int sminLoc = glGetUniformLocation(prog_, "uScalarMin");
+    int smaxLoc = glGetUniformLocation(prog_, "uScalarMax");
+    // Bind the colormap LUT to texture unit 0.
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, lutTex_);
+    glUniform1i(glGetUniformLocation(prog_, "uLut"), 0);
 
     // Solids, pushed back a touch so the feature edges win the depth test on top of them.
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(1.0f, 1.0f);
     for (const auto& s : subs_) {
+        bool useScalar = colormap_ && s.hasScalar;
+        glUniform1i(useScalarLoc, useScalar ? 1 : 0);
+        if (useScalar) {
+            glUniform1f(sminLoc, s.scalarMin);
+            glUniform1f(smaxLoc, s.scalarMax);
+        }
         glUniform3f(colorLoc, s.color[0], s.color[1], s.color[2]);
         glBindVertexArray(s.vao);
         glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);

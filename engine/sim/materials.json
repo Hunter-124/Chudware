@@ -1,0 +1,51 @@
+{
+  "steel_1018": {
+    "name": "Steel 1018",
+    "E_mpa": 200000,
+    "nu": 0.29,
+    "density_g_cm3": 7.87,
+    "yield_mpa": 370
+  },
+  "alu_6061": {
+    "name": "Aluminum 6061-T6",
+    "E_mpa": 68900,
+    "nu": 0.33,
+    "density_g_cm3": 2.70,
+    "yield_mpa": 276
+  },
+  "abs": {
+    "name": "ABS",
+    "E_mpa": 2300,
+    "nu": 0.35,
+    "density_g_cm3": 1.05,
+    "yield_mpa": 40
+  },
+  "pla": {
+    "name": "PLA",
+    "E_mpa": 3500,
+    "nu": 0.36,
+    "density_g_cm3": 1.24,
+    "yield_mpa": 55
+  },
+  "petg": {
+    "name": "PETG",
+    "E_mpa": 2100,
+    "nu": 0.37,
+    "density_g_cm3": 1.27,
+    "yield_mpa": 50
+  },
+  "nylon_pa12": {
+    "name": "Nylon PA-12",
+    "E_mpa": 1600,
+    "nu": 0.39,
+    "density_g_cm3": 1.01,
+    "yield_mpa": 45
+  },
+  "ti_6al4v": {
+    "name": "Titanium Ti-6Al-4V",
+    "E_mpa": 113800,
+    "nu": 0.342,
+    "density_g_cm3": 4.43,
+    "yield_mpa": 880
+  }
+}

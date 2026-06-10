@@ -1,0 +1,37 @@
+"""Feature compilers for the document compiler (engine/doc/compiler.py).
+
+Importing this package registers every available feature compiler (each module decorates its
+entry points with ``@register(<type>)`` at import time). The compiler core imports this package
+and looks compilers up via :func:`base.get_compiler`.
+
+C09 adds dress/extrude/revolve modules here and registers them on the same registry; C10/C11
+build on the :class:`CompileResult` the core returns. New compiler modules MUST be imported below
+so their decorators run.
+"""
+
+from __future__ import annotations
+
+from .base import (
+    CompileContext,
+    CompileOutput,
+    Datum,
+    FeatureError,
+    get_compiler,
+    register,
+    registered_types,
+)
+
+# Import for side effects: each module registers its compilers on import.
+from . import datum as _datum  # noqa: F401
+from . import primitives as _primitives  # noqa: F401
+from . import script as _script  # noqa: F401
+
+__all__ = [
+    "CompileContext",
+    "CompileOutput",
+    "Datum",
+    "FeatureError",
+    "get_compiler",
+    "register",
+    "registered_types",
+]

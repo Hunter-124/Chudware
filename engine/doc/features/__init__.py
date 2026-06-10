@@ -25,6 +25,11 @@ from .base import (
 from . import datum as _datum  # noqa: F401
 from . import primitives as _primitives  # noqa: F401
 from . import script as _script  # noqa: F401
+# C09 registrations (dress-up, sketch, extrude, revolve):
+from . import dress as _dress  # noqa: F401
+from . import sketch as _sketch  # noqa: F401
+from . import extrude as _extrude  # noqa: F401
+from . import revolve as _revolve  # noqa: F401
 
 __all__ = [
     "CompileContext",

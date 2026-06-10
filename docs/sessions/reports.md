@@ -84,6 +84,20 @@ session transcripts; commit messages carry verification evidence.
   beginOverlay/endOverlay. AI_CAD_SHOT=pick gate prints "pick: body=1 kind=face id=N".
 - CMake: C15 sources in marked blocks; optional test_aicm.exe target (19 CPU checks).
 
+## C09 features (dress/sketch/extrude/revolve)
+- Registered: fillet/chamfer/shell (auto-clamp halve x3 floor 0.2mm; dangling -> feature error),
+  sketch (NO-solve compile from stored coords -> regions; pseudo-body = tool_body compound of
+  region faces, bodies list untouched), extrude (blind/mid_plane/through_all, boss/cut; draft
+  param read but DEFERRED), revolve (reserved-datum or edge-selector axis; region-line deferred).
+- Cross-feature state piggybacks ctx.datums sentinels: "_sketch_regions" Datum.obj =
+  {sketch_fid: {faces, descs, plane, all_edges}}; "_topo_owners" Datum.obj = {fid: {"face":
+  {1-based: owner}, "edge": {...}}} (last fid = current). Helpers _store/_get_topo_owners in
+  extrude.py. GAP: primitives don't store owners -> selectors on primitive-only bodies resolve
+  ownerless (all-candidates fallback). C11 should fix by storing topo maps after EVERY feature
+  in the compiler/session layer, or accept the fallback.
+- dress.py/sketch.py import private selectors._score_candidate for a hint_index tiebreak
+  fallback (margin<=0.05 but best<0.01 — geometrically identical twins). Don't rename it.
+
 ## C10 sketch solver
 - `from engine.doc.sketch_solver import solve_sketch, drag, SolveState, SketchSolution`.
 - solve_sketch(sketch_params, equations_env, warm=None) -> SketchSolution{entities (solved param

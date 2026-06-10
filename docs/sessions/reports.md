@@ -1,0 +1,60 @@
+# Landed-card integration notes (orchestrator log)
+
+Terse API facts future dispatch prompts need. Updated as cards land. Full reports live in the
+session transcripts; commit messages carry verification evidence.
+
+## C01 compiler (committed 9024c8d)
+- `from engine.doc.compiler import compile_document, CompileCache, BodyOut, CompileResult`
+- Register features: `from engine.doc.features.base import register, CompileContext,
+  CompileOutput, FeatureError`; append `from . import <mod>` to `engine/doc/features/__init__.py`
+  (designated append-only). `ctx.dim(params,key,default)`, `ctx.datum(ref)`,
+  return `CompileOutput(bodies=..., tool_body=...)`.
+- `CompileResult`: bodies (BodyOut: body_id,name,shape,color), feature_status
+  ({id,ok,ms,error,resolved,skipped,dangling_refs}), face_owners/edge_owners
+  ({body_id: {1-based idx: feature_id}}, order = build123d .faces()/.edges()),
+  tool_bodies, equations_env, cache_hits/misses. Never raises.
+- engine/doc/__init__ stays OCP-free: import compiler/tessellate/selectors modules DIRECTLY.
+
+## C02 tessellate (6fa0cad)
+- `engine.doc.tessellate`: tessellate_body(...)->BodyTess; write_aicm(bodies, extra_chunks=[]);
+  write_aicm_file; read_aicm(data)->dict(bodies: pos(n,3)f32, idx(n,3)u32, faces[{face_id,
+  first_tri,tri_count,surf_type}], edges, edge_pts, verts); scalar_chunk(body_id,name,values,
+  vmin,vmax)->bytes; disp_chunk(body_id,scale_hint,vectors); lines_chunk(name,polylines,scalars).
+- OCP 7.8: no lowercase `topods` module — use TopoDS.Face_s/Edge_s/Vertex_s.
+
+## C03 selectors (fa16389)
+- `engine.doc.selectors`: TopoInfo, ResolveResult, make_selector, resolve, resolve_region,
+  describe_faces/edges/vertices(shape, owners). owners keyed by id(ocp_obj) — valid ONLY in the
+  same scope; build from compiler's index-keyed owners by enumerating .faces()/.edges() in-scope.
+- dangling_refs string format: "<refslot>[i]: {reason}".
+
+## C04 split (f3fac91)
+- AppState aggregate: host/src/core/app_state.{h,cpp} (addLog/startSetup/tryStartWorker/
+  showPartMesh methods). Panels: host/src/ui/*. Frame loop + AI_CAD_SHOT modes: host/src/app.cpp.
+  Shared draw helpers defined in legacy_chat.cpp, declared in app_state.h.
+- GOTCHA: never add host/src to include path (math.h shadows CRT <math.h> on MSVC).
+- Exe: <BUILD_DIR>/bin/Release/AI-CAD.exe.
+
+## C05 icons (b8efce1)
+- host/assets/icons/{atlas_dark.png, atlas_light.png, atlas.json}; 123 names; single 56×4182
+  vertical strip; key "name@32"/"name@20" -> {x,y,w,h}; theme switch = swap texture, UVs constant.
+
+## C08 FEA (9391071)
+- engine/sim: mesh_step(step_path,density)->MeshResult; run_static(mesh,material,fixtures,
+  loads,on_progress)->StaticResult (npz save); run_modal(...); sim worker = `python -m
+  engine.sim.worker` (ping {pong,protocol:2,sim:true}; sim_mesh/sim_run_static/sim_run_modal/
+  sim_run_flow/sim_cancel/shutdown; sim_progress stages mesh/assemble/solve/post).
+- Study JSON accepts mesh_path OR step_path (panel should cache mesh_path).
+- tet4 ~15% stiff in bending; P2 upgrade path = skfem ElementTetP2 (later card).
+
+## C12 evaluate (this commit)
+- engine.doc.evaluate: mass_props(shape,density), measure(infos), section_props(shape,plane),
+  interference(bodies), check(shape), symmetry(shape,plane), draft_field/thickness_field/
+  curvature_field(tess, shape, ...) each -> (values, vmin, vmax, chunk_bytes).
+- Worker registration recommendations (for the card that wires eval_*): nine handlers
+  eval_mass/measure/section_props/interference/check/symmetry/draft/thickness/curvature;
+  field handlers: tessellate active body -> field fn -> write_aicm([tess], extra_chunks=[chunk])
+  to temp path -> {aicm_path}.
+- thickness uses Möller–Trumbore numpy fallback (venv lacks rtree); p25 = min-wall metric.
+  curvature via ShapeAnalysis_Surface.ValueOfUV projection. check() reports numeric BRepCheck
+  codes (no stable string labels in OCP 7.8.1).

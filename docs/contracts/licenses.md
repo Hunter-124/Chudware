@@ -1,0 +1,31 @@
+# Contract: Dependency License Ledger
+
+> Policy: the default distribution stays GPL-clean except where isolated below. Re-audit at every
+> wheelhouse rebuild (M10 gate). Today's posture: personal/local tool; revisit before any
+> commercial distribution.
+
+| dependency | license | role | posture |
+|---|---|---|---|
+| build123d | Apache-2.0 | kernel | ok |
+| cadquery-ocp / OCCT | LGPL-2.1 (OCCT excepted) | B-rep kernel | ok (dynamic) |
+| pyvista / VTK | MIT / BSD-3 | contact-sheet renders | ok |
+| trimesh | MIT | voxelize, ray casts | ok |
+| numpy / scipy | BSD-3 | math, solvers | ok |
+| matplotlib | PSF-based | colormap LUTs only | ok |
+| lib3mf | BSD-2 | 3MF export | ok |
+| anthropic / openai / mcp / httpx | MIT/Apache | providers | ok |
+| Dear ImGui | MIT | UI | ok |
+| **ImGui Test Engine** | **dual: free for OSS/personal; paid for closed-source commercial** | dev-only GUI tests | vendored behind `AI_CAD_TESTS=ON`, NEVER shipped in dist; flag before commercialization |
+| GLFW / glad / nlohmann_json / stb | zlib / MIT / MIT | host | ok |
+| Rubik / JetBrains Mono | OFL-1.1 | fonts | ok |
+| **gmsh** (M6) | **GPL-2+ (no linking exception)** | FEA tet meshing | **isolation policy**: imported ONLY inside the separate sim worker process; sim pack treated as optional; documented swap path = netgen-mesher (LGPL). If ever distributed closed-source: subprocess-only invocation or netgen switch |
+| scikit-fem (M6) | BSD-3 | FEA assembly | ok |
+| meshio (M6) | MIT | mesh I/O | ok |
+| pyamg (M6, optional) | MIT | AMG preconditioner | ok |
+| **python-solvespace** (optional backend) | **GPL-3** | sketch solver alternative | **NOT bundled by default**; in-house `nsolve` is primary. If a user enables it, it installs into their runtime venv on demand with a license notice |
+| numba (optional, M7 perf) | BSD-2 | LBM JIT | ok if added |
+
+Rules:
+- Adding any dependency requires a row here in the same change.
+- `installer/build_release.py` gains (M10) a license-manifest step that dumps wheel METADATA
+  licenses into `dist/AI-CAD/licenses/` for shipped wheels.

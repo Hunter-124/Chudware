@@ -1,0 +1,63 @@
+{
+  "schema": "aicad.asm/1",
+  "id": "a1d4f8c2-7b6e-4a90-8d3c-2e5f6a7b8c9d",
+  "name": "clamp",
+  "units": {"system": "MMGS"},
+  "components": [
+    {
+      "id": "k1",
+      "name": "base",
+      "source": {"path": "base.step+"},
+      "transform": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+      "fixed": true,
+      "suppressed": false
+    },
+    {
+      "id": "k2",
+      "name": "lid",
+      "source": {"path": "lid.step+"},
+      "transform": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 12, 0, 0, 0, 1],
+      "fixed": false,
+      "suppressed": false
+    }
+  ],
+  "mates": [
+    {
+      "id": "m1",
+      "type": "coincident",
+      "align": "aligned",
+      "suppressed": false,
+      "refs": [
+        {"component": "k1", "selector": {"kind": "face", "surf": "plane", "centroid": [0.0, 0.0, 12.0], "axis": [0.0, 0.0, 1.0], "area_or_len": 4000.0, "owner_feature": "f2", "hint_index": 0}},
+        {"component": "k2", "selector": {"kind": "face", "surf": "plane", "centroid": [0.0, 0.0, 0.0], "axis": [0.0, 0.0, -1.0], "area_or_len": 4000.0, "owner_feature": "f2", "hint_index": 1}}
+      ],
+      "value": null
+    },
+    {
+      "id": "m2",
+      "type": "concentric",
+      "align": "aligned",
+      "suppressed": false,
+      "refs": [
+        {"component": "k1", "selector": {"kind": "face", "surf": "cylinder", "centroid": [15.0, 15.0, 6.0], "axis": [0.0, 0.0, 1.0], "area_or_len": 94.2, "owner_feature": "f4", "hint_index": 0}},
+        {"component": "k2", "selector": {"kind": "face", "surf": "cylinder", "centroid": [15.0, 15.0, 3.0], "axis": [0.0, 0.0, 1.0], "area_or_len": 47.1, "owner_feature": "f3", "hint_index": 0}}
+      ],
+      "value": null
+    },
+    {
+      "id": "m3",
+      "type": "distance",
+      "align": "aligned",
+      "suppressed": false,
+      "refs": [
+        {"component": "k1", "selector": {"kind": "face", "surf": "plane", "centroid": [40.0, 0.0, 6.0], "axis": [0.0, -1.0, 0.0], "area_or_len": 480.0, "owner_feature": "f2", "hint_index": 2}},
+        {"component": "k2", "selector": {"kind": "face", "surf": "plane", "centroid": [40.0, 0.0, 14.0], "axis": [0.0, -1.0, 0.0], "area_or_len": 240.0, "owner_feature": "f2", "hint_index": 3}}
+      ],
+      "value": {"value": 0.0, "expr": null}
+    }
+  ],
+  "features": [],
+  "explode": [
+    {"component": "k2", "vector": [0.0, 0.0, 1.0], "distance": 40.0}
+  ]
+}

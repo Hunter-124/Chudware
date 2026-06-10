@@ -1,0 +1,108 @@
+# Contract: Document Ops — v1
+
+> The closed vocabulary of document mutations. The GUI submits these; **the M9 AI modeler emits
+> exactly these as its tool calls.** Design once, freeze here. Changes require a version bump.
+
+## 1. Envelope
+
+Request (`doc_apply_ops`):
+
+```json
+{"doc_id": "…", "base_revision": 17, "ops": [ Op, … ]}
+```
+
+Response (also returned by `doc_undo`/`doc_redo`/`doc_rebuild`):
+
+```json
+{
+  "revision": 18,
+  "id_map": {"$0": "f9", "$1": "e12"},
+  "tree": { …full document JSON (aicad.part/1 | aicad.asm/1)… },
+  "rebuild": {
+    "feature_status": [
+      {"id": "f1", "ok": true,  "ms": 4.2, "error": null, "dangling_refs": []},
+      {"id": "f5", "ok": false, "ms": 1.0, "error": "fillet failed: radius 12 exceeds…",
+       "dangling_refs": ["edges[1]"]}
+    ],
+    "doc_status": {"active_sketch": null, "mates": null}
+  },
+  "tess": {"aicm_path": "…\\doc_6f0c_r18.aicm",
+           "bodies": [{"body_id": 1, "name": "Body1", "color": [0.71,0.76,0.82]}]}
+}
+```
+
+- `doc_status.active_sketch`: `"under" | "full" | "over" | null`; `doc_status.mates`:
+  `"ok" | "over" | null` (assemblies).
+- `id_map` maps batch placeholders (§3) to assigned ids.
+
+## 2. Transactionality (normative)
+
+1. **Validation is atomic**: every op is schema- and referentially-validated first; any failure
+   rejects the whole batch with `invalid_op {index, reason}` and NO state change.
+2. **Application is atomic**: all ops apply, revision increments by 1 per batch.
+3. **Rebuild failures do not reject ops** (SolidWorks behavior): a feature that fails to compile
+   keeps its edited definition and reports `ok:false` in `feature_status`; downstream features
+   build against the last good body where possible.
+4. Undo/redo operate on whole batches.
+
+## 3. Id placeholders
+
+Ops that create objects may be referenced by later ops **in the same batch** as `"$<op-index>"`
+(e.g. add a sketch in op 0, add its entities with `"sketch": "$0"`). Inside
+`sketch_add_entity.constraints`, `"$self"` refers to the entity being added.
+
+## 4. Op vocabulary
+
+### Part + general
+
+| op | fields | notes |
+|---|---|---|
+| `add_feature` | `feature` (full envelope, no `id`), `before` (feature id \| null=append) | placeholder-eligible |
+| `edit_feature` | `id`, `params` (patch), `refs` (patch) | patch = present keys replace; `null` deletes an optional key |
+| `delete_feature` | `id`, `cascade:bool=false` | without cascade, fails `dependency_exists` if referenced |
+| `reorder_feature` | `id`, `before` (feature id \| null=end) | dependency-validated |
+| `set_suppressed` | `id`, `value:bool` | |
+| `rename` | `id`, `name` | |
+| `set_material` | `key` | part docs |
+| `set_units` | `system: MMGS\|IPS` | display-only |
+| `eq_set` | `name`, `expr` | create-or-update; re-validates dependents |
+| `eq_delete` | `name` | fails `eq_in_use` if referenced |
+
+### Sketch (sketch = feature id of a sketch; placeholder-eligible)
+
+| op | fields |
+|---|---|
+| `sketch_add_entity` | `sketch`, `entity` (no `id`), `constraints:[Constraint]` (inferred relations; may use `"$self"`) |
+| `sketch_edit_entity` | `sketch`, `id`, `params` (entity-field patch) |
+| `sketch_delete_entity` | `sketch`, `id` (cascades constraints touching it) |
+| `sketch_add_constraint` | `sketch`, `constraint` (no `id`) |
+| `sketch_delete_constraint` | `sketch`, `id` |
+| `sketch_set_dim` | `sketch`, `id`, `value:float` OR `expr:string` |
+
+Geometry helpers (defined now; implemented M2 — same envelope, expand to entity edits server-side):
+`sketch_trim {sketch, entity, at:[x,y]}` · `sketch_extend {sketch, entity, end}` ·
+`sketch_offset {sketch, entities:[ids], distance, side}` ·
+`sketch_convert {sketch, edges:[Selector]}` (project model edges) ·
+`sketch_mirror_entities {sketch, entities:[ids], about: line id}` ·
+`sketch_pattern_entities {sketch, entities:[ids], kind: linear|circular, …dims}`
+
+### Assembly
+
+| op | fields |
+|---|---|
+| `asm_insert_component` | `source:{path}`, `transform?` (default identity), `fixed?` (default: first=true), `name?` |
+| `asm_edit_component` | `id`, `transform?`, `name?`, `suppressed?`, `fixed?` |
+| `asm_delete_component` | `id`, `cascade:bool=false` (mates referencing it) |
+| `asm_add_mate` | `mate` (no `id`) |
+| `asm_edit_mate` | `id`, `value?`, `align?`, `suppressed?` |
+| `asm_delete_mate` | `id` |
+| `asm_set_explode` | `steps:[{component, vector:[3], distance}]` (whole-list replace) |
+
+## 5. Error codes (RPC error envelope `{code, message, detail}`)
+
+`unknown_doc` · `stale_revision {detail.current_revision}` · `invalid_op {detail.index,
+detail.reason}` · `dependency_exists {detail.dependents}` · `eq_in_use {detail.referencing}` ·
+`io_error` · `unsupported` · `internal`
+
+`stale_revision` is the optimistic-concurrency signal: the GUI must resync (`doc_tree`) and replay
+user intent. Rebuild failures are NOT errors (see §2.3).

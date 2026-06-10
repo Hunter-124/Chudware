@@ -30,6 +30,8 @@ from . import dress as _dress  # noqa: F401
 from . import sketch as _sketch  # noqa: F401
 from . import extrude as _extrude  # noqa: F401
 from . import revolve as _revolve  # noqa: F401
+# C21 registrations (import):
+from . import import_feature as _import_feature  # noqa: F401
 
 __all__ = [
     "CompileContext",

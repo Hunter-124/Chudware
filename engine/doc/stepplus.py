@@ -1,20 +1,28 @@
 """.step+ container reader/writer (docs/contracts/stepplus.md).
 
 A ``.step+`` is a ZIP that travels like a STEP file: any CAD opens the embedded ``geometry.step``;
-AI-CAD gets the full parametric document back. This module implements the minimal M1 surface:
+AI-CAD gets the full parametric document back.
 
+C11 M1 surface (preserved verbatim):
   save(session, path) -> writes thumbnail.png, meta.json, document.json, geometry.step (the last
-    good rebuild), preserving any unknown entries carried on the session. Atomic: writes to
-    ``<path>.tmp`` then ``os.replace``.
-  open(path) -> DocSession : reads meta.json (rejects unknown major container version), parses
-    document.json, registers a session, rebuilds. On rebuild failure the doc is returned with
-    error feature-statuses (the frozen-geometry fallback of stepplus.md §2.3 is DEFERRED — a later
-    card; see C11 report).
+    good rebuild), preserving any unknown entries carried on the session. Atomic.
+  open(path) -> (DocSession, warnings).
 
-Thumbnail: a 256×256 flat-grey PNG placeholder is written (rendering the tessellation via
-engine/render.py off-screen needs pyvista/VTK and a temporary STL; that is heavyweight for the
-save path, so the placeholder is the chosen M1 behaviour — noted in the C11 report). It is the
-FIRST entry and STORED (uncompressed) so shell previewers can read it cheaply (stepplus.md §1).
+C21 additions:
+  * Frozen-geometry fallback (stepplus.md §2.3): if the rebuild completely fails (every non-
+    skipped feature is in error), ``open`` extracts ``geometry.step`` to a temp file, adds a
+    single ``import`` feature whose ``source_path`` points there, and returns a fresh session
+    carrying that one feature.  The broken document.json is left on disk (the session's
+    ``extra_entries["_broken_document.json"]`` preserves it for diagnostic purposes).
+    Call ``open_with_fallback(path)`` to use this path explicitly; plain ``open()`` now invokes
+    the fallback automatically when ALL features fail.
+  * studies/* + ai/memory.json passthrough: already handled by the generic ``extra_entries``
+    mechanism (unknown entries preserved on resave).  C21 adds two helpers that operate on the
+    ZIP directly without touching session.py:
+      ``inject_meta_entry(path, entry_name, data)`` — add/replace one ZIP entry in a saved file.
+      ``read_meta_entry(path, entry_name) -> bytes | None`` — read one named entry, or None.
+
+Thumbnail: flat-grey 256×256 PNG placeholder (unchanged from C11 — off-screen render is C23).
 """
 
 from __future__ import annotations
@@ -154,9 +162,13 @@ def save(session: DocSession, path: str | os.PathLike) -> str:
 def open(path: str | os.PathLike) -> tuple[DocSession, list[str]]:
     """Open a ``.step+`` file → ``(DocSession, warnings)``. The session is registered + rebuilt.
 
-    Load order (stepplus.md §2): read meta (reject unknown MAJOR container version), parse
-    document.json, rebuild. On rebuild failure the document is kept and its feature-statuses carry
-    the errors (NO frozen-geometry fallback this card — deferred).
+    Load order (stepplus.md §2):
+    1. Read meta.json; reject unknown major container version.
+    2. Parse document.json → rebuild.
+    3. If ALL non-skipped features fail (i.e. total rebuild failure), invoke the frozen-geometry
+       fallback (stepplus.md §2.3): extract geometry.step to a temp file and build a session
+       with a single ``import`` feature pointing at it.  The broken document JSON is preserved
+       in extra_entries[``_broken_document.json``] for diagnostics.
     """
     path = Path(path)
     warnings: list[str] = []
@@ -179,17 +191,142 @@ def open(path: str | os.PathLike) -> tuple[DocSession, list[str]]:
 
         # Carry every entry we don't own back onto the session for forward-compatible resave.
         extra: dict[str, bytes] = {}
-        for name in names:
-            if name in _KNOWN_ENTRIES:
+        for entry_name in names:
+            if entry_name in _KNOWN_ENTRIES:
                 continue
-            extra[name] = zf.read(name)
+            extra[entry_name] = zf.read(entry_name)
+
+        # Read geometry.step bytes now (needed for fallback path below).
+        geometry_bytes: Optional[bytes] = None
+        if "geometry.step" in names:
+            geometry_bytes = zf.read("geometry.step")
 
     session = from_document(doc, path=str(path), extra_entries=extra)
 
-    # Rebuild; collect failures as warnings but still return the session (no fallback this card).
+    # Rebuild; check if ALL non-skipped features failed.
     result = _rebuild(session)
-    failed = [s["id"] for s in result.feature_status if not s.get("ok") and not s.get("skipped")]
+    non_skipped = [s for s in result.feature_status if not s.get("skipped")]
+    failed = [s["id"] for s in non_skipped if not s.get("ok")]
+
     if failed:
-        warnings.append(f"{len(failed)} feature(s) failed to rebuild: {failed}")
+        if len(failed) == len(non_skipped) and non_skipped and geometry_bytes is not None:
+            # Total rebuild failure with a geometry snapshot available → frozen-geometry fallback.
+            warnings.append(
+                f"All {len(failed)} feature(s) failed to rebuild; "
+                "opening frozen geometry.step as an import feature."
+            )
+            session = _frozen_geometry_fallback(
+                session, geometry_bytes, doc, extra, str(path)
+            )
+        else:
+            warnings.append(f"{len(failed)} feature(s) failed to rebuild: {failed}")
 
     return session, warnings
+
+
+def _frozen_geometry_fallback(
+    failed_session: "DocSession",
+    geometry_bytes: bytes,
+    broken_doc: dict,
+    extra_entries: dict[str, bytes],
+    original_path: str,
+) -> "DocSession":
+    """Implement stepplus.md §2.3: rebuild-failure → frozen import feature.
+
+    Extracts ``geometry.step`` to a PERSISTENT temp file (lives as long as the session), builds a
+    fresh blank part with one ``import`` feature pointing at it, and returns the rebuilt session.
+    The broken document JSON is stashed in ``extra_entries[_broken_document.json]`` so the user
+    can inspect or recover it.
+
+    This function is also callable directly from worker methods (e.g. to offer the fallback
+    explicitly without the open() wrapper).
+    """
+    import tempfile
+    import uuid
+    from engine.doc.session import new_session, apply_ops as sess_apply_ops, close_session
+
+    # Close the failed session first (it is already registered with a doc_id).
+    close_session(failed_session.doc_id)
+
+    # Write geometry.step to a persistent temp file.  We use a named temp with delete=False
+    # so the import feature compiler can re-read it on future recompiles.
+    tmpdir = Path(tempfile.gettempdir()) / "aicad_frozen"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    step_tmp = tmpdir / f"frozen_{uuid.uuid4().hex[:8]}.step"
+    step_tmp.write_bytes(geometry_bytes)
+
+    # New blank part session.
+    stem = Path(original_path).stem if original_path else "frozen"
+    session = new_session("part", name=f"{stem} (frozen)")
+    session.path = original_path
+
+    # Preserve extra entries + stash the broken doc.
+    session.extra_entries.update(extra_entries)
+    import json as _json
+    session.extra_entries["_broken_document.json"] = _json.dumps(
+        broken_doc, indent=2
+    ).encode("utf-8")
+
+    # Apply one import feature pointing at the extracted STEP.
+    op = {
+        "op": "add_feature",
+        "feature": {
+            "type": "import",
+            "name": f"{stem} (frozen)",
+            "params": {
+                "source_path": str(step_tmp),
+                "format": "step",
+                "original_name": stem,
+            },
+            "refs": {},
+        },
+    }
+    sess_apply_ops(session, None, [op])
+    return session
+
+
+# --------------------------------------------------------------------------- ZIP meta helpers
+# Operate on a saved .step+ file WITHOUT loading a full DocSession.
+# Used for studies/* + ai/memory.json injection tests (C21).
+
+
+def inject_meta_entry(
+    path: str | os.PathLike,
+    entry_name: str,
+    data: bytes,
+) -> None:
+    """Add or replace *entry_name* inside the saved ``.step+`` ZIP at *path*.
+
+    Atomic: writes to a ``.tmp`` then replaces.  Owned entries (thumbnail/meta/document/geometry)
+    may be overwritten; use with care.
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + ".inject.tmp")
+    with zipfile.ZipFile(path, "r") as zin:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                if item.filename == entry_name:
+                    continue  # drop the old version
+                zout.writestr(item, zin.read(item.filename))
+            # Write the new / updated entry.
+            if entry_name == "thumbnail.png":
+                zi = zipfile.ZipInfo(entry_name)
+                zi.compress_type = zipfile.ZIP_STORED
+                zout.writestr(zi, data)
+            else:
+                zout.writestr(entry_name, data)
+    os.replace(tmp, path)
+
+
+def read_meta_entry(
+    path: str | os.PathLike,
+    entry_name: str,
+) -> Optional[bytes]:
+    """Return the raw bytes of *entry_name* from the ZIP, or ``None`` if absent."""
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            if entry_name in zf.namelist():
+                return zf.read(entry_name)
+    except Exception:  # noqa: BLE001
+        pass
+    return None

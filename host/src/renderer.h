@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "math.h"
 #include "mesh.h"
 
 class Renderer {
@@ -15,6 +16,24 @@ public:
         Mesh mesh;
         float color[3] = {0.62f, 0.70f, 0.80f};
     };
+
+    // The camera transform for the most recently rendered orbit/view, exposed so the ID-buffer
+    // pass (render/id_pass) and the hover/selection overlays (render/overlays) can draw the same
+    // geometry in pixel-exact alignment with the studio shaded pass. (C15 picking integration.)
+    struct CameraXform {
+        Mat4 mvp;          // model->clip used by the last drawCurrent()
+        Vec3 eye;          // world-space camera position
+        Vec3 center;       // model bounding-sphere center
+        float radius = 1.0f;
+        int ssWidth = 0, ssHeight = 0;  // supersampled framebuffer size (matches colorTexture)
+    };
+    const CameraXform& camera() const { return cam_; }
+    int supersample() const { return SS; }
+
+    // Bind the studio color framebuffer + supersampled viewport so the C15 overlays can draw
+    // highlights on top of the shaded model (call right after renderOrbit, then endOverlay()).
+    void beginOverlay();
+    void endOverlay();
 
     ~Renderer();
     bool init(int width, int height, std::string& err);  // requires a current GL context
@@ -56,4 +75,5 @@ private:
     std::vector<Sub> subs_;
     Vec3 center_;
     float radius_ = 1.0f;
+    CameraXform cam_;  // updated each drawCurrent()
 };

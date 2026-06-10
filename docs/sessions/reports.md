@@ -71,6 +71,19 @@ session transcripts; commit messages carry verification evidence.
 - LIMITATION for C19 UI: walls thinner than ~1 voxel leak (under-predict drag 5-15x) — warn
   when part min-thickness < voxel size. numba/vectorized streaming = M10 perf lever.
 
+## C13 theme + C15 picking (committed together — interleaved edits in app.cpp/viewport_panel)
+- ~65 palette roles in ui::Palette (ui_theme.h); applyTheme(Theme::Dark|Light, scale);
+  Settings.theme persisted; AI_CAD_THEME env override; toU32(role) helper for draw lists.
+  View menu + Settings checkbox switch live. Light = SW-style (#F0F0F0 chrome, #0078D7 accent).
+- render/aicm_loader: DocMesh{bodies, scalars, displacements, lines}. render/id_pass: PickHit
+  {body_id, kind, topo_id}, encodeId/decodeId (8b|2b|22b), R32UI + AI_CAD_IDBUF=rgba8 fallback.
+  core/selection.h: Selection set (selectOne/toggle/clear/setObserver), SelItem.pending_resolve
+  + .selector slots for C16's doc_resolve_pick round-trip.
+- AppState::loadDocMesh(aicmPath, err) = the entry point C16 calls per rebuild; AppState::
+  selection/hover/pickStatus/pickLabel() live; Renderer gained CameraXform camera() +
+  beginOverlay/endOverlay. AI_CAD_SHOT=pick gate prints "pick: body=1 kind=face id=N".
+- CMake: C15 sources in marked blocks; optional test_aicm.exe target (19 CPU checks).
+
 ## C10 sketch solver
 - `from engine.doc.sketch_solver import solve_sketch, drag, SolveState, SketchSolution`.
 - solve_sketch(sketch_params, equations_env, warm=None) -> SketchSolution{entities (solved param

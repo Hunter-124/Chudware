@@ -32,6 +32,9 @@
 #include "win_chrome.h"
 #include "worker_client.h"
 
+#include "render/id_pass.h"
+#include "render/overlays.h"
+
 #include "core/app_state.h"
 #include "core/jobs.h"
 #include "ui/console_panel.h"
@@ -67,7 +70,15 @@ int run_gui(const char* screenshotPath) {
     float xs = 1.0f, ys = 1.0f;
     glfwGetWindowContentScale(win, &xs, &ys);
     float scale = shot ? 1.0f : xs;
-    ui::applyTheme(scale);
+
+    // Theme: honour AI_CAD_THEME env override, then persisted setting, then dark default.
+    // Applied once here; runtime toggle in the View menu calls applyTheme() again.
+    {
+        const char* envTheme = std::getenv("AI_CAD_THEME");
+        ui::Theme initTheme = ui::Theme::Dark;
+        if (envTheme && std::strcmp(envTheme, "light") == 0) initTheme = ui::Theme::Light;
+        ui::applyTheme(initTheme, scale);
+    }
     ui::Fonts fonts = ui::loadFonts(assets, scale);
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init("#version 330");
@@ -84,7 +95,16 @@ int run_gui(const char* screenshotPath) {
     std::string rerr;
     Renderer renderer;
     renderer.init(960, 720, rerr);
-    renderer.setBackground(0.17f, 0.19f, 0.23f, 0.085f, 0.095f, 0.115f);
+    // Viewport gradient driven by palette roles so it switches with the theme.
+    renderer.setBackground(ui::palette.viewportTop[0], ui::palette.viewportTop[1],
+                           ui::palette.viewportTop[2], ui::palette.viewportBottom[0],
+                           ui::palette.viewportBottom[1], ui::palette.viewportBottom[2]);
+
+    // Topology picking (C15): id pass + overlays live for the GUI's lifetime; AppState borrows
+    // them. They stay inert until a doc mesh (AICM) is loaded. Highlight colors track theme roles.
+    render::IdPass idPass;
+    render::Overlays overlays;
+    overlays.setColors(ui::palette.hoverHighlight, ui::palette.selectionHighlight);
 
     // ---------- application state (bundles what were run_gui locals) ----------
     AppState st;
@@ -97,10 +117,23 @@ int run_gui(const char* screenshotPath) {
     st.logoIcon = logoIcon;
     st.renderer = &renderer;
     st.hitLayout = &hitLayout;
+    st.idPass = &idPass;
+    st.overlays = &overlays;
 
     loadSettings(st.settings);
     // editor buffer for the system-prompt override (Settings > Agent)
     std::strncpy(st.spBuf.data(), st.settings.systemPrompt.c_str(), st.spBuf.size() - 1);
+
+    // Re-apply theme from persisted settings (env override already applied above; if a
+    // saved setting differs, the persisted value wins unless env was set).
+    {
+        const char* envTheme = std::getenv("AI_CAD_THEME");
+        if (!envTheme) {
+            // No env override — use the saved setting.
+            ui::Theme t = (st.settings.theme == "light") ? ui::Theme::Light : ui::Theme::Dark;
+            if (t != ui::activeTheme) ui::applyTheme(t, scale);
+        }
+    }
 
     // ---------- runtime + worker ----------
     st.rtReady = runtimeReady();
@@ -137,6 +170,46 @@ int run_gui(const char* screenshotPath) {
     st.wantChat = shot && shotMode && std::strcmp(shotMode, "chat") == 0;
     st.wantAssembly = shot && shotMode && std::strcmp(shotMode, "assembly") == 0;
     st.wantPlan = shot && shotMode && std::strcmp(shotMode, "plan") == 0;
+    st.wantPick = shot && shotMode && std::strcmp(shotMode, "pick") == 0;
+    if (st.wantPick) {
+        // C15 picking demo/verification: load the golden box AICM, assert its topology counts,
+        // and (in the frame loop) simulate a center-screen pick + highlight. The AICM path can be
+        // overridden via AI_CAD_AICM; otherwise we probe the repo fixture relative to the exe.
+        std::string aicm;
+        if (const char* env = std::getenv("AI_CAD_AICM")) aicm = env;
+        if (aicm.empty()) {
+            const char* candidates[] = {
+                "docs\\contracts\\fixtures\\box.aicm",
+                "..\\docs\\contracts\\fixtures\\box.aicm",
+                "..\\..\\docs\\contracts\\fixtures\\box.aicm",
+                "..\\..\\..\\docs\\contracts\\fixtures\\box.aicm",
+                "..\\..\\..\\..\\docs\\contracts\\fixtures\\box.aicm",
+            };
+            for (const char* c : candidates) {
+                FILE* f = std::fopen(c, "rb");
+                if (f) { std::fclose(f); aicm = c; break; }
+            }
+        }
+        std::string lerr;
+        if (aicm.empty() || !st.loadDocMesh(aicm, lerr)) {
+            std::fprintf(stderr, "pick: failed to load box.aicm (%s): %s\n",
+                         aicm.empty() ? "not found" : aicm.c_str(), lerr.c_str());
+        } else {
+            // Assert + print golden counts (mesh_format.md §4): 6 faces / 12 edges / 8 verts.
+            render::DocMesh probe;
+            std::string perr;
+            render::loadAicmFile(aicm, probe, perr);
+            const auto& b = probe.bodies.front();
+            std::printf("aicm: bodies=%zu name=%s verts=%u tris=%u faces=%zu edges=%zu brep_verts=%zu\n",
+                        probe.bodies.size(), b.name.c_str(), b.n_verts, b.n_tris,
+                        b.faces.size(), b.edges.size(), b.brep_verts.size());
+            if (probe.bodies.size() != 1 || b.faces.size() != 6 || b.edges.size() != 12 ||
+                b.brep_verts.size() != 8 || b.n_verts != 24 || b.n_tris != 12) {
+                std::fprintf(stderr, "pick: golden box.aicm counts mismatch!\n");
+            }
+            st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;  // iso so a face faces the camera
+        }
+    }
     if (st.wantPlan) {
         // The moment plan mode shines: the plan card is drafted and visible while the
         // first code pass is still being written.
@@ -474,6 +547,30 @@ int run_gui(const char* screenshotPath) {
         ui::drawViewportPanel(st, io, busy);
         ui::drawConsolePanel(st);
 
+        // ---------- C15 pick-shot driver: simulate a center-screen pick ----------
+        // The viewport panel rendered the id buffer for this frame's camera; pick its center,
+        // apply the selection (highlight shows from the next frame), and print the PickHit once
+        // so verification is scriptable. Runs every frame so the camera has settled by capture.
+        if (st.wantPick && st.pickReady) {
+            const Renderer::CameraXform& cam = renderer.camera();
+            int fw = cam.ssWidth / renderer.supersample();
+            int fh = cam.ssHeight / renderer.supersample();
+            render::PickHit center = idPass.pickFinal(fw / 2, fh / 2, fw, fh);
+            st.hover = render::PickHit{};
+            st.selection.selectOne(center);
+            st.pickStatus = st.pickLabel(center);
+            if (!st.pickPrinted) {
+                const char* kindName =
+                    center.kind == render::PickKind::Face ? "face" :
+                    center.kind == render::PickKind::Edge ? "edge" :
+                    center.kind == render::PickKind::Vertex ? "vertex" : "none";
+                std::printf("pick: body=%u kind=%s id=%u\n", center.body_id, kindName,
+                            center.topo_id);
+                std::fflush(stdout);
+                st.pickPrinted = true;
+            }
+        }
+
         // ---------- modals ----------
         ui::drawSettingsModal(st, busy);
 
@@ -481,7 +578,8 @@ int run_gui(const char* screenshotPath) {
         int dw, dh;
         glfwGetFramebufferSize(win, &dw, &dh);
         glViewport(0, 0, dw, dh);
-        glClearColor(0.06f, 0.07f, 0.08f, 1.0f);
+        glClearColor(ui::palette.windowBg[0], ui::palette.windowBg[1],
+                     ui::palette.windowBg[2], 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 

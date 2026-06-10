@@ -19,12 +19,15 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14, 5));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.075f, 0.086f, 0.108f, 1));
+    const auto& pal = ui::palette;
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,
+        ImVec4(pal.statusBg[0], pal.statusBg[1], pal.statusBg[2], pal.statusBg[3]));
     ImGui::Begin("##StatusBar", nullptr, hostFlags);
-    ImVec4 sc = st.statusKind == 2 ? ImVec4(0.96f, 0.55f, 0.42f, 1)
-              : st.statusKind == 1 ? ImVec4(0.95f, 0.76f, 0.42f, 1)
-              : ImVec4(ui::palette.accent[0], ui::palette.accent[1],
-                       ui::palette.accent[2], 1);
+    ImVec4 sc = st.statusKind == 2
+              ? ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1)
+              : st.statusKind == 1
+              ? ImVec4(pal.statusWarn[0], pal.statusWarn[1], pal.statusWarn[2], 1)
+              : ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 1);
     ImVec2 dp0 = ImGui::GetCursorScreenPos();
     float dr = ImGui::GetFontSize() * 0.24f;
     if (busy)  // pulse while a job runs
@@ -38,7 +41,8 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     ImGui::TextColored(sc, "%s", st.status.c_str());
     if (busy && !st.livePhase.empty()) {
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.60f, 0.67f, 1));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1));
         ImGui::Text("|  %s", st.livePhase.c_str());
         ImGui::PopStyleColor();
     }
@@ -50,7 +54,8 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
                        (st.settings.planMode ? "   [plan mode]" : "");
     float ptw = ImGui::CalcTextSize(ptxt.c_str()).x;
     ImGui::SameLine(ImGui::GetWindowWidth() - ptw - 16);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.60f, 0.67f, 1));
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1));
     ImGui::TextUnformatted(ptxt.c_str());
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered()) {

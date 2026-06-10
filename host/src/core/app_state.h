@@ -19,8 +19,11 @@
 #include "../win_chrome.h"
 #include "../worker_client.h"
 
+#include "selection.h"  // core::Selection (pulls render::PickHit; all GL-free headers)
+
 struct GLFWwindow;
 class Renderer;
+namespace render { class IdPass; class Overlays; }
 
 extern const char* kStarterCode;
 
@@ -37,6 +40,7 @@ struct Settings {
     bool planMode = true;        // draft a build plan (parts/dimensions/features) first
     int maxIters = 0;            // refine-pass cap per turn; 0 = automatic
     std::string systemPrompt;    // system prompt override; empty = built-in
+    std::string theme = "dark";  // "dark" | "light" — persisted to config.json
 };
 
 std::string appdataDir();
@@ -235,6 +239,16 @@ struct AppState {
     Renderer* renderer = nullptr;     // owned by run_gui; AppState only borrows it
     chrome::HitLayout* hitLayout = nullptr;
 
+    // ---- topology picking (C15) — id pass + overlays owned by run_gui; AppState borrows ----
+    render::IdPass* idPass = nullptr;
+    render::Overlays* overlays = nullptr;
+    bool hasDocMesh = false;            // an AICM doc is loaded into idPass/overlays
+    core::Selection selection;          // current picked topology set
+    render::PickHit hover;              // last hovered topology (transient)
+    bool pickReady = false;             // id buffer rendered this frame (safe to pickFinal)
+    // Status-bar hook: set to a human label like "Face 12 of Body1" on hover/selection change.
+    std::string pickStatus;
+
     // ---- settings + system-prompt editor buffer ----
     Settings settings;
     std::vector<char> spBuf{std::vector<char>(16384, 0)};
@@ -281,10 +295,21 @@ struct AppState {
 
     // ---- screenshot-mode flags (set from AI_CAD_SHOT in run_gui) ----
     bool wantSettings = false, wantChat = false, wantAssembly = false, wantPlan = false;
+    bool wantPick = false;  // C15: load box.aicm, simulate a center pick, print + screenshot
+    bool pickPrinted = false;  // guard so the "pick:" stdout line prints exactly once
 
     // ---- the run_gui lambdas, now methods ----
     void addLog(const std::string& s);
     void startSetup(bool force);
     void tryStartWorker();
     void showPartMesh(int sel);
+
+    // Load an AICM tessellation file into the id pass + overlays (and clear the selection).
+    // Requires a current GL context and st.idPass/st.overlays to be set. Returns false on
+    // parse/GL failure (err set); on success sets hasDocMesh. (C15; the worker that produces
+    // these per-rebuild files is wired in C16.)
+    bool loadDocMesh(const std::string& aicmPath, std::string& err);
+
+    // Build the "Face 12 of Body1" status label for a pick (empty string for an invalid hit).
+    std::string pickLabel(const render::PickHit& h) const;
 };

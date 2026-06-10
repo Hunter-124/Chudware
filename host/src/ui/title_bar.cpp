@@ -8,6 +8,7 @@
 #include "title_bar.h"
 
 #include "../core/app_state.h"
+#include "../renderer.h"
 
 // ---------------- caption buttons (shared small ui helper) ----------------
 bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
@@ -20,8 +21,10 @@ bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
         ImU32 bg = kind == BTN_CLOSE ? IM_COL32(232, 17, 35, 255) : IM_COL32(255, 255, 255, 26);
         dl->AddRectFilled(p0, ImVec2(p0.x + size.x, p0.y + size.y), bg);
     }
+    // Caption glyph color from palette so it adapts to light/dark themes.
+    const unsigned char fgv = (unsigned char)(ui::palette.captionFg * 255.0f + 0.5f);
     const ImU32 fg = (hovered && kind == BTN_CLOSE) ? IM_COL32(255, 255, 255, 255)
-                                                    : IM_COL32(226, 232, 240, 235);
+                                                    : IM_COL32(fgv, fgv, fgv, 235);
     const ImVec2 c(p0.x + size.x * 0.5f, p0.y + size.y * 0.5f);
     const float s = h * 0.16f;  // glyph half-size
     const float th = 1.4f;
@@ -64,7 +67,9 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14.0f, 12.0f));
     const float barH = ImGui::GetFrameHeight();
     hitLayout.titleBarHeight = (int)barH;
-    ImGui::PushStyleColor(ImGuiCol_MenuBarBg, ImVec4(0.110f, 0.125f, 0.157f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_MenuBarBg,
+        ImVec4(ui::palette.headerBg[0], ui::palette.headerBg[1],
+               ui::palette.headerBg[2], ui::palette.headerBg[3]));
     if (ImGui::BeginMainMenuBar()) {
         // brand mark on the left (draggable caption around it)
         const float iconH = barH * 0.52f;
@@ -100,6 +105,21 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             ImGui::MenuItem("Design / Chat", nullptr, &st.showDesign);
             ImGui::MenuItem("Viewport", nullptr, &st.showViewport);
             ImGui::MenuItem("Console", nullptr, &st.showConsole);
+            ImGui::Separator();
+            // Theme toggle — switches between dark and light palettes at runtime.
+            bool isLight = (ui::activeTheme == ui::Theme::Light);
+            if (ImGui::MenuItem("Light theme (SolidWorks-style)", nullptr, isLight)) {
+                ui::Theme next = isLight ? ui::Theme::Dark : ui::Theme::Light;
+                ui::applyTheme(next, st.scale);
+                st.settings.theme = (next == ui::Theme::Light) ? "light" : "dark";
+                saveSettings(st.settings);
+                // Sync viewport gradient to the new palette.
+                if (st.renderer)
+                    st.renderer->setBackground(
+                        ui::palette.viewportTop[0], ui::palette.viewportTop[1],
+                        ui::palette.viewportTop[2], ui::palette.viewportBottom[0],
+                        ui::palette.viewportBottom[1], ui::palette.viewportBottom[2]);
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Reset layout")) st.resetLayout = true;
             ImGui::EndMenu();

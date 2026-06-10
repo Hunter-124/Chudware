@@ -18,9 +18,18 @@
 
 // ============================ shared small-UI helpers ============================
 bool primaryButton(const char* label, const ImVec2& size) {
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.176f, 0.831f, 0.749f, 1));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.31f, 0.90f, 0.82f, 1));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.10f, 0.69f, 0.61f, 1));
+    const auto& p = ui::palette;
+    // Primary button always uses the accent color regardless of theme.
+    ImGui::PushStyleColor(ImGuiCol_Button,
+        ImVec4(p.accent[0], p.accent[1], p.accent[2], 1));
+    // Hovered: lighten for dark theme, darken for light (just brighten accent channel).
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+        ImVec4(p.accent[0]*1.15f > 1.f ? 1.f : p.accent[0]*1.15f,
+               p.accent[1]*1.08f > 1.f ? 1.f : p.accent[1]*1.08f,
+               p.accent[2]*1.08f > 1.f ? 1.f : p.accent[2]*1.08f, 1));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+        ImVec4(p.accentDim[0], p.accentDim[1], p.accentDim[2], 1));
+    // Text on the accent button: dark for light-themed accent, dark for teal accent.
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.04f, 0.10f, 0.10f, 1));
     bool r = ImGui::Button(label, size);
     ImGui::PopStyleColor(4);
@@ -41,7 +50,9 @@ void dimText(const char* t) {
 
 // A small pill button that highlights when its section is expanded.
 bool toggleChip(const char* label, bool active) {
-    if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.176f, 0.831f, 0.749f, 0.30f));
+    if (active) ImGui::PushStyleColor(ImGuiCol_Button,
+        ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1],
+               ui::palette.chipBg[2], ui::palette.chipBg[3]));
     bool clicked = ImGui::SmallButton(label);
     if (active) ImGui::PopStyleColor();
     return clicked;
@@ -63,24 +74,30 @@ void drawCodeBox(const char* id, const std::string& code, ImFont* mono, float ma
 
 // Colored unified-diff view (+ green / - red / @@ blue) in a scrolling box.
 void drawDiffBox(const char* id, const std::string& diff, ImFont* mono, float maxH) {
+    const auto& p = ui::palette;
     int lines = 1;
     for (char c : diff) if (c == '\n') ++lines;
     if (mono) ImGui::PushFont(mono);
     float lh = ImGui::GetTextLineHeightWithSpacing();
     float h = lh * (float)lines + 10.0f;
     if (h > maxH) h = maxH;
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.055f, 0.065f, 0.085f, 1));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImVec4(p.codeBg[0], p.codeBg[1], p.codeBg[2], p.codeBg[3]));
     ImGui::BeginChild(id, ImVec2(0, h), ImGuiChildFlags_Border,
                       ImGuiWindowFlags_HorizontalScrollbar);
     size_t start = 0;
     while (start <= diff.size()) {
         size_t nl = diff.find('\n', start);
         std::string ln = diff.substr(start, nl == std::string::npos ? std::string::npos : nl - start);
-        ImVec4 col(0.78f, 0.82f, 0.88f, 1);
-        if (ln.rfind("+++", 0) == 0 || ln.rfind("---", 0) == 0) col = ImVec4(0.60f, 0.66f, 0.74f, 1);
-        else if (ln.rfind("@@", 0) == 0) col = ImVec4(0.45f, 0.74f, 0.96f, 1);
-        else if (!ln.empty() && ln[0] == '+') col = ImVec4(0.46f, 0.86f, 0.55f, 1);
-        else if (!ln.empty() && ln[0] == '-') col = ImVec4(0.96f, 0.50f, 0.50f, 1);
+        ImVec4 col(p.diffDefault[0], p.diffDefault[1], p.diffDefault[2], 1);
+        if (ln.rfind("+++", 0) == 0 || ln.rfind("---", 0) == 0)
+            col = ImVec4(p.diffHdr[0], p.diffHdr[1], p.diffHdr[2], 1);
+        else if (ln.rfind("@@", 0) == 0)
+            col = ImVec4(p.diffHunk[0], p.diffHunk[1], p.diffHunk[2], 1);
+        else if (!ln.empty() && ln[0] == '+')
+            col = ImVec4(p.diffAdd[0], p.diffAdd[1], p.diffAdd[2], 1);
+        else if (!ln.empty() && ln[0] == '-')
+            col = ImVec4(p.diffDel[0], p.diffDel[1], p.diffDel[2], 1);
         ImGui::TextColored(col, "%s", ln.empty() ? " " : ln.c_str());
         if (nl == std::string::npos) break;
         start = nl + 1;
@@ -92,9 +109,12 @@ void drawDiffBox(const char* id, const std::string& diff, ImFont* mono, float ma
 
 // Dim, wrapped prose (reasoning / notes) in a scrolling box.
 void drawProseBox(const char* id, const std::string& text, float maxH) {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.085f, 0.10f, 0.13f, 1));
+    const auto& p = ui::palette;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImVec4(p.proseBg[0], p.proseBg[1], p.proseBg[2], p.proseBg[3]));
     ImGui::BeginChild(id, ImVec2(0, maxH), ImGuiChildFlags_Border);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.74f, 0.80f, 1));
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(p.proseText[0], p.proseText[1], p.proseText[2], 1));
     ImGui::TextWrapped("%s", text.c_str());
     ImGui::PopStyleColor();
     ImGui::EndChild();
@@ -105,8 +125,10 @@ void drawProseBox(const char* id, const std::string& text, float maxH) {
 // the per-pair overlap volumes (red) and clearance gaps (dim) below it.
 void drawFitReadout(const FitReport& fit, bool detailed) {
     if (!fit.present) return;
-    const ImVec4 good(0.46f, 0.86f, 0.55f, 1), bad(0.96f, 0.55f, 0.5f, 1),
-        dim(0.62f, 0.66f, 0.72f, 1);
+    const auto& p = ui::palette;
+    const ImVec4 good(p.fitOk[0], p.fitOk[1], p.fitOk[2], 1);
+    const ImVec4 bad(p.fitBad[0], p.fitBad[1], p.fitBad[2], 1);
+    const ImVec4 dim(p.fitDim[0], p.fitDim[1], p.fitDim[2], 1);
     ImGui::TextColored(fit.ok ? good : bad, "%s  %s", fit.ok ? "[fits]" : "[clash]",
                        fit.summary.empty() ? (fit.ok ? "No interference" : "Interference")
                                            : fit.summary.c_str());
@@ -129,14 +151,18 @@ void drawFitReadout(const FitReport& fit, bool detailed) {
 // committed dimensions (mono) and feature bullets — the agent's blueprint, shown before
 // any code runs so the user can see (and steer) what is about to be built.
 void drawPlanCard(const PlanInfo& plan, const ui::Fonts& fonts) {
-    const ImVec4 accent(ui::palette.accent[0], ui::palette.accent[1], ui::palette.accent[2], 1);
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.071f, 0.102f, 0.110f, 1));
+    const auto& pal = ui::palette;
+    const ImVec4 accent(pal.accent[0], pal.accent[1], pal.accent[2], 1);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImVec4(pal.planCardBg[0], pal.planCardBg[1], pal.planCardBg[2], pal.planCardBg[3]));
     ImGui::BeginChild("##plancard", ImVec2(0, 0),
                       ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 w0 = ImGui::GetWindowPos();
+    // Accent bar: use the same accent color with alpha from planAccentBar role.
     dl->AddRectFilled(w0, ImVec2(w0.x + 3.0f, w0.y + ImGui::GetWindowHeight()),
-                      IM_COL32(45, 212, 191, 150));
+                      ui::Palette::toU32(pal.accent) & 0x00FFFFFFu |
+                      ((uint32_t)(unsigned char)pal.planAccentBar << 24));
     ImGui::PushFont(fonts.medium);
     ImGui::TextColored(accent, "Build plan");
     if (!plan.name.empty()) {
@@ -159,12 +185,14 @@ void drawPlanCard(const PlanInfo& plan, const ui::Fonts& fonts) {
         if (!p.purpose.empty()) dimText(p.purpose.c_str());
         if (!p.dims.empty()) {
             ImGui::PushFont(fonts.mono);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.64f, 0.72f, 0.78f, 1));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(pal.planDims[0], pal.planDims[1], pal.planDims[2], 1));
             ImGui::TextWrapped("%s  (mm)", p.dims.c_str());
             ImGui::PopStyleColor();
             ImGui::PopFont();
         }
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.64f, 0.70f, 1));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(pal.planFeature[0], pal.planFeature[1], pal.planFeature[2], 1));
         for (const auto& f : p.features) {
             ImGui::Bullet();
             ImGui::SameLine();
@@ -184,7 +212,9 @@ void drawPlanCard(const PlanInfo& plan, const ui::Fonts& fonts) {
 // One line "Parts: a, b, c" with each name tinted its assembly color.
 void drawPartsLine(const std::vector<PartInfo>& parts) {
     if (parts.empty()) return;
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.66f, 0.72f, 1));
+    const auto& p = ui::palette;
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(p.partsDim[0], p.partsDim[1], p.partsDim[2], 1));
     ImGui::TextUnformatted("Parts:");
     ImGui::PopStyleColor();
     for (size_t i = 0; i < parts.size(); ++i) {
@@ -215,13 +245,18 @@ void drawDesignPanel(AppState& st, bool busy, bool canRun) {
 
         if (!st.workerStarted) {
             ImGui::Dummy(ImVec2(0, 6));
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.20f, 0.13f, 0.10f, 1));
+            const auto& pal = ui::palette;
+            ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                ImVec4(pal.setupWarnBg[0], pal.setupWarnBg[1],
+                       pal.setupWarnBg[2], pal.setupWarnBg[3]));
             ImGui::BeginChild("setup", ImVec2(0, 132), ImGuiChildFlags_Border);
             if (st.setupRunning.load()) {
-                ImGui::TextColored(ImVec4(0.98f, 0.78f, 0.45f, 1), "Setting up runtime...");
+                ImGui::TextColored(ImVec4(pal.statusWarn[0], pal.statusWarn[1],
+                                         pal.statusWarn[2], 1), "Setting up runtime...");
                 dimText("First run installs an isolated Python + build123d (~once).");
             } else {
-                ImGui::TextColored(ImVec4(0.98f, 0.7f, 0.5f, 1), "Runtime not ready");
+                ImGui::TextColored(ImVec4(pal.statusWarn[0], pal.statusWarn[1],
+                                         pal.statusWarn[2], 1), "Runtime not ready");
                 dimText("Run the packaged build (dist) or install.ps1 so the engine can "
                         "self-install, then use Repair runtime.");
                 if (ImGui::Button("Try setup now")) st.startSetup(false);
@@ -302,8 +337,8 @@ void drawDesignPanel(AppState& st, bool busy, bool canRun) {
             float chatH = ImGui::GetContentRegionAvail().y - inputH - buildReserve;
             if (chatH < 130.0f) chatH = 130.0f;
             ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_Border);
-            const ImVec4 accentCol(ui::palette.accent[0], ui::palette.accent[1],
-                                   ui::palette.accent[2], 1);
+            const auto& pal = ui::palette;
+            const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
             const float logW = ImGui::GetContentRegionAvail().x;
             for (size_t mi = 0; mi < st.chat.size(); ++mi) {
                 ChatMsg& m = st.chat[mi];
@@ -311,9 +346,11 @@ void drawDesignPanel(AppState& st, bool busy, bool canRun) {
                 if (m.fromUser) {
                     // user turn: a soft accent-tinted bubble
                     ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                                          ImVec4(0.176f, 0.831f, 0.749f, 0.07f));
+                        ImVec4(pal.userBubbleBg[0], pal.userBubbleBg[1],
+                               pal.userBubbleBg[2], pal.userBubbleBg[3]));
                     ImGui::PushStyleColor(ImGuiCol_Border,
-                                          ImVec4(0.176f, 0.831f, 0.749f, 0.22f));
+                        ImVec4(pal.userBubbleBorder[0], pal.userBubbleBorder[1],
+                               pal.userBubbleBorder[2], pal.userBubbleBorder[3]));
                     ImGui::BeginChild("##umsg", ImVec2(0, 0),
                                       ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
                     ImGui::PushFont(fonts.medium);
@@ -327,14 +364,17 @@ void drawDesignPanel(AppState& st, bool busy, bool canRun) {
                     continue;
                 }
                 ImGui::PushFont(fonts.medium);
-                ImGui::TextColored(ImVec4(0.78f, 0.82f, 0.90f, 1), "Assistant");
+                ImGui::TextColored(ImVec4(pal.assistantName[0], pal.assistantName[1],
+                                         pal.assistantName[2], 1), "Assistant");
                 ImGui::PopFont();
                 if (m.plan.present) drawPlanCard(m.plan, fonts);
                 if (!m.text.empty()) {
                     if (m.errKind == ERR_SYSTEM)
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.6f, 0.5f, 1));
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ImVec4(pal.errSystem[0], pal.errSystem[1], pal.errSystem[2], 1));
                     else if (m.errKind == ERR_CAD)
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.93f, 0.80f, 0.56f, 1));
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ImVec4(pal.errCad[0], pal.errCad[1], pal.errCad[2], 1));
                     ImGui::TextWrapped("%s", m.text.c_str());
                     if (m.errKind != ERR_NONE) ImGui::PopStyleColor();
                 }
@@ -344,13 +384,18 @@ void drawDesignPanel(AppState& st, bool busy, bool canRun) {
                     AgentStep& s = m.steps[si];
                     ImGui::PushID((int)si);
                     ImGui::Dummy(ImVec2(0, 2));
-                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.082f, 0.094f, 0.118f, 1));
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                        ImVec4(pal.stepCardBg[0], pal.stepCardBg[1],
+                               pal.stepCardBg[2], pal.stepCardBg[3]));
                     ImGui::BeginChild("##stepcard", ImVec2(0, 0),
                                       ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
                     // Build issues are amber, not red: a failed pass is normal mid-loop —
                     // the error goes straight back to the model, which usually fixes it.
-                    ImVec4 badge = s.ok ? (s.done ? accentCol : ImVec4(0.60f, 0.78f, 0.95f, 1))
-                                        : ImVec4(0.95f, 0.76f, 0.42f, 1);
+                    ImVec4 badge = s.ok ? (s.done ? accentCol
+                                               : ImVec4(pal.iterBuilt[0], pal.iterBuilt[1],
+                                                        pal.iterBuilt[2], 1))
+                                        : ImVec4(pal.statusWarn[0], pal.statusWarn[1],
+                                                 pal.statusWarn[2], 1);
                     const char* word = s.ok ? (s.done ? "done" : "built") : "build issue";
                     ImGui::PushFont(fonts.medium);
                     ImGui::TextColored(badge, "Iteration %d - %s", s.index + 1, word);
@@ -358,7 +403,8 @@ void drawDesignPanel(AppState& st, bool busy, bool canRun) {
                     if (!s.dims.empty()) {
                         ImGui::SameLine();
                         ImGui::PushFont(fonts.mono);
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.66f, 0.72f, 1));
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
                         ImGui::Text("%s", s.dims.c_str());
                         ImGui::PopStyleColor();
                         ImGui::PopFont();
@@ -387,7 +433,9 @@ void drawDesignPanel(AppState& st, bool busy, bool canRun) {
                     if (!s.ok && !s.error.empty()) {
                         // Calm one-line cause; the raw traceback stays behind a toggle so
                         // a self-correcting pass never reads like a crash.
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.76f, 0.42f, 1));
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ImVec4(pal.statusWarn[0], pal.statusWarn[1],
+                                   pal.statusWarn[2], 1));
                         ImGui::TextWrapped("%s", errSummary(s.error).c_str());
                         ImGui::PopStyleColor();
                         dimText("The CAD code failed this pass; the error was fed back to "
@@ -430,7 +478,8 @@ void drawDesignPanel(AppState& st, bool busy, bool canRun) {
 
                 if (m.running) {
                     ImGui::Dummy(ImVec2(0, 2));
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.66f, 0.72f, 1));
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1));
                     ImGui::TextWrapped("%s", m.liveStatus.empty() ? "working..."
                                                                   : m.liveStatus.c_str());
                     ImGui::PopStyleColor();
@@ -486,7 +535,9 @@ void drawDesignPanel(AppState& st, bool busy, bool canRun) {
         }
         if (!canRun) ImGui::EndDisabled();
         if (!st.buildErrSummary.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.76f, 0.42f, 1));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1],
+                       ui::palette.statusWarn[2], 1));
             ImGui::TextWrapped("Build issue - %s", st.buildErrSummary.c_str());
             ImGui::PopStyleColor();
             if (toggleChip(st.showBuildErr ? "Hide details" : "Details", st.showBuildErr))

@@ -10,6 +10,7 @@
 #include "settings_modal.h"
 
 #include "../core/app_state.h"
+#include "../renderer.h"
 
 namespace ui {
 
@@ -25,6 +26,31 @@ void drawSettingsModal(AppState& st, bool busy) {
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
                             ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Settings", nullptr, ImGuiWindowFlags_NoResize)) {
+        // ---- theme row (before the tab body) ----
+        {
+            bool isLight = (ui::activeTheme == ui::Theme::Light);
+            if (ImGui::Checkbox("Light theme (SolidWorks-style)", &isLight)) {
+                ui::Theme next = isLight ? ui::Theme::Light : ui::Theme::Dark;
+                ui::applyTheme(next, 1.0f);  // scale unknown here; 1.0 is fine post-init
+                st.settings.theme = (next == ui::Theme::Light) ? "light" : "dark";
+                // Viewport background sync is handled by View menu or next applyTheme call;
+                // do it here too if renderer is accessible.
+                if (st.renderer)
+                    st.renderer->setBackground(
+                        ui::palette.viewportTop[0], ui::palette.viewportTop[1],
+                        ui::palette.viewportTop[2], ui::palette.viewportBottom[0],
+                        ui::palette.viewportBottom[1], ui::palette.viewportBottom[2]);
+            }
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                                         ui::palette.textDim[2], 1));
+            ImGui::TextUnformatted("(saved immediately)");
+            ImGui::PopStyleColor();
+        }
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0, 2));
+
         // tab content scrolls in its own region; Save/Cancel stay pinned at the bottom
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
         ImGui::BeginChild("##settabsarea",

@@ -51,6 +51,12 @@ add_executable(AI-CAD
   src/ui/viewport_panel.cpp
   src/mesh.cpp
   src/renderer.cpp
+  # --- C15: AICM loader + ID-buffer picking + overlays + selection ---
+  src/render/aicm_loader.cpp
+  src/render/id_pass.cpp
+  src/render/overlays.cpp
+  src/core/selection.cpp
+  # --- end C15 ---
   src/worker_client.cpp
   src/bootstrap.cpp
   src/ui_theme.cpp
@@ -76,6 +82,16 @@ endif()
 
 set_target_properties(AI-CAD PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# --- C15: optional pure-CPU loader test (no GL/GLFW). Built with the default target set. ---
+add_executable(test_aicm
+  src/render/aicm_loader.cpp
+  src/render/test_aicm_cpp/test_aicm.cpp)
+target_include_directories(test_aicm PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/extern/glad/include)
+set_target_properties(test_aicm PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+# --- end C15 ---
 
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET AI-CAD POST_BUILD

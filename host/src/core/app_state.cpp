@@ -21,6 +21,10 @@
 #include "../mesh.h"
 #include "../renderer.h"
 
+#include "../render/aicm_loader.h"
+#include "../render/id_pass.h"
+#include "../render/overlays.h"
+
 const char* kStarterCode =
     "# build123d is imported. Assign the final solid to `result`.\n"
     "with BuildPart() as p:\n"
@@ -57,6 +61,7 @@ void loadSettings(Settings& s) {
         s.planMode = j.value("plan_mode", true);
         s.maxIters = j.value("max_iters", 0);
         s.systemPrompt = j.value("system_prompt", "");
+        s.theme = j.value("theme", "dark");
     } catch (...) {
     }
 }
@@ -80,6 +85,7 @@ void saveSettings(const Settings& s) {
     j["plan_mode"] = s.planMode;
     if (s.maxIters > 0) j["max_iters"] = s.maxIters;
     if (!s.systemPrompt.empty()) j["system_prompt"] = s.systemPrompt;
+    j["theme"] = s.theme;
     try {
         std::filesystem::create_directories(appdataDir() + "\\AI-CAD");
         std::ofstream(configPath()) << j.dump(2);
@@ -298,4 +304,72 @@ void AppState::showPartMesh(int sel) {
     Mesh m;
     if (loadBinarySTL(asmStl, m, e)) renderer->setMesh(m);
     else addLog("[err] part mesh: " + e);
+}
+
+// Convert one AICM body's tessellation to a shaded Mesh (for the studio pass + camera bounds).
+// Faithfully reuses the AICM positions/normals/indices and the per-EDGE polylines as feature
+// edges, so the shaded view matches exactly what the id pass picks.
+static Mesh meshFromBody(const render::BodyMesh& b) {
+    Mesh m;
+    m.positions = b.pos;
+    m.normals = b.nrm;
+    m.indices = b.idx;
+    // feature edges: emit every segment of every edge polyline as a line-list pair
+    for (const auto& es : b.edges) {
+        for (uint32_t i = 0; i + 1 < es.pt_count; ++i) {
+            const float* a = &b.edge_pts[(size_t)(es.first_pt + i) * 3];
+            const float* c = &b.edge_pts[(size_t)(es.first_pt + i + 1) * 3];
+            m.edgeLines.insert(m.edgeLines.end(), {a[0], a[1], a[2], c[0], c[1], c[2]});
+        }
+    }
+    // bounds from positions
+    Vec3 mn(1e30f, 1e30f, 1e30f), mx(-1e30f, -1e30f, -1e30f);
+    for (size_t i = 0; i + 2 < b.pos.size(); i += 3) {
+        float x = b.pos[i], y = b.pos[i + 1], z = b.pos[i + 2];
+        if (x < mn.x) mn.x = x; if (y < mn.y) mn.y = y; if (z < mn.z) mn.z = z;
+        if (x > mx.x) mx.x = x; if (y > mx.y) mx.y = y; if (z > mx.z) mx.z = z;
+    }
+    m.bbMin = mn; m.bbMax = mx; m.center = (mn + mx) * 0.5f;
+    m.radius = std::max(0.001f, length(mx - mn) * 0.5f);
+    return m;
+}
+
+bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err) {
+    if (!renderer || !idPass || !overlays) { err = "render objects not initialized"; return false; }
+    render::DocMesh doc;
+    if (!render::loadAicmFile(aicmPath, doc, err)) return false;
+    if (doc.bodies.empty()) { err = "AICM has no bodies"; return false; }
+
+    // Shaded view: render each body with its AICM color (camera bounds come from here).
+    std::vector<Renderer::PartMesh> pms;
+    for (const auto& b : doc.bodies) {
+        if (b.pos.empty()) continue;
+        Renderer::PartMesh pm;
+        pm.mesh = meshFromBody(b);
+        pm.color[0] = b.color[0]; pm.color[1] = b.color[1]; pm.color[2] = b.color[2];
+        pms.push_back(std::move(pm));
+    }
+    if (!pms.empty()) renderer->setMeshes(pms);
+
+    if (!idPass->setDoc(doc, err)) return false;
+    if (!overlays->setDoc(doc, err)) return false;
+
+    selection.clear();
+    hover = render::PickHit{};
+    pickStatus.clear();
+    hasDocMesh = true;
+    return true;
+}
+
+std::string AppState::pickLabel(const render::PickHit& h) const {
+    if (!h.valid()) return std::string();
+    const char* kind = "Item";
+    switch (h.kind) {
+        case render::PickKind::Face: kind = "Face"; break;
+        case render::PickKind::Edge: kind = "Edge"; break;
+        case render::PickKind::Vertex: kind = "Vertex"; break;
+        default: break;
+    }
+    return std::string(kind) + " " + std::to_string(h.topo_id) + " of Body" +
+           std::to_string(h.body_id);
 }

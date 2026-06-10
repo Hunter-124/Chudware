@@ -306,6 +306,14 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     Mat4 view = lookAt(eye, center_, up);
     Mat4 mvp = mul(proj, view);
 
+    // Publish the transform so the ID-buffer pass and overlays (C15) align to this exact frame.
+    cam_.mvp = mvp;
+    cam_.eye = eye;
+    cam_.center = center_;
+    cam_.radius = radius_;
+    cam_.ssWidth = sw_;
+    cam_.ssHeight = sh_;
+
     // Camera-relative studio rig: key over the left shoulder, fill from the right,
     // rim from behind-above so silhouettes separate from the dark background.
     Vec3 V = normalize(dir);                       // model -> camera
@@ -344,6 +352,15 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
         glDrawArrays(GL_LINES, 0, s.edgeVerts);
     }
     glBindVertexArray(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void Renderer::beginOverlay() {
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+    glViewport(0, 0, sw_, sh_);
+}
+
+void Renderer::endOverlay() {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 

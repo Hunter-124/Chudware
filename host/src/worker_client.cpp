@@ -187,7 +187,20 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
             result = j.value("result", json::object());
             return true;
         }
-        err = j.value("error", "unknown rpc error");
-        return false;
+        // Protocol-2 methods report errors as a structured envelope {code,message,detail}.
+        // Deliver it in `result` (doc_mirror checks result.contains("code")) and return true:
+        // the RPC round-trip succeeded, the METHOD reported an error. Legacy methods use a
+        // plain string error and keep the false-return contract. Transport failures stay false.
+        {
+            const auto it = j.find("error");
+            if (it != j.end() && it->is_object()) {
+                result = *it;
+                err = it->value("message", std::string("rpc error"));
+                return true;
+            }
+            err = (it != j.end() && it->is_string()) ? it->get<std::string>()
+                                                     : std::string("unknown rpc error");
+            return false;
+        }
     }
 }

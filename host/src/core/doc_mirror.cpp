@@ -32,6 +32,8 @@ OpsResponse DocMirror::parseOpsResponse(const nlohmann::json& result) {
     }
     if (result.contains("tess") && result["tess"].is_object())
         r.aicm_path = jstr(result["tess"], "aicm_path");
+    if (result.contains("id_map") && result["id_map"].is_object())
+        r.id_map = result["id_map"];   // C17: add-feature flows find their new id here
     r.ok = true;
     return r;
 }
@@ -52,7 +54,8 @@ bool DocMirror::resyncTree(WorkerClient& w) {
 
 bool DocMirror::newPart(WorkerClient& w, std::string& err) {
     nlohmann::json res;
-    if (!w.call("doc_new", {{"schema", "aicad.part/1"}}, res, err)) return false;
+    if (!w.call("doc_new", {{"kind", "part"}}, res, err)) return false;
+    if (res.contains("code")) { err = jstr(res, "message"); return false; }
     docId_ = jstr(res, "doc_id");
     revision_ = jint(res, "revision");
     tree_ = {};

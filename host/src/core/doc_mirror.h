@@ -25,6 +25,7 @@ struct OpsResponse {
     int  revision = -1;
     nlohmann::json tree;              // full doc JSON (aicad.part/1 | aicad.asm/1)
     nlohmann::json feature_status;   // [{id,ok,ms,error,dangling_refs}]
+    nlohmann::json id_map;           // {"$0":"f9", …} batch placeholder -> assigned id (C17)
     std::string aicm_path;           // tess.aicm_path (empty if no tess block)
     std::string error_code;          // set on RPC error (stale_revision, invalid_op, …)
     std::string error_message;       // human-readable error

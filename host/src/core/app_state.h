@@ -304,11 +304,17 @@ struct AppState {
     int  ribbonTab  = 0;           // 0=Features 1=Sketch 2=Evaluate 3=Simulation
     bool showFeatureTree = true;   // View > FeatureManager (C16)
 
+    // ---- PropertyManager (C17) — occupies the tree dock slot while a command is active ----
+    // Opaque pointer so app_state.h stays free of the ui/property_manager.h include (kept GL-light).
+    void* propertyManager = nullptr;   // ui::PropertyManager* (owned by run_gui)
+
     // ---- screenshot-mode flags (set from AI_CAD_SHOT in run_gui) ----
     bool wantSettings = false, wantChat = false, wantAssembly = false, wantPlan = false;
     bool wantPick   = false;  // C15: load box.aicm, simulate a center pick, print + screenshot
     bool wantRibbon = false;  // C14: ribbon screenshot mode
     bool pickPrinted = false;  // guard so the "pick:" stdout line prints exactly once
+    bool wantM1 = false;       // C17: AI_CAD_SHOT=m1 scripted integration scenario
+    bool m1ShotDone = false;   // guard so the m1 scenario runs exactly once per shot
 
     // ---- the run_gui lambdas, now methods ----
     void addLog(const std::string& s);

@@ -61,6 +61,10 @@ add_executable(AI-CAD
   src/core/doc_mirror.cpp
   src/ui/feature_tree.cpp
   # --- end C16 ---
+  # --- C17: PropertyManager + data-driven feature forms ---
+  src/ui/property_manager.cpp
+  src/ui/pm_forms.cpp
+  # --- end C17 ---
   src/worker_client.cpp
   src/bootstrap.cpp
   src/ui_theme.cpp

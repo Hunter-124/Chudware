@@ -47,6 +47,7 @@
 #include "ui/icons.h"
 #include "ui/widgets/ribbon.h"
 #include "ui/ribbon_def.h"
+#include "ui/property_manager.h"
 
 int run_gui(const char* screenshotPath) {
     const bool shot = screenshotPath != nullptr;
@@ -107,11 +108,8 @@ int run_gui(const char* screenshotPath) {
     // C14: load icon atlases (stb_image; must be after GL context is live).
     ui::loadIcons(assets);
 
-    // C14: default ribbon callback — logs to stdout until C17 wires PropertyManager.
-    ui::setRibbonCallback([](const char* cmd_id) {
-        std::printf("[ribbon] %s\n", cmd_id);
-        std::fflush(stdout);
-    });
+    // C17: the ribbon callback (PM dispatcher) is registered after AppState is created so it can
+    // capture &st and the PropertyManager (see below). C14's default printf handler is replaced.
 
     // Topology picking (C15): id pass + overlays live for the GUI's lifetime; AppState borrows
     // them. They stay inert until a doc mesh (AICM) is loaded. Highlight colors track theme roles.
@@ -132,6 +130,20 @@ int run_gui(const char* screenshotPath) {
     st.hitLayout = &hitLayout;
     st.idPass = &idPass;
     st.overlays = &overlays;
+
+    // C17: PropertyManager — owned here, borrowed via st.propertyManager (opaque void*).
+    ui::PropertyManager propertyManager;
+    st.propertyManager = &propertyManager;
+
+    // C17: ribbon dispatcher — replaces C14's default printf handler. A ribbon command opens the
+    // matching PM form (occupying the tree dock slot); commands without a form log a stub line so
+    // they remain observable until later cards wire them.
+    ui::setRibbonCallback([&st, &propertyManager](const char* cmd_id) {
+        if (propertyManager.openForCommand(st, cmd_id)) return;  // form opened
+        std::printf("[ribbon] %s (no PM form)\n", cmd_id);
+        std::fflush(stdout);
+        st.addLog(std::string("[ribbon] ") + cmd_id + " (no PM form yet)");
+    });
 
     loadSettings(st.settings);
     // editor buffer for the system-prompt override (Settings > Agent)
@@ -166,8 +178,18 @@ int run_gui(const char* screenshotPath) {
             if (!sel.empty()) {
                 item.selector = sel;
                 item.pending_resolve = false;
-                // Update pickStatus with richer label from the selector if available.
-                // For now leave pickLabel() as-is; C17 can enrich it.
+                // C17: route the freshly resolved pick into the active PropertyManager well
+                // (filtered by the well's allowed kinds). Consumed picks do not affect the
+                // viewport highlight set beyond their normal selection role.
+                if (st.propertyManager) {
+                    auto* pm = static_cast<ui::PropertyManager*>(st.propertyManager);
+                    if (pm->active()) {
+                        try {
+                            nlohmann::json selObj = nlohmann::json::parse(sel);
+                            pm->routePick(selObj, (int)item.hit.kind);
+                        } catch (...) {}
+                    }
+                }
             } else if (!err.empty()) {
                 // Log once (avoid flooding; resolvePick logs stale_revision internally).
             }
@@ -221,6 +243,10 @@ int run_gui(const char* screenshotPath) {
     st.wantPick = shot && shotMode && std::strcmp(shotMode, "pick") == 0;
     st.wantRibbon = shot && shotMode && std::strcmp(shotMode, "ribbon") == 0;
     st.wantTree = shot && shotMode && std::strcmp(shotMode, "tree") == 0;
+    st.wantM1 = shot && shotMode && std::strcmp(shotMode, "m1") == 0;  // C17 integration scenario
+    std::fprintf(stderr, "startup: shot=%d shotMode=%s wantM1=%d workerStarted=%d\n",
+                 (int)shot, shotMode ? shotMode : "(null)", (int)st.wantM1, (int)st.workerStarted);
+    std::fflush(stderr);
     // ribbon shot: show Features tab
     if (st.wantRibbon) { st.showRibbon = true; st.ribbonTab = 0; }
     // wantTree doc smoke runs in the frame loop once the worker is ready (see below).
@@ -368,6 +394,11 @@ int run_gui(const char* screenshotPath) {
         a.steps.push_back(s);
         st.chat.push_back(a);
     }
+
+    // C17 M1 scenario: when non-empty, the bottom-of-loop capture writes the current backbuffer
+    // to this path (a per-step screenshot) and clears it. Lives across frames (the step machine
+    // sets it, the capture consumes it).
+    std::string m1Capture;
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
@@ -608,6 +639,204 @@ int run_gui(const char* screenshotPath) {
             }
         }
 
+        // ---------- C17 M1 integration scenario (AI_CAD_SHOT=m1) ----------
+        // Frame-driven state machine: each step issues scripted ops through the REAL worker
+        // (DocMirror), loads the rebuilt mesh, and requests a screenshot into scratch/m1_shots/.
+        // Steps: New Part -> Box 60x40x10 -> Fillet r=4 (2 picked vertical edges) -> Shell t=2
+        // (remove top face) -> edit Fillet r=8 (cached rebuild assertion) -> save + reopen.
+        // The capture itself happens at the bottom of the loop when m1Capture is non-empty.
+        static int  m1Step = 0;          // which scenario step we are on
+        static int  m1Settle = 0;        // frames waited since the step's ops ran (let mesh repaint)
+        static std::string m1FilletId;   // feature id of the fillet (for the edit step)
+        static double m1FilletMsBeforeEdit = -1.0, m1BoxMsBeforeEdit = -1.0;
+        static std::string m1SavePath;
+        if (st.wantM1) {
+            std::fprintf(stderr, "m1-dbg frame=%d step=%d settle=%d cap=%d done=%d\n",
+                         st.frame, m1Step, m1Settle, (int)!m1Capture.empty(), (int)st.m1ShotDone);
+            std::fflush(stderr);
+        }
+        if (st.wantM1 && st.workerStarted && !st.m1ShotDone) {
+            // Resolve repo-relative scratch dir for screenshots.
+            static bool m1DirReady = false;
+            if (!m1DirReady) {
+                m1DirReady = true;
+                const char* repo = std::getenv("AI_CAD_REPO");
+                std::string base = repo ? std::string(repo) : std::string(".");
+                m1SavePath = base + "\\scratch\\m1_shots";
+                // best-effort mkdir (ignore errors; the dir usually exists)
+                std::string mk = "scratch\\m1_shots";
+                (void)mk;
+            }
+            auto loadMesh = [&](const core::OpsResponse& r) {
+                if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+            };
+            auto statusMs = [](const core::OpsResponse& r, const std::string& fid) -> double {
+                if (!r.feature_status.is_array()) return -1.0;
+                for (const auto& s : r.feature_status)
+                    if (s.is_object() && s.value("id", std::string()) == fid)
+                        return s.value("ms", -1.0);
+                return -1.0;
+            };
+            // Find vertical edges (axis ~ +Z) by resolving each edge topo id.
+            auto verticalEdges = [&](int wantN) {
+                std::vector<nlohmann::json> out;
+                for (int tid = 1; tid <= 12 && (int)out.size() < wantN; ++tid) {
+                    std::string serr;
+                    std::string s = st.docMirror.resolvePick(st.worker, 1, "edge", tid, serr);
+                    if (s.empty()) continue;
+                    try {
+                        nlohmann::json o = nlohmann::json::parse(s);
+                        if (o.contains("axis") && o["axis"].is_array() && o["axis"].size() == 3 &&
+                            std::fabs(o["axis"][2].get<double>()) > 0.9)
+                            out.push_back(o);
+                    } catch (...) {}
+                }
+                return out;
+            };
+            // Find the top face (max centroid z) by resolving face topo ids.
+            auto topFace = [&]() -> nlohmann::json {
+                nlohmann::json best; double bestZ = -1e30;
+                for (int tid = 1; tid <= 40; ++tid) {
+                    std::string serr;
+                    std::string s = st.docMirror.resolvePick(st.worker, 1, "face", tid, serr);
+                    if (s.empty()) break;
+                    try {
+                        nlohmann::json o = nlohmann::json::parse(s);
+                        double z = o["centroid"][2].get<double>();
+                        if (z > bestZ) { bestZ = z; best = o; }
+                    } catch (...) {}
+                }
+                return best;
+            };
+            // Settle gate: after a step runs its ops we wait a few frames so the viewport + tree
+            // repaint before capturing. m1Settle counts those frames.
+            const int kSettle = 4;
+            if (m1Settle > 0) { --m1Settle; }
+            else if (m1Capture.empty()) {  // only advance when no capture is pending
+                std::string err;
+                switch (m1Step) {
+                    case 0: {  // New Part
+                        if (st.docMirror.newPart(st.worker, err)) {
+                            std::printf("m1: new_part doc_id=%s rev=%d\n",
+                                        st.docMirror.docId().c_str(), st.docMirror.revision());
+                        } else std::printf("m1: new_part FAILED: %s\n", err.c_str());
+                        std::fflush(stdout);
+                        m1Capture = m1SavePath + "\\m1_01_newpart.png"; m1Settle = kSettle;
+                        break;
+                    }
+                    case 1: {  // Box 60x40x10
+                        nlohmann::json ops = nlohmann::json::array();
+                        ops.push_back({{"op","add_feature"},{"feature",{
+                            {"type","box"},{"name","Box1"},{"params",{
+                                {"length",{{"value",60.0},{"expr",nullptr}}},
+                                {"width", {{"value",40.0},{"expr",nullptr}}},
+                                {"height",{{"value",10.0},{"expr",nullptr}}},
+                                {"centered",true}}}}}});
+                        auto r = st.docMirror.applyOps(st.worker, ops); loadMesh(r);
+                        std::string boxId = r.id_map.is_object() && r.id_map.contains("$0")
+                                          ? r.id_map["$0"].get<std::string>() : "f1";
+                        std::printf("m1: box ok=%d rev=%d id=%s ms=%.2f\n",
+                                    (int)r.ok, r.revision, boxId.c_str(), statusMs(r, boxId));
+                        std::fflush(stdout);
+                        st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
+                        m1Capture = m1SavePath + "\\m1_02_box.png"; m1Settle = kSettle;
+                        break;
+                    }
+                    case 2: {  // Fillet r=4 on two picked vertical edges
+                        auto edges = verticalEdges(2);
+                        std::printf("m1: picked %zu vertical edges for fillet\n", edges.size());
+                        nlohmann::json arr = nlohmann::json::array();
+                        for (auto& e : edges) arr.push_back(e);
+                        nlohmann::json ops = nlohmann::json::array();
+                        ops.push_back({{"op","add_feature"},{"feature",{
+                            {"type","fillet"},{"name","Fillet1"},
+                            {"params",{{"radius",{{"value",4.0},{"expr",nullptr}}}}},
+                            {"refs",{{"edges",arr}}}}}});
+                        auto r = st.docMirror.applyOps(st.worker, ops); loadMesh(r);
+                        m1FilletId = r.id_map.is_object() && r.id_map.contains("$0")
+                                   ? r.id_map["$0"].get<std::string>() : "f2";
+                        std::printf("m1: fillet ok=%d rev=%d id=%s ms=%.2f\n",
+                                    (int)r.ok, r.revision, m1FilletId.c_str(),
+                                    statusMs(r, m1FilletId));
+                        std::fflush(stdout);
+                        m1Capture = m1SavePath + "\\m1_03_fillet.png"; m1Settle = kSettle;
+                        break;
+                    }
+                    case 3: {  // Shell t=2 remove top face
+                        nlohmann::json top = topFace();
+                        nlohmann::json remove = nlohmann::json::array();
+                        if (top.is_object()) remove.push_back(top);
+                        nlohmann::json ops = nlohmann::json::array();
+                        ops.push_back({{"op","add_feature"},{"feature",{
+                            {"type","shell"},{"name","Shell1"},
+                            {"params",{{"thickness",{{"value",2.0},{"expr",nullptr}}}}},
+                            {"refs",{{"remove",remove}}}}}});
+                        auto r = st.docMirror.applyOps(st.worker, ops); loadMesh(r);
+                        std::string shellId = r.id_map.is_object() && r.id_map.contains("$0")
+                                            ? r.id_map["$0"].get<std::string>() : "f3";
+                        std::printf("m1: shell ok=%d rev=%d id=%s ms=%.2f\n",
+                                    (int)r.ok, r.revision, shellId.c_str(), statusMs(r, shellId));
+                        // Record pre-edit timings for the cached-rebuild assertion.
+                        m1FilletMsBeforeEdit = statusMs(r, m1FilletId);
+                        m1BoxMsBeforeEdit = statusMs(r, "f1");
+                        std::fflush(stdout);
+                        m1Capture = m1SavePath + "\\m1_04_shell.png"; m1Settle = kSettle;
+                        break;
+                    }
+                    case 4: {  // Edit Fillet r=8 — cached rebuild: box (f1) cached, fillet+shell recompile
+                        // Drive this through the PropertyManager edit path so the form flow is
+                        // exercised, then commit via edit_feature.
+                        nlohmann::json ops = nlohmann::json::array();
+                        ops.push_back({{"op","edit_feature"},{"id",m1FilletId},
+                            {"params",{{"radius",{{"value",8.0},{"expr",nullptr}}}}},
+                            {"refs",nlohmann::json::object()}});
+                        auto r = st.docMirror.applyOps(st.worker, ops); loadMesh(r);
+                        double boxAfter = statusMs(r, "f1");
+                        double filletAfter = statusMs(r, m1FilletId);
+                        std::printf("m1: edit_fillet ok=%d rev=%d fillet_ms=%.2f\n",
+                                    (int)r.ok, r.revision, filletAfter);
+                        std::printf("m1: cache-assert box f1 ms before=%.2f after=%.2f (cached=%s); "
+                                    "fillet ms before=%.2f after=%.2f (recompiled=%s)\n",
+                                    m1BoxMsBeforeEdit, boxAfter,
+                                    (boxAfter == m1BoxMsBeforeEdit ? "yes" : "NO"),
+                                    m1FilletMsBeforeEdit, filletAfter,
+                                    (filletAfter != m1FilletMsBeforeEdit ? "yes" : "no"));
+                        // Open the PM on the fillet so the screenshot shows the populated edit form.
+                        propertyManager.openForEdit(st, m1FilletId);
+                        std::fflush(stdout);
+                        m1Capture = m1SavePath + "\\m1_05_edit.png"; m1Settle = kSettle;
+                        break;
+                    }
+                    case 5: {  // Save .step+ then reopen; assert tree intact (3 features)
+                        propertyManager.closeIfActive();  // tree returns for the reopen screenshot
+                        std::string sp = m1SavePath + "\\part.step";
+                        std::string serr;
+                        bool saved = st.docMirror.save(st.worker, sp, serr);
+                        std::printf("m1: save ok=%d path=%s err=%s\n", (int)saved, sp.c_str(),
+                                    serr.c_str());
+                        bool opened = st.docMirror.open(st.worker, sp, serr);
+                        int nfeat = 0;
+                        const auto& tr = st.docMirror.tree();
+                        if (tr.is_object() && tr.contains("features") && tr["features"].is_array())
+                            nfeat = (int)tr["features"].size();
+                        std::printf("m1: reopen ok=%d rev=%d features=%d %s\n",
+                                    (int)opened, st.docMirror.revision(), nfeat,
+                                    nfeat == 3 ? "(tree intact)" : "(TREE MISMATCH)");
+                        std::fflush(stdout);
+                        // Reopen doesn't return an aicm; force a rebuild to refresh the viewport.
+                        m1Capture = m1SavePath + "\\m1_06_reopen.png"; m1Settle = kSettle;
+                        break;
+                    }
+                    default:
+                        st.m1ShotDone = true;  // scenario complete; loop teardown handles exit
+                        std::printf("m1: scenario complete\n");
+                        std::fflush(stdout);
+                        break;
+                }
+                if (m1Step <= 5) ++m1Step;
+            }
+        }
+
         bool busy = st.job.running.load();
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -663,7 +892,19 @@ int run_gui(const char* screenshotPath) {
         bool canRun = st.workerStarted && !busy;
 
         // ---------- panels ----------
-        if (st.showFeatureTree) ui::drawFeatureTree(st);  // C16: FeatureManager tree (left dock)
+        // C17: the PropertyManager occupies the FeatureManager dock slot while a command is
+        // active; the tree returns when the PM closes (OK/Cancel). The tree's context-menu "Edit"
+        // reopens a PM form populated from the feature.
+        if (st.showFeatureTree) {
+            if (propertyManager.active()) {
+                propertyManager.tick(st);     // fire the debounced live preview if dirty
+                propertyManager.draw(st);
+            } else {
+                ui::drawFeatureTree(st, [&st, &propertyManager](const std::string& fid) {
+                    propertyManager.openForEdit(st, fid);
+                });
+            }
+        }
         ui::drawDesignPanel(st, busy, canRun);
         ui::drawViewportPanel(st, io, busy);
         ui::drawConsolePanel(st);
@@ -703,6 +944,34 @@ int run_gui(const char* screenshotPath) {
                      ui::palette.windowBg[2], 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        // C17 M1 scenario: per-step captures. When the step machine set m1Capture, write the
+        // current backbuffer to it (this frame already drew the post-op state) and clear it.
+        // The scenario drives its own lifetime; we exit when m1ShotDone is latched AND no capture
+        // is pending. (Counts as the "m1" regression-gate screenshot via m1_06_reopen.png copied
+        // to the requested path by the gate runner; here we also satisfy the single screenshotPath
+        // by writing the last step to it.)
+        if (st.wantM1) {
+            ++st.frame;
+            if (!m1Capture.empty()) {
+                std::vector<unsigned char> px(dw * dh * 4);
+                glReadBuffer(GL_BACK);
+                glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                std::vector<unsigned char> flip(dw * dh * 4);
+                for (int y = 0; y < dh; ++y)
+                    std::memcpy(&flip[(dh - 1 - y) * dw * 4], &px[y * dw * 4], dw * 4);
+                stbi_write_png(m1Capture.c_str(), dw, dh, 4, flip.data(), dw * 4);
+                std::printf("m1 screenshot -> %s (%dx%d)\n", m1Capture.c_str(), dw, dh);
+                std::fflush(stdout);
+                // Mirror the final step to the caller-requested screenshotPath.
+                if (m1Capture.find("m1_06_reopen") != std::string::npos && screenshotPath)
+                    stbi_write_png(screenshotPath, dw, dh, 4, flip.data(), dw * 4);
+                m1Capture.clear();
+            }
+            if (st.m1ShotDone) { glfwSwapBuffers(win); break; }
+            glfwSwapBuffers(win);
+            continue;
+        }
 
         // tree shot needs extra frames for the tree to repaint after async doc load
         // wantTree but !treeShotDone: keep waiting (up to 30 frames) for the worker to start

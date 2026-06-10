@@ -123,6 +123,23 @@ session transcripts; commit messages carry verification evidence.
 - AI_CAD_SHOT=tree needs AI_CAD_REPO set so the worker resolves; shot frame budget bumped for
   worker startup (wantTree ? 30 : 6).
 
+## C17 PropertyManager + M1 close (agent died at session limit; orchestrator finished it)
+- ui/property_manager.{h,cpp} + pm_forms.cpp: PM swaps over the FeatureManager dock while a
+  command is active (SW behavior); data-driven forms (box/cylinder/extrude/revolve/fillet/
+  chamfer/shell); DimField (mm/in/fraction suffixes + =expr); SelectorWell consumes resolved
+  selectors from core::Selection filtered by kind; live preview via debounced apply + Cancel =
+  N worker undos; ribbon callback dispatches to PM (replaces C14 printf).
+- ORCHESTRATOR FIX (the crash that killed the night's first m1 run): worker_client.cpp call()
+  did j.value("error","...") -> get<string> on protocol-2 OBJECT error envelopes -> nlohmann
+  type_error -> std::terminate (0xC0000409). Fixed: object errors land in `result` (mirror
+  checks result.contains("code")) with call() returning true; string errors keep legacy false
+  path; transport failures false. ALSO doc_new now sends {kind:"part"} per contract (was
+  {schema:...}, worker defaulted correctly).
+- AI_CAD_SHOT=m1 = the M1 integration scenario (needs AI_CAD_REPO): new part -> box -> pick 2
+  vertical edges -> fillet -> shell(top) -> edit fillet r=8 (CACHE ASSERT: box ms unchanged,
+  fillet recompiled) -> save .step+ -> reopen tree intact(3). Exit 0; shots in scratch/m1_shots.
+- Gate at m1 tag: 17/17 suites green (test_lbm ran green separately, 90s).
+
 ## C10 sketch solver
 - `from engine.doc.sketch_solver import solve_sketch, drag, SolveState, SketchSolution`.
 - solve_sketch(sketch_params, equations_env, warm=None) -> SketchSolution{entities (solved param

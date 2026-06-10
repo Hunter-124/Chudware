@@ -1,0 +1,1604 @@
+"""Sketch constraint solver for AI-CAD (docs/contracts/doc_schema.md §3).
+
+Parameterization
+----------------
+Every sketch entity maps to a flat slice of a float64 variable vector x:
+
+  point    : [x, y]                            (2 vars)
+  line     : [p1x, p1y, p2x, p2y]             (4 vars)
+  circle   : [cx, cy, r]                       (3 vars)
+  arc      : [cx, cy, r, a0, a1]              (5 vars, a0/a1 in degrees)
+  ellipse  : [cx, cy, rx, ry, rot]             (5 vars, rot in degrees)
+  slot     : [p1x, p1y, p2x, p2y, w]          (5 vars)
+  spline   : [x0, y0, x1, y1, ..., xN, yN]    (2*(N+1) vars)
+
+Derived handles ("e3.start", "e3.end" for arcs, etc.) map to expressions over
+the entity's variables and expose chain-rule Jacobians for residual wiring.
+
+All angular variables and dimension constraints are in DEGREES (CAD convention,
+matching doc_schema.md §0 and equations.py).
+
+Constraint → residual mapping
+------------------------------
+Each schema constraint type becomes one add_residual call, tagged with the
+constraint's id string. Driving dims use the resolved dim value; driven:true dims
+are excluded from the system and measured after solve.
+
+See docs/contracts/doc_schema.md §3 for the full constraint table.
+
+Public API (C18 sketch mode UI and C11 doc worker will call these)
+------------------------------------------------------------------
+  solve_sketch(sketch_params, equations_env, warm) -> SketchSolution
+  drag(state, handle, target_xy) -> dict   (entity coords, no commit)
+
+Both functions are pure dict-in / dict-out; no document or compiler imports.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+
+from engine.doc.nsolve import System
+
+# ---------------------------------------------------------------------------
+# Public data types
+# ---------------------------------------------------------------------------
+
+EntityCoords = Dict[str, Any]   # entity id -> solved params dict
+
+
+@dataclass
+class SolveState:
+    """Opaque warm-start state returned by solve_sketch, accepted by drag."""
+    x: np.ndarray                        # last solved variable vector
+    var_map: Dict[str, np.ndarray]       # entity id -> int64 variable indices
+    n_vars: int                          # total variable count
+
+
+@dataclass
+class SketchSolution:
+    entities: EntityCoords               # entity id -> param dict (solved coords)
+    statuses: Dict[str, str]             # entity id -> "under"|"full"|"over"
+    dof: int
+    redundant: List[str]                 # constraint ids
+    conflicting: List[str]               # constraint ids
+    converged: bool
+    state: SolveState
+
+
+# ---------------------------------------------------------------------------
+# Degree/radian helpers (all solver math in radians; dims stored in degrees)
+# ---------------------------------------------------------------------------
+
+_DEG = math.pi / 180.0
+_RAD = 180.0 / math.pi
+
+
+def _d2r(d: float) -> float:
+    return d * _DEG
+
+
+def _r2d(r: float) -> float:
+    return r * _RAD
+
+
+# ---------------------------------------------------------------------------
+# Parameterization: build variable layout from entity list
+# ---------------------------------------------------------------------------
+
+def _allocate_entity(sys: System, entity: dict) -> np.ndarray:
+    """Allocate variables for one entity; return index array."""
+    etype = entity["type"]
+    eid = entity["id"]
+
+    if etype == "point":
+        px, py = entity["p"]
+        return sys.add_vars(2, [px, py])
+
+    elif etype == "line":
+        p1x, p1y = entity["p1"]
+        p2x, p2y = entity["p2"]
+        return sys.add_vars(4, [p1x, p1y, p2x, p2y])
+
+    elif etype == "circle":
+        cx, cy = entity["center"]
+        r = entity["radius"]
+        return sys.add_vars(3, [cx, cy, r])
+
+    elif etype == "arc":
+        cx, cy = entity["center"]
+        r = entity["radius"]
+        a0 = entity["start"]   # degrees
+        a1 = entity["end"]     # degrees
+        return sys.add_vars(5, [cx, cy, r, a0, a1])
+
+    elif etype == "ellipse":
+        cx, cy = entity["center"]
+        rx = entity["rx"]
+        ry = entity["ry"]
+        rot = entity["rot"]    # degrees
+        return sys.add_vars(5, [cx, cy, rx, ry, rot])
+
+    elif etype == "slot":
+        p1x, p1y = entity["p1"]
+        p2x, p2y = entity["p2"]
+        w = entity["width"]
+        return sys.add_vars(5, [p1x, p1y, p2x, p2y, w])
+
+    elif etype == "spline":
+        pts = entity["points"]
+        init = []
+        for px, py in pts:
+            init += [px, py]
+        return sys.add_vars(len(init), init)
+
+    elif etype == "text":
+        # text has no geometric constraints; allocate position only
+        px, py = entity["p"]
+        return sys.add_vars(2, [px, py])
+
+    else:
+        raise ValueError(f"Unknown entity type: {etype!r}")
+
+
+# ---------------------------------------------------------------------------
+# Handle resolution: handle string -> (var_indices, value_fn, jacobian_fn)
+#
+# value_fn(x_sub) -> 2-vector [hx, hy] (for point handles)
+#   or scalar (for derived scalars, not needed here)
+# jacobian_fn(x_sub) -> (2, k) array (chain rule)
+#
+# For handles that ARE direct variables (e.g. e1.p1 on a line), the value and
+# Jacobian are trivially identity slices.
+# ---------------------------------------------------------------------------
+
+def _resolve_handle(
+    handle: str,
+    entities: dict,     # id -> entity dict
+    var_map: dict,      # id -> np.ndarray of variable indices
+) -> Tuple[np.ndarray, Any, Any]:
+    """Return (var_idx, val_fn, jac_fn) for a point handle.
+
+    val_fn(x_sub) -> ndarray([hx, hy])   (x_sub = x[var_idx])
+    jac_fn(x_sub) -> ndarray((2, k))
+
+    var_idx are the variables the handle DEPENDS ON (may be the full entity's
+    vars for derived handles like arc.start).
+    """
+    if "." in handle:
+        eid, sub = handle.split(".", 1)
+    else:
+        eid = handle
+        sub = None
+
+    ent = entities[eid]
+    etype = ent["type"]
+    vidx = var_map[eid]
+
+    if etype == "point":
+        # variables: [x, y]
+        # sub can be None or "p"
+        return (vidx,
+                lambda xs: np.array([xs[0], xs[1]]),
+                lambda xs: np.eye(2))
+
+    elif etype == "line":
+        # variables: [p1x, p1y, p2x, p2y]
+        if sub in (None, "p1"):
+            idx = vidx[[0, 1]]
+            return (idx,
+                    lambda xs: np.array([xs[0], xs[1]]),
+                    lambda xs: np.eye(2))
+        elif sub == "p2":
+            idx = vidx[[2, 3]]
+            return (idx,
+                    lambda xs: np.array([xs[0], xs[1]]),
+                    lambda xs: np.eye(2))
+        else:
+            raise ValueError(f"Unknown sub-handle {sub!r} for line {eid}")
+
+    elif etype == "circle":
+        # variables: [cx, cy, r]
+        if sub in (None, "center"):
+            idx = vidx[[0, 1]]
+            return (idx,
+                    lambda xs: np.array([xs[0], xs[1]]),
+                    lambda xs: np.eye(2))
+        else:
+            raise ValueError(f"Unknown sub-handle {sub!r} for circle {eid}")
+
+    elif etype == "arc":
+        # variables: [cx, cy, r, a0, a1]
+        if sub in (None, "center"):
+            idx = vidx[[0, 1]]
+            return (idx,
+                    lambda xs: np.array([xs[0], xs[1]]),
+                    lambda xs: np.eye(2))
+        elif sub == "start":
+            # start point: (cx + r*cos(a0), cy + r*sin(a0)), angles in degrees
+            # vars touched: [cx, cy, r, a0] -> indices [0,1,2,3] in full 5-var block
+            idx = vidx[[0, 1, 2, 3]]
+            def _arc_start_val(xs):
+                cx, cy, r, a0 = xs
+                a0r = a0 * _DEG
+                return np.array([cx + r * math.cos(a0r), cy + r * math.sin(a0r)])
+            def _arc_start_jac(xs):
+                cx, cy, r, a0 = xs
+                a0r = a0 * _DEG
+                # d/d[cx, cy, r, a0]
+                return np.array([
+                    [1.0, 0.0, math.cos(a0r), -r * math.sin(a0r) * _DEG],
+                    [0.0, 1.0, math.sin(a0r),  r * math.cos(a0r) * _DEG],
+                ])
+            return (idx, _arc_start_val, _arc_start_jac)
+        elif sub == "end":
+            # end point: (cx + r*cos(a1), cy + r*sin(a1))
+            idx = vidx[[0, 1, 2, 4]]
+            def _arc_end_val(xs):
+                cx, cy, r, a1 = xs
+                a1r = a1 * _DEG
+                return np.array([cx + r * math.cos(a1r), cy + r * math.sin(a1r)])
+            def _arc_end_jac(xs):
+                cx, cy, r, a1 = xs
+                a1r = a1 * _DEG
+                return np.array([
+                    [1.0, 0.0, math.cos(a1r), -r * math.sin(a1r) * _DEG],
+                    [0.0, 1.0, math.sin(a1r),  r * math.cos(a1r) * _DEG],
+                ])
+            return (idx, _arc_end_val, _arc_end_jac)
+        else:
+            raise ValueError(f"Unknown sub-handle {sub!r} for arc {eid}")
+
+    elif etype == "ellipse":
+        # variables: [cx, cy, rx, ry, rot]
+        if sub in (None, "center"):
+            idx = vidx[[0, 1]]
+            return (idx,
+                    lambda xs: np.array([xs[0], xs[1]]),
+                    lambda xs: np.eye(2))
+        else:
+            raise ValueError(f"Unknown sub-handle {sub!r} for ellipse {eid}")
+
+    elif etype == "slot":
+        # variables: [p1x, p1y, p2x, p2y, w]
+        if sub in (None, "p1"):
+            idx = vidx[[0, 1]]
+            return (idx,
+                    lambda xs: np.array([xs[0], xs[1]]),
+                    lambda xs: np.eye(2))
+        elif sub == "p2":
+            idx = vidx[[2, 3]]
+            return (idx,
+                    lambda xs: np.array([xs[0], xs[1]]),
+                    lambda xs: np.eye(2))
+        else:
+            raise ValueError(f"Unknown sub-handle {sub!r} for slot {eid}")
+
+    elif etype == "spline":
+        # variables: [x0,y0, x1,y1, ...]
+        if sub is None:
+            # whole entity -> return first point as representative
+            idx = vidx[[0, 1]]
+            return (idx,
+                    lambda xs: np.array([xs[0], xs[1]]),
+                    lambda xs: np.eye(2))
+        elif sub.startswith("p"):
+            k = int(sub[1:])
+            idx = vidx[[2*k, 2*k+1]]
+            return (idx,
+                    lambda xs: np.array([xs[0], xs[1]]),
+                    lambda xs: np.eye(2))
+        else:
+            raise ValueError(f"Unknown sub-handle {sub!r} for spline {eid}")
+
+    elif etype == "text":
+        idx = vidx[[0, 1]]
+        return (idx,
+                lambda xs: np.array([xs[0], xs[1]]),
+                lambda xs: np.eye(2))
+
+    else:
+        raise ValueError(f"Unknown entity type {etype!r} for handle {handle!r}")
+
+
+# ---------------------------------------------------------------------------
+# Constraint residual builders
+# ---------------------------------------------------------------------------
+
+def _resolve_dim(constraint: dict, equations_env: dict) -> float:
+    """Extract the float value for a dimension constraint, resolving expr if set."""
+    val_obj = constraint.get("value", {})
+    expr = val_obj.get("expr")
+    if expr is not None and expr in equations_env:
+        return float(equations_env[expr])
+    elif expr is not None:
+        # Try evaluating the expression through the equations evaluator
+        from engine.doc.equations import evaluate
+        return evaluate(expr, equations_env)
+    return float(val_obj.get("value", 0.0))
+
+
+def _add_constraint(
+    sys: System,
+    constraint: dict,
+    entities: dict,
+    var_map: dict,
+    equations_env: dict,
+) -> None:
+    """Register residual block(s) for one constraint.
+
+    driven:true dimension constraints are skipped entirely.
+    """
+    cid = constraint["id"]
+    ctype = constraint["type"]
+    refs = constraint.get("refs", [])
+    driven = constraint.get("driven", False)
+
+    # Skip driven (reference) dimensions — they are measured after solve, not enforced.
+    if driven:
+        return
+
+    if ctype == "coincident":
+        _add_coincident(sys, cid, refs[0], refs[1], entities, var_map)
+
+    elif ctype == "horizontal":
+        ref = refs[0]
+        if "." not in ref:
+            # whole entity (line): enforce p1y == p2y
+            eid = ref
+            etype = entities[eid]["type"]
+            if etype == "line":
+                vidx = var_map[eid]
+                # residual: p1y - p2y = 0
+                # vars: [p1x, p1y, p2x, p2y] -> indices [1,3]
+                idx = vidx[[1, 3]]
+                sys.add_residual(
+                    lambda xs: np.array([xs[0] - xs[1]]),
+                    idx, lambda xs: np.array([[1.0, -1.0]]), cid)
+            elif etype == "slot":
+                vidx = var_map[eid]
+                idx = vidx[[1, 3]]
+                sys.add_residual(
+                    lambda xs: np.array([xs[0] - xs[1]]),
+                    idx, lambda xs: np.array([[1.0, -1.0]]), cid)
+        else:
+            # two point handles: enforce ya == yb
+            _add_horizontal_2pts(sys, cid, refs[0], refs[1], entities, var_map)
+
+    elif ctype == "vertical":
+        ref = refs[0]
+        if "." not in ref:
+            eid = ref
+            etype = entities[eid]["type"]
+            if etype == "line":
+                vidx = var_map[eid]
+                idx = vidx[[0, 2]]
+                sys.add_residual(
+                    lambda xs: np.array([xs[0] - xs[1]]),
+                    idx, lambda xs: np.array([[1.0, -1.0]]), cid)
+            elif etype == "slot":
+                vidx = var_map[eid]
+                idx = vidx[[0, 2]]
+                sys.add_residual(
+                    lambda xs: np.array([xs[0] - xs[1]]),
+                    idx, lambda xs: np.array([[1.0, -1.0]]), cid)
+        else:
+            _add_vertical_2pts(sys, cid, refs[0], refs[1], entities, var_map)
+
+    elif ctype == "parallel":
+        _add_parallel(sys, cid, refs[0], refs[1], entities, var_map)
+
+    elif ctype == "perpendicular":
+        _add_perpendicular(sys, cid, refs[0], refs[1], entities, var_map)
+
+    elif ctype == "tangent":
+        _add_tangent(sys, cid, refs[0], refs[1], entities, var_map)
+
+    elif ctype == "equal":
+        _add_equal(sys, cid, refs[0], refs[1], entities, var_map)
+
+    elif ctype == "concentric":
+        # Two circles/arcs share the same center
+        eid0 = refs[0].split(".")[0]
+        eid1 = refs[1].split(".")[0]
+        # center of each: first two vars
+        idx0 = var_map[eid0][[0, 1]]
+        idx1 = var_map[eid1][[0, 1]]
+        combined = np.concatenate([idx0, idx1])
+        sys.add_residual(
+            lambda xs: np.array([xs[0] - xs[2], xs[1] - xs[3]]),
+            combined, lambda xs: np.array([[1, 0, -1, 0], [0, 1, 0, -1]], dtype=float), cid)
+
+    elif ctype == "midpoint":
+        # refs[0] = point handle; refs[1] = line entity
+        _add_midpoint(sys, cid, refs[0], refs[1], entities, var_map)
+
+    elif ctype == "symmetric":
+        # refs[0], refs[1] = points/entities; refs[2] = axis line
+        _add_symmetric(sys, cid, refs[0], refs[1], refs[2], entities, var_map)
+
+    elif ctype == "fix":
+        _add_fix(sys, cid, refs[0], entities, var_map)
+
+    elif ctype == "point_on":
+        _add_point_on(sys, cid, refs[0], refs[1], entities, var_map)
+
+    elif ctype == "distance":
+        d = _resolve_dim(constraint, equations_env)
+        _add_distance(sys, cid, refs[0], refs[1], d, entities, var_map)
+
+    elif ctype == "angle":
+        ang = _resolve_dim(constraint, equations_env)
+        _add_angle(sys, cid, refs[0], refs[1], ang, entities, var_map)
+
+    elif ctype == "radius":
+        r = _resolve_dim(constraint, equations_env)
+        eid = refs[0].split(".")[0]
+        etype = entities[eid]["type"]
+        if etype in ("circle", "arc"):
+            ridx = var_map[eid][[2]]
+            sys.add_residual(
+                lambda xs, _r=r: np.array([xs[0] - _r]),
+                ridx, lambda xs: np.array([[1.0]]), cid)
+
+    elif ctype == "diameter":
+        d = _resolve_dim(constraint, equations_env)
+        r = d / 2.0
+        eid = refs[0].split(".")[0]
+        etype = entities[eid]["type"]
+        if etype in ("circle", "arc"):
+            ridx = var_map[eid][[2]]
+            sys.add_residual(
+                lambda xs, _r=r: np.array([xs[0] - _r]),
+                ridx, lambda xs: np.array([[1.0]]), cid)
+
+    else:
+        # Unknown constraint type — skip silently (forward-tolerant)
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Individual constraint helpers
+# ---------------------------------------------------------------------------
+
+def _add_coincident(sys, cid, h0, h1, entities, var_map):
+    """Two point handles must be equal."""
+    idx0, vf0, jf0 = _resolve_handle(h0, entities, var_map)
+    idx1, vf1, jf1 = _resolve_handle(h1, entities, var_map)
+    # Combine indices; slice in rfunc/jfunc
+    k0 = len(idx0)
+    k1 = len(idx1)
+    combined = np.concatenate([idx0, idx1])
+
+    def _r(xs):
+        p0 = vf0(xs[:k0])
+        p1 = vf1(xs[k0:k0+k1])
+        return p0 - p1  # shape (2,)
+
+    def _j(xs):
+        J0 = jf0(xs[:k0])        # (2, k0)
+        J1 = jf1(xs[k0:k0+k1])  # (2, k1)
+        return np.hstack([J0, -J1])  # (2, k0+k1)
+
+    sys.add_residual(_r, combined, _j, cid)
+
+
+def _add_horizontal_2pts(sys, cid, h0, h1, entities, var_map):
+    """Two point handles: enforce ya == yb."""
+    idx0, vf0, jf0 = _resolve_handle(h0, entities, var_map)
+    idx1, vf1, jf1 = _resolve_handle(h1, entities, var_map)
+    k0, k1 = len(idx0), len(idx1)
+    combined = np.concatenate([idx0, idx1])
+
+    def _r(xs):
+        ya = vf0(xs[:k0])[1]
+        yb = vf1(xs[k0:k0+k1])[1]
+        return np.array([ya - yb])
+
+    def _j(xs):
+        Ja = jf0(xs[:k0])[1:2, :]   # row 1 (y) of Jacobian, shape (1, k0)
+        Jb = jf1(xs[k0:k0+k1])[1:2, :]
+        return np.hstack([Ja, -Jb])
+
+    sys.add_residual(_r, combined, _j, cid)
+
+
+def _add_vertical_2pts(sys, cid, h0, h1, entities, var_map):
+    """Two point handles: enforce xa == xb."""
+    idx0, vf0, jf0 = _resolve_handle(h0, entities, var_map)
+    idx1, vf1, jf1 = _resolve_handle(h1, entities, var_map)
+    k0, k1 = len(idx0), len(idx1)
+    combined = np.concatenate([idx0, idx1])
+
+    def _r(xs):
+        xa = vf0(xs[:k0])[0]
+        xb = vf1(xs[k0:k0+k1])[0]
+        return np.array([xa - xb])
+
+    def _j(xs):
+        Ja = jf0(xs[:k0])[0:1, :]   # row 0 (x)
+        Jb = jf1(xs[k0:k0+k1])[0:1, :]
+        return np.hstack([Ja, -Jb])
+
+    sys.add_residual(_r, combined, _j, cid)
+
+
+def _line_direction_idx(eid, var_map):
+    """Return var indices for [p1x, p1y, p2x, p2y] of a line entity."""
+    return var_map[eid][[0, 1, 2, 3]]
+
+
+def _add_parallel(sys, cid, h0, h1, entities, var_map):
+    """Two lines parallel: cross((B-A), (D-C)) = 0, i.e. (bx-ax)(dy-cy) - (by-ay)(dx-cx) = 0."""
+    eid0 = h0.split(".")[0]
+    eid1 = h1.split(".")[0]
+    assert entities[eid0]["type"] == "line" and entities[eid1]["type"] == "line"
+    idx0 = _line_direction_idx(eid0, var_map)  # [p1x,p1y,p2x,p2y]
+    idx1 = _line_direction_idx(eid1, var_map)
+    combined = np.concatenate([idx0, idx1])
+
+    def _r(xs):
+        ax, ay, bx, by = xs[0], xs[1], xs[2], xs[3]
+        cx, cy, dx, dy = xs[4], xs[5], xs[6], xs[7]
+        return np.array([(bx-ax)*(dy-cy) - (by-ay)*(dx-cx)])
+
+    def _j(xs):
+        ax, ay, bx, by = xs[0], xs[1], xs[2], xs[3]
+        cx, cy, dx, dy = xs[4], xs[5], xs[6], xs[7]
+        dax = -(dy-cy)
+        day = (dx-cx)
+        dbx = (dy-cy)
+        dby = -(dx-cx)
+        dcx = (by-ay)
+        dcy = -(bx-ax)
+        ddx = -(by-ay)
+        ddy = (bx-ax)
+        return np.array([[dax, day, dbx, dby, dcx, dcy, ddx, ddy]])
+
+    sys.add_residual(_r, combined, _j, cid)
+
+
+def _add_perpendicular(sys, cid, h0, h1, entities, var_map):
+    """Two lines perpendicular: dot((B-A),(D-C)) = 0."""
+    eid0 = h0.split(".")[0]
+    eid1 = h1.split(".")[0]
+    idx0 = _line_direction_idx(eid0, var_map)
+    idx1 = _line_direction_idx(eid1, var_map)
+    combined = np.concatenate([idx0, idx1])
+
+    def _r(xs):
+        ax, ay, bx, by = xs[0], xs[1], xs[2], xs[3]
+        cx, cy, dx, dy = xs[4], xs[5], xs[6], xs[7]
+        return np.array([(bx-ax)*(dx-cx) + (by-ay)*(dy-cy)])
+
+    def _j(xs):
+        ax, ay, bx, by = xs[0], xs[1], xs[2], xs[3]
+        cx, cy, dx, dy = xs[4], xs[5], xs[6], xs[7]
+        dax = -(dx-cx)
+        day = -(dy-cy)
+        dbx = (dx-cx)
+        dby = (dy-cy)
+        dcx = -(bx-ax)
+        dcy = -(by-ay)
+        ddx = (bx-ax)
+        ddy = (by-ay)
+        return np.array([[dax, day, dbx, dby, dcx, dcy, ddx, ddy]])
+
+    sys.add_residual(_r, combined, _j, cid)
+
+
+def _entity_center_radius_idx(eid, entities, var_map):
+    """Return (center_idx, radius_idx) for circle or arc entity."""
+    etype = entities[eid]["type"]
+    vidx = var_map[eid]
+    if etype in ("circle", "arc"):
+        return vidx[[0, 1]], vidx[2]
+    raise ValueError(f"Entity {eid} of type {etype!r} has no center/radius")
+
+
+def _add_tangent(sys, cid, h0, h1, entities, var_map):
+    """Tangency between:
+      line-circle: distance from line to circle center = radius
+      line-arc: same as line-circle
+      circle-circle (ext): |C1-C2| = r1+r2  or  |C1-C2| = |r1-r2| (internal)
+        We implement external tangency (distance = sum of radii).
+      arc-arc / arc-circle: same as circle-circle.
+    """
+    eid0 = h0.split(".")[0]
+    eid1 = h1.split(".")[0]
+    t0 = entities[eid0]["type"]
+    t1 = entities[eid1]["type"]
+
+    curved = {"circle", "arc"}
+    if t0 == "line" and t1 in curved:
+        _add_tangent_line_circle(sys, cid, eid0, eid1, entities, var_map)
+    elif t0 in curved and t1 == "line":
+        _add_tangent_line_circle(sys, cid, eid1, eid0, entities, var_map)
+    elif t0 in curved and t1 in curved:
+        _add_tangent_circle_circle(sys, cid, eid0, eid1, entities, var_map)
+    else:
+        # line-line tangent is not geometrically meaningful; skip
+        pass
+
+
+def _add_tangent_line_circle(sys, cid, line_eid, circ_eid, entities, var_map):
+    """Distance from line to circle center = radius.
+
+    line: [p1x, p1y, p2x, p2y]
+    circle/arc: [cx, cy, r, ...]
+    residual: dist(center, line) - r = 0
+    dist(P, line AB) = |(B-A) x (A-P)| / |B-A|
+    = |cross| / |BA|, where cross = (bx-ax)(ay-py) - (by-ay)(ax-px)
+    """
+    lidx = var_map[line_eid][[0, 1, 2, 3]]    # [ax,ay,bx,by]
+    cidx = var_map[circ_eid][[0, 1, 2]]        # [cx,cy,r]
+    combined = np.concatenate([lidx, cidx])
+
+    def _r(xs):
+        ax, ay, bx, by = xs[0], xs[1], xs[2], xs[3]
+        cx, cy, r = xs[4], xs[5], xs[6]
+        dxab = bx - ax
+        dyab = by - ay
+        L = math.hypot(dxab, dyab)
+        if L < 1e-14:
+            return np.array([r])
+        cross = dxab * (ay - cy) - dyab * (ax - cx)
+        dist = abs(cross) / L
+        return np.array([dist - r])
+
+    def _j(xs):
+        ax, ay, bx, by = xs[0], xs[1], xs[2], xs[3]
+        cx, cy, r = xs[4], xs[5], xs[6]
+        dxab = bx - ax
+        dyab = by - ay
+        L2 = dxab**2 + dyab**2
+        L = math.sqrt(L2) if L2 > 1e-28 else 1e-14
+        cross = dxab * (ay - cy) - dyab * (ax - cx)
+        sgn = 1.0 if cross >= 0 else -1.0
+
+        # d(cross)/d[ax,ay,bx,by,cx,cy]
+        # cross = (bx-ax)(ay-cy) - (by-ay)(ax-cx)
+        d_cross_ax = -(ay - cy) + (by - ay)
+        d_cross_ay = (bx - ax) - 0   # + (by-ay)*1 ... wait, let me redo
+        # cross = dxab*(ay-cy) - dyab*(ax-cx)
+        # d/dax = -1*(ay-cy) - (-1)*(ax-cx)*0 ... let me be careful:
+        # dxab = bx-ax, dyab = by-ay
+        # d(dxab)/dax = -1, d(dyab)/dax = 0
+        # d(cross)/dax = -1*(ay-cy) - 0*(ax-cx) - dyab*(-1) = -(ay-cy) + dyab
+        # d(cross)/day = dxab*(1) - 0 = dxab  ... wait: d(ay-cy)/day = 1
+        # cross = dxab*(ay-cy) - dyab*(ax-cx)
+        # dcross/day = dxab * 1
+        # dcross/dax = d(dxab)/dax * (ay-cy) - d(dyab)/dax * (ax-cx) - dyab*d(ax-cx)/dax
+        #            = -1*(ay-cy) - 0 - dyab*1 = -(ay-cy) - dyab
+        # Let me just compute each:
+        d_cross = {
+            'ax': -(ay-cy) - dyab,   # wait: -(ay-cy) + 0 - dyab*1
+            'ay': dxab,
+            'bx': (ay-cy),
+            'by': -(ax-cx),
+            'cx': dyab,
+            'cy': -dxab,
+        }
+        # Actually let me recompute carefully:
+        # cross = (bx-ax)*(ay-cy) - (by-ay)*(ax-cx)
+        # dcross/dax = -1*(ay-cy) - (-1)*(ax-cx) * but (ax-cx) has d/dax=1
+        #            = -(ay-cy) - (by-ay)*(-1) ... no
+        # (by-ay)*(ax-cx): d/dax = (by-ay)*1
+        # so dcross/dax = -(ay-cy) - (by-ay) = -(ay-cy) - dyab
+        # dcross/day = (bx-ax)*1 - (-1)*(ax-cx) = dxab + (ax-cx)
+        # Actually: (by-ay) has d/day = -1
+        # (by-ay)*(ax-cx): d/day = -1*(ax-cx) = -(ax-cx)
+        # dcross/day = dxab - (-(ax-cx)) = dxab + (ax-cx)  ... hmm that doesn't seem right
+        # Let me expand completely:
+        # cross = bx*ay - bx*cy - ax*ay + ax*cy - by*ax + by*cx + ay*ax - ay*cx
+        # Simplify: cross = bx*ay - bx*cy - ax*ay + ax*cy - by*ax + by*cx + ay*ax - ay*cx
+        #                 = bx*ay - bx*cy + ax*cy - by*ax + by*cx - ay*cx
+        # d/dax = -by + cy = cy - by
+        # d/day = bx - cx = bx - cx
+        # d/dbx = ay - cy
+        # d/dby = -ax + cx = cx - ax
+        # d/dcx = by - ay  ... wait: +by*cx -> d/dcx = by; -ay*cx -> d/dcx = -ay  => by-ay
+        # d/dcy = -bx + ax = ax - bx
+        d_cross2 = {
+            'ax': cy - by,
+            'ay': bx - cx,
+            'bx': ay - cy,
+            'by': cx - ax,
+            'cx': by - ay,
+            'cy': ax - bx,
+        }
+
+        # d(L)/d[ax,ay,bx,by]: L = sqrt(dxab^2 + dyab^2)
+        d_L = {
+            'ax': -dxab / L,
+            'ay': -dyab / L,
+            'bx': dxab / L,
+            'by': dyab / L,
+        }
+
+        # dist = |cross| / L  => d(dist)/d[...] = sgn * (d_cross * L - cross * d_L) / L^2
+        def _d_dist(var, is_line=True):
+            dc = d_cross2.get(var, 0.0)
+            dl = d_L.get(var, 0.0) if is_line else 0.0
+            return sgn * (dc * L - abs(cross) * dl) / L2
+
+        J = np.zeros((1, 7))
+        J[0, 0] = _d_dist('ax')
+        J[0, 1] = _d_dist('ay')
+        J[0, 2] = _d_dist('bx')
+        J[0, 3] = _d_dist('by')
+        J[0, 4] = sgn * d_cross2.get('cx', 0.0) / L   # dcx
+        J[0, 5] = sgn * d_cross2.get('cy', 0.0) / L   # dcy
+        J[0, 6] = -1.0  # d(dist - r)/dr = -1
+        return J
+
+    sys.add_residual(_r, combined, _j, cid)
+
+
+def _add_tangent_circle_circle(sys, cid, eid0, eid1, entities, var_map):
+    """External tangency: |C0-C1| - r0 - r1 = 0."""
+    idx0 = var_map[eid0][[0, 1, 2]]  # cx0,cy0,r0
+    idx1 = var_map[eid1][[0, 1, 2]]  # cx1,cy1,r1
+    combined = np.concatenate([idx0, idx1])
+
+    def _r(xs):
+        cx0, cy0, r0 = xs[0], xs[1], xs[2]
+        cx1, cy1, r1 = xs[3], xs[4], xs[5]
+        d = math.hypot(cx0 - cx1, cy0 - cy1)
+        return np.array([d - r0 - r1])
+
+    def _j(xs):
+        cx0, cy0, r0 = xs[0], xs[1], xs[2]
+        cx1, cy1, r1 = xs[3], xs[4], xs[5]
+        dx = cx0 - cx1; dy = cy0 - cy1
+        d = math.hypot(dx, dy)
+        if d < 1e-12:
+            return np.zeros((1, 6))
+        return np.array([[dx/d, dy/d, -1.0, -dx/d, -dy/d, -1.0]])
+
+    sys.add_residual(_r, combined, _j, cid)
+
+
+def _add_equal(sys, cid, h0, h1, entities, var_map):
+    """Equal length (lines) or equal radius (circles/arcs)."""
+    eid0 = h0.split(".")[0]
+    eid1 = h1.split(".")[0]
+    t0 = entities[eid0]["type"]
+    t1 = entities[eid1]["type"]
+
+    if t0 == "line" and t1 == "line":
+        # |p2-p1|_0 = |p2-p1|_1
+        idx0 = var_map[eid0][[0, 1, 2, 3]]
+        idx1 = var_map[eid1][[0, 1, 2, 3]]
+        combined = np.concatenate([idx0, idx1])
+
+        def _r(xs):
+            ax, ay, bx, by = xs[0], xs[1], xs[2], xs[3]
+            cx, cy, dx, dy = xs[4], xs[5], xs[6], xs[7]
+            L0 = math.hypot(bx-ax, by-ay)
+            L1 = math.hypot(dx-cx, dy-cy)
+            return np.array([L0 - L1])
+
+        def _j(xs):
+            ax, ay, bx, by = xs[0], xs[1], xs[2], xs[3]
+            cx, cy, dx, dy = xs[4], xs[5], xs[6], xs[7]
+            L0 = math.hypot(bx-ax, by-ay)
+            L1 = math.hypot(dx-cx, dy-cy)
+            if L0 < 1e-12: L0 = 1e-12
+            if L1 < 1e-12: L1 = 1e-12
+            dL0_a = [-(bx-ax)/L0, -(by-ay)/L0, (bx-ax)/L0, (by-ay)/L0]
+            dL1_b = [-(dx-cx)/L1, -(dy-cy)/L1, (dx-cx)/L1, (dy-cy)/L1]
+            return np.array([dL0_a + [-v for v in dL1_b]])
+
+        sys.add_residual(_r, combined, _j, cid)
+
+    elif t0 in ("circle", "arc") and t1 in ("circle", "arc"):
+        # r0 = r1
+        ridx0 = var_map[eid0][[2]]
+        ridx1 = var_map[eid1][[2]]
+        combined = np.concatenate([ridx0, ridx1])
+        sys.add_residual(
+            lambda xs: np.array([xs[0] - xs[1]]),
+            combined, lambda xs: np.array([[1.0, -1.0]]), cid)
+
+    elif t0 == "slot" and t1 == "slot":
+        # slot length p1->p2 equal
+        idx0 = var_map[eid0][[0, 1, 2, 3]]
+        idx1 = var_map[eid1][[0, 1, 2, 3]]
+        combined = np.concatenate([idx0, idx1])
+        _add_equal_length_4var(sys, cid, combined)
+
+    # else: mixed types, skip
+
+
+def _add_equal_length_4var(sys, cid, combined):
+    def _r(xs):
+        L0 = math.hypot(xs[2]-xs[0], xs[3]-xs[1])
+        L1 = math.hypot(xs[6]-xs[4], xs[7]-xs[5])
+        return np.array([L0 - L1])
+
+    def _j(xs):
+        ax, ay, bx, by = xs[0], xs[1], xs[2], xs[3]
+        cx, cy, dx, dy = xs[4], xs[5], xs[6], xs[7]
+        L0 = math.hypot(bx-ax, by-ay)
+        L1 = math.hypot(dx-cx, dy-cy)
+        if L0 < 1e-12: L0 = 1e-12
+        if L1 < 1e-12: L1 = 1e-12
+        return np.array([[-(bx-ax)/L0, -(by-ay)/L0, (bx-ax)/L0, (by-ay)/L0,
+                           (dx-cx)/L1, (dy-cy)/L1, -(dx-cx)/L1, -(dy-cy)/L1]])
+
+    sys.add_residual(_r, combined, _j, cid)
+
+
+def _add_midpoint(sys, cid, point_handle, line_handle, entities, var_map):
+    """Point P is at the midpoint of line entity."""
+    pidx, pvf, pjf = _resolve_handle(point_handle, entities, var_map)
+    eid = line_handle.split(".")[0]
+    assert entities[eid]["type"] == "line"
+    lidx = var_map[eid][[0, 1, 2, 3]]   # [ax,ay,bx,by]
+    kp = len(pidx)
+    combined = np.concatenate([pidx, lidx])
+
+    def _r(xs):
+        P = pvf(xs[:kp])
+        ax, ay, bx, by = xs[kp], xs[kp+1], xs[kp+2], xs[kp+3]
+        mx = (ax + bx) / 2.0
+        my = (ay + by) / 2.0
+        return np.array([P[0] - mx, P[1] - my])
+
+    def _j(xs):
+        Jp = pjf(xs[:kp])   # (2, kp)
+        # d(P - mid)/d[ax,ay,bx,by] = [[-0.5,0,-0.5,0],[0,-0.5,0,-0.5]]
+        Jl = np.array([[-0.5, 0.0, -0.5, 0.0],
+                        [0.0, -0.5, 0.0, -0.5]])
+        return np.hstack([Jp, Jl])
+
+    sys.add_residual(_r, combined, _j, cid)
+
+
+def _add_symmetric(sys, cid, h0, h1, axis_handle, entities, var_map):
+    """Points h0 and h1 are symmetric about the axis line.
+
+    The axis line's mirror: let the axis be defined by its p1/p2.
+    For a point P to be symmetric to Q about line AB:
+      1. midpoint M = (P+Q)/2 lies on line AB
+      2. (P-Q) is perpendicular to (B-A)
+    Two scalar residuals.
+    """
+    idx0, vf0, jf0 = _resolve_handle(h0, entities, var_map)
+    idx1, vf1, jf1 = _resolve_handle(h1, entities, var_map)
+    eid_ax = axis_handle.split(".")[0]
+    assert entities[eid_ax]["type"] == "line"
+    aidx = var_map[eid_ax][[0, 1, 2, 3]]   # [ax,ay,bx,by]
+    k0, k1, ka = len(idx0), len(idx1), 4
+    combined = np.concatenate([idx0, idx1, aidx])
+
+    def _r(xs):
+        P = vf0(xs[:k0])
+        Q = vf1(xs[k0:k0+k1])
+        ax, ay, bx, by = xs[k0+k1], xs[k0+k1+1], xs[k0+k1+2], xs[k0+k1+3]
+        Mx = (P[0]+Q[0])/2.0; My = (P[1]+Q[1])/2.0  # midpoint
+        dxab = bx-ax; dyab = by-ay
+        # midpoint on line: cross product (B-A) x (M-A) = 0
+        c1 = dxab*(My-ay) - dyab*(Mx-ax)
+        # perpendicularity: dot(P-Q, B-A) = 0
+        c2 = (P[0]-Q[0])*dxab + (P[1]-Q[1])*dyab
+        return np.array([c1, c2])
+
+    def _j(xs):
+        P = vf0(xs[:k0])
+        Q = vf1(xs[k0:k0+k1])
+        ax, ay, bx, by = xs[k0+k1], xs[k0+k1+1], xs[k0+k1+2], xs[k0+k1+3]
+        Jp0 = jf0(xs[:k0])    # (2, k0)
+        Jq0 = jf1(xs[k0:k0+k1])  # (2, k1)
+        dxab = bx-ax; dyab = by-ay
+        Mx = (P[0]+Q[0])/2.0; My = (P[1]+Q[1])/2.0
+
+        # c1 = dxab*(My-ay) - dyab*(Mx-ax)
+        # dc1/dP = dxab*0.5*[0,1] - dyab*0.5*[1,0]  ... via Mx/My
+        # dc1/dPx = -dyab*0.5
+        # dc1/dPy = dxab*0.5
+        # similarly dc1/dQ = same
+        dc1_dP = np.array([-dyab*0.5, dxab*0.5])  # shape (2,)
+        dc1_dQ = np.array([-dyab*0.5, dxab*0.5])
+
+        # c2 = (Px-Qx)*dxab + (Py-Qy)*dyab
+        # dc2/dPx = dxab, dc2/dPy = dyab
+        dc2_dP = np.array([dxab, dyab])
+        dc2_dQ = np.array([-dxab, -dyab])
+
+        # dc1/d[ax,ay,bx,by]:
+        # c1 = (bx-ax)*(My-ay) - (by-ay)*(Mx-ax)
+        # dc1/dax = -1*(My-ay) + (by-ay)*1 = -(My-ay) + dyab ... wait:
+        # Actually: expanded using same logic as parallel constraint
+        # c1 = bx*My - bx*ay - ax*My + ax*ay - by*Mx + by*ax + ay*Mx - ay*ax
+        # dc1/dax = -My + ay + by = -My + ay + by
+        # dc1/day = -bx + ax - Mx + ax ... hmm let me just use the formula directly:
+        # c1 = dxab*(My-ay) - dyab*(Mx-ax)
+        # dc1/dax = -1*(My-ay) - (-1)*(Mx-ax)*... no:
+        # d(dxab)/dax = -1, d(dyab)/dax = 0, d(Mx)/dax = 0, d(My)/dax = 0
+        # dc1/dax = -1*(My-ay) - 0 = -(My-ay)
+        # dc1/day = d(-dyab)/day... d(dyab)/day = -1 (since dy = by-ay)
+        # dc1/day = dxab*(-1) - (-1)*(Mx-ax) - dyab*0 = -dxab + (Mx-ax)
+        # Hmm, let me be even more careful:
+        # c1 = (bx-ax)*(My-ay) - (by-ay)*(Mx-ax)
+        # d/dax = (-1)*(My-ay) - 0 - (by-ay)*(-1) = -(My-ay) + (by-ay)
+        # d/day = (bx-ax)*(-1) - (-1)*(Mx-ax) = -(bx-ax) + (Mx-ax)
+        # d/dbx = 1*(My-ay) - 0 = My-ay
+        # d/dby = 0 - 1*(Mx-ax) = -(Mx-ax)
+        dc1_da = np.array([-(My-ay)+(by-ay), -(bx-ax)+(Mx-ax), My-ay, -(Mx-ax)])
+
+        # dc2/d[ax,ay,bx,by]:
+        # c2 = (Px-Qx)*dxab + (Py-Qy)*dyab
+        # d/dax = (Px-Qx)*(-1) = -(Px-Qx)
+        # d/day = (Py-Qy)*(-1) = -(Py-Qy)
+        # d/dbx = (Px-Qx)
+        # d/dby = (Py-Qy)
+        dc2_da = np.array([-(P[0]-Q[0]), -(P[1]-Q[1]), P[0]-Q[0], P[1]-Q[1]])
+
+        # Build J row by row
+        # Row 0: c1; Row 1: c2
+        # Columns: [P_vars (k0), Q_vars (k1), axis_vars (4)]
+        J = np.zeros((2, k0 + k1 + 4))
+        # c1 w.r.t. P
+        J[0, :k0] = dc1_dP @ Jp0   # (2,) @ (2, k0) = (k0,)
+        # c1 w.r.t. Q
+        J[0, k0:k0+k1] = dc1_dQ @ Jq0
+        # c1 w.r.t. axis
+        J[0, k0+k1:] = dc1_da
+        # c2 w.r.t. P
+        J[1, :k0] = dc2_dP @ Jp0
+        # c2 w.r.t. Q
+        J[1, k0:k0+k1] = dc2_dQ @ Jq0
+        # c2 w.r.t. axis
+        J[1, k0+k1:] = dc2_da
+        return J
+
+    sys.add_residual(_r, combined, _j, cid)
+
+
+def _add_fix(sys, cid, handle, entities, var_map):
+    """Fix a point (or entity center) to its current position."""
+    eid = handle.split(".")[0]
+    ent = entities[eid]
+    etype = ent["type"]
+    sub = handle.split(".")[1] if "." in handle else None
+
+    if etype == "point":
+        px, py = ent["p"]
+        idx = var_map[eid]
+        tx, ty = px, py
+        sys.add_residual(
+            lambda xs, _tx=tx, _ty=ty: np.array([xs[0] - _tx, xs[1] - _ty]),
+            idx, lambda xs: np.eye(2), cid)
+
+    elif etype == "line":
+        if sub == "p1" or sub is None:
+            px, py = ent["p1"]
+            idx = var_map[eid][[0, 1]]
+            sys.add_residual(
+                lambda xs, _tx=px, _ty=py: np.array([xs[0] - _tx, xs[1] - _ty]),
+                idx, lambda xs: np.eye(2), cid)
+        elif sub == "p2":
+            px, py = ent["p2"]
+            idx = var_map[eid][[2, 3]]
+            sys.add_residual(
+                lambda xs, _tx=px, _ty=py: np.array([xs[0] - _tx, xs[1] - _ty]),
+                idx, lambda xs: np.eye(2), cid)
+
+    elif etype == "circle":
+        if sub == "center" or sub is None:
+            cx, cy = ent["center"]
+            idx = var_map[eid][[0, 1]]
+            sys.add_residual(
+                lambda xs, _tx=cx, _ty=cy: np.array([xs[0] - _tx, xs[1] - _ty]),
+                idx, lambda xs: np.eye(2), cid)
+
+    elif etype == "arc":
+        if sub == "center" or sub is None:
+            cx, cy = ent["center"]
+            idx = var_map[eid][[0, 1]]
+            sys.add_residual(
+                lambda xs, _tx=cx, _ty=cy: np.array([xs[0] - _tx, xs[1] - _ty]),
+                idx, lambda xs: np.eye(2), cid)
+        elif sub == "start":
+            vidx, vf, jf = _resolve_handle(handle, entities, var_map)
+            # Get the actual start point coordinates from entity
+            cx, cy = ent["center"]
+            r = ent["radius"]
+            a0 = ent["start"]
+            tx = cx + r * math.cos(a0 * _DEG)
+            ty = cy + r * math.sin(a0 * _DEG)
+            k = len(vidx)
+            sys.add_residual(
+                lambda xs, _tx=tx, _ty=ty, _vf=vf, _k=k: _vf(xs) - np.array([_tx, _ty]),
+                vidx, lambda xs, _jf=jf: _jf(xs), cid)
+
+    elif etype == "ellipse":
+        if sub == "center" or sub is None:
+            cx, cy = ent["center"]
+            idx = var_map[eid][[0, 1]]
+            sys.add_residual(
+                lambda xs, _tx=cx, _ty=cy: np.array([xs[0] - _tx, xs[1] - _ty]),
+                idx, lambda xs: np.eye(2), cid)
+
+    elif etype == "slot":
+        if sub == "p1" or sub is None:
+            px, py = ent["p1"]
+            idx = var_map[eid][[0, 1]]
+            sys.add_residual(
+                lambda xs, _tx=px, _ty=py: np.array([xs[0] - _tx, xs[1] - _ty]),
+                idx, lambda xs: np.eye(2), cid)
+        elif sub == "p2":
+            px, py = ent["p2"]
+            idx = var_map[eid][[2, 3]]
+            sys.add_residual(
+                lambda xs, _tx=px, _ty=py: np.array([xs[0] - _tx, xs[1] - _ty]),
+                idx, lambda xs: np.eye(2), cid)
+
+
+def _add_point_on(sys, cid, point_handle, entity_handle, entities, var_map):
+    """Point lies on entity (line, circle, or arc)."""
+    pidx, pvf, pjf = _resolve_handle(point_handle, entities, var_map)
+    eid = entity_handle.split(".")[0]
+    ent = entities[eid]
+    etype = ent["type"]
+    kp = len(pidx)
+
+    if etype == "line":
+        lidx = var_map[eid][[0, 1, 2, 3]]  # [ax,ay,bx,by]
+        combined = np.concatenate([pidx, lidx])
+
+        def _r(xs):
+            P = pvf(xs[:kp])
+            ax, ay, bx, by = xs[kp], xs[kp+1], xs[kp+2], xs[kp+3]
+            return np.array([(bx-ax)*(P[1]-ay) - (by-ay)*(P[0]-ax)])
+
+        def _j(xs):
+            P = pvf(xs[:kp])
+            Jp = pjf(xs[:kp])   # (2, kp)
+            ax, ay, bx, by = xs[kp], xs[kp+1], xs[kp+2], xs[kp+3]
+            dxab = bx-ax; dyab = by-ay
+            # d/dP: cross = dxab*(Py-ay) - dyab*(Px-ax)
+            # dc/dPx = -dyab; dc/dPy = dxab
+            dc_dP = np.array([-dyab, dxab])  # (2,)
+            dc_dP_full = dc_dP @ Jp  # (kp,)
+            # d/d[ax,ay,bx,by]:
+            # Using same as point_on_line from test_nsolve:
+            # dpx->-(by-ay), dpy->(bx-ax), dax->-(py-ay)+(by-ay), day->-(bx-ax)+(px-ax), dbx->(py-ay), dby->-(px-ax)
+            Px, Py = P[0], P[1]
+            dax = -(Py-ay) + (by-ay)   # = -(Py-ay) + dyab
+            day = (Px-ax) - (bx-ax)    # = (Px-ax) - dxab
+            dbx = Py-ay
+            dby = -(Px-ax)
+            dc_dl = np.array([dax, day, dbx, dby])
+            J = np.zeros((1, kp + 4))
+            J[0, :kp] = dc_dP_full
+            J[0, kp:] = dc_dl
+            return J
+
+        sys.add_residual(_r, combined, _j, cid)
+
+    elif etype in ("circle", "arc"):
+        cidx = var_map[eid][[0, 1, 2]]  # [cx, cy, r]
+        combined = np.concatenate([pidx, cidx])
+
+        def _r(xs):
+            P = pvf(xs[:kp])
+            cx, cy, r = xs[kp], xs[kp+1], xs[kp+2]
+            return np.array([math.hypot(P[0]-cx, P[1]-cy) - r])
+
+        def _j(xs):
+            P = pvf(xs[:kp])
+            Jp = pjf(xs[:kp])
+            cx, cy, r = xs[kp], xs[kp+1], xs[kp+2]
+            dx = P[0]-cx; dy = P[1]-cy
+            d = math.hypot(dx, dy)
+            if d < 1e-12:
+                return np.zeros((1, kp + 3))
+            # d(|P-C| - r) / d[P] = (P-C)/d
+            # d/dP_full = ((P-C)/d)^T @ Jp
+            dP_dir = np.array([dx/d, dy/d])
+            J = np.zeros((1, kp + 3))
+            J[0, :kp] = dP_dir @ Jp
+            J[0, kp] = -dx/d
+            J[0, kp+1] = -dy/d
+            J[0, kp+2] = -1.0
+            return J
+
+        sys.add_residual(_r, combined, _j, cid)
+
+
+def _add_distance(sys, cid, h0, h1, d, entities, var_map):
+    """Distance constraint: point-point, or point-line (foot distance)."""
+    # Determine kinds
+    def _is_line(h):
+        eid = h.split(".")[0]
+        return entities[eid]["type"] == "line" and "." not in h
+
+    if _is_line(h0) or _is_line(h1):
+        # point-line distance
+        if _is_line(h0):
+            line_h, pt_h = h0, h1
+        else:
+            line_h, pt_h = h1, h0
+        eid_l = line_h.split(".")[0]
+        lidx = var_map[eid_l][[0, 1, 2, 3]]
+        pidx, pvf, pjf = _resolve_handle(pt_h, entities, var_map)
+        kp = len(pidx)
+        combined = np.concatenate([pidx, lidx])
+        _d = float(d)
+
+        def _r(xs):
+            P = pvf(xs[:kp])
+            ax, ay, bx, by = xs[kp], xs[kp+1], xs[kp+2], xs[kp+3]
+            dxab = bx-ax; dyab = by-ay
+            L = math.hypot(dxab, dyab)
+            if L < 1e-14:
+                return np.array([math.hypot(P[0]-ax, P[1]-ay) - _d])
+            cross = dxab*(P[1]-ay) - dyab*(P[0]-ax)
+            return np.array([abs(cross)/L - _d])
+
+        def _j(xs):
+            P = pvf(xs[:kp])
+            Jp = pjf(xs[:kp])
+            ax, ay, bx, by = xs[kp], xs[kp+1], xs[kp+2], xs[kp+3]
+            dxab = bx-ax; dyab = by-ay
+            L2 = dxab**2 + dyab**2
+            L = math.sqrt(L2) if L2 > 1e-28 else 1e-14
+            cross = dxab*(P[1]-ay) - dyab*(P[0]-ax)
+            sgn = 1.0 if cross >= 0 else -1.0
+            Px, Py = P[0], P[1]
+            # d(cross)/dP: cross = dxab*(Py-ay) - dyab*(Px-ax)
+            dc_dPx = -dyab; dc_dPy = dxab
+            dc_dP = np.array([dc_dPx, dc_dPy])
+            # d(dist)/dP = sgn * d(cross)/dP / L
+            J = np.zeros((1, kp + 4))
+            J[0, :kp] = sgn * (dc_dP @ Jp) / L
+            # Analytic Jacobian for d(|cross|/L - _d) w.r.t. [ax,ay,bx,by]:
+            # cross = (bx-ax)*(Py-ay) - (by-ay)*(Px-ax)
+            # Expanded: bx*Py - bx*ay - ax*Py - by*Px + by*ax + ay*Px
+            # d/dax = Py-by; d/day = bx-Px; d/dbx = ay-Py; d/dby = Px-ax
+            # (Same as d_cross2 in _add_tangent_line_circle with cx->Px, cy->Py)
+            dc_ax = Py - by;  dc_ay = bx - Px
+            dc_bx = ay - Py;  dc_by = Px - ax
+            d_L_ax = -dxab / L; d_L_ay = -dyab / L
+            d_L_bx = dxab / L;  d_L_by = dyab / L
+            # dist = |cross|/L; d(dist)/d[...] = sgn*(dc_[...]*L - abs(cross)*dL_[...])/L^2
+            def dd(dc, dl):
+                return sgn * (dc * L - abs(cross) * dl) / L2
+            J[0, kp]   = dd(dc_ax, d_L_ax)
+            J[0, kp+1] = dd(dc_ay, d_L_ay)
+            J[0, kp+2] = dd(dc_bx, d_L_bx)
+            J[0, kp+3] = dd(dc_by, d_L_by)
+            return J
+
+        sys.add_residual(_r, combined, _j, cid)
+
+    else:
+        # point-point distance
+        idx0, vf0, jf0 = _resolve_handle(h0, entities, var_map)
+        idx1, vf1, jf1 = _resolve_handle(h1, entities, var_map)
+        k0, k1 = len(idx0), len(idx1)
+        combined = np.concatenate([idx0, idx1])
+        _d = float(d)
+
+        def _r(xs):
+            P0 = vf0(xs[:k0])
+            P1 = vf1(xs[k0:k0+k1])
+            return np.array([math.hypot(P0[0]-P1[0], P0[1]-P1[1]) - _d])
+
+        def _j(xs):
+            P0 = vf0(xs[:k0])
+            P1 = vf1(xs[k0:k0+k1])
+            J0 = jf0(xs[:k0])     # (2, k0)
+            J1 = jf1(xs[k0:k0+k1])  # (2, k1)
+            dx = P0[0]-P1[0]; dy = P0[1]-P1[1]
+            d = math.hypot(dx, dy)
+            if d < 1e-12:
+                return np.zeros((1, k0+k1))
+            dir_ = np.array([dx/d, dy/d])  # (2,)
+            J = np.zeros((1, k0+k1))
+            J[0, :k0] = dir_ @ J0
+            J[0, k0:] = -dir_ @ J1
+            return J
+
+        sys.add_residual(_r, combined, _j, cid)
+
+
+def _add_angle(sys, cid, h0, h1, ang_deg, entities, var_map):
+    """Angle between two lines (the unsigned angle, in degrees).
+
+    residual: atan2(cross, dot) - ang_rad
+    where cross = (B-A) x (D-C), dot = (B-A).(D-C)
+    """
+    eid0 = h0.split(".")[0]
+    eid1 = h1.split(".")[0]
+    assert entities[eid0]["type"] == "line" and entities[eid1]["type"] == "line"
+    idx0 = var_map[eid0][[0, 1, 2, 3]]
+    idx1 = var_map[eid1][[0, 1, 2, 3]]
+    combined = np.concatenate([idx0, idx1])
+    ang_rad = ang_deg * _DEG
+
+    def _r(xs):
+        ax, ay, bx, by = xs[0], xs[1], xs[2], xs[3]
+        cx, cy, dx, dy = xs[4], xs[5], xs[6], xs[7]
+        ux, uy = bx-ax, by-ay
+        vx, vy = dx-cx, dy-cy
+        # Use the angle between the direction vectors:
+        # residual = |dot/(|u||v|)| - cos(ang)  ... but that has issues near 0/180
+        # Better: use sin/cos pair residuals? Or just atan2.
+        # atan2(|cross|, dot) gives unsigned angle in [0, pi]
+        # We want residual = atan2(|cross|, dot) - ang_rad
+        cross = ux*vy - uy*vx
+        dot = ux*vx + uy*vy
+        theta = math.atan2(abs(cross), dot)
+        return np.array([theta - ang_rad])
+
+    def _j(xs):
+        ax, ay, bx, by = xs[0], xs[1], xs[2], xs[3]
+        cx, cy, dx, dy = xs[4], xs[5], xs[6], xs[7]
+        ux, uy = bx-ax, by-ay
+        vx, vy = dx-cx, dy-cy
+        cross = ux*vy - uy*vx
+        dot = ux*vx + uy*vy
+        abs_cross = abs(cross)
+        sgn_cross = 1.0 if cross >= 0 else -1.0
+        denom = dot**2 + abs_cross**2   # = |u|^2 * |v|^2
+
+        if denom < 1e-24:
+            return np.zeros((1, 8))
+
+        # d(atan2(|c|, d)) = (d * d(|c|) - |c| * d(d)) / denom
+        # d(|c|)/d[...] = sgn_cross * d(cross)/d[...]
+        # d(cross)/dux = vy, d(cross)/duy = -vx, d(cross)/dvx = -uy, d(cross)/dvy = ux
+        dc_dux = vy; dc_duy = -vx; dc_dvx = -uy; dc_dvy = ux
+        # d(dot)/dux = vx, d(dot)/duy = vy, d(dot)/dvx = ux, d(dot)/dvy = uy
+        dd_dux = vx; dd_duy = vy; dd_dvx = ux; dd_dvy = uy
+
+        def dtheta(dc_d_var, dd_d_var):
+            return (dot * sgn_cross * dc_d_var - abs_cross * dd_d_var) / denom
+
+        # Chain rule: dux/d[ax,ay,bx,by] = [-1,0,1,0]; duy = [0,-1,0,1]
+        # dvx/d[cx,cy,dx,dy] = [-1,0,1,0]; dvy = [0,-1,0,1]
+        J = np.zeros((1, 8))
+        # u components: ux = bx-ax, uy = by-ay
+        dt_dux = dtheta(dc_dux, dd_dux)
+        dt_duy = dtheta(dc_duy, dd_duy)
+        J[0, 0] = -dt_dux   # dax
+        J[0, 1] = -dt_duy   # day
+        J[0, 2] = dt_dux    # dbx
+        J[0, 3] = dt_duy    # dby
+        # v components: vx = dx-cx, vy = dy-cy
+        dt_dvx = dtheta(dc_dvx, dd_dvx)
+        dt_dvy = dtheta(dc_dvy, dd_dvy)
+        J[0, 4] = -dt_dvx   # dcx
+        J[0, 5] = -dt_dvy   # dcy
+        J[0, 6] = dt_dvx    # ddx
+        J[0, 7] = dt_dvy    # ddy
+        return J
+
+    sys.add_residual(_r, combined, _j, cid)
+
+
+# ---------------------------------------------------------------------------
+# Extract solved coordinates from variable vector
+# ---------------------------------------------------------------------------
+
+def _extract_entities(x: np.ndarray, entities_list: list, var_map: dict) -> EntityCoords:
+    """Build entity coord dict from the solved variable vector."""
+    result = {}
+    for ent in entities_list:
+        eid = ent["id"]
+        etype = ent["type"]
+        vidx = var_map[eid]
+        vals = x[vidx]
+
+        if etype == "point":
+            result[eid] = {"type": "point", "p": [float(vals[0]), float(vals[1])]}
+
+        elif etype == "line":
+            result[eid] = {
+                "type": "line",
+                "p1": [float(vals[0]), float(vals[1])],
+                "p2": [float(vals[2]), float(vals[3])],
+            }
+
+        elif etype == "circle":
+            result[eid] = {
+                "type": "circle",
+                "center": [float(vals[0]), float(vals[1])],
+                "radius": float(vals[2]),
+            }
+
+        elif etype == "arc":
+            result[eid] = {
+                "type": "arc",
+                "center": [float(vals[0]), float(vals[1])],
+                "radius": float(vals[2]),
+                "start": float(vals[3]),
+                "end": float(vals[4]),
+            }
+
+        elif etype == "ellipse":
+            result[eid] = {
+                "type": "ellipse",
+                "center": [float(vals[0]), float(vals[1])],
+                "rx": float(vals[2]),
+                "ry": float(vals[3]),
+                "rot": float(vals[4]),
+            }
+
+        elif etype == "slot":
+            result[eid] = {
+                "type": "slot",
+                "p1": [float(vals[0]), float(vals[1])],
+                "p2": [float(vals[2]), float(vals[3])],
+                "width": float(vals[4]),
+            }
+
+        elif etype == "spline":
+            n = len(vidx) // 2
+            pts = [[float(vals[2*i]), float(vals[2*i+1])] for i in range(n)]
+            result[eid] = {"type": "spline", "points": pts}
+
+        elif etype == "text":
+            result[eid] = {"type": "text", "p": [float(vals[0]), float(vals[1])]}
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Per-entity status via nullspace analysis
+# ---------------------------------------------------------------------------
+
+def _compute_entity_statuses(
+    x: np.ndarray,
+    entities_list: list,
+    var_map: dict,
+    sys: System,
+    analysis,
+) -> Dict[str, str]:
+    """Return "under"|"full"|"over" for each entity.
+
+    Strategy:
+    - If analysis.conflicting_tags is non-empty: any entity whose variable set
+      intersects a conflicting constraint is "over"; others follow the normal path.
+    - Otherwise compute the nullspace of the Jacobian. A variable is "determined"
+      if it has near-zero projection onto the nullspace basis. An entity is "full"
+      iff all its variables are determined; "under" if any are free.
+
+    This is kept inside sketch_solver.py and uses the same QR machinery as
+    nsolve.analyze (we call analyze and then compute the nullspace from J directly).
+    """
+    import scipy.linalg as sla
+
+    statuses: Dict[str, str] = {}
+
+    # Build dense Jacobian over real (non-soft) blocks
+    real_blocks = [b for b in sys._blocks if not b.soft]
+    n = sys.n_vars
+    m_total = sum(b.m for b in real_blocks)
+
+    if m_total == 0 or n == 0:
+        for ent in entities_list:
+            statuses[ent["id"]] = "under"
+        return statuses
+
+    J = np.zeros((m_total, n), dtype=np.float64)
+    row = 0
+    for b in real_blocks:
+        jb = np.atleast_2d(np.asarray(b.jfunc(x[b.var_idx]), dtype=np.float64))
+        J[row:row+b.m, b.var_idx] = jb
+        row += b.m
+
+    # SVD of J to get the nullspace
+    _, s, Vt = np.linalg.svd(J, full_matrices=True)
+    rank = int(np.sum(s > max(1e-7, 1e3 * np.finfo(float).eps * (s[0] if s.size else 1.0))))
+    # Nullspace basis: rows of Vt[rank:] (each row is a nullspace direction)
+    null_basis = Vt[rank:]  # shape (n_null, n)
+
+    if null_basis.shape[0] == 0:
+        # No nullspace: all variables determined
+        null_proj = np.zeros(n)
+    else:
+        # Projection of each variable onto the nullspace:
+        # proj[i] = ||null_basis[:, i]|| (norm of the i-th column of the nullspace basis)
+        null_proj = np.linalg.norm(null_basis, axis=0)  # shape (n,)
+
+    tol_null = 1e-6
+
+    # Build set of conflicting variable indices (over-defined)
+    conflicting_var_set: set = set()
+    if analysis.conflicting_tags:
+        ctag_set = set(analysis.conflicting_tags)
+        for b in real_blocks:
+            if b.tag in ctag_set:
+                for i in b.var_idx:
+                    conflicting_var_set.add(int(i))
+
+    for ent in entities_list:
+        eid = ent["id"]
+        vidx = var_map[eid]
+        var_ints = [int(i) for i in vidx]
+
+        if conflicting_var_set and any(v in conflicting_var_set for v in var_ints):
+            statuses[eid] = "over"
+            continue
+
+        # Check if all entity variables are determined (zero null-space projection)
+        projections = null_proj[var_ints]
+        if np.all(projections < tol_null):
+            statuses[eid] = "full"
+        else:
+            statuses[eid] = "under"
+
+    return statuses
+
+
+# ---------------------------------------------------------------------------
+# Main public API
+# ---------------------------------------------------------------------------
+
+def solve_sketch(
+    sketch_params: dict,
+    equations_env: dict,
+    warm: Optional[SolveState] = None,
+) -> SketchSolution:
+    """Solve a sketch and return statuses + DOF analysis.
+
+    Parameters
+    ----------
+    sketch_params:
+        The dict at feature.params for a sketch feature (has "entities" and
+        "constraints" keys per doc_schema.md §3).
+    equations_env:
+        Pre-resolved equations dict (str -> float), e.g. from
+        equations.evaluate_globals(). Expression dims are looked up here.
+    warm:
+        Previous SolveState for warm-starting (pass None on first call).
+
+    Returns
+    -------
+    SketchSolution with entity coords, per-entity status, DOF, redundant/
+    conflicting constraint ids, convergence flag, and opaque SolveState.
+    """
+    entities_list = sketch_params.get("entities", [])
+    constraints_list = sketch_params.get("constraints", [])
+
+    # Build entity lookup
+    entities = {e["id"]: e for e in entities_list}
+
+    # Create the solver system
+    sys = System()
+    var_map: Dict[str, np.ndarray] = {}
+
+    for ent in entities_list:
+        var_map[ent["id"]] = _allocate_entity(sys, ent)
+
+    # Register constraints
+    for c in constraints_list:
+        try:
+            _add_constraint(sys, c, entities, var_map, equations_env)
+        except Exception as exc:
+            # Don't crash the whole solve on a single bad constraint; skip it
+            # (matches "forward tolerant" pattern from doc_schema conventions)
+            pass
+
+    # Determine warm-start vector
+    x0 = None
+    if warm is not None and warm.n_vars == sys.n_vars:
+        x0 = warm.x
+
+    # Solve
+    result = sys.solve(x0=x0, tol=1e-10, max_iter=50)
+    x = result.x
+
+    # Analyze
+    analysis = sys.analyze(x)
+
+    # Extract entity coordinates
+    entity_coords = _extract_entities(x, entities_list, var_map)
+
+    # Per-entity status
+    statuses = _compute_entity_statuses(x, entities_list, var_map, sys, analysis)
+
+    state = SolveState(x=x.copy(), var_map=var_map, n_vars=sys.n_vars)
+
+    return SketchSolution(
+        entities=entity_coords,
+        statuses=statuses,
+        dof=analysis.dof,
+        redundant=[str(t) for t in analysis.redundant_tags],
+        conflicting=[str(t) for t in analysis.conflicting_tags],
+        converged=result.converged,
+        state=state,
+    )
+
+
+def drag(
+    state: SolveState,
+    handle: str,
+    target_xy: Tuple[float, float],
+    sketch_params: dict,
+    equations_env: dict,
+) -> Dict[str, Any]:
+    """Constrained drag: pull handle toward target_xy, constraints stay exact.
+
+    Rebuilds the system from sketch_params (same topology, constraints), soft-
+    targets the dragged point's x and y coordinates, warm-starts from state.x,
+    and solves with a 10 ms time budget (best-so-far is returned if over budget).
+
+    Returns {"entities": EntityCoords, "statuses": {...}} — does NOT modify state
+    and does NOT commit to the document (transient preview).
+    """
+    entities_list = sketch_params.get("entities", [])
+    constraints_list = sketch_params.get("constraints", [])
+    entities = {e["id"]: e for e in entities_list}
+
+    sys = System()
+    var_map: Dict[str, np.ndarray] = {}
+    for ent in entities_list:
+        var_map[ent["id"]] = _allocate_entity(sys, ent)
+
+    for c in constraints_list:
+        try:
+            _add_constraint(sys, c, entities, var_map, equations_env)
+        except Exception:
+            pass
+
+    # Resolve the handle to get its variable indices
+    try:
+        hidx, hvf, hjf = _resolve_handle(handle, entities, var_map)
+    except (KeyError, ValueError):
+        # Unknown handle — return last known coords
+        entity_coords = _extract_entities(state.x, entities_list, var_map)
+        return {"entities": entity_coords, "statuses": {}}
+
+    # Register soft targets for the two coordinates of the dragged point
+    # hidx are the variable indices for the handle's value function
+    # For direct point handles, hidx has exactly 2 vars (x and y)
+    # For derived handles (arc start/end), hidx has more vars — we soft-target
+    # the actual derived x,y by adding soft targets at the x,y variable indices.
+    # The simplest correct approach: identify the two output coordinates of hvf
+    # and add one soft_target per coordinate that maps directly to a variable.
+    # For direct handles (point, line p1/p2, circle center), hidx = [ix, iy]
+    # and we can directly target them. For derived handles we fall back to the
+    # center/endpoint variables.
+    tx, ty = float(target_xy[0]), float(target_xy[1])
+
+    if len(hidx) == 2:
+        # Direct 2-var handle: soft-target x and y independently
+        sys.soft_target(int(hidx[0]), tx, weight=0.01)
+        sys.soft_target(int(hidx[1]), ty, weight=0.01)
+    elif len(hidx) == 4:
+        # e.g. arc.start: [cx, cy, r, a0/a1] — target the derived point
+        # We add soft-targets on the center + angle instead, which indirectly
+        # pulls the start/end point. In practice, target the center to move
+        # the arc, but this is a simplification. A better approach: add a
+        # "derived point near target" as two soft residuals, but that changes
+        # the system's variable set. Instead, for arcs with derived endpoints
+        # we soft-target the center (first two vars of the arc).
+        sys.soft_target(int(hidx[0]), tx, weight=0.01)
+        sys.soft_target(int(hidx[1]), ty, weight=0.01)
+    else:
+        # Fallback: soft-target first two vars
+        sys.soft_target(int(hidx[0]), tx, weight=0.01)
+        if len(hidx) > 1:
+            sys.soft_target(int(hidx[1]), ty, weight=0.01)
+
+    # Use warm start from state if topology matches
+    x0 = state.x if state.n_vars == sys.n_vars else None
+    result = sys.solve(x0=x0, tol=1e-10, max_iter=50, time_budget_ms=10.0)
+    x = result.x
+
+    analysis = sys.analyze(x)
+    entity_coords = _extract_entities(x, entities_list, var_map)
+    tmp_state = SolveState(x=x, var_map=var_map, n_vars=sys.n_vars)
+    statuses = _compute_entity_statuses(x, entities_list, var_map, sys, analysis)
+
+    return {"entities": entity_coords, "statuses": statuses}

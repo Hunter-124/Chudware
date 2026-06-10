@@ -60,6 +60,17 @@ session transcripts; commit messages carry verification evidence.
 - Worked residual templates (coincident/distance/point_on_line/fix/h/v) in test_nsolve.py.
 - Perf: warm median ~8.8-9.0 ms @ 200 vars.
 
+## C10 sketch solver
+- `from engine.doc.sketch_solver import solve_sketch, drag, SolveState, SketchSolution`.
+- solve_sketch(sketch_params, equations_env, warm=None) -> SketchSolution{entities (solved param
+  dicts, doc_schema §3.1 shape), statuses {eid: under|full|over}, dof, redundant, conflicting,
+  converged, state}. Pass sol.state as warm= next call; DISCARD state on topology change.
+- drag(state, handle, target_xy, sketch_params, equations_env) -> {entities, statuses} —
+  transient, constraint-exact, ~10-11 ms; card signature extended (needs params+env to rebuild
+  the System) — C18 must pass them.
+- Parallel line-line distance: pass refs as point+line ("e1.p1","e2"); bare line-line treated
+  as point_on path. Per-entity status via SVD nullspace inside sketch_solver (nsolve untouched).
+
 ## C12 evaluate (this commit)
 - engine.doc.evaluate: mass_props(shape,density), measure(infos), section_props(shape,plane),
   interference(bodies), check(shape), symmetry(shape,plane), draft_field/thickness_field/

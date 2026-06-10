@@ -40,7 +40,15 @@ FetchContent_MakeAvailable(glfw stb json imgui)
 
 add_executable(AI-CAD
   src/main.cpp
-  src/gui_app.cpp
+  src/app.cpp
+  src/core/app_state.cpp
+  src/core/jobs.cpp
+  src/ui/legacy_chat.cpp
+  src/ui/settings_modal.cpp
+  src/ui/console_panel.cpp
+  src/ui/title_bar.cpp
+  src/ui/status_bar.cpp
+  src/ui/viewport_panel.cpp
   src/mesh.cpp
   src/renderer.cpp
   src/worker_client.cpp

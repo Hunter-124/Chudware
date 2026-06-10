@@ -16,4 +16,4 @@ config.json
 imgui.ini
 
 # Scratch + spike outputs
-scratch/wheels_probe/
+scratch/

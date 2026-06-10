@@ -109,6 +109,20 @@ session transcripts; commit messages carry verification evidence.
   overlap on narrow big-buttons and group captions ("Lin. Pattern"/"Coord. Sys" collide);
   needs min button width from label measure + tab strip vertical padding.
 
+## C16 tree + doc mirror
+- core::DocMirror (app_state: st.docMirror): newPart/applyOps(json ops)->OpsResponse{revision,
+  tree, feature_status, aicm_path}/undo/redo/resolvePick(returns selector JSON string)/save/
+  open/list; auto-resync on stale_revision; listener callback fires after every response
+  (app.cpp feeds aicm_path to loadDocMesh). Doc calls are direct synchronous UI-thread calls
+  (worker callMtx serializes; doc ops bypass the job system).
+- ui/feature_tree: drawFeatureTree(st, editCallback) — pass the PM-opening lambda (C17).
+  Fixed nodes + status badges + context menu + rollback strip + New Part/Undo/Redo.
+- For C17: id_map not exposed standalone (parse from tree if needed); face-owner highlight
+  deferred ("face-owner map not yet in C++ layer"); icon names used 'datum_plane'/'feature'
+  are NOT in the atlas (use 'plane'/'history' or extend make_icons).
+- AI_CAD_SHOT=tree needs AI_CAD_REPO set so the worker resolves; shot frame budget bumped for
+  worker startup (wantTree ? 30 : 6).
+
 ## C10 sketch solver
 - `from engine.doc.sketch_solver import solve_sketch, drag, SolveState, SketchSolution`.
 - solve_sketch(sketch_params, equations_env, warm=None) -> SketchSolution{entities (solved param

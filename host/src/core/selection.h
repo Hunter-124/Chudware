@@ -36,6 +36,8 @@ public:
     }
 
     const std::vector<SelItem>& items() const { return items_; }
+    // Non-const access for C16's resolve round-trip (fills pending_resolve / selector slots).
+    std::vector<SelItem>& mutableItems() { return items_; }
     bool empty() const { return items_.empty(); }
     size_t size() const { return items_.size(); }
 

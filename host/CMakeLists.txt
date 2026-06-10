@@ -57,6 +57,10 @@ add_executable(AI-CAD
   src/render/overlays.cpp
   src/core/selection.cpp
   # --- end C15 ---
+  # --- C16: feature tree + doc mirror ---
+  src/core/doc_mirror.cpp
+  src/ui/feature_tree.cpp
+  # --- end C16 ---
   src/worker_client.cpp
   src/bootstrap.cpp
   src/ui_theme.cpp

@@ -1,0 +1,195 @@
+// DocMirror implementation (C16).
+#include <cstdio>
+#include <string>
+
+#include "doc_mirror.h"
+#include "../worker_client.h"
+
+namespace core {
+
+// ---- helpers ----
+
+static inline std::string jstr(const nlohmann::json& o, const char* k) {
+    auto it = o.find(k);
+    return (it != o.end() && it->is_string()) ? it->get<std::string>() : std::string();
+}
+static inline int jint(const nlohmann::json& o, const char* k) {
+    auto it = o.find(k);
+    return (it != o.end() && it->is_number_integer()) ? it->get<int>() : 0;
+}
+
+// ---- OpsResponse parser ----
+
+OpsResponse DocMirror::parseOpsResponse(const nlohmann::json& result) {
+    OpsResponse r;
+    r.revision = jint(result, "revision");
+    if (result.contains("tree") && result["tree"].is_object())
+        r.tree = result["tree"];
+    if (result.contains("rebuild") && result["rebuild"].is_object()) {
+        const auto& rb = result["rebuild"];
+        if (rb.contains("feature_status") && rb["feature_status"].is_array())
+            r.feature_status = rb["feature_status"];
+    }
+    if (result.contains("tess") && result["tess"].is_object())
+        r.aicm_path = jstr(result["tess"], "aicm_path");
+    r.ok = true;
+    return r;
+}
+
+// ---- resync on stale_revision ----
+
+bool DocMirror::resyncTree(WorkerClient& w) {
+    if (docId_.empty()) return false;
+    nlohmann::json res;
+    std::string err;
+    if (!w.call("doc_tree", {{"doc_id", docId_}}, res, err)) return false;
+    revision_ = jint(res, "revision");
+    if (res.contains("tree") && res["tree"].is_object()) tree_ = res["tree"];
+    return true;
+}
+
+// ---- public API ----
+
+bool DocMirror::newPart(WorkerClient& w, std::string& err) {
+    nlohmann::json res;
+    if (!w.call("doc_new", {{"schema", "aicad.part/1"}}, res, err)) return false;
+    docId_ = jstr(res, "doc_id");
+    revision_ = jint(res, "revision");
+    tree_ = {};
+    featureStatus_ = {};
+    notify();
+    return true;
+}
+
+OpsResponse DocMirror::applyOps(WorkerClient& w, const nlohmann::json& ops) {
+    OpsResponse r;
+    nlohmann::json res;
+    std::string err;
+    nlohmann::json params = {
+        {"doc_id", docId_},
+        {"base_revision", revision_},
+        {"ops", ops}
+    };
+    bool ok = w.call("doc_apply_ops", params, res, err);
+    if (!ok) {
+        r.error_code = "transport";
+        r.error_message = err;
+        return r;
+    }
+    // Check for error envelope {code, message, detail}
+    if (res.contains("code")) {
+        r.error_code = jstr(res, "code");
+        r.error_message = jstr(res, "message");
+        if (r.error_code == "stale_revision") {
+            // Auto-resync and surface a note.
+            std::printf("[doc] stale_revision — resyncing tree (now at rev %d)\n",
+                        jint(res.value("detail", nlohmann::json::object()), "current_revision"));
+            std::fflush(stdout);
+            resyncTree(w);
+        }
+        return r;
+    }
+    r = parseOpsResponse(res);
+    if (r.ok) {
+        revision_ = r.revision;
+        if (!r.tree.is_null()) tree_ = r.tree;
+        if (!r.feature_status.is_null()) featureStatus_ = r.feature_status;
+        notify();
+    }
+    return r;
+}
+
+OpsResponse DocMirror::undo(WorkerClient& w) {
+    OpsResponse r;
+    if (docId_.empty()) { r.error_code = "no_doc"; r.error_message = "no document open"; return r; }
+    nlohmann::json res;
+    std::string err;
+    if (!w.call("doc_undo", {{"doc_id", docId_}}, res, err)) {
+        r.error_code = "transport"; r.error_message = err; return r;
+    }
+    if (res.contains("code")) {
+        r.error_code = jstr(res, "code"); r.error_message = jstr(res, "message"); return r;
+    }
+    r = parseOpsResponse(res);
+    if (r.ok) {
+        revision_ = r.revision;
+        if (!r.tree.is_null()) tree_ = r.tree;
+        if (!r.feature_status.is_null()) featureStatus_ = r.feature_status;
+        notify();
+    }
+    return r;
+}
+
+OpsResponse DocMirror::redo(WorkerClient& w) {
+    OpsResponse r;
+    if (docId_.empty()) { r.error_code = "no_doc"; r.error_message = "no document open"; return r; }
+    nlohmann::json res;
+    std::string err;
+    if (!w.call("doc_redo", {{"doc_id", docId_}}, res, err)) {
+        r.error_code = "transport"; r.error_message = err; return r;
+    }
+    if (res.contains("code")) {
+        r.error_code = jstr(res, "code"); r.error_message = jstr(res, "message"); return r;
+    }
+    r = parseOpsResponse(res);
+    if (r.ok) {
+        revision_ = r.revision;
+        if (!r.tree.is_null()) tree_ = r.tree;
+        if (!r.feature_status.is_null()) featureStatus_ = r.feature_status;
+        notify();
+    }
+    return r;
+}
+
+std::string DocMirror::resolvePick(WorkerClient& w, uint32_t body_id,
+                                   const std::string& kind, uint32_t topo_id,
+                                   std::string& err) {
+    if (docId_.empty()) { err = "no document open"; return {}; }
+    nlohmann::json res;
+    nlohmann::json params = {
+        {"doc_id", docId_},
+        {"revision", revision_},
+        {"body_id", body_id},
+        {"kind", kind},
+        {"topo_id", (int)topo_id}
+    };
+    if (!w.call("doc_resolve_pick", params, res, err)) return {};
+    if (res.contains("code")) {
+        err = jstr(res, "message");
+        if (jstr(res, "code") == "stale_revision") resyncTree(w);
+        return {};
+    }
+    // selector is returned as a JSON object; serialize to string for storage in SelItem
+    if (res.contains("selector")) return res["selector"].dump();
+    return {};
+}
+
+bool DocMirror::save(WorkerClient& w, const std::string& path, std::string& err) {
+    if (docId_.empty()) { err = "no document open"; return false; }
+    nlohmann::json res;
+    if (!w.call("doc_save", {{"doc_id", docId_}, {"path", path}}, res, err)) return false;
+    if (res.contains("code")) { err = jstr(res, "message"); return false; }
+    return true;
+}
+
+bool DocMirror::open(WorkerClient& w, const std::string& path, std::string& err) {
+    nlohmann::json res;
+    if (!w.call("doc_open", {{"path", path}}, res, err)) return false;
+    if (res.contains("code")) { err = jstr(res, "message"); return false; }
+    docId_ = jstr(res, "doc_id");
+    revision_ = jint(res, "revision");
+    if (res.contains("tree") && res["tree"].is_object()) tree_ = res["tree"];
+    featureStatus_ = {};
+    notify();
+    return true;
+}
+
+nlohmann::json DocMirror::list(WorkerClient& w, std::string& err) {
+    nlohmann::json res;
+    if (!w.call("doc_list", {}, res, err)) return nlohmann::json::array();
+    if (res.contains("code")) { err = jstr(res, "message"); return nlohmann::json::array(); }
+    if (res.contains("docs") && res["docs"].is_array()) return res["docs"];
+    return nlohmann::json::array();
+}
+
+}  // namespace core

@@ -48,9 +48,12 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     ImGui::DockBuilderRemoveNode(root);
     ImGui::DockBuilderAddNode(root, ImGuiDockNodeFlags_DockSpace);
     ImGui::DockBuilderSetNodeSize(root, size);
-    ImGuiID main = root, left, bottom;
+    ImGuiID main = root, left, bottom, leftTree;
+    // Split off the left column; then split the left into a tree pane (top) + design pane (bottom)
     left = ImGui::DockBuilderSplitNode(main, ImGuiDir_Left, 0.31f, nullptr, &main);
+    leftTree = ImGui::DockBuilderSplitNode(left, ImGuiDir_Up, 0.50f, nullptr, &left);
     bottom = ImGui::DockBuilderSplitNode(main, ImGuiDir_Down, 0.24f, nullptr, &main);
+    ImGui::DockBuilderDockWindow("FeatureManager", leftTree);
     ImGui::DockBuilderDockWindow("Design", left);
     ImGui::DockBuilderDockWindow("Viewport", main);
     ImGui::DockBuilderDockWindow("Console", bottom);
@@ -103,6 +106,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         }
         if (ImGui::BeginMenu("View")) {
             ImGui::MenuItem("Ribbon", nullptr, &st.showRibbon);
+            ImGui::MenuItem("FeatureManager", nullptr, &st.showFeatureTree);
             ImGui::MenuItem("Design / Chat", nullptr, &st.showDesign);
             ImGui::MenuItem("Viewport", nullptr, &st.showViewport);
             ImGui::MenuItem("Console", nullptr, &st.showConsole);

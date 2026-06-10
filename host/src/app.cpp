@@ -38,6 +38,7 @@
 #include "core/app_state.h"
 #include "core/jobs.h"
 #include "ui/console_panel.h"
+#include "ui/feature_tree.h"
 #include "ui/legacy_chat.h"
 #include "ui/settings_modal.h"
 #include "ui/status_bar.h"
@@ -147,6 +148,41 @@ int run_gui(const char* screenshotPath) {
         }
     }
 
+    // C16: Selection observer — on every selection change, resolve picks through the worker
+    // (doc_resolve_pick) and fill the selector slot in each pending SelItem.
+    // Called on the GL thread (selection changes happen there); worker call is synchronous.
+    st.selection.setObserver([&st]() {
+        if (!st.docMirror.hasDoc() || !st.workerStarted) return;
+        for (auto& item : st.selection.mutableItems()) {
+            if (!item.pending_resolve || !item.hit.valid()) continue;
+            const char* kindStr =
+                item.hit.kind == render::PickKind::Face   ? "face"   :
+                item.hit.kind == render::PickKind::Edge   ? "edge"   :
+                item.hit.kind == render::PickKind::Vertex ? "vertex" : nullptr;
+            if (!kindStr) continue;
+            std::string err;
+            std::string sel = st.docMirror.resolvePick(
+                st.worker, item.hit.body_id, kindStr, item.hit.topo_id, err);
+            if (!sel.empty()) {
+                item.selector = sel;
+                item.pending_resolve = false;
+                // Update pickStatus with richer label from the selector if available.
+                // For now leave pickLabel() as-is; C17 can enrich it.
+            } else if (!err.empty()) {
+                // Log once (avoid flooding; resolvePick logs stale_revision internally).
+            }
+        }
+    });
+
+    // C16: Doc mirror listener — re-draws the tree whenever a mutation lands.
+    // (Tree reads st.docMirror.tree() directly; listener fires on the calling thread.)
+    st.docMirror.setListener([&st]() {
+        // Nothing to do beyond triggering a redraw; ImGui redraws every frame so
+        // the tree panel auto-updates from docMirror.tree() on the next frame.
+        // We log the new revision for observability.
+        st.addLog("[doc] tree updated  rev=" + std::to_string(st.docMirror.revision()));
+    });
+
     // ---------- runtime + worker ----------
     st.rtReady = runtimeReady();
 
@@ -184,8 +220,10 @@ int run_gui(const char* screenshotPath) {
     st.wantPlan = shot && shotMode && std::strcmp(shotMode, "plan") == 0;
     st.wantPick = shot && shotMode && std::strcmp(shotMode, "pick") == 0;
     st.wantRibbon = shot && shotMode && std::strcmp(shotMode, "ribbon") == 0;
+    st.wantTree = shot && shotMode && std::strcmp(shotMode, "tree") == 0;
     // ribbon shot: show Features tab
     if (st.wantRibbon) { st.showRibbon = true; st.ribbonTab = 0; }
+    // wantTree doc smoke runs in the frame loop once the worker is ready (see below).
     if (st.wantPick) {
         // C15 picking demo/verification: load the golden box AICM, assert its topology counts,
         // and (in the frame loop) simulate a center-screen pick + highlight. The AICM path can be
@@ -510,6 +548,66 @@ int run_gui(const char* screenshotPath) {
             }
         }
 
+        // C16 tree shot: run the doc smoke once the worker is ready (fires the first time
+        // workerStarted is true after a wantTree shot). Synchronous calls are OK here since
+        // we defer the screenshot to frame >= 10 (giving extra frames for the tree to repaint).
+        if (st.wantTree && !st.treeShotDone && st.workerStarted) {
+            st.treeShotDone = true;
+            std::string err;
+            if (st.docMirror.newPart(st.worker, err)) {
+                std::printf("doc_new: doc_id=%s rev=%d\n",
+                            st.docMirror.docId().c_str(), st.docMirror.revision());
+                std::fflush(stdout);
+                nlohmann::json boxOps = nlohmann::json::array();
+                boxOps.push_back({{"op","add_feature"},{"feature",{
+                    {"type","box"},{"name","Box1"},{"params",{
+                        {"length",{{"value",50.0},{"expr",nullptr}}},
+                        {"width", {{"value",40.0},{"expr",nullptr}}},
+                        {"height",{{"value",30.0},{"expr",nullptr}}}
+                    }}}}});
+                auto r1 = st.docMirror.applyOps(st.worker, boxOps);
+                std::printf("add_box: ok=%d rev=%d aicm=%s\n",
+                            (int)r1.ok, r1.revision, r1.aicm_path.c_str());
+                std::fflush(stdout);
+                if (r1.ok && !r1.aicm_path.empty()) { std::string le; st.loadDocMesh(r1.aicm_path, le); }
+                std::string selStr, serr;
+                selStr = st.docMirror.resolvePick(st.worker, 1, "face", 1, serr);
+                std::printf("resolve_pick: selector=%s err=%s\n", selStr.c_str(), serr.c_str());
+                std::fflush(stdout);
+                nlohmann::json edgeRef;
+                try { edgeRef = nlohmann::json::parse(
+                    R"({"kind":"edge","surf":"line","centroid":[0,0,15],"axis":[0,0,1],"area_or_len":30,"owner_feature":null,"hint_index":0})");
+                } catch (...) {}
+                if (!edgeRef.is_null()) {
+                    nlohmann::json fo = nlohmann::json::array();
+                    fo.push_back({{"op","add_feature"},{"feature",{
+                        {"type","fillet"},{"name","Fillet1"},
+                        {"params",{{"radius",{{"value",3.0},{"expr",nullptr}}}}},
+                        {"refs",{{"edges",nlohmann::json::array({edgeRef})}}}}}});
+                    auto r2 = st.docMirror.applyOps(st.worker, fo);
+                    std::printf("add_fillet: ok=%d rev=%d err=%s\n",
+                                (int)r2.ok, r2.revision, r2.error_message.c_str());
+                    std::fflush(stdout);
+                    if (r2.ok && !r2.aicm_path.empty()) { std::string le; st.loadDocMesh(r2.aicm_path, le); }
+                }
+                auto ru = st.docMirror.undo(st.worker);
+                std::printf("undo: ok=%d rev=%d features=%d\n", (int)ru.ok, ru.revision,
+                    (int)(ru.tree.is_object()&&ru.tree.contains("features")&&ru.tree["features"].is_array()
+                          ? ru.tree["features"].size() : 0));
+                std::fflush(stdout);
+                if (ru.ok && !ru.aicm_path.empty()) { std::string le; st.loadDocMesh(ru.aicm_path, le); }
+                auto rr = st.docMirror.redo(st.worker);
+                std::printf("redo: ok=%d rev=%d features=%d\n", (int)rr.ok, rr.revision,
+                    (int)(rr.tree.is_object()&&rr.tree.contains("features")&&rr.tree["features"].is_array()
+                          ? rr.tree["features"].size() : 0));
+                std::fflush(stdout);
+                if (rr.ok && !rr.aicm_path.empty()) { std::string le; st.loadDocMesh(rr.aicm_path, le); }
+            } else {
+                std::printf("tree-shot: doc_new failed: %s\n", err.c_str());
+                std::fflush(stdout);
+            }
+        }
+
         bool busy = st.job.running.load();
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -520,6 +618,7 @@ int run_gui(const char* screenshotPath) {
             if (st.wantSettings) st.openSettings = true;
             if (st.wantChat || st.wantAssembly || st.wantPlan)
                 st.designStarted = true;  // show the conversation takeover
+
         }
 
         // ---------- custom title bar (our own; the OS title bar is stripped) ----------
@@ -564,6 +663,7 @@ int run_gui(const char* screenshotPath) {
         bool canRun = st.workerStarted && !busy;
 
         // ---------- panels ----------
+        if (st.showFeatureTree) ui::drawFeatureTree(st);  // C16: FeatureManager tree (left dock)
         ui::drawDesignPanel(st, busy, canRun);
         ui::drawViewportPanel(st, io, busy);
         ui::drawConsolePanel(st);
@@ -604,7 +704,11 @@ int run_gui(const char* screenshotPath) {
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-        if (shot && ++st.frame >= 6) {
+        // tree shot needs extra frames for the tree to repaint after async doc load
+        // wantTree but !treeShotDone: keep waiting (up to 30 frames) for the worker to start
+        // wantTree and treeShotDone: take the screenshot at frame 10 (tree has repainted)
+        const int shotFrame = st.wantTree ? (st.treeShotDone ? 10 : 30) : 6;
+        if (shot && ++st.frame >= shotFrame) {
             std::vector<unsigned char> px(dw * dh * 4);
             glReadBuffer(GL_BACK);
             glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());

@@ -19,7 +19,8 @@
 #include "../win_chrome.h"
 #include "../worker_client.h"
 
-#include "selection.h"  // core::Selection (pulls render::PickHit; all GL-free headers)
+#include "selection.h"   // core::Selection (pulls render::PickHit; all GL-free headers)
+#include "doc_mirror.h"  // core::DocMirror (C16)
 
 struct GLFWwindow;
 class Renderer;
@@ -239,6 +240,11 @@ struct AppState {
     Renderer* renderer = nullptr;     // owned by run_gui; AppState only borrows it
     chrome::HitLayout* hitLayout = nullptr;
 
+    // ---- document mirror (C16) — worker-backed document state ----
+    core::DocMirror docMirror;
+    bool wantTree = false;   // AI_CAD_SHOT=tree: scripted doc-smoke flow + screenshot
+    bool treeShotDone = false; // guard so doc smoke runs exactly once per shot
+
     // ---- topology picking (C15) — id pass + overlays owned by run_gui; AppState borrows ----
     render::IdPass* idPass = nullptr;
     render::Overlays* overlays = nullptr;
@@ -294,8 +300,9 @@ struct AppState {
     int frame = 0;
 
     // ---- ribbon (C14) ----
-    bool showRibbon = true;   // View > Ribbon visibility toggle
-    int  ribbonTab  = 0;      // 0=Features 1=Sketch 2=Evaluate 3=Simulation
+    bool showRibbon = true;        // View > Ribbon visibility toggle
+    int  ribbonTab  = 0;           // 0=Features 1=Sketch 2=Evaluate 3=Simulation
+    bool showFeatureTree = true;   // View > FeatureManager (C16)
 
     // ---- screenshot-mode flags (set from AI_CAD_SHOT in run_gui) ----
     bool wantSettings = false, wantChat = false, wantAssembly = false, wantPlan = false;

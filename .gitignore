@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# C++ host build output
+host/build/
+
+# Release artifacts (regenerate with installer/build_release.py)
+dist/
+
+# Local config / secrets
+config.json
+
+# Editor / app state
+imgui.ini
+
+# Scratch + spike outputs
+scratch/wheels_probe/

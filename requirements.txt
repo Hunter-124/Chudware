@@ -1,0 +1,19 @@
+# AI-CAD managed runtime — core pins (provisioned into %APPDATA%\AI-CAD\runtime).
+# The shipped installer pre-bundles these wheels for embed-and-extract; this file is the
+# source of truth for what goes in.
+build123d==0.10.0
+cadquery-ocp==7.8.1.1.post1
+ocpsvg==0.5.0
+numpy==2.4.6
+scipy==1.17.1
+trimesh==4.12.2
+pillow==12.2.0
+# headless rendering
+pyvista==0.48.4
+vtk==9.3.1
+# interfaces
+mcp==1.27.2
+# built-in agent provider adapters
+anthropic==0.107.1
+openai==2.41.0
+httpx==0.28.1

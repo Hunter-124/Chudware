@@ -1,0 +1,1026 @@
+"""The built-in agent loop: prompt -> code -> render -> visual self-check -> iterate.
+
+The model writes a build123d script, the kernel builds the precise solid, the renderer
+produces a multi-view contact sheet, and that image is fed back so the model can compare
+the result against the request and either fix the code or declare it done.
+
+Two layers of iteration:
+  * within a turn  — the loop refines the code over several passes until the render matches;
+  * across turns   — a ``Session`` keeps the conversation (and the last render) alive, so a
+                     follow-up request like "make it 30mm taller" continues from the existing
+                     design instead of starting from scratch.
+
+Provider-agnostic: any `Provider` (Anthropic by default, OpenAI, mock) plugs in. A live
+``on_event`` callback streams per-iteration detail (code, diff, reasoning, render) to a UI.
+"""
+from __future__ import annotations
+
+import difflib
+import json
+import re
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
+
+from engine import paths, render
+from engine.kernel import AssemblyResult, ModelResult, run_code_multi
+
+from . import config as agent_config
+from .providers.base import Provider, assistant, image_part, text_part, user
+
+SYSTEM_PROMPT = """\
+You are a senior mechanical CAD engineer who designs precise, manufacturable parts as \
+parametric models using build123d (a Python B-rep CAD library on the OpenCASCADE kernel). \
+Units are millimeters.
+
+Your job: turn the user's request into a build123d script, then verify the rendered \
+result visually and refine until it faithfully matches the request. When the user follows \
+up, MODIFY the existing design — keep what already matches and change only what they asked.
+
+If the request comes with a BUILD PLAN (parts / dimensions / features), IMPLEMENT THE PLAN: \
+use its dimensions as your named parameter values and its feature list as your checklist — \
+every planned feature should exist in the script. Deviate from a planned value only when the \
+geometry genuinely forces it, and say what you changed (and why) in the json "notes".
+
+Rules for the script:
+- The full `build123d` namespace is already in scope (assume `from build123d import *`).
+- Assign the final solid to a variable named `result` (a Part/Solid/Compound, or a \
+BuildPart context — it will be unwrapped).
+- Prefer real CAD features — extrude/revolve/loft/sweep, fillet, chamfer, holes, \
+counterbores, patterns, shells, threads — over mesh tricks. Keep it parametric (named \
+variables for key dimensions).
+- Keep it self-contained and deterministic. No file I/O, no network, no plotting.
+
+3D SOLID PRIMITIVES (use these directly as solids):
+  Box(length, width, height)
+  Cylinder(radius, height)
+  Sphere(radius)
+  Cone(bottom_radius, top_radius, height)
+  Torus(major_radius, minor_radius)
+
+2D SKETCH -> EXTRUDE PATTERN (use for polygon / custom profiles):
+  face = RegularPolygon(radius=11, side_count=6)   # hex or any n-gon (circumscribed radius)
+  result = extrude(face, amount=22)
+
+  face = Circle(radius=8)
+  result = extrude(face, amount=5)
+
+  face = Rectangle(width=30, height=20)            # rectangle is 2D - MUST be extruded
+  result = extrude(face, amount=8)
+
+BOOLEAN OPS:  result += solid   (fuse)   result -= solid  (cut)   result &= solid  (intersect)
+POSITIONING:  Pos(x,y,z) * Solid(...)   or   Rot(rx,ry,rz) * Solid(...)
+  Pos and Rot are STANDALONE names used exactly like that. There is NO `Mode.Pos`,
+  `Align.Pos` or `.Pos` attribute on anything (writing one raises AttributeError).
+  Solids are CENTERED on the origin by default: Box(L,W,H) spans -L/2..+L/2 in X, NOT 0..L.
+  For corner-at-origin use align=(Align.MIN, Align.MIN, Align.MIN); otherwise place by center.
+  AXES: Box(a, b, c) maps a->X, b->Y, c->Z. FIX one convention at the top of the script
+  (e.g. X=width, Y=depth, Z=height) and derive EVERY feature position from those same
+  variables. A cutter centered beyond +/- dim/2 on an axis lies OUTSIDE the body and
+  removes NOTHING - recheck each feature's center against the half-dimensions.
+PATTERNS (repeated features - hole patterns, standoffs, vents): loop and cut/fuse per spot:
+  for x, y in [(x1,y1), (x2,y2), (x3,y3)]:              # explicit coordinate list
+      result -= Pos(x, y, 0) * Cylinder(radius=r, height=h)
+  for loc in GridLocations(x_pitch, y_pitch, nx, ny):   # regular grid of locations
+      result -= loc * Cylinder(radius=r, height=h)
+  (`with Locations(...): Hole(...)` works ONLY inside `with BuildPart()` - at top level it
+  silently does NOTHING. Outside BuildPart always use the explicit loops above.)
+FEATURES:     fillet(edges, radius=r)   chamfer(edges, length=c)
+              Hole(radius, depth)  CounterBoreHole(radius, counter_bore_radius, counter_bore_depth, depth)
+
+Example 1 - mounting plate with a bolt-hole pattern and a raised boss:
+```python
+plate_l, plate_w, plate_t = 80, 60, 6
+hole_r = 1.7                      # M3 clearance
+result = Box(plate_l, plate_w, plate_t)
+result = fillet(result.edges().filter_by(Axis.Z), radius=4)
+for x, y in [(-32, -22), (32, -22), (-32, 22), (32, 22)]:   # 4-corner pattern
+    result -= Pos(x, y, 0) * Cylinder(radius=hole_r, height=plate_t + 2)
+boss_h = 5                        # raised standoff boss on the top face, with screw bore
+result += Pos(0, 0, plate_t / 2 + boss_h / 2) * Cylinder(radius=4, height=boss_h)
+result -= Pos(0, 0, plate_t / 2 + boss_h / 2) * Cylinder(radius=1.25, height=boss_h + 2)
+```
+
+Example 2 - hex standoff with bore:
+```python
+af = 10              # across-flats (mm)
+total_h = 20         # total height
+bore_r = 1.6         # M3 clearance
+hex_r = af / (3**0.5)  # circumscribed radius from across-flats
+face = RegularPolygon(radius=hex_r, side_count=6)
+result = extrude(face, amount=total_h)
+result -= Cylinder(radius=bore_r, height=total_h)
+```
+
+Example 3 - build-context style (alternative):
+```python
+with BuildPart() as bp:
+    with BuildSketch():
+        RegularPolygon(radius=6, side_count=6)
+    extrude(amount=20)
+    Cylinder(radius=1.5, height=20, mode=Mode.SUBTRACT)
+result = bp.part
+```
+
+MULTI-PART & ASSEMBLY (when the request needs SEVERAL bodies that fit together):
+Instead of a single `result`, define named, individually-positioned parts and let the kernel \
+assemble + fit-check them:
+- `parts = {"base": base_solid, "lid": lid_solid, ...}`  — each value is a complete solid, \
+positioned in the SHARED assembly coordinate space with `Pos(x,y,z) *` / `Rot(rx,ry,rz) *`.
+- Optionally `assembly = Compound(children=[base_solid, lid_solid])` for explicit grouping \
+(usually unnecessary — the kernel builds the assembly from `parts`).
+Model each body around its own origin, then translate/rotate it into place. Define `parts` \
+ONCE as a single dict (don't repeat the assignment). Mating bodies must be positioned so they \
+actually meet: a peg meant to seat in a hole has to reach into it; two plates that bolt \
+together should touch or leave the intended gap. But do NOT place a body where it overlaps \
+solid material of another - a panel positioned AT a wall's coordinate buries itself in that \
+wall (a large interference). To seat a panel/lid against a wall, offset it so it sits just \
+outside (gap), or cut a matching opening/recess in the other part for it to drop into.
+
+Example 4 - a two-part snap box (base + lid) that fit together:
+```python
+wall = 2.0
+base = Box(40, 30, 20)
+base -= Pos(0, 0, wall) * Box(40 - 2*wall, 30 - 2*wall, 20)   # hollow it out
+lid = Box(40, 30, 6)
+lid = Pos(0, 0, 13) * lid                                     # sits on top of the base
+parts = {"base": base, "lid": lid}
+```
+
+Example 5 - a peg seated in a socket (clearance fit):
+```python
+socket = Box(30, 30, 20) - Cylinder(5.2, 16)                 # 10.4mm bore, 16 deep
+peg = Pos(0, 0, 6) * Cylinder(5.0, 24)                       # 10mm peg, 0.2mm radial clearance
+parts = {"socket": socket, "peg": peg}
+```
+
+After an assembly build you ALSO receive a FIT REPORT - the pairwise interference (overlap \
+volume in mm^3 for any bodies that collide) and clearances (the gap in mm between bodies that \
+don't) - plus a COLOR-CODED render with each part a distinct color and a legend. Use it: an \
+unintended INTERFERENCE means two bodies overlap (shrink/move one); too large a clearance \
+means a loose fit (a press-fit wants a tiny intended overlap, a slip-fit a few tenths of mm). \
+Set "done": true for an assembly only once the fit report and render confirm the parts fit as \
+intended.
+
+COMMON MISTAKES TO AVOID:
+- Pos/Rot are standalone: `Pos(x,y,z) * shape`. NEVER write `Mode.Pos`, `Align.Pos` or
+  `shape.Pos` - none of those exist. Repeat a feature with a coordinate-list loop or
+  GridLocations (see PATTERNS); `with Locations(...)` belongs inside BuildPart only.
+- Rectangle / Circle / RegularPolygon are 2D - they CANNOT be used as 3D solids. Always extrude them.
+- Do NOT write `Rectangle(w, h, d)` - Rectangle only takes (width, height).
+- For hex profiles use RegularPolygon(radius=..., side_count=6), not Rectangle or Box.
+- Use radius= and height= keywords on Cylinder/Sphere/Cone (r=/d=/h= are tolerated but discouraged).
+- Solids are origin-centered (see POSITIONING). Coordinates that assume a corner at the origin
+  will place features OUTSIDE the part. A cut tool that doesn't overlap the solid removes nothing.
+- A hole/cutter must fully pass through its wall: make it LONGER than the wall thickness and
+  orient it through the wall (use Rot for side/back panels, not a default vertical cylinder).
+- fillet/chamfer take the EDGES as the FIRST POSITIONAL arg (no `edges=` keyword), and select
+  the edges FROM the part you're modifying: result = fillet(result.edges().filter_by(Axis.Z),
+  radius=2). chamfer uses length= (not radius=): result = chamfer(result.edges(), length=1).
+  Don't pass the whole solid plus a separate edges= (that errors). Apply them to `result`
+  AFTER its holes/bores so the feature isn't lost. Keep the radius/length SMALLER than the
+  thinnest wall it touches - a 2mm wall cannot take a 5mm fillet (the build fails).
+- Don't gold-plate texture: fine "knurling" is hard - a light chamfer or a few ridges is
+  enough; never let a decorative detail break an already-correct part.
+- An enclosure / case / housing must be HOLLOW: subtract the interior volume (outer Box
+  minus inner Box) FIRST, then add internal features (trays, standoffs) INSIDE the cavity.
+  Internal parts must not poke through or sit outside the outer walls - work out each
+  feature's position from the origin-centered coordinates before placing it.
+- Mounting/standoff holes are FEW and SPARSE: typically 4-10 holes at the corners and edge
+  midpoints of the board/part they support, with SMALL radii (M3 clearance radius ~1.7mm,
+  M4 ~2.2mm). Never carpet a face with a dense grid of large holes - list the handful of
+  (x, y) mounting coordinates explicitly and loop over that list.
+- Do not import from build123d - it is already in scope.
+
+After each build you will receive: the captured stdout, mass properties (volume, bounding \
+box), and a rendered contact sheet image (iso / front / back / right / top / bottom). \
+STUDY THE IMAGE. Check proportions, feature presence, counts, orientation, and symmetry \
+against the request - the back and bottom views exist so rear/underside features can be \
+checked too; a cutout or hole pattern that appears in NO view was not actually made.
+
+Respond every turn with EXACTLY these two fenced blocks, in this order:
+1. A ```python block containing the COMPLETE script (assign `result`). If you are only \
+confirming a correct prior result, you may omit this block.
+2. A ```json block: {"done": <bool>, "notes": "<what you see / what you changed>"}.
+
+Knowing when to STOP is part of the job. Set "done": true as soon as you have inspected a \
+render of the CURRENT design and it satisfies the request - do NOT keep polishing a part that \
+is already correct. Return another ```python block ONLY while there is a CONCRETE, visible \
+problem: a wrong dimension, a missing or extra feature, a bad proportion, or - for an assembly \
+- an unintended interference or an out-of-spec clearance. If the render matches the request, \
+"good enough" IS done: stop and set "done": true. Don't invent new requirements the user did \
+not ask for.\
+"""
+
+FIRST_USER = """\
+Design request:
+{request}
+
+Produce the first version now (a ```python block) and set "done": false in the json block \
+- you must inspect at least one render before finishing.\
+"""
+
+# Sent when the user follows up on an existing part. The current contact sheet is attached
+# right after, so the model can see the design it is being asked to change.
+REFINE_USER = """\
+Follow-up request - refine the CURRENT design (shown in the image below). Keep everything \
+that already matches and change only what is needed:
+{request}
+
+Return the COMPLETE updated ```python block (assign `result`) and a ```json block with \
+"done": false - you must inspect a fresh render of the change before finishing.\
+"""
+
+VERIFY = """\
+Compare the image above against the original request. Check these CONCRETE points first:
+1. CONTAINMENT - internal features (trays, bosses, standoffs, mounts) must be INSIDE the \
+body. Anything jutting out past the outer faces that shouldn't is a placement error.
+2. HOLLOWNESS - if the request is an enclosure/case/box/housing, it must be hollowed out \
+(interior cavity subtracted). A very high "solid material fills X% of the bounding box" \
+number means it is still a solid block.
+3. FEATURES - the requested features exist, in roughly the right count, size and spacing. \
+Check the view that actually faces each feature (back view for rear cutouts, bottom for \
+underside). A feature visible in NO view does not exist - its coordinates put it outside \
+the body; fix the placement, don't declare done.
+If all of these pass - even if you can imagine cosmetic tweaks the user didn't ask for - \
+reply with JUST a ```json block {{"done": true, "notes": "..."}} and STOP. Only if one \
+concretely fails, return a corrected ```python block with {{"done": false, "notes": "what \
+is wrong + your fix"}}.\
+"""
+
+# A compact system prompt used after a context-overflow, to free tokens for small-context
+# (local) models while preserving the essential build123d contract.
+SYSTEM_PROMPT_COMPACT = """\
+You are a CAD engineer using build123d (Python on OpenCASCADE; millimeters). The full \
+build123d namespace is already in scope. Assign the final solid to `result`.
+Primitives: Box(length,width,height), Cylinder(radius,height), Sphere(radius), \
+Cone(bottom_radius,top_radius,height), Torus(major_radius,minor_radius). 2D (Rectangle/Circle/\
+RegularPolygon) MUST be extruded: extrude(face, amount=h). Booleans: result += / -= / &= . \
+Place with Pos(x,y,z)* and Rot(rx,ry,rz)* ; solids are centered on the origin by default. \
+Pos/Rot are standalone - `Mode.Pos`/`Align.Pos` do not exist. Repeat features with a loop: \
+`for x, y in [(0,0), (10,0)]: result -= Pos(x,y,0) * Cylinder(radius=r, height=h)` or \
+`for loc in GridLocations(dx,dy,nx,ny): result -= loc * Cylinder(radius=r, height=h)`. \
+fillet(edges, radius=r), chamfer(edges, length=c). An enclosure/case must be HOLLOW \
+(subtract the inner volume) and internal features must sit INSIDE the walls.
+For SEVERAL bodies that fit together, set `parts = {"base": solid_a, "lid": solid_b}` \
+(each positioned with Pos/Rot) INSTEAD of `result`; you then get a fit report \
+(interference overlap + clearances) and a color-coded render to verify the fit.
+Reply with EXACTLY two fenced blocks: a ```python block with the COMPLETE script (assign \
+`result`, or `parts` for an assembly), then a ```json block {"done": <bool>, "notes": "..."}. \
+Set "done": true as soon as the render matches the request - don't over-polish. Keep code concise.\
+"""
+
+# ---------------------------------------------------------------------------
+# PLAN MODE: before any CAD code is written, the model drafts a build plan —
+# the parts, concrete dimensions that make sense, and the features of each part
+# with a rough implementation route. The plan is shown to the user and injected
+# into the design conversation, so the code generation aims at a thought-out
+# target instead of improvising dimensions mid-script.
+# ---------------------------------------------------------------------------
+PLAN_PROMPT = """\
+You are a senior mechanical design engineer planning a CAD build. You will receive a part \
+or assembly request. Do NOT write CAD code. Produce a concise BUILD PLAN that a CAD \
+programmer will implement exactly. Units are millimeters.
+
+Work out three things:
+1. PARTS - one entry per physical body. A simple object is ONE part. Use several parts only \
+when pieces must separate, move, or were explicitly requested as separate (e.g. box + lid).
+2. DIMENSIONS - commit to CONCRETE values for every key dimension. Honor every number the \
+user gave; derive the rest from function and proportion, preferring round, manufacturable \
+values. Sanity anchors: M2/M3/M4 clearance holes r=1.1/1.7/2.2; M3 heat-set boss outer \
+r~3; wall thickness 2-3 for small enclosures (1.5 minimum); fillet/chamfer smaller than the \
+thinnest wall it touches; PCB standoffs 4-6 tall; slip fit = 0.1-0.3 radial clearance, \
+press fit = ~0.05 interference.
+3. FEATURES - per part, the features (holes, pockets, bosses, fillets, vents, lips, slots) \
+with count, size and position, each with a short implementation route.
+
+Implementation routes to draw from (build123d, solids are origin-centered, X=width \
+Y=depth Z=height):
+- plate/panel: Box(L, W, T); round corners = fillet on vertical edges; holes = loop of \
+Pos(x, y, 0) * Cylinder cuts at explicit coordinates.
+- enclosure/case: outer Box minus inner Box (leaves walls + floor), hollow FIRST, then add \
+bosses/standoffs inside the cavity; openings = Box/Cylinder cutters through a wall.
+- standoff/spacer/bushing: Cylinder (or extruded hex RegularPolygon) minus a bore Cylinder.
+- bracket: two plates at 90 degrees (two Boxes), optional triangular gusset; holes per leg.
+- lid: thin Box (or plate with a lip rim) sized to the opening minus clearance.
+- peg/pin in a hole: peg radius = hole radius - 0.1..0.3 for slip, + ~0.05 for press.
+- repeated features: explicit (x, y) coordinate list or GridLocations.
+
+Reply with exactly ONE ```json block, no code, shaped like:
+{
+  "name": "short part name",
+  "summary": "one-sentence overall approach",
+  "parts": [
+    {
+      "name": "base",
+      "purpose": "what this body does",
+      "dimensions": {"length": 80, "width": 60, "thickness": 6},
+      "features": [
+        "4x M3 clearance holes (r=1.7) at corners inset 8 - loop Pos(x,y,0)*Cylinder",
+        "fillet the 4 vertical edges r=4"
+      ]
+    }
+  ],
+  "fit": "how parts mate + intended clearances ('' for a single part)"
+}
+Keep it tight: at most 8 parts and ~6 features per part. No prose outside the json block.\
+"""
+
+PLAN_USER = """\
+Request:
+{request}
+
+Produce the build plan json now.\
+"""
+
+_PLAN_HEADER = "BUILD PLAN (follow it; adjust a value only if the geometry forces it):"
+
+
+def _extract_plan(reply: str) -> dict | None:
+    """Parse the planning reply into a normalized plan dict, or None if unusable."""
+    raw = None
+    m = _JSON_RE.search(reply)
+    if m:
+        raw = m.group(1)
+    else:  # tolerate a bare top-level {...} without the fence
+        a, b = reply.find("{"), reply.rfind("}")
+        if 0 <= a < b:
+            raw = reply[a:b + 1]
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("parts"), list):
+        return None
+    parts = []
+    for p in data["parts"][:8]:
+        if not isinstance(p, dict):
+            continue
+        dims = p.get("dimensions")
+        if isinstance(dims, dict):
+            dim_s = ", ".join(f"{k} {v}" for k, v in list(dims.items())[:10])
+        else:
+            dim_s = str(dims or "").strip()
+        feats = []
+        for f in (p.get("features") or [])[:6]:
+            if isinstance(f, dict):  # tolerate {"feature": ..., "how": ...} objects
+                feats.append(" - ".join(str(v) for v in f.values() if v))
+            elif f:
+                feats.append(str(f))
+        parts.append({"name": str(p.get("name") or f"part{len(parts) + 1}"),
+                      "purpose": str(p.get("purpose") or ""),
+                      "dimensions": dim_s, "features": feats})
+    if not parts:
+        return None
+    return {"name": str(data.get("name") or ""),
+            "summary": str(data.get("summary") or ""),
+            "parts": parts, "fit": str(data.get("fit") or "")}
+
+
+def _plan_text(plan: dict) -> str:
+    """Render the plan as compact text for the design conversation."""
+    lines = [_PLAN_HEADER]
+    head = " - ".join(x for x in (plan.get("name"), plan.get("summary")) if x)
+    if head:
+        lines.append(head)
+    for p in plan["parts"]:
+        lines.append(f'Part "{p["name"]}"'
+                     + (f' - {p["purpose"]}' if p["purpose"] else "")
+                     + (f'. Dimensions (mm): {p["dimensions"]}' if p["dimensions"] else ""))
+        lines.extend(f"  - {f}" for f in p["features"])
+    if plan.get("fit"):
+        lines.append(f"Fit: {plan['fit']}")
+    text = "\n".join(lines)
+    return text if len(text) <= 1800 else text[:1800] + "\n...[plan truncated]"
+
+
+def _make_plan(session: Session, request: str, provider: Provider,
+               on_event: EventFn | None) -> dict | None:
+    """Run the planning call. Best-effort: any failure just means we design without a
+    plan — planning must never block the build itself."""
+    turn = session.turns + 1
+    _emit(on_event, kind="status", index=0, turn=turn, phase="planning",
+          text="Drafting a build plan (parts, dimensions, features)...")
+    try:
+        reply, _ = provider.complete_ex(
+            PLAN_PROMPT, [user([text_part(PLAN_USER.format(request=request))])],
+            max_tokens=2000)
+    except Exception as e:  # noqa: BLE001
+        _emit(on_event, kind="status", index=0, turn=turn, phase="plan_failed",
+              text=f"Planning skipped ({type(e).__name__}) - designing directly.")
+        return None
+    plan = _extract_plan(reply or "")
+    if plan is None:
+        _emit(on_event, kind="status", index=0, turn=turn, phase="plan_failed",
+              text="Plan wasn't parseable - designing directly.")
+        return None
+    session.plan = plan
+    _emit(on_event, kind="plan", turn=turn, plan=plan, raw=_cap(reply, 4000))
+    return plan
+
+
+# Substrings (lowercased) that mark a provider "ran out of context" error, across backends
+# (LM Studio / llama.cpp, OpenAI, Anthropic). Matching one triggers auto-compaction + retry.
+_CTX_OVERFLOW_SIGNS = (
+    "context size", "context length", "context_length_exceeded", "maximum context",
+    "context window", "available context", "prompt is too long", "too many tokens",
+    "reduce the length", "exceeds the maximum", "input is too long",
+)
+_MAX_COMPACT_PASSES = 4
+
+# How many refine passes one turn may take. Generous, so the agent can keep "cooking" on a
+# hard part — but it normally stops far sooner, the moment a render matches the request (see
+# the convergence logic in run_turn). Overridable per call or via config.json "max_iters".
+DEFAULT_MAX_ITERS = 24
+# Stop a turn after this many consecutive iterations that rebuild the SAME geometry without the
+# model declaring done — it has stopped making progress (settled, or stuck going in circles).
+_STAGNATION_LIMIT = 3
+# Give up a turn when the model is stuck on failures it can't fix — quickly when the SAME
+# error keeps coming back (it's looping), more patiently when each failure is DIFFERENT
+# (a model working through distinct problems — a typo, then a too-big fillet — is making
+# progress and deserves the extra passes). Empty replies stay on the tighter limit.
+_SAME_ERROR_LIMIT = 3
+_MAX_FAIL_STREAK = 8
+_NO_CODE_LIMIT = 4
+
+_PY_RE = re.compile(r"```(?:python|py)\s*\n(.*?)```", re.DOTALL)
+_JSON_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL)
+_JSON_OBJ_RE = re.compile(r'\{[^{}]*"done"[^{}]*\}', re.DOTALL)  # bare {...} mentioning "done"
+_DONE_TRUE_RE = re.compile(r'"done"\s*:\s*true', re.IGNORECASE)
+_ANY_FENCE_RE = re.compile(r"```([A-Za-z0-9_+-]*)[ \t]*\n(.*?)```", re.DOTALL)
+_SCRIPTISH_RE = re.compile(r"^\s*(?:result|parts|assembly)\s*=", re.M)
+
+# Event callback: receives a dict describing live progress (see _emit_* below).
+EventFn = Callable[[dict], None]
+
+
+def _extract_code(reply: str) -> str | None:
+    m = _PY_RE.search(reply)
+    if m:
+        return m.group(1).strip()
+    # Fallback for (small) models that drop the language tag: accept the first fenced
+    # block that looks like a build123d script (assigns result/parts/assembly) and isn't
+    # the json verdict — otherwise a perfectly good script triggers a "no code" retry.
+    for lang, body in _ANY_FENCE_RE.findall(reply):
+        if lang.lower() == "json":
+            continue
+        body = body.strip()
+        if _SCRIPTISH_RE.search(body):
+            return body
+    return None
+
+
+def _extract_decision(reply: str) -> dict:
+    """Parse the model's {"done", "notes"} verdict, tolerant of format drift.
+
+    Tries a fenced ```json block first, then any bare ``{...}`` object that mentions "done",
+    then a last-resort structured ``"done": true`` match — so a missing/garbled fence never
+    silently reads as "not done" and traps the loop into running every iteration.
+    """
+    blobs: list[str] = []
+    m = _JSON_RE.search(reply)
+    if m:
+        blobs.append(m.group(1).strip())
+    blobs.extend(_JSON_OBJ_RE.findall(reply))
+    for blob in blobs:
+        try:
+            d = json.loads(blob)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(d, dict) and "done" in d:
+            return {"done": bool(d.get("done", False)), "notes": str(d.get("notes", ""))}
+    if _DONE_TRUE_RE.search(reply):  # broken fence but an unambiguous done:true is present
+        return {"done": True, "notes": ""}
+    return {"done": False, "notes": ""}
+
+
+def _dims(res: ModelResult) -> str:
+    bb = res.bbox or {}
+    size = bb.get("size")
+    if not size:
+        return ""
+    txt = f"{size[0]:.1f} x {size[1]:.1f} x {size[2]:.1f} mm"
+    if res.volume:
+        txt += f"  |  {res.volume:.0f} mm^3"
+    return txt
+
+
+def _fill_ratio(res: ModelResult) -> float | None:
+    """Solid material volume as a fraction of the bounding-box volume. A strong, cheap
+    signal the model can reason from: an enclosure/case near 1.0 was never hollowed out;
+    a plate stays high; a frame/bracket runs low."""
+    bb = res.bbox or {}
+    size = bb.get("size")
+    if not size or not res.volume:
+        return None
+    box = size[0] * size[1] * size[2]
+    if box <= 0:
+        return None
+    return res.volume / box
+
+
+def _format_fit(fit: dict | None) -> str:
+    """Render the kernel's fit report as feedback text the model can act on."""
+    if not fit:
+        return ""
+    lines = [f"FIT REPORT: {fit.get('summary', '')}"]
+    for it in fit.get("interferences", []):
+        lines.append(f"  INTERFERENCE  {it['a']} <-> {it['b']}: {it['volume']:.2f} mm^3 overlap")
+    for cl in fit.get("clearances", []):
+        lines.append(f"  clearance     {cl['a']} <-> {cl['b']}: {cl['distance']:.2f} mm gap")
+    if fit.get("interferences"):
+        lines.append("  -> If that overlap is NOT an intended press-fit, fix it: REPOSITION one "
+                     "part (change its Pos along the axis where the bodies overlap) or CUT a "
+                     "matching opening/pocket in the other part so the inserted part has room. "
+                     "A part placed AT a wall coordinate overlaps that wall - offset it by at "
+                     "least half its own thickness plus the wall thickness to sit flush outside, "
+                     "or place it in an actual gap/opening.")
+    return "\n".join(lines)
+
+
+def _feedback_ok(res: "ModelResult | AssemblyResult") -> str:
+    out = res.stdout.strip()
+    is_asm = getattr(res, "is_assembly", False)
+    head = f"Build OK. Bounding box: {_dims(res) or 'n/a'}. Triangles: {res.triangles}."
+    fill = _fill_ratio(res)
+    if fill is not None:
+        head += f"\nSolid material fills {fill * 100:.0f}% of the bounding box."
+        if not is_asm and fill > 0.85:
+            head += (" If this is meant to be a hollow enclosure/case, it is NOT hollow - "
+                     "subtract the interior volume.")
+    faces = getattr(res, "faces", None)
+    if faces:
+        head += (f"\nFaces: {faces['total']} total, {faces['planar']} planar, "
+                 f"{faces['cylindrical']} cylindrical.")
+        if faces["cylindrical"] == 0:
+            head += (" Zero cylindrical faces = this part has NO round holes or bosses; "
+                     "if the request needs them (screw holes, standoffs, bores), they do "
+                     "not exist yet - their cutters/solids missed the body.")
+    if is_asm:
+        names = ", ".join(p["name"] for p in (res.parts or []))
+        head += f"\nParts ({len(res.parts or [])}): {names}"
+        fit_txt = _format_fit(getattr(res, "fit", None))
+        if fit_txt:
+            head += "\n" + fit_txt
+        tail = ("\nRendered ASSEMBLY contact sheet (each part a distinct color, see legend; "
+                "iso / front / back / right / top / bottom):")
+    else:
+        tail = "\nRendered contact sheet (iso / front / back / right / top / bottom):"
+    return head + (f"\nstdout:\n{out}" if out else "") + tail
+
+
+def _feedback_err(res: ModelResult, can_revert: bool = False) -> str:
+    msg = (
+        "Build FAILED. Fix the script and return a corrected ```python block.\n"
+        f"Error:\n{res.error}"
+        + (f"\nstdout:\n{res.stdout}" if res.stdout.strip() else "")
+    )
+    if can_revert:
+        msg += ("\nNOTE: an earlier version already BUILT successfully. If you can't fix this "
+                "error in one step, REVERT to that last working version and make a smaller, "
+                "safer change (or drop the change that broke it) - don't pile on more changes "
+                "that compound the failure.")
+    return msg
+
+
+# Prepended to VERIFY when the code changed but produced byte-identical geometry — the
+# model "added" features that touched nothing (outside the body / inside a void), which it
+# otherwise tends not to notice (and a weak judge then hallucinates them in the render).
+NOOP_CHANGE_NOTE = """\
+NOTE: your script changed but the resulting geometry is IDENTICAL to the previous build \
+(same volume, same triangle count). Whatever you added or edited had NO effect - new \
+cutters probably sit outside the body or inside an already-empty region, or new solids \
+were never fused into `result`. Re-derive those features' coordinates from the body's \
+half-dimensions, check which AXIS each one should act along (a hole through a wall runs \
+along the wall's normal), and make sure every cutter overlaps solid material.
+"""
+
+
+def _repeat_nudge(res: "ModelResult | AssemblyResult") -> str:
+    """Sent when the model resubmits IDENTICAL code without finishing — a pointed kick to
+    either declare done or make a concrete change, so it stops spinning on the same script."""
+    msg = ("You returned the SAME script as the previous step, so nothing changed. Do ONE of "
+           "these:\n"
+           '- If the render already satisfies the request, reply with just {"done": true}.\n'
+           "- Otherwise make a CONCRETE, specific change this time (different dimensions or "
+           "positions) - do NOT resend identical code.")
+    fit = getattr(res, "fit", None)
+    if fit and fit.get("interferences"):
+        it = fit["interferences"][0]
+        msg += (f"\nThe interference between {it['a']} and {it['b']} ({it['volume']:.0f} mm^3) is "
+                "still unresolved: the two bodies occupy the same space. MOVE one of them (change "
+                "its Pos along the overlapping axis) or CUT an opening for it - resending the same "
+                "positions cannot fix it.")
+    return msg
+
+
+def _diff(old: str | None, new: str) -> str | None:
+    """Unified diff old->new, or None when there is nothing meaningful to show."""
+    if not old or old == new:
+        return None
+    lines = difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        fromfile="previous", tofile="current", lineterm="\n",
+    )
+    return "".join(lines)
+
+
+def _save_iteration(out_dir: Path, name: str, i: int, code: str, res: ModelResult) -> None:
+    """Persist each iteration's script (plus a 'latest' copy) so a failed design is
+    debuggable and the user can inspect / reuse the generated build123d code."""
+    try:
+        status = "OK" if res.ok else "FAILED"
+        tail = ""
+        if not res.ok and res.error:
+            lines = res.error.strip().splitlines()
+            tail = f"  ({lines[-1].strip()})" if lines else ""
+        header = f"# AI-CAD generated build123d script - iteration {i} - {status}{tail}\n\n"
+        (out_dir / f"{name}_iter{i:02d}.py").write_text(header + code, encoding="utf-8")
+        (out_dir / f"{name}.py").write_text(header + code, encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass  # persisting code is best-effort; never let it break the design loop
+
+
+@dataclass
+class IterationLog:
+    index: int
+    ok: bool
+    done: bool
+    notes: str
+    error: str | None = None
+    code: str | None = None
+    diff: str | None = None
+    thinking: str | None = None
+    contact_sheet: str | None = None
+    stl_path: str | None = None   # this pass's built mesh, for live viewport preview
+    dims: str | None = None
+    volume: float | None = None
+    triangles: int | None = None
+    stdout: str | None = None
+    is_assembly: bool = False
+    parts: list | None = None     # per-part [{name, stl_path, bbox, volume, ...}] (assemblies)
+    fit: dict | None = None       # interference/clearance report (assemblies)
+
+
+@dataclass
+class AgentRun:
+    request: str
+    success: bool
+    iterations: int
+    final_code: str | None
+    result: dict | None           # ModelResult / AssemblyResult as dict
+    contact_sheet: str | None
+    out_dir: str
+    session_id: str | None = None
+    turn: int = 1
+    log: list = field(default_factory=list)
+    is_assembly: bool = False
+    fit: dict | None = None       # final assembly fit report (None for single parts)
+    converged: bool = False       # True = the model declared/settled done; False = hit the cap
+    stop_reason: str = ""         # confirmed | stabilized | failed | no_code | max_iters
+    plan: dict | None = None      # the session's build plan (parts/dimensions/features)
+
+
+@dataclass
+class Session:
+    """Conversation state for one part, kept alive across follow-up turns so the agent
+    can iterate on its own prior work instead of restarting each message."""
+    name: str
+    messages: list = field(default_factory=list)
+    last_code: str | None = None
+    last_ok_res: dict | None = None      # ModelResult as dict (for context / fallback)
+    contact_sheet: str | None = None     # latest render, re-shown on the next turn
+    turns: int = 0
+    compact: bool = False                # set once a provider overflows: stay in compact mode
+    plan: dict | None = None             # build plan drafted before the first code pass
+
+
+def _emit(on_event: EventFn | None, **data) -> None:
+    if on_event is not None:
+        try:
+            on_event(data)
+        except Exception:  # noqa: BLE001
+            pass  # a flaky UI sink must never break the design loop
+
+
+def _cap(s: str | None, n: int) -> str | None:
+    if not s:
+        return s
+    return s if len(s) <= n else s[:n] + "\n... (truncated)"
+
+
+def _is_context_overflow(err: Exception) -> bool:
+    msg = str(err).lower()
+    return any(s in msg for s in _CTX_OVERFLOW_SIGNS)
+
+
+_ERR_LINE_RE = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception)\b")
+
+
+def _err_sig(err: str | None) -> str:
+    """A stable signature for a build error: the exception line of the traceback (skipping
+    any appended kernel HINT), so 'the same error again' can be told apart from a new one."""
+    if not err:
+        return ""
+    lines = [ln.strip() for ln in err.strip().splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        if _ERR_LINE_RE.match(ln):
+            return ln
+    return lines[-1] if lines else ""
+
+
+def _strip_images(messages: list, keep_last: int) -> int:
+    """Replace image parts with a short placeholder, keeping only the last ``keep_last``
+    images (images dominate token cost for small-context vision models)."""
+    locs = [(mi, pi) for mi, m in enumerate(messages)
+            for pi, p in enumerate(m["content"]) if p.get("type") == "image"]
+    drop = set(locs if keep_last <= 0 else locs[:-keep_last])
+    n = 0
+    for mi, m in enumerate(messages):
+        out = []
+        for pi, p in enumerate(m["content"]):
+            if (mi, pi) in drop:
+                out.append(text_part("[earlier render omitted to fit context]"))
+                n += 1
+            else:
+                out.append(p)
+        m["content"] = out
+    return n
+
+
+def _keep_recent(messages: list, keep_pairs: int) -> int:
+    """Keep messages[0] (the original request) + the most recent ``keep_pairs`` exchanges,
+    preserving user/assistant alternation. The history is [user, assistant, ..., user]."""
+    n = 2 * keep_pairs
+    if len(messages) <= n + 1:
+        return 0
+    dropped = len(messages) - 1 - n
+    messages[:] = messages[:1] + messages[-n:]
+    return dropped
+
+
+def _truncate_text(messages: list, limit: int) -> None:
+    for m in messages:
+        for p in m["content"]:
+            if p.get("type") == "text" and len(p.get("text", "")) > limit:
+                p["text"] = p["text"][:limit] + "\n...[truncated]"
+
+
+def _apply_compaction(messages: list, level: int) -> None:
+    """Shrink the message history in place; higher levels are more aggressive (cumulative)."""
+    if level >= 1:
+        _strip_images(messages, keep_last=1)     # keep only the latest render
+    if level >= 2:
+        _keep_recent(messages, keep_pairs=3)     # drop older exchanges
+    if level >= 3:
+        _strip_images(messages, keep_last=0)     # drop all images -> stats-only
+        _keep_recent(messages, keep_pairs=2)
+        _truncate_text(messages, 1200)
+    if level >= 4:
+        _keep_recent(messages, keep_pairs=1)     # just the request + the last exchange
+        _truncate_text(messages, 600)
+
+
+def _generate(session: Session, provider: Provider, on_event: EventFn | None,
+              idx: int, turn: int) -> tuple[str, str]:
+    """Get the model's next reply. On a context-overflow error, switch to the compact system
+    prompt, compact the (in-place) history, and retry — so small-context models self-heal
+    instead of dying. Big-context models (Claude) never trigger this."""
+    # config.json "system_prompt" (set via the GUI Settings > Agent tab) fully replaces the
+    # built-in prompt. The compact prompt still takes over on a context overflow — a custom
+    # prompt that overflowed once would just overflow again.
+    override = ""
+    try:
+        override = (agent_config.load_config().get("system_prompt") or "").strip()
+    except Exception:  # noqa: BLE001
+        pass
+    base_prompt = override or SYSTEM_PROMPT
+    for level in range(_MAX_COMPACT_PASSES + 1):
+        compact = session.compact or level > 0
+        system = SYSTEM_PROMPT_COMPACT if compact else base_prompt
+        max_tokens = 2048 if compact else 8000
+        try:
+            return provider.complete_ex(system, session.messages, max_tokens=max_tokens)
+        except Exception as e:  # noqa: BLE001
+            if not _is_context_overflow(e) or level >= _MAX_COMPACT_PASSES:
+                raise
+            session.compact = True
+            _apply_compaction(session.messages, level + 1)
+            _emit(on_event, kind="status", index=idx, turn=turn, phase="compacting",
+                  text=f"Context full - auto-compacting history (pass {level + 1})...")
+
+
+def run_turn(session: Session, request: str, provider: Provider,
+             on_event: EventFn | None = None, max_iters: int | None = None,
+             plan_first: bool = False) -> AgentRun:
+    """Run one user turn against a persistent ``session``, refining until the render matches
+    the request (the model declares "done"), it stops making progress, or ``max_iters`` is hit
+    (default ``DEFAULT_MAX_ITERS``). With ``plan_first``, the first turn opens with a planning
+    call (parts / dimensions / features) that is streamed as a "plan" event and injected into
+    the design conversation. Streams progress via ``on_event`` and returns an AgentRun."""
+    if max_iters is None:
+        max_iters = DEFAULT_MAX_ITERS
+    out_dir = paths.model_dir(session.name)
+    first_turn = not session.messages
+
+    if first_turn:
+        if plan_first:
+            _make_plan(session, request, provider, on_event)
+        opening = FIRST_USER.format(request=request)
+        if session.plan:
+            opening += "\n\n" + _plan_text(session.plan)
+        session.messages.append(user([text_part(opening)]))
+    else:
+        parts = [text_part(REFINE_USER.format(request=request))]
+        prior = session.contact_sheet
+        if prior and getattr(provider, "supports_vision", True) and Path(prior).exists():
+            parts.append(image_part(prior))
+            parts.append(text_part("(Above: the current design you are modifying.)"))
+        session.messages.append(user(parts))
+
+    session.turns += 1
+    turn = session.turns
+
+    log: list[IterationLog] = []
+    last_code: str | None = session.last_code
+    prev_built_code: str | None = session.last_code   # diff baseline across the whole session
+    last_built: str | None = None     # geometry built in the prior pass THIS turn (change baseline)
+    last_res: AssemblyResult | None = None
+    last_ok_res: AssemblyResult | None = None
+    contact_sheet: str | None = session.contact_sheet
+    stagnant = 0                      # consecutive passes that rebuilt identical geometry
+    fail_streak = 0                   # consecutive failed builds / empty replies
+    same_err_streak = 0               # consecutive failures with the SAME error signature
+    last_err_sig = ""
+    prev_metrics = None               # (volume, triangles) of the previous successful build
+    converged = False
+    stop_reason = "max_iters"
+
+    for i in range(max_iters):
+        _emit(on_event, kind="status", index=i, turn=turn, phase="thinking",
+              text=f"Iteration {i + 1}: generating build123d...")
+        reply, thinking = _generate(session, provider, on_event, i, turn)
+        session.messages.append(assistant([text_part(reply)]))
+
+        code = _extract_code(reply)
+        decision = _extract_decision(reply)
+        new_code = code if code is not None else last_code
+
+        if new_code is None:
+            fail_streak += 1
+            if fail_streak >= _NO_CODE_LIMIT:
+                stop_reason = "no_code"
+                break
+            session.messages.append(user([text_part(
+                "No ```python block found. Provide the full script assigning `result` "
+                "(or `parts` for an assembly).")]))
+            _emit(on_event, kind="status", index=i, turn=turn, phase="retry",
+                  text="No code block returned - asking again.")
+            continue
+
+        diff = _diff(prev_built_code, new_code) if code is not None else None
+        _emit(on_event, kind="status", index=i, turn=turn, phase="building",
+              text=f"Iteration {i + 1}: building solid...")
+
+        res = run_code_multi(new_code, out_dir, session.name)
+        last_code, last_res = new_code, res
+        _save_iteration(out_dir, session.name, i, new_code, res)
+
+        sheet_i: str | None = None
+        if res.ok and res.stl_path:
+            last_ok_res = res
+            _emit(on_event, kind="status", index=i, turn=turn, phase="rendering",
+                  text=f"Iteration {i + 1}: rendering views...")
+            # Assemblies get a color-coded per-part contact sheet (falling back to the
+            # combined mesh); single parts use the plain grid as before.
+            if res.is_assembly and res.parts:
+                sheet_i = render.render_assembly_grid(
+                    res.parts, out_dir / f"{session.name}_grid_{i:02d}.png")
+            if not sheet_i:
+                sheet_i = render.render_grid(
+                    res.stl_path, out_dir / f"{session.name}_grid_{i:02d}.png")
+            if sheet_i:
+                contact_sheet = sheet_i
+                # keep a stable "latest" alias for the next turn / external callers
+                try:
+                    Path(out_dir / f"{session.name}_grid.png").write_bytes(
+                        Path(sheet_i).read_bytes())
+                except Exception:  # noqa: BLE001
+                    pass
+
+        entry = IterationLog(
+            index=i, ok=res.ok, done=bool(decision["done"]) and res.ok,
+            notes=decision["notes"], error=res.error,
+            code=new_code, diff=diff, thinking=_cap(thinking, 6000),
+            contact_sheet=sheet_i, stl_path=res.stl_path if res.ok else None,
+            dims=_dims(res) if res.ok else None,
+            volume=res.volume, triangles=res.triangles or None,
+            stdout=_cap(res.stdout.strip() or None, 2000),
+            is_assembly=res.is_assembly,
+            parts=res.parts if res.is_assembly else None,
+            fit=res.fit if res.is_assembly else None,
+        )
+        log.append(entry)
+        prev_built_code = new_code
+        _emit(on_event, kind="iteration", turn=turn, **asdict(entry))
+
+        if res.ok and res.stl_path:
+            fail_streak = 0
+            same_err_streak = 0
+            last_err_sig = ""
+            changed = new_code != last_built
+            metrics = (round(res.volume, 4) if res.volume else None, res.triangles)
+            noop_change = changed and prev_metrics is not None and metrics == prev_metrics
+            prev_metrics = metrics
+            # 1) The model confirms it's done — accept once it has seen a render THIS turn and
+            #    is confirming the CURRENT design (not declaring done on a build it just changed
+            #    and hasn't seen rendered yet; that one gets a render + a final confirm first).
+            if decision["done"] and i >= 1 and not changed:
+                converged = True
+                stop_reason = "confirmed"
+                break
+            # 2) Stagnation — geometry stopped changing but the model won't declare done.
+            #    First repeat(s) get a pointed nudge to actually change something; if it keeps
+            #    resending identical code, treat it as settled and stop (don't burn the budget).
+            if not changed:
+                stagnant += 1
+                if stagnant >= _STAGNATION_LIMIT and i >= 1:
+                    converged = True
+                    stop_reason = "stabilized"
+                    break
+                prompt_text = _repeat_nudge(res)   # repeated identical code -> kick it to change
+            else:
+                stagnant = 0
+                last_built = new_code
+                prompt_text = VERIFY               # genuine progress -> normal verdict request
+                if noop_change:                    # edited code, byte-identical geometry
+                    prompt_text = NOOP_CHANGE_NOTE + "\n" + VERIFY
+            # Show the render (+ fit report) and ask for the next step.
+            if sheet_i and getattr(provider, "supports_vision", True):
+                feedback = [text_part(_feedback_ok(res)), image_part(sheet_i),
+                            text_part(prompt_text)]
+            else:
+                feedback = [text_part(_feedback_ok(res) + "\n(No image available - judge from "
+                                      "the dimensions and your own reasoning.)\n" + prompt_text)]
+            session.messages.append(user(feedback))
+        else:
+            fail_streak += 1
+            sig = _err_sig(res.error)
+            same_err_streak = same_err_streak + 1 if (sig and sig == last_err_sig) else 1
+            last_err_sig = sig
+            if same_err_streak >= _SAME_ERROR_LIMIT or fail_streak >= _MAX_FAIL_STREAK:
+                stop_reason = "failed"
+                break
+            # If a prior version built, tell the model it can revert instead of devolving.
+            can_revert = last_ok_res is not None or session.last_ok_res is not None
+            session.messages.append(user([text_part(_feedback_err(res, can_revert=can_revert))]))
+
+    # Prefer the last successful build over the last attempted build, so a failing
+    # refinement iteration doesn't mask a good model that was already produced.
+    best_res = last_ok_res or last_res
+    success = bool(best_res and best_res.ok)
+
+    # Persist session state for the next turn.
+    session.last_code = last_code
+    if best_res is not None:
+        session.last_ok_res = asdict(best_res)
+    session.contact_sheet = contact_sheet
+
+    # A closing status so the UI can say WHY the turn ended (and whether a nudge would help).
+    if stop_reason == "max_iters":
+        done_text = (f"Stopped after {len(log)} iterations (cap). Ask me to keep going to "
+                     f"continue refining.")
+    elif stop_reason in ("failed", "no_code"):
+        done_text = f"Stopped after {len(log)} iterations - couldn't get a clean build."
+    else:
+        done_text = f"Finished in {len(log)} iteration(s)."
+    _emit(on_event, kind="status", index=len(log), turn=turn, phase="done",
+          text=done_text, converged=converged, stop_reason=stop_reason)
+
+    return AgentRun(
+        request=request,
+        success=success,
+        iterations=len(log),
+        final_code=last_code,
+        result=asdict(best_res) if best_res else None,
+        contact_sheet=contact_sheet,
+        out_dir=str(out_dir),
+        session_id=session.name,
+        turn=turn,
+        log=[asdict(x) for x in log],
+        is_assembly=bool(best_res and best_res.is_assembly),
+        fit=best_res.fit if best_res and best_res.is_assembly else None,
+        converged=converged,
+        stop_reason=stop_reason,
+        plan=session.plan,
+    )
+
+
+def run(request: str, provider: Provider, name: str = "agent_model",
+        max_iters: int | None = None, on_event: EventFn | None = None) -> AgentRun:
+    """One-shot design (no persistent session) - back-compatible entry point used by the
+    CLI and tests. For multi-turn refinement, create a ``Session`` and call ``run_turn``."""
+    return run_turn(Session(name=name), request, provider,
+                    on_event=on_event, max_iters=max_iters)

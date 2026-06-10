@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy to %APPDATA%/AI-CAD/config.json and fill in. Or just set ANTHROPIC_API_KEY in your environment and skip this file.",
+  "provider": "anthropic",
+  "model": "claude-opus-4-8",
+  "api_key": "sk-ant-...",
+  "openai": {
+    "base_url": null
+  }
+}

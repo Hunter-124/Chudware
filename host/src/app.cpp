@@ -43,6 +43,9 @@
 #include "ui/status_bar.h"
 #include "ui/title_bar.h"
 #include "ui/viewport_panel.h"
+#include "ui/icons.h"
+#include "ui/widgets/ribbon.h"
+#include "ui/ribbon_def.h"
 
 int run_gui(const char* screenshotPath) {
     const bool shot = screenshotPath != nullptr;
@@ -99,6 +102,15 @@ int run_gui(const char* screenshotPath) {
     renderer.setBackground(ui::palette.viewportTop[0], ui::palette.viewportTop[1],
                            ui::palette.viewportTop[2], ui::palette.viewportBottom[0],
                            ui::palette.viewportBottom[1], ui::palette.viewportBottom[2]);
+
+    // C14: load icon atlases (stb_image; must be after GL context is live).
+    ui::loadIcons(assets);
+
+    // C14: default ribbon callback — logs to stdout until C17 wires PropertyManager.
+    ui::setRibbonCallback([](const char* cmd_id) {
+        std::printf("[ribbon] %s\n", cmd_id);
+        std::fflush(stdout);
+    });
 
     // Topology picking (C15): id pass + overlays live for the GUI's lifetime; AppState borrows
     // them. They stay inert until a doc mesh (AICM) is loaded. Highlight colors track theme roles.
@@ -165,12 +177,15 @@ int run_gui(const char* screenshotPath) {
         st.chat.push_back(w);
     }
 
-    const char* shotMode = std::getenv("AI_CAD_SHOT");  // screenshot-only: settings|chat|assembly|plan
+    const char* shotMode = std::getenv("AI_CAD_SHOT");  // screenshot-only: settings|chat|assembly|plan|ribbon
     st.wantSettings = shot && shotMode && std::strcmp(shotMode, "settings") == 0;
     st.wantChat = shot && shotMode && std::strcmp(shotMode, "chat") == 0;
     st.wantAssembly = shot && shotMode && std::strcmp(shotMode, "assembly") == 0;
     st.wantPlan = shot && shotMode && std::strcmp(shotMode, "plan") == 0;
     st.wantPick = shot && shotMode && std::strcmp(shotMode, "pick") == 0;
+    st.wantRibbon = shot && shotMode && std::strcmp(shotMode, "ribbon") == 0;
+    // ribbon shot: show Features tab
+    if (st.wantRibbon) { st.showRibbon = true; st.ribbonTab = 0; }
     if (st.wantPick) {
         // C15 picking demo/verification: load the golden box AICM, assert its topology counts,
         // and (in the frame loop) simulate a center-screen pick + highlight. The AICM path can be
@@ -514,10 +529,16 @@ int run_gui(const char* screenshotPath) {
         float barH = 0.0f;
         ui::drawTitleBar(st, maximized, barH);
 
-        // ---------- dockspace host (between the title bar and the status bar) ----------
+        // ---------- C14: ribbon bar (drawn between title bar and dockspace) ----------
+        // syncIconTheme keeps texture selection in sync with the active theme.
+        ui::syncIconTheme();
+        float ribbonH = ui::drawRibbon(st.ribbonTab, st.showRibbon);
+
+        // ---------- dockspace host (between the title bar+ribbon and the status bar) ----------
         const float statusH = 30.0f * scale;
-        ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + barH));
-        ImGui::SetNextWindowSize(ImVec2(vp->Size.x, vp->Size.y - barH - statusH));
+        const float dockTopY = barH + ribbonH;
+        ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + dockTopY));
+        ImGui::SetNextWindowSize(ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
         ImGui::SetNextWindowViewport(vp->ID);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
@@ -530,7 +551,7 @@ int run_gui(const char* screenshotPath) {
         ImGui::PopStyleVar(3);
         ImGuiID dockId = ImGui::GetID("AICADDock");
         if ((!st.layoutInit && ImGui::DockBuilderGetNode(dockId) == nullptr) || st.resetLayout) {
-            buildDefaultLayout(dockId, ImVec2(vp->Size.x, vp->Size.y - barH - statusH));
+            buildDefaultLayout(dockId, ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
             st.layoutInit = true;
             st.resetLayout = false;
         }
@@ -598,6 +619,7 @@ int run_gui(const char* screenshotPath) {
     }
 
     freeChatTextures(st.chat);  // release iteration thumbnails while the GL context is still live
+    ui::freeIcons();            // C14: release atlas textures while GL context is still live
     st.worker.stop();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();

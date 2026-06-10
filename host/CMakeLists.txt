@@ -62,6 +62,11 @@ add_executable(AI-CAD
   src/ui_theme.cpp
   src/win_chrome.cpp
   src/stb_impl.cpp
+  # --- C14: ribbon widgets + command table + icon loader ---
+  src/ui/icons.cpp
+  src/ui/widgets/ribbon.cpp
+  src/ui/ribbon_def.cpp
+  # --- end C14 ---
   extern/glad/src/gl.c
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp

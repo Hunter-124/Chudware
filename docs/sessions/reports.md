@@ -98,6 +98,17 @@ session transcripts; commit messages carry verification evidence.
 - dress.py/sketch.py import private selectors._score_candidate for a hint_index tiebreak
   fallback (margin<=0.05 but best<0.01 — geometrically identical twins). Don't rename it.
 
+## C14 ribbon
+- ui/icons.{h,cpp}: loadIcons(assetsDir), getIcon(name, size)->IconUV, syncIconTheme() (swap
+  texture, UVs constant), magenta placeholder. ui/widgets/ribbon: setRibbonCallback(fn(cmd_id)),
+  drawRibbon(tab, show), ribbonHeight(). ribbon_def.cpp: 73 rows (Features 27/Sketch 25/
+  Evaluate 11/Simulation 10), stretch rows disabled. AppState: showRibbon/ribbonTab/wantRibbon.
+- C17 replaces the default printf callback with the PM dispatcher.
+- ImGui 1.91.6: ImTextureID is ImU64 — cast (ImTextureID)0, not nullptr.
+- POLISH DEBT (cosmetic, for C17 or a polish card): tab strip crowds the title bar; long labels
+  overlap on narrow big-buttons and group captions ("Lin. Pattern"/"Coord. Sys" collide);
+  needs min button width from label measure + tab strip vertical padding.
+
 ## C10 sketch solver
 - `from engine.doc.sketch_solver import solve_sketch, drag, SolveState, SketchSolution`.
 - solve_sketch(sketch_params, equations_env, warm=None) -> SketchSolution{entities (solved param

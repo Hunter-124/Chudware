@@ -102,6 +102,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("View")) {
+            ImGui::MenuItem("Ribbon", nullptr, &st.showRibbon);
             ImGui::MenuItem("Design / Chat", nullptr, &st.showDesign);
             ImGui::MenuItem("Viewport", nullptr, &st.showViewport);
             ImGui::MenuItem("Console", nullptr, &st.showConsole);

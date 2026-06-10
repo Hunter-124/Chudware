@@ -293,9 +293,14 @@ struct AppState {
     bool showAbout = false, designStarted = false;
     int frame = 0;
 
+    // ---- ribbon (C14) ----
+    bool showRibbon = true;   // View > Ribbon visibility toggle
+    int  ribbonTab  = 0;      // 0=Features 1=Sketch 2=Evaluate 3=Simulation
+
     // ---- screenshot-mode flags (set from AI_CAD_SHOT in run_gui) ----
     bool wantSettings = false, wantChat = false, wantAssembly = false, wantPlan = false;
-    bool wantPick = false;  // C15: load box.aicm, simulate a center pick, print + screenshot
+    bool wantPick   = false;  // C15: load box.aicm, simulate a center pick, print + screenshot
+    bool wantRibbon = false;  // C14: ribbon screenshot mode
     bool pickPrinted = false;  // guard so the "pick:" stdout line prints exactly once
 
     // ---- the run_gui lambdas, now methods ----

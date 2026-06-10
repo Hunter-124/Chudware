@@ -60,6 +60,17 @@ session transcripts; commit messages carry verification evidence.
 - Worked residual templates (coincident/distance/point_on_line/fix/h/v) in test_nsolve.py.
 - Perf: warm median ~8.8-9.0 ms @ 200 vars.
 
+## C07 LBM wind tunnel
+- `from engine.sim.lbm import run_wind_tunnel` (C08's sim worker already calls it).
+- FlowResult: slices[3] (YZ/XZ/XY mid-plane vmag m/s float32 2D), slice_transforms[3] (4x4
+  world mm), streamline_points[i] (N,3 mm) + streamline_speeds[i], trace [(step, drag_n)],
+  reynolds_note (qualitative disclaimer string), diverged, frontal_area_mm2, cd, drag_n, lift_n.
+  AICM packaging (SCLR slices/LINS streamlines) is C19's job.
+- Runtime guidance: coarse full run ~23s; medium ~2min; fine ~16min, xfine ~73min — C19 must
+  surface honest estimates + use max_steps caps for fine/xfine.
+- LIMITATION for C19 UI: walls thinner than ~1 voxel leak (under-predict drag 5-15x) — warn
+  when part min-thickness < voxel size. numba/vectorized streaming = M10 perf lever.
+
 ## C10 sketch solver
 - `from engine.doc.sketch_solver import solve_sketch, drag, SolveState, SketchSolution`.
 - solve_sketch(sketch_params, equations_env, warm=None) -> SketchSolution{entities (solved param

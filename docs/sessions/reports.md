@@ -47,6 +47,19 @@ session transcripts; commit messages carry verification evidence.
 - Study JSON accepts mesh_path OR step_path (panel should cache mesh_path).
 - tet4 ~15% stiff in bending; P2 upgrade path = skfem ElementTetP2 (later card).
 
+## C06 nsolve (committed with this note)
+- `engine.doc.nsolve`: System(); add_vars(n, init)->int64 indices; add_residual(rfunc, var_idx,
+  jfunc, tag, weight=1.0, soft=False) — one block PER CONSTRAINT tagged with its constraint id;
+  shapes probed at registration. solve(x0, tol, max_iter, time_budget_ms)->Result{x, converged,
+  iterations, max_residual} (warm start = pass previous x; budget returns best-so-far).
+  analyze(x)->Analysis{dof, redundant_tags (consistent dependents = warn), conflicting_tags
+  (inconsistent = over-defined red), well_posed, rank}. dof>0 under; dof==0 & well_posed full.
+- soft_target(idx, target, weight): CONSTRAINED drag (null-space projected) — hard constraints
+  exact, point tracks cursor along the manifold; one soft_target per dragged coordinate.
+- Analytic Jacobians only; sparsity pattern cached per solve; dense QR rank ok to ~600 vars.
+- Worked residual templates (coincident/distance/point_on_line/fix/h/v) in test_nsolve.py.
+- Perf: warm median ~8.8-9.0 ms @ 200 vars.
+
 ## C12 evaluate (this commit)
 - engine.doc.evaluate: mass_props(shape,density), measure(infos), section_props(shape,plane),
   interference(bodies), check(shape), symmetry(shape,plane), draft_field/thickness_field/

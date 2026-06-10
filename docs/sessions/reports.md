@@ -120,6 +120,19 @@ session transcripts; commit messages carry verification evidence.
 - Parallel line-line distance: pass refs as point+line ("e1.p1","e2"); bare line-line treated
   as point_on path. Per-entity status via SVD nullspace inside sketch_solver (nsolve untouched).
 
+## C11 sessions + worker doc_* + .step+ (the C16 contract)
+- engine/worker.py now serves: 11 doc_* + 9 eval_* methods, ping protocol:2; legacy methods
+  byte-identical (errors: NEW methods use {code,message,detail}; legacy keep plain strings).
+- C16 contract transcript (test_worker_doc.py, real stdio): doc_new->doc_id+rev0;
+  doc_apply_ops(add box)->rev1, id_map {$0:f1}, tess.aicm_path; doc_resolve_pick{revision,
+  body_id, kind, topo_id(1-based TopExp == AICM ids)}->selector (stale revision -> code
+  stale_revision + detail.current_revision); fillet via picked selector; undo/redo BUMP revision
+  FORWARD and return full ops-response; doc_save/doc_open (.step+ ~5.6KB, doc_open adds doc_id
+  + warnings); doc_list.
+- .step+ thumbnail = flat placeholder (render path deferred); frozen-geometry open fallback
+  deferred to C21. eval_measure/section/symmetry: last-body + reserved datums only (M5 refines).
+- GOTCHA: `from engine.doc import evaluate` shadows -> use `import engine.doc.evaluate as ...`.
+
 ## C12 evaluate (this commit)
 - engine.doc.evaluate: mass_props(shape,density), measure(infos), section_props(shape,plane),
   interference(bodies), check(shape), symmetry(shape,plane), draft_field/thickness_field/

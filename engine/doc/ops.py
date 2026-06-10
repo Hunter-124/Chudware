@@ -1,0 +1,712 @@
+"""Document ops — validate-then-apply the closed mutation vocabulary (docs/contracts/doc_ops.md).
+
+The GUI and (M9) the AI modeler emit exactly these ops. :func:`apply_ops` is the single entry
+point: it takes a document dict + an op batch and returns ``(new_doc, id_map)`` or raises
+:class:`OpError` with a structured ``{code, message, detail}`` payload (doc_ops.md §5).
+
+Transactionality (doc_ops.md §2):
+  1. Validation is atomic — the WHOLE batch is structurally + referentially checked first (and the
+     RESULTING document is run through the schema validator). Any failure rejects the batch with
+     ``invalid_op {index, reason}`` and NO state change.
+  2. Application is atomic — all ops apply to a working copy; the caller swaps it in and bumps the
+     revision by exactly 1.
+  3. Rebuild failures are NOT op errors (a feature that fails to compile keeps its edited
+     definition) — that is the session/compiler layer's concern, not this module's.
+
+Id placeholders (doc_ops.md §3): an op that creates an object may be referenced by a LATER op in
+the same batch as ``"$<op-index>"``. Inside ``sketch_add_entity.constraints``, ``"$self"`` refers
+to the entity being added. Placeholders are resolved against assigned ids before the resulting
+document is validated.
+
+Ids are assigned monotonically per document: features ``f<N>``, sketch entities ``e<N>``,
+constraints ``c<N>``, components ``k<N>``, mates ``m<N>``. Counters never reuse a freed id.
+"""
+
+from __future__ import annotations
+
+import copy
+import re
+from typing import Any
+
+from engine.doc.schema import (
+    RESERVED_DATUMS,
+    validate_document,
+)
+
+# --------------------------------------------------------------------------- error envelope
+
+
+class OpError(Exception):
+    """A structured op error (doc_ops.md §5). Carries ``code`` + ``detail`` for the RPC envelope."""
+
+    def __init__(self, code: str, message: str, detail: dict | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.detail = detail or {}
+
+    def to_envelope(self) -> dict:
+        return {"code": self.code, "message": self.message, "detail": self.detail}
+
+
+def _invalid(index: int, reason: str) -> OpError:
+    return OpError("invalid_op", f"op[{index}]: {reason}", {"index": index, "reason": reason})
+
+
+# --------------------------------------------------------------------------- id counters
+
+
+_ID_RE = {
+    "f": re.compile(r"^f(\d+)$"),
+    "e": re.compile(r"^e(\d+)$"),
+    "c": re.compile(r"^c(\d+)$"),
+    "k": re.compile(r"^k(\d+)$"),
+    "m": re.compile(r"^m(\d+)$"),
+}
+
+
+def _scan_max(doc: dict) -> dict[str, int]:
+    """Find the current max numeric suffix per id family so new ids are monotonic."""
+    hi = {"f": 0, "e": 0, "c": 0, "k": 0, "m": 0}
+
+    def bump(prefix: str, value: Any) -> None:
+        if isinstance(value, str):
+            m = _ID_RE[prefix].match(value)
+            if m:
+                hi[prefix] = max(hi[prefix], int(m.group(1)))
+
+    for feat in doc.get("features", []) or []:
+        if not isinstance(feat, dict):
+            continue
+        bump("f", feat.get("id"))
+        if feat.get("type") == "sketch":
+            params = feat.get("params", {}) or {}
+            for ent in params.get("entities", []) or []:
+                if isinstance(ent, dict):
+                    bump("e", ent.get("id"))
+            for con in params.get("constraints", []) or []:
+                if isinstance(con, dict):
+                    bump("c", con.get("id"))
+    for comp in doc.get("components", []) or []:
+        if isinstance(comp, dict):
+            bump("k", comp.get("id"))
+    for mate in doc.get("mates", []) or []:
+        if isinstance(mate, dict):
+            bump("m", mate.get("id"))
+    return hi
+
+
+class _IdGen:
+    """Monotonic id generator seeded from the document's existing ids."""
+
+    def __init__(self, doc: dict) -> None:
+        self._hi = _scan_max(doc)
+
+    def next(self, prefix: str) -> str:
+        self._hi[prefix] += 1
+        return f"{prefix}{self._hi[prefix]}"
+
+
+# --------------------------------------------------------------------------- doc helpers
+
+
+def _features(doc: dict) -> list[dict]:
+    return doc.setdefault("features", [])
+
+
+def _find_feature(doc: dict, fid: str) -> tuple[int, dict] | tuple[None, None]:
+    for i, f in enumerate(_features(doc)):
+        if isinstance(f, dict) and f.get("id") == fid:
+            return i, f
+    return None, None
+
+
+def _find_sketch(doc: dict, fid: str) -> dict:
+    _, f = _find_feature(doc, fid)
+    if f is None:
+        raise OpError("invalid_op", f"sketch '{fid}' not found", {"reason": f"unknown sketch {fid}"})
+    if f.get("type") != "sketch":
+        raise OpError("invalid_op", f"feature '{fid}' is not a sketch",
+                      {"reason": f"{fid} is not a sketch"})
+    return f
+
+
+def _patch(target: dict, patch: dict) -> None:
+    """Apply patch semantics: present keys replace; a ``None`` value deletes the key."""
+    for k, v in patch.items():
+        if v is None:
+            target.pop(k, None)
+        else:
+            target[k] = v
+
+
+# --------------------------------------------------------------------------- reference scan
+
+
+def _walk_selector_owners(obj: Any, out: set[str]) -> None:
+    """Collect every ``owner_feature`` / datum ``feature`` / region ``sketch`` referenced anywhere
+    inside *obj* (a ref value, a selector, a list of selectors, ...)."""
+    if isinstance(obj, dict):
+        kind = obj.get("kind")
+        if kind in ("face", "edge", "vertex", "body"):
+            ow = obj.get("owner_feature")
+            if isinstance(ow, str):
+                out.add(ow)
+        elif kind == "datum":
+            fe = obj.get("feature")
+            if isinstance(fe, str):
+                out.add(fe)
+        elif kind == "region":
+            sk = obj.get("sketch")
+            if isinstance(sk, str):
+                out.add(sk)
+        for v in obj.values():
+            _walk_selector_owners(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _walk_selector_owners(v, out)
+
+
+def _feature_dependents(doc: dict, fid: str) -> list[str]:
+    """Feature ids that reference *fid* (via selectors, datum refs, region refs, or feature-list
+    refs like patterns/mirror). Used to refuse a non-cascade delete/reorder."""
+    deps: list[str] = []
+    for f in _features(doc):
+        if not isinstance(f, dict) or f.get("id") == fid:
+            continue
+        refs = f.get("refs", {}) or {}
+        referenced: set[str] = set()
+        _walk_selector_owners(refs, referenced)
+        # feature-id-list refs (linear_pattern/circular_pattern/mirror features slot)
+        for slot_val in refs.values():
+            if isinstance(slot_val, list):
+                for item in slot_val:
+                    if isinstance(item, str):
+                        referenced.add(item)
+            elif isinstance(slot_val, str):
+                referenced.add(slot_val)
+        if fid in referenced:
+            deps.append(f["id"])
+    return deps
+
+
+def _eq_referencing(doc: dict, name: str) -> list[str]:
+    """Feature ids (or 'equations.<other>') whose expressions reference equation *name*."""
+    from engine.doc.equations import EquationError, expr_names
+
+    refs: list[str] = []
+
+    def uses(expr: Any) -> bool:
+        if not isinstance(expr, str) or not expr:
+            return False
+        try:
+            return name in expr_names(expr)
+        except EquationError:
+            return False
+
+    # Other globals
+    for g in (doc.get("equations", {}) or {}).get("globals", []) or []:
+        if isinstance(g, dict) and g.get("name") != name and uses(g.get("expr")):
+            refs.append(f"equations.{g.get('name')}")
+
+    # Feature dim exprs
+    def walk(v: Any, where: str) -> None:
+        if isinstance(v, dict):
+            if uses(v.get("expr")):
+                refs.append(where)
+            for k, sub in v.items():
+                walk(sub, where)
+        elif isinstance(v, list):
+            for sub in v:
+                walk(sub, where)
+
+    for f in _features(doc):
+        if isinstance(f, dict):
+            walk(f.get("params", {}), f.get("id", "?"))
+    return refs
+
+
+# --------------------------------------------------------------------------- op application
+
+
+def _new_feature_envelope(feature: dict, fid: str) -> dict:
+    """Normalize an inbound ``add_feature.feature`` (no id) into a full feature envelope."""
+    out = copy.deepcopy(feature)
+    out["id"] = fid
+    out.setdefault("name", fid)
+    out.setdefault("suppressed", False)
+    out.setdefault("params", {})
+    out.setdefault("refs", {})
+    return out
+
+
+def _resolve_placeholder(value: Any, id_map: dict[str, str], index: int) -> Any:
+    """Resolve a ``"$N"`` placeholder string to its assigned id. Non-placeholders pass through.
+    A ``"$N"`` referring to an op that produced no id (or a later op) is an error."""
+    if isinstance(value, str) and value.startswith("$") and value != "$self":
+        if value not in id_map:
+            raise _invalid(index, f"placeholder '{value}' does not refer to an earlier created object")
+        return id_map[value]
+    return value
+
+
+def _resolve_placeholders_deep(obj: Any, id_map: dict[str, str], index: int) -> Any:
+    """Recursively resolve ``$N`` placeholders that appear as the ``sketch`` field of an op or as a
+    feature-id inside a feature-list ref. We only substitute strings that look like ``$N``; ``$self``
+    is left for the sketch-entity constraint pass."""
+    if isinstance(obj, dict):
+        return {k: _resolve_placeholders_deep(v, id_map, index) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_resolve_placeholders_deep(v, id_map, index) for v in obj]
+    return _resolve_placeholder(obj, id_map, index)
+
+
+def _apply_one(doc: dict, op: dict, index: int, idgen: _IdGen, id_map: dict[str, str]) -> None:
+    """Apply a single op to *doc* in place. Records any created id in *id_map* under ``$<index>``."""
+    if not isinstance(op, dict):
+        raise _invalid(index, "op must be an object")
+    kind = op.get("op")
+    if not isinstance(kind, str):
+        raise _invalid(index, "op.op (the op name) is required")
+
+    handler = _OP_HANDLERS.get(kind)
+    if handler is None:
+        raise OpError("unsupported", f"op[{index}]: unknown op '{kind}'",
+                      {"index": index, "reason": f"unsupported op '{kind}'"})
+    handler(doc, op, index, idgen, id_map)
+
+
+# ---- part + general ----
+
+
+def _op_add_feature(doc, op, index, idgen, id_map):
+    feature = op.get("feature")
+    if not isinstance(feature, dict):
+        raise _invalid(index, "add_feature requires a 'feature' object")
+    fid = idgen.next("f")
+    feat = _new_feature_envelope(feature, fid)
+    # Resolve $N placeholders inside the feature's refs (e.g. region sketch placeholders).
+    feat["refs"] = _resolve_placeholders_deep(feat.get("refs", {}), id_map, index)
+    feats = _features(doc)
+    before = op.get("before")
+    if before is None:
+        feats.append(feat)
+    else:
+        pos, _ = _find_feature(doc, before)
+        if pos is None:
+            raise _invalid(index, f"before='{before}' is not an existing feature")
+        feats.insert(pos, feat)
+    id_map[f"${index}"] = fid
+
+
+def _op_edit_feature(doc, op, index, idgen, id_map):
+    fid = op.get("id")
+    _, feat = _find_feature(doc, fid)
+    if feat is None:
+        raise _invalid(index, f"edit_feature: '{fid}' not found")
+    if "params" in op and isinstance(op["params"], dict):
+        feat.setdefault("params", {})
+        _patch(feat["params"], op["params"])
+    if "refs" in op and isinstance(op["refs"], dict):
+        feat.setdefault("refs", {})
+        _patch(feat["refs"], _resolve_placeholders_deep(op["refs"], id_map, index))
+    if "name" in op and op["name"] is not None:
+        feat["name"] = op["name"]
+
+
+def _op_delete_feature(doc, op, index, idgen, id_map):
+    fid = op.get("id")
+    pos, feat = _find_feature(doc, fid)
+    if feat is None:
+        raise _invalid(index, f"delete_feature: '{fid}' not found")
+    cascade = bool(op.get("cascade", False))
+    deps = _feature_dependents(doc, fid)
+    if deps and not cascade:
+        raise OpError("dependency_exists",
+                      f"feature '{fid}' is referenced by {deps}",
+                      {"dependents": deps})
+    to_delete = {fid}
+    if cascade:
+        # Transitively collect dependents.
+        changed = True
+        while changed:
+            changed = False
+            for f in _features(doc):
+                if isinstance(f, dict) and f["id"] not in to_delete:
+                    if _feature_dependents_subset(doc, f["id"], to_delete):
+                        to_delete.add(f["id"])
+                        changed = True
+    doc["features"] = [f for f in _features(doc) if not (isinstance(f, dict) and f["id"] in to_delete)]
+
+
+def _feature_dependents_subset(doc: dict, fid: str, deleted: set[str]) -> bool:
+    """True if feature *fid* references any feature already marked for deletion."""
+    _, feat = _find_feature(doc, fid)
+    if feat is None:
+        return False
+    referenced: set[str] = set()
+    refs = feat.get("refs", {}) or {}
+    _walk_selector_owners(refs, referenced)
+    for slot_val in refs.values():
+        if isinstance(slot_val, list):
+            referenced.update(x for x in slot_val if isinstance(x, str))
+        elif isinstance(slot_val, str):
+            referenced.add(slot_val)
+    return bool(referenced & deleted)
+
+
+def _op_reorder_feature(doc, op, index, idgen, id_map):
+    fid = op.get("id")
+    pos, feat = _find_feature(doc, fid)
+    if feat is None:
+        raise _invalid(index, f"reorder_feature: '{fid}' not found")
+    feats = _features(doc)
+    feats.pop(pos)
+    before = op.get("before")
+    if before is None:
+        feats.append(feat)
+        new_pos = len(feats) - 1
+    else:
+        bpos, _ = _find_feature(doc, before)
+        if bpos is None:
+            raise _invalid(index, f"reorder_feature: before='{before}' not found")
+        feats.insert(bpos, feat)
+        new_pos = bpos
+    # Dependency validation: every feature this one references must still precede it.
+    referenced: set[str] = set()
+    _walk_selector_owners(feat.get("refs", {}) or {}, referenced)
+    for slot_val in (feat.get("refs", {}) or {}).values():
+        if isinstance(slot_val, list):
+            referenced.update(x for x in slot_val if isinstance(x, str))
+        elif isinstance(slot_val, str):
+            referenced.add(slot_val)
+    referenced -= set(RESERVED_DATUMS)
+    preceding = {f["id"] for f in feats[:new_pos] if isinstance(f, dict)}
+    missing = [r for r in referenced if r not in preceding and _find_feature(doc, r)[1] is not None]
+    if missing:
+        raise OpError("dependency_exists",
+                      f"reorder would place '{fid}' before its dependencies {missing}",
+                      {"dependents": missing})
+
+
+def _op_set_suppressed(doc, op, index, idgen, id_map):
+    fid = op.get("id")
+    _, feat = _find_feature(doc, fid)
+    if feat is None:
+        raise _invalid(index, f"set_suppressed: '{fid}' not found")
+    feat["suppressed"] = bool(op.get("value"))
+
+
+def _op_rename(doc, op, index, idgen, id_map):
+    fid = op.get("id")
+    _, feat = _find_feature(doc, fid)
+    if feat is None:
+        raise _invalid(index, f"rename: '{fid}' not found")
+    name = op.get("name")
+    if not isinstance(name, str) or not name:
+        raise _invalid(index, "rename requires a non-empty 'name'")
+    feat["name"] = name
+
+
+def _op_set_material(doc, op, index, idgen, id_map):
+    key = op.get("key")
+    if key is None:
+        doc["material"] = None
+    elif isinstance(key, str):
+        doc["material"] = {"key": key}
+    else:
+        raise _invalid(index, "set_material requires a string 'key' (or null)")
+
+
+def _op_set_units(doc, op, index, idgen, id_map):
+    system = op.get("system")
+    if system not in ("MMGS", "IPS"):
+        raise _invalid(index, "set_units.system must be MMGS or IPS")
+    doc.setdefault("units", {})["system"] = system
+
+
+def _op_eq_set(doc, op, index, idgen, id_map):
+    name = op.get("name")
+    expr = op.get("expr")
+    if not isinstance(name, str) or not re.match(r"^[A-Za-z_]\w*$", name):
+        raise _invalid(index, f"eq_set: invalid equation name '{name}'")
+    if not isinstance(expr, str):
+        raise _invalid(index, "eq_set requires a string 'expr'")
+    eq = doc.setdefault("equations", {"globals": []})
+    globs = eq.setdefault("globals", [])
+    for g in globs:
+        if isinstance(g, dict) and g.get("name") == name:
+            g["expr"] = expr
+            return
+    globs.append({"name": name, "expr": expr})
+
+
+def _op_eq_delete(doc, op, index, idgen, id_map):
+    name = op.get("name")
+    refs = _eq_referencing(doc, name)
+    if refs:
+        raise OpError("eq_in_use", f"equation '{name}' is referenced by {refs}",
+                      {"referencing": refs})
+    eq = doc.get("equations", {"globals": []})
+    eq["globals"] = [g for g in eq.get("globals", []) if not (isinstance(g, dict) and g.get("name") == name)]
+
+
+# ---- sketch ----
+
+
+def _op_sketch_add_entity(doc, op, index, idgen, id_map):
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    entity = op.get("entity")
+    if not isinstance(entity, dict):
+        raise _invalid(index, "sketch_add_entity requires an 'entity' object")
+    eid = idgen.next("e")
+    ent = copy.deepcopy(entity)
+    ent["id"] = eid
+    ent.setdefault("construction", False)
+    sk.setdefault("params", {}).setdefault("entities", []).append(ent)
+    # Inferred constraints (may use "$self" to refer to this entity).
+    for con in op.get("constraints", []) or []:
+        c = copy.deepcopy(con)
+        c["id"] = idgen.next("c")
+        c["refs"] = [_sub_self(r, eid) for r in (c.get("refs", []) or [])]
+        sk["params"].setdefault("constraints", []).append(c)
+    id_map[f"${index}"] = eid
+
+
+def _sub_self(handle: Any, eid: str) -> Any:
+    """Replace a ``$self`` (optionally ``$self.sub``) handle with the just-created entity id."""
+    if isinstance(handle, str) and handle.startswith("$self"):
+        return eid + handle[len("$self"):]
+    return handle
+
+
+def _op_sketch_edit_entity(doc, op, index, idgen, id_map):
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    eid = op.get("id")
+    for ent in sk.get("params", {}).get("entities", []):
+        if ent.get("id") == eid:
+            if isinstance(op.get("params"), dict):
+                _patch(ent, op["params"])
+            return
+    raise _invalid(index, f"sketch_edit_entity: entity '{eid}' not found")
+
+
+def _op_sketch_delete_entity(doc, op, index, idgen, id_map):
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    eid = op.get("id")
+    params = sk.setdefault("params", {})
+    ents = params.setdefault("entities", [])
+    if not any(e.get("id") == eid for e in ents):
+        raise _invalid(index, f"sketch_delete_entity: entity '{eid}' not found")
+    params["entities"] = [e for e in ents if e.get("id") != eid]
+    # Cascade: drop constraints whose handles touch this entity.
+    cons = params.setdefault("constraints", [])
+    params["constraints"] = [
+        c for c in cons
+        if not any(_handle_base(h) == eid for h in (c.get("refs", []) or []))
+    ]
+
+
+def _handle_base(handle: Any) -> str | None:
+    if isinstance(handle, str):
+        return handle.split(".", 1)[0]
+    return None
+
+
+def _op_sketch_add_constraint(doc, op, index, idgen, id_map):
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    con = op.get("constraint")
+    if not isinstance(con, dict):
+        raise _invalid(index, "sketch_add_constraint requires a 'constraint' object")
+    c = copy.deepcopy(con)
+    c["id"] = idgen.next("c")
+    sk.setdefault("params", {}).setdefault("constraints", []).append(c)
+    id_map[f"${index}"] = c["id"]
+
+
+def _op_sketch_delete_constraint(doc, op, index, idgen, id_map):
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    cid = op.get("id")
+    params = sk.setdefault("params", {})
+    cons = params.setdefault("constraints", [])
+    if not any(c.get("id") == cid for c in cons):
+        raise _invalid(index, f"sketch_delete_constraint: '{cid}' not found")
+    params["constraints"] = [c for c in cons if c.get("id") != cid]
+
+
+def _op_sketch_set_dim(doc, op, index, idgen, id_map):
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    cid = op.get("id")
+    for c in sk.get("params", {}).get("constraints", []):
+        if c.get("id") == cid:
+            if "expr" in op and op["expr"] is not None:
+                cur = c.get("value") if isinstance(c.get("value"), dict) else {"value": 0.0}
+                c["value"] = {"value": cur.get("value", 0.0), "expr": op["expr"]}
+            elif "value" in op:
+                c["value"] = {"value": float(op["value"]), "expr": None}
+            else:
+                raise _invalid(index, "sketch_set_dim requires 'value' or 'expr'")
+            return
+    raise _invalid(index, f"sketch_set_dim: constraint '{cid}' not found")
+
+
+# ---- assembly ----
+
+
+def _op_asm_insert_component(doc, op, index, idgen, id_map):
+    source = op.get("source")
+    if not isinstance(source, dict) or not (source.get("path") or source.get("embedded")):
+        raise _invalid(index, "asm_insert_component requires source.{path|embedded}")
+    kid = idgen.next("k")
+    comps = doc.setdefault("components", [])
+    first = len(comps) == 0
+    comp = {
+        "id": kid,
+        "name": op.get("name") or kid,
+        "source": source,
+        "transform": op.get("transform") or _identity16(),
+        "fixed": bool(op.get("fixed", first)),
+        "suppressed": False,
+    }
+    comps.append(comp)
+    id_map[f"${index}"] = kid
+
+
+def _identity16() -> list[float]:
+    return [1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0]
+
+
+def _op_asm_edit_component(doc, op, index, idgen, id_map):
+    kid = op.get("id")
+    for c in doc.get("components", []):
+        if c.get("id") == kid:
+            for k in ("transform", "name", "suppressed", "fixed"):
+                if k in op and op[k] is not None:
+                    c[k] = op[k]
+            return
+    raise _invalid(index, f"asm_edit_component: '{kid}' not found")
+
+
+def _op_asm_delete_component(doc, op, index, idgen, id_map):
+    kid = op.get("id")
+    comps = doc.get("components", [])
+    if not any(c.get("id") == kid for c in comps):
+        raise _invalid(index, f"asm_delete_component: '{kid}' not found")
+    mates = doc.get("mates", [])
+    referencing = [m["id"] for m in mates
+                   if any(isinstance(r, dict) and r.get("component") == kid for r in m.get("refs", []))]
+    if referencing and not bool(op.get("cascade", False)):
+        raise OpError("dependency_exists", f"component '{kid}' used by mates {referencing}",
+                      {"dependents": referencing})
+    doc["components"] = [c for c in comps if c.get("id") != kid]
+    doc["mates"] = [m for m in mates
+                    if not any(isinstance(r, dict) and r.get("component") == kid for r in m.get("refs", []))]
+
+
+def _op_asm_add_mate(doc, op, index, idgen, id_map):
+    mate = op.get("mate")
+    if not isinstance(mate, dict):
+        raise _invalid(index, "asm_add_mate requires a 'mate' object")
+    m = copy.deepcopy(mate)
+    m["id"] = idgen.next("m")
+    m.setdefault("suppressed", False)
+    m.setdefault("align", "aligned")
+    doc.setdefault("mates", []).append(m)
+    id_map[f"${index}"] = m["id"]
+
+
+def _op_asm_edit_mate(doc, op, index, idgen, id_map):
+    mid = op.get("id")
+    for m in doc.get("mates", []):
+        if m.get("id") == mid:
+            for k in ("value", "align", "suppressed"):
+                if k in op and op[k] is not None:
+                    m[k] = op[k]
+            return
+    raise _invalid(index, f"asm_edit_mate: '{mid}' not found")
+
+
+def _op_asm_delete_mate(doc, op, index, idgen, id_map):
+    mid = op.get("id")
+    mates = doc.get("mates", [])
+    if not any(m.get("id") == mid for m in mates):
+        raise _invalid(index, f"asm_delete_mate: '{mid}' not found")
+    doc["mates"] = [m for m in mates if m.get("id") != mid]
+
+
+def _op_asm_set_explode(doc, op, index, idgen, id_map):
+    steps = op.get("steps")
+    if not isinstance(steps, list):
+        raise _invalid(index, "asm_set_explode requires a 'steps' list")
+    doc["explode"] = copy.deepcopy(steps)
+
+
+# ---- M2 geometry helpers: schema-reserved, not implemented this card ----
+
+
+def _op_unsupported_m2(doc, op, index, idgen, id_map):
+    raise OpError("unsupported", f"op[{index}]: '{op.get('op')}' is reserved for M2",
+                  {"index": index, "reason": f"{op.get('op')} not implemented yet"})
+
+
+_OP_HANDLERS = {
+    "add_feature": _op_add_feature,
+    "edit_feature": _op_edit_feature,
+    "delete_feature": _op_delete_feature,
+    "reorder_feature": _op_reorder_feature,
+    "set_suppressed": _op_set_suppressed,
+    "rename": _op_rename,
+    "set_material": _op_set_material,
+    "set_units": _op_set_units,
+    "eq_set": _op_eq_set,
+    "eq_delete": _op_eq_delete,
+    "sketch_add_entity": _op_sketch_add_entity,
+    "sketch_edit_entity": _op_sketch_edit_entity,
+    "sketch_delete_entity": _op_sketch_delete_entity,
+    "sketch_add_constraint": _op_sketch_add_constraint,
+    "sketch_delete_constraint": _op_sketch_delete_constraint,
+    "sketch_set_dim": _op_sketch_set_dim,
+    "asm_insert_component": _op_asm_insert_component,
+    "asm_edit_component": _op_asm_edit_component,
+    "asm_delete_component": _op_asm_delete_component,
+    "asm_add_mate": _op_asm_add_mate,
+    "asm_edit_mate": _op_asm_edit_mate,
+    "asm_delete_mate": _op_asm_delete_mate,
+    "asm_set_explode": _op_asm_set_explode,
+    "sketch_trim": _op_unsupported_m2,
+    "sketch_extend": _op_unsupported_m2,
+    "sketch_offset": _op_unsupported_m2,
+    "sketch_convert": _op_unsupported_m2,
+    "sketch_mirror_entities": _op_unsupported_m2,
+    "sketch_pattern_entities": _op_unsupported_m2,
+}
+
+
+# --------------------------------------------------------------------------- public entry
+
+
+def apply_ops(doc: dict, ops: list[dict]) -> tuple[dict, dict[str, str]]:
+    """Validate-then-apply *ops* against *doc*. Returns ``(new_doc, id_map)``.
+
+    Atomic: the whole batch is applied to a deep copy; if any op fails OR the resulting document
+    does not validate, the original *doc* is left untouched and an :class:`OpError` is raised.
+    """
+    if not isinstance(ops, list):
+        raise OpError("invalid_op", "ops must be a list", {"index": -1, "reason": "ops not a list"})
+
+    working = copy.deepcopy(doc)
+    idgen = _IdGen(working)
+    id_map: dict[str, str] = {}
+
+    for index, op in enumerate(ops):
+        _apply_one(working, op, index, idgen, id_map)
+
+    # Resulting-document validation (doc_ops.md §2.1): reject batches that produce an invalid doc.
+    errs = validate_document(working)
+    if errs:
+        raise OpError("invalid_op",
+                      "resulting document failed validation: " + "; ".join(errs[:5]),
+                      {"index": -1, "reason": errs[0] if errs else "invalid document",
+                       "all_errors": errs})
+
+    return working, id_map

@@ -3,8 +3,8 @@ __pycache__/
 *.pyc
 .venv/
 
-# C++ host build output
-host/build/
+# C++ host build output (parallel agent build dirs included)
+host/build*/
 
 # Release artifacts (regenerate with installer/build_release.py)
 dist/

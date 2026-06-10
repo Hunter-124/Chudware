@@ -55,7 +55,7 @@ def _ping(_params: dict, _emit_event: EmitFn) -> dict:
         ver = getattr(build123d, "__version__", "?")
     except Exception:  # noqa: BLE001
         ver = None
-    return {"pong": True, "build123d": ver}
+    return {"pong": True, "build123d": ver, "protocol": 2}
 
 
 def _run_model(params: dict, _emit_event: EmitFn) -> dict:
@@ -111,11 +111,307 @@ def _get_prompts(_params: dict, _emit_event: EmitFn) -> dict:
             "override": config.load_config().get("system_prompt", "")}
 
 
+# =========================================================================== doc_* RPC (C11)
+#
+# Document sessions, the op vocabulary, tessellation on rebuild, pick resolution, and minimal
+# .step+ save/open. New methods use the STRUCTURED error envelope {code, message, detail}
+# (doc_ops.md §5); legacy methods keep their plain-string `error` (worker_rpc.md §2).
+
+
+def _doc_emit(emit_event: EmitFn):
+    """Adapt a session/eval emit-callback (dict) onto the worker's event sink."""
+    def _e(data: dict) -> None:
+        emit_event(data)
+    return _e
+
+
+def _doc_new(params: dict, _emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.new_session(kind=params.get("kind", "part"), name=params.get("name"))
+    resp = docsess.rebuild(s)
+    resp["doc_id"] = s.doc_id
+    return resp
+
+
+def _doc_open(params: dict, _emit: EmitFn) -> dict:
+    from engine.doc import stepplus, session as docsess
+    s, warnings = stepplus.open(params["path"])
+    resp = docsess.rebuild(s)
+    resp["doc_id"] = s.doc_id
+    resp["warnings"] = warnings
+    return resp
+
+
+def _doc_save(params: dict, _emit: EmitFn) -> dict:
+    from engine.doc import stepplus, session as docsess
+    s = docsess.get_session(params["doc_id"])
+    path = params.get("path") or s.path
+    if not path:
+        from engine.doc.ops import OpError
+        raise OpError("io_error", "doc_save: no path given and document has no current path",
+                      {"reason": "missing path"})
+    out = stepplus.save(s, path)
+    return {"path": out}
+
+
+def _doc_close(params: dict, _emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    closed = docsess.close_session(params["doc_id"])
+    return {"closed": closed}
+
+
+def _doc_list(_params: dict, _emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    return {"docs": docsess.list_sessions()}
+
+
+def _doc_apply_ops(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.apply_ops(s, params.get("base_revision"), params.get("ops", []),
+                             emit=_doc_emit(emit))
+
+
+def _doc_undo(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    return docsess.undo(docsess.get_session(params["doc_id"]), emit=_doc_emit(emit))
+
+
+def _doc_redo(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    return docsess.redo(docsess.get_session(params["doc_id"]), emit=_doc_emit(emit))
+
+
+def _doc_tree(params: dict, _emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    return docsess.tree(docsess.get_session(params["doc_id"]))
+
+
+def _doc_rebuild(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    return docsess.rebuild(docsess.get_session(params["doc_id"]), emit=_doc_emit(emit))
+
+
+def _doc_resolve_pick(params: dict, _emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.resolve_pick(
+        s, params.get("revision"),
+        int(params["body_id"]), params["kind"], int(params["topo_id"]))
+
+
+# =========================================================================== eval_* RPC (C12)
+#
+# Per reports.md §C12: nine handlers over the active document's bodies. Field handlers tessellate
+# the active body, run the field fn, and write_aicm([tess], extra_chunks=[chunk]) to a temp path,
+# returning {aicm_path}. mm / degrees / grams throughout.
+
+
+def _eval_active_shape(doc_id: str, body_id: int | None = None):
+    """Return (session, BodyOut) for the active (or selected) solid body."""
+    from engine.doc import session as docsess
+    s = docsess.get_session(doc_id)
+    result = docsess._ensure_built(s)
+    bodies = list(result.bodies)
+    if not bodies:
+        from engine.doc.ops import OpError
+        raise OpError("invalid_op", "document has no bodies to evaluate",
+                      {"reason": "no bodies"})
+    if body_id is not None:
+        if body_id < 1 or body_id > len(bodies):
+            from engine.doc.ops import OpError
+            raise OpError("invalid_op", f"body_id {body_id} out of range", {"reason": "bad body_id"})
+        return s, bodies[body_id - 1], result
+    return s, bodies[-1], result
+
+
+def _eval_write_field_aicm(doc_id: str, body, chunk_fn) -> str:
+    """Tessellate *body*, run chunk_fn(tess, shape)->(...,chunk_bytes), write AICM to temp."""
+    import tempfile
+    from engine.doc import tessellate as tess
+    bt = tess.tessellate_body(body.shape, body_id=1, name=body.name or "Body1",
+                              color=tuple(body.color) if body.color else (0.71, 0.76, 0.82))
+    chunk = chunk_fn(bt, body.shape)
+    with tempfile.NamedTemporaryFile(suffix=".aicm", delete=False) as tf:
+        tmp = tf.name
+    tess.write_aicm_file(tmp, [bt], extra_chunks=[chunk])
+    return tmp
+
+
+def _eval_mass(params: dict, _emit: EmitFn) -> dict:
+    import engine.doc.evaluate as evaluate
+    _, body, _r = _eval_active_shape(params["doc_id"], params.get("body"))
+    density = params.get("density_g_cm3", 7.85)
+    return evaluate.mass_props(body.shape, density)
+
+
+def _eval_measure(params: dict, _emit: EmitFn) -> dict:
+    import engine.doc.evaluate as evaluate
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    result = docsess._ensure_built(s)
+    bodies = list(result.bodies)
+    infos = []
+    for ref in params.get("refs", []):
+        infos.append(_resolve_eval_ref(ref, result, bodies))
+    return evaluate.measure(infos)
+
+
+def _resolve_eval_ref(ref: dict, result, bodies) -> dict:
+    """Resolve a selector ref to a {shape, kind} dict for evaluate.measure (best-effort)."""
+    from engine.doc import selectors as sel
+    kind = ref.get("kind")
+    # Resolve against the last body's topology (M5 multi-body refinement is a later card).
+    if not bodies:
+        from engine.doc.ops import OpError
+        raise OpError("invalid_op", "no bodies for measure", {"reason": "no bodies"})
+    body = bodies[-1]
+    raw = body.shape.wrapped
+    diag = 100.0
+    try:
+        bb = body.shape.bounding_box()
+        import math
+        diag = max(math.sqrt((bb.max.X - bb.min.X) ** 2 + (bb.max.Y - bb.min.Y) ** 2
+                             + (bb.max.Z - bb.min.Z) ** 2), 1e-3)
+    except Exception:  # noqa: BLE001
+        pass
+    if kind == "face":
+        infos = sel.describe_faces(raw)
+        elems = body.shape.faces()
+    elif kind == "edge":
+        infos = sel.describe_edges(raw)
+        elems = body.shape.edges()
+    elif kind == "vertex":
+        infos = sel.describe_vertices(raw)
+        elems = body.shape.vertices()
+    else:
+        from engine.doc.ops import OpError
+        raise OpError("invalid_op", f"measure ref kind '{kind}' unsupported",
+                      {"reason": "bad kind"})
+    rr = sel.resolve(ref, infos, diag)
+    if rr.index is None:
+        from engine.doc.ops import OpError
+        raise OpError("invalid_op", f"measure ref dangling: {rr.dangling_reason}",
+                      {"reason": rr.dangling_reason})
+    return {"shape": elems[rr.index], "kind": kind}
+
+
+def _eval_section_props(params: dict, _emit: EmitFn) -> dict:
+    import engine.doc.evaluate as evaluate
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    result = docsess._ensure_built(s)
+    body = list(result.bodies)[-1]
+    plane = _resolve_eval_plane(params.get("plane"), s)
+    return evaluate.section_props(body.shape, plane)
+
+
+def _resolve_eval_plane(plane_ref, session):
+    """Resolve a plane ref (datum id / datum selector) to a build123d Plane for section/symmetry."""
+    from engine.doc.features.datum import reserved_datums
+    from engine.doc.ops import OpError
+    fid = None
+    if isinstance(plane_ref, str):
+        fid = plane_ref
+    elif isinstance(plane_ref, dict) and plane_ref.get("kind") == "datum":
+        fid = plane_ref.get("feature")
+    if fid is None:
+        raise OpError("invalid_op", "plane must be a datum id or datum selector",
+                      {"reason": "bad plane"})
+    d = reserved_datums().get(fid)
+    if d is None or d.kind != "plane":
+        raise OpError("invalid_op", f"plane '{fid}' is not a reserved planar datum",
+                      {"reason": "bad plane"})
+    return d.obj
+
+
+def _eval_interference(params: dict, _emit: EmitFn) -> dict:
+    import engine.doc.evaluate as evaluate
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    result = docsess._ensure_built(s)
+    members = [(bo.name or bo.body_id, bo.shape) for bo in result.bodies]
+    return evaluate.interference(members)
+
+
+def _eval_check(params: dict, _emit: EmitFn) -> dict:
+    import engine.doc.evaluate as evaluate
+    _, body, _r = _eval_active_shape(params["doc_id"], params.get("body"))
+    return evaluate.check(body.shape)
+
+
+def _eval_symmetry(params: dict, _emit: EmitFn) -> dict:
+    import engine.doc.evaluate as evaluate
+    s, body, _r = _eval_active_shape(params["doc_id"], params.get("body"))
+    plane = _resolve_eval_plane(params.get("plane"), s)
+    return evaluate.symmetry(body.shape, plane)
+
+
+def _eval_draft(params: dict, _emit: EmitFn) -> dict:
+    import engine.doc.evaluate as evaluate
+    _, body, _r = _eval_active_shape(params["doc_id"], params.get("body"))
+    pull = params.get("pull", [0.0, 0.0, 1.0])
+    angle = params.get("angle_deg", 0.0)
+    path = _eval_write_field_aicm(
+        params["doc_id"], body,
+        lambda bt, sh: evaluate.draft_field(bt, sh, pull, angle)[3])
+    return {"aicm_path": path}
+
+
+def _eval_thickness(params: dict, _emit: EmitFn) -> dict:
+    import engine.doc.evaluate as evaluate
+    _, body, _r = _eval_active_shape(params["doc_id"], params.get("body"))
+    path = _eval_write_field_aicm(
+        params["doc_id"], body,
+        lambda bt, sh: evaluate.thickness_field(bt, sh)[3])
+    return {"aicm_path": path}
+
+
+def _eval_curvature(params: dict, _emit: EmitFn) -> dict:
+    import engine.doc.evaluate as evaluate
+    _, body, _r = _eval_active_shape(params["doc_id"], params.get("body"))
+    kind = params.get("kind", "mean")
+    path = _eval_write_field_aicm(
+        params["doc_id"], body,
+        lambda bt, sh: evaluate.curvature_field(bt, sh, kind)[3])
+    return {"aicm_path": path}
+
+
 _METHODS = {
     "ping": _ping,
     "run_model": _run_model,
     "agent_design": _agent_design,
     "get_prompts": _get_prompts,
+    # Documents (C11)
+    "doc_new": _doc_new,
+    "doc_open": _doc_open,
+    "doc_save": _doc_save,
+    "doc_close": _doc_close,
+    "doc_list": _doc_list,
+    "doc_apply_ops": _doc_apply_ops,
+    "doc_undo": _doc_undo,
+    "doc_redo": _doc_redo,
+    "doc_tree": _doc_tree,
+    "doc_rebuild": _doc_rebuild,
+    "doc_resolve_pick": _doc_resolve_pick,
+    # Evaluate (C12)
+    "eval_mass": _eval_mass,
+    "eval_measure": _eval_measure,
+    "eval_section_props": _eval_section_props,
+    "eval_interference": _eval_interference,
+    "eval_check": _eval_check,
+    "eval_symmetry": _eval_symmetry,
+    "eval_draft": _eval_draft,
+    "eval_thickness": _eval_thickness,
+    "eval_curvature": _eval_curvature,
+}
+
+# Methods that emit the structured error envelope {code, message, detail} on failure.
+_STRUCTURED_ERROR_METHODS = {
+    "doc_new", "doc_open", "doc_save", "doc_close", "doc_list", "doc_apply_ops",
+    "doc_undo", "doc_redo", "doc_tree", "doc_rebuild", "doc_resolve_pick",
+    "eval_mass", "eval_measure", "eval_section_props", "eval_interference", "eval_check",
+    "eval_symmetry", "eval_draft", "eval_thickness", "eval_curvature",
 }
 
 
@@ -153,10 +449,21 @@ def serve() -> None:
             result = fn(req.get("params") or {}, emit_event)
             _emit({"id": rid, "ok": True, "result": result})
         except Exception as e:  # noqa: BLE001
-            # Lead with the concise "Type: message" (callers often show only the first line)
-            # then the full traceback for debugging.
-            _emit({"id": rid, "ok": False,
-                   "error": f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"})
+            if method in _STRUCTURED_ERROR_METHODS:
+                # New methods (doc_*/eval_*) use the structured envelope of doc_ops.md §5.
+                from engine.doc.ops import OpError
+                if isinstance(e, OpError):
+                    _emit({"id": rid, "ok": False, "error": e.to_envelope()})
+                else:
+                    _emit({"id": rid, "ok": False, "error": {
+                        "code": "internal", "message": f"{type(e).__name__}: {e}",
+                        "detail": {"traceback": traceback.format_exc()}}})
+            else:
+                # Legacy methods keep the plain-string error (frozen wire shape).
+                # Lead with the concise "Type: message" (callers often show only the first line)
+                # then the full traceback for debugging.
+                _emit({"id": rid, "ok": False,
+                       "error": f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"})
 
 
 if __name__ == "__main__":

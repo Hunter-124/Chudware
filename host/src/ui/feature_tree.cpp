@@ -186,13 +186,17 @@ static bool appearanceColorPicker(const char* popupId, float outColor[3]) {
 // ---- draw one feature row ----
 // Returns true if the row was left-clicked (selection).
 // reorderCb(draggedId, beforeId): drop draggedId immediately before beforeId (empty = end).
+// convertCb (optional): called when the user picks "Convert to Chamfer/Fillet"; label supplied
+//   by the caller; nullptr hides the menu item.
 static bool featureRow(const std::string& fid, const std::string& name, const char* iconName,
                        const char* iconFallback, bool suppressed, bool selected, bool dimmed,
                        bool ok, bool hasError, const std::string& errText,
                        const std::vector<std::string>& danglingRefs,
                        const std::function<void(const std::string&)>& editCallback,
                        const std::function<void(const std::string&, const std::string&)>& reorderCb,
-                       AppState& st) {
+                       AppState& st,
+                       const char* convertLabel = nullptr,
+                       const std::function<void()>& convertCb = nullptr) {
     float iconW = 20.0f;
     treeIcon(iconName, iconFallback, iconW);
     ImGui::SameLine(0, 4);
@@ -298,6 +302,14 @@ static bool featureRow(const std::string& fid, const std::string& name, const ch
             nlohmann::json ops = nlohmann::json::array();
             ops.push_back({{"op", "set_suppressed"}, {"id", fid}, {"value", !suppressed}});
             applyTreeOps(st, ops, "suppress");
+        }
+        // C27-C: Convert Fillet↔Chamfer (SolidWorks dress-up parity).
+        // convertCb is supplied by the draw loop when the feature type is fillet or chamfer.
+        // v1 note: if a downstream feature depends on this one, applyTreeOpsNow surfaces a
+        // "dependency_exists" warning and leaves the tree unchanged.
+        if (convertCb && convertLabel) {
+            ImGui::Separator();
+            if (ImGui::MenuItem(convertLabel)) convertCb();
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Delete")) {
@@ -938,12 +950,68 @@ void drawFeatureTree(AppState& st,
                                 Palette::toU32(pal.treeRowSelected));
                         }
 
+                        // C27-C: convert fillet↔chamfer. Carry radius↔length + refs verbatim.
+                        // Position preserved: delete current, add_feature before the *next* id
+                        // (or omit "before" when this is the last feature).
+                        const char* convertLabel = nullptr;
+                        std::function<void()> convertCb = nullptr;
+                        bool isFillet  = (ftype == "fillet");
+                        bool isChamfer = (ftype == "chamfer");
+                        if (isFillet || isChamfer) {
+                            convertLabel = isFillet ? "Convert to Chamfer" : "Convert to Fillet";
+                            // Capture by value everything we need (f is a ref into the tree json
+                            // being iterated — must copy before the callback fires).
+                            nlohmann::json capturedFeat = f;        // deep copy
+                            std::string    capturedType = ftype;
+                            std::string    capturedFid  = fid;
+                            // Determine the id of the feature AFTER this one (for position).
+                            std::string nextId;
+                            {
+                                bool foundSelf = false;
+                                for (const auto& ff : *feat) {
+                                    if (!ff.is_object()) continue;
+                                    if (foundSelf) { nextId = jfld(ff, "id"); break; }
+                                    if (jfld(ff, "id") == fid) foundSelf = true;
+                                }
+                            }
+                            convertCb = [&st, capturedFeat, capturedType, capturedFid, nextId]() {
+                                std::string toType = (capturedType == "fillet") ? "chamfer" : "fillet";
+                                // Build params for the new feature: carry radius↔length.
+                                nlohmann::json newParams = nlohmann::json::object();
+                                if (capturedType == "fillet") {
+                                    // fillet -> chamfer: radius becomes length
+                                    auto rIt = capturedFeat["params"].find("radius");
+                                    newParams["length"] = (rIt != capturedFeat["params"].end())
+                                        ? *rIt : nlohmann::json({{"value", 1.0}});
+                                } else {
+                                    // chamfer -> fillet: length becomes radius
+                                    auto lIt = capturedFeat["params"].find("length");
+                                    newParams["radius"] = (lIt != capturedFeat["params"].end())
+                                        ? *lIt : nlohmann::json({{"value", 2.0}});
+                                }
+                                // Build new feature json (refs.edges carried verbatim).
+                                nlohmann::json newFeat = {
+                                    {"type",   toType},
+                                    {"params", newParams},
+                                    {"refs",   capturedFeat.value("refs", nlohmann::json::object())},
+                                };
+                                nlohmann::json addOp = {{"op", "add_feature"}, {"feature", newFeat}};
+                                if (!nextId.empty()) addOp["before"] = nextId;
+                                nlohmann::json ops = nlohmann::json::array({
+                                    {{"op", "delete_feature"}, {"id", capturedFid}, {"cascade", false}},
+                                    addOp,
+                                });
+                                applyTreeOps(st, ops, "convert");
+                            };
+                        }
+
                         bool clicked = featureRow(
                             fid, fname,
                             featureIcon(ftype), featureFallback(ftype),
                             suppressed, sel, dimmed,
                             fs.ok, !fs.error.empty(), fs.error, fs.dangling,
-                            editCallback, reorderCb, st);
+                            editCallback, reorderCb, st,
+                            convertLabel, convertCb);
 
                         if (clicked) {
                             selectedFeatureId = fid;

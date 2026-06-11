@@ -265,6 +265,12 @@ struct AppState {
     // Value = {nx, ny, nz, cx, cy, cz} — area-weighted average face normal + face centroid (world).
     std::unordered_map<uint64_t, std::array<float, 6>> faceNormalCache;
 
+    // C27-A: per-edge centroid cache, filled in the same loadDocMesh pass as the face cache.
+    // Key = (body_id << 32) | edge_id (matches PickHit body_id / topo_id for PickKind::Edge).
+    // Value = {cx, cy, cz} — mean of the edge polyline points (world). Used to anchor in-viewport
+    // parameter callouts to a filleted/chamfered edge when the PM selector lacks a centroid.
+    std::unordered_map<uint64_t, std::array<float, 3>> edgeCentroidCache;
+
     // ---- settings + system-prompt editor buffer ----
     Settings settings;
     std::vector<char> spBuf{std::vector<char>(16384, 0)};

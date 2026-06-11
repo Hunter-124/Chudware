@@ -22,6 +22,7 @@
 #include "../render/overlays.h"
 
 #include "sketch_mode.h"   // C18
+#include "property_manager.h"  // C27-A: in-viewport parameter callouts
 
 namespace ui {
 
@@ -979,7 +980,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
             ImGui::PopID();
         }
-        if (!st.modelInfo.empty() && renderer.hasMesh()) {
+        // C27-A: hide the model-info dims pill while a PM form is active (callouts own the
+        // viewport's parameter readout; avoids visual clutter / overlap).
+        bool pmActive = st.propertyManager &&
+                        static_cast<ui::PropertyManager*>(st.propertyManager)->active();
+        if (!st.modelInfo.empty() && renderer.hasMesh() && !pmActive) {
             // dimensions readout, bottom-left (sits above the orientation triad)
             ImFont* mf = st.fonts.mono ? st.fonts.mono : ImGui::GetFont();
             float fs = mf->FontSize * 0.92f;
@@ -1024,6 +1029,76 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 vdl->AddRectFilled(q0, q1, overlayBg, 4.0f);
                 vdl->AddRect(q0, q1, planeChipBord, 4.0f);
                 vdl->AddText(ImVec2(x0 + 6, y0 + 3), overlayTxt, nm);
+            }
+        }
+
+        // ---- C27-A: SolidWorks-style in-viewport parameter callouts ----
+        // While the PropertyManager is editing a feature, show a small chip ("Radius: 4mm")
+        // per visible+enabled Dim field, tied by a leader line to the affected geometry.
+        if (st.propertyManager && st.hasDocMesh) {
+            auto* pm = static_cast<ui::PropertyManager*>(st.propertyManager);
+            if (pm->active()) {
+                std::vector<ui::PMCalloutItem> items = pm->calloutItems(st);
+                if (!items.empty()) {
+                    const float* m = renderer.camera().mvp.m;  // column-major model->clip
+                    auto project = [&](const float w[3], ImVec2& out) -> bool {
+                        float x = m[0]*w[0] + m[4]*w[1] + m[8]*w[2]  + m[12];
+                        float y = m[1]*w[0] + m[5]*w[1] + m[9]*w[2]  + m[13];
+                        float wc= m[3]*w[0] + m[7]*w[1] + m[11]*w[2] + m[15];
+                        if (wc <= 1e-4f) return false;  // behind the camera
+                        out.x = vr0.x + (x / wc * 0.5f + 0.5f) * (vr1.x - vr0.x);
+                        out.y = vr0.y + (1.0f - (y / wc * 0.5f + 0.5f)) * (vr1.y - vr0.y);
+                        return true;
+                    };
+                    const float sc = ui::uiScale;
+                    const ImU32 leaderCol = ImGui::ColorConvertFloat4ToU32(
+                        ImVec4(vpal.accent[0], vpal.accent[1], vpal.accent[2], 0.8f));
+                    const ImU32 chipBord = ui::Palette::toU32(vpal.accent);
+                    // Limit to ~3 chips; stagger vertically so anchored chips don't overlap.
+                    int shown = 0, anchoredRow = 0, dockRow = 0;
+                    for (const auto& ci : items) {
+                        if (shown >= 3) break;
+                        std::string txt = ci.label + ": " + ci.value;
+                        ImVec2 ts = ImGui::CalcTextSize(txt.c_str());
+                        float padX = 8.0f * sc, padY = 4.0f * sc;
+                        float cw = ts.x + padX * 2, ch = ts.y + padY * 2;
+
+                        ImVec2 chipTL;
+                        bool drawLeader = false;
+                        ImVec2 anchorSp;
+                        if (ci.hasAnchor && project(ci.anchor, anchorSp)) {
+                            // Offset the chip up-right from the anchor; stagger by row.
+                            float off = 40.0f * sc;
+                            chipTL = ImVec2(anchorSp.x + off,
+                                            anchorSp.y - off - anchoredRow * (ch + 6.0f * sc));
+                            drawLeader = true;
+                            ++anchoredRow;
+                        } else {
+                            // No geometry: dock top-right, under the HUD pick readout.
+                            chipTL = ImVec2(vr1.x - cw - 12.0f * sc,
+                                            vr0.y + 44.0f * sc + dockRow * (ch + 6.0f * sc));
+                            ++dockRow;
+                        }
+                        // Clamp the chip inside the viewport rect.
+                        if (chipTL.x + cw > vr1.x - 4) chipTL.x = vr1.x - cw - 4;
+                        if (chipTL.x < vr0.x + 4)       chipTL.x = vr0.x + 4;
+                        if (chipTL.y + ch > vr1.y - 4) chipTL.y = vr1.y - ch - 4;
+                        if (chipTL.y < vr0.y + 4)       chipTL.y = vr0.y + 4;
+                        ImVec2 chipBR(chipTL.x + cw, chipTL.y + ch);
+
+                        if (drawLeader) {
+                            // Leader from the anchor to the nearest chip corner-ish point.
+                            ImVec2 leaderEnd(chipTL.x, chipTL.y + ch * 0.5f);
+                            vdl->AddLine(anchorSp, leaderEnd, leaderCol, 1.5f * sc);
+                            vdl->AddCircleFilled(anchorSp, 2.6f * sc, leaderCol);
+                        }
+                        vdl->AddRectFilled(chipTL, chipBR, overlayBg, 4.0f * sc);
+                        vdl->AddRect(chipTL, chipBR, chipBord, 4.0f * sc);
+                        vdl->AddText(ImVec2(chipTL.x + padX, chipTL.y + padY), overlayTxt,
+                                     txt.c_str());
+                        ++shown;
+                    }
+                }
             }
         }
 

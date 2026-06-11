@@ -117,11 +117,28 @@ bool pmParseDim(const std::string& text, double& outMm, std::string& err);
 // Format a canonical mm value for display, honouring IPS when ips==true.
 std::string pmFormatDim(double mm, bool ips);
 
+// ---- in-viewport callouts (C27-A) -----------------------------------------
+
+// One viewport callout chip for a visible+enabled Dim field while a form is open.
+// SolidWorks-style: "Radius: 4mm" attached by a leader line to the affected geometry.
+struct PMCalloutItem {
+    std::string label;          // field label ("Radius", "Depth", …)
+    std::string value;          // formatted with unit ("4mm", "0.2in")
+    bool hasAnchor = false;     // false => no geometry to point at (dock the chip top-right)
+    float anchor[3] = {0, 0, 0};  // world-space anchor point (valid when hasAnchor)
+};
+
 // ---- the PropertyManager --------------------------------------------------
 
 class PropertyManager {
 public:
     bool active() const { return active_; }
+
+    // C27-A: build the list of viewport callout items for the active form (empty if not active).
+    // For each visible+enabled Dim field: {label, formatted value, anchor}. The anchor is derived
+    // from the form's selected refs — first edge ref's centroid, else first face ref's centroid,
+    // else none (chip docks top-right). Cheap to call every frame (rebuilds a small vector).
+    std::vector<PMCalloutItem> calloutItems(AppState& st) const;
     // The feature id under live edit/preview (empty until the first preview lands or on edit).
     const std::string& targetId() const { return targetId_; }
 

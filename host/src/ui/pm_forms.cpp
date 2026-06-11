@@ -111,13 +111,18 @@ static const std::vector<PMFormDef>& forms() {
             CheckSoon ("tangent_prop","Tangent propagation (coming soon)", "Fillet Parameters"),
             CheckSoon ("full_round", "Full round fillet (coming soon)",    "Fillet Parameters"),
         }},
-        // --- chamfer ---  length ; edges[]
-        //   Engine (dress.py): length only (kind frozen "equal"). distance2/angle reserved in
-        //   feature_params.md §chamfer. Added disabled for SW parity discoverability.
+        // --- chamfer ---  length / [length2] ; edges[]
+        //   C27-C: asymmetric chamfer. A Combo "kind" (symmetric|asymmetric) gates length2 via
+        //   the existing DimIf/enableKey mechanism — the only gating plumbing in this form system.
+        //   (Check has no gating constructor; a 2-entry Combo is the cleanest existing fit.)
+        //   Engine ignores "kind" param; length2=0/absent => symmetric path in dress.py.
         { "chamfer", "Chamfer", "chamfer", {
-            Well    ("edges",    "Edges",                      "Items to Chamfer",  K_EDGE, true),
-            Dim     ("length",   "Distance",                   "Chamfer Parameters", 1.0),
-            DimSoon ("length2",  "Distance 2 (coming soon)",   "Chamfer Parameters", 1.0),
+            Well    ("edges",    "Edges",                       "Items to Chamfer",   K_EDGE, true),
+            Dim     ("length",   "Distance",                    "Chamfer Parameters", 1.0),
+            ComboL  ("kind",     "Chamfer Type",                "Chamfer Parameters",
+                     "symmetric|asymmetric", "Symmetric|Asymmetric"),
+            DimIf   ("length2",  "Distance 2",                  "Chamfer Parameters", 1.0,
+                     "kind", "asymmetric"),
         }},
         // --- shell ---  thickness/outward ; remove[]
         { "shell", "Shell", "shell", {

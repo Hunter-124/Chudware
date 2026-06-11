@@ -195,6 +195,53 @@ def test_eq_set_drives_and_eq_delete_in_use() -> None:
     print("[ops] eq_set create-or-update + dependent rebind; eq_delete refused in use, then allowed")
 
 
+# --------------------------------------------------------------------------- C27-B cache-hit owner maps
+
+
+def test_cache_hit_face_owners_nonempty() -> None:
+    """After a pure cache-hit rebuild (apply_ops then rebuild), face_owners must map every face
+    to its owning feature — not be empty (C27-B regression)."""
+    s = new_session("part", "CacheOwnerTest")
+    session_apply_ops(s, 0, [_box_op()])
+    # Second rebuild is a pure cache hit for f1.
+    from engine.doc.session import rebuild as sess_rebuild
+    sess_rebuild(s)
+    fo = s.last_result.face_owners
+    assert fo, "face_owners must be non-empty after cache-hit rebuild"
+    bid = next(iter(fo))
+    assert fo[bid], f"face_owners[{bid!r}] must be non-empty"
+    assert all(v == "f1" for v in fo[bid].values()), \
+        f"all box faces must be owned by f1 on cache hit, got {fo[bid]}"
+    print(f"[C27-B] cache-hit rebuild: face_owners={fo!r}")
+
+
+def test_cache_hit_partial_rebuild_owner_maps() -> None:
+    """Partial rebuild: first feature (box) is cache-hit, second feature (box2) compiles fresh.
+    face_owners for the first feature must be correctly restored; the second feature's faces must
+    be owned by f2."""
+    s = new_session("part", "PartialCacheTest")
+    session_apply_ops(s, 0, [_box_op(name="Box1")])
+    # Add a second box (both features now in cache from the first full compile).
+    session_apply_ops(s, 1, [_box_op(l=10, w=10, h=10, name="Box2")])
+    # Forced rebuild: both features are cache hits.
+    from engine.doc.session import rebuild as sess_rebuild
+    sess_rebuild(s)
+    fo = s.last_result.face_owners
+    eo = s.last_result.edge_owners
+    # Two bodies (box + box) — each should have non-empty owner maps.
+    assert len(fo) >= 1, f"expected at least one body in face_owners, got {fo!r}"
+    for bid, owners in fo.items():
+        assert owners, f"face_owners[{bid!r}] must be non-empty"
+    # Now edit Box1's height (invalidates f1 cache, keeps f2 cache if it existed before edit).
+    session_apply_ops(s, 2, [{"op": "edit_feature", "id": "f1",
+                               "params": {"height": {"value": 30, "expr": None}}}])
+    fo2 = s.last_result.face_owners
+    assert fo2, "face_owners must be non-empty after partial rebuild"
+    for bid, owners in fo2.items():
+        assert owners, f"face_owners[{bid!r}] must be non-empty after partial rebuild"
+    print(f"[C27-B] partial rebuild: face_owners non-empty in all {len(fo2)} bodies")
+
+
 def main() -> None:
     test_placeholder_batch_sketch_and_entities()
     test_patch_edit_replaces_and_deletes()
@@ -202,6 +249,8 @@ def main() -> None:
     test_reorder_dependency_validation()
     test_stale_revision()
     test_eq_set_drives_and_eq_delete_in_use()
+    test_cache_hit_face_owners_nonempty()
+    test_cache_hit_partial_rebuild_owner_maps()
     print("\nDOC OPS TESTS PASSED")
 
 

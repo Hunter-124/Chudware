@@ -96,6 +96,9 @@ class _CacheEntry:
     tool_body: Any | None
     datum: Any | None
     status: dict
+    # per-body owner maps produced by this feature (keyed by body_id string)
+    face_owners: dict[str, dict[int, str]] = field(default_factory=dict)
+    edge_owners: dict[str, dict[int, str]] = field(default_factory=dict)
 
 
 class CompileCache:
@@ -328,7 +331,12 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
                 datums[fid] = hit_entry.datum
             result.feature_status.append(dict(hit_entry.status))
             prev_key = feat_key
-            # Recompute the top-body topology maps so the NEXT feature can diff against them.
+            # Restore the stored owner maps for every body this feature produced.
+            for bid_k, fo in hit_entry.face_owners.items():
+                face_owners[bid_k] = dict(fo)
+            for bid_k, eo in hit_entry.edge_owners.items():
+                edge_owners[bid_k] = dict(eo)
+            # Feed the top-body maps into the NEXT feature's diff.
             top = _top_body(bodies)
             bid = _ensure_body_id(top) if top is not None else None
             if top is not None:
@@ -412,9 +420,14 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
 
         # --- cache store -------------------------------------------------
         if cache is not None:
+            # Deep-copy owner maps: _diff_owners may reuse dict references that get
+            # overwritten on subsequent features, so we snapshot them here.
+            stored_face = {bid_k: dict(fo) for bid_k, fo in face_owners.items()}
+            stored_edge = {bid_k: dict(eo) for bid_k, eo in edge_owners.items()}
             cache.put(feat_key, _CacheEntry(
                 bodies=list(bodies), tool_body=out.tool_body,
-                datum=out.datum, status=dict(status)))
+                datum=out.datum, status=dict(status),
+                face_owners=stored_face, edge_owners=stored_edge))
 
     # --- assemble BodyOut list -------------------------------------------
     for shape in bodies:

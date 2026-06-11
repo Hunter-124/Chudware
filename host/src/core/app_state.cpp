@@ -422,6 +422,27 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err) {
         }
     }
 
+    // C27-A: per-edge centroid cache (mean of each edge's polyline points). Mirrors the face-cache
+    // keying so callout anchors can resolve PickKind::Edge topo ids -> a world point.
+    edgeCentroidCache.clear();
+    for (const auto& b : doc.bodies) {
+        if (b.edges.empty() || b.edge_pts.empty()) continue;
+        for (const auto& es : b.edges) {
+            if (es.pt_count == 0) continue;
+            double cx = 0, cy = 0, cz = 0;
+            uint32_t n = 0;
+            for (uint32_t p = 0; p < es.pt_count; ++p) {
+                size_t base = (size_t)(es.first_pt + p) * 3;
+                if (base + 2 >= b.edge_pts.size()) break;
+                cx += b.edge_pts[base]; cy += b.edge_pts[base + 1]; cz += b.edge_pts[base + 2];
+                ++n;
+            }
+            if (n == 0) continue;
+            uint64_t key = ((uint64_t)b.body_id << 32) | (uint64_t)es.edge_id;
+            edgeCentroidCache[key] = {(float)(cx / n), (float)(cy / n), (float)(cz / n)};
+        }
+    }
+
     selection.clear();
     hover = render::PickHit{};
     pickStatus.clear();

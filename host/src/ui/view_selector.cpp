@@ -253,6 +253,25 @@ void ViewSelector::update(AppState& st, Renderer& renderer, bool imgHovered, boo
         }
     }
 
+    // C27-D: maintain the hover-preview dwell. The preview shows the model from the hovered zone's
+    // orientation, but only after the hover has been steady for ~0.12s on the SAME orientation —
+    // sweeping across the box resets the timer so we don't re-render the offscreen thumbnail every
+    // frame. Hide instantly when nothing is hovered.
+    if (m_hoverZone >= 0) {
+        float y = zones[m_hoverZone].view.yaw, p = zones[m_hoverZone].view.pitch;
+        if (y == m_hoverYaw && p == m_hoverPitch) {
+            m_hoverDwell += io.DeltaTime;          // same orientation: accumulate
+        } else {
+            m_hoverDwell = 0.0f;                    // moved to a new zone: restart the dwell
+            m_previewReady = false;
+        }
+        m_hoverYaw = y; m_hoverPitch = p;
+        if (m_hoverDwell >= 0.12f) m_previewReady = true;
+    } else {
+        m_hoverDwell = 0.0f;
+        m_previewReady = false;
+    }
+
     // Click: fire the hovered zone's view, else close (click-on-empty dismisses). Clicks inside the
     // top-center orientation popup are left for draw()'s InvisibleButtons to handle (don't dismiss).
     if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -336,6 +355,45 @@ void ViewSelector::draw(AppState& st, ImDrawList* dl, ImVec2 vr0, ImVec2 vr1) {
         dl->AddRectFilled(cp, ImVec2(cp.x + ts.x + 12, cp.y + ts.y + 8), overlayBg, 4.0f);
         dl->AddRect(cp, ImVec2(cp.x + ts.x + 12, cp.y + ts.y + 8), overlayBord, 4.0f);
         dl->AddText(ImVec2(cp.x + 6, cp.y + 4), overlayTxt, cap);
+    }
+
+    // ---- C27-D: hover-preview thumbnail panel, top-right ----
+    // When a zone has been hovered steadily (dwell satisfied in update()), render the model from
+    // that candidate orientation into a small offscreen texture and show it in a panel anchored to
+    // the viewport's top-right. Sits clear of the top-CENTER orientation pill. Hidden instantly when
+    // nothing is hovered (m_previewReady is cleared in update()).
+    if (m_previewReady && renderer.hasMesh()) {
+        const float thumb = 168.0f * s;                 // square preview render size (px)
+        const int   thumbPx = (int)(thumb + 0.5f);
+        unsigned int tex = renderer.renderThumbnail(m_hoverYaw, m_hoverPitch, thumbPx);
+        if (tex) {
+            const char* cap = "Click a face or corner to switch views";
+            // Wrap the caption to the panel width so it reads on two lines.
+            const float pad = 8.0f * s;
+            const float panelW = thumb + pad * 2.0f;
+            ImVec2 capSz = ImGui::CalcTextSize(cap, nullptr, false, panelW - pad * 2.0f);
+            const float panelH = thumb + pad * 3.0f + capSz.y;
+
+            // Top-right, inset from the viewport edge; clamped inside the viewport rect.
+            float px0 = vr1.x - panelW - 14.0f * s;
+            float py0 = vr0.y + 14.0f * s;
+            if (px0 < vr0.x + 6.0f * s) px0 = vr0.x + 6.0f * s;
+            ImVec2 p0(px0, py0), p1(px0 + panelW, py0 + panelH);
+
+            // Panel chrome (theme overlay roles).
+            dl->AddRectFilled(p0, p1, overlayBg, 6.0f * s);
+            dl->AddRect(p0, p1, overlayBord, 6.0f * s);
+
+            // Thumbnail image. GL texture origin is bottom-left -> flip V (uv0.y=1, uv1.y=0).
+            ImVec2 i0(p0.x + pad, p0.y + pad);
+            ImVec2 i1(i0.x + thumb, i0.y + thumb);
+            dl->AddImage((ImTextureID)(intptr_t)tex, i0, i1, ImVec2(0, 1), ImVec2(1, 0));
+            dl->AddRect(i0, i1, overlayBord, 3.0f * s);  // subtle frame around the render
+
+            // Caption below the image (wrapped to the panel width).
+            dl->AddText(nullptr, 0.0f, ImVec2(i0.x, i1.y + pad), overlayTxt, cap, nullptr,
+                        panelW - pad * 2.0f);
+        }
     }
 
     // ---- caption pill, bottom-center ----

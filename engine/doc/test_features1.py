@@ -536,6 +536,96 @@ def test_shell_open_top() -> None:
     print(f"[shell] 20mm cube shell t=2 open top: vol={vol:.1f} (analytic~{analytic})")
 
 
+# --------------------------------------------------------------------------- test 9: asymmetric chamfer
+
+
+def _box_edge_selectors(box_size: float = 20.0) -> list[dict]:
+    """Return selectors for two vertical edges of a box of the given size."""
+    from engine.doc.selectors import describe_edges, make_selector
+
+    doc_box = _doc([_feat("f1", "box", {
+        "length": _dim(box_size), "width": _dim(box_size), "height": _dim(box_size),
+    })])
+    res0 = compile_document(doc_box)
+    body = res0.bodies[0]
+    infos = describe_edges(body.shape.wrapped)
+    vert = [i for i in infos if i.surf == "line" and i.axis is not None and abs(i.axis[2]) > 0.9]
+    assert len(vert) >= 2, "need at least 2 vertical edges on box"
+    sels = []
+    for info in vert[:2]:
+        s = make_selector(info)
+        s["owner_feature"] = "f1"
+        sels.append(s)
+    return sels
+
+
+def test_chamfer_symmetric_builds() -> None:
+    """Symmetric chamfer (no length2) on a box compiles and reduces volume."""
+    sels = _box_edge_selectors(20.0)
+    doc = _doc([
+        _feat("f1", "box", {"length": _dim(20), "width": _dim(20), "height": _dim(20)}),
+        _feat("f2", "chamfer", {"length": _dim(2.0)}, refs={"edges": sels}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f2")
+    assert s["ok"], f"symmetric chamfer failed: {s['error']}"
+    vol_box = 20.0 ** 3
+    vol = res.bodies[0].shape.volume
+    assert vol < vol_box, "chamfer should reduce volume"
+    assert "length2" not in s["resolved"], "symmetric chamfer should not write length2 to resolved"
+    print(f"[chamfer-sym] vol {vol_box:.1f} -> {vol:.1f}")
+
+
+def test_chamfer_asymmetric_builds_and_differs() -> None:
+    """Asymmetric chamfer (length != length2) produces a different volume than symmetric."""
+    sels = _box_edge_selectors(20.0)
+
+    def _compile_chamfer(length: float, length2: float | None) -> float:
+        p: dict = {"length": _dim(length)}
+        if length2 is not None:
+            p["length2"] = _dim(length2)
+        doc = _doc([
+            _feat("f1", "box", {"length": _dim(20), "width": _dim(20), "height": _dim(20)}),
+            _feat("f2", "chamfer", p, refs={"edges": sels}),
+        ])
+        _assert_valid(doc)
+        res = compile_document(doc)
+        s = _status(res, "f2")
+        assert s["ok"], f"chamfer compile failed (length={length}, length2={length2}): {s['error']}"
+        return res.bodies[0].shape.volume
+
+    vol_sym  = _compile_chamfer(2.0, None)    # symmetric: length=2
+    vol_asym = _compile_chamfer(2.0, 4.0)     # asymmetric: length=2, length2=4
+
+    # Both must produce valid solids with positive, reduced volumes.
+    vol_box = 20.0 ** 3
+    assert vol_sym  > 0 and vol_sym  < vol_box, f"symmetric vol out of range: {vol_sym}"
+    assert vol_asym > 0 and vol_asym < vol_box, f"asymmetric vol out of range: {vol_asym}"
+    # The asymmetric chamfer cuts more material → smaller volume.
+    assert abs(vol_sym - vol_asym) > 1.0, (
+        f"symmetric ({vol_sym:.2f}) and asymmetric ({vol_asym:.2f}) volumes should differ"
+    )
+    print(f"[chamfer-asym] sym vol={vol_sym:.2f}  asym(l2=4) vol={vol_asym:.2f}  "
+          f"delta={vol_sym - vol_asym:.2f}")
+
+
+def test_chamfer_asymmetric_resolved_has_length2() -> None:
+    """When length2 is set and != length, resolved output contains length2."""
+    sels = _box_edge_selectors(20.0)
+    doc = _doc([
+        _feat("f1", "box", {"length": _dim(20), "width": _dim(20), "height": _dim(20)}),
+        _feat("f2", "chamfer", {"length": _dim(2.0), "length2": _dim(4.0)},
+              refs={"edges": sels}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f2")
+    assert s["ok"], f"asymmetric chamfer failed: {s['error']}"
+    assert "length2" in s["resolved"], "resolved should contain length2 for asymmetric chamfer"
+    print(f"[chamfer-asym-resolved] resolved={s['resolved']}")
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -552,6 +642,9 @@ def main() -> None:
     test_fillet_oversized_auto_clamps()
     test_fillet_dangling_selector()
     test_shell_open_top()
+    test_chamfer_symmetric_builds()
+    test_chamfer_asymmetric_builds_and_differs()
+    test_chamfer_asymmetric_resolved_has_length2()
     print("\nFEATURES1 TESTS PASSED")
 
 

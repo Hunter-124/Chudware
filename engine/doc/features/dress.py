@@ -238,6 +238,10 @@ def compile_chamfer(feat: dict, ctx: CompileContext) -> CompileOutput:
     if length <= 0.0:
         raise FeatureError("chamfer length must be > 0")
 
+    # Optional asymmetric second distance. 0 / missing / equal to length → symmetric.
+    length2_raw = ctx.dim(p, "length2", 0.0) if "length2" in p else 0.0
+    asymmetric = length2_raw > 0.0 and abs(length2_raw - length) > 1e-9
+
     bodies = list(ctx.bodies)
     if not bodies:
         raise FeatureError("chamfer: no body to apply to")
@@ -258,16 +262,22 @@ def compile_chamfer(feat: dict, ctx: CompileContext) -> CompileOutput:
 
     warnings: list[str] = []
     result_body = None
-    d = length
+    d  = length
+    d2 = length2_raw if asymmetric else None
     last_err: Exception | None = None
 
     for attempt in range(4):
         if attempt > 0:
             d = d / 2.0
+            if d2 is not None:
+                d2 = d2 / 2.0
             if d < 0.2:
                 break
         try:
-            result_body = b3d_chamfer(edges, length=d)
+            if d2 is not None:
+                result_body = b3d_chamfer(edges, length=d, length2=d2)
+            else:
+                result_body = b3d_chamfer(edges, length=d)
             if attempt > 0:
                 warnings.append(
                     f"chamfer length {length:g} mm too large; auto-clamped to {d:g} mm"
@@ -284,6 +294,8 @@ def compile_chamfer(feat: dict, ctx: CompileContext) -> CompileOutput:
         )
 
     resolved: dict[str, float] = {"length": d}
+    if d2 is not None:
+        resolved["length2"] = d2
     bodies[-1] = result_body
     return CompileOutput(bodies=bodies, tool_body=result_body, resolved=resolved)
 

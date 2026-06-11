@@ -5,6 +5,7 @@
 // commits (OK) / rolls back (Cancel via worker undo of each preview batch).
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -303,6 +304,73 @@ void PropertyManager::loadFromTree(AppState& st, const nlohmann::json& feature) 
             }
         }
     }
+}
+
+// ---- in-viewport callouts (C27-A) -----------------------------------------
+
+// Pull a world-space anchor from a selector entry: prefer the selector's own "centroid"
+// (resolve_pick stamps a world centroid on every face/edge selector); fall back to the
+// AppState topo-id centroid caches keyed by (body_id<<32 | topo_id) when absent.
+static bool anchorFromSel(AppState& st, const PMSelEntry& e, bool wantEdge, float out[3]) {
+    const nlohmann::json& s = e.selector;
+    auto c = s.find("centroid");
+    if (c != s.end() && c->is_array() && c->size() == 3 &&
+        (*c)[0].is_number() && (*c)[1].is_number() && (*c)[2].is_number()) {
+        out[0] = (float)(*c)[0].get<double>();
+        out[1] = (float)(*c)[1].get<double>();
+        out[2] = (float)(*c)[2].get<double>();
+        return true;
+    }
+    // Cache fallback: hint_index is 0-based; cache keys are 1-based AICM topo ids.
+    int hint = s.value("hint_index", -1);
+    if (hint < 0) return false;
+    uint64_t key = (uint64_t)1 << 32 | (uint64_t)(hint + 1);  // body 1 (single-part edit path)
+    if (wantEdge) {
+        auto it = st.edgeCentroidCache.find(key);
+        if (it == st.edgeCentroidCache.end()) return false;
+        out[0] = it->second[0]; out[1] = it->second[1]; out[2] = it->second[2];
+        return true;
+    }
+    auto it = st.faceNormalCache.find(key);  // {nx,ny,nz, cx,cy,cz}
+    if (it == st.faceNormalCache.end()) return false;
+    out[0] = it->second[3]; out[1] = it->second[4]; out[2] = it->second[5];
+    return true;
+}
+
+std::vector<PMCalloutItem> PropertyManager::calloutItems(AppState& st) const {
+    std::vector<PMCalloutItem> out;
+    if (!active_ || !form_) return out;
+
+    // Resolve a single shared anchor for the feature: first edge ref's centroid, else first
+    // face ref's centroid, else none. Edges win (dress-up features point at an edge).
+    float anchor[3] = {0, 0, 0};
+    bool hasAnchor = false;
+    for (const auto& f : fields_) {
+        if (f.def->kind != PMFieldKind::SelectorWell || f.picks.empty()) continue;
+        if (!f.def->selKinds.edge) continue;
+        if (anchorFromSel(st, f.picks.front(), /*wantEdge=*/true, anchor)) { hasAnchor = true; break; }
+    }
+    if (!hasAnchor) {
+        for (const auto& f : fields_) {
+            if (f.def->kind != PMFieldKind::SelectorWell || f.picks.empty()) continue;
+            if (!f.def->selKinds.face) continue;
+            if (anchorFromSel(st, f.picks.front(), /*wantEdge=*/false, anchor)) { hasAnchor = true; break; }
+        }
+    }
+
+    const bool useIps = false;  // M1 default MMGS (mirrors draw())
+    for (const auto& f : fields_) {
+        if (f.def->kind != PMFieldKind::Dim) continue;
+        if (!fieldEnabled(*f.def, fields_)) continue;   // skip greyed / coming-soon dims
+        PMCalloutItem it;
+        it.label = f.def->label;
+        it.value = f.dimExpr.empty() ? pmFormatDim(f.dimValue, useIps)
+                                     : ("=" + f.dimExpr);
+        it.hasAnchor = hasAnchor;
+        if (hasAnchor) { it.anchor[0] = anchor[0]; it.anchor[1] = anchor[1]; it.anchor[2] = anchor[2]; }
+        out.push_back(std::move(it));
+    }
+    return out;
 }
 
 void PropertyManager::close() {

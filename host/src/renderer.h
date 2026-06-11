@@ -112,6 +112,16 @@ public:
     // no body carries a scalar.
     bool scalarRange(float& vmin, float& vmax) const;
 
+    // ---- C27-D: offscreen preview thumbnail (View Selector hover panel) ----
+    // Render the CURRENT meshes from a candidate orientation (zoom=1 fit, no pan) into a small
+    // dedicated FBO (px*px, no supersampling) and return its GL color-texture id. The texture is
+    // owned by the renderer and valid only until the next renderThumbnail() call. Cheap to call:
+    // a (yaw,pitch,meshes-revision) cache skips the re-render when nothing relevant changed, so
+    // a steady hover doesn't redraw every frame. The thumb FBO is lazily allocated on first use.
+    // GL note: the texture origin is bottom-left (GL) — flip V when blitting with ImGui::Image.
+    // ALL state the main pass relies on (bound FBO, viewport, program) is restored before return.
+    unsigned int renderThumbnail(float yawDeg, float pitchDeg, int px);
+
     std::vector<unsigned char> readRGBA() const;         // final w*h*4, top-left origin
     unsigned int colorTexture() const { return colorTex_; }
     int width() const { return w_; }
@@ -148,6 +158,15 @@ private:
     int w_ = 0, h_ = 0;           // final size
     int sw_ = 0, sh_ = 0;         // supersampled size
     unsigned int fbo_ = 0, colorTex_ = 0, depthRbo_ = 0;
+    // C27-D: dedicated small offscreen target for the View Selector preview thumbnail. Lazily
+    // allocated on the first renderThumbnail() call; reallocated only when the requested px changes.
+    unsigned int thumbFbo_ = 0, thumbTex_ = 0, thumbDepth_ = 0;
+    int thumbPx_ = 0;                                  // current thumb target size (0 = unallocated)
+    // Cache: skip the re-render while the hovered orientation and the model are unchanged.
+    float thumbYaw_ = 1e30f, thumbPitch_ = 1e30f;     // last rendered orientation (deg)
+    unsigned int thumbMeshRev_ = 0;                   // meshesRevision_ at last render (mismatch = dirty)
+    bool thumbValid_ = false;                         // a thumbnail has been rendered at least once
+    unsigned int meshesRevision_ = 0;                 // bumped by setMeshes(); thumbnail cache key
     unsigned int prog_ = 0;
     unsigned int edgeProg_ = 0;
     unsigned int bgProg_ = 0, bgVao_ = 0;

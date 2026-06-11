@@ -225,6 +225,10 @@ Renderer::~Renderer() {
     if (fbo_) glDeleteFramebuffers(1, &fbo_);
     if (colorTex_) glDeleteTextures(1, &colorTex_);
     if (depthRbo_) glDeleteRenderbuffers(1, &depthRbo_);
+    // C27-D: View Selector preview thumbnail target (lazily created; may be 0).
+    if (thumbFbo_) glDeleteFramebuffers(1, &thumbFbo_);
+    if (thumbTex_) glDeleteTextures(1, &thumbTex_);
+    if (thumbDepth_) glDeleteRenderbuffers(1, &thumbDepth_);
     if (prog_) glDeleteProgram(prog_);
     if (edgeProg_) glDeleteProgram(edgeProg_);
     if (bgProg_) glDeleteProgram(bgProg_);
@@ -516,6 +520,9 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
     // C19: apply any standing deformation scale to the freshly uploaded bodies.
     if (deformScale_ != 0.0f)
         for (auto& s : subs_) uploadDeformed(s);
+
+    // C27-D: invalidate the View Selector thumbnail cache — the meshes changed.
+    ++meshesRevision_;
 }
 
 // C25: world radius used when the document has no geometry yet (a fresh "new part") —
@@ -670,6 +677,131 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     drawReferencePlanes(mvp);
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// C27-D: render the current meshes from a candidate orientation into a small dedicated FBO and
+// return its color-texture id (for the View Selector hover preview). No supersampling, no ground
+// shadow / section / datum planes — just the lit solids + feature edges over a solid light bg, so
+// the candidate view reads at a glance. Cheap: a (yaw,pitch,meshes-revision) cache skips the
+// re-render when nothing changed. CRITICALLY restores every GL state the main pass depends on:
+// the bound framebuffer (0), the full-window viewport is re-set by the next drawCurrent() (which
+// always binds fbo_ + sets glViewport), but we still leave GL in a clean, predictable state here.
+unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px) {
+    if (px < 16) px = 16;
+
+    // Lazily (re)allocate the dedicated thumb target when missing or the size changed.
+    if (thumbPx_ != px || thumbFbo_ == 0) {
+        if (!thumbFbo_)   glGenFramebuffers(1, &thumbFbo_);
+        if (!thumbTex_)   glGenTextures(1, &thumbTex_);
+        if (!thumbDepth_) glGenRenderbuffers(1, &thumbDepth_);
+        glBindTexture(GL_TEXTURE_2D, thumbTex_);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, px, px, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindRenderbuffer(GL_RENDERBUFFER, thumbDepth_);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, px, px);
+        glBindRenderbuffer(GL_RENDERBUFFER, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, thumbFbo_);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, thumbTex_, 0);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, thumbDepth_);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        thumbPx_ = px;
+        thumbValid_ = false;  // size change forces a re-render below
+    }
+
+    // Cache: re-use the existing texture if the orientation and meshes are unchanged.
+    if (thumbValid_ && thumbMeshRev_ == meshesRevision_ &&
+        thumbYaw_ == yawDeg && thumbPitch_ == pitchDeg) {
+        return thumbTex_;
+    }
+
+    // ---- render the thumbnail ----
+    glBindFramebuffer(GL_FRAMEBUFFER, thumbFbo_);
+    glViewport(0, 0, px, px);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // Solid light studio background (single fill via the gradient shader with all three stops equal
+    // — avoids a separate clear-color path and keeps the same near-white look as the main view).
+    glDisable(GL_DEPTH_TEST);
+    glUseProgram(bgProg_);
+    glUniform3fv(glGetUniformLocation(bgProg_, "uTop"), 1, bgTop_);
+    glUniform3fv(glGetUniformLocation(bgProg_, "uMid"), 1, bgMid_);
+    glUniform3fv(glGetUniformLocation(bgProg_, "uBot"), 1, bgBot_);
+    glBindVertexArray(bgVao_);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBindVertexArray(0);
+    glEnable(GL_DEPTH_TEST);
+
+    const float sceneR = (radius_ > 0.0f) ? radius_ : kEmptySceneRadius;
+    const float deg = 3.14159265f / 180.0f;
+    float yaw = yawDeg * deg, pitch = pitchDeg * deg;
+    Vec3 dir(std::cos(pitch) * std::sin(yaw), -std::cos(pitch) * std::cos(yaw), std::sin(pitch));
+    float fov = kFovDeg * deg;
+    float dist = sceneR / std::sin(fov * 0.5f) * 1.05f;  // zoom=1 fit, no pan
+    Vec3 target = center_;
+    Vec3 eye = target + dir * dist;
+    Vec3 up(0, 0, 1);
+    if (std::fabs(pitch) > 89.0f * deg) up = Vec3(0, 1, 0);  // avoid gimbal at top/bottom
+
+    Mat4 proj = perspective(fov, 1.0f, dist * 0.01f, dist * 10.0f);  // square aspect
+    Mat4 view = lookAt(eye, target, up);
+    Mat4 mvp = mul(proj, view);
+
+    // Camera-relative studio rig (same as drawCurrent so the thumbnail shades identically).
+    Vec3 V = normalize(dir);
+    Vec3 R = normalize(cross(up, V));
+    Vec3 U = normalize(cross(V, R));
+    Vec3 keyDir = normalize(V + R * -0.45f + U * 0.85f);
+    Vec3 fillDir = normalize(V + R * 0.85f + U * 0.10f);
+    Vec3 rimDir = normalize(V * -1.0f + U * 0.55f);
+
+    // Solids (flat part colors — skip the colormap LUT path for clarity; section clip off).
+    glUseProgram(prog_);
+    glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, mvp.m);
+    glUniform3f(glGetUniformLocation(prog_, "uKeyDir"), keyDir.x, keyDir.y, keyDir.z);
+    glUniform3f(glGetUniformLocation(prog_, "uFillDir"), fillDir.x, fillDir.y, fillDir.z);
+    glUniform3f(glGetUniformLocation(prog_, "uRimDir"), rimDir.x, rimDir.y, rimDir.z);
+    glUniform3f(glGetUniformLocation(prog_, "uCamPos"), eye.x, eye.y, eye.z);
+    glUniform1i(glGetUniformLocation(prog_, "uUseScalar"), 0);
+    glUniform1i(glGetUniformLocation(prog_, "uClip"), 0);
+    int colorLoc = glGetUniformLocation(prog_, "uColor");
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(1.0f, 1.0f);
+    for (const auto& s : subs_) {
+        glUniform3f(colorLoc, s.color[0], s.color[1], s.color[2]);
+        glBindVertexArray(s.vao);
+        glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);
+    }
+    glBindVertexArray(0);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+
+    // Feature edges (so the preview reads like the main ShadedEdges view).
+    glUseProgram(edgeProg_);
+    glUniformMatrix4fv(glGetUniformLocation(edgeProg_, "uMVP"), 1, GL_FALSE, mvp.m);
+    glUniform3fv(glGetUniformLocation(edgeProg_, "uColor"), 1, edgeColor_);
+    glUniform1i(glGetUniformLocation(edgeProg_, "uClip"), 0);
+    glLineWidth(1.0f);  // no supersample here, so 1px lines
+    for (const auto& s : subs_) {
+        if (s.edgeVerts <= 0) continue;
+        glBindVertexArray(s.edgeVao);
+        glDrawArrays(GL_LINES, 0, s.edgeVerts);
+    }
+    glBindVertexArray(0);
+
+    // Restore the main render state: unbind our FBO. (The next drawCurrent() rebinds fbo_ and
+    // re-sets the supersampled viewport, but leave GL bound to the default FBO as the safe default,
+    // matching drawCurrent's own epilogue.)
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    thumbYaw_ = yawDeg; thumbPitch_ = pitchDeg;
+    thumbMeshRev_ = meshesRevision_;
+    thumbValid_ = true;
+    return thumbTex_;
 }
 
 // Soft elliptical contact shadow on a virtual ground plane just below the model bbox. Z is up

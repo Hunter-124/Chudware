@@ -16,6 +16,12 @@ static PMFieldDef Dim(const char* key, const char* label, const char* group, dou
     PMFieldDef f; f.kind = PMFieldKind::Dim; f.key = key; f.label = label;
     f.group = group; f.dimDefault = def; return f;
 }
+// Dim that is enabled only when a sibling Combo (named enableKey) holds one of enableVals.
+static PMFieldDef DimIf(const char* key, const char* label, const char* group, double def,
+                        const char* enableKey, const char* enableVals) {
+    PMFieldDef f = Dim(key, label, group, def);
+    f.enableKey = enableKey; f.enableVals = enableVals; return f;
+}
 static PMFieldDef Well(const char* key, const char* label, const char* group,
                        PMSelKinds kinds, bool multi) {
     PMFieldDef f; f.kind = PMFieldKind::SelectorWell; f.key = key; f.label = label;
@@ -26,11 +32,23 @@ static PMFieldDef Combo(const char* key, const char* label, const char* group,
     PMFieldDef f; f.kind = PMFieldKind::Combo; f.key = key; f.label = label;
     f.group = group; f.comboOptions = options; return f;
 }
+// Combo with separate display labels (options = param values, labels = UI strings).
+static PMFieldDef ComboL(const char* key, const char* label, const char* group,
+                         const char* options, const char* labels) {
+    PMFieldDef f = Combo(key, label, group, options);
+    f.comboLabels = labels; return f;
+}
 static PMFieldDef Check(const char* key, const char* label, const char* group, bool def) {
     PMFieldDef f; f.kind = PMFieldKind::Check; f.key = key; f.label = label;
     f.group = group; f.checkDefault = def; return f;
 }
-
+// Check/Dim that is disabled and shows "(coming soon)" — discoverability only, never serialised.
+static PMFieldDef CheckSoon(const char* key, const char* label, const char* group) {
+    PMFieldDef f = Check(key, label, group, false); f.comingSoon = true; return f;
+}
+static PMFieldDef DimSoon(const char* key, const char* label, const char* group, double def) {
+    PMFieldDef f = Dim(key, label, group, def); f.comingSoon = true; return f;
+}
 static const PMSelKinds K_FACE   {true,  false, false};
 static const PMSelKinds K_EDGE   {false, true,  false};
 static const PMSelKinds K_VERTEX {false, false, true};
@@ -54,34 +72,52 @@ static const std::vector<PMFormDef>& forms() {
             Check ("centered", "Centered", "Cylinder", true),
         }},
         // --- extrude ---  mode/end/depth/flip/draft/draft_outward/merge ; profile[]
+        //   Direction 2: end2 / depth2 (C26-B engine; UI ready, errors gracefully before merge)
         { "extrude", "Extrude", "extrude_boss", {
-            Well  ("profile",  "Profile",  "From",  K_FACE, true),
-            Combo ("mode",     "Type",     "Direction", "boss|cut"),
-            Combo ("end",      "End",      "Direction", "blind|through_all|mid_plane"),
-            Dim   ("depth",    "Depth",    "Direction", 10.0),
-            Check ("flip",     "Flip",     "Direction", false),
-            Dim   ("draft",    "Draft",    "Draft",  0.0),
-            Check ("draft_outward", "Draft outward", "Draft", false),
-            Check ("merge",    "Merge result", "Options", true),
+            Well      ("profile",  "Profile",         "From",        K_FACE, true),
+            ComboL    ("mode",     "Type",            "Direction 1", "boss|cut",
+                                                                     "Boss|Cut"),
+            ComboL    ("end",      "End Condition",   "Direction 1",
+                       "blind|mid_plane|through_all|up_to_next",
+                       "Blind|Mid Plane|Through All|Up To Next"),
+            DimIf     ("depth",    "Depth",           "Direction 1", 10.0,
+                       "end", "blind|mid_plane"),
+            Check     ("flip",     "Reverse direction","Direction 1", false),
+            Dim       ("draft",    "Draft angle",     "Direction 1", 0.0),
+            Check     ("draft_outward", "Draft outward","Direction 1", false),
+            ComboL    ("end2",     "End Condition",   "Direction 2",
+                       "none|blind|through_all|up_to_next",
+                       "None|Blind|Through All|Up To Next"),
+            DimIf     ("depth2",   "Depth",           "Direction 2", 10.0,
+                       "end2", "blind"),
+            Check     ("merge",    "Merge result",    "Options",      true),
         }},
         // --- revolve ---  mode/angle/flip/merge ; profile[]/axis
+        //   Engine (revolve.py): mode, angle, flip, merge — all exposed. No mid-plane in engine.
         { "revolve", "Revolve", "revolve_boss", {
-            Well  ("profile",  "Profile",  "From",  K_FACE, true),
-            Well  ("axis",     "Axis",     "From",  K_EDGE, false),
-            Combo ("mode",     "Type",     "Direction", "boss|cut"),
-            Dim   ("angle",    "Angle",    "Direction", 360.0),
-            Check ("flip",     "Flip",     "Direction", false),
-            Check ("merge",    "Merge result", "Options", true),
+            Well  ("profile",  "Profile",        "From",      K_FACE, true),
+            Well  ("axis",     "Axis",           "From",      K_EDGE, false),
+            Combo ("mode",     "Type",           "Direction", "boss|cut"),
+            Dim   ("angle",    "Angle",          "Direction", 360.0),
+            Check ("flip",     "Reverse direction", "Direction", false),
+            Check ("merge",    "Merge result",   "Options",   true),
         }},
         // --- fillet ---  radius ; edges[]
+        //   Engine (dress.py): radius only. SW shows tangent propagation, profile type, etc.
+        //   Controls the engine lacks are added disabled with "(coming soon)" for discoverability.
         { "fillet", "Fillet", "fillet", {
-            Well  ("edges",    "Edges",    "Items to Fillet", K_EDGE, true),
-            Dim   ("radius",   "Radius",   "Fillet Parameters", 2.0),
+            Well      ("edges",      "Edges",              "Items to Fillet",    K_EDGE, true),
+            Dim       ("radius",     "Radius",             "Fillet Parameters",  2.0),
+            CheckSoon ("tangent_prop","Tangent propagation (coming soon)", "Fillet Parameters"),
+            CheckSoon ("full_round", "Full round fillet (coming soon)",    "Fillet Parameters"),
         }},
-        // --- chamfer ---  length/kind ; edges[]
+        // --- chamfer ---  length ; edges[]
+        //   Engine (dress.py): length only (kind frozen "equal"). distance2/angle reserved in
+        //   feature_params.md §chamfer. Added disabled for SW parity discoverability.
         { "chamfer", "Chamfer", "chamfer", {
-            Well  ("edges",    "Edges",    "Items to Chamfer", K_EDGE, true),
-            Dim   ("length",   "Distance", "Chamfer Parameters", 1.0),
+            Well    ("edges",    "Edges",                      "Items to Chamfer",  K_EDGE, true),
+            Dim     ("length",   "Distance",                   "Chamfer Parameters", 1.0),
+            DimSoon ("length2",  "Distance 2 (coming soon)",   "Chamfer Parameters", 1.0),
         }},
         // --- shell ---  thickness/outward ; remove[]
         { "shell", "Shell", "shell", {

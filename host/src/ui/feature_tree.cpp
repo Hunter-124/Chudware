@@ -121,6 +121,68 @@ static void flushPendingTreeOps(AppState& st) {
 static std::string s_renamingId;
 static char        s_renameBuf[128] = {0};
 
+// ---- C26: shared appearance color-picker popup ----
+// A small SolidWorks-style appearance editor: a row of ~8 preset swatches over a full ColorPicker3,
+// with Apply / Cancel. Palette-styled, uiScale-aware. Returns true exactly once — when the user
+// commits via a preset swatch or Apply — writing the chosen color into outColor[3].
+//
+// The popup is identity-less re: the target body; the CALLER opens it (ImGui::OpenPopup(popupId))
+// after stashing which body key it applies to, then turns a true return into a set_appearance op.
+// (This same helper is duplicated verbatim in viewport_panel.cpp; sharing it would need a new TU in
+// CMakeLists, which another agent owns this wave — duplication is the lighter choice.)
+static bool appearanceColorPicker(const char* popupId, float outColor[3]) {
+    static float s_pick[3] = {0.71f, 0.76f, 0.82f};
+    static bool  s_seeded  = false;
+    bool committed = false;
+    if (ImGui::BeginPopup(popupId)) {
+        // Seed the picker from the caller's current color once per open.
+        if (!s_seeded) { s_pick[0] = outColor[0]; s_pick[1] = outColor[1]; s_pick[2] = outColor[2];
+                         s_seeded = true; }
+        ImGui::TextUnformatted("Appearance");
+        ImGui::Separator();
+        // Preset swatches (SolidWorks-ish: greys, primaries). Click = apply immediately.
+        static const float kPresets[8][3] = {
+            {0.71f, 0.76f, 0.82f},  // default grey-blue
+            {0.50f, 0.50f, 0.52f},  // mid grey
+            {0.20f, 0.21f, 0.23f},  // dark grey
+            {0.85f, 0.85f, 0.86f},  // light grey
+            {0.80f, 0.15f, 0.15f},  // red
+            {0.15f, 0.35f, 0.80f},  // blue
+            {0.18f, 0.60f, 0.25f},  // green
+            {0.92f, 0.80f, 0.12f},  // yellow
+        };
+        float sw = 22.0f * ui::uiScale;
+        for (int i = 0; i < 8; ++i) {
+            if (i) ImGui::SameLine(0, 4.0f * ui::uiScale);
+            ImVec4 c(kPresets[i][0], kPresets[i][1], kPresets[i][2], 1.0f);
+            if (ImGui::ColorButton(("##aprs" + std::to_string(i)).c_str(), c,
+                                   ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop,
+                                   ImVec2(sw, sw))) {
+                outColor[0] = kPresets[i][0];
+                outColor[1] = kPresets[i][1];
+                outColor[2] = kPresets[i][2];
+                committed = true;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(180.0f * ui::uiScale);
+        ImGui::ColorPicker3("##appk", s_pick,
+                            ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoSmallPreview);
+        if (ImGui::Button("Apply", ImVec2(80.0f * ui::uiScale, 0))) {
+            outColor[0] = s_pick[0]; outColor[1] = s_pick[1]; outColor[2] = s_pick[2];
+            committed = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(80.0f * ui::uiScale, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    } else {
+        s_seeded = false;  // re-seed next time the popup opens
+    }
+    return committed;
+}
+
 // ---- draw one feature row ----
 // Returns true if the row was left-clicked (selection).
 // reorderCb(draggedId, beforeId): drop draggedId immediately before beforeId (empty = end).
@@ -672,7 +734,41 @@ void drawFeatureTree(AppState& st,
         ImGuiTreeNodeFlags rootFlags =
             ImGuiTreeNodeFlags_DefaultOpen |
             ImGuiTreeNodeFlags_SpanFullWidth;
-        if (ImGui::TreeNodeEx(docName.c_str(), rootFlags)) {
+        bool rootOpen = ImGui::TreeNodeEx(docName.c_str(), rootFlags);
+
+        // C26: root-row "Appearance…" — sets the primary body's color (the common single-body
+        // case). Body key "b1" matches the engine's per-body appearance key (session._write_aicm).
+        // Routed through the DEFERRED applyTreeOps queue, like every other tree-originated op.
+        {
+            bool isAsmDoc = tree.is_object() && jfld(tree, "schema") == "aicad.asm/1";
+            static float s_rootColor[3] = {0.71f, 0.76f, 0.82f};
+            static bool  s_openRootPicker = false;
+            if (!isAsmDoc && st.docMirror.hasDoc()) {
+                if (ImGui::BeginPopupContextItem("##root_ctx")) {
+                    if (ImGui::MenuItem("Appearance...")) {
+                        s_rootColor[0] = 0.71f; s_rootColor[1] = 0.76f; s_rootColor[2] = 0.82f;
+                        s_openRootPicker = true;  // open the picker (a sibling popup) next
+                    }
+                    if (ImGui::MenuItem("Clear Appearance")) {
+                        applyTreeOps(st, nlohmann::json::array({
+                            {{"op", "set_appearance"}, {"id", "b1"}, {"color", nullptr}}}),
+                            "set_appearance");
+                    }
+                    ImGui::EndPopup();
+                }
+                // Picker popup lives OUTSIDE the context menu (a sibling) to avoid nested-popup
+                // ordering pitfalls; it is opened by the menu item via s_openRootPicker.
+                if (s_openRootPicker) { ImGui::OpenPopup("##appearance_root"); s_openRootPicker = false; }
+                if (appearanceColorPicker("##appearance_root", s_rootColor)) {
+                    applyTreeOps(st, nlohmann::json::array({
+                        {{"op", "set_appearance"}, {"id", "b1"},
+                         {"color", {s_rootColor[0], s_rootColor[1], s_rootColor[2]}}}}),
+                        "set_appearance");
+                }
+            }
+        }
+
+        if (rootOpen) {
             ImGui::PopStyleColor();  // text color
 
             // ---- fixed header nodes ----

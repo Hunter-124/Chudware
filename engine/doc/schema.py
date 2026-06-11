@@ -466,6 +466,26 @@ def _validate_equations(doc: dict, where: str) -> tuple[list[str], set[str]]:
     return errs, names
 
 
+def _validate_appearances(doc: dict) -> list[str]:
+    """Optional document-level body appearances (C26): ``{body_key: [r,g,b]}`` in 0..1.
+
+    The body_key is the body's owner-feature id (parts) or component id (assemblies) — whatever the
+    rebuild reports as the body's stable owner. A missing key just means "default color".
+    """
+    ap = doc.get("appearances")
+    if ap is None:
+        return []
+    if not isinstance(ap, dict):
+        return ["appearances: must be an object {body_key: [r,g,b]}"]
+    errs: list[str] = []
+    for key, col in ap.items():
+        if not isinstance(key, str) or not key:
+            errs.append(f"appearances: key '{key}' must be a non-empty string")
+        if not _is_vec(col, 3) or any(not (0.0 <= float(c) <= 1.0) for c in col):
+            errs.append(f"appearances.{key}: must be [r,g,b] with each component in 0..1")
+    return errs
+
+
 def _validate_common(doc: dict, schema: str) -> list[str]:
     errs: list[str] = []
     if doc.get("schema") != schema:
@@ -477,6 +497,7 @@ def _validate_common(doc: dict, schema: str) -> list[str]:
     units = doc.get("units")
     if not isinstance(units, dict) or units.get("system") not in UNIT_SYSTEMS:
         errs.append(f"units.system: must be one of {sorted(UNIT_SYSTEMS)}")
+    errs += _validate_appearances(doc)
     return errs
 
 

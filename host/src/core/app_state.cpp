@@ -380,6 +380,48 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err) {
     if (!idPass->setDoc(doc, err)) return false;
     if (!overlays->setDoc(doc, err)) return false;
 
+    // C26-C: build per-face normal + centroid cache while the DocMesh is still in memory.
+    // For each face, accumulate area-weighted triangle normals and centroids.
+    faceNormalCache.clear();
+    for (const auto& b : doc.bodies) {
+        if (b.pos.empty() || b.idx.empty() || b.faces.empty()) continue;
+        for (const auto& fr : b.faces) {
+            float nx = 0, ny = 0, nz = 0;  // accumulated area-weighted normal
+            float cx = 0, cy = 0, cz = 0;  // accumulated area-weighted centroid
+            float totalArea = 0;
+            for (uint32_t t = 0; t < fr.tri_count; ++t) {
+                size_t base = (size_t)(fr.first_tri + t) * 3;
+                if (base + 2 >= b.idx.size()) break;
+                uint32_t i0 = b.idx[base], i1 = b.idx[base + 1], i2 = b.idx[base + 2];
+                // vertex positions
+                const float* p0 = &b.pos[(size_t)i0 * 3];
+                const float* p1 = &b.pos[(size_t)i1 * 3];
+                const float* p2 = &b.pos[(size_t)i2 * 3];
+                // edge vectors
+                float e1x = p1[0]-p0[0], e1y = p1[1]-p0[1], e1z = p1[2]-p0[2];
+                float e2x = p2[0]-p0[0], e2y = p2[1]-p0[1], e2z = p2[2]-p0[2];
+                // cross product (area-weighted normal, magnitude = 2*area)
+                float crx = e1y*e2z - e1z*e2y;
+                float cry = e1z*e2x - e1x*e2z;
+                float crz = e1x*e2y - e1y*e2x;
+                float area = std::sqrt(crx*crx + cry*cry + crz*crz);
+                nx += crx; ny += cry; nz += crz;
+                float triCx = (p0[0]+p1[0]+p2[0]) * (1.0f/3.0f);
+                float triCy = (p0[1]+p1[1]+p2[1]) * (1.0f/3.0f);
+                float triCz = (p0[2]+p1[2]+p2[2]) * (1.0f/3.0f);
+                cx += triCx * area; cy += triCy * area; cz += triCz * area;
+                totalArea += area;
+            }
+            // normalize normal; normalize centroid by total area
+            float len = std::sqrt(nx*nx + ny*ny + nz*nz);
+            if (len < 1e-12f) continue;
+            nx /= len; ny /= len; nz /= len;
+            if (totalArea > 1e-12f) { cx /= totalArea; cy /= totalArea; cz /= totalArea; }
+            uint64_t key = ((uint64_t)b.body_id << 32) | (uint64_t)fr.face_id;
+            faceNormalCache[key] = {nx, ny, nz, cx, cy, cz};
+        }
+    }
+
     selection.clear();
     hover = render::PickHit{};
     pickStatus.clear();

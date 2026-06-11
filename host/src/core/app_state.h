@@ -6,10 +6,13 @@
 // semantics are unchanged from the monolith.
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -256,6 +259,11 @@ struct AppState {
     bool pickReady = false;             // id buffer rendered this frame (safe to pickFinal)
     // Status-bar hook: set to a human label like "Face 12 of Body1" on hover/selection change.
     std::string pickStatus;
+
+    // C26-C: per-face normal + centroid cache, filled during loadDocMesh while the DocMesh is in
+    // memory. Key = (body_id << 32) | face_id (matches PickHit body_id / topo_id exactly).
+    // Value = {nx, ny, nz, cx, cy, cz} — area-weighted average face normal + face centroid (world).
+    std::unordered_map<uint64_t, std::array<float, 6>> faceNormalCache;
 
     // ---- settings + system-prompt editor buffer ----
     Settings settings;

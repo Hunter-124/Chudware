@@ -256,6 +256,15 @@ zoom_area, view_selector, normal_to.
 **Verify:** interactive camera jitter <1 px; theme toggle preserves viewport state; context menu
 closes on click-outside; section view clipping shots both themes.
 
+### C26 — Definition types + appearance (1–1.5 wks)
+Extrude end conditions (Blind, Mid Plane, Through All, Up To Next + Direction 2) exposed in PM
+forms with reverse-direction buttons; draft taper angle applied per direction; true face-normal
+Normal-To view (Ctrl+8) with clickable orientation triad in viewport; per-body appearance colors
+(set_appearance op, AICM round-trip, context menus tree + viewport + PM dropdown). Engine tests:
+test_extrude_ends.py (all end condition paths), test_appearance.py (color round-trip + AICM encoding).
+**Verify:** PM form fields for Direction 2 depth + draft; Normal-To camera locks to picked face
+normal; appearance color survives save/open; context menu Appearance → [Pick Color] updates tree icon.
+
 ## 6. Feature tiers (the scope contract — anything not V1/S is a no without re-planning)
 
 - **Features tab V1**: extrude boss/cut, revolve, sweep, loft, fillet, chamfer, shell, draft,

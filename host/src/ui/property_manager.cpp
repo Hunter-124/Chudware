@@ -24,6 +24,46 @@ namespace ui {
 // Debounce window for live preview (card §4).
 static const double kDebounceSec = 0.40;
 
+// ---- field enable helpers -------------------------------------------------
+
+// Return the param-value string currently selected by a Combo field with the given key.
+static std::string comboValue(const std::vector<PMField>& fields, const char* key) {
+    for (const auto& f : fields) {
+        if (f.def->kind != PMFieldKind::Combo || std::strcmp(f.def->key, key) != 0) continue;
+        std::string opts = f.def->comboOptions ? f.def->comboOptions : "";
+        int cur = 0; size_t start = 0;
+        while (start <= opts.size()) {
+            size_t bar = opts.find('|', start);
+            std::string opt = opts.substr(start, bar - start);
+            if (cur == f.comboIndex) return opt;
+            ++cur;
+            if (bar == std::string::npos) break;
+            start = bar + 1;
+        }
+    }
+    return {};
+}
+
+// Return true when the field's enableKey/enableVals condition is satisfied (always true when
+// enableKey is null). comingSoon fields are never enabled for interaction.
+static bool fieldEnabled(const PMFieldDef& def, const std::vector<PMField>& fields) {
+    if (def.comingSoon) return false;
+    if (!def.enableKey)  return true;
+    std::string cur = comboValue(fields, def.enableKey);
+    std::string allowed = def.enableVals ? def.enableVals : "";
+    if (allowed.empty()) return true;
+    // Check if cur appears as a token in the pipe-separated allowed list.
+    size_t start = 0;
+    while (start <= allowed.size()) {
+        size_t bar = allowed.find('|', start);
+        std::string tok = allowed.substr(start, bar - start);
+        if (tok == cur) return true;
+        if (bar == std::string::npos) break;
+        start = bar + 1;
+    }
+    return false;
+}
+
 // ---- dim parsing ----------------------------------------------------------
 // Accepts: "25", "25mm", "1.5in", "3/8in", "3/8" (assumed in when a fraction). Canonical = mm.
 
@@ -328,6 +368,8 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
     nlohmann::json params = nlohmann::json::object();
     nlohmann::json refs   = nlohmann::json::object();
     for (const auto& f : fields_) {
+        // comingSoon fields are display-only; never emit them to the engine.
+        if (f.def->comingSoon) continue;
         const char* key = f.def->key;
         switch (f.def->kind) {
             case PMFieldKind::Dim:
@@ -529,18 +571,24 @@ void PropertyManager::draw(AppState& st) {
         }
         if (!groupOpen) continue;
 
+        // Conditional enable: grey-out when the sibling Combo condition isn't met or comingSoon.
+        bool enabled = fieldEnabled(*f.def, fields_);
+        if (!enabled) ImGui::BeginDisabled();
+
         ImGui::PushID((int)i);
         switch (f.def->kind) {
             case PMFieldKind::Dim: {
                 pushTextColor(pal.textDim);
                 ImGui::TextUnformatted(f.def->label);
                 ImGui::PopStyleColor();
+                if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Not yet supported by engine");
                 ImGui::SetNextItemWidth(-1);
                 bool changed = ImGui::InputText("##dim", f.dimBuf.data(), f.dimBuf.size(),
                                                 ImGuiInputTextFlags_EnterReturnsTrue |
                                                 ImGuiInputTextFlags_AutoSelectAll);
                 bool deact = ImGui::IsItemDeactivatedAfterEdit();
-                if (changed || deact) {
+                if (enabled && (changed || deact)) {
                     std::string txt = f.dimBuf.data();
                     // trim
                     while (!txt.empty() && std::isspace((unsigned char)txt.front())) txt.erase(txt.begin());
@@ -561,7 +609,7 @@ void PropertyManager::draw(AppState& st) {
                     }
                 }
                 // expr resolved-value + tooltip
-                if (!f.dimExpr.empty()) {
+                if (enabled && !f.dimExpr.empty()) {
                     pushTextColor(pal.accent);
                     ImGui::Text(u8"= %s  (%s)", f.dimExpr.c_str(),
                                 pmFormatDim(f.dimValue, useIps).c_str());
@@ -569,7 +617,7 @@ void PropertyManager::draw(AppState& st) {
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Bound to equation '%s'", f.dimExpr.c_str());
                 }
-                if (!f.dimError.empty()) {
+                if (enabled && !f.dimError.empty()) {
                     pushTextColor(pal.statusErr);
                     ImGui::Text("! %s", f.dimError.c_str());
                     ImGui::PopStyleColor();
@@ -620,22 +668,25 @@ void PropertyManager::draw(AppState& st) {
                 pushTextColor(pal.textDim);
                 ImGui::TextUnformatted(f.def->label);
                 ImGui::PopStyleColor();
-                // Build option list.
-                std::string opts = f.def->comboOptions ? f.def->comboOptions : "";
-                std::vector<std::string> items; size_t start = 0;
-                while (start <= opts.size()) {
-                    size_t bar = opts.find('|', start);
-                    items.push_back(opts.substr(start, bar - start));
-                    if (bar == std::string::npos) break;
-                    start = bar + 1;
+                if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Not yet supported by engine");
+                // Build display labels (comboLabels if provided, else fall back to comboOptions).
+                std::string lblSrc = f.def->comboLabels ? f.def->comboLabels
+                                   : (f.def->comboOptions ? f.def->comboOptions : "");
+                std::vector<std::string> labels; { size_t s = 0;
+                    while (s <= lblSrc.size()) {
+                        size_t b = lblSrc.find('|', s);
+                        labels.push_back(lblSrc.substr(s, b - s));
+                        if (b == std::string::npos) break; s = b + 1;
+                    }
                 }
-                std::string preview = (f.comboIndex < (int)items.size()) ? items[f.comboIndex] : "";
+                std::string preview = (f.comboIndex < (int)labels.size()) ? labels[f.comboIndex] : "";
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::BeginCombo("##combo", preview.c_str())) {
-                    for (int n = 0; n < (int)items.size(); ++n) {
+                    for (int n = 0; n < (int)labels.size(); ++n) {
                         bool sel = (f.comboIndex == n);
-                        if (ImGui::Selectable(items[n].c_str(), sel)) {
-                            f.comboIndex = n; dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                        if (ImGui::Selectable(labels[n].c_str(), sel)) {
+                            if (enabled) { f.comboIndex = n; dirty_ = true; lastEditTime_ = ImGui::GetTime(); }
                         }
                         if (sel) ImGui::SetItemDefaultFocus();
                     }
@@ -644,13 +695,18 @@ void PropertyManager::draw(AppState& st) {
                 break;
             }
             case PMFieldKind::Check: {
-                if (ImGui::Checkbox(f.def->label, &f.checkValue)) {
-                    dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                bool val = f.checkValue;
+                if (ImGui::Checkbox(f.def->label, &val)) {
+                    if (enabled) { f.checkValue = val; dirty_ = true; lastEditTime_ = ImGui::GetTime(); }
                 }
+                if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Not yet supported by engine");
                 break;
             }
         }
         ImGui::PopID();
+
+        if (!enabled) ImGui::EndDisabled();
     }
 
     // ---- live-preview status hint -----------------------------------------

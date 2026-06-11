@@ -60,6 +60,29 @@
   cut = boolean subtract; through_all = 1.05× bbox extent both ways as needed.
 - errors: open profile (region detection failed); cut removes nothing (warn).
 
+#### `extrude` — C26-B additions (implemented; supersede where noted)
+- `end` extended: now `"blind"|"through_all"|"mid_plane"|"up_to_next"`. `up_to_next` extrudes
+  until the first surface of the existing body along the direction (requires a body — clean
+  error `"extrude: up_to_next requires an existing body"` otherwise).
+- Second direction (opposite of direction 1, which `flip` controls):
+  `end2: "none"|"blind"|"through_all"|"up_to_next"` ("none") · `depth2: dim` (10, used when
+  `end2 == "blind"`). When `end2 != "none"` a second tool is built from the same profiles along
+  the negated direction and applied together (boss: union both; cut: subtract both).
+- `mid_plane` semantics confirmed/normative: `depth` is the TOTAL height (±depth/2 each side of
+  the sketch plane). (Implementation already did this; verified, kept.)
+- Draft is now IMPLEMENTED (no longer deferred) via build123d `extrude(..., taper=°)`
+  (`Solid.extrude_taper`). Sign convention: default inward draft (`draft_outward=false`) →
+  POSITIVE taper (profile narrows toward the extrude direction, smaller top, matching SolidWorks
+  default); `draft_outward=true` → NEGATIVE taper (profile grows). Draft applies to `blind` and
+  `mid_plane` only; for `through_all`/`up_to_next` it is IGNORED with a resolved note
+  `resolved._draft_note` (SolidWorks greys it out there too).
+- `resolved` (echoed for the PM to display) is extended: `{"depth": effective_amount,
+  "taper": <signed °>, "depth2": <amount2 when end2 != none>, "_draft_note": <when ignored>}`.
+- up_to_next realization: boss uses the library path `extrude(face, until=Until.NEXT,
+  target=body, dir=…)` (void-fill to next face); cut uses a manual nearest-solid-slab subtract
+  (a full-length linear column ∩ body, nearest slab along the cut direction) because the library
+  `Until.NEXT` fills the next void and isn't directly subtractable.
+
 ### `revolve`
 - params: `mode: "boss"|"cut"` · `angle: dim` (360) · `flip: bool` (false) · `merge: bool` (true)
 - refs: `profile: [sel(region)]` · `axis: sel(edge[line], datum, region-line)` — axis must not

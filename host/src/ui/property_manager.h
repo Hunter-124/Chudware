@@ -53,10 +53,20 @@ struct PMFieldDef {
     bool selMulti = true;       // array of selectors (edges/remove) vs single (axis/plane)
 
     // Combo
-    const char* comboOptions = nullptr;  // "boss|cut" (first = default)
+    const char* comboOptions = nullptr;  // "boss|cut" — param values emitted to engine (first = default)
+    const char* comboLabels  = nullptr;  // "Boss|Cut" — display labels; null = use comboOptions
 
     // Check
     bool checkDefault = false;
+
+    // Conditional enable: when enableKey is non-null, this field is enabled only when the
+    // sibling Combo named enableKey has its selected value in the pipe-separated enableVals
+    // list (e.g. enableVals="blind|mid_plane"). A null enableKey means always enabled.
+    // comingSoon=true renders the field greyed/disabled with a "(coming soon)" tooltip even
+    // when the enable condition would otherwise pass — for discoverability of future params.
+    const char* enableKey  = nullptr;
+    const char* enableVals = nullptr;   // pipe-separated allowed values; empty = all
+    bool comingSoon = false;
 };
 
 // A complete feature form: type + display title + ordered fields.

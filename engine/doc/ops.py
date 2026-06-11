@@ -434,6 +434,28 @@ def _op_set_material(doc, op, index, idgen, id_map):
         raise _invalid(index, "set_material requires a string 'key' (or null)")
 
 
+def _op_set_appearance(doc, op, index, idgen, id_map):
+    """Set (or clear) a body's display color (C26). ``id`` is the body's stable owner key — the
+    owner-feature id for a part body, the component id for an assembly body (whatever the rebuild
+    reports as the body's owner; see session._write_aicm). ``color`` is ``[r,g,b]`` in 0..1, or
+    ``null`` to clear back to the default palette color. Append-only vocabulary entry; mirrors
+    set_folder/set_material's create-or-clear shape and round-trips through the document JSON."""
+    bid = op.get("id")
+    if not isinstance(bid, str) or not bid:
+        raise _invalid(index, "set_appearance requires a non-empty 'id' (body owner key)")
+    color = op.get("color")
+    ap = doc.setdefault("appearances", {})
+    if color is None:
+        ap.pop(bid, None)
+        if not ap:
+            doc.pop("appearances", None)
+        return
+    if not (isinstance(color, list) and len(color) == 3
+            and all(isinstance(c, (int, float)) and not isinstance(c, bool) for c in color)):
+        raise _invalid(index, "set_appearance.color must be [r,g,b] floats (or null to clear)")
+    ap[bid] = [max(0.0, min(1.0, float(c))) for c in color]
+
+
 def _op_set_units(doc, op, index, idgen, id_map):
     system = op.get("system")
     if system not in ("MMGS", "IPS"):
@@ -683,6 +705,7 @@ _OP_HANDLERS = {
     "rename": _op_rename,
     "set_folder": _op_set_folder,
     "set_material": _op_set_material,
+    "set_appearance": _op_set_appearance,
     "set_units": _op_set_units,
     "eq_set": _op_eq_set,
     "eq_delete": _op_eq_delete,

@@ -1,4 +1,4 @@
-"""Extrude feature compiler — boss/cut, blind/through_all/mid_plane.
+"""Extrude feature compiler — boss/cut, blind/through_all/mid_plane/up_to_next.
 
 feature_params.md §Sketched features > extrude.
 
@@ -7,8 +7,22 @@ Profile source:
   using ``resolve_region``.
 - ``{"kind":"face",...}`` → resolved via describe_faces + resolve (face selector).
 
-``draft`` is DEFERRED — BRepOffsetAPI_DraftAngle not implemented in this card.
-``through_all`` = 1.05× combined bounding-box extent in the extrude direction.
+End conditions (direction 1 = first profile face normal, flipped by ``flip``):
+- ``blind`` = ``depth`` along the direction.
+- ``through_all`` = 1.05× combined bounding-box extent in the extrude direction.
+- ``mid_plane`` = ±depth/2 each side (SolidWorks: ``depth`` is the TOTAL height).
+- ``up_to_next`` = library ``extrude(..., until=Until.NEXT, target=body)`` — extrudes
+  until the first surface of the existing body along the direction. Requires a body.
+
+Second direction (``end2`` != "none") builds a second tool from the same profiles along
+the *negated* direction with its own end-condition logic; both tools are applied in one
+feature (boss: union both; cut: subtract both).
+
+``draft`` is applied via build123d ``extrude(..., taper=)`` (``Solid.extrude_taper``).
+Sign convention: SolidWorks default "draft inward" (profile narrows toward the extrude
+direction) maps to POSITIVE taper; ``draft_outward=True`` flips to NEGATIVE taper (profile
+grows). Draft applies to blind/mid_plane only — ignored (with a resolved note) for
+through_all/up_to_next, matching SolidWorks greying it out there.
 """
 
 from __future__ import annotations
@@ -23,6 +37,7 @@ from build123d import (
     Mode,
     Plane,
     Solid,
+    Until,
     Vector,
     Wire,
 )
@@ -214,6 +229,80 @@ def _to_solid_normalized(shape) -> Any:
 # --------------------------------------------------------------------------- extrude
 
 
+_VALID_ENDS = ("blind", "through_all", "mid_plane", "up_to_next")
+_VALID_ENDS2 = ("none", "blind", "through_all", "up_to_next")
+
+
+def _up_to_next_cut_tool(face: Face, direction: Vector, body) -> Any:
+    """Cut "up to next": the SOLID material from the sketch plane to the next face.
+
+    build123d ``Until.NEXT`` fills the next VOID (boss semantics) and isn't subtractable,
+    so for a cut we extrude a full-length linear column, intersect it with the body, and
+    keep the solid slab nearest the sketch plane along the cut direction.
+    """
+    reach = max(_body_extent_along(body, direction), _body_bbox_diag(body)) * 4.0
+    column = Solid.extrude(face, Vector(direction) * reach)
+    inside = body.intersect(column)
+    try:
+        slabs = inside.solids()
+    except Exception:  # noqa: BLE001
+        slabs = []
+    if not slabs:
+        raise FeatureError(
+            "extrude: up_to_next cut removed no material",
+            hint="the profile does not intersect the body along the cut direction",
+        )
+    # Nearest slab to the sketch plane along the cut direction.
+    axis = Axis(face.center(), Vector(direction))
+    nearest = slabs.sort_by(axis)[0]
+    return nearest
+
+
+def _build_tool_for_dir(
+    face: Face, end_cond: str, amount: float, direction: Vector, taper: float,
+    bodies: list, fid: str, *, label: str, mode: str = "boss",
+) -> Any:
+    """Build a single-direction extrude tool for one profile face.
+
+    ``end_cond`` ∈ blind|through_all|up_to_next. ``amount`` is the linear distance for
+    blind/through_all (ignored for up_to_next). ``taper`` (deg) applies to blind only.
+    ``mode`` selects the up_to_next realization (boss = library Until.NEXT void-fill;
+    cut = nearest solid slab to subtract).
+    """
+    if end_cond == "up_to_next":
+        if not bodies:
+            raise FeatureError(
+                "extrude: up_to_next requires an existing body",
+                hint="add a base feature before extruding up to next",
+            )
+        if mode == "cut":
+            return _up_to_next_cut_tool(face, direction, bodies[-1])
+        try:
+            tool = b3d_extrude(
+                face, until=Until.NEXT, target=bodies[-1], dir=direction,
+                mode=Mode.PRIVATE,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise FeatureError(
+                f"extrude: up_to_next ({label}) build failed: {exc}",
+                hint="the profile must project onto a face of the existing body along the direction",
+            )
+        return tool
+
+    try:
+        if end_cond == "blind" and abs(taper) > 1e-9:
+            tool = b3d_extrude(face, amount=amount, dir=direction, taper=taper,
+                               mode=Mode.PRIVATE)
+        else:
+            tool = b3d_extrude(face, amount=amount, dir=direction, mode=Mode.PRIVATE)
+    except Exception as exc:  # noqa: BLE001
+        raise FeatureError(
+            f"extrude: build failed ({label}): {exc}",
+            hint="check that the profile is a closed region in the extrude plane",
+        )
+    return tool
+
+
 @register("extrude")
 def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
     p = feat.get("params", {})
@@ -221,17 +310,24 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
 
     mode = p.get("mode", "boss")
     end = p.get("end", "blind")
+    end2 = p.get("end2", "none")
     flip = p.get("flip", False)
     merge = p.get("merge", True)
 
-    depth = ctx.dim(p, "depth", 10.0)  # used for blind and mid_plane
+    if end not in _VALID_ENDS:
+        raise FeatureError(f"extrude: unknown end '{end}'")
+    if end2 not in _VALID_ENDS2:
+        raise FeatureError(f"extrude: unknown end2 '{end2}'")
 
-    # Draft is deferred
-    draft_val = p.get("draft")
-    if draft_val is not None:
-        draft_deg = ctx.dim(p, "draft", 0.0)
-        if abs(draft_deg) > 1e-9:
-            pass  # DEFERRED: BRepOffsetAPI_DraftAngle not implemented
+    depth = ctx.dim(p, "depth", 10.0)    # blind & mid_plane (dir 1)
+    depth2 = ctx.dim(p, "depth2", 10.0)  # blind (dir 2)
+
+    # Draft → taper (degrees). SW "draft inward" (default) = positive taper (narrows);
+    # draft_outward flips the sign. Applies to blind/mid_plane only.
+    draft_deg = ctx.dim(p, "draft", 0.0) if p.get("draft") is not None else 0.0
+    draft_outward = bool(p.get("draft_outward", False))
+    taper = -draft_deg if draft_outward else draft_deg
+    draft_ignored = False  # set true when end condition greys out draft
 
     # Resolve profile faces
     profile_sels = refs.get("profile") or []
@@ -269,74 +365,93 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
     if flip:
         normal = normal * -1.0
 
-    # Compute amount
-    if end == "blind":
-        amount = depth
-    elif end == "through_all":
-        # 1.05× combined bounding-box extent in the extrude direction
-        if bodies:
-            extent = _body_extent_along(bodies[-1], normal)
-        else:
-            # No body yet; estimate from face bounding box
-            try:
-                bb = face0.bounding_box()
-                dx = bb.max.X - bb.min.X
-                dy = bb.max.Y - bb.min.Y
-                dz = bb.max.Z - bb.min.Z
-                extent = math.sqrt(dx * dx + dy * dy + dz * dz) * 2
-            except Exception:  # noqa: BLE001
-                extent = 100.0
-        amount = 1.05 * extent
-    elif end == "mid_plane":
-        amount = depth / 2.0
-    else:
-        raise FeatureError(f"extrude: unknown end '{end}'")
+    fid = feat.get("id", "?")
 
-    if amount <= 0.0:
+    def _linear_amount(end_cond: str, blind_depth: float, dir_vec: Vector) -> float:
+        """Linear distance for blind/through_all. up_to_next ignores amount."""
+        if end_cond == "blind":
+            return blind_depth
+        if end_cond == "through_all":
+            if bodies:
+                extent = _body_extent_along(bodies[-1], dir_vec)
+            else:
+                try:
+                    bb = face0.bounding_box()
+                    dx = bb.max.X - bb.min.X
+                    dy = bb.max.Y - bb.min.Y
+                    dz = bb.max.Z - bb.min.Z
+                    extent = math.sqrt(dx * dx + dy * dy + dz * dz) * 2
+                except Exception:  # noqa: BLE001
+                    extent = 100.0
+            return 1.05 * extent
+        return 0.0
+
+    # --- direction-1 amount (or mid_plane half-depth) ---
+    if end == "mid_plane":
+        amount = depth / 2.0  # SW: depth = TOTAL height, half each side
+    else:
+        amount = _linear_amount(end, depth, normal)
+        if end in ("through_all", "up_to_next") and abs(taper) > 1e-9:
+            draft_ignored = True  # SW greys draft here
+    if end != "up_to_next" and amount <= 0.0:
         raise FeatureError(f"extrude: effective depth {amount:.3g} must be > 0")
 
-    # Build extruded tools for each profile face
+    # Taper applies to blind/mid_plane only.
+    taper1 = taper if (end in ("blind", "mid_plane") and not draft_ignored) else 0.0
+
+    # --- direction-2 amount ---
+    amount2 = 0.0
+    if end2 != "none":
+        amount2 = _linear_amount(end2, depth2, normal * -1.0)
+        if end2 in ("through_all", "up_to_next") and abs(taper) > 1e-9:
+            draft_ignored = True
+        if end2 != "up_to_next" and amount2 <= 0.0:
+            raise FeatureError(f"extrude: effective depth2 {amount2:.3g} must be > 0")
+
+    # Build per-profile tools. Each profile contributes a dir-1 tool (and a dir-2 tool
+    # when end2 != none); we union the per-profile pieces into one tool_solid.
     tool_bodies: list[Any] = []
     for face in profile_faces:
-        try:
-            if end == "mid_plane":
-                # Extrude both ways by amount (half-depth each side)
-                try:
-                    tool_fwd = b3d_extrude(face, amount=amount, mode=Mode.PRIVATE)
-                    face_normal = face.normal_at()
-                    tool_rev = b3d_extrude(face, amount=amount, dir=face_normal * -1.0,
-                                           mode=Mode.PRIVATE)
-                    combined = tool_fwd + tool_rev
-                    tool_bodies.append(combined)
-                except Exception:  # noqa: BLE001
-                    try:
-                        tool_both = b3d_extrude(face, amount=amount, both=True, mode=Mode.PRIVATE)
-                        tool_bodies.append(tool_both)
-                    except Exception as e2:  # noqa: BLE001
-                        raise FeatureError(
-                            f"extrude: mid_plane build failed: {e2}",
-                            hint="check that the profile is a closed region in the extrude plane",
-                        )
-            else:
-                tool = b3d_extrude(face, amount=amount, dir=normal, mode=Mode.PRIVATE)
-                tool_bodies.append(tool)
-        except Exception as exc:  # noqa: BLE001
-            raise FeatureError(
-                f"extrude: build failed: {exc}",
-                hint="check that the profile is a closed region in the extrude plane",
-            )
+        if end == "mid_plane":
+            try:
+                if abs(taper1) > 1e-9:
+                    fn = face.normal_at()
+                    if flip:
+                        fn = fn * -1.0
+                    t_fwd = b3d_extrude(face, amount=amount, dir=fn, taper=taper1,
+                                        mode=Mode.PRIVATE)
+                    t_rev = b3d_extrude(face, amount=amount, dir=fn * -1.0, taper=taper1,
+                                        mode=Mode.PRIVATE)
+                    piece = t_fwd + t_rev
+                else:
+                    piece = b3d_extrude(face, amount=amount, both=True, mode=Mode.PRIVATE)
+            except Exception as exc:  # noqa: BLE001
+                raise FeatureError(
+                    f"extrude: mid_plane build failed: {exc}",
+                    hint="check that the profile is a closed region in the extrude plane",
+                )
+            tool_bodies.append(piece)
+            continue
 
-    # Combine all tool solids
-    if len(tool_bodies) == 1:
-        tool_solid = tool_bodies[0]
-    else:
-        tool_solid = tool_bodies[0]
-        for tb in tool_bodies[1:]:
-            tool_solid = tool_solid + tb
+        piece = _build_tool_for_dir(face, end, amount, normal, taper1, bodies, fid,
+                                    label="dir1", mode=mode)
+        if end2 != "none":
+            piece2 = _build_tool_for_dir(face, end2, amount2, normal * -1.0, taper1,
+                                         bodies, fid, label="dir2", mode=mode)
+            piece = piece + piece2
+        tool_bodies.append(piece)
 
+    # Union all per-profile tool pieces.
+    tool_solid = tool_bodies[0]
+    for tb in tool_bodies[1:]:
+        tool_solid = tool_solid + tb
     tool_solid = _to_solid_normalized(tool_solid)
 
-    fid = feat.get("id", "?")
+    resolved: dict[str, float | str] = {"depth": amount, "taper": taper1}
+    if end2 != "none":
+        resolved["depth2"] = amount2
+    if draft_ignored:
+        resolved["_draft_note"] = "draft ignored (not supported for through_all/up_to_next)"
 
     # Apply to the running body
     if not bodies or not merge:
@@ -344,8 +459,7 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
             raise FeatureError("extrude: cut mode requires an existing body to subtract from")
         bodies.append(tool_solid)
         _store_topo_owners(ctx, fid, tool_solid, None)
-        return CompileOutput(bodies=bodies, tool_body=tool_solid,
-                             resolved={"depth": amount})
+        return CompileOutput(bodies=bodies, tool_body=tool_solid, resolved=resolved)
 
     target = bodies[-1]
     try:
@@ -371,6 +485,6 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
             )
 
     bodies[-1] = result
+    # Both-direction / single-direction share this one owner-store on the final result.
     _store_topo_owners(ctx, fid, result, target)
-    return CompileOutput(bodies=bodies, tool_body=tool_solid,
-                         resolved={"depth": amount})
+    return CompileOutput(bodies=bodies, tool_body=tool_solid, resolved=resolved)

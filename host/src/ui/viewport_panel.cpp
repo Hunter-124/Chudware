@@ -1,5 +1,6 @@
 // AI-CAD Viewport panel — 3D orbit view + parts list + fit readout + overlays.
 #include <cmath>
+#include <cstdint>
 #include <string>
 
 #include "imgui.h"
@@ -36,29 +37,75 @@ static bool  s_zoomAreaDragging = false;
 static ImVec2 s_zoomAreaP0 = {0, 0};  // drag start (screen)
 static ImVec2 s_zoomAreaP1 = {0, 0};  // drag current (screen)
 
-// ---- C25 W2-D: Normal-To (Ctrl+8 / shortcut) --------------------------------------------------
-// "Look straight at the selected face." If a face is selected we'd animate down its average vertex
-// normal; the per-face normals live only inside render::IdPass's GPU buffers (the CPU DocMesh is
-// discarded after load), so wiring the true face path requires retaining the DocMesh — TODO, see
-// the report. Until then this ships the documented fallback: snap to the axis-aligned view whose
-// view direction is nearest the current one (animated, zoom unchanged).
-static void normalToSelectionOrNearestAxis(AppState& st) {
-    // TODO(W2-D face Normal-To): when a face is selected (st.selection has a Face hit) and the
-    // DocMesh is retained, average that face's vertex normals (BodyMesh::nrm over the FaceRange's
-    // triangles) and animate yaw/pitch so dir == +normal (Z-up). Needs a CPU DocMesh cache in
-    // AppState (loadDocMesh currently drops it) — out of scope for this wave's owned files.
+// ---- C26-C: Normal-To (Ctrl+8 / shortcut) -----------------------------------------------------
+// "Look straight at the selected face." If a face is selected and the C26-C normal cache has data
+// for it, animate the camera so the view direction equals the face's outward normal. Second press
+// while already looking at that face flips to the anti-view (SolidWorks behavior). Pan resets to
+// the face centroid (so the face centers on screen). Zoom is kept.
+//
+// Yaw/pitch derivation (Z-up, target-to-eye convention):
+//   dir = (cos(pitch)*sin(yaw), -cos(pitch)*cos(yaw), sin(pitch))
+//   Given face normal N = (nx, ny, nz):
+//     pitch = asin(nz)            (clamped ±89.5° by requestCameraAnimation)
+//     yaw   = atan2(nx, -ny)
+//   This satisfies dir == N by construction; verified against Front (N=(0,-1,0) → yaw=0,pitch=0)
+//   and Top (N=(0,0,1) → yaw=0,pitch=90) which match the existing presets.
+//
+// Nearest-axis fallback: when no face is selected, snaps to the axis-aligned view whose view
+// direction is nearest the current one (same as the old stub).
 
-    // Nearest-axis fallback. dir = view direction from target toward eye (matches drawCurrent):
-    //   dir = (cos p sin y, -cos p cos y, sin p).  Snap to the closest of ±X/±Y/±Z and map to the
-    // preset that orients the camera along that axis.
-    const float deg = 3.14159265f / 180.0f;
-    float y = st.yaw * deg, p = st.pitch * deg;
+// Persistent state for second-press flip detection (file-static, one viewport):
+static uint64_t s_normalToKey   = 0;    // last cached key (body<<32 | face_id)
+static float    s_normalToYaw   = 0;    // the yaw we animated to
+static float    s_normalToPitch = 0;    // the pitch we animated to
+
+static void normalToSelectionOrNearestAxis(AppState& st) {
+    const float kPiOver180 = 3.14159265f / 180.0f;
+
+    // ---- try true face normal path ----
+    if (!st.selection.empty()) {
+        const render::PickHit& h = st.selection.items().back().hit;
+        if (h.valid() && h.kind == render::PickKind::Face) {
+            uint64_t key = ((uint64_t)h.body_id << 32) | (uint64_t)h.topo_id;
+            auto it = st.faceNormalCache.find(key);
+            if (it != st.faceNormalCache.end()) {
+                const auto& v = it->second;
+                float nx = v[0], ny = v[1], nz = v[2];
+                float faceCx = v[3], faceCy = v[4], faceCz = v[5];
+
+                // Second-press flip: if we already animated to this face, flip to anti-view.
+                bool alreadyNormal = (key == s_normalToKey);
+                float targetNx = nx, targetNy = ny, targetNz = nz;
+                if (alreadyNormal) {
+                    targetNx = -nx; targetNy = -ny; targetNz = -nz;
+                    s_normalToKey = 0;  // next press goes forward again
+                } else {
+                    s_normalToKey = key;
+                }
+
+                float pitch = std::asin(targetNz > 1.0f ? 1.0f : (targetNz < -1.0f ? -1.0f : targetNz));
+                float yaw   = std::atan2(targetNx, -targetNy);
+                float pitchDeg = pitch / kPiOver180;
+                float yawDeg   = yaw   / kPiOver180;
+                s_normalToYaw   = yawDeg;
+                s_normalToPitch = pitchDeg;
+
+                // Pan to centroid so the face is centered on screen.
+                float pan[3] = {faceCx, faceCy, faceCz};
+                requestCameraAnimation(st, yawDeg, pitchDeg, -1.0f, pan);
+                return;
+            }
+        }
+    }
+    s_normalToKey = 0;  // no face selected: reset flip state
+
+    // ---- nearest-axis fallback ----
+    // dir = view direction from target toward eye (target-to-eye convention):
+    //   dir = (cos p sin y, -cos p cos y, sin p)
+    float y = st.yaw * kPiOver180, p = st.pitch * kPiOver180;
     float dx = std::cos(p) * std::sin(y);
     float dy = -std::cos(p) * std::cos(y);
     float dz = std::sin(p);
-    // The six axis presets and their view directions (see applyViewPreset):
-    //   Front +? : Front dir=(0,-1,0); Back (0,1,0); Right (1,0,0); Left (-1,0,0);
-    //   Top (0,0,1); Bottom (0,0,-1).
     struct AxView { float x, y, z; ViewPreset preset; };
     static const AxView kAx[6] = {
         { 0, -1,  0, ViewPreset::Front  },
@@ -73,9 +120,76 @@ static void normalToSelectionOrNearestAxis(AppState& st) {
         float d = dx * kAx[i].x + dy * kAx[i].y + dz * kAx[i].z;
         if (d > bestDot) { bestDot = d; best = i; }
     }
-    // applyViewPreset resets pan and keeps zoom for orientation presets — exactly Normal-To's
-    // "zoom unchanged" requirement.
     applyViewPreset(st, kAx[best].preset);
+}
+
+// ---- C26: appearance color-picker popup (duplicated from feature_tree.cpp; sharing it would
+// need a new translation unit in CMakeLists, owned by another agent this wave). Preset swatches
+// over a ColorPicker3; returns true once on commit, writing into outColor[3]. ----
+static bool appearanceColorPicker(const char* popupId, float outColor[3]) {
+    static float s_pick[3] = {0.71f, 0.76f, 0.82f};
+    static bool  s_seeded  = false;
+    bool committed = false;
+    if (ImGui::BeginPopup(popupId)) {
+        if (!s_seeded) { s_pick[0] = outColor[0]; s_pick[1] = outColor[1]; s_pick[2] = outColor[2];
+                         s_seeded = true; }
+        ImGui::TextUnformatted("Appearance");
+        ImGui::Separator();
+        static const float kPresets[8][3] = {
+            {0.71f, 0.76f, 0.82f}, {0.50f, 0.50f, 0.52f}, {0.20f, 0.21f, 0.23f},
+            {0.85f, 0.85f, 0.86f}, {0.80f, 0.15f, 0.15f}, {0.15f, 0.35f, 0.80f},
+            {0.18f, 0.60f, 0.25f}, {0.92f, 0.80f, 0.12f},
+        };
+        float sw = 22.0f * ui::uiScale;
+        for (int i = 0; i < 8; ++i) {
+            if (i) ImGui::SameLine(0, 4.0f * ui::uiScale);
+            ImVec4 c(kPresets[i][0], kPresets[i][1], kPresets[i][2], 1.0f);
+            if (ImGui::ColorButton(("##aprs" + std::to_string(i)).c_str(), c,
+                                   ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop,
+                                   ImVec2(sw, sw))) {
+                outColor[0] = kPresets[i][0]; outColor[1] = kPresets[i][1]; outColor[2] = kPresets[i][2];
+                committed = true;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(180.0f * ui::uiScale);
+        ImGui::ColorPicker3("##appk", s_pick,
+                            ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoSmallPreview);
+        if (ImGui::Button("Apply", ImVec2(80.0f * ui::uiScale, 0))) {
+            outColor[0] = s_pick[0]; outColor[1] = s_pick[1]; outColor[2] = s_pick[2];
+            committed = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(80.0f * ui::uiScale, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    } else {
+        s_seeded = false;
+    }
+    return committed;
+}
+
+// ---- C26: apply a set_appearance op straight from the viewport, then reload the mesh. ----
+// A DIRECT apply (not the feature tree's deferred queue) is SAFE here: the viewport context menu is
+// NOT drawn while iterating the DocMirror tree json (the feature tree's use-after-free hazard) — it
+// runs inside the Viewport window after rendering, touching no tree-iteration state. This mirrors
+// feature_tree's applyTreeOpsNow: apply -> loadDocMesh(resp.aicm_path) repaints the body with its
+// new color on the next frame.
+static void applyAppearanceFromViewport(AppState& st, const std::string& bodyKey,
+                                        const float* color /* nullptr = clear */) {
+    if (!st.docMirror.hasDoc() || !st.workerStarted) return;
+    nlohmann::json op = {{"op", "set_appearance"}, {"id", bodyKey}};
+    if (color) op["color"] = {color[0], color[1], color[2]};
+    else       op["color"] = nullptr;
+    auto resp = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (resp.ok && !resp.aicm_path.empty()) {
+        std::string lerr;
+        st.loadDocMesh(resp.aicm_path, lerr);
+        if (!lerr.empty()) st.addLog("[err] loadDocMesh: " + lerr);
+    } else if (!resp.ok) {
+        st.addLog("[err] set_appearance: " + resp.error_message);
+    }
 }
 
 void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
@@ -398,6 +512,23 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             st.wantContextMenu = false;
             ImGui::OpenPopup("##vp_ctx");
         }
+        // C26: appearance state shared between the vp_ctx menu item and its sibling picker popup.
+        static float s_vpColor[3]   = {0.71f, 0.76f, 0.82f};
+        static std::string s_vpKey;          // "b<ordinal>" of the body to recolor
+        static bool  s_openVpPicker = false;
+        // The picked body's stable appearance key (part bodies: "b<ordinal>", matching the engine).
+        // Appearance is offered for part docs only; assembly bodies key by component id, which the
+        // viewport pick alone can't resolve (deferred — see report).
+        // NOTE: tree() is null until the first ops response after doc_new — json::value()
+        // on a null json THROWS (this crashed the m1 scenario); guard with is_object().
+        bool vpIsPart = st.docMirror.hasDoc() && st.docMirror.tree().is_object() &&
+                        st.docMirror.tree().value("schema", std::string()) != "aicad.asm/1";
+        std::string vpBodyKey;
+        if (vpIsPart && !st.selection.empty()) {
+            uint32_t bid = st.selection.items().back().hit.body_id;
+            if (bid != 0) vpBodyKey = "b" + std::to_string(bid);
+        }
+
         if (ImGui::BeginPopup("##vp_ctx")) {
             // Selection section (shown only when something is selected / hovered).
             if (!st.pickStatus.empty()) {
@@ -407,6 +538,16 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 ImGui::TextUnformatted(st.pickStatus.c_str());
                 ImGui::PopStyleColor();
                 if (ImGui::MenuItem("Clear Selection")) st.selection.clear();
+                // C26: recolor the selected body. Opens the shared picker (a sibling popup).
+                if (!vpBodyKey.empty()) {
+                    if (ImGui::MenuItem("Appearance...")) {
+                        s_vpKey = vpBodyKey;
+                        s_vpColor[0] = 0.71f; s_vpColor[1] = 0.76f; s_vpColor[2] = 0.82f;
+                        s_openVpPicker = true;
+                    }
+                    if (ImGui::MenuItem("Clear Appearance"))
+                        applyAppearanceFromViewport(st, vpBodyKey, nullptr);
+                }
                 ImGui::Separator();
             }
             // View presets submenu.
@@ -464,6 +605,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 /* ViewSelector has no public open(); trigger via Space key next frame: */ (void)0;
             ImGui::EndPopup();
         }
+
+        // C26: appearance picker — a SIBLING popup of vp_ctx (opened from its menu item) to avoid
+        // nested-popup ordering issues. Direct-applies on commit (safe outside tree iteration).
+        if (s_openVpPicker) { ImGui::OpenPopup("##appearance_vp"); s_openVpPicker = false; }
+        if (appearanceColorPicker("##appearance_vp", s_vpColor) && !s_vpKey.empty())
+            applyAppearanceFromViewport(st, s_vpKey, s_vpColor);
 
         // ---- C25 W3-J: heads-up view toolbar (SolidWorks-style, fully functional) ----
         // Centered pill at the viewport top; hidden while editing a sketch.
@@ -740,45 +887,97 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             renderer.setGroundShadow(vpal.groundShadow[0], vpal.groundShadow[1],
                                      vpal.groundShadow[2], alpha);
         }
-        // ---- C24: orientation triad, bottom-left of the viewport (SolidWorks-style) ----
+        // ---- C24 / C26-C: orientation triad, bottom-left of the viewport (SolidWorks-style) ----
         // C25 W3-J: gated by st.showTriad.
-        // A tiny XYZ gizmo reflecting the current orbit (yaw/pitch). Axes are projected from world
-        // to screen with the same convention the renderer uses, so it tracks the live camera.
+        // C26-C: each axis tip is a small invisible ImGui button. Clicking an axis goes to the
+        // corresponding preset view; clicking the axis you're already looking down flips opposite.
+        //   +X tip → Right  (yaw=90,  pitch=0)
+        //   +Y tip → Front  (yaw=0,   pitch=0)  — "look from the +Y side" = Front in this basis
+        //   +Z tip → Top    (yaw=0,   pitch=89.5)
+        // Hover: accentSoft circle behind the label. Tooltip: view name.
         if (st.showTriad) {
             const float ts = ui::uiScale;
-            float cx = vr0.x + 34.0f * ts, cy = vr1.y - 34.0f * ts;  // triad center, bottom-left
+            float cx = vr0.x + 34.0f * ts, cy = vr1.y - 34.0f * ts;
             float L = 20.0f * ts;
             float yawR = st.yaw * 3.14159265f / 180.0f, pitR = st.pitch * 3.14159265f / 180.0f;
             float cyaw = std::cos(yawR), syaw = std::sin(yawR);
             float cpit = std::cos(pitR), spit = std::sin(pitR);
-            // World axis -> screen (x right, y down). Project (Xw,Yw,Zw) after yaw about up then
-            // pitch: screen_x = Xw*cyaw - Yw*syaw; depth-tilt folds Z up by pitch.
             auto proj = [&](float wx, float wy, float wz, float& sx, float& sy) {
                 float rx = wx * cyaw + wy * syaw;
                 float ry = -wx * syaw + wy * cyaw;
                 sx = rx;
                 sy = -(wz * cpit - ry * spit);
             };
-            struct Ax { float x, y, z; const char* l; const float* col; };
-            const Ax axes[] = {
-                {1, 0, 0, "X", ui::palette.axisX},
-                {0, 1, 0, "Y", ui::palette.axisY},
-                {0, 0, 1, "Z", ui::palette.axisZ},
+            struct Ax {
+                float x, y, z;
+                const char* l;
+                const float* col;
+                ViewPreset preset;
+                const char* viewName;
+                // The yaw/pitch that represents "already looking at this axis" (approx check).
+                float chkYaw, chkPitch;
             };
+            const Ax axes[] = {
+                {1, 0, 0, "X", ui::palette.axisX, ViewPreset::Right,  "Right",  90.0f,  0.0f},
+                {0, 1, 0, "Y", ui::palette.axisY, ViewPreset::Front,  "Front",   0.0f,  0.0f},
+                {0, 0, 1, "Z", ui::palette.axisZ, ViewPreset::Top,    "Top",     0.0f, 89.5f},
+            };
+            // Draw lines and label chips first (under buttons).
             for (const auto& a : axes) {
                 float sx, sy; proj(a.x, a.y, a.z, sx, sy);
                 ImVec2 tip(cx + sx * L, cy + sy * L);
                 ImU32 col = ImGui::ColorConvertFloat4ToU32(
                     ImVec4(a.col[0], a.col[1], a.col[2], 0.95f));
                 vdl->AddLine(ImVec2(cx, cy), tip, col, 1.8f);
-                // Back the axis glyph with a small chip so it stays legible over any geometry.
+            }
+            vdl->AddCircleFilled(ImVec2(cx, cy), 2.4f, overlayTxt);
+
+            // Draw buttons + labels on top.
+            ImGui::PushID("##triad");
+            const float hitR = 8.0f * ts;  // invisible button half-size
+            for (int ai = 0; ai < 3; ++ai) {
+                const auto& a = axes[ai];
+                float sx, sy; proj(a.x, a.y, a.z, sx, sy);
+                ImVec2 tip(cx + sx * L, cy + sy * L);
+
+                // Invisible button centered on the axis tip.
+                ImGui::SetCursorScreenPos(ImVec2(tip.x - hitR, tip.y - hitR));
+                ImGui::PushID(ai);
+                bool clicked = ImGui::InvisibleButton("##tb", ImVec2(hitR * 2, hitR * 2));
+                bool hov = ImGui::IsItemHovered();
+                ImGui::PopID();
+
+                if (hov) {
+                    // Hover: accentSoft circle highlight.
+                    vdl->AddCircleFilled(tip, hitR,
+                        ui::Palette::toU32(ui::palette.accentSoft));
+                    ImGui::SetTooltip("%s view", a.viewName);
+                }
+                if (clicked) {
+                    // Check if already looking from this axis (within 5° tolerance).
+                    float dy2  = std::fabs(std::fmod(st.yaw - a.chkYaw + 540.0f, 360.0f) - 180.0f);
+                    float dp2  = std::fabs(st.pitch - a.chkPitch);
+                    bool already = (dy2 < 5.0f && dp2 < 5.0f);
+                    if (already) {
+                        // Flip to opposite view.
+                        static const float kZeroPan[3] = {0,0,0};
+                        requestCameraAnimation(st, a.chkYaw + 180.0f,
+                                               -a.chkPitch, -1.0f, kZeroPan);
+                    } else {
+                        applyViewPreset(st, a.preset);
+                    }
+                }
+
+                // Label chip.
+                ImU32 col = ImGui::ColorConvertFloat4ToU32(
+                    ImVec4(a.col[0], a.col[1], a.col[2], 0.95f));
                 ImVec2 lp(tip.x - 3, tip.y - 7);
                 ImVec2 lts = ImGui::CalcTextSize(a.l);
                 vdl->AddRectFilled(ImVec2(lp.x - 2, lp.y - 1),
                                    ImVec2(lp.x + lts.x + 2, lp.y + lts.y + 1), overlayBg, 2.0f);
                 vdl->AddText(lp, col, a.l);
             }
-            vdl->AddCircleFilled(ImVec2(cx, cy), 2.4f, overlayTxt);
+            ImGui::PopID();
         }
         if (!st.modelInfo.empty() && renderer.hasMesh()) {
             // dimensions readout, bottom-left (sits above the orientation triad)

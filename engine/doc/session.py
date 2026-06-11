@@ -237,11 +237,26 @@ def _write_aicm(session: DocSession, result: CompileResult) -> tuple[str, list[d
 
     body_tesses: list[tess.BodyTess] = []
     bodies_meta: list[dict] = []
+    appearances = session.doc.get("appearances", {}) or {}
     for i, bo in enumerate(_solid_bodies(result), start=1):
-        color = tuple(bo.color) if bo.color else _DEFAULT_COLOR
+        # C26 appearance: a per-body color stored in the document under the body's stable key wins
+        # over the compiler/default color. The AICM BODY chunk already carries this color and the
+        # renderer's PartMesh renders it directly — no new transport needed.
+        #
+        # Body key = "b{ordinal}" where ordinal is the 1-based AICM body id (the same body_id the
+        # host's PickHit carries). It is deterministic by feature order and always present (unlike
+        # the face-owner map, which is empty on a pure cache-hit rebuild), so the host can form the
+        # set_appearance id directly from a body pick without a resolve round-trip.
+        key = f"b{i}"
+        override = appearances.get(key)
+        if override:
+            color = tuple(float(c) for c in override)
+        else:
+            color = tuple(bo.color) if bo.color else _DEFAULT_COLOR
         bt = tess.tessellate_body(bo.shape, body_id=i, name=bo.name or f"Body{i}", color=color)
         body_tesses.append(bt)
-        bodies_meta.append({"body_id": i, "name": bo.name or f"Body{i}", "color": list(color)})
+        bodies_meta.append({"body_id": i, "name": bo.name or f"Body{i}", "color": list(color),
+                            "owner_key": key})
 
     aicm = _aicm_path(session.doc_id, session.revision)
     tess.write_aicm_file(aicm, body_tesses)
@@ -256,14 +271,19 @@ def _write_aicm_assembly(session: DocSession) -> tuple[str, list[dict]]:
     body_tesses: list[tess.BodyTess] = []
     bodies_meta: list[dict] = []
     offsets = asm.explode_offsets(session.doc, session.explode_factor) if session.explode_active else {}
+    appearances = session.doc.get("appearances", {}) or {}
     for body in (ares.bodies if ares else []):
         off = offsets.get(body.component_id)
         world = asm.placed_world_shape(body, np.asarray(off) if off is not None else None)
-        color = tuple(body.color)
+        # C26 appearance: assembly bodies are keyed by component id (the stable owner of an
+        # assembly body). A stored color wins over the component's own color.
+        override = appearances.get(body.component_id)
+        color = tuple(float(c) for c in override) if override else tuple(body.color)
         bt = tess.tessellate_body(world, body_id=body.body_id, name=body.name, color=color)
         body_tesses.append(bt)
         bodies_meta.append({"body_id": body.body_id, "name": body.name,
-                            "color": list(color), "component": body.component_id})
+                            "color": list(color), "component": body.component_id,
+                            "owner_key": body.component_id})
     aicm = _aicm_path(session.doc_id, session.revision)
     tess.write_aicm_file(aicm, body_tesses)
     return str(aicm), bodies_meta

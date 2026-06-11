@@ -85,3 +85,22 @@ unit suffixes ("2.50in"), reverse-direction arrow buttons next to direction drop
 - Variable-size fillet PM, chamfer PM, shell/draft PMs, Hole Wizard tabs, pattern PMs,
   appearance editor, scene/lighting editor, RealView toggles, mate PMs (assembly),
   drawing mode anything, Instant3D drag handles.
+
+## Status (C25/C26)
+
+| Catalog item | Status | Notes |
+|---|---|---|
+| **Viewport visuals** | SHIPPED C25 | Background gradient, part appearance, selection highlight, preview, reference planes |
+| **Space / view interaction** | SHIPPED C25 | View Selector glass box with animated camera; heads-up toolbar; display style flyout (5 styles); hotkeys Ctrl+1..8 |
+| **Sketch tool flyouts** | SHIPPED C25 | Rectangle, Circle, Slot, Spline variants; Ellipse group (Partial Ellipse/Parabola/Conic greyed in UI) |
+| **Features ribbon** | SHIPPED C25 | Button groups and organization; PropertyManager chrome (header, commit row, groups, selector wells) |
+| **Extrude end conditions** | SHIPPED C26 | Blind, Mid Plane, Through All, Up To Next; Direction 2; draft taper; reverse buttons in PM forms |
+| **Extrude draft + direction2** | SHIPPED C26 | Draft outward checkbox, direction field per Direction 1/2; engine test test_extrude_ends.py |
+| **Face-normal Normal-To (Ctrl+8)** | SHIPPED C26 | True face-normal camera lock; clickable orientation triad in viewport |
+| **Per-body appearance colors** | SHIPPED C26 | set_appearance op; AICM color encoding; tree icon + viewport tint; PM appearance dropdown; context menu color picker; engine test test_appearance.py |
+| **Fillet type tabs** | OPEN | Variable Size, Face Fillet, Full Round tab row in PM (Constant Size shipped) |
+| **Conic sketch entities** | OPEN | Partial Ellipse, Parabola, Conic in Ellipse flyout (greyed pending constraint/solve work) |
+| **Hole Wizard advanced tabs** | OPEN | Callout, Positions, Thread, Cosmetic (simple/cbore/csink core shipped, advanced deferred) |
+| **Zonal/multi-plane section** | OPEN | Section Method dropdown with Zonal option; up to 3 independent section planes |
+| **RealView-class rendering** | OPEN | Material library, reflections, photorealistic surface finish (qualitative CFD model is baseline) |
+| **Preview thumbnail in view selector** | OPEN | Hover on View Selector glass box face → thumbnail panel (currently shows caption, preview deferred) |

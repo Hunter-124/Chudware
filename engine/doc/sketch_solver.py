@@ -12,6 +12,21 @@ Every sketch entity maps to a flat slice of a float64 variable vector x:
   slot     : [p1x, p1y, p2x, p2y, w]          (5 vars)
   spline   : [x0, y0, x1, y1, ..., xN, yN]    (2*(N+1) vars)
 
+  ellipse_arc : [cx, cy, rx, ry, rot, a0, a1]  (7 vars; ellipse + trim angles, deg)
+  parabola    : [vx, vy, fx, fy, t0, t1]       (6 vars; vertex, focus, param range)
+  conic       : [p0x, p0y, p1x, p1y, apx, apy, rho]  (7 vars; SW conic)
+
+Conic-family parameterizations (C28-A):
+  ellipse_arc — same 5 base vars as ellipse plus a0/a1 trim angles in the
+    UN-rotated ellipse frame (start/end derived like arc but with rx/ry/rot).
+  parabola — own frame: origin = vertex, axis u = unit(focus - vertex) (opening
+    direction), w = perp(u). focal length f = |focus - vertex|. A point at the
+    perpendicular parameter t is P(t) = vertex + (t^2/(4f))*u + t*w. t0/t1 bound
+    the drawn segment; start = P(t0), end = P(t1).
+  conic — SolidWorks rho conic: endpoints p0/p1, tangent-intersection apex, and
+    rho in (0,1). Renders as a rational quadratic Bezier P0,(apex,w),P1 with
+    w = rho/(1-rho). start = p0, end = p1, apex handle = apex.
+
 Derived handles ("e3.start", "e3.end" for arcs, etc.) map to expressions over
 the entity's variables and expose chain-rule Jacobians for residual wiring.
 
@@ -123,6 +138,29 @@ def _allocate_entity(sys: System, entity: dict) -> np.ndarray:
         rot = entity["rot"]    # degrees
         return sys.add_vars(5, [cx, cy, rx, ry, rot])
 
+    elif etype == "ellipse_arc":
+        cx, cy = entity["center"]
+        rx = entity["rx"]
+        ry = entity["ry"]
+        rot = entity.get("rot", 0.0)   # degrees
+        a0 = entity["a0"]              # degrees, un-rotated ellipse frame
+        a1 = entity["a1"]
+        return sys.add_vars(7, [cx, cy, rx, ry, rot, a0, a1])
+
+    elif etype == "parabola":
+        vx, vy = entity["vertex"]
+        fx, fy = entity["focus"]
+        t0 = entity["t0"]
+        t1 = entity["t1"]
+        return sys.add_vars(6, [vx, vy, fx, fy, t0, t1])
+
+    elif etype == "conic":
+        p0x, p0y = entity["p0"]
+        p1x, p1y = entity["p1"]
+        apx, apy = entity["apex"]
+        rho = entity.get("rho", 0.5)
+        return sys.add_vars(7, [p0x, p0y, p1x, p1y, apx, apy, rho])
+
     elif etype == "slot":
         p1x, p1y = entity["p1"]
         p2x, p2y = entity["p2"]
@@ -155,6 +193,75 @@ def _allocate_entity(sys: System, entity: dict) -> np.ndarray:
 # For handles that ARE direct variables (e.g. e1.p1 on a line), the value and
 # Jacobian are trivially identity slices.
 # ---------------------------------------------------------------------------
+
+# --- Conic-family derived-point helpers (C28-A) ----------------------------
+#
+# Each takes the entity's relevant variable sub-slice (see _resolve_handle) and
+# returns the world (x, y) of a handle plus its analytic Jacobian. Kept honest
+# so coincident/fix on these handles flow correct partials into DOF accounting.
+
+
+def _ellipse_arc_pt_val(xs):
+    # xs = [cx, cy, rx, ry, rot, a]   (rot, a in degrees)
+    cx, cy, rx, ry, rot, a = xs
+    rr = rot * _DEG
+    ar = a * _DEG
+    lx = rx * math.cos(ar)
+    ly = ry * math.sin(ar)
+    cr, sr = math.cos(rr), math.sin(rr)
+    return np.array([cx + cr * lx - sr * ly, cy + sr * lx + cr * ly])
+
+
+def _ellipse_arc_pt_jac(xs):
+    cx, cy, rx, ry, rot, a = xs
+    rr = rot * _DEG
+    ar = a * _DEG
+    ca, sa = math.cos(ar), math.sin(ar)
+    cr, sr = math.cos(rr), math.sin(rr)
+    lx = rx * ca
+    ly = ry * sa
+    # d(local)/d[rx,ry,a]
+    dlx_drx, dly_dry = ca, sa
+    dlx_da = -rx * sa * _DEG
+    dly_da = ry * ca * _DEG
+    # world = c + R(rr) @ local; R = [[cr,-sr],[sr,cr]]
+    # d/d[cx,cy]=I; d/drot = R'(rr)@local where R'=[[-sr,-cr],[cr,-sr]]*_DEG
+    dwx_drot = (-sr * lx - cr * ly) * _DEG
+    dwy_drot = (cr * lx - sr * ly) * _DEG
+    # cols: cx, cy, rx, ry, rot, a
+    return np.array([
+        [1.0, 0.0, cr * dlx_drx, -sr * dly_dry, dwx_drot, cr * dlx_da - sr * dly_da],
+        [0.0, 1.0, sr * dlx_drx,  cr * dly_dry, dwy_drot, sr * dlx_da + cr * dly_da],
+    ])
+
+
+def _parabola_pt_val(xs):
+    # xs = [vx, vy, fx, fy, t]
+    # P(t) = vertex + (t^2/(4f)) * u + t * w, u = unit(focus-vertex), w = perp(u)
+    vx, vy, fx, fy, t = xs
+    dx, dy = fx - vx, fy - vy
+    f = math.hypot(dx, dy)
+    if f < 1e-12:
+        return np.array([vx, vy])
+    ux, uy = dx / f, dy / f
+    wx, wy = -uy, ux
+    s = (t * t) / (4.0 * f)
+    return np.array([vx + s * ux + t * wx, vy + s * uy + t * wy])
+
+
+def _parabola_pt_jac(xs):
+    # Numeric Jacobian (central differences) — robust and compact for the
+    # parabola's nonlinear vertex/focus coupling. cols: vx,vy,fx,fy,t
+    xs = np.asarray(xs, dtype=float)
+    n = len(xs)
+    J = np.zeros((2, n))
+    for i in range(n):
+        h = 1e-6 * max(1.0, abs(xs[i]))
+        xp = xs.copy(); xp[i] += h
+        xm = xs.copy(); xm[i] -= h
+        J[:, i] = (_parabola_pt_val(xp) - _parabola_pt_val(xm)) / (2.0 * h)
+    return J
+
 
 def _resolve_handle(
     handle: str,
@@ -262,6 +369,56 @@ def _resolve_handle(
                     lambda xs: np.eye(2))
         else:
             raise ValueError(f"Unknown sub-handle {sub!r} for ellipse {eid}")
+
+    elif etype == "ellipse_arc":
+        # variables: [cx, cy, rx, ry, rot, a0, a1]
+        if sub in (None, "center"):
+            idx = vidx[[0, 1]]
+            return (idx,
+                    lambda xs: np.array([xs[0], xs[1]]),
+                    lambda xs: np.eye(2))
+        elif sub in ("start", "end"):
+            # endpoint of a rotated ellipse at trim angle a (deg, un-rotated frame):
+            #   local = (rx*cos a, ry*sin a); world = center + R(rot) @ local
+            ai = 5 if sub == "start" else 6
+            idx = vidx[[0, 1, 2, 3, 4, ai]]   # cx,cy,rx,ry,rot,a
+            return (idx, _ellipse_arc_pt_val, _ellipse_arc_pt_jac)
+        else:
+            raise ValueError(f"Unknown sub-handle {sub!r} for ellipse_arc {eid}")
+
+    elif etype == "parabola":
+        # variables: [vx, vy, fx, fy, t0, t1]
+        if sub in (None, "vertex"):
+            idx = vidx[[0, 1]]
+            return (idx,
+                    lambda xs: np.array([xs[0], xs[1]]),
+                    lambda xs: np.eye(2))
+        elif sub in ("start", "end"):
+            ti = 4 if sub == "start" else 5
+            idx = vidx[[0, 1, 2, 3, ti]]   # vx,vy,fx,fy,t
+            return (idx, _parabola_pt_val, _parabola_pt_jac)
+        else:
+            raise ValueError(f"Unknown sub-handle {sub!r} for parabola {eid}")
+
+    elif etype == "conic":
+        # variables: [p0x, p0y, p1x, p1y, apx, apy, rho]
+        if sub in (None, "start", "p0"):
+            idx = vidx[[0, 1]]
+            return (idx,
+                    lambda xs: np.array([xs[0], xs[1]]),
+                    lambda xs: np.eye(2))
+        elif sub in ("end", "p1"):
+            idx = vidx[[2, 3]]
+            return (idx,
+                    lambda xs: np.array([xs[0], xs[1]]),
+                    lambda xs: np.eye(2))
+        elif sub == "apex":
+            idx = vidx[[4, 5]]
+            return (idx,
+                    lambda xs: np.array([xs[0], xs[1]]),
+                    lambda xs: np.eye(2))
+        else:
+            raise ValueError(f"Unknown sub-handle {sub!r} for conic {eid}")
 
     elif etype == "slot":
         # variables: [p1x, p1y, p2x, p2y, w]
@@ -1040,6 +1197,45 @@ def _add_fix(sys, cid, handle, entities, var_map):
                 lambda xs, _tx=px, _ty=py: np.array([xs[0] - _tx, xs[1] - _ty]),
                 idx, lambda xs: np.eye(2), cid)
 
+    elif etype in ("ellipse_arc", "parabola", "conic"):
+        # Generic fix on any resolvable handle (center/start/end/apex/vertex):
+        # pin the derived point to its current world position via _resolve_handle.
+        vidx, vf, jf = _resolve_handle(handle, entities, var_map)
+        # Seed init slice from the entity's current variable values so the target
+        # is the *current* world coords of that handle (matches arc.start above).
+        cur = _entity_init_slice(ent)
+        # Map the handle's vidx (global indices) back to local positions within
+        # the entity block to read the seed values.
+        base = var_map[eid][0]
+        local = [int(i - base) for i in vidx]
+        seed = np.array([cur[i] for i in local], dtype=float)
+        tx, ty = vf(seed)
+        sys.add_residual(
+            lambda xs, _tx=tx, _ty=ty, _vf=vf: _vf(xs) - np.array([_tx, _ty]),
+            vidx, lambda xs, _jf=jf: _jf(xs), cid)
+
+
+def _entity_init_slice(ent: dict) -> list:
+    """Return the initial variable values for an entity in allocation order.
+
+    Used by _add_fix for conic-family handles so the pinned target equals the
+    handle's current world position. Mirrors _allocate_entity's layout.
+    """
+    et = ent["type"]
+    if et == "ellipse_arc":
+        cx, cy = ent["center"]
+        return [cx, cy, ent["rx"], ent["ry"], ent.get("rot", 0.0), ent["a0"], ent["a1"]]
+    if et == "parabola":
+        vx, vy = ent["vertex"]
+        fx, fy = ent["focus"]
+        return [vx, vy, fx, fy, ent["t0"], ent["t1"]]
+    if et == "conic":
+        p0x, p0y = ent["p0"]
+        p1x, p1y = ent["p1"]
+        apx, apy = ent["apex"]
+        return [p0x, p0y, p1x, p1y, apx, apy, ent.get("rho", 0.5)]
+    return []
+
 
 def _add_point_on(sys, cid, point_handle, entity_handle, entities, var_map):
     """Point lies on entity (line, circle, or arc)."""
@@ -1331,6 +1527,35 @@ def _extract_entities(x: np.ndarray, entities_list: list, var_map: dict) -> Enti
                 "rx": float(vals[2]),
                 "ry": float(vals[3]),
                 "rot": float(vals[4]),
+            }
+
+        elif etype == "ellipse_arc":
+            result[eid] = {
+                "type": "ellipse_arc",
+                "center": [float(vals[0]), float(vals[1])],
+                "rx": float(vals[2]),
+                "ry": float(vals[3]),
+                "rot": float(vals[4]),
+                "a0": float(vals[5]),
+                "a1": float(vals[6]),
+            }
+
+        elif etype == "parabola":
+            result[eid] = {
+                "type": "parabola",
+                "vertex": [float(vals[0]), float(vals[1])],
+                "focus": [float(vals[2]), float(vals[3])],
+                "t0": float(vals[4]),
+                "t1": float(vals[5]),
+            }
+
+        elif etype == "conic":
+            result[eid] = {
+                "type": "conic",
+                "p0": [float(vals[0]), float(vals[1])],
+                "p1": [float(vals[2]), float(vals[3])],
+                "apex": [float(vals[4]), float(vals[5])],
+                "rho": float(vals[6]),
             }
 
         elif etype == "slot":

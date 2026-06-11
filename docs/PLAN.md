@@ -265,6 +265,28 @@ test_extrude_ends.py (all end condition paths), test_appearance.py (color round-
 **Verify:** PM form fields for Direction 2 depth + draft; Normal-To camera locks to picked face
 normal; appearance color survives save/open; context menu Appearance → [Pick Color] updates tree icon.
 
+### C27 — In-viewport dimension callouts + view refinement (1–1.5 wks)
+In-viewport PM dimension callouts with leader lines attached to geometry; view-selector hover preview
+thumbnail; asymmetric chamfer support (Symmetric|Asymmetric dropdown in Chamfer PM, engine length2); Convert
+Fillet↔Chamfer via context menu. Engine fix: compiler owner-map cache coherency on feature edit.
+**Verify:** dimension callouts render during Fillet edit; hover on View Selector glass box shows
+thumbnail in top-right panel; asymmetric chamfer PM form + engine test; Convert context menu updates
+feature type.
+
+### C28 — Sketcher conics + tool variants + multi-plane section (1.5–2 wks)
+Conic sketch entities: Ellipse Arc / Parabola / Conic Solver enabled in Ellipse group flyout (entity
+creation + constraint/solve in `sketch_solver.py`, build123d region construction for conics via
+`test_sketch_conics.py`). Sketch input variants un-greyed: 3-point corner/center rectangle,
+parallelogram, perimeter circle, centerpoint straight slot, arc slot variants (entity-permit dependent;
+PM selector auto-populates per tool choice). Section view extended to multi-plane: Section Method
+dropdown (Planar | Zonal); up to 3 independent section planes with per-plane offsets, rotation angles,
+caps toggle (AI_CAD_SECTION=2/3 debug knobs for plane count testing); zonal half-space intersection
+logic + per-plane cap shader. Engine tests: test_sketch_conics.py (ellipse_arc, parabola, solver
+entities), section evaluation on ≥2 planes.
+**Verify:** Ellipse group flyout has arc/parabola/conic buttons un-greyed; sketch input tools enable
+3pt variants + perimeter + slot variants on draw; Section Method dropdown available + up to 3 planes
+configurable in UI; multi-plane caps render correctly with occlusion.
+
 ## 6. Feature tiers (the scope contract — anything not V1/S is a no without re-planning)
 
 - **Features tab V1**: extrude boss/cut, revolve, sweep, loft, fillet, chamfer, shell, draft,

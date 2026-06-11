@@ -26,7 +26,13 @@ namespace ui {
 
 // The active drawing tool. None = selection/drag mode.
 enum class SketchTool {
-    None, Line, RectCorner, Circle, ArcCenter, Slot, SmartDim
+    None, Line, RectCorner, Circle, ArcCenter, Slot, SmartDim,
+    // C28-B flyout variants (map clicks to existing entity types unless noted):
+    Rect3ptCorner, Rect3ptCenter, Parallelogram,   // -> 4 lines
+    CirclePerimeter,                                // -> 1 circle (circumcircle of 3 pts)
+    SlotCtrStr,                                     // -> 1 slot (centerpoint input)
+    // Conic family (engine contract C28-A: ellipse_arc / parabola / conic entities):
+    EllipsePartial, Parabola, Conic
 };
 
 // One solved entity in the active sketch (mirrors a worker sketch_enter/solve entity record).
@@ -118,6 +124,12 @@ private:
     SketchTool tool_ = SketchTool::None;
     std::vector<ImVec2> toolUV_;     // in-progress click points in (u,v)
     std::vector<std::string> toolSnaps_;  // snapped-onto handle per click (for coincident)
+    float conicRho_ = 0.5f;          // Conic tool: live shoulder weight 0..1 during the rho pick
+
+    // Emit the 4 lines of a quad (corners A,B,C,D in order) as one chained loop with the given
+    // relation kinds (mirrors the corner-rect op pattern; relations[i] applies to edge i->i+1,
+    // "" = none). Used by the 3pt/center/parallelogram rectangle variants.
+    void addQuadLoop(AppState& st, const ImVec2 corners[4], const char* relations[4]);
 
     // drag state
     std::string dragHandle_;

@@ -177,15 +177,19 @@ static const RibbonCmd kCmds[] = {
 
     // --- Rectangle flyout (parent: sk_rect_corner) ---
     // sk_rect_center already existed as sub_of sk_rect_corner (see row above)
-    { "sk_rect_3pt_corner",  "3Pt Cor. Rect",  "rect_3pt_corner",  "Sketch", "Draw", false, "sk_rect_corner", true  },
-    { "sk_rect_3pt_center",  "3Pt Ctr. Rect",  "rect_3pt_center",  "Sketch", "Draw", false, "sk_rect_corner", true  },
-    { "sk_parallelogram",    "Parallelogram",   "parallelogram",    "Sketch", "Draw", false, "sk_rect_corner", true  },
+    // C28-B: 3pt/center rect + parallelogram implemented (map to 4 lines w/ relations) — enabled.
+    { "sk_rect_3pt_corner",  "3Pt Cor. Rect",  "rect_3pt_corner",  "Sketch", "Draw", false, "sk_rect_corner", false },
+    { "sk_rect_3pt_center",  "3Pt Ctr. Rect",  "rect_3pt_center",  "Sketch", "Draw", false, "sk_rect_corner", false },
+    { "sk_parallelogram",    "Parallelogram",   "parallelogram",    "Sketch", "Draw", false, "sk_rect_corner", false },
 
     // --- Circle flyout (parent: sk_circle) ---
-    { "sk_circle_perimeter", "Perim. Circle",   "circle_perimeter", "Sketch", "Draw", false, "sk_circle",      true  },
+    // C28-B: perimeter circle (circumcircle of 3 picks) implemented — enabled.
+    { "sk_circle_perimeter", "Perim. Circle",   "circle_perimeter", "Sketch", "Draw", false, "sk_circle",      false },
 
     // --- Slot flyout (parent: sk_slot) ---
-    { "sk_slot_ctr_str",     "Ctr. Str. Slot",  "slot_ctr_str",     "Sketch", "Draw", false, "sk_slot",        true  },
+    // C28-B: centerpoint straight slot implemented — enabled. Arc slots stay greyed: the slot
+    // entity schema is straight-only (p1,p2,width — no arc spine field), so they cannot be faked.
+    { "sk_slot_ctr_str",     "Ctr. Str. Slot",  "slot_ctr_str",     "Sketch", "Draw", false, "sk_slot",        false },
     { "sk_slot_arc_3pt",     "3Pt Arc Slot",    "slot_arc_3pt",     "Sketch", "Draw", false, "sk_slot",        true  },
     { "sk_slot_arc_ctr",     "Ctr. Arc Slot",   "slot_arc_ctr",     "Sketch", "Draw", false, "sk_slot",        true  },
 
@@ -199,9 +203,11 @@ static const RibbonCmd kCmds[] = {
     // its default face shows the Ellipse icon+label (instead of the greyed generic look) and a plain
     // click opens the flyout. Sub-variants stay greyed (stretch=true, no engine support yet).
     { "sk_ellipse_big",      "Ellipse",         "ellipse",          "Sketch", "Draw", false, nullptr,          false },
-    { "sk_ellipse_partial",  "Partial Ellipse", "ellipse_partial",  "Sketch", "Draw", false, "sk_ellipse_big", true  },
-    { "sk_parabola",         "Parabola",        "parabola",         "Sketch", "Draw", false, "sk_ellipse_big", true  },
-    { "sk_conic",            "Conic",           "conic",            "Sketch", "Draw", false, "sk_ellipse_big", true  },
+    // C28-B: conic family wired to the C28-A engine contract (ellipse_arc/parabola/conic entities) —
+    // enabled. (Worker errors at add-time are acceptable until the engine side merges.)
+    { "sk_ellipse_partial",  "Partial Ellipse", "ellipse_partial",  "Sketch", "Draw", false, "sk_ellipse_big", false },
+    { "sk_parabola",         "Parabola",        "parabola",         "Sketch", "Draw", false, "sk_ellipse_big", false },
+    { "sk_conic",            "Conic",           "conic",            "Sketch", "Draw", false, "sk_ellipse_big", false },
 
 };
 // clang-format on

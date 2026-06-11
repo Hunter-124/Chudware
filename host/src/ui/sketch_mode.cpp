@@ -43,6 +43,18 @@ ImU32 col(const float role[4], float a = 1.0f) {
     return ui::Palette::toU32(c);
 }
 
+// Circumcircle of three (u,v) points. Returns false when (near-)collinear.
+bool circumcircle(const ImVec2& a, const ImVec2& b, const ImVec2& c,
+                  float& cu, float& cv, float& r) {
+    float d = 2.0f * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
+    if (std::fabs(d) < 1e-6f) return false;
+    float a2 = a.x * a.x + a.y * a.y, b2 = b.x * b.x + b.y * b.y, c2 = c.x * c.x + c.y * c.y;
+    cu = (a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d;
+    cv = (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d;
+    r = std::hypot(a.x - cu, a.y - cv);
+    return true;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -188,6 +200,64 @@ void SketchMode::addConstraint(AppState& st, const nlohmann::json& constraint) {
     resolve(st);
 }
 
+// Emit 4 lines as a closed loop (corners A,B,C,D). Each edge i (corners[i]->corners[(i+1)%4]) gets
+// a chained coincident to the previous edge's p2, plus the per-edge relation in relations[i] (one
+// of "horizontal"/"vertical"/"parallel"/"perpendicular"/"equal"/"", referencing $self, or for the
+// two-ref relations referencing the opposite edge's id via the {prefix}). Mirrors the corner-rect
+// op pattern (successive applyOps so coincidents reference real ids).
+void SketchMode::addQuadLoop(AppState& st, const ImVec2 corners[4], const char* relations[4]) {
+    std::string ids[4];
+    std::string prevId, firstId;
+    for (int i = 0; i < 4; ++i) {
+        int j = (i + 1) % 4;
+        nlohmann::json cs = nlohmann::json::array();
+        const char* rel = relations[i];
+        // Single-ref auto relations (h/v) reference $self; pair relations (parallel/equal/perp) are
+        // applied in a second pass below once all four ids exist.
+        if (rel && (std::strcmp(rel, "horizontal") == 0 || std::strcmp(rel, "vertical") == 0))
+            cs.push_back({{"type", rel}, {"refs", {"$self"}}});
+        if (!prevId.empty())
+            cs.push_back({{"type", "coincident"}, {"refs", {prevId + ".p2", "$self.p1"}}});
+        nlohmann::json ent = {{"type", "line"},
+            {"p1", nlohmann::json::array({corners[i].x, corners[i].y})},
+            {"p2", nlohmann::json::array({corners[j].x, corners[j].y})}};
+        nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_},
+                             {"entity", ent}, {"constraints", cs}};
+        auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+        if (!r.ok) { st.addLog("[sketch] quad line failed: " + r.error_message); break; }
+        std::string nid = (r.id_map.is_object() && r.id_map.contains("$0"))
+                        ? r.id_map["$0"].get<std::string>() : std::string();
+        ids[i] = nid;
+        if (i == 0) firstId = nid;
+        prevId = nid;
+        if (i == 3 && !firstId.empty() && !nid.empty()) {
+            nlohmann::json clop = {{"op", "sketch_add_constraint"}, {"sketch", fid_},
+                {"constraint", {{"type", "coincident"}, {"refs", {nid + ".p2", firstId + ".p1"}}}}};
+            st.docMirror.applyOps(st.worker, nlohmann::json::array({clop}));
+        }
+        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    }
+    // Second pass: pair relations on the two OPPOSITE-edge pairs (0<->2, 1<->3). The relation token
+    // may combine "parallel"/"equal"/"perpendicular" (space-separated); we apply each once per pair
+    // (only for i<2 so the 0/2 and 1/3 pairs aren't double-emitted). "perpendicular" relates the
+    // pair's first edge to the adjacent edge i+1.
+    auto pair = [&](const char* type, const std::string& a, const std::string& b) {
+        if (a.empty() || b.empty()) return;
+        nlohmann::json op = {{"op", "sketch_add_constraint"}, {"sketch", fid_},
+            {"constraint", {{"type", type}, {"refs", {a, b}}}}};
+        st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    };
+    for (int i = 0; i < 2; ++i) {
+        const char* rel = relations[i];
+        if (!rel) continue;
+        std::string tok(rel);
+        if (tok.find("parallel") != std::string::npos) pair("parallel", ids[i], ids[i + 2]);
+        if (tok.find("equal") != std::string::npos)    pair("equal",    ids[i], ids[i + 2]);
+        if (tok.find("perpendicular") != std::string::npos) pair("perpendicular", ids[i], ids[i + 1]);
+    }
+    resolve(st);
+}
+
 // ---------------------------------------------------------------------------
 // enter / exit
 // ---------------------------------------------------------------------------
@@ -291,6 +361,17 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sk_arc_center")  { resetTool(); tool_ = SketchTool::ArcCenter;  return true; }
     if (cmdId == "sk_slot")        { resetTool(); tool_ = SketchTool::Slot;       return true; }
     if (cmdId == "smart_dim")      { resetTool(); tool_ = SketchTool::SmartDim;   return true; }
+    // C28-B flyout variants:
+    if (cmdId == "sk_rect_3pt_corner") { resetTool(); tool_ = SketchTool::Rect3ptCorner;  return true; }
+    if (cmdId == "sk_rect_3pt_center") { resetTool(); tool_ = SketchTool::Rect3ptCenter;  return true; }
+    if (cmdId == "sk_parallelogram")   { resetTool(); tool_ = SketchTool::Parallelogram;  return true; }
+    if (cmdId == "sk_circle_perimeter"){ resetTool(); tool_ = SketchTool::CirclePerimeter;return true; }
+    if (cmdId == "sk_slot_ctr_str")    { resetTool(); tool_ = SketchTool::SlotCtrStr;     return true; }
+    if (cmdId == "sk_ellipse_partial") { resetTool(); tool_ = SketchTool::EllipsePartial; return true; }
+    if (cmdId == "sk_parabola")        { resetTool(); tool_ = SketchTool::Parabola;       return true; }
+    if (cmdId == "sk_conic")           { resetTool(); tool_ = SketchTool::Conic;          return true; }
+    // sk_slot_arc_3pt / sk_slot_arc_ctr intentionally NOT handled: the slot entity schema is
+    // straight-only (p1,p2,width — no arc spine), so they stay greyed (see ribbon_def.cpp).
     return false;
 }
 
@@ -299,6 +380,7 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
 // ---------------------------------------------------------------------------
 
 void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSnaps_.clear();
+                               conicRho_ = 0.5f;
                                dimPopupOpen_ = false; dimPending_ = nullptr; }
 void SketchMode::cancelTool() { resetTool(); }
 
@@ -511,6 +593,174 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 dl->AddCircle(a, rpx, prevCol, 48, 1.2f);
             }
         }
+
+        // C28-B variant previews (drawn in the sketch under-defined color, matching the placed
+        // entities while still in-tool). Each branch builds the live geometry from the prior clicks
+        // in toolUV_ + the snapped cursor (su,sv).
+        {
+            const ImU32 uCol = col(pal.sketchUnder, 0.95f);
+            auto pl = [&](const std::vector<ImVec2>& uv) {  // draw a (u,v) polyline
+                for (size_t i = 1; i < uv.size(); ++i)
+                    dl->AddLine(uvToScreen(uv[i - 1].x, uv[i - 1].y),
+                                uvToScreen(uv[i].x, uv[i].y), uCol, 1.6f);
+            };
+            const size_t n = toolUV_.size();
+            if (tool_ == SketchTool::Rect3ptCorner && n >= 1) {
+                ImVec2 A = toolUV_[0];
+                ImVec2 B = (n >= 2) ? toolUV_[1] : ImVec2(su, sv);
+                if (n < 2) { dl->AddLine(uvToScreen(A.x, A.y), sCur, uCol, 1.6f); }
+                else {
+                    // edge A-B fixed; third click sets width (perp offset of cursor from A-B).
+                    float ex = B.x - A.x, ey = B.y - A.y; float L = std::hypot(ex, ey);
+                    float nx = L > 1e-6f ? -ey / L : 0, ny = L > 1e-6f ? ex / L : 0;
+                    float w = (su - A.x) * nx + (sv - A.y) * ny;
+                    ImVec2 D(A.x + nx * w, A.y + ny * w), C(B.x + nx * w, B.y + ny * w);
+                    pl({A, B, C, D, A});
+                }
+            } else if (tool_ == SketchTool::Rect3ptCenter && n >= 1) {
+                ImVec2 ctr = toolUV_[0];
+                ImVec2 mid = (n >= 2) ? toolUV_[1] : ImVec2(su, sv);
+                if (n < 2) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, 1.6f); }
+                else {
+                    // ctr->mid is a half-edge direction (half-height); cursor sets half-width.
+                    float hx = mid.x - ctr.x, hy = mid.y - ctr.y; float L = std::hypot(hx, hy);
+                    float px = L > 1e-6f ? -hy / L : 0, py = L > 1e-6f ? hx / L : 0;
+                    float hw = (su - ctr.x) * px + (sv - ctr.y) * py;
+                    ImVec2 wv(px * hw, py * hw);
+                    ImVec2 P0(ctr.x + hx + wv.x, ctr.y + hy + wv.y);
+                    ImVec2 P1(ctr.x + hx - wv.x, ctr.y + hy - wv.y);
+                    ImVec2 P2(ctr.x - hx - wv.x, ctr.y - hy - wv.y);
+                    ImVec2 P3(ctr.x - hx + wv.x, ctr.y - hy + wv.y);
+                    pl({P0, P1, P2, P3, P0});
+                }
+            } else if (tool_ == SketchTool::Parallelogram && n >= 1) {
+                ImVec2 A = toolUV_[0];
+                ImVec2 B = (n >= 2) ? toolUV_[1] : ImVec2(su, sv);
+                if (n < 2) { dl->AddLine(uvToScreen(A.x, A.y), sCur, uCol, 1.6f); }
+                else {
+                    ImVec2 C(su, sv);                 // third corner sets the shear
+                    ImVec2 D(A.x + (C.x - B.x), A.y + (C.y - B.y));
+                    pl({A, B, C, D, A});
+                }
+            } else if (tool_ == SketchTool::CirclePerimeter) {
+                std::vector<ImVec2> pts;
+                for (size_t i = 0; i < n && i < 3; ++i) pts.push_back(toolUV_[i]);
+                if (pts.size() < 3) pts.push_back(ImVec2(su, sv));
+                for (auto& q : pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), 3.0f, uCol);
+                if (pts.size() == 3) {
+                    float cu, cv, rad;
+                    if (circumcircle(pts[0], pts[1], pts[2], cu, cv, rad)) {
+                        ImVec2 prev;
+                        for (int i = 0; i <= 48; ++i) {
+                            float a = i / 48.0f * 6.2831853f;
+                            ImVec2 q = uvToScreen(cu + rad * std::cos(a), cv + rad * std::sin(a));
+                            if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                        }
+                    }
+                }
+            } else if (tool_ == SketchTool::SlotCtrStr && n >= 1) {
+                ImVec2 ctr = toolUV_[0];
+                ImVec2 end = (n >= 2) ? toolUV_[1] : ImVec2(su, sv);
+                if (n < 2) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, 1.6f); }
+                else {
+                    // centerpoint slot: spine endpoints are ctr +/- (end-ctr); cursor sets width.
+                    ImVec2 e1(ctr.x + (end.x - ctr.x), ctr.y + (end.y - ctr.y));
+                    ImVec2 e2(ctr.x - (end.x - ctr.x), ctr.y - (end.y - ctr.y));
+                    float dx = e1.x - e2.x, dy = e1.y - e2.y; float L = std::hypot(dx, dy);
+                    float hw = L > 1e-6f ? std::fabs((su - e2.x) * (-dy) + (sv - e2.y) * dx) / L : 5.0f;
+                    ImVec2 a = uvToScreen(e1.x, e1.y), b = uvToScreen(e2.x, e2.y);
+                    dl->AddLine(a, b, uCol, 1.6f);
+                    ImVec2 wEnd = uvToScreen(e1.x + hw, e1.y);
+                    float rpx = std::hypot(wEnd.x - a.x, wEnd.y - a.y);
+                    dl->AddCircle(a, rpx, uCol, 24, 1.6f);
+                    dl->AddCircle(b, rpx, uCol, 24, 1.6f);
+                }
+            } else if (tool_ == SketchTool::EllipsePartial && n >= 1) {
+                ImVec2 ctr = toolUV_[0];
+                ImVec2 rxp = (n >= 2) ? toolUV_[1] : ImVec2(su, sv);
+                float rot = std::atan2(rxp.y - ctr.y, rxp.x - ctr.x);
+                float rx = std::hypot(rxp.x - ctr.x, rxp.y - ctr.y);
+                float ca = std::cos(rot), sa = std::sin(rot);
+                if (n < 2) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, 1.6f); }
+                else {
+                    // ry from the third pick's perpendicular distance; live cursor while n==2.
+                    ImVec2 ryp = (n >= 3) ? toolUV_[2] : ImVec2(su, sv);
+                    float ry = std::fabs(-(ryp.x - ctr.x) * sa + (ryp.y - ctr.y) * ca);
+                    if (ry < 1e-4f) ry = rx * 0.5f;
+                    // angle sweep: a0 from the 4th pick, a1 from the 5th/live pick.
+                    auto angOf = [&](ImVec2 q) {
+                        float lx = (q.x - ctr.x) * ca + (q.y - ctr.y) * sa;
+                        float ly = -(q.x - ctr.x) * sa + (q.y - ctr.y) * ca;
+                        return std::atan2(ly / std::fmax(ry, 1e-6f), lx / std::fmax(rx, 1e-6f));
+                    };
+                    float a0 = (n >= 4) ? angOf(toolUV_[3]) : 0.0f;
+                    float a1 = (n >= 4) ? angOf(ImVec2(su, sv)) : 6.2831853f;
+                    if (a1 < a0) a1 += 6.2831853f;
+                    ImVec2 prev;
+                    for (int i = 0; i <= 64; ++i) {
+                        float t = a0 + (a1 - a0) * (i / 64.0f);
+                        float lx = rx * std::cos(t), ly = ry * std::sin(t);
+                        ImVec2 q = uvToScreen(ctr.x + lx * ca - ly * sa, ctr.y + lx * sa + ly * ca);
+                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                    }
+                }
+            } else if (tool_ == SketchTool::Parabola && n >= 1) {
+                ImVec2 focus = toolUV_[0];
+                ImVec2 vertex = (n >= 2) ? toolUV_[1] : ImVec2(su, sv);
+                dl->AddCircleFilled(uvToScreen(focus.x, focus.y), 3.0f, uCol);
+                if (n < 2) { dl->AddLine(uvToScreen(focus.x, focus.y), sCur, uCol, 1.6f); }
+                else {
+                    // axis = vertex->focus; f = |vertex-focus|. Sample y = x^2/(4f) in axis frame
+                    // over the [start..end] parametric range set by the 3rd/4th (or live) picks.
+                    float ax = focus.x - vertex.x, ay = focus.y - vertex.y;
+                    float f = std::hypot(ax, ay); if (f < 1e-4f) f = 1.0f;
+                    float ux = ax / f, uy = ay / f;     // axis dir
+                    float px = -uy, py = ux;            // perp (opening) dir
+                    auto tOf = [&](ImVec2 q) { return (q.x - vertex.x) * px + (q.y - vertex.y) * py; };
+                    float t0 = (n >= 3) ? tOf(toolUV_[2]) : -2.0f * f;
+                    float t1 = (n >= 3) ? tOf(ImVec2(su, sv)) : 2.0f * f;
+                    ImVec2 prev;
+                    for (int i = 0; i <= 48; ++i) {
+                        float t = t0 + (t1 - t0) * (i / 48.0f);
+                        float d = t * t / (4.0f * f);    // distance along axis from vertex
+                        ImVec2 q = uvToScreen(vertex.x + ux * d + px * t, vertex.y + uy * d + py * t);
+                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                    }
+                }
+            } else if (tool_ == SketchTool::Conic && n >= 1) {
+                ImVec2 P0 = toolUV_[0];
+                ImVec2 P1 = (n >= 2) ? toolUV_[1] : ImVec2(su, sv);
+                dl->AddCircleFilled(uvToScreen(P0.x, P0.y), 3.0f, uCol);
+                if (n < 2) { dl->AddLine(uvToScreen(P0.x, P0.y), sCur, uCol, 1.6f); }
+                else {
+                    ImVec2 apex = (n >= 3) ? toolUV_[2] : ImVec2(su, sv);
+                    // rho: 0..1 weight of the apex (shoulder). Live-pick while n==3 (cursor sets it),
+                    // committed in conicRho_ once the apex is placed.
+                    float rho = conicRho_;
+                    if (n == 3) {  // live rho preview: project cursor onto the mid->apex segment
+                        ImVec2 mid((P0.x + P1.x) * 0.5f, (P0.y + P1.y) * 0.5f);
+                        float dx = apex.x - mid.x, dy = apex.y - mid.y; float L2 = dx * dx + dy * dy;
+                        rho = L2 > 1e-9f ? ((su - mid.x) * dx + (sv - mid.y) * dy) / L2 : 0.5f;
+                        rho = std::fmax(0.01f, std::fmin(0.99f, rho));
+                    }
+                    // Rational Bezier conic: B(t)=((1-t)^2 P0 + 2(1-t)t w Apex + t^2 P1)/den,
+                    // den=(1-t)^2 + 2(1-t)t w + t^2, with w = rho/(1-rho).
+                    float w = rho / std::fmax(1e-3f, 1.0f - rho);
+                    ImVec2 prev;
+                    for (int i = 0; i <= 48; ++i) {
+                        float t = i / 48.0f, mt = 1.0f - t;
+                        float b0 = mt * mt, b1 = 2.0f * mt * t * w, b2 = t * t;
+                        float den = b0 + b1 + b2;
+                        float qx = (b0 * P0.x + b1 * apex.x + b2 * P1.x) / den;
+                        float qy = (b0 * P0.y + b1 * apex.y + b2 * P1.y) / den;
+                        ImVec2 q = uvToScreen(qx, qy);
+                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                    }
+                    dl->AddCircle(uvToScreen(apex.x, apex.y), 4.0f, uCol, 12, 1.2f);
+                }
+            }
+        }
+
         // Cursor marker + inference glyph.
         dl->AddCircle(sCur, 4.0f, prevCol, 12, 1.5f);
         if (!snapH.empty()) {  // coincident inference glyph (small square)
@@ -610,6 +860,127 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     {"p2", nlohmann::json::array({p2.x, p2.y})}, {"width", w * 2.0f}};
                 addEntity(st, ent, nlohmann::json::array());
                 resetTool();
+
+            // ---- C28-B variants ----
+            } else if (tool_ == SketchTool::Rect3ptCorner && toolUV_.size() == 3) {
+                // A, B (one edge + angle), C (width by perp offset). Rotated rect: opposite sides
+                // parallel+equal, adjacent perpendicular.
+                ImVec2 A = toolUV_[0], B = toolUV_[1], C3 = toolUV_[2];
+                float ex = B.x - A.x, ey = B.y - A.y; float L = std::hypot(ex, ey);
+                float nx = L > 1e-6f ? -ey / L : 0, ny = L > 1e-6f ? ex / L : 0;
+                float w = (C3.x - A.x) * nx + (C3.y - A.y) * ny;
+                ImVec2 D(A.x + nx * w, A.y + ny * w), C(B.x + nx * w, B.y + ny * w);
+                ImVec2 quad[4] = {A, B, C, D};
+                const char* rel[4] = {"parallel perpendicular", "parallel", nullptr, nullptr};
+                addQuadLoop(st, quad, rel);
+                resetTool();
+            } else if (tool_ == SketchTool::Rect3ptCenter && toolUV_.size() == 3) {
+                // center, edge-midpoint dir (half-height), half-width pick.
+                ImVec2 ctr = toolUV_[0], mid = toolUV_[1], wpk = toolUV_[2];
+                float hx = mid.x - ctr.x, hy = mid.y - ctr.y; float L = std::hypot(hx, hy);
+                float px = L > 1e-6f ? -hy / L : 0, py = L > 1e-6f ? hx / L : 0;
+                float hw = (wpk.x - ctr.x) * px + (wpk.y - ctr.y) * py;
+                ImVec2 wv(px * hw, py * hw);
+                ImVec2 P0(ctr.x + hx + wv.x, ctr.y + hy + wv.y);
+                ImVec2 P1(ctr.x + hx - wv.x, ctr.y + hy - wv.y);
+                ImVec2 P2(ctr.x - hx - wv.x, ctr.y - hy - wv.y);
+                ImVec2 P3(ctr.x - hx + wv.x, ctr.y - hy + wv.y);
+                ImVec2 quad[4] = {P0, P1, P2, P3};
+                const char* rel[4] = {"parallel perpendicular", "parallel", nullptr, nullptr};
+                addQuadLoop(st, quad, rel);
+                resetTool();
+            } else if (tool_ == SketchTool::Parallelogram && toolUV_.size() == 3) {
+                // 3 corners -> opposite sides parallel+equal, NO perpendicular.
+                ImVec2 A = toolUV_[0], B = toolUV_[1], C = toolUV_[2];
+                ImVec2 D(A.x + (C.x - B.x), A.y + (C.y - B.y));
+                ImVec2 quad[4] = {A, B, C, D};
+                const char* rel[4] = {"parallel equal", "parallel equal", nullptr, nullptr};
+                addQuadLoop(st, quad, rel);
+                resetTool();
+            } else if (tool_ == SketchTool::CirclePerimeter && toolUV_.size() == 3) {
+                float cu, cv, rad;
+                if (!circumcircle(toolUV_[0], toolUV_[1], toolUV_[2], cu, cv, rad)) {
+                    // collinear/degenerate guard: drop the 3rd pick, keep first two, hint via log.
+                    st.addLog("[sketch] Perimeter Circle: 3 points are collinear — pick a 3rd off the line");
+                    toolUV_.pop_back(); toolSnaps_.pop_back();
+                } else {
+                    nlohmann::json ent = {{"type", "circle"},
+                        {"center", nlohmann::json::array({cu, cv})}, {"radius", rad}};
+                    addEntity(st, ent, nlohmann::json::array());
+                    resetTool();
+                }
+            } else if (tool_ == SketchTool::SlotCtrStr && toolUV_.size() == 3) {
+                // center, end-direction/length, width. Spine = center +/- (end-center).
+                ImVec2 ctr = toolUV_[0], end = toolUV_[1], wpk = toolUV_[2];
+                ImVec2 e1(ctr.x + (end.x - ctr.x), ctr.y + (end.y - ctr.y));
+                ImVec2 e2(ctr.x - (end.x - ctr.x), ctr.y - (end.y - ctr.y));
+                float dx = e1.x - e2.x, dy = e1.y - e2.y; float L = std::hypot(dx, dy);
+                float w = L > 1e-6f ? std::fabs((wpk.x - e2.x) * (-dy) + (wpk.y - e2.y) * dx) / L : 5.0f;
+                if (w < 1e-3f) w = 5.0f;
+                nlohmann::json ent = {{"type", "slot"},
+                    {"p1", nlohmann::json::array({e1.x, e1.y})},
+                    {"p2", nlohmann::json::array({e2.x, e2.y})}, {"width", w * 2.0f}};
+                addEntity(st, ent, nlohmann::json::array());
+                resetTool();
+            } else if (tool_ == SketchTool::EllipsePartial && toolUV_.size() == 5) {
+                // center, rx point, ry/rot point, start-angle, end-angle.
+                ImVec2 ctr = toolUV_[0], rxp = toolUV_[1], ryp = toolUV_[2];
+                float rot = std::atan2(rxp.y - ctr.y, rxp.x - ctr.x);
+                float rx = std::hypot(rxp.x - ctr.x, rxp.y - ctr.y);
+                float ca = std::cos(rot), sa = std::sin(rot);
+                float ry = std::fabs(-(ryp.x - ctr.x) * sa + (ryp.y - ctr.y) * ca);
+                if (rx < 1e-4f || ry < 1e-4f) { st.addLog("[sketch] Partial Ellipse: degenerate radii"); resetTool(); }
+                else {
+                    auto angOf = [&](ImVec2 q) {
+                        float lx = (q.x - ctr.x) * ca + (q.y - ctr.y) * sa;
+                        float ly = -(q.x - ctr.x) * sa + (q.y - ctr.y) * ca;
+                        return std::atan2(ly / ry, lx / rx);
+                    };
+                    // Contract (doc_schema.md §3.1): rot/a0/a1 are DEGREES, angles in the
+                    // un-rotated ellipse frame, CCW a0 -> a1.
+                    const float kR2D = 57.29577951f;
+                    float a0 = angOf(toolUV_[3]) * kR2D, a1 = angOf(toolUV_[4]) * kR2D;
+                    if (a1 <= a0) a1 += 360.0f;   // enforce CCW sweep
+                    nlohmann::json ent = {{"type", "ellipse_arc"},
+                        {"center", nlohmann::json::array({ctr.x, ctr.y})},
+                        {"rx", rx}, {"ry", ry}, {"rot", rot * kR2D}, {"a0", a0}, {"a1", a1}};
+                    addEntity(st, ent, nlohmann::json::array());
+                    resetTool();
+                }
+            } else if (tool_ == SketchTool::Parabola && toolUV_.size() == 4) {
+                // focus, vertex, start, end picks. Contract (doc_schema.md §3.1) stores the
+                // range as t0/t1: signed extents along w = perp(unit(focus - vertex)), i.e.
+                // t = (P - vertex)·w in the parabola's own frame.
+                ImVec2 focus = toolUV_[0], vertex = toolUV_[1], s0 = toolUV_[2], s1 = toolUV_[3];
+                float ux = focus.x - vertex.x, uy = focus.y - vertex.y;
+                float ul = std::hypot(ux, uy);
+                if (ul < 1e-4f) { st.addLog("[sketch] Parabola: focus == vertex"); resetTool(); }
+                else {
+                    ux /= ul; uy /= ul;
+                    float wx = -uy, wy = ux;   // perp(u)
+                    float t0 = (s0.x - vertex.x) * wx + (s0.y - vertex.y) * wy;
+                    float t1 = (s1.x - vertex.x) * wx + (s1.y - vertex.y) * wy;
+                    nlohmann::json ent = {{"type", "parabola"},
+                        {"vertex", nlohmann::json::array({vertex.x, vertex.y})},
+                        {"focus", nlohmann::json::array({focus.x, focus.y})},
+                        {"t0", t0}, {"t1", t1}};
+                    addEntity(st, ent, nlohmann::json::array());
+                    resetTool();
+                }
+            } else if (tool_ == SketchTool::Conic && toolUV_.size() == 4) {
+                // p0, p1, apex, then a 4th click sets rho (projection onto mid->apex).
+                ImVec2 P0 = toolUV_[0], P1 = toolUV_[1], apex = toolUV_[2], rhoPk = toolUV_[3];
+                ImVec2 mid((P0.x + P1.x) * 0.5f, (P0.y + P1.y) * 0.5f);
+                float dx = apex.x - mid.x, dy = apex.y - mid.y; float L2 = dx * dx + dy * dy;
+                float rho = L2 > 1e-9f ? ((rhoPk.x - mid.x) * dx + (rhoPk.y - mid.y) * dy) / L2 : 0.5f;
+                rho = std::fmax(0.01f, std::fmin(0.99f, rho));
+                nlohmann::json ent = {{"type", "conic"},
+                    {"p0", nlohmann::json::array({P0.x, P0.y})},
+                    {"p1", nlohmann::json::array({P1.x, P1.y})},
+                    {"apex", nlohmann::json::array({apex.x, apex.y})},
+                    {"rho", rho}};
+                addEntity(st, ent, nlohmann::json::array());
+                resetTool();
             }
         }
         // ESC ends the tool.
@@ -689,8 +1060,42 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          tool_ == SketchTool::Circle ? "Circle" :
                          tool_ == SketchTool::ArcCenter ? "Center Arc" :
                          tool_ == SketchTool::Slot ? "Slot" :
-                         tool_ == SketchTool::SmartDim ? "Smart Dimension" : "";
-        std::string hint = std::string(tn) + "  (ESC to end)";
+                         tool_ == SketchTool::SmartDim ? "Smart Dimension" :
+                         tool_ == SketchTool::Rect3ptCorner ? "3 Point Corner Rectangle" :
+                         tool_ == SketchTool::Rect3ptCenter ? "3 Point Center Rectangle" :
+                         tool_ == SketchTool::Parallelogram ? "Parallelogram" :
+                         tool_ == SketchTool::CirclePerimeter ? "Perimeter Circle" :
+                         tool_ == SketchTool::SlotCtrStr ? "Centerpoint Slot" :
+                         tool_ == SketchTool::EllipsePartial ? "Partial Ellipse" :
+                         tool_ == SketchTool::Parabola ? "Parabola" :
+                         tool_ == SketchTool::Conic ? "Conic" : "";
+        // Per-stage step prompt (status-bar style) for the multi-click variants.
+        const size_t n = toolUV_.size();
+        const char* step = nullptr;
+        switch (tool_) {
+            case SketchTool::Rect3ptCorner:
+                step = n == 0 ? "click corner" : n == 1 ? "click edge end" : "click width"; break;
+            case SketchTool::Rect3ptCenter:
+                step = n == 0 ? "click center" : n == 1 ? "click edge midpoint" : "click width"; break;
+            case SketchTool::Parallelogram:
+                step = n == 0 ? "click corner 1" : n == 1 ? "click corner 2" : "click corner 3"; break;
+            case SketchTool::CirclePerimeter:
+                step = n < 3 ? "click 3 points on the circumference" : nullptr; break;
+            case SketchTool::SlotCtrStr:
+                step = n == 0 ? "click center" : n == 1 ? "click end (length/dir)" : "click width"; break;
+            case SketchTool::EllipsePartial:
+                step = n == 0 ? "click center" : n == 1 ? "click major (rx/rot)" :
+                       n == 2 ? "click minor (ry)" : n == 3 ? "click start angle" : "click end angle"; break;
+            case SketchTool::Parabola:
+                step = n == 0 ? "click focus" : n == 1 ? "click vertex" :
+                       n == 2 ? "click start" : "click end"; break;
+            case SketchTool::Conic:
+                step = n == 0 ? "click endpoint 1" : n == 1 ? "click endpoint 2" :
+                       n == 2 ? "click apex" : "click to set rho (fullness)"; break;
+            default: break;
+        }
+        std::string hint = std::string(tn) + (step ? std::string(" \xE2\x80\x94 ") + step : std::string()) +
+                           "  (ESC to end)";
         ImVec2 ts = ImGui::CalcTextSize(hint.c_str());
         float cx = (imgMin.x + imgMax.x) * 0.5f;
         ImVec2 p0(cx - ts.x * 0.5f - 12, imgMin.y + 12);

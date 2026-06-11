@@ -237,8 +237,106 @@ def _entity_to_edges(ent: dict) -> list[Any]:
         except Exception:  # noqa: BLE001
             return []
 
+    elif etype == "ellipse_arc":
+        # Partial ellipse: trimmed ellipse via make_ellipse(start_angle,end_angle)
+        # in the un-rotated frame, then rotate by rot about the center.
+        cx, cy = _to_vec2(ent["center"], "center")
+        rx = float(ent["rx"])
+        ry = float(ent["ry"])
+        rot = float(ent.get("rot", 0))
+        a0 = float(ent["a0"])
+        a1 = float(ent["a1"])
+        if rx <= 0 or ry <= 0 or abs(a1 - a0) < 1e-9:
+            return []
+        try:
+            from build123d import Rot
+            e = Edge.make_ellipse(rx, ry, Plane(origin=Vector(cx, cy, 0)),
+                                  start_angle=a0, end_angle=a1)
+            if abs(rot) > 1e-9:
+                e = Rot(0, 0, rot) * e
+            return [e]
+        except Exception:  # noqa: BLE001
+            return []
+
+    elif etype == "parabola":
+        # Approximated by a cubic spline through sampled parabola points
+        # (build123d has no native parabola edge). Sampling density below is
+        # ample for visual fidelity and region closure at sketch scale.
+        pts = _sample_parabola(ent)
+        if len(pts) < 2:
+            return []
+        try:
+            vecs = [Vector(px, py, 0) for px, py in pts]
+            return [Edge.make_spline(vecs)]
+        except Exception:  # noqa: BLE001
+            return []
+
+    elif etype == "conic":
+        # SolidWorks rho conic == rational quadratic Bezier with apex shoulder.
+        # Use Edge.make_bezier with control weights (1, w, 1), w = rho/(1-rho).
+        # Falls back to a sampled spline if the weighted bezier is rejected.
+        try:
+            p0 = _to_vec2(ent["p0"], "p0")
+            p1 = _to_vec2(ent["p1"], "p1")
+            ap = _to_vec2(ent["apex"], "apex")
+            rho = float(ent.get("rho", 0.5))
+            rho = min(max(rho, 1e-3), 1.0 - 1e-3)
+            w = rho / (1.0 - rho)
+            ctrl = [Vector(p0[0], p0[1], 0), Vector(ap[0], ap[1], 0),
+                    Vector(p1[0], p1[1], 0)]
+            try:
+                return [Edge.make_bezier(*ctrl, weights=[1.0, w, 1.0])]
+            except Exception:  # noqa: BLE001
+                pts = _sample_conic(p0, p1, ap, w)
+                vecs = [Vector(px, py, 0) for px, py in pts]
+                return [Edge.make_spline(vecs)]
+        except Exception:  # noqa: BLE001
+            return []
+
     # Unknown or "point" entity (no geometry)
     return []
+
+
+# --------------------------------------------------------------------------- conic sampling
+
+
+def _sample_parabola(ent: dict, n: int = 24) -> list[tuple[float, float]]:
+    """Sample a parabola entity into XY points (sketch_solver frame).
+
+    Frame: origin = vertex, axis u = unit(focus - vertex), w = perp(u),
+    focal length f = |focus - vertex|; P(t) = vertex + (t^2/(4f))*u + t*w.
+    """
+    vx, vy = _to_vec2(ent["vertex"], "vertex")
+    fx, fy = _to_vec2(ent["focus"], "focus")
+    t0 = float(ent["t0"])
+    t1 = float(ent["t1"])
+    dx, dy = fx - vx, fy - vy
+    f = math.hypot(dx, dy)
+    if f < 1e-12 or abs(t1 - t0) < 1e-12:
+        return []
+    ux, uy = dx / f, dy / f
+    wx, wy = -uy, ux
+    out: list[tuple[float, float]] = []
+    for i in range(n + 1):
+        t = t0 + (t1 - t0) * i / n
+        s = (t * t) / (4.0 * f)
+        out.append((vx + s * ux + t * wx, vy + s * uy + t * wy))
+    return out
+
+
+def _sample_conic(p0, p1, ap, w: float, n: int = 24) -> list[tuple[float, float]]:
+    """Sample a rational quadratic Bezier (P0, apex@weight w, P1) into XY points."""
+    out: list[tuple[float, float]] = []
+    for i in range(n + 1):
+        t = i / n
+        b0 = (1 - t) ** 2
+        b1 = 2 * (1 - t) * t * w
+        b2 = t * t
+        den = b0 + b1 + b2
+        x = (b0 * p0[0] + b1 * ap[0] + b2 * p1[0]) / den
+        y = (b0 * p0[1] + b1 * ap[1] + b2 * p1[1]) / den
+        out.append((x, y))
+    return out
 
 
 # --------------------------------------------------------------------------- loop detection

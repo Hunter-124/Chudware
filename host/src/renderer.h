@@ -92,13 +92,17 @@ public:
     // Returns false if the plane index is out of range. Valid after a render (uses center_/radius_).
     bool planeAnchor(int plane, Vec3& world) const;
 
-    // ---- W3-I: SolidWorks-style Section View (single clip plane + optional filled cap) ----
-    // Fragments on the positive side of the plane (dot(worldPos, n) > offset) are discarded across
-    // faces and edges in every display style. When showCap is set, the cut is filled with capRgb
-    // via a stencil pass so the body reads as solid. enabled=false restores the full model.
+    // ---- C28-C: SolidWorks-style Section View — up to 3 simultaneous clip planes ----
+    // A fragment is visible only when it is inside ALL active half-spaces: dot(p,Ni) <= Oi.
+    // When showCap is set, each active plane gets a stencil-masked filled cap, also clipped by
+    // the other planes so intersecting cuts read as solid material (SolidWorks zonal mode).
+    // count must be 1..3. The single-plane setSectionPlane() wrapper forwards here with count=1.
+    void setSectionPlanes(const float n[][3], const float off[], int count,
+                          const float capRgb[3], bool showCap);
+    // Backward-compat single-plane setter (existing callers unchanged).
     void setSectionPlane(const float normal[3], float offset, bool enabled,
                          const float capRgb[3], bool showCap);
-    bool sectionEnabled() const { return section_.enabled; }
+    bool sectionEnabled() const { return section_.count > 0; }
 
     // ---- C19 result colormap + deformation ----
     // When colormap mode is on, bodies that carry a per-vertex scalar render through the LUT.
@@ -148,7 +152,7 @@ private:
     void drawCurrent(float yawDeg, float pitchDeg, float zoom);
     void drawGroundShadow(const Mat4& mvp, const Vec3& eye, const Vec3& up);  // soft contact blob
     void drawReferencePlanes(const Mat4& mvp);   // translucent datum planes (after the opaque pass)
-    void drawSectionCap(const Mat4& mvp);        // W3-I: stencil-masked filled cut cap
+    void drawSectionCap(const Mat4& mvp, int planeIdx);  // C28-C: cap for one plane, clipped by others
     void planeCorners(int plane, float e, Vec3 out[4]) const;  // 4 world corners of plane quad
     void freeSubs();
     void buildLut();              // C19: build the SW-style jet LUT texture (lazy)
@@ -180,13 +184,14 @@ private:
     float planeFill_[4]    = {0.380f, 0.620f, 0.910f, 0.085f};
     float planeOutline_[4] = {0.290f, 0.540f, 0.870f, 0.700f};
 
-    // W3-I: section clip plane state. The plane is `dot(worldPos, normal) = offset`; geometry on
-    // the positive side is discarded. capRgb fills the cut face when showCap is set.
+    // C28-C: multi-plane section state. count=0 means disabled; 1..3 = that many active planes.
+    // The visible region is the intersection of all half-spaces dot(p, normals[i]) <= offsets[i].
+    static constexpr int kMaxSectionPlanes = 3;
     struct Section {
-        bool  enabled = false;
+        int   count = 0;              // 0 = off; 1..3 = active
         bool  showCap = false;
-        float normal[3] = {1, 0, 0};
-        float offset = 0.0f;
+        float normals[kMaxSectionPlanes][3] = {{1,0,0},{0,1,0},{0,0,1}};
+        float offsets[kMaxSectionPlanes] = {0,0,0};
         float capRgb[3] = {0.62f, 0.66f, 0.74f};
     } section_;
     Vec3 capKeyDir_;  // W3-I: key-light dir captured for the cap's flat lighting

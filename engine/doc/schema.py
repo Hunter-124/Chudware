@@ -31,7 +31,7 @@ RESERVED_DATUMS = {
 
 UNIT_SYSTEMS = {"MMGS", "IPS"}
 
-HANDLE_RE = re.compile(r"^e\d+(\.(p1|p2|p|center|start|end|p\d+))?$")
+HANDLE_RE = re.compile(r"^e\d+(\.(p1|p2|p|center|start|end|vertex|apex|p\d+))?$")
 FEATURE_ID_RE = re.compile(r"^f\d+$")
 
 SELECTOR_KINDS = {"face", "edge", "vertex", "body", "datum", "region"}
@@ -51,6 +51,9 @@ ENTITY_FIELDS: dict[str, list[str]] = {
     "circle": ["center", "radius"],
     "arc": ["center", "radius", "start", "end", "ccw"],
     "ellipse": ["center", "rx", "ry", "rot"],
+    "ellipse_arc": ["center", "rx", "ry", "rot", "a0", "a1"],
+    "parabola": ["vertex", "focus", "t0", "t1"],
+    "conic": ["p0", "p1", "apex", "rho"],
     "spline": ["points"],
     "slot": ["p1", "p2", "width"],
     "text": ["p", "text", "height"],
@@ -63,6 +66,9 @@ _ENTITY_SUBS: dict[str, set[str]] = {
     "circle": {"center"},
     "arc": {"center", "start", "end"},
     "ellipse": {"center"},
+    "ellipse_arc": {"center", "start", "end"},
+    "parabola": {"vertex", "start", "end"},
+    "conic": {"start", "end", "apex"},
     "slot": {"p1", "p2"},
     "text": {"p"},
     # spline handled specially (p0..pN)
@@ -280,7 +286,7 @@ def validate_entity(e: Any, where: str) -> list[str]:
             errs.append(f"{where}.{field}: required for {etype}")
             continue
         v = e[field]
-        if field in ("p", "p1", "p2", "center"):
+        if field in ("p", "p1", "p2", "p0", "center", "vertex", "focus", "apex"):
             if not _is_vec(v, 2):
                 errs.append(f"{where}.{field}: must be [x,y]")
         elif field == "points":

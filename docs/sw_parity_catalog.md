@@ -86,21 +86,25 @@ unit suffixes ("2.50in"), reverse-direction arrow buttons next to direction drop
   appearance editor, scene/lighting editor, RealView toggles, mate PMs (assembly),
   drawing mode anything, Instant3D drag handles.
 
-## Status (C25/C26)
+## Status (C25–C28)
 
 | Catalog item | Status | Notes |
 |---|---|---|
 | **Viewport visuals** | SHIPPED C25 | Background gradient, part appearance, selection highlight, preview, reference planes |
 | **Space / view interaction** | SHIPPED C25 | View Selector glass box with animated camera; heads-up toolbar; display style flyout (5 styles); hotkeys Ctrl+1..8 |
-| **Sketch tool flyouts** | SHIPPED C25 | Rectangle, Circle, Slot, Spline variants; Ellipse group (Partial Ellipse/Parabola/Conic greyed in UI) |
+| **Sketch tool flyouts** | SHIPPED C25 | Rectangle, Circle, Slot, Spline variants; Ellipse group base (full set un-greyed C28) |
 | **Features ribbon** | SHIPPED C25 | Button groups and organization; PropertyManager chrome (header, commit row, groups, selector wells) |
 | **Extrude end conditions** | SHIPPED C26 | Blind, Mid Plane, Through All, Up To Next; Direction 2; draft taper; reverse buttons in PM forms |
 | **Extrude draft + direction2** | SHIPPED C26 | Draft outward checkbox, direction field per Direction 1/2; engine test test_extrude_ends.py |
 | **Face-normal Normal-To (Ctrl+8)** | SHIPPED C26 | True face-normal camera lock; clickable orientation triad in viewport |
 | **Per-body appearance colors** | SHIPPED C26 | set_appearance op; AICM color encoding; tree icon + viewport tint; PM appearance dropdown; context menu color picker; engine test test_appearance.py |
+| **In-viewport dimension callouts** | SHIPPED C27 | Dimension values with leader lines to geometry during PM edit; theme-aware rendering |
+| **View-selector hover preview** | SHIPPED C27 | Hover face on View Selector glass box → thumbnail preview panel top-right |
+| **Asymmetric fillet** | SHIPPED C27 | Symmetric|Asymmetric dropdown in Fillet PM; engine support for per-side radius |
+| **Convert Fillet↔Chamfer** | SHIPPED C27 | Context menu option to toggle feature type; tree/icon update |
+| **Conic sketch entities** | SHIPPED C28 | Ellipse Arc, Parabola, Conic in Ellipse flyout (entity creation + constraint/solve); test_sketch_conics.py |
+| **Sketch input variants** | SHIPPED C28 | 3-point corner/center rectangle, parallelogram, perimeter circle, centerpoint slot, arc slots enabled |
+| **Zonal/multi-plane section** | SHIPPED C28 | Section Method dropdown (Planar | Zonal); up to 3 independent planes; per-plane offsets/rotations/caps; AI_CAD_SECTION=2/3 debug knobs |
 | **Fillet type tabs** | OPEN | Variable Size, Face Fillet, Full Round tab row in PM (Constant Size shipped) |
-| **Conic sketch entities** | OPEN | Partial Ellipse, Parabola, Conic in Ellipse flyout (greyed pending constraint/solve work) |
 | **Hole Wizard advanced tabs** | OPEN | Callout, Positions, Thread, Cosmetic (simple/cbore/csink core shipped, advanced deferred) |
-| **Zonal/multi-plane section** | OPEN | Section Method dropdown with Zonal option; up to 3 independent section planes |
 | **RealView-class rendering** | OPEN | Material library, reflections, photorealistic surface finish (qualitative CFD model is baseline) |
-| **Preview thumbnail in view selector** | OPEN | Hover on View Selector glass box face → thumbnail panel (currently shows caption, preview deferred) |

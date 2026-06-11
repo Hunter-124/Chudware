@@ -42,12 +42,13 @@ uniform vec3 uColor;      // sRGB part color
 uniform int  uUseScalar;  // C19: 1 = sample the LUT by the per-vertex scalar
 uniform float uScalarMin, uScalarMax;
 uniform sampler2D uLut;   // 256x1 jet ramp
-uniform int  uClip;       // W3-I: 1 = section clip active
-uniform vec3 uClipN;      // section plane normal (world)
-uniform float uClipOff;   // section plane offset along the normal
+uniform int   uClipCount;              // C28-C: 0 = off; 1..3 active planes
+uniform vec3  uClipN[3];               // plane normals
+uniform float uClipOff[3];            // plane offsets
 out vec4 frag;
 void main(){
-    if (uClip == 1 && dot(vPos, uClipN) > uClipOff) discard;  // W3-I: drop the cut-away side
+    for (int ci = 0; ci < uClipCount; ++ci)
+        if (dot(vPos, uClipN[ci]) > uClipOff[ci]) discard;
     vec3 N = normalize(vN);
     vec3 V = normalize(uCamPos - vPos);
     if (dot(N, V) < 0.0) N = -N;            // two-sided
@@ -143,12 +144,13 @@ void main(){ vPos = aPos; gl_Position = uMVP * vec4(aPos, 1.0); })";
 const char* kEdgeFrag = R"(#version 330 core
 in vec3 vPos;
 uniform vec3 uColor;
-uniform int  uClip;       // W3-I: 1 = section clip active
-uniform vec3 uClipN;
-uniform float uClipOff;
+uniform int   uClipCount;
+uniform vec3  uClipN[3];
+uniform float uClipOff[3];
 out vec4 frag;
 void main(){
-    if (uClip == 1 && dot(vPos, uClipN) > uClipOff) discard;
+    for (int ci = 0; ci < uClipCount; ++ci)
+        if (dot(vPos, uClipN[ci]) > uClipOff[ci]) discard;
     frag = vec4(uColor, 1.0);
 })";
 
@@ -163,19 +165,28 @@ uniform vec4 uColor;
 out vec4 frag;
 void main(){ frag = uColor; })";
 
-// W3-I: section-cap quad. Flat-lit by the plane normal so the filled cut reads as a solid face
-// (not a flat sticker). uColor is the sRGB cap color; lighting is a gentle hemisphere + key.
+// C28-C: section-cap quad. Flat-lit by its plane normal. Also clipped by the OTHER active planes
+// (cross-plane clipping) so intersecting cuts read as solid material at their intersection line.
+// uCapExclude is the index of THIS cap's plane — that plane is skipped in the discard loop.
 const char* kCapVert = R"(#version 330 core
 layout(location=0) in vec3 aPos;
 uniform mat4 uMVP;
-void main(){ gl_Position = uMVP * vec4(aPos, 1.0); })";
+out vec3 vPos;
+void main(){ vPos = aPos; gl_Position = uMVP * vec4(aPos, 1.0); })";
 
 const char* kCapFrag = R"(#version 330 core
-uniform vec3 uColor;
-uniform vec3 uN;        // plane normal (world)
-uniform vec3 uKeyDir;   // toward the key light (world)
+in vec3 vPos;
+uniform vec3  uColor;
+uniform vec3  uN;           // this cap's plane normal
+uniform vec3  uKeyDir;
+uniform int   uClipCount;   // total active planes
+uniform vec3  uClipN[3];    // all plane normals
+uniform float uClipOff[3];  // all plane offsets
+uniform int   uCapExclude;  // index of THIS cap's plane (not re-applied)
 out vec4 frag;
 void main(){
+    for (int ci = 0; ci < uClipCount; ++ci)
+        if (ci != uCapExclude && dot(vPos, uClipN[ci]) > uClipOff[ci]) discard;
     vec3 N = normalize(uN);
     vec3 base = pow(uColor, vec3(2.2));
     float key = max(dot(N, normalize(uKeyDir)), 0.0);
@@ -608,10 +619,15 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, lutTex_);
     glUniform1i(glGetUniformLocation(prog_, "uLut"), 0);
-    // W3-I: section clip (faces).
-    glUniform1i(glGetUniformLocation(prog_, "uClip"), section_.enabled ? 1 : 0);
-    glUniform3fv(glGetUniformLocation(prog_, "uClipN"), 1, section_.normal);
-    glUniform1f(glGetUniformLocation(prog_, "uClipOff"), section_.offset);
+    // C28-C: multi-plane section clip (faces). Push all active planes as arrays.
+    {
+        int cnt = section_.count;
+        glUniform1i(glGetUniformLocation(prog_, "uClipCount"), cnt);
+        if (cnt > 0) {
+            glUniform3fv(glGetUniformLocation(prog_, "uClipN"),   cnt, section_.normals[0]);
+            glUniform1fv(glGetUniformLocation(prog_, "uClipOff"), cnt, section_.offsets);
+        }
+    }
 
     // Solids, pushed back a touch so the feature edges win the depth test on top of them.
     // In HLR styles the faces are painted in the background color so they only occlude (depth) —
@@ -636,20 +652,26 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
         glDisable(GL_POLYGON_OFFSET_FILL);
     }
 
-    // W3-I: filled section cap (stencil-masked). Needs face geometry for the stencil pass, so it
-    // runs only when faces are drawn (skipped in Wireframe — SW does the same).
-    if (section_.enabled && section_.showCap && drawFaces) {
+    // C28-C: filled section caps (stencil-masked per plane). One cap pass per active plane;
+    // skipped in Wireframe (SW does the same).
+    if (section_.count > 0 && section_.showCap && drawFaces) {
         capKeyDir_ = keyDir;
-        drawSectionCap(mvp);
+        for (int pi = 0; pi < section_.count; ++pi) drawSectionCap(mvp, pi);
     }
 
     if (drawEdges) {
         glUseProgram(edgeProg_);
         glUniformMatrix4fv(glGetUniformLocation(edgeProg_, "uMVP"), 1, GL_FALSE, mvp.m);
         int eColorLoc = glGetUniformLocation(edgeProg_, "uColor");
-        glUniform1i(glGetUniformLocation(edgeProg_, "uClip"), section_.enabled ? 1 : 0);
-        glUniform3fv(glGetUniformLocation(edgeProg_, "uClipN"), 1, section_.normal);
-        glUniform1f(glGetUniformLocation(edgeProg_, "uClipOff"), section_.offset);
+        // C28-C: multi-plane clip for edges.
+        {
+            int cnt = section_.count;
+            glUniform1i(glGetUniformLocation(edgeProg_, "uClipCount"), cnt);
+            if (cnt > 0) {
+                glUniform3fv(glGetUniformLocation(edgeProg_, "uClipN"),   cnt, section_.normals[0]);
+                glUniform1fv(glGetUniformLocation(edgeProg_, "uClipOff"), cnt, section_.offsets);
+            }
+        }
         glLineWidth(edgeWidthPx_ * (float)SS);  // screen-space width after downsample
 
         // HiddenLinesVisible: first draw occluded edges dim (depth GL_GREATER), then visible edges.
@@ -768,7 +790,7 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px) {
     glUniform3f(glGetUniformLocation(prog_, "uRimDir"), rimDir.x, rimDir.y, rimDir.z);
     glUniform3f(glGetUniformLocation(prog_, "uCamPos"), eye.x, eye.y, eye.z);
     glUniform1i(glGetUniformLocation(prog_, "uUseScalar"), 0);
-    glUniform1i(glGetUniformLocation(prog_, "uClip"), 0);
+    glUniform1i(glGetUniformLocation(prog_, "uClipCount"), 0);  // thumbnail: no section clip
     int colorLoc = glGetUniformLocation(prog_, "uColor");
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(1.0f, 1.0f);
@@ -784,7 +806,7 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px) {
     glUseProgram(edgeProg_);
     glUniformMatrix4fv(glGetUniformLocation(edgeProg_, "uMVP"), 1, GL_FALSE, mvp.m);
     glUniform3fv(glGetUniformLocation(edgeProg_, "uColor"), 1, edgeColor_);
-    glUniform1i(glGetUniformLocation(edgeProg_, "uClip"), 0);
+    glUniform1i(glGetUniformLocation(edgeProg_, "uClipCount"), 0);  // thumbnail: no clip
     glLineWidth(1.0f);  // no supersample here, so 1px lines
     for (const auto& s : subs_) {
         if (s.edgeVerts <= 0) continue;
@@ -867,15 +889,26 @@ void Renderer::setPlanes(const bool show[3], int emphasized) {
     planeEmphasis_ = emphasized;
 }
 
-void Renderer::setSectionPlane(const float normal[3], float offset, bool enabled,
-                               const float capRgb[3], bool showCap) {
-    section_.enabled = enabled;
+void Renderer::setSectionPlanes(const float n[][3], const float off[], int count,
+                                const float capRgb[3], bool showCap) {
+    count = count < 1 ? 1 : (count > kMaxSectionPlanes ? kMaxSectionPlanes : count);
+    section_.count = count;
     section_.showCap = showCap;
-    section_.offset = offset;
-    Vec3 n = normalize(Vec3(normal[0], normal[1], normal[2]));
-    section_.normal[0] = n.x; section_.normal[1] = n.y; section_.normal[2] = n.z;
+    for (int i = 0; i < count; ++i) {
+        Vec3 nv = normalize(Vec3(n[i][0], n[i][1], n[i][2]));
+        section_.normals[i][0] = nv.x; section_.normals[i][1] = nv.y; section_.normals[i][2] = nv.z;
+        section_.offsets[i] = off[i];
+    }
     if (capRgb) { section_.capRgb[0] = capRgb[0]; section_.capRgb[1] = capRgb[1];
                   section_.capRgb[2] = capRgb[2]; }
+}
+
+void Renderer::setSectionPlane(const float normal[3], float offset, bool enabled,
+                               const float capRgb[3], bool showCap) {
+    if (!enabled) { section_.count = 0; return; }
+    const float ns[1][3] = {{normal[0], normal[1], normal[2]}};
+    const float offs[1] = {offset};
+    setSectionPlanes(ns, offs, 1, capRgb, showCap);
 }
 
 // Four world-space corners of a plane quad of half-extent e, centered at center_.
@@ -960,29 +993,33 @@ void Renderer::drawReferencePlanes(const Mat4& mvp) {
     glDisable(GL_BLEND);
 }
 
-// W3-I: filled section cap. Marks the cut region in stencil by counting front/back faces of the
-// clipped solid along each ray (kept front faces +1, kept back faces -1 → interior of the cut is
-// odd/nonzero), then paints a flat-lit plane quad masked by that stencil. Robust for closed meshes.
-void Renderer::drawSectionCap(const Mat4& mvp) {
-    if (subs_.empty()) return;
+// C28-C: filled section cap for plane[planeIdx]. Stencil-counts the clipped solid to find the
+// cut interior, then paints a flat-lit quad masked by the stencil. The stencil pass applies ALL
+// active planes (so only the visible intersection is marked). The cap quad is clipped by the OTHER
+// planes in the cap shader so intersecting cuts never bleed through each other.
+void Renderer::drawSectionCap(const Mat4& mvp, int planeIdx) {
+    if (subs_.empty() || planeIdx < 0 || planeIdx >= section_.count) return;
 
-    // ---- pass A: build the cap mask in stencil (no color, no depth) ----
+    const float* pNorm = section_.normals[planeIdx];
+    float pOff = section_.offsets[planeIdx];
+
+    // ---- pass A: stencil mask using ALL active planes (full intersection) ----
     glEnable(GL_STENCIL_TEST);
     glClear(GL_STENCIL_BUFFER_BIT);
     glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
     glDepthMask(GL_FALSE);
-    glDisable(GL_DEPTH_TEST);          // count every fragment along the ray, not just the nearest
+    glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glStencilFunc(GL_ALWAYS, 0, 0xFF);
-    // Front-facing kept fragments increment, back-facing decrement (wrap-safe).
     glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR_WRAP);
     glStencilOpSeparate(GL_BACK,  GL_KEEP, GL_KEEP, GL_DECR_WRAP);
 
-    glUseProgram(prog_);   // reuse the lit program; clip uniforms still set from drawCurrent
+    // Reuse the face program — all active clip planes already set from drawCurrent.
+    glUseProgram(prog_);
     glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, mvp.m);
-    glUniform1i(glGetUniformLocation(prog_, "uClip"), 1);
-    glUniform3fv(glGetUniformLocation(prog_, "uClipN"), 1, section_.normal);
-    glUniform1f(glGetUniformLocation(prog_, "uClipOff"), section_.offset);
+    glUniform1i(glGetUniformLocation(prog_, "uClipCount"), section_.count);
+    glUniform3fv(glGetUniformLocation(prog_, "uClipN"),   section_.count, section_.normals[0]);
+    glUniform1fv(glGetUniformLocation(prog_, "uClipOff"), section_.count, section_.offsets);
     glUniform1i(glGetUniformLocation(prog_, "uUseScalar"), 0);
     for (const auto& s : subs_) {
         glBindVertexArray(s.vao);
@@ -997,28 +1034,32 @@ void Renderer::drawSectionCap(const Mat4& mvp) {
     glStencilFunc(GL_NOTEQUAL, 0, 0xFF);
     glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
 
-    // Plane basis: a quad on dot(p,n)=offset, centered on the model center projected to the plane.
-    Vec3 n(section_.normal[0], section_.normal[1], section_.normal[2]);
+    Vec3 n(pNorm[0], pNorm[1], pNorm[2]);
     Vec3 up = (std::fabs(n.z) < 0.95f) ? Vec3(0, 0, 1) : Vec3(1, 0, 0);
     Vec3 u = normalize(cross(up, n));
     Vec3 v = normalize(cross(n, u));
-    // Center: project center_ onto the plane (so the quad always covers the cut even when offset
-    // moves the plane off the bbox center).
-    float d = dot(center_, n) - section_.offset;
+    float d = dot(center_, n) - pOff;
     Vec3 c = center_ - n * d;
     float e = radius_ * 2.2f;
     Vec3 q[4] = {
-        c - u * e - v * e, c + u * e - v * e, c + u * e + v * e, c - u * e + v * e,
+        c - u*e - v*e, c + u*e - v*e, c + u*e + v*e, c - u*e + v*e,
     };
     float tri[18] = {
         q[0].x,q[0].y,q[0].z, q[1].x,q[1].y,q[1].z, q[2].x,q[2].y,q[2].z,
         q[0].x,q[0].y,q[0].z, q[2].x,q[2].y,q[2].z, q[3].x,q[3].y,q[3].z,
     };
+
     glUseProgram(capProg_);
     glUniformMatrix4fv(glGetUniformLocation(capProg_, "uMVP"), 1, GL_FALSE, mvp.m);
     glUniform3fv(glGetUniformLocation(capProg_, "uColor"), 1, section_.capRgb);
-    glUniform3fv(glGetUniformLocation(capProg_, "uN"), 1, section_.normal);
+    glUniform3fv(glGetUniformLocation(capProg_, "uN"),     1, pNorm);
     glUniform3f(glGetUniformLocation(capProg_, "uKeyDir"), capKeyDir_.x, capKeyDir_.y, capKeyDir_.z);
+    // Cross-plane clipping in the cap shader (excludes this plane's own half-space).
+    glUniform1i(glGetUniformLocation(capProg_, "uClipCount"),  section_.count);
+    glUniform3fv(glGetUniformLocation(capProg_, "uClipN"),     section_.count, section_.normals[0]);
+    glUniform1fv(glGetUniformLocation(capProg_, "uClipOff"),   section_.count, section_.offsets);
+    glUniform1i(glGetUniformLocation(capProg_, "uCapExclude"), planeIdx);
+
     glBindVertexArray(capVao_);
     glBindBuffer(GL_ARRAY_BUFFER, capVbo_);
     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(tri), tri);

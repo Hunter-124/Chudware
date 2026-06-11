@@ -78,18 +78,32 @@ A sketch is a feature (`type:"sketch"`) with `refs.plane` = selector-or-datum an
 | `circle` | `center:[x,y]`, `radius:r` |
 | `arc` | `center:[x,y]`, `radius:r`, `start:deg`, `end:deg`, `ccw:bool` (3-point arcs are normalized to this form on creation) |
 | `ellipse` (S) | `center:[x,y]`, `rx`, `ry`, `rot:deg` |
+| `ellipse_arc` (S) | `center:[x,y]`, `rx`, `ry`, `rot:deg`, `a0:deg`, `a1:deg` (partial ellipse; `a0`/`a1` are trim angles in the **un-rotated** ellipse frame, CCW `a0`→`a1`) |
+| `parabola` (S) | `vertex:[x,y]`, `focus:[x,y]`, `t0`, `t1` (drawn segment of a parabola; own frame `u=unit(focus−vertex)`, `w=perp(u)`, `f=\|focus−vertex\|`, point `P(t)=vertex+(t²/4f)·u+t·w`; `t0`/`t1` are signed `w`-extents) |
+| `conic` (S) | `p0:[x,y]`, `p1:[x,y]`, `apex:[x,y]`, `rho:0..1` (SolidWorks conic: endpoints + tangent-intersection `apex` + `rho`; rendered as rational quadratic Bézier with apex weight `w=rho/(1−rho)`) |
 | `spline` | `points:[[x,y],…]` (cubic through-points) |
 | `slot` | `p1:[x,y]`, `p2:[x,y]`, `width:w` (straight slot, arc caps) |
 | `text` (S) | `p:[x,y]`, `text:str`, `height:mm` |
 
 All entities carry `construction:bool` (construction geometry never forms profile regions).
 
+**Conic-family solver support (C28-A):** `ellipse_arc`/`parabola`/`conic` participate in the solve
+with these DOF: ellipse_arc 7 (`cx,cy,rx,ry,rot,a0,a1`), parabola 6 (`vx,vy,fx,fy,t0,t1`),
+conic 7 (`p0,p1,apex,rho`). Supported relations on these types are limited to `coincident`
+(on the handles below) and `fix` (on any handle). NOT yet supported (deferred): `tangent`,
+`equal`, `concentric`, `point_on`, `radius`/`diameter`, `horizontal`/`vertical`,
+`symmetric`, `midpoint`, `parallel`, `perpendicular`, `angle` for the conic family. b3d region
+geometry: ellipse_arc → trimmed `Edge.make_ellipse`; parabola → cubic spline through sampled
+points; conic → `Edge.make_bezier` with weights (sampled-spline fallback). All closed loops
+containing these still build region faces.
+
 ### 3.2 Handles
 
 Constraint references use **handles**: `"e3"` = whole entity; point sub-refs:
-`"e3.p1"`, `"e3.p2"` (line/slot endpoints), `"e3.center"` (circle/arc/ellipse),
-`"e3.start"`, `"e3.end"` (arc endpoints), `"e3.p"` (point entity), `"e3.p0"…"e3.pN"` (spline pts).
-Grammar: `^e\d+(\.(p1|p2|p|center|start|end|p\d+))?$`.
+`"e3.p1"`, `"e3.p2"` (line/slot endpoints), `"e3.center"` (circle/arc/ellipse/ellipse_arc),
+`"e3.start"`, `"e3.end"` (arc/ellipse_arc/parabola/conic endpoints), `"e3.p"` (point entity),
+`"e3.p0"…"e3.pN"` (spline pts); conic-family extras: `"e3.vertex"` (parabola),
+`"e3.apex"` (conic). Grammar: `^e\d+(\.(p1|p2|p|center|start|end|vertex|apex|p\d+))?$`.
 
 ### 3.3 Constraints
 

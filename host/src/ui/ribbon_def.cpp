@@ -187,11 +187,11 @@ static const RibbonCmd kCmds[] = {
     { "sk_circle_perimeter", "Perim. Circle",   "circle_perimeter", "Sketch", "Draw", false, "sk_circle",      false },
 
     // --- Slot flyout (parent: sk_slot) ---
-    // C28-B: centerpoint straight slot implemented — enabled. Arc slots stay greyed: the slot
-    // entity schema is straight-only (p1,p2,width — no arc spine field), so they cannot be faked.
+    // C28-B: centerpoint straight slot implemented. C30-B: arc slots implemented (arc_slot entity,
+    // arc-spine capsule) — enabled.
     { "sk_slot_ctr_str",     "Ctr. Str. Slot",  "slot_ctr_str",     "Sketch", "Draw", false, "sk_slot",        false },
-    { "sk_slot_arc_3pt",     "3Pt Arc Slot",    "slot_arc_3pt",     "Sketch", "Draw", false, "sk_slot",        true  },
-    { "sk_slot_arc_ctr",     "Ctr. Arc Slot",   "slot_arc_ctr",     "Sketch", "Draw", false, "sk_slot",        true  },
+    { "sk_slot_arc_3pt",     "3Pt Arc Slot",    "slot_arc_3pt",     "Sketch", "Draw", false, "sk_slot",        false },
+    { "sk_slot_arc_ctr",     "Ctr. Arc Slot",   "slot_arc_ctr",     "Sketch", "Draw", false, "sk_slot",        false },
 
     // --- Spline flyout (parent: sk_spline) ---
     { "sk_spline_style",     "Style Spline",    "spline_style",     "Sketch", "Draw", false, "sk_spline",      true  },

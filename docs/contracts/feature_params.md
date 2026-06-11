@@ -114,6 +114,18 @@
 - compiler: `features/dress.py::compile_fillet`; **auto-clamp retry** (halve ×3, floor 0.2 mm,
   warning surfaced) — generalizes the proven `kernel._wrap_edge_op` behavior.
 
+#### `fillet` — C30-A additions (implemented; variable size)
+- Optional `radius2: dim` (absent/0/equal-to-radius → constant path, untouched). When present and
+  `!= radius`, the fillet becomes **variable size**: `radius` applies at each edge's START vertex,
+  `radius2` at its END vertex, with a linear radius law between them. build123d has no
+  variable-radius wrapper, so this path drops to raw OCP `BRepFilletAPI_MakeFillet.Add(r1, r2,
+  edge)` and re-wraps the result as a build123d `Solid`.
+- Edge START/END come from OCCT topology direction and may feel arbitrary (SolidWorks shows a
+  draggable handle per vertex; v1 exposes the two numbers and documents this honestly — to flip
+  which end gets which radius, swap the two values).
+- Auto-clamp retry: on OCCT failure, BOTH radii halve in lockstep (×3, floor 0.2 mm on either).
+- `resolved` gains `radius2` (effective end radius after any clamping) on the variable path.
+
 ### `chamfer`
 - params: `length: dim` (1) · `kind: "equal"` (frozen v1; `two_dist`/`dist_angle` reserved)
 - refs: `edges: [sel(edge)]`

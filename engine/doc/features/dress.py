@@ -18,7 +18,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from build123d import fillet as b3d_fillet, chamfer as b3d_chamfer, offset
+from build123d import fillet as b3d_fillet, chamfer as b3d_chamfer, offset, Solid
+from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
 
 from .base import CompileContext, CompileOutput, FeatureError, register
 from engine.doc.selectors import (
@@ -163,6 +164,23 @@ def _resolve_faces(
 # --------------------------------------------------------------------------- fillet
 
 
+def _variable_fillet(body, edges, r1: float, r2: float):
+    """Apply a linear-law variable-radius fillet (r1 at edge start, r2 at end).
+
+    build123d has no variable-radius wrapper, so drop to raw OCP:
+    BRepFilletAPI_MakeFillet.Add(r1, r2, edge) sets a linear radius law per edge.
+    Result is re-wrapped as a build123d Solid (matches revolve.py's OCP→Solid path).
+    Raises on IsDone()==False so the caller's clamp loop can retry.
+    """
+    mk = BRepFilletAPI_MakeFillet(body.wrapped)
+    for e in edges:
+        mk.Add(r1, r2, e.wrapped)
+    mk.Build()
+    if not mk.IsDone():
+        raise RuntimeError("BRepFilletAPI_MakeFillet IsDone=False")
+    return Solid(mk.Shape()).clean()
+
+
 @register("fillet")
 def compile_fillet(feat: dict, ctx: CompileContext) -> CompileOutput:
     p = feat.get("params", {})
@@ -171,6 +189,10 @@ def compile_fillet(feat: dict, ctx: CompileContext) -> CompileOutput:
     radius = ctx.dim(p, "radius", 2.0)
     if radius <= 0.0:
         raise FeatureError("fillet radius must be > 0")
+
+    # Optional variable-radius end value. 0 / missing / equal to radius → constant.
+    radius2_raw = ctx.dim(p, "radius2", 0.0) if "radius2" in p else 0.0
+    variable = radius2_raw > 0.0 and abs(radius2_raw - radius) > 1e-9
 
     bodies = list(ctx.bodies)
     if not bodies:
@@ -193,16 +215,22 @@ def compile_fillet(feat: dict, ctx: CompileContext) -> CompileOutput:
     warnings: list[str] = []
     result_body = None
     r = radius
+    r2 = radius2_raw if variable else None
     last_err: Exception | None = None
 
-    # Auto-clamp retry: halve ×3, floor 0.2 mm
+    # Auto-clamp retry: halve ×3, floor 0.2 mm (both radii in lockstep when variable)
     for attempt in range(4):  # 0 = original, 1-3 = clamped
         if attempt > 0:
             r = r / 2.0
-            if r < 0.2:
+            if r2 is not None:
+                r2 = r2 / 2.0
+            if r < 0.2 or (r2 is not None and r2 < 0.2):
                 break
         try:
-            result_body = b3d_fillet(edges, radius=r)
+            if r2 is not None:
+                result_body = _variable_fillet(body, edges, r, r2)
+            else:
+                result_body = b3d_fillet(edges, radius=r)
             if attempt > 0:
                 warnings.append(
                     f"fillet radius {radius:g} mm too large; auto-clamped to {r:g} mm"
@@ -219,6 +247,8 @@ def compile_fillet(feat: dict, ctx: CompileContext) -> CompileOutput:
         )
 
     resolved: dict[str, float] = {"radius": r}
+    if r2 is not None:
+        resolved["radius2"] = r2
     if warnings:
         resolved["_warning"] = 1.0  # token so the warning text can ride in resolved
 

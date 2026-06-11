@@ -151,6 +151,11 @@ void SketchMode::applyEnterResult(const nlohmann::json& res) {
             se.end = e.value("end", 0.0f);
             se.ccw = e.value("ccw", true);
             se.width = e.value("width", 0.0f);
+            if (se.type == "arc_slot") {   // arc_slot stores spine angles as a0/a1 (CCW)
+                se.start = e.value("a0", 0.0f);
+                se.end = e.value("a1", 0.0f);
+                se.ccw = true;
+            }
             ents_.push_back(se);
         }
     }
@@ -368,6 +373,8 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sk_parallelogram")   { resetTool(); tool_ = SketchTool::Parallelogram;  return true; }
     if (cmdId == "sk_circle_perimeter"){ resetTool(); tool_ = SketchTool::CirclePerimeter;return true; }
     if (cmdId == "sk_slot_ctr_str")    { resetTool(); tool_ = SketchTool::SlotCtrStr;     return true; }
+    if (cmdId == "sk_slot_arc_ctr")    { resetTool(); tool_ = SketchTool::SlotArcCtr;     return true; }
+    if (cmdId == "sk_slot_arc_3pt")    { resetTool(); tool_ = SketchTool::SlotArc3pt;     return true; }
     if (cmdId == "sk_ellipse_partial") { resetTool(); tool_ = SketchTool::EllipsePartial; return true; }
     if (cmdId == "sk_parabola")        { resetTool(); tool_ = SketchTool::Parabola;       return true; }
     if (cmdId == "sk_conic")           { resetTool(); tool_ = SketchTool::Conic;          return true; }
@@ -376,8 +383,6 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sk_extend")          { resetTool(); tool_ = SketchTool::Extend;         return true; }
     if (cmdId == "sk_offset_ent")      { resetTool(); tool_ = SketchTool::Offset;
                                          offsetStage_ = 0; offsetChain_.clear();           return true; }
-    // sk_slot_arc_3pt / sk_slot_arc_ctr intentionally NOT handled: the slot entity schema is
-    // straight-only (p1,p2,width — no arc spine), so they stay greyed (see ribbon_def.cpp).
     return false;
 }
 
@@ -406,7 +411,7 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle) const {
         if (e.type == "line" || e.type == "slot") {
             consider(e.id + ".p1", e.p1[0], e.p1[1]);
             consider(e.id + ".p2", e.p2[0], e.p2[1]);
-        } else if (e.type == "circle" || e.type == "arc") {
+        } else if (e.type == "circle" || e.type == "arc" || e.type == "arc_slot") {
             consider(e.id + ".center", e.center[0], e.center[1]);
         } else if (e.type == "point") {
             consider(e.id + ".p", e.p1[0], e.p1[1]);
@@ -427,7 +432,7 @@ int SketchMode::hitTestHandle(const ImVec2& s, std::string& handleOut, float& uO
         if (e.type == "line" || e.type == "slot") {
             consider(e.id + ".p1", e.p1[0], e.p1[1]);
             consider(e.id + ".p2", e.p2[0], e.p2[1]);
-        } else if (e.type == "circle" || e.type == "arc") {
+        } else if (e.type == "circle" || e.type == "arc" || e.type == "arc_slot") {
             consider(e.id + ".center", e.center[0], e.center[1]);
         } else if (e.type == "point") {
             consider(e.id + ".p", e.p1[0], e.p1[1]);
@@ -565,6 +570,36 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             float rpx = std::hypot(wEnd.x - a.x, wEnd.y - a.y);
             dl->AddCircle(a, rpx, cc, 24, th);
             dl->AddCircle(b, rpx, cc, 24, th);
+        } else if (e.type == "arc_slot") {
+            // Capsule outline around a circular spine (center, radius; CCW a0->a1 in start/end).
+            // Outer arc (r+hw), inner arc (r-hw), and a half-circle cap at each spine endpoint.
+            const float D2R = 3.14159265f / 180.0f;
+            float hw = e.width * 0.5f;
+            float a0 = e.start, a1 = e.end; if (a1 < a0) a1 += 360.0f;
+            auto arcPoly = [&](float rad) {
+                ImVec2 prev; int seg = 64;
+                for (int i = 0; i <= seg; ++i) {
+                    float a = (a0 + (a1 - a0) * (i / (float)seg)) * D2R;
+                    ImVec2 p = uvToScreen(e.center[0] + rad * std::cos(a),
+                                          e.center[1] + rad * std::sin(a));
+                    if (i) dl->AddLine(prev, p, cc, th); prev = p;
+                }
+            };
+            arcPoly(e.radius + hw);
+            arcPoly(e.radius - hw);
+            // End-cap half-circles centered on the spine endpoints, radius hw.
+            auto cap = [&](float aDeg) {
+                float sa = aDeg * D2R;
+                float sx = e.center[0] + e.radius * std::cos(sa);
+                float sy = e.center[1] + e.radius * std::sin(sa);
+                ImVec2 prev; int seg = 24;
+                for (int i = 0; i <= seg; ++i) {
+                    float t = (aDeg - 90.0f + 180.0f * (i / (float)seg)) * D2R;
+                    ImVec2 p = uvToScreen(sx + hw * std::cos(t), sy + hw * std::sin(t));
+                    if (i) dl->AddLine(prev, p, cc, th); prev = p;
+                }
+            };
+            cap(e.start); cap(e.end);
         } else if (e.type == "point") {
             dl->AddCircleFilled(uvToScreen(e.p1[0], e.p1[1]), 3.5f, cc);
         }
@@ -820,6 +855,30 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     dl->AddLine(uvToScreen(uv[i - 1].x, uv[i - 1].y),
                                 uvToScreen(uv[i].x, uv[i].y), uCol, 1.6f);
             };
+            // Arc-slot capsule preview: outer/inner arcs (r+/-hw, a0..a1 deg CCW) + two end caps.
+            auto drawCapsule = [&](float cu, float cv, float rad, float a0d, float a1d, float hw) {
+                const float D2R = 3.14159265f / 180.0f;
+                if (a1d < a0d) a1d += 360.0f;
+                auto arcPoly = [&](float rr) {
+                    ImVec2 prev;
+                    for (int i = 0; i <= 64; ++i) {
+                        float a = (a0d + (a1d - a0d) * (i / 64.0f)) * D2R;
+                        ImVec2 q = uvToScreen(cu + rr * std::cos(a), cv + rr * std::sin(a));
+                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                    }
+                };
+                arcPoly(rad + hw); arcPoly(rad - hw);
+                auto cap = [&](float aDeg) {
+                    float sx = cu + rad * std::cos(aDeg * D2R), sy = cv + rad * std::sin(aDeg * D2R);
+                    ImVec2 prev;
+                    for (int i = 0; i <= 24; ++i) {
+                        float t = (aDeg - 90.0f + 180.0f * (i / 24.0f)) * D2R;
+                        ImVec2 q = uvToScreen(sx + hw * std::cos(t), sy + hw * std::sin(t));
+                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                    }
+                };
+                cap(a0d); cap(a1d);
+            };
             const size_t n = toolUV_.size();
             if (tool_ == SketchTool::Rect3ptCorner && n >= 1) {
                 ImVec2 A = toolUV_[0];
@@ -890,6 +949,46 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     float rpx = std::hypot(wEnd.x - a.x, wEnd.y - a.y);
                     dl->AddCircle(a, rpx, uCol, 24, 1.6f);
                     dl->AddCircle(b, rpx, uCol, 24, 1.6f);
+                }
+            } else if (tool_ == SketchTool::SlotArcCtr && n >= 1) {
+                // click 1 = arc center; 2 = spine start (sets radius+a0); 3 = spine end (a1);
+                // 4 = width. Live preview at each stage with the snapped cursor.
+                const float R2D = 57.29577951f;
+                ImVec2 ctr = toolUV_[0];
+                dl->AddCircleFilled(uvToScreen(ctr.x, ctr.y), 3.0f, uCol);
+                if (n < 2) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, 1.6f); }
+                else {
+                    ImVec2 s0 = toolUV_[1];
+                    float rad = std::hypot(s0.x - ctr.x, s0.y - ctr.y);
+                    float a0 = std::atan2(s0.y - ctr.y, s0.x - ctr.x) * R2D;
+                    ImVec2 endPt = (n >= 3) ? toolUV_[2] : ImVec2(su, sv);
+                    float a1 = std::atan2(endPt.y - ctr.y, endPt.x - ctr.x) * R2D;
+                    float hw = 0.0f;
+                    if (n >= 3) {  // width stage: perp distance of cursor from the spine radius
+                        hw = std::fabs(std::hypot(su - ctr.x, sv - ctr.y) - rad);
+                        if (hw < 1e-3f) hw = rad * 0.15f;
+                    } else { hw = rad * 0.15f; }
+                    drawCapsule(ctr.x, ctr.y, rad, a0, a1, hw);
+                }
+            } else if (tool_ == SketchTool::SlotArc3pt && n >= 1) {
+                // clicks 1,2,3 = points ON the spine arc (circumcircle); 4 = width.
+                const float R2D = 57.29577951f;
+                std::vector<ImVec2> pts;
+                for (size_t i = 0; i < n && i < 3; ++i) pts.push_back(toolUV_[i]);
+                if (pts.size() < 3) pts.push_back(ImVec2(su, sv));
+                for (auto& q : pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), 3.0f, uCol);
+                float cu, cv, rad;
+                if (circumcircle(pts[0], pts[1], pts[2], cu, cv, rad)) {
+                    float a0 = std::atan2(pts[0].y - cv, pts[0].x - cu) * R2D;
+                    float amid = std::atan2(pts[1].y - cv, pts[1].x - cu) * R2D;
+                    float a1 = std::atan2(pts[2].y - cv, pts[2].x - cu) * R2D;
+                    // Choose CCW a0->a1 that passes through the middle pick.
+                    auto norm = [](float a) { while (a < 0) a += 360.0f; while (a >= 360.0f) a -= 360.0f; return a; };
+                    float sweep = norm(a1 - a0), midSw = norm(amid - a0);
+                    if (midSw > sweep) { float t = a0; a0 = a1; a1 = t; }  // go the other way
+                    float hw = (n >= 3) ? std::fabs(std::hypot(su - cu, sv - cv) - rad) : rad * 0.15f;
+                    if (hw < 1e-3f) hw = rad * 0.15f;
+                    drawCapsule(cu, cv, rad, a0, a1, hw);
                 }
             } else if (tool_ == SketchTool::EllipsePartial && n >= 1) {
                 ImVec2 ctr = toolUV_[0];
@@ -1138,6 +1237,49 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     {"p2", nlohmann::json::array({e2.x, e2.y})}, {"width", w * 2.0f}};
                 addEntity(st, ent, nlohmann::json::array());
                 resetTool();
+            } else if (tool_ == SketchTool::SlotArcCtr && toolUV_.size() == 4) {
+                // center, spine start (radius+a0), spine end dir (a1), width.
+                const float R2D = 57.29577951f;
+                ImVec2 ctr = toolUV_[0], s0 = toolUV_[1], endPt = toolUV_[2], wpk = toolUV_[3];
+                float rad = std::hypot(s0.x - ctr.x, s0.y - ctr.y);
+                if (rad < 1e-4f) { st.addLog("[sketch] Arc Slot: center == start"); resetTool(); }
+                else {
+                    float a0 = std::atan2(s0.y - ctr.y, s0.x - ctr.x) * R2D;
+                    float a1 = std::atan2(endPt.y - ctr.y, endPt.x - ctr.x) * R2D;
+                    if (a1 <= a0) a1 += 360.0f;            // enforce CCW a0 -> a1
+                    // width = total capsule width = 2 * |dist(wpk, center) - radius|.
+                    float w = 2.0f * std::fabs(std::hypot(wpk.x - ctr.x, wpk.y - ctr.y) - rad);
+                    if (w < 1e-3f || w >= 2.0f * rad) w = std::fmin(rad * 0.3f, rad * 0.9f);
+                    nlohmann::json ent = {{"type", "arc_slot"},
+                        {"center", nlohmann::json::array({ctr.x, ctr.y})},
+                        {"radius", rad}, {"a0", a0}, {"a1", a1}, {"width", w}};
+                    addEntity(st, ent, nlohmann::json::array());
+                    resetTool();
+                }
+            } else if (tool_ == SketchTool::SlotArc3pt && toolUV_.size() == 4) {
+                // 3 points on the spine arc (circumcircle), then width.
+                const float R2D = 57.29577951f;
+                float cu, cv, rad;
+                if (!circumcircle(toolUV_[0], toolUV_[1], toolUV_[2], cu, cv, rad)) {
+                    st.addLog("[sketch] 3Pt Arc Slot: 3 points are collinear — pick a 3rd off the line");
+                    toolUV_.pop_back(); toolSnaps_.pop_back();   // drop the width pick, keep retrying
+                } else {
+                    ImVec2 p0 = toolUV_[0], pm = toolUV_[1], p2 = toolUV_[2], wpk = toolUV_[3];
+                    float a0 = std::atan2(p0.y - cv, p0.x - cu) * R2D;
+                    float amid = std::atan2(pm.y - cv, pm.x - cu) * R2D;
+                    float a1 = std::atan2(p2.y - cv, p2.x - cu) * R2D;
+                    auto norm = [](float a) { while (a < 0) a += 360.0f; while (a >= 360.0f) a -= 360.0f; return a; };
+                    float sweep = norm(a1 - a0), midSw = norm(amid - a0);
+                    if (midSw > sweep) { float t = a0; a0 = a1; a1 = t; }  // CCW must pass thru mid
+                    if (a1 <= a0) a1 += 360.0f;
+                    float w = 2.0f * std::fabs(std::hypot(wpk.x - cu, wpk.y - cv) - rad);
+                    if (w < 1e-3f || w >= 2.0f * rad) w = std::fmin(rad * 0.3f, rad * 0.9f);
+                    nlohmann::json ent = {{"type", "arc_slot"},
+                        {"center", nlohmann::json::array({cu, cv})},
+                        {"radius", rad}, {"a0", a0}, {"a1", a1}, {"width", w}};
+                    addEntity(st, ent, nlohmann::json::array());
+                    resetTool();
+                }
             } else if (tool_ == SketchTool::EllipsePartial && toolUV_.size() == 5) {
                 // center, rx point, ry/rot point, start-angle, end-angle.
                 ImVec2 ctr = toolUV_[0], rxp = toolUV_[1], ryp = toolUV_[2];
@@ -1282,6 +1424,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          tool_ == SketchTool::Parallelogram ? "Parallelogram" :
                          tool_ == SketchTool::CirclePerimeter ? "Perimeter Circle" :
                          tool_ == SketchTool::SlotCtrStr ? "Centerpoint Slot" :
+                         tool_ == SketchTool::SlotArcCtr ? "Centerpoint Arc Slot" :
+                         tool_ == SketchTool::SlotArc3pt ? "3 Point Arc Slot" :
                          tool_ == SketchTool::EllipsePartial ? "Partial Ellipse" :
                          tool_ == SketchTool::Parabola ? "Parabola" :
                          tool_ == SketchTool::Conic ? "Conic" :
@@ -1302,6 +1446,11 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 step = n < 3 ? "click 3 points on the circumference" : nullptr; break;
             case SketchTool::SlotCtrStr:
                 step = n == 0 ? "click center" : n == 1 ? "click end (length/dir)" : "click width"; break;
+            case SketchTool::SlotArcCtr:
+                step = n == 0 ? "click arc center" : n == 1 ? "click spine start" :
+                       n == 2 ? "click spine end" : "click width"; break;
+            case SketchTool::SlotArc3pt:
+                step = n < 3 ? "click 3 points on the arc spine" : "click width"; break;
             case SketchTool::EllipsePartial:
                 step = n == 0 ? "click center" : n == 1 ? "click major (rx/rot)" :
                        n == 2 ? "click minor (ry)" : n == 3 ? "click start angle" : "click end angle"; break;

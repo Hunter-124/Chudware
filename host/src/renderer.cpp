@@ -45,7 +45,29 @@ uniform sampler2D uLut;   // 256x1 jet ramp
 uniform int   uClipCount;              // C28-C: 0 = off; 1..3 active planes
 uniform vec3  uClipN[3];               // plane normals
 uniform float uClipOff[3];            // plane offsets
+uniform float uRealView;               // C30-C: 0 = off, 1 = environment reflections on
 out vec4 frag;
+
+// C30-C: procedural studio environment sampled by a reflected direction R (Z-up world).
+// Vertical gradient (near-white sky overhead, neutral grey at the horizon band, a soft darker
+// floor below) plus a few elongated "softbox" lobes — the classic RealView look that makes a
+// surface read as real material instead of flat plastic. Pure math, no textures.
+vec3 env(vec3 R){
+    float up = R.z;                                  // -1 (down) .. +1 (up)
+    vec3 sky   = vec3(0.97, 0.98, 1.00);
+    vec3 horiz = vec3(0.66, 0.68, 0.72);
+    vec3 floorC= vec3(0.30, 0.30, 0.32);
+    vec3 c = (up >= 0.0) ? mix(horiz, sky, smoothstep(0.0, 0.55, up))
+                         : mix(horiz, floorC, smoothstep(0.0, -0.45, up));
+    // Soft elongated softbox highlights at fixed studio directions (wide in azimuth, tight in tilt).
+    vec3 d1 = normalize(vec3(-0.35,  0.30, 0.88));   // big overhead-left key softbox
+    vec3 d2 = normalize(vec3( 0.62,  0.10, 0.55));   // right fill softbox
+    float l1 = smoothstep(0.62, 0.985, dot(R, d1));
+    float l2 = smoothstep(0.70, 0.990, dot(R, d2)) * 0.6;
+    c += vec3(l1 + l2);                               // additive bright lobes (clamped on mix)
+    return c;
+}
+
 void main(){
     for (int ci = 0; ci < uClipCount; ++ci)
         if (dot(vPos, uClipN[ci]) > uClipOff[ci]) discard;
@@ -83,9 +105,18 @@ void main(){
     vec3 rimLight = rimCol * (rim * edge * 0.10);
 
     vec3 H = normalize(normalize(uKeyDir) + V);
-    float spec = pow(max(dot(N, H), 0.0), 56.0) * 0.16;
+    float spec = pow(max(dot(N, H), 0.0), 56.0) * 0.13;
 
     vec3 c = base * (diffuse + ambient) + rimLight + keyCol * spec;
+
+    // C30-C: RealView environment sheen. Schlick fresnel (F0=0.04 dielectric) weights a procedural
+    // studio reflection — a whisper on flat faces, a clear pickup at grazing angles. Gated off for
+    // the FEA colormap path so results stay readable. k kept low so plastic/aluminum, not chrome.
+    if (uRealView > 0.5 && uUseScalar == 0) {
+        float fres = 0.04 + 0.96 * pow(1.0 - max(dot(N, V), 0.0), 5.0);
+        vec3 R = reflect(-V, N);
+        c += pow(env(R), vec3(2.2)) * fres * 0.42;   // env is sRGB-ish -> to linear before add
+    }
     c = pow(max(c, 0.0), vec3(1.0 / 2.2));  // linear -> sRGB
     frag = vec4(c, 1.0);
 })";
@@ -628,6 +659,7 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
             glUniform1fv(glGetUniformLocation(prog_, "uClipOff"), cnt, section_.offsets);
         }
     }
+    glUniform1f(glGetUniformLocation(prog_, "uRealView"), realView_ ? 1.0f : 0.0f);  // C30-C
 
     // Solids, pushed back a touch so the feature edges win the depth test on top of them.
     // In HLR styles the faces are painted in the background color so they only occlude (depth) —
@@ -791,6 +823,7 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px) {
     glUniform3f(glGetUniformLocation(prog_, "uCamPos"), eye.x, eye.y, eye.z);
     glUniform1i(glGetUniformLocation(prog_, "uUseScalar"), 0);
     glUniform1i(glGetUniformLocation(prog_, "uClipCount"), 0);  // thumbnail: no section clip
+    glUniform1f(glGetUniformLocation(prog_, "uRealView"), 1.0f);  // C30-C: reflections on in previews
     int colorLoc = glGetUniformLocation(prog_, "uColor");
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(1.0f, 1.0f);

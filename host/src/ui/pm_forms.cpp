@@ -102,12 +102,18 @@ static const std::vector<PMFormDef>& forms() {
             Check ("flip",     "Reverse direction", "Direction", false),
             Check ("merge",    "Merge result",   "Options",   true),
         }},
-        // --- fillet ---  radius ; edges[]
-        //   Engine (dress.py): radius only. SW shows tangent propagation, profile type, etc.
-        //   Controls the engine lacks are added disabled with "(coming soon)" for discoverability.
+        // --- fillet ---  radius / [radius2] ; edges[]
+        //   C30-A: variable-size fillet. A ComboL "type" (constant|variable) gates radius2 via the
+        //   existing DimIf/enableKey mechanism — mirrors the chamfer Symmetric|Asymmetric gating.
+        //   "type" is UI-only; the engine keys off radius2 (absent/equal => constant path).
+        //   tangent_prop/full_round remain disabled "(coming soon)" for discoverability.
         { "fillet", "Fillet", "fillet", {
             Well      ("edges",      "Edges",              "Items to Fillet",    K_EDGE, true),
+            ComboL    ("type",       "Fillet Type",        "Fillet Parameters",
+                       "constant|variable", "Constant Size|Variable Size"),
             Dim       ("radius",     "Radius",             "Fillet Parameters",  2.0),
+            DimIf     ("radius2",    "End Radius",         "Fillet Parameters",  2.0,
+                       "type", "variable"),
             CheckSoon ("tangent_prop","Tangent propagation (coming soon)", "Fillet Parameters"),
             CheckSoon ("full_round", "Full round fillet (coming soon)",    "Fillet Parameters"),
         }},

@@ -83,6 +83,7 @@ A sketch is a feature (`type:"sketch"`) with `refs.plane` = selector-or-datum an
 | `conic` (S) | `p0:[x,y]`, `p1:[x,y]`, `apex:[x,y]`, `rho:0..1` (SolidWorks conic: endpoints + tangent-intersection `apex` + `rho`; rendered as rational quadratic Bézier with apex weight `w=rho/(1−rho)`) |
 | `spline` | `points:[[x,y],…]` (cubic through-points) |
 | `slot` | `p1:[x,y]`, `p2:[x,y]`, `width:w` (straight slot, arc caps) |
+| `arc_slot` (S) | `center:[x,y]`, `radius:r`, `a0:deg`, `a1:deg`, `width:w` (arc-spine slot: spine = circular arc, center/radius, CCW `a0`→`a1` like `arc`; capsule of total width `w` around it. `radius − w/2 > 0` required) |
 | `text` (S) | `p:[x,y]`, `text:str`, `height:mm` |
 
 All entities carry `construction:bool` (construction geometry never forms profile regions).
@@ -97,11 +98,18 @@ geometry: ellipse_arc → trimmed `Edge.make_ellipse`; parabola → cubic spline
 points; conic → `Edge.make_bezier` with weights (sampled-spline fallback). All closed loops
 containing these still build region faces.
 
+**Arc-slot solver support (C30-B):** `arc_slot` participates in the solve with 6 DOF
+(`cx,cy,r,a0,a1,w`). Spine-endpoint handles `start`/`end` carry analytic partials (like `arc`).
+Supported relations: `coincident` (on `center`/`start`/`end`) and `fix` (on any handle); all
+others are skipped-silently (same convention as the conic family). b3d region geometry: a closed
+capsule wire (outer arc `r+w/2`, end-cap half-circle `w/2`, inner arc `r−w/2` reversed, start cap);
+`radius − w/2 ≤ 0` raises a FeatureError.
+
 ### 3.2 Handles
 
 Constraint references use **handles**: `"e3"` = whole entity; point sub-refs:
 `"e3.p1"`, `"e3.p2"` (line/slot endpoints), `"e3.center"` (circle/arc/ellipse/ellipse_arc),
-`"e3.start"`, `"e3.end"` (arc/ellipse_arc/parabola/conic endpoints), `"e3.p"` (point entity),
+`"e3.start"`, `"e3.end"` (arc/ellipse_arc/parabola/conic/arc_slot endpoints; for `arc_slot` these are the derived spine endpoints), `"e3.p"` (point entity),
 `"e3.p0"…"e3.pN"` (spline pts); conic-family extras: `"e3.vertex"` (parabola),
 `"e3.apex"` (conic). Grammar: `^e\d+(\.(p1|p2|p|center|start|end|vertex|apex|p\d+))?$`.
 

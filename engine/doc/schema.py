@@ -56,6 +56,7 @@ ENTITY_FIELDS: dict[str, list[str]] = {
     "conic": ["p0", "p1", "apex", "rho"],
     "spline": ["points"],
     "slot": ["p1", "p2", "width"],
+    "arc_slot": ["center", "radius", "a0", "a1", "width"],  # C30-B: arc-spine slot
     "text": ["p", "text", "height"],
 }
 
@@ -70,6 +71,7 @@ _ENTITY_SUBS: dict[str, set[str]] = {
     "parabola": {"vertex", "start", "end"},
     "conic": {"start", "end", "apex"},
     "slot": {"p1", "p2"},
+    "arc_slot": {"center", "start", "end"},  # C30-B: derived spine endpoints
     "text": {"p"},
     # spline handled specially (p0..pN)
 }

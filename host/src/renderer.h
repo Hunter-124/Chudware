@@ -67,6 +67,8 @@ public:
     void setDefaultPartColor(float r, float g, float b);
     // Soft contact-shadow blob color + peak alpha (alpha falls to 0 at the blob rim).
     void setGroundShadow(float r, float g, float b, float maxAlpha);
+    // C30-C: RealView-style procedural environment reflections on shaded faces (0=off, 1=on).
+    void setRealView(bool on) { realView_ = on; }
     void setDisplayStyle(DisplayStyle s) { displayStyle_ = s; }
     DisplayStyle displayStyle() const { return displayStyle_; }
     void renderView(const std::string& view);            // "iso"|"front"|"right"|"top"
@@ -202,6 +204,7 @@ private:
     float edgeWidthPx_ = 1.6f;
     float defaultPart_[3] = {0.776f, 0.792f, 0.847f};
     float groundShadow_[4] = {0.20f, 0.22f, 0.26f, 0.35f};
+    bool realView_ = true;  // C30-C: environment-reflection sheen (uRealView in kFrag)
     DisplayStyle displayStyle_ = DisplayStyle::ShadedEdges;
     std::vector<Sub> subs_;
     Vec3 center_;

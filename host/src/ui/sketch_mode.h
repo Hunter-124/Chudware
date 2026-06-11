@@ -31,6 +31,7 @@ enum class SketchTool {
     Rect3ptCorner, Rect3ptCenter, Parallelogram,   // -> 4 lines
     CirclePerimeter,                                // -> 1 circle (circumcircle of 3 pts)
     SlotCtrStr,                                     // -> 1 slot (centerpoint input)
+    SlotArcCtr, SlotArc3pt,                          // -> 1 arc_slot (C30-B; arc-spine capsule)
     // Conic family (engine contract C28-A: ellipse_arc / parabola / conic entities):
     EllipsePartial, Parabola, Conic,
     // C29-B sketch-editing tools (engine contract C29-A: sketch_trim/extend/offset ops):
@@ -40,16 +41,16 @@ enum class SketchTool {
 // One solved entity in the active sketch (mirrors a worker sketch_enter/solve entity record).
 struct SketchEntity {
     std::string id;
-    std::string type;            // line|circle|arc|slot|point|ellipse|spline
+    std::string type;            // line|circle|arc|slot|arc_slot|point|ellipse|spline
     std::string status;          // under|full|over (from the solver)
     bool construction = false;
     // Coordinate payload (sketch-plane u,v). Only the fields for `type` are populated.
     float p1[2] = {0, 0}, p2[2] = {0, 0};   // line/slot endpoints
-    float center[2] = {0, 0};               // circle/arc/ellipse
+    float center[2] = {0, 0};               // circle/arc/ellipse/arc_slot
     float radius = 0;
-    float start = 0, end = 0;               // arc angles (deg)
+    float start = 0, end = 0;               // arc angles (deg); arc_slot reuses these for a0/a1
     bool ccw = true;
-    float width = 0;                        // slot
+    float width = 0;                        // slot/arc_slot
 };
 
 class SketchMode {

@@ -211,6 +211,9 @@ def _entity_to_edges(ent: dict) -> list[Any]:
         except Exception:  # noqa: BLE001
             return []
 
+    elif etype == "arc_slot":
+        return _arc_slot_edges(ent)
+
     elif etype == "spline":
         pts = ent.get("points", [])
         if len(pts) < 2:
@@ -295,6 +298,54 @@ def _entity_to_edges(ent: dict) -> list[Any]:
 
     # Unknown or "point" entity (no geometry)
     return []
+
+
+# --------------------------------------------------------------------------- arc slot
+
+
+def _arc_slot_edges(ent: dict) -> list[Any]:
+    """Build the closed capsule wire of an arc-spine slot (C30-B).
+
+    Spine = circular arc (center, radius r, CCW a0->a1 deg). The capsule is the
+    set of points within w/2 of the spine: outer arc (r+w/2), an end-cap
+    half-circle at the a1 spine end, the inner arc (r-w/2) reversed, and a
+    start-cap half-circle at the a0 spine end. Mirrors `slot` (lines + two cap
+    arcs) adapted to a curved spine.
+    """
+    cx, cy = _to_vec2(ent["center"], "center")
+    r = float(ent["radius"])
+    a0 = float(ent["a0"])
+    a1 = float(ent["a1"])
+    w = float(ent["width"])
+    hw = w / 2.0
+    if r - hw <= 1e-9:
+        raise FeatureError("arc slot width exceeds diameter")
+    if abs(a1 - a0) < 1e-9 or w <= 0:
+        return []
+    pl = Plane(origin=Vector(cx, cy, 0))
+    a0r = math.radians(a0)
+    a1r = math.radians(a1)
+
+    def _cap(a_rad: float, tangent_sign: float):
+        # Half-circle (radius hw) at the spine endpoint S = C + r*(cos a, sin a),
+        # connecting outer (r+hw) to inner (r-hw) bulging along +/- the spine tangent.
+        ca, sa = math.cos(a_rad), math.sin(a_rad)
+        sx, sy = cx + r * ca, cy + r * sa
+        outer = Vector(cx + (r + hw) * ca, cy + (r + hw) * sa, 0)
+        inner = Vector(cx + (r - hw) * ca, cy + (r - hw) * sa, 0)
+        # tangent of a CCW arc at angle a is (-sin a, cos a); cap bulges along it.
+        tx, ty = -sa * tangent_sign, ca * tangent_sign
+        mid = Vector(sx + hw * tx, sy + hw * ty, 0)
+        return Edge.make_three_point_arc(outer, mid, inner)
+
+    try:
+        outer_arc = Edge.make_circle(r + hw, pl, start_angle=a0, end_angle=a1)
+        inner_arc = Edge.make_circle(r - hw, pl, start_angle=a0, end_angle=a1)
+        end_cap = _cap(a1r, +1.0)    # bulge forward (CCW travel direction)
+        start_cap = _cap(a0r, -1.0)  # bulge backward
+        return [outer_arc, end_cap, inner_arc, start_cap]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 # --------------------------------------------------------------------------- conic sampling

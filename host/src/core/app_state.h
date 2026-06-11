@@ -330,6 +330,7 @@ struct AppState {
     int  displayStyle  = 1;          // mirrors DisplayStyle enum; 0=Shaded 1=ShadedEdges(default) 2=HLR 3=HLV 4=Wire
     bool showTriad        = true;    // orientation triad, bottom-left of viewport
     bool showGroundShadow = true;    // soft contact-shadow blob
+    bool showRealView     = true;    // C30-C: procedural environment reflections (RealView sheen)
     // Viewport left-drag mode: 0=rotate (default), 1=pan.
     int  vpDragMode = 0;
     // One-shot flag: set by mouse_gestures right-click-without-drag hook; consumed by viewport_panel.

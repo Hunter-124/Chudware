@@ -599,6 +599,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
                 ImGui::MenuItem("Origin Triad",  nullptr, &st.showTriad);
                 ImGui::MenuItem("Ground Shadow", nullptr, &st.showGroundShadow);
+                ImGui::MenuItem("RealView reflections", nullptr, &st.showRealView);
                 ImGui::EndMenu();
             }
             ImGui::Separator();
@@ -803,6 +804,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     }
                     ImGui::MenuItem("Origin Triad",    nullptr, &st.showTriad);
                     ImGui::MenuItem("Ground Shadow",   nullptr, &st.showGroundShadow);
+                    ImGui::MenuItem("RealView reflections", nullptr, &st.showRealView);
                     ImGui::EndPopup();
                 }
                 ImGui::PopID();

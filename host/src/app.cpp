@@ -1560,6 +1560,7 @@ int run_gui(const char* screenshotPath) {
             float gsA = st.showGroundShadow ? ui::palette.groundShadow[3] : 0.0f;
             renderer.setGroundShadow(ui::palette.groundShadow[0], ui::palette.groundShadow[1],
                                      ui::palette.groundShadow[2], gsA);
+            renderer.setRealView(st.showRealView);  // C30-C: RealView environment reflections
             renderer.setPlaneColors(ui::palette.planeFill, ui::palette.planeOutline);
         }
 

@@ -10,6 +10,7 @@ Every sketch entity maps to a flat slice of a float64 variable vector x:
   arc      : [cx, cy, r, a0, a1]              (5 vars, a0/a1 in degrees)
   ellipse  : [cx, cy, rx, ry, rot]             (5 vars, rot in degrees)
   slot     : [p1x, p1y, p2x, p2y, w]          (5 vars)
+  arc_slot : [cx, cy, r, a0, a1, w]           (6 vars; a0/a1 deg, arc-spine slot)
   spline   : [x0, y0, x1, y1, ..., xN, yN]    (2*(N+1) vars)
 
   ellipse_arc : [cx, cy, rx, ry, rot, a0, a1]  (7 vars; ellipse + trim angles, deg)
@@ -166,6 +167,15 @@ def _allocate_entity(sys: System, entity: dict) -> np.ndarray:
         p2x, p2y = entity["p2"]
         w = entity["width"]
         return sys.add_vars(5, [p1x, p1y, p2x, p2y, w])
+
+    elif etype == "arc_slot":
+        # arc-spine slot: [cx, cy, r, a0, a1, w]  (a0/a1 in degrees, CCW a0->a1)
+        cx, cy = entity["center"]
+        r = entity["radius"]
+        a0 = entity["a0"]
+        a1 = entity["a1"]
+        w = entity["width"]
+        return sys.add_vars(6, [cx, cy, r, a0, a1, w])
 
     elif etype == "spline":
         pts = entity["points"]
@@ -434,6 +444,31 @@ def _resolve_handle(
                     lambda xs: np.eye(2))
         else:
             raise ValueError(f"Unknown sub-handle {sub!r} for slot {eid}")
+
+    elif etype == "arc_slot":
+        # variables: [cx, cy, r, a0, a1, w]; spine endpoints derived like arc.
+        if sub in (None, "center"):
+            idx = vidx[[0, 1]]
+            return (idx,
+                    lambda xs: np.array([xs[0], xs[1]]),
+                    lambda xs: np.eye(2))
+        elif sub in ("start", "end"):
+            ai = 3 if sub == "start" else 4
+            idx = vidx[[0, 1, 2, ai]]   # cx, cy, r, a
+            def _as_pt_val(xs):
+                cx, cy, r, a = xs
+                ar = a * _DEG
+                return np.array([cx + r * math.cos(ar), cy + r * math.sin(ar)])
+            def _as_pt_jac(xs):
+                cx, cy, r, a = xs
+                ar = a * _DEG
+                return np.array([
+                    [1.0, 0.0, math.cos(ar), -r * math.sin(ar) * _DEG],
+                    [0.0, 1.0, math.sin(ar),  r * math.cos(ar) * _DEG],
+                ])
+            return (idx, _as_pt_val, _as_pt_jac)
+        else:
+            raise ValueError(f"Unknown sub-handle {sub!r} for arc_slot {eid}")
 
     elif etype == "spline":
         # variables: [x0,y0, x1,y1, ...]
@@ -1197,7 +1232,7 @@ def _add_fix(sys, cid, handle, entities, var_map):
                 lambda xs, _tx=px, _ty=py: np.array([xs[0] - _tx, xs[1] - _ty]),
                 idx, lambda xs: np.eye(2), cid)
 
-    elif etype in ("ellipse_arc", "parabola", "conic"):
+    elif etype in ("ellipse_arc", "parabola", "conic", "arc_slot"):
         # Generic fix on any resolvable handle (center/start/end/apex/vertex):
         # pin the derived point to its current world position via _resolve_handle.
         vidx, vf, jf = _resolve_handle(handle, entities, var_map)
@@ -1234,6 +1269,9 @@ def _entity_init_slice(ent: dict) -> list:
         p1x, p1y = ent["p1"]
         apx, apy = ent["apex"]
         return [p0x, p0y, p1x, p1y, apx, apy, ent.get("rho", 0.5)]
+    if et == "arc_slot":
+        cx, cy = ent["center"]
+        return [cx, cy, ent["radius"], ent["a0"], ent["a1"], ent["width"]]
     return []
 
 
@@ -1564,6 +1602,16 @@ def _extract_entities(x: np.ndarray, entities_list: list, var_map: dict) -> Enti
                 "p1": [float(vals[0]), float(vals[1])],
                 "p2": [float(vals[2]), float(vals[3])],
                 "width": float(vals[4]),
+            }
+
+        elif etype == "arc_slot":
+            result[eid] = {
+                "type": "arc_slot",
+                "center": [float(vals[0]), float(vals[1])],
+                "radius": float(vals[2]),
+                "a0": float(vals[3]),
+                "a1": float(vals[4]),
+                "width": float(vals[5]),
             }
 
         elif etype == "spline":

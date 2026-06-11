@@ -626,6 +626,110 @@ def test_chamfer_asymmetric_resolved_has_length2() -> None:
     print(f"[chamfer-asym-resolved] resolved={s['resolved']}")
 
 
+# --------------------------------------------------------------------------- test 10: variable fillet
+
+
+def _one_box_edge_selector(box_size: float = 20.0) -> dict:
+    """Return a selector for a single vertical edge of a box of the given size."""
+    from engine.doc.selectors import describe_edges, make_selector
+
+    doc_box = _doc([_feat("f1", "box", {
+        "length": _dim(box_size), "width": _dim(box_size), "height": _dim(box_size),
+    })])
+    res0 = compile_document(doc_box)
+    body = res0.bodies[0]
+    infos = describe_edges(body.shape.wrapped)
+    vert = [i for i in infos if i.surf == "line" and i.axis is not None and abs(i.axis[2]) > 0.9]
+    assert vert, "need a vertical edge on box"
+    s = make_selector(vert[0])
+    s["owner_feature"] = "f1"
+    return s
+
+
+def _compile_fillet_vol(radius: float, radius2: float | None, sel: dict) -> tuple[bool, float, dict]:
+    """Compile a 20mm box + fillet on one edge. Returns (ok, volume, resolved)."""
+    p: dict = {"radius": _dim(radius)}
+    if radius2 is not None:
+        p["radius2"] = _dim(radius2)
+    doc = _doc([
+        _feat("f1", "box", {"length": _dim(20), "width": _dim(20), "height": _dim(20)}),
+        _feat("f2", "fillet", p, refs={"edges": [sel]}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f2")
+    if not s["ok"]:
+        return False, 0.0, s["resolved"]
+    return True, res.bodies[0].shape.volume, s["resolved"]
+
+
+def test_fillet_variable_size_builds_and_differs() -> None:
+    """Variable fillet (r 2 -> 6) builds; its volume is strictly between constant-2 and constant-6."""
+    sel = _one_box_edge_selector(20.0)
+
+    ok2, vol_c2, _ = _compile_fillet_vol(2.0, None, sel)
+    ok6, vol_c6, _ = _compile_fillet_vol(6.0, None, sel)
+    okv, vol_var, res_var = _compile_fillet_vol(2.0, 6.0, sel)
+
+    assert ok2 and ok6, f"constant fillets must build (c2={ok2}, c6={ok6})"
+    assert okv, "variable fillet (2->6) must build"
+
+    # Filleting rounds material OFF an edge: bigger radius removes more => smaller volume.
+    # So volume ordering is constant-6 < variable(2->6) < constant-2.
+    assert vol_c6 < vol_var < vol_c2, (
+        f"variable vol {vol_var:.2f} must be strictly between c6 {vol_c6:.2f} and c2 {vol_c2:.2f}"
+    )
+    assert "radius2" in res_var, f"variable fillet resolved should carry radius2; got {res_var}"
+    assert abs(res_var["radius2"] - 6.0) < 1e-6, f"radius2 should be 6.0; got {res_var['radius2']}"
+    print(f"[fillet-var] c2={vol_c2:.2f} > var(2->6)={vol_var:.2f} > c6={vol_c6:.2f}; "
+          f"resolved={res_var}")
+
+
+def test_fillet_variable_constant_when_equal() -> None:
+    """radius2 == radius takes the constant path (no radius2 in resolved)."""
+    sel = _one_box_edge_selector(20.0)
+    ok, vol, res = _compile_fillet_vol(2.0, 2.0, sel)
+    assert ok, "fillet with radius2==radius should build (constant path)"
+    assert "radius2" not in res, f"equal radii should not write radius2 to resolved; got {res}"
+    print(f"[fillet-var-equal] r2==r constant path vol={vol:.2f} resolved={res}")
+
+
+def test_fillet_variable_auto_clamps() -> None:
+    """Oversized variable fillet on a thin box auto-clamps both radii in lockstep, or hits floor."""
+    from engine.doc.selectors import describe_edges, make_selector
+
+    doc_box = _doc([_feat("f1", "box", {"length": _dim(20), "width": _dim(20), "height": _dim(5)})])
+    _assert_valid(doc_box)
+    res0 = compile_document(doc_box)
+    body = res0.bodies[0]
+    infos = describe_edges(body.shape.wrapped)
+    vert = [i for i in infos if i.surf == "line" and i.axis is not None and abs(i.axis[2]) > 0.5]
+    assert vert, "need a vertical edge to fillet"
+    sel = make_selector(vert[0])
+    sel["owner_feature"] = "f1"
+
+    # Radii 40 -> 80 are far too large for a 5mm-thick box.
+    doc2 = _doc([
+        _feat("f1", "box", {"length": _dim(20), "width": _dim(20), "height": _dim(5)}),
+        _feat("f2", "fillet", {"radius": _dim(40.0), "radius2": _dim(80.0)},
+              refs={"edges": [sel]}),
+    ])
+    _assert_valid(doc2)
+    res2 = compile_document(doc2)
+    s = _status(res2, "f2")
+    if s["ok"]:
+        # Auto-clamped: both radii reduced, ratio preserved (halved in lockstep).
+        r  = s["resolved"]["radius"]
+        r2 = s["resolved"]["radius2"]
+        assert r < 40.0 and r2 < 80.0, f"expected clamped radii, got r={r}, r2={r2}"
+        assert abs(r2 / r - 2.0) < 1e-6, f"lockstep clamp should keep 2:1 ratio; got {r}, {r2}"
+        print(f"[fillet-var-clamp] r=40->80 clamped to {r:.2f}->{r2:.2f}, ok")
+    else:
+        assert "fillet" in s["error"].lower() or "radius" in s["error"].lower(), \
+            f"expected fillet error, got: {s['error']}"
+        print(f"[fillet-var-clamp] r=40->80 hit clamp floor, error: {s['error'][:60]}")
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -645,6 +749,9 @@ def main() -> None:
     test_chamfer_symmetric_builds()
     test_chamfer_asymmetric_builds_and_differs()
     test_chamfer_asymmetric_resolved_has_length2()
+    test_fillet_variable_size_builds_and_differs()
+    test_fillet_variable_constant_when_equal()
+    test_fillet_variable_auto_clamps()
     print("\nFEATURES1 TESTS PASSED")
 
 

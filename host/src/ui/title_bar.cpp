@@ -44,20 +44,67 @@ bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
     return clicked;
 }
 
+// C24: SolidWorks 2025 default arrangement.
+//   LEFT   = FeatureManager, full height ribbon->status (~280px). The PropertyManager swaps INTO
+//            this same dock slot during a command (both Begin "FeatureManager").
+//   RIGHT  = Task Pane (~340px): Design (AI panel) + Agent Activity as tabs, like SW's task pane.
+//            The floating command dialogs (Insert/Mate/Exploded/Interference/BOM, Mass Properties
+//            & friends, Simulation) dock as tabs into the bottom of this pane on first open so they
+//            never hide behind the central viewport node (the C20b NoBringToFrontOnFocus debt).
+//   BOTTOM = Console, a thin strip below the viewport (collapsed-feeling; SW has no console but we
+//            keep ours unobtrusive).
+//   CENTER = Viewport, as large as possible.
+// "Reset layout" rebuilds exactly this.
 void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     ImGui::DockBuilderRemoveNode(root);
     ImGui::DockBuilderAddNode(root, ImGuiDockNodeFlags_DockSpace);
     ImGui::DockBuilderSetNodeSize(root, size);
-    ImGuiID main = root, left, bottom, leftTree;
-    // Split off the left column; then split the left into a tree pane (top) + design pane (bottom)
-    left = ImGui::DockBuilderSplitNode(main, ImGuiDir_Left, 0.31f, nullptr, &main);
-    leftTree = ImGui::DockBuilderSplitNode(left, ImGuiDir_Up, 0.50f, nullptr, &left);
-    bottom = ImGui::DockBuilderSplitNode(main, ImGuiDir_Down, 0.24f, nullptr, &main);
-    ImGui::DockBuilderDockWindow("FeatureManager", leftTree);
-    ImGui::DockBuilderDockWindow("Design", left);
+
+    // Target pixel widths translated to fractions of the dockspace width.
+    const float w = size.x > 1.0f ? size.x : 1440.0f;
+    const float h = size.y > 1.0f ? size.y : 800.0f;
+    float leftFrac  = 280.0f / w;  leftFrac  = leftFrac  < 0.14f ? 0.14f : (leftFrac  > 0.34f ? 0.34f : leftFrac);
+    float rightFrac = 340.0f / w;  rightFrac = rightFrac < 0.16f ? 0.16f : (rightFrac > 0.40f ? 0.40f : rightFrac);
+    float consFrac  = 150.0f / h;  consFrac  = consFrac  < 0.12f ? 0.12f : (consFrac  > 0.32f ? 0.32f : consFrac);
+
+    ImGuiID main = root, left, right, bottom, rightBottom;
+    // Left column = FeatureManager (full height).
+    left  = ImGui::DockBuilderSplitNode(main, ImGuiDir_Left,  leftFrac,  nullptr, &main);
+    // Right column = Task Pane; split off before the bottom so it spans full height like SW.
+    right = ImGui::DockBuilderSplitNode(main, ImGuiDir_Right, rightFrac / (1.0f - leftFrac),
+                                        nullptr, &main);
+    // Console = a thin strip under the viewport (center column only).
+    bottom = ImGui::DockBuilderSplitNode(main, ImGuiDir_Down, consFrac, nullptr, &main);
+    // Bottom slice of the right pane holds the command dialogs as docked tabs.
+    rightBottom = ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.42f, nullptr, &right);
+
+    ImGui::DockBuilderDockWindow("FeatureManager", left);
+    // Task pane tabs. Dock Agent Activity first then Design so Design ends up the selected tab
+    // (ImGui selects the most-recently-docked window in a node), matching SolidWorks's task pane.
+    ImGui::DockBuilderDockWindow("Agent Activity", right);
+    ImGui::DockBuilderDockWindow("Design", right);
     ImGui::DockBuilderDockWindow("Viewport", main);
     ImGui::DockBuilderDockWindow("Console", bottom);
+    // Command dialogs dock into the lower-right slot so they surface as tabs instead of floating
+    // behind the central node. They share one node (only one is typically open at a time).
+    const char* dialogs[] = {
+        "Simulation", "Insert Component", "Mate##asm", "Exploded View",
+        "Interference Detection", "Bill of Materials",
+        // Evaluate dialogs (titles set in evaluate_dialogs.cpp) — pre-registered so they land in
+        // the task pane the first time they open (DockBuilderDockWindow matches by name).
+        "Mass Properties", "Measure", "Section Properties", "Geometry Check", "Symmetry Check",
+        "Zebra Stripes", "Draft angle", "Wall thickness", "Mean curvature",
+    };
+    for (const char* d : dialogs) ImGui::DockBuilderDockWindow(d, rightBottom);
+
     ImGui::DockBuilderFinish(root);
+
+    // C24: make Design the selected tab of the right task-pane node (over Agent Activity), matching
+    // SolidWorks's task pane defaulting to its first tab. DockBuilderFinish leaves the node's
+    // SelectedTabId at the last-docked window, so set it explicitly to Design's window id. A
+    // top-level window's id is ImHashStr(name) seeded with 0.
+    if (ImGuiDockNode* node = ImGui::DockBuilderGetNode(right))
+        node->SelectedTabId = ImHashStr("Design");
 }
 
 namespace ui {
@@ -107,7 +154,12 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         if (ImGui::BeginMenu("View")) {
             ImGui::MenuItem("Ribbon", nullptr, &st.showRibbon);
             ImGui::MenuItem("FeatureManager", nullptr, &st.showFeatureTree);
-            ImGui::MenuItem("Design / Chat", nullptr, &st.showDesign);
+            // C24: the right Task Pane hosts the AI Design panel + Agent Activity (SolidWorks-style).
+            // Its checkbox drives the Design + Activity dock visibility together.
+            if (ImGui::MenuItem("Task Pane", nullptr, &st.showTaskPane)) {
+                st.showDesign = st.showTaskPane;
+                st.showActivityPanel = st.showTaskPane;
+            }
             ImGui::MenuItem("Viewport", nullptr, &st.showViewport);
             ImGui::MenuItem("Console", nullptr, &st.showConsole);
             ImGui::Separator();

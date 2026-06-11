@@ -149,12 +149,10 @@ void SketchMode::resolve(AppState& st) {
 }
 
 // sketch_drag_commit / sketch_exit bump the worker's document revision out from under the mirror.
-// The mirror has no public "set revision", but its resolve_pick auto-resyncs on a stale revision
-// (the worker checks revision before anything else), so a throwaway resolve forces the mirror's
-// revision + tree back in step. Body-less sketch docs are fine: the stale check fires first.
+// C24: DocMirror::resync() pulls the fresh tree + revision (doc_tree) and fires the listener so
+// the FeatureManager repaints — replaces the old throwaway resolvePick(1,"body",1) trick.
 static void resyncMirror(AppState& st) {
-    std::string err;
-    st.docMirror.resolvePick(st.worker, 1, "body", 1, err);
+    st.docMirror.resync(st.worker);
 }
 
 void SketchMode::commitDrag(AppState& st) {

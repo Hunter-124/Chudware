@@ -59,16 +59,43 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
         ImGui::Text("|  %s", st.livePhase.c_str());
         ImGui::PopStyleColor();
     }
-    // provider / model summary, right-aligned; click to open Settings
+    // ---- right cluster (SolidWorks order): units | editing-mode | provider/model ----
+    // C24: SW shows the unit system ("MMGS"/"IPS") and "Editing Part"/"Editing Assembly" near the
+    // right edge of the status bar; we mirror that, with the provider/model summary furthest right
+    // (click anywhere on it to open Settings).
+    bool isAsm = false;
+    {
+        const auto& tr = st.docMirror.tree();
+        if (tr.is_object()) {
+            auto it = tr.find("schema");
+            isAsm = (it != tr.end() && it->is_string() &&
+                     it->get<std::string>() == "aicad.asm/1");
+        }
+    }
     const char* provName = st.settings.provider == 0 ? "Anthropic"
                          : st.settings.provider == 1 ? "OpenAI" : "Local";
     std::string ptxt = std::string(provName) + "  /  " +
                        (st.settings.model[0] ? st.settings.model : "default") +
                        (st.settings.planMode ? "   [plan mode]" : "");
-    float ptw = ImGui::CalcTextSize(ptxt.c_str()).x;
-    ImGui::SameLine(ImGui::GetWindowWidth() - ptw - 16);
+    const char* unitsTxt = "MMGS";  // canonical mm/grams/seconds (doc_schema §0)
+    const char* editTxt  = st.docMirror.hasDoc()
+                         ? (isAsm ? "Editing Assembly" : "Editing Part") : "";
+    std::string sep = "    |    ";
+    float ptw   = ImGui::CalcTextSize(ptxt.c_str()).x;
+    float uniw  = ImGui::CalcTextSize(unitsTxt).x;
+    float editw = editTxt[0] ? ImGui::CalcTextSize(editTxt).x : 0.0f;
+    float sepw  = ImGui::CalcTextSize(sep.c_str()).x;
+    float total = uniw + sepw + (editw > 0 ? editw + sepw : 0.0f) + ptw;
+    ImGui::SameLine(ImGui::GetWindowWidth() - total - 16);
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1));
+    ImGui::TextUnformatted(unitsTxt);
+    if (editTxt[0]) {
+        ImGui::SameLine(0, 0); ImGui::TextUnformatted(sep.c_str());
+        ImGui::SameLine(0, 0); ImGui::TextUnformatted(editTxt);
+    }
+    ImGui::SameLine(0, 0); ImGui::TextUnformatted(sep.c_str());
+    ImGui::SameLine(0, 0);
     ImGui::TextUnformatted(ptxt.c_str());
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered()) {

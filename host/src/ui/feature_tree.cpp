@@ -119,7 +119,7 @@ static bool featureRow(const std::string& fid, const std::string& name, const ch
     if (ImGui::BeginPopupContextItem(("##ctx_" + fid).c_str())) {
         // C18: sketch features get an "Edit Sketch" entry that enters sketch mode (camera lock +
         // tools). iconName == "sketch" identifies the row's feature type (see featureIcon()).
-        bool isSketch = iconName && std::strcmp(iconName, "sketch") == 0;
+        bool isSketch = iconName && std::strcmp(iconName, "sketch_node") == 0;
         if (isSketch) {
             if (ImGui::MenuItem("Edit Sketch")) {
                 auto* sk = static_cast<ui::SketchMode*>(st.sketchMode);
@@ -180,19 +180,34 @@ static bool featureRow(const std::string& fid, const std::string& name, const ch
 }
 
 // ---- feature type -> icon name ----
+// C24: every type maps to an atlas name that actually exists (see host/assets/icons/atlas.json),
+// so the FeatureManager shows a per-type glyph and the old 'datum_plane'/'feature' unknown-icon
+// warnings are gone.
 static const char* featureIcon(const std::string& type) {
-    if (type == "extrude")          return "extrude";
-    if (type == "revolve")          return "revolve";
-    if (type == "sketch")           return "sketch";
+    if (type == "sketch")           return "sketch_node";
+    if (type == "extrude")          return "extrude_boss";
+    if (type == "revolve")          return "revolve_boss";
+    if (type == "sweep")            return "sweep";
+    if (type == "loft")             return "loft";
     if (type == "fillet")           return "fillet";
     if (type == "chamfer")          return "chamfer";
     if (type == "shell")            return "shell";
+    if (type == "draft")            return "draft";
+    if (type == "rib")              return "rib";
+    if (type == "hole")             return "hole_wizard";
     if (type == "linear_pattern")   return "linear_pattern";
     if (type == "circular_pattern") return "circular_pattern";
-    if (type == "loft")             return "loft";
-    if (type == "sweep")            return "sweep";
-    if (type == "datum_plane")      return "datum_plane";
-    return "feature";
+    if (type == "mirror")           return "mirror";
+    if (type == "plane" || type == "datum_plane") return "plane";
+    if (type == "axis")             return "axis";
+    if (type == "point")            return "point";
+    if (type == "import")           return "open";
+    if (type == "script")           return "history";
+    // Primitives (box/cylinder/sphere/cone/torus) and anything else: the generic part glyph.
+    if (type == "box" || type == "cylinder" || type == "sphere" ||
+        type == "cone" || type == "torus")
+        return "part";
+    return "part";
 }
 static const char* featureFallback(const std::string& type) {
     if (type == "sketch")   return "[S]";
@@ -379,6 +394,112 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
     }
 }
 
+// ---- C24: small icon-button used in the FeatureManager top toolbar (24px square) ----
+// Returns true on click. Disabled buttons render dimmed and don't fire.
+static bool toolbarIconBtn(const char* id, const char* iconName, const char* tooltip,
+                           bool enabled) {
+    const auto& pal = ui::palette;
+    float btn = 24.0f;
+    ImGui::PushID(id);
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    bool clicked = ImGui::InvisibleButton("##tb", ImVec2(btn, btn)) && enabled;
+    bool hov = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (hov && enabled)
+        dl->AddRectFilled(p0, ImVec2(p0.x + btn, p0.y + btn),
+                          ui::Palette::toU32(pal.buttonHovered), 3.0f);
+    IconUV iv = getIcon(iconName, 20);
+    float iz = 18.0f, off = (btn - iz) * 0.5f;
+    ImU32 tint = enabled ? IM_COL32(255,255,255,255) : IM_COL32(128,128,128,150);
+    dl->AddImage(iv.texId, ImVec2(p0.x + off, p0.y + off),
+                 ImVec2(p0.x + off + iz, p0.y + off + iz), iv.uv0, iv.uv1, tint);
+    if (hov && tooltip) ImGui::SetTooltip("%s", tooltip);
+    ImGui::PopID();
+    return clicked;
+}
+
+// ---- C24: FeatureManager top strip — a SolidWorks-style tab row (tree active; properties /
+// configurations tabs are visual stubs) plus a compact document toolbar (New Part / New Assembly /
+// Open / Save / Undo / Redo) that replaces the old wide text-button strip at the panel bottom.
+static void drawFeatureManagerTopStrip(AppState& st) {
+    const auto& pal = ui::palette;
+    bool canDoc = st.workerStarted && !st.job.running.load();
+
+    // --- tab strip (tree | properties | configurations) ---
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    struct Tab { const char* icon; const char* tip; };
+    static const Tab kTabs[] = {
+        {"history",  "Feature tree"},
+        {"material", "Properties"},
+        {"settings", "Configurations"},
+    };
+    float tabBtn = 22.0f;
+    for (int i = 0; i < 3; ++i) {
+        if (i) ImGui::SameLine(0, 2);
+        ImGui::PushID(i + 7700);
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##fmtab", ImVec2(tabBtn, tabBtn));
+        bool hov = ImGui::IsItemHovered();
+        bool act = (i == 0);  // only the tree tab is functional
+        if (act || hov)
+            dl->AddRectFilled(p0, ImVec2(p0.x + tabBtn, p0.y + tabBtn),
+                              ui::Palette::toU32(act ? pal.ribbonTabActive : pal.buttonHovered), 3.0f);
+        if (act)
+            dl->AddLine(ImVec2(p0.x + 2, p0.y + tabBtn - 1), ImVec2(p0.x + tabBtn - 2, p0.y + tabBtn - 1),
+                        ui::Palette::toU32(pal.accent), 2.0f);
+        IconUV iv = getIcon(kTabs[i].icon, 20);
+        float iz = 16.0f, off = (tabBtn - iz) * 0.5f;
+        dl->AddImage(iv.texId, ImVec2(p0.x + off, p0.y + off),
+                     ImVec2(p0.x + off + iz, p0.y + off + iz), iv.uv0, iv.uv1,
+                     act ? IM_COL32(255,255,255,255) : IM_COL32(190,190,190,180));
+        if (hov) ImGui::SetTooltip("%s", kTabs[i].tip);
+        ImGui::PopID();
+    }
+    // right-aligned document toolbar
+    float nBtns = 6.0f, gap = 2.0f, bw = 24.0f;
+    float toolW = nBtns * bw + (nBtns - 1) * gap;
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - toolW + ImGui::GetCursorPosX() -
+                    ImGui::GetStyle().ItemSpacing.x);
+    if (toolbarIconBtn("fm_new", "new_doc", "New Part", canDoc) && canDoc) {
+        std::string err;
+        if (st.docMirror.newPart(st.worker, err))
+            st.addLog("[doc] new part  rev=" + std::to_string(st.docMirror.revision()));
+        else st.addLog("[err] new part: " + err);
+    }
+    ImGui::SameLine(0, gap);
+    if (toolbarIconBtn("fm_newasm", "assembly", "New Assembly", canDoc) && canDoc) {
+        std::string err;
+        if (st.docMirror.newAssembly(st.worker, err)) {
+            st.addLog("[doc] new assembly  rev=" + std::to_string(st.docMirror.revision()));
+            st.showRibbon = true; st.ribbonTab = 4;
+        } else st.addLog("[err] new assembly: " + err);
+    }
+    ImGui::SameLine(0, gap);
+    if (toolbarIconBtn("fm_open", "open", "Open...", canDoc) && canDoc)
+        st.addLog("[doc] open: use the path field below the tree");
+    ImGui::SameLine(0, gap);
+    bool canSave = canDoc && st.docMirror.hasDoc();
+    if (toolbarIconBtn("fm_save", "save", "Save...", canSave) && canSave)
+        st.addLog("[doc] save: use the path field below the tree");
+    ImGui::SameLine(0, gap);
+    if (toolbarIconBtn("fm_undo", "undo", "Undo", canDoc) && canDoc) {
+        auto r = st.docMirror.undo(st.worker);
+        if (r.ok) {
+            st.addLog("[doc] undo  rev=" + std::to_string(r.revision));
+            if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        } else st.addLog("[doc] undo: " + r.error_message);
+    }
+    ImGui::SameLine(0, gap);
+    if (toolbarIconBtn("fm_redo", "redo", "Redo", canDoc) && canDoc) {
+        auto r = st.docMirror.redo(st.worker);
+        if (r.ok) {
+            st.addLog("[doc] redo  rev=" + std::to_string(r.revision));
+            if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        } else st.addLog("[doc] redo: " + r.error_message);
+    }
+    ImGui::Separator();
+}
+
 // ---- main draw function ----
 
 void drawFeatureTree(AppState& st,
@@ -386,6 +507,10 @@ void drawFeatureTree(AppState& st,
     if (!ImGui::Begin("FeatureManager")) { ImGui::End(); return; }
 
     const auto& pal = ui::palette;
+
+    // C24: SolidWorks-style top strip (tab row + compact doc toolbar), replacing the old wide
+    // New Part / Undo / Redo text buttons that used to live at the panel bottom.
+    drawFeatureManagerTopStrip(st);
 
     // Panel background
     ImGui::PushStyleColor(ImGuiCol_ChildBg,
@@ -453,7 +578,7 @@ void drawFeatureTree(AppState& st,
 
             // Reference planes
             static const char* kPlanes[] = {"Front Plane", "Top Plane", "Right Plane"};
-            static const char* kPlaneIcons[] = {"datum_plane", "datum_plane", "datum_plane"};
+            static const char* kPlaneIcons[] = {"plane", "plane", "plane"};
             for (int pi = 0; pi < 3; ++pi) {
                 ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_Leaf |
                                        ImGuiTreeNodeFlags_NoTreePushOnOpen |
@@ -533,12 +658,24 @@ void drawFeatureTree(AppState& st,
                 }
             }
 
-            // ---- Rollback bar (visual only, no ops tonight) ----
-            ImGui::Separator();
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.7f));
-            ImGui::TextUnformatted("--- Rollback bar (drag: C17) ---");
-            ImGui::PopStyleColor();
+            // ---- Rollback bar ----
+            // C24: SolidWorks-style thin accent line with a centered grab handle, sitting at the
+            // end of the feature history. (Dragging is not wired — visual affordance only.)
+            {
+                ImGui::Dummy(ImVec2(0, 2));
+                ImVec2 r0 = ImGui::GetCursorScreenPos();
+                float w = ImGui::GetContentRegionAvail().x;
+                ImDrawList* rdl = ImGui::GetWindowDrawList();
+                float ly = r0.y + 3.0f;
+                rdl->AddLine(ImVec2(r0.x, ly), ImVec2(r0.x + w, ly),
+                             ui::Palette::toU32(pal.accentMid), 2.0f);
+                // grab handle (a small rounded tab centered on the line)
+                float hw = 18.0f, hh = 6.0f, hx = r0.x + (w - hw) * 0.5f;
+                rdl->AddRectFilled(ImVec2(hx, ly - hh * 0.5f), ImVec2(hx + hw, ly + hh * 0.5f),
+                                   ui::Palette::toU32(pal.accent), 3.0f);
+                ImGui::Dummy(ImVec2(w, hh + 4.0f));
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Rollback bar");
+            }
 
             ImGui::TreePop();
         } else {
@@ -548,70 +685,12 @@ void drawFeatureTree(AppState& st,
 
     ImGui::PopStyleColor();  // ChildBg
 
-    // ---- File > New Part, Undo, Redo buttons (quick access strip while C17 is pending) ----
-    ImGui::Separator();
+    // ---- Save / Open path strip (the New/Undo/Redo/Save buttons live in the top toolbar now) ----
     bool canDoc = st.workerStarted && !st.job.running.load();
-
-    if (canDoc) {
-        if (ImGui::Button("New Part")) {
-            std::string err;
-            if (st.docMirror.newPart(st.worker, err)) {
-                st.addLog("[doc] new part  rev=" + std::to_string(st.docMirror.revision()));
-            } else {
-                st.addLog("[err] new part: " + err);
-            }
-        }
-        ImGui::SameLine();
-        // C20b: File > New Assembly (creates an aicad.asm/1 doc; switches the ribbon to Assembly).
-        if (ImGui::Button("New Assembly")) {
-            std::string err;
-            if (st.docMirror.newAssembly(st.worker, err)) {
-                st.addLog("[doc] new assembly  rev=" + std::to_string(st.docMirror.revision()));
-                st.showRibbon = true; st.ribbonTab = 4;  // Assembly tab
-            } else {
-                st.addLog("[err] new assembly: " + err);
-            }
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Undo")) {
-            auto r = st.docMirror.undo(st.worker);
-            if (r.ok) {
-                st.addLog("[doc] undo  rev=" + std::to_string(r.revision));
-                if (!r.aicm_path.empty()) {
-                    std::string lerr;
-                    st.loadDocMesh(r.aicm_path, lerr);
-                    if (!lerr.empty()) st.addLog("[err] undo mesh: " + lerr);
-                }
-            } else {
-                st.addLog("[doc] undo: " + r.error_message);
-            }
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Redo")) {
-            auto r = st.docMirror.redo(st.worker);
-            if (r.ok) {
-                st.addLog("[doc] redo  rev=" + std::to_string(r.revision));
-                if (!r.aicm_path.empty()) {
-                    std::string lerr;
-                    st.loadDocMesh(r.aicm_path, lerr);
-                    if (!lerr.empty()) st.addLog("[err] redo mesh: " + lerr);
-                }
-            } else {
-                st.addLog("[doc] redo: " + r.error_message);
-            }
-        }
-    } else {
-        ImGui::BeginDisabled();
-        ImGui::Button("New Part"); ImGui::SameLine();
-        ImGui::Button("Undo"); ImGui::SameLine();
-        ImGui::Button("Redo");
-        ImGui::EndDisabled();
-    }
-
-    // ---- Save / Open strip ----
     if (canDoc && st.docMirror.hasDoc()) {
+        ImGui::Separator();
         static char savePath[512] = "";
-        ImGui::SetNextItemWidth(-70);
+        ImGui::SetNextItemWidth(-104);
         ImGui::InputText("##savepath", savePath, sizeof(savePath));
         ImGui::SameLine();
         if (ImGui::Button("Save") && savePath[0]) {
@@ -621,6 +700,7 @@ void drawFeatureTree(AppState& st,
             else
                 st.addLog("[err] save: " + err);
         }
+        ImGui::SameLine();
         if (ImGui::Button("Open") && savePath[0]) {
             std::string err;
             if (st.docMirror.open(st.worker, savePath, err)) {

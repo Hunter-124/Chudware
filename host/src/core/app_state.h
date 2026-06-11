@@ -296,6 +296,9 @@ struct AppState {
     float yaw = 35, pitch = 28, zoom = 1.0f;
     bool layoutInit = false, resetLayout = false, openSettings = false;
     bool showDesign = true, showViewport = true, showConsole = true;
+    // C24: the right task pane (Design + Agent Activity tabs, SolidWorks-style). View > Task Pane.
+    bool showTaskPane = true;
+    bool focusDesignTab = false;  // one-shot: focus the Design tab after a (re)layout
     bool showAbout = false, designStarted = false;
     int frame = 0;
 

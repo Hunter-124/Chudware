@@ -69,6 +69,10 @@ static void fillDark(Palette& p) {
     // selection
     set4(p.selectionHighlight, 0.176f,0.831f,0.749f, 0.22f);
     set4(p.hoverHighlight,     0.176f,0.831f,0.749f, 0.40f);
+    // C24 orientation-triad axes
+    set4(p.axisX, 0.910f,0.380f,0.380f, 1);
+    set4(p.axisY, 0.470f,0.820f,0.450f, 1);
+    set4(p.axisZ, 0.420f,0.620f,0.960f, 1);
     // C18 sketch mode
     set4(p.sketchUnder, 0.337f,0.612f,0.960f, 1);
     set4(p.sketchGrid,  0.520f,0.560f,0.620f, 0.18f);
@@ -168,6 +172,10 @@ static void fillLight(Palette& p) {
     // selection
     set4(p.selectionHighlight, 0.000f,0.471f,0.843f, 0.18f);
     set4(p.hoverHighlight,     0.000f,0.471f,0.843f, 0.35f);
+    // C24 orientation-triad axes (slightly deeper on the light studio bg for contrast)
+    set4(p.axisX, 0.800f,0.180f,0.180f, 1);
+    set4(p.axisY, 0.180f,0.580f,0.220f, 1);
+    set4(p.axisZ, 0.000f,0.380f,0.820f, 1);
     // C18 sketch mode (SW blue under-defined, darker grid on the light studio)
     set4(p.sketchUnder, 0.000f,0.471f,0.843f, 1);
     set4(p.sketchGrid,  0.420f,0.447f,0.502f, 0.22f);

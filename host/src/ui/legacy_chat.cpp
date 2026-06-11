@@ -233,6 +233,9 @@ void drawDesignPanel(AppState& st, bool busy, bool canRun) {
 
     // ---------- Design ----------
     if (st.showDesign) {
+    // C24: after a (re)layout, bring Design to the front of the task pane (over Agent Activity),
+    // matching SolidWorks's task pane defaulting to its first tab.
+    if (st.focusDesignTab) { ImGui::SetNextWindowFocus(); st.focusDesignTab = false; }
     if (ImGui::Begin("Design"))
     {
         float panelW = ImGui::GetContentRegionAvail().x;

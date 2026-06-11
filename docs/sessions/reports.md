@@ -1,5 +1,48 @@
 # Landed-card integration notes (orchestrator log)
 
+## C24 (final UI polish pass)
+- DEFAULT LAYOUT rebuilt (title_bar.cpp buildDefaultLayout) to the SolidWorks arrangement: LEFT =
+  FeatureManager full-height (~280px; PM still swaps into the same dock slot), RIGHT = Task Pane
+  (~340px) with Design + Agent Activity as tabs, BOTTOM = Console thin strip under the viewport,
+  CENTER = Viewport. View menu gained a "Task Pane" toggle (drives showDesign+showActivityPanel).
+  "Reset layout" reproduces exactly this. New AppState flags: showTaskPane, focusDesignTab.
+- FLOATING-DIALOG DOCKING (C20b debt): buildDefaultLayout pre-registers the command dialogs
+  (Simulation, Insert Component, Mate##asm, Exploded View, Interference Detection, Bill of
+  Materials, and the evaluate-dialog titles Mass Properties/Measure/Section Properties/Geometry
+  Check/Symmetry Check/Zebra Stripes/Draft angle/Wall thickness/Mean curvature) into a lower-right
+  task-pane node via DockBuilderDockWindow, so they open as DOCKED TABS instead of floating behind
+  the NoBringToFrontOnFocus central node. Verified: Mass Properties + Exploded View land docked.
+- RIBBON polish (widgets/ribbon.cpp): per-button width = max(min, wrapped-label width) clamped to a
+  cap (no overlap); two-line labels via ribbon_wrapLabel (splits on '\n' or last space; ribbon_def
+  untouched — wrapping is render-side); group captions clipped to group width (no collision);
+  reserved bottom caption strip (kCaptionH) so captions never overlap small-button rows; taller tab
+  strip (kTabH 28) with top inset clear of the title bar; body taller (kBodyH 76). Horizontal
+  overflow scroll retained.
+- FEATURE TREE polish (feature_tree.cpp): featureIcon() now maps every type to a real atlas name
+  (sketch->sketch_node, extrude->extrude_boss, revolve->revolve_boss, datum_plane->plane,
+  feature/script->history, box/cylinder/sphere/cone/torus->part, hole->hole_wizard, etc.) — the two
+  'datum_plane'/'feature' unknown-icon warnings are GONE (header planes use 'plane'). New top strip:
+  SW-style tab row (tree active; properties/configurations stubs) + compact icon toolbar
+  (New Part/New Assembly/Open/Save/Undo/Redo) replacing the old wide bottom button strip (only the
+  Save/Open path field remains at the bottom). Rollback bar = thin accent line + centered grab
+  handle. NOTE: the sketch-row context detection now matches "sketch_node".
+- VIEWPORT (viewport_panel.cpp): centered translucent heads-up toolbar at the top (zoom-fit +
+  Iso/Front/Right/Top presets + display-style/section toggles as stubs); orientation triad
+  bottom-left projected from the live yaw/pitch. New palette roles axisX/axisY/axisZ added to BOTH
+  dark + light (ui_theme.{h,cpp}). The old top-of-panel view buttons were removed.
+- STATUS BAR (status_bar.cpp): right cluster now "MMGS | Editing Part/Editing Assembly | provider/
+  model" (SW order; editing-mode reads the doc schema; whole cluster click opens Settings).
+- DocMirror::resync() (doc_mirror.{h,cpp}): public doc_tree pull + listener notify; replaces the
+  throwaway resolvePick(1,"body",1) in sketch_mode.cpp resyncMirror + the two in the app.cpp sketch
+  scenario. (The C22b doc_rebuild-after-v2-run call is LEFT as-is: it also returns the aicm_path
+  the viewport reload needs, which doc_tree does not.)
+- GALLERY: every AI_CAD_SHOT mode (default/ribbon/tree/pick/m1/sketch/asm/activity/evalmass) shot in
+  dark AND light into scratch/c24_gallery/ — all exit 0; m1 cache-assert + tree-intact green, asm
+  z=15 PASS both themes, no icon warnings. test_aicm.exe 19/19. Tab-default caveat: the right pane
+  may show Agent Activity selected on the very first frame of a fast shot (SelectedTabId set in
+  DockBuilder + SetNextWindowFocus, but ImGui's runtime tab bar can override on appearing frame);
+  settles to Design by ~frame 10 and is correct in normal interactive use. Both tabs always present.
+
 ## C20b + C22b (wave C, combined commit)
 - AsmPanels: Insert Component, Mate PM (auto-suggest by picked surf pair, Aligned/Anti flip w/
   "seat-on-face = Anti" hint, DimField for distance/angle), Exploded slider (view-only state,

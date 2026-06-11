@@ -73,6 +73,11 @@ struct Palette {
     float selectionHighlight[4] = {0.176f,0.831f,0.749f, 0.22f};
     float hoverHighlight[4]     = {0.176f,0.831f,0.749f, 0.40f};
 
+    // ---- C24: orientation-triad axis colors (X/Y/Z) ----
+    float axisX[4]         = {0.910f,0.380f,0.380f, 1};   // red
+    float axisY[4]         = {0.470f,0.820f,0.450f, 1};   // green
+    float axisZ[4]         = {0.420f,0.620f,0.960f, 1};   // blue
+
     // ---- C18 sketch mode ----
     float sketchUnder[4]   = {0.337f,0.612f,0.960f, 1};   // under-defined entity (SW-style blue)
     float sketchGrid[4]    = {0.520f,0.560f,0.620f, 0.18f}; // faint sketch grid lines

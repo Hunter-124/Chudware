@@ -1059,7 +1059,7 @@ int run_gui(const char* screenshotPath) {
                         nlohmann::json cP = {{"doc_id",st.docMirror.docId()},{"sketch",skFid}};
                         st.worker.call("sketch_drag_commit", cP, cres, err);
                         // resync mirror (commit bumped the revision) then set the width dim
-                        std::string serr; st.docMirror.resolvePick(st.worker, 1, "body", 1, serr);
+                        st.docMirror.resync(st.worker);
                         if (!skWidthCid.empty())
                             st.docMirror.applyOps(st.worker, nlohmann::json::array({
                                 {{"op","sketch_set_dim"},{"sketch",skFid},{"id",skWidthCid},{"value",100.0}}}));
@@ -1074,7 +1074,7 @@ int run_gui(const char* screenshotPath) {
                     }
                     case 2: {  // exit + extrude region depth 10
                         if (sk) sk->exitSketch(st, /*keep=*/true);
-                        std::string serr; st.docMirror.resolvePick(st.worker, 1, "body", 1, serr);
+                        st.docMirror.resync(st.worker);
                         nlohmann::json region = {{"kind","region"},{"sketch",skFid},
                             {"centroid",nlohmann::json::array({50.0,20.0})},{"hint_index",0}};
                         auto r = applyOne({{"op","add_feature"},{"feature",{
@@ -1532,6 +1532,10 @@ int run_gui(const char* screenshotPath) {
             buildDefaultLayout(dockId, ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
             st.layoutInit = true;
             st.resetLayout = false;
+            // C24: make Design the active tab in the right task pane (not Agent Activity), matching
+            // SolidWorks's task pane defaulting to the first tab. Deferred one frame via a flag so
+            // the docked windows exist before we focus.
+            st.focusDesignTab = true;
         }
         ImGui::DockSpace(dockId, ImVec2(0, 0), ImGuiDockNodeFlags_None);
         ImGui::End();
@@ -1555,6 +1559,10 @@ int run_gui(const char* screenshotPath) {
                 });
             }
         }
+        // --- C22b: Activity panel (drawn BEFORE Design so, sharing the right task-pane node, the
+        // Design tab is the last-begun and ends up selected — SolidWorks defaults to the first tab).
+        activityPanel.draw(st);
+        // --- end C22b ---
         ui::drawDesignPanel(st, busy, canRun);
         ui::drawViewportPanel(st, io, busy);
         ui::drawConsolePanel(st);
@@ -1566,10 +1574,6 @@ int run_gui(const char* screenshotPath) {
 
         // ---------- C20b: assembly panels (Insert / Mate / Explode / Interference / BOM) ----------
         asmPanels.draw(st);
-
-        // --- C22b: Activity panel ---
-        activityPanel.draw(st);
-        // --- end C22b ---
 
         // ---------- C15 pick-shot driver: simulate a center-screen pick ----------
         // The viewport panel rendered the id buffer for this frame's camera; pick its center,

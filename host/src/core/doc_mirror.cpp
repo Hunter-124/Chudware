@@ -47,6 +47,18 @@ bool DocMirror::resyncTree(WorkerClient& w) {
     if (!w.call("doc_tree", {{"doc_id", docId_}}, res, err)) return false;
     revision_ = jint(res, "revision");
     if (res.contains("tree") && res["tree"].is_object()) tree_ = res["tree"];
+    if (res.contains("rebuild") && res["rebuild"].is_object()) {
+        const auto& rb = res["rebuild"];
+        if (rb.contains("feature_status") && rb["feature_status"].is_array())
+            featureStatus_ = rb["feature_status"];
+    }
+    return true;
+}
+
+// C24: public convenience wrapper — pull tree/revision and notify so the tree repaints.
+bool DocMirror::resync(WorkerClient& w) {
+    if (!resyncTree(w)) return false;
+    notify();
     return true;
 }
 

@@ -7,6 +7,7 @@
 #include "viewport_panel.h"
 
 #include "legend.h"
+#include "icons.h"
 
 #include "../core/app_state.h"
 
@@ -29,14 +30,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     if (st.showViewport) {
     if (ImGui::Begin("Viewport"))
     {
-        struct V { const char* l; float y, p; };
-        const V views[] = {{"Iso", 35, 28}, {"Front", 0, 0}, {"Right", 90, 0}, {"Top", 0, 89}};
-        for (int i = 0; i < 4; ++i) {
-            if (i) ImGui::SameLine();
-            if (ImGui::Button(views[i].l)) { st.yaw = views[i].y; st.pitch = views[i].p; }
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Reset")) { st.yaw = 35; st.pitch = 28; st.zoom = 1.0f; }
+        // C24: the view-orientation presets moved into the centered heads-up toolbar drawn over the
+        // viewport image (below), SolidWorks-style. Nothing is drawn here at the panel top so the
+        // 3D view starts flush against the ribbon.
 
         // ---- assembly fit readout + parts list (multi-part builds only) ----
         if (!st.asmParts.empty()) {
@@ -153,6 +149,68 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
         }
 
+        // ---- C24: heads-up view toolbar, centered at the viewport top (SolidWorks-style) ----
+        // A translucent chip hosting: Zoom-fit, the orientation presets (Iso/Front/Right/Top),
+        // display-style and section toggles. Buttons are InvisibleButtons positioned over the 3D
+        // image with hover fills + icon glyphs from the atlas. Hidden while editing a sketch.
+        if (!inSketch) {
+            const auto& hpal = ui::palette;
+            ImDrawList* hdl = ImGui::GetWindowDrawList();
+            struct HU { const char* icon; const char* tip; int act; float y, p; };
+            // act: 0=zoom-fit(reset), 1=iso,2=front,3=right,4=top, 5=display(noop), 6=section(noop)
+            const HU items[] = {
+                {"zoom_fit",        "Zoom to Fit",   0, 0, 0},
+                {"view_cube",       "Isometric",     1, 35, 28},
+                {"orientation",     "Front",         2, 0, 0},
+                {"orientation",     "Right",         3, 90, 0},
+                {"orientation",     "Top",           4, 0, 89},
+                {"display_shaded",  "Display Style", 5, 0, 0},
+                {"section_view",    "Section View",  6, 0, 0},
+            };
+            const int nHU = (int)(sizeof(items) / sizeof(items[0]));
+            float btn = 26.0f, gap = 3.0f, padX = 8.0f, padY = 4.0f;
+            float barW = nHU * btn + (nHU - 1) * gap + padX * 2;
+            float barH = btn + padY * 2;
+            float bx0 = vr0.x + ((vr1.x - vr0.x) - barW) * 0.5f;
+            float by0 = vr0.y + 8.0f;
+            // chip background
+            hdl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx0 + barW, by0 + barH),
+                               ui::Palette::toU32(hpal.overlayBg), barH * 0.30f);
+            hdl->AddRect(ImVec2(bx0, by0), ImVec2(bx0 + barW, by0 + barH),
+                         ui::Palette::toU32(hpal.overlayBorder), barH * 0.30f);
+            ImGui::PushID("##headsup");
+            for (int i = 0; i < nHU; ++i) {
+                float bxi = bx0 + padX + i * (btn + gap);
+                float byi = by0 + padY;
+                ImGui::SetCursorScreenPos(ImVec2(bxi, byi));
+                ImGui::PushID(i);
+                bool clicked = ImGui::InvisibleButton("##hb", ImVec2(btn, btn));
+                bool hov = ImGui::IsItemHovered();
+                if (hov)
+                    hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
+                                       ui::Palette::toU32(hpal.buttonHovered), 3.0f);
+                IconUV iv = ui::getIcon(items[i].icon, 20);
+                float iz = 18.0f, off = (btn - iz) * 0.5f;
+                hdl->AddImage(iv.texId, ImVec2(bxi + off, byi + off),
+                              ImVec2(bxi + off + iz, byi + off + iz), iv.uv0, iv.uv1,
+                              IM_COL32(255, 255, 255, 235));
+                if (hov) ImGui::SetTooltip("%s", items[i].tip);
+                if (clicked) {
+                    int a = items[i].act;
+                    if (a == 0) { st.zoom = 1.0f; }                    // zoom-fit (reset zoom)
+                    else if (a >= 1 && a <= 4) { st.yaw = items[i].y; st.pitch = items[i].p; }
+                    // a==5/6 (display style / section) are visual stubs — no functional change.
+                }
+                ImGui::PopID();
+                // small separators before display-style and section groups
+                if (i == 0 || i == 4)
+                    hdl->AddLine(ImVec2(bxi + btn + gap * 0.5f, byi + 3),
+                                 ImVec2(bxi + btn + gap * 0.5f, byi + btn - 3),
+                                 ui::Palette::toU32(hpal.border), 1.0f);
+            }
+            ImGui::PopID();
+        }
+
         // ---- overlays on the 3D view ----
         ImDrawList* vdl = ImGui::GetWindowDrawList();
         {
@@ -191,12 +249,45 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             vdl->AddText(ImVec2(p0.x + 10, p0.y + 5), overlayTxt,
                          st.pickStatus.c_str());
         }
+        // ---- C24: orientation triad, bottom-left of the viewport (SolidWorks-style) ----
+        // A tiny XYZ gizmo reflecting the current orbit (yaw/pitch). Axes are projected from world
+        // to screen with the same convention the renderer uses, so it tracks the live camera.
+        {
+            float cx = vr0.x + 34.0f, cy = vr1.y - 34.0f;  // triad center, bottom-left
+            float L = 20.0f;
+            float yawR = st.yaw * 3.14159265f / 180.0f, pitR = st.pitch * 3.14159265f / 180.0f;
+            float cyaw = std::cos(yawR), syaw = std::sin(yawR);
+            float cpit = std::cos(pitR), spit = std::sin(pitR);
+            // World axis -> screen (x right, y down). Project (Xw,Yw,Zw) after yaw about up then
+            // pitch: screen_x = Xw*cyaw - Yw*syaw; depth-tilt folds Z up by pitch.
+            auto proj = [&](float wx, float wy, float wz, float& sx, float& sy) {
+                float rx = wx * cyaw + wy * syaw;
+                float ry = -wx * syaw + wy * cyaw;
+                sx = rx;
+                sy = -(wz * cpit - ry * spit);
+            };
+            struct Ax { float x, y, z; const char* l; const float* col; };
+            const Ax axes[] = {
+                {1, 0, 0, "X", ui::palette.axisX},
+                {0, 1, 0, "Y", ui::palette.axisY},
+                {0, 0, 1, "Z", ui::palette.axisZ},
+            };
+            for (const auto& a : axes) {
+                float sx, sy; proj(a.x, a.y, a.z, sx, sy);
+                ImVec2 tip(cx + sx * L, cy + sy * L);
+                ImU32 col = ImGui::ColorConvertFloat4ToU32(
+                    ImVec4(a.col[0], a.col[1], a.col[2], 0.95f));
+                vdl->AddLine(ImVec2(cx, cy), tip, col, 1.8f);
+                vdl->AddText(ImVec2(tip.x - 3, tip.y - 7), col, a.l);
+            }
+            vdl->AddCircleFilled(ImVec2(cx, cy), 2.4f, overlayTxt);
+        }
         if (!st.modelInfo.empty() && renderer.hasMesh()) {
-            // dimensions readout, bottom-left
+            // dimensions readout, bottom-left (sits above the orientation triad)
             ImFont* mf = st.fonts.mono ? st.fonts.mono : ImGui::GetFont();
             float fs = mf->FontSize * 0.92f;
             ImVec2 ts = mf->CalcTextSizeA(fs, 1e30f, 0.0f, st.modelInfo.c_str());
-            ImVec2 p0(vr0.x + 12, vr1.y - ts.y - 22.0f);
+            ImVec2 p0(vr0.x + 12, vr1.y - ts.y - 70.0f);
             ImVec2 p1(p0.x + ts.x + 20.0f, p0.y + ts.y + 10.0f);
             vdl->AddRectFilled(p0, p1, overlayBg, 6.0f);
             vdl->AddText(mf, fs, ImVec2(p0.x + 10, p0.y + 5),

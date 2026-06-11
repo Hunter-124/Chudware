@@ -89,6 +89,13 @@ public:
     // List open docs (returns array or empty on error).
     nlohmann::json list(WorkerClient& w, std::string& err);
 
+    // Re-pull the document tree + revision from the worker (doc_tree) and fire the listener.
+    // C24: the public face of the formerly-private resyncTree — callers that mutated the doc
+    // out-of-band (sketch drag/commit/exit, a v2 agent run) use this to bring the mirror back in
+    // step instead of the old throwaway resolvePick(1,"body",1) trick. Returns false if no doc is
+    // open or the call fails; on success the listener fires so the tree repaints.
+    bool resync(WorkerClient& w);
+
     // Reset local state (e.g. on worker restart).
     void reset() { docId_.clear(); revision_ = -1; tree_ = {}; featureStatus_ = {}; }
 

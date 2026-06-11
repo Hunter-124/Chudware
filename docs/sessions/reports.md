@@ -1,5 +1,28 @@
 # Landed-card integration notes (orchestrator log)
 
+## C20-engine + C22a (wave B engine; both agents died hung — orchestrator salvaged + fixed)
+- ROOT CAUSE of the hangs + test flakes: agent/config.py resolved provider as
+  config.json BEFORE the AI_CAD_PROVIDER env var, so "mock" subprocess tests silently called
+  the user's LIVE LM Studio (gemma) — nondeterministic replies, multi-hour stalls. FIXED:
+  env var now outranks config.json (it's a per-process override). Plus: roles.load_prompt
+  raises on unreadable builtin (was silent ""), run.py prepends "ROLE: <role>" line to every
+  system prompt (deterministic mock routing; harmless for real models), RoleScriptedProvider
+  returns a loud MOCK-MISSING-ROLE sentinel. agent.test_orchestrator now 6/6 stable.
+- C22a surface: agent/orchestrator/{state,machine,roles,ops_emit,run,events}.py +
+  agent/prompts/*.md (+shared/ops_cheatsheet.md); worker agent_run_v2/agent_cancel/
+  get_prompts_v2; events per events.md §3 + %APPDATA%/cache/runs/<id>/events.jsonl + sidecars;
+  memory staged as session.extra_entries["ai/memory.json"]. Escape hatch verified (garbage ops
+  -> script feature). Context cap: max 911 est tokens across calls (<=6000 asserted).
+- C20-engine surface: engine/doc/mate_solver.py (8 mate types over nsolve, align aligned/anti
+  — SW semantics: seat-on-face = ANTI; warm per-component (t,quat)), assembly.py (component
+  loading .step+/.STEP w/ mtime cache, selector->MateGeom in component-local frame),
+  session.py asm state (asm_result/asm_warm/explode_active+factor; set_explode_state is
+  VIEW-ONLY: no revision bump, re-tessellates IN PLACE — compare content not paths),
+  worker doc_solve_mates + doc_set_explode_state; component default name = file stem
+  (orchestrator fix in ops.py). VERIFIED end-to-end by orchestrator-authored
+  test_worker_asm.py: insert x2 -> concentric+coincident(anti) -> (0,0,15) exact, designed
+  0.1mm clearance reported, explode +40mm, undo. C++ half NOT built (agent died) -> C20b.
+
 ## C18 sketch UI + C19 sim/eval UI + C21 formats (wave A, combined commit)
 - Worker now also serves: sketch_enter/solve/drag/drag_commit/exit (C18; session.py holds
   _SketchState w/ warm solver state; drag transient, commit = one undoable batch; exit persists

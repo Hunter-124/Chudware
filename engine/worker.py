@@ -200,6 +200,28 @@ def _doc_resolve_pick(params: dict, _emit: EmitFn) -> dict:
         int(params["body_id"]), params["kind"], int(params["topo_id"]))
 
 
+# =========================================================================== C20 assembly methods
+#
+# doc_solve_mates  {doc_id, drag?: {component, target:[x,y,z]}}  -> ops-response (re-solve mates,
+#   persist solved transforms, bump revision). A drag soft-pulls one component's translation toward
+#   target along its free DOF (constrained drag); without drag it just re-solves.
+# doc_set_explode_state {doc_id, active: bool, factor: 0..1} -> ops-response (re-tessellate with the
+#   explode offsets applied; view-only, no revision bump).
+
+
+def _doc_solve_mates(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.solve_mates(s, drag=params.get("drag"), emit=_doc_emit(emit))
+
+
+def _doc_set_explode_state(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.set_explode_state(s, bool(params.get("active", False)),
+                                     float(params.get("factor", 0.0)), emit=_doc_emit(emit))
+
+
 # ============================================================== C19 doc-side sim bridge handlers
 #
 # Produce sim INPUTS from the live doc session (the sim worker is a separate process that only
@@ -266,9 +288,29 @@ def _sketch_exit(params: dict, emit: EmitFn) -> dict:
 
 
 def _eval_active_shape(doc_id: str, body_id: int | None = None):
-    """Return (session, BodyOut) for the active (or selected) solid body."""
+    """Return (session, BodyOut, result) for the active (or selected) solid body.
+
+    For an assembly, ``body_id`` selects a component (1-based ordinal) and the returned BodyOut
+    carries that component's LOCAL shape (mass/CoG are transform-invariant, so local is fine)."""
     from engine.doc import session as docsess
     s = docsess.get_session(doc_id)
+    if s.is_assembly:
+        from engine.doc.compiler import BodyOut
+        comps = docsess.asm_component_bodies(s)
+        if not comps:
+            from engine.doc.ops import OpError
+            raise OpError("invalid_op", "assembly has no components to evaluate",
+                          {"reason": "no components"})
+        if body_id is not None:
+            if body_id < 1 or body_id > len(comps):
+                from engine.doc.ops import OpError
+                raise OpError("invalid_op", f"body_id {body_id} out of range",
+                              {"reason": "bad body_id"})
+            c = comps[body_id - 1]
+        else:
+            c = comps[0]
+        bo = BodyOut(body_id=str(body_id or 1), name=c["name"], shape=c["shape"], color=None)
+        return s, bo, s.last_result or docsess._ensure_built(s)
     result = docsess._ensure_built(s)
     bodies = list(result.bodies)
     if not bodies:
@@ -387,6 +429,10 @@ def _eval_interference(params: dict, _emit: EmitFn) -> dict:
     import engine.doc.evaluate as evaluate
     from engine.doc import session as docsess
     s = docsess.get_session(params["doc_id"])
+    if s.is_assembly:
+        # World-placed component bodies (clearance/interference between distinct components).
+        members = docsess.asm_world_bodies(s, explode=False)
+        return evaluate.interference(members)
     result = docsess._ensure_built(s)
     members = [(bo.name or bo.body_id, bo.shape) for bo in result.bodies]
     return evaluate.interference(members)
@@ -435,6 +481,74 @@ def _eval_curvature(params: dict, _emit: EmitFn) -> dict:
     return {"aicm_path": path}
 
 
+# =========================================================================== C22a orchestrator (M9)
+#
+# The deterministic AI orchestrator (agent/orchestrator). agent_run_v2 runs a design against an
+# OPEN doc session, streaming the events.md §3 hierarchy (run/stage/agent_call/agent_output/
+# stage_result/run_finished) via the per-request emit fn. agent_cancel flags a run for best-effort
+# cancel (checked at stage boundaries). get_prompts_v2 exposes the per-role editable prompts. The
+# legacy agent_design path (above) is untouched.
+
+# Active orchestrator runs: run_id -> RunControl (cooperative cancel flag).
+_RUNS: dict = {}
+
+
+def _agent_run_v2(params: dict, emit_event: EmitFn) -> dict:
+    from agent import config
+    from agent.orchestrator import run as orun
+    from agent.orchestrator.machine import RunControl
+    from engine.doc import session as docsess
+    from dataclasses import asdict
+
+    request = params["request"]
+    s = docsess.get_session(params["doc_id"])
+    provider = config.get_provider()
+    options = dict(params.get("options") or {})
+    control = RunControl()
+    run_id = options.get("run_id")
+    if run_id:
+        _RUNS[run_id] = control
+    options["control"] = control
+
+    seen_ids: set = set()
+
+    def _register_then_emit(ev: dict) -> None:
+        # The first event (run_started) carries the generated run_id; register the control under it
+        # so agent_cancel can find a run that didn't pass an explicit id.
+        rid = ev.get("run_id")
+        if rid:
+            seen_ids.add(rid)
+            if rid not in _RUNS:
+                _RUNS[rid] = control
+        emit_event(ev)
+
+    try:
+        result = orun.run_design(request, s, provider, emit=_register_then_emit, options=options)
+        seen_ids.add(result.run_id)
+        return asdict(result)
+    finally:
+        for rid in seen_ids:
+            _RUNS.pop(rid, None)
+        if run_id:
+            _RUNS.pop(run_id, None)
+
+
+def _agent_cancel(params: dict, _emit_event: EmitFn) -> dict:
+    """Best-effort cancel: flag the run; the machine checks the flag at the next stage boundary."""
+    run_id = params["run_id"]
+    control = _RUNS.get(run_id)
+    if control is None:
+        return {"cancelled": False, "reason": "unknown or finished run"}
+    control.cancelled = True
+    return {"cancelled": True}
+
+
+def _get_prompts_v2(_params: dict, _emit_event: EmitFn) -> dict:
+    """Per-role editable prompt records for the GUI prompt editor (diff vs built-in, reset)."""
+    from agent.orchestrator import roles
+    return {"prompts": roles.get_prompts_v2()}
+
+
 _METHODS = {
     "ping": _ping,
     "run_model": _run_model,
@@ -452,6 +566,9 @@ _METHODS = {
     "doc_tree": _doc_tree,
     "doc_rebuild": _doc_rebuild,
     "doc_resolve_pick": _doc_resolve_pick,
+    # Assembly (C20)
+    "doc_solve_mates": _doc_solve_mates,
+    "doc_set_explode_state": _doc_set_explode_state,
     # Sketch mode (C18)
     "sketch_enter": _sketch_enter,
     "sketch_solve": _sketch_solve,
@@ -478,10 +595,20 @@ from engine.doc import formats as _formats  # noqa: E402
 
 _METHODS.update(_formats.WORKER_METHODS)
 
+# C22a orchestrator (M9) — registered via update so the shared _METHODS dict literal stays owned by
+# the worker integrator. agent_run_v2/agent_cancel/get_prompts_v2 keep the LEGACY plain-string error
+# shape (they are not in _STRUCTURED_ERROR_METHODS), matching agent_design.
+_METHODS.update({
+    "agent_run_v2": _agent_run_v2,
+    "agent_cancel": _agent_cancel,
+    "get_prompts_v2": _get_prompts_v2,
+})
+
 # Methods that emit the structured error envelope {code, message, detail} on failure.
 _STRUCTURED_ERROR_METHODS = {
     "doc_new", "doc_open", "doc_save", "doc_close", "doc_list", "doc_apply_ops",
     "doc_undo", "doc_redo", "doc_tree", "doc_rebuild", "doc_resolve_pick",
+    "doc_solve_mates", "doc_set_explode_state",  # C20
     "sketch_enter", "sketch_solve", "sketch_drag", "sketch_drag_commit", "sketch_exit",
     "eval_mass", "eval_measure", "eval_section_props", "eval_interference", "eval_check",
     "eval_symmetry", "eval_draft", "eval_thickness", "eval_curvature",

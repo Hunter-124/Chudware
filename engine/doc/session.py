@@ -20,6 +20,7 @@ No GUI assumptions; canonical units throughout.
 from __future__ import annotations
 
 import copy
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -63,6 +64,17 @@ class DocSession:
     # C18 — active-sketch interaction state (one sketch edited at a time, SolidWorks-style).
     # Populated by sketch_enter, warm-started across solve/drag, cleared by sketch_exit.
     active_sketch: Optional["_SketchState"] = None
+    # C20 — assembly state. asm_result is the last assembly compile (AssemblyResult); asm_warm is
+    # the per-component (t,w) warm start carried across re-solves; explode_active/factor drive
+    # tessellation-time explode offsets (doc_set_explode_state).
+    asm_result: Any = None
+    asm_warm: dict = field(default_factory=dict)
+    explode_active: bool = False
+    explode_factor: float = 0.0
+
+    @property
+    def is_assembly(self) -> bool:
+        return self.doc.get("schema") == "aicad.asm/1"
 
     # -- snapshot helpers -------------------------------------------------
 
@@ -191,14 +203,38 @@ def _rebuild(session: DocSession, emit: EmitFn | None = None) -> CompileResult:
                 emitted_start = True
             emit({"kind": "doc_progress", "doc_id": session.doc_id, "stage": stage})
 
+    if session.is_assembly:
+        _rebuild_assembly(session)
+        maybe_progress("assembly_solved")
+        # last_result stays a (possibly empty) CompileResult for part-only code paths.
+        if session.last_result is None:
+            session.last_result = CompileResult()
+        return session.last_result
+
     result = compile_document(session.doc, session.compile_cache)
     maybe_progress("compiled")
     session.last_result = result
     return result
 
 
+def _rebuild_assembly(session: DocSession) -> None:
+    """Compile the assembly: solve mates, write solved transforms back into the doc, cache result."""
+    from engine.doc import assembly as asm
+    base_dir = os.path.dirname(session.path) if session.path else None
+    ares = asm.compile_assembly(session.doc, base_dir=base_dir, warm=session.asm_warm or None)
+    # Persist solved transforms back into the document (so save captures the mated pose).
+    for comp in session.doc.get("components", []):
+        if comp["id"] in ares.transforms:
+            comp["transform"] = ares.transforms[comp["id"]]
+    session.asm_result = ares
+    session.asm_warm = ares.warm
+
+
 def _write_aicm(session: DocSession, result: CompileResult) -> tuple[str, list[dict]]:
     """Tessellate every solid body and write the AICM; return (aicm_path, bodies-list)."""
+    if session.is_assembly:
+        return _write_aicm_assembly(session)
+
     body_tesses: list[tess.BodyTess] = []
     bodies_meta: list[dict] = []
     for i, bo in enumerate(_solid_bodies(result), start=1):
@@ -212,31 +248,74 @@ def _write_aicm(session: DocSession, result: CompileResult) -> tuple[str, list[d
     return str(aicm), bodies_meta
 
 
+def _write_aicm_assembly(session: DocSession) -> tuple[str, list[dict]]:
+    """Tessellate each component (world-placed, optional explode offset) as one AICM body."""
+    from engine.doc import assembly as asm
+    import numpy as np
+    ares = session.asm_result
+    body_tesses: list[tess.BodyTess] = []
+    bodies_meta: list[dict] = []
+    offsets = asm.explode_offsets(session.doc, session.explode_factor) if session.explode_active else {}
+    for body in (ares.bodies if ares else []):
+        off = offsets.get(body.component_id)
+        world = asm.placed_world_shape(body, np.asarray(off) if off is not None else None)
+        color = tuple(body.color)
+        bt = tess.tessellate_body(world, body_id=body.body_id, name=body.name, color=color)
+        body_tesses.append(bt)
+        bodies_meta.append({"body_id": body.body_id, "name": body.name,
+                            "color": list(color), "component": body.component_id})
+    aicm = _aicm_path(session.doc_id, session.revision)
+    tess.write_aicm_file(aicm, body_tesses)
+    return str(aicm), bodies_meta
+
+
 def _tree(session: DocSession) -> dict:
     return copy.deepcopy(session.doc)
 
 
 def _doc_status(session: DocSession, result: CompileResult) -> dict:
     st = session.active_sketch
-    return {"active_sketch": st.last_overall_status if st else None, "mates": None}
+    mates_status = None
+    if session.is_assembly and session.asm_result is not None:
+        mates_status = "over" if session.asm_result.over_defined else "ok"
+    return {"active_sketch": st.last_overall_status if st else None, "mates": mates_status}
 
 
 def _ops_response(session: DocSession, result: CompileResult,
                   id_map: dict[str, str]) -> dict:
     aicm_path, bodies_meta = _write_aicm(session, result)
-    feature_status = [
-        {"id": s["id"], "ok": s["ok"], "ms": s["ms"], "error": s["error"],
-         "dangling_refs": s.get("dangling_refs", [])}
-        for s in result.feature_status
-    ]
+    if session.is_assembly and session.asm_result is not None:
+        ares = session.asm_result
+        # feature_status carries component build status (one row per loaded component).
+        feature_status = [
+            {"id": cs["id"], "ok": cs["ok"], "ms": cs["ms"], "error": cs["error"],
+             "dangling_refs": cs.get("dangling_refs", [])}
+            for cs in ares.component_status
+        ]
+        rebuild = {
+            "feature_status": feature_status,
+            "doc_status": _doc_status(session, result),
+            "components": ares.component_status,
+            "mates": ares.mate_status,
+            "dof": ares.dof,
+            "over_defined": ares.over_defined,
+            "dof_summary": ares.dof_summary,
+        }
+    else:
+        feature_status = [
+            {"id": s["id"], "ok": s["ok"], "ms": s["ms"], "error": s["error"],
+             "dangling_refs": s.get("dangling_refs", [])}
+            for s in result.feature_status
+        ]
+        rebuild = {
+            "feature_status": feature_status,
+            "doc_status": _doc_status(session, result),
+        }
     return {
         "revision": session.revision,
         "id_map": id_map,
         "tree": _tree(session),
-        "rebuild": {
-            "feature_status": feature_status,
-            "doc_status": _doc_status(session, result),
-        },
+        "rebuild": rebuild,
         "tess": {"aicm_path": aicm_path, "bodies": bodies_meta},
     }
 
@@ -316,6 +395,7 @@ def undo(session: DocSession, emit: EmitFn | None = None) -> dict:
     session.doc = json.loads(snap)
     session.revision += 1
     session.dirty = True
+    session.asm_warm = {}  # re-seed mate solve from the restored doc transforms
     result = _rebuild(session, emit)
     return _ops_response(session, result, {})
 
@@ -331,18 +411,177 @@ def redo(session: DocSession, emit: EmitFn | None = None) -> dict:
     session.doc = json.loads(snap)
     session.revision += 1
     session.dirty = True
+    session.asm_warm = {}  # re-seed mate solve from the restored doc transforms
     result = _rebuild(session, emit)
     return _ops_response(session, result, {})
+
+
+# =========================================================================== C20 assembly methods
+#
+# Re-solve mates (doc_solve_mates) and explode-state toggle (doc_set_explode_state). solve_mates
+# accepts an optional drag {component, target[3]} for free-DOF move; it re-solves, persists the
+# new transforms into the doc, bumps the revision (one undoable step), and returns an ops-response.
+
+
+def solve_mates(session: DocSession, drag: dict | None = None,
+                emit: EmitFn | None = None) -> dict:
+    """Re-solve the assembly mates (optionally with a drag soft-target) and return an ops-response.
+
+    A solve is a document mutation (component transforms change), so it pushes an undo snapshot and
+    bumps the revision exactly like an op batch."""
+    if not session.is_assembly:
+        raise OpError("invalid_op", "doc_solve_mates: document is not an assembly",
+                      {"reason": "not an assembly"})
+    from engine.doc import assembly as asm
+    base_dir = os.path.dirname(session.path) if session.path else None
+    session._push_undo()
+    ares = asm.compile_assembly(session.doc, base_dir=base_dir,
+                                warm=session.asm_warm or None) if drag is None else \
+        _compile_assembly_drag(session, asm, base_dir, drag)
+    for comp in session.doc.get("components", []):
+        if comp["id"] in ares.transforms:
+            comp["transform"] = ares.transforms[comp["id"]]
+    session.asm_result = ares
+    session.asm_warm = ares.warm
+    session.revision += 1
+    session.dirty = True
+    if session.last_result is None:
+        session.last_result = CompileResult()
+    return _ops_response(session, session.last_result, {})
+
+
+def _compile_assembly_drag(session: DocSession, asm, base_dir, drag: dict):
+    """compile_assembly with a drag soft-target threaded through to the mate solver."""
+    # compile_assembly doesn't take a drag arg directly; replicate its solve with drag by calling
+    # the mate solver inside a thin wrapper. We reuse compile_assembly for load+resolve, then a
+    # second solve_mates pass with the drag target using the warm result.
+    ares = asm.compile_assembly(session.doc, base_dir=base_dir, warm=session.asm_warm or None)
+    # Now re-solve with the drag soft target, reusing freshly-loaded geometry by going through the
+    # public mate solver against the doc's (now solved) transforms as the warm start.
+    from engine.doc.mate_solver import solve_mates as _solve
+    components = [c for c in session.doc.get("components", []) if not c.get("suppressed")]
+    loaded_ok = {b.component_id for b in ares.bodies}
+    solve_components = [
+        {"id": c["id"], "transform": ares.transforms.get(c["id"], c.get("transform")),
+         "fixed": bool(c.get("fixed", False)), "suppressed": False}
+        for c in components if c["id"] in loaded_ok
+    ]
+    # rebuild resolved geometry the same way compile_assembly did
+    resolved_geometry = _asm_resolved_geometry(session.doc, base_dir, asm)
+    res = _solve(solve_components, session.doc.get("mates", []), resolved_geometry,
+                 warm=ares.warm, drag=drag, time_budget_ms=120.0)
+    # repackage into an AssemblyResult-like object using ares as the template
+    ares.transforms = res.transforms
+    ares.warm = {cid: res.params[cid] for cid in res.params}
+    ares.dof = res.dof
+    ares.over_defined = res.over_defined
+    ares.converged = res.converged
+    ares.dof_summary = res.summary
+    ares.mate_status = [{"id": m.mate_id, "type": m.type, "status": m.status,
+                         "dangling_refs": []} for m in res.mate_status]
+    for b in ares.bodies:
+        b.transform = list(res.transforms.get(b.component_id, b.transform))
+    return ares
+
+
+def _asm_resolved_geometry(doc: dict, base_dir, asm) -> dict:
+    """Resolve every mate ref to a local-frame MateGeom (mirror of compile_assembly's pass)."""
+    loaded = {}
+    for comp in doc.get("components", []):
+        if comp.get("suppressed"):
+            continue
+        try:
+            loaded[comp["id"]] = asm.load_component(comp["source"]["path"], base_dir)
+        except Exception:  # noqa: BLE001
+            pass
+    resolved = {}
+    for mate in doc.get("mates", []):
+        if mate.get("suppressed"):
+            continue
+        mid = mate["id"]
+        for i, ref in enumerate(mate.get("refs", [])[:2]):
+            lc = loaded.get(ref.get("component"))
+            sel_obj = ref.get("selector")
+            if lc is None or not isinstance(sel_obj, dict):
+                continue
+            geom = asm._selector_to_mategeom(sel_obj, lc)
+            if geom is not None:
+                resolved[(mid, i)] = geom
+    return resolved
+
+
+def set_explode_state(session: DocSession, active: bool, factor: float,
+                      emit: EmitFn | None = None) -> dict:
+    """Toggle exploded-view state and re-tessellate (no revision bump — view-only state)."""
+    if not session.is_assembly:
+        raise OpError("invalid_op", "doc_set_explode_state: document is not an assembly",
+                      {"reason": "not an assembly"})
+    session.explode_active = bool(active)
+    session.explode_factor = max(0.0, min(1.0, float(factor)))
+    if session.asm_result is None:
+        _rebuild(session, emit)
+    if session.last_result is None:
+        session.last_result = CompileResult()
+    return _ops_response(session, session.last_result, {})
 
 
 # --------------------------------------------------------------------------- resolve pick
 
 
 def _ensure_built(session: DocSession) -> CompileResult:
+    if session.is_assembly:
+        if session.asm_result is None:
+            _rebuild(session)
+        if session.last_result is None:
+            session.last_result = CompileResult()
+        return session.last_result
     if session.last_result is None:
         _rebuild(session)
     assert session.last_result is not None
     return session.last_result
+
+
+def asm_world_bodies(session: DocSession, explode: bool = False) -> list[tuple[str, Any]]:
+    """World-placed ``(component_name, shape)`` for each assembly component (interference / BOM).
+
+    ``explode=False`` ignores the explode offset (interference/mass measure the real assembly).
+    """
+    from engine.doc import assembly as asm
+    import numpy as np
+    if session.asm_result is None:
+        _rebuild(session)
+    ares = session.asm_result
+    if ares is None:
+        return []
+    offsets = asm.explode_offsets(session.doc, session.explode_factor) \
+        if (explode and session.explode_active) else {}
+    out: list[tuple[str, Any]] = []
+    for body in ares.bodies:
+        off = offsets.get(body.component_id)
+        world = asm.placed_world_shape(body, np.asarray(off) if off is not None else None)
+        out.append((body.name, world))
+    return out
+
+
+def asm_component_bodies(session: DocSession) -> list[dict]:
+    """Per-component local-shape list for BOM (name, source path, shape) — mass measured locally
+    (mass is transform-invariant, so no need to world-place)."""
+    if session.asm_result is None:
+        _rebuild(session)
+    ares = session.asm_result
+    if ares is None:
+        return []
+    out: list[dict] = []
+    by_id = {c["id"]: c for c in session.doc.get("components", [])}
+    for body in ares.bodies:
+        comp = by_id.get(body.component_id, {})
+        out.append({
+            "component": body.component_id,
+            "name": body.name,
+            "source": (comp.get("source") or {}).get("path", ""),
+            "shape": body.shape_local,
+        })
+    return out
 
 
 def _bbox_diag(shape) -> float:
@@ -368,6 +607,9 @@ def resolve_pick(session: DocSession, revision: int | None,
         raise OpError("stale_revision",
                       f"revision {revision} != current {session.revision}",
                       {"current_revision": session.revision})
+
+    if session.is_assembly:
+        return _resolve_pick_assembly(session, body_id, kind, topo_id)
 
     result = _ensure_built(session)
     bodies = _solid_bodies(result)
@@ -409,6 +651,47 @@ def resolve_pick(session: DocSession, revision: int | None,
 
     selector = sel.make_selector(info)
     return {"selector": selector}
+
+
+def _resolve_pick_assembly(session: DocSession, body_id: int, kind: str, topo_id: int) -> dict:
+    """Resolve a pick in an assembly: body_id = component ordinal, topo_id indexes that component's
+    LOCAL topology (TopExp order is transform-invariant, so the world AICM ids match local ids).
+
+    Returns ``{selector, component}`` so the host can build a mate ref ``{component, selector}``."""
+    _rebuild_if_needed(session)
+    ares = session.asm_result
+    if ares is None or body_id < 1 or body_id > len(ares.bodies):
+        raise OpError("invalid_op", f"body_id {body_id} out of range for assembly",
+                      {"reason": "bad body_id"})
+    abody = ares.bodies[body_id - 1]
+    shape_local = abody.shape_local
+
+    if kind == "body":
+        return {"selector": {"kind": "body", "owner_feature": ""}, "component": abody.component_id}
+
+    raw = shape_local.wrapped
+    if kind == "face":
+        infos = sel.describe_faces(raw)
+    elif kind == "edge":
+        infos = sel.describe_edges(raw)
+    elif kind == "vertex":
+        infos = sel.describe_vertices(raw)
+    else:
+        raise OpError("invalid_op", f"kind '{kind}' must be face|edge|vertex|body",
+                      {"reason": "bad kind"})
+    if topo_id < 1 or topo_id > len(infos):
+        raise OpError("invalid_op",
+                      f"topo_id {topo_id} out of range (1..{len(infos)}) for {kind}",
+                      {"reason": "bad topo_id"})
+    info = infos[topo_id - 1]
+    info.hint_index = topo_id - 1
+    selector = sel.make_selector(info)
+    return {"selector": selector, "component": abody.component_id}
+
+
+def _rebuild_if_needed(session: DocSession) -> None:
+    if session.asm_result is None:
+        _rebuild(session)
 
 
 def _body_owner(result: CompileResult, bo) -> str:

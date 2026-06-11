@@ -560,9 +560,18 @@ def _op_asm_insert_component(doc, op, index, idgen, id_map):
     kid = idgen.next("k")
     comps = doc.setdefault("components", [])
     first = len(comps) == 0
+    # Default name = source file stem (SolidWorks names components from the file).
+    default_name = kid
+    if source.get("path"):
+        stem = str(source["path"]).replace("\\", "/").rsplit("/", 1)[-1]
+        for ext in (".step+", ".step", ".stp", ".stl", ".brep", ".iges", ".igs"):
+            if stem.lower().endswith(ext):
+                stem = stem[: -len(ext)]
+                break
+        default_name = stem or kid
     comp = {
         "id": kid,
-        "name": op.get("name") or kid,
+        "name": op.get("name") or default_name,
         "source": source,
         "transform": op.get("transform") or _identity16(),
         "fixed": bool(op.get("fixed", first)),

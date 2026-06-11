@@ -86,7 +86,7 @@ unit suffixes ("2.50in"), reverse-direction arrow buttons next to direction drop
   appearance editor, scene/lighting editor, RealView toggles, mate PMs (assembly),
   drawing mode anything, Instant3D drag handles.
 
-## Status (C25–C28)
+## Status (C25–C30)
 
 | Catalog item | Status | Notes |
 |---|---|---|
@@ -104,7 +104,12 @@ unit suffixes ("2.50in"), reverse-direction arrow buttons next to direction drop
 | **Convert Fillet↔Chamfer** | SHIPPED C27 | Context menu option to toggle feature type; tree/icon update |
 | **Conic sketch entities** | SHIPPED C28 | Ellipse Arc, Parabola, Conic in Ellipse flyout (entity creation + constraint/solve); test_sketch_conics.py |
 | **Sketch input variants** | SHIPPED C28 | 3-point corner/center rectangle, parallelogram, perimeter circle, centerpoint slot, arc slots enabled |
-| **Zonal/multi-plane section** | SHIPPED C28 | Section Method dropdown (Planar | Zonal); up to 3 independent planes; per-plane offsets/rotations/caps; AI_CAD_SECTION=2/3 debug knobs |
-| **Fillet type tabs** | OPEN | Variable Size, Face Fillet, Full Round tab row in PM (Constant Size shipped) |
+| **Zonal/multi-plane section** | SHIPPED C28 | Section Method dropdown (Planar | Zonal); up to 3 independent planes; per-plane offsets/rotations/caps; AI_CAD_SECTION=2/3 debug knobs (AI_CAD_SECTION_PANEL=1 forces panel open) |
+| **Trim / Extend / Offset** | SHIPPED C29 | Sketch-tab Trim, Extend, Offset entity tools |
+| **3-plane zonal section** | SHIPPED C29 | Corner-octant cut (stencil-masked caps per plane, cross-plane clipping); AI_CAD_SECTION=3 |
+| **Variable-size fillet** | SHIPPED C30 | Fillet PM "Fillet Type" combo Constant Size | Variable Size; End Radius field gated on Variable; engine per-side radius |
+| **Arc slot (3-pt + centerpoint)** | SHIPPED C30 | 3 Point Arc Slot, Centerpoint Arc Slot enabled in Slot flyout |
+| **RealView reflections** | SHIPPED C30 | RealView sheen/reflections in viewport (theme-aware); hide/show toggle |
+| **Fillet type tabs (Face/Full Round)** | OPEN | Constant + Variable shipped; Face Fillet and Full Round remain "(coming soon)" rows in PM |
 | **Hole Wizard advanced tabs** | OPEN | Callout, Positions, Thread, Cosmetic (simple/cbore/csink core shipped, advanced deferred) |
-| **RealView-class rendering** | OPEN | Material library, reflections, photorealistic surface finish (qualitative CFD model is baseline) |
+| **RealView material library** | OPEN | Material picker / photorealistic finish presets (reflections shipped C30; qualitative CFD model is baseline) |

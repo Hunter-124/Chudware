@@ -598,11 +598,22 @@ void PropertyManager::draw(AppState& st) {
         ImGui::TextUnformatted(title_.c_str());
         ImGui::PopStyleColor();
 
-        // OK / Cancel buttons, right-aligned.
-        float btnW = 30.0f;
-        float avail = ImGui::GetContentRegionAvail().x;
-        ImGui::SameLine(0, 0);
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - btnW * 2 - 8));
+        // OK / Cancel buttons, right-aligned. Anchor from the window's right inner
+        // edge so a narrow dock never clips the buttons ("OK" -> "OI"). The pair
+        // needs btnW*2 + the 4px gap between them; pin its left edge inside the
+        // content region. Wrap to a new line if the title leaves no room.
+        float btnW = 28.0f;
+        float pairW = btnW * 2 + 4;
+        float rightX = ImGui::GetWindowContentRegionMax().x - pairW;
+        float afterTitleX = ImGui::GetCursorPosX();
+        if (rightX > afterTitleX + 6) {
+            ImGui::SameLine(0, 0);
+            ImGui::SetCursorPosX(rightX);
+        } else {
+            // Title too wide for same line: drop the buttons to their own row,
+            // still right-aligned, so neither overlaps the title nor clips.
+            ImGui::SetCursorPosX(rightX < 0 ? 0 : rightX);
+        }
 
         ImGui::PushStyleColor(ImGuiCol_Button,
             ImVec4(pal.accentDim[0], pal.accentDim[1], pal.accentDim[2], 1));
@@ -764,10 +775,21 @@ void PropertyManager::draw(AppState& st) {
             }
             case PMFieldKind::Check: {
                 bool val = f.checkValue;
-                if (ImGui::Checkbox(f.def->label, &val)) {
+                // Render the box with no inline label, then place the label on the
+                // same row with wrapping enabled. ImGui's built-in Checkbox label
+                // never wraps and gets clipped on a narrow dock (e.g. the long
+                // "Tangent propagation (coming soon)" rows) — wrap it ourselves.
+                if (ImGui::Checkbox("##chk", &val)) {
                     if (enabled) { f.checkValue = val; dirty_ = true; lastEditTime_ = ImGui::GetTime(); }
                 }
-                if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                bool boxHov = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
+                ImGui::SameLine(0, ImGui::GetStyle().ItemInnerSpacing.x);
+                float wrapX = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+                ImGui::PushTextWrapPos(wrapX);
+                ImGui::TextUnformatted(f.def->label);
+                ImGui::PopTextWrapPos();
+                if (f.def->comingSoon &&
+                    (boxHov || ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)))
                     ImGui::SetTooltip("Not yet supported by engine");
                 break;
             }

@@ -364,10 +364,6 @@ int run_gui(const char* screenshotPath) {
         st.showRibbon = true; st.ribbonTab = 4;  // Assembly tab forward
         st.showActivityPanel = false;            // keep the FeatureManager (Mates folder) unobscured
     }
-    std::fprintf(stderr, "startup: shot=%d shotMode=%s wantM1=%d wantSketch=%d workerStarted=%d\n",
-                 (int)shot, shotMode ? shotMode : "(null)", (int)st.wantM1, (int)st.wantSketch,
-                 (int)st.workerStarted);
-    std::fflush(stderr);
     // ribbon shot: show Features tab by default; AI_CAD_TAB=<0..4> selects which tab to capture
     // (0=Features 1=Sketch 2=Evaluate 3=Simulation 4=Assembly) for headless per-tab verification.
     if (st.wantRibbon) {
@@ -828,11 +824,6 @@ int run_gui(const char* screenshotPath) {
         static std::string m1FilletId;   // feature id of the fillet (for the edit step)
         static double m1FilletMsBeforeEdit = -1.0, m1BoxMsBeforeEdit = -1.0;
         static std::string m1SavePath;
-        if (st.wantM1) {
-            std::fprintf(stderr, "m1-dbg frame=%d step=%d settle=%d cap=%d done=%d\n",
-                         st.frame, m1Step, m1Settle, (int)!m1Capture.empty(), (int)st.m1ShotDone);
-            std::fflush(stderr);
-        }
         if (st.wantM1 && st.workerStarted && !st.m1ShotDone) {
             // Resolve repo-relative scratch dir for screenshots.
             static bool m1DirReady = false;

@@ -104,7 +104,10 @@ void SectionTool::updateAndDraw(AppState& st, Renderer& renderer, bool imgHovere
             int n = e[0] - '0';
             if (n >= 1 && n <= 3) {
                 m_active = true;
-                m_collapsed = false;
+                // Debug captures want the cut geometry visible, not the PM panel
+                // covering it. AI_CAD_SECTION_PANEL=1 forces the panel open.
+                const char* pe = std::getenv("AI_CAD_SECTION_PANEL");
+                m_collapsed = !(pe && pe[0] == '1');
                 m_planeCount = n;
                 for (int i = 0; i < kMaxPlanes; ++i) {
                     m_planes[i] = PlaneState{};

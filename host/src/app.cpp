@@ -907,6 +907,32 @@ int run_gui(const char* screenshotPath) {
                         std::printf("m1: box ok=%d rev=%d id=%s ms=%.2f\n",
                                     (int)r.ok, r.revision, boxId.c_str(), statusMs(r, boxId));
                         std::fflush(stdout);
+                        // C32-A material proof: AI_CAD_MATERIAL=<plastic|aluminum|steel|brass|dark>
+                        // applies the matching RealView preset to body b1 so a headless shot can be
+                        // judged for metallic realism (clear env reflection + tinted fresnel).
+                        if (const char* mat = std::getenv("AI_CAD_MATERIAL")) {
+                            struct P { const char* k; float m, rough, rgb[3]; };
+                            static const P kP[] = {
+                                {"plastic",  0.00f, 0.50f, {0.71f, 0.76f, 0.82f}},
+                                {"aluminum", 0.90f, 0.35f, {0.83f, 0.85f, 0.88f}},
+                                {"steel",    0.85f, 0.25f, {0.56f, 0.58f, 0.62f}},
+                                {"brass",    0.95f, 0.30f, {0.80f, 0.62f, 0.28f}},
+                                {"dark",     0.90f, 0.45f, {0.16f, 0.17f, 0.19f}},
+                            };
+                            for (const auto& p : kP) {
+                                if (std::strcmp(mat, p.k) == 0) {
+                                    nlohmann::json mop = nlohmann::json::array();
+                                    mop.push_back({{"op","set_appearance"},{"id","b1"},
+                                        {"color",{p.rgb[0],p.rgb[1],p.rgb[2]}},
+                                        {"metallic",p.m},{"roughness",p.rough}});
+                                    auto rm = st.docMirror.applyOps(st.worker, mop); loadMesh(rm);
+                                    std::printf("m1: material '%s' applied ok=%d rev=%d\n",
+                                                p.k, (int)rm.ok, rm.revision);
+                                    std::fflush(stdout);
+                                    break;
+                                }
+                            }
+                        }
                         st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
                         m1Capture = m1SavePath + "\\m1_02_box.png"; m1Settle = kSettle;
                         break;

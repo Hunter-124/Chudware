@@ -46,6 +46,8 @@ uniform int   uClipCount;              // C28-C: 0 = off; 1..3 active planes
 uniform vec3  uClipN[3];               // plane normals
 uniform float uClipOff[3];            // plane offsets
 uniform float uRealView;               // C30-C: 0 = off, 1 = environment reflections on
+uniform float uMetallic;               // C32-A: 0 = dielectric, 1 = metal
+uniform float uRoughness;              // C32-A: 0 = mirror, 1 = matte
 out vec4 frag;
 
 // C30-C: procedural studio environment sampled by a reflected direction R (Z-up world).
@@ -104,18 +106,36 @@ void main(){
     float edge = pow(1.0 - max(dot(N, V), 0.0), 2.0);
     vec3 rimLight = rimCol * (rim * edge * 0.10);
 
+    // C32-A: a metal absorbs most of its diffuse term (the body color survives mainly as the tint of
+    // the environment reflection below). Dielectric (metallic 0) keeps the full diffuse = C30 look.
+    float diffK = 1.0 - uMetallic * 0.7;
+
+    // C32-A: specular exponent narrows for a polished surface, widens for a rough one. Anchored so
+    // roughness 0.5 == the C30 dielectric highlight (exp 56): mix(100,12,0.5) = 56, weight 0.13.
     vec3 H = normalize(normalize(uKeyDir) + V);
-    float spec = pow(max(dot(N, H), 0.0), 56.0) * 0.13;
+    float specExp = mix(100.0, 12.0, uRoughness);
+    float spec = pow(max(dot(N, H), 0.0), specExp) * 0.13;
 
-    vec3 c = base * (diffuse + ambient) + rimLight + keyCol * spec;
+    vec3 c = base * ((diffuse + ambient) * diffK) + rimLight + keyCol * spec;
 
-    // C30-C: RealView environment sheen. Schlick fresnel (F0=0.04 dielectric) weights a procedural
-    // studio reflection — a whisper on flat faces, a clear pickup at grazing angles. Gated off for
-    // the FEA colormap path so results stay readable. k kept low so plastic/aluminum, not chrome.
+    // C30-C + C32-A: RealView environment reflection. Schlick fresnel weights a procedural studio
+    // reflection. F0 lifts from the dielectric 0.04 toward a body-color-tinted 0.6 with metallic, and
+    // the strength k climbs from 0.42 (plastic sheen) to ~0.8 (clear metal). Roughness fakes a blur
+    // by mixing the sharp env(R) toward the hemisphere ambient. Gated off for the FEA colormap path.
     if (uRealView > 0.5 && uUseScalar == 0) {
-        float fres = 0.04 + 0.96 * pow(1.0 - max(dot(N, V), 0.0), 5.0);
         vec3 R = reflect(-V, N);
-        c += pow(env(R), vec3(2.2)) * fres * 0.42;   // env is sRGB-ish -> to linear before add
+        float fres = 0.04 + 0.96 * pow(1.0 - max(dot(N, V), 0.0), 5.0);
+        vec3 F0   = mix(vec3(0.04), base * 0.6 + 0.4 * uMetallic, uMetallic);
+        vec3 F    = F0 + (1.0 - F0) * pow(1.0 - max(dot(N, V), 0.0), 5.0);
+        vec3 fresV = mix(vec3(fres), F, uMetallic);   // dielectric -> scalar Schlick (C30 identity)
+        float k   = mix(0.42, 0.80, uMetallic);
+        vec3 envSharp = pow(env(R), vec3(2.2));
+        vec3 envAmb   = pow(mix(gndCol, skyCol, hemi), vec3(2.2));  // matte = diffuse env, no mirror
+        // Blur is anchored at roughness 0.5 (the C30 plastic baseline = sharp env, no blur): only
+        // rougher-than-0.5 surfaces mix toward the ambient env, so the dielectric default is exact.
+        float blur = clamp((uRoughness - 0.5) * 2.0, 0.0, 1.0) * 0.7;
+        vec3 envRefl  = mix(envSharp, envAmb, blur);
+        c += envRefl * fresV * k;
     }
     c = pow(max(c, 0.0), vec3(1.0 / 2.2));  // linear -> sRGB
     frag = vec4(c, 1.0);
@@ -481,6 +501,8 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
         s.color[0] = unset ? defaultPart_[0] : part.color[0];
         s.color[1] = unset ? defaultPart_[1] : part.color[1];
         s.color[2] = unset ? defaultPart_[2] : part.color[2];
+        s.metallic = part.metallic;     // C32-A RealView material
+        s.roughness = part.roughness;
         // C19: keep CPU copies so the deform slider can re-upload displaced positions.
         s.basePos = m.positions;
         s.baseEdge = m.edgeLines;
@@ -646,6 +668,8 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     int useScalarLoc = glGetUniformLocation(prog_, "uUseScalar");
     int sminLoc = glGetUniformLocation(prog_, "uScalarMin");
     int smaxLoc = glGetUniformLocation(prog_, "uScalarMax");
+    int metallicLoc = glGetUniformLocation(prog_, "uMetallic");   // C32-A RealView material
+    int roughnessLoc = glGetUniformLocation(prog_, "uRoughness");
     // Bind the colormap LUT to texture unit 0.
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, lutTex_);
@@ -677,6 +701,8 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
             }
             if (hlr) glUniform3fv(colorLoc, 1, bgMid_);
             else     glUniform3f(colorLoc, s.color[0], s.color[1], s.color[2]);
+            glUniform1f(metallicLoc, s.metallic);    // C32-A per-body RealView material
+            glUniform1f(roughnessLoc, s.roughness);
             glBindVertexArray(s.vao);
             glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);
         }
@@ -825,10 +851,14 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px) {
     glUniform1i(glGetUniformLocation(prog_, "uClipCount"), 0);  // thumbnail: no section clip
     glUniform1f(glGetUniformLocation(prog_, "uRealView"), 1.0f);  // C30-C: reflections on in previews
     int colorLoc = glGetUniformLocation(prog_, "uColor");
+    int metallicLoc = glGetUniformLocation(prog_, "uMetallic");   // C32-A RealView material
+    int roughnessLoc = glGetUniformLocation(prog_, "uRoughness");
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(1.0f, 1.0f);
     for (const auto& s : subs_) {
         glUniform3f(colorLoc, s.color[0], s.color[1], s.color[2]);
+        glUniform1f(metallicLoc, s.metallic);
+        glUniform1f(roughnessLoc, s.roughness);
         glBindVertexArray(s.vao);
         glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);
     }

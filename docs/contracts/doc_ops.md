@@ -64,7 +64,7 @@ Ops that create objects may be referenced by later ops **in the same batch** as 
 | `set_suppressed` | `id`, `value:bool` | |
 | `rename` | `id`, `name` | |
 | `set_material` | `key` | part docs |
-| `set_appearance` | `id` (body key), `color: [r,g,b] 0..1 \| null` | C26 body color; `id` = `"b<ordinal>"` (part body, 1-based AICM body id) or component id (assembly body); `null` clears to the default. Stored in `appearances: {body_key: [r,g,b]}`; round-trips through save/open and is baked into the AICM BODY chunk color the renderer reads. Slightly-off floats are clamped, not rejected. |
+| `set_appearance` | `id` (body key), `color: [r,g,b] 0..1 \| null`, `metallic: 0..1?`, `roughness: 0..1?` | C26 body color + C32-A RealView material; `id` = `"b<ordinal>"` (part body, 1-based AICM body id) or component id (assembly body); `null` color clears to the default. Stored in `appearances: {body_key: ...}` where the value is a bare `[r,g,b]` (color only) OR `{color,metallic,roughness}` (set when `metallic`/`roughness` are supplied — both forms accepted on read and round-trip through save/open). Baked into the AICM BODY chunk: color + a 2-float material trailer appended after `idx` (length-prefixed chunk, so pre-C32 readers skip it and fall back to dielectric `metallic 0 / roughness 0.5`). Slightly-off floats are clamped, not rejected. |
 | `set_units` | `system: MMGS\|IPS` | display-only |
 | `eq_set` | `name`, `expr` | create-or-update; re-validates dependents |
 | `eq_delete` | `name` | fails `eq_in_use` if referenced |

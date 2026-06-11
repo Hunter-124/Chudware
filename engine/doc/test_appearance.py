@@ -51,6 +51,14 @@ def _aicm_color(path: str) -> tuple:
     return tuple(round(c, 4) for c in doc["bodies"][0]["color"])
 
 
+def _aicm_material(path: str) -> tuple:
+    """(metallic, roughness) carried in the body's AICM BODY chunk trailer (C32-A)."""
+    doc = read_aicm(open(path, "rb").read())
+    assert len(doc["bodies"]) == 1
+    b = doc["bodies"][0]
+    return round(float(b["metallic"]), 4), round(float(b["roughness"]), 4)
+
+
 def test_set_appearance_roundtrip_and_undo() -> None:
     s = _box_session()
     # Discover the body's stable owner key from the rebuild meta (owner-feature id for a part).
@@ -127,10 +135,96 @@ def test_set_appearance_validation() -> None:
     print("[appearance] validation OK")
 
 
+# --------------------------------------------------------------------------- C32-A material
+
+_ALU = [0.83, 0.85, 0.88]
+
+
+def test_material_object_roundtrip() -> None:
+    """Object-form appearance (color + metallic + roughness): set -> AICM carries the trailer ->
+    save/reopen keeps it -> undo restores the default dielectric."""
+    s = _box_session()
+    owner = docsess.rebuild(s)["tess"]["bodies"][0]["owner_key"]
+
+    # Pre-C32 default body: dielectric (metallic 0, roughness 0.5) in the AICM trailer.
+    resp0 = docsess.rebuild(s)
+    assert _aicm_material(resp0["tess"]["aicm_path"]) == (0.0, 0.5)
+
+    resp = docsess.apply_ops(s, None, [{"op": "set_appearance", "id": owner,
+                                        "color": _ALU, "metallic": 0.9, "roughness": 0.35}])
+    # Stored as the object form.
+    assert s.doc["appearances"][owner] == {"color": _ALU, "metallic": 0.9, "roughness": 0.35}
+    # Ops-response tess meta carries the material.
+    bodies = resp["tess"]["bodies"]
+    assert round(bodies[0]["metallic"], 4) == 0.9 and round(bodies[0]["roughness"], 4) == 0.35
+    # AICM BODY chunk trailer carries it (this is what the renderer reads).
+    assert _aicm_color(resp["tess"]["aicm_path"]) == tuple(round(c, 4) for c in _ALU)
+    assert _aicm_material(resp["tess"]["aicm_path"]) == (0.9, 0.35)
+
+    # save -> open round-trips the object-form appearance.
+    tmpdir = tempfile.mkdtemp()
+    path = os.path.join(tmpdir, "metal.step+")
+    stepplus.save(s, path)
+    s2, warnings = stepplus.open(path)
+    assert warnings == [], warnings
+    assert s2.doc.get("appearances", {}).get(owner) == \
+        {"color": _ALU, "metallic": 0.9, "roughness": 0.35}
+    resp2 = docsess.rebuild(s2)
+    assert _aicm_material(resp2["tess"]["aicm_path"]) == (0.9, 0.35)
+
+    # undo restores the default dielectric.
+    resp_u = docsess.undo(s)
+    assert s.doc.get("appearances", {}).get(owner) is None
+    assert _aicm_material(resp_u["tess"]["aicm_path"]) == (0.0, 0.5)
+    print(f"[appearance] material object round-trip/undo OK (owner={owner})")
+
+
+def test_material_legacy_array_still_accepted() -> None:
+    """A bare [r,g,b] appearance (C26 form) is still valid and yields the dielectric default."""
+    s = _box_session()
+    owner = docsess.rebuild(s)["tess"]["bodies"][0]["owner_key"]
+    resp = docsess.apply_ops(s, None, [{"op": "set_appearance", "id": owner, "color": _RED}])
+    assert s.doc["appearances"][owner] == _RED   # bare-array form preserved
+    assert _aicm_material(resp["tess"]["aicm_path"]) == (0.0, 0.5)
+    # Schema directly accepts a legacy-array appearances map.
+    legacy = dict(s.doc); legacy["appearances"] = {"b1": [0.1, 0.2, 0.3]}
+    assert validate_part(legacy) == [] or all("appearances" not in m for m in validate_part(legacy))
+    # Schema directly accepts an object-form appearances map.
+    objdoc = dict(s.doc)
+    objdoc["appearances"] = {"b1": {"color": [0.1, 0.2, 0.3], "metallic": 0.5, "roughness": 0.2}}
+    assert all("appearances" not in m for m in validate_part(objdoc))
+    print("[appearance] legacy-array + object schema acceptance OK")
+
+
+def test_material_clamping() -> None:
+    """metallic/roughness are clamped to 0..1; malformed types rejected; the schema rejects
+    out-of-range object-form material."""
+    s = _box_session()
+    owner = docsess.rebuild(s)["tess"]["bodies"][0]["owner_key"]
+    clamped, _ = apply_ops(s.doc, [{"op": "set_appearance", "id": owner, "color": _ALU,
+                                    "metallic": 1.4, "roughness": -0.2}])
+    ap = clamped["appearances"][owner]
+    assert ap["metallic"] == 1.0 and ap["roughness"] == 0.0, ap
+    # Non-numeric metallic rejected.
+    try:
+        apply_ops(s.doc, [{"op": "set_appearance", "id": owner, "color": _ALU, "metallic": "x"}])
+        raise AssertionError("expected rejection of non-numeric metallic")
+    except OpError as e:
+        assert e.code == "invalid_op", e.code
+    # Schema rejects an out-of-range object-form material.
+    bad = dict(s.doc)
+    bad["appearances"] = {"b1": {"color": [0.1, 0.2, 0.3], "metallic": 2.0}}
+    assert any("appearances" in m for m in validate_part(bad))
+    print("[appearance] material clamping + validation OK")
+
+
 def main() -> None:
     test_set_appearance_roundtrip_and_undo()
     test_set_appearance_clear()
     test_set_appearance_validation()
+    test_material_object_roundtrip()
+    test_material_legacy_array_still_accepted()
+    test_material_clamping()
     print("\nAPPEARANCE TESTS PASSED")
 
 

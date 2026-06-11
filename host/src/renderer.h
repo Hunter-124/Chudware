@@ -29,6 +29,9 @@ public:
     struct PartMesh {
         Mesh mesh;
         float color[3] = {0.62f, 0.70f, 0.80f};
+        // C32-A RealView material (0 metallic / 0.5 roughness == dielectric plastic, the C30 look).
+        float metallic = 0.0f;
+        float roughness = 0.5f;
         std::vector<float> scalar;       // n_verts values (NaN = neutral); empty = no field
         float scalarMin = 0.0f, scalarMax = 1.0f;
         std::vector<float> disp;         // 3*n_verts displacement vectors (mm); empty = none
@@ -142,6 +145,7 @@ private:
         unsigned int vboScalar = 0;   // C19: per-vertex scalar attribute (location 2); 0 = none
         int idxCount = 0, edgeVerts = 0;
         float color[3] = {0.62f, 0.70f, 0.80f};
+        float metallic = 0.0f, roughness = 0.5f;  // C32-A RealView material
         // CPU-side copies kept so the deform slider can re-upload displaced positions.
         std::vector<float> basePos;   // undeformed positions (3*n)
         std::vector<float> baseEdge;  // undeformed edge-line verts (3*k)

@@ -273,6 +273,74 @@ def _parabola_pt_jac(xs):
     return J
 
 
+# --- Conic-family curve evaluators (C32-B point_on / tangent) ---------------
+#
+# These map an entity's full variable slice + a curve parameter to the world
+# point P and the (un-normalized) tangent dP/dparam. Used by point_on (closest-
+# param projection) and tangent (param where curve tangent ∥ line). Range-free:
+# point_on/tangent ignore the a0..a1 / t0..t1 trim, mirroring how arc/circle
+# point_on uses the full circle today.
+
+
+def _parabola_curve(xs, t):
+    # xs = [vx, vy, fx, fy]; P(t) = vertex + (t^2/4f)*u + t*w; tangent dP/dt.
+    vx, vy, fx, fy = xs[0], xs[1], xs[2], xs[3]
+    dx, dy = fx - vx, fy - vy
+    f = math.hypot(dx, dy)
+    if f < 1e-12:
+        return np.array([vx, vy]), np.array([0.0, 1.0])
+    ux, uy = dx / f, dy / f
+    wx, wy = -uy, ux
+    s = (t * t) / (4.0 * f)
+    P = np.array([vx + s * ux + t * wx, vy + s * uy + t * wy])
+    dsd = (2.0 * t) / (4.0 * f)
+    dP = np.array([dsd * ux + wx, dsd * uy + wy])   # dP/dt
+    return P, dP
+
+
+def _conic_curve(xs, u):
+    # xs = [p0x, p0y, p1x, p1y, apx, apy, rho]; rational quadratic Bezier on u∈[0,1]
+    #   P0,(apex,w),P1 with apex weight w = rho/(1-rho). P(u), tangent dP/du.
+    p0 = np.array([xs[0], xs[1]])
+    p1 = np.array([xs[2], xs[3]])
+    ap = np.array([xs[4], xs[5]])
+    rho = xs[6]
+    rho = min(max(rho, 1e-6), 1.0 - 1e-6)
+    w = rho / (1.0 - rho)
+    b0 = (1.0 - u) ** 2
+    b1 = 2.0 * (1.0 - u) * u * w
+    b2 = u * u
+    den = b0 + b1 + b2
+    num = b0 * p0 + b1 * ap + b2 * p1
+    P = num / den
+    # derivative of P = num/den w.r.t. u, quotient rule
+    db0 = -2.0 * (1.0 - u)
+    db1 = 2.0 * w * (1.0 - 2.0 * u)
+    db2 = 2.0 * u
+    dnum = db0 * p0 + db1 * ap + db2 * p1
+    dden = db0 + db1 + db2
+    dP = (dnum * den - num * dden) / (den * den)
+    return P, dP
+
+
+def _ellipse_implicit(xs, P):
+    # xs = [cx, cy, rx, ry, rot]; signed implicit value f(P) for the rotated
+    # ellipse, scaled to length units so the residual is a true distance proxy:
+    #   local q = R(-rot)·(P - c);  f = (sqrt((qx/rx)^2+(qy/ry)^2) - 1) * r_mean
+    # Zero exactly on the ellipse; near-linear in distance for the solver.
+    cx, cy, rx, ry, rot = xs[0], xs[1], xs[2], xs[3], xs[4]
+    rr = rot * _DEG
+    cr, sr = math.cos(rr), math.sin(rr)
+    dxp, dyp = P[0] - cx, P[1] - cy
+    qx = cr * dxp + sr * dyp
+    qy = -sr * dxp + cr * dyp
+    rx = rx if abs(rx) > 1e-9 else 1e-9
+    ry = ry if abs(ry) > 1e-9 else 1e-9
+    rad = math.hypot(qx / rx, qy / ry)
+    r_mean = 0.5 * (abs(rx) + abs(ry))
+    return (rad - 1.0) * r_mean
+
+
 def _resolve_handle(
     handle: str,
     entities: dict,     # id -> entity dict
@@ -806,14 +874,19 @@ def _add_tangent(sys, cid, h0, h1, entities, var_map):
     t1 = entities[eid1]["type"]
 
     curved = {"circle", "arc"}
+    conics = {"ellipse_arc", "parabola", "conic"}
     if t0 == "line" and t1 in curved:
         _add_tangent_line_circle(sys, cid, eid0, eid1, entities, var_map)
     elif t0 in curved and t1 == "line":
         _add_tangent_line_circle(sys, cid, eid1, eid0, entities, var_map)
     elif t0 in curved and t1 in curved:
         _add_tangent_circle_circle(sys, cid, eid0, eid1, entities, var_map)
+    elif t0 == "line" and t1 in conics:
+        _add_tangent_line_conic(sys, cid, eid0, eid1, entities, var_map)
+    elif t0 in conics and t1 == "line":
+        _add_tangent_line_conic(sys, cid, eid1, eid0, entities, var_map)
     else:
-        # line-line tangent is not geometrically meaningful; skip
+        # line-line, and curve↔curve / conic↔conic tangent stay deferred; skip.
         pass
 
 
@@ -953,6 +1026,133 @@ def _add_tangent_circle_circle(sys, cid, eid0, eid1, entities, var_map):
         return np.array([[dx/d, dy/d, -1.0, -dx/d, -dy/d, -1.0]])
 
     sys.add_residual(_r, combined, _j, cid)
+
+
+def _add_tangent_line_conic(sys, cid, line_eid, conic_eid, entities, var_map):
+    """Tangency line ↔ conic-family curve.
+
+    Residual = signed distance from the line to the curve's nearest point.
+    For ellipse_arc this is EXACT via the support function: the distance from the
+    ellipse center to a line, minus the ellipse's support width in the line's
+    normal direction, is zero exactly when the line is tangent:
+
+        dist(center, line) - sqrt((a·cosφ)^2 + (b·sinφ)^2) = 0
+
+    where φ is the line-normal direction measured in the ellipse's rotated frame
+    and (a,b)=(rx,ry). (Range-free: ignores the a0/a1 trim — documented.)
+
+    For parabola/conic there is no clean closed support form, so the residual is
+    the NUMERIC closest-distance: project the curve's extreme point in the line-
+    normal direction (param where curve tangent ∥ line) and measure its signed
+    perpendicular distance to the line. Jacobian is central-difference (the
+    parabola handles already use numeric partials).
+    """
+    etype = entities[conic_eid]["type"]
+    lidx = var_map[line_eid][[0, 1, 2, 3]]   # ax,ay,bx,by
+
+    if etype == "ellipse_arc":
+        eidx = var_map[conic_eid][[0, 1, 2, 3, 4]]   # cx,cy,rx,ry,rot
+        combined = np.concatenate([lidx, eidx])
+
+        def _r(xs):
+            return np.array([_ellipse_line_support(xs[:4], xs[4:9])])
+
+        def _j(xs):
+            return _numeric_jac_1(
+                lambda v: np.array([_ellipse_line_support(v[:4], v[4:9])]),
+                xs, 9)
+
+        sys.add_residual(_r, combined, _j, cid)
+        return
+
+    if etype == "parabola":
+        eidx = var_map[conic_eid][[0, 1, 2, 3]]   # vx,vy,fx,fy
+        curve = _parabola_curve
+        scan = lambda cv, n: np.linspace(-200.0, 200.0, n)
+    else:   # conic
+        eidx = var_map[conic_eid][[0, 1, 2, 3, 4, 5, 6]]
+        curve = _conic_curve
+        scan = lambda cv, n: np.linspace(0.0, 1.0, n)
+
+    ke = len(eidx)
+    combined = np.concatenate([lidx, eidx])
+
+    def _support_resid(v):
+        ax, ay, bx, by = v[0], v[1], v[2], v[3]
+        cv = v[4:4+ke]
+        dxab, dyab = bx - ax, by - ay
+        L = math.hypot(dxab, dyab)
+        if L < 1e-12:
+            return np.array([0.0])
+        nx, ny = -dyab / L, dxab / L   # unit line normal
+        # param where curve tangent ∥ line (tangent·n = 0): scan then Newton.
+        p = _extremum_param(curve, cv, nx, ny, scan)
+        Q, _ = curve(cv, p)
+        # signed distance of the extreme curve point from the line
+        return np.array([(Q[0] - ax) * nx + (Q[1] - ay) * ny])
+
+    def _r(xs):
+        return _support_resid(xs)
+
+    def _j(xs):
+        return _numeric_jac_1(_support_resid, xs, 4 + ke)
+
+    sys.add_residual(_r, combined, _j, cid)
+
+
+def _ellipse_line_support(line, ell):
+    """Exact line↔ellipse tangency residual via the support function.
+
+    line = [ax,ay,bx,by]; ell = [cx,cy,rx,ry,rot]. Returns
+      dist(center→line) - support, support = sqrt((rx·cosφ)^2+(ry·sinφ)^2),
+    φ = angle of the line normal in the ellipse's rotated frame.
+    """
+    ax, ay, bx, by = line
+    cx, cy, rx, ry, rot = ell
+    dxab, dyab = bx - ax, by - ay
+    L = math.hypot(dxab, dyab)
+    if L < 1e-12:
+        return 0.0
+    nx, ny = -dyab / L, dxab / L          # unit line normal (world)
+    rr = rot * _DEG
+    cr, sr = math.cos(rr), math.sin(rr)
+    # normal in the ellipse's un-rotated frame
+    nlx = cr * nx + sr * ny
+    nly = -sr * nx + cr * ny
+    support = math.hypot(rx * nlx, ry * nly)
+    dist = abs((cx - ax) * nx + (cy - ay) * ny)   # |center→line| along normal
+    return dist - support
+
+
+def _extremum_param(curve, cv, nx, ny, scan):
+    """Param p where the curve tangent is parallel to a line (tangent·n = 0).
+
+    Coarse scan for the extreme point in the +n direction, then Newton on
+    g(p) = C'(p)·n. Returns the param at the point farthest along +n (the
+    near-side tangency candidate), range-free.
+    """
+    pts = scan(cv, 41)
+    best_p, best_proj = pts[0], -float("inf")
+    for p in pts:
+        Q, _ = curve(cv, p)
+        proj = Q[0] * nx + Q[1] * ny
+        if proj > best_proj:
+            best_proj, best_p = proj, p
+    p = best_p
+    for _ in range(12):
+        _, dQ = curve(cv, p)
+        g = dQ[0] * nx + dQ[1] * ny
+        h = 1e-4
+        _, dQp = curve(cv, p + h)
+        _, dQm = curve(cv, p - h)
+        ddg = ((dQp[0] - dQm[0]) * nx + (dQp[1] - dQm[1]) * ny) / (2.0 * h)
+        if abs(ddg) < 1e-14:
+            break
+        step = g / ddg
+        p -= step
+        if abs(step) < 1e-12:
+            break
+    return p
 
 
 def _add_equal(sys, cid, h0, h1, entities, var_map):
@@ -1345,6 +1545,155 @@ def _add_point_on(sys, cid, point_handle, entity_handle, entities, var_map):
             return J
 
         sys.add_residual(_r, combined, _j, cid)
+
+    elif etype == "ellipse_arc":
+        # Implicit rotated-ellipse residual; ignores a0/a1 trim (full ellipse),
+        # mirroring the arc/circle point_on convention above.
+        eidx = var_map[eid][[0, 1, 2, 3, 4]]   # cx,cy,rx,ry,rot
+        combined = np.concatenate([pidx, eidx])
+        ke = 5
+
+        def _r(xs):
+            P = pvf(xs[:kp])
+            return np.array([_ellipse_implicit(xs[kp:kp+ke], P)])
+
+        def _j(xs):
+            return _numeric_jac_1(lambda v: np.array(
+                [_ellipse_implicit(v[kp:kp+ke], pvf(v[:kp]))]), xs, kp + ke)
+
+        sys.add_residual(_r, combined, _j, cid)
+
+    elif etype == "parabola":
+        # Closest-param projection: residual = signed offset of P from the curve
+        # along the curve normal at the projected param t*. Range-free (ignores
+        # t0/t1), matching the arc convention.
+        eidx = var_map[eid][[0, 1, 2, 3]]   # vx,vy,fx,fy
+        combined = np.concatenate([pidx, eidx])
+        ke = 4
+
+        def _r(xs):
+            P = pvf(xs[:kp])
+            cv = xs[kp:kp+ke]
+            t = _parabola_project(cv, P)
+            Q, dQ = _parabola_curve(cv, t)
+            return np.array([_signed_offset(P, Q, dQ)])
+
+        def _j(xs):
+            return _numeric_jac_1(lambda v: _r_proj_parabola(v, pvf, kp, ke),
+                                  xs, kp + ke)
+
+        sys.add_residual(_r, combined, _j, cid)
+
+    elif etype == "conic":
+        eidx = var_map[eid][[0, 1, 2, 3, 4, 5, 6]]   # p0,p1,apex,rho
+        combined = np.concatenate([pidx, eidx])
+        ke = 7
+
+        def _r(xs):
+            P = pvf(xs[:kp])
+            cv = xs[kp:kp+ke]
+            u = _conic_project(cv, P)
+            Q, dQ = _conic_curve(cv, u)
+            return np.array([_signed_offset(P, Q, dQ)])
+
+        def _j(xs):
+            return _numeric_jac_1(lambda v: _r_proj_conic(v, pvf, kp, ke),
+                                  xs, kp + ke)
+
+        sys.add_residual(_r, combined, _j, cid)
+
+    # else: unsupported entity type for point_on — skip silently.
+
+
+# --- point_on projection / numeric helpers (C32-B) -------------------------
+
+
+def _signed_offset(P, Q, dQ):
+    """Signed perpendicular offset of P from curve point Q with tangent dQ.
+
+    = (P - Q) · n,  n = unit normal (perp of tangent). Zero iff P lies on the
+    curve at Q; sign keeps the residual smooth across the curve for Newton.
+    """
+    L = math.hypot(dQ[0], dQ[1])
+    if L < 1e-12:
+        return math.hypot(P[0] - Q[0], P[1] - Q[1])
+    nx, ny = -dQ[1] / L, dQ[0] / L
+    return (P[0] - Q[0]) * nx + (P[1] - Q[1]) * ny
+
+
+def _parabola_project(cv, P, t0=-200.0, t1=200.0):
+    """Param t minimizing |P - parabola(t)|: coarse scan + Newton refine."""
+    best_t, best_d = t0, float("inf")
+    for k in range(81):
+        t = t0 + (t1 - t0) * k / 80.0
+        Q, _ = _parabola_curve(cv, t)
+        d = (P[0] - Q[0]) ** 2 + (P[1] - Q[1]) ** 2
+        if d < best_d:
+            best_d, best_t = d, t
+    return _newton_project(lambda t: _parabola_curve(cv, t), best_t, P)
+
+
+def _conic_project(cv, P):
+    """Param u∈[0,1] minimizing |P - conic(u)|: coarse scan + Newton refine."""
+    best_u, best_d = 0.0, float("inf")
+    for k in range(41):
+        u = k / 40.0
+        Q, _ = _conic_curve(cv, u)
+        d = (P[0] - Q[0]) ** 2 + (P[1] - Q[1]) ** 2
+        if d < best_d:
+            best_d, best_u = d, u
+    u = _newton_project(lambda u: _conic_curve(cv, u), best_u, P)
+    return min(max(u, 0.0), 1.0)
+
+
+def _newton_project(curve_fn, p0, P, iters=12):
+    """Refine the closest-point param: root of g(p)=(C(p)-P)·C'(p)=0 (Newton)."""
+    p = p0
+    for _ in range(iters):
+        Q, dQ = curve_fn(p)
+        diff = np.array([Q[0] - P[0], Q[1] - P[1]])
+        g = diff[0] * dQ[0] + diff[1] * dQ[1]
+        # g' ~ |C'|^2 + diff·C'' ; approximate C'' numerically (cheap, stable)
+        h = 1e-4
+        _, dQp = curve_fn(p + h)
+        _, dQm = curve_fn(p - h)
+        ddQ = (dQp - dQm) / (2.0 * h)
+        gp = dQ[0] ** 2 + dQ[1] ** 2 + diff[0] * ddQ[0] + diff[1] * ddQ[1]
+        if abs(gp) < 1e-14:
+            break
+        step = g / gp
+        p -= step
+        if abs(step) < 1e-12:
+            break
+    return p
+
+
+def _r_proj_parabola(v, pvf, kp, ke):
+    P = pvf(v[:kp])
+    cv = v[kp:kp+ke]
+    t = _parabola_project(cv, P)
+    Q, dQ = _parabola_curve(cv, t)
+    return np.array([_signed_offset(P, Q, dQ)])
+
+
+def _r_proj_conic(v, pvf, kp, ke):
+    P = pvf(v[:kp])
+    cv = v[kp:kp+ke]
+    u = _conic_project(cv, P)
+    Q, dQ = _conic_curve(cv, u)
+    return np.array([_signed_offset(P, Q, dQ)])
+
+
+def _numeric_jac_1(rfn, xs, n):
+    """Central-difference Jacobian of a scalar residual rfn(x)->(1,) over n vars."""
+    xs = np.asarray(xs, dtype=float)
+    J = np.zeros((1, n))
+    for i in range(n):
+        h = 1e-6 * max(1.0, abs(xs[i]))
+        xp = xs.copy(); xp[i] += h
+        xm = xs.copy(); xm[i] -= h
+        J[0, i] = (rfn(xp)[0] - rfn(xm)[0]) / (2.0 * h)
+    return J
 
 
 def _add_distance(sys, cid, h0, h1, d, entities, var_map):

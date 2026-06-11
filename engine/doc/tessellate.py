@@ -112,6 +112,9 @@ class BodyTess:
     edges: list[EdgeRec] = field(default_factory=list)
     edge_pts: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), np.float32))
     verts: list[VertRec] = field(default_factory=list)
+    # C32-A RealView material (dielectric default = matches the C30 reflection look exactly).
+    metallic: float = 0.0
+    roughness: float = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +140,8 @@ def tessellate_body(
     color: tuple[float, float, float],
     lin_deflection: float = 0.05,
     ang_deflection: float = 0.35,
+    metallic: float = 0.0,
+    roughness: float = 0.5,
 ) -> BodyTess:
     """Tessellate an OCP/build123d shape to AICM geometry.
 
@@ -309,6 +314,8 @@ def tessellate_body(
         edges=edge_recs,
         edge_pts=edge_pts_arr,
         verts=vert_recs,
+        metallic=float(metallic),
+        roughness=float(roughness),
     )
 
 
@@ -329,6 +336,10 @@ def _encode_body(bt: BodyTess) -> bytes:
         + pos_flat.tobytes()
         + nrm_flat.tobytes()
         + idx_flat.tobytes()
+        # C32-A: RealView material trailer (metallic, roughness). Appended after idx; the BODY chunk
+        # is length-prefixed and readers re-sync to the chunk boundary, so pre-C32 readers skip these
+        # two floats and post-C32 readers pick them up (back-compat both ways).
+        + struct.pack("<2f", float(bt.metallic), float(bt.roughness))
     )
 
 
@@ -549,10 +560,18 @@ def read_aicm(data: bytes) -> dict:
             pos = _floats(3 * n_verts).reshape(n_verts, 3)
             nrm = _floats(3 * n_verts).reshape(n_verts, 3)
             idx = _uints(3 * n_tris).reshape(n_tris, 3)
+            # C32-A material trailer: present iff the chunk has >=8 bytes left after idx (old files
+            # without it fall back to the dielectric default and are skipped by the boundary re-sync).
+            metallic, roughness = 0.0, 0.5
+            if offset - payload_start + 8 <= payload_len:
+                metallic = _f32()
+                roughness = _f32()
             current_body = {
                 "body_id": body_id,
                 "name": name,
                 "color": color,
+                "metallic": metallic,
+                "roughness": roughness,
                 "n_verts": n_verts,
                 "n_tris": n_tris,
                 "pos": pos,

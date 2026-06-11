@@ -127,7 +127,18 @@ static void normalToSelectionOrNearestAxis(AppState& st) {
 // ---- C26: appearance color-picker popup (duplicated from feature_tree.cpp; sharing it would
 // need a new translation unit in CMakeLists, owned by another agent this wave). Preset swatches
 // over a ColorPicker3; returns true once on commit, writing into outColor[3]. ----
-static bool appearanceColorPicker(const char* popupId, float outColor[3]) {
+// C32-A RealView material presets (duplicated from feature_tree.cpp; see note above re: sharing).
+struct MaterialPreset { const char* name; float metallic, roughness, rgb[3]; };
+static const MaterialPreset kMaterials[5] = {
+    {"Plastic",    0.00f, 0.50f, {0.71f, 0.76f, 0.82f}},
+    {"Aluminum",   0.90f, 0.35f, {0.83f, 0.85f, 0.88f}},
+    {"Steel",      0.85f, 0.25f, {0.56f, 0.58f, 0.62f}},
+    {"Brass",      0.95f, 0.30f, {0.80f, 0.62f, 0.28f}},
+    {"Dark Metal", 0.90f, 0.45f, {0.16f, 0.17f, 0.19f}},
+};
+
+static bool appearanceColorPicker(const char* popupId, float outColor[3],
+                                  float* outMetallic, float* outRoughness) {
     static float s_pick[3] = {0.71f, 0.76f, 0.82f};
     static bool  s_seeded  = false;
     bool committed = false;
@@ -135,6 +146,21 @@ static bool appearanceColorPicker(const char* popupId, float outColor[3]) {
         if (!s_seeded) { s_pick[0] = outColor[0]; s_pick[1] = outColor[1]; s_pick[2] = outColor[2];
                          s_seeded = true; }
         ImGui::TextUnformatted("Appearance");
+        ImGui::Separator();
+        // C32-A: RealView material presets (above the color swatches). Click = apply color+material.
+        ImGui::TextUnformatted("Material");
+        for (int i = 0; i < 5; ++i) {
+            if (i) ImGui::SameLine(0, 4.0f * ui::uiScale);
+            if (ImGui::SmallButton(kMaterials[i].name)) {
+                outColor[0] = kMaterials[i].rgb[0];
+                outColor[1] = kMaterials[i].rgb[1];
+                outColor[2] = kMaterials[i].rgb[2];
+                if (outMetallic)  *outMetallic = kMaterials[i].metallic;
+                if (outRoughness) *outRoughness = kMaterials[i].roughness;
+                committed = true;
+                ImGui::CloseCurrentPopup();
+            }
+        }
         ImGui::Separator();
         static const float kPresets[8][3] = {
             {0.71f, 0.76f, 0.82f}, {0.50f, 0.50f, 0.52f}, {0.20f, 0.21f, 0.23f},
@@ -178,11 +204,17 @@ static bool appearanceColorPicker(const char* popupId, float outColor[3]) {
 // feature_tree's applyTreeOpsNow: apply -> loadDocMesh(resp.aicm_path) repaints the body with its
 // new color on the next frame.
 static void applyAppearanceFromViewport(AppState& st, const std::string& bodyKey,
-                                        const float* color /* nullptr = clear */) {
+                                        const float* color /* nullptr = clear */,
+                                        float metallic = 0.0f, float roughness = 0.5f) {
     if (!st.docMirror.hasDoc() || !st.workerStarted) return;
     nlohmann::json op = {{"op", "set_appearance"}, {"id", bodyKey}};
-    if (color) op["color"] = {color[0], color[1], color[2]};
-    else       op["color"] = nullptr;
+    if (color) {
+        op["color"] = {color[0], color[1], color[2]};
+        op["metallic"] = metallic;   // C32-A RealView material
+        op["roughness"] = roughness;
+    } else {
+        op["color"] = nullptr;
+    }
     auto resp = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
     if (resp.ok && !resp.aicm_path.empty()) {
         std::string lerr;
@@ -515,6 +547,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         }
         // C26: appearance state shared between the vp_ctx menu item and its sibling picker popup.
         static float s_vpColor[3]   = {0.71f, 0.76f, 0.82f};
+        static float s_vpMetallic = 0.0f, s_vpRoughness = 0.5f;  // C32-A material
         static std::string s_vpKey;          // "b<ordinal>" of the body to recolor
         static bool  s_openVpPicker = false;
         // The picked body's stable appearance key (part bodies: "b<ordinal>", matching the engine).
@@ -544,6 +577,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     if (ImGui::MenuItem("Appearance...")) {
                         s_vpKey = vpBodyKey;
                         s_vpColor[0] = 0.71f; s_vpColor[1] = 0.76f; s_vpColor[2] = 0.82f;
+                        s_vpMetallic = 0.0f; s_vpRoughness = 0.5f;
                         s_openVpPicker = true;
                     }
                     if (ImGui::MenuItem("Clear Appearance"))
@@ -611,8 +645,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // C26: appearance picker — a SIBLING popup of vp_ctx (opened from its menu item) to avoid
         // nested-popup ordering issues. Direct-applies on commit (safe outside tree iteration).
         if (s_openVpPicker) { ImGui::OpenPopup("##appearance_vp"); s_openVpPicker = false; }
-        if (appearanceColorPicker("##appearance_vp", s_vpColor) && !s_vpKey.empty())
-            applyAppearanceFromViewport(st, s_vpKey, s_vpColor);
+        if (appearanceColorPicker("##appearance_vp", s_vpColor, &s_vpMetallic, &s_vpRoughness)
+            && !s_vpKey.empty())
+            applyAppearanceFromViewport(st, s_vpKey, s_vpColor, s_vpMetallic, s_vpRoughness);
 
         // ---- C25 W3-J: heads-up view toolbar (SolidWorks-style, fully functional) ----
         // Centered pill at the viewport top; hidden while editing a sketch.

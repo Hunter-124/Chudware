@@ -90,9 +90,15 @@ All entities carry `construction:bool` (construction geometry never forms profil
 
 **Conic-family solver support (C28-A):** `ellipse_arc`/`parabola`/`conic` participate in the solve
 with these DOF: ellipse_arc 7 (`cx,cy,rx,ry,rot,a0,a1`), parabola 6 (`vx,vy,fx,fy,t0,t1`),
-conic 7 (`p0,p1,apex,rho`). Supported relations on these types are limited to `coincident`
-(on the handles below) and `fix` (on any handle). NOT yet supported (deferred): `tangent`,
-`equal`, `concentric`, `point_on`, `radius`/`diameter`, `horizontal`/`vertical`,
+conic 7 (`p0,p1,apex,rho`). Supported relations on these types: `coincident`
+(on the handles below), `fix` (on any handle), `point_on` (a point handle lies on the
+curve), and `tangent` against a **line** (C32-B). `point_on`/`tangent` are **range-free** —
+they use the full conic (ellipse_arc ignores `a0`/`a1`, parabola ignores `t0`/`t1`), mirroring
+how `arc`/`circle` `point_on` uses the full circle. `point_on` residual is the implicit
+rotated-ellipse distance (ellipse_arc) or a closest-param projection offset (parabola/conic).
+`tangent[line]` is exact for ellipse_arc (support-function residual) and numeric for
+parabola/conic. NOT yet supported (deferred): curve↔curve / conic↔conic `tangent`,
+`equal`, `concentric`, `radius`/`diameter`, `horizontal`/`vertical`,
 `symmetric`, `midpoint`, `parallel`, `perpendicular`, `angle` for the conic family. b3d region
 geometry: ellipse_arc → trimmed `Edge.make_ellipse`; parabola → cubic spline through sampled
 points; conic → `Edge.make_bezier` with weights (sampled-spline fallback). All closed loops

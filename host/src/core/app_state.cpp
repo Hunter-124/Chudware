@@ -348,6 +348,7 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err) {
         Renderer::PartMesh pm;
         pm.mesh = meshFromBody(b);
         pm.color[0] = b.color[0]; pm.color[1] = b.color[1]; pm.color[2] = b.color[2];
+        pm.metallic = b.metallic; pm.roughness = b.roughness;  // C32-A RealView material
         // First scalar field for this body (von Mises / |u| / thickness / …).
         for (const auto& sc : doc.scalars) {
             if (sc.body_id == b.body_id && sc.values.size() == b.n_verts) {

@@ -435,11 +435,14 @@ def _op_set_material(doc, op, index, idgen, id_map):
 
 
 def _op_set_appearance(doc, op, index, idgen, id_map):
-    """Set (or clear) a body's display color (C26). ``id`` is the body's stable owner key — the
-    owner-feature id for a part body, the component id for an assembly body (whatever the rebuild
-    reports as the body's owner; see session._write_aicm). ``color`` is ``[r,g,b]`` in 0..1, or
-    ``null`` to clear back to the default palette color. Append-only vocabulary entry; mirrors
-    set_folder/set_material's create-or-clear shape and round-trips through the document JSON."""
+    """Set (or clear) a body's display appearance (C26 color + C32-A material). ``id`` is the body's
+    stable owner key — the owner-feature id for a part body, the component id for an assembly body
+    (whatever the rebuild reports as the body's owner; see session._write_aicm). ``color`` is
+    ``[r,g,b]`` in 0..1, or ``null`` to clear back to the default palette color. Optional
+    ``metallic``/``roughness`` (0..1, clamped) select a RealView material; when either is present the
+    value is stored as ``{color, metallic, roughness}``, otherwise as a legacy bare ``[r,g,b]`` array
+    (both forms round-trip). Append-only vocabulary entry; mirrors set_folder/set_material's
+    create-or-clear shape and round-trips through the document JSON."""
     bid = op.get("id")
     if not isinstance(bid, str) or not bid:
         raise _invalid(index, "set_appearance requires a non-empty 'id' (body owner key)")
@@ -453,7 +456,24 @@ def _op_set_appearance(doc, op, index, idgen, id_map):
     if not (isinstance(color, list) and len(color) == 3
             and all(isinstance(c, (int, float)) and not isinstance(c, bool) for c in color)):
         raise _invalid(index, "set_appearance.color must be [r,g,b] floats (or null to clear)")
-    ap[bid] = [max(0.0, min(1.0, float(c))) for c in color]
+    rgb = [max(0.0, min(1.0, float(c))) for c in color]
+
+    def _clamped(name):
+        v = op.get(name)
+        if v is None:
+            return None
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            raise _invalid(index, f"set_appearance.{name} must be a number in 0..1")
+        return max(0.0, min(1.0, float(v)))
+
+    metallic = _clamped("metallic")
+    roughness = _clamped("roughness")
+    if metallic is None and roughness is None:
+        ap[bid] = rgb  # legacy bare-array form (color-only)
+    else:
+        ap[bid] = {"color": rgb,
+                   "metallic": metallic if metallic is not None else 0.0,
+                   "roughness": roughness if roughness is not None else 0.5}
 
 
 def _op_set_units(doc, op, index, idgen, id_map):

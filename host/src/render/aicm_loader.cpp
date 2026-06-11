@@ -105,6 +105,13 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
             c.floats(current->pos, 3ull * current->n_verts);
             c.floats(current->nrm, 3ull * current->n_verts);
             c.uints(current->idx, 3ull * current->n_tris);
+            // C32-A material trailer: present iff the chunk has >=8 bytes left after idx. Old AICM
+            // files (no trailer) keep the dielectric defaults; the boundary re-sync below skips any
+            // bytes either way, so this stays forward-compatible.
+            if (c.ok && (size_t)(c.p - payload_start) + 8 <= payload_len) {
+                current->metallic = c.f32();
+                current->roughness = c.f32();
+            }
         } else if (fcc("FACE")) {
             uint32_t n = c.u32();
             std::vector<FaceRange> faces;

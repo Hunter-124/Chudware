@@ -130,7 +130,22 @@ static char        s_renameBuf[128] = {0};
 // after stashing which body key it applies to, then turns a true return into a set_appearance op.
 // (This same helper is duplicated verbatim in viewport_panel.cpp; sharing it would need a new TU in
 // CMakeLists, which another agent owns this wave — duplication is the lighter choice.)
-static bool appearanceColorPicker(const char* popupId, float outColor[3]) {
+// C32-A RealView material presets (metallic, roughness, [r,g,b] tint). Clicking a preset commits
+// color + material in one set_appearance op. Plastic restores the dielectric default (the C30 look).
+struct MaterialPreset { const char* name; float metallic, roughness, rgb[3]; };
+static const MaterialPreset kMaterials[5] = {
+    {"Plastic",    0.00f, 0.50f, {0.71f, 0.76f, 0.82f}},
+    {"Aluminum",   0.90f, 0.35f, {0.83f, 0.85f, 0.88f}},  // silver
+    {"Steel",      0.85f, 0.25f, {0.56f, 0.58f, 0.62f}},  // darker
+    {"Brass",      0.95f, 0.30f, {0.80f, 0.62f, 0.28f}},  // warm
+    {"Dark Metal", 0.90f, 0.45f, {0.16f, 0.17f, 0.19f}},  // near-black
+};
+
+// Appearance editor. Returns true once on commit, writing color into outColor[3] and the chosen
+// material into outMetallic/outRoughness (a preset sets all three; the custom color path carries the
+// material in unchanged so a previously-set metal keeps its finish).
+static bool appearanceColorPicker(const char* popupId, float outColor[3],
+                                  float* outMetallic, float* outRoughness) {
     static float s_pick[3] = {0.71f, 0.76f, 0.82f};
     static bool  s_seeded  = false;
     bool committed = false;
@@ -139,6 +154,21 @@ static bool appearanceColorPicker(const char* popupId, float outColor[3]) {
         if (!s_seeded) { s_pick[0] = outColor[0]; s_pick[1] = outColor[1]; s_pick[2] = outColor[2];
                          s_seeded = true; }
         ImGui::TextUnformatted("Appearance");
+        ImGui::Separator();
+        // C32-A: RealView material presets (above the color swatches). Click = apply color+material.
+        ImGui::TextUnformatted("Material");
+        for (int i = 0; i < 5; ++i) {
+            if (i) ImGui::SameLine(0, 4.0f * ui::uiScale);
+            if (ImGui::SmallButton(kMaterials[i].name)) {
+                outColor[0] = kMaterials[i].rgb[0];
+                outColor[1] = kMaterials[i].rgb[1];
+                outColor[2] = kMaterials[i].rgb[2];
+                if (outMetallic)  *outMetallic = kMaterials[i].metallic;
+                if (outRoughness) *outRoughness = kMaterials[i].roughness;
+                committed = true;
+                ImGui::CloseCurrentPopup();
+            }
+        }
         ImGui::Separator();
         // Preset swatches (SolidWorks-ish: greys, primaries). Click = apply immediately.
         static const float kPresets[8][3] = {
@@ -754,11 +784,13 @@ void drawFeatureTree(AppState& st,
         {
             bool isAsmDoc = tree.is_object() && jfld(tree, "schema") == "aicad.asm/1";
             static float s_rootColor[3] = {0.71f, 0.76f, 0.82f};
+            static float s_rootMetallic = 0.0f, s_rootRoughness = 0.5f;  // C32-A material
             static bool  s_openRootPicker = false;
             if (!isAsmDoc && st.docMirror.hasDoc()) {
                 if (ImGui::BeginPopupContextItem("##root_ctx")) {
                     if (ImGui::MenuItem("Appearance...")) {
                         s_rootColor[0] = 0.71f; s_rootColor[1] = 0.76f; s_rootColor[2] = 0.82f;
+                        s_rootMetallic = 0.0f; s_rootRoughness = 0.5f;
                         s_openRootPicker = true;  // open the picker (a sibling popup) next
                     }
                     if (ImGui::MenuItem("Clear Appearance")) {
@@ -771,10 +803,12 @@ void drawFeatureTree(AppState& st,
                 // Picker popup lives OUTSIDE the context menu (a sibling) to avoid nested-popup
                 // ordering pitfalls; it is opened by the menu item via s_openRootPicker.
                 if (s_openRootPicker) { ImGui::OpenPopup("##appearance_root"); s_openRootPicker = false; }
-                if (appearanceColorPicker("##appearance_root", s_rootColor)) {
+                if (appearanceColorPicker("##appearance_root", s_rootColor,
+                                          &s_rootMetallic, &s_rootRoughness)) {
                     applyTreeOps(st, nlohmann::json::array({
                         {{"op", "set_appearance"}, {"id", "b1"},
-                         {"color", {s_rootColor[0], s_rootColor[1], s_rootColor[2]}}}}),
+                         {"color", {s_rootColor[0], s_rootColor[1], s_rootColor[2]}},
+                         {"metallic", s_rootMetallic}, {"roughness", s_rootRoughness}}}),
                         "set_appearance");
                 }
             }

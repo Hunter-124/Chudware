@@ -45,6 +45,19 @@ _PROGRESS_MS = 300.0
 _DEFAULT_COLOR = (0.71, 0.76, 0.82)
 
 
+def _appearance_material(override):
+    """Normalize a stored appearance value (C26 bare ``[r,g,b]`` OR C32-A
+    ``{color, metallic, roughness}``) into ``(rgb|None, metallic, roughness)``. A missing override
+    returns ``(None, 0.0, 0.5)`` — the dielectric default that renders identically to pre-C32."""
+    if override is None:
+        return None, 0.0, 0.5
+    if isinstance(override, dict):
+        col = override.get("color")
+        rgb = tuple(float(c) for c in col) if col else None
+        return (rgb, float(override.get("metallic", 0.0)), float(override.get("roughness", 0.5)))
+    return tuple(float(c) for c in override), 0.0, 0.5
+
+
 # --------------------------------------------------------------------------- session
 
 
@@ -248,15 +261,16 @@ def _write_aicm(session: DocSession, result: CompileResult) -> tuple[str, list[d
         # the face-owner map, which is empty on a pure cache-hit rebuild), so the host can form the
         # set_appearance id directly from a body pick without a resolve round-trip.
         key = f"b{i}"
-        override = appearances.get(key)
-        if override:
-            color = tuple(float(c) for c in override)
+        rgb, metallic, roughness = _appearance_material(appearances.get(key))
+        if rgb is not None:
+            color = rgb
         else:
             color = tuple(bo.color) if bo.color else _DEFAULT_COLOR
-        bt = tess.tessellate_body(bo.shape, body_id=i, name=bo.name or f"Body{i}", color=color)
+        bt = tess.tessellate_body(bo.shape, body_id=i, name=bo.name or f"Body{i}", color=color,
+                                  metallic=metallic, roughness=roughness)
         body_tesses.append(bt)
         bodies_meta.append({"body_id": i, "name": bo.name or f"Body{i}", "color": list(color),
-                            "owner_key": key})
+                            "owner_key": key, "metallic": metallic, "roughness": roughness})
 
     aicm = _aicm_path(session.doc_id, session.revision)
     tess.write_aicm_file(aicm, body_tesses)
@@ -277,13 +291,15 @@ def _write_aicm_assembly(session: DocSession) -> tuple[str, list[dict]]:
         world = asm.placed_world_shape(body, np.asarray(off) if off is not None else None)
         # C26 appearance: assembly bodies are keyed by component id (the stable owner of an
         # assembly body). A stored color wins over the component's own color.
-        override = appearances.get(body.component_id)
-        color = tuple(float(c) for c in override) if override else tuple(body.color)
-        bt = tess.tessellate_body(world, body_id=body.body_id, name=body.name, color=color)
+        rgb, metallic, roughness = _appearance_material(appearances.get(body.component_id))
+        color = rgb if rgb is not None else tuple(body.color)
+        bt = tess.tessellate_body(world, body_id=body.body_id, name=body.name, color=color,
+                                  metallic=metallic, roughness=roughness)
         body_tesses.append(bt)
         bodies_meta.append({"body_id": body.body_id, "name": body.name,
                             "color": list(color), "component": body.component_id,
-                            "owner_key": body.component_id})
+                            "owner_key": body.component_id,
+                            "metallic": metallic, "roughness": roughness})
     aicm = _aicm_path(session.doc_id, session.revision)
     tess.write_aicm_file(aicm, body_tesses)
     return str(aicm), bodies_meta

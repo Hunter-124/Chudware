@@ -475,7 +475,12 @@ def _validate_equations(doc: dict, where: str) -> tuple[list[str], set[str]]:
 
 
 def _validate_appearances(doc: dict) -> list[str]:
-    """Optional document-level body appearances (C26): ``{body_key: [r,g,b]}`` in 0..1.
+    """Optional document-level body appearances (C26 + C32-A material).
+
+    Two value forms are accepted (both round-trip):
+      * legacy bare ``[r,g,b]`` in 0..1 (color only — dielectric default material);
+      * object ``{"color": [r,g,b], "metallic": 0..1, "roughness": 0..1}`` (RealView material).
+        ``color`` is required; ``metallic``/``roughness`` are optional 0..1 floats.
 
     The body_key is the body's owner-feature id (parts) or component id (assemblies) — whatever the
     rebuild reports as the body's stable owner. A missing key just means "default color".
@@ -484,13 +489,20 @@ def _validate_appearances(doc: dict) -> list[str]:
     if ap is None:
         return []
     if not isinstance(ap, dict):
-        return ["appearances: must be an object {body_key: [r,g,b]}"]
+        return ["appearances: must be an object {body_key: [r,g,b] | {color,...}}"]
     errs: list[str] = []
-    for key, col in ap.items():
+    for key, val in ap.items():
         if not isinstance(key, str) or not key:
             errs.append(f"appearances: key '{key}' must be a non-empty string")
-        if not _is_vec(col, 3) or any(not (0.0 <= float(c) <= 1.0) for c in col):
-            errs.append(f"appearances.{key}: must be [r,g,b] with each component in 0..1")
+        if isinstance(val, dict):
+            col = val.get("color")
+            if not _is_vec(col, 3) or any(not (0.0 <= float(c) <= 1.0) for c in col):
+                errs.append(f"appearances.{key}.color: must be [r,g,b] with each component in 0..1")
+            for mk in ("metallic", "roughness"):
+                if mk in val and (not _is_num(val[mk]) or not (0.0 <= float(val[mk]) <= 1.0)):
+                    errs.append(f"appearances.{key}.{mk}: must be a number in 0..1")
+        elif not _is_vec(val, 3) or any(not (0.0 <= float(c) <= 1.0) for c in val):
+            errs.append(f"appearances.{key}: must be [r,g,b] (0..1) or {{color, metallic, roughness}}")
     return errs
 
 

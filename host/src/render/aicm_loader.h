@@ -40,6 +40,9 @@ struct BodyMesh {
     uint32_t body_id = 0;
     std::string name;
     float color[3] = {0.71f, 0.76f, 0.82f};
+    // C32-A RealView material (dielectric default == pre-C32 look; absent in old AICM files).
+    float metallic = 0.0f;
+    float roughness = 0.5f;
 
     uint32_t n_verts = 0;
     uint32_t n_tris = 0;

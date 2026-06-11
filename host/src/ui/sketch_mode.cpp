@@ -1,6 +1,7 @@
 // Sketch mode UI (C18) implementation. See sketch_mode.h for the design overview.
 #include "sketch_mode.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -370,6 +371,11 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sk_ellipse_partial") { resetTool(); tool_ = SketchTool::EllipsePartial; return true; }
     if (cmdId == "sk_parabola")        { resetTool(); tool_ = SketchTool::Parabola;       return true; }
     if (cmdId == "sk_conic")           { resetTool(); tool_ = SketchTool::Conic;          return true; }
+    // C29-B sketch-editing tools (engine ops sketch_trim / sketch_extend / sketch_offset):
+    if (cmdId == "sk_trim")            { resetTool(); tool_ = SketchTool::Trim;           return true; }
+    if (cmdId == "sk_extend")          { resetTool(); tool_ = SketchTool::Extend;         return true; }
+    if (cmdId == "sk_offset_ent")      { resetTool(); tool_ = SketchTool::Offset;
+                                         offsetStage_ = 0; offsetChain_.clear();           return true; }
     // sk_slot_arc_3pt / sk_slot_arc_ctr intentionally NOT handled: the slot entity schema is
     // straight-only (p1,p2,width — no arc spine), so they stay greyed (see ribbon_def.cpp).
     return false;
@@ -381,6 +387,7 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
 
 void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSnaps_.clear();
                                conicRho_ = 0.5f;
+                               offsetStage_ = 0; offsetChain_.clear(); offsetFocusInput_ = false;
                                dimPopupOpen_ = false; dimPending_ = nullptr; }
 void SketchMode::cancelTool() { resetTool(); }
 
@@ -425,6 +432,36 @@ int SketchMode::hitTestHandle(const ImVec2& s, std::string& handleOut, float& uO
         } else if (e.type == "point") {
             consider(e.id + ".p", e.p1[0], e.p1[1]);
         }
+    }
+    return hit;
+}
+
+// Nearest whole entity under the screen point. Distance is measured to the projected geometry:
+// segment for lines/slots, |dist-to-center - radius_px| for circles/arcs, and the same rim metric
+// (no angular clamp) for arcs — a deliberately simple approximation matching the Smart-Dimension
+// picker. Returns the ents_ index or -1 when nothing is within maxPx.
+int SketchMode::hitTestEntity(const ImVec2& s, float maxPx) const {
+    float best = maxPx * maxPx;
+    int hit = -1;
+    for (size_t i = 0; i < ents_.size(); ++i) {
+        const SketchEntity& e = ents_[i];
+        float d2 = 1e30f;
+        if (e.type == "line" || e.type == "slot") {
+            ImVec2 a = uvToScreen(e.p1[0], e.p1[1]), b = uvToScreen(e.p2[0], e.p2[1]);
+            float vx = b.x - a.x, vy = b.y - a.y;
+            float wx = s.x - a.x, wy = s.y - a.y;
+            float t = (vx * wx + vy * wy) / std::fmax(1e-6f, vx * vx + vy * vy);
+            t = std::fmax(0.0f, std::fmin(1.0f, t));
+            float px = a.x + t * vx, py = a.y + t * vy;
+            d2 = (px - s.x) * (px - s.x) + (py - s.y) * (py - s.y);
+        } else if (e.type == "circle" || e.type == "arc") {
+            ImVec2 cc = uvToScreen(e.center[0], e.center[1]);
+            ImVec2 rim = uvToScreen(e.center[0] + e.radius, e.center[1]);
+            float rpx = std::hypot(rim.x - cc.x, rim.y - cc.y);
+            float dm = std::hypot(s.x - cc.x, s.y - cc.y);
+            d2 = (dm - rpx) * (dm - rpx);
+        }
+        if (d2 < best) { best = d2; hit = (int)i; }
     }
     return hit;
 }
@@ -566,8 +603,187 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             dl->AddCircle(uvToScreen(hu, hv), 6.0f, col(pal.hoverHighlight), 16, 2.0f);
     }
 
+    // ---- C29-B sketch-editing tools (Trim / Extend / Offset) ----
+    // These have bespoke pick semantics (whole-entity hover + ops), so they run BEFORE the generic
+    // drawing-tool block and short-circuit it. Each refreshes the entity set via the ops response
+    // path (loadDocMesh + resolve), exactly like sketch_add_entity; op errors are logged and the
+    // tool stays active. Esc exits.
+    bool editTool = (tool_ == SketchTool::Trim || tool_ == SketchTool::Extend ||
+                     tool_ == SketchTool::Offset);
+    if (editTool) {
+        int hovered = imgHovered ? hitTestEntity(io.MousePos) : -1;
+
+        // ----- TRIM: highlight the hovered entity in red; click sends sketch_trim at the uv. -----
+        if (tool_ == SketchTool::Trim) {
+            if (hovered >= 0) {
+                // Whole-entity emphasis in red (honest approximation: we do NOT compute the exact
+                // trimmed span client-side — the engine splits at intersections and returns the
+                // surviving spans; we just flag the picked entity).
+                const SketchEntity& e = ents_[hovered];
+                const ImU32 rc = col(pal.statusErr, 0.95f);
+                if (e.type == "line" || e.type == "slot") {
+                    dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), rc, 3.5f);
+                } else if (e.type == "circle" || e.type == "arc") {
+                    float a0 = 0, a1 = 6.2831853f;
+                    if (e.type == "arc") {
+                        a0 = e.start * 3.14159265f / 180.0f; a1 = e.end * 3.14159265f / 180.0f;
+                        if (!e.ccw) { float t = a0; a0 = a1; a1 = t; }
+                        if (a1 < a0) a1 += 6.2831853f;
+                    }
+                    ImVec2 prev; int seg = 64;
+                    for (int i = 0; i <= seg; ++i) {
+                        float a = a0 + (a1 - a0) * (i / (float)seg);
+                        ImVec2 p = uvToScreen(e.center[0] + e.radius * std::cos(a),
+                                              e.center[1] + e.radius * std::sin(a));
+                        if (i) dl->AddLine(prev, p, rc, 3.5f); prev = p;
+                    }
+                }
+            }
+            if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hovered >= 0) {
+                const SketchEntity& e = ents_[hovered];
+                if (e.type != "line" && e.type != "circle" && e.type != "arc") {
+                    st.addLog("[sketch] Trim: unsupported entity type '" + e.type + "'");
+                } else {
+                    nlohmann::json op = {{"op", "sketch_trim"}, {"sketch", fid_},
+                        {"entity", e.id}, {"point", nlohmann::json::array({mu, mv})}};
+                    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+                    if (!r.ok) st.addLog("[sketch] trim failed: " + r.error_message);
+                    else {
+                        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+                        resolve(st);   // refresh entities/statuses (same path as add_entity)
+                    }
+                }
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) cancelTool();
+        }
+
+        // ----- EXTEND: highlight the nearer end; click sends sketch_extend with start|end. -----
+        else if (tool_ == SketchTool::Extend) {
+            const char* whichEnd = nullptr;     // "start"|"end" for line/arc, by nearer endpoint
+            ImVec2 endPx;
+            if (hovered >= 0) {
+                const SketchEntity& e = ents_[hovered];
+                const ImU32 ac = col(pal.accent, 0.95f);
+                // Faint accent over the whole entity, bright dot on the nearer pickable end.
+                if (e.type == "line") {
+                    ImVec2 a = uvToScreen(e.p1[0], e.p1[1]), b = uvToScreen(e.p2[0], e.p2[1]);
+                    dl->AddLine(a, b, ac, 2.5f);
+                    float da = std::hypot(a.x - io.MousePos.x, a.y - io.MousePos.y);
+                    float db = std::hypot(b.x - io.MousePos.x, b.y - io.MousePos.y);
+                    whichEnd = da < db ? "start" : "end"; endPx = da < db ? a : b;
+                } else if (e.type == "arc") {
+                    ImVec2 a = uvToScreen(e.center[0] + e.radius * std::cos(e.start * 3.14159265f / 180.0f),
+                                          e.center[1] + e.radius * std::sin(e.start * 3.14159265f / 180.0f));
+                    ImVec2 b = uvToScreen(e.center[0] + e.radius * std::cos(e.end * 3.14159265f / 180.0f),
+                                          e.center[1] + e.radius * std::sin(e.end * 3.14159265f / 180.0f));
+                    float da = std::hypot(a.x - io.MousePos.x, a.y - io.MousePos.y);
+                    float db = std::hypot(b.x - io.MousePos.x, b.y - io.MousePos.y);
+                    whichEnd = da < db ? "start" : "end"; endPx = da < db ? a : b;
+                }
+                if (whichEnd) dl->AddCircleFilled(endPx, 6.0f, ac);
+            }
+            if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hovered >= 0) {
+                const SketchEntity& e = ents_[hovered];
+                if (!whichEnd) {
+                    st.addLog("[sketch] Extend: unsupported entity type '" + e.type + "'");
+                } else {
+                    nlohmann::json op = {{"op", "sketch_extend"}, {"sketch", fid_},
+                        {"entity", e.id}, {"end", whichEnd}};
+                    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+                    if (!r.ok) st.addLog("[sketch] extend failed: " + r.error_message);
+                    else {
+                        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+                        resolve(st);
+                    }
+                }
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) cancelTool();
+        }
+
+        // ----- OFFSET: pick chain -> Enter/[Offset] chip -> type distance -> click side. -----
+        else if (tool_ == SketchTool::Offset) {
+            auto inChain = [&](const std::string& id) {
+                return std::find(offsetChain_.begin(), offsetChain_.end(), id) != offsetChain_.end();
+            };
+            // Tint already-selected chain entities in accent.
+            for (const auto& e : ents_) {
+                if (!inChain(e.id)) continue;
+                const ImU32 ac = col(pal.accent, 0.95f);
+                if (e.type == "line" || e.type == "slot") {
+                    dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), ac, 3.5f);
+                } else if (e.type == "circle" || e.type == "arc") {
+                    float a0 = 0, a1 = 6.2831853f;
+                    if (e.type == "arc") {
+                        a0 = e.start * 3.14159265f / 180.0f; a1 = e.end * 3.14159265f / 180.0f;
+                        if (!e.ccw) { float t = a0; a0 = a1; a1 = t; }
+                        if (a1 < a0) a1 += 6.2831853f;
+                    }
+                    ImVec2 prev; int seg = 64;
+                    for (int i = 0; i <= seg; ++i) {
+                        float a = a0 + (a1 - a0) * (i / (float)seg);
+                        ImVec2 p = uvToScreen(e.center[0] + e.radius * std::cos(a),
+                                              e.center[1] + e.radius * std::sin(a));
+                        if (i) dl->AddLine(prev, p, ac, 3.5f); prev = p;
+                    }
+                }
+            }
+            if (offsetStage_ == 0) {
+                // Hover preview (faint) over the would-be-added entity.
+                if (hovered >= 0 && !inChain(ents_[hovered].id)) {
+                    const SketchEntity& e = ents_[hovered];
+                    const ImU32 hc = col(pal.hoverHighlight, 0.9f);
+                    if (e.type == "line" || e.type == "slot")
+                        dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), hc, 3.0f);
+                    else if (e.type == "circle" || e.type == "arc")
+                        dl->AddCircle(uvToScreen(e.center[0], e.center[1]),
+                                      std::hypot(uvToScreen(e.center[0] + e.radius, e.center[1]).x -
+                                                 uvToScreen(e.center[0], e.center[1]).x, 0.0f),
+                                      hc, 48, 3.0f);
+                }
+                // Click toggles an entity in/out of the chain.
+                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hovered >= 0) {
+                    const SketchEntity& e = ents_[hovered];
+                    if (e.type != "line" && e.type != "circle" && e.type != "arc") {
+                        st.addLog("[sketch] Offset: unsupported entity type '" + e.type + "'");
+                    } else {
+                        auto it = std::find(offsetChain_.begin(), offsetChain_.end(), e.id);
+                        if (it != offsetChain_.end()) offsetChain_.erase(it);
+                        else offsetChain_.push_back(e.id);
+                    }
+                }
+                // Enter advances to the distance stage when the chain is non-empty.
+                if (!offsetChain_.empty() && ImGui::IsKeyPressed(ImGuiKey_Enter)) {
+                    offsetStage_ = 1; offsetFocusInput_ = true; offsetOverlayPos_ = io.MousePos;
+                }
+            } else if (offsetStage_ == 2) {
+                // Side pick: the next click's uv is the side hint.
+                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    nlohmann::json eids = nlohmann::json::array();
+                    for (const auto& id : offsetChain_) eids.push_back(id);
+                    nlohmann::json op = {{"op", "sketch_offset"}, {"sketch", fid_},
+                        {"entities", eids}, {"distance", offsetDist_},
+                        {"side", nlohmann::json::array({mu, mv})}};
+                    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+                    if (!r.ok) st.addLog("[sketch] offset failed: " + r.error_message);
+                    else {
+                        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+                        resolve(st);
+                    }
+                    // Reset for another offset (stay in the tool), keep the distance default.
+                    offsetStage_ = 0; offsetChain_.clear();
+                }
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                // Esc backs out one stage; from the chain stage it exits the tool.
+                if (offsetStage_ == 2) { offsetStage_ = 1; offsetFocusInput_ = true; }
+                else if (offsetStage_ == 1) offsetStage_ = 0;
+                else cancelTool();
+            }
+        }
+    }
+
     // ---- drawing tools: rubber-band preview + click handling ----
-    if (tool_ != SketchTool::None && tool_ != SketchTool::SmartDim) {
+    if (!editTool && tool_ != SketchTool::None && tool_ != SketchTool::SmartDim) {
         // Snap the live cursor for preview + inference glyphs.
         float su = mu, sv = mv; std::string snapH;
         if (imgHovered) snapPoint(su, sv, snapH);
@@ -1068,7 +1284,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          tool_ == SketchTool::SlotCtrStr ? "Centerpoint Slot" :
                          tool_ == SketchTool::EllipsePartial ? "Partial Ellipse" :
                          tool_ == SketchTool::Parabola ? "Parabola" :
-                         tool_ == SketchTool::Conic ? "Conic" : "";
+                         tool_ == SketchTool::Conic ? "Conic" :
+                         tool_ == SketchTool::Trim ? "Trim" :
+                         tool_ == SketchTool::Extend ? "Extend" :
+                         tool_ == SketchTool::Offset ? "Offset" : "";
         // Per-stage step prompt (status-bar style) for the multi-click variants.
         const size_t n = toolUV_.size();
         const char* step = nullptr;
@@ -1092,6 +1311,14 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             case SketchTool::Conic:
                 step = n == 0 ? "click endpoint 1" : n == 1 ? "click endpoint 2" :
                        n == 2 ? "click apex" : "click to set rho (fullness)"; break;
+            case SketchTool::Trim:
+                step = "hover a segment (red), click to trim"; break;
+            case SketchTool::Extend:
+                step = "hover near an end, click to extend"; break;
+            case SketchTool::Offset:
+                step = offsetStage_ == 0 ? "click entities for the chain, then Enter"
+                     : offsetStage_ == 1 ? "type the offset distance, Enter"
+                     : "click the side to offset toward"; break;
             default: break;
         }
         std::string hint = std::string(tn) + (step ? std::string(" \xE2\x80\x94 ") + step : std::string()) +
@@ -1161,6 +1388,27 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 }
             }
             if (cancel) { dimPopupOpen_ = false; dimPending_ = nullptr; dimError_.clear(); }
+        }
+        ImGui::End();
+    }
+
+    // ---- Offset distance overlay (small InputFloat near the cursor; Enter -> side-pick stage) ----
+    if (tool_ == SketchTool::Offset && offsetStage_ == 1) {
+        ImGui::SetNextWindowPos(offsetOverlayPos_, ImGuiCond_Appearing);
+        ImGui::SetNextWindowBgAlpha(0.98f);
+        if (ImGui::Begin("##SketchOffsetDist", nullptr,
+                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::TextUnformatted("Offset distance (mm)");
+            ImGui::SetNextItemWidth(120);
+            if (offsetFocusInput_) { ImGui::SetKeyboardFocusHere(); offsetFocusInput_ = false; }
+            bool enter = ImGui::InputFloat("##offdist", &offsetDist_, 0.0f, 0.0f, "%.3f",
+                                           ImGuiInputTextFlags_EnterReturnsTrue);
+            bool ok = ImGui::Button("Next") || enter;
+            ImGui::SameLine();
+            bool cancel = ImGui::Button("Cancel");
+            if (ok) { offsetDist_ = std::fabs(offsetDist_); offsetStage_ = 2; }
+            if (cancel) { offsetStage_ = 0; }
         }
         ImGui::End();
     }

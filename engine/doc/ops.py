@@ -588,6 +588,198 @@ def _op_sketch_set_dim(doc, op, index, idgen, id_map):
     raise _invalid(index, f"sketch_set_dim: constraint '{cid}' not found")
 
 
+# ---- sketch geometry tools (C29-A): trim / extend / offset ----
+#
+# These mutate the sketch feature's entity list and flow through the normal apply_ops rebuild path
+# (revision bump, solver re-run, tree/aicm re-emit) via session.apply_ops, exactly like
+# sketch_add_entity. The pure 2D math lives in engine.doc.sketch_geom; this layer resolves ids,
+# splices the entity list, drops dangling constraints, and records the id mapping.
+#
+# id_map convention (extends the flat "$<index>" -> id scheme): an op that produces several entities
+# records the primary/surviving id under "$<index>" and any additional new ids under
+# "$<index>#1", "$<index>#2", ... (still flat string->string, JSON-safe).
+
+
+def _sketch_entities(sk: dict) -> list[dict]:
+    return sk.setdefault("params", {}).setdefault("entities", [])
+
+
+def _find_entity(sk: dict, eid: str) -> dict | None:
+    for e in _sketch_entities(sk):
+        if e.get("id") == eid:
+            return e
+    return None
+
+
+def _geom_view(ent: dict) -> dict:
+    """A plain-math entity dict (engine.doc.sketch_geom shape) for one stored sketch entity."""
+    return {k: copy.deepcopy(v) for k, v in ent.items() if k not in ("id", "construction")}
+
+
+def _drop_constraints_touching(sk: dict, eids: set[str]) -> None:
+    """Drop constraints whose handles touch any removed entity (mirrors sketch_delete_entity)."""
+    params = sk.setdefault("params", {})
+    cons = params.setdefault("constraints", [])
+    params["constraints"] = [
+        c for c in cons
+        if not any(_handle_base(h) in eids for h in (c.get("refs", []) or []))
+    ]
+
+
+def _stamp_entity(ent: dict, geom: dict, eid: str, construction: bool) -> dict:
+    """Build a full stored entity from a sketch_geom result dict + id + construction flag."""
+    out = copy.deepcopy(geom)
+    out["id"] = eid
+    out["construction"] = bool(construction)
+    return out
+
+
+def _op_sketch_trim(doc, op, index, idgen, id_map):
+    from engine.doc import sketch_geom as geom
+
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    eid = op.get("entity")
+    target = _find_entity(sk, eid)
+    if target is None:
+        raise _invalid(index, f"sketch_trim: entity '{eid}' not found")
+    point = op.get("point")
+    if not (isinstance(point, list) and len(point) == 2):
+        raise _invalid(index, "sketch_trim requires 'point': [u, v]")
+
+    ents = _sketch_entities(sk)
+    # Cut against every OTHER non-construction supported entity.
+    others = [_geom_view(e) for e in ents
+              if e.get("id") != eid and not e.get("construction", False)]
+    try:
+        spans = geom.split_entity(_geom_view(target), others, [float(point[0]), float(point[1])])
+    except geom.UnsupportedEntity as exc:
+        raise OpError("unsupported_entity",
+                      f"op[{index}]: sketch_trim involves an unsupported entity ({exc.etype})",
+                      {"index": index, "reason": f"unsupported entity '{exc.etype}'"})
+
+    pos = next(i for i, e in enumerate(ents) if e.get("id") == eid)
+    construction = bool(target.get("construction", False))
+
+    if not spans:
+        # No interior crossings -> power-trim deletes the whole entity.
+        ents.pop(pos)
+        _drop_constraints_touching(sk, {eid})
+        id_map[f"${index}"] = ""   # nothing survives
+        return
+
+    # First surviving span keeps the original id; the rest get fresh ids.
+    new_ents: list[dict] = [_stamp_entity(spans[0], spans[0], eid, construction)]
+    extra_ids: list[str] = []
+    for span in spans[1:]:
+        neid = idgen.next("e")
+        extra_ids.append(neid)
+        new_ents.append(_stamp_entity(span, span, neid, construction))
+    ents[pos:pos + 1] = new_ents
+
+    # The target geometry changed shape: drop constraints that referenced the trimmed entity (its
+    # handles no longer describe the same span). Mirrors entity-deletion's dangling-constraint drop.
+    _drop_constraints_touching(sk, {eid})
+
+    id_map[f"${index}"] = eid
+    for k, neid in enumerate(extra_ids, start=1):
+        id_map[f"${index}#{k}"] = neid
+
+
+def _op_sketch_extend(doc, op, index, idgen, id_map):
+    from engine.doc import sketch_geom as geom
+
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    eid = op.get("entity")
+    target = _find_entity(sk, eid)
+    if target is None:
+        raise _invalid(index, f"sketch_extend: entity '{eid}' not found")
+    end = op.get("end")
+    if end not in ("start", "end"):
+        raise _invalid(index, "sketch_extend requires 'end': 'start' | 'end'")
+
+    ents = _sketch_entities(sk)
+    others = [_geom_view(e) for e in ents
+              if e.get("id") != eid and not e.get("construction", False)]
+    try:
+        new_geom = geom.extend_entity(_geom_view(target), end, others)
+    except geom.UnsupportedEntity as exc:
+        raise OpError("unsupported_entity",
+                      f"op[{index}]: sketch_extend involves an unsupported entity ({exc.etype})",
+                      {"index": index, "reason": f"unsupported entity '{exc.etype}'"})
+
+    if new_geom is None:
+        raise OpError("extend_no_target",
+                      f"op[{index}]: sketch_extend found nothing to extend '{eid}' to",
+                      {"index": index, "reason": "no target ahead of the extended end"})
+
+    # In-place edit of the existing entity's geometry fields (id/construction preserved).
+    for k in list(target.keys()):
+        if k not in ("id", "construction"):
+            target.pop(k, None)
+    target.update(new_geom)
+    id_map[f"${index}"] = eid
+
+
+def _op_sketch_offset(doc, op, index, idgen, id_map):
+    from engine.doc import sketch_geom as geom
+
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    eids = op.get("entities")
+    if not (isinstance(eids, list) and eids):
+        raise _invalid(index, "sketch_offset requires a non-empty 'entities' id list")
+    distance = op.get("distance")
+    if not isinstance(distance, (int, float)) or isinstance(distance, bool):
+        raise _invalid(index, "sketch_offset requires a numeric 'distance'")
+    side = op.get("side")
+    if not (isinstance(side, list) and len(side) == 2):
+        raise _invalid(index, "sketch_offset requires 'side': [u, v]")
+
+    chain: list[dict] = []
+    for e_id in eids:
+        ent = _find_entity(sk, e_id)
+        if ent is None:
+            raise _invalid(index, f"sketch_offset: entity '{e_id}' not found")
+        chain.append(_geom_view(ent))
+
+    try:
+        out = geom.offset_chain(chain, float(distance),
+                                [float(side[0]), float(side[1])])
+        closed = geom._chain_is_closed(chain)
+    except geom.UnsupportedEntity as exc:
+        raise OpError("unsupported_entity",
+                      f"op[{index}]: sketch_offset involves an unsupported entity ({exc.etype})",
+                      {"index": index, "reason": f"unsupported entity '{exc.etype}'"})
+
+    ents = _sketch_entities(sk)
+    cons = sk["params"].setdefault("constraints", [])
+    new_ids: list[str] = []
+    for span in out:
+        neid = idgen.next("e")
+        new_ids.append(neid)
+        ents.append(_stamp_entity(span, span, neid, False))
+
+    # Coincident constraints at the NEW joints only (consecutive offset entities meet end->start;
+    # a closed chain also joins the last back to the first). Handle names are per-type: a line's end
+    # is p2 / start is p1, an arc's are end / start (schema HANDLE_RE).
+    def _end_handle(eid: str, which: str) -> str:
+        etype = _find_entity(sk, eid).get("type")
+        if etype == "line":
+            return f"{eid}." + ("p1" if which == "start" else "p2")
+        return f"{eid}.{which}"
+
+    n = len(new_ids)
+    joints = n if (closed and n > 1) else n - 1
+    for i in range(joints):
+        a = new_ids[i]
+        b = new_ids[(i + 1) % n]
+        cons.append({"id": idgen.next("c"), "type": "coincident",
+                     "refs": [_end_handle(a, "end"), _end_handle(b, "start")]})
+
+    id_map[f"${index}"] = new_ids[0] if new_ids else ""
+    for k, neid in enumerate(new_ids[1:], start=1):
+        id_map[f"${index}#{k}"] = neid
+
+
 # ---- assembly ----
 
 
@@ -722,9 +914,9 @@ _OP_HANDLERS = {
     "asm_edit_mate": _op_asm_edit_mate,
     "asm_delete_mate": _op_asm_delete_mate,
     "asm_set_explode": _op_asm_set_explode,
-    "sketch_trim": _op_unsupported_m2,
-    "sketch_extend": _op_unsupported_m2,
-    "sketch_offset": _op_unsupported_m2,
+    "sketch_trim": _op_sketch_trim,
+    "sketch_extend": _op_sketch_extend,
+    "sketch_offset": _op_sketch_offset,
     "sketch_convert": _op_unsupported_m2,
     "sketch_mirror_entities": _op_unsupported_m2,
     "sketch_pattern_entities": _op_unsupported_m2,

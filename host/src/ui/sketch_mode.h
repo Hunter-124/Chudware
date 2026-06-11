@@ -32,7 +32,9 @@ enum class SketchTool {
     CirclePerimeter,                                // -> 1 circle (circumcircle of 3 pts)
     SlotCtrStr,                                     // -> 1 slot (centerpoint input)
     // Conic family (engine contract C28-A: ellipse_arc / parabola / conic entities):
-    EllipsePartial, Parabola, Conic
+    EllipsePartial, Parabola, Conic,
+    // C29-B sketch-editing tools (engine contract C29-A: sketch_trim/extend/offset ops):
+    Trim, Extend, Offset
 };
 
 // One solved entity in the active sketch (mirrors a worker sketch_enter/solve entity record).
@@ -102,6 +104,9 @@ private:
     // handle (e.g. "e3.p2") when an endpoint snap fired.
     void snapPoint(float& u, float& v, std::string& snapHandle) const;
     int hitTestHandle(const ImVec2& s, std::string& handleOut, float& uOut, float& vOut) const;
+    // Nearest WHOLE entity under the screen point (line segment / circle rim / arc rim distance);
+    // returns the index into ents_ or -1. Used by Trim / Extend / Offset hover + pick (C29-B).
+    int hitTestEntity(const ImVec2& s, float maxPx = 12.0f) const;
 
     bool active_ = false;
     bool isNewEmpty_ = false;        // entered a freshly-created sketch (delete on cancel-exit)
@@ -135,6 +140,15 @@ private:
     std::string dragHandle_;
     bool dragging_ = false;
     int dragFrame_ = -1;             // last frame a sketch_drag was issued (throttle: once/frame)
+
+    // C29-B Offset tool state. Stages: collect a chain of entity ids (selected ones tint accent),
+    // then a distance overlay (InputFloat near cursor, Enter commits), then one click for the side
+    // hint -> sketch_offset op. offsetStage_: 0=picking chain, 1=typing distance, 2=picking side.
+    std::vector<std::string> offsetChain_;
+    int offsetStage_ = 0;
+    float offsetDist_ = 10.0f;
+    ImVec2 offsetOverlayPos_{0, 0};
+    bool offsetFocusInput_ = false;   // request keyboard focus on the distance field next frame
 
     // smart-dimension popup state
     bool dimPopupOpen_ = false;

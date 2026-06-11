@@ -7,11 +7,9 @@
 
 namespace ui {
 
-void drawConsolePanel(AppState& st) {
-    // ---------- Console ----------
-    if (st.showConsole) {
-    if (ImGui::Begin("Console"))
-    {
+// Body only (no Begin/End) — used both by the standalone Console window and the consolidated
+// AI panel's Console tab.
+void drawConsoleBody(AppState& st) {
         const auto& pal = ui::palette;
         ImGui::PushFont(st.fonts.mono);
         ImGui::PushStyleColor(ImGuiCol_ChildBg,
@@ -34,9 +32,12 @@ void drawConsolePanel(AppState& st) {
         ImGui::EndChild();
         ImGui::PopStyleColor();
         ImGui::PopFont();
-    }
+}
+
+void drawConsolePanel(AppState& st) {
+    if (!st.showConsole) return;
+    if (ImGui::Begin("Console")) drawConsoleBody(st);
     ImGui::End();
-    }
 }
 
 }  // namespace ui

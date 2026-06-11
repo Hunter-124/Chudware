@@ -85,7 +85,8 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::OpenPopup("Settings");
         st.openSettings = false;
     }
-    ImGui::SetNextWindowSize(ImVec2(580, 640), ImGuiCond_Appearing);
+    float sc = ui::uiScale;
+    ImGui::SetNextWindowSize(ImVec2(580.0f * sc, 640.0f * sc), ImGuiCond_Appearing);
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
                             ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Settings", nullptr, ImGuiWindowFlags_NoResize)) {
@@ -132,7 +133,7 @@ void drawSettingsModal(AppState& st, bool busy) {
         // tab content scrolls in its own region; Save/Cancel stay pinned at the bottom
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
         ImGui::BeginChild("##settabsarea",
-                          ImVec2(0, ImGui::GetContentRegionAvail().y - 52));
+                          ImVec2(0, ImGui::GetContentRegionAvail().y - 52.0f * sc));
         if (ImGui::BeginTabBar("##settabs")) {
             if (ImGui::BeginTabItem("AI provider")) {
                 ImGui::Dummy(ImVec2(0, 2));
@@ -180,12 +181,12 @@ void drawSettingsModal(AppState& st, bool busy) {
                 }
                 if (s_promptsLoaded && !s_promptRecs.empty()) {
                     // Left column: role list
-                    float listW = 100.0f;
+                    float listW = 100.0f * sc;
                     float avail = ImGui::GetContentRegionAvail().y;
                     ImGui::PushStyleColor(ImGuiCol_ChildBg,
                         ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
                                ui::palette.panelBg[2], 1));
-                    ImGui::BeginChild("##rolelist", ImVec2(listW, avail - 38),
+                    ImGui::BeginChild("##rolelist", ImVec2(listW, avail - 38.0f * sc),
                                       ImGuiChildFlags_Border);
                     for (int i = 0; i < (int)s_promptRecs.size(); ++i) {
                         bool sel = (i == s_selectedRole);
@@ -201,7 +202,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                     ImGui::SameLine();
 
                     // Right column: editor + diff indicator
-                    ImGui::BeginChild("##roleeditor", ImVec2(0, avail - 38), ImGuiChildFlags_None);
+                    ImGui::BeginChild("##roleeditor", ImVec2(0, avail - 38.0f * sc), ImGuiChildFlags_None);
                     if (s_selectedRole < (int)s_promptRecs.size()) {
                         auto& pr = s_promptRecs[s_selectedRole];
                         // Overridden badge
@@ -232,14 +233,14 @@ void drawSettingsModal(AppState& st, bool busy) {
                         ImGui::PopFont();
                         // Save / Reset
                         if (!canFetch) ImGui::BeginDisabled();
-                        if (primaryButton("Save", ImVec2(80, 28))) {
+                        if (primaryButton("Save", ImVec2(80.0f * sc, 28.0f * sc))) {
                             savePromptOverride(pr);
                             st.addLog("[ok] prompt saved: " + pr.role);
                         }
                         if (!canFetch) ImGui::EndDisabled();
                         ImGui::SameLine();
                         if (!canFetch) ImGui::BeginDisabled();
-                        if (ImGui::Button("Reset to built-in", ImVec2(140, 28))) {
+                        if (ImGui::Button("Reset to built-in", ImVec2(140.0f * sc, 28.0f * sc))) {
                             resetPromptOverride(pr, st);
                             st.addLog("[ok] prompt reset: " + pr.role);
                         }
@@ -307,14 +308,14 @@ void drawSettingsModal(AppState& st, bool busy) {
         }
         ImGui::EndChild();
         ImGui::PopStyleColor();
-        if (primaryButton("Save", ImVec2(120, 34))) {
+        if (primaryButton("Save", ImVec2(120.0f * sc, 34.0f * sc))) {
             settings.systemPrompt = st.spBuf.data();
             saveSettings(settings);
             st.addLog("[ok] saved settings");
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(100, 34))) {
+        if (ImGui::Button("Cancel", ImVec2(100.0f * sc, 34.0f * sc))) {
             std::fill(st.spBuf.begin(), st.spBuf.end(), 0);  // discard edits
             std::strncpy(st.spBuf.data(), settings.systemPrompt.c_str(), st.spBuf.size() - 1);
             ImGui::CloseCurrentPopup();
@@ -327,11 +328,13 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::OpenPopup("About AI-CAD");
         st.showAbout = false;
     }
-    ImGui::SetNextWindowSize(ImVec2(380, 0), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(380.0f * sc, 0), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal("About AI-CAD", nullptr, ImGuiWindowFlags_NoResize)) {
-        if (st.wordmark.id) {
-            ImGui::Image((ImTextureID)(intptr_t)st.wordmark.id,
-                         ImVec2(190, 190 * (float)st.wordmark.h / st.wordmark.w));
+        const Tex& wm = (ui::activeTheme == ui::Theme::Light && st.wordmarkDark.id)
+                            ? st.wordmarkDark : st.wordmark;
+        if (wm.id) {
+            ImGui::Image((ImTextureID)(intptr_t)wm.id,
+                         ImVec2(190.0f * sc, 190.0f * sc * (float)wm.h / wm.w));
         } else {
             sectionHeader(st.fonts.h1, "AI-CAD");
         }
@@ -340,7 +343,7 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::TextUnformatted("build123d + OpenCASCADE kernel");
         ImGui::TextUnformatted("GLFW / Dear ImGui / OpenGL");
         ImGui::Dummy(ImVec2(0, 8));
-        if (primaryButton("Close", ImVec2(110, 32))) ImGui::CloseCurrentPopup();
+        if (primaryButton("Close", ImVec2(110.0f * sc, 32.0f * sc))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
 }

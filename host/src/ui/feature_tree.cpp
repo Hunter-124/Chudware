@@ -77,32 +77,100 @@ static void featureBadge(bool ok, bool hasError, const std::string& errText,
     (void)hasError;
 }
 
+// ---- shared op applier (DocMirror ops -> rebuild -> reload mesh) ----
+// Centralizes the apply_ops -> loadDocMesh pattern used by suppress/delete/reorder/rename/folder.
+// Dependency violations (reorder/delete) are reported as a warning, leaving the tree unchanged.
+//
+// C25 CRASH FIX: DocMirror::applyOps REPLACES the mirror's tree json, but every caller here
+// sits inside the draw code that iterates references INTO that json (drag-drop reorder,
+// row context menus, Ctrl+Up/Down) — applying immediately is a use-after-free. applyTreeOps
+// therefore only ENQUEUES; flushPendingTreeOps() applies after all tree reads are done
+// (end of drawFeatureTree).
+struct PendingTreeOps { nlohmann::json ops; std::string what; };
+static std::vector<PendingTreeOps> s_pendingTreeOps;
+
+static void applyTreeOpsNow(AppState& st, const nlohmann::json& ops, const char* what) {
+    if (!st.docMirror.hasDoc() || !st.workerStarted) return;
+    auto resp = st.docMirror.applyOps(st.worker, ops);
+    if (resp.ok && !resp.aicm_path.empty()) {
+        std::string lerr;
+        st.loadDocMesh(resp.aicm_path, lerr);
+        if (!lerr.empty()) st.addLog("[err] loadDocMesh: " + lerr);
+    } else if (!resp.ok) {
+        if (resp.error_code == "dependency_exists")
+            st.addLog(std::string("[warn] ") + what +
+                      ": blocked — a feature depends on this order");
+        else
+            st.addLog(std::string("[err] ") + what + ": " + resp.error_message);
+    }
+}
+
+static void applyTreeOps(AppState& st, const nlohmann::json& ops, const char* what) {
+    (void)st;
+    s_pendingTreeOps.push_back({ops, what});
+}
+
+static void flushPendingTreeOps(AppState& st) {
+    if (s_pendingTreeOps.empty()) return;
+    auto pending = std::move(s_pendingTreeOps);
+    s_pendingTreeOps.clear();
+    for (const auto& p : pending) applyTreeOpsNow(st, p.ops, p.what.c_str());
+}
+
+// Inline-rename state: which feature id is being renamed + its edit buffer.
+static std::string s_renamingId;
+static char        s_renameBuf[128] = {0};
+
 // ---- draw one feature row ----
 // Returns true if the row was left-clicked (selection).
+// reorderCb(draggedId, beforeId): drop draggedId immediately before beforeId (empty = end).
 static bool featureRow(const std::string& fid, const std::string& name, const char* iconName,
-                       const char* iconFallback, bool suppressed, bool selected,
+                       const char* iconFallback, bool suppressed, bool selected, bool dimmed,
                        bool ok, bool hasError, const std::string& errText,
                        const std::vector<std::string>& danglingRefs,
                        const std::function<void(const std::string&)>& editCallback,
+                       const std::function<void(const std::string&, const std::string&)>& reorderCb,
                        AppState& st) {
+    float iconW = 20.0f;
+    treeIcon(iconName, iconFallback, iconW);
+    ImGui::SameLine(0, 4);
+
+    // ---- inline rename editor (replaces the label while active) ----
+    if (s_renamingId == fid) {
+        ImGui::SetNextItemWidth(-1);
+        if (!ImGui::IsAnyItemActive()) ImGui::SetKeyboardFocusHere();
+        bool commit = ImGui::InputText(("##rn_" + fid).c_str(), s_renameBuf, sizeof(s_renameBuf),
+                                       ImGuiInputTextFlags_EnterReturnsTrue |
+                                       ImGuiInputTextFlags_AutoSelectAll);
+        bool cancel = ImGui::IsKeyPressed(ImGuiKey_Escape);
+        bool deact  = ImGui::IsItemDeactivated();
+        if (commit || cancel || deact) {
+            std::string newName = s_renameBuf;
+            std::string old = s_renamingId;
+            s_renamingId.clear();
+            if (!cancel && !newName.empty() && newName != name) {
+                nlohmann::json ops = nlohmann::json::array();
+                ops.push_back({{"op", "rename"}, {"id", old}, {"name", newName}});
+                applyTreeOps(st, ops, "rename");
+            }
+        }
+        return false;
+    }
+
     ImGuiTreeNodeFlags flags =
         ImGuiTreeNodeFlags_Leaf |
         ImGuiTreeNodeFlags_NoTreePushOnOpen |
         ImGuiTreeNodeFlags_SpanFullWidth;
     if (selected) flags |= ImGuiTreeNodeFlags_Selected;
 
-    // Suppress dimming
-    if (suppressed) {
+    // Suppressed features dim heavily; features rolled back (after the edit point) dim lightly.
+    bool dim = suppressed || dimmed;
+    if (dim) {
+        float a = suppressed ? 0.5f : 0.6f;
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                   ui::palette.textDim[2], 0.5f));
+                   ui::palette.textDim[2], a));
     }
-
-    // Small icon before the label
-    float iconW = 20.0f;
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX());
-    treeIcon(iconName, iconFallback, iconW);
-    ImGui::SameLine(0, 4);
 
     // Build the label string; add "[S]" suffix for suppressed
     std::string label = name;
@@ -111,7 +179,25 @@ static bool featureRow(const std::string& fid, const std::string& name, const ch
 
     bool clicked = ImGui::TreeNodeEx(label.c_str(), flags);
 
-    if (suppressed) ImGui::PopStyleColor();
+    if (dim) ImGui::PopStyleColor();
+
+    // ---- drag-drop reorder ----
+    if (reorderCb && ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+        ImGui::SetDragDropPayload("FEATURE_ROW", fid.c_str(), fid.size() + 1);
+        ImGui::Text("Move %s", name.c_str());
+        ImGui::EndDragDropSource();
+    }
+    if (reorderCb && ImGui::BeginDragDropTarget()) {
+        // Insertion line at this row's top edge so the drop point is obvious.
+        ImVec2 rmin = ImGui::GetItemRectMin(), rmax = ImGui::GetItemRectMax();
+        ImGui::GetWindowDrawList()->AddLine(ImVec2(rmin.x, rmin.y), ImVec2(rmax.x, rmin.y),
+                                            ui::Palette::toU32(ui::palette.accent), 2.0f);
+        if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("FEATURE_ROW")) {
+            std::string dragged(static_cast<const char*>(pl->Data));
+            if (dragged != fid) reorderCb(dragged, fid);
+        }
+        ImGui::EndDragDropTarget();
+    }
 
     featureBadge(ok, hasError, errText, danglingRefs);
 
@@ -134,44 +220,28 @@ static bool featureRow(const std::string& fid, const std::string& name, const ch
             ImGui::MenuItem("Edit");
             ImGui::EndDisabled();
         }
-        // Rename (inline) — we use a small InputText below the menu
+        // Rename (inline): arm the in-place editor on the row.
         if (ImGui::MenuItem("Rename")) {
-            // Trigger rename mode by setting a flag via log (simple approach for M1)
-            st.addLog("[tree] rename: " + fid + " (UI: click to rename)");
+            s_renamingId = fid;
+            std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", name.c_str());
+        }
+        // Remove from folder (only meaningful when grouped).
+        if (ImGui::MenuItem("Remove from folder")) {
+            nlohmann::json ops = nlohmann::json::array();
+            ops.push_back({{"op", "set_folder"}, {"id", fid}, {"folder", ""}});
+            applyTreeOps(st, ops, "set_folder");
         }
         ImGui::Separator();
         if (ImGui::MenuItem(suppressed ? "Unsuppress" : "Suppress")) {
-            if (st.docMirror.hasDoc() && st.workerStarted) {
-                nlohmann::json ops = nlohmann::json::array();
-                ops.push_back({{"op", "set_suppressed"}, {"id", fid}, {"value", !suppressed}});
-                auto resp = st.docMirror.applyOps(st.worker, ops);
-                if (resp.ok && !resp.aicm_path.empty()) {
-                    std::string lerr;
-                    st.loadDocMesh(resp.aicm_path, lerr);
-                    if (!lerr.empty()) st.addLog("[err] loadDocMesh: " + lerr);
-                } else if (!resp.ok) {
-                    st.addLog("[err] suppress: " + resp.error_message);
-                }
-            }
+            nlohmann::json ops = nlohmann::json::array();
+            ops.push_back({{"op", "set_suppressed"}, {"id", fid}, {"value", !suppressed}});
+            applyTreeOps(st, ops, "suppress");
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Delete")) {
-            // Confirm before deleting (simple: just proceed for M1; dependency_exists returns error)
-            if (st.docMirror.hasDoc() && st.workerStarted) {
-                nlohmann::json ops = nlohmann::json::array();
-                ops.push_back({{"op", "delete_feature"}, {"id", fid}, {"cascade", false}});
-                auto resp = st.docMirror.applyOps(st.worker, ops);
-                if (resp.ok && !resp.aicm_path.empty()) {
-                    std::string lerr;
-                    st.loadDocMesh(resp.aicm_path, lerr);
-                    if (!lerr.empty()) st.addLog("[err] loadDocMesh: " + lerr);
-                } else if (!resp.ok) {
-                    if (resp.error_code == "dependency_exists")
-                        st.addLog("[warn] delete: feature has dependents (cascade needed)");
-                    else
-                        st.addLog("[err] delete: " + resp.error_message);
-                }
-            }
+            nlohmann::json ops = nlohmann::json::array();
+            ops.push_back({{"op", "delete_feature"}, {"id", fid}, {"cascade", false}});
+            applyTreeOps(st, ops, "delete");
         }
         ImGui::EndPopup();
     }
@@ -364,20 +434,16 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                 if (msup) ImGui::PopStyleColor();
 
                 if (ImGui::BeginPopupContextItem(("##mctx_" + mid).c_str())) {
+                    // C25: deferred via applyTreeOps — applying here would invalidate the
+                    // tree json this loop iterates (same UAF as feature reorder).
                     if (ImGui::MenuItem(msup ? "Unsuppress" : "Suppress")) {
-                        if (st.docMirror.hasDoc() && st.workerStarted) {
-                            auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
-                                {{"op","asm_edit_mate"},{"id",mid},{"suppressed",!msup}}}));
-                            reloadFrom(r);
-                        }
+                        applyTreeOps(st, nlohmann::json::array({
+                            {{"op","asm_edit_mate"},{"id",mid},{"suppressed",!msup}}}), "mate");
                     }
                     ImGui::Separator();
                     if (ImGui::MenuItem("Delete")) {
-                        if (st.docMirror.hasDoc() && st.workerStarted) {
-                            auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
-                                {{"op","asm_delete_mate"},{"id",mid}}}));
-                            reloadFrom(r);
-                        }
+                        applyTreeOps(st, nlohmann::json::array({
+                            {{"op","asm_delete_mate"},{"id",mid}}}), "mate");
                     }
                     ImGui::EndPopup();
                 }
@@ -399,7 +465,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
 static bool toolbarIconBtn(const char* id, const char* iconName, const char* tooltip,
                            bool enabled) {
     const auto& pal = ui::palette;
-    float btn = 24.0f;
+    float btn = 24.0f * ui::uiScale;
     ImGui::PushID(id);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     bool clicked = ImGui::InvisibleButton("##tb", ImVec2(btn, btn)) && enabled;
@@ -409,13 +475,66 @@ static bool toolbarIconBtn(const char* id, const char* iconName, const char* too
         dl->AddRectFilled(p0, ImVec2(p0.x + btn, p0.y + btn),
                           ui::Palette::toU32(pal.buttonHovered), 3.0f);
     IconUV iv = getIcon(iconName, 20);
-    float iz = 18.0f, off = (btn - iz) * 0.5f;
+    float iz = 18.0f * ui::uiScale, off = (btn - iz) * 0.5f;
     ImU32 tint = enabled ? IM_COL32(255,255,255,255) : IM_COL32(128,128,128,150);
     dl->AddImage(iv.texId, ImVec2(p0.x + off, p0.y + off),
                  ImVec2(p0.x + off + iz, p0.y + off + iz), iv.uv0, iv.uv1, tint);
     if (hov && tooltip) ImGui::SetTooltip("%s", tooltip);
     ImGui::PopID();
     return clicked;
+}
+
+// ---- "Name & group" — SolidWorks-style auto-naming + folder grouping ----
+// Renames every feature to a conventional per-type name ("Boss-Extrude1", "Fillet2", ...) and
+// sorts dress-up / pattern / reference / sketch features into folders. One batched op set, one
+// rebuild. (A future revision can route this through the AI agent for semantic names.)
+static void nameAndGroupFeatures(AppState& st) {
+    const nlohmann::json& tree = st.docMirror.tree();
+    if (!tree.is_object()) return;
+    auto feat = tree.find("features");
+    if (feat == tree.end() || !feat->is_array()) return;
+
+    std::map<std::string, int> counts;
+    nlohmann::json ops = nlohmann::json::array();
+
+    for (const auto& f : *feat) {
+        if (!f.is_object()) continue;
+        std::string fid = jfld(f, "id");
+        std::string ty  = jfld(f, "type");
+        std::string mode;
+        if (f.contains("params") && f["params"].is_object())
+            mode = jfld(f["params"], "mode");
+        bool cut = (mode == "cut");
+
+        std::string base, folder;
+        if      (ty == "sketch")           { base = "Sketch";              folder = "Sketches"; }
+        else if (ty == "extrude")          { base = cut ? "Cut-Extrude" : "Boss-Extrude"; }
+        else if (ty == "revolve")          { base = cut ? "Cut-Revolve" : "Boss-Revolve"; }
+        else if (ty == "sweep")            { base = cut ? "Cut-Sweep"   : "Boss-Sweep"; }
+        else if (ty == "loft")             { base = cut ? "Cut-Loft"    : "Boss-Loft"; }
+        else if (ty == "fillet")           { base = "Fillet";   folder = "Dress-up"; }
+        else if (ty == "chamfer")          { base = "Chamfer";  folder = "Dress-up"; }
+        else if (ty == "shell")            { base = "Shell";    folder = "Dress-up"; }
+        else if (ty == "draft")            { base = "Draft";    folder = "Dress-up"; }
+        else if (ty == "rib")              { base = "Rib";      folder = "Dress-up"; }
+        else if (ty == "hole")             { base = "Hole"; }
+        else if (ty == "linear_pattern")   { base = "LPattern"; folder = "Patterns"; }
+        else if (ty == "circular_pattern") { base = "CPattern"; folder = "Patterns"; }
+        else if (ty == "mirror")           { base = "Mirror";   folder = "Patterns"; }
+        else if (ty == "plane" || ty == "datum_plane") { base = "Plane"; folder = "Reference"; }
+        else if (ty == "axis")             { base = "Axis";  folder = "Reference"; }
+        else if (ty == "point")            { base = "Point"; folder = "Reference"; }
+        else                                { base = ty.empty() ? "Feature" : ty; }
+
+        int n = ++counts[base];
+        std::string name = base + std::to_string(n);
+        ops.push_back({{"op", "rename"}, {"id", fid}, {"name", name}});
+        ops.push_back({{"op", "set_folder"}, {"id", fid}, {"folder", folder}});
+    }
+    if (!ops.empty()) {
+        applyTreeOps(st, ops, "name & group");
+        st.addLog("[tree] named & grouped " + std::to_string(ops.size() / 2) + " features");
+    }
 }
 
 // ---- C24: FeatureManager top strip — a SolidWorks-style tab row (tree active; properties /
@@ -433,7 +552,7 @@ static void drawFeatureManagerTopStrip(AppState& st) {
         {"material", "Properties"},
         {"settings", "Configurations"},
     };
-    float tabBtn = 22.0f;
+    float tabBtn = 22.0f * ui::uiScale;
     for (int i = 0; i < 3; ++i) {
         if (i) ImGui::SameLine(0, 2);
         ImGui::PushID(i + 7700);
@@ -448,7 +567,7 @@ static void drawFeatureManagerTopStrip(AppState& st) {
             dl->AddLine(ImVec2(p0.x + 2, p0.y + tabBtn - 1), ImVec2(p0.x + tabBtn - 2, p0.y + tabBtn - 1),
                         ui::Palette::toU32(pal.accent), 2.0f);
         IconUV iv = getIcon(kTabs[i].icon, 20);
-        float iz = 16.0f, off = (tabBtn - iz) * 0.5f;
+        float iz = 16.0f * ui::uiScale, off = (tabBtn - iz) * 0.5f;
         dl->AddImage(iv.texId, ImVec2(p0.x + off, p0.y + off),
                      ImVec2(p0.x + off + iz, p0.y + off + iz), iv.uv0, iv.uv1,
                      act ? IM_COL32(255,255,255,255) : IM_COL32(190,190,190,180));
@@ -456,7 +575,7 @@ static void drawFeatureManagerTopStrip(AppState& st) {
         ImGui::PopID();
     }
     // right-aligned document toolbar
-    float nBtns = 6.0f, gap = 2.0f, bw = 24.0f;
+    float nBtns = 6.0f, gap = 2.0f * ui::uiScale, bw = 24.0f * ui::uiScale;
     float toolW = nBtns * bw + (nBtns - 1) * gap;
     ImGui::SameLine(ImGui::GetContentRegionAvail().x - toolW + ImGui::GetCursorPosX() -
                     ImGui::GetStyle().ItemSpacing.x);
@@ -497,6 +616,31 @@ static void drawFeatureManagerTopStrip(AppState& st) {
             if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
         } else st.addLog("[doc] redo: " + r.error_message);
     }
+
+    // --- "Name & group" — auto-name features SolidWorks-style and sort into folders. ---
+    // Shown only for a part doc that actually has features (not assemblies / empty docs).
+    bool isPart = st.docMirror.hasDoc() &&
+                  jfld(st.docMirror.tree(), "schema") != "aicad.asm/1";
+    int featCount = 0;
+    if (isPart) {
+        const nlohmann::json& tr = st.docMirror.tree();
+        auto fa = tr.find("features");
+        if (fa != tr.end() && fa->is_array()) featCount = (int)fa->size();
+    }
+    if (isPart && featCount > 0) {
+        ImGui::Spacing();
+        bool can = canDoc;
+        if (!can) ImGui::BeginDisabled();
+        ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.accentSoft));
+        if (ImGui::Button("Name & group features", ImVec2(-1, 0)) && can)
+            nameAndGroupFeatures(st);
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Auto-name every feature (Boss-Extrude1, Fillet2, ...) and\n"
+                              "group dress-up / patterns / reference geometry into folders.");
+        if (!can) ImGui::EndDisabled();
+    }
+
     ImGui::Separator();
 }
 
@@ -576,16 +720,28 @@ void drawFeatureTree(AppState& st,
                 ImGui::PopStyleColor();
             }
 
-            // Reference planes
+            // Reference planes — click to show/hide in the viewport; the clicked plane is
+            // emphasized (brighter) and the others dim (focus-follows-selection).
             static const char* kPlanes[] = {"Front Plane", "Top Plane", "Right Plane"};
-            static const char* kPlaneIcons[] = {"plane", "plane", "plane"};
             for (int pi = 0; pi < 3; ++pi) {
                 ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_Leaf |
                                        ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                        ImGuiTreeNodeFlags_SpanFullWidth;
-                treeIcon(kPlaneIcons[pi], "[P]", 16.0f);
+                if (st.planeEmphasis == pi) f |= ImGuiTreeNodeFlags_Selected;
+                bool hidden = !st.showPlane[pi];
+                treeIcon("plane", "[P]", 16.0f);
                 ImGui::SameLine(0, 4);
+                if (hidden)
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.55f));
                 ImGui::TreeNodeEx((std::string(kPlanes[pi]) + "##plane" + std::to_string(pi)).c_str(), f);
+                if (hidden) ImGui::PopStyleColor();
+                if (ImGui::IsItemClicked()) {
+                    st.showPlane[pi] = !st.showPlane[pi];
+                    st.planeEmphasis = st.showPlane[pi] ? pi : -1;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(hidden ? "Show %s" : "Hide %s", kPlanes[pi]);
             }
 
             // Origin
@@ -612,17 +768,61 @@ void drawFeatureTree(AppState& st,
             if (tree.is_object()) {
                 auto feat = tree.find("features");
                 if (feat != tree.end() && feat->is_array()) {
+                    // Reorder op: drop draggedId before beforeId (empty => append to the end).
+                    auto reorderCb = [&st](const std::string& dragged, const std::string& before) {
+                        nlohmann::json op = {{"op", "reorder_feature"}, {"id", dragged}};
+                        if (!before.empty()) op["before"] = before;   // omit => move to end
+                        applyTreeOps(st, nlohmann::json::array({op}), "reorder");
+                    };
+
+                    // Ordered id list + the selected feature's raw position (drives rollback dimming
+                    // and Ctrl+Up/Down sibling moves).
+                    std::vector<std::string> order;
+                    int selPos = -1;
+                    {
+                        int i = 0;
+                        for (const auto& f : *feat) {
+                            if (f.is_object()) {
+                                std::string id = jfld(f, "id");
+                                order.push_back(id);
+                                if (id == selectedFeatureId) selPos = i;
+                            }
+                            ++i;
+                        }
+                    }
+
+                    std::string openFolder;    // folder tag of the open folder node ("" = none)
+                    bool        folderOpen = false;
+                    int         folderIdx  = 0;
                     int idx = 0;
                     for (const auto& f : *feat) {
                         if (!f.is_object()) { ++idx; continue; }
-                        std::string fid  = jfld(f, "id");
-                        std::string fname = jfld(f, "name");
-                        std::string ftype = jfld(f, "type");
+                        std::string fid    = jfld(f, "id");
+                        std::string fname  = jfld(f, "name");
+                        std::string ftype  = jfld(f, "type");
+                        std::string folder = jfld(f, "folder");
                         bool suppressed = jftbool(f, "suppressed");
                         if (fname.empty()) fname = ftype + std::to_string(idx + 1);
 
+                        // Open/close collapsible folder nodes as the run of folder tags changes.
+                        if (folder != openFolder) {
+                            if (folderOpen) { ImGui::TreePop(); folderOpen = false; }
+                            openFolder = folder;
+                            if (!folder.empty()) {
+                                treeIcon("mates_folder", "[F]", 16.0f);
+                                ImGui::SameLine(0, 4);
+                                folderOpen = ImGui::TreeNodeEx(
+                                    (folder + "##fld" + std::to_string(folderIdx++)).c_str(),
+                                    ImGuiTreeNodeFlags_DefaultOpen |
+                                    ImGuiTreeNodeFlags_SpanFullWidth);
+                            }
+                        }
+                        // Hide rows whose folder is collapsed.
+                        if (!openFolder.empty() && !folderOpen) { ++idx; continue; }
+
                         FStatus fs = getFeatureStatus(statusArr, fid);
-                        bool sel = (selectedFeatureId == fid);
+                        bool sel    = (selectedFeatureId == fid);
+                        bool dimmed = (selPos >= 0 && idx > selPos);  // "rolled back" look
 
                         // Alternate row background
                         if (idx % 2 == 0) {
@@ -645,15 +845,35 @@ void drawFeatureTree(AppState& st,
                         bool clicked = featureRow(
                             fid, fname,
                             featureIcon(ftype), featureFallback(ftype),
-                            suppressed, sel,
+                            suppressed, sel, dimmed,
                             fs.ok, !fs.error.empty(), fs.error, fs.dangling,
-                            editCallback, st);
+                            editCallback, reorderCb, st);
 
                         if (clicked) {
                             selectedFeatureId = fid;
                             highlightFeature(st, fid);
                         }
                         ++idx;
+                    }
+                    if (folderOpen) { ImGui::TreePop(); folderOpen = false; }
+
+                    // ---- Ctrl+Up / Ctrl+Down: move the selected feature among its siblings ----
+                    if (!selectedFeatureId.empty() &&
+                        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+                        int p = -1;
+                        for (int i = 0; i < (int)order.size(); ++i)
+                            if (order[i] == selectedFeatureId) { p = i; break; }
+                        if (p >= 0) {
+                            if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_UpArrow) && p > 0)
+                                reorderCb(selectedFeatureId, order[p - 1]);
+                            else if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_DownArrow) &&
+                                     p < (int)order.size() - 1) {
+                                if (p + 2 < (int)order.size())
+                                    reorderCb(selectedFeatureId, order[p + 2]);
+                                else
+                                    reorderCb(selectedFeatureId, "");  // already next-to-last -> end
+                            }
+                        }
                     }
                 }
             }
@@ -666,15 +886,28 @@ void drawFeatureTree(AppState& st,
                 ImVec2 r0 = ImGui::GetCursorScreenPos();
                 float w = ImGui::GetContentRegionAvail().x;
                 ImDrawList* rdl = ImGui::GetWindowDrawList();
-                float ly = r0.y + 3.0f;
+                float rsc = ui::uiScale;
+                float ly = r0.y + 3.0f * rsc;
                 rdl->AddLine(ImVec2(r0.x, ly), ImVec2(r0.x + w, ly),
                              ui::Palette::toU32(pal.accentMid), 2.0f);
                 // grab handle (a small rounded tab centered on the line)
-                float hw = 18.0f, hh = 6.0f, hx = r0.x + (w - hw) * 0.5f;
+                float hw = 18.0f * rsc, hh = 6.0f * rsc, hx = r0.x + (w - hw) * 0.5f;
                 rdl->AddRectFilled(ImVec2(hx, ly - hh * 0.5f), ImVec2(hx + hw, ly + hh * 0.5f),
                                    ui::Palette::toU32(pal.accent), 3.0f);
-                ImGui::Dummy(ImVec2(w, hh + 4.0f));
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Rollback bar");
+                ImGui::Dummy(ImVec2(w, hh + 4.0f * rsc));
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Rollback bar — drop a feature here to move it to the end");
+                // Drop target: moving a feature onto the rollback bar sends it to the end.
+                if (ImGui::BeginDragDropTarget()) {
+                    rdl->AddLine(ImVec2(r0.x, ly), ImVec2(r0.x + w, ly),
+                                 ui::Palette::toU32(pal.accent), 2.5f);
+                    if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("FEATURE_ROW")) {
+                        std::string dragged(static_cast<const char*>(pl->Data));
+                        applyTreeOps(st, nlohmann::json::array(
+                            {{{"op", "reorder_feature"}, {"id", dragged}}}), "reorder");
+                    }
+                    ImGui::EndDragDropTarget();
+                }
             }
 
             ImGui::TreePop();
@@ -690,7 +923,7 @@ void drawFeatureTree(AppState& st,
     if (canDoc && st.docMirror.hasDoc()) {
         ImGui::Separator();
         static char savePath[512] = "";
-        ImGui::SetNextItemWidth(-104);
+        ImGui::SetNextItemWidth(-104.0f * ui::uiScale);
         ImGui::InputText("##savepath", savePath, sizeof(savePath));
         ImGui::SameLine();
         if (ImGui::Button("Save") && savePath[0]) {
@@ -711,6 +944,9 @@ void drawFeatureTree(AppState& st,
             }
         }
     }
+
+    // C25: apply ops queued during drawing — safe now, nothing reads the tree json below.
+    flushPendingTreeOps(st);
 
     ImGui::End();
 }

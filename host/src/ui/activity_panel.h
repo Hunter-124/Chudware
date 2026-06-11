@@ -27,6 +27,9 @@ public:
     // Draw the dockable window.  Call every frame.
     void draw(AppState& st);
 
+    // Draw just the panel body (no Begin/End) — for hosting inside the consolidated AI panel tab.
+    void drawBody(AppState& st);
+
 private:
     // ---- data model ----
     struct AttemptNode {

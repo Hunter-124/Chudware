@@ -63,11 +63,20 @@ struct Palette {
     float treeRowSelected[4]= {0.176f,0.831f,0.749f, 0.18f};
 
     // ---- viewport ----
-    float viewportTop[4]   = {0.170f,0.190f,0.230f, 1};   // renderer bg gradient top
-    float viewportBottom[4]= {0.085f,0.095f,0.115f, 1};   // renderer bg gradient bottom
+    // C25: the 3D viewport is light in BOTH themes (SolidWorks studio look).
+    float viewportTop[4]   = {0.957f,0.965f,0.976f, 1};   // bg gradient top    (#F4F6F9)
+    float viewportMid[4]   = {0.851f,0.867f,0.894f, 1};   // bg gradient mid    (#D9DDE4)
+    float viewportBottom[4]= {0.933f,0.941f,0.953f, 1};   // bg floor glow      (#EEF0F3)
+    float viewportEdge[4]  = {0.090f,0.100f,0.120f, 1};   // model feature-edge lines
+    float partDefault[4]   = {0.776f,0.792f,0.847f, 1};   // default body color (#C6CAD8)
+    float groundShadow[4]  = {0.200f,0.220f,0.260f, 0.35f}; // soft contact shadow (a = max)
     float overlayBg[4]     = {0.039f,0.055f,0.075f, 0.843f}; // pill overlays on 3D view
     float overlayBorder[4] = {0.176f,0.831f,0.749f, 0.275f};
     float overlayText[4]   = {0.886f,0.906f,0.941f, 0.941f};
+    // W4-K: SolidWorks-style datum planes — subtle light-blue translucent fill + thin blue
+    // outline (alpha in [3] is the base; the renderer scales it per emphasis state).
+    float planeFill[4]     = {0.380f,0.620f,0.910f, 0.085f};
+    float planeOutline[4]  = {0.290f,0.540f,0.870f, 0.700f};
 
     // ---- selection / hover ----
     float selectionHighlight[4] = {0.176f,0.831f,0.749f, 0.22f};
@@ -169,5 +178,11 @@ extern Palette palette;
 
 // The active theme — readable from any code that needs to branch on dark vs. light.
 extern Theme activeTheme;
+
+// The active UI content scale (1.0 at 100% DPI, 1.5 at 150%, etc). Set by applyTheme().
+// Custom-drawn widgets (e.g. the ribbon) multiply their pixel geometry by this so it tracks
+// the pre-scaled font atlas. Prefer this over ImGui::GetIO().FontGlobalScale, which the app
+// leaves at 1.0 (fonts are scaled at load time, not via FontGlobalScale).
+extern float uiScale;
 
 }  // namespace ui

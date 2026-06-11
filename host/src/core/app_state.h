@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -237,6 +238,7 @@ struct AppState {
     std::string assets;
     ui::Fonts fonts;
     Tex wordmark, logoIcon;
+    Tex wordmarkDark;   // dark-text "-CAD" variant for the light theme (white text washes out)
     Renderer* renderer = nullptr;     // owned by run_gui; AppState only borrows it
     chrome::HitLayout* hitLayout = nullptr;
 
@@ -294,11 +296,39 @@ struct AppState {
     std::string buildErrFull;     // its full traceback, behind a Details toggle
     bool showBuildErr = false;
     float yaw = 35, pitch = 28, zoom = 1.0f;
+    // W2-D: world-space orbit-target offset (pan). 0 = look at the model bbox center.
+    float pan[3] = {0, 0, 0};
+    // W2-D: camera animation state (driven by ui::requestCameraAnimation/tickCameraAnimation in
+    // ui/camera_anim.*). animActive gates the tween; the from/to snapshots + clock live here so the
+    // animation module stays stateless across frames and rides AppState's lifetime.
+    bool  animActive = false;
+    float animT = 0.0f;          // elapsed seconds into the current tween
+    float animDur = 0.35f;       // smoothstep ease duration
+    float animYaw0 = 0, animPitch0 = 0, animZoom0 = 1.0f, animPan0[3] = {0, 0, 0};
+    float animYaw1 = 0, animPitch1 = 0, animZoom1 = 1.0f, animPan1[3] = {0, 0, 0};
+    // Reference planes (Front / Top / Right) shown faintly in the viewport; click a plane row in
+    // the FeatureManager to toggle it. planeEmphasis (0..2, -1=none) brightens one, dims the others.
+    // W4-K: hidden by default (SolidWorks behavior). Toggle a plane on via the FeatureManager row
+    // or it is forced visible during sketch-plane picking. Sketch mode hides them (grid owns view).
+    bool showPlane[3] = {false, false, false};
+    int  planeEmphasis = -1;
+    // C25 W3-J: viewport display/visibility state.
+    int  displayStyle  = 1;          // mirrors DisplayStyle enum; 0=Shaded 1=ShadedEdges(default) 2=HLR 3=HLV 4=Wire
+    bool showTriad        = true;    // orientation triad, bottom-left of viewport
+    bool showGroundShadow = true;    // soft contact-shadow blob
+    // Viewport left-drag mode: 0=rotate (default), 1=pan.
+    int  vpDragMode = 0;
+    // One-shot flag: set by mouse_gestures right-click-without-drag hook; consumed by viewport_panel.
+    bool wantContextMenu = false;
     bool layoutInit = false, resetLayout = false, openSettings = false;
     bool showDesign = true, showViewport = true, showConsole = true;
     // C24: the right task pane (Design + Agent Activity tabs, SolidWorks-style). View > Task Pane.
     bool showTaskPane = true;
     bool focusDesignTab = false;  // one-shot: focus the Design tab after a (re)layout
+    // Consolidated AI panel (Design / Activity / Console as internal tabs). One dock window "AI".
+    bool showAIPanel = true;
+    int  aiInteraction = 0;       // 0=Design (new part) 1=Edit (orchestrator v2) 2=Chat
+    bool focusActivityTab = false;  // one-shot: select the Activity tab (e.g. when a v2 run starts)
     bool showAbout = false, designStarted = false;
     int frame = 0;
 
@@ -338,7 +368,7 @@ struct AppState {
     bool asmShotDone = false;          // guard so the asm scenario runs once per shot
 
     // ---- C22b: Activity panel + prompt editor + orchestrator wiring ----
-    bool showActivityPanel = true;          // View > Activity dock visibility
+    bool showActivityPanel = false;         // View > Activity window (hidden until a run/View toggle opens it)
     bool agentV2 = true;                    // "Use orchestrator (v2)" checkbox in Design panel
     std::string pendingPromptRole;          // when non-empty, Settings > Agents tab opens on this role
     void* activityPanel = nullptr;          // ui::ActivityPanel* (owned by run_gui; opaque here)
@@ -346,6 +376,11 @@ struct AppState {
     std::string agentV2Status;              // e.g. "PLAN > planner attempt 1..."
     bool agentV2Running = false;            // a v2 run is in flight (blocks concurrent runs)
     // --- end C22b ---
+
+    // ---- C25: ribbon dispatch hook (set in app.cpp after the ribbon callback is wired) ----
+    // Allows UI widgets (shortcut bar, gesture wheel) to fire ribbon commands without
+    // knowing about the full dispatcher capture.
+    std::function<void(const char*)> ribbonDispatch;
 
     // ---- screenshot-mode flags (set from AI_CAD_SHOT in run_gui) ----
     bool wantSettings = false, wantChat = false, wantAssembly = false, wantPlan = false;

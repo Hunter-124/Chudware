@@ -9,6 +9,15 @@
 #include "math.h"
 #include "mesh.h"
 
+// Display style for the shaded pass (SolidWorks "Display Style" toolbar).
+enum class DisplayStyle {
+    Shaded,               // faces only, no feature edges
+    ShadedEdges,          // faces + feature edges (default)
+    HiddenLinesRemoved,   // faces in bg color (depth only) + visible edges -> classic HLR
+    HiddenLinesVisible,   // HLR + occluded edges drawn dim
+    Wireframe,            // edges only over the background
+};
+
 class Renderer {
 public:
     // One body of the displayed model: geometry + its display color (RGB 0..1).
@@ -50,8 +59,46 @@ public:
     void setMesh(const Mesh& m);                          // single body, neutral color
     void setMeshes(const std::vector<PartMesh>& parts);   // multi-body, per-part colors
     void setBackground(float tr, float tg, float tb, float br, float bg, float bb);
+    // 3-stop vertical background gradient (top / mid-band ~55% / bottom floor glow).
+    void setBackground3(const float top[3], const float mid[3], const float bot[3]);
+    // Feature-edge color + screen-space line width (px); width is scaled by the supersample factor.
+    void setEdgeStyle(float r, float g, float b, float widthPx);
+    // Fallback body color used when a body carries no explicit color (palette.partDefault).
+    void setDefaultPartColor(float r, float g, float b);
+    // Soft contact-shadow blob color + peak alpha (alpha falls to 0 at the blob rim).
+    void setGroundShadow(float r, float g, float b, float maxAlpha);
+    void setDisplayStyle(DisplayStyle s) { displayStyle_ = s; }
+    DisplayStyle displayStyle() const { return displayStyle_; }
     void renderView(const std::string& view);            // "iso"|"front"|"right"|"top"
     void renderOrbit(float yawDeg, float pitchDeg, float zoom);
+    // W2-D: orbit with a world-space pan offset added to the look-at target. The orbit center
+    // becomes bbox-center + pan, so the published camera (mvp/eye/center) — and therefore the
+    // id-buffer pick pass + overlays, which consume camera() — all stay pixel-exact in sync.
+    void renderOrbit(float yawDeg, float pitchDeg, float zoom, const float pan[3]);
+
+    // W2-D: bounding radius of the loaded model (1 if none). The viewport input code uses it to
+    // convert a screen-space pan drag (px) into a world-space offset (matches drawCurrent's FOV/dist).
+    float modelRadius() const { return radius_; }
+    static constexpr float kFovDeg = 35.0f;  // shared with drawCurrent's projection
+
+    // ---- reference planes (Front=XY, Top=XZ, Right=YZ) ----
+    // Translucent datum planes drawn over the model. `show[3]` toggles each; `emphasized` (0..2,
+    // or -1) renders that plane brighter and dims the others (focus-follows-selection).
+    void setPlanes(const bool show[3], int emphasized);
+    // W4-K: datum-plane fill + outline color (RGBA each), from palette.planeFill/planeOutline.
+    // SolidWorks-style subtle light-blue; the alpha in each is the base, scaled per emphasis state.
+    void setPlaneColors(const float fill[4], const float outline[4]);
+    // World-space label anchor (a corner of the plane quad) for projecting the plane name to screen.
+    // Returns false if the plane index is out of range. Valid after a render (uses center_/radius_).
+    bool planeAnchor(int plane, Vec3& world) const;
+
+    // ---- W3-I: SolidWorks-style Section View (single clip plane + optional filled cap) ----
+    // Fragments on the positive side of the plane (dot(worldPos, n) > offset) are discarded across
+    // faces and edges in every display style. When showCap is set, the cut is filled with capRgb
+    // via a stencil pass so the body reads as solid. enabled=false restores the full model.
+    void setSectionPlane(const float normal[3], float offset, bool enabled,
+                         const float capRgb[3], bool showCap);
+    bool sectionEnabled() const { return section_.enabled; }
 
     // ---- C19 result colormap + deformation ----
     // When colormap mode is on, bodies that carry a per-vertex scalar render through the LUT.
@@ -89,21 +136,52 @@ private:
 
     void allocTargets();
     void drawCurrent(float yawDeg, float pitchDeg, float zoom);
+    void drawGroundShadow(const Mat4& mvp, const Vec3& eye, const Vec3& up);  // soft contact blob
+    void drawReferencePlanes(const Mat4& mvp);   // translucent datum planes (after the opaque pass)
+    void drawSectionCap(const Mat4& mvp);        // W3-I: stencil-masked filled cut cap
+    void planeCorners(int plane, float e, Vec3 out[4]) const;  // 4 world corners of plane quad
     void freeSubs();
     void buildLut();              // C19: build the SW-style jet LUT texture (lazy)
     void uploadDeformed(Sub& s);  // C19: re-upload displaced positions for the current scale
 
-    static constexpr int SS = 2;  // supersample factor for anti-aliasing
+    static constexpr int SS = 3;  // supersample factor for anti-aliasing (3x for crisp thin edges)
     int w_ = 0, h_ = 0;           // final size
     int sw_ = 0, sh_ = 0;         // supersampled size
     unsigned int fbo_ = 0, colorTex_ = 0, depthRbo_ = 0;
     unsigned int prog_ = 0;
     unsigned int edgeProg_ = 0;
     unsigned int bgProg_ = 0, bgVao_ = 0;
-    float bgTop_[3] = {0.95f, 0.96f, 0.97f};
-    float bgBot_[3] = {0.88f, 0.90f, 0.93f};
+    unsigned int shadowProg_ = 0;  // ground contact-shadow quad
+    unsigned int planeProg_ = 0, planeVao_ = 0, planeVbo_ = 0;
+    unsigned int capProg_ = 0, capVao_ = 0, capVbo_ = 0;  // W3-I: section cap (flat-lit quad)
+    bool  showPlane_[3] = {false, false, false};
+    int   planeEmphasis_ = -1;
+    // W4-K: datum-plane colors (light-blue, SolidWorks look). Defaults match palette.planeFill/
+    // planeOutline so a render before the first setPlaneColors() still looks right.
+    float planeFill_[4]    = {0.380f, 0.620f, 0.910f, 0.085f};
+    float planeOutline_[4] = {0.290f, 0.540f, 0.870f, 0.700f};
+
+    // W3-I: section clip plane state. The plane is `dot(worldPos, normal) = offset`; geometry on
+    // the positive side is discarded. capRgb fills the cut face when showCap is set.
+    struct Section {
+        bool  enabled = false;
+        bool  showCap = false;
+        float normal[3] = {1, 0, 0};
+        float offset = 0.0f;
+        float capRgb[3] = {0.62f, 0.66f, 0.74f};
+    } section_;
+    Vec3 capKeyDir_;  // W3-I: key-light dir captured for the cap's flat lighting
+    float bgTop_[3] = {0.957f, 0.965f, 0.976f};
+    float bgMid_[3] = {0.851f, 0.867f, 0.894f};
+    float bgBot_[3] = {0.933f, 0.941f, 0.953f};
+    float edgeColor_[3] = {0.090f, 0.100f, 0.120f};
+    float edgeWidthPx_ = 1.6f;
+    float defaultPart_[3] = {0.776f, 0.792f, 0.847f};
+    float groundShadow_[4] = {0.20f, 0.22f, 0.26f, 0.35f};
+    DisplayStyle displayStyle_ = DisplayStyle::ShadedEdges;
     std::vector<Sub> subs_;
     Vec3 center_;
+    Vec3 pan_;  // W2-D: world-space orbit-target offset (set by renderOrbit; added to center_)
     float radius_ = 1.0f;
     CameraXform cam_;  // updated each drawCurrent()
 

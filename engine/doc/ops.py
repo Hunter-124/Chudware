@@ -408,6 +408,22 @@ def _op_rename(doc, op, index, idgen, id_map):
     feat["name"] = name
 
 
+def _op_set_folder(doc, op, index, idgen, id_map):
+    """Set (or clear) a feature's organizational folder tag. UI-only metadata: the compiler
+    ignores it, but it round-trips through save/open so the FeatureManager can group features."""
+    fid = op.get("id")
+    _, feat = _find_feature(doc, fid)
+    if feat is None:
+        raise _invalid(index, f"set_folder: '{fid}' not found")
+    folder = op.get("folder")
+    if folder is None or folder == "":
+        feat.pop("folder", None)
+    elif isinstance(folder, str):
+        feat["folder"] = folder
+    else:
+        raise _invalid(index, "set_folder requires a string 'folder' (or null/empty to clear)")
+
+
 def _op_set_material(doc, op, index, idgen, id_map):
     key = op.get("key")
     if key is None:
@@ -665,6 +681,7 @@ _OP_HANDLERS = {
     "reorder_feature": _op_reorder_feature,
     "set_suppressed": _op_set_suppressed,
     "rename": _op_rename,
+    "set_folder": _op_set_folder,
     "set_material": _op_set_material,
     "set_units": _op_set_units,
     "eq_set": _op_eq_set,

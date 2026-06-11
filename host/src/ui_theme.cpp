@@ -12,6 +12,7 @@ namespace ui {
 
 Palette palette;
 Theme   activeTheme = Theme::Dark;
+float   uiScale     = 1.0f;
 
 // ---- small helper -------------------------------------------------------
 static ImVec4 rgba(float r, float g, float b, float a = 1.0f) {
@@ -60,12 +61,19 @@ static void fillDark(Palette& p) {
     set4(p.treeRow,       0,0,0, 0);
     set4(p.treeRowAlt,    0,0,0, 0.04f);
     set4(p.treeRowSelected,0.176f,0.831f,0.749f,0.18f);
-    // viewport
-    set4(p.viewportTop,   0.170f,0.190f,0.230f, 1);
-    set4(p.viewportBottom,0.085f,0.095f,0.115f, 1);
+    // viewport — C25: light studio gradient in BOTH themes (SolidWorks look)
+    set4(p.viewportTop,   0.957f,0.965f,0.976f, 1);   // #F4F6F9
+    set4(p.viewportMid,   0.851f,0.867f,0.894f, 1);   // #D9DDE4
+    set4(p.viewportBottom,0.933f,0.941f,0.953f, 1);   // #EEF0F3 floor glow
+    set4(p.viewportEdge,  0.090f,0.100f,0.120f, 1);
+    set4(p.partDefault,   0.776f,0.792f,0.847f, 1);   // #C6CAD8
+    set4(p.groundShadow,  0.200f,0.220f,0.260f, 0.35f);
     set4(p.overlayBg,     0.039f,0.055f,0.075f, 0.843f);
     set4(p.overlayBorder, 0.176f,0.831f,0.749f, 0.275f);
     set4(p.overlayText,   0.886f,0.906f,0.941f, 0.941f);
+    // datum planes (light-blue, SolidWorks look — viewport is light in both themes)
+    set4(p.planeFill,    0.380f,0.620f,0.910f, 0.140f);   // C25: 0.085 was imperceptible
+    set4(p.planeOutline, 0.290f,0.540f,0.870f, 0.700f);
     // selection
     set4(p.selectionHighlight, 0.176f,0.831f,0.749f, 0.22f);
     set4(p.hoverHighlight,     0.176f,0.831f,0.749f, 0.40f);
@@ -144,8 +152,8 @@ static void fillLight(Palette& p) {
     set4(p.ribbonTabActive,1.000f,1.000f,1.000f, 1);
     // text
     set4(p.text,          0.118f,0.137f,0.196f, 1);   // #1E2332 slate
-    set4(p.textDim,       0.420f,0.447f,0.502f, 1);   // medium grey
-    set4(p.textDisabled,  0.631f,0.647f,0.675f, 1);
+    set4(p.textDim,       0.357f,0.384f,0.439f, 1);   // secondary grey (a touch darker = more legible)
+    set4(p.textDisabled,  0.561f,0.580f,0.612f, 1);   // disabled (slightly stronger than before)
     // accent: use SW blue #0078D7 for selection, muted teal for accent highlights
     set4(p.accent,        0.000f,0.471f,0.843f, 1);   // #0078D7
     set4(p.accentDim,     0.000f,0.353f,0.631f, 1);   // darker blue
@@ -163,12 +171,19 @@ static void fillLight(Palette& p) {
     set4(p.treeRow,       0,0,0, 0);
     set4(p.treeRowAlt,    0,0,0, 0.025f);
     set4(p.treeRowSelected,0.000f,0.471f,0.843f,0.18f);
-    // viewport: light-gray studio gradient (SW-style)
-    set4(p.viewportTop,   0.847f,0.847f,0.847f, 1);   // #D8D8D8
-    set4(p.viewportBottom,0.706f,0.706f,0.706f, 1);   // #B4B4B4
+    // viewport — C25: same light studio gradient as dark theme (SolidWorks look)
+    set4(p.viewportTop,   0.957f,0.965f,0.976f, 1);   // #F4F6F9
+    set4(p.viewportMid,   0.851f,0.867f,0.894f, 1);   // #D9DDE4
+    set4(p.viewportBottom,0.933f,0.941f,0.953f, 1);   // #EEF0F3 floor glow
+    set4(p.viewportEdge,  0.090f,0.100f,0.120f, 1);
+    set4(p.partDefault,   0.776f,0.792f,0.847f, 1);   // #C6CAD8
+    set4(p.groundShadow,  0.200f,0.220f,0.260f, 0.35f);
     set4(p.overlayBg,     0.961f,0.961f,0.961f, 0.882f);
     set4(p.overlayBorder, 0.000f,0.471f,0.843f, 0.40f);
     set4(p.overlayText,   0.118f,0.137f,0.196f, 0.941f);
+    // datum planes (same light-blue as dark theme — viewport gradient is identical)
+    set4(p.planeFill,    0.380f,0.620f,0.910f, 0.140f);   // C25: 0.090 was imperceptible
+    set4(p.planeOutline, 0.000f,0.471f,0.843f, 0.750f);
     // selection
     set4(p.selectionHighlight, 0.000f,0.471f,0.843f, 0.18f);
     set4(p.hoverHighlight,     0.000f,0.471f,0.843f, 0.35f);
@@ -227,6 +242,7 @@ static void fillLight(Palette& p) {
 // =========================================================================
 void applyTheme(Theme t, float scale) {
     activeTheme = t;
+    uiScale     = scale;   // expose the content scale to custom-drawn widgets (ribbon, etc.)
 
     // Step 1: fill the palette struct
     if (t == Theme::Light)

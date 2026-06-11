@@ -239,6 +239,23 @@ Wheelhouse rebuild + pins (stamp-hash auto-reprovisions installs); full sweep (a
 test-engine, shot gallery both themes); rebuild budget: 20-feature part <2 s warm; ARCHITECTURE.md
 rewrite; installer smoke on clean VM.
 
+## 5.1 Wave C — Viewport & Interactive refinement (concurrent with M1–M3)
+
+These waves are user-visible refinements landing in parallel with core feature development,
+gated by the same regression suite. They do not block the critical path.
+
+### C25 — SolidWorks-class viewport (1.5–2 wks)
+Light studio viewport in both themes with retuned lighting + ground shadow; theme-aware silhouette
+edges; rich display styles (shaded, shaded+edges, HLR, HLV, wireframe); animated camera with
+smooth interpolation; MMB navigation (rotate/pan/zoom via middle-mouse gestures); S shortcut bar
+(quick access to view/display/sketch tools); heads-up toolbar completion (align remaining command
+icons); viewport context menu (section view, display toggle, camera presets); section view clipping
+with uncapped v2 shader (see through cut); GUI audit pass (redundant widgets, orphaned state).
+New icons: display_shaded_edges, display_hlr, display_hlv, display_wireframe, pan_view, rotate_view,
+zoom_area, view_selector, normal_to.
+**Verify:** interactive camera jitter <1 px; theme toggle preserves viewport state; context menu
+closes on click-outside; section view clipping shots both themes.
+
 ## 6. Feature tiers (the scope contract — anything not V1/S is a no without re-planning)
 
 - **Features tab V1**: extrude boss/cut, revolve, sweep, loft, fillet, chamfer, shell, draft,

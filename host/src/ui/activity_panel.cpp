@@ -499,14 +499,19 @@ void ActivityPanel::drawRunTree(AppState& st, RunNode& run, bool live) {
 
 void ActivityPanel::draw(AppState& st) {
     if (!st.showActivityPanel) return;
-    pulseT_ += ImGui::GetIO().DeltaTime;
-
-    const auto& p = ui::palette;
     ImGui::SetNextWindowSize(ImVec2(340, 500), ImGuiCond_Appearing);
     if (!ImGui::Begin("Agent Activity", &st.showActivityPanel)) {
         ImGui::End();
         return;
     }
+    drawBody(st);
+    ImGui::End();
+}
+
+void ActivityPanel::drawBody(AppState& st) {
+    pulseT_ += ImGui::GetIO().DeltaTime;
+
+    const auto& p = ui::palette;
 
     // ---- Open run combo ----
     refreshReplayList();
@@ -565,7 +570,6 @@ void ActivityPanel::draw(AppState& st) {
 
     ImGui::EndChild();
     ImGui::PopStyleColor();
-    ImGui::End();
 }
 
 }  // namespace ui

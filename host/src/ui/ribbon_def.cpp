@@ -170,6 +170,39 @@ static const RibbonCmd kCmds[] = {
     // --- Group: Display ---
     { "asm_explode",       "Exploded View",  "exploded_view",    "Assembly", "Display",         true,  nullptr,          false },
 
+    // =========================================================================
+    // C25: Sketch flyout variants (SolidWorks parity — append-only)
+    // stretch=false  = wired in engine;  stretch=true = Coming Soon (greyed)
+    // =========================================================================
+
+    // --- Rectangle flyout (parent: sk_rect_corner) ---
+    // sk_rect_center already existed as sub_of sk_rect_corner (see row above)
+    { "sk_rect_3pt_corner",  "3Pt Cor. Rect",  "rect_3pt_corner",  "Sketch", "Draw", false, "sk_rect_corner", true  },
+    { "sk_rect_3pt_center",  "3Pt Ctr. Rect",  "rect_3pt_center",  "Sketch", "Draw", false, "sk_rect_corner", true  },
+    { "sk_parallelogram",    "Parallelogram",   "parallelogram",    "Sketch", "Draw", false, "sk_rect_corner", true  },
+
+    // --- Circle flyout (parent: sk_circle) ---
+    { "sk_circle_perimeter", "Perim. Circle",   "circle_perimeter", "Sketch", "Draw", false, "sk_circle",      true  },
+
+    // --- Slot flyout (parent: sk_slot) ---
+    { "sk_slot_ctr_str",     "Ctr. Str. Slot",  "slot_ctr_str",     "Sketch", "Draw", false, "sk_slot",        true  },
+    { "sk_slot_arc_3pt",     "3Pt Arc Slot",    "slot_arc_3pt",     "Sketch", "Draw", false, "sk_slot",        true  },
+    { "sk_slot_arc_ctr",     "Ctr. Arc Slot",   "slot_arc_ctr",     "Sketch", "Draw", false, "sk_slot",        true  },
+
+    // --- Spline flyout (parent: sk_spline) ---
+    { "sk_spline_style",     "Style Spline",    "spline_style",     "Sketch", "Draw", false, "sk_spline",      true  },
+    { "sk_spline_surface",   "Spline on Surf.", "spline_surface",   "Sketch", "Draw", false, "sk_spline",      true  },
+    { "sk_spline_equation",  "Eq. Driven Crv.", "spline_equation",  "Sketch", "Draw", false, "sk_spline",      true  },
+
+    // --- Ellipse flyout (new big-button parent; original sk_ellipse small-btn kept for compat) ---
+    // sk_ellipse_big is the split-button parent with sub-variants. W4-K: enabled (stretch=false) so
+    // its default face shows the Ellipse icon+label (instead of the greyed generic look) and a plain
+    // click opens the flyout. Sub-variants stay greyed (stretch=true, no engine support yet).
+    { "sk_ellipse_big",      "Ellipse",         "ellipse",          "Sketch", "Draw", false, nullptr,          false },
+    { "sk_ellipse_partial",  "Partial Ellipse", "ellipse_partial",  "Sketch", "Draw", false, "sk_ellipse_big", true  },
+    { "sk_parabola",         "Parabola",        "parabola",         "Sketch", "Draw", false, "sk_ellipse_big", true  },
+    { "sk_conic",            "Conic",           "conic",            "Sketch", "Draw", false, "sk_ellipse_big", true  },
+
 };
 // clang-format on
 

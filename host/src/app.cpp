@@ -87,6 +87,12 @@ int run_gui(const char* screenshotPath) {
     float xs = 1.0f, ys = 1.0f;
     glfwGetWindowContentScale(win, &xs, &ys);
     float scale = shot ? 1.0f : xs;
+    // AI_CAD_SCALE overrides the content scale (incl. in screenshot mode) so HiDPI layout can be
+    // reproduced/verified headlessly. Clamped to a sane range.
+    if (const char* envScale = std::getenv("AI_CAD_SCALE")) {
+        float v = (float)std::atof(envScale);
+        if (v >= 0.5f && v <= 4.0f) scale = v;
+    }
 
     // Theme: honour AI_CAD_THEME env override, then persisted setting, then dark default.
     // Applied once here; runtime toggle in the View menu calls applyTheme() again.
@@ -107,15 +113,31 @@ int run_gui(const char* screenshotPath) {
     chrome::install(win, &hitLayout);
 
     Tex wordmark = loadTexture(assets + "\\logo_wordmark.png");
+    Tex wordmarkDark = loadTexture(assets + "\\logo_wordmark_dark.png");
     Tex logoIcon = loadTexture(assets + "\\logo_icon.png");
 
     std::string rerr;
     Renderer renderer;
     renderer.init(960, 720, rerr);
-    // Viewport gradient driven by palette roles so it switches with the theme.
-    renderer.setBackground(ui::palette.viewportTop[0], ui::palette.viewportTop[1],
-                           ui::palette.viewportTop[2], ui::palette.viewportBottom[0],
-                           ui::palette.viewportBottom[1], ui::palette.viewportBottom[2]);
+    // Viewport visuals driven by palette roles so they switch with the theme. These are cheap
+    // uniform/state sets re-pushed every frame in the main loop (see below) so a runtime theme
+    // toggle takes effect immediately; this initial push covers the first headless frame.
+    {
+        float top3[3] = {ui::palette.viewportTop[0], ui::palette.viewportTop[1],
+                         ui::palette.viewportTop[2]};
+        float mid3[3] = {ui::palette.viewportMid[0], ui::palette.viewportMid[1],
+                         ui::palette.viewportMid[2]};
+        float bot3[3] = {ui::palette.viewportBottom[0], ui::palette.viewportBottom[1],
+                         ui::palette.viewportBottom[2]};
+        renderer.setBackground3(top3, mid3, bot3);
+        renderer.setEdgeStyle(ui::palette.viewportEdge[0], ui::palette.viewportEdge[1],
+                              ui::palette.viewportEdge[2], 1.6f * ui::uiScale);
+        renderer.setDefaultPartColor(ui::palette.partDefault[0], ui::palette.partDefault[1],
+                                     ui::palette.partDefault[2]);
+        renderer.setGroundShadow(ui::palette.groundShadow[0], ui::palette.groundShadow[1],
+                                 ui::palette.groundShadow[2], ui::palette.groundShadow[3]);
+        renderer.setPlaneColors(ui::palette.planeFill, ui::palette.planeOutline);
+    }
 
     // C14: load icon atlases (stb_image; must be after GL context is live).
     ui::loadIcons(assets);
@@ -137,6 +159,7 @@ int run_gui(const char* screenshotPath) {
     st.assets = assets;
     st.fonts = fonts;
     st.wordmark = wordmark;
+    st.wordmarkDark = wordmarkDark;
     st.logoIcon = logoIcon;
     st.renderer = &renderer;
     st.hitLayout = &hitLayout;
@@ -191,6 +214,23 @@ int run_gui(const char* screenshotPath) {
         std::fflush(stdout);
         st.addLog(std::string("[ribbon] ") + cmd_id + " (no PM form yet)");
     });
+    // C25: expose the same dispatcher to UI widgets (shortcut bar, gesture wheel).
+    st.ribbonDispatch = [&st, &propertyManager, &sketchMode, &simPanel,
+                         &evaluateDialogs, &asmPanels](const char* cmd_id) {
+        if (sketchMode.onRibbonCommand(st, cmd_id)) return;
+        {
+            std::string cmd(cmd_id);
+            if ((cmd.rfind("asm_", 0) == 0 || cmd == "new_assembly") &&
+                asmPanels.handleCommand(st, cmd)) return;
+        }
+        if (propertyManager.openForCommand(st, cmd_id)) return;
+        std::string cmd(cmd_id);
+        if (cmd.rfind("sim_", 0) == 0 && simPanel.handleCommand(st, cmd)) return;
+        if (cmd.rfind("eval_", 0) == 0 && evaluateDialogs.handleCommand(st, cmd)) return;
+        std::printf("[ribbon] %s (no PM form)\n", cmd_id);
+        std::fflush(stdout);
+        st.addLog(std::string("[ribbon] ") + cmd_id + " (no PM form yet)");
+    };
 
     loadSettings(st.settings);
     // editor buffer for the system-prompt override (Settings > Agent)
@@ -328,8 +368,15 @@ int run_gui(const char* screenshotPath) {
                  (int)shot, shotMode ? shotMode : "(null)", (int)st.wantM1, (int)st.wantSketch,
                  (int)st.workerStarted);
     std::fflush(stderr);
-    // ribbon shot: show Features tab
-    if (st.wantRibbon) { st.showRibbon = true; st.ribbonTab = 0; }
+    // ribbon shot: show Features tab by default; AI_CAD_TAB=<0..4> selects which tab to capture
+    // (0=Features 1=Sketch 2=Evaluate 3=Simulation 4=Assembly) for headless per-tab verification.
+    if (st.wantRibbon) {
+        st.showRibbon = true; st.ribbonTab = 0;
+        if (const char* tabEnv = std::getenv("AI_CAD_TAB")) {
+            int t = std::atoi(tabEnv);
+            if (t >= 0 && t <= 4) st.ribbonTab = t;
+        }
+    }
     // wantTree doc smoke runs in the frame loop once the worker is ready (see below).
     if (st.wantPick) {
         // C15 picking demo/verification: load the golden box AICM, assert its topology counts,
@@ -1493,6 +1540,29 @@ int run_gui(const char* screenshotPath) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        // Re-push palette-derived viewport visuals every frame so a runtime theme toggle (from the
+        // title bar) takes effect immediately. Cheap uniform/state sets; no GPU allocation.
+        {
+            float top3[3] = {ui::palette.viewportTop[0], ui::palette.viewportTop[1],
+                             ui::palette.viewportTop[2]};
+            float mid3[3] = {ui::palette.viewportMid[0], ui::palette.viewportMid[1],
+                             ui::palette.viewportMid[2]};
+            float bot3[3] = {ui::palette.viewportBottom[0], ui::palette.viewportBottom[1],
+                             ui::palette.viewportBottom[2]};
+            renderer.setBackground3(top3, mid3, bot3);
+            renderer.setEdgeStyle(ui::palette.viewportEdge[0], ui::palette.viewportEdge[1],
+                                  ui::palette.viewportEdge[2], 1.6f * ui::uiScale);
+            renderer.setDefaultPartColor(ui::palette.partDefault[0], ui::palette.partDefault[1],
+                                         ui::palette.partDefault[2]);
+            // W4-K: gate on showGroundShadow so the HUD hide/show toggle actually kills the shadow.
+            // (Previously this unconditional full-alpha push every frame clobbered viewport_panel's
+            // gated value before renderOrbit ran, so the toggle had no visible effect.)
+            float gsA = st.showGroundShadow ? ui::palette.groundShadow[3] : 0.0f;
+            renderer.setGroundShadow(ui::palette.groundShadow[0], ui::palette.groundShadow[1],
+                                     ui::palette.groundShadow[2], gsA);
+            renderer.setPlaneColors(ui::palette.planeFill, ui::palette.planeOutline);
+        }
+
         if (shot && st.frame == 1) {
             if (st.wantSettings) st.openSettings = true;
             if (st.wantChat || st.wantAssembly || st.wantPlan)
@@ -1559,13 +1629,14 @@ int run_gui(const char* screenshotPath) {
                 });
             }
         }
-        // --- C22b: Activity panel (drawn BEFORE Design so, sharing the right task-pane node, the
-        // Design tab is the last-begun and ends up selected — SolidWorks defaults to the first tab).
+        // W3-H: unified AI Copilot pane (input-at-top + conversation; embeds the run tree
+        // inline while a v2 run is active). st.activityPanel is still fed events via onEvent.
+        ui::drawAIPanel(st, busy, canRun);
+        // W3-H: standalone "Agent Activity" window (View > Activity / the pane's Activity
+        // button / the activity shot). No-op unless st.showActivityPanel; was previously
+        // unreachable because only the in-pane tab hosted drawBody.
         activityPanel.draw(st);
-        // --- end C22b ---
-        ui::drawDesignPanel(st, busy, canRun);
         ui::drawViewportPanel(st, io, busy);
-        ui::drawConsolePanel(st);
 
         // ---------- C19: simulation panel + evaluate dialogs ----------
         simPanel.tick(st);          // drain SimClient progress + completion (loads overlays)

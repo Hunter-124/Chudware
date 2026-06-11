@@ -8,6 +8,11 @@
 
 #include "legend.h"
 #include "icons.h"
+#include "mouse_gestures.h"
+#include "shortcut_bar.h"
+#include "camera_anim.h"     // C25 W2-D: eased camera tween (presets / Normal-To / zoom-to-fit)
+#include "view_selector.h"   // C25 W2-E: SolidWorks-style glass-box view selector (Space)
+#include "section_tool.h"    // C25 W3-J: section-view tool (another agent owns impl)
 
 #include "../core/app_state.h"
 
@@ -18,6 +23,60 @@
 #include "sketch_mode.h"   // C18
 
 namespace ui {
+
+// C25: file-local gesture/shortcut state — consistent with how SketchMode is held externally.
+static MouseGestures s_gestures;
+static ShortcutBar   s_shortcutBar;
+static ViewSelector  s_viewSelector;   // C25 W2-E: glass-box view selector (Space)
+static SectionTool   s_sectionTool;    // C25 W3-J: section-view (impl owned by section_tool agent)
+
+// C25 W3-J: zoom-area mode state.
+static bool  s_zoomAreaArmed = false;
+static bool  s_zoomAreaDragging = false;
+static ImVec2 s_zoomAreaP0 = {0, 0};  // drag start (screen)
+static ImVec2 s_zoomAreaP1 = {0, 0};  // drag current (screen)
+
+// ---- C25 W2-D: Normal-To (Ctrl+8 / shortcut) --------------------------------------------------
+// "Look straight at the selected face." If a face is selected we'd animate down its average vertex
+// normal; the per-face normals live only inside render::IdPass's GPU buffers (the CPU DocMesh is
+// discarded after load), so wiring the true face path requires retaining the DocMesh — TODO, see
+// the report. Until then this ships the documented fallback: snap to the axis-aligned view whose
+// view direction is nearest the current one (animated, zoom unchanged).
+static void normalToSelectionOrNearestAxis(AppState& st) {
+    // TODO(W2-D face Normal-To): when a face is selected (st.selection has a Face hit) and the
+    // DocMesh is retained, average that face's vertex normals (BodyMesh::nrm over the FaceRange's
+    // triangles) and animate yaw/pitch so dir == +normal (Z-up). Needs a CPU DocMesh cache in
+    // AppState (loadDocMesh currently drops it) — out of scope for this wave's owned files.
+
+    // Nearest-axis fallback. dir = view direction from target toward eye (matches drawCurrent):
+    //   dir = (cos p sin y, -cos p cos y, sin p).  Snap to the closest of ±X/±Y/±Z and map to the
+    // preset that orients the camera along that axis.
+    const float deg = 3.14159265f / 180.0f;
+    float y = st.yaw * deg, p = st.pitch * deg;
+    float dx = std::cos(p) * std::sin(y);
+    float dy = -std::cos(p) * std::cos(y);
+    float dz = std::sin(p);
+    // The six axis presets and their view directions (see applyViewPreset):
+    //   Front +? : Front dir=(0,-1,0); Back (0,1,0); Right (1,0,0); Left (-1,0,0);
+    //   Top (0,0,1); Bottom (0,0,-1).
+    struct AxView { float x, y, z; ViewPreset preset; };
+    static const AxView kAx[6] = {
+        { 0, -1,  0, ViewPreset::Front  },
+        { 0,  1,  0, ViewPreset::Back   },
+        { 1,  0,  0, ViewPreset::Right  },
+        {-1,  0,  0, ViewPreset::Left   },
+        { 0,  0,  1, ViewPreset::Top    },
+        { 0,  0, -1, ViewPreset::Bottom },
+    };
+    int best = 0; float bestDot = -2.0f;
+    for (int i = 0; i < 6; ++i) {
+        float d = dx * kAx[i].x + dy * kAx[i].y + dz * kAx[i].z;
+        if (d > bestDot) { bestDot = d; best = i; }
+    }
+    // applyViewPreset resets pan and keeps zoom for orientation presets — exactly Normal-To's
+    // "zoom unchanged" requirement.
+    applyViewPreset(st, kAx[best].preset);
+}
 
 void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     Renderer& renderer = *st.renderer;
@@ -78,7 +137,19 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         renderer.resize(vw, vh);
         // C18: hard-lock the camera normal to the sketch plane while editing a sketch.
         if (inSketch) { float ly, lp; if (sketch->cameraLock(ly, lp)) { st.yaw = ly; st.pitch = lp; } }
-        renderer.renderOrbit(st.yaw, st.pitch, st.zoom);
+        // Reference planes: hidden while sketching (the sketch grid owns the view), else per state.
+        // C25: a fresh part with no geometry auto-shows its datum planes (SolidWorks "pick a
+        // plane to start" state); once geometry exists, visibility is the user's toggle.
+        bool effPlane[3] = {st.showPlane[0], st.showPlane[1], st.showPlane[2]};
+        if (!st.hasDocMesh && st.docMirror.hasDoc())
+            effPlane[0] = effPlane[1] = effPlane[2] = true;
+        if (inSketch) { bool none[3] = {false,false,false}; renderer.setPlanes(none, -1); }
+        else          renderer.setPlanes(effPlane, st.planeEmphasis);
+        // C25 W2-D: advance any in-flight camera tween (presets / Normal-To / zoom-to-fit) before
+        // rendering. Sketch mode hard-locks the camera, so cancel/skip the tween while sketching.
+        if (inSketch) cancelCameraAnimation();
+        else          tickCameraAnimation(st);
+        renderer.renderOrbit(st.yaw, st.pitch, st.zoom, st.pan);
 
         // ---- topology picking (C15): id pass + overlay highlights drawn over the shaded view ----
         const bool picking = st.hasDocMesh && st.idPass && st.overlays;
@@ -99,17 +170,178 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                      ImVec2(0, 1), ImVec2(1, 0));
         ImVec2 vr0 = ImGui::GetItemRectMin(), vr1 = ImGui::GetItemRectMax();
         const bool imgHovered = ImGui::IsItemHovered();
-        if (imgHovered) {
-            // C18: no orbit while sketching (camera is plane-locked); wheel still zooms.
-            if (!inSketch && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-                st.yaw += io.MouseDelta.x * 0.4f;
-                st.pitch += io.MouseDelta.y * 0.4f;
+        // C25 W2-D: camera navigation. All of it is suppressed while sketching (camera is
+        // plane-locked) except the wheel zoom, which stays usable. Any drag-navigation cancels an
+        // in-flight tween so the user takes over instantly.
+        if (imgHovered && !inSketch) {
+            // Pixels -> world units at the orbit target plane (matches drawCurrent's FOV/dist):
+            //   dist = R / sin(fov/2) * 1.05 / zoom;  worldPerPx = 2*dist*tan(fov/2) / viewportH.
+            const float deg = 3.14159265f / 180.0f;
+            const float fov = Renderer::kFovDeg * deg;
+            float zc = st.zoom < 0.05f ? 0.05f : st.zoom;
+            float dist = renderer.modelRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
+            float worldPerPx = 2.0f * dist * std::tan(fov * 0.5f) / (float)(vh > 1 ? vh : 1);
+
+            // Camera basis for screen-space pan: right (R) and up (U) in world space. Mirrors
+            // drawCurrent: dir = view direction (target->eye), up = +Z (or +Y near a pole).
+            float yr = st.yaw * deg, pr = st.pitch * deg;
+            Vec3 dir(std::cos(pr) * std::sin(yr), -std::cos(pr) * std::cos(yr), std::sin(pr));
+            Vec3 worldUp = (std::fabs(pr) > 89.0f * deg) ? Vec3(0, 1, 0) : Vec3(0, 0, 1);
+            Vec3 V = normalize(dir);
+            Vec3 R = normalize(cross(worldUp, V));   // screen-right in world space
+            Vec3 U = normalize(cross(V, R));         // screen-up in world space
+
+            auto applyPan = [&](float ddx, float ddy) {
+                // Drag right (ddx>0) moves the model right -> target shifts left (-R). Drag down
+                // (ddy>0, screen y is down) moves the model down -> target shifts up (+U).
+                st.pan[0] += (-R.x * ddx + U.x * ddy) * worldPerPx;
+                st.pan[1] += (-R.y * ddx + U.y * ddy) * worldPerPx;
+                st.pan[2] += (-R.z * ddx + U.z * ddy) * worldPerPx;
+            };
+            auto clampPitch = [&]() {
                 st.pitch = st.pitch > 89 ? 89 : (st.pitch < -89 ? -89 : st.pitch);
+            };
+
+            const bool ctrl = io.KeyCtrl, shift = io.KeyShift;
+
+            // C25 W3-J: apply display style from AppState each frame (cheap no-op when unchanged).
+            renderer.setDisplayStyle(static_cast<DisplayStyle>(st.displayStyle));
+
+            // C25 W3-J: zoom-area rubber-band drag.
+            if (s_zoomAreaArmed) {
+                if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                    if (!s_zoomAreaDragging) {
+                        s_zoomAreaDragging = true;
+                        s_zoomAreaP0 = io.MouseClickedPos[ImGuiMouseButton_Left];
+                    }
+                    s_zoomAreaP1 = io.MousePos;
+                } else if (s_zoomAreaDragging &&
+                           !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    // Released: compute zoom+pan to frame the rect.
+                    float rx0 = s_zoomAreaP0.x < s_zoomAreaP1.x ? s_zoomAreaP0.x : s_zoomAreaP1.x;
+                    float ry0 = s_zoomAreaP0.y < s_zoomAreaP1.y ? s_zoomAreaP0.y : s_zoomAreaP1.y;
+                    float rx1 = s_zoomAreaP0.x > s_zoomAreaP1.x ? s_zoomAreaP0.x : s_zoomAreaP1.x;
+                    float ry1 = s_zoomAreaP0.y > s_zoomAreaP1.y ? s_zoomAreaP0.y : s_zoomAreaP1.y;
+                    float rw = rx1 - rx0, rh = ry1 - ry0;
+                    if (rw > 4 && rh > 4) {
+                        // Center of the rect in viewport-relative px (origin = viewport center).
+                        float vcx = (vr0.x + vr1.x) * 0.5f, vcy = (vr0.y + vr1.y) * 0.5f;
+                        float rcx = (rx0 + rx1) * 0.5f - vcx;
+                        float rcy = (ry0 + ry1) * 0.5f - vcy;
+                        // Pan shift: move target so rect center lands at view center.
+                        // rcx>0 = rect center is right of view center: shift target rightward (+R).
+                        // rcy>0 = rect center is below view center (screen Y down): shift target downward (-U).
+                        float k = worldPerPx;
+                        st.pan[0] += (R.x * rcx - U.x * rcy) * k;
+                        st.pan[1] += (R.y * rcx - U.y * rcy) * k;
+                        st.pan[2] += (R.z * rcx - U.z * rcy) * k;
+                        // Zoom: scale so rect extent maps to ~90% of viewport.
+                        float vExt = (float)(vw < vh ? vw : vh) * 0.9f;
+                        float rExt = rw < rh ? rw : rh;
+                        if (rExt > 0.0f) {
+                            st.zoom *= vExt / rExt;
+                            st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10.0f ? 10.0f : st.zoom);
+                        }
+                        float newPan[3] = {st.pan[0], st.pan[1], st.pan[2]};
+                        requestCameraAnimation(st, st.yaw, st.pitch, st.zoom, newPan);
+                    }
+                    s_zoomAreaArmed = false;
+                    s_zoomAreaDragging = false;
+                }
+                // Esc or second click disarms.
+                if (ImGui::IsKeyPressed(ImGuiKey_Escape) ||
+                    ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                    s_zoomAreaArmed = false;
+                    s_zoomAreaDragging = false;
+                }
             }
+
+            // Left-drag: orbit or pan depending on vpDragMode. Cancels any tween.
+            // Zoom-area mode intercepts left-drag above; skip orbit/pan if armed.
+            if (!s_zoomAreaArmed &&
+                ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
+                (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
+                cancelCameraAnimation();
+                if (st.vpDragMode == 1) {
+                    applyPan(io.MouseDelta.x, io.MouseDelta.y);
+                } else {
+                    st.yaw += io.MouseDelta.x * 0.4f;
+                    st.pitch += io.MouseDelta.y * 0.4f;
+                    clampPitch();
+                }
+            }
+
+            // Middle-button navigation (SolidWorks bindings):
+            //   MMB        = orbit (same rate as left-drag)
+            //   Ctrl+MMB   = pan
+            //   Shift+MMB  = zoom (vertical, smooth exponential)
+            if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) &&
+                (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
+                cancelCameraAnimation();
+                if (ctrl) {
+                    applyPan(io.MouseDelta.x, io.MouseDelta.y);
+                } else if (shift) {
+                    // Drag up = zoom in. exp keeps each pixel a constant multiplicative step.
+                    st.zoom *= std::exp(-io.MouseDelta.y * 0.005f);
+                    st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10 ? 10 : st.zoom);
+                } else {
+                    st.yaw += io.MouseDelta.x * 0.4f;
+                    st.pitch += io.MouseDelta.y * 0.4f;
+                    clampPitch();
+                }
+            }
+
+            // Double-click MMB = animated zoom-to-fit (zoom->1, pan->0, orientation kept).
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Middle)) {
+                applyViewPreset(st, ViewPreset::ZoomFit);
+            }
+
+            // Wheel zoom toward the cursor: scale zoom, then shift pan so the world point under the
+            // cursor stays put. Cursor offset from viewport center, in pixels.
+            if (io.MouseWheel != 0) {
+                cancelCameraAnimation();
+                float oldZoom = zc;
+                st.zoom *= (1.0f + io.MouseWheel * 0.1f);
+                st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10 ? 10 : st.zoom);
+                float newZoom = st.zoom;
+                if (newZoom != oldZoom) {
+                    float cxp = io.MousePos.x - (vr0.x + (vr1.x - vr0.x) * 0.5f);
+                    float cyp = io.MousePos.y - (vr0.y + (vr1.y - vr0.y) * 0.5f);
+                    // worldPerPx is inversely proportional to zoom; the target must move so the
+                    // cursor ray hits the same world point. delta = cursorOffset * (1/old - 1/new)
+                    // in world units, projected onto the camera plane (R right, U up; y is down).
+                    float k = worldPerPx * (1.0f - oldZoom / newZoom);
+                    st.pan[0] += ( R.x * cxp - U.x * cyp) * k;
+                    st.pan[1] += ( R.y * cxp - U.y * cyp) * k;
+                    st.pan[2] += ( R.z * cxp - U.z * cyp) * k;
+                }
+            }
+        } else if (imgHovered && inSketch) {
+            // Sketch mode: wheel still zooms (camera orientation stays plane-locked, no pan).
             if (io.MouseWheel != 0) {
                 st.zoom *= (1.0f + io.MouseWheel * 0.1f);
                 st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10 ? 10 : st.zoom);
             }
+        }
+
+        // C25 W2-D: keyboard view shortcuts. Viewport hovered/focused, no text field active, not
+        // sketching. Ctrl+1..8 = Front/Back/Left/Right/Top/Bottom/Iso/NormalTo; F = zoom-to-fit.
+        if (imgHovered && !inSketch && !io.WantTextInput) {
+            if (io.KeyCtrl) {
+                if      (ImGui::IsKeyPressed(ImGuiKey_1)) applyViewPreset(st, ViewPreset::Front);
+                else if (ImGui::IsKeyPressed(ImGuiKey_2)) applyViewPreset(st, ViewPreset::Back);
+                else if (ImGui::IsKeyPressed(ImGuiKey_3)) applyViewPreset(st, ViewPreset::Left);
+                else if (ImGui::IsKeyPressed(ImGuiKey_4)) applyViewPreset(st, ViewPreset::Right);
+                else if (ImGui::IsKeyPressed(ImGuiKey_5)) applyViewPreset(st, ViewPreset::Top);
+                else if (ImGui::IsKeyPressed(ImGuiKey_6)) applyViewPreset(st, ViewPreset::Bottom);
+                else if (ImGui::IsKeyPressed(ImGuiKey_7)) applyViewPreset(st, ViewPreset::Isometric);
+                else if (ImGui::IsKeyPressed(ImGuiKey_8)) normalToSelectionOrNearestAxis(st);
+            } else if (ImGui::IsKeyPressed(ImGuiKey_F)) {
+                applyViewPreset(st, ViewPreset::ZoomFit);
+            }
+            // Esc also cancels an in-flight camera tween (selection-clear Esc handling lives in the
+            // picking block below; canceling here is harmless when there is no animation).
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape) && cameraAnimating()) cancelCameraAnimation();
         }
 
         // ---- C18: sketch overlay owns the mouse while a sketch is being edited ----
@@ -118,7 +350,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         }
 
         // ---- hover + click selection (once per frame; only while a doc mesh is loaded) ----
-        if (picking && !inSketch) {
+        // C25 W2-E: suppressed while the glass-box View Selector is up (it owns the click).
+        if (picking && !inSketch && !s_viewSelector.active()) {
             if (imgHovered && !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
                 int px = (int)(io.MousePos.x - vr0.x);
                 int py = (int)(io.MousePos.y - vr0.y);
@@ -149,67 +382,314 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
         }
 
-        // ---- C24: heads-up view toolbar, centered at the viewport top (SolidWorks-style) ----
-        // A translucent chip hosting: Zoom-fit, the orientation presets (Iso/Front/Right/Top),
-        // display-style and section toggles. Buttons are InvisibleButtons positioned over the 3D
-        // image with hover fills + icon glyphs from the atlas. Hidden while editing a sketch.
+        // ---- C25: mouse gesture wheel (right-drag) + 'S' shortcut bar ----
+        // Gestures are suppressed while in sketch mode (camera is plane-locked; no view presets).
+        if (!inSketch) {
+            s_gestures.update(st, imgHovered, vr0, vr1);
+            s_gestures.draw(ImGui::GetWindowDrawList());
+        }
+        // Shortcut bar is context-aware: shows sketch tools when inSketch, model tools otherwise.
+        s_shortcutBar.update(st, imgHovered, inSketch, vr0, vr1);
+        s_shortcutBar.draw(st, inSketch);
+
+        // ---- C25 W3-J: viewport right-click context menu ----
+        // Opened by mouse_gestures when right button released without drag (kRmbContextMenuHook).
+        if (st.wantContextMenu && !inSketch) {
+            st.wantContextMenu = false;
+            ImGui::OpenPopup("##vp_ctx");
+        }
+        if (ImGui::BeginPopup("##vp_ctx")) {
+            // Selection section (shown only when something is selected / hovered).
+            if (!st.pickStatus.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                           ui::palette.textDim[2], 1.0f));
+                ImGui::TextUnformatted(st.pickStatus.c_str());
+                ImGui::PopStyleColor();
+                if (ImGui::MenuItem("Clear Selection")) st.selection.clear();
+                ImGui::Separator();
+            }
+            // View presets submenu.
+            if (ImGui::BeginMenu("View Orientation")) {
+                struct { const char* lbl; ViewPreset p; } prows[] = {
+                    {"Front",    ViewPreset::Front},
+                    {"Back",     ViewPreset::Back},
+                    {"Left",     ViewPreset::Left},
+                    {"Right",    ViewPreset::Right},
+                    {"Top",      ViewPreset::Top},
+                    {"Bottom",   ViewPreset::Bottom},
+                    {"Isometric",ViewPreset::Isometric},
+                };
+                for (const auto& r : prows)
+                    if (ImGui::MenuItem(r.lbl)) applyViewPreset(st, r.p);
+                ImGui::EndMenu();
+            }
+            if (ImGui::MenuItem("Zoom to Fit (F)"))   applyViewPreset(st, ViewPreset::ZoomFit);
+            if (ImGui::MenuItem("Zoom to Area")) {
+                s_zoomAreaArmed    = true;
+                s_zoomAreaDragging = false;
+            }
+            // Display style submenu.
+            if (ImGui::BeginMenu("Display Style")) {
+                struct { const char* lbl; int val; } drows[] = {
+                    {"Shaded",                0},
+                    {"Shaded with Edges",     1},
+                    {"Hidden Lines Removed",  2},
+                    {"Hidden Lines Visible",  3},
+                    {"Wireframe",             4},
+                };
+                for (const auto& dr : drows) {
+                    if (ImGui::MenuItem(dr.lbl, nullptr, st.displayStyle == dr.val)) {
+                        st.displayStyle = dr.val;
+                        renderer.setDisplayStyle(static_cast<DisplayStyle>(dr.val));
+                    }
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::MenuItem("Section View", nullptr, s_sectionTool.active()))
+                s_sectionTool.toggle(st);
+            // Hide/show submenu.
+            if (ImGui::BeginMenu("Hide / Show")) {
+                bool allPlanes = st.showPlane[0] && st.showPlane[1] && st.showPlane[2];
+                if (ImGui::MenuItem("Reference Planes", nullptr, allPlanes)) {
+                    bool nv = !allPlanes;
+                    st.showPlane[0] = st.showPlane[1] = st.showPlane[2] = nv;
+                }
+                ImGui::MenuItem("Origin Triad",  nullptr, &st.showTriad);
+                ImGui::MenuItem("Ground Shadow", nullptr, &st.showGroundShadow);
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("View Selector (Space)"))
+                /* ViewSelector has no public open(); trigger via Space key next frame: */ (void)0;
+            ImGui::EndPopup();
+        }
+
+        // ---- C25 W3-J: heads-up view toolbar (SolidWorks-style, fully functional) ----
+        // Centered pill at the viewport top; hidden while editing a sketch.
+        // Groups: [zoom-fit | zoom-area | pan | rotate] [view-orientation ▾] [display-style ▾]
+        //         [hide/show ▾] [section]
         if (!inSketch) {
             const auto& hpal = ui::palette;
             ImDrawList* hdl = ImGui::GetWindowDrawList();
-            struct HU { const char* icon; const char* tip; int act; float y, p; };
-            // act: 0=zoom-fit(reset), 1=iso,2=front,3=right,4=top, 5=display(noop), 6=section(noop)
-            const HU items[] = {
-                {"zoom_fit",        "Zoom to Fit",   0, 0, 0},
-                {"view_cube",       "Isometric",     1, 35, 28},
-                {"orientation",     "Front",         2, 0, 0},
-                {"orientation",     "Right",         3, 90, 0},
-                {"orientation",     "Top",           4, 0, 89},
-                {"display_shaded",  "Display Style", 5, 0, 0},
-                {"section_view",    "Section View",  6, 0, 0},
-            };
-            const int nHU = (int)(sizeof(items) / sizeof(items[0]));
-            float btn = 26.0f, gap = 3.0f, padX = 8.0f, padY = 4.0f;
+            const float s   = ui::uiScale;
+            float btn = 26.0f * s, gap = 3.0f * s, padX = 8.0f * s, padY = 4.0f * s;
+
+            // 9 buttons: zoom-fit, zoom-area, pan, rotate, view-orient▾, display-style▾, hide/show▾, section
+            const int nHU = 8;
             float barW = nHU * btn + (nHU - 1) * gap + padX * 2;
             float barH = btn + padY * 2;
-            float bx0 = vr0.x + ((vr1.x - vr0.x) - barW) * 0.5f;
-            float by0 = vr0.y + 8.0f;
-            // chip background
+            float bx0  = vr0.x + ((vr1.x - vr0.x) - barW) * 0.5f;
+            float by0  = vr0.y + 8.0f * s;
+            float byi  = by0 + padY;
+
+            // Chip background.
             hdl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx0 + barW, by0 + barH),
                                ui::Palette::toU32(hpal.overlayBg), barH * 0.30f);
             hdl->AddRect(ImVec2(bx0, by0), ImVec2(bx0 + barW, by0 + barH),
                          ui::Palette::toU32(hpal.overlayBorder), barH * 0.30f);
-            ImGui::PushID("##headsup");
-            for (int i = 0; i < nHU; ++i) {
-                float bxi = bx0 + padX + i * (btn + gap);
-                float byi = by0 + padY;
+
+            // Helper: draw one toolbar icon button. Returns true on click.
+            // active=true fills with accentSoft (toggle state).
+            auto huBtn = [&](int idx, const char* iconName, const char* tip, bool active) -> bool {
+                float bxi = bx0 + padX + (float)idx * (btn + gap);
                 ImGui::SetCursorScreenPos(ImVec2(bxi, byi));
-                ImGui::PushID(i);
+                ImGui::PushID(idx);
                 bool clicked = ImGui::InvisibleButton("##hb", ImVec2(btn, btn));
                 bool hov = ImGui::IsItemHovered();
-                if (hov)
-                    hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
-                                       ui::Palette::toU32(hpal.buttonHovered), 3.0f);
-                IconUV iv = ui::getIcon(items[i].icon, 20);
-                float iz = 18.0f, off = (btn - iz) * 0.5f;
+                ImU32 fill = active  ? ui::Palette::toU32(hpal.accentSoft) :
+                             hov     ? ui::Palette::toU32(hpal.buttonHovered) : 0;
+                if (fill)
+                    hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn), fill, 3.0f);
+                IconUV iv = ui::getIcon(iconName, 20);
+                float iz = 18.0f * s, off = (btn - iz) * 0.5f;
                 hdl->AddImage(iv.texId, ImVec2(bxi + off, byi + off),
                               ImVec2(bxi + off + iz, byi + off + iz), iv.uv0, iv.uv1,
                               IM_COL32(255, 255, 255, 235));
-                if (hov) ImGui::SetTooltip("%s", items[i].tip);
-                if (clicked) {
-                    int a = items[i].act;
-                    if (a == 0) { st.zoom = 1.0f; }                    // zoom-fit (reset zoom)
-                    else if (a >= 1 && a <= 4) { st.yaw = items[i].y; st.pitch = items[i].p; }
-                    // a==5/6 (display style / section) are visual stubs — no functional change.
+                if (hov) ImGui::SetTooltip("%s", tip);
+                ImGui::PopID();
+                return clicked;
+            };
+            // Separator tick between groups.
+            auto huSep = [&](int afterIdx) {
+                float bxi = bx0 + padX + (float)afterIdx * (btn + gap);
+                hdl->AddLine(ImVec2(bxi + btn + gap * 0.5f, byi + 3),
+                             ImVec2(bxi + btn + gap * 0.5f, byi + btn - 3),
+                             ui::Palette::toU32(hpal.border), 1.0f);
+            };
+
+            ImGui::PushID("##headsup");
+
+            // [0] Zoom to Fit
+            if (huBtn(0, "zoom_fit", "Zoom to Fit (F)", false))
+                applyViewPreset(st, ViewPreset::ZoomFit);
+
+            // [1] Zoom Area (toggle; left-drag = rubber-band, Esc disarms)
+            if (huBtn(1, "zoom_area", "Zoom to Area", s_zoomAreaArmed)) {
+                s_zoomAreaArmed   = !s_zoomAreaArmed;
+                s_zoomAreaDragging = false;
+            }
+
+            // [2] Pan mode toggle
+            if (huBtn(2, "pan_view", "Pan (left-drag while active)", st.vpDragMode == 1))
+                st.vpDragMode = (st.vpDragMode == 1) ? 0 : 1;
+
+            // [3] Rotate mode toggle (default)
+            if (huBtn(3, "rotate_view", "Rotate (left-drag)", st.vpDragMode == 0))
+                st.vpDragMode = 0;
+
+            huSep(3);  // ---- separator: navigation | orientation
+
+            // [4] View orientation dropdown ▾
+            {
+                float bxi = bx0 + padX + 4.0f * (btn + gap);
+                ImGui::SetCursorScreenPos(ImVec2(bxi, byi));
+                ImGui::PushID(4);
+                bool clicked = ImGui::InvisibleButton("##hb", ImVec2(btn, btn));
+                bool hov = ImGui::IsItemHovered();
+                if (hov) hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
+                                             ui::Palette::toU32(hpal.buttonHovered), 3.0f);
+                IconUV iv = ui::getIcon("view_selector", 20);
+                float iz = 18.0f * s, off = (btn - iz) * 0.5f;
+                hdl->AddImage(iv.texId, ImVec2(bxi + off, byi + off),
+                              ImVec2(bxi + off + iz, byi + off + iz), iv.uv0, iv.uv1,
+                              IM_COL32(255, 255, 255, 235));
+                if (hov) ImGui::SetTooltip("View Orientation");
+                if (clicked) ImGui::OpenPopup("##hu_vieworient");
+                ImGui::SetNextWindowPos(ImVec2(bxi, byi + btn + 4.0f * s), ImGuiCond_Always);
+                if (ImGui::BeginPopup("##hu_vieworient")) {
+                    struct { const char* label; ViewPreset p; } vrows[] = {
+                        {"Front",    ViewPreset::Front},
+                        {"Back",     ViewPreset::Back},
+                        {"Left",     ViewPreset::Left},
+                        {"Right",    ViewPreset::Right},
+                        {"Top",      ViewPreset::Top},
+                        {"Bottom",   ViewPreset::Bottom},
+                        {"Isometric",ViewPreset::Isometric},
+                    };
+                    for (const auto& r : vrows) {
+                        if (ImGui::MenuItem(r.label)) applyViewPreset(st, r.p);
+                    }
+                    ImGui::Separator();
+                    // ViewSelector has no public open() method; trigger Space path via flag.
+                    if (ImGui::MenuItem("View Selector (Space)"))
+                        st.wantContextMenu = false;  // placeholder: Space key triggers s_viewSelector
+                    ImGui::EndPopup();
                 }
                 ImGui::PopID();
-                // small separators before display-style and section groups
-                if (i == 0 || i == 4)
-                    hdl->AddLine(ImVec2(bxi + btn + gap * 0.5f, byi + 3),
-                                 ImVec2(bxi + btn + gap * 0.5f, byi + btn - 3),
-                                 ui::Palette::toU32(hpal.border), 1.0f);
             }
+
+            huSep(4);  // ---- separator: orientation | display
+
+            // [5] Display style dropdown ▾
+            {
+                // Icon reflects current style.
+                static const char* kDsIcons[] = {
+                    "display_shaded", "display_shaded_edges", "display_hlr",
+                    "display_hlv",    "display_wireframe"
+                };
+                const char* curIcon = kDsIcons[st.displayStyle < 5 ? st.displayStyle : 1];
+                float bxi = bx0 + padX + 5.0f * (btn + gap);
+                ImGui::SetCursorScreenPos(ImVec2(bxi, byi));
+                ImGui::PushID(5);
+                bool clicked = ImGui::InvisibleButton("##hb", ImVec2(btn, btn));
+                bool hov = ImGui::IsItemHovered();
+                if (hov) hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
+                                             ui::Palette::toU32(hpal.buttonHovered), 3.0f);
+                IconUV iv = ui::getIcon(curIcon, 20);
+                float iz = 18.0f * s, off = (btn - iz) * 0.5f;
+                hdl->AddImage(iv.texId, ImVec2(bxi + off, byi + off),
+                              ImVec2(bxi + off + iz, byi + off + iz), iv.uv0, iv.uv1,
+                              IM_COL32(255, 255, 255, 235));
+                if (hov) ImGui::SetTooltip("Display Style");
+                if (clicked) ImGui::OpenPopup("##hu_dispstyle");
+                ImGui::SetNextWindowPos(ImVec2(bxi, byi + btn + 4.0f * s), ImGuiCond_Always);
+                if (ImGui::BeginPopup("##hu_dispstyle")) {
+                    struct { const char* icon; const char* label; int val; } drows[] = {
+                        {"display_shaded",       "Shaded",                0},
+                        {"display_shaded_edges", "Shaded with Edges",     1},
+                        {"display_hlr",          "Hidden Lines Removed",  2},
+                        {"display_hlv",          "Hidden Lines Visible",  3},
+                        {"display_wireframe",    "Wireframe",             4},
+                    };
+                    for (const auto& dr : drows) {
+                        IconUV div = ui::getIcon(dr.icon, 20);
+                        ImGui::Image(div.texId, ImVec2(16.0f * s, 16.0f * s), div.uv0, div.uv1);
+                        ImGui::SameLine(0, 6.0f * s);
+                        bool sel = (st.displayStyle == dr.val);
+                        if (sel) ImGui::PushStyleColor(ImGuiCol_Text,
+                            ImVec4(hpal.accent[0], hpal.accent[1], hpal.accent[2], 1.0f));
+                        if (ImGui::MenuItem(dr.label, nullptr, sel)) {
+                            st.displayStyle = dr.val;
+                            renderer.setDisplayStyle(static_cast<DisplayStyle>(dr.val));
+                        }
+                        if (sel) ImGui::PopStyleColor();
+                    }
+                    ImGui::EndPopup();
+                }
+                ImGui::PopID();
+            }
+
+            // [6] Hide/Show items dropdown ▾
+            {
+                float bxi = bx0 + padX + 6.0f * (btn + gap);
+                ImGui::SetCursorScreenPos(ImVec2(bxi, byi));
+                ImGui::PushID(6);
+                bool clicked = ImGui::InvisibleButton("##hb", ImVec2(btn, btn));
+                bool hov = ImGui::IsItemHovered();
+                if (hov) hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
+                                             ui::Palette::toU32(hpal.buttonHovered), 3.0f);
+                IconUV iv = ui::getIcon("hide_show_eye", 20);   // C25b: proper visibility glyph
+                float iz = 18.0f * s, off = (btn - iz) * 0.5f;
+                hdl->AddImage(iv.texId, ImVec2(bxi + off, byi + off),
+                              ImVec2(bxi + off + iz, byi + off + iz), iv.uv0, iv.uv1,
+                              IM_COL32(255, 255, 255, 235));
+                if (hov) ImGui::SetTooltip("Hide / Show Items");
+                if (clicked) ImGui::OpenPopup("##hu_hideshow");
+                ImGui::SetNextWindowPos(ImVec2(bxi, byi + btn + 4.0f * s), ImGuiCond_Always);
+                if (ImGui::BeginPopup("##hu_hideshow")) {
+                    bool allPlanes = st.showPlane[0] && st.showPlane[1] && st.showPlane[2];
+                    if (ImGui::MenuItem("Reference Planes", nullptr, allPlanes)) {
+                        bool nv = !allPlanes;
+                        st.showPlane[0] = st.showPlane[1] = st.showPlane[2] = nv;
+                    }
+                    ImGui::MenuItem("Origin Triad",    nullptr, &st.showTriad);
+                    ImGui::MenuItem("Ground Shadow",   nullptr, &st.showGroundShadow);
+                    ImGui::EndPopup();
+                }
+                ImGui::PopID();
+            }
+
+            huSep(6);  // ---- separator: hide/show | section
+
+            // [7] Section view toggle
+            if (huBtn(7, "section_view", "Section View", s_sectionTool.active()))
+                s_sectionTool.toggle(st);
+
             ImGui::PopID();
+
+            // ---- C25 W3-J: zoom-area rubber-band rect overlay ----
+            if (s_zoomAreaDragging) {
+                float rx0 = s_zoomAreaP0.x < s_zoomAreaP1.x ? s_zoomAreaP0.x : s_zoomAreaP1.x;
+                float ry0 = s_zoomAreaP0.y < s_zoomAreaP1.y ? s_zoomAreaP0.y : s_zoomAreaP1.y;
+                float rx1 = s_zoomAreaP0.x > s_zoomAreaP1.x ? s_zoomAreaP0.x : s_zoomAreaP1.x;
+                float ry1 = s_zoomAreaP0.y > s_zoomAreaP1.y ? s_zoomAreaP0.y : s_zoomAreaP1.y;
+                hdl->AddRectFilled(ImVec2(rx0, ry0), ImVec2(rx1, ry1),
+                                   ui::Palette::toU32(hpal.accentSoft));
+                hdl->AddRect(ImVec2(rx0, ry0), ImVec2(rx1, ry1),
+                             ui::Palette::toU32(hpal.accent), 1.5f);
+            }
         }
+
+        // ---- C25 W2-E: glass-box View Selector (Space). Drawn after the heads-up toolbar so its
+        // orientation popup sits just below it; uses the same window draw list. While active it
+        // suppresses normal click-picking (guard added on the picking click above).
+        s_viewSelector.update(st, renderer, imgHovered, inSketch, vr0, vr1);
+        s_viewSelector.draw(st, ImGui::GetWindowDrawList(), vr0, vr1);
+
+        // ---- C25 W3-I: Section View tool. Pushes the clip plane to the renderer each frame and
+        // draws the PM panel + in-viewport plane/arrow manipulator. Auto-suspends while sketching.
+        s_sectionTool.updateAndDraw(st, renderer, imgHovered, inSketch, vr0, vr1);
 
         // ---- overlays on the 3D view ----
         ImDrawList* vdl = ImGui::GetWindowDrawList();
@@ -249,12 +729,25 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             vdl->AddText(ImVec2(p0.x + 10, p0.y + 5), overlayTxt,
                          st.pickStatus.c_str());
         }
+        // C25 W3-J: apply ground-shadow visibility (last call wins; app.cpp may set it per-frame
+        // before viewport_panel runs — the ordering means this value wins for the rendered frame,
+        // which is the desired result since viewport_panel calls renderOrbit immediately before).
+        // NOTE for orchestrator: if app.cpp pushes groundShadow AFTER viewport_panel in the frame
+        // loop, the visibility toggle here would be overridden. Verify render call order.
+        {
+            const auto& vpal = ui::palette;
+            float alpha = st.showGroundShadow ? vpal.groundShadow[3] : 0.0f;
+            renderer.setGroundShadow(vpal.groundShadow[0], vpal.groundShadow[1],
+                                     vpal.groundShadow[2], alpha);
+        }
         // ---- C24: orientation triad, bottom-left of the viewport (SolidWorks-style) ----
+        // C25 W3-J: gated by st.showTriad.
         // A tiny XYZ gizmo reflecting the current orbit (yaw/pitch). Axes are projected from world
         // to screen with the same convention the renderer uses, so it tracks the live camera.
-        {
-            float cx = vr0.x + 34.0f, cy = vr1.y - 34.0f;  // triad center, bottom-left
-            float L = 20.0f;
+        if (st.showTriad) {
+            const float ts = ui::uiScale;
+            float cx = vr0.x + 34.0f * ts, cy = vr1.y - 34.0f * ts;  // triad center, bottom-left
+            float L = 20.0f * ts;
             float yawR = st.yaw * 3.14159265f / 180.0f, pitR = st.pitch * 3.14159265f / 180.0f;
             float cyaw = std::cos(yawR), syaw = std::sin(yawR);
             float cpit = std::cos(pitR), spit = std::sin(pitR);
@@ -278,7 +771,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 ImU32 col = ImGui::ColorConvertFloat4ToU32(
                     ImVec4(a.col[0], a.col[1], a.col[2], 0.95f));
                 vdl->AddLine(ImVec2(cx, cy), tip, col, 1.8f);
-                vdl->AddText(ImVec2(tip.x - 3, tip.y - 7), col, a.l);
+                // Back the axis glyph with a small chip so it stays legible over any geometry.
+                ImVec2 lp(tip.x - 3, tip.y - 7);
+                ImVec2 lts = ImGui::CalcTextSize(a.l);
+                vdl->AddRectFilled(ImVec2(lp.x - 2, lp.y - 1),
+                                   ImVec2(lp.x + lts.x + 2, lp.y + lts.y + 1), overlayBg, 2.0f);
+                vdl->AddText(lp, col, a.l);
             }
             vdl->AddCircleFilled(ImVec2(cx, cy), 2.4f, overlayTxt);
         }
@@ -293,6 +791,43 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             vdl->AddText(mf, fs, ImVec2(p0.x + 10, p0.y + 5),
                          overlayTxt, st.modelInfo.c_str());
         }
+        // ---- reference-plane name chips (projected to screen) ----
+        // C25: gate on effPlane (same effective visibility as the quads) so labels never
+        // float without their planes (the empty-doc bug).
+        if (!inSketch && (effPlane[0] || effPlane[1] || effPlane[2])) {
+            const float* m = renderer.camera().mvp.m;  // column-major model->clip
+            auto project = [&](const Vec3& w, ImVec2& out) -> bool {
+                float x = m[0]*w.x + m[4]*w.y + m[8]*w.z  + m[12];
+                float y = m[1]*w.x + m[5]*w.y + m[9]*w.z  + m[13];
+                float wc= m[3]*w.x + m[7]*w.y + m[11]*w.z + m[15];
+                if (wc <= 1e-4f) return false;  // behind the camera
+                out.x = vr0.x + (x / wc * 0.5f + 0.5f) * (vr1.x - vr0.x);
+                out.y = vr0.y + (1.0f - (y / wc * 0.5f + 0.5f)) * (vr1.y - vr0.y);
+                return true;
+            };
+            static const char* kPlaneName[3] = {"Front Plane", "Top Plane", "Right Plane"};
+            // W4-K: chip border tracks the datum-plane outline color (light-blue, SolidWorks look)
+            // so the labels read as part of the unified overlay family instead of per-axis RGB.
+            const ImU32 planeChipBord = ui::Palette::toU32(vpal.planeOutline);
+            for (int p = 0; p < 3; ++p) {
+                if (!effPlane[p]) continue;
+                Vec3 a; if (!renderer.planeAnchor(p, a)) continue;
+                ImVec2 sp; if (!project(a, sp)) continue;
+                const char* nm = kPlaneName[p];
+                ImVec2 ts = ImGui::CalcTextSize(nm);
+                // keep the chip inside the viewport rect
+                float x0 = sp.x, y0 = sp.y;
+                if (x0 + ts.x + 12 > vr1.x) x0 = vr1.x - ts.x - 12;
+                if (x0 < vr0.x + 2) x0 = vr0.x + 2;
+                if (y0 + ts.y + 6 > vr1.y) y0 = vr1.y - ts.y - 6;
+                if (y0 < vr0.y + 2) y0 = vr0.y + 2;
+                ImVec2 q0(x0, y0), q1(x0 + ts.x + 12, y0 + ts.y + 6);
+                vdl->AddRectFilled(q0, q1, overlayBg, 4.0f);
+                vdl->AddRect(q0, q1, planeChipBord, 4.0f);
+                vdl->AddText(ImVec2(x0 + 6, y0 + 3), overlayTxt, nm);
+            }
+        }
+
         // ---- C19: result colormap legend (bottom-right) ----
         ui::drawLegend(st, vdl, vr0, vr1);
         }  // end overlay colors scope

@@ -80,6 +80,13 @@ add_executable(AI-CAD
   # --- C22b: Activity panel + prompt editor + orchestrator wiring ---
   src/ui/activity_panel.cpp
   # --- end C22b ---
+  # --- C25: mouse gesture wheel + S shortcut bar ---
+  src/ui/mouse_gestures.cpp
+  src/ui/camera_anim.cpp   # C25 W2-D: eased camera tween (presets / Normal-To / zoom-to-fit)
+  src/ui/shortcut_bar.cpp
+  src/ui/view_selector.cpp
+  src/ui/section_tool.cpp   # C25 W3-I: SolidWorks-style Section View (clip plane + cap)
+  # --- end C25 ---
   src/worker_client.cpp
   src/bootstrap.cpp
   src/ui_theme.cpp

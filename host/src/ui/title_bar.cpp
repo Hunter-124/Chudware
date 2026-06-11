@@ -9,10 +9,13 @@
 
 #include "../core/app_state.h"
 #include "../renderer.h"
+#include "../ui_theme.h"   // ui::uiScale
 
 // ---------------- caption buttons (shared small ui helper) ----------------
 bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
-    const ImVec2 size(h * 1.35f, h);
+    // C25-W3G: button width tracks uiScale so buttons stay clickable at 1.5x/2.0x.
+    const float btnW = h * (1.35f + 0.15f * (ui::uiScale - 1.0f));
+    const ImVec2 size(btnW, h);
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
     bool clicked = ImGui::InvisibleButton(id, size);
     bool hovered = ImGui::IsItemHovered();
@@ -63,28 +66,29 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     // Target pixel widths translated to fractions of the dockspace width.
     const float w = size.x > 1.0f ? size.x : 1440.0f;
     const float h = size.y > 1.0f ? size.y : 800.0f;
-    float leftFrac  = 280.0f / w;  leftFrac  = leftFrac  < 0.14f ? 0.14f : (leftFrac  > 0.34f ? 0.34f : leftFrac);
-    float rightFrac = 340.0f / w;  rightFrac = rightFrac < 0.16f ? 0.16f : (rightFrac > 0.40f ? 0.40f : rightFrac);
-    float consFrac  = 150.0f / h;  consFrac  = consFrac  < 0.12f ? 0.12f : (consFrac  > 0.32f ? 0.32f : consFrac);
+    // Tuned to maximize the central viewport: a compact FeatureManager, a single-tab-group task
+    // pane (Phase 4 consolidates Design/Activity/Console into one), and an unobtrusive console.
+    // W4-K: scale the target pixel widths by uiScale so the docks track the (pre-scaled) fonts —
+    // at 2x the framebuffer grows but text is ~2x wider, so a fixed-px dock clips tree labels.
+    const float sc = ui::uiScale;
+    float leftFrac  = 258.0f * sc / w;  leftFrac  = leftFrac  < 0.13f ? 0.13f : (leftFrac  > 0.34f ? 0.34f : leftFrac);
+    float rightFrac = 300.0f * sc / w;  rightFrac = rightFrac < 0.15f ? 0.15f : (rightFrac > 0.36f ? 0.36f : rightFrac);
+    float consFrac  = 108.0f * sc / h;  consFrac  = consFrac  < 0.10f ? 0.10f : (consFrac  > 0.26f ? 0.26f : consFrac);
 
-    ImGuiID main = root, left, right, bottom, rightBottom;
+    (void)consFrac;  // Console is now a tab inside the AI panel, not a bottom strip.
+    ImGuiID main = root, left, right, rightBottom;
     // Left column = FeatureManager (full height).
     left  = ImGui::DockBuilderSplitNode(main, ImGuiDir_Left,  leftFrac,  nullptr, &main);
-    // Right column = Task Pane; split off before the bottom so it spans full height like SW.
+    // Right column = Task Pane (the consolidated AI panel), full height like SolidWorks.
     right = ImGui::DockBuilderSplitNode(main, ImGuiDir_Right, rightFrac / (1.0f - leftFrac),
                                         nullptr, &main);
-    // Console = a thin strip under the viewport (center column only).
-    bottom = ImGui::DockBuilderSplitNode(main, ImGuiDir_Down, consFrac, nullptr, &main);
     // Bottom slice of the right pane holds the command dialogs as docked tabs.
     rightBottom = ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.42f, nullptr, &right);
 
     ImGui::DockBuilderDockWindow("FeatureManager", left);
-    // Task pane tabs. Dock Agent Activity first then Design so Design ends up the selected tab
-    // (ImGui selects the most-recently-docked window in a node), matching SolidWorks's task pane.
-    ImGui::DockBuilderDockWindow("Agent Activity", right);
-    ImGui::DockBuilderDockWindow("Design", right);
+    // One task-pane window: Design / Activity / Console live as internal tabs.
+    ImGui::DockBuilderDockWindow("AI", right);
     ImGui::DockBuilderDockWindow("Viewport", main);
-    ImGui::DockBuilderDockWindow("Console", bottom);
     // Command dialogs dock into the lower-right slot so they surface as tabs instead of floating
     // behind the central node. They share one node (only one is typically open at a time).
     const char* dialogs[] = {
@@ -98,13 +102,6 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     for (const char* d : dialogs) ImGui::DockBuilderDockWindow(d, rightBottom);
 
     ImGui::DockBuilderFinish(root);
-
-    // C24: make Design the selected tab of the right task-pane node (over Agent Activity), matching
-    // SolidWorks's task pane defaulting to its first tab. DockBuilderFinish leaves the node's
-    // SelectedTabId at the last-docked window, so set it explicitly to Design's window id. A
-    // top-level window's id is ImHashStr(name) seeded with 0.
-    if (ImGuiDockNode* node = ImGui::DockBuilderGetNode(right))
-        node->SelectedTabId = ImHashStr("Design");
 }
 
 namespace ui {
@@ -113,35 +110,51 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
     GLFWwindow* win = st.win;
     chrome::HitLayout& hitLayout = *st.hitLayout;
 
+    // C25-W3G: scale the frame padding so the title bar grows with DPI.
+    float s = ui::uiScale;
     // ---------- custom title bar (our own; the OS title bar is stripped) ----------
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14.0f, 12.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14.0f * s, 12.0f * s));
     const float barH = ImGui::GetFrameHeight();
     hitLayout.titleBarHeight = (int)barH;
     ImGui::PushStyleColor(ImGuiCol_MenuBarBg,
         ImVec4(ui::palette.headerBg[0], ui::palette.headerBg[1],
                ui::palette.headerBg[2], ui::palette.headerBg[3]));
     if (ImGui::BeginMainMenuBar()) {
-        // brand mark on the left (draggable caption around it)
+        // C25-W3G: compute caption button width early so we can clamp the brand/menu region.
+        const float bw = barH * (1.35f + 0.15f * (s - 1.0f));
+        const float captionZoneW = bw * 3.0f;
+        const float winW = ImGui::GetWindowWidth();
+        // Available horizontal space for brand + menus (leave caption buttons on the right).
+        const float menuZoneR = winW - captionZoneW - 4.0f;
+
+        // brand mark on the left
         const float iconH = barH * 0.52f;
         if (st.logoIcon.id) {
-            ImGui::SetCursorPosX(12.0f);
+            ImGui::SetCursorPosX(12.0f * s);
             ImGui::SetCursorPosY((barH - iconH) * 0.5f);
             ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(iconH, iconH));
-            ImGui::SameLine(0, 9);
+            ImGui::SameLine(0, 9.0f * s);
         } else {
-            ImGui::SetCursorPosX(14.0f);
+            ImGui::SetCursorPosX(14.0f * s);
         }
-        if (st.wordmark.id) {
+        const Tex& wm = (ui::activeTheme == ui::Theme::Light && st.wordmarkDark.id)
+                            ? st.wordmarkDark : st.wordmark;
+        if (wm.id) {
             const float wmH = barH * 0.40f;
-            ImGui::SetCursorPosY((barH - wmH) * 0.5f);
-            ImGui::Image((ImTextureID)(intptr_t)st.wordmark.id,
-                         ImVec2(wmH * (float)st.wordmark.w / st.wordmark.h, wmH));
-            ImGui::SameLine(0, 18);
+            float wmW = wmH * (float)wm.w / wm.h;
+            // C25-W3G: only show wordmark if it fits in the available zone.
+            if (ImGui::GetCursorPosX() + wmW + 18.0f * s < menuZoneR - 120.0f) {
+                ImGui::SetCursorPosY((barH - wmH) * 0.5f);
+                ImGui::Image((ImTextureID)(intptr_t)wm.id, ImVec2(wmW, wmH));
+                ImGui::SameLine(0, 18.0f * s);
+            }
         }
 
-        // menus — record their horizontal span so the native hit-test keeps them clickable
+        // C25-W3G: collapse to single "Menu" dropdown below a width threshold.
+        const float collapseThreshold = 700.0f * s;
         hitLayout.menuLeft = (int)ImGui::GetCursorScreenPos().x;
-        if (ImGui::BeginMenu("AI-CAD")) {
+
+        auto drawAiCadMenu = [&]() {
             if (ImGui::MenuItem("Settings...")) st.openSettings = true;
             if (ImGui::MenuItem("Repair / install runtime", nullptr, false,
                                 !st.setupRunning.load() && !st.job.running.load()))
@@ -149,28 +162,19 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             if (ImGui::MenuItem("Reset layout")) st.resetLayout = true;
             ImGui::Separator();
             if (ImGui::MenuItem("Quit", "Alt+F4")) glfwSetWindowShouldClose(win, 1);
-            ImGui::EndMenu();
-        }
-        if (ImGui::BeginMenu("View")) {
+        };
+        auto drawViewMenu = [&]() {
             ImGui::MenuItem("Ribbon", nullptr, &st.showRibbon);
             ImGui::MenuItem("FeatureManager", nullptr, &st.showFeatureTree);
-            // C24: the right Task Pane hosts the AI Design panel + Agent Activity (SolidWorks-style).
-            // Its checkbox drives the Design + Activity dock visibility together.
-            if (ImGui::MenuItem("Task Pane", nullptr, &st.showTaskPane)) {
-                st.showDesign = st.showTaskPane;
-                st.showActivityPanel = st.showTaskPane;
-            }
+            ImGui::MenuItem("AI Panel", nullptr, &st.showAIPanel);
             ImGui::MenuItem("Viewport", nullptr, &st.showViewport);
-            ImGui::MenuItem("Console", nullptr, &st.showConsole);
             ImGui::Separator();
-            // Theme toggle — switches between dark and light palettes at runtime.
             bool isLight = (ui::activeTheme == ui::Theme::Light);
             if (ImGui::MenuItem("Light theme (SolidWorks-style)", nullptr, isLight)) {
                 ui::Theme next = isLight ? ui::Theme::Dark : ui::Theme::Light;
                 ui::applyTheme(next, st.scale);
                 st.settings.theme = (next == ui::Theme::Light) ? "light" : "dark";
                 saveSettings(st.settings);
-                // Sync viewport gradient to the new palette.
                 if (st.renderer)
                     st.renderer->setBackground(
                         ui::palette.viewportTop[0], ui::palette.viewportTop[1],
@@ -179,21 +183,30 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Reset layout")) st.resetLayout = true;
-            ImGui::EndMenu();
-        }
-        if (ImGui::BeginMenu("Help")) {
+        };
+        auto drawHelpMenu = [&]() {
             if (ImGui::MenuItem("About AI-CAD")) st.showAbout = true;
-            ImGui::EndMenu();
+        };
+
+        if (winW < collapseThreshold) {
+            // Collapsed: single "Menu" top-level item with all submenus
+            if (ImGui::BeginMenu("Menu")) {
+                if (ImGui::BeginMenu("AI-CAD")) { drawAiCadMenu(); ImGui::EndMenu(); }
+                if (ImGui::BeginMenu("View"))   { drawViewMenu();  ImGui::EndMenu(); }
+                if (ImGui::BeginMenu("Help"))   { drawHelpMenu();  ImGui::EndMenu(); }
+                ImGui::EndMenu();
+            }
+        } else {
+            if (ImGui::BeginMenu("AI-CAD")) { drawAiCadMenu(); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("View"))   { drawViewMenu();  ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Help"))   { drawHelpMenu();  ImGui::EndMenu(); }
         }
         hitLayout.menuRight = (int)ImGui::GetItemRectMax().x;
 
-        // window controls, right-aligned (minimize / maximize-restore / close).
-        // Position each one absolutely so they share one baseline (the menu bar's
-        // horizontal flow otherwise drifts arbitrary widgets vertically).
-        const float bw = barH * 1.35f;
-        const float bx = ImGui::GetWindowWidth() - bw * 3.0f;
+        // window controls, right-aligned.
+        const float bx = winW - captionZoneW;
         hitLayout.controlsLeft = (int)bx;
-        hitLayout.controlsRight = (int)(bx + bw * 3.0f);
+        hitLayout.controlsRight = (int)(bx + captionZoneW);
         ImGui::SetCursorPos(ImVec2(bx, 0.0f));
         if (windowButton("##min", BTN_MIN, barH, false)) glfwIconifyWindow(win);
         ImGui::SetCursorPos(ImVec2(bx + bw, 0.0f));

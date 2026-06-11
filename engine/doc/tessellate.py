@@ -135,8 +135,8 @@ def tessellate_body(
     body_id: int,
     name: str,
     color: tuple[float, float, float],
-    lin_deflection: float = 0.1,
-    ang_deflection: float = 0.5,
+    lin_deflection: float = 0.05,
+    ang_deflection: float = 0.35,
 ) -> BodyTess:
     """Tessellate an OCP/build123d shape to AICM geometry.
 

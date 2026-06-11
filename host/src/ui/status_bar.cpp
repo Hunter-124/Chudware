@@ -17,9 +17,10 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + vp->Size.y - statusH));
     ImGui::SetNextWindowSize(ImVec2(vp->Size.x, statusH));
     ImGui::SetNextWindowViewport(vp->ID);
+    float dpiS = ui::uiScale;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14, 5));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f * dpiS, 5.0f * dpiS));
     const auto& pal = ui::palette;
     ImGui::PushStyleColor(ImGuiCol_WindowBg,
         ImVec4(pal.statusBg[0], pal.statusBg[1], pal.statusBg[2], pal.statusBg[3]));
@@ -86,7 +87,7 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     float editw = editTxt[0] ? ImGui::CalcTextSize(editTxt).x : 0.0f;
     float sepw  = ImGui::CalcTextSize(sep.c_str()).x;
     float total = uniw + sepw + (editw > 0 ? editw + sepw : 0.0f) + ptw;
-    ImGui::SameLine(ImGui::GetWindowWidth() - total - 16);
+    ImGui::SameLine(ImGui::GetWindowWidth() - total - 16.0f * dpiS);
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1));
     ImGui::TextUnformatted(unitsTxt);

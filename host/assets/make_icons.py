@@ -49,11 +49,21 @@ CONTRACT_NAMES: list[str] = [
     "study_static", "study_modal", "study_flow", "fixture", "load_force",
     "load_pressure", "mesh", "run_study", "results", "flow_arrow",
     # Viewport HUD
-    "zoom_fit", "view_cube", "display_shaded", "display_edges",
-    "display_wire", "section_view", "orientation",
+    "zoom_fit", "view_cube", "display_shaded", "display_shaded_edges",
+    "display_hlr", "display_hlv", "display_wireframe", "display_edges",
+    "display_wire", "section_view", "pan_view", "rotate_view", "zoom_area",
+    "view_selector", "normal_to", "orientation",
     # General
     "ok_check", "cancel_x", "settings", "save", "open", "new_doc",
     "undo", "redo", "theme_toggle", "ai_panel", "activity", "prompt_edit",
+    # C25: sketch flyout variant icons (append-only)
+    "rect_3pt_corner", "rect_3pt_center", "parallelogram",
+    "circle_perimeter",
+    "slot_ctr_str", "slot_arc_3pt", "slot_arc_ctr",
+    "spline_style", "spline_surface", "spline_equation",
+    "ellipse_partial", "parabola", "conic",
+    # C25b: HUD hide/show visibility toggle (normal_to read as "arrow", not "visibility")
+    "hide_show_eye",
 ]
 
 # ---------------------------------------------------------------------------
@@ -840,22 +850,42 @@ def draw_text_ent(d, cell, p):
 
 @icon("trim")
 def draw_trim(d, cell, p):
-    """Line with segment erased."""
+    """Scissors cutting a line; the trimmed-off segment is dashed (removed)."""
     s = cell * SS
-    lw = stroke_width(cell) * 2
-    d.line([(s*0.15, s*0.5), (s*0.40, s*0.5)], fill=p.stroke, width=lw)
-    d.line([(s*0.65, s*0.5), (s*0.85, s*0.5)], fill=p.stroke, width=lw)
-    # scissor X at gap
-    x_sign(d, s*0.52, s*0.5, s*0.1, p.err, lw)
+    lw = stroke_width(cell)
+    y = s * 0.50
+    cut = s * 0.50
+    # kept segment (solid) up to the cut point
+    d.line([(s*0.08, y), (cut, y)], fill=p.stroke, width=lw * 2)
+    # trimmed-off segment (dashed, in 'remove' red) past the cut
+    seg = s * 0.09
+    x = cut + seg * 0.8
+    while x < s * 0.94:
+        d.line([(x, y), (min(x + seg, s*0.94), y)], fill=p.err, width=lw)
+        x += seg * 1.8
+    # scissors at the cut: two blades opening right + two finger loops on the handles
+    bx, by = cut, y
+    d.line([(bx, by), (bx + s*0.16, by - s*0.18)], fill=p.accent, width=lw)
+    d.line([(bx, by), (bx + s*0.16, by + s*0.18)], fill=p.accent, width=lw)
+    filled_circle(d, bx, by, lw * 0.7, p.accent)
+    circle(d, bx - s*0.12, by - s*0.13, s*0.06, outline=p.accent, lw=lw)
+    circle(d, bx - s*0.12, by + s*0.13, s*0.06, outline=p.accent, lw=lw)
+    d.line([(bx, by), (bx - s*0.07, by - s*0.07)], fill=p.accent, width=lw)
+    d.line([(bx, by), (bx - s*0.07, by + s*0.07)], fill=p.accent, width=lw)
 
 @icon("extend")
 def draw_extend(d, cell, p):
-    """Short line extending to meet a boundary."""
+    """Solid line extended (accent dashed continuation) reaching a boundary wall with an arrow."""
     s = cell * SS
-    lw = stroke_width(cell) * 2
-    d.line([(s*0.15, s*0.5), (s*0.55, s*0.5)], fill=p.stroke, width=lw)
-    d.line([(s*0.55, s*0.5), (s*0.75, s*0.5)], fill=p.accent, width=lw)
-    d.line([(s*0.82, s*0.2), (s*0.82, s*0.8)], fill=p.stroke, width=lw)
+    lw = stroke_width(cell)
+    y = s * 0.50
+    wall = s * 0.86
+    # existing entity (solid)
+    d.line([(s*0.10, y), (s*0.45, y)], fill=p.stroke, width=lw * 2)
+    # extension reaching toward the boundary (accent arrow)
+    arrow(d, s*0.45, y, wall - lw, y, p.accent, lw)
+    # boundary wall (vertical) the entity extends to
+    d.line([(wall, s*0.16), (wall, s*0.84)], fill=p.stroke, width=lw * 2)
 
 @icon("offset_ent")
 def draw_offset_ent(d, cell, p):
@@ -868,16 +898,15 @@ def draw_offset_ent(d, cell, p):
 
 @icon("convert_ent")
 def draw_convert_ent(d, cell, p):
+    """Two stacked rects (model face -> sketch entity) with an arrow showing the conversion."""
     s = cell * SS
     lw = stroke_width(cell)
-    # entity to convert (outer solid)
-    d.rectangle([s*0.15, s*0.25, s*0.65, s*0.70], outline=p.stroke, width=lw)
-    # converted edge (dashed style — accent)
-    for i in range(4):
-        t = i / 4
-        y = s*0.25 + (s*0.45) * t
-        if i % 2 == 0:
-            d.line([(s*0.65, y), (s*0.80, y)], fill=p.accent, width=lw)
+    # source (model edge/face) — upper-left, solid stroke
+    d.rectangle([s*0.12, s*0.14, s*0.50, s*0.46], outline=p.stroke, width=lw)
+    # converted result — lower-right, accent (the new sketch entity)
+    d.rectangle([s*0.50, s*0.54, s*0.88, s*0.86], outline=p.accent, width=lw)
+    # arrow from source to result
+    arrow(d, s*0.40, s*0.42, s*0.60, s*0.58, p.accent, lw)
 
 @icon("mirror_ent")
 def draw_mirror_ent(d, cell, p):
@@ -1360,6 +1389,65 @@ def draw_display_shaded(d, cell, p):
     d.rounded_rectangle([s*0.15, s*0.15, s*0.85, s*0.85], radius=int(s*0.12),
                          fill=(*p.accent[:3], 120), outline=p.stroke, width=lw)
 
+@icon("display_shaded_edges")
+def draw_display_shaded_edges(d, cell, p):
+    """Filled cube with dark edges outline."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    # filled cube
+    d.rounded_rectangle([s*0.15, s*0.15, s*0.85, s*0.85], radius=int(s*0.12),
+                         fill=(*p.accent[:3], 120), outline=None)
+    # dark outline for edges
+    d.rounded_rectangle([s*0.15, s*0.15, s*0.85, s*0.85], radius=int(s*0.12),
+                         fill=None, outline=p.stroke, width=lw*2)
+
+@icon("display_hlr")
+def draw_display_hlr(d, cell, p):
+    """Outline cube (hidden line removal - visible edges only)."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    iso_box(d, s/2, s/2, s*0.28, p.stroke, lw)
+
+@icon("display_hlv")
+def draw_display_hlv(d, cell, p):
+    """Outline cube with dashed hidden edges (hidden line visible)."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    # solid visible edges
+    iso_box(d, s/2, s/2, s*0.28, p.stroke, lw)
+    # dashed hidden edges
+    c = s / 2
+    r = s * 0.28
+    t = (c, c - r * 0.7)
+    rt = (c + r, c - r * 0.35)
+    rm = (c + r, c + r * 0.15)
+    # dashed line from left to right back edge
+    segs = 3
+    for i in range(segs):
+        t0 = i / segs
+        t1 = (i + 0.6) / segs
+        x0 = t[0] + (rm[0] - t[0]) * t0
+        y0 = t[1] + (rm[1] - t[1]) * t0
+        x1 = t[0] + (rm[0] - t[0]) * t1
+        y1 = t[1] + (rm[1] - t[1]) * t1
+        col = p.accent if i % 2 == 0 else (p.accent[0], p.accent[1], p.accent[2], 80)
+        d.line([(x0, y0), (x1, y1)], fill=col, width=lw)
+
+@icon("display_wireframe")
+def draw_display_wireframe(d, cell, p):
+    """Full wireframe cube with all edges visible."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    # front face
+    d.rectangle([s*0.2, s*0.35, s*0.7, s*0.80], outline=p.stroke, width=lw)
+    # back face offset
+    d.rectangle([s*0.35, s*0.2, s*0.85, s*0.65], outline=p.accent, width=lw)
+    # connecting lines
+    for (x0, y0), (x1, y1) in [((s*0.2, s*0.35), (s*0.35, s*0.2)),
+                                ((s*0.7, s*0.35), (s*0.85, s*0.2)),
+                                ((s*0.7, s*0.80), (s*0.85, s*0.65))]:
+        d.line([(x0, y0), (x1, y1)], fill=p.stroke, width=lw)
+
 @icon("display_edges")
 def draw_display_edges(d, cell, p):
     """Rounded square outline with visible edges."""
@@ -1392,6 +1480,95 @@ def draw_section_view(d, cell, p):
                          outline=p.stroke, width=lw)
     d.line([(s*0.5, s*0.14), (s*0.5, s*0.86)], fill=p.err, width=lw*2)
     d.rectangle([s*0.15, s*0.22, s*0.5, s*0.78], fill=(*p.accent[:3], 60))
+
+@icon("pan_view")
+def draw_pan_view(d, cell, p):
+    """Four-way arrows pointing outward (pan/drag navigation)."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx, cy = s/2, s/2
+    m = s * 0.32
+    # four arrows: up, down, left, right
+    arrow(d, cx, cy - m, cx, cy - m - s*0.10, p.accent, lw)
+    arrow(d, cx, cy + m, cx, cy + m + s*0.10, p.accent, lw)
+    arrow(d, cx - m, cy, cx - m - s*0.10, cy, p.accent, lw)
+    arrow(d, cx + m, cy, cx + m + s*0.10, cy, p.accent, lw)
+    # center circle
+    circle(d, cx, cy, s*0.08, outline=p.stroke, lw=lw)
+
+@icon("rotate_view")
+def draw_rotate_view(d, cell, p):
+    """Circular arrow around a sphere (rotate view)."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx, cy = s/2, s/2
+    r_sphere = s * 0.22
+    r_orbit = s * 0.35
+    # sphere center
+    circle(d, cx, cy, r_sphere, outline=p.stroke, lw=lw)
+    # orbital arc (circular arrow)
+    arc_segment(d, cx, cy, r_orbit, 45, 315, p.accent, lw)
+    arrow(d, cx + r_orbit*0.707, cy - r_orbit*0.707,
+          cx + r_orbit*0.8, cy - r_orbit*0.8, p.accent, lw)
+
+@icon("zoom_area")
+def draw_zoom_area(d, cell, p):
+    """Magnifier glass over a dashed rectangle."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    # dashed rectangle (zoom area)
+    segs = 4
+    for i in range(segs):
+        t0 = i / segs
+        t1 = (i + 0.6) / segs
+        # top edge
+        d.line([(s*0.15 + (s*0.4)*t0, s*0.15), (s*0.15 + (s*0.4)*t1, s*0.15)], fill=p.accent, width=lw)
+        # bottom edge
+        d.line([(s*0.15 + (s*0.4)*t0, s*0.55), (s*0.15 + (s*0.4)*t1, s*0.55)], fill=p.accent, width=lw)
+        # left edge
+        d.line([(s*0.15, s*0.15 + (s*0.4)*t0), (s*0.15, s*0.15 + (s*0.4)*t1)], fill=p.accent, width=lw)
+        # right edge
+        d.line([(s*0.55, s*0.15 + (s*0.4)*t0), (s*0.55, s*0.15 + (s*0.4)*t1)], fill=p.accent, width=lw)
+    # magnifier glass
+    cx, cy, r = s*0.62, s*0.62, s*0.18
+    circle(d, cx, cy, r, outline=p.stroke, lw=lw)
+    arrow(d, cx + r * 0.72, cy + r * 0.72, s*0.82, s*0.82, p.stroke, lw)
+
+@icon("view_selector")
+def draw_view_selector(d, cell, p):
+    """Small cube with one highlighted face."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    # isometric cube
+    c = s / 2
+    r = s * 0.25
+    t = (c, c - r * 0.7)
+    rt = (c + r, c - r * 0.35)
+    lt = (c - r, c - r * 0.35)
+    rm = (c + r, c + r * 0.15)
+    lm = (c - r, c + r * 0.15)
+    b = (c, c + r * 0.5)
+    # top face (highlighted)
+    d.polygon([lt, t, rt, rm, b, lm], fill=(*p.accent[:3], 100))
+    # outlines
+    polyline(d, [lt, t, rt, rm, b, lm, lt], p.stroke, lw)
+    # internal edge
+    d.line([lt, rm], fill=p.stroke, width=lw)
+    d.line([t, b], fill=p.stroke, width=lw)
+
+@icon("normal_to")
+def draw_normal_to(d, cell, p):
+    """Arrow perpendicular to a plane."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    # plane (parallelogram)
+    pts = [(s*0.15, s*0.65), (s*0.55, s*0.28), (s*0.75, s*0.48), (s*0.35, s*0.85)]
+    d.polygon(pts, fill=(*p.accent[:3], 60))
+    d.line([pts[0], pts[1], pts[2], pts[3], pts[0]], fill=p.stroke, width=lw)
+    # normal arrow perpendicular to plane (upward)
+    cx, cy = (pts[0][0] + pts[1][0] + pts[2][0] + pts[3][0])/4, \
+             (pts[0][1] + pts[1][1] + pts[2][1] + pts[3][1])/4
+    arrow(d, cx, cy, cx + s*0.15, cy - s*0.25, p.accent, lw*2)
 
 @icon("orientation")
 def draw_orientation(d, cell, p):
@@ -1549,6 +1726,201 @@ def draw_prompt_edit(d, cell, p):
     d.line([(s*0.22, s*0.56), (s*0.45, s*0.56)], fill=p.stroke, width=lw)
     # cursor
     d.line([(s*0.65, s*0.38), (s*0.65, s*0.62)], fill=p.accent, width=lw*2)
+
+# ---------------------------------------------------------------------------
+# C25: sketch flyout variant icons
+# ---------------------------------------------------------------------------
+
+@icon("rect_3pt_corner")
+def draw_rect_3pt_corner(d, cell, p):
+    """Rectangle with 3-point annotation dots on two corners + midpoint."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rectangle([s*0.15, s*0.25, s*0.85, s*0.75], outline=p.stroke, width=lw)
+    for x, y in [(s*0.15, s*0.25), (s*0.85, s*0.25), (s*0.85, s*0.75)]:
+        filled_circle(d, x, y, lw, p.accent)
+    # small 3 label hint (three dots in triangle)
+    for ox, oy in [(-0.06, -0.11), (0, -0.11), (0.06, -0.11)]:
+        filled_circle(d, s*0.5 + ox*s, s*0.13 + oy*s, lw*0.6, p.accent)
+
+@icon("rect_3pt_center")
+def draw_rect_3pt_center(d, cell, p):
+    """Rectangle with center + 3 control points."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rectangle([s*0.15, s*0.25, s*0.85, s*0.75], outline=p.stroke, width=lw)
+    filled_circle(d, s*0.5, s*0.5, lw, p.accent)
+    d.line([(s*0.15, s*0.5), (s*0.85, s*0.5)], fill=p.accent, width=lw)
+    d.line([(s*0.5, s*0.25), (s*0.5, s*0.75)], fill=p.accent, width=lw)
+    for ox, oy in [(-0.06, -0.11), (0, -0.11), (0.06, -0.11)]:
+        filled_circle(d, s*0.5 + ox*s, s*0.13 + oy*s, lw*0.6, p.accent)
+
+@icon("parallelogram")
+def draw_parallelogram(d, cell, p):
+    """Parallelogram shape."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    pts = [(s*0.30, s*0.25), (s*0.85, s*0.25), (s*0.70, s*0.75), (s*0.15, s*0.75)]
+    d.polygon(pts, fill=None, outline=p.stroke)
+    d.line([pts[0], pts[1], pts[2], pts[3], pts[0]], fill=p.stroke, width=lw)
+    filled_circle(d, pts[0][0], pts[0][1], lw, p.accent)
+
+@icon("circle_perimeter")
+def draw_circle_perimeter(d, cell, p):
+    """Circle with perimeter point instead of center point."""
+    s = cell * SS
+    lw = stroke_width(cell) * 2
+    cx, cy = s/2, s/2
+    r = s * 0.32
+    circle(d, cx, cy, r, outline=p.stroke, lw=lw)
+    # accent dot on perimeter (top)
+    filled_circle(d, cx, cy - r, lw, p.accent)
+    # two additional perimeter dots
+    filled_circle(d, cx + r*0.87, cy + r*0.5, lw*0.7, p.accent)
+    filled_circle(d, cx - r*0.87, cy + r*0.5, lw*0.7, p.accent)
+
+@icon("slot_ctr_str")
+def draw_slot_ctr_str(d, cell, p):
+    """Centerpoint straight slot — oblong with center dot."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rounded_rectangle([s*0.15, s*0.35, s*0.85, s*0.65], radius=int(s*0.15),
+                         outline=p.stroke, width=lw)
+    filled_circle(d, s*0.5, s*0.5, lw, p.accent)
+    d.line([(s*0.15, s*0.5), (s*0.85, s*0.5)], fill=p.accent, width=lw)
+
+@icon("slot_arc_3pt")
+def draw_slot_arc_3pt(d, cell, p):
+    """3-point arc slot — slot following a curved arc."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    # curved arc path
+    arc_segment(d, s*0.5, s*0.75, s*0.38, 210, 330, p.stroke, lw)
+    arc_segment(d, s*0.5, s*0.75, s*0.52, 210, 330, p.stroke, lw)
+    # end caps
+    for angle in [210, 330]:
+        a = math.radians(angle)
+        cx1 = s*0.5 + s*0.38*math.cos(a)
+        cy1 = s*0.75 + s*0.38*math.sin(a)
+        cx2 = s*0.5 + s*0.52*math.cos(a)
+        cy2 = s*0.75 + s*0.52*math.sin(a)
+        d.line([(cx1, cy1), (cx2, cy2)], fill=p.stroke, width=lw)
+    # 3-pt dots
+    for angle in [210, 270, 330]:
+        a = math.radians(angle)
+        cx = s*0.5 + s*0.45*math.cos(a)
+        cy = s*0.75 + s*0.45*math.sin(a)
+        filled_circle(d, cx, cy, lw*0.7, p.accent)
+
+@icon("slot_arc_ctr")
+def draw_slot_arc_ctr(d, cell, p):
+    """Centerpoint arc slot."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    arc_segment(d, s*0.5, s*0.75, s*0.38, 210, 330, p.stroke, lw)
+    arc_segment(d, s*0.5, s*0.75, s*0.52, 210, 330, p.stroke, lw)
+    for angle in [210, 330]:
+        a = math.radians(angle)
+        cx1 = s*0.5 + s*0.38*math.cos(a)
+        cy1 = s*0.75 + s*0.38*math.sin(a)
+        cx2 = s*0.5 + s*0.52*math.cos(a)
+        cy2 = s*0.75 + s*0.52*math.sin(a)
+        d.line([(cx1, cy1), (cx2, cy2)], fill=p.stroke, width=lw)
+    # center dot
+    filled_circle(d, s*0.5, s*0.75, lw, p.accent)
+
+@icon("spline_style")
+def draw_spline_style(d, cell, p):
+    """Style spline — smooth S-curve with control polygon."""
+    s = cell * SS
+    lw = stroke_width(cell) * 2
+    d.arc([s*0.15, s*0.1, s*0.65, s*0.6], start=200, end=360, fill=p.stroke, width=lw)
+    d.arc([s*0.35, s*0.4, s*0.85, s*0.9], start=20, end=180, fill=p.stroke, width=lw)
+    # control polygon (dashed-style in accent)
+    ctrl_pts = [(s*0.18, s*0.55), (s*0.38, s*0.22), (s*0.62, s*0.78), (s*0.82, s*0.45)]
+    for i in range(len(ctrl_pts) - 1):
+        d.line([ctrl_pts[i], ctrl_pts[i+1]], fill=p.accent, width=lw//2)
+    for pt in ctrl_pts:
+        filled_circle(d, pt[0], pt[1], lw*0.6, p.accent)
+
+@icon("spline_surface")
+def draw_spline_surface(d, cell, p):
+    """Spline on surface — S-curve overlaid on a plane parallelogram."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    pts = [(s*0.1, s*0.65), (s*0.45, s*0.28), (s*0.9, s*0.38), (s*0.55, s*0.75)]
+    d.polygon(pts, fill=(*p.stroke[:3], 30))
+    d.line([pts[0], pts[1], pts[2], pts[3], pts[0]], fill=p.stroke, width=lw)
+    # spline over it
+    d.arc([s*0.20, s*0.18, s*0.65, s*0.62], start=200, end=360, fill=p.accent, width=lw*2)
+    d.arc([s*0.38, s*0.40, s*0.82, s*0.84], start=20, end=180, fill=p.accent, width=lw*2)
+
+@icon("spline_equation")
+def draw_spline_equation(d, cell, p):
+    """Equation-driven curve — smooth curve with '=' annotation."""
+    s = cell * SS
+    lw = stroke_width(cell) * 2
+    d.arc([s*0.15, s*0.1, s*0.65, s*0.6], start=200, end=360, fill=p.stroke, width=lw)
+    d.arc([s*0.35, s*0.4, s*0.85, s*0.9], start=20, end=180, fill=p.stroke, width=lw)
+    # '=' sign top-right
+    d.line([(s*0.70, s*0.18), (s*0.88, s*0.18)], fill=p.accent, width=lw//2)
+    d.line([(s*0.70, s*0.28), (s*0.88, s*0.28)], fill=p.accent, width=lw//2)
+
+@icon("ellipse_partial")
+def draw_ellipse_partial(d, cell, p):
+    """Partial ellipse arc."""
+    s = cell * SS
+    lw = stroke_width(cell) * 2
+    # draw only part of the ellipse
+    d.arc([s*0.12, s*0.28, s*0.88, s*0.72], start=30, end=250, fill=p.stroke, width=lw)
+    # endpoints
+    for angle in [30, 250]:
+        a = math.radians(angle)
+        cx = s*0.5 + s*0.38*math.cos(a)
+        cy = s*0.5 + s*0.22*math.sin(a)
+        filled_circle(d, cx, cy, lw*0.7, p.accent)
+
+@icon("parabola")
+def draw_parabola(d, cell, p):
+    """Parabolic curve — U-shape open upward."""
+    s = cell * SS
+    lw = stroke_width(cell) * 2
+    pts = []
+    steps = 20
+    for i in range(steps + 1):
+        t = (i / steps) * 2 - 1  # -1 to 1
+        x = s*0.5 + t * s*0.35
+        y = s*0.75 - t*t * s*0.50
+        pts.append((x, y))
+    for i in range(len(pts) - 1):
+        d.line([pts[i], pts[i+1]], fill=p.stroke, width=lw)
+    # focal point
+    filled_circle(d, s*0.5, s*0.50, lw*0.7, p.accent)
+    # axis
+    d.line([(s*0.5, s*0.15), (s*0.5, s*0.78)], fill=p.accent, width=lw//2)
+
+@icon("conic")
+def draw_conic(d, cell, p):
+    """Conic section — ellipse with rho value indicator."""
+    s = cell * SS
+    lw = stroke_width(cell) * 2
+    # slightly asymmetric ellipse to suggest conic
+    d.ellipse([s*0.15, s*0.25, s*0.85, s*0.75], outline=p.stroke, width=lw)
+    # diagonal cutting plane line (suggesting conic section)
+    d.line([(s*0.15, s*0.22), (s*0.85, s*0.78)], fill=p.accent, width=lw//2)
+    filled_circle(d, s*0.5, s*0.5, lw*0.7, p.accent)
+
+@icon("hide_show_eye")
+def draw_hide_show_eye(d, cell, p):
+    """Eye — the HUD Hide/Show Items visibility toggle."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    # almond eye outline: two arcs forming the lids
+    d.arc([s*0.10, s*0.18, s*0.90, s*0.98], start=200, end=340, fill=p.stroke, width=lw)
+    d.arc([s*0.10, s*0.02, s*0.90, s*0.82], start=20,  end=160, fill=p.stroke, width=lw)
+    # iris + pupil
+    circle(d, s*0.5, s*0.5, s*0.16, outline=p.stroke, lw=lw)
+    filled_circle(d, s*0.5, s*0.5, s*0.06, p.accent)
 
 # ---------------------------------------------------------------------------
 # MISSING placeholder

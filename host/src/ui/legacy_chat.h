@@ -6,8 +6,8 @@ struct AppState;
 
 namespace ui {
 
-// Draw the Design dockable window if state.showDesign. `busy` whether a job is running,
-// `canRun` whether new jobs can be launched (worker started and not busy).
-void drawDesignPanel(AppState& state, bool busy, bool canRun);
+// Draw the consolidated AI panel (Design / Activity / Console tabs + workflow control strip).
+// `busy` whether a job is running, `canRun` whether new jobs can be launched.
+void drawAIPanel(AppState& state, bool busy, bool canRun);
 
 }  // namespace ui

@@ -80,7 +80,11 @@ def make_tile(px=256, radius_frac=0.235, with_spark=True):
     return tile.resize((px, px), Image.LANCZOS)
 
 
-def make_wordmark(height=200):
+# "-CAD" text color for the light-theme wordmark (near-black slate, matches palette.text).
+SLATE = (30, 35, 50)
+
+
+def make_wordmark(height=200, cad_color=WHITE):
     s = height * SS
     cube_r = s * 0.30
     pad = s * 0.16
@@ -98,7 +102,7 @@ def make_wordmark(height=200):
     tx = pad + cube_w + pad * 0.9
     ty = s * 0.5 - s * 0.30
     d.text((tx, ty), seg_ai, font=font, fill=ACCENT)
-    d.text((tx + w_ai, ty), seg_cad, font=font, fill=WHITE)
+    d.text((tx + w_ai, ty), seg_cad, font=font, fill=cad_color)
     target_h = height
     target_w = int(total_w * target_h / s)
     return img.resize((target_w, target_h), Image.LANCZOS)
@@ -107,8 +111,9 @@ def make_wordmark(height=200):
 def main():
     make_tile(256).save(HERE / "logo_icon.png")
     make_tile(48).save(HERE / "logo_window.png")
-    make_wordmark(200).save(HERE / "logo_wordmark.png")
-    print("wrote logo_icon.png, logo_window.png, logo_wordmark.png to", HERE)
+    make_wordmark(200).save(HERE / "logo_wordmark.png")              # dark theme (white "-CAD")
+    make_wordmark(200, cad_color=SLATE).save(HERE / "logo_wordmark_dark.png")  # light theme (slate "-CAD")
+    print("wrote logo_icon.png, logo_window.png, logo_wordmark.png, logo_wordmark_dark.png to", HERE)
 
 
 if __name__ == "__main__":

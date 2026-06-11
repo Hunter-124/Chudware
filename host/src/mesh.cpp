@@ -1,10 +1,13 @@
 #include "mesh.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace {
 // Quantize a position to weld coincident vertices (STL stores no shared topology).
@@ -28,6 +31,14 @@ Key quant(float x, float y, float z) {
             static_cast<int64_t>(std::llround(y * s)),
             static_cast<int64_t>(std::llround(z * s))};
 }
+
+// Crease threshold shared by smoothing-group normal computation AND feature-edge extraction:
+// adjacent triangles whose face normals differ by more than this angle are considered a crease
+// (their shared vertices are NOT smoothed together, and the shared edge is drawn as feature line).
+// 30 deg cleanly separates fillet curvature from the planar faces it blends into, while still
+// smoothing the many small facets within a single cylinder/fillet.
+constexpr float kCreaseDeg = 30.0f;
+const float kCreaseCos = std::cos(kCreaseDeg * 3.14159265f / 180.0f);
 }  // namespace
 
 bool loadBinarySTL(const std::string& path, Mesh& out, std::string& err) {
@@ -50,27 +61,33 @@ bool loadBinarySTL(const std::string& path, Mesh& out, std::string& err) {
     }
 
     out = Mesh{};
+
+    // ------------------------------------------------------------------
+    // Pass 1: read triangles, weld vertices by position (topology only), and accumulate the
+    // per-triangle geometric face normal (area-weighted) and a normalized face normal per tri.
+    // The welded set drives adjacency (for crease detection + feature edges); the *render* mesh
+    // built in pass 2 splits welded vertices back apart at creases so a fillet's curvature never
+    // bleeds across a crease onto an adjacent planar face.
+    // ------------------------------------------------------------------
     std::unordered_map<Key, uint32_t, KeyHash> lut;
-    std::vector<Vec3> accNormals;  // accumulated (area-weighted) normals per unique vertex
+    std::vector<Vec3> weldPos;                 // unique welded positions
+    std::vector<uint32_t> triWeld;             // 3 welded indices per triangle
+    std::vector<Vec3> triFaceN;                // normalized face normal per triangle
+    triWeld.reserve(size_t(nTris) * 3);
+    triFaceN.reserve(nTris);
 
     Vec3 mn(std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
             std::numeric_limits<float>::max());
     Vec3 mx(-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(),
             -std::numeric_limits<float>::max());
 
-    auto addVertex = [&](float x, float y, float z, const Vec3& fn) -> uint32_t {
+    auto weld = [&](float x, float y, float z) -> uint32_t {
         Key k = quant(x, y, z);
         auto it = lut.find(k);
-        uint32_t idx;
-        if (it == lut.end()) {
-            idx = static_cast<uint32_t>(out.positions.size() / 3);
-            lut.emplace(k, idx);
-            out.positions.insert(out.positions.end(), {x, y, z});
-            accNormals.push_back(fn);
-        } else {
-            idx = it->second;
-            accNormals[idx] = accNormals[idx] + fn;  // area-weighted (fn not normalized yet)
-        }
+        if (it != lut.end()) return it->second;
+        uint32_t idx = static_cast<uint32_t>(weldPos.size());
+        lut.emplace(k, idx);
+        weldPos.emplace_back(x, y, z);
         if (x < mn.x) mn.x = x; if (y < mn.y) mn.y = y; if (z < mn.z) mn.z = z;
         if (x > mx.x) mx.x = x; if (y > mx.y) mx.y = y; if (z > mx.z) mx.z = z;
         return idx;
@@ -85,17 +102,102 @@ bool loadBinarySTL(const std::string& path, Mesh& out, std::string& err) {
             return false;
         }
         Vec3 a(buf[3], buf[4], buf[5]), b(buf[6], buf[7], buf[8]), c(buf[9], buf[10], buf[11]);
-        Vec3 fn = cross(b - a, c - a);  // length proportional to triangle area => area weighting
-        uint32_t ia = addVertex(a.x, a.y, a.z, fn);
-        uint32_t ib = addVertex(b.x, b.y, b.z, fn);
-        uint32_t ic = addVertex(c.x, c.y, c.z, fn);
-        out.indices.insert(out.indices.end(), {ia, ib, ic});
+        uint32_t ia = weld(a.x, a.y, a.z);
+        uint32_t ib = weld(b.x, b.y, b.z);
+        uint32_t ic = weld(c.x, c.y, c.z);
+        triWeld.insert(triWeld.end(), {ia, ib, ic});
+        triFaceN.push_back(normalize(cross(b - a, c - a)));
     }
     std::fclose(f);
 
-    out.normals.resize(out.positions.size());
-    for (size_t i = 0; i < accNormals.size(); ++i) {
-        Vec3 n = normalize(accNormals[i]);
+    const size_t nFaceTris = triFaceN.size();
+
+    // ------------------------------------------------------------------
+    // Group triangles into smoothing groups via a union-find over shared welded edges: two
+    // triangles sharing an edge are unioned iff the dihedral angle between their face normals is
+    // below the crease threshold. The union therefore floods across a smoothly-varying surface (a
+    // cylinder, a fillet) — even all the way around a 360 deg cylinder, because each step is small —
+    // but STOPS at every crease (fillet->plane, cylinder->cap). A welded vertex shared by N groups
+    // is later split into N render vertices, so curvature on one side of a crease never bleeds onto
+    // the planar face on the other side. Build is O(n) amortized (near-linear union-find).
+    // ------------------------------------------------------------------
+    std::vector<uint32_t> uf(nFaceTris);
+    for (uint32_t i = 0; i < nFaceTris; ++i) uf[i] = i;
+    std::function<uint32_t(uint32_t)> findRoot = [&](uint32_t a) {
+        while (uf[a] != a) { uf[a] = uf[uf[a]]; a = uf[a]; }
+        return a;
+    };
+    auto unite = [&](uint32_t a, uint32_t b) {
+        uint32_t ra = findRoot(a), rb = findRoot(b);
+        if (ra != rb) uf[ra] = rb;
+    };
+
+    // Find triangles adjacent across each welded edge and union the non-crease pairs.
+    {
+        struct EdgeAdj { uint32_t tri; };
+        std::unordered_map<uint64_t, uint32_t> firstTriOnEdge;  // edge -> tri index (+1, 0=empty)
+        firstTriOnEdge.reserve(nFaceTris * 3);
+        auto ekey = [](uint32_t a, uint32_t b) -> uint64_t {
+            if (a > b) std::swap(a, b);
+            return (uint64_t(a) << 32) | uint64_t(b);
+        };
+        for (uint32_t t = 0; t < nFaceTris; ++t) {
+            uint32_t v[3] = {triWeld[t * 3], triWeld[t * 3 + 1], triWeld[t * 3 + 2]};
+            uint32_t pairs[3][2] = {{v[0], v[1]}, {v[1], v[2]}, {v[2], v[0]}};
+            for (auto& e : pairs) {
+                uint64_t k = ekey(e[0], e[1]);
+                auto it = firstTriOnEdge.find(k);
+                if (it == firstTriOnEdge.end()) {
+                    firstTriOnEdge.emplace(k, t + 1);
+                } else {
+                    uint32_t other = it->second - 1;
+                    // Manifold edge shared by exactly two tris: smooth across it if not a crease.
+                    if (dot(triFaceN[t], triFaceN[other]) >= kCreaseCos) unite(t, other);
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Pass 2: build the render mesh. Split each welded vertex per distinct smoothing-group root that
+    // touches it; accumulate area-weighted normals from only that group's triangles. Flat faces
+    // collapse to a single constant normal -> zero streaks; smooth surfaces keep one shared normal.
+    // ------------------------------------------------------------------
+    out.positions.reserve(weldPos.size() * 3);
+    out.normals.reserve(weldPos.size() * 3);
+    out.indices.resize(nFaceTris * 3);
+
+    // Per welded vertex: map smoothing-group root -> emitted split-vertex index.
+    std::vector<std::unordered_map<uint32_t, uint32_t>> vgroups(weldPos.size());
+    std::vector<Vec3> accN;  // accumulated area-weighted normal per emitted vertex
+    accN.reserve(weldPos.size());
+
+    auto emitCorner = [&](uint32_t wv, uint32_t root) -> uint32_t {
+        auto& groups = vgroups[wv];
+        auto it = groups.find(root);
+        if (it != groups.end()) return it->second;
+        uint32_t idx = static_cast<uint32_t>(out.positions.size() / 3);
+        const Vec3& p = weldPos[wv];
+        out.positions.insert(out.positions.end(), {p.x, p.y, p.z});
+        out.normals.insert(out.normals.end(), {0.0f, 0.0f, 0.0f});  // filled below
+        accN.emplace_back(0.0f, 0.0f, 0.0f);
+        groups.emplace(root, idx);
+        return idx;
+    };
+
+    for (uint32_t t = 0; t < nFaceTris; ++t) {
+        uint32_t root = findRoot(t);
+        uint32_t i0 = triWeld[t * 3], i1 = triWeld[t * 3 + 1], i2 = triWeld[t * 3 + 2];
+        Vec3 areaN = cross(weldPos[i1] - weldPos[i0], weldPos[i2] - weldPos[i0]);  // ~2*area
+        for (int k = 0; k < 3; ++k) {
+            uint32_t wv = triWeld[t * 3 + k];
+            uint32_t e = emitCorner(wv, root);
+            out.indices[t * 3 + k] = e;
+            accN[e] = accN[e] + areaN;
+        }
+    }
+    for (size_t i = 0; i < accN.size(); ++i) {
+        Vec3 n = normalize(accN[i]);
         out.normals[i * 3 + 0] = n.x;
         out.normals[i * 3 + 1] = n.y;
         out.normals[i * 3 + 2] = n.z;
@@ -106,9 +208,9 @@ bool loadBinarySTL(const std::string& path, Mesh& out, std::string& err) {
     out.center = (mn + mx) * 0.5f;
     out.radius = std::max(0.001f, length(mx - mn) * 0.5f);
 
-    // Feature edges: boundary edges, plus edges where the two adjacent faces meet at an
-    // angle sharper than the crease threshold. Gives clean CAD line work without the
-    // triangulation noise of a full wireframe.
+    // Feature edges: boundary edges, plus edges where the two adjacent faces meet at an angle
+    // sharper than the (shared) crease threshold. Gives clean CAD line work without the
+    // triangulation noise of a full wireframe. Computed on the welded set so an edge appears once.
     struct EdgeRec {
         Vec3 n0, n1;
         int count = 0;
@@ -118,11 +220,9 @@ bool loadBinarySTL(const std::string& path, Mesh& out, std::string& err) {
         if (a > b) std::swap(a, b);
         return (uint64_t(a) << 32) | uint64_t(b);
     };
-    auto pos = [&](uint32_t i) { return Vec3(out.positions[i * 3], out.positions[i * 3 + 1],
-                                             out.positions[i * 3 + 2]); };
-    for (size_t t = 0; t + 2 < out.indices.size(); t += 3) {
-        uint32_t i0 = out.indices[t], i1 = out.indices[t + 1], i2 = out.indices[t + 2];
-        Vec3 fn = normalize(cross(pos(i1) - pos(i0), pos(i2) - pos(i0)));
+    for (size_t t = 0; t < nFaceTris; ++t) {
+        uint32_t i0 = triWeld[t * 3], i1 = triWeld[t * 3 + 1], i2 = triWeld[t * 3 + 2];
+        const Vec3& fn = triFaceN[t];
         uint32_t tri[3][2] = {{i0, i1}, {i1, i2}, {i2, i0}};
         for (auto& e : tri) {
             EdgeRec& r = edges[ekey(e[0], e[1])];
@@ -130,13 +230,13 @@ bool loadBinarySTL(const std::string& path, Mesh& out, std::string& err) {
             r.count++;
         }
     }
-    const float creaseCos = std::cos(25.0f * 3.14159265f / 180.0f);
     for (auto& kv : edges) {
         const EdgeRec& r = kv.second;
-        bool feature = (r.count == 1) || (r.count == 2 && dot(r.n0, r.n1) < creaseCos);
+        bool feature = (r.count == 1) || (r.count == 2 && dot(r.n0, r.n1) < kCreaseCos);
         if (!feature) continue;
         uint32_t a = uint32_t(kv.first >> 32), b = uint32_t(kv.first & 0xffffffff);
-        Vec3 pa = pos(a), pb = pos(b);
+        const Vec3& pa = weldPos[a];
+        const Vec3& pb = weldPos[b];
         out.edgeLines.insert(out.edgeLines.end(), {pa.x, pa.y, pa.z, pb.x, pb.y, pb.z});
     }
     return !out.indices.empty();

@@ -1,5 +1,24 @@
 # Landed-card integration notes (orchestrator log)
 
+## C20b + C22b (wave C, combined commit)
+- AsmPanels: Insert Component, Mate PM (auto-suggest by picked surf pair, Aligned/Anti flip w/
+  "seat-on-face = Anti" hint, DimField for distance/angle), Exploded slider (view-only state,
+  reload SAME aicm path), Interference window, BOM (qty rollup by source, CSV). DocMirror gained
+  newAssembly() + resolvePickAsm() (returns {selector, component}). Assembly ribbon tab appended
+  at index 4 (existing tab indices stable). Assembly tree: (f) prefix + Mates folder w/ context.
+- ActivityPanel: live run->stage->attempt tree from agent_run_v2 events (routed through jobs
+  event queue with "orch_" prefix) + events.jsonl replay combo; attempt nodes expose role,
+  prompt_file (click -> opens Agents editor), context size, duration, verdict chips, raw output.
+  Settings "Agents" tab: per-role editor, Save->override_path, Reset, char-count diff badge.
+  Design panel "Use orchestrator (v2)" checkbox (agent_v2 setting; needs an open doc); after a
+  v2 run, doc_rebuild refreshes tree+mesh. Fixture docs/contracts/fixtures/mock_replies_v2.json.
+- AI_CAD_SHOT now also: asm (asserts |peg z-15|<0.5), activity. ALWAYS run shots with
+  AI_CAD_PROVIDER=mock.
+- C24 DEBTS (from both agents): dock the floating asm dialogs (dockspace NoBringToFrontOnFocus
+  hides floating windows behind the central node — dock them or use the PM slot), viewport-drag
+  move-component, asm pattern op (engine gap), DocMirror::resync() convenience, prompt-editor
+  full diff, run-list human timestamps.
+
 ## C20-engine + C22a (wave B engine; both agents died hung — orchestrator salvaged + fixed)
 - ROOT CAUSE of the hangs + test flakes: agent/config.py resolved provider as
   config.json BEFORE the AI_CAD_PROVIDER env var, so "mock" subprocess tests silently called

@@ -10,6 +10,7 @@
 #include "imgui.h"
 
 #include "legacy_chat.h"
+#include "activity_panel.h"  // C22b: for castind st.activityPanel
 
 #include "../core/app_state.h"
 #include "../core/jobs.h"
@@ -291,6 +292,17 @@ void drawDesignPanel(AppState& st, bool busy, bool canRun) {
                     std::strncpy(st.prompt.data(), kExamples[ei], st.prompt.size() - 1);
             }
             ImGui::Dummy(ImVec2(0, 2));
+            // --- C22b: "Use orchestrator (v2)" checkbox (only when a doc is open) ---
+            bool hasDoc = st.docMirror.hasDoc();
+            ImGui::Checkbox("Use orchestrator (v2)", &st.agentV2);
+            if (hasDoc) {
+                dimText("Routes to the deterministic planner/modeler/reviewer pipeline (M9).");
+            } else {
+                dimText("Open or create a part first to use v2.");
+                st.agentV2 = false;  // v2 requires an open doc
+            }
+            // --- end C22b marked block ---
+
             bool canStart = canRun && st.prompt[0];
             if (!canStart) ImGui::BeginDisabled();
             bool goDesign = primaryButton("Design with AI", ImVec2(-1, 38));
@@ -303,8 +315,22 @@ void drawDesignPanel(AppState& st, bool busy, bool canRun) {
                 st.addLog("[..] designing: " + p);
                 st.status = "Designing...";
                 st.statusKind = 0;
-                launchJob(st.worker, st.job, JOB_DESIGN, p, /*reset=*/true,
-                          st.settings.planMode);  // new part = fresh session
+                // --- C22b: route to agent_run_v2 when v2 is on and a doc is open ---
+                if (st.agentV2 && st.docMirror.hasDoc()) {
+                    // Launch agent_run_v2 on a background thread; events are routed through
+                    // the existing job.evMtx path using the new "orch_*" kinds so the
+                    // main-thread drain routes them to the ActivityPanel.
+                    st.agentV2Running = true;
+                    if (st.activityPanel) {
+                        auto* ap = static_cast<ui::ActivityPanel*>(st.activityPanel);
+                        ap->clearLive();
+                    }
+                    launchAgentRunV2(st.worker, st.job, p, st.docMirror.docId());
+                } else {
+                    launchJob(st.worker, st.job, JOB_DESIGN, p, /*reset=*/true,
+                              st.settings.planMode);  // new part = fresh session
+                }
+                // --- end C22b ---
             }
         } else {
             // ----- conversation takeover (bounded so the code/build section below stays

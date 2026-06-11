@@ -64,6 +64,45 @@ bool DocMirror::newPart(WorkerClient& w, std::string& err) {
     return true;
 }
 
+// --- C20b: assembly support ---
+
+bool DocMirror::newAssembly(WorkerClient& w, std::string& err) {
+    nlohmann::json res;
+    if (!w.call("doc_new", {{"kind", "assembly"}}, res, err)) return false;
+    if (res.contains("code")) { err = jstr(res, "message"); return false; }
+    docId_ = jstr(res, "doc_id");
+    revision_ = jint(res, "revision");
+    if (res.contains("tree") && res["tree"].is_object()) tree_ = res["tree"];
+    else tree_ = {};
+    featureStatus_ = {};
+    notify();
+    return true;
+}
+
+std::string DocMirror::resolvePickAsm(WorkerClient& w, uint32_t body_id,
+                                      const std::string& kind, uint32_t topo_id,
+                                      std::string& component, std::string& err) {
+    component.clear();
+    if (docId_.empty()) { err = "no document open"; return {}; }
+    nlohmann::json res;
+    nlohmann::json params = {
+        {"doc_id", docId_},
+        {"revision", revision_},
+        {"body_id", body_id},
+        {"kind", kind},
+        {"topo_id", (int)topo_id}
+    };
+    if (!w.call("doc_resolve_pick", params, res, err)) return {};
+    if (res.contains("code")) {
+        err = jstr(res, "message");
+        if (jstr(res, "code") == "stale_revision") resyncTree(w);
+        return {};
+    }
+    component = jstr(res, "component");
+    if (res.contains("selector")) return res["selector"].dump();
+    return {};
+}
+
 OpsResponse DocMirror::applyOps(WorkerClient& w, const nlohmann::json& ops) {
     OpsResponse r;
     nlohmann::json res;

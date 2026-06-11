@@ -301,7 +301,7 @@ struct AppState {
 
     // ---- ribbon (C14) ----
     bool showRibbon = true;        // View > Ribbon visibility toggle
-    int  ribbonTab  = 0;           // 0=Features 1=Sketch 2=Evaluate 3=Simulation
+    int  ribbonTab  = 0;           // 0=Features 1=Sketch 2=Evaluate 3=Simulation 4=Assembly (C20b)
     bool showFeatureTree = true;   // View > FeatureManager (C16)
 
     // ---- PropertyManager (C17) — occupies the tree dock slot while a command is active ----
@@ -329,6 +329,21 @@ struct AppState {
     bool wantSketch = false;           // AI_CAD_SHOT=sketch scripted flow
     bool sketchShotDone = false;       // guard so the sketch scenario runs once per shot
 
+    // ---- AsmPanels (C20b) — assembly windows/forms; opaque like the PropertyManager ----
+    void* asmPanels = nullptr;         // ui::AsmPanels* (owned by run_gui)
+    bool wantAsm = false;              // AI_CAD_SHOT=asm scripted assembly flow
+    bool asmShotDone = false;          // guard so the asm scenario runs once per shot
+
+    // ---- C22b: Activity panel + prompt editor + orchestrator wiring ----
+    bool showActivityPanel = true;          // View > Activity dock visibility
+    bool agentV2 = true;                    // "Use orchestrator (v2)" checkbox in Design panel
+    std::string pendingPromptRole;          // when non-empty, Settings > Agents tab opens on this role
+    void* activityPanel = nullptr;          // ui::ActivityPanel* (owned by run_gui; opaque here)
+    // Live status line for the v2 orchestrator run, shown in the chat area
+    std::string agentV2Status;              // e.g. "PLAN > planner attempt 1..."
+    bool agentV2Running = false;            // a v2 run is in flight (blocks concurrent runs)
+    // --- end C22b ---
+
     // ---- screenshot-mode flags (set from AI_CAD_SHOT in run_gui) ----
     bool wantSettings = false, wantChat = false, wantAssembly = false, wantPlan = false;
     bool wantPick   = false;  // C15: load box.aicm, simulate a center pick, print + screenshot
@@ -336,6 +351,8 @@ struct AppState {
     bool pickPrinted = false;  // guard so the "pick:" stdout line prints exactly once
     bool wantM1 = false;       // C17: AI_CAD_SHOT=m1 scripted integration scenario
     bool m1ShotDone = false;   // guard so the m1 scenario runs exactly once per shot
+    bool wantActivity = false;  // C22b: AI_CAD_SHOT=activity scripted orchestrator run + activity panel
+    bool activityShotDone = false; // guard so the activity scenario runs exactly once
 
     // ---- the run_gui lambdas, now methods ----
     void addLog(const std::string& s);

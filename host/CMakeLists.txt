@@ -74,6 +74,12 @@ add_executable(AI-CAD
   src/ui/legend.cpp
   src/ui/evaluate_dialogs.cpp
   # --- end C19 ---
+  # --- C20b: assembly UI panels ---
+  src/ui/asm_panels.cpp
+  # --- end C20b ---
+  # --- C22b: Activity panel + prompt editor + orchestrator wiring ---
+  src/ui/activity_panel.cpp
+  # --- end C22b ---
   src/worker_client.cpp
   src/bootstrap.cpp
   src/ui_theme.cpp

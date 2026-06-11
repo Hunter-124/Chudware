@@ -1,0 +1,7 @@
+{
+  "intake": ["```json\n{\"object\": \"bracket\", \"key_dims\": {\"length\": 40, \"width\": 30, \"height\": 10}, \"features\": [\"fillet top edge\"], \"constraints\": []}\n```"],
+  "planner": ["```json\n{\"name\": \"bracket\", \"summary\": \"one filleted plate\", \"parts\": [{\"name\": \"plate\", \"purpose\": \"body\", \"dimensions\": {\"length\": 40, \"width\": 30, \"height\": 10}, \"features\": [\"3mm fillet on a top edge\"]}], \"fit\": \"\"}\n```"],
+  "modeler": ["```json\n[{\"op\": \"add_feature\", \"feature\": {\"type\": \"box\", \"name\": \"Box1\", \"params\": {\"length\": {\"value\": 40, \"expr\": null}, \"width\": {\"value\": 30, \"expr\": null}, \"height\": {\"value\": 10, \"expr\": null}}}}, {\"op\": \"add_feature\", \"feature\": {\"type\": \"fillet\", \"name\": \"Fillet1\", \"params\": {\"radius\": {\"value\": 3, \"expr\": null}}, \"refs\": {\"edges\": [{\"kind\": \"edge\", \"surf\": \"line\", \"centroid\": [20, 0, 5], \"axis\": [0, 1, 0], \"area_or_len\": 30, \"owner_feature\": \"$0\", \"hint_index\": 0}]}}}]\n```"],
+  "reviewer": ["```json\n{\"done\": true, \"issues\": []}\n```"],
+  "memory": ["```json\n{\"summary\": \"built a 40x30x10 filleted bracket\", \"decisions\": [\"fillet r=3 on top edge\"], \"open_issues\": []}\n```"]
+}

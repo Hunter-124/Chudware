@@ -108,3 +108,68 @@ void launchJob(WorkerClient& w, JobState& job, int kind, std::string payload, bo
         job.running = false;
     }).detach();
 }
+
+// --- C22b: agent_run_v2 launcher ---
+// Runs agent_run_v2 on a background thread. Orchestrator events arrive via the EventFn
+// callback with kind = "run_started" / "stage_started" / etc.  We push them into
+// job.events with an "orch_" prefix (kind field) so the main thread drain can distinguish
+// them from legacy iteration events and route them to the ActivityPanel.
+void launchAgentRunV2(WorkerClient& w, JobState& job,
+                      const std::string& request, const std::string& docId) {
+    if (job.running.exchange(true)) return;
+    job.ready = false;
+    job.kind = JOB_DESIGN;
+    {
+        std::lock_guard<std::mutex> lk(job.mtx);
+        job.error.clear(); job.stl.clear(); job.info.clear();
+        job.errorIsCad = false;
+        job.converged = true; job.stopReason.clear();
+    }
+    { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
+
+    std::thread([&w, &job, request, docId]() {
+        nlohmann::json result;
+        std::string err;
+
+        // The onEvent callback is called on the worker thread for each streamed event.
+        // We package it as an AgentEvent with kind = "orch_<original_kind>" so the GL thread
+        // drain (in app.cpp) can identify and route it to the ActivityPanel.
+        WorkerClient::EventFn onEvent = [&job](const nlohmann::json& d) {
+            AgentEvent e;
+            // The worker emits events.md §3 kinds; we prefix them "orch_" for routing.
+            std::string origKind = jstr(d, "kind");
+            e.kind = "orch_" + origKind;
+            // Carry the full event data in the "text" field as JSON for the panel to parse.
+            e.text = d.dump();
+            // Also expose a human-readable phase hint in notes.
+            std::string stage = jstr(d, "stage");
+            std::string role  = jstr(d, "role");
+            if (origKind == "stage_started")
+                e.notes = stage + " > " + role + " attempt " +
+                          std::to_string(jint(d, "attempt") + 1) + "...";
+            else if (origKind == "run_finished")
+                e.notes = "run " + jstr(d, "status");
+            std::lock_guard<std::mutex> lk(job.evMtx);
+            job.events.push_back(std::move(e));
+        };
+
+        bool ok = w.call("agent_run_v2",
+                         {{"request", request}, {"doc_id", docId}},
+                         result, err, 900000, onEvent);
+        std::lock_guard<std::mutex> lk(job.mtx);
+        if (!ok) {
+            job.error = err;
+            job.errorIsCad = false;
+        } else {
+            // agent_run_v2 returns {status, stop_reason, run_id, revision}.
+            // The doc was rebuilt by the orchestrator; the DocMirror listener will be
+            // called next time the GL thread calls doc_tree (or the existing listener path
+            // fires via the worker's rebuild). The simplest correct path: on job ready,
+            // the GL thread calls docMirror.open() or resync (C22b: see app.cpp drain).
+            job.converged = (result.value("status", "") == "done");
+            job.stopReason = result.value("stop_reason", "");
+        }
+        job.ready = true;
+        job.running = false;
+    }).detach();
+}

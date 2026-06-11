@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -241,6 +242,143 @@ static FStatus getFeatureStatus(const nlohmann::json& statusArr, const std::stri
     return fs;
 }
 
+// ---- C20b: assembly tree (components + Mates folder) ----
+// Renders an aicad.asm/1 doc: each component as a "(f)"-fixed-marked row (SolidWorks), then a
+// Mates folder listing each mate as "Concentric1 (base<->peg)" with a suppress/delete context
+// menu (asm_edit_mate / asm_delete_mate). Returns nothing; mutates the doc via DocMirror.
+static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
+                             const nlohmann::json& statusArr) {
+    const auto& pal = ui::palette;
+
+    // Map component id -> display name (for the mate captions).
+    auto compName = [&](const std::string& cid) -> std::string {
+        if (tree.contains("components") && tree["components"].is_array())
+            for (const auto& c : tree["components"])
+                if (c.is_object() && jfld(c, "id") == cid) {
+                    std::string n = jfld(c, "name");
+                    return n.empty() ? cid : n;
+                }
+        return cid;
+    };
+
+    auto reloadFrom = [&](const core::OpsResponse& r) {
+        if (r.ok && !r.aicm_path.empty()) {
+            std::string le; st.loadDocMesh(r.aicm_path, le);
+            if (!le.empty()) st.addLog("[err] loadDocMesh: " + le);
+        } else if (!r.ok) {
+            st.addLog("[err] mate op: " + r.error_message);
+        }
+    };
+
+    // ---- components ----
+    int ci = 0;
+    if (tree.contains("components") && tree["components"].is_array()) {
+        for (const auto& c : tree["components"]) {
+            if (!c.is_object()) { ++ci; continue; }
+            std::string cid   = jfld(c, "id");
+            std::string cname = jfld(c, "name");
+            if (cname.empty()) cname = cid;
+            bool fixed = jftbool(c, "fixed");
+            bool suppressed = jftbool(c, "suppressed");
+            // Component vs subassembly icon (we only have parts for now; subassemblies = C24).
+            bool isAsm = false;
+            if (c.contains("source") && c["source"].is_object()) {
+                std::string p = jfld(c["source"], "path");
+                std::string low = p; for (auto& ch : low) ch = (char)std::tolower((unsigned char)ch);
+                isAsm = low.find(".asmstep") != std::string::npos;  // reserved; none today
+            }
+            FStatus fs = getFeatureStatus(statusArr, cid);
+
+            if (ci % 2 == 0) {
+                ImVec2 rowMin = ImGui::GetCursorScreenPos();
+                ImVec2 rowMax(rowMin.x + ImGui::GetContentRegionAvail().x,
+                              rowMin.y + ImGui::GetTextLineHeightWithSpacing());
+                ImGui::GetWindowDrawList()->AddRectFilled(rowMin, rowMax,
+                    Palette::toU32(pal.treeRowAlt));
+            }
+            treeIcon(isAsm ? "assembly" : "part", isAsm ? "[A]" : "[P]", 16.0f);
+            ImGui::SameLine(0, 4);
+            // SolidWorks marks fixed components with a "(f)" prefix.
+            std::string label = (fixed ? "(f) " : "") + cname;
+            if (suppressed) label += " [S]";
+            ImGuiTreeNodeFlags lf = ImGuiTreeNodeFlags_Leaf |
+                ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanFullWidth;
+            ImGui::TreeNodeEx((label + "##comp_" + cid).c_str(), lf);
+            featureBadge(fs.ok, !fs.error.empty(), fs.error, fs.dangling);
+            ++ci;
+        }
+    }
+
+    ImGui::Separator();
+
+    // ---- Mates folder ----
+    treeIcon("mates_folder", "[M]", 16.0f);
+    ImGui::SameLine(0, 4);
+    ImGuiTreeNodeFlags ff = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth;
+    if (ImGui::TreeNodeEx("Mates##mates_folder", ff)) {
+        if (tree.contains("mates") && tree["mates"].is_array()) {
+            // Per-type running index so each mate gets a SolidWorks-style name "Concentric1".
+            std::map<std::string, int> typeCount;
+            int mi = 0;
+            for (const auto& m : tree["mates"]) {
+                if (!m.is_object()) { ++mi; continue; }
+                std::string mid   = jfld(m, "id");
+                std::string mtype = jfld(m, "type");
+                bool msup = jftbool(m, "suppressed");
+                int n = ++typeCount[mtype];
+                std::string disp = mtype.empty() ? "Mate" : mtype;
+                if (!disp.empty()) disp[0] = (char)std::toupper((unsigned char)disp[0]);
+                disp += std::to_string(n);
+                // "(base<->peg)" from the two refs' components.
+                std::string pair;
+                if (m.contains("refs") && m["refs"].is_array() && m["refs"].size() >= 2) {
+                    std::string a = compName(jfld(m["refs"][0], "component"));
+                    std::string b = compName(jfld(m["refs"][1], "component"));
+                    pair = " (" + a + "<->" + b + ")";
+                }
+                std::string row = disp + pair;
+                if (msup) row += " [S]";
+
+                treeIcon("mate", "[m]", 16.0f);
+                ImGui::SameLine(0, 4);
+                if (msup) ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.5f));
+                ImGuiTreeNodeFlags mf = ImGuiTreeNodeFlags_Leaf |
+                    ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanFullWidth;
+                ImGui::TreeNodeEx((row + "##mate_" + mid).c_str(), mf);
+                if (msup) ImGui::PopStyleColor();
+
+                if (ImGui::BeginPopupContextItem(("##mctx_" + mid).c_str())) {
+                    if (ImGui::MenuItem(msup ? "Unsuppress" : "Suppress")) {
+                        if (st.docMirror.hasDoc() && st.workerStarted) {
+                            auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                                {{"op","asm_edit_mate"},{"id",mid},{"suppressed",!msup}}}));
+                            reloadFrom(r);
+                        }
+                    }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Delete")) {
+                        if (st.docMirror.hasDoc() && st.workerStarted) {
+                            auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                                {{"op","asm_delete_mate"},{"id",mid}}}));
+                            reloadFrom(r);
+                        }
+                    }
+                    ImGui::EndPopup();
+                }
+                ++mi;
+            }
+            if (tree["mates"].empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.7f));
+                ImGui::TextUnformatted("  (no mates)");
+                ImGui::PopStyleColor();
+            }
+        }
+        ImGui::TreePop();
+    }
+}
+
 // ---- main draw function ----
 
 void drawFeatureTree(AppState& st,
@@ -341,6 +479,11 @@ void drawFeatureTree(AppState& st,
             const nlohmann::json& statusArr = st.docMirror.featureStatus();
             static std::string selectedFeatureId;
 
+            // C20b: assemblies render components + a Mates folder instead of a feature history.
+            bool isAssembly = tree.is_object() && jfld(tree, "schema") == "aicad.asm/1";
+            if (isAssembly) {
+                drawAssemblyTree(st, tree, statusArr);
+            } else
             if (tree.is_object()) {
                 auto feat = tree.find("features");
                 if (feat != tree.end() && feat->is_array()) {
@@ -416,6 +559,17 @@ void drawFeatureTree(AppState& st,
                 st.addLog("[doc] new part  rev=" + std::to_string(st.docMirror.revision()));
             } else {
                 st.addLog("[err] new part: " + err);
+            }
+        }
+        ImGui::SameLine();
+        // C20b: File > New Assembly (creates an aicad.asm/1 doc; switches the ribbon to Assembly).
+        if (ImGui::Button("New Assembly")) {
+            std::string err;
+            if (st.docMirror.newAssembly(st.worker, err)) {
+                st.addLog("[doc] new assembly  rev=" + std::to_string(st.docMirror.revision()));
+                st.showRibbon = true; st.ribbonTab = 4;  // Assembly tab
+            } else {
+                st.addLog("[err] new assembly: " + err);
             }
         }
         ImGui::SameLine();

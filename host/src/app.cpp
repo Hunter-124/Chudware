@@ -54,6 +54,12 @@
 #include "ui/sim_panel.h"
 #include "ui/evaluate_dialogs.h"
 // --- end C19 ---
+// --- C22b: Activity panel + prompt editor ---
+#include "ui/activity_panel.h"
+// --- end C22b ---
+// --- C20b: assembly UI ---
+#include "ui/asm_panels.h"
+// --- end C20b ---
 
 int run_gui(const char* screenshotPath) {
     const bool shot = screenshotPath != nullptr;
@@ -152,14 +158,30 @@ int run_gui(const char* screenshotPath) {
     ui::SketchMode sketchMode;
     st.sketchMode = &sketchMode;
 
+    // --- C22b: ActivityPanel — owned here, borrowed via st.activityPanel (opaque void*). ---
+    ui::ActivityPanel activityPanel;
+    st.activityPanel = &activityPanel;
+    // --- end C22b ---
+
+    // --- C20b: AsmPanels — owned here, borrowed via st.asmPanels (opaque void*). ---
+    ui::AsmPanels asmPanels;
+    st.asmPanels = &asmPanels;
+    // --- end C20b ---
+
     // C17: ribbon dispatcher — replaces C14's default printf handler. A ribbon command opens the
     // matching PM form (occupying the tree dock slot); commands without a form log a stub line so
     // they remain observable until later cards wire them.
     // C18: sketch-tab commands (sketch_new / sk_* / smart_dim / sketch_exit) route to SketchMode
     // first so the sketch experience takes priority over any PM form for those ids.
     ui::setRibbonCallback([&st, &propertyManager, &sketchMode, &simPanel,
-                           &evaluateDialogs](const char* cmd_id) {
+                           &evaluateDialogs, &asmPanels](const char* cmd_id) {
         if (sketchMode.onRibbonCommand(st, cmd_id)) return;       // C18 sketch tool handled
+        // C20b: Assembly tab + New Assembly route to the assembly panels first.
+        {
+            std::string cmd(cmd_id);
+            if ((cmd.rfind("asm_", 0) == 0 || cmd == "new_assembly") &&
+                asmPanels.handleCommand(st, cmd)) return;
+        }
         if (propertyManager.openForCommand(st, cmd_id)) return;  // form opened
         // C19: Simulation tab -> sim panel; Evaluate tab -> evaluate dialogs.
         std::string cmd(cmd_id);
@@ -198,6 +220,25 @@ int run_gui(const char* screenshotPath) {
                 item.hit.kind == render::PickKind::Vertex ? "vertex" : nullptr;
             if (!kindStr) continue;
             std::string err;
+            // C20b: while the Mate form is open, assembly picks resolve via the asm path
+            // (doc_resolve_pick returns {selector, component}) and route into the active well.
+            if (st.asmPanels) {
+                auto* ap = static_cast<ui::AsmPanels*>(st.asmPanels);
+                if (ap->mateFormActive()) {
+                    std::string comp;
+                    std::string asel = st.docMirror.resolvePickAsm(
+                        st.worker, item.hit.body_id, kindStr, item.hit.topo_id, comp, err);
+                    if (!asel.empty()) {
+                        item.selector = asel;
+                        item.pending_resolve = false;
+                        try {
+                            nlohmann::json selObj = nlohmann::json::parse(asel);
+                            ap->routeAsmPick(selObj, comp, (int)item.hit.kind);
+                        } catch (...) {}
+                    }
+                    continue;  // handled (or failed) — skip the part-doc resolve path
+                }
+            }
             std::string sel = st.docMirror.resolvePick(
                 st.worker, item.hit.body_id, kindStr, item.hit.topo_id, err);
             if (!sel.empty()) {
@@ -274,6 +315,15 @@ int run_gui(const char* screenshotPath) {
     st.wantFea = shot && shotMode && std::strcmp(shotMode, "fea") == 0;       // C19 static study
     st.wantEvalMass = shot && shotMode && std::strcmp(shotMode, "evalmass") == 0;  // C19 mass props
     if (st.wantFea) { st.showRibbon = true; st.ribbonTab = 3; st.showSimPanel = true; }
+    // C22b: activity shot — new part doc -> agent_run_v2 -> Activity panel -> Settings Agents tab
+    st.wantActivity = shot && shotMode && std::strcmp(shotMode, "activity") == 0;
+    if (st.wantActivity) { st.showActivityPanel = true; }
+    // C20b: assembly shot — author base/peg parts, new assembly, insert + mate + interference.
+    st.wantAsm = shot && shotMode && std::strcmp(shotMode, "asm") == 0;
+    if (st.wantAsm) {
+        st.showRibbon = true; st.ribbonTab = 4;  // Assembly tab forward
+        st.showActivityPanel = false;            // keep the FeatureManager (Mates folder) unobscured
+    }
     std::fprintf(stderr, "startup: shot=%d shotMode=%s wantM1=%d wantSketch=%d workerStarted=%d\n",
                  (int)shot, shotMode ? shotMode : "(null)", (int)st.wantM1, (int)st.wantSketch,
                  (int)st.workerStarted);
@@ -432,6 +482,8 @@ int run_gui(const char* screenshotPath) {
     std::string m1Capture;
     // C18 sketch scenario: same per-step capture mechanism, separate path slot.
     std::string sketchCapture;
+    // C20b assembly scenario: same per-step capture mechanism, separate path slot.
+    std::string asmCapture;
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
@@ -467,6 +519,24 @@ int run_gui(const char* screenshotPath) {
                 for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
                     if (!it->fromUser && it->running) { active = &(*it); break; }
                 for (auto& e : evs) {
+                    // --- C22b: route orchestrator events to the ActivityPanel ---
+                    if (e.kind.rfind("orch_", 0) == 0) {
+                        std::string orchKind = e.kind.substr(5);  // strip "orch_"
+                        try {
+                            nlohmann::json data = nlohmann::json::parse(e.text);
+                            if (st.activityPanel) {
+                                auto* ap = static_cast<ui::ActivityPanel*>(st.activityPanel);
+                                ap->onEvent(orchKind, data);
+                            }
+                        } catch (...) {}
+                        // Also update the compact status line in the chat
+                        if (!e.notes.empty()) {
+                            st.agentV2Status = e.notes;
+                            if (active) active->liveStatus = e.notes;
+                        }
+                        continue;  // don't process as legacy event
+                    }
+                    // --- end C22b ---
                     if (e.kind == "status") {
                         st.livePhase = e.text;
                         if (active) active->liveStatus = e.text;
@@ -509,6 +579,34 @@ int run_gui(const char* screenshotPath) {
         if (st.job.ready.exchange(false)) {
             std::lock_guard<std::mutex> lk(st.job.mtx);
             st.livePhase.clear();
+            st.agentV2Status.clear();
+            // --- C22b: if this was a v2 run, resync the DocMirror tree + reload mesh ---
+            // The worker already rebuilt the doc; call doc_rebuild to refresh the tree and
+            // get the latest aicm_path, then load it into the viewport.
+            if (st.agentV2Running) {
+                st.agentV2Running = false;
+                if (st.docMirror.hasDoc() && st.job.error.empty()) {
+                    nlohmann::json rebuildResult;
+                    std::string rerr2;
+                    if (st.worker.call("doc_rebuild",
+                                       {{"doc_id", st.docMirror.docId()}},
+                                       rebuildResult, rerr2, 60000)) {
+                        // Update mirror revision/tree from the rebuild response
+                        int newRev = rebuildResult.value("revision", -1);
+                        (void)newRev;  // DocMirror handles this via listener
+                        std::string aicmPath = rebuildResult.value("aicm_path", "");
+                        if (!aicmPath.empty()) {
+                            std::string le;
+                            st.loadDocMesh(aicmPath, le);
+                        }
+                        st.addLog("[v2] doc_rebuild after run: rev=" +
+                                  std::to_string(st.docMirror.revision()));
+                    } else {
+                        st.addLog("[err] doc_rebuild after v2 run: " + rerr2);
+                    }
+                }
+            }
+            // --- end C22b ---
             std::string assistant;
             int assistantErr = ERR_NONE;
             if (!st.job.error.empty() && st.job.errorIsCad) {
@@ -1002,6 +1100,199 @@ int run_gui(const char* screenshotPath) {
             }
         }
 
+        // ---------- C20b assembly scenario (AI_CAD_SHOT=asm) ----------
+        // Mirrors engine/doc/test_worker_asm.py through the C++ DocMirror/AsmPanels stack:
+        //   author + save base.step+ (40x40x10 plate, 8mm hole) and peg.step+ (r=3.9, h=20),
+        //   new assembly, insert both, concentric (hole<->peg) + coincident ANTI (plate top<->peg
+        //   bottom) -> peg seats at (0,0,15); screenshot the seated assembly with the Mates folder
+        //   visible; explode factor 1.0 -> screenshot; interference window open -> screenshot.
+        // Per-step captures reuse the m1/sketch backbuffer-write mechanism (asmCapture).
+        static int  asmStep = 0, asmSettle = 0;
+        static std::string asmSavePath, asmBasePath, asmPegPath, asmDoc, asmK2;
+        static double asmSolvedZ = -999.0;
+        if (st.wantAsm && st.workerStarted && !st.asmShotDone && st.frame >= 5) {
+            auto* ap = static_cast<ui::AsmPanels*>(st.asmPanels);
+            static bool asmDirReady = false;
+            if (!asmDirReady) {
+                asmDirReady = true;
+                const char* repo = std::getenv("AI_CAD_REPO");
+                std::string base = repo ? std::string(repo) : std::string(".");
+                asmSavePath = base + "\\scratch\\asm_shots";
+                asmBasePath = asmSavePath + "\\base.step+";
+                asmPegPath  = asmSavePath + "\\peg.step+";
+            }
+            // Helper: author a part via raw worker calls (doc_new part -> apply_ops -> save -> close).
+            auto dim = [](double v) { return nlohmann::json{{"value", v}, {"expr", nullptr}}; };
+            auto makePart = [&](const std::string& name, const nlohmann::json& ops,
+                                const std::string& path) -> bool {
+                nlohmann::json res; std::string err;
+                if (!st.worker.call("doc_new", {{"kind", "part"}, {"name", name}}, res, err)) return false;
+                std::string did = res.value("doc_id", std::string());
+                int rev = res.value("revision", 0);
+                nlohmann::json ap2;
+                if (!st.worker.call("doc_apply_ops",
+                        {{"doc_id", did}, {"base_revision", rev}, {"ops", ops}}, ap2, err)) return false;
+                nlohmann::json sv;
+                if (!st.worker.call("doc_save", {{"doc_id", did}, {"path", path}}, sv, err)) return false;
+                nlohmann::json cl;
+                st.worker.call("doc_close", {{"doc_id", did}}, cl, err);
+                return true;
+            };
+            const int kSettle = 4;
+            if (asmSettle > 0) { --asmSettle; }
+            else if (asmCapture.empty()) switch (asmStep) {  // only advance when no capture pending
+                case 0: {  // author the two parts
+                    nlohmann::json baseOps = nlohmann::json::array();
+                    baseOps.push_back({{"op","add_feature"},{"feature",{
+                        {"type","box"},{"name","Plate"},{"suppressed",false},
+                        {"params",{{"length",dim(40)},{"width",dim(40)},{"height",dim(10)},
+                                   {"centered",true}}},{"refs",nlohmann::json::object()}}}});
+                    baseOps.push_back({{"op","add_feature"},{"feature",{
+                        {"type","cylinder"},{"name","Hole"},{"suppressed",false},
+                        {"params",{{"radius",dim(4)},{"height",dim(12)},{"centered",true},
+                                   {"mode","cut"}}},{"refs",nlohmann::json::object()}}}});
+                    nlohmann::json pegOps = nlohmann::json::array();
+                    pegOps.push_back({{"op","add_feature"},{"feature",{
+                        {"type","cylinder"},{"name","Peg"},{"suppressed",false},
+                        {"params",{{"radius",dim(3.9)},{"height",dim(20)},{"centered",true}}},
+                        {"refs",nlohmann::json::object()}}}});
+                    bool okB = makePart("base", baseOps, asmBasePath);
+                    bool okP = makePart("peg", pegOps, asmPegPath);
+                    std::printf("asm: parts authored base=%d peg=%d\n", (int)okB, (int)okP);
+                    std::fflush(stdout);
+                    asmSettle = 2; ++asmStep; break;
+                }
+                case 1: {  // new assembly + insert both (peg offset away from the hole)
+                    std::string err;
+                    if (!st.docMirror.newAssembly(st.worker, err)) {
+                        std::printf("asm: new_assembly FAILED: %s\n", err.c_str()); std::fflush(stdout);
+                        st.asmShotDone = true; break;
+                    }
+                    asmDoc = st.docMirror.docId();
+                    std::string aicm;
+                    ap->insertComponent(st, asmBasePath, nullptr, aicm);
+                    nlohmann::json off = nlohmann::json::array({1,0,0,30, 0,1,0,25, 0,0,1,18, 0,0,0,1});
+                    ap->insertComponent(st, asmPegPath, off, aicm);
+                    // identify the peg component id (k2 = second component)
+                    const auto& tr = st.docMirror.tree();
+                    if (tr.contains("components") && tr["components"].is_array() &&
+                        tr["components"].size() >= 2)
+                        asmK2 = tr["components"][1].value("id", std::string());
+                    std::printf("asm: assembly %s inserted base+peg (peg=%s)\n",
+                                asmDoc.c_str(), asmK2.c_str());
+                    std::fflush(stdout);
+                    st.yaw = 28; st.pitch = 22; st.zoom = 1.0f;
+                    asmSettle = kSettle; ++asmStep; break;
+                }
+                case 2: {  // concentric + coincident(anti) mates -> peg seats at z=15
+                    // Resolve the mate selectors via the asm pick path (component-body ordinals).
+                    auto resolveAsm = [&](int bodyId, const char* kind, int topo,
+                                          std::string& comp) -> nlohmann::json {
+                        std::string err;
+                        std::string s = st.docMirror.resolvePickAsm(st.worker, bodyId, kind, topo, comp, err);
+                        if (s.empty()) return nlohmann::json();
+                        try { return nlohmann::json::parse(s); } catch (...) { return nlohmann::json(); }
+                    };
+                    // Scan base (body 1) faces for the hole cylinder + the top plane (max z plane).
+                    std::string cBase, cPeg;
+                    nlohmann::json holeCyl, topPlate;
+                    for (int t = 1; t <= 30; ++t) {
+                        std::string comp;
+                        nlohmann::json s = resolveAsm(1, "face", t, comp);
+                        if (!s.is_object()) break;
+                        cBase = comp;
+                        std::string surf = s.value("surf", std::string());
+                        if (surf == "cylinder" && holeCyl.is_null()) holeCyl = s;
+                        if (surf == "plane") {
+                            double z = s.contains("centroid") ? s["centroid"][2].get<double>() : -1e9;
+                            double bz = topPlate.is_object() && topPlate.contains("centroid")
+                                        ? topPlate["centroid"][2].get<double>() : -1e9;
+                            if (z > bz) topPlate = s;
+                        }
+                    }
+                    // Scan peg (body 2) faces for its cylinder + the bottom plane (min z plane).
+                    nlohmann::json pegCyl, botPeg;
+                    for (int t = 1; t <= 30; ++t) {
+                        std::string comp;
+                        nlohmann::json s = resolveAsm(2, "face", t, comp);
+                        if (!s.is_object()) break;
+                        cPeg = comp;
+                        std::string surf = s.value("surf", std::string());
+                        if (surf == "cylinder" && pegCyl.is_null()) pegCyl = s;
+                        if (surf == "plane") {
+                            double z = s.contains("centroid") ? s["centroid"][2].get<double>() : 1e9;
+                            double bz = botPeg.is_object() && botPeg.contains("centroid")
+                                        ? botPeg["centroid"][2].get<double>() : 1e9;
+                            if (z < bz) botPeg = s;
+                        }
+                    }
+                    std::string aicm;
+                    if (holeCyl.is_object() && pegCyl.is_object()) {
+                        nlohmann::json refs = nlohmann::json::array();
+                        refs.push_back({{"component", cBase}, {"selector", holeCyl}});
+                        refs.push_back({{"component", cPeg},  {"selector", pegCyl}});
+                        ap->addMate(st, "concentric", "aligned", refs, aicm);
+                    }
+                    if (topPlate.is_object() && botPeg.is_object()) {
+                        nlohmann::json refs = nlohmann::json::array();
+                        refs.push_back({{"component", cBase}, {"selector", topPlate}});
+                        refs.push_back({{"component", cPeg},  {"selector", botPeg}});
+                        ap->addMate(st, "coincident", "anti", refs, aicm);
+                    }
+                    // Read the solved peg transform z from the tree.
+                    asmSolvedZ = -999.0;
+                    const auto& tr = st.docMirror.tree();
+                    if (tr.contains("components"))
+                        for (const auto& c : tr["components"])
+                            if (c.value("id", std::string()) == asmK2 &&
+                                c.contains("transform") && c["transform"].is_array() &&
+                                c["transform"].size() == 16)
+                                asmSolvedZ = c["transform"][11].get<double>();
+                    // Open the Mate form so the screenshot shows the assembly Mate PM; the Mates
+                    // folder itself lives in the FeatureManager tree (visible alongside). Close the
+                    // auto-opened Insert window so the tree's Mates folder is unobscured.
+                    ap->closeInsert();
+                    ap->openMateForm();
+                    std::printf("asm: mates added; solved peg z=%.3f (expect 15)\n", asmSolvedZ);
+                    std::fflush(stdout);
+                    if (std::fabs(asmSolvedZ - 15.0) < 0.5)
+                        std::printf("asm: PASS |z-15|<0.5\n");
+                    else
+                        std::printf("asm: FAIL z=%.3f not within 0.5 of 15\n", asmSolvedZ);
+                    std::fflush(stdout);
+                    asmCapture = asmSavePath + "\\asm_01_seated.png"; asmSettle = kSettle; ++asmStep; break;
+                }
+                case 3: {  // explode factor 1.0
+                    ap->closeMateForm();
+                    // Define an explode step for the peg (lift it +Z 40mm) so the slider has
+                    // something to act on, then activate the exploded view at factor 1.0.
+                    {
+                        nlohmann::json step = {{"component", asmK2},
+                            {"vector", nlohmann::json::array({0, 0, 1})}, {"distance", 40.0}};
+                        nlohmann::json steps = nlohmann::json::array(); steps.push_back(step);
+                        st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                            {{"op","asm_set_explode"},{"steps",steps}}}));
+                    }
+                    ap->handleCommand(st, "asm_explode");  // opens the Exploded View slider window
+                    ap->setExplode(st, true, 1.0f);
+                    std::printf("asm: explode factor=1.0 (peg +40mm)\n"); std::fflush(stdout);
+                    asmCapture = asmSavePath + "\\asm_02_explode.png"; asmSettle = kSettle; ++asmStep; break;
+                }
+                case 4: {  // interference window
+                    ap->setExplode(st, false, 0.0f);  // collapse before checking real fit
+                    ap->closeExplode();               // dismiss the explode window so it isn't on top
+                    ap->openInterference(st);
+                    std::printf("asm: interference window open\n"); std::fflush(stdout);
+                    asmCapture = asmSavePath + "\\asm_03_interference.png"; asmSettle = kSettle; ++asmStep; break;
+                }
+                default:
+                    st.asmShotDone = true;
+                    std::printf("asm: scenario complete (solved z=%.3f)\n", asmSolvedZ);
+                    std::fflush(stdout);
+                    break;
+            }
+        }
+
         // ---------- C19 FEA scenario (AI_CAD_SHOT=fea) ----------
         // new part -> box 60x40x10 -> static study: fix the -X end face, 100 N -Z on the +X end,
         // steel (index 0), density 0.4 -> wait for completion (cap ~90 s) -> von Mises colormap.
@@ -1125,6 +1416,77 @@ int run_gui(const char* screenshotPath) {
             }
         }
 
+        // --- C22b activity scenario (AI_CAD_SHOT=activity) ---
+        static int actStep = 0, actSettle = 0, actWaitFrames = 0;
+        static std::string actCapture;
+        static std::string actSavePath;
+        if (st.wantActivity && st.workerStarted && !st.activityShotDone && st.frame >= 5) {
+            static bool actDirReady = false;
+            if (!actDirReady) {
+                actDirReady = true;
+                const char* repo = std::getenv("AI_CAD_REPO");
+                std::string base = repo ? std::string(repo) : std::string(".");
+                actSavePath = base + "\\scratch\\activity_shots";
+            }
+            const int kSettle = 4;
+            if (actSettle > 0) { --actSettle; }
+            else if (actCapture.empty()) {
+                std::string aerr;
+                switch (actStep) {
+                    case 0: {  // New part
+                        if (!st.docMirror.newPart(st.worker, aerr)) {
+                            std::printf("activity: new_part FAILED: %s\n", aerr.c_str());
+                            std::fflush(stdout); st.activityShotDone = true; break;
+                        }
+                        std::printf("activity: new_part doc_id=%s rev=%d\n",
+                                    st.docMirror.docId().c_str(), st.docMirror.revision());
+                        std::fflush(stdout);
+                        actSettle = kSettle; ++actStep; break;
+                    }
+                    case 1: {  // Launch agent_run_v2
+                        std::string req = "a bracket with a filleted top edge";
+                        std::strncpy(st.prompt.data(), req.c_str(), st.prompt.size() - 1);
+                        st.agentV2 = true;
+                        st.agentV2Running = true;
+                        activityPanel.clearLive();
+                        launchAgentRunV2(st.worker, st.job, req, st.docMirror.docId());
+                        std::printf("activity: agent_run_v2 launched: %s\n", req.c_str());
+                        std::fflush(stdout);
+                        actWaitFrames = 0; ++actStep; break;
+                    }
+                    case 2: {  // Wait for run to finish
+                        ++actWaitFrames;
+                        if (!st.job.running.load() || actWaitFrames > 1800) {
+                            std::printf("activity: run done (frames=%d)\n", actWaitFrames);
+                            std::fflush(stdout);
+                            actSettle = kSettle * 2; ++actStep;
+                        }
+                        break;
+                    }
+                    case 3: {  // Screenshot 1: Activity panel with run tree
+                        std::printf("activity: shot1 activity panel\n"); std::fflush(stdout);
+                        actCapture = actSavePath + "\\activity_01_run.png";
+                        actSettle = kSettle; ++actStep; break;
+                    }
+                    case 4: {  // Open Settings > Agents tab
+                        st.openSettings = true;
+                        st.pendingPromptRole = "modeler";
+                        actSettle = kSettle * 2; ++actStep; break;
+                    }
+                    case 5: {  // Screenshot 2: Settings Agents tab
+                        std::printf("activity: shot2 agents settings tab\n"); std::fflush(stdout);
+                        actCapture = actSavePath + "\\activity_02_agents.png";
+                        actSettle = kSettle; ++actStep; break;
+                    }
+                    default:
+                        st.activityShotDone = true;
+                        std::printf("activity: scenario complete\n"); std::fflush(stdout);
+                        break;
+                }
+            }
+        }
+        // --- end C22b activity scenario ---
+
         bool busy = st.job.running.load();
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -1201,6 +1563,13 @@ int run_gui(const char* screenshotPath) {
         simPanel.tick(st);          // drain SimClient progress + completion (loads overlays)
         simPanel.draw(st);
         evaluateDialogs.draw(st);
+
+        // ---------- C20b: assembly panels (Insert / Mate / Explode / Interference / BOM) ----------
+        asmPanels.draw(st);
+
+        // --- C22b: Activity panel ---
+        activityPanel.draw(st);
+        // --- end C22b ---
 
         // ---------- C15 pick-shot driver: simulate a center-screen pick ----------
         // The viewport panel rendered the id buffer for this frame's camera; pick its center,
@@ -1288,6 +1657,28 @@ int run_gui(const char* screenshotPath) {
             continue;
         }
 
+        // C20b assembly scenario: identical per-step capture mechanism.
+        if (st.wantAsm) {
+            ++st.frame;
+            if (!asmCapture.empty()) {
+                std::vector<unsigned char> px(dw * dh * 4);
+                glReadBuffer(GL_BACK);
+                glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                std::vector<unsigned char> flip(dw * dh * 4);
+                for (int y = 0; y < dh; ++y)
+                    std::memcpy(&flip[(dh - 1 - y) * dw * 4], &px[y * dw * 4], dw * 4);
+                stbi_write_png(asmCapture.c_str(), dw, dh, 4, flip.data(), dw * 4);
+                std::printf("asm screenshot -> %s (%dx%d)\n", asmCapture.c_str(), dw, dh);
+                std::fflush(stdout);
+                if (asmCapture.find("asm_01_seated") != std::string::npos && screenshotPath)
+                    stbi_write_png(screenshotPath, dw, dh, 4, flip.data(), dw * 4);
+                asmCapture.clear();
+            }
+            if (st.asmShotDone) { glfwSwapBuffers(win); break; }
+            glfwSwapBuffers(win);
+            continue;
+        }
+
         // C19 fea/evalmass shots: drive the async scenario across frames; capture once it's done.
         if (st.wantFea) {
             ++st.frame;
@@ -1325,6 +1716,34 @@ int run_gui(const char* screenshotPath) {
             glfwSwapBuffers(win);
             continue;
         }
+
+        // --- C22b activity shot capture ---
+        if (st.wantActivity) {
+            ++st.frame;
+            if (!actCapture.empty()) {
+                // mkdir best-effort
+                std::string mkCmd = "if not exist \"" + actSavePath + "\" mkdir \"" + actSavePath + "\"";
+                std::system(mkCmd.c_str());
+                std::vector<unsigned char> px(dw * dh * 4);
+                glReadBuffer(GL_BACK);
+                glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                std::vector<unsigned char> flip(dw * dh * 4);
+                for (int y = 0; y < dh; ++y)
+                    std::memcpy(&flip[(dh - 1 - y) * dw * 4], &px[y * dw * 4], dw * 4);
+                stbi_write_png(actCapture.c_str(), dw, dh, 4, flip.data(), dw * 4);
+                std::printf("activity: screenshot -> %s (%dx%d)\n",
+                            actCapture.c_str(), dw, dh);
+                std::fflush(stdout);
+                // Mirror the last step to screenshotPath
+                if (actCapture.find("activity_02_agents") != std::string::npos && screenshotPath)
+                    stbi_write_png(screenshotPath, dw, dh, 4, flip.data(), dw * 4);
+                actCapture.clear();
+            }
+            if (st.activityShotDone) { glfwSwapBuffers(win); break; }
+            glfwSwapBuffers(win);
+            continue;
+        }
+        // --- end C22b activity shot capture ---
 
         // tree shot needs extra frames for the tree to repaint after async doc load
         // wantTree but !treeShotDone: keep waiting (up to 30 frames) for the worker to start

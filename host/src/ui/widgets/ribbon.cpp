@@ -23,8 +23,8 @@
 
 static std::function<void(const char*)> s_RibbonCb;
 
-static const char* kRibbonTabs[] = {"Features", "Sketch", "Evaluate", "Simulation"};
-static constexpr int kRibbonTabCount = 4;
+static const char* kRibbonTabs[] = {"Features", "Sketch", "Evaluate", "Simulation", "Assembly"};
+static constexpr int kRibbonTabCount = 5;  // C20b: + Assembly tab (appended to keep indices stable)
 
 // Ribbon geometry constants
 static constexpr float kTabH        = 24.0f;

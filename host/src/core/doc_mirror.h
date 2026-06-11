@@ -54,6 +54,18 @@ public:
     // Create a new empty part doc. Returns true + fills docId / revision on success.
     bool newPart(WorkerClient& w, std::string& err);
 
+    // --- C20b: assembly support ---
+    // Create a new empty assembly doc (doc_new {kind:"assembly"}). Like newPart but the worker
+    // builds an aicad.asm/1 document.
+    bool newAssembly(WorkerClient& w, std::string& err);
+
+    // Resolve a viewport pick in an ASSEMBLY: doc_resolve_pick returns {selector, component} so the
+    // host can build a mate ref {component, selector}. Returns the selector JSON string and fills
+    // *component with the component id (k-id). Empty return on error (err filled).
+    std::string resolvePickAsm(WorkerClient& w, uint32_t body_id,
+                               const std::string& kind, uint32_t topo_id,
+                               std::string& component, std::string& err);
+
     // Apply a batch of ops. base_revision must equal revision() or stale_revision is returned.
     // On stale_revision: auto-resyncs via doc_tree (revision & tree updated), logs a note to
     // the console string (caller should surface it), and returns the error so the caller can

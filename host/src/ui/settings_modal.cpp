@@ -1,7 +1,10 @@
-// AI-CAD Settings modal (AI provider + Agent tabs) and the About modal.
+// AI-CAD Settings modal (AI provider + Agent + Agents-prompt-editor tabs) and the About modal.
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -11,6 +14,66 @@
 
 #include "../core/app_state.h"
 #include "../renderer.h"
+
+// ---- C22b prompt editor state ----
+// Per-role editor buffer and metadata, lazily loaded from get_prompts_v2.
+namespace {
+struct PromptRecord {
+    std::string role;
+    std::string builtinPath;     // abs path of the built-in .md
+    std::string overridePath;    // abs path where we write the override
+    bool overridden = false;
+    // 16 KB buffer (matches the card spec)
+    std::vector<char> buf{std::vector<char>(16 * 1024, 0)};
+    int builtinLen = 0;  // length of the built-in text (for diff indicator)
+};
+static std::vector<PromptRecord> s_promptRecs;
+static bool s_promptsLoaded = false;
+static int  s_selectedRole  = 0;
+
+static void loadPrompts(AppState& st) {
+    nlohmann::json result;
+    std::string err;
+    if (!st.worker.call("get_prompts_v2", nlohmann::json::object(), result, err, 20000)) {
+        st.addLog("[err] get_prompts_v2: " + err);
+        return;
+    }
+    auto& recs = result.value("prompts", nlohmann::json::array());
+    s_promptRecs.clear();
+    for (auto& r : recs) {
+        PromptRecord pr;
+        pr.role         = r.value("role", "");
+        pr.builtinPath  = r.value("path", "");
+        pr.overridePath = r.value("override_path", "");
+        pr.overridden   = r.value("overridden", false);
+        std::string text = r.value("text", "");
+        pr.builtinLen = (int)text.size();
+        // fill buf with the resolved text (override or built-in)
+        std::fill(pr.buf.begin(), pr.buf.end(), 0);
+        std::strncpy(pr.buf.data(), text.c_str(), pr.buf.size() - 1);
+        s_promptRecs.push_back(std::move(pr));
+    }
+    s_promptsLoaded = true;
+}
+
+static void savePromptOverride(PromptRecord& pr) {
+    // Write the buffer contents to the override file
+    std::ofstream f(pr.overridePath, std::ios::out | std::ios::trunc);
+    if (f.is_open()) {
+        f << pr.buf.data();
+        pr.overridden = true;
+    }
+}
+
+static void resetPromptOverride(PromptRecord& pr, AppState& st) {
+    // Delete the override file
+    std::remove(pr.overridePath.c_str());
+    pr.overridden = false;
+    // Reload built-in text from the worker
+    s_promptsLoaded = false;
+    loadPrompts(st);
+}
+}  // anonymous namespace
 
 namespace ui {
 
@@ -51,6 +114,21 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::Separator();
         ImGui::Dummy(ImVec2(0, 2));
 
+        // C22b: if a pending prompt role was requested, load prompts and jump to Agents tab.
+        bool jumpToAgents = false;
+        if (!st.pendingPromptRole.empty() && st.workerStarted) {
+            if (!s_promptsLoaded) loadPrompts(st);
+            // Select the matching role in the list
+            for (int i = 0; i < (int)s_promptRecs.size(); ++i) {
+                if (s_promptRecs[i].role == st.pendingPromptRole) {
+                    s_selectedRole = i;
+                    break;
+                }
+            }
+            st.pendingPromptRole.clear();
+            jumpToAgents = true;
+        }
+
         // tab content scrolls in its own region; Save/Cancel stay pinned at the bottom
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
         ImGui::BeginChild("##settabsarea",
@@ -87,6 +165,94 @@ void drawSettingsModal(AppState& st, bool busy) {
                 }
                 ImGui::EndTabItem();
             }
+            // --- C22b: Agents tab (role prompt editor) --- begin marked block ---
+            if (ImGui::BeginTabItem("Agents", nullptr,
+                                    jumpToAgents ? ImGuiTabItemFlags_SetSelected
+                                                 : ImGuiTabItemFlags_None)) {
+                ImGui::Dummy(ImVec2(0, 2));
+                bool canFetch = st.workerStarted && !busy;
+                if (!s_promptsLoaded) {
+                    if (canFetch) {
+                        loadPrompts(st);
+                    } else {
+                        dimText("Worker not ready — start the runtime first.");
+                    }
+                }
+                if (s_promptsLoaded && !s_promptRecs.empty()) {
+                    // Left column: role list
+                    float listW = 100.0f;
+                    float avail = ImGui::GetContentRegionAvail().y;
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                        ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
+                               ui::palette.panelBg[2], 1));
+                    ImGui::BeginChild("##rolelist", ImVec2(listW, avail - 38),
+                                      ImGuiChildFlags_Border);
+                    for (int i = 0; i < (int)s_promptRecs.size(); ++i) {
+                        bool sel = (i == s_selectedRole);
+                        auto& pr = s_promptRecs[i];
+                        std::string lbl = pr.role;
+                        if (pr.overridden) lbl += " *";
+                        if (ImGui::Selectable(lbl.c_str(), sel))
+                            s_selectedRole = i;
+                    }
+                    ImGui::EndChild();
+                    ImGui::PopStyleColor();
+
+                    ImGui::SameLine();
+
+                    // Right column: editor + diff indicator
+                    ImGui::BeginChild("##roleeditor", ImVec2(0, avail - 38), ImGuiChildFlags_None);
+                    if (s_selectedRole < (int)s_promptRecs.size()) {
+                        auto& pr = s_promptRecs[s_selectedRole];
+                        // Overridden badge
+                        if (pr.overridden) {
+                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1],
+                                       ui::palette.statusWarn[2], 1));
+                            ImGui::TextUnformatted("[overridden]");
+                            ImGui::PopStyleColor();
+                            ImGui::SameLine();
+                        }
+                        ImGui::PushFont(st.fonts.medium);
+                        ImGui::TextUnformatted(pr.role.c_str());
+                        ImGui::PopFont();
+                        // Diff indicator (just char count difference — not a full diff)
+                        int curLen = (int)std::strlen(pr.buf.data());
+                        int delta  = curLen - pr.builtinLen;
+                        if (delta != 0) {
+                            ImGui::SameLine();
+                            dimText(delta > 0 ? "(differs from built-in: longer)"
+                                              : "(differs from built-in: shorter)");
+                        }
+                        ImGui::PushFont(st.fonts.mono);
+                        float edH = ImGui::GetContentRegionAvail().y - 38;
+                        if (edH < 100) edH = 100;
+                        ImGui::InputTextMultiline("##prompted", pr.buf.data(), pr.buf.size(),
+                                                  ImVec2(-1, edH));
+                        ImGui::PopFont();
+                        // Save / Reset
+                        if (!canFetch) ImGui::BeginDisabled();
+                        if (primaryButton("Save", ImVec2(80, 28))) {
+                            savePromptOverride(pr);
+                            st.addLog("[ok] prompt saved: " + pr.role);
+                        }
+                        if (!canFetch) ImGui::EndDisabled();
+                        ImGui::SameLine();
+                        if (!canFetch) ImGui::BeginDisabled();
+                        if (ImGui::Button("Reset to built-in", ImVec2(140, 28))) {
+                            resetPromptOverride(pr, st);
+                            st.addLog("[ok] prompt reset: " + pr.role);
+                        }
+                        if (!canFetch) ImGui::EndDisabled();
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Delete the override and restore the shipped prompt");
+                    }
+                    ImGui::EndChild();
+                }
+                ImGui::EndTabItem();
+            }
+            // --- end C22b marked block ---
+
             if (ImGui::BeginTabItem("Agent", nullptr,
                                     st.wantSettings ? ImGuiTabItemFlags_SetSelected
                                                     : ImGuiTabItemFlags_None)) {

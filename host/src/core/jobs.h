@@ -12,3 +12,10 @@ struct JobState;
 // `plan` lets the agent draft a build plan before writing code (plan mode).
 void launchJob(WorkerClient& w, JobState& job, int kind, std::string payload, bool reset,
                bool plan);
+
+// --- C22b: launch agent_run_v2 on a background thread ---
+// Streams orchestrator events (run_started / stage_started / agent_call / agent_output /
+// stage_result / run_finished) through job.events with kind prefixed "orch_" so the
+// main-thread drain can route them to the ActivityPanel separately from legacy events.
+void launchAgentRunV2(WorkerClient& w, JobState& job,
+                      const std::string& request, const std::string& docId);

@@ -151,6 +151,25 @@ static const RibbonCmd kCmds[] = {
     { "sim_run",           "Run",            "run_study",       "Simulation","Run",            true,  nullptr,          false },
     { "sim_results",       "Results",        "results",         "Simulation","Run",            true,  nullptr,          false },
 
+    // =========================================================================
+    // Tab: Assembly (C20b)
+    // =========================================================================
+
+    // --- Group: Components ---
+    { "asm_insert",        "Insert Comp.",   "insert_component", "Assembly", "Components",      true,  nullptr,          false },
+    { "asm_move",          "Move Comp.",     "move_component",   "Assembly", "Components",      true,  nullptr,          false },
+    { "asm_pattern",       "Comp. Pattern",  "pattern_component","Assembly", "Components",      true,  nullptr,          false },
+
+    // --- Group: Mate ---
+    { "asm_mate",          "Mate",           "mate",             "Assembly", "Mate",            true,  nullptr,          false },
+
+    // --- Group: Evaluate ---
+    { "asm_interference",  "Interference",   "interference",     "Assembly", "Evaluate",        true,  nullptr,          false },
+    { "asm_bom",           "Bill of Mat.",   "bom",              "Assembly", "Evaluate",        true,  nullptr,          false },
+
+    // --- Group: Display ---
+    { "asm_explode",       "Exploded View",  "exploded_view",    "Assembly", "Display",         true,  nullptr,          false },
+
 };
 // clang-format on
 

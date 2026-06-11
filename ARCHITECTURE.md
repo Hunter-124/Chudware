@@ -1,5 +1,15 @@
 # AI-CAD — Architecture
 
+> **2026-06 overhaul:** AI-CAD is now a SolidWorks-class parametric CAD application — ribbon UI,
+> FeatureManager tree, PropertyManager, constraint-solver sketcher, assemblies with mates,
+> FEA (static/modal) + LBM flow simulation, Evaluate tools, STEP/IGES/BREP/STL/3MF + native
+> `.step+`, and a deterministic AI orchestrator with editable role prompts and a transparent
+> Activity panel. **Canonical references:** [docs/PLAN.md](docs/PLAN.md) (design + milestones),
+> [docs/contracts/](docs/contracts) (frozen interface contracts),
+> [docs/sessions/reports.md](docs/sessions/reports.md) (per-component integration notes).
+> The description below covers the original v1 pipeline, which still works unchanged
+> (a script becomes a `script` feature in the document tree).
+
 AI-driven **parametric CAD**. An AI model (built-in agent, or any external agent over
 MCP) writes [build123d](https://build123d.readthedocs.io/) Python code; the engine
 executes it on the OpenCASCADE B-rep kernel to produce a **precise, feature-rich solid**;

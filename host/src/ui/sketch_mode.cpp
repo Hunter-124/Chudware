@@ -167,6 +167,10 @@ void SketchMode::applyEnterResult(const nlohmann::json& res) {
     }
     parseEntities(res, ents_);
     applyConstraints(res);   // C37-D: store the constraints array for dim annotations
+    // C41 (T2): drop selected ids that no longer exist (entity deleted / undone away).
+    selIds_.erase(std::remove_if(selIds_.begin(), selIds_.end(),
+                                 [&](const std::string& id) { return entById(id) == nullptr; }),
+                  selIds_.end());
     // C38 (S1): ents_ was just refilled — any in-flight Smart Dimension picks now point at stale
     // entities (their by-id resolution may shift or vanish). Drop the pending pick buffer so we never
     // feed dangling picks into dimBuildPending/highlight on the next frame. The Modify box (if open)
@@ -205,6 +209,11 @@ void SketchMode::applyConstraints(const nlohmann::json& res) {
 const SketchEntity* SketchMode::entById(const std::string& id) const {
     for (const auto& e : ents_) if (e.id == id) return &e;
     return nullptr;
+}
+
+// C41 (T2): is this entity id in the in-sketch selection?
+bool SketchMode::isSelected(const std::string& id) const {
+    return std::find(selIds_.begin(), selIds_.end(), id) != selIds_.end();
 }
 
 // C38 (S1): resolve a stored entity id to its CURRENT index in ents_ (-1 if gone). DimPicks store
@@ -573,6 +582,7 @@ const char* SketchMode::activeToolCmd() const {
 
 void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSnaps_.clear();
                                conicRho_ = 0.5f; chainPrevId_.clear();
+                               selIds_.clear();   // C41 (T2): selection dies with any tool change/exit
                                offsetStage_ = 0; offsetChain_.clear(); offsetFocusInput_ = false;
                                // C37-D: clear the Smart Dimension state machine.
                                dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr;
@@ -661,6 +671,9 @@ int SketchMode::hitTestEntity(const ImVec2& s, float maxPx) const {
 
 std::string SketchMode::statusLine() const {
     if (!active_) return {};
+    // C41 (T4): a sketch with no geometry isn't meaningfully "Fully Defined DOF: 0" — invite
+    // the user to draw instead.
+    if (ents_.empty()) return "Empty sketch \xE2\x80\x94 pick a tool to draw";
     const char* s = status_ == "full" ? "Fully Defined"
                   : status_ == "over" ? "Over Defined" : "Under Defined";
     char buf[64];
@@ -1375,6 +1388,11 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         if (!active_) { dl->PopClipRect(); return; }
     }
 
+    // C41 (T1): Esc consumption flag. The specific Esc behaviors that KEEP the tool armed
+    // (Smart Dim pick-buffer clear, Offset stage back-out, Modify box close) set this so the
+    // hover-independent catch-all at the end of drawOverlay doesn't also disarm the tool.
+    bool escHandled = false;
+
     // ---- faint grid (lines along sketch u/v through the origin neighbourhood) ----
     const ImU32 gridCol = col(pal.sketchGrid);
     const ImU32 axisCol = col(pal.sketchGrid, 2.2f);
@@ -1409,8 +1427,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         return col(pal.sketchUnder);   // under-defined (blue-ish)
     };
     for (const auto& e : ents_) {
-        ImU32 cc = statusCol(e);
-        float th = e.construction ? 1.0f : 2.0f;
+        // C41 (T2): selected entities render in the accent color, slightly thicker.
+        bool sel = !selIds_.empty() && isSelected(e.id);
+        ImU32 cc = sel ? col(pal.accent) : statusCol(e);
+        float th = (e.construction ? 1.0f : 2.0f) + (sel ? 1.0f : 0.0f);
         if (e.type == "line") {
             ImVec2 a = uvToScreen(e.p1[0], e.p1[1]), b = uvToScreen(e.p2[0], e.p2[1]);
             dl->AddLine(a, b, cc, th);
@@ -1488,8 +1508,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         const ImU32 dimTextCol = col(pal.sketchInk);
         const ImU32 dimDrivenCol = col(pal.consoleDim);     // dimmer for driven (reference) dims
         const ImU32 dimHoverCol = col(pal.accent);
-        // 1) relation glyphs (subtle green badges) for geometric constraints, near the first ref.
-        const ImU32 glyphCol = col(pal.statusOk, 0.9f);
+        // 1) relation badges for geometric (non-dimensional) constraints.
         auto baseId = [](const std::string& h) { return h.substr(0, h.find('.')); };
         auto refScreen = [&](const std::string& h, ImVec2& s) -> bool {
             const SketchEntity* e = entById(baseId(h));
@@ -1501,27 +1520,95 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             else                         s = uvToScreen(e->center[0], e->center[1]);
             return true;
         };
-        // pack glyphs so multiple on one entity don't overlap: tiny offset per relation index
-        int glyphIdx = 0;
+        // C41 (T3): SolidWorks-like relation badges — ~16px (ui::uiScale-scaled) rounded chips
+        // with a light-green fill (palette.sketchRelBg), darker green border, and a DARK ASCII
+        // glyph (plain ASCII on purpose: no missing-glyph boxes). Entity-level relations sit at
+        // the entity midpoint pushed ~10px perpendicular; point-level ones at the point + a
+        // small diagonal offset. Badges whose refs can't be resolved are skipped. Multiple
+        // badges on the same ref stack horizontally.
+        const float bs = 16.0f * ui::uiScale;                 // chip side
+        const ImU32 relBg     = col(pal.sketchRelBg);
+        const ImU32 relBorder = col(pal.sketchRelBorder);
+        const ImU32 relInk    = col(pal.sketchInk);
+        std::unordered_map<std::string, int> badgeStack;      // per-anchor-cell stacking index
+        // Chip-center anchor for a ref handle (entity id "e3" or point handle "e3.p2").
+        auto badgeAnchor = [&](const std::string& h, ImVec2& out) -> bool {
+            const SketchEntity* e = entById(baseId(h));
+            if (!e) return false;
+            const float off = 10.0f * ui::uiScale + bs * 0.5f;   // clear the geometry line
+            if (h.find('.') != std::string::npos) {              // point-level: point + offset
+                ImVec2 s;
+                if (!refScreen(h, s)) return false;
+                out = ImVec2(s.x + off * 0.8f, s.y - off * 0.8f);
+                return true;
+            }
+            if (e->type == "line" || e->type == "slot") {        // midpoint + unit perpendicular
+                ImVec2 a = uvToScreen(e->p1[0], e->p1[1]), b = uvToScreen(e->p2[0], e->p2[1]);
+                ImVec2 m((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
+                float dx = b.x - a.x, dy = b.y - a.y; float L = std::hypot(dx, dy);
+                float nx = L > 1e-3f ? -dy / L : 0.0f, ny = L > 1e-3f ? dx / L : -1.0f;
+                out = ImVec2(m.x + nx * off, m.y + ny * off);
+                return true;
+            }
+            if (e->type == "circle" || e->type == "arc" || e->type == "arc_slot") {
+                // rim point (45° for circles, mid-sweep for arcs), pushed radially outward
+                float aMid = 45.0f;
+                if (e->type != "circle") {
+                    float a0 = e->start, a1 = e->end; if (a1 < a0) a1 += 360.0f;
+                    aMid = (a0 + a1) * 0.5f;
+                }
+                float ar = aMid * 3.14159265f / 180.0f;
+                ImVec2 cc = uvToScreen(e->center[0], e->center[1]);
+                ImVec2 rim = uvToScreen(e->center[0] + e->radius * std::cos(ar),
+                                        e->center[1] + e->radius * std::sin(ar));
+                float dx = rim.x - cc.x, dy = rim.y - cc.y; float L = std::hypot(dx, dy);
+                if (L > 1e-3f) out = ImVec2(rim.x + dx / L * off, rim.y + dy / L * off);
+                else           out = ImVec2(cc.x + off, cc.y - off);
+                return true;
+            }
+            ImVec2 s;                                            // point entity / fallback
+            if (!refScreen(h, s)) return false;
+            out = ImVec2(s.x + off * 0.8f, s.y - off * 0.8f);
+            return true;
+        };
+        auto drawBadge = [&](const std::string& h, const char* glyph, const char* name) {
+            ImVec2 gp;
+            if (!badgeAnchor(h, gp)) return;
+            // Stack badges landing in the same screen cell along +x (covers both multiple
+            // relations on one ref AND distinct refs whose anchors coincide, e.g. a fix and a
+            // coincident on the same corner point).
+            char cell[40];
+            std::snprintf(cell, sizeof(cell), "%d:%d",
+                          (int)std::floor(gp.x / bs), (int)std::floor(gp.y / bs));
+            gp.x += (float)badgeStack[cell]++ * (bs + 2.0f);
+            ImVec2 c0(gp.x - bs * 0.5f, gp.y - bs * 0.5f), c1(gp.x + bs * 0.5f, gp.y + bs * 0.5f);
+            dl->AddRectFilled(c0, c1, relBg, 3.5f * ui::uiScale);
+            dl->AddRect(c0, c1, relBorder, 3.5f * ui::uiScale, 0, 1.2f);
+            ImVec2 gs = ImGui::CalcTextSize(glyph);
+            dl->AddText(ImVec2(gp.x - gs.x * 0.5f, gp.y - gs.y * 0.5f), relInk, glyph);
+            // Hover tooltip naming the relation type.
+            if (imgHovered && io.MousePos.x >= c0.x && io.MousePos.x <= c1.x &&
+                io.MousePos.y >= c0.y && io.MousePos.y <= c1.y)
+                ImGui::SetTooltip("%s", name);
+        };
         for (const auto& c : cons_) {
-            if (c.isDimensional()) continue;
-            // SolidWorks-style single-char badges. Math/shape glyphs come from CADSymbols.ttf
-            // (merged into Rubik in ui_theme.cpp); H/V/T/=/# stay ASCII.
-            const char* g = c.type == "horizontal" ? "H" : c.type == "vertical" ? "V"
-                          : c.type == "coincident" ? "\xE2\x8A\x99"   // ⊙ U+2299
-                          : c.type == "parallel" ? "\xE2\x88\xA5"     // ∥ U+2225
-                          : c.type == "perpendicular" ? "\xE2\x8A\xA5" // ⊥ U+22A5
-                          : c.type == "equal" ? "=" : c.type == "tangent" ? "T"
-                          : c.type == "fix" ? "#" : nullptr;
-            if (!g || c.refs.empty()) continue;
-            ImVec2 s;
-            if (!refScreen(c.refs[0], s)) continue;
-            float ox = 10.0f + (glyphIdx % 3) * 11.0f, oy = -10.0f - (glyphIdx / 3) * 11.0f;
-            ImVec2 gp(s.x + ox, s.y + oy);
-            dl->AddRectFilled(ImVec2(gp.x - 1, gp.y - 1), ImVec2(gp.x + 11, gp.y + 11),
-                              col(pal.overlayBg, 0.7f), 2.0f);
-            dl->AddText(gp, glyphCol, g);
-            ++glyphIdx;
+            if (c.isDimensional() || c.refs.empty()) continue;
+            const char* g = c.type == "horizontal"    ? "-"
+                          : c.type == "vertical"      ? "|"
+                          : c.type == "parallel"      ? "//"
+                          : c.type == "perpendicular" ? "L"
+                          : c.type == "equal"         ? "="
+                          : c.type == "coincident"    ? "o"
+                          : c.type == "concentric"    ? "c"
+                          : c.type == "tangent"       ? "T"
+                          : c.type == "fix"           ? "x" : nullptr;
+            if (!g) continue;
+            // Entity-pair relations get a badge on EACH ref (SolidWorks shows both sides);
+            // single-entity / point relations get one badge at the first ref.
+            bool pairRel = c.type == "parallel" || c.type == "perpendicular" ||
+                           c.type == "equal" || c.type == "tangent" || c.type == "concentric";
+            if (pairRel) { for (const auto& rh : c.refs) drawBadge(rh, g, c.type.c_str()); }
+            else         drawBadge(c.refs[0], g, c.type.c_str());
         }
         // 2) dimension annotations. Hover-test the text anchor; track for drag / double-click / delete.
         std::string newHover;
@@ -1592,6 +1679,22 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 break;
             }
         }
+        // C41 (T2): Delete/Backspace removes the selected entities (one ops array for all of
+        // them, then re-solve). A hovered dimension text takes priority (handler below) — keep
+        // this gated on dimHoverCid_.empty() and BEFORE that handler (it clears the hover id).
+        if (!selIds_.empty() && dimHoverCid_.empty() && !io.WantTextInput &&
+            (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
+            nlohmann::json ops = nlohmann::json::array();
+            for (const auto& id : selIds_)
+                ops.push_back({{"op", "sketch_delete_entity"}, {"sketch", fid_}, {"id", id}});
+            auto r = st.docMirror.applyOps(st.worker, ops);
+            if (!r.ok) st.toast(ui::ToastLevel::Error, "Delete: " + r.error_message);
+            else {
+                if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+                resolve(st);
+            }
+            selIds_.clear();
+        }
         // Delete key removes the hovered dim.
         if (!dimHoverCid_.empty() && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
             nlohmann::json op = {{"op", "sketch_delete_constraint"}, {"sketch", fid_}, {"id", dimHoverCid_}};
@@ -1612,6 +1715,24 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             std::string h; float hu, hv;
             if (hitTestHandle(io.MousePos, h, hu, hv) > 0) {
                 dragging_ = true; dragHandle_ = h; dragFrame_ = -1;
+            } else {
+                // C41 (T2): no drag handle hit -> entity selection. Plain click selects the
+                // entity under the cursor (or clears on empty space); Ctrl+click toggles it
+                // in/out of the multi-selection (and leaves the rest alone on empty space).
+                int ei = hitTestEntity(io.MousePos);
+                if (ei >= 0) {
+                    const std::string id = ents_[ei].id;
+                    auto it = std::find(selIds_.begin(), selIds_.end(), id);
+                    if (io.KeyCtrl) {
+                        if (it != selIds_.end()) selIds_.erase(it);
+                        else selIds_.push_back(id);
+                    } else {
+                        selIds_.clear();
+                        selIds_.push_back(id);
+                    }
+                } else if (!io.KeyCtrl) {
+                    selIds_.clear();
+                }
             }
         }
         if (dragging_ && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
@@ -1818,6 +1939,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 }
             }
             if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                escHandled = true;   // C41 (T1): stage back-out keeps the tool armed
                 // Esc backs out one stage; from the chain stage it exits the tool.
                 if (offsetStage_ == 2) { offsetStage_ = 1; offsetFocusInput_ = true; }
                 else if (offsetStage_ == 1) offsetStage_ = 0;
@@ -2450,6 +2572,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // Esc semantics: with the Modify box open, item-4 handler closes it (below). With picks in
         // the buffer, first Esc clears the buffer; second Esc exits the tool.
         if (!dimPopupOpen_ && ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            escHandled = true;   // C41 (T1): pick-buffer clear keeps the tool armed
             if (!dimPicks_.empty()) { dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr; }
             else cancelTool();
         }
@@ -2590,7 +2713,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // ---- status chip (top-LEFT now; confirmation corner owns the top-right) ----
     {
         std::string sl = statusLine();
-        ImU32 sc = status_ == "over" ? col(pal.statusErr)
+        // C41 (T4): neutral pill while the sketch is empty (statusLine shows the draw hint).
+        ImU32 sc = ents_.empty()  ? col(pal.overlayText, 0.9f)
+                 : status_ == "over" ? col(pal.statusErr)
                  : status_ == "full" ? col(pal.statusOk) : col(pal.sketchUnder);
         ImVec2 ts = ImGui::CalcTextSize(sl.c_str());
         ImVec2 p0(imgMin.x + 12, imgMin.y + 12);
@@ -2649,6 +2774,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             // Esc (or Cancel) closes the box WITHOUT committing; stay in Smart Dimension. Clearing
             // the pick buffer mirrors SolidWorks (the dimension is abandoned, tool stays armed).
             if (cancel || (ImGui::IsKeyPressed(ImGuiKey_Escape) && !ImGui::IsKeyDown(ImGuiKey_LeftCtrl))) {
+                escHandled = true;   // C41 (T1): box close keeps Smart Dimension armed
                 dimPopupOpen_ = false; dimError_.clear();
                 if (dimEditCid_.empty()) { dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr; }
                 dimEditCid_.clear();
@@ -2677,6 +2803,15 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         }
         ImGui::End();
     }
+
+    // ---- C41 (T1): catch-all Esc — disarm the armed tool / in-progress chain even when the
+    // viewport image is NOT hovered. The more specific handlers above run first: the ones that
+    // fully cancel leave tool_ == None (no-op here); the ones that keep the tool armed (Modify
+    // box close, Smart Dim pick clear, Offset stage back-out) mark escHandled. Suppressed while
+    // any text field owns the keyboard. Esc with no tool armed does nothing here.
+    if (!escHandled && tool_ != SketchTool::None && !io.WantTextInput &&
+        ImGui::IsKeyPressed(ImGuiKey_Escape))
+        cancelTool();
 }
 
 }  // namespace ui

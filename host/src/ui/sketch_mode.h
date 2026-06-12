@@ -241,6 +241,13 @@ private:
     bool dragging_ = false;
     int dragFrame_ = -1;             // last frame a sketch_drag was issued (throttle: once/frame)
 
+    // C41 (T2): in-sketch selection (tool_ == None). Left-click on/near an entity selects it
+    // (Ctrl+click toggles multi-select); Delete/Backspace deletes the selection via
+    // sketch_delete_entity ops. Cleared by resetTool (and thus every exit/cancel path) and
+    // pruned of vanished ids on every applyEnterResult refill.
+    std::vector<std::string> selIds_;
+    bool isSelected(const std::string& id) const;
+
     // C29-B Offset tool state. Stages: collect a chain of entity ids (selected ones tint accent),
     // then a distance overlay (InputFloat near cursor, Enter commits), then one click for the side
     // hint -> sketch_offset op. offsetStage_: 0=picking chain, 1=typing distance, 2=picking side.

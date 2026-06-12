@@ -95,6 +95,10 @@ struct Palette {
     // role (near-white in the dark theme = invisible on the white canvas).
     float sketchInk[4]     = {0.090f,0.100f,0.125f, 1};   // fully-defined entities, dim text
     float sketchDimLine[4] = {0.165f,0.184f,0.220f, 1};   // dim/extension lines + arrows
+    // C41: relation-badge chips (SolidWorks-like): light green fill + darker green border;
+    // the glyph itself is drawn with sketchInk (dark on the light canvas in both themes).
+    float sketchRelBg[4]     = {0.550f,0.780f,0.550f, 0.90f};
+    float sketchRelBorder[4] = {0.300f,0.520f,0.300f, 1};
 
     // ---- status ----
     float statusOk[4]   = {0.176f,0.831f,0.749f, 1};   // same as accent

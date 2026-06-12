@@ -1824,8 +1824,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     float mu = 0, mv = 0;
     if (imgHovered) screenToUV(io.MousePos, mu, mv);
 
-    // ---- C37-D: dimension text drag + double-click-to-edit + Delete (only when no tool active) ----
-    if (tool_ == SketchTool::None && !dimPopupOpen_) {
+    // ---- C37-D: dimension text drag + double-click-to-edit + Delete ----
+    // C47: also active while Smart Dimension is armed (SolidWorks lets you drag/edit existing
+    // dims mid-dimensioning); the SmartDim pick-click below skips text-hovered clicks.
+    if ((tool_ == SketchTool::None || tool_ == SketchTool::SmartDim) && !dimPopupOpen_) {
         // Begin a drag on the hovered dim text. C38 (S4): the second click of a double-click also
         // fires IsMouseClicked; exclude it so a double-click-to-edit never spawns a phantom drag
         // (which would commit a stray sketch_set_dim placement on release).
@@ -2940,7 +2942,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     dimPlaceU_ = mu; dimPlaceV_ = mv;
                     dimOpenModify(io.MousePos);
                 }
-            } else if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            } else if (imgHovered && dimHoverCid_.empty() &&
+                       ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                // C47: skip when an existing dim's text is hovered — that click belongs to the
+                // drag / double-click-edit handler above, not a new pick.
                 DimPick pick;
                 if (dimHitTest(io.MousePos, pick)) {
                     // Avoid duplicate picks of the same target. C38 (S1): compare entity picks by id

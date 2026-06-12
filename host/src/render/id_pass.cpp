@@ -229,6 +229,7 @@ void IdPass::render(const Renderer::CameraXform& cam) {
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(1.0f, 1.0f);
     for (const auto& f : faces_) {
+        if (bodyHidden(f.id)) continue;  // hidden body: unpickable
         glUniform1ui(idLoc, f.id);
         glBindVertexArray(f.vao);
         glDrawElements(GL_TRIANGLES, f.idxCount, GL_UNSIGNED_INT, 0);
@@ -240,6 +241,7 @@ void IdPass::render(const Renderer::CameraXform& cam) {
     glDepthRange(0.0, 0.999);
     glLineWidth(3.0f);
     for (const auto& e : edges_) {
+        if (bodyHidden(e.id)) continue;  // hidden body: unpickable
         glUniform1ui(idLoc, e.id);
         glBindVertexArray(e.vao);
         glDrawArrays(GL_LINES, 0, e.vertCount);
@@ -256,6 +258,7 @@ void IdPass::render(const Renderer::CameraXform& cam) {
     if (verts_.count > 0) {
         glBindVertexArray(verts_.vao);
         for (int i = 0; i < verts_.count; ++i) {
+            if (bodyHidden(verts_.ids[i])) continue;  // hidden body: unpickable
             glUniform1ui(idLoc, verts_.ids[i]);
             glDrawArrays(GL_POINTS, i, 1);
         }

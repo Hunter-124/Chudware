@@ -61,6 +61,25 @@ static void treeIcon(const char* name, const char* fallback, float size = 16.0f,
     }
 }
 
+// ---- Solid Bodies visibility helper ----
+// Show/hide one renderer body slot. Host-side state only (AppState::bodyVisible) — no doc ops,
+// so it is applied immediately (no s_pendingTreeOps detour needed). Hiding also drops any
+// selection/hover that references the body: the id pass stops rendering it, so a stale highlight
+// would point at geometry the user can no longer see or re-pick.
+static void setBodyShown(AppState& st, int slot, bool shown) {
+    if (slot < 0 || slot >= (int)st.bodyVisible.size()) return;
+    st.bodyVisible[slot] = shown ? 1 : 0;
+    if (!shown) {
+        uint32_t bid = slot < (int)st.docBodyIds.size() ? st.docBodyIds[slot] : 0;
+        bool selHasBody = false;
+        for (const auto& it : st.selection.items())
+            if (it.hit.body_id == bid) { selHasBody = true; break; }
+        if (selHasBody) st.selection.clear();
+        if (st.hover.body_id == bid) { st.hover = render::PickHit{}; st.pickStatus.clear(); }
+    }
+    st.applyBodyVisibility();
+}
+
 // ---- status badge (ok/warn/error/rolled-back) ----
 // C37-E: a rolled-back feature (after the rollback bar) is NOT an error — it gets a distinct muted
 // "paused" marker, never the red "!". Pass rolledBack=true for those rows.
@@ -1107,6 +1126,86 @@ void drawFeatureTree(AppState& st,
                     ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1.0f));
                 ImGui::TextUnformatted(mat.c_str());
                 ImGui::PopStyleColor();
+            }
+
+            // ---- Solid Bodies folder (per-body hide/show, SolidWorks-style) ----
+            // Part docs only, when the loaded doc mesh has at least one body. One row per
+            // renderer body slot: click toggles visibility (same interaction as the plane rows
+            // below); the context menu adds Hide/Show, Isolate (when every OTHER body is already
+            // hidden it acts as SolidWorks Exit Isolate = Show All), and Show All Bodies. Pure
+            // host-side state — see setBodyShown above.
+            {
+                bool isAsmDoc = tree.is_object() && jfld(tree, "schema") == "aicad.asm/1";
+                int nBodies = (int)st.bodyVisible.size();
+                if (!isAsmDoc && st.hasDocMesh && nBodies >= 1) {
+                    char hdr[64];
+                    std::snprintf(hdr, sizeof(hdr), "Solid Bodies (%d)##solid_bodies", nBodies);
+                    treeIcon("mates_folder", "[F]", 16.0f);
+                    ImGui::SameLine(0, 4);
+                    bool open = ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_DefaultOpen |
+                                                       ImGuiTreeNodeFlags_SpanFullWidth);
+                    if (open) {
+                        for (int bi = 0; bi < nBodies; ++bi) {
+                            bool hidden = !st.bodyVisible[bi];
+                            uint32_t bid = bi < (int)st.docBodyIds.size()
+                                               ? st.docBodyIds[bi] : (uint32_t)bi + 1;
+                            char bname[32];
+                            std::snprintf(bname, sizeof(bname), "Body%u", bid);
+                            ImGuiTreeNodeFlags bf = ImGuiTreeNodeFlags_Leaf |
+                                                    ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                                                    ImGuiTreeNodeFlags_SpanFullWidth;
+                            treeIcon("part", "[B]", 16.0f, hidden ? 0.45f : 1.0f);
+                            ImGui::SameLine(0, 4);
+                            if (hidden)
+                                ImGui::PushStyleColor(ImGuiCol_Text,
+                                    ImVec4(pal.textDim[0], pal.textDim[1],
+                                           pal.textDim[2], 0.55f));
+                            char rowId[48];
+                            std::snprintf(rowId, sizeof(rowId), "%s##body%d", bname, bi);
+                            ImGui::TreeNodeEx(rowId, bf);
+                            if (hidden) ImGui::PopStyleColor();
+                            // Capture row interactions NOW; BeginPopupContextItem binds to the
+                            // LAST item, so it must come right after TreeNodeEx, before any
+                            // other widget.
+                            bool rowClicked = ImGui::IsItemClicked();
+                            bool rowHovered = ImGui::IsItemHovered();
+                            char ctxId[32];
+                            std::snprintf(ctxId, sizeof(ctxId), "##body_ctx%d", bi);
+                            if (ImGui::BeginPopupContextItem(ctxId)) {
+                                if (ImGui::MenuItem(hidden ? "Show" : "Hide"))
+                                    setBodyShown(st, bi, hidden);
+                                if (ImGui::MenuItem("Isolate")) {
+                                    bool othersAllHidden = true;
+                                    for (int j = 0; j < nBodies; ++j)
+                                        if (j != bi && st.bodyVisible[j]) {
+                                            othersAllHidden = false; break;
+                                        }
+                                    if (othersAllHidden) {
+                                        // Already isolated -> Exit Isolate = plain Show All.
+                                        std::fill(st.bodyVisible.begin(),
+                                                  st.bodyVisible.end(), (uint8_t)1);
+                                        st.applyBodyVisibility();
+                                    } else {
+                                        for (int j = 0; j < nBodies; ++j)
+                                            if (j != bi && st.bodyVisible[j])
+                                                setBodyShown(st, j, false);
+                                        if (!st.bodyVisible[bi]) setBodyShown(st, bi, true);
+                                    }
+                                }
+                                if (ImGui::MenuItem("Show All Bodies")) {
+                                    std::fill(st.bodyVisible.begin(),
+                                              st.bodyVisible.end(), (uint8_t)1);
+                                    st.applyBodyVisibility();
+                                }
+                                ImGui::EndPopup();
+                            }
+                            if (rowClicked) setBodyShown(st, bi, hidden);
+                            if (rowHovered)
+                                ImGui::SetTooltip(hidden ? "Show %s" : "Hide %s", bname);
+                        }
+                        ImGui::TreePop();
+                    }
+                }
             }
 
             // Reference planes — click to show/hide in the viewport; the clicked plane is

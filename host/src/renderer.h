@@ -137,6 +137,19 @@ public:
     int height() const { return h_; }
     bool hasMesh() const { return !subs_.empty(); }
 
+    // ---- per-body visibility (Solid Bodies folder hide/show) ----
+    // Index = the body's position in the setMeshes() vector (same order AppState builds it from
+    // the AICM body list). setMeshes() resets every body to visible. Hidden bodies are skipped by
+    // the shaded pass, both edge passes, the section-cap stencil pass, and the thumbnail; the
+    // ground-shadow blob is skipped only when EVERY body is hidden (it is one aggregate blob, not
+    // per-mesh). Camera bounds intentionally still include hidden bodies (SolidWorks keeps the
+    // model extents stable while toggling visibility).
+    size_t bodyCount() const { return subs_.size(); }
+    void setBodyVisible(size_t index, bool visible);
+    bool bodyVisible(size_t index) const {
+        return index < subs_.size() && subs_[index].visible;
+    }
+
 private:
     // GPU buffers for one body.
     struct Sub {
@@ -152,6 +165,7 @@ private:
         std::vector<float> disp;      // 3*n displacement (empty = none)
         bool hasScalar = false;
         float scalarMin = 0.0f, scalarMax = 1.0f;
+        bool visible = true;          // per-body hide/show (Solid Bodies folder)
     };
 
     void allocTargets();

@@ -304,6 +304,20 @@ struct AppState {
     // from each face's triangle range. Empty for faces with no triangles.
     std::unordered_map<uint64_t, std::array<float, 6>> faceBBoxCache;
 
+    // ---- Solid Bodies visibility (FeatureManager "Solid Bodies" folder hide/show) ----
+    // Parallel arrays indexed by the renderer body slot (the order loadDocMesh feeds setMeshes,
+    // i.e. the AICM body order minus empty bodies). bodyVisible[i] != 0 -> shown. docBodyIds[i]
+    // is that slot's AICM body_id (1-based ordinal) — it keys the id-pass pick skip and the
+    // "BodyN" tree label. Reset semantics: loadDocMesh PRESERVES the hidden set across a rebuild
+    // when the body-id list is unchanged (the common edit-a-feature case) and RESETS everything
+    // to visible when it differs (a rebuild that adds/removes bodies realigns ordinals, so stale
+    // by-ordinal hides would land on the wrong body). clearViewportForNewDoc clears both.
+    std::vector<uint8_t>  bodyVisible;
+    std::vector<uint32_t> docBodyIds;
+    // Push bodyVisible to the renderer (per-slot draw skip) and the id pass (pick skip). Call
+    // after any toggle; loadDocMesh calls it after every setMeshes/setDoc.
+    void applyBodyVisibility();
+
     // ---- Wave-2 shared UI state (cross-panel contracts; each field has one writer + one reader) ----
     // True while SketchMode runs the SolidWorks-style "pick a plane to start the sketch" step.
     // Writer: sketch_mode. Readers: viewport_panel (force-show origin planes, suppress its own

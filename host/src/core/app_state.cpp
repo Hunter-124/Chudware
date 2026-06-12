@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <thread>
 
 #include "app_state.h"
@@ -410,8 +411,10 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err) {
     // Shaded view: render each body with its AICM color (camera bounds come from here).
     // C19: attach any SCLR / DISP overlay arrays so the renderer can colormap + deform.
     std::vector<Renderer::PartMesh> pms;
+    std::vector<uint32_t> newBodyIds;  // AICM body id per renderer slot (parallels pms)
     for (const auto& b : doc.bodies) {
         if (b.pos.empty()) continue;
+        newBodyIds.push_back(b.body_id);
         Renderer::PartMesh pm;
         pm.mesh = meshFromBody(b);
         pm.color[0] = b.color[0]; pm.color[1] = b.color[1]; pm.color[2] = b.color[2];
@@ -447,6 +450,15 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err) {
 
     if (!idPass->setDoc(doc, err)) return false;
     if (!overlays->setDoc(doc, err)) return false;
+
+    // Solid Bodies visibility: a rebuild with the SAME body-id list keeps the user's hidden set
+    // (hide-by-ordinal is stable while the body set is unchanged); a different list — a feature
+    // added/removed a body, so ordinals realigned — resets everything to visible. (Documented
+    // limitation: hides are by ordinal, not by persistent body identity.)
+    if (docBodyIds != newBodyIds || bodyVisible.size() != newBodyIds.size())
+        bodyVisible.assign(newBodyIds.size(), 1);
+    docBodyIds = std::move(newBodyIds);
+    applyBodyVisibility();
 
     // C26-C: build per-face normal + centroid cache while the DocMesh is still in memory.
     // For each face, accumulate area-weighted triangle normals and centroids.
@@ -562,6 +574,11 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err) {
 void AppState::clearViewportForNewDoc() {
     if (renderer) renderer->setMeshes(std::vector<Renderer::PartMesh>{});
     hasDocMesh = false;
+    // Solid Bodies visibility: a fresh doc starts with no bodies and nothing hidden (stale hides
+    // must never leak into the next document).
+    bodyVisible.clear();
+    docBodyIds.clear();
+    applyBodyVisibility();
     asmParts.clear();
     selectedPart = -1;
     selection.clear();
@@ -581,6 +598,23 @@ void AppState::clearViewportForNewDoc() {
     sketchPlanePickActive = false;
     featureHighlightFaces.clear();
     zoomToBBoxRequested = false;
+}
+
+// Solid Bodies hide/show: push the host-side visibility mask to the renderer (per-slot draw
+// skip) and to the id pass (hidden-body pick skip), keeping both perfectly in sync. Safe to call
+// with no doc loaded (both sinks tolerate empty state).
+void AppState::applyBodyVisibility() {
+    if (renderer) {
+        size_t n = std::min(bodyVisible.size(), renderer->bodyCount());
+        for (size_t i = 0; i < n; ++i) renderer->setBodyVisible(i, bodyVisible[i] != 0);
+    }
+    if (idPass) {
+        std::set<uint32_t> hidden;
+        size_t n = std::min(bodyVisible.size(), docBodyIds.size());
+        for (size_t i = 0; i < n; ++i)
+            if (!bodyVisible[i]) hidden.insert(docBodyIds[i]);
+        idPass->setHiddenBodies(hidden);
+    }
 }
 
 std::string AppState::pickLabel(const render::PickHit& h) const {

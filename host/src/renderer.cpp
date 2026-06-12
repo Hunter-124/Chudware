@@ -481,6 +481,14 @@ bool Renderer::scalarRange(float& vmin, float& vmax) const {
     return false;
 }
 
+// Per-body hide/show (Solid Bodies folder). Bumps the mesh revision so the View Selector
+// thumbnail cache redraws with the new visibility set.
+void Renderer::setBodyVisible(size_t index, bool visible) {
+    if (index >= subs_.size() || subs_[index].visible == visible) return;
+    subs_[index].visible = visible;
+    ++meshesRevision_;
+}
+
 void Renderer::setMesh(const Mesh& m) {
     PartMesh p;
     p.mesh = m;
@@ -698,6 +706,7 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
         glPolygonOffset(1.0f, 1.0f);
         if (hlr) glUniform1i(useScalarLoc, 0);
         for (const auto& s : subs_) {
+            if (!s.visible) continue;   // Solid Bodies: hidden body draws nothing
             bool useScalar = !hlr && colormap_ && s.hasScalar;
             glUniform1i(useScalarLoc, useScalar ? 1 : 0);
             if (useScalar) {
@@ -742,7 +751,7 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
             glDepthFunc(GL_GREATER);
             glUniform3f(eColorLoc, 0.62f, 0.65f, 0.70f);  // dim grey for hidden edges
             for (const auto& s : subs_) {
-                if (s.edgeVerts <= 0) continue;
+                if (!s.visible || s.edgeVerts <= 0) continue;
                 glBindVertexArray(s.edgeVao);
                 glDrawArrays(GL_LINES, 0, s.edgeVerts);
             }
@@ -751,7 +760,7 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
 
         glUniform3fv(eColorLoc, 1, edgeColor_);
         for (const auto& s : subs_) {
-            if (s.edgeVerts <= 0) continue;
+            if (!s.visible || s.edgeVerts <= 0) continue;
             glBindVertexArray(s.edgeVao);
             glDrawArrays(GL_LINES, 0, s.edgeVerts);
         }
@@ -861,6 +870,7 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px) {
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(1.0f, 1.0f);
     for (const auto& s : subs_) {
+        if (!s.visible) continue;   // Solid Bodies: thumbnail mirrors viewport visibility
         glUniform3f(colorLoc, s.color[0], s.color[1], s.color[2]);
         glUniform1f(metallicLoc, s.metallic);
         glUniform1f(roughnessLoc, s.roughness);
@@ -877,7 +887,7 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px) {
     glUniform1i(glGetUniformLocation(edgeProg_, "uClipCount"), 0);  // thumbnail: no clip
     glLineWidth(1.0f);  // no supersample here, so 1px lines
     for (const auto& s : subs_) {
-        if (s.edgeVerts <= 0) continue;
+        if (!s.visible || s.edgeVerts <= 0) continue;
         glBindVertexArray(s.edgeVao);
         glDrawArrays(GL_LINES, 0, s.edgeVerts);
     }
@@ -899,6 +909,11 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px) {
 // Drawn with alpha blending, depth-tested but not depth-writing (it sits under the geometry).
 void Renderer::drawGroundShadow(const Mat4& mvp, const Vec3& eye, const Vec3& up) {
     if (subs_.empty() || groundShadow_[3] <= 0.0f) return;
+    // Solid Bodies: the blob is one aggregate (not per-mesh) — drop it only when EVERYTHING is
+    // hidden, so an empty-looking viewport doesn't keep a floating shadow.
+    bool anyVisible = false;
+    for (const auto& s : subs_) if (s.visible) { anyVisible = true; break; }
+    if (!anyVisible) return;
     (void)eye; (void)up;
     // Lowest Z of the model bbox; nudge down a hair to avoid z-fighting with the part's base.
     float groundZ = center_.z - radius_ * 1.0f;
@@ -1090,6 +1105,7 @@ void Renderer::drawSectionCap(const Mat4& mvp, int planeIdx) {
     glUniform1fv(glGetUniformLocation(prog_, "uClipOff"), section_.count, section_.offsets);
     glUniform1i(glGetUniformLocation(prog_, "uUseScalar"), 0);
     for (const auto& s : subs_) {
+        if (!s.visible) continue;   // hidden body never marks the cap stencil
         glBindVertexArray(s.vao);
         glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);
     }

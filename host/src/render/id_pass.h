@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstdint>
+#include <set>
 #include <vector>
 
 #include "aicm_loader.h"
@@ -66,7 +67,17 @@ public:
 
     bool usesRgba8() const { return rgba8_; }
 
+    // Solid Bodies hide/show: bodies in this set are skipped by render(), so hidden geometry is
+    // unpickable (a click goes through to whatever is behind it — never an invisible hit).
+    // Persists across setDoc(); AppState::applyBodyVisibility() re-syncs it after every reload
+    // and clearViewportForNewDoc() clears it.
+    void setHiddenBodies(const std::set<uint32_t>& bodyIds) { hidden_ = bodyIds; }
+
 private:
+    // True when the encoded id belongs to a hidden body (body id lives in bits [31:24]).
+    bool bodyHidden(uint32_t encoded) const {
+        return !hidden_.empty() && hidden_.count((encoded >> 24) & 0xFFu) != 0;
+    }
     void destroy();
     void allocTargets(int w, int h);
 
@@ -99,6 +110,7 @@ private:
     std::vector<FaceDraw> faces_;
     std::vector<EdgeDraw> edges_;
     VertDraw verts_;  // all bodies' brep verts in one buffer; ids drawn one point at a time
+    std::set<uint32_t> hidden_;  // AICM body ids hidden in the viewport (skip in render())
 };
 
 }  // namespace render

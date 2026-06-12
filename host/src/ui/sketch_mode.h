@@ -171,10 +171,19 @@ private:
     // ---- tool helpers ----
     void resetTool();
     void cancelTool();
-    // Snap a free (u,v) to nearby entity endpoints (coincident) + axis directions (h/v); fills the
-    // inferred-constraint list for the next sketch_add_entity. *snapHandle set to the snapped-onto
-    // handle (e.g. "e3.p2") when an endpoint snap fired.
-    void snapPoint(float& u, float& v, std::string& snapHandle) const;
+    // C49: per-frame alignment-inference result filled by snapPoint (dashed lines to the source
+    // points; positional only — no constraint emitted, matching SolidWorks inference lines).
+    struct SnapInfer {
+        bool alignU = false, alignV = false;   // cursor u / v pulled to a source point's u / v
+        ImVec2 srcU{0, 0}, srcV{0, 0};         // (u,v) of the alignment source point(s)
+    };
+    // Snap a free (u,v) to nearby sketch geometry. *snapHandle encodes what fired:
+    //   "e3.p2" / "e4.center" / "e5.p"  point snap -> coincident candidate (existing behavior)
+    //   "mid:e3"                        line-midpoint snap -> midpoint-constraint candidate
+    //   "rim:e5"                        circle/arc rim snap -> point_on (+ maybe tangent) candidate
+    //   ""                              nothing within range
+    // Midpoint/rim/alignment fire only while inferenceOn_; plain point snap is always on.
+    void snapPoint(float& u, float& v, std::string& snapHandle, SnapInfer* infer = nullptr) const;
     int hitTestHandle(const ImVec2& s, std::string& handleOut, float& uOut, float& vOut) const;
     // Nearest WHOLE entity under the screen point (line segment / circle rim / arc rim distance);
     // returns the index into ents_ or -1. Used by Trim / Extend / Offset hover + pick (C29-B).
@@ -227,10 +236,16 @@ private:
     float det_ = 1.0f;
     bool basisOk_ = false;
 
+    // C49: master inference toggle (SolidWorks "sketch snaps/relations"). Default on; no ribbon
+    // UI here — the orchestrator wires a toggle later. When off, only the plain endpoint/center
+    // coincident snap stays (pre-C49 behavior); h/v force, alignment lines, midpoint, rim and
+    // tangent inference all stand down and no auto h/v relation is emitted.
+    bool inferenceOn_ = true;
+
     // active tool state
     SketchTool tool_ = SketchTool::None;
     std::vector<ImVec2> toolUV_;     // in-progress click points in (u,v)
-    std::vector<std::string> toolSnaps_;  // snapped-onto handle per click (for coincident)
+    std::vector<std::string> toolSnaps_;  // per-click snap record (snapPoint encoding, "" = none)
     // C37-D: id of the previous chained Line segment, so the next segment's p1 gets a coincident to
     // its p2 (the chain start handle is otherwise dropped). Cleared by resetTool via cancelTool.
     std::string chainPrevId_;

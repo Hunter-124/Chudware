@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 
 #include "../core/app_state.h"
 #include "../renderer.h"
@@ -22,6 +23,20 @@ constexpr float kSnapPx = 6.0f;        // endpoint coincident snap radius (scree
 constexpr float kHandlePx = 8.0f;      // drag hit-test radius (screen px)
 constexpr float kHVDeg = 5.0f;         // horizontal/vertical auto-relation tolerance (deg)
 constexpr float kGridStep = 10.0f;     // sketch grid spacing (mm)
+// C49 inference tolerances:
+constexpr float kInferHVDeg = 4.0f;    // Line rubber-band h/v direction-snap tolerance (deg)
+constexpr float kTangentDeg = 6.0f;    // Line-on-rim tangent direction-snap tolerance (deg)
+
+// C49: toolSnaps_ entries are either a plain coincident point handle ("e3.p2" / "e4.center" /
+// "e5.p"), or a prefixed inference snap: "mid:<lineId>" (line midpoint), "rim:<circleId>"
+// (point on a circle/arc rim), "tan:<circleId>" (on-rim + tangent direction matched).
+// coincRef() returns the handle only for the plain coincident form.
+inline bool snapHasPrefix(const std::string& s, const char* pfx) { return s.rfind(pfx, 0) == 0; }
+inline std::string coincRef(const std::string& s) {
+    if (snapHasPrefix(s, "mid:") || snapHasPrefix(s, "rim:") || snapHasPrefix(s, "tan:"))
+        return std::string();
+    return s;
+}
 
 // Project a world point through the camera MVP to screen pixels inside [imgMin, imgMin+(vw,vh)].
 // The viewport image is drawn flipped vertically (UV 0,1 -> 1,0), so screen-y uses (1 - ndcY).
@@ -689,30 +704,86 @@ void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSn
                                dimPopupOpen_ = false; dimError_.clear(); dimPopupDriven_ = false; }
 void SketchMode::cancelTool() { resetTool(); }
 
-void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle) const {
+void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfer* infer) const {
     snapHandle.clear();
-    // Endpoint coincident snap: search entity endpoints within kSnapPx in SCREEN space.
-    ImVec2 cur = uvToScreen(u, v);
+    const ImVec2 cur = uvToScreen(u, v);   // raw cursor (snap distances measure from here)
+    // Visit every snappable POINT (handle, u, v) — point snap + alignment share this set.
+    auto forEachPoint = [&](const std::function<void(const std::string&, float, float)>& fn) {
+        for (const auto& e : ents_) {
+            if (e.type == "line" || e.type == "slot") {
+                fn(e.id + ".p1", e.p1[0], e.p1[1]);
+                fn(e.id + ".p2", e.p2[0], e.p2[1]);
+            } else if (e.type == "circle" || e.type == "arc" || e.type == "arc_slot" ||
+                       e.type == "ellipse") {
+                fn(e.id + ".center", e.center[0], e.center[1]);
+            } else if (e.type == "point") {
+                fn(e.id + ".p", e.p1[0], e.p1[1]);
+            } else if (e.type == "spline") {  // C42: sub-handles p0..pN (sketch_solver convention)
+                for (size_t i = 0; i < e.pts.size(); ++i)
+                    fn(e.id + ".p" + std::to_string(i), e.pts[i].x, e.pts[i].y);
+            }
+        }
+    };
+    // 1) Endpoint/center/point coincident snap within kSnapPx (screen space) — highest priority.
     float best = kSnapPx * kSnapPx;
-    auto consider = [&](const std::string& handle, float eu, float ev) {
+    forEachPoint([&](const std::string& handle, float eu, float ev) {
         ImVec2 s = uvToScreen(eu, ev);
         float dx = s.x - cur.x, dy = s.y - cur.y;
         float d2 = dx * dx + dy * dy;
         if (d2 < best) { best = d2; snapHandle = handle; u = eu; v = ev; }
-    };
-    for (const auto& e : ents_) {
-        if (e.type == "line" || e.type == "slot") {
-            consider(e.id + ".p1", e.p1[0], e.p1[1]);
-            consider(e.id + ".p2", e.p2[0], e.p2[1]);
-        } else if (e.type == "circle" || e.type == "arc" || e.type == "arc_slot" ||
-                   e.type == "ellipse") {
-            consider(e.id + ".center", e.center[0], e.center[1]);
-        } else if (e.type == "point") {
-            consider(e.id + ".p", e.p1[0], e.p1[1]);
-        } else if (e.type == "spline") {   // C42: sub-handles p0..pN (sketch_solver convention)
-            for (size_t i = 0; i < e.pts.size(); ++i)
-                consider(e.id + ".p" + std::to_string(i), e.pts[i].x, e.pts[i].y);
+    });
+    if (!inferenceOn_) return;   // master toggle: everything below is C49 inference
+    // 2) Line-midpoint snap ("mid:<id>") — only when no point snap fired.
+    if (snapHandle.empty()) {
+        best = kSnapPx * kSnapPx;
+        for (const auto& e : ents_) {
+            if (e.type != "line") continue;
+            float mu2 = (e.p1[0] + e.p2[0]) * 0.5f, mv2 = (e.p1[1] + e.p2[1]) * 0.5f;
+            ImVec2 s = uvToScreen(mu2, mv2);
+            float dx = s.x - cur.x, dy = s.y - cur.y;
+            float d2 = dx * dx + dy * dy;
+            if (d2 < best) { best = d2; snapHandle = "mid:" + e.id; u = mu2; v = mv2; }
         }
+    }
+    // 3) Circle/arc RIM snap ("rim:<id>"): within kSnapPx of the rim (full-circle metric, like
+    //    hitTestEntity), pulled to the exact rim along the center->cursor ray. Tiny circles
+    //    (rim within 2*kSnapPx of the center) are skipped — the center snap owns those.
+    if (snapHandle.empty()) {
+        best = kSnapPx;          // compare |dist - r| in px (1D)
+        for (const auto& e : ents_) {
+            if (e.type != "circle" && e.type != "arc") continue;
+            ImVec2 cc = uvToScreen(e.center[0], e.center[1]);
+            ImVec2 rimRef = uvToScreen(e.center[0] + e.radius, e.center[1]);
+            float rpx = std::hypot(rimRef.x - cc.x, rimRef.y - cc.y);
+            if (rpx < 2.0f * kSnapPx) continue;
+            float dm = std::hypot(cur.x - cc.x, cur.y - cc.y);
+            float d = std::fabs(dm - rpx);
+            if (d < best) {
+                float a = std::atan2(v - e.center[1], u - e.center[0]);
+                best = d; snapHandle = "rim:" + e.id;
+                u = e.center[0] + e.radius * std::cos(a);
+                v = e.center[1] + e.radius * std::sin(a);
+            }
+        }
+    }
+    // 4) Alignment inference (positional only — SolidWorks-style dashed lines, no constraint):
+    //    cursor u (or v) within kSnapPx of a source point's u (or v), the point itself clearly
+    //    OUTSIDE the coincident radius (else the dashed line degenerates / fights the point snap).
+    if (infer && snapHandle.empty()) {
+        const float pxPerU = std::hypot(uAxisS_.x, uAxisS_.y);
+        const float pxPerV = std::hypot(vAxisS_.x, vAxisS_.y);
+        float bestU = kSnapPx, bestV = kSnapPx;   // screen-px distance along each axis
+        forEachPoint([&](const std::string&, float eu, float ev) {
+            ImVec2 s = uvToScreen(eu, ev);
+            float d2 = (s.x - cur.x) * (s.x - cur.x) + (s.y - cur.y) * (s.y - cur.y);
+            if (d2 < (2.0f * kSnapPx) * (2.0f * kSnapPx)) return;  // too close to the point itself
+            float dU = std::fabs(eu - u) * pxPerU;
+            float dV = std::fabs(ev - v) * pxPerV;
+            if (dU < bestU) { bestU = dU; infer->alignU = true; infer->srcU = ImVec2(eu, ev); }
+            if (dV < bestV) { bestV = dV; infer->alignV = true; infer->srcV = ImVec2(eu, ev); }
+        });
+        if (infer->alignU) u = infer->srcU.x;
+        if (infer->alignV) v = infer->srcV.y;
     }
 }
 
@@ -2179,9 +2250,85 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
 
     // ---- drawing tools: rubber-band preview + click handling ----
     if (!editTool && tool_ != SketchTool::None && tool_ != SketchTool::SmartDim) {
-        // Snap the live cursor for preview + inference glyphs.
+        // Snap the live cursor for preview + inference glyphs (C49: point snap + midpoint/rim
+        // snap + alignment inference, see snapPoint).
         float su = mu, sv = mv; std::string snapH;
-        if (imgHovered) snapPoint(su, sv, snapH);
+        SnapInfer infer;
+        if (imgHovered) snapPoint(su, sv, snapH, &infer);
+
+        // C49: direction inference for the Line tool's SECOND point only (polygon/spline legs
+        // and the 3-pt arc chord deliberately stay free). Priority: point snap > tangent > h/v.
+        bool hvH = false, hvV = false;       // live h/v chip + exact-direction force
+        bool tanSnap = false;                // live tangent chip
+        bool tanStartUpgrade = false;        // placement click upgrades toolSnaps_[0] rim->tan
+        if (inferenceOn_ && imgHovered && tool_ == SketchTool::Line && toolUV_.size() == 1) {
+            const ImVec2 a = toolUV_[0];
+            const float D2R = 3.14159265f / 180.0f;
+            if (snapHasPrefix(snapH, "rim:")) {
+                // (a) END point on a circle/arc rim: if the segment is nearly tangent there,
+                // pull it to the EXACT tangent contact seen from the fixed start point.
+                const SketchEntity* ce = entById(snapH.substr(4));
+                if (ce && (ce->type == "circle" || ce->type == "arc") && ce->radius > 1e-5f) {
+                    float cx = ce->center[0], cy = ce->center[1], r = ce->radius;
+                    float dx = a.x - cx, dy = a.y - cy;
+                    float d = std::hypot(dx, dy);
+                    float segx = su - a.x, segy = sv - a.y;
+                    float segL = std::hypot(segx, segy);
+                    if (d > r + 1e-4f && segL > 1e-5f) {       // start outside; tangent exists
+                        // tangent direction at the current rim point = perp(rim - center)
+                        float tx = -(sv - cy), ty = su - cx;
+                        float tL = std::hypot(tx, ty);
+                        float cosang = std::fabs(segx * tx + segy * ty) / (segL * tL);
+                        if (std::acos(std::fmin(1.0f, cosang)) < kTangentDeg * D2R) {
+                            // exact contacts: center angle alpha +/- beta, cos(beta) = r/d
+                            float alpha = std::atan2(dy, dx);
+                            float beta = std::acos(std::fmax(-1.0f, std::fmin(1.0f, r / d)));
+                            float u1 = cx + r * std::cos(alpha + beta), v1 = cy + r * std::sin(alpha + beta);
+                            float u2 = cx + r * std::cos(alpha - beta), v2 = cy + r * std::sin(alpha - beta);
+                            bool first = std::hypot(u1 - su, v1 - sv) <= std::hypot(u2 - su, v2 - sv);
+                            su = first ? u1 : u2; sv = first ? v1 : v2;
+                            snapH = "tan:" + ce->id;
+                            tanSnap = true;
+                        }
+                    }
+                }
+            } else if (snapH.empty()) {
+                // (b) START point sits on a rim: keep the segment tangent at that contact.
+                if (!toolSnaps_.empty() && (snapHasPrefix(toolSnaps_[0], "rim:") ||
+                                            snapHasPrefix(toolSnaps_[0], "tan:"))) {
+                    const SketchEntity* ce = entById(toolSnaps_[0].substr(4));
+                    if (ce && (ce->type == "circle" || ce->type == "arc")) {
+                        float tx = -(a.y - ce->center[1]), ty = a.x - ce->center[0];
+                        float tL = std::hypot(tx, ty);
+                        float segx = su - a.x, segy = sv - a.y;
+                        float segL = std::hypot(segx, segy);
+                        if (tL > 1e-5f && segL > 1e-5f) {
+                            float cosang = std::fabs(segx * tx + segy * ty) / (segL * tL);
+                            if (std::acos(std::fmin(1.0f, cosang)) < kTangentDeg * D2R) {
+                                float s = (segx * tx + segy * ty) / (tL * tL);  // project on tangent
+                                su = a.x + tx * s; sv = a.y + ty * s;
+                                tanSnap = true; tanStartUpgrade = true;
+                                infer.alignU = infer.alignV = false;  // direction owns the point now
+                            }
+                        }
+                    }
+                }
+                // (c) plain h/v direction snap (kInferHVDeg) — skipped when tangent fired.
+                if (!tanSnap) {
+                    float du = su - a.x, dv = sv - a.y;
+                    float ang = std::atan2(std::fabs(dv), std::fabs(du)) * 57.2957795f;
+                    if (ang < kInferHVDeg && (du != 0.0f || dv != 0.0f)) {
+                        // drop a conflicting v-alignment (h/v force wins its own axis; an
+                        // alignment on the OTHER axis combines — SW-style intersection).
+                        if (infer.alignV && infer.srcV.y != a.y) infer.alignV = false;
+                        sv = a.y; hvH = true;
+                    } else if (ang > 90.0f - kInferHVDeg) {
+                        if (infer.alignU && infer.srcU.x != a.x) infer.alignU = false;
+                        su = a.x; hvV = true;
+                    }
+                }
+            }
+        }
         ImVec2 sCur = uvToScreen(su, sv);
         const ImU32 prevCol = col(pal.accent, 0.9f);
 
@@ -2510,11 +2657,60 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             }
         }
 
-        // Cursor marker + inference glyph.
-        dl->AddCircle(sCur, 4.0f, prevCol, 12, 1.5f);
-        if (!snapH.empty()) {  // coincident inference glyph (small square)
-            dl->AddRect(ImVec2(sCur.x - 6, sCur.y - 6), ImVec2(sCur.x + 6, sCur.y + 6),
-                        col(pal.accent), 0, 0, 1.6f);
+        // ---- C49: inference feedback (dashed alignment lines, snap markers, relation chips) ----
+        const ImU32 inferCol = col(pal.sketchInfer);
+        if (infer.alignU || infer.alignV) {
+            // Dashed line from the alignment source point to the cursor (positional only).
+            auto dashed = [&](ImVec2 a, ImVec2 b) {
+                float dx = b.x - a.x, dy = b.y - a.y;
+                float L = std::hypot(dx, dy);
+                if (L < 1.0f) return;
+                const float dash = 6.0f * ui::uiScale, gap = 4.0f * ui::uiScale;
+                for (float t = 0; t < L; t += dash + gap) {
+                    float e = std::fmin(t + dash, L);
+                    dl->AddLine(ImVec2(a.x + dx * (t / L), a.y + dy * (t / L)),
+                                ImVec2(a.x + dx * (e / L), a.y + dy * (e / L)), inferCol, 1.2f);
+                }
+            };
+            if (infer.alignU) dashed(uvToScreen(infer.srcU.x, infer.srcU.y), sCur);
+            if (infer.alignV) dashed(uvToScreen(infer.srcV.x, infer.srcV.y), sCur);
+        }
+        // Cursor marker.
+        dl->AddCircle(sCur, 4.0f * ui::uiScale, prevCol, 12, 1.5f);
+        // Snap markers (unified, ui::uiScale-scaled): yellow-ish dot = endpoint/point snap,
+        // concentric rings = center snap, diamond = midpoint snap, plain ring = rim contact.
+        if (!snapH.empty()) {
+            const float ms = 5.0f * ui::uiScale;
+            if (snapHasPrefix(snapH, "mid:")) {
+                ImVec2 d[4] = {ImVec2(sCur.x, sCur.y - ms * 1.5f), ImVec2(sCur.x + ms * 1.5f, sCur.y),
+                               ImVec2(sCur.x, sCur.y + ms * 1.5f), ImVec2(sCur.x - ms * 1.5f, sCur.y)};
+                dl->AddQuad(d[0], d[1], d[2], d[3], inferCol, 1.6f);
+            } else if (snapHasPrefix(snapH, "rim:") || snapHasPrefix(snapH, "tan:")) {
+                dl->AddCircle(sCur, ms * 1.4f, inferCol, 16, 1.6f);
+            } else if (snapH.find(".center") != std::string::npos) {
+                dl->AddCircle(sCur, ms, inferCol, 16, 1.6f);
+                dl->AddCircle(sCur, ms * 1.9f, inferCol, 16, 1.2f);
+            } else {  // endpoint / point / spline through-point
+                dl->AddCircleFilled(sCur, ms * 0.7f, inferCol);
+                dl->AddCircle(sCur, ms * 1.4f, inferCol, 16, 1.2f);
+            }
+        }
+        // Live relation chips near the cursor (same style as the C41 relation badges).
+        if (hvH || hvV || tanSnap) {
+            const float bs2 = 16.0f * ui::uiScale;
+            float chipX = sCur.x + bs2;                       // below-right of the cursor
+            auto chip = [&](const char* glyph) {
+                ImVec2 gp(chipX, sCur.y + bs2);
+                ImVec2 c0(gp.x - bs2 * 0.5f, gp.y - bs2 * 0.5f), c1(gp.x + bs2 * 0.5f, gp.y + bs2 * 0.5f);
+                dl->AddRectFilled(c0, c1, col(pal.sketchRelBg), 3.5f * ui::uiScale);
+                dl->AddRect(c0, c1, col(pal.sketchRelBorder), 3.5f * ui::uiScale, 0, 1.2f);
+                ImVec2 gs = ImGui::CalcTextSize(glyph);
+                dl->AddText(ImVec2(gp.x - gs.x * 0.5f, gp.y - gs.y * 0.5f), col(pal.sketchInk), glyph);
+                chipX += bs2 + 2.0f;
+            };
+            if (hvH) chip("-");
+            if (hvV) chip("|");
+            if (tanSnap) chip("T");
         }
 
         // Click placement.
@@ -2525,17 +2721,48 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             if (tool_ == SketchTool::Line && toolUV_.size() == 2) {
                 ImVec2 p1 = toolUV_[0], p2 = toolUV_[1];
                 nlohmann::json cs = nlohmann::json::array();
-                // Auto h/v relation if within tolerance.
+                // C49: a rim-snapped START whose placement direction matched gets the tangent too.
+                if (tanStartUpgrade && snapHasPrefix(toolSnaps_[0], "rim:"))
+                    toolSnaps_[0] = "tan:" + toolSnaps_[0].substr(4);
+                bool tangentSeg = snapHasPrefix(toolSnaps_[0], "tan:") ||
+                                  snapHasPrefix(toolSnaps_[1], "tan:");
+                // Auto h/v relation (inference only). When the END landed on a snapped point that
+                // point wins: only add h/v if the result is EXACTLY axis-aligned. A tangent-snapped
+                // direction never gets h/v stacked on top.
                 float du = p2.x - p1.x, dv = p2.y - p1.y;
-                float ang = std::atan2(std::fabs(dv), std::fabs(du)) * 57.2957795f;
-                if (ang < kHVDeg) cs.push_back({{"type", "horizontal"}, {"refs", {"$self"}}});
-                else if (ang > 90.0f - kHVDeg) cs.push_back({{"type", "vertical"}, {"refs", {"$self"}}});
-                // C37-D: coincident on the start endpoint — from the chained predecessor's p2 (so a
-                // continued chain stays constrained) OR from a snapped existing endpoint.
+                if (inferenceOn_ && !tangentSeg) {
+                    float ang = std::atan2(std::fabs(dv), std::fabs(du)) * 57.2957795f;
+                    float tol = toolSnaps_[1].empty() ? kHVDeg : 0.01f;
+                    if (ang < tol) cs.push_back({{"type", "horizontal"}, {"refs", {"$self"}}});
+                    else if (ang > 90.0f - tol) cs.push_back({{"type", "vertical"}, {"refs", {"$self"}}});
+                }
+                // C49: snap-derived constraint for one endpoint (pt = "$self.p1"/"$self.p2"):
+                // plain handle -> coincident; "mid:" -> midpoint; "rim:"/"tan:" -> point_on
+                // (+ one tangent per segment).
+                bool tangentEmitted = false;
+                auto snapCons = [&](const std::string& snap, const char* pt) {
+                    if (snap.empty()) return;
+                    if (snapHasPrefix(snap, "mid:")) {
+                        cs.push_back({{"type", "midpoint"}, {"refs", {pt, snap.substr(4)}}});
+                    } else if (snapHasPrefix(snap, "rim:") || snapHasPrefix(snap, "tan:")) {
+                        std::string eid = snap.substr(4);
+                        cs.push_back({{"type", "point_on"}, {"refs", {pt, eid}}});
+                        if (snapHasPrefix(snap, "tan:") && !tangentEmitted) {
+                            cs.push_back({{"type", "tangent"}, {"refs", {"$self", eid}}});
+                            tangentEmitted = true;
+                        }
+                    } else {
+                        cs.push_back({{"type", "coincident"}, {"refs", {snap, pt}}});
+                    }
+                };
+                // C37-D: start endpoint — from the chained predecessor's p2 (so a continued chain
+                // stays constrained) OR from the start click's snap.
                 if (!chainPrevId_.empty())
                     cs.push_back({{"type", "coincident"}, {"refs", {chainPrevId_ + ".p2", "$self.p1"}}});
-                else if (!toolSnaps_[0].empty())
-                    cs.push_back({{"type", "coincident"}, {"refs", {toolSnaps_[0], "$self.p1"}}});
+                else
+                    snapCons(toolSnaps_[0], "$self.p1");
+                // C49: the END click's snap is now constrained too (was positional-only before).
+                snapCons(toolSnaps_[1], "$self.p2");
                 nlohmann::json ent = {{"type", "line"},
                     {"p1", nlohmann::json::array({p1.x, p1.y})},
                     {"p2", nlohmann::json::array({p2.x, p2.y})}};
@@ -2812,13 +3039,16 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     float a0 = fwd ? aS : aE, a1 = fwd ? aE : aS;
                     // Endpoint snaps -> coincidents onto the arc's start/end handles (like Line);
                     // when reversed, p1 sits on the "end" handle and p2 on "start".
+                    // C49: only PLAIN point snaps become coincidents here — midpoint/rim snaps on
+                    // arc picks stay positional (coincRef filters the prefixed records).
                     nlohmann::json cs = nlohmann::json::array();
-                    if (!toolSnaps_[0].empty())
+                    std::string s0 = coincRef(toolSnaps_[0]), s1 = coincRef(toolSnaps_[1]);
+                    if (!s0.empty())
                         cs.push_back({{"type", "coincident"},
-                                      {"refs", {toolSnaps_[0], fwd ? "$self.start" : "$self.end"}}});
-                    if (!toolSnaps_[1].empty())
+                                      {"refs", {s0, fwd ? "$self.start" : "$self.end"}}});
+                    if (!s1.empty())
                         cs.push_back({{"type", "coincident"},
-                                      {"refs", {toolSnaps_[1], fwd ? "$self.end" : "$self.start"}}});
+                                      {"refs", {s1, fwd ? "$self.end" : "$self.start"}}});
                     nlohmann::json ent = {{"type", "arc"},
                         {"center", nlohmann::json::array({cu, cv})}, {"radius", rad},
                         {"start", a0}, {"end", a1}, {"ccw", true}};
@@ -2859,7 +3089,16 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             } else if (tool_ == SketchTool::Point && toolUV_.size() == 1) {
                 nlohmann::json ent = {{"type", "point"},
                     {"p", nlohmann::json::array({toolUV_[0].x, toolUV_[0].y})}};
-                addEntity(st, ent, nlohmann::json::array());
+                // C49: a snapped Point pick gets the matching relation (its handle is "$self.p").
+                nlohmann::json cs = nlohmann::json::array();
+                const std::string& sp = toolSnaps_[0];
+                if (snapHasPrefix(sp, "mid:"))
+                    cs.push_back({{"type", "midpoint"}, {"refs", {"$self.p", sp.substr(4)}}});
+                else if (snapHasPrefix(sp, "rim:") || snapHasPrefix(sp, "tan:"))
+                    cs.push_back({{"type", "point_on"}, {"refs", {"$self.p", sp.substr(4)}}});
+                else if (!sp.empty())
+                    cs.push_back({{"type", "coincident"}, {"refs", {sp, "$self.p"}}});
+                addEntity(st, ent, cs);
                 toolUV_.clear(); toolSnaps_.clear();   // stay armed (SW point tool repeats)
             } else if (tool_ == SketchTool::Ellipse && toolUV_.size() == 3) {
                 // center, major-axis end (rx + rot), minor point (ry = perp distance).

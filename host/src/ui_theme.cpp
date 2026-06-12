@@ -90,6 +90,8 @@ static void fillDark(Palette& p) {
     // C41: relation-badge chips (light green fill + darker green border; glyph = sketchInk).
     set4(p.sketchRelBg,     0.550f,0.780f,0.550f, 0.90f);
     set4(p.sketchRelBorder, 0.300f,0.520f,0.300f, 1);
+    // C49: inference ink (dashed alignment lines + snap markers) — amber on the light canvas.
+    set4(p.sketchInfer,     0.950f,0.650f,0.200f, 0.85f);
     // status
     set4(p.statusOk,   0.176f,0.831f,0.749f, 1);
     set4(p.statusWarn, 0.953f,0.761f,0.420f, 1);
@@ -206,6 +208,8 @@ static void fillLight(Palette& p) {
     // C41: relation-badge chips (same in both themes — drawn on the light canvas).
     set4(p.sketchRelBg,     0.550f,0.780f,0.550f, 0.90f);
     set4(p.sketchRelBorder, 0.300f,0.520f,0.300f, 1);
+    // C49: inference ink (same in both themes — drawn on the light canvas).
+    set4(p.sketchInfer,     0.950f,0.650f,0.200f, 0.85f);
     // status
     set4(p.statusOk,   0.039f,0.573f,0.176f, 1);    // #0A9230 green
     set4(p.statusWarn, 0.784f,0.549f,0.000f, 1);    // #C88C00 amber

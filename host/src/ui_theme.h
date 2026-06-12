@@ -99,6 +99,9 @@ struct Palette {
     // the glyph itself is drawn with sketchInk (dark on the light canvas in both themes).
     float sketchRelBg[4]     = {0.550f,0.780f,0.550f, 0.90f};
     float sketchRelBorder[4] = {0.300f,0.520f,0.300f, 1};
+    // C49: sketch inference ink (dashed alignment lines + snap markers). Amber so it reads on
+    // the light canvas in both themes and never collides with the under-defined blue.
+    float sketchInfer[4]     = {0.950f,0.650f,0.200f, 0.85f};
 
     // ---- status ----
     float statusOk[4]   = {0.176f,0.831f,0.749f, 1};   // same as accent

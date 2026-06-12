@@ -164,10 +164,14 @@ public:
     // For interactive use prefer the OK/Cancel header buttons.
     void closeIfActive() { if (active_) close(); }
 
+    // C43: public cancel — revert every preview batch to the open-time checkpoint and close.
+    // Used by the ribbon dispatcher when a sketch command must displace an open form
+    // (mutual exclusion: a PM and the plane-pick overlay must never coexist).
+    void cancelEdits(AppState& st); // Cancel: undo every preview batch
+
 private:
     void close();
     void commit(AppState& st);     // OK
-    void cancelEdits(AppState& st); // Cancel: undo every preview batch
     void buildOpFeature(nlohmann::json& feature) const;   // assemble {type,name,params,refs}
     void applyPreview(AppState& st);  // add (first) or edit_feature; debounced
     void loadFromTree(AppState& st, const nlohmann::json& feature);  // edit-path populate

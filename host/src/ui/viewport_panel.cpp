@@ -1291,9 +1291,21 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 if (y0 + ts.y + 6 > vr1.y) y0 = vr1.y - ts.y - 6;
                 if (y0 < vr0.y + 2) y0 = vr0.y + 2;
                 ImVec2 q0(x0, y0), q1(x0 + ts.x + 12, y0 + ts.y + 6);
+                // C43: during plane-pick the label chips are CLICK TARGETS too (the quads
+                // overlap heavily near the origin; the labels are unambiguous).
+                bool chipHovered = st.sketchPlanePickActive &&
+                                   ImGui::IsMouseHoveringRect(q0, q1);
                 vdl->AddRectFilled(q0, q1, overlayBg, 4.0f);
-                vdl->AddRect(q0, q1, planeChipBord, 4.0f);
+                vdl->AddRect(q0, q1, chipHovered ? ui::Palette::toU32(vpal.accent)
+                                                 : planeChipBord, 4.0f, 0,
+                             chipHovered ? 2.0f : 1.0f);
                 vdl->AddText(ImVec2(x0 + 6, y0 + 3), overlayTxt, nm);
+                if (chipHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                    st.sketchMode) {
+                    static const char* kPlaneSel[3] = {"plane.front", "plane.top", "plane.right"};
+                    st.sketchPlanePickActive = false;
+                    st.sketchMode->createSketchOnPlane(st, kPlaneSel[p]);
+                }
             }
         }
 

@@ -204,6 +204,11 @@ int run_gui(const char* screenshotPath) {
     // first so the sketch experience takes priority over any PM form for those ids.
     ui::setRibbonCallback([&st, &propertyManager, &sketchMode, &simPanel,
                            &evaluateDialogs, &asmPanels](const char* cmd_id) {
+        // C43: starting a sketch while a PM form is open cancels the form first (revert
+        // preview + close). Without this, plane-pick and the PM coexisted: the PM hid the
+        // FeatureManager, both fought over the viewport mouse, and Esc couldn't untangle it.
+        if (propertyManager.active() && std::strcmp(cmd_id, "sketch_new") == 0)
+            propertyManager.cancelEdits(st);
         if (sketchMode.onRibbonCommand(st, cmd_id)) return;       // C18 sketch tool handled
         // C20b: Assembly tab + New Assembly route to the assembly panels first.
         {
@@ -223,6 +228,9 @@ int run_gui(const char* screenshotPath) {
     // C25: expose the same dispatcher to UI widgets (shortcut bar, gesture wheel).
     st.ribbonDispatch = [&st, &propertyManager, &sketchMode, &simPanel,
                          &evaluateDialogs, &asmPanels](const char* cmd_id) {
+        // C43: same PM-vs-sketch mutual exclusion as the ribbon callback above.
+        if (propertyManager.active() && std::strcmp(cmd_id, "sketch_new") == 0)
+            propertyManager.cancelEdits(st);
         if (sketchMode.onRibbonCommand(st, cmd_id)) return;
         {
             std::string cmd(cmd_id);

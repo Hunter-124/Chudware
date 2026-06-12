@@ -144,11 +144,20 @@ static void parseEntities(const nlohmann::json& res, std::vector<SketchEntity>& 
             }
         };
         v2("p1", se.p1); v2("p2", se.p2); v2("center", se.center);
+        v2("p", se.p1);   // C42: point/text store their anchor as "p" — reuse p1
         se.radius = e.value("radius", 0.0f);
         se.start = e.value("start", 0.0f);
         se.end = e.value("end", 0.0f);
         se.ccw = e.value("ccw", true);
         se.width = e.value("width", 0.0f);
+        se.rx = e.value("rx", 0.0f);          // C42: ellipse
+        se.ry = e.value("ry", 0.0f);
+        se.rot = e.value("rot", 0.0f);
+        se.pts.clear();                       // C42: spline through-points
+        if (e.contains("points") && e["points"].is_array())
+            for (const auto& q : e["points"])
+                if (q.is_array() && q.size() == 2)
+                    se.pts.push_back(ImVec2(q[0].get<float>(), q[1].get<float>()));
         if (se.type == "arc_slot") {   // arc_slot stores spine angles as a0/a1 (CCW)
             se.start = e.value("a0", 0.0f);
             se.end = e.value("a1", 0.0f);
@@ -322,6 +331,49 @@ void SketchMode::addQuadLoop(AppState& st, const ImVec2 corners[4], const char* 
         if (tok.find("parallel") != std::string::npos) pair("parallel", ids[i], ids[i + 2]);
         if (tok.find("equal") != std::string::npos)    pair("equal",    ids[i], ids[i + 2]);
         if (tok.find("perpendicular") != std::string::npos) pair("perpendicular", ids[i], ids[i + 1]);
+    }
+    resolve(st);
+}
+
+// C42: N-line closed loop (generalized addQuadLoop without the per-edge h/v relations). Each edge
+// gets a chained coincident to its predecessor's p2 (+ loop-closing coincident); equalEdges adds
+// "equal" between consecutive edges so a Polygon stays regular-ish under drag.
+void SketchMode::addPolyLoop(AppState& st, const std::vector<ImVec2>& corners, bool equalEdges) {
+    const size_t n = corners.size();
+    if (n < 3) return;
+    std::vector<std::string> ids(n);
+    std::string prevId, firstId;
+    for (size_t i = 0; i < n; ++i) {
+        size_t j = (i + 1) % n;
+        nlohmann::json cs = nlohmann::json::array();
+        if (!prevId.empty())
+            cs.push_back({{"type", "coincident"}, {"refs", {prevId + ".p2", "$self.p1"}}});
+        nlohmann::json ent = {{"type", "line"},
+            {"p1", nlohmann::json::array({corners[i].x, corners[i].y})},
+            {"p2", nlohmann::json::array({corners[j].x, corners[j].y})}};
+        nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_},
+                             {"entity", ent}, {"constraints", cs}};
+        auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+        if (!r.ok) { st.addLog("[sketch] poly line failed: " + r.error_message); break; }
+        std::string nid = (r.id_map.is_object() && r.id_map.contains("$0"))
+                        ? r.id_map["$0"].get<std::string>() : std::string();
+        ids[i] = nid;
+        if (i == 0) firstId = nid;
+        prevId = nid;
+        if (i == n - 1 && !firstId.empty() && !nid.empty()) {
+            nlohmann::json clop = {{"op", "sketch_add_constraint"}, {"sketch", fid_},
+                {"constraint", {{"type", "coincident"}, {"refs", {nid + ".p2", firstId + ".p1"}}}}};
+            st.docMirror.applyOps(st.worker, nlohmann::json::array({clop}));
+        }
+        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    }
+    if (equalEdges) {
+        for (size_t i = 0; i + 1 < n; ++i) {
+            if (ids[i].empty() || ids[i + 1].empty()) continue;
+            nlohmann::json op = {{"op", "sketch_add_constraint"}, {"sketch", fid_},
+                {"constraint", {{"type", "equal"}, {"refs", {ids[i], ids[i + 1]}}}}};
+            st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+        }
     }
     resolve(st);
 }
@@ -546,6 +598,46 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sk_extend")          { resetTool(); tool_ = SketchTool::Extend;         return true; }
     if (cmdId == "sk_offset_ent")      { resetTool(); tool_ = SketchTool::Offset;
                                          offsetStage_ = 0; offsetChain_.clear();           return true; }
+    // C42: remaining draw tools.
+    if (cmdId == "sk_arc_3pt")         { resetTool(); tool_ = SketchTool::Arc3pt;         return true; }
+    if (cmdId == "sk_polygon")         { resetTool(); tool_ = SketchTool::Polygon;        return true; }
+    if (cmdId == "sk_rect_center")     { resetTool(); tool_ = SketchTool::RectCenter;     return true; }
+    if (cmdId == "sk_point")           { resetTool(); tool_ = SketchTool::Point;          return true; }
+    if (cmdId == "sk_ellipse" || cmdId == "sk_ellipse_big") {
+        resetTool(); tool_ = SketchTool::Ellipse; return true;
+    }
+    if (cmdId == "sk_spline")          { resetTool(); tool_ = SketchTool::Spline;         return true; }
+    // C42: Construction — immediate toggle on the current selection (engine op
+    // sketch_toggle_construction). Not a tool: the selection survives (entity ids persist).
+    if (cmdId == "sk_construction") {
+        if (selIds_.empty()) {
+            st.toast(ui::ToastLevel::Info,
+                     "Construction: select sketch entities first (click them with no tool armed)");
+            return true;
+        }
+        nlohmann::json ops = nlohmann::json::array();
+        for (const auto& id : selIds_)
+            ops.push_back({{"op", "sketch_toggle_construction"}, {"sketch", fid_}, {"id", id}});
+        auto r = st.docMirror.applyOps(st.worker, ops);
+        if (!r.ok) st.toast(ui::ToastLevel::Error, "Construction: " + r.error_message);
+        else {
+            if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+            resolve(st);
+        }
+        return true;
+    }
+    // C42: minimal Add Relation popup over the current 1-2 entity selection (drawOverlay renders
+    // it; the offered relations depend on the selected entity types).
+    if (cmdId == "sk_relations") {
+        if (selIds_.empty() || selIds_.size() > 2) {
+            st.toast(ui::ToastLevel::Info, "Add Relation: select 1 or 2 sketch entities first");
+            return true;
+        }
+        relIds_ = selIds_;
+        relPopupOpen_ = true;
+        relPopupPos_ = ImGui::GetMousePos();
+        return true;
+    }
     return false;
 }
 
@@ -572,6 +664,12 @@ const char* SketchMode::activeToolCmd() const {
         case SketchTool::Trim:            return "sk_trim";
         case SketchTool::Extend:          return "sk_extend";
         case SketchTool::Offset:          return "sk_offset_ent";
+        case SketchTool::Arc3pt:          return "sk_arc_3pt";
+        case SketchTool::Polygon:         return "sk_polygon";
+        case SketchTool::RectCenter:      return "sk_rect_center";
+        case SketchTool::Point:           return "sk_point";
+        case SketchTool::Ellipse:         return "sk_ellipse_big";
+        case SketchTool::Spline:          return "sk_spline";
         default:                          return "";
     }
 }
@@ -583,6 +681,7 @@ const char* SketchMode::activeToolCmd() const {
 void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSnaps_.clear();
                                conicRho_ = 0.5f; chainPrevId_.clear();
                                selIds_.clear();   // C41 (T2): selection dies with any tool change/exit
+                               relPopupOpen_ = false; relIds_.clear();   // C42: relation popup too
                                offsetStage_ = 0; offsetChain_.clear(); offsetFocusInput_ = false;
                                // C37-D: clear the Smart Dimension state machine.
                                dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr;
@@ -605,10 +704,14 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle) const {
         if (e.type == "line" || e.type == "slot") {
             consider(e.id + ".p1", e.p1[0], e.p1[1]);
             consider(e.id + ".p2", e.p2[0], e.p2[1]);
-        } else if (e.type == "circle" || e.type == "arc" || e.type == "arc_slot") {
+        } else if (e.type == "circle" || e.type == "arc" || e.type == "arc_slot" ||
+                   e.type == "ellipse") {
             consider(e.id + ".center", e.center[0], e.center[1]);
         } else if (e.type == "point") {
             consider(e.id + ".p", e.p1[0], e.p1[1]);
+        } else if (e.type == "spline") {   // C42: sub-handles p0..pN (sketch_solver convention)
+            for (size_t i = 0; i < e.pts.size(); ++i)
+                consider(e.id + ".p" + std::to_string(i), e.pts[i].x, e.pts[i].y);
         }
     }
 }
@@ -626,10 +729,14 @@ int SketchMode::hitTestHandle(const ImVec2& s, std::string& handleOut, float& uO
         if (e.type == "line" || e.type == "slot") {
             consider(e.id + ".p1", e.p1[0], e.p1[1]);
             consider(e.id + ".p2", e.p2[0], e.p2[1]);
-        } else if (e.type == "circle" || e.type == "arc" || e.type == "arc_slot") {
+        } else if (e.type == "circle" || e.type == "arc" || e.type == "arc_slot" ||
+                   e.type == "ellipse") {
             consider(e.id + ".center", e.center[0], e.center[1]);
         } else if (e.type == "point") {
             consider(e.id + ".p", e.p1[0], e.p1[1]);
+        } else if (e.type == "spline") {   // C42: draggable through-points p0..pN
+            for (size_t i = 0; i < e.pts.size(); ++i)
+                consider(e.id + ".p" + std::to_string(i), e.pts[i].x, e.pts[i].y);
         }
     }
     return hit;
@@ -659,6 +766,36 @@ int SketchMode::hitTestEntity(const ImVec2& s, float maxPx) const {
             float rpx = std::hypot(rim.x - cc.x, rim.y - cc.y);
             float dm = std::hypot(s.x - cc.x, s.y - cc.y);
             d2 = (dm - rpx) * (dm - rpx);
+        } else if (e.type == "point") {                       // C42: distance to the point itself
+            ImVec2 p = uvToScreen(e.p1[0], e.p1[1]);
+            d2 = (p.x - s.x) * (p.x - s.x) + (p.y - s.y) * (p.y - s.y);
+        } else if (e.type == "ellipse" || e.type == "spline") {
+            // C42: min distance to a sampled polyline (32-seg ellipse / spline through-points).
+            auto seg2 = [&](ImVec2 a, ImVec2 b) {
+                float vx = b.x - a.x, vy = b.y - a.y;
+                float wx = s.x - a.x, wy = s.y - a.y;
+                float t = (vx * wx + vy * wy) / std::fmax(1e-6f, vx * vx + vy * vy);
+                t = std::fmax(0.0f, std::fmin(1.0f, t));
+                float px = a.x + t * vx, py = a.y + t * vy;
+                return (px - s.x) * (px - s.x) + (py - s.y) * (py - s.y);
+            };
+            if (e.type == "ellipse") {
+                const float D2R = 3.14159265f / 180.0f;
+                float ca = std::cos(e.rot * D2R), sa = std::sin(e.rot * D2R);
+                ImVec2 prev;
+                for (int k = 0; k <= 32; ++k) {
+                    float a = k / 32.0f * 6.2831853f;
+                    float lx = e.rx * std::cos(a), ly = e.ry * std::sin(a);
+                    ImVec2 p = uvToScreen(e.center[0] + lx * ca - ly * sa,
+                                          e.center[1] + lx * sa + ly * ca);
+                    if (k) d2 = std::fmin(d2, seg2(prev, p));
+                    prev = p;
+                }
+            } else {
+                for (size_t k = 1; k < e.pts.size(); ++k)
+                    d2 = std::fmin(d2, seg2(uvToScreen(e.pts[k - 1].x, e.pts[k - 1].y),
+                                            uvToScreen(e.pts[k].x, e.pts[k].y)));
+            }
         }
         if (d2 < best) { best = d2; hit = (int)i; }
     }
@@ -1239,8 +1376,32 @@ void SketchMode::drawGhosts(AppState& st, const ImVec2& imgMin, const ImVec2& im
                         }, 24);
                     }
                 }
+            } else if (e.type == "ellipse") {
+                // C42: rotated parametric sample (rot in degrees).
+                float ca = std::cos(e.rot * D2R), sa = std::sin(e.rot * D2R);
+                poly([&](float t, float& u, float& v) {
+                    float a = t * 6.2831853f;
+                    float lx = e.rx * std::cos(a), ly = e.ry * std::sin(a);
+                    u = e.center[0] + lx * ca - ly * sa;
+                    v = e.center[1] + lx * sa + ly * ca;
+                }, 48);
+            } else if (e.type == "spline" && e.pts.size() >= 2) {
+                // C42: polyline through the solved through-points.
+                for (size_t i = 1; i < e.pts.size(); ++i) {
+                    ImVec2 a, b;
+                    if (uv2s(e.pts[i - 1].x, e.pts[i - 1].y, a) && uv2s(e.pts[i].x, e.pts[i].y, b))
+                        dl->AddLine(a, b, col(pal.sketchInk, 0.55f), 1.5f);
+                }
+            } else if (e.type == "point") {
+                // C42: small ghost cross.
+                ImVec2 p;
+                if (uv2s(e.p1[0], e.p1[1], p)) {
+                    const ImU32 gc = col(pal.sketchInk, 0.55f);
+                    dl->AddLine(ImVec2(p.x - 4, p.y), ImVec2(p.x + 4, p.y), gc, 1.5f);
+                    dl->AddLine(ImVec2(p.x, p.y - 4), ImVec2(p.x, p.y + 4), gc, 1.5f);
+                }
             }
-            // ellipse / conic / spline ghosts: not yet sampled (rare as standalone profiles).
+            // conic-family ghosts: not yet sampled (rare as standalone profiles).
         }
     }
     dl->PopClipRect();
@@ -1498,7 +1659,31 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             };
             cap(e.start); cap(e.end);
         } else if (e.type == "point") {
-            dl->AddCircleFilled(uvToScreen(e.p1[0], e.p1[1]), 3.5f, cc);
+            // C42: dot + small cross so a lone point reads as geometry, not a stray handle.
+            ImVec2 p = uvToScreen(e.p1[0], e.p1[1]);
+            dl->AddCircleFilled(p, 3.0f, cc);
+            dl->AddLine(ImVec2(p.x - 6, p.y), ImVec2(p.x + 6, p.y), cc, 1.2f);
+            dl->AddLine(ImVec2(p.x, p.y - 6), ImVec2(p.x, p.y + 6), cc, 1.2f);
+        } else if (e.type == "ellipse") {
+            // C42: parametric sample with the rotation applied (rot stored in degrees).
+            const float D2R = 3.14159265f / 180.0f;
+            float ca = std::cos(e.rot * D2R), sa = std::sin(e.rot * D2R);
+            ImVec2 prev; int seg = 64;
+            for (int i = 0; i <= seg; ++i) {
+                float a = i / (float)seg * 6.2831853f;
+                float lx = e.rx * std::cos(a), ly = e.ry * std::sin(a);
+                ImVec2 p = uvToScreen(e.center[0] + lx * ca - ly * sa,
+                                      e.center[1] + lx * sa + ly * ca);
+                if (i) dl->AddLine(prev, p, cc, th);
+                prev = p;
+            }
+            dl->AddCircleFilled(uvToScreen(e.center[0], e.center[1]), 2.5f, cc);
+        } else if (e.type == "spline") {
+            // C42: polyline through the solved through-points + point markers.
+            for (size_t i = 1; i < e.pts.size(); ++i)
+                dl->AddLine(uvToScreen(e.pts[i - 1].x, e.pts[i - 1].y),
+                            uvToScreen(e.pts[i].x, e.pts[i].y), cc, th);
+            for (const auto& q : e.pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), 2.5f, cc);
         }
     }
 
@@ -2204,6 +2389,80 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     }
                     dl->AddCircle(uvToScreen(apex.x, apex.y), 4.0f, uCol, 12, 1.2f);
                 }
+
+            // ---- C42 tool previews ----
+            } else if (tool_ == SketchTool::Arc3pt && n >= 1) {
+                // picks: arc start, arc end, point ON the arc (live cursor fills the missing one).
+                std::vector<ImVec2> pts;
+                for (size_t i = 0; i < n && i < 3; ++i) pts.push_back(toolUV_[i]);
+                if (pts.size() < 3) pts.push_back(ImVec2(su, sv));
+                for (auto& q : pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), 3.0f, uCol);
+                if (n == 1) { dl->AddLine(uvToScreen(pts[0].x, pts[0].y), sCur, uCol, 1.6f); }
+                else {
+                    float cu, cv, rad;
+                    if (circumcircle(pts[0], pts[1], pts[2], cu, cv, rad)) {
+                        const float R2D = 57.29577951f;
+                        float aS = std::atan2(pts[0].y - cv, pts[0].x - cu) * R2D;
+                        float aE = std::atan2(pts[1].y - cv, pts[1].x - cu) * R2D;
+                        float aM = std::atan2(pts[2].y - cv, pts[2].x - cu) * R2D;
+                        auto norm = [](float a) { while (a < 0) a += 360.0f; while (a >= 360.0f) a -= 360.0f; return a; };
+                        bool fwd = norm(aM - aS) <= norm(aE - aS);   // CCW start->end passes thru mid?
+                        float a0 = fwd ? aS : aE, a1 = fwd ? aE : aS;
+                        if (a1 < a0) a1 += 360.0f;
+                        const float D2R = 3.14159265f / 180.0f;
+                        ImVec2 prev;
+                        for (int i = 0; i <= 48; ++i) {
+                            float a = (a0 + (a1 - a0) * (i / 48.0f)) * D2R;
+                            ImVec2 q = uvToScreen(cu + rad * std::cos(a), cv + rad * std::sin(a));
+                            if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                        }
+                    }
+                }
+            } else if (tool_ == SketchTool::Polygon && n >= 1) {
+                ImVec2 ctr = toolUV_[0];
+                dl->AddCircleFilled(uvToScreen(ctr.x, ctr.y), 3.0f, uCol);
+                float vx = su - ctr.x, vy = sv - ctr.y;
+                float R = std::hypot(vx, vy);
+                if (R < 1e-4f) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, 1.6f); }
+                else {
+                    float a0 = std::atan2(vy, vx);
+                    ImVec2 prev;
+                    for (int i = 0; i <= polySides_; ++i) {
+                        float a = a0 + 6.2831853f * i / (float)polySides_;
+                        ImVec2 q = uvToScreen(ctr.x + R * std::cos(a), ctr.y + R * std::sin(a));
+                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                    }
+                }
+            } else if (tool_ == SketchTool::RectCenter && n >= 1) {
+                ImVec2 ctr = toolUV_[0];
+                dl->AddCircleFilled(uvToScreen(ctr.x, ctr.y), 3.0f, uCol);
+                float dx = std::fabs(su - ctr.x), dy = std::fabs(sv - ctr.y);
+                ImVec2 A(ctr.x - dx, ctr.y - dy), B(ctr.x + dx, ctr.y - dy);
+                ImVec2 C(ctr.x + dx, ctr.y + dy), D(ctr.x - dx, ctr.y + dy);
+                pl({A, B, C, D, A});
+            } else if (tool_ == SketchTool::Ellipse && n >= 1) {
+                ImVec2 ctr = toolUV_[0];
+                ImVec2 rxp = (n >= 2) ? toolUV_[1] : ImVec2(su, sv);
+                float rot = std::atan2(rxp.y - ctr.y, rxp.x - ctr.x);
+                float rx = std::hypot(rxp.x - ctr.x, rxp.y - ctr.y);
+                float ca = std::cos(rot), sa = std::sin(rot);
+                if (n < 2) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, 1.6f); }
+                else {
+                    float ry = std::fabs(-(su - ctr.x) * sa + (sv - ctr.y) * ca);
+                    if (ry < 1e-4f) ry = rx * 0.5f;
+                    ImVec2 prev;
+                    for (int i = 0; i <= 64; ++i) {
+                        float a = i / 64.0f * 6.2831853f;
+                        float lx = rx * std::cos(a), ly = ry * std::sin(a);
+                        ImVec2 q = uvToScreen(ctr.x + lx * ca - ly * sa, ctr.y + lx * sa + ly * ca);
+                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                    }
+                }
+            } else if (tool_ == SketchTool::Spline && n >= 1) {
+                std::vector<ImVec2> pts(toolUV_.begin(), toolUV_.end());
+                pts.push_back(ImVec2(su, sv));
+                pl(pts);
+                for (auto& q : pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), 3.0f, uCol);
             }
         }
 
@@ -2487,12 +2746,138 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     {"rho", rho}};
                 addEntity(st, ent, nlohmann::json::array());
                 resetTool();
+
+            // ---- C42 tool completions ----
+            } else if (tool_ == SketchTool::Arc3pt && toolUV_.size() == 3) {
+                // p1 = arc start, p2 = arc end, p3 = point ON the arc -> circumcircle; ccw chosen
+                // so the sweep from start to end passes through p3.
+                float cu, cv, rad;
+                if (!circumcircle(toolUV_[0], toolUV_[1], toolUV_[2], cu, cv, rad)) {
+                    st.addLog("[sketch] 3-Pt Arc: points are collinear \xE2\x80\x94 pick the on-arc point off the line");
+                    toolUV_.pop_back(); toolSnaps_.pop_back();
+                } else {
+                    const float R2D = 57.29577951f;
+                    float aS = std::atan2(toolUV_[0].y - cv, toolUV_[0].x - cu) * R2D;
+                    float aE = std::atan2(toolUV_[1].y - cv, toolUV_[1].x - cu) * R2D;
+                    float aM = std::atan2(toolUV_[2].y - cv, toolUV_[2].x - cu) * R2D;
+                    auto norm = [](float a) { while (a < 0) a += 360.0f; while (a >= 360.0f) a -= 360.0f; return a; };
+                    // Always emit a CCW arc (the solver's solved records drop "ccw", so a false
+                    // flag would re-render wrong after the first solve): if the CCW sweep p1->p2
+                    // misses p3, store the arc as CCW p2->p1 instead (same geometry).
+                    bool fwd = norm(aM - aS) <= norm(aE - aS);
+                    float a0 = fwd ? aS : aE, a1 = fwd ? aE : aS;
+                    // Endpoint snaps -> coincidents onto the arc's start/end handles (like Line);
+                    // when reversed, p1 sits on the "end" handle and p2 on "start".
+                    nlohmann::json cs = nlohmann::json::array();
+                    if (!toolSnaps_[0].empty())
+                        cs.push_back({{"type", "coincident"},
+                                      {"refs", {toolSnaps_[0], fwd ? "$self.start" : "$self.end"}}});
+                    if (!toolSnaps_[1].empty())
+                        cs.push_back({{"type", "coincident"},
+                                      {"refs", {toolSnaps_[1], fwd ? "$self.end" : "$self.start"}}});
+                    nlohmann::json ent = {{"type", "arc"},
+                        {"center", nlohmann::json::array({cu, cv})}, {"radius", rad},
+                        {"start", a0}, {"end", a1}, {"ccw", true}};
+                    addEntity(st, ent, cs);
+                    resetTool();
+                }
+            } else if (tool_ == SketchTool::Polygon && toolUV_.size() == 2) {
+                // center + one vertex -> inscribed N-gon (closed equal-edged line loop).
+                ImVec2 ctr = toolUV_[0], vtx = toolUV_[1];
+                float R = std::hypot(vtx.x - ctr.x, vtx.y - ctr.y);
+                if (R < 1e-4f) {
+                    st.addLog("[sketch] Polygon: vertex == center \xE2\x80\x94 pick a vertex away from the center");
+                    toolUV_.pop_back(); toolSnaps_.pop_back();
+                } else {
+                    float a0 = std::atan2(vtx.y - ctr.y, vtx.x - ctr.x);
+                    std::vector<ImVec2> corners;
+                    for (int i = 0; i < polySides_; ++i) {
+                        float a = a0 + 6.2831853f * i / (float)polySides_;
+                        corners.push_back(ImVec2(ctr.x + R * std::cos(a), ctr.y + R * std::sin(a)));
+                    }
+                    addPolyLoop(st, corners, /*equalEdges=*/true);
+                    resetTool();
+                }
+            } else if (tool_ == SketchTool::RectCenter && toolUV_.size() == 2) {
+                // center + corner -> axis-aligned rect (same per-edge h/v relations as RectCorner).
+                ImVec2 ctr = toolUV_[0], cor = toolUV_[1];
+                float dx = std::fabs(cor.x - ctr.x), dy = std::fabs(cor.y - ctr.y);
+                if (dx < 1e-4f || dy < 1e-4f) {
+                    st.addLog("[sketch] Center Rectangle: zero width/height \xE2\x80\x94 pick a corner off the axes");
+                    toolUV_.pop_back(); toolSnaps_.pop_back();
+                } else {
+                    ImVec2 quad[4] = {ImVec2(ctr.x - dx, ctr.y - dy), ImVec2(ctr.x + dx, ctr.y - dy),
+                                      ImVec2(ctr.x + dx, ctr.y + dy), ImVec2(ctr.x - dx, ctr.y + dy)};
+                    const char* rel[4] = {"horizontal", "vertical", "horizontal", "vertical"};
+                    addQuadLoop(st, quad, rel);
+                    resetTool();
+                }
+            } else if (tool_ == SketchTool::Point && toolUV_.size() == 1) {
+                nlohmann::json ent = {{"type", "point"},
+                    {"p", nlohmann::json::array({toolUV_[0].x, toolUV_[0].y})}};
+                addEntity(st, ent, nlohmann::json::array());
+                toolUV_.clear(); toolSnaps_.clear();   // stay armed (SW point tool repeats)
+            } else if (tool_ == SketchTool::Ellipse && toolUV_.size() == 3) {
+                // center, major-axis end (rx + rot), minor point (ry = perp distance).
+                ImVec2 ctr = toolUV_[0], rxp = toolUV_[1], ryp = toolUV_[2];
+                float rot = std::atan2(rxp.y - ctr.y, rxp.x - ctr.x);
+                float rx = std::hypot(rxp.x - ctr.x, rxp.y - ctr.y);
+                float ca = std::cos(rot), sa = std::sin(rot);
+                float ry = std::fabs(-(ryp.x - ctr.x) * sa + (ryp.y - ctr.y) * ca);
+                if (rx < 1e-4f || ry < 1e-4f) {
+                    st.addLog("[sketch] Ellipse: degenerate radii \xE2\x80\x94 pick the minor point off the major axis");
+                    toolUV_.pop_back(); toolSnaps_.pop_back();
+                } else {
+                    const float kR2D = 57.29577951f;
+                    nlohmann::json ent = {{"type", "ellipse"},
+                        {"center", nlohmann::json::array({ctr.x, ctr.y})},
+                        {"rx", rx}, {"ry", ry}, {"rot", rot * kR2D}};   // rot in degrees (schema)
+                    addEntity(st, ent, nlohmann::json::array());
+                    resetTool();
+                }
+            }
+        }
+
+        // C42: Polygon side count — number keys 3-9 (top row or keypad) while the tool is armed.
+        if (tool_ == SketchTool::Polygon && !io.WantTextInput) {
+            for (int d = 3; d <= 9; ++d) {
+                if (ImGui::IsKeyPressed((ImGuiKey)(ImGuiKey_0 + d)) ||
+                    ImGui::IsKeyPressed((ImGuiKey)(ImGuiKey_Keypad0 + d)))
+                    polySides_ = d;
+            }
+        }
+
+        // C42: Spline finishing — Enter / right-click / double-click commits (>= 2 points); a
+        // right-click with fewer just drops the in-progress points (mirrors the Line-chain RMB).
+        if (tool_ == SketchTool::Spline) {
+            bool finish = false;
+            if (imgHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+                toolUV_.size() >= 3) {
+                // The double-click's 2nd click pushed a duplicate point this frame — drop it.
+                toolUV_.pop_back(); toolSnaps_.pop_back();
+                finish = true;
+            }
+            if (!io.WantTextInput && toolUV_.size() >= 2 &&
+                (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)))
+                finish = true;
+            if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                if (toolUV_.size() >= 2) finish = true;
+                else { toolUV_.clear(); toolSnaps_.clear(); }
+            }
+            if (finish && toolUV_.size() >= 2) {
+                nlohmann::json pts = nlohmann::json::array();
+                for (const auto& q : toolUV_) pts.push_back(nlohmann::json::array({q.x, q.y}));
+                nlohmann::json ent = {{"type", "spline"}, {"points", pts}};
+                addEntity(st, ent, nlohmann::json::array());
+                resetTool();
             }
         }
         // C37-D: right-click ends the current chain/segment but keeps the tool armed (SW muscle
         // memory: the Line tool drops its in-progress points and waits for a fresh first point).
         // mouse_gestures is disabled in-sketch (viewport_panel), so the RMB is free here; consume it.
-        if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        // C42: Spline owns its RMB (finish/drop, handled above).
+        if (tool_ != SketchTool::Spline && imgHovered &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
             toolUV_.clear(); toolSnaps_.clear(); chainPrevId_.clear();
         }
         // ESC ends the tool.
@@ -2645,7 +3030,13 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          tool_ == SketchTool::Conic ? "Conic" :
                          tool_ == SketchTool::Trim ? "Trim" :
                          tool_ == SketchTool::Extend ? "Extend" :
-                         tool_ == SketchTool::Offset ? "Offset" : "";
+                         tool_ == SketchTool::Offset ? "Offset" :
+                         tool_ == SketchTool::Arc3pt ? "3 Point Arc" :
+                         tool_ == SketchTool::Polygon ? "Polygon" :
+                         tool_ == SketchTool::RectCenter ? "Center Rectangle" :
+                         tool_ == SketchTool::Point ? "Point" :
+                         tool_ == SketchTool::Ellipse ? "Ellipse" :
+                         tool_ == SketchTool::Spline ? "Spline" : "";
         // Per-stage step prompt (status-bar style) for the multi-click variants.
         const size_t n = toolUV_.size();
         const char* step = nullptr;
@@ -2696,10 +3087,29 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 step = offsetStage_ == 0 ? "click entities for the chain, then Enter"
                      : offsetStage_ == 1 ? "type the offset distance, Enter"
                      : "click the side to offset toward"; break;
+            case SketchTool::Arc3pt:
+                step = n == 0 ? "click arc start" : n == 1 ? "click arc end"
+                     : "click a point on the arc"; break;
+            case SketchTool::Polygon:
+                step = n == 0 ? "click center" : "click a vertex"; break;
+            case SketchTool::RectCenter:
+                step = n == 0 ? "click center" : "click a corner"; break;
+            case SketchTool::Point:
+                step = "click to place a point"; break;
+            case SketchTool::Ellipse:
+                step = n == 0 ? "click center" : n == 1 ? "click major-axis end" : "click minor (ry)"; break;
+            case SketchTool::Spline:
+                step = n < 2 ? "click points; Enter / right-click / double-click to finish"
+                             : "click more points \xC2\xB7 Enter / right-click / double-click finishes"; break;
             default: break;
         }
-        std::string hint = std::string(tn) + (step ? std::string(" \xE2\x80\x94 ") + step : std::string()) +
-                           "  (ESC to end)";
+        std::string hint = std::string(tn) + (step ? std::string(" \xE2\x80\x94 ") + step : std::string());
+        if (tool_ == SketchTool::Polygon) {   // C42: live side count + how to change it
+            char sb[48];
+            std::snprintf(sb, sizeof(sb), "  [Sides: %d \xC2\xB7 press 3-9]", polySides_);
+            hint += sb;
+        }
+        hint += "  (ESC to end)";
         ImVec2 ts = ImGui::CalcTextSize(hint.c_str());
         float cx = (imgMin.x + imgMax.x) * 0.5f;
         ImVec2 p0(cx - ts.x * 0.5f - 12, imgMin.y + 12);
@@ -2800,6 +3210,60 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             bool cancel = ImGui::Button("Cancel");
             if (ok) { offsetDist_ = std::fabs(offsetDist_); offsetStage_ = 2; }
             if (cancel) { offsetStage_ = 0; }
+        }
+        ImGui::End();
+    }
+
+    // ---- C42: minimal Add Relation popup (ribbon sk_relations over a 1-2 entity selection) ----
+    // Lists the relations applicable to the snapshotted selection's entity types and emits ONE
+    // sketch_add_constraint. Closes if any referenced entity vanished (undo/delete mid-popup).
+    if (relPopupOpen_) {
+        for (const auto& id : relIds_)
+            if (!entById(id)) { relPopupOpen_ = false; relIds_.clear(); break; }
+    }
+    if (relPopupOpen_) {
+        const SketchEntity* a = entById(relIds_[0]);
+        const SketchEntity* b = relIds_.size() > 1 ? entById(relIds_[1]) : nullptr;
+        auto isCirc = [](const SketchEntity* e) {
+            return e && (e->type == "circle" || e->type == "arc");
+        };
+        ImGui::SetNextWindowPos(relPopupPos_, ImGuiCond_Appearing);
+        ImGui::SetNextWindowBgAlpha(0.98f);
+        if (ImGui::Begin("##SketchRel", nullptr,
+                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::TextUnformatted("Add Relation");
+            ImGui::Separator();
+            bool any = false;
+            auto rel = [&](const char* label, const char* type, bool pair) {
+                any = true;
+                if (!ImGui::MenuItem(label)) return;
+                nlohmann::json refs = nlohmann::json::array({relIds_[0]});
+                if (pair) refs.push_back(relIds_[1]);
+                addConstraint(st, {{"type", type}, {"refs", refs}});   // errors logged + re-solve
+                relPopupOpen_ = false; relIds_.clear();
+            };
+            if (!b) {
+                if (a->type == "line") { rel("Horizontal", "horizontal", false);
+                                         rel("Vertical",   "vertical",   false); }
+                rel("Fix", "fix", false);
+            } else {
+                bool aLine = a->type == "line", bLine = b->type == "line";
+                if (aLine && bLine) { rel("Parallel",      "parallel",      true);
+                                      rel("Perpendicular", "perpendicular", true);
+                                      rel("Equal",         "equal",         true); }
+                else if (isCirc(a) && isCirc(b)) { rel("Equal",      "equal",      true);
+                                                   rel("Concentric", "concentric", true); }
+                else if ((aLine && isCirc(b)) || (isCirc(a) && bLine))
+                    rel("Tangent", "tangent", true);
+            }
+            if (!any) ImGui::TextDisabled("No relations for this selection");
+            ImGui::Separator();
+            if (ImGui::MenuItem("Cancel") ||
+                (relPopupOpen_ && ImGui::IsKeyPressed(ImGuiKey_Escape))) {
+                escHandled = true;
+                relPopupOpen_ = false; relIds_.clear();
+            }
         }
         ImGui::End();
     }

@@ -245,6 +245,28 @@ def test_unsupported_entity_error() -> None:
     print("[unsupported] trimming a spline raised unsupported_entity")
 
 
+# --------------------------------------------------------------------------- construction toggle
+
+
+def test_toggle_construction_roundtrip() -> None:
+    """C42: sketch_toggle_construction flips the flag both ways; unknown id raises invalid_op."""
+    doc = _sketch_with([_line("e1", [0.0, 0.0], [100.0, 0.0])])
+    on_doc, _ = apply_ops(doc, [
+        {"op": "sketch_toggle_construction", "sketch": "f1", "id": "e1"}])
+    assert validate_document(on_doc) == [], validate_document(on_doc)
+    assert _by_id(on_doc)["e1"]["construction"] is True, _by_id(on_doc)["e1"]
+    off_doc, _ = apply_ops(on_doc, [
+        {"op": "sketch_toggle_construction", "sketch": "f1", "id": "e1"}])
+    assert validate_document(off_doc) == [], validate_document(off_doc)
+    assert _by_id(off_doc)["e1"]["construction"] is False, _by_id(off_doc)["e1"]
+    try:
+        apply_ops(doc, [{"op": "sketch_toggle_construction", "sketch": "f1", "id": "nope"}])
+        raise AssertionError("toggling an unknown entity must raise invalid_op")
+    except OpError as e:
+        assert e.code == "invalid_op", e.to_envelope()
+    print("[construction] e1 toggled on -> off; unknown id raised invalid_op")
+
+
 def main() -> None:
     test_trim_middle_of_double_crossed_line()
     test_trim_no_intersections_deletes_whole()
@@ -254,6 +276,7 @@ def main() -> None:
     test_offset_L_chain_both_sides()
     test_offset_closed_rectangle_inward()
     test_unsupported_entity_error()
+    test_toggle_construction_roundtrip()
     print("\nSKETCH TOOLS TESTS PASSED")
 
 

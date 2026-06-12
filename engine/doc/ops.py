@@ -972,6 +972,20 @@ def _op_unsupported_m2(doc, op, index, idgen, id_map):
                   {"index": index, "reason": f"{op.get('op')} not implemented yet"})
 
 
+# ---- C42: construction toggle (host ribbon "Construction" over the sketch selection) ----
+
+
+def _op_sketch_toggle_construction(doc, op, index, idgen, id_map):
+    """Flip one entity's ``construction`` flag (host Sketch-tab Construction button)."""
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    eid = op.get("id")
+    for ent in sk.get("params", {}).get("entities", []):
+        if ent.get("id") == eid:
+            ent["construction"] = not bool(ent.get("construction", False))
+            return
+    raise _invalid(index, f"sketch_toggle_construction: entity '{eid}' not found")
+
+
 _OP_HANDLERS = {
     "add_feature": _op_add_feature,
     "edit_feature": _op_edit_feature,
@@ -1005,6 +1019,7 @@ _OP_HANDLERS = {
     "sketch_convert": _op_unsupported_m2,
     "sketch_mirror_entities": _op_unsupported_m2,
     "sketch_pattern_entities": _op_unsupported_m2,
+    "sketch_toggle_construction": _op_sketch_toggle_construction,  # C42
 }
 
 

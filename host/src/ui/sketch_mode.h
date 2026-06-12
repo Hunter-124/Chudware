@@ -36,7 +36,9 @@ enum class SketchTool {
     // Conic family (engine contract C28-A: ellipse_arc / parabola / conic entities):
     EllipsePartial, Parabola, Conic,
     // C29-B sketch-editing tools (engine contract C29-A: sketch_trim/extend/offset ops):
-    Trim, Extend, Offset
+    Trim, Extend, Offset,
+    // C42: remaining draw tools (3-pt arc, polygon, center rect, point, ellipse, spline):
+    Arc3pt, Polygon, RectCenter, Point, Ellipse, Spline
 };
 
 // C37-D: One constraint record from a sketch_enter/solve/drag response (worker_rpc.md §"constraints").
@@ -67,12 +69,14 @@ struct SketchEntity {
     std::string status;          // under|full|over (from the solver)
     bool construction = false;
     // Coordinate payload (sketch-plane u,v). Only the fields for `type` are populated.
-    float p1[2] = {0, 0}, p2[2] = {0, 0};   // line/slot endpoints
+    float p1[2] = {0, 0}, p2[2] = {0, 0};   // line/slot endpoints; point reuses p1 for "p"
     float center[2] = {0, 0};               // circle/arc/ellipse/arc_slot
     float radius = 0;
     float start = 0, end = 0;               // arc angles (deg); arc_slot reuses these for a0/a1
     bool ccw = true;
     float width = 0;                        // slot/arc_slot
+    float rx = 0, ry = 0, rot = 0;          // ellipse (rot in degrees)
+    std::vector<ImVec2> pts;                // spline solved through-points
 };
 
 class SketchMode {
@@ -235,6 +239,17 @@ private:
     // relation kinds (mirrors the corner-rect op pattern; relations[i] applies to edge i->i+1,
     // "" = none). Used by the 3pt/center/parallelogram rectangle variants.
     void addQuadLoop(AppState& st, const ImVec2 corners[4], const char* relations[4]);
+    // C42: emit N lines as a closed coincident-chained loop (generalized addQuadLoop, no per-edge
+    // h/v). equalEdges adds "equal" relations between consecutive edges (Polygon regularity).
+    void addPolyLoop(AppState& st, const std::vector<ImVec2>& corners, bool equalEdges);
+    // C42: Polygon tool side count (set with number keys 3-9 while the tool is armed).
+    int polySides_ = 6;
+
+    // C42: minimal "Add Relation" popup (ribbon sk_relations with 1-2 entities selected). The
+    // selection is snapshotted into relIds_ when the popup opens (selIds_ may churn).
+    bool relPopupOpen_ = false;
+    ImVec2 relPopupPos_{0, 0};
+    std::vector<std::string> relIds_;
 
     // drag state
     std::string dragHandle_;

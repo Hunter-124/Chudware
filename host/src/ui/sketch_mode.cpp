@@ -185,6 +185,9 @@ static void parseEntities(const nlohmann::json& res, std::vector<SketchEntity>& 
 void SketchMode::applyEnterResult(const nlohmann::json& res) {
     dof_ = res.value("dof", 0);
     status_ = res.value("status", std::string("under"));
+    conflicting_.clear();
+    if (res.contains("conflicting") && res["conflicting"].is_array())
+        for (const auto& c : res["conflicting"]) if (c.is_string()) conflicting_.push_back(c.get<std::string>());
     if (res.contains("plane_frame") && res["plane_frame"].is_array() &&
         res["plane_frame"].size() == 16) {
         for (int i = 0; i < 16; ++i) frame_[i] = res["plane_frame"][i].get<float>();
@@ -775,7 +778,8 @@ void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSn
                                // C37-D: clear the Smart Dimension state machine.
                                dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr;
                                dimType_.clear(); dimAxis_.clear(); dimEditCid_.clear();
-                               dimPopupOpen_ = false; dimError_.clear(); dimPopupDriven_ = false; }
+                               dimPopupOpen_ = false; dimError_.clear(); dimPopupDriven_ = false;
+                               overDefOpen_ = false; overDefCid_.clear(); }   // C50: over-define prompt
 void SketchMode::cancelTool() { resetTool(); }
 
 void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfer* infer) const {
@@ -1222,8 +1226,9 @@ bool SketchMode::defaultPlacement(const SketchConstraint& c, float& pu, float& p
         if (baseId(h) == "origin") { u = 0; v = 0; return true; }
         const SketchEntity* e = entById(baseId(h));
         if (!e) return false;
-        if (h.find(".p1") != std::string::npos)      { u = e->p1[0]; v = e->p1[1]; }
-        else if (h.find(".p2") != std::string::npos) { u = e->p2[0]; v = e->p2[1]; }
+        if (h.find(".mid") != std::string::npos)      { u = (e->p1[0]+e->p2[0])*0.5f; v = (e->p1[1]+e->p2[1])*0.5f; }
+        else if (h.find(".p1") != std::string::npos)  { u = e->p1[0]; v = e->p1[1]; }
+        else if (h.find(".p2") != std::string::npos)  { u = e->p2[0]; v = e->p2[1]; }
         else if (h.find(".center") != std::string::npos) { u = e->center[0]; v = e->center[1]; }
         else if (e->type == "circle" || e->type == "arc") { u = e->center[0]; v = e->center[1]; }
         else { u = e->p1[0]; v = e->p1[1]; }
@@ -1279,8 +1284,9 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
         if (baseId(h) == "origin") { s = uvToScreen(0, 0); return true; }
         const SketchEntity* e = entById(baseId(h));
         if (!e) return false;
-        if (h.find(".p1") != std::string::npos)      s = uvToScreen(e->p1[0], e->p1[1]);
-        else if (h.find(".p2") != std::string::npos) s = uvToScreen(e->p2[0], e->p2[1]);
+        if (h.find(".mid") != std::string::npos)      s = uvToScreen((e->p1[0]+e->p2[0])*0.5f, (e->p1[1]+e->p2[1])*0.5f);
+        else if (h.find(".p1") != std::string::npos)  s = uvToScreen(e->p1[0], e->p1[1]);
+        else if (h.find(".p2") != std::string::npos)  s = uvToScreen(e->p2[0], e->p2[1]);
         else if (h.find(".center") != std::string::npos) s = uvToScreen(e->center[0], e->center[1]);
         else if (e->type == "circle" || e->type == "arc") s = uvToScreen(e->center[0], e->center[1]);
         else s = uvToScreen(e->p1[0], e->p1[1]);
@@ -1431,9 +1437,35 @@ bool SketchMode::dimHitTest(const ImVec2& s, DimPick& out) const {
     if (got) return true;
     // 2) whole entity — C38 (S1): record the id (stable) alongside the per-frame index.
     int ei = hitTestEntity(s, 12.0f);
-    if (ei >= 0) { out.handle.clear(); out.isPoint = false; out.entIdx = ei;
-                   out.entId = ents_[ei].id; return true; }
+    if (ei >= 0) {
+        const SketchEntity& e = ents_[ei];
+        // C50: SolidWorks line-MIDPOINT target. The midpoint is only offered while the line body
+        // is hovered (we're inside this whole-entity branch), and only when the cursor is within a
+        // comfortable radius of the midpoint — otherwise the click selects the whole line. The
+        // midpoint marker itself is drawn by the hover code when a line is hovered.
+        if (e.type == "line") {
+            float mu = (e.p1[0] + e.p2[0]) * 0.5f, mv = (e.p1[1] + e.p2[1]) * 0.5f;
+            ImVec2 mp = uvToScreen(mu, mv);
+            if (std::hypot(mp.x - s.x, mp.y - s.y) < 11.0f) {
+                out.handle = e.id + ".mid"; out.isPoint = true; out.entIdx = -1;
+                out.entId.clear(); out.u = mu; out.v = mv; return true;
+            }
+        }
+        out.handle.clear(); out.isPoint = false; out.entIdx = ei;
+        out.entId = e.id; return true;
+    }
     return false;
+}
+
+// C50: the midpoint of the line currently hovered in Smart Dimension, in (u,v), or false. Used by
+// the hover overlay to draw the SolidWorks midpoint marker whenever a line is hovered (so the user
+// knows the target is available before moving onto it).
+bool SketchMode::hoveredLineMidpoint(const ImVec2& s, float& mu, float& mv) const {
+    int ei = hitTestEntity(s, 12.0f);
+    if (ei < 0 || ents_[ei].type != "line") return false;
+    const SketchEntity& e = ents_[ei];
+    mu = (e.p1[0] + e.p2[0]) * 0.5f; mv = (e.p1[1] + e.p2[1]) * 0.5f;
+    return true;
 }
 
 // Build the pending dimension from the current pick buffer + the live cursor. Returns true when the
@@ -1632,10 +1664,63 @@ void SketchMode::dimCommit(AppState& st) {
         return;
     }
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
-    resolve(st);
+    std::string newCid = (r.id_map.is_object() && r.id_map.contains("$0"))
+                       ? r.id_map["$0"].get<std::string>() : std::string();
+    resolve(st);   // refreshes conflicting_ + status_
+    // C50: SolidWorks over-define guard. If the dim we just added is the one the solver flagged
+    // conflicting (it over-defines the sketch), don't leave it silently driving — pop the "Make
+    // Dimension Driven?" prompt (Make Driven / Keep Driving / Cancel). A driving conflicting dim
+    // sits at a least-squares compromise and its annotation flip-flops as the geometry oscillates,
+    // which is exactly the bug the user hit.
+    if (!dimPopupDriven_ && !newCid.empty() &&
+        std::find(conflicting_.begin(), conflicting_.end(), newCid) != conflicting_.end()) {
+        overDefOpen_ = true; overDefCid_ = newCid; overDefPos_ = dimPopupPos_;
+    }
     // Stay in Smart Dimension; clear the pick buffer for the next dimension.
     dimPopupOpen_ = false; dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr;
     dimAxis_.clear(); dimPopupDriven_ = false;
+}
+
+// C50: the SolidWorks "Make Dimension Driven?" modal, shown after a Smart Dimension commit that
+// over-defines the sketch. overDefCid_ is the offending constraint id.
+void SketchMode::drawOverDefinePrompt(AppState& st) {
+    if (!overDefOpen_) return;
+    const auto& pal = ui::palette;
+    ImGui::SetNextWindowPos(overDefPos_, ImGuiCond_Appearing);
+    ImGui::SetNextWindowBgAlpha(0.98f);
+    if (ImGui::Begin("##OverDefine", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1));
+        ImGui::TextUnformatted("Make Dimension Driven?");
+        ImGui::PopStyleColor();
+        ImGui::TextUnformatted("This dimension over-defines the sketch.");
+        ImGui::Spacing();
+        auto finish = [&]() { overDefOpen_ = false; overDefCid_.clear(); };
+        // Default action (Make Driven) — converts the dim to a reference dimension.
+        if (ImGui::Button("Make Driven")) {
+            nlohmann::json op = {{"op", "sketch_set_dim"}, {"sketch", fid_},
+                                 {"id", overDefCid_}, {"driven", true}};
+            auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+            if (!r.ok) st.toast(ui::ToastLevel::Warn, "Make driven: " + r.error_message);
+            else { if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); } resolve(st); }
+            finish();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Keep Driving")) {
+            // Leave the over-defined driving dim (SolidWorks allows it; the sketch reads red).
+            finish();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            // Remove the dimension we just added.
+            nlohmann::json op = {{"op", "sketch_delete_constraint"}, {"sketch", fid_}, {"id", overDefCid_}};
+            auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+            if (r.ok) { if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); } resolve(st); }
+            finish();
+        }
+    }
+    ImGui::End();
 }
 
 // C37-D: in-sketch Ctrl+Z. Mid-stroke -> pop the last placed point. Else doc undo + re-solve; if the
@@ -3587,16 +3672,30 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // single-pick combo (diameter / line length) is already previewing: clicking ANOTHER
         // target replaces it with the two-pick combo (SolidWorks behavior; this also makes the
         // line-line angle and all circle-distance combos actually reachable).
-        const bool canAddPick = !dimPopupOpen_ && dimPicks_.size() < 2;
+        const bool canAddPick = !dimPopupOpen_ && !overDefOpen_ && dimPicks_.size() < 2;
         DimPick hoverPick; bool hoverHit = false;
         if (canAddPick && imgHovered) hoverHit = dimHitTest(io.MousePos, hoverPick);
         if (hoverHit) {
-            if (hoverPick.isPoint) dl->AddCircle(uvToScreen(hoverPick.u, hoverPick.v), 6.0f, hiCol, 12, 2.0f);
-            else if (hoverPick.entIdx >= 0) {
+            // A midpoint pick (handle ".mid") draws as a small filled diamond — the SolidWorks
+            // midpoint glyph — to distinguish it from an endpoint circle.
+            bool isMid = hoverPick.isPoint && hoverPick.handle.size() > 4 &&
+                         hoverPick.handle.compare(hoverPick.handle.size() - 4, 4, ".mid") == 0;
+            if (isMid) {
+                ImVec2 m = uvToScreen(hoverPick.u, hoverPick.v); float r = 5.0f;
+                dl->AddQuadFilled(ImVec2(m.x, m.y - r), ImVec2(m.x + r, m.y),
+                                  ImVec2(m.x, m.y + r), ImVec2(m.x - r, m.y), hiCol);
+            } else if (hoverPick.isPoint) {
+                dl->AddCircle(uvToScreen(hoverPick.u, hoverPick.v), 6.0f, hiCol, 12, 2.0f);
+            } else if (hoverPick.entIdx >= 0) {
                 const SketchEntity& e = ents_[hoverPick.entIdx];
-                if (e.type == "line")
+                if (e.type == "line") {
                     dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), hiCol, 2.5f);
-                else if (e.type == "circle" || e.type == "arc")
+                    // SolidWorks shows the midpoint marker whenever a line is hovered, so the user
+                    // knows they can snap to it — a hollow diamond at the center.
+                    ImVec2 m = uvToScreen((e.p1[0]+e.p2[0])*0.5f, (e.p1[1]+e.p2[1])*0.5f); float r = 5.0f;
+                    dl->AddQuad(ImVec2(m.x, m.y - r), ImVec2(m.x + r, m.y),
+                                ImVec2(m.x, m.y + r), ImVec2(m.x - r, m.y), hiCol, 1.6f);
+                } else if (e.type == "circle" || e.type == "arc")
                     dl->AddCircle(uvToScreen(e.center[0], e.center[1]),
                                   std::hypot(uvToScreen(e.center[0] + e.radius, e.center[1]).x -
                                              uvToScreen(e.center[0], e.center[1]).x, 0.0f), hiCol, 48, 2.5f);
@@ -3617,7 +3716,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         st.hover = extHit;   // empty hit = no highlight; cleared when SmartDim disarms (below)
 
         // Phase A: collecting picks (no full combo yet). A click adds the hovered target.
-        if (!dimPopupOpen_) {
+        if (!dimPopupOpen_ && !overDefOpen_) {
             // Rebuild the pending dim from the current picks + live cursor (drives the preview AND
             // the live h/v/aligned variant choice for point-point).
             dimBuildPending(io.MousePos, mu, mv);
@@ -3876,43 +3975,71 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         wdl->AddText(ImVec2(p0.x + 10, p0.y + 5), sc, sl.c_str());
     }
 
-    // ---- C37-D: Smart Dimension Modify box ----
-    // Auto-focused + text pre-selected, +/- step buttons, unit suffix, Driven checkbox, Enter
-    // commits, Esc closes WITHOUT committing but stays in the tool (pick buffer cleared). Expression
-    // input ("=...") keeps working.
+    // ---- Smart Dimension Modify box (C50 redesign) ----
+    // SolidWorks-style compact panel: titled header with the dim type + live readout, a prominent
+    // value field flanked by steppers with the unit suffix, Driven + Arc-condition controls, an
+    // inline error line, and a primary OK / Cancel footer. Auto-focused + text pre-selected; Enter
+    // commits, Esc closes without committing (pick buffer cleared) but stays in the tool. Expression
+    // input ("=...") and full unit math ("100mm+2in/0.5m") keep working.
     if (dimPopupOpen_) {
+        const float sc = ui::uiScale;
         ImGui::SetNextWindowPos(dimPopupPos_, ImGuiCond_Appearing);
-        ImGui::SetNextWindowBgAlpha(0.98f);
+        ImGui::SetNextWindowBgAlpha(0.99f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * sc, 10 * sc));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(7 * sc, 7 * sc));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
         if (ImGui::Begin("##SketchDim", nullptr,
                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
                          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
-            ImGui::TextUnformatted(dimEditCid_.empty() ? "Dimension" : "Edit Dimension");
-            // +/- step buttons adjust the numeric value (skipped for an expr input).
-            const char* suffix = dimIsAngle_ ? "\xC2\xB0" : "mm";
+            const bool isAngle = dimIsAngle_;
+            const char* suffix = isAngle ? "\xC2\xB0" : "mm";
+            // Friendly title + symbol per dim type.
+            const char* title = dimType_ == "diameter" ? "\xE2\x8C\x80 Diameter"
+                              : dimType_ == "radius"   ? "R Radius"
+                              : dimType_ == "angle"    ? "\xE2\x88\xA0 Angle"
+                              : "Distance";
+            // ---- header row: title (accent) + live measured readout on the right ----
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
+            ImGui::TextUnformatted(dimEditCid_.empty() ? title : (std::string("Edit ") + title).c_str());
+            ImGui::PopStyleColor();
+            {
+                std::string meas = isAngle ? fmtAng(dimMeasured_) : (fmtLen(dimMeasured_) + " mm");
+                std::string lab = "now " + meas;
+                float w = ImGui::CalcTextSize(lab.c_str()).x;
+                ImGui::SameLine(0, 0);
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                    std::max(14.0f * sc, ImGui::GetContentRegionAvail().x - w));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1));
+                ImGui::TextUnformatted(lab.c_str());
+                ImGui::PopStyleColor();
+            }
+            ImGui::Separator();
+
+            // ---- value row: [-] [ value ] unit [+] ----
             auto stepVal = [&](double delta) {
                 std::string txt = dimBuf_.data();
                 if (!txt.empty() && txt[0] == '=') return;   // don't mutate expressions
                 double cur = dimMeasured_; std::string perr;
-                if (pmParseDim(txt, cur, perr, dimIsAngle_)) {}  // parse current text if valid
+                if (pmParseDim(txt, cur, perr, isAngle)) {}  // parse current text if valid
                 cur += delta;
                 std::snprintf(dimBuf_.data(), dimBuf_.size(), "%s", fmtLen(cur).c_str());
             };
-            if (ImGui::Button("-")) stepVal(-dimPopupStep_);
+            const float btn = ImGui::GetFrameHeight();
+            if (ImGui::Button("-", ImVec2(btn, btn))) stepVal(-dimPopupStep_);
             ImGui::SameLine();
-            ImGui::SetNextItemWidth(120);
-            // Auto-focus + select-all on first frame of the box.
-            if (dimPopupFocus_) { ImGui::SetKeyboardFocusHere(); }
+            ImGui::SetNextItemWidth(150 * sc);
+            if (dimPopupFocus_) ImGui::SetKeyboardFocusHere();
             bool enter = ImGui::InputText("##dimval", dimBuf_.data(), dimBuf_.size(),
                                           ImGuiInputTextFlags_EnterReturnsTrue |
                                           (dimPopupFocus_ ? ImGuiInputTextFlags_AutoSelectAll : 0));
             dimPopupFocus_ = false;
-            ImGui::SameLine();
+            ImGui::SameLine(0, 4 * sc);
             ImGui::TextUnformatted(suffix);
             ImGui::SameLine();
-            if (ImGui::Button("+")) stepVal(dimPopupStep_);
-            ImGui::Checkbox("Driven", &dimPopupDriven_);
-            // Arc condition (distance involving a circle/arc): anchor that ref at its Center,
-            // near rim (Min, i.e. tangent gap) or far rim (Max). SolidWorks dim-properties combo.
+            if (ImGui::Button("+", ImVec2(btn, btn))) stepVal(dimPopupStep_);
+
+            // ---- options row: Driven + Arc condition ----
+            ImGui::Checkbox("Driven (reference)", &dimPopupDriven_);
             if (dimEditCid_.empty() && dimType_ == "distance") {
                 static const char* kConds[3] = {"Center", "Min (near rim)", "Max (far rim)"};
                 bool condChanged = false;
@@ -3923,7 +4050,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     if (!ce || (ce->type != "circle" && ce->type != "arc")) continue;
                     int cur = p.cond == "min" ? 1 : p.cond == "max" ? 2 : 0;
                     double adjOld = cur == 1 ? -(double)ce->radius : cur == 2 ? (double)ce->radius : 0.0;
-                    ImGui::SetNextItemWidth(150);
+                    ImGui::SetNextItemWidth(150 * sc);
                     std::string lbl = std::string(shown == 0 ? "Arc condition" : "Arc condition 2")
                                       + "##cond" + p.entId;
                     if (ImGui::Combo(lbl.c_str(), &cur, kConds, 3)) {
@@ -3935,8 +4062,6 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     ++shown;
                 }
                 if (condChanged && dimPending_.contains("refs")) {
-                    // Rebuild cond ALIGNED WITH THE REFS ORDER (point-line combos may have the
-                    // picks in the opposite order to the refs) + re-seed the value buffer.
                     nlohmann::json cond = nlohmann::json::array();
                     for (const auto& rr : dimPending_["refs"]) {
                         std::string rs = rr.get<std::string>();
@@ -3946,22 +4071,30 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         cond.push_back(cv);
                     }
                     dimPending_["cond"] = cond;
-                    std::snprintf(dimBuf_.data(), dimBuf_.size(), "%s",
-                                  fmtLen(dimMeasured_).c_str());
+                    std::snprintf(dimBuf_.data(), dimBuf_.size(), "%s", fmtLen(dimMeasured_).c_str());
                 }
             }
             if (!dimError_.empty()) {
                 ImGui::PushStyleColor(ImGuiCol_Text,
                     ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1));
-                ImGui::TextUnformatted(dimError_.c_str());
+                ImGui::Text("! %s", dimError_.c_str());
                 ImGui::PopStyleColor();
             }
-            bool ok = ImGui::Button("OK") || enter;
+
+            // ---- footer: primary OK (accent) + Cancel, right-aligned ----
+            ImGui::Separator();
+            const float okW = 64 * sc, cancelW = 64 * sc;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                std::max(0.0f, ImGui::GetContentRegionAvail().x - okW - cancelW - 7 * sc));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.85f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.70f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.windowBg[0], pal.windowBg[1], pal.windowBg[2], 1));
+            bool ok = ImGui::Button("OK", ImVec2(okW, 0)) || enter;
+            ImGui::PopStyleColor(4);
             ImGui::SameLine();
-            bool cancel = ImGui::Button("Cancel");
+            bool cancel = ImGui::Button("Cancel", ImVec2(cancelW, 0));
             if (ok) dimCommit(st);
-            // Esc (or Cancel) closes the box WITHOUT committing; stay in Smart Dimension. Clearing
-            // the pick buffer mirrors SolidWorks (the dimension is abandoned, tool stays armed).
             if (cancel || (ImGui::IsKeyPressed(ImGuiKey_Escape) && !ImGui::IsKeyDown(ImGuiKey_LeftCtrl))) {
                 escHandled = true;   // C41 (T1): box close keeps Smart Dimension armed
                 dimPopupOpen_ = false; dimError_.clear();
@@ -3970,7 +4103,11 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             }
         }
         ImGui::End();
+        ImGui::PopStyleVar(3);
     }
+
+    // C50: SolidWorks "Make Dimension Driven?" prompt after an over-defining commit.
+    drawOverDefinePrompt(st);
 
     // ---- Offset distance overlay (small InputFloat near the cursor; Enter -> side-pick stage) ----
     if (tool_ == SketchTool::Offset && offsetStage_ == 1) {

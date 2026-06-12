@@ -804,6 +804,32 @@ def test_fix_whole_entity() -> None:
           f"sub-handle dof={sol3.dof}")
 
 
+def test_line_midpoint_handle():
+    """SolidWorks midpoint dimensioning: 'eN.mid' resolves to the line midpoint as a point
+    handle (solver constraint target + measurement)."""
+    from engine.doc.sketch_solver import solve_sketch
+    params = {
+        "entities": [
+            {"id": "e1", "type": "line", "p1": [-20.0, 0.0], "p2": [20.0, 0.0]},
+            {"id": "e2", "type": "point", "p": [3.0, 15.0]},
+        ],
+        "constraints": [
+            {"id": "c0", "type": "horizontal", "refs": ["e1"]},
+            {"id": "c1", "type": "fix", "refs": ["e1"]},
+            {"id": "c2", "type": "vertical", "refs": ["e2.p", "e1.mid"]},
+            {"id": "c3", "type": "distance", "refs": ["e2.p", "e1.mid"],
+             "value": {"value": 10.0, "expr": None}},
+        ],
+    }
+    sol = solve_sketch(params, {})
+    pt = sol.entities["e2"]["p"]
+    ln = sol.entities["e1"]
+    midx = (ln["p1"][0] + ln["p2"][0]) * 0.5
+    assert abs(pt[0] - midx) < 1e-6, f"point X should match midpoint: {pt} vs {midx}"
+    assert abs(abs(pt[1] - 0.0) - 10.0) < 1e-5, f"point 10mm above the fixed midpoint: {pt}"
+    print("[midpoint] line mid handle solves + aligns")
+
+
 def test_warm_solve_respects_geometry_edits():
     """A doc-level geometry edit (sketch_trim/extend/edit_entity) must NOT be undone by the
     warm-start vector: same entity id + same var count used to let warm.x win over the new
@@ -836,6 +862,7 @@ def test_warm_solve_respects_geometry_edits():
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    test_line_midpoint_handle()
     test_warm_solve_respects_geometry_edits()
     test_bracket_fully_defined()
     test_remove_dim_dof1()

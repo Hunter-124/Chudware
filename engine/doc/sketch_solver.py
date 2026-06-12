@@ -400,6 +400,13 @@ def _resolve_handle(
             return (idx,
                     lambda xs: np.array([xs[0], xs[1]]),
                     lambda xs: np.eye(2))
+        elif sub == "mid":
+            # Line midpoint ((p1+p2)/2): depends on all four line vars (SolidWorks midpoint
+            # dimension target). d(mid)/d[p1x,p1y,p2x,p2y] = 0.5 on the matching component.
+            return (vidx,
+                    lambda xs: np.array([(xs[0] + xs[2]) * 0.5, (xs[1] + xs[3]) * 0.5]),
+                    lambda xs: np.array([[0.5, 0.0, 0.5, 0.0],
+                                         [0.0, 0.5, 0.0, 0.5]]))
         else:
             raise ValueError(f"Unknown sub-handle {sub!r} for line {eid}")
 
@@ -2230,6 +2237,9 @@ def _handle_point(handle: str, entity_coords: dict):
             return tuple(ent["p1"])
         if sub == "p2":
             return tuple(ent["p2"])
+        if sub == "mid":
+            (ax, ay), (bx, by) = tuple(ent["p1"]), tuple(ent["p2"])
+            return ((ax + bx) * 0.5, (ay + by) * 0.5)
     if et in ("circle", "arc", "ellipse", "ellipse_arc", "arc_slot"):
         c = ent.get("center")
         if sub in (None, "center") and c is not None:

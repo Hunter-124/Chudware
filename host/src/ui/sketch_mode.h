@@ -169,6 +169,8 @@ private:
                      std::string cond; };   // circle/arc entity picks: "center"|"min"|"max" anchor
     int entIndexById(const std::string& id) const;   // C38 (S1): id -> current ents_ index, or -1
     bool dimHitTest(const ImVec2& s, DimPick& out) const;       // point-priority then entity
+    // C50: (u,v) midpoint of the line under the cursor (Smart Dim hover marker), or false.
+    bool hoveredLineMidpoint(const ImVec2& s, float& mu, float& mv) const;
     bool dimBuildPending(const ImVec2& cursor, float cu, float cv);  // picks -> dimPending_ (+axis)
     void dimOpenModify(const ImVec2& at);                       // open Modify box for dimPending_
     void dimCommit(AppState& st);                               // apply the Modify box value/expr
@@ -235,6 +237,15 @@ private:
     std::string fid_;
     int dof_ = 0;
     std::string status_;             // under|full|over
+    std::vector<std::string> conflicting_;   // C50: constraint ids the solver flagged conflicting
+
+    // C50: SolidWorks "Make Dimension Driven?" prompt. When a just-committed Smart Dimension
+    // over-defines the sketch (its id lands in conflicting_), this modal offers Make Driven /
+    // Keep Driving / Cancel(remove) instead of silently leaving an over-defined sketch.
+    bool overDefOpen_ = false;
+    std::string overDefCid_;         // the offending (just-added) constraint id
+    ImVec2 overDefPos_{0, 0};
+    void drawOverDefinePrompt(AppState& st);
     float frame_[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};  // sketch(u,v,0)->world, row-major
     float camYaw_ = 0, camPitch_ = 89;
     // C34: pre-sketch camera, restored (animated) on exit.

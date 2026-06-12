@@ -31,7 +31,7 @@ RESERVED_DATUMS = {
 
 UNIT_SYSTEMS = {"MMGS", "IPS"}
 
-HANDLE_RE = re.compile(r"^e\d+(\.(p1|p2|p|center|start|end|vertex|apex|p\d+))?$")
+HANDLE_RE = re.compile(r"^e\d+(\.(p1|p2|mid|p|center|start|end|vertex|apex|p\d+))?$")
 FEATURE_ID_RE = re.compile(r"^f\d+$")
 
 SELECTOR_KINDS = {"face", "edge", "vertex", "body", "datum", "region"}
@@ -63,7 +63,7 @@ ENTITY_FIELDS: dict[str, list[str]] = {
 # Entity type -> point sub-handles it exposes
 _ENTITY_SUBS: dict[str, set[str]] = {
     "point": {"p"},
-    "line": {"p1", "p2"},
+    "line": {"p1", "p2", "mid"},   # mid = line midpoint (SolidWorks midpoint dim target)
     "circle": {"center"},
     "arc": {"center", "start", "end"},
     "ellipse": {"center"},

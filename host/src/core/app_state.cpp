@@ -451,6 +451,17 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err) {
     return true;
 }
 
+void AppState::clearViewportForNewDoc() {
+    if (renderer) renderer->setMeshes(std::vector<Renderer::PartMesh>{});
+    hasDocMesh = false;
+    asmParts.clear();
+    selectedPart = -1;
+    selection.clear();
+    modelInfo.clear();
+    faceNormalCache.clear();
+    edgeCentroidCache.clear();
+}
+
 std::string AppState::pickLabel(const render::PickHit& h) const {
     if (!h.valid()) return std::string();
     const char* kind = "Item";

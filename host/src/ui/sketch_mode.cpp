@@ -1,6 +1,8 @@
 // Sketch mode UI (C18) implementation. See sketch_mode.h for the design overview.
 #include "sketch_mode.h"
 
+#include "camera_anim.h"   // C34: restore the pre-sketch camera on exit
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -283,6 +285,11 @@ bool SketchMode::enterForFeature(AppState& st, const std::string& sketchFid) {
     active_ = true;
     isNewEmpty_ = false;
     resetTool();
+    // C34: remember the pre-sketch camera so exit can restore the user's 3D view
+    // (SolidWorks returns to the previous orientation when a sketch closes).
+    prevYaw_ = st.yaw; prevPitch_ = st.pitch; prevZoom_ = st.zoom;
+    prevPan_[0] = st.pan[0]; prevPan_[1] = st.pan[1]; prevPan_[2] = st.pan[2];
+    havePrevCam_ = true;
     // Lock the camera looking down the plane normal (frame_ column 2 = z_dir in world).
     float nz0 = frame_[2], nz1 = frame_[6], nz2 = frame_[10];
     // yaw/pitch from the normal: pitch = asin(nz2), yaw = atan2(nz1, nz0).
@@ -298,6 +305,7 @@ bool SketchMode::enterNewOnSelection(AppState& st) {
     if (!st.docMirror.hasDoc()) {
         std::string err;
         if (!st.docMirror.newPart(st.worker, err)) { st.addLog("[sketch] newPart failed: " + err); return false; }
+        st.clearViewportForNewDoc();   // C34: auto-created part must also drop the demo mesh
     }
     // Plane ref: a resolved planar face/datum selector from the current selection, else plane.top.
     nlohmann::json planeRef = "plane.top";
@@ -351,6 +359,12 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
     status_.clear();
     dof_ = 0;
     resetTool();
+    // C34: glide back to the pre-sketch camera (the viewport resumes ticking the
+    // animation now that sketch mode is off).
+    if (havePrevCam_) {
+        requestCameraAnimation(st, prevYaw_, prevPitch_, prevZoom_, prevPan_);
+        havePrevCam_ = false;
+    }
 }
 
 // ---------------------------------------------------------------------------

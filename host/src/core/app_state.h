@@ -419,6 +419,11 @@ struct AppState {
     // these per-rebuild files is wired in C16.)
     bool loadDocMesh(const std::string& aicmPath, std::string& err);
 
+    // C34: reset the viewport to the fresh-document state — drops the legacy/demo mesh and any
+    // previous doc's parts so the empty-doc datum-planes view shows. Called by every path that
+    // creates a new document (tree toolbar New Part/Assembly, sketch auto-create).
+    void clearViewportForNewDoc();
+
     // Build the "Face 12 of Body1" status label for a pick (empty string for an invalid hit).
     std::string pickLabel(const render::PickHit& h) const;
 };

@@ -495,8 +495,10 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
             if (it != s_LastUsed.end() && !it->second.empty()) {
                 ribbon_fire(it->second.c_str());
             } else {
-                // No last-used — open flyout so the user can pick a variant.
-                s_flyoutOpenReq = cmd_id;   // deferred (ID-scope fix)
+                // C34: plain click on a split button fires the PARENT tool itself (SolidWorks
+                // behavior — the flyout is the arrow's job). Parents with no action of their
+                // own are pre-seeded via kParentDefaults, so they never reach this branch.
+                ribbon_fire(cmd_id);
             }
         } else {
             ribbon_fire(cmd_id);
@@ -593,7 +595,7 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
             if (it != s_LastUsed.end() && !it->second.empty())
                 ribbon_fire(it->second.c_str());
             else {
-                s_flyoutOpenReq = cmd_id;   // deferred (ID-scope fix)
+                ribbon_fire(cmd_id);   // C34: plain click fires the parent (see bigBtn)
             }
         } else {
             ribbon_fire(cmd_id);

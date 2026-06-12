@@ -116,6 +116,10 @@ private:
     std::string status_;             // under|full|over
     float frame_[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};  // sketch(u,v,0)->world, row-major
     float camYaw_ = 0, camPitch_ = 89;
+    // C34: pre-sketch camera, restored (animated) on exit.
+    bool  havePrevCam_ = false;
+    float prevYaw_ = 35, prevPitch_ = 30, prevZoom_ = 1;
+    float prevPan_[3] = {0, 0, 0};
 
     std::vector<SketchEntity> ents_;
 

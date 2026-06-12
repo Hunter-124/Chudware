@@ -580,6 +580,11 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
         Vec3 half(bbMax.x - center_.x, bbMax.y - center_.y, bbMax.z - center_.z);
         radius_ = std::sqrt(half.x * half.x + half.y * half.y + half.z * half.z);
         if (radius_ < 1e-6f) radius_ = 1.0f;
+    } else {
+        // C34: cleared to an EMPTY scene — reset the frame so the empty-doc fallback
+        // (kEmptySceneRadius camera + datum planes) takes over instead of a stale bbox.
+        center_ = Vec3(0, 0, 0);
+        radius_ = 0.0f;
     }
     // C19: apply any standing deformation scale to the freshly uploaded bodies.
     if (deformScale_ != 0.0f)

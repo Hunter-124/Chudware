@@ -17,6 +17,7 @@
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
 #include "../render/id_pass.h"
+#include "../renderer.h"   // C34: clearViewportForNewDoc resets meshes
 
 // Safe JSON string accessor (local copy avoids including app_state.h accessors).
 static inline std::string jfld(const nlohmann::json& o, const char* k) {
@@ -685,8 +686,10 @@ static void drawFeatureManagerTopStrip(AppState& st) {
                     ImGui::GetStyle().ItemSpacing.x);
     if (toolbarIconBtn("fm_new", "new_doc", "New Part", canDoc) && canDoc) {
         std::string err;
-        if (st.docMirror.newPart(st.worker, err))
+        if (st.docMirror.newPart(st.worker, err)) {
             st.addLog("[doc] new part  rev=" + std::to_string(st.docMirror.revision()));
+            st.clearViewportForNewDoc();   // C34: fresh part = clean viewport (planes state)
+        }
         else st.addLog("[err] new part: " + err);
     }
     ImGui::SameLine(0, gap);
@@ -694,6 +697,7 @@ static void drawFeatureManagerTopStrip(AppState& st) {
         std::string err;
         if (st.docMirror.newAssembly(st.worker, err)) {
             st.addLog("[doc] new assembly  rev=" + std::to_string(st.docMirror.revision()));
+            st.clearViewportForNewDoc();   // C34
             st.showRibbon = true; st.ribbonTab = 4;
         } else st.addLog("[err] new assembly: " + err);
     }

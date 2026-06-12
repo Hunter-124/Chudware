@@ -1598,6 +1598,16 @@ int run_gui(const char* screenshotPath) {
         // ---------- C14: ribbon bar (drawn between title bar and dockspace) ----------
         // syncIconTheme keeps texture selection in sync with the active theme.
         ui::syncIconTheme();
+        // C34: SolidWorks behavior — entering a sketch flips the ribbon to the Sketch tab,
+        // exiting returns to Features. Edge-triggered so the user can still switch tabs freely
+        // while sketching.
+        {
+            static bool s_wasInSketch = false;
+            const bool nowInSketch = sketchMode.active();
+            if (nowInSketch && !s_wasInSketch)      st.ribbonTab = 1;   // Sketch
+            else if (!nowInSketch && s_wasInSketch) st.ribbonTab = 0;   // Features
+            s_wasInSketch = nowInSketch;
+        }
         float ribbonH = ui::drawRibbon(st.ribbonTab, st.showRibbon);
 
         // ---------- dockspace host (between the title bar+ribbon and the status bar) ----------

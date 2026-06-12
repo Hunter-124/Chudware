@@ -113,9 +113,13 @@ struct PMField {
     bool checkValue = false;
 };
 
-// Parse a dim string ("25", "25mm", "1.5in", "3/8in") to canonical mm. Returns true on success.
+// Parse a dim string to canonical units (mm; degrees when angle=true). Accepts SolidWorks-style
+// unit math: full +-*/() expressions with per-literal unit suffixes ("100mm+2in/0.5m",
+// "(3+1/8)in", "25.4/2"); a single TRAILING unit applies to the whole expression ("1/2in" =
+// half an inch). Length units: mm cm m um/µm in/" ft/' mil/thou; angle units: deg ° rad. Bare
+// numbers are document units (mm / deg). Returns true on success.
 // Leading "=" is NOT handled here (that is an expr binding, detected by the caller).
-bool pmParseDim(const std::string& text, double& outMm, std::string& err);
+bool pmParseDim(const std::string& text, double& outMm, std::string& err, bool angle = false);
 // Format a canonical mm value for display, honouring IPS when ips==true.
 std::string pmFormatDim(double mm, bool ips);
 

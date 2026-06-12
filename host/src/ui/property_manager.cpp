@@ -67,47 +67,190 @@ static bool fieldEnabled(const PMFieldDef& def, const std::vector<PMField>& fiel
 }
 
 // ---- dim parsing ----------------------------------------------------------
-// Accepts: "25", "25mm", "1.5in", "3/8in", "3/8" (assumed in when a fraction). Canonical = mm.
+// SolidWorks-style unit math (C50c): a dim field accepts a full arithmetic expression with
+// per-literal unit suffixes — "100mm+2in/0.5m", "(3+1/8)in", "25.4/2", "0.5m-3cm". Each unit
+// literal converts to canonical units (mm; deg for angle fields) at the literal, with standard
+// */ over +- precedence and parentheses. ONE SolidWorks-compatible exception: when the whole
+// input carries exactly one unit and it is the trailing token, the unit applies to the entire
+// expression ("1/2in" = half an inch, not 1 ÷ 50.8mm). Bare numbers = document units (MMGS).
 
-static bool parseFraction(const std::string& s, double& out) {
-    auto slash = s.find('/');
-    if (slash == std::string::npos) return false;
-    try {
-        double num = std::stod(s.substr(0, slash));
-        double den = std::stod(s.substr(slash + 1));
-        if (den == 0.0) return false;
-        out = num / den;
-        return true;
-    } catch (...) { return false; }
+namespace {
+
+struct DimTok {
+    enum Kind { Num, Op, LParen, RParen, End } kind = End;
+    double value = 0.0;     // Num: literal already converted to canonical units
+    bool   hadUnit = false; // Num: a unit suffix was attached
+    char   op = 0;          // Op: + - * /
+};
+
+// Longest-match unit table. Factor converts to mm (length) or deg (angle).
+struct DimUnit { const char* name; double factor; bool angle; };
+static const DimUnit kDimUnits[] = {
+    {"thou", 0.0254, false}, {"mil", 0.0254, false},
+    {"deg", 1.0, true},      {"rad", 57.29577951308232, true},
+    {"\xc2\xb0", 1.0, true},                                      // °
+    {"mm", 1.0, false},  {"cm", 10.0, false}, {"um", 0.001, false},
+    {"\xc2\xb5m", 0.001, false},                                  // µm
+    {"ft", 304.8, false}, {"in", 25.4, false},
+    {"m", 1000.0, false}, {"\"", 25.4, false}, {"'", 304.8, false},
+};
+
+// Tokenize a de-spaced, lowercased dim string. Returns false with err on a bad token.
+// unitCount/lastIsUnit report unit usage for the trailing-unit-applies-to-all rule.
+static bool dimTokenize(const std::string& s, bool angle, std::vector<DimTok>& out,
+                        int& unitCount, bool& endsWithUnit, std::string& err) {
+    unitCount = 0; endsWithUnit = false;
+    size_t i = 0;
+    while (i < s.size()) {
+        char c = s[i];
+        if (c == '+' || c == '-' || c == '*' || c == '/') {
+            DimTok t; t.kind = DimTok::Op; t.op = c; out.push_back(t); ++i; continue;
+        }
+        if (c == '(') { out.push_back({DimTok::LParen}); ++i; continue; }
+        if (c == ')') {
+            out.push_back({DimTok::RParen}); ++i; endsWithUnit = false;
+            // A unit directly after a group scales the group: "(3+1/8)in" -> (3+1/8)*25.4.
+            for (const auto& u : kDimUnits) {
+                size_t n = std::strlen(u.name);
+                if (s.compare(i, n, u.name) != 0) continue;
+                if (i + n < s.size() && std::isalpha((unsigned char)s[i + n])) continue;
+                if (u.angle != angle) {
+                    err = angle ? "length unit in an angle value"
+                                : "angle unit in a length value";
+                    return false;
+                }
+                DimTok mul; mul.kind = DimTok::Op; mul.op = '*'; out.push_back(mul);
+                DimTok f; f.kind = DimTok::Num; f.value = u.factor; f.hadUnit = true;
+                out.push_back(f);
+                ++unitCount;
+                endsWithUnit = true;
+                i += n;
+                break;
+            }
+            continue;
+        }
+        if (std::isdigit((unsigned char)c) || c == '.') {
+            size_t pos = 0;
+            double v = 0;
+            try { v = std::stod(s.substr(i), &pos); }
+            catch (...) { err = "bad number"; return false; }
+            i += pos;
+            DimTok t; t.kind = DimTok::Num; t.value = v;
+            // unit suffix? (longest match wins)
+            for (const auto& u : kDimUnits) {
+                size_t n = std::strlen(u.name);
+                if (s.compare(i, n, u.name) != 0) continue;
+                // "m" must not eat the m of a following identifier — units are only ever
+                // followed by an operator/paren/end, so a letter after the match means a
+                // longer (unknown) suffix; keep scanning the table for the longer names
+                // first (table order) and reject leftover letters below.
+                if (i + n < s.size() && std::isalpha((unsigned char)s[i + n])) continue;
+                if (u.angle != angle) {
+                    err = angle ? "length unit in an angle value"
+                                : "angle unit in a length value";
+                    return false;
+                }
+                t.value *= u.factor;
+                t.hadUnit = true;
+                ++unitCount;
+                i += n;
+                break;
+            }
+            endsWithUnit = t.hadUnit;
+            out.push_back(t);
+            continue;
+        }
+        err = std::string("unexpected '") + c + "'";
+        return false;
+    }
+    out.push_back({DimTok::End});
+    return true;
 }
 
-bool pmParseDim(const std::string& raw, double& outMm, std::string& err) {
+// Recursive-descent evaluation: expr := term (('+'|'-') term)*, term := unary (('*'|'/') unary)*,
+// unary := '-' unary | num | '(' expr ')'.
+struct DimEval {
+    const std::vector<DimTok>& t;
+    size_t i = 0;
+    std::string err;
+    double expr() {
+        double v = term();
+        while (err.empty() && t[i].kind == DimTok::Op && (t[i].op == '+' || t[i].op == '-')) {
+            char op = t[i].op; ++i;
+            double r = term();
+            v = (op == '+') ? v + r : v - r;
+        }
+        return v;
+    }
+    double term() {
+        double v = unary();
+        while (err.empty() && t[i].kind == DimTok::Op && (t[i].op == '*' || t[i].op == '/')) {
+            char op = t[i].op; ++i;
+            double r = unary();
+            if (op == '/') {
+                if (std::fabs(r) < 1e-30) { err = "division by zero"; return 0; }
+                v /= r;
+            } else v *= r;
+        }
+        return v;
+    }
+    double unary() {
+        if (t[i].kind == DimTok::Op && t[i].op == '-') { ++i; return -unary(); }
+        if (t[i].kind == DimTok::Op && t[i].op == '+') { ++i; return unary(); }
+        if (t[i].kind == DimTok::Num) return t[i++].value;
+        if (t[i].kind == DimTok::LParen) {
+            ++i;
+            double v = expr();
+            if (err.empty() && t[i].kind != DimTok::RParen) { err = "missing ')'"; return 0; }
+            ++i;
+            return v;
+        }
+        err = "expected a number";
+        return 0;
+    }
+};
+
+}  // namespace
+
+bool pmParseDim(const std::string& raw, double& outMm, std::string& err, bool angle) {
     err.clear();
     std::string s;
     for (char c : raw) if (!std::isspace((unsigned char)c)) s += c;
     if (s.empty()) { err = "empty"; return false; }
     for (auto& c : s) c = (char)std::tolower((unsigned char)c);
 
-    double scale = 1.0;          // mm per unit
-    bool inches = false;
-    if (s.size() >= 2 && s.compare(s.size() - 2, 2, "mm") == 0) {
-        s.erase(s.size() - 2);
-    } else if (s.size() >= 2 && s.compare(s.size() - 2, 2, "in") == 0) {
-        s.erase(s.size() - 2); inches = true; scale = 25.4;
-    } else if (!s.empty() && s.back() == '"') {
-        s.pop_back(); inches = true; scale = 25.4;
+    // Trailing-unit-applies-to-all: exactly one unit in the input AND it is the final token
+    // ("1/2in", "(3+5)/2 in"). Strip it, evaluate bare, scale the result. Inputs with units on
+    // interior literals ("100mm+2in/0.5m") fall through to per-literal conversion.
+    double wholeScale = 1.0;
+    {
+        std::vector<DimTok> probe;
+        int unitCount = 0; bool endsWithUnit = false; std::string perr;
+        if (dimTokenize(s, angle, probe, unitCount, endsWithUnit, perr) &&
+            unitCount == 1 && endsWithUnit) {
+            for (const auto& u : kDimUnits) {
+                size_t n = std::strlen(u.name);
+                if (u.angle == angle && s.size() > n &&
+                    s.compare(s.size() - n, n, u.name) == 0) {
+                    wholeScale = u.factor;
+                    s.erase(s.size() - n);
+                    break;
+                }
+            }
+        }
     }
-    (void)inches;
 
-    double val = 0.0;
-    if (s.find('/') != std::string::npos) {
-        if (!parseFraction(s, val)) { err = "bad fraction"; return false; }
-    } else {
-        try { size_t pos = 0; val = std::stod(s, &pos);
-              if (pos != s.size()) { err = "bad number"; return false; } }
-        catch (...) { err = "bad number"; return false; }
-    }
-    outMm = val * scale;
+    std::vector<DimTok> toks;
+    int unitCount = 0; bool endsWithUnit = false;
+    if (!dimTokenize(s, angle, toks, unitCount, endsWithUnit, err)) return false;
+    if (toks.size() <= 1) { err = "empty"; return false; }
+
+    DimEval ev{toks};
+    double v = ev.expr();
+    if (!ev.err.empty()) { err = ev.err; return false; }
+    if (ev.t[ev.i].kind != DimTok::End) { err = "trailing input"; return false; }
+    if (!std::isfinite(v)) { err = "not a number"; return false; }
+    outMm = v * wholeScale;
     return true;
 }
 

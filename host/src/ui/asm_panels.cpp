@@ -232,7 +232,7 @@ bool AsmPanels::addMate(AppState& st, const std::string& type, const std::string
     if (type == "distance" || type == "angle") {
         double v = 0; std::string perr;
         std::string txt(dimBuf_.data());
-        if (!pmParseDim(txt, v, perr)) { mateError_ = "value: " + perr; return false; }
+        if (!pmParseDim(txt, v, perr, type == "angle")) { mateError_ = "value: " + perr; return false; }
         mate["value"] = {{"value", v}, {"expr", nullptr}};
     }
     auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({

@@ -1600,7 +1600,7 @@ void SketchMode::dimCommit(AppState& st) {
     double mm = dimMeasured_;
     if (!isExpr) {
         std::string perr;
-        if (!pmParseDim(txt, mm, perr)) { dimError_ = perr.empty() ? "bad value" : perr; return; }
+        if (!pmParseDim(txt, mm, perr, dimIsAngle_)) { dimError_ = perr.empty() ? "bad value" : perr; return; }
     }
     if (!dimEditCid_.empty()) {
         // Editing an EXISTING dim: sketch_set_dim.
@@ -3893,7 +3893,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 std::string txt = dimBuf_.data();
                 if (!txt.empty() && txt[0] == '=') return;   // don't mutate expressions
                 double cur = dimMeasured_; std::string perr;
-                if (pmParseDim(txt, cur, perr)) {}           // parse current text if valid
+                if (pmParseDim(txt, cur, perr, dimIsAngle_)) {}  // parse current text if valid
                 cur += delta;
                 std::snprintf(dimBuf_.data(), dimBuf_.size(), "%s", fmtLen(cur).c_str());
             };

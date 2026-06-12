@@ -188,6 +188,37 @@ def test_coalesce_undo_groups_multi_batch_action() -> None:
     print("[ops] coalesce: 4-batch rectangle undoes/redoes as ONE step")
 
 
+def test_undo_cold_solves_sketch_to_exact_prior_state() -> None:
+    """C50: undo must return the active sketch to its EXACT prior geometry. The seed-coords cold
+    solve after undo (warm state cleared) reproduces the pre-action solution instead of leaving the
+    geometry warm-stuck at the post-action configuration."""
+    from engine.doc.session import (sketch_enter, sketch_solve, undo as session_undo)
+    s = new_session("part", "UndoSolve")
+    r = session_apply_ops(s, None, [{"op": "add_feature", "feature": {
+        "type": "sketch", "name": "Sketch1", "refs": {"plane": "plane.front"},
+        "params": {"entities": [], "constraints": []}}}])
+    fid = r["id_map"]["$0"]
+    session_apply_ops(s, None, [{"op": "sketch_add_entity", "sketch": fid,
+        "entity": {"type": "line", "p1": [0.0, 0.0], "p2": [47.0, 0.0]},
+        "constraints": [{"type": "horizontal", "refs": ["$self"]},
+                        {"type": "coincident", "refs": ["$self.p1", "origin"]}]}])
+    sk = next(f for f in s.doc["features"] if f["id"] == fid)
+    lid = sk["params"]["entities"][0]["id"]
+    sketch_enter(s, fid)
+    before = sketch_solve(s, fid)["entities"][0]["p2"]
+    # length dim 80 moves the line from 47 -> 80 (warm-solved)
+    session_apply_ops(s, None, [{"op": "sketch_add_constraint", "sketch": fid, "constraint": {
+        "type": "distance", "refs": [lid + ".p1", lid + ".p2"], "axis": "h",
+        "value": {"value": 80.0, "expr": None}}}])
+    moved = sketch_solve(s, fid)["entities"][0]["p2"]
+    assert abs(moved[0] - 80.0) < 1e-6
+    session_undo(s)
+    restored = sketch_solve(s, fid)["entities"][0]["p2"]
+    assert abs(restored[0] - before[0]) < 1e-6 and abs(restored[1] - before[1]) < 1e-6, \
+        f"undo must restore exact geometry: {restored} != {before}"
+    print("[ops] undo cold-solves sketch back to exact pre-dim geometry")
+
+
 # --------------------------------------------------------------------------- equations
 
 
@@ -278,6 +309,7 @@ def main() -> None:
     test_cache_hit_face_owners_nonempty()
     test_cache_hit_partial_rebuild_owner_maps()
     test_coalesce_undo_groups_multi_batch_action()
+    test_undo_cold_solves_sketch_to_exact_prior_state()
     print("\nDOC OPS TESTS PASSED")
 
 

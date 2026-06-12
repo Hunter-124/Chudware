@@ -1633,6 +1633,7 @@ void SketchMode::dimOpenModify(const ImVec2& at) {
 
 // Commit the Modify box: parse value/expr, apply, and (on success) keep the tool armed.
 void SketchMode::dimCommit(AppState& st) {
+    const int dofBefore = dof_;   // C50: over-define = a driving dim that removes no DOF
     std::string txt = dimBuf_.data();
     nlohmann::json con = dimPending_;
     bool isExpr = (!txt.empty() && txt[0] == '=');
@@ -1673,16 +1674,19 @@ void SketchMode::dimCommit(AppState& st) {
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     std::string newCid = (r.id_map.is_object() && r.id_map.contains("$0"))
                        ? r.id_map["$0"].get<std::string>() : std::string();
-    resolve(st);   // refreshes conflicting_ + redundant_ + status_
-    // C50: SolidWorks over-define guard. A driving dimension that the solver flags REDUNDANT
-    // (removes no DOF — the geometry is already constrained that way) or CONFLICTING (inconsistent)
-    // over-defines the sketch. SolidWorks catches the redundant case at add-time — BEFORE you can
-    // change the value to break the sketch — and pops "Make Dimension Driven?". Catching only
-    // conflicting (the old code) missed the consistent-redundant case the user hit.
+    resolve(st);   // refreshes conflicting_ + redundant_ + status_ + dof_
+    // C50: SolidWorks over-define guard. A driving DIMENSION always adds exactly one equation, so
+    // it must drop the DOF by one — if the DOF did NOT decrease, the dimension removed no freedom
+    // and therefore over-defines the sketch (whether the solver attributes the redundancy to THIS
+    // dim or to a pre-existing constraint elsewhere — the earlier newCid-in-list check missed the
+    // latter, which is the case the user hit). conflicting/redundant on the new id is a secondary
+    // signal. Either way SolidWorks offers "Make Dimension Driven?" at add-time, before the value
+    // can be edited to break the sketch.
     auto inList = [&](const std::vector<std::string>& v) {
         return std::find(v.begin(), v.end(), newCid) != v.end();
     };
-    if (!dimPopupDriven_ && !newCid.empty() && (inList(conflicting_) || inList(redundant_))) {
+    bool overDefined = (dof_ >= dofBefore) || inList(conflicting_) || inList(redundant_);
+    if (!dimPopupDriven_ && !newCid.empty() && overDefined) {
         overDefOpen_ = true; overDefCid_ = newCid; overDefPos_ = dimPopupPos_;
     }
     // Stay in Smart Dimension; clear the pick buffer for the next dimension.
@@ -1710,7 +1714,8 @@ void SketchMode::drawOverDefinePrompt(AppState& st) {
         if (ImGui::Button("Make Driven")) {
             nlohmann::json op = {{"op", "sketch_set_dim"}, {"sketch", fid_},
                                  {"id", overDefCid_}, {"driven", true}};
-            auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+            // Coalesce into the dim's undo step: add-then-make-driven is ONE Ctrl+Z (SolidWorks).
+            auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/true);
             if (!r.ok) st.toast(ui::ToastLevel::Warn, "Make driven: " + r.error_message);
             else { if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); } resolve(st); }
             finish();
@@ -1722,9 +1727,9 @@ void SketchMode::drawOverDefinePrompt(AppState& st) {
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) {
-            // Remove the dimension we just added.
+            // Remove the dimension we just added. Coalesce so one Ctrl+Z returns to before the add.
             nlohmann::json op = {{"op", "sketch_delete_constraint"}, {"sketch", fid_}, {"id", overDefCid_}};
-            auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+            auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/true);
             if (r.ok) { if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); } resolve(st); }
             finish();
         }
@@ -3333,41 +3338,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 toolSnaps_.push_back("");
             } else if (tool_ == SketchTool::RectCorner && toolUV_.size() == 2) {
                 ImVec2 a = toolUV_[0], b = toolUV_[1];
-                // Four lines with coincident corners + h/v relations (inferred per line via $self).
-                float xs[4] = {a.x, b.x, b.x, a.x};
-                float ys[4] = {a.y, a.y, b.y, b.y};
-                // Build as four separate add_entity ops via successive applyOps so coincidents can
-                // reference real ids; for simplicity emit them with inferred h/v only and rely on
-                // the solver + later dims. We chain coincidents using the running entity ids.
-                std::string prevId;
-                std::string firstId;
-                for (int i = 0; i < 4; ++i) {
-                    int j = (i + 1) % 4;
-                    nlohmann::json cs = nlohmann::json::array();
-                    bool horiz = (i == 0 || i == 2);
-                    cs.push_back({{"type", horiz ? "horizontal" : "vertical"}, {"refs", {"$self"}}});
-                    if (!prevId.empty())
-                        cs.push_back({{"type", "coincident"}, {"refs", {prevId + ".p2", "$self.p1"}}});
-                    nlohmann::json ent = {{"type", "line"},
-                        {"p1", nlohmann::json::array({xs[i], ys[i]})},
-                        {"p2", nlohmann::json::array({xs[j], ys[j]})}};
-                    nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_},
-                                         {"entity", ent}, {"constraints", cs}};
-                    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
-                    if (!r.ok) { st.addLog("[sketch] rect line failed: " + r.error_message); break; }
-                    std::string nid = (r.id_map.is_object() && r.id_map.contains("$0"))
-                                    ? r.id_map["$0"].get<std::string>() : std::string();
-                    if (i == 0) firstId = nid;
-                    prevId = nid;
-                    if (i == 3 && !firstId.empty() && !nid.empty()) {
-                        // close the loop: last.p2 coincident first.p1
-                        nlohmann::json clop = {{"op", "sketch_add_constraint"}, {"sketch", fid_},
-                            {"constraint", {{"type", "coincident"}, {"refs", {nid + ".p2", firstId + ".p1"}}}}};
-                        st.docMirror.applyOps(st.worker, nlohmann::json::array({clop}));
-                    }
-                    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
-                }
-                resolve(st);
+                // Axis-aligned rect: 4 coincident-chained lines with per-edge h/v relations.
+                // C50: route through addQuadLoop so the 4 line batches COALESCE into one undo step
+                // (was an inline loop with 4 separate undo steps -> "vanishes one corner at a time").
+                ImVec2 quad[4] = {{a.x, a.y}, {b.x, a.y}, {b.x, b.y}, {a.x, b.y}};
+                const char* rel[4] = {"horizontal", "vertical", "horizontal", "vertical"};
+                addQuadLoop(st, quad, rel);
                 resetTool();
             } else if (tool_ == SketchTool::Circle && toolUV_.size() == 2) {
                 ImVec2 c = toolUV_[0], rim = toolUV_[1];

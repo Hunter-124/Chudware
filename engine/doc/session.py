@@ -493,6 +493,12 @@ def undo(session: DocSession, emit: EmitFn | None = None) -> dict:
     session.revision += 1
     session.dirty = True
     session.asm_warm = {}  # re-seed mate solve from the restored doc transforms
+    # C50: drop the active sketch's warm solver state so the next sketch_solve COLD-solves the
+    # restored doc seeds. Warm-starting from the post-action configuration was non-deterministic —
+    # the solver could settle on a different branch, so an undo failed to return the sketch to its
+    # exact prior geometry ("calculates relations differently and irreversibly messes up").
+    if session.active_sketch is not None:
+        session.active_sketch.solve_state = None
     result = _rebuild(session, emit)
     return _ops_response(session, result, {})
 
@@ -509,6 +515,8 @@ def redo(session: DocSession, emit: EmitFn | None = None) -> dict:
     session.revision += 1
     session.dirty = True
     session.asm_warm = {}  # re-seed mate solve from the restored doc transforms
+    if session.active_sketch is not None:   # C50: cold-solve the restored doc (see undo)
+        session.active_sketch.solve_state = None
     result = _rebuild(session, emit)
     return _ops_response(session, result, {})
 

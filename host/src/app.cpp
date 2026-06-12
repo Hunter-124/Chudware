@@ -670,6 +670,7 @@ int run_gui(const char* screenshotPath) {
             // --- C22b: if this was a v2 run, resync the DocMirror tree + reload mesh ---
             // The worker already rebuilt the doc; call doc_rebuild to refresh the tree and
             // get the latest aicm_path, then load it into the viewport.
+            const bool wasV2 = st.agentV2Running;
             if (st.agentV2Running) {
                 st.agentV2Running = false;
                 if (st.docMirror.hasDoc() && st.job.error.empty()) {
@@ -686,7 +687,14 @@ int run_gui(const char* screenshotPath) {
                                 // fast call) pulls the new tree + revision + owner map and fires
                                 // the listener so the tree repaints with what the agent built.
                                 st.docMirror.resync(st.worker);
-                                std::string aicmPath = r.result.value("aicm_path", "");
+                                // C40: doc_rebuild is an ops-response — the mesh path lives at
+                                // tess.aicm_path (the old top-level read was always empty, so
+                                // the viewport NEVER refreshed after a v2 agent run).
+                                std::string aicmPath;
+                                if (r.result.contains("tess") && r.result["tess"].is_object())
+                                    aicmPath = r.result["tess"].value("aicm_path", "");
+                                if (aicmPath.empty())
+                                    aicmPath = r.result.value("aicm_path", "");
                                 if (!aicmPath.empty()) {
                                     std::string le;
                                     st.loadDocMesh(aicmPath, le);
@@ -788,6 +796,26 @@ int run_gui(const char* screenshotPath) {
                     st.addLog("[err] " + e);
                     assistant = "Built it, but couldn't load the mesh: " + e;
                     assistantErr = ERR_SYSTEM;
+                }
+            } else if (wasV2 && st.job.error.empty()) {
+                // C40: a v2 orchestrator run has no job.stl — the doc itself was built. Without
+                // this branch the assistant bubble finished EMPTY (the run looked dead even when
+                // it succeeded). Summarize from the run result; the tree/viewport refresh lands
+                // via the async doc_rebuild above.
+                if (st.job.converged) {
+                    st.status = "Done";
+                    st.statusKind = 0;
+                    assistant = "Done - I built this as parametric features; see the FeatureManager "
+                                "tree and the viewport. Switch to \"Edit part\" to ask for changes, "
+                                "or edit any feature directly (double-click / right-click it).";
+                } else {
+                    st.status = "Stopped early";
+                    st.statusKind = 1;
+                    assistantErr = ERR_CAD;
+                    std::string why = st.job.stopReason.empty() ? "unknown reason" : st.job.stopReason;
+                    assistant = "I stopped before fully finishing (" + why + "). Whatever was built "
+                                "so far is in the FeatureManager tree - check the Activity panel "
+                                "for the step-by-step log, or rephrase and try again.";
                 }
             }
             if (st.job.kind == JOB_DESIGN || st.job.kind == JOB_CHAT) {

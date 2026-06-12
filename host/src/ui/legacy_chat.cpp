@@ -496,15 +496,44 @@ static void submitTurn(AppState& st, const std::string& text) {
             st.activityPanel->clearLive();
         launchAgentRunV2(st.worker, st.job, text, st.docMirror.docId());
     } else if (askMode && st.designStarted && !st.chat.empty()) {
-        // Ask -> continue the session conversationally.
+        // Ask -> continue the session conversationally (legacy loop; Q&A only).
         st.addLog("[..] chat: " + text);
         st.status = "Refining...";  st.statusKind = 0;
         launchJob(st.worker, st.job, JOB_CHAT, text, /*reset=*/false, st.settings.planMode);
     } else {
-        // Design new -> fresh design session.
-        st.addLog("[..] designing: " + text);
+        // Design new -> C40: the v2 orchestrator on a FRESH part document, so "Design with AI"
+        // produces a real parametric feature tree. (The legacy build123d loop rendered a dead
+        // mesh disconnected from the document — you couldn't edit, dimension, or save what the
+        // AI built.) The current doc is replaced only when it already has features.
+        std::string err;
+        bool docOk = st.docMirror.hasDoc();
+        if (docOk) {
+            const nlohmann::json& tree = st.docMirror.tree();
+            bool hasFeatures = tree.is_object() && tree.contains("features") &&
+                               tree["features"].is_array() && !tree["features"].empty();
+            if (hasFeatures) docOk = st.docMirror.newPart(st.worker, err);
+        } else {
+            docOk = st.docMirror.newPart(st.worker, err);
+        }
+        if (!docOk) {
+            st.addLog("[err] design: could not create a part document: " + err);
+            st.status = "Worker not ready";  st.statusKind = 2;
+            if (!st.chat.empty() && st.chat.back().running) {
+                st.chat.back().running = false;
+                st.chat.back().errKind = 2;
+                st.chat.back().text = "I couldn't open a new part document (worker not ready). "
+                                      "Check the Console and try again.";
+            }
+            return;
+        }
+        st.clearViewportForNewDoc();
+        st.addLog("[..] designing (v2): " + text);
         st.status = "Designing...";  st.statusKind = 0;
-        launchJob(st.worker, st.job, JOB_DESIGN, text, /*reset=*/true, st.settings.planMode);
+        st.agentV2Running = true;
+        st.agentV2 = true;
+        if (st.activityPanel)
+            st.activityPanel->clearLive();
+        launchAgentRunV2(st.worker, st.job, text, st.docMirror.docId());
     }
 }
 

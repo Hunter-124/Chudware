@@ -1250,19 +1250,52 @@ void SketchMode::inSketchUndo(AppState& st) {
 void SketchMode::refreshGhosts(AppState& st) {
     const std::string docId = st.docMirror.docId();
     const int rev = st.docMirror.revision();
-    if (docId == ghostsDocId_ && rev == ghostsRevision_) return;
+    // C48: the in-flight create-mode PM preview (Extrude/Revolve...) consumes its profile
+    // sketch in the doc, but the curves must STAY visible until commit (SolidWorks shows the
+    // profile through the preview). A change of the exempt id also forces a refresh.
+    std::string exemptFid;
+    if (st.propertyManager) exemptFid = st.propertyManager->previewFeatureId();
+    if (docId == ghostsDocId_ && rev == ghostsRevision_ && exemptFid == ghostsExemptFid_) return;
     ghostsDocId_ = docId;
     ghostsRevision_ = rev;
-    ghosts_.clear();
+    ghostsExemptFid_ = exemptFid;
     ++ghostsGen_;
+    // C48: keep already-loaded snapshots across the refresh — during PM preview churn the
+    // revision bumps faster than the async overview fetch completes, and clearing here made
+    // every unconsumed sketch flicker out (or vanish for the whole preview session). Stale
+    // coords draw until the fresh fetch lands.
+    std::vector<GhostSketch> old;
+    old.swap(ghosts_);
     const nlohmann::json& tree = st.docMirror.tree();
     if (!tree.is_object() || !tree.contains("features") || !tree["features"].is_array()) return;
     const auto& feats = tree["features"];
-    // A sketch is "consumed" when any other feature references it (region selectors carry
-    // "sketch":"<fid>"). Consumed sketches are hidden, matching SolidWorks' absorbed sketches.
-    std::string refsBlob;
-    for (const auto& f : feats)
-        if (f.is_object() && f.contains("refs")) refsBlob += f["refs"].dump();
+    // Per-sketch consumer scan: a sketch is consumed when a DIFFERENT feature references it
+    // ("sketch":"<fid>" inside a region selector) AND that consumer is actually built —
+    // sketches referenced by an errored or rolled-back feature still ghost (the user needs to
+    // see them to fix things), as does the PM's exempt preview feature.
+    const nlohmann::json& statusArr = st.docMirror.featureStatus();
+    auto consumerCounts = [&](const std::string& fid) -> bool {
+        const std::string needle = "\"sketch\":\"" + fid + "\"";
+        for (const auto& f : feats) {
+            if (!f.is_object() || f.value("type", std::string()) == "sketch") continue;
+            const std::string cid = f.value("id", std::string());
+            if (cid.empty() || cid == exemptFid) continue;
+            if (!f.contains("refs") || f["refs"].dump().find(needle) == std::string::npos)
+                continue;
+            // Consumer found — does it actually build? (missing status record = assume ok)
+            bool ok = true, rolledBack = false;
+            if (statusArr.is_array()) {
+                for (const auto& s : statusArr) {
+                    if (!s.is_object() || s.value("id", std::string()) != cid) continue;
+                    ok = s.value("ok", true);
+                    rolledBack = s.value("rolled_back", false);
+                    break;
+                }
+            }
+            if (ok && !rolledBack) return true;
+        }
+        return false;
+    };
     for (const auto& f : feats) {
         if (!f.is_object() || f.value("type", std::string()) != "sketch") continue;
         if (f.value("suppressed", false)) continue;
@@ -1271,11 +1304,20 @@ void SketchMode::refreshGhosts(AppState& st) {
         if (!f.contains("params") || !f["params"].is_object()) continue;
         const auto& ents = f["params"].value("entities", nlohmann::json::array());
         if (!ents.is_array() || ents.empty()) continue;
-        if (refsBlob.find("\"sketch\":\"" + fid + "\"") != std::string::npos) continue;
+        if (consumerCounts(fid)) continue;
         ghosts_.push_back(GhostSketch{});
         ghosts_.back().fid = fid;
+        // Carry over the previous snapshot (stale-but-visible) while the refresh is in flight.
+        for (auto& o : old) {
+            if (o.fid != fid || !o.loaded) continue;
+            std::memcpy(ghosts_.back().frame, o.frame, sizeof(o.frame));
+            ghosts_.back().ents = std::move(o.ents);
+            ghosts_.back().loaded = true;
+            break;
+        }
         // Fetch the solved coords + plane frame asynchronously; the callback runs on the GL
-        // thread (AsyncRpc::drain) and is dropped if the doc moved on (gen guard).
+        // thread (AsyncRpc::drain) and is dropped if the doc moved on (gen guard) — harmless
+        // now, since the carried-over snapshot keeps drawing until a fresh fetch lands.
         const int gen = ghostsGen_;
         st.rpc.call("doc_sketch_overview", {{"doc_id", docId}, {"sketch", fid}},
                     [this, gen, fid](const core::RpcResult& r) {

@@ -187,9 +187,10 @@ private:
         std::vector<SketchEntity> ents;
         bool loaded = false;         // overview response applied
     };
-    void refreshGhosts(AppState& st);   // re-fetch on (doc id, revision) change
+    void refreshGhosts(AppState& st);   // re-fetch on (doc id, revision, exempt-fid) change
     std::vector<GhostSketch> ghosts_;
     std::string ghostsDocId_;
+    std::string ghostsExemptFid_;    // C48: PM create-preview feature whose consumption is ignored
     int ghostsRevision_ = -999;
     int ghostsGen_ = 0;              // supersede guard for in-flight overview responses
 

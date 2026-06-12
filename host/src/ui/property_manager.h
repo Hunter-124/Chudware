@@ -169,6 +169,14 @@ public:
     // (mutual exclusion: a PM and the plane-pick overlay must never coexist).
     void cancelEdits(AppState& st); // Cancel: undo every preview batch
 
+    // C48: id of the IN-FLIGHT create-mode preview feature ("" when none / edit mode).
+    // The sketch ghost renderer exempts this feature's sketch consumption so the profile
+    // curves stay visible during an Extrude/Revolve preview (SolidWorks behavior) — the
+    // consumption only "counts" once the feature is committed.
+    std::string previewFeatureId() const {
+        return (active_ && !editMode_) ? targetId_ : std::string();
+    }
+
 private:
     void close();
     void commit(AppState& st);     // OK

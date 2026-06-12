@@ -102,6 +102,13 @@ public:
     void drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, const ImVec2& imgMax,
                      int vw, int vh, bool imgHovered);
 
+    // C40: ghost-render every UNCONSUMED, non-active sketch as flat curves in the viewport
+    // (SolidWorks shows inactive sketches in grey). Cached per (doc id, revision); entity
+    // snapshots are fetched via the async doc_sketch_overview RPC, so frames never block.
+    // Called from the Viewport panel after the ImGui::Image in ALL modes (the active sketch,
+    // if any, is skipped — drawOverlay owns it).
+    void drawGhosts(AppState& st, const ImVec2& imgMin, const ImVec2& imgMax, int vw, int vh);
+
     // Short status line for the status bar ("Under Defined   DOF: 4"). Empty when inactive.
     std::string statusLine() const;
 
@@ -164,6 +171,19 @@ private:
     // Nearest WHOLE entity under the screen point (line segment / circle rim / arc rim distance);
     // returns the index into ents_ or -1. Used by Trim / Extend / Offset hover + pick (C29-B).
     int hitTestEntity(const ImVec2& s, float maxPx = 12.0f) const;
+
+    // ---- C40 ghost sketches (inactive-sketch rendering) ----
+    struct GhostSketch {
+        std::string fid;
+        float frame[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        std::vector<SketchEntity> ents;
+        bool loaded = false;         // overview response applied
+    };
+    void refreshGhosts(AppState& st);   // re-fetch on (doc id, revision) change
+    std::vector<GhostSketch> ghosts_;
+    std::string ghostsDocId_;
+    int ghostsRevision_ = -999;
+    int ghostsGen_ = 0;              // supersede guard for in-flight overview responses
 
     bool active_ = false;
     bool isNewEmpty_ = false;        // entered a freshly-created sketch (delete on cancel-exit)

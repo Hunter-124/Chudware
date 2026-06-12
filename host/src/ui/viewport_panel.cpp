@@ -672,6 +672,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // ---- C18: sketch overlay owns the mouse while a sketch is being edited ----
         // C37-C item 5: also call drawOverlay during sketchPlanePickActive (no active sketch yet,
         // but the sketcher agent needs to draw plane hover/click overlay). Guard with sketch != null.
+        // C40: inactive sketches ghost-render in every mode (SolidWorks grey sketches); the
+        // active sketch (if any) is skipped — drawOverlay below owns it.
+        if (sketch != nullptr) sketch->drawGhosts(st, vr0, vr1, vw, vh);
         if (inSketch) {
             sketch->drawOverlay(st, io, vr0, vr1, vw, vh, imgHovered);
         } else if (st.sketchPlanePickActive && sketch != nullptr) {

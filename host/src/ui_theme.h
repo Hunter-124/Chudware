@@ -90,6 +90,11 @@ struct Palette {
     // ---- C18 sketch mode ----
     float sketchUnder[4]   = {0.337f,0.612f,0.960f, 1};   // under-defined entity (SW-style blue)
     float sketchGrid[4]    = {0.520f,0.560f,0.620f, 0.18f}; // faint sketch grid lines
+    // C40: ink drawn ON the 3D viewport (which is light in BOTH themes) — fully-defined
+    // entities and dimension lines/text must be dark like SolidWorks, never the panel text
+    // role (near-white in the dark theme = invisible on the white canvas).
+    float sketchInk[4]     = {0.090f,0.100f,0.125f, 1};   // fully-defined entities, dim text
+    float sketchDimLine[4] = {0.165f,0.184f,0.220f, 1};   // dim/extension lines + arrows
 
     // ---- status ----
     float statusOk[4]   = {0.176f,0.831f,0.749f, 1};   // same as accent

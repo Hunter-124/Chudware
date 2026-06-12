@@ -125,42 +125,47 @@ bool SketchMode::callSketch(AppState& st, const char* method, const nlohmann::js
     return true;
 }
 
+// Parse a sketch response's "entities" (+ optional "statuses") array into SketchEntity records.
+// Shared by applyEnterResult (live sketch) and the C40 ghost-sketch cache.
+static void parseEntities(const nlohmann::json& res, std::vector<SketchEntity>& out) {
+    out.clear();
+    const nlohmann::json* stats = res.contains("statuses") ? &res["statuses"] : nullptr;
+    if (!res.contains("entities") || !res["entities"].is_array()) return;
+    for (const auto& e : res["entities"]) {
+        SketchEntity se;
+        se.id = e.value("id", std::string());
+        se.type = e.value("type", std::string());
+        se.construction = e.value("construction", false);
+        if (stats && stats->contains(se.id)) se.status = (*stats)[se.id].get<std::string>();
+        else se.status = "under";
+        auto v2 = [&](const char* k, float o[2]) {
+            if (e.contains(k) && e[k].is_array() && e[k].size() == 2) {
+                o[0] = e[k][0].get<float>(); o[1] = e[k][1].get<float>();
+            }
+        };
+        v2("p1", se.p1); v2("p2", se.p2); v2("center", se.center);
+        se.radius = e.value("radius", 0.0f);
+        se.start = e.value("start", 0.0f);
+        se.end = e.value("end", 0.0f);
+        se.ccw = e.value("ccw", true);
+        se.width = e.value("width", 0.0f);
+        if (se.type == "arc_slot") {   // arc_slot stores spine angles as a0/a1 (CCW)
+            se.start = e.value("a0", 0.0f);
+            se.end = e.value("a1", 0.0f);
+            se.ccw = true;
+        }
+        out.push_back(se);
+    }
+}
+
 void SketchMode::applyEnterResult(const nlohmann::json& res) {
-    ents_.clear();
     dof_ = res.value("dof", 0);
     status_ = res.value("status", std::string("under"));
     if (res.contains("plane_frame") && res["plane_frame"].is_array() &&
         res["plane_frame"].size() == 16) {
         for (int i = 0; i < 16; ++i) frame_[i] = res["plane_frame"][i].get<float>();
     }
-    const nlohmann::json* stats = res.contains("statuses") ? &res["statuses"] : nullptr;
-    if (res.contains("entities") && res["entities"].is_array()) {
-        for (const auto& e : res["entities"]) {
-            SketchEntity se;
-            se.id = e.value("id", std::string());
-            se.type = e.value("type", std::string());
-            se.construction = e.value("construction", false);
-            if (stats && stats->contains(se.id)) se.status = (*stats)[se.id].get<std::string>();
-            else se.status = "under";
-            auto v2 = [&](const char* k, float out[2]) {
-                if (e.contains(k) && e[k].is_array() && e[k].size() == 2) {
-                    out[0] = e[k][0].get<float>(); out[1] = e[k][1].get<float>();
-                }
-            };
-            v2("p1", se.p1); v2("p2", se.p2); v2("center", se.center);
-            se.radius = e.value("radius", 0.0f);
-            se.start = e.value("start", 0.0f);
-            se.end = e.value("end", 0.0f);
-            se.ccw = e.value("ccw", true);
-            se.width = e.value("width", 0.0f);
-            if (se.type == "arc_slot") {   // arc_slot stores spine angles as a0/a1 (CCW)
-                se.start = e.value("a0", 0.0f);
-                se.end = e.value("a1", 0.0f);
-                se.ccw = true;
-            }
-            ents_.push_back(se);
-        }
-    }
+    parseEntities(res, ents_);
     applyConstraints(res);   // C37-D: store the constraints array for dim annotations
     // C38 (S1): ents_ was just refilled — any in-flight Smart Dimension picks now point at stale
     // entities (their by-id resolution may shift or vanish). Drop the pending pick buffer so we never
@@ -338,9 +343,14 @@ bool SketchMode::enterForFeature(AppState& st, const std::string& sketchFid) {
     havePrevCam_ = true;
     // Lock the camera looking down the plane normal (frame_ column 2 = z_dir in world).
     float nz0 = frame_[2], nz1 = frame_[6], nz2 = frame_[10];
-    // yaw/pitch from the normal: pitch = asin(nz2), yaw = atan2(nz1, nz0).
+    // The renderer's orbit convention (viewport_panel/renderer drawCurrent) is
+    //   dir(yaw,pitch) = (cos(p)*sin(y), -cos(p)*cos(y), sin(p))   [target->eye]
+    // For a fronto-parallel view we need dir == +normal:
+    //   pitch = asin(nz), yaw = atan2(nx, -ny).
+    // (The old atan2(ny, nx) put Front/Right plane sketches EDGE-ON: the u-axis projected to
+    // ~0 screen px, buildBasis went degenerate, and every sketch tool silently died.)
     camPitch_ = std::asin(std::fmax(-1.0f, std::fmin(1.0f, nz2))) * 57.2957795f;
-    camYaw_ = std::atan2(nz1, nz0) * 57.2957795f;
+    camYaw_ = std::atan2(nz0, -nz1) * 57.2957795f;
     if (std::fabs(camPitch_) > 88.9f) camPitch_ = camPitch_ > 0 ? 89.0f : -89.0f;
     st.yaw = camYaw_; st.pitch = camPitch_;
     // C37-D: snapshot the doc so the confirmation-corner ✗ (cancel) can revert the whole session.
@@ -1057,6 +1067,146 @@ void SketchMode::inSketchUndo(AppState& st) {
 }
 
 // ---------------------------------------------------------------------------
+// C40: ghost rendering of inactive sketches
+// ---------------------------------------------------------------------------
+
+void SketchMode::refreshGhosts(AppState& st) {
+    const std::string docId = st.docMirror.docId();
+    const int rev = st.docMirror.revision();
+    if (docId == ghostsDocId_ && rev == ghostsRevision_) return;
+    ghostsDocId_ = docId;
+    ghostsRevision_ = rev;
+    ghosts_.clear();
+    ++ghostsGen_;
+    const nlohmann::json& tree = st.docMirror.tree();
+    if (!tree.is_object() || !tree.contains("features") || !tree["features"].is_array()) return;
+    const auto& feats = tree["features"];
+    // A sketch is "consumed" when any other feature references it (region selectors carry
+    // "sketch":"<fid>"). Consumed sketches are hidden, matching SolidWorks' absorbed sketches.
+    std::string refsBlob;
+    for (const auto& f : feats)
+        if (f.is_object() && f.contains("refs")) refsBlob += f["refs"].dump();
+    for (const auto& f : feats) {
+        if (!f.is_object() || f.value("type", std::string()) != "sketch") continue;
+        if (f.value("suppressed", false)) continue;
+        const std::string fid = f.value("id", std::string());
+        if (fid.empty()) continue;
+        if (!f.contains("params") || !f["params"].is_object()) continue;
+        const auto& ents = f["params"].value("entities", nlohmann::json::array());
+        if (!ents.is_array() || ents.empty()) continue;
+        if (refsBlob.find("\"sketch\":\"" + fid + "\"") != std::string::npos) continue;
+        ghosts_.push_back(GhostSketch{});
+        ghosts_.back().fid = fid;
+        // Fetch the solved coords + plane frame asynchronously; the callback runs on the GL
+        // thread (AsyncRpc::drain) and is dropped if the doc moved on (gen guard).
+        const int gen = ghostsGen_;
+        st.rpc.call("doc_sketch_overview", {{"doc_id", docId}, {"sketch", fid}},
+                    [this, gen, fid](const core::RpcResult& r) {
+                        if (gen != ghostsGen_) return;
+                        if (!r.ok || !r.result.is_object() || r.result.contains("code")) return;
+                        for (auto& g : ghosts_) {
+                            if (g.fid != fid) continue;
+                            if (r.result.contains("plane_frame") &&
+                                r.result["plane_frame"].is_array() &&
+                                r.result["plane_frame"].size() == 16)
+                                for (int i = 0; i < 16; ++i)
+                                    g.frame[i] = r.result["plane_frame"][i].get<float>();
+                            parseEntities(r.result, g.ents);
+                            g.loaded = true;
+                        }
+                    });
+    }
+}
+
+void SketchMode::drawGhosts(AppState& st, const ImVec2& imgMin, const ImVec2& imgMax,
+                            int vw, int vh) {
+    if (!st.renderer || !st.workerStarted || !st.docMirror.hasDoc()) {
+        if (!ghosts_.empty()) { ghosts_.clear(); ghostsDocId_.clear(); ghostsRevision_ = -999; }
+        return;
+    }
+    refreshGhosts(st);
+    if (ghosts_.empty()) return;
+    const auto& cam = st.renderer->camera();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->PushClipRect(imgMin, imgMax, true);
+    const auto& pal = ui::palette;
+    for (const auto& g : ghosts_) {
+        if (!g.loaded) continue;
+        if (active_ && g.fid == fid_) continue;   // the live overlay owns the active sketch
+        // Project sketch (u,v) through this ghost's own plane frame (no shared basis).
+        auto uv2s = [&](float u, float v, ImVec2& o) -> bool {
+            float wx = g.frame[0] * u + g.frame[1] * v + g.frame[3];
+            float wy = g.frame[4] * u + g.frame[5] * v + g.frame[7];
+            float wz = g.frame[8] * u + g.frame[9] * v + g.frame[11];
+            return worldToScreen(cam, imgMin, vw, vh, wx, wy, wz, o);
+        };
+        auto poly = [&](auto pointAt, int seg) {     // sample pointAt(t) for t in [0,1]
+            ImVec2 prev; bool havePrev = false;
+            for (int i = 0; i <= seg; ++i) {
+                float u, v; pointAt(i / (float)seg, u, v);
+                ImVec2 p;
+                if (!uv2s(u, v, p)) { havePrev = false; continue; }
+                if (havePrev)
+                    dl->AddLine(prev, p, col(pal.sketchInk, g.fid == fid_ ? 0.9f : 0.55f), 1.5f);
+                prev = p; havePrev = true;
+            }
+        };
+        const float D2R = 3.14159265f / 180.0f;
+        for (const auto& e : g.ents) {
+            if (e.construction) continue;   // ghost view: skip construction geometry
+            if (e.type == "line" || e.type == "slot") {
+                poly([&](float t, float& u, float& v) {
+                    u = e.p1[0] + (e.p2[0] - e.p1[0]) * t;
+                    v = e.p1[1] + (e.p2[1] - e.p1[1]) * t;
+                }, 1);
+                if (e.type == "slot" && e.width > 0) {
+                    for (const float* end : {e.p1, e.p2})
+                        poly([&](float t, float& u, float& v) {
+                            float a = t * 6.2831853f;
+                            u = end[0] + e.width * 0.5f * std::cos(a);
+                            v = end[1] + e.width * 0.5f * std::sin(a);
+                        }, 24);
+                }
+            } else if (e.type == "circle") {
+                poly([&](float t, float& u, float& v) {
+                    float a = t * 6.2831853f;
+                    u = e.center[0] + e.radius * std::cos(a);
+                    v = e.center[1] + e.radius * std::sin(a);
+                }, 48);
+            } else if (e.type == "arc" || e.type == "arc_slot") {
+                float a0 = e.start, a1 = e.end;
+                if (e.type == "arc" && !e.ccw) { float t = a0; a0 = a1; a1 = t; }
+                if (a1 < a0) a1 += 360.0f;
+                auto arcAt = [&](float rad, float t, float& u, float& v) {
+                    float a = (a0 + (a1 - a0) * t) * D2R;
+                    u = e.center[0] + rad * std::cos(a);
+                    v = e.center[1] + rad * std::sin(a);
+                };
+                if (e.type == "arc") {
+                    poly([&](float t, float& u, float& v) { arcAt(e.radius, t, u, v); }, 40);
+                } else {
+                    float hw = e.width * 0.5f;
+                    poly([&](float t, float& u, float& v) { arcAt(e.radius + hw, t, u, v); }, 40);
+                    poly([&](float t, float& u, float& v) { arcAt(e.radius - hw, t, u, v); }, 40);
+                    for (float aDeg : {e.start, e.end}) {
+                        float sa = aDeg * D2R;
+                        float cx = e.center[0] + e.radius * std::cos(sa);
+                        float cy = e.center[1] + e.radius * std::sin(sa);
+                        poly([&](float t, float& u, float& v) {
+                            float a = t * 6.2831853f;
+                            u = cx + hw * std::cos(a);
+                            v = cy + hw * std::sin(a);
+                        }, 24);
+                    }
+                }
+            }
+            // ellipse / conic / spline ghosts: not yet sampled (rare as standalone profiles).
+        }
+    }
+    dl->PopClipRect();
+}
+
+// ---------------------------------------------------------------------------
 // overlay draw + interaction
 // ---------------------------------------------------------------------------
 
@@ -1152,7 +1302,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         const char* banner = "Select a plane or a planar face for the sketch \xE2\x80\x94 Esc to cancel";
         ImVec2 bts = ImGui::CalcTextSize(banner);
         float bcx = (imgMin.x + imgMax.x) * 0.5f;
-        ImVec2 b0(bcx - bts.x * 0.5f - 14, imgMin.y + 14);
+        // Sit BELOW the heads-up view toolbar (centered pill at imgMin.y+8, ~34px tall) so the
+        // two don't overlap (the HUD stays visible during plane-pick).
+        ImVec2 b0(bcx - bts.x * 0.5f - 14, imgMin.y + 52.0f * ui::uiScale);
         ImVec2 b1(bcx + bts.x * 0.5f + 14, b0.y + bts.y + 12);
         wdl->AddRectFilled(b0, b1, col(pal.overlayBg), 6.0f);
         wdl->AddRect(b0, b1, col(pal.overlayBorder), 6.0f);
@@ -1226,7 +1378,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // ---- entities (color by solver status via theme roles) ----
     auto statusCol = [&](const SketchEntity& e) -> ImU32 {
         if (e.status == "over") return col(pal.statusErr);
-        if (e.status == "full") return col(pal.text);
+        if (e.status == "full") return col(pal.sketchInk);
         return col(pal.sketchUnder);   // under-defined (blue-ish)
     };
     for (const auto& e : ents_) {
@@ -1305,8 +1457,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
 
     // ---- C37-D: dimension annotations + relation glyphs (always rendered) ----
     {
-        const ImU32 dimLineCol = col(pal.text, 0.85f);
-        const ImU32 dimTextCol = col(pal.text);
+        const ImU32 dimLineCol = col(pal.sketchDimLine, 0.85f);
+        const ImU32 dimTextCol = col(pal.sketchInk);
         const ImU32 dimDrivenCol = col(pal.consoleDim);     // dimmer for driven (reference) dims
         const ImU32 dimHoverCol = col(pal.accent);
         // 1) relation glyphs (subtle green badges) for geometric constraints, near the first ref.

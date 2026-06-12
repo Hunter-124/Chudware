@@ -1024,6 +1024,23 @@ def sketch_enter(session: DocSession, sketch_fid: str) -> dict:
     }
 
 
+def sketch_overview(session: DocSession, sketch_fid: str) -> dict:
+    """C40: read-only snapshot of a sketch (plane frame + solved entity coords) so the host can
+    ghost-render inactive sketches in the 3D viewport. Unlike sketch_enter this NEVER touches
+    ``session.active_sketch`` — it is safe to call while another sketch is being edited."""
+    feat = _find_sketch_feature(session, sketch_fid)
+    result = _ensure_built(session)
+    plane = _resolve_sketch_plane(session, feat, result)
+    packed = _solve_active(session, feat, warm=None)
+    return {
+        "entities": packed["entities"],
+        "statuses": packed["statuses"],
+        "dof": packed["dof"],
+        "plane_frame": _plane_frame(plane),
+        "status": _overall_status(packed["statuses"], packed["dof"], packed["conflicting"]),
+    }
+
+
 def sketch_solve(session: DocSession, sketch_fid: str) -> dict:
     """Re-solve the active sketch (e.g. after a dim edit) and refresh warm state."""
     feat = _find_sketch_feature(session, sketch_fid)

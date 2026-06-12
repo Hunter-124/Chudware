@@ -220,6 +220,13 @@ void freeChatTextures(std::vector<ChatMsg>& chat) {
 void AppState::addLog(const std::string& s) {
     log.push_back(s);
     if (log.size() > 500) log.erase(log.begin());
+    // C40: tee to a file when AI_CAD_LOG_FILE is set — the in-app console is hard to reach
+    // when diagnosing interaction bugs (and stdout is lost for a windowed exe).
+    static FILE* tee = [] {
+        const char* p = std::getenv("AI_CAD_LOG_FILE");
+        return p && *p ? std::fopen(p, "a") : nullptr;
+    }();
+    if (tee) { std::fputs(s.c_str(), tee); std::fputc('\n', tee); std::fflush(tee); }
 }
 
 // W1-B: post a transient toast. born is filled by drawToasts on the first frame it's seen (we can't

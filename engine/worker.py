@@ -297,6 +297,14 @@ def _sketch_exit(params: dict, emit: EmitFn) -> dict:
     return docsess.sketch_exit(s, params["sketch"], emit=_doc_emit(emit))
 
 
+def _doc_sketch_overview(params: dict, _emit: EmitFn) -> dict:
+    # C40: read-only sketch snapshot (plane_frame + solved entities) for ghost rendering of
+    # inactive sketches in the viewport. Never touches session.active_sketch.
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.sketch_overview(s, params["sketch"])
+
+
 # =========================================================================== eval_* RPC (C12)
 #
 # Per reports.md §C12: nine handlers over the active document's bodies. Field handlers tessellate
@@ -604,6 +612,7 @@ _METHODS = {
     "sketch_drag": _sketch_drag,
     "sketch_drag_commit": _sketch_drag_commit,
     "sketch_exit": _sketch_exit,
+    "doc_sketch_overview": _doc_sketch_overview,  # C40 ghost rendering
     # Evaluate (C12)
     "eval_mass": _eval_mass,
     "eval_measure": _eval_measure,
@@ -640,6 +649,7 @@ _STRUCTURED_ERROR_METHODS = {
     "doc_checkpoint", "doc_revert",
     "doc_solve_mates", "doc_set_explode_state",  # C20
     "sketch_enter", "sketch_solve", "sketch_drag", "sketch_drag_commit", "sketch_exit",
+    "doc_sketch_overview",  # C40
     "eval_mass", "eval_measure", "eval_section_props", "eval_interference", "eval_check",
     "eval_symmetry", "eval_draft", "eval_thickness", "eval_curvature",
     "doc_export_step", "doc_face_points",  # C19

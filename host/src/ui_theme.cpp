@@ -84,6 +84,9 @@ static void fillDark(Palette& p) {
     // C18 sketch mode
     set4(p.sketchUnder, 0.337f,0.612f,0.960f, 1);
     set4(p.sketchGrid,  0.520f,0.560f,0.620f, 0.18f);
+    // C40: dark sketch ink — the viewport canvas is light in both themes.
+    set4(p.sketchInk,     0.090f,0.100f,0.125f, 1);
+    set4(p.sketchDimLine, 0.165f,0.184f,0.220f, 1);
     // status
     set4(p.statusOk,   0.176f,0.831f,0.749f, 1);
     set4(p.statusWarn, 0.953f,0.761f,0.420f, 1);
@@ -194,6 +197,9 @@ static void fillLight(Palette& p) {
     // C18 sketch mode (SW blue under-defined, darker grid on the light studio)
     set4(p.sketchUnder, 0.000f,0.471f,0.843f, 1);
     set4(p.sketchGrid,  0.420f,0.447f,0.502f, 0.22f);
+    // C40: dark sketch ink (same in both themes — the canvas is always light).
+    set4(p.sketchInk,     0.090f,0.100f,0.125f, 1);
+    set4(p.sketchDimLine, 0.165f,0.184f,0.220f, 1);
     // status
     set4(p.statusOk,   0.039f,0.573f,0.176f, 1);    // #0A9230 green
     set4(p.statusWarn, 0.784f,0.549f,0.000f, 1);    // #C88C00 amber

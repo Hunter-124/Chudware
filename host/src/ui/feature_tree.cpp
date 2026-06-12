@@ -478,22 +478,10 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         ImGui::EndDragDropTarget();
     }
 
-    featureBadge(c.fs.ok, !c.fs.error.empty(), c.fs.error, c.fs.dangling, c.rolledBack);
-
-    // ---- rich tooltip (type · status · compile ms · owner body count) ----
-    if (itemHovered && !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-        std::string tip = "Type: " + (c.type.empty() ? std::string("feature") : c.type);
-        if (c.suppressed) tip += "\nStatus: Suppressed";
-        else if (c.rolledBack) tip += "\nStatus: Rolled back (after the bar)";
-        else if (!c.fs.ok) tip += "\nStatus: Error" + (c.fs.error.empty() ? "" : (" — " + c.fs.error));
-        else if (!c.fs.dangling.empty()) tip += "\nStatus: Dangling references";
-        else tip += "\nStatus: OK";
-        if (c.fs.ms >= 0.0) { char b[48]; std::snprintf(b, sizeof(b), "\nCompile: %.2f ms", c.fs.ms); tip += b; }
-        tip += "\nBodies owned: " + std::to_string(c.ownerBodyCount);
-        ImGui::SetTooltip("%s", tip.c_str());
-    }
-
-    // Context menu
+    // Context menu — MUST come while the TreeNode row is still the last item:
+    // BeginPopupContextItem opens on right-click of the LAST item, and featureBadge() below
+    // emits its own SameLine text item. With the old order the menu only opened when the user
+    // right-clicked the tiny status dot, i.e. effectively never (C40 fix).
     if (ImGui::BeginPopupContextItem(("##ctx_" + fid).c_str())) {
         bool isSketch = c.iconName && std::strcmp(c.iconName, "sketch_node") == 0;
         bool multi    = s_multiSel.size() > 1 && s_multiSel.count(fid) > 0;
@@ -582,6 +570,21 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         }
         if (!c.canDoc) ImGui::EndDisabled();
         ImGui::EndPopup();
+    }
+
+    featureBadge(c.fs.ok, !c.fs.error.empty(), c.fs.error, c.fs.dangling, c.rolledBack);
+
+    // ---- rich tooltip (type · status · compile ms · owner body count) ----
+    if (itemHovered && !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        std::string tip = "Type: " + (c.type.empty() ? std::string("feature") : c.type);
+        if (c.suppressed) tip += "\nStatus: Suppressed";
+        else if (c.rolledBack) tip += "\nStatus: Rolled back (after the bar)";
+        else if (!c.fs.ok) tip += "\nStatus: Error" + (c.fs.error.empty() ? "" : (" — " + c.fs.error));
+        else if (!c.fs.dangling.empty()) tip += "\nStatus: Dangling references";
+        else tip += "\nStatus: OK";
+        if (c.fs.ms >= 0.0) { char b[48]; std::snprintf(b, sizeof(b), "\nCompile: %.2f ms", c.fs.ms); tip += b; }
+        tip += "\nBodies owned: " + std::to_string(c.ownerBodyCount);
+        ImGui::SetTooltip("%s", tip.c_str());
     }
 
     if (c.nested) ImGui::Unindent(14.0f);
@@ -1123,11 +1126,20 @@ void drawFeatureTree(AppState& st,
                 ImGui::TreeNodeEx((std::string(kPlanes[pi]) + "##plane" + std::to_string(pi)).c_str(), f);
                 if (hidden) ImGui::PopStyleColor();
                 if (ImGui::IsItemClicked()) {
-                    st.showPlane[pi] = !st.showPlane[pi];
-                    st.planeEmphasis = st.showPlane[pi] ? pi : -1;
+                    if (st.sketchPlanePickActive && st.sketchMode) {
+                        // Plane-pick in progress: clicking a plane in the tree picks it for the
+                        // new sketch (SolidWorks behavior), instead of toggling visibility.
+                        static const char* kPlaneSel[] = {"plane.front", "plane.top", "plane.right"};
+                        st.sketchPlanePickActive = false;
+                        st.sketchMode->createSketchOnPlane(st, kPlaneSel[pi]);
+                    } else {
+                        st.showPlane[pi] = !st.showPlane[pi];
+                        st.planeEmphasis = st.showPlane[pi] ? pi : -1;
+                    }
                 }
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip(hidden ? "Show %s" : "Hide %s", kPlanes[pi]);
+                    ImGui::SetTooltip(st.sketchPlanePickActive ? "Sketch on %s"
+                                      : (hidden ? "Show %s" : "Hide %s"), kPlanes[pi]);
             }
 
             // Origin

@@ -367,13 +367,10 @@ int run_gui(const char* screenshotPath) {
         st.startSetup(false);  // self-provision from the payload next to the exe / source tree
     }
 
-    // welcome model
-    {
-        Mesh m;
-        std::string e;
-        if (loadBinarySTL(appdataDir() + "\\AI-CAD\\cache\\mounting_plate\\mounting_plate.stl", m, e))
-            renderer.setMesh(m);
-    }
+    // NOTE: the old "welcome model" (mounting_plate.stl into the bare renderer) is gone — it
+    // contradicted the empty Part1 document (a mesh with no tree features), occluded the
+    // plane-pick quads, and inflated the empty-scene camera radius. Startup now shows the
+    // clean empty-doc state: origin planes + triad, like a fresh SolidWorks part.
 
     std::strncpy(st.code.data(), kStarterCode, st.code.size() - 1);
     std::strncpy(st.prompt.data(), "a knurled hex standoff, 22mm tall, M3 clearance bore", st.prompt.size() - 1);

@@ -156,6 +156,17 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     if (!form) return false;
     if (active_) close();   // a previous form is replaced (no commit)
 
+    // C40: SolidWorks mode exclusion. Invoking a feature command while a sketch is being
+    // edited EXITS the sketch first (its profile then pre-seeds extrude/revolve below);
+    // an armed plane-pick is cancelled — a feature PM and the pick overlay must never
+    // coexist (they fight over the viewport mouse).
+    std::string justExitedSketch;
+    if (st.sketchMode && st.sketchMode->active()) {
+        justExitedSketch = st.sketchMode->sketchId();
+        st.sketchMode->exitSketch(st, /*keep=*/true);
+    }
+    st.sketchPlanePickActive = false;
+
     active_ = true;
     editMode_ = false;
     form_ = form;
@@ -204,6 +215,53 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
                 int k = (int)it.hit.kind;
                 routePick(selObj, k);
             } catch (...) {}
+        }
+    }
+
+    // C40: SolidWorks pre-select for extrude/revolve — the sketch chosen in the FeatureManager
+    // (or, failing that, the most recent non-empty sketch) becomes the Profile region. Sketch
+    // curves are not in the viewport pick pass, so without this the Profile well could not be
+    // filled at all for a freshly drawn sketch and the command was a dead end.
+    if (std::strcmp(form_->type, "extrude") == 0 || std::strcmp(form_->type, "revolve") == 0) {
+        PMField* prof = nullptr;
+        for (auto& f : fields_)
+            if (f.def->kind == PMFieldKind::SelectorWell && std::strcmp(f.def->key, "profile") == 0) {
+                prof = &f; break;
+            }
+        const nlohmann::json& tree = st.docMirror.tree();
+        if (prof && prof->picks.empty() && tree.is_object() &&
+            tree.contains("features") && tree["features"].is_array()) {
+            const nlohmann::json* pick = nullptr;   // just-exited/selected sketch wins, else last
+            for (const auto& f : tree["features"]) {
+                if (!f.is_object() || f.value("type", std::string()) != "sketch") continue;
+                // Skip empty sketches — they have no regions to extrude.
+                const auto& ents = f.contains("params") ? f["params"].value("entities", nlohmann::json::array())
+                                                        : nlohmann::json::array();
+                if (!ents.is_array() || ents.empty()) continue;
+                const std::string fidv = f.value("id", std::string());
+                if (fidv == justExitedSketch || fidv == st.selectedFeatureId) { pick = &f; break; }
+                pick = &f;
+            }
+            if (pick) {
+                // Region hint centroid: average of the sketch entities' anchor coords.
+                double cu = 0, cv = 0; int n = 0;
+                for (const auto& e : (*pick)["params"]["entities"]) {
+                    for (const char* k : {"p1", "p2", "center"}) {
+                        if (e.contains(k) && e[k].is_array() && e[k].size() == 2) {
+                            cu += e[k][0].get<double>(); cv += e[k][1].get<double>(); ++n;
+                        }
+                    }
+                }
+                if (n) { cu /= n; cv /= n; }
+                PMSelEntry se;
+                se.selector = {{"kind", "region"}, {"sketch", pick->value("id", std::string())},
+                               {"centroid", nlohmann::json::array({cu, cv})}, {"hint_index", 0}};
+                se.label = pick->value("name", std::string("Sketch")) + " region";
+                prof->picks.push_back(std::move(se));
+                dirty_ = true;   // schedule the live preview against the seeded profile
+                lastEditTime_ = ImGui::GetTime();
+                st.addLog("[pm] profile seeded from " + pick->value("id", std::string()));
+            }
         }
     }
 
@@ -949,8 +1007,12 @@ void PropertyManager::draw(AppState& st) {
                 std::string chip;
                 if (f.picks.empty()) {
                     chip = "(pick in viewport)";
+                } else if (f.picks.size() == 1) {
+                    chip = f.picks.front().label;
                 } else {
-                    chip = f.picks.front().label + u8"\xc3\x97" + std::to_string(f.picks.size());
+                    // ASCII "x" — the UI fonts don't carry U+00D7 and a count suffix on a
+                    // single pick was pure noise anyway.
+                    chip = f.picks.front().label + " x" + std::to_string(f.picks.size());
                 }
 
                 ImVec4 border = f.wellDangling

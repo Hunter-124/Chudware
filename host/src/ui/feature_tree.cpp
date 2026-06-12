@@ -1475,15 +1475,26 @@ void drawFeatureTree(AppState& st,
                                 consumer[sk] = fid;  // last writer; only meaningful when count==1
                             }
                         }
-                        for (const auto& kv : consumer)
-                            if (consumeCount[kv.first] == 1)
-                                childrenOf[kv.second].push_back(kv.first);
+                        for (const auto& kv : consumer) {
+                            if (consumeCount[kv.first] != 1) continue;
+                            // C48: a consumer that is ROLLED BACK or ERRORED does not absorb its
+                            // sketch — the sketch un-nests to a flat row (SolidWorks behavior).
+                            // Critically, this keeps the rollback bar drawable/grabbable when it
+                            // sits after a profile sketch: a nested sketch never renders a flat
+                            // row, so a bar anchored to it simply vanished from the tree.
+                            auto cs = statusMap.find(kv.second);
+                            if (cs != statusMap.end() && (!cs->second.ok || cs->second.rolledBack))
+                                continue;
+                            childrenOf[kv.second].push_back(kv.first);
+                        }
                     }
-                    // A sketch is nested (hidden from the flat list, shown under its consumer) iff it
-                    // has exactly one consumer.
+                    // A sketch is nested (hidden from the flat list, shown under its consumer) iff
+                    // it landed in childrenOf (one consumer, and that consumer actually builds).
+                    std::unordered_set<std::string> nestedSketchIds;
+                    for (const auto& kv : childrenOf)
+                        for (const auto& sk : kv.second) nestedSketchIds.insert(sk);
                     auto isNestedSketch = [&](const std::string& fid) {
-                        auto it = consumeCount.find(fid);
-                        return it != consumeCount.end() && it->second == 1;
+                        return nestedSketchIds.count(fid) != 0;
                     };
 
                     // Reorder op: drop draggedId before beforeId. A "@after:<id>" sentinel means drop

@@ -599,6 +599,21 @@ int run_gui(const char* screenshotPath) {
         // thread, before this frame's panels draw, so results land like any other state.
         st.rpc.drain();
 
+        // C48: click telemetry for interaction debugging — only when AI_CAD_DEBUG_INPUT is
+        // set (pairs with AI_CAD_LOG_FILE). Logs what ImGui thinks is under every click.
+        {
+            static const bool dbgInput = std::getenv("AI_CAD_DEBUG_INPUT") != nullptr;
+            if (dbgInput && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                ImGuiContext* g = ImGui::GetCurrentContext();
+                char b[256];
+                std::snprintf(b, sizeof(b), "[dbg] click (%.0f,%.0f) win=%s item=0x%08X",
+                              ImGui::GetIO().MousePos.x, ImGui::GetIO().MousePos.y,
+                              g->HoveredWindow ? g->HoveredWindow->Name : "(none)",
+                              g->HoveredIdPreviousFrame);
+                st.addLog(b);
+            }
+        }
+
         // Drain streamed agent progress into the active (running) assistant message so the
         // conversation updates live, iteration by iteration (texture loads stay on this thread).
         {

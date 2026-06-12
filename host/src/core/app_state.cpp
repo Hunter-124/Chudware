@@ -406,7 +406,28 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err) {
     if (!renderer || !idPass || !overlays) { err = "render objects not initialized"; return false; }
     render::DocMesh doc;
     if (!render::loadAicmFile(aicmPath, doc, err)) return false;
-    if (doc.bodies.empty()) { err = "AICM has no bodies"; return false; }
+    if (doc.bodies.empty()) {
+        // C48: a rebuild can legitimately produce ZERO bodies — every solid feature rolled
+        // back (rollback bar), suppressed, or deleted, or a sketch-only document. That is an
+        // empty MODEL, not a load error. Clear the shaded view + pick caches so the viewport
+        // tracks the document; before, the stale previous mesh kept rendering and the
+        // rollback bar looked like it did nothing.
+        if (renderer) renderer->setMeshes(std::vector<Renderer::PartMesh>{});
+        bodyVisible.clear();
+        docBodyIds.clear();
+        applyBodyVisibility();
+        faceNormalCache.clear();
+        edgeCentroidCache.clear();
+        bodyBBoxCache.clear();
+        faceBBoxCache.clear();
+        selection.clear();
+        hover = render::PickHit{};
+        pickStatus.clear();
+        docMeshHasScalar = false;
+        docMeshHasDisp = false;
+        hasDocMesh = false;   // the empty-doc fallback (datum planes + camera) takes over
+        return true;
+    }
 
     // Shaded view: render each body with its AICM color (camera bounds come from here).
     // C19: attach any SCLR / DISP overlay arrays so the renderer can colormap + deform.
@@ -438,7 +459,10 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err) {
         }
         pms.push_back(std::move(pm));
     }
-    if (!pms.empty()) renderer->setMeshes(pms);
+    // C48: unconditional — pms can be empty when every body has no triangles; keeping the
+    // previous meshes would desync the viewport from the document (same stale-mesh bug as
+    // the zero-bodies case above).
+    renderer->setMeshes(pms);
 
     // C19: surface overlay presence for the simulation panel's result controls.
     docMeshHasScalar = false;

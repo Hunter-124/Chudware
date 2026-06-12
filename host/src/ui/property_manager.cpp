@@ -22,8 +22,8 @@
 
 namespace ui {
 
-// Debounce window for live preview (card §4).
-static const double kDebounceSec = 0.40;
+// C37-F: Debounce window for live preview (was 0.40 s; reduced for snappier feel).
+static const double kDebounceSec = 0.25;
 
 // ---- field enable helpers -------------------------------------------------
 
@@ -165,6 +165,14 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     dirty_ = false;
     firstPreviewDone_ = false;
     lastEditTime_ = ImGui::GetTime();
+    previewError_.clear();
+    focusedOnOpen_ = false;
+    wantFocusFirstField_ = true;  // C37-F: focus first field on next draw
+
+    // C37-F: Take a checkpoint BEFORE any preview, so Cancel can revert with a single call.
+    checkpointId_ = st.docMirror.hasDoc() ? st.docMirror.checkpoint(st.worker) : std::string();
+    if (checkpointId_.empty())
+        st.addLog("[pm] checkpoint failed — Cancel will use undo loop fallback");
 
     const bool useIps = false;  // M1: units display follows set_units; default MMGS.
     fields_.clear();
@@ -228,6 +236,14 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
     dirty_ = false;
     firstPreviewDone_ = true;   // the feature already exists; edits go straight to edit_feature
     lastEditTime_ = ImGui::GetTime();
+    previewError_.clear();
+    focusedOnOpen_ = false;
+    wantFocusFirstField_ = true;  // C37-F: focus first field on next draw
+
+    // C37-F: Take a checkpoint BEFORE any preview edit, so Cancel reverts with one call.
+    checkpointId_ = st.docMirror.hasDoc() ? st.docMirror.checkpoint(st.worker) : std::string();
+    if (checkpointId_.empty())
+        st.addLog("[pm] checkpoint failed — Cancel will use undo loop fallback");
 
     fields_.clear();
     fields_.resize(form->fields.size());
@@ -384,6 +400,10 @@ void PropertyManager::close() {
     previewBatches_ = 0;
     dirty_ = false;
     firstPreviewDone_ = false;
+    checkpointId_.clear();    // C37-F
+    focusedOnOpen_ = false;   // C37-F
+    wantFocusFirstField_ = false; // C37-F
+    previewError_.clear();    // C37-F
 }
 
 // ---- selector wells -------------------------------------------------------
@@ -476,20 +496,32 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
     if (!refs.empty()) feature["refs"] = refs;
 }
 
-// Minimum refs satisfied so a preview is worth attempting (avoid spamming the worker with
-// no-edge fillets). Returns true when every multi-well that the feature *requires* has ≥1 pick.
+// C37-F: Minimum conditions for a preview RPC to be worth firing.
+// ALL forms now gate on this — box/cylinder need at least one Dim with a valid (>0) value
+// rather than firing immediately on open. Selector-based forms need their primary well filled.
 static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& fields) {
-    // Dress-up + sketched features need their primary selector populated.
-    const char* needWell = nullptr;
     std::string t = form->type;
+
+    // Selector-gated forms: primary well must have at least one pick.
+    const char* needWell = nullptr;
     if (t == "fillet" || t == "chamfer") needWell = "edges";
     else if (t == "extrude" || t == "revolve") needWell = "profile";
-    // shell can preview with 0 faces (hollow closed shell); box/cylinder have no wells.
-    if (!needWell) return true;
-    for (const auto& f : fields)
-        if (f.def->kind == PMFieldKind::SelectorWell && std::strcmp(f.def->key, needWell) == 0)
-            return !f.picks.empty();
-    return true;
+    if (needWell) {
+        for (const auto& f : fields)
+            if (f.def->kind == PMFieldKind::SelectorWell && std::strcmp(f.def->key, needWell) == 0)
+                return !f.picks.empty();
+        return false;  // well not found
+    }
+
+    // Primitive forms (box/cylinder): at least one enabled Dim must be >0 and error-free.
+    // shell: any non-zero thickness is enough. Revolve with no wells handled above.
+    for (const auto& f : fields) {
+        if (f.def->kind != PMFieldKind::Dim) continue;
+        if (f.def->comingSoon) continue;
+        if (!f.dimError.empty()) return false;   // invalid input — don't fire
+        if (f.dimValue > 0.0) return true;
+    }
+    return false;
 }
 
 // ---- preview / commit / cancel --------------------------------------------
@@ -497,6 +529,27 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
 void PropertyManager::applyPreview(AppState& st) {
     if (!st.docMirror.hasDoc() || !st.workerStarted) return;
     if (!readyForPreview(form_, fields_)) { dirty_ = false; return; }
+
+    // C37-F: Defensive check — if the target feature has vanished from the mirror tree (agent
+    // run / external undo replaced the doc), close the PM rather than firing an edit_feature
+    // that will be rejected. Only relevant for the edit-path where targetId_ is known.
+    if (firstPreviewDone_ && !targetId_.empty()) {
+        const nlohmann::json& tree = st.docMirror.tree();
+        bool found = false;
+        if (tree.is_object()) {
+            auto feat = tree.find("features");
+            if (feat != tree.end() && feat->is_array()) {
+                for (const auto& f : *feat)
+                    if (f.is_object() && f.value("id", std::string()) == targetId_) { found = true; break; }
+            }
+        }
+        if (!found) {
+            st.toast(ui::ToastLevel::Warn, "Feature " + targetId_ + " no longer exists — closing PM");
+            st.addLog("[pm] tick: feature " + targetId_ + " vanished; closing PM");
+            close();
+            return;
+        }
+    }
 
     nlohmann::json feature;
     buildOpFeature(feature);
@@ -515,10 +568,14 @@ void PropertyManager::applyPreview(AppState& st) {
 
     auto resp = st.docMirror.applyOps(st.worker, ops);
     if (!resp.ok) {
+        // C37-F: show inline error in the PM body AND a global toast.
+        previewError_ = resp.error_message;
+        st.toast(ui::ToastLevel::Error, "Preview: " + resp.error_message);
         st.addLog("[pm] preview failed: " + resp.error_message);
         dirty_ = false;
         return;
     }
+    previewError_.clear();  // C37-F: clear stale error on success
     ++previewBatches_;
     // The add-feature flow learns the new feature id from id_map ($0 -> fX).
     if (targetId_.empty() && resp.id_map.is_object()) {
@@ -556,6 +613,8 @@ void PropertyManager::tick(AppState& st) {
     double now = ImGui::GetTime();
     if (now - lastEditTime_ < kDebounceSec) return;
     applyPreview(st);
+    // applyPreview may have called close() if the feature vanished; check active_ again.
+    (void)active_;
 }
 
 void PropertyManager::commit(AppState& st) {
@@ -567,14 +626,27 @@ void PropertyManager::commit(AppState& st) {
 }
 
 void PropertyManager::cancelEdits(AppState& st) {
-    // Undo every preview batch we applied (batch-level worker undo).
-    int n = previewBatches_;
-    for (int i = 0; i < n; ++i) {
-        auto r = st.docMirror.undo(st.worker);
-        if (!r.ok) { st.addLog("[pm] cancel undo failed: " + r.error_message); break; }
-        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    // C37-F: Single revert call replaces the old N-undo loop, eliminating the UI freeze.
+    if (!checkpointId_.empty()) {
+        auto r = st.docMirror.revert(st.worker, checkpointId_);
+        if (r.ok) {
+            if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+            st.addLog("[pm] Cancel -> reverted to checkpoint (was " +
+                      std::to_string(previewBatches_) + " preview batch(es))");
+        } else {
+            st.toast(ui::ToastLevel::Error, "Cancel revert failed: " + r.error_message);
+            st.addLog("[pm] Cancel revert failed: " + r.error_message);
+        }
+    } else {
+        // Fallback: checkpoint wasn't available at open — use the undo loop.
+        int n = previewBatches_;
+        for (int i = 0; i < n; ++i) {
+            auto r = st.docMirror.undo(st.worker);
+            if (!r.ok) { st.addLog("[pm] cancel undo failed: " + r.error_message); break; }
+            if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        }
+        st.addLog("[pm] Cancel -> undid " + std::to_string(n) + " preview batch(es) (no checkpoint)");
     }
-    st.addLog("[pm] Cancel -> undid " + std::to_string(n) + " preview batch(es)");
     close();
 }
 
@@ -584,25 +656,92 @@ static void pushTextColor(const float c[4]) {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], c[3]));
 }
 
+// C37-F: descriptions for each form type shown under the title.
+static const char* formDescription(const char* type) {
+    if (!type) return "";
+    if (std::strcmp(type, "box")      == 0) return "Create a rectangular solid at the origin.";
+    if (std::strcmp(type, "cylinder") == 0) return "Create a cylinder at the origin.";
+    if (std::strcmp(type, "extrude")  == 0) return "Extrude a sketch profile along its normal.";
+    if (std::strcmp(type, "revolve")  == 0) return "Revolve a profile around an axis.";
+    if (std::strcmp(type, "fillet")   == 0) return "Round selected edges with a constant or variable radius.";
+    if (std::strcmp(type, "chamfer")  == 0) return "Bevel selected edges by distance.";
+    if (std::strcmp(type, "shell")    == 0) return "Hollow the solid to a uniform wall thickness.";
+    return "";
+}
+
 void PropertyManager::draw(AppState& st) {
     if (!active_) return;
-    if (!ImGui::Begin("FeatureManager")) { ImGui::End(); return; }  // same dock slot as the tree
+
+    // C37-F: Floating fallback — if the FeatureManager dock window isn't visible this frame
+    // (dock closed or un-docked and minimised), draw the PM as an independent floating window
+    // so it can never be invisibly active and trap keyboard/pick input.
+    bool dockVisible = ImGui::Begin("FeatureManager");
+    if (!dockVisible) {
+        ImGui::End();
+        // Open as a floating fallback.
+        ImGui::SetNextWindowSize(ImVec2(260.0f * ui::uiScale, 400.0f * ui::uiScale),
+                                 ImGuiCond_Appearing);
+        ImGui::SetNextWindowPos(ImVec2(80.0f * ui::uiScale, 80.0f * ui::uiScale),
+                                ImGuiCond_Appearing);
+        if (!ImGui::Begin("##PMFloating", nullptr,
+                          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav)) {
+            ImGui::End(); return;
+        }
+    }
 
     const auto& pal = ui::palette;
 
-    // ---- header: title + OK (accent ✓) / Cancel (✗) -----------------------
+    // ---- C37-F: Keyboard policy -------------------------------------------
+    // Gather focus/hover state for this PM window BEFORE processing buttons.
+    bool pmWindowFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    bool pmWindowHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows |
+                                                   ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+    // Track whether a PM widget was active this frame (used to allow Enter-commit).
+    bool pmWidgetWasActive = ImGui::IsAnyItemActive();
+
+    const ImGuiIO& io = ImGui::GetIO();
+
+    // C37-F: Esc cancels from anywhere UNLESS sketch-plane-pick mode owns Esc.
+    // When a text field is active (WantTextInput), the first Esc deactivates the field (ImGui
+    // handles this natively via IsItemDeactivatedAfterEdit / InputText Escape handling).
+    // We check WantTextInput BEFORE the key is consumed to avoid double-cancelling the PM.
+    bool escPressed = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+    bool cancel = false;
+    bool ok     = false;
+    if (escPressed && !st.sketchPlanePickActive) {
+        if (io.WantTextInput) {
+            // A text field is active; Esc will blur it this frame (ImGui's default behaviour).
+            // Don't cancel the PM — let the field deactivate first.
+        } else {
+            cancel = true;
+        }
+    }
+
+    // ---- header: feature icon + title + description -----------------------
     {
         IconUV ic = getIcon(form_->icon, 20);
-        if (ic.valid) { ImGui::Image(ic.texId, ImVec2(18, 18), ic.uv0, ic.uv1); ImGui::SameLine(0, 6); }
+        if (ic.valid) {
+            ImGui::Image(ic.texId, ImVec2(18.0f * ui::uiScale, 18.0f * ui::uiScale),
+                         ic.uv0, ic.uv1);
+            ImGui::SameLine(0, 6);
+        }
         pushTextColor(pal.text);
         ImGui::TextUnformatted(title_.c_str());
         ImGui::PopStyleColor();
 
-        // OK / Cancel buttons, right-aligned. Anchor from the window's right inner
-        // edge so a narrow dock never clips the buttons ("OK" -> "OI"). The pair
-        // needs btnW*2 + the 4px gap between them; pin its left edge inside the
-        // content region. Wrap to a new line if the title leaves no room.
-        float btnW = 28.0f;
+        // C37-F: One-line command description beneath the title.
+        const char* desc = formDescription(form_->type);
+        if (desc && desc[0]) {
+            pushTextColor(pal.textDim);
+            float wrapW = ImGui::GetContentRegionAvail().x;
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
+            ImGui::TextUnformatted(desc);
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+        }
+
+        // C37-F: OK / Cancel buttons scaled by uiScale, with tooltips and green/red iconography.
+        float btnW = 28.0f * ui::uiScale;
         float pairW = btnW * 2 + 4;
         float rightX = ImGui::GetWindowContentRegionMax().x - pairW;
         float afterTitleX = ImGui::GetCursorPosX();
@@ -610,25 +749,56 @@ void PropertyManager::draw(AppState& st) {
             ImGui::SameLine(0, 0);
             ImGui::SetCursorPosX(rightX);
         } else {
-            // Title too wide for same line: drop the buttons to their own row,
-            // still right-aligned, so neither overlaps the title nor clips.
             ImGui::SetCursorPosX(rightX < 0 ? 0 : rightX);
         }
 
+        // OK button — green accent.
         ImGui::PushStyleColor(ImGuiCol_Button,
             ImVec4(pal.accentDim[0], pal.accentDim[1], pal.accentDim[2], 1));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
             ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
-        bool ok = ImGui::Button("OK##pm", ImVec2(btnW, 0));
+        {
+            // Use checkmark glyph if the atlas has one, else text fallback.
+            IconUV okIc = getIcon("ok", 20);
+            bool btnOk;
+            if (okIc.valid) {
+                btnOk = ImGui::ImageButton("##pm_ok",
+                    okIc.texId, ImVec2(btnW - 4, btnW - 4), okIc.uv0, okIc.uv1);
+            } else {
+                btnOk = ImGui::Button(u8"✓##pm", ImVec2(btnW, 0));
+            }
+            ok = btnOk;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("OK (Enter)");
         ImGui::PopStyleColor(2);
+
         ImGui::SameLine(0, 4);
+
+        // Cancel button — red/muted.
         ImGui::PushStyleColor(ImGuiCol_Button,
             ImVec4(pal.button[0], pal.button[1], pal.button[2], 1));
-        bool cancel = ImGui::Button("X##pm", ImVec2(btnW, 0));
-        ImGui::PopStyleColor();
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+            ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 0.7f));
+        {
+            IconUV cancelIc = getIcon("cancel", 20);
+            bool btnCancel;
+            if (cancelIc.valid) {
+                btnCancel = ImGui::ImageButton("##pm_cancel",
+                    cancelIc.texId, ImVec2(btnW - 4, btnW - 4), cancelIc.uv0, cancelIc.uv1);
+            } else {
+                btnCancel = ImGui::Button(u8"✗##pm", ImVec2(btnW, 0));
+            }
+            cancel = cancel || btnCancel;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cancel (Esc)");
+        ImGui::PopStyleColor(2);
 
-        if (ImGui::IsItemHovered() && ImGui::IsKeyPressed(ImGuiKey_Escape)) cancel = true;
-        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) && !ImGui::IsAnyItemActive()) ok = true;
+        // C37-F: Enter commits ONLY when the PM window is focused/hovered or a PM widget was
+        // active this frame. This prevents Enter-in-chat from accidentally committing the form.
+        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) &&
+            (pmWindowFocused || pmWindowHovered || pmWidgetWasActive)) {
+            ok = true;
+        }
 
         ImGui::Separator();
 
@@ -640,6 +810,9 @@ void PropertyManager::draw(AppState& st) {
     const char* curGroup = nullptr;
     bool groupOpen = true;
     bool useIps = false;   // M1 default MMGS
+
+    // C37-F: track which Dim field is first/editable for SetKeyboardFocusHere.
+    bool firstEditableDimSeen = false;
 
     for (size_t i = 0; i < fields_.size(); ++i) {
         PMField& f = fields_[i];
@@ -658,15 +831,67 @@ void PropertyManager::draw(AppState& st) {
         switch (f.def->kind) {
             case PMFieldKind::Dim: {
                 pushTextColor(pal.textDim);
-                ImGui::TextUnformatted(f.def->label);
+                // C37-F: unit suffix in label ("Radius [mm]").
+                const char* unitSuffix = useIps ? " [in]" : " [mm]";
+                ImGui::Text("%s%s", f.def->label, unitSuffix);
                 ImGui::PopStyleColor();
                 if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip("Not yet supported by engine");
                 ImGui::SetNextItemWidth(-1);
+
+                // C37-F: SetKeyboardFocusHere on the very first editable Dim field when opening.
+                if (wantFocusFirstField_ && enabled && !f.def->comingSoon && !firstEditableDimSeen) {
+                    ImGui::SetKeyboardFocusHere(0);
+                    firstEditableDimSeen = true;
+                    // Don't clear wantFocusFirstField_ yet — clear it after this frame so the
+                    // focus request is processed.
+                }
+
                 bool changed = ImGui::InputText("##dim", f.dimBuf.data(), f.dimBuf.size(),
                                                 ImGuiInputTextFlags_EnterReturnsTrue |
                                                 ImGuiInputTextFlags_AutoSelectAll);
                 bool deact = ImGui::IsItemDeactivatedAfterEdit();
+
+                // C37-F: Step buttons (- / +) trigger immediate preview (no debounce).
+                ImGui::SameLine(0, 3);
+                ImGui::PushStyleColor(ImGuiCol_Button,
+                    ImVec4(pal.button[0], pal.button[1], pal.button[2], 1));
+                if (ImGui::SmallButton("-##step")) {
+                    if (enabled && !f.def->comingSoon) {
+                        f.dimValue = std::max(0.0, f.dimValue - 1.0);
+                        std::string disp = pmFormatDim(f.dimValue, useIps);
+                        std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
+                        f.dimError.clear();
+                        dirty_ = true;
+                        lastEditTime_ = ImGui::GetTime() - kDebounceSec;  // fire immediately
+                    }
+                }
+                ImGui::SameLine(0, 2);
+                if (ImGui::SmallButton("+##step")) {
+                    if (enabled && !f.def->comingSoon) {
+                        f.dimValue += 1.0;
+                        std::string disp = pmFormatDim(f.dimValue, useIps);
+                        std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
+                        f.dimError.clear();
+                        dirty_ = true;
+                        lastEditTime_ = ImGui::GetTime() - kDebounceSec;  // fire immediately
+                    }
+                }
+                ImGui::PopStyleColor();
+
+                // C37-F: mouse-wheel on hovered field triggers immediate preview.
+                if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+                    float wheel = io.MouseWheel;
+                    if (wheel != 0.0f && enabled && !f.def->comingSoon) {
+                        f.dimValue = std::max(0.0, f.dimValue + (double)wheel);
+                        std::string disp = pmFormatDim(f.dimValue, useIps);
+                        std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
+                        f.dimError.clear();
+                        dirty_ = true;
+                        lastEditTime_ = ImGui::GetTime() - kDebounceSec;  // fire immediately
+                    }
+                }
+
                 if (enabled && (changed || deact)) {
                     std::string txt = f.dimBuf.data();
                     // trim
@@ -696,9 +921,10 @@ void PropertyManager::draw(AppState& st) {
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Bound to equation '%s'", f.dimExpr.c_str());
                 }
+                // C37-F: inline red error — shown as a red hint line, not silently ignored.
                 if (enabled && !f.dimError.empty()) {
                     pushTextColor(pal.statusErr);
-                    ImGui::Text("! %s", f.dimError.c_str());
+                    ImGui::Text(u8"! %s", f.dimError.c_str());
                     ImGui::PopStyleColor();
                 }
                 break;
@@ -709,32 +935,56 @@ void PropertyManager::draw(AppState& st) {
                 ImGui::TextUnformatted(f.def->label);
                 ImGui::PopStyleColor();
 
-                // The well box: click activates (routes picks here); right-click clears.
-                std::string chip = f.picks.empty() ? std::string("(pick in viewport)")
-                                                   : (f.picks.front().label + u8"×" +
-                                                      std::to_string(f.picks.size()));
+                // C37-F: chip shows count + entity kind for filled wells.
+                std::string chip;
+                if (f.picks.empty()) {
+                    chip = "(pick in viewport)";
+                } else {
+                    chip = f.picks.front().label + u8"\xc3\x97" + std::to_string(f.picks.size());
+                }
+
                 ImVec4 border = f.wellDangling
                     ? ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1)
                     : (f.wellActive
                         ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)
                         : ImVec4(pal.border[0], pal.border[1], pal.border[2], pal.border[3]));
+                // C37-F: thicker border on active wells for clearer active-state visual.
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, f.wellActive ? 2.0f : 1.0f);
                 ImGui::PushStyleColor(ImGuiCol_Border, border);
                 ImGui::PushStyleColor(ImGuiCol_Button,
                     f.wellActive ? ImVec4(pal.accentSoft[0], pal.accentSoft[1],
                                           pal.accentSoft[2], pal.accentSoft[3])
                                  : ImVec4(pal.frameBg[0], pal.frameBg[1], pal.frameBg[2], 1));
-                ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
                 if (ImGui::Button((chip + "##well").c_str(), ImVec2(-1, 0))) {
                     // Activate this well; deactivate others.
                     for (auto& o : fields_)
                         if (o.def->kind == PMFieldKind::SelectorWell) o.wellActive = false;
                     f.wellActive = true;
                 }
-                ImGui::PopStyleVar();
                 ImGui::PopStyleColor(2);
+                ImGui::PopStyleVar();
+
+                // C37-F: tooltip on the well button.
+                if (ImGui::IsItemHovered()) {
+                    if (f.wellActive)
+                        ImGui::SetTooltip("Active — pick faces/edges in the viewport");
+                    else if (!f.picks.empty())
+                        ImGui::SetTooltip("Click to re-activate; right-click to clear");
+                    else
+                        ImGui::SetTooltip("Click to activate pick target");
+                }
+
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                     f.picks.clear(); f.wellDangling = false;
                     dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                }
+                // C37-F: hint line under active well.
+                if (f.wellActive) {
+                    // Use accent with reduced alpha as the hint color.
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.75f));
+                    ImGui::TextUnformatted("Pick faces/edges in the viewport");
+                    ImGui::PopStyleColor();
                 }
                 if (f.wellDangling) {
                     pushTextColor(pal.statusErr);
@@ -799,10 +1049,27 @@ void PropertyManager::draw(AppState& st) {
         if (!enabled) ImGui::EndDisabled();
     }
 
+    // C37-F: After iterating all fields, mark focus request as handled.
+    if (wantFocusFirstField_ && firstEditableDimSeen) {
+        wantFocusFirstField_ = false;
+        focusedOnOpen_ = true;
+    }
+
+    // C37-F: Inline preview error block (red text, shown when the last preview RPC failed).
+    if (!previewError_.empty()) {
+        ImGui::Separator();
+        pushTextColor(pal.statusErr);
+        float wrapW = ImGui::GetContentRegionAvail().x;
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
+        ImGui::Text(u8"! Preview error: %s", previewError_.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    }
+
     // ---- live-preview status hint -----------------------------------------
     ImGui::Separator();
     pushTextColor(pal.textDim);
-    if (dirty_)            ImGui::TextUnformatted("editing… (live preview)");
+    if (dirty_)            ImGui::TextUnformatted("editing\xe2\x80\xa6 (live preview)");
     else if (firstPreviewDone_ && !targetId_.empty())
         ImGui::Text("preview: %s", targetId_.c_str());
     else                  ImGui::TextUnformatted("set parameters to preview");

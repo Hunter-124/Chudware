@@ -17,3 +17,5 @@ imgui.ini
 
 # Scratch + spike outputs
 scratch/
+
+.claude/

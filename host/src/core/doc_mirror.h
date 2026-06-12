@@ -119,6 +119,14 @@ public:
     OpsResponse undo(WorkerClient& w);
     OpsResponse redo(WorkerClient& w);
 
+    // C37-F: Checkpoint / revert helpers for the PropertyManager cancel path.
+    // checkpoint() issues doc_checkpoint and returns the opaque checkpoint id string (empty on
+    // failure). revert() issues doc_revert, parses the full ops-style response (tree / revision /
+    // feature_status / owner_map), updates the mirror, fires the listener, and returns the response
+    // so the PM can refresh the mesh from aicm_path. Both are no-ops when no doc is open.
+    std::string checkpoint(WorkerClient& w);
+    OpsResponse revert(WorkerClient& w, const std::string& checkpointId);
+
     // Resolve a viewport pick to a typed selector string.
     // Returns the selector JSON string, or empty on error (err filled).
     std::string resolvePick(WorkerClient& w, uint32_t body_id,

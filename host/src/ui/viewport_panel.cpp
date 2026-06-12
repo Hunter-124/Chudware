@@ -39,56 +39,229 @@ static bool  s_zoomAreaDragging = false;
 static ImVec2 s_zoomAreaP0 = {0, 0};  // drag start (screen)
 static ImVec2 s_zoomAreaP1 = {0, 0};  // drag current (screen)
 
-// ---- C26-C: Normal-To (Ctrl+8 / shortcut) -----------------------------------------------------
+// C37-C: LMB drag-threshold state — suppress orbit micro-movement on click-selects.
+static bool   s_lmbDragActive  = false;  // true once the 4px threshold has been crossed
+static ImVec2 s_lmbDragOrigin  = {0, 0}; // screen position of the LMB press
+
+// ---- C26-C / C37-C: Normal-To (Ctrl+8 / shortcut) -------------------------------------------
 // "Look straight at the selected face." If a face is selected and the C26-C normal cache has data
 // for it, animate the camera so the view direction equals the face's outward normal. Second press
 // while already looking at that face flips to the anti-view (SolidWorks behavior). Pan resets to
 // the face centroid (so the face centers on screen). Zoom is kept.
 //
+// C37-C additions:
+//   - While in sketch: Ctrl+8 orients to the sketch plane (uses cameraLock yaw/pitch), second press
+//     flips 180° (anti-plane view). Cooperates with cameraLock (sets same yaw/pitch so the lock
+//     re-asserts them without fighting).
+//   - Cylindrical/conical faces: reads axis from selector JSON if available, falls back to face
+//     normal cache. Looking DOWN the axis (axis treated as face normal for yaw/pitch derivation).
+//   - Adds to context menu and HUD view-orientation dropdown (done in the drawing section below).
+//
 // Yaw/pitch derivation (Z-up, target-to-eye convention):
 //   dir = (cos(pitch)*sin(yaw), -cos(pitch)*cos(yaw), sin(pitch))
 //   Given face normal N = (nx, ny, nz):
-//     pitch = asin(nz)            (clamped ±89.5° by requestCameraAnimation)
+//     pitch = asin(nz)        (clamped ±89.5°)
 //     yaw   = atan2(nx, -ny)
-//   This satisfies dir == N by construction; verified against Front (N=(0,-1,0) → yaw=0,pitch=0)
-//   and Top (N=(0,0,1) → yaw=0,pitch=90) which match the existing presets.
 //
-// Nearest-axis fallback: when no face is selected, snaps to the axis-aligned view whose view
-// direction is nearest the current one (same as the old stub).
+// Nearest-axis fallback: when no face is selected and not in sketch, snaps to nearest axis-aligned.
 
 // Persistent state for second-press flip detection (file-static, one viewport):
-static uint64_t s_normalToKey   = 0;    // last cached key (body<<32 | face_id)
+static uint64_t s_normalToKey   = 0;    // last cached key (body<<32|face_id, or UINT64_MAX for sketch)
 static float    s_normalToYaw   = 0;    // the yaw we animated to
 static float    s_normalToPitch = 0;    // the pitch we animated to
 
-static void normalToSelectionOrNearestAxis(AppState& st) {
+// C37-C: internal helper — convert a unit direction vector to yaw/pitch degrees.
+static void dirToYawPitch(float nx, float ny, float nz, float& yawDeg, float& pitchDeg) {
     const float kPiOver180 = 3.14159265f / 180.0f;
+    float nzC = nz > 1.0f ? 1.0f : (nz < -1.0f ? -1.0f : nz);
+    float pitch = std::asin(nzC);
+    float yaw   = std::atan2(nx, -ny);
+    yawDeg   = yaw   / kPiOver180;
+    pitchDeg = pitch / kPiOver180;
+}
+
+// C37-C: shared AABB-framing helper — pan to bbox center, zoom to fit bbox radius (animated).
+// Used by Zoom to Selection (Shift+F), st.zoomToBBoxRequested, and can be called directly.
+// bboxMin/Max are world-space. Uses the same math as ZoomFit (zoom=1 frames scene radius r;
+// for a sub-box we set zoom = sceneRadius / bboxRadius so the sub-box fills the view).
+static void frameBBox(AppState& st, const float bboxMin[3], const float bboxMax[3]) {
+    // Bbox center becomes the pan target.
+    float cx = (bboxMin[0] + bboxMax[0]) * 0.5f;
+    float cy = (bboxMin[1] + bboxMax[1]) * 0.5f;
+    float cz = (bboxMin[2] + bboxMax[2]) * 0.5f;
+    // Bbox radius (half-diagonal).
+    float dx = bboxMax[0] - bboxMin[0];
+    float dy = bboxMax[1] - bboxMin[1];
+    float dz = bboxMax[2] - bboxMin[2];
+    float bboxR = 0.5f * std::sqrt(dx * dx + dy * dy + dz * dz);
+    // Scene radius — the Renderer's modelRadius drives ZoomFit (zoom=1 shows sceneR at full view).
+    float sceneR = st.renderer ? st.renderer->modelRadius() : 1.0f;
+    if (sceneR < 1e-5f) sceneR = 1.0f;
+    float targetZoom;
+    if (bboxR < 1e-5f) {
+        // Degenerate (vertex/edge selection): zoom in close.
+        targetZoom = 4.0f;
+    } else {
+        targetZoom = sceneR / bboxR;
+        // Cap zoom: never more than 8× (avoids extreme zoom for tiny features) and never less than
+        // the ZoomFit value (framing the full scene is always the minimum zoom).
+        const float kMaxZoom = 8.0f;
+        if (targetZoom > kMaxZoom) targetZoom = kMaxZoom;
+        if (targetZoom < 1.0f) targetZoom = 1.0f;
+    }
+    float pan[3] = {cx, cy, cz};
+    requestCameraAnimation(st, st.yaw, st.pitch, targetZoom, pan);
+}
+
+// C37-C: Zoom to Selection — union AABB over selection items, then frame it.
+// Empty selection: falls back to ZoomFit (same as applyViewPreset ZoomFit).
+static void zoomToSelection(AppState& st) {
+    if (st.selection.empty()) {
+        applyViewPreset(st, ViewPreset::ZoomFit);
+        return;
+    }
+    float bmin[3] = { 1e30f,  1e30f,  1e30f};
+    float bmax[3] = {-1e30f, -1e30f, -1e30f};
+    bool gotAny = false;
+    const float kEdgePad = 3.0f;  // mm padding for edge/vertex degenerate extent
+    for (const auto& item : st.selection.items()) {
+        const auto& h = item.hit;
+        if (!h.valid()) continue;
+        if (h.kind == render::PickKind::Face) {
+            uint64_t key = ((uint64_t)h.body_id << 32) | (uint64_t)h.topo_id;
+            auto it = st.faceBBoxCache.find(key);
+            if (it != st.faceBBoxCache.end()) {
+                const auto& b = it->second;
+                for (int i = 0; i < 3; ++i) {
+                    if (b[i]   < bmin[i]) bmin[i] = b[i];
+                    if (b[i+3] > bmax[i]) bmax[i] = b[i+3];
+                }
+                gotAny = true;
+            }
+        } else if (h.kind == render::PickKind::Edge) {
+            uint64_t key = ((uint64_t)h.body_id << 32) | (uint64_t)h.topo_id;
+            auto it = st.edgeCentroidCache.find(key);
+            if (it != st.edgeCentroidCache.end()) {
+                const auto& c = it->second;
+                for (int i = 0; i < 3; ++i) {
+                    if (c[i] - kEdgePad < bmin[i]) bmin[i] = c[i] - kEdgePad;
+                    if (c[i] + kEdgePad > bmax[i]) bmax[i] = c[i] + kEdgePad;
+                }
+                gotAny = true;
+            }
+        } else if (h.kind == render::PickKind::Vertex) {
+            uint64_t key = ((uint64_t)h.body_id << 32) | (uint64_t)h.topo_id;
+            auto it = st.edgeCentroidCache.find(key);  // vertex centroid falls in edgeCentroidCache
+            if (it != st.edgeCentroidCache.end()) {
+                const auto& c = it->second;
+                for (int i = 0; i < 3; ++i) {
+                    if (c[i] - kEdgePad < bmin[i]) bmin[i] = c[i] - kEdgePad;
+                    if (c[i] + kEdgePad > bmax[i]) bmax[i] = c[i] + kEdgePad;
+                }
+                gotAny = true;
+            } else {
+                // Fall back to body bbox if no per-vertex data.
+                auto bit = st.bodyBBoxCache.find(h.body_id);
+                if (bit != st.bodyBBoxCache.end()) {
+                    const auto& b = bit->second;
+                    for (int i = 0; i < 3; ++i) {
+                        if (b[i]   < bmin[i]) bmin[i] = b[i];
+                        if (b[i+3] > bmax[i]) bmax[i] = b[i+3];
+                    }
+                    gotAny = true;
+                }
+            }
+        }
+    }
+    if (!gotAny) {
+        applyViewPreset(st, ViewPreset::ZoomFit);
+        return;
+    }
+    frameBBox(st, bmin, bmax);
+}
+
+static void normalToSelectionOrNearestAxis(AppState& st, bool inSketch) {
+    const float kPiOver180 = 3.14159265f / 180.0f;
+
+    // C37-C: while in sketch, orient to the sketch plane via cameraLock; second press flips 180°.
+    if (inSketch) {
+        auto* sketch = st.sketchMode;
+        if (sketch && sketch->active()) {
+            float ly = 0, lp = 0;
+            if (sketch->cameraLock(ly, lp)) {
+                const uint64_t kSketchKey = 0xFFFFFFFFFFFFFFFFull;
+                bool alreadyLocked = (s_normalToKey == kSketchKey);
+                float targetYaw = ly, targetPitch = lp;
+                if (alreadyLocked) {
+                    // Flip: rotate 180° about the plane normal (add 180° yaw, negate pitch).
+                    targetYaw = ly + 180.0f;
+                    targetPitch = -lp;
+                    s_normalToKey = 0;
+                } else {
+                    s_normalToKey = kSketchKey;
+                }
+                s_normalToYaw   = targetYaw;
+                s_normalToPitch = targetPitch;
+                float pan[3] = {st.pan[0], st.pan[1], st.pan[2]};
+                requestCameraAnimation(st, targetYaw, targetPitch, -1.0f, pan);
+            }
+        }
+        return;
+    }
 
     // ---- try true face normal path ----
     if (!st.selection.empty()) {
-        const render::PickHit& h = st.selection.items().back().hit;
+        const core::SelItem& selItem = st.selection.items().back();
+        const render::PickHit& h = selItem.hit;
         if (h.valid() && h.kind == render::PickKind::Face) {
             uint64_t key = ((uint64_t)h.body_id << 32) | (uint64_t)h.topo_id;
+
+            // C37-C: try to read axis from the resolved selector JSON (cylinder/cone support).
+            // The selector is in selItem.selector (filled by C16 resolve round-trip).
+            float axNx = 0, axNy = 0, axNz = 0;
+            float faceCx = 0, faceCy = 0, faceCz = 0;
+            bool hasAxis = false;
+
+            if (!selItem.selector.empty()) {
+                try {
+                    auto sj = nlohmann::json::parse(selItem.selector);
+                    // Selector format per docs/contracts/selectors.md: for cylinder/cone the
+                    // selector carries "axis": [x,y,z] (unit vector along the axis).
+                    if (sj.contains("axis") && sj["axis"].is_array() && sj["axis"].size() == 3) {
+                        axNx = sj["axis"][0].get<float>();
+                        axNy = sj["axis"][1].get<float>();
+                        axNz = sj["axis"][2].get<float>();
+                        // Normalize (should already be, but guard against float drift).
+                        float len = std::sqrt(axNx*axNx + axNy*axNy + axNz*axNz);
+                        if (len > 1e-5f) { axNx /= len; axNy /= len; axNz /= len; hasAxis = true; }
+                    }
+                } catch (...) {}
+            }
+
+            // Fall back to faceNormalCache for centroid and (if no axis) normal.
             auto it = st.faceNormalCache.find(key);
             if (it != st.faceNormalCache.end()) {
                 const auto& v = it->second;
-                float nx = v[0], ny = v[1], nz = v[2];
-                float faceCx = v[3], faceCy = v[4], faceCz = v[5];
+                faceCx = v[3]; faceCy = v[4]; faceCz = v[5];
+                if (!hasAxis) {
+                    axNx = v[0]; axNy = v[1]; axNz = v[2];
+                    hasAxis = true;
+                }
+            }
 
+            if (hasAxis) {
                 // Second-press flip: if we already animated to this face, flip to anti-view.
                 bool alreadyNormal = (key == s_normalToKey);
-                float targetNx = nx, targetNy = ny, targetNz = nz;
+                float targetNx = axNx, targetNy = axNy, targetNz = axNz;
                 if (alreadyNormal) {
-                    targetNx = -nx; targetNy = -ny; targetNz = -nz;
+                    targetNx = -axNx; targetNy = -axNy; targetNz = -axNz;
                     s_normalToKey = 0;  // next press goes forward again
                 } else {
                     s_normalToKey = key;
                 }
 
-                float pitch = std::asin(targetNz > 1.0f ? 1.0f : (targetNz < -1.0f ? -1.0f : targetNz));
-                float yaw   = std::atan2(targetNx, -targetNy);
-                float pitchDeg = pitch / kPiOver180;
-                float yawDeg   = yaw   / kPiOver180;
+                float yawDeg, pitchDeg;
+                dirToYawPitch(targetNx, targetNy, targetNz, yawDeg, pitchDeg);
                 s_normalToYaw   = yawDeg;
                 s_normalToPitch = pitchDeg;
 
@@ -106,7 +279,7 @@ static void normalToSelectionOrNearestAxis(AppState& st) {
     //   dir = (cos p sin y, -cos p cos y, sin p)
     float y = st.yaw * kPiOver180, p = st.pitch * kPiOver180;
     float dx = std::cos(p) * std::sin(y);
-    float dy = -std::cos(p) * std::cos(y);
+    float dy2 = -std::cos(p) * std::cos(y);
     float dz = std::sin(p);
     struct AxView { float x, y, z; ViewPreset preset; };
     static const AxView kAx[6] = {
@@ -119,7 +292,7 @@ static void normalToSelectionOrNearestAxis(AppState& st) {
     };
     int best = 0; float bestDot = -2.0f;
     for (int i = 0; i < 6; ++i) {
-        float d = dx * kAx[i].x + dy * kAx[i].y + dz * kAx[i].z;
+        float d = dx * kAx[i].x + dy2 * kAx[i].y + dz * kAx[i].z;
         if (d > bestDot) { bestDot = d; best = i; }
     }
     applyViewPreset(st, kAx[best].preset);
@@ -216,11 +389,35 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         renderer.resize(vw, vh);
         // C18: hard-lock the camera normal to the sketch plane while editing a sketch.
         if (inSketch) { float ly, lp; if (sketch->cameraLock(ly, lp)) { st.yaw = ly; st.pitch = lp; } }
+        // C37-C: reset zoom-area state on mode transitions (avoids cross-mode state leak).
+        // Check at frame start: if sketch mode OR plane-pick activated, disarm zoom-area.
+        if (inSketch || st.sketchPlanePickActive) {
+            s_zoomAreaArmed    = false;
+            s_zoomAreaDragging = false;
+            s_lmbDragActive    = false;
+        }
+        // Also disarm when a PM form is open (item 3 requirement).
+        if (st.propertyManager && st.propertyManager->active()) {
+            s_zoomAreaArmed    = false;
+            s_zoomAreaDragging = false;
+        }
+
+        // C37-C: consume st.zoomToBBoxRequested (one-shot from feature tree "Zoom to Feature").
+        if (st.zoomToBBoxRequested) {
+            st.zoomToBBoxRequested = false;
+            frameBBox(st, st.zoomToBBoxMin, st.zoomToBBoxMax);
+        }
+
         // Reference planes: hidden while sketching (the sketch grid owns the view), else per state.
         // C25: a fresh part with no geometry auto-shows its datum planes (SolidWorks "pick a
         // plane to start" state); once geometry exists, visibility is the user's toggle.
         bool effPlane[3] = {st.showPlane[0], st.showPlane[1], st.showPlane[2]};
         if (!st.hasDocMesh && st.docMirror.hasDoc())
+            effPlane[0] = effPlane[1] = effPlane[2] = true;
+        // C37-C item 5: while sketchPlanePickActive, force-show all three origin planes (the sketcher
+        // needs them visible so the user can pick one). This uses the same effPlane mechanism as
+        // the empty-doc state (viewport_panel.cpp:290-294 convention).
+        if (st.sketchPlanePickActive)
             effPlane[0] = effPlane[1] = effPlane[2] = true;
         if (inSketch) { bool none[3] = {false,false,false}; renderer.setPlanes(none, -1); }
         else          renderer.setPlanes(effPlane, st.planeEmphasis);
@@ -238,6 +435,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             st.pickReady = true;
             // Re-draw hover + selection highlights into the studio color FBO before it's sampled.
             renderer.beginOverlay();
+            // C37-C item 4: draw feature-highlight faces first (underneath selection/hover) using
+            // a slightly dimmer tint. Empty vector is zero-cost. Stale keys after rebuild are
+            // silently skipped inside drawFeatureHighlight.
+            if (!st.featureHighlightFaces.empty())
+                st.overlays->drawFeatureHighlight(renderer.camera(), st.featureHighlightFaces);
             std::vector<render::PickHit> selHits;
             selHits.reserve(st.selection.size());
             for (const auto& it : st.selection.items()) selHits.push_back(it.hit);
@@ -335,10 +537,30 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
             }
 
+            // C37-C item 3: LMB drag threshold — track press origin and only commit to drag
+            // once 4px * uiScale has been exceeded, so click-selects don't micro-orbit.
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                s_lmbDragOrigin = io.MousePos;
+                s_lmbDragActive = false;
+            }
+            if (!s_lmbDragActive && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                float ddx = io.MousePos.x - s_lmbDragOrigin.x;
+                float ddy = io.MousePos.y - s_lmbDragOrigin.y;
+                const float kThresh = 4.0f * ui::uiScale;
+                if (std::sqrt(ddx * ddx + ddy * ddy) >= kThresh)
+                    s_lmbDragActive = true;
+            }
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+                s_lmbDragActive = false;
+
+            // C37-C: crosshair cursor while zoom-area is armed.
+            if (s_zoomAreaArmed)
+                st.requestCursor(ui::CursorKind::Crosshair);
+
             // Left-drag: orbit or pan depending on vpDragMode. Cancels any tween.
             // Zoom-area mode intercepts left-drag above; skip orbit/pan if armed.
-            if (!s_zoomAreaArmed &&
-                ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
+            // C37-C: only starts dragging once the 4px threshold is crossed (s_lmbDragActive).
+            if (!s_zoomAreaArmed && s_lmbDragActive &&
                 (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
                 cancelCameraAnimation();
                 if (st.vpDragMode == 1) {
@@ -408,35 +630,60 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
         }
 
-        // C25 W2-D: keyboard view shortcuts. Viewport hovered/focused, no text field active, not
-        // sketching. Ctrl+1..8 = Front/Back/Left/Right/Top/Bottom/Iso/NormalTo; F = zoom-to-fit.
-        if (imgHovered && !inSketch && !io.WantTextInput) {
-            if (io.KeyCtrl) {
-                if      (ImGui::IsKeyPressed(ImGuiKey_1)) applyViewPreset(st, ViewPreset::Front);
-                else if (ImGui::IsKeyPressed(ImGuiKey_2)) applyViewPreset(st, ViewPreset::Back);
-                else if (ImGui::IsKeyPressed(ImGuiKey_3)) applyViewPreset(st, ViewPreset::Left);
-                else if (ImGui::IsKeyPressed(ImGuiKey_4)) applyViewPreset(st, ViewPreset::Right);
-                else if (ImGui::IsKeyPressed(ImGuiKey_5)) applyViewPreset(st, ViewPreset::Top);
-                else if (ImGui::IsKeyPressed(ImGuiKey_6)) applyViewPreset(st, ViewPreset::Bottom);
-                else if (ImGui::IsKeyPressed(ImGuiKey_7)) applyViewPreset(st, ViewPreset::Isometric);
-                else if (ImGui::IsKeyPressed(ImGuiKey_8)) normalToSelectionOrNearestAxis(st);
-            } else if (ImGui::IsKeyPressed(ImGuiKey_F)) {
-                applyViewPreset(st, ViewPreset::ZoomFit);
+        // C37-C: keyboard view shortcuts — globalized: fire when the viewport is VISIBLE and
+        // !io.WantTextInput and no modal open, regardless of hover. Keep !inSketch for the preset
+        // rotations. Ctrl+8 (Normal To) is allowed while in sketch (item 1). F/Shift+F blocked in
+        // sketch (camera is locked; ZoomFit would fight the lock). Space opens ViewSelector.
+        // Condition: viewport is showing (we are inside the Begin/End block), and no text input.
+        if (st.showViewport && !io.WantTextInput) {
+            bool noModal = !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
+            if (noModal) {
+                if (io.KeyCtrl && !inSketch) {
+                    // Ctrl+1..7 = view presets (not in sketch).
+                    if      (ImGui::IsKeyPressed(ImGuiKey_1)) applyViewPreset(st, ViewPreset::Front);
+                    else if (ImGui::IsKeyPressed(ImGuiKey_2)) applyViewPreset(st, ViewPreset::Back);
+                    else if (ImGui::IsKeyPressed(ImGuiKey_3)) applyViewPreset(st, ViewPreset::Left);
+                    else if (ImGui::IsKeyPressed(ImGuiKey_4)) applyViewPreset(st, ViewPreset::Right);
+                    else if (ImGui::IsKeyPressed(ImGuiKey_5)) applyViewPreset(st, ViewPreset::Top);
+                    else if (ImGui::IsKeyPressed(ImGuiKey_6)) applyViewPreset(st, ViewPreset::Bottom);
+                    else if (ImGui::IsKeyPressed(ImGuiKey_7)) applyViewPreset(st, ViewPreset::Isometric);
+                }
+                // Ctrl+8 = Normal To — allowed in AND out of sketch (item 1).
+                if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_8))
+                    normalToSelectionOrNearestAxis(st, inSketch);
+                if (!inSketch) {
+                    // F = Zoom to Fit (not in sketch).
+                    if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F))
+                        applyViewPreset(st, ViewPreset::ZoomFit);
+                    // C37-C item 2: Shift+F = Zoom to Selection (not in sketch).
+                    if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F))
+                        zoomToSelection(st);
+                    // C37-C item 3: Space = open View Selector (when viewport visible, not sketching).
+                    if (imgHovered && ImGui::IsKeyPressed(ImGuiKey_Space))
+                        /* Space handled by ViewSelector::update() below — it reads imgHovered and
+                           !inSketch; we just ensure no double-handling here. */ (void)0;
+                }
+                // Esc: cancel in-flight camera tween (selection-clear Esc handling lives in the
+                // picking block below; canceling here is harmless when there is no animation).
+                if (ImGui::IsKeyPressed(ImGuiKey_Escape) && cameraAnimating()) cancelCameraAnimation();
             }
-            // Esc also cancels an in-flight camera tween (selection-clear Esc handling lives in the
-            // picking block below; canceling here is harmless when there is no animation).
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape) && cameraAnimating()) cancelCameraAnimation();
         }
 
         // ---- C18: sketch overlay owns the mouse while a sketch is being edited ----
+        // C37-C item 5: also call drawOverlay during sketchPlanePickActive (no active sketch yet,
+        // but the sketcher agent needs to draw plane hover/click overlay). Guard with sketch != null.
         if (inSketch) {
+            sketch->drawOverlay(st, io, vr0, vr1, vw, vh, imgHovered);
+        } else if (st.sketchPlanePickActive && sketch != nullptr) {
+            // Plane-pick mode: sketcher draws the plane quads/hover/click, but no sketch is active.
             sketch->drawOverlay(st, io, vr0, vr1, vw, vh, imgHovered);
         }
 
         // ---- hover + click selection (once per frame; only while a doc mesh is loaded) ----
         // C25 W2-E: suppressed while the glass-box View Selector is up (it owns the click).
-        if (picking && !inSketch && !s_viewSelector.active()) {
-            if (imgHovered && !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        // C37-C item 5: also suppressed while sketchPlanePickActive (the overlay owns the mouse).
+        if (picking && !inSketch && !s_viewSelector.active() && !st.sketchPlanePickActive) {
+            if (imgHovered && !s_lmbDragActive) {
                 int px = (int)(io.MousePos.x - vr0.x);
                 int py = (int)(io.MousePos.y - vr0.y);
                 st.hover = st.idPass->pickFinal(px, py, vw, vh);
@@ -445,8 +692,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
 
             // Click = replace, Ctrl-click = toggle. Empty-space click clears.
+            // C37-C item 3: guard against micro-orbit clicks — only fire if drag was not active.
             if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-                !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                !s_lmbDragActive) {
                 if (io.KeyCtrl) {
                     if (st.hover.valid()) st.selection.toggle(st.hover);
                 } else {
@@ -454,6 +702,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
             }
             // ESC clears the selection while the viewport is focused/hovered.
+            // C37-C item 5: do NOT consume Esc while sketchPlanePickActive (guard above already
+            // prevents this block from running in that case, so this Esc is safe).
             if (imgHovered && ImGui::IsKeyPressed(ImGuiKey_Escape)) st.selection.clear();
 
             // Status text: prefer the live hover, else the last selected item.
@@ -523,6 +773,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 ImGui::Separator();
             }
             // View presets submenu.
+            // C37-C: added Normal To (Ctrl+8) and Zoom to Selection (Shift+F).
             if (ImGui::BeginMenu("View Orientation")) {
                 struct { const char* lbl; ViewPreset p; } prows[] = {
                     {"Front",    ViewPreset::Front},
@@ -535,9 +786,20 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 };
                 for (const auto& r : prows)
                     if (ImGui::MenuItem(r.lbl)) applyViewPreset(st, r.p);
+                ImGui::Separator();
+                // C37-C item 1: Normal To — available when a face is selected or always for axis fallback.
+                if (ImGui::MenuItem("Normal To (Ctrl+8)"))
+                    normalToSelectionOrNearestAxis(st, inSketch);
                 ImGui::EndMenu();
             }
             if (ImGui::MenuItem("Zoom to Fit (F)"))   applyViewPreset(st, ViewPreset::ZoomFit);
+            // C37-C item 2: Zoom to Selection — disabled when nothing is selected.
+            {
+                bool hasSelection = !st.selection.empty();
+                if (!hasSelection) ImGui::BeginDisabled();
+                if (ImGui::MenuItem("Zoom to Selection (Shift+F)")) zoomToSelection(st);
+                if (!hasSelection) ImGui::EndDisabled();
+            }
             if (ImGui::MenuItem("Zoom to Area")) {
                 s_zoomAreaArmed    = true;
                 s_zoomAreaDragging = false;
@@ -574,8 +836,16 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 ImGui::EndMenu();
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("View Selector (Space)"))
-                /* ViewSelector has no public open(); trigger via Space key next frame: */ (void)0;
+            // C37-C item 3: wire the dead "View Selector (Space)" menu item to actually open the selector.
+            if (ImGui::MenuItem("View Selector (Space)")) {
+                // Simulate a Space key press for the ViewSelector to catch in its next update().
+                // ViewSelector::update() checks imgHovered + !inSketch + Space key pressed.
+                // Simplest hook: set a one-shot flag that the selector reads — but ViewSelector
+                // has no public open(). The cleanest path without modifying ViewSelector's public
+                // API is to post a simulated Space key via ImGui's input queue.
+                ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, true);
+                ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, false);
+            }
             ImGui::EndPopup();
         }
 
@@ -692,9 +962,23 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         if (ImGui::MenuItem(r.label)) applyViewPreset(st, r.p);
                     }
                     ImGui::Separator();
-                    // ViewSelector has no public open() method; trigger Space path via flag.
-                    if (ImGui::MenuItem("View Selector (Space)"))
-                        st.wantContextMenu = false;  // placeholder: Space key triggers s_viewSelector
+                    // C37-C item 1: Normal To entry in HUD view-orientation dropdown.
+                    if (ImGui::MenuItem("Normal To (Ctrl+8)"))
+                        normalToSelectionOrNearestAxis(st, inSketch);
+                    ImGui::Separator();
+                    // C37-C item 2: Zoom to Selection entry in HUD view dropdown.
+                    {
+                        bool hasSelection = !st.selection.empty();
+                        if (!hasSelection) ImGui::BeginDisabled();
+                        if (ImGui::MenuItem("Zoom to Selection (Shift+F)")) zoomToSelection(st);
+                        if (!hasSelection) ImGui::EndDisabled();
+                    }
+                    ImGui::Separator();
+                    // C37-C item 3: wire View Selector to actually open the selector widget.
+                    if (ImGui::MenuItem("View Selector (Space)")) {
+                        ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, true);
+                        ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, false);
+                    }
                     ImGui::EndPopup();
                 }
                 ImGui::PopID();

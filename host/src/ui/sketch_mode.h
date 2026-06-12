@@ -13,6 +13,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -36,6 +37,27 @@ enum class SketchTool {
     EllipsePartial, Parabola, Conic,
     // C29-B sketch-editing tools (engine contract C29-A: sketch_trim/extend/offset ops):
     Trim, Extend, Offset
+};
+
+// C37-D: One constraint record from a sketch_enter/solve/drag response (worker_rpc.md §"constraints").
+// Drives the always-on dimension annotations + relation glyphs.
+struct SketchConstraint {
+    std::string id;
+    std::string type;                 // distance|angle|radius|diameter|coincident|horizontal|...
+    std::vector<std::string> refs;    // handles ("e1.p2") or entity ids ("e1")
+    bool hasValue = false;            // value present (stored dim)
+    double value = 0.0;
+    bool hasExpr = false;
+    std::string expr;
+    bool driven = false;
+    bool hasPlacement = false;
+    float placement[2] = {0, 0};      // [u,v] annotation anchor (sketch coords)
+    bool hasMeasured = false;
+    double measured = 0.0;            // solved measurement (mm/deg)
+    std::string axis;                 // distance only: "h"|"v"|"" (aligned)
+    bool isDimensional() const {
+        return type == "distance" || type == "angle" || type == "radius" || type == "diameter";
+    }
 };
 
 // One solved entity in the active sketch (mirrors a worker sketch_enter/solve entity record).
@@ -63,6 +85,11 @@ public:
     // and enters it (ribbon "New Sketch"). Both lock the camera to the plane.
     bool enterForFeature(AppState& st, const std::string& sketchFid);
     bool enterNewOnSelection(AppState& st);
+    // C37-D: create + enter a new sketch on an EXPLICIT plane ref (datum string "plane.top" or a
+    // resolved face/datum selector JSON). enterNewOnSelection() and the plane-pick flow both route
+    // here; the scripted scenarios in app.cpp keep using enterForFeature/enterNewOnSelection
+    // unchanged. Returns the new feature id (empty on failure) so callers can re-enter it.
+    std::string createSketchOnPlane(AppState& st, const nlohmann::json& planeRef);
     void exitSketch(AppState& st, bool keep = true);   // keep=false also deletes an empty new sketch
 
     // Ribbon Sketch-tab command dispatch (sk_line / sk_rect_corner / sk_circle / sk_arc_center /
@@ -90,6 +117,31 @@ private:
     void commitDrag(AppState& st);              // sketch_drag_commit -> rebuild mesh
     void addEntity(AppState& st, const nlohmann::json& entity, const nlohmann::json& constraints);
     void addConstraint(AppState& st, const nlohmann::json& constraint);
+    // C37-D: store the constraints array carried on every sketch response.
+    void applyConstraints(const nlohmann::json& res);
+
+    // C37-D: in-sketch undo (mid-stroke point pop, else doc undo + resolve). Returns false when the
+    // sketch vanished from the undo (caller exits gracefully).
+    void inSketchUndo(AppState& st);
+    // C37-D: confirmation-corner ✗ — revert the whole sketch session via doc_revert(checkpoint),
+    // then drop out of sketch mode cleanly (falls back to a plain keep-exit if no checkpoint).
+    void cancelSketch(AppState& st);
+
+    // C37-D: Smart Dimension state machine helpers.
+    // A pick target: either an entity endpoint/center handle ("e3.p2") or a whole entity id ("e3").
+    struct DimPick { std::string handle; int entIdx = -1; bool isPoint = false; float u = 0, v = 0; };
+    bool dimHitTest(const ImVec2& s, DimPick& out) const;       // point-priority then entity
+    bool dimBuildPending(const ImVec2& cursor, float cu, float cv);  // picks -> dimPending_ (+axis)
+    void dimOpenModify(const ImVec2& at);                       // open Modify box for dimPending_
+    void dimCommit(AppState& st);                               // apply the Modify box value/expr
+    // Render one dimension annotation (extension/dim lines, arrows, text). placement in (u,v).
+    void drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 lineCol, ImU32 textCol,
+                       bool hovered, float pu, float pv) const;
+    // Compute a sensible default placement (u,v) for a constraint that has none yet.
+    bool defaultPlacement(const SketchConstraint& c, float& pu, float& pv) const;
+    // Screen location of a dimension's text (for hover / drag / double-click hit-testing).
+    bool dimTextAnchor(const SketchConstraint& c, ImVec2& out) const;
+    const SketchEntity* entById(const std::string& id) const;
 
     // ---- projection (camera locked fronto-parallel to the plane) ----
     // Build the affine screen<->(u,v) basis for this frame from three projected plane points.
@@ -122,6 +174,18 @@ private:
     float prevPan_[3] = {0, 0, 0};
 
     std::vector<SketchEntity> ents_;
+    std::vector<SketchConstraint> cons_;   // C37-D: every constraint (drives dim annotations)
+    // C37-D: locally-remembered placements for dims whose engine placement is null, so a freshly
+    // auto-placed dim keeps its spot frame-to-frame until the user drags it (which persists it).
+    std::unordered_map<std::string, ImVec2> autoPlace_;
+
+    // C37-D: cancel checkpoint taken at sketch entry; doc_revert on the confirmation-corner ✗.
+    std::string cancelCheckpoint_;
+
+    // C37-D: plane-pick (SolidWorks "select a plane to start") state. Driven by drawOverlay while
+    // st.sketchPlanePickActive; -1 = no origin-plane hovered, else 0/1/2 = front/top/right.
+    bool planePicking_ = false;
+    int  planeHover_ = -1;
 
     // per-frame projection basis
     ImVec2 originS_{0, 0};
@@ -134,6 +198,9 @@ private:
     SketchTool tool_ = SketchTool::None;
     std::vector<ImVec2> toolUV_;     // in-progress click points in (u,v)
     std::vector<std::string> toolSnaps_;  // snapped-onto handle per click (for coincident)
+    // C37-D: id of the previous chained Line segment, so the next segment's p1 gets a coincident to
+    // its p2 (the chain start handle is otherwise dropped). Cleared by resetTool via cancelTool.
+    std::string chainPrevId_;
     float conicRho_ = 0.5f;          // Conic tool: live shoulder weight 0..1 during the rho pick
 
     // Emit the 4 lines of a quad (corners A,B,C,D in order) as one chained loop with the given
@@ -155,12 +222,34 @@ private:
     ImVec2 offsetOverlayPos_{0, 0};
     bool offsetFocusInput_ = false;   // request keyboard focus on the distance field next frame
 
-    // smart-dimension popup state
+    // ---- C37-D Smart Dimension state machine ----
+    // Pick buffer (separate from toolUV_): points/entities collected for the next dimension.
+    std::vector<DimPick> dimPicks_;
+    // The constraint object being built (refs/type/axis filled by dimBuildPending), awaiting a
+    // placement click. dimHasPending_ gates the live preview.
+    bool dimHasPending_ = false;
+    nlohmann::json dimPending_;
+    std::string dimType_;             // "distance"|"angle"|"radius"|"diameter"
+    std::string dimAxis_;             // distance variant chosen at placement: "h"|"v"|""
+    double dimMeasured_ = 0.0;        // current measured value (for preview text + box prefill)
+    float dimPlaceU_ = 0, dimPlaceV_ = 0;   // committed placement (set on the placement click)
+
+    // Modify box (replaces the old auto-popup): auto-focused, pre-selected, +/- step, Driven, units.
     bool dimPopupOpen_ = false;
     std::vector<char> dimBuf_{std::vector<char>(64, 0)};
     std::string dimError_;
-    nlohmann::json dimPending_;       // the constraint object awaiting a value/expr
     ImVec2 dimPopupPos_{0, 0};
+    bool dimPopupFocus_ = false;      // request keyboard focus + select-all next frame
+    bool dimPopupDriven_ = false;     // Driven checkbox state
+    double dimPopupStep_ = 1.0;       // +/- step (1mm distance/radius/diameter, 1deg angle)
+    bool dimIsAngle_ = false;         // suffix + step selection
+    std::string dimEditCid_;          // non-empty: editing an EXISTING dim (double-click) via set_dim
+
+    // ---- C37-D dimension hover / text-drag ----
+    std::string dimHoverCid_;         // constraint id hovered this frame
+    std::string dimDragCid_;          // constraint id whose text is being dragged
+    bool dimDragging_ = false;
+    ImVec2 dimDragPlace_{0, 0};       // transient placement (u,v) while dragging
 };
 
 }  // namespace ui

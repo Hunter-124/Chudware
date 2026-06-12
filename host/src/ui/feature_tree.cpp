@@ -1,11 +1,19 @@
 // FeatureManager tree panel (C16).
 // Shows the SolidWorks-style left panel with fixed header nodes and the feature history.
 // Reads AppState::docMirror for the document tree; calls AppState::loadDocMesh on rebuild.
+//
+// C37-E: FeatureManager overhaul — tree<->viewport selection sync (owner-map face highlights +
+// scroll-to + bbox zoom), stability fixes (stable fids/folder ids, O(N) status lookup, canDoc
+// gating), SolidWorks interactions (double-click edit, slow-double-click rename, Ctrl multi-select,
+// per-row appearance/zoom/rollback), a real grabbable rollback bar, and SW-style sketch nesting.
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <map>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "imgui.h"
@@ -14,6 +22,7 @@
 #include "icons.h"
 #include "sketch_mode.h"   // C18 (Edit Sketch context entry)
 #include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
+#include "cursors.h"        // C37-E: ResizeV cursor over the rollback bar
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
@@ -29,23 +38,47 @@ static inline bool jftbool(const nlohmann::json& o, const char* k, bool def = fa
     auto it = o.find(k);
     return (it != o.end() && it->is_boolean()) ? it->get<bool>() : def;
 }
+// C37-E: tolerant number accessor (feature_status "ms" timing).
+static inline double jftnum(const nlohmann::json& o, const char* k, double def = -1.0) {
+    auto it = o.find(k);
+    return (it != o.end() && it->is_number()) ? it->get<double>() : def;
+}
 
 namespace ui {
 
 // ---- icon helper ----
 // Attempt to draw a named atlas icon; fall back to a text glyph if the atlas is absent.
-static void treeIcon(const char* name, const char* fallback, float size = 16.0f) {
+// C37-E: `alpha` dims the icon (suppressed / rolled-back rows get a faded icon, item 6).
+static void treeIcon(const char* name, const char* fallback, float size = 16.0f, float alpha = 1.0f) {
     IconUV iv = getIcon(name, 20);
     if (iv.valid) {
-        ImGui::Image(iv.texId, ImVec2(size, size), iv.uv0, iv.uv1);
+        ImGui::Image(iv.texId, ImVec2(size, size), iv.uv0, iv.uv1, ImVec4(1, 1, 1, alpha));
     } else {
+        if (alpha < 1.0f) ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], alpha));
         ImGui::TextUnformatted(fallback);
+        if (alpha < 1.0f) ImGui::PopStyleColor();
     }
 }
 
-// ---- status badge (ok/warn/error) ----
+// ---- status badge (ok/warn/error/rolled-back) ----
+// C37-E: a rolled-back feature (after the rollback bar) is NOT an error — it gets a distinct muted
+// "paused" marker, never the red "!". Pass rolledBack=true for those rows.
 static void featureBadge(bool ok, bool hasError, const std::string& errText,
-                         const std::vector<std::string>& danglingRefs) {
+                         const std::vector<std::string>& danglingRefs,
+                         bool rolledBack = false) {
+    if (rolledBack) {
+        // Muted hollow ring — "not currently built" (distinct from ok/error/dangling).
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                   ui::palette.textDim[2], 0.75f));
+        ImGui::TextUnformatted(u8"◦");  // hollow bullet = rolled back
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Rolled back (after the rollback bar — not built)");
+        return;
+    }
     if (ok && danglingRefs.empty()) {
         // Green check (just a color dot for compactness)
         ImGui::SameLine();
@@ -132,12 +165,49 @@ static void flushPendingTreeOps(AppState& st) {
 static std::string s_renamingId;
 static char        s_renameBuf[128] = {0};
 
+// C37-E: multi-selection (Ctrl+click). File-local; st.selectedFeatureId tracks the PRIMARY (last
+// clicked). Cleared on a plain click, on doc change (featureTreeResetTransient), and whenever the
+// selection is validated away. A row is "selected" if it is the primary OR in this set.
+static std::unordered_set<std::string> s_multiSel;
+
+// C37-E: slow-double-click rename arming. A second single-click on the already-primary row, with a
+// gap in (0.4s, 2.0s), arms the inline editor (SolidWorks "click-pause-click to rename"). We record
+// the time of the last single-click commit per row.
+static std::string s_lastClickId;
+static double      s_lastClickTime = -1.0;
+
+// C37-E: hover-to-highlight is CLICK-ONLY in this revision (see DEVIATIONS). A transient hover tint
+// would have to repaint st.featureHighlightFaces on enter and restore the click selection on leave
+// every frame; in immediate mode that fought the click highlight and flickered, and the card
+// explicitly permits click-only. So we do not track hover dwell.
+
+// C37-E: rollback-bar drag state. While the user is dragging the bar handle we track it here so the
+// drop computes the feature the bar should sit AFTER (or null = end). s_rbDropAfter is the fid the
+// bar would land after given the cursor's current row (sentinel "\0end" = drop at the end).
+static bool        s_rollbackDragging = false;
+static std::string s_rbDropAfter;   // updated each frame while dragging; "" until a row is hit
+
+// C37-E: per-row appearance picker target. The row's context menu stashes which body to recolor + a
+// one-shot open flag; drawFeatureTree renders the picker popup (sibling) and turns a commit into a
+// set_appearance op. File-local so one picker serves every row.
+static std::string s_apprBody;     // body key ("b1") the picker targets, or empty
+static bool        s_apprOpen = false;
+static float       s_apprColor[3] = {0.71f, 0.76f, 0.82f};
+static float       s_apprMetallic = 0.0f, s_apprRoughness = 0.5f;
+
 // W1-B (item 5): drop the tree's in-progress transient state on a doc change. Declared in
 // feature_tree.h; called from AppState::clearViewportForNewDoc and wholesale-replace paths.
 void featureTreeResetTransient() {
     s_renamingId.clear();
     s_renameBuf[0] = '\0';
     s_pendingTreeOps.clear();
+    s_multiSel.clear();                 // C37-E
+    s_lastClickId.clear();              // C37-E
+    s_lastClickTime = -1.0;
+    s_rollbackDragging = false;
+    s_rbDropAfter.clear();
+    s_apprBody.clear();
+    s_apprOpen = false;
 }
 
 // ---- C26: appearance color-picker popup ----
@@ -146,22 +216,157 @@ void featureTreeResetTransient() {
 // ColorPicker(); the CALLER opens the popup (ImGui::OpenPopup(popupId)) after stashing which body
 // the edit targets, then turns a true return into a set_appearance op.
 
+// ---- feature_status (ok / error / dangling / rolled-back / compile ms) ----
+struct FStatus {
+    bool ok = true;
+    std::string error;
+    std::vector<std::string> dangling;
+    bool   rolledBack = false;   // C37-E: feature sits after the rollback bar (not built, not error)
+    double ms = -1.0;            // C37-E: last compile time (ms); <0 = unknown
+};
+
+static FStatus parseStatusRow(const nlohmann::json& s) {
+    FStatus fs;
+    fs.ok = jftbool(s, "ok", true);
+    fs.rolledBack = jftbool(s, "rolled_back", false);
+    fs.ms = jftnum(s, "ms", -1.0);
+    auto it = s.find("error");
+    if (it != s.end() && it->is_string()) fs.error = it->get<std::string>();
+    auto dr = s.find("dangling_refs");
+    if (dr != s.end() && dr->is_array())
+        for (const auto& d : *dr)
+            if (d.is_string()) fs.dangling.push_back(d.get<std::string>());
+    return fs;
+}
+
+// Linear scan — kept for the assembly tree (component count is small). The feature history uses the
+// per-frame map below (buildStatusMap) to avoid an O(N^2) scan.
+static FStatus getFeatureStatus(const nlohmann::json& statusArr, const std::string& fid) {
+    if (!statusArr.is_array()) return {};
+    for (const auto& s : statusArr) {
+        if (!s.is_object()) continue;
+        if (jfld(s, "id") != fid) continue;
+        return parseStatusRow(s);
+    }
+    return {};
+}
+
+// C37-E (item 2): build one id->status map per frame so each feature row is an O(1) lookup instead
+// of re-scanning the whole status array (the old O(N^2)).
+static std::unordered_map<std::string, FStatus> buildStatusMap(const nlohmann::json& statusArr) {
+    std::unordered_map<std::string, FStatus> m;
+    if (!statusArr.is_array()) return m;
+    m.reserve(statusArr.size());
+    for (const auto& s : statusArr) {
+        if (!s.is_object()) continue;
+        std::string id = jfld(s, "id");
+        if (!id.empty()) m.emplace(std::move(id), parseStatusRow(s));
+    }
+    return m;
+}
+
+// ---- C37-E: feature -> viewport highlight (owner map -> featureHighlightFaces) ----
+// Fills st.featureHighlightFaces with the (body<<32)|face keys this feature owns. The viewport
+// agent tints them. Tolerant of a missing owner map: the vector is simply left empty.
+static void fillHighlightFaces(AppState& st, const std::string& fid,
+                               std::vector<uint64_t>& out) {
+    out.clear();
+    const auto& om = st.docMirror.ownerMap();
+    auto it = om.find(fid);
+    if (it == om.end()) return;
+    out.reserve(it->second.faces.size());
+    for (const auto& bf : it->second.faces)
+        out.push_back(((uint64_t)bf.first << 32) | (uint64_t)bf.second);
+}
+
+// Apply the persistent (click) highlight for a feature: clear topology selection (the tree owns the
+// highlight now) and repopulate featureHighlightFaces. No toast when there's no owner map — an empty
+// highlight is fine (the card says so).
+static void selectFeatureInViewport(AppState& st, const std::string& fid) {
+    st.selection.clear();
+    fillHighlightFaces(st, fid, st.featureHighlightFaces);
+}
+
+static void clearFeatureHighlight(AppState& st) {
+    st.featureHighlightFaces.clear();
+}
+
+// C37-E (item 3): "Zoom to Feature" — union the owned faces'/bodies' bboxes (from the host-side
+// bbox caches) and post a one-shot camera request. Toasts when nothing framable was found.
+static void zoomToFeature(AppState& st, const std::string& fid) {
+    const auto& om = st.docMirror.ownerMap();
+    auto it = om.find(fid);
+    bool any = false;
+    float mn[3] = {0, 0, 0}, mx[3] = {0, 0, 0};
+    auto acc = [&](const std::array<float, 6>& b) {
+        if (!any) { for (int i = 0; i < 3; ++i) { mn[i] = b[i]; mx[i] = b[3 + i]; } any = true; }
+        else {
+            for (int i = 0; i < 3; ++i) {
+                if (b[i]     < mn[i]) mn[i] = b[i];
+                if (b[3 + i] > mx[i]) mx[i] = b[3 + i];
+            }
+        }
+    };
+    if (it != om.end()) {
+        for (const auto& bf : it->second.faces) {
+            uint64_t key = ((uint64_t)bf.first << 32) | (uint64_t)bf.second;
+            auto fit = st.faceBBoxCache.find(key);
+            if (fit != st.faceBBoxCache.end()) acc(fit->second);
+        }
+        // Fall back to the owned bodies' boxes (faces may not all be cached).
+        if (!any)
+            for (uint32_t b : it->second.bodies) {
+                auto bit = st.bodyBBoxCache.find(b);
+                if (bit != st.bodyBBoxCache.end()) acc(bit->second);
+            }
+    }
+    if (!any) {
+        st.toast(ui::ToastLevel::Info, "Zoom to Feature: no cached geometry for this feature");
+        return;
+    }
+    for (int i = 0; i < 3; ++i) { st.zoomToBBoxMin[i] = mn[i]; st.zoomToBBoxMax[i] = mx[i]; }
+    st.zoomToBBoxRequested = true;
+}
+
 // ---- draw one feature row ----
-// Returns true if the row was left-clicked (selection).
-// reorderCb(draggedId, beforeId): drop draggedId immediately before beforeId (empty = end).
-// convertCb (optional): called when the user picks "Convert to Chamfer/Fillet"; label supplied
-//   by the caller; nullptr hides the menu item.
-static bool featureRow(const std::string& fid, const std::string& name, const char* iconName,
-                       const char* iconFallback, bool suppressed, bool selected, bool dimmed,
-                       bool ok, bool hasError, const std::string& errText,
-                       const std::vector<std::string>& danglingRefs,
-                       const std::function<void(const std::string&)>& editCallback,
-                       const std::function<void(const std::string&, const std::string&)>& reorderCb,
-                       AppState& st,
-                       const char* convertLabel = nullptr,
-                       const std::function<void()>& convertCb = nullptr) {
+// All the data + behavior a single feature row needs. Returns the click outcome so the caller can
+// update selection. The struct keeps the (formerly sprawling) parameter list readable.
+struct RowCtx {
+    std::string fid, name, type;
+    const char* iconName = nullptr;
+    const char* iconFallback = nullptr;
+    bool suppressed = false;
+    bool selected   = false;        // primary OR multi-selected
+    bool rolledBack = false;        // after the rollback bar → greyed/italic, NOT error styling
+    FStatus fs;                     // ok / error / dangling / ms
+    int  ownerBodyCount = 0;        // for the tooltip
+    bool nested = false;            // a sketch child node (indented under its consumer)
+    bool canDoc = true;            // gates every mutating menu item + drag-reorder
+    bool barAtEnd = true;          // hides "Roll to End" when already at the end
+    std::string firstOwnedBody;    // body key for the per-row Appearance item ("b<n>")
+    const char* convertLabel = nullptr;
+    std::function<void()> convertCb = nullptr;
+    // reorderCb(dragged, before): drop dragged immediately before `before` ("" = end).
+    std::function<void(const std::string&, const std::string&)> reorderCb;
+    const std::function<void(const std::string&)>* editCallback = nullptr;
+};
+
+// Outcomes of interacting with a row this frame (consumed by the caller).
+struct RowResult {
+    bool clicked     = false;   // plain left-click (select)
+    bool ctrlClicked = false;   // Ctrl+left-click (toggle multi-select)
+    bool doubleClick = false;   // open the edit form
+    bool hovered     = false;
+};
+
+static RowResult featureRow(RowCtx& c, AppState& st) {
+    RowResult res;
+    const std::string& fid = c.fid;
     float iconW = 20.0f;
-    treeIcon(iconName, iconFallback, iconW);
+    if (c.nested) ImGui::Indent(14.0f);   // sketch child indent (visual nesting)
+    // C37-E (item 6): suppressed/rolled-back rows get a faded icon (clearer than just the [S] tag).
+    float iconAlpha = c.suppressed ? 0.45f : (c.rolledBack ? 0.6f : 1.0f);
+    treeIcon(c.iconName, c.iconFallback, iconW, iconAlpha);
     ImGui::SameLine(0, 4);
 
     // ---- inline rename editor (replaces the label while active) ----
@@ -177,113 +382,200 @@ static bool featureRow(const std::string& fid, const std::string& name, const ch
             std::string newName = s_renameBuf;
             std::string old = s_renamingId;
             s_renamingId.clear();
-            if (!cancel && !newName.empty() && newName != name) {
-                nlohmann::json ops = nlohmann::json::array();
-                ops.push_back({{"op", "rename"}, {"id", old}, {"name", newName}});
-                applyTreeOps(st, ops, "rename");
+            // C37-E (item 2): verify the fid still exists in the live tree before sending; a rename
+            // committed onto a feature that was deleted/reordered away would be a stale op.
+            bool stillExists = false;
+            {
+                const nlohmann::json& tr = st.docMirror.tree();
+                auto fa = tr.is_object() ? tr.find("features") : tr.end();
+                if (tr.is_object() && fa != tr.end() && fa->is_array())
+                    for (const auto& f : *fa)
+                        if (f.is_object() && jfld(f, "id") == old) { stillExists = true; break; }
+            }
+            if (!cancel && !newName.empty() && newName != c.name) {
+                if (stillExists) {
+                    nlohmann::json ops = nlohmann::json::array();
+                    ops.push_back({{"op", "rename"}, {"id", old}, {"name", newName}});
+                    applyTreeOps(st, ops, "rename");
+                } else {
+                    st.toast(ui::ToastLevel::Warn, "Rename dropped: feature no longer exists");
+                }
             }
         }
-        return false;
+        if (c.nested) ImGui::Unindent(14.0f);
+        return res;
     }
 
     ImGuiTreeNodeFlags flags =
         ImGuiTreeNodeFlags_Leaf |
         ImGuiTreeNodeFlags_NoTreePushOnOpen |
         ImGuiTreeNodeFlags_SpanFullWidth;
-    if (selected) flags |= ImGuiTreeNodeFlags_Selected;
+    if (c.selected) flags |= ImGuiTreeNodeFlags_Selected;
 
-    // Suppressed features dim heavily; features rolled back (after the edit point) dim lightly.
-    bool dim = suppressed || dimmed;
+    // Suppressed → dim heavily. Rolled back → dim + italic-ish look (we cannot truly italicize a
+    // default font, so we use the lighter dim + the "(Rolled back)" cue in the badge/tooltip).
+    bool dim = c.suppressed || c.rolledBack;
     if (dim) {
-        float a = suppressed ? 0.5f : 0.6f;
+        float a = c.suppressed ? 0.5f : 0.62f;
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
                    ui::palette.textDim[2], a));
     }
 
-    // Build the label string; add "[S]" suffix for suppressed
-    std::string label = name;
-    if (suppressed) label += " [S]";
+    // Label: dimmed-icon suppressed cue handled via the tree icon; keep a compact [S] too.
+    std::string label = c.name;
+    if (c.suppressed) label += " [S]";
     label += "##ft_" + fid;
 
-    bool clicked = ImGui::TreeNodeEx(label.c_str(), flags);
+    ImGui::TreeNodeEx(label.c_str(), flags);
 
     if (dim) ImGui::PopStyleColor();
 
-    // ---- drag-drop reorder ----
-    if (reorderCb && ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+    // ---- click classification (defer the actual selection change to the caller) ----
+    bool itemHovered = ImGui::IsItemHovered();
+    res.hovered = itemHovered;
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) res.doubleClick = true;
+        else if (ImGui::GetIO().KeyCtrl)                        res.ctrlClicked = true;
+        else                                                    res.clicked = true;
+    }
+
+    // ---- drag-drop reorder (gated on canDoc) ----
+    if (c.reorderCb && c.canDoc && ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
         ImGui::SetDragDropPayload("FEATURE_ROW", fid.c_str(), fid.size() + 1);
-        ImGui::Text("Move %s", name.c_str());
+        ImGui::Text("Move %s", c.name.c_str());
         ImGui::EndDragDropSource();
     }
-    if (reorderCb && ImGui::BeginDragDropTarget()) {
-        // Insertion line at this row's top edge so the drop point is obvious.
+    if (c.reorderCb && c.canDoc && ImGui::BeginDragDropTarget()) {
+        // C37-E (item 3): draw the insertion indicator in the GAP at the real insertion position —
+        // top edge if the cursor is in the upper half (drop BEFORE this row), bottom edge if in the
+        // lower half (drop AFTER → before the next row).
         ImVec2 rmin = ImGui::GetItemRectMin(), rmax = ImGui::GetItemRectMax();
-        ImGui::GetWindowDrawList()->AddLine(ImVec2(rmin.x, rmin.y), ImVec2(rmax.x, rmin.y),
-                                            ui::Palette::toU32(ui::palette.accent), 2.0f);
+        float  mid  = (rmin.y + rmax.y) * 0.5f;
+        bool   after = ImGui::GetIO().MousePos.y > mid;
+        float  ly = after ? rmax.y : rmin.y;
+        ImGui::GetWindowDrawList()->AddLine(ImVec2(rmin.x, ly), ImVec2(rmax.x, ly),
+                                            ui::Palette::toU32(ui::palette.accent), 2.5f);
         if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("FEATURE_ROW")) {
             std::string dragged(static_cast<const char*>(pl->Data));
-            if (dragged != fid) reorderCb(dragged, fid);
+            if (dragged != fid) {
+                // reorderCb takes a "before" id. Dropping in this row's UPPER half = insert before
+                // this row (pass fid). LOWER half = insert after this row, which we encode with the
+                // "@after:<fid>" sentinel so the caller resolves the following feature's id.
+                c.reorderCb(dragged, after ? ("@after:" + fid) : fid);
+            }
         }
         ImGui::EndDragDropTarget();
     }
 
-    featureBadge(ok, hasError, errText, danglingRefs);
+    featureBadge(c.fs.ok, !c.fs.error.empty(), c.fs.error, c.fs.dangling, c.rolledBack);
+
+    // ---- rich tooltip (type · status · compile ms · owner body count) ----
+    if (itemHovered && !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        std::string tip = "Type: " + (c.type.empty() ? std::string("feature") : c.type);
+        if (c.suppressed) tip += "\nStatus: Suppressed";
+        else if (c.rolledBack) tip += "\nStatus: Rolled back (after the bar)";
+        else if (!c.fs.ok) tip += "\nStatus: Error" + (c.fs.error.empty() ? "" : (" — " + c.fs.error));
+        else if (!c.fs.dangling.empty()) tip += "\nStatus: Dangling references";
+        else tip += "\nStatus: OK";
+        if (c.fs.ms >= 0.0) { char b[48]; std::snprintf(b, sizeof(b), "\nCompile: %.2f ms", c.fs.ms); tip += b; }
+        tip += "\nBodies owned: " + std::to_string(c.ownerBodyCount);
+        ImGui::SetTooltip("%s", tip.c_str());
+    }
 
     // Context menu
     if (ImGui::BeginPopupContextItem(("##ctx_" + fid).c_str())) {
-        // C18: sketch features get an "Edit Sketch" entry that enters sketch mode (camera lock +
-        // tools). iconName == "sketch" identifies the row's feature type (see featureIcon()).
-        bool isSketch = iconName && std::strcmp(iconName, "sketch_node") == 0;
+        bool isSketch = c.iconName && std::strcmp(c.iconName, "sketch_node") == 0;
+        bool multi    = s_multiSel.size() > 1 && s_multiSel.count(fid) > 0;
+        if (!c.canDoc) ImGui::BeginDisabled();   // gate every mutating item while an agent run is busy
+
         if (isSketch) {
             if (ImGui::MenuItem("Edit Sketch")) {
                 auto* sk = st.sketchMode;
                 if (sk) sk->enterForFeature(st, fid);
             }
         }
-        // Edit callback (C17 wires this)
-        if (editCallback) {
-            if (ImGui::MenuItem("Edit")) editCallback(fid);
+        if (c.editCallback && *c.editCallback) {
+            if (ImGui::MenuItem("Edit")) (*c.editCallback)(fid);
         } else {
-            ImGui::BeginDisabled();
-            ImGui::MenuItem("Edit");
-            ImGui::EndDisabled();
+            ImGui::BeginDisabled(); ImGui::MenuItem("Edit"); ImGui::EndDisabled();
         }
-        // Rename (inline): arm the in-place editor on the row.
         if (ImGui::MenuItem("Rename")) {
             s_renamingId = fid;
-            std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", name.c_str());
+            std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", c.name.c_str());
         }
-        // Remove from folder (only meaningful when grouped).
         if (ImGui::MenuItem("Remove from folder")) {
-            nlohmann::json ops = nlohmann::json::array();
-            ops.push_back({{"op", "set_folder"}, {"id", fid}, {"folder", ""}});
-            applyTreeOps(st, ops, "set_folder");
+            applyTreeOps(st, nlohmann::json::array({
+                {{"op", "set_folder"}, {"id", fid}, {"folder", ""}}}), "set_folder");
         }
+
         ImGui::Separator();
-        if (ImGui::MenuItem(suppressed ? "Unsuppress" : "Suppress")) {
-            nlohmann::json ops = nlohmann::json::array();
-            ops.push_back({{"op", "set_suppressed"}, {"id", fid}, {"value", !suppressed}});
-            applyTreeOps(st, ops, "suppress");
+        // C37-E (item 3): multi-selection applies Suppress/Unsuppress/Delete to ALL selected rows.
+        if (multi) {
+            int n = (int)s_multiSel.size();
+            if (ImGui::MenuItem(("Suppress " + std::to_string(n) + " features").c_str())) {
+                nlohmann::json ops = nlohmann::json::array();
+                for (const auto& id : s_multiSel)
+                    ops.push_back({{"op", "set_suppressed"}, {"id", id}, {"value", true}});
+                applyTreeOps(st, ops, "suppress");
+            }
+            if (ImGui::MenuItem(("Unsuppress " + std::to_string(n) + " features").c_str())) {
+                nlohmann::json ops = nlohmann::json::array();
+                for (const auto& id : s_multiSel)
+                    ops.push_back({{"op", "set_suppressed"}, {"id", id}, {"value", false}});
+                applyTreeOps(st, ops, "unsuppress");
+            }
+            if (ImGui::MenuItem(("Delete " + std::to_string(n) + " features").c_str())) {
+                nlohmann::json ops = nlohmann::json::array();
+                for (const auto& id : s_multiSel)
+                    ops.push_back({{"op", "delete_feature"}, {"id", id}, {"cascade", false}});
+                applyTreeOps(st, ops, "delete");
+            }
+        } else {
+            if (ImGui::MenuItem(c.suppressed ? "Unsuppress" : "Suppress")) {
+                applyTreeOps(st, nlohmann::json::array({
+                    {{"op", "set_suppressed"}, {"id", fid}, {"value", !c.suppressed}}}), "suppress");
+            }
         }
-        // C27-C: Convert Fillet↔Chamfer (SolidWorks dress-up parity).
-        // convertCb is supplied by the draw loop when the feature type is fillet or chamfer.
-        // v1 note: if a downstream feature depends on this one, applyTreeOpsNow surfaces a
-        // "dependency_exists" warning and leaves the tree unchanged.
-        if (convertCb && convertLabel) {
+
+        if (c.convertCb && c.convertLabel) {
             ImGui::Separator();
-            if (ImGui::MenuItem(convertLabel)) convertCb();
+            if (ImGui::MenuItem(c.convertLabel)) c.convertCb();
         }
+
+        // C37-E (item 3): Zoom to Feature / Rollback to Here / Roll to End / Appearance.
+        ImGui::Separator();
+        if (ImGui::MenuItem("Zoom to Feature")) zoomToFeature(st, fid);
+        if (ImGui::MenuItem("Rollback to Here")) {
+            applyTreeOps(st, nlohmann::json::array({
+                {{"op", "set_rollback"}, {"after", fid}}}), "rollback");
+        }
+        if (!c.barAtEnd) {
+            if (ImGui::MenuItem("Roll to End")) {
+                applyTreeOps(st, nlohmann::json::array({
+                    {{"op", "set_rollback"}, {"after", nullptr}}}), "rollback");
+            }
+        }
+        if (!c.firstOwnedBody.empty()) {
+            if (ImGui::MenuItem("Appearance...")) {
+                s_apprBody = c.firstOwnedBody;
+                s_apprColor[0] = 0.71f; s_apprColor[1] = 0.76f; s_apprColor[2] = 0.82f;
+                s_apprMetallic = 0.0f; s_apprRoughness = 0.5f;
+                s_apprOpen = true;   // a sibling popup opens next frame (see drawFeatureTree)
+            }
+        }
+
         ImGui::Separator();
         if (ImGui::MenuItem("Delete")) {
-            nlohmann::json ops = nlohmann::json::array();
-            ops.push_back({{"op", "delete_feature"}, {"id", fid}, {"cascade", false}});
-            applyTreeOps(st, ops, "delete");
+            applyTreeOps(st, nlohmann::json::array({
+                {{"op", "delete_feature"}, {"id", fid}, {"cascade", false}}}), "delete");
         }
+        if (!c.canDoc) ImGui::EndDisabled();
         ImGui::EndPopup();
     }
 
-    return clicked;
+    if (c.nested) ImGui::Unindent(14.0f);
+    return res;
 }
 
 // ---- feature type -> icon name ----
@@ -322,46 +614,6 @@ static const char* featureFallback(const std::string& type) {
     if (type == "fillet")   return "[F]";
     if (type == "chamfer")  return "[C]";
     return "[?]";
-}
-
-// ---- highlight feature's owned faces in the viewport ----
-static void highlightFeature(AppState& st, const std::string& fid) {
-    // Look up which faces in the loaded AICM are owned by fid.
-    // The AICM's face_owners come from the worker's ops-response rebuild. For M1 we don't yet
-    // store a face->owner map in the C++ layer, so we scan the last featureStatus to confirm
-    // the feature exists, then select all faces of bodies whose owner matches.
-    // If owner data isn't available in the AICM, skip with a note (as per the card).
-    st.selection.clear();
-    if (!st.hasDocMesh || !st.idPass) return;
-
-    // For M1: we don't have a face-owner map in C++ yet (that's C17/C19 territory).
-    // Log a note and skip — the card allows this: "if owner data isn't in the AICM, skip and note".
-    st.addLog("[tree] face highlight for " + fid + ": owner map not yet in C++ layer (deferred)");
-}
-
-// ---- lookup feature_status for a feature id ----
-struct FStatus {
-    bool ok = true;
-    std::string error;
-    std::vector<std::string> dangling;
-};
-
-static FStatus getFeatureStatus(const nlohmann::json& statusArr, const std::string& fid) {
-    FStatus fs;
-    if (!statusArr.is_array()) return fs;
-    for (const auto& s : statusArr) {
-        if (!s.is_object()) continue;
-        if (jfld(s, "id") != fid) continue;
-        fs.ok = jftbool(s, "ok", true);
-        auto it = s.find("error");
-        if (it != s.end() && it->is_string()) fs.error = it->get<std::string>();
-        auto dr = s.find("dangling_refs");
-        if (dr != s.end() && dr->is_array())
-            for (const auto& d : *dr)
-                if (d.is_string()) fs.dangling.push_back(d.get<std::string>());
-        return fs;
-    }
-    return fs;
 }
 
 // ---- C20b: assembly tree (components + Mates folder) ----
@@ -574,6 +826,57 @@ static void nameAndGroupFeatures(AppState& st) {
     }
 }
 
+// ---- C37-E (item 4): the rollback bar widget ----
+// Draws a thick grabbable horizontal line at the CURRENT cursor position (the caller places it right
+// after the bar feature's row, or after the last row when the bar is at the end). The bar is a
+// proper drag interaction: hovering shows a vertical-resize cursor + a brighter line; dragging it and
+// releasing over a row gap enqueues set_rollback{after: <fid above the drop gap> | null}. It also
+// remains a DROP TARGET for a dragged FEATURE_ROW (drop-to-end reorder, kept from C24).
+//
+// While dragging, the per-row hit-test in the feature walk records s_rbDropAfter (the feature the
+// bar would land after); the walk's release handler turns it into set_rollback. `enabled` (canDoc)
+// gates the mutating feature-row drop. `barAfterFid` is unused here but documents placement.
+static void drawRollbackBarLine(AppState& st, bool enabled, const std::string& /*barAfterFid*/) {
+    const auto& pal = ui::palette;
+    ImGui::Dummy(ImVec2(0, 2.0f * ui::uiScale));
+    ImVec2 r0 = ImGui::GetCursorScreenPos();
+    float  w  = ImGui::GetContentRegionAvail().x;
+    float  rsc = ui::uiScale;
+    float  barH = 9.0f * rsc;          // grabbable band height
+    // An invisible button across the whole band gives us hover + active (drag) state.
+    ImGui::PushID("##rollback_bar");
+    ImGui::InvisibleButton("##rb", ImVec2(w, barH));
+    bool hovered = ImGui::IsItemHovered();
+    bool active  = ImGui::IsItemActive();
+    if (hovered || active) st.requestCursor(ui::CursorKind::ResizeV);
+    if (active) s_rollbackDragging = true;
+
+    ImDrawList* rdl = ImGui::GetWindowDrawList();
+    float ly = r0.y + barH * 0.5f;
+    ImU32 lineCol = ui::Palette::toU32((hovered || active) ? pal.accent : pal.accentMid);
+    rdl->AddLine(ImVec2(r0.x, ly), ImVec2(r0.x + w, ly), lineCol,
+                 (hovered || active) ? 3.0f : 2.0f);
+    float hw = 22.0f * rsc, hh = 7.0f * rsc, hx = r0.x + (w - hw) * 0.5f;
+    rdl->AddRectFilled(ImVec2(hx, ly - hh * 0.5f), ImVec2(hx + hw, ly + hh * 0.5f),
+                       ui::Palette::toU32(pal.accent), 3.0f);
+    if (hovered && !active)
+        ImGui::SetTooltip("Rollback bar — drag up/down to roll the model back/forward,\n"
+                          "or drop a feature here to move it to the end");
+
+    // Drop target: a dragged feature row landing on the bar goes to the end (kept from C24).
+    if (enabled && ImGui::BeginDragDropTarget()) {
+        rdl->AddLine(ImVec2(r0.x, ly), ImVec2(r0.x + w, ly),
+                     ui::Palette::toU32(pal.accent), 2.5f);
+        if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("FEATURE_ROW")) {
+            std::string dragged(static_cast<const char*>(pl->Data));
+            applyTreeOps(st, nlohmann::json::array(
+                {{{"op", "reorder_feature"}, {"id", dragged}}}), "reorder");
+        }
+        ImGui::EndDragDropTarget();
+    }
+    ImGui::PopID();
+}
+
 // ---- C24: FeatureManager top strip — a SolidWorks-style tab row (tree active; properties /
 // configurations tabs are visual stubs) plus a compact document toolbar (New Part / New Assembly /
 // Open / Save / Undo / Redo) that replaces the old wide text-button strip at the panel bottom.
@@ -695,6 +998,11 @@ void drawFeatureTree(AppState& st,
     std::string docName = "Part1";
     if (tree.is_object()) docName = jfld(tree, "name");
     if (docName.empty()) docName = "Part1";
+
+    // C37-E (item 2): the SAME guard the top toolbar uses (st.workerStarted && !st.job.running).
+    // Every mutating tree interaction — context menu, drag-reorder, Ctrl+Up/Down, rollback drag —
+    // is gated on this so no op fires while an agent run is in flight.
+    bool canDocTree = st.workerStarted && !st.job.running.load();
 
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(pal.text[0], pal.text[1], pal.text[2], pal.text[3]));
@@ -826,8 +1134,6 @@ void drawFeatureTree(AppState& st,
 
             // ---- feature history ----
             const nlohmann::json& statusArr = st.docMirror.featureStatus();
-            // W1-B (item 5): the selected feature id now lives on AppState (so a viewport pick can
-            // drive it and a doc change can clear it). Bind a local reference to keep the body terse.
             std::string& selectedFeatureId = st.selectedFeatureId;
 
             // C20b: assemblies render components + a Mates folder instead of a feature history.
@@ -838,43 +1144,312 @@ void drawFeatureTree(AppState& st,
             if (tree.is_object()) {
                 auto feat = tree.find("features");
                 if (feat != tree.end() && feat->is_array()) {
-                    // Reorder op: drop draggedId before beforeId (empty => append to the end).
-                    auto reorderCb = [&st](const std::string& dragged, const std::string& before) {
+                    // C37-E (item 2): one status map per frame (kills the per-row O(N^2) scan).
+                    std::unordered_map<std::string, FStatus> statusMap = buildStatusMap(statusArr);
+
+                    // Ordered id list (drives selection validation, Ctrl+Up/Down, rollback math).
+                    std::vector<std::string> order;
+                    order.reserve(feat->size());
+                    for (const auto& f : *feat)
+                        if (f.is_object()) order.push_back(jfld(f, "id"));
+
+                    // C37-E (item 2): validate the selection/multi-set against the live tree; drop
+                    // anything that vanished (a delete/reorder/undo can orphan them) and clear the
+                    // viewport highlight if the primary is gone.
+                    {
+                        std::unordered_set<std::string> live(order.begin(), order.end());
+                        if (!selectedFeatureId.empty() && !live.count(selectedFeatureId)) {
+                            selectedFeatureId.clear();
+                            clearFeatureHighlight(st);
+                        }
+                        for (auto it = s_multiSel.begin(); it != s_multiSel.end();)
+                            it = live.count(*it) ? std::next(it) : s_multiSel.erase(it);
+                    }
+
+                    // C37-E (item 4): rollback bar position. `rollback_after` = the feature the bar
+                    // sits AFTER (null/absent = bar at end). Everything after it is "rolled back".
+                    std::string rollbackAfter;
+                    {
+                        auto rb = tree.find("rollback_after");
+                        if (rb != tree.end() && rb->is_string()) rollbackAfter = rb->get<std::string>();
+                    }
+                    int barPos = (int)order.size() - 1;   // index of the feature the bar sits after
+                    if (!rollbackAfter.empty()) {
+                        for (int i = 0; i < (int)order.size(); ++i)
+                            if (order[i] == rollbackAfter) { barPos = i; break; }
+                    }
+                    bool barAtEnd = rollbackAfter.empty() || barPos >= (int)order.size() - 1;
+
+                    // C37-E (item 5): sketch nesting. A sketch consumed by EXACTLY ONE downstream
+                    // feature (via a region ref {"kind":"region","sketch":"fX"} or positions_sketch)
+                    // nests under that consumer. Unconsumed / multiply-consumed sketches stay flat.
+                    std::unordered_map<std::string, int> consumeCount;   // sketch fid -> #consumers
+                    std::unordered_map<std::string, std::string> consumer;  // sketch fid -> consumer
+                    std::unordered_map<std::string, std::vector<std::string>> childrenOf;  // consumer -> sketches
+                    {
+                        std::unordered_set<std::string> sketchIds;
+                        for (const auto& f : *feat)
+                            if (f.is_object() && jfld(f, "type") == "sketch")
+                                sketchIds.insert(jfld(f, "id"));
+                        // Recursively scan a feature's refs for sketch references. A sketch is
+                        // "consumed" via (a) a region selector {"kind":"region","sketch":"fX"} or
+                        // (b) a bare sketch-id string under a *_sketch / sketch / profile key (e.g.
+                        // positions_sketch). We deliberately do NOT treat a bare sketch id under a
+                        // generic "features" list (pattern/mirror) as consumption — patterns don't
+                        // absorb sketches, and that would wrongly hide them.
+                        std::function<void(const nlohmann::json&, const std::string&,
+                                           std::unordered_set<std::string>&)> scan =
+                            [&](const nlohmann::json& node, const std::string& key,
+                                std::unordered_set<std::string>& seen) {
+                            if (node.is_object()) {
+                                if (jfld(node, "kind") == "region") {
+                                    std::string sk = jfld(node, "sketch");
+                                    if (!sk.empty() && sketchIds.count(sk)) seen.insert(sk);
+                                }
+                                for (auto it = node.begin(); it != node.end(); ++it)
+                                    scan(it.value(), it.key(), seen);
+                            } else if (node.is_array()) {
+                                for (const auto& e : node) scan(e, key, seen);
+                            } else if (node.is_string()) {
+                                bool keyImpliesSketch =
+                                    key.find("sketch") != std::string::npos || key == "profile";
+                                std::string v = node.get<std::string>();
+                                if (keyImpliesSketch && sketchIds.count(v)) seen.insert(v);
+                            }
+                        };
+                        for (const auto& f : *feat) {
+                            if (!f.is_object()) continue;
+                            std::string fid = jfld(f, "id");
+                            if (jfld(f, "type") == "sketch") continue;  // a sketch isn't a consumer
+                            auto refs = f.find("refs");
+                            if (refs == f.end()) continue;
+                            std::unordered_set<std::string> seen;
+                            scan(*refs, std::string(), seen);   // top-level refs object: no key yet
+                            for (const auto& sk : seen) {
+                                ++consumeCount[sk];
+                                consumer[sk] = fid;  // last writer; only meaningful when count==1
+                            }
+                        }
+                        for (const auto& kv : consumer)
+                            if (consumeCount[kv.first] == 1)
+                                childrenOf[kv.second].push_back(kv.first);
+                    }
+                    // A sketch is nested (hidden from the flat list, shown under its consumer) iff it
+                    // has exactly one consumer.
+                    auto isNestedSketch = [&](const std::string& fid) {
+                        auto it = consumeCount.find(fid);
+                        return it != consumeCount.end() && it->second == 1;
+                    };
+
+                    // Reorder op: drop draggedId before beforeId. A "@after:<id>" sentinel means drop
+                    // AFTER <id> (i.e. before the feature following <id>, or end). "" = end.
+                    auto reorderCb = [&st, &order](const std::string& dragged, const std::string& before) {
+                        std::string beforeId = before;
+                        if (before.rfind("@after:", 0) == 0) {
+                            std::string anchor = before.substr(7);
+                            beforeId.clear();
+                            for (int i = 0; i < (int)order.size(); ++i)
+                                if (order[i] == anchor) {
+                                    if (i + 1 < (int)order.size()) beforeId = order[i + 1];
+                                    break;
+                                }
+                        }
                         nlohmann::json op = {{"op", "reorder_feature"}, {"id", dragged}};
-                        if (!before.empty()) op["before"] = before;   // omit => move to end
+                        if (!beforeId.empty()) op["before"] = beforeId;  // omit => move to end
                         applyTreeOps(st, nlohmann::json::array({op}), "reorder");
                     };
 
-                    // Ordered id list + the selected feature's raw position (drives rollback dimming
-                    // and Ctrl+Up/Down sibling moves).
-                    std::vector<std::string> order;
-                    int selPos = -1;
-                    {
-                        int i = 0;
-                        for (const auto& f : *feat) {
-                            if (f.is_object()) {
-                                std::string id = jfld(f, "id");
-                                order.push_back(id);
-                                if (id == selectedFeatureId) selPos = i;
-                            }
-                            ++i;
-                        }
-                    }
+                    // Owner-map → first owned body key ("b<n>") for the per-row Appearance item, and
+                    // the owned-body count for the tooltip.
+                    const auto& ownerMap = st.docMirror.ownerMap();
+                    auto firstBodyKey = [&](const std::string& fid) -> std::string {
+                        auto it = ownerMap.find(fid);
+                        if (it == ownerMap.end() || it->second.bodies.empty()) return {};
+                        return "b" + std::to_string(it->second.bodies.front());
+                    };
+                    auto bodyCount = [&](const std::string& fid) -> int {
+                        auto it = ownerMap.find(fid);
+                        return it == ownerMap.end() ? 0 : (int)it->second.bodies.size();
+                    };
 
-                    std::string openFolder;    // folder tag of the open folder node ("" = none)
-                    bool        folderOpen = false;
-                    int         folderIdx  = 0;
-                    int idx = 0;
-                    for (const auto& f : *feat) {
-                        if (!f.is_object()) { ++idx; continue; }
+                    // ---- render one feature row (shared by flat + nested-sketch paths) ----
+                    int rowIdx = 0;   // visual stripe index (stable across nesting)
+                    auto drawOneRow = [&](const nlohmann::json& f, bool nested) {
                         std::string fid    = jfld(f, "id");
                         std::string fname  = jfld(f, "name");
                         std::string ftype  = jfld(f, "type");
-                        std::string folder = jfld(f, "folder");
-                        bool suppressed = jftbool(f, "suppressed");
-                        if (fname.empty()) fname = ftype + std::to_string(idx + 1);
+                        if (fname.empty()) fname = ftype + "·" + fid;  // C37-E: stable fid, not index
 
-                        // Open/close collapsible folder nodes as the run of folder tags changes.
+                        FStatus fs;
+                        { auto it = statusMap.find(fid); if (it != statusMap.end()) fs = it->second; }
+                        bool suppressed = jftbool(f, "suppressed");
+                        bool rolledBack = fs.rolledBack;   // authoritative (engine sets it)
+                        bool sel = (selectedFeatureId == fid) || s_multiSel.count(fid) > 0;
+
+                        // Row backgrounds (alt stripe + selection highlight).
+                        ImVec2 rowMin = ImGui::GetCursorScreenPos();
+                        float availW = ImGui::GetContentRegionAvail().x;
+                        ImVec2 rowMax(rowMin.x + availW,
+                                      rowMin.y + ImGui::GetTextLineHeightWithSpacing());
+                        if (rowIdx % 2 == 0)
+                            ImGui::GetWindowDrawList()->AddRectFilled(rowMin, rowMax,
+                                Palette::toU32(pal.treeRowAlt));
+                        if (sel) {
+                            ImGui::GetWindowDrawList()->AddRectFilled(rowMin, rowMax,
+                                Palette::toU32(pal.treeRowSelected));
+                            if (selectedFeatureId == fid && st.treeScrollToSelection) {
+                                ImGui::SetScrollHereY(0.5f);
+                                st.treeScrollToSelection = false;
+                            }
+                        }
+                        ++rowIdx;
+
+                        // C27-C: convert fillet↔chamfer (kept).
+                        const char* convertLabel = nullptr;
+                        std::function<void()> convertCb = nullptr;
+                        bool isFillet  = (ftype == "fillet");
+                        bool isChamfer = (ftype == "chamfer");
+                        if (isFillet || isChamfer) {
+                            convertLabel = isFillet ? "Convert to Chamfer" : "Convert to Fillet";
+                            nlohmann::json capturedFeat = f;
+                            std::string capturedType = ftype, capturedFid = fid, nextId;
+                            { bool found = false;
+                              for (const auto& ff : *feat) {
+                                  if (!ff.is_object()) continue;
+                                  if (found) { nextId = jfld(ff, "id"); break; }
+                                  if (jfld(ff, "id") == fid) found = true;
+                              } }
+                            convertCb = [&st, capturedFeat, capturedType, capturedFid, nextId]() {
+                                std::string toType = (capturedType == "fillet") ? "chamfer" : "fillet";
+                                nlohmann::json newParams = nlohmann::json::object();
+                                if (capturedType == "fillet") {
+                                    auto rIt = capturedFeat["params"].find("radius");
+                                    newParams["length"] = (rIt != capturedFeat["params"].end())
+                                        ? *rIt : nlohmann::json({{"value", 1.0}});
+                                } else {
+                                    auto lIt = capturedFeat["params"].find("length");
+                                    newParams["radius"] = (lIt != capturedFeat["params"].end())
+                                        ? *lIt : nlohmann::json({{"value", 2.0}});
+                                }
+                                nlohmann::json newFeat = {
+                                    {"type", toType}, {"params", newParams},
+                                    {"refs", capturedFeat.value("refs", nlohmann::json::object())},
+                                };
+                                nlohmann::json addOp = {{"op", "add_feature"}, {"feature", newFeat}};
+                                if (!nextId.empty()) addOp["before"] = nextId;
+                                applyTreeOps(st, nlohmann::json::array({
+                                    {{"op", "delete_feature"}, {"id", capturedFid}, {"cascade", false}},
+                                    addOp}), "convert");
+                            };
+                        }
+
+                        RowCtx ctx;
+                        ctx.fid = fid; ctx.name = fname; ctx.type = ftype;
+                        ctx.iconName = featureIcon(ftype);
+                        ctx.iconFallback = featureFallback(ftype);
+                        ctx.suppressed = suppressed; ctx.selected = sel;
+                        ctx.rolledBack = rolledBack; ctx.fs = fs;
+                        ctx.ownerBodyCount = bodyCount(fid);
+                        ctx.nested = nested;
+                        ctx.canDoc = canDocTree;
+                        ctx.barAtEnd = barAtEnd;
+                        ctx.firstOwnedBody = firstBodyKey(fid);
+                        ctx.convertLabel = convertLabel; ctx.convertCb = convertCb;
+                        ctx.reorderCb = reorderCb;
+                        ctx.editCallback = &editCallback;
+
+                        RowResult rr = featureRow(ctx, st);
+
+                        // ---- rollback-bar drag hit-test (item 4) ----
+                        // While the bar is being dragged, find which row's gap the cursor is over so
+                        // the release can compute "after: <fid>". A line is drawn at that gap.
+                        if (s_rollbackDragging && !nested) {
+                            ImVec2 imn = ImGui::GetItemRectMin(), imx = ImGui::GetItemRectMax();
+                            float my = ImGui::GetIO().MousePos.y;
+                            if (my >= imn.y && my <= imx.y) {
+                                s_rbDropAfter = fid;  // drop the bar right after this feature
+                                ImGui::GetWindowDrawList()->AddLine(
+                                    ImVec2(imn.x, imx.y), ImVec2(imx.x, imx.y),
+                                    ui::Palette::toU32(pal.accent), 2.5f);
+                            } else if (my < imn.y && s_rbDropAfter.empty()) {
+                                // cursor above the first row → roll back before everything (to start)
+                                s_rbDropAfter = "\1start";
+                            }
+                        }
+
+                        // ---- selection / interaction handling ----
+                        if (rr.doubleClick) {
+                            selectedFeatureId = fid;
+                            s_multiSel.clear();
+                            selectFeatureInViewport(st, fid);
+                            if (ftype == "sketch") {
+                                if (st.sketchMode) st.sketchMode->enterForFeature(st, fid);
+                            } else if (editCallback) {
+                                editCallback(fid);
+                            }
+                        } else if (rr.ctrlClicked) {
+                            // Ctrl+click toggles this row in/out of the multi-set. The current
+                            // primary joins the set first (so the FIRST ctrl-click on a 2nd row keeps
+                            // both). Primary tracks the last-clicked; toggling the primary off moves
+                            // it to any remaining member (or clears).
+                            if (!selectedFeatureId.empty()) s_multiSel.insert(selectedFeatureId);
+                            if (s_multiSel.count(fid)) {
+                                s_multiSel.erase(fid);
+                                if (selectedFeatureId == fid) {
+                                    selectedFeatureId = s_multiSel.empty() ? std::string()
+                                                                           : *s_multiSel.begin();
+                                }
+                            } else {
+                                s_multiSel.insert(fid);
+                                selectedFeatureId = fid;
+                            }
+                            selectFeatureInViewport(st, selectedFeatureId);
+                        } else if (rr.clicked) {
+                            // Slow-double-click rename: a 2nd plain click on the already-primary row
+                            // within (0.4s, 2.0s) arms the inline editor.
+                            double now = ImGui::GetTime();
+                            bool armRename = (selectedFeatureId == fid && s_lastClickId == fid &&
+                                              s_lastClickTime > 0 &&
+                                              (now - s_lastClickTime) > 0.4 &&
+                                              (now - s_lastClickTime) < 2.0);
+                            selectedFeatureId = fid;
+                            s_multiSel.clear();
+                            selectFeatureInViewport(st, fid);
+                            if (armRename) {
+                                s_renamingId = fid;
+                                std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", fname.c_str());
+                                s_lastClickTime = -1.0;
+                            } else {
+                                s_lastClickId = fid;
+                                s_lastClickTime = now;
+                            }
+                        }
+                    };
+
+                    // fid the rollback bar currently sits AFTER (empty = end).
+                    std::string barFid = (!barAtEnd && barPos >= 0 && barPos < (int)order.size())
+                                       ? order[barPos] : std::string();
+
+                    // Reset the bar drop-target each frame the bar is being dragged; rows below set
+                    // it as the cursor passes over them. If no row claims it (cursor below the last
+                    // row), it stays empty → set_rollback{after:null} = bar at the end.
+                    if (s_rollbackDragging) s_rbDropAfter.clear();
+
+                    // ---- walk the feature list ----
+                    std::string openFolder;
+                    bool folderOpen = false;
+                    for (int i = 0; i < (int)feat->size(); ++i) {
+                        const auto& f = (*feat)[i];
+                        if (!f.is_object()) continue;
+                        std::string fid    = jfld(f, "id");
+                        std::string ftype  = jfld(f, "type");
+                        std::string folder = jfld(f, "folder");
+
+                        // Skip nested sketches in the flat pass — they render under their consumer.
+                        if (ftype == "sketch" && isNestedSketch(fid)) continue;
+
+                        // Folder grouping (C37-E item 2: ImGui id from the folder NAME, stable across
+                        // reorders, not a per-frame counter).
                         if (folder != openFolder) {
                             if (folderOpen) { ImGui::TreePop(); folderOpen = false; }
                             openFolder = folder;
@@ -882,115 +1457,39 @@ void drawFeatureTree(AppState& st,
                                 treeIcon("mates_folder", "[F]", 16.0f);
                                 ImGui::SameLine(0, 4);
                                 folderOpen = ImGui::TreeNodeEx(
-                                    (folder + "##fld" + std::to_string(folderIdx++)).c_str(),
+                                    (folder + "##fld_" + folder).c_str(),
                                     ImGuiTreeNodeFlags_DefaultOpen |
                                     ImGuiTreeNodeFlags_SpanFullWidth);
                             }
                         }
-                        // Hide rows whose folder is collapsed.
-                        if (!openFolder.empty() && !folderOpen) { ++idx; continue; }
+                        if (!openFolder.empty() && !folderOpen) continue;
 
-                        FStatus fs = getFeatureStatus(statusArr, fid);
-                        bool sel    = (selectedFeatureId == fid);
-                        bool dimmed = (selPos >= 0 && idx > selPos);  // "rolled back" look
+                        drawOneRow(f, /*nested=*/false);
 
-                        // Alternate row background
-                        if (idx % 2 == 0) {
-                            ImVec2 rowMin = ImGui::GetCursorScreenPos();
-                            ImVec2 rowMax(rowMin.x + ImGui::GetContentRegionAvail().x,
-                                          rowMin.y + ImGui::GetTextLineHeightWithSpacing());
-                            ImGui::GetWindowDrawList()->AddRectFilled(
-                                rowMin, rowMax,
-                                Palette::toU32(pal.treeRowAlt));
-                        }
-                        if (sel) {
-                            ImVec2 rowMin = ImGui::GetCursorScreenPos();
-                            ImVec2 rowMax(rowMin.x + ImGui::GetContentRegionAvail().x,
-                                          rowMin.y + ImGui::GetTextLineHeightWithSpacing());
-                            ImGui::GetWindowDrawList()->AddRectFilled(
-                                rowMin, rowMax,
-                                Palette::toU32(pal.treeRowSelected));
-                            // W1-B (item 7): a viewport pick that resolved to this feature requested
-                            // a scroll-to. Consume the one-shot so the selected row comes into view.
-                            if (st.treeScrollToSelection) {
-                                ImGui::SetScrollHereY(0.5f);
-                                st.treeScrollToSelection = false;
+                        // Nested-sketch children: render absorbed sketches indented under this row.
+                        auto kids = childrenOf.find(fid);
+                        if (kids != childrenOf.end()) {
+                            for (const auto& skId : kids->second) {
+                                for (const auto& sf : *feat)
+                                    if (sf.is_object() && jfld(sf, "id") == skId) {
+                                        drawOneRow(sf, /*nested=*/true);
+                                        break;
+                                    }
                             }
                         }
 
-                        // C27-C: convert fillet↔chamfer. Carry radius↔length + refs verbatim.
-                        // Position preserved: delete current, add_feature before the *next* id
-                        // (or omit "before" when this is the last feature).
-                        const char* convertLabel = nullptr;
-                        std::function<void()> convertCb = nullptr;
-                        bool isFillet  = (ftype == "fillet");
-                        bool isChamfer = (ftype == "chamfer");
-                        if (isFillet || isChamfer) {
-                            convertLabel = isFillet ? "Convert to Chamfer" : "Convert to Fillet";
-                            // Capture by value everything we need (f is a ref into the tree json
-                            // being iterated — must copy before the callback fires).
-                            nlohmann::json capturedFeat = f;        // deep copy
-                            std::string    capturedType = ftype;
-                            std::string    capturedFid  = fid;
-                            // Determine the id of the feature AFTER this one (for position).
-                            std::string nextId;
-                            {
-                                bool foundSelf = false;
-                                for (const auto& ff : *feat) {
-                                    if (!ff.is_object()) continue;
-                                    if (foundSelf) { nextId = jfld(ff, "id"); break; }
-                                    if (jfld(ff, "id") == fid) foundSelf = true;
-                                }
-                            }
-                            convertCb = [&st, capturedFeat, capturedType, capturedFid, nextId]() {
-                                std::string toType = (capturedType == "fillet") ? "chamfer" : "fillet";
-                                // Build params for the new feature: carry radius↔length.
-                                nlohmann::json newParams = nlohmann::json::object();
-                                if (capturedType == "fillet") {
-                                    // fillet -> chamfer: radius becomes length
-                                    auto rIt = capturedFeat["params"].find("radius");
-                                    newParams["length"] = (rIt != capturedFeat["params"].end())
-                                        ? *rIt : nlohmann::json({{"value", 1.0}});
-                                } else {
-                                    // chamfer -> fillet: length becomes radius
-                                    auto lIt = capturedFeat["params"].find("length");
-                                    newParams["radius"] = (lIt != capturedFeat["params"].end())
-                                        ? *lIt : nlohmann::json({{"value", 2.0}});
-                                }
-                                // Build new feature json (refs.edges carried verbatim).
-                                nlohmann::json newFeat = {
-                                    {"type",   toType},
-                                    {"params", newParams},
-                                    {"refs",   capturedFeat.value("refs", nlohmann::json::object())},
-                                };
-                                nlohmann::json addOp = {{"op", "add_feature"}, {"feature", newFeat}};
-                                if (!nextId.empty()) addOp["before"] = nextId;
-                                nlohmann::json ops = nlohmann::json::array({
-                                    {{"op", "delete_feature"}, {"id", capturedFid}, {"cascade", false}},
-                                    addOp,
-                                });
-                                applyTreeOps(st, ops, "convert");
-                            };
-                        }
-
-                        bool clicked = featureRow(
-                            fid, fname,
-                            featureIcon(ftype), featureFallback(ftype),
-                            suppressed, sel, dimmed,
-                            fs.ok, !fs.error.empty(), fs.error, fs.dangling,
-                            editCallback, reorderCb, st,
-                            convertLabel, convertCb);
-
-                        if (clicked) {
-                            selectedFeatureId = fid;
-                            highlightFeature(st, fid);
-                        }
-                        ++idx;
+                        // C37-E (item 4): draw the rollback bar inline right after the bar feature
+                        // (and its absorbed sketches) when it sits mid-history.
+                        if (!barFid.empty() && fid == barFid)
+                            drawRollbackBarLine(st, canDocTree, barFid);
                     }
                     if (folderOpen) { ImGui::TreePop(); folderOpen = false; }
+                    // Bar at the end → draw it after the last row.
+                    if (barAtEnd)
+                        drawRollbackBarLine(st, canDocTree, std::string());
 
                     // ---- Ctrl+Up / Ctrl+Down: move the selected feature among its siblings ----
-                    if (!selectedFeatureId.empty() &&
+                    if (canDocTree && !selectedFeatureId.empty() &&
                         ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
                         int p = -1;
                         for (int i = 0; i < (int)order.size(); ++i)
@@ -1007,38 +1506,34 @@ void drawFeatureTree(AppState& st,
                             }
                         }
                     }
-                }
-            }
 
-            // ---- Rollback bar ----
-            // C24: SolidWorks-style thin accent line with a centered grab handle, sitting at the
-            // end of the feature history. (Dragging is not wired — visual affordance only.)
-            {
-                ImGui::Dummy(ImVec2(0, 2));
-                ImVec2 r0 = ImGui::GetCursorScreenPos();
-                float w = ImGui::GetContentRegionAvail().x;
-                ImDrawList* rdl = ImGui::GetWindowDrawList();
-                float rsc = ui::uiScale;
-                float ly = r0.y + 3.0f * rsc;
-                rdl->AddLine(ImVec2(r0.x, ly), ImVec2(r0.x + w, ly),
-                             ui::Palette::toU32(pal.accentMid), 2.0f);
-                // grab handle (a small rounded tab centered on the line)
-                float hw = 18.0f * rsc, hh = 6.0f * rsc, hx = r0.x + (w - hw) * 0.5f;
-                rdl->AddRectFilled(ImVec2(hx, ly - hh * 0.5f), ImVec2(hx + hw, ly + hh * 0.5f),
-                                   ui::Palette::toU32(pal.accent), 3.0f);
-                ImGui::Dummy(ImVec2(w, hh + 4.0f * rsc));
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Rollback bar — drop a feature here to move it to the end");
-                // Drop target: moving a feature onto the rollback bar sends it to the end.
-                if (ImGui::BeginDragDropTarget()) {
-                    rdl->AddLine(ImVec2(r0.x, ly), ImVec2(r0.x + w, ly),
-                                 ui::Palette::toU32(pal.accent), 2.5f);
-                    if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("FEATURE_ROW")) {
-                        std::string dragged(static_cast<const char*>(pl->Data));
-                        applyTreeOps(st, nlohmann::json::array(
-                            {{{"op", "reorder_feature"}, {"id", dragged}}}), "reorder");
+                    // ---- Rollback bar drag release (C37-E item 4) ----
+                    // The bar is rendered inline above. When a bar drag ends, enqueue set_rollback
+                    // for the gap the cursor landed in: after the hovered feature, or null (= end)
+                    // when below the last row, or null/first when above (roll fully back ≈ start →
+                    // we encode "to start" as set_rollback{after: first feature} so at least the
+                    // first feature stays, matching SolidWorks' minimum-one rolled state... actually
+                    // SW allows rolling to the very top; we map "above first" to the first feature).
+                    if (s_rollbackDragging && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                        std::string target = s_rbDropAfter;
+                        nlohmann::json after = nullptr;   // default = end
+                        if (target == "\1start") {
+                            after = order.empty() ? nlohmann::json(nullptr)
+                                                  : nlohmann::json(order.front());
+                        } else if (!target.empty()) {
+                            // Dropping after the last feature = bar at end (null).
+                            if (!order.empty() && target == order.back()) after = nullptr;
+                            else after = target;
+                        }
+                        if (canDocTree)
+                            applyTreeOps(st, nlohmann::json::array({
+                                {{"op", "set_rollback"}, {"after", after}}}), "rollback");
+                        s_rollbackDragging = false;
+                        s_rbDropAfter.clear();
+                    } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                        // Mouse up without a drag in progress — clear stale hit state.
+                        s_rbDropAfter.clear();
                     }
-                    ImGui::EndDragDropTarget();
                 }
             }
 
@@ -1050,8 +1545,24 @@ void drawFeatureTree(AppState& st,
 
     ImGui::PopStyleColor();  // ChildBg
 
+    // C37-E (item 3): per-row "Appearance..." picker. The row's context menu stashed the target body
+    // key + a one-shot open flag; render the picker as a sibling popup (same pattern as the root
+    // node) and turn a commit into a set_appearance op on that body.
+    if (s_apprOpen && !s_apprBody.empty()) { ImGui::OpenPopup("##appearance_feat"); s_apprOpen = false; }
+    if (!s_apprBody.empty()) {
+        if (appearanceColorPicker("##appearance_feat", s_apprColor,
+                                  &s_apprMetallic, &s_apprRoughness)) {
+            applyTreeOps(st, nlohmann::json::array({
+                {{"op", "set_appearance"}, {"id", s_apprBody},
+                 {"color", {s_apprColor[0], s_apprColor[1], s_apprColor[2]}},
+                 {"metallic", s_apprMetallic}, {"roughness", s_apprRoughness}}}),
+                "set_appearance");
+            s_apprBody.clear();
+        }
+    }
+
     // ---- Save / Open path strip (the New/Undo/Redo/Save buttons live in the top toolbar now) ----
-    bool canDoc = st.workerStarted && !st.job.running.load();
+    bool canDoc = canDocTree;
     if (canDoc && st.docMirror.hasDoc()) {
         ImGui::Separator();
         static char savePath[512] = "";

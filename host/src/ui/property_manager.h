@@ -14,9 +14,11 @@
 //   - Combo / Check: enum / bool fields.
 //
 // Flow: ribbon cmd -> openForCommand() opens the form with defaults -> user edits ->
-//   live preview (debounced ~400 ms): add (first preview) or edit_feature -> viewport refresh.
-//   Cancel -> worker undo of every preview batch applied (count tracked). OK -> leave committed +
-//   tree refresh. Edit path -> openForEdit() populates from the feature's params/refs.
+//   live preview (debounced ~250 ms): add (first preview) or edit_feature -> viewport refresh.
+//   Cancel -> single doc_revert call (C37-F checkpoint/revert) replaces the old N-undo loop.
+//   OK -> leave committed + tree refresh. Edit path -> openForEdit() populates from params/refs.
+//
+// C37-F additions: checkpoint/revert cancel, keyboard policy, form polish, defensive fixes.
 #pragma once
 
 #include <functional>
@@ -179,10 +181,23 @@ private:
     std::string targetId_;         // feature id once it exists (add returns it; edit knows it)
     std::vector<PMField> fields_;
 
-    int previewBatches_ = 0;       // preview ops applied (for Cancel undo)
+    int previewBatches_ = 0;       // preview ops applied (fallback undo count if checkpoint failed)
     bool dirty_ = false;           // a field changed since last preview
     double lastEditTime_ = 0.0;    // ImGui::GetTime() of the last field change (debounce)
     bool firstPreviewDone_ = false;
+
+    // C37-F: checkpoint id taken at open (before any preview). Empty = checkpoint failed at open
+    // (fallback: undo loop). revert(checkpointId_) is the single cancel call.
+    std::string checkpointId_;
+
+    // C37-F: true when the first field in the form has received SetKeyboardFocusHere.
+    bool focusedOnOpen_ = false;
+
+    // C37-F: inline preview-error message shown in the PM body (cleared on next successful preview).
+    std::string previewError_;
+
+    // C37-F: true when we need to set keyboard focus on the first editable field next frame.
+    bool wantFocusFirstField_ = false;
 };
 
 }  // namespace ui

@@ -35,6 +35,12 @@ public:
     void draw(const Renderer::CameraXform& cam, const PickHit& hover,
               const std::vector<PickHit>& sel);
 
+    // C37-C: draw a set of faces with the feature-highlight tint (slightly dimmer than selection).
+    // Keys are (body_id<<32)|face_id matching st.featureHighlightFaces. Stale keys are silently
+    // skipped. Zero-cost when the vector is empty.
+    void drawFeatureHighlight(const Renderer::CameraXform& cam,
+                              const std::vector<uint64_t>& faceKeys);
+
 private:
     void destroy();
 
@@ -61,6 +67,8 @@ private:
 
     float hoverCol_[4] = {0.176f, 0.831f, 0.749f, 0.45f};      // teal wash
     float selCol_[4] = {1.000f, 0.620f, 0.180f, 0.55f};        // amber wash
+    // C37-C: feature-highlight color — slightly dimmer amber (same hue, lower alpha)
+    float featHlCol_[4] = {1.000f, 0.620f, 0.180f, 0.30f};
 };
 
 }  // namespace render

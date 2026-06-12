@@ -198,6 +198,33 @@ void Overlays::drawHit(const Renderer::CameraXform& cam, const PickHit& h, const
     }
 }
 
+// C37-C: draw a set of faces with the feature-highlight tint.
+void Overlays::drawFeatureHighlight(const Renderer::CameraXform& cam,
+                                    const std::vector<uint64_t>& faceKeys) {
+    if (faceKeys.empty() || !prog_) return;
+    glUseProgram(prog_);
+    glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, cam.mvp.m);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(-1.0f, -1.0f);
+    int colLoc = glGetUniformLocation(prog_, "uColor");
+    glUniform4fv(colLoc, 1, featHlCol_);
+    for (uint64_t key : faceKeys) {
+        uint32_t body_id  = (uint32_t)(key >> 32);
+        uint32_t face_id  = (uint32_t)(key & 0xFFFFFFFFu);
+        const FaceBuf* fb = findFace(body_id, face_id);
+        if (!fb) continue;  // stale key after rebuild — skip silently
+        glBindVertexArray(fb->vao);
+        glDrawElements(GL_TRIANGLES, fb->idxCount, GL_UNSIGNED_INT, 0);
+    }
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glDisable(GL_BLEND);
+    glBindVertexArray(0);
+}
+
 void Overlays::draw(const Renderer::CameraXform& cam, const PickHit& hover,
                     const std::vector<PickHit>& sel) {
     if (!prog_) return;

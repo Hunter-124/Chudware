@@ -268,6 +268,41 @@ std::string DocMirror::resolvePick(WorkerClient& w, uint32_t body_id,
     return {};
 }
 
+// C37-F: Checkpoint / revert helpers -----------------------------------------
+
+std::string DocMirror::checkpoint(WorkerClient& w) {
+    if (docId_.empty()) return {};
+    nlohmann::json res;
+    std::string err;
+    if (!w.call("doc_checkpoint", {{"doc_id", docId_}}, res, err)) return {};
+    if (res.contains("code")) return {};   // engine error — leave empty so PM falls back to undo loop
+    return jstr(res, "checkpoint");
+}
+
+OpsResponse DocMirror::revert(WorkerClient& w, const std::string& checkpointId) {
+    OpsResponse r;
+    if (docId_.empty() || checkpointId.empty()) {
+        r.error_code = "no_doc"; r.error_message = "no document or checkpoint"; return r;
+    }
+    nlohmann::json res;
+    std::string err;
+    if (!w.call("doc_revert", {{"doc_id", docId_}, {"checkpoint", checkpointId}}, res, err)) {
+        r.error_code = "transport"; r.error_message = err; return r;
+    }
+    if (res.contains("code")) {
+        r.error_code = jstr(res, "code"); r.error_message = jstr(res, "message"); return r;
+    }
+    r = parseOpsResponse(res);
+    if (r.ok) {
+        revision_ = r.revision;
+        if (!r.tree.is_null()) tree_ = r.tree;
+        if (!r.feature_status.is_null()) featureStatus_ = r.feature_status;
+        storeOwnerMap(r.owner_map);
+        notify();
+    }
+    return r;
+}
+
 bool DocMirror::save(WorkerClient& w, const std::string& path, std::string& err) {
     if (docId_.empty()) { err = "no document open"; return false; }
     nlohmann::json res;

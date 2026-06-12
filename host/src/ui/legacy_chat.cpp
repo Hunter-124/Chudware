@@ -378,7 +378,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             if (ImGui::CollapsingHeader("Activity")) {
                 ImGui::BeginChild("##inlineact", ImVec2(0, 220.0f * ui::uiScale),
                                   ImGuiChildFlags_Border);
-                static_cast<ui::ActivityPanel*>(st.activityPanel)->drawBody(st);
+                st.activityPanel->drawBody(st);
                 ImGui::EndChild();
                 if (ImGui::SmallButton("Open Activity panel")) st.showActivityPanel = true;
             }
@@ -493,7 +493,7 @@ static void submitTurn(AppState& st, const std::string& text) {
         st.agentV2Running = true;
         st.agentV2 = true;
         if (st.activityPanel)
-            static_cast<ui::ActivityPanel*>(st.activityPanel)->clearLive();
+            st.activityPanel->clearLive();
         launchAgentRunV2(st.worker, st.job, text, st.docMirror.docId());
     } else if (askMode && st.designStarted && !st.chat.empty()) {
         // Ask -> continue the session conversationally.

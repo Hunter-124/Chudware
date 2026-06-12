@@ -129,7 +129,7 @@ bool AsmPanels::insertComponent(AppState& st, const std::string& path,
 void AsmPanels::drawInsert(AppState& st) {
     if (!insertOpen_) return;
     bool open = true;
-    ImGui::SetNextWindowSize(ImVec2(380, 0), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(380 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (insertFocus_) { ImGui::SetNextWindowFocus(); insertFocus_ = false; }
     if (ImGui::Begin("Insert Component", &open)) {
         asmIcon("insert_component", "[+]"); ImGui::SameLine(0, 6);
@@ -250,7 +250,7 @@ void AsmPanels::drawMateForm(AppState& st) {
     if (!mateOpen_) return;
     const auto& pal = ui::palette;
     bool open = true;
-    ImGui::SetNextWindowSize(ImVec2(320, 0), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(320 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (mateFocus_) { ImGui::SetNextWindowFocus(); mateFocus_ = false; }
     if (ImGui::Begin("Mate##asm", &open)) {
         // header: icon + title + Add / Cancel (PM style)
@@ -385,7 +385,7 @@ bool AsmPanels::setExplode(AppState& st, bool active, float factor) {
 void AsmPanels::drawExplode(AppState& st) {
     if (!explodeOpen_) return;
     bool open = true;
-    ImGui::SetNextWindowSize(ImVec2(300, 0), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(300 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (explodeFocus_) { ImGui::SetNextWindowFocus(); explodeFocus_ = false; }
     if (ImGui::Begin("Exploded View", &open)) {
         asmIcon("exploded_view", "[X]"); ImGui::SameLine(0, 6);
@@ -437,7 +437,7 @@ void AsmPanels::drawInterference(AppState& st) {
     if (!interferenceOpen_) return;
     const auto& pal = ui::palette;
     bool open = true;
-    ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(420 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (interferenceFocus_) { ImGui::SetNextWindowFocus(); interferenceFocus_ = false; }
     if (ImGui::Begin("Interference Detection", &open)) {
         asmIcon("interference", "[!]"); ImGui::SameLine(0, 6);
@@ -544,7 +544,7 @@ void AsmPanels::refreshBom(AppState& st) {
 void AsmPanels::drawBom(AppState& st) {
     if (!bomOpen_) return;
     bool open = true;
-    ImGui::SetNextWindowSize(ImVec2(560, 0), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(560 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (bomFocus_) { ImGui::SetNextWindowFocus(); bomFocus_ = false; }
     if (ImGui::Begin("Bill of Materials", &open)) {
         asmIcon("bom", "[B]"); ImGui::SameLine(0, 6);

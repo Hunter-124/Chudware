@@ -205,7 +205,8 @@ def _resolve_params(params: Any, env: dict[str, float]) -> tuple[Any, dict[str, 
 
 def _status(fid: str, *, ok: bool, ms: float, error: str | None = None,
             resolved: dict | None = None, skipped: bool = False,
-            dangling_refs: list[str] | None = None) -> dict:
+            dangling_refs: list[str] | None = None,
+            rolled_back: bool = False) -> dict:
     return {
         "id": fid,
         "ok": ok,
@@ -214,6 +215,7 @@ def _status(fid: str, *, ok: bool, ms: float, error: str | None = None,
         "resolved": resolved or {},
         "skipped": skipped,
         "dangling_refs": dangling_refs or [],
+        "rolled_back": rolled_back,
     }
 
 
@@ -274,6 +276,19 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
 
     features = doc.get("features") or []
 
+    # --- rollback bar (SolidWorks semantics) -----------------------------
+    # doc["rollback_after"] = <feature_id> | null. Features AFTER the bar are NOT compiled; they get
+    # status "rolled_back" (distinct from an error — no error icon) and contribute no geometry. The
+    # bar is identified by a feature id; null (or a dangling id) means the bar is at the end. We
+    # compute the cut INDEX (number of features to actually compile) once up front.
+    rollback_after = doc.get("rollback_after")
+    rollback_cut = len(features)  # default: compile everything
+    if rollback_after:
+        for i, feat in enumerate(features):
+            if isinstance(feat, dict) and feat.get("id") == rollback_after:
+                rollback_cut = i + 1  # compile through (and including) the bar feature
+                break
+
     # --- context shared across features ----------------------------------
     bodies: list[Any] = []
     datums = reserved_datums()
@@ -299,10 +314,19 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
 
     prev_key = doc.get("schema", "aicad.part/1")
 
-    for feat in features:
+    for feat_index, feat in enumerate(features):
         fid = feat.get("id", "?")
         fname = feat.get("name", fid)
         t0 = time.perf_counter()
+
+        # Rollback bar: features at or beyond the cut are NOT compiled (geometry reflects only the
+        # prefix). They report status "rolled_back" (no error, no geometry) and do not advance the
+        # rolling cache key — so moving the bar forward later is a pure prefix-extension (the prefix
+        # keys are unchanged → cache hits) and the rolled-back tail stays out of the body list.
+        if feat_index >= rollback_cut:
+            result.feature_status.append(
+                _status(fid, ok=True, ms=0.0, rolled_back=True))
+            continue
 
         # Suppressed: skip, status ok/skipped, do not advance topology.
         if feat.get("suppressed"):

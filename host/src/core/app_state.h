@@ -26,9 +26,25 @@
 #include "selection.h"   // core::Selection (pulls render::PickHit; all GL-free headers)
 #include "doc_mirror.h"  // core::DocMirror (C16)
 
+#include "../ui/toast.h"    // W1-B: ToastLevel / Toast (toast queue lives on AppState)
+#include "../ui/cursors.h"  // W1-B: CursorKind (per-frame cursor request)
+
 struct GLFWwindow;
 class Renderer;
 namespace render { class IdPass; class Overlays; }
+
+// W1-B: typed subsystem forward declarations — AppState borrows these as proper typed pointers
+// (replacing the old opaque void* + static_cast<...> sites scattered across host/src). The full
+// class definitions stay in their own headers; AppState only needs the incomplete type for a
+// pointer member, so the headers are NOT pulled in here (app_state.h stays GL-light).
+namespace ui {
+class PropertyManager;
+class SketchMode;
+class SimPanel;
+class AsmPanels;
+class ActivityPanel;
+}  // namespace ui
+namespace core { class SimClient; }
 
 extern const char* kStarterCode;
 
@@ -261,6 +277,13 @@ struct AppState {
     // Status-bar hook: set to a human label like "Face 12 of Body1" on hover/selection change.
     std::string pickStatus;
 
+    // ---- W1-B: feature-tree selection state (moved out of feature_tree.cpp's file statics) ----
+    // The currently-selected feature id in the FeatureManager; the tree renders its row highlighted
+    // and (Wave-2) scrolls to it. A viewport pick that resolves to a feature owner sets these so the
+    // tree row highlights/scrolls to follow the 3D selection (item 7). Cleared on every doc change.
+    std::string selectedFeatureId;
+    bool treeScrollToSelection = false;  // one-shot: tree should scroll the selected row into view
+
     // C26-C: per-face normal + centroid cache, filled during loadDocMesh while the DocMesh is in
     // memory. Key = (body_id << 32) | face_id (matches PickHit body_id / topo_id exactly).
     // Value = {nx, ny, nz, cx, cy, cz} — area-weighted average face normal + face centroid (world).
@@ -271,6 +294,32 @@ struct AppState {
     // Value = {cx, cy, cz} — mean of the edge polyline points (world). Used to anchor in-viewport
     // parameter callouts to a filleted/chamfered edge when the PM selector lacks a centroid.
     std::unordered_map<uint64_t, std::array<float, 3>> edgeCentroidCache;
+
+    // ---- W1-B (item 8): axis-aligned bounding-box caches for Zoom-to-Selection (Wave-2). ----
+    // Filled in loadDocMesh from the same DocMesh in memory. Plain float arrays keep memory sane.
+    // bodyBBoxCache: key body_id -> {minX,minY,minZ, maxX,maxY,maxZ} (world).
+    std::unordered_map<uint32_t, std::array<float, 6>> bodyBBoxCache;
+    // faceBBoxCache: key (body_id<<32)|face_id -> {minX,minY,minZ, maxX,maxY,maxZ} (world), built
+    // from each face's triangle range. Empty for faces with no triangles.
+    std::unordered_map<uint64_t, std::array<float, 6>> faceBBoxCache;
+
+    // ---- Wave-2 shared UI state (cross-panel contracts; each field has one writer + one reader) ----
+    // True while SketchMode runs the SolidWorks-style "pick a plane to start the sketch" step.
+    // Writer: sketch_mode. Readers: viewport_panel (force-show origin planes, suppress its own
+    // click-pick/selection handling, keep calling drawOverlay even though no sketch is active yet).
+    bool sketchPlanePickActive = false;
+
+    // Faces to tint with the selection highlight because their owning feature is selected in the
+    // FeatureManager tree. Keys = (body_id<<32)|face_id. Writer: feature_tree (on row click, from
+    // DocMirror owner map). Reader: viewport_panel/overlays render pass. Cleared on doc change.
+    std::vector<uint64_t> featureHighlightFaces;
+
+    // One-shot camera request: animate to frame this world-space AABB ("Zoom to Selection" /
+    // tree "Zoom to Feature"). Writers: feature_tree, viewport context menu. Reader: viewport_panel
+    // (consumes the flag, computes zoom/pan from the box, calls requestCameraAnimation).
+    bool  zoomToBBoxRequested = false;
+    float zoomToBBoxMin[3] = {0, 0, 0};
+    float zoomToBBoxMax[3] = {0, 0, 0};
 
     // ---- settings + system-prompt editor buffer ----
     Settings settings;
@@ -354,12 +403,13 @@ struct AppState {
     bool showFeatureTree = true;   // View > FeatureManager (C16)
 
     // ---- PropertyManager (C17) — occupies the tree dock slot while a command is active ----
-    // Opaque pointer so app_state.h stays free of the ui/property_manager.h include (kept GL-light).
-    void* propertyManager = nullptr;   // ui::PropertyManager* (owned by run_gui)
+    // W1-B: typed pointer (forward-declared above) so app_state.h stays free of the heavy
+    // ui/property_manager.h include while every borrow site drops its static_cast.
+    ui::PropertyManager* propertyManager = nullptr;   // owned by run_gui
 
     // ---- C19: simulation + result-overlay UI state ----
-    void* simClient = nullptr;         // core::SimClient* (owned by run_gui; opaque to stay light)
-    void* simPanel = nullptr;          // ui::SimPanel* (owned by run_gui)
+    core::SimClient* simClient = nullptr;  // owned by run_gui
+    ui::SimPanel*    simPanel   = nullptr;  // owned by run_gui
     bool showSimPanel = false;         // Simulation dock visibility
     bool colormapOn = false;           // result colormap toggle (mirrors renderer state)
     bool docMeshHasScalar = false;     // the loaded overlay carries a per-vertex scalar
@@ -373,13 +423,13 @@ struct AppState {
     bool wantEvalMass = false;  // C19: AI_CAD_SHOT=evalmass mass-properties window
     bool evalMassShotDone = false;
 
-    // ---- SketchMode (C18) — in-sketch tools/overlay; opaque like the PropertyManager ----
-    void* sketchMode = nullptr;        // ui::SketchMode* (owned by run_gui)
+    // ---- SketchMode (C18) — in-sketch tools/overlay; typed like the PropertyManager (W1-B) ----
+    ui::SketchMode* sketchMode = nullptr;  // owned by run_gui
     bool wantSketch = false;           // AI_CAD_SHOT=sketch scripted flow
     bool sketchShotDone = false;       // guard so the sketch scenario runs once per shot
 
-    // ---- AsmPanels (C20b) — assembly windows/forms; opaque like the PropertyManager ----
-    void* asmPanels = nullptr;         // ui::AsmPanels* (owned by run_gui)
+    // ---- AsmPanels (C20b) — assembly windows/forms; typed like the PropertyManager (W1-B) ----
+    ui::AsmPanels* asmPanels = nullptr;  // owned by run_gui
     bool wantAsm = false;              // AI_CAD_SHOT=asm scripted assembly flow
     bool asmShotDone = false;          // guard so the asm scenario runs once per shot
 
@@ -387,7 +437,7 @@ struct AppState {
     bool showActivityPanel = false;         // View > Activity window (hidden until a run/View toggle opens it)
     bool agentV2 = true;                    // "Use orchestrator (v2)" checkbox in Design panel
     std::string pendingPromptRole;          // when non-empty, Settings > Agents tab opens on this role
-    void* activityPanel = nullptr;          // ui::ActivityPanel* (owned by run_gui; opaque here)
+    ui::ActivityPanel* activityPanel = nullptr;  // owned by run_gui (W1-B: typed)
     // Live status line for the v2 orchestrator run, shown in the chat area
     std::string agentV2Status;              // e.g. "PLAN > planner attempt 1..."
     bool agentV2Running = false;            // a v2 run is in flight (blocks concurrent runs)
@@ -408,11 +458,25 @@ struct AppState {
     bool wantActivity = false;  // C22b: AI_CAD_SHOT=activity scripted orchestrator run + activity panel
     bool activityShotDone = false; // guard so the activity scenario runs exactly once
 
+    // ---- W1-B: toast notification queue (rendered by ui::drawToasts in app.cpp) ----
+    std::vector<ui::Toast> toasts;
+
+    // ---- W1-B: per-frame cursor request (consumed by ui::applyCursorRequest at end of frame) ----
+    ui::CursorKind cursorRequest = ui::CursorKind::Default;
+    bool imguiCursorSuspended = false;  // tracks whether we toggled NoMouseCursorChange last frame
+
     // ---- the run_gui lambdas, now methods ----
     void addLog(const std::string& s);
     void startSetup(bool force);
     void tryStartWorker();
     void showPartMesh(int sel);
+
+    // W1-B: post a transient toast. Trivially callable from any TU that includes app_state.h.
+    // Caps the queue so a storm of errors can't grow it unbounded (drawToasts also limits visible).
+    void toast(ui::ToastLevel level, std::string msg);
+
+    // W1-B: request a non-default cursor for THIS frame. The last request before end-of-frame wins.
+    void requestCursor(ui::CursorKind k) { cursorRequest = k; }
 
     // Load an AICM tessellation file into the id pass + overlays (and clear the selection).
     // Requires a current GL context and st.idPass/st.overlays to be set. Returns false on
@@ -427,4 +491,12 @@ struct AppState {
 
     // Build the "Face 12 of Body1" status label for a pick (empty string for an invalid hit).
     std::string pickLabel(const render::PickHit& h) const;
+
+    // W1-B (item 4): the single undo/redo entry point. Both the FeatureManager toolbar buttons and
+    // the global Ctrl+Z / Ctrl+Y keys route through here, so behavior stays identical. Performs the
+    // DocMirror mutation, refreshes the viewport mesh + owner map on success, logs, and posts a
+    // brief confirmation toast ("Undo: ok" / "Undo: nothing to undo"). Returns the response so the
+    // caller can branch further if it wants. No-op (returns a no_doc response) when no doc is open.
+    core::OpsResponse docUndo();
+    core::OpsResponse docRedo();
 };

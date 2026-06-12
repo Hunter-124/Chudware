@@ -34,8 +34,47 @@ OpsResponse DocMirror::parseOpsResponse(const nlohmann::json& result) {
         r.aicm_path = jstr(result["tess"], "aicm_path");
     if (result.contains("id_map") && result["id_map"].is_object())
         r.id_map = result["id_map"];   // C17: add-feature flows find their new id here
+    if (result.contains("owner_map") && result["owner_map"].is_object())
+        r.owner_map = result["owner_map"];  // W1-B (item 6): feature -> owned topology (optional)
     r.ok = true;
     return r;
+}
+
+// ---- W1-B (item 6): owner-map storage + reverse-index build ----
+// Tolerant of absence: a missing/null/non-object owner_map clears the maps (lookups then no-op).
+void DocMirror::storeOwnerMap(const nlohmann::json& ownerMapJson) {
+    ownerMap_.clear();
+    faceOwner_.clear();
+    edgeOwner_.clear();
+    bodyOwners_.clear();
+    if (!ownerMapJson.is_object()) return;  // engine hasn't shipped it yet — fine.
+    auto pairList = [](const nlohmann::json& arr,
+                       std::vector<std::pair<uint32_t, uint32_t>>& out) {
+        if (!arr.is_array()) return;
+        for (const auto& e : arr) {
+            if (e.is_array() && e.size() == 2 && e[0].is_number_integer() &&
+                e[1].is_number_integer())
+                out.emplace_back((uint32_t)e[0].get<long long>(), (uint32_t)e[1].get<long long>());
+        }
+    };
+    for (auto it = ownerMapJson.begin(); it != ownerMapJson.end(); ++it) {
+        const std::string& fid = it.key();
+        const nlohmann::json& o = it.value();
+        if (!o.is_object()) continue;
+        Owned owned;
+        if (auto b = o.find("bodies"); b != o.end() && b->is_array())
+            for (const auto& e : *b)
+                if (e.is_number_integer()) owned.bodies.push_back((uint32_t)e.get<long long>());
+        if (auto f = o.find("faces"); f != o.end()) pairList(*f, owned.faces);
+        if (auto e = o.find("edges"); e != o.end()) pairList(*e, owned.edges);
+        // reverse indices
+        for (uint32_t body : owned.bodies) bodyOwners_[body].push_back(fid);
+        for (const auto& bf : owned.faces)
+            faceOwner_[((uint64_t)bf.first << 32) | (uint64_t)bf.second] = fid;
+        for (const auto& be : owned.edges)
+            edgeOwner_[((uint64_t)be.first << 32) | (uint64_t)be.second] = fid;
+        ownerMap_.emplace(fid, std::move(owned));
+    }
 }
 
 // ---- resync on stale_revision ----
@@ -52,6 +91,12 @@ bool DocMirror::resyncTree(WorkerClient& w) {
         if (rb.contains("feature_status") && rb["feature_status"].is_array())
             featureStatus_ = rb["feature_status"];
     }
+    // W1-B (item 6): doc_tree may carry owner_map (top-level or under rebuild); refresh if present.
+    if (res.contains("owner_map") && res["owner_map"].is_object())
+        storeOwnerMap(res["owner_map"]);
+    else if (res.contains("rebuild") && res["rebuild"].is_object() &&
+             res["rebuild"].contains("owner_map") && res["rebuild"]["owner_map"].is_object())
+        storeOwnerMap(res["rebuild"]["owner_map"]);
     return true;
 }
 
@@ -140,6 +185,8 @@ OpsResponse DocMirror::applyOps(WorkerClient& w, const nlohmann::json& ops) {
                         jint(res.value("detail", nlohmann::json::object()), "current_revision"));
             std::fflush(stdout);
             resyncTree(w);
+            if (staleResyncCb_) staleResyncCb_();  // W1-B: surface a toast — action was discarded
+            notify();                              // repaint the tree at the resynced revision
         }
         return r;
     }
@@ -148,6 +195,7 @@ OpsResponse DocMirror::applyOps(WorkerClient& w, const nlohmann::json& ops) {
         revision_ = r.revision;
         if (!r.tree.is_null()) tree_ = r.tree;
         if (!r.feature_status.is_null()) featureStatus_ = r.feature_status;
+        storeOwnerMap(r.owner_map);  // W1-B: refresh owner map (tolerates absence)
         notify();
     }
     return r;
@@ -169,6 +217,7 @@ OpsResponse DocMirror::undo(WorkerClient& w) {
         revision_ = r.revision;
         if (!r.tree.is_null()) tree_ = r.tree;
         if (!r.feature_status.is_null()) featureStatus_ = r.feature_status;
+        storeOwnerMap(r.owner_map);  // W1-B
         notify();
     }
     return r;
@@ -190,6 +239,7 @@ OpsResponse DocMirror::redo(WorkerClient& w) {
         revision_ = r.revision;
         if (!r.tree.is_null()) tree_ = r.tree;
         if (!r.feature_status.is_null()) featureStatus_ = r.feature_status;
+        storeOwnerMap(r.owner_map);  // W1-B
         notify();
     }
     return r;

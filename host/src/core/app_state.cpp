@@ -25,6 +25,8 @@
 #include "../render/id_pass.h"
 #include "../render/overlays.h"
 
+#include "../ui/feature_tree.h"  // W1-B: ui::featureTreeResetTransient (clear tree statics on doc change)
+
 const char* kStarterCode =
     "# build123d is imported. Assign the final solid to `result`.\n"
     "with BuildPart() as p:\n"
@@ -218,6 +220,55 @@ void freeChatTextures(std::vector<ChatMsg>& chat) {
 void AppState::addLog(const std::string& s) {
     log.push_back(s);
     if (log.size() > 500) log.erase(log.begin());
+}
+
+// W1-B: post a transient toast. born is filled by drawToasts on the first frame it's seen (we can't
+// reach ImGui's clock from here cheaply), so we leave born=0 and let drawToasts stamp it.
+void AppState::toast(ui::ToastLevel level, std::string msg) {
+    ui::Toast t;
+    t.level = level;
+    t.msg = std::move(msg);
+    t.born = 0.0;  // 0 = unstamped; drawToasts stamps it with ImGui::GetTime() on first sight
+    t.ttl = ui::toastTtl(level);
+    toasts.push_back(std::move(t));
+    // Cap the backing queue so an error storm can't grow it without bound (drawToasts shows <= 5).
+    if (toasts.size() > 32) toasts.erase(toasts.begin(), toasts.begin() + (toasts.size() - 32));
+}
+
+// W1-B (item 4): shared undo/redo. Both the tree toolbar and the global keys call these.
+core::OpsResponse AppState::docUndo() {
+    core::OpsResponse r = docMirror.undo(worker);
+    if (r.ok) {
+        addLog("[doc] undo  rev=" + std::to_string(r.revision));
+        if (!r.aicm_path.empty()) { std::string le; loadDocMesh(r.aicm_path, le); }
+        toast(ui::ToastLevel::Info, "Undo: ok");
+    } else {
+        // doc_undo with an empty stack reports a benign error code; treat it as "nothing to undo".
+        bool nothing = r.error_code == "nothing_to_undo" || r.error_code == "no_history" ||
+                       r.error_code == "empty_stack";
+        addLog("[doc] undo: " + (r.error_message.empty() ? r.error_code : r.error_message));
+        toast(nothing ? ui::ToastLevel::Info : ui::ToastLevel::Warn,
+              nothing ? "Undo: nothing to undo"
+                      : ("Undo failed: " + (r.error_message.empty() ? r.error_code : r.error_message)));
+    }
+    return r;
+}
+
+core::OpsResponse AppState::docRedo() {
+    core::OpsResponse r = docMirror.redo(worker);
+    if (r.ok) {
+        addLog("[doc] redo  rev=" + std::to_string(r.revision));
+        if (!r.aicm_path.empty()) { std::string le; loadDocMesh(r.aicm_path, le); }
+        toast(ui::ToastLevel::Info, "Redo: ok");
+    } else {
+        bool nothing = r.error_code == "nothing_to_redo" || r.error_code == "no_history" ||
+                       r.error_code == "empty_stack";
+        addLog("[doc] redo: " + (r.error_message.empty() ? r.error_code : r.error_message));
+        toast(nothing ? ui::ToastLevel::Info : ui::ToastLevel::Warn,
+              nothing ? "Redo: nothing to redo"
+                      : ("Redo failed: " + (r.error_message.empty() ? r.error_code : r.error_message)));
+    }
+    return r;
 }
 
 // Provision (force=false) or repair (force=true) the runtime on a background thread.
@@ -446,6 +497,47 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err) {
         }
     }
 
+    // W1-B (item 8): per-body and per-face axis-aligned bounding-box caches for Zoom-to-Selection.
+    // Built from the same in-memory DocMesh positions; consumed by a later wave's zoom-to-fit.
+    bodyBBoxCache.clear();
+    faceBBoxCache.clear();
+    for (const auto& b : doc.bodies) {
+        if (b.pos.empty()) continue;
+        // Body bbox: sweep all positions.
+        float bmn[3] = {1e30f, 1e30f, 1e30f}, bmx[3] = {-1e30f, -1e30f, -1e30f};
+        for (size_t i = 0; i + 2 < b.pos.size(); i += 3) {
+            for (int c = 0; c < 3; ++c) {
+                float v = b.pos[i + c];
+                if (v < bmn[c]) bmn[c] = v;
+                if (v > bmx[c]) bmx[c] = v;
+            }
+        }
+        bodyBBoxCache[b.body_id] = {bmn[0], bmn[1], bmn[2], bmx[0], bmx[1], bmx[2]};
+        // Per-face bbox: sweep the vertices referenced by each face's triangle range.
+        if (b.idx.empty() || b.faces.empty()) continue;
+        for (const auto& fr : b.faces) {
+            if (fr.tri_count == 0) continue;
+            float fmn[3] = {1e30f, 1e30f, 1e30f}, fmx[3] = {-1e30f, -1e30f, -1e30f};
+            bool any = false;
+            for (uint32_t t = 0; t < fr.tri_count; ++t) {
+                size_t base = (size_t)(fr.first_tri + t) * 3;
+                if (base + 2 >= b.idx.size()) break;
+                for (int k = 0; k < 3; ++k) {
+                    uint32_t vi = b.idx[base + k];
+                    const float* p = &b.pos[(size_t)vi * 3];
+                    for (int c = 0; c < 3; ++c) {
+                        if (p[c] < fmn[c]) fmn[c] = p[c];
+                        if (p[c] > fmx[c]) fmx[c] = p[c];
+                    }
+                    any = true;
+                }
+            }
+            if (!any) continue;
+            uint64_t key = ((uint64_t)b.body_id << 32) | (uint64_t)fr.face_id;
+            faceBBoxCache[key] = {fmn[0], fmn[1], fmn[2], fmx[0], fmx[1], fmx[2]};
+        }
+    }
+
     selection.clear();
     hover = render::PickHit{};
     pickStatus.clear();
@@ -462,6 +554,19 @@ void AppState::clearViewportForNewDoc() {
     modelInfo.clear();
     faceNormalCache.clear();
     edgeCentroidCache.clear();
+    bodyBBoxCache.clear();
+    faceBBoxCache.clear();
+    // W1-B (item 5): drop the tree's selection + in-progress rename/pending-op transients so a fresh
+    // doc starts clean (the selection state now lives here; the rename buffer in feature_tree.cpp is
+    // cleared via the exposed reset hook).
+    selectedFeatureId.clear();
+    treeScrollToSelection = false;
+    ui::featureTreeResetTransient();
+    // Wave-2 shared UI state: a fresh doc cancels any plane-pick step, tree-driven face highlight,
+    // and pending zoom-to-bbox request.
+    sketchPlanePickActive = false;
+    featureHighlightFaces.clear();
+    zoomToBBoxRequested = false;
 }
 
 std::string AppState::pickLabel(const render::PickHit& h) const {

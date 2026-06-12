@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,8 @@
 #include "ui/ribbon_def.h"
 #include "ui/property_manager.h"
 #include "ui/sketch_mode.h"   // C18
+#include "ui/toast.h"         // W1-B: toast notifications
+#include "ui/cursors.h"       // W1-B: cursor manager
 // --- C19: simulation + flow + evaluate UI ---
 #include "core/sim_client.h"
 #include "ui/sim_panel.h"
@@ -141,6 +144,9 @@ int run_gui(const char* screenshotPath) {
 
     // C14: load icon atlases (stb_image; must be after GL context is live).
     ui::loadIcons(assets);
+
+    // W1-B: create the GLFW standard cursors once (consumed per-frame via st.requestCursor).
+    ui::initCursors(win);
 
     // C17: the ribbon callback (PM dispatcher) is registered after AppState is created so it can
     // capture &st and the PropertyManager (see below). C14's default printf handler is replaced.
@@ -263,7 +269,7 @@ int run_gui(const char* screenshotPath) {
             // C20b: while the Mate form is open, assembly picks resolve via the asm path
             // (doc_resolve_pick returns {selector, component}) and route into the active well.
             if (st.asmPanels) {
-                auto* ap = static_cast<ui::AsmPanels*>(st.asmPanels);
+                auto* ap = st.asmPanels;
                 if (ap->mateFormActive()) {
                     std::string comp;
                     std::string asel = st.docMirror.resolvePickAsm(
@@ -284,11 +290,31 @@ int run_gui(const char* screenshotPath) {
             if (!sel.empty()) {
                 item.selector = sel;
                 item.pending_resolve = false;
+                // W1-B (item 7): viewport->tree sync. Resolve the pick's owning feature via the
+                // DocMirror owner map and select it in the FeatureManager so its row highlights and
+                // (Wave-2) scrolls into view. Faces/edges use ownerOfFace/ownerOfEdge; a body pick
+                // (or a face whose owner is unknown) falls back to the body's first owner. TOLERANT
+                // of an empty owner map (engine hasn't shipped it) — then we leave the tree alone.
+                {
+                    std::string owner;
+                    if (item.hit.kind == render::PickKind::Face)
+                        owner = st.docMirror.ownerOfFace(item.hit.body_id, item.hit.topo_id);
+                    else if (item.hit.kind == render::PickKind::Edge)
+                        owner = st.docMirror.ownerOfEdge(item.hit.body_id, item.hit.topo_id);
+                    if (owner.empty()) {
+                        auto owners = st.docMirror.ownerOfBody(item.hit.body_id);
+                        if (!owners.empty()) owner = owners.back();  // most-recent feature on the body
+                    }
+                    if (!owner.empty()) {
+                        st.selectedFeatureId = owner;
+                        st.treeScrollToSelection = true;
+                    }
+                }
                 // C17: route the freshly resolved pick into the active PropertyManager well
                 // (filtered by the well's allowed kinds). Consumed picks do not affect the
                 // viewport highlight set beyond their normal selection role.
                 if (st.propertyManager) {
-                    auto* pm = static_cast<ui::PropertyManager*>(st.propertyManager);
+                    auto* pm = st.propertyManager;
                     if (pm->active()) {
                         try {
                             nlohmann::json selObj = nlohmann::json::parse(sel);
@@ -309,6 +335,17 @@ int run_gui(const char* screenshotPath) {
         // the tree panel auto-updates from docMirror.tree() on the next frame.
         // We log the new revision for observability.
         st.addLog("[doc] tree updated  rev=" + std::to_string(st.docMirror.revision()));
+    });
+
+    // W1-B (item 2/11): route otherwise-silent failures into the toast system.
+    //  - WorkerClient transport errors (timeout / closed pipe) from ANY call site (77 of them),
+    //    incl. ones owned by other modules — they all share this one client.
+    //  - DocMirror stale_revision auto-resync — the user's action was discarded; tell them.
+    st.worker.setErrorSink([&st](const std::string& method, const std::string& err) {
+        st.toast(ui::ToastLevel::Error, "Worker error (" + method + "): " + err);
+    });
+    st.docMirror.setStaleResyncCallback([&st]() {
+        st.toast(ui::ToastLevel::Warn, "Model changed — action was discarded, try again");
     });
 
     // ---------- runtime + worker ----------
@@ -568,7 +605,7 @@ int run_gui(const char* screenshotPath) {
                         try {
                             nlohmann::json data = nlohmann::json::parse(e.text);
                             if (st.activityPanel) {
-                                auto* ap = static_cast<ui::ActivityPanel*>(st.activityPanel);
+                                auto* ap = st.activityPanel;
                                 ap->onEvent(orchKind, data);
                             }
                         } catch (...) {}
@@ -634,18 +671,22 @@ int run_gui(const char* screenshotPath) {
                     if (st.worker.call("doc_rebuild",
                                        {{"doc_id", st.docMirror.docId()}},
                                        rebuildResult, rerr2, 60000)) {
-                        // Update mirror revision/tree from the rebuild response
-                        int newRev = rebuildResult.value("revision", -1);
-                        (void)newRev;  // DocMirror handles this via listener
+                        // W1-B (item 6): STALENESS FIX. The old code reloaded the mesh from the
+                        // rebuild's aicm_path but never resynced the mirror's tree/revision, so the
+                        // FeatureManager still showed the PRE-run features. Resync now (doc_tree)
+                        // which pulls the new tree + revision + owner map and fires the listener so
+                        // the tree repaints with the features the agent actually produced.
+                        st.docMirror.resync(st.worker);
                         std::string aicmPath = rebuildResult.value("aicm_path", "");
                         if (!aicmPath.empty()) {
                             std::string le;
                             st.loadDocMesh(aicmPath, le);
                         }
-                        st.addLog("[v2] doc_rebuild after run: rev=" +
+                        st.addLog("[v2] doc_rebuild + resync after run: rev=" +
                                   std::to_string(st.docMirror.revision()));
                     } else {
                         st.addLog("[err] doc_rebuild after v2 run: " + rerr2);
+                        st.toast(ui::ToastLevel::Error, "Agent run finished but the model couldn't refresh");
                     }
                 }
             }
@@ -675,6 +716,7 @@ int run_gui(const char* screenshotPath) {
                 st.statusKind = 2;
                 std::string e = st.job.error.substr(0, 300);
                 st.addLog("[err] " + e);
+                st.toast(ui::ToastLevel::Error, "System error: " + errSummary(st.job.error));  // W1-B
                 assistantErr = ERR_SYSTEM;
                 // A missing Python module means the venv is incomplete — auto-repair once.
                 bool missingModule = st.job.error.find("ModuleNotFoundError") != std::string::npos ||
@@ -832,9 +874,11 @@ int run_gui(const char* screenshotPath) {
                 const char* repo = std::getenv("AI_CAD_REPO");
                 std::string base = repo ? std::string(repo) : std::string(".");
                 m1SavePath = base + "\\scratch\\m1_shots";
-                // best-effort mkdir (ignore errors; the dir usually exists)
-                std::string mk = "scratch\\m1_shots";
-                (void)mk;
+                // W1-B (item 12): create the output dir robustly. The old code left a dead `mk`
+                // variable and never actually created the dir, so captures silently failed when it
+                // was missing; an earlier ad-hoc string join also produced the malformed stray dir
+                // `CUsers...scratch` in the repo root. Use std::filesystem on the joined path.
+                std::error_code ec; std::filesystem::create_directories(m1SavePath, ec);
             }
             auto loadMesh = [&](const core::OpsResponse& r) {
                 if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
@@ -1043,13 +1087,14 @@ int run_gui(const char* screenshotPath) {
         // Hold the scenario for a few frames so the dockspace builds + docks the panels before the
         // first (step-0) capture; otherwise the first screenshot lands before the layout exists.
         if (st.wantSketch && st.workerStarted && !st.sketchShotDone && st.frame >= 5) {
-            auto* sk = static_cast<ui::SketchMode*>(st.sketchMode);
+            auto* sk = st.sketchMode;
             static bool skDirReady = false;
             if (!skDirReady) {
                 skDirReady = true;
                 const char* repo = std::getenv("AI_CAD_REPO");
                 std::string base = repo ? std::string(repo) : std::string(".");
                 skSavePath = base + "\\scratch\\sketch_shots";
+                std::error_code ec; std::filesystem::create_directories(skSavePath, ec);  // W1-B (item 12)
             }
             auto applyOne = [&](const nlohmann::json& op) -> core::OpsResponse {
                 return st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
@@ -1175,7 +1220,7 @@ int run_gui(const char* screenshotPath) {
         static std::string asmSavePath, asmBasePath, asmPegPath, asmDoc, asmK2;
         static double asmSolvedZ = -999.0;
         if (st.wantAsm && st.workerStarted && !st.asmShotDone && st.frame >= 5) {
-            auto* ap = static_cast<ui::AsmPanels*>(st.asmPanels);
+            auto* ap = st.asmPanels;
             static bool asmDirReady = false;
             if (!asmDirReady) {
                 asmDirReady = true;
@@ -1184,6 +1229,7 @@ int run_gui(const char* screenshotPath) {
                 asmSavePath = base + "\\scratch\\asm_shots";
                 asmBasePath = asmSavePath + "\\base.step+";
                 asmPegPath  = asmSavePath + "\\peg.step+";
+                std::error_code ec; std::filesystem::create_directories(asmSavePath, ec);  // W1-B (item 12)
             }
             // Helper: author a part via raw worker calls (doc_new part -> apply_ops -> save -> close).
             auto dim = [](double v) { return nlohmann::json{{"value", v}, {"expr", nullptr}}; };
@@ -1362,7 +1408,7 @@ int run_gui(const char* screenshotPath) {
         // steel (index 0), density 0.4 -> wait for completion (cap ~90 s) -> von Mises colormap.
         static int feaStep = 0, feaSettle = 0, feaWaitFrames = 0;
         if (st.wantFea && st.workerStarted && !st.feaShotDone) {
-            auto* sim = static_cast<core::SimClient*>(st.simClient);
+            auto* sim = st.simClient;
             simPanel.tick(st);  // pump the panel so completion lands while we wait
             if (feaSettle > 0) { --feaSettle; }
             else switch (feaStep) {
@@ -1491,6 +1537,7 @@ int run_gui(const char* screenshotPath) {
                 const char* repo = std::getenv("AI_CAD_REPO");
                 std::string base = repo ? std::string(repo) : std::string(".");
                 actSavePath = base + "\\scratch\\activity_shots";
+                std::error_code ec; std::filesystem::create_directories(actSavePath, ec);  // W1-B (item 12)
             }
             const int kSettle = 4;
             if (actSettle > 0) { --actSettle; }
@@ -1556,6 +1603,30 @@ int run_gui(const char* screenshotPath) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
+
+        // ---------- W1-B (item 4): global Undo / Redo keys ----------
+        // Ctrl+Z = undo, Ctrl+Y / Ctrl+Shift+Z = redo. Routed through the SAME AppState helper the
+        // FeatureManager toolbar buttons use (mesh refresh + owner map + confirmation toast).
+        // Guards:
+        //   - skip while a text field has focus (the field owns Ctrl+Z for its own edit history),
+        //   - skip while a sketch is active (sketch mode owns in-sketch undo in a later wave),
+        //   - skip while a background job / v2 agent run is in flight (same canDoc gate the toolbar
+        //     uses), so we never mutate the doc under a running worker call.
+        {
+            const bool canDoc = st.workerStarted && !st.job.running.load() && !st.agentV2Running;
+            const bool textFocus = io.WantTextInput;
+            const bool inSketchNow = sketchMode.active();
+            if (canDoc && !textFocus && !inSketchNow && st.docMirror.hasDoc() &&
+                (io.KeyCtrl || io.KeySuper)) {
+                if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+                    st.docRedo();
+                } else if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+                    st.docUndo();
+                } else if (ImGui::IsKeyPressed(ImGuiKey_Y, false)) {
+                    st.docRedo();
+                }
+            }
+        }
 
         // Re-push palette-derived viewport visuals every frame so a runtime theme toggle (from the
         // title bar) takes effect immediately. Cheap uniform/state sets; no GPU allocation.
@@ -1701,6 +1772,14 @@ int run_gui(const char* screenshotPath) {
         // ---------- modals ----------
         ui::drawSettingsModal(st, busy);
 
+        // ---------- W1-B: toast notifications (top-right, over everything) ----------
+        ui::drawToasts(st);
+
+        // ---------- W1-B: consume this frame's cursor request (item 3) ----------
+        // After all panels have had a chance to call st.requestCursor(); suspends ImGui cursor
+        // management and sets the GLFW cursor when a non-default cursor was requested, else restores.
+        ui::applyCursorRequest(st, win);
+
         ImGui::Render();
         int dw, dh;
         glfwGetFramebufferSize(win, &dw, &dh);
@@ -1824,9 +1903,10 @@ int run_gui(const char* screenshotPath) {
         if (st.wantActivity) {
             ++st.frame;
             if (!actCapture.empty()) {
-                // mkdir best-effort
-                std::string mkCmd = "if not exist \"" + actSavePath + "\" mkdir \"" + actSavePath + "\"";
-                std::system(mkCmd.c_str());
+                // W1-B (item 12): the dir was created up-front via std::filesystem; ensure it again
+                // here (no-op if present) instead of the old fragile std::system("mkdir ...") shell
+                // call, which could mangle quotes on some paths.
+                std::error_code ec; std::filesystem::create_directories(actSavePath, ec);
                 std::vector<unsigned char> px(dw * dh * 4);
                 glReadBuffer(GL_BACK);
                 glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
@@ -1868,6 +1948,7 @@ int run_gui(const char* screenshotPath) {
 
     freeChatTextures(st.chat);  // release iteration thumbnails while the GL context is still live
     ui::freeIcons();            // C14: release atlas textures while GL context is still live
+    ui::destroyCursors();       // W1-B: free the GLFW standard cursors
     st.worker.stop();
     simClient.stop();  // C19: shut down the second worker process
     ImGui_ImplOpenGL3_Shutdown();

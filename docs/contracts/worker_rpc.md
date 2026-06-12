@@ -6,6 +6,10 @@
 > final `{"id": n, "ok": true, "result": {…}}` or `{"id": n, "ok": false, "error": {code, message, detail}}`.
 > (Legacy methods that returned `error` as a plain string keep doing so; all NEW methods use the
 > structured error envelope of doc_ops.md §5.)
+>
+> **C35-overhaul (additive):** the ops-response gains `owner_map`; `doc_tree` now carries it too;
+> sketch responses gain `constraints`; per-feature rebuild status gains `rolled_back`; new
+> `doc_checkpoint`/`doc_revert` methods. All additions are append-only — existing fields unchanged.
 
 ## 1. Handshake & versioning
 
@@ -27,20 +31,58 @@ max_iters?, plan?}` · `get_prompts` · `shutdown`
 | `doc_save` | `{doc_id, path?}` → `{path}` (`.step+` writer; path omitted = current) |
 | `doc_close` | `{doc_id}` → `{closed: true}` (discards unsaved state) |
 | `doc_list` | `{}` → `{docs:[{doc_id, name, kind, path, revision, dirty}]}` |
-| `doc_apply_ops` | doc_ops §1 envelope → ops-response |
+| `doc_apply_ops` | doc_ops §1 envelope → ops-response (incl. `owner_map`) |
 | `doc_undo` / `doc_redo` | `{doc_id}` → ops-response |
-| `doc_tree` | `{doc_id}` → `{revision, tree}` (no rebuild) |
+| `doc_tree` | `{doc_id}` → `{revision, tree, owner_map}` (no rebuild; uses the last build) |
 | `doc_rebuild` | `{doc_id, from?: feature_id}` → ops-response (forced) |
 | `doc_resolve_pick` | `{doc_id, revision, body_id, kind: "face"\|"edge"\|"vertex"\|"body", topo_id}` → `{selector}` (errors `stale_revision` if revision moved) |
+| `doc_checkpoint` | `{doc_id}` → `{checkpoint: "<id>"}` — deep-snapshot the current doc (PropertyManager-cancel). Multiple live checkpoints allowed; all cleared on doc close/new/open |
+| `doc_revert` | `{doc_id, checkpoint}` → ops-response — restore the snapshot, rebuild, bump revision, and push ONE undo entry (a single `doc_undo` after a revert returns to the pre-revert state). Reverting when the doc already equals the snapshot is a cheap no-op but still returns the full response. `invalid_op` on an unknown checkpoint id |
+
+**`owner_map` (ops-response + `doc_tree`, C35-overhaul).** The compiler's per-feature topology
+ownership, keyed by the feature id that created each face/edge. Ids are the **integer pick ids** the
+AICM file and `doc_resolve_pick` use (body ordinal + 1-based topo index):
+
+```json
+"owner_map": {
+  "f1": {"bodies": [1], "faces": [[1, 4], [1, 7]], "edges": [[1, 1], [1, 2]]},
+  "f2": {"bodies": [1], "faces": [[1, 1], [1, 2], [1, 3]], "edges": [[1, 9]]}
+}
+```
+
+`faces`/`edges` entries are `[body_id, topo_id]`; `bodies` lists body ids the feature owns (a feature
+owns a body if it owns ≥1 of its faces). Empty for assemblies (no part-feature topology diff). This
+is the same diff-tag heuristic the selectors contract consumes — booleans/fillets regenerate
+coincident faces that may be re-attributed to the triggering feature (selectors.md §2).
+
+**`rolled_back` (rebuild `feature_status`, C35-overhaul).** Each per-feature status row gains
+`rolled_back: bool`. A feature **after** the rollback bar (doc `rollback_after`) is not compiled and
+reports `{ok: true, rolled_back: true, error: null}` — distinct from an error (no error icon); the
+geometry reflects only the prefix through the bar.
 
 ### Sketch interaction (M2)
 | method | params → result |
 |---|---|
-| `sketch_enter` | `{doc_id, sketch}` → `{entities:[{id, …solved params}], statuses:{e1:"full",…}, dof:int, plane_frame:[16]}` |
+| `sketch_enter` | `{doc_id, sketch}` → `{entities:[{id, …solved params}], statuses:{e1:"full",…}, dof:int, plane_frame:[16], constraints:[…]}` |
 | `sketch_solve` | `{doc_id, sketch}` → same as `sketch_enter` |
-| `sketch_drag` | `{doc_id, sketch, handle, xy:[x,y]}` → `{entities, statuses}` — transient, warm-started, does NOT commit or bump revision |
-| `sketch_drag_commit` | `{doc_id, sketch}` → ops-response (persists final positions as one undoable batch) |
+| `sketch_drag` | `{doc_id, sketch, handle, xy:[x,y]}` → `{entities, statuses, constraints}` — transient, warm-started, does NOT commit or bump revision |
+| `sketch_drag_commit` | `{doc_id, sketch}` → ops-response (persists final positions as one undoable batch) + `constraints` |
 | `sketch_exit` | `{doc_id, sketch}` → ops-response (rebuilds downstream) |
+
+**`constraints` (sketch responses, C35-overhaul).** Every constraint in the active sketch, for the
+sketcher's dimension annotations. Each record:
+
+```json
+{"id": "c5", "type": "distance", "refs": ["e1.p1", "e1.p2"],
+ "value": 80.0, "expr": null, "driven": false,
+ "placement": [40.0, -5.0], "measured": 80.0}
+```
+
+`value`/`expr` come from the stored dim (`null` for geometric relations). `driven` defaults false,
+`placement` is the `[u,v]` annotation anchor (`null` if unset). `measured` is the **current solved
+measurement** for dimensional types (distance/angle in mm/deg, radius/diameter in mm; angle in
+`[0,180)`); `null` for geometric relations (coincident/parallel/…) and when refs cannot resolve.
+Driven (reference) dims still report `measured`.
 
 ### Evaluate (M5; overlay-producing methods return `{aicm_path}` with `SCLR` chunks)
 `eval_measure {doc_id, refs:[Selector,…]}` → `{kind, distance?, angle?, length?, area?, radius?,

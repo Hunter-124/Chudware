@@ -2,6 +2,14 @@
 
 > Version 1. Changes require a schema-string bump and a migration note here.
 > Machine-checked by `engine/doc/schema.py`; fixtures in `docs/contracts/fixtures/`.
+>
+> **C35-overhaul migration (additive, no schema-string bump).** Three OPTIONAL fields are added;
+> every pre-overhaul document remains valid (the fields default to absent/null), so the schema
+> string stays `aicad.part/1`:
+> - dimensional constraints may carry `placement:[u,v]` (annotation anchor, §3.3);
+> - `distance` constraints may carry `axis:"h"|"v"` (§3.3);
+> - the part/assembly document may carry `rollback_after: <feature id>|null` (the rollback bar, §1).
+> A future change to any EXISTING field's meaning would still require the schema-string bump.
 
 ## 0. Conventions
 
@@ -28,13 +36,18 @@
   "units": {"system": "MMGS"},
   "material": {"key": "alu_6061"},
   "equations": {"globals": [{"name": "thickness", "expr": "6"}]},
-  "features": [ Feature, … ]
+  "features": [ Feature, … ],
+  "rollback_after": "f3"
 }
 ```
 
 - `material` may be `null`. `key` indexes `engine/sim/materials.json`.
 - `features` array order **is** the history; the rollback bar is an index into it.
 - `equations.globals` evaluate in dependency order; cycles are a document error.
+- `rollback_after` (optional, C35-overhaul): the rollback bar. `null`/absent = bar at the end
+  (compile everything). A feature id = the bar sits **after** that feature; features after it are not
+  compiled and report `rolled_back` (worker_rpc). Must reference an existing feature id. The
+  assembly document accepts the same field with the same meaning.
 
 ## 2. Feature envelope
 
@@ -123,7 +136,8 @@ Constraint references use **handles**: `"e3"` = whole entity; point sub-refs:
 
 ```json
 {"id": "c7", "type": "distance", "refs": ["e1.p1", "e1.p2"],
- "value": {"value": 80.0, "expr": "W"}, "driven": false}
+ "value": {"value": 80.0, "expr": "W"}, "driven": false,
+ "axis": null, "placement": [40.0, -5.0]}
 ```
 
 | type | refs (arity, kinds) | value |
@@ -140,13 +154,20 @@ Constraint references use **handles**: `"e3"` = whole entity; point sub-refs:
 | `symmetric` | 3 — point/entity, point/entity, line (mirror axis) | — |
 | `fix` | 1 — any handle | — |
 | `point_on` | 2 — point, entity | — |
-| `distance` | 2 — point/line, point/line | dimension value (mm) |
-| `angle` | 2 — line, line | dimension value (deg) |
+| `distance` | 2 — `[point, point]` or `[point, line entity]` | dimension value (mm) |
+| `angle` | 2 — line entity, line entity | dimension value (deg), measured/reported in `[0,180)` |
 | `radius` | 1 — arc/circle | dimension value (mm) |
 | `diameter` | 1 — circle | dimension value (mm) |
 
 `driven:true` marks a reference dimension (measured, never enforced). Dimension constraints
 (`distance|angle|radius|diameter`) MUST carry `value`; the rest MUST NOT.
+
+**Optional dimensional fields (C35-overhaul):**
+- `placement:[u,v]` — sketch-plane coordinates of the annotation text anchor (where the sketcher
+  draws the dimension label). Optional, `null`/absent if unplaced; round-trips through save/open.
+- `distance.axis:"h"|"v"` — constrain only the horizontal (`|Δu|`) or vertical (`|Δv|`) gap;
+  `null`/absent = aligned Euclidean distance. **Point-point refs only** — a `[point, line]` distance
+  (perpendicular foot distance to the infinite line) is already directional and rejects `axis`.
 
 ### 3.4 Solver status (computed, not stored)
 

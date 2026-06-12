@@ -46,6 +46,11 @@ add_executable(AI-CAD
   src/ui/legacy_chat.cpp
   src/ui/settings_modal.cpp
   src/ui/console_panel.cpp
+  # --- W1-B: core infrastructure (toast / cursor manager / shared appearance picker) ---
+  src/ui/toast.cpp
+  src/ui/cursors.cpp
+  src/ui/appearance_common.cpp
+  # --- end W1-B ---
   src/ui/title_bar.cpp
   src/ui/status_bar.cpp
   src/ui/viewport_panel.cpp

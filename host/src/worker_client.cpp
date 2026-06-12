@@ -137,7 +137,14 @@ bool WorkerClient::readLine(std::string& line, int timeoutMs) {
                     avail == 0)
                     return false;
             } else {
-                Sleep(5);
+                // W1-B (item 11): tighter poll. For the first ~2ms after the request was written,
+                // yield with Sleep(0) (no enforced minimum sleep) so a fast doc_* round-trip returns
+                // with sub-millisecond latency; past that, fall back to Sleep(1) to avoid burning a
+                // core while waiting on a slow call. Measurable win across the 77 RPC call sites with
+                // no architectural change (still a synchronous busy-poll).
+                ULONGLONG waited = GetTickCount64() - start;
+                if (waited < 2) Sleep(0);
+                else Sleep(1);
                 continue;
             }
         }
@@ -154,6 +161,7 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
     std::lock_guard<std::mutex> lk(callMtx_);
     if (!running_) {
         err = "worker not started";
+        if (errorSink_) errorSink_(method, err);  // W1-B: surface transport failures
         return false;
     }
     int id = nextId_++;
@@ -162,12 +170,14 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
     DWORD wrote = 0;
     if (!WriteFile(childStdinWr_, line.data(), (DWORD)line.size(), &wrote, nullptr)) {
         err = "write failed";
+        if (errorSink_) errorSink_(method, err);  // W1-B
         return false;
     }
     for (;;) {
         std::string resp;
         if (!readLine(resp, timeoutMs)) {
             err = "timeout/closed waiting for response";
+            if (errorSink_) errorSink_(method, err);  // W1-B
             return false;
         }
         if (resp.empty()) continue;

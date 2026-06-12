@@ -66,6 +66,28 @@ _REVIEW_DONE = _json_block({"done": True, "issues": []})
 _MEMORY = _json_block({"summary": "built a 40x30x10 filleted plate",
                        "decisions": ["fillet r=3 on top edge"], "open_issues": []})
 
+# C35 micro-orchestration replies. The micro profile (engaged for LOCAL providers, which the mock
+# RoleScriptedProvider counts as — see micro.should_engage) runs DECOMPOSE -> per-step EXECUTE.
+# The decomposer emits an ordered step list; the executor emits ONE ops array per step, applied
+# immediately, so the fillet step (step 2) can reference the box feature id (f1) created by step 1.
+_DECOMPOSE = _json_block([
+    {"type": "box", "desc": "40x30x10 base plate",
+     "params": {"length": 40, "width": 30, "height": 10}},
+    {"type": "fillet", "desc": "3mm fillet on a top edge", "params": {"radius": 3}},
+])
+_EXEC_BOX = _json_block([
+    {"op": "add_feature", "feature": {"type": "box", "name": "Box1",
+        "params": {"length": {"value": 40, "expr": None}, "width": {"value": 30, "expr": None},
+                   "height": {"value": 10, "expr": None}}}},
+])
+_EXEC_FILLET = _json_block([
+    {"op": "add_feature", "feature": {"type": "fillet", "name": "Fillet1",
+        "params": {"radius": {"value": 3, "expr": None}},
+        "refs": {"edges": [{"kind": "edge", "surf": "line", "centroid": [20, 0, 5],
+                            "axis": [0, 1, 0], "area_or_len": 30,
+                            "owner_feature": "f1", "hint_index": 0}]}}},
+])
+
 
 def _read_jsonl(run_id: str) -> list[dict]:
     p = run_dir(run_id) / "events.jsonl"
@@ -249,9 +271,12 @@ def test_worker_agent_run_v2_subprocess() -> None:
     import sys
     import tempfile
 
-    # Scripted replies (role-keyed) written to a temp file the mock provider loads via env.
+    # Scripted replies (role-keyed) written to a temp file the mock provider loads via env. The
+    # worker's mock provider counts as LOCAL, so the C35 MICRO profile engages: it drives the
+    # decomposer + executor roles (one executor call per decomposed step), not the v2 modeler.
     replies = {"intake": [_SPEC], "planner": [_PLAN], "modeler": [_BOX_FILLET_OPS],
-               "reviewer": [_REVIEW_DONE], "memory": [_MEMORY]}
+               "reviewer": [_REVIEW_DONE], "memory": [_MEMORY],
+               "decomposer": [_DECOMPOSE], "executor": [_EXEC_BOX, _EXEC_FILLET]}
     fd, replies_path = tempfile.mkstemp(suffix=".json")
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(replies, fh)

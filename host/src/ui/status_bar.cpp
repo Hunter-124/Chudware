@@ -42,7 +42,7 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     ImGui::SameLine();
     ImGui::TextColored(sc, "%s", st.status.c_str());
     // C18: while editing a sketch, show "Under/Fully/Over Defined + DOF" tinted by status.
-    if (auto* sk = static_cast<ui::SketchMode*>(st.sketchMode)) {
+    if (auto* sk = st.sketchMode) {
         if (sk->active()) {
             std::string sl = sk->statusLine();
             if (!sl.empty()) {

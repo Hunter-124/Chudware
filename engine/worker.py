@@ -200,6 +200,23 @@ def _doc_resolve_pick(params: dict, _emit: EmitFn) -> dict:
         int(params["body_id"]), params["kind"], int(params["topo_id"]))
 
 
+def _doc_checkpoint(params: dict, _emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.checkpoint(s)
+
+
+def _doc_revert(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    ckpt = params.get("checkpoint")
+    if not isinstance(ckpt, str) or not ckpt:
+        from engine.doc.ops import OpError
+        raise OpError("invalid_op", "doc_revert requires a 'checkpoint' id",
+                      {"reason": "missing checkpoint"})
+    return docsess.revert(s, ckpt, emit=_doc_emit(emit))
+
+
 # =========================================================================== C20 assembly methods
 #
 # doc_solve_mates  {doc_id, drag?: {component, target:[x,y,z]}}  -> ops-response (re-solve mates,
@@ -576,6 +593,8 @@ _METHODS = {
     "doc_tree": _doc_tree,
     "doc_rebuild": _doc_rebuild,
     "doc_resolve_pick": _doc_resolve_pick,
+    "doc_checkpoint": _doc_checkpoint,
+    "doc_revert": _doc_revert,
     # Assembly (C20)
     "doc_solve_mates": _doc_solve_mates,
     "doc_set_explode_state": _doc_set_explode_state,
@@ -618,6 +637,7 @@ _METHODS.update({
 _STRUCTURED_ERROR_METHODS = {
     "doc_new", "doc_open", "doc_save", "doc_close", "doc_list", "doc_apply_ops",
     "doc_undo", "doc_redo", "doc_tree", "doc_rebuild", "doc_resolve_pick",
+    "doc_checkpoint", "doc_revert",
     "doc_solve_mates", "doc_set_explode_state",  # C20
     "sketch_enter", "sketch_solve", "sketch_drag", "sketch_drag_commit", "sketch_exit",
     "eval_mass", "eval_measure", "eval_section_props", "eval_interference", "eval_check",

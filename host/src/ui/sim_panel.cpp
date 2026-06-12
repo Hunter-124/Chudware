@@ -140,7 +140,7 @@ nlohmann::json SimPanel::facePointsFor(AppState& st, const nlohmann::json& selec
 
 void SimPanel::runStaticOrModal(AppState& st, Study& s) {
     if (!st.simClient) return;
-    auto* sim = static_cast<core::SimClient*>(st.simClient);
+    auto* sim = st.simClient;
     if (!st.docMirror.hasDoc()) { st.addLog("[sim] no document to analyse"); return; }
     ensureMaterials(st);
 
@@ -213,7 +213,7 @@ void SimPanel::runStaticOrModal(AppState& st, Study& s) {
 
 void SimPanel::runFlow(AppState& st, Study& s) {
     if (!st.simClient) return;
-    auto* sim = static_cast<core::SimClient*>(st.simClient);
+    auto* sim = st.simClient;
     if (!st.docMirror.hasDoc()) { st.addLog("[sim] no document to analyse"); return; }
 
     // C07's run_wind_tunnel loads an STL via trimesh — export the bodies to STL (bridge.export_step
@@ -245,7 +245,7 @@ void SimPanel::runFlow(AppState& st, Study& s) {
 
 void SimPanel::tick(AppState& st) {
     if (!st.simClient) return;
-    auto* sim = static_cast<core::SimClient*>(st.simClient);
+    auto* sim = st.simClient;
     auto& job = sim->job();
 
     // Drain progress events -> status text + live drag trace.
@@ -412,7 +412,7 @@ void SimPanel::drawStaticForm(AppState& st, Study& s) {
     ImGui::SliderFloat("Density", &s.meshDensity, 0.1f, 1.0f, "%.2f");
 
     ImGui::Spacing();
-    bool busy = st.simClient && static_cast<core::SimClient*>(st.simClient)->busy();
+    bool busy = st.simClient && st.simClient->busy();
     if (busy) ImGui::BeginDisabled();
     if (ImGui::Button("Run", ImVec2(120, 0))) runStaticOrModal(st, s);
     if (busy) ImGui::EndDisabled();
@@ -440,7 +440,7 @@ void SimPanel::drawModalForm(AppState& st, Study& s) {
     ImGui::SliderInt("Modes", &s.nModes, 1, 12);
     ImGui::SliderFloat("Density", &s.meshDensity, 0.1f, 1.0f, "%.2f");
 
-    bool busy = st.simClient && static_cast<core::SimClient*>(st.simClient)->busy();
+    bool busy = st.simClient && st.simClient->busy();
     if (busy) ImGui::BeginDisabled();
     if (ImGui::Button("Run", ImVec2(120, 0))) runStaticOrModal(st, s);
     if (busy) ImGui::EndDisabled();
@@ -468,7 +468,7 @@ void SimPanel::drawFlowForm(AppState& st, Study& s) {
                        "Use a finer preset for thin features.");
     ImGui::PopStyleColor();
 
-    bool busy = st.simClient && static_cast<core::SimClient*>(st.simClient)->busy();
+    bool busy = st.simClient && st.simClient->busy();
     if (busy) ImGui::BeginDisabled();
     if (ImGui::Button("Run", ImVec2(120, 0))) runFlow(st, s);
     if (busy) ImGui::EndDisabled();

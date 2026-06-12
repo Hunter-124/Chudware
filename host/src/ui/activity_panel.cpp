@@ -499,7 +499,7 @@ void ActivityPanel::drawRunTree(AppState& st, RunNode& run, bool live) {
 
 void ActivityPanel::draw(AppState& st) {
     if (!st.showActivityPanel) return;
-    ImGui::SetNextWindowSize(ImVec2(340, 500), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(340 * ui::uiScale, 500 * ui::uiScale), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (!ImGui::Begin("Agent Activity", &st.showActivityPanel)) {
         ImGui::End();
         return;

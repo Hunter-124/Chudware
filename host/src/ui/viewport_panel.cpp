@@ -23,6 +23,7 @@
 
 #include "sketch_mode.h"   // C18
 #include "property_manager.h"  // C27-A: in-viewport parameter callouts
+#include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
 
 namespace ui {
 
@@ -124,78 +125,9 @@ static void normalToSelectionOrNearestAxis(AppState& st) {
     applyViewPreset(st, kAx[best].preset);
 }
 
-// ---- C26: appearance color-picker popup (duplicated from feature_tree.cpp; sharing it would
-// need a new translation unit in CMakeLists, owned by another agent this wave). Preset swatches
-// over a ColorPicker3; returns true once on commit, writing into outColor[3]. ----
-// C32-A RealView material presets (duplicated from feature_tree.cpp; see note above re: sharing).
-struct MaterialPreset { const char* name; float metallic, roughness, rgb[3]; };
-static const MaterialPreset kMaterials[5] = {
-    {"Plastic",    0.00f, 0.50f, {0.71f, 0.76f, 0.82f}},
-    {"Aluminum",   0.90f, 0.35f, {0.83f, 0.85f, 0.88f}},
-    {"Steel",      0.85f, 0.25f, {0.56f, 0.58f, 0.62f}},
-    {"Brass",      0.95f, 0.30f, {0.80f, 0.62f, 0.28f}},
-    {"Dark Metal", 0.90f, 0.45f, {0.16f, 0.17f, 0.19f}},
-};
-
-static bool appearanceColorPicker(const char* popupId, float outColor[3],
-                                  float* outMetallic, float* outRoughness) {
-    static float s_pick[3] = {0.71f, 0.76f, 0.82f};
-    static bool  s_seeded  = false;
-    bool committed = false;
-    if (ImGui::BeginPopup(popupId)) {
-        if (!s_seeded) { s_pick[0] = outColor[0]; s_pick[1] = outColor[1]; s_pick[2] = outColor[2];
-                         s_seeded = true; }
-        ImGui::TextUnformatted("Appearance");
-        ImGui::Separator();
-        // C32-A: RealView material presets (above the color swatches). Click = apply color+material.
-        ImGui::TextUnformatted("Material");
-        for (int i = 0; i < 5; ++i) {
-            if (i) ImGui::SameLine(0, 4.0f * ui::uiScale);
-            if (ImGui::SmallButton(kMaterials[i].name)) {
-                outColor[0] = kMaterials[i].rgb[0];
-                outColor[1] = kMaterials[i].rgb[1];
-                outColor[2] = kMaterials[i].rgb[2];
-                if (outMetallic)  *outMetallic = kMaterials[i].metallic;
-                if (outRoughness) *outRoughness = kMaterials[i].roughness;
-                committed = true;
-                ImGui::CloseCurrentPopup();
-            }
-        }
-        ImGui::Separator();
-        static const float kPresets[8][3] = {
-            {0.71f, 0.76f, 0.82f}, {0.50f, 0.50f, 0.52f}, {0.20f, 0.21f, 0.23f},
-            {0.85f, 0.85f, 0.86f}, {0.80f, 0.15f, 0.15f}, {0.15f, 0.35f, 0.80f},
-            {0.18f, 0.60f, 0.25f}, {0.92f, 0.80f, 0.12f},
-        };
-        float sw = 22.0f * ui::uiScale;
-        for (int i = 0; i < 8; ++i) {
-            if (i) ImGui::SameLine(0, 4.0f * ui::uiScale);
-            ImVec4 c(kPresets[i][0], kPresets[i][1], kPresets[i][2], 1.0f);
-            if (ImGui::ColorButton(("##aprs" + std::to_string(i)).c_str(), c,
-                                   ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop,
-                                   ImVec2(sw, sw))) {
-                outColor[0] = kPresets[i][0]; outColor[1] = kPresets[i][1]; outColor[2] = kPresets[i][2];
-                committed = true;
-                ImGui::CloseCurrentPopup();
-            }
-        }
-        ImGui::Separator();
-        ImGui::SetNextItemWidth(180.0f * ui::uiScale);
-        ImGui::ColorPicker3("##appk", s_pick,
-                            ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoSmallPreview);
-        if (ImGui::Button("Apply", ImVec2(80.0f * ui::uiScale, 0))) {
-            outColor[0] = s_pick[0]; outColor[1] = s_pick[1]; outColor[2] = s_pick[2];
-            committed = true;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(80.0f * ui::uiScale, 0))) ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    } else {
-        s_seeded = false;
-    }
-    return committed;
-}
+// W1-B (item 9): the appearance picker + MaterialPreset table moved to ui/appearance_common.{h,cpp}
+// (formerly duplicated verbatim here and in feature_tree.cpp). The call site below uses
+// ui::appearanceColorPicker().
 
 // ---- C26: apply a set_appearance op straight from the viewport, then reload the mesh. ----
 // A DIRECT apply (not the feature tree's deferred queue) is SAFE here: the viewport context menu is
@@ -229,7 +161,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     Renderer& renderer = *st.renderer;
     // C18: while a sketch is being edited the camera locks normal to the sketch plane and the
     // sketch tools own the mouse (no orbit, no topology picking).
-    auto* sketch = static_cast<ui::SketchMode*>(st.sketchMode);
+    auto* sketch = st.sketchMode;
     const bool inSketch = sketch && sketch->active();
 
     // ---------- Viewport ----------
@@ -417,6 +349,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     clampPitch();
                 }
             }
+            // W1-B (item 3): in pan-drag mode, show the Hand cursor over the viewport so the user
+            // sees they can grab-pan (SolidWorks behavior). The cursor manager in app.cpp consumes
+            // this per-frame request. (Wave-2 sketch tools / PM wells request Crosshair similarly.)
+            if (st.vpDragMode == 1 && !s_zoomAreaArmed)
+                st.requestCursor(ui::CursorKind::Hand);
 
             // Middle-button navigation (SolidWorks bindings):
             //   MMB        = orbit (same rate as left-drag)
@@ -1019,8 +956,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         }
         // C27-A: hide the model-info dims pill while a PM form is active (callouts own the
         // viewport's parameter readout; avoids visual clutter / overlap).
-        bool pmActive = st.propertyManager &&
-                        static_cast<ui::PropertyManager*>(st.propertyManager)->active();
+        bool pmActive = st.propertyManager && st.propertyManager->active();
         if (!st.modelInfo.empty() && renderer.hasMesh() && !pmActive) {
             // dimensions readout, bottom-left (sits above the orientation triad)
             ImFont* mf = st.fonts.mono ? st.fonts.mono : ImGui::GetFont();
@@ -1073,7 +1009,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // While the PropertyManager is editing a feature, show a small chip ("Radius: 4mm")
         // per visible+enabled Dim field, tied by a leader line to the affected geometry.
         if (st.propertyManager && st.hasDocMesh) {
-            auto* pm = static_cast<ui::PropertyManager*>(st.propertyManager);
+            auto* pm = st.propertyManager;
             if (pm->active()) {
                 std::vector<ui::PMCalloutItem> items = pm->calloutItems(st);
                 if (!items.empty()) {

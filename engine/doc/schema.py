@@ -341,8 +341,30 @@ def validate_constraint(
             errs += validate_dim(c["value"], f"{where}.value", globals_names)
         if "driven" in c and not isinstance(c["driven"], bool):
             errs.append(f"{where}.driven: must be bool")
+        # Optional annotation anchor [u, v] in sketch-plane coords (C35-overhaul §4).
+        if "placement" in c and c["placement"] is not None and not _is_vec(c["placement"], 2):
+            errs.append(f"{where}.placement: must be [u, v] (two numbers) or null")
     elif c.get("value") is not None:
         errs.append(f"{where}.value: {ctype} must not carry a value")
+
+    # Dimensional-constraint ref typing (C35-overhaul §3): angle is between two LINE entities;
+    # distance accepts point-point (optional axis), or point-line (perpendicular foot distance).
+    if ctype == "angle":
+        for i, h in enumerate(refs[:2]):
+            base = h.split(".")[0] if isinstance(h, str) else None
+            ent = entities_by_id.get(base) if base else None
+            if "." in (h or "") or (ent is not None and ent.get("type") != "line"):
+                errs.append(f"{where}.refs[{i}]: angle takes two line entity ids")
+    if ctype == "distance" and "axis" in c and c["axis"] is not None:
+        if c["axis"] not in ("h", "v"):
+            errs.append(f"{where}.axis: must be 'h', 'v', or null")
+        else:
+            # axis is point-point only — a point-line distance is already directional.
+            for h in refs[:2]:
+                base = h.split(".")[0] if isinstance(h, str) else None
+                ent = entities_by_id.get(base) if base else None
+                if ent is not None and ent.get("type") == "line" and "." not in (h or ""):
+                    errs.append(f"{where}.axis: not allowed for a point-line distance")
     return errs
 
 
@@ -529,6 +551,19 @@ def _validate_appearances(doc: dict) -> list[str]:
     return errs
 
 
+def _validate_rollback(doc: dict, feature_ids: set[str]) -> list[str]:
+    """Optional doc-level ``rollback_after``: null (bar at end) or an existing feature id (the bar
+    sits AFTER that feature). C35-overhaul §6."""
+    rb = doc.get("rollback_after")
+    if rb is None:
+        return []
+    if not isinstance(rb, str):
+        return ["rollback_after: must be a feature id string or null"]
+    if rb not in feature_ids:
+        return [f"rollback_after: '{rb}' is not an existing feature id"]
+    return []
+
+
 def _validate_common(doc: dict, schema: str) -> list[str]:
     errs: list[str] = []
     if doc.get("schema") != schema:
@@ -558,6 +593,7 @@ def validate_part(doc: Any) -> list[str]:
         return errs + ["features: must be a list"]
     earlier: set[str] = set(RESERVED_DATUMS)
     seen: set[str] = set()
+    feat_ids: set[str] = set()
     for i, f in enumerate(feats):
         fid = f.get("id") if isinstance(f, dict) else None
         loc = f"features[{i}]({fid})"
@@ -567,6 +603,8 @@ def validate_part(doc: Any) -> list[str]:
                 errs.append(f"{loc}.id: duplicate")
             seen.add(fid)
             earlier.add(fid)
+            feat_ids.add(fid)
+    errs += _validate_rollback(doc, feat_ids)
     return errs
 
 
@@ -655,6 +693,7 @@ def validate_assembly(doc: Any) -> list[str]:
         errs.append("features: must be a list")
         feats = []
     earlier: set[str] = set(RESERVED_DATUMS)
+    asm_feat_ids: set[str] = set()
     for i, f in enumerate(feats):
         fid = f.get("id") if isinstance(f, dict) else None
         errs += validate_feature(
@@ -662,6 +701,8 @@ def validate_assembly(doc: Any) -> list[str]:
         )
         if isinstance(fid, str):
             earlier.add(fid)
+            asm_feat_ids.add(fid)
+    errs += _validate_rollback(doc, asm_feat_ids)
 
     explode = doc.get("explode", [])
     if not isinstance(explode, list):

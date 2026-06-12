@@ -13,6 +13,7 @@
 #include "feature_tree.h"
 #include "icons.h"
 #include "sketch_mode.h"   // C18 (Edit Sketch context entry)
+#include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
@@ -98,11 +99,20 @@ static void applyTreeOpsNow(AppState& st, const nlohmann::json& ops, const char*
         st.loadDocMesh(resp.aicm_path, lerr);
         if (!lerr.empty()) st.addLog("[err] loadDocMesh: " + lerr);
     } else if (!resp.ok) {
-        if (resp.error_code == "dependency_exists")
+        if (resp.error_code == "dependency_exists") {
             st.addLog(std::string("[warn] ") + what +
                       ": blocked — a feature depends on this order");
-        else
+            st.toast(ui::ToastLevel::Warn,
+                     std::string(what) + " blocked: a feature depends on this order");
+        } else {
             st.addLog(std::string("[err] ") + what + ": " + resp.error_message);
+            // W1-B (item 2): surface the failure instead of only logging it. (Transport errors are
+            // already toasted via the worker error sink; this covers method-level op rejections.)
+            if (resp.error_code != "transport")
+                st.toast(ui::ToastLevel::Error,
+                         std::string(what) + " failed: " +
+                         (resp.error_message.empty() ? resp.error_code : resp.error_message));
+        }
     }
 }
 
@@ -122,97 +132,19 @@ static void flushPendingTreeOps(AppState& st) {
 static std::string s_renamingId;
 static char        s_renameBuf[128] = {0};
 
-// ---- C26: shared appearance color-picker popup ----
-// A small SolidWorks-style appearance editor: a row of ~8 preset swatches over a full ColorPicker3,
-// with Apply / Cancel. Palette-styled, uiScale-aware. Returns true exactly once — when the user
-// commits via a preset swatch or Apply — writing the chosen color into outColor[3].
-//
-// The popup is identity-less re: the target body; the CALLER opens it (ImGui::OpenPopup(popupId))
-// after stashing which body key it applies to, then turns a true return into a set_appearance op.
-// (This same helper is duplicated verbatim in viewport_panel.cpp; sharing it would need a new TU in
-// CMakeLists, which another agent owns this wave — duplication is the lighter choice.)
-// C32-A RealView material presets (metallic, roughness, [r,g,b] tint). Clicking a preset commits
-// color + material in one set_appearance op. Plastic restores the dielectric default (the C30 look).
-struct MaterialPreset { const char* name; float metallic, roughness, rgb[3]; };
-static const MaterialPreset kMaterials[5] = {
-    {"Plastic",    0.00f, 0.50f, {0.71f, 0.76f, 0.82f}},
-    {"Aluminum",   0.90f, 0.35f, {0.83f, 0.85f, 0.88f}},  // silver
-    {"Steel",      0.85f, 0.25f, {0.56f, 0.58f, 0.62f}},  // darker
-    {"Brass",      0.95f, 0.30f, {0.80f, 0.62f, 0.28f}},  // warm
-    {"Dark Metal", 0.90f, 0.45f, {0.16f, 0.17f, 0.19f}},  // near-black
-};
-
-// Appearance editor. Returns true once on commit, writing color into outColor[3] and the chosen
-// material into outMetallic/outRoughness (a preset sets all three; the custom color path carries the
-// material in unchanged so a previously-set metal keeps its finish).
-static bool appearanceColorPicker(const char* popupId, float outColor[3],
-                                  float* outMetallic, float* outRoughness) {
-    static float s_pick[3] = {0.71f, 0.76f, 0.82f};
-    static bool  s_seeded  = false;
-    bool committed = false;
-    if (ImGui::BeginPopup(popupId)) {
-        // Seed the picker from the caller's current color once per open.
-        if (!s_seeded) { s_pick[0] = outColor[0]; s_pick[1] = outColor[1]; s_pick[2] = outColor[2];
-                         s_seeded = true; }
-        ImGui::TextUnformatted("Appearance");
-        ImGui::Separator();
-        // C32-A: RealView material presets (above the color swatches). Click = apply color+material.
-        ImGui::TextUnformatted("Material");
-        for (int i = 0; i < 5; ++i) {
-            if (i) ImGui::SameLine(0, 4.0f * ui::uiScale);
-            if (ImGui::SmallButton(kMaterials[i].name)) {
-                outColor[0] = kMaterials[i].rgb[0];
-                outColor[1] = kMaterials[i].rgb[1];
-                outColor[2] = kMaterials[i].rgb[2];
-                if (outMetallic)  *outMetallic = kMaterials[i].metallic;
-                if (outRoughness) *outRoughness = kMaterials[i].roughness;
-                committed = true;
-                ImGui::CloseCurrentPopup();
-            }
-        }
-        ImGui::Separator();
-        // Preset swatches (SolidWorks-ish: greys, primaries). Click = apply immediately.
-        static const float kPresets[8][3] = {
-            {0.71f, 0.76f, 0.82f},  // default grey-blue
-            {0.50f, 0.50f, 0.52f},  // mid grey
-            {0.20f, 0.21f, 0.23f},  // dark grey
-            {0.85f, 0.85f, 0.86f},  // light grey
-            {0.80f, 0.15f, 0.15f},  // red
-            {0.15f, 0.35f, 0.80f},  // blue
-            {0.18f, 0.60f, 0.25f},  // green
-            {0.92f, 0.80f, 0.12f},  // yellow
-        };
-        float sw = 22.0f * ui::uiScale;
-        for (int i = 0; i < 8; ++i) {
-            if (i) ImGui::SameLine(0, 4.0f * ui::uiScale);
-            ImVec4 c(kPresets[i][0], kPresets[i][1], kPresets[i][2], 1.0f);
-            if (ImGui::ColorButton(("##aprs" + std::to_string(i)).c_str(), c,
-                                   ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop,
-                                   ImVec2(sw, sw))) {
-                outColor[0] = kPresets[i][0];
-                outColor[1] = kPresets[i][1];
-                outColor[2] = kPresets[i][2];
-                committed = true;
-                ImGui::CloseCurrentPopup();
-            }
-        }
-        ImGui::Separator();
-        ImGui::SetNextItemWidth(180.0f * ui::uiScale);
-        ImGui::ColorPicker3("##appk", s_pick,
-                            ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoSmallPreview);
-        if (ImGui::Button("Apply", ImVec2(80.0f * ui::uiScale, 0))) {
-            outColor[0] = s_pick[0]; outColor[1] = s_pick[1]; outColor[2] = s_pick[2];
-            committed = true;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(80.0f * ui::uiScale, 0))) ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    } else {
-        s_seeded = false;  // re-seed next time the popup opens
-    }
-    return committed;
+// W1-B (item 5): drop the tree's in-progress transient state on a doc change. Declared in
+// feature_tree.h; called from AppState::clearViewportForNewDoc and wholesale-replace paths.
+void featureTreeResetTransient() {
+    s_renamingId.clear();
+    s_renameBuf[0] = '\0';
+    s_pendingTreeOps.clear();
 }
+
+// ---- C26: appearance color-picker popup ----
+// W1-B (item 9): the MaterialPreset table + the appearance picker popup, formerly duplicated here
+// and in viewport_panel.cpp, now live in ui/appearance_common.{h,cpp}. Both call ui::appearance-
+// ColorPicker(); the CALLER opens the popup (ImGui::OpenPopup(popupId)) after stashing which body
+// the edit targets, then turns a true return into a set_appearance op.
 
 // ---- draw one feature row ----
 // Returns true if the row was left-clicked (selection).
@@ -305,7 +237,7 @@ static bool featureRow(const std::string& fid, const std::string& name, const ch
         bool isSketch = iconName && std::strcmp(iconName, "sketch_node") == 0;
         if (isSketch) {
             if (ImGui::MenuItem("Edit Sketch")) {
-                auto* sk = static_cast<ui::SketchMode*>(st.sketchMode);
+                auto* sk = st.sketchMode;
                 if (sk) sk->enterForFeature(st, fid);
             }
         }
@@ -709,21 +641,11 @@ static void drawFeatureManagerTopStrip(AppState& st) {
     if (toolbarIconBtn("fm_save", "save", "Save...", canSave) && canSave)
         st.addLog("[doc] save: use the path field below the tree");
     ImGui::SameLine(0, gap);
-    if (toolbarIconBtn("fm_undo", "undo", "Undo", canDoc) && canDoc) {
-        auto r = st.docMirror.undo(st.worker);
-        if (r.ok) {
-            st.addLog("[doc] undo  rev=" + std::to_string(r.revision));
-            if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
-        } else st.addLog("[doc] undo: " + r.error_message);
-    }
+    // W1-B (item 4): route through the shared AppState helper so the toolbar buttons and the global
+    // Ctrl+Z / Ctrl+Y keys take the identical path (mesh refresh + owner map + confirmation toast).
+    if (toolbarIconBtn("fm_undo", "undo", "Undo", canDoc) && canDoc) st.docUndo();
     ImGui::SameLine(0, gap);
-    if (toolbarIconBtn("fm_redo", "redo", "Redo", canDoc) && canDoc) {
-        auto r = st.docMirror.redo(st.worker);
-        if (r.ok) {
-            st.addLog("[doc] redo  rev=" + std::to_string(r.revision));
-            if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
-        } else st.addLog("[doc] redo: " + r.error_message);
-    }
+    if (toolbarIconBtn("fm_redo", "redo", "Redo", canDoc) && canDoc) st.docRedo();
 
     // --- "Name & group" — auto-name features SolidWorks-style and sort into folders. ---
     // Shown only for a part doc that actually has features (not assemblies / empty docs).
@@ -904,7 +826,9 @@ void drawFeatureTree(AppState& st,
 
             // ---- feature history ----
             const nlohmann::json& statusArr = st.docMirror.featureStatus();
-            static std::string selectedFeatureId;
+            // W1-B (item 5): the selected feature id now lives on AppState (so a viewport pick can
+            // drive it and a doc change can clear it). Bind a local reference to keep the body terse.
+            std::string& selectedFeatureId = st.selectedFeatureId;
 
             // C20b: assemblies render components + a Mates folder instead of a feature history.
             bool isAssembly = tree.is_object() && jfld(tree, "schema") == "aicad.asm/1";
@@ -986,6 +910,12 @@ void drawFeatureTree(AppState& st,
                             ImGui::GetWindowDrawList()->AddRectFilled(
                                 rowMin, rowMax,
                                 Palette::toU32(pal.treeRowSelected));
+                            // W1-B (item 7): a viewport pick that resolved to this feature requested
+                            // a scroll-to. Consume the one-shot so the selected row comes into view.
+                            if (st.treeScrollToSelection) {
+                                ImGui::SetScrollHereY(0.5f);
+                                st.treeScrollToSelection = false;
+                            }
                         }
 
                         // C27-C: convert fillet↔chamfer. Carry radius↔length + refs verbatim.

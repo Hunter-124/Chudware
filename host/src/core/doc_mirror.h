@@ -9,14 +9,26 @@
 // invoked on the same thread so the feature tree can refresh.
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
 class WorkerClient;
 
 namespace core {
+
+// W1-B (item 6): the topology a single feature owns, parsed from a response's "owner_map".
+// Shape on the wire: {"<fid>": {"bodies":[id...], "faces":[[body,face]...], "edges":[[body,edge]...]}}.
+struct Owned {
+    std::vector<uint32_t> bodies;                       // body ids this feature created/owns
+    std::vector<std::pair<uint32_t, uint32_t>> faces;   // (body_id, face_id)
+    std::vector<std::pair<uint32_t, uint32_t>> edges;   // (body_id, edge_id)
+};
 
 // Represents an ops-response (doc_apply_ops / doc_undo / doc_redo).
 // The caller should feed tess.aicm_path into AppState::loadDocMesh().
@@ -29,6 +41,7 @@ struct OpsResponse {
     std::string aicm_path;           // tess.aicm_path (empty if no tess block)
     std::string error_code;          // set on RPC error (stale_revision, invalid_op, …)
     std::string error_message;       // human-readable error
+    nlohmann::json owner_map;        // W1-B: raw "owner_map" object when present (else null)
 };
 
 class DocMirror {
@@ -36,6 +49,12 @@ public:
     // Listener called after every mutation that succeeds (on the calling thread).
     using Listener = std::function<void()>;
     void setListener(Listener l) { listener_ = std::move(l); }
+
+    // W1-B (item 2/6): notified when an op was discarded because the mirror was stale and we had to
+    // auto-resync (the caller's action did NOT apply). app.cpp routes this to a toast so the user
+    // learns their action was dropped instead of silently failing. Fired on the calling thread.
+    using StaleCb = std::function<void()>;
+    void setStaleResyncCallback(StaleCb cb) { staleResyncCb_ = std::move(cb); }
 
     // ---- accessors ----
     bool        hasDoc()   const { return !docId_.empty(); }
@@ -48,6 +67,30 @@ public:
 
     // Last rebuild feature_status array from the worker response.
     const nlohmann::json& featureStatus() const { return featureStatus_; }
+
+    // ---- W1-B (item 6): owner-map lookups ----
+    // The parsed feature->topology map from the latest response that carried one. TOLERANT of the
+    // engine not (yet) sending "owner_map": the map is simply empty and the lookups return nothing.
+
+    // Which feature (if any) owns this face. Empty string when unknown.
+    std::string ownerOfFace(uint32_t body_id, uint32_t face_id) const {
+        auto it = faceOwner_.find(((uint64_t)body_id << 32) | (uint64_t)face_id);
+        return it == faceOwner_.end() ? std::string() : it->second;
+    }
+    // Which feature (if any) owns this edge. Empty string when unknown.
+    std::string ownerOfEdge(uint32_t body_id, uint32_t edge_id) const {
+        auto it = edgeOwner_.find(((uint64_t)body_id << 32) | (uint64_t)edge_id);
+        return it == edgeOwner_.end() ? std::string() : it->second;
+    }
+    // Every feature that owns this body (most bodies have exactly one creator; patterns/booleans can
+    // touch several). Empty vector when unknown.
+    std::vector<std::string> ownerOfBody(uint32_t body_id) const {
+        auto it = bodyOwners_.find(body_id);
+        return it == bodyOwners_.end() ? std::vector<std::string>() : it->second;
+    }
+    // True when the worker has supplied an owner map at least once (lets callers fall back gracefully
+    // before the engine lands the feature).
+    bool hasOwnerMap() const { return !faceOwner_.empty() || !bodyOwners_.empty(); }
 
     // ---- mutations (synchronous, blocking the calling thread) ----
 
@@ -99,16 +142,31 @@ public:
     // Reset local state (e.g. on worker restart).
     void reset() { docId_.clear(); revision_ = -1; tree_ = {}; featureStatus_ = {}; }
 
+    // Owned topology for each feature (raw, as last parsed). Exposed for completeness / debugging.
+    const std::unordered_map<std::string, Owned>& ownerMap() const { return ownerMap_; }
+
 private:
     OpsResponse parseOpsResponse(const nlohmann::json& result);
     bool resyncTree(WorkerClient& w);  // called on stale_revision
     void notify() { if (listener_) listener_(); }
+
+    // W1-B (item 6): (re)build ownerMap_ + the reverse lookups from a response's "owner_map" object.
+    // TOLERATES a missing/null/empty owner_map: in that case the maps are cleared and lookups
+    // return nothing, so the host can build and run before the engine ships the field.
+    void storeOwnerMap(const nlohmann::json& ownerMapJson);
 
     std::string    docId_;
     int            revision_ = -1;
     nlohmann::json tree_;
     nlohmann::json featureStatus_;
     Listener       listener_;
+    StaleCb        staleResyncCb_;  // W1-B: fired on stale_revision auto-resync
+
+    // W1-B: parsed owner map + reverse indices (key = (body<<32)|topo for faces/edges).
+    std::unordered_map<std::string, Owned> ownerMap_;          // fid -> owned topology
+    std::unordered_map<uint64_t, std::string> faceOwner_;      // (body<<32)|face -> fid
+    std::unordered_map<uint64_t, std::string> edgeOwner_;      // (body<<32)|edge -> fid
+    std::unordered_map<uint32_t, std::vector<std::string>> bodyOwners_;  // body -> [fid...]
 };
 
 }  // namespace core

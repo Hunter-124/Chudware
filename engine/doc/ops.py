@@ -289,13 +289,23 @@ def _op_add_feature(doc, op, index, idgen, id_map):
     feat["refs"] = _resolve_placeholders_deep(feat.get("refs", {}), id_map, index)
     feats = _features(doc)
     before = op.get("before")
-    if before is None:
-        feats.append(feat)
-    else:
+    if before is not None:
         pos, _ = _find_feature(doc, before)
         if pos is None:
             raise _invalid(index, f"before='{before}' is not an existing feature")
         feats.insert(pos, feat)
+    else:
+        # SolidWorks behavior: if the rollback bar is NOT at the end, a new feature is inserted
+        # immediately AFTER the bar position, and the bar then moves to sit after the new feature
+        # (so the new feature is the last rolled-IN feature). With the bar at the end (or unset),
+        # the feature simply appends.
+        rb = doc.get("rollback_after")
+        bar_pos, bar_feat = (_find_feature(doc, rb) if rb else (None, None))
+        if bar_feat is not None and bar_pos < len(feats) - 1:
+            feats.insert(bar_pos + 1, feat)
+            doc["rollback_after"] = fid  # bar follows the freshly-inserted feature
+        else:
+            feats.append(feat)
     id_map[f"${index}"] = fid
 
 
@@ -336,6 +346,23 @@ def _op_delete_feature(doc, op, index, idgen, id_map):
                     if _feature_dependents_subset(doc, f["id"], to_delete):
                         to_delete.add(f["id"])
                         changed = True
+    # If the rollback bar sits on a feature about to be deleted, move it to the nearest surviving
+    # PRECEDING feature (or null = end) so the bar stays valid (SolidWorks semantics).
+    rb = doc.get("rollback_after")
+    if rb in to_delete:
+        feats_now = _features(doc)
+        bar_pos = next((i for i, f in enumerate(feats_now)
+                        if isinstance(f, dict) and f.get("id") == rb), None)
+        new_bar = None
+        if bar_pos is not None:
+            for f in reversed(feats_now[:bar_pos]):
+                if isinstance(f, dict) and f.get("id") not in to_delete:
+                    new_bar = f.get("id")
+                    break
+        if new_bar:
+            doc["rollback_after"] = new_bar
+        else:
+            doc.pop("rollback_after", None)
     doc["features"] = [f for f in _features(doc) if not (isinstance(f, dict) and f["id"] in to_delete)]
 
 
@@ -476,6 +503,24 @@ def _op_set_appearance(doc, op, index, idgen, id_map):
                    "roughness": roughness if roughness is not None else 0.5}
 
 
+def _op_set_rollback(doc, op, index, idgen, id_map):
+    """Move the rollback bar (SolidWorks semantics). ``after`` = feature id the bar sits AFTER, or
+    null = bar at the end (compile everything). Validates the feature exists. Undo-able like any op
+    (the whole doc is snapshotted by the session before the batch applies)."""
+    if "after" not in op:
+        raise _invalid(index, "set_rollback requires an 'after' field (feature id or null)")
+    after = op.get("after")
+    if after is None:
+        doc.pop("rollback_after", None)
+        return
+    if not isinstance(after, str):
+        raise _invalid(index, "set_rollback.after must be a feature id string or null")
+    _, feat = _find_feature(doc, after)
+    if feat is None:
+        raise _invalid(index, f"set_rollback: feature '{after}' not found")
+    doc["rollback_after"] = after
+
+
 def _op_set_units(doc, op, index, idgen, id_map):
     system = op.get("system")
     if system not in ("MMGS", "IPS"):
@@ -597,13 +642,32 @@ def _op_sketch_set_dim(doc, op, index, idgen, id_map):
     cid = op.get("id")
     for c in sk.get("params", {}).get("constraints", []):
         if c.get("id") == cid:
+            # Any subset of {value|expr, placement, driven} may be supplied (C35-overhaul §4). At
+            # least one of value/expr/placement/driven must be present.
+            touched = False
             if "expr" in op and op["expr"] is not None:
                 cur = c.get("value") if isinstance(c.get("value"), dict) else {"value": 0.0}
                 c["value"] = {"value": cur.get("value", 0.0), "expr": op["expr"]}
-            elif "value" in op:
+                touched = True
+            elif "value" in op and op["value"] is not None:
                 c["value"] = {"value": float(op["value"]), "expr": None}
-            else:
-                raise _invalid(index, "sketch_set_dim requires 'value' or 'expr'")
+                touched = True
+            if "placement" in op:
+                if op["placement"] is None:
+                    c.pop("placement", None)
+                elif isinstance(op["placement"], list) and len(op["placement"]) == 2:
+                    c["placement"] = [float(op["placement"][0]), float(op["placement"][1])]
+                else:
+                    raise _invalid(index, "sketch_set_dim.placement must be [u, v] or null")
+                touched = True
+            if "driven" in op and op["driven"] is not None:
+                if not isinstance(op["driven"], bool):
+                    raise _invalid(index, "sketch_set_dim.driven must be a bool")
+                c["driven"] = op["driven"]
+                touched = True
+            if not touched:
+                raise _invalid(index, "sketch_set_dim requires 'value', 'expr', "
+                                      "'placement', or 'driven'")
             return
     raise _invalid(index, f"sketch_set_dim: constraint '{cid}' not found")
 
@@ -919,6 +983,7 @@ _OP_HANDLERS = {
     "set_material": _op_set_material,
     "set_appearance": _op_set_appearance,
     "set_units": _op_set_units,
+    "set_rollback": _op_set_rollback,
     "eq_set": _op_eq_set,
     "eq_delete": _op_eq_delete,
     "sketch_add_entity": _op_sketch_add_entity,

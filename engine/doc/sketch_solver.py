@@ -689,7 +689,8 @@ def _add_constraint(
 
     elif ctype == "distance":
         d = _resolve_dim(constraint, equations_env)
-        _add_distance(sys, cid, refs[0], refs[1], d, entities, var_map)
+        axis = constraint.get("axis")
+        _add_distance(sys, cid, refs[0], refs[1], d, entities, var_map, axis=axis)
 
     elif ctype == "angle":
         ang = _resolve_dim(constraint, equations_env)
@@ -1696,8 +1697,13 @@ def _numeric_jac_1(rfn, xs, n):
     return J
 
 
-def _add_distance(sys, cid, h0, h1, d, entities, var_map):
-    """Distance constraint: point-point, or point-line (foot distance)."""
+def _add_distance(sys, cid, h0, h1, d, entities, var_map, axis=None):
+    """Distance constraint: point-point, or point-line (perpendicular foot distance).
+
+    ``axis`` (point-point only): ``"h"`` constrains the horizontal gap |Δu|, ``"v"`` the vertical
+    gap |Δv|; ``None`` is the aligned Euclidean distance (the historical behavior). A point-line
+    distance ignores ``axis`` (the foot distance is already directional).
+    """
     # Determine kinds
     def _is_line(h):
         eid = h.split(".")[0]
@@ -1769,6 +1775,35 @@ def _add_distance(sys, cid, h0, h1, d, entities, var_map):
         k0, k1 = len(idx0), len(idx1)
         combined = np.concatenate([idx0, idx1])
         _d = float(d)
+        ax = (axis or None)
+        if isinstance(ax, str):
+            ax = ax.lower()
+
+        if ax in ("h", "v"):
+            # Axis-aligned gap: residual = |Δcoord| - d (coord = u for "h", v for "v"). Smooth via a
+            # signed residual whose sign tracks the current gap (avoids the abs() kink at the root;
+            # mirrors how the angle residual uses a signed atan2 with a fixed sign per evaluation).
+            comp = 0 if ax == "h" else 1   # which coordinate (x=u, y=v)
+
+            def _r(xs):
+                P0 = vf0(xs[:k0])
+                P1 = vf1(xs[k0:k0+k1])
+                return np.array([abs(P0[comp] - P1[comp]) - _d])
+
+            def _j(xs):
+                P0 = vf0(xs[:k0])
+                P1 = vf1(xs[k0:k0+k1])
+                J0 = jf0(xs[:k0])
+                J1 = jf1(xs[k0:k0+k1])
+                delta = P0[comp] - P1[comp]
+                sgn = 1.0 if delta >= 0 else -1.0
+                J = np.zeros((1, k0 + k1))
+                J[0, :k0] = sgn * J0[comp, :]
+                J[0, k0:] = -sgn * J1[comp, :]
+                return J
+
+            sys.add_residual(_r, combined, _j, cid)
+            return
 
         def _r(xs):
             P0 = vf0(xs[:k0])
@@ -2060,6 +2095,136 @@ def _compute_entity_statuses(
             statuses[eid] = "under"
 
     return statuses
+
+
+# ---------------------------------------------------------------------------
+# Dimensional measurement (driven dims + response annotations)
+# ---------------------------------------------------------------------------
+
+_DIMENSIONAL_TYPES = ("distance", "angle", "radius", "diameter")
+
+
+def _handle_point(handle: str, entity_coords: dict):
+    """World (x, y) of a point handle against SOLVED entity coords (EntityCoords from
+    :func:`_extract_entities`). Returns None if it cannot be resolved (dangling)."""
+    if "." in handle:
+        eid, sub = handle.split(".", 1)
+    else:
+        eid, sub = handle, None
+    ent = entity_coords.get(eid)
+    if ent is None:
+        return None
+    et = ent.get("type")
+    if et == "point":
+        return tuple(ent["p"])
+    if et == "line":
+        if sub in (None, "p1"):
+            return tuple(ent["p1"])
+        if sub == "p2":
+            return tuple(ent["p2"])
+    if et in ("circle", "arc", "ellipse", "ellipse_arc", "arc_slot"):
+        c = ent.get("center")
+        if sub in (None, "center") and c is not None:
+            return tuple(c)
+        if et == "arc" and sub in ("start", "end"):
+            cx, cy = ent["center"]
+            r = ent["radius"]
+            a = ent["start"] if sub == "start" else ent["end"]
+            ar = a * _DEG
+            return (cx + r * math.cos(ar), cy + r * math.sin(ar))
+    if et == "slot":
+        if sub in (None, "p1"):
+            return tuple(ent["p1"])
+        if sub == "p2":
+            return tuple(ent["p2"])
+    return None
+
+
+def _line_endpoints(handle: str, entity_coords: dict):
+    """(p1, p2) of a line entity referenced by a (possibly sub-less) handle, or None."""
+    eid = handle.split(".")[0]
+    ent = entity_coords.get(eid)
+    if ent is None or ent.get("type") != "line":
+        return None
+    return tuple(ent["p1"]), tuple(ent["p2"])
+
+
+def measure_constraint(constraint: dict, entity_coords: dict):
+    """Current solved measurement for a DIMENSIONAL constraint, in canonical units.
+
+    distance → mm (point-point Euclidean, or |Δu|/|Δv| with axis, or perpendicular point-line);
+    angle → degrees in [0, 180); radius/diameter → mm. Geometric relations (coincident, parallel,
+    …) return None. Returns None when the refs cannot be resolved against ``entity_coords``.
+    """
+    ctype = constraint.get("type")
+    refs = constraint.get("refs", []) or []
+    if ctype not in _DIMENSIONAL_TYPES:
+        return None
+
+    if ctype == "radius":
+        eid = refs[0].split(".")[0] if refs else None
+        ent = entity_coords.get(eid) if eid else None
+        if ent and ent.get("type") in ("circle", "arc"):
+            return float(ent["radius"])
+        return None
+
+    if ctype == "diameter":
+        eid = refs[0].split(".")[0] if refs else None
+        ent = entity_coords.get(eid) if eid else None
+        if ent and ent.get("type") in ("circle", "arc"):
+            return float(ent["radius"]) * 2.0
+        return None
+
+    if ctype == "angle":
+        if len(refs) < 2:
+            return None
+        la = _line_endpoints(refs[0], entity_coords)
+        lb = _line_endpoints(refs[1], entity_coords)
+        if la is None or lb is None:
+            return None
+        ux, uy = la[1][0] - la[0][0], la[1][1] - la[0][1]
+        vx, vy = lb[1][0] - lb[0][0], lb[1][1] - lb[0][1]
+        cross = ux * vy - uy * vx
+        dot = ux * vx + uy * vy
+        theta = math.degrees(math.atan2(abs(cross), dot))
+        # Report in [0, 180) — atan2(|cross|, dot) already lies in [0, 180].
+        return float(theta % 180.0)
+
+    if ctype == "distance":
+        if len(refs) < 2:
+            return None
+        # point-line?
+        def _is_line(h):
+            eid = h.split(".")[0]
+            ent = entity_coords.get(eid)
+            return ent is not None and ent.get("type") == "line" and "." not in h
+
+        if _is_line(refs[0]) or _is_line(refs[1]):
+            line_h = refs[0] if _is_line(refs[0]) else refs[1]
+            pt_h = refs[1] if _is_line(refs[0]) else refs[0]
+            le = _line_endpoints(line_h, entity_coords)
+            P = _handle_point(pt_h, entity_coords)
+            if le is None or P is None:
+                return None
+            (ax, ay), (bx, by) = le
+            dxab, dyab = bx - ax, by - ay
+            L = math.hypot(dxab, dyab)
+            if L < 1e-12:
+                return float(math.hypot(P[0] - ax, P[1] - ay))
+            cross = dxab * (P[1] - ay) - dyab * (P[0] - ax)
+            return float(abs(cross) / L)
+        P0 = _handle_point(refs[0], entity_coords)
+        P1 = _handle_point(refs[1], entity_coords)
+        if P0 is None or P1 is None:
+            return None
+        axis = constraint.get("axis")
+        if isinstance(axis, str) and axis.lower() == "h":
+            return float(abs(P0[0] - P1[0]))
+        if isinstance(axis, str) and axis.lower() == "v":
+            return float(abs(P0[1] - P1[1]))
+        return float(math.hypot(P0[0] - P1[0], P0[1] - P1[1]))
+
+    return None
 
 
 # ---------------------------------------------------------------------------

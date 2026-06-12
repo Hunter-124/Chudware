@@ -84,6 +84,9 @@ class DocSession:
     asm_warm: dict = field(default_factory=dict)
     explode_active: bool = False
     explode_factor: float = 0.0
+    # C35-overhaul §5 — live PropertyManager-cancel checkpoints: id -> doc-JSON snapshot string.
+    # Multiple live checkpoints allowed; all cleared on doc close/new/open.
+    checkpoints: dict[str, str] = field(default_factory=dict)
 
     @property
     def is_assembly(self) -> bool:
@@ -309,6 +312,51 @@ def _tree(session: DocSession) -> dict:
     return copy.deepcopy(session.doc)
 
 
+def _owner_map(session: DocSession, result: CompileResult) -> dict:
+    """Invert the compiler's per-body face/edge owner tags into a per-FEATURE map (C35-overhaul §1).
+
+    The compiler keys ``face_owners``/``edge_owners`` by the per-rebuild string body key ("b1", ...)
+    and a 1-based TopExp topo index; :func:`_write_aicm` re-numbers solid bodies to the 1-based AICM
+    ordinal (the integer ``body_id`` the host's PickHit and :func:`resolve_pick` use). Here we walk
+    those maps and produce, per creating-feature-id::
+
+        {"<fid>": {"bodies": [<body_id>...],
+                    "faces": [[body_id, face_id], ...],
+                    "edges": [[body_id, edge_id], ...]}}
+
+    where every id is the integer pick id (body ordinal / 1-based topo index). A feature owns a body
+    iff it owns at least one of that body's faces (the representative-owner rule used by whole-body
+    selectors). Assemblies have no part-feature topology diff, so the map is empty for them.
+    """
+    out: dict[str, dict] = {}
+    if session.is_assembly:
+        return out
+
+    def slot(fid: str) -> dict:
+        return out.setdefault(fid, {"bodies": [], "faces": [], "edges": []})
+
+    body_face_owners: dict[int, set[str]] = {}
+    for ordinal, bo in enumerate(result.bodies, start=1):
+        faces = result.face_owners.get(bo.body_id, {}) or {}
+        edges = result.edge_owners.get(bo.body_id, {}) or {}
+        owners_here: set[str] = set()
+        for topo_id, fid in sorted(faces.items()):
+            slot(fid)["faces"].append([ordinal, int(topo_id)])
+            owners_here.add(fid)
+        for topo_id, fid in sorted(edges.items()):
+            slot(fid)["edges"].append([ordinal, int(topo_id)])
+            owners_here.add(fid)
+        body_face_owners[ordinal] = {f for t, f in faces.items()}
+
+    # A feature "owns" a body if it owns any face of it (whole-body attribution).
+    for ordinal, fids in body_face_owners.items():
+        for fid in sorted(fids):
+            slot(fid)["bodies"].append(ordinal)
+    for rec in out.values():
+        rec["bodies"].sort()
+    return out
+
+
 def _doc_status(session: DocSession, result: CompileResult) -> dict:
     st = session.active_sketch
     mates_status = None
@@ -340,7 +388,8 @@ def _ops_response(session: DocSession, result: CompileResult,
     else:
         feature_status = [
             {"id": s["id"], "ok": s["ok"], "ms": s["ms"], "error": s["error"],
-             "dangling_refs": s.get("dangling_refs", [])}
+             "dangling_refs": s.get("dangling_refs", []),
+             "rolled_back": s.get("rolled_back", False)}
             for s in result.feature_status
         ]
         rebuild = {
@@ -353,6 +402,7 @@ def _ops_response(session: DocSession, result: CompileResult,
         "tree": _tree(session),
         "rebuild": rebuild,
         "tess": {"aicm_path": aicm_path, "bodies": bodies_meta},
+        "owner_map": _owner_map(session, result),
     }
 
 
@@ -419,7 +469,11 @@ def rebuild(session: DocSession, emit: EmitFn | None = None) -> dict:
 
 
 def tree(session: DocSession) -> dict:
-    return {"revision": session.revision, "tree": _tree(session)}
+    # doc_tree does not rebuild, but it MUST carry the owner_map (C35-overhaul §1). Use the last
+    # build if present; otherwise build once so faces/edges have owner tags to expose.
+    result = session.last_result if session.last_result is not None else _ensure_built(session)
+    return {"revision": session.revision, "tree": _tree(session),
+            "owner_map": _owner_map(session, result)}
 
 
 def undo(session: DocSession, emit: EmitFn | None = None) -> dict:
@@ -448,6 +502,46 @@ def redo(session: DocSession, emit: EmitFn | None = None) -> dict:
     session.revision += 1
     session.dirty = True
     session.asm_warm = {}  # re-seed mate solve from the restored doc transforms
+    result = _rebuild(session, emit)
+    return _ops_response(session, result, {})
+
+
+# =========================================================================== C35-overhaul §5
+#
+# PropertyManager-cancel checkpoints. doc_checkpoint deep-snapshots the current doc; doc_revert
+# restores it, rebuilds, bumps the revision, and pushes ONE undo entry (a single undo after a revert
+# returns to the pre-revert state). Checkpoints are per-session and cleared on close/new/open.
+
+
+def checkpoint(session: DocSession) -> dict:
+    """Take a deep snapshot of the current doc and return its checkpoint id (C35-overhaul §5)."""
+    cid = "ckpt-" + uuid.uuid4().hex[:10]
+    session.checkpoints[cid] = session._snapshot()
+    return {"checkpoint": cid}
+
+
+def revert(session: DocSession, checkpoint_id: str, emit: EmitFn | None = None) -> dict:
+    """Restore the doc to a previously-taken checkpoint (C35-overhaul §5).
+
+    Pushes ONE undo entry of the CURRENT (pre-revert) doc, swaps in the snapshot, rebuilds, and
+    bumps the revision — so a single undo after a revert returns to the pre-revert state. Reverting
+    when the doc already equals the snapshot is cheap (a no-op rebuild) but still returns the full
+    ops-response. The checkpoint stays live (re-revertable)."""
+    import json
+    snap = session.checkpoints.get(checkpoint_id)
+    if snap is None:
+        raise OpError("invalid_op", f"no such checkpoint '{checkpoint_id}'",
+                      {"reason": "unknown checkpoint", "checkpoint": checkpoint_id})
+    current = session._snapshot()
+    # One undo entry of the pre-revert state (a single undo restores it). Clears redo like any edit.
+    session.undo_stack.append(current)
+    if len(session.undo_stack) > _UNDO_LIMIT:
+        session.undo_stack.pop(0)
+    session.redo_stack.clear()
+    session.doc = json.loads(snap)
+    session.revision += 1
+    session.dirty = True
+    session.asm_warm = {}  # re-seed mate solve from the restored transforms
     result = _rebuild(session, emit)
     return _ops_response(session, result, {})
 
@@ -842,6 +936,39 @@ def _overall_status(statuses: dict, dof: int, conflicting: list) -> str:
     return "under"
 
 
+def _sketch_constraints(sketch_feat: dict, entity_coords: dict) -> list[dict]:
+    """Pack EVERY constraint in the active sketch for the C++ sketcher's dimension annotations
+    (C35-overhaul §2). Each record: ``{id, type, refs, value, expr, driven, placement, measured}``.
+
+    ``measured`` is the current solved measurement for dimensional types (distance/angle/radius/
+    diameter), null for geometric relations; ``value``/``expr`` come from the stored dim; ``driven``
+    and ``placement`` default to false/null when unset.
+    """
+    from engine.doc.sketch_solver import measure_constraint
+    out: list[dict] = []
+    params = sketch_feat.get("params", {}) or {}
+    for c in params.get("constraints", []) or []:
+        if not isinstance(c, dict):
+            continue
+        val_obj = c.get("value") if isinstance(c.get("value"), dict) else None
+        rec = {
+            "id": c.get("id"),
+            "type": c.get("type"),
+            "refs": list(c.get("refs", []) or []),
+            "value": val_obj.get("value") if val_obj else None,
+            "expr": val_obj.get("expr") if val_obj else None,
+            "driven": bool(c.get("driven", False)),
+            "placement": c.get("placement"),
+            "measured": None,
+        }
+        try:
+            rec["measured"] = measure_constraint(c, entity_coords)
+        except Exception:  # noqa: BLE001
+            rec["measured"] = None
+        out.append(rec)
+    return out
+
+
 def _solve_active(session: DocSession, sketch_feat: dict, warm) -> dict:
     """Solve the active sketch and pack the sketch_enter/solve result dict (minus plane_frame)."""
     from engine.doc.sketch_solver import solve_sketch
@@ -893,6 +1020,7 @@ def sketch_enter(session: DocSession, sketch_fid: str) -> dict:
         "plane_frame": frame,
         "status": st.last_overall_status,
         "conflicting": packed["conflicting"],
+        "constraints": _sketch_constraints(feat, packed["entity_map"]),
     }
 
 
@@ -918,6 +1046,7 @@ def sketch_solve(session: DocSession, sketch_fid: str) -> dict:
         "plane_frame": st.plane_frame,
         "status": st.last_overall_status,
         "conflicting": packed["conflicting"],
+        "constraints": _sketch_constraints(feat, packed["entity_map"]),
     }
 
 
@@ -947,7 +1076,8 @@ def sketch_drag(session: DocSession, sketch_fid: str, handle: str, xy) -> dict:
     # Remember the dragged coords so commit can persist them (transient; no warm-state churn).
     st.last_entities = dict(res["entities"])
     st.last_statuses = dict(res.get("statuses", {}))
-    return {"entities": entities, "statuses": res.get("statuses", {})}
+    return {"entities": entities, "statuses": res.get("statuses", {}),
+            "constraints": _sketch_constraints(feat, res["entities"])}
 
 
 def sketch_drag_commit(session: DocSession, sketch_fid: str,
@@ -971,13 +1101,20 @@ def sketch_drag_commit(session: DocSession, sketch_fid: str,
         ops.append({"op": "sketch_edit_entity", "sketch": sketch_fid, "id": eid, "params": patch})
 
     resp = apply_ops(session, None, ops, emit=emit)
-    # Re-solve so warm state matches the freshly persisted document.
+    # Re-solve so warm state matches the freshly persisted document, and surface the constraint
+    # annotations (with refreshed `measured`) for the C++ sketcher (C35-overhaul §2).
     if session.active_sketch is not None and session.active_sketch.sketch_fid == sketch_fid:
         try:
-            sketch_solve(session, sketch_fid)
+            solved = sketch_solve(session, sketch_fid)
             resp["rebuild"]["doc_status"] = _doc_status(session, session.last_result)
+            resp["constraints"] = solved.get("constraints", [])
         except Exception:  # noqa: BLE001
             pass
+    if "constraints" not in resp:
+        # Fall back to measuring against the just-committed (stored) coords.
+        feat2 = _find_sketch_feature(session, sketch_fid)
+        resp["constraints"] = _sketch_constraints(
+            feat2, session.active_sketch.last_entities if session.active_sketch else {})
     return resp
 
 

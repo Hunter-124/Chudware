@@ -21,44 +21,79 @@ static nlohmann::json selectionRefs(AppState& st) {
     return refs;
 }
 
+// C39: evals run async on st.rpc — heavy methods (interference, thickness on a dense model)
+// used to freeze the window for their full duration. The callback runs on the GL thread
+// inside the per-frame drain; gen_ guards against a newer eval superseding a pending one.
 void EvaluateDialogs::runEval(AppState& st, const std::string& method,
                               const nlohmann::json& extra) {
     errorText_.clear();
     result_ = nlohmann::json::object();
+    pending_ = false;
     if (!st.docMirror.hasDoc()) { errorText_ = "No document loaded."; return; }
     nlohmann::json params = {{"doc_id", st.docMirror.docId()}};
     for (auto it = extra.begin(); it != extra.end(); ++it) params[it.key()] = it.value();
-    nlohmann::json result;
-    std::string err;
-    if (!st.worker.call(method, params, result, err, 60000)) {
-        errorText_ = err.empty() ? ("worker call failed: " + method) : err;
-        return;
-    }
-    if (result.is_object() && result.contains("code")) {
-        errorText_ = result.value("message", std::string("evaluate error"));
-        return;
-    }
-    result_ = result;
+    pending_ = true;
+    const int gen = ++gen_;
+    st.rpc.call(method, params, [this, gen, method](const core::RpcResult& r) {
+        if (gen != gen_) return;  // a newer eval replaced this one
+        pending_ = false;
+        if (!r.ok) {
+            errorText_ = r.err.empty() ? ("worker call failed: " + method) : r.err;
+            return;
+        }
+        if (r.result.is_object() && r.result.contains("code")) {
+            errorText_ = r.result.value("message", std::string("evaluate error"));
+            return;
+        }
+        result_ = r.result;
+    }, 60000);
 }
 
 void EvaluateDialogs::runFieldEval(AppState& st, const std::string& method,
                                    const nlohmann::json& extra,
                                    const std::string& legendTitle, const std::string& units) {
-    runEval(st, method, extra);
-    if (!errorText_.empty()) { openWindow_ = "field_err"; title_ = legendTitle; return; }
-    std::string aicm = result_.value("aicm_path", std::string());
-    if (aicm.empty()) { errorText_ = "no overlay produced"; openWindow_ = "field_err"; title_ = legendTitle; return; }
-    std::string le;
-    if (!st.loadDocMesh(aicm, le)) { errorText_ = "overlay load failed: " + le; openWindow_ = "field_err"; title_ = legendTitle; return; }
-    st.colormapOn = true;
-    if (st.renderer) st.renderer->setColormapMode(true);
-    st.legendOn = true;
-    st.legendTitle = legendTitle;
-    st.legendUnits = units;
-    float vmin = 0, vmax = 1;
-    if (st.renderer && st.renderer->scalarRange(vmin, vmax)) { st.legendMin = vmin; st.legendMax = vmax; }
-    openWindow_.clear();  // field results are shown in-viewport, not a window
-    st.addLog("[eval] " + method + " overlay loaded");
+    errorText_.clear();
+    result_ = nlohmann::json::object();
+    pending_ = false;
+    title_ = legendTitle;
+    if (!st.docMirror.hasDoc()) { errorText_ = "No document loaded."; openWindow_ = "field_err"; return; }
+    nlohmann::json params = {{"doc_id", st.docMirror.docId()}};
+    for (auto it = extra.begin(); it != extra.end(); ++it) params[it.key()] = it.value();
+    pending_ = true;
+    const int gen = ++gen_;
+    // Field results are shown in-viewport; while computing, a small wait window gives the
+    // user feedback (the old sync call "gave feedback" by freezing the app instead).
+    openWindow_ = "field_wait";
+    st.rpc.call(method, params,
+        [this, &st, gen, method, legendTitle, units](const core::RpcResult& r) {
+            if (gen != gen_) return;
+            pending_ = false;
+            if (!r.ok) {
+                errorText_ = r.err.empty() ? ("worker call failed: " + method) : r.err;
+                openWindow_ = "field_err"; return;
+            }
+            if (r.result.is_object() && r.result.contains("code")) {
+                errorText_ = r.result.value("message", std::string("evaluate error"));
+                openWindow_ = "field_err"; return;
+            }
+            result_ = r.result;
+            std::string aicm = result_.value("aicm_path", std::string());
+            if (aicm.empty()) { errorText_ = "no overlay produced"; openWindow_ = "field_err"; return; }
+            std::string le;
+            if (!st.loadDocMesh(aicm, le)) {
+                errorText_ = "overlay load failed: " + le;
+                openWindow_ = "field_err"; return;
+            }
+            st.colormapOn = true;
+            if (st.renderer) st.renderer->setColormapMode(true);
+            st.legendOn = true;
+            st.legendTitle = legendTitle;
+            st.legendUnits = units;
+            float vmin = 0, vmax = 1;
+            if (st.renderer && st.renderer->scalarRange(vmin, vmax)) { st.legendMin = vmin; st.legendMax = vmax; }
+            openWindow_.clear();  // field results are shown in-viewport, not a window
+            st.addLog("[eval] " + method + " overlay loaded");
+        }, 60000);
 }
 
 bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
@@ -102,7 +137,15 @@ void EvaluateDialogs::draw(AppState& st) {
     bool open = true;
     ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_Appearing);
     if (ImGui::Begin(title_.c_str(), &open)) {
-        if (!errorText_.empty()) {
+        if (pending_) {
+            // C39: the eval is in flight on the dispatch thread; the result fills in when
+            // it drains. A spinner-ish pulse keeps it obviously alive.
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1));
+            ImGui::TextUnformatted("Computing");
+            ImGui::SameLine(0, 0);
+            ImGui::TextUnformatted(&"..."[2 - ((int)(ImGui::GetTime() * 3.0) % 3)]);
+            ImGui::PopStyleColor();
+        } else if (!errorText_.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.35f, 0.30f, 1));
             ImGui::TextWrapped("%s", errorText_.c_str());
             ImGui::PopStyleColor();

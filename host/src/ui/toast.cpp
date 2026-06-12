@@ -22,6 +22,9 @@ static void levelColors(ToastLevel lvl, const float*& accent, const char*& tag) 
 }
 
 void drawToasts(AppState& st) {
+    // C39: the queue is also written from background threads (worker errorSink); hold the
+    // lock for the whole pass — contention is a rare sub-microsecond push_back.
+    std::lock_guard<std::mutex> lk(st.toastsMtx);
     if (st.toasts.empty()) return;
 
     const double now = ImGui::GetTime();

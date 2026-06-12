@@ -66,6 +66,9 @@ add_executable(AI-CAD
   src/core/doc_mirror.cpp
   src/ui/feature_tree.cpp
   # --- end C16 ---
+  # --- C39: async worker dispatch (per-frame drained callbacks on the GL thread) ---
+  src/core/async_rpc.cpp
+  # --- end C39 ---
   # --- C17: PropertyManager + data-driven feature forms ---
   src/ui/property_manager.cpp
   src/ui/pm_forms.cpp

@@ -411,26 +411,38 @@ void AsmPanels::drawExplode(AppState& st) {
 // Interference Detection
 // ===========================================================================
 
+// C39: async — pairwise boolean intersections scale with component count and used to freeze
+// the window for up to 60s. The window opens immediately showing "Computing..."; the result
+// fills in when the call drains (GL thread). A re-refresh while pending supersedes (gen).
 void AsmPanels::refreshInterference(AppState& st) {
     interferenceError_.clear();
     interferenceResult_ = nlohmann::json::object();
+    interferencePending_ = false;
     if (!st.docMirror.hasDoc()) { interferenceError_ = "No assembly open."; return; }
-    nlohmann::json res; std::string err;
-    if (!st.worker.call("eval_interference", {{"doc_id", st.docMirror.docId()}}, res, err, 60000)) {
-        interferenceError_ = err.empty() ? "eval_interference failed" : err; return;
-    }
-    if (res.is_object() && res.contains("code")) {
-        interferenceError_ = res.value("message", std::string("interference error")); return;
-    }
-    interferenceResult_ = res;
-    // Surface a summary in the console so the result is observable even when the window is behind
-    // the docked viewport (and useful for scripted shots).
-    int nInter = (res.contains("interferences") && res["interferences"].is_array())
-        ? (int)res["interferences"].size() : 0;
-    int nClear = (res.contains("clearances") && res["clearances"].is_array())
-        ? (int)res["clearances"].size() : 0;
-    st.addLog("[asm] interference: " + std::to_string(nInter) + " overlap(s), " +
-              std::to_string(nClear) + " clearance(s)");
+    interferencePending_ = true;
+    const int gen = ++interferenceGen_;
+    st.rpc.call("eval_interference", {{"doc_id", st.docMirror.docId()}},
+        [this, &st, gen](const core::RpcResult& r) {
+            if (gen != interferenceGen_) return;
+            interferencePending_ = false;
+            if (!r.ok) {
+                interferenceError_ = r.err.empty() ? "eval_interference failed" : r.err; return;
+            }
+            if (r.result.is_object() && r.result.contains("code")) {
+                interferenceError_ = r.result.value("message", std::string("interference error"));
+                return;
+            }
+            interferenceResult_ = r.result;
+            // Surface a summary in the console so the result is observable even when the window
+            // is behind the docked viewport (and useful for scripted shots).
+            const auto& res = interferenceResult_;
+            int nInter = (res.contains("interferences") && res["interferences"].is_array())
+                ? (int)res["interferences"].size() : 0;
+            int nClear = (res.contains("clearances") && res["clearances"].is_array())
+                ? (int)res["clearances"].size() : 0;
+            st.addLog("[asm] interference: " + std::to_string(nInter) + " overlap(s), " +
+                      std::to_string(nClear) + " clearance(s)");
+        }, 60000);
 }
 
 void AsmPanels::drawInterference(AppState& st) {
@@ -446,7 +458,11 @@ void AsmPanels::drawInterference(AppState& st) {
         if (ImGui::Button("Refresh")) refreshInterference(st);
         ImGui::Separator();
 
-        if (!interferenceError_.empty()) {
+        if (interferencePending_) {
+            pushText(pal.textDim);
+            ImGui::TextUnformatted("Computing interference...");
+            ImGui::PopStyleColor();
+        } else if (!interferenceError_.empty()) {
             pushText(pal.statusErr);
             ImGui::TextWrapped("%s", interferenceError_.c_str());
             ImGui::PopStyleColor();
@@ -503,6 +519,8 @@ void AsmPanels::drawInterference(AppState& st) {
 void AsmPanels::refreshBom(AppState& st) {
     bomRows_.clear();
     bomNote_.clear();
+    bomPending_ = 0;
+    const int gen = ++bomGen_;  // C39: invalidates eval_mass callbacks of an older refresh
     const auto& tree = st.docMirror.tree();
     if (!tree.is_object() || !tree.contains("components") || !tree["components"].is_array()) {
         bomNote_ = "No assembly components.";
@@ -528,16 +546,22 @@ void AsmPanels::refreshBom(AppState& st) {
             bomRows_[it->second].qty += 1;
         }
     }
-    // Mass per distinct source via eval_mass on its component ordinal (cheap: one solid each).
+    // Mass per distinct source via eval_mass on its component ordinal. C39: the rows draw
+    // immediately; each mass fills in as its async call drains (the old sync loop froze the
+    // window for rows x call-time). Failures just leave haveMass=false (blank cell), as before.
     for (size_t i = 0; i < bomRows_.size(); ++i) {
-        nlohmann::json res; std::string err;
         nlohmann::json params = {{"doc_id", st.docMirror.docId()}, {"body", ordinalForRow[i]}};
-        if (st.worker.call("eval_mass", params, res, err, 60000) &&
-            res.is_object() && !res.contains("code")) {
-            bomRows_[i].volMm3 = res.value("volume_mm3", 0.0);
-            bomRows_[i].massG = res.value("mass_g", 0.0);
-            bomRows_[i].haveMass = true;
-        }
+        ++bomPending_;
+        st.rpc.call("eval_mass", params, [this, gen, i](const core::RpcResult& r) {
+            if (gen != bomGen_) return;  // a newer refresh rebuilt the rows
+            --bomPending_;
+            if (r.ok && r.result.is_object() && !r.result.contains("code") &&
+                i < bomRows_.size()) {
+                bomRows_[i].volMm3 = r.result.value("volume_mm3", 0.0);
+                bomRows_[i].massG = r.result.value("mass_g", 0.0);
+                bomRows_[i].haveMass = true;
+            }
+        }, 60000);
     }
 }
 
@@ -582,6 +606,7 @@ void AsmPanels::drawBom(AppState& st) {
                 ImGui::TableNextColumn(); ImGui::Text("%d", row.qty);
                 ImGui::TableNextColumn();
                 if (row.haveMass) ImGui::Text("%.2f", row.massG * row.qty);
+                else if (bomPending_ > 0) ImGui::TextDisabled("...");  // C39: eval_mass in flight
                 else ImGui::Text("%.0f mm3", row.volMm3 * row.qty);
             }
             ImGui::EndTable();

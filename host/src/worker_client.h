@@ -1,6 +1,7 @@
 // Spawns the Python kernel worker (engine.worker) and talks to it over stdio with
 // newline-delimited JSON-RPC. Windows pipes; one synchronous request/response per call.
 #pragma once
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -36,6 +37,11 @@ public:
               nlohmann::json& result, std::string& err, int timeoutMs = 120000,
               const EventFn& onEvent = {});
 
+    // C39: one-way teardown abort — makes a blocked (and any future) call() fail fast with
+    // err "aborted" instead of running out its timeout. Set at app exit (AsyncRpc::shutdown)
+    // so a long in-flight RPC can't hang the close. The errorSink is NOT fired for aborts.
+    void abortPending() { abort_.store(true); }
+
 private:
     bool readLine(std::string& line, int timeoutMs);
 
@@ -47,4 +53,5 @@ private:
     bool running_ = false;
     std::mutex callMtx_;             // serialize concurrent call()s
     ErrorSink errorSink_;            // W1-B: transport-error notification (optional)
+    std::atomic<bool> abort_{false}; // C39: teardown abort (one-way; see abortPending)
 };

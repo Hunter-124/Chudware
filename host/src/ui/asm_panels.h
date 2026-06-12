@@ -118,6 +118,8 @@ private:
     bool interferenceOpen_ = false, interferenceFocus_ = false;
     nlohmann::json interferenceResult_;
     std::string interferenceError_;
+    bool interferencePending_ = false;  // C39: eval_interference in flight (async)
+    int  interferenceGen_ = 0;          // C39: bumped per refresh; stale callbacks ignored
 
     // ---- BOM ----
     bool bomOpen_ = false, bomFocus_ = false;
@@ -125,6 +127,8 @@ private:
     std::vector<BomRow> bomRows_;
     std::vector<char> bomCsvPath_{std::vector<char>(512, 0)};
     std::string bomNote_;
+    int bomPending_ = 0;                // C39: eval_mass calls still in flight (async)
+    int bomGen_ = 0;                    // C39: bumped per refresh; stale callbacks ignored
 };
 
 }  // namespace ui

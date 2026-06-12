@@ -592,6 +592,10 @@ int run_gui(const char* screenshotPath) {
             }
         }
 
+        // C39: deliver finished async worker calls — their callbacks run HERE, on the GL
+        // thread, before this frame's panels draw, so results land like any other state.
+        st.rpc.drain();
+
         // Drain streamed agent progress into the active (running) assistant message so the
         // conversation updates live, iteration by iteration (texture loads stay on this thread).
         {
@@ -672,28 +676,32 @@ int run_gui(const char* screenshotPath) {
             if (st.agentV2Running) {
                 st.agentV2Running = false;
                 if (st.docMirror.hasDoc() && st.job.error.empty()) {
-                    nlohmann::json rebuildResult;
-                    std::string rerr2;
-                    if (st.worker.call("doc_rebuild",
-                                       {{"doc_id", st.docMirror.docId()}},
-                                       rebuildResult, rerr2, 60000)) {
-                        // W1-B (item 6): STALENESS FIX. The old code reloaded the mesh from the
-                        // rebuild's aicm_path but never resynced the mirror's tree/revision, so the
-                        // FeatureManager still showed the PRE-run features. Resync now (doc_tree)
-                        // which pulls the new tree + revision + owner map and fires the listener so
-                        // the tree repaints with the features the agent actually produced.
-                        st.docMirror.resync(st.worker);
-                        std::string aicmPath = rebuildResult.value("aicm_path", "");
-                        if (!aicmPath.empty()) {
-                            std::string le;
-                            st.loadDocMesh(aicmPath, le);
-                        }
-                        st.addLog("[v2] doc_rebuild + resync after run: rev=" +
-                                  std::to_string(st.docMirror.revision()));
-                    } else {
-                        st.addLog("[err] doc_rebuild after v2 run: " + rerr2);
-                        st.toast(ui::ToastLevel::Error, "Agent run finished but the model couldn't refresh");
-                    }
+                    // C39: doc_rebuild can take tens of seconds on a heavy doc — the old sync
+                    // call froze the window right after the agent finished. Queue it async;
+                    // the callback (a later frame's drain, GL thread) resyncs and reloads.
+                    st.livePhase = "Refreshing model...";
+                    st.rpc.call("doc_rebuild", {{"doc_id", st.docMirror.docId()}},
+                        [&st](const core::RpcResult& r) {
+                            st.livePhase.clear();
+                            if (r.ok) {
+                                // W1-B (item 6): STALENESS FIX. Reloading the mesh alone left the
+                                // FeatureManager showing PRE-run features. Resync (doc_tree — a
+                                // fast call) pulls the new tree + revision + owner map and fires
+                                // the listener so the tree repaints with what the agent built.
+                                st.docMirror.resync(st.worker);
+                                std::string aicmPath = r.result.value("aicm_path", "");
+                                if (!aicmPath.empty()) {
+                                    std::string le;
+                                    st.loadDocMesh(aicmPath, le);
+                                }
+                                st.addLog("[v2] doc_rebuild + resync after run: rev=" +
+                                          std::to_string(st.docMirror.revision()));
+                            } else {
+                                st.addLog("[err] doc_rebuild after v2 run: " + r.err);
+                                st.toast(ui::ToastLevel::Error,
+                                         "Agent run finished but the model couldn't refresh");
+                            }
+                        }, 60000);
                 }
             }
             // --- end C22b ---
@@ -1846,9 +1854,11 @@ int run_gui(const char* screenshotPath) {
         }
 
         // C20b assembly scenario: identical per-step capture mechanism.
+        // C39: a capture waits for async worker calls (eval_interference) to be drained —
+        // busy() stays true until the result was applied, so the frame shows the table.
         if (st.wantAsm) {
             ++st.frame;
-            if (!asmCapture.empty()) {
+            if (!asmCapture.empty() && !st.rpc.busy()) {
                 std::vector<unsigned char> px(dw * dh * 4);
                 glReadBuffer(GL_BACK);
                 glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
@@ -1888,7 +1898,8 @@ int run_gui(const char* screenshotPath) {
         }
         if (st.wantEvalMass) {
             ++st.frame;
-            if (st.evalMassShotDone && st.frame > 6) {
+            // C39: also wait for the async eval_mass to drain so the window shows values.
+            if (st.evalMassShotDone && st.frame > 6 && !st.rpc.busy()) {
                 std::vector<unsigned char> px(dw * dh * 4);
                 glReadBuffer(GL_BACK);
                 glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
@@ -1906,9 +1917,10 @@ int run_gui(const char* screenshotPath) {
         }
 
         // --- C22b activity shot capture ---
+        // C39: wait for the async post-run doc_rebuild to drain before shot1 captures.
         if (st.wantActivity) {
             ++st.frame;
-            if (!actCapture.empty()) {
+            if (!actCapture.empty() && !st.rpc.busy()) {
                 // W1-B (item 12): the dir was created up-front via std::filesystem; ensure it again
                 // here (no-op if present) instead of the old fragile std::system("mkdir ...") shell
                 // call, which could mangle quotes on some paths.
@@ -1955,6 +1967,7 @@ int run_gui(const char* screenshotPath) {
     freeChatTextures(st.chat);  // release iteration thumbnails while the GL context is still live
     ui::freeIcons();            // C14: release atlas textures while GL context is still live
     ui::destroyCursors();       // W1-B: free the GLFW standard cursors
+    st.rpc.shutdown();          // C39: drop pending async calls + abort the in-flight one
     st.worker.stop();
     simClient.stop();  // C19: shut down the second worker process
     ImGui_ImplOpenGL3_Shutdown();

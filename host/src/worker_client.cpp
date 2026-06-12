@@ -120,6 +120,7 @@ void WorkerClient::stop() {
 bool WorkerClient::readLine(std::string& line, int timeoutMs) {
     ULONGLONG start = GetTickCount64();
     for (;;) {
+        if (abort_.load()) return false;  // C39: teardown — stop polling immediately
         size_t nl = readBuf_.find('\n');
         if (nl != std::string::npos) {
             line = readBuf_.substr(0, nl);
@@ -159,6 +160,10 @@ bool WorkerClient::readLine(std::string& line, int timeoutMs) {
 bool WorkerClient::call(const std::string& method, const json& params, json& result,
                         std::string& err, int timeoutMs, const EventFn& onEvent) {
     std::lock_guard<std::mutex> lk(callMtx_);
+    if (abort_.load()) {  // C39: app is tearing down — intentional, no errorSink toast
+        err = "aborted";
+        return false;
+    }
     if (!running_) {
         err = "worker not started";
         if (errorSink_) errorSink_(method, err);  // W1-B: surface transport failures
@@ -176,6 +181,10 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
     for (;;) {
         std::string resp;
         if (!readLine(resp, timeoutMs)) {
+            if (abort_.load()) {  // C39: teardown abort, not a worker failure
+                err = "aborted";
+                return false;
+            }
             err = "timeout/closed waiting for response";
             if (errorSink_) errorSink_(method, err);  // W1-B
             return false;

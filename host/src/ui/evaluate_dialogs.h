@@ -15,8 +15,9 @@ namespace ui {
 
 class EvaluateDialogs {
 public:
-    // Handle a ribbon Evaluate command. Returns true if consumed. Synchronous worker call (eval_*
-    // are fast); on field analyses it loads the overlay + enables the colormap/legend.
+    // Handle a ribbon Evaluate command. Returns true if consumed. C39: the eval_* call runs
+    // async (st.rpc) — the result window opens immediately showing "Computing..." and fills
+    // in when the result drains; field analyses load the overlay + colormap/legend then.
     bool handleCommand(AppState& st, const std::string& cmdId);
 
     // Draw the currently-open result window (no-op when none is open).
@@ -31,6 +32,8 @@ private:
     std::string title_;
     nlohmann::json result_;      // last eval result object
     std::string errorText_;      // set when the eval failed
+    bool pending_ = false;       // C39: an eval is in flight (window shows "Computing...")
+    int  gen_ = 0;               // C39: bumped per eval; stale callbacks are ignored
 };
 
 }  // namespace ui

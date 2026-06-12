@@ -25,6 +25,7 @@
 
 #include "selection.h"   // core::Selection (pulls render::PickHit; all GL-free headers)
 #include "doc_mirror.h"  // core::DocMirror (C16)
+#include "async_rpc.h"   // core::AsyncRpc (C39) — non-blocking worker calls
 
 #include "../ui/toast.h"    // W1-B: ToastLevel / Toast (toast queue lives on AppState)
 #include "../ui/cursors.h"  // W1-B: CursorKind (per-frame cursor request)
@@ -330,6 +331,10 @@ struct AppState {
 
     // ---- runtime + worker ----
     WorkerClient worker;
+    // C39: async dispatch over the same worker. Declared AFTER worker so it is destroyed
+    // FIRST (joins its thread before the client goes away). run_gui also shuts it down
+    // explicitly before worker.stop() so teardown never waits out an RPC timeout.
+    core::AsyncRpc rpc{worker};
     std::string werr;
     bool workerStarted = false;
     bool rtReady = false;
@@ -459,6 +464,10 @@ struct AppState {
     bool activityShotDone = false; // guard so the activity scenario runs exactly once
 
     // ---- W1-B: toast notification queue (rendered by ui::drawToasts in app.cpp) ----
+    // C39: guarded by toastsMtx — the worker errorSink posts toasts from background threads
+    // (jobs.cpp agent threads, the AsyncRpc dispatch thread) while drawToasts reads on the
+    // GL thread. toast() and drawToasts() both take the lock.
+    std::mutex toastsMtx;
     std::vector<ui::Toast> toasts;
 
     // ---- W1-B: per-frame cursor request (consumed by ui::applyCursorRequest at end of frame) ----

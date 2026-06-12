@@ -224,12 +224,14 @@ void AppState::addLog(const std::string& s) {
 
 // W1-B: post a transient toast. born is filled by drawToasts on the first frame it's seen (we can't
 // reach ImGui's clock from here cheaply), so we leave born=0 and let drawToasts stamp it.
+// C39: thread-safe — the worker errorSink calls this from background threads.
 void AppState::toast(ui::ToastLevel level, std::string msg) {
     ui::Toast t;
     t.level = level;
     t.msg = std::move(msg);
     t.born = 0.0;  // 0 = unstamped; drawToasts stamps it with ImGui::GetTime() on first sight
     t.ttl = ui::toastTtl(level);
+    std::lock_guard<std::mutex> lk(toastsMtx);
     toasts.push_back(std::move(t));
     // Cap the backing queue so an error storm can't grow it without bound (drawToasts shows <= 5).
     if (toasts.size() > 32) toasts.erase(toasts.begin(), toasts.begin() + (toasts.size() - 32));

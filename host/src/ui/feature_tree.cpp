@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -19,6 +20,7 @@
 #include "imgui.h"
 
 #include "feature_tree.h"
+#include "file_dialog.h"   // C41: native Win32 Save/Open dialogs
 #include "icons.h"
 #include "sketch_mode.h"   // C18 (Edit Sketch context entry)
 #include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
@@ -214,6 +216,12 @@ static bool        s_apprOpen = false;
 static float       s_apprColor[3] = {0.71f, 0.76f, 0.82f};
 static float       s_apprMetallic = 0.0f, s_apprRoughness = 0.5f;
 
+// C41: the document's CURRENT file path ("" = never saved). Owned by this panel: Save re-uses
+// it silently (the dialog only shows on first save / Save As), the bottom strip displays its
+// file name, and a successful Open sets it. Cleared with the other transients on every doc
+// change (featureTreeResetTransient), so a New Part never inherits the previous doc's path.
+static std::string s_docPath;
+
 // W1-B (item 5): drop the tree's in-progress transient state on a doc change. Declared in
 // feature_tree.h; called from AppState::clearViewportForNewDoc and wholesale-replace paths.
 void featureTreeResetTransient() {
@@ -227,6 +235,7 @@ void featureTreeResetTransient() {
     s_rbDropAfter.clear();
     s_apprBody.clear();
     s_apprOpen = false;
+    s_docPath.clear();                  // C41: a fresh/replaced doc has no file path yet
 }
 
 // ---- C26: appearance color-picker popup ----
@@ -805,6 +814,121 @@ static bool toolbarIconBtn(const char* id, const char* iconName, const char* too
     return clicked;
 }
 
+// ---- C41: real file Save / Open (native dialogs + viewport refresh) -------------------------
+// fm_save = classic Save: silent re-save to s_docPath, dialog only on first save (or Shift+click
+// = Save As). fm_open = native Open dialog -> DocMirror::open -> applyOpenedDoc, the one shared
+// "apply a just-opened doc" seam that resets the viewport AND refreshes the geometry (the old
+// path-strip open updated the tree but never loaded the mesh).
+
+static const char* kStepPlusFilter = "AI-CAD part (*.step+)\0*.step+\0All files (*.*)\0*.*\0";
+
+static std::string pathBaseName(const std::string& p) {
+    size_t cut = p.find_last_of("\\/");
+    return cut == std::string::npos ? p : p.substr(cut + 1);
+}
+
+// Escape hatch: headless shot scenarios / CI can't click a native dialog. With
+// AI_CAD_NO_FILE_DIALOGS set the bottom strip keeps the old raw-path InputText fallback and
+// the dialog-needing paths refuse politely instead of blocking a headless run.
+static bool fileDialogsDisabled() {
+    static const bool disabled = std::getenv("AI_CAD_NO_FILE_DIALOGS") != nullptr;
+    return disabled;
+}
+
+// Suggested file name for the first save: the doc's name (else "Part1") + ".step+".
+static std::string suggestedSaveName(AppState& st) {
+    std::string name = jfld(st.docMirror.tree(), "name");
+    if (name.empty()) name = "Part1";
+    if (name.find('.') == std::string::npos) name += ".step+";
+    return name;
+}
+
+// Save the document. forceDialog = "Save As..." (always ask); otherwise the dialog only
+// appears when no path is known yet (classic Save semantics).
+static void doSaveDoc(AppState& st, bool forceDialog) {
+    if (!st.docMirror.hasDoc()) return;
+    st.addLog("[doc] save requested");
+    std::string path = s_docPath;
+    if (forceDialog || path.empty()) {
+        if (fileDialogsDisabled()) {
+            st.toast(ui::ToastLevel::Info,
+                     "File dialogs disabled — use the path field below the tree");
+            return;
+        }
+        std::string suggest = s_docPath.empty() ? suggestedSaveName(st)
+                                                : pathBaseName(s_docPath);
+        path = saveFileDialog(kStepPlusFilter, "step+", suggest.c_str());
+        if (path.empty()) return;  // canceled
+    }
+    std::string err;
+    if (st.docMirror.save(st.worker, path, err)) {
+        s_docPath = path;
+        st.addLog("[doc] saved: " + path);
+        st.toast(ui::ToastLevel::Info, "Saved " + pathBaseName(path));
+    } else {
+        st.addLog("[err] save: " + err);
+        st.toast(ui::ToastLevel::Error, "Save failed: " + err);
+    }
+}
+
+// Apply a JUST-OPENED document (DocMirror::open already succeeded, so the mirror holds the new
+// doc id / revision / tree). Factored out so BOTH open paths (native dialog and the
+// AI_CAD_NO_FILE_DIALOGS path-strip fallback) take the identical route.
+//
+// Geometry refresh: the worker's doc_open response DOES carry a tess block, but
+// DocMirror::open() discards it (doc_mirror.cpp parses only doc_id/revision/tree and is owned
+// elsewhere), so we fetch the mesh with a forced doc_rebuild — async via st.rpc to keep the GL
+// thread live. A forced rebuild does NOT bump the revision (engine/doc/session.py rebuild()),
+// so the mirror stays in step. The callback runs on the GL thread (AsyncRpc::drain), so
+// loadDocMesh / toast / resync are all safe there.
+static void applyOpenedDoc(AppState& st, const std::string& path) {
+    st.clearViewportForNewDoc();   // resets viewport + tree transients (clears s_docPath too)
+    s_docPath = path;
+    st.addLog("[doc] opened: " + path + "  rev=" + std::to_string(st.docMirror.revision()));
+    st.toast(ui::ToastLevel::Info, "Opened " + pathBaseName(path));
+    std::string base = pathBaseName(path);
+    st.rpc.call("doc_rebuild", {{"doc_id", st.docMirror.docId()}},
+        [&st, base](const core::RpcResult& r) {
+            if (!r.ok || r.result.contains("code")) {
+                std::string msg = !r.ok ? r.err : jfld(r.result, "message");
+                st.addLog("[err] open mesh refresh: " + msg);
+                st.toast(ui::ToastLevel::Warn,
+                         "Opened " + base + " — mesh refresh failed: " + msg);
+                return;
+            }
+            std::string aicm;
+            if (r.result.contains("tess") && r.result["tess"].is_object())
+                aicm = jfld(r.result["tess"], "aicm_path");
+            if (!aicm.empty()) {
+                std::string lerr;
+                if (!st.loadDocMesh(aicm, lerr) && !lerr.empty())
+                    st.addLog("[err] loadDocMesh: " + lerr);
+            }
+            // doc_open left the mirror without feature_status / owner_map (DocMirror::open
+            // clears them); doc_tree is a cheap no-rebuild pull that restores both (status
+            // badges + feature->face highlights) and fires the listener so the tree repaints.
+            st.docMirror.resync(st.worker);
+        }, 60000);
+}
+
+// Native-dialog Open: pick a .step+ file, open it in the worker, apply it.
+static void doOpenDoc(AppState& st) {
+    if (fileDialogsDisabled()) {
+        st.toast(ui::ToastLevel::Info,
+                 "File dialogs disabled — use the path field below the tree");
+        return;
+    }
+    std::string path = openFileDialog(kStepPlusFilter);
+    if (path.empty()) return;  // canceled
+    std::string err;
+    if (st.docMirror.open(st.worker, path, err)) {
+        applyOpenedDoc(st, path);
+    } else {
+        st.addLog("[err] open: " + err);
+        st.toast(ui::ToastLevel::Error, "Open failed: " + err);
+    }
+}
+
 // ---- "Name & group" — SolidWorks-style auto-naming + folder grouping ----
 // Renames every feature to a conventional per-type name ("Boss-Extrude1", "Fillet2", ...) and
 // sorts dress-up / pattern / reference / sketch features into folders. One batched op set, one
@@ -970,11 +1094,11 @@ static void drawFeatureManagerTopStrip(AppState& st) {
     }
     ImGui::SameLine(0, gap);
     if (toolbarIconBtn("fm_open", "open", "Open...", canDoc) && canDoc)
-        st.addLog("[doc] open: use the path field below the tree");
+        doOpenDoc(st);   // C41: native dialog -> DocMirror::open -> viewport refresh
     ImGui::SameLine(0, gap);
     bool canSave = canDoc && st.docMirror.hasDoc();
-    if (toolbarIconBtn("fm_save", "save", "Save...", canSave) && canSave)
-        st.addLog("[doc] save: use the path field below the tree");
+    if (toolbarIconBtn("fm_save", "save", "Save  (Shift-click: Save As...)", canSave) && canSave)
+        doSaveDoc(st, /*forceDialog=*/ImGui::GetIO().KeyShift);   // C41
     ImGui::SameLine(0, gap);
     // W1-B (item 4): route through the shared AppState helper so the toolbar buttons and the global
     // Ctrl+Z / Ctrl+Y keys take the identical path (mesh refresh + owner map + confirmation toast).
@@ -1688,30 +1812,58 @@ void drawFeatureTree(AppState& st,
         }
     }
 
-    // ---- Save / Open path strip (the New/Undo/Redo/Save buttons live in the top toolbar now) ----
+    // ---- C41: bottom file strip ----
+    // Compact row: [Save] [Save As...] [Open...] + the current file name (dimmed; "(unsaved)"
+    // until the doc is saved/opened). Buttons size themselves from their labels — no fixed-width
+    // math, so nothing clips off the panel edge (the old strip's Open button did).
+    // AI_CAD_NO_FILE_DIALOGS keeps the old raw-path InputText fallback for headless/CI use.
     bool canDoc = canDocTree;
-    if (canDoc && st.docMirror.hasDoc()) {
+    if (canDoc && (st.docMirror.hasDoc() || !fileDialogsDisabled())) {
         ImGui::Separator();
-        static char savePath[512] = "";
-        ImGui::SetNextItemWidth(-104.0f * ui::uiScale);
-        ImGui::InputText("##savepath", savePath, sizeof(savePath));
-        ImGui::SameLine();
-        if (ImGui::Button("Save") && savePath[0]) {
-            std::string err;
-            if (st.docMirror.save(st.worker, savePath, err))
-                st.addLog("[doc] saved: " + std::string(savePath));
-            else
-                st.addLog("[err] save: " + err);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Open") && savePath[0]) {
-            std::string err;
-            if (st.docMirror.open(st.worker, savePath, err)) {
-                st.addLog("[doc] opened rev=" + std::to_string(st.docMirror.revision()));
-                // If we get an aicm from the open response, load it (not typical for open).
-            } else {
-                st.addLog("[err] open: " + err);
+        if (fileDialogsDisabled()) {
+            // Escape hatch: raw path + Save/Open, the pre-C41 behavior — except Open now routes
+            // through applyOpenedDoc so the viewport mesh refreshes (the old code never did).
+            if (st.docMirror.hasDoc()) {
+                static char savePath[512] = "";
+                const ImGuiStyle& style = ImGui::GetStyle();
+                float btnW = ImGui::CalcTextSize("Save").x + ImGui::CalcTextSize("Open").x +
+                             4.0f * style.FramePadding.x + 2.0f * style.ItemSpacing.x;
+                ImGui::SetNextItemWidth(-btnW);
+                ImGui::InputText("##savepath", savePath, sizeof(savePath));
+                ImGui::SameLine();
+                if (ImGui::Button("Save") && savePath[0]) {
+                    std::string err;
+                    if (st.docMirror.save(st.worker, savePath, err)) {
+                        s_docPath = savePath;
+                        st.addLog("[doc] saved: " + std::string(savePath));
+                    } else st.addLog("[err] save: " + err);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Open") && savePath[0]) {
+                    std::string err;
+                    std::string p = savePath;
+                    if (st.docMirror.open(st.worker, p, err)) applyOpenedDoc(st, p);
+                    else st.addLog("[err] open: " + err);
+                }
             }
+        } else {
+            // File name on its own dimmed line (a narrow panel must never push it — or the
+            // buttons — past the edge); the full path shows on hover.
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1.0f));
+            std::string fileLabel = s_docPath.empty() ? "(unsaved)" : pathBaseName(s_docPath);
+            ImGui::TextUnformatted(fileLabel.c_str());
+            ImGui::PopStyleColor();
+            if (!s_docPath.empty() && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", s_docPath.c_str());
+            bool canSave = st.docMirror.hasDoc();
+            if (!canSave) ImGui::BeginDisabled();
+            if (ImGui::Button("Save")) doSaveDoc(st, /*forceDialog=*/false);
+            ImGui::SameLine();
+            if (ImGui::Button("Save As...")) doSaveDoc(st, /*forceDialog=*/true);
+            if (!canSave) ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Open...")) doOpenDoc(st);
         }
     }
 

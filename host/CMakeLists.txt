@@ -66,6 +66,7 @@ add_executable(AI-CAD
   # --- C16: feature tree + doc mirror ---
   src/core/doc_mirror.cpp
   src/ui/feature_tree.cpp
+  src/ui/file_dialog.cpp   # C41: native Win32 Save/Open dialogs
   # --- end C16 ---
   # --- C39: async worker dispatch (per-frame drained callbacks on the GL thread) ---
   src/core/async_rpc.cpp
@@ -121,7 +122,7 @@ target_include_directories(AI-CAD PRIVATE
   ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(AI-CAD PRIVATE glfw nlohmann_json::nlohmann_json)
 if(WIN32)
-  target_link_libraries(AI-CAD PRIVATE dwmapi)
+  target_link_libraries(AI-CAD PRIVATE dwmapi comdlg32)  # comdlg32: C41 file dialogs
 endif()
 
 set_target_properties(AI-CAD PROPERTIES

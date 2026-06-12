@@ -634,8 +634,13 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         }
     }
 
-    // conversation log fills the remaining height above the collapsing footers
+    // conversation log fills the remaining height above the collapsing footers.
+    // C40: reserve space for OPEN footers too (one-frame-lagged open state) — before, an
+    // opened Console/code section landed entirely below the window with no scroll path.
+    static bool s_codeOpen = false, s_consoleOpen = false;
     float footerReserve = ImGui::GetFrameHeightWithSpacing() * 2.0f + 8.0f;
+    if (s_codeOpen)    footerReserve += (140.0f + 30.0f) * ui::uiScale + 24.0f;
+    if (s_consoleOpen) footerReserve += 160.0f * ui::uiScale + 12.0f;
     float chatH = ImGui::GetContentRegionAvail().y - footerReserve;
     if (chatH < 120.0f) chatH = 120.0f;
     ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_Border);
@@ -691,7 +696,8 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     if (ImGui::SmallButton("Activity panel")) st.showActivityPanel = true;
 
     // build123d code editor — folded away by default (was always-visible before).
-    if (ImGui::CollapsingHeader("build123d code")) {
+    s_codeOpen = ImGui::CollapsingHeader("build123d code");
+    if (s_codeOpen) {
         ImGui::PushFont(fonts.mono);
         ImGui::InputTextMultiline("##code", st.code.data(), st.code.size(),
                                   ImVec2(-1, 140 * ui::uiScale));
@@ -716,7 +722,8 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
                 drawCodeBox("##builderr", st.buildErrFull, fonts.mono, 180.0f);
         }
     }
-    if (ImGui::CollapsingHeader("Console")) {
+    s_consoleOpen = ImGui::CollapsingHeader("Console");
+    if (s_consoleOpen) {
         ImGui::BeginChild("##consolebody", ImVec2(0, 160 * ui::uiScale), ImGuiChildFlags_Border);
         drawConsoleBody(st);
         ImGui::EndChild();

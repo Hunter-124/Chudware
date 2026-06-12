@@ -1718,6 +1718,8 @@ int run_gui(const char* screenshotPath) {
             else if (!nowInSketch && s_wasInSketch) st.ribbonTab = 0;   // Features
             s_wasInSketch = nowInSketch;
         }
+        // C40: accent-highlight the armed sketch tool's ribbon button.
+        ui::setRibbonActiveCmd(sketchMode.activeToolCmd());
         float ribbonH = ui::drawRibbon(st.ribbonTab, st.showRibbon);
 
         // ---------- dockspace host (between the title bar+ribbon and the status bar) ----------

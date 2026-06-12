@@ -112,6 +112,10 @@ public:
     // Short status line for the status bar ("Under Defined   DOF: 4"). Empty when inactive.
     std::string statusLine() const;
 
+    // C40: ribbon cmd id of the armed tool ("" when none) — drives the ribbon's armed-tool
+    // highlight (ui::setRibbonActiveCmd each frame from app.cpp).
+    const char* activeToolCmd() const;
+
     // The plane-normal camera angles (so the caller can hard-lock the orbit while active).
     bool cameraLock(float& yaw, float& pitch) const;
 

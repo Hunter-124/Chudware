@@ -540,6 +540,33 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     return false;
 }
 
+// C40: armed tool -> ribbon cmd id (inverse of onRibbonCommand). "" when no tool armed.
+const char* SketchMode::activeToolCmd() const {
+    if (!active_) return "";
+    switch (tool_) {
+        case SketchTool::Line:            return "sk_line";
+        case SketchTool::RectCorner:      return "sk_rect_corner";
+        case SketchTool::Circle:          return "sk_circle";
+        case SketchTool::ArcCenter:       return "sk_arc_center";
+        case SketchTool::Slot:            return "sk_slot";
+        case SketchTool::SmartDim:        return "smart_dim";
+        case SketchTool::Rect3ptCorner:   return "sk_rect_3pt_corner";
+        case SketchTool::Rect3ptCenter:   return "sk_rect_3pt_center";
+        case SketchTool::Parallelogram:   return "sk_parallelogram";
+        case SketchTool::CirclePerimeter: return "sk_circle_perimeter";
+        case SketchTool::SlotCtrStr:      return "sk_slot_ctr_str";
+        case SketchTool::SlotArcCtr:      return "sk_slot_arc_ctr";
+        case SketchTool::SlotArc3pt:      return "sk_slot_arc_3pt";
+        case SketchTool::EllipsePartial:  return "sk_ellipse_partial";
+        case SketchTool::Parabola:        return "sk_parabola";
+        case SketchTool::Conic:           return "sk_conic";
+        case SketchTool::Trim:            return "sk_trim";
+        case SketchTool::Extend:          return "sk_extend";
+        case SketchTool::Offset:          return "sk_offset_ent";
+        default:                          return "";
+    }
+}
+
 // ---------------------------------------------------------------------------
 // tool helpers
 // ---------------------------------------------------------------------------

@@ -194,6 +194,12 @@ static void ribbon_fire(const char* cmd_id) {
     else { std::printf("[ribbon] %s\n", cmd_id); std::fflush(stdout); }
 }
 
+// C40: the currently ACTIVE tool command (accent-filled button). See ribbon.h.
+static std::string s_activeCmd;
+static bool ribbon_isActive(const char* cmd_id) {
+    return !s_activeCmd.empty() && cmd_id && s_activeCmd == cmd_id;
+}
+
 static RibbonGroup& ribbon_findOrAddGroup(std::vector<RibbonGroup>& groups,
                                           const char* gLabel) {
     for (auto& g : groups)
@@ -415,6 +421,15 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     bool mainHov    = ImGui::IsItemHovered();
     bool mainHovTip = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
 
+    // C40: armed-tool highlight (drawn under the hover fill).
+    if (ribbon_isActive(cmd_id)) {
+        ImDrawList* adl = ImGui::GetWindowDrawList();
+        adl->AddRectFilled(p0, ImVec2(p0.x + bw, p0.y + bh),
+                           ui::Palette::toU32(ui::palette.accentSoft), 3.0f);
+        adl->AddRect(p0, ImVec2(p0.x + bw, p0.y + bh),
+                     ui::Palette::toU32(ui::palette.accent), 3.0f, 0, 1.5f);
+    }
+
     if (hasDrop) {
         ImGui::SameLine(0, 0);
         dropClicked = ImGui::InvisibleButton("##drop", ImVec2(kArrowW * s, bh));
@@ -534,6 +549,15 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
     clicked = ImGui::InvisibleButton("##msm", ImVec2(mainW, rowH));
     bool mainHov    = ImGui::IsItemHovered();
     bool mainHovTip = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
+
+    // C40: armed-tool highlight (drawn under the hover fill).
+    if (ribbon_isActive(cmd_id)) {
+        ImDrawList* adl = ImGui::GetWindowDrawList();
+        adl->AddRectFilled(p0, ImVec2(p0.x + totalW, p0.y + rowH),
+                           ui::Palette::toU32(ui::palette.accentSoft), 3.0f);
+        adl->AddRect(p0, ImVec2(p0.x + totalW, p0.y + rowH),
+                     ui::Palette::toU32(ui::palette.accent), 3.0f, 0, 1.5f);
+    }
 
     if (hasDrop) {
         ImGui::SameLine(0, 0);
@@ -733,6 +757,14 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
     ImGui::PopStyleColor(3);
     ImGui::PopStyleVar();
 
+    // C40: armed-tool highlight (under the hover fill).
+    if (ribbon_isActive(cmd_id)) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(p0, ImVec2(p0.x + totalW, p0.y + rowH),
+                          ui::Palette::toU32(ui::palette.accentSoft), 3.0f);
+        dl->AddRect(p0, ImVec2(p0.x + totalW, p0.y + rowH),
+                    ui::Palette::toU32(ui::palette.accent), 3.0f, 0, 1.5f);
+    }
     if (hov && enabled) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->AddRectFilled(p0, ImVec2(p0.x + totalW, p0.y + rowH),
@@ -806,6 +838,10 @@ void setRibbonCallback(std::function<void(const char* cmd_id)> cb) {
 float ribbonHeight() {
     float s = ui::uiScale;
     return (kTabH + kBodyH + 8.0f) * s;
+}
+
+void setRibbonActiveCmd(const char* cmd_id) {
+    s_activeCmd = (cmd_id && *cmd_id) ? cmd_id : "";
 }
 
 float drawRibbon(int& activeTab, bool visible) {

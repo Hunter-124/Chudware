@@ -164,6 +164,17 @@ void drawSettingsModal(AppState& st, bool busy) {
                     ImGui::Checkbox("Model supports vision (send screenshots)",
                                     &settings.vision);
                 }
+                // --- C35: local-only / offline mode (ITAR compliance) --- begin marked block ---
+                ImGui::Dummy(ImVec2(0, 6));
+                ImGui::Checkbox("Offline mode (local models only — no network egress)",
+                                &settings.offlineMode);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "When enabled, the AI refuses any provider whose endpoint is not the "
+                        "local machine (localhost / 127.0.0.1 / ::1). Cloud providers (Anthropic, "
+                        "OpenAI) are blocked outright, so no technical data ever leaves this "
+                        "computer. Enforced in the agent before every run.");
+                // --- end C35 marked block ---
                 ImGui::EndTabItem();
             }
             // --- C22b: Agents tab (role prompt editor) --- begin marked block ---

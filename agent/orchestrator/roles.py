@@ -16,13 +16,39 @@ from pathlib import Path
 
 from engine import paths
 
-ROLES = ("intake", "planner", "modeler", "reviewer", "fixer", "memory")
+# C35 micro-orchestration adds two roles: decomposer (request -> step list) and executor
+# (one step -> one op array, with a per-feature-type cheat-sheet appended at call time, NOT here).
+ROLES = ("intake", "planner", "modeler", "reviewer", "fixer", "memory",
+         "decomposer", "executor")
 
-# Roles that get the ops cheatsheet appended (they emit doc ops).
+# Roles that get the shared ops cheatsheet appended (they emit doc ops). The executor does NOT —
+# it gets only the per-step feature-type cheat-sheet (see load_cheatsheet) to stay tiny.
 _OPS_ROLES = ("modeler", "fixer")
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 _SHARED_DIR = _PROMPTS_DIR / "shared"
+_CHEATSHEET_DIR = _SHARED_DIR / "cheatsheets"
+
+# Map a step's feature type to its cheat-sheet file (one sheet loaded per step).
+_CHEATSHEET_BY_TYPE = {
+    "box": "box", "cylinder": "cylinder", "sphere": "box", "cone": "cylinder",
+    "sketch": "sketch", "extrude": "extrude", "revolve": "revolve",
+    "fillet": "fillet", "chamfer": "chamfer", "shell": "shell", "hole": "hole",
+    "linear_pattern": "pattern", "circular_pattern": "pattern", "pattern": "pattern",
+}
+
+
+def load_cheatsheet(feature_type: str) -> str:
+    """Return the editable op cheat-sheet markdown for *feature_type* (empty if none).
+
+    Only ONE sheet is loaded per executor call — the one for the current step's feature type —
+    keeping the prompt tiny for small-context models. Sheets live in
+    ``agent/prompts/shared/cheatsheets/<name>.md`` and are user-editable like any role prompt.
+    """
+    name = _CHEATSHEET_BY_TYPE.get((feature_type or "").lower())
+    if not name:
+        return ""
+    return _read(_CHEATSHEET_DIR / f"{name}.md").strip()
 
 
 def _override_dir() -> Path:

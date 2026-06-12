@@ -58,6 +58,7 @@ void loadSettings(Settings& s) {
             std::strncpy(s.baseUrl, base.c_str(), sizeof(s.baseUrl) - 1);
             s.vision = oai.value("vision", false);
         }
+        s.offlineMode = j.value("offline_mode", false);
         s.planMode = j.value("plan_mode", true);
         s.maxIters = j.value("max_iters", 0);
         s.systemPrompt = j.value("system_prompt", "");
@@ -82,6 +83,7 @@ void saveSettings(const Settings& s) {
         j["api_key"] = s.apiKey[0] ? s.apiKey : "lm-studio";
         j["openai"] = {{"base_url", s.baseUrl}, {"vision", s.vision}};
     }
+    j["offline_mode"] = s.offlineMode;
     j["plan_mode"] = s.planMode;
     if (s.maxIters > 0) j["max_iters"] = s.maxIters;
     if (!s.systemPrompt.empty()) j["system_prompt"] = s.systemPrompt;

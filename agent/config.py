@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+from urllib.parse import urlparse
 
 from engine import paths
 
@@ -35,9 +36,99 @@ DEFAULT_LOCAL_MODEL = "gemma-4-e4b"
 DEFAULT_LOCAL_BASE_URL = "http://localhost:1234/v1"
 
 
-def get_provider(name: str | None = None, cfg: dict | None = None) -> Provider:
+# --------------------------------------------------------------------------- offline mode (C35)
+# LOCAL-ONLY / OFFLINE MODE — the ITAR-compliance feature. When config.json "offline_mode" is
+# true NO technical data may leave the machine: only providers whose endpoint is a loopback host
+# (localhost / 127.0.0.1 / ::1) are allowed; cloud providers (Anthropic, OpenAI) are refused
+# outright. Enforced here at provider resolution AND re-asserted in the agent loop before every
+# run (defense in depth). The error always names the setting so the user knows what to change.
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
+OFFLINE_SETTING = "offline_mode"
+
+
+def offline_enabled(cfg: dict | None = None) -> bool:
     cfg = cfg if cfg is not None else load_config()
+    return bool(cfg.get(OFFLINE_SETTING, False))
+
+
+def _host_is_loopback(base_url: str | None) -> bool:
+    """True if *base_url*'s host is a loopback address (the only egress allowed offline)."""
+    if not base_url:
+        return False
+    host = (urlparse(base_url).hostname or "").lower()
+    return host in _LOOPBACK_HOSTS
+
+
+class OfflineModeError(RuntimeError):
+    """Raised when offline mode would be violated by the resolved provider/endpoint."""
+
+
+def provider_offline_safe(provider: Provider) -> bool:
+    """True if *provider* keeps all traffic on the local machine (loopback endpoint).
+
+    Cloud SDK providers (Anthropic, OpenAI cloud) talk to remote APIs and are never offline-safe.
+    A local OpenAI-compatible endpoint (LM Studio etc.) is safe only when its base_url is loopback.
+    The mock provider is always safe (it makes no network calls — used by tests).
+    """
+    name = getattr(provider, "name", "")
+    if name in ("mock", "mock-roles", "base"):
+        return True
+    if name == "anthropic":
+        return False  # always cloud
+    base_url = getattr(provider, "base_url", None)
+    if name == "openai":
+        # No base_url means the real OpenAI cloud endpoint; otherwise check the host.
+        return _host_is_loopback(base_url)
+    # Unknown provider with a loopback base_url is allowed; anything else is refused.
+    return _host_is_loopback(base_url)
+
+
+def assert_offline_safe(provider: Provider, cfg: dict | None = None) -> None:
+    """Defense-in-depth guard the agent loop calls before every run when offline mode is set.
+
+    No-op when offline mode is off. When on, raises :class:`OfflineModeError` (naming the setting)
+    if *provider* is not offline-safe.
+    """
+    if not offline_enabled(cfg):
+        return
+    if not provider_offline_safe(provider):
+        name = getattr(provider, "name", "?")
+        base = getattr(provider, "base_url", None) or "(cloud endpoint)"
+        raise OfflineModeError(
+            f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the resolved provider "
+            f"{name!r} -> {base} is NOT local-only, so the run is refused. Switch to a local "
+            f"(loopback) model server or disable offline mode in Settings."
+        )
+
+
+def get_provider(name: str | None = None, cfg: dict | None = None) -> Provider:
+    """Resolve the configured provider, enforcing offline mode (C35) at two points: cloud
+    providers are refused by name BEFORE construction, and the resolved provider is re-checked
+    against ``provider_offline_safe`` AFTER (catches the empty-name local default + edge cases)."""
+    cfg = cfg if cfg is not None else load_config()
+    provider = _resolve_provider(name, cfg)
+    assert_offline_safe(provider, cfg)
+    return provider
+
+
+def _resolve_provider(name: str | None, cfg: dict) -> Provider:
     name = (name or os.environ.get("AI_CAD_PROVIDER") or cfg.get("provider") or "").lower()
+    offline = offline_enabled(cfg)
+
+    # Offline mode: refuse cloud providers OUTRIGHT before constructing them (no client, no key
+    # lookup). A local OpenAI-compatible endpoint is checked against its base_url below.
+    if offline and name in ("anthropic", "openai") and name != "":
+        if name == "anthropic":
+            raise OfflineModeError(
+                f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the Anthropic "
+                f"cloud provider is refused. Use a local (loopback) model server instead.")
+        # openai: only allowed if a loopback base_url is configured.
+        if not _host_is_loopback((cfg.get("openai", {}) or {}).get("base_url")):
+            raise OfflineModeError(
+                f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the OpenAI cloud "
+                f"provider is refused. Configure a local (loopback) base_url, or disable offline "
+                f"mode in Settings.")
 
     if not name:
         # Nothing configured: default to a local LM Studio (OpenAI-compatible) endpoint

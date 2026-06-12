@@ -133,6 +133,11 @@ def run_design(request: str, doc_session, provider: Provider,
     budgets = options.get("budgets")
     control: RunControl = options.get("control") or RunControl()
 
+    # OFFLINE MODE defense-in-depth (C35): refuse to run if the resolved provider is not
+    # local-only while offline mode is set. Raises OfflineModeError naming the setting.
+    from .. import config as agent_config
+    agent_config.assert_offline_safe(provider)
+
     events = RunEvents(run_id, emit)
 
     state = DesignState(request=request,

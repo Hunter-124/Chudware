@@ -522,8 +522,18 @@ def _agent_run_v2(params: dict, emit_event: EmitFn) -> dict:
                 _RUNS[rid] = control
         emit_event(ev)
 
+    # C35: route to the MICRO-ORCHESTRATION profile for small-context local models (decompose ->
+    # per-step execute + python verify). Falls back to the full v2 machine otherwise.
+    from agent.orchestrator import micro
+    use_micro = micro.should_engage(provider, config.load_config())
+
     try:
-        result = orun.run_design(request, s, provider, emit=_register_then_emit, options=options)
+        if use_micro:
+            result = micro.run_micro_design(request, s, provider,
+                                            emit=_register_then_emit, options=options)
+        else:
+            result = orun.run_design(request, s, provider,
+                                     emit=_register_then_emit, options=options)
         seen_ids.add(result.run_id)
         return asdict(result)
     finally:

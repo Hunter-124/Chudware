@@ -822,6 +822,9 @@ def run_turn(session: Session, request: str, provider: Provider,
     the design conversation. Streams progress via ``on_event`` and returns an AgentRun."""
     if max_iters is None:
         max_iters = DEFAULT_MAX_ITERS
+    # OFFLINE MODE defense-in-depth (C35): the legacy loop is the second call site (the
+    # orchestrator run_design is the first). Refuse a non-local provider when offline mode is set.
+    agent_config.assert_offline_safe(provider)
     out_dir = paths.model_dir(session.name)
     first_turn = not session.messages
 

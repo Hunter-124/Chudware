@@ -42,6 +42,7 @@ struct Settings {
     char apiKey[256] = "";
     char baseUrl[256] = "http://localhost:1234/v1";
     bool vision = true;
+    bool offlineMode = false;    // C35: local-only mode — refuse any non-loopback provider (ITAR)
     bool planMode = true;        // draft a build plan (parts/dimensions/features) first
     int maxIters = 0;            // refine-pass cap per turn; 0 = automatic
     std::string systemPrompt;    // system prompt override; empty = built-in

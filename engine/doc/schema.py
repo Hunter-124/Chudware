@@ -328,6 +328,8 @@ def validate_constraint(
         errs.append(f"{where}.refs: {ctype} takes {lo}..{hi} refs")
         refs = []
     for i, h in enumerate(refs):
+        if isinstance(h, str) and h in ("origin", "origin.p"):
+            continue  # C50: virtual fixed sketch origin — valid in any point slot
         if not isinstance(h, str) or not HANDLE_RE.match(h):
             errs.append(f"{where}.refs[{i}]: '{h}' is not a valid handle")
             continue
@@ -355,6 +357,13 @@ def validate_constraint(
             ent = entities_by_id.get(base) if base else None
             if "." in (h or "") or (ent is not None and ent.get("type") != "line"):
                 errs.append(f"{where}.refs[{i}]: angle takes two line entity ids")
+    # C50: distance arc-conditions — optional "cond", a 2-list aligned with refs,
+    # each "center"|"min"|"max" (honored only for bare circle/arc refs; see solver).
+    if ctype == "distance" and c.get("cond") is not None:
+        cnd = c["cond"]
+        if not (isinstance(cnd, list) and len(cnd) == 2
+                and all(x in ("center", "min", "max") for x in cnd)):
+            errs.append(f"{where}.cond: must be a 2-list of 'center'|'min'|'max'")
     if ctype == "distance" and "axis" in c and c["axis"] is not None:
         if c["axis"] not in ("h", "v"):
             errs.append(f"{where}.axis: must be 'h', 'v', or null")

@@ -305,6 +305,15 @@ def _doc_sketch_overview(params: dict, _emit: EmitFn) -> dict:
     return docsess.sketch_overview(s, params["sketch"])
 
 
+def _sketch_project_ref(params: dict, _emit: EmitFn) -> dict:
+    # C50: read-only projection of a datum plane / planar face / model edge into a sketch's
+    # (u,v) plane. {doc_id, sketch, ref} -> {entity, source}; never mutates the doc, never
+    # bumps the revision, never rebuilds meshes.
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.sketch_project_ref(s, params["sketch"], params.get("ref"))
+
+
 # =========================================================================== eval_* RPC (C12)
 #
 # Per reports.md §C12: nine handlers over the active document's bodies. Field handlers tessellate
@@ -637,6 +646,7 @@ _METHODS = {
     "sketch_drag_commit": _sketch_drag_commit,
     "sketch_exit": _sketch_exit,
     "doc_sketch_overview": _doc_sketch_overview,  # C40 ghost rendering
+    "sketch_project_ref": _sketch_project_ref,  # C50 project-into-sketch (read-only)
     # Evaluate (C12)
     "eval_mass": _eval_mass,
     "eval_measure": _eval_measure,
@@ -674,6 +684,7 @@ _STRUCTURED_ERROR_METHODS = {
     "doc_solve_mates", "doc_set_explode_state",  # C20
     "sketch_enter", "sketch_solve", "sketch_drag", "sketch_drag_commit", "sketch_exit",
     "doc_sketch_overview",  # C40
+    "sketch_project_ref",  # C50
     "eval_mass", "eval_measure", "eval_section_props", "eval_interference", "eval_check",
     "eval_symmetry", "eval_draft", "eval_thickness", "eval_curvature",
     "doc_export_step", "doc_face_points",  # C19

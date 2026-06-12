@@ -26,8 +26,220 @@ extruded volume is sane.
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
+
+
+def _spawn_worker():
+    """Start the real worker subprocess; return (proc, rpc) — rpc skips event lines."""
+    p = subprocess.Popen([sys.executable, "-m", "engine.worker"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         text=True, bufsize=1)
+    _idc = [0]
+
+    def rpc(method: str, params: dict | None = None) -> dict:
+        _idc[0] += 1
+        p.stdin.write(json.dumps({"id": _idc[0], "method": method,
+                                  "params": params or {}}) + "\n")
+        p.stdin.flush()
+        while True:
+            line = p.stdout.readline()
+            if not line:
+                raise RuntimeError("worker closed the pipe unexpectedly")
+            msg = json.loads(line)
+            if "event" in msg:
+                continue
+            return msg
+
+    return p, rpc
+
+
+def test_sketch_project_ref() -> None:
+    """C50 sketch_project_ref over the REAL worker subprocess.
+
+    Box doc: datum line into a top-plane sketch, a planar (vertical) box face, a linear
+    box edge, a vertical box edge (projects to a point). Cylinder doc: circular edge into
+    a top sketch -> circle; same edge into a front sketch -> unsupported_ref; parallel
+    datum -> unsupported_ref. The method is READ-ONLY: the revision never moves.
+    """
+    p, rpc = _spawn_worker()
+    try:
+        r = rpc("ping")
+        assert r["ok"] and r["result"]["protocol"] == 2, r
+
+        # ---- box doc: 80 x 40 x 10 centered at the origin + a sketch on plane.top ----
+        r = rpc("doc_new", {"kind": "part"})
+        assert r["ok"], r
+        doc_id = r["result"]["doc_id"]
+        r = rpc("doc_apply_ops", {"doc_id": doc_id, "base_revision": 0, "ops": [
+            {"op": "add_feature", "feature": {
+                "type": "box", "name": "Box1",
+                "params": {"length": {"value": 80.0, "expr": None},
+                           "width": {"value": 40.0, "expr": None},
+                           "height": {"value": 10.0, "expr": None}}}},
+            {"op": "add_feature", "feature": {
+                "type": "sketch", "name": "Sketch1",
+                "refs": {"plane": "plane.top"},
+                "params": {"entities": [], "constraints": []}}}]})
+        assert r["ok"], r
+        sk = r["result"]["id_map"]["$1"]
+        rev0 = r["result"]["revision"]
+
+        # 1. datum front -> the u axis (v == 0), span >= 2x bbox diag (>= 100mm half)
+        r = rpc("sketch_project_ref", {"doc_id": doc_id, "sketch": sk,
+                                       "ref": {"datum": "front"}})
+        assert r["ok"], r
+        ent = r["result"]["entity"]
+        assert ent["type"] == "line", ent
+        assert abs(ent["p1"][1]) < 1e-6 and abs(ent["p2"][1]) < 1e-6, ent
+        dlen = math.hypot(ent["p2"][0] - ent["p1"][0], ent["p2"][1] - ent["p1"][1])
+        assert dlen >= 200.0, f"datum line too short: {dlen}"
+        assert r["result"]["source"] == "plane.front", r["result"]
+        print(f"[project] datum front -> line v=0, len={dlen:.1f}")
+
+        # also the 'plane.right' spelling -> the v axis (u == 0)
+        r = rpc("sketch_project_ref", {"doc_id": doc_id, "sketch": sk,
+                                       "ref": {"datum": "plane.right"}})
+        assert r["ok"], r
+        ent = r["result"]["entity"]
+        assert ent["type"] == "line" and abs(ent["p1"][0]) < 1e-6 and abs(ent["p2"][0]) < 1e-6, ent
+
+        # collect the box's face + edge selectors via doc_resolve_pick
+        def pick_all(kind: str) -> list[dict]:
+            out = []
+            topo = 1
+            while True:
+                rr = rpc("doc_resolve_pick", {"doc_id": doc_id, "body_id": 1,
+                                              "kind": kind, "topo_id": topo})
+                if not rr["ok"]:
+                    break
+                out.append(rr["result"]["selector"])
+                topo += 1
+            return out
+
+        faces = pick_all("face")
+        edges = pick_all("edge")
+        # TopExp_Explorer visits shared edges once per owning face (24 for a box)
+        assert len(faces) == 6 and len(edges) >= 12, (len(faces), len(edges))
+
+        # 2. planar vertical face (normal +-x at u = +-40) -> intersection line u=+-40,
+        #    spanned by the face's projected vertices (40 wide) + 5mm pad each side.
+        fsel = next(s for s in faces
+                    if s["axis"] is not None and abs(abs(s["axis"][0]) - 1.0) < 1e-6)
+        r = rpc("sketch_project_ref", {"doc_id": doc_id, "sketch": sk,
+                                       "ref": {"kind": "face", "selector": fsel}})
+        assert r["ok"], r
+        ent = r["result"]["entity"]
+        assert ent["type"] == "line", ent
+        ux = fsel["centroid"][0]
+        assert abs(ent["p1"][0] - ux) < 1e-6 and abs(ent["p2"][0] - ux) < 1e-6, (ent, ux)
+        flen = math.hypot(ent["p2"][0] - ent["p1"][0], ent["p2"][1] - ent["p1"][1])
+        assert abs(flen - 50.0) < 1e-5, f"face span should be 40 + 2*5 pad = 50, got {flen}"
+        print(f"[project] vertical face -> line u={ux:.1f}, len={flen:.1f}")
+
+        # 3. linear box edge along x (top rim) -> a line at the edge's y, full 80 length
+        esel = next(s for s in edges
+                    if s["surf"] == "line" and s["axis"] is not None
+                    and abs(abs(s["axis"][0]) - 1.0) < 1e-6)
+        r = rpc("sketch_project_ref", {"doc_id": doc_id, "sketch": sk,
+                                       "ref": {"kind": "edge", "selector": esel}})
+        assert r["ok"], r
+        ent = r["result"]["entity"]
+        assert ent["type"] == "line", ent
+        ey = esel["centroid"][1]
+        assert abs(ent["p1"][1] - ey) < 1e-6 and abs(ent["p2"][1] - ey) < 1e-6, (ent, ey)
+        elen = math.hypot(ent["p2"][0] - ent["p1"][0], ent["p2"][1] - ent["p1"][1])
+        assert abs(elen - 80.0) < 1e-5, f"projected edge length should be 80, got {elen}"
+        print(f"[project] linear edge -> line v={ey:.1f}, len={elen:.1f}")
+
+        # 4. vertical box edge (along z == the sketch normal) -> projects to ONE point
+        vsel = next(s for s in edges
+                    if s["surf"] == "line" and s["axis"] is not None
+                    and abs(abs(s["axis"][2]) - 1.0) < 1e-6)
+        r = rpc("sketch_project_ref", {"doc_id": doc_id, "sketch": sk,
+                                       "ref": {"kind": "edge", "selector": vsel}})
+        assert r["ok"], r
+        ent = r["result"]["entity"]
+        assert ent["type"] == "point", ent
+        assert abs(ent["p"][0] - vsel["centroid"][0]) < 1e-6 \
+            and abs(ent["p"][1] - vsel["centroid"][1]) < 1e-6, (ent, vsel["centroid"])
+        print(f"[project] vertical edge -> point {ent['p']}")
+
+        # 5. parallel datum -> structured unsupported_ref error
+        r = rpc("sketch_project_ref", {"doc_id": doc_id, "sketch": sk,
+                                       "ref": {"datum": "top"}})
+        assert not r["ok"], "projecting a parallel plane must fail"
+        assert r["error"]["code"] == "unsupported_ref", r["error"]
+        assert "parallel" in r["error"]["message"], r["error"]
+        print(f"[project] parallel datum -> {r['error']['code']}: {r['error']['message']}")
+
+        # READ-ONLY: nothing above moved the revision
+        r = rpc("doc_tree", {"doc_id": doc_id})
+        assert r["ok"] and r["result"]["revision"] == rev0, \
+            f"sketch_project_ref must not bump the revision ({r['result']['revision']} != {rev0})"
+
+        # ---- cylinder doc: circular edge -> circle; tilted axis -> unsupported ----
+        r = rpc("doc_new", {"kind": "part"})
+        assert r["ok"], r
+        doc2 = r["result"]["doc_id"]
+        r = rpc("doc_apply_ops", {"doc_id": doc2, "base_revision": 0, "ops": [
+            {"op": "add_feature", "feature": {
+                "type": "cylinder", "name": "Boss1",
+                "params": {"radius": {"value": 15.0, "expr": None},
+                           "height": {"value": 20.0, "expr": None}}}},
+            {"op": "add_feature", "feature": {
+                "type": "sketch", "name": "TopSketch",
+                "refs": {"plane": "plane.top"},
+                "params": {"entities": [], "constraints": []}}},
+            {"op": "add_feature", "feature": {
+                "type": "sketch", "name": "FrontSketch",
+                "refs": {"plane": "plane.front"},
+                "params": {"entities": [], "constraints": []}}}]})
+        assert r["ok"], r
+        sk_top = r["result"]["id_map"]["$1"]
+        sk_front = r["result"]["id_map"]["$2"]
+
+        # circular rim edge of the boss
+        csel = None
+        topo = 1
+        while True:
+            rr = rpc("doc_resolve_pick", {"doc_id": doc2, "body_id": 1,
+                                          "kind": "edge", "topo_id": topo})
+            if not rr["ok"]:
+                break
+            if rr["result"]["selector"]["surf"] == "circle":
+                csel = rr["result"]["selector"]
+                break
+            topo += 1
+        assert csel is not None, "cylinder must expose a circular edge"
+
+        # 6. circle axis parallel to the top sketch normal -> circle entity
+        r = rpc("sketch_project_ref", {"doc_id": doc2, "sketch": sk_top,
+                                       "ref": {"kind": "edge", "selector": csel}})
+        assert r["ok"], r
+        ent = r["result"]["entity"]
+        assert ent["type"] == "circle", ent
+        assert abs(ent["radius"] - 15.0) < 1e-6, ent
+        assert abs(ent["center"][0]) < 1e-6 and abs(ent["center"][1]) < 1e-6, ent
+        print(f"[project] circular edge -> circle r={ent['radius']:.1f} @ {ent['center']}")
+
+        # 7. same edge into the FRONT sketch (axis perpendicular to the normal) -> error
+        r = rpc("sketch_project_ref", {"doc_id": doc2, "sketch": sk_front,
+                                       "ref": {"kind": "edge", "selector": csel}})
+        assert not r["ok"], "tilted circular edge must be unsupported"
+        assert r["error"]["code"] == "unsupported_ref", r["error"]
+        assert "not supported" in r["error"]["message"], r["error"]
+        print(f"[project] tilted circle -> {r['error']['code']}")
+
+        rpc("shutdown")
+        print("\nSKETCH PROJECT REF WORKER TEST PASSED")
+    finally:
+        try:
+            p.stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+        p.wait(timeout=60)
 
 
 def main() -> None:
@@ -242,3 +454,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    test_sketch_project_ref()

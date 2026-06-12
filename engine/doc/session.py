@@ -1173,3 +1173,265 @@ def sketch_exit(session: DocSession, sketch_fid: str, emit: EmitFn | None = None
             session.undo_stack.pop()  # nothing changed — don't leave a no-op undo step
     session.active_sketch = None
     return rebuild(session, emit=emit)
+
+
+# =========================================================================== C50 sketch projection
+#
+# sketch_project_ref — READ-ONLY projection of a datum plane / planar face / model edge into a
+# sketch's (u,v) plane (the SolidWorks "project into sketch"). Projection is along the sketch
+# plane normal. Never mutates the doc, never bumps the revision, never re-tessellates: the HOST
+# takes the returned 2D entity and adds it itself (construction geometry + a whole-entity fix).
+
+
+def _plane_uv_frame(plane):
+    """(origin, u, v, n) of a build123d Plane as float64 world-coord arrays."""
+    import numpy as np
+    O = np.asarray(plane.origin.to_tuple(), dtype=float)
+    u = np.asarray(plane.x_dir.to_tuple(), dtype=float)
+    v = np.asarray(plane.y_dir.to_tuple(), dtype=float)
+    n = np.asarray(plane.z_dir.to_tuple(), dtype=float)
+    return O, u, v, n
+
+
+def _plane_plane_line_uv(O1, u, v, n1, O2, n2):
+    """Intersection line of a second plane (O2, n2) with the sketch plane (O1, n1), in
+    sketch (u,v) coords. Returns ``(p_near, t)``: the line point nearest the sketch
+    origin and the unit line direction (2-vectors). Raises ``unsupported_ref`` when
+    the planes are parallel (|n1 × n2| < 1e-9)."""
+    import numpy as np
+    n2 = np.asarray(n2, dtype=float)
+    n2 = n2 / max(float(np.linalg.norm(n2)), 1e-30)
+    d3 = np.cross(n1, n2)
+    L = float(np.linalg.norm(d3))
+    if L < 1e-9:
+        raise OpError("unsupported_ref", "plane is parallel to the sketch plane",
+                      {"reason": "parallel planes"})
+    # Point on both planes: P0 = a·n1 + b·n2 with n1·P0 = c1, n2·P0 = c2.
+    c1 = float(n1 @ O1)
+    c2 = float(n2 @ O2)
+    k = float(n1 @ n2)
+    denom = 1.0 - k * k          # == |n1 × n2|² for unit normals
+    P0 = ((c1 - c2 * k) * n1 + (c2 - c1 * k) * n2) / denom
+    p0 = np.array([float((P0 - O1) @ u), float((P0 - O1) @ v)])
+    t3 = d3 / L                  # lies in BOTH planes, so its uv image is exact
+    t = np.array([float(t3 @ u), float(t3 @ v)])
+    t = t / max(float(np.linalg.norm(t)), 1e-30)
+    p_near = p0 - float(p0 @ t) * t
+    return p_near, t
+
+
+def _dedupe_topo_infos(infos: list) -> list:
+    """Drop duplicate TopoInfo entries (TopExp_Explorer revisits shared edges once per
+    owning face). Identical duplicates would tie selectors.resolve's ambiguity margin
+    at 0 and falsely dangle every shared-edge selector."""
+    seen: set = set()
+    out = []
+    for info in infos:
+        key = (info.surf,
+               tuple(round(float(c), 6) for c in info.centroid),
+               round(float(info.measure), 6) if info.measure is not None else None)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(info)
+    return out
+
+
+def _resolve_topo_selector(result: CompileResult, kind: str, selector):
+    """Resolve a face/edge selector against the CURRENT compiled solid bodies.
+
+    Mirrors resolve_pick's body iteration (describe_faces/describe_edges over each
+    solid body + selectors.resolve): every body is scored and the best accepted match
+    wins. Returns ``(body_ordinal, body_out, info)``; the concrete subshape is then
+    matched geometrically with :func:`_match_subshape`."""
+    if not isinstance(selector, dict):
+        raise OpError("invalid_op", "sketch_project_ref: 'selector' must be an object",
+                      {"reason": "bad selector"})
+    bodies = _solid_bodies(result)
+    best = None
+    last_reason = "no solid bodies"
+    for ordinal, bo in enumerate(bodies, start=1):
+        raw = bo.shape.wrapped
+        infos = sel.describe_faces(raw) if kind == "face" else sel.describe_edges(raw)
+        infos = _dedupe_topo_infos(infos)
+        diag = _bbox_diag(bo.shape)
+        rr = sel.resolve(selector, infos, diag)
+        info = None
+        score = rr.score
+        if rr.index is not None:
+            # resolve returns the candidate's TopoInfo.index — map it back to the
+            # deduped list position.
+            info = next(i for i in infos if i.index == rr.index)
+        elif rr.dangling_reason and "margin" in rr.dangling_reason and rr.score < 0.01:
+            # Same fallback as features/sketch._resolve_plane_ref: a near-zero best
+            # score means the selector matches this exact element — accept it even
+            # when a symmetric sibling sits inside the ambiguity margin.
+            from engine.doc.selectors import _score_candidate
+            hint = selector.get("hint_index") or 0
+            scored = sorted(
+                ((_score_candidate(selector, c, diag), abs(c.hint_index - hint), c)
+                 for c in infos if c.kind == kind),
+                key=lambda t: (t[0], t[1]))
+            if scored and scored[0][0] < 0.01:
+                score, _, info = scored[0]
+        if info is not None:
+            if best is None or score < best[0]:
+                best = (score, ordinal, bo, info)
+        elif rr.dangling_reason:
+            last_reason = rr.dangling_reason
+    if best is None:
+        raise OpError("invalid_op",
+                      f"sketch_project_ref: {kind} selector dangling — {last_reason}",
+                      {"reason": last_reason})
+    return best[1], best[2], best[3]
+
+
+def _match_subshape(shapes, info):
+    """The face/edge in *shapes* (build123d ``.faces()``/``.edges()``) geometrically
+    matching a TopoInfo: nearest centroid, with the measure as tiebreak."""
+    best, best_d = None, float("inf")
+    for s in shapes:
+        c = s.center()
+        d = ((c.X - float(info.centroid[0])) ** 2
+             + (c.Y - float(info.centroid[1])) ** 2
+             + (c.Z - float(info.centroid[2])) ** 2)
+        if info.measure is not None:
+            try:
+                m = s.area if hasattr(s, "area") and info.kind == "face" else s.length
+                d += (float(m) - float(info.measure)) ** 2 * 1e-6
+            except Exception:  # noqa: BLE001
+                pass
+        if d < best_d:
+            best, best_d = s, d
+    if best is None:
+        raise OpError("invalid_op", "sketch_project_ref: resolved topology vanished",
+                      {"reason": "no subshapes"})
+    return best
+
+
+def sketch_project_ref(session: DocSession, sketch_fid: str, ref) -> dict:
+    """Project a reference into a sketch's (u,v) plane (worker_rpc sketch_project_ref, C50).
+
+    ``ref`` is one of::
+
+        {"datum": "front"|"top"|"right"}                 (also "plane.front" etc.)
+        {"kind": "face"|"edge", "selector": {...}}        (selector from resolve_pick)
+
+    Returns ``{"entity": E, "source": str}`` with E a plain 2D entity dict in the
+    sketch's (u,v) coords: ``line {p1,p2}`` | ``circle {center,radius}`` | ``point {p}``.
+
+    Math: planes (datum / planar face) intersect the sketch plane in a line; edges are
+    projected along the sketch normal (linear edge -> line, or point when the projected
+    endpoints coincide; circular edge with axis ∥ sketch normal -> circle). Anything
+    else raises ``OpError("unsupported_ref", ...)``. READ-ONLY (no doc mutation, no
+    revision bump, no mesh rebuild)."""
+    import math
+    import numpy as np
+
+    feat = _find_sketch_feature(session, sketch_fid)
+    result = _ensure_built(session)
+    plane = _resolve_sketch_plane(session, feat, result)
+    O1, u, v, n1 = _plane_uv_frame(plane)
+
+    if not isinstance(ref, dict) or ("datum" not in ref and "kind" not in ref):
+        raise OpError("invalid_op",
+                      "sketch_project_ref: 'ref' must carry 'datum' or 'kind'+'selector'",
+                      {"reason": "bad ref"})
+
+    def _uv(P3):
+        d = np.asarray(P3, dtype=float) - O1
+        return [float(d @ u), float(d @ v)]
+
+    # ---- datum plane -> intersection line --------------------------------------
+    if "datum" in ref:
+        from engine.doc.features.datum import reserved_datums
+        name = str(ref["datum"])
+        if not name.startswith("plane."):
+            name = "plane." + name
+        d = reserved_datums().get(name)
+        if d is None or d.kind != "plane":
+            raise OpError("invalid_op",
+                          f"sketch_project_ref: unknown datum '{ref['datum']}'",
+                          {"reason": "unknown datum"})
+        O2, _, _, n2 = _plane_uv_frame(d.obj)
+        p_near, t = _plane_plane_line_uv(O1, u, v, n1, O2, n2)
+        # Span: half-length max(2 × model bbox diagonal, 100 mm), centered on the
+        # line point nearest the sketch origin.
+        diag = 0.0
+        for bo in _solid_bodies(result):
+            diag = max(diag, _bbox_diag(bo.shape))
+        half = max(2.0 * diag, 100.0)
+        p1 = p_near - half * t
+        p2 = p_near + half * t
+        return {"entity": {"type": "line",
+                           "p1": [float(p1[0]), float(p1[1])],
+                           "p2": [float(p2[0]), float(p2[1])]},
+                "source": name}
+
+    kind = ref.get("kind")
+
+    # ---- planar face -> intersection line, spanned by the face's vertices ------
+    if kind == "face":
+        ordinal, bo, info = _resolve_topo_selector(result, "face", ref.get("selector"))
+        if info.surf != "plane" or info.axis is None:
+            raise OpError("unsupported_ref",
+                          "sketch_project_ref: only planar faces can be projected",
+                          {"reason": f"face surf '{info.surf}'"})
+        p_near, t = _plane_plane_line_uv(O1, u, v, n1,
+                                         np.asarray(info.centroid, dtype=float),
+                                         np.asarray(info.axis, dtype=float))
+        face = _match_subshape(bo.shape.faces(), info)
+        # Face vertices projected onto the line direction -> min/max span, +5 mm pad.
+        ss = []
+        for vx in face.vertices():
+            duv = np.asarray(_uv(vx.center().to_tuple()), dtype=float)
+            ss.append(float((duv - p_near) @ t))
+        if not ss:
+            ss = [0.0]
+        lo, hi = min(ss) - 5.0, max(ss) + 5.0
+        p1 = p_near + lo * t
+        p2 = p_near + hi * t
+        return {"entity": {"type": "line",
+                           "p1": [float(p1[0]), float(p1[1])],
+                           "p2": [float(p2[0]), float(p2[1])]},
+                "source": f"planar face (body {ordinal})"}
+
+    # ---- edge -> line / point / circle ------------------------------------------
+    if kind == "edge":
+        ordinal, bo, info = _resolve_topo_selector(result, "edge", ref.get("selector"))
+        edge = _match_subshape(bo.shape.edges(), info)
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.GeomAbs import GeomAbs_Line, GeomAbs_Circle
+        ad = BRepAdaptor_Curve(edge.wrapped)
+        ct = ad.GetType()
+        if ct == GeomAbs_Line:
+            Pa = ad.Value(ad.FirstParameter())
+            Pb = ad.Value(ad.LastParameter())
+            a = _uv([Pa.X(), Pa.Y(), Pa.Z()])
+            b = _uv([Pb.X(), Pb.Y(), Pb.Z()])
+            if math.hypot(a[0] - b[0], a[1] - b[1]) < 1e-6:
+                # Edge runs along the sketch normal — its projection is one point.
+                return {"entity": {"type": "point", "p": a},
+                        "source": f"linear edge (body {ordinal}, projects to a point)"}
+            return {"entity": {"type": "line", "p1": a, "p2": b},
+                    "source": f"linear edge (body {ordinal})"}
+        if ct == GeomAbs_Circle:
+            circ = ad.Circle()
+            axd = circ.Axis().Direction()
+            ax3 = np.array([axd.X(), axd.Y(), axd.Z()], dtype=float)
+            ax3 = ax3 / max(float(np.linalg.norm(ax3)), 1e-30)
+            if abs(float(ax3 @ n1)) <= 1.0 - 1e-6:
+                raise OpError("unsupported_ref",
+                              "edge type not supported for sketch projection",
+                              {"reason": "circle axis not parallel to the sketch normal"})
+            loc = circ.Location()
+            return {"entity": {"type": "circle",
+                               "center": _uv([loc.X(), loc.Y(), loc.Z()]),
+                               "radius": float(circ.Radius())},
+                    "source": f"circular edge (body {ordinal})"}
+        raise OpError("unsupported_ref", "edge type not supported for sketch projection",
+                      {"reason": f"curve type '{info.surf}'"})
+
+    raise OpError("invalid_op",
+                  f"sketch_project_ref: ref kind '{kind}' must be face|edge",
+                  {"reason": "bad kind"})

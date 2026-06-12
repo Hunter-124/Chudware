@@ -353,12 +353,22 @@ def _resolve_handle(
 
     var_idx are the variables the handle DEPENDS ON (may be the full entity's
     vars for derived handles like arc.start).
+
+    The virtual handle "origin" (also "origin.p") resolves to the fixed sketch
+    origin (0, 0): no variables, constant value, zero-width Jacobian.
     """
     if "." in handle:
         eid, sub = handle.split(".", 1)
     else:
         eid = handle
         sub = None
+
+    if eid == "origin" and eid not in entities:
+        # Fixed sketch origin: contributes no variables; (2, 0) Jacobian.
+        idx = np.zeros(0, dtype=np.int64)
+        return (idx,
+                lambda xs: np.array([0.0, 0.0]),
+                lambda xs: np.zeros((2, 0)))
 
     ent = entities[eid]
     etype = ent["type"]
@@ -607,7 +617,10 @@ def _add_constraint(
 
     elif ctype == "horizontal":
         ref = refs[0]
-        if "." not in ref:
+        if len(refs) >= 2:
+            # two point handles (either may be the virtual "origin"): ya == yb
+            _add_horizontal_2pts(sys, cid, refs[0], refs[1], entities, var_map)
+        elif "." not in ref:
             # whole entity (line): enforce p1y == p2y
             eid = ref
             etype = entities[eid]["type"]
@@ -631,7 +644,10 @@ def _add_constraint(
 
     elif ctype == "vertical":
         ref = refs[0]
-        if "." not in ref:
+        if len(refs) >= 2:
+            # two point handles (either may be the virtual "origin"): xa == xb
+            _add_vertical_2pts(sys, cid, refs[0], refs[1], entities, var_map)
+        elif "." not in ref:
             eid = ref
             etype = entities[eid]["type"]
             if etype == "line":
@@ -690,7 +706,8 @@ def _add_constraint(
     elif ctype == "distance":
         d = _resolve_dim(constraint, equations_env)
         axis = constraint.get("axis")
-        _add_distance(sys, cid, refs[0], refs[1], d, entities, var_map, axis=axis)
+        _add_distance(sys, cid, refs[0], refs[1], d, entities, var_map, axis=axis,
+                      cond=constraint.get("cond"))
 
     elif ctype == "angle":
         ang = _resolve_dim(constraint, equations_env)
@@ -1355,8 +1372,16 @@ def _add_symmetric(sys, cid, h0, h1, axis_handle, entities, var_map):
 
 
 def _add_fix(sys, cid, handle, entities, var_map):
-    """Fix a point (or entity center) to its current position."""
+    """Fix constraint (SolidWorks "Fix" relation).
+
+    Bare entity-id ref (C50): freeze the WHOLE entity — line: p1 AND p2 (4
+    residuals); circle: center + radius (3); arc: center + radius + both angles
+    (5); point: its position (unchanged). Sub-handle refs ("e1.p2") keep the
+    single-point behavior. The host uses bare-id fix to pin projected reference
+    geometry (sketch_project_ref)."""
     eid = handle.split(".")[0]
+    if eid == "origin" and eid not in entities:
+        return  # the virtual origin is implicitly fixed — nothing to pin
     ent = entities[eid]
     etype = ent["type"]
     sub = handle.split(".")[1] if "." in handle else None
@@ -1370,7 +1395,16 @@ def _add_fix(sys, cid, handle, entities, var_map):
             idx, lambda xs: np.eye(2), cid)
 
     elif etype == "line":
-        if sub == "p1" or sub is None:
+        if sub is None:
+            # whole line: both endpoints (4 residuals)
+            p1x, p1y = ent["p1"]
+            p2x, p2y = ent["p2"]
+            idx = var_map[eid][[0, 1, 2, 3]]
+            tgt = np.array([p1x, p1y, p2x, p2y], dtype=float)
+            sys.add_residual(
+                lambda xs, _t=tgt: xs - _t,
+                idx, lambda xs: np.eye(4), cid)
+        elif sub == "p1":
             px, py = ent["p1"]
             idx = var_map[eid][[0, 1]]
             sys.add_residual(
@@ -1384,7 +1418,15 @@ def _add_fix(sys, cid, handle, entities, var_map):
                 idx, lambda xs: np.eye(2), cid)
 
     elif etype == "circle":
-        if sub == "center" or sub is None:
+        if sub is None:
+            # whole circle: center + radius (3 residuals)
+            cx, cy = ent["center"]
+            idx = var_map[eid][[0, 1, 2]]
+            tgt = np.array([cx, cy, ent["radius"]], dtype=float)
+            sys.add_residual(
+                lambda xs, _t=tgt: xs - _t,
+                idx, lambda xs: np.eye(3), cid)
+        elif sub == "center":
             cx, cy = ent["center"]
             idx = var_map[eid][[0, 1]]
             sys.add_residual(
@@ -1392,7 +1434,16 @@ def _add_fix(sys, cid, handle, entities, var_map):
                 idx, lambda xs: np.eye(2), cid)
 
     elif etype == "arc":
-        if sub == "center" or sub is None:
+        if sub is None:
+            # whole arc: center + radius + both angles (5 residuals)
+            cx, cy = ent["center"]
+            idx = var_map[eid][[0, 1, 2, 3, 4]]
+            tgt = np.array([cx, cy, ent["radius"], ent["start"], ent["end"]],
+                           dtype=float)
+            sys.add_residual(
+                lambda xs, _t=tgt: xs - _t,
+                idx, lambda xs: np.eye(5), cid)
+        elif sub == "center":
             cx, cy = ent["center"]
             idx = var_map[eid][[0, 1]]
             sys.add_residual(
@@ -1697,40 +1748,71 @@ def _numeric_jac_1(rfn, xs, n):
     return J
 
 
-def _add_distance(sys, cid, h0, h1, d, entities, var_map, axis=None):
+def _distance_cond_sign(h, c, entities) -> float:
+    """Per-ref arc-condition sign for a distance constraint (C50, SolidWorks min/max).
+
+    Returns -1.0 for "min" (near-rim gap), +1.0 for "max" (far rim), 0.0 otherwise.
+    A condition is honored ONLY when the ref is a BARE circle/arc entity id (no
+    ".sub"); any other ref kind is treated as "center" (sign 0)."""
+    if c not in ("min", "max"):
+        return 0.0
+    if not isinstance(h, str) or "." in h:
+        return 0.0
+    ent = entities.get(h)
+    if ent is None or ent.get("type") not in ("circle", "arc"):
+        return 0.0
+    return -1.0 if c == "min" else 1.0
+
+
+def _add_distance(sys, cid, h0, h1, d, entities, var_map, axis=None, cond=None):
     """Distance constraint: point-point, or point-line (perpendicular foot distance).
 
     ``axis`` (point-point only): ``"h"`` constrains the horizontal gap |Δu|, ``"v"`` the vertical
     gap |Δv|; ``None`` is the aligned Euclidean distance (the historical behavior). A point-line
     distance ignores ``axis`` (the foot distance is already directional).
+
+    ``cond`` (C50): optional 2-list aligned with [h0, h1], each "center"|"min"|"max".
+    For a ref that is a BARE circle/arc entity id, "min"/"max" measure to the near/far
+    rim instead of the center: residual = (D + Σ adj) - d with adj = -r ("min") or +r
+    ("max"); the radius r is a solver VARIABLE (∂residual/∂r = ∓1). Every other ref
+    kind ignores its condition ("center" — today's behavior). Absent cond == today.
     """
-    # Determine kinds
+    # Determine kinds (entities.get: the virtual "origin" handle is not an entity)
     def _is_line(h):
         eid = h.split(".")[0]
-        return entities[eid]["type"] == "line" and "." not in h
+        ent = entities.get(eid)
+        return ent is not None and ent["type"] == "line" and "." not in h
+
+    conds = list(cond) if isinstance(cond, (list, tuple)) else []
+    conds = (conds + [None, None])[:2]
+    s0 = _distance_cond_sign(h0, conds[0], entities)
+    s1 = _distance_cond_sign(h1, conds[1], entities)
 
     if _is_line(h0) or _is_line(h1):
-        # point-line distance
+        # point-line distance (the "point" may be a bare circle/arc center)
         if _is_line(h0):
-            line_h, pt_h = h0, h1
+            line_h, pt_h, s_pt = h0, h1, s1
         else:
-            line_h, pt_h = h1, h0
+            line_h, pt_h, s_pt = h1, h0, s0
         eid_l = line_h.split(".")[0]
         lidx = var_map[eid_l][[0, 1, 2, 3]]
         pidx, pvf, pjf = _resolve_handle(pt_h, entities, var_map)
         kp = len(pidx)
-        combined = np.concatenate([pidx, lidx])
+        # min/max condition on a circle/arc ref: append its radius variable.
+        rparts = [var_map[pt_h][[2]]] if s_pt else []
+        combined = np.concatenate([pidx, lidx] + rparts)
         _d = float(d)
 
         def _r(xs):
             P = pvf(xs[:kp])
             ax, ay, bx, by = xs[kp], xs[kp+1], xs[kp+2], xs[kp+3]
+            adj = s_pt * xs[kp+4] if s_pt else 0.0
             dxab = bx-ax; dyab = by-ay
             L = math.hypot(dxab, dyab)
             if L < 1e-14:
-                return np.array([math.hypot(P[0]-ax, P[1]-ay) - _d])
+                return np.array([math.hypot(P[0]-ax, P[1]-ay) + adj - _d])
             cross = dxab*(P[1]-ay) - dyab*(P[0]-ax)
-            return np.array([abs(cross)/L - _d])
+            return np.array([abs(cross)/L + adj - _d])
 
         def _j(xs):
             P = pvf(xs[:kp])
@@ -1746,7 +1828,7 @@ def _add_distance(sys, cid, h0, h1, d, entities, var_map, axis=None):
             dc_dPx = -dyab; dc_dPy = dxab
             dc_dP = np.array([dc_dPx, dc_dPy])
             # d(dist)/dP = sgn * d(cross)/dP / L
-            J = np.zeros((1, kp + 4))
+            J = np.zeros((1, kp + 4 + (1 if s_pt else 0)))
             J[0, :kp] = sgn * (dc_dP @ Jp) / L
             # Analytic Jacobian for d(|cross|/L - _d) w.r.t. [ax,ay,bx,by]:
             # cross = (bx-ax)*(Py-ay) - (by-ay)*(Px-ax)
@@ -1764,20 +1846,33 @@ def _add_distance(sys, cid, h0, h1, d, entities, var_map, axis=None):
             J[0, kp+1] = dd(dc_ay, d_L_ay)
             J[0, kp+2] = dd(dc_bx, d_L_bx)
             J[0, kp+3] = dd(dc_by, d_L_by)
+            if s_pt:
+                J[0, kp+4] = s_pt   # ∂(D + s·r - d)/∂r
             return J
 
         sys.add_residual(_r, combined, _j, cid)
 
     else:
-        # point-point distance
+        # point-point distance (a bare circle/arc ref resolves to its center)
         idx0, vf0, jf0 = _resolve_handle(h0, entities, var_map)
         idx1, vf1, jf1 = _resolve_handle(h1, entities, var_map)
         k0, k1 = len(idx0), len(idx1)
-        combined = np.concatenate([idx0, idx1])
+        # min/max conditions append the circle/arc radius variables, in ref order.
+        rparts = []
+        sgns = []
+        for h, s in ((h0, s0), (h1, s1)):
+            if s:
+                rparts.append(var_map[h][[2]])
+                sgns.append(s)
+        combined = np.concatenate([idx0, idx1] + rparts)
+        kb = k0 + k1
         _d = float(d)
         ax = (axis or None)
         if isinstance(ax, str):
             ax = ax.lower()
+
+        def _adj(xs):
+            return sum(s * xs[kb + j] for j, s in enumerate(sgns))
 
         if ax in ("h", "v"):
             # Axis-aligned gap: residual = |Δcoord| - d (coord = u for "h", v for "v"). Smooth via a
@@ -1788,7 +1883,7 @@ def _add_distance(sys, cid, h0, h1, d, entities, var_map, axis=None):
             def _r(xs):
                 P0 = vf0(xs[:k0])
                 P1 = vf1(xs[k0:k0+k1])
-                return np.array([abs(P0[comp] - P1[comp]) - _d])
+                return np.array([abs(P0[comp] - P1[comp]) + _adj(xs) - _d])
 
             def _j(xs):
                 P0 = vf0(xs[:k0])
@@ -1797,9 +1892,11 @@ def _add_distance(sys, cid, h0, h1, d, entities, var_map, axis=None):
                 J1 = jf1(xs[k0:k0+k1])
                 delta = P0[comp] - P1[comp]
                 sgn = 1.0 if delta >= 0 else -1.0
-                J = np.zeros((1, k0 + k1))
+                J = np.zeros((1, kb + len(sgns)))
                 J[0, :k0] = sgn * J0[comp, :]
-                J[0, k0:] = -sgn * J1[comp, :]
+                J[0, k0:kb] = -sgn * J1[comp, :]
+                for j, s in enumerate(sgns):
+                    J[0, kb + j] = s
                 return J
 
             sys.add_residual(_r, combined, _j, cid)
@@ -1808,7 +1905,7 @@ def _add_distance(sys, cid, h0, h1, d, entities, var_map, axis=None):
         def _r(xs):
             P0 = vf0(xs[:k0])
             P1 = vf1(xs[k0:k0+k1])
-            return np.array([math.hypot(P0[0]-P1[0], P0[1]-P1[1]) - _d])
+            return np.array([math.hypot(P0[0]-P1[0], P0[1]-P1[1]) + _adj(xs) - _d])
 
         def _j(xs):
             P0 = vf0(xs[:k0])
@@ -1818,11 +1915,13 @@ def _add_distance(sys, cid, h0, h1, d, entities, var_map, axis=None):
             dx = P0[0]-P1[0]; dy = P0[1]-P1[1]
             d = math.hypot(dx, dy)
             if d < 1e-12:
-                return np.zeros((1, k0+k1))
+                return np.zeros((1, kb + len(sgns)))
             dir_ = np.array([dx/d, dy/d])  # (2,)
-            J = np.zeros((1, k0+k1))
+            J = np.zeros((1, kb + len(sgns)))
             J[0, :k0] = dir_ @ J0
-            J[0, k0:] = -dir_ @ J1
+            J[0, k0:kb] = -dir_ @ J1
+            for j, s in enumerate(sgns):
+                J[0, kb + j] = s   # ∂(D + s·r - d)/∂r
             return J
 
         sys.add_residual(_r, combined, _j, cid)
@@ -2113,6 +2212,8 @@ def _handle_point(handle: str, entity_coords: dict):
         eid, sub = handle, None
     ent = entity_coords.get(eid)
     if ent is None:
+        if eid == "origin":
+            return (0.0, 0.0)   # virtual fixed sketch origin
         return None
     et = ent.get("type")
     if et == "point":
@@ -2147,6 +2248,27 @@ def _line_endpoints(handle: str, entity_coords: dict):
     if ent is None or ent.get("type") != "line":
         return None
     return tuple(ent["p1"]), tuple(ent["p2"])
+
+
+def _measure_cond_adj(constraint: dict, refs: list, entity_coords: dict) -> float:
+    """Σ adj of a distance constraint's arc-conditions against SOLVED coords (C50).
+
+    Mirrors :func:`_distance_cond_sign`: only a BARE circle/arc entity-id ref honors
+    its "min"/"max" condition (adj = -r / +r); everything else contributes 0. Keeps
+    measure_constraint in semantic lockstep with the solver residual."""
+    cond = constraint.get("cond")
+    if not isinstance(cond, (list, tuple)):
+        return 0.0
+    adj = 0.0
+    for h, c in zip(refs[:2], list(cond)[:2]):
+        if c not in ("min", "max") or not isinstance(h, str) or "." in h:
+            continue
+        ent = entity_coords.get(h)
+        if ent is None or ent.get("type") not in ("circle", "arc"):
+            continue
+        r = float(ent.get("radius", 0.0))
+        adj += -r if c == "min" else r
+    return adj
 
 
 def measure_constraint(constraint: dict, entity_coords: dict):
@@ -2199,6 +2321,7 @@ def measure_constraint(constraint: dict, entity_coords: dict):
             ent = entity_coords.get(eid)
             return ent is not None and ent.get("type") == "line" and "." not in h
 
+        adj = _measure_cond_adj(constraint, refs, entity_coords)
         if _is_line(refs[0]) or _is_line(refs[1]):
             line_h = refs[0] if _is_line(refs[0]) else refs[1]
             pt_h = refs[1] if _is_line(refs[0]) else refs[0]
@@ -2210,19 +2333,19 @@ def measure_constraint(constraint: dict, entity_coords: dict):
             dxab, dyab = bx - ax, by - ay
             L = math.hypot(dxab, dyab)
             if L < 1e-12:
-                return float(math.hypot(P[0] - ax, P[1] - ay))
+                return float(math.hypot(P[0] - ax, P[1] - ay) + adj)
             cross = dxab * (P[1] - ay) - dyab * (P[0] - ax)
-            return float(abs(cross) / L)
+            return float(abs(cross) / L + adj)
         P0 = _handle_point(refs[0], entity_coords)
         P1 = _handle_point(refs[1], entity_coords)
         if P0 is None or P1 is None:
             return None
         axis = constraint.get("axis")
         if isinstance(axis, str) and axis.lower() == "h":
-            return float(abs(P0[0] - P1[0]))
+            return float(abs(P0[0] - P1[0]) + adj)
         if isinstance(axis, str) and axis.lower() == "v":
-            return float(abs(P0[1] - P1[1]))
-        return float(math.hypot(P0[0] - P1[0], P0[1] - P1[1]))
+            return float(abs(P0[1] - P1[1]) + adj)
+        return float(math.hypot(P0[0] - P1[0], P0[1] - P1[1]) + adj)
 
     return None
 
@@ -2343,6 +2466,11 @@ def drag(
         hidx, hvf, hjf = _resolve_handle(handle, entities, var_map)
     except (KeyError, ValueError):
         # Unknown handle — return last known coords
+        entity_coords = _extract_entities(state.x, entities_list, var_map)
+        return {"entities": entity_coords, "statuses": {}}
+
+    if len(hidx) == 0:
+        # Zero-variable handle (the virtual "origin") — nothing to drag.
         entity_coords = _extract_entities(state.x, entities_list, var_map)
         return {"entities": entity_coords, "statuses": {}}
 

@@ -550,6 +550,261 @@ def test_warm_start() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 15: distance arc-conditions (C50 — SolidWorks min/max/center)
+# ---------------------------------------------------------------------------
+
+def test_distance_cond_point_circle() -> None:
+    """Distance point<->circle with cond min/max drives the rim gap; measure agrees."""
+    from engine.doc.sketch_solver import measure_constraint
+
+    def _sketch(cond):
+        return {
+            "entities": [
+                {"id": "e1", "type": "point", "construction": False, "p": [0.0, 0.0]},
+                {"id": "e2", "type": "circle", "construction": False,
+                 "center": [20.0, 0.0], "radius": 5.0},
+            ],
+            "constraints": [
+                {"id": "c1", "type": "fix", "refs": ["e1"]},
+                {"id": "c2", "type": "radius", "refs": ["e2"],
+                 "value": {"value": 5.0, "expr": None}},
+                {"id": "c3", "type": "horizontal", "refs": ["e1", "e2.center"]},
+                {"id": "c4", "type": "distance", "refs": ["e1", "e2"],
+                 "value": {"value": 10.0, "expr": None}, "cond": cond},
+            ],
+        }
+
+    # min: near-rim gap = 10 -> center distance = 10 + r = 15
+    skm = _sketch(["center", "min"])
+    sol = solve_sketch(skm, {}, warm=None)
+    assert sol.converged, "point-circle cond=min: did not converge"
+    cx, cy = sol.entities["e2"]["center"]
+    assert abs(math.hypot(cx, cy) - 15.0) < 1e-5, f"min: center dist should be 15, got {math.hypot(cx, cy)}"
+    m = measure_constraint(skm["constraints"][3], sol.entities)
+    assert abs(m - 10.0) < 1e-5, f"min: measured should be 10, got {m}"
+
+    # max: far-rim gap = 10 -> center distance = 10 - r = 5
+    skx = _sketch(["center", "max"])
+    solx = solve_sketch(skx, {}, warm=None)
+    assert solx.converged, "point-circle cond=max: did not converge"
+    cxx, cyx = solx.entities["e2"]["center"]
+    assert abs(math.hypot(cxx, cyx) - 5.0) < 1e-5, f"max: center dist should be 5, got {math.hypot(cxx, cyx)}"
+    mx = measure_constraint(skx["constraints"][3], solx.entities)
+    assert abs(mx - 10.0) < 1e-5, f"max: measured should be 10, got {mx}"
+
+    # absent cond == center (back-compat)
+    skc = _sketch(None)
+    skc["constraints"][3].pop("cond")
+    solc = solve_sketch(skc, {}, warm=None)
+    assert solc.converged
+    cxc, cyc = solc.entities["e2"]["center"]
+    assert abs(math.hypot(cxc, cyc) - 10.0) < 1e-5, "no cond: center distance must be 10"
+
+    print(f"[dist_cond:pt-circle] min->center@15, max->center@5, none->center@10 OK")
+
+
+def test_distance_cond_line_circle() -> None:
+    """Distance line<->circle with cond min: perpendicular center distance = d + r."""
+    from engine.doc.sketch_solver import measure_constraint
+    sketch = {
+        "entities": [
+            {"id": "e1", "type": "line", "construction": False,
+             "p1": [-20.0, 0.0], "p2": [20.0, 0.0]},
+            {"id": "e2", "type": "circle", "construction": False,
+             "center": [0.0, 8.0], "radius": 5.0},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "fix", "refs": ["e1.p1"]},
+            {"id": "c2", "type": "fix", "refs": ["e1.p2"]},
+            {"id": "c3", "type": "radius", "refs": ["e2"],
+             "value": {"value": 5.0, "expr": None}},
+            {"id": "c4", "type": "vertical", "refs": ["e1.p1", "e2.center"]},
+            {"id": "c5", "type": "distance", "refs": ["e1", "e2"],
+             "value": {"value": 10.0, "expr": None}, "cond": ["center", "min"]},
+        ],
+    }
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.converged, "line-circle cond=min: did not converge"
+    cx, cy = sol.entities["e2"]["center"]
+    # line is the x-axis; near-rim gap 10 -> |cy| = 10 + r = 15
+    assert abs(abs(cy) - 15.0) < 1e-5, f"min: perpendicular center dist should be 15, got {cy}"
+    m = measure_constraint(sketch["constraints"][4], sol.entities)
+    assert abs(m - 10.0) < 1e-5, f"min: measured should be 10, got {m}"
+    print(f"[dist_cond:line-circle] center=({cx:.3f},{cy:.3f}), measured={m:.4f}")
+
+
+def test_distance_cond_circle_circle() -> None:
+    """Distance circle<->circle with cond [min,min]: center gap = d + r1 + r2."""
+    from engine.doc.sketch_solver import measure_constraint
+    sketch = {
+        "entities": [
+            {"id": "e1", "type": "circle", "construction": False,
+             "center": [0.0, 0.0], "radius": 3.0},
+            {"id": "e2", "type": "circle", "construction": False,
+             "center": [20.0, 0.0], "radius": 5.0},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "fix", "refs": ["e1"]},
+            {"id": "c2", "type": "radius", "refs": ["e2"],
+             "value": {"value": 5.0, "expr": None}},
+            {"id": "c3", "type": "horizontal", "refs": ["e1.center", "e2.center"]},
+            {"id": "c4", "type": "distance", "refs": ["e1", "e2"],
+             "value": {"value": 4.0, "expr": None}, "cond": ["min", "min"]},
+        ],
+    }
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.converged, "circle-circle cond=[min,min]: did not converge"
+    c1 = sol.entities["e1"]["center"]
+    c2 = sol.entities["e2"]["center"]
+    gap = math.hypot(c2[0] - c1[0], c2[1] - c1[1])
+    assert abs(gap - 12.0) < 1e-5, f"[min,min]: center gap should be 4+3+5=12, got {gap}"
+    m = measure_constraint(sketch["constraints"][3], sol.entities)
+    assert abs(m - 4.0) < 1e-5, f"[min,min]: measured should be 4, got {m}"
+    # whole-circle fix (C50) must have kept e1 frozen
+    assert abs(c1[0]) < 1e-7 and abs(c1[1]) < 1e-7 and abs(sol.entities["e1"]["radius"] - 3.0) < 1e-7
+    print(f"[dist_cond:circle-circle] gap={gap:.4f}, measured={m:.4f}")
+
+
+# ---------------------------------------------------------------------------
+# Test 16: "origin" virtual handle (C50)
+# ---------------------------------------------------------------------------
+
+def test_origin_refs() -> None:
+    """Constraints may reference the fixed sketch origin; it never leaks into outputs."""
+    from engine.doc.sketch_solver import measure_constraint
+    sketch = {
+        "entities": [
+            {"id": "e1", "type": "point", "construction": False, "p": [10.0, 3.0]},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "distance", "refs": ["origin", "e1"],
+             "value": {"value": 25.0, "expr": None}},
+            {"id": "c2", "type": "horizontal", "refs": ["origin", "e1"]},
+        ],
+    }
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.converged, "origin distance: did not converge"
+    p = sol.entities["e1"]["p"]
+    assert abs(math.hypot(p[0], p[1]) - 25.0) < 1e-5, f"distance to origin should be 25, got {p}"
+    assert abs(p[1]) < 1e-5, f"horizontal with origin should zero v, got {p[1]}"
+    # origin is virtual: absent from every output
+    assert "origin" not in sol.entities and "origin" not in sol.statuses, \
+        "origin must not appear in solver outputs"
+    # both DOF of the point are consumed by the two origin constraints
+    assert sol.dof == 0 and sol.statuses["e1"] == "full", (sol.dof, sol.statuses)
+    m = measure_constraint(sketch["constraints"][0], sol.entities)
+    assert abs(m - 25.0) < 1e-5, f"measured origin distance should be 25, got {m}"
+
+    # coincident with origin (accepts the "origin.p" alias too)
+    sk2 = {
+        "entities": [
+            {"id": "e1", "type": "line", "construction": False,
+             "p1": [2.0, 2.0], "p2": [12.0, 2.0]},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "coincident", "refs": ["e1.p1", "origin.p"]},
+        ],
+    }
+    sol2 = solve_sketch(sk2, {}, warm=None)
+    assert sol2.converged, "coincident with origin: did not converge"
+    assert abs(sol2.entities["e1"]["p1"][0]) < 1e-6 and abs(sol2.entities["e1"]["p1"][1]) < 1e-6
+
+    # distance origin <-> circle with cond min
+    sk3 = {
+        "entities": [
+            {"id": "e1", "type": "circle", "construction": False,
+             "center": [30.0, 0.0], "radius": 4.0},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "radius", "refs": ["e1"],
+             "value": {"value": 4.0, "expr": None}},
+            {"id": "c2", "type": "horizontal", "refs": ["origin", "e1.center"]},
+            {"id": "c3", "type": "distance", "refs": ["origin", "e1"],
+             "value": {"value": 6.0, "expr": None}, "cond": ["center", "min"]},
+        ],
+    }
+    sol3 = solve_sketch(sk3, {}, warm=None)
+    assert sol3.converged, "origin-circle cond=min: did not converge"
+    c = sol3.entities["e1"]["center"]
+    assert abs(math.hypot(c[0], c[1]) - 10.0) < 1e-5, f"center should be 6+4=10 from origin, got {c}"
+    m3 = measure_constraint(sk3["constraints"][2], sol3.entities)
+    assert abs(m3 - 6.0) < 1e-5, f"measured should be 6, got {m3}"
+    print(f"[origin] dist={m:.3f}, coincident snap OK, circle-min={m3:.3f}")
+
+
+# ---------------------------------------------------------------------------
+# Test 17: whole-entity fix (C50)
+# ---------------------------------------------------------------------------
+
+def test_fix_whole_entity() -> None:
+    """A bare-id fix freezes the WHOLE entity (line endpoints / circle radius / arc angles)."""
+    sketch = {
+        "entities": [
+            {"id": "e1", "type": "line", "construction": False,
+             "p1": [0.0, 0.0], "p2": [10.0, 0.0]},
+            {"id": "e2", "type": "circle", "construction": False,
+             "center": [0.0, 20.0], "radius": 5.0},
+            {"id": "e3", "type": "arc", "construction": False,
+             "center": [40.0, 0.0], "radius": 8.0, "start": 10.0, "end": 80.0, "ccw": True},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "fix", "refs": ["e1"]},
+            {"id": "c2", "type": "fix", "refs": ["e2"]},
+            {"id": "c3", "type": "fix", "refs": ["e3"]},
+        ],
+    }
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.converged, "whole-entity fix: did not converge"
+    # whole-entity fix removes every DOF: all entities full, dof 0
+    assert sol.dof == 0, f"expected dof=0 with whole-entity fixes, got {sol.dof}"
+    for eid in ("e1", "e2", "e3"):
+        assert sol.statuses[eid] == "full", f"{eid} should be full: {sol.statuses}"
+
+    # competing drags must not move the frozen geometry
+    state = sol.state
+    r1 = drag(state, "e1.p2", (30.0, 15.0), sketch, {})
+    e1 = r1["entities"]["e1"]
+    assert abs(e1["p2"][0] - 10.0) < 1e-6 and abs(e1["p2"][1]) < 1e-6, \
+        f"fixed line endpoint moved under drag: {e1['p2']}"
+    r2 = drag(state, "e2", (5.0, 5.0), sketch, {})
+    e2 = r2["entities"]["e2"]
+    assert abs(e2["center"][0]) < 1e-6 and abs(e2["center"][1] - 20.0) < 1e-6 \
+        and abs(e2["radius"] - 5.0) < 1e-6, f"fixed circle moved under drag: {e2}"
+
+    # a competing radius dim now CONFLICTS with the frozen radius (instead of resizing)
+    sk2 = {
+        "entities": [
+            {"id": "e2", "type": "circle", "construction": False,
+             "center": [0.0, 20.0], "radius": 5.0},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "fix", "refs": ["e2"]},
+            {"id": "c2", "type": "radius", "refs": ["e2"],
+             "value": {"value": 9.0, "expr": None}},
+        ],
+    }
+    sol2 = solve_sketch(sk2, {}, warm=None)
+    assert sol2.conflicting, "radius dim against a whole-circle fix should conflict"
+    # (the conflicting system settles at the least-squares compromise; what matters is
+    # that the radius is now CONSTRAINED by the fix — pre-C50 the dim would simply win)
+    assert abs(sol2.entities["e2"]["radius"] - 9.0) > 1e-3, \
+        "the radius dim must no longer freely resize a whole-fixed circle"
+
+    # sub-handle refs keep today's single-point behavior (the rest stays draggable)
+    sk3 = {
+        "entities": [
+            {"id": "e1", "type": "line", "construction": False,
+             "p1": [0.0, 0.0], "p2": [10.0, 0.0]},
+        ],
+        "constraints": [{"id": "c1", "type": "fix", "refs": ["e1.p1"]}],
+    }
+    sol3 = solve_sketch(sk3, {}, warm=None)
+    assert sol3.dof == 2, f"sub-handle fix should leave p2 free (dof 2), got {sol3.dof}"
+    print(f"[fix_whole] line/circle/arc frozen, dof=0; conflict={sol2.conflicting}; "
+          f"sub-handle dof={sol3.dof}")
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -568,6 +823,11 @@ def main() -> None:
     test_point_on_line()
     test_equal_lines()
     test_warm_start()
+    test_distance_cond_point_circle()
+    test_distance_cond_line_circle()
+    test_distance_cond_circle_circle()
+    test_origin_refs()
+    test_fix_whole_entity()
     print("\nSKETCH SOLVER TESTS PASSED")
 
 

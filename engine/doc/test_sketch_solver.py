@@ -804,11 +804,39 @@ def test_fix_whole_entity() -> None:
           f"sub-handle dof={sol3.dof}")
 
 
+def test_warm_solve_respects_geometry_edits():
+    """A doc-level geometry edit (sketch_trim/extend/edit_entity) must NOT be undone by the
+    warm-start vector: same entity id + same var count used to let warm.x win over the new
+    doc coordinates (the in-app trim looked like a no-op)."""
+    import copy
+    from engine.doc.sketch_solver import solve_sketch
+    params = {
+        "entities": [
+            {"id": "e1", "type": "line", "p1": [-33.0, -9.0], "p2": [29.0, -9.0]},
+            {"id": "e2", "type": "line", "p1": [-2.0, 12.0], "p2": [-2.0, -27.0]},
+        ],
+        "constraints": [{"id": "c1", "type": "vertical", "refs": ["e2"]}],
+    }
+    sol = solve_sketch(params, {})
+    assert abs(sol.entities["e1"]["p2"][0] - 29.0) < 1e-9
+
+    # Simulate a trim: e1's p2 pulled back to the crossing; warm state from the pre-trim solve.
+    params2 = copy.deepcopy(params)
+    params2["entities"][0]["p2"] = [-2.0, -9.0]
+    sol2 = solve_sketch(params2, {}, warm=sol.state)
+    assert abs(sol2.entities["e1"]["p2"][0] - (-2.0)) < 1e-9, \
+        f"warm start resurrected pre-trim geometry: {sol2.entities['e1']}"
+    # The untouched entity keeps warm continuity.
+    assert abs(sol2.entities["e2"]["p1"][0] - (-2.0)) < 1e-9
+    print("[warm_edit] doc geometry edit wins over warm state")
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    test_warm_solve_respects_geometry_edits()
     test_bracket_fully_defined()
     test_remove_dim_dof1()
     test_redundant_constraint()

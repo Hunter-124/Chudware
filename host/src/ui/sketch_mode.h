@@ -47,6 +47,9 @@ struct SketchConstraint {
     std::string id;
     std::string type;                 // distance|angle|radius|diameter|coincident|horizontal|...
     std::vector<std::string> refs;    // handles ("e1.p2") or entity ids ("e1")
+    // distance only: per-ref arc condition ("center"|"min"|"max"), aligned with refs. Only
+    // meaningful where the ref is a bare circle/arc id; empty = all center (legacy).
+    std::vector<std::string> cond;
     bool hasValue = false;            // value present (stored dim)
     double value = 0.0;
     bool hasExpr = false;
@@ -123,6 +126,21 @@ public:
     // The plane-normal camera angles (so the caller can hard-lock the orbit while active).
     bool cameraLock(float& yaw, float& pitch) const;
 
+    // Origin-plane index (0/1/2, -1 none) hovered during the plane-pick step. The viewport feeds
+    // this to Renderer::setPlanes as the emphasis so the hovered datum plane brightens and the
+    // other two dim (single source of plane visuals — the overlay no longer paints its own fills).
+    int planeHover() const { return planePicking_ ? planeHover_ : -1; }
+
+    // Smart Dimension may reference geometry that is not (yet) a sketch entity. Both paths project
+    // the source into the sketch as a FIXED construction entity (worker sketch_project_ref) and add
+    // it to the pick buffer, so the normal dimension combos apply.
+    // True when the Smart Dimension tool is armed and collecting picks (feature_tree uses this to
+    // route a datum-plane click here instead of toggling plane visibility).
+    bool smartDimPicking() const;
+    // Datum plane (0=front 1=top 2=right) clicked in the tree while Smart Dimension is armed:
+    // project its intersection line with the sketch plane and add it as a dimension pick.
+    void addPlaneDimRef(AppState& st, int planeIdx);
+
 private:
     // ---- worker round-trips ----
     bool callSketch(AppState& st, const char* method, const nlohmann::json& extra,
@@ -147,7 +165,8 @@ private:
     // C38 (S1): store the entity id STRING (entId) — ents_ is refilled while picks are held, so an
     // index into ents_ goes stale. entIdx is a per-frame convenience resolved from entId via
     // entIndexById(); -1 means the entity is currently absent (skip).
-    struct DimPick { std::string handle; std::string entId; int entIdx = -1; bool isPoint = false; float u = 0, v = 0; };
+    struct DimPick { std::string handle; std::string entId; int entIdx = -1; bool isPoint = false; float u = 0, v = 0;
+                     std::string cond; };   // circle/arc entity picks: "center"|"min"|"max" anchor
     int entIndexById(const std::string& id) const;   // C38 (S1): id -> current ents_ index, or -1
     bool dimHitTest(const ImVec2& s, DimPick& out) const;       // point-priority then entity
     bool dimBuildPending(const ImVec2& cursor, float cu, float cv);  // picks -> dimPending_ (+axis)
@@ -188,6 +207,14 @@ private:
     // Nearest WHOLE entity under the screen point (line segment / circle rim / arc rim distance);
     // returns the index into ents_ or -1. Used by Trim / Extend / Offset hover + pick (C29-B).
     int hitTestEntity(const ImVec2& s, float maxPx = 12.0f) const;
+
+    // Trim preview: the exact span of ents_[idx] that a trim click at sketch point (mu,mv) would
+    // remove, as a (u,v) polyline. Mirrors engine sketch_geom.split_entity (cut at every in-range
+    // crossing with other lines/circles/arcs, drop the span nearest the point); when there are no
+    // interior crossings the WHOLE entity is doomed (engine deletes it) and `wholeEntity` is set.
+    // Returns false for unsupported entity types.
+    bool trimDoomedSpan(int idx, float mu, float mv,
+                        std::vector<ImVec2>& outUV, bool& wholeEntity) const;
 
     // ---- C40 ghost sketches (inactive-sketch rendering) ----
     struct GhostSketch {
@@ -242,6 +269,10 @@ private:
     // tangent inference all stand down and no auto h/v relation is emitted.
     bool inferenceOn_ = true;
 
+    // Sketch grid visibility — OFF by default (SolidWorks-style); toggled from the in-sketch
+    // right-click context menu. The origin marker draws regardless.
+    bool showGrid_ = false;
+
     // active tool state
     SketchTool tool_ = SketchTool::None;
     std::vector<ImVec2> toolUV_;     // in-progress click points in (u,v)
@@ -279,6 +310,10 @@ private:
     std::vector<std::string> selIds_;
     bool isSelected(const std::string& id) const;
 
+    // Trim power-sweep state: LMB held after a trim keeps trimming entities the cursor crosses.
+    bool trimSweeping_ = false;
+    ImVec2 trimSweepLast_{0, 0};
+
     // C29-B Offset tool state. Stages: collect a chain of entity ids (selected ones tint accent),
     // then a distance overlay (InputFloat near cursor, Enter commits), then one click for the side
     // hint -> sketch_offset op. offsetStage_: 0=picking chain, 1=typing distance, 2=picking side.
@@ -291,6 +326,13 @@ private:
     // ---- C37-D Smart Dimension state machine ----
     // Pick buffer (separate from toolUV_): points/entities collected for the next dimension.
     std::vector<DimPick> dimPicks_;
+    // External references projected into this sketch (key = datum string / selector JSON dump,
+    // value = the fixed construction entity id), so re-picking the same source reuses one entity.
+    std::unordered_map<std::string, std::string> projRefs_;
+    // Project an external ref (worker sketch_project_ref "ref" param) into the sketch as a fixed
+    // construction entity and append it to dimPicks_. Returns the entity id ("" on failure).
+    std::string addProjectedDimRef(AppState& st, const nlohmann::json& ref,
+                                   const std::string& srcKey);
     // The constraint object being built (refs/type/axis filled by dimBuildPending), awaiting a
     // placement click. dimHasPending_ gates the live preview.
     bool dimHasPending_ = false;

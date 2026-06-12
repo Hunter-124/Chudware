@@ -420,6 +420,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         if (st.sketchPlanePickActive)
             effPlane[0] = effPlane[1] = effPlane[2] = true;
         if (inSketch) { bool none[3] = {false,false,false}; renderer.setPlanes(none, -1); }
+        else if (st.sketchPlanePickActive && sketch != nullptr)
+            // Plane-pick: the hovered plane (from last frame's overlay hit-test) gets the
+            // emphasis brightening; the other two dim. One-frame lag is invisible.
+            renderer.setPlanes(effPlane, sketch->planeHover());
         else          renderer.setPlanes(effPlane, st.planeEmphasis);
         // C25 W2-D: advance any in-flight camera tween (presets / Normal-To / zoom-to-fit) before
         // rendering. Sketch mode hard-locks the camera, so cancel/skip the tween while sketching.

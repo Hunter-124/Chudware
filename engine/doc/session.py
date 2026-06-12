@@ -961,6 +961,14 @@ def _sketch_constraints(sketch_feat: dict, entity_coords: dict) -> list[dict]:
             "placement": c.get("placement"),
             "measured": None,
         }
+        # C50: annotation-affecting dim variants must survive the round trip — the host renders
+        # committed dims from THIS record. Without axis the h/v variant drew as an aligned dim;
+        # without cond a min/max (rim) distance snapped back to center anchoring after commit
+        # (the solver still enforced it — display-only, but reads as the wrong constraint).
+        if isinstance(c.get("axis"), str) and c["axis"]:
+            rec["axis"] = c["axis"]
+        if isinstance(c.get("cond"), list):
+            rec["cond"] = list(c["cond"])
         try:
             rec["measured"] = measure_constraint(c, entity_coords)
         except Exception:  # noqa: BLE001

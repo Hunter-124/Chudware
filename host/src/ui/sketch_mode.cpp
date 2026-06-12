@@ -195,13 +195,31 @@ void SketchMode::applyEnterResult(const nlohmann::json& res) {
     selIds_.erase(std::remove_if(selIds_.begin(), selIds_.end(),
                                  [&](const std::string& id) { return entById(id) == nullptr; }),
                   selIds_.end());
-    // C38 (S1): ents_ was just refilled — any in-flight Smart Dimension picks now point at stale
-    // entities (their by-id resolution may shift or vanish). Drop the pending pick buffer so we never
-    // feed dangling picks into dimBuildPending/highlight on the next frame. The Modify box (if open)
-    // already captured its placement + refs, so it survives this refresh untouched.
+    // C38 (S1) / C50: ents_ was just refilled — prune Smart Dimension picks SURGICALLY instead of
+    // clearing the buffer. A projection of external geometry (addProjectedDimRef) applies ops and
+    // resolves MID-PICK, and the wholesale clear was throwing away the user's first pick. Picks
+    // whose entity vanished are dropped; point picks get their (u,v) refreshed from the solved
+    // entity so the preview math doesn't use stale coordinates. The Modify box (if open) already
+    // captured its placement + refs, so it survives this refresh untouched.
     if (!dimPopupOpen_) {
-        dimPicks_.clear();
-        dimHasPending_ = false;
+        auto baseOf = [](const std::string& h) { return h.substr(0, h.find('.')); };
+        dimPicks_.erase(std::remove_if(dimPicks_.begin(), dimPicks_.end(),
+            [&](DimPick& p) {
+                if (p.isPoint) {
+                    std::string base = baseOf(p.handle);
+                    if (base == "origin") { p.u = 0; p.v = 0; return false; }
+                    const SketchEntity* e = entById(base);
+                    if (!e) return true;
+                    if (p.handle.find(".p1") != std::string::npos)      { p.u = e->p1[0]; p.v = e->p1[1]; }
+                    else if (p.handle.find(".p2") != std::string::npos) { p.u = e->p2[0]; p.v = e->p2[1]; }
+                    else if (p.handle.find(".center") != std::string::npos) { p.u = e->center[0]; p.v = e->center[1]; }
+                    else if (p.handle.find(".p") != std::string::npos)  { p.u = e->p1[0]; p.v = e->p1[1]; }
+                    return false;
+                }
+                p.entIdx = entIndexById(p.entId);
+                return p.entIdx < 0;
+            }), dimPicks_.end());
+        dimHasPending_ = false;     // rebuilt next frame from the surviving picks
         dimPending_ = nullptr;
     }
 }
@@ -226,6 +244,8 @@ void SketchMode::applyConstraints(const nlohmann::json& res) {
         }
         if (c.contains("measured") && c["measured"].is_number()) { sc.hasMeasured = true; sc.measured = c["measured"].get<double>(); }
         if (c.contains("axis") && c["axis"].is_string()) sc.axis = c["axis"].get<std::string>();
+        if (c.contains("cond") && c["cond"].is_array())
+            for (const auto& q : c["cond"]) sc.cond.push_back(q.is_string() ? q.get<std::string>() : "center");
         cons_.push_back(sc);
     }
 }
@@ -290,6 +310,60 @@ void SketchMode::addConstraint(AppState& st, const nlohmann::json& constraint) {
     if (!r.ok) { st.addLog("[sketch] add_constraint failed: " + r.error_message); return; }
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     resolve(st);
+}
+
+bool SketchMode::smartDimPicking() const {
+    return active_ && tool_ == SketchTool::SmartDim && !dimPopupOpen_ && dimPicks_.size() < 2;
+}
+
+// Project external geometry (model edge / planar face / datum plane) into the sketch as a FIXED
+// construction entity and chain it into the Smart Dimension pick buffer. The worker does the 3D
+// math (sketch_project_ref); the entity goes through the normal ops path so it undoes cleanly.
+std::string SketchMode::addProjectedDimRef(AppState& st, const nlohmann::json& ref,
+                                           const std::string& srcKey) {
+    std::string eid;
+    auto it = projRefs_.find(srcKey);
+    if (it != projRefs_.end() && entById(it->second)) {
+        eid = it->second;   // same source picked before — reuse its reference entity
+    } else {
+        nlohmann::json res;
+        if (!callSketch(st, "sketch_project_ref", {{"ref", ref}}, res)) {
+            st.toast(ui::ToastLevel::Warn,
+                     "Can't dimension to that reference (projection not supported)");
+            return std::string();
+        }
+        if (!res.contains("entity") || !res["entity"].is_object()) return std::string();
+        nlohmann::json ent = res["entity"];
+        ent["construction"] = true;
+        nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_}, {"entity", ent},
+            {"constraints", nlohmann::json::array(
+                {{{"type", "fix"}, {"refs", nlohmann::json::array({"$self"})}}})}};
+        auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+        if (!r.ok) { st.addLog("[sketch] project ref failed: " + r.error_message); return std::string(); }
+        eid = (r.id_map.is_object() && r.id_map.contains("$0"))
+            ? r.id_map["$0"].get<std::string>() : std::string();
+        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        resolve(st);
+        if (eid.empty()) return eid;
+        projRefs_[srcKey] = eid;
+    }
+    const SketchEntity* e = entById(eid);
+    if (!e) return std::string();
+    DimPick p;
+    if (e->type == "point") { p.isPoint = true; p.handle = eid + ".p"; p.u = e->p1[0]; p.v = e->p1[1]; }
+    else { p.entId = eid; p.entIdx = entIndexById(eid); }
+    for (const auto& q : dimPicks_)
+        if (q.isPoint == p.isPoint && (p.isPoint ? q.handle == p.handle : q.entId == p.entId))
+            return eid;   // already in the buffer
+    dimPicks_.push_back(p);
+    return eid;
+}
+
+void SketchMode::addPlaneDimRef(AppState& st, int planeIdx) {
+    static const char* kDatum[3] = {"front", "top", "right"};
+    if (planeIdx < 0 || planeIdx > 2 || !smartDimPicking()) return;
+    addProjectedDimRef(st, nlohmann::json{{"datum", kDatum[planeIdx]}},
+                       std::string("datum:") + kDatum[planeIdx]);
 }
 
 // Emit 4 lines as a closed loop (corners A,B,C,D). Each edge i (corners[i]->corners[(i+1)%4]) gets
@@ -514,7 +588,7 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
     fid_.clear();
     ents_.clear();
     cons_.clear();              // C37-D
-    autoPlace_.clear();         // C37-D
+    autoPlace_.clear(); projRefs_.clear();         // C37-D
     cancelCheckpoint_.clear();  // C37-D
     status_.clear();
     dof_ = 0;
@@ -570,7 +644,7 @@ void SketchMode::cancelSketch(AppState& st) {
     fid_.clear();
     ents_.clear();
     cons_.clear();
-    autoPlace_.clear();
+    autoPlace_.clear(); projRefs_.clear();
     cancelCheckpoint_.clear();
     status_.clear();
     dof_ = 0;
@@ -709,6 +783,7 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfe
     const ImVec2 cur = uvToScreen(u, v);   // raw cursor (snap distances measure from here)
     // Visit every snappable POINT (handle, u, v) — point snap + alignment share this set.
     auto forEachPoint = [&](const std::function<void(const std::string&, float, float)>& fn) {
+        fn("origin", 0.0f, 0.0f);   // the sketch origin is a first-class snap/anchor target
         for (const auto& e : ents_) {
             if (e.type == "line" || e.type == "slot") {
                 fn(e.id + ".p1", e.p1[0], e.p1[1]);
@@ -874,6 +949,216 @@ int SketchMode::hitTestEntity(const ImVec2& s, float maxPx) const {
 }
 
 // ---------------------------------------------------------------------------
+// Trim doomed-span preview (client-side mirror of engine sketch_geom.split_entity)
+// ---------------------------------------------------------------------------
+// The engine splits the target at every in-range crossing with the OTHER lines/circles/arcs and
+// deletes the span nearest the click. Replicating that math here lets the Trim tool highlight
+// exactly what a click will remove (SolidWorks power-trim red segment) instead of the whole
+// entity. Geometry only — the engine stays authoritative on the actual edit.
+namespace {
+struct TrimHit { float ta; float tb; float px, py; };  // params on target/other + point
+
+// All crossings of two entities among line/circle/arc. ta/tb are the natural parameters
+// (line: 0..1; circle/arc: angle in degrees, [0,360)). Mirrors sketch_geom.intersect.
+void trimIntersect(const SketchEntity& A, const SketchEntity& B, std::vector<TrimHit>& out) {
+    auto angOf = [](float cx, float cy, float x, float y) {
+        float a = std::atan2(y - cy, x - cx) * 57.29577951f;
+        return a < 0 ? a + 360.0f : a;
+    };
+    bool aLine = (A.type == "line"), bLine = (B.type == "line");
+    if (aLine && bLine) {
+        float d1x = A.p2[0] - A.p1[0], d1y = A.p2[1] - A.p1[1];
+        float d2x = B.p2[0] - B.p1[0], d2y = B.p2[1] - B.p1[1];
+        float den = d1x * d2y - d1y * d2x;
+        if (std::fabs(den) < 1e-9f) return;
+        float fx = B.p1[0] - A.p1[0], fy = B.p1[1] - A.p1[1];
+        float t = (fx * d2y - fy * d2x) / den;
+        float u = (fx * d1y - fy * d1x) / den;
+        out.push_back({t, u, A.p1[0] + d1x * t, A.p1[1] + d1y * t});
+        return;
+    }
+    if (aLine != bLine) {
+        const SketchEntity& L = aLine ? A : B;
+        const SketchEntity& C = aLine ? B : A;
+        float dx = L.p2[0] - L.p1[0], dy = L.p2[1] - L.p1[1];
+        float L2 = dx * dx + dy * dy;
+        if (L2 < 1e-14f) return;
+        float fx = L.p1[0] - C.center[0], fy = L.p1[1] - C.center[1];
+        float b = 2.0f * (fx * dx + fy * dy);
+        float c = fx * fx + fy * fy - C.radius * C.radius;
+        float disc = b * b - 4.0f * L2 * c;
+        if (disc < 0) return;
+        float sq = std::sqrt(std::fmax(disc, 0.0f));
+        float prevX = 1e30f, prevY = 1e30f;
+        for (float t : {(-b - sq) / (2.0f * L2), (-b + sq) / (2.0f * L2)}) {
+            float x = L.p1[0] + dx * t, y = L.p1[1] + dy * t;
+            if (std::fabs(x - prevX) < 1e-7f && std::fabs(y - prevY) < 1e-7f) continue;  // tangent
+            prevX = x; prevY = y;
+            float ang = angOf(C.center[0], C.center[1], x, y);
+            if (aLine) out.push_back({t, ang, x, y});
+            else       out.push_back({ang, t, x, y});
+        }
+        return;
+    }
+    // both curved (circle/arc): circle-circle intersection on the underlying circles
+    float dxc = B.center[0] - A.center[0], dyc = B.center[1] - A.center[1];
+    float d = std::hypot(dxc, dyc);
+    if (d < 1e-9f) return;  // concentric
+    if (d > A.radius + B.radius + 1e-7f || d < std::fabs(A.radius - B.radius) - 1e-7f) return;
+    float a = (A.radius * A.radius - B.radius * B.radius + d * d) / (2.0f * d);
+    float h2 = A.radius * A.radius - a * a;
+    float h = std::sqrt(std::fmax(h2, 0.0f));
+    float ux = dxc / d, uy = dyc / d;
+    float mx = A.center[0] + ux * a, my = A.center[1] + uy * a;
+    float prevX = 1e30f, prevY = 1e30f;
+    for (float sgn : {1.0f, -1.0f}) {
+        float x = mx + sgn * h * (-uy), y = my + sgn * h * ux;
+        if (std::fabs(x - prevX) < 1e-7f && std::fabs(y - prevY) < 1e-7f) continue;
+        prevX = x; prevY = y;
+        out.push_back({angOf(A.center[0], A.center[1], x, y),
+                       angOf(B.center[0], B.center[1], x, y), x, y});
+    }
+}
+
+// Is angle (deg) within the arc's drawn sweep? Mirrors sketch_geom._arc_sweep_contains.
+bool arcSweepContains(const SketchEntity& arc, float ang) {
+    float a0 = std::fmod(arc.start, 360.0f); if (a0 < 0) a0 += 360.0f;
+    float a1 = std::fmod(arc.end, 360.0f);   if (a1 < 0) a1 += 360.0f;
+    float a = std::fmod(ang, 360.0f);        if (a < 0)  a += 360.0f;
+    float span, rel;
+    if (arc.ccw) { span = std::fmod(a1 - a0 + 360.0f, 360.0f); rel = std::fmod(a - a0 + 360.0f, 360.0f); }
+    else         { span = std::fmod(a0 - a1 + 360.0f, 360.0f); rel = std::fmod(a0 - a + 360.0f, 360.0f); }
+    if (span < 1e-7f) span = 360.0f;
+    return rel <= span + 1e-5f;
+}
+
+bool trimParamInRange(const SketchEntity& e, float t) {
+    if (e.type == "line")   return t >= -1e-7f && t <= 1.0f + 1e-7f;
+    if (e.type == "circle") return true;
+    if (e.type == "arc")    return arcSweepContains(e, t);
+    return false;
+}
+}  // namespace
+
+bool SketchMode::trimDoomedSpan(int idx, float mu, float mv,
+                                std::vector<ImVec2>& outUV, bool& wholeEntity) const {
+    outUV.clear(); wholeEntity = false;
+    if (idx < 0 || idx >= (int)ents_.size()) return false;
+    const SketchEntity& T = ents_[idx];
+    if (T.type != "line" && T.type != "circle" && T.type != "arc") return false;
+
+    // Cut parameters on the target from every other line/circle/arc (in-range on BOTH).
+    std::vector<float> cuts;
+    for (size_t i = 0; i < ents_.size(); ++i) {
+        if ((int)i == idx) continue;
+        const SketchEntity& O = ents_[i];
+        if (O.type != "line" && O.type != "circle" && O.type != "arc") continue;
+        std::vector<TrimHit> hits;
+        trimIntersect(T, O, hits);
+        for (const auto& h : hits)
+            if (trimParamInRange(O, h.tb) && trimParamInRange(T, h.ta)) cuts.push_back(h.ta);
+    }
+
+    auto sampleArc = [&](float cx, float cy, float r, float aa0, float aa1) {
+        int seg = 48;
+        const float D2R = 3.14159265f / 180.0f;
+        for (int i = 0; i <= seg; ++i) {
+            float a = (aa0 + (aa1 - aa0) * (i / (float)seg)) * D2R;
+            outUV.push_back(ImVec2(cx + r * std::cos(a), cy + r * std::sin(a)));
+        }
+    };
+
+    if (T.type == "line") {
+        // interior cuts sorted, endpoints excluded (engine _dedupe_sorted)
+        std::sort(cuts.begin(), cuts.end());
+        std::vector<float> inner;
+        for (float t : cuts) {
+            if (t <= 1e-7f || t >= 1.0f - 1e-7f) continue;
+            if (!inner.empty() && std::fabs(t - inner.back()) <= 1e-6f) continue;
+            inner.push_back(t);
+        }
+        if (inner.empty()) { wholeEntity = true; return true; }
+        std::vector<float> bounds; bounds.push_back(0.0f);
+        for (float t : inner) bounds.push_back(t);
+        bounds.push_back(1.0f);
+        float dx = T.p2[0] - T.p1[0], dy = T.p2[1] - T.p1[1];
+        int best = 0; float bestD = 1e30f;
+        for (size_t i = 0; i + 1 < bounds.size(); ++i) {
+            float tm = (bounds[i] + bounds[i + 1]) * 0.5f;
+            float x = T.p1[0] + dx * tm, y = T.p1[1] + dy * tm;
+            float dd = std::hypot(x - mu, y - mv);
+            if (dd < bestD) { bestD = dd; best = (int)i; }
+        }
+        float t0 = bounds[best], t1 = bounds[best + 1];
+        outUV.push_back(ImVec2(T.p1[0] + dx * t0, T.p1[1] + dy * t0));
+        outUV.push_back(ImVec2(T.p1[0] + dx * t1, T.p1[1] + dy * t1));
+        return true;
+    }
+
+    if (T.type == "circle") {
+        // distinct cut angles; need >= 2 to form removable arcs (engine _split_circle)
+        std::vector<float> angs;
+        for (float a : cuts) { a = std::fmod(a, 360.0f); if (a < 0) a += 360.0f; angs.push_back(a); }
+        std::sort(angs.begin(), angs.end());
+        std::vector<float> ded;
+        for (float a : angs) {
+            if (!ded.empty() && std::fabs(a - ded.back()) <= 1e-6f) continue;
+            ded.push_back(a);
+        }
+        if (ded.size() >= 2 && std::fabs((ded.front() + 360.0f) - ded.back()) <= 1e-6f) ded.pop_back();
+        if (ded.size() < 2) { wholeEntity = true; return true; }
+        const float D2R = 3.14159265f / 180.0f;
+        int n = (int)ded.size(); int best = 0; float bestD = 1e30f;
+        for (int i = 0; i < n; ++i) {
+            float a0 = ded[i], a1 = ded[(i + 1) % n];
+            float span = std::fmod(a1 - a0 + 360.0f, 360.0f); if (span < 1e-7f) span = 360.0f;
+            float am = (a0 + span * 0.5f) * D2R;
+            float x = T.center[0] + T.radius * std::cos(am), y = T.center[1] + T.radius * std::sin(am);
+            float dd = std::hypot(x - mu, y - mv);
+            if (dd < bestD) { bestD = dd; best = i; }
+        }
+        float a0 = ded[best], a1 = ded[(best + 1) % n];
+        if (a1 <= a0) a1 += 360.0f;
+        sampleArc(T.center[0], T.center[1], T.radius, a0, a1);
+        return true;
+    }
+
+    // arc: relative sweep offsets within (0, full), spans in the drawn direction (engine _split_arc)
+    float a0 = std::fmod(T.start, 360.0f); if (a0 < 0) a0 += 360.0f;
+    float a1 = std::fmod(T.end, 360.0f);   if (a1 < 0) a1 += 360.0f;
+    float full = T.ccw ? std::fmod(a1 - a0 + 360.0f, 360.0f) : std::fmod(a0 - a1 + 360.0f, 360.0f);
+    if (full < 1e-7f) full = 360.0f;
+    std::vector<float> rels;
+    for (float a : cuts) {
+        float rel = T.ccw ? std::fmod(a - a0 + 360.0f, 360.0f) : std::fmod(a0 - a + 360.0f, 360.0f);
+        if (rel > 1e-7f && rel < full - 1e-7f) rels.push_back(rel);
+    }
+    std::sort(rels.begin(), rels.end());
+    std::vector<float> ded;
+    for (float r2 : rels) {
+        if (!ded.empty() && std::fabs(r2 - ded.back()) <= 1e-6f) continue;
+        ded.push_back(r2);
+    }
+    if (ded.empty()) { wholeEntity = true; return true; }
+    std::vector<float> bounds; bounds.push_back(0.0f);
+    for (float r2 : ded) bounds.push_back(r2);
+    bounds.push_back(full);
+    const float D2R = 3.14159265f / 180.0f;
+    int best = 0; float bestD = 1e30f;
+    for (size_t i = 0; i + 1 < bounds.size(); ++i) {
+        float rm = (bounds[i] + bounds[i + 1]) * 0.5f;
+        float am = (T.ccw ? a0 + rm : a0 - rm) * D2R;
+        float x = T.center[0] + T.radius * std::cos(am), y = T.center[1] + T.radius * std::sin(am);
+        float dd = std::hypot(x - mu, y - mv);
+        if (dd < bestD) { bestD = dd; best = (int)i; }
+    }
+    float s0 = T.ccw ? a0 + bounds[best] : a0 - bounds[best];
+    float s1 = T.ccw ? a0 + bounds[best + 1] : a0 - bounds[best + 1];
+    sampleArc(T.center[0], T.center[1], T.radius, s0, s1);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // status
 // ---------------------------------------------------------------------------
 
@@ -934,11 +1219,13 @@ static std::string dimLabel(const SketchConstraint& c) {
 bool SketchMode::defaultPlacement(const SketchConstraint& c, float& pu, float& pv) const {
     auto baseId = [](const std::string& h) { return h.substr(0, h.find('.')); };
     auto pt = [&](const std::string& h, float& u, float& v) -> bool {
+        if (baseId(h) == "origin") { u = 0; v = 0; return true; }
         const SketchEntity* e = entById(baseId(h));
         if (!e) return false;
         if (h.find(".p1") != std::string::npos)      { u = e->p1[0]; v = e->p1[1]; }
         else if (h.find(".p2") != std::string::npos) { u = e->p2[0]; v = e->p2[1]; }
         else if (h.find(".center") != std::string::npos) { u = e->center[0]; v = e->center[1]; }
+        else if (e->type == "circle" || e->type == "arc") { u = e->center[0]; v = e->center[1]; }
         else { u = e->p1[0]; v = e->p1[1]; }
         return true;
     };
@@ -989,11 +1276,13 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
                                ImU32 textCol, bool hovered, float pu, float pv) const {
     auto baseId = [](const std::string& h) { return h.substr(0, h.find('.')); };
     auto handlePt = [&](const std::string& h, ImVec2& s) -> bool {
+        if (baseId(h) == "origin") { s = uvToScreen(0, 0); return true; }
         const SketchEntity* e = entById(baseId(h));
         if (!e) return false;
         if (h.find(".p1") != std::string::npos)      s = uvToScreen(e->p1[0], e->p1[1]);
         else if (h.find(".p2") != std::string::npos) s = uvToScreen(e->p2[0], e->p2[1]);
         else if (h.find(".center") != std::string::npos) s = uvToScreen(e->center[0], e->center[1]);
+        else if (e->type == "circle" || e->type == "arc") s = uvToScreen(e->center[0], e->center[1]);
         else s = uvToScreen(e->p1[0], e->p1[1]);
         return true;
     };
@@ -1068,6 +1357,29 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
     if (c.axis == "h")      B.y = A.y;   // horizontal: ignore vertical delta
     else if (c.axis == "v") B.x = A.x;   // vertical
 
+    // Arc conditions: a "min"/"max" circle ref visually attaches at its near/far RIM point along
+    // the measurement direction instead of the center (matches the engine's ∓r adjustment).
+    {
+        auto condShift = [&](size_t i, ImVec2& P, const ImVec2& other) {
+            if (c.cond.size() <= i || c.refs.size() <= i) return;
+            const std::string& cd = c.cond[i];
+            if (cd != "min" && cd != "max") return;
+            const SketchEntity* e = entById(baseId(c.refs[i]));
+            if (!e || (e->type != "circle" && e->type != "arc")) return;
+            ImVec2 cc = uvToScreen(e->center[0], e->center[1]);
+            ImVec2 rimRef = uvToScreen(e->center[0] + e->radius, e->center[1]);
+            float rpx = std::hypot(rimRef.x - cc.x, rimRef.y - cc.y);
+            float ddx = other.x - P.x, ddy = other.y - P.y;
+            float LL = std::hypot(ddx, ddy);
+            if (LL < 1e-3f) return;
+            float sgn = (cd == "min") ? 1.0f : -1.0f;
+            P.x += ddx / LL * rpx * sgn; P.y += ddy / LL * rpx * sgn;
+        };
+        ImVec2 A0 = A, B0 = B;
+        condShift(0, A, B0);
+        condShift(1, B, A0);
+    }
+
     // Dimension line passes through the placement point, parallel to A->B; extension lines run from
     // A and B out to that offset line.
     float dx = B.x - A.x, dy = B.y - A.y; float L = std::hypot(dx, dy);
@@ -1105,6 +1417,7 @@ bool SketchMode::dimHitTest(const ImVec2& s, DimPick& out) const {
         float d2 = (p.x - s.x) * (p.x - s.x) + (p.y - s.y) * (p.y - s.y);
         if (d2 < best) { best = d2; out.handle = h; out.isPoint = true; out.entIdx = -1; out.entId.clear(); out.u = u; out.v = v; got = true; }
     };
+    consider("origin", 0.0f, 0.0f);   // sketch origin: dimension FROM the origin marker
     for (const auto& e : ents_) {
         if (e.type == "line" || e.type == "slot") {
             consider(e.id + ".p1", e.p1[0], e.p1[1]);
@@ -1141,6 +1454,33 @@ bool SketchMode::dimBuildPending(const ImVec2& cursor, float cu, float cv) {
         const SketchEntity& e = *entOf(p);
         u = e.center[0]; v = e.center[1];
     };
+    // Circle/arc entity picks act as their CENTER in distance combos, with an optional per-pick
+    // arc condition: "min" (near rim / tangent) or "max" (far rim) adds -r/+r to the measured
+    // and enforced distance (engine `cond` field). Default is the center (SolidWorks default).
+    auto isCirc = [&](const DimPick& p) {
+        if (p.isPoint) return false;
+        const SketchEntity* e = entOf(p);
+        return e && (e->type == "circle" || e->type == "arc");
+    };
+    auto condOf = [&](const DimPick& p) -> std::string {
+        return p.cond.empty() ? std::string("center") : p.cond;
+    };
+    auto condAdj = [&](const DimPick& p) -> double {
+        if (!isCirc(p)) return 0.0;
+        std::string c = condOf(p);
+        if (c == "min") return -(double)entOf(p)->radius;
+        if (c == "max") return  (double)entOf(p)->radius;
+        return 0.0;
+    };
+    auto refOf = [&](const DimPick& p) -> std::string {
+        return p.isPoint ? p.handle : p.entId;
+    };
+    // Attach the cond array when any ref is a circle/arc with a non-center condition.
+    auto attachCond = [&](const DimPick& a, const DimPick& b) {
+        if ((isCirc(a) && condOf(a) != "center") || (isCirc(b) && condOf(b) != "center"))
+            dimPending_["cond"] = nlohmann::json::array(
+                {isCirc(a) ? condOf(a) : "center", isCirc(b) ? condOf(b) : "center"});
+    };
     size_t n = dimPicks_.size();
     if (n == 1) {
         const DimPick& a = dimPicks_[0];
@@ -1168,7 +1508,13 @@ bool SketchMode::dimBuildPending(const ImVec2& cursor, float cu, float cv) {
         const DimPick& a = dimPicks_[0]; const DimPick& b = dimPicks_[1];
         bool aLine = !a.isPoint && entOf(a)->type == "line";
         bool bLine = !b.isPoint && entOf(b)->type == "line";
-        if (a.isPoint && b.isPoint) {              // point-point distance (variant chosen at place)
+        // A pick is "point-like" when it's a point handle OR a circle/arc (anchored at center).
+        bool aPt = a.isPoint || isCirc(a);
+        bool bPt = b.isPoint || isCirc(b);
+        // Same-entity guard (e.g. a circle's center handle + the same circle entity): no combo.
+        auto base = [](const std::string& h) { return h.substr(0, h.find('.')); };
+        if (base(refOf(a)) == base(refOf(b))) return false;
+        if (aPt && bPt) {        // point/circle <-> point/circle distance (variant chosen at place)
             float au, av, bu, bv; handleUV(a, au, av); handleUV(b, bu, bv);
             // SolidWorks variant by cursor zone: beyond the vertical span -> horizontal; beyond the
             // horizontal span -> vertical; inside both -> aligned.
@@ -1181,22 +1527,27 @@ bool SketchMode::dimBuildPending(const ImVec2& cursor, float cu, float cv) {
             if (dimAxis_ == "h") m = std::fabs(bu - au);
             else if (dimAxis_ == "v") m = std::fabs(bv - av);
             else m = std::hypot(bu - au, bv - av);
+            m += condAdj(a) + condAdj(b);          // min/max arc conditions shift by the radii
             dimType_ = "distance"; dimMeasured_ = m;
-            dimPending_ = {{"type", "distance"}, {"refs", nlohmann::json::array({a.handle, b.handle})}};
+            dimPending_ = {{"type", "distance"},
+                           {"refs", nlohmann::json::array({refOf(a), refOf(b)})}};
+            attachCond(a, b);
             if (!dimAxis_.empty()) dimPending_["axis"] = dimAxis_;
             dimHasPending_ = true; return true;
         }
-        if ((a.isPoint && bLine) || (aLine && b.isPoint)) {   // point-line perpendicular distance
-            const DimPick& pp = a.isPoint ? a : b;
-            const DimPick& ll = a.isPoint ? b : a;
+        if ((aPt && bLine) || (aLine && bPt)) {   // point/circle <-> line perpendicular distance
+            const DimPick& pp = aPt ? a : b;
+            const DimPick& ll = aPt ? b : a;
             const SketchEntity& le = *entOf(ll);
             float pu, pv; handleUV(pp, pu, pv);
-            // perpendicular foot distance
+            // perpendicular foot distance (center-based), plus the arc condition
             float dx = le.p2[0] - le.p1[0], dy = le.p2[1] - le.p1[1]; float L = std::hypot(dx, dy);
             float nx = L > 1e-6f ? -dy / L : 0, ny = L > 1e-6f ? dx / L : 1;
-            double m = std::fabs((pu - le.p1[0]) * nx + (pv - le.p1[1]) * ny);
+            double m = std::fabs((pu - le.p1[0]) * nx + (pv - le.p1[1]) * ny) + condAdj(pp);
             dimType_ = "distance"; dimMeasured_ = m;
-            dimPending_ = {{"type", "distance"}, {"refs", nlohmann::json::array({pp.handle, le.id})}};
+            dimPending_ = {{"type", "distance"},
+                           {"refs", nlohmann::json::array({refOf(pp), le.id})}};
+            attachCond(pp, ll);
             dimHasPending_ = true; return true;
         }
         if (aLine && bLine) {                      // two lines: parallel -> distance, else angle
@@ -1303,7 +1654,7 @@ void SketchMode::inSketchUndo(AppState& st) {
         st.toast(ui::ToastLevel::Info, "Sketch removed by undo — closing");
         // The sketch feature is gone; drop out cleanly without re-exiting the worker sketch.
         active_ = false; isNewEmpty_ = false; fid_.clear();
-        ents_.clear(); cons_.clear(); autoPlace_.clear(); cancelCheckpoint_.clear();
+        ents_.clear(); cons_.clear(); autoPlace_.clear(); projRefs_.clear(); cancelCheckpoint_.clear();
         status_.clear(); dof_ = 0;
         // C38 (S2): clear plane-pick state in the emergency teardown too.
         planePicking_ = false; planeHover_ = -1; st.sketchPlanePickActive = false;
@@ -1539,30 +1890,20 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         ImDrawList* wdl = ImGui::GetWindowDrawList();
         wdl->PushClipRect(imgMin, imgMax, true);
 
-        // Project each origin-plane quad (front=0/top=1/right=2) — geometry mirrors renderer.cpp's
-        // planeCorners (half-extent = sceneR*1.25). Hover-tint the quad whose projected polygon
-        // contains the cursor; click -> enter that datum plane.
-        const float e = (r.modelRadius() > 0.0f ? r.modelRadius() : 35.0f) * 1.25f;
+        // Project each origin-plane quad (front=0/top=1/right=2). The corners come straight from
+        // Renderer::planeQuad — the SAME geometry drawReferencePlanes renders — so the hit-test
+        // polygon and the visible plane always coincide (the old mirrored copy used cam.center,
+        // which includes the pan offset, and drifted away from the drawn planes after any pan).
         const char* planeSel[3] = {"plane.front", "plane.top", "plane.right"};
-        // C37-D: mirror renderer.cpp planeCorners (private there) — center = bbox center (camera
-        // .center), half-extent e, uv {-1,-1},{1,-1},{1,1},{-1,1}; plane 0=Front(XY) 1=Top(XZ)
-        // 2=Right(YZ). DEVIATION: replicated geometry because Renderer::planeCorners is private.
-        const Vec3 ctr = cam.center;
-        auto planeCorner = [&](int plane, int i, float& wx, float& wy, float& wz) {
-            static const float uv[4][2] = {{-1,-1}, {1,-1}, {1,1}, {-1,1}};
-            float u = uv[i][0] * e, v = uv[i][1] * e;
-            if (plane == 0)      { wx = ctr.x + u; wy = ctr.y + v; wz = ctr.z; }       // XY
-            else if (plane == 1) { wx = ctr.x + u; wy = ctr.y;     wz = ctr.z + v; }   // XZ
-            else                 { wx = ctr.x;     wy = ctr.y + u; wz = ctr.z + v; }   // YZ
-        };
         int hovered = -1;
         ImVec2 quadS[3][4];
         bool quadVis[3] = {false, false, false};
         for (int p = 0; p < 3; ++p) {
+            Vec3 c4[4];
+            if (!r.planeQuad(p, c4)) continue;
             bool ok = true;
             for (int i = 0; i < 4; ++i) {
-                float wx, wy, wz; planeCorner(p, i, wx, wy, wz);
-                if (!worldToScreen(cam, imgMin, vw, vh, wx, wy, wz, quadS[p][i])) { ok = false; break; }
+                if (!worldToScreen(cam, imgMin, vw, vh, c4[i].x, c4[i].y, c4[i].z, quadS[p][i])) { ok = false; break; }
             }
             quadVis[p] = ok;
             if (!ok) continue;
@@ -1582,12 +1923,16 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 hovered = p;
         }
         planeHover_ = hovered;
-        for (int p = 0; p < 3; ++p) {
-            if (!quadVis[p]) continue;
-            ImU32 fill = col(pal.accent, p == hovered ? 0.28f : 0.10f);
-            ImU32 line = col(pal.accent, p == hovered ? 0.95f : 0.45f);
-            wdl->AddQuadFilled(quadS[p][0], quadS[p][1], quadS[p][2], quadS[p][3], fill);
-            wdl->AddQuad(quadS[p][0], quadS[p][1], quadS[p][2], quadS[p][3], line, 2.0f);
+        // The renderer already draws all three datum planes (fill + outline, with emphasis
+        // brightening the hovered one — viewport_panel passes planeHover() as the emphasis).
+        // Painting a second translucent fill per plane on top made the overlap muddy and
+        // unreadable (user bug report), so the overlay adds ONLY a hover tint on the one
+        // plane under the cursor.
+        if (hovered >= 0 && quadVis[hovered]) {
+            wdl->AddQuadFilled(quadS[hovered][0], quadS[hovered][1], quadS[hovered][2],
+                               quadS[hovered][3], col(pal.accent, 0.16f));
+            wdl->AddQuad(quadS[hovered][0], quadS[hovered][1], quadS[hovered][2],
+                         quadS[hovered][3], col(pal.accent, 0.90f), 2.0f);
         }
         // Click: an origin plane wins if hovered; else attempt the hovered planar face.
         if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -1668,9 +2013,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     bool escHandled = false;
 
     // ---- faint grid (lines along sketch u/v through the origin neighbourhood) ----
+    // Off by default (SolidWorks ships with the sketch grid off); right-click > Grid toggles it.
     const ImU32 gridCol = col(pal.sketchGrid);
     const ImU32 axisCol = col(pal.sketchGrid, 2.2f);
-    {
+    if (showGrid_) {
         // Estimate the visible (u,v) span from the four image corners.
         float umin = 1e9f, umax = -1e9f, vmin = 1e9f, vmax = -1e9f;
         ImVec2 corners[4] = {imgMin, ImVec2(imgMax.x, imgMin.y), ImVec2(imgMin.x, imgMax.y), imgMax};
@@ -1692,6 +2038,28 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             ImVec2 a = uvToScreen(umin, v), b = uvToScreen(umax, v);
             dl->AddLine(a, b, std::fabs(v) < 1e-3f ? axisCol : gridCol, std::fabs(v) < 1e-3f ? 1.4f : 1.0f);
         }
+    }
+
+    // ---- sketch origin marker (always visible, SolidWorks red L-arrows at (0,0)) ----
+    // The origin is real geometry: snapPoint and the Smart Dimension hit-test both expose it as
+    // the "origin" handle, so entities can be anchored / dimensioned to it.
+    {
+        const ImU32 oc = col(pal.statusErr, 0.95f);
+        ImVec2 o = uvToScreen(0, 0);
+        // unit u/v directions in screen space (normalized axis deltas)
+        auto unit = [](ImVec2 d) {
+            float L = std::hypot(d.x, d.y);
+            return L > 1e-6f ? ImVec2(d.x / L, d.y / L) : ImVec2(1, 0);
+        };
+        ImVec2 du = unit(uAxisS_), dv = unit(vAxisS_);
+        const float len = 22.0f * ui::uiScale;
+        ImVec2 tu(o.x + du.x * len, o.y + du.y * len);
+        ImVec2 tv(o.x + dv.x * len, o.y + dv.y * len);
+        dl->AddLine(o, tu, oc, 1.8f);
+        dl->AddLine(o, tv, oc, 1.8f);
+        arrowHead(dl, tu, du.x, du.y, 7.0f, oc);
+        arrowHead(dl, tv, dv.x, dv.y, 7.0f, oc);
+        dl->AddCircle(o, 3.5f, oc, 12, 1.8f);
     }
 
     // ---- entities (color by solver status via theme roles) ----
@@ -1809,6 +2177,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // 1) relation badges for geometric (non-dimensional) constraints.
         auto baseId = [](const std::string& h) { return h.substr(0, h.find('.')); };
         auto refScreen = [&](const std::string& h, ImVec2& s) -> bool {
+            if (baseId(h) == "origin") { s = uvToScreen(0, 0); return true; }
             const SketchEntity* e = entById(baseId(h));
             if (!e) return false;
             if (h.find(".p1") != std::string::npos)      s = uvToScreen(e->p1[0], e->p1[1]);
@@ -2062,6 +2431,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     if (ImGui::BeginPopup("##SketchCtx")) {
         if (ImGui::MenuItem("Select")) resetTool();
         if (ImGui::MenuItem("Smart Dimension")) { resetTool(); tool_ = SketchTool::SmartDim; }
+        if (ImGui::MenuItem("Grid", nullptr, showGrid_)) showGrid_ = !showGrid_;
         ImGui::Separator();
         if (ImGui::MenuItem("Exit Sketch")) { ImGui::CloseCurrentPopup(); ImGui::EndPopup();
                                               exitSketch(st, /*keep=*/true); dl->PopClipRect(); return; }
@@ -2078,47 +2448,73 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     if (editTool) {
         int hovered = imgHovered ? hitTestEntity(io.MousePos) : -1;
 
-        // ----- TRIM: highlight the hovered entity in red; click sends sketch_trim at the uv. -----
+        // ----- TRIM (power trim): highlight the exact doomed SPAN in red; click trims it; -----
+        // ----- holding LMB and sweeping across entities trims each one crossed (SW style). -----
         if (tool_ == SketchTool::Trim) {
+            const ImU32 rc = col(pal.statusErr, 0.95f);
+            // Preview: the span a click would remove (client-side mirror of the engine split).
+            // Spans of unsupported types (slot etc.) draw nothing — the click logs the error.
             if (hovered >= 0) {
-                // Whole-entity emphasis in red (honest approximation: we do NOT compute the exact
-                // trimmed span client-side — the engine splits at intersections and returns the
-                // surviving spans; we just flag the picked entity).
-                const SketchEntity& e = ents_[hovered];
-                const ImU32 rc = col(pal.statusErr, 0.95f);
-                if (e.type == "line" || e.type == "slot") {
-                    dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), rc, 3.5f);
-                } else if (e.type == "circle" || e.type == "arc") {
-                    float a0 = 0, a1 = 6.2831853f;
-                    if (e.type == "arc") {
-                        a0 = e.start * 3.14159265f / 180.0f; a1 = e.end * 3.14159265f / 180.0f;
-                        if (!e.ccw) { float t = a0; a0 = a1; a1 = t; }
-                        if (a1 < a0) a1 += 6.2831853f;
-                    }
-                    ImVec2 prev; int seg = 64;
-                    for (int i = 0; i <= seg; ++i) {
-                        float a = a0 + (a1 - a0) * (i / (float)seg);
-                        ImVec2 p = uvToScreen(e.center[0] + e.radius * std::cos(a),
-                                              e.center[1] + e.radius * std::sin(a));
-                        if (i) dl->AddLine(prev, p, rc, 3.5f); prev = p;
+                std::vector<ImVec2> span; bool whole = false;
+                if (trimDoomedSpan(hovered, mu, mv, span, whole)) {
+                    if (whole) {
+                        // No interior crossing: the whole entity goes (engine deletes it).
+                        const SketchEntity& e = ents_[hovered];
+                        if (e.type == "line") {
+                            dl->AddLine(uvToScreen(e.p1[0], e.p1[1]),
+                                        uvToScreen(e.p2[0], e.p2[1]), rc, 3.5f);
+                        } else {
+                            float a0 = 0, a1 = 6.2831853f;
+                            if (e.type == "arc") {
+                                a0 = e.start * 3.14159265f / 180.0f; a1 = e.end * 3.14159265f / 180.0f;
+                                if (!e.ccw) { float t = a0; a0 = a1; a1 = t; }
+                                if (a1 < a0) a1 += 6.2831853f;
+                            }
+                            ImVec2 prev; int seg = 64;
+                            for (int i = 0; i <= seg; ++i) {
+                                float a = a0 + (a1 - a0) * (i / (float)seg);
+                                ImVec2 p = uvToScreen(e.center[0] + e.radius * std::cos(a),
+                                                      e.center[1] + e.radius * std::sin(a));
+                                if (i) dl->AddLine(prev, p, rc, 3.5f); prev = p;
+                            }
+                        }
+                    } else {
+                        for (size_t i = 1; i < span.size(); ++i)
+                            dl->AddLine(uvToScreen(span[i - 1].x, span[i - 1].y),
+                                        uvToScreen(span[i].x, span[i].y), rc, 3.5f);
                     }
                 }
             }
-            if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hovered >= 0) {
-                const SketchEntity& e = ents_[hovered];
+            // One trim op at the current cursor (shared by click + sweep).
+            auto fireTrim = [&](int idx) -> bool {
+                const SketchEntity& e = ents_[idx];
                 if (e.type != "line" && e.type != "circle" && e.type != "arc") {
                     st.addLog("[sketch] Trim: unsupported entity type '" + e.type + "'");
-                } else {
-                    nlohmann::json op = {{"op", "sketch_trim"}, {"sketch", fid_},
-                        {"entity", e.id}, {"point", nlohmann::json::array({mu, mv})}};
-                    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
-                    if (!r.ok) st.addLog("[sketch] trim failed: " + r.error_message);
-                    else {
-                        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
-                        resolve(st);   // refresh entities/statuses (same path as add_entity)
-                    }
+                    return false;
+                }
+                nlohmann::json op = {{"op", "sketch_trim"}, {"sketch", fid_},
+                    {"entity", e.id}, {"point", nlohmann::json::array({mu, mv})}};
+                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+                if (!r.ok) { st.addLog("[sketch] trim failed: " + r.error_message); return false; }
+                if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+                resolve(st);   // refresh entities/statuses (same path as add_entity)
+                return true;
+            };
+            if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hovered >= 0) {
+                if (fireTrim(hovered)) { trimSweepLast_ = io.MousePos; trimSweeping_ = true; }
+            } else if (trimSweeping_ && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                // Power-trim sweep: each entity the cursor crosses while LMB is held gets trimmed.
+                // A small pixel gate between ops avoids re-firing on the same spot while the
+                // entity list refills (ids change across every trim).
+                float moved = std::hypot(io.MousePos.x - trimSweepLast_.x,
+                                         io.MousePos.y - trimSweepLast_.y);
+                if (imgHovered && moved > 10.0f && hovered >= 0) {
+                    const SketchEntity& e = ents_[hovered];
+                    if (e.type == "line" || e.type == "circle" || e.type == "arc")
+                        if (fireTrim(hovered)) trimSweepLast_ = io.MousePos;
                 }
             }
+            if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) trimSweeping_ = false;
             if (ImGui::IsKeyPressed(ImGuiKey_Escape)) cancelTool();
         }
 
@@ -3187,22 +3583,38 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                                              uvToScreen(e.center[0], e.center[1]).x, 0.0f), pickCol, 48, 3.0f);
             }
         }
-        // Hover highlight for the next pickable target (only while collecting picks).
-        if (!dimHasPending_ && imgHovered && !dimPopupOpen_) {
-            DimPick hp;
-            if (dimHitTest(io.MousePos, hp)) {
-                if (hp.isPoint) dl->AddCircle(uvToScreen(hp.u, hp.v), 6.0f, hiCol, 12, 2.0f);
-                else if (hp.entIdx >= 0) {
-                    const SketchEntity& e = ents_[hp.entIdx];
-                    if (e.type == "line")
-                        dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), hiCol, 2.5f);
-                    else if (e.type == "circle" || e.type == "arc")
-                        dl->AddCircle(uvToScreen(e.center[0], e.center[1]),
-                                      std::hypot(uvToScreen(e.center[0] + e.radius, e.center[1]).x -
-                                                 uvToScreen(e.center[0], e.center[1]).x, 0.0f), hiCol, 48, 2.5f);
-                }
+        // A pick can still be chained while fewer than 2 targets are collected — even when a
+        // single-pick combo (diameter / line length) is already previewing: clicking ANOTHER
+        // target replaces it with the two-pick combo (SolidWorks behavior; this also makes the
+        // line-line angle and all circle-distance combos actually reachable).
+        const bool canAddPick = !dimPopupOpen_ && dimPicks_.size() < 2;
+        DimPick hoverPick; bool hoverHit = false;
+        if (canAddPick && imgHovered) hoverHit = dimHitTest(io.MousePos, hoverPick);
+        if (hoverHit) {
+            if (hoverPick.isPoint) dl->AddCircle(uvToScreen(hoverPick.u, hoverPick.v), 6.0f, hiCol, 12, 2.0f);
+            else if (hoverPick.entIdx >= 0) {
+                const SketchEntity& e = ents_[hoverPick.entIdx];
+                if (e.type == "line")
+                    dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), hiCol, 2.5f);
+                else if (e.type == "circle" || e.type == "arc")
+                    dl->AddCircle(uvToScreen(e.center[0], e.center[1]),
+                                  std::hypot(uvToScreen(e.center[0] + e.radius, e.center[1]).x -
+                                             uvToScreen(e.center[0], e.center[1]).x, 0.0f), hiCol, 48, 2.5f);
             }
         }
+
+        // External (model) geometry: when nothing sketch-side is under the cursor, probe the
+        // id-buffer for a model edge/face. st.hover drives the standard 3D hover highlight
+        // (rendered next frame); a click projects the reference into the sketch as a FIXED
+        // construction entity (worker sketch_project_ref) and chains it as a pick.
+        render::PickHit extHit{};
+        if (canAddPick && imgHovered && !hoverHit && st.hasDocMesh && st.idPass) {
+            int px = (int)(io.MousePos.x - imgMin.x), py = (int)(io.MousePos.y - imgMin.y);
+            render::PickHit h = st.idPass->pickFinal(px, py, vw, vh);
+            if (h.valid() && (h.kind == render::PickKind::Edge || h.kind == render::PickKind::Face))
+                extHit = h;
+        }
+        st.hover = extHit;   // empty hit = no highlight; cleared when SmartDim disarms (below)
 
         // Phase A: collecting picks (no full combo yet). A click adds the hovered target.
         if (!dimPopupOpen_) {
@@ -3210,6 +3622,53 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             // the live h/v/aligned variant choice for point-point).
             dimBuildPending(io.MousePos, mu, mv);
 
+            bool clicked = imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+            bool pickAdded = false;
+            if (clicked && canAddPick && dimHoverCid_.empty()) {
+                // C47: dimHoverCid_ guard — a click on an existing dim's text belongs to the
+                // drag / double-click-edit handler above, not a new pick.
+                if (hoverHit) {
+                    // Avoid duplicate picks of the same target. C38 (S1): compare entity picks by
+                    // id (stable) rather than ents_ index (per-frame, may have shifted).
+                    bool dup = false;
+                    for (const auto& q : dimPicks_)
+                        if (q.isPoint == hoverPick.isPoint &&
+                            (hoverPick.isPoint ? q.handle == hoverPick.handle
+                                               : q.entId == hoverPick.entId)) dup = true;
+                    if (!dup) {
+                        // Shift+click a circle/arc = tangent (near-rim "min") anchor; plain click
+                        // anchors at the center. Either way the Modify box can switch it after.
+                        if (!hoverPick.isPoint) {
+                            const SketchEntity* ce = entById(hoverPick.entId);
+                            if (ce && (ce->type == "circle" || ce->type == "arc"))
+                                hoverPick.cond = io.KeyShift ? "min" : "center";
+                        }
+                        dimPicks_.push_back(hoverPick);
+                        pickAdded = true;
+                        dimBuildPending(io.MousePos, mu, mv);   // refresh the combo immediately
+                    }
+                } else if (extHit.valid()) {
+                    std::string perr;
+                    std::string selStr = st.docMirror.resolvePick(
+                        st.worker, extHit.body_id,
+                        extHit.kind == render::PickKind::Edge ? "edge" : "face",
+                        extHit.topo_id, perr);
+                    nlohmann::json selJs;
+                    if (!selStr.empty()) { try { selJs = nlohmann::json::parse(selStr); } catch (...) {} }
+                    if (selJs.is_object()) {
+                        nlohmann::json ref = {
+                            {"kind", extHit.kind == render::PickKind::Edge ? "edge" : "face"},
+                            {"selector", selJs}};
+                        if (!addProjectedDimRef(st, ref, selStr).empty()) {
+                            pickAdded = true;
+                            dimBuildPending(io.MousePos, mu, mv);
+                        }
+                    } else {
+                        st.toast(ui::ToastLevel::Warn, "Can't reference that geometry" +
+                                 (perr.empty() ? std::string() : ": " + perr));
+                    }
+                }
+            }
             if (dimHasPending_) {
                 // LIVE PREVIEW: a full annotation following the cursor until the placement click.
                 SketchConstraint pc;
@@ -3217,25 +3676,14 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 pc.hasMeasured = true; pc.measured = dimMeasured_;
                 if (dimPending_.contains("refs"))
                     for (const auto& rr : dimPending_["refs"]) pc.refs.push_back(rr.get<std::string>());
+                if (dimPending_.contains("cond"))
+                    for (const auto& q : dimPending_["cond"]) pc.cond.push_back(q.get<std::string>());
                 drawDimension(dl, pc, hiCol, hiCol, true, mu, mv);
-                // Placement click stores the placement and opens the Modify box.
-                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                // Placement click (a click that didn't chain a pick) stores the placement and
+                // opens the Modify box.
+                if (clicked && !pickAdded) {
                     dimPlaceU_ = mu; dimPlaceV_ = mv;
                     dimOpenModify(io.MousePos);
-                }
-            } else if (imgHovered && dimHoverCid_.empty() &&
-                       ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                // C47: skip when an existing dim's text is hovered — that click belongs to the
-                // drag / double-click-edit handler above, not a new pick.
-                DimPick pick;
-                if (dimHitTest(io.MousePos, pick)) {
-                    // Avoid duplicate picks of the same target. C38 (S1): compare entity picks by id
-                    // (stable) rather than ents_ index (per-frame, may have shifted).
-                    bool dup = false;
-                    for (const auto& q : dimPicks_)
-                        if (q.isPoint == pick.isPoint &&
-                            (pick.isPoint ? q.handle == pick.handle : q.entId == pick.entId)) dup = true;
-                    if (!dup) dimPicks_.push_back(pick);
                 }
             }
         }
@@ -3251,6 +3699,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
             dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr;
         }
+    } else if (st.hover.valid()) {
+        // Smart Dimension was the only in-sketch writer of st.hover (model-ref picking); clear a
+        // stale highlight once the tool disarms (the viewport's own picking is off in-sketch).
+        st.hover = render::PickHit{};
     }
 
     dl->PopClipRect();
@@ -3338,9 +3790,11 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             case SketchTool::Slot:
                 step = n == 0 ? "click start" : n == 1 ? "click end" : "click width"; break;
             case SketchTool::SmartDim:
-                step = dimHasPending_ ? "click to place the dimension"
-                     : dimPicks_.empty() ? "click an entity or point to dimension"
-                     : "click another entity/point, or place"; break;
+                step = dimPicks_.empty()
+                     ? "click an entity, point, model edge/face, or a tree plane (Shift+circle = tangent)"
+                     : dimPicks_.size() < 2
+                     ? "click another entity/point/model ref, or click empty space to place"
+                     : "click to place the dimension"; break;
             case SketchTool::Rect3ptCorner:
                 step = n == 0 ? "click corner" : n == 1 ? "click edge end" : "click width"; break;
             case SketchTool::Rect3ptCenter:
@@ -3457,6 +3911,45 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             ImGui::SameLine();
             if (ImGui::Button("+")) stepVal(dimPopupStep_);
             ImGui::Checkbox("Driven", &dimPopupDriven_);
+            // Arc condition (distance involving a circle/arc): anchor that ref at its Center,
+            // near rim (Min, i.e. tangent gap) or far rim (Max). SolidWorks dim-properties combo.
+            if (dimEditCid_.empty() && dimType_ == "distance") {
+                static const char* kConds[3] = {"Center", "Min (near rim)", "Max (far rim)"};
+                bool condChanged = false;
+                int shown = 0;
+                for (auto& p : dimPicks_) {
+                    if (p.isPoint) continue;
+                    const SketchEntity* ce = entById(p.entId);
+                    if (!ce || (ce->type != "circle" && ce->type != "arc")) continue;
+                    int cur = p.cond == "min" ? 1 : p.cond == "max" ? 2 : 0;
+                    double adjOld = cur == 1 ? -(double)ce->radius : cur == 2 ? (double)ce->radius : 0.0;
+                    ImGui::SetNextItemWidth(150);
+                    std::string lbl = std::string(shown == 0 ? "Arc condition" : "Arc condition 2")
+                                      + "##cond" + p.entId;
+                    if (ImGui::Combo(lbl.c_str(), &cur, kConds, 3)) {
+                        double adjNew = cur == 1 ? -(double)ce->radius : cur == 2 ? (double)ce->radius : 0.0;
+                        p.cond = cur == 1 ? "min" : cur == 2 ? "max" : "center";
+                        dimMeasured_ += adjNew - adjOld;
+                        condChanged = true;
+                    }
+                    ++shown;
+                }
+                if (condChanged && dimPending_.contains("refs")) {
+                    // Rebuild cond ALIGNED WITH THE REFS ORDER (point-line combos may have the
+                    // picks in the opposite order to the refs) + re-seed the value buffer.
+                    nlohmann::json cond = nlohmann::json::array();
+                    for (const auto& rr : dimPending_["refs"]) {
+                        std::string rs = rr.get<std::string>();
+                        std::string cv = "center";
+                        for (const auto& p : dimPicks_)
+                            if (!p.isPoint && p.entId == rs && !p.cond.empty()) cv = p.cond;
+                        cond.push_back(cv);
+                    }
+                    dimPending_["cond"] = cond;
+                    std::snprintf(dimBuf_.data(), dimBuf_.size(), "%s",
+                                  fmtLen(dimMeasured_).c_str());
+                }
+            }
             if (!dimError_.empty()) {
                 ImGui::PushStyleColor(ImGuiCol_Text,
                     ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1));

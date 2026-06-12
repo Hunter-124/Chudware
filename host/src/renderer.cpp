@@ -1006,6 +1006,12 @@ void Renderer::planeCorners(int plane, float e, Vec3 out[4]) const {
     }
 }
 
+bool Renderer::planeQuad(int plane, Vec3 out[4]) const {
+    if (plane < 0 || plane > 2) return false;
+    planeCorners(plane, ((radius_ > 0.0f) ? radius_ : kEmptySceneRadius) * 1.25f, out);
+    return true;
+}
+
 bool Renderer::planeAnchor(int plane, Vec3& world) const {
     if (plane < 0 || plane > 2) return false;
     Vec3 c[4];

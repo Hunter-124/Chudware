@@ -96,6 +96,10 @@ public:
     // World-space label anchor (a corner of the plane quad) for projecting the plane name to screen.
     // Returns false if the plane index is out of range. Valid after a render (uses center_/radius_).
     bool planeAnchor(int plane, Vec3& world) const;
+    // The exact 4 world-space corners of a datum-plane quad as drawReferencePlanes draws it
+    // (center_ + the same half-extent), so screen-space overlays (sketch plane-pick) hit-test the
+    // SAME geometry the user sees. Returns false if the plane index is out of range.
+    bool planeQuad(int plane, Vec3 out[4]) const;
 
     // ---- C28-C: SolidWorks-style Section View — up to 3 simultaneous clip planes ----
     // A fragment is visible only when it is inside ALL active half-spaces: dot(p,Ni) <= Oi.

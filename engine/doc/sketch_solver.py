@@ -52,6 +52,7 @@ Both functions are pure dict-in / dict-out; no document or compiler imports.
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -73,6 +74,12 @@ class SolveState:
     x: np.ndarray                        # last solved variable vector
     var_map: Dict[str, np.ndarray]       # entity id -> int64 variable indices
     n_vars: int                          # total variable count
+    # Per-entity doc-geometry signature at the time this state was built (id -> json dump of the
+    # entity params dict). solve_sketch warm-starts an entity from this state ONLY while its doc
+    # geometry is unchanged — a sketch_trim/extend/edit_entity that rewrites an entity's params
+    # under the SAME id (and often the same var count) must win over the stale warm vector.
+    # Default empty = legacy whole-vector warm behavior for states without signatures.
+    ent_sig: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -2399,10 +2406,30 @@ def solve_sketch(
             # (matches "forward tolerant" pattern from doc_schema conventions)
             pass
 
-    # Determine warm-start vector
+    # Per-entity doc-geometry signatures for warm-start gating (see SolveState.ent_sig).
+    cur_sig = {e["id"]: json.dumps(e, sort_keys=True, default=str) for e in entities_list}
+
+    # Determine warm-start vector.
+    # Warm values are applied PER ENTITY, and only while that entity's doc geometry is unchanged
+    # since the warm state was built. A whole-vector warm start (the old behavior) silently
+    # resurrected pre-edit geometry after sketch_trim/extend/edit_entity: the edited entity keeps
+    # its id (and often the var count), so warm.x overrode the new doc coordinates and — with no
+    # constraint pinning the freed points — the solver simply stayed there.
     x0 = None
-    if warm is not None and warm.n_vars == sys.n_vars:
-        x0 = warm.x
+    if warm is not None:
+        if not getattr(warm, "ent_sig", None):
+            # Legacy state without signatures: previous whole-vector behavior.
+            if warm.n_vars == sys.n_vars:
+                x0 = warm.x
+        else:
+            x0 = np.asarray(sys._init, dtype=np.float64).copy()
+            for eid, idx in var_map.items():
+                widx = warm.var_map.get(eid)
+                if widx is None or len(widx) != len(idx):
+                    continue
+                if warm.ent_sig.get(eid) != cur_sig.get(eid):
+                    continue   # doc geometry changed -> cold-start this entity
+                x0[idx] = warm.x[widx]
 
     # Solve
     result = sys.solve(x0=x0, tol=1e-10, max_iter=50)
@@ -2417,7 +2444,7 @@ def solve_sketch(
     # Per-entity status
     statuses = _compute_entity_statuses(x, entities_list, var_map, sys, analysis)
 
-    state = SolveState(x=x.copy(), var_map=var_map, n_vars=sys.n_vars)
+    state = SolveState(x=x.copy(), var_map=var_map, n_vars=sys.n_vars, ent_sig=cur_sig)
 
     return SketchSolution(
         entities=entity_coords,

@@ -242,6 +242,43 @@ def test_sketch_project_ref() -> None:
         p.wait(timeout=60)
 
 
+def test_dim_variant_fields_roundtrip() -> None:
+    """C50 regression: the sketch_solve constraint annotations must carry the dim VARIANT fields.
+
+    The host renders committed dims from these records — when `cond` was dropped, a min/max (rim)
+    distance visually snapped back to center anchoring the moment it was applied (solver still
+    enforced the rim gap, so it read as the wrong constraint); when `axis` was dropped, h/v
+    distance dims drew as aligned dimension lines."""
+    from engine.doc import session as S
+
+    s = S.new_session(kind="part")
+    r = S.apply_ops(s, None, [
+        {"op": "add_feature", "feature": {"type": "sketch", "name": "Sketch1",
+         "refs": {"plane": "plane.front"}, "params": {"entities": [], "constraints": []}}}])
+    fid = r["id_map"]["$0"]
+    S.apply_ops(s, None, [{"op": "sketch_add_entity", "sketch": fid,
+        "entity": {"type": "circle", "center": [0.0, 10.0], "radius": 4.0}, "constraints": []}])
+    S.apply_ops(s, None, [{"op": "sketch_add_entity", "sketch": fid,
+        "entity": {"type": "line", "p1": [-20.0, 0.0], "p2": [20.0, 0.0]}, "constraints": []}])
+    sk = next(f for f in s.doc["features"] if f["id"] == fid)
+    cid, lid = [e["id"] for e in sk["params"]["entities"]]
+    S.apply_ops(s, None, [{"op": "sketch_add_constraint", "sketch": fid, "constraint": {
+        "type": "distance", "refs": [cid, lid], "cond": ["min", "center"],
+        "value": {"value": 3.0, "expr": None}}}])
+    S.apply_ops(s, None, [{"op": "sketch_add_constraint", "sketch": fid, "constraint": {
+        "type": "distance", "refs": [cid + ".center", "origin"], "axis": "h",
+        "value": {"value": 0.0, "expr": None}, "driven": True}}])
+
+    sol = S.sketch_solve(s, fid)
+    dists = [c for c in sol["constraints"] if c["type"] == "distance"]
+    by_cond = next(c for c in dists if c.get("cond"))
+    by_axis = next(c for c in dists if c.get("axis"))
+    assert by_cond["cond"] == ["min", "center"], by_cond
+    assert abs(by_cond["measured"] - 3.0) < 1e-3, by_cond
+    assert by_axis["axis"] == "h", by_axis
+    print("[dim_fields] cond + axis survive the sketch_solve response")
+
+
 def main() -> None:
     p = subprocess.Popen([sys.executable, "-m", "engine.worker"],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,

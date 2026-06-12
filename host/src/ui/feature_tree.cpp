@@ -1355,6 +1355,10 @@ void drawFeatureTree(AppState& st,
                         static const char* kPlaneSel[] = {"plane.front", "plane.top", "plane.right"};
                         st.sketchPlanePickActive = false;
                         st.sketchMode->createSketchOnPlane(st, kPlaneSel[pi]);
+                    } else if (st.sketchMode && st.sketchMode->smartDimPicking()) {
+                        // Smart Dimension armed in a sketch: a tree plane click references that
+                        // datum plane (projected into the sketch) instead of toggling visibility.
+                        st.sketchMode->addPlaneDimRef(st, pi);
                     } else {
                         st.showPlane[pi] = !st.showPlane[pi];
                         st.planeEmphasis = st.showPlane[pi] ? pi : -1;
@@ -1362,7 +1366,9 @@ void drawFeatureTree(AppState& st,
                 }
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip(st.sketchPlanePickActive ? "Sketch on %s"
-                                      : (hidden ? "Show %s" : "Hide %s"), kPlanes[pi]);
+                                      : ((st.sketchMode && st.sketchMode->smartDimPicking())
+                                             ? "Dimension to %s"
+                                             : (hidden ? "Show %s" : "Hide %s")), kPlanes[pi]);
             }
 
             // Origin

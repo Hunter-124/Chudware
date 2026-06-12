@@ -113,7 +113,11 @@ public:
     // On stale_revision: auto-resyncs via doc_tree (revision & tree updated), logs a note to
     // the console string (caller should surface it), and returns the error so the caller can
     // decide to replay.
-    OpsResponse applyOps(WorkerClient& w, const nlohmann::json& ops);
+    // `coalesce` (undo grouping): when true the worker folds this batch into the previous batch's
+    // undo step (no new undo snapshot). Set it on the 2nd..Nth applyOps of ONE user action that
+    // can only be expressed as several batches (e.g. a rectangle's chained line ops), so a single
+    // Ctrl+Z reverts the whole action.
+    OpsResponse applyOps(WorkerClient& w, const nlohmann::json& ops, bool coalesce = false);
 
     // Undo / redo the most recent batch. Return the ops-response (same shape as applyOps).
     OpsResponse undo(WorkerClient& w);

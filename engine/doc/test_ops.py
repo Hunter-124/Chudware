@@ -162,6 +162,32 @@ def test_stale_revision() -> None:
     print("[ops] stale_revision: base!=current refused (current_revision echoed); current accepted")
 
 
+def test_coalesce_undo_groups_multi_batch_action() -> None:
+    """C50: ``coalesce=True`` folds a batch into the previous undo step so one Ctrl+Z reverts a
+    whole multi-batch user action (e.g. a rectangle = 4 chained line ops)."""
+    from engine.doc.session import undo as session_undo, redo as session_redo
+    s = new_session("part", "Coalesce")
+    r0 = session_apply_ops(s, None, [{"op": "add_feature", "feature": {
+        "type": "sketch", "name": "Sketch1", "refs": {"plane": "plane.front"},
+        "params": {"entities": [], "constraints": []}}}])
+    fid = r0["id_map"]["$0"]
+
+    def nents():
+        sk = next(f for f in s.doc["features"] if f["id"] == fid)
+        return len(sk["params"].get("entities", []))
+
+    corners = [([0, 0], [10, 0]), ([10, 0], [10, 10]), ([10, 10], [0, 10]), ([0, 10], [0, 0])]
+    for i, (p1, p2) in enumerate(corners):
+        session_apply_ops(s, None, [{"op": "sketch_add_entity", "sketch": fid,
+            "entity": {"type": "line", "p1": p1, "p2": p2}}], coalesce=(i != 0))
+    assert nents() == 4
+    session_undo(s)
+    assert nents() == 0, "one undo must revert the whole coalesced rectangle"
+    session_redo(s)
+    assert nents() == 4, "redo must restore the whole rectangle"
+    print("[ops] coalesce: 4-batch rectangle undoes/redoes as ONE step")
+
+
 # --------------------------------------------------------------------------- equations
 
 
@@ -251,6 +277,7 @@ def main() -> None:
     test_eq_set_drives_and_eq_delete_in_use()
     test_cache_hit_face_owners_nonempty()
     test_cache_hit_partial_rebuild_owner_maps()
+    test_coalesce_undo_groups_multi_batch_action()
     print("\nDOC OPS TESTS PASSED")
 
 

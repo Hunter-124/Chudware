@@ -188,15 +188,20 @@ void SketchMode::applyEnterResult(const nlohmann::json& res) {
     conflicting_.clear();
     if (res.contains("conflicting") && res["conflicting"].is_array())
         for (const auto& c : res["conflicting"]) if (c.is_string()) conflicting_.push_back(c.get<std::string>());
+    redundant_.clear();
+    if (res.contains("redundant") && res["redundant"].is_array())
+        for (const auto& c : res["redundant"]) if (c.is_string()) redundant_.push_back(c.get<std::string>());
     if (res.contains("plane_frame") && res["plane_frame"].is_array() &&
         res["plane_frame"].size() == 16) {
         for (int i = 0; i < 16; ++i) frame_[i] = res["plane_frame"][i].get<float>();
     }
     parseEntities(res, ents_);
     applyConstraints(res);   // C37-D: store the constraints array for dim annotations
-    // C41 (T2): drop selected ids that no longer exist (entity deleted / undone away).
+    // C41 (T2) / C50: drop selected handles whose OWNING entity no longer exists (deleted/undone).
     selIds_.erase(std::remove_if(selIds_.begin(), selIds_.end(),
-                                 [&](const std::string& id) { return entById(id) == nullptr; }),
+                                 [&](const std::string& id) {
+                                     return entById(id.substr(0, id.find('.'))) == nullptr;
+                                 }),
                   selIds_.end());
     // C38 (S1) / C50: ents_ was just refilled — prune Smart Dimension picks SURGICALLY instead of
     // clearing the buffer. A projection of external geometry (addProjectedDimRef) applies ops and
@@ -392,7 +397,8 @@ void SketchMode::addQuadLoop(AppState& st, const ImVec2 corners[4], const char* 
             {"p2", nlohmann::json::array({corners[j].x, corners[j].y})}};
         nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_},
                              {"entity", ent}, {"constraints", cs}};
-        auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+        // C50: one undo step for the whole rectangle — only the first batch pushes an undo snapshot.
+        auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/i != 0);
         if (!r.ok) { st.addLog("[sketch] quad line failed: " + r.error_message); break; }
         std::string nid = (r.id_map.is_object() && r.id_map.contains("$0"))
                         ? r.id_map["$0"].get<std::string>() : std::string();
@@ -402,7 +408,7 @@ void SketchMode::addQuadLoop(AppState& st, const ImVec2 corners[4], const char* 
         if (i == 3 && !firstId.empty() && !nid.empty()) {
             nlohmann::json clop = {{"op", "sketch_add_constraint"}, {"sketch", fid_},
                 {"constraint", {{"type", "coincident"}, {"refs", {nid + ".p2", firstId + ".p1"}}}}};
-            st.docMirror.applyOps(st.worker, nlohmann::json::array({clop}));
+            st.docMirror.applyOps(st.worker, nlohmann::json::array({clop}), /*coalesce=*/true);
         }
         if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     }
@@ -414,7 +420,7 @@ void SketchMode::addQuadLoop(AppState& st, const ImVec2 corners[4], const char* 
         if (a.empty() || b.empty()) return;
         nlohmann::json op = {{"op", "sketch_add_constraint"}, {"sketch", fid_},
             {"constraint", {{"type", type}, {"refs", {a, b}}}}};
-        st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+        st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/true);
     };
     for (int i = 0; i < 2; ++i) {
         const char* rel = relations[i];
@@ -445,7 +451,8 @@ void SketchMode::addPolyLoop(AppState& st, const std::vector<ImVec2>& corners, b
             {"p2", nlohmann::json::array({corners[j].x, corners[j].y})}};
         nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_},
                              {"entity", ent}, {"constraints", cs}};
-        auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+        // C50: one undo step for the whole polygon — only the first batch pushes an undo snapshot.
+        auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/i != 0);
         if (!r.ok) { st.addLog("[sketch] poly line failed: " + r.error_message); break; }
         std::string nid = (r.id_map.is_object() && r.id_map.contains("$0"))
                         ? r.id_map["$0"].get<std::string>() : std::string();
@@ -455,7 +462,7 @@ void SketchMode::addPolyLoop(AppState& st, const std::vector<ImVec2>& corners, b
         if (i == n - 1 && !firstId.empty() && !nid.empty()) {
             nlohmann::json clop = {{"op", "sketch_add_constraint"}, {"sketch", fid_},
                 {"constraint", {{"type", "coincident"}, {"refs", {nid + ".p2", firstId + ".p1"}}}}};
-            st.docMirror.applyOps(st.worker, nlohmann::json::array({clop}));
+            st.docMirror.applyOps(st.worker, nlohmann::json::array({clop}), /*coalesce=*/true);
         }
         if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     }
@@ -464,7 +471,7 @@ void SketchMode::addPolyLoop(AppState& st, const std::vector<ImVec2>& corners, b
             if (ids[i].empty() || ids[i + 1].empty()) continue;
             nlohmann::json op = {{"op", "sketch_add_constraint"}, {"sketch", fid_},
                 {"constraint", {{"type", "equal"}, {"refs", {ids[i], ids[i + 1]}}}}};
-            st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+            st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/true);
         }
     }
     resolve(st);
@@ -721,8 +728,8 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     // C42: minimal Add Relation popup over the current 1-2 entity selection (drawOverlay renders
     // it; the offered relations depend on the selected entity types).
     if (cmdId == "sk_relations") {
-        if (selIds_.empty() || selIds_.size() > 2) {
-            st.toast(ui::ToastLevel::Info, "Add Relation: select 1 or 2 sketch entities first");
+        if (selIds_.empty()) {
+            st.toast(ui::ToastLevel::Info, "Add Relation: select sketch entities or points first");
             return true;
         }
         relIds_ = selIds_;
@@ -1666,14 +1673,16 @@ void SketchMode::dimCommit(AppState& st) {
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     std::string newCid = (r.id_map.is_object() && r.id_map.contains("$0"))
                        ? r.id_map["$0"].get<std::string>() : std::string();
-    resolve(st);   // refreshes conflicting_ + status_
-    // C50: SolidWorks over-define guard. If the dim we just added is the one the solver flagged
-    // conflicting (it over-defines the sketch), don't leave it silently driving — pop the "Make
-    // Dimension Driven?" prompt (Make Driven / Keep Driving / Cancel). A driving conflicting dim
-    // sits at a least-squares compromise and its annotation flip-flops as the geometry oscillates,
-    // which is exactly the bug the user hit.
-    if (!dimPopupDriven_ && !newCid.empty() &&
-        std::find(conflicting_.begin(), conflicting_.end(), newCid) != conflicting_.end()) {
+    resolve(st);   // refreshes conflicting_ + redundant_ + status_
+    // C50: SolidWorks over-define guard. A driving dimension that the solver flags REDUNDANT
+    // (removes no DOF — the geometry is already constrained that way) or CONFLICTING (inconsistent)
+    // over-defines the sketch. SolidWorks catches the redundant case at add-time — BEFORE you can
+    // change the value to break the sketch — and pops "Make Dimension Driven?". Catching only
+    // conflicting (the old code) missed the consistent-redundant case the user hit.
+    auto inList = [&](const std::vector<std::string>& v) {
+        return std::find(v.begin(), v.end(), newCid) != v.end();
+    };
+    if (!dimPopupDriven_ && !newCid.empty() && (inList(conflicting_) || inList(redundant_))) {
         overDefOpen_ = true; overDefCid_ = newCid; overDefPos_ = dimPopupPos_;
     }
     // Stay in Smart Dimension; clear the pick buffer for the next dimension.
@@ -1732,6 +1741,17 @@ void SketchMode::inSketchUndo(AppState& st) {
         return;
     }
     st.docUndo();
+    afterSketchHistory(st);
+}
+
+void SketchMode::inSketchRedo(AppState& st) {
+    st.docRedo();
+    afterSketchHistory(st);
+}
+
+// Shared post-undo/redo refresh: resync the mirror, re-solve the active sketch, or close cleanly
+// if the sketch feature itself was undone/redone away.
+void SketchMode::afterSketchHistory(AppState& st) {
     resyncMirror(st);
     // Does the sketch still exist? Re-solving an absent sketch returns an error envelope.
     nlohmann::json res;
@@ -2084,12 +2104,21 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             imgHovered = false;
     }
 
-    // C37-D: in-sketch Ctrl+Z (the global app handler skips Ctrl+Z while sketch is active). Mid-
-    // stroke pops the last point; otherwise doc undo + re-solve. Suppressed while a text field
-    // (the Modify box) owns the keyboard. Returns early if the sketch vanished from the undo.
-    if (!io.WantTextInput && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
-        inSketchUndo(st);
-        if (!active_) { dl->PopClipRect(); return; }
+    // C37-D / C50: in-sketch undo + redo (the global app handler skips both while a sketch is
+    // active). Ctrl+Z undoes (mid-stroke pops the last point); Ctrl+Y or Ctrl+Shift+Z redoes.
+    // Suppressed while a text field (the Modify box) owns the keyboard. Returns early if the
+    // sketch vanished from the undo/redo.
+    if (!io.WantTextInput && io.KeyCtrl) {
+        if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+            inSketchRedo(st);
+            if (!active_) { dl->PopClipRect(); return; }
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+            inSketchUndo(st);
+            if (!active_) { dl->PopClipRect(); return; }
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Y, false)) {
+            inSketchRedo(st);
+            if (!active_) { dl->PopClipRect(); return; }
+        }
     }
 
     // C41 (T1): Esc consumption flag. The specific Esc behaviors that KEEP the tool armed
@@ -2251,6 +2280,23 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                             uvToScreen(e.pts[i].x, e.pts[i].y), cc, th);
             for (const auto& q : e.pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), 2.5f, cc);
         }
+    }
+
+    // C50: selected POINT handles (vertices/centers picked for relations) — filled accent squares.
+    // Entity-level selection already thickens the whole entity above; this marks sub-handle picks.
+    for (const auto& selh : selIds_) {
+        auto dot = selh.find('.');
+        if (dot == std::string::npos) continue;   // bare entity id, handled in the entity loop
+        const SketchEntity* e = entById(selh.substr(0, dot));
+        if (!e) continue;
+        std::string sub = selh.substr(dot + 1);
+        ImVec2 p;
+        if (sub == "p1")          p = uvToScreen(e->p1[0], e->p1[1]);
+        else if (sub == "p2")     p = uvToScreen(e->p2[0], e->p2[1]);
+        else if (sub == "center") p = uvToScreen(e->center[0], e->center[1]);
+        else if (sub == "p")      p = uvToScreen(e->p1[0], e->p1[1]);
+        else continue;
+        dl->AddRectFilled(ImVec2(p.x - 4, p.y - 4), ImVec2(p.x + 4, p.y + 4), col(pal.accent), 1.5f);
     }
 
     // ---- C37-D: dimension annotations + relation glyphs (always rendered) ----
@@ -2438,9 +2484,15 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // this gated on dimHoverCid_.empty() and BEFORE that handler (it clears the hover id).
         if (!selIds_.empty() && dimHoverCid_.empty() && !io.WantTextInput &&
             (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
+            // C50: selection may hold point handles ("e3.p2") — delete the OWNING entity, deduped.
             nlohmann::json ops = nlohmann::json::array();
-            for (const auto& id : selIds_)
-                ops.push_back({{"op", "sketch_delete_entity"}, {"sketch", fid_}, {"id", id}});
+            std::vector<std::string> done;
+            for (const auto& sel : selIds_) {
+                std::string base = sel.substr(0, sel.find('.'));
+                if (std::find(done.begin(), done.end(), base) != done.end()) continue;
+                done.push_back(base);
+                ops.push_back({{"op", "sketch_delete_entity"}, {"sketch", fid_}, {"id", base}});
+            }
             auto r = st.docMirror.applyOps(st.worker, ops);
             if (!r.ok) st.toast(ui::ToastLevel::Error, "Delete: " + r.error_message);
             else {
@@ -2464,29 +2516,31 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // commits. At most one sketch_drag per frame (throttled by dragFrame_).
     if (tool_ == SketchTool::None) {
         // C37-D: a hovered/dragging dimension text claims the click (dim drag/edit above handles it).
+        auto toggleSel = [&](const std::string& id) {
+            auto it = std::find(selIds_.begin(), selIds_.end(), id);
+            if (io.KeyCtrl) { if (it != selIds_.end()) selIds_.erase(it); else selIds_.push_back(id); }
+            else { selIds_.clear(); selIds_.push_back(id); }
+        };
         if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !dragging_ &&
-            !dimDragging_ && dimHoverCid_.empty()) {
+            !dragArmed_ && !dimDragging_ && dimHoverCid_.empty()) {
             std::string h; float hu, hv;
             if (hitTestHandle(io.MousePos, h, hu, hv) > 0) {
-                dragging_ = true; dragHandle_ = h; dragFrame_ = -1;
+                // C50: ARM a potential drag on this point handle — don't move yet. A release
+                // without dragging selects the handle; a move past threshold starts the drag.
+                dragArmed_ = true; pendingHandle_ = h; dragDownPos_ = io.MousePos;
             } else {
                 // C41 (T2): no drag handle hit -> entity selection. Plain click selects the
                 // entity under the cursor (or clears on empty space); Ctrl+click toggles it
                 // in/out of the multi-selection (and leaves the rest alone on empty space).
                 int ei = hitTestEntity(io.MousePos);
-                if (ei >= 0) {
-                    const std::string id = ents_[ei].id;
-                    auto it = std::find(selIds_.begin(), selIds_.end(), id);
-                    if (io.KeyCtrl) {
-                        if (it != selIds_.end()) selIds_.erase(it);
-                        else selIds_.push_back(id);
-                    } else {
-                        selIds_.clear();
-                        selIds_.push_back(id);
-                    }
-                } else if (!io.KeyCtrl) {
-                    selIds_.clear();
-                }
+                if (ei >= 0)            toggleSel(ents_[ei].id);
+                else if (!io.KeyCtrl)   selIds_.clear();
+            }
+        }
+        // Armed handle: promote to a real drag once the cursor moves past the threshold.
+        if (dragArmed_ && !dragging_ && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            if (std::hypot(io.MousePos.x - dragDownPos_.x, io.MousePos.y - dragDownPos_.y) > 4.0f) {
+                dragging_ = true; dragHandle_ = pendingHandle_; dragFrame_ = -1; dragArmed_ = false;
             }
         }
         if (dragging_ && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
@@ -2499,9 +2553,13 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 if (callSketch(st, "sketch_drag", extra, res)) applyEnterResult(res);
             }
         }
-        if (dragging_ && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-            dragging_ = false;
-            commitDrag(st);
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            if (dragging_) { dragging_ = false; commitDrag(st); }
+            else if (dragArmed_) {
+                // Released without dragging -> select the point handle (vertex/center pick).
+                toggleSel(pendingHandle_);
+            }
+            dragArmed_ = false;
         }
         // Highlight handles on hover.
         std::string hh; float hu, hv;
@@ -2514,6 +2572,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             ImGui::OpenPopup("##SketchCtx");
     }
     if (ImGui::BeginPopup("##SketchCtx")) {
+        if (!selIds_.empty()) {
+            if (ImGui::MenuItem("Add Relation...")) {
+                relIds_ = selIds_; relPopupOpen_ = true; relPopupPos_ = ImGui::GetMousePos();
+            }
+            ImGui::Separator();
+        }
         if (ImGui::MenuItem("Select")) resetTool();
         if (ImGui::MenuItem("Smart Dimension")) { resetTool(); tool_ = SketchTool::SmartDim; }
         if (ImGui::MenuItem("Grid", nullptr, showGrid_)) showGrid_ = !showGrid_;
@@ -4130,48 +4194,98 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         ImGui::End();
     }
 
-    // ---- C42: minimal Add Relation popup (ribbon sk_relations over a 1-2 entity selection) ----
-    // Lists the relations applicable to the snapshotted selection's entity types and emits ONE
-    // sketch_add_constraint. Closes if any referenced entity vanished (undo/delete mid-popup).
+    // ---- C50: Add Relation popup over an N-element selection (entities and/or point handles) ----
+    // Classifies the snapshotted selection and offers the SolidWorks relations valid for it:
+    // points -> coincident / horizontal (same Y) / vertical (same X); lines -> parallel /
+    // perpendicular(2) / equal / horizontal / vertical; circles/arcs -> equal / concentric;
+    // line+circle -> tangent. Pair relations chain to the first ref (e0~e1, e0~e2, …).
     if (relPopupOpen_) {
-        for (const auto& id : relIds_)
-            if (!entById(id)) { relPopupOpen_ = false; relIds_.clear(); break; }
+        for (const auto& h : relIds_)
+            if (!entById(h.substr(0, h.find('.')))) { relPopupOpen_ = false; relIds_.clear(); break; }
     }
     if (relPopupOpen_) {
-        const SketchEntity* a = entById(relIds_[0]);
-        const SketchEntity* b = relIds_.size() > 1 ? entById(relIds_[1]) : nullptr;
-        auto isCirc = [](const SketchEntity* e) {
-            return e && (e->type == "circle" || e->type == "arc");
+        // Classify: a handle with a '.' (or a bare point entity) is a POINT; bare line/circle ids
+        // are entities. (Centers select as "eN.center" = point.)
+        auto isPointHandle = [&](const std::string& h) {
+            if (h.find('.') != std::string::npos) return true;
+            const SketchEntity* e = entById(h);
+            return e && e->type == "point";
         };
+        int nPts = 0, nLines = 0, nCircles = 0, nOther = 0;
+        for (const auto& h : relIds_) {
+            if (isPointHandle(h)) { ++nPts; continue; }
+            const SketchEntity* e = entById(h);
+            if (!e) { ++nOther; continue; }
+            if (e->type == "line") ++nLines;
+            else if (e->type == "circle" || e->type == "arc") ++nCircles;
+            else ++nOther;
+        }
+        const int n = (int)relIds_.size();
+
         ImGui::SetNextWindowPos(relPopupPos_, ImGuiCond_Appearing);
         ImGui::SetNextWindowBgAlpha(0.98f);
         if (ImGui::Begin("##SketchRel", nullptr,
                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
                          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
-            ImGui::TextUnformatted("Add Relation");
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
+            ImGui::Text("Add Relation  (%d selected)", n);
+            ImGui::PopStyleColor();
             ImGui::Separator();
             bool any = false;
-            auto rel = [&](const char* label, const char* type, bool pair) {
+            // Emit a relation. mode: 'each' = one constraint per ref ($self-style single ref);
+            // 'chain' = relate refs[0] to every other ref; 'pair' = exactly refs[0],refs[1].
+            auto emit = [&](const char* label, const char* type, char mode) {
                 any = true;
                 if (!ImGui::MenuItem(label)) return;
-                nlohmann::json refs = nlohmann::json::array({relIds_[0]});
-                if (pair) refs.push_back(relIds_[1]);
-                addConstraint(st, {{"type", type}, {"refs", refs}});   // errors logged + re-solve
+                nlohmann::json ops = nlohmann::json::array();
+                if (mode == 'e') {
+                    for (const auto& h : relIds_)
+                        ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
+                            {"constraint", {{"type", type}, {"refs", nlohmann::json::array({h})}}}});
+                } else if (mode == 'p') {
+                    ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
+                        {"constraint", {{"type", type}, {"refs", nlohmann::json::array({relIds_[0], relIds_[1]})}}}});
+                } else {  // chain
+                    for (size_t i = 1; i < relIds_.size(); ++i)
+                        ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
+                            {"constraint", {{"type", type}, {"refs", nlohmann::json::array({relIds_[0], relIds_[i]})}}}});
+                }
+                auto r = st.docMirror.applyOps(st.worker, ops);
+                if (!r.ok) st.toast(ui::ToastLevel::Warn, std::string(label) + ": " + r.error_message);
+                else { if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); } resolve(st); }
                 relPopupOpen_ = false; relIds_.clear();
             };
-            if (!b) {
-                if (a->type == "line") { rel("Horizontal", "horizontal", false);
-                                         rel("Vertical",   "vertical",   false); }
-                rel("Fix", "fix", false);
-            } else {
-                bool aLine = a->type == "line", bLine = b->type == "line";
-                if (aLine && bLine) { rel("Parallel",      "parallel",      true);
-                                      rel("Perpendicular", "perpendicular", true);
-                                      rel("Equal",         "equal",         true); }
-                else if (isCirc(a) && isCirc(b)) { rel("Equal",      "equal",      true);
-                                                   rel("Concentric", "concentric", true); }
-                else if ((aLine && isCirc(b)) || (isCirc(a) && bLine))
-                    rel("Tangent", "tangent", true);
+
+            const bool onlyPts    = nPts == n;
+            const bool onlyLines  = nLines == n;
+            const bool onlyCircs  = nCircles == n;
+
+            if (onlyPts && n >= 2) {
+                emit("Coincident / Merge", "coincident", n == 2 ? 'p' : 'c');
+                emit("Horizontal (align Y)", "horizontal", 'c');
+                emit("Vertical (align X)",   "vertical",   'c');
+            } else if (onlyLines && n == 1) {
+                emit("Horizontal", "horizontal", 'e');
+                emit("Vertical",   "vertical",   'e');
+                emit("Fix",        "fix",        'e');
+            } else if (onlyLines && n >= 2) {
+                emit("Parallel", "parallel", 'c');
+                if (n == 2) emit("Perpendicular", "perpendicular", 'p');
+                emit("Equal", "equal", 'c');
+                emit("Horizontal (each)", "horizontal", 'e');
+                emit("Vertical (each)",   "vertical",   'e');
+            } else if (onlyCircs && n >= 2) {
+                emit("Equal", "equal", 'c');
+                emit("Concentric", "concentric", 'c');
+            } else if (n == 2 && nLines == 1 && nCircles == 1) {
+                emit("Tangent", "tangent", 'p');
+            } else if (n == 2 && nPts == 1 && nLines == 1) {
+                // point + line -> point lies on the line. point_on expects refs [point, line];
+                // reorder the snapshot so the point handle is first regardless of pick order.
+                if (!isPointHandle(relIds_[0])) std::swap(relIds_[0], relIds_[1]);
+                emit("Coincident (point on line)", "point_on", 'p');
+            } else if (n == 1) {
+                emit("Fix", "fix", 'e');
             }
             if (!any) ImGui::TextDisabled("No relations for this selection");
             ImGui::Separator();

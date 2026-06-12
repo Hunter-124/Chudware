@@ -804,6 +804,31 @@ def test_fix_whole_entity() -> None:
           f"sub-handle dof={sol3.dof}")
 
 
+def test_redundant_consistent_dim_flagged():
+    """C50: a consistent-but-redundant driving dimension (removes no DOF) must appear in the
+    solver's `redundant` list — the host prompts 'Make Dimension Driven?' on it BEFORE the value
+    can be changed to break the sketch. (Conflicting catches the inconsistent case separately.)"""
+    from engine.doc.sketch_solver import solve_sketch
+    base = {
+        "entities": [{"id": "e1", "type": "line", "p1": [0.0, 0.0], "p2": [50.0, 0.0]}],
+        "constraints": [
+            {"id": "c0", "type": "horizontal", "refs": ["e1"]},
+            {"id": "c1", "type": "fix", "refs": ["e1.p1"]},
+            {"id": "c2", "type": "distance", "refs": ["e1.p1", "e1.p2"], "axis": "h",
+             "value": {"value": 50.0, "expr": None}},
+            {"id": "c3", "type": "distance", "refs": ["e1.p1", "e1.p2"], "axis": "h",
+             "value": {"value": 50.0, "expr": None}},
+        ],
+    }
+    sol = solve_sketch(base, {})
+    assert "c3" in sol.redundant and not sol.conflicting, (sol.redundant, sol.conflicting)
+    # Change the duplicate's value -> now inconsistent -> conflicting (not merely redundant).
+    base["constraints"][3]["value"]["value"] = 30.0
+    sol2 = solve_sketch(base, {})
+    assert "c3" in sol2.conflicting, sol2.conflicting
+    print("[redundant] consistent dup -> redundant; inconsistent -> conflicting")
+
+
 def test_line_midpoint_handle():
     """SolidWorks midpoint dimensioning: 'eN.mid' resolves to the line midpoint as a point
     handle (solver constraint target + measurement)."""
@@ -862,6 +887,7 @@ def test_warm_solve_respects_geometry_edits():
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    test_redundant_consistent_dim_flagged()
     test_line_midpoint_handle()
     test_warm_solve_respects_geometry_edits()
     test_bracket_fully_defined()

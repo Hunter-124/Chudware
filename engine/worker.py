@@ -169,7 +169,7 @@ def _doc_apply_ops(params: dict, emit: EmitFn) -> dict:
     from engine.doc import session as docsess
     s = docsess.get_session(params["doc_id"])
     return docsess.apply_ops(s, params.get("base_revision"), params.get("ops", []),
-                             emit=_doc_emit(emit))
+                             emit=_doc_emit(emit), coalesce=bool(params.get("coalesce", False)))
 
 
 def _doc_undo(params: dict, emit: EmitFn) -> dict:

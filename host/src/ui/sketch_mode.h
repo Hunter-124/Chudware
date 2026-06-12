@@ -156,6 +156,10 @@ private:
     // C37-D: in-sketch undo (mid-stroke point pop, else doc undo + resolve). Returns false when the
     // sketch vanished from the undo (caller exits gracefully).
     void inSketchUndo(AppState& st);
+    // C50: in-sketch redo (Ctrl+Y / Ctrl+Shift+Z). doc redo + re-solve; closes gracefully if the
+    // sketch vanished. Shares the post-undo/redo refresh path with inSketchUndo.
+    void inSketchRedo(AppState& st);
+    void afterSketchHistory(AppState& st);   // shared: re-solve or close after a doc undo/redo
     // C37-D: confirmation-corner ✗ — revert the whole sketch session via doc_revert(checkpoint),
     // then drop out of sketch mode cleanly (falls back to a plain keep-exit if no checkpoint).
     void cancelSketch(AppState& st);
@@ -238,6 +242,7 @@ private:
     int dof_ = 0;
     std::string status_;             // under|full|over
     std::vector<std::string> conflicting_;   // C50: constraint ids the solver flagged conflicting
+    std::vector<std::string> redundant_;     // C50: constraint ids that remove no DOF (over-define)
 
     // C50: SolidWorks "Make Dimension Driven?" prompt. When a just-committed Smart Dimension
     // over-defines the sketch (its id lands in conflicting_), this modal offers Make Driven /
@@ -313,6 +318,12 @@ private:
     std::string dragHandle_;
     bool dragging_ = false;
     int dragFrame_ = -1;             // last frame a sketch_drag was issued (throttle: once/frame)
+    // C50: click-vs-drag on a point handle. Mouse-down near an endpoint/center ARMS a potential
+    // drag; moving past kDragThreshPx starts the drag, releasing without moving SELECTS that point
+    // handle (so vertices can be picked for coincident / alignment relations, SolidWorks-style).
+    bool dragArmed_ = false;
+    std::string pendingHandle_;
+    ImVec2 dragDownPos_{0, 0};
 
     // C41 (T2): in-sketch selection (tool_ == None). Left-click on/near an entity selects it
     // (Ctrl+click toggles multi-select); Delete/Backspace deletes the selection via

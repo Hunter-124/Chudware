@@ -160,14 +160,15 @@ std::string DocMirror::resolvePickAsm(WorkerClient& w, uint32_t body_id,
     return {};
 }
 
-OpsResponse DocMirror::applyOps(WorkerClient& w, const nlohmann::json& ops) {
+OpsResponse DocMirror::applyOps(WorkerClient& w, const nlohmann::json& ops, bool coalesce) {
     OpsResponse r;
     nlohmann::json res;
     std::string err;
     nlohmann::json params = {
         {"doc_id", docId_},
         {"base_revision", revision_},
-        {"ops", ops}
+        {"ops", ops},
+        {"coalesce", coalesce}
     };
     bool ok = w.call("doc_apply_ops", params, res, err);
     if (!ok) {

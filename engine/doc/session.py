@@ -410,11 +410,16 @@ def _ops_response(session: DocSession, result: CompileResult,
 
 
 def apply_ops(session: DocSession, base_revision: int | None, ops: list[dict],
-              emit: EmitFn | None = None) -> dict:
+              emit: EmitFn | None = None, coalesce: bool = False) -> dict:
     """Apply an op batch, bump revision, rebuild, and return the ops-response (doc_ops.md §1).
 
     ``base_revision`` (optional optimistic-concurrency guard): if provided and it does not match
     the session's current revision, raises ``stale_revision``.
+
+    ``coalesce`` (undo grouping): when True, do NOT push a new undo snapshot — this batch folds
+    into the previous batch's undo step. The host sets it on the 2nd..Nth op of a single user
+    action that the engine can only express as several apply_ops calls (e.g. a rectangle = 4 line
+    ops whose coincidents need real ids), so one Ctrl+Z reverts the whole action (SolidWorks).
     """
     if base_revision is not None and base_revision != session.revision:
         raise OpError("stale_revision",
@@ -423,8 +428,10 @@ def apply_ops(session: DocSession, base_revision: int | None, ops: list[dict],
 
     new_doc, id_map = _apply_ops_to_doc(session.doc, ops)  # raises OpError on any failure
 
-    # Commit: snapshot the OLD doc for undo, swap in the new doc, bump revision.
-    session._push_undo()
+    # Commit: snapshot the OLD doc for undo (unless coalescing into the prior step), swap in the
+    # new doc, bump revision.
+    if not coalesce:
+        session._push_undo()
     session.doc = new_doc
     session.revision += 1
     session.dirty = True
@@ -1028,6 +1035,7 @@ def sketch_enter(session: DocSession, sketch_fid: str) -> dict:
         "plane_frame": frame,
         "status": st.last_overall_status,
         "conflicting": packed["conflicting"],
+        "redundant": packed["redundant"],
         "constraints": _sketch_constraints(feat, packed["entity_map"]),
     }
 
@@ -1071,6 +1079,7 @@ def sketch_solve(session: DocSession, sketch_fid: str) -> dict:
         "plane_frame": st.plane_frame,
         "status": st.last_overall_status,
         "conflicting": packed["conflicting"],
+        "redundant": packed["redundant"],
         "constraints": _sketch_constraints(feat, packed["entity_map"]),
     }
 

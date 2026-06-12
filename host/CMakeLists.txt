@@ -41,6 +41,7 @@ FetchContent_MakeAvailable(glfw stb json imgui)
 add_executable(AI-CAD
   src/main.cpp
   src/app.cpp
+  src/ui/scenarios.cpp   # scripted screenshot/test scenarios (extracted from app.cpp)
   src/core/app_state.cpp
   src/core/jobs.cpp
   src/ui/legacy_chat.cpp

@@ -335,6 +335,12 @@ int run_gui(const char* screenshotPath) {
         // the tree panel auto-updates from docMirror.tree() on the next frame.
         // We log the new revision for observability.
         st.addLog("[doc] tree updated  rev=" + std::to_string(st.docMirror.revision()));
+        // C38 (T1): this is the single central choke point — DocMirror::notify() fires here after
+        // EVERY mutation (applyOps, resync, undo, redo, newPart) once the rebuilt owner map is
+        // stored. Re-derive the feature highlight from the fresh owner map so the tinted faces never
+        // go stale after a topology rebuild retags them. (docUndo/docRedo also refresh explicitly,
+        // which is redundant-but-harmless; this listener covers the ops/resync paths.)
+        ui::refreshFeatureHighlight(st);
     });
 
     // W1-B (item 2/11): route otherwise-silent failures into the toast system.

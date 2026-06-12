@@ -162,6 +162,15 @@ void SketchMode::applyEnterResult(const nlohmann::json& res) {
         }
     }
     applyConstraints(res);   // C37-D: store the constraints array for dim annotations
+    // C38 (S1): ents_ was just refilled — any in-flight Smart Dimension picks now point at stale
+    // entities (their by-id resolution may shift or vanish). Drop the pending pick buffer so we never
+    // feed dangling picks into dimBuildPending/highlight on the next frame. The Modify box (if open)
+    // already captured its placement + refs, so it survives this refresh untouched.
+    if (!dimPopupOpen_) {
+        dimPicks_.clear();
+        dimHasPending_ = false;
+        dimPending_ = nullptr;
+    }
 }
 
 // C37-D: pull the constraints array (worker_rpc.md §"constraints") off any sketch response.
@@ -191,6 +200,13 @@ void SketchMode::applyConstraints(const nlohmann::json& res) {
 const SketchEntity* SketchMode::entById(const std::string& id) const {
     for (const auto& e : ents_) if (e.id == id) return &e;
     return nullptr;
+}
+
+// C38 (S1): resolve a stored entity id to its CURRENT index in ents_ (-1 if gone). DimPicks store
+// the id (stable) rather than the index (refilled by applyEnterResult/resolve mid-pick).
+int SketchMode::entIndexById(const std::string& id) const {
+    for (size_t i = 0; i < ents_.size(); ++i) if (ents_[i].id == id) return (int)i;
+    return -1;
 }
 
 void SketchMode::resolve(AppState& st) {
@@ -364,6 +380,10 @@ std::string SketchMode::createSketchOnPlane(AppState& st, const nlohmann::json& 
 }
 
 bool SketchMode::enterNewOnSelection(AppState& st) {
+    // C38 (S2): a double-fire of the ribbon "New Sketch" (sketch_new) while a sketch is already
+    // entered would start a plane-pick over the live sketch and leave a zombie state. Refuse to
+    // re-enter when already active — the user must exit the current sketch first.
+    if (active_) return false;
     // C37-D: if the selection already names a usable plane/planar face, enter directly. Otherwise
     // start the SolidWorks plane-pick step (drawOverlay handles the ray-pick while the flag is set).
     nlohmann::json planeRef;
@@ -412,6 +432,9 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
     cancelCheckpoint_.clear();  // C37-D
     status_.clear();
     dof_ = 0;
+    // C38 (S2): unconditionally clear any plane-pick state so a stale pick flag can't survive an
+    // exit (e.g. exit raced against an armed plane-pick) and trap the next session in pick mode.
+    planePicking_ = false; planeHover_ = -1; st.sketchPlanePickActive = false;
     resetTool();
     // C34: glide back to the pre-sketch camera (the viewport resumes ticking the
     // animation now that sketch mode is off).
@@ -431,6 +454,13 @@ void SketchMode::cancelSketch(AppState& st) {
         // No checkpoint available — fall back to a plain exit (deletes an empty new sketch).
         exitSketch(st, /*keep=*/false);
         return;
+    }
+    // C38 (S6): exit the worker's active sketch BEFORE reverting. doc_revert rewinds the document but
+    // leaves the worker's active_sketch dangling, so the next sketch_enter errors with "already in
+    // sketch". sketch_exit clears it; we ignore its tess payload because the revert below rebuilds.
+    {
+        nlohmann::json exitRes;
+        callSketch(st, "sketch_exit", nlohmann::json::object(), exitRes);
     }
     nlohmann::json res, params = {{"doc_id", st.docMirror.docId()}, {"checkpoint", cancelCheckpoint_}};
     std::string err;
@@ -458,6 +488,8 @@ void SketchMode::cancelSketch(AppState& st) {
     cancelCheckpoint_.clear();
     status_.clear();
     dof_ = 0;
+    // C38 (S2): same unconditional plane-pick clear as exitSketch.
+    planePicking_ = false; planeHover_ = -1; st.sketchPlanePickActive = false;
     resetTool();
     if (havePrevCam_) {
         requestCameraAnimation(st, prevYaw_, prevPitch_, prevZoom_, prevPan_);
@@ -633,7 +665,7 @@ static std::string dimLabel(const SketchConstraint& c) {
     std::string body;
     if (c.type == "angle")          body = fmtAng(v);
     else if (c.type == "radius")    body = "R" + fmtLen(v);
-    else if (c.type == "diameter")  body = "\xC3\x98" + fmtLen(v);   // Ø (0x00D8, diameter glyph)
+    else if (c.type == "diameter")  body = "\xE2\x8C\x80" + fmtLen(v);   // ⌀ U+2300 (CADSymbols)
     else                            body = fmtLen(v);
     if (c.hasExpr) body += "";   // expr-bound dims still show the measured value
     return c.driven ? "(" + body + ")" : body;
@@ -813,7 +845,7 @@ bool SketchMode::dimHitTest(const ImVec2& s, DimPick& out) const {
     auto consider = [&](const std::string& h, float u, float v) {
         ImVec2 p = uvToScreen(u, v);
         float d2 = (p.x - s.x) * (p.x - s.x) + (p.y - s.y) * (p.y - s.y);
-        if (d2 < best) { best = d2; out.handle = h; out.isPoint = true; out.entIdx = -1; out.u = u; out.v = v; got = true; }
+        if (d2 < best) { best = d2; out.handle = h; out.isPoint = true; out.entIdx = -1; out.entId.clear(); out.u = u; out.v = v; got = true; }
     };
     for (const auto& e : ents_) {
         if (e.type == "line" || e.type == "slot") {
@@ -826,9 +858,10 @@ bool SketchMode::dimHitTest(const ImVec2& s, DimPick& out) const {
         }
     }
     if (got) return true;
-    // 2) whole entity
+    // 2) whole entity — C38 (S1): record the id (stable) alongside the per-frame index.
     int ei = hitTestEntity(s, 12.0f);
-    if (ei >= 0) { out.handle.clear(); out.isPoint = false; out.entIdx = ei; return true; }
+    if (ei >= 0) { out.handle.clear(); out.isPoint = false; out.entIdx = ei;
+                   out.entId = ents_[ei].id; return true; }
     return false;
 }
 
@@ -837,16 +870,24 @@ bool SketchMode::dimHitTest(const ImVec2& s, DimPick& out) const {
 // the h/v/aligned variant choice on point-point).
 bool SketchMode::dimBuildPending(const ImVec2& cursor, float cu, float cv) {
     dimHasPending_ = false; dimAxis_.clear();
+    // C38 (S1): resolve every pick's stored id to a CURRENT entity ptr. If any entity-pick has
+    // vanished from ents_ (refilled mid-pick), bail — the combo is no longer valid.
+    auto entOf = [&](const DimPick& p) -> const SketchEntity* {
+        if (p.isPoint) return nullptr;
+        return entById(p.entId);
+    };
+    for (const auto& p : dimPicks_)
+        if (!p.isPoint && !entById(p.entId)) return false;
     auto handleUV = [&](const DimPick& p, float& u, float& v) {
         if (p.isPoint) { u = p.u; v = p.v; return; }
-        const SketchEntity& e = ents_[p.entIdx];
+        const SketchEntity& e = *entOf(p);
         u = e.center[0]; v = e.center[1];
     };
     size_t n = dimPicks_.size();
     if (n == 1) {
         const DimPick& a = dimPicks_[0];
         if (!a.isPoint) {
-            const SketchEntity& e = ents_[a.entIdx];
+            const SketchEntity& e = *entOf(a);
             if (e.type == "line") {                 // length: point-point on endpoints, aligned
                 double Lm = std::hypot(e.p2[0] - e.p1[0], e.p2[1] - e.p1[1]);
                 dimType_ = "distance"; dimMeasured_ = Lm;
@@ -867,8 +908,8 @@ bool SketchMode::dimBuildPending(const ImVec2& cursor, float cu, float cv) {
     }
     if (n == 2) {
         const DimPick& a = dimPicks_[0]; const DimPick& b = dimPicks_[1];
-        bool aLine = !a.isPoint && ents_[a.entIdx].type == "line";
-        bool bLine = !b.isPoint && ents_[b.entIdx].type == "line";
+        bool aLine = !a.isPoint && entOf(a)->type == "line";
+        bool bLine = !b.isPoint && entOf(b)->type == "line";
         if (a.isPoint && b.isPoint) {              // point-point distance (variant chosen at place)
             float au, av, bu, bv; handleUV(a, au, av); handleUV(b, bu, bv);
             // SolidWorks variant by cursor zone: beyond the vertical span -> horizontal; beyond the
@@ -890,7 +931,7 @@ bool SketchMode::dimBuildPending(const ImVec2& cursor, float cu, float cv) {
         if ((a.isPoint && bLine) || (aLine && b.isPoint)) {   // point-line perpendicular distance
             const DimPick& pp = a.isPoint ? a : b;
             const DimPick& ll = a.isPoint ? b : a;
-            const SketchEntity& le = ents_[ll.entIdx];
+            const SketchEntity& le = *entOf(ll);
             float pu, pv; handleUV(pp, pu, pv);
             // perpendicular foot distance
             float dx = le.p2[0] - le.p1[0], dy = le.p2[1] - le.p1[1]; float L = std::hypot(dx, dy);
@@ -901,7 +942,7 @@ bool SketchMode::dimBuildPending(const ImVec2& cursor, float cu, float cv) {
             dimHasPending_ = true; return true;
         }
         if (aLine && bLine) {                      // two lines: parallel -> distance, else angle
-            const SketchEntity& la = ents_[a.entIdx]; const SketchEntity& lb = ents_[b.entIdx];
+            const SketchEntity& la = *entOf(a); const SketchEntity& lb = *entOf(b);
             float ax = la.p2[0] - la.p1[0], ay = la.p2[1] - la.p1[1];
             float bx = lb.p2[0] - lb.p1[0], by = lb.p2[1] - lb.p1[1];
             float cross = ax * by - ay * bx, dot = ax * bx + ay * by;
@@ -931,7 +972,15 @@ void SketchMode::dimOpenModify(const ImVec2& at) {
     dimPopupPos_ = at;
     dimIsAngle_ = (dimType_ == "angle");
     dimPopupStep_ = dimIsAngle_ ? 1.0 : 1.0;
-    std::snprintf(dimBuf_.data(), dimBuf_.size(), "%s", fmtLen(dimMeasured_).c_str());
+    // C38 (S5): when there's no real measured value, leave the buffer EMPTY so a stray Enter can't
+    // silently commit a fake "0" — the user must type a value (pmParseDim rejects empty). When there
+    // IS a value, seed the plain number; for angles dimMeasured_ is already in DEGREES (set by
+    // dimBuildPending), so fmtLen yields the correct degree number — the "°" unit is shown as the box
+    // suffix label, NOT baked into the buffer (a trailing "°" would make pmParseDim reject the value).
+    if (std::isfinite(dimMeasured_) && std::fabs(dimMeasured_) > 1e-9)
+        std::snprintf(dimBuf_.data(), dimBuf_.size(), "%s", fmtLen(dimMeasured_).c_str());
+    else
+        dimBuf_[0] = '\0';
 }
 
 // Commit the Modify box: parse value/expr, apply, and (on success) keep the tool armed.
@@ -952,7 +1001,11 @@ void SketchMode::dimCommit(AppState& st) {
         if (!r.ok) { st.toast(ui::ToastLevel::Error, "Dimension: " + r.error_message); dimError_ = r.error_message; return; }
         if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
         resolve(st);
+        // C38 (S3): full pick-buffer cleanup, matching the new-dim path below. A double-click edit
+        // leaves stale picks otherwise, which dimBuildPending consumes on the next frame.
         dimPopupOpen_ = false; dimEditCid_.clear();
+        dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr;
+        dimAxis_.clear(); dimPopupDriven_ = false;
         return;
     }
     // New dim: attach value/expr + placement + driven, then sketch_add_constraint.
@@ -993,7 +1046,10 @@ void SketchMode::inSketchUndo(AppState& st) {
         // The sketch feature is gone; drop out cleanly without re-exiting the worker sketch.
         active_ = false; isNewEmpty_ = false; fid_.clear();
         ents_.clear(); cons_.clear(); autoPlace_.clear(); cancelCheckpoint_.clear();
-        status_.clear(); dof_ = 0; resetTool();
+        status_.clear(); dof_ = 0;
+        // C38 (S2): clear plane-pick state in the emergency teardown too.
+        planePicking_ = false; planeHover_ = -1; st.sketchPlanePickActive = false;
+        resetTool();
         if (havePrevCam_) { requestCameraAnimation(st, prevYaw_, prevPitch_, prevZoom_, prevPan_); havePrevCam_ = false; }
         return;
     }
@@ -1270,12 +1326,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         int glyphIdx = 0;
         for (const auto& c : cons_) {
             if (c.isDimensional()) continue;
-            // ASCII-only glyphs (the bundled Rubik font lacks the geometric-shapes block, so any
-            // multi-byte glyph renders as a notdef box). SolidWorks-style single-char badges.
+            // SolidWorks-style single-char badges. Math/shape glyphs come from CADSymbols.ttf
+            // (merged into Rubik in ui_theme.cpp); H/V/T/=/# stay ASCII.
             const char* g = c.type == "horizontal" ? "H" : c.type == "vertical" ? "V"
-                          : c.type == "coincident" ? "o"
-                          : c.type == "parallel" ? "//"
-                          : c.type == "perpendicular" ? "|-"
+                          : c.type == "coincident" ? "\xE2\x8A\x99"   // ⊙ U+2299
+                          : c.type == "parallel" ? "\xE2\x88\xA5"     // ∥ U+2225
+                          : c.type == "perpendicular" ? "\xE2\x8A\xA5" // ⊥ U+22A5
                           : c.type == "equal" ? "=" : c.type == "tangent" ? "T"
                           : c.type == "fix" ? "#" : nullptr;
             if (!g || c.refs.empty()) continue;
@@ -1319,9 +1375,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
 
     // ---- C37-D: dimension text drag + double-click-to-edit + Delete (only when no tool active) ----
     if (tool_ == SketchTool::None && !dimPopupOpen_) {
-        // Begin a drag on the hovered dim text.
+        // Begin a drag on the hovered dim text. C38 (S4): the second click of a double-click also
+        // fires IsMouseClicked; exclude it so a double-click-to-edit never spawns a phantom drag
+        // (which would commit a stray sketch_set_dim placement on release).
         if (imgHovered && !dimDragging_ && !dragging_ && !dimHoverCid_.empty() &&
-            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            !ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             dimDragging_ = true; dimDragCid_ = dimHoverCid_; dimDragPlace_ = ImVec2(mu, mv);
         }
         if (dimDragging_) {
@@ -1340,6 +1399,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         }
         // Double-click a dim text -> reopen the Modify box prefilled.
         if (imgHovered && !dimHoverCid_.empty() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            // C38 (S4): if a drag somehow began on the first click of this double-click, cancel it so
+            // its release-handler can't also fire a placement op behind the edit box.
+            dimDragging_ = false; dimDragCid_.clear();
             for (const auto& c : cons_) {
                 if (c.id != dimHoverCid_) continue;
                 dimEditCid_ = c.id; dimType_ = c.type; dimIsAngle_ = (c.type == "angle");
@@ -2141,11 +2203,13 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         st.requestCursor(ui::CursorKind::Crosshair);
         const ImU32 hiCol = col(pal.accent);
         const ImU32 pickCol = col(pal.accent, 0.95f);
-        // Highlight already-picked targets.
+        // Highlight already-picked targets. C38 (S1): resolve the picked entity by id (ents_ may have
+        // been refilled since the pick) — skip the highlight when it's gone.
         for (const auto& p : dimPicks_) {
-            if (p.isPoint) dl->AddCircle(uvToScreen(p.u, p.v), 6.0f, pickCol, 12, 2.0f);
-            else if (p.entIdx >= 0 && p.entIdx < (int)ents_.size()) {
-                const SketchEntity& e = ents_[p.entIdx];
+            if (p.isPoint) { dl->AddCircle(uvToScreen(p.u, p.v), 6.0f, pickCol, 12, 2.0f); continue; }
+            const SketchEntity* ep = entById(p.entId);
+            if (ep) {
+                const SketchEntity& e = *ep;
                 if (e.type == "line")
                     dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), pickCol, 3.0f);
                 else if (e.type == "circle" || e.type == "arc")
@@ -2193,11 +2257,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             } else if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 DimPick pick;
                 if (dimHitTest(io.MousePos, pick)) {
-                    // Avoid duplicate picks of the same target.
+                    // Avoid duplicate picks of the same target. C38 (S1): compare entity picks by id
+                    // (stable) rather than ents_ index (per-frame, may have shifted).
                     bool dup = false;
                     for (const auto& q : dimPicks_)
                         if (q.isPoint == pick.isPoint &&
-                            (pick.isPoint ? q.handle == pick.handle : q.entIdx == pick.entIdx)) dup = true;
+                            (pick.isPoint ? q.handle == pick.handle : q.entId == pick.entId)) dup = true;
                     if (!dup) dimPicks_.push_back(pick);
                 }
             }
@@ -2242,7 +2307,16 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             wdl->AddLine(ImVec2(c.x - 6, c.y - 6), ImVec2(c.x + 6, c.y + 6), col(pal.windowBg), 2.6f);
             wdl->AddLine(ImVec2(c.x - 6, c.y + 6), ImVec2(c.x + 6, c.y - 6), col(pal.windowBg), 2.6f);
         }
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && (okOver || cxOver)) {
+            // C38 (S8): if the Smart Dimension Modify box is open when ✓/✗ is clicked, the pending
+            // dimension is INTENTIONALLY DISCARDED (the user chose to leave the sketch instead of
+            // finishing the dim). Close the box and clear the pick buffer explicitly FIRST so
+            // resetTool/exit teardown can't leave half-state behind, then run exit/cancel.
+            if (dimPopupOpen_) {
+                dimPopupOpen_ = false; dimError_.clear(); dimEditCid_.clear();
+                dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr;
+                dimAxis_.clear(); dimPopupDriven_ = false;
+            }
             if (okOver)      exitSketch(st, /*keep=*/true);
             else if (cxOver) cancelSketch(st);
         }

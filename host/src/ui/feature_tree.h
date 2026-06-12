@@ -24,4 +24,10 @@ void drawFeatureTree(AppState& st,
 // previous one. The selection itself now lives on AppState (selectedFeatureId), cleared separately.
 void featureTreeResetTransient();
 
+// C38 (T1): rebuild st.featureHighlightFaces from the CURRENT owner map for st.selectedFeatureId
+// (clearing it when the feature is absent or there's no selection). Face tags are retagged on every
+// applyOps/undo/redo/resync rebuild, so the cached highlight goes stale; call this after any such
+// rebuild (docUndo/docRedo in app_state.cpp, and the central DocMirror listener in app.cpp).
+void refreshFeatureHighlight(AppState& st);
+
 }  // namespace ui

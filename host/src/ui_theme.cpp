@@ -339,34 +339,63 @@ void applyTheme(Theme t, float scale) {
 // =========================================================================
 // Font loading (unchanged)
 // =========================================================================
+// Glyphs covered by Rubik / JetBrains Mono (the body faces).
+// Latin-1 (incl. ° U+00B0, Ø U+00D8), general punctuation, superscripts/subscripts, bullet.
+// NOTE: arrows (0x2190-0x21FF) and geometric-shapes (0x25A0-0x25FF) are intentionally NOT
+// requested — Rubik does not ship them, so leaving them out keeps the atlas small and avoids
+// allocating notdef boxes. CAD-specific math/shape glyphs come from CADSymbols below.
 static const ImWchar* uiGlyphRanges() {
     static const ImWchar r[] = {
         0x0020, 0x00FF,
         0x2010, 0x2027,
         0x2070, 0x209F,
-        0x2190, 0x21FF,
-        0x2022, 0x2022,
-        0x25A0, 0x25FF,
         0,
     };
     return r;
 }
 
-static ImFont* addFont(ImGuiIO& io, const std::string& path, float px, ImFont* fallback) {
+// CAD-specific symbols sourced from CADSymbols.ttf (merged over the body face).
+// Codepoints: ∅ U+2205, ∥ U+2225, ≡ U+2261, ⊕ U+2295, ⊙ U+2299, ⊥ U+22A5,
+// ⌀ U+2300, ◆ U+25C6, ◇ U+25C7. Keep this in sync with the font's cmap.
+static const ImWchar* cadSymbolRanges() {
+    static const ImWchar r[] = {
+        0x2205, 0x2205,
+        0x2225, 0x2225,
+        0x2261, 0x2261,
+        0x2295, 0x2295,
+        0x2299, 0x2299,
+        0x22A5, 0x22A5,
+        0x2300, 0x2300,
+        0x25C6, 0x25C7,
+        0,
+    };
+    return r;
+}
+
+static ImFont* addFont(ImGuiIO& io,
+                       const std::string& path, float px, ImFont* fallback,
+                       const std::string& cadSymPath /*may be empty*/) {
     ImFont* f = io.Fonts->AddFontFromFileTTF(path.c_str(), px, nullptr, uiGlyphRanges());
-    return f ? f : fallback;
+    if (!f) return fallback;
+    if (!cadSymPath.empty()) {
+        ImFontConfig merge; merge.MergeMode = true; merge.PixelSnapH = true;
+        // Match the host face's vertical metrics so merged glyphs sit on the same baseline.
+        io.Fonts->AddFontFromFileTTF(cadSymPath.c_str(), px, &merge, cadSymbolRanges());
+    }
+    return f;
 }
 
 Fonts loadFonts(const std::string& assetsDir, float pxScale) {
     ImGuiIO& io = ImGui::GetIO();
-    const std::string fd = assetsDir + "\\fonts\\";
+    const std::string fd  = assetsDir + "\\fonts\\";
+    const std::string cad = fd + "CADSymbols.ttf";
     Fonts f;
     ImFont* def = io.Fonts->AddFontDefault();
-    f.body   = addFont(io, fd + "Rubik-Regular.ttf",      17.5f * pxScale, def);
-    f.medium = addFont(io, fd + "Rubik-Medium.ttf",       17.5f * pxScale, f.body);
-    f.h1     = addFont(io, fd + "Rubik-Bold.ttf",         30.0f * pxScale, f.body);
-    f.h2     = addFont(io, fd + "Rubik-SemiBold.ttf",     19.0f * pxScale, f.body);
-    f.mono   = addFont(io, fd + "JetBrainsMono-Regular.ttf",15.5f * pxScale, f.body);
+    f.body   = addFont(io, fd + "Rubik-Regular.ttf",       17.5f * pxScale, def,    cad);
+    f.medium = addFont(io, fd + "Rubik-Medium.ttf",        17.5f * pxScale, f.body, cad);
+    f.h1     = addFont(io, fd + "Rubik-Bold.ttf",          30.0f * pxScale, f.body, cad);
+    f.h2     = addFont(io, fd + "Rubik-SemiBold.ttf",      19.0f * pxScale, f.body, cad);
+    f.mono   = addFont(io, fd + "JetBrainsMono-Regular.ttf",15.5f * pxScale, f.body, cad);
     io.Fonts->Build();
     io.FontDefault = f.body;
     return f;

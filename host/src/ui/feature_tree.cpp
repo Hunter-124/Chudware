@@ -291,6 +291,16 @@ static void clearFeatureHighlight(AppState& st) {
     st.featureHighlightFaces.clear();
 }
 
+// C38 (T1): public re-backfill of the feature highlight from the CURRENT owner map. The owner map's
+// face tags are rebuilt on every applyOps/undo/redo/resync, so a previously-populated
+// featureHighlightFaces (captured at click time) points at stale face ids and tints the wrong faces
+// — or none. Re-derive it for the currently-selected feature; clear when nothing is selected or the
+// feature is gone. Cheap (one map lookup + small vector fill); safe to call every rebuild.
+void refreshFeatureHighlight(AppState& st) {
+    if (st.selectedFeatureId.empty()) { st.featureHighlightFaces.clear(); return; }
+    fillHighlightFaces(st, st.selectedFeatureId, st.featureHighlightFaces);
+}
+
 // C37-E (item 3): "Zoom to Feature" — union the owned faces'/bodies' bboxes (from the host-side
 // bbox caches) and post a one-shot camera request. Toasts when nothing framable was found.
 static void zoomToFeature(AppState& st, const std::string& fid) {
@@ -1534,6 +1544,12 @@ void drawFeatureTree(AppState& st,
                         // Mouse up without a drag in progress — clear stale hit state.
                         s_rbDropAfter.clear();
                     }
+                } else if (s_rollbackDragging) {
+                    // C38 (T2): the feature list vanished mid-drag (no walk loop, so the release
+                    // handler above never runs). Clear the drag flag so it can't linger a frame and
+                    // leave the bar visually "stuck" to the cursor.
+                    s_rollbackDragging = false;
+                    s_rbDropAfter.clear();
                 }
             }
 

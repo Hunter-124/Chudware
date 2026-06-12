@@ -241,6 +241,9 @@ core::OpsResponse AppState::docUndo() {
     if (r.ok) {
         addLog("[doc] undo  rev=" + std::to_string(r.revision));
         if (!r.aicm_path.empty()) { std::string le; loadDocMesh(r.aicm_path, le); }
+        // C38 (T1): the owner map was just rebuilt; re-derive the feature highlight so the tinted
+        // faces track the retagged topology instead of pointing at stale face ids.
+        ui::refreshFeatureHighlight(*this);
         toast(ui::ToastLevel::Info, "Undo: ok");
     } else {
         // doc_undo with an empty stack reports a benign error code; treat it as "nothing to undo".
@@ -259,6 +262,8 @@ core::OpsResponse AppState::docRedo() {
     if (r.ok) {
         addLog("[doc] redo  rev=" + std::to_string(r.revision));
         if (!r.aicm_path.empty()) { std::string le; loadDocMesh(r.aicm_path, le); }
+        // C38 (T1): re-derive the feature highlight after the rebuild (see docUndo).
+        ui::refreshFeatureHighlight(*this);
         toast(ui::ToastLevel::Info, "Redo: ok");
     } else {
         bool nothing = r.error_code == "nothing_to_redo" || r.error_code == "no_history" ||

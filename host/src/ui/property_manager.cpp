@@ -15,6 +15,7 @@
 
 #include "property_manager.h"
 #include "icons.h"
+#include "sketch_mode.h"   // C38 (P1f): SketchMode::active() — sketch owns Esc while editing
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
@@ -568,9 +569,11 @@ void PropertyManager::applyPreview(AppState& st) {
 
     auto resp = st.docMirror.applyOps(st.worker, ops);
     if (!resp.ok) {
-        // C37-F: show inline error in the PM body AND a global toast.
+        // C38 (P4f): the inline previewError_ block in the PM body is the surface for a failed
+        // debounced preview — do NOT toast here. Previews fire per-keystroke, so toasting each
+        // failure spams the user with transient parse/validation errors mid-edit. Toasts stay on the
+        // commit/cancel paths (terminal, user-initiated). Still logged for observability.
         previewError_ = resp.error_message;
-        st.toast(ui::ToastLevel::Error, "Preview: " + resp.error_message);
         st.addLog("[pm] preview failed: " + resp.error_message);
         dirty_ = false;
         return;
@@ -696,8 +699,10 @@ void PropertyManager::draw(AppState& st) {
     bool pmWindowFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
     bool pmWindowHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows |
                                                    ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
-    // Track whether a PM widget was active this frame (used to allow Enter-commit).
-    bool pmWidgetWasActive = ImGui::IsAnyItemActive();
+    // C38 (P2f): use last frame's PM-scoped "a PM widget was active" flag (set at the END of this
+    // draw, below) instead of a global, prior-frame ImGui::IsAnyItemActive() — the latter is true
+    // whenever ANY window has an active item, so Enter in an unrelated panel would commit the PM.
+    bool pmWidgetWasActive = pmWidgetActivePrevFrame_;
 
     const ImGuiIO& io = ImGui::GetIO();
 
@@ -708,7 +713,12 @@ void PropertyManager::draw(AppState& st) {
     bool escPressed = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
     bool cancel = false;
     bool ok     = false;
-    if (escPressed && !st.sketchPlanePickActive) {
+    // C38 (P1f): sketch mode owns Esc while a sketch is active (its Modify box / tool / cancel all
+    // consume it). Without this guard the PM grabs the same Esc the frame the sketch Modify box
+    // closes and cancels the PM out from under the user. Skip PM Esc whenever a sketch is active, in
+    // addition to the existing plane-pick guard.
+    bool sketchActive = st.sketchMode && st.sketchMode->active();
+    if (escPressed && !st.sketchPlanePickActive && !sketchActive) {
         if (io.WantTextInput) {
             // A text field is active; Esc will blur it this frame (ImGui's default behaviour).
             // Don't cancel the PM — let the field deactivate first.
@@ -1049,10 +1059,13 @@ void PropertyManager::draw(AppState& st) {
         if (!enabled) ImGui::EndDisabled();
     }
 
-    // C37-F: After iterating all fields, mark focus request as handled.
-    if (wantFocusFirstField_ && firstEditableDimSeen) {
+    // C38 (P3f): After iterating all fields on the first draw after open, mark the focus request
+    // handled UNCONDITIONALLY. Previously this only cleared when an editable Dim field was seen, so a
+    // SelectorWell-first (or Dim-less) form re-issued SetKeyboardFocusHere every frame and stole
+    // focus continuously. We still record focusedOnOpen_ only when a field actually took focus.
+    if (wantFocusFirstField_) {
+        if (firstEditableDimSeen) focusedOnOpen_ = true;
         wantFocusFirstField_ = false;
-        focusedOnOpen_ = true;
     }
 
     // C37-F: Inline preview error block (red text, shown when the last preview RPC failed).
@@ -1074,6 +1087,13 @@ void PropertyManager::draw(AppState& st) {
         ImGui::Text("preview: %s", targetId_.c_str());
     else                  ImGui::TextUnformatted("set parameters to preview");
     ImGui::PopStyleColor();
+
+    // C38 (P2f): record whether a PM widget is active at the end of OUR draw, scoped to this PM
+    // window (active item AND PM window focus). Read at the top of next frame's draw() to gate
+    // Enter-commit. We're still inside the PM window's Begin/End here, so IsAnyItemActive() +
+    // window-focus is PM-scoped — an active item in another window won't set this.
+    pmWidgetActivePrevFrame_ = ImGui::IsAnyItemActive() &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
 
     ImGui::End();
 }

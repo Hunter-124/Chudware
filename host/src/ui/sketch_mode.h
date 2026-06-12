@@ -129,7 +129,11 @@ private:
 
     // C37-D: Smart Dimension state machine helpers.
     // A pick target: either an entity endpoint/center handle ("e3.p2") or a whole entity id ("e3").
-    struct DimPick { std::string handle; int entIdx = -1; bool isPoint = false; float u = 0, v = 0; };
+    // C38 (S1): store the entity id STRING (entId) — ents_ is refilled while picks are held, so an
+    // index into ents_ goes stale. entIdx is a per-frame convenience resolved from entId via
+    // entIndexById(); -1 means the entity is currently absent (skip).
+    struct DimPick { std::string handle; std::string entId; int entIdx = -1; bool isPoint = false; float u = 0, v = 0; };
+    int entIndexById(const std::string& id) const;   // C38 (S1): id -> current ents_ index, or -1
     bool dimHitTest(const ImVec2& s, DimPick& out) const;       // point-priority then entity
     bool dimBuildPending(const ImVec2& cursor, float cu, float cv);  // picks -> dimPending_ (+axis)
     void dimOpenModify(const ImVec2& at);                       // open Modify box for dimPending_
@@ -236,7 +240,7 @@ private:
 
     // Modify box (replaces the old auto-popup): auto-focused, pre-selected, +/- step, Driven, units.
     bool dimPopupOpen_ = false;
-    std::vector<char> dimBuf_{std::vector<char>(64, 0)};
+    std::vector<char> dimBuf_{std::vector<char>(256, 0)};   // C38 (S7): 256B — long exprs no longer truncate
     std::string dimError_;
     ImVec2 dimPopupPos_{0, 0};
     bool dimPopupFocus_ = false;      // request keyboard focus + select-all next frame

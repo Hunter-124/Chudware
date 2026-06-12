@@ -840,11 +840,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             if (ImGui::MenuItem("View Selector (Space)")) {
                 // Simulate a Space key press for the ViewSelector to catch in its next update().
                 // ViewSelector::update() checks imgHovered + !inSketch + Space key pressed.
-                // Simplest hook: set a one-shot flag that the selector reads — but ViewSelector
-                // has no public open(). The cleanest path without modifying ViewSelector's public
-                // API is to post a simulated Space key via ImGui's input queue.
-                ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, true);
-                ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, false);
+                // C38 (V1): only inject when the selector is NOT already up — Space toggles it, so
+                // injecting while it's open would instantly dismiss the box the user just asked for.
+                if (!s_viewSelector.active()) {
+                    ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, true);
+                    ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, false);
+                }
             }
             ImGui::EndPopup();
         }
@@ -976,8 +977,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     ImGui::Separator();
                     // C37-C item 3: wire View Selector to actually open the selector widget.
                     if (ImGui::MenuItem("View Selector (Space)")) {
-                        ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, true);
-                        ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, false);
+                        // C38 (V1): don't inject Space when the selector is already up (Space toggles
+                        // it — re-injecting would instantly close the box the user just requested).
+                        if (!s_viewSelector.active()) {
+                            ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, true);
+                            ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, false);
+                        }
                     }
                     ImGui::EndPopup();
                 }

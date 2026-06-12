@@ -198,6 +198,12 @@ private:
 
     // C37-F: true when we need to set keyboard focus on the first editable field next frame.
     bool wantFocusFirstField_ = false;
+
+    // C38 (P2f): "was a PM widget active during the PM's own draw last frame". Set at the END of
+    // draw() (scoped to the PM window), read at the START of the next draw() to gate Enter-commit.
+    // Replaces the prior-frame, ANY-window ImGui::IsAnyItemActive() read that let Enter in unrelated
+    // panels commit the PM.
+    bool pmWidgetActivePrevFrame_ = false;
 };
 
 }  // namespace ui

@@ -4,7 +4,9 @@
 // so there is one source of truth for the preset table + the picker popup.
 #include "appearance_common.h"
 
+#include <array>
 #include <string>
+#include <unordered_map>
 
 #include "imgui.h"
 
@@ -22,13 +24,19 @@ const MaterialPreset kMaterials[5] = {
 
 bool appearanceColorPicker(const char* popupId, float outColor[3],
                            float* outMetallic, float* outRoughness) {
-    static float s_pick[3] = {0.71f, 0.76f, 0.82f};
-    static bool  s_seeded  = false;
+    // C38 (A1): per-popup-id seed state. Three callers share this function with distinct popup ids;
+    // a single shared s_pick/s_seeded corrupted the seed when two pickers were armed the same frame
+    // (the second BeginPopup would reuse the first's half-seeded buffer). Key it by popupId so each
+    // picker keeps its own working color + seeded flag. Map is tiny (one entry per popup id).
+    struct PickState { std::array<float, 3> pick{0.71f, 0.76f, 0.82f}; bool seeded = false; };
+    static std::unordered_map<std::string, PickState> s_states;
+    PickState& ps = s_states[popupId];
+    float* s_pick = ps.pick.data();
     bool committed = false;
     if (ImGui::BeginPopup(popupId)) {
         // Seed the picker from the caller's current color once per open.
-        if (!s_seeded) { s_pick[0] = outColor[0]; s_pick[1] = outColor[1]; s_pick[2] = outColor[2];
-                         s_seeded = true; }
+        if (!ps.seeded) { s_pick[0] = outColor[0]; s_pick[1] = outColor[1]; s_pick[2] = outColor[2];
+                          ps.seeded = true; }
         ImGui::TextUnformatted("Appearance");
         ImGui::Separator();
         // C32-A: RealView material presets (above the color swatches). Click = apply color+material.
@@ -84,7 +92,7 @@ bool appearanceColorPicker(const char* popupId, float outColor[3],
         if (ImGui::Button("Cancel", ImVec2(80.0f * ui::uiScale, 0))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     } else {
-        s_seeded = false;  // re-seed next time the popup opens
+        ps.seeded = false;  // re-seed next time the popup opens (C38 A1: per-id flag)
     }
     return committed;
 }

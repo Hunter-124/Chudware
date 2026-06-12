@@ -79,18 +79,71 @@ class DesignState:
 # --------------------------------------------------------------------------- digests
 
 
+def _digest_params(params: dict, limit: int = 6) -> str:
+    """A short ``k=v`` summary of a feature's key params (dim objects + plain scalars)."""
+    out: list[str] = []
+    for k, v in list((params or {}).items())[:limit]:
+        if isinstance(v, dict) and "value" in v:
+            out.append(f"{k}={v['value']}")
+        elif isinstance(v, (int, float)):
+            out.append(f"{k}={v}")
+    return ", ".join(out)
+
+
 def digest_tree(tree: dict, max_lines: int = 40) -> str:
-    """One compact line per feature: ``<id> <type> <name>`` (+ a [supp] marker)."""
+    """One compact line per feature: ``<id> <type> <name> (key params)`` (+ a [supp] marker).
+
+    Key params are included (Wave D) so an edit-shaped request can be steered to ``edit_feature``
+    on the right feature/param instead of duplicating geometry with ``add_feature``.
+    """
     feats = (tree or {}).get("features", []) or []
     lines: list[str] = []
     for f in feats[:max_lines]:
         if not isinstance(f, dict):
             continue
         sup = " [supp]" if f.get("suppressed") else ""
-        lines.append(f"{f.get('id', '?')} {f.get('type', '?')} {f.get('name', '')}{sup}".rstrip())
+        line = f"{f.get('id', '?')} {f.get('type', '?')} {f.get('name', '')}{sup}".rstrip()
+        dims = _digest_params(f.get("params") or {})
+        if dims:
+            line += f" ({dims})"
+        lines.append(line)
     if len(feats) > max_lines:
         lines.append(f"... (+{len(feats) - max_lines} more features)")
     return "\n".join(lines) if lines else "(empty — no features yet)"
+
+
+# ----------------------------------------------------------------- edit bias (Wave D)
+# When the document ALREADY HAS features and the request reads like a modification, the
+# ops-emitting roles get an explicit steer: edit_feature on the existing feature, not a new
+# add_feature duplicate. The heuristic is a cheap word list — a false positive only adds one
+# short instruction block; a false negative just means no extra steer.
+
+_EDIT_WORDS = (
+    "make ", "change", "set ", "resize", "increase", "decrease", "widen", "narrow",
+    "shorten", "lengthen", "thicker", "thinner", "wider", "taller", "shorter", "deeper",
+    "shallower", "bigger", "smaller", "larger", "edit", "modify", "update", "adjust",
+    "rename", "instead", "should be", "reduce", "enlarge", "scale", "move ",
+    "remove", "delete",
+)
+
+EDIT_BIAS_TEXT = (
+    "EDIT BIAS: the document ALREADY HAS the features listed above (ids, names and current "
+    "params shown). This request modifies something that exists — PREFER `edit_feature` on the "
+    "existing feature's id over `add_feature`. Example: \"make the plate 60mm wide\" => "
+    '[{"op":"edit_feature","id":"<the plate feature id>","params":{"width":{"value":60,'
+    '"expr":null}}}] — do NOT add a second plate. Use `delete_feature` with the feature id for '
+    "removals. Only use add_feature for genuinely NEW geometry."
+)
+
+
+def looks_like_edit(request: str) -> bool:
+    """True when *request* reads like a modification of existing geometry (cheap word list)."""
+    r = f" {(request or '').lower()} "
+    return any(w in r for w in _EDIT_WORDS)
+
+
+def _has_features(state: "DesignState") -> bool:
+    return bool(state.tree_digest) and not state.tree_digest.startswith("(empty")
 
 
 def feature_status_errors(feature_status: list[dict]) -> list[str]:
@@ -179,6 +232,8 @@ def _role_blocks(state: DesignState, role: str) -> list[tuple[str, str]]:
     tree = f"CURRENT FEATURE TREE:\n{state.tree_digest}" if state.tree_digest else ""
     errs = ("ERRORS:\n" + "\n".join(state.last_errors)) if state.last_errors else ""
     issues = ("REVIEW ISSUES:\n" + "\n".join(state.last_issues)) if state.last_issues else ""
+    # Wave D: explicit edit_feature steer for the ops-emitting roles on edit-shaped requests.
+    bias = EDIT_BIAS_TEXT if _has_features(state) and looks_like_edit(state.request) else ""
 
     if role == "intake":
         blocks = [("opt:mem", mem), ("req", req)]
@@ -189,7 +244,7 @@ def _role_blocks(state: DesignState, role: str) -> list[tuple[str, str]]:
         plan = _plan_text(state.plan) if state.plan else ""
         step = f"STEP TO IMPLEMENT NOW:\n{state.current_step}" if state.current_step else ""
         blocks = [("opt:mem", mem), ("opt:plan", plan), ("req", req),
-                  ("tree", tree), ("step", step), ("errors", errs)]
+                  ("tree", tree), ("bias", bias), ("step", step), ("errors", errs)]
     elif role == "reviewer":
         plan = _plan_text(state.plan, compact=True) if state.plan else ""
         blocks = [("opt:mem", mem), ("opt:plan", plan), ("req", req), ("tree", tree)]
@@ -197,7 +252,7 @@ def _role_blocks(state: DesignState, role: str) -> list[tuple[str, str]]:
         plan = _plan_text(state.plan, compact=True) if state.plan else ""
         prob = errs or issues
         blocks = [("opt:mem", mem), ("opt:plan", plan), ("req", req),
-                  ("tree", tree), ("problem", prob)]
+                  ("tree", tree), ("bias", bias), ("problem", prob)]
     elif role == "memory":
         plan = _plan_text(state.plan, compact=True) if state.plan else ""
         blocks = [("opt:plan", plan), ("req", req), ("tree", tree)]

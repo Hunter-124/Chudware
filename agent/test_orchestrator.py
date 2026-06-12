@@ -251,6 +251,55 @@ def test_identical_failure_stop() -> None:
           "run:", res.status)
 
 
+def test_edit_bias_edit_feature() -> None:
+    """Wave D edit bias: a doc that ALREADY HAS a box + an edit-shaped request — the modeler
+    context lists the existing feature WITH its id/params and the explicit edit_feature steer,
+    and a scripted edit_feature op APPLIES to the existing feature (no duplicate plate)."""
+    s = docsess.new_session("part", name="orch_editbias")
+    docsess.apply_ops(s, 0, [{"op": "add_feature", "feature": {"type": "box", "name": "Plate",
+        "params": {"length": {"value": 40, "expr": None}, "width": {"value": 30, "expr": None},
+                   "height": {"value": 10, "expr": None}}}}])
+    assert [f["id"] for f in s.doc["features"]] == ["f1"]
+
+    class RecordingProvider(ScriptedProvider):
+        """ScriptedProvider that also records every (system, user_text) per role."""
+
+        def __init__(self, by_role):
+            super().__init__(by_role)
+            self.contexts: dict[str, list[tuple[str, str]]] = {}
+
+        def complete(self, system: str, messages: list[dict], max_tokens: int = 8000) -> str:
+            utext = messages[-1]["content"][0]["text"] if messages else ""
+            self.contexts.setdefault(self.role_of(system), []).append((system, utext))
+            return super().complete(system, messages, max_tokens=max_tokens)
+
+    spec = _json_block({"object": "plate", "key_dims": {"width": 60}, "features": [],
+                        "constraints": []})
+    plan = _json_block({"name": "plate edit", "summary": "widen the existing plate",
+                        "parts": [{"name": "plate", "purpose": "set width to 60",
+                                   "dimensions": {"width": 60}, "features": []}], "fit": ""})
+    edit_ops = _json_block([{"op": "edit_feature", "id": "f1",
+                             "params": {"width": {"value": 60, "expr": None}}}])
+    prov = RecordingProvider({"intake": [spec], "planner": [plan], "modeler": [edit_ops],
+                              "reviewer": [_REVIEW_DONE], "memory": [_MEMORY]})
+    res = orun.run_design("make the plate 60mm wide", s, prov, emit=lambda e: None)
+
+    assert res.status == "done", f"expected done, got {res.status}/{res.stop_reason}"
+    feats = s.doc["features"]
+    assert len(feats) == 1 and feats[0]["type"] == "box", \
+        f"edit must NOT add a duplicate feature, got {[f['type'] for f in feats]}"
+    assert feats[0]["params"]["width"]["value"] == 60, \
+        f"width must be edited to 60, got {feats[0]['params']['width']}"
+
+    # The modeler context lists the existing feature with id + CURRENT params, plus the steer.
+    mctx = prov.contexts["modeler"][0][1]
+    assert "f1 box Plate" in mctx, mctx
+    assert "width=30" in mctx, "the existing feature's current params must be in the context"
+    assert "EDIT BIAS" in mctx and "edit_feature" in mctx, \
+        "the modeler must be explicitly steered toward edit_feature"
+    print("[editbias] width 30 -> 60 via edit_feature; modeler context carried tree+bias")
+
+
 def test_get_prompts_v2() -> None:
     """get_prompts_v2 returns one editable record per role with the built-in text + override path."""
     recs = roles.get_prompts_v2()
@@ -356,6 +405,7 @@ def main() -> None:
     test_malformed_ops_escape_hatch()
     test_events_jsonl_replay_integrity()
     test_identical_failure_stop()
+    test_edit_bias_edit_feature()
     test_get_prompts_v2()
     test_worker_agent_run_v2_subprocess()
     print("\nORCHESTRATOR (C22a) TESTS PASSED")

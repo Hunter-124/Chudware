@@ -584,6 +584,30 @@ def _get_prompts_v2(_params: dict, _emit_event: EmitFn) -> dict:
     return {"prompts": roles.get_prompts_v2()}
 
 
+# =========================================================================== ask mode (Wave D)
+#
+# agent_ask_v2 {doc_id, question} -> {answer}: answers a QUESTION about the open part WITHOUT
+# mutating anything. Thin adapter — the prompt assembly + single provider call live in
+# agent/ask.py (testable without the worker subprocess). A missing/empty/unknown doc_id is
+# handled gracefully: the assistant answers about general CAD usage instead of erroring.
+
+
+def _agent_ask_v2(params: dict, _emit_event: EmitFn) -> dict:
+    from agent import ask, config
+
+    question = params["question"]
+    session = None
+    doc_id = params.get("doc_id") or ""
+    if doc_id:
+        try:
+            from engine.doc import session as docsess
+            session = docsess.get_session(doc_id)
+        except Exception:  # noqa: BLE001 — unknown doc => answer about general usage
+            session = None
+    provider = config.get_provider()
+    return {"answer": ask.answer_question(question, session, provider)}
+
+
 _METHODS = {
     "ping": _ping,
     "run_model": _run_model,
@@ -655,6 +679,10 @@ _STRUCTURED_ERROR_METHODS = {
     "doc_export_step", "doc_face_points",  # C19
     "import_file", "export_file",  # C21
 }
+
+# ---- ask mode (Wave D) — registered via update/add so the literals above stay frozen ----
+_METHODS.update({"agent_ask_v2": _agent_ask_v2})
+_STRUCTURED_ERROR_METHODS.add("agent_ask_v2")
 
 
 def _emit(obj: dict) -> None:

@@ -419,7 +419,7 @@ static void drawModeRow(AppState& st) {
     const char* kModeTips[] = {
         "Design new — describe a new part and the AI models it from scratch.",
         "Edit part — the orchestrator (v2) edits the open part via validated document ops.",
-        "Ask — keep refining the current part conversationally.",
+        "Ask — ask questions about the current part; nothing is modified.",
     };
     float avail = ImGui::GetContentRegionAvail().x;
     const ImGuiStyle& style = ImGui::GetStyle();
@@ -495,11 +495,53 @@ static void submitTurn(AppState& st, const std::string& text) {
         if (st.activityPanel)
             st.activityPanel->clearLive();
         launchAgentRunV2(st.worker, st.job, text, st.docMirror.docId());
-    } else if (askMode && st.designStarted && !st.chat.empty()) {
-        // Ask -> continue the session conversationally (legacy loop; Q&A only).
-        st.addLog("[..] chat: " + text);
-        st.status = "Refining...";  st.statusKind = 0;
-        launchJob(st.worker, st.job, JOB_CHAT, text, /*reset=*/false, st.settings.planMode);
+    } else if (askMode) {
+        // Ask -> Wave D: question answering about the open part via agent_ask_v2. The worker
+        // answers from the doc tree without mutating anything (an empty doc_id is handled
+        // there — the assistant falls back to general CAD usage). NOT a job: the call runs on
+        // the AsyncRpc dispatch thread and the callback fills the chat on the GL thread.
+        if (st.agentV2Running) {
+            // A design/edit run is in flight — refuse politely instead of queueing behind it.
+            if (!st.chat.empty() && st.chat.back().running && !st.chat.back().fromUser) {
+                st.chat.back().running = false;
+                st.chat.back().text = "A design/edit run is still in progress - "
+                                      "ask me again when it finishes.";
+            }
+            return;
+        }
+        st.addLog("[..] ask: " + text);
+        st.status = "Answering...";  st.statusKind = 0;
+        nlohmann::json params = {
+            {"doc_id", st.docMirror.hasDoc() ? st.docMirror.docId() : std::string()},
+            {"question", text}};
+        st.rpc.call("agent_ask_v2", params, [&st](const core::RpcResult& r) {
+            // Find the last running assistant message (the one this turn pushed).
+            ChatMsg* msg = nullptr;
+            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+                if (!it->fromUser && it->running) { msg = &*it; break; }
+            std::string err;
+            if (!r.ok)
+                err = r.err.empty() ? "worker call failed" : r.err;
+            else if (r.result.is_object() && r.result.contains("code"))
+                err = r.result.value("message", std::string("worker error"));
+            if (msg) {
+                msg->running = false;
+                msg->liveStatus.clear();
+                if (!err.empty()) {
+                    msg->errKind = ERR_SYSTEM;
+                    msg->text = "I couldn't answer that: " + err;
+                } else {
+                    msg->text = r.result.value("answer", std::string());
+                    if (msg->text.empty()) msg->text = "(no answer)";
+                }
+            }
+            if (!err.empty()) {
+                st.addLog("[err] ask: " + err);
+                st.status = "Ask failed.";  st.statusKind = 2;
+            } else {
+                st.status = "Ready.";  st.statusKind = 0;
+            }
+        }, 300000);
     } else {
         // Design new -> C40: the v2 orchestrator on a FRESH part document, so "Design with AI"
         // produces a real parametric feature tree. (The legacy build123d loop rendered a dead

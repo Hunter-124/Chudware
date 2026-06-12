@@ -29,7 +29,7 @@ from typing import Optional
 from ..providers.base import Provider, text_part, user
 from . import ops_emit, roles
 from .events import RunEvents
-from .state import est_tokens
+from .state import est_tokens, looks_like_edit
 
 # Per-call budgets (token estimate = chars // 4, matching state.est_tokens / the events contract).
 DECOMPOSE_SYSTEM_BUDGET_TOKENS = 400      # the decomposer system prompt must stay <=400 tokens
@@ -196,6 +196,25 @@ def total_volume(last_result) -> Optional[float]:
 
 # --------------------------------------------------------------------------- prompt assembly
 
+# Wave D edit bias — when the doc already has features and the request reads like a
+# modification, both micro roles are explicitly steered toward editing the existing feature
+# instead of adding a duplicate. Kept tiny (these prompts are budget-asserted).
+_DECOMPOSE_EDIT_BIAS = (
+    "EDIT BIAS: the document above ALREADY HAS those features. If the request modifies one of "
+    "them, emit a step that EDITS it — name the existing feature id in params (e.g. "
+    '{"type":"box","desc":"edit f1: set width to 60","params":{"feature_id":"f1","width":60}}) '
+    "— do NOT emit a step that rebuilds it from scratch.")
+
+_EXEC_EDIT_BIAS = (
+    "EDIT BIAS: the CURRENT DOC above already has features (ids + current params shown). If this "
+    "step modifies one of them, emit `edit_feature` on that feature's id (e.g. "
+    '[{"op":"edit_feature","id":"f1","params":{"width":{"value":60,"expr":null}}}]) — '
+    "NOT a new add_feature duplicate.")
+
+
+def _doc_has_features(doc_summary: str) -> bool:
+    return bool(doc_summary) and "(empty" not in doc_summary
+
 
 def build_decompose_prompt() -> tuple[str, list[dict]]:
     """(system, messages) for the decomposer. System asserted <= DECOMPOSE_SYSTEM_BUDGET_TOKENS."""
@@ -223,6 +242,9 @@ def build_executor_prompt(step: Step, doc_summary: str, request: str,
     step_text = (f"STEP TO DO NOW:\ntype: {step.type}\n{step.desc}"
                  + (f"\nparams: {json.dumps(step.params)}" if step.params else ""))
     parts = [f"REQUEST (overall): {request}", doc_summary, step_text]
+    # Wave D: steer an edit-shaped step over an existing doc to edit_feature, not a duplicate.
+    if _doc_has_features(doc_summary) and looks_like_edit(request):
+        parts.append(_EXEC_EDIT_BIAS)
     if error_feedback:
         parts.append("PREVIOUS ATTEMPT FAILED — fix this and re-emit the op array:\n"
                      + error_feedback)
@@ -353,7 +375,16 @@ def run_micro_design(request, doc_session, provider, emit=None, options=None):
     events.emit("stage_started", stage="decompose", role="decomposer", attempt=1, budget=1)
     dsys, _ = build_decompose_prompt()
     dsys = f"ROLE: decomposer\n{dsys}"
-    duser = [user([text_part(f"REQUEST:\n{request}\n\nProduce the step list json now.")])]
+    # Wave D: when the doc already has features, show them (ids/names/key params) so an
+    # edit-shaped request decomposes into steps that EDIT the existing feature.
+    dparts = [f"REQUEST:\n{request}"]
+    doc_summary0 = summarize_doc(_tree(), getattr(doc_session, "last_result", None))
+    if _doc_has_features(doc_summary0):
+        dparts.append(doc_summary0)
+        if looks_like_edit(request):
+            dparts.append(_DECOMPOSE_EDIT_BIAS)
+    dparts.append("Produce the step list json now.")
+    duser = [user([text_part("\n\n".join(dparts))])]
     events.emit("agent_call", stage="decompose", role="decomposer", attempt=1,
                 context_tokens_est=est_tokens(dsys) + est_tokens(duser[0]["content"][0]["text"]))
     reply, dur = _provider_call(provider, dsys, duser, max_tokens=1024)

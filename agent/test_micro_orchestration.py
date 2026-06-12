@@ -155,6 +155,43 @@ def test_op_error_retries_once() -> None:
     print("[micro retry] attempts:", len(outs), "-> tree:", types)
 
 
+def test_edit_bias_edit_feature() -> None:
+    """Wave D edit bias (micro profile): a doc that already has a box + an edit-shaped request —
+    the decomposer sees the existing features + the edit steer, the executor sees the
+    edit_feature steer, and a scripted edit_feature op edits the box in place (no duplicate)."""
+    s = docsess.new_session("part", name="micro_editbias")
+    docsess.apply_ops(s, 0, [{"op": "add_feature", "feature": {"type": "box", "name": "Plate",
+        "params": {"length": {"value": 40, "expr": None}, "width": {"value": 30, "expr": None},
+                   "height": {"value": 10, "expr": None}}}}])
+    assert [f["id"] for f in s.doc["features"]] == ["f1"]
+
+    steps = _json_block([{"type": "box", "desc": "edit f1: set width to 60",
+                          "params": {"feature_id": "f1", "width": 60}}])
+    edit_ops = _json_block([{"op": "edit_feature", "id": "f1",
+                             "params": {"width": {"value": 60, "expr": None}}}])
+    prov = MicroScriptedProvider(decompose=steps, executor=[edit_ops])
+    events: list[dict] = []
+    res = micro.run_micro_design("make the plate 60mm wide", s, prov, emit=events.append)
+
+    assert res.status == "done", f"expected done, got {res.status}/{res.stop_reason}"
+    feats = s.doc["features"]
+    assert len(feats) == 1 and feats[0]["type"] == "box", \
+        f"edit must NOT add a duplicate feature, got {[f['type'] for f in feats]}"
+    assert feats[0]["params"]["width"]["value"] == 60, feats[0]["params"]["width"]
+
+    # Decomposer prompt: existing features (id + key dims) + the decompose edit steer.
+    dec_user = prov.prompts[0][1]
+    assert "f1 box" in dec_user and "width=30" in dec_user, dec_user
+    assert "EDIT BIAS" in dec_user, "decomposer must be steered toward edit steps"
+    # Executor prompt: the edit_feature steer.
+    exec_user = prov.prompts[1][1]
+    assert "EDIT BIAS" in exec_user and "edit_feature" in exec_user, \
+        "executor must be steered toward edit_feature"
+
+    _assert_prompt_budgets(prov)
+    print("[micro editbias] width 30 -> 60 via edit_feature; both prompts carried the steer")
+
+
 def test_verifier_volume_direction() -> None:
     """The pure-python verifier flags a 'cut' step that did not shrink the volume."""
     box_step = micro.Step(type="box", desc="base", params={})
@@ -187,6 +224,7 @@ def test_should_engage() -> None:
 def main() -> None:
     test_happy_path_box_fillet()
     test_op_error_retries_once()
+    test_edit_bias_edit_feature()
     test_verifier_volume_direction()
     test_should_engage()
     print("\nMICRO-ORCHESTRATION (C35) TESTS PASSED")

@@ -324,6 +324,26 @@ static void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
 // One assistant turn: name + plan card + summary + iteration cards. While running, an inline
 // live status line (spinner + phase) with a thin progress accent bar, plus a collapsible
 // "Activity" section embedding the orchestrator run tree for this run.
+// C45: local models reply in markdown but ImGui renders plain text — the raw ** and ###
+// marks read as noise. Strip the common inline marks (bold/italic asterisks, heading hashes,
+// backticks) for DISPLAY only; the stored message keeps the original text.
+static std::string stripMdMarks(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        char c = in[i];
+        if (c == '*' || c == '`') continue;                       // **bold* / *it* / `code`
+        if (c == '#' && (i == 0 || in[i - 1] == '\n')) {          // heading hashes at line start
+            while (i < in.size() && in[i] == '#') ++i;
+            if (i < in.size() && in[i] == ' ') ++i;
+            --i;
+            continue;
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
 static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW) {
     const auto& pal = ui::palette;
     const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
@@ -340,7 +360,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         else if (m.errKind == ERR_CAD)
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(pal.errCad[0], pal.errCad[1], pal.errCad[2], 1));
-        ImGui::TextWrapped("%s", m.text.c_str());
+        ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
         if (m.errKind != ERR_NONE) ImGui::PopStyleColor();
     }
 

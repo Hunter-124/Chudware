@@ -102,6 +102,7 @@ _SEL_OR_DATUM = "selector_or_datum"  # selector object | datum feature id | rese
 _SEL_LIST = "selector_list"
 _FEAT_LIST = "feature_id_list"
 _COMP_LIST = "component_id_list"
+_UV_LIST = "uv_list"               # list of [u,v] local-frame offsets (C33-A hole positions)
 
 # Feature type -> {"params": [required keys], "refs": {slot: (form, required)}}
 FEATURE_TYPES: dict[str, dict[str, Any]] = {
@@ -127,7 +128,10 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
                                            "path": (_SEL_OR_DATUM, True)}},
     "loft": {"params": ["mode"], "refs": {"sections": (_SEL_LIST, True)}},
     "helix": {"params": ["pitch", "height"], "refs": {"base": (_SEL_OR_DATUM, True)}},
-    "fillet": {"params": ["radius"], "refs": {"edges": (_SEL_LIST, True)}},
+    # fillet: edges/radius required only on the normal path; the full_round path
+    # uses params.full_round + refs.middle_face (enforced in _validate_feature).
+    "fillet": {"params": [], "refs": {"edges": (_SEL_LIST, False),
+                                      "middle_face": (_SEL_OR_DATUM, False)}},
     "chamfer": {"params": ["length"], "refs": {"edges": (_SEL_LIST, True)}},
     "shell": {"params": ["thickness"], "refs": {"remove": (_SEL_LIST, False)}},
     "draft": {"params": ["angle"], "refs": {"neutral": (_SEL_OR_DATUM, True),
@@ -135,7 +139,8 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
                                             "faces": (_SEL_LIST, True)}},
     "hole": {"params": ["style", "end"], "refs": {"face": (_SEL_OR_DATUM, False),
                                                   "positions": (_SEL_LIST, False),
-                                                  "positions_sketch": (_SEL_OR_DATUM, False)}},
+                                                  "positions_sketch": (_SEL_OR_DATUM, False),
+                                                  "points": (_UV_LIST, False)}},
     "linear_pattern": {"params": ["count1", "spacing1"],
                        "refs": {"dir1": (_SEL_OR_DATUM, True),
                                 "dir2": (_SEL_OR_DATUM, False),
@@ -409,6 +414,17 @@ def validate_feature(
     if ftype == "sketch":
         errs += _validate_sketch_params(params, f"{where}.params", globals_names)
 
+    if ftype == "fillet":
+        # Conditional requiredness: full_round needs middle_face; else edges+radius.
+        if params.get("full_round"):
+            if not refs.get("middle_face"):
+                errs.append(f"{where}.refs.middle_face: required for full_round fillet")
+        else:
+            if "radius" not in params:
+                errs.append(f"{where}.params.radius: required for fillet")
+            if not refs.get("edges"):
+                errs.append(f"{where}.refs.edges: required for fillet")
+
     known_slots = spec["refs"]
     for slot, (form, required) in known_slots.items():
         if slot not in refs or refs[slot] is None:
@@ -436,6 +452,13 @@ def validate_feature(
                         errs.append(f"{loc}[{i}]: not a feature id")
                     elif s not in earlier_ids:
                         errs.append(f"{loc}[{i}]: '{s}' does not precede this feature")
+        elif form == _UV_LIST:
+            if not isinstance(v, list) or not v:
+                errs.append(f"{loc}: must be a non-empty list of [u,v] points")
+            else:
+                for i, pt in enumerate(v):
+                    if not _is_vec(pt, 2):
+                        errs.append(f"{loc}[{i}]: must be [u,v] (two numbers)")
         elif form == _COMP_LIST:
             comp = component_ids or set()
             if not isinstance(v, list) or not v:

@@ -32,6 +32,8 @@ from . import extrude as _extrude  # noqa: F401
 from . import revolve as _revolve  # noqa: F401
 # C21 registrations (import):
 from . import import_feature as _import_feature  # noqa: F401
+# C33-A registrations (hole wizard, multi-position):
+from . import hole as _hole  # noqa: F401
 
 __all__ = [
     "CompileContext",

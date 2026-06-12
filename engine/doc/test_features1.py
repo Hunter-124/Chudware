@@ -730,6 +730,105 @@ def test_fillet_variable_auto_clamps() -> None:
         print(f"[fillet-var-clamp] r=40->80 hit clamp floor, error: {s['error'][:60]}")
 
 
+# --------------------------------------------------------------------------- test 11: full round
+
+
+def _rib_features() -> list[dict]:
+    """Two centered boxes forming a rib: 40x40x5 base + 10x40x20 rib (merged).
+
+    The rib's top face (z=10, plane normal +Z, 10x40) is a planar constant-width
+    strip — the canonical full-round middle face.
+    """
+    return [
+        _feat("f1", "box", {"length": _dim(40), "width": _dim(40), "height": _dim(5)}),
+        _feat("f2", "box", {"length": _dim(10), "width": _dim(40), "height": _dim(20),
+                            "merge": True}, refs={"at": "origin"}),
+    ]
+
+
+def _rib_top_face_selector(res, owner: str = "f2") -> dict:
+    """Selector for the rib's planar top face (highest +Z plane)."""
+    from engine.doc.selectors import describe_faces, make_selector
+    body = res.bodies[0]
+    infos = describe_faces(body.shape.wrapped)
+    top = None
+    for i in infos:
+        if i.surf == "plane" and i.axis is not None and abs(i.axis[2]) > 0.9 \
+                and i.centroid[2] > 5.0:
+            top = i
+            break
+    assert top is not None, "no rib top face found"
+    sel = make_selector(top)
+    sel["owner_feature"] = owner
+    return sel
+
+
+def test_full_round_rib_builds() -> None:
+    """Full round on a rib top: builds, replaces the planar strip with a tangent
+    half-cylinder. Volume matches the analytic full round (sharp block top swapped
+    for a half-cylinder of radius width/2) and 2 cylindrical faces appear."""
+    res0 = compile_document(_doc(_rib_features()))
+    vol_sharp = res0.bodies[0].shape.volume
+    sel = _rib_top_face_selector(res0)
+
+    doc = _doc(_rib_features() + [
+        _feat("f3", "fillet", {"full_round": True}, refs={"middle_face": sel}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f3")
+    assert s["ok"], f"full round failed: {s['error']}"
+    assert abs(s["resolved"].get("full_round_width", 0.0) - 10.0) < 1e-3, \
+        f"full_round_width should be 10; got {s['resolved']}"
+
+    body = res.bodies[0]
+    # Top sharp edges gone: the planar 10x40 strip is replaced by a half-cylinder.
+    cyls = [f for f in body.shape.faces() if f.geom_type == GeomType.CYLINDER]
+    assert len(cyls) >= 2, f"full round should add cylindrical faces; got {len(cyls)}"
+    # No wide planar face remains at the very top (only a sub-mm residual sliver).
+    wide_top = [
+        f for f in body.shape.faces()
+        if f.geom_type == GeomType.PLANE and f.center().Z > 9.0 and f.area > 1.0
+    ]
+    assert not wide_top, f"rib top strip should be consumed; {len(wide_top)} wide faces remain"
+
+    # Analytic: 10x40x5 sharp block top -> half-cylinder r=5, length 40.
+    vol_round = vol_sharp - (10.0 * 40.0 * 5.0 - 0.5 * math.pi * 25.0 * 40.0)
+    vol = body.shape.volume
+    assert abs(vol - vol_round) / vol_round < 0.01, \
+        f"full-round vol {vol:.2f} vs analytic {vol_round:.2f}"
+    print(f"[full-round] rib vol {vol_sharp:.1f} -> {vol:.1f} "
+          f"(analytic {vol_round:.1f}), cyls={len(cyls)}")
+
+
+def test_full_round_non_planar_middle_face_errors() -> None:
+    """Full round with a non-planar (cylindrical) middle face -> clean precondition
+    error, not a crash."""
+    from engine.doc.selectors import describe_faces, make_selector
+
+    doc_cyl = _doc([_feat("f1", "cylinder", {"radius": _dim(8), "height": _dim(30)})])
+    _assert_valid(doc_cyl)
+    res0 = compile_document(doc_cyl)
+    body = res0.bodies[0]
+    infos = describe_faces(body.shape.wrapped)
+    cyl_info = next((i for i in infos if i.surf == "cylinder"), None)
+    assert cyl_info is not None, "cylinder should have a cylindrical face"
+    sel = make_selector(cyl_info)
+    sel["owner_feature"] = "f1"
+
+    doc = _doc([
+        _feat("f1", "cylinder", {"radius": _dim(8), "height": _dim(30)}),
+        _feat("f2", "fillet", {"full_round": True}, refs={"middle_face": sel}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f2")
+    assert not s["ok"], "full round on a non-planar middle face should fail"
+    assert "planar" in s["error"].lower(), \
+        f"error should mention the planar precondition; got: {s['error']}"
+    print(f"[full-round-error] non-planar middle face -> '{s['error'][:60]}'")
+
+
 # --------------------------------------------------------------------------- main
 
 

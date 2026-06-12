@@ -18,8 +18,9 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from build123d import fillet as b3d_fillet, chamfer as b3d_chamfer, offset, Solid
+from build123d import fillet as b3d_fillet, chamfer as b3d_chamfer, offset, Solid, GeomType
 from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+from OCP.BRepAdaptor import BRepAdaptor_Curve
 
 from .base import CompileContext, CompileOutput, FeatureError, register
 from engine.doc.selectors import (
@@ -164,6 +165,113 @@ def _resolve_faces(
 # --------------------------------------------------------------------------- fillet
 
 
+def _line_dir(edge) -> tuple[float, float, float]:
+    """Unit direction of a straight build123d edge (raw OCP line adaptor)."""
+    ad = BRepAdaptor_Curve(edge.wrapped)
+    d = ad.Line().Direction()
+    return (d.X(), d.Y(), d.Z())
+
+
+def _analyze_middle_face(face):
+    """Validate a full-round middle face and compute its constant width.
+
+    v1 precondition (the rib-top case users want): the middle face is planar and
+    has a pair of parallel, equal-length straight "long" edges. The full round is
+    the tangent cylinder that replaces the strip between those two edges; its
+    radius is width/2 where width = the perpendicular distance between the pair.
+
+    Returns ``(width, [edge0, edge1])`` or raises FeatureError with a clear v1
+    constraint message (see feature_params.md §full_round).
+    """
+    if face.geom_type != GeomType.PLANE:
+        raise FeatureError(
+            "full round requires a planar constant-width middle face (v1)"
+        )
+    lines = [e for e in face.edges() if e.geom_type == GeomType.LINE]
+    if len(lines) < 2:
+        raise FeatureError(
+            "full round middle face needs two straight side edges (v1)"
+        )
+    lines.sort(key=lambda e: -e.length)
+    e0 = lines[0]
+    d0 = _line_dir(e0)
+    mate = None
+    for e in lines[1:]:
+        d = _line_dir(e)
+        if abs(abs(d[0] * d0[0] + d[1] * d0[1] + d[2] * d0[2]) - 1.0) < 1e-4:
+            mate = e
+            break
+    if mate is None:
+        raise FeatureError(
+            "full round requires a planar constant-width middle face (v1): "
+            "no parallel long-edge pair found"
+        )
+    if abs(e0.length - mate.length) > 1e-4 * max(e0.length, 1.0):
+        raise FeatureError(
+            "full round requires a planar constant-width middle face (v1): "
+            "the two long edges are not equal length"
+        )
+    c0 = e0.center()
+    c1 = mate.center()
+    sep = (c1.X - c0.X, c1.Y - c0.Y, c1.Z - c0.Z)
+    proj = sep[0] * d0[0] + sep[1] * d0[1] + sep[2] * d0[2]
+    perp = (sep[0] - proj * d0[0], sep[1] - proj * d0[1], sep[2] - proj * d0[2])
+    width = math.sqrt(perp[0] ** 2 + perp[1] ** 2 + perp[2] ** 2)
+    if width <= 1e-6:
+        raise FeatureError("full round middle face has zero width (v1)")
+    return width, [e0, mate]
+
+
+def _compile_full_round(feat: dict, ctx: CompileContext) -> CompileOutput:
+    """Full-round fillet: replace a planar constant-width middle face with a
+    tangent half-cylinder (rib-top case). feature_params.md §full_round.
+
+    Realized as the "poor man's full round": both long edges of the middle face
+    filleted at r = width/2 * 0.999 in a single build123d fillet call. At exactly
+    width/2 OCCT fails (the strip degenerates to a tangent seam); 0.999 leaves a
+    ~width*1e-3 mm residual planar sliver that is below CAD tolerance, and the
+    volume matches a true half-cylinder full round to <0.01%.
+    """
+    refs = feat.get("refs", {})
+    bodies = list(ctx.bodies)
+    if not bodies:
+        raise FeatureError("fillet: no body to apply to")
+    body = bodies[-1]
+
+    mid_sel = refs.get("middle_face")
+    if not mid_sel:
+        raise FeatureError(
+            "fillet full_round: refs.middle_face is required",
+        )
+    sel_list = mid_sel if isinstance(mid_sel, list) else [mid_sel]
+    faces, dangling = _resolve_faces(sel_list, body, "middle_face", ctx=ctx)
+    if dangling:
+        raise FeatureError(
+            f"fillet full_round: {len(dangling)} face selector(s) dangling",
+            dangling_refs=dangling,
+        )
+    if not faces:
+        raise FeatureError("fillet full_round: middle face not resolved")
+
+    width, long_edges = _analyze_middle_face(faces[0])
+    r = width / 2.0 * 0.999
+
+    try:
+        result_body = b3d_fillet(long_edges, radius=r)
+    except Exception as exc:  # noqa: BLE001
+        raise FeatureError(
+            f"full round failed (width={width:g} mm): {exc}",
+            hint="middle face may be too narrow or adjacent to other features",
+        )
+
+    bodies[-1] = result_body
+    return CompileOutput(
+        bodies=bodies,
+        tool_body=result_body,
+        resolved={"full_round_width": width},
+    )
+
+
 def _variable_fillet(body, edges, r1: float, r2: float):
     """Apply a linear-law variable-radius fillet (r1 at edge start, r2 at end).
 
@@ -185,6 +293,13 @@ def _variable_fillet(body, edges, r1: float, r2: float):
 def compile_fillet(feat: dict, ctx: CompileContext) -> CompileOutput:
     p = feat.get("params", {})
     refs = feat.get("refs", {})
+
+    # Full-round (C33-B): replaces a middle face with a tangent half-cylinder.
+    # Distinct ref slot (middle_face) + own validation; bypasses the edge path.
+    # Triggered by params.full_round (canonical) or the PM "Fillet Type" combo
+    # value type == "full_round" (the form gates on that single combo).
+    if p.get("full_round") or p.get("type") == "full_round":
+        return _compile_full_round(feat, ctx)
 
     radius = ctx.dim(p, "radius", 2.0)
     if radius <= 0.0:

@@ -27,6 +27,13 @@ static PMFieldDef Well(const char* key, const char* label, const char* group,
     PMFieldDef f; f.kind = PMFieldKind::SelectorWell; f.key = key; f.label = label;
     f.group = group; f.selKinds = kinds; f.selMulti = multi; return f;
 }
+// SelectorWell enabled only when a sibling Combo (named enableKey) holds one of enableVals.
+static PMFieldDef WellIf(const char* key, const char* label, const char* group,
+                         PMSelKinds kinds, bool multi,
+                         const char* enableKey, const char* enableVals) {
+    PMFieldDef f = Well(key, label, group, kinds, multi);
+    f.enableKey = enableKey; f.enableVals = enableVals; return f;
+}
 static PMFieldDef Combo(const char* key, const char* label, const char* group,
                         const char* options) {
     PMFieldDef f; f.kind = PMFieldKind::Combo; f.key = key; f.label = label;
@@ -102,20 +109,28 @@ static const std::vector<PMFormDef>& forms() {
             Check ("flip",     "Reverse direction", "Direction", false),
             Check ("merge",    "Merge result",   "Options",   true),
         }},
-        // --- fillet ---  radius / [radius2] ; edges[]
+        // --- fillet ---  radius / [radius2] ; edges[]  OR  full_round + middle_face
         //   C30-A: variable-size fillet. A ComboL "type" (constant|variable) gates radius2 via the
         //   existing DimIf/enableKey mechanism — mirrors the chamfer Symmetric|Asymmetric gating.
         //   "type" is UI-only; the engine keys off radius2 (absent/equal => constant path).
-        //   tangent_prop/full_round remain disabled "(coming soon)" for discoverability.
+        //   C33-B: extend "type" with "full_round" (Check has no gating constructor, so the proven
+        //   Combo-gating path is the clean fit). full_round swaps the edge/radius rows for a single
+        //   "Middle Face" face well; the type combo also emits params.full_round=true (the engine
+        //   reads params.full_round + refs.middle_face, ignoring edges/radius on that path).
+        //   tangent_prop remains disabled "(coming soon)" for discoverability.
         { "fillet", "Fillet", "fillet", {
-            Well      ("edges",      "Edges",              "Items to Fillet",    K_EDGE, true),
+            WellIf    ("edges",      "Edges",              "Items to Fillet",    K_EDGE, true,
+                       "type", "constant|variable"),
+            WellIf    ("middle_face","Middle Face",        "Items to Fillet",    K_FACE, false,
+                       "type", "full_round"),
             ComboL    ("type",       "Fillet Type",        "Fillet Parameters",
-                       "constant|variable", "Constant Size|Variable Size"),
-            Dim       ("radius",     "Radius",             "Fillet Parameters",  2.0),
+                       "constant|variable|full_round",
+                       "Constant Size|Variable Size|Full Round"),
+            DimIf     ("radius",     "Radius",             "Fillet Parameters",  2.0,
+                       "type", "constant|variable"),
             DimIf     ("radius2",    "End Radius",         "Fillet Parameters",  2.0,
                        "type", "variable"),
             CheckSoon ("tangent_prop","Tangent propagation (coming soon)", "Fillet Parameters"),
-            CheckSoon ("full_round", "Full round fillet (coming soon)",    "Fillet Parameters"),
         }},
         // --- chamfer ---  length / [length2] ; edges[]
         //   C27-C: asymmetric chamfer. A Combo "kind" (symmetric|asymmetric) gates length2 via

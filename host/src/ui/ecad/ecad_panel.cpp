@@ -169,7 +169,7 @@ void drawEcadEditor(AppState& st) {
     // so the editor surfaces instead of staying hidden behind the Viewport tab.
     static bool prevHadDoc = false;
     const bool hasDocNow = es.mirror.hasDoc();
-    if (hasDocNow && !prevHadDoc) ImGui::SetWindowFocus("ECAD");
+    if (hasDocNow && !prevHadDoc) ImGui::SetNextWindowFocus();  // applies to the Begin below
     prevHadDoc = hasDocNow;
 
     if (!ImGui::Begin("ECAD")) { ImGui::End(); return; }

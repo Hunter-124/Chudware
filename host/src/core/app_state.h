@@ -273,6 +273,8 @@ struct AppState {
     int         ecadRevision = -1;  // last known ECAD revision (optimistic-concurrency base)
     bool        wantEcad = false;   // AI_CAD_SHOT=ecad scripted scenario
     bool        ecadShotDone = false;
+    int         wantFocusViewport = 0;      // frames to keep forcing the 3D Viewport tab forward
+                                            // (set by the ECAD board->3D bridge so the board shows)
 
     // ---- topology picking (C15) — id pass + overlays owned by run_gui; AppState borrows ----
     render::IdPass* idPass = nullptr;

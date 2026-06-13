@@ -132,16 +132,37 @@ void ecadExport(AppState& st, const char* kind) {
     st.addLog("[ecad] export " + std::string(kind) + " -> " + dir);
 }
 
+// The headline integration: export the current board to STEP, then IMPORT it into a live CAD part
+// document shown in the 3D viewport — the starting point for designing an enclosure/housing around
+// the board with the existing modeling + interference tools.
 void ecadTo3d(AppState& st) {
     if (st.ecadDocId.empty()) { st.toast(ui::ToastLevel::Warn, "Open an ECAD board first"); return; }
     std::error_code ec;
     const std::string dir = appdataDir() + "\\AI-CAD\\ecad_out";
     std::filesystem::create_directories(dir, ec);
+    const std::string step = dir + "\\board.step";
     nlohmann::json res;
-    if (!ecadCall(st, "ecad_to_3d", {{"doc_id", st.ecadDocId}, {"path", dir + "\\board.step"}}, res))
+    if (!ecadCall(st, "ecad_to_3d", {{"doc_id", st.ecadDocId}, {"path", step}}, res)) return;
+    std::string stepPath = jstr(res, "step_path");
+    if (stepPath.empty()) stepPath = step;
+
+    // Bring the board into the CAD viewport as an `import` feature on a fresh part doc.
+    std::string err;
+    if (!st.docMirror.newPart(st.worker, err)) {
+        st.toast(ui::ToastLevel::Error, "ECAD 3D: new CAD part failed: " + err);
         return;
-    st.toast(ui::ToastLevel::Info, "Board exported to STEP (open it in CAD to design a housing)");
-    st.addLog("[ecad] to_3d -> " + jstr(res, "step_path"));
+    }
+    st.clearViewportForNewDoc();
+    nlohmann::json ops = nlohmann::json::array();
+    ops.push_back({{"op", "add_feature"}, {"feature", {
+        {"type", "import"}, {"name", "PCB"},
+        {"params", {{"source_path", stepPath}, {"format", "step"}}}}}});
+    auto r = st.docMirror.applyOps(st.worker, ops);
+    if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    st.wantFocusViewport = 6;            // surface the 3D view (force for a few frames so it sticks)
+    st.toast(ui::ToastLevel::Info, r.ok ? "Board imported into 3D - design the housing around it"
+                                        : "Board exported to STEP (CAD import failed)");
+    st.addLog("[ecad] board -> 3D part: " + stepPath);
 }
 
 // Route a PCB-tab ribbon command. New docs + doc-scoped analysis/exports run now; geometry-placing
@@ -1045,9 +1066,10 @@ int run_gui(const char* screenshotPath) {
             };
             const char* kindEnv = std::getenv("AI_CAD_ECAD_KIND");
             const bool wantPcb = kindEnv && std::strcmp(kindEnv, "pcb") == 0;
+            const bool want3d  = kindEnv && std::strcmp(kindEnv, "3d") == 0;
             nlohmann::json r;
             std::string showId;
-            if (wantPcb) {
+            if (wantPcb || want3d) {
                 // Build a small demo board explicitly: outline + two 0603 footprints (pads
                 // resolved from the library) + a routed track + a GND copper pour, then fill it.
                 if (ecall("ecad_new", {{"kind", "pcb"}}, r)) {
@@ -1070,7 +1092,12 @@ int run_gui(const char* screenshotPath) {
                         nlohmann::json::array({ {1,1},{39,1},{39,29},{1,29} })}});
                     ecall("ecad_apply_ops", {{"doc_id",pcbId},{"base_revision",rev},{"ops",ops}}, r);
                     ecall("ecad_fill_zones", {{"doc_id", pcbId}}, r);
-                    showId = pcbId;
+                    if (want3d) {
+                        st.ecadDocId = pcbId;   // ecadTo3d exports the current ecad doc
+                        ecadTo3d(st);           // STEP -> CAD part -> 3D viewport (leave ECAD empty)
+                    } else {
+                        showId = pcbId;         // show the board in the ECAD canvas
+                    }
                 }
             } else {
                 // AI design -> a verified divider schematic (recipe fallback; no model needed).
@@ -1231,6 +1258,7 @@ int run_gui(const char* screenshotPath) {
         // button / the activity shot). No-op unless st.showActivityPanel; was previously
         // unreachable because only the in-pane tab hosted drawBody.
         activityPanel.draw(st);
+        if (st.wantFocusViewport > 0) { ImGui::SetNextWindowFocus(); st.wantFocusViewport--; }
         ui::drawViewportPanel(st, io, busy);
         ui::drawEcadEditor(st);   // Wave N: AI-ECAD 2D editor (empty-state until an ECAD doc loads)
 
@@ -1300,7 +1328,11 @@ int run_gui(const char* screenshotPath) {
         // wantTree but !treeShotDone: keep waiting (up to 30 frames) for the worker to start
         // wantTree and treeShotDone: take the screenshot at frame 10 (tree has repainted)
         int shotFrame = st.wantTree ? (st.treeShotDone ? 10 : 30) : 6;
-        if (st.wantEcad) shotFrame = st.ecadShotDone ? 10 : 150;  // wait for worker+design, then settle
+        if (st.wantEcad) {
+            if (!st.ecadShotDone)            shotFrame = 150;    // wait for worker + design
+            else if (st.wantFocusViewport>0) shotFrame = 99999;  // let the 3D-view focus settle
+            else                             shotFrame = 10;     // then capture
+        }
         if (shot && ++st.frame >= shotFrame) {
             std::vector<unsigned char> px(dw * dh * 4);
             glReadBuffer(GL_BACK);

@@ -88,8 +88,11 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     ImGui::DockBuilderDockWindow("FeatureManager", left);
     // One task-pane window: Design / Activity / Console live as internal tabs.
     ImGui::DockBuilderDockWindow("AI", right);
+    // Wave N/O: ECAD shares the central node with the Viewport (tabbed). Dock ECAD FIRST so the
+    // Viewport is the default-active tab (3D is the primary view); the ECAD tab pops forward on its
+    // own (SetNextWindowFocus) when an ECAD document is loaded.
+    ImGui::DockBuilderDockWindow("ECAD", main);
     ImGui::DockBuilderDockWindow("Viewport", main);
-    ImGui::DockBuilderDockWindow("ECAD", main);  // Wave N: ECAD editor tabs with the Viewport in the central node
     // Command dialogs dock into the lower-right slot so they surface as tabs instead of floating
     // behind the central node. They share one node (only one is typically open at a time).
     const char* dialogs[] = {

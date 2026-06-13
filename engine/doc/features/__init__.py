@@ -45,6 +45,8 @@ from . import boolean as _boolean  # noqa: F401
 from . import curves as _curves  # noqa: F401
 # Sheet metal (base flange + edge flange with real bend geometry + bend-allowance records):
 from . import sheetmetal as _sheetmetal  # noqa: F401
+# Sheet-metal flat pattern (unfold the folded part into its developed blank + bend lines + outline):
+from . import sheetmetal_flat as _sheetmetal_flat  # noqa: F401
 # Weldments (structural profile swept along sketch segments → trimmed members + cut-list data):
 from . import weldment as _weldment  # noqa: F401
 

@@ -232,6 +232,38 @@ at `K·T` into the thickness), and bend interior angle `θ`:
   `angle ∉ (0,180)`; degenerate placement where the flange is not connected to the sheet (e.g.
   `bend_outside` folded away — the union stays disjoint).
 
+### `sm_flat_pattern`
+- params: `{}` (none). refs: none. Operates on the RUNNING sheet-metal body plus the per-bend
+  records the edge flanges stored (`ctx.datums["_sheet_metal_bends"]`).
+- compiler: `features/sheetmetal_flat.py::compile_sm_flat_pattern` → UNFOLDS the folded part into
+  its flat blank. The base flange is the fixed face; each flange is developed flat in the base
+  plane. The bend records are SUFFICIENT — they carry `bend_allowance` (BA), the `bend_line`
+  endpoints, and the `e_dir`/`length_dir`/`fold_dir` frame — so no re-derivation from the solid is
+  needed. Method: rebuild the flat base block from the base broad face (the largest planar face ∥
+  the base normal `e_dir × length_dir`; for `material_inside` it still spans the whole base), then
+  for each bend lay a developed strip in that plane starting at the bend tangent line
+  `tangent = bend_line[0] + length_dir·x0` and extending along `length_dir` by `BA + wall_length`
+  (the bend region develops to BA; the wall keeps its length), at sheet thickness. `x0` is the
+  flange-position setback mirroring the flange builder: `material_inside → −(R+T)`,
+  `material_outside → −R`, `bend_outside → 0`. The result is a single planar sheet of `thickness`.
+- **developed length** (the SolidWorks check): for one bend, the flat length along the flange
+  direction = `base_length_to_bend + BA + wall_length`, where `base_length_to_bend` is the base
+  extent minus the `|x0|` setback. The bend's projected/outer corner length is REPLACED by BA. For
+  the canonical 60×40×2 + 90° flange (R=2, K=0.45, wall=20, `material_inside`): `x0 = −4`,
+  base_to_bend = 36, `BA = (π/2)(2 + 0.45·2) = 4.5553`, `L_flat = 36 + 4.5553 + 20 = 60.5553 mm`.
+- outputs: the FLAT solid (planar sheet) becomes the body. `resolved`:
+  `{bend_count, thickness, flat_area, flat_volume, volume}` (`flat_area` = developed one-side broad
+  area; `flat_volume` = `flat_area·thickness`). For the later flat-DXF / flat-view wave it stores
+  `ctx.datums["_sheet_metal_flat"][fid] = {feature, thickness, bend_lines:[{feature, angle,
+  bend_allowance, radius, line_start:[[x,y,z],[x,y,z]], line_end:[…]}], outline:[[x,y,z],…],
+  flat_area, flat_volume, n_base, multibend}` — `bend_lines` are the per-bend flat lines (start =
+  bend tangent, end = +BA), `outline` is the flat-blank boundary polyline.
+- single vs multi-bend: single-level flanges (base + one or more edge flanges) unfold exactly. A
+  flange off a flange (multi-level) is detected (its tangent line is off the base plane) and noted
+  in `multibend`; it is developed at the correct size but its placement is best-effort.
+- errors (contained `FeatureError`): no body / non-sheet-metal part; no bends (a flat sheet is
+  already its own flat pattern — nothing to unfold); empty developed body.
+
 ## Weldments
 
 A `weld_member` sweeps a structural PROFILE from the small profile library along the segments of a

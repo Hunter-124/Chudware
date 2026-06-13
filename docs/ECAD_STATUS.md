@@ -53,23 +53,31 @@ Run the demo to see the whole pipeline:
 2. ⚑ **Native MNA simulator instead of ngspice** — satisfies "improve the simulations" and stays
    GPL-clean. ngspice remains a documented, subprocess-isolated *optional* backend (not built).
 3. **Mirrors `engine/doc` architecture** exactly (schema/ops/session/compile/RPC/tools/PM-forms).
-4. **C++ UI not build-verified** — see below.
 
-## C++ GUI (Wave D — scaffold, NOT build-verified)
+## C++ GUI (Wave N — BUILT + headless-verified)
 
-`host/src/ui/ecad/` (mirror + 2D canvas + dockable panel) is written correct-by-construction against
-the real host headers but **was not compiled** (this environment has no FetchContent'd ImGui/GLFW,
-and the parallel CAD agent owns `host/` build files). Integration is deliberately deferred to a
-guide: **`docs/ECAD_UI_INTEGRATION.md`** has the exact fenced snippets for `CMakeLists.txt`,
-`app.cpp`, `title_bar.cpp`, `ribbon_def.cpp`, the PM-form entries, and the worker-RPC call pattern.
-Expect minor ImGui-signature fixups on first real build.
+`host/src/ui/ecad/` (mirror + 2D canvas + dockable panel) is now **compiled into `AI-CAD.exe`
+(VS2022) and verified headlessly** via `AI_CAD_SHOT=ecad` (+ `AI_CAD_ECAD_KIND=pcb`). It is wired
+into the dockspace (tabbed with the Viewport), the draw loop, a new **"PCB" ribbon tab** (New/
+Schematic/Board/Outputs), and the dispatcher (`ecad_*`/`sch_*`/`pcb_*` → `ecadDispatch` → worker
+RPCs). New Schematic/New PCB create live docs; Autoroute/Fill Zones/ERC-DRC/Gerber/Drill/BOM/Board-
+to-3D operate on the current doc. **Verified renders (dark + light themes):** schematic (symbols,
+pins, net labels, Nets/Symbols panel, ERC strip) and PCB (board outline, footprints + pads, tracks,
+copper pour, per-layer Layers panel, DRC strip). `docs/ECAD_UI_INTEGRATION.md` documents the wiring.
+
+Build: `cmake -S host -B host/build -G "Visual Studio 17 2022" -A x64 && cmake --build host/build
+--config Release --target AI-CAD`. Shot: `AI-CAD.exe --ui-screenshot out.png` with `AI_CAD_SHOT=ecad`.
+
+**GUI follow-ups (not blocking):** interactive canvas placement (click-to-place symbol/footprint via
+`ecad_resolve_pick` + PM forms — the ops/RPC already exist; only the canvas-click → op wiring + the
+`PMFieldKind` additions in `docs/ECAD_UI_INTEGRATION.md §f` remain); move the editor mirror onto
+AppState for undo/redo + multi-doc; `ecad_open` file dialog.
 
 ## Remaining work / known debt (prioritized)
 
-1. **Wire + build the C++ UI** — apply `ECAD_UI_INTEGRATION.md` steps (a)–(c) for an empty-state
-   render, then (d)–(f) for live docs + PM forms + picking. First build will need small fixups.
-   *(Biggest remaining gap; can't be build-verified in this env; overlaps the parallel CAD agent's
-   host/ ownership — best done in coordination with them.)*
+1. **Interactive ECAD editing in the GUI** — placement/routing is currently driven by the worker/AI
+   (ribbon New + the orchestrator); add canvas click-to-place + PM forms for fully manual editing
+   (engine ops + RPC already exist; see the GUI follow-ups above).
 2. **Full bus routing** (electrical): member labels already net correctly (KiCad's bus is largely a
    drawing convenience over labels); explicit bus-wire + bus-entry tap objects are a follow-up.
 3. **Advanced routing**: push-and-shove (router is eviction-based rip-up + maze, not negotiated-
@@ -79,7 +87,8 @@ Expect minor ImGui-signature fixups on first real build.
 5. **Cosmetic/realism**: copper-region realism in `threed.py` (proxies + substrate only); zone
    island removal is area-thresholded (not width-based necking).
 
-**Resolved across Waves E–M:** ~~pcb_update_from_sch~~, ~~.ecad+ container~~, ~~KiCad sch/pcb import~~,
+**Resolved across Waves E–N:** ~~the C++ ECAD GUI~~ (built + verified, both themes),
+~~pcb_update_from_sch~~, ~~.ecad+ container~~, ~~KiCad sch/pcb import~~,
 ~~KiCad file-open~~, ~~zone fill~~, ~~autoroute~~ + ~~rip-up~~ + ~~differential pairs/length-match~~,
 ~~hierarchical sheets~~, ~~DFM checks~~, ~~signal integrity (impedance + transmission lines)~~,
 ~~transformers (K)~~, ~~behavioral B-sources~~, ~~`.subckt`/NE555/`.step`/default-probes~~,

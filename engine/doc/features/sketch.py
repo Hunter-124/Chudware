@@ -449,41 +449,52 @@ def _detect_loops(edges: list) -> list[list]:
     for start_idx in range(n):
         if used[start_idx]:
             continue
-        chain: list[int] = [start_idx]
+        # Each chain entry is (edge index, reversed?) so a loop can be rebuilt head-to-tail.
+        chain: list[tuple[int, bool]] = [(start_idx, False)]
         used[start_idx] = True
         chain_closed = False
         loop_head = start_pts[start_idx]
 
         current_tip = end_pts[start_idx]
         while True:
-            # Find an unused edge whose start or end connects to current_tip
+            # Find an unused edge whose start or end connects to current_tip.
             found = -1
+            found_rev = False
             for j in range(n):
                 if used[j]:
                     continue
                 if _near(start_pts[j], current_tip):
-                    found = j
+                    found, found_rev = j, False
                     break
                 if _near(end_pts[j], current_tip):
-                    # Reverse the edge — build123d Edge.reversed()
-                    found = j
+                    found, found_rev = j, True   # matched by its END -> reverse it in the loop
                     break
             if found == -1:
                 break
-            chain.append(found)
+            chain.append((found, found_rev))
             used[found] = True
-            # Update tip — pick the end that is NOT the junction
-            if _near(start_pts[found], current_tip):
-                current_tip = end_pts[found]
-            else:
-                current_tip = start_pts[found]
+            # Advance the tip to the FAR end of the appended edge.
+            current_tip = start_pts[found] if found_rev else end_pts[found]
 
             if _near(current_tip, loop_head):
                 chain_closed = True
                 break
 
         if chain_closed:
-            loops.append([edges[i] for i in chain])
+            # Rebuild the loop as a consistently head-to-tail oriented chain: an edge matched by its
+            # END point is REVERSED so the wire winds continuously. Without this, a cap arc stored
+            # end-first (e.g. a decomposed slot's 2 lines + 2 arcs) left the loop inconsistently
+            # oriented, so _loop_polyline / Wire() mis-wound it and _orient_ccw flipped it the wrong
+            # way -> the even-odd logic ADDED the slot as material instead of subtracting it (the
+            # user-reported "slotted plate extrudes solid, with wedges" bug).
+            from OCP.TopoDS import TopoDS
+            loop = []
+            for idx, rev in chain:
+                e = edges[idx]
+                if rev:
+                    e = Edge(TopoDS.Edge_s(e.wrapped.Reversed()))
+                loop.append(e)
+            loops.append(loop)
 
     return loops
 

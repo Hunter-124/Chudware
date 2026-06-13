@@ -25,14 +25,20 @@ Run the demo to see the whole pipeline:
 | Connectivity | `netlist.py` (deterministic union-find), `erc.py` (full catalog) | `test_netlist` (7) |
 | Library | `library/` sexpr + KiCad `.kicad_sym`/`.kicad_mod` import + native resolver + 25-sym/19-fp clean-room **starter lib** | `test_library` (9) |
 | Simulator | `engine/sim/circuit.py` + `devices.py` — MNA op/dc/tran/ac | `test_circuit` — **all 8 analytic gates** (divider exact, RC τ 0.001%, RLC ring 0.006%, op-amp gain exact, RC −3 dB/−20 dB-dec) |
+| Sim depth | `.subckt` expansion + built-in **NE555** (oscillates) & op-amp macromodel; `.step` param sweep; default-all-nodes probes | `test_simdepth` |
 | SPICE I/O | `engine/sim/spice.py` parse/serialize + netlist→circuit bridge | `test_spice` |
 | DRC | `engine/ecad/drc.py` — net-aware clearance/width/via/annular/hole/edge + ratsnest MST | `test_drc` (11) |
+| Zone fill | `engine/ecad/zonefill.py` — copper pours w/ clearance + thermal relief (grid raster, G36-safe) | `test_zonefill` (9) |
+| Autoroute | `engine/ecad/autoroute.py` — 2-layer Lee/maze router w/ vias, DRC-clean | `test_autoroute` (8) |
 | Fabrication | `engine/ecad/fab/` — Gerber RS-274X, Excellon, BOM, pick-and-place | `test_fab` |
+| Interop / persistence | `engine/ecad/formats.py` — native `.ecad+` ZIP container + KiCad `.kicad_sch`/`.kicad_pcb` import | `test_formats` (7) |
 | 3D bridge | `engine/ecad/threed.py` — board→STEP + `aicad.part/1` import doc | `test_threed` — board volume exact, part doc **compiles in the CAD pipeline** |
 | Sch→PCB sync | `engine/ecad/sync.py` — `update_board_from_sch` (footprint resolve + pad-net bind, idempotent); RPC `ecad_update_from_sch` | `test_sync` |
-| Worker RPC | `engine/ecad/rpc.py` — 14 `ecad_*` methods (fenced into `engine/worker.py`) | `test_rpc` (5); legacy `test_worker_doc` still green |
-| AI tools | `mcp_server/ecad_tools.py` — 13 tools w/ rich context helpers | `test_ecad_tools`; legacy `test_roundtrip` still green |
-| Full pipeline | `engine/ecad/test_integration.py` + `demo.py` | end-to-end green |
+| Worker RPC | `engine/ecad/rpc.py` — 16 `ecad_*` methods (fenced into `engine/worker.py`) | `test_rpc`; legacy `test_worker_doc` still green |
+| AI tools | `mcp_server/ecad_tools.py` — 18 tools w/ rich context helpers (place/wire/status/sim/sweep/autoroute/fill/sync) | `test_ecad_tools`; legacy `test_roundtrip` still green |
+| Full pipeline | `engine/ecad/test_integration.py` + `demo.py` (sch→netlist→ERC→sim→PCB→sync→autoroute→pour→DRC→fab→STEP) | end-to-end green |
+
+**18 test suites green** (16 ECAD/sim/mcp + 2 legacy) as of Wave F.
 
 **Regression:** the 5 shared/legacy suites touched by fenced appends remain green. No edits to
 `engine/doc/*`. All new work is additive and isolated.
@@ -59,21 +65,21 @@ Expect minor ImGui-signature fixups on first real build.
 
 1. **Wire + build the C++ UI** — apply `ECAD_UI_INTEGRATION.md` steps (a)–(c) for an empty-state
    render, then (d)–(f) for live docs + PM forms + picking. First build will need small fixups.
-2. ~~`pcb_update_from_sch`~~ **DONE** — implemented as `engine/ecad/sync.py` +
-   `ecad_update_from_sch` RPC (footprint resolve + pad-net bind, idempotent, `test_sync` green).
-   Follow-up: surface it as an AI tool + a ribbon command.
-3. **`sch_import_kicad`** is a stub — needs a `.kicad_sch` importer (the `.kicad_sym`/`.kicad_mod`
-   importers already exist in `library/`).
-4. **`.ecad+` container** (`engine/ecad/formats.py`) not built — `ecad_save/open` fall back to plain
-   JSON. Mirror `engine/doc/stepplus.py` (ZIP: document.json + netlist + thumbnail).
-5. **Simulator gaps**: MOSFET level-1 AC + voltage-controlled switch are registered stubs;
-   `.subckt` (NE555) expansion not done; sim core returns empty traces if `study.probes` is empty
-   (the AI tool layer defaults to all nodes — consider doing the same in the core).
-6. **Bus routing** is parse-only (members expand; bus-entry merges into nets are a follow-up).
-7. **Gerber extensions** have cosmetic quirks (`B.Fab→.GBP2`, `F.Fab→.GGP`); normalize to the
-   conventional set. Copper-region realism in `threed.py` is deferred (proxies + substrate only).
-8. **Agent orchestrator** integration — the ECAD tools are ready for the M9-style orchestrator; an
-   ECAD design loop (intake→place→wire→ERC→sim→fix) can reuse the CAD loop's feedback discipline.
+   *(Biggest remaining gap; can't be build-verified in this env.)*
+2. **Agent orchestrator** for ECAD — the tools are ready (place/wire/status/sim/autoroute/fill/sync
+   with rich hints); an autonomous design loop (intake→place→wire→ERC→sim→fix) can reuse the CAD
+   loop's feedback discipline. The next high-value AI feature.
+3. **`sch_import_kicad` op wiring** — `formats.import_kicad_sch/_pcb` exist & are tested; the
+   single-doc `sch_import_kicad` op + an `ecad_open` of `.kicad_*` files just need to call them.
+4. **Simulator** — MOSFET level-1 AC + voltage-controlled-switch AC remain stubs; Monte-Carlo
+   tolerance analysis is a future add. (`.subckt`/NE555/`.step`/default-probes are DONE.)
+5. **Bus routing** is parse-only (members expand; bus-entry→net merges are a follow-up).
+6. **Cosmetic/realism**: Gerber `B.Fab→.GBP2`/`F.Fab→.GGP` extension quirks; copper-region realism
+   in `threed.py` (proxies + substrate only); zone island removal is area-thresholded (not
+   width-based necking).
+
+**Resolved since first status:** ~~pcb_update_from_sch~~, ~~.ecad+ container~~, ~~KiCad import~~,
+~~zone fill~~, ~~autoroute~~, ~~.subckt/NE555/.step/default-probes~~ — all DONE & tested (Waves E–F).
 
 ## How to run everything
 ```
@@ -83,6 +89,7 @@ $py = "$env:APPDATA\AI-CAD\runtime\venv\Scripts\python.exe"
 # all suites:
 foreach ($m in 'engine.ecad.test_ops','engine.ecad.test_netlist','engine.ecad.test_library',
   'engine.ecad.test_drc','engine.ecad.test_fab','engine.ecad.test_threed','engine.ecad.test_rpc',
-  'engine.ecad.test_integration','engine.sim.test_circuit','engine.sim.test_spice',
-  'mcp_server.test_ecad_tools') { & $py -m $m }
+  'engine.ecad.test_sync','engine.ecad.test_zonefill','engine.ecad.test_autoroute',
+  'engine.ecad.test_formats','engine.ecad.test_integration','engine.sim.test_circuit',
+  'engine.sim.test_spice','engine.sim.test_simdepth','mcp_server.test_ecad_tools') { & $py -m $m }
 ```

@@ -39,7 +39,9 @@ Run the demo to see the whole pipeline:
 | **AI orchestrator** | `engine/ecad/orchestrator.py` + `recipes.py` — NL request → verified schematic (plan→build→ERC→sim→fix), recipe fallback for weak models; RPC + MCP `ecad_design` | `test_orchestrator` |
 | Full pipeline | `engine/ecad/test_integration.py` + `demo.py` (11-step: AI design→sim suite→PCB→sync→autoroute→pour→DRC→fab→STEP→.ecad+→KiCad import) + `docs/ECAD_USERGUIDE.md` | end-to-end green |
 
-**21 test suites green** (19 ECAD/sim/mcp + 2 legacy) as of Wave I. `python -m engine.ecad.demo` runs the full pipeline.
+**27 test suites green** (25 ECAD/sim/mcp + 2 legacy) as of Wave M. `python -m engine.ecad.demo` runs the full pipeline.
+
+**Waves L–M additions:** autorouter v2 (**rip-up-and-reroute** + **differential-pair routing** w/ length-match), **hierarchical multi-sheet** schematics (sheet symbols ↔ child hier-labels; flat netlist byte-identical), **DFM** manufacturability checks (`dfm.py`: silk-over-pad, mask sliver, acid trap, courtyard overlap, drill/annular minimums), **signal integrity** (controlled-impedance calc + transmission-line sim), simulator **transformers** (coupled inductors `K`) + **behavioral `B`-sources** (safe-AST V/I expressions). 24 AI tools incl. `ecad_run_dfm`, `ecad_check_diff_impedance`, diff-pair autoroute.
 
 **Regression:** the 5 shared/legacy suites touched by fenced appends remain green. No edits to
 `engine/doc/*`. All new work is additive and isolated.
@@ -68,20 +70,21 @@ Expect minor ImGui-signature fixups on first real build.
    render, then (d)–(f) for live docs + PM forms + picking. First build will need small fixups.
    *(Biggest remaining gap; can't be build-verified in this env; overlaps the parallel CAD agent's
    host/ ownership — best done in coordination with them.)*
-2. **Schematic-capture parity**: hierarchical sheets (netlist is flat) + full bus routing
-   (members expand but bus-entry→net merges are a follow-up).
-3. **Advanced PCB routing**: the autorouter is a basic 2-layer maze router — differential pairs,
-   length matching, and push-and-shove are future work.
-4. **Simulator**: voltage-controlled-switch AC stub; pole-zero/distortion analyses; transmission-
-   line (LTRA) + controlled-impedance SI are future SI adds. (Core op/dc/tran/ac + `.step/.four/.mc/
-   .temp/.noise/.tf` + subckt + MOSFET-L1 AC are DONE.)
+2. **Full bus routing** (electrical): member labels already net correctly (KiCad's bus is largely a
+   drawing convenience over labels); explicit bus-wire + bus-entry tap objects are a follow-up.
+3. **Advanced routing**: push-and-shove (router is eviction-based rip-up + maze, not negotiated-
+   congestion); single-net length matching (diff-pair length-match is DONE); blind/buried vias.
+4. **Simulator**: voltage-controlled-switch AC stub; pole-zero/distortion analyses; lossy
+   transmission line (LTRA — lossless `T` is DONE). 
 5. **Cosmetic/realism**: copper-region realism in `threed.py` (proxies + substrate only); zone
    island removal is area-thresholded (not width-based necking).
 
-**Resolved across Waves E–I:** ~~pcb_update_from_sch~~, ~~.ecad+ container~~, ~~KiCad sch/pcb import~~,
-~~KiCad file-open~~, ~~zone fill~~, ~~autoroute~~, ~~`.subckt`/NE555/`.step`/default-probes~~,
+**Resolved across Waves E–M:** ~~pcb_update_from_sch~~, ~~.ecad+ container~~, ~~KiCad sch/pcb import~~,
+~~KiCad file-open~~, ~~zone fill~~, ~~autoroute~~ + ~~rip-up~~ + ~~differential pairs/length-match~~,
+~~hierarchical sheets~~, ~~DFM checks~~, ~~signal integrity (impedance + transmission lines)~~,
+~~transformers (K)~~, ~~behavioral B-sources~~, ~~`.subckt`/NE555/`.step`/default-probes~~,
 ~~Fourier/THD~~, ~~Monte-Carlo~~, ~~temp sweep~~, ~~noise~~, ~~`.tf`~~, ~~MOSFET-L1 AC~~,
-~~AI design orchestrator + `ecad_design`~~, ~~Gerber extension quirks~~ — all DONE & tested.
+~~AI design orchestrator + `ecad_design`~~, ~~Gerber extensions~~ — all DONE & tested.
 
 ## How to run everything
 ```

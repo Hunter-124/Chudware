@@ -232,6 +232,48 @@ at `K·T` into the thickness), and bend interior angle `θ`:
   `angle ∉ (0,180)`; degenerate placement where the flange is not connected to the sheet (e.g.
   `bend_outside` folded away — the union stays disjoint).
 
+### `sm_hem`
+- params: `type: "closed"|"open"|"teardrop"` ("closed") · `length: dim` (hem return length,
+  ~5·thickness; clamped to ≥1.5·thickness) · `radius: dim` (inner bend radius; default ≈
+  thickness/2 for `closed` so the two skins sit a material-thickness apart, else = thickness) ·
+  `k_factor: dim` (inherited from the base flange) · `flip: bool` (false; which side the hem folds
+  toward).
+- refs: `edge: sel(edge[line])` — a STRAIGHT thickness-face edge (the fold line), resolved exactly
+  like the edge flange's bend edge.
+- compiler: `features/sheetmetal.py::compile_sm_hem` → walks a CONSTANT-THICKNESS strip centerline
+  (a lead-in run, one bend, a return wall) in the bend-edge frame and prisms it along the edge, then
+  FUSES it to the sheet. Hem types differ only in the bend sweep + radius: `closed` = 180° fold at a
+  tiny radius (≈ T/2) so the return wall folds flat back against the sheet (gap ≈ thickness);
+  `open` = 180° bend at the requested `radius`, leaving a visible standoff (≈ 2·radius + T);
+  `teardrop` = the bend curls PAST 180° (≈ 235°) at `radius` to nearly close a round teardrop.
+- Stored bend record (one, same shape as the edge flange) with `angle` = the bend sweep
+  (180° / 235°) and `BA = θ_rad·(R+K·T)`, so the flat pattern develops the hem. `resolved`:
+  `{_type, angle, length, radius, k_factor, bend_allowance, neutral_radius, volume}`.
+- errors (contained `FeatureError`): no base flange / non-sheet part; dangling or curved bend edge;
+  edge not on a `~thickness`-wide face; `radius ≤ 0`; bad `type`; degenerate placement (the hem is
+  not connected to / adds no material to the sheet).
+
+### `sm_jog`
+- params: `angle: dim` (90, the jog bend angle, in (0, 90]) · `offset: dim` (10, the Z-step the end
+  flange is raised by) · `length: dim` (20, the flat end-flange length after the jog) · `radius:
+  dim` (inner bend radius, default = sheet `default_bend_radius`) · `k_factor: dim` (inherited) ·
+  `position: "material_inside"|"material_outside"|"bend_outside"` ("material_inside") · `flip: bool`
+  (false).
+- refs: `edge: sel(edge[line])` — the STRAIGHT thickness-face bend line (as the edge flange).
+- compiler: `features/sheetmetal.py::compile_sm_jog` → TWO opposing bends: bend UP by `angle`, a
+  short inclined connector that climbs the `offset`, then bend BACK by `angle` so the end flange is
+  PARALLEL to the original face but offset from it by `offset`, then a flat run of `length`. Built as
+  a constant-thickness strip centerline and fused to the sheet. The connector length is solved so
+  the net perpendicular rise (the two bend arcs' rise + the inclined run) equals `offset`; if
+  `offset` is smaller than the two bend radii already produce, the connector is clamped tiny and the
+  achievable step is echoed in `resolved.offset`.
+- Stores TWO bend records (the up bend + the back bend), each `BA = θ_rad·(R+K·T)`, so the flat
+  pattern develops BOTH. `resolved`: `{angle, offset (achieved), length, radius, k_factor,
+  bend_allowance, neutral_radius, volume}`.
+- errors (contained `FeatureError`): no base flange / non-sheet part; dangling or curved bend edge;
+  edge not on a `~thickness`-wide face; `radius ≤ 0`; `length ≤ 0`; `angle ∉ (0, 90]`; bad
+  `position`; degenerate placement.
+
 ### `sm_flat_pattern`
 - params: `{}` (none). refs: none. Operates on the RUNNING sheet-metal body plus the per-bend
   records the edge flanges stored (`ctx.datums["_sheet_metal_bends"]`).

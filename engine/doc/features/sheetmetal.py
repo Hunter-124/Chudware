@@ -476,6 +476,169 @@ def _build_flange_solid(
     return solid
 
 
+# --------------------------------------------------------------------------- multi-bend strip
+#
+# Hem and jog are not single bend+wall walls — a hem folds the material 180° back on itself, a jog
+# makes two opposing bends with a short connector. Both are most cleanly built as a CONSTANT-
+# THICKNESS strip that walks a centerline of straight runs and circular bends in the 2-D
+# (x = length_dir, y = fold_dir) cross-section plane, then offsets ±T/2 to inner/outer boundaries
+# and prisms along the bend edge. The walker also yields the per-bend swept angle so the caller can
+# emit a flat-pattern bend record (BA = θ·(R+K·T)) for EACH bend, exactly like the edge flange.
+#
+# Centerline convention (matches _build_flange_solid so records stay consistent): the strip starts
+# at the picked thickness-face plane and the FIRST point of the centerline is the mid-thickness
+# point of the base material at the bend origin. We track a moving frame (position + heading unit
+# vector) and a half-thickness offset, sampling the OUTER (+normal) and INNER (−normal) edges.
+
+
+def _strip_from_centerline(
+    p_start: Vector, e_dir: Vector, length_dir: Vector, fold_dir: Vector,
+    edge_length: float, thickness: float, ops: list[dict], start_x: float, start_y: float,
+) -> Solid:
+    """Build a constant-thickness strip in the (length_dir, fold_dir) plane and prism it along e_dir.
+
+    ``ops`` is a list of moves applied to a moving frame that starts at 2-D point ``(start_x,
+    start_y)`` heading +length_dir:
+      * ``{"run": L}``                      — straight segment of centerline length ``L``.
+      * ``{"bend": angle_deg, "r_center": Rc, "ccw": bool}`` — a circular arc of the centerline of
+        centre-radius ``Rc`` sweeping ``angle_deg`` (left turn if ccw).
+
+    The strip is the locus of points within ±T/2 of the centerline along the in-plane normal of the
+    heading. Returns the prismed Solid.
+    """
+    T = thickness
+    half = T / 2.0
+
+    def xy(x: float, y: float) -> Vector:
+        return p_start + length_dir * x + fold_dir * y
+
+    # Moving frame in 2-D: position (px, py) and heading angle (radians, 0 = +x = +length_dir).
+    px, py = start_x, start_y
+    heading = 0.0
+    # Left-hand normal of the heading (rotate heading by +90°) — used to offset to the OUTER edge.
+    # We collect centerline points; inner/outer are derived by offsetting each sample ±half along
+    # the local normal. To keep corners clean we sample arcs finely and emit straight-run endpoints.
+    inner: list[tuple[float, float]] = []
+    outer: list[tuple[float, float]] = []
+
+    def emit(x: float, y: float, h: float) -> None:
+        nx, ny = -math.sin(h), math.cos(h)  # left normal of heading
+        outer.append((x + nx * half, y + ny * half))
+        inner.append((x - nx * half, y - ny * half))
+
+    emit(px, py, heading)
+    for op in ops:
+        if "run" in op:
+            L = float(op["run"])
+            px += math.cos(heading) * L
+            py += math.sin(heading) * L
+            emit(px, py, heading)
+        else:
+            ang = math.radians(float(op["bend"]))
+            Rc = float(op["r_center"])
+            ccw = bool(op.get("ccw", True))
+            sign = 1.0 if ccw else -1.0
+            # Centre of the arc: offset from the current position by Rc along the (left/right) normal.
+            cnx, cny = -math.sin(heading), math.cos(heading)  # left normal
+            cx = px + sign * cnx * Rc
+            cy = py + sign * cny * Rc
+            # Current position's polar angle about the centre.
+            a0 = math.atan2(py - cy, px - cx)
+            nseg = max(8, int(math.degrees(ang) / 6.0))
+            for i in range(1, nseg + 1):
+                a = a0 + sign * ang * (i / nseg)
+                cpx = cx + Rc * math.cos(a)
+                cpy = cy + Rc * math.sin(a)
+                h = heading + sign * ang * (i / nseg)
+                emit(cpx, cpy, h)
+            px = cx + Rc * math.cos(a0 + sign * ang)
+            py = cy + Rc * math.sin(a0 + sign * ang)
+            heading += sign * ang
+
+    # Closed cross-section polygon: outer forward, inner backward.
+    poly2d: list[tuple[float, float]] = list(outer) + list(reversed(inner))
+    pts3d = [xy(x, y) for (x, y) in poly2d]
+    cleaned: list[Vector] = []
+    for v in pts3d:
+        if not cleaned or (v - cleaned[-1]).length > 1e-7:
+            cleaned.append(v)
+    if len(cleaned) >= 2 and (cleaned[0] - cleaned[-1]).length <= 1e-7:
+        cleaned.pop()
+    if len(cleaned) < 3:
+        raise FeatureError("sheet metal: degenerate strip cross-section")
+    section = _make_face_from_pts(cleaned)
+    return _prism(section, e_dir * edge_length)
+
+
+def _bend_frame(body, edge: Edge, thickness: float, flip: bool
+                ) -> tuple[Vector, Vector, float, Vector, Vector, Vector]:
+    """Resolve the common bend-edge frame shared by hem / jog (mirrors the edge-flange setup).
+
+    Returns ``(p_start, p_end, edge_length, e_dir, length_dir, fold_dir)``."""
+    e_dir, p_start, p_end, edge_length = _edge_dir_and_endpoints(edge)
+    broad_face, thick_face, n_broad, n_thick = _classify_bend_edge(
+        body, edge, thickness, e_dir
+    )
+    length_dir = n_thick - n_broad * n_thick.dot(n_broad)
+    if length_dir.length < 1e-9:
+        length_dir = e_dir.cross(n_broad)
+    length_dir = length_dir * (1.0 / length_dir.length)
+    fold_dir = n_broad * (-1.0 if flip else 1.0)
+    fold_dir = fold_dir * (1.0 / max(fold_dir.length, 1e-12))
+    return p_start, p_end, edge_length, e_dir, length_dir, fold_dir
+
+
+def _resolve_bend_edge(refs: dict, body, ctx: CompileContext, what: str) -> Edge:
+    """Resolve the single straight bend edge for a hem / jog (shared with edge flange)."""
+    edge_sel = refs.get("edge")
+    if edge_sel is None:
+        raise FeatureError(f"{what}: refs.edge is required (the bend line)")
+    sel_list = edge_sel if isinstance(edge_sel, list) else [edge_sel]
+    edges, dangling = _resolve_edges(sel_list, body, "edge", ctx=ctx)
+    if dangling:
+        raise FeatureError(f"{what}: {len(dangling)} edge selector(s) dangling",
+                           dangling_refs=dangling)
+    if not edges:
+        raise FeatureError(f"{what}: bend edge not resolved")
+    return edges[0]
+
+
+def _append_bend_record(ctx: CompileContext, rec: dict) -> None:
+    if _BEND_KEY not in ctx.datums:
+        ctx.datums[_BEND_KEY] = Datum(kind=_BEND_KEY, obj=[], feature_id="__sys__")
+    ctx.datums[_BEND_KEY].obj.append(rec)
+
+
+def _make_bend_record(fid: str, angle_deg: float, inner_radius: float, thickness: float,
+                      k_factor: float, wall_length: float, position: str, flip: bool,
+                      p_start: Vector, p_end: Vector, e_dir: Vector,
+                      length_dir: Vector, fold_dir: Vector) -> dict:
+    """One per-bend flat-pattern record (same shape the edge flange stores) with BA = θ·(R+K·T)."""
+    ba = bend_allowance(angle_deg, inner_radius, thickness, k_factor)
+    bd = bend_deduction(angle_deg, inner_radius, thickness, k_factor)
+    return {
+        "feature": fid,
+        "angle": angle_deg,
+        "radius": inner_radius,
+        "thickness": thickness,
+        "k_factor": k_factor,
+        "neutral_radius": inner_radius + k_factor * thickness,
+        "bend_allowance": ba,
+        "bend_deduction": bd,
+        "wall_length": wall_length,
+        "position": position,
+        "flip": flip,
+        "bend_line": [[p_start.X, p_start.Y, p_start.Z], [p_end.X, p_end.Y, p_end.Z]],
+        "e_dir": [e_dir.X, e_dir.Y, e_dir.Z],
+        "length_dir": [length_dir.X, length_dir.Y, length_dir.Z],
+        "fold_dir": [fold_dir.X, fold_dir.Y, fold_dir.Z],
+    }
+
+
+# Bend-record container key (shared with the edge flange + read by sheetmetal_flat).
+_BEND_KEY = "_sheet_metal_bends"
+
+
 # --------------------------------------------------------------------------- edge flange
 
 
@@ -650,6 +813,271 @@ def compile_sm_edge_flange(feat: dict, ctx: CompileContext) -> CompileOutput:
             "bend_allowance": ba,
             "bend_deduction": bd,
             "neutral_radius": neutral_radius,
+            "volume": float(getattr(result, "volume", 0.0) or 0.0),
+        },
+    )
+
+
+# --------------------------------------------------------------------------- fuse helper
+
+
+def _fuse_to_sheet(target, addition, what: str):
+    """Fuse a hem/jog addition to the running sheet and validate it stayed one connected solid."""
+    if getattr(addition, "volume", 0.0) <= 1e-9:
+        raise FeatureError(f"{what}: produced an empty solid")
+    try:
+        fused = target + addition
+    except Exception as exc:  # noqa: BLE001
+        raise FeatureError(f"{what}: fuse to sheet failed: {exc}",
+                           hint="the addition may not be tangent to the parent face")
+    try:
+        n_solids = len(fused.solids())
+    except Exception:  # noqa: BLE001
+        n_solids = 1
+    if n_solids > 1:
+        raise FeatureError(
+            f"{what}: result is not connected to the sheet (degenerate placement)",
+            hint="try clearing 'flip' or a different size")
+    result = _to_solid_normalized(fused)
+    if getattr(result, "volume", 0.0) <= getattr(target, "volume", 0.0) + 1e-9:
+        raise FeatureError(f"{what}: added no material (degenerate placement?)")
+    return result
+
+
+# --------------------------------------------------------------------------- hem
+
+_VALID_HEM_TYPES = ("closed", "open", "teardrop")
+
+
+@register("sm_hem")
+def compile_sm_hem(feat: dict, ctx: CompileContext) -> CompileOutput:
+    """Hem — fold a sheet edge back on itself (closed / open / teardrop).
+
+    A hem stiffens an edge and removes the sharp burr. Three forms (mirrors SolidWorks):
+      * ``closed``   — the return wall folds flat back AGAINST the sheet; the bend is 180° at a tiny
+        inner radius (≈ T/2) so the two skins almost touch (gap ≈ the material thickness only).
+      * ``open``     — a 180° bend at the requested ``radius``, so the return wall is parallel to the
+        sheet but stood off by a visible gap (≈ 2·radius + T).
+      * ``teardrop`` — the bend curls PAST 180° (≈ 235°) at ``radius`` to nearly close a round
+        teardrop opening; the return wall tucks back toward the sheet.
+
+    Geometry is a constant-thickness strip walking one (or, teardrop, one >180°) bend then a flat
+    return wall, fused to the sheet. A bend record (BA = θ·(R+K·T)) is stored so the flat pattern
+    develops it.
+    """
+    p = feat.get("params", {})
+    refs = feat.get("refs", {})
+    fid = feat.get("id", "?")
+
+    bodies = list(ctx.bodies)
+    if not bodies:
+        raise FeatureError("sm_hem: no sheet body — add a base flange first")
+    body = bodies[-1]
+
+    sheet_ctx = _get_sheet_context(ctx)
+    if sheet_ctx is None:
+        raise FeatureError("sm_hem: part is not sheet metal — add a base flange first")
+    thickness = sheet_ctx["thickness"]
+    k_default = sheet_ctx["k_factor"]
+
+    htype = p.get("type", "closed")
+    if htype not in _VALID_HEM_TYPES:
+        raise FeatureError(f"sm_hem: type must be one of {_VALID_HEM_TYPES}")
+    length = ctx.dim(p, "length", 5.0 * thickness)
+    # Closed hem: inner radius ~T/2 (skins ~T apart). Open/teardrop: a real radius (default = T).
+    radius_default = (thickness / 2.0) if htype == "closed" else thickness
+    inner_radius = ctx.dim(p, "radius", radius_default)
+    k_factor = ctx.dim(p, "k_factor", k_default)
+    flip = bool(p.get("flip", False))
+
+    if inner_radius <= 0.0:
+        raise FeatureError("sm_hem: bend radius must be > 0")
+    # Clamp a degenerate return length: a hem return must be long enough to clear the bend.
+    length = max(length, 1.5 * thickness)
+
+    edge = _resolve_bend_edge(refs, body, ctx, "sm_hem")
+    try:
+        p_start, p_end, edge_length, e_dir, length_dir, fold_dir = _bend_frame(
+            body, edge, thickness, flip)
+    except FeatureError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise FeatureError(f"sm_hem: could not frame the bend edge: {exc}")
+
+    # Bend sweep angle: 180° for closed/open, >180° (curl) for teardrop.
+    bend_angle = 235.0 if htype == "teardrop" else 180.0
+    Rc = inner_radius + thickness / 2.0           # centerline (mid-thickness) bend radius
+
+    # Centerline walk in the (length_dir, fold_dir) plane. Start at the mid-thickness of the base
+    # material at the picked edge: x = -(R+T) setback (material_inside-like), y = -T/2 (mid-skin).
+    # Run inward a touch so the bend sits on the base, then fold back by ``bend_angle`` (turning
+    # toward +fold_dir = "up" then back over the sheet), then the flat return wall of ``length``.
+    start_x = -(inner_radius + thickness)
+    start_y = -thickness / 2.0
+    pre_run = inner_radius + thickness          # bring the centerline to the bend origin
+    ops = [
+        {"run": pre_run},
+        {"bend": bend_angle, "r_center": Rc, "ccw": True},
+        {"run": length},
+    ]
+    try:
+        hem = _strip_from_centerline(
+            p_start, e_dir, length_dir, fold_dir, edge_length, thickness, ops,
+            start_x, start_y)
+    except FeatureError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise FeatureError(f"sm_hem: geometry build failed: {exc}",
+                           hint="check the bend edge, radius and that the hem does not self-intersect")
+
+    result = _fuse_to_sheet(body, hem, "sm_hem")
+    bodies[-1] = result
+    _store_topo_owners(ctx, fid, result, body)
+    _set_sheet_context(ctx, fid, thickness, k_factor,
+                       sheet_ctx.get("default_bend_radius", thickness))
+
+    rec = _make_bend_record(fid, bend_angle, inner_radius, thickness, k_factor, length,
+                            "material_inside", flip, p_start, p_end, e_dir, length_dir, fold_dir)
+    _append_bend_record(ctx, rec)
+
+    ba = rec["bend_allowance"]
+    return CompileOutput(
+        bodies=bodies, tool_body=hem, op="add",
+        resolved={
+            "_type": htype,
+            "angle": bend_angle,
+            "length": length,
+            "radius": inner_radius,
+            "k_factor": k_factor,
+            "bend_allowance": ba,
+            "neutral_radius": rec["neutral_radius"],
+            "volume": float(getattr(result, "volume", 0.0) or 0.0),
+        },
+    )
+
+
+# --------------------------------------------------------------------------- jog
+
+
+@register("sm_jog")
+def compile_sm_jog(feat: dict, ctx: CompileContext) -> CompileOutput:
+    """Jog — two opposing bends that step the flange to a parallel, OFFSET plane.
+
+    A jog bends the material UP by ``angle`` (default 90°), runs a short connector to climb the
+    ``offset`` (the Z-step height), then bends BACK by ``angle`` so the end flange is PARALLEL to the
+    original face but offset from it by ``offset``. The flange then continues flat for ``length``.
+
+    Two bends => two bend records (each BA = θ·(R+K·T)), so the flat pattern develops both.
+    """
+    p = feat.get("params", {})
+    refs = feat.get("refs", {})
+    fid = feat.get("id", "?")
+
+    bodies = list(ctx.bodies)
+    if not bodies:
+        raise FeatureError("sm_jog: no sheet body — add a base flange first")
+    body = bodies[-1]
+
+    sheet_ctx = _get_sheet_context(ctx)
+    if sheet_ctx is None:
+        raise FeatureError("sm_jog: part is not sheet metal — add a base flange first")
+    thickness = sheet_ctx["thickness"]
+    k_default = sheet_ctx["k_factor"]
+    radius_default = sheet_ctx.get("default_bend_radius", thickness)
+
+    angle_deg = ctx.dim(p, "angle", 90.0)
+    offset = ctx.dim(p, "offset", 10.0)
+    length = ctx.dim(p, "length", 20.0)
+    inner_radius = ctx.dim(p, "radius", radius_default)
+    k_factor = ctx.dim(p, "k_factor", k_default)
+    position = p.get("position", "material_inside")
+    flip = bool(p.get("flip", False))
+
+    if inner_radius <= 0.0:
+        raise FeatureError("sm_jog: bend radius must be > 0")
+    if length <= 0.0:
+        raise FeatureError("sm_jog: flange length must be > 0")
+    if abs(angle_deg) < 1e-6 or abs(angle_deg) > 90.0 + 1e-6:
+        raise FeatureError("sm_jog: angle must be in (0, 90] degrees")
+    if position not in _VALID_POSITIONS:
+        raise FeatureError(f"sm_jog: position must be one of {_VALID_POSITIONS}")
+
+    edge = _resolve_bend_edge(refs, body, ctx, "sm_jog")
+    try:
+        p_start, p_end, edge_length, e_dir, length_dir, fold_dir = _bend_frame(
+            body, edge, thickness, flip)
+    except FeatureError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise FeatureError(f"sm_jog: could not frame the bend edge: {exc}")
+
+    Rc = inner_radius + thickness / 2.0
+    ang = math.radians(angle_deg)
+    # The connector run climbs the vertical ``offset`` over the inclined segment between the two
+    # opposing bends. For angle θ the connector's centerline length so the NET perpendicular rise of
+    # the END flange's mid-plane equals ``offset`` is offset/sin(θ) minus the rise the two bend arcs
+    # already contribute. Each Rc bend contributes Rc·(1−cos θ) of perpendicular rise.
+    bend_rise = 2.0 * Rc * (1.0 - math.cos(ang))
+    needed = offset - bend_rise
+    connector = needed / math.sin(ang) if math.sin(ang) > 1e-6 else 0.0
+    if connector < 0.0:
+        # offset is smaller than what the two bend radii already produce — clamp to a tiny connector
+        # (the achievable step is then ~bend_rise; reported in resolved).
+        connector = 0.05 * thickness
+
+    # Position setback so the first bend lands like an edge flange.
+    if position == "material_inside":
+        x0 = -(inner_radius + thickness)
+    elif position == "material_outside":
+        x0 = -inner_radius
+    else:
+        x0 = 0.0
+    start_x = x0
+    start_y = -thickness / 2.0
+    pre_run = -x0  # run from the picked edge plane to the bend origin (>=0)
+    if pre_run < 0:
+        pre_run = 0.0
+    ops = [
+        {"run": pre_run + thickness},      # base lead-in to the first bend
+        {"bend": angle_deg, "r_center": Rc, "ccw": True},   # bend UP
+        {"run": connector},                                  # climb the offset
+        {"bend": angle_deg, "r_center": Rc, "ccw": False},  # bend BACK parallel
+        {"run": length},                                     # the offset end flange
+    ]
+    try:
+        jog = _strip_from_centerline(
+            p_start, e_dir, length_dir, fold_dir, edge_length, thickness, ops,
+            start_x, start_y)
+    except FeatureError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise FeatureError(f"sm_jog: geometry build failed: {exc}",
+                           hint="check the bend edge, radius, offset and that the jog does not self-intersect")
+
+    result = _fuse_to_sheet(body, jog, "sm_jog")
+    bodies[-1] = result
+    _store_topo_owners(ctx, fid, result, body)
+    _set_sheet_context(ctx, fid, thickness, k_factor, radius_default)
+
+    # TWO bend records (the up bend and the back bend). Both develop in the flat pattern.
+    rec_up = _make_bend_record(fid, angle_deg, inner_radius, thickness, k_factor, connector,
+                               position, flip, p_start, p_end, e_dir, length_dir, fold_dir)
+    rec_back = _make_bend_record(fid, angle_deg, inner_radius, thickness, k_factor, length,
+                                 position, flip, p_start, p_end, e_dir, length_dir, fold_dir)
+    _append_bend_record(ctx, rec_up)
+    _append_bend_record(ctx, rec_back)
+
+    achieved_offset = bend_rise + connector * math.sin(ang)
+    return CompileOutput(
+        bodies=bodies, tool_body=jog, op="add",
+        resolved={
+            "angle": angle_deg,
+            "offset": achieved_offset,
+            "length": length,
+            "radius": inner_radius,
+            "k_factor": k_factor,
+            "bend_allowance": rec_up["bend_allowance"],
+            "neutral_radius": rec_up["neutral_radius"],
             "volume": float(getattr(result, "volume", 0.0) or 0.0),
         },
     )

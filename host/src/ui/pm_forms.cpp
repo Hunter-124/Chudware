@@ -373,6 +373,35 @@ static const std::vector<PMFormDef>& forms() {
                     "Material Inside|Material Outside|Bend Outside"),
             Check  ("flip",     "Reverse direction","Flange", false),
         }},
+        // --- sm_hem (Sheet Metal) --- engine features/sheet_metal sm_hem. Fold a straight thickness-
+        //   face edge back on itself. type picks closed (180° flat fold, tiny gap) / open (180° at a
+        //   real radius, visible standoff) / teardrop (curls past 180°). length is the hem return
+        //   wall; radius is the inner bend radius (defaults engine-side: ~T/2 for closed, T else).
+        //   flip mirrors the fold side. k_factor inherited from the base flange (not on this form).
+        { "sm_hem", "Hem", "shell", {
+            Well   ("edge",   "Bend Edge",      "Hem",   K_EDGE, false),
+            ComboL ("type",   "Hem Type",       "Hem",
+                    "closed|open|teardrop", "Closed|Open|Teardrop"),
+            Dim    ("length", "Length",         "Hem",   10.0),
+            Dim    ("radius", "Bend Radius",    "Hem",   2.0),
+            Check  ("flip",   "Reverse direction","Hem", false),
+        }},
+        // --- sm_jog (Sheet Metal) --- engine features/sheet_metal sm_jog. Two opposing bends that
+        //   step the flange to a parallel plane offset by the Z-step. angle is the jog bend angle
+        //   (0..90]; offset is the step height; length is the flat end flange; radius is the inner
+        //   bend radius (defaults to thickness). position aligns the first bend to the picked edge;
+        //   flip mirrors the bend direction. k_factor inherited from the base flange.
+        { "sm_jog", "Jog", "extrude_boss", {
+            Well   ("edge",     "Bend Edge",      "Jog",   K_EDGE, false),
+            Angle  ("angle",    "Angle",          "Jog",   90.0),
+            Dim    ("offset",   "Offset",         "Jog",   10.0),
+            Dim    ("length",   "Length",         "Jog",   20.0),
+            Dim    ("radius",   "Bend Radius",    "Jog",   2.0),
+            ComboL ("position", "Flange Position","Jog",
+                    "material_inside|material_outside|bend_outside",
+                    "Material Inside|Material Outside|Bend Outside"),
+            Check  ("flip",     "Reverse direction","Jog", false),
+        }},
         // --- weld_member (Weldments / Structural Member) --- engine features weld_member. Sweeps a
         //   library profile along the segments of ONE path sketch (refs.sketch = a single sketch
         //   feature-id STRING, not an array — FeatWell1 single-emit). segments are OMITTED here so the
@@ -439,6 +468,8 @@ const PMFormDef* pmFormForCommand(const std::string& cmdId, std::string& mode) {
     // Sheet Metal — ribbon cmd id == the engine feature type, so route straight through.
     if (cmdId == "sm_base_flange")    return pmFindForm("sm_base_flange");
     if (cmdId == "sm_edge_flange")    return pmFindForm("sm_edge_flange");
+    if (cmdId == "sm_hem")            return pmFindForm("sm_hem");
+    if (cmdId == "sm_jog")            return pmFindForm("sm_jog");
     // Weldments — ribbon cmd id == the engine feature type.
     if (cmdId == "weld_member")       return pmFindForm("weld_member");
     // Primitive quick-start commands (AI-CAD extensions; not in the C14 ribbon but reachable

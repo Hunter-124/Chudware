@@ -168,6 +168,9 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
     # Sheet metal — base flange (sheet from a region) + edge flange (bent wall off an edge).
     "sm_base_flange": {"params": [], "refs": {"profile": (_SEL_LIST, True)}},
     "sm_edge_flange": {"params": [], "refs": {"edge": (_SEL_OR_DATUM, True)}},
+    # Hem (fold an edge back on itself) + jog (two bends -> a parallel offset step).
+    "sm_hem": {"params": [], "refs": {"edge": (_SEL_OR_DATUM, True)}},
+    "sm_jog": {"params": [], "refs": {"edge": (_SEL_OR_DATUM, True)}},
     # Flat pattern (unfold) — operates on the running sheet-metal body + stored bend records.
     "sm_flat_pattern": {"params": [], "refs": {}},
     # Weldments — sweep a structural profile along sketch segments → members + cut-list data.

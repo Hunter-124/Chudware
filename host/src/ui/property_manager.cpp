@@ -1020,6 +1020,8 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
     else if (t == "boolean") needWell = "targets";   // need at least one target body
     else if (t == "sm_base_flange") needWell = "profile";  // sheet-metal base needs a sketch region
     else if (t == "sm_edge_flange") needWell = "edge";     // sheet-metal edge flange needs a bend edge
+    else if (t == "sm_hem")         needWell = "edge";     // hem needs a bend edge
+    else if (t == "sm_jog")         needWell = "edge";     // jog needs a bend edge
     else if (t == "axis")    needWell = "a";          // datum axis primary reference
     else if (t == "point")   needWell = "target";     // datum point reference
     if (needWell) {

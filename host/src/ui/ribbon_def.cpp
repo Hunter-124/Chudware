@@ -233,6 +233,10 @@ static const RibbonCmd kCmds[] = {
     // --- Group: Create ---
     { "sm_base_flange",      "Base Flange",     "extrude_boss",     "Sheet Metal", "Create",      true,  nullptr,          false },
     { "sm_edge_flange",      "Edge Flange",     "shell",            "Sheet Metal", "Create",      true,  nullptr,          false },
+    // Hem (fold an edge back on itself) + Jog (two bends -> a parallel offset step). cmd_id ==
+    // engine feature type (pmFormForCommand routes straight through). Icons reuse shell/extrude_boss.
+    { "sm_hem",              "Hem",             "shell",            "Sheet Metal", "Create",      true,  nullptr,          false },
+    { "sm_jog",              "Jog",             "extrude_boss",     "Sheet Metal", "Create",      true,  nullptr,          false },
     // W16: one-click Flatten — adds the param-less sm_flat_pattern feature (handled in app.cpp).
     { "sm_flat_pattern",     "Flatten",         "shell",            "Sheet Metal", "Flat Pattern",true,  nullptr,          false },
     // W14: export the flat pattern (outline on layer OUTLINE + bend lines on layer BEND) to DXF.

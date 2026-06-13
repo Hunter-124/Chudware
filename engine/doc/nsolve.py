@@ -105,6 +105,12 @@ class Result:
     converged: bool
     iterations: int
     max_residual: float
+    # True iff the solve stopped because its wall-clock `time_budget_ms` elapsed
+    # before converging (the interactive drag fast-path). Distinguishes a budget
+    # cutoff — where another warm iteration would likely converge — from a genuine
+    # non-convergence (conflict / singular config). `x` is always the best finite
+    # iterate either way. Defaults False so existing constructors are unaffected.
+    budget_exceeded: bool = False
 
 
 @dataclass
@@ -336,7 +342,9 @@ class System:
         if not self._has_soft:
             asm = self._assembler(self._blocks, self._n_rows)
             x, it1, maxr = self._lm(x, asm, tol, max_iter, deadline)
-            return Result(x=x, converged=maxr <= tol, iterations=it1, max_residual=maxr)
+            conv = maxr <= tol
+            return Result(x=x, converged=conv, iterations=it1, max_residual=maxr,
+                          budget_exceeded=_budget_hit(deadline, conv))
 
         return self._drag_solve(x, tol, max_iter, deadline)
 
@@ -349,13 +357,26 @@ class System:
     ) -> Result:
         """Constrained drag: minimize the soft objective s.t. the hard constraints.
 
-        Null-space projected descent. Each outer step (a) projects x onto the hard
-        manifold with a few Newton steps, then (b) takes a damped step along the
-        soft objective's gradient *projected into the tangent space* of the hard
-        constraints (P = I - J^+ J), so it slides along the manifold toward the
-        cursor without leaving it. A final hard projection guarantees exact
-        constraint satisfaction. Soft weights set the relative pull of competing
-        drag targets; they do not trade off against hard constraints.
+        Sequential equality-constrained least squares (the SolidWorks drag-to-flex
+        behavior). Each outer step (a) projects x onto the hard manifold with a few
+        Newton steps, then (b) takes the step `s` that moves the soft (dragged) vars
+        toward the cursor as far as the *linearized* hard constraints allow:
+
+            minimize ½‖s − g‖²_W   s.t.   J_h · s = 0      (g = desired displacement)
+
+        whose KKT solution is `s = g − W⁻¹ J_hᵀ λ` with `(J_h W⁻¹ J_hᵀ) λ = J_h g`.
+        Dragged vars carry weight `w` (small); every other var carries a tiny weight
+        so free DOF follow the drag and the step stays well posed. The normal matrix
+        `M = J_h W⁻¹ J_hᵀ` is m×m (one row per hard residual) and assembled SPARSELY —
+        no dense `pinv` of the full Jacobian — which is what keeps a ~200-unknown warm
+        drag inside the interactive budget. A manifold line search re-projects each
+        trial step so the hard constraints stay satisfied EXACTLY (the soft term never
+        trades off against a real constraint), and a final projection guarantees it.
+
+        Convergence is reported on the HARD residual only: the soft target is a drag
+        aid, not a constraint. On a `deadline` (drag budget) or a non-improving step
+        the loop stops and returns the best hard-feasible iterate seen — always finite,
+        never garbage (the last-good fallback the interactive UI relies on).
         """
         hard_blocks = [b for b in self._blocks if not b.soft]
         soft_blocks = [b for b in self._blocks if b.soft]
@@ -373,63 +394,96 @@ class System:
             s = np.sqrt(b.weight)
             soft_t[i] = -float(b.rfunc(np.array([0.0]))[0]) / s
 
-        total_it = 0
-        for _ in range(max_iter):
-            # (a) project onto the hard manifold.
-            x, it_h, hard_maxr = self._lm(x, hard_asm, tol, 20, deadline)
-            total_it += it_h
+        # Per-variable inverse weight for the constrained-LS step. Soft (dragged)
+        # vars use 1/w; a small free-var regularization makes the step unique and
+        # lets undriven DOF flow with the drag (W⁻¹ large = nearly unconstrained).
+        # When two targets pin the same var, their weights add (matches the old
+        # weighted-average pull).
+        free_w = 1e-6
+        wsum = np.full(self.n_vars, free_w, dtype=np.float64)
+        np.add.at(wsum, soft_idx, soft_w)
+        winv = 1.0 / wsum
+        winv_diag = sp.diags(winv)
+        # Desired absolute position: dragged vars want the cursor, everything else
+        # wants to stay put (so the free regularization pulls toward the current x).
+        n_eye = np.eye(hard_rows) if hard_rows else None
 
+        def _soft_cost(xv: np.ndarray) -> float:
+            return float(np.sum(soft_w * (xv[soft_idx] - soft_t) ** 2))
+
+        # First projection onto the hard manifold; this is the baseline best.
+        x, total_it, hard_maxr = self._lm(x, hard_asm, tol, 20, deadline)
+        best_x = x.copy()
+        best_maxr = hard_maxr
+        best_cost = _soft_cost(x)
+
+        for _ in range(max_iter):
             if deadline is not None and time.perf_counter() >= deadline:
                 break
-
-            # (b) tangential soft step. The Newton step toward the soft minimum of
-            # 0.5*sum w*(x_i - t_i)^2 is (t_i - x_i) on each soft var (the weight
-            # cancels in the per-target Newton scaling); relative weights still bias
-            # which target wins when two pull the same DOF. Project that desired
-            # displacement into the tangent space of the hard constraints (P d) so
-            # the move stays on the manifold.
-            d = np.zeros(self.n_vars, dtype=np.float64)
-            # weighted average pull per variable (handles >1 target on one var)
-            wsum = np.zeros(self.n_vars, dtype=np.float64)
-            np.add.at(wsum, soft_idx, soft_w)
-            np.add.at(d, soft_idx, soft_w * (soft_t - x[soft_idx]))
-            nz = wsum > 0
-            d[nz] /= wsum[nz]
-            if np.max(np.abs(d)) < 1e-12:
-                break
-            J = hard_asm.jacobian(x).toarray()
-            if J.size:
-                Jp = np.linalg.pinv(J)
-                d = d - Jp @ (J @ d)        # tangent-space projection (P d)
-            if np.max(np.abs(d)) < 1e-12:
+            if hard_rows == 0:
+                # No hard constraints: the soft minimum is just the targets.
+                x = x.copy()
+                x[soft_idx] = soft_t
+                best_x, best_maxr = x.copy(), 0.0
                 break
 
-            # Damped tangential move: a full Newton step overshoots a curved
-            # manifold, so backtrack until the soft objective actually decreases
-            # (after re-projecting to the manifold). This is a manifold line search.
-            f0 = float(np.sum(soft_w * (x[soft_idx] - soft_t) ** 2))
+            # Desired displacement g: move dragged vars toward the cursor; free vars
+            # stay (g = 0 there, up to the regularization).
+            tvec = x.copy()
+            tvec[soft_idx] = soft_t
+            g = tvec - x
+            if np.max(np.abs(g)) < 1e-12:
+                break
+
+            Jh = hard_asm.jacobian(x)                       # sparse (m, n)
+            # KKT-Schur: (Jh W⁻¹ Jhᵀ) λ = Jh g ;  s = g − W⁻¹ Jhᵀ λ.
+            M = (Jh @ winv_diag @ Jh.T).toarray()
+            rhs = Jh @ g
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", sla.LinAlgWarning)
+                    lam = sla.solve(M + 1e-12 * n_eye, rhs, assume_a="sym")
+            except (np.linalg.LinAlgError, sla.LinAlgError, sla.LinAlgWarning, ValueError):
+                lam, *_ = np.linalg.lstsq(M, rhs, rcond=None)
+            s = g - winv * (Jh.T @ lam)
+            if not np.all(np.isfinite(s)) or np.max(np.abs(s)) < 1e-12:
+                break
+
+            # Manifold line search: take the step, re-project onto the hard
+            # manifold, accept only if the soft objective improves. A warm drag
+            # accepts alpha=1 on the first try; a curved manifold backtracks.
+            f0 = _soft_cost(x)
             alpha = 1.0
             advanced = False
             for _ in range(20):
-                x_try = x + alpha * d
+                x_try = x + alpha * s
                 if not np.all(np.isfinite(x_try)):
                     alpha *= 0.5
                     continue
-                x_try, _, _ = self._lm(x_try, hard_asm, tol, 20, deadline)
-                f1 = float(np.sum(soft_w * (x_try[soft_idx] - soft_t) ** 2))
+                x_try, it_p, maxr_try = self._lm(x_try, hard_asm, tol, 20, deadline)
+                total_it += it_p
+                f1 = _soft_cost(x_try)
                 if f1 < f0 - 1e-15:
                     x = x_try
+                    hard_maxr = maxr_try
                     advanced = True
+                    if maxr_try <= best_maxr and f1 <= best_cost:
+                        best_x, best_maxr, best_cost = x.copy(), maxr_try, f1
                     break
                 alpha *= 0.5
             if not advanced:
                 break
 
-        # Final exact projection onto the hard constraints.
+        # Final exact projection onto the hard constraints (cheap when warm).
         x, it_f, hard_maxr = self._lm(x, hard_asm, tol, max_iter, deadline)
         total_it += it_f
+        # Guard: never emit non-finite or a worse-than-baseline hard residual.
+        if not np.all(np.isfinite(x)) or hard_maxr > best_maxr + 1e-9:
+            x, hard_maxr = best_x, best_maxr
+        conv = hard_maxr <= tol
         return Result(
-            x=x, converged=hard_maxr <= tol, iterations=total_it, max_residual=hard_maxr
+            x=x, converged=conv, iterations=total_it, max_residual=hard_maxr,
+            budget_exceeded=_budget_hit(deadline, conv),
         )
 
     def _lm(
@@ -618,6 +672,16 @@ class System:
 
 
 # -- module-level numeric helpers ---------------------------------------------
+
+
+def _budget_hit(deadline: Optional[float], converged: bool) -> bool:
+    """True iff a wall-clock `deadline` was set, not converged, and the clock is past it.
+
+    Lets a caller distinguish a drag that ran out of its interactive time budget (where
+    one more warm step would likely converge) from a genuinely non-convergent system
+    (conflict / singular). Cheap and side-effect free.
+    """
+    return deadline is not None and (not converged) and time.perf_counter() >= deadline
 
 
 def _tag_key(tag: object) -> object:

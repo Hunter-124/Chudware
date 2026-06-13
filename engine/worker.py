@@ -689,6 +689,12 @@ from engine.doc import formats as _formats  # noqa: E402
 
 _METHODS.update(_formats.WORKER_METHODS)
 
+# Instant3D push-pull (drag-a-face-to-edit). Registered via its own WORKER_METHODS dict so the
+# literal above stays owned by the worker integrator.
+from engine.doc import instant3d as _instant3d  # noqa: E402
+
+_METHODS.update(_instant3d.WORKER_METHODS)
+
 # C22a orchestrator (M9) — registered via update so the shared _METHODS dict literal stays owned by
 # the worker integrator. agent_run_v2/agent_cancel/get_prompts_v2 keep the LEGACY plain-string error
 # shape (they are not in _STRUCTURED_ERROR_METHODS), matching agent_design.
@@ -713,6 +719,7 @@ _STRUCTURED_ERROR_METHODS = {
     "eval_symmetry", "eval_draft", "eval_thickness", "eval_curvature",
     "doc_export_step", "doc_face_points",  # C19
     "import_file", "export_file",  # C21
+    "doc_push_pull",  # Instant3D push-pull (drag a face)
 }
 
 # ---- ask mode (Wave D) — registered via update/add so the literals above stay frozen ----

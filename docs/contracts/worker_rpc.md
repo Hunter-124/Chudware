@@ -38,6 +38,7 @@ max_iters?, plan?}` · `get_prompts` · `shutdown`
 | `doc_resolve_pick` | `{doc_id, revision, body_id, kind: "face"\|"edge"\|"vertex"\|"body", topo_id}` → `{selector}` (errors `stale_revision` if revision moved) |
 | `doc_checkpoint` | `{doc_id}` → `{checkpoint: "<id>"}` — deep-snapshot the current doc (PropertyManager-cancel). Multiple live checkpoints allowed; all cleared on doc close/new/open |
 | `doc_revert` | `{doc_id, checkpoint}` → ops-response — restore the snapshot, rebuild, bump revision, and push ONE undo entry (a single `doc_undo` after a revert returns to the pre-revert state). Reverting when the doc already equals the snapshot is a cheap no-op but still returns the full response. `invalid_op` on an unknown checkpoint id |
+| `doc_push_pull` | `{doc_id, body_id, topo_id, distance, commit?}` → push-pull response (Instant3D, §2.1) — drag a planar/cylindrical FACE by a signed `distance` (mm along the face outward normal); resolves the face's owning feature + the single drivable param, edits it, rebuilds. `commit:false` (default) = transient preview (no undo entry); `commit:true` = ONE undo entry. A face mapping to no single param returns `{ok:true, draggable:false, reason}` with NO doc mutation |
 
 **`owner_map` (ops-response + `doc_tree`, C35-overhaul).** The compiler's per-feature topology
 ownership, keyed by the feature id that created each face/edge. Ids are the **integer pick ids** the
@@ -59,6 +60,56 @@ coincident faces that may be re-attributed to the triggering feature (selectors.
 `rolled_back: bool`. A feature **after** the rollback bar (doc `rollback_after`) is not compiled and
 reports `{ok: true, rolled_back: true, error: null}` — distinct from an error (no error icon); the
 geometry reflects only the prefix through the bar.
+
+#### 2.1 `doc_push_pull` (Instant3D — drag a face to change the model)
+
+Request `{doc_id, body_id, topo_id, distance, commit?}`:
+- `body_id` — 1-based body ordinal (the host PickHit / AICM body id).
+- `topo_id` — 1-based TopExp **face** index (same index `doc_resolve_pick` uses for `kind:"face"`).
+- `distance` — mm, **signed along the face's outward normal**. Positive grows the body (push out),
+  negative shrinks it (pull in).
+- `commit` — `false` (default) = transient preview, pushes NOTHING onto the undo stack; `true` =
+  pushes EXACTLY ONE undo entry (a single `doc_undo` after release returns to the pre-drag state).
+
+Response (draggable face) — the full ops-response (`revision`/`id_map`/`tree`/`rebuild`/`tess`/
+`owner_map`, so the host viewport updates exactly like a normal edit) PLUS:
+
+```json
+{"ok": true, "draggable": true,
+ "feature_id": "f1", "feature_type": "box", "param": "height", "axis": "z",
+ "old_value": 20.0, "new_value": 25.0, "distance": 5.0,
+ "clamped": false, "committed": true, "revision": 3, "tess": {…}, …}
+```
+
+Response (non-draggable face — **no doc mutation**): `{ok:true, draggable:false, reason, feature_id?,
+feature_type?}`.
+
+**Face → drivable-param map (implemented).** The face is resolved to a `TopoInfo` (surf/axis/
+centroid) and its owning feature via `owner_map`:
+
+| owner feature | face | param | direction |
+|---|---|---|---|
+| `box` | planar, normal ∥ a principal axis | `length`/`width`/`height` (by axis) | `+= distance` |
+| `extrude` (`end:"blind"`) | planar **cap** (normal ∥ extrude/sketch axis) | `depth` | `+= distance` (both caps grow on outward drag) |
+| `extrude` | planar **side wall** (normal ⊥ extrude axis) | — | **draggable:false** |
+| `extrude` (`end` != `blind`) | any | — | **draggable:false** (no single blind-depth param) |
+| `cylinder` | cylindrical wall | `radius` | `+= distance` (radial) |
+| `cylinder`/`cone` | planar cap | `height` | `+= distance` (axial) |
+| `hole` (`standard:"custom"`) | cylindrical bore | `diameter` | `+= 2·distance` (radial doubles the diameter) |
+| `hole` (standard table) | bore | — | **draggable:false** (bore driven by the standard) |
+| offset/midplane `plane` datum | the moved plane | `offset` | `+= distance` |
+| `revolve` / `sphere` / `cone` round wall / sweep / loft / bspline | any | — | **draggable:false** (angle-/profile-driven; no single linear param) |
+| any param that is **expression-driven** (`expr`) | — | — | **draggable:false** (edit the equation) |
+
+New length/radius/depth/diameter values clamp to a `0.1 mm` floor (`clamped:true`) so a drag can
+never invert or collapse the body.
+
+**Transient-preview vs commit (host envelope).** For a live drag the host: (1) `doc_checkpoint`
+at drag start; (2) per drag sample, `doc_revert` to the checkpoint then
+`doc_push_pull(commit:false)` for the CURRENT cumulative distance — so previews never compound and
+a cancel is a single `doc_revert`; (3) on release, `doc_revert` to the checkpoint then ONE
+`doc_push_pull(commit:true)`, which is the single undoable step. A degenerate/failed rebuild rolls
+the document fully back and returns `draggable:false` with a reason (never corrupts the doc).
 
 ### Sketch interaction (M2)
 | method | params → result |

@@ -45,6 +45,8 @@
 #include "ui/status_bar.h"
 #include "ui/title_bar.h"
 #include "ui/viewport_panel.h"
+#include "ui/ecad/ecad_panel.h"   // Wave N: AI-ECAD 2D editor
+#include "ui/ecad/ecad_mirror.h"  // Wave N: complete type for EcadMirror::setDocId
 #include "ui/icons.h"
 #include "ui/widgets/ribbon.h"
 #include "ui/ribbon_def.h"
@@ -64,6 +66,102 @@
 #include "ui/asm_panels.h"
 // --- end C20b ---
 #include "ui/scenarios.h"  // scripted screenshot/test scenarios (m1/sketch/asm/fea/evalmass/activity)
+
+#include <filesystem>      // Wave N: ecad export output dir
+
+// =====================================================================================
+// Wave N: AI-ECAD GUI command wiring. Creates/routes ECAD documents through the worker
+// ecad_* RPCs (engine/ecad/rpc.py) and feeds the {revision,kind,tree,compile} responses into
+// the editor mirror — the same discipline core/doc_mirror.cpp uses for the CAD doc_* methods.
+// See docs/ECAD_UI_INTEGRATION.md §(e). New docs + doc-scoped analysis/exports are live;
+// geometry-placing ops (sch_add_symbol, pcb_add_track, ...) still need canvas-click placement.
+// =====================================================================================
+namespace {
+
+// Feed a worker ECAD ops-response into the editor mirror; track doc id + revision.
+void ecadAdopt(AppState& st, const nlohmann::json& res) {
+    const std::string id = jstr(res, "doc_id");
+    if (!id.empty()) st.ecadDocId = id;
+    st.ecadRevision = jint(res, "revision");
+    if (!st.ecadDocId.empty()) ui::ecadEditorMirror().setDocId(st.ecadDocId);
+    ui::ecadEditorLoadResponse(res);
+}
+
+// Blocking ECAD RPC; toasts on transport or {code,message} error. Returns false on failure.
+bool ecadCall(AppState& st, const char* method, const nlohmann::json& params, nlohmann::json& res) {
+    std::string err;
+    if (!st.worker.call(method, params, res, err)) {
+        st.toast(ui::ToastLevel::Error, std::string("ECAD ") + method + ": " + err);
+        return false;
+    }
+    if (res.is_object() && res.contains("code")) {
+        st.toast(ui::ToastLevel::Error, "ECAD: " + jstr(res, "message"));
+        return false;
+    }
+    return true;
+}
+
+void ecadNewDoc(AppState& st, const char* kind) {
+    nlohmann::json res;
+    if (!ecadCall(st, "ecad_new", {{"kind", kind}}, res)) return;
+    ecadAdopt(st, res);
+    st.addLog(std::string("[ecad] new ") + kind + " doc " + st.ecadDocId);
+    st.toast(ui::ToastLevel::Info,
+             std::string("New ECAD ") + (std::string(kind) == "sch" ? "schematic" : "board"));
+    ImGui::SetWindowFocus("ECAD");   // bring the editor tab forward
+}
+
+// A doc-scoped RPC that returns an ops-response (rebuild / autoroute / fill_zones) -> refresh.
+void ecadDocRpc(AppState& st, const char* method, const char* okMsg) {
+    if (st.ecadDocId.empty()) { st.toast(ui::ToastLevel::Warn, "Open an ECAD document first"); return; }
+    nlohmann::json res;
+    if (!ecadCall(st, method, {{"doc_id", st.ecadDocId}}, res)) return;
+    ecadAdopt(st, res);
+    if (okMsg) st.toast(ui::ToastLevel::Info, okMsg);
+}
+
+void ecadExport(AppState& st, const char* kind) {
+    if (st.ecadDocId.empty()) { st.toast(ui::ToastLevel::Warn, "Open an ECAD document first"); return; }
+    std::error_code ec;
+    const std::string dir = appdataDir() + "\\AI-CAD\\ecad_out";
+    std::filesystem::create_directories(dir, ec);
+    nlohmann::json res;
+    if (!ecadCall(st, "ecad_export", {{"doc_id", st.ecadDocId}, {"kind", kind}, {"path", dir}}, res))
+        return;
+    st.toast(ui::ToastLevel::Info, std::string("Exported ") + kind + " -> ecad_out");
+    st.addLog("[ecad] export " + std::string(kind) + " -> " + dir);
+}
+
+void ecadTo3d(AppState& st) {
+    if (st.ecadDocId.empty()) { st.toast(ui::ToastLevel::Warn, "Open an ECAD board first"); return; }
+    std::error_code ec;
+    const std::string dir = appdataDir() + "\\AI-CAD\\ecad_out";
+    std::filesystem::create_directories(dir, ec);
+    nlohmann::json res;
+    if (!ecadCall(st, "ecad_to_3d", {{"doc_id", st.ecadDocId}, {"path", dir + "\\board.step"}}, res))
+        return;
+    st.toast(ui::ToastLevel::Info, "Board exported to STEP (open it in CAD to design a housing)");
+    st.addLog("[ecad] to_3d -> " + jstr(res, "step_path"));
+}
+
+// Route a PCB-tab ribbon command. New docs + doc-scoped analysis/exports run now; geometry-placing
+// ops need canvas-click placement / a PM form (logged so they stay observable).
+void ecadDispatch(AppState& st, const std::string& cmd) {
+    if (cmd == "ecad_new_sch")       { ecadNewDoc(st, "sch"); return; }
+    if (cmd == "ecad_new_pcb")       { ecadNewDoc(st, "pcb"); return; }
+    if (cmd == "ecad_run_erc")       { ecadDocRpc(st, "ecad_rebuild", "ERC updated"); return; }
+    if (cmd == "ecad_run_drc")       { ecadDocRpc(st, "ecad_rebuild", "DRC updated"); return; }
+    if (cmd == "ecad_autoroute")     { ecadDocRpc(st, "ecad_autoroute", "Autoroute complete"); return; }
+    if (cmd == "ecad_fill_zones")    { ecadDocRpc(st, "ecad_fill_zones", "Copper zones filled"); return; }
+    if (cmd == "ecad_to_3d")         { ecadTo3d(st); return; }
+    if (cmd == "ecad_export_gerber") { ecadExport(st, "gerber"); return; }
+    if (cmd == "ecad_export_drill")  { ecadExport(st, "drill"); return; }
+    if (cmd == "ecad_export_bom")    { ecadExport(st, "bom"); return; }
+    st.addLog("[ecad] " + cmd + " (interactive placement pending)");
+    st.toast(ui::ToastLevel::Info, "ECAD: place/edit on the canvas (interactive tools coming)");
+}
+
+}  // namespace
 
 int run_gui(const char* screenshotPath) {
     const bool shot = screenshotPath != nullptr;
@@ -217,6 +315,13 @@ int run_gui(const char* screenshotPath) {
             if ((cmd.rfind("asm_", 0) == 0 || cmd == "new_assembly") &&
                 asmPanels.handleCommand(st, cmd)) return;
         }
+        // Wave N: AI-ECAD commands (ecad_/sch_/pcb_) route to the ECAD editor.
+        {
+            std::string ec(cmd_id);
+            if (ec.rfind("ecad_", 0) == 0 || ec.rfind("sch_", 0) == 0 || ec.rfind("pcb_", 0) == 0) {
+                ecadDispatch(st, ec); return;
+            }
+        }
         if (propertyManager.openForCommand(st, cmd_id)) return;  // form opened
         // C19: Simulation tab -> sim panel; Evaluate tab -> evaluate dialogs.
         std::string cmd(cmd_id);
@@ -237,6 +342,13 @@ int run_gui(const char* screenshotPath) {
             std::string cmd(cmd_id);
             if ((cmd.rfind("asm_", 0) == 0 || cmd == "new_assembly") &&
                 asmPanels.handleCommand(st, cmd)) return;
+        }
+        // Wave N: AI-ECAD commands (ecad_/sch_/pcb_) route to the ECAD editor.
+        {
+            std::string ec(cmd_id);
+            if (ec.rfind("ecad_", 0) == 0 || ec.rfind("sch_", 0) == 0 || ec.rfind("pcb_", 0) == 0) {
+                ecadDispatch(st, ec); return;
+            }
         }
         if (propertyManager.openForCommand(st, cmd_id)) return;
         std::string cmd(cmd_id);
@@ -1060,6 +1172,7 @@ int run_gui(const char* screenshotPath) {
         // unreachable because only the in-pane tab hosted drawBody.
         activityPanel.draw(st);
         ui::drawViewportPanel(st, io, busy);
+        ui::drawEcadEditor(st);   // Wave N: AI-ECAD 2D editor (empty-state until an ECAD doc loads)
 
         // ---------- C19: simulation panel + evaluate dialogs ----------
         simPanel.tick(st);          // drain SimClient progress + completion (loads overlays)

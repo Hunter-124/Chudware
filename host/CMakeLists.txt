@@ -90,6 +90,11 @@ add_executable(AI-CAD
   # --- C22b: Activity panel + prompt editor + orchestrator wiring ---
   src/ui/activity_panel.cpp
   # --- end C22b ---
+  # --- Wave N: AI-ECAD 2D GUI (schematic / PCB editor) ---
+  src/ui/ecad/ecad_mirror.cpp
+  src/ui/ecad/ecad_canvas.cpp
+  src/ui/ecad/ecad_panel.cpp
+  # --- end Wave N ---
   # --- C25: mouse gesture wheel + S shortcut bar ---
   src/ui/mouse_gestures.cpp
   src/ui/camera_anim.cpp   # C25 W2-D: eased camera tween (presets / Normal-To / zoom-to-fit)

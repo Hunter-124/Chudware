@@ -266,7 +266,13 @@ struct AppState {
     // ---- document mirror (C16) — worker-backed document state ----
     core::DocMirror docMirror;
     bool wantTree = false;   // AI_CAD_SHOT=tree: scripted doc-smoke flow + screenshot
-    bool treeShotDone = false; // guard so doc smoke runs exactly once per shot
+    bool treeShotDone = false; // guard so doc smoke runs exactly once
+
+    // ---- Wave N: AI-ECAD document (worker ecad_* RPCs; the editor mirror lives in ecad_panel.cpp) ----
+    std::string ecadDocId;          // open ECAD doc id ("" = none)
+    int         ecadRevision = -1;  // last known ECAD revision (optimistic-concurrency base)
+    bool        wantEcad = false;   // AI_CAD_SHOT=ecad scripted scenario
+    bool        ecadShotDone = false;
 
     // ---- topology picking (C15) — id pass + overlays owned by run_gui; AppState borrows ----
     render::IdPass* idPass = nullptr;

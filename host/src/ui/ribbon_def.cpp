@@ -214,6 +214,39 @@ static const RibbonCmd kCmds[] = {
     { "sk_parabola",         "Parabola",        "parabola",         "Sketch", "Draw", false, "sk_ellipse_big", false },
     { "sk_conic",            "Conic",           "conic",            "Sketch", "Draw", false, "sk_ellipse_big", false },
 
+    // =========================================================================
+    // Tab: PCB  (Wave N — AI-ECAD electrical design: schematic capture, PCB layout, sim)
+    // =========================================================================
+
+    // --- Group: New ---
+    { "ecad_new_sch",       "Schematic",      "sketch",          "PCB", "New",        true,  nullptr, false },
+    { "ecad_new_pcb",       "PCB Layout",     "extrude_boss",    "PCB", "New",        true,  nullptr, false },
+    { "ecad_open",          "Open",           "ref_plane",       "PCB", "New",        false, nullptr, false },
+
+    // --- Group: Schematic ---
+    { "sch_add_symbol",     "Place Symbol",   "point_ent",       "PCB", "Schematic",  true,  nullptr, false },
+    { "sch_add_wire",       "Wire",           "line",            "PCB", "Schematic",  false, nullptr, false },
+    { "sch_add_label",      "Net Label",      "text_ent",        "PCB", "Schematic",  false, nullptr, false },
+    { "sch_add_power",      "Power Port",     "construction",    "PCB", "Schematic",  false, nullptr, false },
+    { "sch_annotate",       "Annotate",       "ok_check",        "PCB", "Schematic",  false, nullptr, false },
+    { "ecad_run_erc",       "Run ERC",        "interference",    "PCB", "Schematic",  false, nullptr, false },
+
+    // --- Group: Board ---
+    { "pcb_update_from_sch","Update Board",   "ok_check",        "PCB", "Board",      true,  nullptr, false },
+    { "pcb_add_footprint",  "Footprint",      "point_ent",       "PCB", "Board",      false, nullptr, false },
+    { "pcb_add_track",      "Route",          "line",            "PCB", "Board",      false, nullptr, false },
+    { "pcb_add_via",        "Via",            "circle",          "PCB", "Board",      false, nullptr, false },
+    { "pcb_add_zone",       "Copper Zone",    "rect_center",     "PCB", "Board",      false, nullptr, false },
+    { "ecad_autoroute",     "Autoroute",      "sweep",           "PCB", "Board",      true,  nullptr, false },
+    { "ecad_fill_zones",    "Fill Zones",     "shell",           "PCB", "Board",      false, nullptr, false },
+    { "ecad_run_drc",       "Run DRC",        "interference",    "PCB", "Board",      false, nullptr, false },
+
+    // --- Group: Outputs ---
+    { "ecad_to_3d",         "Board to 3D",    "extrude_boss",    "PCB", "Outputs",    true,  nullptr, false },
+    { "ecad_export_gerber", "Gerbers",        "ref_plane",       "PCB", "Outputs",    false, nullptr, false },
+    { "ecad_export_drill",  "Drill",          "hole_wizard",     "PCB", "Outputs",    false, nullptr, false },
+    { "ecad_export_bom",    "BOM",            "bom",             "PCB", "Outputs",    false, nullptr, false },
+
 };
 // clang-format on
 

@@ -94,6 +94,9 @@ static const RibbonCmd kCmds[] = {
     { "sk_trim",           "Trim",           "trim",            "Sketch",   "Sketch Tools",    true,  nullptr,          false },
     { "sk_extend",         "Extend",         "extend",          "Sketch",   "Sketch Tools",    true,  nullptr,          false },
     { "sk_offset_ent",     "Offset",         "offset_ent",      "Sketch",   "Sketch Tools",    true,  nullptr,          false },
+    // C52: line-line corner fillet / chamfer (engine ops sketch_fillet / sketch_chamfer).
+    { "sk_fillet",         "Sk. Fillet",     "fillet",          "Sketch",   "Sketch Tools",    false, nullptr,          false },
+    { "sk_chamfer",        "Sk. Chamfer",    "chamfer",         "Sketch",   "Sketch Tools",    false, nullptr,          false },
     // C42 honesty: convert/mirror/patterns/move have no SketchMode handler (engine ops still
     // schema-reserved _op_unsupported_m2) — greyed (Coming soon) instead of eating clicks.
     { "sk_convert_ent",    "Convert",        "convert_ent",     "Sketch",   "Sketch Tools",    true,  nullptr,          true  },

@@ -37,6 +37,8 @@ enum class SketchTool {
     EllipsePartial, Parabola, Conic,
     // C29-B sketch-editing tools (engine contract C29-A: sketch_trim/extend/offset ops):
     Trim, Extend, Offset,
+    // C52 sketch corner tools (engine ops sketch_fillet / sketch_chamfer; line-line corners):
+    SkFillet, SkChamfer,
     // C42: remaining draw tools (3-pt arc, polygon, center rect, point, ellipse, spline):
     Arc3pt, Polygon, RectCenter, Point, Ellipse, Spline
 };
@@ -505,6 +507,18 @@ private:
     float offsetDist_ = 10.0f;
     ImVec2 offsetOverlayPos_{0, 0};
     bool offsetFocusInput_ = false;   // request keyboard focus on the distance field next frame
+
+    // ---- C52 Sketch Fillet / Chamfer state (line-line corners; engine sketch_fillet/chamfer) ----
+    // Both tools pick two lines in turn. corner1Id_ holds the first picked line ("" = none yet);
+    // the second pick builds the op and applies it. radius/distance persist across corners and
+    // across invocations within the session (SolidWorks remembers the last value). They stay armed
+    // for another corner after each success; Esc clears the first pick (or exits if none held).
+    std::string corner1Id_;           // first picked line id ("" = waiting for line 1)
+    float skFilletRadius_ = 3.0f;     // mm, persisted
+    float skChamferDist_ = 3.0f;      // mm, persisted
+    // Apply one sketch_fillet/chamfer op (e1=corner1Id_, e2=line2) and refresh. On engine OpError
+    // the message is toasted, the sketch is untouched, and corner1Id_ is reset (pick a fresh pair).
+    void applyCornerOp(AppState& st, const std::string& line2);
 
     // ---- C37-D Smart Dimension state machine ----
     // Pick buffer (separate from toolUV_): points/entities collected for the next dimension.

@@ -920,6 +920,9 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sk_extend")          { resetTool(); tool_ = SketchTool::Extend;         return true; }
     if (cmdId == "sk_offset_ent")      { resetTool(); tool_ = SketchTool::Offset;
                                          offsetStage_ = 0; offsetChain_.clear();           return true; }
+    // C52: line-line corner fillet / chamfer (radius/distance persist across invocations).
+    if (cmdId == "sk_fillet")          { resetTool(); tool_ = SketchTool::SkFillet;  corner1Id_.clear(); return true; }
+    if (cmdId == "sk_chamfer")         { resetTool(); tool_ = SketchTool::SkChamfer; corner1Id_.clear(); return true; }
     // C42: remaining draw tools.
     if (cmdId == "sk_arc_3pt")         { resetTool(); tool_ = SketchTool::Arc3pt;         return true; }
     if (cmdId == "sk_polygon")         { resetTool(); tool_ = SketchTool::Polygon;        return true; }
@@ -986,6 +989,8 @@ const char* SketchMode::activeToolCmd() const {
         case SketchTool::Trim:            return "sk_trim";
         case SketchTool::Extend:          return "sk_extend";
         case SketchTool::Offset:          return "sk_offset_ent";
+        case SketchTool::SkFillet:        return "sk_fillet";
+        case SketchTool::SkChamfer:       return "sk_chamfer";
         case SketchTool::Arc3pt:          return "sk_arc_3pt";
         case SketchTool::Polygon:         return "sk_polygon";
         case SketchTool::RectCenter:      return "sk_rect_center";
@@ -1010,6 +1015,7 @@ void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSn
                                selRelIds_.clear(); hoverRelCid_.clear();
                                relPopupOpen_ = false; relIds_.clear();   // C42: relation popup too
                                offsetStage_ = 0; offsetChain_.clear(); offsetFocusInput_ = false;
+                               corner1Id_.clear();   // C52: drop a held first corner pick (keep radius/distance)
                                // C37-D: clear the Smart Dimension state machine.
                                dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr;
                                dimType_.clear(); dimAxis_.clear(); dimEditCid_.clear();
@@ -1018,6 +1024,34 @@ void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSn
                                editOverDefOpen_ = false; editOverDefOp_ = nullptr;   // C50f: edit-path over-define dialog
                                relOverDefOpen_ = false; relOverDefOps_ = nullptr; relOverDefLabel_.clear(); }   // C50g
 void SketchMode::cancelTool() { resetTool(); }
+
+// C52: apply one sketch_fillet / sketch_chamfer op for the held corner (e1=corner1Id_, e2=line2).
+// The engine round-trips like every other sketch-editing op (applyOps -> loadDocMesh -> resolve).
+// On an OpError (unsupported_entity / fillet_failed / chamfer_failed / invalid_op) the sketch is
+// NOT mutated; we toast the engine message and reset the first pick so the user starts a fresh
+// pair. On success the new arc/line appears and the sketch re-solves; we stay armed for the next
+// corner (SolidWorks keeps filleting until Esc).
+void SketchMode::applyCornerOp(AppState& st, const std::string& line2) {
+    const bool fillet = (tool_ == SketchTool::SkFillet);
+    nlohmann::json op = {{"op", fillet ? "sketch_fillet" : "sketch_chamfer"},
+                         {"sketch", fid_}, {"e1", corner1Id_}, {"e2", line2}};
+    if (fillet) op["radius"]   = skFilletRadius_;
+    else        op["distance"] = skChamferDist_;
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (!r.ok) {
+        // Engine refused (bad corner / unsupported entity): surface the message, keep tool armed.
+        std::string msg = r.error_message.empty()
+            ? std::string(fillet ? "Sketch fillet failed" : "Sketch chamfer failed")
+            : r.error_message;
+        st.addLog(std::string("[sketch] ") + (fillet ? "fillet" : "chamfer") + " failed: " + msg);
+        st.toast(ui::ToastLevel::Warn, msg);
+        corner1Id_.clear();   // start a fresh pair (match Offset's reset-on-error UX)
+        return;
+    }
+    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    resolve(st);              // refresh entities/statuses (same path as trim/extend/offset)
+    corner1Id_.clear();       // ready for the next corner; stay in the tool
+}
 
 void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfer* infer) const {
     snapHandle.clear();
@@ -4009,7 +4043,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // path (loadDocMesh + resolve), exactly like sketch_add_entity; op errors are logged and the
     // tool stays active. Esc exits.
     bool editTool = (tool_ == SketchTool::Trim || tool_ == SketchTool::Extend ||
-                     tool_ == SketchTool::Offset);
+                     tool_ == SketchTool::Offset ||
+                     tool_ == SketchTool::SkFillet || tool_ == SketchTool::SkChamfer);
     if (editTool) {
         int hovered = imgHovered ? hitTestEntity(io.MousePos) : -1;
 
@@ -4208,6 +4243,49 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 // Esc backs out one stage; from the chain stage it exits the tool.
                 if (offsetStage_ == 2) { offsetStage_ = 1; offsetFocusInput_ = true; }
                 else if (offsetStage_ == 1) offsetStage_ = 0;
+                else cancelTool();
+            }
+        }
+
+        // ----- SKETCH FILLET / CHAMFER (C52): pick two lines; second pick builds the op. -----
+        // Engine handles LINE-LINE corners only (sketch_fillet radius / sketch_chamfer distance).
+        // The radius/distance numeric field lives in a small always-on overlay pinned top-left
+        // (drawn after the interaction pass) and persists across corners. On the second pick the op
+        // is applied; success appends the new arc/line + re-solves and we stay armed for another
+        // corner. A non-line pick toasts and is ignored. Esc clears a held first pick (or exits the
+        // tool if none is held).
+        else if (tool_ == SketchTool::SkFillet || tool_ == SketchTool::SkChamfer) {
+            const ImU32 ac = col(pal.accent, 0.95f);
+            const ImU32 hc = col(pal.hoverHighlight, 0.9f);
+            // Tint the already-picked first line in accent.
+            const SketchEntity* first = corner1Id_.empty() ? nullptr : entById(corner1Id_);
+            if (first && first->type == "line")
+                dl->AddLine(uvToScreen(first->p1[0], first->p1[1]),
+                            uvToScreen(first->p2[0], first->p2[1]), ac, 3.5f);
+            // Hover preview (faint) over the would-be-picked line (skip the already-picked one).
+            if (hovered >= 0 && ents_[hovered].type == "line" && ents_[hovered].id != corner1Id_) {
+                const SketchEntity& e = ents_[hovered];
+                dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), hc, 3.0f);
+            }
+            if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hovered >= 0) {
+                const SketchEntity& e = ents_[hovered];
+                if (e.type != "line") {
+                    const char* what = tool_ == SketchTool::SkFillet ? "Sketch Fillet" : "Sketch Chamfer";
+                    st.addLog(std::string("[sketch] ") + what + ": pick a line, not " + e.type);
+                    st.toast(ui::ToastLevel::Info,
+                             std::string(what) + " works on two lines — not " + e.type);
+                } else if (corner1Id_.empty()) {
+                    corner1Id_ = e.id;                 // first line picked; wait for the second
+                } else if (e.id == corner1Id_) {
+                    // Clicking the same line again deselects it (pick a different first line).
+                    corner1Id_.clear();
+                } else {
+                    applyCornerOp(st, e.id);           // second line: build + apply, then stay armed
+                }
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                escHandled = true;   // C41 (T1): clear a held first pick, else exit the tool
+                if (!corner1Id_.empty()) corner1Id_.clear();
                 else cancelTool();
             }
         }
@@ -5351,6 +5429,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          tool_ == SketchTool::Trim ? "Trim" :
                          tool_ == SketchTool::Extend ? "Extend" :
                          tool_ == SketchTool::Offset ? "Offset" :
+                         tool_ == SketchTool::SkFillet ? "Sketch Fillet" :
+                         tool_ == SketchTool::SkChamfer ? "Sketch Chamfer" :
                          tool_ == SketchTool::Arc3pt ? "3 Point Arc" :
                          tool_ == SketchTool::Polygon ? "Polygon" :
                          tool_ == SketchTool::RectCenter ? "Center Rectangle" :
@@ -5409,6 +5489,20 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 step = offsetStage_ == 0 ? "click entities for the chain, then Enter"
                      : offsetStage_ == 1 ? "type the offset distance, Enter"
                      : "click the side to offset toward"; break;
+            case SketchTool::SkFillet: {
+                static char fb[64];
+                std::snprintf(fb, sizeof(fb), corner1Id_.empty()
+                                  ? "pick two lines (radius %.3g mm)"
+                                  : "pick the second line (radius %.3g mm)", skFilletRadius_);
+                step = fb; break;
+            }
+            case SketchTool::SkChamfer: {
+                static char cb[64];
+                std::snprintf(cb, sizeof(cb), corner1Id_.empty()
+                                  ? "pick two lines (distance %.3g mm)"
+                                  : "pick the second line (distance %.3g mm)", skChamferDist_);
+                step = cb; break;
+            }
             case SketchTool::Arc3pt:
                 step = n == 0 ? "click arc start" : n == 1 ? "click arc end"
                      : "click a point on the arc"; break;
@@ -5630,6 +5724,27 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             bool cancel = ImGui::Button("Cancel");
             if (ok) { offsetDist_ = std::fabs(offsetDist_); offsetStage_ = 2; }
             if (cancel) { offsetStage_ = 0; }
+        }
+        ImGui::End();
+    }
+
+    // ---- C52: Sketch Fillet / Chamfer numeric input (always shown while the tool is armed) ----
+    // A small always-on overlay near the status chip holds the radius (fillet) / distance (chamfer);
+    // the value persists across corners and invocations. Editing it never disturbs the pick state —
+    // the two lines are still picked by clicking in the viewport. Pinned top-left so it doesn't fight
+    // the cursor while the user clicks corners (unlike Offset's one-shot box near the cursor).
+    if (tool_ == SketchTool::SkFillet || tool_ == SketchTool::SkChamfer) {
+        const bool fillet = (tool_ == SketchTool::SkFillet);
+        ImGui::SetNextWindowPos(ImVec2(imgMin.x + 12, imgMin.y + 52), ImGuiCond_Appearing);
+        ImGui::SetNextWindowBgAlpha(0.98f);
+        if (ImGui::Begin(fillet ? "##SketchFilletParam" : "##SketchChamferParam", nullptr,
+                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::TextUnformatted(fillet ? "Fillet radius (mm)" : "Chamfer distance (mm)");
+            ImGui::SetNextItemWidth(120);
+            float* val = fillet ? &skFilletRadius_ : &skChamferDist_;
+            ImGui::InputFloat(fillet ? "##skfilletr" : "##skchamferd", val, 1.0f, 5.0f, "%.3f");
+            if (*val < 0.001f) *val = 0.001f;   // engine requires a strictly positive value
         }
         ImGui::End();
     }

@@ -275,6 +275,9 @@ struct AppState {
     bool        ecadShotDone = false;
     int         wantFocusViewport = 0;      // frames to keep forcing the 3D Viewport tab forward
                                             // (set by the ECAD board->3D bridge so the board shows)
+    int         wantFocusEcad = 0;          // frames to keep forcing the ECAD tab forward (AI Design)
+    std::string ecadAiRequest;              // NL circuit request from the ECAD launchpad
+    bool        ecadAiGo = false;           // one-shot: run ecad_design(ecadAiRequest) this frame
 
     // ---- topology picking (C15) — id pass + overlays owned by run_gui; AppState borrows ----
     render::IdPass* idPass = nullptr;

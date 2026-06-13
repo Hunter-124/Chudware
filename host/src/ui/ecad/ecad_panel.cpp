@@ -164,6 +164,7 @@ void ecadEditorLoadResponse(const nlohmann::json& resp) {
 void drawEcadEditor(AppState& st) {
     EcadEditorState& es = state();
     const ui::Palette& pal = ui::palette;
+    const float sc = ui::uiScale;
 
     // Pop the ECAD tab forward the frame a document first appears (New Schematic/PCB, or a shot),
     // so the editor surfaces instead of staying hidden behind the Viewport tab.
@@ -175,14 +176,35 @@ void drawEcadEditor(AppState& st) {
     if (!ImGui::Begin("ECAD")) { ImGui::End(); return; }
 
     if (!es.mirror.hasDoc()) {
+        // Launchpad: describe a circuit -> the AI designs a verified schematic. (Blank docs come
+        // from the PCB ribbon's New Schematic / New PCB.) The button hands the request to the app
+        // loop via st.ecadAiRequest/ecadAiGo, which runs ecad_design + loads the result here.
+        ImGui::Dummy(ImVec2(0, 18 * sc));
+        ImGui::Indent(24 * sc);
+        ImGui::TextColored(v4(pal.accent), "AI-ECAD  -  electronics design");
+        ImGui::Spacing();
         ImGui::TextColored(v4(pal.textDim),
-                           "No ECAD document open. Use the PCB ribbon (New Schematic / New PCB).");
+            "Describe a circuit and the AI designs a verified schematic, or start a blank");
+        ImGui::TextColored(v4(pal.textDim),
+            "document from the PCB ribbon (New Schematic / New PCB).");
+        ImGui::Dummy(ImVec2(0, 10 * sc));
+        static char aibuf[512] = "5V divider with 2.5V output";
+        ImGui::SetNextItemWidth(440 * sc);
+        ImGui::InputTextWithHint("##ecad_ai", "describe a circuit...", aibuf, sizeof(aibuf));
+        ImGui::SameLine();
+        if (ImGui::Button("Design with AI", ImVec2(150 * sc, 0))) {
+            st.ecadAiRequest = aibuf;
+            st.ecadAiGo = true;
+        }
+        ImGui::Dummy(ImVec2(0, 6 * sc));
+        ImGui::TextColored(v4(pal.textDisabled),
+            "examples:  inverting amp gain 10    RC low-pass 1kHz    555 astable");
+        ImGui::Unindent(24 * sc);
         ImGui::End();
         return;
     }
 
     // ---- header toolbar: doc badge + name + revision (left); view controls (right) ----
-    const float sc = ui::uiScale;
     ImGui::AlignTextToFramePadding();
     ImGui::TextColored(v4(pal.accent), "%s", es.mirror.isSch() ? "SCHEMATIC" : "PCB LAYOUT");
     ImGui::SameLine(0, 12 * sc);

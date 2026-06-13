@@ -165,9 +165,27 @@ void ecadTo3d(AppState& st) {
     st.addLog("[ecad] board -> 3D part: " + stepPath);
 }
 
+// AI-design an ECAD schematic from a natural-language request (the launchpad / "AI Design" command):
+// run the orchestrator (ecad_design) on the worker, then load the produced schematic into the editor.
+void ecadAiDesign(AppState& st, const std::string& request) {
+    if (request.empty()) return;
+    st.toast(ui::ToastLevel::Info, "AI: designing \"" + request + "\" ...");
+    st.addLog("[ecad] AI design: " + request);
+    nlohmann::json res;
+    if (!ecadCall(st, "ecad_design", {{"request", request}}, res)) return;
+    const std::string id = jstr(res, "doc_id");
+    if (id.empty()) { st.toast(ui::ToastLevel::Warn, "AI design produced no document"); return; }
+    nlohmann::json tree;
+    if (ecadCall(st, "ecad_tree", {{"doc_id", id}}, tree)) ecadAdopt(st, tree);
+    const std::string recipe = jstr(res, "recipe_used");
+    st.toast(ui::ToastLevel::Info,
+             recipe.empty() ? "AI design ready" : ("AI design ready (recipe: " + recipe + ")"));
+}
+
 // Route a PCB-tab ribbon command. New docs + doc-scoped analysis/exports run now; geometry-placing
 // ops need canvas-click placement / a PM form (logged so they stay observable).
 void ecadDispatch(AppState& st, const std::string& cmd) {
+    if (cmd == "ecad_ai_design")     { st.wantFocusEcad = 6; return; }  // surface the AI launchpad
     if (cmd == "ecad_new_sch")       { ecadNewDoc(st, "sch"); return; }
     if (cmd == "ecad_new_pcb")       { ecadNewDoc(st, "pcb"); return; }
     if (cmd == "ecad_run_erc")       { ecadDocRpc(st, "ecad_rebuild", "ERC updated"); return; }
@@ -1067,9 +1085,12 @@ int run_gui(const char* screenshotPath) {
             const char* kindEnv = std::getenv("AI_CAD_ECAD_KIND");
             const bool wantPcb = kindEnv && std::strcmp(kindEnv, "pcb") == 0;
             const bool want3d  = kindEnv && std::strcmp(kindEnv, "3d") == 0;
+            const bool wantAi  = kindEnv && std::strcmp(kindEnv, "ai") == 0;
             nlohmann::json r;
             std::string showId;
-            if (wantPcb || want3d) {
+            if (wantAi) {
+                st.wantFocusEcad = 6;   // surface the empty AI launchpad for the screenshot
+            } else if (wantPcb || want3d) {
                 // Build a small demo board explicitly: outline + two 0603 footprints (pads
                 // resolved from the library) + a routed track + a GND copper pour, then fill it.
                 if (ecall("ecad_new", {{"kind", "pcb"}}, r)) {
@@ -1260,7 +1281,9 @@ int run_gui(const char* screenshotPath) {
         activityPanel.draw(st);
         if (st.wantFocusViewport > 0) { ImGui::SetNextWindowFocus(); st.wantFocusViewport--; }
         ui::drawViewportPanel(st, io, busy);
-        ui::drawEcadEditor(st);   // Wave N: AI-ECAD 2D editor (empty-state until an ECAD doc loads)
+        if (st.wantFocusEcad > 0) { ImGui::SetNextWindowFocus(); st.wantFocusEcad--; }
+        ui::drawEcadEditor(st);   // Wave N: AI-ECAD 2D editor (launchpad until an ECAD doc loads)
+        if (st.ecadAiGo) { st.ecadAiGo = false; ecadAiDesign(st, st.ecadAiRequest); }  // Wave P
 
         // ---------- C19: simulation panel + evaluate dialogs ----------
         simPanel.tick(st);          // drain SimClient progress + completion (loads overlays)
@@ -1329,9 +1352,9 @@ int run_gui(const char* screenshotPath) {
         // wantTree and treeShotDone: take the screenshot at frame 10 (tree has repainted)
         int shotFrame = st.wantTree ? (st.treeShotDone ? 10 : 30) : 6;
         if (st.wantEcad) {
-            if (!st.ecadShotDone)            shotFrame = 150;    // wait for worker + design
-            else if (st.wantFocusViewport>0) shotFrame = 99999;  // let the 3D-view focus settle
-            else                             shotFrame = 10;     // then capture
+            if (!st.ecadShotDone)                                       shotFrame = 150;   // worker + design
+            else if (st.wantFocusViewport > 0 || st.wantFocusEcad > 0)  shotFrame = 99999; // let focus settle
+            else                                                        shotFrame = 10;    // then capture
         }
         if (shot && ++st.frame >= shotFrame) {
             std::vector<unsigned char> px(dw * dh * 4);

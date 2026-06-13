@@ -103,6 +103,32 @@ def _iso_axes() -> tuple[tuple[float, float, float], tuple[float, float, float]]
     return (float(d[0]), float(d[1]), float(d[2])), (float(sx[0]), float(sx[1]), float(sx[2]))
 
 
+def _orient_frame(orientation: str):
+    """Return (view_dir, screen_x, screen_y) unit numpy vectors for a named orientation.
+
+    ``screen_y`` = ``view_dir × screen_x`` (the on-sheet +y / "up"). This is the SAME basis
+    ``project_view`` hands the HLR projector, exposed so the section/detail code can map a 2D
+    sheet point in a parent view back to a 3D world ray (W15+ section/detail views).
+    """
+    import numpy as np
+
+    if orientation == "iso":
+        view_dir, screen_x = _iso_axes()
+    else:
+        spec = _ORIENT.get(orientation)
+        if spec is None:
+            raise OpError("invalid_op", f"unknown orientation '{orientation}'",
+                          {"reason": "bad orientation"})
+        view_dir, screen_x = spec
+    d = np.array(view_dir, dtype=float)
+    sx = np.array(screen_x, dtype=float)
+    d = d / (np.linalg.norm(d) or 1.0)
+    sx = sx / (np.linalg.norm(sx) or 1.0)
+    sy = np.cross(d, sx)
+    sy = sy / (np.linalg.norm(sy) or 1.0)
+    return d, sx, sy
+
+
 # --------------------------------------------------------------------------- HLR projection
 
 
@@ -253,6 +279,417 @@ def project_view(shapes: list, orientation: str, scale: float = 1.0,
     return base
 
 
+# --------------------------------------------------------------------------- SECTION views (W15)
+
+
+def _half_space_cut(raw_shape, normal, point):
+    """Cut ``raw_shape`` (a TopoDS shape) by the half-space on the +``normal`` side of the plane
+    through ``point``: a ``BRepAlgoAPI_Cut`` against a large box covering that half-space.
+
+    The retained half is the one the section LOOKS AT (we remove the material between the eye and
+    the cut so the bore/cavity is revealed). Returns the cut TopoDS shape. ``normal``/``point`` are
+    numpy 3-vectors in WORLD mm.
+    """
+    import numpy as np
+    from OCP.gp import gp_Pnt, gp_Ax2, gp_Dir
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+
+    n = np.array(normal, dtype=float)
+    n = n / (np.linalg.norm(n) or 1.0)
+    p = np.array(point, dtype=float)
+
+    # A big box occupying the +n half-space: corner = point, local Z = +n, depth = BIG along +n,
+    # spanning ±BIG in the two in-plane directions. Anything on the +n side of the plane is removed.
+    BIG = 100000.0
+    # An orthonormal in-plane basis (u, v) for the box footprint.
+    seed = np.array([1.0, 0.0, 0.0])
+    if abs(float(np.dot(seed, n))) > 0.9:
+        seed = np.array([0.0, 1.0, 0.0])
+    u = np.cross(n, seed)
+    u = u / (np.linalg.norm(u) or 1.0)
+    # Box origin: shift back along u and v by BIG so the footprint is centered on `point`.
+    origin = p - u * BIG - np.cross(n, u) * BIG
+    ax = gp_Ax2(gp_Pnt(*origin), gp_Dir(*n), gp_Dir(*u))
+    tool = BRepPrimAPI_MakeBox(ax, 2 * BIG, 2 * BIG, BIG).Shape()
+    cut = BRepAlgoAPI_Cut(raw_shape, tool)
+    cut.Build()
+    if not cut.IsDone():
+        raise OpError("invalid_op", "section half-space cut failed", {"reason": "boolean failed"})
+    return cut.Shape()
+
+
+def _section_face_polygons(cut_shape, normal, point, screen_x, screen_y, scale, position):
+    """Outer-wire polygons of every face of ``cut_shape`` LYING IN the cut plane, projected to the
+    section view's sheet frame (``screen_x``/``screen_y``) and scaled/translated like the edges.
+
+    These are the hatched cross-section areas. A face is "in the cut plane" when it is planar, its
+    normal is parallel to the section ``normal``, and its centroid lies on the plane. The hole/cavity
+    splits the cut face into several pieces — each is returned as its own closed polygon, so the bore
+    reads as a gap in the hatch. Returns a list of ``[[x, y], …]`` closed polygons in sheet mm.
+    """
+    import numpy as np
+    from OCP.TopoDS import TopoDS
+    from OCP.TopExp import TopExp, TopExp_Explorer
+    from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
+    from OCP.TopTools import TopTools_IndexedMapOfShape
+    from OCP.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
+    from OCP.GeomAbs import GeomAbs_Plane, GeomAbs_Line
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepTools import BRepTools
+    from OCP.GCPnts import GCPnts_TangentialDeflection
+
+    n = np.array(normal, dtype=float)
+    n = n / (np.linalg.norm(n) or 1.0)
+    p = np.array(point, dtype=float)
+    sx = np.array(screen_x, dtype=float)
+    sy = np.array(screen_y, dtype=float)
+    px, py = position
+
+    fmap = TopTools_IndexedMapOfShape()
+    TopExp.MapShapes_s(cut_shape, TopAbs_FACE, fmap)
+    polys: list[list[list[float]]] = []
+    for i in range(1, fmap.Extent() + 1):
+        f = TopoDS.Face_s(fmap.FindKey(i))
+        surf = BRepAdaptor_Surface(f)
+        if surf.GetType() != GeomAbs_Plane:
+            continue
+        g = GProp_GProps()
+        BRepGProp.SurfaceProperties_s(f, g)
+        c = g.CentreOfMass()
+        cvec = np.array([c.X(), c.Y(), c.Z()])
+        fn = surf.Plane().Axis().Direction()
+        fnv = np.array([fn.X(), fn.Y(), fn.Z()])
+        # in-plane (centroid on the cut plane) AND coplanar (face normal ∥ cut normal)?
+        if abs(float(np.dot(cvec - p, n))) > 1e-6:
+            continue
+        if abs(abs(float(np.dot(fnv, n))) - 1.0) > 1e-6:
+            continue
+        try:
+            ow = BRepTools.OuterWire_s(f)
+        except Exception:  # noqa: BLE001
+            continue
+        exp = TopExp_Explorer(ow, TopAbs_EDGE)
+        poly: list[list[float]] = []
+        while exp.More():
+            e = TopoDS.Edge_s(exp.Current())
+            ad = BRepAdaptor_Curve(e)
+            pts3 = []
+            if ad.GetType() == GeomAbs_Line:
+                a = ad.Value(ad.FirstParameter())
+                b = ad.Value(ad.LastParameter())
+                pts3 = [a, b]
+            else:
+                try:
+                    disc = GCPnts_TangentialDeflection(ad, 0.05 / max(scale, 1e-6), 0.3)
+                    pts3 = [disc.Value(k) for k in range(1, disc.NbPoints() + 1)]
+                except Exception:  # noqa: BLE001
+                    a = ad.Value(ad.FirstParameter())
+                    b = ad.Value(ad.LastParameter())
+                    pts3 = [a, b]
+            for q in pts3:
+                v = np.array([q.X(), q.Y(), q.Z()])
+                poly.append([float(np.dot(v, sx)) * scale + px,
+                             float(np.dot(v, sy)) * scale + py])
+            exp.Next()
+        if len(poly) >= 3:
+            polys.append(poly)
+    return polys
+
+
+def _resolve_section_plane(view: dict, parent_view: dict):
+    """Resolve a section view's cut plane → (world_normal, world_point, look_dir, screen_x).
+
+    Two definition forms (both end at a world plane + a look direction = the section view dir):
+
+    * explicit world plane — ``view["plane"] = {normal:[x,y,z], point:[x,y,z]}``. The look direction
+      is along the plane normal (you view the cut face-on); screen_x is chosen so the result reads
+      upright relative to the parent.
+    * a 2D ``cut_line`` in the PARENT view's sheet coords — ``view["cut_line"] = [[x1,y1],[x2,y2]]``
+      (sheet mm, the parent's scaled+positioned frame). The two endpoints are un-projected onto the
+      parent's view frame to world points; the cut plane CONTAINS the cut-line direction and the
+      parent's view direction (a vertical cutting plane through the part), and the section looks along
+      the in-plane perpendicular — exactly the SolidWorks "drop a cutting line, look sideways" model.
+
+    Returns numpy vectors. Raises ``OpError`` on a malformed/degenerate definition.
+    """
+    import numpy as np
+
+    plane = view.get("plane")
+    if isinstance(plane, dict) and plane.get("normal") is not None and plane.get("point") is not None:
+        n = np.array(plane["normal"], dtype=float)
+        pnt = np.array(plane["point"], dtype=float)
+        if n.shape != (3,) or pnt.shape != (3,) or float(np.linalg.norm(n)) < 1e-9:
+            raise OpError("invalid_op", "section plane.normal/point must be 3-vectors",
+                          {"reason": "bad plane"})
+        n = n / np.linalg.norm(n)
+        look = n
+        # screen_x: pick a world axis most perpendicular to the look so the projection is non-degenerate.
+        seed = np.array([0.0, 0.0, 1.0])
+        if abs(float(np.dot(seed, look))) > 0.9:
+            seed = np.array([1.0, 0.0, 0.0])
+        sx = np.cross(seed, look)
+        sx = sx / (np.linalg.norm(sx) or 1.0)
+        return n, pnt, look, sx
+
+    cut_line = view.get("cut_line")
+    if not (isinstance(cut_line, (list, tuple)) and len(cut_line) == 2
+            and all(isinstance(q, (list, tuple)) and len(q) == 2 for q in cut_line)):
+        raise OpError("invalid_op",
+                      "section needs a world 'plane' {normal, point} or a 2D 'cut_line' [[x,y],[x,y]]",
+                      {"reason": "no plane"})
+
+    p_orient = parent_view.get("orientation", "front")
+    p_scale = float(parent_view.get("scale", 1.0)) or 1.0
+    p_pos = parent_view.get("position", [0.0, 0.0]) or [0.0, 0.0]
+    d, sx_p, sy_p = _orient_frame(p_orient)
+    # Un-project a parent sheet-mm point to a world point on the cut plane: the HLR projector centers
+    # the model's projected origin at the parent position, so model_world ≈ (sheet - pos)/scale mapped
+    # back through (screen_x, screen_y). Depth along the view dir is arbitrary (we build a plane that
+    # spans the whole part along the look), so we anchor at the world origin's depth.
+    def unproj(qxy):
+        u = (float(qxy[0]) - float(p_pos[0])) / p_scale
+        v = (float(qxy[1]) - float(p_pos[1])) / p_scale
+        return sx_p * u + sy_p * v
+
+    a = unproj(cut_line[0])
+    b = unproj(cut_line[1])
+    line = b - a
+    if float(np.linalg.norm(line)) < 1e-9:
+        raise OpError("invalid_op", "section cut_line endpoints coincide", {"reason": "degenerate"})
+    line = line / np.linalg.norm(line)
+    # The cutting plane contains the on-sheet cut line AND the parent's view direction (it cuts
+    # straight INTO the part). Its normal is line × view_dir; the section looks along that normal's
+    # in-plane companion — we look perpendicular to the cut line, parallel to the sheet — i.e. along
+    # ``line × d`` projected to be perpendicular to the cut plane normal. Concretely:
+    #   plane_normal = line × d   (perpendicular to both the cut line and the look-into direction)
+    #   look (section view dir)   = plane_normal  (you view the freshly-cut face head-on)
+    plane_normal = np.cross(line, d)
+    if float(np.linalg.norm(plane_normal)) < 1e-9:
+        raise OpError("invalid_op", "section cut line is parallel to the view direction",
+                      {"reason": "degenerate"})
+    plane_normal = plane_normal / np.linalg.norm(plane_normal)
+    look = plane_normal
+    point = a  # any point on the cut line lies on the plane
+    # screen_x for the section: keep the cut-line direction horizontal on the section sheet.
+    sx = line
+    return plane_normal, point, look, sx
+
+
+def project_section(shapes: list, view: dict, parent_view: dict, scale: float = 1.0,
+                    position: tuple[float, float] = (0.0, 0.0), show_hidden: bool = False,
+                    view_id: str = "v?") -> dict:
+    """HLR-project the CUT model for a section view + the hatched section-face polygons.
+
+    Cuts the source ``shapes`` by the section half-space (revealing the cavity), then HLR-projects
+    the remaining solid along the section look direction. ``section_faces`` carries the cut-plane
+    cross-section outlines (closed polygons, sheet mm) for the host to hatch. Returns the normal
+    ViewGeometry shape (``visible``/``hidden``/``bbox``/``ms``/``error``) plus ``section_faces``.
+    Every failure is contained (sets ``error``, empties geometry).
+    """
+    t0 = time.perf_counter()
+    base = {"view_id": view_id, "scale": float(scale), "orientation": "section",
+            "visible": [], "hidden": [], "section_faces": [], "bbox": None, "ms": 0.0,
+            "error": None}
+    if not shapes:
+        base["error"] = "source has no bodies to project"
+        return base
+    # Resolve the cut plane OUTSIDE the contained try: a malformed plane/cut_line is a CALLER error
+    # and must surface as a structured RPC error, not a quietly-empty view.
+    import numpy as np
+    normal, point, look, sx = _resolve_section_plane(view, parent_view)
+    try:
+        from OCP.gp import gp_Ax2, gp_Pnt, gp_Dir
+        from OCP.HLRAlgo import HLRAlgo_Projector
+        from OCP.HLRBRep import HLRBRep_Algo, HLRBRep_HLRToShape
+
+        # The section look direction is along the cut normal; build the projector frame.
+        look = look / (np.linalg.norm(look) or 1.0)
+        sx = sx / (np.linalg.norm(sx) or 1.0)
+        # Re-orthogonalize screen_x against the look so the gp_Ax2 is valid.
+        sx = sx - look * float(np.dot(sx, look))
+        if float(np.linalg.norm(sx)) < 1e-9:
+            seed = np.array([0.0, 0.0, 1.0])
+            if abs(float(np.dot(seed, look))) > 0.9:
+                seed = np.array([1.0, 0.0, 0.0])
+            sx = np.cross(seed, look)
+        sx = sx / np.linalg.norm(sx)
+        sy = np.cross(look, sx)
+        sy = sy / (np.linalg.norm(sy) or 1.0)
+
+        # Cut each solid by the half-space (remove the material on the +look side, i.e. between the
+        # eye and the cut plane), then collect the retained pieces + the section faces.
+        cut_shapes = []
+        section_faces: list[list[list[float]]] = []
+        for sh in shapes:
+            raw = sh.wrapped if hasattr(sh, "wrapped") else sh
+            try:
+                cs = _half_space_cut(raw, look, point)
+            except Exception:  # noqa: BLE001 — a body the plane misses entirely keeps its full shape
+                cs = raw
+            cut_shapes.append(cs)
+            section_faces.extend(
+                _section_face_polygons(cs, normal, point, sx, sy, scale, position))
+
+        # HLR-project the cut solids along the look direction.
+        ax = gp_Ax2(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(*look), gp_Dir(*sx))
+        projector = HLRAlgo_Projector(ax)
+        algo = HLRBRep_Algo()
+        for cs in cut_shapes:
+            algo.Add(cs)
+        algo.Projector(projector)
+        algo.Update()
+        algo.Hide()
+        hlr = HLRBRep_HLRToShape(algo)
+        visible_compounds = [hlr.VCompound(), hlr.OutLineVCompound(), hlr.Rg1LineVCompound()]
+        hidden_compounds = ([hlr.HCompound(), hlr.OutLineHCompound()] if show_hidden else [])
+        lin_defl, ang_defl = 0.05, 0.35
+        visible: list[list[list[float]]] = []
+        for c in visible_compounds:
+            visible.extend(_compound_polylines(c, scale, position, lin_defl, ang_defl))
+        hidden: list[list[list[float]]] = []
+        for c in hidden_compounds:
+            hidden.extend(_compound_polylines(c, scale, position, lin_defl, ang_defl))
+
+        base["visible"] = visible
+        base["hidden"] = hidden
+        base["section_faces"] = section_faces
+        base["bbox"] = _bbox_of_polylines(visible + hidden + section_faces)
+        if not section_faces:
+            base["error"] = "cut plane does not intersect the model"
+    except Exception as exc:  # noqa: BLE001 — contained
+        base["error"] = f"{type(exc).__name__}: {exc}"
+    base["ms"] = round((time.perf_counter() - t0) * 1000.0, 3)
+    return base
+
+
+# --------------------------------------------------------------------------- DETAIL views (W15)
+
+
+def _clip_polyline_to_circle(pl, cx, cy, r):
+    """Clip a sheet-mm polyline to the disc of radius ``r`` about (``cx``,``cy``); return the list of
+    sub-polylines (in the same coords) that lie inside. Segment endpoints crossing the circle are
+    truncated at the intersection so the detail crop has clean edges (SolidWorks detail-circle clip).
+    """
+    import math as _m
+
+    r2 = r * r
+
+    def inside(pt):
+        return (pt[0] - cx) ** 2 + (pt[1] - cy) ** 2 <= r2
+
+    def intersect(p0, p1):
+        # Parametric point p0 + t*(p1-p0) hitting the circle; return the t in [0,1] for the crossing
+        # nearest p0 that lands on the boundary (the relevant root for an entering/leaving segment).
+        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+        fx, fy = p0[0] - cx, p0[1] - cy
+        a = dx * dx + dy * dy
+        if a < 1e-12:
+            return None
+        b = 2 * (fx * dx + fy * dy)
+        c = fx * fx + fy * fy - r2
+        disc = b * b - 4 * a * c
+        if disc < 0:
+            return None
+        sq = _m.sqrt(disc)
+        roots = sorted(t for t in ((-b - sq) / (2 * a), (-b + sq) / (2 * a)) if 0.0 <= t <= 1.0)
+        return roots[0] if roots else None
+
+    out: list[list[list[float]]] = []
+    cur: list[list[float]] = []
+    for i in range(len(pl)):
+        pt = pl[i]
+        if inside(pt):
+            if not cur and i > 0:
+                # entering: add the crossing point from the previous (outside) vertex.
+                t = intersect(pl[i - 1], pt)
+                if t is not None:
+                    cur.append([pl[i - 1][0] + t * (pt[0] - pl[i - 1][0]),
+                                pl[i - 1][1] + t * (pt[1] - pl[i - 1][1])])
+            cur.append([pt[0], pt[1]])
+        else:
+            if cur:
+                # leaving: truncate at the crossing from the previous (inside) vertex.
+                t = intersect(pl[i - 1], pt)
+                if t is not None:
+                    cur.append([pl[i - 1][0] + t * (pt[0] - pl[i - 1][0]),
+                                pl[i - 1][1] + t * (pt[1] - pl[i - 1][1])])
+                if len(cur) >= 2:
+                    out.append(cur)
+                cur = []
+            else:
+                # both endpoints outside — the segment may still pass THROUGH the disc (chord).
+                if i > 0:
+                    p0, p1 = pl[i - 1], pt
+                    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+                    fx, fy = p0[0] - cx, p0[1] - cy
+                    a = dx * dx + dy * dy
+                    if a >= 1e-12:
+                        b = 2 * (fx * dx + fy * dy)
+                        cc = fx * fx + fy * fy - r2
+                        dsc = b * b - 4 * a * cc
+                        if dsc > 0:
+                            sq = _m.sqrt(dsc)
+                            t0 = (-b - sq) / (2 * a)
+                            t1 = (-b + sq) / (2 * a)
+                            if 0.0 <= t0 <= 1.0 and 0.0 <= t1 <= 1.0 and t1 > t0:
+                                out.append([
+                                    [p0[0] + t0 * dx, p0[1] + t0 * dy],
+                                    [p0[0] + t1 * dx, p0[1] + t1 * dy],
+                                ])
+    if len(cur) >= 2:
+        out.append(cur)
+    return out
+
+
+def project_detail(parent_geom: dict, center, radius: float, scale: float,
+                   position: tuple[float, float], view_id: str = "v?") -> dict:
+    """A magnified detail crop of a parent view's already-projected geometry.
+
+    Reuses the parent's HLR polylines (no re-projection): clips both ``visible`` and ``hidden`` to
+    the circle of ``radius`` about ``center`` (both in the parent's sheet mm), then RE-ORIGINS the
+    kept geometry on the circle center, applies the detail ``scale`` magnification (relative to the
+    parent's own scale), and translates to the detail view ``position``. Returns the normal
+    ViewGeometry shape. The clipped detail is associative because it derives from the live parent
+    projection on every fetch.
+    """
+    t0 = time.perf_counter()
+    base = {"view_id": view_id, "scale": float(scale), "orientation": "detail",
+            "visible": [], "hidden": [], "bbox": None, "ms": 0.0, "error": None}
+    cx, cy = float(center[0]), float(center[1])
+    r = float(radius)
+    if r <= 0:
+        base["error"] = "detail radius must be positive"
+        base["ms"] = round((time.perf_counter() - t0) * 1000.0, 3)
+        return base
+    parent_scale = float(parent_geom.get("scale", 1.0)) or 1.0
+    # Magnification of the parent geometry: the detail is drawn at `scale`, the parent at
+    # `parent_scale`, so a kept sheet-mm point is re-scaled by (scale / parent_scale) about center.
+    mag = scale / parent_scale
+    px, py = float(position[0]), float(position[1])
+
+    def remap(pl):
+        return [[(x - cx) * mag + px, (y - cy) * mag + py] for x, y in pl]
+
+    try:
+        for layer in ("visible", "hidden"):
+            src = parent_geom.get(layer, []) or []
+            kept: list[list[list[float]]] = []
+            for pl in src:
+                for sub in _clip_polyline_to_circle(pl, cx, cy, r):
+                    if len(sub) >= 2:
+                        kept.append(remap(sub))
+            base[layer] = kept
+        base["bbox"] = _bbox_of_polylines(base["visible"] + base["hidden"])
+        if not base["visible"] and not base["hidden"]:
+            base["error"] = "detail circle encloses no parent geometry"
+    except Exception as exc:  # noqa: BLE001 — contained
+        base["error"] = f"{type(exc).__name__}: {exc}"
+    base["ms"] = round((time.perf_counter() - t0) * 1000.0, 3)
+    return base
+
+
 # --------------------------------------------------------------------------- drawing session
 
 
@@ -358,27 +795,68 @@ def _next_view_id(doc: dict) -> str:
 
 
 def _project_one(s: DrawingSession, view: dict, src_shapes: list, src_rev: int) -> dict:
-    """Project a single view, using/filling the per-(rev, orient, scale, hidden) cache."""
-    orient = view.get("orientation", "front")
+    """Project a single view, using/filling the per-(rev, orient, scale, hidden) cache.
+
+    Dispatches on the view ``type``: ``section`` cuts the model then HLR-projects the cut (+ section
+    faces); ``detail`` clips its parent view's projected geometry to a magnifier circle. Ortho/iso
+    views go through the cached :func:`project_view`. Section/detail are NOT position-cached (each is
+    cheap relative to a full HLR, or derives from the live parent), so they re-project on every fetch
+    and stay associative.
+    """
+    vtype = view.get("type")
     scale = float(view.get("scale", 1.0))
     show_hidden = bool(view.get("show_hidden", True))
     pos = view.get("position", [0.0, 0.0]) or [0.0, 0.0]
-    key = (src_rev, orient, round(scale, 6), show_hidden)
-    cached = s._proj_cache.get(key)
-    if cached is not None:
-        # Re-apply this view's position (cache is keyed on rev/orient/scale/hidden, not position —
-        # position is a cheap translate that doesn't need a re-HLR).
-        proj = _shift_to_position(cached, pos)
+
+    if vtype == "section":
+        parent_view = _resolve_parent(s.doc, view)
+        proj = project_section(src_shapes, view, parent_view or {}, scale=scale,
+                               position=(float(pos[0]), float(pos[1])),
+                               show_hidden=show_hidden, view_id=view.get("id", "v?"))
+    elif vtype == "detail":
+        parent_view = _resolve_parent(s.doc, view)
+        center = view.get("center", [0.0, 0.0]) or [0.0, 0.0]
+        radius = float(view.get("radius", 0.0) or 0.0)
+        if parent_view is None:
+            proj = {"view_id": view.get("id"), "scale": scale, "orientation": "detail",
+                    "visible": [], "hidden": [], "bbox": None, "ms": 0.0,
+                    "error": "detail view has no resolvable parent"}
+        else:
+            parent_geom = _project_one(s, parent_view, src_shapes, src_rev)
+            proj = project_detail(parent_geom, center, radius, scale,
+                                  (float(pos[0]), float(pos[1])), view_id=view.get("id", "v?"))
     else:
-        proj = project_view(src_shapes, orient, scale=scale, position=(0.0, 0.0),
-                            show_hidden=show_hidden, view_id=view.get("id", "v?"))
-        s._proj_cache[key] = proj
-        proj = _shift_to_position(proj, pos)
+        orient = view.get("orientation", "front")
+        key = (src_rev, orient, round(scale, 6), show_hidden)
+        cached = s._proj_cache.get(key)
+        if cached is not None:
+            # Re-apply this view's position (cache is keyed on rev/orient/scale/hidden, not position —
+            # position is a cheap translate that doesn't need a re-HLR).
+            proj = _shift_to_position(cached, pos)
+        else:
+            proj = project_view(src_shapes, orient, scale=scale, position=(0.0, 0.0),
+                                show_hidden=show_hidden, view_id=view.get("id", "v?"))
+            s._proj_cache[key] = proj
+            proj = _shift_to_position(proj, pos)
+
     out = dict(proj)
     out["view_id"] = view.get("id")
-    out["type"] = view.get("type")
+    out["type"] = vtype
     out["position"] = [float(pos[0]), float(pos[1])]
     out["show_hidden"] = show_hidden
+    # Section/detail carry their defining fields so the host can draw the cutting line / detail circle
+    # on the parent and label the view ("SECTION A-A" / "DETAIL B").
+    if vtype == "section":
+        out["parent"] = view.get("parent")
+        if view.get("cut_line") is not None:
+            out["cut_line"] = view.get("cut_line")
+        if view.get("plane") is not None:
+            out["plane"] = view.get("plane")
+    elif vtype == "detail":
+        out["parent"] = view.get("parent")
+        out["center"] = [float((view.get("center") or [0.0, 0.0])[0]),
+                         float((view.get("center") or [0.0, 0.0])[1])]
+        out["radius"] = float(view.get("radius", 0.0) or 0.0)
     # W13: the view's stored annotations (dimensions/notes) ride along with the projected geometry so
     # drawing_get / add_view round-trip them. They are sheet-mm coords, independent of the HLR cache.
     import copy as _copy
@@ -386,6 +864,15 @@ def _project_one(s: DrawingSession, view: dict, src_shapes: list, src_rev: int) 
     if view.get("label") is not None:
         out["label"] = view.get("label")
     return out
+
+
+def _resolve_parent(doc: dict, view: dict) -> Optional[dict]:
+    """The stored View dict named by ``view['parent']`` (a view id), or None when absent/unknown."""
+    pid = view.get("parent")
+    if not isinstance(pid, str):
+        return None
+    _sh, pv = _find_view(doc, pid)
+    return pv
 
 
 def _shift_to_position(proj: dict, pos) -> dict:
@@ -439,6 +926,122 @@ def add_view(doc_id: str, *, type: str, orientation: str, sheet_id: Optional[str
         "scale": float(scale) if scale is not None else 1.0,
         "position": [float(position[0]), float(position[1])] if position else [0.0, 0.0],
         "show_hidden": bool(show_hidden) if show_hidden is not None else True,
+    }
+    sheet.setdefault("views", []).append(view)
+    s.revision += 1
+    s.dirty = True
+    src_shapes, src_rev = _source_shapes(s.source_doc_id)
+    geom = _project_one(s, view, src_shapes, src_rev)
+    return {"view_id": view["id"], "revision": s.revision, "view": geom}
+
+
+def _next_label(doc: dict) -> str:
+    """The next free single-letter view label (A, B, C, …) across the whole drawing.
+
+    Section/detail views are labelled with a capital letter ("SECTION A-A", "DETAIL B"); we scan the
+    existing labels and return the lowest unused letter so the host doesn't have to manage them.
+    """
+    used = set()
+    for _sh, v in _all_views(doc):
+        lab = v.get("label")
+        if isinstance(lab, str) and len(lab) == 1 and lab.isalpha():
+            used.add(lab.upper())
+    for code in range(ord("A"), ord("Z") + 1):
+        c = chr(code)
+        if c not in used:
+            return c
+    return "A"
+
+
+def _default_section_position(parent_view: dict) -> list:
+    """A default sheet position for a new section view: offset to the RIGHT of the parent view's
+    position by a margin so it doesn't overlap (the host usually overrides this on placement)."""
+    pp = parent_view.get("position", [0.0, 0.0]) or [0.0, 0.0]
+    return [float(pp[0]) + 120.0, float(pp[1])]
+
+
+def add_section(doc_id: str, parent_view_id: str, *, plane: Optional[dict] = None,
+                cut_line: Optional[list] = None, label: Optional[str] = None,
+                scale: Optional[float] = None, position: Optional[list] = None,
+                sheet_id: Optional[str] = None, show_hidden: Optional[bool] = None) -> dict:
+    """drawing_add_section — add a SECTION view cutting the model relative to a parent view.
+
+    The cut is given either as an explicit world ``plane`` ``{normal:[x,y,z], point:[x,y,z]}`` or as
+    a 2D ``cut_line`` ``[[x1,y1],[x2,y2]]`` in the PARENT view's sheet-mm coords (a cutting line
+    dropped across the parent — the SolidWorks workflow). Returns ``{view_id, revision, view}`` where
+    ``view`` is the projected ViewGeometry including ``section_faces`` (the hatched cut polygons)."""
+    s = get_drawing(doc_id)
+    sheet = _find_sheet(s.doc, sheet_id)
+    _psh, parent = _find_view(s.doc, parent_view_id)
+    if parent is None:
+        raise OpError("invalid_op", f"section parent view '{parent_view_id}' not found",
+                      {"reason": "unknown parent"})
+    if plane is None and cut_line is None:
+        raise OpError("invalid_op",
+                      "section needs a world 'plane' {normal, point} or a 2D 'cut_line'",
+                      {"reason": "no plane"})
+    lab = label if isinstance(label, str) and label else _next_label(s.doc)
+    view = {
+        "id": _next_view_id(s.doc),
+        "type": "section",
+        "orientation": "section",
+        "parent": parent_view_id,
+        "label": lab,
+        "scale": float(scale) if scale is not None else float(parent.get("scale", 1.0) or 1.0),
+        "position": ([float(position[0]), float(position[1])] if position
+                     else _default_section_position(parent)),
+        "show_hidden": bool(show_hidden) if show_hidden is not None else False,
+    }
+    if plane is not None:
+        view["plane"] = plane
+    if cut_line is not None:
+        view["cut_line"] = [[float(cut_line[0][0]), float(cut_line[0][1])],
+                            [float(cut_line[1][0]), float(cut_line[1][1])]]
+    sheet.setdefault("views", []).append(view)
+    s.revision += 1
+    s.dirty = True
+    src_shapes, src_rev = _source_shapes(s.source_doc_id)
+    geom = _project_one(s, view, src_shapes, src_rev)
+    return {"view_id": view["id"], "revision": s.revision, "view": geom}
+
+
+def add_detail(doc_id: str, parent_view_id: str, *, center: list, radius: float,
+               scale: Optional[float] = None, label: Optional[str] = None,
+               position: Optional[list] = None, sheet_id: Optional[str] = None,
+               show_hidden: Optional[bool] = None) -> dict:
+    """drawing_add_detail — add a magnified DETAIL view of a circular region of a parent view.
+
+    ``center`` ([x,y] in the parent's sheet mm) + ``radius`` define the magnifier circle; the detail
+    reuses the parent's HLR clipped to that circle, drawn at ``scale`` (default 2× the parent). The
+    parent view's returned geometry gains a ``detail_circle`` marker so the host can draw the bubble.
+    Returns ``{view_id, revision, view}``."""
+    s = get_drawing(doc_id)
+    sheet = _find_sheet(s.doc, sheet_id)
+    _psh, parent = _find_view(s.doc, parent_view_id)
+    if parent is None:
+        raise OpError("invalid_op", f"detail parent view '{parent_view_id}' not found",
+                      {"reason": "unknown parent"})
+    if not (_is_xy(center)):
+        raise OpError("invalid_op", "detail center must be [x,y] (parent sheet mm)",
+                      {"reason": "bad center"})
+    if not isinstance(radius, (int, float)) or radius <= 0:
+        raise OpError("invalid_op", "detail radius must be a positive number",
+                      {"reason": "bad radius"})
+    lab = label if isinstance(label, str) and label else _next_label(s.doc)
+    parent_scale = float(parent.get("scale", 1.0) or 1.0)
+    view = {
+        "id": _next_view_id(s.doc),
+        "type": "detail",
+        "orientation": "detail",
+        "parent": parent_view_id,
+        "label": lab,
+        "center": [float(center[0]), float(center[1])],
+        "radius": float(radius),
+        "scale": float(scale) if scale is not None else parent_scale * 2.0,
+        "position": ([float(position[0]), float(position[1])] if position
+                     else [float((parent.get("position") or [0, 0])[0]) + 150.0,
+                           float((parent.get("position") or [0, 0])[1])]),
+        "show_hidden": bool(show_hidden) if show_hidden is not None else False,
     }
     sheet.setdefault("views", []).append(view)
     s.revision += 1
@@ -682,6 +1285,7 @@ def get_drawing_full(doc_id: str) -> dict:
             geom = _project_one(s, v, src_shapes, src_rev)
             total_ms += float(geom.get("ms", 0.0))
             views_out.append(geom)
+        _attach_parent_markers(views_out)
         sheets_out.append({
             "id": sh.get("id"),
             "size": sh.get("size"),
@@ -697,6 +1301,29 @@ def get_drawing_full(doc_id: str) -> dict:
         "sheets": sheets_out,
         "total_hlr_ms": round(total_ms, 3),
     }
+
+
+def _attach_parent_markers(views_out: list[dict]) -> None:
+    """Decorate parent views with markers for their child section/detail views (in place).
+
+    A section child adds a ``section_lines`` entry to its parent's geometry — the cutting line drawn
+    across the parent (sheet mm) + the label; a detail child adds a ``detail_circles`` entry — the
+    magnifier circle (center+radius) + label. The host renders these on the parent so the drawing
+    reads like SolidWorks (a cutting line with arrows, a labelled detail bubble)."""
+    by_id = {g.get("view_id"): g for g in views_out}
+    for g in views_out:
+        if g.get("type") == "section" and g.get("cut_line") is not None:
+            parent = by_id.get(g.get("parent"))
+            if parent is not None:
+                parent.setdefault("section_lines", []).append(
+                    {"label": g.get("label"), "view_id": g.get("view_id"),
+                     "line": g.get("cut_line")})
+        elif g.get("type") == "detail":
+            parent = by_id.get(g.get("parent"))
+            if parent is not None and g.get("center") is not None:
+                parent.setdefault("detail_circles", []).append(
+                    {"label": g.get("label"), "view_id": g.get("view_id"),
+                     "center": g.get("center"), "radius": g.get("radius")})
 
 
 def _tree(s: DrawingSession) -> dict:
@@ -719,6 +1346,31 @@ def _drawing_add_view(params: dict, _emit) -> dict:
         sheet_id=params.get("sheet_id"),
         scale=params.get("scale"),
         position=params.get("position"),
+        show_hidden=params.get("show_hidden"),
+    )
+
+
+def _drawing_add_section(params: dict, _emit) -> dict:
+    return add_section(
+        params["doc_id"], params["parent_view_id"],
+        plane=params.get("plane"),
+        cut_line=params.get("cut_line"),
+        label=params.get("label"),
+        scale=params.get("scale"),
+        position=params.get("position"),
+        sheet_id=params.get("sheet_id"),
+        show_hidden=params.get("show_hidden"),
+    )
+
+
+def _drawing_add_detail(params: dict, _emit) -> dict:
+    return add_detail(
+        params["doc_id"], params["parent_view_id"],
+        center=params["center"], radius=params["radius"],
+        scale=params.get("scale"),
+        label=params.get("label"),
+        position=params.get("position"),
+        sheet_id=params.get("sheet_id"),
         show_hidden=params.get("show_hidden"),
     )
 
@@ -766,6 +1418,8 @@ def _drawing_bom(params: dict, _emit) -> dict:
 WORKER_METHODS = {
     "drawing_new": _drawing_new,
     "drawing_add_view": _drawing_add_view,
+    "drawing_add_section": _drawing_add_section,
+    "drawing_add_detail": _drawing_add_detail,
     "drawing_remove_view": _drawing_remove_view,
     "drawing_set_view": _drawing_set_view,
     "drawing_get": _drawing_get,

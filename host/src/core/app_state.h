@@ -324,6 +324,19 @@ struct AppState {
         bool        bomVisible = false;        // show the BOM overlay table (assembly drawings)
         nlohmann::json bomRows;                // cached drawing_bom result {rows, is_assembly, ...}
         bool        bomFetched = false;        // have we fetched the BOM for this drawing yet
+
+        // ---- W15: Section + Detail view tools (drawing tabs) ----
+        // Section tool: arm it, then click two points across a parent view to drop a cutting line ->
+        // drawing_add_section{cut_line}. Detail tool: arm, click a center on a parent view then drag
+        // to set the radius -> drawing_add_detail. Both mirror the dimension tool's modal stages.
+        bool        sectionToolActive = false;  // armed: clicks place a cutting line
+        int         sectionStage = 0;           // 0=pick line start, 1=pick line end
+        std::string sectionViewId;              // parent view the cutting line is anchored to
+        float       sectionAx = 0, sectionAy = 0;  // cut-line start (sheet mm)
+        bool        detailToolActive = false;   // armed: click center + drag radius
+        int         detailStage = 0;            // 0=pick center, 1=drag radius
+        std::string detailViewId;               // parent view the detail circle is anchored to
+        float       detailCx = 0, detailCy = 0; // detail circle center (sheet mm)
     };
     std::vector<DocTab> docTabs;
     int activeTab = -1;             // index into docTabs; -1 = no document open (start state)

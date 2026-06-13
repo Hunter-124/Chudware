@@ -792,6 +792,8 @@ _STRUCTURED_ERROR_METHODS = {
     "drawing_get", "drawing_close",
     # W13 drawing annotations + BOM.
     "drawing_add_dim", "drawing_remove_annotation", "drawing_bom",
+    # W15 section + detail views.
+    "drawing_add_section", "drawing_add_detail",
 }
 
 # ---- ask mode (Wave D) — registered via update/add so the literals above stay frozen ----

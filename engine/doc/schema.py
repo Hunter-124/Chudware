@@ -25,8 +25,9 @@ SCHEMA_DRAWING = "aicad.drawing/1"  # W12 — 2D orthographic/iso drawing of a s
 SHEET_SIZES = {"A4", "A3", "A2", "A1", "A0", "A", "B", "C", "D", "E"}
 # Drawing view kinds + canonical orientations (Z-up: front looks +Y, top -Z, right -X — see
 # engine/doc/features/datum.py reserved_datums + drawing.py orientation table).
-VIEW_TYPES = {"base", "projected", "iso"}
-VIEW_ORIENTATIONS = {"front", "back", "top", "bottom", "left", "right", "iso"}
+VIEW_TYPES = {"base", "projected", "iso", "section", "detail"}
+VIEW_ORIENTATIONS = {"front", "back", "top", "bottom", "left", "right", "iso",
+                     "section", "detail"}
 
 RESERVED_DATUMS = {
     "origin",
@@ -889,24 +890,50 @@ def validate_assembly(doc: Any) -> list[str]:
 def _validate_view(v: Any, where: str) -> list[str]:
     """A drawing View: {id, type, orientation, scale, position:[x,y], show_hidden}.
 
-    Optional reserved fields (W13): ``annotations`` (a list) and ``label`` (a string). Geometry —
-    whether the projection actually yields edges — is the projector's concern (drawing.py), not the
-    structural validator's.
+    Optional reserved fields (W13): ``annotations`` (a list) and ``label`` (a string). W15 adds two
+    derived view types — ``section`` (a cut, oriented "section", carrying ``parent`` + a world
+    ``plane`` {normal, point} OR a 2D ``cut_line`` [[x,y],[x,y]] in the parent's sheet mm) and
+    ``detail`` (a magnified crop, oriented "detail", carrying ``parent`` + ``center`` [x,y] +
+    ``radius``). Geometry — whether the projection actually yields edges — is the projector's
+    concern (drawing.py), not the structural validator's.
     """
     errs: list[str] = []
     if not isinstance(v, dict):
         return [f"{where}: view must be an object"]
     if not isinstance(v.get("id"), str) or not re.match(r"^v\d+$", v["id"]):
         errs.append(f"{where}.id: must match v<N>")
-    if v.get("type") not in VIEW_TYPES:
-        errs.append(f"{where}.type: '{v.get('type')}' not in {sorted(VIEW_TYPES)}")
+    vtype = v.get("type")
+    if vtype not in VIEW_TYPES:
+        errs.append(f"{where}.type: '{vtype}' not in {sorted(VIEW_TYPES)}")
     if v.get("orientation") not in VIEW_ORIENTATIONS:
         errs.append(f"{where}.orientation: '{v.get('orientation')}' not in {sorted(VIEW_ORIENTATIONS)}")
     # An iso view must be oriented "iso"; an ortho (base/projected) view must not.
-    if v.get("type") == "iso" and v.get("orientation") != "iso":
+    if vtype == "iso" and v.get("orientation") != "iso":
         errs.append(f"{where}: an 'iso' view requires orientation 'iso'")
-    if v.get("type") in ("base", "projected") and v.get("orientation") == "iso":
+    if vtype in ("base", "projected") and v.get("orientation") == "iso":
         errs.append(f"{where}: orientation 'iso' is only valid for an 'iso' view")
+    # A section/detail view is oriented by its own keyword and references a parent view id.
+    if vtype == "section" and v.get("orientation") != "section":
+        errs.append(f"{where}: a 'section' view requires orientation 'section'")
+    if vtype == "detail" and v.get("orientation") != "detail":
+        errs.append(f"{where}: a 'detail' view requires orientation 'detail'")
+    if vtype in ("section", "detail"):
+        if not (isinstance(v.get("parent"), str) and re.match(r"^v\d+$", v["parent"])):
+            errs.append(f"{where}.parent: {vtype} view needs a parent view id (v<N>)")
+    if vtype == "section":
+        plane = v.get("plane")
+        cut_line = v.get("cut_line")
+        has_plane = (isinstance(plane, dict) and _is_vec(plane.get("normal"), 3)
+                     and _is_vec(plane.get("point"), 3))
+        has_line = (isinstance(cut_line, list) and len(cut_line) == 2
+                    and all(_is_vec(q, 2) for q in cut_line))
+        if not (has_plane or has_line):
+            errs.append(f"{where}: section needs a 'plane' {{normal,point}} or a 2D 'cut_line'")
+    if vtype == "detail":
+        if not _is_vec(v.get("center"), 2):
+            errs.append(f"{where}.center: detail view needs [x,y] (parent sheet mm)")
+        if not _is_num(v.get("radius")) or float(v.get("radius", 0)) <= 0:
+            errs.append(f"{where}.radius: detail view needs a positive radius")
     if not _is_num(v.get("scale")) or float(v.get("scale", 0)) <= 0:
         errs.append(f"{where}.scale: must be a positive number")
     if not _is_vec(v.get("position"), 2):

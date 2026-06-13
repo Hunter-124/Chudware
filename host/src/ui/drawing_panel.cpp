@@ -181,6 +181,32 @@ static bool snapToVertex(const nlohmann::json& sheet, double qx, double qy, doub
     return found;
 }
 
+// W15: find which VIEW a sheet-mm query point falls inside (by bbox, with a small mm margin), so
+// the section/detail tools can anchor a cutting line / detail circle to the parent view under the
+// cursor. Returns the view id (empty when the point is over no view). A derived section/detail view
+// can't itself be a section parent here, but the engine validates the parent anyway.
+static std::string viewAtPoint(const nlohmann::json& sheet, double qx, double qy, double marginMm) {
+    if (!(sheet.contains("views") && sheet["views"].is_array())) return {};
+    std::string hit;
+    double bestArea = 1e300;
+    for (const auto& v : sheet["views"]) {
+        if (!v.is_object() || !v.contains("bbox") || !v["bbox"].is_array() ||
+            v["bbox"].size() != 4) continue;
+        const auto& b = v["bbox"];
+        if (!(b[0].is_number() && b[1].is_number() && b[2].is_number() && b[3].is_number())) continue;
+        double x0 = b[0].get<double>() - marginMm, y0 = b[1].get<double>() - marginMm;
+        double x1 = b[2].get<double>() + marginMm, y1 = b[3].get<double>() + marginMm;
+        if (qx >= x0 && qx <= x1 && qy >= y0 && qy <= y1) {
+            double area = (x1 - x0) * (y1 - y0);   // prefer the smallest enclosing view (detail over parent)
+            if (area < bestArea) {
+                bestArea = area;
+                hit = djstr(v, "view_id").empty() ? djstr(v, "id") : djstr(v, "view_id");
+            }
+        }
+    }
+    return hit;
+}
+
 // Push a finished dimension to the engine (drawing_add_dim) and refresh the cached drawing_get.
 static void commitDimension(AppState& st, AppState::DocTab& tab, const std::string& viewId,
                             float ax, float ay, float bx, float by, float px, float py) {
@@ -223,6 +249,95 @@ static void deleteAnnotation(AppState& st, AppState::DocTab& tab, const std::str
     }
     tab.selAnnViewId.clear();
     tab.selAnnId.clear();
+}
+
+// W15: push a finished cutting line to the engine (drawing_add_section{cut_line}) + refresh.
+static void commitSection(AppState& st, AppState::DocTab& tab, const std::string& parentViewId,
+                          float ax, float ay, float bx, float by) {
+    nlohmann::json res;
+    std::string err;
+    nlohmann::json params = {
+        {"doc_id", tab.drawingDocId},
+        {"parent_view_id", parentViewId},
+        {"cut_line", nlohmann::json::array({nlohmann::json::array({ax, ay}),
+                                            nlohmann::json::array({bx, by})})},
+    };
+    if (st.worker.call("drawing_add_section", params, res, err) && res.is_object() &&
+        !res.contains("code")) {
+        st.refreshDrawingTab(st.activeTab);
+        st.addLog("[draw] added section on " + parentViewId);
+        tab.drawNeedFit = true;   // frame the new section view
+    } else {
+        std::string msg = res.is_object() && res.contains("message") ? djstr(res, "message") : err;
+        st.addLog("[draw] drawing_add_section failed: " + msg);
+        st.toast(ui::ToastLevel::Error, "Section failed: " + (msg.empty() ? "engine error" : msg));
+    }
+}
+
+// W15: push a finished detail circle to the engine (drawing_add_detail) + refresh.
+static void commitDetail(AppState& st, AppState::DocTab& tab, const std::string& parentViewId,
+                         float cx, float cy, float radius) {
+    nlohmann::json res;
+    std::string err;
+    nlohmann::json params = {
+        {"doc_id", tab.drawingDocId},
+        {"parent_view_id", parentViewId},
+        {"center", nlohmann::json::array({cx, cy})},
+        {"radius", radius},
+    };
+    if (st.worker.call("drawing_add_detail", params, res, err) && res.is_object() &&
+        !res.contains("code")) {
+        st.refreshDrawingTab(st.activeTab);
+        st.addLog("[draw] added detail on " + parentViewId);
+        tab.drawNeedFit = true;
+    } else {
+        std::string msg = res.is_object() && res.contains("message") ? djstr(res, "message") : err;
+        st.addLog("[draw] drawing_add_detail failed: " + msg);
+        st.toast(ui::ToastLevel::Error, "Detail failed: " + (msg.empty() ? "engine error" : msg));
+    }
+}
+
+// W15: hatch a closed section-face polygon with 45° lines (sheet-mm spacing), clipped to the
+// polygon by even-odd scanline crossings. `toScreen` maps sheet-mm -> screen px. We sweep a family
+// of lines x + y = c (i.e. 45°) across the polygon's mm bbox; for each we collect the polygon-edge
+// crossings, sort along the line, and stroke inside/outside pairs.
+static void hatchPolygon(ImDrawList* dl, const std::vector<std::array<float, 2>>& poly,
+                         const std::function<ImVec2(double, double)>& toScreen, ImU32 col,
+                         float thick, float spacingMm) {
+    if (poly.size() < 3) return;
+    float minx = poly[0][0], maxx = poly[0][0], miny = poly[0][1], maxy = poly[0][1];
+    for (const auto& p : poly) {
+        minx = std::min(minx, p[0]); maxx = std::max(maxx, p[0]);
+        miny = std::min(miny, p[1]); maxy = std::max(maxy, p[1]);
+    }
+    // 45° hatch direction d=(1,1)/sqrt2; the family is parameterized by c = (y - x). For each line
+    // y = x + c we intersect each polygon edge and pair up the crossings (even-odd fill).
+    const float cMin = (miny - maxx), cMax = (maxy - minx);
+    const float step = std::max(spacingMm, 0.5f) * 1.41421356f;  // perpendicular spacing -> c-step
+    for (float c = cMin; c <= cMax; c += step) {
+        // crossings: solve edge (p0->p1) against y = x + c.  param t where (p0.y + t*dy) = (p0.x + t*dx) + c
+        std::vector<float> xs;  // x-coordinate of each crossing
+        for (size_t i = 0; i < poly.size(); ++i) {
+            const auto& p0 = poly[i];
+            const auto& p1 = poly[(i + 1) % poly.size()];
+            float dx = p1[0] - p0[0], dy = p1[1] - p0[1];
+            float denom = dy - dx;                       // d/dt of (y - x)
+            float num = c - (p0[1] - p0[0]);             // target (y-x)=c minus current at t=0
+            if (std::fabs(denom) < 1e-6f) continue;      // edge parallel to the hatch line
+            float t = num / denom;
+            if (t < 0.0f || t > 1.0f) continue;
+            xs.push_back(p0[0] + t * dx);
+        }
+        if (xs.size() < 2) continue;
+        std::sort(xs.begin(), xs.end());
+        for (size_t k = 0; k + 1 < xs.size(); k += 2) {
+            float x0 = xs[k], x1 = xs[k + 1];
+            // points on the line: y = x + c
+            ImVec2 a = toScreen(x0, x0 + c);
+            ImVec2 b = toScreen(x1, x1 + c);
+            dl->AddLine(a, b, col, thick);
+        }
+    }
 }
 
 // Fetch the BOM for the active drawing (drawing_bom) into the tab cache.
@@ -384,6 +499,42 @@ void drawDrawingSheet(AppState& st) {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("linear = horizontal/vertical span; aligned = true point-to-point distance");
 
+    // ---- W15: Section View tool ----
+    ImGui::SameLine();
+    {
+        bool armed = tab.sectionToolActive;
+        if (armed) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.62f, 0.18f, 1.0f));
+        if (ImGui::SmallButton(armed ? "Section*" : "Section")) {
+            bool now = !tab.sectionToolActive;
+            // Disarm the other modal tools (mutually exclusive).
+            tab.dimToolActive = false; tab.detailToolActive = false;
+            tab.sectionToolActive = now;
+            tab.sectionStage = 0; tab.sectionViewId.clear();
+            if (now) { tab.selAnnViewId.clear(); tab.selAnnId.clear(); }
+        }
+        if (armed) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Section View: click two points across a view to drop a cutting line; "
+                              "the cut model is projected with the cut faces hatched. Esc cancels.");
+    }
+    // ---- W15: Detail View tool ----
+    ImGui::SameLine();
+    {
+        bool armed = tab.detailToolActive;
+        if (armed) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.62f, 0.18f, 1.0f));
+        if (ImGui::SmallButton(armed ? "Detail*" : "Detail")) {
+            bool now = !tab.detailToolActive;
+            tab.dimToolActive = false; tab.sectionToolActive = false;
+            tab.detailToolActive = now;
+            tab.detailStage = 0; tab.detailViewId.clear();
+            if (now) { tab.selAnnViewId.clear(); tab.selAnnId.clear(); }
+        }
+        if (armed) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Detail View: click a center on a view, then drag to set the circle "
+                              "radius; a magnified crop is created. Esc cancels.");
+    }
+
     // BOM toggle — only meaningful for assembly source drawings; we fetch lazily and disable for
     // part drawings (the engine returns is_assembly=false + empty rows).
     ImGui::SameLine();
@@ -396,10 +547,18 @@ void drawDrawingSheet(AppState& st) {
 
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
-    if (tab.dimToolActive) {
-        const char* stageMsg = tab.dimStage == 0 ? "  click vertex A"
-                             : tab.dimStage == 1 ? "  click vertex B"
-                                                 : "  click to place text";
+    if (tab.dimToolActive || tab.sectionToolActive || tab.detailToolActive) {
+        const char* stageMsg;
+        if (tab.dimToolActive)
+            stageMsg = tab.dimStage == 0 ? "  click vertex A"
+                     : tab.dimStage == 1 ? "  click vertex B"
+                                         : "  click to place text";
+        else if (tab.sectionToolActive)
+            stageMsg = tab.sectionStage == 0 ? "  click the cutting-line start across a view"
+                                             : "  click the cutting-line end";
+        else
+            stageMsg = tab.detailStage == 0 ? "  click the detail-circle center on a view"
+                                            : "  move to set the radius, click to finish";
         ImGui::PopStyleColor();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.62f, 0.18f, 1.0f));
         ImGui::TextUnformatted(stageMsg);
@@ -580,6 +739,30 @@ void drawDrawingSheet(AppState& st) {
                 continue;
             }
 
+            // W15: section hatching — fill each section_face polygon with 45° lines (under the
+            // edges, so the cut outline draws crisply on top). The bore shows as a gap because the
+            // engine returns the cut face split into pieces around the hole.
+            if (v.contains("section_faces") && v["section_faces"].is_array()) {
+                const ImU32 hatchCol = IM_COL32(70, 90, 130, 200);
+                for (const auto& poly : v["section_faces"]) {
+                    if (!poly.is_array() || poly.size() < 3) continue;
+                    std::vector<std::array<float, 2>> mm;
+                    mm.reserve(poly.size());
+                    for (const auto& pt : poly)
+                        if (pt.is_array() && pt.size() == 2 && pt[0].is_number() && pt[1].is_number())
+                            mm.push_back({(float)pt[0].get<double>(), (float)pt[1].get<double>()});
+                    if (mm.size() < 3) continue;
+                    // 45° hatch at ~3 mm spacing (sheet mm); thin lines.
+                    hatchPolygon(dl, mm, toScreen, hatchCol, std::max(1.0f, 0.8f * s), 3.0f);
+                    // Outline the cut face boundary so the hatched region reads as a solid cut.
+                    std::vector<ImVec2> bnd;
+                    bnd.reserve(mm.size());
+                    for (const auto& p : mm) bnd.push_back(toScreen(p[0], p[1]));
+                    dl->AddPolyline(bnd.data(), (int)bnd.size(), inkVisible,
+                                    ImDrawFlags_Closed, visThick);
+                }
+            }
+
             // Stroke hidden polylines first (under the solid lines).
             if (v.contains("hidden") && v["hidden"].is_array()) {
                 for (const auto& pl : v["hidden"]) {
@@ -606,11 +789,74 @@ void drawDrawingSheet(AppState& st) {
                 }
             }
 
-            // Per-view label: orientation + scale, just under the view bbox.
+            // W15: parent-view markers — the cutting line(s) and detail circle(s) the engine
+            // attaches to a parent view in drawing_get, drawn over the geometry.
+            const ImU32 markCol = IM_COL32(190, 60, 50, 235);
+            const float markThick = std::max(1.2f, 1.3f * s);
+            if (v.contains("section_lines") && v["section_lines"].is_array()) {
+                for (const auto& sl : v["section_lines"]) {
+                    if (!sl.is_object() || !sl.contains("line") || !sl["line"].is_array() ||
+                        sl["line"].size() != 2) continue;
+                    const auto& L = sl["line"];
+                    if (!(L[0].is_array() && L[1].is_array())) continue;
+                    ImVec2 a = toScreen(L[0][0].get<double>(), L[0][1].get<double>());
+                    ImVec2 b = toScreen(L[1][0].get<double>(), L[1][1].get<double>());
+                    addDashedPolyline(dl, {a, b}, markCol, markThick, 10.0f * s, 4.0f * s);
+                    // End arrows + the section letter at both ends ("A").
+                    std::string lab = djstr(sl, "label");
+                    ImVec2 dir(b.x - a.x, b.y - a.y);
+                    float len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
+                    if (len > 1e-3f) {
+                        ImVec2 n(-dir.y / len, dir.x / len);   // perpendicular (arrow body)
+                        auto endArrow = [&](const ImVec2& tip, float sgn) {
+                            ImVec2 bdir(n.x * sgn, n.y * sgn);  // arrow points along the look dir
+                            float ah = 10.0f * s, aw = 4.0f * s;
+                            ImVec2 base(tip.x + bdir.x * ah, tip.y + bdir.y * ah);
+                            ImVec2 u(dir.x / len, dir.y / len);
+                            dl->AddTriangleFilled(tip,
+                                ImVec2(base.x + u.x * aw, base.y + u.y * aw),
+                                ImVec2(base.x - u.x * aw, base.y - u.y * aw), markCol);
+                        };
+                        endArrow(a, 1.0f);
+                        endArrow(b, 1.0f);
+                        if (!lab.empty()) {
+                            dl->AddText(ImVec2(a.x - 6 * s, a.y - 16 * s), markCol, lab.c_str());
+                            dl->AddText(ImVec2(b.x - 6 * s, b.y + 6 * s), markCol, lab.c_str());
+                        }
+                    }
+                }
+            }
+            if (v.contains("detail_circles") && v["detail_circles"].is_array()) {
+                for (const auto& dc : v["detail_circles"]) {
+                    if (!dc.is_object() || !dc.contains("center") || !dc["center"].is_array() ||
+                        dc["center"].size() != 2) continue;
+                    double ccx = dc["center"][0].get<double>(), ccy = dc["center"][1].get<double>();
+                    double rad = djnum(dc, "radius", 0.0);
+                    ImVec2 c = toScreen(ccx, ccy);
+                    float rpx = (float)rad * z;
+                    dl->AddCircle(c, rpx, markCol, 48, markThick);
+                    std::string lab = djstr(dc, "label");
+                    if (!lab.empty()) {
+                        ImVec2 lp(c.x + rpx * 0.7f, c.y - rpx * 0.7f - 14 * s);
+                        dl->AddText(lp, markCol, lab.c_str());
+                    }
+                }
+            }
+
+            // Per-view label: SolidWorks-style title. Section/detail get "SECTION A-A" / "DETAIL B"
+            // (with the scale); ortho/iso show the orientation + scale.
             if (haveBox) {
-                char lbl[64];
-                std::snprintf(lbl, sizeof(lbl), "%s  (%.2g:1)",
-                              orient.empty() ? "view" : orient.c_str(), scale);
+                char lbl[80];
+                std::string vtype = djstr(v, "type");
+                std::string vlabel = djstr(v, "label");
+                if (vtype == "section" && !vlabel.empty())
+                    std::snprintf(lbl, sizeof(lbl), "SECTION %s-%s  (%.2g:1)",
+                                  vlabel.c_str(), vlabel.c_str(), scale);
+                else if (vtype == "detail" && !vlabel.empty())
+                    std::snprintf(lbl, sizeof(lbl), "DETAIL %s  (%.2g:1)", vlabel.c_str(), scale);
+                else
+                    std::snprintf(lbl, sizeof(lbl), "%s  (%.2g:1)",
+                                  orient.empty() ? "view" : orient.c_str(), scale);
                 ImVec2 lp(boxTL.x, boxBR.y + 4 * s);
                 ImVec2 ts = ImGui::CalcTextSize(lbl);
                 dl->AddRectFilled(ImVec2(lp.x - 2, lp.y - 1),
@@ -638,10 +884,11 @@ void drawDrawingSheet(AppState& st) {
 
     // ---- W13: dimension tool interaction (snap + place) + annotation select/delete ----
     {
-        // Esc cancels the in-progress dimension (or disarms a fresh tool).
-        if (tab.dimToolActive && ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-            tab.dimStage = 0;
-            tab.dimViewId.clear();
+        // Esc cancels the in-progress dimension/section/detail (or disarms a fresh tool).
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            if (tab.dimToolActive) { tab.dimStage = 0; tab.dimViewId.clear(); }
+            if (tab.sectionToolActive) { tab.sectionStage = 0; tab.sectionViewId.clear(); }
+            if (tab.detailToolActive) { tab.detailStage = 0; tab.detailViewId.clear(); }
         }
         ImVec2 mouse = ImGui::GetIO().MousePos;
         bool overCanvas = canvasHovered;
@@ -650,7 +897,60 @@ void drawDrawingSheet(AppState& st) {
         double curMy = -(mouse.y - canvasMin.y - panY) / z;
         double snapRadiusMm = 9.0 / std::max(z, 1e-4f);   // ~9 px snap radius -> sheet mm
 
-        if (tab.dimToolActive && overCanvas) {
+        // ---- W15: Section View tool (drop a 2-click cutting line across a parent view) ----
+        if (tab.sectionToolActive && overCanvas) {
+            std::string overView = viewAtPoint(*sheet, curMx, curMy, 8.0);
+            // Rubber-band preview of the cutting line.
+            if (tab.sectionStage == 1) {
+                ImVec2 a = toScreen(tab.sectionAx, tab.sectionAy);
+                addDashedPolyline(dl, {a, mouse}, IM_COL32(190, 60, 50, 200), 1.4f * s,
+                                  10.0f * s, 4.0f * s);
+            }
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
+                if (tab.sectionStage == 0) {
+                    if (!overView.empty()) {
+                        tab.sectionAx = (float)curMx; tab.sectionAy = (float)curMy;
+                        tab.sectionViewId = overView; tab.sectionStage = 1;
+                    } else {
+                        st.toast(ui::ToastLevel::Warn, "Start the cutting line on a view");
+                    }
+                } else if (tab.sectionStage == 1) {
+                    commitSection(st, tab, tab.sectionViewId, tab.sectionAx, tab.sectionAy,
+                                  (float)curMx, (float)curMy);
+                    tab.sectionStage = 0; tab.sectionViewId.clear();
+                }
+            }
+        }
+        // ---- W15: Detail View tool (click center, drag radius) ----
+        else if (tab.detailToolActive && overCanvas) {
+            std::string overView = viewAtPoint(*sheet, curMx, curMy, 8.0);
+            if (tab.detailStage == 1) {
+                ImVec2 c = toScreen(tab.detailCx, tab.detailCy);
+                double rmm = std::hypot(curMx - tab.detailCx, curMy - tab.detailCy);
+                dl->AddCircle(c, (float)rmm * z, IM_COL32(190, 60, 50, 220), 48, 1.4f * s);
+                dl->AddCircleFilled(c, 2.5f * s, IM_COL32(190, 60, 50, 220));
+            }
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
+                if (tab.detailStage == 0) {
+                    if (!overView.empty()) {
+                        tab.detailCx = (float)curMx; tab.detailCy = (float)curMy;
+                        tab.detailViewId = overView; tab.detailStage = 1;
+                    } else {
+                        st.toast(ui::ToastLevel::Warn, "Click the detail center on a view");
+                    }
+                } else if (tab.detailStage == 1) {
+                    double rmm = std::hypot(curMx - tab.detailCx, curMy - tab.detailCy);
+                    if (rmm < 1.0) {
+                        st.toast(ui::ToastLevel::Warn, "Drag out a larger detail radius");
+                    } else {
+                        commitDetail(st, tab, tab.detailViewId, tab.detailCx, tab.detailCy,
+                                     (float)rmm);
+                        tab.detailStage = 0; tab.detailViewId.clear();
+                    }
+                }
+            }
+        }
+        else if (tab.dimToolActive && overCanvas) {
             // Live snap highlight.
             double sx, sy; std::string svid;
             bool snapped = snapToVertex(*sheet, curMx, curMy, snapRadiusMm, sx, sy, svid);
@@ -684,8 +984,9 @@ void drawDrawingSheet(AppState& st) {
                     tab.dimViewId.clear();
                 }
             }
-        } else if (!tab.dimToolActive && overCanvas &&
-                   ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown && !panning) {
+        } else if (!tab.dimToolActive && !tab.sectionToolActive && !tab.detailToolActive &&
+                   overCanvas && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown &&
+                   !panning) {
             // Selection: pick the nearest stored dimension's text position to the click.
             std::string hitView, hitAnn; double bestD2 = (14.0 / std::max(z, 1e-4f)) *
                                                           (14.0 / std::max(z, 1e-4f));

@@ -295,6 +295,41 @@ source's CURRENT bodies on every fetch (associative); the host re-fetches after 
   `(source_revision, orientation, scale, show_hidden)` so re-fetching an unchanged source is cheap
   (position is re-applied as a cheap translate without re-running HLR).
 
+#### Section + Detail views (W15 — additive)
+
+Two DERIVED view types built on the same HLR projection, each anchored to a `parent` view id.
+
+| method | params → result |
+|---|---|
+| `drawing_add_section` | `{doc_id, parent_view_id, plane?|cut_line?, label?, scale?, position?, sheet_id?, show_hidden?}` → `{view_id, revision, view}` — cut the model and project the cut. The cut is EITHER a world `plane` `{normal:[x,y,z], point:[x,y,z]}` OR a 2D `cut_line` `[[x1,y1],[x2,y2]]` in the PARENT view's sheet-mm coords (a cutting line dropped across the parent). Defaults: `label`=next free letter, `scale`=parent's, `show_hidden`=false. `view` is a ViewGeometry with `type:"section"`, `orientation:"section"`, `parent`, `label`, the cutting definition echoed back, and a new **`section_faces`** field (below). `invalid_op` on an unknown parent or a missing/degenerate cut definition. |
+| `drawing_add_detail` | `{doc_id, parent_view_id, center, radius, scale?, label?, position?, sheet_id?, show_hidden?}` → `{view_id, revision, view}` — a magnified circular crop of the parent. `center` is `[x,y]` in the PARENT's sheet mm; `radius` > 0 (parent sheet mm). Defaults: `label`=next free letter, `scale`=2× the parent's. `view` is a ViewGeometry with `type:"detail"`, `orientation:"detail"`, `parent`, `label`, `center`, `radius`. `invalid_op` on an unknown parent, a non-`[x,y]` center, or a non-positive radius. |
+
+**`section_faces` (section ViewGeometry, W15).** A list of CLOSED polygons (each `[[x,y],…]` in
+sheet mm, ≥3 points) — the cross-section areas where the cut plane slices solid material. The host
+HATCHES these (45° lines clipped to each polygon). A through hole / cavity SPLITS the cut face into
+several polygons, so the bore reads as a gap in the hatch (the section reveals the bore). The
+section's HLR is run on the CUT solid (the half between the eye and the plane is removed via an
+OCCT `BRepAlgoAPI_Cut` against a large half-space box), so the visible polylines show the actual cut
+silhouette + the geometry behind it. A cut plane that misses the model sets `error` +
+empty `section_faces` (contained, not a raise).
+
+**Parent markers (attached by `drawing_get`).** Each PARENT view's geometry gains, when it has
+children: `section_lines:[{label, view_id, line:[[x,y],[x,y]]}]` (the cutting line to draw across the
+parent, sheet mm — only for `cut_line`-defined sections) and
+`detail_circles:[{label, view_id, center:[x,y], radius}]` (the detail bubble). The host draws the
+labelled cutting line / detail circle on the parent and titles each derived view
+("SECTION A-A" / "DETAIL B").
+
+- **Geometry model / limitation:** the section cut is a real OCCT half-space boolean on the source
+  solids (real cut geometry, bore revealed, hatched cut faces), projected along the cut normal. The
+  `cut_line` form un-projects the two parent sheet points through the parent's view frame to a world
+  cutting plane that contains the cut line and the parent's view direction (the SolidWorks "drop a
+  line, look sideways" model). Section faces are detected as planar faces of the cut solid that are
+  coplanar with and lie on the cut plane. Section/detail views are NOT position-cached (each
+  re-cuts / re-derives from the live parent on every fetch, staying associative). A cut line parallel
+  to the parent's view direction, or a section whose plane contains no solid material, yields a
+  contained `error`.
+
 ### Evaluate (M5; overlay-producing methods return `{aicm_path}` with `SCLR` chunks)
 `eval_measure {doc_id, refs:[Selector,…]}` → `{kind, distance?, angle?, length?, area?, radius?,
 points?:[…]} `· `eval_mass {doc_id, body?}` → `{volume_mm3, mass_g, com:[3], inertia:[9],

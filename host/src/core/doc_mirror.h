@@ -186,6 +186,22 @@ public:
     // List open docs (returns array or empty on error).
     nlohmann::json list(WorkerClient& w, std::string& err);
 
+    // ---- Configurations (SolidWorks ConfigurationManager) ----
+    // Generic config-op caller: issue `method` ({"config_add"|"config_delete"|"config_activate"|
+    // "config_set_override"|"config_set_suppression"}) with {doc_id, ...extraParams}. These all
+    // return the SAME ops-response shape applyOps does (revision/tree/rebuild/tess/owner_map), for
+    // the now-active config, so this ingests it EXACTLY like applyOps: updates revision/tree/
+    // feature_status/owner_map and fires the listener (so the FeatureManager tree repaints). The
+    // caller feeds the returned OpsResponse::aicm_path into AppState::loadDocMesh so the viewport
+    // updates. doc_id is injected automatically. No-op (no_doc) when no document is open.
+    OpsResponse callConfig(WorkerClient& w, const std::string& method,
+                           const nlohmann::json& extraParams);
+
+    // Read-only config listing (config_list): returns the raw result
+    // {configurations:[name...], active, detail:[{name, param_overrides, suppressions}]} or a null
+    // json on error (err filled). Does NOT mutate the mirror.
+    nlohmann::json configList(WorkerClient& w, std::string& err);
+
     // Re-pull the document tree + revision from the worker (doc_tree) and fire the listener.
     // C24: the public face of the formerly-private resyncTree — callers that mutated the doc
     // out-of-band (sketch drag/commit/exit, a v2 agent run) use this to bring the mirror back in

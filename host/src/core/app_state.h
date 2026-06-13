@@ -499,6 +499,9 @@ struct AppState {
     bool focusDesignTab = false;  // one-shot: focus the Design tab after a (re)layout
     // Consolidated AI panel (Design / Activity / Console as internal tabs). One dock window "AI".
     bool showAIPanel = true;
+    // Configurations panel (SolidWorks ConfigurationManager). Dockable "Configurations" window in
+    // the right task pane; View > Configurations toggles it. Only meaningful for part/asm docs.
+    bool showConfigPanel = false;
     int  aiInteraction = 0;       // 0=Design (new part) 1=Edit (orchestrator v2) 2=Chat
     bool focusActivityTab = false;  // one-shot: select the Activity tab (e.g. when a v2 run starts)
     bool showAbout = false, designStarted = false;

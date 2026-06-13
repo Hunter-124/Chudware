@@ -85,6 +85,9 @@ add_executable(AI-CAD
   # --- C18: sketch mode UI ---
   src/ui/sketch_mode.cpp
   # --- end C18 ---
+  # --- Configurations panel (SolidWorks ConfigurationManager) ---
+  src/ui/config_panel.cpp
+  # --- end Configurations ---
   # --- C19: simulation + flow + evaluate UI ---
   src/core/sim_client.cpp
   src/ui/sim_panel.cpp

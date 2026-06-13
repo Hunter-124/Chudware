@@ -51,6 +51,7 @@
 #include "ui/ribbon_def.h"
 #include "ui/property_manager.h"
 #include "ui/sketch_mode.h"   // C18
+#include "ui/config_panel.h"  // Configurations (SolidWorks ConfigurationManager)
 #include "ui/toast.h"         // W1-B: toast notifications
 #include "ui/cursors.h"       // W1-B: cursor manager
 // --- C19: simulation + flow + evaluate UI ---
@@ -188,6 +189,9 @@ int run_gui(const char* screenshotPath) {
     // C18: SketchMode — owned here, borrowed via st.sketchMode (opaque void*).
     ui::SketchMode sketchMode;
     st.sketchMode = &sketchMode;
+
+    // Configurations panel (SolidWorks ConfigurationManager) — owned here, drawn each frame.
+    ui::ConfigPanel configPanel;
 
     // --- C22b: ActivityPanel — owned here, borrowed via st.activityPanel (opaque void*). ---
     ui::ActivityPanel activityPanel;
@@ -1102,6 +1106,11 @@ int run_gui(const char* screenshotPath) {
 
         // ---------- C20b: assembly panels (Insert / Mate / Explode / Interference / BOM) ----------
         asmPanels.draw(st);
+
+        // ---------- Configurations panel (SolidWorks ConfigurationManager) ----------
+        // Lists the active part/asm doc's configurations; activate/add/delete ingest the
+        // ops-response so the viewport + FeatureManager refresh. No-op unless st.showConfigPanel.
+        configPanel.draw(st);
 
         // ---------- C15 pick-shot driver: simulate a center-screen pick ----------
         // The viewport panel rendered the id buffer for this frame's camera; pick its center,

@@ -417,4 +417,45 @@ nlohmann::json DocMirror::list(WorkerClient& w, std::string& err) {
     return nlohmann::json::array();
 }
 
+// ---- Configurations -------------------------------------------------------
+
+OpsResponse DocMirror::callConfig(WorkerClient& w, const std::string& method,
+                                  const nlohmann::json& extraParams) {
+    OpsResponse r;
+    if (docId_.empty()) { r.error_code = "no_doc"; r.error_message = "no document open"; return r; }
+    nlohmann::json params = extraParams.is_object() ? extraParams : nlohmann::json::object();
+    params["doc_id"] = docId_;
+    nlohmann::json res;
+    std::string err;
+    // A config_activate/add/delete can trigger a full rebuild — give it the same headroom the
+    // tab-switch doc_rebuild uses rather than the doc_* default.
+    if (!w.call(method, params, res, err, 60000)) {
+        r.error_code = "transport"; r.error_message = err; return r;
+    }
+    if (res.contains("code")) {
+        r.error_code = jstr(res, "code"); r.error_message = jstr(res, "message");
+        if (r.error_code == "stale_revision") resyncTree(w);
+        return r;
+    }
+    // Same ops-response shape apply_ops returns — ingest it so the mirror (revision/tree/owner_map)
+    // stays in step with the now-active config and the listener repaints the tree.
+    r = parseOpsResponse(res);
+    if (r.ok) {
+        revision_ = r.revision;
+        if (!r.tree.is_null()) tree_ = r.tree;
+        if (!r.feature_status.is_null()) featureStatus_ = r.feature_status;
+        storeOwnerMap(r.owner_map);
+        notify();
+    }
+    return r;
+}
+
+nlohmann::json DocMirror::configList(WorkerClient& w, std::string& err) {
+    if (docId_.empty()) { err = "no document open"; return nlohmann::json(); }
+    nlohmann::json res;
+    if (!w.call("config_list", {{"doc_id", docId_}}, res, err)) return nlohmann::json();
+    if (res.contains("code")) { err = jstr(res, "message"); return nlohmann::json(); }
+    return res;
+}
+
 }  // namespace core

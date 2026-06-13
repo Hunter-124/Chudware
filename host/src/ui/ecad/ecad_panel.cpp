@@ -3,6 +3,7 @@
 
 #include "ecad_panel.h"
 
+#include <cmath>
 #include <cstdio>
 
 #include "../../core/app_state.h"
@@ -23,6 +24,11 @@ struct EcadEditorState {
     EcadMirror::Kind lastKind = EcadMirror::Kind::None;
     float leftW = 200.0f;     // left sub-panel width (px, pre-scale)
     bool  showLeft = true;
+    // Wave Q — canvas editing tool state.
+    std::string placeLib = "Device:R";             // symbol to place (Place tool, schematic)
+    std::string placeFp  = "Resistor_SMD:R_0603";  // footprint to place (Place tool, board)
+    bool  routing = false;       // a Route chain is in progress
+    float lastX = 0, lastY = 0;  // last routed point (world mm)
 };
 
 EcadEditorState& state() {
@@ -44,6 +50,37 @@ ImVec4 layerSwatch(int copperIndex) {
         case 4:  return v4(p.axisY);
         default: return v4(p.statusErr);
     }
+}
+
+// Snap a world coordinate to a sensible ECAD grid (schematic 1.27mm; board 0.5mm).
+float snapTo(float v, float g) { return std::round(v / g) * g; }
+
+// Wave Q — translate a canvas click into a place/route op for the active tool. Sets
+// st.ecadPendingOps / st.ecadOpsGo; the app loop applies them via ecad_apply_ops + reloads.
+void handleCanvasEdit(AppState& st, EcadEditorState& es, const EcadCanvasIO& io) {
+    // Esc or right-click ends an in-progress route chain.
+    if (es.routing && (ImGui::IsKeyPressed(ImGuiKey_Escape) ||
+                       ImGui::IsMouseClicked(ImGuiMouseButton_Right)))
+        es.routing = false;
+    if (st.ecadTool == 0 || !io.clicked || !io.hasWorldMouse) return;
+
+    const bool sch = es.mirror.isSch();
+    const float g = sch ? 1.27f : 0.5f;
+    const float gx = snapTo(io.worldMouse.x, g), gy = snapTo(io.worldMouse.y, g);
+    nlohmann::json ops = nlohmann::json::array();
+
+    if (st.ecadTool == 1) {              // Place
+        if (sch) ops.push_back({{"op", "sch_add_symbol"}, {"libid", es.placeLib}, {"pos", {gx, gy}}});
+        else     ops.push_back({{"op", "pcb_add_footprint"}, {"fpid", es.placeFp}, {"pos", {gx, gy}}});
+    } else if (st.ecadTool == 2) {       // Route (click-to-click polyline)
+        if (es.routing) {
+            if (sch) ops.push_back({{"op", "sch_add_wire"}, {"pts", {{es.lastX, es.lastY}, {gx, gy}}}});
+            else     ops.push_back({{"op", "pcb_add_track"}, {"layer", "F.Cu"}, {"width", 0.25},
+                                    {"p1", {es.lastX, es.lastY}}, {"p2", {gx, gy}}});
+        }
+        es.routing = true; es.lastX = gx; es.lastY = gy;  // anchor for the next segment
+    }
+    if (!ops.empty()) { st.ecadPendingOps = ops; st.ecadOpsGo = true; }
 }
 
 // ---- left sub-panel: PCB layers / sch nets ----
@@ -219,6 +256,46 @@ void drawEcadEditor(AppState& st) {
 
     ImGui::Separator();
 
+    // ---- canvas tool toolbar (Wave Q): Select / Place / Route + the part to place ----
+    {
+        auto toolBtn = [&](const char* label, int tool) {
+            const bool on = (st.ecadTool == tool);
+            if (on) ImGui::PushStyleColor(ImGuiCol_Button, v4(pal.accentDim));
+            if (ImGui::Button(label)) { st.ecadTool = tool; es.routing = false; }
+            if (on) ImGui::PopStyleColor();
+            ImGui::SameLine();
+        };
+        toolBtn("Select", 0);
+        toolBtn("Place", 1);
+        toolBtn("Route", 2);
+        ImGui::TextColored(v4(pal.textDim), "|");
+        ImGui::SameLine();
+        if (st.ecadTool == 1 && es.mirror.isSch()) {
+            static const char* kLibs[] = {"Device:R", "Device:C", "Device:L", "Device:D",
+                "Simulation_SPICE:V_source", "power:GND", "power:VCC"};
+            ImGui::SetNextItemWidth(210 * sc);
+            if (ImGui::BeginCombo("Part", es.placeLib.c_str())) {
+                for (auto* l : kLibs)
+                    if (ImGui::Selectable(l, es.placeLib == l)) es.placeLib = l;
+                ImGui::EndCombo();
+            }
+        } else if (st.ecadTool == 1) {
+            static const char* kFps[] = {"Resistor_SMD:R_0603", "Capacitor_SMD:C_0603",
+                "Package_SO:SOIC-8", "Package_TO_SOT_SMD:SOT-23"};
+            ImGui::SetNextItemWidth(250 * sc);
+            if (ImGui::BeginCombo("Footprint", es.placeFp.c_str())) {
+                for (auto* f : kFps)
+                    if (ImGui::Selectable(f, es.placeFp == f)) es.placeFp = f;
+                ImGui::EndCombo();
+            }
+        } else {
+            ImGui::TextColored(v4(pal.textDim), st.ecadTool == 2
+                ? "Route: click points; Esc / right-click to finish"
+                : "Select: middle/right-drag to pan, wheel to zoom");
+        }
+    }
+    ImGui::Separator();
+
     // Reserve the bottom results strip; the rest splits left sub-panel | canvas.
     const float bottomH = 140.0f * sc;
     const ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -238,7 +315,8 @@ void drawEcadEditor(AppState& st) {
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     const ImVec2 canvasAvail = ImGui::GetContentRegionAvail();
     EcadCanvasIO io = es.canvas.draw(es.mirror, canvasAvail);
-    // Scaffold: surface the world cursor in the corner (the worker pick hook is documented, not wired).
+    handleCanvasEdit(st, es, io);  // Wave Q: tool-mode place/route on click
+    // Surface the world cursor in the corner.
     if (io.hasWorldMouse) {
         char buf[64];
         std::snprintf(buf, sizeof(buf), "%.2f, %.2f mm", io.worldMouse.x, io.worldMouse.y);

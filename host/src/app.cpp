@@ -120,6 +120,30 @@ void ecadDocRpc(AppState& st, const char* method, const char* okMsg) {
     if (okMsg) st.toast(ui::ToastLevel::Info, okMsg);
 }
 
+// Apply an op batch to the current ECAD doc (canvas place/route edits) with the optimistic-
+// concurrency + stale-revision-resync discipline core/doc_mirror.cpp uses for the CAD doc.
+void ecadApplyOps(AppState& st, const nlohmann::json& ops) {
+    if (st.ecadDocId.empty() || !ops.is_array() || ops.empty()) return;
+    nlohmann::json res; std::string err;
+    nlohmann::json params = {{"doc_id", st.ecadDocId}, {"base_revision", st.ecadRevision}, {"ops", ops}};
+    if (!st.worker.call("ecad_apply_ops", params, res, err)) {
+        st.toast(ui::ToastLevel::Error, "ECAD edit failed: " + err);
+        return;
+    }
+    if (res.is_object() && res.contains("code")) {
+        if (jstr(res, "code") == "stale_revision") {
+            nlohmann::json tr; std::string e2;
+            if (st.worker.call("ecad_tree", {{"doc_id", st.ecadDocId}}, tr, e2) &&
+                !(tr.is_object() && tr.contains("code"))) ecadAdopt(st, tr);
+            st.toast(ui::ToastLevel::Warn, "ECAD edit dropped (stale) - resynced");
+        } else {
+            st.toast(ui::ToastLevel::Error, "ECAD: " + jstr(res, "message"));
+        }
+        return;
+    }
+    ecadAdopt(st, res);
+}
+
 void ecadExport(AppState& st, const char* kind) {
     if (st.ecadDocId.empty()) { st.toast(ui::ToastLevel::Warn, "Open an ECAD document first"); return; }
     std::error_code ec;
@@ -196,6 +220,17 @@ void ecadDispatch(AppState& st, const std::string& cmd) {
     if (cmd == "ecad_export_gerber") { ecadExport(st, "gerber"); return; }
     if (cmd == "ecad_export_drill")  { ecadExport(st, "drill"); return; }
     if (cmd == "ecad_export_bom")    { ecadExport(st, "bom"); return; }
+    // Canvas tool modes (Wave Q): place a part / route on click.
+    if (cmd == "sch_add_symbol" || cmd == "pcb_add_footprint") {
+        st.ecadTool = 1; st.wantFocusEcad = 4;
+        st.toast(ui::ToastLevel::Info, "Place tool: click the canvas to drop the part");
+        return;
+    }
+    if (cmd == "sch_add_wire" || cmd == "pcb_add_track") {
+        st.ecadTool = 2; st.wantFocusEcad = 4;
+        st.toast(ui::ToastLevel::Info, "Route tool: click points; Esc or right-click to finish");
+        return;
+    }
     st.addLog("[ecad] " + cmd + " (interactive placement pending)");
     st.toast(ui::ToastLevel::Info, "ECAD: place/edit on the canvas (interactive tools coming)");
 }
@@ -1086,10 +1121,28 @@ int run_gui(const char* screenshotPath) {
             const bool wantPcb = kindEnv && std::strcmp(kindEnv, "pcb") == 0;
             const bool want3d  = kindEnv && std::strcmp(kindEnv, "3d") == 0;
             const bool wantAi  = kindEnv && std::strcmp(kindEnv, "ai") == 0;
+            const bool wantEdit = kindEnv && std::strcmp(kindEnv, "editsch") == 0;
             nlohmann::json r;
             std::string showId;
             if (wantAi) {
                 st.wantFocusEcad = 6;   // surface the empty AI launchpad for the screenshot
+            } else if (wantEdit) {
+                // Exercise the Place/Route tools by applying the ops a user's clicks would produce.
+                if (ecall("ecad_new", {{"kind", "sch"}}, r)) {
+                    const std::string id = jstr(r, "doc_id");
+                    const int rev = jint(r, "revision");
+                    nlohmann::json ops = nlohmann::json::array();
+                    ops.push_back({{"op","sch_add_symbol"},{"libid","Simulation_SPICE:V_source"},{"pos",{10,42}},{"value","5"}});
+                    ops.push_back({{"op","sch_add_symbol"},{"libid","Device:R"},{"pos",{32,42}},{"value","10k"}});
+                    ops.push_back({{"op","sch_add_symbol"},{"libid","Device:R"},{"pos",{32,22}},{"value","10k"}});
+                    ops.push_back({{"op","sch_add_symbol"},{"libid","Device:C"},{"pos",{54,22}},{"value","100n"}});
+                    ops.push_back({{"op","sch_add_symbol"},{"libid","power:GND"},{"pos",{32,6}}});
+                    ops.push_back({{"op","sch_add_wire"},{"pts",{{10,32},{32,32}}}});
+                    ops.push_back({{"op","sch_add_wire"},{"pts",{{32,32},{54,32},{54,26}}}});
+                    ecall("ecad_apply_ops", {{"doc_id",id},{"base_revision",rev},{"ops",ops}}, r);
+                    st.ecadTool = 1;   // show the Place tool active in the toolbar
+                    showId = id;
+                }
             } else if (wantPcb || want3d) {
                 // Build a small demo board explicitly: outline + two 0603 footprints (pads
                 // resolved from the library) + a routed track + a GND copper pour, then fill it.
@@ -1284,6 +1337,7 @@ int run_gui(const char* screenshotPath) {
         if (st.wantFocusEcad > 0) { ImGui::SetNextWindowFocus(); st.wantFocusEcad--; }
         ui::drawEcadEditor(st);   // Wave N: AI-ECAD 2D editor (launchpad until an ECAD doc loads)
         if (st.ecadAiGo) { st.ecadAiGo = false; ecadAiDesign(st, st.ecadAiRequest); }  // Wave P
+        if (st.ecadOpsGo) { st.ecadOpsGo = false; ecadApplyOps(st, st.ecadPendingOps); }  // Wave Q
 
         // ---------- C19: simulation panel + evaluate dialogs ----------
         simPanel.tick(st);          // drain SimClient progress + completion (loads overlays)

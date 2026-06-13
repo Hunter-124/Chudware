@@ -40,6 +40,9 @@ from . import hole as _hole  # noqa: F401
 # Patterns + mirror (replicate upstream seed features) and draft (taper faces):
 from . import pattern as _pattern  # noqa: F401
 from . import draft as _draft  # noqa: F401
+# Multi-body boolean (combine/subtract/intersect) and helix curve (sweep path source):
+from . import boolean as _boolean  # noqa: F401
+from . import curves as _curves  # noqa: F401
 
 __all__ = [
     "CompileContext",

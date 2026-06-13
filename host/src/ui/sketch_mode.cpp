@@ -4055,6 +4055,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 const SketchEntity& e = ents_[idx];
                 if (e.type != "line" && e.type != "circle" && e.type != "arc") {
                     st.addLog("[sketch] Trim: unsupported entity type '" + e.type + "'");
+                    st.toast(ui::ToastLevel::Info,
+                             "Trim works on lines, circles, and arcs — not " + e.type);
                     return false;
                 }
                 nlohmann::json op = {{"op", "sketch_trim"}, {"sketch", fid_},
@@ -4112,6 +4114,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 const SketchEntity& e = ents_[hovered];
                 if (!whichEnd) {
                     st.addLog("[sketch] Extend: unsupported entity type '" + e.type + "'");
+                    st.toast(ui::ToastLevel::Info,
+                             "Extend works on lines and arcs — not " + e.type);
                 } else {
                     nlohmann::json op = {{"op", "sketch_extend"}, {"sketch", fid_},
                         {"entity", e.id}, {"end", whichEnd}};

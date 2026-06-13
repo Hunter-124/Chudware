@@ -379,6 +379,12 @@ def _project_one(s: DrawingSession, view: dict, src_shapes: list, src_rev: int) 
     out["type"] = view.get("type")
     out["position"] = [float(pos[0]), float(pos[1])]
     out["show_hidden"] = show_hidden
+    # W13: the view's stored annotations (dimensions/notes) ride along with the projected geometry so
+    # drawing_get / add_view round-trip them. They are sheet-mm coords, independent of the HLR cache.
+    import copy as _copy
+    out["annotations"] = _copy.deepcopy(view.get("annotations", []) or [])
+    if view.get("label") is not None:
+        out["label"] = view.get("label")
     return out
 
 
@@ -483,6 +489,183 @@ def set_view(doc_id: str, view_id: str, *, scale: Optional[float] = None,
     return {"view_id": view_id, "revision": s.revision, "view": geom}
 
 
+# --------------------------------------------------------------------------- annotations (W13)
+
+
+_ANNOTATION_TYPES = {"linear_dim", "aligned_dim", "note"}
+
+
+def _format_dim_value(value: float, units: str) -> str:
+    """Format a measured MODEL length for the annotation's default ``text``.
+
+    The engine is canonical mm; for MMGS we show millimetres, for IPS we convert to inches. The host
+    re-formats on render (pmFormatDim) so this is only the stored default — keep it human-readable.
+    """
+    if units == "IPS":
+        return f"{value / 25.4:.4g} in"
+    return f"{value:.4g}"
+
+
+def _next_ann_id(view: dict) -> str:
+    hi = 0
+    for a in view.get("annotations", []) or []:
+        aid = a.get("id", "")
+        if isinstance(aid, str) and aid.startswith("a") and aid[1:].isdigit():
+            hi = max(hi, int(aid[1:]))
+    return f"a{hi + 1}"
+
+
+def _doc_units(doc: dict) -> str:
+    u = (doc.get("units") or {}).get("system")
+    return u if u in ("MMGS", "IPS") else "MMGS"
+
+
+def add_dim(doc_id: str, view_id: str, *, type: str, a: list, b: list,
+            pos: Optional[list] = None, text: Optional[str] = None) -> dict:
+    """drawing_add_dim — append a dimension/note annotation to a view.
+
+    ``a`` and ``b`` are SHEET-mm points (the host snaps them to projected polyline vertices). The
+    displayed ``value`` is the TRUE MODEL length: ``|a - b| / view.scale`` — because the view geometry
+    is drawn at ``scale`` (sheet = model * scale), dividing the sheet distance by the scale recovers
+    the real measured model distance, so the value is SCALE-INDEPENDENT (a 2:1 view of a 50 mm edge
+    still dimensions 50 mm). For a ``note`` the value is 0 and ``text`` is whatever the caller passed.
+
+    Returns ``{annotation, drawing}`` (the new annotation + the full re-projected drawing_get so the
+    host can re-render in one round-trip).
+    """
+    s = get_drawing(doc_id)
+    if type not in _ANNOTATION_TYPES:
+        raise OpError("invalid_op",
+                      f"annotation type '{type}' must be one of {sorted(_ANNOTATION_TYPES)}",
+                      {"reason": "bad type"})
+    _sh, view = _find_view(s.doc, view_id)
+    if view is None:
+        raise OpError("invalid_op", f"no view '{view_id}'", {"reason": "unknown view"})
+    if not (_is_xy(a) and _is_xy(b)):
+        raise OpError("invalid_op", "dimension endpoints a,b must each be [x,y] sheet mm",
+                      {"reason": "bad points"})
+
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    scale = float(view.get("scale", 1.0)) or 1.0
+    if type == "linear_dim":
+        # SolidWorks linear (smart) dimension: the shorter axis-aligned span. We store the larger of
+        # the |dx|,|dy| sheet extents (the dominant ordinate) so a near-horizontal pick reads its
+        # horizontal length; an aligned_dim instead measures the true point-to-point distance.
+        sheet_dist = max(abs(bx - ax), abs(by - ay))
+    elif type == "aligned_dim":
+        sheet_dist = math.hypot(bx - ax, by - ay)
+    else:  # note — no measured value
+        sheet_dist = 0.0
+    value = sheet_dist / scale   # TRUE model length (scale-independent)
+
+    units = _doc_units(s.doc)
+    if pos is None:
+        # Default text position: offset the midpoint perpendicular to a→b by a small sheet margin so
+        # the dimension line clears the geometry. The host may override on the third click.
+        mx, my = (ax + bx) / 2.0, (ay + by) / 2.0
+        dx, dy = bx - ax, by - ay
+        n = math.hypot(dx, dy) or 1.0
+        ppos = [mx - dy / n * 10.0, my + dx / n * 10.0]
+    else:
+        if not _is_xy(pos):
+            raise OpError("invalid_op", "dimension pos must be [x,y] sheet mm or null",
+                          {"reason": "bad pos"})
+        ppos = [float(pos[0]), float(pos[1])]
+
+    ann = {
+        "id": _next_ann_id(view),
+        "type": type,
+        "a": [ax, ay],
+        "b": [bx, by],
+        "pos": ppos,
+        "value": round(value, 6),
+        "text": text if isinstance(text, str) and text else _format_dim_value(value, units),
+    }
+    view.setdefault("annotations", []).append(ann)
+    s.revision += 1
+    s.dirty = True
+    return {"annotation": ann, "drawing": get_drawing_full(doc_id)}
+
+
+def remove_annotation(doc_id: str, view_id: str, ann_id: str) -> dict:
+    """drawing_remove_annotation — delete an annotation by id from a view."""
+    s = get_drawing(doc_id)
+    _sh, view = _find_view(s.doc, view_id)
+    if view is None:
+        raise OpError("invalid_op", f"no view '{view_id}'", {"reason": "unknown view"})
+    anns = view.get("annotations", []) or []
+    kept = [a for a in anns if a.get("id") != ann_id]
+    if len(kept) == len(anns):
+        raise OpError("invalid_op", f"no annotation '{ann_id}' on view '{view_id}'",
+                      {"reason": "unknown annotation"})
+    view["annotations"] = kept
+    s.revision += 1
+    s.dirty = True
+    return {"removed": True, "view_id": view_id, "ann_id": ann_id, "revision": s.revision}
+
+
+def _is_xy(p: Any) -> bool:
+    return (isinstance(p, (list, tuple)) and len(p) == 2
+            and all(isinstance(c, (int, float)) and not isinstance(c, bool) for c in p))
+
+
+# --------------------------------------------------------------------------- BOM (W13)
+
+
+def drawing_bom(doc_id: str) -> dict:
+    """drawing_bom — a bill of materials for the drawing's source document.
+
+    For an ASSEMBLY source: one row per DISTINCT part (grouped by source path, falling back to the
+    component name), with a running quantity, the item ordinal, the part name, and the source file.
+    Reuses :func:`engine.doc.session.asm_component_bodies` (the same per-component listing the mass
+    evaluator uses). For a PART source: an empty BOM (a part drawing has no components) — clean, not
+    an error.
+
+    Returns ``{rows, is_assembly, source_doc_id}`` where each row is
+    ``{item, name, quantity, source}``.
+    """
+    from engine.doc import session as docsess
+
+    s = get_drawing(doc_id)
+    try:
+        src = docsess.get_session(s.source_doc_id)
+    except Exception:  # noqa: BLE001 — a closed source yields an empty BOM, never a crash
+        return {"rows": [], "is_assembly": False, "source_doc_id": s.source_doc_id,
+                "note": "source document is not open"}
+
+    if not src.is_assembly:
+        return {"rows": [], "is_assembly": False, "source_doc_id": s.source_doc_id,
+                "note": "part drawings have no BOM"}
+
+    try:
+        comps = docsess.asm_component_bodies(src)
+    except Exception as exc:  # noqa: BLE001 — assembly introspection failure -> empty BOM + note
+        return {"rows": [], "is_assembly": True, "source_doc_id": s.source_doc_id,
+                "note": f"assembly introspection failed: {type(exc).__name__}: {exc}"}
+
+    # Group identical parts: same source path (or name when there is no path) is the same part.
+    groups: dict[str, dict] = {}
+    order: list[str] = []
+    for c in comps:
+        name = c.get("name") or c.get("component") or "Part"
+        source = c.get("source") or ""
+        key = source or f"name:{name}"
+        g = groups.get(key)
+        if g is None:
+            g = {"name": name, "source": source, "quantity": 0}
+            groups[key] = g
+            order.append(key)
+        g["quantity"] += 1
+
+    rows = []
+    for i, key in enumerate(order, start=1):
+        g = groups[key]
+        rows.append({"item": i, "name": g["name"], "quantity": g["quantity"],
+                     "source": g["source"]})
+    return {"rows": rows, "is_assembly": True, "source_doc_id": s.source_doc_id}
+
+
 def get_drawing_full(doc_id: str) -> dict:
     """drawing_get — the full drawing doc + every view's projected 2D geometry.
 
@@ -562,6 +745,24 @@ def _drawing_close(params: dict, _emit) -> dict:
     return {"closed": close_drawing(params["doc_id"])}
 
 
+def _drawing_add_dim(params: dict, _emit) -> dict:
+    return add_dim(
+        params["doc_id"], params["view_id"],
+        type=params.get("type", "linear_dim"),
+        a=params["a"], b=params["b"],
+        pos=params.get("pos"),
+        text=params.get("text"),
+    )
+
+
+def _drawing_remove_annotation(params: dict, _emit) -> dict:
+    return remove_annotation(params["doc_id"], params["view_id"], params["ann_id"])
+
+
+def _drawing_bom(params: dict, _emit) -> dict:
+    return drawing_bom(params["doc_id"])
+
+
 WORKER_METHODS = {
     "drawing_new": _drawing_new,
     "drawing_add_view": _drawing_add_view,
@@ -569,4 +770,7 @@ WORKER_METHODS = {
     "drawing_set_view": _drawing_set_view,
     "drawing_get": _drawing_get,
     "drawing_close": _drawing_close,
+    "drawing_add_dim": _drawing_add_dim,
+    "drawing_remove_annotation": _drawing_remove_annotation,
+    "drawing_bom": _drawing_bom,
 }

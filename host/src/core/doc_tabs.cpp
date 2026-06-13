@@ -346,6 +346,9 @@ void AppState::refreshDrawingTab(int idx) {
     std::string err;
     if (worker.call("drawing_get", {{"doc_id", t.drawingDocId}}, res, err) && res.is_object()) {
         t.drawingDoc = std::move(res);
+        // The source may have changed components/quantities; invalidate the cached BOM so the next
+        // BOM open re-fetches. (W13: drawing_bom reads the live source assembly.)
+        t.bomFetched = false;
     } else {
         addLog("[draw] refresh drawing_get failed for " + t.drawingDocId + ": " + err);
         // Keep the previously-cached drawing so the sheet doesn't blank on a transient failure.

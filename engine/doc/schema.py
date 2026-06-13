@@ -906,10 +906,46 @@ def _validate_view(v: Any, where: str) -> list[str]:
         errs.append(f"{where}.position: must be [x,y] (sheet mm)")
     if not isinstance(v.get("show_hidden"), bool):
         errs.append(f"{where}.show_hidden: required bool")
-    if "annotations" in v and not isinstance(v["annotations"], list):
-        errs.append(f"{where}.annotations: must be a list (reserved for W13)")
+    if "annotations" in v:
+        if not isinstance(v["annotations"], list):
+            errs.append(f"{where}.annotations: must be a list (W13 dimensions/notes)")
+        else:
+            for j, a in enumerate(v["annotations"]):
+                errs += _validate_annotation(a, f"{where}.annotations[{j}]")
     if "label" in v and not isinstance(v["label"], (str, type(None))):
         errs.append(f"{where}.label: must be a string or null")
+    return errs
+
+
+ANNOTATION_TYPES = {"linear_dim", "aligned_dim", "note"}
+
+
+def _validate_annotation(a: Any, where: str) -> list[str]:
+    """A drawing annotation: {id, type, a:[x,y], b:[x,y], pos:[x,y], value, text} (W13).
+
+    ``a``/``b`` are sheet-mm endpoints (point picks); ``pos`` is the text/leader anchor; ``value`` is
+    the measured MODEL length; ``text`` is the displayed string. A ``note`` may omit a/b (value 0).
+    """
+    errs: list[str] = []
+    if not isinstance(a, dict):
+        return [f"{where}: annotation must be an object"]
+    if not isinstance(a.get("id"), str) or not re.match(r"^a\d+$", a["id"]):
+        errs.append(f"{where}.id: must match a<N>")
+    atype = a.get("type")
+    if atype not in ANNOTATION_TYPES:
+        errs.append(f"{where}.type: '{atype}' not in {sorted(ANNOTATION_TYPES)}")
+    is_note = atype == "note"
+    for key in ("a", "b"):
+        if key in a and a[key] is not None and not _is_vec(a[key], 2):
+            errs.append(f"{where}.{key}: must be [x,y] (sheet mm)")
+        elif not is_note and a.get(key) is None:
+            errs.append(f"{where}.{key}: required for a dimension")
+    if "pos" in a and a["pos"] is not None and not _is_vec(a["pos"], 2):
+        errs.append(f"{where}.pos: must be [x,y] (sheet mm) or null")
+    if "value" in a and a["value"] is not None and not _is_num(a["value"]):
+        errs.append(f"{where}.value: must be a number")
+    if "text" in a and a["text"] is not None and not isinstance(a["text"], str):
+        errs.append(f"{where}.text: must be a string or null")
     return errs
 
 

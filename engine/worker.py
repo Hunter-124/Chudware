@@ -790,6 +790,8 @@ _STRUCTURED_ERROR_METHODS = {
     # W12 drawings — all use the structured error envelope.
     "drawing_new", "drawing_add_view", "drawing_remove_view", "drawing_set_view",
     "drawing_get", "drawing_close",
+    # W13 drawing annotations + BOM.
+    "drawing_add_dim", "drawing_remove_annotation", "drawing_bom",
 }
 
 # ---- ask mode (Wave D) — registered via update/add so the literals above stay frozen ----

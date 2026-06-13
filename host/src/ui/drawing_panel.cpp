@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,7 @@
 #include "../core/app_state.h"
 #include "../ui_theme.h"
 #include "file_dialog.h"
+#include "property_manager.h"   // pmFormatDim — dimension text follows MMGS/IPS like the rest of the UI
 
 namespace ui {
 
@@ -148,6 +150,183 @@ static bool sheetBounds(const nlohmann::json& sheet, float& minx, float& miny,
     return any;
 }
 
+// --- W13 dimension helpers --------------------------------------------------------------------
+
+// Snap a sheet-mm query point to the NEAREST projected polyline VERTEX across all views (the line
+// endpoints / arc sample points that the engine returns). `pickPx` is the screen-space snap radius;
+// we convert it to sheet-mm via the live zoom. Returns true + fills (sx,sy) in sheet mm and the
+// owning view id when a vertex is within range.
+static bool snapToVertex(const nlohmann::json& sheet, double qx, double qy, double radiusMm,
+                         double& sx, double& sy, std::string& viewId) {
+    bool found = false;
+    double best = radiusMm * radiusMm;
+    if (!(sheet.contains("views") && sheet["views"].is_array())) return false;
+    for (const auto& v : sheet["views"]) {
+        if (!v.is_object()) continue;
+        const std::string vid = djstr(v, "id").empty() ? djstr(v, "view_id") : djstr(v, "id");
+        for (const char* layer : {"visible", "hidden"}) {
+            if (!(v.contains(layer) && v[layer].is_array())) continue;
+            for (const auto& pl : v[layer]) {
+                if (!pl.is_array()) continue;
+                for (const auto& pt : pl) {
+                    if (!(pt.is_array() && pt.size() == 2 && pt[0].is_number() && pt[1].is_number()))
+                        continue;
+                    double px = pt[0].get<double>(), py = pt[1].get<double>();
+                    double d2 = (px - qx) * (px - qx) + (py - qy) * (py - qy);
+                    if (d2 < best) { best = d2; sx = px; sy = py; viewId = vid; found = true; }
+                }
+            }
+        }
+    }
+    return found;
+}
+
+// Push a finished dimension to the engine (drawing_add_dim) and refresh the cached drawing_get.
+static void commitDimension(AppState& st, AppState::DocTab& tab, const std::string& viewId,
+                            float ax, float ay, float bx, float by, float px, float py) {
+    nlohmann::json res;
+    std::string err;
+    nlohmann::json params = {
+        {"doc_id", tab.drawingDocId},
+        {"view_id", viewId},
+        {"type", tab.dimType},
+        {"a", nlohmann::json::array({ax, ay})},
+        {"b", nlohmann::json::array({bx, by})},
+        {"pos", nlohmann::json::array({px, py})},
+    };
+    if (st.worker.call("drawing_add_dim", params, res, err) && res.is_object() &&
+        !res.contains("code")) {
+        if (res.contains("drawing") && res["drawing"].is_object())
+            tab.drawingDoc = res["drawing"];      // engine returned the full re-projected drawing
+        else
+            st.refreshDrawingTab(st.activeTab);
+        st.addLog("[draw] added " + tab.dimType + " on " + viewId);
+    } else {
+        std::string msg = res.is_object() && res.contains("message") ? djstr(res, "message") : err;
+        st.addLog("[draw] drawing_add_dim failed: " + msg);
+        st.toast(ui::ToastLevel::Error, "Dimension failed: " + (msg.empty() ? "engine error" : msg));
+    }
+}
+
+// Delete a stored annotation (drawing_remove_annotation) + refresh.
+static void deleteAnnotation(AppState& st, AppState::DocTab& tab, const std::string& viewId,
+                             const std::string& annId) {
+    nlohmann::json res;
+    std::string err;
+    nlohmann::json params = {{"doc_id", tab.drawingDocId}, {"view_id", viewId}, {"ann_id", annId}};
+    if (st.worker.call("drawing_remove_annotation", params, res, err) && res.is_object() &&
+        !res.contains("code")) {
+        st.refreshDrawingTab(st.activeTab);
+        st.addLog("[draw] removed annotation " + annId);
+    } else {
+        st.addLog("[draw] drawing_remove_annotation failed: " + err);
+    }
+    tab.selAnnViewId.clear();
+    tab.selAnnId.clear();
+}
+
+// Fetch the BOM for the active drawing (drawing_bom) into the tab cache.
+static void fetchBom(AppState& st, AppState::DocTab& tab) {
+    nlohmann::json res;
+    std::string err;
+    if (st.worker.call("drawing_bom", {{"doc_id", tab.drawingDocId}}, res, err) && res.is_object() &&
+        !res.contains("code")) {
+        tab.bomRows = res;
+    } else {
+        st.addLog("[draw] drawing_bom failed: " + err);
+        tab.bomRows = nlohmann::json::object();
+    }
+    tab.bomFetched = true;
+}
+
+// Render one stored dimension annotation: extension lines from a & b, a dimension line through the
+// text position, simple arrowheads, and the value text. `toScreen` maps sheet-mm to screen px.
+static void renderDimension(ImDrawList* dl, const nlohmann::json& ann, bool ips,
+                            const std::function<ImVec2(double, double)>& toScreen, float s,
+                            bool selected) {
+    auto rdvec = [&](const char* k, double& x, double& y) -> bool {
+        auto it = ann.find(k);
+        if (it == ann.end() || !it->is_array() || it->size() != 2 ||
+            !(*it)[0].is_number() || !(*it)[1].is_number()) return false;
+        x = (*it)[0].get<double>(); y = (*it)[1].get<double>(); return true;
+    };
+    const std::string atype = djstr(ann, "type");
+    double ax, ay, bx, by, px, py;
+    bool haveA = rdvec("a", ax, ay), haveB = rdvec("b", bx, by), haveP = rdvec("pos", px, py);
+
+    const ImU32 dimCol = selected ? IM_COL32(220, 120, 30, 255) : IM_COL32(40, 90, 180, 255);
+    const float thick = std::max(1.0f, 1.0f * s);
+
+    // Note: just text at pos.
+    if (atype == "note" || !haveA || !haveB) {
+        if (haveP) {
+            std::string txt = djstr(ann, "text");
+            if (txt.empty()) txt = "note";
+            ImVec2 tp = toScreen(px, py);
+            dl->AddText(ImVec2(tp.x, tp.y), dimCol, txt.c_str());
+        }
+        return;
+    }
+    if (!haveP) { px = (ax + bx) * 0.5; py = (ay + by) * 0.5; }
+
+    ImVec2 A = toScreen(ax, ay), B = toScreen(bx, by), P = toScreen(px, py);
+
+    // The dimension line is parallel to A->B, passing through P. We project A and B onto that line so
+    // the dimension line spans the measured extent at the text offset; extension lines connect the
+    // real points to the dimension line ends.
+    ImVec2 dir(B.x - A.x, B.y - A.y);
+    float len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
+    if (len < 1e-3f) return;
+    ImVec2 u(dir.x / len, dir.y / len);          // unit along A->B
+    // Offset = component of (P - A) perpendicular to u, applied to both ends.
+    ImVec2 pa(P.x - A.x, P.y - A.y);
+    float along = pa.x * u.x + pa.y * u.y;
+    ImVec2 perp(pa.x - along * u.x, pa.y - along * u.y);   // perpendicular vector A->dimline
+    ImVec2 A2(A.x + perp.x, A.y + perp.y);
+    ImVec2 B2(B.x + perp.x, B.y + perp.y);
+
+    // Extension lines (with a small gap off the geometry).
+    auto gapStart = [&](const ImVec2& from, const ImVec2& to) {
+        ImVec2 d(to.x - from.x, to.y - from.y);
+        float l = std::sqrt(d.x * d.x + d.y * d.y);
+        if (l < 1e-3f) return from;
+        float g = std::min(4.0f * s, l * 0.25f);
+        return ImVec2(from.x + d.x / l * g, from.y + d.y / l * g);
+    };
+    dl->AddLine(gapStart(A, A2), A2, dimCol, thick);
+    dl->AddLine(gapStart(B, B2), B2, dimCol, thick);
+    // Dimension line.
+    dl->AddLine(A2, B2, dimCol, thick);
+
+    // Arrowheads at A2 and B2 pointing inward.
+    auto arrow = [&](const ImVec2& tip, const ImVec2& other) {
+        ImVec2 d(other.x - tip.x, other.y - tip.y);
+        float l = std::sqrt(d.x * d.x + d.y * d.y);
+        if (l < 1e-3f) return;
+        d.x /= l; d.y /= l;
+        ImVec2 n(-d.y, d.x);
+        float ah = 7.0f * s, aw = 2.6f * s;
+        ImVec2 base(tip.x + d.x * ah, tip.y + d.y * ah);
+        dl->AddTriangleFilled(tip, ImVec2(base.x + n.x * aw, base.y + n.y * aw),
+                              ImVec2(base.x - n.x * aw, base.y - n.y * aw), dimCol);
+    };
+    arrow(A2, B2);
+    arrow(B2, A2);
+
+    // Value text at P (centered above the dimension line).
+    std::string txt = djstr(ann, "text");
+    if (txt.empty()) {
+        double val = djnum(ann, "value", 0.0);
+        txt = pmFormatDim(val, ips);   // engine value is canonical mm; pmFormatDim handles IPS
+    }
+    ImVec2 ts = ImGui::CalcTextSize(txt.c_str());
+    ImVec2 mid((A2.x + B2.x) * 0.5f, (A2.y + B2.y) * 0.5f);
+    ImVec2 tp(mid.x - ts.x * 0.5f, mid.y - ts.y - 2 * s);
+    dl->AddRectFilled(ImVec2(tp.x - 2, tp.y - 1), ImVec2(tp.x + ts.x + 2, tp.y + ts.y + 1),
+                      IM_COL32(255, 255, 255, 220), 2.0f);
+    dl->AddText(tp, dimCol, txt.c_str());
+}
+
 void drawDrawingSheet(AppState& st) {
     const auto& pal = ui::palette;
     const float s = ui::uiScale;
@@ -177,9 +356,56 @@ void drawDrawingSheet(AppState& st) {
     if (ImGui::SmallButton("Export PDF")) exportActiveDrawing(st, "pdf");
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Write this drawing's views to a vector PDF (1:1 mm)");
+
+    // ---- W13: Dimension tool (arm/disarm) + type, and BOM toggle ----
+    ImGui::SameLine();
+    {
+        bool armed = tab.dimToolActive;
+        if (armed) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.62f, 0.18f, 1.0f));
+        if (ImGui::SmallButton(armed ? "Dimension*" : "Dimension")) {
+            tab.dimToolActive = !tab.dimToolActive;
+            tab.dimStage = 0;
+            tab.dimViewId.clear();
+            if (tab.dimToolActive) { tab.selAnnViewId.clear(); tab.selAnnId.clear(); }
+        }
+        if (armed) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Place a linear dimension: click two polyline vertices, then a 3rd "
+                              "click sets the text position. Esc cancels.");
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(86 * s);
+    {
+        const char* kinds[] = {"linear", "aligned"};
+        int cur = (tab.dimType == "aligned_dim") ? 1 : 0;
+        if (ImGui::Combo("##dimtype", &cur, kinds, 2))
+            tab.dimType = (cur == 1) ? "aligned_dim" : "linear_dim";
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("linear = horizontal/vertical span; aligned = true point-to-point distance");
+
+    // BOM toggle — only meaningful for assembly source drawings; we fetch lazily and disable for
+    // part drawings (the engine returns is_assembly=false + empty rows).
+    ImGui::SameLine();
+    if (ImGui::SmallButton(tab.bomVisible ? "BOM*" : "BOM")) {
+        tab.bomVisible = !tab.bomVisible;
+        if (tab.bomVisible && !tab.bomFetched) fetchBom(st, tab);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Toggle the Bill of Materials table (assembly drawings list components)");
+
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
-    ImGui::Text("  wheel: zoom   MMB / Space+drag: pan");
+    if (tab.dimToolActive) {
+        const char* stageMsg = tab.dimStage == 0 ? "  click vertex A"
+                             : tab.dimStage == 1 ? "  click vertex B"
+                                                 : "  click to place text";
+        ImGui::PopStyleColor();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.62f, 0.18f, 1.0f));
+        ImGui::TextUnformatted(stageMsg);
+    } else {
+        ImGui::Text("  wheel: zoom   MMB / Space+drag: pan   Del: delete dim");
+    }
     ImGui::PopStyleColor();
 
     // ---- canvas child ----
@@ -391,6 +617,156 @@ void drawDrawingSheet(AppState& st) {
                                   ImVec2(lp.x + ts.x + 4, lp.y + ts.y + 2),
                                   IM_COL32(255, 255, 255, 210), 2.0f);
                 dl->AddText(lp, IM_COL32(70, 76, 88, 255), lbl);
+            }
+        }
+    }
+
+    // ---- W13: render stored dimensions/notes (over the geometry) ----
+    if (sheet->contains("views") && (*sheet)["views"].is_array()) {
+        for (const auto& v : (*sheet)["views"]) {
+            if (!v.is_object() || !v.contains("annotations") || !v["annotations"].is_array())
+                continue;
+            const std::string vid = djstr(v, "view_id").empty() ? djstr(v, "id")
+                                                                 : djstr(v, "view_id");
+            for (const auto& ann : v["annotations"]) {
+                if (!ann.is_object()) continue;
+                bool sel = (tab.selAnnViewId == vid && tab.selAnnId == djstr(ann, "id"));
+                renderDimension(dl, ann, st.ips(), toScreen, s, sel);
+            }
+        }
+    }
+
+    // ---- W13: dimension tool interaction (snap + place) + annotation select/delete ----
+    {
+        // Esc cancels the in-progress dimension (or disarms a fresh tool).
+        if (tab.dimToolActive && ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            tab.dimStage = 0;
+            tab.dimViewId.clear();
+        }
+        ImVec2 mouse = ImGui::GetIO().MousePos;
+        bool overCanvas = canvasHovered;
+        // Convert the cursor to sheet-mm (inverse of toScreen).
+        double curMx = (mouse.x - canvasMin.x - panX) / z;
+        double curMy = -(mouse.y - canvasMin.y - panY) / z;
+        double snapRadiusMm = 9.0 / std::max(z, 1e-4f);   // ~9 px snap radius -> sheet mm
+
+        if (tab.dimToolActive && overCanvas) {
+            // Live snap highlight.
+            double sx, sy; std::string svid;
+            bool snapped = snapToVertex(*sheet, curMx, curMy, snapRadiusMm, sx, sy, svid);
+            if (snapped) {
+                ImVec2 sp = toScreen(sx, sy);
+                dl->AddCircle(sp, 5.0f * s, IM_COL32(220, 120, 30, 255), 12, 1.6f * s);
+                dl->AddCircleFilled(sp, 2.0f * s, IM_COL32(220, 120, 30, 255));
+            }
+            // Rubber-band preview of the in-progress dimension.
+            if (tab.dimStage == 1) {
+                ImVec2 a = toScreen(tab.dimAx, tab.dimAy);
+                ImVec2 b = snapped ? toScreen(sx, sy) : mouse;
+                dl->AddLine(a, b, IM_COL32(220, 120, 30, 160), 1.2f * s);
+            } else if (tab.dimStage == 2) {
+                ImVec2 a = toScreen(tab.dimAx, tab.dimAy);
+                ImVec2 b = toScreen(tab.dimBx, tab.dimBy);
+                dl->AddLine(a, b, IM_COL32(220, 120, 30, 160), 1.2f * s);
+            }
+            // A left click advances the placement (ignore Space+drag pans).
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
+                if (tab.dimStage == 0) {
+                    if (snapped) { tab.dimAx = (float)sx; tab.dimAy = (float)sy;
+                                   tab.dimViewId = svid; tab.dimStage = 1; }
+                } else if (tab.dimStage == 1) {
+                    if (snapped) { tab.dimBx = (float)sx; tab.dimBy = (float)sy; tab.dimStage = 2; }
+                } else if (tab.dimStage == 2) {
+                    // 3rd click sets the text/leader position (free, no snap).
+                    commitDimension(st, tab, tab.dimViewId, tab.dimAx, tab.dimAy,
+                                    tab.dimBx, tab.dimBy, (float)curMx, (float)curMy);
+                    tab.dimStage = 0;
+                    tab.dimViewId.clear();
+                }
+            }
+        } else if (!tab.dimToolActive && overCanvas &&
+                   ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown && !panning) {
+            // Selection: pick the nearest stored dimension's text position to the click.
+            std::string hitView, hitAnn; double bestD2 = (14.0 / std::max(z, 1e-4f)) *
+                                                          (14.0 / std::max(z, 1e-4f));
+            if (sheet->contains("views") && (*sheet)["views"].is_array()) {
+                for (const auto& v : (*sheet)["views"]) {
+                    if (!v.is_object() || !v.contains("annotations") ||
+                        !v["annotations"].is_array()) continue;
+                    const std::string vid = djstr(v, "view_id").empty() ? djstr(v, "id")
+                                                                        : djstr(v, "view_id");
+                    for (const auto& ann : v["annotations"]) {
+                        if (!ann.is_object()) continue;
+                        auto it = ann.find("pos");
+                        if (it == ann.end() || !it->is_array() || it->size() != 2) continue;
+                        double ppx = (*it)[0].get<double>(), ppy = (*it)[1].get<double>();
+                        double d2 = (ppx - curMx) * (ppx - curMx) + (ppy - curMy) * (ppy - curMy);
+                        if (d2 < bestD2) { bestD2 = d2; hitView = vid; hitAnn = djstr(ann, "id"); }
+                    }
+                }
+            }
+            tab.selAnnViewId = hitView;   // empty clears the selection
+            tab.selAnnId = hitAnn;
+        }
+
+        // Delete the selected dimension.
+        if (!tab.dimToolActive && !tab.selAnnId.empty() &&
+            (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
+            deleteAnnotation(st, tab, tab.selAnnViewId, tab.selAnnId);
+        }
+    }
+
+    // ---- W13: BOM table overlay (top-right of the canvas) ----
+    if (tab.bomVisible) {
+        if (!tab.bomFetched) fetchBom(st, tab);   // (re)fetch after a Rebuild invalidated the cache
+        const nlohmann::json& bom = tab.bomRows;
+        bool isAsm = bom.is_object() && bom.value("is_assembly", false);
+        const nlohmann::json* rows = (bom.is_object() && bom.contains("rows") &&
+                                      bom["rows"].is_array()) ? &bom["rows"] : nullptr;
+        const float pad = 6.0f * s, rowH = ImGui::GetTextLineHeight() + 4 * s;
+        // Column layout (item / part / qty).
+        const float wItem = 34 * s, wQty = 40 * s, wName = 150 * s;
+        const float tableW = wItem + wName + wQty + pad * 2;
+        int nRows = rows ? (int)rows->size() : 0;
+        const float tableH = rowH * (nRows + 2) + pad * 2;   // header + title + rows
+        ImVec2 t0(canvasMax.x - tableW - 10 * s, canvasMin.y + 10 * s);
+        ImVec2 t1(t0.x + tableW, t0.y + tableH);
+        dl->AddRectFilled(t0, t1, IM_COL32(252, 252, 250, 240), 3.0f);
+        dl->AddRect(t0, t1, IM_COL32(60, 64, 74, 255), 3.0f, 0, 1.2f * s);
+        const ImU32 ink = IM_COL32(40, 44, 52, 255);
+        float yy = t0.y + pad;
+        dl->AddText(ImVec2(t0.x + pad, yy), ink, "Bill of Materials");
+        yy += rowH;
+        if (!isAsm || nRows == 0) {
+            const char* msg = bom.is_object() && bom.contains("note") && bom["note"].is_string()
+                                  ? bom["note"].get<std::string>().c_str()
+                                  : (isAsm ? "no components" : "part drawing - no BOM");
+            dl->AddText(ImVec2(t0.x + pad, yy), IM_COL32(120, 126, 138, 255), msg);
+        } else {
+            // Header row.
+            dl->AddText(ImVec2(t0.x + pad, yy), ink, "#");
+            dl->AddText(ImVec2(t0.x + pad + wItem, yy), ink, "Part");
+            dl->AddText(ImVec2(t0.x + pad + wItem + wName, yy), ink, "Qty");
+            dl->AddLine(ImVec2(t0.x + pad, yy + rowH - 2), ImVec2(t1.x - pad, yy + rowH - 2),
+                        IM_COL32(150, 154, 164, 200), 1.0f * s);
+            yy += rowH;
+            for (const auto& r : *rows) {
+                if (!r.is_object()) continue;
+                char itemBuf[16];
+                std::snprintf(itemBuf, sizeof(itemBuf), "%d", (int)djnum(r, "item", 0));
+                std::string name = djstr(r, "name");
+                if ((float)ImGui::CalcTextSize(name.c_str()).x > wName - 4 * s) {
+                    while (name.size() > 3 &&
+                           (float)ImGui::CalcTextSize((name + "...").c_str()).x > wName - 4 * s)
+                        name.pop_back();
+                    name += "...";
+                }
+                char qtyBuf[16];
+                std::snprintf(qtyBuf, sizeof(qtyBuf), "%d", (int)djnum(r, "quantity", 0));
+                dl->AddText(ImVec2(t0.x + pad, yy), ink, itemBuf);
+                dl->AddText(ImVec2(t0.x + pad + wItem, yy), ink, name.c_str());
+                dl->AddText(ImVec2(t0.x + pad + wItem + wName, yy), ink, qtyBuf);
+                yy += rowH;
             }
         }
     }

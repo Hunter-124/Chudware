@@ -308,6 +308,22 @@ struct AppState {
         float drawZoom = 0.0f;          // 0 = uninitialized -> triggers a fit on first show
         float drawPanX = 0.0f, drawPanY = 0.0f;
         bool  drawNeedFit = true;
+
+        // ---- W13: dimension tool + BOM (drawing tabs) ----
+        // The Dimension tool is a modal placement workflow owned by the 2D panel: arm it, then click
+        // near a view's projected polyline VERTEX to snap point a, then b, then a 3rd click sets the
+        // text position -> drawing_add_dim. Esc cancels. dimType is "linear_dim"|"aligned_dim".
+        bool        dimToolActive = false;     // armed: clicks place a dimension
+        std::string dimType = "linear_dim";    // which dimension the tool places
+        int         dimStage = 0;              // 0=pick a, 1=pick b, 2=pick text pos
+        std::string dimViewId;                 // view the in-progress dim is anchored to
+        float       dimAx = 0, dimAy = 0;      // picked point a (sheet mm)
+        float       dimBx = 0, dimBy = 0;      // picked point b (sheet mm)
+        std::string selAnnViewId;              // selected stored annotation (for Delete)
+        std::string selAnnId;
+        bool        bomVisible = false;        // show the BOM overlay table (assembly drawings)
+        nlohmann::json bomRows;                // cached drawing_bom result {rows, is_assembly, ...}
+        bool        bomFetched = false;        // have we fetched the BOM for this drawing yet
     };
     std::vector<DocTab> docTabs;
     int activeTab = -1;             // index into docTabs; -1 = no document open (start state)

@@ -67,6 +67,28 @@
 // --- end C20b ---
 #include "ui/scenarios.h"  // scripted screenshot/test scenarios (m1/sketch/asm/fea/evalmass/activity)
 
+// W16: apply the param-less sm_flat_pattern feature (Sheet Metal "Flatten") + reload the mesh.
+// One-click feature (no PM form) — add_feature then loadDocMesh from the ops-response, like the
+// feature-tree op helper. The DocMirror listener refreshes the FeatureManager automatically.
+static void applyFlatPattern(AppState& st) {
+    if (!st.docMirror.hasDoc()) {
+        st.toast(ui::ToastLevel::Info, "Open a sheet metal part first");
+        return;
+    }
+    nlohmann::json ops = nlohmann::json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "sm_flat_pattern"}, {"name", "Flat-Pattern"},
+                                             {"params", nlohmann::json::object()}}}}});
+    auto r = st.docMirror.applyOps(st.worker, ops);
+    if (r.ok && !r.aicm_path.empty()) {
+        std::string le;
+        st.loadDocMesh(r.aicm_path, le);
+        st.toast(ui::ToastLevel::Info, "Flat pattern created");
+    } else if (!r.ok) {
+        st.toast(ui::ToastLevel::Warn,
+                 r.error_message.empty() ? std::string("Flatten failed") : r.error_message);
+    }
+}
+
 int run_gui(const char* screenshotPath) {
     const bool shot = screenshotPath != nullptr;
     if (!glfwInit()) return 1;
@@ -228,6 +250,7 @@ int run_gui(const char* screenshotPath) {
         if (propertyManager.openForCommand(st, cmd_id)) return;  // form opened
         // C19: Simulation tab -> sim panel; Evaluate tab -> evaluate dialogs.
         std::string cmd(cmd_id);
+        if (cmd == "sm_flat_pattern") { applyFlatPattern(st); return; }  // W16: one-click Flatten
         if (cmd.rfind("sim_", 0) == 0 && simPanel.handleCommand(st, cmd)) return;
         if (cmd.rfind("eval_", 0) == 0 && evaluateDialogs.handleCommand(st, cmd)) return;
         std::printf("[ribbon] %s (no PM form)\n", cmd_id);
@@ -249,6 +272,7 @@ int run_gui(const char* screenshotPath) {
         }
         if (propertyManager.openForCommand(st, cmd_id)) return;
         std::string cmd(cmd_id);
+        if (cmd == "sm_flat_pattern") { applyFlatPattern(st); return; }  // W16: one-click Flatten
         if (cmd.rfind("sim_", 0) == 0 && simPanel.handleCommand(st, cmd)) return;
         if (cmd.rfind("eval_", 0) == 0 && evaluateDialogs.handleCommand(st, cmd)) return;
         std::printf("[ribbon] %s (no PM form)\n", cmd_id);

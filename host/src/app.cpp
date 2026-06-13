@@ -334,7 +334,14 @@ int run_gui(const char* screenshotPath) {
                     if (pm->active()) {
                         try {
                             nlohmann::json selObj = nlohmann::json::parse(sel);
-                            pm->routePick(selObj, (int)item.hit.kind);
+                            // Feedback when a pick is rejected for the wrong topology (the active
+                            // well wants a different kind) — otherwise the click is silently lost.
+                            if (!pm->routePick(selObj, (int)item.hit.kind)) {
+                                std::string hint = pm->activeWellKindHint();
+                                if (!hint.empty())
+                                    st.toast(ui::ToastLevel::Info,
+                                             "This field takes " + hint + " — that pick wasn't added");
+                            }
                         } catch (...) {}
                     }
                 }

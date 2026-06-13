@@ -181,6 +181,11 @@ public:
     // kind="body") instead of the face/edge/vertex it clicked.
     bool activeWellWantsBody() const;
 
+    // Human phrase for the active well's accepted topology ("edges", "faces or edges", …), or ""
+    // when no selector well is active. Used to toast feedback when a pick is rejected for the
+    // wrong kind (SolidWorks tells you what a field wants).
+    std::string activeWellKindHint() const;
+
     // ---- C51: sketched-feature region picking ----------------------------------------------
     // The viewport region picker (SketchMode::drawRegionPicker) drives these to render region
     // highlights and feed click-to-toggle selections into the profile (extrude/revolve/sweep) or

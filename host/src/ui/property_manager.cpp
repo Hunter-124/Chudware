@@ -735,6 +735,25 @@ bool PropertyManager::activeWellWantsBody() const {
     return false;
 }
 
+std::string PropertyManager::activeWellKindHint() const {
+    for (const auto& f : fields_) {
+        if (f.def->kind != PMFieldKind::SelectorWell || !f.wellActive) continue;
+        const PMSelKinds& k = f.def->selKinds;
+        std::vector<const char*> parts;
+        if (k.face)   parts.push_back("faces");
+        if (k.edge)   parts.push_back("edges");
+        if (k.vertex) parts.push_back("vertices");
+        if (k.body)   parts.push_back("bodies");
+        std::string s;
+        for (size_t i = 0; i < parts.size(); ++i) {
+            if (i) s += (i + 1 == parts.size()) ? " or " : ", ";
+            s += parts[i];
+        }
+        return s;
+    }
+    return "";
+}
+
 // ---- C51: sketched-feature region picking ---------------------------------
 
 // Short chip label for a region/face selector (region picks read "Whole sketch" / "Region N").

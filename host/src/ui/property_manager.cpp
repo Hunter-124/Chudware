@@ -1017,6 +1017,8 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
     else if (t == "draft") needWell = "faces";
     else if (t == "linear_pattern" || t == "circular_pattern") needWell = "features";
     else if (t == "weld_member") needWell = "sketch";  // FeatureWell: path sketch must be picked
+    else if (t == "weld_gusset") needWell = "faces";   // two member faces forming the corner
+    else if (t == "weld_end_cap") needWell = "face";   // one member end face to close
     else if (t == "boolean") needWell = "targets";   // need at least one target body
     else if (t == "sm_base_flange") needWell = "profile";  // sheet-metal base needs a sketch region
     else if (t == "sm_edge_flange") needWell = "edge";     // sheet-metal edge flange needs a bend edge

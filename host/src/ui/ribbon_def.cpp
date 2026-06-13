@@ -252,6 +252,11 @@ static const RibbonCmd kCmds[] = {
     // --- Group: Structural ---
     { "weld_member",         "Structural Member","sweep",           "Weldments",   "Structural",  true,  nullptr,          false },
 
+    // --- Group: Dress --- gusset (corner plate) + end cap (closes a tube end). cmd_id == engine
+    // feature type (pmFormForCommand routes straight through). Reuse shell/fillet icons.
+    { "weld_gusset",         "Gusset",          "shell",            "Weldments",   "Dress",       true,  nullptr,          false },
+    { "weld_end_cap",        "End Cap",         "fillet",           "Weldments",   "Dress",       true,  nullptr,          false },
+
 };
 // clang-format on
 

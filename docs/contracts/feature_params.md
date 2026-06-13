@@ -357,6 +357,45 @@ depends on this).
   sketch has no usable (open) segments; degenerate (zero-length) segment; degenerate profile
   dimensions (e.g. wall ≥ half the tube).
 
+### `weld_gusset` (dress)
+A triangular/polygonal reinforcing plate welded into an L-corner between two members. It is a
+SEPARATE weldment body (welded in, not fused into a member).
+- params: `thickness: dim` (5) · `d1: dim` (30; leg along member 1) · `d2: dim` (30; leg along
+  member 2) · `type: "triangular"|"polygonal"` ("triangular"; polygonal clips the outer hypotenuse
+  tip to a cut-corner pentagon) · `location: "centered"|"inner"|"outer"` ("centered"; shifts the
+  plate ±½·thickness off the shared plane) · `offset: dim` (0; extra shift along the plane normal).
+- refs: `faces: [sel(face)]` — **exactly two** planar face selectors, one on each member at the
+  corner (the two coplanar faces facing into the corner, e.g. the members' top faces). Faces resolve
+  against ALL current member bodies (members are separate bodies).
+- compiler: `features/weldment.py::compile_weld_gusset`. Recovers each member's axis as the picked
+  face's longest in-plane edge; the corner apex = the near-intersection of the two axis lines; each
+  leg points from the apex toward its face centre; the plate (right triangle `apex, apex+d1·leg1,
+  apex+d2·leg2`, or the cut-corner pentagon for `polygonal`) is extruded by `thickness` along the
+  shared-plane normal and appended as a new body. `resolved`: `{thickness, d1, d2, _plate_area,
+  _triangle_area, volume}`.
+- supported: the common L-corner of two non-parallel members (any orientation, recovered from the
+  picks). Limitation: a member-to-face or 3-member junction is not specially fitted — pick the two
+  faces whose shared plane you want the gusset to lie in.
+- errors (contained): not exactly two faces; a non-planar pick; faces whose member axes are
+  parallel/collinear (not a corner); a face selector that resolves on no body (dangling);
+  thickness/leg ≤ 0; degenerate plate.
+
+### `weld_end_cap` (dress)
+A plate closing the open END of a hollow member (a tube). SEPARATE weldment body.
+- params: `thickness: dim` (5) · `type: "outer"|"inner"` ("outer" mounts a plate covering the whole
+  tube end ON the end face and extrudes outward; "inner" insets a plate matching the bore INTO the
+  tube) · `offset: dim` (0; shift along the member axis) · `overhang: dim` (0; outer only — grows the
+  plate past the profile on every side).
+- refs: `face: sel(face)` — one planar member END face (its outline is the member's cross-section).
+  Resolves against all member bodies.
+- compiler: `features/weldment.py::compile_weld_end_cap`. Outer: a plate from the end face's OUTER
+  boundary (covers the whole end incl. the bore), optionally grown by `overhang`, extruded outward by
+  `thickness`. Inner: a plate from the end face's INNER boundary (the bore), inset into the tube by
+  `thickness`. `resolved`: `{thickness, overhang, _cap_area, volume}`.
+- supported: square/rect/round hollow tubes (outer + inner) and solid sections (outer only).
+- errors (contained): missing/dangling face; non-planar face; `inner` on a solid section (no bore);
+  thickness ≤ 0; negative overhang; bad `type`.
+
 ## Escape hatches
 
 ### `script`

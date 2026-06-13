@@ -425,6 +425,35 @@ static const std::vector<PMFormDef>& forms() {
             ComboL    ("justify", "Justify",       "Settings", "center|corner", "Center|Corner"),
             Check     ("trim_corners", "Trim corners", "Settings", true),
         }},
+        // --- weld_gusset (Weldments / Gusset) --- engine features/weldment weld_gusset. A triangular
+        //   (or polygonal cut-corner) reinforcing plate welded into the L-corner of two members. The
+        //   faces well takes TWO planar faces (one on each member at the corner — e.g. the two
+        //   members' top faces); the engine recovers each member axis from the pick and builds the
+        //   plate in the faces' shared plane. d1/d2 are the legs along each member; type picks the
+        //   plate shape; location shifts the plate ±½·thickness off the shared plane.
+        { "weld_gusset", "Gusset", "shell", {
+            Well   ("faces",     "Supporting Faces", "Selections", K_FACE, true),
+            Dim    ("thickness", "Thickness",        "Gusset",  5.0),
+            Dim    ("d1",        "Leg 1 (d1)",       "Gusset",  30.0),
+            Dim    ("d2",        "Leg 2 (d2)",       "Gusset",  30.0),
+            ComboL ("type",      "Profile",          "Gusset",
+                    "triangular|polygonal", "Triangular|Polygonal"),
+            ComboL ("location",  "Location",         "Settings",
+                    "centered|inner|outer", "Centered|Inner|Outer"),
+            Dim    ("offset",    "Offset",           "Settings", 0.0),
+        }},
+        // --- weld_end_cap (Weldments / End Cap) --- engine features/weldment weld_end_cap. A plate
+        //   closing the open END of a hollow member. The face well takes ONE planar member end face.
+        //   type: outer mounts a plate covering the whole tube end + overhang on the end face; inner
+        //   insets a plate matching the bore into the tube. offset shifts along the member axis.
+        { "weld_end_cap", "End Cap", "fillet", {
+            Well   ("face",      "End Face",         "Selections", K_FACE, false),
+            Dim    ("thickness", "Thickness",        "End Cap", 5.0),
+            ComboL ("type",      "Type",             "End Cap",
+                    "outer|inner", "Outer (on end)|Inner (inset)"),
+            DimU   ("overhang",  "Overhang",         "End Cap", 0.0),
+            Dim    ("offset",    "Offset",           "End Cap", 0.0),
+        }},
     };
     return kForms;
 }
@@ -472,6 +501,8 @@ const PMFormDef* pmFormForCommand(const std::string& cmdId, std::string& mode) {
     if (cmdId == "sm_jog")            return pmFindForm("sm_jog");
     // Weldments — ribbon cmd id == the engine feature type.
     if (cmdId == "weld_member")       return pmFindForm("weld_member");
+    if (cmdId == "weld_gusset")       return pmFindForm("weld_gusset");
+    if (cmdId == "weld_end_cap")      return pmFindForm("weld_end_cap");
     // Primitive quick-start commands (AI-CAD extensions; not in the C14 ribbon but reachable
     // via the M1 scenario / future "Insert > Primitive" entries).
     if (cmdId == "box")           return pmFindForm("box");

@@ -177,6 +177,10 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
     # refs.sketch is a sketch feature id; refs.segments (optional) is a list of entity ids.
     "weld_member": {"params": ["profile"], "refs": {"sketch": (_SEL_OR_DATUM, True),
                                                     "segments": (_ENTITY_ID_LIST, False)}},
+    # Weldment dress features — gusset (plate in an L-corner of two members) + end cap (plate
+    # closing a member's open end). Both resolve from picked planar faces on the member bodies.
+    "weld_gusset": {"params": [], "refs": {"faces": (_SEL_LIST, True)}},
+    "weld_end_cap": {"params": [], "refs": {"face": (_SEL_OR_DATUM, True)}},
     "script": {"params": ["code"], "refs": {}},
     "import": {"params": ["source_path", "format"], "refs": {}},
     # Stretch — schema-reserved (envelope accepted, no deep checks yet):

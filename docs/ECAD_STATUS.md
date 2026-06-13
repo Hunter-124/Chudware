@@ -29,7 +29,8 @@ Run the demo to see the whole pipeline:
 | DRC | `engine/ecad/drc.py` — net-aware clearance/width/via/annular/hole/edge + ratsnest MST | `test_drc` (11) |
 | Fabrication | `engine/ecad/fab/` — Gerber RS-274X, Excellon, BOM, pick-and-place | `test_fab` |
 | 3D bridge | `engine/ecad/threed.py` — board→STEP + `aicad.part/1` import doc | `test_threed` — board volume exact, part doc **compiles in the CAD pipeline** |
-| Worker RPC | `engine/ecad/rpc.py` — 13 `ecad_*` methods (fenced into `engine/worker.py`) | `test_rpc` (5); legacy `test_worker_doc` still green |
+| Sch→PCB sync | `engine/ecad/sync.py` — `update_board_from_sch` (footprint resolve + pad-net bind, idempotent); RPC `ecad_update_from_sch` | `test_sync` |
+| Worker RPC | `engine/ecad/rpc.py` — 14 `ecad_*` methods (fenced into `engine/worker.py`) | `test_rpc` (5); legacy `test_worker_doc` still green |
 | AI tools | `mcp_server/ecad_tools.py` — 13 tools w/ rich context helpers | `test_ecad_tools`; legacy `test_roundtrip` still green |
 | Full pipeline | `engine/ecad/test_integration.py` + `demo.py` | end-to-end green |
 
@@ -58,8 +59,9 @@ Expect minor ImGui-signature fixups on first real build.
 
 1. **Wire + build the C++ UI** — apply `ECAD_UI_INTEGRATION.md` steps (a)–(c) for an empty-state
    render, then (d)–(f) for live docs + PM forms + picking. First build will need small fixups.
-2. **`pcb_update_from_sch`** is a stub — the netlist-driven back-annotation (add missing footprints,
-   rebind pad nets, report removed parts) needs both docs; implement at the session/worker layer.
+2. ~~`pcb_update_from_sch`~~ **DONE** — implemented as `engine/ecad/sync.py` +
+   `ecad_update_from_sch` RPC (footprint resolve + pad-net bind, idempotent, `test_sync` green).
+   Follow-up: surface it as an AI tool + a ribbon command.
 3. **`sch_import_kicad`** is a stub — needs a `.kicad_sch` importer (the `.kicad_sym`/`.kicad_mod`
    importers already exist in `library/`).
 4. **`.ecad+` container** (`engine/ecad/formats.py`) not built — `ecad_save/open` fall back to plain

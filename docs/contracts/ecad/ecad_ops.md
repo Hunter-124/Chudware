@@ -83,7 +83,7 @@ symbol in op 0, wire to it with `"from":{"sym":"$0","pin":"1"}` in op 1). Same s
 | `pcb_delete_zone` | `id` | |
 | `pcb_set_rules` | patch of DesignRules / `net_classes` | |
 | `pcb_assign_net` | `pad`:{`fp`,`pad`}, `net` | manual override |
-| `pcb_update_from_sch` | `sch_doc_id` | **the back-annotation op**: pull components/nets/footprints from a linked schematic's netlist; add missing footprints, update refs/values, rebind pad nets, report removed parts. Idempotent. |
+| `pcb_update_from_sch` | `sch_doc_id` | **the back-annotation op**: pull components/nets/footprints from a linked schematic's netlist; add missing footprints, update refs/values, rebind pad nets, report removed parts. Idempotent. As a single-doc op it only records `linked_sch` (it cannot reach the schematic doc); the real netlist-driven reconciliation is the cross-document RPC `ecad_update_from_sch` `{board_doc_id, sch_doc_id, prune?, place_origin?}` → board ops-response + `report{added,updated,removed,unresolved,nets_bound}` (engine.ecad.sync.update_board_from_sch). |
 | `pcb_autoplace` | `area?`, `strategy?` | best-effort initial placement of unplaced footprints (grid/connectivity heuristic) |
 
 ## 6. Shared ops (both kinds)

@@ -161,6 +161,10 @@ def _compile(doc: dict) -> dict:
                 out["ratsnest"] = result.get("ratsnest", [])
             else:
                 out["drc"] = result or []
+                # run_drc returns a flat violation list; the airwires live in a separate entry
+                # point, so surface them in compile.ratsnest (the ops-response contract field).
+                if hasattr(drc_mod, "ratsnest"):
+                    out["ratsnest"] = drc_mod.ratsnest(doc)
         except ImportError:
             pass
         except Exception as exc:  # noqa: BLE001
@@ -220,6 +224,35 @@ def apply_ops(session: EcadSession, base_revision: int | None, ops: list[dict],
     session.dirty = True
 
     return _ops_response(session, res["id_map"], res.get("warnings"))
+
+
+def swap_doc(session: EcadSession, new_doc: dict, *, base_revision: int | None = None,
+             warnings: list[str] | None = None, emit: EmitFn | None = None) -> dict:
+    """Swap a wholesale-replaced document into *session* (one revision bump), like :func:`apply_ops`.
+
+    Used by cross-document operations (e.g. ``ecad_update_from_sch`` back-annotation) that compute a
+    new document outside the single-doc op vocabulary. The new doc is validated first (a schema
+    failure raises :class:`OpError` and leaves the session untouched — same atomicity as apply_ops):
+    on success we push an undo snapshot of the OLD doc, swap in the new doc, bump the revision by 1,
+    compile, and return the full ops-response (with an empty ``id_map``).
+    """
+    if base_revision is not None and base_revision != session.revision:
+        raise OpError("stale_revision",
+                      f"base_revision {base_revision} != current {session.revision}",
+                      {"current_revision": session.revision})
+
+    errs = schema.validate(new_doc)
+    if errs:
+        raise OpError("invalid_op",
+                      "resulting document failed validation: " + "; ".join(errs[:5]),
+                      {"reason": errs[0] if errs else "invalid document", "all_errors": errs})
+
+    session._push_undo()
+    session.doc = copy.deepcopy(new_doc)
+    session.revision += 1
+    session.dirty = True
+
+    return _ops_response(session, {}, warnings)
 
 
 def rebuild(session: EcadSession, emit: EmitFn | None = None) -> dict:

@@ -460,6 +460,72 @@ def _ecad_to_3d(params: dict, _emit: EmitFn) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# ecad_update_from_sch  {board_doc_id, sch_doc_id, prune?, place_origin?}
+#   -> ops-response (for the board) + report
+# ---------------------------------------------------------------------------
+
+def _ecad_update_from_sch(params: dict, _emit: EmitFn) -> dict:
+    """Back-annotation: populate a PCB from a linked schematic's netlist (ecad_ops.md §5).
+
+    This is a CROSS-document operation (it needs both the board and the schematic), so it lives at
+    the RPC/session layer rather than inside ops.py's single-doc apply. It:
+
+      1. loads both open sessions (``board_doc_id`` must be a pcb, ``sch_doc_id`` a sch),
+      2. builds the schematic's netlist (engine.ecad.netlist.build_netlist),
+      3. reconciles via engine.ecad.sync.update_board_from_sch (add/update footprints, bind pad
+         nets, register missing nets, report removed parts),
+      4. swaps the new board into the board session (one revision bump, undo snapshot, recompile),
+      5. returns the board ops-response with the sync ``report`` attached.
+
+    Idempotent: a second call with no schematic changes adds/updates nothing.
+    """
+    from engine.ecad import session as esess, schema
+    from engine.ecad import netlist as netlist_mod
+    from engine.ecad import sync as sync_mod
+
+    board_doc_id = str(_require(params, "board_doc_id"))
+    sch_doc_id = str(_require(params, "sch_doc_id"))
+    prune = bool(params.get("prune", False))
+    place_origin = params.get("place_origin")
+    base_revision = params.get("base_revision")
+
+    board_s = esess.get_session(board_doc_id)
+    sch_s = esess.get_session(sch_doc_id)
+
+    if not schema.is_board(board_s.doc):
+        raise OpError("invalid_op",
+                      "ecad_update_from_sch: board_doc_id is not a pcb document",
+                      {"reason": "wrong doc kind", "doc_id": board_doc_id})
+    if not schema.is_schematic(sch_s.doc):
+        raise OpError("invalid_op",
+                      "ecad_update_from_sch: sch_doc_id is not a sch document",
+                      {"reason": "wrong doc kind", "doc_id": sch_doc_id})
+
+    netlist = netlist_mod.build_netlist(sch_s.doc)
+    # Carry the schematic's id so sync records board.linked_sch = the source schematic.
+    netlist = dict(netlist)
+    netlist["id"] = sch_s.doc.get("id")
+
+    result = sync_mod.update_board_from_sch(
+        board_s.doc, netlist, place_origin=place_origin, prune=prune)
+    report = result["report"]
+
+    warnings: list[str] = []
+    if report.get("unresolved"):
+        warnings.append("unresolved footprints (no def found): "
+                        + ", ".join(f"{ref}({fpid})" for ref, fpid in report["unresolved"]))
+    if report.get("removed") and not prune:
+        warnings.append("footprints no longer in schematic (not pruned): "
+                        + ", ".join(report["removed"]))
+
+    resp = esess.swap_doc(board_s, result["mutated_board"],
+                          base_revision=base_revision, warnings=warnings or None)
+    resp["report"] = report
+    resp["doc_id"] = board_doc_id
+    return resp
+
+
+# ---------------------------------------------------------------------------
 # Method + structured-error registration
 # ---------------------------------------------------------------------------
 
@@ -477,6 +543,7 @@ METHODS: dict[str, object] = {
     "ecad_describe": _ecad_describe,
     "ecad_export": _ecad_export,
     "ecad_to_3d": _ecad_to_3d,
+    "ecad_update_from_sch": _ecad_update_from_sch,
 }
 
 STRUCTURED_ERROR_METHODS: set[str] = set(METHODS.keys())

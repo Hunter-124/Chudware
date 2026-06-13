@@ -172,6 +172,65 @@ measurement** for dimensional types (distance/angle in mm/deg, radius/diameter i
 `[0,180)`); `null` for geometric relations (coincident/parallel/…) and when refs cannot resolve.
 Driven (reference) dims still report `measured`.
 
+### Drawings (W12 — 2D orthographic/iso views of a part/assembly via HLR)
+
+A drawing document (`aicad.drawing/1`, doc_schema.md §8) projects a SOURCE part/assembly into 2D
+views. These methods live in `engine/doc/drawing.py` (registered via `drawing.WORKER_METHODS`) and
+keep a SEPARATE registry from `doc_*` sessions — a `drawing_*` `doc_id` is a drawing id, not a part
+session id. All use the **structured error envelope**. The projected geometry is recomputed from the
+source's CURRENT bodies on every fetch (associative); the host re-fetches after editing the source.
+
+| method | params → result |
+|---|---|
+| `drawing_new` | `{source_doc_id, name?}` → `{doc_id, drawing}` — create a drawing referencing an OPEN source part/assembly session. `drawing` is the doc JSON (one default A3 sheet `s1`, no views). `unknown_doc` if the source isn't an open session. |
+| `drawing_add_view` | `{doc_id, type, orientation, sheet_id?, scale?, position?, show_hidden?}` → `{view_id, revision, view}` — append a view (defaults: `sheet_id`=first sheet, `scale`=1.0, `position`=[0,0], `show_hidden`=true; an `iso` type forces `orientation:"iso"`). `view` is the projected 2D geometry for the new view (shape below). |
+| `drawing_set_view` | `{doc_id, view_id, scale?, position?, orientation?, show_hidden?}` → `{view_id, revision, view}` — move/rescale/re-orient (orientation ignored for `iso` views); returns the re-projected `view`. |
+| `drawing_remove_view` | `{doc_id, view_id}` → `{removed: true, revision}`. `invalid_op` on an unknown view. |
+| `drawing_get` | `{doc_id}` → full drawing + every view's projected geometry (shape below). |
+| `drawing_close` | `{doc_id}` → `{closed: bool}`. |
+
+**`drawing_get` result.** Re-projects ALL views against the source's current bodies:
+
+```json
+{
+  "doc_id": "…", "revision": 5,
+  "source_doc_id": "…", "source_revision": 12,
+  "tree": { <the DrawingDocument JSON> },
+  "total_hlr_ms": 6.1,
+  "sheets": [
+    {"id": "s1", "size": "A3", "size_mm": [420.0, 297.0],
+     "views": [ <ViewGeometry>, … ]}
+  ]
+}
+```
+
+**`ViewGeometry` — the normative 2D view-geometry shape** (returned per view by `drawing_get`,
+`drawing_add_view`, `drawing_set_view`). A polyline is a list of `[x, y]` points in **sheet mm**
+(already scaled by the view `scale` and translated to the view `position`):
+
+```json
+{
+  "view_id": "v1", "type": "base", "orientation": "front",
+  "scale": 1.0, "position": [100.0, 100.0], "show_hidden": true,
+  "visible": [ [[x,y],[x,y],…], … ],   // solid lines: sharp edges + silhouette outline + smooth/tangent
+  "hidden":  [ [[x,y],[x,y],…], … ],   // dashed lines: hidden sharp edges (empty when show_hidden=false)
+  "bbox": [min_x, min_y, max_x, max_y], // sheet mm, or null when the view has no geometry
+  "ms": 2.0,                             // HLR timing for this view
+  "error": null                          // string when the projection failed (then visible/hidden empty)
+}
+```
+
+- Straight model edges become 2-point polylines; curved edges (circles, fillets, splines) are
+  discretized (≈0.05 mm chord / 0.35 rad deflection) into many-point polylines.
+- `visible` merges OCCT's `VCompound` (sharp), `OutLineVCompound` (silhouette) and
+  `Rg1LineVCompound` (smooth/tangent, e.g. a fillet run-out). `hidden` merges `HCompound` +
+  `OutLineHCompound`. Orientation→direction is normative in doc_schema.md §8 (Z-up: front=+Y).
+- **Containment:** a single view's HLR/OCCT failure sets `error` and empties that view's geometry;
+  the rest of the drawing is unaffected and the call still succeeds. HLR is the slow step (a few ms
+  per simple solid; tens-of-ms on complex parts); results are cached per
+  `(source_revision, orientation, scale, show_hidden)` so re-fetching an unchanged source is cheap
+  (position is re-applied as a cheap translate without re-running HLR).
+
 ### Evaluate (M5; overlay-producing methods return `{aicm_path}` with `SCLR` chunks)
 `eval_measure {doc_id, refs:[Selector,…]}` → `{kind, distance?, angle?, length?, area?, radius?,
 points?:[…]} `· `eval_mass {doc_id, body?}` → `{volume_mm3, mass_g, com:[3], inertia:[9],

@@ -1,7 +1,14 @@
-# Contract: Document Schema — `aicad.part/1` · `aicad.asm/1`
+# Contract: Document Schema — `aicad.part/1` · `aicad.asm/1` · `aicad.drawing/1`
 
 > Version 1. Changes require a schema-string bump and a migration note here.
 > Machine-checked by `engine/doc/schema.py`; fixtures in `docs/contracts/fixtures/`.
+>
+> **W12 minor version bump (additive).** A NEW top-level document kind `aicad.drawing/1`
+> (`DrawingDocument`, §8) is added — a 2D detailing document that projects a source part/assembly
+> into orthographic + isometric views via HLR. This is a **new schema string**, NOT a change to the
+> existing `aicad.part/1` / `aicad.asm/1` schemas (those are byte-for-byte unchanged and every
+> existing part/assembly document remains valid). `validate_document` now dispatches a third schema
+> string; readers that don't understand `aicad.drawing/1` reject it exactly like any unknown schema.
 >
 > **C35-overhaul migration (additive, no schema-string bump).** Three OPTIONAL fields are added;
 > every pre-overhaul document remains valid (the fields default to absent/null), so the schema
@@ -254,3 +261,70 @@ Normative geometry (Z-up, matching the existing engine/render conventions):
 - Readers MUST reject an unknown major schema string (`aicad.part/2`).
 - Readers MUST ignore unknown keys (forward-tolerant) and preserve them on resave when feasible.
 - Writers MUST emit every required key listed here.
+
+## 8. DrawingDocument (`aicad.drawing/1`, W12)
+
+A **drawing** is a 2D detailing document that projects a SOURCE part/assembly into orthographic +
+isometric views via hidden-line removal (HLR). It carries no features/equations/material — only a
+`source` reference and sheets of views. The projected 2D geometry is **not stored** in the document
+(it is recomputed from the source's current bodies on every `drawing_get`, so the drawing stays
+associative); the document only stores the view *definitions*.
+
+```json
+{
+  "schema": "aicad.drawing/1",
+  "id": "doc-…",
+  "name": "Bracket - Drawing",
+  "units": {"system": "MMGS"},
+  "source": "<source part/assembly doc id>",
+  "sheets": [
+    {
+      "id": "s1",
+      "size": "A3",
+      "views": [
+        {"id": "v1", "type": "base", "orientation": "front",
+         "scale": 1.0, "position": [100, 100], "show_hidden": true},
+        {"id": "v2", "type": "projected", "orientation": "top",
+         "scale": 1.0, "position": [100, 200], "show_hidden": true},
+        {"id": "v3", "type": "iso", "orientation": "iso",
+         "scale": 1.0, "position": [250, 200], "show_hidden": false}
+      ]
+    }
+  ]
+}
+```
+
+- `source` — the source doc to project. A **string** is an open source doc id (the live-session
+  form W12 uses) or a path; the **object** form `{path}` / `{doc_id}` is reserved for embedded
+  sources. The source must resolve to a part or assembly with compiled bodies at projection time.
+- `sheets` — non-empty list. Each sheet: `id` (`s<N>`), `size` (∈ `A4 A3 A2 A1 A0` ISO + `A B C D E`
+  ANSI), `views`. View `id`s (`v<N>`) are **document-unique** (not just per-sheet).
+- **View** = `{id, type, orientation, scale, position:[x,y], show_hidden}`:
+  - `type` ∈ `base` | `projected` | `iso`. `base` = the primary orthographic view; `projected` =
+    an ortho view folded off the base (front/top/right/…); `iso` = the standard isometric.
+  - `orientation` ∈ `front back top bottom left right iso`. An `iso` view MUST be orientation
+    `iso`; a `base`/`projected` view MUST NOT be `iso`.
+  - `scale` — positive float (drawn size ÷ true size). `position:[x,y]` — sheet-mm anchor of the
+    view's projected-origin. `show_hidden` — bool, draw hidden (dashed) edges.
+  - **Reserved (W13):** a view may carry `annotations:[…]` (list) and `label:str|null`.
+
+**Orientation → projection direction (Z-up, matches §5 reserved datums).** The orientation is the
+HLR line of sight; `front` looks along **+Y** (the viewer sits at −Y, exactly like `plane.front`'s
+−Y normal):
+
+| orientation | view dir (eye→model) | sheet +x | sheet +y |
+|---|---|---|---|
+| `front` | +Y | +X | +Z |
+| `back` | −Y | −X | +Z |
+| `top` | −Z | +X | +Y |
+| `bottom` | +Z | +X | −Y |
+| `right` | −X | +Y | +Z |
+| `left` | +X | −Y | +Z |
+| `iso` | −(1,1,1) (eye at (1,1,1)) | iso horizontal | world +Z up |
+
+Canonical units mm. A projection failure on one view is **contained**: that view comes back with
+`error:"<reason>"` and empty geometry; it never invalidates the other views or the document.
+
+The 2D view-geometry JSON shape (what `drawing_get` / `drawing_add_view` return per view) is
+normative in [worker_rpc.md §Drawings](worker_rpc.md). Implemented + machine-checked by
+`engine/doc/drawing.py` + `engine/doc/schema.py::validate_drawing`.

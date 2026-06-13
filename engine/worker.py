@@ -695,6 +695,13 @@ from engine.doc import instant3d as _instant3d  # noqa: E402
 
 _METHODS.update(_instant3d.WORKER_METHODS)
 
+# W12 DRAWINGS — 2D orthographic/iso views of a part/assembly via HLR. Its own WORKER_METHODS dict
+# (drawing_new / drawing_add_view / drawing_get / drawing_remove_view / drawing_set_view /
+# drawing_close) keeps the literal above frozen.
+from engine.doc import drawing as _drawing  # noqa: E402
+
+_METHODS.update(_drawing.WORKER_METHODS)
+
 # C22a orchestrator (M9) — registered via update so the shared _METHODS dict literal stays owned by
 # the worker integrator. agent_run_v2/agent_cancel/get_prompts_v2 keep the LEGACY plain-string error
 # shape (they are not in _STRUCTURED_ERROR_METHODS), matching agent_design.
@@ -720,6 +727,9 @@ _STRUCTURED_ERROR_METHODS = {
     "doc_export_step", "doc_face_points",  # C19
     "import_file", "export_file",  # C21
     "doc_push_pull",  # Instant3D push-pull (drag a face)
+    # W12 drawings — all use the structured error envelope.
+    "drawing_new", "drawing_add_view", "drawing_remove_view", "drawing_set_view",
+    "drawing_get", "drawing_close",
 }
 
 # ---- ask mode (Wave D) — registered via update/add so the literals above stay frozen ----

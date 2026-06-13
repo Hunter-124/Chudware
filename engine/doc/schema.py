@@ -18,6 +18,15 @@ from .equations import EquationError, expr_names, validate_expr
 
 SCHEMA_PART = "aicad.part/1"
 SCHEMA_ASM = "aicad.asm/1"
+SCHEMA_DRAWING = "aicad.drawing/1"  # W12 — 2D orthographic/iso drawing of a source part/assembly
+
+# Drawing sheet sizes (ISO A-series + ANSI). Width/height (landscape) lookup lives in drawing.py;
+# the validator only checks the size token is one we know.
+SHEET_SIZES = {"A4", "A3", "A2", "A1", "A0", "A", "B", "C", "D", "E"}
+# Drawing view kinds + canonical orientations (Z-up: front looks +Y, top -Z, right -X — see
+# engine/doc/features/datum.py reserved_datums + drawing.py orientation table).
+VIEW_TYPES = {"base", "projected", "iso"}
+VIEW_ORIENTATIONS = {"front", "back", "top", "bottom", "left", "right", "iso"}
 
 RESERVED_DATUMS = {
     "origin",
@@ -754,6 +763,98 @@ def validate_assembly(doc: Any) -> list[str]:
     return errs
 
 
+# --------------------------------------------------------------------------- drawing (W12)
+
+
+def _validate_view(v: Any, where: str) -> list[str]:
+    """A drawing View: {id, type, orientation, scale, position:[x,y], show_hidden}.
+
+    Optional reserved fields (W13): ``annotations`` (a list) and ``label`` (a string). Geometry —
+    whether the projection actually yields edges — is the projector's concern (drawing.py), not the
+    structural validator's.
+    """
+    errs: list[str] = []
+    if not isinstance(v, dict):
+        return [f"{where}: view must be an object"]
+    if not isinstance(v.get("id"), str) or not re.match(r"^v\d+$", v["id"]):
+        errs.append(f"{where}.id: must match v<N>")
+    if v.get("type") not in VIEW_TYPES:
+        errs.append(f"{where}.type: '{v.get('type')}' not in {sorted(VIEW_TYPES)}")
+    if v.get("orientation") not in VIEW_ORIENTATIONS:
+        errs.append(f"{where}.orientation: '{v.get('orientation')}' not in {sorted(VIEW_ORIENTATIONS)}")
+    # An iso view must be oriented "iso"; an ortho (base/projected) view must not.
+    if v.get("type") == "iso" and v.get("orientation") != "iso":
+        errs.append(f"{where}: an 'iso' view requires orientation 'iso'")
+    if v.get("type") in ("base", "projected") and v.get("orientation") == "iso":
+        errs.append(f"{where}: orientation 'iso' is only valid for an 'iso' view")
+    if not _is_num(v.get("scale")) or float(v.get("scale", 0)) <= 0:
+        errs.append(f"{where}.scale: must be a positive number")
+    if not _is_vec(v.get("position"), 2):
+        errs.append(f"{where}.position: must be [x,y] (sheet mm)")
+    if not isinstance(v.get("show_hidden"), bool):
+        errs.append(f"{where}.show_hidden: required bool")
+    if "annotations" in v and not isinstance(v["annotations"], list):
+        errs.append(f"{where}.annotations: must be a list (reserved for W13)")
+    if "label" in v and not isinstance(v["label"], (str, type(None))):
+        errs.append(f"{where}.label: must be a string or null")
+    return errs
+
+
+def validate_drawing(doc: Any) -> list[str]:
+    """Validate a ``aicad.drawing/1`` document (W12).
+
+    A drawing is a 2D detailing document that PROJECTS a source part/assembly into orthographic +
+    isometric views. It carries no features/equations/material — only a ``source`` reference and a
+    list of sheets, each holding views.
+    """
+    if not isinstance(doc, dict):
+        return ["document must be a JSON object"]
+    errs = _validate_common(doc, SCHEMA_DRAWING)
+
+    # source: an open doc id (string) or an embedded source spec {path} / {doc_id}.
+    src = doc.get("source")
+    if isinstance(src, str):
+        if not src:
+            errs.append("source: must be a non-empty doc id / path string")
+    elif isinstance(src, dict):
+        if not (isinstance(src.get("path"), str) or isinstance(src.get("doc_id"), str)):
+            errs.append("source: object form must carry {path} or {doc_id}")
+    else:
+        errs.append("source: must be a source doc id string or {path}|{doc_id}")
+
+    sheets = doc.get("sheets")
+    if not isinstance(sheets, list) or not sheets:
+        errs.append("sheets: must be a non-empty list")
+        sheets = []
+    sheet_ids: set[str] = set()
+    view_ids: set[str] = set()
+    for i, sh in enumerate(sheets):
+        loc = f"sheets[{i}]"
+        if not isinstance(sh, dict):
+            errs.append(f"{loc}: must be an object")
+            continue
+        sid = sh.get("id")
+        if not isinstance(sid, str) or not re.match(r"^s\d+$", sid):
+            errs.append(f"{loc}.id: must match s<N>")
+        elif sid in sheet_ids:
+            errs.append(f"{loc}.id: duplicate '{sid}'")
+        else:
+            sheet_ids.add(sid)
+        if sh.get("size") not in SHEET_SIZES:
+            errs.append(f"{loc}.size: '{sh.get('size')}' not in {sorted(SHEET_SIZES)}")
+        views = sh.get("views")
+        if not isinstance(views, list):
+            errs.append(f"{loc}.views: must be a list")
+            views = []
+        for j, v in enumerate(views):
+            errs += _validate_view(v, f"{loc}.views[{j}]")
+            if isinstance(v, dict) and isinstance(v.get("id"), str):
+                if v["id"] in view_ids:
+                    errs.append(f"{loc}.views[{j}].id: duplicate '{v['id']}' (view ids are doc-unique)")
+                view_ids.add(v["id"])
+    return errs
+
+
 def validate_document(doc: Any) -> list[str]:
     """Dispatch on the schema string."""
     if not isinstance(doc, dict):
@@ -763,4 +864,6 @@ def validate_document(doc: Any) -> list[str]:
         return validate_part(doc)
     if schema == SCHEMA_ASM:
         return validate_assembly(doc)
+    if schema == SCHEMA_DRAWING:
+        return validate_drawing(doc)
     return [f"schema: unknown '{schema}'"]

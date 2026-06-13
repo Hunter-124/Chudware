@@ -51,6 +51,12 @@ extern const char* kStarterCode;
 
 enum JobKind { JOB_BUILD, JOB_DESIGN, JOB_CHAT };
 
+// Document display/input unit system. The engine is canonical mm/deg; this is a HOST-only
+// concern that controls how lengths are FORMATTED for display and how a BARE number typed into
+// a dim field is interpreted. Angles stay in degrees in both systems (SolidWorks behavior).
+//   MMGS = millimeter / gram / second   IPS = inch / pound / second
+enum class Units { MMGS = 0, IPS = 1 };
+
 // ---------------- settings (AI provider) -> %APPDATA%/AI-CAD/config.json ----------------
 struct Settings {
     int provider = 2;  // 0 = Anthropic, 1 = OpenAI, 2 = Local (OpenAI-compatible).
@@ -64,6 +70,7 @@ struct Settings {
     int maxIters = 0;            // refine-pass cap per turn; 0 = automatic
     std::string systemPrompt;    // system prompt override; empty = built-in
     std::string theme = "dark";  // "dark" | "light" — persisted to config.json
+    Units units = Units::MMGS;   // document display/input unit system — persisted to config.json
 };
 
 std::string appdataDir();
@@ -549,6 +556,12 @@ struct AppState {
 
     // W1-B: request a non-default cursor for THIS frame. The last request before end-of-frame wins.
     void requestCursor(ui::CursorKind k) { cursorRequest = k; }
+
+    // Active document-unit system helpers (single source of truth = settings.units). Every dim
+    // DISPLAY site routes ips() into pmFormatDim; every BARE-number dim INPUT site passes ips() as
+    // the default-unit so "1.5" means 1.5 in in IPS and 1.5 mm in MMGS. Angles stay in degrees.
+    bool ips() const { return settings.units == Units::IPS; }
+    void toggleUnits() { settings.units = ips() ? Units::MMGS : Units::IPS; }
 
     // Load an AICM tessellation file into the id pass + overlays (and clear the selection).
     // Requires a current GL context and st.idPass/st.overlays to be set. Returns false on

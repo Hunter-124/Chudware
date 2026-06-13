@@ -73,6 +73,38 @@ static void resetPromptOverride(PromptRecord& pr, AppState& st) {
     s_promptsLoaded = false;
     loadPrompts(st);
 }
+
+// A dimmed "(?)" marker that reveals a one-line explanation on hover — for discoverability of the
+// less-obvious settings (vision / plan mode / max iters / units). Drawn inline (SameLine first).
+static void helpMarker(const char* desc) {
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                                 ui::palette.textDim[2], 1));
+    ImGui::TextUnformatted("(?)");
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 28.0f);
+        ImGui::TextUnformatted(desc);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
+// Apply a dark/light theme immediately (settings.theme persists on Save) and sync the viewport
+// background. Shared by the General-tab theme control. scale is unknown here (1.0 is fine
+// post-init — applyTheme only uses it for rounding/padding metrics already set at startup).
+static void applyThemeNow(AppState& st, bool light) {
+    ui::Theme next = light ? ui::Theme::Light : ui::Theme::Dark;
+    ui::applyTheme(next, 1.0f);
+    st.settings.theme = light ? "light" : "dark";
+    if (st.renderer)
+        st.renderer->setBackground(
+            ui::palette.viewportTop[0], ui::palette.viewportTop[1], ui::palette.viewportTop[2],
+            ui::palette.viewportBottom[0], ui::palette.viewportBottom[1],
+            ui::palette.viewportBottom[2]);
+}
 }  // anonymous namespace
 
 namespace ui {
@@ -90,31 +122,6 @@ void drawSettingsModal(AppState& st, bool busy) {
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
                             ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Settings", nullptr, ImGuiWindowFlags_NoResize)) {
-        // ---- theme row (before the tab body) ----
-        {
-            bool isLight = (ui::activeTheme == ui::Theme::Light);
-            if (ImGui::Checkbox("Light theme (SolidWorks-style)", &isLight)) {
-                ui::Theme next = isLight ? ui::Theme::Light : ui::Theme::Dark;
-                ui::applyTheme(next, 1.0f);  // scale unknown here; 1.0 is fine post-init
-                st.settings.theme = (next == ui::Theme::Light) ? "light" : "dark";
-                // Viewport background sync is handled by View menu or next applyTheme call;
-                // do it here too if renderer is accessible.
-                if (st.renderer)
-                    st.renderer->setBackground(
-                        ui::palette.viewportTop[0], ui::palette.viewportTop[1],
-                        ui::palette.viewportTop[2], ui::palette.viewportBottom[0],
-                        ui::palette.viewportBottom[1], ui::palette.viewportBottom[2]);
-            }
-            ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                                  ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                                         ui::palette.textDim[2], 1));
-            ImGui::TextUnformatted("(saved immediately)");
-            ImGui::PopStyleColor();
-        }
-        ImGui::Separator();
-        ImGui::Dummy(ImVec2(0, 2));
-
         // C22b: if a pending prompt role was requested, load prompts and jump to Agents tab.
         bool jumpToAgents = false;
         if (!st.pendingPromptRole.empty() && st.workerStarted) {
@@ -135,8 +142,47 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::BeginChild("##settabsarea",
                           ImVec2(0, ImGui::GetContentRegionAvail().y - 52.0f * sc));
         if (ImGui::BeginTabBar("##settabs")) {
+            // ---- General tab: Document (units) + Display (theme) ----
+            if (ImGui::BeginTabItem("General")) {
+                ImGui::Dummy(ImVec2(0, 2));
+
+                ImGui::SeparatorText("Document");
+                ImGui::TextUnformatted("Units");
+                helpMarker("The unit system for dimension display and input. The model is always "
+                           "stored in canonical millimeters; this only changes how lengths are "
+                           "shown and how a bare typed number is read. Angles stay in degrees in "
+                           "both systems. You can also click the MMGS/IPS badge in the status bar "
+                           "to switch.");
+                int unitSel = st.ips() ? 1 : 0;
+                bool unitsChanged = false;
+                unitsChanged |= ImGui::RadioButton("MMGS (millimeter, gram, second)", &unitSel, 0);
+                unitsChanged |= ImGui::RadioButton("IPS (inch, pound, second)", &unitSel, 1);
+                if (unitsChanged) {
+                    settings.units = (unitSel == 1) ? Units::IPS : Units::MMGS;
+                    // Saved immediately so the choice survives a Cancel (it is a display/document
+                    // preference, like theme — and the status-bar toggle persists the same way).
+                    saveSettings(settings);
+                    st.addLog(std::string("[units] set to ") + (st.ips() ? "IPS" : "MMGS"));
+                }
+                dimText("Changes how lengths display/parse everywhere (saved immediately).");
+
+                ImGui::Dummy(ImVec2(0, 8));
+                ImGui::SeparatorText("Display");
+                bool isLight = (ui::activeTheme == ui::Theme::Light);
+                if (ImGui::Checkbox("Light theme (SolidWorks-style)", &isLight))
+                    applyThemeNow(st, isLight);
+                ImGui::SameLine();
+                dimText("(saved immediately)");
+                helpMarker("Switches the whole UI and viewport between the dark and light "
+                           "(SolidWorks-style) palettes. Persists across restarts.");
+
+                ImGui::Dummy(ImVec2(0, 6));
+                dimText("All settings here are stored in %APPDATA%\\AI-CAD\\config.json.");
+                ImGui::EndTabItem();
+            }
             if (ImGui::BeginTabItem("AI provider")) {
                 ImGui::Dummy(ImVec2(0, 2));
+                ImGui::SeparatorText("Provider");
                 dimText("Used by 'Design with AI' and chat. Stored in "
                         "%APPDATA%\\AI-CAD\\config.json.");
                 ImGui::Dummy(ImVec2(0, 4));
@@ -163,9 +209,14 @@ void drawSettingsModal(AppState& st, bool busy) {
                                      ImGuiInputTextFlags_Password);
                     ImGui::Checkbox("Model supports vision (send screenshots)",
                                     &settings.vision);
+                    helpMarker("Let the agent SEE its own renders: each iteration's contact-sheet "
+                               "screenshot is sent back to the model so it can visually check the "
+                               "part and self-correct. Only enable for multimodal local models — "
+                               "a text-only model will error on image input.");
                 }
                 // --- C35: local-only / offline mode (ITAR compliance) --- begin marked block ---
-                ImGui::Dummy(ImVec2(0, 6));
+                ImGui::Dummy(ImVec2(0, 8));
+                ImGui::SeparatorText("Privacy");
                 ImGui::Checkbox("Offline mode (local models only — no network egress)",
                                 &settings.offlineMode);
                 if (ImGui::IsItemHovered())
@@ -269,12 +320,21 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     st.wantSettings ? ImGuiTabItemFlags_SetSelected
                                                     : ImGuiTabItemFlags_None)) {
                 ImGui::Dummy(ImVec2(0, 2));
+                ImGui::SeparatorText("Build loop");
                 ImGui::Checkbox("Plan before building (recommended)", &settings.planMode);
+                helpMarker("Plan mode: before writing any CAD code the agent drafts a build plan "
+                           "(the parts, their concrete dimensions and the feature list) and shows "
+                           "it in the conversation, then codes against that plan. Off = it goes "
+                           "straight to code.");
                 dimText("The agent first drafts a build plan - the parts, concrete "
                         "dimensions and features - shows it in the conversation, then "
                         "writes the CAD code against it.");
                 ImGui::Dummy(ImVec2(0, 4));
                 ImGui::TextUnformatted("Refine-pass cap per request");
+                helpMarker("Max iters: how many times the agent may re-build and refine a part in "
+                           "one request before it must stop. 0 = automatic — it keeps going until "
+                           "the render matches the request (or stabilizes), then stops on its own. "
+                           "A small cap (e.g. 3) bounds cost/time on hard parts.");
                 ImGui::SetNextItemWidth(140);
                 ImGui::InputInt("##miters", &settings.maxIters);
                 if (settings.maxIters < 0) settings.maxIters = 0;
@@ -282,8 +342,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ImGui::SameLine();
                 dimText("0 = automatic (stops once the render matches)");
                 ImGui::Dummy(ImVec2(0, 6));
-                ImGui::Separator();
-                ImGui::Dummy(ImVec2(0, 4));
+                ImGui::SeparatorText("System prompt");
+                ImGui::Dummy(ImVec2(0, 2));
                 ImGui::TextUnformatted("System prompt override");
                 dimText("Leave empty to use the built-in prompt (recommended). A custom "
                         "prompt fully replaces it - keep the `result`/`parts` contract "

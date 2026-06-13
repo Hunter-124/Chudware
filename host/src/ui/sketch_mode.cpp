@@ -1805,10 +1805,18 @@ std::string SketchMode::statusLine() const {
 // ---------------------------------------------------------------------------
 
 namespace {
-// Format a length (mm) for a dimension label, mirroring pmFormatDim's mm path without the unit
-// suffix subtleties (we add the suffix ourselves). Trims trailing zeros.
+// Active document-unit display for the sketcher's on-canvas dimensions + Modify box. Set once per
+// frame from AppState.ips() at the top of drawOverlay so the free-function formatters below (which
+// have no AppState) follow the MMGS<->IPS toggle. Sketch measured values are canonical mm; angles
+// stay in degrees in both systems.
+bool g_skIps = false;
+const char* skLenUnit() { return g_skIps ? "in" : "mm"; }
+
+// Format a length (mm) for a dimension label in the active document length unit (mm / inch),
+// trimming trailing zeros. The unit suffix is added by the caller.
 std::string fmtLen(double mm) {
-    char b[48]; std::snprintf(b, sizeof(b), "%.2f", mm);
+    double v = g_skIps ? mm / 25.4 : mm;
+    char b[48]; std::snprintf(b, sizeof(b), g_skIps ? "%.4g" : "%.2f", v);
     std::string s(b);
     if (s.find('.') != std::string::npos) { while (s.back() == '0') s.pop_back(); if (s.back() == '.') s.pop_back(); }
     return s;
@@ -2364,7 +2372,10 @@ void SketchMode::dimCommit(AppState& st) {
     double mm = dimMeasured_;
     if (!isExpr) {
         std::string perr;
-        if (!pmParseDim(txt, mm, perr, dimIsAngle_)) { dimError_ = perr.empty() ? "bad value" : perr; return; }
+        // A bare value in the Modify box follows the document length unit (mm / inch); angles
+        // stay degrees. An explicit suffix the user types still wins via pmParseDim.
+        const double bareScale = (g_skIps && !dimIsAngle_) ? 25.4 : 1.0;
+        if (!pmParseDim(txt, mm, perr, dimIsAngle_, bareScale)) { dimError_ = perr.empty() ? "bad value" : perr; return; }
     }
     if (!dimEditCid_.empty()) {
         // Editing an EXISTING dim: sketch_set_dim. C50f: pre-flight the new value with sketch_probe
@@ -3111,6 +3122,9 @@ bool SketchMode::drawRegionPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMi
 void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, const ImVec2& imgMax,
                              int vw, int vh, bool imgHovered) {
     if (!st.renderer) return;
+    // Sketch dimensions + Modify box follow the document unit system (mm / inch); refreshed each
+    // frame so a status-bar units toggle reformats on-canvas dims and the Modify box live.
+    g_skIps = st.ips();
     const auto& pal = ui::palette;
 
     // ---- C37-D: SolidWorks plane-pick step (runs while !active_, before a sketch exists) ----
@@ -5586,7 +5600,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
                          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
             const bool isAngle = dimIsAngle_;
-            const char* suffix = isAngle ? "\xC2\xB0" : "mm";
+            const char* suffix = isAngle ? "\xC2\xB0" : skLenUnit();
             // Friendly title + symbol per dim type.
             const char* title = dimType_ == "diameter" ? "\xE2\x8C\x80 Diameter"
                               : dimType_ == "radius"   ? "R Radius"
@@ -5597,7 +5611,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             ImGui::TextUnformatted(dimEditCid_.empty() ? title : (std::string("Edit ") + title).c_str());
             ImGui::PopStyleColor();
             {
-                std::string meas = isAngle ? fmtAng(dimMeasured_) : (fmtLen(dimMeasured_) + " mm");
+                std::string meas = isAngle ? fmtAng(dimMeasured_)
+                                           : (fmtLen(dimMeasured_) + " " + skLenUnit());
                 std::string lab = "now " + meas;
                 float w = ImGui::CalcTextSize(lab.c_str()).x;
                 ImGui::SameLine(0, 0);
@@ -5613,9 +5628,11 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             auto stepVal = [&](double delta) {
                 std::string txt = dimBuf_.data();
                 if (!txt.empty() && txt[0] == '=') return;   // don't mutate expressions
+                // Steps are one DISPLAY unit: in IPS a length step is 1 inch (= 25.4 mm canonical).
+                const double bareScale = (g_skIps && !isAngle) ? 25.4 : 1.0;
                 double cur = dimMeasured_; std::string perr;
-                if (pmParseDim(txt, cur, perr, isAngle)) {}  // parse current text if valid
-                cur += delta;
+                if (pmParseDim(txt, cur, perr, isAngle, bareScale)) {}  // parse current text if valid
+                cur += delta * ((isAngle) ? 1.0 : bareScale);
                 std::snprintf(dimBuf_.data(), dimBuf_.size(), "%s", fmtLen(cur).c_str());
             };
             const float btn = ImGui::GetFrameHeight();

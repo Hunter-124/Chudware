@@ -97,8 +97,12 @@ static const DimUnit kDimUnits[] = {
 
 // Tokenize a de-spaced, lowercased dim string. Returns false with err on a bad token.
 // unitCount/lastIsUnit report unit usage for the trailing-unit-applies-to-all rule.
+// bareLengthScale: canonical-mm value of one unit-less LENGTH literal (1.0 = MMGS, 25.4 = IPS).
+// A bare length literal (angle=false, no suffix) is scaled by it so "1.5" honours the doc unit;
+// literals with an explicit suffix and all angle values are unaffected.
 static bool dimTokenize(const std::string& s, bool angle, std::vector<DimTok>& out,
-                        int& unitCount, bool& endsWithUnit, std::string& err) {
+                        int& unitCount, bool& endsWithUnit, std::string& err,
+                        double bareLengthScale = 1.0) {
     unitCount = 0; endsWithUnit = false;
     size_t i = 0;
     while (i < s.size()) {
@@ -156,6 +160,9 @@ static bool dimTokenize(const std::string& s, bool angle, std::vector<DimTok>& o
                 i += n;
                 break;
             }
+            // Bare (unit-less) LENGTH literal: interpret in the document's active length unit
+            // (e.g. IPS -> a bare "1.5" is 1.5 in = 38.1 mm). Angles ignore this (degrees in both).
+            if (!t.hadUnit && !angle && bareLengthScale != 1.0) t.value *= bareLengthScale;
             endsWithUnit = t.hadUnit;
             out.push_back(t);
             continue;
@@ -212,7 +219,8 @@ struct DimEval {
 
 }  // namespace
 
-bool pmParseDim(const std::string& raw, double& outMm, std::string& err, bool angle) {
+bool pmParseDim(const std::string& raw, double& outMm, std::string& err, bool angle,
+                double bareLengthScale) {
     err.clear();
     std::string s;
     for (char c : raw) if (!std::isspace((unsigned char)c)) s += c;
@@ -240,9 +248,14 @@ bool pmParseDim(const std::string& raw, double& outMm, std::string& err, bool an
         }
     }
 
+    // When an explicit trailing unit governs the whole expression (wholeScale != 1.0), the bare
+    // literals that remain are scaled by that unit, NOT by the document default — so suppress the
+    // document bare-unit interpretation in that path.
+    const double bareScale = (wholeScale != 1.0) ? 1.0 : bareLengthScale;
+
     std::vector<DimTok> toks;
     int unitCount = 0; bool endsWithUnit = false;
-    if (!dimTokenize(s, angle, toks, unitCount, endsWithUnit, err)) return false;
+    if (!dimTokenize(s, angle, toks, unitCount, endsWithUnit, err, bareScale)) return false;
     if (toks.size() <= 1) { err = "empty"; return false; }
 
     DimEval ev{toks};
@@ -332,11 +345,11 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     if (checkpointId_.empty())
         st.addLog("[pm] checkpoint failed — Cancel will use undo loop fallback");
 
-    const bool useIps = false;  // M1: units display follows set_units; default MMGS.
+    ips_ = st.ips();   // document-unit display follows the active unit system (MMGS / IPS)
     fields_.clear();
     fields_.resize(form->fields.size());
     for (size_t i = 0; i < form->fields.size(); ++i)
-        initField(fields_[i], form->fields[i], useIps);
+        initField(fields_[i], form->fields[i], ips_);
 
     // If a mode/op combo exists, preselect it from the command (boss/cut split button; boolean
     // combine/subtract/intersect). Match mode_ against the combo's option VALUES so any N-way combo
@@ -478,10 +491,11 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
     if (checkpointId_.empty())
         st.addLog("[pm] checkpoint failed — Cancel will use undo loop fallback");
 
+    ips_ = st.ips();   // document-unit display follows the active unit system (MMGS / IPS)
     fields_.clear();
     fields_.resize(form->fields.size());
     for (size_t i = 0; i < form->fields.size(); ++i)
-        initField(fields_[i], form->fields[i], false);
+        initField(fields_[i], form->fields[i], ips_);
 
     loadFromTree(st, *target);
     st.addLog("[pm] edit " + featureId + " (" + type + ")");
@@ -506,7 +520,7 @@ void PropertyManager::loadFromTree(AppState& st, const nlohmann::json& feature) 
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                     } else if (d.contains("value") && d["value"].is_number()) {
                         f.dimValue = d["value"].get<double>();
-                        std::string disp = pmFormatDim(f.dimValue, false);
+                        std::string disp = pmFormatDim(f.dimValue, ips_);
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                     }
                 }
@@ -647,19 +661,33 @@ std::vector<PMCalloutItem> PropertyManager::calloutItems(AppState& st) const {
         }
     }
 
-    const bool useIps = false;  // M1 default MMGS (mirrors draw())
     for (const auto& f : fields_) {
         if (f.def->kind != PMFieldKind::Dim) continue;
         if (!fieldEnabled(*f.def, fields_)) continue;   // skip greyed / coming-soon dims
         PMCalloutItem it;
         it.label = f.def->label;
-        it.value = f.dimExpr.empty() ? pmFormatDim(f.dimValue, useIps)
+        it.value = f.dimExpr.empty() ? pmFormatDim(f.dimValue, ips_)
                                      : ("=" + f.dimExpr);
         it.hasAnchor = hasAnchor;
         if (hasAnchor) { it.anchor[0] = anchor[0]; it.anchor[1] = anchor[1]; it.anchor[2] = anchor[2]; }
         out.push_back(std::move(it));
     }
     return out;
+}
+
+// Live unit-toggle support: rewrite each non-expr Dim field's display buffer from its canonical
+// mm dimValue using the current ips_. Expr-bound fields keep their "=expr" text untouched; the
+// stored canonical value is never changed, so flipping units is purely cosmetic.
+void PropertyManager::reformatDimDisplays() {
+    for (auto& f : fields_) {
+        if (!f.def || f.def->kind != PMFieldKind::Dim) continue;
+        if (!f.dimExpr.empty()) continue;          // expr binding shown as "=expr"; leave it
+        if (f.def->unitLabel && f.def->unitLabel[0] == '\0') continue;  // unit-less field
+        if (f.def->unitLabel && std::strstr(f.def->unitLabel, "deg")) continue;  // angle: degrees both
+        std::string disp = pmFormatDim(f.dimValue, ips_);
+        std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
+        f.dimError.clear();
+    }
 }
 
 void PropertyManager::close() {
@@ -1125,6 +1153,11 @@ static const char* formDescription(const char* type) {
 void PropertyManager::draw(AppState& st) {
     if (!active_) return;
 
+    // Live unit-system toggle: if the document units changed while this form is open (e.g. the
+    // user clicked the status-bar MMGS/IPS cluster), reformat every open Dim field's DISPLAY from
+    // its canonical mm value. The stored value is unchanged — purely a display reformat.
+    if (st.ips() != ips_) { ips_ = st.ips(); reformatDimDisplays(); }
+
     // C37-F: Floating fallback — if the FeatureManager dock window isn't visible this frame
     // (dock closed or un-docked and minimised), draw the PM as an independent floating window
     // so it can never be invisibly active and trap keyboard/pick input.
@@ -1269,7 +1302,7 @@ void PropertyManager::draw(AppState& st) {
     // ---- field rows grouped by `group`, collapsible ------------------------
     const char* curGroup = nullptr;
     bool groupOpen = true;
-    bool useIps = false;   // M1 default MMGS
+    const bool useIps = ips_;   // document-unit display (set at open; re-synced above on toggle)
 
     // C37-F: track which Dim field is first/editable for SetKeyboardFocusHere.
     bool firstEditableDimSeen = false;
@@ -1366,7 +1399,13 @@ void PropertyManager::draw(AppState& st) {
                     } else {
                         double mm;
                         std::string err;
-                        if (pmParseDim(txt, mm, err)) {
+                        // A bare (unit-less) number follows the document length unit: mm in MMGS,
+                        // inch in IPS. Angle fields ([deg]) stay degrees in both systems, so they
+                        // keep the unit-less default scale. (angle stays false as before so an
+                        // explicit length suffix on any field still parses — existing behavior.)
+                        const bool isAngle = f.def->unitLabel && std::strstr(f.def->unitLabel, "deg");
+                        const double bareScale = (useIps && !isAngle) ? 25.4 : 1.0;
+                        if (pmParseDim(txt, mm, err, /*angle=*/false, bareScale)) {
                             f.dimValue = mm; f.dimExpr.clear(); f.dimError.clear();
                             dirty_ = true; lastEditTime_ = ImGui::GetTime();
                         } else {

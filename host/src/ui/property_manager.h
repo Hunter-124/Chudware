@@ -131,10 +131,15 @@ struct PMField {
 // Parse a dim string to canonical units (mm; degrees when angle=true). Accepts SolidWorks-style
 // unit math: full +-*/() expressions with per-literal unit suffixes ("100mm+2in/0.5m",
 // "(3+1/8)in", "25.4/2"); a single TRAILING unit applies to the whole expression ("1/2in" =
-// half an inch). Length units: mm cm m um/µm in/" ft/' mil/thou; angle units: deg ° rad. Bare
-// numbers are document units (mm / deg). Returns true on success.
-// Leading "=" is NOT handled here (that is an expr binding, detected by the caller).
-bool pmParseDim(const std::string& text, double& outMm, std::string& err, bool angle = false);
+// half an inch). Length units: mm cm m um/µm in/" ft/' mil/thou; angle units: deg ° rad. Returns
+// true on success. Leading "=" is NOT handled here (that is an expr binding, detected by caller).
+//
+// bareLengthScale is the canonical-mm value of ONE bare (unit-less) length unit — the document's
+// active length unit. 1.0 = MMGS (a bare "1.5" means 1.5 mm); 25.4 = IPS (a bare "1.5" means
+// 1.5 in). It scales bare LENGTH literals only; literals carrying an explicit suffix (1.5mm, 2in)
+// always honour that suffix, and ANGLE values ignore it entirely (degrees in both systems).
+bool pmParseDim(const std::string& text, double& outMm, std::string& err, bool angle = false,
+                double bareLengthScale = 1.0);
 // Format a canonical mm value for display, honouring IPS when ips==true.
 std::string pmFormatDim(double mm, bool ips);
 
@@ -236,6 +241,12 @@ private:
     // C51: the profile/sections well (first SelectorWell keyed "profile" or "sections").
     PMField* profileWell();
     const PMField* profileWell() const;
+
+    // Active document-unit display state. Set from AppState.ips() at open; re-synced each draw so a
+    // live MMGS<->IPS toggle reformats every open Dim field's DISPLAY (the canonical mm dimValue is
+    // untouched). reformatDimDisplays() rewrites each non-expr dim buffer from its dimValue.
+    bool ips_ = false;
+    void reformatDimDisplays();
 
     bool active_ = false;
     bool editMode_ = false;        // true = reopened on an existing feature (no add op)

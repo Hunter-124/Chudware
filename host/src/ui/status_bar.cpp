@@ -78,7 +78,9 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     std::string ptxt = std::string(provName) + "  /  " +
                        (st.settings.model[0] ? st.settings.model : "default") +
                        (st.settings.planMode ? "   [plan mode]" : "");
-    const char* unitsTxt = "MMGS";  // canonical mm/grams/seconds (doc_schema §0)
+    // C24: the unit-system cluster mirrors SolidWorks — it shows MMGS / IPS and clicking it
+    // toggles the active document unit system, reformatting every dimension display app-wide.
+    const char* unitsTxt = st.ips() ? "IPS" : "MMGS";
     const char* editTxt  = st.docMirror.hasDoc()
                          ? (isAsm ? "Editing Assembly" : "Editing Part") : "";
     std::string sep = "    |    ";
@@ -90,12 +92,27 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     ImGui::SameLine(ImGui::GetWindowWidth() - total - 16.0f * dpiS);
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1));
+    // --- units token: its own clickable item so it can toggle independently of the provider link.
     ImGui::TextUnformatted(unitsTxt);
+    bool unitsHovered = ImGui::IsItemHovered();
+    if (unitsHovered) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        ImGui::SetTooltip("Document units: %s — click to switch to %s\n"
+                          "(lengths reformat everywhere; angles stay in degrees)",
+                          st.ips() ? "IPS (inch)" : "MMGS (millimeter)",
+                          st.ips() ? "MMGS" : "IPS");
+    }
+    if (ImGui::IsItemClicked()) {
+        st.toggleUnits();
+        saveSettings(st.settings);   // persist the choice immediately (survives restart)
+        st.addLog(std::string("[units] switched to ") + (st.ips() ? "IPS" : "MMGS"));
+    }
     if (editTxt[0]) {
         ImGui::SameLine(0, 0); ImGui::TextUnformatted(sep.c_str());
         ImGui::SameLine(0, 0); ImGui::TextUnformatted(editTxt);
     }
     ImGui::SameLine(0, 0); ImGui::TextUnformatted(sep.c_str());
+    // --- provider/model token: clicking opens Settings (unchanged behavior).
     ImGui::SameLine(0, 0);
     ImGui::TextUnformatted(ptxt.c_str());
     ImGui::PopStyleColor();

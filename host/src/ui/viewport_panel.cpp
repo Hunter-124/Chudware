@@ -1460,12 +1460,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
 
                     // Live readout chip near the cursor while dragging.
                     if (dragging && s_pp.haveReadout) {
-                        char buf[96];
                         // Title-case the param for display (depth -> "Depth").
                         std::string label = s_pp.param.empty() ? std::string("Value") : s_pp.param;
                         if (!label.empty()) label[0] = (char)std::toupper((unsigned char)label[0]);
-                        std::snprintf(buf, sizeof(buf), "%s %.1f mm", label.c_str(), s_pp.newValue);
-                        std::string txt = buf;
+                        // Format the (mm) drag distance in the active document units (mm / inch).
+                        std::string txt = label + " " + ui::pmFormatDim(s_pp.newValue, st.ips());
                         if (s_pp.clamped) txt += "  (min)";
                         ImVec2 ts2 = ImGui::CalcTextSize(txt.c_str());
                         float padX = 8.0f * sc, padY = 4.0f * sc;

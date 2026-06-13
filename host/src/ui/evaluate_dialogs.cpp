@@ -8,8 +8,15 @@
 #include "../core/app_state.h"
 #include "../renderer.h"
 #include "../ui_theme.h"
+#include "property_manager.h"   // pmFormatDim — linear readouts follow the document units
 
 namespace ui {
+
+// Format a linear value (canonical mm) for an evaluate readout in the active document units
+// (mm in MMGS, inch in IPS). Area/volume/mass/inertia stay in their canonical units below — only
+// pure LENGTH measures convert, mirroring SolidWorks (which reformats length, not the derived
+// units, on a units toggle).
+static std::string evalLen(AppState& st, double mm) { return pmFormatDim(mm, st.ips()); }
 
 // Build the refs array for eval_measure from the current selection's resolved selectors.
 static nlohmann::json selectionRefs(AppState& st) {
@@ -153,9 +160,10 @@ void EvaluateDialogs::draw(AppState& st) {
             ImGui::Text("Volume:  %.3f mm3", result_.value("volume_mm3", 0.0));
             ImGui::Text("Mass:    %.3f g", result_.value("mass_g", 0.0));
             if (result_.contains("com") && result_["com"].is_array() && result_["com"].size() == 3)
-                ImGui::Text("COM:     %.3f, %.3f, %.3f mm",
-                            result_["com"][0].get<double>(), result_["com"][1].get<double>(),
-                            result_["com"][2].get<double>());
+                ImGui::Text("COM:     %s, %s, %s",
+                            evalLen(st, result_["com"][0].get<double>()).c_str(),
+                            evalLen(st, result_["com"][1].get<double>()).c_str(),
+                            evalLen(st, result_["com"][2].get<double>()).c_str());
             if (result_.contains("inertia") && result_["inertia"].is_array() &&
                 result_["inertia"].size() == 9) {
                 ImGui::SeparatorText("Inertia tensor (g.mm2)");
@@ -171,18 +179,24 @@ void EvaluateDialogs::draw(AppState& st) {
                 if (result_.contains(k) && result_[k].is_number())
                     ImGui::Text("%s: %.4f %s", k, result_[k].get<double>(), unit);
             };
-            show("distance", "mm"); show("angle", "deg"); show("length", "mm");
-            show("area", "mm2"); show("radius", "mm"); show("volume", "mm3");
+            // Linear measures reformat to the document units (mm / inch); angle stays in degrees,
+            // and area/volume keep their canonical derived units.
+            auto showLen = [&](const char* k) {
+                if (result_.contains(k) && result_[k].is_number())
+                    ImGui::Text("%s: %s", k, evalLen(st, result_[k].get<double>()).c_str());
+            };
+            showLen("distance"); show("angle", "deg"); showLen("length");
+            show("area", "mm2"); showLen("radius"); show("volume", "mm3");
             if (kind == "(none)" || result_.empty())
                 ImGui::TextDisabled("Select 1-2 faces/edges/vertices, then Measure.");
         } else if (openWindow_ == "section") {
             ImGui::Text("Area:     %.3f mm2", result_.value("area_mm2", 0.0));
             if (result_.contains("centroid") && result_["centroid"].is_array() &&
                 result_["centroid"].size() == 3)
-                ImGui::Text("Centroid: %.3f, %.3f, %.3f mm",
-                            result_["centroid"][0].get<double>(),
-                            result_["centroid"][1].get<double>(),
-                            result_["centroid"][2].get<double>());
+                ImGui::Text("Centroid: %s, %s, %s",
+                            evalLen(st, result_["centroid"][0].get<double>()).c_str(),
+                            evalLen(st, result_["centroid"][1].get<double>()).c_str(),
+                            evalLen(st, result_["centroid"][2].get<double>()).c_str());
             ImGui::Text("Ixx: %.3f  Iyy: %.3f  Ixy: %.3f",
                         result_.value("Ixx", 0.0), result_.value("Iyy", 0.0),
                         result_.value("Ixy", 0.0));

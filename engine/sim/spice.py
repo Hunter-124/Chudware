@@ -382,8 +382,43 @@ def _parse_element(tokens: list[str]) -> dict | None:
         return _dev(kind_letter, name, nodes, None, None,
                     {"gain": gain, "ctrl": ctrl})
 
+    if kind_letter == "K":
+        # Kname  Lx  Ly  k     (mutual-inductance coupling between two inductors)
+        if len(tokens) < 4:
+            return None
+        l1, l2 = tokens[1], tokens[2]
+        k = _safe_val(tokens[3])
+        # K has no nodes; carry the two inductor names + k in params (value = k for convenience).
+        return _dev("K", name, [], k, None, {"inductors": [l1, l2], "k": k})
+
+    if kind_letter == "B":
+        # Bname  n+ n-  V=<expr> | I=<expr>   (behavioral / arbitrary source)
+        if len(tokens) < 4:
+            return None
+        nodes = [_gnd(tokens[1]), _gnd(tokens[2])]
+        btype, expr = _parse_behavioral_rhs(tokens[3:])
+        if expr is None:
+            return None
+        return _dev("B", name, nodes, None, None, {"btype": btype, "expr": expr})
+
     # Unknown element letter → silently skip
     return None
+
+
+def _parse_behavioral_rhs(rest: list[str]) -> tuple[str, str | None]:
+    """Parse the ``V=<expr>`` / ``I=<expr>`` tail of a B-source card.
+
+    The expression may contain spaces (e.g. ``V = 2 * V(in)``), so the whole tail is re-joined and the
+    leading ``V=`` / ``I=`` stripped. Returns ``(btype, expr_or_None)`` where ``btype`` is ``"V"`` or
+    ``"I"``. Anything else (no V=/I=) yields ``(_, None)`` so the caller skips the card.
+    """
+    tail = " ".join(rest).strip()
+    m = re.match(r"^\s*([VvIi])\s*=\s*(.+)$", tail, re.DOTALL)
+    if not m:
+        return "V", None
+    btype = m.group(1).upper()
+    expr = m.group(2).strip()
+    return btype, (expr or None)
 
 
 def _dev(kind: str, name: str, nodes: list[str],
@@ -627,6 +662,17 @@ def write_spice(circuit: dict, study: dict | None = None) -> str:
             gain = params.get("gain", 1.0)
             ctrl = params.get("ctrl", "")
             lines.append(f"{name} {nodes} {ctrl} {_fmt_value(gain)}")
+
+        elif kind == "K":
+            inds = params.get("inductors", [])
+            k = value if value is not None else params.get("k", 1.0)
+            if len(inds) >= 2:
+                lines.append(f"{name} {inds[0]} {inds[1]} {_fmt_value(k)}")
+
+        elif kind == "B":
+            btype = str(params.get("btype", "V")).upper()
+            expr = params.get("expr", "")
+            lines.append(f"{name} {nodes} {btype}={expr}")
 
         else:
             # OPAMP or anything else — emit a comment

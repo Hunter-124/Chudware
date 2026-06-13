@@ -225,6 +225,12 @@ class _Sim:
             d.gmin = self.gmin
             self.devices.append(d)
 
+        # Resolve inter-device references (e.g. K mutual-inductance couplings bind to their two
+        # inductor instances). Done once after all devices exist; raises DeviceError on a bad ref.
+        by_name = {d.name: d for d in self.devices}
+        for d in self.devices:
+            d.link(by_name)
+
         # A template MnaSystem to pin branch-row allocation (so indices are stable).
         self.node_count = idx
 

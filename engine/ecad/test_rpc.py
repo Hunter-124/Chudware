@@ -450,20 +450,82 @@ def test_ecad_design_rpc() -> None:
     print("  test_ecad_design_rpc PASS")
 
 
+def test_ecad_dfm_rpc() -> None:
+    """ecad_dfm RPC must return violations + summary for a pcb doc; wrong kind raises cleanly."""
+    from engine.ecad.rpc import METHODS
+    from engine.ecad.ops import OpError
+
+    new_fn = METHODS["ecad_new"]
+    apply_fn = METHODS["ecad_apply_ops"]
+    dfm_fn = METHODS["ecad_dfm"]
+
+    # --- wrong kind: schematic -> structured error ---
+    r_sch = _call(new_fn, {"kind": "sch", "name": "DfmSch"})
+    try:
+        _call(dfm_fn, {"doc_id": r_sch["doc_id"]})
+        assert False, "ecad_dfm on a schematic should raise OpError"
+    except OpError as e:
+        assert e.code == "invalid_op", f"expected invalid_op, got {e.code}"
+    print("  ecad_dfm rejects schematic with invalid_op")
+
+    # --- fresh empty board -> violations list present, possibly empty ---
+    r_pcb = _call(new_fn, {"kind": "pcb", "name": "DfmBoard"})
+    doc_id = r_pcb["doc_id"]
+    result = _call(dfm_fn, {"doc_id": doc_id})
+    assert "violations" in result, f"ecad_dfm: missing 'violations': {result}"
+    assert "summary" in result, f"ecad_dfm: missing 'summary': {result}"
+    assert isinstance(result["violations"], list)
+    summary = result["summary"]
+    assert "errors" in summary and "warnings" in summary and "by_rule" in summary
+    print(f"  ecad_dfm (empty board): errors={summary['errors']} "
+          f"warnings={summary['warnings']} rules={[g['rule'] for g in summary['by_rule']]}")
+
+    # --- board with two co-located footprints -> courtyard_overlap must fire ---
+    from engine.ecad.library.starter import FOOTPRINTS
+    import copy as _copy
+    fp_def = FOOTPRINTS.get("Resistor_SMD:R_0603")
+    if fp_def is not None:
+        fp1 = _copy.deepcopy(fp_def)
+        fp2 = _copy.deepcopy(fp_def)
+        _call(apply_fn, {
+            "doc_id": doc_id,
+            "base_revision": r_pcb["revision"],
+            "ops": [
+                {"op": "pcb_add_footprint", "fpid": "Resistor_SMD:R_0603",
+                 "ref": "R1", "value": "10k", "pos": [10.0, 10.0],
+                 "side": "top", "pads": fp1.get("pads", []), "def": fp1},
+                {"op": "pcb_add_footprint", "fpid": "Resistor_SMD:R_0603",
+                 "ref": "R2", "value": "10k", "pos": [10.0, 10.0],
+                 "side": "top", "pads": fp2.get("pads", []), "def": fp2},
+            ],
+        })
+        result2 = _call(dfm_fn, {"doc_id": doc_id})
+        assert "violations" in result2
+        rules = {v.get("rule") for v in result2["violations"]}
+        print(f"  ecad_dfm (co-located fps): violations={len(result2['violations'])} "
+              f"rules={sorted(rules)}")
+        assert "courtyard_overlap" in rules, \
+            f"courtyard_overlap expected with co-located footprints, got rules={sorted(rules)}"
+        print("  ecad_dfm returns courtyard_overlap violation")
+
+    print("  test_ecad_dfm_rpc PASS")
+
+
 def test_worker_registry_regression() -> None:
     """Importing engine.worker must succeed and both doc_* and ecad_* must be present."""
     import importlib
-    # Fresh import (may already be cached — that's fine)
+    # Fresh import (may already be cached -- that's fine)
     import engine.worker as w
 
     assert "doc_new" in w._METHODS, "doc_new missing from worker registry"
     ecad_methods = [m for m in w._METHODS if m.startswith("ecad_")]
     assert len(ecad_methods) > 0, "no ecad_* methods registered in worker"
 
-    # Check a sample of the expected ecad methods
+    # Check a sample of the expected ecad methods (including new Wave-L method).
     for expected in ("ecad_new", "ecad_apply_ops", "ecad_tree", "ecad_undo",
                      "ecad_redo", "ecad_export", "ecad_to_3d", "ecad_describe",
-                     "ecad_autoroute", "ecad_fill_zones", "ecad_design"):
+                     "ecad_autoroute", "ecad_fill_zones", "ecad_design",
+                     "ecad_dfm"):
         assert expected in w._METHODS, f"{expected} not in worker registry"
 
     # All ecad methods must also be in STRUCTURED_ERROR_METHODS
@@ -490,6 +552,7 @@ def main() -> None:
         test_autoroute_wrong_kind,
         test_ecad_open_kicad_sch,
         test_ecad_design_rpc,
+        test_ecad_dfm_rpc,
         test_worker_registry_regression,
     ]
     failed = []

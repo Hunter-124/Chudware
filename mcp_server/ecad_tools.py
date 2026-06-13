@@ -885,6 +885,76 @@ def register_ecad_tools(mcp) -> None:
             ),
         })
 
+    # ---------------------------------------------------------------- DFM
+
+    @mcp.tool()
+    def ecad_run_dfm(doc_id: str = "") -> str:
+        """Run the Design-For-Manufacturing (DFM) check suite on the active board and return a
+        readable summary grouped by rule (counts + worst offenders) with a severity split.
+
+        DFM is advisory: violations are warnings or (for courtyard_overlap) errors but never block
+        editing. Rules checked: silk_over_pad, silk_min_width, silk_min_text, mask_sliver,
+        acid_trap, courtyard_overlap, annular_min (DFM grade), drill_min (DFM grade).
+
+        The reading tells you which rule to fix first: courtyard_overlap (component collision) is
+        always fix-first, followed by drill_min errors, then warnings.
+        """
+        try:
+            session = _get_pcb(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="DFM needs an open board.",
+                        next_actions=["ecad_new_pcb('myboard')"])
+        doc = session.doc
+        try:
+            from engine.ecad import dfm as dfm_mod  # lazy import
+            violations = dfm_mod.run_dfm(doc)
+        except Exception as e:  # noqa: BLE001
+            return _err(f"DFM engine error: {e}", hint="Inspect with ecad_status().")
+        summary = _erc_summary(violations)
+        lines = _erc_lines(violations)
+
+        # group by rule: count + worst message
+        worst_errors = [v for v in violations if v.get("severity") == "error"][:3]
+        worst_lines = lines[:5]
+
+        # Build a priority-ordered fix list.
+        fix_order: list[str] = []
+        # courtyard_overlap first (components collide -> assembly fails)
+        cy_group = next((g for g in summary["groups"] if g["rule"] == "courtyard_overlap"), None)
+        if cy_group:
+            items = cy_group.get("items", [])[:2]
+            fix_order.append(
+                f"fix courtyard_overlap first -- components collide "
+                f"({cy_group['count']}x, items: {', '.join(map(str, items))})")
+        for g in summary["groups"]:
+            if g["rule"] == "courtyard_overlap":
+                continue
+            if g["severity"] == "error":
+                fix_order.append(
+                    f"fix {g['rule']} ({g['count']}x): "
+                    f"{g['messages'][0] if g['messages'] else ''}")
+        for g in summary["groups"]:
+            if g["severity"] != "error":
+                fix_order.append(
+                    f"review {g['rule']} ({g['count']} warning(s))")
+
+        verdict = (f"{summary['errors']} DFM error(s), {summary['warnings']} warning(s)."
+                   + (" worst: " + " | ".join(worst_lines) if worst_lines else " Clean."))
+        return _dumps({
+            "ok": True, "doc_id": session.doc_id, "revision": session.revision,
+            "errors": summary["errors"], "warning_count": summary["warnings"],
+            "verdict": verdict,
+            "violations": lines, "by_rule": summary["groups"],
+            "fix_priority": fix_order,
+            "warnings": worst_lines[:3],
+            "reading": verdict,
+            "hint": verdict + (" " + fix_order[0] if fix_order else ""),
+            "next_actions": (
+                fix_order[:2] if fix_order else
+                ["ecad_export('gerber')  # DFM clean -- proceed to fab"]
+            ),
+        })
+
     # ---------------------------------------------------------------- sync sch -> pcb
 
     @mcp.tool()
@@ -950,14 +1020,25 @@ def register_ecad_tools(mcp) -> None:
     # ---------------------------------------------------------------- autoroute
 
     @mcp.tool()
-    def ecad_autoroute(pitch: float = 0.0, doc_id: str = "") -> str:
+    def ecad_autoroute(pitch: float = 0.0, diff_pairs: Optional[list] = None,
+                       ripup_passes: int = 2, doc_id: str = "") -> str:
         """Auto-route the active board's ratsnest with a basic 2-layer grid (Lee/A*) router.
 
         Connects the unrouted airwires with orthogonal tracks + through-vias, respecting clearance.
-        Honest about its limits: it is single-pass (no rip-up/reroute), so dense boards leave some
-        nets failed — those are reported by name and need manual routing or more space. ``pitch``
-        (mm) overrides the grid resolution (default 0.25); finer threads tighter gaps but is slower.
-        Run ecad_update_from_sch first so there is a ratsnest to route.
+        Honest about limits: failed nets are reported by name and need manual routing or more space.
+
+        ``pitch`` (mm) overrides the grid resolution (default 0.25); finer threads tighter gaps
+        but is slower. Run ecad_update_from_sch first so there is a ratsnest to route.
+
+        ``diff_pairs`` controls differential-pair routing:
+          - omit (default): auto-detect pairs by *_P/*_N, *+/*- naming
+          - [['CLK_P','CLK_N'], ...]: route specific named pairs coupled
+          - 'auto': same as omitting (explicit auto-detect)
+
+        ``ripup_passes`` (default 2): how many rip-up-and-reroute sweeps to attempt after the
+        greedy pass; 0 for the original single-pass behaviour.
+
+        Returns per-pair skew/coupling stats in ``diff_pair_stats`` when pairs are routed.
         """
         try:
             session = _get_pcb(doc_id or None)
@@ -965,7 +1046,14 @@ def register_ecad_tools(mcp) -> None:
             return _err(e.message, hint="Routing needs an open board.",
                         next_actions=["ecad_new_pcb('myboard')"])
         from engine.ecad import rpc as ecad_rpc
-        opts = {"pitch": float(pitch)} if pitch and pitch > 0 else {}
+        opts: dict = {}
+        if pitch and pitch > 0:
+            opts["pitch"] = float(pitch)
+        opts["ripup_passes"] = max(0, int(ripup_passes))
+        # diff_pairs: None/'auto' -> let the router auto-detect; a list -> pass through
+        if diff_pairs is not None and diff_pairs != "auto":
+            opts["diff_pairs"] = [[str(p), str(n)] for p, n in (
+                (entry[0], entry[1]) for entry in diff_pairs if len(entry) >= 2)]
         try:
             resp = ecad_rpc._ecad_autoroute(
                 {"doc_id": session.doc_id, "opts": opts}, lambda _d: None)
@@ -978,9 +1066,32 @@ def register_ecad_tools(mcp) -> None:
         before = report.get("airwires_before", 0)
         after = report.get("airwires_after", 0)
         warnings = list(resp.get("warnings", []))
+        ripup_iters = report.get("ripup_iterations", 0)
+        dp_stats = report.get("diff_pairs", [])
+
+        # Build a human-readable summary of diff-pair results.
+        dp_reading_lines: list[str] = []
+        for dp in dp_stats:
+            # The autoroute engine uses 'nets' list and 'routed' bool.
+            nets = dp.get("nets", [])
+            net_p = nets[0] if len(nets) > 0 else dp.get("net_p", "?")
+            net_n = nets[1] if len(nets) > 1 else dp.get("net_n", "?")
+            skew = dp.get("skew_mm")
+            coupled_pct = dp.get("coupled_pct")
+            dp_routed = dp.get("routed", dp.get("status") == "ok")
+            status_str = "ok" if dp_routed else "failed"
+            line = f"Pair {net_p}/{net_n}: status={status_str}"
+            if skew is not None:
+                line += f", skew={skew:.3f}mm"
+            if coupled_pct is not None:
+                line += f", coupled={coupled_pct:.0f}%"
+            dp_reading_lines.append(line)
+
         head = (f"routed {len(routed)} net(s), {len(failed)} failed; ratsnest "
                 f"{before} -> {after} airwire(s); {report.get('vias', 0)} via(s), "
-                f"{report.get('length_mm', 0.0)} mm of track.")
+                f"{report.get('length_mm', 0.0)} mm of track"
+                + (f"; rip-up rescued {ripup_iters} attempt(s)" if ripup_iters else "")
+                + (f"; {len(dp_stats)} diff pair(s)" if dp_stats else "") + ".")
         next_actions: list[str] = []
         if failed:
             next_actions.append(
@@ -989,6 +1100,10 @@ def register_ecad_tools(mcp) -> None:
             next_actions.append("ecad_autoroute(pitch=0.15)  # retry with a finer grid")
         else:
             next_actions.append("ecad_fill_zones()  # pour copper, then ecad_run_drc()")
+        if dp_stats and any(not dp.get("routed", True) for dp in dp_stats):
+            next_actions.append(
+                "Check diff-pair results: skew > 0.2mm or coupled_pct < 80 means "
+                "the pair needs manual tuning or more board space.")
         return _dumps({
             "ok": True, "doc_id": session.doc_id, "revision": resp.get("revision"),
             "routed_nets": routed, "failed_nets": failed,
@@ -996,9 +1111,13 @@ def register_ecad_tools(mcp) -> None:
             "ratsnest_remaining": after,
             "vias": report.get("vias", 0), "length_mm": report.get("length_mm", 0.0),
             "grid": report.get("grid", {}),
+            "ripup_iterations": ripup_iters,
+            "diff_pair_stats": dp_stats,
+            "diff_pair_reading": "; ".join(dp_reading_lines) if dp_reading_lines else None,
             "warnings": warnings,
             "hint": head + (" All nets routed." if not failed else
-                            f" {len(failed)} net(s) failed — manual routing or more space needed."),
+                            f" {len(failed)} net(s) failed — manual routing or more space needed.")
+                  + (" " + "; ".join(dp_reading_lines) if dp_reading_lines else ""),
             "next_actions": next_actions,
         })
 
@@ -1530,6 +1649,163 @@ def register_ecad_tools(mcp) -> None:
                 if worst else
                 ["ecad_export('gerber')  # SI check passed"]
             ),
+        })
+
+    # ---------------------------------------------------------------- differential impedance
+
+    @mcp.tool()
+    def ecad_check_diff_impedance(net_p: str, net_n: str, target: float = 100.0,
+                                  doc_id: str = "") -> str:
+        """Compute the differential impedance (Z_diff) of an edge-coupled differential pair on the
+        active board and compare it to a target (default 100 ohm, the common PCIe/USB3 spec).
+
+        ``net_p`` / ``net_n`` are the positive and negative net names of the pair (e.g. 'CLK_P',
+        'CLK_N' or 'USB3_TX+', 'USB3_TX-'). Both must have routed tracks on the board.
+
+        Uses the IPC-2141A edge-coupled coupling formula:
+          Z_diff = 2 * Z0_se * (1 - 0.48*exp(-0.96*s/h))   [microstrip]
+          Z_diff = 2 * Z0_se * (1 - 0.347*exp(-2.9*s/h))   [stripline]
+        where ``s`` is the intra-pair edge gap (inferred from the tracks' centre-to-centre distance
+        minus both widths) and ``h`` is the dielectric height from the stackup.
+
+        Returns a plain-English reading like:
+          "Pair CLK_P/CLK_N: Z_diff=98.2 ohm (target 100, -1.8%) -- within 10% tolerance;
+           Z0_se=52.1 ohm, gap=0.20mm, delay=6.7 ps/mm, length=23.4mm, one-way delay=157ps"
+        plus next_actions to widen/narrow/gap the traces.
+        """
+        try:
+            session = _get_pcb(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="Differential impedance needs a board with routed tracks.",
+                        next_actions=["ecad_new_pcb('myboard')", "ecad_autoroute()"])
+        doc = session.doc
+        tracks = doc.get("tracks", [])
+        if not tracks:
+            return _err("no routed tracks on this board",
+                        hint="Route the board first (ecad_autoroute).",
+                        next_actions=["ecad_autoroute()"])
+
+        try:
+            from engine.ecad.impedance import (  # lazy import
+                track_impedance, _stackup_geometry, _track_length_mm, diff_pair_z0,
+            )
+        except ImportError as e:  # noqa: BLE001
+            return _err(f"impedance engine unavailable ({e})",
+                        hint="engine.ecad.impedance could not be imported.",
+                        next_actions=["ecad_run_drc()"])
+
+        # Locate routed tracks for each net.
+        def _first_track(net: str) -> dict | None:
+            return next((t for t in tracks if t.get("net") == net), None)
+
+        tr_p = _first_track(net_p)
+        tr_n = _first_track(net_n)
+        routed_nets = sorted({t.get("net", "") for t in tracks if t.get("net")})
+
+        if tr_p is None or tr_n is None:
+            missing = ([net_p] if tr_p is None else []) + ([net_n] if tr_n is None else [])
+            return _err(
+                f"nets {', '.join(missing)} are not routed on this board",
+                hint=f"Routed nets: {', '.join(routed_nets[:10])}. "
+                     "Run ecad_autoroute with diff_pairs=[['{net_p}','{net_n}']] first.",
+                next_actions=[f"ecad_autoroute(diff_pairs=[['{net_p}','{net_n}']])"],
+                routed_nets=routed_nets)
+
+        # Use the positive net's first track for geometry (width, layer).
+        width_p = float(tr_p.get("width", 0.25))
+        width_n = float(tr_n.get("width", width_p))
+        layer = tr_p.get("layer", "F.Cu")
+
+        # Infer intra-pair gap: centre-to-centre of the two tracks minus half-widths of each.
+        # If tracks are on the same horizontal or vertical run we estimate from the two p1s.
+        import math as _math
+        p1_p = tr_p.get("p1", [0.0, 0.0])
+        p1_n = tr_n.get("p1", [0.0, 0.0])
+        centre_dist = _math.hypot(float(p1_p[0]) - float(p1_n[0]),
+                                  float(p1_p[1]) - float(p1_n[1]))
+        # Clamp gap to something physical (0.05mm minimum; fall back to DEFAULT_DIFF_GAP=0.2)
+        gap = max(centre_dist - width_p / 2.0 - width_n / 2.0, 0.05)
+        if centre_dist < 0.01:
+            gap = 0.2  # overlapping start points -- use default gap
+
+        geo = _stackup_geometry(doc, layer)
+        h, t_cu, er = geo["h"], geo["t"], geo["er"]
+        kind = geo["kind"]  # 'microstrip' or 'stripline'
+
+        try:
+            dz = diff_pair_z0(w=width_p, s=gap, h=h, t=t_cu, er=er, kind=kind)
+        except Exception as e:  # noqa: BLE001
+            return _err(f"diff_pair_z0 failed: {e}",
+                        hint="Check that width/gap/h are positive and er >= 1.",
+                        next_actions=["ecad_status()"])
+
+        z_diff = dz["z0_diff"]
+        z0_se = dz["z0_se"]
+        z0_odd = dz["z0_odd"]
+        delay_ps_per_mm = dz["delay_ps_per_mm"]
+        model = dz["model"]
+
+        length_p = _track_length_mm(doc, net_p, layer)
+        length_n = _track_length_mm(doc, net_n, layer)
+        length_mm = (length_p + length_n) / 2.0  # average pair length
+        skew_mm = abs(length_p - length_n)
+        delay_ps = delay_ps_per_mm * length_mm
+
+        tol_pct = 10.0
+        pct = 100.0 * (z_diff - target) / target if target else 0.0
+        within = abs(pct) <= tol_pct
+
+        status = "within tolerance" if within else "OUT OF TOLERANCE"
+        reading = (f"Pair {net_p}/{net_n}: Z_diff={z_diff:.1f} ohm "
+                   f"(target {target:.0f}, {pct:+.1f}%) -- {status}; "
+                   f"Z0_se={z0_se:.1f} ohm, Z0_odd={z0_odd:.1f} ohm, "
+                   f"gap={gap:.3f}mm, delay={delay_ps_per_mm:.2f}ps/mm, "
+                   f"length={length_mm:.2f}mm (skew={skew_mm:.3f}mm), "
+                   f"one-way delay={delay_ps:.1f}ps [{kind}, w={width_p:.3f}mm, h={h:.3f}mm, "
+                   f"er={er:.2f}] model={model}")
+
+        # Guidance: Z_diff too high -> widen traces or reduce gap; too low -> narrow / widen gap.
+        if not within:
+            if pct > 0:  # Z_diff above target
+                adj = ("Widen traces (increase width) or reduce intra-pair gap to lower Z_diff. "
+                       "Current gap={:.3f}mm; try gap={:.3f}mm.".format(gap, gap * 0.8))
+            else:  # Z_diff below target
+                adj = ("Narrow traces or increase intra-pair gap to raise Z_diff. "
+                       "Current gap={:.3f}mm; try gap={:.3f}mm.".format(gap, gap * 1.2))
+        else:
+            adj = ("Differential impedance is within the standard +/-10% tolerance. "
+                   f"Skew={skew_mm:.3f}mm" +
+                   (" -- consider length matching if skew > 0.2mm." if skew_mm > 0.2 else "."))
+
+        next_actions: list[str] = [adj]
+        if skew_mm > 0.2:
+            next_actions.append(
+                f"Length skew {skew_mm:.3f}mm exceeds 0.2mm: re-route with "
+                f"ecad_autoroute(diff_pairs=[['{net_p}','{net_n}']]) for automatic "
+                "length-matching meanders.")
+        if within:
+            next_actions.append("ecad_export('gerber')  # SI check passed -- proceed to fab")
+
+        return _dumps({
+            "ok": True, "doc_id": session.doc_id,
+            "net_p": net_p, "net_n": net_n,
+            "z_diff": round(z_diff, 2), "z0_se": round(z0_se, 2), "z0_odd": round(z0_odd, 2),
+            "target": target, "pct_error": round(pct, 2), "within_tolerance": within,
+            "gap_mm": round(gap, 4), "width_mm": round(width_p, 4),
+            "h": round(h, 4), "er": round(er, 2), "t": round(t_cu, 4),
+            "kind": kind, "model": model,
+            "length_mm": round(length_mm, 3),
+            "length_p_mm": round(length_p, 3), "length_n_mm": round(length_n, 3),
+            "skew_mm": round(skew_mm, 4),
+            "delay_ps_per_mm": round(delay_ps_per_mm, 3),
+            "delay_ps": round(delay_ps, 2),
+            "eeff": round(dz["eeff"], 4),
+            "warnings": ([] if within else
+                         [f"Z_diff {pct:+.1f}% from target -- pair needs retuning"])
+                      + ([f"skew {skew_mm:.3f}mm > 0.2mm"] if skew_mm > 0.2 else []),
+            "reading": reading,
+            "hint": reading + " " + adj,
+            "next_actions": next_actions,
         })
 
     # ---------------------------------------------------------------- .tf transfer function

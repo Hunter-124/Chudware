@@ -70,6 +70,8 @@ def test_register() -> dict:
         "ecad_sweep", "ecad_design",
         # new tools
         "ecad_check_impedance", "ecad_tf", "ecad_make_board",
+        # Wave-L new tools
+        "ecad_run_dfm", "ecad_check_diff_impedance",
     }
     missing = expected - set(mcp.tools)
     assert not missing, f"tools not registered: {missing}"
@@ -642,6 +644,189 @@ def test_make_board(tools: dict) -> None:
     print("  [make_board] PASS")
 
 
+# --------------------------------------------------------------------------- Wave-L new tests
+
+
+def test_run_dfm_clean(tools: dict) -> None:
+    """ecad_run_dfm on a fresh board (no DFM issues) must return a verdict with 0 errors."""
+    _call(tools, "ecad_new_pcb", name="dfm_clean")
+    r = _call(tools, "ecad_run_dfm")
+    _assert_context(r, "ecad_run_dfm")
+    assert r["ok"], f"ecad_run_dfm failed: {r.get('error')}"
+    assert "errors" in r and "warning_count" in r
+    assert "verdict" in r and "error(s)" in r["verdict"]
+    assert "reading" in r
+    print(f"  ecad_run_dfm (clean board): verdict={r['verdict']!r}")
+    print("  [run_dfm_clean] PASS")
+
+
+def test_run_dfm_seeded(tools: dict) -> None:
+    """ecad_run_dfm on a board with a seeded DFM violation must report it with a reading."""
+    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_tools import _ECAD
+
+    _call(tools, "ecad_new_pcb", name="dfm_seeded")
+    pcb = ecad_session.get_session(_ECAD["current_pcb"])
+
+    # Seed a courtyard_overlap: add two footprints at the same position (courtyards collide).
+    from engine.ecad.library.starter import FOOTPRINTS
+    import copy as _copy
+    fp_def = FOOTPRINTS.get("Resistor_SMD:R_0603")
+    if fp_def is None:
+        print("  [run_dfm_seeded] SKIP (R_0603 not in starter library)")
+        return
+
+    # Two footprints co-located -> their courtyards overlap -> courtyard_overlap error.
+    fp1 = _copy.deepcopy(fp_def)
+    fp2 = _copy.deepcopy(fp_def)
+    ecad_session.apply_ops(pcb, pcb.revision, [
+        {"op": "pcb_add_footprint", "fpid": "Resistor_SMD:R_0603",
+         "ref": "R1", "value": "10k", "pos": [10.0, 10.0],
+         "side": "top", "pads": fp1.get("pads", []), "def": fp1},
+        {"op": "pcb_add_footprint", "fpid": "Resistor_SMD:R_0603",
+         "ref": "R2", "value": "10k", "pos": [10.0, 10.0],  # same position -> overlap
+         "side": "top", "pads": fp2.get("pads", []), "def": fp2},
+    ])
+
+    r = _call(tools, "ecad_run_dfm")
+    _assert_context(r, "ecad_run_dfm")
+    assert r["ok"], f"ecad_run_dfm tool call failed: {r.get('error')}"
+    assert "reading" in r
+    # courtyard_overlap should fire because two components are at the same location.
+    rules_hit = {g["rule"] for g in r.get("by_rule", [])}
+    print(f"  ecad_run_dfm (seeded): errors={r['errors']} warning_count={r.get('warning_count')} "
+          f"rules={sorted(rules_hit)}")
+    print(f"  reading: {r['reading']!r}")
+    # We should see violations of some kind (at minimum the courtyard check).
+    assert r["errors"] + r.get("warning_count", 0) > 0, \
+        "seeded board with co-located footprints must have DFM violations"
+    assert "courtyard_overlap" in rules_hit, (
+        f"courtyard_overlap expected but got rules: {sorted(rules_hit)}")
+    # next_actions must mention fixing courtyard_overlap first.
+    na_joined = " ".join(r["next_actions"]).lower()
+    assert "courtyard" in na_joined or "fix" in na_joined, \
+        f"next_actions should guide courtyard fix: {r['next_actions']}"
+    print("  [run_dfm_seeded] PASS")
+
+
+def test_autoroute_with_diff_pairs(tools: dict) -> None:
+    """ecad_autoroute with diff_pairs=[['CLK_P','CLK_N']] must attempt coupled routing and
+    return diff_pair_stats in the payload."""
+    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_tools import _ECAD
+
+    _build_footprinted_divider(tools)  # sets up a schematic with footprints
+    _call(tools, "ecad_new_pcb", name="dp_board")
+    pcb = ecad_session.get_session(_ECAD["current_pcb"])
+    ecad_session.apply_ops(pcb, pcb.revision, [{"op": "pcb_set_outline", "shapes": [
+        {"type": "line", "p1": [0, 0],   "p2": [80, 0]},
+        {"type": "line", "p1": [80, 0],  "p2": [80, 40]},
+        {"type": "line", "p1": [80, 40], "p2": [0, 40]},
+        {"type": "line", "p1": [0, 40],  "p2": [0, 0]},
+    ], "closed": True}])
+    _call(tools, "ecad_update_from_sch")
+
+    # Add a second pair of pads for CLK_P/CLK_N nets by placing extra footprints directly.
+    from engine.ecad.library.starter import FOOTPRINTS
+    import copy as _copy
+    fp_def = FOOTPRINTS.get("Resistor_SMD:R_0603")
+    if fp_def is None:
+        print("  [autoroute_with_diff_pairs] SKIP (R_0603 not in starter library)")
+        return
+
+    # Add CLK_P and CLK_N nets via footprints so the autorouter has real pairs to attempt.
+    # Register the nets in the board doc first (so pcb_add_footprint + ratsnest work).
+    fp_p = _copy.deepcopy(fp_def)
+    fp_n = _copy.deepcopy(fp_def)
+    for pad in fp_p.get("pads", []):
+        pad["net"] = "CLK_P"
+    for pad in fp_n.get("pads", []):
+        pad["net"] = "CLK_N"
+    # Pre-register nets so pcb_add_footprint's pads are valid.
+    pcb.doc.setdefault("nets", [])
+    pcb.doc["nets"].append({"name": "CLK_P", "class": "default"})
+    pcb.doc["nets"].append({"name": "CLK_N", "class": "default"})
+    ecad_session.apply_ops(pcb, pcb.revision, [
+        {"op": "pcb_add_footprint", "fpid": "Resistor_SMD:R_0603",
+         "ref": "U1", "value": "CLK_P", "pos": [10.0, 20.0],
+         "side": "top", "pads": fp_p.get("pads", []), "def": fp_p},
+        {"op": "pcb_add_footprint", "fpid": "Resistor_SMD:R_0603",
+         "ref": "U2", "value": "CLK_N", "pos": [70.0, 20.0],
+         "side": "top", "pads": fp_n.get("pads", []), "def": fp_n},
+    ])
+
+    ar = _call(tools, "ecad_autoroute",
+               diff_pairs=[["CLK_P", "CLK_N"]], ripup_passes=2)
+    _assert_context(ar, "ecad_autoroute")
+    assert ar["ok"], f"ecad_autoroute failed: {ar.get('error')}"
+    # diff_pair_stats key must be present (may be empty if nets had no airwire).
+    assert "diff_pair_stats" in ar, "ecad_autoroute must return diff_pair_stats"
+    assert isinstance(ar["diff_pair_stats"], list)
+    assert "ripup_iterations" in ar
+    print(f"  ecad_autoroute(diff_pairs): "
+          f"routed={ar['routed_nets']} failed={ar['failed_nets']} "
+          f"diff_pair_stats={ar['diff_pair_stats']} "
+          f"ripup_iterations={ar['ripup_iterations']}")
+    if ar["diff_pair_stats"]:
+        dp = ar["diff_pair_stats"][0]
+        # Each pair stat must have routed bool and either 'nets' or 'net_p'/'net_n'.
+        assert "routed" in dp or "status" in dp, f"pair stat missing routed/status: {dp}"
+        assert "nets" in dp or "net_p" in dp, f"pair stat missing nets/net_p: {dp}"
+        print(f"  diff pair result: {dp}")
+    print(f"  diff_pair_reading: {ar.get('diff_pair_reading')!r}")
+    print("  [autoroute_with_diff_pairs] PASS")
+
+
+def test_check_diff_impedance(tools: dict) -> None:
+    """ecad_check_diff_impedance on a board with routed CLK_P/CLK_N tracks must return Z_diff."""
+    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_tools import _ECAD
+
+    # Start with a clean board.
+    _call(tools, "ecad_new_pcb", name="diff_z_board")
+    pcb = ecad_session.get_session(_ECAD["current_pcb"])
+
+    # Register CLK_P / CLK_N nets directly in the board doc, then inject tracks.
+    # (pcb_add_track calls _require_net; we add the nets to the board doc first.)
+    pcb.doc.setdefault("nets", [])
+    pcb.doc["nets"].append({"name": "CLK_P", "class": "default"})
+    pcb.doc["nets"].append({"name": "CLK_N", "class": "default"})
+
+    # Add two parallel tracks representing the diff pair via ops.
+    ecad_session.apply_ops(pcb, pcb.revision, [
+        {"op": "pcb_add_track",
+         "net": "CLK_P", "layer": "F.Cu", "width": 0.2,
+         "p1": [5.0, 20.0], "p2": [75.0, 20.0], "kind": "segment"},
+        {"op": "pcb_add_track",
+         "net": "CLK_N", "layer": "F.Cu", "width": 0.2,
+         "p1": [5.0, 20.4], "p2": [75.0, 20.4], "kind": "segment"},
+    ])
+
+    # Guard: missing net must fail gracefully.
+    r_bad = _call(tools, "ecad_check_diff_impedance",
+                  net_p="NOPE_P", net_n="NOPE_N", target=100.0)
+    assert not r_bad["ok"], "missing nets should fail cleanly"
+    assert r_bad["next_actions"], "failure must teach"
+    print(f"  check_diff_impedance (missing nets): hint={r_bad['hint'][:80]!r}")
+
+    # Real check on the injected tracks.
+    r = _call(tools, "ecad_check_diff_impedance",
+              net_p="CLK_P", net_n="CLK_N", target=100.0)
+    _assert_context(r, "ecad_check_diff_impedance")
+    assert r["ok"], f"ecad_check_diff_impedance failed: {r.get('error')}"
+    assert "z_diff" in r and r["z_diff"] > 0, f"Z_diff should be positive, got {r.get('z_diff')}"
+    assert "reading" in r and "Pair" in r["reading"]
+    assert "skew_mm" in r
+    # Z_diff for 0.2mm wide traces separated by ~0.2mm gap on default FR-4 should be reasonable.
+    assert 20.0 < r["z_diff"] < 300.0, \
+        f"Z_diff={r['z_diff']} out of expected range (20-300 ohm)"
+    assert "pct_error" in r
+    print(f"  check_diff_impedance(CLK_P/CLK_N): reading={r['reading']!r}")
+    print(f"    z_diff={r['z_diff']} z0_se={r['z0_se']} gap_mm={r['gap_mm']} "
+          f"skew_mm={r['skew_mm']} within={r['within_tolerance']}")
+    print("  [check_diff_impedance] PASS")
+
+
 # --------------------------------------------------------------------------- runner
 
 
@@ -671,6 +856,11 @@ def main() -> None:
     test_check_impedance_no_tracks(tools)
     test_check_impedance_routed(tools)
     test_make_board(tools)
+    # Wave-L new tests
+    test_run_dfm_clean(tools)
+    test_run_dfm_seeded(tools)
+    test_autoroute_with_diff_pairs(tools)
+    test_check_diff_impedance(tools)
     print("\nALL ECAD TOOL TESTS PASSED")
 
 

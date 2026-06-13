@@ -562,6 +562,60 @@ def _ecad_update_from_sch(params: dict, _emit: EmitFn) -> dict:
 #   -> ops-response (for the board) + report (routed/failed nets, length, ratsnest before/after)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# ecad_dfm  {doc_id} -> {violations, summary}
+# ---------------------------------------------------------------------------
+
+def _ecad_dfm(params: dict, _emit: EmitFn) -> dict:
+    """Run the DFM rule catalogue on the board doc and return violations + a grouped summary.
+
+    Lazy-imports engine.ecad.dfm so a missing module degrades to a structured not_available error.
+    """
+    from engine.ecad import session as esess, schema
+
+    doc_id = str(_require(params, "doc_id"))
+    s = esess.get_session(doc_id)
+
+    if not schema.is_board(s.doc):
+        raise OpError("invalid_op", "ecad_dfm requires a pcb document",
+                      {"reason": "wrong doc kind", "doc_id": doc_id})
+
+    try:
+        from engine.ecad import dfm as dfm_mod  # type: ignore
+    except ImportError:
+        _not_available("engine.ecad.dfm")
+
+    rules = params.get("rules")  # optional override dict
+    violations = dfm_mod.run_dfm(s.doc, rules=rules)
+
+    # Group violations by rule (same shape as drc summary).
+    errors = [v for v in violations if v.get("severity") == "error"]
+    warnings_list = [v for v in violations if v.get("severity") != "error"]
+    by_rule: dict[str, dict] = {}
+    for v in violations:
+        rule = v.get("rule", "?")
+        slot = by_rule.setdefault(rule, {"rule": rule, "severity": v.get("severity"),
+                                         "count": 0, "messages": []})
+        slot["count"] += 1
+        if v.get("severity") == "error":
+            slot["severity"] = "error"
+        if len(slot["messages"]) < 3:
+            slot["messages"].append(v.get("message", ""))
+
+    summary = {
+        "errors": len(errors),
+        "warnings": len(warnings_list),
+        "by_rule": sorted(by_rule.values(),
+                          key=lambda g: (g["severity"] != "error", g["rule"])),
+    }
+    return {"violations": violations, "summary": summary}
+
+
+# ---------------------------------------------------------------------------
+# ecad_autoroute  {doc_id, opts?, base_revision?}
+#   -> ops-response (for the board) + report (routed/failed nets, length, ratsnest before/after)
+# ---------------------------------------------------------------------------
+
 def _ecad_autoroute(params: dict, _emit: EmitFn) -> dict:
     """Route a board's ratsnest with the basic grid (Lee/A*) autorouter (engine.ecad.autoroute).
 
@@ -573,6 +627,9 @@ def _ecad_autoroute(params: dict, _emit: EmitFn) -> dict:
       3. applies the returned geometry as ``pcb_add_track`` / ``pcb_add_via`` ops (one batch — atomic,
          one revision bump, undo snapshot, recompile),
       4. returns the board ops-response with the router ``report`` attached.
+
+    ``opts`` may now carry ``diff_pairs`` (list of [net_p, net_n]) and ``ripup_passes`` (int,
+    default 2) which are forwarded verbatim to ``autoroute()``.
 
     ``autoroute`` is a LAZY import; a missing module degrades to a structured ``not_available`` error.
     Routing nothing (no airwires) is a no-op success (an empty op batch still rebuilds).
@@ -785,6 +842,7 @@ METHODS: dict[str, object] = {
     "ecad_autoroute": _ecad_autoroute,
     "ecad_fill_zones": _ecad_fill_zones,
     "ecad_design": _ecad_design,
+    "ecad_dfm": _ecad_dfm,
 }
 
 STRUCTURED_ERROR_METHODS: set[str] = set(METHODS.keys())

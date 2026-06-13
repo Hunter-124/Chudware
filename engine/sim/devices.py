@@ -28,6 +28,7 @@ GPL-clean: pure numpy/scipy, BSD-style maths only.
 """
 from __future__ import annotations
 
+import ast
 import math
 from typing import Any, Callable
 
@@ -131,6 +132,14 @@ class Device:
         if self.n_branches and not self.branch_rows:
             self.branch_rows = [mna.add_branch(f"{self.name}#{i}")
                                 for i in range(self.n_branches)]
+
+    def link(self, devices_by_name: dict[str, "Device"]) -> None:  # noqa: ARG002
+        """Resolve references to sibling devices (called once after all devices are built).
+
+        Default no-op. Used by relational devices (e.g. ``K`` mutual-inductance couplings) that must
+        bind to other device instances by name before any stamping occurs.
+        """
+        return None
 
     # -- stamps (default: linear no-op) ----------------------------------------
 
@@ -252,13 +261,42 @@ class Capacitor(Device):
 
 @device("L")
 class Inductor(Device):
+    """Inductor with current as an MNA unknown; supports mutual coupling (``K`` cards).
+
+    **Mutual inductance.** A ``K Lx Ly k`` card couples two inductors with mutual ``M = k*sqrt(Lx*Ly)``.
+    Each inductor's branch equation is the constitutive relation ``v_i = L_i*di_i/dt + sum_j M_ij*di_j/dt``
+    (the cross terms are the flux contributed by every coupled neighbour). Rather than make the ``K``
+    device reach into another device's branch row, the coupling is resolved up front (``link``) so each
+    Inductor owns the full multi-port stamp of its OWN branch equation, with the neighbour currents read
+    from their branch rows. This keeps the stamp local and the system symmetric.
+
+    The per-derivative companion is built term by term: the self term integrates ``L*di_self/dt`` and each
+    mutual term integrates ``M*di_other/dt`` with the SAME trapezoidal/backward-Euler companion. Stored
+    history is therefore the *flux-derivative voltages* (``L*di/dt`` for self and ``M*di/dt`` per coupled
+    pair), not the terminal voltage -- for an uncoupled inductor these coincide, so behaviour is byte-for-
+    byte identical to the previous self-only model.
+    """
+
     n_branches = 1  # inductor current is an MNA unknown
+
+    def __init__(self, spec: dict, models: dict, params: dict) -> None:
+        super().__init__(spec, models, params)
+        # Couplings filled by KCoupling.link(): list of (other_inductor, M).
+        self.couplings: list[tuple["Inductor", float]] = []
 
     def _l(self) -> float:
         return float(self.value) if self.value is not None else 0.0
 
     def _br(self) -> int:
         return self.branch_rows[0]
+
+    def add_coupling(self, other: "Inductor", m: float) -> None:
+        # Avoid double-registering the same neighbour (e.g. duplicate K cards).
+        for j, (o, _m) in enumerate(self.couplings):
+            if o is other:
+                self.couplings[j] = (other, m)
+                return
+        self.couplings.append((other, m))
 
     def stamp_dc(self, mna: MnaLike, x: np.ndarray) -> None:
         # DC: ideal short — V(a)-V(b) = 0, branch current is the unknown.
@@ -272,20 +310,37 @@ class Inductor(Device):
         a, b, br = mna.n(self.node_names[0]), mna.n(self.node_names[1]), self._br()
         L = self._l()
         method = hist.get("_method", "trap")
-        st = hist.get(self.name, {})
+        st = hist.setdefault(self.name, {})
         i_prev = st.get("i", 0.0)
-        v_prev = st.get("v", 0.0)
+        ldidt_prev = st.get("ldidt", 0.0)  # L*(di/dt) at the previous step (self term)
+        # Snapshot the previous-step current so a coupled neighbour's update_state reads a stable
+        # value regardless of device update order (update_state overwrites "i" with the new current).
+        st["i_at_step"] = i_prev
         # KCL: branch current enters node a, leaves node b
         mna.stamp_G(a, br, 1.0); mna.stamp_G(b, br, -1.0)
-        # Branch equation: V(a)-V(b) - Req*I = Veq
+        # Branch equation: V(a)-V(b) - [ self + mutual companion ] = Veq.
+        # Self term: integrate v_self = L*di_self/dt.
         if method == "trap":
             req = 2.0 * L / dt
-            veq = -(req * i_prev + v_prev)
+            veq = -(req * i_prev + ldidt_prev)
         else:
             req = L / dt
             veq = -req * i_prev
         mna.stamp_G(br, a, 1.0); mna.stamp_G(br, b, -1.0)
         mna.stamp_G(br, br, -req)
+        # Mutual terms: each coupled neighbour adds M*di_other/dt to this branch equation.
+        mh = st.get("m", {})
+        for other, m in self.couplings:
+            obr = other.branch_rows[0]
+            i_other_prev = hist.get(other.name, {}).get("i", 0.0)
+            mdidt_prev = mh.get(other.name, 0.0)  # M*(di_other/dt) at the previous step
+            if method == "trap":
+                reqm = 2.0 * m / dt
+                veq -= reqm * i_other_prev + mdidt_prev
+            else:
+                reqm = m / dt
+                veq -= reqm * i_other_prev
+            mna.stamp_G(br, obr, -reqm)
         mna.stamp_I(br, veq)
 
     def stamp_ac(self, mna: MnaLike, x_op: np.ndarray, omega: float) -> None:
@@ -296,19 +351,424 @@ class Inductor(Device):
         mna.stamp_G(br, a, 1.0); mna.stamp_G(br, b, -1.0)
         # V = jωL I  ->  branch row: V(a)-V(b) - jωL I = 0
         mna.stamp_C(br, br, -L)  # contributes -jωL on the branch diagonal
+        # Mutual: each coupled neighbour adds -jwM I_other to this branch equation.
+        for other, m in self.couplings:
+            mna.stamp_C(br, other.branch_rows[0], -m)
 
     def update_state(self, x: np.ndarray, dt: float, hist: dict) -> None:
         a, b, br = self._a, self._b, self._br()
         v = _xat(x, a) - _xat(x, b)
         i = _xat(x, br)
+        L = self._l()
+        method = hist.get("_method", "trap")
         st = hist.setdefault(self.name, {})
+        i_prev = st.get("i", 0.0)
+        ldidt_prev = st.get("ldidt", 0.0)
+        # Advance the self flux-derivative voltage L*di/dt with the same companion used to stamp it,
+        # so the next step's history is exact. (Uncoupled: this equals the terminal voltage v.)
+        if method == "trap":
+            ldidt_new = 2.0 * L / dt * (i - i_prev) - ldidt_prev
+        else:
+            ldidt_new = L / dt * (i - i_prev)
+        # Advance each mutual flux-derivative voltage M*di_other/dt likewise.
+        mh = st.setdefault("m", {})
+        for other, m in self.couplings:
+            i_other = _xat(x, other.branch_rows[0])
+            o_hist = hist.get(other.name, {})
+            i_other_prev = o_hist.get("i_at_step", o_hist.get("i", 0.0))
+            mdidt_prev = mh.get(other.name, 0.0)
+            if method == "trap":
+                mh[other.name] = 2.0 * m / dt * (i_other - i_other_prev) - mdidt_prev
+            else:
+                mh[other.name] = m / dt * (i_other - i_other_prev)
         st["i"] = i
         st["v"] = v
+        st["ldidt"] = ldidt_new
 
     def record_indices(self, mna: MnaLike) -> None:
         self.alloc_branches(mna)
         self._a = mna.n(self.node_names[0])
         self._b = mna.n(self.node_names[1])
+
+
+# --------------------------------------------------------------------------- K (mutual)
+
+@device("K")
+class KCoupling(Device):
+    """Mutual-inductance coupling between two inductors (``K Lx Ly k``).
+
+    The card names two existing inductors and a coupling coefficient ``k`` (``|k| <= 1``); the mutual
+    inductance is ``M = k*sqrt(Lx*Ly)``. ``K`` is a *relational* device: it has no nodes and stamps
+    nothing itself. Instead, in :meth:`link` (run once after all devices are built) it registers the
+    coupling on BOTH inductors so each inductor's branch equation gains the ``M*di_other/dt`` cross
+    term (transient companion and AC ``jwM``) -- see :class:`Inductor`. Modeling the coupling on the
+    inductors (rather than having ``K`` reach into their branch rows) keeps the MNA system symmetric
+    and the stamps local.
+
+    Parsing: the two inductor names live in ``params["inductors"] = [Lx, Ly]`` and ``k`` is the device
+    ``value`` (or ``params["k"]``).
+    """
+
+    def _k(self) -> float:
+        if self.value is not None:
+            return float(self.value)
+        return float(self.dparams.get("k", self.dparams.get("K", 1.0)))
+
+    def _inductor_names(self) -> tuple[str, str]:
+        names = self.dparams.get("inductors")
+        if names and len(names) >= 2:
+            return str(names[0]), str(names[1])
+        raise DeviceError(f"{self.name}: K card needs two inductor names")
+
+    def link(self, devices_by_name: dict[str, Device]) -> None:
+        n1, n2 = self._inductor_names()
+        l1 = devices_by_name.get(n1)
+        l2 = devices_by_name.get(n2)
+        if not isinstance(l1, Inductor) or not isinstance(l2, Inductor):
+            raise DeviceError(
+                f"{self.name}: K references must be inductors ({n1!r}, {n2!r})")
+        if l1 is l2:
+            raise DeviceError(f"{self.name}: K cannot couple an inductor to itself")
+        k = self._k()
+        if abs(k) > 1.0 + 1e-9:
+            raise DeviceError(f"{self.name}: coupling |k|={abs(k):.4g} exceeds 1")
+        k = max(-1.0, min(1.0, k))
+        m = k * math.sqrt(max(l1._l(), 0.0) * max(l2._l(), 0.0))
+        l1.add_coupling(l2, m)
+        l2.add_coupling(l1, m)
+        self._m = m
+
+    # K stamps nothing -- the coupling lives on the inductor branch equations.
+    def stamp_dc(self, mna: MnaLike, x: np.ndarray) -> None:
+        return None
+
+    def stamp_tran(self, mna: MnaLike, x: np.ndarray, dt: float, hist: dict) -> None:
+        return None
+
+    def stamp_ac(self, mna: MnaLike, x_op: np.ndarray, omega: float) -> None:
+        return None
+
+
+# --------------------------------------------------------------------------- B (behavioral)
+
+class SafeExprError(Exception):
+    """Raised when a behavioral-source expression is malformed or uses a disallowed construct."""
+
+
+class _SafeExpr:
+    """Safe-AST evaluator for behavioral-source expressions (no arbitrary Python ``eval``).
+
+    Grammar (whitelist only -- anything else raises :class:`SafeExprError` at parse time):
+      * numeric literals, parentheses, unary +/-, and binary ``+ - * / **`` (``^`` accepted as ``**``);
+      * the math functions ``sin cos tan exp log ln sqrt abs tanh min max pow`` (radians, SPICE
+        convention -- distinct from the degrees-based document equation evaluator);
+      * the tokens ``time``/``t`` (transient time, 0 at DC/AC), ``pi``, ``e``;
+      * the probe calls ``V(node)``, ``V(a,b)`` (node-voltage / difference) and ``I(Vname)`` (branch
+        current of a voltage-source-like device). These are recorded as dependencies so the B source
+        can build its numeric Jacobian over exactly the unknowns it reads.
+
+    Node/branch names are case-sensitive strings; numeric-looking node names are supported. The
+    evaluator never imports, never attributes, never indexes -- a hostile expression such as
+    ``__import__('os')`` fails the whitelist check (``Call`` to a non-whitelisted name) and is rejected
+    rather than executed.
+    """
+
+    _FUNCS = {
+        "sin": math.sin, "cos": math.cos, "tan": math.tan,
+        "exp": math.exp, "log": math.log, "ln": math.log,
+        "sqrt": math.sqrt, "abs": abs, "tanh": math.tanh,
+        "min": min, "max": max, "pow": pow,
+    }
+    _CONSTS = {"pi": math.pi, "e": math.e}
+    _BINOPS = {
+        ast.Add: lambda a, b: a + b,
+        ast.Sub: lambda a, b: a - b,
+        ast.Mult: lambda a, b: a * b,
+        ast.Div: lambda a, b: a / b,
+        ast.Pow: lambda a, b: a ** b,
+    }
+    _PROBE = ("V", "I")  # call-like probe tokens
+
+    def __init__(self, expr: str) -> None:
+        self.expr = expr
+        if not isinstance(expr, str) or not expr.strip():
+            raise SafeExprError("empty behavioral expression")
+        try:
+            self.tree = ast.parse(expr.replace("^", "**"), mode="eval")
+        except SyntaxError as exc:
+            raise SafeExprError(f"syntax error in '{expr}': {exc.msg}") from exc
+        # Probe dependencies discovered during the whitelist check.
+        self.v_nodes: list[str] = []          # V(node) single-node reads
+        self.v_pairs: list[tuple[str, str]] = []  # V(a,b) differences
+        self.i_srcs: list[str] = []           # I(Vname) branch reads
+        self.uses_time = False
+        self._check(self.tree)
+
+    # -- whitelist + dependency discovery --------------------------------------
+    def _probe_arg_name(self, node: ast.AST) -> str:
+        """A probe argument must be a bare name or a (numeric) node label -- not an expression."""
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return str(node.value)
+        raise SafeExprError(f"probe argument must be a node/source name in '{self.expr}'")
+
+    def _check(self, node: ast.AST) -> None:
+        if isinstance(node, ast.Expression):
+            self._check(node.body)
+        elif isinstance(node, ast.BinOp):
+            if type(node.op) not in self._BINOPS:
+                raise SafeExprError(f"operator not allowed in '{self.expr}'")
+            self._check(node.left); self._check(node.right)
+        elif isinstance(node, ast.UnaryOp):
+            if not isinstance(node.op, (ast.USub, ast.UAdd)):
+                raise SafeExprError(f"operator not allowed in '{self.expr}'")
+            self._check(node.operand)
+        elif isinstance(node, ast.Constant):
+            if not isinstance(node.value, (int, float)) or isinstance(node.value, bool):
+                raise SafeExprError(f"only numbers allowed in '{self.expr}'")
+        elif isinstance(node, ast.Name):
+            nm = node.id
+            if nm in ("time", "t"):
+                self.uses_time = True
+            elif nm in self._CONSTS:
+                pass
+            else:
+                raise SafeExprError(
+                    f"unknown name '{nm}' in '{self.expr}' (use V(...), I(...), time, or a number)")
+        elif isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise SafeExprError(f"only direct function calls allowed in '{self.expr}'")
+            fn = node.func.id
+            if node.keywords:
+                raise SafeExprError(f"keyword arguments not allowed in '{self.expr}'")
+            if fn == "V":
+                if len(node.args) == 1:
+                    self.v_nodes.append(self._probe_arg_name(node.args[0]))
+                elif len(node.args) == 2:
+                    self.v_pairs.append((self._probe_arg_name(node.args[0]),
+                                         self._probe_arg_name(node.args[1])))
+                else:
+                    raise SafeExprError(f"V() takes 1 or 2 node args in '{self.expr}'")
+            elif fn == "I":
+                if len(node.args) != 1:
+                    raise SafeExprError(f"I() takes one source name in '{self.expr}'")
+                self.i_srcs.append(self._probe_arg_name(node.args[0]))
+            elif fn in self._FUNCS:
+                for a in node.args:
+                    self._check(a)
+            else:
+                raise SafeExprError(f"unknown function '{fn}' in '{self.expr}'")
+        else:
+            raise SafeExprError(f"construct not allowed in '{self.expr}'")
+
+    # -- evaluation ------------------------------------------------------------
+    def eval(self, env: dict) -> float:
+        """Evaluate against ``env`` providing ``v_node(name)``, ``v_pair(a,b)``, ``i_src(name)``,
+        and ``time``. Returns a float; raises :class:`SafeExprError` on a math/domain error."""
+        return self._eval(self.tree, env)
+
+    def _eval(self, node: ast.AST, env: dict) -> float:
+        if isinstance(node, ast.Expression):
+            return self._eval(node.body, env)
+        if isinstance(node, ast.BinOp):
+            a = self._eval(node.left, env); b = self._eval(node.right, env)
+            try:
+                return self._BINOPS[type(node.op)](a, b)
+            except ZeroDivisionError:
+                # Robust: treat division by zero as a large-but-finite slope guard.
+                return a / 1e-30 if a else 0.0
+            except (OverflowError, ValueError) as exc:
+                raise SafeExprError(f"math error in '{self.expr}': {exc}") from exc
+        if isinstance(node, ast.UnaryOp):
+            v = self._eval(node.operand, env)
+            return -v if isinstance(node.op, ast.USub) else v
+        if isinstance(node, ast.Constant):
+            return float(node.value)
+        if isinstance(node, ast.Name):
+            if node.id in ("time", "t"):
+                return float(env.get("time", 0.0))
+            return float(self._CONSTS[node.id])
+        if isinstance(node, ast.Call):
+            fn = node.func.id
+            if fn == "V":
+                if len(node.args) == 1:
+                    return float(env["v_node"](self._probe_arg_name(node.args[0])))
+                return float(env["v_pair"](self._probe_arg_name(node.args[0]),
+                                           self._probe_arg_name(node.args[1])))
+            if fn == "I":
+                return float(env["i_src"](self._probe_arg_name(node.args[0])))
+            args = [self._eval(a, env) for a in node.args]
+            try:
+                return float(self._FUNCS[fn](*args))
+            except (ValueError, OverflowError, TypeError) as exc:
+                raise SafeExprError(f"math error in '{self.expr}': {exc}") from exc
+        raise SafeExprError(f"construct not allowed in '{self.expr}'")
+
+
+@device("B")
+class Behavioral(Device):
+    """Behavioral (arbitrary-expression) source: ``B<name> n+ n- V=<expr>`` or ``I=<expr>``.
+
+    The output is an arbitrary function of node voltages ``V(node)``/``V(a,b)``, branch currents
+    ``I(Vname)``, and ``time`` -- the ngspice ``B`` element. It is modeled as a *nonlinear* device and
+    linearized every Newton iteration by a finite-difference Jacobian:
+
+      * ``V=expr`` is a voltage source whose value depends on the solution. Like a VCVS it owns one MNA
+        branch row enforcing ``V(n+) - V(n-) = f(x)``. The branch row is stamped as
+        ``V(n+) - V(n-) - sum_k (df/dx_k) x_k = f(x0) - sum_k (df/dx_k) x0_k`` (Newton companion of the
+        constraint), where ``x_k`` ranges over the controlling node rows / branch rows the expression
+        reads.
+      * ``I=expr`` is a current source ``f(x)`` from n+ to n-, stamped as a Norton companion
+        ``I_eq = f(x0) - sum_k (df/dx_k) x0_k`` with the partials stamped as VCCS/CCCS conductances
+        into the controlling rows.
+
+    Partials ``df/dx_k`` are computed by central finite differences (robust for any safe expression);
+    for a linear expression this reproduces the exact VCVS/VCCS stamp and converges in one iteration.
+    The AC stamp linearizes about the DC operating point using the same partials (so a small-signal
+    ``V=2*V(in)`` behaves as a gain-2 VCVS at AC). The expression is evaluated by :class:`_SafeExpr`
+    (safe-AST, no Python ``eval``)."""
+
+    _FD_REL = 1e-6
+    _FD_ABS = 1e-9
+
+    def __init__(self, spec: dict, models: dict, params: dict) -> None:
+        super().__init__(spec, models, params)
+        # Source type + expression from params (set by the SPICE parser).
+        styp = str(self.dparams.get("btype", "V")).upper()
+        self.src_type = "I" if styp == "I" else "V"
+        expr = self.dparams.get("expr")
+        if not expr:
+            raise DeviceError(f"{self.name}: behavioral source needs V=/I= expression")
+        try:
+            self.sx = _SafeExpr(str(expr))
+        except SafeExprError as exc:
+            raise DeviceError(f"{self.name}: {exc}") from exc
+        self.n_branches = 1 if self.src_type == "V" else 0
+
+    def is_nonlinear(self) -> bool:
+        return True
+
+    # -- controlling-variable plumbing -----------------------------------------
+    def _ctrl_rows(self, mna: MnaLike) -> list[int]:
+        """Matrix rows the expression depends on (controlling node rows + branch rows), de-duplicated.
+
+        Ground (-1) is dropped; an unknown branch reference raises a clear DeviceError."""
+        rows: list[int] = []
+        seen: set[int] = set()
+
+        def add(r: int) -> None:
+            if r >= 0 and r not in seen:
+                seen.add(r); rows.append(r)
+
+        for nm in self.sx.v_nodes:
+            add(mna.n(nm))
+        for a, b in self.sx.v_pairs:
+            add(mna.n(a)); add(mna.n(b))
+        for sn in self.sx.i_srcs:
+            br = mna.branch_index(f"{sn}#0")
+            if br is None:
+                br = mna.branch_index(sn)
+            if br is None:
+                raise DeviceError(
+                    f"{self.name}: I({sn}) controlling current has no branch (source must be V/L/E/H)")
+            add(br)
+        return rows
+
+    def _env(self, mna: MnaLike, x: np.ndarray, t: float) -> dict:
+        """Build the evaluation environment reading the working solution vector ``x``."""
+        node_index = mna.node_index
+
+        def v_node(nm: str) -> float:
+            return _xat(x, node_index.get(str(nm), -1))
+
+        def v_pair(a: str, b: str) -> float:
+            return _xat(x, node_index.get(str(a), -1)) - _xat(x, node_index.get(str(b), -1))
+
+        def i_src(sn: str) -> float:
+            br = mna.branch_index(f"{sn}#0")
+            if br is None:
+                br = mna.branch_index(sn)
+            return _xat(x, br) if br is not None and br >= 0 else 0.0
+
+        return {"v_node": v_node, "v_pair": v_pair, "i_src": i_src, "time": t}
+
+    def _eval_f(self, mna: MnaLike, x: np.ndarray, t: float) -> float:
+        try:
+            return float(self.sx.eval(self._env(mna, x, t)))
+        except SafeExprError as exc:
+            raise DeviceError(f"{self.name}: {exc}") from exc
+
+    def _jacobian(self, mna: MnaLike, x: np.ndarray, t: float,
+                  rows: list[int], f0: float) -> dict[int, float]:
+        """Central-difference partials df/dx_k for each controlling row ``k``."""
+        partials: dict[int, float] = {}
+        xv = np.array(x, dtype=float, copy=True)
+        for r in rows:
+            x0 = xv[r]
+            h = self._FD_REL * abs(x0) + self._FD_ABS
+            xv[r] = x0 + h
+            fp = self._eval_f(mna, xv, t)
+            xv[r] = x0 - h
+            fm = self._eval_f(mna, xv, t)
+            xv[r] = x0
+            partials[r] = (fp - fm) / (2.0 * h)
+        return partials
+
+    # -- DC / transient stamp (Newton companion) -------------------------------
+    def _stamp_companion(self, mna: MnaLike, x: np.ndarray, t: float) -> None:
+        op, on = mna.n(self.node_names[0]), mna.n(self.node_names[1])
+        rows = self._ctrl_rows(mna)
+        f0 = self._eval_f(mna, x, t)
+        partials = self._jacobian(mna, x, t, rows, f0)
+        # Companion offset: f(x0) - sum df/dx_k * x0_k  (so the linearization passes through (x0,f0)).
+        offset = f0 - sum(g * _xat(x, r) for r, g in partials.items())
+
+        if self.src_type == "V":
+            self.alloc_branches(mna)
+            br = self.branch_rows[0]
+            # KCL: branch current leaves n+, enters n-.
+            mna.stamp_G(op, br, 1.0); mna.stamp_G(on, br, -1.0)
+            # Constraint row: V(n+) - V(n-) - sum df/dx_k * x_k = offset.
+            mna.stamp_G(br, op, 1.0); mna.stamp_G(br, on, -1.0)
+            for r, g in partials.items():
+                mna.stamp_G(br, r, -g)
+            mna.stamp_I(br, offset)
+        else:  # I = f(x): Norton companion current from n+ to n-.
+            # Linearized current: i(x) ~= offset + sum df/dx_k * x_k. The controlled (Jacobian) part
+            # is a VCCS into the controlling rows; the constant part is an independent current source.
+            for r, g in partials.items():
+                mna.stamp_G(op, r, g); mna.stamp_G(on, r, -g)
+            # Independent part: push 'offset' amps from n+ to n- -> out of n+, into n-.
+            mna.stamp_I(op, -offset); mna.stamp_I(on, offset)
+
+    def stamp_dc(self, mna: MnaLike, x: np.ndarray) -> None:
+        self._stamp_companion(mna, x, 0.0)
+
+    def stamp_tran(self, mna: MnaLike, x: np.ndarray, dt: float, hist: dict) -> None:
+        self._stamp_companion(mna, x, hist.get("_t", 0.0))
+
+    # -- AC: linearize about the DC operating point ----------------------------
+    def stamp_ac(self, mna: MnaLike, x_op: np.ndarray, omega: float) -> None:
+        op, on = mna.n(self.node_names[0]), mna.n(self.node_names[1])
+        rows = self._ctrl_rows(mna)
+        f0 = self._eval_f(mna, x_op, 0.0)
+        partials = self._jacobian(mna, x_op, 0.0, rows, f0)
+        # Small-signal only: drop the DC constant term, keep the linear (Jacobian) coupling.
+        if self.src_type == "V":
+            self.alloc_branches(mna)
+            br = self.branch_rows[0]
+            mna.stamp_G(op, br, 1.0); mna.stamp_G(on, br, -1.0)
+            mna.stamp_G(br, op, 1.0); mna.stamp_G(br, on, -1.0)
+            for r, g in partials.items():
+                mna.stamp_G(br, r, -g)
+        else:
+            for r, g in partials.items():
+                mna.stamp_G(op, r, g); mna.stamp_G(on, r, -g)
+
+    def record_indices(self, mna: MnaLike) -> None:
+        if self.src_type == "V":
+            self.alloc_branches(mna)
 
 
 # --------------------------------------------------------------------------- waveforms

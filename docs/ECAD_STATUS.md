@@ -54,30 +54,38 @@ Run the demo to see the whole pipeline:
    GPL-clean. ngspice remains a documented, subprocess-isolated *optional* backend (not built).
 3. **Mirrors `engine/doc` architecture** exactly (schema/ops/session/compile/RPC/tools/PM-forms).
 
-## C++ GUI (Wave N — BUILT + headless-verified)
+## C++ GUI (Waves N–R — BUILT + headless-verified, interactive)
 
-`host/src/ui/ecad/` (mirror + 2D canvas + dockable panel) is now **compiled into `AI-CAD.exe`
-(VS2022) and verified headlessly** via `AI_CAD_SHOT=ecad` (+ `AI_CAD_ECAD_KIND=pcb`). It is wired
-into the dockspace (tabbed with the Viewport), the draw loop, a new **"PCB" ribbon tab** (New/
-Schematic/Board/Outputs), and the dispatcher (`ecad_*`/`sch_*`/`pcb_*` → `ecadDispatch` → worker
-RPCs). New Schematic/New PCB create live docs; Autoroute/Fill Zones/ERC-DRC/Gerber/Drill/BOM/Board-
-to-3D operate on the current doc. **Verified renders (dark + light themes):** schematic (symbols,
-pins, net labels, Nets/Symbols panel, ERC strip) and PCB (board outline, footprints + pads, tracks,
-copper pour, per-layer Layers panel, DRC strip). `docs/ECAD_UI_INTEGRATION.md` documents the wiring.
+`host/src/ui/ecad/` (mirror + 2D canvas + dockable panel) is **compiled into `AI-CAD.exe` (VS2022)
+and verified headlessly** (`AI_CAD_SHOT=ecad`, kinds `sch`/`pcb`/`3d`/`ai`/`editsch`/`select`/`del`).
+Wired into the dockspace (tabbed with the Viewport), the draw loop, a **"PCB" ribbon tab**, and the
+dispatcher. It is now an interactive editor:
+- **AI launchpad (N/P):** the empty editor takes a natural-language request → `ecad_design` → a
+  verified schematic loads in the canvas. "AI Design" leads the ribbon's New group.
+- **Create/analyze (N/F):** New Schematic/New PCB; Autoroute / Fill Zones / ERC / DRC / Gerber /
+  Drill / BOM operate on the current doc.
+- **Seamless PCB→3D (O):** "Board to 3D" exports the board STEP and imports it into a live CAD part
+  shown in the 3D viewport — design a housing around it. (The headline integration.)
+- **Interactive editing (Q/R):** a Select/Place/Route toolbar + part picker. Place drops a symbol/
+  footprint at the grid-snapped click; Route adds wire/track segments; Select hit-tests + highlights;
+  Delete removes; drag moves a symbol/footprint. Edits emit ecad ops via `ecadApplyOps`.
+- **Verified renders (dark + light themes):** schematic (symbols/pins/net-labels/Nets+Symbols panel/
+  ERC strip + selection halo) and PCB (outline/footprints+pads/tracks/copper-pour/Layers panel/DRC).
 
 Build: `cmake -S host -B host/build -G "Visual Studio 17 2022" -A x64 && cmake --build host/build
 --config Release --target AI-CAD`. Shot: `AI-CAD.exe --ui-screenshot out.png` with `AI_CAD_SHOT=ecad`.
+`docs/ECAD_UI_INTEGRATION.md` documents the wiring. NOTE: the worker runs STAGED app code at
+`%APPDATA%\AI-CAD\app` — engine edits need re-staging to reach a running GUI.
 
-**GUI follow-ups (not blocking):** interactive canvas placement (click-to-place symbol/footprint via
-`ecad_resolve_pick` + PM forms — the ops/RPC already exist; only the canvas-click → op wiring + the
-`PMFieldKind` additions in `docs/ECAD_UI_INTEGRATION.md §f` remain); move the editor mirror onto
-AppState for undo/redo + multi-doc; `ecad_open` file dialog.
+**GUI follow-ups (not blocking):** PropertyManager forms for ECAD ops (new `PMFieldKind`s — guide §f);
+ECAD undo/redo on Ctrl+Z/Y; move the editor mirror onto AppState for multi-doc; **simulation waveform
+plot** (run sim from the schematic and graph V/I traces); `ecad_open` file dialog.
 
 ## Remaining work / known debt (prioritized)
 
-1. **Interactive ECAD editing in the GUI** — placement/routing is currently driven by the worker/AI
-   (ribbon New + the orchestrator); add canvas click-to-place + PM forms for fully manual editing
-   (engine ops + RPC already exist; see the GUI follow-ups above).
+1. **GUI editor polish** — interactive place/route/select/delete/move is DONE (Waves Q/R); remaining:
+   a **simulation waveform plot** (run sim from the schematic, graph V/I traces — the engine already
+   computes them), PropertyManager forms for ECAD ops, ECAD undo/redo (Ctrl+Z/Y), multi-doc.
 2. **Full bus routing** (electrical): member labels already net correctly (KiCad's bus is largely a
    drawing convenience over labels); explicit bus-wire + bus-entry tap objects are a follow-up.
 3. **Advanced routing**: push-and-shove (router is eviction-based rip-up + maze, not negotiated-

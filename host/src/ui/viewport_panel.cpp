@@ -1,6 +1,8 @@
 // AI-CAD Viewport panel — 3D orbit view + parts list + fit readout + overlays.
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 #include "imgui.h"
@@ -42,6 +44,31 @@ static ImVec2 s_zoomAreaP1 = {0, 0};  // drag current (screen)
 // C37-C: LMB drag-threshold state — suppress orbit micro-movement on click-selects.
 static bool   s_lmbDragActive  = false;  // true once the 4px threshold has been crossed
 static ImVec2 s_lmbDragOrigin  = {0, 0}; // screen position of the LMB press
+
+// ---- Instant3D push-pull (drag-to-modify a face) -------------------------------------------
+// When EXACTLY ONE face is selected we draw a normal-axis drag handle (a short ⟂ arrow + its
+// mirror) at the face centroid. Pressing on the arrow starts a push-pull drag instead of an orbit:
+// the cursor's screen motion is projected onto the face-normal's screen direction and converted
+// px→mm at the face depth, then fed to doc_push_pull through the checkpoint/revert envelope.
+struct PushPullDrag {
+    bool      active     = false;     // a push-pull drag is in flight (owns the mouse, no orbit)
+    uint32_t  bodyId     = 0;         // PickHit body (1-based) of the dragged face
+    uint32_t  topoId     = 0;         // picked FACE topo_id (1-based)
+    std::string checkpoint;           // doc_checkpoint id taken on press (for revert/cancel)
+    ImVec2    pressPos    = {0, 0};    // screen pos at press (drag origin)
+    float     nsx = 0, nsy = 0;       // unit screen-space direction of the face OUTWARD normal
+    float     worldPerPx  = 1.0f;     // world(mm) per screen pixel at the face depth (this frame)
+    double    lastApplied = 1e30f;    // last cumulative distance actually sent (skip dup samples)
+    double    curDist     = 0.0;      // current cumulative signed distance (mm)
+    // Live readout from the most recent draggable response (shown near the cursor).
+    bool        haveReadout = false;
+    std::string param;                // e.g. "depth"
+    double      newValue  = 0.0;
+    bool        clamped   = false;
+    // Persists across the frame so the readout chip can draw even on a no-op sample.
+    void reset() { *this = PushPullDrag{}; }
+};
+static PushPullDrag s_pp;
 
 // ---- C26-C / C37-C: Normal-To (Ctrl+8 / shortcut) -------------------------------------------
 // "Look straight at the selected face." If a face is selected and the C26-C normal cache has data
@@ -330,6 +357,131 @@ static void applyAppearanceFromViewport(AppState& st, const std::string& bodyKey
     }
 }
 
+// ---- Instant3D push-pull helpers -----------------------------------------------------------
+
+// Project a world point through the renderer's published MVP to viewport-screen pixels.
+// Returns false when the point is behind the camera. (Same column-major math the plane-label and
+// PM-callout overlays use.)
+static bool ppProject(const Renderer& renderer, const ImVec2& vr0, const ImVec2& vr1,
+                      int vw, int vh, const float w[3], ImVec2& out) {
+    const float* m = renderer.camera().mvp.m;  // column-major model->clip
+    float x = m[0]*w[0] + m[4]*w[1] + m[8]*w[2]  + m[12];
+    float y = m[1]*w[0] + m[5]*w[1] + m[9]*w[2]  + m[13];
+    float wc= m[3]*w[0] + m[7]*w[1] + m[11]*w[2] + m[15];
+    if (wc <= 1e-4f) return false;  // behind the camera
+    out.x = vr0.x + (x / wc * 0.5f + 0.5f) * (vw);
+    out.y = vr0.y + (1.0f - (y / wc * 0.5f + 0.5f)) * (vh);
+    (void)vr1;
+    return true;
+}
+
+// The push-pull handle for the single selected face: returns false when there is no single face
+// selected or the face has no cached normal/centroid. On success fills the centroid screen pos,
+// the two arrow tips (+normal and −normal) in screen space, the unit screen-space normal
+// direction, and the world-per-pixel scale at the face depth.
+static bool ppHandleGeometry(AppState& st, const Renderer& renderer, const ImVec2& vr0,
+                             const ImVec2& vr1, int vw, int vh, ImVec2& centroidSp,
+                             ImVec2& tipPos, ImVec2& tipNeg, float& nsx, float& nsy,
+                             float& worldPerPx, uint32_t& bodyId, uint32_t& topoId) {
+    if (st.selection.size() != 1) return false;
+    const render::PickHit& h = st.selection.items().front().hit;
+    if (!h.valid() || h.kind != render::PickKind::Face) return false;
+    uint64_t key = ((uint64_t)h.body_id << 32) | (uint64_t)h.topo_id;
+    auto it = st.faceNormalCache.find(key);
+    if (it == st.faceNormalCache.end()) return false;
+    const auto& v = it->second;  // {nx,ny,nz, cx,cy,cz}
+    float nx = v[0], ny = v[1], nz = v[2];
+    float nlen = std::sqrt(nx*nx + ny*ny + nz*nz);
+    if (nlen < 1e-6f) return false;
+    nx /= nlen; ny /= nlen; nz /= nlen;
+    float cx = v[3], cy = v[4], cz = v[5];
+
+    float C[3] = {cx, cy, cz};
+    if (!ppProject(renderer, vr0, vr1, vw, vh, C, centroidSp)) return false;
+
+    // world-per-pixel at the face depth: project a point one mm along the normal and measure the
+    // screen displacement. (Robust to perspective: uses the centroid's actual depth, not the orbit
+    // target plane.) Use a 1mm probe; if the normal is near edge-on the screen vector is tiny, so
+    // fall back to the camera-plane scale used by pan/zoom.
+    float Cp[3] = {cx + nx, cy + ny, cz + nz};
+    ImVec2 cpSp;
+    bool gotProbe = ppProject(renderer, vr0, vr1, vw, vh, Cp, cpSp);
+    float sdx = gotProbe ? (cpSp.x - centroidSp.x) : 0.0f;
+    float sdy = gotProbe ? (cpSp.y - centroidSp.y) : 0.0f;
+    float slen = std::sqrt(sdx*sdx + sdy*sdy);
+
+    if (slen > 1e-3f) {
+        nsx = sdx / slen; nsy = sdy / slen;
+        worldPerPx = 1.0f / slen;   // 1mm spans `slen` px => mm-per-px = 1/slen
+    } else {
+        // Face is nearly edge-on: derive a screen direction from the camera basis projection of the
+        // normal and fall back to the orbit-plane world-per-px (matches pan/zoom conversion).
+        const float deg = 3.14159265f / 180.0f;
+        const float fov = Renderer::kFovDeg * deg;
+        float zc = st.zoom < 0.05f ? 0.05f : st.zoom;
+        float dist = renderer.modelRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
+        worldPerPx = 2.0f * dist * std::tan(fov * 0.5f) / (float)(vh > 1 ? vh : 1);
+        // screen-space normal direction from the camera right/up basis.
+        float yr = st.yaw * deg, pr = st.pitch * deg;
+        Vec3 vdir(std::cos(pr) * std::sin(yr), -std::cos(pr) * std::cos(yr), std::sin(pr));
+        Vec3 worldUp = (std::fabs(pr) > 89.0f * deg) ? Vec3(0, 1, 0) : Vec3(0, 0, 1);
+        Vec3 V = normalize(vdir);
+        Vec3 R = normalize(cross(worldUp, V));
+        Vec3 U = normalize(cross(V, R));
+        Vec3 N(nx, ny, nz);
+        float rN = dot(R, N), uN = dot(U, N);
+        float l2 = std::sqrt(rN*rN + uN*uN);
+        if (l2 < 1e-4f) return false;  // truly edge-on AND parallel to view: no usable handle
+        // screen x is +R, screen y is -U (y down).
+        nsx = rN / l2; nsy = -uN / l2;
+    }
+
+    float armLenPx = 46.0f * ui::uiScale;  // arrow length in screen px
+    tipPos = ImVec2(centroidSp.x + nsx * armLenPx, centroidSp.y + nsy * armLenPx);
+    tipNeg = ImVec2(centroidSp.x - nsx * armLenPx, centroidSp.y - nsy * armLenPx);
+    bodyId = h.body_id; topoId = h.topo_id;
+    return true;
+}
+
+// Run ONE push-pull sample at the given cumulative distance (revert to checkpoint, then apply).
+// Returns false (and leaves s_pp.active as the caller set it) on a hard transport failure. On a
+// non-draggable first response the caller aborts the drag (handled at press time instead).
+static void ppApplySample(AppState& st, double cumulative, bool commit) {
+    if (!st.docMirror.hasDoc()) return;
+    // Revert to the pre-drag checkpoint so previews never compound, then apply the cumulative.
+    if (!s_pp.checkpoint.empty()) {
+        auto rv = st.docMirror.revert(st.worker, s_pp.checkpoint);
+        if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
+    }
+    auto r = st.docMirror.pushPull(st.worker, s_pp.bodyId, s_pp.topoId, cumulative, commit);
+    if (!r.ok) {
+        st.toast(ui::ToastLevel::Error, "Push-pull failed: " + r.error_message);
+        return;
+    }
+    if (!r.draggable) {
+        // Shouldn't happen mid-drag (we validated draggability on press), but guard anyway.
+        st.toast(ui::ToastLevel::Warn, "This face can't be dragged — " + r.reason);
+        return;
+    }
+    if (!r.ops.aicm_path.empty()) { std::string le; st.loadDocMesh(r.ops.aicm_path, le); }
+    s_pp.haveReadout = true;
+    s_pp.param    = r.param;
+    s_pp.newValue = r.new_value;
+    s_pp.clamped  = r.clamped;
+    s_pp.lastApplied = cumulative;
+}
+
+// Cancel an in-flight push-pull drag: revert to the checkpoint and clear all drag state. Safe to
+// call when no drag is active (no-op). Leaves NO zombie checkpoint/flag behind.
+static void ppCancel(AppState& st) {
+    if (!s_pp.active && s_pp.checkpoint.empty()) { s_pp.reset(); return; }
+    if (!s_pp.checkpoint.empty() && st.docMirror.hasDoc()) {
+        auto rv = st.docMirror.revert(st.worker, s_pp.checkpoint);
+        if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
+    }
+    s_pp.reset();
+}
+
 void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     Renderer& renderer = *st.renderer;
     // C18: while a sketch is being edited the camera locks normal to the sketch plane and the
@@ -400,6 +552,22 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         if (st.propertyManager && st.propertyManager->active()) {
             s_zoomAreaArmed    = false;
             s_zoomAreaDragging = false;
+        }
+
+        // Instant3D push-pull safety net (runs every frame, regardless of hover): if a sketch /
+        // plane-pick / PM took over the mouse mid-drag, cancel (revert) so no zombie checkpoint/flag
+        // survives. If the LMB was released while the cursor was OUTSIDE the viewport image (the
+        // hover-gated release handler never ran), commit the drag at its last distance.
+        if (s_pp.active) {
+            bool ppPmNow = st.propertyManager && st.propertyManager->active();
+            if (inSketch || st.sketchPlanePickActive || ppPmNow) {
+                ppCancel(st);
+            } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                ppApplySample(st, s_pp.curDist, /*commit=*/true);
+                s_pp.active = false;
+                s_pp.checkpoint.clear();
+                s_pp.haveReadout = false;
+            }
         }
 
         // C37-C: consume st.zoomToBBoxRequested (one-shot from feature tree "Zoom to Feature").
@@ -561,10 +729,99 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             if (s_zoomAreaArmed)
                 st.requestCursor(ui::CursorKind::Crosshair);
 
+            // ---- Instant3D push-pull: handle press / drag / release ----------------------------
+            // Only when a doc mesh is loaded, no PM/sketch/zoom-area is owning the mouse, and the
+            // press lands on the normal-axis handle of the single selected face. Owns the mouse for
+            // its whole lifetime (orbit/pan/pick all skip while s_pp.active).
+            bool ppPmOpen = st.propertyManager && st.propertyManager->active();
+            if (st.hasDocMesh && !st.sketchPlanePickActive && !ppPmOpen && !s_zoomAreaArmed) {
+                // Press: hit-test the handle arrow. We use the handle geometry computed for THIS
+                // frame's camera; the centroid screen pos + the two tips define a thick segment.
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s_pp.active) {
+                    ImVec2 cSp, tipP, tipN; float nsx, nsy, wpp; uint32_t bId, tId;
+                    if (ppHandleGeometry(st, renderer, vr0, vr1, vw, vh, cSp, tipP, tipN,
+                                         nsx, nsy, wpp, bId, tId)) {
+                        // Distance from the press point to the handle axis segment (centroid..tip,
+                        // both directions). A generous hit radius makes the thin arrow grabbable.
+                        ImVec2 mp = io.MousePos;
+                        float hitR = 10.0f * ui::uiScale;
+                        // Project press onto the infinite handle axis through the centroid.
+                        float dx = mp.x - cSp.x, dy = mp.y - cSp.y;
+                        float along = dx * nsx + dy * nsy;          // signed distance along the axis
+                        float perp  = std::fabs(dx * (-nsy) + dy * nsx);  // perpendicular distance
+                        float armLenPx = 46.0f * ui::uiScale;
+                        bool onAxis = perp <= hitR && std::fabs(along) <= armLenPx + hitR;
+                        // Also accept a direct hit near either arrowhead tip.
+                        auto nearTip = [&](const ImVec2& t) {
+                            float ddx = mp.x - t.x, ddy = mp.y - t.y;
+                            return std::sqrt(ddx*ddx + ddy*ddy) <= hitR * 1.6f;
+                        };
+                        if (onAxis || nearTip(tipP) || nearTip(tipN)) {
+                            // Validate draggability + take a checkpoint BEFORE mutating anything.
+                            std::string cp = st.docMirror.hasDoc()
+                                                 ? st.docMirror.checkpoint(st.worker) : std::string();
+                            auto probe = st.docMirror.pushPull(st.worker, bId, tId, 0.0, false);
+                            if (!probe.ok) {
+                                st.toast(ui::ToastLevel::Error,
+                                         "Push-pull failed: " + probe.error_message);
+                                if (!cp.empty()) st.docMirror.revert(st.worker, cp);
+                            } else if (!probe.draggable) {
+                                st.toast(ui::ToastLevel::Warn,
+                                         "This face can't be dragged — " + probe.reason);
+                                if (!cp.empty()) st.docMirror.revert(st.worker, cp);
+                            } else {
+                                // Begin the drag. The zero-distance probe left geometry unchanged.
+                                s_pp.reset();
+                                s_pp.active     = true;
+                                s_pp.bodyId     = bId;
+                                s_pp.topoId     = tId;
+                                s_pp.checkpoint = cp;
+                                s_pp.pressPos   = mp;
+                                s_pp.nsx = nsx; s_pp.nsy = nsy;
+                                s_pp.worldPerPx = wpp;
+                                s_pp.curDist    = 0.0;
+                                s_pp.lastApplied = 1e30f;
+                                s_pp.haveReadout = true;
+                                s_pp.param    = probe.param;
+                                s_pp.newValue = probe.old_value;  // value before the drag
+                                s_pp.clamped  = false;
+                            }
+                        }
+                    }
+                }
+
+                // Drag: convert cursor motion to a cumulative signed distance and apply a sample.
+                if (s_pp.active && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    st.requestCursor(ui::CursorKind::Crosshair);
+                    cancelCameraAnimation();
+                    float dx = io.MousePos.x - s_pp.pressPos.x;
+                    float dy = io.MousePos.y - s_pp.pressPos.y;
+                    float px = dx * s_pp.nsx + dy * s_pp.nsy;   // signed px along the normal axis
+                    double cumulative = (double)px * (double)s_pp.worldPerPx;
+                    s_pp.curDist = cumulative;
+                    // Throttle: only call the worker when the cumulative distance changed enough to
+                    // matter (~0.05mm), so a steady hold doesn't queue a backlog of rebuilds. The
+                    // call is synchronous, so at most one is ever in flight.
+                    if (std::fabs(cumulative - s_pp.lastApplied) >= 0.05)
+                        ppApplySample(st, cumulative, /*commit=*/false);
+                }
+
+                // Release: commit exactly one undo entry at the final distance.
+                if (s_pp.active && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                    ppApplySample(st, s_pp.curDist, /*commit=*/true);
+                    // Refresh the mirror tree (commit may have changed revision) and clear state.
+                    s_pp.active = false;
+                    s_pp.checkpoint.clear();
+                    // Keep the readout for one frame? No — clear; selection highlight remains.
+                    s_pp.haveReadout = false;
+                }
+            }
+
             // Left-drag: orbit or pan depending on vpDragMode. Cancels any tween.
             // Zoom-area mode intercepts left-drag above; skip orbit/pan if armed.
             // C37-C: only starts dragging once the 4px threshold is crossed (s_lmbDragActive).
-            if (!s_zoomAreaArmed && s_lmbDragActive &&
+            // Instant3D: a push-pull drag owns the mouse — never orbit/pan while it is active.
+            if (!s_pp.active && !s_zoomAreaArmed && s_lmbDragActive &&
                 (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
                 cancelCameraAnimation();
                 if (st.vpDragMode == 1) {
@@ -698,7 +955,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // C25 W2-E: suppressed while the glass-box View Selector is up (it owns the click).
         // C37-C item 5: also suppressed while sketchPlanePickActive (the overlay owns the mouse).
         if (picking && !inSketch && !s_viewSelector.active() && !st.sketchPlanePickActive) {
-            if (imgHovered && !s_lmbDragActive && !regionPickerHot) {
+            // Instant3D: while a push-pull drag owns the mouse, freeze hover and swallow the click
+            // so the press that grabbed the handle doesn't also re-select / clear the face.
+            if (imgHovered && !s_lmbDragActive && !regionPickerHot && !s_pp.active) {
                 int px = (int)(io.MousePos.x - vr0.x);
                 int py = (int)(io.MousePos.y - vr0.y);
                 st.hover = st.idPass->pickFinal(px, py, vw, vh);
@@ -709,18 +968,23 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // Click = replace, Ctrl-click = toggle. Empty-space click clears.
             // C37-C item 3: guard against micro-orbit clicks — only fire if drag was not active.
             // C51: a click consumed by the region picker never falls through to model selection.
+            // Instant3D: a click that started a push-pull drag (s_pp.active) is NOT a selection.
             if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-                !s_lmbDragActive && !regionPickerHot) {
+                !s_lmbDragActive && !regionPickerHot && !s_pp.active) {
                 if (io.KeyCtrl) {
                     if (st.hover.valid()) st.selection.toggle(st.hover);
                 } else {
                     st.selection.selectOne(st.hover);  // clears if hover invalid
                 }
             }
-            // ESC clears the selection while the viewport is focused/hovered.
+            // ESC: during a push-pull drag, cancel it (revert) and DON'T clear the selection.
+            // Otherwise ESC clears the selection while the viewport is focused/hovered.
             // C37-C item 5: do NOT consume Esc while sketchPlanePickActive (guard above already
             // prevents this block from running in that case, so this Esc is safe).
-            if (imgHovered && ImGui::IsKeyPressed(ImGuiKey_Escape)) st.selection.clear();
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                if (s_pp.active) ppCancel(st);
+                else if (imgHovered) st.selection.clear();
+            }
 
             // Status text: prefer the live hover, else the last selected item.
             if (st.hover.valid()) {
@@ -1155,6 +1419,79 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             vdl->AddRect(p0, p1b, overlayBord, 6.0f);
             vdl->AddText(ImVec2(p0.x + 10, p0.y + 5), overlayTxt,
                          st.pickStatus.c_str());
+        }
+
+        // ---- Instant3D push-pull handle + live readout ----
+        // Drawn whenever exactly one face is selected (with a cached normal) and no sketch/PM/
+        // plane-pick owns the view. The handle is a bidirectional accent arrow along the face
+        // outward normal; press it to drag-modify the face. While dragging, a readout chip near the
+        // cursor shows the driven param + new value (and a "clamped" hint at the limit).
+        {
+            bool ppPmOpen2 = st.propertyManager && st.propertyManager->active();
+            bool canShowHandle = st.hasDocMesh && !inSketch && !st.sketchPlanePickActive &&
+                                 !ppPmOpen2 && !s_viewSelector.active();
+            if (canShowHandle) {
+                ImVec2 cSp, tipP, tipN; float nsx, nsy, wpp; uint32_t bId, tId;
+                if (ppHandleGeometry(st, renderer, vr0, vr1, vw, vh, cSp, tipP, tipN,
+                                     nsx, nsy, wpp, bId, tId)) {
+                    const auto& vpal2 = ui::palette;
+                    const ImU32 acc  = ui::Palette::toU32(vpal2.accent);
+                    const ImU32 accS = ui::Palette::toU32(vpal2.accentSoft);
+                    float sc = ui::uiScale;
+                    bool dragging = s_pp.active;
+                    float lw = (dragging ? 3.0f : 2.2f) * sc;
+                    // Shaft (centroid -> +normal tip, and centroid -> -normal tip).
+                    vdl->AddLine(cSp, tipP, acc, lw);
+                    vdl->AddLine(cSp, tipN, acc, lw);
+                    // Arrowheads at both tips.
+                    auto arrowHead = [&](const ImVec2& tip, float dx, float dy) {
+                        float hl = 9.0f * sc, hw = 5.0f * sc;
+                        // back along the shaft from the tip, then +/- perpendicular.
+                        ImVec2 base(tip.x - dx * hl, tip.y - dy * hl);
+                        ImVec2 l(base.x - (-dy) * hw, base.y - (dx) * hw);
+                        ImVec2 r(base.x + (-dy) * hw, base.y + (dx) * hw);
+                        vdl->AddTriangleFilled(tip, l, r, acc);
+                    };
+                    arrowHead(tipP,  nsx,  nsy);
+                    arrowHead(tipN, -nsx, -nsy);
+                    // Hub at the centroid.
+                    vdl->AddCircleFilled(cSp, (dragging ? 4.0f : 3.0f) * sc, acc);
+                    vdl->AddCircle(cSp, (dragging ? 7.0f : 5.0f) * sc, accS, 0, 1.5f * sc);
+
+                    // Live readout chip near the cursor while dragging.
+                    if (dragging && s_pp.haveReadout) {
+                        char buf[96];
+                        // Title-case the param for display (depth -> "Depth").
+                        std::string label = s_pp.param.empty() ? std::string("Value") : s_pp.param;
+                        if (!label.empty()) label[0] = (char)std::toupper((unsigned char)label[0]);
+                        std::snprintf(buf, sizeof(buf), "%s %.1f mm", label.c_str(), s_pp.newValue);
+                        std::string txt = buf;
+                        if (s_pp.clamped) txt += "  (min)";
+                        ImVec2 ts2 = ImGui::CalcTextSize(txt.c_str());
+                        float padX = 8.0f * sc, padY = 4.0f * sc;
+                        ImVec2 q0(io.MousePos.x + 16.0f * sc, io.MousePos.y + 16.0f * sc);
+                        ImVec2 q1(q0.x + ts2.x + padX * 2, q0.y + ts2.y + padY * 2);
+                        // keep inside the viewport rect
+                        if (q1.x > vr1.x - 4) { float w = q1.x - q0.x; q1.x = vr1.x - 4; q0.x = q1.x - w; }
+                        if (q1.y > vr1.y - 4) { float h = q1.y - q0.y; q1.y = vr1.y - 4; q0.y = q1.y - h; }
+                        vdl->AddRectFilled(q0, q1, overlayBg, 4.0f * sc);
+                        ImU32 chipBord = s_pp.clamped
+                            ? ImGui::ColorConvertFloat4ToU32(ImVec4(0.90f, 0.55f, 0.25f, 1.0f))
+                            : acc;
+                        vdl->AddRect(q0, q1, chipBord, 4.0f * sc);
+                        vdl->AddText(ImVec2(q0.x + padX, q0.y + padY), overlayTxt, txt.c_str());
+                    } else if (!dragging) {
+                        // Hint tooltip when hovering the handle (not dragging).
+                        ImVec2 mp = io.MousePos;
+                        float dxh = mp.x - cSp.x, dyh = mp.y - cSp.y;
+                        float perp  = std::fabs(dxh * (-nsy) + dyh * nsx);
+                        float along = std::fabs(dxh * nsx + dyh * nsy);
+                        float armLenPx = 46.0f * ui::uiScale;
+                        if (perp <= 10.0f * sc && along <= armLenPx + 10.0f * sc)
+                            ImGui::SetTooltip("Drag to push/pull this face");
+                    }
+                }
+            }
         }
         // C25 W3-J: apply ground-shadow visibility (last call wins; app.cpp may set it per-frame
         // before viewport_panel runs — the ordering means this value wins for the rendered frame,

@@ -44,6 +44,27 @@ struct OpsResponse {
     nlohmann::json owner_map;        // W1-B: raw "owner_map" object when present (else null)
 };
 
+// Instant3D push-pull result (doc_push_pull). Carries the push-pull verdict + readout fields on
+// TOP of an embedded OpsResponse (the revision/tree/tess/owner_map block, present only when the
+// face is draggable). When draggable==false NO doc mutation happened; `reason` explains why.
+struct PushPullResult {
+    bool        ok = false;          // transport/RPC succeeded (false => err in error_message)
+    bool        draggable = false;   // the picked face mapped to a single drivable param
+    bool        committed = false;   // this call pushed one undo entry (commit=true)
+    bool        clamped = false;     // the new value was clamped to the engine's min dimension
+    std::string reason;              // non-draggable reason (draggable==false)
+    std::string feature_id;          // owning feature id (when known)
+    std::string feature_type;        // box | extrude | cylinder | hole | plane | ...
+    std::string param;               // driven param name (length/width/height/depth/radius/...)
+    std::string axis;                // x|y|z|radial|axial|normal|n (informational)
+    double      old_value = 0.0;
+    double      new_value = 0.0;
+    double      distance = 0.0;      // the signed mm distance applied (echoed back)
+    std::string error_code;          // transport/rpc error code (empty on success)
+    std::string error_message;       // human-readable error
+    OpsResponse ops;                 // embedded ops-response (valid when draggable==true)
+};
+
 class DocMirror {
 public:
     // Listener called after every mutation that succeeds (on the calling thread).
@@ -122,6 +143,19 @@ public:
     // Undo / redo the most recent batch. Return the ops-response (same shape as applyOps).
     OpsResponse undo(WorkerClient& w);
     OpsResponse redo(WorkerClient& w);
+
+    // Instant3D push-pull: drag a face of `body_id` (1-based PickHit body) whose picked FACE is
+    // `topo_id` (1-based TopExp face index) by `distance` mm SIGNED along the face outward normal.
+    // `commit` false = transient preview (no undo entry); true = exactly one undo entry on release.
+    // The host's live-drag envelope is: doc_checkpoint on press, then per sample doc_revert +
+    // pushPull(commit=false, cumulative) so previews never compound, and on release doc_revert +
+    // pushPull(commit=true, final). When the response is draggable, the embedded OpsResponse
+    // (result.ops) updates the mirror EXACTLY like applyOps (revision/tree/owner_map refreshed,
+    // listener fired) and result.ops.aicm_path drives loadDocMesh. When NOT draggable the document
+    // is unchanged and result.reason explains why. A longer timeout is used because the first drag
+    // sample triggers a full rebuild.
+    PushPullResult pushPull(WorkerClient& w, uint32_t body_id, uint32_t topo_id,
+                            double distance, bool commit);
 
     // C37-F: Checkpoint / revert helpers for the PropertyManager cancel path.
     // checkpoint() issues doc_checkpoint and returns the opaque checkpoint id string (empty on

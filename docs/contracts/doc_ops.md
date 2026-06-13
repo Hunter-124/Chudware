@@ -94,10 +94,38 @@ Ops that create objects may be referenced by later ops **in the same batch** as 
 
 Geometry helpers (defined now; implemented M2 — same envelope, expand to entity edits server-side):
 `sketch_trim {sketch, entity, at:[x,y]}` · `sketch_extend {sketch, entity, end}` ·
-`sketch_offset {sketch, entities:[ids], distance, side}` ·
-`sketch_convert {sketch, edges:[Selector]}` (project model edges) ·
-`sketch_mirror_entities {sketch, entities:[ids], about: line id}` ·
-`sketch_pattern_entities {sketch, entities:[ids], kind: linear|circular, …dims}`
+`sketch_offset {sketch, entities:[ids], distance, side}`
+
+**Sketch mirror / pattern / convert (C53 — reflect / array / project the selection):**
+
+| op | fields |
+|---|---|
+| `sketch_mirror_entities` | `sketch`, `entities:[id…]` (line/circle/arc), `line` (construction-line entity id = mirror axis) |
+| `sketch_pattern_entities` | `sketch`, `mode:"linear"\|"circular"`, `entities:[id…]` (line/circle/arc), + per-mode dims |
+| `sketch_convert` | `sketch`, `refs:[Ref…]` where each Ref is `{datum:"front"\|"top"\|"right"}` or `{kind:"face"\|"edge", selector}` (same Ref shape as `sketch_project_ref`) |
+
+- **`sketch_mirror_entities`** reflects each selected entity across the mirror line and appends the
+  copies, then adds relations that keep each pair mirrored: per endpoint-pair `symmetric` (refs
+  `[orig.handle, copy.handle, line]`) — `p1`/`p2` for a line, `center` for a circle, `center`/`start`/
+  `end` for an arc — plus an `equal` (radius) for circles/arcs. Arc copies flip orientation (`ccw`).
+- **`sketch_pattern_entities`** (`mode:"linear"`) takes `dir:[dx,dy]` (normalized internally), integer
+  `count>=2`, numeric `spacing`; (`mode:"circular"`) takes `center:[x,y]`, integer `count>=2`, numeric
+  `angle`, optional `equal_spacing:bool`. `equal_spacing:true` shares `angle` equally across the ring
+  (`step = angle/count`, e.g. `360` → full ring); otherwise `angle` is the step BETWEEN consecutive
+  instances. It appends `count-1` PLAIN copies (no per-instance relations — a SolidWorks geometry
+  pattern); under-defined like fresh geometry.
+- **`sketch_convert`** projects each Ref onto the sketch plane via the same math as `sketch_project_ref`
+  (planes/planar faces → intersection line; linear edge → line or point; circular edge with axis ∥
+  the sketch normal → circle) and appends it as a real sketch entity pinned with a whole-entity `fix`
+  relation (reference geometry tracks the model).
+
+All three record the FIRST new entity under `$<index>` and any further new entities under
+`$<index>#1`, `$<index>#2`, … (the flat id_map scheme `sketch_offset`/`sketch_trim` use). Supported
+entity types for mirror/pattern are **line, circle, arc**; any other selected type raises
+`unsupported_entity`. Empty/zero-length `entities`/`refs`, a non-line mirror `line`, `count<2`, or a
+zero-length `dir` raise `invalid_op`. A reference that cannot be projected raises `convert_failed` (or
+the `unsupported_ref` it bubbles up). Like all op errors these reject the whole batch with no state
+change (§2).
 
 **Sketch fillet / chamfer (round/bevel the corner where two LINE segments meet):**
 
@@ -143,10 +171,12 @@ detail.reason}` · `dependency_exists {detail.dependents}` · `eq_in_use {detail
 `io_error` · `unsupported` · `internal`
 
 Sketch-geometry op codes (all carry `{detail.index, detail.reason}`): `unsupported_entity`
-(sketch_trim/extend/offset/fillet/chamfer hit a non-supported entity type) · `extend_no_target`
-(sketch_extend found nothing ahead) · `fillet_failed` / `chamfer_failed` (degenerate corner:
-parallel, no corner, or radius/setback too large). Like all op errors these reject the whole batch
-with no state change (§2).
+(sketch_trim/extend/offset/fillet/chamfer/mirror/pattern hit a non-supported entity type) ·
+`extend_no_target` (sketch_extend found nothing ahead) · `fillet_failed` / `chamfer_failed`
+(degenerate corner: parallel, no corner, or radius/setback too large) · `mirror_failed`
+(degenerate mirror line) · `convert_failed` (sketch_convert could not project a ref) ·
+`unsupported_ref` (sketch_convert/project: parallel plane or unprojectable edge). Like all op errors
+these reject the whole batch with no state change (§2).
 
 `stale_revision` is the optimistic-concurrency signal: the GUI must resync (`doc_tree`) and replay
 user intent. Rebuild failures are NOT errors (see §2.3).

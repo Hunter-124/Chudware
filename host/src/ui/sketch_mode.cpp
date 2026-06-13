@@ -923,6 +923,14 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     // C52: line-line corner fillet / chamfer (radius/distance persist across invocations).
     if (cmdId == "sk_fillet")          { resetTool(); tool_ = SketchTool::SkFillet;  corner1Id_.clear(); return true; }
     if (cmdId == "sk_chamfer")         { resetTool(); tool_ = SketchTool::SkChamfer; corner1Id_.clear(); return true; }
+    // C53: mirror / linear+circular pattern / convert (numeric dims persist across invocations).
+    if (cmdId == "sk_mirror")          { resetTool(); tool_ = SketchTool::Mirror;
+                                         mpStage_ = 0; mpSel_.clear();                     return true; }
+    if (cmdId == "sk_lin_pattern")     { resetTool(); tool_ = SketchTool::LinPattern;
+                                         mpStage_ = 0; mpSel_.clear();                     return true; }
+    if (cmdId == "sk_circ_pattern")    { resetTool(); tool_ = SketchTool::CircPattern;
+                                         mpStage_ = 0; mpSel_.clear();                     return true; }
+    if (cmdId == "sk_convert_ent")     { resetTool(); tool_ = SketchTool::Convert;         return true; }
     // C42: remaining draw tools.
     if (cmdId == "sk_arc_3pt")         { resetTool(); tool_ = SketchTool::Arc3pt;         return true; }
     if (cmdId == "sk_polygon")         { resetTool(); tool_ = SketchTool::Polygon;        return true; }
@@ -991,6 +999,10 @@ const char* SketchMode::activeToolCmd() const {
         case SketchTool::Offset:          return "sk_offset_ent";
         case SketchTool::SkFillet:        return "sk_fillet";
         case SketchTool::SkChamfer:       return "sk_chamfer";
+        case SketchTool::Mirror:          return "sk_mirror";
+        case SketchTool::LinPattern:      return "sk_lin_pattern";
+        case SketchTool::CircPattern:     return "sk_circ_pattern";
+        case SketchTool::Convert:         return "sk_convert_ent";
         case SketchTool::Arc3pt:          return "sk_arc_3pt";
         case SketchTool::Polygon:         return "sk_polygon";
         case SketchTool::RectCenter:      return "sk_rect_center";
@@ -1016,6 +1028,7 @@ void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSn
                                relPopupOpen_ = false; relIds_.clear();   // C42: relation popup too
                                offsetStage_ = 0; offsetChain_.clear(); offsetFocusInput_ = false;
                                corner1Id_.clear();   // C52: drop a held first corner pick (keep radius/distance)
+                               mpStage_ = 0; mpSel_.clear();   // C53: drop mirror/pattern selection (keep dims)
                                // C37-D: clear the Smart Dimension state machine.
                                dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr;
                                dimType_.clear(); dimAxis_.clear(); dimEditCid_.clear();
@@ -1051,6 +1064,67 @@ void SketchMode::applyCornerOp(AppState& st, const std::string& line2) {
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     resolve(st);              // refresh entities/statuses (same path as trim/extend/offset)
     corner1Id_.clear();       // ready for the next corner; stay in the tool
+}
+
+// C53: apply sketch_mirror_entities (entities=mpSel_, line=lineId) and refresh. On engine OpError
+// the message is toasted and the selection is reset (SolidWorks lets you start a fresh mirror).
+void SketchMode::applyMirrorOp(AppState& st, const std::string& lineId) {
+    nlohmann::json eids = nlohmann::json::array();
+    for (const auto& id : mpSel_) eids.push_back(id);
+    nlohmann::json op = {{"op", "sketch_mirror_entities"}, {"sketch", fid_},
+                         {"entities", eids}, {"line", lineId}};
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (!r.ok) {
+        std::string msg = r.error_message.empty() ? std::string("Mirror failed") : r.error_message;
+        st.addLog("[sketch] mirror failed: " + msg);
+        st.toast(ui::ToastLevel::Warn, msg);
+    } else {
+        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        resolve(st);
+    }
+    mpStage_ = 0; mpSel_.clear();   // stay in the tool, ready for another mirror
+}
+
+// C53: apply sketch_pattern_entities (linear or circular) for the current selection + dims.
+void SketchMode::applyPatternOp(AppState& st, bool circular) {
+    nlohmann::json eids = nlohmann::json::array();
+    for (const auto& id : mpSel_) eids.push_back(id);
+    nlohmann::json op = {{"op", "sketch_pattern_entities"}, {"sketch", fid_},
+                         {"mode", circular ? "circular" : "linear"},
+                         {"entities", eids}, {"count", patternCount_}};
+    if (circular) {
+        op["center"] = nlohmann::json::array({patternCenterU_, patternCenterV_});
+        op["angle"] = patternAngle_;
+        op["equal_spacing"] = patternEqualSpacing_;
+    } else {
+        op["dir"] = nlohmann::json::array({patternDirU_, patternDirV_});
+        op["spacing"] = patternSpacing_;
+    }
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (!r.ok) {
+        std::string msg = r.error_message.empty() ? std::string("Pattern failed") : r.error_message;
+        st.addLog("[sketch] pattern failed: " + msg);
+        st.toast(ui::ToastLevel::Warn, msg);
+    } else {
+        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        resolve(st);
+    }
+    mpStage_ = 0; mpSel_.clear();   // stay in the tool, ready for another pattern
+}
+
+// C53: apply one sketch_convert op for a model edge/face ref (a {kind, selector} or {datum} object).
+void SketchMode::applyConvertRef(AppState& st, const nlohmann::json& ref) {
+    nlohmann::json op = {{"op", "sketch_convert"}, {"sketch", fid_},
+                         {"refs", nlohmann::json::array({ref})}};
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (!r.ok) {
+        std::string msg = r.error_message.empty() ? std::string("Convert failed") : r.error_message;
+        st.addLog("[sketch] convert failed: " + msg);
+        st.toast(ui::ToastLevel::Warn, msg);
+        return;
+    }
+    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    resolve(st);   // the projected entity appears; stay armed for more converts
 }
 
 void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfer* infer) const {
@@ -4058,7 +4132,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // tool stays active. Esc exits.
     bool editTool = (tool_ == SketchTool::Trim || tool_ == SketchTool::Extend ||
                      tool_ == SketchTool::Offset ||
-                     tool_ == SketchTool::SkFillet || tool_ == SketchTool::SkChamfer);
+                     tool_ == SketchTool::SkFillet || tool_ == SketchTool::SkChamfer ||
+                     tool_ == SketchTool::Mirror || tool_ == SketchTool::LinPattern ||
+                     tool_ == SketchTool::CircPattern);
     if (editTool) {
         int hovered = imgHovered ? hitTestEntity(io.MousePos) : -1;
 
@@ -4303,10 +4379,124 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 else cancelTool();
             }
         }
+
+        // ----- C53 MIRROR / LINEAR PATTERN / CIRCULAR PATTERN: collect an entity selection -----
+        // Stage 0 collects line/circle/arc entities (click toggles, like the Offset chain). Enter
+        // advances: Mirror -> stage 1 pick a construction line (the mirror axis); Circular -> stage 1
+        // pick the center point; Linear -> stage 1 the numeric panel. The op is applied from the
+        // numeric panel / line pick (drawn after the interaction pass). Esc backs out a stage.
+        else if (tool_ == SketchTool::Mirror || tool_ == SketchTool::LinPattern ||
+                 tool_ == SketchTool::CircPattern) {
+            const ImU32 ac = col(pal.accent, 0.95f);
+            const ImU32 hc = col(pal.hoverHighlight, 0.9f);
+            auto inSel = [&](const std::string& id) {
+                return std::find(mpSel_.begin(), mpSel_.end(), id) != mpSel_.end();
+            };
+            auto strokeEnt = [&](const SketchEntity& e, ImU32 c, float th) {
+                if (e.type == "line")
+                    dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), c, th);
+                else if (e.type == "circle" || e.type == "arc") {
+                    float a0 = 0, a1 = 6.2831853f;
+                    if (e.type == "arc") {
+                        a0 = e.start * 3.14159265f / 180.0f; a1 = e.end * 3.14159265f / 180.0f;
+                        if (!e.ccw) { float t = a0; a0 = a1; a1 = t; }
+                        if (a1 < a0) a1 += 6.2831853f;
+                    }
+                    ImVec2 prev; int seg = 64;
+                    for (int i = 0; i <= seg; ++i) {
+                        float a = a0 + (a1 - a0) * (i / (float)seg);
+                        ImVec2 p = uvToScreen(e.center[0] + e.radius * std::cos(a),
+                                              e.center[1] + e.radius * std::sin(a));
+                        if (i) dl->AddLine(prev, p, c, th); prev = p;
+                    }
+                }
+            };
+            // Tint the current selection.
+            for (const auto& e : ents_) if (inSel(e.id)) strokeEnt(e, ac, 3.5f);
+
+            if (mpStage_ == 0) {
+                if (hovered >= 0 && !inSel(ents_[hovered].id)) strokeEnt(ents_[hovered], hc, 3.0f);
+                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hovered >= 0) {
+                    const SketchEntity& e = ents_[hovered];
+                    if (e.type != "line" && e.type != "circle" && e.type != "arc") {
+                        st.toast(ui::ToastLevel::Info,
+                                 "Mirror/Pattern works on lines, circles, and arcs — not " + e.type);
+                    } else {
+                        auto it = std::find(mpSel_.begin(), mpSel_.end(), e.id);
+                        if (it != mpSel_.end()) mpSel_.erase(it); else mpSel_.push_back(e.id);
+                    }
+                }
+                if (!mpSel_.empty() && ImGui::IsKeyPressed(ImGuiKey_Enter)) mpStage_ = 1;
+            } else if (tool_ == SketchTool::Mirror && mpStage_ == 1) {
+                // Pick the mirror line (must be a line entity; a construction line is the norm).
+                if (hovered >= 0 && ents_[hovered].type == "line" && !inSel(ents_[hovered].id))
+                    strokeEnt(ents_[hovered], hc, 3.0f);
+                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hovered >= 0) {
+                    const SketchEntity& e = ents_[hovered];
+                    if (e.type != "line")
+                        st.toast(ui::ToastLevel::Info, "Pick a line as the mirror axis, not " + e.type);
+                    else if (inSel(e.id))
+                        st.toast(ui::ToastLevel::Info, "The mirror line can't be one of the mirrored entities");
+                    else
+                        applyMirrorOp(st, e.id);   // build + apply, reset selection, stay armed
+                }
+            } else if (tool_ == SketchTool::CircPattern && mpStage_ == 1) {
+                // Pick the center point: snap to a vertex/center if near one, else the raw cursor.
+                std::string snapH; float su = mu, sv = mv;
+                snapPoint(su, sv, snapH);
+                dl->AddCircle(uvToScreen(su, sv), 5.0f, col(pal.accent, 0.95f), 16, 2.0f);
+                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    patternCenterU_ = su; patternCenterV_ = sv;
+                    mpStage_ = 2;   // advance to the numeric panel
+                }
+            }
+            // Visualize the chosen circular center while in the panel stage.
+            if (tool_ == SketchTool::CircPattern && mpStage_ == 2)
+                dl->AddCircle(uvToScreen(patternCenterU_, patternCenterV_), 5.0f,
+                              col(pal.accent, 0.95f), 16, 2.0f);
+
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                escHandled = true;
+                if (mpStage_ > 0) { mpStage_ = (tool_ == SketchTool::CircPattern) ? mpStage_ - 1 : 0; }
+                else cancelTool();
+            }
+        }
+    }
+
+    // ---- C53 CONVERT ENTITIES: pick MODEL edges/faces in the viewport, project each into ----
+    // ---- the sketch (sketch_convert). Like Smart Dim's external-ref pick, but it applies the ----
+    // ---- op immediately and stays armed for more converts. Esc exits the tool. ----
+    if (tool_ == SketchTool::Convert) {
+        render::PickHit extHit{};
+        if (imgHovered && st.hasDocMesh && st.idPass) {
+            int px = (int)(io.MousePos.x - imgMin.x), py = (int)(io.MousePos.y - imgMin.y);
+            render::PickHit h = st.idPass->pickFinal(px, py, vw, vh);
+            if (h.valid() && (h.kind == render::PickKind::Edge || h.kind == render::PickKind::Face))
+                extHit = h;
+        }
+        st.hover = extHit;   // standard 3D hover highlight on the pickable edge/face
+        if (extHit.valid() && imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            std::string perr;
+            std::string selStr = st.docMirror.resolvePick(
+                st.worker, extHit.body_id,
+                extHit.kind == render::PickKind::Edge ? "edge" : "face", extHit.topo_id, perr);
+            nlohmann::json selJs;
+            if (!selStr.empty()) { try { selJs = nlohmann::json::parse(selStr); } catch (...) {} }
+            if (selJs.is_object()) {
+                applyConvertRef(st, nlohmann::json{
+                    {"kind", extHit.kind == render::PickKind::Edge ? "edge" : "face"},
+                    {"selector", selJs}});
+            } else {
+                st.toast(ui::ToastLevel::Warn, "Can't convert that geometry" +
+                         (perr.empty() ? std::string() : ": " + perr));
+            }
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { escHandled = true; cancelTool(); }
     }
 
     // ---- drawing tools: rubber-band preview + click handling ----
-    if (!editTool && tool_ != SketchTool::None && tool_ != SketchTool::SmartDim) {
+    if (!editTool && tool_ != SketchTool::None && tool_ != SketchTool::SmartDim &&
+        tool_ != SketchTool::Convert) {
         // Snap the live cursor for preview + inference glyphs (C49: point snap + midpoint/rim
         // snap + alignment inference, see snapPoint).
         float su = mu, sv = mv; std::string snapH;
@@ -5445,6 +5635,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          tool_ == SketchTool::Offset ? "Offset" :
                          tool_ == SketchTool::SkFillet ? "Sketch Fillet" :
                          tool_ == SketchTool::SkChamfer ? "Sketch Chamfer" :
+                         tool_ == SketchTool::Mirror ? "Mirror Entities" :
+                         tool_ == SketchTool::LinPattern ? "Linear Pattern" :
+                         tool_ == SketchTool::CircPattern ? "Circular Pattern" :
+                         tool_ == SketchTool::Convert ? "Convert Entities" :
                          tool_ == SketchTool::Arc3pt ? "3 Point Arc" :
                          tool_ == SketchTool::Polygon ? "Polygon" :
                          tool_ == SketchTool::RectCenter ? "Center Rectangle" :
@@ -5517,6 +5711,18 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                                   : "pick the second line (distance %.3g mm)", skChamferDist_);
                 step = cb; break;
             }
+            case SketchTool::Mirror:
+                step = mpStage_ == 0 ? "click entities to mirror, then Enter"
+                                     : "click the mirror line (construction line)"; break;
+            case SketchTool::LinPattern:
+                step = mpStage_ == 0 ? "click entities to pattern, then Enter"
+                                     : "set count / spacing / direction, then Apply"; break;
+            case SketchTool::CircPattern:
+                step = mpStage_ == 0 ? "click entities to pattern, then Enter"
+                     : mpStage_ == 1 ? "click the pattern center point"
+                                     : "set count / angle, then Apply"; break;
+            case SketchTool::Convert:
+                step = "click a model edge or face to project into the sketch"; break;
             case SketchTool::Arc3pt:
                 step = n == 0 ? "click arc start" : n == 1 ? "click arc end"
                      : "click a point on the arc"; break;
@@ -5762,6 +5968,43 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             float* val = fillet ? &skFilletRadius_ : &skChamferDist_;
             ImGui::InputFloat(fillet ? "##skfilletr" : "##skchamferd", val, 1.0f, 5.0f, "%.3f");
             if (*val < 0.001f) *val = 0.001f;   // engine requires a strictly positive value
+        }
+        ImGui::End();
+    }
+
+    // ---- C53: Linear / Circular Pattern numeric panel (count + spacing/angle, then Apply) ----
+    // Shown once the entity selection is locked (Enter): Linear at stage 1, Circular at stage 2
+    // (after the center pick). The dims persist across invocations. Apply builds the op; Cancel
+    // backs out to re-pick. The viewport selection is frozen while the panel is up.
+    bool linPanel  = (tool_ == SketchTool::LinPattern  && mpStage_ == 1);
+    bool circPanel = (tool_ == SketchTool::CircPattern && mpStage_ == 2);
+    if (linPanel || circPanel) {
+        ImGui::SetNextWindowPos(ImVec2(imgMin.x + 12, imgMin.y + 52), ImGuiCond_Appearing);
+        ImGui::SetNextWindowBgAlpha(0.98f);
+        if (ImGui::Begin(linPanel ? "##SketchLinPattern" : "##SketchCircPattern", nullptr,
+                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::Text(linPanel ? "Linear Pattern (%d entities)" : "Circular Pattern (%d entities)",
+                        (int)mpSel_.size());
+            ImGui::Separator();
+            ImGui::SetNextItemWidth(120);
+            ImGui::InputInt("Count", &patternCount_);
+            if (patternCount_ < 2) patternCount_ = 2;   // engine requires count >= 2
+            if (linPanel) {
+                ImGui::SetNextItemWidth(120);
+                ImGui::InputFloat("Spacing (mm)", &patternSpacing_, 1.0f, 10.0f, "%.3f");
+                ImGui::SetNextItemWidth(180);
+                ImGui::InputFloat2("Direction (u,v)", &patternDirU_, "%.2f");
+            } else {
+                ImGui::SetNextItemWidth(120);
+                ImGui::InputFloat(patternEqualSpacing_ ? "Total angle (deg)" : "Step angle (deg)",
+                                  &patternAngle_, 1.0f, 15.0f, "%.2f");
+                ImGui::Checkbox("Equal spacing (full span)", &patternEqualSpacing_);
+            }
+            ImGui::Separator();
+            if (ImGui::Button("Apply")) applyPatternOp(st, circPanel);
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) { mpStage_ = circPanel ? 1 : 0; }
         }
         ImGui::End();
     }

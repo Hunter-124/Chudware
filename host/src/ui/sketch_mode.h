@@ -39,6 +39,9 @@ enum class SketchTool {
     Trim, Extend, Offset,
     // C52 sketch corner tools (engine ops sketch_fillet / sketch_chamfer; line-line corners):
     SkFillet, SkChamfer,
+    // C53 sketch mirror / pattern / convert (engine ops sketch_mirror_entities /
+    // sketch_pattern_entities / sketch_convert):
+    Mirror, LinPattern, CircPattern, Convert,
     // C42: remaining draw tools (3-pt arc, polygon, center rect, point, ellipse, spline):
     Arc3pt, Polygon, RectCenter, Point, Ellipse, Spline
 };
@@ -519,6 +522,29 @@ private:
     // Apply one sketch_fillet/chamfer op (e1=corner1Id_, e2=line2) and refresh. On engine OpError
     // the message is toasted, the sketch is untouched, and corner1Id_ is reset (pick a fresh pair).
     void applyCornerOp(AppState& st, const std::string& line2);
+
+    // ---- C53 Mirror / Linear Pattern / Circular Pattern / Convert state ----
+    // Mirror + both patterns share an entity-selection stage (mpSel_, click to toggle, like the
+    // Offset chain). Mirror then picks a construction line; Linear/Circular collect numeric dims in
+    // an inline panel (count + spacing/angle) — Circular also picks a center point. Convert picks
+    // MODEL edges/faces in the viewport and projects each via sketch_convert (no selection stage).
+    std::vector<std::string> mpSel_;   // entities selected for mirror/pattern (in pick order)
+    // Stage machine (per active tool):
+    //   Mirror:  0=pick entities (Enter advances), 1=pick the mirror construction line.
+    //   LinPattern:  0=pick entities (Enter advances), 1=set count/spacing/dir in the panel.
+    //   CircPattern: 0=pick entities (Enter advances), 1=pick the center point, 2=panel.
+    int mpStage_ = 0;
+    int patternCount_ = 4;             // shared instance count (persisted)
+    float patternSpacing_ = 25.0f;     // linear: spacing (mm)
+    float patternAngle_ = 60.0f;       // circular: angle (deg) — total span when equalSpacing_
+    bool patternEqualSpacing_ = true;  // circular: angle is the full span shared equally
+    float patternDirU_ = 1.0f, patternDirV_ = 0.0f;   // linear direction (sketch u,v)
+    float patternCenterU_ = 0.0f, patternCenterV_ = 0.0f;  // circular center (sketch u,v)
+    // Apply the built sketch_mirror_entities / sketch_pattern_entities op + refresh (toast on error).
+    void applyMirrorOp(AppState& st, const std::string& lineId);
+    void applyPatternOp(AppState& st, bool circular);
+    // Apply one sketch_convert op for a model edge/face ref (already resolved to a selector JSON).
+    void applyConvertRef(AppState& st, const nlohmann::json& ref);
 
     // ---- C37-D Smart Dimension state machine ----
     // Pick buffer (separate from toolUV_): points/entities collected for the next dimension.

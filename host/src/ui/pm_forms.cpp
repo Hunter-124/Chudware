@@ -253,13 +253,19 @@ static const std::vector<PMFormDef>& forms() {
         // --- linear_pattern ---  dir1(+count/spacing), optional dir2, features[]
         //   Engine (pattern.py compile_linear_pattern): lays down a count1×count2 grid of the seed
         //   features' tool bodies (re-applying each boolean). count2=1 disables direction 2.
+        //   W2: an optional edge/planar-face Well shares each direction's ref key with the DatumRef.
+        //   Both emit refs[dir]; the Well is LATER in the form so a pick OVERRIDES the global-axis
+        //   datum (last-wins in buildOpFeature); empty Well => the axis combo's datum is used. The
+        //   engine (_resolve_direction) already resolves a model edge / planar face to a direction.
         { "linear_pattern", "Linear Pattern", "linear_pattern", {
             DatumRef ("dir1",     "Direction 1",  "Direction 1",
                       "axis.x|axis.y|axis.z", "X axis|Y axis|Z axis"),
+            Well     ("dir1",     "…or pick an edge", "Direction 1", K_FACEEDGE, false),
             Int      ("count1",   "Instances",    "Direction 1", 3),
             Dim      ("spacing1", "Spacing",      "Direction 1", 20.0),
             DatumRef ("dir2",     "Direction 2",  "Direction 2",
                       "axis.y|axis.x|axis.z", "Y axis|X axis|Z axis"),
+            Well     ("dir2",     "…or pick an edge", "Direction 2", K_FACEEDGE, false),
             Int      ("count2",   "Instances",    "Direction 2", 1),
             Dim      ("spacing2", "Spacing",      "Direction 2", 20.0),
             FeatWell ("features", "Features to Pattern", "Features to Pattern"),
@@ -270,6 +276,7 @@ static const std::vector<PMFormDef>& forms() {
         { "circular_pattern", "Circular Pattern", "circular_pattern", {
             DatumRef ("axis",     "Pattern Axis", "Parameters",
                       "axis.z|axis.x|axis.y", "Z axis|X axis|Y axis"),
+            Well     ("axis",     "…or pick edge/cyl face", "Parameters", K_FACEEDGE, false),
             Int      ("count",    "Instances",    "Parameters", 4),
             Angle    ("angle",    "Angle",        "Parameters", 360.0),
             Check    ("equal_spacing", "Equal spacing", "Parameters", true),

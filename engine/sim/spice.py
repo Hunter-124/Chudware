@@ -738,10 +738,24 @@ def netlist_to_spice_circuit(
 
         pin_order: list[str] = sim.get("pin_order", [])
 
+        # A sim.pin_order entry may be a pin NUMBER (matching the netlist's
+        # number-keyed pins, e.g. R "1"/"2") OR a pin NAME (e.g. op-amp
+        # "IN+"/"IN-"/"OUT").  Build a name->number map from the SymbolDef so a
+        # name entry resolves against the number-keyed netlist pins.
+        name_to_num: dict[str, str] = {}
+        _sdef = SYMBOLS.get(libid)
+        if _sdef:
+            for _p in _sdef.get("pins", []):
+                _nm, _num = _p.get("name"), _p.get("number")
+                if _nm is not None and _num is not None:
+                    name_to_num[str(_nm)] = str(_num)
+
         # Build ordered node list
         node_list: list[str] = []
         for pname in pin_order:
             net = pins.get(pname)
+            if net is None and pname in name_to_num:
+                net = pins.get(name_to_num[pname])      # pin_order gave a name
             if net is None:
                 warn_msgs.append(
                     f"{ref}: pin '{pname}' not found in netlist pins {list(pins.keys())}"

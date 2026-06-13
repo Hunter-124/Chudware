@@ -315,7 +315,7 @@ C1 OUT 0 1u
     rel_err = abs(mag_at_fc - expected_mag) / expected_mag
     _assert(rel_err < 0.05,
             f"-3dB at {x_f[closest_i]:.1f} Hz: |H|={mag_at_fc:.4f} "
-            f"(expected ≈{expected_mag:.4f}, rel err {rel_err:.1%})")
+            f"(expected ~{expected_mag:.4f}, rel err {rel_err:.1%})")
 
 
 # ---------------------------------------------------------------------------

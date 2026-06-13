@@ -433,8 +433,18 @@ def parse_spice_deck(text: str) -> tuple[dict, dict | None]:
 
     Returns (Circuit, study) where study follows sim.md §3 shape or None.
     Circuit follows sim.md §1 shape exactly.
+
+    ``.subckt`` definitions are collected and ``X`` instances are inlined (node-renamed) via
+    :mod:`engine.sim.subckt`; the built-in subckt library (op-amp, NE555) is always available.
     """
-    lines = _preprocess(text)
+    from engine.sim import subckt as _sub  # local import: subckt imports spice helpers
+
+    raw_lines = _preprocess(text)
+
+    # Pull out .subckt blocks; the remainder are top-level lines (incl. X instances).
+    deck_subckts, lines = _sub.collect_subckts(raw_lines)
+    subckts = _sub.builtin_subckts()
+    subckts.update(deck_subckts)  # deck definitions override built-ins of the same name
 
     devices: list[dict] = []
     models:  dict[str, dict] = {}
@@ -442,6 +452,7 @@ def parse_spice_deck(text: str) -> tuple[dict, dict | None]:
     analyses: list[dict] = []
     probes:   list[str]  = []
     options:  dict = {}
+    x_lines:  list[str]  = []
 
     for line in lines:
         tokens = line.split()
@@ -497,10 +508,22 @@ def parse_spice_deck(text: str) -> tuple[dict, dict | None]:
         if first.startswith("."):
             continue  # unknown control card — skip
 
+        # ── X subcircuit instances (inlined after the loop) ────────────────
+        if tokens[0][0].upper() == "X":
+            x_lines.append(line)
+            continue
+
         # ── element cards ──────────────────────────────────────────────────
         dev = _parse_element(tokens)
         if dev is not None:
             devices.append(dev)
+
+    # Inline all X instances (built-in + deck subckts); merge any models the built-ins need.
+    if x_lines:
+        sub_devs, _warn = _sub.expand_instances(x_lines, subckts, _parse_element)
+        devices.extend(sub_devs)
+        for mname, mparams in _sub.BUILTIN_MODELS.items():
+            models.setdefault(mname, dict(mparams))
 
     circuit = _make_circuit(devices, models, global_params)
 
@@ -672,6 +695,7 @@ def netlist_to_spice_circuit(
     sim_params is folded into Circuit["params"].
     """
     from engine.ecad.library.starter import SYMBOLS  # local import; avoid cycle
+    from engine.sim import subckt as _sub             # local import; avoid cycle
 
     warn_msgs: list[str] = []
     devices:   list[dict] = []
@@ -679,6 +703,9 @@ def netlist_to_spice_circuit(
     params:    dict = {"TEMP": 27}
     if sim_params:
         params.update(sim_params)
+
+    subckts = _sub.builtin_subckts()
+    x_lines: list[str] = []  # X-instance cards to expand after the component loop
 
     for comp in netlist.get("components", []):
         ref    = comp.get("ref", "?")
@@ -706,11 +733,7 @@ def netlist_to_spice_circuit(
         model_name: str = sim.get("model", "")
 
         # Power / ground symbols — not real devices, skip silently
-        if model_name in ("GND", "VCC", "+5V", "+3V3", "-5V", "SUBCKT"):
-            if model_name != "SUBCKT":
-                continue
-            # SUBCKT devices kept but flagged
-            warn_msgs.append(f"{ref} ({libid}): SUBCKT model not yet simulated — skipped")
+        if model_name in ("GND", "VCC", "+5V", "+3V3", "-5V"):
             continue
 
         pin_order: list[str] = sim.get("pin_order", [])
@@ -732,6 +755,21 @@ def netlist_to_spice_circuit(
             node_list = [_gnd(net) for net in
                          (pins[k] for k in sorted(pins.keys()))]
 
+        # ── subcircuit-backed parts → emit an X instance, expand later ──────
+        if model_name in ("SUBCKT", "OPAMP"):
+            sub_name = _resolve_subckt_name(model_name, sim)
+            sub_def = subckts.get(sub_name.upper())
+            if sub_def is None:
+                warn_msgs.append(f"{ref} ({libid}): subckt '{sub_name}' not built-in — skipped")
+                continue
+            # Map this part's ordered nodes onto the subckt's ports, dropping extra (supply) pins
+            # the behavioural model does not use (e.g. OPAMP V+/V- on the 5-pin KiCad symbol).
+            inst_nodes = _map_subckt_nodes(ref, model_name, node_list, sub_def.ports, warn_msgs)
+            if inst_nodes is None:
+                continue
+            x_lines.append(f"X{ref} {' '.join(inst_nodes)} {sub_def.name}")
+            continue
+
         # Parse value
         float_value: float | None = None
         if value:
@@ -747,8 +785,43 @@ def netlist_to_spice_circuit(
         dev = _dev(kind, ref, node_list, float_value, None, {})
         devices.append(dev)
 
+    # Inline X instances (built-in subckts) + pull in the models the built-ins need.
+    if x_lines:
+        sub_devs, sub_warn = _sub.expand_instances(x_lines, subckts, _parse_element)
+        devices.extend(sub_devs)
+        warn_msgs.extend(sub_warn)
+        for mname, mparams in _sub.BUILTIN_MODELS.items():
+            models.setdefault(mname, dict(mparams))
+
     circuit = _make_circuit(devices, models, params)
     return circuit, warn_msgs
+
+
+def _resolve_subckt_name(model_name: str, sim: dict) -> str:
+    """Pick the built-in subckt name for a SUBCKT/OPAMP-backed component."""
+    if model_name == "OPAMP":
+        return "OPAMP"
+    # SUBCKT: prefer the explicit sim["subckt"] (e.g. NE555), else the model name.
+    return str(sim.get("subckt") or model_name)
+
+
+def _map_subckt_nodes(
+    ref: str, model_name: str, node_list: list[str], ports: list[str], warn_msgs: list[str]
+) -> list[str] | None:
+    """Map a component's ordered nodes onto a subckt's ports.
+
+    Exact-length lists pass straight through. For the OPAMP case the 5-pin KiCad order
+    ``[IN+, IN-, V+, V-, OUT]`` is reduced to the 3-port behavioural model ``[in+, in-, out]`` by
+    dropping the V+/V- supply pins. Any other mismatch is a skip with a warning.
+    """
+    if len(node_list) == len(ports):
+        return node_list
+    if model_name == "OPAMP" and len(node_list) == 5 and len(ports) == 3:
+        return [node_list[0], node_list[1], node_list[4]]  # [IN+, IN-, OUT]
+    warn_msgs.append(
+        f"{ref}: {len(node_list)} nodes do not match subckt ports {ports} — skipped"
+    )
+    return None
 
 
 def _model_to_kind(model_name: str, ref: str) -> str:

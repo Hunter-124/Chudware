@@ -695,14 +695,69 @@ def _safe(v):
 # public entry point
 # =============================================================================
 
+def _default_probes(circuit: dict) -> list[str]:
+    """Default probe set when the study specifies none: V(node) for every non-ground node, plus
+    I(Vname) for every independent voltage source.
+
+    High value for callers (and the weak AI) that do not enumerate probes — every node voltage and
+    source current is emitted instead of an empty result. Ground aliases are excluded.
+    """
+    probes: list[str] = []
+    seen: set[str] = set()
+    grounds = {"0", "gnd", "GND"}
+    # Collect node names in a stable order: declared nodes first, then any device-only nodes.
+    nodes: list[str] = list(circuit.get("nodes", []))
+    for d in circuit.get("devices", []):
+        for nm in d.get("nodes", []):
+            if nm not in nodes:
+                nodes.append(nm)
+    for nm in nodes:
+        s = str(nm)
+        if s in grounds or s in seen:
+            continue
+        seen.add(s)
+        probes.append(f"V({s})")
+    for d in circuit.get("devices", []):
+        if d.get("kind") == "V":
+            probes.append(f"I({d.get('name')})")
+    return probes
+
+
 def simulate(circuit: dict, study: dict) -> dict:
     """Run the requested analyses on a Circuit dict; return sim.md §4 results."""
     t0 = time.perf_counter()
     options = dict(study.get("options", {}))
     probes = list(study.get("probes", []))
+    # Default-all-nodes output: when no probes are requested, emit every node voltage (+ source
+    # currents) so callers that omit probes still get a useful result. Callers that DO pass probes
+    # are unaffected.
+    if not probes:
+        probes = _default_probes(circuit)
+        if probes:
+            log_default = True
+        else:
+            log_default = False
+    else:
+        log_default = False
     log: list[str] = []
+    if log_default:
+        log.append(f"probes: none specified — defaulting to all {len(probes)} node/source outputs")
 
     result: dict = {"log": log, "convergence": {}}
+
+    analyses = list(study.get("analyses", []))
+    # A `.step` parameter sweep may be expressed either as a top-level study["step"] spec or as an
+    # analysis entry {"type":"step", ...}; it wraps the remaining (inner) analyses.
+    step_spec = study.get("step")
+    inner_analyses = analyses
+    if step_spec is None:
+        step_entries = [a for a in analyses if a.get("type") == "step"]
+        if step_entries:
+            step_spec = step_entries[0]
+            inner_analyses = [a for a in analyses if a.get("type") != "step"]
+
+    if step_spec is not None:
+        return _run_stepped(circuit, options, step_spec, inner_analyses, probes, log, t0)
 
     try:
         sim = _Sim(circuit, options)
@@ -712,10 +767,19 @@ def simulate(circuit: dict, study: dict) -> dict:
         result["ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
         return result
 
+    _run_analyses(sim, inner_analyses, probes, result, log)
+
+    result["ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+    return result
+
+
+def _run_analyses(sim: "_Sim", analyses: list, probes: list[str],
+                  result: dict, log: list) -> None:
+    """Execute each requested analysis on ``sim``, writing into ``result`` / ``result['convergence']``."""
     # Reset the probe-mna cache for this run.
     _MNA_CACHE.pop(id(sim), None)
 
-    for an in study.get("analyses", []):
+    for an in analyses:
         atype = an.get("type")
         try:
             if atype == "op":
@@ -751,5 +815,89 @@ def simulate(circuit: dict, study: dict) -> dict:
             log.append(f"{atype}: solver exception — {type(e).__name__}: {e}")
             result["convergence"][atype] = False
 
+
+def _step_values(spec: dict) -> list[float]:
+    """Resolve the swept values from a step spec: explicit ``values`` list or start/stop/step."""
+    vals = spec.get("values")
+    if vals is not None:
+        return [float(v) for v in vals]
+    start = float(spec.get("start", 0.0))
+    stop = float(spec.get("stop", 0.0))
+    step = float(spec.get("step", 0.0))
+    out: list[float] = []
+    if step == 0.0:
+        return [start]
+    n = int(round((stop - start) / step)) + 1
+    for i in range(max(n, 1)):
+        out.append(start + i * step)
+    return out
+
+
+def _apply_step_param(circuit: dict, param: str, value: float) -> bool:
+    """Set ``param`` to ``value`` on a *copy-safe* circuit dict in place.
+
+    ``param`` matches (in order): a device name (sets its ``value``); a ``.param`` /
+    ``params`` key (case-insensitive); otherwise no-op. Returns True if something was set.
+    """
+    hit = False
+    for d in circuit.get("devices", []):
+        if d.get("name") == param:
+            d["value"] = value
+            # Device value wins over any waveform DC for a stepped sweep.
+            hit = True
+    if hit:
+        return True
+    # Fall back to a .param entry (case-insensitive).
+    params = circuit.setdefault("params", {})
+    for key in (param, param.upper(), param.lower()):
+        if key in params:
+            params[key] = value
+            return True
+    # Unknown param: still record it under the given name so device _mp lookups can find it.
+    params[param] = value
+    return False
+
+
+def _run_stepped(circuit: dict, options: dict, step_spec: dict, inner_analyses: list,
+                 probes: list[str], log: list, t0: float) -> dict:
+    """Run ``inner_analyses`` once per value of the stepped parameter (sim.md §3 ``.step``).
+
+    Results are returned under ``result["step"]`` = {"param":..., "values":[...],
+    "runs":[{"value":v, <per-run sim.md §4 results>}, ...]}. Each run is an independent sim build,
+    so the swept device value (or .param) takes effect cleanly.
+    """
+    import copy
+
+    param = str(step_spec.get("param", ""))
+    values = _step_values(step_spec)
+    runs: list[dict] = []
+    all_ok = True
+    log.append(f"step: sweeping '{param}' over {len(values)} values {values}")
+
+    for v in values:
+        c = copy.deepcopy(circuit)
+        _apply_step_param(c, param, v)
+        run_res: dict = {"value": v, "convergence": {}}
+        run_log: list[str] = []
+        try:
+            sim = _Sim(c, options)
+        except DeviceError as e:
+            run_log.append(f"build failed: {e}")
+            run_res["convergence"]["build"] = False
+            run_res["log"] = run_log
+            runs.append(run_res)
+            all_ok = False
+            continue
+        run_res["log"] = run_log
+        _run_analyses(sim, inner_analyses, probes, run_res, run_log)
+        if not all(run_res["convergence"].values()):
+            all_ok = False
+        runs.append(run_res)
+
+    result: dict = {
+        "log": log,
+        "convergence": {"step": all_ok},
+        "step": {"param": param, "values": values, "runs": runs},
+    }
     result["ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
     return result

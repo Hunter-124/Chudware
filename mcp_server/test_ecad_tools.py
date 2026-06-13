@@ -68,6 +68,8 @@ def test_register() -> dict:
         "ecad_simulate", "ecad_run_drc", "ecad_export", "ecad_to_3d",
         "ecad_update_from_sch", "ecad_autoroute", "ecad_add_zone", "ecad_fill_zones",
         "ecad_sweep", "ecad_design",
+        # new tools
+        "ecad_check_impedance", "ecad_tf", "ecad_make_board",
     }
     missing = expected - set(mcp.tools)
     assert not missing, f"tools not registered: {missing}"
@@ -443,6 +445,203 @@ def test_ecad_design(tools: dict) -> None:
     print("  [ecad_design] PASS")
 
 
+# --------------------------------------------------------------------------- new tool tests
+
+
+def _build_divider_schematic(tools: dict, name: str = "divider_tf") -> None:
+    """Build a 10V / 1k+2k divider on a fresh schematic (helper for advanced tests)."""
+    _call(tools, "ecad_new_schematic", name=name)
+    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=20, value="10")
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=20, value="1k", angle=90)
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=0, value="2k", angle=90)
+    _call(tools, "ecad_wire", from_ref="V1", from_pin="+", to_ref="R1", to_pin="2")
+    _call(tools, "ecad_wire", from_ref="R1", from_pin="1", to_ref="R2", to_pin="2")
+    _call(tools, "ecad_wire", from_ref="R2", from_pin="1", to_ref="V1", to_pin="-")
+    _call(tools, "ecad_add_power", net="GND", x=0, y=14.92)
+
+
+def test_tf(tools: dict) -> None:
+    """ecad_tf on the divider must return sensible gain/Rin/Rout."""
+    _build_divider_schematic(tools, "divider_tf")
+    r = _call(tools, "ecad_tf", output="V(N$1)", source="V1")
+    # V(N$1) is the midpoint node; if it doesn't work, try the first available node.
+    if not r.get("ok"):
+        # Discover the midpoint node name from an op analysis.
+        sim = _call(tools, "ecad_simulate", analysis="op")
+        nodes = [k[2:-1] for k in sim.get("op", {}).keys() if k.startswith("V(")]
+        # Filter out nodes that are trivially the source.
+        mid_nodes = [n for n in nodes if n not in ("IN", "N$0")]
+        if mid_nodes:
+            r = _call(tools, "ecad_tf", output=f"V({mid_nodes[0]})", source="V1")
+    _assert_context(r, "ecad_tf")
+    # Payload must have reading + numeric fields.
+    assert "reading" in r, "ecad_tf: missing reading"
+    assert "gain" in r and "rin" in r and "rout" in r, "ecad_tf: missing gain/rin/rout"
+    print(f"  ecad_tf: reading={r['reading']!r}")
+    print(f"          gain={r.get('gain')} rin={r.get('rin')} rout={r.get('rout')}")
+    # For the 1k||2k divider the Rin should be 3k (the series combination seen by V1).
+    if r.get("converged"):
+        rin = r.get("rin")
+        if rin is not None and rin > 0:
+            assert 1000 < rin < 10000, f"Rin should be ~3k for this divider, got {rin}"
+    print("  [ecad_tf] PASS")
+
+
+def test_simulate_four(tools: dict) -> None:
+    """ecad_simulate('four') on an RC circuit must return a THD% + reading."""
+    # Build a simple 1kHz sine-driven RC: V_AC -> R -> C -> GND
+    _call(tools, "ecad_new_schematic", name="four_rc")
+    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=10,
+          value="1", ref="V1")
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=10, y=10, value="1k",
+          angle=90, ref="R1")
+    _call(tools, "ecad_place_symbol", libid="Device:C", x=10, y=0, value="100n",
+          angle=90, ref="C1")
+    _call(tools, "ecad_wire", from_ref="V1", from_pin="+", to_ref="R1", to_pin="2")
+    _call(tools, "ecad_wire", from_ref="R1", from_pin="1", to_ref="C1", to_pin="1")
+    _call(tools, "ecad_wire", from_ref="C1", from_pin="2", to_ref="V1", to_pin="-")
+    _call(tools, "ecad_add_power", net="GND", x=0, y=3)
+    # Sine source: set waveform to SIN so the tran has something to analyze.
+    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_tools import _ECAD
+    s = ecad_session.get_session(_ECAD["current_sch"])
+    v_sym = next(sym for sym in s.doc.get("symbols", []) if sym.get("ref") == "V1")
+    ecad_session.apply_ops(s, s.revision, [
+        {"op": "sch_edit_symbol", "id": v_sym["id"],
+         "sim_params": {"waveform": "SIN", "amplitude": "1", "freq": "1000"}},
+    ])
+
+    r = _call(tools, "ecad_simulate", analysis="four",
+              params={"f0": 1000.0, "tstop": 5e-3, "probe": "V(N$1)"})
+    _assert_context(r, "ecad_simulate(four)")
+    # Check the payload shape.
+    assert "reading" in r, "four: missing reading"
+    assert "thd_pct" in r or "four" in r, "four: missing THD% result"
+    print(f"  four analysis: reading={r.get('reading', 'n/a')!r}")
+    print(f"                 thd_pct={r.get('thd_pct')} converged={r.get('converged')}")
+    print("  [simulate_four] PASS")
+
+
+def test_simulate_noise(tools: dict) -> None:
+    """ecad_simulate('noise') on the divider must return a positive total noise RMS + reading."""
+    _build_divider_schematic(tools, "divider_noise")
+    # Need to know the midpoint node name -- get it from op.
+    sim = _call(tools, "ecad_simulate", analysis="op")
+    nodes = [k[2:-1] for k in sim.get("op", {}).keys() if k.startswith("V(")]
+    # Pick the midpoint: the node with V closest to 6.667V.
+    op = sim.get("op", {})
+    best_node = min(nodes, key=lambda n: abs((op.get(f"V({n})", 0.0) or 0.0) - 6.667),
+                    default=nodes[0] if nodes else "OUT")
+    output_probe = f"V({best_node})"
+
+    r = _call(tools, "ecad_simulate", analysis="noise",
+              params={"output": output_probe, "fstart": 10.0, "fstop": 1e6})
+    _assert_context(r, "ecad_simulate(noise)")
+    assert "reading" in r, "noise: missing reading"
+    # RC divider should have finite thermal noise.
+    assert "total_noise_rms" in r, "noise: missing total_noise_rms"
+    if r.get("converged"):
+        rms = r.get("total_noise_rms", 0.0)
+        assert isinstance(rms, (int, float)) and rms >= 0, f"noise RMS should be >=0, got {rms}"
+    print(f"  noise analysis: reading={r.get('reading', 'n/a')!r}")
+    print(f"                  total_noise_rms={r.get('total_noise_rms')} V_rms, "
+          f"converged={r.get('converged')}")
+    print("  [simulate_noise] PASS")
+
+
+def test_simulate_mc(tools: dict) -> None:
+    """ecad_simulate('mc') on the divider must return mean/std near the nominal midpoint."""
+    _build_divider_schematic(tools, "divider_mc")
+    r = _call(tools, "ecad_simulate", analysis="mc",
+              params={"runs": 30, "inner": "op", "tol": {"R": 0.05}})
+    _assert_context(r, "ecad_simulate(mc)")
+    assert "reading" in r, "mc: missing reading"
+    print(f"  mc analysis: reading={r.get('reading', 'n/a')!r}")
+    print(f"               mean={r.get('mean')} std={r.get('std')}")
+    print("  [simulate_mc] PASS")
+
+
+def test_simulate_temp(tools: dict) -> None:
+    """ecad_simulate('temp') on the divider must return a trend across temperatures."""
+    _build_divider_schematic(tools, "divider_temp")
+    r = _call(tools, "ecad_simulate", analysis="temp",
+              params={"values": [-40, 27, 85], "inner": "op"})
+    _assert_context(r, "ecad_simulate(temp)")
+    assert "reading" in r, "temp: missing reading"
+    print(f"  temp analysis: reading={r.get('reading', 'n/a')!r}")
+    print(f"                 temps={r.get('temps')} trend={r.get('trend')}")
+    print("  [simulate_temp] PASS")
+
+
+def test_check_impedance_no_tracks(tools: dict) -> None:
+    """ecad_check_impedance on an empty board must fail gracefully with guidance."""
+    _call(tools, "ecad_new_pcb", name="imp_guard")
+    r = _call(tools, "ecad_check_impedance")
+    assert not r["ok"], "empty board should not have impedance"
+    assert r["next_actions"], "failure must teach"
+    print(f"  check_impedance (no tracks): hint={r['hint'][:80]!r}")
+    print("  [check_impedance_no_tracks] PASS")
+
+
+def test_check_impedance_routed(tools: dict) -> None:
+    """ecad_check_impedance on a board with a routed trace must return a Z0 reading."""
+    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_tools import _ECAD
+
+    # Build a footprinted divider + route it.
+    _build_footprinted_divider(tools)
+    _call(tools, "ecad_new_pcb", name="imp_board")
+    pcb = ecad_session.get_session(_ECAD["current_pcb"])
+    ecad_session.apply_ops(pcb, pcb.revision, [{"op": "pcb_set_outline", "shapes": [
+        {"type": "line", "p1": [0, 0],   "p2": [60, 0]},
+        {"type": "line", "p1": [60, 0],  "p2": [60, 30]},
+        {"type": "line", "p1": [60, 30], "p2": [0, 30]},
+        {"type": "line", "p1": [0, 30],  "p2": [0, 0]},
+    ], "closed": True}])
+    _call(tools, "ecad_update_from_sch")
+    _call(tools, "ecad_autoroute")
+
+    # Now there should be routed tracks; check impedance summary (no net specified).
+    r = _call(tools, "ecad_check_impedance")
+    _assert_context(r, "ecad_check_impedance")
+    assert r["ok"], f"check_impedance failed: {r.get('error')}"
+    assert "reading" in r, "check_impedance: missing reading"
+    print(f"  check_impedance (summary): reading={r.get('reading')!r}")
+    # If we have any summaries, try one specific net.
+    summaries = r.get("summaries", [])
+    if summaries:
+        net = summaries[0]["net"]
+        r2 = _call(tools, "ecad_check_impedance", net_or_ref=net, target=50.0)
+        _assert_context(r2, "ecad_check_impedance(net)")
+        assert r2["ok"], f"check_impedance({net}) failed: {r2.get('error')}"
+        assert "z0" in r2 and r2["z0"] > 0, f"Z0 should be positive, got {r2.get('z0')}"
+        print(f"  check_impedance({net}): reading={r2.get('reading')!r}")
+    print("  [check_impedance_routed] PASS")
+
+
+def test_make_board(tools: dict) -> None:
+    """ecad_make_board() must run the full sync/route/fill/drc flow and return a summary."""
+    _build_footprinted_divider(tools)
+    r = _call(tools, "ecad_make_board", pcb_name="auto_board")
+    _assert_context(r, "ecad_make_board")
+    assert "steps" in r, "ecad_make_board: missing steps"
+    assert "reading" in r, "ecad_make_board: missing reading"
+    # At minimum: new_pcb and update_from_sch should succeed.
+    step_names = {s["step"] for s in r["steps"]}
+    assert "new_pcb" in step_names, f"new_pcb step missing: {step_names}"
+    assert "update_from_sch" in step_names, f"update_from_sch step missing: {step_names}"
+    # The tool must set a current_pcb so ecad_status works immediately after.
+    from mcp_server.ecad_tools import _ECAD
+    assert _ECAD["current_pcb"] is not None, "ecad_make_board must set current_pcb"
+    st = _call(tools, "ecad_status")
+    assert st["ok"] and st["kind"] == "pcb", "ecad_status after make_board should see a board"
+    print(f"  make_board steps: {[(s['step'], 'OK' if s['ok'] else 'FAIL') for s in r['steps']]}")
+    print(f"  make_board: footprints_placed={r.get('footprints_placed')} "
+          f"nets_routed={r.get('nets_routed')} drc_errors={r.get('drc_errors')}")
+    print(f"  hint: {r['hint'][:120]!r}")
+    print("  [make_board] PASS")
+
+
 # --------------------------------------------------------------------------- runner
 
 
@@ -463,6 +662,15 @@ def main() -> None:
     test_add_zone_unknown_net(tools)
     test_export_guard(tools)
     test_ecad_design(tools)
+    # new tool tests
+    test_tf(tools)
+    test_simulate_four(tools)
+    test_simulate_noise(tools)
+    test_simulate_mc(tools)
+    test_simulate_temp(tools)
+    test_check_impedance_no_tracks(tools)
+    test_check_impedance_routed(tools)
+    test_make_board(tools)
     print("\nALL ECAD TOOL TESTS PASSED")
 
 

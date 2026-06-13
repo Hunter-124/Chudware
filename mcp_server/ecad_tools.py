@@ -22,9 +22,12 @@ Tools (each returns ``{ok, ...result, warnings:[], hint:"...", next_actions:[...
   ecad_add_power / ecad_label         power port / net label
   ecad_status                         THE context tool: components, nets, ERC summary, next_actions
   ecad_run_erc                        readable ERC violation lines + "N errors, M warnings"
-  ecad_simulate                       netlist -> SPICE circuit -> simulate; key results + plain English
+  ecad_simulate                       netlist -> SPICE -> simulate; op/dc/tran/ac + four/mc/temp/noise
   ecad_run_drc                        PCB DRC summary with the worst offenders
   ecad_export / ecad_to_3d            wrap fab writers / 3D export (lazy import, clean if unavailable)
+  ecad_check_impedance                Z0 + delay for a routed trace vs. target; plain-English reading
+  ecad_tf                             DC .tf: gain/Rin/Rout with a plain-English reading
+  ecad_make_board                     one-shot sync->route->fill->DRC; sets current_pcb
 """
 from __future__ import annotations
 
@@ -736,12 +739,19 @@ def register_ecad_tools(mcp) -> None:
         """Build the netlist -> SPICE circuit -> run the native simulator, and return the KEY
         results with a plain-English reading.
 
-        ``analysis`` is one of: 'op' (DC operating point), 'dc' (source sweep), 'tran' (transient),
-        'ac' (frequency response). ``params`` carries analysis args:
-          op   -> {}                  (none)
-          dc   -> {"source":"V1","start":0,"stop":5,"step":0.05}
-          tran -> {"tstep":1e-6,"tstop":1e-3,"uic":false}
-          ac   -> {"sweep":"dec","points":20,"fstart":1,"fstop":1e6}
+        ``analysis`` is one of:
+          'op'    -- DC operating point (no params needed)
+          'dc'    -- source sweep {"source":"V1","start":0,"stop":5,"step":0.05}
+          'tran'  -- transient {"tstep":1e-6,"tstop":1e-3,"uic":false}
+          'ac'    -- frequency response {"sweep":"dec","points":20,"fstart":1,"fstop":1e6}
+          'four'  -- Fourier/THD on a transient trace {"f0":1e3,"tstop":5e-3,"probe":"V(OUT)"}
+                     -> returns THD% + dominant harmonics; reading: "THD=0.12%, H1=4.99 V"
+          'mc'    -- Monte-Carlo tolerance {"runs":50,"probe":"V(OUT)","tol":{"R":0.01}}
+                     -> returns mean/std/yield; reading: "mean=2.5V, sigma=0.03V, yield=98%"
+          'temp'  -- temperature sweep {"values":[-40,27,85],"inner":"op","probe":"V(OUT)"}
+                     -> returns output trend vs temperature
+          'noise' -- output noise density {"output":"V(OUT)","fstart":10,"fstop":1e6}
+                     -> returns total RMS noise + per-resistor contributions
         If ``probes`` is omitted, DEFAULTS TO ALL NODE VOLTAGES (you won't always know the node
         names — this surfaces them all). Returns op node voltages, or for tran/ac a compact
         summary (final value / -3 dB point) plus a sentence like 'V(OUT) settles to 2.49 V'.
@@ -780,8 +790,13 @@ def register_ecad_tools(mcp) -> None:
         an = _build_analysis(analysis, params or {}, circuit)
         if an is None:
             return _err(f"unknown analysis {analysis!r}",
-                        hint="Use one of: 'op', 'dc', 'tran', 'ac'.",
+                        hint="Use one of: 'op', 'dc', 'tran', 'ac', 'four', 'mc', 'temp', 'noise'.",
                         next_actions=["ecad_simulate('op')"])
+
+        # Advanced analyses: four/mc/temp/noise each wrap or extend an inner analysis.
+        if an["type"] in ("four", "mc", "temp", "noise"):
+            return _simulate_advanced(session, circuit, an, probe_list, warns)
+
         study = {"analyses": [an], "probes": probe_list}
         result = sim_run(circuit, study)
         conv = result.get("convergence", {})
@@ -1383,6 +1398,376 @@ def register_ecad_tools(mcp) -> None:
             "next_actions": next_actions,
         })
 
+    # ---------------------------------------------------------------- signal-integrity
+
+    @mcp.tool()
+    def ecad_check_impedance(net_or_ref: str = "", target: float = 50.0,
+                             doc_id: str = "") -> str:
+        """Compute the characteristic impedance (Z0) and one-way propagation delay for a routed
+        trace on the active board, and compare it to a target impedance.
+
+        ``net_or_ref`` may be a net name ('CLK', 'USB_D+') or a track id ('t3'). If omitted,
+        the tool scans ALL routed nets and summarises which ones are likely controlled-impedance
+        candidates (width >= 0.1 mm on an outer layer, or any inner layer).
+
+        Returns a plain-English reading like:
+          "Net CLK on F.Cu: Z0=52.1 ohm (target 50.0, +4.2%) -- within 10% tolerance;
+           delay=6.7 ps/mm, length=23.4 mm, one-way delay=157 ps"
+        plus ``next_actions`` to widen/narrow the trace if the target is missed.
+
+        Impedance model: outer copper -> IPC-2141A microstrip; inner copper -> stripline.
+        """
+        try:
+            session = _get_pcb(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="Impedance check needs a board with routed tracks.",
+                        next_actions=["ecad_new_pcb('myboard')", "ecad_autoroute()"])
+        doc = session.doc
+        tracks = doc.get("tracks", [])
+        if not tracks:
+            return _err("no routed tracks on this board",
+                        hint="Route the board first (ecad_autoroute or ecad_update_from_sch).",
+                        next_actions=["ecad_autoroute()", "ecad_update_from_sch()"])
+
+        try:
+            from engine.ecad.impedance import track_impedance, _stackup_geometry  # lazy import
+        except ImportError as e:  # noqa: BLE001
+            return _err(f"impedance engine unavailable ({e})",
+                        hint="engine.ecad.impedance could not be imported.",
+                        next_actions=["ecad_run_drc()"])
+
+        tol_pct = 10.0  # +/-10% is the standard controlled-impedance fab tolerance
+
+        def _pct(z0: float) -> float:
+            return 100.0 * (z0 - target) / target if target else 0.0
+
+        def _reading(r: dict) -> str:
+            pct = _pct(r["z0"])
+            status = ("within tolerance" if abs(pct) <= tol_pct else
+                      "OUT OF TOLERANCE -- widen trace to lower Z0, or narrow to raise Z0")
+            return (f"Net {r.get('net') or '?'} on {r.get('layer')}: "
+                    f"Z0={r['z0']:.1f} ohm (target {target:.1f}, {pct:+.1f}%) -- {status}; "
+                    f"delay={r['delay_ps_per_mm']:.2f} ps/mm, "
+                    f"length={r['length_mm']:.2f} mm, "
+                    f"one-way delay={r['delay_ps']:.1f} ps "
+                    f"[{r['kind']}, w={r['width']:.3f} mm, h={r['h']:.3f} mm, er={r['er']:.2f}]")
+
+        if net_or_ref:
+            try:
+                r = track_impedance(doc, net_or_ref)
+            except Exception as e:  # noqa: BLE001
+                nets_on_board = sorted({tr.get("net", "") for tr in tracks if tr.get("net")})
+                return _err(f"could not compute impedance for {net_or_ref!r}: {e}",
+                            hint=f"Routed nets on this board: {', '.join(nets_on_board[:10])}. "
+                                 "Pass a net name or a track id (from ecad_status).",
+                            next_actions=["ecad_status()"])
+            pct = _pct(r["z0"])
+            reading = _reading(r)
+            within = abs(pct) <= tol_pct
+            # Guidance: wider -> lower Z0; narrower -> higher Z0.
+            if not within:
+                if pct > 0:  # Z0 too high -> widen
+                    adj = "Widen the trace (increase width) to lower Z0 toward the target."
+                else:  # Z0 too low -> narrow
+                    adj = "Narrow the trace (decrease width) to raise Z0 toward the target."
+            else:
+                adj = "Trace impedance is within the standard +/-10% controlled-impedance tolerance."
+            return _dumps({
+                "ok": True, "doc_id": session.doc_id,
+                "net": r.get("net"), "layer": r.get("layer"),
+                "z0": round(r["z0"], 2), "target": target,
+                "pct_error": round(pct, 2), "within_tolerance": within,
+                "kind": r["kind"], "model": r["model"],
+                "width": r["width"], "h": r["h"], "er": r["er"], "t": r["t"],
+                "length_mm": round(r["length_mm"], 3),
+                "delay_ps_per_mm": round(r["delay_ps_per_mm"], 3),
+                "delay_ps": round(r["delay_ps"], 2),
+                "eeff": round(r["eeff"], 4),
+                "warnings": ([] if within else [f"Z0 {pct:+.1f}% from target -- trace needs resizing"]),
+                "reading": reading,
+                "hint": reading + " " + adj,
+                "next_actions": ([adj] if not within else
+                                 ["ecad_export('gerber')  # impedance OK -- proceed to fab"]),
+            })
+
+        # No net/ref given: summarise every net's impedance as a quick SI health check.
+        seen_nets: set = set()
+        summaries: list[dict] = []
+        for tr in tracks:
+            net = tr.get("net", "")
+            if net in seen_nets or not net:
+                continue
+            seen_nets.add(net)
+            try:
+                r = track_impedance(doc, tr)
+                pct = _pct(r["z0"])
+                summaries.append({
+                    "net": net, "layer": r["layer"], "z0": round(r["z0"], 1),
+                    "pct_error": round(pct, 1), "length_mm": round(r["length_mm"], 2),
+                    "delay_ps": round(r["delay_ps"], 1),
+                    "within_tolerance": abs(pct) <= tol_pct,
+                })
+            except Exception:  # noqa: BLE001
+                pass
+        out_of_tol = [s for s in summaries if not s["within_tolerance"]]
+        worst = (sorted(out_of_tol, key=lambda s: abs(s["pct_error"]), reverse=True)[:3]
+                 if out_of_tol else [])
+        head = (f"{len(summaries)} net(s) analysed; "
+                f"{len(out_of_tol)} out of +/-{tol_pct:.0f}% target={target:.0f} ohm tolerance.")
+        return _dumps({
+            "ok": True, "doc_id": session.doc_id, "target": target,
+            "nets_analysed": len(summaries), "out_of_tolerance": len(out_of_tol),
+            "summaries": summaries,
+            "worst": worst,
+            "warnings": ([f"{w['net']}: Z0={w['z0']} ohm ({w['pct_error']:+.1f}%)" for w in worst]
+                         if worst else []),
+            "reading": head,
+            "hint": (head + (" Fix the worst offenders: "
+                             + ", ".join(w["net"] for w in worst)) if worst else
+                     head + " All controlled-impedance traces are within tolerance."),
+            "next_actions": (
+                [f"ecad_check_impedance('{worst[0]['net']}', target={target})  # inspect worst offender"]
+                if worst else
+                ["ecad_export('gerber')  # SI check passed"]
+            ),
+        })
+
+    # ---------------------------------------------------------------- .tf transfer function
+
+    @mcp.tool()
+    def ecad_tf(output: str, source: str, doc_id: str = "") -> str:
+        """Run a DC small-signal transfer function (.tf) on the active schematic's circuit.
+
+        Computes:
+          * DC gain  -- output / source (V/V for V-source input, V/A transimpedance for I-source)
+          * Rin      -- resistance seen looking into the source terminals
+          * Rout     -- resistance seen looking into the output terminals (all sources nulled)
+
+        ``output`` is a voltage probe: 'V(OUT)', 'V(out,in)', etc.
+        ``source`` is the name of an independent V or I source: 'V1', 'I1', etc.
+
+        Reading example: "DC gain V(OUT)/V1 = -10.00, Rin = 1.00 kohm, Rout = 100 ohm"
+        This is exactly the SPICE .tf analysis, useful for amplifier gain/loading checks.
+        """
+        try:
+            session = _get_sch(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="Transfer function needs an open schematic.",
+                        next_actions=["ecad_new_schematic('mydesign')"])
+        doc = session.doc
+        nl = netlist_mod.build_netlist(doc)
+        try:
+            from engine.sim.spice import netlist_to_spice_circuit
+            from engine.sim.circuit import simulate as sim_run
+        except Exception as e:  # noqa: BLE001
+            return _err(f"simulator unavailable ({type(e).__name__}: {e})",
+                        hint="The sim engine (numpy/scipy) is not importable here.")
+        circuit, warns = netlist_to_spice_circuit(nl)
+        if not circuit.get("devices"):
+            return _err("nothing to analyse -- netlist has no simulatable devices",
+                        hint="Place R/C/V/I/op-amp parts with VALUES and wire them first.",
+                        next_actions=["ecad_find_part('voltage')", "ecad_status()"],
+                        warnings=warns)
+
+        study = {"analyses": [{"type": "tf", "output": output, "source": source}],
+                 "probes": [output]}
+        result = sim_run(circuit, study)
+        tf = result.get("tf", {})
+        conv = bool(result.get("convergence", {}).get("tf", False))
+        gain = tf.get("gain", float("nan"))
+        rin = tf.get("rin", float("nan"))
+        rout = tf.get("rout", float("nan"))
+
+        def _ohm(v: float) -> str:
+            if not _finite(v):
+                return "n/a"
+            a = abs(v)
+            if a >= 1e6:
+                return f"{v/1e6:.3g} Mohm"
+            if a >= 1e3:
+                return f"{v/1e3:.3g} kohm"
+            return f"{v:.3g} ohm"
+
+        gain_str = f"{gain:.4g}" if _finite(gain) else "n/a"
+        reading = (f"DC gain {output}/{source} = {gain_str}, "
+                   f"Rin = {_ohm(rin)}, Rout = {_ohm(rout)}")
+        hint = reading
+        if not conv:
+            hint += " -- did NOT converge (check connectivity/source names)"
+
+        # Guidance based on results.
+        next_actions: list[str] = []
+        if not conv:
+            next_actions += ["ecad_run_erc()  # find connectivity problems",
+                             "ecad_status()  # confirm wiring"]
+        else:
+            next_actions.append("ecad_simulate('ac')  # see frequency response, not just DC gain")
+            if _finite(rin) and rin < 100.0:
+                next_actions.append(
+                    f"Low Rin={_ohm(rin)} -- the source may be heavily loaded by the circuit.")
+            if _finite(rout) and rout > 1e3:
+                next_actions.append(
+                    f"High Rout={_ohm(rout)} -- output may not drive low-impedance loads well.")
+
+        return _dumps({
+            "ok": conv, "doc_id": session.doc_id,
+            "output": output, "source": source,
+            "gain": _round(gain), "rin": _round(rin), "rout": _round(rout),
+            "converged": conv,
+            "device_count": len(circuit["devices"]),
+            "warnings": warns + ([] if conv else ["tf did not converge"]),
+            "reading": reading,
+            "hint": hint,
+            "next_actions": next_actions or ["ecad_status()"],
+            "sim_log": result.get("log", [])[-4:],
+        })
+
+    # ---------------------------------------------------------------- one-shot board flow
+
+    @mcp.tool()
+    def ecad_make_board(pcb_name: str = "Board1", doc_id: str = "") -> str:
+        """ONE-SHOT board flow: from the active schematic, run sync -> autoroute -> fill zones ->
+        DRC and report every step's outcome, remaining issues, and what to do next.
+
+        Steps in order:
+          1. ecad_new_pcb          -- create a fresh board document
+          2. ecad_update_from_sch  -- populate footprints from the schematic
+          3. ecad_autoroute        -- route the ratsnest with the 2-layer router
+          4. ecad_fill_zones       -- pour copper on GND (adds a zone automatically if none)
+          5. ecad_run_drc          -- report remaining violations
+
+        Sets _ECAD['current_pcb'] to the produced board so ecad_status / ecad_run_drc /
+        ecad_export work immediately after.
+
+        Finishes with a hint: "call ecad_to_3d to bring the board into the CAD app for a housing".
+        """
+        sch_id = _ECAD.get("current_sch")
+        if sch_id is None:
+            return _err("no active schematic -- build one first",
+                        hint="Create a schematic (ecad_new_schematic + place + wire parts) before "
+                             "calling ecad_make_board.",
+                        next_actions=["ecad_new_schematic('mydesign')",
+                                      "ecad_design('your circuit description')"])
+
+        steps: list[dict] = []
+
+        def _step(name: str, outcome: dict, note: str = "") -> None:
+            steps.append({
+                "step": name,
+                "ok": outcome.get("ok", False),
+                "note": note or outcome.get("hint", "")[:120],
+            })
+
+        # ---- 1. new board ----
+        pcb_sess = ecad_session.new_session("pcb", pcb_name)
+        _ECAD["current_pcb"] = pcb_sess.doc_id
+        _ECAD["current"] = pcb_sess.doc_id
+        _step("new_pcb", {"ok": True}, f"board '{pcb_name}' created ({pcb_sess.doc_id})")
+
+        # ---- 2. sync schematic -> board ----
+        from engine.ecad import rpc as ecad_rpc
+        sync_ok = False
+        try:
+            sync_resp = ecad_rpc._ecad_update_from_sch(
+                {"board_doc_id": pcb_sess.doc_id, "sch_doc_id": sch_id}, lambda _: None)
+            sync_rep = sync_resp.get("report", {})
+            added = sync_rep.get("added", [])
+            ratsnest = sync_resp.get("compile", {}).get("ratsnest", []) or []
+            sync_ok = True
+            _step("update_from_sch", {"ok": True},
+                  f"{len(added)} footprint(s) placed, {len(ratsnest)} airwire(s) to route")
+        except OpError as e:
+            _step("update_from_sch", {"ok": False}, f"FAILED: {e.message}")
+            added = []; ratsnest = []
+
+        # ---- 3. autoroute ----
+        ar_ok = False
+        try:
+            ar_resp = ecad_rpc._ecad_autoroute(
+                {"doc_id": pcb_sess.doc_id, "opts": {}}, lambda _: None)
+            ar_rep = ar_resp.get("report", {})
+            routed = ar_rep.get("routed", [])
+            failed = ar_rep.get("failed", [])
+            ar_ok = True
+            _step("autoroute", {"ok": True},
+                  f"routed {len(routed)} net(s), {len(failed)} failed"
+                  + (f": {failed[:4]}" if failed else ""))
+        except OpError as e:
+            _step("autoroute", {"ok": False}, f"FAILED: {e.message}")
+            routed = []; failed = []
+
+        # ---- 4. fill zones (add GND zone automatically if board has none) ----
+        fill_ok = False
+        try:
+            pcb_doc = pcb_sess.doc
+            if not pcb_doc.get("zones"):
+                # add a whole-board GND zone (need an outline bounding box for the polygon).
+                poly = _outline_bbox(pcb_doc)
+                if poly is None:
+                    # No outline: use a generous 100x100 mm default.
+                    poly_pts = [[0, 0], [100, 0], [100, 100], [0, 100]]
+                else:
+                    x0, y0, x1, y1 = poly
+                    poly_pts = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+                _apply(pcb_sess, [{"op": "pcb_add_zone", "net": "GND", "layer": "F.Cu",
+                                   "polygon": poly_pts}])
+            fill_resp = ecad_rpc._ecad_fill_zones({"doc_id": pcb_sess.doc_id}, lambda _: None)
+            fs = fill_resp.get("fill_summary", {})
+            fill_ok = True
+            _step("fill_zones", {"ok": True},
+                  f"{fs.get('zones_filled', 0)} zone(s) filled, {fs.get('copper_area_mm2', 0):.1f} mm^2")
+        except Exception as e:  # noqa: BLE001
+            _step("fill_zones", {"ok": False}, f"FAILED: {type(e).__name__}: {e}")
+
+        # ---- 5. DRC ----
+        drc_errors = 0; drc_warnings = 0; drc_lines: list[str] = []
+        try:
+            from engine.ecad import drc as drc_mod
+            violations = drc_mod.run_drc(pcb_sess.doc)
+            if isinstance(violations, dict):
+                violations = violations.get("violations", [])
+            drc_sum = _erc_summary(violations)
+            drc_errors = drc_sum["errors"]
+            drc_warnings = drc_sum["warnings"]
+            drc_lines = _erc_lines(violations)[:6]
+            _step("drc", {"ok": drc_errors == 0},
+                  f"{drc_errors} error(s), {drc_warnings} warning(s)")
+        except Exception as e:  # noqa: BLE001
+            _step("drc", {"ok": False}, f"DRC unavailable: {e}")
+
+        all_ok = all(s["ok"] for s in steps)
+        summary_lines = [f"  {s['step']}: {'OK' if s['ok'] else 'FAIL'} -- {s['note']}"
+                         for s in steps]
+        reading = "\n".join(summary_lines)
+        hint = (f"Board flow {'complete' if all_ok else 'partial'}: "
+                + "; ".join(f"{s['step']}={'OK' if s['ok'] else 'FAIL'}" for s in steps)
+                + f". DRC: {drc_errors} error(s). "
+                "Next: call ecad_to_3d() to bring the board into the CAD app for a housing.")
+
+        next_actions: list[str] = []
+        if failed:
+            next_actions.append(
+                f"{len(failed)} net(s) not routed ({', '.join(map(str, failed[:4]))}). "
+                "Try ecad_autoroute(pitch=0.15) or move parts to give the router more room.")
+        if drc_errors:
+            next_actions.append(f"ecad_run_drc()  # {drc_errors} DRC error(s) to fix")
+        next_actions.append("ecad_to_3d()  # export STEP and design an enclosure in the CAD app")
+        if not next_actions:
+            next_actions.append("ecad_export('gerber')  # board passes DRC -- ready for fab")
+
+        return _dumps({
+            "ok": all_ok, "doc_id": pcb_sess.doc_id,
+            "sch_doc_id": sch_id, "pcb_name": pcb_name,
+            "steps": steps, "reading": reading,
+            "footprints_placed": len(added),
+            "nets_routed": len(routed), "nets_failed": len(failed),
+            "drc_errors": drc_errors, "drc_warnings": drc_warnings,
+            "drc_violations": drc_lines,
+            "warnings": drc_lines[:3],
+            "hint": hint,
+            "next_actions": next_actions,
+        })
+
     # tools registered; nothing to return.
 
 
@@ -1418,7 +1803,241 @@ def _build_analysis(analysis: str, params: dict, circuit: dict) -> dict | None:
                 "points": int(params.get("points", 20)),
                 "fstart": float(params.get("fstart", 1.0)),
                 "fstop": float(params.get("fstop", 1e6))}
+    # Advanced analyses: return a spec dict with the analysis type for routing.
+    if a == "four":
+        # Fourier/THD: needs a preceding tran. Default tran params if not supplied.
+        tstop = float(params.get("tstop", 1e-3))
+        f0 = float(params.get("f0", 1e3))
+        probe = params.get("probe")
+        return {"type": "four", "f0": f0, "tstop": tstop,
+                "tstep": float(params.get("tstep", tstop / 400)),
+                "probe": probe, "nharm": int(params.get("nharm", 9))}
+    if a == "mc":
+        inner_name = params.get("inner", "op")
+        inner_params = params.get("inner_params", {})
+        inner_an = _build_analysis(inner_name, inner_params, circuit) or {"type": "op"}
+        return {"type": "mc",
+                "runs": int(params.get("runs", 50)),
+                "analysis": inner_an,
+                "tol": params.get("tol"),
+                "probe": params.get("probe"),
+                "seed": int(params.get("seed", 42))}
+    if a == "temp":
+        inner_name = params.get("inner", "op")
+        inner_params = params.get("inner_params", {})
+        inner_an = _build_analysis(inner_name, inner_params, circuit) or {"type": "op"}
+        vals = params.get("values", [-40.0, 27.0, 85.0])
+        return {"type": "temp", "values": [float(v) for v in vals], "analysis": inner_an}
+    if a == "noise":
+        return {"type": "noise",
+                "output": params.get("output", "V(OUT)"),
+                "source": params.get("source"),
+                "fstart": float(params.get("fstart", 10.0)),
+                "fstop": float(params.get("fstop", 1e6)),
+                "points": int(params.get("points", 20)),
+                "sweep": params.get("sweep", "dec")}
     return None
+
+
+def _simulate_advanced(session, circuit: dict, an: dict, probe_list: list[str],
+                       warns: list[str]) -> str:
+    """Run one of the advanced analyses (four/mc/temp/noise) and return a rich payload."""
+    try:
+        from engine.sim.circuit import simulate as sim_run
+    except Exception as e:  # noqa: BLE001
+        return _err(f"simulator unavailable ({type(e).__name__}: {e})",
+                    hint="The sim engine (numpy/scipy) is not importable here.")
+
+    atype = an["type"]
+
+    if atype == "four":
+        # Run a tran then Fourier on the result.
+        tran_an = {"type": "tran",
+                   "tstep": an.get("tstep", 5e-6),
+                   "tstop": an.get("tstop", 1e-3),
+                   "tstart": 0.0, "uic": False}
+        tran_probes = list(probe_list)
+        probe = an.get("probe")
+        if probe and probe not in tran_probes:
+            tran_probes = [probe] + tran_probes
+        study = {"analyses": [an], "probes": tran_probes}
+        result = sim_run(circuit, study)
+        four = result.get("four", {})
+        if not four:
+            return _err("Fourier analysis produced no result -- tran may not have run or the probe "
+                        "is missing",
+                        hint="Supply 'f0' (fundamental Hz), 'tstop' (seconds), and 'probe' "
+                             "(e.g. 'V(OUT)') in the params dict.",
+                        warnings=warns,
+                        next_actions=["ecad_simulate('four', params={'f0':1e3,'tstop':5e-3,"
+                                      "'probe':'V(OUT)'})"])
+        conv = bool(result.get("convergence", {}).get("four", False))
+        harmonics = four.get("harmonics", [])
+        thd = float(four.get("thd_pct", 0.0))
+        h1 = harmonics[0][1] if harmonics else 0.0
+        probe_used = four.get("probe", "?")
+        dom = [f"H{n}={m:.4g} V" for n, m, _ in harmonics[:4]]
+        reading = (f"{probe_used} @ f0={four.get('f0', '?'):.4g} Hz: "
+                   f"H1={h1:.4g} V, THD={thd:.3f}%, "
+                   f"dominant harmonics: {', '.join(dom)}; "
+                   f"DC bias={four.get('dc', 0.0):.4g} V")
+        return _dumps({
+            "ok": conv, "doc_id": session.doc_id, "analysis": "four",
+            "converged": conv,
+            "device_count": len(circuit["devices"]),
+            "four": four,
+            "thd_pct": _round(thd), "h1_mag": _round(h1),
+            "harmonics": [[int(n), _round(m), _round(p)] for n, m, p in harmonics],
+            "reading": reading,
+            "warnings": warns + ([] if conv else ["four/tran did not converge"]),
+            "hint": (f"THD={thd:.3f}% (H1={h1:.4g} V). "
+                     + ("Low THD < 1% -- good linearity." if thd < 1.0 else
+                        "High THD -- significant harmonic content; check for clipping/nonlinearity.")),
+            "next_actions": ["ecad_simulate('op')  # check DC bias point",
+                             "ecad_simulate('ac')  # see frequency response"],
+            "sim_log": result.get("log", [])[-6:],
+        })
+
+    if atype == "mc":
+        study = {"analyses": [an], "probes": probe_list}
+        result = sim_run(circuit, study)
+        mc = result.get("mc", {})
+        conv = bool(result.get("convergence", {}).get("mc", False))
+        if not mc or not mc.get("runs"):
+            return _err("Monte-Carlo produced no results -- inner analysis may have failed",
+                        hint="Specify 'probe' (e.g. 'V(OUT)'), 'runs' (e.g. 50), and "
+                             "'inner' ('op'/'tran') in params.",
+                        warnings=warns,
+                        next_actions=["ecad_simulate('mc', params={'probe':'V(OUT)','runs':50})"])
+        mean = float(mc.get("mean", float("nan")))
+        std = float(mc.get("std", float("nan")))
+        mn = float(mc.get("min", float("nan")))
+        mx = float(mc.get("max", float("nan")))
+        probe_used = mc.get("probe", "?")
+        tol = mc.get("tol", {})
+        tol_str = ", ".join(f"{k}={v*100:.0f}%" for k, v in (tol.items() if isinstance(tol, dict) else []))
+        reading = (f"Monte-Carlo {mc.get('runs')} run(s) on {probe_used}: "
+                   f"mean={mean:.4g} V, sigma={std:.4g} V, "
+                   f"range=[{mn:.4g}, {mx:.4g}] V "
+                   f"(tolerances: {tol_str or 'defaults'})")
+        yield_pct = 100.0 * sum(1 for v in mc.get("values", []) if _finite(v)) / max(mc.get("runs", 1), 1)
+        return _dumps({
+            "ok": conv, "doc_id": session.doc_id, "analysis": "mc",
+            "converged": conv,
+            "device_count": len(circuit["devices"]),
+            "mc": {k: (round(v, 6) if isinstance(v, float) else v)
+                   for k, v in mc.items() if k != "values"},
+            "mean": _round(mean), "std": _round(std), "min": _round(mn), "max": _round(mx),
+            "yield_pct": round(yield_pct, 1),
+            "reading": reading,
+            "warnings": warns,
+            "hint": (f"MC mean={mean:.4g} V, 3-sigma range [{mean-3*std:.4g}, {mean+3*std:.4g}] V. "
+                     + (f"Yield (finite) = {yield_pct:.1f}%. "
+                        "Tight distribution -- good tolerance stack-up." if yield_pct > 95.0 else
+                        f"Yield = {yield_pct:.1f}% -- some runs may fail; tighten tolerances or "
+                        "redesign for wider margin.")),
+            "next_actions": ["ecad_simulate('op')  # nominal operating point",
+                             "ecad_sweep('R1', [...])  # deterministic sensitivity"],
+            "sim_log": result.get("log", [])[-6:],
+        })
+
+    if atype == "temp":
+        study = {"analyses": [an], "probes": probe_list}
+        result = sim_run(circuit, study)
+        temp_res = result.get("temp", {})
+        conv = bool(result.get("convergence", {}).get("temp", False))
+        points_data = temp_res.get("points", [])
+        temps = temp_res.get("values", [])
+        # Summarise the first probe across temperatures.
+        probe_used = probe_list[0] if probe_list else None
+        trend_vals: list[tuple[float, float]] = []
+        for pt in points_data:
+            op = pt.get("op", {})
+            if probe_used and op and probe_used in op:
+                v = op[probe_used]
+                if _finite(v):
+                    trend_vals.append((pt["temp"], float(v)))
+        if trend_vals and probe_used:
+            first_t, first_v = trend_vals[0]
+            last_t, last_v = trend_vals[-1]
+            delta = last_v - first_v
+            verb = "rises" if delta > 0 else ("falls" if delta < 0 else "holds")
+            reading = (f"{probe_used} over [{temps[0]:.0f}, {temps[-1]:.0f}] degC: "
+                       f"{verb} {first_v:.4g} -> {last_v:.4g} V "
+                       f"(delta={delta:.4g} V, "
+                       f"TC={(delta/(last_t-first_t)*1e3):.3g} mV/degC"
+                       f" at {first_v:.4g} V nominal)")
+        else:
+            reading = f"Temperature sweep over {temps} degC -- see 'temp_points' for raw values."
+        return _dumps({
+            "ok": conv, "doc_id": session.doc_id, "analysis": "temp",
+            "converged": conv,
+            "device_count": len(circuit["devices"]),
+            "temps": temps,
+            "trend": [{"temp": t, probe_used or "probe": round(v, 6)}
+                      for t, v in trend_vals],
+            "temp_points": [{k: (round(v2, 6) if isinstance(v2, float) else v2)
+                             for k, v2 in pt.items() if k != "tran"}
+                            for pt in points_data],
+            "reading": reading,
+            "warnings": warns,
+            "hint": reading,
+            "next_actions": ["ecad_simulate('op')  # nominal operating point",
+                             "ecad_simulate('mc')  # combine with tolerance analysis"],
+            "sim_log": result.get("log", [])[-6:],
+        })
+
+    if atype == "noise":
+        study = {"analyses": [an], "probes": probe_list}
+        result = sim_run(circuit, study)
+        noise = result.get("noise", {})
+        conv = bool(result.get("convergence", {}).get("noise", False))
+        if not noise:
+            return _err("noise analysis produced no result",
+                        hint="Specify 'output' (e.g. 'V(OUT)'), 'fstart', 'fstop' in params. "
+                             "The circuit must have at least one resistor.",
+                        warnings=warns,
+                        next_actions=["ecad_simulate('noise', "
+                                      "params={'output':'V(OUT)','fstart':10,'fstop':1e6})"])
+        total_rms = float(noise.get("total_noise_rms", 0.0))
+        per_r = noise.get("per_resistor", {})
+        freqs = noise.get("x_f", [])
+        spectrum = noise.get("onoise_spectrum", [])
+        output = noise.get("output", "?")
+        # Peak noise density.
+        peak_density = max((v for v in spectrum if _finite(v)), default=0.0)
+        # Which resistor contributes most?
+        dominant_r = max(per_r, key=lambda k: per_r[k]) if per_r else None
+        reading = (f"Output noise at {output}: "
+                   f"total RMS={_eng(total_rms)}Vrms "
+                   f"over {freqs[0] if freqs else '?'}..{freqs[-1] if freqs else '?'} Hz; "
+                   f"peak spectral density={_eng(peak_density)}V/sqrt(Hz)"
+                   + (f"; dominant source: {dominant_r} ({_eng(per_r[dominant_r])}Vrms)"
+                      if dominant_r else ""))
+        return _dumps({
+            "ok": conv, "doc_id": session.doc_id, "analysis": "noise",
+            "converged": conv,
+            "device_count": len(circuit["devices"]),
+            "output": output,
+            "total_noise_rms": _round(total_rms),
+            "peak_density_v_sqrthz": _round(peak_density),
+            "per_resistor_rms": {k: _round(v) for k, v in per_r.items()},
+            "dominant_source": dominant_r,
+            "noise": {k: v for k, v in noise.items() if k not in ("onoise_spectrum", "onoise_psd")},
+            "reading": reading,
+            "warnings": warns,
+            "hint": (reading + ". "
+                     + (f"To reduce noise: lower resistance of {dominant_r}, "
+                        "narrow the bandwidth, or add a post-filter."
+                        if dominant_r else
+                        "No dominant resistor noise source identified.")),
+            "next_actions": ["ecad_simulate('ac')  # check frequency response / bandwidth",
+                             "ecad_simulate('op')  # verify DC operating point"],
+            "sim_log": result.get("log", [])[-6:],
+        })
+
+    return _err(f"internal: _simulate_advanced called with unknown type {atype!r}",
+                next_actions=["ecad_simulate('op')"])
 
 
 def _finite(v: Any) -> bool:

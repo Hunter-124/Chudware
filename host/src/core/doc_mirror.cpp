@@ -378,6 +378,37 @@ bool DocMirror::open(WorkerClient& w, const std::string& path, std::string& err)
     return true;
 }
 
+bool DocMirror::activate(WorkerClient& w, const std::string& docId, std::string& aicmPath,
+                         std::string& err) {
+    aicmPath.clear();
+    if (docId.empty()) { err = "empty doc id"; return false; }
+    nlohmann::json res;
+    // A forced doc_rebuild does NOT bump the revision (session.rebuild) and returns the full
+    // ops-response: tree / revision / rebuild.feature_status / tess.aicm_path / owner_map. It is
+    // the one call that hands us a fresh mesh path for an arbitrary already-open doc, so the
+    // viewport can refresh on switch. (doc_tree alone has no tess block.)
+    if (!w.call("doc_rebuild", {{"doc_id", docId}}, res, err, 60000)) return false;
+    if (res.contains("code")) { err = jstr(res, "message"); return false; }
+    docId_ = docId;
+    revision_ = jint(res, "revision");
+    if (res.contains("tree") && res["tree"].is_object()) tree_ = res["tree"];
+    else tree_ = {};
+    featureStatus_ = {};
+    if (res.contains("rebuild") && res["rebuild"].is_object()) {
+        const auto& rb = res["rebuild"];
+        if (rb.contains("feature_status") && rb["feature_status"].is_array())
+            featureStatus_ = rb["feature_status"];
+    }
+    if (res.contains("owner_map") && res["owner_map"].is_object())
+        storeOwnerMap(res["owner_map"]);
+    else
+        storeOwnerMap(nlohmann::json());  // clear stale owner map from the previous doc
+    if (res.contains("tess") && res["tess"].is_object())
+        aicmPath = jstr(res["tess"], "aicm_path");
+    notify();
+    return true;
+}
+
 nlohmann::json DocMirror::list(WorkerClient& w, std::string& err) {
     nlohmann::json res;
     if (!w.call("doc_list", {}, res, err)) return nlohmann::json::array();

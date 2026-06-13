@@ -68,6 +68,10 @@ add_executable(AI-CAD
   src/ui/feature_tree.cpp
   src/ui/file_dialog.cpp   # C41: native Win32 Save/Open dialogs
   # --- end C16 ---
+  # --- document tabs (multi-document strip + per-tab switching) ---
+  src/core/doc_tabs.cpp
+  src/ui/doc_tabs.cpp
+  # --- end document tabs ---
   # --- C39: async worker dispatch (per-frame drained callbacks on the GL thread) ---
   src/core/async_rpc.cpp
   # --- end C39 ---

@@ -175,6 +175,14 @@ public:
     bool save(WorkerClient& w, const std::string& path, std::string& err);
     bool open(WorkerClient& w, const std::string& path, std::string& err);
 
+    // Document tabs: re-point this mirror at an ALREADY-open worker document (the worker keeps
+    // every doc alive in its registry). Issues a forced doc_rebuild for `docId` so the mirror
+    // gets the new doc's tree/revision/owner_map AND a fresh tess.aicm_path; fills *aicmPath with
+    // that mesh path (empty for an empty doc). Fires the listener so the tree repaints. Returns
+    // false (err set) if the doc id is unknown or the call fails. Used when switching tabs.
+    bool activate(WorkerClient& w, const std::string& docId, std::string& aicmPath,
+                  std::string& err);
+
     // List open docs (returns array or empty on error).
     nlohmann::json list(WorkerClient& w, std::string& err);
 

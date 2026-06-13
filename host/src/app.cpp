@@ -39,6 +39,7 @@
 #include "core/app_state.h"
 #include "core/jobs.h"
 #include "ui/console_panel.h"
+#include "ui/doc_tabs.h"
 #include "ui/feature_tree.h"
 #include "ui/legacy_chat.h"
 #include "ui/settings_modal.h"
@@ -364,6 +365,13 @@ int run_gui(const char* screenshotPath) {
         // go stale after a topology rebuild retags them. (docUndo/docRedo also refresh explicitly,
         // which is redundant-but-harmless; this listener covers the ops/resync paths.)
         ui::refreshFeatureHighlight(st);
+        // Document tabs: a real edit (applyOps/undo/redo/pushPull/revert) lights the active tab's
+        // unsaved-changes marker. Tab switches / fresh-doc activation / resyncs set suppressTabDirty
+        // so they don't falsely dirty a tab. Keep the cached title in step with renames, too.
+        if (!st.suppressTabDirty) {
+            st.markActiveTabDirty();
+            st.syncActiveTabTitle();
+        }
     });
 
     // W1-B (item 2/11): route otherwise-silent failures into the toast system.
@@ -1019,9 +1027,17 @@ int run_gui(const char* screenshotPath) {
         ui::setRibbonActiveCmd(sketchMode.activeToolCmd());
         float ribbonH = ui::drawRibbon(st.ribbonTab, st.showRibbon);
 
+        // ---------- document tab strip (browser/SolidWorks-style; under the ribbon) ----------
+        // Reconcile the strip with the mirror (adopt a doc created by a path that doesn't open its
+        // own tab — sketch auto-create, chat new-part, agent v2 run, assembly panel), then draw it.
+        // Shown whenever at least one document is open; zero-height in the empty start state so the
+        // single-document / no-document layout is unchanged.
+        st.ensureActiveTab();
+        float docTabsH = ui::drawDocTabs(st, barH + ribbonH);
+
         // ---------- dockspace host (between the title bar+ribbon and the status bar) ----------
         const float statusH = 30.0f * scale;
-        const float dockTopY = barH + ribbonH;
+        const float dockTopY = barH + ribbonH + docTabsH;
         ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + dockTopY));
         ImGui::SetNextWindowSize(ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
         ImGui::SetNextWindowViewport(vp->ID);

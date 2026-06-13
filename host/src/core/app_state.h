@@ -268,6 +268,55 @@ struct AppState {
     bool wantTree = false;   // AI_CAD_SHOT=tree: scripted doc-smoke flow + screenshot
     bool treeShotDone = false; // guard so doc smoke runs exactly once per shot
 
+    // ---- document tabs (SolidWorks/browser-style multi-document) ----
+    // The worker already keeps every open document alive in its registry (keyed by doc_id); the
+    // host stays SINGLE-document at the DocMirror level (one "active" doc view: tree, mesh,
+    // selection, caches). One DocTab per open doc records the minimum to re-point DocMirror on a
+    // switch + render the strip. Switching activates the doc in the worker (doc_rebuild → tree +
+    // mesh) and refreshes the viewport/tree/selection; per-tab camera is restored so each doc keeps
+    // its view. docTabs is empty only at the empty/start state (no document open).
+    struct DocTab {
+        std::string docId;          // worker doc id (registry key)
+        std::string title;          // display name (doc "name", "Part1"/"Assembly1")
+        bool        isAssembly = false;
+        bool        dirty = false;  // edits since last save (asterisk on the tab)
+        std::string path;           // last saved file path ("" = never saved)
+        // Saved camera so each tab keeps its own view across switches.
+        float yaw = 35, pitch = 28, zoom = 1.0f, pan[3] = {0, 0, 0};
+        bool  camValid = false;     // false until the first switch-away captures the live camera
+    };
+    std::vector<DocTab> docTabs;
+    int activeTab = -1;             // index into docTabs; -1 = no document open (start state)
+    // While true, the DocMirror listener does NOT mark the active tab dirty. Set around a tab
+    // switch / resync / fresh-doc activation (those fire the mirror's listener via doc_rebuild but
+    // are not user edits, so they must not light the unsaved-changes marker).
+    bool suppressTabDirty = false;
+
+    // ---- document-tab operations (implemented in core/doc_tabs.cpp via ui/doc_tabs) ----
+    // Append a tab for an already-created/opened worker doc and make it active (does NOT touch the
+    // worker — the caller already did doc_new/doc_open and the mirror points at it). Captures the
+    // current doc id from docMirror.
+    void addDocTab(bool isAssembly);
+    // Switch the active document to docTabs[idx]: safely exits any in-progress sketch/PM form,
+    // saves the leaving tab's camera, re-points DocMirror at idx's doc (doc_rebuild → tree+mesh),
+    // resets per-doc caches/selection/tree transients, reloads the mesh, restores idx's camera.
+    void switchToTab(int idx);
+    // Close docTabs[idx] (with the worker doc_close). If it was active, activates a neighbor; if it
+    // was the last tab, returns to the empty start state. Does NOT prompt — the caller decides.
+    void closeDocTab(int idx);
+    // Mark the active tab dirty (on any mutation) / clear it (on save). Safe with no active tab.
+    void markActiveTabDirty();
+    void clearActiveTabDirty();
+    // Refresh the active tab's cached title from the current doc tree (after a rename, etc.).
+    void syncActiveTabTitle();
+    // Index of the tab whose docId matches the mirror's current doc, or -1.
+    int  tabIndexForActiveDoc() const;
+    // Reconcile the tab strip with the mirror once per frame: if the mirror holds a document that
+    // has no tab yet (created by a path that doesn't open one itself — sketch auto-create, chat
+    // "new part", an agent v2 run, the assembly panel), append a tab for it and make it active.
+    // Also keeps the active title/kind fresh. Called from the per-frame draw before the strip.
+    void ensureActiveTab();
+
     // ---- topology picking (C15) — id pass + overlays owned by run_gui; AppState borrows ----
     render::IdPass* idPass = nullptr;
     render::Overlays* overlays = nullptr;

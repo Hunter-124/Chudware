@@ -210,6 +210,22 @@ public:
     // NOT mutate the mirror.
     nlohmann::json weldCutList(WorkerClient& w, std::string& err);
 
+    // ---- 2D export (DXF / PDF) — drawing sheets + sheet-metal flat patterns (W14) ----
+    // Both are read-only passthroughs that DON'T touch the mirror. They forward to the worker and
+    // return the written absolute path (empty on error, err filled). `format` is "dxf" or "pdf".
+
+    // export_flat_dxf: the ACTIVE part's flat-pattern outline (layer OUTLINE) + bend lines (layer
+    // BEND) to `path`. Requires the open part to be sheet metal WITH a flat pattern (Flatten
+    // feature); a clean error otherwise. Uses the mirror's current doc id (the open part).
+    std::string exportFlat(WorkerClient& w, const std::string& path,
+                           const std::string& format, std::string& err);
+
+    // export_drawing: an open DRAWING's visible (layer VISIBLE) + hidden (layer HIDDEN) view
+    // geometry to `path`. `drawingDocId` is a drawing registry id (NOT the part doc this mirror
+    // tracks), so it's passed explicitly. Static-style: no mirror state is read or written.
+    std::string exportDrawing(WorkerClient& w, const std::string& drawingDocId,
+                              const std::string& path, const std::string& format, std::string& err);
+
     // Re-pull the document tree + revision from the worker (doc_tree) and fire the listener.
     // C24: the public face of the formerly-private resyncTree — callers that mutated the doc
     // out-of-band (sketch drag/commit/exit, a v2 agent run) use this to bring the mirror back in

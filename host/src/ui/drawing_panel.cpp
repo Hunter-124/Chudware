@@ -6,7 +6,10 @@
 // pxPerMm + screen pan), then stroke the polylines with ImDrawList. We add a paper border, a faint
 // drop shadow, per-view bounding boxes + labels, and a small "Rebuild" / fit affordance.
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -16,8 +19,64 @@
 
 #include "../core/app_state.h"
 #include "../ui_theme.h"
+#include "file_dialog.h"
 
 namespace ui {
+
+// --- 2D export (DXF / PDF) for the active Drawing tab -----------------------------------------
+// Path choice: a native Save-As dialog when available (remembers the Documents folder); when file
+// dialogs are disabled (headless / AI_CAD_NO_FILE_DIALOGS) we fall back to writing next to nothing
+// in the cwd as "<title>_drawing.<ext>" and toast the path. A future nicety: per-sheet export +
+// remembering the last export dir. The engine writes the file via export_drawing.
+static bool s_drawDialogsDisabled() {
+    static const bool disabled = std::getenv("AI_CAD_NO_FILE_DIALOGS") != nullptr;
+    return disabled;
+}
+
+static std::string s_sanitize(const std::string& in) {
+    std::string out;
+    for (char c : in) {
+        if (c == ' ') out += '_';
+        else if (std::isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.') out += c;
+    }
+    if (out.empty()) out = "drawing";
+    return out;
+}
+
+static void exportActiveDrawing(AppState& st, const char* fmt) {
+    if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return;
+    AppState::DocTab& tab = st.docTabs[st.activeTab];
+    if (tab.kind != AppState::DocTab::TabKind::Drawing || tab.drawingDocId.empty()) {
+        st.toast(ui::ToastLevel::Warn, "Open a drawing first");
+        return;
+    }
+    const bool isDxf = std::strcmp(fmt, "dxf") == 0;
+    const std::string ext = isDxf ? "dxf" : "pdf";
+    const std::string base = s_sanitize(tab.title.empty() ? "drawing" : tab.title) + "_drawing";
+
+    std::string path;
+    if (s_drawDialogsDisabled()) {
+        // Headless fallback: write into the current working directory.
+        path = base + "." + ext;
+    } else {
+        const char* filterDxf = "DXF (*.dxf)\0*.dxf\0All files (*.*)\0*.*\0";
+        const char* filterPdf = "PDF (*.pdf)\0*.pdf\0All files (*.*)\0*.*\0";
+        std::string suggest = base + "." + ext;
+        path = ui::saveFileDialog(isDxf ? filterDxf : filterPdf, ext.c_str(), suggest.c_str());
+        if (path.empty()) return;  // canceled
+    }
+
+    std::string err;
+    std::string written = st.docMirror.exportDrawing(st.worker, tab.drawingDocId, path, fmt, err);
+    if (!written.empty()) {
+        st.addLog("[draw] exported " + ext + ": " + written);
+        st.toast(ui::ToastLevel::Info, "Exported " + written);
+    } else {
+        st.addLog("[draw] export " + ext + " failed: " + err);
+        st.toast(ui::ToastLevel::Error,
+                 "Export failed: " + (err.empty() ? std::string("engine error") : err));
+    }
+}
 
 // --- safe JSON readers (tolerate missing keys / null) ---------------------------------------
 static double djnum(const nlohmann::json& o, const char* k, double def = 0.0) {
@@ -109,6 +168,15 @@ void drawDrawingSheet(AppState& st) {
         ImGui::SetTooltip("Re-project from the source part (picks up edits)");
     ImGui::SameLine();
     if (ImGui::SmallButton("Fit")) tab.drawNeedFit = true;
+    // ---- 2D export: DXF (manufacturing) + PDF ----
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Export DXF")) exportActiveDrawing(st, "dxf");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Write this drawing's views to a DXF (layers VISIBLE + HIDDEN)");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Export PDF")) exportActiveDrawing(st, "pdf");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Write this drawing's views to a vector PDF (1:1 mm)");
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
     ImGui::Text("  wheel: zoom   MMB / Space+drag: pan");

@@ -92,6 +92,14 @@ class CompileResult:
     # side-channel, so callers that need this should compile with a fresh cache (see
     # engine.doc.cutlist).
     weld_members: dict[str, Any] = field(default_factory=dict)
+    # Sheet-metal FLAT-PATTERN side-channel: the per-feature flat-pattern records the
+    # ``sm_flat_pattern`` compiler stashes on ``ctx.datums["_sheet_metal_flat"]``
+    # (``{fid: {bend_lines:[…], outline:[…], flat_area, thickness, n_base, …}}``), surfaced onto the
+    # result so the flat-DXF export RPC can read it WITHOUT poking inside the compiler. Empty for docs
+    # with no flat pattern. SAME cache caveat as ``weld_members``: a CACHE-HIT sm_flat_pattern does
+    # not repopulate the side-channel, so callers that need this should compile with a fresh cache
+    # (see engine.doc.export2d.flat_pattern_for_session).
+    sheet_metal_flat: dict[str, Any] = field(default_factory=dict)
     # CONFIG version bump — the configuration this rebuild compiled (the active config's name, or
     # "Default" when the document carries no configurations). Pure echo; absent-config docs report
     # "Default" and are otherwise unchanged.
@@ -613,5 +621,13 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
     wm = datums.get("_weld_members")
     if wm is not None and isinstance(getattr(wm, "obj", None), dict):
         result.weld_members = wm.obj
+
+    # --- Sheet-metal flat-pattern side-channel -----------------------------
+    # sm_flat_pattern stashes per-feature flat records on a sentinel Datum keyed "_sheet_metal_flat"
+    # ({fid: {bend_lines, outline, flat_area, thickness, n_base, …}}). Surface it so the flat-DXF RPC
+    # can read the outline + bend lines.
+    smf = datums.get("_sheet_metal_flat")
+    if smf is not None and isinstance(getattr(smf, "obj", None), dict):
+        result.sheet_metal_flat = smf.obj
 
     return result

@@ -468,4 +468,30 @@ nlohmann::json DocMirror::weldCutList(WorkerClient& w, std::string& err) {
     return res;
 }
 
+// ---- 2D export (DXF / PDF) -------------------------------------------------
+
+std::string DocMirror::exportFlat(WorkerClient& w, const std::string& path,
+                                  const std::string& format, std::string& err) {
+    if (docId_.empty()) { err = "no document open"; return {}; }
+    nlohmann::json res;
+    if (!w.call("export_flat_dxf",
+                {{"doc_id", docId_}, {"path", path}, {"format", format}}, res, err, 60000))
+        return {};
+    // Structured-error methods return {code, message, detail} on failure.
+    if (res.contains("code")) { err = jstr(res, "message"); return {}; }
+    return jstr(res, "path");
+}
+
+std::string DocMirror::exportDrawing(WorkerClient& w, const std::string& drawingDocId,
+                                     const std::string& path, const std::string& format,
+                                     std::string& err) {
+    if (drawingDocId.empty()) { err = "no drawing open"; return {}; }
+    nlohmann::json res;
+    if (!w.call("export_drawing",
+                {{"doc_id", drawingDocId}, {"path", path}, {"format", format}}, res, err, 60000))
+        return {};
+    if (res.contains("code")) { err = jstr(res, "message"); return {}; }
+    return jstr(res, "path");
+}
+
 }  // namespace core

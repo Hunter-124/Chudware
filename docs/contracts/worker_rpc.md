@@ -308,6 +308,27 @@ plane}` → `{symmetric: bool, deviation_mm3}` · `eval_perf {doc_id}` → `{fea
 `import_file {path, into?: doc_id}` → ops-response (adds `import` feature(s)) ·
 `export_file {doc_id, path, format: "step"|"stl"|"brep"|"iges"|"3mf"}` → `{path}`
 
+#### 2D export — drawing sheets + sheet-metal flat patterns (W14, DXF/PDF)
+
+Write the 2D geometry the engine already produces to a manufacturing file. **DXF** is a native R12
+(AC1009) ASCII file: a TABLES section declaring named layers (color + linetype) and an ENTITIES
+section of canonical `POLYLINE`/`VERTEX`/`SEQEND` chains (opens in LibreCAD / AutoCAD / Fusion /
+ezdxf). **PDF** is a single-page 1:1 mm vector page (hand-written PDF 1.4; no library dependency —
+solid strokes for visible/outline, dashed for hidden/bend). Format comes from an explicit `format`
+param else the path extension; structured error envelope; contained errors (bad path/format/no
+geometry) never crash the worker. Implemented by `engine/worker.py` → `engine/doc/export2d.py`
+(+ `engine/doc/dxf.py`, `engine/doc/pdfvec.py`).
+
+| method | params → result |
+|---|---|
+| `export_drawing` | `{doc_id, path, format?:"dxf"\|"pdf"}` → `{path, format, visible, hidden, entities}`. `doc_id` is a **drawing** registry id (from `drawing_new`). Flattens every sheet/view's `visible`+`hidden` polylines (already in absolute sheet-mm) to layers **VISIBLE** (solid) + **HIDDEN** (dashed) and writes the file. `export_failed` when the drawing has no view geometry. |
+| `export_flat_dxf` | `{doc_id, path, format?:"dxf"\|"pdf"}` → `{path, format, bend_lines, outline_points, flat_area, entities}`. `doc_id` is a **part** doc id. The active sheet-metal part's flat pattern: the blank boundary on layer **OUTLINE** + the bend lines on a SEPARATE layer **BEND** (the key sheet-metal split). Compiles with a FRESH cache so `sm_flat_pattern` repopulates its side-channel (same caveat as `weld_cut_list`); `invalid_op` when the part has no flat pattern (add a Flatten feature first) or is an assembly. |
+
+Layer→style: VISIBLE/OUTLINE = white(7)/continuous, HIDDEN = red(1)/dashed, BEND = green(3)/
+continuous. The flat-pattern geometry is surfaced on `CompileResult.sheet_metal_flat`
+(`{fid: {bend_lines, outline, flat_area, n_base, …}}`) from the `sm_flat_pattern` compiler's
+`ctx.datums["_sheet_metal_flat"]` side-channel, then projected to 2D using the stored `n_base`.
+
 ### AI (M9)
 `agent_run_v2 {request, doc_id, options?:{max_stage_attempts?, plan?, roles_override?}}`
 → streams events.md orchestrator events → `{run_id, status, stop_reason, revision}` ·

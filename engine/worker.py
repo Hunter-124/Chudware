@@ -814,6 +814,15 @@ _STRUCTURED_ERROR_METHODS.update({
 _METHODS.update({"weld_cut_list": _weld_cut_list})
 _STRUCTURED_ERROR_METHODS.add("weld_cut_list")
 
+# ---- 2D EXPORT — drawing sheets + sheet-metal flat patterns to DXF/PDF (structured error) ----
+# export_drawing {doc_id(drawing), path, format:"dxf"|"pdf"} and
+# export_flat_dxf {doc_id(part), path, format?:"dxf"|"pdf"} register via their own WORKER_METHODS so
+# the literal above stays owned by the worker integrator.
+from engine.doc import export2d as _export2d  # noqa: E402
+
+_METHODS.update(_export2d.WORKER_METHODS)
+_STRUCTURED_ERROR_METHODS.update({"export_drawing", "export_flat_dxf"})
+
 
 def _emit(obj: dict) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")

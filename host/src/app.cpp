@@ -19,8 +19,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -53,6 +55,7 @@
 #include "ui/sketch_mode.h"   // C18
 #include "ui/config_panel.h"  // Configurations (SolidWorks ConfigurationManager)
 #include "ui/cutlist_panel.h"  // Weldment Cut List (SolidWorks Weldment Cut List)
+#include "ui/file_dialog.h"   // W14: native Save-As for 2D export (flat-pattern DXF)
 #include "ui/toast.h"         // W1-B: toast notifications
 #include "ui/cursors.h"       // W1-B: cursor manager
 // --- C19: simulation + flow + evaluate UI ---
@@ -87,6 +90,56 @@ static void applyFlatPattern(AppState& st) {
     } else if (!r.ok) {
         st.toast(ui::ToastLevel::Warn,
                  r.error_message.empty() ? std::string("Flatten failed") : r.error_message);
+    }
+}
+
+// W14: export the ACTIVE sheet-metal part's flat pattern to DXF (outline on layer OUTLINE, bend
+// lines on layer BEND). One-click Sheet Metal command (no PM form) — picks a path (native Save-As,
+// or cwd fallback when dialogs are disabled) then calls export_flat_dxf via DocMirror. The engine
+// computes the flat (fresh compile) and errors cleanly if the part has no flat pattern.
+static void exportFlatDxf(AppState& st) {
+    if (!st.docMirror.hasDoc()) {
+        st.toast(ui::ToastLevel::Info, "Open a sheet metal part first");
+        return;
+    }
+    // Suggested file name from the doc title.
+    std::string title = st.docMirror.tree().is_object()
+                            ? st.docMirror.tree().value("name", std::string("part"))
+                            : std::string("part");
+    std::string base;
+    for (char c : title) {
+        if (c == ' ') base += '_';
+        else if (std::isalnum((unsigned char)c) || c == '_' || c == '-') base += c;
+    }
+    if (base.empty()) base = "part";
+    base += "_flat";
+
+    const bool dialogsDisabled = std::getenv("AI_CAD_NO_FILE_DIALOGS") != nullptr;
+    std::string path;
+    if (dialogsDisabled) {
+        path = (std::filesystem::current_path() / (base + ".dxf")).string();
+    } else {
+        const char* filter = "DXF (*.dxf)\0*.dxf\0PDF (*.pdf)\0*.pdf\0All files (*.*)\0*.*\0";
+        path = ui::saveFileDialog(filter, "dxf", (base + ".dxf").c_str());
+        if (path.empty()) return;  // canceled
+    }
+    // Format follows the chosen extension (export_flat_dxf accepts dxf|pdf; defaults to the ext).
+    std::string fmt = "dxf";
+    if (path.size() >= 4) {
+        std::string tail = path.substr(path.size() - 4);
+        for (auto& ch : tail) ch = (char)std::tolower((unsigned char)ch);
+        if (tail == ".pdf") fmt = "pdf";
+    }
+
+    std::string err;
+    std::string written = st.docMirror.exportFlat(st.worker, path, fmt, err);
+    if (!written.empty()) {
+        st.addLog("[sm] exported flat " + fmt + ": " + written);
+        st.toast(ui::ToastLevel::Info, "Exported " + written);
+    } else {
+        st.addLog("[sm] export flat failed: " + err);
+        st.toast(ui::ToastLevel::Warn,
+                 err.empty() ? std::string("Export Flat DXF failed") : err);
     }
 }
 
@@ -255,6 +308,7 @@ int run_gui(const char* screenshotPath) {
         // C19: Simulation tab -> sim panel; Evaluate tab -> evaluate dialogs.
         std::string cmd(cmd_id);
         if (cmd == "sm_flat_pattern") { applyFlatPattern(st); return; }  // W16: one-click Flatten
+        if (cmd == "sm_export_flat_dxf") { exportFlatDxf(st); return; }  // W14: flat-pattern DXF
         if (cmd.rfind("sim_", 0) == 0 && simPanel.handleCommand(st, cmd)) return;
         if (cmd.rfind("eval_", 0) == 0 && evaluateDialogs.handleCommand(st, cmd)) return;
         std::printf("[ribbon] %s (no PM form)\n", cmd_id);
@@ -277,6 +331,7 @@ int run_gui(const char* screenshotPath) {
         if (propertyManager.openForCommand(st, cmd_id)) return;
         std::string cmd(cmd_id);
         if (cmd == "sm_flat_pattern") { applyFlatPattern(st); return; }  // W16: one-click Flatten
+        if (cmd == "sm_export_flat_dxf") { exportFlatDxf(st); return; }  // W14: flat-pattern DXF
         if (cmd.rfind("sim_", 0) == 0 && simPanel.handleCommand(st, cmd)) return;
         if (cmd.rfind("eval_", 0) == 0 && evaluateDialogs.handleCommand(st, cmd)) return;
         std::printf("[ribbon] %s (no PM form)\n", cmd_id);

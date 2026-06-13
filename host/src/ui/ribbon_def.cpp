@@ -235,6 +235,9 @@ static const RibbonCmd kCmds[] = {
     { "sm_edge_flange",      "Edge Flange",     "shell",            "Sheet Metal", "Create",      true,  nullptr,          false },
     // W16: one-click Flatten — adds the param-less sm_flat_pattern feature (handled in app.cpp).
     { "sm_flat_pattern",     "Flatten",         "shell",            "Sheet Metal", "Flat Pattern",true,  nullptr,          false },
+    // W14: export the flat pattern (outline on layer OUTLINE + bend lines on layer BEND) to DXF.
+    // One-click command (no PM form) — handled in app.cpp like Flatten, via export_flat_dxf.
+    { "sm_export_flat_dxf",  "Export Flat DXF", "section_props",    "Sheet Metal", "Flat Pattern",true,  nullptr,          false },
 
     // =========================================================================
     // Tab: Weldments — sweeps a library profile along a path sketch's segments.

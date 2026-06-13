@@ -334,6 +334,57 @@ def _sketch_project_ref(params: dict, _emit: EmitFn) -> dict:
     return docsess.sketch_project_ref(s, params["sketch"], params.get("ref"))
 
 
+# =========================================================================== CONFIG config_* RPC
+#
+# Named configurations (param overrides + feature/component suppression). All config_* methods take
+# {doc_id, ...}. config_list is read-only; the rest mutate the doc (one undoable step) and return
+# the ops-response. config_activate / editing-the-active-config rebuild; editing an inactive config
+# is a metadata-only write that reuses the last build. Structured error envelope.
+
+
+def _config_list(params: dict, _emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    return docsess.config_list(docsess.get_session(params["doc_id"]))
+
+
+def _config_add(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.config_add(s, params["name"], params.get("copy_from"),
+                              emit=_doc_emit(emit))
+
+
+def _config_delete(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.config_delete(s, params["name"], emit=_doc_emit(emit))
+
+
+def _config_activate(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.config_activate(s, params["name"], emit=_doc_emit(emit))
+
+
+def _config_set_override(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    # value == null (and no clear flag) means CLEAR the override (use the base param value).
+    value = params.get("value")
+    clear = bool(params.get("clear", False)) or value is None
+    return docsess.config_set_override(s, params["name"], params["feature_id"],
+                                       params["param"], value, clear=clear,
+                                       emit=_doc_emit(emit))
+
+
+def _config_set_suppression(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.config_set_suppression(s, params["name"], params["feature_id"],
+                                          bool(params.get("suppressed", False)),
+                                          emit=_doc_emit(emit))
+
+
 # =========================================================================== eval_* RPC (C12)
 #
 # Per reports.md §C12: nine handlers over the active document's bodies. Field handlers tessellate
@@ -735,6 +786,20 @@ _STRUCTURED_ERROR_METHODS = {
 # ---- ask mode (Wave D) — registered via update/add so the literals above stay frozen ----
 _METHODS.update({"agent_ask_v2": _agent_ask_v2})
 _STRUCTURED_ERROR_METHODS.add("agent_ask_v2")
+
+# ---- CONFIG configurations — config_* RPCs (registered via update so the literal stays frozen) --
+_METHODS.update({
+    "config_list": _config_list,
+    "config_add": _config_add,
+    "config_delete": _config_delete,
+    "config_activate": _config_activate,
+    "config_set_override": _config_set_override,
+    "config_set_suppression": _config_set_suppression,
+})
+_STRUCTURED_ERROR_METHODS.update({
+    "config_list", "config_add", "config_delete", "config_activate",
+    "config_set_override", "config_set_suppression",
+})
 
 
 def _emit(obj: dict) -> None:

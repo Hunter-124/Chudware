@@ -111,6 +111,35 @@ a cancel is a single `doc_revert`; (3) on release, `doc_revert` to the checkpoin
 `doc_push_pull(commit:true)`, which is the single undoable step. A degenerate/failed rebuild rolls
 the document fully back and returns `draggable:false` with a reason (never corrupts the doc).
 
+#### 2.2 Configurations (CONFIG — `config_*`)
+
+Named configurations: variants of one part/assembly driven by per-config feature-param overrides +
+feature/component suppression (doc_schema.md §9). All `config_*` methods take `{doc_id, …}` and use
+the structured error envelope. `config_list` is read-only; every other `config_*` method is a single
+**undoable** document edit that bumps the revision and returns the full **ops-response**
+(`revision`/`id_map`/`tree`/`rebuild`/`tess`/`owner_map`). Activating a config — or editing the
+**active** config — rebuilds; editing an **inactive** config is a metadata-only write that reuses the
+last build but still returns the ops-response so the host refreshes its config table.
+
+| method | params → result |
+|---|---|
+| `config_list` | `{doc_id}` → `{configurations:[name…], active, detail:[{name, param_overrides, suppressions}]}` (read-only, no rebuild). A config-less doc reports the single implicit `["Default"]`, `active:"Default"` |
+| `config_add` | `{doc_id, name, copy_from?}` → ops-response. Adds a config (optionally seeding overrides/suppressions from `copy_from`). Does NOT activate it (reuses the last build). `invalid_op` on a duplicate name |
+| `config_delete` | `{doc_id, name}` → ops-response. Deletes a config; deleting the ACTIVE one falls the active pointer back to the first remaining config and rebuilds. The LAST config cannot be deleted |
+| `config_activate` | `{doc_id, name}` → ops-response for the NEW active config (tree/rebuild/tess reflect its overrides + suppression). `invalid_op` on an unknown name |
+| `config_set_override` | `{doc_id, name, feature_id, param, value}` → ops-response. Sets a per-config override of `feature_id.param`; `value` is a scalar or a `{value, expr}` dim. `value: null` (or `clear: true`) CLEARS the override (the base param value is used) |
+| `config_set_suppression` | `{doc_id, name, feature_id, suppressed}` → ops-response. Sets a per-config suppression of `feature_id` (a `k<N>` component id in assemblies). `suppressed: false` drops the entry (configs stay minimal) |
+
+The active configuration is surfaced on the ops-response at `rebuild.doc_status.active_configuration`
+(the config the returned geometry reflects; `"Default"` for config-less docs). A `config_*` edit that
+would produce an invalid document (e.g. an override/suppression naming a non-existent feature) is
+rejected with `invalid_op` and the session document is left **unchanged**. A config that fails to
+compile reports per-feature errors in `rebuild.feature_status` exactly like a normal rebuild.
+
+Implemented by `engine/worker.py` (`config_*`) over `engine/doc/session.py`
+(`config_list`/`config_add`/`config_delete`/`config_activate`/`config_set_override`/
+`config_set_suppression`); machine-checked by `engine/doc/test_configurations.py`.
+
 ### Sketch interaction (M2)
 | method | params → result |
 |---|---|

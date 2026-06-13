@@ -17,6 +17,15 @@
 > - `distance` constraints may carry `axis:"h"|"v"` (§3.3);
 > - the part/assembly document may carry `rollback_after: <feature id>|null` (the rollback bar, §1).
 > A future change to any EXISTING field's meaning would still require the schema-string bump.
+>
+> **CONFIG migration (additive, no schema-string bump).** Two OPTIONAL top-level fields are added to
+> `aicad.part/1` AND `aicad.asm/1` — `configurations` (a list) + `active_configuration` (a name); see
+> §9. They drive named part/assembly variants by per-config feature-param overrides + feature
+> (and, in assemblies, component) suppression. **ABSENT `configurations` is exactly today's
+> behavior**: the document compiles as a single implicit `"Default"` configuration and is
+> byte-identical to a pre-CONFIG rebuild — so every existing document remains valid and unchanged,
+> and the schema string stays `aicad.part/1` / `aicad.asm/1`. This is the SECOND additive doc-schema
+> version bump of the SolidWorks-class overhaul (the first being the C35-overhaul fields above).
 
 ## 0. Conventions
 
@@ -328,3 +337,63 @@ Canonical units mm. A projection failure on one view is **contained**: that view
 The 2D view-geometry JSON shape (what `drawing_get` / `drawing_add_view` return per view) is
 normative in [worker_rpc.md §Drawings](worker_rpc.md). Implemented + machine-checked by
 `engine/doc/drawing.py` + `engine/doc/schema.py::validate_drawing`.
+
+## 9. Configurations (CONFIG — additive)
+
+A part (`aicad.part/1`) or assembly (`aicad.asm/1`) document MAY carry named **configurations** —
+variants of the one document driven by per-config feature-param overrides + feature (and, in
+assemblies, component) suppression. This is the SolidWorks "Configurations" feature.
+
+```json
+{
+  "schema": "aicad.part/1",
+  "…": "…",
+  "features": [ … ],
+  "configurations": [
+    {"name": "Default", "param_overrides": {}, "suppressions": {}},
+    {"name": "Small",
+     "param_overrides": {"f2.depth": {"value": 20, "expr": null}},
+     "suppressions": {"f3": true}},
+    {"name": "Large",
+     "param_overrides": {"f2.depth": {"value": 40, "expr": null}},
+     "suppressions": {}}
+  ],
+  "active_configuration": "Small"
+}
+```
+
+- `configurations` — OPTIONAL list. Each entry:
+  - `name` — non-empty, **unique** within the document. The display + lookup key.
+  - `param_overrides` — object keyed `"<feature_id>.<param_key>"`; the value REPLACES that feature's
+    stored `params[<param_key>]` when the config is active. The value is whatever the param holds —
+    a scalar (`int`/`bool`/`str`), an array, or a **dimension value** `{value, expr}` (dim-shaped
+    overrides are validated like any stored dim). The key's `<feature_id>` must exist and (for the
+    structural check) `<param_key>` must be a key of that feature's `params`.
+  - `suppressions` — object keyed by `<feature_id>` (and, in assemblies, `<component_id>` `k<N>`) →
+    `bool`. A `true` entry suppresses that feature/component **in addition to** its base
+    `suppressed` flag (the effective flag is `base.suppressed OR config.suppressions[id]`). A
+    `false`/absent entry does nothing. The id must exist.
+- `active_configuration` — OPTIONAL name of the active config. When `configurations` is present but
+  this is absent/unknown, the **first** configuration is active. When `configurations` is absent it
+  has no meaning (and validates only as a string-or-null).
+
+**Absent = implicit Default (byte-identical).** A document with no `configurations` (or an empty
+list) compiles as a single implicit configuration named `"Default"` with no overrides and no extra
+suppression — i.e. exactly the pre-CONFIG behavior. Such a document is byte-for-byte valid and
+compiles to identical geometry, status, and topology as before this version. The compiler echoes the
+active config name on its result (`"Default"` for config-less docs).
+
+**Compile semantics.** Activating a config recompiles the model with the active config's overrides +
+suppression applied to a **non-mutating overlay** of the stored feature list — the stored document is
+never edited. Everything else (equation resolution, per-feature caching, owner-tagging, tessellation)
+flows unchanged; the compile cache keys on the active config so switching configs recomputes only
+what changed and caches per-config (switching back is a cache hit). A config that fails to compile
+reports per-feature errors like any normal rebuild — it never crashes.
+
+**Persistence.** `configurations` + `active_configuration` are part of `document.json` and round-trip
+through `.step+` save/open. Reopening recompiles the active configuration.
+
+Implemented + machine-checked by `engine/doc/schema.py::_validate_configurations`,
+`engine/doc/compiler.py` (`resolve_active_config` / `apply_configuration_to_doc` /
+`_config_effective_features`), and `engine/doc/test_configurations.py`. The `config_*` worker RPCs
+that drive configurations live in [worker_rpc.md §Configurations](worker_rpc.md).

@@ -87,6 +87,10 @@ class DocSession:
     # C35-overhaul §5 — live PropertyManager-cancel checkpoints: id -> doc-JSON snapshot string.
     # Multiple live checkpoints allowed; all cleared on doc close/new/open.
     checkpoints: dict[str, str] = field(default_factory=dict)
+    # CONFIG — name of the last-compiled active configuration (mirrors the compiled
+    # CompileResult.active_configuration; "Default" for config-less docs). Surfaced in the
+    # ops-response doc_status so the host's config switcher knows which config the geometry reflects.
+    active_configuration: str = "Default"
 
     @property
     def is_assembly(self) -> bool:
@@ -230,15 +234,25 @@ def _rebuild(session: DocSession, emit: EmitFn | None = None) -> CompileResult:
     result = compile_document(session.doc, session.compile_cache)
     maybe_progress("compiled")
     session.last_result = result
+    session.active_configuration = result.active_configuration
     return result
 
 
 def _rebuild_assembly(session: DocSession) -> None:
-    """Compile the assembly: solve mates, write solved transforms back into the doc, cache result."""
+    """Compile the assembly: solve mates, write solved transforms back into the doc, cache result.
+
+    The active configuration is overlaid onto a NON-MUTATING effective doc first (param overrides +
+    feature/component suppression), so an assembly config recompiles the mated model with those
+    components dropped / params changed. Solved transforms are written back to the ORIGINAL doc
+    (matched by component id) so save still captures the mated pose; suppressed-out components keep
+    their stored transform untouched."""
     from engine.doc import assembly as asm
+    from engine.doc.compiler import apply_configuration_to_doc
     base_dir = os.path.dirname(session.path) if session.path else None
-    ares = asm.compile_assembly(session.doc, base_dir=base_dir, warm=session.asm_warm or None)
-    # Persist solved transforms back into the document (so save captures the mated pose).
+    active_name, eff_doc = apply_configuration_to_doc(session.doc)
+    session.active_configuration = active_name
+    ares = asm.compile_assembly(eff_doc, base_dir=base_dir, warm=session.asm_warm or None)
+    # Persist solved transforms back into the (original) document (so save captures the mated pose).
     for comp in session.doc.get("components", []):
         if comp["id"] in ares.transforms:
             comp["transform"] = ares.transforms[comp["id"]]
@@ -362,7 +376,9 @@ def _doc_status(session: DocSession, result: CompileResult) -> dict:
     mates_status = None
     if session.is_assembly and session.asm_result is not None:
         mates_status = "over" if session.asm_result.over_defined else "ok"
-    return {"active_sketch": st.last_overall_status if st else None, "mates": mates_status}
+    return {"active_sketch": st.last_overall_status if st else None, "mates": mates_status,
+            # CONFIG — which configuration the geometry in this response reflects.
+            "active_configuration": session.active_configuration}
 
 
 def _ops_response(session: DocSession, result: CompileResult,
@@ -668,6 +684,229 @@ def set_explode_state(session: DocSession, active: bool, factor: float,
     if session.last_result is None:
         session.last_result = CompileResult()
     return _ops_response(session, session.last_result, {})
+
+
+# =========================================================================== CONFIG configurations
+#
+# Named configurations: variants of one document driven by per-config feature-param overrides +
+# feature/component suppression (the SolidWorks "Configurations" feature). The doc stores
+#   configurations: [{name, param_overrides:{"fid.key": value|{value,expr}}, suppressions:{fid: bool}}]
+#   active_configuration: <name>
+# ABSENT configurations => one implicit "Default" config (today's behavior). Activating/editing the
+# ACTIVE config rebuilds (geometry changes); editing an inactive config is a cheap metadata write
+# that still bumps the revision (one undoable step) but reuses the last build. All config edits go
+# through _config_commit, which validates the resulting doc, pushes one undo snapshot, bumps the
+# revision, and (when geometry could change) rebuilds.
+
+
+def _ensure_configs(doc: dict) -> list[dict]:
+    """The doc's configurations list, materializing the implicit Default on first real edit.
+
+    A config-less document carries no ``configurations`` key (so it stays byte-identical until the
+    user first touches configs). The first config edit creates an explicit ``Default`` config so the
+    list is never empty and ``active_configuration`` always names a real entry — mirroring SolidWorks,
+    where a part always has at least one (Default) configuration once you open the ConfigurationManager."""
+    configs = doc.get("configurations")
+    if not isinstance(configs, list):
+        configs = []
+        doc["configurations"] = configs
+    if not configs:
+        configs.append({"name": "Default", "param_overrides": {}, "suppressions": {}})
+        doc.setdefault("active_configuration", "Default")
+    return configs
+
+
+def _config_snapshot(doc: dict):
+    """Deep-copy the pre-edit (configurations, active_configuration) for rollback on invalid edits."""
+    cfgs = doc.get("configurations")
+    return (copy.deepcopy(cfgs) if cfgs is not None else None,
+            doc.get("active_configuration"))
+
+
+def _find_config(doc: dict, name: str) -> dict:
+    for c in doc.get("configurations", []) or []:
+        if isinstance(c, dict) and c.get("name") == name:
+            return c
+    raise OpError("invalid_op", f"no configuration named '{name}'",
+                  {"reason": "unknown configuration", "name": name})
+
+
+def _config_active_name(doc: dict) -> str:
+    """The active config name, honoring the implicit-Default + first-config fallbacks."""
+    from engine.doc.compiler import resolve_active_config
+    return resolve_active_config(doc)[0]
+
+
+def config_list(session: DocSession) -> dict:
+    """Read-only: configuration names + the active one (worker_rpc config_list). Never rebuilds.
+
+    For a config-less document this reports the single implicit ``["Default"]`` with
+    ``active="Default"`` so the host always has at least one config to show."""
+    configs = session.doc.get("configurations")
+    if isinstance(configs, list) and configs:
+        names = [c.get("name") for c in configs if isinstance(c, dict)]
+        active = _config_active_name(session.doc)
+    else:
+        names = ["Default"]
+        active = "Default"
+    # Echo each config's override/suppression payload so the host can render the config table.
+    detail = []
+    for c in (configs or []):
+        if isinstance(c, dict):
+            detail.append({"name": c.get("name"),
+                           "param_overrides": c.get("param_overrides", {}) or {},
+                           "suppressions": c.get("suppressions", {}) or {}})
+    if not detail:
+        detail = [{"name": "Default", "param_overrides": {}, "suppressions": {}}]
+    return {"configurations": names, "active": active, "detail": detail}
+
+
+def _config_commit(session: DocSession, *, rebuild_needed: bool,
+                   emit: EmitFn | None = None) -> dict:
+    """Validate the edited doc, push one undo step, bump the revision, and (re)build.
+
+    ``rebuild_needed`` True forces a fresh compile of the (now possibly different) active config;
+    False reuses the last build (an inactive-config metadata edit) but still emits the ops-response
+    so the host refreshes its config table. Validation failure raises OpError WITHOUT mutating the
+    session (the caller already mutated session.doc, so we must validate BEFORE this is called and
+    let the OpError propagate — see callers, which validate first)."""
+    session._push_undo()
+    session.revision += 1
+    session.dirty = True
+    if rebuild_needed:
+        # Switching/editing the active config changes geometry — drop warm sketch state (the active
+        # sketch may now solve different seeds) and recompile. Clear the compile cache first: a
+        # region-consuming feature (extrude/revolve/sweep/loft) reads its profile from the upstream
+        # sketch's compiler side-channel, which a CACHE-HIT sketch does not repopulate. Switching a
+        # config recompiles the changed (override/suppress) features while their unchanged sketch
+        # would be a hit, so without this clear the consumer would see "sketch not compiled". Same
+        # targeted clear apply_ops uses for region-selector batches.
+        session.compile_cache.clear()
+        if session.active_sketch is not None:
+            session.active_sketch.solve_state = None
+        result = _rebuild(session, emit)
+    else:
+        result = session.last_result if session.last_result is not None else _rebuild(session, emit)
+    return _ops_response(session, result, {})
+
+
+def _validate_or_rollback(session: DocSession, before_configs, before_active) -> None:
+    """Validate the edited document; on failure RESTORE the pre-edit config state and raise.
+
+    A config mutator edits ``session.doc`` in place (it holds direct references into the live
+    configurations). If the result is invalid (e.g. an override naming a non-existent feature), we
+    must not leave the session document in a broken state — so the mutator passes the deep-copied
+    pre-edit ``configurations`` + ``active_configuration`` and we revert them before raising."""
+    from engine.doc.schema import validate_document
+    errs = validate_document(session.doc)
+    if errs:
+        if before_configs is None:
+            session.doc.pop("configurations", None)
+        else:
+            session.doc["configurations"] = before_configs
+        if before_active is None:
+            session.doc.pop("active_configuration", None)
+        else:
+            session.doc["active_configuration"] = before_active
+        raise OpError("invalid_op", "configuration edit produced an invalid document: "
+                      + "; ".join(errs[:5]), {"reason": "invalid configuration", "errors": errs})
+
+
+def config_add(session: DocSession, name: str, copy_from: str | None = None,
+               emit: EmitFn | None = None) -> dict:
+    """Add a new configuration (worker_rpc config_add). ``copy_from`` (optional) seeds the new
+    config's overrides/suppressions from an existing one. Does NOT activate it (no geometry change),
+    so it reuses the last build. Duplicate names are a clean error."""
+    if not isinstance(name, str) or not name:
+        raise OpError("invalid_op", "config_add: 'name' must be a non-empty string",
+                      {"reason": "bad name"})
+    before = _config_snapshot(session.doc)
+    configs = _ensure_configs(session.doc)
+    if any(c.get("name") == name for c in configs):
+        raise OpError("invalid_op", f"config_add: configuration '{name}' already exists",
+                      {"reason": "duplicate name", "name": name})
+    seed = {"param_overrides": {}, "suppressions": {}}
+    if copy_from is not None:
+        src = _find_config(session.doc, copy_from)
+        seed = {"param_overrides": copy.deepcopy(src.get("param_overrides", {}) or {}),
+                "suppressions": copy.deepcopy(src.get("suppressions", {}) or {})}
+    configs.append({"name": name, **seed})
+    _validate_or_rollback(session, *before)
+    return _config_commit(session, rebuild_needed=False, emit=emit)
+
+
+def config_delete(session: DocSession, name: str, emit: EmitFn | None = None) -> dict:
+    """Delete a configuration (worker_rpc config_delete). Deleting the ACTIVE config falls the
+    active pointer back to the first remaining config and rebuilds. The LAST config cannot be
+    deleted (a document always keeps at least one configuration)."""
+    configs = session.doc.get("configurations")
+    if not isinstance(configs, list) or not configs:
+        raise OpError("invalid_op", f"config_delete: no configuration '{name}' to delete",
+                      {"reason": "no configurations"})
+    if not any(c.get("name") == name for c in configs):
+        raise OpError("invalid_op", f"config_delete: no configuration named '{name}'",
+                      {"reason": "unknown configuration", "name": name})
+    if len(configs) == 1:
+        raise OpError("invalid_op", "config_delete: cannot delete the only configuration",
+                      {"reason": "last configuration"})
+    before = _config_snapshot(session.doc)
+    was_active = _config_active_name(session.doc) == name
+    session.doc["configurations"] = [c for c in configs if c.get("name") != name]
+    if was_active:
+        session.doc["active_configuration"] = session.doc["configurations"][0].get("name")
+    _validate_or_rollback(session, *before)
+    return _config_commit(session, rebuild_needed=was_active, emit=emit)
+
+
+def config_activate(session: DocSession, name: str, emit: EmitFn | None = None) -> dict:
+    """Activate a configuration (worker_rpc config_activate) → rebuild + ops-response for the new
+    active config (tree/rebuild/tess reflect its overrides + suppressions)."""
+    before = _config_snapshot(session.doc)
+    _ensure_configs(session.doc)
+    _find_config(session.doc, name)  # raises if unknown
+    session.doc["active_configuration"] = name
+    _validate_or_rollback(session, *before)
+    return _config_commit(session, rebuild_needed=True, emit=emit)
+
+
+def config_set_override(session: DocSession, name: str, feature_id: str, param: str,
+                        value: Any, clear: bool = False, emit: EmitFn | None = None) -> dict:
+    """Set or clear a per-config param override (worker_rpc config_set_override).
+
+    ``value`` is the override (a scalar, or a ``{value, expr}`` dim object); pass ``clear=True``
+    (or ``value=None`` with no expr) to REMOVE the override so the base param value is used. Editing
+    the active config rebuilds; editing an inactive config is a metadata-only write."""
+    before = _config_snapshot(session.doc)
+    cfg = _find_config(session.doc, name)
+    key = f"{feature_id}.{param}"
+    overrides = cfg.setdefault("param_overrides", {})
+    if clear or value is None:
+        overrides.pop(key, None)
+    else:
+        overrides[key] = value
+    _validate_or_rollback(session, *before)
+    rebuild_needed = _config_active_name(session.doc) == name
+    return _config_commit(session, rebuild_needed=rebuild_needed, emit=emit)
+
+
+def config_set_suppression(session: DocSession, name: str, feature_id: str,
+                           suppressed: bool, emit: EmitFn | None = None) -> dict:
+    """Set a per-config feature/component suppression (worker_rpc config_set_suppression).
+
+    Setting ``suppressed=False`` records an explicit un-suppress (the feature compiles even if its
+    base is suppressed-by-config elsewhere)? No — the overlay is base.suppressed OR config flag, so
+    a False entry is a no-op vs. absent; we therefore DROP a False entry to keep configs minimal.
+    Editing the active config rebuilds."""
+    before = _config_snapshot(session.doc)
+    cfg = _find_config(session.doc, name)
+    sup = cfg.setdefault("suppressions", {})
+    if suppressed:
+        sup[feature_id] = True
+    else:
+        sup.pop(feature_id, None)
+    _validate_or_rollback(session, *before)
+    rebuild_needed = _config_active_name(session.doc) == name
+    return _config_commit(session, rebuild_needed=rebuild_needed, emit=emit)
 
 
 # --------------------------------------------------------------------------- resolve pick

@@ -620,6 +620,94 @@ def _validate_rollback(doc: dict, feature_ids: set[str]) -> list[str]:
     return []
 
 
+def _validate_configurations(doc: dict, features_by_id: dict[str, dict]) -> list[str]:
+    """Optional doc-level ``configurations`` + ``active_configuration`` (CONFIG version bump).
+
+    A part/assembly may carry NAMED configurations — variants of one document driven by per-config
+    feature-param overrides and/or feature suppression. The shape::
+
+        "configurations": [
+            {"name": str,
+             "param_overrides": {"<feature_id>.<param_key>": <value | {value, expr}>},
+             "suppressions": {"<feature_id>": bool}}
+        ],
+        "active_configuration": "<name>"
+
+    ABSENT ``configurations`` => exactly today's behavior (one implicit "Default" config). The
+    validator checks: names are non-empty + unique; ``active_configuration`` (when present) names a
+    real config; each override key is ``fid.param`` referencing an existing feature whose params
+    carry that key; each suppression key references an existing feature. ``param_overrides`` values
+    that look like dims (``{value, expr}``) are dim-validated. Errors are clean (no exception)."""
+    configs = doc.get("configurations")
+    if configs is None:
+        # active_configuration is meaningless without a configurations list; flag a stray pointer.
+        ac = doc.get("active_configuration")
+        if ac is not None and not isinstance(ac, str):
+            return ["active_configuration: must be a configuration name string or null"]
+        return []
+    if not isinstance(configs, list):
+        return ["configurations: must be a list"]
+
+    errs: list[str] = []
+    names: set[str] = set()
+    for i, cfg in enumerate(configs):
+        loc = f"configurations[{i}]"
+        if not isinstance(cfg, dict):
+            errs.append(f"{loc}: must be an object")
+            continue
+        name = cfg.get("name")
+        if not isinstance(name, str) or not name:
+            errs.append(f"{loc}.name: required non-empty string")
+        elif name in names:
+            errs.append(f"{loc}.name: duplicate '{name}'")
+        else:
+            names.add(name)
+
+        overrides = cfg.get("param_overrides", {})
+        if overrides is None:
+            overrides = {}
+        if not isinstance(overrides, dict):
+            errs.append(f"{loc}.param_overrides: must be an object")
+        else:
+            for key, val in overrides.items():
+                kloc = f"{loc}.param_overrides.{key}"
+                if not isinstance(key, str) or "." not in key:
+                    errs.append(f"{kloc}: key must be '<feature_id>.<param_key>'")
+                    continue
+                fid, _, pkey = key.partition(".")
+                feat = features_by_id.get(fid)
+                if feat is None:
+                    errs.append(f"{kloc}: feature '{fid}' does not exist")
+                    continue
+                params = feat.get("params")
+                if isinstance(params, dict) and pkey not in params:
+                    errs.append(f"{kloc}: feature '{fid}' has no param '{pkey}'")
+                # Dim-shaped override values get the same structural check as stored dims.
+                if isinstance(val, dict) and ("value" in val or "expr" in val):
+                    errs += validate_dim(val, kloc, set())
+
+        sup = cfg.get("suppressions", {})
+        if sup is None:
+            sup = {}
+        if not isinstance(sup, dict):
+            errs.append(f"{loc}.suppressions: must be an object")
+        else:
+            for fid, flag in sup.items():
+                sloc = f"{loc}.suppressions.{fid}"
+                if fid not in features_by_id:
+                    errs.append(f"{sloc}: feature '{fid}' does not exist")
+                if not isinstance(flag, bool):
+                    errs.append(f"{sloc}: must be a bool")
+
+    ac = doc.get("active_configuration")
+    if ac is not None:
+        if not isinstance(ac, str):
+            errs.append("active_configuration: must be a configuration name string or null")
+        elif ac not in names:
+            errs.append(f"active_configuration: '{ac}' is not a defined configuration")
+    return errs
+
+
 def _validate_common(doc: dict, schema: str) -> list[str]:
     errs: list[str] = []
     if doc.get("schema") != schema:
@@ -650,6 +738,7 @@ def validate_part(doc: Any) -> list[str]:
     earlier: set[str] = set(RESERVED_DATUMS)
     seen: set[str] = set()
     feat_ids: set[str] = set()
+    feats_by_id: dict[str, dict] = {}
     for i, f in enumerate(feats):
         fid = f.get("id") if isinstance(f, dict) else None
         loc = f"features[{i}]({fid})"
@@ -660,7 +749,10 @@ def validate_part(doc: Any) -> list[str]:
             seen.add(fid)
             earlier.add(fid)
             feat_ids.add(fid)
+            if isinstance(f, dict):
+                feats_by_id[fid] = f
     errs += _validate_rollback(doc, feat_ids)
+    errs += _validate_configurations(doc, feats_by_id)
     return errs
 
 
@@ -750,6 +842,7 @@ def validate_assembly(doc: Any) -> list[str]:
         feats = []
     earlier: set[str] = set(RESERVED_DATUMS)
     asm_feat_ids: set[str] = set()
+    asm_feats_by_id: dict[str, dict] = {}
     for i, f in enumerate(feats):
         fid = f.get("id") if isinstance(f, dict) else None
         errs += validate_feature(
@@ -758,7 +851,10 @@ def validate_assembly(doc: Any) -> list[str]:
         if isinstance(fid, str):
             earlier.add(fid)
             asm_feat_ids.add(fid)
+            if isinstance(f, dict):
+                asm_feats_by_id[fid] = f
     errs += _validate_rollback(doc, asm_feat_ids)
+    errs += _validate_configurations(doc, asm_feats_by_id)
 
     explode = doc.get("explode", [])
     if not isinstance(explode, list):

@@ -29,7 +29,7 @@ Response (also returned by `doc_undo`/`doc_redo`/`doc_rebuild`):
       {"id": "f5", "ok": false, "ms": 1.0, "error": "fillet failed: radius 12 exceeds…",
        "dangling_refs": ["edges[1]"]}
     ],
-    "doc_status": {"active_sketch": null, "mates": null}
+    "doc_status": {"active_sketch": null, "mates": null, "active_configuration": "Default"}
   },
   "tess": {"aicm_path": "…\\doc_6f0c_r18.aicm",
            "bodies": [{"body_id": 1, "name": "Body1", "color": [0.71,0.76,0.82]}]}
@@ -37,7 +37,9 @@ Response (also returned by `doc_undo`/`doc_redo`/`doc_rebuild`):
 ```
 
 - `doc_status.active_sketch`: `"under" | "full" | "over" | null`; `doc_status.mates`:
-  `"ok" | "over" | null` (assemblies).
+  `"ok" | "over" | null` (assemblies). `doc_status.active_configuration`: the name of the
+  configuration the returned geometry reflects (`"Default"` for documents without configurations —
+  doc_schema.md §9 / worker_rpc.md §2.2).
 - `id_map` maps batch placeholders (§3) to assigned ids.
 
 ## 2. Transactionality (normative)

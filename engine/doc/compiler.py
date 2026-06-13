@@ -85,6 +85,10 @@ class CompileResult:
     cache_hits: int = 0
     cache_misses: int = 0
     equations_error: str | None = None
+    # CONFIG version bump — the configuration this rebuild compiled (the active config's name, or
+    # "Default" when the document carries no configurations). Pure echo; absent-config docs report
+    # "Default" and are otherwise unchanged.
+    active_configuration: str = "Default"
 
 
 # --------------------------------------------------------------------------- cache
@@ -252,6 +256,118 @@ def _top_body(bodies: list[Any]):
     return bodies[-1] if bodies else None
 
 
+# --------------------------------------------------------------------------- configurations
+
+DEFAULT_CONFIG_NAME = "Default"
+
+
+def resolve_active_config(doc: dict) -> tuple[str, dict | None]:
+    """Pick the active configuration: ``(name, config_dict | None)``.
+
+    A document with no ``configurations`` (or an empty list) compiles as the single implicit
+    ``"Default"`` config (returns ``(None_name, None)``-equivalent ``("Default", None)``). When
+    configurations exist, ``active_configuration`` selects one by name; if that pointer is
+    missing/unknown the FIRST configuration is used (SolidWorks always has exactly one active
+    config). The returned config dict (when not None) is the verbatim stored config — overlay logic
+    reads its ``param_overrides`` + ``suppressions``."""
+    configs = doc.get("configurations")
+    if not isinstance(configs, list) or not configs:
+        return DEFAULT_CONFIG_NAME, None
+    active_name = doc.get("active_configuration")
+    by_name = {c.get("name"): c for c in configs if isinstance(c, dict)}
+    if isinstance(active_name, str) and active_name in by_name:
+        return active_name, by_name[active_name]
+    first = configs[0] if isinstance(configs[0], dict) else None
+    name = first.get("name") if first else DEFAULT_CONFIG_NAME
+    return (name if isinstance(name, str) and name else DEFAULT_CONFIG_NAME), first
+
+
+def _config_effective_features(features: list[dict], config: dict | None) -> list[dict]:
+    """Overlay ``config`` onto ``features`` and return a NEW effective feature list.
+
+    Never mutates the stored features. For each feature it produces a shallow overlay where:
+      * ``suppressed`` becomes ``base.suppressed OR config.suppressions[fid]``;
+      * each ``params[key]`` is replaced by ``config.param_overrides["fid.key"]`` when present.
+
+    When ``config`` is None (the implicit Default) the features are returned UNCHANGED (the exact
+    same dict objects), so a config-less document compiles byte-identically to before — no copy,
+    no overlay, no behavioral difference."""
+    if config is None:
+        return features
+    overrides = config.get("param_overrides") or {}
+    suppressions = config.get("suppressions") or {}
+    if not overrides and not suppressions:
+        return features
+
+    # Bucket overrides by feature id: {fid: {param_key: value}}.
+    by_fid: dict[str, dict] = {}
+    for key, val in overrides.items():
+        if isinstance(key, str) and "." in key:
+            fid, _, pkey = key.partition(".")
+            by_fid.setdefault(fid, {})[pkey] = val
+
+    out: list[dict] = []
+    for feat in features:
+        if not isinstance(feat, dict):
+            out.append(feat)
+            continue
+        fid = feat.get("id")
+        param_ov = by_fid.get(fid)
+        sup_ov = suppressions.get(fid)
+        if param_ov is None and sup_ov is None:
+            out.append(feat)  # untouched feature: reuse the original object (cache-stable)
+            continue
+        ef = dict(feat)
+        if sup_ov is not None:
+            ef["suppressed"] = bool(feat.get("suppressed")) or bool(sup_ov)
+        if param_ov:
+            params = dict(feat.get("params") or {})
+            for pkey, pval in param_ov.items():
+                params[pkey] = pval
+            ef["params"] = params
+        out.append(ef)
+    return out
+
+
+def apply_configuration_to_doc(doc: dict) -> tuple[str, dict]:
+    """Produce ``(active_name, effective_doc)``: a shallow overlay of ``doc`` with the active
+    configuration applied to BOTH ``features`` (param overrides + feature suppression) and, for
+    assemblies, ``components`` (suppression — a config's ``suppressions[<component_id>]`` toggles a
+    component out of the assembly). The original document is NEVER mutated; ``effective_doc`` shares
+    every untouched sub-object with the original. A config-less document returns ``("Default", doc)``
+    — the exact same object, no copy — preserving byte-identical behavior.
+
+    The part compiler (:func:`compile_document`) applies feature overlay itself; this helper is for
+    callers (the assembly rebuild) that don't route through :func:`compile_document` and need the
+    component-suppression overlay too."""
+    active_name, config = resolve_active_config(doc)
+    if config is None:
+        return DEFAULT_CONFIG_NAME, doc
+
+    suppressions = config.get("suppressions") or {}
+    eff = dict(doc)
+    eff["features"] = _config_effective_features(doc.get("features") or [], config)
+
+    # Component suppression (assemblies): a suppression keyed by a component id (k<N>) suppresses
+    # that component. Feature ids (f<N>) are handled by the feature overlay above; keys that match
+    # neither simply do nothing (the validator already flags unknown ids).
+    comps = doc.get("components")
+    if isinstance(comps, list) and suppressions:
+        new_comps = []
+        changed = False
+        for c in comps:
+            if isinstance(c, dict) and c.get("id") in suppressions:
+                sc = dict(c)
+                sc["suppressed"] = bool(c.get("suppressed")) or bool(suppressions[c["id"]])
+                new_comps.append(sc)
+                changed = changed or sc["suppressed"] != bool(c.get("suppressed"))
+            else:
+                new_comps.append(c)
+        if changed:
+            eff["components"] = new_comps
+    return active_name, eff
+
+
 # --------------------------------------------------------------------------- compile
 
 
@@ -275,7 +391,16 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
         result.equations_error = str(exc)
     result.equations_env = env
 
-    features = doc.get("features") or []
+    # --- configurations: overlay the active config onto the feature list -
+    # The active config's param overrides + suppressions are applied to a NON-MUTATING overlay of
+    # the stored features (see _config_effective_features). A config-less document yields the exact
+    # original feature objects, so it compiles byte-identically to before this version. The active
+    # config name is echoed on the result AND seeded into the rolling cache key, so switching
+    # configs produces a disjoint key chain (caches stay per-config; switching back is a hit).
+    base_features = doc.get("features") or []
+    active_name, active_config = resolve_active_config(doc)
+    result.active_configuration = active_name
+    features = _config_effective_features(base_features, active_config)
 
     # --- rollback bar (SolidWorks semantics) -----------------------------
     # doc["rollback_after"] = <feature_id> | null. Features AFTER the bar are NOT compiled; they get
@@ -317,7 +442,14 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
             next_body_num += 1
         return body_ids[key]
 
+    # Seed the rolling cache key with the schema, and (only when the document HAS configurations)
+    # the active config name. A config-less document keeps the exact pre-CONFIG seed, so every
+    # per-feature key — and the whole rebuild — is unchanged (the regression-guard byte-identity
+    # holds, caches included). When configs exist, the seed differs per active config, so two
+    # configs cache on disjoint key chains and never cross-contaminate (switching back is a hit).
     prev_key = doc.get("schema", "aicad.part/1")
+    if active_config is not None:
+        prev_key += "\x00cfg:" + active_name
 
     for feat_index, feat in enumerate(features):
         fid = feat.get("id", "?")

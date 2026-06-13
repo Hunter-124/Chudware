@@ -25,7 +25,7 @@ Run the demo to see the whole pipeline:
 | Connectivity | `netlist.py` (deterministic union-find), `erc.py` (full catalog) | `test_netlist` (7) |
 | Library | `library/` sexpr + KiCad `.kicad_sym`/`.kicad_mod` import + native resolver + 25-sym/19-fp clean-room **starter lib** | `test_library` (9) |
 | Simulator | `engine/sim/circuit.py` + `devices.py` — MNA op/dc/tran/ac | `test_circuit` — **all 8 analytic gates** (divider exact, RC τ 0.001%, RLC ring 0.006%, op-amp gain exact, RC −3 dB/−20 dB-dec) |
-| Sim depth | `.subckt` expansion + built-in **NE555** (oscillates) & op-amp macromodel; `.step` param sweep; default-all-nodes probes | `test_simdepth` |
+| Sim depth | `.subckt` + built-in **NE555** & op-amp macromodel; `.step` sweep; **Fourier/THD, Monte-Carlo, temp sweep, thermal noise** (`.four/.mc/.temp/.noise`); **`.tf`** (gain/Rin/Rout); **MOSFET-L1 AC**; default-all-nodes probes | `test_simdepth`, `test_simdepth2`, `test_tf_mosfet` |
 | SPICE I/O | `engine/sim/spice.py` parse/serialize + netlist→circuit bridge | `test_spice` |
 | DRC | `engine/ecad/drc.py` — net-aware clearance/width/via/annular/hole/edge + ratsnest MST | `test_drc` (11) |
 | Zone fill | `engine/ecad/zonefill.py` — copper pours w/ clearance + thermal relief (grid raster, G36-safe) | `test_zonefill` (9) |
@@ -35,10 +35,11 @@ Run the demo to see the whole pipeline:
 | 3D bridge | `engine/ecad/threed.py` — board→STEP + `aicad.part/1` import doc | `test_threed` — board volume exact, part doc **compiles in the CAD pipeline** |
 | Sch→PCB sync | `engine/ecad/sync.py` — `update_board_from_sch` (footprint resolve + pad-net bind, idempotent); RPC `ecad_update_from_sch` | `test_sync` |
 | Worker RPC | `engine/ecad/rpc.py` — 16 `ecad_*` methods (fenced into `engine/worker.py`) | `test_rpc`; legacy `test_worker_doc` still green |
-| AI tools | `mcp_server/ecad_tools.py` — 18 tools w/ rich context helpers (place/wire/status/sim/sweep/autoroute/fill/sync) | `test_ecad_tools`; legacy `test_roundtrip` still green |
-| Full pipeline | `engine/ecad/test_integration.py` + `demo.py` (sch→netlist→ERC→sim→PCB→sync→autoroute→pour→DRC→fab→STEP) | end-to-end green |
+| AI tools | `mcp_server/ecad_tools.py` — 19 tools w/ rich context helpers (place/wire/status/sim/sweep/autoroute/fill/sync + **`ecad_design`** = full orchestrator) | `test_ecad_tools`; legacy `test_roundtrip` still green |
+| **AI orchestrator** | `engine/ecad/orchestrator.py` + `recipes.py` — NL request → verified schematic (plan→build→ERC→sim→fix), recipe fallback for weak models; RPC + MCP `ecad_design` | `test_orchestrator` |
+| Full pipeline | `engine/ecad/test_integration.py` + `demo.py` (11-step: AI design→sim suite→PCB→sync→autoroute→pour→DRC→fab→STEP→.ecad+→KiCad import) + `docs/ECAD_USERGUIDE.md` | end-to-end green |
 
-**18 test suites green** (16 ECAD/sim/mcp + 2 legacy) as of Wave F.
+**21 test suites green** (19 ECAD/sim/mcp + 2 legacy) as of Wave I. `python -m engine.ecad.demo` runs the full pipeline.
 
 **Regression:** the 5 shared/legacy suites touched by fenced appends remain green. No edits to
 `engine/doc/*`. All new work is additive and isolated.
@@ -65,21 +66,22 @@ Expect minor ImGui-signature fixups on first real build.
 
 1. **Wire + build the C++ UI** — apply `ECAD_UI_INTEGRATION.md` steps (a)–(c) for an empty-state
    render, then (d)–(f) for live docs + PM forms + picking. First build will need small fixups.
-   *(Biggest remaining gap; can't be build-verified in this env.)*
-2. **Agent orchestrator** for ECAD — the tools are ready (place/wire/status/sim/autoroute/fill/sync
-   with rich hints); an autonomous design loop (intake→place→wire→ERC→sim→fix) can reuse the CAD
-   loop's feedback discipline. The next high-value AI feature.
-3. **`sch_import_kicad` op wiring** — `formats.import_kicad_sch/_pcb` exist & are tested; the
-   single-doc `sch_import_kicad` op + an `ecad_open` of `.kicad_*` files just need to call them.
-4. **Simulator** — MOSFET level-1 AC + voltage-controlled-switch AC remain stubs; Monte-Carlo
-   tolerance analysis is a future add. (`.subckt`/NE555/`.step`/default-probes are DONE.)
-5. **Bus routing** is parse-only (members expand; bus-entry→net merges are a follow-up).
-6. **Cosmetic/realism**: Gerber `B.Fab→.GBP2`/`F.Fab→.GGP` extension quirks; copper-region realism
-   in `threed.py` (proxies + substrate only); zone island removal is area-thresholded (not
-   width-based necking).
+   *(Biggest remaining gap; can't be build-verified in this env; overlaps the parallel CAD agent's
+   host/ ownership — best done in coordination with them.)*
+2. **Schematic-capture parity**: hierarchical sheets (netlist is flat) + full bus routing
+   (members expand but bus-entry→net merges are a follow-up).
+3. **Advanced PCB routing**: the autorouter is a basic 2-layer maze router — differential pairs,
+   length matching, and push-and-shove are future work.
+4. **Simulator**: voltage-controlled-switch AC stub; pole-zero/distortion analyses; transmission-
+   line (LTRA) + controlled-impedance SI are future SI adds. (Core op/dc/tran/ac + `.step/.four/.mc/
+   .temp/.noise/.tf` + subckt + MOSFET-L1 AC are DONE.)
+5. **Cosmetic/realism**: copper-region realism in `threed.py` (proxies + substrate only); zone
+   island removal is area-thresholded (not width-based necking).
 
-**Resolved since first status:** ~~pcb_update_from_sch~~, ~~.ecad+ container~~, ~~KiCad import~~,
-~~zone fill~~, ~~autoroute~~, ~~.subckt/NE555/.step/default-probes~~ — all DONE & tested (Waves E–F).
+**Resolved across Waves E–I:** ~~pcb_update_from_sch~~, ~~.ecad+ container~~, ~~KiCad sch/pcb import~~,
+~~KiCad file-open~~, ~~zone fill~~, ~~autoroute~~, ~~`.subckt`/NE555/`.step`/default-probes~~,
+~~Fourier/THD~~, ~~Monte-Carlo~~, ~~temp sweep~~, ~~noise~~, ~~`.tf`~~, ~~MOSFET-L1 AC~~,
+~~AI design orchestrator + `ecad_design`~~, ~~Gerber extension quirks~~ — all DONE & tested.
 
 ## How to run everything
 ```

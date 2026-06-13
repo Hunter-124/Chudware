@@ -43,6 +43,8 @@ from . import draft as _draft  # noqa: F401
 # Multi-body boolean (combine/subtract/intersect) and helix curve (sweep path source):
 from . import boolean as _boolean  # noqa: F401
 from . import curves as _curves  # noqa: F401
+# Sheet metal (base flange + edge flange with real bend geometry + bend-allowance records):
+from . import sheetmetal as _sheetmetal  # noqa: F401
 
 __all__ = [
     "CompileContext",

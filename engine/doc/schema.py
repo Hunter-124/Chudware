@@ -164,6 +164,9 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
                                       "bodies": (_SEL_LIST, False)}},
     "boolean": {"params": ["op"], "refs": {"targets": (_SEL_LIST, True),
                                            "tools": (_SEL_LIST, False)}},
+    # Sheet metal — base flange (sheet from a region) + edge flange (bent wall off an edge).
+    "sm_base_flange": {"params": [], "refs": {"profile": (_SEL_LIST, True)}},
+    "sm_edge_flange": {"params": [], "refs": {"edge": (_SEL_OR_DATUM, True)}},
     "script": {"params": ["code"], "refs": {}},
     "import": {"params": ["source_path", "format"], "refs": {}},
     # Stretch — schema-reserved (envelope accepted, no deep checks yet):

@@ -183,6 +183,55 @@ transform the SEED FEATURES' tool bodies and re-apply the same boolean per insta
 - params: `op: "combine"|"subtract"|"intersect"` · `keep_tools: bool` (false)
 - refs: `targets: [sel(body)]` (≥1) · `tools: [sel(body)]` (≥1, subtract/intersect)
 
+## Sheet Metal
+
+The first sheet-metal feature (`sm_base_flange`) establishes the part as sheet metal: a
+uniform-thickness sheet with a stored thickness + k-factor that later flanges inherit. Flanges
+build TRUE solid geometry (a cylindrical bend region of the given inner radius + a flat tangent
+wall, both at sheet thickness) and additionally record per-bend data for a future flat-pattern
+unfold.
+
+**Bend math** (canonical mm/deg). For inner radius `R`, thickness `T`, k-factor `K` (neutral fibre
+at `K·T` into the thickness), and bend interior angle `θ`:
+- neutral radius `Rn = R + K·T`
+- **bend allowance** `BA = θ_rad · (R + K·T)` — the developed (flat) arc length of the neutral
+  fibre through the bend; what the flat pattern consumes per bend.
+- bend deduction `BD = 2·(R+T)·tan(θ/2) − BA` (the outside-setback convention; stored too).
+
+### `sm_base_flange`
+- params: `thickness: dim` (2) · `k_factor: dim` (0.45, 0..1) · `default_bend_radius: dim`
+  (= thickness)
+- refs: `profile: [sel(region)]` (≥1 closed sketch region)
+- compiler: `features/sheetmetal.py::compile_sm_base_flange` → extrude the region(s) by
+  `thickness`. Stores part-level `{thickness, k_factor, default_bend_radius}` on the body so edge
+  flanges inherit them. `resolved`: `{thickness, k_factor, default_bend_radius, volume}`.
+- errors: missing/open profile (no closed region); `thickness ≤ 0`; `k_factor` outside 0..1.
+
+### `sm_edge_flange`
+- params: `angle: dim` (90, in (0,180)) · `length: dim` (20, flat-wall length, EXCLUDING the bend
+  region) · `radius: dim` (inner bend radius, default = sheet `default_bend_radius`) · `k_factor:
+  dim` (inherited from the base flange) · `position: "material_inside"|"material_outside"|
+  "bend_outside"` ("material_inside") · `flip: bool` (false)
+- refs: `edge: sel(edge[line])` — a STRAIGHT edge on the sheet's thickness (side) face: the bend
+  line.
+- compiler: `features/sheetmetal.py::compile_sm_edge_flange` → builds a bend arc (inner radius `R`,
+  sweep `angle`) tangent to the parent face + a flat wall of `length` tangent to the bend, at sheet
+  thickness, as a cross-section prismed along the bend edge, then FUSED to the sheet body.
+- `position` (mirrors SolidWorks "Flange Position", measured against the picked thickness-face
+  plane): `material_inside` = the wall's OUTER surface is flush with that plane (bend eats inward,
+  outside envelope unchanged); `material_outside` = the wall's INNER surface is flush (flange sits
+  outside the original envelope); `bend_outside` = the bend's inner arc starts at the plane (bulges
+  outward the most).
+- `flip` reverses which side of the parent face the wall folds toward.
+- Stored bend record (per flange, for the future flat pattern): `{feature, angle, radius,
+  thickness, k_factor, neutral_radius, bend_allowance, bend_deduction, wall_length, position, flip,
+  bend_line:[[x,y,z],[x,y,z]], e_dir, length_dir, fold_dir}`. `resolved`: `{angle, length, radius,
+  k_factor, bend_allowance, bend_deduction, neutral_radius, volume}`.
+- errors (all contained `FeatureError`): no base flange / non-sheet part; dangling or curved
+  (non-straight) bend edge; edge not on a `~thickness`-wide face; `radius ≤ 0`; `length ≤ 0`;
+  `angle ∉ (0,180)`; degenerate placement where the flange is not connected to the sheet (e.g.
+  `bend_outside` folded away — the union stays disjoint).
+
 ## Escape hatches
 
 ### `script`

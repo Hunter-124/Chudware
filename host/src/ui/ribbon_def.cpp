@@ -224,6 +224,16 @@ static const RibbonCmd kCmds[] = {
     // sheet-ish glyph until a dedicated drawing icon ships.
     { "make_drawing",        "Make Drawing",    "section_props",    "Evaluate", "Drawing",        true,  nullptr,          false },
 
+    // =========================================================================
+    // Tab: Sheet Metal — base + edge flange drive the engine sm_* features.
+    // cmd_id == engine feature type (pmFormForCommand routes straight through).
+    // Icons reuse extrude_boss (base) and shell (edge); ribbon falls back gracefully.
+    // =========================================================================
+
+    // --- Group: Create ---
+    { "sm_base_flange",      "Base Flange",     "extrude_boss",     "Sheet Metal", "Create",      true,  nullptr,          false },
+    { "sm_edge_flange",      "Edge Flange",     "shell",            "Sheet Metal", "Create",      true,  nullptr,          false },
+
 };
 // clang-format on
 

@@ -56,6 +56,10 @@ static PMFieldDef Int(const char* key, const char* label, const char* group, dou
     PMFieldDef f; f.kind = PMFieldKind::Int; f.key = key; f.label = label;
     f.group = group; f.dimDefault = def; f.unitLabel = ""; return f;
 }
+// Unitless Dim (real-valued, no "[mm]" suffix) — e.g. sheet-metal k-factor in 0..1.
+static PMFieldDef DimU(const char* key, const char* label, const char* group, double def) {
+    PMFieldDef f = Dim(key, label, group, def); f.unitLabel = ""; return f;
+}
 // Angle dim (shows "[deg]" instead of "[mm]"; value is plain degrees, like revolve's angle).
 static PMFieldDef Angle(const char* key, const char* label, const char* group, double def) {
     PMFieldDef f = Dim(key, label, group, def); f.unitLabel = " [deg]"; return f;
@@ -337,6 +341,31 @@ static const std::vector<PMFormDef>& forms() {
             Well   ("tools",      "Tool Bodies",        "Bodies", K_BODY, true),
             Check  ("keep_tools", "Keep tool bodies",   "Options", false),
         }},
+        // --- sm_base_flange (Sheet Metal) --- engine features/sheet_metal sm_base_flange. Profile is
+        //   a sketch region, resolved exactly like extrude's profile well (K_FACE, multi). thickness
+        //   drives the wall; k_factor (0..1, unitless) sets the bend-allowance neutral axis;
+        //   default_bend_radius seeds the inner radius (defaults to thickness engine-side).
+        { "sm_base_flange", "Base Flange", "extrude_boss", {
+            Well ("profile",            "Profile",            "Profile",          K_FACE, true),
+            Dim  ("thickness",          "Thickness",          "Sheet Metal Gauges", 2.0),
+            DimU ("k_factor",           "K-Factor",           "Sheet Metal Gauges", 0.45),
+            Dim  ("default_bend_radius","Bend Radius",        "Sheet Metal Gauges", 2.0),
+        }},
+        // --- sm_edge_flange (Sheet Metal) --- engine features/sheet_metal sm_edge_flange. The bend
+        //   edge is a single straight thickness-face edge (K_EDGE). angle 0..180 deg; length is the
+        //   flange wall; radius is the inner bend radius (defaults to thickness). position picks how
+        //   the flange aligns to the picked edge; flip mirrors the bend direction. k_factor is
+        //   inherited from the base flange — intentionally NOT on this form.
+        { "sm_edge_flange", "Edge Flange", "shell", {
+            Well   ("edge",     "Bend Edge",      "Flange",   K_EDGE, false),
+            Angle  ("angle",    "Angle",          "Flange",   90.0),
+            Dim    ("length",   "Length",         "Flange",   20.0),
+            Dim    ("radius",   "Bend Radius",    "Flange",   2.0),
+            ComboL ("position", "Flange Position","Flange",
+                    "material_inside|material_outside|bend_outside",
+                    "Material Inside|Material Outside|Bend Outside"),
+            Check  ("flip",     "Reverse direction","Flange", false),
+        }},
     };
     return kForms;
 }
@@ -377,6 +406,9 @@ const PMFormDef* pmFormForCommand(const std::string& cmdId, std::string& mode) {
     if (cmdId == "boolean_combine")   { mode = "combine";   return pmFindForm("boolean"); }
     if (cmdId == "boolean_subtract")  { mode = "subtract";  return pmFindForm("boolean"); }
     if (cmdId == "boolean_intersect") { mode = "intersect"; return pmFindForm("boolean"); }
+    // Sheet Metal — ribbon cmd id == the engine feature type, so route straight through.
+    if (cmdId == "sm_base_flange")    return pmFindForm("sm_base_flange");
+    if (cmdId == "sm_edge_flange")    return pmFindForm("sm_edge_flange");
     // Primitive quick-start commands (AI-CAD extensions; not in the C14 ribbon but reachable
     // via the M1 scenario / future "Insert > Primitive" entries).
     if (cmdId == "box")           return pmFindForm("box");

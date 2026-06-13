@@ -89,6 +89,10 @@ static PMFieldDef DimSoon(const char* key, const char* label, const char* group,
 static const PMSelKinds K_FACE   {true,  false, false};
 static const PMSelKinds K_EDGE   {false, true,  false};
 static const PMSelKinds K_VERTEX {false, false, true};
+static const PMSelKinds K_FEV    {true,  true,  true };   // face/edge/vertex (datum a / point target)
+static const PMSelKinds K_FACEEDGE {true, true,  false};  // face or edge (datum plane hinge / midplane #2)
+static const PMSelKinds K_FACEVERT {true, false, true};   // face or vertex (datum axis b)
+static const PMSelKinds K_BODY   {false, false, false, true};  // solid body (boolean targets/tools)
 
 // ----------------------------------------------------------------------------
 // The forms. Field order == feature_params.md order == PM tab order.
@@ -270,6 +274,69 @@ static const std::vector<PMFormDef>& forms() {
                       "Top plane|Front plane|Right plane"),
             Well     ("faces",   "Faces to Draft", "Draft", K_FACE, true),
         }},
+        // --- helix (Curve) --- engine features/curves.py. Produces a sweep PATH (a Sweep can then
+        //   reference this helix feature). v1 is "Height & Pitch"-defined; the engine derives turns
+        //   = height/pitch. radius defaults the coil radius when base is a datum plane.
+        { "helix", "Helix / Spiral", "curve_helix", {
+            DatumRef ("base",   "Axis Plane",       "Helix",
+                      "plane.top|plane.front|plane.right", "Top plane|Front plane|Right plane"),
+            Dim      ("radius", "Radius",           "Helix", 10.0),
+            Dim      ("pitch",  "Pitch",            "Helix", 5.0),
+            Dim      ("height", "Height",           "Helix", 20.0),
+            Angle    ("taper",  "Taper Angle",      "Helix", 0.0),
+            Angle    ("start_angle", "Start Angle", "Helix", 0.0),
+            Check    ("ccw",    "Counterclockwise", "Helix", true),
+        }},
+        // --- ref_plane (datum) --- engine datum.py compile_plane. method gates which refs apply:
+        //   offset/angle use base (+ second hinge for angle); three_point uses 3 vertices; midplane
+        //   uses base + second. base is a DatumRef (the 3 origin planes); second/points are picks.
+        { "plane", "Plane", "ref_plane", {
+            ComboL   ("method", "Type",            "First Reference",
+                      "offset|angle|three_point|midplane",
+                      "Offset|At Angle|Three Points|Mid Plane"),
+            DatumRef ("base",   "Reference",       "First Reference",
+                      "plane.top|plane.front|plane.right", "Top plane|Front plane|Right plane"),
+            DimIf    ("offset", "Offset Distance", "Parameters", 10.0, "method", "offset"),
+            AngleIf  ("angle",  "Angle",           "Parameters", 45.0, "method", "angle"),
+            WellIf   ("second", "Hinge / 2nd Plane","Second Reference", K_FACEEDGE, false,
+                      "method", "angle|midplane"),
+            WellIf   ("points", "Three Vertices",  "Points", K_VERTEX, true,
+                      "method", "three_point"),
+            Check    ("flip",   "Flip",            "Parameters", false),
+        }},
+        // --- ref_axis (datum) --- engine datum.py compile_axis. a = the primary reference (cyl
+        //   face / edge / vertex); b = the second vertex (two_points) or plane (plane_intersect).
+        { "axis", "Axis", "ref_axis", {
+            ComboL ("method", "Type",        "Reference",
+                    "cylinder|two_points|edge|plane_intersect",
+                    "Cylindrical Face|Two Points|Edge|Two Planes"),
+            Well   ("a",      "Reference 1", "Reference", K_FEV, false),
+            WellIf ("b",      "Reference 2", "Reference", K_FACEVERT, false,
+                    "method", "two_points|plane_intersect"),
+        }},
+        // --- ref_point (datum) --- engine datum.py compile_point. vertex/arc-center/on-face.
+        { "point", "Point", "ref_point", {
+            ComboL ("method", "Type",      "Reference",
+                    "vertex|center|on_face", "At Vertex|Arc/Circle Center|On Face"),
+            Well   ("target", "Reference", "Reference", K_FEV, false),
+        }},
+        // --- ref_csys (datum) --- engine datum.py compile_csys. origin + optional X/Y direction
+        //   edges (orthonormalized engine-side).
+        { "csys", "Coordinate System", "ref_csys", {
+            Well ("origin", "Origin",        "Coordinate System", K_VERTEX, false),
+            Well ("x_dir",  "X Axis (edge)", "Coordinate System", K_EDGE, false),
+            Well ("y_dir",  "Y Axis (edge)", "Coordinate System", K_EDGE, false),
+        }},
+        // --- boolean (Multi-body) --- engine features/boolean.py. op is preset from the ribbon
+        //   command (Combine/Subtract/Intersect), like extrude boss/cut. Body wells (K_BODY): a
+        //   pick resolves the clicked element's OWNING body (selection observer -> resolvePick body).
+        { "boolean", "Combine", "combine", {
+            ComboL ("op",         "Operation",          "Operation",
+                    "combine|subtract|intersect", "Add|Subtract|Common"),
+            Well   ("targets",    "Main / Target Bodies","Bodies", K_BODY, true),
+            Well   ("tools",      "Tool Bodies",        "Bodies", K_BODY, true),
+            Check  ("keep_tools", "Keep tool bodies",   "Options", false),
+        }},
     };
     return kForms;
 }
@@ -301,6 +368,15 @@ const PMFormDef* pmFormForCommand(const std::string& cmdId, std::string& mode) {
     if (cmdId == "mirror_feature")   return pmFindForm("mirror");
     if (cmdId == "linear_pattern")   return pmFindForm("linear_pattern");
     if (cmdId == "circular_pattern") return pmFindForm("circular_pattern");
+    // Curves + reference geometry + multi-body booleans (W3/W4 — engine compilers now exist).
+    if (cmdId == "curve_helix")      return pmFindForm("helix");
+    if (cmdId == "ref_plane")        return pmFindForm("plane");
+    if (cmdId == "ref_axis")         return pmFindForm("axis");
+    if (cmdId == "ref_point")        return pmFindForm("point");
+    if (cmdId == "ref_csys")         return pmFindForm("csys");
+    if (cmdId == "boolean_combine")   { mode = "combine";   return pmFindForm("boolean"); }
+    if (cmdId == "boolean_subtract")  { mode = "subtract";  return pmFindForm("boolean"); }
+    if (cmdId == "boolean_intersect") { mode = "intersect"; return pmFindForm("boolean"); }
     // Primitive quick-start commands (AI-CAD extensions; not in the C14 ribbon but reachable
     // via the M1 scenario / future "Insert > Primitive" entries).
     if (cmdId == "box")           return pmFindForm("box");

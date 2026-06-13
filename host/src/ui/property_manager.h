@@ -43,7 +43,7 @@ enum class PMFieldKind { Dim, SelectorWell, Combo, Check, Int, DatumRef, Feature
 
 // Which topology kinds a SelectorWell accepts (mirrors feature_params sel(kinds…)).
 struct PMSelKinds {
-    bool face = false, edge = false, vertex = false;
+    bool face = false, edge = false, vertex = false, body = false;
 };
 
 // One row of a feature form (data-driven; one per param/ref in feature_params order).
@@ -175,6 +175,11 @@ public:
     // Feed a resolved viewport pick into the active selector well (called from the selection
     // observer). Returns true if the pick was consumed (an active well accepted it).
     bool routePick(const nlohmann::json& selector, int pickKind /*render::PickKind*/);
+
+    // True when the active selector well wants BODY selectors (e.g. boolean targets/tools). The
+    // selection observer uses this to resolve the picked element's owning body (resolvePick
+    // kind="body") instead of the face/edge/vertex it clicked.
+    bool activeWellWantsBody() const;
 
     // ---- C51: sketched-feature region picking ----------------------------------------------
     // The viewport region picker (SketchMode::drawRegionPicker) drives these to render region

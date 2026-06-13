@@ -338,12 +338,23 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     for (size_t i = 0; i < form->fields.size(); ++i)
         initField(fields_[i], form->fields[i], useIps);
 
-    // If a mode combo exists, preselect it from the command (boss/cut split button).
+    // If a mode/op combo exists, preselect it from the command (boss/cut split button; boolean
+    // combine/subtract/intersect). Match mode_ against the combo's option VALUES so any N-way combo
+    // works (not just boss/cut), falling back to index 0 (legacy "cut" -> 1).
     if (!mode_.empty()) {
         for (auto& f : fields_) {
-            if (f.def->kind == PMFieldKind::Combo && std::strcmp(f.def->key, "mode") == 0) {
-                f.comboIndex = (mode_ == "cut") ? 1 : 0;
+            if (f.def->kind != PMFieldKind::Combo) continue;
+            if (std::strcmp(f.def->key, "mode") != 0 && std::strcmp(f.def->key, "op") != 0) continue;
+            const std::string opts = f.def->comboOptions ? f.def->comboOptions : "";
+            int idx = -1, cur = 0; size_t start = 0;
+            while (start <= opts.size()) {
+                size_t bar = opts.find('|', start);
+                if (opts.substr(start, bar - start) == mode_) { idx = cur; break; }
+                ++cur;
+                if (bar == std::string::npos) break;
+                start = bar + 1;
             }
+            f.comboIndex = (idx >= 0) ? idx : ((mode_ == "cut") ? 1 : 0);
         }
     }
 
@@ -685,6 +696,9 @@ bool PropertyManager::routePick(const nlohmann::json& selector, int pickKind) {
     bool allowed = (k == render::PickKind::Face   && ak.face) ||
                    (k == render::PickKind::Edge   && ak.edge) ||
                    (k == render::PickKind::Vertex && ak.vertex);
+    // Body wells (boolean): the selection observer resolved a body selector (kind="body") from
+    // whatever element was clicked — accept it regardless of the underlying pick kind.
+    if (!allowed && ak.body && selector.value("kind", std::string()) == "body") allowed = true;
     if (!allowed) return false;
 
     // De-dup by hint_index + centroid (same element picked twice toggles off — SolidWorks).
@@ -712,6 +726,13 @@ bool PropertyManager::routePick(const nlohmann::json& selector, int pickKind) {
     well->wellDangling = false;
     dirty_ = true; lastEditTime_ = ImGui::GetTime();
     return true;
+}
+
+bool PropertyManager::activeWellWantsBody() const {
+    for (const auto& f : fields_)
+        if (f.def->kind == PMFieldKind::SelectorWell && f.wellActive)
+            return f.def->selKinds.body;
+    return false;
 }
 
 // ---- C51: sketched-feature region picking ---------------------------------
@@ -913,6 +934,9 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
     else if (t == "hole") needWell = "face";
     else if (t == "draft") needWell = "faces";
     else if (t == "linear_pattern" || t == "circular_pattern") needWell = "features";
+    else if (t == "boolean") needWell = "targets";   // need at least one target body
+    else if (t == "axis")    needWell = "a";          // datum axis primary reference
+    else if (t == "point")   needWell = "target";     // datum point reference
     if (needWell) {
         for (const auto& f : fields)
             if ((f.def->kind == PMFieldKind::SelectorWell || f.def->kind == PMFieldKind::FeatureWell)

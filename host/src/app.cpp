@@ -294,8 +294,15 @@ int run_gui(const char* screenshotPath) {
                     continue;  // handled (or failed) — skip the part-doc resolve path
                 }
             }
+            // Body wells (boolean targets/tools): resolve the clicked element's OWNING body
+            // (doc_resolve_pick kind="body" -> {kind:"body", owner_feature:...}) instead of the
+            // face/edge/vertex it landed on, so picking anywhere on a body selects that body.
+            const char* resolveKind = kindStr;
+            if (st.propertyManager && st.propertyManager->active() &&
+                st.propertyManager->activeWellWantsBody())
+                resolveKind = "body";
             std::string sel = st.docMirror.resolvePick(
-                st.worker, item.hit.body_id, kindStr, item.hit.topo_id, err);
+                st.worker, item.hit.body_id, resolveKind, item.hit.topo_id, err);
             if (!sel.empty()) {
                 item.selector = sel;
                 item.pending_resolve = false;

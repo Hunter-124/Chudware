@@ -1277,6 +1277,64 @@ def _op_sketch_pattern_entities(doc, op, index, idgen, id_map):
         id_map[f"${index}#{k}"] = neid
 
 
+def _op_sketch_move(doc, op, index, idgen, id_map):
+    """Translate the selected entities by (dx, dy) — SolidWorks "Move/Copy Entities".
+
+    ``copy`` false (default): move IN PLACE — each entity's own geometry shifts by (dx, dy) and its
+    relations ride along (no new ids). ``copy`` true: the originals are left untouched and a single
+    translated copy of each is APPENDED (like a pattern with count=2, copies only). The plain
+    geometry copies carry no per-instance relations. Supported entity types: line, circle, arc."""
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    eids = op.get("entities")
+    if not (isinstance(eids, list) and eids):
+        raise _invalid(index, "sketch_move requires a non-empty 'entities' id list")
+    dx = op.get("dx")
+    dy = op.get("dy")
+    if not isinstance(dx, (int, float)) or isinstance(dx, bool):
+        raise _invalid(index, "sketch_move requires a numeric 'dx'")
+    if not isinstance(dy, (int, float)) or isinstance(dy, bool):
+        raise _invalid(index, "sketch_move requires a numeric 'dy'")
+    copy_flag = op.get("copy", False)
+    if not isinstance(copy_flag, bool):
+        raise _invalid(index, "sketch_move 'copy' must be a bool")
+
+    # Resolve + validate the selection up front (atomic: reject before any mutation).
+    sources: list[dict] = []
+    for e_id in eids:
+        ent = _find_entity(sk, e_id)
+        if ent is None:
+            raise _invalid(index, f"sketch_move: entity '{e_id}' not found")
+        if ent.get("type") not in _MP_SUPPORTED:
+            raise OpError("unsupported_entity",
+                          f"op[{index}]: sketch_move does not support entity type "
+                          f"'{ent.get('type')}'",
+                          {"index": index, "reason": f"unsupported entity '{ent.get('type')}'"})
+        sources.append(ent)
+
+    dxf, dyf = float(dx), float(dy)
+    if not copy_flag:
+        # In-place: shift each source entity's own geometry; constraints ride along untouched.
+        for ent in sources:
+            moved = _translate_entity(_geom_view(ent), dxf, dyf)
+            for k in moved:
+                ent[k] = moved[k]
+        id_map[f"${index}"] = sources[0]["id"] if sources else ""
+        return
+
+    # Copy: append one translated copy of each source (plain geometry, no relations).
+    ents = _sketch_entities(sk)
+    new_ids: list[str] = []
+    for ent in sources:
+        geom = _translate_entity(_geom_view(ent), dxf, dyf)
+        neid = idgen.next("e")
+        new_ids.append(neid)
+        ents.append(_stamp_entity(geom, geom, neid, bool(ent.get("construction", False))))
+
+    id_map[f"${index}"] = new_ids[0] if new_ids else ""
+    for k, neid in enumerate(new_ids[1:], start=1):
+        id_map[f"${index}#{k}"] = neid
+
+
 def _op_sketch_convert(doc, op, index, idgen, id_map):
     """Project referenced model geometry (datum plane / planar face / model edge) onto the sketch
     plane as real sketch entities (SolidWorks "Convert Entities"). Reuses session.sketch_project_ref
@@ -1486,6 +1544,7 @@ _OP_HANDLERS = {
     "sketch_convert": _op_sketch_convert,                  # C53
     "sketch_mirror_entities": _op_sketch_mirror_entities,  # C53
     "sketch_pattern_entities": _op_sketch_pattern_entities,  # C53
+    "sketch_move": _op_sketch_move,                        # C54 (Move/Copy)
     "sketch_toggle_construction": _op_sketch_toggle_construction,  # C42
 }
 

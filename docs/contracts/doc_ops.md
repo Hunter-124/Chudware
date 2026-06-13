@@ -129,6 +129,24 @@ zero-length `dir` raise `invalid_op`. A reference that cannot be projected raise
 the `unsupported_ref` it bubbles up). Like all op errors these reject the whole batch with no state
 change (§2).
 
+**Sketch move/copy (C54 — translate or duplicate the selection by a delta):**
+
+| op | fields |
+|---|---|
+| `sketch_move` | `sketch`, `entities:[id…]` (line/circle/arc), `dx`, `dy` (numeric delta), `copy:bool=false` |
+
+- **`copy:false`** (default) moves the selection **IN PLACE**: each entity's own geometry shifts by
+  `(dx, dy)` and its relations ride along — no new entities, the entity count is unchanged. The first
+  moved entity id is recorded under `$<index>`.
+- **`copy:true`** leaves the originals untouched and **appends one translated copy of each** selected
+  entity (a plain-geometry copy, no per-instance relations — like a 2-instance pattern minus the
+  original), so the entity count of the selection doubles. The first copy is recorded under
+  `$<index>`, the rest under `$<index>#1`, `$<index>#2`, … (the flat id_map scheme).
+
+Supported entity types are **line, circle, arc**; any other selected type raises `unsupported_entity`.
+An empty `entities`, an unknown `sketch`, a non-numeric `dx`/`dy`, or a non-bool `copy` raise
+`invalid_op`. Like all op errors these reject the whole batch with no state change (§2).
+
 **Sketch fillet / chamfer (round/bevel the corner where two LINE segments meet):**
 
 | op | fields |

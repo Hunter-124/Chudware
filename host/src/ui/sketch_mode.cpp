@@ -931,6 +931,11 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sk_circ_pattern")    { resetTool(); tool_ = SketchTool::CircPattern;
                                          mpStage_ = 0; mpSel_.clear();                     return true; }
     if (cmdId == "sk_convert_ent")     { resetTool(); tool_ = SketchTool::Convert;         return true; }
+    // C54: Move/Copy entities (engine op sketch_move) — reuses the mirror/pattern selection stage.
+    if (cmdId == "sk_move")            { resetTool(); tool_ = SketchTool::Move;
+                                         mpStage_ = 0; mpSel_.clear(); moveCopy_ = false;   return true; }
+    // C54: Tangent Arc — draws an arc starting tangent to a prior/selected entity's free endpoint.
+    if (cmdId == "sk_arc_tangent")     { resetTool(); tool_ = SketchTool::ArcTangent;      return true; }
     // C42: remaining draw tools.
     if (cmdId == "sk_arc_3pt")         { resetTool(); tool_ = SketchTool::Arc3pt;         return true; }
     if (cmdId == "sk_polygon")         { resetTool(); tool_ = SketchTool::Polygon;        return true; }
@@ -1003,6 +1008,8 @@ const char* SketchMode::activeToolCmd() const {
         case SketchTool::LinPattern:      return "sk_lin_pattern";
         case SketchTool::CircPattern:     return "sk_circ_pattern";
         case SketchTool::Convert:         return "sk_convert_ent";
+        case SketchTool::Move:            return "sk_move";
+        case SketchTool::ArcTangent:      return "sk_arc_tangent";
         case SketchTool::Arc3pt:          return "sk_arc_3pt";
         case SketchTool::Polygon:         return "sk_polygon";
         case SketchTool::RectCenter:      return "sk_rect_center";
@@ -1125,6 +1132,133 @@ void SketchMode::applyConvertRef(AppState& st, const nlohmann::json& ref) {
     }
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     resolve(st);   // the projected entity appears; stay armed for more converts
+}
+
+// C54: apply sketch_move (translate or copy) for the current selection + delta.
+void SketchMode::applyMoveOp(AppState& st, float dx, float dy, bool copy) {
+    nlohmann::json eids = nlohmann::json::array();
+    for (const auto& id : mpSel_) eids.push_back(id);
+    nlohmann::json op = {{"op", "sketch_move"}, {"sketch", fid_},
+                         {"entities", eids}, {"dx", dx}, {"dy", dy}, {"copy", copy}};
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (!r.ok) {
+        std::string msg = r.error_message.empty() ? std::string("Move failed") : r.error_message;
+        st.addLog("[sketch] move failed: " + msg);
+        st.toast(ui::ToastLevel::Warn, msg);
+    } else {
+        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        resolve(st);
+    }
+    mpStage_ = 0; mpSel_.clear();   // stay in the tool, ready for another move
+}
+
+// C54: resolve the tangent-arc source — the line/circle/arc nearest the cursor, the endpoint of it
+// nearest the cursor (the arc start), and the unit tangent direction there (pointing into the arc).
+// Prefers the last selected entity, then the entity under the cursor, then the last drawn entity.
+bool SketchMode::tangentArcSource(const ImVec2& cursorScreen, TangentArcSrc& out) const {
+    const SketchEntity* src = nullptr;
+    // 1) a held selection wins (its last-picked entity is the source).
+    for (auto it = selIds_.rbegin(); it != selIds_.rend() && !src; ++it) {
+        const SketchEntity* e = entById(*it);
+        if (e && (e->type == "line" || e->type == "arc" || e->type == "circle")) src = e;
+    }
+    // 2) else the entity under the cursor.
+    if (!src) {
+        int h = hitTestEntity(cursorScreen);
+        if (h >= 0 && (ents_[h].type == "line" || ents_[h].type == "arc" ||
+                       ents_[h].type == "circle"))
+            src = &ents_[h];
+    }
+    // 3) else the most-recently-drawn supported entity (last in the list).
+    if (!src) {
+        for (auto it = ents_.rbegin(); it != ents_.rend() && !src; ++it)
+            if (it->type == "line" || it->type == "arc" || it->type == "circle") src = &*it;
+    }
+    if (!src) return false;
+
+    const float D2R = 3.14159265f / 180.0f;
+    if (src->type == "line") {
+        ImVec2 p1(src->p1[0], src->p1[1]), p2(src->p2[0], src->p2[1]);
+        ImVec2 s1 = uvToScreen(p1.x, p1.y), s2 = uvToScreen(p2.x, p2.y);
+        bool useP1 = std::hypot(s1.x - cursorScreen.x, s1.y - cursorScreen.y) <=
+                     std::hypot(s2.x - cursorScreen.x, s2.y - cursorScreen.y);
+        ImVec2 endpt = useP1 ? p1 : p2;
+        ImVec2 other = useP1 ? p2 : p1;
+        // Tangent continues the segment outward (away from the line body).
+        float dx = endpt.x - other.x, dy = endpt.y - other.y;
+        float L = std::hypot(dx, dy);
+        if (L < 1e-6f) return false;
+        out.id = src->id;
+        out.handle = src->id + (useP1 ? ".p1" : ".p2");
+        out.start = endpt;
+        out.tdir = ImVec2(dx / L, dy / L);
+        return true;
+    }
+    // arc / circle: tangent is perpendicular to the radius at the endpoint.
+    // A full circle has no free endpoint — fall back to the point on it nearest the cursor.
+    float a0 = src->start, a1 = src->end;
+    ImVec2 c(src->center[0], src->center[1]);
+    float rad = src->radius;
+    if (src->type == "arc") {
+        ImVec2 pa(c.x + rad * std::cos(a0 * D2R), c.y + rad * std::sin(a0 * D2R));
+        ImVec2 pb(c.x + rad * std::cos(a1 * D2R), c.y + rad * std::sin(a1 * D2R));
+        ImVec2 sa = uvToScreen(pa.x, pa.y), sb = uvToScreen(pb.x, pb.y);
+        bool useStart = std::hypot(sa.x - cursorScreen.x, sa.y - cursorScreen.y) <=
+                        std::hypot(sb.x - cursorScreen.x, sb.y - cursorScreen.y);
+        float ang = (useStart ? a0 : a1) * D2R;
+        ImVec2 endpt(c.x + rad * std::cos(ang), c.y + rad * std::sin(ang));
+        // Radial unit, then rotate +90 for the tangent; orient it along the arc's sweep so the new
+        // arc continues smoothly outward (ccw => +tangent at end / -tangent at start).
+        float rx = std::cos(ang), ry = std::sin(ang);
+        float tx = -ry, ty = rx;             // +90 rotation of the radial
+        bool ccw = src->ccw;
+        float sgn = (useStart ? -1.0f : 1.0f) * (ccw ? 1.0f : -1.0f);
+        out.id = src->id;
+        out.handle = src->id + (useStart ? ".start" : ".end");
+        out.start = endpt;
+        out.tdir = ImVec2(tx * sgn, ty * sgn);
+        return true;
+    }
+    // circle: nearest rim point to the cursor; tangent perpendicular to the radius (ccw sense).
+    float cu, cv; screenToUV(cursorScreen, cu, cv);
+    float ang = std::atan2(cv - c.y, cu - c.x);
+    ImVec2 endpt(c.x + rad * std::cos(ang), c.y + rad * std::sin(ang));
+    out.id = src->id;
+    out.handle = src->id;                    // whole-circle ref (no endpoint sub-handle)
+    out.start = endpt;
+    out.tdir = ImVec2(-std::sin(ang), std::cos(ang));   // ccw tangent
+    return true;
+}
+
+// C54: solve the arc tangent to `tdir` at `start`, passing through `end`. The center lies on the
+// line perpendicular to tdir at start (start + r*N). Requiring |C-end| == |C-start| == |r| gives
+// r = |end-start|^2 / (2 * (end-start)·N), with N the left-normal of tdir. Returns false when the
+// end is on the tangent line through start (denominator ~0 -> infinite radius) or coincident.
+bool SketchMode::tangentArcThrough(const ImVec2& start, const ImVec2& tdir, const ImVec2& end,
+                                   float& cu, float& cv, float& rad,
+                                   float& a0deg, float& a1deg, bool& ccw) {
+    float tx = tdir.x, ty = tdir.y;
+    float tl = std::hypot(tx, ty);
+    if (tl < 1e-9f) return false;
+    tx /= tl; ty /= tl;
+    float nx = -ty, ny = tx;                 // left-normal of the tangent
+    float ex = end.x - start.x, ey = end.y - start.y;
+    float d2 = ex * ex + ey * ey;
+    if (d2 < 1e-12f) return false;           // start == end
+    float denom = 2.0f * (ex * nx + ey * ny);
+    if (std::fabs(denom) < 1e-9f) return false;   // end on the tangent line -> straight, no arc
+    float r = d2 / denom;                    // signed radius (sign picks the side)
+    cu = start.x + r * nx;
+    cv = start.y + r * ny;
+    rad = std::fabs(r);
+    const float R2D = 57.29577951f;
+    a0deg = std::atan2(start.y - cv, start.x - cu) * R2D;
+    a1deg = std::atan2(end.y - cv, end.x - cu) * R2D;
+    // The sweep direction is set by the tangent: cross(radial_at_start, tangent) sign. radial at
+    // start is (start-center) = -r*N; tangent is T. ccw when cross(radial, T) > 0.
+    float radx = start.x - cu, rady = start.y - cv;
+    ccw = (radx * ty - rady * tx) > 0.0f;
+    return true;
 }
 
 void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfer* infer) const {
@@ -4134,7 +4268,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                      tool_ == SketchTool::Offset ||
                      tool_ == SketchTool::SkFillet || tool_ == SketchTool::SkChamfer ||
                      tool_ == SketchTool::Mirror || tool_ == SketchTool::LinPattern ||
-                     tool_ == SketchTool::CircPattern);
+                     tool_ == SketchTool::CircPattern || tool_ == SketchTool::Move);
     if (editTool) {
         int hovered = imgHovered ? hitTestEntity(io.MousePos) : -1;
 
@@ -4458,6 +4592,103 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
                 escHandled = true;
                 if (mpStage_ > 0) { mpStage_ = (tool_ == SketchTool::CircPattern) ? mpStage_ - 1 : 0; }
+                else cancelTool();
+            }
+        }
+
+        // ----- C54 MOVE/COPY: stage 0 collect entities (Enter advances) -> stage 1 pick a -----
+        // ----- FROM point -> stage 2 live drag to a TO point; the second click applies         -----
+        // ----- sketch_move {entities, dx, dy, copy} with delta = to - from. Ctrl => copy.       -----
+        else if (tool_ == SketchTool::Move) {
+            const ImU32 ac = col(pal.accent, 0.95f);
+            const ImU32 hc = col(pal.hoverHighlight, 0.9f);
+            auto inSel = [&](const std::string& id) {
+                return std::find(mpSel_.begin(), mpSel_.end(), id) != mpSel_.end();
+            };
+            auto strokeEnt = [&](const SketchEntity& e, ImU32 c, float th) {
+                if (e.type == "line")
+                    dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), c, th);
+                else if (e.type == "circle" || e.type == "arc") {
+                    float a0 = 0, a1 = 6.2831853f;
+                    if (e.type == "arc") {
+                        a0 = e.start * 3.14159265f / 180.0f; a1 = e.end * 3.14159265f / 180.0f;
+                        if (!e.ccw) { float t = a0; a0 = a1; a1 = t; }
+                        if (a1 < a0) a1 += 6.2831853f;
+                    }
+                    ImVec2 prev; int seg = 64;
+                    for (int i = 0; i <= seg; ++i) {
+                        float a = a0 + (a1 - a0) * (i / (float)seg);
+                        ImVec2 p = uvToScreen(e.center[0] + e.radius * std::cos(a),
+                                              e.center[1] + e.radius * std::sin(a));
+                        if (i) dl->AddLine(prev, p, c, th); prev = p;
+                    }
+                }
+            };
+            for (const auto& e : ents_) if (inSel(e.id)) strokeEnt(e, ac, 3.5f);
+
+            if (mpStage_ == 0) {
+                if (hovered >= 0 && !inSel(ents_[hovered].id)) strokeEnt(ents_[hovered], hc, 3.0f);
+                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hovered >= 0) {
+                    const SketchEntity& e = ents_[hovered];
+                    if (e.type != "line" && e.type != "circle" && e.type != "arc") {
+                        st.toast(ui::ToastLevel::Info,
+                                 "Move works on lines, circles, and arcs — not " + e.type);
+                    } else {
+                        auto it = std::find(mpSel_.begin(), mpSel_.end(), e.id);
+                        if (it != mpSel_.end()) mpSel_.erase(it); else mpSel_.push_back(e.id);
+                    }
+                }
+                if (!mpSel_.empty() && ImGui::IsKeyPressed(ImGuiKey_Enter)) mpStage_ = 1;
+            } else if (mpStage_ == 1) {
+                // Pick the FROM anchor (snap to a vertex/center if near one).
+                std::string snapH; float su = mu, sv = mv;
+                snapPoint(su, sv, snapH);
+                dl->AddCircle(uvToScreen(su, sv), 5.0f, ac, 16, 2.0f);
+                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    moveFromUV_ = ImVec2(su, sv);
+                    mpStage_ = 2;
+                }
+            } else if (mpStage_ == 2) {
+                // Live drag to the TO point; second click applies the move (Ctrl => copy).
+                std::string snapH; float su = mu, sv = mv;
+                snapPoint(su, sv, snapH);
+                bool copy = io.KeyCtrl;
+                dl->AddLine(uvToScreen(moveFromUV_.x, moveFromUV_.y), uvToScreen(su, sv),
+                            ac, 1.6f);
+                dl->AddCircle(uvToScreen(moveFromUV_.x, moveFromUV_.y), 4.0f, ac, 16, 1.6f);
+                // Ghost-preview the selection translated by the live delta.
+                float pdx = su - moveFromUV_.x, pdy = sv - moveFromUV_.y;
+                const ImU32 gc = col(pal.sketchUnder, 0.8f);
+                for (const auto& e : ents_) {
+                    if (!inSel(e.id)) continue;
+                    if (e.type == "line") {
+                        dl->AddLine(uvToScreen(e.p1[0] + pdx, e.p1[1] + pdy),
+                                    uvToScreen(e.p2[0] + pdx, e.p2[1] + pdy), gc, 2.0f);
+                    } else if (e.type == "circle" || e.type == "arc") {
+                        float a0 = 0, a1 = 6.2831853f;
+                        if (e.type == "arc") {
+                            a0 = e.start * 3.14159265f / 180.0f; a1 = e.end * 3.14159265f / 180.0f;
+                            if (!e.ccw) { float t = a0; a0 = a1; a1 = t; }
+                            if (a1 < a0) a1 += 6.2831853f;
+                        }
+                        ImVec2 prev; int seg = 64;
+                        for (int i = 0; i <= seg; ++i) {
+                            float a = a0 + (a1 - a0) * (i / (float)seg);
+                            ImVec2 p = uvToScreen(e.center[0] + pdx + e.radius * std::cos(a),
+                                                  e.center[1] + pdy + e.radius * std::sin(a));
+                            if (i) dl->AddLine(prev, p, gc, 2.0f); prev = p;
+                        }
+                    }
+                }
+                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    applyMoveOp(st, su - moveFromUV_.x, sv - moveFromUV_.y, copy);
+                    // applyMoveOp resets the selection + stage 0 for another move.
+                }
+            }
+
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                escHandled = true;
+                if (mpStage_ > 0) mpStage_ = mpStage_ - 1;   // back out from to-pick -> from-pick -> select
                 else cancelTool();
             }
         }
@@ -4887,6 +5118,39 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         }
                     }
                 }
+            } else if (tool_ == SketchTool::ArcTangent) {
+                // C54: derive the source + free endpoint each frame; the arc starts there tangent to
+                // the source and sweeps to the live cursor. Highlight the snapped start; if no source
+                // exists we fall back to a plain 2-point chord (treated as a near-straight arc).
+                TangentArcSrc src;
+                if (tangentArcSource(io.MousePos, src)) {
+                    // bright dot on the tangent start + faint tangent direction tick
+                    ImVec2 sS = uvToScreen(src.start.x, src.start.y);
+                    dl->AddCircleFilled(sS, 4.0f, col(pal.accent, 0.95f));
+                    ImVec2 tEnd = uvToScreen(src.start.x + src.tdir.x * 6.0f,
+                                             src.start.y + src.tdir.y * 6.0f);
+                    dl->AddLine(sS, tEnd, col(pal.accent, 0.6f), 1.2f);
+                    float cu, cv, rad, a0, a1; bool ccw;
+                    if (tangentArcThrough(src.start, src.tdir, ImVec2(su, sv),
+                                          cu, cv, rad, a0, a1, ccw)) {
+                        if (a1 < a0) a1 += 360.0f;
+                        float lo = ccw ? a0 : a1, hi = ccw ? a1 : a0;
+                        if (hi < lo) hi += 360.0f;
+                        const float D2R = 3.14159265f / 180.0f;
+                        ImVec2 prev;
+                        for (int i = 0; i <= 48; ++i) {
+                            float a = (lo + (hi - lo) * (i / 48.0f)) * D2R;
+                            ImVec2 q = uvToScreen(cu + rad * std::cos(a), cv + rad * std::sin(a));
+                            if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                        }
+                    } else {
+                        // Degenerate (cursor on the tangent line): preview a straight chord.
+                        dl->AddLine(sS, sCur, uCol, 1.6f);
+                    }
+                } else {
+                    // No source -> behave like a 3-pt arc's first leg (rubber chord from cursor).
+                    dl->AddCircleFilled(sCur, 3.0f, uCol);
+                }
             } else if (tool_ == SketchTool::Polygon && n >= 1) {
                 ImVec2 ctr = toolUV_[0];
                 dl->AddCircleFilled(uvToScreen(ctr.x, ctr.y), 3.0f, uCol);
@@ -4996,7 +5260,45 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             toolUV_.push_back(ImVec2(su, sv));
             toolSnaps_.push_back(snapH);
             // Tools that complete on a fixed number of clicks:
-            if (tool_ == SketchTool::Line && toolUV_.size() == 2) {
+            // C54: Tangent Arc — ONE click places the end. The start + tangent come from the source
+            // entity (resolved at click time). We commit an arc tangent to the source there, joined
+            // by a coincident at the shared endpoint and a tangent relation (arc <-> source) so it
+            // stays tangent under drag. No source / degenerate geometry -> toast a hint and reset.
+            if (tool_ == SketchTool::ArcTangent && toolUV_.size() == 1) {
+                ImVec2 endPt = toolUV_[0];
+                TangentArcSrc src;
+                float cu, cv, rad, a0, a1; bool ccw;
+                if (!tangentArcSource(io.MousePos, src)) {
+                    st.toast(ui::ToastLevel::Info,
+                             "Tangent Arc: draw or select a line/arc first, then click the arc end");
+                    resetTool(); tool_ = SketchTool::ArcTangent;
+                } else if (!tangentArcThrough(src.start, src.tdir, endPt,
+                                              cu, cv, rad, a0, a1, ccw)) {
+                    st.toast(ui::ToastLevel::Info,
+                             "Tangent Arc: the end is on the tangent line (no arc) — pick a point off it");
+                    resetTool(); tool_ = SketchTool::ArcTangent;
+                } else {
+                    // The solved arc always sweeps start->end; store CCW with the matching angle order
+                    // (solver drops the ccw flag, so a false flag would re-render mirrored). When the
+                    // geometric sweep is CW, store the CCW arc end->start (same curve) and join the
+                    // source endpoint to whichever arc handle landed on the start.
+                    float sStart = a0, sEnd = a1;
+                    const char* startHandle = "$self.start";
+                    if (!ccw) { float t = sStart; sStart = sEnd; sEnd = t; startHandle = "$self.end"; }
+                    nlohmann::json ent = {{"type", "arc"},
+                        {"center", nlohmann::json::array({cu, cv})}, {"radius", rad},
+                        {"start", sStart}, {"end", sEnd}, {"ccw", true}};
+                    // Relations: coincident joining the source endpoint to the arc's start handle +
+                    // tangent(arc, source). For a whole-circle source there's no endpoint sub-handle
+                    // (src.handle == src.id) so we skip the coincident and keep only the tangent.
+                    nlohmann::json cs = nlohmann::json::array();
+                    if (src.handle != src.id)
+                        cs.push_back({{"type", "coincident"}, {"refs", {src.handle, startHandle}}});
+                    cs.push_back({{"type", "tangent"}, {"refs", {"$self", src.id}}});
+                    addEntity(st, ent, cs);
+                    resetTool(); tool_ = SketchTool::ArcTangent;   // stay armed for another tangent arc
+                }
+            } else if (tool_ == SketchTool::Line && toolUV_.size() == 2) {
                 ImVec2 p1 = toolUV_[0], p2 = toolUV_[1];
                 nlohmann::json cs = nlohmann::json::array();
                 // C49: a rim-snapped START whose placement direction matched gets the tangent too.
@@ -5639,6 +5941,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          tool_ == SketchTool::LinPattern ? "Linear Pattern" :
                          tool_ == SketchTool::CircPattern ? "Circular Pattern" :
                          tool_ == SketchTool::Convert ? "Convert Entities" :
+                         tool_ == SketchTool::Move ? "Move Entities" :
+                         tool_ == SketchTool::ArcTangent ? "Tangent Arc" :
                          tool_ == SketchTool::Arc3pt ? "3 Point Arc" :
                          tool_ == SketchTool::Polygon ? "Polygon" :
                          tool_ == SketchTool::RectCenter ? "Center Rectangle" :
@@ -5723,6 +6027,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                                      : "set count / angle, then Apply"; break;
             case SketchTool::Convert:
                 step = "click a model edge or face to project into the sketch"; break;
+            case SketchTool::Move:
+                step = mpStage_ == 0 ? "click entities to move, then Enter"
+                     : mpStage_ == 1 ? "click the from point (anchor)"
+                                     : "click the to point \xC2\xB7 hold Ctrl to copy"; break;
+            case SketchTool::ArcTangent:
+                step = "click the arc end (it starts tangent to the prior/selected entity)"; break;
             case SketchTool::Arc3pt:
                 step = n == 0 ? "click arc start" : n == 1 ? "click arc end"
                      : "click a point on the arc"; break;

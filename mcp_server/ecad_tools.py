@@ -870,6 +870,284 @@ def register_ecad_tools(mcp) -> None:
             ),
         })
 
+    # ---------------------------------------------------------------- sync sch -> pcb
+
+    @mcp.tool()
+    def ecad_update_from_sch(sch_doc_id: str = "", pcb_doc_id: str = "") -> str:
+        """Populate the active PCB from the active schematic (KiCad 'Update PCB from Schematic').
+
+        Adds a footprint for every schematic component that carries one, binds each pad to its
+        schematic net, registers missing nets, and reports parts that no longer exist on the
+        schematic. Sim-only parts (V/I sources) and power symbols are skipped (they have no
+        footprint). Run this AFTER the schematic is wired and BEFORE routing: the typical flow is
+        update_from_sch -> ecad_autoroute -> ecad_fill_zones.
+        """
+        sch_id = sch_doc_id or _ECAD["current_sch"]
+        pcb_id = pcb_doc_id or _ECAD["current_pcb"]
+        if sch_id is None:
+            return _err("no active schematic to sync FROM",
+                        hint="Build a schematic first (ecad_new_schematic, place + wire parts).",
+                        next_actions=["ecad_new_schematic('mydesign')"])
+        if pcb_id is None:
+            return _err("no active board to sync INTO",
+                        hint="Create a board first; it will be populated from the schematic.",
+                        next_actions=["ecad_new_pcb('myboard')"])
+        from engine.ecad import rpc as ecad_rpc
+        try:
+            resp = ecad_rpc._ecad_update_from_sch(
+                {"board_doc_id": pcb_id, "sch_doc_id": sch_id}, lambda _d: None)
+        except OpError as e:
+            return _err(f"update_from_sch failed: {e.message}", hint=e.message,
+                        next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
+        report = resp.get("report", {})
+        board = resp.get("tree", {})
+        compile_info = resp.get("compile", {})
+        ratsnest = compile_info.get("ratsnest", []) or []
+        added = report.get("added", [])
+        updated = report.get("updated", [])
+        unresolved = report.get("unresolved", [])
+        warnings = list(resp.get("warnings", []))
+        head = (f"{len(added)} footprint(s) added, {len(updated)} updated, "
+                f"{report.get('nets_bound', 0)} pad-net binding(s); "
+                f"{len(ratsnest)} airwire(s) now need routing.")
+        next_actions: list[str] = []
+        if unresolved:
+            next_actions.append(
+                "Resolve missing footprints (assign a real fpid in the schematic): "
+                + ", ".join(f"{ref}({fpid})" for ref, fpid in unresolved))
+        if ratsnest:
+            next_actions.append("ecad_autoroute()  # connect the ratsnest, then ecad_fill_zones()")
+        else:
+            next_actions.append("ecad_run_drc()  # board populated; check spacing")
+        return _dumps({
+            "ok": True, "doc_id": pcb_id, "sch_doc_id": sch_id, "kind": "pcb",
+            "revision": resp.get("revision"),
+            "footprints_added": added, "footprints_updated": updated,
+            "nets_bound": report.get("nets_bound", 0),
+            "unresolved": unresolved,
+            "footprint_count": len(board.get("footprints", [])),
+            "ratsnest_remaining": len(ratsnest),
+            "warnings": warnings,
+            "hint": head + " Next: ecad_autoroute then ecad_fill_zones.",
+            "next_actions": next_actions,
+        })
+
+    # ---------------------------------------------------------------- autoroute
+
+    @mcp.tool()
+    def ecad_autoroute(pitch: float = 0.0, doc_id: str = "") -> str:
+        """Auto-route the active board's ratsnest with a basic 2-layer grid (Lee/A*) router.
+
+        Connects the unrouted airwires with orthogonal tracks + through-vias, respecting clearance.
+        Honest about its limits: it is single-pass (no rip-up/reroute), so dense boards leave some
+        nets failed — those are reported by name and need manual routing or more space. ``pitch``
+        (mm) overrides the grid resolution (default 0.25); finer threads tighter gaps but is slower.
+        Run ecad_update_from_sch first so there is a ratsnest to route.
+        """
+        try:
+            session = _get_pcb(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="Routing needs an open board.",
+                        next_actions=["ecad_new_pcb('myboard')"])
+        from engine.ecad import rpc as ecad_rpc
+        opts = {"pitch": float(pitch)} if pitch and pitch > 0 else {}
+        try:
+            resp = ecad_rpc._ecad_autoroute(
+                {"doc_id": session.doc_id, "opts": opts}, lambda _d: None)
+        except OpError as e:
+            return _err(f"autoroute failed: {e.message}", hint=e.message,
+                        next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
+        report = resp.get("report", {})
+        routed = report.get("routed", [])
+        failed = report.get("failed", [])
+        before = report.get("airwires_before", 0)
+        after = report.get("airwires_after", 0)
+        warnings = list(resp.get("warnings", []))
+        head = (f"routed {len(routed)} net(s), {len(failed)} failed; ratsnest "
+                f"{before} -> {after} airwire(s); {report.get('vias', 0)} via(s), "
+                f"{report.get('length_mm', 0.0)} mm of track.")
+        next_actions: list[str] = []
+        if failed:
+            next_actions.append(
+                f"{len(failed)} net(s) failed ({', '.join(map(str, failed[:6]))}) — "
+                "they need manual routing or more space (move parts apart / finer pitch).")
+            next_actions.append("ecad_autoroute(pitch=0.15)  # retry with a finer grid")
+        else:
+            next_actions.append("ecad_fill_zones()  # pour copper, then ecad_run_drc()")
+        return _dumps({
+            "ok": True, "doc_id": session.doc_id, "revision": resp.get("revision"),
+            "routed_nets": routed, "failed_nets": failed,
+            "airwires_before": before, "airwires_after": after,
+            "ratsnest_remaining": after,
+            "vias": report.get("vias", 0), "length_mm": report.get("length_mm", 0.0),
+            "grid": report.get("grid", {}),
+            "warnings": warnings,
+            "hint": head + (" All nets routed." if not failed else
+                            f" {len(failed)} net(s) failed — manual routing or more space needed."),
+            "next_actions": next_actions,
+        })
+
+    # ---------------------------------------------------------------- zones
+
+    @mcp.tool()
+    def ecad_add_zone(net: str, layer: str = "F.Cu",
+                      rect_or_polygon: Optional[list] = None, doc_id: str = "") -> str:
+        """Add a copper pour (zone) bound to ``net`` on ``layer`` — usually a ground/power plane.
+
+        ``rect_or_polygon`` is either a rectangle ``[x0, y0, x1, y1]`` (auto-expanded to 4 corners)
+        or an explicit polygon ``[[x, y], ...]`` (>=3 points). Omit it to flood the whole board
+        outline bounding box (a full-board GND pour, the common case). The pour is not filled until
+        ecad_fill_zones runs (compile fills a coarse preview automatically after this edit).
+        """
+        try:
+            session = _get_pcb(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="Zones live on a board.",
+                        next_actions=["ecad_new_pcb('myboard')"])
+        doc = session.doc
+        polygon = _zone_polygon(doc, rect_or_polygon)
+        if polygon is None:
+            return _err("could not derive a zone polygon",
+                        hint="Pass rect_or_polygon as [x0,y0,x1,y1] or [[x,y],...] (>=3 pts), "
+                             "or set a board outline first so the whole-board default works.",
+                        next_actions=["ecad_status()"])
+        # The zone op requires the net to already exist on the board (there is no add-net op). A
+        # fresh board has GND; other nets arrive via ecad_update_from_sch. Guide the model rather
+        # than emitting an op that would fail.
+        if not any(n.get("name") == net for n in doc.get("nets", [])):
+            existing = [n.get("name") for n in doc.get("nets", [])]
+            return _err(f"net {net!r} is not on the board yet",
+                        hint=f"Board nets are: {', '.join(existing) or '(none)'}. A fresh board "
+                             "has GND; populate other nets with ecad_update_from_sch first, or "
+                             "pour GND.",
+                        next_actions=["ecad_add_zone('GND')  # the default ground net",
+                                      "ecad_update_from_sch()  # bind schematic nets to the board"],
+                        board_nets=existing)
+        try:
+            resp = _apply(session, [{"op": "pcb_add_zone", "net": net, "layer": layer,
+                                     "polygon": polygon}])
+        except OpError as e:
+            return _err(f"could not add zone on {net!r}/{layer}: {e.message}", hint=e.message,
+                        next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
+        zones = session.doc.get("zones", [])
+        return _dumps({
+            "ok": True, "doc_id": session.doc_id, "revision": session.revision,
+            "net": net, "layer": layer, "polygon": polygon,
+            "zone_count": len(zones),
+            "warnings": list(resp.get("warnings", [])),
+            "hint": (f"Added a {net} copper pour on {layer} ({len(polygon)} vertices). "
+                     "Fill it (ecad_fill_zones) to compute the actual copper, then ecad_run_drc."),
+            "next_actions": ["ecad_fill_zones()  # compute the poured copper",
+                             "ecad_run_drc()  # confirm clearance to other-net copper"],
+        })
+
+    @mcp.tool()
+    def ecad_fill_zones(doc_id: str = "") -> str:
+        """Fill every copper pour on the active board at FULL resolution and report the result.
+
+        Computes each zone's copper polygons (outline clipped to the board, minus clearance around
+        other-net copper, with thermal relief on same-net through-hole pads) and persists them — this
+        is the copper that gets exported to Gerber. Reports zones filled + total copper area. The
+        interactive rebuild already fills a coarse preview after each edit; call this before export
+        for the precise fill.
+        """
+        try:
+            session = _get_pcb(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="Pours live on a board.",
+                        next_actions=["ecad_new_pcb('myboard')"])
+        if not session.doc.get("zones"):
+            return _err("the board has no copper pours to fill",
+                        hint="Add a ground/power pour first.",
+                        next_actions=["ecad_add_zone('GND')  # whole-board ground pour"])
+        from engine.ecad import rpc as ecad_rpc
+        try:
+            resp = ecad_rpc._ecad_fill_zones({"doc_id": session.doc_id}, lambda _d: None)
+        except OpError as e:
+            return _err(f"zone fill failed: {e.message}", hint=e.message,
+                        next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
+        summary = resp.get("fill_summary", {})
+        filled = summary.get("zones_filled", 0)
+        total = summary.get("zones", 0)
+        area = summary.get("copper_area_mm2", 0.0)
+        return _dumps({
+            "ok": True, "doc_id": session.doc_id, "revision": resp.get("revision"),
+            "zones": total, "zones_filled": filled,
+            "polygons": summary.get("polygons", 0),
+            "copper_area_mm2": area,
+            "warnings": list(resp.get("warnings", [])),
+            "hint": (f"Filled {filled}/{total} pour(s): {area} mm^2 of copper across "
+                     f"{summary.get('polygons', 0)} polygon(s). This is the copper Gerber exports."),
+            "next_actions": ["ecad_run_drc()  # check the pour respects clearance",
+                             "ecad_export('gerber')  # the fill is baked into the copper layers"],
+        })
+
+    # ---------------------------------------------------------------- parameter sweep
+
+    @mcp.tool()
+    def ecad_sweep(param: str, values: Optional[list] = None,
+                   analysis: str = "op", probe: str = "", doc_id: str = "") -> str:
+        """Parameter sweep: re-simulate the active schematic once per value of ``param`` and report
+        how the output moves (a SPICE ``.step``).
+
+        ``param`` is a device name (e.g. 'R1', 'V1' — sets its value) or a circuit .param. ``values``
+        is the list to sweep (e.g. [1000, 2000, 5000]); start/stop/step is not exposed here — pass an
+        explicit list. ``analysis`` is 'op'/'dc'/'tran'/'ac' (default 'op'). ``probe`` picks the
+        output trace to summarize (default: the first non-ground node voltage). Returns the swept
+        trend in plain English ('V(OUT) rises 2.5 V -> 4.0 V as R1 goes 1k -> 5k').
+        """
+        try:
+            session = _get_sch(doc_id or None)
+        except OpError as e:
+            return _err(e.message, hint="Sweeps run on a schematic.",
+                        next_actions=["ecad_new_schematic('mydesign')"])
+        if not values or not isinstance(values, list):
+            return _err("ecad_sweep needs a non-empty 'values' list",
+                        hint="Pass the values to sweep, e.g. ecad_sweep('R1', [1000, 2000, 5000]).",
+                        next_actions=["ecad_sweep('R1', [1000, 2000, 5000])"])
+        doc = session.doc
+        nl = netlist_mod.build_netlist(doc)
+        try:
+            from engine.sim.spice import netlist_to_spice_circuit
+            from engine.sim.circuit import simulate as sim_run
+        except Exception as e:  # noqa: BLE001
+            return _err(f"simulator unavailable ({type(e).__name__}: {e})",
+                        hint="The sim engine (numpy/scipy) is not importable here.")
+        circuit, warns = netlist_to_spice_circuit(nl)
+        if not circuit.get("devices"):
+            return _err("nothing to sweep — the netlist has no simulatable devices",
+                        hint="Place R/C/L/V/I/D parts with VALUES and wire them up first.",
+                        next_actions=["ecad_status()"], warnings=warns)
+
+        nodes = [n for n in circuit.get("nodes", []) if str(n) not in ("0", "gnd", "GND")]
+        probe_list = [probe] if probe else [f"V({n})" for n in nodes]
+        an = _build_analysis(analysis, {}, circuit)
+        if an is None:
+            return _err(f"unknown analysis {analysis!r}",
+                        hint="Use one of: 'op', 'dc', 'tran', 'ac'.",
+                        next_actions=["ecad_sweep('R1', [1000, 2000])"])
+        fvals = [float(v) for v in values]
+        study = {"analyses": [an], "probes": probe_list,
+                 "step": {"param": param, "values": fvals}}
+        result = sim_run(circuit, study)
+        step = result.get("step", {})
+        runs = step.get("runs", [])
+        trend, sweep_table, chosen = _summarize_sweep_steps(runs, an["type"], probe or None)
+        converged = bool(result.get("convergence", {}).get("step", False))
+        return _dumps({
+            "ok": True, "doc_id": session.doc_id, "analysis": an["type"],
+            "param": param, "values": fvals, "converged": converged,
+            "probe": chosen, "sweep": sweep_table,
+            "trend": trend,
+            "warnings": warns + ([] if converged else
+                                 ["one or more sweep points did not converge"]),
+            "hint": (f"Swept {param} over {len(fvals)} value(s): {trend}" if trend else
+                     f"Swept {param} but found no finite {chosen or 'probe'} value — "
+                     "check connectivity / values (ecad_run_erc)."),
+            "next_actions": ["ecad_simulate('op')  # inspect one operating point in detail",
+                             "ecad_status()"],
+        })
+
     # ---------------------------------------------------------------- export
 
     @mcp.tool()
@@ -1126,6 +1404,115 @@ def _summarize_ac(ac: dict, reading_lines: list[str]) -> dict:
         else:
             reading_lines.append(f"{p}: peak |H|={_round(peak)} (no -3 dB rolloff in band)")
     return out
+
+
+def _zone_polygon(doc: dict, rect_or_polygon: Optional[list]) -> list | None:
+    """Resolve the ecad_add_zone shape arg into a polygon ``[[x, y], ...]`` (>=3 vertices).
+
+    Accepts a rect ``[x0, y0, x1, y1]`` (4 scalars -> 4 corners), an explicit polygon
+    ``[[x, y], ...]``, or ``None`` (flood the board outline's bounding box — the whole-board pour).
+    Returns None if no usable polygon can be derived (e.g. None + no outline)."""
+    if rect_or_polygon is None:
+        bbox = _outline_bbox(doc)
+        if bbox is None:
+            return None
+        x0, y0, x1, y1 = bbox
+        return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    # explicit polygon: list of [x, y] points
+    if (isinstance(rect_or_polygon, list) and len(rect_or_polygon) >= 3
+            and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in rect_or_polygon)):
+        return [[float(p[0]), float(p[1])] for p in rect_or_polygon]
+    # rect: [x0, y0, x1, y1]
+    if (isinstance(rect_or_polygon, list) and len(rect_or_polygon) == 4
+            and all(isinstance(v, (int, float)) for v in rect_or_polygon)):
+        x0, y0, x1, y1 = (float(v) for v in rect_or_polygon)
+        lo_x, hi_x = sorted((x0, x1))
+        lo_y, hi_y = sorted((y0, y1))
+        return [[lo_x, lo_y], [hi_x, lo_y], [hi_x, hi_y], [lo_x, hi_y]]
+    return None
+
+
+def _outline_bbox(doc: dict) -> tuple[float, float, float, float] | None:
+    """Bounding box (minx, miny, maxx, maxy) of the board outline shapes, or None if empty."""
+    xs: list[float] = []
+    ys: list[float] = []
+    for sh in doc.get("outline", {}).get("shapes", []) or []:
+        for key in ("p1", "p2", "center"):
+            p = sh.get(key)
+            if isinstance(p, (list, tuple)) and len(p) == 2:
+                xs.append(float(p[0]))
+                ys.append(float(p[1]))
+    if not xs or not ys:
+        return None
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _summarize_sweep_steps(runs: list, atype: str, probe: Optional[str]):
+    """Compact a `.step` sweep into (trend_sentence, sweep_table, chosen_probe).
+
+    For each swept value we pull a single scalar for the chosen probe (the op node voltage, or the
+    final transient value, or the peak AC magnitude) and build a plain-English 'rises/falls/holds'
+    sentence so a weak model can read the trend without parsing the raw runs."""
+    # Pick the probe to report: the explicit one, else the first probe that has finite values.
+    def _scalar(run: dict, p: str):
+        if atype == "op":
+            return run.get("op", {}).get(p)
+        if atype == "tran":
+            tr = run.get("tran", {}).get("traces", {}).get(p, [])
+            return tr[-1] if tr else None
+        if atype == "ac":
+            mags = run.get("ac", {}).get("mag", {}).get(p, [])
+            fin = [m for m in mags if _finite(m)]
+            return max(fin) if fin else None
+        if atype == "dc":
+            tr = run.get("dc", {}).get("traces", {}).get(p, [])
+            fin = [v for v in tr if _finite(v)]
+            return fin[-1] if fin else None
+        return None
+
+    chosen = probe
+    if chosen is None:
+        # find the probe name present across runs with the most finite values
+        names: list[str] = []
+        for run in runs:
+            for key in ("op",):
+                names += list(run.get(key, {}).keys())
+            for key in ("tran", "dc"):
+                names += list(run.get(key, {}).get("traces", {}).keys())
+            for key in ("ac",):
+                names += list(run.get(key, {}).get("mag", {}).keys())
+        # prefer a node voltage
+        v_names = [n for n in names if str(n).startswith("V(")]
+        ordered = v_names or names
+        for cand in ordered:
+            if any(_finite(_scalar(run, cand)) for run in runs):
+                chosen = cand
+                break
+
+    table: list[dict] = []
+    series: list[tuple[float, float]] = []
+    for run in runs:
+        val = run.get("value")
+        scal = _scalar(run, chosen) if chosen else None
+        row = {"value": _round(val), chosen or "probe": _round(scal)}
+        table.append(row)
+        if _finite(val) and _finite(scal):
+            series.append((float(val), float(scal)))
+
+    if not series or chosen is None:
+        return "", table, chosen
+    first_v, first_y = series[0]
+    last_v, last_y = series[-1]
+    delta = last_y - first_y
+    unit = "" if atype == "ac" else " V"
+    if abs(delta) < 1e-9:
+        verb = "holds at"
+        trend = f"{chosen} {verb} {_round(first_y)}{unit} as {_round(first_v)} -> {_round(last_v)}"
+    else:
+        verb = "rises" if delta > 0 else "falls"
+        trend = (f"{chosen} {verb} {_round(first_y)}{unit} -> {_round(last_y)}{unit} "
+                 f"as the swept value goes {_round(first_v)} -> {_round(last_v)}")
+    return trend, table, chosen
 
 
 def _default_out_dir(name: str):

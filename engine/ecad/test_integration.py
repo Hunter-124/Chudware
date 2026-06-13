@@ -325,6 +325,112 @@ def test_pcb() -> dict:
 
 
 # ==============================================================================
+# 3b. SYNC + AUTOROUTE + ZONE FILL  (the new capability wiring)
+# ==============================================================================
+
+def test_sync_autoroute_fill() -> None:
+    """sync populates a blank board -> autoroute reduces the ratsnest -> a GND pour fills cleanly.
+
+    Exercises the freshly-wired capabilities end-to-end on a sync-built board (the canonical path),
+    asserting the contract the task calls for:
+      * after update_board_from_sch the board has the resistor footprints + an unrouted ratsnest;
+      * autoroute drops the routable net's airwire (ideally the whole ratsnest -> 0);
+      * a GND pour + fill_zones yields non-empty filled_polys AND keeps DRC clearance clean.
+    """
+    print("\n-- 3b. SYNC + AUTOROUTE + ZONE FILL ------------------------------")
+    import copy as _copy
+    from engine.ecad import schema, sync
+    from engine.ecad.ops import apply_ops
+    from engine.ecad.netlist import build_netlist
+    from engine.ecad.drc import ratsnest, run_drc
+    from engine.ecad import autoroute as autoroute_mod
+    from engine.ecad import zonefill as zonefill_mod
+
+    # -- build a divider schematic whose resistors carry a real footprint --------
+    from engine.ecad.library.starter import SYMBOLS
+    sch = schema.new_schematic("divider_sync")
+    for libid in ("Simulation_SPICE:V_source", "Device:R", "power:GND"):
+        sch["lib_cache"][libid] = _copy.deepcopy(SYMBOLS[libid])
+    res = apply_ops(sch, [
+        {"op": "sch_add_symbol", "libid": "Simulation_SPICE:V_source",
+         "pos": [0.0, 0.0], "ref": "V1", "value": "5"},
+        {"op": "sch_add_symbol", "libid": "Device:R", "pos": [20.0, 5.0],
+         "ref": "R1", "value": "10k", "footprint": "Resistor_SMD:R_0603"},
+        {"op": "sch_add_symbol", "libid": "Device:R", "pos": [40.0, 5.0],
+         "ref": "R2", "value": "10k", "footprint": "Resistor_SMD:R_0603"},
+    ])
+    sch = res["doc"]
+    res = apply_ops(sch, [
+        {"op": "sch_add_power", "net": "+5V", "pos": [0.0, 5.08]},
+        {"op": "sch_add_power", "net": "+5V", "pos": [14.92, 5.0]},
+        {"op": "sch_add_label", "text": "MID", "pos": [25.08, 5.0], "scope": "local"},
+        {"op": "sch_add_label", "text": "MID", "pos": [34.92, 5.0], "scope": "local"},
+        {"op": "sch_add_power", "net": "GND", "pos": [0.0, -5.08]},
+        {"op": "sch_add_power", "net": "GND", "pos": [45.08, 5.0]},
+    ])
+    sch = res["doc"]
+    nl = build_netlist(sch)
+
+    # -- sync: populate a blank board from the netlist ---------------------------
+    board = schema.new_board("divider_sync_pcb")
+    # a generous outline so the autorouter has room + the pour has area
+    res = apply_ops(board, [{"op": "pcb_set_outline", "shapes": [
+        {"type": "line", "p1": [0, 0],   "p2": [60, 0]},
+        {"type": "line", "p1": [60, 0],  "p2": [60, 30]},
+        {"type": "line", "p1": [60, 30], "p2": [0, 30]},
+        {"type": "line", "p1": [0, 30],  "p2": [0, 0]},
+    ], "closed": True}])
+    board = res["doc"]
+
+    out = sync.update_board_from_sch(board, dict(nl, id=sch.get("id")))
+    board = out["mutated_board"]
+    _assert(out["report"]["added"] == ["R1", "R2"],
+            f"sync added R1+R2 (got {out['report']['added']})")
+    _assert(len(board["footprints"]) == 2,
+            f"board has 2 footprints after sync (got {len(board['footprints'])})")
+
+    rats_before = ratsnest(board)
+    nets_before = {r["net"] for r in rats_before}
+    _assert("MID" in nets_before,
+            f"MID is an unrouted airwire before routing (got {sorted(nets_before)})")
+    print(f"  ratsnest before autoroute: {len(rats_before)} airwire(s) {sorted(nets_before)}")
+
+    # -- autoroute: the MID net should connect, dropping its airwire -------------
+    ar = autoroute_mod.autoroute(board, {})
+    board = _copy.deepcopy(board)
+    board["tracks"] = list(board.get("tracks", [])) + ar["tracks"]
+    board["vias"] = list(board.get("vias", [])) + ar["vias"]
+    rats_after = ratsnest(board)
+    nets_after = {r["net"] for r in rats_after}
+    _assert(len(rats_after) < len(rats_before),
+            f"autoroute reduced the ratsnest ({len(rats_before)} -> {len(rats_after)})")
+    _assert("MID" not in nets_after,
+            f"MID routed away (still unrouted: {sorted(nets_after)})")
+    print(f"  autoroute report: routed={ar['report']['routed']} failed={ar['report']['failed']} "
+          f"ratsnest {len(rats_before)} -> {len(rats_after)} ({ar['report']['length_mm']} mm)")
+
+    # -- GND copper pour over the whole board, then fill -------------------------
+    res = apply_ops(board, [{"op": "pcb_add_zone", "net": "GND", "layer": "F.Cu",
+                             "polygon": [[1, 1], [59, 1], [59, 29], [1, 29]]}])
+    board = res["doc"]
+    filled = zonefill_mod.fill_zones(board)
+    gnd_zone = next(z for z in filled["zones"] if z.get("net") == "GND")
+    _assert(len(gnd_zone.get("filled_polys", [])) >= 1,
+            f"GND pour produced filled_polys (got {len(gnd_zone.get('filled_polys', []))})")
+    total_pts = sum(len(p) for p in gnd_zone["filled_polys"])
+    print(f"  zone fill: GND pour -> {len(gnd_zone['filled_polys'])} polygon(s), {total_pts} vertices")
+
+    # -- DRC still clean (no clearance errors) on the filled, routed board -------
+    drc_filled = run_drc(filled)
+    clearance_errs = [v for v in drc_filled
+                      if v.get("rule") == "clearance" and v.get("severity") == "error"]
+    _assert(len(clearance_errs) == 0,
+            f"no clearance violations after route + fill (got {len(clearance_errs)})")
+    print(f"  DRC after route+fill: {len(drc_filled)} violation(s), "
+          f"{len(clearance_errs)} clearance error(s)")
+
+
+# ==============================================================================
 # 4. FAB
 # ==============================================================================
 
@@ -419,6 +525,7 @@ def main() -> None:
     doc, nl = test_schematic()
     test_simulate(nl)
     board = test_pcb()
+    test_sync_autoroute_fill()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         test_fab(board, tmpdir)

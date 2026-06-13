@@ -31,6 +31,13 @@ EmitFn = Callable[[dict], None]
 
 _UNDO_LIMIT = 100
 
+# Interactive compile uses a COARSER zone-fill grid than the full-resolution export path
+# (engine.ecad.zonefill.DEFAULT_RESOLUTION = 0.1mm). 0.25mm is ~6x cheaper (cost is ~1/res^2)
+# while still giving a representative pour preview after every rebuild; full-resolution fill
+# happens on explicit ecad_fill_zones / export (see rpc._ecad_fill_zones). A board with no zones
+# is never touched (the fill block is guarded by zone presence below).
+_INTERACTIVE_FILL_RESOLUTION = 0.25
+
 
 # --------------------------------------------------------------------------- session
 
@@ -122,6 +129,35 @@ def open_session(doc: dict, *, path: str | None = None) -> EcadSession:
 # --------------------------------------------------------------------------- compile (best-effort)
 
 
+def _fill_zones_into(doc: dict, resolution: float) -> int | None:
+    """Recompute every copper zone's ``filled_polys`` IN PLACE on ``doc``, returning the number of
+    zones filled (or ``None`` if there were no zones / fill was unavailable).
+
+    GUARD: a board with no zones returns immediately (no work, no cost) — zone-less boards are
+    never slowed. ``engine.ecad.zonefill`` is a LAZY import wrapped in try/except so a missing
+    module (or a fill failure) degrades gracefully and never rejects a rebuild. ``fill_zones`` is
+    pure (returns a filled deep copy); we copy each zone's freshly-computed ``filled_polys`` back
+    onto the working doc's matching zone so fab/gerber.py and ecad_describe see current fills.
+    """
+    zones = doc.get("zones")
+    if not zones:
+        return None
+    try:
+        from engine.ecad import zonefill as zonefill_mod  # type: ignore
+    except ImportError:
+        return None
+    try:
+        filled = zonefill_mod.fill_zones(doc, resolution=resolution)
+    except Exception:  # noqa: BLE001 - a fill failure must not reject the rebuild
+        return None
+    filled_by_id = {z.get("id"): z.get("filled_polys", []) for z in filled.get("zones", [])}
+    n = 0
+    for zone in zones:
+        zone["filled_polys"] = filled_by_id.get(zone.get("id"), [])
+        n += 1
+    return n
+
+
 def _compile(doc: dict) -> dict:
     """Compute the ``compile`` field (ecad_rpc.md §1). Best-effort via LAZY imports.
 
@@ -152,6 +188,13 @@ def _compile(doc: dict) -> dict:
             out["stats"]["erc_error"] = str(exc)
         out["stats"]["nets"] = len(netlist.get("nets", {})) if isinstance(netlist, dict) else 0
     elif schema.is_board(doc):
+        # Refresh copper-pour fills so each zone's filled_polys is current after the rebuild
+        # (fab/gerber.py reads zone["filled_polys"] directly). GUARDED by zone presence so a
+        # zone-less board pays nothing, and run at a COARSER resolution than export to keep the
+        # interactive path fast (full-resolution fill is explicit — see rpc._ecad_fill_zones).
+        zfilled = _fill_zones_into(doc, _INTERACTIVE_FILL_RESOLUTION)
+        if zfilled is not None:
+            out["stats"]["zones_filled"] = zfilled
         try:
             from engine.ecad import drc as drc_mod  # type: ignore
             result = drc_mod.run_drc(doc)

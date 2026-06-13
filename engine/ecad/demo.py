@@ -224,35 +224,88 @@ def step5_pcb():
     board = res["doc"]
     print(f"  Placed R2 footprint  (id={res['id_map']['$0']})")
 
-    # Ratsnest BEFORE routing
+    # Ratsnest of the placed-but-unrouted board (the next step lets the autorouter connect it).
     rats_before = ratsnest(board)
-    print(f"  Ratsnest before routing: {len(rats_before)} airwire(s)")
+    print(f"  Ratsnest (unrouted): {len(rats_before)} airwire(s)")
     for r in rats_before:
         print(f"    net={r['net']}  {r['p1']} -> {r['p2']}")
-
-    # Route VMID: straight track R1.pad2 [8.8,10] -> R2.pad1 [19.2,10]
-    res = apply_ops(board, [{"op": "pcb_add_track", "net": "VMID", "layer": "F.Cu",
-                              "p1": [8.8, 10.0], "p2": [19.2, 10.0], "width": 0.25}])
-    board = res["doc"]
-    print("  Routed VMID net: track (8.8,10)->(19.2,10) on F.Cu, w=0.25mm")
-
-    # Ratsnest AFTER routing
-    rats_after = ratsnest(board)
-    print(f"  Ratsnest after routing: {len(rats_after)} airwire(s)")
-    if not rats_after:
-        print("    All nets fully routed!")
+    print("  (left unrouted on purpose -- Step 6 autoroutes it)")
 
     return board
 
 
 # ==============================================================================
-# Step 6 -- DRC
+# Step 6 -- Autoroute (basic grid router)
+# ==============================================================================
+
+def step6_autoroute(board):
+    """Auto-route any remaining ratsnest airwires with the basic 2-layer grid router.
+
+    Honest about limits: single-pass, no rip-up/reroute. On this clean divider the +5V/GND nets
+    have a single board terminal each (the other end is V1/GND, which have no footprint), so only
+    the MID-equivalent multi-pad net has an airwire to route -- the rest are reported as-is.
+    """
+    from engine.ecad import autoroute as autoroute_mod
+    from engine.ecad.drc import ratsnest
+
+    _section(6, "Autoroute  (basic grid Lee/A* router)")
+    before = ratsnest(board)
+    print(f"  Ratsnest before autoroute: {len(before)} airwire(s)")
+
+    result = autoroute_mod.autoroute(board, {})
+    report = result["report"]
+    board["tracks"] = list(board.get("tracks", [])) + result["tracks"]
+    board["vias"] = list(board.get("vias", [])) + result["vias"]
+
+    after = ratsnest(board)
+    print(f"  Routed nets:  {report['routed'] or '(none)'}")
+    print(f"  Failed nets:  {report['failed'] or '(none)'}")
+    print(f"  Tracks added: {len(result['tracks'])}  vias: {len(result['vias'])}  "
+          f"length: {report['length_mm']} mm")
+    print(f"  Grid: pitch={report['grid'].get('pitch')} mm  "
+          f"{report['grid'].get('nx')}x{report['grid'].get('ny')} cells")
+    print(f"  Ratsnest after autoroute:  {len(after)} airwire(s)")
+    if not report["failed"]:
+        print("  OK All routable airwires connected.")
+    return board
+
+
+# ==============================================================================
+# Step 7 -- Zone fill (copper pour)
+# ==============================================================================
+
+def step7_zone_fill(board):
+    """Add a GND copper pour over the board and fill it (the copper Gerber exports)."""
+    from engine.ecad.ops import apply_ops
+    from engine.ecad import zonefill as zonefill_mod
+
+    _section(7, "Copper Pour  (GND zone fill)")
+    # GND pour inset 1 mm from the 30x20 board edges.
+    res = apply_ops(board, [{"op": "pcb_add_zone", "net": "GND", "layer": "F.Cu",
+                             "polygon": [[1, 1], [29, 1], [29, 19], [1, 19]]}])
+    board = res["doc"]
+    print("  Added GND pour on F.Cu (inset 1 mm from the board edge)")
+
+    filled = zonefill_mod.fill_zones(board)
+    for zone in filled.get("zones", []):
+        polys = zone.get("filled_polys", [])
+        verts = sum(len(p) for p in polys)
+        print(f"    zone net={zone.get('net'):4s} layer={zone.get('layer'):5s} "
+              f"-> {len(polys)} polygon(s), {verts} vertices")
+    # carry the filled zones back onto the board so downstream fab export sees them
+    board["zones"] = filled.get("zones", board.get("zones", []))
+    print("  OK Copper pour computed (clipped to outline, cleared around other-net copper).")
+    return board
+
+
+# ==============================================================================
+# Step 9 -- DRC
 # ==============================================================================
 
 def step6_drc(board):
     from engine.ecad.drc import run_drc
 
-    _section(6, "Design Rule Check (DRC)")
+    _section(9, "Design Rule Check (DRC)")
     violations = run_drc(board)
     errors   = [v for v in violations if v["severity"] == "error"]
     warnings = [v for v in violations if v["severity"] == "warning"]
@@ -272,13 +325,13 @@ def step6_drc(board):
 
 
 # ==============================================================================
-# Step 7 -- Fab outputs
+# Step 10 -- Fab outputs
 # ==============================================================================
 
 def step7_fab(board, tmpdir):
     from engine.ecad.fab import write_gerbers, write_drill, write_bom
 
-    _section(7, "Fabrication Outputs  (Gerber + Drill + BOM)")
+    _section(10, "Fabrication Outputs  (Gerber + Drill + BOM)")
     gerber_dir = os.path.join(tmpdir, "gerbers")
     os.makedirs(gerber_dir, exist_ok=True)
     files = write_gerbers(board, gerber_dir)
@@ -300,13 +353,13 @@ def step7_fab(board, tmpdir):
 
 
 # ==============================================================================
-# Step 8 -- 3D STEP
+# Step 11 -- 3D STEP
 # ==============================================================================
 
 def step8_threed(board, tmpdir):
     from engine.ecad.threed import board_to_step, board_to_part_doc
 
-    _section(8, "3D STEP Export")
+    _section(11, "3D STEP Export")
     step_path = os.path.join(tmpdir, "board.step")
     result = board_to_step(board, step_path, opts={"components": False, "copper": False})
 
@@ -358,6 +411,8 @@ def main() -> None:
     _    = step3_erc(doc, nl)
     _    = step4_simulate(nl)
     board = step5_pcb()
+    board = step6_autoroute(board)
+    board = step7_zone_fill(board)
     step6_drc(board)
 
     with tempfile.TemporaryDirectory() as tmpdir:

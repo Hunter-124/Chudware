@@ -526,6 +526,150 @@ def _ecad_update_from_sch(params: dict, _emit: EmitFn) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# ecad_autoroute  {doc_id, opts?, base_revision?}
+#   -> ops-response (for the board) + report (routed/failed nets, length, ratsnest before/after)
+# ---------------------------------------------------------------------------
+
+def _ecad_autoroute(params: dict, _emit: EmitFn) -> dict:
+    """Route a board's ratsnest with the basic grid (Lee/A*) autorouter (engine.ecad.autoroute).
+
+    Like ``ecad_update_from_sch`` this is a higher-level operation than the single-doc op vocabulary,
+    so it lives at the RPC/session layer. It:
+
+      1. loads the board session (``doc_id`` must be a pcb),
+      2. calls ``autoroute(board, opts)`` (PURE — returns fresh track/via dicts + a report),
+      3. applies the returned geometry as ``pcb_add_track`` / ``pcb_add_via`` ops (one batch — atomic,
+         one revision bump, undo snapshot, recompile),
+      4. returns the board ops-response with the router ``report`` attached.
+
+    ``autoroute`` is a LAZY import; a missing module degrades to a structured ``not_available`` error.
+    Routing nothing (no airwires) is a no-op success (an empty op batch still rebuilds).
+    """
+    from engine.ecad import session as esess, schema
+
+    doc_id = str(_require(params, "doc_id"))
+    opts = params.get("opts") or {}
+    base_revision = params.get("base_revision")
+
+    s = esess.get_session(doc_id)
+    if not schema.is_board(s.doc):
+        raise OpError("invalid_op", "ecad_autoroute requires a pcb document",
+                      {"reason": "wrong doc kind", "doc_id": doc_id})
+
+    try:
+        from engine.ecad import autoroute as autoroute_mod  # type: ignore
+    except ImportError:
+        _not_available("engine.ecad.autoroute")
+
+    result = autoroute_mod.autoroute(s.doc, opts)
+    report = result.get("report", {})
+
+    # Translate the router's track/via dicts into add-ops. The autorouter already allocated ids past
+    # the board's existing ones and assigned net/layer/width, so we forward those fields verbatim.
+    ops: list[dict] = []
+    for t in result.get("tracks", []):
+        op = {"op": "pcb_add_track", "net": t["net"], "layer": t["layer"],
+              "p1": t["p1"], "p2": t["p2"], "width": t.get("width"),
+              "kind": t.get("kind", "segment")}
+        if op["kind"] == "arc":
+            for k in ("center", "a0", "a1"):
+                if k in t:
+                    op[k] = t[k]
+        ops.append(op)
+    for v in result.get("vias", []):
+        ops.append({"op": "pcb_add_via", "net": v["net"], "at": v["at"],
+                    "drill": v.get("drill"), "diameter": v.get("diameter"),
+                    "layers": v.get("layers"), "type": v.get("type", "through")})
+
+    warnings: list[str] = []
+    if report.get("failed"):
+        warnings.append("nets the autorouter could not route (need manual routing or more space): "
+                        + ", ".join(map(str, report["failed"])))
+
+    resp = esess.apply_ops(s, base_revision, ops, _emit)
+    if warnings:
+        resp["warnings"] = list(resp.get("warnings", [])) + warnings
+    resp["report"] = report
+    resp["doc_id"] = doc_id
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# ecad_fill_zones  {doc_id, resolution?, base_revision?}
+#   -> ops-response (for the board) + summary (zones filled, copper area, polygons)
+# ---------------------------------------------------------------------------
+
+def _ecad_fill_zones(params: dict, _emit: EmitFn) -> dict:
+    """Full-resolution copper-pour fill: recompute every zone's ``filled_polys`` and persist them.
+
+    The interactive compile path (engine.ecad.session._compile) fills zones at a COARSE resolution on
+    every rebuild for a fast preview; this RPC runs the FULL-resolution fill (zonefill default 0.1mm,
+    or an explicit ``resolution``) and swaps the filled board into the session so the result is the
+    one fab/gerber.py exports. Returns the board ops-response plus a ``fill_summary`` (zones filled +
+    total copper area mm^2 + polygon count).
+
+    ``zonefill`` is a LAZY import; a missing module degrades to a structured ``not_available`` error.
+    """
+    from engine.ecad import session as esess, schema
+
+    doc_id = str(_require(params, "doc_id"))
+    base_revision = params.get("base_revision")
+
+    s = esess.get_session(doc_id)
+    if not schema.is_board(s.doc):
+        raise OpError("invalid_op", "ecad_fill_zones requires a pcb document",
+                      {"reason": "wrong doc kind", "doc_id": doc_id})
+
+    try:
+        from engine.ecad import zonefill as zonefill_mod  # type: ignore
+    except ImportError:
+        _not_available("engine.ecad.zonefill")
+
+    resolution = params.get("resolution")
+    if resolution is not None:
+        filled_board = zonefill_mod.fill_zones(s.doc, resolution=float(resolution))
+    else:
+        filled_board = zonefill_mod.fill_zones(s.doc)
+
+    summary = _zone_fill_summary(filled_board)
+
+    resp = esess.swap_doc(s, filled_board, base_revision=base_revision)
+    resp["fill_summary"] = summary
+    resp["doc_id"] = doc_id
+    return resp
+
+
+def _polygon_area(poly: list) -> float:
+    """Absolute shoelace area of a simple polygon ``[[x, y], ...]`` (mm^2)."""
+    n = len(poly)
+    if n < 3:
+        return 0.0
+    s = 0.0
+    for i in range(n):
+        x1, y1 = poly[i][0], poly[i][1]
+        x2, y2 = poly[(i + 1) % n][0], poly[(i + 1) % n][1]
+        s += x1 * y2 - x2 * y1
+    return abs(s) / 2.0
+
+
+def _zone_fill_summary(board: dict) -> dict:
+    """Summarize a filled board: zones filled, total copper area (mm^2), polygon count."""
+    zones = board.get("zones", []) or []
+    filled = 0
+    polys = 0
+    area = 0.0
+    for z in zones:
+        fp = z.get("filled_polys", []) or []
+        if fp:
+            filled += 1
+        polys += len(fp)
+        for poly in fp:
+            area += _polygon_area(poly)
+    return {"zones": len(zones), "zones_filled": filled, "polygons": polys,
+            "copper_area_mm2": round(area, 4)}
+
+
+# ---------------------------------------------------------------------------
 # Method + structured-error registration
 # ---------------------------------------------------------------------------
 
@@ -544,6 +688,8 @@ METHODS: dict[str, object] = {
     "ecad_export": _ecad_export,
     "ecad_to_3d": _ecad_to_3d,
     "ecad_update_from_sch": _ecad_update_from_sch,
+    "ecad_autoroute": _ecad_autoroute,
+    "ecad_fill_zones": _ecad_fill_zones,
 }
 
 STRUCTURED_ERROR_METHODS: set[str] = set(METHODS.keys())

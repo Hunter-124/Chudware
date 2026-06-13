@@ -66,6 +66,8 @@ def test_register() -> dict:
         "ecad_new_schematic", "ecad_new_pcb", "ecad_find_part", "ecad_place_symbol",
         "ecad_wire", "ecad_add_power", "ecad_label", "ecad_status", "ecad_run_erc",
         "ecad_simulate", "ecad_run_drc", "ecad_export", "ecad_to_3d",
+        "ecad_update_from_sch", "ecad_autoroute", "ecad_add_zone", "ecad_fill_zones",
+        "ecad_sweep",
     }
     missing = expected - set(mcp.tools)
     assert not missing, f"tools not registered: {missing}"
@@ -262,6 +264,141 @@ def test_pcb_and_drc(tools: dict) -> None:
     print("  [pcb_and_drc] PASS")
 
 
+def test_sweep(tools: dict) -> None:
+    """A parameter sweep over R1 must move the divider midpoint monotonically + read in English."""
+    # Fresh footprint-free divider (sim only): V1=10, R1 swept, R2=2k.
+    _call(tools, "ecad_new_schematic", name="sweep")
+    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=20, value="10")
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=20, value="1k", angle=90)
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=0, value="2k", angle=90)
+    _call(tools, "ecad_wire", from_ref="V1", from_pin="+", to_ref="R1", to_pin="2")
+    _call(tools, "ecad_wire", from_ref="R1", from_pin="1", to_ref="R2", to_pin="2")
+    _call(tools, "ecad_wire", from_ref="R2", from_pin="1", to_ref="V1", to_pin="-")
+    _call(tools, "ecad_add_power", net="GND", x=0, y=14.92)
+
+    sw = _call(tools, "ecad_sweep", param="R1", values=[1000, 2000, 5000], analysis="op")
+    _assert_context(sw, "ecad_sweep")
+    assert sw["ok"], f"sweep failed: {sw.get('error')}"
+    assert sw["converged"], f"sweep did not converge: {sw.get('warnings')}"
+    assert len(sw["sweep"]) == 3, f"expected 3 swept points, got {sw['sweep']}"
+    # As R1 rises with R2 fixed, the divider output V=10*R2/(R1+R2) FALLS.
+    probe = sw["probe"]
+    ys = [row[probe] for row in sw["sweep"] if row.get(probe) is not None]
+    assert len(ys) == 3, f"expected 3 finite probe values, got {ys}"
+    assert ys[0] > ys[-1], f"output should fall as R1 rises (got {ys})"
+    # First point: R1=1k,R2=2k -> 10*2/3 = 6.667 V; last: R1=5k -> 10*2/7 = 2.857 V
+    assert abs(ys[0] - 6.6667) < 0.05, f"R1=1k midpoint should be ~6.667V, got {ys[0]}"
+    assert abs(ys[-1] - 2.8571) < 0.05, f"R1=5k midpoint should be ~2.857V, got {ys[-1]}"
+    assert "fall" in sw["trend"].lower(), f"trend should read as falling: {sw['trend']!r}"
+    print(f"  sweep R1[1k,2k,5k]: {probe} {ys}")
+    print(f"  trend: {sw['trend']}")
+    print("  [sweep] PASS")
+
+
+def test_sweep_guard(tools: dict) -> None:
+    """ecad_sweep without a values list must fail gracefully with guidance."""
+    sw = _call(tools, "ecad_sweep", param="R1")
+    assert not sw["ok"], "sweep with no values should not succeed"
+    assert sw["next_actions"], "failure must still teach"
+    print("  [sweep_guard] PASS")
+
+
+def _build_footprinted_divider(tools: dict) -> None:
+    """Build a divider whose resistors carry a real footprint, so sync places them on the board."""
+    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_tools import _ECAD
+
+    _call(tools, "ecad_new_schematic", name="sync_div")
+    v1 = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source",
+               x=0, y=0, value="5", ref="V1")
+    r1 = _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=5, value="10k", ref="R1")
+    r2 = _call(tools, "ecad_place_symbol", libid="Device:R", x=40, y=5, value="10k", ref="R2")
+    # Assign footprints via the session ops (the MCP layer has no footprint setter for symbols).
+    s = ecad_session.get_session(_ECAD["current_sch"])
+    ecad_session.apply_ops(s, s.revision, [
+        {"op": "sch_edit_symbol", "id": r1["id"], "footprint": "Resistor_SMD:R_0603"},
+        {"op": "sch_edit_symbol", "id": r2["id"], "footprint": "Resistor_SMD:R_0603"},
+    ])
+    # Connectivity by net name (robust): +5V, MID, GND.
+    ecad_session.apply_ops(s, s.revision, [
+        {"op": "sch_add_power", "net": "+5V", "pos": [0.0, 5.08]},
+        {"op": "sch_add_power", "net": "+5V", "pos": [14.92, 5.0]},
+        {"op": "sch_add_label", "text": "MID", "pos": [25.08, 5.0], "scope": "local"},
+        {"op": "sch_add_label", "text": "MID", "pos": [34.92, 5.0], "scope": "local"},
+        {"op": "sch_add_power", "net": "GND", "pos": [45.08, 5.0]},
+    ])
+
+
+def test_sync_autoroute_zone_flow(tools: dict) -> None:
+    """The full PCB capability chain via the AI tools: update_from_sch -> autoroute -> add_zone ->
+    fill_zones, asserting the rich-context contract at each step."""
+    from engine.ecad import session as ecad_session
+    from mcp_server.ecad_tools import _ECAD
+
+    _build_footprinted_divider(tools)
+    _call(tools, "ecad_new_pcb", name="sync_board")
+    # Give the board an outline so the whole-board zone default + router have room.
+    pcb = ecad_session.get_session(_ECAD["current_pcb"])
+    ecad_session.apply_ops(pcb, pcb.revision, [{"op": "pcb_set_outline", "shapes": [
+        {"type": "line", "p1": [0, 0],   "p2": [60, 0]},
+        {"type": "line", "p1": [60, 0],  "p2": [60, 30]},
+        {"type": "line", "p1": [60, 30], "p2": [0, 30]},
+        {"type": "line", "p1": [0, 30],  "p2": [0, 0]},
+    ], "closed": True}])
+
+    # --- update_from_sch ---
+    up = _call(tools, "ecad_update_from_sch")
+    _assert_context(up, "ecad_update_from_sch")
+    assert up["ok"], f"update_from_sch failed: {up.get('error')}"
+    assert sorted(up["footprints_added"]) == ["R1", "R2"], \
+        f"sync should add R1+R2 (got {up['footprints_added']})"
+    assert up["ratsnest_remaining"] >= 1, "MID should be an unrouted airwire after sync"
+    print(f"  update_from_sch: added={up['footprints_added']} "
+          f"ratsnest={up['ratsnest_remaining']} nets_bound={up['nets_bound']}")
+
+    # --- autoroute ---
+    ar = _call(tools, "ecad_autoroute")
+    _assert_context(ar, "ecad_autoroute")
+    assert ar["ok"], f"autoroute failed: {ar.get('error')}"
+    assert ar["airwires_after"] <= ar["airwires_before"], \
+        f"ratsnest should not grow ({ar['airwires_before']} -> {ar['airwires_after']})"
+    assert "MID" in ar["routed_nets"], f"MID should route (routed={ar['routed_nets']})"
+    print(f"  autoroute: {ar['airwires_before']} -> {ar['airwires_after']} airwire(s), "
+          f"routed={ar['routed_nets']} failed={ar['failed_nets']}")
+
+    # --- add_zone (whole-board GND pour) ---
+    az = _call(tools, "ecad_add_zone", net="GND", layer="F.Cu")
+    _assert_context(az, "ecad_add_zone")
+    assert az["ok"], f"add_zone failed: {az.get('error')}"
+    assert az["zone_count"] == 1, f"one zone expected, got {az['zone_count']}"
+    print(f"  add_zone: GND pour, {len(az['polygon'])} vertices")
+
+    # --- fill_zones ---
+    fz = _call(tools, "ecad_fill_zones")
+    _assert_context(fz, "ecad_fill_zones")
+    assert fz["ok"], f"fill_zones failed: {fz.get('error')}"
+    assert fz["zones_filled"] >= 1, f"GND pour should fill (got {fz})"
+    assert fz["copper_area_mm2"] > 0.0, f"copper area should be positive (got {fz})"
+    print(f"  fill_zones: {fz['zones_filled']} filled, {fz['copper_area_mm2']} mm^2, "
+          f"{fz['polygons']} polygon(s)")
+    print("  [sync_autoroute_zone_flow] PASS")
+
+
+def test_add_zone_unknown_net(tools: dict) -> None:
+    """ecad_add_zone on a net the board does not have yet must guide, not crash."""
+    _call(tools, "ecad_new_pcb", name="zone_guard")
+    # No outline -> whole-board default can't derive a polygon; pass an explicit rect.
+    z = _call(tools, "ecad_add_zone", net="NOPE", layer="F.Cu",
+              rect_or_polygon=[0, 0, 10, 10])
+    assert not z["ok"], "adding a zone on an unknown net should fail cleanly"
+    assert z["next_actions"], "failure must still teach"
+    # GND (present on a fresh board) should work with an explicit rect.
+    z2 = _call(tools, "ecad_add_zone", net="GND", layer="F.Cu",
+               rect_or_polygon=[0, 0, 10, 10])
+    assert z2["ok"], f"GND zone with an explicit rect should succeed: {z2.get('error')}"
+    print("  [add_zone_unknown_net] PASS")
+
+
 def test_export_guard(tools: dict) -> None:
     # 3D export is best-effort; assert it returns a clean payload either way (no exception).
     out = _call(tools, "ecad_to_3d")
@@ -283,7 +420,11 @@ def main() -> None:
     test_run_erc(tools)
     test_simulate_op(tools)
     test_simulate_no_devices(tools)
+    test_sweep(tools)
+    test_sweep_guard(tools)
     test_pcb_and_drc(tools)
+    test_sync_autoroute_zone_flow(tools)
+    test_add_zone_unknown_net(tools)
     test_export_guard(tools)
     print("\nALL ECAD TOOL TESTS PASSED")
 

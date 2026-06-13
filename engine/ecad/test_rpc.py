@@ -267,6 +267,132 @@ def test_describe() -> None:
 
 
 # ---------------------------------------------------------------------------
+# test_autoroute_and_fill_zones  (the new capability RPCs)
+# ---------------------------------------------------------------------------
+
+def _build_routable_board() -> str:
+    """New board + outline + two footprints sharing a 'SIG' net on two pads -> one airwire to route.
+
+    Returns the board doc_id (registered in the session registry).
+    """
+    from engine.ecad.rpc import METHODS
+    new_fn = METHODS["ecad_new"]
+    apply_fn = METHODS["ecad_apply_ops"]
+
+    r0 = _call(new_fn, {"kind": "pcb", "name": "RouteBoard"})
+    doc_id = r0["doc_id"]
+
+    # Generous 40x20 outline so the grid router has room.
+    _call(apply_fn, {"doc_id": doc_id, "base_revision": 0, "ops": [
+        {"op": "pcb_set_outline", "shapes": [
+            {"type": "line", "p1": [0, 0],  "p2": [40, 0]},
+            {"type": "line", "p1": [40, 0], "p2": [40, 20]},
+            {"type": "line", "p1": [40, 20], "p2": [0, 20]},
+            {"type": "line", "p1": [0, 20], "p2": [0, 0]},
+        ], "closed": True},
+    ]})
+
+    # Two R_0603 footprints; pad "2" of R1 and pad "1" of R2 share net SIG (an airwire). GND already
+    # exists; SIG is introduced by the pads (pcb_add_track/zone _require_net, but pads register via
+    # the footprint op path). To be safe, give both footprints SIG pads via explicit pad nets.
+    from engine.ecad.library.starter import FOOTPRINTS
+    import copy as _copy
+    fp = FOOTPRINTS["Resistor_SMD:R_0603"]
+
+    # The board needs the SIG net registered before pads reference it for routing. Footprint pads can
+    # carry any net string; ratsnest groups by net name. But pcb_add_track (used by autoroute) calls
+    # _require_net -> SIG must be in board.nets. There is no add-net op, so we route a net that the
+    # footprint pads introduce AND that is already present: use GND (present on a fresh board) for the
+    # routable pair so the autorouter's pcb_add_track passes _require_net.
+    r1_pads = _copy.deepcopy(fp["pads"])
+    for pad in r1_pads:
+        pad["net"] = "GND"
+    r2_pads = _copy.deepcopy(fp["pads"])
+    for pad in r2_pads:
+        pad["net"] = "GND"
+
+    _call(apply_fn, {"doc_id": doc_id, "base_revision": 1, "ops": [
+        {"op": "pcb_add_footprint", "fpid": "Resistor_SMD:R_0603", "ref": "R1",
+         "value": "10k", "pos": [10.0, 10.0], "side": "top", "pads": r1_pads, "def": fp},
+        {"op": "pcb_add_footprint", "fpid": "Resistor_SMD:R_0603", "ref": "R2",
+         "value": "10k", "pos": [28.0, 10.0], "side": "top", "pads": r2_pads, "def": fp},
+    ]})
+    return doc_id
+
+
+def test_autoroute_and_fill_zones() -> None:
+    from engine.ecad.rpc import METHODS
+    from engine.ecad.drc import ratsnest
+
+    autoroute_fn = METHODS["ecad_autoroute"]
+    fill_fn = METHODS["ecad_fill_zones"]
+    apply_fn = METHODS["ecad_apply_ops"]
+    tree_fn = METHODS["ecad_tree"]
+
+    doc_id = _build_routable_board()
+
+    # Ratsnest before: GND now spans 4 pads (all on one net) -> at least one airwire.
+    tr = _call(tree_fn, {"doc_id": doc_id})
+    rats_before = ratsnest(tr["tree"])
+    assert len(rats_before) >= 1, f"expected airwires before routing, got {rats_before}"
+
+    # --- ecad_autoroute ---
+    base_rev = tr["revision"]
+    resp = _call(autoroute_fn, {"doc_id": doc_id})
+    assert resp["kind"] == "pcb"
+    assert resp["revision"] == base_rev + 1, \
+        f"autoroute should bump revision by 1 (got {resp['revision']} from {base_rev})"
+    assert "report" in resp, "autoroute response carries the router report"
+    report = resp["report"]
+    assert report["airwires_after"] <= report["airwires_before"], \
+        f"ratsnest should not grow ({report['airwires_before']} -> {report['airwires_after']})"
+    # The compile field reflects the routed board.
+    assert "compile" in resp and "ratsnest" in resp["compile"]
+    rats_after_compile = len(resp["compile"]["ratsnest"])
+    assert rats_after_compile == report["airwires_after"], \
+        f"compile.ratsnest ({rats_after_compile}) matches report ({report['airwires_after']})"
+    print(f"  autoroute: ratsnest {report['airwires_before']} -> {report['airwires_after']}, "
+          f"{len(resp['tree'].get('tracks', []))} track(s), routed={report['routed']}, "
+          f"failed={report['failed']}")
+
+    # --- add a GND zone, then ecad_fill_zones (full resolution) ---
+    rev = resp["revision"]
+    zr = _call(apply_fn, {"doc_id": doc_id, "base_revision": rev, "ops": [
+        {"op": "pcb_add_zone", "net": "GND", "layer": "F.Cu",
+         "polygon": [[1, 1], [39, 1], [39, 19], [1, 19]]},
+    ]})
+    rev = zr["revision"]
+    fz = _call(fill_fn, {"doc_id": doc_id})
+    assert fz["revision"] == rev + 1, f"fill_zones bumps revision (got {fz['revision']} from {rev})"
+    assert "fill_summary" in fz, "fill_zones response carries a fill_summary"
+    summary = fz["fill_summary"]
+    assert summary["zones_filled"] >= 1, f"GND pour should fill (got {summary})"
+    assert summary["copper_area_mm2"] > 0.0, f"copper area should be positive (got {summary})"
+    # The filled polys are persisted onto the doc's zone.
+    gnd_zone = next(z for z in fz["tree"]["zones"] if z.get("net") == "GND")
+    assert len(gnd_zone.get("filled_polys", [])) >= 1, "filled_polys persisted on the zone"
+    print(f"  fill_zones: {summary['zones_filled']} zone(s), "
+          f"{summary['copper_area_mm2']} mm^2, {summary['polygons']} polygon(s)")
+    print("  test_autoroute_and_fill_zones PASS")
+
+
+def test_autoroute_wrong_kind() -> None:
+    """ecad_autoroute on a schematic must return a clean structured error, not crash."""
+    from engine.ecad.rpc import METHODS
+    from engine.ecad.ops import OpError
+
+    new_fn = METHODS["ecad_new"]
+    autoroute_fn = METHODS["ecad_autoroute"]
+    r0 = _call(new_fn, {"kind": "sch", "name": "NotABoard"})
+    try:
+        _call(autoroute_fn, {"doc_id": r0["doc_id"]})
+        assert False, "autoroute on a schematic should raise"
+    except OpError as e:
+        assert e.code == "invalid_op", f"expected invalid_op, got {e.code}"
+    print("  test_autoroute_wrong_kind PASS")
+
+
+# ---------------------------------------------------------------------------
 # test_worker_registry_regression
 # ---------------------------------------------------------------------------
 
@@ -282,7 +408,8 @@ def test_worker_registry_regression() -> None:
 
     # Check a sample of the expected ecad methods
     for expected in ("ecad_new", "ecad_apply_ops", "ecad_tree", "ecad_undo",
-                     "ecad_redo", "ecad_export", "ecad_to_3d", "ecad_describe"):
+                     "ecad_redo", "ecad_export", "ecad_to_3d", "ecad_describe",
+                     "ecad_autoroute", "ecad_fill_zones"):
         assert expected in w._METHODS, f"{expected} not in worker registry"
 
     # All ecad methods must also be in STRUCTURED_ERROR_METHODS
@@ -305,6 +432,8 @@ def main() -> None:
         test_pcb_outline_footprint_bom_export,
         test_ecad_to_3d_graceful,
         test_describe,
+        test_autoroute_and_fill_zones,
+        test_autoroute_wrong_kind,
         test_worker_registry_regression,
     ]
     failed = []

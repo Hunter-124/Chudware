@@ -45,6 +45,11 @@ mcp = FastMCP(
     ),
 )
 
+# === ECAD tools (Wave C3) ===
+from mcp_server.ecad_tools import register_ecad_tools
+register_ecad_tools(mcp)
+# === end ECAD tools ===
+
 # in-memory "current model" — one active part per server session
 _STATE: dict = {"name": None, "result": None, "out_dir": None}
 # separate "current assembly" so the multi-part tools don't clobber the single-part state

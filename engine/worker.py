@@ -719,6 +719,17 @@ _STRUCTURED_ERROR_METHODS = {
 _METHODS.update({"agent_ask_v2": _agent_ask_v2})
 _STRUCTURED_ERROR_METHODS.add("agent_ask_v2")
 
+# === ECAD (Wave C2) ===
+try:
+    from engine.ecad.rpc import METHODS as _ECAD_METHODS, STRUCTURED_ERROR_METHODS as _ECAD_SEM
+    _METHODS.update(_ECAD_METHODS)
+    _STRUCTURED_ERROR_METHODS |= _ECAD_SEM
+except Exception as _ecad_import_err:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger("ai-cad.worker").warning(
+        "engine.ecad.rpc unavailable — ecad_* methods not registered: %s", _ecad_import_err)
+# === end ECAD ===
+
 
 def _emit(obj: dict) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")

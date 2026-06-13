@@ -536,6 +536,93 @@ def _op_sch_set_grid(doc, op, index, idgen, id_map, warnings):
     doc.setdefault("units", {})["grid"] = float(grid)
 
 
+def _op_sch_add_sheet(doc, op, index, idgen, id_map, warnings):
+    """Create a child sheet (hierarchy). ``parent`` defaults to the root sheet ``sh1``.
+
+    Additive: a flat single-sheet doc is unaffected. The new sheet id is recorded under ``$<index>``
+    so a later ``sch_add_sheet_symbol`` can reference it via ``"child":"$<index>"``.
+    """
+    _require_sch(doc, index)
+    sheets = doc.setdefault("sheets", [])
+    parent = op.get("parent", "sh1")
+    if parent is not None and _find(sheets, parent) is None:
+        raise OpError("unknown_object", f"op[{index}]: no parent sheet '{parent}'",
+                      {"index": index, "reason": f"unknown sheet {parent}"})
+    shid = idgen.next("sh")
+    sheet = {
+        "id": shid, "name": op.get("name", shid), "parent": parent,
+        "size": list(op.get("size", [297, 210])), "ports": [],
+    }
+    sheets.append(sheet)
+    id_map[f"${index}"] = shid
+
+
+def _op_sch_add_sheet_symbol(doc, op, index, idgen, id_map, warnings):
+    """Place a hierarchical sheet symbol that instantiates a child sheet, exposing sheet pins.
+
+    ``sheet`` is the parent sheet the symbol is drawn on; ``child`` is the instantiated sheet id
+    (placeholder-eligible). ``pins`` is an optional list of ``{name, pos, shape}`` connection points;
+    each bridges to the equal-named ``hier`` label in the child sheet (netlist.py). The new sheet
+    symbol id is recorded under ``$<index>``.
+    """
+    _require_sch(doc, index)
+    child = _resolve_placeholder(op.get("child"), id_map, index)
+    if not isinstance(child, str) or not child:
+        raise _invalid(index, "sch_add_sheet_symbol requires a 'child' sheet id")
+    if _find(doc.get("sheets", []), child) is None:
+        raise OpError("unknown_object", f"op[{index}]: no child sheet '{child}'",
+                      {"index": index, "reason": f"unknown sheet {child}"})
+    hid = idgen.next("hs")
+    pins_out: list[dict] = []
+    seen: set[str] = set()
+    for k, pn in enumerate(op.get("pins", []) or []):
+        if not isinstance(pn, dict):
+            raise _invalid(index, f"pins[{k}] must be an object")
+        name = pn.get("name")
+        if not isinstance(name, str) or not name:
+            raise _invalid(index, f"pins[{k}].name must be a non-empty string")
+        if name in seen:
+            raise _invalid(index, f"pins[{k}].name duplicate {name!r}")
+        seen.add(name)
+        shape = pn.get("shape", "passive")
+        if shape not in schema.SHEET_PIN_SHAPES:
+            raise _invalid(index, f"pins[{k}].shape must be one of {sorted(schema.SHEET_PIN_SHAPES)}")
+        pos = pn.get("pos")
+        if not (isinstance(pos, (list, tuple)) and len(pos) == 2
+                and all(isinstance(c, (int, float)) and not isinstance(c, bool) for c in pos)):
+            raise _invalid(index, f"pins[{k}].pos must be [x, y]")
+        pins_out.append({"name": name, "pos": [float(pos[0]), float(pos[1])], "shape": shape})
+    hs = {
+        "id": hid, "sheet": op.get("sheet", "sh1"), "child": child,
+        "pos": _require_xy(op, "pos", index), "pins": pins_out,
+    }
+    doc.setdefault("sheet_symbols", []).append(hs)
+    id_map[f"${index}"] = hid
+
+
+def _op_sch_add_sheet_pin(doc, op, index, idgen, id_map, warnings):
+    """Add a sheet pin to an existing sheet symbol (placeholder-eligible ``id``).
+
+    The pin name should match a ``hier`` label in the instantiated child sheet for the net to bridge.
+    """
+    _require_sch(doc, index)
+    hid = _resolve_placeholder(op.get("id"), id_map, index)
+    hs = _find(doc.get("sheet_symbols", []), hid)
+    if hs is None:
+        raise OpError("unknown_object", f"op[{index}]: no sheet symbol '{hid}'",
+                      {"index": index, "reason": f"unknown sheet symbol {hid}"})
+    name = op.get("name")
+    if not isinstance(name, str) or not name:
+        raise _invalid(index, "sch_add_sheet_pin requires a non-empty 'name'")
+    pins = hs.setdefault("pins", [])
+    if any(isinstance(p, dict) and p.get("name") == name for p in pins):
+        raise _invalid(index, f"sheet pin {name!r} already exists on {hid}")
+    shape = op.get("shape", "passive")
+    if shape not in schema.SHEET_PIN_SHAPES:
+        raise _invalid(index, f"shape must be one of {sorted(schema.SHEET_PIN_SHAPES)}")
+    pins.append({"name": name, "pos": _require_xy(op, "pos", index), "shape": shape})
+
+
 def _op_sch_import_kicad(doc, op, index, idgen, id_map, warnings):
     """Best-effort .kicad_sch import (ecad_ops.md §4). The KiCad importer lives in the library
     module (built in parallel). Until it lands this is a documented best-effort stub: it never
@@ -1013,6 +1100,9 @@ _OP_HANDLERS = {
     "sch_connect": _op_sch_connect,
     "sch_annotate": _op_sch_annotate,
     "sch_set_grid": _op_sch_set_grid,
+    "sch_add_sheet": _op_sch_add_sheet,
+    "sch_add_sheet_symbol": _op_sch_add_sheet_symbol,
+    "sch_add_sheet_pin": _op_sch_add_sheet_pin,
     "sch_import_kicad": _op_sch_import_kicad,
     # pcb
     "pcb_set_stackup": _op_pcb_set_stackup,

@@ -33,7 +33,7 @@
   canvas flips for screen). Angles in **degrees CCW**.
 - Id prefixes (never reused, per-document counters): symbols `s1`, pins are addressed
   `"s1.3"` (symbol id + pin number/name), wires `w1`, junctions `j1`, labels `l1`, buses `bus1`,
-  power ports `pw1`, no-connects `nc1`, sheets `sh1`, graphics `g1`.
+  power ports `pw1`, no-connects `nc1`, sheets `sh1`, graphics `g1`, sheet symbols `hs1`.
 
 ## 3. SymbolDef (library definition; in `lib_cache` and library files)
 
@@ -112,18 +112,44 @@ equal `net` merge globally.
 
 ```json
 {"id":"sh1","name":"root","parent":null,"size":[297,210],
- "instances_of":null,                       // non-null => this sheet embeds another sheet file/def
- "ports":[{"name":"CLK","type":"input","pos":[x,y]}]}  // hierarchical sheet pins
+ "instances_of":null,                       // non-null => this sheet embeds another sheet file/def (reserved)
+ "ports":[{"name":"CLK","type":"input","pos":[x,y]}]}  // reserved per-sheet port list
 ```
 
-v1 ships flat (single root sheet) end-to-end; hierarchical fields are reserved and validated but the
-netlist treats `global` labels and power as the cross-sheet merge mechanism until hierarchy lands.
+A document carries a flat `sheets` list (at least one root). Hierarchy is layered on top via a
+separate top-level **`sheet_symbols`** list (NOT by overloading the sheet object — keeping it a
+distinct list mirrors how `symbols`/`wires`/etc. are flat, sheet-tagged lists, and keeps sheet-object
+round-tripping unchanged):
+
+```json
+SheetSymbol: {
+  "id":"hs1",                               // id prefix "hs" (never reused)
+  "sheet":"sh1",                            // PARENT sheet this symbol is drawn on
+  "child":"sh2",                            // the child sheet it instantiates
+  "pos":[x,y],
+  "pins":[{"name":"CLK","pos":[x,y],"shape":"input|output|bidirectional|tri_state|passive"}]
+}
+```
+
+A sheet symbol is the parent-side instantiation of a child sheet; its **sheet pins** are named
+connection points placed in the parent (like a component's pins). The child sheet exposes matching
+**hierarchical labels** (`Label` with `scope:"hier"`) of the same name. Connectivity bridges the
+two: a parent net touching sheet pin `"CLK"` of a symbol instantiating child `C` is the SAME net as
+the `hier` label `"CLK"` in sheet `C` (see `netlist.md` §2). `global` labels and power still merge
+across all sheets; `local` labels stay per-sheet.
+
+Additive + backward-compatible: a document with no `sheet_symbols` (or none with `scope:"hier"`
+labels) validates and netlists byte-identically to the pre-hierarchy flat behavior. `instances_of`
+and the per-sheet `ports` list remain reserved.
 
 ## 7. Validation (`schema.py`)
 
 - `validate_schematic(doc) -> []|[errors]`. Checks: schema tag, id uniqueness & prefix, every
   `symbol.libid` resolves in `lib_cache`, pin `unit` in range, wire `pts` length ≥2 and orthogonal
-  (warn-only if diagonal), label scope enum, power `net` non-empty, sheet parent acyclic.
+  (warn-only if diagonal), label scope enum, power `net` non-empty, sheet parent acyclic. Sheet
+  symbols (`sheet_symbols`, prefix `hs`): `child` is a known sheet id, `pos` is `[x,y]`, each pin
+  has a non-empty unique `name`, a `[x,y]` `pos`, and a valid `shape`. Absent `sheet_symbols`
+  validates exactly as before.
 - Numeric values stored as plain floats (mm). No expressions in v1 (CAD's equation engine is not
   wired into ECAD yet — reserved).
 - Forward-compat: unknown top-level/object keys preserved verbatim on load→save round-trip.

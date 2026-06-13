@@ -21,9 +21,12 @@
 }
 ```
 
-Net naming priority (highest wins): explicit **power port** net > **global label** > **local
-label** (per sheet) > auto `N$<n>` (stable per build: assigned in deterministic geometric order so
-diffs are minimal). A net touched by a power port keeps the power name even if also labeled.
+Net naming priority (highest wins): explicit **power port** net > **global label** > **local /
+hier label** (per sheet) / connected **sheet-pin** name > auto `N$<n>` (stable per build: assigned
+in deterministic geometric order so diffs are minimal). A net touched by a power port keeps the
+power name even if also labeled. A hierarchy-spanning net (a parent sheet pin bridged to a child
+`hier` label) is named by that shared name (which the child hier label and parent sheet pin agree
+on) unless a higher-priority power/global name also touches the class.
 
 ## 2. Connectivity algorithm (normative)
 
@@ -38,7 +41,15 @@ diffs are minimal). A net touched by a power port keeps the power name even if a
 5. **Power ports**: union coincident points; then union all ports of equal `net` globally.
 6. **Buses**: a bus label `D[0..7]` expands to members; a bus-entry connects a wire to a named
    member. (v1: parse + expand; full bus routing is a documented follow-up.)
-7. **Name** each union-find class by §1 priority; emit `nets`, `by_pin`, `components`.
+7. **Hierarchy** (sheet symbols): each sheet pin's `pos` attaches to the parent sheet's wires/pins
+   like a label (on-segment OR coincident). Then, for every sheet symbol on a parent sheet
+   instantiating child `C`, each sheet pin `"X"` is unioned with the `hier`-label `"X"` anchor in
+   sheet `C` (equal name + same child). This is the cross-sheet bridge: the parent net touching the
+   sheet pin and the child net touching the hier label become one class. Sheet pins and their child
+   labels are iterated in sorted (id, name) order for determinism. Absent `sheet_symbols` (or no
+   `hier` labels) this step is a no-op and the netlist is byte-identical to the flat behavior.
+   `global` labels and power still merge across all sheets; `local` labels stay per-sheet.
+8. **Name** each union-find class by §1 priority; emit `nets`, `by_pin`, `components`.
 
 Determinism: every set/dict iteration is sorted by id/coordinate so the netlist is byte-stable for a
 given schematic (golden-test requirement).
@@ -59,6 +70,8 @@ given schematic (golden-test requirement).
 | `duplicate_ref` | error | two symbols share a non-`?` ref |
 | `missing_footprint` | warning | `on_board` symbol has empty `footprint` |
 | `floating_net_single_pin` | warning | net of exactly one pin (likely a wiring slip) |
+| `hier_pin_no_label` | warning | a sheet pin with no matching `hier` label in the instantiated child sheet |
+| `hier_label_no_pin` | warning | a `hier` label in an instantiated child sheet not exposed as a sheet pin |
 
 The pin-type compatibility matrix (output↔output = error, etc.) lives as a table in `erc.py`;
 contract: it is symmetric and `unspecified`/`free` never raise. ERC is **advisory** — it never

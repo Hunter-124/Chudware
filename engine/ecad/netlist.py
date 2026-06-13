@@ -258,6 +258,11 @@ def build_netlist(sch: dict) -> dict:
     # group labels by (name, scope-key) for the cross-merge. scope-key folds the sheet in for local.
     label_groups: dict[tuple[str, str], list[Point]] = {}
     label_points: list[dict] = []   # for ERC multiple_nets_label
+    # hier_label_pts[(sheet, name)] -> the anchor point of equal-named hier labels on that sheet
+    # (used by the hierarchy bridge below; a child's "CLK" hier label connects to the parent's "CLK"
+    # sheet pin). All such labels on one sheet already merge via the per-sheet group below, so one
+    # representative anchor per (sheet, name) is enough.
+    hier_label_pts: dict[tuple[str, str], Point] = {}
     for lb in labels:
         name = _label_name(lb)
         if not name:
@@ -271,11 +276,40 @@ def build_netlist(sch: dict) -> dict:
         gkey = (name, "*global*") if scope == "global" else (name, f"sheet:{sheet}")
         label_groups.setdefault(gkey, []).append(lp)
         label_points.append({"name": name, "scope": scope, "sheet": sheet, "pt": lp})
+        if scope == "hier":
+            # first (deterministic, labels sorted by id) hier label of a (sheet, name) is the anchor
+            hier_label_pts.setdefault((sheet, name), lp)
     for gkey in sorted(label_groups):
         anchors = sorted(label_groups[gkey])
         first = anchors[0]
         for other in anchors[1:]:
             uf.union(first, other)
+
+    # ── §2.4(b) Hierarchy bridge: union each sheet-pin net with the child's equal-named hier label ──
+    # A sheet symbol (on a parent sheet) instantiates a child sheet and exposes named sheet pins. A
+    # sheet pin "CLK" of a symbol instantiating child C is the SAME net as the hier label "CLK" in C
+    # (sch_schema.md §6 / netlist.md). The pin's pos attaches to the parent's wires/pins like a label
+    # would; then we union it with the child's hier-label anchor of equal name. Deterministic: sheet
+    # symbols and their pins are iterated in sorted order. Absent sheet_symbols => this loop is a
+    # no-op and connectivity is byte-identical to the flat single-sheet behavior.
+    sheet_pin_names: list[dict] = []   # naming candidates (treated at hier/local priority)
+    sheet_symbols = sorted(sch.get("sheet_symbols", []), key=lambda h: h.get("id", ""))
+    for hs in sheet_symbols:
+        parent_sheet = hs.get("sheet", "")
+        child = hs.get("child", "")
+        for pn in sorted(hs.get("pins", []), key=lambda p: str(p.get("name", ""))):
+            name = str(pn.get("name", ""))
+            if not name:
+                continue
+            pp = _snap(pn.get("pos", [0, 0]))
+            uf.add(pp)
+            # the sheet pin lives on the PARENT sheet: bond it to parent wires/pins it touches.
+            _attach_to_wires(pp, parent_sheet)
+            sheet_pin_names.append({"name": name, "sheet": parent_sheet, "pt": pp})
+            # bridge into the child sheet's equal-named hier label (if present).
+            child_anchor = hier_label_pts.get((child, name))
+            if child_anchor is not None:
+                uf.union(pp, child_anchor)
 
     # ── §2.5 Power ports: union coincident points, then union all ports of equal net globally ──
     power = sorted(sch.get("power", []), key=lambda pw: pw.get("id", ""))
@@ -335,6 +369,17 @@ def build_netlist(sch: dict) -> dict:
             global_label_for.setdefault(root, rec["name"])
         else:  # local / hier treated as local for naming
             local_label_for.setdefault(root, rec["name"])
+
+    # Sheet-pin names are naming candidates at the same (local/hier) priority as a hier label, so a
+    # hierarchy-spanning net is named by its connected sheet-pin/hier-label name (above auto N$). A
+    # hier label on the class, if any, already populated local_label_for; setdefault keeps that
+    # higher-id-stable choice and only fills in the name for a class that has a sheet pin but no
+    # local/hier label of its own.
+    for rec in sorted(sheet_pin_names, key=lambda r: (r["pt"], r["name"])):
+        root = root_of.get(rec["pt"])
+        if root is None:
+            continue
+        local_label_for.setdefault(root, rec["name"])
 
     # Assign final names. Auto names N$<n> in deterministic geometric order: sort the unnamed class
     # roots by their canonical (smallest) point, then number sequentially.

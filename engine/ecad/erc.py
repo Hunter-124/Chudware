@@ -227,6 +227,9 @@ def run_erc(sch: dict, netlist: dict) -> list[dict]:
     # checking the nets their coincident pins land on.
     out.extend(_multiple_nets_label(sch, netlist))
 
+    # ── hierarchy: a sheet pin with no matching child hier label (or vice versa) ──
+    out.extend(_hier_pin_label_mismatch(sch))
+
     # deterministic final ordering
     out.sort(key=lambda v: (v["rule"], v["net"] or "", tuple(v["pins"]),
                             tuple(v["xy"]) if v["xy"] else ()))
@@ -239,6 +242,67 @@ def _net_has_power_port(sch: dict, net: str) -> bool:
         if str(pw.get("net", "")) == net:
             return True
     return False
+
+
+def _hier_pin_label_mismatch(sch: dict) -> list[dict]:
+    """Hierarchy ERC: a sheet pin "X" on a symbol instantiating child C must have a matching
+    ``hier`` label "X" in sheet C, and vice versa (a dangling cross-sheet connection point).
+
+    Two warnings:
+      * ``hier_pin_no_label`` - a sheet pin with no equal-named hier label in the child sheet.
+      * ``hier_label_no_pin`` - a child-sheet hier label with no equal-named sheet pin on any symbol
+        instantiating that sheet.
+    Pure + deterministic (sorted). Absent sheet_symbols => no violations.
+    """
+    out: list[dict] = []
+    symbols = sch.get("sheet_symbols", [])
+    if not symbols:
+        return out
+    # hier labels in each sheet: sheet id -> set of names
+    hier_by_sheet: dict[str, set[str]] = {}
+    for lb in sch.get("labels", []):
+        if str(lb.get("scope", "")) == "hier":
+            nm = str(lb.get("text", ""))
+            if nm:
+                hier_by_sheet.setdefault(str(lb.get("sheet", "")), set()).add(nm)
+    # which children are instantiated, and the pin names exposed for each child
+    pins_for_child: dict[str, set[str]] = {}
+    for hs in symbols:
+        child = str(hs.get("child", ""))
+        for pn in hs.get("pins", []):
+            if isinstance(pn, dict):
+                nm = str(pn.get("name", ""))
+                if nm:
+                    pins_for_child.setdefault(child, set()).add(nm)
+
+    for hs in sorted(symbols, key=lambda h: h.get("id", "")):
+        hid = hs.get("id", "")
+        child = str(hs.get("child", ""))
+        child_labels = hier_by_sheet.get(child, set())
+        pos = hs.get("pos")
+        for pn in sorted(hs.get("pins", []), key=lambda p: str(p.get("name", ""))):
+            if not isinstance(pn, dict):
+                continue
+            nm = str(pn.get("name", ""))
+            if nm and nm not in child_labels:
+                out.append(_violation(
+                    "hier_pin_no_label", "warning", None, [f"{hid}.{nm}"],
+                    pn.get("pos") or pos,
+                    f"sheet pin {nm!r} on {hid} has no matching hier label in child sheet "
+                    f"{child!r}"))
+
+    # vice versa: a hier label in an instantiated child with no exposing sheet pin
+    for child in sorted(hier_by_sheet):
+        if child not in pins_for_child:
+            continue  # sheet not instantiated by any symbol -> not a hierarchy mismatch
+        exposed = pins_for_child.get(child, set())
+        for nm in sorted(hier_by_sheet[child]):
+            if nm not in exposed:
+                out.append(_violation(
+                    "hier_label_no_pin", "warning", None, [f"{child}:{nm}"], None,
+                    f"hier label {nm!r} in sheet {child!r} is not exposed as a sheet pin on any "
+                    f"symbol instantiating it"))
+    return out
 
 
 def _multiple_nets_label(sch: dict, netlist: dict) -> list[dict]:

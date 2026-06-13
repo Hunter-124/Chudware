@@ -32,6 +32,9 @@ PIN_TYPES = {
 }
 LABEL_SCOPES = {"local", "global", "hier"}
 SYM_MIRROR = {"none", "x", "y"}
+# Hierarchical sheet-pin directions (cosmetic + ERC hint; mirrors KiCad sheet-pin shapes). Connection
+# semantics do not depend on the value - the netlist bridges by name (see netlist.py / netlist.md).
+SHEET_PIN_SHAPES = {"input", "output", "bidirectional", "tri_state", "passive"}
 
 COPPER_LAYERS_MAX = 32
 TECH_LAYERS = {
@@ -49,6 +52,7 @@ ZONE_FILLS = {"solid", "hatch"}
 _SCH_PREFIXES = {
     "s": "symbols", "w": "wires", "j": "junctions", "l": "labels",
     "bus": "buses", "pw": "power", "nc": "no_connect", "sh": "sheets", "g": "graphics",
+    "hs": "sheet_symbols",
 }
 _PCB_PREFIXES = {
     "fp": "footprints", "t": "tracks", "v": "vias", "z": "zones", "g": "graphics",
@@ -77,7 +81,8 @@ def new_schematic(name: str = "Schematic") -> dict:
         "units": {"grid": 2.54},
         "sheets": [{"id": "sh1", "name": "root", "parent": None, "size": [297, 210], "ports": []}],
         "symbols": [], "wires": [], "junctions": [], "labels": [], "buses": [],
-        "power": [], "no_connect": [], "graphics": [], "lib_cache": {}, "annotations": {},
+        "power": [], "no_connect": [], "graphics": [], "sheet_symbols": [],
+        "lib_cache": {}, "annotations": {},
     }
 
 
@@ -246,6 +251,7 @@ def validate_schematic(doc: dict) -> list[str]:
     _check_ids(doc.get("labels", []), "l", "labels", errs)
     _check_ids(doc.get("power", []), "pw", "power", errs)
     _check_ids(doc.get("no_connect", []), "nc", "no_connect", errs)
+    _check_ids(doc.get("sheet_symbols", []), "hs", "sheet_symbols", errs)
 
     refs_seen: dict[str, str] = {}
     for i, s in enumerate(doc.get("symbols", [])):
@@ -276,6 +282,42 @@ def validate_schematic(doc: dict) -> list[str]:
     for i, p in enumerate(doc.get("power", [])):
         if not p.get("net"):
             errs.append(f"power[{i}].net: required non-empty")
+
+    # ── hierarchical sheet symbols (additive; absent => no checks, validates as before) ──
+    # A sheet symbol lives on a parent sheet and instantiates a child sheet, exposing named sheet
+    # pins. Connectivity (netlist.py) bridges a sheet pin to the equal-named hier label in the child.
+    sheet_ids = {s.get("id") for s in doc.get("sheets", []) if isinstance(s, dict)}
+    for i, hs in enumerate(doc.get("sheet_symbols", [])):
+        loc = f"sheet_symbols[{i}]"
+        child = hs.get("child")
+        if not isinstance(child, str) or not child:
+            errs.append(f"{loc}.child: required (id of the instantiated child sheet)")
+        elif sheet_ids and child not in sheet_ids:
+            errs.append(f"{loc}.child: {child!r} not a known sheet id")
+        if not _is_xy(hs.get("pos")):
+            errs.append(f"{loc}.pos: must be [x,y]")
+        pin_names: set[str] = set()
+        pins = hs.get("pins", [])
+        if not isinstance(pins, list):
+            errs.append(f"{loc}.pins: must be a list")
+            pins = []
+        for j, pn in enumerate(pins):
+            ploc = f"{loc}.pins[{j}]"
+            if not isinstance(pn, dict):
+                errs.append(f"{ploc}: not an object")
+                continue
+            nm = pn.get("name")
+            if not isinstance(nm, str) or not nm:
+                errs.append(f"{ploc}.name: required non-empty string")
+            elif nm in pin_names:
+                errs.append(f"{ploc}.name: duplicate {nm!r} on this sheet symbol")
+            else:
+                pin_names.add(nm)
+            if not _is_xy(pn.get("pos")):
+                errs.append(f"{ploc}.pos: must be [x,y]")
+            shape = pn.get("shape", "passive")
+            if shape not in SHEET_PIN_SHAPES:
+                errs.append(f"{ploc}.shape: bad value {shape!r}")
 
     # validate embedded symbol defs (pins)
     for libid, sdef in cache.items():

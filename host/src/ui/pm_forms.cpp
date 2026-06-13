@@ -78,10 +78,17 @@ static PMFieldDef DatumRef(const char* key, const char* label, const char* group
     f.group = group; f.comboOptions = options; f.comboLabels = labels; return f;
 }
 // A feature-id list (refs _FEAT_LIST), seeded from the FeatureManager selection — the features a
-// pattern/mirror replicates.
+// pattern/mirror replicates. selMulti defaults true => emitted as refs[key] = [ids].
 static PMFieldDef FeatWell(const char* key, const char* label, const char* group) {
     PMFieldDef f; f.kind = PMFieldKind::FeatureWell; f.key = key; f.label = label;
     f.group = group; return f;
+}
+// SINGLE-feature-id FeatureWell: selMulti=false => buildOpFeature emits refs[key] = "<one id>"
+// (the bare string, not an array). For refs that take exactly one feature id, e.g.
+// weld_member's path sketch. The user fills it by selecting the sketch in the FeatureManager
+// tree and clicking "Add selected" (the well replaces any prior pick when single).
+static PMFieldDef FeatWell1(const char* key, const char* label, const char* group) {
+    PMFieldDef f = FeatWell(key, label, group); f.selMulti = false; return f;
 }
 // Check/Dim that is disabled and shows "(coming soon)" — discoverability only, never serialised.
 static PMFieldDef CheckSoon(const char* key, const char* label, const char* group) {
@@ -366,6 +373,29 @@ static const std::vector<PMFormDef>& forms() {
                     "Material Inside|Material Outside|Bend Outside"),
             Check  ("flip",     "Reverse direction","Flange", false),
         }},
+        // --- weld_member (Weldments / Structural Member) --- engine features weld_member. Sweeps a
+        //   library profile along the segments of ONE path sketch (refs.sketch = a single sketch
+        //   feature-id STRING, not an array — FeatWell1 single-emit). segments are OMITTED here so the
+        //   engine defaults to ALL sketch segments. The profile combo picks one of six library shapes;
+        //   each shape's dim keys are gated on that combo with omit=true so only the active profile's
+        //   dims are emitted (the engine's per-profile defaults drive the rest). thickness applies to
+        //   every profile. angle rotates the section; justify centres vs corner-aligns it to the path;
+        //   trim_corners miters where members meet.
+        { "weld_member", "Structural Member", "sweep", {
+            FeatWell1 ("sketch",  "Path Sketch",   "Selections"),
+            ComboL    ("profile", "Profile",       "Profile",
+                       "square_tube|rect_tube|round_tube|angle_L|flat_bar|c_channel",
+                       "Square Tube|Rect Tube|Round Tube|Angle (L)|Flat Bar|C-Channel"),
+            DimIf     ("size",    "Size",          "Profile", 20.0, "profile", "square_tube",          true),
+            DimIf     ("w",       "Width",         "Profile", 40.0, "profile", "rect_tube|c_channel|flat_bar", true),
+            DimIf     ("h",       "Height",        "Profile", 20.0, "profile", "rect_tube|c_channel",  true),
+            DimIf     ("od",      "Outer Dia.",    "Profile", 25.0, "profile", "round_tube",           true),
+            DimIf     ("leg",     "Leg",           "Profile", 25.0, "profile", "angle_L",              true),
+            Dim       ("thickness","Thickness",    "Profile", 2.0),
+            Angle     ("angle",   "Rotation",      "Settings", 0.0),
+            ComboL    ("justify", "Justify",       "Settings", "center|corner", "Center|Corner"),
+            Check     ("trim_corners", "Trim corners", "Settings", true),
+        }},
     };
     return kForms;
 }
@@ -409,6 +439,8 @@ const PMFormDef* pmFormForCommand(const std::string& cmdId, std::string& mode) {
     // Sheet Metal — ribbon cmd id == the engine feature type, so route straight through.
     if (cmdId == "sm_base_flange")    return pmFindForm("sm_base_flange");
     if (cmdId == "sm_edge_flange")    return pmFindForm("sm_edge_flange");
+    // Weldments — ribbon cmd id == the engine feature type.
+    if (cmdId == "weld_member")       return pmFindForm("weld_member");
     // Primitive quick-start commands (AI-CAD extensions; not in the C14 ribbon but reachable
     // via the M1 scenario / future "Insert > Primitive" entries).
     if (cmdId == "box")           return pmFindForm("box");

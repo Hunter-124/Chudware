@@ -234,6 +234,15 @@ static const RibbonCmd kCmds[] = {
     { "sm_base_flange",      "Base Flange",     "extrude_boss",     "Sheet Metal", "Create",      true,  nullptr,          false },
     { "sm_edge_flange",      "Edge Flange",     "shell",            "Sheet Metal", "Create",      true,  nullptr,          false },
 
+    // =========================================================================
+    // Tab: Weldments — sweeps a library profile along a path sketch's segments.
+    // cmd_id == engine feature type weld_member (pmFormForCommand routes straight through).
+    // Reuses the sweep icon (a structural member is a profile swept along a path).
+    // =========================================================================
+
+    // --- Group: Structural ---
+    { "weld_member",         "Structural Member","sweep",           "Weldments",   "Structural",  true,  nullptr,          false },
+
 };
 // clang-format on
 

@@ -452,6 +452,31 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
         }
     }
 
+    // Weldments: seed the single "sketch" FeatureWell from a tree-selected SKETCH so a path picked
+    // before the command auto-fills (SolidWorks pre-select). Non-sketch selections are ignored —
+    // the user picks the path sketch in the FeatureManager then clicks "Add selected".
+    if (std::strcmp(form_->type, "weld_member") == 0) {
+        const std::string& sfid = st.selectedFeatureId;
+        if (!sfid.empty()) {
+            const nlohmann::json& tree = st.docMirror.tree();
+            std::string nm = sfid, ftype;
+            if (tree.is_object() && tree.contains("features") && tree["features"].is_array())
+                for (const auto& tf : tree["features"])
+                    if (tf.is_object() && tf.value("id", std::string()) == sfid) {
+                        nm = tf.value("name", sfid); ftype = tf.value("type", std::string()); break;
+                    }
+            if (ftype == "sketch")
+                for (auto& fld : fields_)
+                    if (fld.def->kind == PMFieldKind::FeatureWell &&
+                        std::strcmp(fld.def->key, "sketch") == 0) {
+                        PMSelEntry e; e.selector = sfid; e.label = nm;
+                        fld.picks.push_back(std::move(e));
+                        dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                        break;
+                    }
+        }
+    }
+
     st.addLog("[pm] open " + std::string(form_->type) +
               (mode_.empty() ? "" : " (" + mode_ + ")"));
     return true;
@@ -577,15 +602,18 @@ void PropertyManager::loadFromTree(AppState& st, const nlohmann::json& feature) 
             }
             case PMFieldKind::FeatureWell: {
                 f.picks.clear();
-                if (refs.contains(key) && refs[key].is_array()) {
-                    const nlohmann::json& tree = feature;  // names resolved below from the doc tree
-                    (void)tree;
-                    for (const auto& s : refs[key]) {
-                        if (!s.is_string()) continue;
-                        std::string fid = s.get<std::string>();
-                        PMSelEntry e; e.selector = fid; e.label = fid;
-                        f.picks.push_back(std::move(e));
-                    }
+                // Multi wells (mirror/pattern) store an array of ids; a single-emit well
+                // (FeatWell1, e.g. weld_member.sketch) stores a bare id string. Accept both on
+                // the edit path so the well re-populates.
+                auto addFid = [&](const nlohmann::json& s) {
+                    if (!s.is_string()) return;
+                    std::string fid = s.get<std::string>();
+                    PMSelEntry e; e.selector = fid; e.label = fid;
+                    f.picks.push_back(std::move(e));
+                };
+                if (refs.contains(key)) {
+                    if (refs[key].is_array()) for (const auto& s : refs[key]) addFid(s);
+                    else addFid(refs[key]);
                 }
                 break;
             }
@@ -939,12 +967,19 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
                 break;
             }
             case PMFieldKind::FeatureWell: {
-                // Each pick's selector is a bare feature-id string; emit a _FEAT_LIST array. Omit the
-                // ref entirely when empty (mirror reads an absent list as a whole-body mirror).
+                // Each pick's selector is a bare feature-id string. selMulti (default) emits a
+                // _FEAT_LIST array (mirror/pattern). selMulti=false (FeatWell1) is SINGLE-EMIT:
+                // refs[key] = the bare id string (weld_member's path sketch wants one id, not an
+                // array). Omit the ref entirely when empty (mirror reads an absent list as a
+                // whole-body mirror; weld_member then dangles until a sketch is picked).
                 if (!f.picks.empty()) {
-                    nlohmann::json arr = nlohmann::json::array();
-                    for (const auto& p : f.picks) arr.push_back(p.selector);
-                    refs[key] = arr;
+                    if (f.def->selMulti) {
+                        nlohmann::json arr = nlohmann::json::array();
+                        for (const auto& p : f.picks) arr.push_back(p.selector);
+                        refs[key] = arr;
+                    } else {
+                        refs[key] = f.picks.front().selector;
+                    }
                 }
                 break;
             }
@@ -981,6 +1016,7 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
     else if (t == "hole") needWell = "face";
     else if (t == "draft") needWell = "faces";
     else if (t == "linear_pattern" || t == "circular_pattern") needWell = "features";
+    else if (t == "weld_member") needWell = "sketch";  // FeatureWell: path sketch must be picked
     else if (t == "boolean") needWell = "targets";   // need at least one target body
     else if (t == "sm_base_flange") needWell = "profile";  // sheet-metal base needs a sketch region
     else if (t == "sm_edge_flange") needWell = "edge";     // sheet-metal edge flange needs a bend edge
@@ -1594,6 +1630,7 @@ void PropertyManager::draw(AppState& st) {
                 pushTextColor(pal.textDim);
                 ImGui::TextUnformatted(f.def->label);
                 ImGui::PopStyleColor();
+                const bool single = !f.def->selMulti;   // FeatWell1: holds exactly one feature id
                 std::string chip;
                 if (f.picks.empty()) chip = "(select a feature in the tree, then Add)";
                 else for (size_t k = 0; k < f.picks.size(); ++k) {
@@ -1603,7 +1640,8 @@ void PropertyManager::draw(AppState& st) {
                 ImGui::PushTextWrapPos(0.0f);
                 ImGui::TextUnformatted(chip.c_str());
                 ImGui::PopTextWrapPos();
-                // Add the currently tree-selected feature to the list.
+                // Add the currently tree-selected feature to the list. A single-emit well
+                // (selMulti=false) replaces its one pick instead of appending.
                 if (ImGui::SmallButton("Add selected")) {
                     const std::string& fid = st.selectedFeatureId;
                     if (!fid.empty()) {
@@ -1619,6 +1657,7 @@ void PropertyManager::draw(AppState& st) {
                                     if (tf.is_object() && tf.value("id", std::string()) == fid) {
                                         nm = tf.value("name", fid); break;
                                     }
+                            if (single) f.picks.clear();   // single well holds one id only
                             PMSelEntry e; e.selector = fid; e.label = nm;
                             f.picks.push_back(std::move(e));
                             dirty_ = true; lastEditTime_ = ImGui::GetTime();

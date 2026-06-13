@@ -704,6 +704,159 @@ def run_noise(sim: _Sim, an: dict, probes_or_log, log: list = None) -> tuple[dic
 
 
 # =============================================================================
+# .tf transfer function (DC gain, input resistance, output resistance)
+# =============================================================================
+
+def _tf_node_pair(sim: "_Sim", output: str) -> tuple[int, int]:
+    """Resolve the output probe's node-row pair (i, j) for V(node) or V(a,b). Ground -> -1."""
+    kind, args = _parse_probe(output)
+    if kind != "V":
+        # Only voltage outputs are meaningful for the resistance/gain definitions here.
+        raise DeviceError(f"tf: output '{output}' must be a voltage probe V(node) or V(a,b)")
+    if len(args) == 1:
+        return sim.node_index.get(args[0], -1), -1
+    return sim.node_index.get(args[0], -1), sim.node_index.get(args[1], -1)
+
+
+def _tf_stamp_linear(sim: "_Sim", mna: MnaSystem) -> str:
+    """Stamp every device's small-signal (AC, omega=0) contribution into ``mna`` and then ZERO the
+    RHS, leaving only the linearized topology matrix with all independent sources nulled.
+
+    The matrix is built from the G/C triplets (independent of the RHS vector), so clearing ``_z``
+    after stamping removes every independent V/I source's excitation while keeping its branch
+    topology (a shorted V source / opened I source) -- exactly the network SPICE uses for the .tf
+    output-resistance and zeroed-source gain solves."""
+    mna.begin_solve()
+    mna.src_scales = {}
+    err = ""
+    for d in sim.devices:
+        try:
+            d.stamp_ac(mna, mna._tf_xop, 0.0)
+        except (DeviceError, NotImplementedError) as e:
+            err = str(e)
+            return err
+    # Null all independent-source excitation (their RHS entries) -- keep the matrix.
+    mna._z[:] = 0.0
+    return err
+
+
+def run_tf(sim: "_Sim", an: dict, log: list) -> tuple[dict, bool]:
+    """Small-signal transfer function (.tf): DC gain, input resistance, output resistance.
+
+    Spec: ``{"type":"tf", "output":"V(OUT)"|"V(a,b)", "source":"V1"|"I1"}``.
+
+    All three quantities are computed on the network linearized at the DC operating point and
+    evaluated at DC (omega=0 through the complex AC stamping path):
+
+      * gain : output / source. Drive ``source`` with a unit small-signal excitation (1 V for a
+        V source, 1 A for an I source) with every other independent source nulled; read ``output``.
+        For a V-source input this is dimensionless V/V; for an I-source input it is a
+        transimpedance (V/A) -- the classic SPICE .tf "transfer_function" value.
+      * rin  : resistance seen by ``source``. For a V source, Rin = V_drive / I(source-branch);
+        for an I source, Rin = V(across the source nodes) / I_drive.
+      * rout : resistance at ``output``. Null every independent source, inject a 1 A test current
+        across the output nodes, and read the resulting output voltage (Rout = V/1A) -- the
+        source-shorted output resistance.
+
+    Returns ``({"gain","rin","rout","output","source"}, converged)``."""
+    output = an.get("output") or "V(OUT)"
+    source = an.get("source")
+
+    # DC operating point for linearization (nonlinear devices) -- also the node voltages used to
+    # recompute MOSFET/BJT/diode small-signal parameters.
+    x_op = None
+    if sim.has_nonlinear():
+        x_op, ok = solve_dc_op(sim, log)
+        if x_op is None:
+            log.append("tf: DC op for linearization failed")
+
+    mna = sim.new_system(complex_mode=True)
+    n = mna.dim
+    mna._tf_xop = x_op if x_op is not None else np.zeros(n)
+
+    try:
+        oi, oj = _tf_node_pair(sim, output)
+    except DeviceError as e:
+        log.append(str(e))
+        return {"gain": float("nan"), "rin": float("nan"), "rout": float("nan"),
+                "output": output, "source": source}, False
+
+    # Locate the source device.
+    src_dev = None
+    for d in sim.devices:
+        if d.name == source:
+            src_dev = d
+            break
+    if src_dev is None or src_dev.kind not in ("V", "I"):
+        log.append(f"tf: source '{source}' must name an independent V or I source")
+        return {"gain": float("nan"), "rin": float("nan"), "rout": float("nan"),
+                "output": output, "source": source}, False
+
+    sa = mna.n(src_dev.node_names[0])
+    sb = mna.n(src_dev.node_names[1])
+
+    def _read(x, i, j) -> complex:
+        return complex(_val(x, i)) - complex(_val(x, j))
+
+    converged = True
+
+    # --- gain + Rin : unit drive of the chosen source, all others nulled -------------------
+    err = _tf_stamp_linear(sim, mna)
+    if err:
+        log.append(f"tf: linearization failed ({err})")
+        return {"gain": float("nan"), "rin": float("nan"), "rout": float("nan"),
+                "output": output, "source": source}, False
+
+    if src_dev.kind == "V":
+        # Unit voltage across the source branch: stamp +1 V on its branch RHS (mirrors stamp_ac).
+        br = src_dev.branch_rows[0]
+        mna.stamp_I(br, 1.0)
+        drive = 1.0
+    else:  # I source: inject 1 A INTO the from-node (n+), out of n- -> raises V(n+), so the
+        # transimpedance/Rin come out positive for a passive load (textbook .tf sign).
+        mna.stamp_I(sa, 1.0)
+        mna.stamp_I(sb, -1.0)
+        drive = 1.0
+    xsol, status = mna.solve(omega=0.0)
+    gain = float("nan"); rin = float("nan")
+    if xsol is None:
+        converged = False
+        log.append(f"tf: gain solve singular ({status})")
+    else:
+        out_v = _read(xsol, oi, oj)
+        gain = (out_v / drive).real
+        if src_dev.kind == "V":
+            # The V-source branch current uses the passive sign convention (negative when current
+            # is delivered to the network, cf. I(V1) in the divider gate). The current the source
+            # *drives into* the network is therefore -I(branch); Rin = V_drive / I_delivered.
+            i_src = complex(_val(xsol, src_dev.branch_rows[0]))
+            i_delivered = -i_src
+            rin = (drive / i_delivered).real if abs(i_delivered) > 0 else float("inf")
+        else:
+            # Voltage developed across the current-source nodes per unit injected current = Rin.
+            v_src = _read(xsol, sa, sb)
+            rin = (v_src / drive).real
+
+    # --- Rout : all independent sources nulled, 1 A test current across the output nodes ----
+    err = _tf_stamp_linear(sim, mna)
+    if err:
+        converged = False
+    mna.stamp_I(oi, 1.0)
+    mna.stamp_I(oj, -1.0)
+    xsol2, status2 = mna.solve(omega=0.0)
+    rout = float("nan")
+    if xsol2 is None:
+        converged = False
+        log.append(f"tf: rout solve singular ({status2})")
+    else:
+        rout = _read(xsol2, oi, oj).real  # V developed per 1 A test source
+
+    log.append(f"tf: gain={gain:.6g} rin={rin:.6g} rout={rout:.6g} "
+               f"(output={output}, source={source})")
+    return {"gain": gain, "rin": rin, "rout": rout, "output": output, "source": source}, converged
+
+
+# =============================================================================
 # helpers
 # =============================================================================
 
@@ -888,6 +1041,11 @@ def _run_analyses(sim: "_Sim", analyses: list, probes: list[str],
                 out, ok = run_noise(sim, an, log)
                 result["noise"] = out
                 result["convergence"]["noise"] = ok
+
+            elif atype == "tf":
+                out, ok = run_tf(sim, an, log)
+                result["tf"] = out
+                result["convergence"]["tf"] = ok
 
             else:
                 log.append(f"unknown analysis type '{atype}' — skipped")

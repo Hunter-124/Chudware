@@ -897,7 +897,7 @@ class OpAmp(Device):
 
 @device("M")
 class Mosfet(Device):
-    """MOSFET level-1 (square-law). nodes=[D, G, S, (B)]. NICE-TO-HAVE — basic DC only."""
+    """MOSFET level-1 (square-law). nodes=[D, G, S, (B)]. DC + small-signal AC (no caps in v1)."""
 
     def is_nonlinear(self) -> bool:
         return True
@@ -912,7 +912,15 @@ class Mosfet(Device):
         beta = KP * W / L
         return VTO, beta, LAMBDA, typ
 
-    def stamp_dc(self, mna: MnaLike, x: np.ndarray) -> None:
+    def _bias(self, x: np.ndarray, mna: MnaLike) -> tuple[float, float, float, float, float]:
+        """Recompute the level-1 operating point from the (op-point) node voltages.
+
+        Returns ``(sign, Id, gm, gds, vgs)`` in device polarity (the controlled drain current is
+        ``gm*vgs`` referred drain->source). Both ``stamp_dc`` and ``stamp_ac`` linearize the
+        square-law about this bias -- the AC path passes the converged DC solution ``x_op`` (same
+        approach as the BJT / diode), so the small-signal parameters are evaluated exactly at the
+        operating point with no stored state needed.
+        """
         VTO, beta, lam, typ = self._params()
         d = mna.n(self.node_names[0]); g = mna.n(self.node_names[1]); s = mna.n(self.node_names[2])
         sign = 1.0 if typ in ("nmos", "n") else -1.0
@@ -929,15 +937,41 @@ class Mosfet(Device):
             id_ = 0.5 * beta * (vgs - vth) ** 2 * (1 + lam * vds)
             gm = beta * (vgs - vth) * (1 + lam * vds)
             gds = 0.5 * beta * (vgs - vth) ** 2 * lam + self.gmin
-        ieq = id_ - gm * vgs - gds * vds
+        return sign, id_, gm, gds, vgs
+
+    def _stamp_conductances(self, mna: MnaLike, gm: float, gds: float) -> None:
+        """Stamp the linear small-signal conductances: gds across D-S plus the controlled drain
+        current source gm*Vgs (referred drain->source). Polarity-symmetric, so it is identical for
+        n- and p-channel (the channel-type sign only enters the bias computation)."""
+        d = mna.n(self.node_names[0]); g = mna.n(self.node_names[1]); s = mna.n(self.node_names[2])
+        # gds : drain-source output conductance.
         mna.stamp_G(d, d, gds); mna.stamp_G(d, s, -gds)
-        mna.stamp_G(d, g, gm); mna.stamp_G(d, s, -gm)
         mna.stamp_G(s, d, -gds); mna.stamp_G(s, s, gds)
+        # gm*Vgs : VCCS from drain to source controlled by V(g)-V(s).
+        mna.stamp_G(d, g, gm); mna.stamp_G(d, s, -gm)
         mna.stamp_G(s, g, -gm); mna.stamp_G(s, s, gm)
+
+    def stamp_dc(self, mna: MnaLike, x: np.ndarray) -> None:
+        d = mna.n(self.node_names[0]); g = mna.n(self.node_names[1]); s = mna.n(self.node_names[2])
+        sign, id_, gm, gds, vgs = self._bias(x, mna)
+        vds = sign * (_xat(x, d) - _xat(x, s))
+        self._stamp_conductances(mna, gm, gds)
+        # Newton companion current source: I_eq = Id - gm*Vgs - gds*Vds (in device polarity),
+        # injected drain->source. Multiply by the channel sign to map back to terminal polarity.
+        ieq = id_ - gm * vgs - gds * vds
         mna.stamp_I(d, -sign * ieq); mna.stamp_I(s, sign * ieq)
 
     def stamp_ac(self, mna: MnaLike, x_op: np.ndarray, omega: float) -> None:
-        raise DeviceError("MOSFET AC small-signal not yet modeled")
+        """Level-1 small-signal AC stamp linearized at the DC operating point.
+
+        Transconductance ``gm`` and output conductance ``gds`` are recomputed from the op-point
+        node voltages (the AC driver passes the converged DC solution as ``x_op``). Only the linear
+        conductances are stamped: the controlled source ``gm*Vgs`` (drain->source) plus ``gds``
+        across drain-source. Junction/overlap capacitances (Cgs, Cgd, Cds) are intentionally OMITTED
+        in v1 -- the AC response is frequency-flat, exact for the resistive small-signal model and a
+        valid low-frequency approximation. Works for both n- and p-channel."""
+        _sign, _id, gm, gds, _vgs = self._bias(x_op, mna)
+        self._stamp_conductances(mna, gm, gds)
 
 
 # --------------------------------------------------------------------------- S (stub)

@@ -689,8 +689,12 @@ bool PropertyManager::routePick(const nlohmann::json& selector, int pickKind) {
 
     // De-dup by hint_index + centroid (same element picked twice toggles off — SolidWorks).
     auto same = [&](const nlohmann::json& a, const nlohmann::json& b) {
+        // hint_index uses the SAME absent-sentinel on both sides — with asymmetric defaults
+        // (-1 vs -2) two picks that both lack a hint_index never compared equal, so a re-pick of a
+        // hint-less selector couldn't toggle off. The centroid term still distinguishes distinct
+        // elements that happen to share a missing hint_index.
         return a.value("kind", std::string()) == b.value("kind", std::string()) &&
-               a.value("hint_index", -1) == b.value("hint_index", -2) &&
+               a.value("hint_index", -1) == b.value("hint_index", -1) &&
                a.value("centroid", nlohmann::json()) == b.value("centroid", nlohmann::json());
     };
     for (size_t i = 0; i < well->picks.size(); ++i) {
@@ -812,6 +816,9 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
         // params like extrude's depth on a through-all are still emitted — the engine ignores the
         // ones that don't apply, and the schema requires their presence.)
         if (f.def->comingSoon) continue;
+        // Conditionally-omitted fields (e.g. hole.diameter when a non-custom standard is chosen):
+        // dropping them lets the engine's table/defaults drive the value instead of an override.
+        if (f.def->omitWhenDisabled && !fieldEnabled(*f.def, fields_)) continue;
         const char* key = f.def->key;
         switch (f.def->kind) {
             case PMFieldKind::Dim:

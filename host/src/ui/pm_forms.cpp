@@ -17,10 +17,12 @@ static PMFieldDef Dim(const char* key, const char* label, const char* group, dou
     f.group = group; f.dimDefault = def; return f;
 }
 // Dim that is enabled only when a sibling Combo (named enableKey) holds one of enableVals.
+// omit=true => the param is dropped from the op entirely while disabled (so the engine's
+// table/defaults drive it) rather than emitted-and-ignored.
 static PMFieldDef DimIf(const char* key, const char* label, const char* group, double def,
-                        const char* enableKey, const char* enableVals) {
+                        const char* enableKey, const char* enableVals, bool omit = false) {
     PMFieldDef f = Dim(key, label, group, def);
-    f.enableKey = enableKey; f.enableVals = enableVals; return f;
+    f.enableKey = enableKey; f.enableVals = enableVals; f.omitWhenDisabled = omit; return f;
 }
 static PMFieldDef Well(const char* key, const char* label, const char* group,
                        PMSelKinds kinds, bool multi) {
@@ -57,6 +59,12 @@ static PMFieldDef Int(const char* key, const char* label, const char* group, dou
 // Angle dim (shows "[deg]" instead of "[mm]"; value is plain degrees, like revolve's angle).
 static PMFieldDef Angle(const char* key, const char* label, const char* group, double def) {
     PMFieldDef f = Dim(key, label, group, def); f.unitLabel = " [deg]"; return f;
+}
+// Angle dim enabled only when a sibling Combo (named enableKey) holds one of enableVals.
+static PMFieldDef AngleIf(const char* key, const char* label, const char* group, double def,
+                          const char* enableKey, const char* enableVals) {
+    PMFieldDef f = Angle(key, label, group, def);
+    f.enableKey = enableKey; f.enableVals = enableVals; return f;
 }
 // A datum-reference combo whose chosen value is emitted as a refs string ("axis.x"/"plane.right").
 // For _SEL_OR_DATUM slots (pattern direction, mirror plane, draft neutral plane).
@@ -191,22 +199,32 @@ static const std::vector<PMFormDef>& forms() {
             Dim   ("thickness","Thickness", "Parameters", 2.0),
             Check ("outward",  "Shell outward",   "Parameters", false),
         }},
-        // --- hole (Hole Wizard) ---  face + style/standard/diameter/end/depth
-        //   Engine (hole.py): style simple|cbore|csink|tap; standard "custom" uses params.diameter,
-        //   else an ISO-metric table (M2..M12) supplies diameter (+cbore/csink dims). No positions =>
-        //   one hole at the face centre (multi-position grids are an engine capability the viewport
-        //   point picker can drive later). end through_all/blind; blind uses depth.
-        { "hole", "Hole", "hole_wizard", {
-            Well   ("face",     "Face",          "Hole Position", K_FACE, false),
-            ComboL ("style",    "Type",          "Hole Type",
-                    "simple|cbore|csink|tap", "Simple|Counterbore|Countersink|Tapped"),
-            ComboL ("standard", "Size standard", "Hole Type",
-                    "custom|M2|M2.5|M3|M4|M5|M6|M8|M10|M12",
-                    "Custom|M2|M2.5|M3|M4|M5|M6|M8|M10|M12"),
-            DimIf  ("diameter", "Diameter",      "Hole Type", 6.0, "standard", "custom"),
-            ComboL ("end",      "End Condition", "Direction",
-                    "through_all|blind", "Through All|Blind"),
-            DimIf  ("depth",    "Depth",         "Direction", 10.0, "end", "blind"),
+        // --- hole (Hole Wizard) ---  full SolidWorks Hole Wizard over features/hole.py.
+        //   style simple|cbore|csink|tap; standard M2..M12 drives diameter + cbore/csink dims from
+        //   the ISO table (features/hole.py _STD_TABLE), "custom" reveals an explicit Diameter.
+        //   CRITICAL: diameter is OMITTED while a non-custom standard is chosen (omitWhenDisabled),
+        //   so the table — not a form default — sets it. cbore/csink dims are left to the engine
+        //   table + proportional defaults (exposing them as overrides would shadow the table).
+        //   Multi-position (SolidWorks Hole Wizard's Positions tab): a rectangular grid (nx×ny at
+        //   dx,dy pitch, centred on the face) and/or picked vertices (refs.positions). No positions
+        //   => one hole at the face centre. end through_all/blind; blind uses depth.
+        { "hole", "Hole Wizard", "hole_wizard", {
+            Well    ("face",     "Face",             "Hole Position", K_FACE, false),
+            ComboL  ("style",    "Type",             "Hole Type",
+                     "simple|cbore|csink|tap", "Simple|Counterbore|Countersink|Tapped"),
+            ComboL  ("standard", "Size",             "Hole Type",
+                     "M2|M2.5|M3|M4|M5|M6|M8|M10|M12|custom",
+                     "M2|M2.5|M3|M4|M5|M6|M8|M10|M12|Custom"),
+            DimIf   ("diameter", "Diameter",         "Hole Type", 6.6, "standard", "custom", true),
+            AngleIf ("csink_angle", "C'Sink Angle",  "Hole Type", 90.0, "style", "csink"),
+            ComboL  ("end",      "End Condition",    "End Condition",
+                     "through_all|blind", "Through All|Blind"),
+            DimIf   ("depth",    "Depth",            "End Condition", 10.0, "end", "blind"),
+            Well    ("positions","Position Vertices","Positions", K_VERTEX, true),
+            Int     ("nx",       "Count X",          "Positions", 1),
+            Int     ("ny",       "Count Y",          "Positions", 1),
+            Dim     ("dx",       "Pitch X",          "Positions", 20.0),
+            Dim     ("dy",       "Pitch Y",          "Positions", 20.0),
         }},
         // --- mirror ---  plane (datum/face) + features[] (seeded from selection)
         //   Engine (pattern.py compile_mirror): reflects each seed feature's tool body across the

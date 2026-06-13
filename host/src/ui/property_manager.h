@@ -76,6 +76,11 @@ struct PMFieldDef {
     const char* enableKey  = nullptr;
     const char* enableVals = nullptr;   // pipe-separated allowed values; empty = all
     bool comingSoon = false;
+    // When true, this field is OMITTED from the emitted op while its enable condition is false
+    // (instead of the default "emit anyway; engine ignores"). Needed when a present-but-default
+    // value would change engine behaviour — e.g. hole.diameter must be ABSENT for the ISO
+    // `standard` table to drive the diameter; emitting a default would override the table.
+    bool omitWhenDisabled = false;
 };
 
 // A complete feature form: type + display title + ordered fields.

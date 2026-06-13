@@ -53,6 +53,15 @@ public:
     // Camera accessors (mm/px).
     float zoom() const { return pxPerMm_; }
 
+    // Selection: the panel sets a "<kind>:<id>" token (e.g. "s:s1","fp:fp1","w:w1","t:t1")
+    // before draw(); the canvas halos/outlines that entity. Empty = nothing selected.
+    void setSelection(const std::string& sel) { selected_ = sel; }
+
+    // Transient drag-move offset (world mm) applied to the selected symbol/footprint while a
+    // left-drag is in progress, for live visual feedback. The panel sets it each frame; (0,0)
+    // when not dragging.
+    void setDragOffset(float dx, float dy) { dragDx_ = dx; dragDy_ = dy; }
+
 private:
     // ---- camera (affine; no 3D) ----
     // screen = origin_ + (worldX - pan_.x)*pxPerMm_,   y flips: screen.y grows downward.
@@ -71,6 +80,8 @@ private:
     EcadPt pan_{0, 0};             // world point shown at the canvas centre
     bool   wantFit_ = true;        // fit on first draw
     bool   inited_ = false;
+    std::string selected_;         // "<kind>:<id>" of the highlighted entity ("" = none)
+    float  dragDx_ = 0.0f, dragDy_ = 0.0f;  // live drag-move offset (world mm) for selected sym/fp
 };
 
 }  // namespace ui

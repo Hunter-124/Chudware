@@ -29,6 +29,10 @@ struct EcadEditorState {
     std::string placeFp  = "Resistor_SMD:R_0603";  // footprint to place (Place tool, board)
     bool  routing = false;       // a Route chain is in progress
     float lastX = 0, lastY = 0;  // last routed point (world mm)
+    // Select-tool state: highlighted entity + live drag-move (symbols/footprints only).
+    std::string selected;        // "<kind>:<id>" ("" = nothing), kind in {s,fp,w,t}
+    bool  dragging = false;      // a left-drag-move of the selected sym/fp is in progress
+    float dragDx = 0, dragDy = 0;  // live drag offset (world mm) for visual feedback
 };
 
 EcadEditorState& state() {
@@ -55,6 +59,139 @@ ImVec4 layerSwatch(int copperIndex) {
 // Snap a world coordinate to a sensible ECAD grid (schematic 1.27mm; board 0.5mm).
 float snapTo(float v, float g) { return std::round(v / g) * g; }
 
+// Distance (world mm) from point p to segment a-b.
+float ptSegDistP(const EcadPt& p, const EcadPt& a, const EcadPt& b) {
+    const float vx = b.x - a.x, vy = b.y - a.y;
+    const float wx = p.x - a.x, wy = p.y - a.y;
+    const float vv = vx * vx + vy * vy;
+    float t = (vv > 1e-9f) ? (wx * vx + wy * vy) / vv : 0.0f;
+    t = std::max(0.0f, std::min(1.0f, t));
+    const float cx = a.x + t * vx, cy = a.y + t * vy;
+    return std::hypot(p.x - cx, p.y - cy);
+}
+
+// Hit-test the mirror at world point w (tolerance worldTol mm). Returns a "<kind>:<id>" token for
+// the nearest entity, or "" for empty space. Symbols/footprints (by distance to pos within a
+// generous body radius) win over wires/tracks (by point-to-segment distance).
+std::string hitTest(const EcadMirror& m, const EcadPt& w, float worldTol) {
+    std::string best;
+    float bestD = 1e30f;
+    if (m.isSch()) {
+        const float bodyR = std::max(worldTol, 2.6f);  // generous symbol body radius (mm)
+        for (const auto& s : m.symbols()) {
+            const float d = std::hypot(w.x - s.pos.x, w.y - s.pos.y);
+            if (d <= bodyR && d < bestD) { bestD = d; best = "s:" + s.id; }
+        }
+        if (!best.empty()) return best;  // symbols take priority over wires
+        for (const auto& wire : m.wires()) {
+            for (size_t i = 1; i < wire.pts.size(); ++i) {
+                const float d = ptSegDistP(w, wire.pts[i - 1], wire.pts[i]);
+                if (d <= worldTol && d < bestD) { bestD = d; best = "w:" + wire.id; }
+            }
+        }
+    } else if (m.isPcb()) {
+        for (const auto& fp : m.footprints()) {
+            // Body radius from the courtyard half-diagonal when present, else a default.
+            float bodyR = std::max(worldTol, 1.5f);
+            if (fp.hasCourtyard) {
+                bodyR = std::max(bodyR, 0.5f * std::hypot(fp.courtyardMax.x - fp.courtyardMin.x,
+                                                          fp.courtyardMax.y - fp.courtyardMin.y));
+            }
+            const float d = std::hypot(w.x - fp.pos.x, w.y - fp.pos.y);
+            if (d <= bodyR && d < bestD) { bestD = d; best = "fp:" + fp.id; }
+        }
+        if (!best.empty()) return best;  // footprints take priority over tracks
+        for (const auto& t : m.tracks()) {
+            const float tol = std::max(worldTol, t.width * 0.5f);
+            const float d = ptSegDistP(w, t.p1, t.p2);
+            if (d <= tol && d < bestD) { bestD = d; best = "t:" + t.id; }
+        }
+    }
+    return best;
+}
+
+// Look up the world pos of the selected symbol/footprint (the only movable kinds). Returns false if
+// the selection is not a sym/fp or the id is gone.
+bool selectedPos(const EcadMirror& m, const std::string& sel, EcadPt& out) {
+    const auto c = sel.find(':');
+    if (c == std::string::npos) return false;
+    const std::string kind = sel.substr(0, c), id = sel.substr(c + 1);
+    if (kind == "s") {
+        for (const auto& s : m.symbols()) if (s.id == id) { out = s.pos; return true; }
+    } else if (kind == "fp") {
+        for (const auto& fp : m.footprints()) if (fp.id == id) { out = fp.pos; return true; }
+    }
+    return false;
+}
+
+// Select-tool interaction: pick/highlight on click, Delete to remove, left-drag to move a
+// symbol/footprint (emits sch_edit_symbol / pcb_edit_footprint on release, grid-snapped). Sets
+// es.dragDx/dragDy each frame for the canvas's live visual feedback. Emits ops via
+// st.ecadPendingOps / st.ecadOpsGo, same mechanism as Place/Route.
+void handleSelectEdit(AppState& st, EcadEditorState& es, const EcadCanvasIO& io) {
+    const bool sch = es.mirror.isSch();
+    const float g = sch ? 1.27f : 0.5f;
+    const float pxTol = 9.0f;
+    const float worldTol = pxTol / std::max(0.01f, es.canvas.zoom());
+
+    // ---- drag-move of the selected symbol/footprint ----
+    // Begin a drag when a left-drag starts over the (already) selected, movable entity.
+    if (!es.dragging && io.hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        EcadPt selPos;
+        if (selectedPos(es.mirror, es.selected, selPos)) {
+            // Anchor the drag only if it started on/near the selected body (avoid grabbing on a
+            // far-away drag, which should pan-free in Select mode does nothing).
+            const ImVec2 d0 = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+            const EcadPt startWorld{io.worldMouse.x - d0.x / es.canvas.zoom(),
+                                    io.worldMouse.y + d0.y / es.canvas.zoom()};
+            float bodyR = std::max(worldTol, sch ? 2.6f : 1.5f);
+            if (std::hypot(startWorld.x - selPos.x, startWorld.y - selPos.y) <= bodyR * 1.5f)
+                es.dragging = true;
+        }
+    }
+    if (es.dragging) {
+        const ImVec2 d = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+        es.dragDx = d.x / es.canvas.zoom();
+        es.dragDy = -d.y / es.canvas.zoom();  // screen down -> world down
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            EcadPt selPos;
+            if (selectedPos(es.mirror, es.selected, selPos) &&
+                (std::fabs(es.dragDx) > 1e-4f || std::fabs(es.dragDy) > 1e-4f)) {
+                const float nx = snapTo(selPos.x + es.dragDx, g);
+                const float ny = snapTo(selPos.y + es.dragDy, g);
+                const std::string id = es.selected.substr(es.selected.find(':') + 1);
+                nlohmann::json ops = nlohmann::json::array();
+                if (sch) ops.push_back({{"op", "sch_edit_symbol"}, {"id", id}, {"pos", {nx, ny}}});
+                else     ops.push_back({{"op", "pcb_edit_footprint"}, {"id", id}, {"pos", {nx, ny}}});
+                st.ecadPendingOps = ops; st.ecadOpsGo = true;
+            }
+            es.dragging = false;
+            es.dragDx = es.dragDy = 0.0f;
+        }
+        return;  // a drag in progress consumes the interaction (no select-on-click)
+    }
+    es.dragDx = es.dragDy = 0.0f;
+
+    // ---- Delete the selected entity (only when the canvas is hovered, so the key doesn't fire
+    // while typing elsewhere) ----
+    if (!es.selected.empty() && io.hovered && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+        const auto c = es.selected.find(':');
+        const std::string kind = es.selected.substr(0, c), id = es.selected.substr(c + 1);
+        nlohmann::json ops = nlohmann::json::array();
+        if (kind == "s")       ops.push_back({{"op", "sch_delete_symbol"}, {"id", id}});
+        else if (kind == "w")  ops.push_back({{"op", "sch_delete_wire"}, {"id", id}});
+        else if (kind == "fp") ops.push_back({{"op", "pcb_delete_footprint"}, {"id", id}});
+        else if (kind == "t")  ops.push_back({{"op", "pcb_delete_track"}, {"id", id}});
+        if (!ops.empty()) { st.ecadPendingOps = ops; st.ecadOpsGo = true; }
+        es.selected.clear();
+        return;
+    }
+
+    // ---- pick on click (hit-test nearest entity; empty space clears) ----
+    if (io.clicked && io.hasWorldMouse)
+        es.selected = hitTest(es.mirror, io.worldMouse, worldTol);
+}
+
 // Wave Q — translate a canvas click into a place/route op for the active tool. Sets
 // st.ecadPendingOps / st.ecadOpsGo; the app loop applies them via ecad_apply_ops + reloads.
 void handleCanvasEdit(AppState& st, EcadEditorState& es, const EcadCanvasIO& io) {
@@ -62,7 +199,8 @@ void handleCanvasEdit(AppState& st, EcadEditorState& es, const EcadCanvasIO& io)
     if (es.routing && (ImGui::IsKeyPressed(ImGuiKey_Escape) ||
                        ImGui::IsMouseClicked(ImGuiMouseButton_Right)))
         es.routing = false;
-    if (st.ecadTool == 0 || !io.clicked || !io.hasWorldMouse) return;
+    if (st.ecadTool == 0) { handleSelectEdit(st, es, io); return; }
+    if (!io.clicked || !io.hasWorldMouse) return;
 
     const bool sch = es.mirror.isSch();
     const float g = sch ? 1.27f : 0.5f;
@@ -189,6 +327,8 @@ void drawResultsStrip(AppState& st, EcadEditorState& es) {
 
 EcadMirror& ecadEditorMirror() { return state().mirror; }
 
+void ecadEditorSelect(const std::string& sel) { state().selected = sel; }
+
 void ecadEditorLoadResponse(const nlohmann::json& resp) {
     EcadEditorState& es = state();
     es.mirror.loadFromTree(resp);
@@ -314,8 +454,12 @@ void drawEcadEditor(AppState& st) {
                       ImVec2(0, mainH), ImGuiChildFlags_Border,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     const ImVec2 canvasAvail = ImGui::GetContentRegionAvail();
+    // Push the current selection + live drag offset into the canvas so it haloes the picked entity
+    // (and shows drag feedback). Only the Select tool shows a selection.
+    es.canvas.setSelection(st.ecadTool == 0 ? es.selected : std::string());
+    es.canvas.setDragOffset(es.dragDx, es.dragDy);
     EcadCanvasIO io = es.canvas.draw(es.mirror, canvasAvail);
-    handleCanvasEdit(st, es, io);  // Wave Q: tool-mode place/route on click
+    handleCanvasEdit(st, es, io);  // Wave Q: select/place/route + delete/drag on the canvas
     // Surface the world cursor in the corner.
     if (io.hasWorldMouse) {
         char buf[64];

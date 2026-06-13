@@ -59,6 +59,26 @@ ImU32 copperColor(int copperIndex, float a) {
     }
 }
 
+// Split a "<kind>:<id>" selection token into its parts. Returns false on an empty/malformed token.
+bool splitSel(const std::string& sel, std::string& kind, std::string& id) {
+    const auto c = sel.find(':');
+    if (sel.empty() || c == std::string::npos) return false;
+    kind = sel.substr(0, c);
+    id   = sel.substr(c + 1);
+    return !id.empty();
+}
+
+// Point-to-segment distance in world mm (used for wire/track hit-test + halo decisions).
+float ptSegDist(const EcadPt& p, const EcadPt& a, const EcadPt& b) {
+    const float vx = b.x - a.x, vy = b.y - a.y;
+    const float wx = p.x - a.x, wy = p.y - a.y;
+    const float vv = vx * vx + vy * vy;
+    float t = (vv > 1e-9f) ? (wx * vx + wy * vy) / vv : 0.0f;
+    t = std::max(0.0f, std::min(1.0f, t));
+    const float cx = a.x + t * vx, cy = a.y + t * vy;
+    return std::hypot(p.x - cx, p.y - cy);
+}
+
 }  // namespace
 
 // ---- camera --------------------------------------------------------------------------------
@@ -269,6 +289,32 @@ void EcadCanvas::drawSch(const EcadMirror& doc) {
         if (!pw.net.empty())
             dl_->AddText(ImVec2(sp.x + r + 2, sp.y - r * 1.6f - 8), pwrCol, pw.net.c_str());
     }
+
+    // Selection highlight (drawn last so it sits on top). A symbol gets a translucent halo disk +
+    // a thicker ring around its origin; a wire gets a thick translucent over-stroke per segment.
+    std::string skind, sid;
+    if (splitSel(selected_, skind, sid)) {
+        const ImU32 halo = col(p.selectionHighlight);
+        const ImU32 ring = col(p.hoverHighlight, 2.2f);
+        if (skind == "s") {
+            for (const auto& s : doc.symbols()) {
+                if (s.id != sid) continue;
+                const EcadPt eff{s.pos.x + dragDx_, s.pos.y + dragDy_};
+                const ImVec2 sp = toScreen(eff);
+                const float rad = 16.0f * ui::uiScale;
+                dl_->AddCircleFilled(sp, rad, halo, 24);
+                dl_->AddCircle(sp, rad, ring, 24, 2.4f);
+                break;
+            }
+        } else if (skind == "w") {
+            for (const auto& w : doc.wires()) {
+                if (w.id != sid) continue;
+                for (size_t i = 1; i < w.pts.size(); ++i)
+                    dl_->AddLine(toScreen(w.pts[i - 1]), toScreen(w.pts[i]), halo, 6.0f);
+                break;
+            }
+        }
+    }
 }
 
 // ---- board ---------------------------------------------------------------------------------
@@ -382,6 +428,38 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
     // Ratsnest airwires: thin dashed lines between unrouted pads.
     for (const auto& aw : doc.ratsnest())
         drawDashedLine(dl_, toScreen(aw.p1), toScreen(aw.p2), ratsCol, 1.2f, 5, 4);
+
+    // Selection highlight (drawn last, on top). A footprint gets a translucent halo over its
+    // courtyard (or origin) + a ring; a track gets a thick translucent over-stroke.
+    std::string skind, sid;
+    if (splitSel(selected_, skind, sid)) {
+        const ImU32 halo = col(ui::palette.selectionHighlight);
+        const ImU32 ring = col(ui::palette.hoverHighlight, 2.2f);
+        if (skind == "fp") {
+            for (const auto& fp : doc.footprints()) {
+                if (fp.id != sid) continue;
+                const EcadPt eff{fp.pos.x + dragDx_, fp.pos.y + dragDy_};
+                const ImVec2 sp = toScreen(eff);
+                // Halo radius from the courtyard half-diagonal when present, else a default body.
+                float radMm = 1.5f;
+                if (fp.hasCourtyard) {
+                    radMm = 0.5f * std::hypot(fp.courtyardMax.x - fp.courtyardMin.x,
+                                              fp.courtyardMax.y - fp.courtyardMin.y);
+                }
+                const float rad = std::max(14.0f * ui::uiScale, radMm * pxPerMm_);
+                dl_->AddCircleFilled(sp, rad, halo, 28);
+                dl_->AddCircle(sp, rad, ring, 28, 2.4f);
+                break;
+            }
+        } else if (skind == "t") {
+            for (const auto& t : doc.tracks()) {
+                if (t.id != sid) continue;
+                const float wpx = std::max(6.0f, t.width * pxPerMm_ + 4.0f);
+                dl_->AddLine(toScreen(t.p1), toScreen(t.p2), halo, wpx);
+                break;
+            }
+        }
+    }
 }
 
 // ---- main draw -----------------------------------------------------------------------------

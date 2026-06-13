@@ -46,4 +46,9 @@ EcadMirror& ecadEditorMirror();
 // over ecadEditorMirror().loadFromTree(); call after every successful ECAD RPC (guide §(e)).
 void ecadEditorLoadResponse(const nlohmann::json& resp);
 
+// Set the editor's selected entity to a "<kind>:<id>" token (kind in {s,fp,w,t}), or "" to clear.
+// Lets a headless scenario drive selection without a mouse so a shot can show the highlight; the
+// canvas haloes the matching symbol/footprint/wire/track on the next draw. (Select tool only.)
+void ecadEditorSelect(const std::string& sel);
+
 }  // namespace ui

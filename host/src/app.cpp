@@ -1122,12 +1122,15 @@ int run_gui(const char* screenshotPath) {
             const bool want3d  = kindEnv && std::strcmp(kindEnv, "3d") == 0;
             const bool wantAi  = kindEnv && std::strcmp(kindEnv, "ai") == 0;
             const bool wantEdit = kindEnv && std::strcmp(kindEnv, "editsch") == 0;
+            const bool wantSelect = kindEnv && std::strcmp(kindEnv, "select") == 0;  // selection highlight
+            const bool wantDel    = kindEnv && std::strcmp(kindEnv, "del") == 0;     // delete a symbol
             nlohmann::json r;
             std::string showId;
             if (wantAi) {
                 st.wantFocusEcad = 6;   // surface the empty AI launchpad for the screenshot
-            } else if (wantEdit) {
+            } else if (wantEdit || wantSelect || wantDel) {
                 // Exercise the Place/Route tools by applying the ops a user's clicks would produce.
+                // select/del reuse this same schematic batch then drive selection/delete (below).
                 if (ecall("ecad_new", {{"kind", "sch"}}, r)) {
                     const std::string id = jstr(r, "doc_id");
                     const int rev = jint(r, "revision");
@@ -1140,8 +1143,16 @@ int run_gui(const char* screenshotPath) {
                     ops.push_back({{"op","sch_add_wire"},{"pts",{{10,32},{32,32}}}});
                     ops.push_back({{"op","sch_add_wire"},{"pts",{{32,32},{54,32},{54,26}}}});
                     ecall("ecad_apply_ops", {{"doc_id",id},{"base_revision",rev},{"ops",ops}}, r);
-                    st.ecadTool = 1;   // show the Place tool active in the toolbar
+                    st.ecadTool = wantEdit ? 1 : 0;   // editsch shows Place; select/del use Select
                     showId = id;
+                    if (wantDel) {
+                        // Delete one symbol directly (what the Delete key emits) so the shot shows
+                        // FEWER symbols than the editsch baseline. Re-read the new revision first.
+                        const int rev2 = jint(r, "revision");
+                        nlohmann::json delOps = nlohmann::json::array();
+                        delOps.push_back({{"op","sch_delete_symbol"},{"id","s2"}});  // the 2nd symbol (a 10k R)
+                        ecall("ecad_apply_ops", {{"doc_id",id},{"base_revision",rev2},{"ops",delOps}}, r);
+                    }
                 }
             } else if (wantPcb || want3d) {
                 // Build a small demo board explicitly: outline + two 0603 footprints (pads
@@ -1184,6 +1195,18 @@ int run_gui(const char* screenshotPath) {
                 ui::ecadEditorMirror().setDocId(showId);
                 ui::ecadEditorLoadResponse(r);
                 std::printf("[ecad-shot] showing %s rev=%d\n", showId.c_str(), st.ecadRevision);
+                if (wantSelect) {
+                    // Drive selection without a mouse so the shot shows the highlight halo. Pick a
+                    // real symbol id from the loaded mirror (the 2nd symbol when present).
+                    const auto& syms = ui::ecadEditorMirror().symbols();
+                    const std::string sel = "s:" + (syms.size() >= 2 ? syms[1].id
+                                                    : (syms.empty() ? std::string("s1") : syms[0].id));
+                    ui::ecadEditorSelect(sel);
+                    std::printf("[ecad-shot] selected %s (%d symbols)\n", sel.c_str(), (int)syms.size());
+                }
+                if (wantDel)
+                    std::printf("[ecad-shot] after delete: %d symbols\n",
+                                (int)ui::ecadEditorMirror().symbols().size());
                 std::fflush(stdout);
             }
         }

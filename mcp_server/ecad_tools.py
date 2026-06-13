@@ -933,11 +933,15 @@ def register_ecad_tools(mcp) -> None:
 
     @mcp.tool()
     def ecad_to_3d(path: str = "", doc_id: str = "") -> str:
-        """Export a 3D model (STEP) of the active board, if a 3D exporter is available.
+        """Export a 3D model (STEP) of the active board.
 
-        Best-effort: the board-to-3D pipeline is built in parallel; if it is not wired yet this
-        returns a clean, actionable message (it never raises). When available, returns the STEP
-        path.
+        Calls ``engine.ecad.threed.board_to_step`` (now available), assembles the board substrate
+        and proxy-boxes for every on-board footprint, and writes a STEP file. Returns the file
+        path + volume summary and a hint telling the user to open the STEP as an import feature
+        in the AI-CAD app so they can design an enclosure around the board.
+
+        Falls back to a clean, actionable error (never raises) when the board has no outline or
+        when there is no active PCB session.
         """
         try:
             session = _get_pcb(doc_id or None)
@@ -945,34 +949,51 @@ def register_ecad_tools(mcp) -> None:
             return _err(e.message, hint="3D export needs an open board.",
                         next_actions=["ecad_new_pcb('myboard')"])
         doc = session.doc
+
+        # Build the output path (default: AI-CAD cache dir named after the board).
         out_path = path or str(_default_out_dir(doc.get("name", "board")) / "board.step")
-        # Try the (parallel-built) board 3D exporter under a few plausible names; degrade cleanly.
-        for modname, fname in (("engine.ecad.threed", "export_step"),
-                               ("engine.ecad.board3d", "to_step"),
-                               ("engine.ecad.fab.threed", "write_step")):
-            try:
-                mod = __import__(modname, fromlist=[fname])
-                fn = getattr(mod, fname, None)
-                if fn is None:
-                    continue
-                result_path = fn(doc, out_path)
-                _ECAD["out_dir"] = os.path.dirname(out_path)
-                return _dumps({
-                    "ok": True, "doc_id": session.doc_id, "kind": "step",
-                    "path": result_path or out_path, "warnings": [],
-                    "hint": f"Wrote 3D STEP model to {result_path or out_path}.",
-                    "next_actions": ["open the STEP in a 3D viewer / mechanical CAD"],
-                })
-            except ImportError:
-                continue
-            except Exception as e:  # noqa: BLE001
-                return _err(f"3D export failed: {type(e).__name__}: {e}",
-                            hint="The 3D exporter is present but errored on this board.")
-        return _err("3D board export is not available in this build",
-                    hint="No engine.ecad 3D exporter is wired yet. Use ecad_export('gerber') for "
-                         "fab output; 3D STEP export is a follow-up module.",
-                    next_actions=["ecad_export('gerber')", "ecad_export('drill')"],
-                    available=False)
+
+        try:
+            from engine.ecad.threed import board_to_step  # lazy import; no OCP at module load
+        except ImportError as e:
+            return _err(f"3D exporter unavailable (ImportError: {e})",
+                        hint="engine.ecad.threed could not be imported — "
+                             "OCP/build123d may not be installed in this environment. "
+                             "Use ecad_export('gerber') for fab output.",
+                        next_actions=["ecad_export('gerber')", "ecad_export('drill')"],
+                        available=False)
+
+        try:
+            result = board_to_step(doc, out_path)
+        except Exception as e:  # noqa: BLE001 — BoardGeometryError or any OCP error
+            return _err(f"3D export failed: {type(e).__name__}: {e}",
+                        hint="Check that the board has a closed Edge.Cuts outline "
+                             "(pcb_set_outline op, closed=True). "
+                             "An empty outline or open chain raises BoardGeometryError.",
+                        next_actions=["ecad_run_drc()  # confirms outline is present",
+                                      "ecad_status()"])
+
+        step_path = result.get("step_path", out_path)
+        summary   = result.get("summary", {})
+        _ECAD["out_dir"] = os.path.dirname(step_path)
+        return _dumps({
+            "ok": True, "doc_id": session.doc_id, "kind": "step",
+            "step_path": step_path,
+            "board_volume_mm3": summary.get("board_volume", 0.0),
+            "n_components": summary.get("n_components", 0),
+            "n_proxies": summary.get("n_proxies", 0),
+            "summary": summary,
+            "warnings": summary.get("warnings", []),
+            "hint": (f"Wrote STEP to {step_path} "
+                     f"(board volume {summary.get('board_volume', 0):.1f} mm³, "
+                     f"{summary.get('n_components', 0)} component body/bodies). "
+                     "Open this STEP in the CAD app as an import feature to design "
+                     "the enclosure."),
+            "next_actions": [
+                f"# In the CAD app: File > Import > {step_path}",
+                "# Or drag the STEP onto the 3D canvas to start the enclosure design.",
+            ],
+        })
 
     # tools registered; nothing to return.
 

@@ -16,8 +16,18 @@
 }
 Device: {"kind":"R|L|C|V|I|D|Q|M|E|F|G|H|S|OPAMP", "name":"R1",
          "nodes":["N$3","GND"], "value":10000.0|null, "model":"D1N4148"|null,
-         "params":{...}}                    // e.g. V PULSE/SIN/PWL, C ic=, etc.
+         "params":{...}}
 ```
+
+**Independent-source `params` encoding (NORMATIVE — the parser↔solver boundary).** A V/I source's
+excitation lives in `params` under these exact keys (the SPICE parser emits them; the solver reads
+them — keep them in sync):
+- `params["dc"]` : float DC level (or carry it in the device `value`; the solver uses `value` if
+  non-null else `params["dc"]`).
+- `params["ac"]` : `{"mag":float, "phase":float}` — small-signal AC excitation (lowercase `ac`).
+- `params["waveform"]` : `{"type":"DC|PULSE|SIN|PWL", ...}` — transient waveform. Field names by type:
+  `PULSE{v1,v2,td,tr,tf,pw,per}`, `SIN{vo,va,f,td,theta}`, `PWL{points:[[t,v],...]}`.
+Capacitor/inductor initial conditions use `params["ic"]`.
 
 ## 2. Device models (`devices.py`)
 

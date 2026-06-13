@@ -342,6 +342,15 @@ def _sketch_project_ref(params: dict, _emit: EmitFn) -> dict:
 # is a metadata-only write that reuses the last build. Structured error envelope.
 
 
+def _weld_cut_list(params: dict, _emit: EmitFn) -> dict:
+    # Weldments cut list: aggregate the active part doc's weld_member structural members into a
+    # grouped cut-list table (read-only; ensures-built then reads the _weld_members side-channel).
+    # A doc with no weld_member features -> empty rows (not an error).
+    from engine.doc import session as docsess
+    from engine.doc import cutlist
+    return cutlist.cut_list_for_session(docsess.get_session(params["doc_id"]))
+
+
 def _config_list(params: dict, _emit: EmitFn) -> dict:
     from engine.doc import session as docsess
     return docsess.config_list(docsess.get_session(params["doc_id"]))
@@ -800,6 +809,10 @@ _STRUCTURED_ERROR_METHODS.update({
     "config_list", "config_add", "config_delete", "config_activate",
     "config_set_override", "config_set_suppression",
 })
+
+# ---- WELDMENTS cut list — read-only aggregation of weld_member members (structured error) ----
+_METHODS.update({"weld_cut_list": _weld_cut_list})
+_STRUCTURED_ERROR_METHODS.add("weld_cut_list")
 
 
 def _emit(obj: dict) -> None:

@@ -140,6 +140,41 @@ Implemented by `engine/worker.py` (`config_*`) over `engine/doc/session.py`
 (`config_list`/`config_add`/`config_delete`/`config_activate`/`config_set_override`/
 `config_set_suppression`); machine-checked by `engine/doc/test_configurations.py`.
 
+#### 2.3 Weldments cut list (`weld_cut_list`)
+
+The signature weldment deliverable: aggregate every structural member produced by the part's
+`weld_member` features (feature_params.md §Weldments) into a grouped cut-list table. **Read-only** —
+it never mutates the document or bumps the revision. Structured error envelope.
+
+| method | params → result |
+|---|---|
+| `weld_cut_list` | `{doc_id}` → `{rows:[{item, profile, description, length_mm, quantity, total_length_mm}], total_members, total_length_mm, profiles:[…]}` (read-only). A part with NO `weld_member` features (or an assembly) reports `rows:[]` with zero totals — **not** an error |
+
+Members across ALL `weld_member` features are pooled and grouped by `(profile + resolved dims +
+length rounded to 0.1 mm)`: identical members collapse into ONE row carrying `quantity` (the count)
+and `total_length_mm` (= `quantity × length_mm`); distinct lengths get separate rows. `description`
+is a human profile label (e.g. `"Square Tube 20 x 20 x 2"`). Rows sort by `profile` (asc) then
+`length_mm` (desc); `item` is the 1-based post-sort row number. `total_length_mm` is the sum of all
+member lengths; `profiles` lists the distinct profile names present.
+
+```json
+{
+  "rows": [
+    {"item": 1, "profile": "square_tube", "description": "Square Tube 20 x 20 x 2",
+     "length_mm": 100.0, "quantity": 2, "total_length_mm": 200.0},
+    {"item": 2, "profile": "square_tube", "description": "Square Tube 20 x 20 x 2",
+     "length_mm": 80.0, "quantity": 1, "total_length_mm": 80.0}
+  ],
+  "total_members": 3, "total_length_mm": 280.0, "profiles": ["square_tube"]
+}
+```
+
+Implemented by `engine/worker.py` (`weld_cut_list`) → `engine/doc/cutlist.py`
+(`cut_list_for_session` forces a fresh uncached compile so the `weld_member` compiler repopulates
+the `_weld_members` side-channel surfaced on `CompileResult.weld_members`, then `build_cut_list`
+groups it); machine-checked by `engine/doc/test_weld_cutlist.py`. Host passthrough:
+`DocMirror::weldCutList` + the "Cut List" panel.
+
 ### Sketch interaction (M2)
 | method | params → result |
 |---|---|

@@ -85,6 +85,13 @@ class CompileResult:
     cache_hits: int = 0
     cache_misses: int = 0
     equations_error: str | None = None
+    # Weldments cut-list side-channel: the per-feature structural-member records the weld_member
+    # compiler stashes on ``ctx.datums["_weld_members"]`` (``{fid: {profile, dims, members:[…]}}``),
+    # surfaced onto the result so a worker RPC can read it WITHOUT poking inside the compiler. Empty
+    # for docs with no weld_member features. NOTE: a CACHE-HIT weld_member does not repopulate the
+    # side-channel, so callers that need this should compile with a fresh cache (see
+    # engine.doc.cutlist).
+    weld_members: dict[str, Any] = field(default_factory=dict)
     # CONFIG version bump — the configuration this rebuild compiled (the active config's name, or
     # "Default" when the document carries no configurations). Pure echo; absent-config docs report
     # "Default" and are otherwise unchanged.
@@ -599,5 +606,12 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
         result.bodies.append(BodyOut(body_id=bid, name=bid, shape=shape, color=None))
     result.face_owners = {bo.body_id: face_owners.get(bo.body_id, {}) for bo in result.bodies}
     result.edge_owners = {bo.body_id: edge_owners.get(bo.body_id, {}) for bo in result.bodies}
+
+    # --- Weldments cut-list side-channel ---------------------------------
+    # weld_member stashes per-feature member records on a sentinel Datum keyed "_weld_members".
+    # Surface its obj (a {fid: {profile, dims, members}} dict) so the cut-list RPC can read it.
+    wm = datums.get("_weld_members")
+    if wm is not None and isinstance(getattr(wm, "obj", None), dict):
+        result.weld_members = wm.obj
 
     return result

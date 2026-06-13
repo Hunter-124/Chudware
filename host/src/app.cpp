@@ -52,6 +52,7 @@
 #include "ui/property_manager.h"
 #include "ui/sketch_mode.h"   // C18
 #include "ui/config_panel.h"  // Configurations (SolidWorks ConfigurationManager)
+#include "ui/cutlist_panel.h"  // Weldment Cut List (SolidWorks Weldment Cut List)
 #include "ui/toast.h"         // W1-B: toast notifications
 #include "ui/cursors.h"       // W1-B: cursor manager
 // --- C19: simulation + flow + evaluate UI ---
@@ -214,6 +215,9 @@ int run_gui(const char* screenshotPath) {
 
     // Configurations panel (SolidWorks ConfigurationManager) — owned here, drawn each frame.
     ui::ConfigPanel configPanel;
+
+    // Weldment Cut List panel (SolidWorks Weldment Cut List) — owned here, drawn each frame.
+    ui::CutListPanel cutListPanel;
 
     // --- C22b: ActivityPanel — owned here, borrowed via st.activityPanel (opaque void*). ---
     ui::ActivityPanel activityPanel;
@@ -1135,6 +1139,11 @@ int run_gui(const char* screenshotPath) {
         // Lists the active part/asm doc's configurations; activate/add/delete ingest the
         // ops-response so the viewport + FeatureManager refresh. No-op unless st.showConfigPanel.
         configPanel.draw(st);
+
+        // ---------- Weldment Cut List panel (SolidWorks Weldment Cut List) ----------
+        // Read-only table of the active part's weld_member structural members grouped by
+        // profile + length into rows with quantities. No-op unless st.showCutListPanel.
+        cutListPanel.draw(st);
 
         // ---------- C15 pick-shot driver: simulate a center-screen pick ----------
         // The viewport panel rendered the id buffer for this frame's camera; pick its center,

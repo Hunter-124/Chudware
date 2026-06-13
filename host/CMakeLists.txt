@@ -88,6 +88,9 @@ add_executable(AI-CAD
   # --- Configurations panel (SolidWorks ConfigurationManager) ---
   src/ui/config_panel.cpp
   # --- end Configurations ---
+  # --- Weldment Cut List panel (SolidWorks Weldment Cut List) ---
+  src/ui/cutlist_panel.cpp
+  # --- end Cut List ---
   # --- C19: simulation + flow + evaluate UI ---
   src/core/sim_client.cpp
   src/ui/sim_panel.cpp

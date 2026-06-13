@@ -202,6 +202,14 @@ public:
     // json on error (err filled). Does NOT mutate the mirror.
     nlohmann::json configList(WorkerClient& w, std::string& err);
 
+    // ---- Weldments cut list (SolidWorks Weldment Cut List) ----
+    // Read-only passthrough of weld_cut_list: returns the raw result
+    // {rows:[{item, profile, description, length_mm, quantity, total_length_mm}],
+    //  total_members, total_length_mm, profiles:[...]} or a null json on error (err filled). A part
+    // with no weld_member features (or an assembly) returns an empty rows list — NOT an error. Does
+    // NOT mutate the mirror.
+    nlohmann::json weldCutList(WorkerClient& w, std::string& err);
+
     // Re-pull the document tree + revision from the worker (doc_tree) and fire the listener.
     // C24: the public face of the formerly-private resyncTree — callers that mutated the doc
     // out-of-band (sketch drag/commit/exit, a v2 agent run) use this to bring the mirror back in

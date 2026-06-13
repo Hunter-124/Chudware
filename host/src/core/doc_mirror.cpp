@@ -458,4 +458,14 @@ nlohmann::json DocMirror::configList(WorkerClient& w, std::string& err) {
     return res;
 }
 
+// ---- Weldments cut list ----------------------------------------------------
+
+nlohmann::json DocMirror::weldCutList(WorkerClient& w, std::string& err) {
+    if (docId_.empty()) { err = "no document open"; return nlohmann::json(); }
+    nlohmann::json res;
+    if (!w.call("weld_cut_list", {{"doc_id", docId_}}, res, err)) return nlohmann::json();
+    if (res.contains("code")) { err = jstr(res, "message"); return nlohmann::json(); }
+    return res;
+}
+
 }  // namespace core

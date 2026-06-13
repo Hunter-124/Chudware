@@ -101,6 +101,8 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
         // Configurations (SolidWorks ConfigurationManager) — lands in the task pane the first time
         // it's toggled on so it surfaces as a tab rather than floating over the viewport.
         "Configurations",
+        // Weldment Cut List — same task-pane slot so it surfaces as a tab when toggled on.
+        "Cut List",
     };
     for (const char* d : dialogs) ImGui::DockBuilderDockWindow(d, rightBottom);
 
@@ -170,6 +172,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             ImGui::MenuItem("Ribbon", nullptr, &st.showRibbon);
             ImGui::MenuItem("FeatureManager", nullptr, &st.showFeatureTree);
             ImGui::MenuItem("Configurations", nullptr, &st.showConfigPanel);
+            ImGui::MenuItem("Cut List", nullptr, &st.showCutListPanel);
             ImGui::MenuItem("AI Panel", nullptr, &st.showAIPanel);
             ImGui::MenuItem("Viewport", nullptr, &st.showViewport);
             ImGui::Separator();

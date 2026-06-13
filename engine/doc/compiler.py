@@ -96,6 +96,7 @@ class _CacheEntry:
     tool_body: Any | None
     datum: Any | None
     status: dict
+    op: str | None = None
     # per-body owner maps produced by this feature (keyed by body_id string)
     face_owners: dict[str, dict[int, str]] = field(default_factory=dict)
     edge_owners: dict[str, dict[int, str]] = field(default_factory=dict)
@@ -292,6 +293,10 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
     # --- context shared across features ----------------------------------
     bodies: list[Any] = []
     datums = reserved_datums()
+    # Per-feature tool solids + their boolean op, threaded into every CompileContext so a
+    # pattern/mirror feature can replicate the features it references. result.tool_bodies is the
+    # source of truth for the solids; feature_ops mirrors it with "add"/"cut".
+    feature_ops: dict[str, str] = {}
     # body_id -> face/edge owner maps + the cached topo map for diffing the NEXT feature
     face_owners: dict[str, dict[int, str]] = {}
     edge_owners: dict[str, dict[int, str]] = {}
@@ -351,6 +356,7 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
             bodies = list(hit_entry.bodies)
             if hit_entry.tool_body is not None:
                 result.tool_bodies[fid] = hit_entry.tool_body
+                feature_ops[fid] = hit_entry.op or "add"
             if hit_entry.datum is not None:
                 datums[fid] = hit_entry.datum
             result.feature_status.append(dict(hit_entry.status))
@@ -393,7 +399,8 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
             prev_key = feat_key
             continue
 
-        ctx = CompileContext(equations_env=env, bodies=bodies, datums=datums)
+        ctx = CompileContext(equations_env=env, bodies=bodies, datums=datums,
+                             tool_bodies=result.tool_bodies, feature_ops=feature_ops)
         # Hand the compiler a feature view with resolved params (so ctx.dim reads evaluated values).
         feat_view = dict(feat)
         feat_view["params"] = resolved_params
@@ -420,6 +427,7 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
         bodies = out.bodies
         if out.tool_body is not None:
             result.tool_bodies[fid] = out.tool_body
+            feature_ops[fid] = out.op or "add"
         if out.datum is not None:
             datums[fid] = out.datum
 
@@ -450,7 +458,7 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
             stored_edge = {bid_k: dict(eo) for bid_k, eo in edge_owners.items()}
             cache.put(feat_key, _CacheEntry(
                 bodies=list(bodies), tool_body=out.tool_body,
-                datum=out.datum, status=dict(status),
+                datum=out.datum, status=dict(status), op=out.op,
                 face_owners=stored_face, edge_owners=stored_edge))
 
     # --- assemble BodyOut list -------------------------------------------

@@ -91,12 +91,16 @@ class CompileOutput:
       with ``merge:false`` append a new one, datums return the bodies unchanged).
     - ``tool_body``: the solid this feature fused or subtracted (patterns/mirror need it later);
       None for datums/scripts that don't contribute a single tool solid.
+    - ``op``: the boolean this feature applied with its ``tool_body`` — ``"add"`` (fused) or
+      ``"cut"`` (subtracted). Patterns/mirror read it to replicate an instance with the SAME
+      boolean. ``None`` defaults to ``"add"`` in the core (primitives, bosses).
     - ``datum``: a :class:`Datum` to register (datum features only).
     - ``resolved``: resolved dim values to echo back in feature_status (``{param: float}``).
     """
 
     bodies: list[Any] = field(default_factory=list)
     tool_body: Any | None = None
+    op: str | None = None
     datum: Datum | None = None
     resolved: dict[str, float] = field(default_factory=dict)
 
@@ -117,6 +121,12 @@ class CompileContext:
     equations_env: dict[str, float]
     bodies: list[Any]
     datums: dict[str, Datum]
+    # Per-feature tool solids built SO FAR (feature_id -> shape) and the boolean each applied
+    # (feature_id -> "add"|"cut"). The compiler core threads the live accumulating dicts in, so a
+    # pattern/mirror feature can look up the solids of the features it replicates. Empty for the
+    # leading features; populated by the time a pattern/mirror runs (it always references upstream).
+    tool_bodies: dict[str, Any] = field(default_factory=dict)
+    feature_ops: dict[str, str] = field(default_factory=dict)
     _resolved_params: dict[str, Any] = field(default_factory=dict)
 
     # -- dim access -------------------------------------------------------

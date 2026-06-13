@@ -63,11 +63,48 @@ geometry reflects only the prefix through the bar.
 ### Sketch interaction (M2)
 | method | params → result |
 |---|---|
-| `sketch_enter` | `{doc_id, sketch}` → `{entities:[{id, …solved params}], statuses:{e1:"full",…}, dof:int, plane_frame:[16], constraints:[…]}` |
+| `sketch_enter` | `{doc_id, sketch}` → `{entities:[{id, …solved params}], statuses:{e1:"full",…}, dof:int, plane_frame:[16], conflicting:[cid…], redundant:[cid…], solve_rejected:bool, status, constraints:[…]}` |
 | `sketch_solve` | `{doc_id, sketch}` → same as `sketch_enter` |
-| `sketch_drag` | `{doc_id, sketch, handle, xy:[x,y]}` → `{entities, statuses, constraints}` — transient, warm-started, does NOT commit or bump revision |
+| `sketch_probe` | `{doc_id, sketch, action}` → over-define pre-flight (read-only, see below) |
+| `sketch_drag` | `{doc_id, sketch, handle, xy:[x,y]}` OR `{doc_id, sketch, targets:[{handle, xy:[x,y]},…]}` → `{entities, statuses, solve_rejected:false, constraints}` — transient, warm-started, does NOT commit or bump revision. `targets` (optional) soft-targets many point handles at once for whole-entity / closed-profile / multi-select drags; each point translates while constraints stay exact. When `targets` is present `handle`/`xy` are ignored. |
 | `sketch_drag_commit` | `{doc_id, sketch}` → ops-response (persists final positions as one undoable batch) + `constraints` |
 | `sketch_exit` | `{doc_id, sketch}` → ops-response (rebuilds downstream) |
+
+**`solve_rejected` (sketch_enter / sketch_solve / sketch_drag, C50f).** Conflict-safe solving:
+when a re-solve comes back **contradictory** (`conflicting` non-empty) OR **non-convergent**, the
+solver's least-squares compromise is rejected for geometry. The response's `entities` carry the
+document's last-valid (pre-solve) coords instead — geometry is **frozen**, never persisted, and the
+warm state is dropped — while `dof`/`statuses`/`conflicting`/`redundant`/`status` still report the
+real over-defined analysis so the host can show "Over Defined" and which constraints conflict.
+`solve_rejected:true` flags this freeze so the host can message the user. Consistent
+over-definition (`redundant` non-empty, `conflicting` empty, convergent) is **not** rejected — it
+has a valid solution and solves/persists as before (`solve_rejected:false`).
+
+**`sketch_probe` (C50f over-define pre-flight).** A dry run over a **deep copy** of the active
+sketch — it MUST NOT mutate the document, session sketch state, undo stack, or warm-start state.
+`action` is exactly one of:
+
+```json
+{"add_constraint": {<constraint json, same schema as sketch_add_constraint's constraint>}}
+{"set_dim": {"id": "<cid>", "value": <num>, "expr"?: "<str>", "driven"?: <bool>}}
+{"delete_constraint": {"id": "<cid>"}}
+```
+
+Response:
+
+```json
+{"ok": true, "status": "under"|"full"|"over",
+ "dof_before": int, "dof_after": int, "converged": bool,
+ "conflicting": ["<cid>", …], "redundant": ["<cid>", …],
+ "would_over_define": bool}
+```
+
+The probed `add_constraint` is tagged id `__probe__` so it can be spotted in `conflicting`/
+`redundant`. `would_over_define` is true when the probe constraint appears in `conflicting` or
+`redundant`, OR a **dimensional** add leaves `dof_after >= dof_before` (absorbed by an already
+determined system), OR the solve no longer converges (e.g. a `set_dim` to a contradictory value),
+OR the system is otherwise conflicting. On an unmatched/inactive sketch or malformed action:
+`{"ok": false, "error": "<reason>"}`.
 
 **`constraints` (sketch responses, C35-overhaul).** Every constraint in the active sketch, for the
 sketcher's dimension annotations. Each record:

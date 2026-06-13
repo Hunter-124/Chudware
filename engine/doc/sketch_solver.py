@@ -688,6 +688,9 @@ def _add_constraint(
     elif ctype == "tangent":
         _add_tangent(sys, cid, refs[0], refs[1], entities, var_map)
 
+    elif ctype == "collinear":
+        _add_collinear(sys, cid, refs[0], refs[1], entities, var_map)
+
     elif ctype == "equal":
         _add_equal(sys, cid, refs[0], refs[1], entities, var_map)
 
@@ -702,6 +705,10 @@ def _add_constraint(
         sys.add_residual(
             lambda xs: np.array([xs[0] - xs[2], xs[1] - xs[3]]),
             combined, lambda xs: np.array([[1, 0, -1, 0], [0, 1, 0, -1]], dtype=float), cid)
+
+    elif ctype == "coradial":
+        # Two circles/arcs share the same center AND the same radius.
+        _add_coradial(sys, cid, refs[0], refs[1], entities, var_map)
 
     elif ctype == "midpoint":
         # refs[0] = point handle; refs[1] = line entity
@@ -736,6 +743,12 @@ def _add_constraint(
             sys.add_residual(
                 lambda xs, _r=r: np.array([xs[0] - _r]),
                 ridx, lambda xs: np.array([[1.0]]), cid)
+        elif etype in ("slot", "arc_slot"):
+            # cap radius = w/2 -> constrain the width variable: w = 2r.
+            widx = var_map[eid][[4 if etype == "slot" else 5]]
+            sys.add_residual(
+                lambda xs, _r=r: np.array([xs[0] - 2.0 * _r]),
+                widx, lambda xs: np.array([[1.0]]), cid)
 
     elif ctype == "diameter":
         d = _resolve_dim(constraint, equations_env)
@@ -747,6 +760,12 @@ def _add_constraint(
             sys.add_residual(
                 lambda xs, _r=r: np.array([xs[0] - _r]),
                 ridx, lambda xs: np.array([[1.0]]), cid)
+        elif etype in ("slot", "arc_slot"):
+            # slot WIDTH == cap diameter == the width variable: w = d.
+            widx = var_map[eid][[4 if etype == "slot" else 5]]
+            sys.add_residual(
+                lambda xs, _d=d: np.array([xs[0] - _d]),
+                widx, lambda xs: np.array([[1.0]]), cid)
 
     else:
         # Unknown constraint type — skip silently (forward-tolerant)
@@ -883,6 +902,87 @@ def _add_perpendicular(sys, cid, h0, h1, entities, var_map):
     sys.add_residual(_r, combined, _j, cid)
 
 
+def _add_collinear(sys, cid, h0, h1, entities, var_map):
+    """Two lines lie on the same infinite line (2 residuals, removes 2 DOF).
+
+    r1 = cross(dirA, dirB) = 0                  (directions parallel)
+    r2 = cross(dirA, (C - A)) = 0               (endpoint C of line B on line A)
+
+    where line A = (A=p1, B=p2) and line B = (C=p1, D=p2). r2 is the (un-normalized)
+    signed area, vanishing exactly when C lies on the infinite line through A,B.
+    Combined with r1 this pins both lines onto one infinite line. Matches the
+    parallel/point_on residual conventions (raw cross products, analytic Jacobian).
+    """
+    eid0 = h0.split(".")[0]
+    eid1 = h1.split(".")[0]
+    assert entities[eid0]["type"] == "line" and entities[eid1]["type"] == "line"
+    idx0 = _line_direction_idx(eid0, var_map)  # [ax,ay,bx,by]
+    idx1 = _line_direction_idx(eid1, var_map)  # [cx,cy,dx,dy]
+    combined = np.concatenate([idx0, idx1])
+
+    def _r(xs):
+        ax, ay, bx, by = xs[0], xs[1], xs[2], xs[3]
+        cx, cy, dx, dy = xs[4], xs[5], xs[6], xs[7]
+        # r1: directions parallel
+        r1 = (bx-ax)*(dy-cy) - (by-ay)*(dx-cx)
+        # r2: endpoint C of line B on infinite line A
+        r2 = (bx-ax)*(cy-ay) - (by-ay)*(cx-ax)
+        return np.array([r1, r2])
+
+    def _j(xs):
+        ax, ay, bx, by = xs[0], xs[1], xs[2], xs[3]
+        cx, cy, dx, dy = xs[4], xs[5], xs[6], xs[7]
+        # r1 = (bx-ax)(dy-cy) - (by-ay)(dx-cx)
+        r1 = [
+            -(dy-cy),   # dax
+            (dx-cx),    # day
+            (dy-cy),    # dbx
+            -(dx-cx),   # dby
+            (by-ay),    # dcx
+            -(bx-ax),   # dcy
+            -(by-ay),   # ddx
+            (bx-ax),    # ddy
+        ]
+        # r2 = (bx-ax)(cy-ay) - (by-ay)(cx-ax)
+        r2 = [
+            -(cy-ay) + (by-ay),   # dax
+            -(bx-ax) + (cx-ax),   # day  (note: d/day of -(by-ay)(cx-ax) = +(cx-ax))
+            (cy-ay),              # dbx
+            -(cx-ax),             # dby
+            -(by-ay),             # dcx
+            (bx-ax),              # dcy
+            0.0,                  # ddx
+            0.0,                  # ddy
+        ]
+        return np.array([r1, r2])
+
+    sys.add_residual(_r, combined, _j, cid)
+
+
+def _add_coradial(sys, cid, h0, h1, entities, var_map):
+    """Two circles/arcs share the same center AND the same radius (3 residuals).
+
+    cx0 == cx1, cy0 == cy1, r0 == r1. Distinct SolidWorks relation (= concentric
+    + equal-radius combined into one). Linear residuals, constant Jacobian.
+    """
+    eid0 = h0.split(".")[0]
+    eid1 = h1.split(".")[0]
+    assert entities[eid0]["type"] in ("circle", "arc")
+    assert entities[eid1]["type"] in ("circle", "arc")
+    idx0 = var_map[eid0][[0, 1, 2]]  # cx0,cy0,r0
+    idx1 = var_map[eid1][[0, 1, 2]]  # cx1,cy1,r1
+    combined = np.concatenate([idx0, idx1])
+
+    _Jc = np.array([
+        [1.0, 0.0, 0.0, -1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0, 0.0, -1.0],
+    ])
+    sys.add_residual(
+        lambda xs: np.array([xs[0]-xs[3], xs[1]-xs[4], xs[2]-xs[5]]),
+        combined, lambda xs: _Jc, cid)
+
+
 def _entity_center_radius_idx(eid, entities, var_map):
     """Return (center_idx, radius_idx) for circle or arc entity."""
     etype = entities[eid]["type"]
@@ -1017,11 +1117,14 @@ def _add_tangent_line_circle(sys, cid, line_eid, circ_eid, entities, var_map):
             'by': dyab / L,
         }
 
-        # dist = |cross| / L  => d(dist)/d[...] = sgn * (d_cross * L - cross * d_L) / L^2
+        # dist = |cross| / L  => d(dist)/d[...] = (sgn * d_cross * L - |cross| * d_L) / L^2.
+        # sgn applies ONLY to the d_cross term (chain rule through |cross|) — applying it to the
+        # whole quotient negates the d_L term when cross < 0 (same bug as the point-line distance
+        # dd(); see that comment).
         def _d_dist(var, is_line=True):
             dc = d_cross2.get(var, 0.0)
             dl = d_L.get(var, 0.0) if is_line else 0.0
-            return sgn * (dc * L - abs(cross) * dl) / L2
+            return (sgn * dc * L - abs(cross) * dl) / L2
 
         J = np.zeros((1, 7))
         J[0, 0] = _d_dist('ax')
@@ -1037,16 +1140,35 @@ def _add_tangent_line_circle(sys, cid, line_eid, circ_eid, entities, var_map):
 
 
 def _add_tangent_circle_circle(sys, cid, eid0, eid1, entities, var_map):
-    """External tangency: |C0-C1| - r0 - r1 = 0."""
+    """Circle/arc ↔ circle/arc tangency.
+
+    Two arrangements satisfy tangency:
+      external: |C0-C1| = r0 + r1   (circles touch, sit outside each other)
+      internal: |C0-C1| = |r0 - r1| (one circle inside the other, touching)
+
+    Branch selection (SolidWorks behavior): evaluate the CURRENT geometry and pick
+    whichever branch the user already drew — the one whose residual is currently
+    smaller. This preserves the drawn configuration and stops the solver flipping a
+    nested pair inside-out (or vice versa). The chosen branch is frozen at
+    constraint-build time (does not re-evaluate during the solve iterations).
+    """
     idx0 = var_map[eid0][[0, 1, 2]]  # cx0,cy0,r0
     idx1 = var_map[eid1][[0, 1, 2]]  # cx1,cy1,r1
     combined = np.concatenate([idx0, idx1])
+
+    # Pick internal vs external from the as-drawn geometry.
+    e0, e1 = entities[eid0], entities[eid1]
+    c0 = e0.get("center", [0.0, 0.0]); c1 = e1.get("center", [0.0, 0.0])
+    r0_0 = float(e0.get("radius", 0.0)); r1_0 = float(e1.get("radius", 0.0))
+    d0 = math.hypot(c0[0] - c1[0], c0[1] - c1[1])
+    internal = abs(d0 - abs(r0_0 - r1_0)) < abs(d0 - (r0_0 + r1_0))
 
     def _r(xs):
         cx0, cy0, r0 = xs[0], xs[1], xs[2]
         cx1, cy1, r1 = xs[3], xs[4], xs[5]
         d = math.hypot(cx0 - cx1, cy0 - cy1)
-        return np.array([d - r0 - r1])
+        target = abs(r0 - r1) if internal else (r0 + r1)
+        return np.array([d - target])
 
     def _j(xs):
         cx0, cy0, r0 = xs[0], xs[1], xs[2]
@@ -1054,8 +1176,16 @@ def _add_tangent_circle_circle(sys, cid, eid0, eid1, entities, var_map):
         dx = cx0 - cx1; dy = cy0 - cy1
         d = math.hypot(dx, dy)
         if d < 1e-12:
-            return np.zeros((1, 6))
-        return np.array([[dx/d, dy/d, -1.0, -dx/d, -dy/d, -1.0]])
+            ux, uy = 0.0, 0.0
+        else:
+            ux, uy = dx/d, dy/d
+        if internal:
+            # d(|r0-r1|)/dr0 = sgn(r0-r1), /dr1 = -sgn(r0-r1)
+            s = 1.0 if (r0 - r1) >= 0 else -1.0
+            dr0, dr1 = -s, s
+        else:
+            dr0, dr1 = -1.0, -1.0
+        return np.array([[ux, uy, dr0, -ux, -uy, dr1]])
 
     sys.add_residual(_r, combined, _j, cid)
 
@@ -1847,15 +1977,23 @@ def _add_distance(sys, cid, h0, h1, d, entities, var_map, axis=None, cond=None):
             # Analytic Jacobian for d(|cross|/L - _d) w.r.t. [ax,ay,bx,by]:
             # cross = (bx-ax)*(Py-ay) - (by-ay)*(Px-ax)
             # Expanded: bx*Py - bx*ay - ax*Py - by*Px + by*ax + ay*Px
-            # d/dax = Py-by; d/day = bx-Px; d/dbx = ay-Py; d/dby = Px-ax
-            # (Same as d_cross2 in _add_tangent_line_circle with cx->Px, cy->Py)
-            dc_ax = Py - by;  dc_ay = bx - Px
-            dc_bx = ay - Py;  dc_by = Px - ax
+            # d/dax = by-Py; d/day = Px-bx; d/dbx = Py-ay; d/dby = ax-Px
+            # NOTE: this cross is the NEGATIVE of _add_tangent_line_circle's (which uses (A-C),
+            # ours uses (P-A)) — its d_cross2 values must be negated here, not copied. The copied
+            # (un-negated) partials made the Jacobian row rank-independent of geometrically
+            # redundant dims (phantom DOF loss, no redundant tag) and broke Newton steps whenever
+            # the LINE's variables were free (spurious non-convergence).
+            dc_ax = by - Py;  dc_ay = Px - bx
+            dc_bx = Py - ay;  dc_by = ax - Px
             d_L_ax = -dxab / L; d_L_ay = -dyab / L
             d_L_bx = dxab / L;  d_L_by = dyab / L
-            # dist = |cross|/L; d(dist)/d[...] = sgn*(dc_[...]*L - abs(cross)*dL_[...])/L^2
+            # dist = |cross|/L; d(dist)/d[...] = (sgn*dc_[...]*L - abs(cross)*dL_[...])/L^2.
+            # sgn applies ONLY to the dc term (chain rule through |cross|); multiplying the whole
+            # quotient by sgn negates the dL term too, which is wrong whenever cross < 0 and the
+            # line's own variables are free — one garbage column poisons the QR rank analysis
+            # (missed redundancy => silent over-define) and Newton steps (false non-convergence).
             def dd(dc, dl):
-                return sgn * (dc * L - abs(cross) * dl) / L2
+                return (sgn * dc * L - abs(cross) * dl) / L2
             J[0, kp]   = dd(dc_ax, d_L_ax)
             J[0, kp+1] = dd(dc_ay, d_L_ay)
             J[0, kp+2] = dd(dc_bx, d_L_bx)
@@ -2305,6 +2443,8 @@ def measure_constraint(constraint: dict, entity_coords: dict):
         ent = entity_coords.get(eid) if eid else None
         if ent and ent.get("type") in ("circle", "arc"):
             return float(ent["radius"])
+        if ent and ent.get("type") in ("slot", "arc_slot"):
+            return float(ent["width"]) / 2.0   # cap radius
         return None
 
     if ctype == "diameter":
@@ -2312,6 +2452,8 @@ def measure_constraint(constraint: dict, entity_coords: dict):
         ent = entity_coords.get(eid) if eid else None
         if ent and ent.get("type") in ("circle", "arc"):
             return float(ent["radius"]) * 2.0
+        if ent and ent.get("type") in ("slot", "arc_slot"):
+            return float(ent["width"])         # slot width = cap diameter
         return None
 
     if ctype == "angle":
@@ -2473,12 +2615,20 @@ def drag(
     target_xy: Tuple[float, float],
     sketch_params: dict,
     equations_env: dict,
+    targets: list | None = None,
 ) -> Dict[str, Any]:
-    """Constrained drag: pull handle toward target_xy, constraints stay exact.
+    """Constrained drag: pull handle(s) toward target_xy, constraints stay exact.
 
     Rebuilds the system from sketch_params (same topology, constraints), soft-
     targets the dragged point's x and y coordinates, warm-starts from state.x,
     and solves with a 10 ms time budget (best-so-far is returned if over budget).
+
+    Single-point drag (the common case) passes ``handle`` + ``target_xy``.
+    Whole-entity / profile / multi-select drags pass ``targets`` — a list of
+    ``{"handle": str, "xy": [x, y]}`` (or ``(handle, (x, y))`` tuples). Every
+    target is soft-targeted at weight 0.01, so a set of points sharing the same
+    translation moves rigidly while constraints (coincidence, h/v, dims) still
+    hold exactly. ``handle``/``target_xy`` are ignored when ``targets`` is given.
 
     Returns {"entities": EntityCoords, "statuses": {...}} — does NOT modify state
     and does NOT commit to the document (transient preview).
@@ -2498,50 +2648,42 @@ def drag(
         except Exception:
             pass
 
-    # Resolve the handle to get its variable indices
-    try:
-        hidx, hvf, hjf = _resolve_handle(handle, entities, var_map)
-    except (KeyError, ValueError):
-        # Unknown handle — return last known coords
-        entity_coords = _extract_entities(state.x, entities_list, var_map)
-        return {"entities": entity_coords, "statuses": {}}
+    # Normalize to a list of (handle, (tx, ty)). The legacy single-handle call
+    # becomes a one-element list.
+    target_pairs: list[tuple[str, tuple[float, float]]] = []
+    if targets:
+        for t in targets:
+            if isinstance(t, dict):
+                h = t.get("handle")
+                xy = t.get("xy")
+            else:
+                h, xy = t
+            if h is None or xy is None:
+                continue
+            target_pairs.append((h, (float(xy[0]), float(xy[1]))))
+    elif handle is not None and target_xy is not None:
+        target_pairs.append((handle, (float(target_xy[0]), float(target_xy[1]))))
 
-    if len(hidx) == 0:
-        # Zero-variable handle (the virtual "origin") — nothing to drag.
-        entity_coords = _extract_entities(state.x, entities_list, var_map)
-        return {"entities": entity_coords, "statuses": {}}
-
-    # Register soft targets for the two coordinates of the dragged point
-    # hidx are the variable indices for the handle's value function
-    # For direct point handles, hidx has exactly 2 vars (x and y)
-    # For derived handles (arc start/end), hidx has more vars — we soft-target
-    # the actual derived x,y by adding soft targets at the x,y variable indices.
-    # The simplest correct approach: identify the two output coordinates of hvf
-    # and add one soft_target per coordinate that maps directly to a variable.
-    # For direct handles (point, line p1/p2, circle center), hidx = [ix, iy]
-    # and we can directly target them. For derived handles we fall back to the
-    # center/endpoint variables.
-    tx, ty = float(target_xy[0]), float(target_xy[1])
-
-    if len(hidx) == 2:
-        # Direct 2-var handle: soft-target x and y independently
-        sys.soft_target(int(hidx[0]), tx, weight=0.01)
-        sys.soft_target(int(hidx[1]), ty, weight=0.01)
-    elif len(hidx) == 4:
-        # e.g. arc.start: [cx, cy, r, a0/a1] — target the derived point
-        # We add soft-targets on the center + angle instead, which indirectly
-        # pulls the start/end point. In practice, target the center to move
-        # the arc, but this is a simplification. A better approach: add a
-        # "derived point near target" as two soft residuals, but that changes
-        # the system's variable set. Instead, for arcs with derived endpoints
-        # we soft-target the center (first two vars of the arc).
-        sys.soft_target(int(hidx[0]), tx, weight=0.01)
-        sys.soft_target(int(hidx[1]), ty, weight=0.01)
-    else:
-        # Fallback: soft-target first two vars
+    # Soft-target each resolvable handle's first two (x, y) variables. Derived
+    # handles (arc start/end) expose extra vars (cx, cy, r, a); soft-targeting
+    # their leading center vars translates the curve, which is the desired drag.
+    any_target = False
+    for h, (tx, ty) in target_pairs:
+        try:
+            hidx, _hvf, _hjf = _resolve_handle(h, entities, var_map)
+        except (KeyError, ValueError):
+            continue
+        if len(hidx) == 0:
+            continue   # zero-var virtual handle (origin) — nothing to drag
         sys.soft_target(int(hidx[0]), tx, weight=0.01)
         if len(hidx) > 1:
             sys.soft_target(int(hidx[1]), ty, weight=0.01)
+        any_target = True
+
+    if not any_target:
+        # Nothing resolvable — return last known coords unchanged.
+        entity_coords = _extract_entities(state.x, entities_list, var_map)
+        return {"entities": entity_coords, "statuses": {}}
 
     # Use warm start from state if topology matches
     x0 = state.x if state.n_vars == sys.n_vars else None

@@ -30,10 +30,16 @@ from . import dress as _dress  # noqa: F401
 from . import sketch as _sketch  # noqa: F401
 from . import extrude as _extrude  # noqa: F401
 from . import revolve as _revolve  # noqa: F401
+# Sketched-feature sweep + loft (profile region(s) along a path / blended through sections):
+from . import sweep as _sweep  # noqa: F401
+from . import loft as _loft  # noqa: F401
 # C21 registrations (import):
 from . import import_feature as _import_feature  # noqa: F401
 # C33-A registrations (hole wizard, multi-position):
 from . import hole as _hole  # noqa: F401
+# Patterns + mirror (replicate upstream seed features) and draft (taper faces):
+from . import pattern as _pattern  # noqa: F401
+from . import draft as _draft  # noqa: F401
 
 __all__ = [
     "CompileContext",

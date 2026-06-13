@@ -84,8 +84,10 @@ CONSTRAINT_SPECS: dict[str, tuple[int, int, bool]] = {
     "parallel": (2, 2, False),
     "perpendicular": (2, 2, False),
     "tangent": (2, 2, False),
+    "collinear": (2, 2, False),
     "equal": (2, 2, False),
     "concentric": (2, 2, False),
+    "coradial": (2, 2, False),
     "midpoint": (2, 2, False),
     "symmetric": (3, 3, False),
     "fix": (1, 1, False),
@@ -135,7 +137,7 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
     "chamfer": {"params": ["length"], "refs": {"edges": (_SEL_LIST, True)}},
     "shell": {"params": ["thickness"], "refs": {"remove": (_SEL_LIST, False)}},
     "draft": {"params": ["angle"], "refs": {"neutral": (_SEL_OR_DATUM, True),
-                                            "pull": (_SEL_OR_DATUM, True),
+                                            "pull": (_SEL_OR_DATUM, False),
                                             "faces": (_SEL_LIST, True)}},
     "hole": {"params": ["style", "end"], "refs": {"face": (_SEL_OR_DATUM, False),
                                                   "positions": (_SEL_LIST, False),
@@ -219,12 +221,19 @@ def validate_selector(sel: Any, where: str) -> list[str]:
             errs.append(f"{where}.feature: datum selector needs a feature id or reserved datum")
         return errs
     if kind == "region":
+        # Three valid forms (any may carry the sketch feature id):
+        #   whole sketch  -> {sketch}                (no index/centroid; all material regions)
+        #   indexed pick  -> {sketch, index}         (stable region ordinal from the UI)
+        #   legacy match  -> {sketch, centroid, hint_index}
         if not isinstance(sel.get("sketch"), str):
             errs.append(f"{where}.sketch: region selector needs a sketch feature id")
-        if not _is_vec(sel.get("centroid"), 2):
-            errs.append(f"{where}.centroid: region centroid must be [u,v]")
-        if not _is_num(sel.get("hint_index")):
-            errs.append(f"{where}.hint_index: required for regions")
+        if sel.get("index") is not None and not _is_num(sel.get("index")):
+            errs.append(f"{where}.index: region index must be a number")
+        if sel.get("centroid") is not None:
+            if not _is_vec(sel.get("centroid"), 2):
+                errs.append(f"{where}.centroid: region centroid must be [u,v]")
+            if not _is_num(sel.get("hint_index")):
+                errs.append(f"{where}.hint_index: required when a centroid is given")
         return errs
     if kind == "body":
         if not isinstance(sel.get("owner_feature"), str):
@@ -357,6 +366,20 @@ def validate_constraint(
             ent = entities_by_id.get(base) if base else None
             if "." in (h or "") or (ent is not None and ent.get("type") != "line"):
                 errs.append(f"{where}.refs[{i}]: angle takes two line entity ids")
+    # collinear: two whole LINE entities lying on the same infinite line.
+    if ctype == "collinear":
+        for i, h in enumerate(refs[:2]):
+            base = h.split(".")[0] if isinstance(h, str) else None
+            ent = entities_by_id.get(base) if base else None
+            if "." in (h or "") or (ent is not None and ent.get("type") != "line"):
+                errs.append(f"{where}.refs[{i}]: collinear takes two line entity ids")
+    # coradial: two whole arc/circle entities (same center AND same radius).
+    if ctype == "coradial":
+        for i, h in enumerate(refs[:2]):
+            base = h.split(".")[0] if isinstance(h, str) else None
+            ent = entities_by_id.get(base) if base else None
+            if "." in (h or "") or (ent is not None and ent.get("type") not in ("circle", "arc")):
+                errs.append(f"{where}.refs[{i}]: coradial takes two arc/circle entity ids")
     # C50: distance arc-conditions — optional "cond", a 2-list aligned with refs,
     # each "center"|"min"|"max" (honored only for bare circle/arc refs; see solver).
     if ctype == "distance" and c.get("cond") is not None:

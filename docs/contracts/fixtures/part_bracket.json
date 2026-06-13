@@ -2,14 +2,30 @@
   "schema": "aicad.part/1",
   "id": "b7e2c1f0-5a3d-4e8b-9c6f-1d2e3a4b5c6d",
   "name": "bracket",
-  "units": {"system": "MMGS"},
-  "material": {"key": "alu_6061"},
+  "units": {
+    "system": "MMGS"
+  },
+  "material": {
+    "key": "alu_6061"
+  },
   "equations": {
     "globals": [
-      {"name": "W", "expr": "80"},
-      {"name": "H", "expr": "50"},
-      {"name": "thickness", "expr": "6"},
-      {"name": "hole_d", "expr": "5"}
+      {
+        "name": "W",
+        "expr": "80"
+      },
+      {
+        "name": "H",
+        "expr": "50"
+      },
+      {
+        "name": "thickness",
+        "expr": "6"
+      },
+      {
+        "name": "hole_d",
+        "expr": "5"
+      }
     ]
   },
   "features": [
@@ -20,26 +36,158 @@
       "suppressed": false,
       "params": {
         "entities": [
-          {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [80.0, 0.0]},
-          {"id": "e2", "type": "line", "construction": false, "p1": [80.0, 0.0], "p2": [80.0, 50.0]},
-          {"id": "e3", "type": "line", "construction": false, "p1": [80.0, 50.0], "p2": [0.0, 50.0]},
-          {"id": "e4", "type": "line", "construction": false, "p1": [0.0, 50.0], "p2": [0.0, 0.0]}
+          {
+            "id": "e1",
+            "type": "line",
+            "construction": false,
+            "p1": [
+              0.0,
+              0.0
+            ],
+            "p2": [
+              80.0,
+              0.0
+            ]
+          },
+          {
+            "id": "e2",
+            "type": "line",
+            "construction": false,
+            "p1": [
+              80.0,
+              0.0
+            ],
+            "p2": [
+              80.0,
+              50.0
+            ]
+          },
+          {
+            "id": "e3",
+            "type": "line",
+            "construction": false,
+            "p1": [
+              80.0,
+              50.0
+            ],
+            "p2": [
+              0.0,
+              50.0
+            ]
+          },
+          {
+            "id": "e4",
+            "type": "line",
+            "construction": false,
+            "p1": [
+              0.0,
+              50.0
+            ],
+            "p2": [
+              0.0,
+              0.0
+            ]
+          }
         ],
         "constraints": [
-          {"id": "c1", "type": "coincident", "refs": ["e1.p2", "e2.p1"]},
-          {"id": "c2", "type": "coincident", "refs": ["e2.p2", "e3.p1"]},
-          {"id": "c3", "type": "coincident", "refs": ["e3.p2", "e4.p1"]},
-          {"id": "c4", "type": "coincident", "refs": ["e4.p2", "e1.p1"]},
-          {"id": "c5", "type": "horizontal", "refs": ["e1"]},
-          {"id": "c6", "type": "horizontal", "refs": ["e3"]},
-          {"id": "c7", "type": "vertical", "refs": ["e2"]},
-          {"id": "c8", "type": "vertical", "refs": ["e4"]},
-          {"id": "c9", "type": "fix", "refs": ["e1.p1"]},
-          {"id": "c10", "type": "distance", "refs": ["e1.p1", "e1.p2"], "value": {"value": 80.0, "expr": "W"}, "driven": false},
-          {"id": "c11", "type": "distance", "refs": ["e2.p1", "e2.p2"], "value": {"value": 50.0, "expr": "H"}, "driven": false}
+          {
+            "id": "c1",
+            "type": "coincident",
+            "refs": [
+              "e1.p2",
+              "e2.p1"
+            ]
+          },
+          {
+            "id": "c2",
+            "type": "coincident",
+            "refs": [
+              "e2.p2",
+              "e3.p1"
+            ]
+          },
+          {
+            "id": "c3",
+            "type": "coincident",
+            "refs": [
+              "e3.p2",
+              "e4.p1"
+            ]
+          },
+          {
+            "id": "c4",
+            "type": "coincident",
+            "refs": [
+              "e4.p2",
+              "e1.p1"
+            ]
+          },
+          {
+            "id": "c5",
+            "type": "horizontal",
+            "refs": [
+              "e1"
+            ]
+          },
+          {
+            "id": "c6",
+            "type": "horizontal",
+            "refs": [
+              "e3"
+            ]
+          },
+          {
+            "id": "c7",
+            "type": "vertical",
+            "refs": [
+              "e2"
+            ]
+          },
+          {
+            "id": "c8",
+            "type": "vertical",
+            "refs": [
+              "e4"
+            ]
+          },
+          {
+            "id": "c9",
+            "type": "fix",
+            "refs": [
+              "e1.p1"
+            ]
+          },
+          {
+            "id": "c10",
+            "type": "distance",
+            "refs": [
+              "e1.p1",
+              "e1.p2"
+            ],
+            "value": {
+              "value": 80.0,
+              "expr": "W"
+            },
+            "driven": false
+          },
+          {
+            "id": "c11",
+            "type": "distance",
+            "refs": [
+              "e2.p1",
+              "e2.p2"
+            ],
+            "value": {
+              "value": 50.0,
+              "expr": "H"
+            },
+            "driven": false
+          }
         ]
       },
-      "refs": {"plane": "plane.top"}
+      "refs": {
+        "plane": "plane.top"
+      }
     },
     {
       "id": "f2",
@@ -49,15 +197,30 @@
       "params": {
         "mode": "boss",
         "end": "blind",
-        "depth": {"value": 6.0, "expr": "thickness"},
+        "depth": {
+          "value": 6.0,
+          "expr": "thickness"
+        },
         "flip": false,
-        "draft": {"value": 0.0, "expr": null},
+        "draft": {
+          "value": 0.0,
+          "expr": null
+        },
         "draft_outward": false,
         "merge": true
       },
       "refs": {
         "profile": [
-          {"kind": "region", "sketch": "f1", "centroid": [40.0, 25.0], "area_or_len": 4000.0, "hint_index": 0}
+          {
+            "kind": "region",
+            "sketch": "f1",
+            "centroid": [
+              40.0,
+              25.0
+            ],
+            "area_or_len": 4000.0,
+            "hint_index": 0
+          }
         ]
       }
     },
@@ -68,15 +231,57 @@
       "suppressed": false,
       "params": {
         "entities": [
-          {"id": "e1", "type": "circle", "construction": false, "center": [15.0, 15.0], "radius": 2.5}
+          {
+            "id": "e1",
+            "type": "circle",
+            "construction": false,
+            "center": [
+              15.0,
+              15.0
+            ],
+            "radius": 2.5
+          }
         ],
         "constraints": [
-          {"id": "c1", "type": "diameter", "refs": ["e1"], "value": {"value": 5.0, "expr": "hole_d"}, "driven": false},
-          {"id": "c2", "type": "fix", "refs": ["e1.center"]}
+          {
+            "id": "c1",
+            "type": "diameter",
+            "refs": [
+              "e1"
+            ],
+            "value": {
+              "value": 5.0,
+              "expr": "hole_d"
+            },
+            "driven": false
+          },
+          {
+            "id": "c2",
+            "type": "fix",
+            "refs": [
+              "e1.center"
+            ]
+          }
         ]
       },
       "refs": {
-        "plane": {"kind": "face", "surf": "plane", "centroid": [40.0, 25.0, 6.0], "axis": [0.0, 0.0, 1.0], "area_or_len": 4000.0, "owner_feature": "f2", "hint_index": 0}
+        "plane": {
+          "kind": "face",
+          "surf": "plane",
+          "centroid": [
+            40.0,
+            25.0,
+            6.0
+          ],
+          "axis": [
+            0.0,
+            0.0,
+            1.0
+          ],
+          "area_or_len": 4000.0,
+          "owner_feature": "f2",
+          "hint_index": 0
+        }
       }
     },
     {
@@ -87,15 +292,30 @@
       "params": {
         "mode": "cut",
         "end": "through_all",
-        "depth": {"value": 10.0, "expr": null},
+        "depth": {
+          "value": 10.0,
+          "expr": null
+        },
         "flip": true,
-        "draft": {"value": 0.0, "expr": null},
+        "draft": {
+          "value": 0.0,
+          "expr": null
+        },
         "draft_outward": false,
         "merge": true
       },
       "refs": {
         "profile": [
-          {"kind": "region", "sketch": "f3", "centroid": [15.0, 15.0], "area_or_len": 19.634954084936208, "hint_index": 0}
+          {
+            "kind": "region",
+            "sketch": "f3",
+            "centroid": [
+              15.0,
+              15.0
+            ],
+            "area_or_len": 19.634954084936208,
+            "hint_index": 0
+          }
         ]
       }
     },
@@ -104,11 +324,48 @@
       "type": "fillet",
       "name": "Fillet1",
       "suppressed": false,
-      "params": {"radius": {"value": 8.0, "expr": null}},
+      "params": {
+        "radius": {
+          "value": 8.0,
+          "expr": null
+        }
+      },
       "refs": {
         "edges": [
-          {"kind": "edge", "surf": "line", "centroid": [0.0, 0.0, 3.0], "axis": [0.0, 0.0, 1.0], "area_or_len": 6.0, "owner_feature": "f2", "hint_index": 0},
-          {"kind": "edge", "surf": "line", "centroid": [80.0, 0.0, 3.0], "axis": [0.0, 0.0, 1.0], "area_or_len": 6.0, "owner_feature": "f2", "hint_index": 1}
+          {
+            "kind": "edge",
+            "surf": "line",
+            "centroid": [
+              0.0,
+              0.0,
+              3.0
+            ],
+            "axis": [
+              0.0,
+              0.0,
+              1.0
+            ],
+            "area_or_len": 6.0,
+            "owner_feature": "f2",
+            "hint_index": 0
+          },
+          {
+            "kind": "edge",
+            "surf": "line",
+            "centroid": [
+              80.0,
+              0.0,
+              3.0
+            ],
+            "axis": [
+              0.0,
+              0.0,
+              1.0
+            ],
+            "area_or_len": 6.0,
+            "owner_feature": "f2",
+            "hint_index": 1
+          }
         ]
       }
     },
@@ -119,16 +376,24 @@
       "suppressed": false,
       "params": {
         "count1": 2,
-        "spacing1": {"value": 50.0, "expr": null},
+        "spacing1": {
+          "value": 50.0,
+          "expr": null
+        },
         "count2": 2,
-        "spacing2": {"value": 20.0, "expr": null},
+        "spacing2": {
+          "value": 20.0,
+          "expr": null
+        },
         "reverse1": false,
         "reverse2": false
       },
       "refs": {
-        "dir1": {"kind": "edge", "surf": "line", "centroid": [40.0, 0.0, 6.0], "axis": [1.0, 0.0, 0.0], "area_or_len": 80.0, "owner_feature": "f2", "hint_index": 2},
-        "dir2": {"kind": "edge", "surf": "line", "centroid": [0.0, 25.0, 6.0], "axis": [0.0, 1.0, 0.0], "area_or_len": 50.0, "owner_feature": "f2", "hint_index": 3},
-        "features": ["f4"]
+        "dir1": "axis.x",
+        "dir2": "axis.y",
+        "features": [
+          "f4"
+        ]
       }
     }
   ]

@@ -146,14 +146,19 @@ def _body_extent_along(body, direction: Vector) -> float:
         return 100.0
 
 
-def _resolve_profile_selector(
+def _resolve_profile_faces(
     sel: dict[str, Any], ctx: CompileContext
-) -> Face:
-    """Resolve a single profile selector to a build123d Face.
+) -> list[Face]:
+    """Resolve a single profile selector to one or more build123d Faces.
 
-    Handles:
-    - ``{"kind":"region","sketch":fid,...}`` → ctx._sketch_regions
-    - ``{"kind":"face",...}`` → resolved via describe_faces
+    Region selectors (``{"kind":"region","sketch":fid,...}``) resolve three ways:
+    - **whole sketch** (no ``index``/``centroid``) → ALL *material* (even-depth) regions of the
+      sketch, so a circle-in-a-square extrudes as a washer. This is the UI default and avoids the
+      fragile centroid match that produced spurious "dangling reference" errors.
+    - **indexed** (``index`` present) → that one region (the host emits a stable index per pick).
+    - **centroid** (legacy) → nearest region via ``resolve_region``.
+
+    Face selectors (``{"kind":"face",...}``) resolve via describe_faces against the running body.
     """
     kind = sel.get("kind")
 
@@ -173,27 +178,41 @@ def _resolve_profile_selector(
             raise FeatureError(
                 f"extrude profile: sketch '{sketch_id}' produced no closed-loop regions"
             )
-        # Compute sketch bbox diag from the face bounding boxes
-        try:
-            coords = []
-            for f in faces:
-                bb = f.bounding_box()
-                coords.extend([bb.min.X, bb.min.Y, bb.max.X, bb.max.Y])
-            if coords:
-                span = max(coords) - min(coords)
-                sketch_diag = max(span * math.sqrt(2), 1e-3)
-            else:
-                sketch_diag = 100.0
-        except Exception:  # noqa: BLE001
-            sketch_diag = 100.0
 
-        rr = resolve_region(sel, descs, sketch_diag)
-        if rr.index is None:
-            raise FeatureError(
-                f"extrude profile: region selector dangling — {rr.dangling_reason}",
-                dangling_refs=[f"profile[?]: {rr.dangling_reason}"],
-            )
-        return faces[rr.index]
+        # Explicit, stable index from a UI pick.
+        idx_val = sel.get("index")
+        if isinstance(idx_val, (int, float)) and not isinstance(idx_val, bool):
+            idx = int(idx_val)
+            if idx < 0 or idx >= len(faces):
+                raise FeatureError(
+                    f"extrude profile: region index {idx} out of range (0..{len(faces) - 1})",
+                    dangling_refs=[f"region index {idx} out of range (sketch has {len(faces)})"],
+                )
+            return [faces[idx]]
+
+        # Legacy centroid resolution.
+        if sel.get("centroid") is not None:
+            try:
+                coords = []
+                for f in faces:
+                    bb = f.bounding_box()
+                    coords.extend([bb.min.X, bb.min.Y, bb.max.X, bb.max.Y])
+                span = (max(coords) - min(coords)) if coords else 100.0
+                sketch_diag = max(span * math.sqrt(2), 1e-3)
+            except Exception:  # noqa: BLE001
+                sketch_diag = 100.0
+            rr = resolve_region(sel, descs, sketch_diag)
+            if rr.index is None:
+                raise FeatureError(
+                    f"extrude profile: region selector dangling — {rr.dangling_reason}",
+                    dangling_refs=[f"profile[?]: {rr.dangling_reason}"],
+                )
+            return [faces[rr.index]]
+
+        # Whole sketch → all material (even-depth) regions; fall back to every region if the
+        # nesting metadata is absent (older stored sketches).
+        material = [f for f, d in zip(faces, descs) if d.get("is_material", True)]
+        return material if material else list(faces)
 
     if kind == "face":
         bodies = ctx.bodies
@@ -208,11 +227,16 @@ def _resolve_profile_selector(
                 f"extrude profile: face selector dangling — {rr.dangling_reason}",
                 dangling_refs=[f"profile[?]: {rr.dangling_reason}"],
             )
-        return body.faces()[rr.index]
+        return [body.faces()[rr.index]]
 
     raise FeatureError(
         f"extrude profile: unsupported selector kind '{kind}' (expected 'region' or 'face')"
     )
+
+
+def _resolve_profile_selector(sel: dict[str, Any], ctx: CompileContext) -> Face:
+    """Back-compat single-face shim (returns the first resolved face)."""
+    return _resolve_profile_faces(sel, ctx)[0]
 
 
 def _to_solid_normalized(shape) -> Any:
@@ -338,8 +362,7 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
     dangling: list[str] = []
     for i, sel in enumerate(profile_sels):
         try:
-            f = _resolve_profile_selector(sel, ctx)
-            profile_faces.append(f)
+            profile_faces.extend(_resolve_profile_faces(sel, ctx))
         except FeatureError as exc:
             if exc.dangling_refs:
                 dangling.extend([f"profile[{i}]: " + dr for dr in exc.dangling_refs])
@@ -459,7 +482,7 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
             raise FeatureError("extrude: cut mode requires an existing body to subtract from")
         bodies.append(tool_solid)
         _store_topo_owners(ctx, fid, tool_solid, None)
-        return CompileOutput(bodies=bodies, tool_body=tool_solid, resolved=resolved)
+        return CompileOutput(bodies=bodies, tool_body=tool_solid, op="add", resolved=resolved)
 
     target = bodies[-1]
     try:
@@ -487,4 +510,5 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
     bodies[-1] = result
     # Both-direction / single-direction share this one owner-store on the final result.
     _store_topo_owners(ctx, fid, result, target)
-    return CompileOutput(bodies=bodies, tool_body=tool_solid, resolved=resolved)
+    return CompileOutput(bodies=bodies, tool_body=tool_solid,
+                         op=("cut" if mode == "cut" else "add"), resolved=resolved)

@@ -279,10 +279,22 @@ def _sketch_solve(params: dict, _emit: EmitFn) -> dict:
     return docsess.sketch_solve(s, params["sketch"])
 
 
+def _sketch_probe(params: dict, _emit: EmitFn) -> dict:
+    # C50f over-define pre-flight: dry-run an add_constraint/set_dim/delete_constraint on a deep copy
+    # of the active sketch and report would_over_define. READ-ONLY — never mutates the doc, the
+    # session sketch state, the undo stack, or the warm-start state.
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.sketch_probe(s, params["sketch"], params.get("action", {}))
+
+
 def _sketch_drag(params: dict, _emit: EmitFn) -> dict:
     from engine.doc import session as docsess
     s = docsess.get_session(params["doc_id"])
-    return docsess.sketch_drag(s, params["sketch"], params["handle"], params["xy"])
+    # `targets` (multi-point profile / group drag) is optional; single-point drags still pass
+    # handle + xy. Either path is honored by session.sketch_drag.
+    return docsess.sketch_drag(s, params["sketch"], params.get("handle"),
+                               params.get("xy"), params.get("targets"))
 
 
 def _sketch_drag_commit(params: dict, emit: EmitFn) -> dict:
@@ -303,6 +315,14 @@ def _doc_sketch_overview(params: dict, _emit: EmitFn) -> dict:
     from engine.doc import session as docsess
     s = docsess.get_session(params["doc_id"])
     return docsess.sketch_overview(s, params["sketch"])
+
+
+def _doc_sketch_regions(params: dict, _emit: EmitFn) -> dict:
+    # C51: read-only even-odd region enumeration for the feature-PM viewport overlay
+    # (hover-highlight + click-to-toggle profile picking). Never mutates the doc.
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.sketch_regions(s, params["sketch"])
 
 
 def _sketch_project_ref(params: dict, _emit: EmitFn) -> dict:
@@ -642,10 +662,12 @@ _METHODS = {
     # Sketch mode (C18)
     "sketch_enter": _sketch_enter,
     "sketch_solve": _sketch_solve,
+    "sketch_probe": _sketch_probe,  # C50f over-define pre-flight (read-only)
     "sketch_drag": _sketch_drag,
     "sketch_drag_commit": _sketch_drag_commit,
     "sketch_exit": _sketch_exit,
     "doc_sketch_overview": _doc_sketch_overview,  # C40 ghost rendering
+    "doc_sketch_regions": _doc_sketch_regions,  # C51 feature-PM region overlay (read-only)
     "sketch_project_ref": _sketch_project_ref,  # C50 project-into-sketch (read-only)
     # Evaluate (C12)
     "eval_mass": _eval_mass,
@@ -682,8 +704,10 @@ _STRUCTURED_ERROR_METHODS = {
     "doc_undo", "doc_redo", "doc_tree", "doc_rebuild", "doc_resolve_pick",
     "doc_checkpoint", "doc_revert",
     "doc_solve_mates", "doc_set_explode_state",  # C20
-    "sketch_enter", "sketch_solve", "sketch_drag", "sketch_drag_commit", "sketch_exit",
+    "sketch_enter", "sketch_solve", "sketch_probe", "sketch_drag", "sketch_drag_commit",
+    "sketch_exit",
     "doc_sketch_overview",  # C40
+    "doc_sketch_regions",  # C51
     "sketch_project_ref",  # C50
     "eval_mass", "eval_measure", "eval_section_props", "eval_interference", "eval_check",
     "eval_symmetry", "eval_draft", "eval_thickness", "eval_curvature",

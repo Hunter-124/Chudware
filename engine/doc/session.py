@@ -943,8 +943,11 @@ def _plane_frame(plane) -> list:
     return [v for row in rows for v in row]
 
 
-def _overall_status(statuses: dict, dof: int, conflicting: list) -> str:
-    if conflicting or any(s == "over" for s in statuses.values()):
+def _overall_status(statuses: dict, dof: int, conflicting: list,
+                    redundant: list | None = None) -> str:
+    # SolidWorks parity: a redundant DRIVING dim makes the sketch Over Defined even when the
+    # values are consistent (driven dims never reach the solver, so they can't appear here).
+    if conflicting or redundant or any(s == "over" for s in statuses.values()):
         return "over"
     if dof <= 0:
         return "full"
@@ -992,15 +995,48 @@ def _sketch_constraints(sketch_feat: dict, entity_coords: dict) -> list[dict]:
     return out
 
 
+def _doc_entity_coords(params: dict) -> dict:
+    """Freeze map: entity id -> its CURRENT stored coords (same key shape solve_sketch returns).
+
+    Used by the conflict-safe path (C50f) — when a solve is rejected (contradictory/non-convergent)
+    we ship the document's last-valid geometry instead of the solver's least-squares compromise, so
+    the sketch never visually explodes. Strips non-coord bookkeeping keys (id/construction)."""
+    out: dict = {}
+    for e in params.get("entities", []) or []:
+        if not isinstance(e, dict) or "id" not in e:
+            continue
+        rec = {k: v for k, v in e.items() if k not in ("id", "construction")}
+        out[e["id"]] = rec
+    return out
+
+
 def _solve_active(session: DocSession, sketch_feat: dict, warm) -> dict:
-    """Solve the active sketch and pack the sketch_enter/solve result dict (minus plane_frame)."""
+    """Solve the active sketch and pack the sketch_enter/solve result dict (minus plane_frame).
+
+    C50f conflict-safe solving: if the solve is REJECTED (``conflicting`` non-empty OR not
+    converged) the geometry is frozen at the document's current (pre-solve) coords rather than
+    persisting/returning the solver's least-squares compromise. Consistent over-definition
+    (``redundant`` non-empty, ``conflicting`` empty, converged) still solves and persists as before.
+    The packed dict carries ``rejected`` so callers can skip persistence, drop warm state, and set
+    the ``solve_rejected`` response flag."""
     from engine.doc.sketch_solver import solve_sketch
     env = _equations_env(session)
     params = sketch_feat.get("params", {}) or {}
     sol = solve_sketch(params, env, warm=warm)
-    # entities list: solved coords carrying ids (host renders these directly)
+    # Reject (freeze geometry) when the constraints are CONTRADICTORY: the solver tagged specific
+    # conflicting constraints, OR the solve failed to converge at all. A non-converged solve NEVER
+    # ships its coordinates — they are a least-squares compromise, not a solution. (An earlier
+    # revision exempted non-convergence when dof > 0, assuming contradictions read dof <= 0; both
+    # halves of that were wrong: QR counts a contradiction's rank deficiency as slack, so
+    # contradictory chains report POSITIVE dof, and the "healthy sketches sometimes don't
+    # converge" fear traced back to the sign-flipped point-line Jacobian, fixed in C50g —
+    # see scratch/probe_converged_audit.py.)
+    rejected = bool(sol.conflicting) or not sol.converged
+    # On rejection freeze geometry at the last-valid doc coords; otherwise use the solver output.
+    coord_map = _doc_entity_coords(params) if rejected else dict(sol.entities)
+    # entities list: coords carrying ids (host renders these directly)
     entities = []
-    for eid, coords in sol.entities.items():
+    for eid, coords in coord_map.items():
         rec = dict(coords)
         rec["id"] = eid
         # carry construction flag through for host rendering
@@ -1010,13 +1046,16 @@ def _solve_active(session: DocSession, sketch_feat: dict, warm) -> dict:
                 break
         entities.append(rec)
     return {
-        "_state": sol.state,
+        # On rejection clear warm state (None) — the undo-determinism precedent (C50) prefers a cold
+        # re-solve over warm-starting from a failed/compromise configuration.
+        "_state": None if rejected else sol.state,
         "entities": entities,
-        "entity_map": dict(sol.entities),
+        "entity_map": coord_map,
         "statuses": dict(sol.statuses),
         "dof": int(sol.dof),
         "conflicting": list(sol.conflicting),
         "redundant": list(sol.redundant),
+        "rejected": rejected,
     }
 
 
@@ -1032,7 +1071,8 @@ def sketch_enter(session: DocSession, sketch_fid: str) -> dict:
     st.solve_state = packed["_state"]
     st.last_entities = packed["entity_map"]
     st.last_statuses = packed["statuses"]
-    st.last_overall_status = _overall_status(packed["statuses"], packed["dof"], packed["conflicting"])
+    st.last_overall_status = _overall_status(packed["statuses"], packed["dof"],
+                                             packed["conflicting"], packed["redundant"])
     st.plane_frame = frame
     session.active_sketch = st
 
@@ -1044,6 +1084,7 @@ def sketch_enter(session: DocSession, sketch_fid: str) -> dict:
         "status": st.last_overall_status,
         "conflicting": packed["conflicting"],
         "redundant": packed["redundant"],
+        "solve_rejected": packed["rejected"],
         "constraints": _sketch_constraints(feat, packed["entity_map"]),
     }
 
@@ -1061,7 +1102,177 @@ def sketch_overview(session: DocSession, sketch_fid: str) -> dict:
         "statuses": packed["statuses"],
         "dof": packed["dof"],
         "plane_frame": _plane_frame(plane),
-        "status": _overall_status(packed["statuses"], packed["dof"], packed["conflicting"]),
+        "status": _overall_status(packed["statuses"], packed["dof"],
+                                  packed["conflicting"], packed["redundant"]),
+    }
+
+
+def sketch_regions(session: DocSession, sketch_fid: str) -> dict:
+    """Read-only enumeration of a sketch's closed-loop regions for the feature-PM viewport overlay.
+
+    Returns ``{plane_frame, bbox_diag, regions:[{index, centroid:[u,v], area, depth, is_material,
+    outer:[[u,v]...], holes:[[[u,v]...]...]}]}`` — the same even-odd regions extrude/revolve see,
+    so a viewport pick's ``index`` maps 1:1 to the profile the compiler resolves. ``outer``/``holes``
+    are sketch-local 2-D polylines; the host lifts them with ``plane_frame``. Never mutates the doc
+    or touches ``session.active_sketch`` (safe alongside an open PM)."""
+    import math
+    from engine.doc.features.sketch import (
+        _entity_to_edges, compute_regions, region_triangles_2d,
+    )
+
+    feat = _find_sketch_feature(session, sketch_fid)
+    result = _ensure_built(session)
+    plane = _resolve_sketch_plane(session, feat, result)
+
+    entities = (feat.get("params", {}) or {}).get("entities", []) or []
+    all_edges: list = []
+    for ent in entities:
+        if not isinstance(ent, dict) or ent.get("construction", False):
+            continue
+        try:
+            all_edges.extend(_entity_to_edges(ent))
+        except Exception:  # noqa: BLE001
+            continue
+
+    faces, descs = compute_regions(all_edges, plane)
+
+    coords: list[float] = []
+    for d in descs:
+        for pt in d.get("outer", []):
+            coords.extend((pt[0], pt[1]))
+    span = (max(coords) - min(coords)) if coords else 100.0
+    diag = max(span * math.sqrt(2), 1e-3)
+
+    regions = [{
+        "index": d["index"],
+        "centroid": d["centroid"],
+        "area": d.get("area_or_len", 0.0),
+        "depth": d.get("depth", 0),
+        "is_material": bool(d.get("is_material", True)),
+        "outer": d.get("outer", []),
+        "holes": d.get("holes", []),
+        "tris": region_triangles_2d(f, plane),
+    } for d, f in zip(descs, faces)]
+
+    return {
+        "plane_frame": _plane_frame(plane),
+        "bbox_diag": diag,
+        "regions": regions,
+    }
+
+
+# Dimensional constraint types — adding one of these consumes a DOF, so dof_after >= dof_before
+# means the new dimension was absorbed by an already-determined system (i.e. it over-defines).
+_PROBE_DIM_TYPES = frozenset({"distance", "angle", "radius", "diameter", "length"})
+_PROBE_CID = "__probe__"
+
+
+def sketch_probe(session: DocSession, sketch_fid: str, action: dict) -> dict:
+    """C50f over-define PRE-FLIGHT probe. Apply ``action`` to a DEEP COPY of the active sketch's
+    params, cold-solve the copy, and report whether the action would over-define — WITHOUT touching
+    the document, session sketch state, undo stack, or warm-start state.
+
+    ``action`` is exactly one of:
+      ``{"add_constraint": {<constraint json>}}`` — the probe constraint is tagged id ``__probe__``
+        so it can be spotted in the conflicting/redundant lists.
+      ``{"set_dim": {"id": <cid>, "value": <num>, "expr"?: str, "driven"?: bool}}``
+      ``{"delete_constraint": {"id": <cid>}}``
+
+    Returns ``{ok, status, dof_before, dof_after, converged, conflicting, redundant,
+    would_over_define}``. On an unmatched sketch or malformed action: ``{ok: False, error}``.
+    """
+    import copy as _copy
+    from engine.doc.sketch_solver import solve_sketch
+
+    # The probe operates on the active sketch session (same context sketch_solve uses).
+    try:
+        feat = _find_sketch_feature(session, sketch_fid)
+    except OpError:
+        return {"ok": False, "error": f"no sketch feature '{sketch_fid}'"}
+    st = session.active_sketch
+    if st is None or st.sketch_fid != sketch_fid:
+        return {"ok": False, "error": f"sketch '{sketch_fid}' is not the active sketch"}
+
+    if not isinstance(action, dict) or len(action) != 1:
+        return {"ok": False, "error": "action must be exactly one of "
+                "add_constraint / set_dim / delete_constraint"}
+
+    env = _equations_env(session)
+    base_params = feat.get("params", {}) or {}
+
+    # COLD baseline solve of the unmodified copy (no warm state) for dof_before.
+    before = solve_sketch(_copy.deepcopy(base_params), env, warm=None)
+    dof_before = int(before.dof)
+
+    # Deep-copy and mutate the COPY only.
+    params = _copy.deepcopy(base_params)
+    params.setdefault("entities", [])
+    cons = params.setdefault("constraints", [])
+
+    probe_is_dim = False
+    if "add_constraint" in action:
+        con = action["add_constraint"]
+        if not isinstance(con, dict):
+            return {"ok": False, "error": "add_constraint requires a constraint object"}
+        c = _copy.deepcopy(con)
+        c["id"] = _PROBE_CID
+        cons.append(c)
+        probe_is_dim = c.get("type") in _PROBE_DIM_TYPES
+    elif "set_dim" in action:
+        sd = action["set_dim"]
+        if not isinstance(sd, dict) or "id" not in sd:
+            return {"ok": False, "error": "set_dim requires an 'id'"}
+        cid = sd["id"]
+        target = next((c for c in cons if c.get("id") == cid), None)
+        if target is None:
+            return {"ok": False, "error": f"set_dim: constraint '{cid}' not found"}
+        # Mirror ops._op_sketch_set_dim's value/expr/driven handling on the copy.
+        if sd.get("expr") is not None:
+            cur = target.get("value") if isinstance(target.get("value"), dict) else {"value": 0.0}
+            target["value"] = {"value": cur.get("value", 0.0), "expr": sd["expr"]}
+        elif sd.get("value") is not None:
+            target["value"] = {"value": float(sd["value"]), "expr": None}
+        if sd.get("driven") is not None:
+            target["driven"] = bool(sd["driven"])
+    elif "delete_constraint" in action:
+        dc = action["delete_constraint"]
+        if not isinstance(dc, dict) or "id" not in dc:
+            return {"ok": False, "error": "delete_constraint requires an 'id'"}
+        cid = dc["id"]
+        if not any(c.get("id") == cid for c in cons):
+            return {"ok": False, "error": f"delete_constraint: '{cid}' not found"}
+        params["constraints"] = [c for c in cons if c.get("id") != cid]
+    else:
+        return {"ok": False, "error": "unknown action; expected add_constraint / "
+                "set_dim / delete_constraint"}
+
+    after = solve_sketch(params, env, warm=None)
+    dof_after = int(after.dof)
+    conflicting = list(after.conflicting)
+    redundant = list(after.redundant)
+
+    # would_over_define: the probed constraint is flagged conflicting/redundant, OR adding a
+    # dimensional constraint failed to reduce the DOF (absorbed by an already-determined system),
+    # OR the system no longer converges (contradictory value — note contradictions can read
+    # POSITIVE dof: QR counts their rank deficiency as slack, so don't gate on dof here; same
+    # rule as the _solve_active rejection test).
+    would = (
+        _PROBE_CID in conflicting
+        or _PROBE_CID in redundant
+        or (probe_is_dim and dof_after >= dof_before)
+        or not after.converged
+        or bool(conflicting)
+    )
+
+    return {
+        "ok": True,
+        "status": _overall_status(dict(after.statuses), dof_after, conflicting, redundant),
+        "dof_before": dof_before,
+        "dof_after": dof_after,
+        "converged": bool(after.converged),
+        "conflicting": conflicting,
+        "redundant": redundant,
+        "would_over_define": bool(would),
     }
 
 
@@ -1079,7 +1290,8 @@ def sketch_solve(session: DocSession, sketch_fid: str) -> dict:
     st.solve_state = packed["_state"]
     st.last_entities = packed["entity_map"]
     st.last_statuses = packed["statuses"]
-    st.last_overall_status = _overall_status(packed["statuses"], packed["dof"], packed["conflicting"])
+    st.last_overall_status = _overall_status(packed["statuses"], packed["dof"],
+                                             packed["conflicting"], packed["redundant"])
     return {
         "entities": packed["entities"],
         "statuses": packed["statuses"],
@@ -1088,12 +1300,18 @@ def sketch_solve(session: DocSession, sketch_fid: str) -> dict:
         "status": st.last_overall_status,
         "conflicting": packed["conflicting"],
         "redundant": packed["redundant"],
+        "solve_rejected": packed["rejected"],
         "constraints": _sketch_constraints(feat, packed["entity_map"]),
     }
 
 
-def sketch_drag(session: DocSession, sketch_fid: str, handle: str, xy) -> dict:
-    """Transient warm-started drag (worker_rpc.md sketch_drag). NO revision bump, NO commit."""
+def sketch_drag(session: DocSession, sketch_fid: str, handle: str, xy,
+                targets: list | None = None) -> dict:
+    """Transient warm-started drag (worker_rpc.md sketch_drag). NO revision bump, NO commit.
+
+    Single-point: pass ``handle`` + ``xy``. Whole-entity / profile / multi-select drag: pass
+    ``targets`` = list of ``{"handle", "xy":[x,y]}`` to translate many points rigidly at once.
+    """
     from engine.doc.sketch_solver import drag as _drag
     feat = _find_sketch_feature(session, sketch_fid)
     st = session.active_sketch
@@ -1103,8 +1321,8 @@ def sketch_drag(session: DocSession, sketch_fid: str, handle: str, xy) -> dict:
         st = session.active_sketch
     env = _equations_env(session)
     params = feat.get("params", {}) or {}
-    target = (float(xy[0]), float(xy[1]))
-    res = _drag(st.solve_state, handle, target, params, env)
+    target = (float(xy[0]), float(xy[1])) if xy is not None else None
+    res = _drag(st.solve_state, handle, target, params, env, targets=targets)
     # Pack entities with ids + construction flags for the host.
     entities = []
     for eid, coords in res["entities"].items():
@@ -1118,7 +1336,11 @@ def sketch_drag(session: DocSession, sketch_fid: str, handle: str, xy) -> dict:
     # Remember the dragged coords so commit can persist them (transient; no warm-state churn).
     st.last_entities = dict(res["entities"])
     st.last_statuses = dict(res.get("statuses", {}))
+    # Drag is a transient soft-target preview; the solver's drag() carries no conflict signal, so a
+    # drag never triggers the freeze path. Surface solve_rejected=False for response-shape parity
+    # with sketch_solve/sketch_enter (C50f).
     return {"entities": entities, "statuses": res.get("statuses", {}),
+            "solve_rejected": False,
             "constraints": _sketch_constraints(feat, res["entities"])}
 
 

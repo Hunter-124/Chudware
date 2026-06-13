@@ -148,8 +148,10 @@ Constraint references use **handles**: `"e3"` = whole entity; point sub-refs:
 | `parallel` | 2 — line, line | — |
 | `perpendicular` | 2 — line, line | — |
 | `tangent` | 2 — line/arc/circle pair (≥1 curved) | — |
-| `equal` | 2 — same family (line-line length, arc/circle radius) | — |
+| `collinear` | 2 — line, line | — |
+| `equal` | 2 — same family (line-line length, arc/circle radius incl. mixed arc↔circle) | — |
 | `concentric` | 2 — arc/circle, arc/circle | — |
+| `coradial` | 2 — arc/circle, arc/circle (same center **and** radius) | — |
 | `midpoint` | 2 — point, line | — |
 | `symmetric` | 3 — point/entity, point/entity, line (mirror axis) | — |
 | `fix` | 1 — any handle | — |
@@ -161,6 +163,16 @@ Constraint references use **handles**: `"e3"` = whole entity; point sub-refs:
 
 `driven:true` marks a reference dimension (measured, never enforced). Dimension constraints
 (`distance|angle|radius|diameter`) MUST carry `value`; the rest MUST NOT.
+
+**Tangent branch (curve↔curve):** a `tangent` between two arcs/circles admits two arrangements —
+*external* (`|C0−C1| = r0+r1`) and *internal* (`|C0−C1| = |r0−r1|`, one nested inside the other).
+The solver picks the branch matching the **as-drawn** geometry (whichever residual is smaller at
+constraint-build time) and freezes it for the solve, so a nested pair is never flipped inside-out.
+The line↔arc/circle tangent (distance from center to line = radius) is unaffected.
+
+**collinear vs parallel:** `collinear` forces both lines onto one infinite line (parallel directions
++ one endpoint on the other line, 2 DOF removed); `parallel` only equates directions (1 DOF).
+`coradial` = `concentric` + equal radius rolled into one relation (3 DOF removed).
 
 **Optional dimensional fields (C35-overhaul):**
 - `placement:[u,v]` — sketch-plane coordinates of the annotation text anchor (where the sketcher

@@ -67,8 +67,8 @@ def _status(res, fid: str) -> dict:
 
 
 def test_bracket_fixture() -> None:
-    """Load part_bracket.json and compile. f1-f5 must be ok. f6 (linear_pattern) must
-    give a clean 'unknown feature type' error, not crash."""
+    """Load part_bracket.json and compile. f1-f6 must be ok (f6 = linear_pattern of the f4 cut,
+    implemented in the pattern/mirror wave; it used to be an 'unknown feature type' stub)."""
 
     fixture_path = os.path.join(
         os.path.dirname(__file__),
@@ -103,17 +103,15 @@ def test_bracket_fixture() -> None:
     s5 = _status(res, "f5")
     assert s5["ok"], f"f5 (fillet) failed: {s5['error']}"
 
-    # f6 (linear_pattern) - must be a clean "unknown feature type" error, not a crash
+    # f6 (linear_pattern of the f4 cut) - now implemented, must compile cleanly
     s6 = _status(res, "f6")
-    assert not s6["ok"], "f6 (linear_pattern) should not compile successfully"
-    assert "linear_pattern" in s6["error"].lower() or "no compiler" in s6["error"].lower(), \
-        f"f6 error should mention feature type; got: {s6['error']}"
+    assert s6["ok"], f"f6 (linear_pattern) should now compile; got: {s6.get('error')}"
 
     # At least one body produced
     assert len(res.bodies) >= 1, "bracket fixture should produce at least one body"
     vol = res.bodies[0].shape.volume
     assert vol > 0, f"bracket volume should be positive; got {vol}"
-    print(f"[bracket] fixture f1-f5 ok; f6 clean error '{s6['error'][:60]}'; volume={vol:.1f}")
+    print(f"[bracket] fixture f1-f6 ok; volume={vol:.1f}")
 
 
 # --------------------------------------------------------------------------- test 2: sketch regions

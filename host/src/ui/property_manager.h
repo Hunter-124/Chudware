@@ -33,7 +33,13 @@ namespace ui {
 
 // ---- field model ----------------------------------------------------------
 
-enum class PMFieldKind { Dim, SelectorWell, Combo, Check };
+// Dim          numeric (mm/deg) input.   SelectorWell  viewport face/edge/vertex picks.
+// Combo/Check  enum / bool params.        Int           integer param (pattern counts).
+// DatumRef     a combo whose chosen value is emitted as a refs string (datum axis/plane, e.g.
+//              "axis.x"/"plane.right") — for _SEL_OR_DATUM ref slots (pattern direction, mirror
+//              plane, draft neutral). FeatureWell  a list of feature ids (refs _FEAT_LIST) seeded
+//              from the FeatureManager selection — the features a pattern/mirror replicates.
+enum class PMFieldKind { Dim, SelectorWell, Combo, Check, Int, DatumRef, FeatureWell };
 
 // Which topology kinds a SelectorWell accepts (mirrors feature_params sel(kinds…)).
 struct PMSelKinds {
@@ -48,7 +54,8 @@ struct PMFieldDef {
     const char* group = "";     // collapsible group caption (empty = ungrouped header)
 
     // Dim
-    double dimDefault = 0.0;    // canonical mm default
+    double dimDefault = 0.0;    // canonical mm default (also the Int default, truncated)
+    const char* unitLabel = nullptr;   // override the "[mm]" suffix (e.g. "[deg]"; "" = none)
 
     // SelectorWell
     PMSelKinds selKinds;        // allowed kinds
@@ -106,11 +113,14 @@ struct PMField {
     bool wellActive = false;     // this well is receiving viewport picks
     bool wellDangling = false;   // a ref came back dangling in feature_status
 
-    // Combo
+    // Combo / DatumRef
     int comboIndex = 0;
 
     // Check
     bool checkValue = false;
+
+    // Int (pattern counts)
+    int intValue = 1;
 };
 
 // Parse a dim string to canonical units (mm; degrees when angle=true). Accepts SolidWorks-style
@@ -161,6 +171,26 @@ public:
     // observer). Returns true if the pick was consumed (an active well accepted it).
     bool routePick(const nlohmann::json& selector, int pickKind /*render::PickKind*/);
 
+    // ---- C51: sketched-feature region picking ----------------------------------------------
+    // The viewport region picker (SketchMode::drawRegionPicker) drives these to render region
+    // highlights and feed click-to-toggle selections into the profile (extrude/revolve/sweep) or
+    // sections (loft) well. The picker owns all selection policy; the PM just stores selectors and
+    // fires the debounced preview.
+    //
+    // wantsRegionPicker(): the active form has a profile/sections well (so regions are pickable).
+    bool wantsRegionPicker() const;
+    // sectionsAreOrdered(): true for loft — clicks APPEND in order; false = unordered toggle set.
+    bool sectionsAreOrdered() const;
+    // Current selectors held by the profile/sections well (region/face selector objects).
+    std::vector<nlohmann::json> profilePicks() const;
+    // Replace the profile/sections well selectors and schedule a preview. An empty list on a
+    // profile well is coerced to nothing here — the picker guarantees a whole-sketch fallback so
+    // the profile never dangles.
+    void setProfilePicks(AppState& st, const std::vector<nlohmann::json>& sels);
+    // Sketch feature ids whose regions the picker should display: the sketches already referenced
+    // by the current picks, else (sections / unseeded) every unconsumed non-empty sketch.
+    std::vector<std::string> regionCandidateSketches(AppState& st) const;
+
     // Called every frame: fires the debounced live preview if the form is dirty.
     void tick(AppState& st);
 
@@ -188,6 +218,9 @@ private:
     void applyPreview(AppState& st);  // add (first) or edit_feature; debounced
     void loadFromTree(AppState& st, const nlohmann::json& feature);  // edit-path populate
     PMField* activeWell();
+    // C51: the profile/sections well (first SelectorWell keyed "profile" or "sections").
+    PMField* profileWell();
+    const PMField* profileWell() const;
 
     bool active_ = false;
     bool editMode_ = false;        // true = reopened on an existing feature (no add op)

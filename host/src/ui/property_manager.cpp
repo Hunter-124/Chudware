@@ -288,8 +288,11 @@ static void initField(PMField& f, const PMFieldDef& d, bool ips) {
             break;
         }
         case PMFieldKind::Combo:   f.comboIndex = 0; break;
+        case PMFieldKind::DatumRef: f.comboIndex = 0; break;
         case PMFieldKind::Check:   f.checkValue = d.checkDefault; break;
-        case PMFieldKind::SelectorWell: f.picks.clear(); f.wellActive = false; break;
+        case PMFieldKind::Int:     f.intValue = (int)(d.dimDefault + 0.5); break;
+        case PMFieldKind::SelectorWell:
+        case PMFieldKind::FeatureWell: f.picks.clear(); f.wellActive = false; break;
     }
 }
 
@@ -361,50 +364,67 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
         }
     }
 
-    // C40: SolidWorks pre-select for extrude/revolve — the sketch chosen in the FeatureManager
-    // (or, failing that, the most recent non-empty sketch) becomes the Profile region. Sketch
-    // curves are not in the viewport pick pass, so without this the Profile well could not be
-    // filled at all for a freshly drawn sketch and the command was a dead end.
-    if (std::strcmp(form_->type, "extrude") == 0 || std::strcmp(form_->type, "revolve") == 0) {
-        PMField* prof = nullptr;
-        for (auto& f : fields_)
-            if (f.def->kind == PMFieldKind::SelectorWell && std::strcmp(f.def->key, "profile") == 0) {
-                prof = &f; break;
-            }
+    // C40/C51: SolidWorks pre-select for extrude/revolve/sweep — the sketch chosen in the
+    // FeatureManager (or, failing that, the most recent non-empty sketch) seeds the Profile well
+    // as a WHOLE-SKETCH region ({kind:region, sketch:fid} with no centroid/index). Whole-sketch
+    // resolves to all material (even-odd) regions, so a circle-in-a-square previews as a washer and
+    // the old fragile centroid match (which produced spurious "dangling reference" errors on
+    // concentric loops) is gone. The viewport region picker then lets the user narrow to specific
+    // regions. Loft is NOT seeded — its sections are chosen explicitly (needs 2+, ordered).
+    if (std::strcmp(form_->type, "extrude") == 0 || std::strcmp(form_->type, "revolve") == 0 ||
+        std::strcmp(form_->type, "sweep") == 0) {
+        PMField* prof = profileWell();
         const nlohmann::json& tree = st.docMirror.tree();
         if (prof && prof->picks.empty() && tree.is_object() &&
             tree.contains("features") && tree["features"].is_array()) {
             const nlohmann::json* pick = nullptr;   // just-exited/selected sketch wins, else last
             for (const auto& f : tree["features"]) {
                 if (!f.is_object() || f.value("type", std::string()) != "sketch") continue;
-                // Skip empty sketches — they have no regions to extrude.
                 const auto& ents = f.contains("params") ? f["params"].value("entities", nlohmann::json::array())
                                                         : nlohmann::json::array();
-                if (!ents.is_array() || ents.empty()) continue;
+                if (!ents.is_array() || ents.empty()) continue;   // empty sketch: nothing to extrude
                 const std::string fidv = f.value("id", std::string());
                 if (fidv == justExitedSketch || fidv == st.selectedFeatureId) { pick = &f; break; }
                 pick = &f;
             }
             if (pick) {
-                // Region hint centroid: average of the sketch entities' anchor coords.
-                double cu = 0, cv = 0; int n = 0;
-                for (const auto& e : (*pick)["params"]["entities"]) {
-                    for (const char* k : {"p1", "p2", "center"}) {
-                        if (e.contains(k) && e[k].is_array() && e[k].size() == 2) {
-                            cu += e[k][0].get<double>(); cv += e[k][1].get<double>(); ++n;
-                        }
-                    }
-                }
-                if (n) { cu /= n; cv /= n; }
                 PMSelEntry se;
-                se.selector = {{"kind", "region"}, {"sketch", pick->value("id", std::string())},
-                               {"centroid", nlohmann::json::array({cu, cv})}, {"hint_index", 0}};
-                se.label = pick->value("name", std::string("Sketch")) + " region";
+                se.selector = {{"kind", "region"}, {"sketch", pick->value("id", std::string())}};
+                se.label = "Whole sketch";
                 prof->picks.push_back(std::move(se));
-                dirty_ = true;   // schedule the live preview against the seeded profile
+                dirty_ = true;   // schedule the live preview against the seeded whole-sketch profile
                 lastEditTime_ = ImGui::GetTime();
-                st.addLog("[pm] profile seeded from " + pick->value("id", std::string()));
+                st.addLog("[pm] profile seeded (whole sketch) from " + pick->value("id", std::string()));
             }
+        }
+    }
+
+    // Pattern/mirror: seed the "features" FeatureWell from the FeatureManager selection so the
+    // command operates immediately on the selected feature (SolidWorks pre-select). A sketch/datum
+    // selection is skipped (nothing to replicate); an empty list leaves mirror as a whole-body
+    // mirror and the patterns waiting for an "Add selected" pick.
+    if (std::strcmp(form_->type, "mirror") == 0 ||
+        std::strcmp(form_->type, "linear_pattern") == 0 ||
+        std::strcmp(form_->type, "circular_pattern") == 0) {
+        const std::string& sfid = st.selectedFeatureId;
+        if (!sfid.empty()) {
+            const nlohmann::json& tree = st.docMirror.tree();
+            std::string nm = sfid, ftype;
+            if (tree.is_object() && tree.contains("features") && tree["features"].is_array())
+                for (const auto& tf : tree["features"])
+                    if (tf.is_object() && tf.value("id", std::string()) == sfid) {
+                        nm = tf.value("name", sfid); ftype = tf.value("type", std::string()); break;
+                    }
+            const bool replicable = !(ftype == "sketch" || ftype == "plane" || ftype == "axis" ||
+                                      ftype == "point" || ftype == "csys" || ftype.empty());
+            if (replicable)
+                for (auto& fld : fields_)
+                    if (fld.def->kind == PMFieldKind::FeatureWell) {
+                        PMSelEntry e; e.selector = sfid; e.label = nm;
+                        fld.picks.push_back(std::move(e));
+                        dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                        break;
+                    }
         }
     }
 
@@ -502,6 +522,46 @@ void PropertyManager::loadFromTree(AppState& st, const nlohmann::json& feature) 
             case PMFieldKind::Check: {
                 if (params.contains(key) && params[key].is_boolean())
                     f.checkValue = params[key].get<bool>();
+                break;
+            }
+            case PMFieldKind::Int: {
+                if (params.contains(key) && params[key].is_number())
+                    f.intValue = (int)(params[key].get<double>() + 0.5);
+                else if (params.contains(key) && params[key].is_object() &&
+                         params[key]["value"].is_number())
+                    f.intValue = (int)(params[key]["value"].get<double>() + 0.5);
+                break;
+            }
+            case PMFieldKind::DatumRef: {
+                // refs[key] is a datum string ("axis.x"); resolve it to the combo option index.
+                if (refs.contains(key) && refs[key].is_string()) {
+                    std::string val = refs[key].get<std::string>();
+                    std::string opts = f.def->comboOptions ? f.def->comboOptions : "";
+                    int idx = 0, cur = 0; size_t start = 0;
+                    while (start <= opts.size()) {
+                        size_t bar = opts.find('|', start);
+                        std::string opt = opts.substr(start, bar - start);
+                        if (opt == val) { idx = cur; break; }
+                        ++cur;
+                        if (bar == std::string::npos) break;
+                        start = bar + 1;
+                    }
+                    f.comboIndex = idx;
+                }
+                break;
+            }
+            case PMFieldKind::FeatureWell: {
+                f.picks.clear();
+                if (refs.contains(key) && refs[key].is_array()) {
+                    const nlohmann::json& tree = feature;  // names resolved below from the doc tree
+                    (void)tree;
+                    for (const auto& s : refs[key]) {
+                        if (!s.is_string()) continue;
+                        std::string fid = s.get<std::string>();
+                        PMSelEntry e; e.selector = fid; e.label = fid;
+                        f.picks.push_back(std::move(e));
+                    }
+                }
                 break;
             }
             case PMFieldKind::SelectorWell: {
@@ -650,6 +710,96 @@ bool PropertyManager::routePick(const nlohmann::json& selector, int pickKind) {
     return true;
 }
 
+// ---- C51: sketched-feature region picking ---------------------------------
+
+// Short chip label for a region/face selector (region picks read "Whole sketch" / "Region N").
+static std::string pmRegionLabel(const nlohmann::json& sel) {
+    std::string kind = sel.value("kind", std::string("ref"));
+    if (kind == "region") {
+        if (sel.contains("index") && sel["index"].is_number())
+            return "Region " + std::to_string((int)sel["index"].get<double>() + 1);
+        return "Whole sketch";
+    }
+    if (kind.empty()) return "Ref";
+    return std::string(1, (char)std::toupper((unsigned char)kind[0])) + kind.substr(1);
+}
+
+PMField* PropertyManager::profileWell() {
+    for (auto& f : fields_)
+        if (f.def->kind == PMFieldKind::SelectorWell &&
+            (std::strcmp(f.def->key, "profile") == 0 || std::strcmp(f.def->key, "sections") == 0))
+            return &f;
+    return nullptr;
+}
+
+const PMField* PropertyManager::profileWell() const {
+    for (const auto& f : fields_)
+        if (f.def->kind == PMFieldKind::SelectorWell &&
+            (std::strcmp(f.def->key, "profile") == 0 || std::strcmp(f.def->key, "sections") == 0))
+            return &f;
+    return nullptr;
+}
+
+bool PropertyManager::wantsRegionPicker() const {
+    return active_ && profileWell() != nullptr;
+}
+
+bool PropertyManager::sectionsAreOrdered() const {
+    const PMField* w = profileWell();
+    return w && std::strcmp(w->def->key, "sections") == 0;
+}
+
+std::vector<nlohmann::json> PropertyManager::profilePicks() const {
+    std::vector<nlohmann::json> out;
+    if (const PMField* w = profileWell())
+        for (const auto& p : w->picks) out.push_back(p.selector);
+    return out;
+}
+
+void PropertyManager::setProfilePicks(AppState& st, const std::vector<nlohmann::json>& sels) {
+    (void)st;
+    PMField* w = profileWell();
+    if (!w) return;
+    w->picks.clear();
+    for (const auto& s : sels) {
+        PMSelEntry e; e.selector = s; e.label = pmRegionLabel(s);
+        w->picks.push_back(std::move(e));
+    }
+    w->wellDangling = false;
+    dirty_ = true; lastEditTime_ = ImGui::GetTime();
+}
+
+std::vector<std::string> PropertyManager::regionCandidateSketches(AppState& st) const {
+    std::vector<std::string> out;
+    const PMField* w = profileWell();
+    if (!w) return out;
+    auto pushUnique = [&](const std::string& s) {
+        if (s.empty()) return;
+        for (const auto& e : out) if (e == s) return;
+        out.push_back(s);
+    };
+    // Sketches already referenced by current picks (preserve order).
+    for (const auto& p : w->picks)
+        if (p.selector.value("kind", std::string()) == "region")
+            pushUnique(p.selector.value("sketch", std::string()));
+    const bool sections = std::strcmp(w->def->key, "sections") == 0;
+    if (!out.empty() && !sections) return out;   // single-profile well is bound to its sketch
+    // Otherwise enumerate non-empty unsuppressed sketches from the tree (loft / unseeded profile).
+    const nlohmann::json& tree = st.docMirror.tree();
+    if (tree.is_object() && tree.contains("features") && tree["features"].is_array()) {
+        for (const auto& f : tree["features"]) {
+            if (!f.is_object() || f.value("type", std::string()) != "sketch") continue;
+            if (f.value("suppressed", false)) continue;
+            const auto& ents = f.contains("params")
+                ? f["params"].value("entities", nlohmann::json::array())
+                : nlohmann::json::array();
+            if (!ents.is_array() || ents.empty()) continue;
+            pushUnique(f.value("id", std::string()));
+        }
+    }
+    return out;
+}
+
 // ---- op assembly ----------------------------------------------------------
 
 void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
@@ -658,7 +808,9 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
     nlohmann::json params = nlohmann::json::object();
     nlohmann::json refs   = nlohmann::json::object();
     for (const auto& f : fields_) {
-        // comingSoon fields are display-only; never emit them to the engine.
+        // comingSoon fields are display-only; never emit them to the engine. (Disabled-but-required
+        // params like extrude's depth on a through-all are still emitted — the engine ignores the
+        // ones that don't apply, and the schema requires their presence.)
         if (f.def->comingSoon) continue;
         const char* key = f.def->key;
         switch (f.def->kind) {
@@ -682,6 +834,25 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
             case PMFieldKind::Check:
                 params[key] = f.checkValue;
                 break;
+            case PMFieldKind::Int:
+                params[key] = f.intValue;
+                break;
+            case PMFieldKind::DatumRef: {
+                // The chosen combo OPTION value is a datum string ("axis.x"/"plane.right") emitted
+                // straight into refs (a _SEL_OR_DATUM slot accepts reserved datum strings).
+                std::string opts = f.def->comboOptions ? f.def->comboOptions : "";
+                int cur = 0; size_t start = 0; std::string chosen;
+                while (start <= opts.size()) {
+                    size_t bar = opts.find('|', start);
+                    std::string opt = opts.substr(start, bar - start);
+                    if (cur == f.comboIndex) { chosen = opt; break; }
+                    ++cur;
+                    if (bar == std::string::npos) break;
+                    start = bar + 1;
+                }
+                if (!chosen.empty()) refs[key] = chosen;
+                break;
+            }
             case PMFieldKind::SelectorWell: {
                 if (f.def->selMulti) {
                     nlohmann::json arr = nlohmann::json::array();
@@ -689,6 +860,16 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
                     refs[key] = arr;
                 } else if (!f.picks.empty()) {
                     refs[key] = f.picks.front().selector;
+                }
+                break;
+            }
+            case PMFieldKind::FeatureWell: {
+                // Each pick's selector is a bare feature-id string; emit a _FEAT_LIST array. Omit the
+                // ref entirely when empty (mirror reads an absent list as a whole-body mirror).
+                if (!f.picks.empty()) {
+                    nlohmann::json arr = nlohmann::json::array();
+                    for (const auto& p : f.picks) arr.push_back(p.selector);
+                    refs[key] = arr;
                 }
                 break;
             }
@@ -704,13 +885,31 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
 static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& fields) {
     std::string t = form->type;
 
-    // Selector-gated forms: primary well must have at least one pick.
+    // Mirror is ready as soon as it opens — the plane is a DatumRef (always set) and an empty
+    // feature list is a valid whole-body mirror.
+    if (t == "mirror") return true;
+
+    // Loft needs at least TWO section profiles before a preview is meaningful.
+    if (t == "loft") {
+        for (const auto& f : fields)
+            if ((f.def->kind == PMFieldKind::SelectorWell) && std::strcmp(f.def->key, "sections") == 0)
+                return f.picks.size() >= 2;
+        return false;
+    }
+
+    // Selector-gated forms: a primary well (SelectorWell or FeatureWell) must have at least one
+    // pick. Patterns gate on their FeatureWell; sweep on profile (path errors surface inline);
+    // hole on the face; draft on the faces to taper.
     const char* needWell = nullptr;
     if (t == "fillet" || t == "chamfer") needWell = "edges";
-    else if (t == "extrude" || t == "revolve") needWell = "profile";
+    else if (t == "extrude" || t == "revolve" || t == "sweep") needWell = "profile";
+    else if (t == "hole") needWell = "face";
+    else if (t == "draft") needWell = "faces";
+    else if (t == "linear_pattern" || t == "circular_pattern") needWell = "features";
     if (needWell) {
         for (const auto& f : fields)
-            if (f.def->kind == PMFieldKind::SelectorWell && std::strcmp(f.def->key, needWell) == 0)
+            if ((f.def->kind == PMFieldKind::SelectorWell || f.def->kind == PMFieldKind::FeatureWell)
+                && std::strcmp(f.def->key, needWell) == 0)
                 return !f.picks.empty();
         return false;  // well not found
     }
@@ -1042,8 +1241,10 @@ void PropertyManager::draw(AppState& st) {
         switch (f.def->kind) {
             case PMFieldKind::Dim: {
                 pushTextColor(pal.textDim);
-                // C37-F: unit suffix in label ("Radius [mm]").
-                const char* unitSuffix = useIps ? " [in]" : " [mm]";
+                // C37-F: unit suffix in label ("Radius [mm]"). A field may override it (angle =
+                // "[deg]"; an empty override = no suffix).
+                const char* unitSuffix = f.def->unitLabel ? f.def->unitLabel
+                                                          : (useIps ? " [in]" : " [mm]");
                 ImGui::Text("%s%s", f.def->label, unitSuffix);
                 ImGui::PopStyleColor();
                 if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -1256,6 +1457,89 @@ void PropertyManager::draw(AppState& st) {
                 if (f.def->comingSoon &&
                     (boxHov || ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)))
                     ImGui::SetTooltip("Not yet supported by engine");
+                break;
+            }
+            case PMFieldKind::Int: {
+                pushTextColor(pal.textDim);
+                ImGui::TextUnformatted(f.def->label);
+                ImGui::PopStyleColor();
+                ImGui::SetNextItemWidth(-1);
+                int v = f.intValue;
+                if (ImGui::InputInt("##int", &v)) {
+                    if (enabled) {
+                        if (v < 1) v = 1;
+                        f.intValue = v; dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                    }
+                }
+                break;
+            }
+            case PMFieldKind::DatumRef: {
+                pushTextColor(pal.textDim);
+                ImGui::TextUnformatted(f.def->label);
+                ImGui::PopStyleColor();
+                std::string lblSrc = f.def->comboLabels ? f.def->comboLabels
+                                   : (f.def->comboOptions ? f.def->comboOptions : "");
+                std::vector<std::string> labels; { size_t s = 0;
+                    while (s <= lblSrc.size()) {
+                        size_t b = lblSrc.find('|', s);
+                        labels.push_back(lblSrc.substr(s, b - s));
+                        if (b == std::string::npos) break; s = b + 1;
+                    }
+                }
+                std::string preview = (f.comboIndex < (int)labels.size()) ? labels[f.comboIndex] : "";
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::BeginCombo("##datum", preview.c_str())) {
+                    for (int n = 0; n < (int)labels.size(); ++n) {
+                        bool sel = (f.comboIndex == n);
+                        if (ImGui::Selectable(labels[n].c_str(), sel))
+                            if (enabled) { f.comboIndex = n; dirty_ = true; lastEditTime_ = ImGui::GetTime(); }
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                break;
+            }
+            case PMFieldKind::FeatureWell: {
+                pushTextColor(pal.textDim);
+                ImGui::TextUnformatted(f.def->label);
+                ImGui::PopStyleColor();
+                std::string chip;
+                if (f.picks.empty()) chip = "(select a feature in the tree, then Add)";
+                else for (size_t k = 0; k < f.picks.size(); ++k) {
+                    if (k) chip += ", ";
+                    chip += f.picks[k].label;
+                }
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextUnformatted(chip.c_str());
+                ImGui::PopTextWrapPos();
+                // Add the currently tree-selected feature to the list.
+                if (ImGui::SmallButton("Add selected")) {
+                    const std::string& fid = st.selectedFeatureId;
+                    if (!fid.empty()) {
+                        bool dup = false;
+                        for (const auto& p : f.picks)
+                            if (p.selector.is_string() && p.selector.get<std::string>() == fid) dup = true;
+                        if (!dup) {
+                            // Look up the feature's display name from the mirror tree.
+                            std::string nm = fid;
+                            const nlohmann::json& tree = st.docMirror.tree();
+                            if (tree.is_object() && tree.contains("features") && tree["features"].is_array())
+                                for (const auto& tf : tree["features"])
+                                    if (tf.is_object() && tf.value("id", std::string()) == fid) {
+                                        nm = tf.value("name", fid); break;
+                                    }
+                            PMSelEntry e; e.selector = fid; e.label = nm;
+                            f.picks.push_back(std::move(e));
+                            dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                        }
+                    } else {
+                        st.toast(ui::ToastLevel::Info, "Select a feature in the FeatureManager first");
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Clear##feat")) {
+                    f.picks.clear(); dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                }
                 break;
             }
         }

@@ -194,8 +194,8 @@ def test_redundant_constraint() -> None:
     a = s.analyze(res.x)
     assert a.well_posed, f"consistent redundancy should stay well_posed, conflicts={a.conflicting_tags}"
     flagged = set(a.redundant_tags)
-    assert ("dist1" in flagged) or ("dist2" in flagged), \
-        f"expected dist1/dist2 in redundant_tags, got {a.redundant_tags}"
+    assert "dist2" in flagged and "dist1" not in flagged, \
+        f"expected the later duplicate dist2 in redundant_tags, got {a.redundant_tags}"
     assert not a.conflicting_tags, f"unexpected conflicts: {a.conflicting_tags}"
     print(f"[redundant] redundant_tags={a.redundant_tags} well_posed={a.well_posed}")
 
@@ -211,6 +211,8 @@ def test_conflicting_constraints() -> None:
     res = s.solve()
     a = s.analyze(res.x)
     assert a.conflicting_tags, f"expected a conflict, got none (redundant={a.redundant_tags})"
+    assert "dist12" in set(a.conflicting_tags), \
+        f"expected the later contradictory dim dist12 to be flagged, got {a.conflicting_tags}"
     assert not a.well_posed, "system with contradiction must be not well_posed"
     print(f"[conflict] conflicting_tags={a.conflicting_tags} well_posed={a.well_posed}")
 

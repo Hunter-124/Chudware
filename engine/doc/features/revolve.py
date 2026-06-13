@@ -31,7 +31,7 @@ from engine.doc.selectors import describe_edges, resolve
 # Import shared helper from extrude
 from .extrude import (
     _body_bbox_diag,
-    _resolve_profile_selector,
+    _resolve_profile_faces,
     _to_solid_normalized,
 )
 
@@ -196,8 +196,7 @@ def compile_revolve(feat: dict, ctx: CompileContext) -> CompileOutput:
     dangling: list[str] = []
     for i, sel in enumerate(profile_sels):
         try:
-            f = _resolve_profile_selector(sel, ctx)
-            profile_faces.append(f)
+            profile_faces.extend(_resolve_profile_faces(sel, ctx))
         except FeatureError as exc:
             if exc.dangling_refs:
                 dangling.extend([f"profile[{i}]: {dr}" for dr in exc.dangling_refs])
@@ -273,7 +272,7 @@ def compile_revolve(feat: dict, ctx: CompileContext) -> CompileOutput:
         if mode == "cut":
             raise FeatureError("revolve: cut mode requires an existing body to subtract from")
         bodies.append(tool_solid)
-        return CompileOutput(bodies=bodies, tool_body=tool_solid,
+        return CompileOutput(bodies=bodies, tool_body=tool_solid, op="add",
                              resolved={"angle": angle_deg})
 
     target = bodies[-1]
@@ -301,4 +300,5 @@ def compile_revolve(feat: dict, ctx: CompileContext) -> CompileOutput:
 
     bodies[-1] = result
     return CompileOutput(bodies=bodies, tool_body=tool_solid,
+                         op=("cut" if mode == "cut" else "add"),
                          resolved={"angle": angle_deg})

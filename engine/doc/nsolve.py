@@ -529,10 +529,10 @@ class System:
 
           - dof = n_vars - rank  (0 = fully defined, >0 = under, <0 impossible here
             since rank <= n_vars; over-defined shows up as redundant rows instead).
-          - redundant = constraint rows that are linearly dependent on the rest of
-            the system (they remove no DOF). Identified by a row-pivoted QR of J^T
-            (columns = constraint rows): rows beyond the numeric rank are dependent.
-            Mapped back to the owning block's tag.
+          - redundant = constraint rows that are linearly dependent on rows registered
+            earlier (they remove no DOF). This chronological attribution matters for
+            CAD UX: adding a duplicate relation should blame the newly-added relation,
+            not an older equivalent one that QR happened to pivot behind it.
           - conflicting = redundant AND not currently satisfiable: the dependent row
             carries residual that can't be driven to zero (residual norm stays high
             at the solution). These drive "over-defined (red)"; pure-redundant (the
@@ -576,8 +576,9 @@ class System:
         dof = n - rank
 
         # Redundancy: find rows of J that are linearly dependent on earlier rows.
-        # QR with pivoting on J^T orders columns (= constraint rows) by independence;
-        # pivot columns beyond `rank` correspond to redundant rows.
+        # We still use QR for each rank decision, but attribution is chronological:
+        # the first row that spans a constraint direction owns it, and later rows
+        # that fail to increase rank are the redundant/conflicting ones.
         redundant_rows = _dependent_rows(J, rank, tol)
 
         redundant_tags: List[object] = []
@@ -643,15 +644,33 @@ def _numeric_rank(J: np.ndarray, tol: float) -> int:
 
 
 def _dependent_rows(J: np.ndarray, rank: int, tol: float) -> List[int]:
-    """Row indices of J that are linearly dependent on the independent set.
+    """Row indices of J that are dependent on earlier registered rows.
 
-    Column-pivoted QR of J^T puts the most-independent rows (now columns) first;
-    pivot positions from `rank` onward are the dependent rows. Returns them in
-    original row order.
+    Earlier builds used a row-pivoted QR of ``J.T``. That gives a numerically good
+    independent row set, but it is intentionally order-free: a later duplicate
+    dimension can cause the older dimension to be reported redundant. CAD editing
+    needs stable, insertion-order attribution instead. We scan rows in registration
+    order and keep a chronological basis; a row is dependent when adding it does
+    not increase that basis rank.
     """
     m = J.shape[0]
     if rank >= m or m == 0:
         return []
-    _, _, piv = sla.qr(J.T, mode="economic", pivoting=True)
-    dep = sorted(int(p) for p in piv[rank:])
+    if rank <= 0:
+        return list(range(m))
+
+    dep: List[int] = []
+    basis_rows: List[int] = []
+    cur_rank = 0
+    for ri in range(m):
+        if cur_rank >= rank:
+            dep.extend(range(ri, m))
+            break
+        candidate = J[basis_rows + [ri], :]
+        new_rank = _numeric_rank(candidate, tol)
+        if new_rank > cur_rank:
+            basis_rows.append(ri)
+            cur_rank = new_rank
+        else:
+            dep.append(ri)
     return dep

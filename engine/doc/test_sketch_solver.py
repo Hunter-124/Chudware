@@ -804,6 +804,71 @@ def test_fix_whole_entity() -> None:
           f"sub-handle dof={sol3.dof}")
 
 
+def test_multi_target_drag_translates_profile() -> None:
+    """C51: a `targets` list soft-targets many handles at once, so a whole closed profile
+    translates rigidly while its coincident corners stay joined."""
+    # A free unit square as 4 coincident-chained lines (no h/v/dims -> fully draggable).
+    corners = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+    ents, cons = [], []
+    for i in range(4):
+        a, b = corners[i], corners[(i + 1) % 4]
+        ents.append({"id": f"e{i+1}", "type": "line", "construction": False,
+                     "p1": [a[0], a[1]], "p2": [b[0], b[1]]})
+    # chain coincident: e_i.p2 == e_{i+1}.p1
+    for i in range(4):
+        cons.append({"id": f"c{i+1}", "type": "coincident",
+                     "refs": [f"e{i+1}.p2", f"e{(i+1)%4+1}.p1"]})
+    sketch = {"entities": ents, "constraints": cons}
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.converged
+
+    dx, dy = 7.0, -3.0
+    targets = []
+    for e in ents:
+        targets.append({"handle": f"{e['id']}.p1", "xy": [e["p1"][0] + dx, e["p1"][1] + dy]})
+        targets.append({"handle": f"{e['id']}.p2", "xy": [e["p2"][0] + dx, e["p2"][1] + dy]})
+    res = drag(sol.state, None, None, sketch, {}, targets=targets)
+
+    for e in ents:
+        got = res["entities"][e["id"]]
+        assert abs(got["p1"][0] - (e["p1"][0] + dx)) < 1e-3, got
+        assert abs(got["p1"][1] - (e["p1"][1] + dy)) < 1e-3, got
+        assert abs(got["p2"][0] - (e["p2"][0] + dx)) < 1e-3, got
+        assert abs(got["p2"][1] - (e["p2"][1] + dy)) < 1e-3, got
+    # corners stay coincident (rigid translation preserves the chain)
+    assert abs(res["entities"]["e1"]["p2"][0] - res["entities"]["e2"]["p1"][0]) < 1e-6
+    print(f"[multi_drag] profile translated by ({dx},{dy}) rigidly, corners joined")
+
+
+def test_slot_length_and_width_dims() -> None:
+    """C51: a slot can be dimensioned — distance on its centerline endpoints sets the center-to-
+    center LENGTH, and a diameter/radius constraint on the slot sets its WIDTH (cap diameter)."""
+    from engine.doc.sketch_solver import measure_constraint
+    sk = {
+        "entities": [{"id": "e1", "type": "slot", "p1": [0, 0], "p2": [40, 0], "width": 10}],
+        "constraints": [
+            {"id": "c1", "type": "distance", "refs": ["e1.p1", "e1.p2"],
+             "value": {"value": 55.0, "expr": None}},
+            {"id": "c2", "type": "diameter", "refs": ["e1"], "value": {"value": 16.0, "expr": None}},
+        ],
+    }
+    sol = solve_sketch(sk, {}, warm=None)
+    assert sol.converged and not sol.conflicting, sol.conflicting
+    e = sol.entities["e1"]
+    length = math.hypot(e["p2"][0] - e["p1"][0], e["p2"][1] - e["p1"][1])
+    assert abs(length - 55.0) < 1e-4, length
+    assert abs(e["width"] - 16.0) < 1e-4, e["width"]
+    assert abs(measure_constraint(sk["constraints"][0], sol.entities) - 55.0) < 1e-4
+    assert abs(measure_constraint(sk["constraints"][1], sol.entities) - 16.0) < 1e-4
+    # radius constraint on a slot sets the cap radius = width/2
+    sk2 = {"entities": [{"id": "e1", "type": "slot", "p1": [0, 0], "p2": [40, 0], "width": 10}],
+           "constraints": [{"id": "c1", "type": "radius", "refs": ["e1"],
+                            "value": {"value": 6.0, "expr": None}}]}
+    sol2 = solve_sketch(sk2, {}, warm=None)
+    assert abs(sol2.entities["e1"]["width"] - 12.0) < 1e-4, sol2.entities["e1"]["width"]
+    print(f"[slot_dim] length=55 width=16 (radius->width 12) ok")
+
+
 def test_redundant_consistent_dim_flagged():
     """C50: a consistent-but-redundant driving dimension (removes no DOF) must appear in the
     solver's `redundant` list — the host prompts 'Make Dimension Driven?' on it BEFORE the value
@@ -883,10 +948,637 @@ def test_warm_solve_respects_geometry_edits():
 
 
 # ---------------------------------------------------------------------------
+# C50g: collinear / coradial / curve-curve tangent / mixed equal / mid+sym e2e
+# ---------------------------------------------------------------------------
+
+def test_collinear() -> None:
+    """Two lines collinear: a free, skewed second line snaps onto the infinite line
+    through a fixed first line (removes 2 DOF)."""
+    sketch = {
+        "entities": [
+            {"id": "e1", "type": "line", "construction": False,
+             "p1": [0.0, 0.0], "p2": [10.0, 0.0]},
+            # skewed + offset second line
+            {"id": "e2", "type": "line", "construction": False,
+             "p1": [20.0, 3.0], "p2": [30.0, 1.0]},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "fix", "refs": ["e1"]},
+            {"id": "c2", "type": "collinear", "refs": ["e1", "e2"]},
+        ],
+    }
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.converged, "collinear: did not converge"
+    a = sol.entities["e1"]; b = sol.entities["e2"]
+    # both endpoints of e2 must lie on the line y=0 (the infinite line of e1)
+    assert abs(b["p1"][1]) < 1e-5 and abs(b["p2"][1]) < 1e-5, \
+        f"collinear: e2 not on e1's line: {b}"
+    # direction preserved parallel (it was already ~horizontal-ish; cross ~ 0)
+    cross = (a["p2"][0]-a["p1"][0])*(b["p2"][1]-b["p1"][1]) \
+        - (a["p2"][1]-a["p1"][1])*(b["p2"][0]-b["p1"][0])
+    assert abs(cross) < 1e-5, f"collinear: directions not parallel, cross={cross}"
+    print(f"[collinear] e2 onto e1 line: p1={b['p1']}, p2={b['p2']}")
+
+
+def test_collinear_redundant_over_parallel_coincident() -> None:
+    """A collinear added on top of parallel + endpoint coincidence is redundant:
+    it must land in the `redundant` list (not conflicting, not breaking the solve)."""
+    sketch = {
+        "entities": [
+            {"id": "e1", "type": "line", "construction": False,
+             "p1": [0.0, 0.0], "p2": [10.0, 0.0]},
+            {"id": "e2", "type": "line", "construction": False,
+             "p1": [10.0, 0.0], "p2": [20.0, 0.0]},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "fix", "refs": ["e1"]},
+            # e2.p1 shares e1.p2 (a point already on e1's line) ...
+            {"id": "c2", "type": "coincident", "refs": ["e1.p2", "e2.p1"]},
+            # ... and e2 parallel to e1 -> e2 is already collinear with e1.
+            {"id": "c3", "type": "parallel", "refs": ["e1", "e2"]},
+            # This collinear adds nothing new -> redundant.
+            {"id": "c4", "type": "collinear", "refs": ["e1", "e2"]},
+        ],
+    }
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.converged, "collinear-redundant: did not converge"
+    assert not sol.conflicting, f"unexpected conflicts: {sol.conflicting}"
+    assert "c4" in sol.redundant, f"collinear not flagged redundant: {sol.redundant}"
+    print(f"[collinear_redundant] redundant={sol.redundant}")
+
+
+def test_tangent_circle_circle_external() -> None:
+    """Two circles drawn apart: external tangency |C0-C1| = r0+r1."""
+    sketch = {
+        "entities": [
+            {"id": "e1", "type": "circle", "construction": False,
+             "center": [0.0, 0.0], "radius": 5.0},
+            {"id": "e2", "type": "circle", "construction": False,
+             "center": [12.0, 0.0], "radius": 4.0},   # drawn apart -> external
+        ],
+        "constraints": [
+            # Fix e1 fully and e2's center; e2 radius floats so tangency is solvable
+            # (centers 12 apart, r0=5 -> r1 solves to 7 for external).
+            {"id": "c1", "type": "fix", "refs": ["e1"]},
+            {"id": "c2", "type": "fix", "refs": ["e2.center"]},
+            {"id": "c4", "type": "tangent", "refs": ["e1", "e2"]},
+        ],
+    }
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.converged, "tangent ext: did not converge"
+    c0 = sol.entities["e1"]; c1 = sol.entities["e2"]
+    d = math.hypot(c0["center"][0]-c1["center"][0], c0["center"][1]-c1["center"][1])
+    assert abs(d - (c0["radius"]+c1["radius"])) < 1e-4, \
+        f"external tangency wrong: d={d}, r0+r1={c0['radius']+c1['radius']}"
+    assert abs(c1["radius"] - 7.0) < 1e-4, f"e2 radius should solve to 7: {c1['radius']}"
+    print(f"[tangent_cc_ext] d={d:.4f}, r0+r1={c0['radius']+c1['radius']:.4f}")
+
+
+def test_tangent_circle_circle_internal() -> None:
+    """A small circle nested inside a big one: internal tangency |C0-C1| = |r0-r1|.
+    Branch selection must keep it nested (not flip to external)."""
+    sketch = {
+        "entities": [
+            {"id": "e1", "type": "circle", "construction": False,
+             "center": [0.0, 0.0], "radius": 10.0},
+            {"id": "e2", "type": "circle", "construction": False,
+             "center": [3.0, 0.0], "radius": 4.0},   # nested -> internal
+        ],
+        "constraints": [
+            {"id": "c1", "type": "fix", "refs": ["e1"]},
+            # leave e2 center.y fixed but let center.x + nothing else; pin radius
+            {"id": "c2", "type": "radius", "refs": ["e2"],
+             "value": {"value": 4.0, "expr": None}},
+            {"id": "c3", "type": "horizontal", "refs": ["e1.center", "e2.center"]},
+            {"id": "c4", "type": "tangent", "refs": ["e1", "e2"]},
+        ],
+    }
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.converged, "tangent int: did not converge"
+    c0 = sol.entities["e1"]; c1 = sol.entities["e2"]
+    d = math.hypot(c0["center"][0]-c1["center"][0], c0["center"][1]-c1["center"][1])
+    expect = abs(c0["radius"] - c1["radius"])
+    assert abs(d - expect) < 1e-4, \
+        f"internal tangency wrong: d={d}, |r0-r1|={expect}"
+    # still nested: center distance < bigger radius
+    assert d < c0["radius"], f"branch flipped to external: d={d} >= R={c0['radius']}"
+    print(f"[tangent_cc_int] d={d:.4f}, |r0-r1|={expect:.4f} (nested)")
+
+
+def test_tangent_arc_circle() -> None:
+    """tangent works for an arc against a circle (curved↔curved path)."""
+    sketch = {
+        "entities": [
+            {"id": "e1", "type": "circle", "construction": False,
+             "center": [0.0, 0.0], "radius": 5.0},
+            {"id": "e2", "type": "arc", "construction": False,
+             "center": [11.0, 0.0], "radius": 3.0, "start": 0.0, "end": 180.0, "ccw": True},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "fix", "refs": ["e1"]},
+            {"id": "c2", "type": "fix", "refs": ["e2.center"]},
+            {"id": "c3", "type": "tangent", "refs": ["e1", "e2"]},
+        ],
+    }
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.converged, "tangent arc-circle: did not converge"
+    c0 = sol.entities["e1"]; c1 = sol.entities["e2"]
+    d = math.hypot(c0["center"][0]-c1["center"][0], c0["center"][1]-c1["center"][1])
+    # centers fixed at 11 apart; only radii free -> r0+r1 should solve to 11 (external)
+    assert abs(d - (c0["radius"]+c1["radius"])) < 1e-4, \
+        f"arc-circle tangency: d={d}, r0+r1={c0['radius']+c1['radius']}"
+    print(f"[tangent_arc_circle] d={d:.4f}, r0+r1={c0['radius']+c1['radius']:.4f}")
+
+
+def test_coradial() -> None:
+    """coradial: two arcs end up with identical center AND radius."""
+    sketch = {
+        "entities": [
+            {"id": "e1", "type": "arc", "construction": False,
+             "center": [0.0, 0.0], "radius": 8.0, "start": 0.0, "end": 90.0, "ccw": True},
+            {"id": "e2", "type": "arc", "construction": False,
+             "center": [2.0, 1.0], "radius": 5.0, "start": 90.0, "end": 180.0, "ccw": True},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "fix", "refs": ["e1.center"]},
+            {"id": "c2", "type": "radius", "refs": ["e1"],
+             "value": {"value": 8.0, "expr": None}},
+            {"id": "c3", "type": "coradial", "refs": ["e1", "e2"]},
+        ],
+    }
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.converged, "coradial: did not converge"
+    a = sol.entities["e1"]; b = sol.entities["e2"]
+    cd = math.hypot(a["center"][0]-b["center"][0], a["center"][1]-b["center"][1])
+    assert cd < 1e-5, f"coradial: centers differ by {cd}"
+    assert abs(a["radius"] - b["radius"]) < 1e-5, \
+        f"coradial: radii differ {a['radius']} vs {b['radius']}"
+    print(f"[coradial] center match dist={cd:.2e}, r0={a['radius']:.4f} r1={b['radius']:.4f}")
+
+
+def test_equal_arc_circle_radius() -> None:
+    """equal between an arc and a circle equates their radii (mixed pair)."""
+    sketch = {
+        "entities": [
+            {"id": "e1", "type": "circle", "construction": False,
+             "center": [0.0, 0.0], "radius": 7.0},
+            {"id": "e2", "type": "arc", "construction": False,
+             "center": [20.0, 0.0], "radius": 3.0, "start": 0.0, "end": 90.0, "ccw": True},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "fix", "refs": ["e1"]},
+            {"id": "c2", "type": "fix", "refs": ["e2.center"]},
+            {"id": "c3", "type": "equal", "refs": ["e1", "e2"]},
+        ],
+    }
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.converged, "equal arc-circle: did not converge"
+    assert abs(sol.entities["e1"]["radius"] - sol.entities["e2"]["radius"]) < 1e-5, \
+        f"equal arc-circle radii differ: {sol.entities['e1']['radius']} vs {sol.entities['e2']['radius']}"
+    assert abs(sol.entities["e2"]["radius"] - 7.0) < 1e-5, \
+        f"arc radius should follow fixed circle (7): {sol.entities['e2']['radius']}"
+    print(f"[equal_arc_circle] r={sol.entities['e2']['radius']:.4f}")
+
+
+def test_midpoint_tracks_moving_endpoints() -> None:
+    """End-to-end: a point at a line's midpoint stays at the midpoint when the
+    line's endpoints are moved (re-solve from edited geometry)."""
+    sketch = {
+        "entities": [
+            {"id": "e1", "type": "line", "construction": False,
+             "p1": [0.0, 0.0], "p2": [10.0, 0.0]},
+            {"id": "e2", "type": "point", "construction": False, "p": [3.0, 0.5]},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "fix", "refs": ["e1.p1"]},
+            {"id": "c2", "type": "fix", "refs": ["e1.p2"]},
+            {"id": "c3", "type": "midpoint", "refs": ["e2", "e1"]},
+        ],
+    }
+    sol = solve_sketch(sketch, {}, warm=None)
+    p = sol.entities["e2"]["p"]
+    assert abs(p[0]-5.0) < 1e-6 and abs(p[1]-0.0) < 1e-6, f"midpoint #1 wrong: {p}"
+
+    # Move the line endpoints; re-solve. Midpoint must track to the new mid.
+    s2 = copy.deepcopy(sketch)
+    s2["entities"][0]["p1"] = [4.0, 2.0]
+    s2["entities"][0]["p2"] = [16.0, 10.0]
+    # fix constraints pin to the NEW doc coords (read from entity on build)
+    sol2 = solve_sketch(s2, {}, warm=None)
+    p2 = sol2.entities["e2"]["p"]
+    lp1 = sol2.entities["e1"]["p1"]; lp2 = sol2.entities["e1"]["p2"]
+    ex = (lp1[0]+lp2[0])/2.0; ey = (lp1[1]+lp2[1])/2.0
+    assert abs(p2[0]-ex) < 1e-5 and abs(p2[1]-ey) < 1e-5, \
+        f"midpoint #2 did not track: got {p2}, expected ({ex},{ey})"
+    print(f"[midpoint_track] p1={p}, p2={p2} expected=({ex:.3f},{ey:.3f})")
+
+
+def test_symmetric_mirrors_pair() -> None:
+    """End-to-end symmetric: the free point mirrors the fixed point across the axis."""
+    sketch = {
+        "entities": [
+            {"id": "e1", "type": "point", "construction": False, "p": [2.0, 3.0]},
+            {"id": "e2", "type": "point", "construction": False, "p": [7.0, -1.0]},
+            {"id": "axis", "type": "line", "construction": True,
+             "p1": [5.0, 0.0], "p2": [5.0, 10.0]},   # vertical axis x=5
+        ],
+        "constraints": [
+            {"id": "c1", "type": "fix", "refs": ["axis.p1"]},
+            {"id": "c2", "type": "fix", "refs": ["axis.p2"]},
+            {"id": "c3", "type": "fix", "refs": ["e1"]},     # fix the mirror source
+            {"id": "c4", "type": "symmetric", "refs": ["e1", "e2", "axis"]},
+        ],
+    }
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.converged, "symmetric: did not converge"
+    p1 = sol.entities["e1"]["p"]; p2 = sol.entities["e2"]["p"]
+    # mirror of (2,3) across x=5 is (8,3)
+    assert abs(p2[0]-8.0) < 1e-5 and abs(p2[1]-3.0) < 1e-5, \
+        f"symmetric mirror wrong: e2={p2}, expected (8,3)"
+    print(f"[symmetric_mirror] e1={p1}, e2={p2}")
+
+
+def test_schema_validates_collinear_coradial() -> None:
+    """schema.py accepts well-formed collinear/coradial and rejects wrong ref kinds."""
+    from engine.doc.schema import validate_constraint
+    by_id = {
+        "e1": {"id": "e1", "type": "line"},
+        "e2": {"id": "e2", "type": "line"},
+        "e3": {"id": "e3", "type": "circle"},
+        "e4": {"id": "e4", "type": "arc"},
+        "e5": {"id": "e5", "type": "point"},
+    }
+    g: set = set()
+    # collinear: two lines OK
+    assert validate_constraint(
+        {"id": "c1", "type": "collinear", "refs": ["e1", "e2"]}, "w", by_id, g) == []
+    # collinear: circle ref rejected
+    errs = validate_constraint(
+        {"id": "c2", "type": "collinear", "refs": ["e1", "e3"]}, "w", by_id, g)
+    assert any("collinear takes two line" in e for e in errs), errs
+    # collinear: sub-handle rejected
+    errs = validate_constraint(
+        {"id": "c3", "type": "collinear", "refs": ["e1", "e2.p1"]}, "w", by_id, g)
+    assert any("collinear takes two line" in e for e in errs), errs
+    # coradial: circle+arc OK
+    assert validate_constraint(
+        {"id": "c4", "type": "coradial", "refs": ["e3", "e4"]}, "w", by_id, g) == []
+    # coradial: line ref rejected
+    errs = validate_constraint(
+        {"id": "c5", "type": "coradial", "refs": ["e3", "e1"]}, "w", by_id, g)
+    assert any("coradial takes two arc/circle" in e for e in errs), errs
+    # coradial: point ref rejected
+    errs = validate_constraint(
+        {"id": "c6", "type": "coradial", "refs": ["e3", "e5"]}, "w", by_id, g)
+    assert any("coradial takes two arc/circle" in e for e in errs), errs
+    # arity still enforced
+    errs = validate_constraint(
+        {"id": "c7", "type": "collinear", "refs": ["e1"]}, "w", by_id, g)
+    assert any("takes 2..2 refs" in e for e in errs), errs
+    print("[schema] collinear/coradial validation OK")
+
+
+def test_horizontal_vertical_both_forms() -> None:
+    """horizontal/vertical accept both the 1-line form and the 2-point form."""
+    # 1-line form
+    s_line = {
+        "entities": [{"id": "e1", "type": "line", "construction": False,
+                      "p1": [0.0, 0.0], "p2": [10.0, 4.0]}],
+        "constraints": [
+            {"id": "c1", "type": "fix", "refs": ["e1.p1"]},
+            {"id": "c2", "type": "horizontal", "refs": ["e1"]},
+        ],
+    }
+    sol = solve_sketch(s_line, {}, warm=None)
+    assert sol.converged
+    ln = sol.entities["e1"]
+    assert abs(ln["p1"][1] - ln["p2"][1]) < 1e-6, f"1-line horizontal failed: {ln}"
+
+    # 2-point form (horizontal: ya == yb)
+    s_pts = {
+        "entities": [
+            {"id": "e1", "type": "point", "construction": False, "p": [0.0, 0.0]},
+            {"id": "e2", "type": "point", "construction": False, "p": [10.0, 7.0]},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "fix", "refs": ["e1"]},
+            {"id": "c2", "type": "horizontal", "refs": ["e1.p", "e2.p"]},
+        ],
+    }
+    sol2 = solve_sketch(s_pts, {}, warm=None)
+    assert sol2.converged
+    assert abs(sol2.entities["e2"]["p"][1] - 0.0) < 1e-6, \
+        f"2-point horizontal failed: {sol2.entities['e2']}"
+
+    # 2-point vertical (xa == xb)
+    s_pts_v = copy.deepcopy(s_pts)
+    s_pts_v["constraints"][1] = {"id": "c2", "type": "vertical", "refs": ["e1.p", "e2.p"]}
+    sol3 = solve_sketch(s_pts_v, {}, warm=None)
+    assert sol3.converged
+    assert abs(sol3.entities["e2"]["p"][0] - 0.0) < 1e-6, \
+        f"2-point vertical failed: {sol3.entities['e2']}"
+    print("[hv_forms] 1-line + 2-point horizontal/vertical all hold")
+
+
+def test_point_line_distance_jacobian_fd() -> None:
+    """C50g regression: the point-line distance analytic Jacobian must match finite differences,
+    INCLUDING the line-endpoint partials.
+
+    The original implementation copied d_cross2 from _add_tangent_line_circle, whose cross uses
+    the opposite sign convention ((A-C) vs (P-A)) — all four line partials came in negated. The
+    point partials were correct, so any test where the line was pinned still passed, but a free
+    line made the QR rank analysis see a garbage row (phantom DOF loss, missed redundancy) and
+    broke Newton steps (spurious non-convergence)."""
+    from engine.doc.sketch_solver import _allocate_entity, _add_distance
+    from engine.doc.nsolve import System
+
+    # Two generic (tilted, non-degenerate) lines; distance from L1.p1 to infinite line L2.
+    ents = {
+        "L1": {"id": "L1", "type": "line", "p1": [1.3, 4.1], "p2": [7.2, 2.5]},
+        "L2": {"id": "L2", "type": "line", "p1": [-2.0, -1.5], "p2": [6.0, 3.7]},
+    }
+    sys = System()
+    var_map = {eid: _allocate_entity(sys, e) for eid, e in ents.items()}
+    _add_distance(sys, "c0", "L1.p1", "L2", 3.0, ents, var_map)
+
+    blk = sys._blocks[-1]
+    # BOTH sign branches of |cross|: the original config has cross > 0; mirroring the point to the
+    # other side of the line flips cross < 0 (the C50g dd() bug only bit on the negative branch —
+    # sgn was applied to the d_L term too, garbage exactly when cross < 0 and the line is free).
+    for label, full in (
+        ("cross>0", np.array([1.3, 4.1, 7.2, 2.5, -2.0, -1.5, 6.0, 3.7])),
+        ("cross<0", np.array([1.3, -4.6, 7.2, 2.5, -2.0, -1.5, 6.0, 3.7])),
+    ):
+        xs = full[blk.var_idx]
+        J = np.atleast_2d(blk.jfunc(xs))
+        eps = 1e-7
+        for k in range(len(xs)):
+            xp = xs.copy(); xp[k] += eps
+            xm = xs.copy(); xm[k] -= eps
+            fd = (blk.rfunc(xp)[0] - blk.rfunc(xm)[0]) / (2 * eps)
+            assert abs(J[0, k] - fd) < 1e-5, \
+                f"point-line distance ({label}) dJ/dx[{k}]: analytic {J[0, k]:.8f} vs FD {fd:.8f}"
+    print("[pl_jacobian] point-line distance Jacobian matches FD on both |cross| branches")
+
+
+def test_point_line_gap_redundant_with_connector_length() -> None:
+    """C50g regression (user repro): top/bottom horizontal rails joined by a vertical connector
+    whose length is dimensioned — a point-line gap dim between the rails is REDUNDANT, must be
+    tagged so (not silently eat a phantom DOF), and must not flip the sketch to non-converged."""
+    sk = {
+        "entities": [
+            {"id": "T", "type": "line", "p1": [0.0, 27.45], "p2": [60.0, 27.45]},
+            {"id": "V", "type": "line", "p1": [0.0, 27.45], "p2": [0.0, 0.0]},
+            {"id": "B", "type": "line", "p1": [0.0, 0.0], "p2": [60.0, 0.0]},
+        ],
+        "constraints": [
+            {"id": "c0", "type": "coincident", "refs": ["T.p1", "V.p1"]},
+            {"id": "c1", "type": "coincident", "refs": ["V.p2", "B.p1"]},
+            {"id": "c2", "type": "horizontal", "refs": ["T"]},
+            {"id": "c3", "type": "horizontal", "refs": ["B"]},
+            {"id": "c4", "type": "vertical", "refs": ["V"]},
+            {"id": "c5", "type": "distance", "refs": ["V.p1", "V.p2"],
+             "value": {"value": 27.45, "expr": None}},
+        ],
+    }
+    base = solve_sketch(copy.deepcopy(sk), {}, warm=None)
+    assert base.converged and not base.conflicting and not base.redundant, \
+        f"baseline: converged={base.converged} conf={base.conflicting} red={base.redundant}"
+
+    sk2 = copy.deepcopy(sk)
+    sk2["constraints"].append({"id": "c6", "type": "distance", "refs": ["T.p1", "B"],
+                               "value": {"value": 27.45, "expr": None}})
+    sol = solve_sketch(sk2, {}, warm=None)
+    assert sol.converged, "duplicate gap dim must not break convergence"
+    assert not sol.conflicting, f"consistent duplicate must not conflict: {sol.conflicting}"
+    assert sol.redundant == ["c6"], \
+        f"duplicate point-line gap must blame the newly-added dim c6, got {sol.redundant}"
+    assert sol.dof == base.dof, \
+        f"redundant dim must not eat a DOF (phantom rank): {base.dof} -> {sol.dof}"
+    print(f"[pl_redundant] gap dim tagged redundant={sol.redundant}, dof stays {sol.dof}")
+
+
+def test_all_constraint_jacobians_fd_sweep() -> None:
+    """C50g insurance: finite-difference-validate EVERY constraint type's analytic Jacobian at
+    randomized configurations (fixed seed), covering both sign branches of abs()-style residuals.
+
+    Two separate sign bugs in this family already shipped (point-line distance line partials;
+    sgn applied to the d_L quotient term in point-line distance AND line-circle tangent). A wrong
+    Jacobian row doesn't just slow the solver — it poisons the QR rank analysis: missed
+    redundancy = silent over-define, and false non-convergence = spurious over-define warnings."""
+    from engine.doc.sketch_solver import _allocate_entity, _add_constraint
+    from engine.doc.nsolve import System
+
+    rng = np.random.default_rng(20260612)
+
+    def ents():
+        """Fresh entity set with randomized geometry: 3 lines, 2 circles, arc, 2 points."""
+        def rp(lo=-30.0, hi=30.0):
+            return [float(v) for v in rng.uniform(lo, hi, 2)]
+        return {
+            "l1": {"id": "l1", "type": "line", "p1": rp(), "p2": rp()},
+            "l2": {"id": "l2", "type": "line", "p1": rp(), "p2": rp()},
+            "l3": {"id": "l3", "type": "line", "p1": rp(), "p2": rp()},
+            "k1": {"id": "k1", "type": "circle", "center": rp(), "radius": float(rng.uniform(2, 9))},
+            "k2": {"id": "k2", "type": "circle", "center": rp(), "radius": float(rng.uniform(2, 9))},
+            "a1": {"id": "a1", "type": "arc", "center": rp(), "radius": float(rng.uniform(2, 9)),
+                   "start": 0.4, "end": 2.2},
+            "p1": {"id": "p1", "type": "point", "p": rp()},
+            "p2": {"id": "p2", "type": "point", "p": rp()},
+        }
+
+    CASES = [
+        {"type": "coincident", "refs": ["l1.p2", "l2.p1"]},
+        {"type": "horizontal", "refs": ["l1"]},
+        {"type": "horizontal", "refs": ["p1", "p2"]},
+        {"type": "vertical", "refs": ["l1"]},
+        {"type": "vertical", "refs": ["p1", "p2"]},
+        {"type": "parallel", "refs": ["l1", "l2"]},
+        {"type": "perpendicular", "refs": ["l1", "l2"]},
+        {"type": "collinear", "refs": ["l1", "l2"]},
+        {"type": "tangent", "refs": ["l1", "k1"]},
+        {"type": "tangent", "refs": ["k1", "k2"]},
+        {"type": "tangent", "refs": ["l1", "a1"]},
+        {"type": "equal", "refs": ["l1", "l2"]},
+        {"type": "equal", "refs": ["k1", "k2"]},
+        {"type": "equal", "refs": ["a1", "k1"]},
+        {"type": "concentric", "refs": ["k1", "k2"]},
+        {"type": "coradial", "refs": ["k1", "k2"]},
+        {"type": "midpoint", "refs": ["p1", "l1"]},
+        {"type": "symmetric", "refs": ["p1", "p2", "l1"]},
+        {"type": "point_on", "refs": ["p1", "l1"]},
+        {"type": "point_on", "refs": ["p1", "k1"]},
+        {"type": "distance", "refs": ["p1", "p2"], "value": {"value": 11.0, "expr": None}},
+        {"type": "distance", "refs": ["p1", "p2"], "axis": "h", "value": {"value": 7.0, "expr": None}},
+        {"type": "distance", "refs": ["p1", "p2"], "axis": "v", "value": {"value": 7.0, "expr": None}},
+        {"type": "distance", "refs": ["p1", "l1"], "value": {"value": 5.0, "expr": None}},
+        {"type": "distance", "refs": ["k1", "l1"], "cond": ["center", "center"],
+         "value": {"value": 5.0, "expr": None}},
+        {"type": "distance", "refs": ["k1", "l1"], "cond": ["min", "center"],
+         "value": {"value": 5.0, "expr": None}},
+        {"type": "distance", "refs": ["k1", "k2"], "cond": ["min", "max"],
+         "value": {"value": 5.0, "expr": None}},
+        {"type": "angle", "refs": ["l1", "l2"], "value": {"value": 30.0, "expr": None}},
+        {"type": "radius", "refs": ["k1"], "value": {"value": 6.0, "expr": None}},
+        {"type": "diameter", "refs": ["k1"], "value": {"value": 12.0, "expr": None}},
+    ]
+
+    TRIALS = 6   # randomized geometry per case — catches branch-dependent (sgn) bugs
+    eps = 1e-6
+    checked = 0
+    for case in CASES:
+        for trial in range(TRIALS):
+            entities = ents()
+            sys = System()
+            var_map = {eid: _allocate_entity(sys, e) for eid, e in entities.items()}
+            n_before = len(sys._blocks)
+            con = dict(case); con["id"] = "cX"
+            try:
+                _add_constraint(sys, con, entities, var_map, {})
+            except Exception as exc:  # noqa: BLE001
+                raise AssertionError(f"{case}: _add_constraint raised {exc!r}") from exc
+            assert len(sys._blocks) > n_before, f"{case}: no residual registered"
+            # Random x near the entity geometry (perturbed so residuals are off-zero, generic).
+            x = np.zeros(sys.n_vars)
+            for eid, e in entities.items():
+                idx = var_map[eid]
+                flat = []
+                if e["type"] == "line":
+                    flat = [*e["p1"], *e["p2"]]
+                elif e["type"] in ("circle",):
+                    flat = [*e["center"], e["radius"]]
+                elif e["type"] == "arc":
+                    flat = [*e["center"], e["radius"], e["start"], e["end"]]
+                elif e["type"] == "point":
+                    flat = [*e["p"]]
+                x[idx[:len(flat)]] = flat
+            x += rng.uniform(-0.5, 0.5, len(x))
+            for blk in sys._blocks[n_before:]:
+                xs = x[blk.var_idx]
+                J = np.atleast_2d(blk.jfunc(xs))
+                for k in range(len(xs)):
+                    xp = xs.copy(); xp[k] += eps
+                    xm = xs.copy(); xm[k] -= eps
+                    fd = (np.atleast_1d(blk.rfunc(xp)) - np.atleast_1d(blk.rfunc(xm))) / (2 * eps)
+                    err = float(np.abs(J[:, k] - fd).max())
+                    assert err < 5e-4, (
+                        f"{case} trial {trial}: dJ/dx[{k}] analytic {J[:, k]} vs FD {fd} "
+                        f"(err {err:.2e})")
+                    checked += 1
+    print(f"[fd_sweep] {checked} Jacobian columns FD-validated across {len(CASES)} constraint forms")
+
+
+def test_user_recipe_two_squares_overdefine() -> None:
+    """C50g regression (user recipe 1): two stacked rectangles, left vertical lengths dimmed,
+    middle gap dimmed (point-line), then the OUTER gap dim must be tagged redundant when
+    consistent and must reject (freeze-class) when contradictory."""
+    def rect(prefix, x0, y0, w, h):
+        b, r_, t, l = f"{prefix}B", f"{prefix}R", f"{prefix}T", f"{prefix}L"
+        ents = [
+            {"id": b, "type": "line", "p1": [x0, y0], "p2": [x0+w, y0]},
+            {"id": r_, "type": "line", "p1": [x0+w, y0], "p2": [x0+w, y0+h]},
+            {"id": t, "type": "line", "p1": [x0+w, y0+h], "p2": [x0, y0+h]},
+            {"id": l, "type": "line", "p1": [x0, y0+h], "p2": [x0, y0]},
+        ]
+        cons = [
+            {"id": f"{prefix}c0", "type": "coincident", "refs": [f"{b}.p2", f"{r_}.p1"]},
+            {"id": f"{prefix}c1", "type": "coincident", "refs": [f"{r_}.p2", f"{t}.p1"]},
+            {"id": f"{prefix}c2", "type": "coincident", "refs": [f"{t}.p2", f"{l}.p1"]},
+            {"id": f"{prefix}c3", "type": "coincident", "refs": [f"{l}.p2", f"{b}.p1"]},
+            {"id": f"{prefix}c4", "type": "horizontal", "refs": [b]},
+            {"id": f"{prefix}c5", "type": "horizontal", "refs": [t]},
+            {"id": f"{prefix}c6", "type": "vertical", "refs": [r_]},
+            {"id": f"{prefix}c7", "type": "vertical", "refs": [l]},
+        ]
+        return ents, cons
+
+    eA, cA = rect("A", 0, 0, 30, 20)
+    eB, cB = rect("B", 0, 28, 30, 20)
+    base_cons = cA + cB + [
+        {"id": "d1", "type": "distance", "refs": ["AL.p1", "AL.p2"], "value": {"value": 20.0, "expr": None}},
+        {"id": "d2", "type": "distance", "refs": ["BL.p1", "BL.p2"], "value": {"value": 20.0, "expr": None}},
+        {"id": "d3", "type": "distance", "refs": ["AT.p1", "BB"], "value": {"value": 8.0, "expr": None}},
+    ]
+    sk = {"entities": eA + eB, "constraints": list(base_cons)}
+    pre = solve_sketch(copy.deepcopy(sk), {}, warm=None)
+    assert pre.converged and not pre.redundant and not pre.conflicting
+
+    good = copy.deepcopy(sk)
+    good["constraints"].append({"id": "d4", "type": "distance", "refs": ["AB.p1", "BT"],
+                                "value": {"value": 48.0, "expr": None}})
+    sol = solve_sketch(good, {}, warm=None)
+    assert sol.converged and sol.redundant and not sol.conflicting, \
+        f"consistent outer dim: converged={sol.converged} red={sol.redundant} conf={sol.conflicting}"
+    assert sol.dof == pre.dof, f"outer dim ate a phantom DOF: {pre.dof} -> {sol.dof}"
+
+    bad = copy.deepcopy(sk)
+    bad["constraints"].append({"id": "d4", "type": "distance", "refs": ["AB.p1", "BT"],
+                               "value": {"value": 40.0, "expr": None}})
+    solb = solve_sketch(bad, {}, warm=None)
+    assert (not solb.converged) or solb.conflicting, \
+        "contradictory outer dim must fail convergence or tag a conflict (freeze trigger)"
+    print(f"[two_squares] consistent: redundant={sol.redundant}; "
+          f"contradictory: converged={solb.converged} red={solb.redundant}")
+
+
+def test_user_recipe_box_circle_overdefine() -> None:
+    """C50g regression (user recipe 2): box height + circle radius + circle-to-bottom dim,
+    then top-line-to-circle dim (center AND min-rim variants) must be tagged redundant when
+    consistent and reject when contradictory."""
+    ents = [
+        {"id": "CB", "type": "line", "p1": [0, 0], "p2": [30, 0]},
+        {"id": "CR", "type": "line", "p1": [30, 0], "p2": [30, 20]},
+        {"id": "CT", "type": "line", "p1": [30, 20], "p2": [0, 20]},
+        {"id": "CL", "type": "line", "p1": [0, 20], "p2": [0, 0]},
+        {"id": "K", "type": "circle", "center": [15.0, -12.0], "radius": 5.0},
+    ]
+    cons = [
+        {"id": "c0", "type": "coincident", "refs": ["CB.p2", "CR.p1"]},
+        {"id": "c1", "type": "coincident", "refs": ["CR.p2", "CT.p1"]},
+        {"id": "c2", "type": "coincident", "refs": ["CT.p2", "CL.p1"]},
+        {"id": "c3", "type": "coincident", "refs": ["CL.p2", "CB.p1"]},
+        {"id": "c4", "type": "horizontal", "refs": ["CB"]},
+        {"id": "c5", "type": "horizontal", "refs": ["CT"]},
+        {"id": "c6", "type": "vertical", "refs": ["CR"]},
+        {"id": "c7", "type": "vertical", "refs": ["CL"]},
+        {"id": "d1", "type": "distance", "refs": ["CL.p1", "CL.p2"], "value": {"value": 20.0, "expr": None}},
+        {"id": "d2", "type": "radius", "refs": ["K"], "value": {"value": 5.0, "expr": None}},
+        {"id": "d3", "type": "distance", "refs": ["K", "CB"], "cond": ["center", "center"],
+         "value": {"value": 12.0, "expr": None}},
+    ]
+    sk = {"entities": ents, "constraints": cons}
+    pre = solve_sketch(copy.deepcopy(sk), {}, warm=None)
+    assert pre.converged and not pre.redundant and not pre.conflicting
+
+    for label, cond, val in (("center", ["center", "center"], 32.0),
+                             ("min-rim", ["min", "center"], 27.0)):
+        good = copy.deepcopy(sk)
+        good["constraints"].append({"id": "d4", "type": "distance", "refs": ["K", "CT"],
+                                    "cond": cond, "value": {"value": val, "expr": None}})
+        sol = solve_sketch(good, {}, warm=None)
+        assert sol.converged and sol.redundant and not sol.conflicting, \
+            f"{label}: converged={sol.converged} red={sol.redundant} conf={sol.conflicting}"
+        assert sol.dof == pre.dof, f"{label}: phantom DOF {pre.dof} -> {sol.dof}"
+
+    bad = copy.deepcopy(sk)
+    bad["constraints"].append({"id": "d4", "type": "distance", "refs": ["K", "CT"],
+                               "cond": ["center", "center"], "value": {"value": 25.0, "expr": None}})
+    solb = solve_sketch(bad, {}, warm=None)
+    assert (not solb.converged) or solb.conflicting, \
+        "contradictory top-to-circle dim must fail convergence or tag a conflict"
+    print("[box_circle] center + min-rim variants tagged redundant; contradiction rejects")
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    test_point_line_distance_jacobian_fd()
+    test_point_line_gap_redundant_with_connector_length()
+    test_all_constraint_jacobians_fd_sweep()
+    test_user_recipe_two_squares_overdefine()
+    test_user_recipe_box_circle_overdefine()
     test_redundant_consistent_dim_flagged()
     test_line_midpoint_handle()
     test_warm_solve_respects_geometry_edits()
@@ -909,6 +1601,17 @@ def main() -> None:
     test_distance_cond_circle_circle()
     test_origin_refs()
     test_fix_whole_entity()
+    test_collinear()
+    test_collinear_redundant_over_parallel_coincident()
+    test_tangent_circle_circle_external()
+    test_tangent_circle_circle_internal()
+    test_tangent_arc_circle()
+    test_coradial()
+    test_equal_arc_circle_radius()
+    test_midpoint_tracks_moving_endpoints()
+    test_symmetric_mirrors_pair()
+    test_schema_validates_collinear_coradial()
+    test_horizontal_vertical_both_forms()
     print("\nSKETCH SOLVER TESTS PASSED")
 
 

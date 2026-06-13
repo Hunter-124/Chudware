@@ -49,6 +49,28 @@ static PMFieldDef Check(const char* key, const char* label, const char* group, b
     PMFieldDef f; f.kind = PMFieldKind::Check; f.key = key; f.label = label;
     f.group = group; f.checkDefault = def; return f;
 }
+// Integer param (pattern instance counts). No unit suffix.
+static PMFieldDef Int(const char* key, const char* label, const char* group, double def) {
+    PMFieldDef f; f.kind = PMFieldKind::Int; f.key = key; f.label = label;
+    f.group = group; f.dimDefault = def; f.unitLabel = ""; return f;
+}
+// Angle dim (shows "[deg]" instead of "[mm]"; value is plain degrees, like revolve's angle).
+static PMFieldDef Angle(const char* key, const char* label, const char* group, double def) {
+    PMFieldDef f = Dim(key, label, group, def); f.unitLabel = " [deg]"; return f;
+}
+// A datum-reference combo whose chosen value is emitted as a refs string ("axis.x"/"plane.right").
+// For _SEL_OR_DATUM slots (pattern direction, mirror plane, draft neutral plane).
+static PMFieldDef DatumRef(const char* key, const char* label, const char* group,
+                           const char* options, const char* labels) {
+    PMFieldDef f; f.kind = PMFieldKind::DatumRef; f.key = key; f.label = label;
+    f.group = group; f.comboOptions = options; f.comboLabels = labels; return f;
+}
+// A feature-id list (refs _FEAT_LIST), seeded from the FeatureManager selection — the features a
+// pattern/mirror replicates.
+static PMFieldDef FeatWell(const char* key, const char* label, const char* group) {
+    PMFieldDef f; f.kind = PMFieldKind::FeatureWell; f.key = key; f.label = label;
+    f.group = group; return f;
+}
 // Check/Dim that is disabled and shows "(coming soon)" — discoverability only, never serialised.
 static PMFieldDef CheckSoon(const char* key, const char* label, const char* group) {
     PMFieldDef f = Check(key, label, group, false); f.comingSoon = true; return f;
@@ -109,6 +131,24 @@ static const std::vector<PMFormDef>& forms() {
             Check ("flip",     "Reverse direction", "Direction", false),
             Check ("merge",    "Merge result",   "Options",   true),
         }},
+        // --- sweep ---  mode/merge ; profile[] (region) + path (sketch chain or model edge)
+        //   Engine (sweep.py): profile resolves like extrude (whole-sketch/index/centroid region or
+        //   model face); path = a sketch region selector (its edge chain becomes the spine) or a
+        //   model edge. The viewport region picker fills profile; path is seeded/clicked.
+        { "sweep", "Sweep", "sweep", {
+            Well      ("profile", "Profile",      "Profile and Path", K_FACE, true),
+            Well      ("path",    "Path",         "Profile and Path", K_EDGE, false),
+            ComboL    ("mode",    "Type",         "Options", "boss|cut", "Boss|Cut"),
+            Check     ("merge",   "Merge result", "Options", true),
+        }},
+        // --- loft ---  mode/ruled/merge ; sections[] (>=2 ordered region selectors)
+        //   Engine (loft.py): ThruSections through each section's outer wire, in list order.
+        { "loft", "Loft", "loft", {
+            Well      ("sections","Profiles",     "Profiles", K_FACE, true),
+            ComboL    ("mode",    "Type",         "Options", "boss|cut", "Boss|Cut"),
+            Check     ("ruled",   "Ruled (straight transitions)", "Options", false),
+            Check     ("merge",   "Merge result", "Options", true),
+        }},
         // --- fillet ---  radius / [radius2] ; edges[]  OR  full_round + middle_face
         //   C30-A: variable-size fillet. A ComboL "type" (constant|variable) gates radius2 via the
         //   existing DimIf/enableKey mechanism — mirrors the chamfer Symmetric|Asymmetric gating.
@@ -151,6 +191,67 @@ static const std::vector<PMFormDef>& forms() {
             Dim   ("thickness","Thickness", "Parameters", 2.0),
             Check ("outward",  "Shell outward",   "Parameters", false),
         }},
+        // --- hole (Hole Wizard) ---  face + style/standard/diameter/end/depth
+        //   Engine (hole.py): style simple|cbore|csink|tap; standard "custom" uses params.diameter,
+        //   else an ISO-metric table (M2..M12) supplies diameter (+cbore/csink dims). No positions =>
+        //   one hole at the face centre (multi-position grids are an engine capability the viewport
+        //   point picker can drive later). end through_all/blind; blind uses depth.
+        { "hole", "Hole", "hole_wizard", {
+            Well   ("face",     "Face",          "Hole Position", K_FACE, false),
+            ComboL ("style",    "Type",          "Hole Type",
+                    "simple|cbore|csink|tap", "Simple|Counterbore|Countersink|Tapped"),
+            ComboL ("standard", "Size standard", "Hole Type",
+                    "custom|M2|M2.5|M3|M4|M5|M6|M8|M10|M12",
+                    "Custom|M2|M2.5|M3|M4|M5|M6|M8|M10|M12"),
+            DimIf  ("diameter", "Diameter",      "Hole Type", 6.0, "standard", "custom"),
+            ComboL ("end",      "End Condition", "Direction",
+                    "through_all|blind", "Through All|Blind"),
+            DimIf  ("depth",    "Depth",         "Direction", 10.0, "end", "blind"),
+        }},
+        // --- mirror ---  plane (datum/face) + features[] (seeded from selection)
+        //   Engine (pattern.py compile_mirror): reflects each seed feature's tool body across the
+        //   plane with the same boolean; empty features => whole-body mirror + union.
+        { "mirror", "Mirror", "mirror_feature", {
+            DatumRef ("plane",    "Mirror Face/Plane", "Mirror Plane",
+                      "plane.right|plane.front|plane.top",
+                      "Right plane|Front plane|Top plane"),
+            FeatWell ("features", "Features to Mirror", "Features to Mirror"),
+        }},
+        // --- linear_pattern ---  dir1(+count/spacing), optional dir2, features[]
+        //   Engine (pattern.py compile_linear_pattern): lays down a count1×count2 grid of the seed
+        //   features' tool bodies (re-applying each boolean). count2=1 disables direction 2.
+        { "linear_pattern", "Linear Pattern", "linear_pattern", {
+            DatumRef ("dir1",     "Direction 1",  "Direction 1",
+                      "axis.x|axis.y|axis.z", "X axis|Y axis|Z axis"),
+            Int      ("count1",   "Instances",    "Direction 1", 3),
+            Dim      ("spacing1", "Spacing",      "Direction 1", 20.0),
+            DatumRef ("dir2",     "Direction 2",  "Direction 2",
+                      "axis.y|axis.x|axis.z", "Y axis|X axis|Z axis"),
+            Int      ("count2",   "Instances",    "Direction 2", 1),
+            Dim      ("spacing2", "Spacing",      "Direction 2", 20.0),
+            FeatWell ("features", "Features to Pattern", "Features to Pattern"),
+        }},
+        // --- circular_pattern ---  axis + count/angle + equal_spacing, features[]
+        //   Engine (pattern.py compile_circular_pattern): count instances about the axis; equal
+        //   spacing fills the angle (step = angle/count), else angle is the per-step increment.
+        { "circular_pattern", "Circular Pattern", "circular_pattern", {
+            DatumRef ("axis",     "Pattern Axis", "Parameters",
+                      "axis.z|axis.x|axis.y", "Z axis|X axis|Y axis"),
+            Int      ("count",    "Instances",    "Parameters", 4),
+            Angle    ("angle",    "Angle",        "Parameters", 360.0),
+            Check    ("equal_spacing", "Equal spacing", "Parameters", true),
+            FeatWell ("features", "Features to Pattern", "Features to Pattern"),
+        }},
+        // --- draft ---  angle + neutral plane + faces[]
+        //   Engine (draft.py): tapers each selected face about the line where it meets the neutral
+        //   plane (OCCT DraftAngle). Pull direction defaults to the neutral plane normal.
+        { "draft", "Draft", "draft", {
+            Angle    ("angle",   "Draft Angle",   "Draft", 3.0),
+            DatumRef ("neutral", "Neutral Plane", "Draft",
+                      "plane.top|plane.front|plane.right",
+                      "Top plane|Front plane|Right plane"),
+            Well     ("faces",   "Faces to Draft", "Draft", K_FACE, true),
+        }},
     };
     return kForms;
 }
@@ -172,6 +273,16 @@ const PMFormDef* pmFormForCommand(const std::string& cmdId, std::string& mode) {
     if (cmdId == "extrude_cut")   { mode = "cut";  return pmFindForm("extrude"); }
     if (cmdId == "revolve_boss")  { mode = "boss"; return pmFindForm("revolve"); }
     if (cmdId == "revolve_cut")   { mode = "cut";  return pmFindForm("revolve"); }
+    if (cmdId == "sweep_boss")    { mode = "boss"; return pmFindForm("sweep"); }
+    if (cmdId == "sweep_cut")     { mode = "cut";  return pmFindForm("sweep"); }
+    if (cmdId == "loft_boss")     { mode = "boss"; return pmFindForm("loft"); }
+    if (cmdId == "loft_cut")      { mode = "cut";  return pmFindForm("loft"); }
+    // Hole wizard, draft, and the feature pattern/mirror family (no boss/cut mode).
+    if (cmdId == "hole_wizard")      return pmFindForm("hole");
+    if (cmdId == "draft")            return pmFindForm("draft");
+    if (cmdId == "mirror_feature")   return pmFindForm("mirror");
+    if (cmdId == "linear_pattern")   return pmFindForm("linear_pattern");
+    if (cmdId == "circular_pattern") return pmFindForm("circular_pattern");
     // Primitive quick-start commands (AI-CAD extensions; not in the C14 ribbon but reachable
     // via the M1 scenario / future "Insert > Primitive" entries).
     if (cmdId == "box")           return pmFindForm("box");

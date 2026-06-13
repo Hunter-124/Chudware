@@ -354,4 +354,4 @@ def compile_hole(feat: dict, ctx: CompileContext) -> CompileOutput:
             resolved[k] = dims[k]
 
     bodies[-1] = result
-    return CompileOutput(bodies=bodies, tool_body=tool_solid, resolved=resolved)
+    return CompileOutput(bodies=bodies, tool_body=tool_solid, op="cut", resolved=resolved)

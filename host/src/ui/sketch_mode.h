@@ -116,6 +116,16 @@ public:
     // if any, is skipped — drawOverlay owns it).
     void drawGhosts(AppState& st, const ImVec2& imgMin, const ImVec2& imgMax, int vw, int vh);
 
+    // C51: feature-PM region picker. While a feature PropertyManager with a profile/sections well
+    // is open, the candidate sketches' even-odd regions are fetched (doc_sketch_regions) and drawn
+    // as fills in the viewport: subtle outline for every region, accent fill on hover, teal fill +
+    // bold edge for regions currently in the profile. Hovering highlights; left-click toggles the
+    // region into/out of the profile (whole-sketch <-> explicit, SolidWorks Selected-Contours). The
+    // picker owns the mouse over a region (returns true) so model picking doesn't also fire. Called
+    // from the Viewport panel when no sketch is being edited and a feature PM is active.
+    bool drawRegionPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin, const ImVec2& imgMax,
+                          int vw, int vh, bool imgHovered);
+
     // Short status line for the status bar ("Under Defined   DOF: 4"). Empty when inactive.
     std::string statusLine() const;
 
@@ -145,6 +155,12 @@ private:
     // ---- worker round-trips ----
     bool callSketch(AppState& st, const char* method, const nlohmann::json& extra,
                     nlohmann::json& result);
+    // C50f: read-only over-define pre-flight (sketch_probe RPC). `action` is the exact action
+    // object from worker_rpc.md §2 ({"add_constraint":{…}} / {"set_dim":{…}} / {"delete_constraint":{…}}).
+    // On success fills `would_over_define` (+ conflicting/redundant of the probe) and returns true;
+    // returns false on transport/RPC failure (caller falls back to committing normally, never blocks).
+    bool sketchProbe(AppState& st, const nlohmann::json& action, bool& wouldOverDefine,
+                     std::vector<std::string>& conflicting, std::vector<std::string>& redundant);
     void applyEnterResult(const nlohmann::json& res);
     void resolve(AppState& st);                 // sketch_solve -> refresh entities/statuses
     void commitDrag(AppState& st);              // sketch_drag_commit -> rebuild mesh
@@ -178,9 +194,20 @@ private:
     bool dimBuildPending(const ImVec2& cursor, float cu, float cv);  // picks -> dimPending_ (+axis)
     void dimOpenModify(const ImVec2& at);                       // open Modify box for dimPending_
     void dimCommit(AppState& st);                               // apply the Modify box value/expr
+    // C50g: hit-test geometry for one dimension annotation, populated by drawDimension. SolidWorks
+    // picks a dim by its TEXT box or its DIMENSION LINE (not the extension lines); we record both so
+    // the hover loop can do a rect test + segment-distance test. Up to two segments (the diameter
+    // leader straddles the circle as two collinear pieces; radius/distance use one).
+    struct DimHit {
+        std::string cid;
+        ImVec2 textMin{0, 0}, textMax{0, 0};   // rendered label bounding rect (already padded)
+        ImVec2 seg[2][2];                       // up to nSeg dimension-line segments (endpoints)
+        int nSeg = 0;
+    };
     // Render one dimension annotation (extension/dim lines, arrows, text). placement in (u,v).
+    // hitOut (optional) receives the text rect + dim-line segments for SolidWorks-style picking.
     void drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 lineCol, ImU32 textCol,
-                       bool hovered, float pu, float pv) const;
+                       bool hovered, float pu, float pv, DimHit* hitOut = nullptr) const;
     // Compute a sensible default placement (u,v) for a constraint that has none yet.
     bool defaultPlacement(const SketchConstraint& c, float& pu, float& pv) const;
     // Screen location of a dimension's text (for hover / drag / double-click hit-testing).
@@ -236,6 +263,28 @@ private:
     int ghostsRevision_ = -999;
     int ghostsGen_ = 0;              // supersede guard for in-flight overview responses
 
+    // ---- C51: feature-PM region picker state (engine even-odd regions) ----
+    struct PickRegion {
+        int index = 0;                                  // stable region ordinal (matches engine)
+        bool isMaterial = true;                         // even-depth = whole-sketch material
+        float centroid[2] = {0, 0};
+        std::vector<float> outer;                       // u,v,u,v,... boundary polyline
+        std::vector<std::vector<float>> holes;          // each u,v,... (even-odd hit test)
+        std::vector<float> tris;                        // u,v per vertex, 3 per tri (hole-aware fill)
+    };
+    struct RegionSketch {
+        std::string fid;
+        float frame[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        std::vector<PickRegion> regions;
+        bool loaded = false;
+    };
+    void refreshRegionPicker(AppState& st);   // re-fetch candidate sketches on doc/rev/candidate change
+    std::vector<RegionSketch> pickRegions_;
+    std::string pickDocId_;
+    int pickRevision_ = -999;
+    std::string pickCandidatesKey_;   // joined candidate fids — refetch when the set changes
+    int pickGen_ = 0;                 // supersede guard for in-flight region responses
+
     bool active_ = false;
     bool isNewEmpty_ = false;        // entered a freshly-created sketch (delete on cancel-exit)
     std::string fid_;
@@ -244,13 +293,40 @@ private:
     std::vector<std::string> conflicting_;   // C50: constraint ids the solver flagged conflicting
     std::vector<std::string> redundant_;     // C50: constraint ids that remove no DOF (over-define)
 
-    // C50: SolidWorks "Make Dimension Driven?" prompt. When a just-committed Smart Dimension
-    // over-defines the sketch (its id lands in conflicting_), this modal offers Make Driven /
-    // Keep Driving / Cancel(remove) instead of silently leaving an over-defined sketch.
+    // C50f: SolidWorks over-define pre-flight prompt for a NEW dimension. sketch_probe flagged the
+    // pending add as over-defining BEFORE it was committed; this modal offers three choices —
+    // Make Driven (default), Keep Driving, Cancel — and commits accordingly. The pending constraint
+    // json (placement + value/expr already attached) is stashed in overDefPendingCon_ so the chosen
+    // button commits it; nothing has been applied to the doc yet.
     bool overDefOpen_ = false;
-    std::string overDefCid_;         // the offending (just-added) constraint id
+    nlohmann::json overDefPendingCon_;   // the constraint to commit (Driven adds "driven":true)
     ImVec2 overDefPos_{0, 0};
     void drawOverDefinePrompt(AppState& st);
+    void overDefCommit(AppState& st, bool driven);   // commit overDefPendingCon_ (driving|driven)
+
+    // C50f: over-define pre-flight prompt for a dimension EDIT (sketch_set_dim). The probed new
+    // value contradicts other relations; Cancel keeps the old value (sends nothing), Apply anyway
+    // pushes it (the sketch goes over-defined with frozen geometry). The pending op is stashed.
+    bool editOverDefOpen_ = false;
+    nlohmann::json editOverDefOp_;       // the sketch_set_dim op to apply on "Apply anyway"
+    ImVec2 editOverDefPos_{0, 0};
+    void drawEditOverDefinePrompt(AppState& st);
+    void applyDimEditOp(AppState& st, const nlohmann::json& op);   // shared set_dim apply + refresh
+
+    // C50g: relation add pre-flight. Relations cannot be made driven, so an over-defining relation
+    // gets a Cancel / Add anyway prompt before the op mutates the document.
+    bool relOverDefOpen_ = false;
+    nlohmann::json relOverDefOps_;
+    std::string relOverDefLabel_;
+    ImVec2 relOverDefPos_{0, 0};
+    void addRelationOps(AppState& st, const nlohmann::json& ops, const std::string& label);
+    void applyRelationOps(AppState& st, const nlohmann::json& ops, const std::string& label);
+    void drawRelationOverDefinePrompt(AppState& st);
+
+    // C50f: transient warning shown when a solve response carried solve_rejected:true (the
+    // constraint system is contradictory and geometry is frozen at the last valid coords). Set by
+    // applyEnterResult; cleared when a later solve comes back solve_rejected:false.
+    bool solveRejected_ = false;
     float frame_[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};  // sketch(u,v,0)->world, row-major
     float camYaw_ = 0, camPitch_ = 89;
     // C34: pre-sketch camera, restored (animated) on exit.
@@ -305,6 +381,14 @@ private:
     // C42: emit N lines as a closed coincident-chained loop (generalized addQuadLoop, no per-edge
     // h/v). equalEdges adds "equal" relations between consecutive edges (Polygon regularity).
     void addPolyLoop(AppState& st, const std::vector<ImVec2>& corners, bool equalEdges);
+    // C51: emit a straight slot as REAL geometry — 2 side lines + 2 cap arcs + 1 construction
+    // centerline — joined by coincident endpoints (closure), the centerline ends coincident with
+    // the arc centers, and equal cap radii. SolidWorks-style: every piece is individually
+    // selectable + dimensionable (dimension to an arc center, shift-pick two sides for a relation).
+    // Only these NON-redundant relations are emitted (tangent/parallel come back redundant in our
+    // solver and would flag a false over-define), so the fresh slot is under-defined like any new
+    // sketch geometry — the user dimensions it. p1/p2 are the spine (arc-center) endpoints.
+    void addDecomposedSlot(AppState& st, const ImVec2& p1, const ImVec2& p2, float width);
     // C42: Polygon tool side count (set with number keys 3-9 while the tool is armed).
     int polySides_ = 6;
 
@@ -331,6 +415,83 @@ private:
     // pruned of vanished ids on every applyEnterResult refill.
     std::vector<std::string> selIds_;
     bool isSelected(const std::string& id) const;
+
+    // ---- C51: box (rubber-band) selection ----
+    // Dragging from empty canvas rubber-bands a selection rectangle (SolidWorks style):
+    // left->right = WINDOW (only entities fully enclosed); right->left = CROSSING (any entity
+    // the box touches). Ctrl makes the box ADD to the current selection instead of replacing it.
+    // A press in empty space arms the box (boxArmed_); moving past the threshold promotes it to a
+    // live drag (boxSelecting_); release that never moved is a plain click (clears, or selects a
+    // hot profile region — see below).
+    bool boxArmed_ = false;
+    bool boxSelecting_ = false;
+    bool boxCtrl_ = false;            // Ctrl state captured at press (additive box select)
+    ImVec2 boxStart_{0, 0};           // anchor corner (screen) of the rubber band
+    // Apply a finished box: select every entity window-enclosed (crossing=false) or touched
+    // (crossing=true) by the screen rect (a,b). additive keeps the existing selection.
+    void boxSelect(const ImVec2& a, const ImVec2& b, bool crossing, bool additive);
+
+    // ---- C51: closed-profile (region) shading + one-click loop select ----
+    // Closed loops are detected client-side from the live, non-construction entities (mirrors the
+    // engine connectivity walk in features/sketch.py). Each region is shaded faintly. Clicking a
+    // region's interior selects its whole loop IMMEDIATELY (no dwell). The dwell is repurposed:
+    // resting the cursor on a single entity edge for kLoopDwell seconds previews (highlights) the
+    // loop that edge belongs to, so a click then grabs the whole loop instead of the lone edge.
+    struct SketchRegion {
+        std::vector<std::string> ids;   // entity ids forming the closed loop
+        std::vector<ImVec2> poly;       // boundary polygon in sketch (u,v), CCW-ish, not closed-dup
+        float area = 0.0f;              // |signed area| in uv (innermost-region tie-break)
+    };
+    std::vector<SketchRegion> regions_;
+    void rebuildRegions();                            // refill regions_ from ents_
+    int  hitTestRegion(const ImVec2& s) const;        // smallest region under screen pt, or -1
+    int  regionContaining(const std::string& entId) const;   // multi-entity loop holding entId, or -1
+    // Sample an entity's boundary into sketch-(u,v) points. closed=true for self-closed shapes
+    // (circle/ellipse/slot); for line/arc the two endpoints bound an open polyline. Used by region
+    // detection, box-select containment, hit-testing and hover outlines.
+    void entityBoundaryUV(const SketchEntity& e, std::vector<ImVec2>& out, bool& closed) const;
+    // Stroke an entity's outline (hover pre-highlight / loop preview), drawn on top of geometry.
+    void strokeEntityOutline(ImDrawList* dl, const SketchEntity& e, ImU32 c, float th) const;
+    bool regionValid(int idx) const { return idx >= 0 && idx < (int)regions_.size(); }
+    int   hotRegion_ = -1;            // region to render brightened this frame (hover/loop preview)
+    // Entity-edge dwell -> loop preview. While the cursor rests on the same single entity that
+    // belongs to a closed loop, dwellAccum_ grows; past kLoopDwell, entityLoopRegion_ names that
+    // loop so the pre-highlight + click target expand from the lone edge to the whole loop.
+    std::string dwellEnt_;
+    float dwellAccum_ = 0.0f;
+    int   entityLoopRegion_ = -1;
+
+    // ---- C51: geometric-relation selection ----
+    // Relation badges (coincident / h / v / parallel / …) are click-selectable like entities. A
+    // selected relation renders in the accent color and Delete removes it (sketch_delete_constraint).
+    // relHits_ is refilled every frame as the badges are drawn (screen rects + constraint id), then
+    // hit-tested by the interaction pass; hoverRelCid_ carries one frame of hover for the tint.
+    struct RelHit { std::string cid; ImVec2 lo, hi; };
+    std::vector<RelHit> relHits_;
+    std::string hoverRelCid_;
+    std::vector<std::string> selRelIds_;
+    bool isRelSelected(const std::string& cid) const;
+    int  hitTestRelationBadge(const ImVec2& s) const;   // index into relHits_, or -1
+
+    // ---- C51: whole-entity / profile / multi-select DRAG (translate, not reshape) ----
+    // Pressing on an entity BODY (not a vertex handle) or inside a multi-entity profile arms a
+    // group drag; moving past the threshold translates every entity in the set together via the
+    // sketch_drag `targets` list (each defining point soft-targeted at orig+delta, so constraints
+    // stay exact). A press that never moves falls back to a plain click (select entity / loop).
+    bool groupDragArmed_ = false;
+    bool groupDragging_ = false;
+    ImVec2 groupDragStartUV_{0, 0};
+    std::vector<std::pair<std::string, ImVec2>> groupDragTargets_;   // (handle, orig u,v)
+    int groupClickKind_ = 0;          // release-without-move: 0=clear/none, 1=select entity, 2=loop
+    std::string groupClickEnt_;       // entity id for kind 1
+    int groupClickRegion_ = -1;       // region index for kind 2
+    // Enumerate the point handles that rigidly translate entity e, with their current (u,v).
+    void entityDragHandles(const SketchEntity& e,
+                           std::vector<std::pair<std::string, ImVec2>>& out) const;
+    // Begin a group drag of `ids` (capture their translation handles from the current coords).
+    void beginGroupDrag(const std::vector<std::string>& ids, float startU, float startV);
+    // Push one frame of the in-progress group translation to the worker (delta from start).
+    void updateGroupDrag(AppState& st, float curU, float curV);
 
     // Trim power-sweep state: LMB held after a trim keeps trimming entities the cursor crosses.
     bool trimSweeping_ = false;

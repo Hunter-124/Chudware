@@ -551,6 +551,226 @@ def _region_descriptor(face: Face, loop_index: int, plane: Plane | None = None) 
     }
 
 
+# --------------------------------------------------------------------------- region nesting (even-odd)
+
+
+def _loop_polyline(loop_edges: list) -> list[tuple[float, float]]:
+    """Sample a closed loop into an ordered 2-D polyline (XY sketch space).
+
+    Builds a build123d Wire (which orders + orients the edges head-to-tail) and samples it at
+    a curvature-aware point count. Used for containment tests and the viewport region overlay.
+    The polyline is implicitly closed (last point connects back to the first)."""
+    try:
+        w = Wire(loop_edges)
+    except Exception:  # noqa: BLE001
+        # Endpoint fallback (degenerate / unorderable): chain raw endpoints.
+        pts: list[tuple[float, float]] = []
+        for e in loop_edges:
+            (sx, sy), _ = _endpoints(e)
+            pts.append((sx, sy))
+        return pts
+    npts = max(48, 16 * len(loop_edges))
+    out: list[tuple[float, float]] = []
+    for i in range(npts):
+        try:
+            p = w.position_at(i / npts)
+            out.append((float(p.X), float(p.Y)))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _poly_area_centroid(pts: list[tuple[float, float]]) -> tuple[float, tuple[float, float]]:
+    """Shoelace signed area + centroid of a closed 2-D polyline."""
+    n = len(pts)
+    if n < 3:
+        if not pts:
+            return 0.0, (0.0, 0.0)
+        mx = sum(p[0] for p in pts) / n
+        my = sum(p[1] for p in pts) / n
+        return 0.0, (mx, my)
+    a = cx = cy = 0.0
+    for i in range(n):
+        x0, y0 = pts[i]
+        x1, y1 = pts[(i + 1) % n]
+        cross = x0 * y1 - x1 * y0
+        a += cross
+        cx += (x0 + x1) * cross
+        cy += (y0 + y1) * cross
+    a *= 0.5
+    if abs(a) < 1e-12:
+        mx = sum(p[0] for p in pts) / n
+        my = sum(p[1] for p in pts) / n
+        return 0.0, (mx, my)
+    return a, (cx / (6.0 * a), cy / (6.0 * a))
+
+
+def _point_in_poly(pt: tuple[float, float], poly: list[tuple[float, float]]) -> bool:
+    """Ray-casting point-in-polygon for a closed 2-D polyline."""
+    x, y = pt
+    inside = False
+    n = len(poly)
+    if n < 3:
+        return False
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-30) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _orient_ccw(loop_edges: list) -> list:
+    """Return *loop_edges* wound counter-clockwise (positive signed area in sketch uv).
+
+    The sketch solver may emit a loop in either winding; OCCT's hole logic needs a KNOWN
+    relative orientation between outer and inner wires, so we normalise every loop to CCW
+    first (then the hole is reversed to CW when added). Without this, a clockwise outer loop
+    made the hole reversal a no-op — the circle was added as material instead of subtracted
+    (square+circle extruded as a filled square + disc instead of a washer)."""
+    area, _ = _poly_area_centroid(_loop_polyline(loop_edges))
+    if area >= 0:
+        return loop_edges
+    from OCP.TopoDS import TopoDS
+    return [Edge(TopoDS.Edge_s(e.wrapped.Reversed())) for e in reversed(loop_edges)]
+
+
+def _region_face(outer_edges: list, hole_edge_lists: list[list], plane: Plane) -> Face | None:
+    """Build a planar Face from an outer loop minus inner (hole) loops, lifted to plane space.
+
+    Outer + hole loops are normalised to CCW first, then each hole is added reversed (CW) so the
+    relative orientation is always correct regardless of how the solver wound the input loops."""
+    try:
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+        from OCP.TopoDS import TopoDS
+
+        outer_w = Wire([plane.location * e for e in _orient_ccw(outer_edges)])
+        if not outer_w.is_valid:
+            return None
+        mf = BRepBuilderAPI_MakeFace(outer_w.wrapped, True)
+        for hedges in hole_edge_lists:
+            hw = Wire([plane.location * e for e in _orient_ccw(hedges)])
+            if not hw.is_valid:
+                continue
+            # Both wires are now CCW — reverse the hole to CW so OCCT subtracts it.
+            mf.Add(TopoDS.Wire_s(hw.wrapped.Reversed()))
+        if not mf.IsDone():
+            return None
+        return Face(mf.Face())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def region_triangles_2d(face: Face, plane: Plane) -> list[list[list[float]]]:
+    """Tessellate a region face into hole-aware 2-D triangles in sketch-local (u,v) coords.
+
+    The host fills these (lifted via plane_frame) to highlight a hovered/selected region — a
+    washer (square-with-hole) fills correctly because OCCT meshes the trimmed face. Returns a
+    list of ``[[u,v],[u,v],[u,v]]`` triangles (empty if meshing fails)."""
+    try:
+        from OCP.BRep import BRep_Tool
+        from OCP.BRepMesh import BRepMesh_IncrementalMesh
+        from OCP.TopLoc import TopLoc_Location
+
+        BRepMesh_IncrementalMesh(face.wrapped, 0.25, False, 0.5, True).Perform()
+        loc = TopLoc_Location()
+        tri = BRep_Tool.Triangulation_s(face.wrapped, loc)
+        if tri is None:
+            return []
+        trsf = loc.Transformation()
+        ident = loc.IsIdentity()
+        ox, oy, oz = plane.origin.X, plane.origin.Y, plane.origin.Z
+        xd, yd = plane.x_dir, plane.y_dir
+
+        def _uv(i: int) -> list[float]:
+            nd = tri.Node(i)
+            if not ident:
+                nd.Transform(trsf)
+            dx, dy, dz = nd.X() - ox, nd.Y() - oy, nd.Z() - oz
+            return [dx * xd.X + dy * xd.Y + dz * xd.Z,
+                    dx * yd.X + dy * yd.Y + dz * yd.Z]
+
+        nodes = [_uv(i) for i in range(1, tri.NbNodes() + 1)]
+        out: list[list[list[float]]] = []
+        for ti in range(1, tri.NbTriangles() + 1):
+            a, b, c = tri.Triangle(ti).Get()
+            out.append([nodes[a - 1], nodes[b - 1], nodes[c - 1]])
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def compute_regions(all_edges: list, plane: Plane) -> tuple[list[Face], list[dict[str, Any]]]:
+    """Detect closed loops, resolve even-odd nesting, and build region faces + descriptors.
+
+    Each closed loop becomes ONE region whose face is that loop minus its DIRECT child loops
+    (holes). ``depth`` = number of enclosing loops; ``is_material`` = depth is even. The
+    whole-sketch profile (extrude/revolve default) unions only material regions, so a circle
+    inside a square extrudes as a washer (SolidWorks even-odd). Every loop — material or void —
+    is still an individually selectable region (SolidWorks "Selected Contours").
+
+    Returns ``(faces, descs)`` paired and sorted by centroid for stable indices. Each desc:
+    ``{centroid:[u,v], area_or_len, hint_index, index, depth, is_material, outer:[[u,v]...],
+    holes:[[[u,v]...]...]}`` (``outer``/``holes`` in sketch-local 2-D for the viewport overlay)."""
+    loops = _detect_loops(all_edges)
+    if not loops:
+        return [], []
+
+    polys = [_loop_polyline(le) for le in loops]
+    areas: list[float] = []
+    cents: list[tuple[float, float]] = []
+    for pl in polys:
+        a, c = _poly_area_centroid(pl)
+        areas.append(abs(a))
+        cents.append(c)
+
+    n = len(loops)
+    depth = [0] * n
+    parent = [-1] * n
+    for i in range(n):
+        best = -1
+        best_area: float | None = None
+        for j in range(n):
+            if i == j or areas[j] <= areas[i]:
+                continue
+            if _point_in_poly(cents[i], polys[j]):
+                depth[i] += 1
+                if best_area is None or areas[j] < best_area:
+                    best_area, best = areas[j], j
+        parent[i] = best
+
+    children: list[list[int]] = [[] for _ in range(n)]
+    for i in range(n):
+        if parent[i] >= 0:
+            children[parent[i]].append(i)
+
+    faces: list[Face] = []
+    descs: list[dict[str, Any]] = []
+    for i in range(n):
+        face = _region_face(loops[i], [loops[c] for c in children[i]], plane)
+        if face is None:
+            continue
+        desc = _region_descriptor(face, i, plane=plane)
+        desc["depth"] = depth[i]
+        desc["is_material"] = (depth[i] % 2 == 0)
+        desc["outer"] = [[float(x), float(y)] for (x, y) in polys[i]]
+        desc["holes"] = [[[float(x), float(y)] for (x, y) in polys[c]] for c in children[i]]
+        faces.append(face)
+        descs.append(desc)
+
+    if faces:
+        paired = sorted(zip(descs, faces),
+                        key=lambda p: (p[0]["centroid"][0], p[0]["centroid"][1]))
+        descs = [d for d, _ in paired]
+        faces = [f for _, f in paired]
+        for i, d in enumerate(descs):
+            d["hint_index"] = i
+            d["index"] = i
+    return faces, descs
+
+
 # --------------------------------------------------------------------------- compiler
 
 
@@ -577,36 +797,10 @@ def compile_sketch(feat: dict, ctx: CompileContext) -> CompileOutput:
             continue
         all_edges.extend(_entity_to_edges(ent))
 
-    # Detect loops
-    loops = _detect_loops(all_edges)
-
-    # Build region faces
-    region_faces: list[Face] = []
-    region_descs: list[dict[str, Any]] = []
-
-    for i, loop_edges in enumerate(loops):
-        face = _loop_to_face(loop_edges, plane)
-        if face is None:
-            continue
-        # Order by (cx, cy) on the descriptor for selector stability
-        desc = _region_descriptor(face, i, plane=plane)
-        region_faces.append(face)
-        region_descs.append(desc)
-
-    # Sort regions by centroid for selector stability (selectors.md §4)
-    paired = sorted(zip(region_descs, region_faces),
-                    key=lambda x: (x[0]["centroid"][0], x[0]["centroid"][1]))
-    if paired:
-        region_descs, region_faces = zip(*paired)  # type: ignore[assignment]
-        region_descs = list(region_descs)
-        region_faces = list(region_faces)
-    else:
-        region_descs = []
-        region_faces = []
-
-    # Re-index hint_index after sorting
-    for i, desc in enumerate(region_descs):
-        desc["hint_index"] = i
+    # Detect loops + build even-odd region faces (outer loops carry their contained loops as
+    # holes; every loop is still an individually selectable region). compute_regions handles
+    # nesting, hole subtraction, centroid sort and hint_index assignment.
+    region_faces, region_descs = compute_regions(all_edges, plane)
 
     # Store regions persistently via ctx.datums so extrude/revolve can access them
     # across feature boundaries (ctx is re-created per feature but datums is shared).

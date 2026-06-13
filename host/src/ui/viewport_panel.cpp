@@ -686,11 +686,19 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             sketch->drawOverlay(st, io, vr0, vr1, vw, vh, imgHovered);
         }
 
+        // ---- C51: feature-PM region picker (hover-highlight + click-to-toggle profiles) ----
+        // Runs when a feature PropertyManager with a profile/sections well is open and no sketch is
+        // being edited. Returns true while the cursor is over a sketch region, so the model-pick
+        // click below is suppressed (a region click must not also select a model face/edge).
+        bool regionPickerHot = false;
+        if (sketch != nullptr && !inSketch && !st.sketchPlanePickActive)
+            regionPickerHot = sketch->drawRegionPicker(st, io, vr0, vr1, vw, vh, imgHovered);
+
         // ---- hover + click selection (once per frame; only while a doc mesh is loaded) ----
         // C25 W2-E: suppressed while the glass-box View Selector is up (it owns the click).
         // C37-C item 5: also suppressed while sketchPlanePickActive (the overlay owns the mouse).
         if (picking && !inSketch && !s_viewSelector.active() && !st.sketchPlanePickActive) {
-            if (imgHovered && !s_lmbDragActive) {
+            if (imgHovered && !s_lmbDragActive && !regionPickerHot) {
                 int px = (int)(io.MousePos.x - vr0.x);
                 int py = (int)(io.MousePos.y - vr0.y);
                 st.hover = st.idPass->pickFinal(px, py, vw, vh);
@@ -700,8 +708,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
 
             // Click = replace, Ctrl-click = toggle. Empty-space click clears.
             // C37-C item 3: guard against micro-orbit clicks — only fire if drag was not active.
+            // C51: a click consumed by the region picker never falls through to model selection.
             if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-                !s_lmbDragActive) {
+                !s_lmbDragActive && !regionPickerHot) {
                 if (io.KeyCtrl) {
                     if (st.hover.valid()) st.selection.toggle(st.hover);
                 } else {

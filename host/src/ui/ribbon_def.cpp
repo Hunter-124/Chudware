@@ -217,6 +217,13 @@ static const RibbonCmd kCmds[] = {
     { "sk_parabola",         "Parabola",        "parabola",         "Sketch", "Draw", false, "sk_ellipse_big", false },
     { "sk_conic",            "Conic",           "conic",            "Sketch", "Draw", false, "sk_ellipse_big", false },
 
+    // =========================================================================
+    // DRAWINGS module — "Make Drawing" entry point. Lives on the Evaluate tab (the produce-a-
+    // deliverable home) in its own group. From an open part it creates a drawing sheet with the
+    // standard four views and opens it as a Drawing tab. Reuses the section_props icon as a
+    // sheet-ish glyph until a dedicated drawing icon ships.
+    { "make_drawing",        "Make Drawing",    "section_props",    "Evaluate", "Drawing",        true,  nullptr,          false },
+
 };
 // clang-format on
 

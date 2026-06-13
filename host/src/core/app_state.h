@@ -282,8 +282,15 @@ struct AppState {
     // switch + render the strip. Switching activates the doc in the worker (doc_rebuild → tree +
     // mesh) and refreshes the viewport/tree/selection; per-tab camera is restored so each doc keeps
     // its view. docTabs is empty only at the empty/start state (no document open).
+    // A tab is one of three kinds. Part/Assembly tabs are backed by a DocMirror part/asm session
+    // (docId is a doc_* worker id, the central area shows the 3D viewport). A Drawing tab is NOT a
+    // DocMirror doc — it is backed by a SEPARATE drawing registry id (drawingDocId) and the central
+    // area shows a 2D sheet instead of the 3D viewport. switchToTab/ensureActiveTab keep their hands
+    // off the mirror for Drawing tabs so the underlying part stays loaded behind the drawing.
     struct DocTab {
-        std::string docId;          // worker doc id (registry key)
+        enum class TabKind { Part, Assembly, Drawing };
+        TabKind     kind = TabKind::Part;
+        std::string docId;          // worker doc id (registry key) — empty for Drawing tabs
         std::string title;          // display name (doc "name", "Part1"/"Assembly1")
         bool        isAssembly = false;
         bool        dirty = false;  // edits since last save (asterisk on the tab)
@@ -291,6 +298,16 @@ struct AppState {
         // Saved camera so each tab keeps its own view across switches.
         float yaw = 35, pitch = 28, zoom = 1.0f, pan[3] = {0, 0, 0};
         bool  camValid = false;     // false until the first switch-away captures the live camera
+
+        // ---- Drawing tabs only (kind == Drawing) ----
+        std::string drawingDocId;       // drawing registry id (from drawing_new) — NOT a doc_* id
+        std::string sourceDocId;        // the part/asm doc this drawing projects from (for Rebuild)
+        nlohmann::json drawingDoc;      // cached drawing_get result {sheets:[{...views...}]}
+        // 2D sheet pan/zoom (persisted per tab). pxPerMm scales sheet-mm -> screen px; panPx is the
+        // screen-space offset of the sheet origin. needFit=true requests a one-shot fit-to-window.
+        float drawZoom = 0.0f;          // 0 = uninitialized -> triggers a fit on first show
+        float drawPanX = 0.0f, drawPanY = 0.0f;
+        bool  drawNeedFit = true;
     };
     std::vector<DocTab> docTabs;
     int activeTab = -1;             // index into docTabs; -1 = no document open (start state)
@@ -323,6 +340,21 @@ struct AppState {
     // "new part", an agent v2 run, the assembly panel), append a tab for it and make it active.
     // Also keeps the active title/kind fresh. Called from the per-frame draw before the strip.
     void ensureActiveTab();
+
+    // ---- DRAWINGS module (host UI for the drawing engine RPCs) ----
+    // "Make Drawing": from the active PART/ASM tab, create a blank drawing (drawing_new), add the
+    // standard four views (front/top/right/iso) at a default layout, then open + activate a new
+    // Drawing tab caching the drawing_get result. No-op + toast when no part is open. All worker
+    // calls are guarded; a failure logs + toasts and leaves no half-open tab.
+    void makeDrawing();
+    // Re-fetch a Drawing tab's drawing_get (the engine reprojects from the live source part, so this
+    // is how edits to the source reflect). Called on tab activation and by the manual Rebuild button.
+    void refreshDrawingTab(int idx);
+    // True when the active tab is a Drawing (the central area shows the 2D sheet, not the 3D view).
+    bool activeTabIsDrawing() const {
+        return activeTab >= 0 && activeTab < (int)docTabs.size() &&
+               docTabs[activeTab].kind == DocTab::TabKind::Drawing;
+    }
 
     // ---- topology picking (C15) — id pass + overlays owned by run_gui; AppState borrows ----
     render::IdPass* idPass = nullptr;

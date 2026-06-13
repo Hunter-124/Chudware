@@ -72,6 +72,9 @@ add_executable(AI-CAD
   src/core/doc_tabs.cpp
   src/ui/doc_tabs.cpp
   # --- end document tabs ---
+  # --- DRAWINGS module: 2D sheet renderer for Drawing tabs ---
+  src/ui/drawing_panel.cpp
+  # --- end DRAWINGS ---
   # --- C39: async worker dispatch (per-frame drained callbacks on the GL thread) ---
   src/core/async_rpc.cpp
   # --- end C39 ---

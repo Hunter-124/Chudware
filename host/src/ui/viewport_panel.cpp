@@ -28,6 +28,7 @@
 #include "sketch_mode.h"   // C18
 #include "property_manager.h"  // C27-A: in-viewport parameter callouts
 #include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
+#include "drawing_panel.h"  // DRAWINGS: 2D sheet renderer for a Drawing tab
 
 namespace ui {
 
@@ -805,6 +806,18 @@ static void dimCancel(AppState& st) {
 
 void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     Renderer& renderer = *st.renderer;
+
+    // ---------- DRAWINGS module: a Drawing tab hosts a 2D sheet in the SAME central dock window
+    // as the 3D viewport. Branch here BEFORE any 3D state is touched so part/asm behavior stays
+    // byte-identical and the dock layout is unchanged (the "Viewport" window just paints a sheet).
+    if (st.showViewport && st.activeTabIsDrawing()) {
+        if (ImGui::Begin("Viewport")) {
+            ui::drawDrawingSheet(st);
+        }
+        ImGui::End();
+        return;
+    }
+
     // C18: while a sketch is being edited the camera locks normal to the sketch plane and the
     // sketch tools own the mouse (no orbit, no topology picking).
     auto* sketch = st.sketchMode;

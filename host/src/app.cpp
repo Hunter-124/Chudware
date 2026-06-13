@@ -212,6 +212,9 @@ int run_gui(const char* screenshotPath) {
         if (propertyManager.active() && std::strcmp(cmd_id, "sketch_new") == 0)
             propertyManager.cancelEdits(st);
         if (sketchMode.onRibbonCommand(st, cmd_id)) return;       // C18 sketch tool handled
+        // DRAWINGS: "Make Drawing" creates a drawing + standard views from the active part and
+        // opens it as a Drawing tab (guarded; toasts if no part is open).
+        if (std::strcmp(cmd_id, "make_drawing") == 0) { st.makeDrawing(); return; }
         // C20b: Assembly tab + New Assembly route to the assembly panels first.
         {
             std::string cmd(cmd_id);
@@ -234,6 +237,7 @@ int run_gui(const char* screenshotPath) {
         if (propertyManager.active() && std::strcmp(cmd_id, "sketch_new") == 0)
             propertyManager.cancelEdits(st);
         if (sketchMode.onRibbonCommand(st, cmd_id)) return;
+        if (std::strcmp(cmd_id, "make_drawing") == 0) { st.makeDrawing(); return; }
         {
             std::string cmd(cmd_id);
             if ((cmd.rfind("asm_", 0) == 0 || cmd == "new_assembly") &&

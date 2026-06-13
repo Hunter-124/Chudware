@@ -43,6 +43,7 @@ int AppState::tabIndexForActiveDoc() const {
 void AppState::addDocTab(bool isAssembly) {
     if (!docMirror.hasDoc()) return;
     DocTab t;
+    t.kind = isAssembly ? DocTab::TabKind::Assembly : DocTab::TabKind::Part;
     t.docId = docMirror.docId();
     t.isAssembly = isAssembly;
     t.title = docTitle(docMirror.tree(), isAssembly);
@@ -63,17 +64,37 @@ static void exitActiveEdits(AppState& st) {
 
 void AppState::switchToTab(int idx) {
     if (idx < 0 || idx >= (int)docTabs.size()) return;
-    if (idx == activeTab && docMirror.docId() == docTabs[idx].docId) return;  // already active
+    // Already-active no-op early-out (part/asm: also require the mirror to match; drawing: index).
+    if (idx == activeTab) {
+        if (docTabs[idx].kind == DocTab::TabKind::Drawing) return;
+        if (docMirror.docId() == docTabs[idx].docId) return;
+    }
 
     // 1) Leave any in-progress sketch / PM form (no zombie edit state across docs).
     exitActiveEdits(*this);
 
-    // 2) Save the LEAVING tab's camera so it keeps its own view.
-    if (activeTab >= 0 && activeTab < (int)docTabs.size()) {
+    // 2) Save the LEAVING tab's camera so it keeps its own view (only meaningful for a 3D part/asm
+    //    tab — a Drawing tab's "camera" is its sheet pan/zoom, persisted live in the tab struct).
+    if (activeTab >= 0 && activeTab < (int)docTabs.size() &&
+        docTabs[activeTab].kind != DocTab::TabKind::Drawing) {
         DocTab& cur = docTabs[activeTab];
         cur.yaw = yaw; cur.pitch = pitch; cur.zoom = zoom;
         cur.pan[0] = pan[0]; cur.pan[1] = pan[1]; cur.pan[2] = pan[2];
         cur.camValid = true;
+    }
+
+    DocTab& dst0 = docTabs[idx];
+
+    // 2b) DRAWING tab: do NOT touch the DocMirror (a drawing id is not a doc_* session). The active
+    //     part/asm stays loaded behind the sheet; the central area branches to the 2D renderer on
+    //     activeTabIsDrawing(). Re-fetch drawing_get on activation so source-part edits reflect.
+    if (dst0.kind == DocTab::TabKind::Drawing) {
+        activeTab = idx;
+        animActive = false;
+        if (ribbonTab == 4) ribbonTab = 0;  // a drawing doesn't have the Assembly tab context
+        refreshDrawingTab(idx);
+        addLog("[tabs] switched to drawing '" + dst0.title + "' (" + dst0.drawingDocId + ")");
+        return;
     }
 
     DocTab& dst = docTabs[idx];
@@ -132,8 +153,15 @@ void AppState::closeDocTab(int idx) {
     DocTab closing = docTabs[idx];
 
     // Tell the worker to drop the document from its registry. (Best-effort: a failure still removes
-    // the host tab so the UI never wedges on a doc the user asked to close.)
-    {
+    // the host tab so the UI never wedges on a doc the user asked to close.) A Drawing tab lives in
+    // the separate drawing registry, so it closes via drawing_close {doc_id: <drawing id>}.
+    if (closing.kind == DocTab::TabKind::Drawing) {
+        nlohmann::json res;
+        std::string err;
+        if (!closing.drawingDocId.empty() &&
+            !worker.call("drawing_close", {{"doc_id", closing.drawingDocId}}, res, err))
+            addLog("[tabs] drawing_close failed for " + closing.drawingDocId + ": " + err);
+    } else {
         nlohmann::json res;
         std::string err;
         if (!worker.call("doc_close", {{"doc_id", closing.docId}}, res, err))
@@ -181,6 +209,10 @@ void AppState::clearActiveTabDirty() {
 }
 
 void AppState::ensureActiveTab() {
+    // A Drawing tab is active: the mirror still points at the drawing's SOURCE part (we never
+    // re-pointed it), so the reconcile below would steal focus back to that part's tab. Leave the
+    // drawing active — the central area is showing its 2D sheet.
+    if (activeTabIsDrawing()) return;
     if (!docMirror.hasDoc()) return;          // empty start state — nothing to track
     int idx = tabIndexForActiveDoc();
     if (idx >= 0) {
@@ -201,7 +233,121 @@ void AppState::ensureActiveTab() {
 void AppState::syncActiveTabTitle() {
     if (activeTab < 0 || activeTab >= (int)docTabs.size()) return;
     DocTab& t = docTabs[activeTab];
+    if (t.kind == DocTab::TabKind::Drawing) return;  // drawing keeps its own name, not the mirror's
     t.isAssembly = docMirror.tree().is_object() &&
                    (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
     t.title = docTitle(docMirror.tree(), t.isAssembly);
+}
+
+// ---------------------------------------------------------------------------------------------
+// DRAWINGS module
+// ---------------------------------------------------------------------------------------------
+
+// The standard four-view layout placed on the blank A3 sheet (positions in sheet mm; the engine
+// scales + translates each projected polyline to these anchors). Matches the wave brief.
+namespace {
+struct DrawingViewSpec {
+    const char* type;         // "base" | "projected" | "iso"
+    const char* orientation;  // "front" | "top" | "right" | "iso"
+    double x, y;              // sheet-mm anchor
+};
+const DrawingViewSpec kStdViews[] = {
+    {"base",      "front", 105.0, 180.0},
+    {"projected", "top",   105.0,  80.0},
+    {"projected", "right", 230.0, 180.0},
+    {"iso",       "iso",   300.0,  80.0},
+};
+}  // namespace
+
+void AppState::makeDrawing() {
+    // Guard: need an active PART/ASM tab to project from.
+    if (activeTab < 0 || activeTab >= (int)docTabs.size() ||
+        docTabs[activeTab].kind == DocTab::TabKind::Drawing || !docMirror.hasDoc()) {
+        toast(ui::ToastLevel::Warn, "Open a part first, then Make Drawing");
+        return;
+    }
+    const std::string sourceId = docMirror.docId();
+    const std::string sourceName = docTabs[activeTab].title;
+
+    // 1) Create a blank drawing sheet from the source part. drawing_new returns a DRAWING id in a
+    //    separate registry (NOT a doc_* id) plus the initial (view-less) drawing object.
+    std::string drawingId, drawingName;
+    {
+        nlohmann::json res;
+        std::string err;
+        nlohmann::json params = {{"source_doc_id", sourceId},
+                                 {"name", sourceName + " - Drawing"}};
+        if (!worker.call("drawing_new", params, res, err) || !res.is_object()) {
+            addLog("[draw] drawing_new failed: " + err);
+            toast(ui::ToastLevel::Error, "Make Drawing failed: " + (err.empty() ? "engine error" : err));
+            return;
+        }
+        drawingId = jstr(res, "doc_id");
+        if (res.contains("drawing") && res["drawing"].is_object())
+            drawingName = jstr(res["drawing"], "name");
+        if (drawingId.empty()) {
+            addLog("[draw] drawing_new returned no doc_id");
+            toast(ui::ToastLevel::Error, "Make Drawing failed: no drawing id");
+            return;
+        }
+    }
+    if (drawingName.empty()) drawingName = sourceName + " - Drawing";
+
+    // 2) Add the four standard views. Each is best-effort: a view that fails to project still leaves
+    //    a usable drawing (the panel renders a "view failed" note for it). We keep going on errors.
+    int added = 0;
+    for (const auto& v : kStdViews) {
+        nlohmann::json res;
+        std::string err;
+        nlohmann::json params = {
+            {"doc_id", drawingId},
+            {"type", v.type},
+            {"orientation", v.orientation},
+            {"position", nlohmann::json::array({v.x, v.y})},
+            {"scale", 1.0},
+        };
+        if (worker.call("drawing_add_view", params, res, err))
+            ++added;
+        else
+            addLog(std::string("[draw] add_view ") + v.orientation + " failed: " + err);
+    }
+
+    // 3) Fetch the assembled drawing (sheets + view geometry) and open a Drawing tab for it.
+    nlohmann::json drawingDoc;
+    {
+        nlohmann::json res;
+        std::string err;
+        if (worker.call("drawing_get", {{"doc_id", drawingId}}, res, err) && res.is_object())
+            drawingDoc = res;
+        else
+            addLog("[draw] drawing_get failed: " + err);
+    }
+
+    DocTab t;
+    t.kind = DocTab::TabKind::Drawing;
+    t.title = drawingName;
+    t.drawingDocId = drawingId;
+    t.sourceDocId = sourceId;
+    t.drawingDoc = std::move(drawingDoc);
+    t.drawNeedFit = true;
+    docTabs.push_back(std::move(t));
+    activeTab = (int)docTabs.size() - 1;
+    if (ribbonTab == 4) ribbonTab = 0;
+    addLog("[draw] created drawing '" + drawingName + "' (" + drawingId + ", " +
+           std::to_string(added) + " views) from " + sourceId);
+    toast(ui::ToastLevel::Info, "Drawing created with " + std::to_string(added) + " views");
+}
+
+void AppState::refreshDrawingTab(int idx) {
+    if (idx < 0 || idx >= (int)docTabs.size()) return;
+    DocTab& t = docTabs[idx];
+    if (t.kind != DocTab::TabKind::Drawing || t.drawingDocId.empty()) return;
+    nlohmann::json res;
+    std::string err;
+    if (worker.call("drawing_get", {{"doc_id", t.drawingDocId}}, res, err) && res.is_object()) {
+        t.drawingDoc = std::move(res);
+    } else {
+        addLog("[draw] refresh drawing_get failed for " + t.drawingDocId + ": " + err);
+        // Keep the previously-cached drawing so the sheet doesn't blank on a transient failure.
+    }
 }

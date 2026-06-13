@@ -89,6 +89,13 @@ public:
     // Last rebuild feature_status array from the worker response.
     const nlohmann::json& featureStatus() const { return featureStatus_; }
 
+    // W12+ — drawings restored by the most recent doc_open: an array of {doc_id, name,
+    // source_doc_id}, one per embedded drawing the engine re-registered (their `source` already
+    // re-pointed to THIS reopened doc). Empty for a file with no drawings. The open caller
+    // (applyOpenedDoc) reads this once to re-create the Drawing tabs, then it is reset on the next
+    // open/new. Additive + tolerant: stays empty if the engine omits the field.
+    const nlohmann::json& lastOpenedDrawings() const { return lastOpenedDrawings_; }
+
     // ---- W1-B (item 6): owner-map lookups ----
     // The parsed feature->topology map from the latest response that carried one. TOLERANT of the
     // engine not (yet) sending "owner_map": the map is simply empty and the lookups return nothing.
@@ -253,6 +260,7 @@ private:
     int            revision_ = -1;
     nlohmann::json tree_;
     nlohmann::json featureStatus_;
+    nlohmann::json lastOpenedDrawings_ = nlohmann::json::array();  // W12+ doc_open "drawings"
     Listener       listener_;
     StaleCb        staleResyncCb_;  // W1-B: fired on stale_revision auto-resync
 

@@ -735,6 +735,44 @@ def _blank_drawing(name: str, source_doc_id: str) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- persistence (W12+)
+#
+# A DrawingDocument stores NO geometry — only the source-doc reference + the view definitions and
+# annotations (all plain JSON). So a drawing round-trips through a part/asm ``.step+`` as the doc
+# JSON: stepplus.save embeds one ``drawings/<drawing_id>.json`` per open drawing whose ``source``
+# is the saved doc; stepplus.open re-registers each as a fresh DrawingSession and re-points its
+# ``source`` to the reopened part's NEW doc_id (the old source id is meaningless once the part is
+# reloaded under a new session id).
+
+
+def drawings_for_source(source_doc_id: str) -> list[DrawingSession]:
+    """Every open drawing session whose ``source`` is ``source_doc_id`` (save-time embed list)."""
+    return [s for s in _DRAWINGS.values() if s.source_doc_id == source_doc_id]
+
+
+def serialize_drawing(s: DrawingSession) -> dict:
+    """The DrawingDocument JSON for one open drawing (a deep copy — pure data, no geometry)."""
+    import copy
+    return copy.deepcopy(s.doc)
+
+
+def register_restored_drawing(doc: dict, source_doc_id: str) -> DrawingSession:
+    """Adopt a DrawingDocument restored from a ``.step+`` as a FRESH DrawingSession.
+
+    Assigns a brand-new drawing doc_id (the persisted ``doc['id']`` is the in-document id, not the
+    session registry key) and re-points the doc's ``source`` to ``source_doc_id`` — the reopened
+    part/assembly's new session id — so the drawing projects against the just-reloaded bodies. The
+    per-projection cache starts empty (it's keyed on the live source revision). Returns the session.
+    """
+    import copy
+    d = copy.deepcopy(doc)
+    d["source"] = source_doc_id
+    doc_id = uuid.uuid4().hex[:12]
+    s = DrawingSession(doc_id=doc_id, doc=d, source_doc_id=source_doc_id, revision=0)
+    _DRAWINGS[doc_id] = s
+    return s
+
+
 # --------------------------------------------------------------------------- source geometry
 
 

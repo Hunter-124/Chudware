@@ -139,6 +139,13 @@ def _doc_open(params: dict, _emit: EmitFn) -> dict:
     resp = docsess.rebuild(s)
     resp["doc_id"] = s.doc_id
     resp["warnings"] = warnings
+    # W12+ — restore any embedded drawings as fresh drawing sessions (source re-pointed to this
+    # reopened doc) and surface them so the host can re-open their Drawing tabs. Additive +
+    # contained: a file with no drawings returns [], a malformed drawing json is skipped.
+    try:
+        resp["drawings"] = stepplus.restore_drawings(s)
+    except Exception:  # noqa: BLE001 — drawing restore must never break the part open
+        resp["drawings"] = []
     return resp
 
 

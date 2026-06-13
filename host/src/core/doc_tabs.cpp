@@ -354,3 +354,38 @@ void AppState::refreshDrawingTab(int idx) {
         // Keep the previously-cached drawing so the sheet doesn't blank on a transient failure.
     }
 }
+
+void AppState::adoptDrawingTab(const std::string& drawingDocId, const std::string& name,
+                               const std::string& sourceDocId) {
+    if (drawingDocId.empty()) return;
+    // Already adopted? (a re-open of the same file should not stack duplicate drawing tabs)
+    for (const auto& dt : docTabs)
+        if (dt.kind == DocTab::TabKind::Drawing && dt.drawingDocId == drawingDocId) return;
+
+    // Fetch the restored drawing's assembled sheets + view geometry (it reprojects against the
+    // just-reopened part). The drawing is already registered by the engine (doc_open restore), so
+    // this is exactly makeDrawing()'s step 3 without the drawing_new + add_view steps.
+    nlohmann::json drawingDoc;
+    {
+        nlohmann::json res;
+        std::string err;
+        if (worker.call("drawing_get", {{"doc_id", drawingDocId}}, res, err) && res.is_object())
+            drawingDoc = res;
+        else
+            addLog("[draw] adopt drawing_get failed for " + drawingDocId + ": " + err);
+    }
+
+    const std::string title = name.empty() ? std::string("Drawing") : name;
+    DocTab t;
+    t.kind = DocTab::TabKind::Drawing;
+    t.title = title;
+    t.drawingDocId = drawingDocId;
+    t.sourceDocId = sourceDocId;
+    t.drawingDoc = std::move(drawingDoc);
+    t.drawNeedFit = true;
+    docTabs.push_back(std::move(t));
+    // Do NOT switch activeTab — the reopened part should remain the active tab; the restored
+    // drawing tabs sit alongside it for the user to click into.
+    addLog("[draw] restored drawing tab '" + title + "' (" + drawingDocId + ") from " +
+           sourceDocId);
+}

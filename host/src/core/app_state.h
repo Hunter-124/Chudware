@@ -379,6 +379,12 @@ struct AppState {
     // Re-fetch a Drawing tab's drawing_get (the engine reprojects from the live source part, so this
     // is how edits to the source reflect). Called on tab activation and by the manual Rebuild button.
     void refreshDrawingTab(int idx);
+    // W12+ — adopt an ALREADY-registered drawing (restored by doc_open from a .step+) into a new
+    // Drawing tab. Unlike makeDrawing (which creates a blank drawing + standard views), this just
+    // fetches drawing_get for an existing drawing id and opens its tab. Does NOT steal the active
+    // tab focus (the reopened part stays active). No-op + log on a failed fetch.
+    void adoptDrawingTab(const std::string& drawingDocId, const std::string& name,
+                         const std::string& sourceDocId);
     // True when the active tab is a Drawing (the central area shows the 2D sheet, not the 3D view).
     bool activeTabIsDrawing() const {
         return activeTab >= 0 && activeTab < (int)docTabs.size() &&

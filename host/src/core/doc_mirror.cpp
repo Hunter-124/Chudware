@@ -374,6 +374,11 @@ bool DocMirror::open(WorkerClient& w, const std::string& path, std::string& err)
     revision_ = jint(res, "revision");
     if (res.contains("tree") && res["tree"].is_object()) tree_ = res["tree"];
     featureStatus_ = {};
+    // W12+ — stash any restored drawings so the open caller can re-create their Drawing tabs.
+    if (res.contains("drawings") && res["drawings"].is_array())
+        lastOpenedDrawings_ = res["drawings"];
+    else
+        lastOpenedDrawings_ = nlohmann::json::array();
     notify();
     return true;
 }

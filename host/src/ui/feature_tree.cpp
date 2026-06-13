@@ -901,6 +901,20 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
     }
     st.addLog("[doc] opened: " + path + "  rev=" + std::to_string(st.docMirror.revision()));
     st.toast(ui::ToastLevel::Info, "Opened " + pathBaseName(path));
+    // W12+ — re-open any drawings the engine restored from this .step+ (their `source` already
+    // re-pointed to the just-opened part). Each becomes a Drawing tab ALONGSIDE the part tab (the
+    // part stays active). Tolerant: an empty/absent list is a no-op (a file with no drawings).
+    {
+        const nlohmann::json& drws = st.docMirror.lastOpenedDrawings();
+        if (drws.is_array() && !drws.empty()) {
+            for (const auto& d : drws) {
+                if (!d.is_object()) continue;
+                st.adoptDrawingTab(jfld(d, "doc_id"), jfld(d, "name"), jfld(d, "source_doc_id"));
+            }
+            st.toast(ui::ToastLevel::Info,
+                     "Restored " + std::to_string(drws.size()) + " drawing(s)");
+        }
+    }
     std::string base = pathBaseName(path);
     st.rpc.call("doc_rebuild", {{"doc_id", st.docMirror.docId()}},
         [&st, base](const core::RpcResult& r) {

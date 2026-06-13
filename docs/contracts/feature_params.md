@@ -232,6 +232,57 @@ at `K·T` into the thickness), and bend interior angle `θ`:
   `angle ∉ (0,180)`; degenerate placement where the flange is not connected to the sheet (e.g.
   `bend_outside` folded away — the union stays disjoint).
 
+## Weldments
+
+A `weld_member` sweeps a structural PROFILE from the small profile library along the segments of a
+sketch, producing weldment members (one solid per segment) with mitre corner trim and a stored
+per-member length for the future cut list. Gusset / end-cap / weld-bead and the cut-list TABLE are
+later waves. Canonical units mm/deg.
+
+### Profile library (`engine/doc/weld_profiles.py`)
+Each profile is a 2-D cross-section (outer boundary minus any inner void — hollow tubes are
+genuinely hollow), drawn centred on its local origin and swept along +Z by the member compiler.
+Dimension keys (mm) with their defaults:
+- `square_tube`: `size` (20) · `thickness` (2) — hollow square. area = `size² − (size−2t)²`.
+- `rect_tube`: `w` (40) · `h` (20) · `thickness` (2) — hollow rectangle. area = `w·h − (w−2t)(h−2t)`.
+- `round_tube`: `od` (20) · `thickness` (2) — hollow round. area = `π((od/2)² − (od/2−t)²)`.
+- `angle_L`: `leg` (30) · `thickness` (3) — equal-leg L (true L, not a filled square).
+  area = `2·leg·t − t²`.
+- `flat_bar`: `w` (40) · `thickness` (6) — solid bar. area = `w·t`.
+- `c_channel`: `h` (50) · `w` (25) · `thickness` (3) — open C-channel (opening +X).
+  area = `h·w − (h−2t)(w−t)`.
+
+The analytic area of every profile matches its built-face area exactly (the cut-list mass roll-up
+depends on this).
+
+### `weld_member`
+- params: `profile: str` (a library name; required) · per-profile dimension keys (mm; missing keys
+  fall back to the library default) · `angle: dim` (0; profile rotation about the path) ·
+  `justify: "center"|"corner"` ("center"; SolidWorks "Locate Profile" — `center` centres the
+  section on the segment, `corner` hangs its lower-left bbox corner on the segment) ·
+  `trim_corners: bool` (true).
+- refs: `sketch: feature-id` (the source sketch; its raw OPEN line/arc segments become the member
+  paths — closed loops like circles are skipped) · `segments: [entity-id]?` (default ALL segments).
+- compiler: `features/weldment.py::compile_weld_member`. Per segment: build the profile face,
+  orient it perpendicular to the segment at its start (profile plane normal = path tangent), sweep
+  along that one segment via OCCT `BRepOffsetAPI_MakePipe` → one member solid. Members are kept as
+  SEPARATE bodies (an assembly of members), each appended to the rolling body list so it is
+  individually addressable for the cut list.
+- corner trim (joint type = **mutual mitre**): where two STRAIGHT members share a sketch vertex,
+  both are cut by the mitre plane through that vertex (the plane bisecting the two outgoing
+  tangents); each member is subtracted by the half-space on the OTHER member's side, so neither
+  crosses the plane — a clean mitre with no interpenetration (pairwise intersection volume ≈ 0).
+  Best-effort: a kernel hiccup leaves the member untrimmed rather than failing the feature.
+  Limitations: straight (line) segments only (arcs sweep but butt at their ends); a 3+-member
+  vertex trims each adjacent pair independently (no single fitted gusset); near-collinear members
+  (≈180°) are left untrimmed.
+- cut-list data: per-member records `{segment_id, profile, length, start, end, area, volume}` are
+  stashed in `ctx.datums["_weld_members"][feature_id]` (`{profile, dims, members:[…]}`); the
+  summary `{_member_count, _total_length, _total_volume, _section_area}` is echoed in `resolved`.
+- errors (all contained `FeatureError`): unknown profile name; sketch missing / not compiled;
+  sketch has no usable (open) segments; degenerate (zero-length) segment; degenerate profile
+  dimensions (e.g. wall ≥ half the tube).
+
 ## Escape hatches
 
 ### `script`

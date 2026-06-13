@@ -815,6 +815,9 @@ def compile_sketch(feat: dict, ctx: CompileContext) -> CompileOutput:
         "descs": region_descs,
         "plane": plane,
         "all_edges": all_edges,
+        # Raw entity list (additive — weldments tags member paths by entity id; other consumers
+        # ignore it). Stored as-is so per-entity edges can be re-derived with their ids.
+        "entities": entities,
     }
 
     # Pseudo-body: compound of region faces for tessellation (C02/AICM).

@@ -114,6 +114,7 @@ _SEL_LIST = "selector_list"
 _FEAT_LIST = "feature_id_list"
 _COMP_LIST = "component_id_list"
 _UV_LIST = "uv_list"               # list of [u,v] local-frame offsets (C33-A hole positions)
+_ENTITY_ID_LIST = "entity_id_list"  # list of sketch entity ids e<N> (weldment segment picks)
 
 # Feature type -> {"params": [required keys], "refs": {slot: (form, required)}}
 FEATURE_TYPES: dict[str, dict[str, Any]] = {
@@ -167,6 +168,10 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
     # Sheet metal — base flange (sheet from a region) + edge flange (bent wall off an edge).
     "sm_base_flange": {"params": [], "refs": {"profile": (_SEL_LIST, True)}},
     "sm_edge_flange": {"params": [], "refs": {"edge": (_SEL_OR_DATUM, True)}},
+    # Weldments — sweep a structural profile along sketch segments → members + cut-list data.
+    # refs.sketch is a sketch feature id; refs.segments (optional) is a list of entity ids.
+    "weld_member": {"params": ["profile"], "refs": {"sketch": (_SEL_OR_DATUM, True),
+                                                    "segments": (_ENTITY_ID_LIST, False)}},
     "script": {"params": ["code"], "refs": {}},
     "import": {"params": ["source_path", "format"], "refs": {}},
     # Stretch — schema-reserved (envelope accepted, no deep checks yet):
@@ -525,6 +530,13 @@ def validate_feature(
                 for i, pt in enumerate(v):
                     if not _is_vec(pt, 2):
                         errs.append(f"{loc}[{i}]: must be [u,v] (two numbers)")
+        elif form == _ENTITY_ID_LIST:
+            if not isinstance(v, list) or not v:
+                errs.append(f"{loc}: must be a non-empty list of sketch entity ids")
+            else:
+                for i, s in enumerate(v):
+                    if not isinstance(s, str) or not re.match(r"^e\d+$", s):
+                        errs.append(f"{loc}[{i}]: '{s}' is not a sketch entity id (e<N>)")
         elif form == _COMP_LIST:
             comp = component_ids or set()
             if not isinstance(v, list) or not v:

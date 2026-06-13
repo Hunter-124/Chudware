@@ -995,14 +995,22 @@ void Renderer::setSectionPlane(const float normal[3], float offset, bool enabled
 }
 
 // Four world-space corners of a plane quad of half-extent e, centered at center_.
-// plane 0 = Front (XY, normal Z); 1 = Top (XZ, normal Y); 2 = Right (YZ, normal X).
+// The index convention MUST match the engine's reserved datums (engine/doc/features/datum.py
+// reserved_datums, canonical Z-up) AND the camera view presets (renderer eyeForView):
+//   0 = Front (XZ, normal -Y)  — the "Front" view looks along +Y at this plane
+//   1 = Top   (XY, normal +Z)  — the "Top" view looks down -Z at this plane
+//   2 = Right (YZ, normal +X)  — the "Right" view looks along -X at this plane
+// The host previously drew 0=XY (Front) / 1=XZ (Top) — the SolidWorks *Y-up* naming — which
+// disagreed with the engine's Z-up plane.front=XZ / plane.top=XY. The datum overlay therefore
+// highlighted/labelled one plane while the click sketched on the swapped plane (the reported
+// "it highlights a vertical plane but sketches on Top" bug). Geometry now matches the engine.
 void Renderer::planeCorners(int plane, float e, Vec3 out[4]) const {
     static const float uv[4][2] = {{-1,-1}, {1,-1}, {1,1}, {-1,1}};
     for (int i = 0; i < 4; ++i) {
         float u = uv[i][0] * e, v = uv[i][1] * e;
-        if (plane == 0)      out[i] = Vec3(center_.x + u, center_.y + v, center_.z);       // XY
-        else if (plane == 1) out[i] = Vec3(center_.x + u, center_.y,     center_.z + v);   // XZ
-        else                 out[i] = Vec3(center_.x,     center_.y + u, center_.z + v);   // YZ
+        if (plane == 0)      out[i] = Vec3(center_.x + u, center_.y,     center_.z + v);   // XZ  Front
+        else if (plane == 1) out[i] = Vec3(center_.x + u, center_.y + v, center_.z);       // XY  Top
+        else                 out[i] = Vec3(center_.x,     center_.y + u, center_.z + v);   // YZ  Right
     }
 }
 

@@ -99,6 +99,31 @@ Geometry helpers (defined now; implemented M2 — same envelope, expand to entit
 `sketch_mirror_entities {sketch, entities:[ids], about: line id}` ·
 `sketch_pattern_entities {sketch, entities:[ids], kind: linear|circular, …dims}`
 
+**Sketch fillet / chamfer (round/bevel the corner where two LINE segments meet):**
+
+| op | fields |
+|---|---|
+| `sketch_fillet` | `sketch`, `e1`, `e2` (the two segment ids sharing/near a corner), `radius` (>0) |
+| `sketch_chamfer` | `sketch`, `e1`, `e2`, `distance` (>0 setback along e1), `distance2?` (>0 setback along e2; defaults to `distance` for an equal-leg bevel) |
+
+Both trim `e1` and `e2` back to the corner setback points and insert the connecting geometry,
+recording its new entity id under the op placeholder `$<index>`:
+- **`sketch_fillet`** inserts a tangent **arc** of `radius` and adds: `coincident` (arc.start ↔ the
+  trimmed e1 corner end), `coincident` (arc.end ↔ the trimmed e2 corner end), `tangent(arc, e1)`,
+  `tangent(arc, e2)`. (On an orthogonal corner the two tangents are geometrically implied by the
+  coincident joins, so the solver may flag one as *redundant* — benign, mirrors SolidWorks.)
+- **`sketch_chamfer`** inserts a connecting **line** and adds: `coincident` (line.p1 ↔ trimmed e1
+  end), `coincident` (line.p2 ↔ trimmed e2 end).
+
+Both first **drop the original coincident** that joined the two corner endpoints (the sharp corner
+is gone) so the new geometry is not pulled back together at solve time.
+
+**Supported:** line–line corners only. A non-line `e1`/`e2` raises `unsupported_entity` (the solver
+has no line↔arc / arc↔arc tangent yet — doc_schema.md §3.3). Degenerate input — parallel segments,
+no shared corner, or a `radius`/setback too large to fit between the corner and the segments' far
+ends — raises `fillet_failed` / `chamfer_failed` with NO mutation (the whole op-batch is rejected
+atomically, §2). Non-positive `radius`/`distance`, missing/identical `e1`/`e2` raise `invalid_op`.
+
 ### Assembly
 
 | op | fields |
@@ -116,6 +141,12 @@ Geometry helpers (defined now; implemented M2 — same envelope, expand to entit
 `unknown_doc` · `stale_revision {detail.current_revision}` · `invalid_op {detail.index,
 detail.reason}` · `dependency_exists {detail.dependents}` · `eq_in_use {detail.referencing}` ·
 `io_error` · `unsupported` · `internal`
+
+Sketch-geometry op codes (all carry `{detail.index, detail.reason}`): `unsupported_entity`
+(sketch_trim/extend/offset/fillet/chamfer hit a non-supported entity type) · `extend_no_target`
+(sketch_extend found nothing ahead) · `fillet_failed` / `chamfer_failed` (degenerate corner:
+parallel, no corner, or radius/setback too large). Like all op errors these reject the whole batch
+with no state change (§2).
 
 `stale_revision` is the optimistic-concurrency signal: the GUI must resync (`doc_tree`) and replay
 user intent. Rebuild failures are NOT errors (see §2.3).

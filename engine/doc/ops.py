@@ -864,6 +864,160 @@ def _op_sketch_offset(doc, op, index, idgen, id_map):
         id_map[f"${index}#{k}"] = neid
 
 
+# ---- sketch fillet / chamfer (round/bevel the corner where two segments meet) ----
+#
+# Both mirror sketch_trim/extend/offset: resolve the two segment ids, run the pure 2D math in
+# sketch_geom, edit the two lines' corner endpoints back to the tangent/setback points, and insert
+# the connecting geometry (a tangent arc for fillet, a line for chamfer) with the relations that
+# keep the corner closed (coincident at both joins) and — for the fillet — tangent to both edges.
+# Only line-line corners are supported (the solver has no line-arc/arc-arc tangent yet); other
+# entity combinations raise a clean OpError. The id_map records the new entity under "$<index>".
+
+
+def _line_end_handle(eid: str, which: str) -> str:
+    """Map a geom end name ('start'|'end') to a line's point handle ('p1'|'p2')."""
+    return f"{eid}." + ("p1" if which == "start" else "p2")
+
+
+def _set_line_end(ent: dict, which: str, pt) -> None:
+    """Move a line entity's corner endpoint to *pt* ('start'->p1, 'end'->p2)."""
+    ent["p1" if which == "start" else "p2"] = [float(pt[0]), float(pt[1])]
+
+
+def _drop_corner_join(sk: dict, h1: str, h2: str) -> None:
+    """Drop any constraint that JOINED the two corner endpoints to each other (the original
+    coincident/coradial/midpoint/etc. at the sharp corner). That corner no longer exists — the
+    fillet/chamfer splits it into two distinct tangent points — so leaving the stale join would
+    pull the trimmed ends back together and undo the round/bevel at solve time. Constraints that
+    touch only ONE of the two handles (e.g. the next edge's own corner join) are preserved."""
+    params = sk.setdefault("params", {})
+    cons = params.setdefault("constraints", [])
+    kept = []
+    for c in cons:
+        refs = c.get("refs", []) or []
+        if h1 in refs and h2 in refs:
+            continue  # this constraint binds the two corner endpoints together -> drop it
+        kept.append(c)
+    params["constraints"] = kept
+
+
+def _op_sketch_fillet(doc, op, index, idgen, id_map):
+    from engine.doc import sketch_geom as geom
+
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    e1id = op.get("e1")
+    e2id = op.get("e2")
+    e1 = _find_entity(sk, e1id)
+    e2 = _find_entity(sk, e2id)
+    if e1 is None or e2 is None:
+        raise _invalid(index, "sketch_fillet requires existing 'e1' and 'e2' entity ids")
+    if e1id == e2id:
+        raise _invalid(index, "sketch_fillet: e1 and e2 must be different entities")
+    radius = op.get("radius")
+    if not isinstance(radius, (int, float)) or isinstance(radius, bool) or radius <= 0:
+        raise _invalid(index, "sketch_fillet requires a positive numeric 'radius'")
+
+    for ent in (e1, e2):
+        if ent.get("type") != "line":
+            raise OpError("unsupported_entity",
+                          f"op[{index}]: sketch_fillet supports line-line corners only "
+                          f"(got '{ent.get('type')}')",
+                          {"index": index, "reason": f"unsupported entity '{ent.get('type')}'"})
+
+    try:
+        res = geom.fillet_corner(_geom_view(e1), _geom_view(e2), float(radius))
+    except geom.GeomError as exc:
+        raise OpError("fillet_failed", f"op[{index}]: sketch_fillet — {exc.reason}",
+                      {"index": index, "reason": exc.reason})
+
+    # The sharp corner is gone — drop the original coincident that joined the two corner ends.
+    _drop_corner_join(sk, _line_end_handle(e1id, res["end_a"]),
+                      _line_end_handle(e2id, res["end_b"]))
+
+    # Trim each line back to its tangent point.
+    _set_line_end(e1, res["end_a"], res["ta"])
+    _set_line_end(e2, res["end_b"], res["tb"])
+
+    # Insert the tangent arc (ta -> tb).
+    aid = idgen.next("e")
+    arc = copy.deepcopy(res["arc"])
+    arc["id"] = aid
+    arc["construction"] = False
+    _sketch_entities(sk).append(arc)
+
+    # Relations: arc endpoints coincident with the trimmed line ends + tangent to both lines.
+    cons = sk["params"].setdefault("constraints", [])
+    cons.append({"id": idgen.next("c"), "type": "coincident",
+                 "refs": [f"{aid}.start", _line_end_handle(e1id, res["end_a"])]})
+    cons.append({"id": idgen.next("c"), "type": "coincident",
+                 "refs": [f"{aid}.end", _line_end_handle(e2id, res["end_b"])]})
+    cons.append({"id": idgen.next("c"), "type": "tangent", "refs": [aid, e1id]})
+    cons.append({"id": idgen.next("c"), "type": "tangent", "refs": [aid, e2id]})
+
+    id_map[f"${index}"] = aid
+
+
+def _op_sketch_chamfer(doc, op, index, idgen, id_map):
+    from engine.doc import sketch_geom as geom
+
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    e1id = op.get("e1")
+    e2id = op.get("e2")
+    e1 = _find_entity(sk, e1id)
+    e2 = _find_entity(sk, e2id)
+    if e1 is None or e2 is None:
+        raise _invalid(index, "sketch_chamfer requires existing 'e1' and 'e2' entity ids")
+    if e1id == e2id:
+        raise _invalid(index, "sketch_chamfer: e1 and e2 must be different entities")
+    distance = op.get("distance")
+    if not isinstance(distance, (int, float)) or isinstance(distance, bool) or distance <= 0:
+        raise _invalid(index, "sketch_chamfer requires a positive numeric 'distance'")
+    # Optional unequal setback on the second edge; defaults to equal.
+    distance2 = op.get("distance2")
+    if distance2 is None:
+        distance2 = distance
+    elif not isinstance(distance2, (int, float)) or isinstance(distance2, bool) or distance2 <= 0:
+        raise _invalid(index, "sketch_chamfer 'distance2' must be a positive number when given")
+
+    for ent in (e1, e2):
+        if ent.get("type") != "line":
+            raise OpError("unsupported_entity",
+                          f"op[{index}]: sketch_chamfer supports line-line corners only "
+                          f"(got '{ent.get('type')}')",
+                          {"index": index, "reason": f"unsupported entity '{ent.get('type')}'"})
+
+    try:
+        res = geom.chamfer_corner(_geom_view(e1), _geom_view(e2),
+                                  float(distance), float(distance2))
+    except geom.GeomError as exc:
+        raise OpError("chamfer_failed", f"op[{index}]: sketch_chamfer — {exc.reason}",
+                      {"index": index, "reason": exc.reason})
+
+    # The sharp corner is gone — drop the original coincident that joined the two corner ends.
+    _drop_corner_join(sk, _line_end_handle(e1id, res["end_a"]),
+                      _line_end_handle(e2id, res["end_b"]))
+
+    # Trim each line back to its setback point.
+    _set_line_end(e1, res["end_a"], res["ta"])
+    _set_line_end(e2, res["end_b"], res["tb"])
+
+    # Insert the connecting bevel line (ta -> tb).
+    lid = idgen.next("e")
+    line = {"id": lid, "type": "line", "construction": False,
+            "p1": [float(res["ta"][0]), float(res["ta"][1])],
+            "p2": [float(res["tb"][0]), float(res["tb"][1])]}
+    _sketch_entities(sk).append(line)
+
+    # Relations: bevel endpoints coincident with the trimmed line ends.
+    cons = sk["params"].setdefault("constraints", [])
+    cons.append({"id": idgen.next("c"), "type": "coincident",
+                 "refs": [f"{lid}.p1", _line_end_handle(e1id, res["end_a"])]})
+    cons.append({"id": idgen.next("c"), "type": "coincident",
+                 "refs": [f"{lid}.p2", _line_end_handle(e2id, res["end_b"])]})
+
+    id_map[f"${index}"] = lid
+
+
 # ---- assembly ----
 
 
@@ -1016,6 +1170,8 @@ _OP_HANDLERS = {
     "sketch_trim": _op_sketch_trim,
     "sketch_extend": _op_sketch_extend,
     "sketch_offset": _op_sketch_offset,
+    "sketch_fillet": _op_sketch_fillet,
+    "sketch_chamfer": _op_sketch_chamfer,
     "sketch_convert": _op_unsupported_m2,
     "sketch_mirror_entities": _op_unsupported_m2,
     "sketch_pattern_entities": _op_unsupported_m2,

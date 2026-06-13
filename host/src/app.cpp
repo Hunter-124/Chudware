@@ -54,6 +54,7 @@
 #include "ui/property_manager.h"
 #include "ui/sketch_mode.h"   // C18
 #include "ui/config_panel.h"  // Configurations (SolidWorks ConfigurationManager)
+#include "ui/design_table_panel.h"  // Design Table (SolidWorks editable config grid)
 #include "ui/cutlist_panel.h"  // Weldment Cut List (SolidWorks Weldment Cut List)
 #include "ui/file_dialog.h"   // W14: native Save-As for 2D export (flat-pattern DXF)
 #include "ui/toast.h"         // W1-B: toast notifications
@@ -268,6 +269,9 @@ int run_gui(const char* screenshotPath) {
 
     // Configurations panel (SolidWorks ConfigurationManager) — owned here, drawn each frame.
     ui::ConfigPanel configPanel;
+
+    // Design Table panel (SolidWorks editable config grid) — owned here, drawn each frame.
+    ui::DesignTablePanel designTablePanel;
 
     // Weldment Cut List panel (SolidWorks Weldment Cut List) — owned here, drawn each frame.
     ui::CutListPanel cutListPanel;
@@ -1194,6 +1198,12 @@ int run_gui(const char* screenshotPath) {
         // Lists the active part/asm doc's configurations; activate/add/delete ingest the
         // ops-response so the viewport + FeatureManager refresh. No-op unless st.showConfigPanel.
         configPanel.draw(st);
+
+        // ---------- Design Table panel (SolidWorks editable config grid) ----------
+        // Editable spreadsheet over the active doc's configurations: rows=configs, columns=driven
+        // params + per-feature suppression. Cell edits write per-config overrides via the same
+        // config_* RPCs; editing the active row updates the viewport. No-op unless the flag is set.
+        designTablePanel.draw(st);
 
         // ---------- Weldment Cut List panel (SolidWorks Weldment Cut List) ----------
         // Read-only table of the active part's weld_member structural members grouped by

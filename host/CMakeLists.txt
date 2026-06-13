@@ -88,6 +88,9 @@ add_executable(AI-CAD
   # --- Configurations panel (SolidWorks ConfigurationManager) ---
   src/ui/config_panel.cpp
   # --- end Configurations ---
+  # --- Design Table panel (SolidWorks editable config grid) ---
+  src/ui/design_table_panel.cpp
+  # --- end Design Table ---
   # --- Weldment Cut List panel (SolidWorks Weldment Cut List) ---
   src/ui/cutlist_panel.cpp
   # --- end Cut List ---

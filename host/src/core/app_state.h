@@ -502,6 +502,10 @@ struct AppState {
     // Configurations panel (SolidWorks ConfigurationManager). Dockable "Configurations" window in
     // the right task pane; View > Configurations toggles it. Only meaningful for part/asm docs.
     bool showConfigPanel = false;
+    // Design Table panel (SolidWorks Design Table). Dockable "Design Table" window in the right
+    // task pane; View > Design Table toggles it. An editable grid (rows=configs, columns=driven
+    // params + per-feature suppression) over the same config_* RPCs the Configurations panel reads.
+    bool showDesignTablePanel = false;
     // Weldment Cut List panel (SolidWorks Weldment Cut List). Dockable "Cut List" window in the
     // right task pane; View > Cut List toggles it. Only meaningful for part docs with weldments.
     bool showCutListPanel = false;

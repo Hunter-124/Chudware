@@ -84,6 +84,12 @@ def _vt(temp_c: float) -> float:
     return _K * (temp_c + 273.15) / _Q
 
 
+# Nominal temperature (deg C) at which device parameters are specified.
+_TNOM_C = 27.0
+# Silicon bandgap energy used for the diode IS temperature law (eV).
+_EG_SI = 1.11
+
+
 # --------------------------------------------------------------------------- base
 
 class Device:
@@ -154,11 +160,28 @@ MnaLike = Any
 
 @device("R")
 class Resistor(Device):
-    def _g(self) -> float:
+    def _r(self) -> float:
+        """Resistance at the current temperature.
+
+        Optional tempco: ``R(T) = R0 * (1 + tc1*(T-Tnom) + tc2*(T-Tnom)^2)`` where ``tc1`` (1/degC)
+        and ``tc2`` (1/degC^2) come from the device/model params (default 0 -> temperature-independent).
+        ``Tnom`` is the param-spec temperature (27 degC). This makes the resistor temp-aware for the
+        ``temp`` sweep analysis without affecting any caller that omits a tempco.
+        """
         r = float(self.value) if self.value is not None else 0.0
         if abs(r) < 1e-12:
             r = 1e-9  # 0-ohm guard -> tiny series R (sim.md §2)
-        return 1.0 / r
+        tc1 = self._mp("tc1", 0.0)
+        tc2 = self._mp("tc2", 0.0)
+        if tc1 != 0.0 or tc2 != 0.0:
+            dt = self.temp_c - _TNOM_C
+            r = r * (1.0 + tc1 * dt + tc2 * dt * dt)
+            if abs(r) < 1e-12:
+                r = 1e-9
+        return r
+
+    def _g(self) -> float:
+        return 1.0 / self._r()
 
     def stamp_dc(self, mna: MnaLike, x: np.ndarray) -> None:
         a, b = mna.n(self.node_names[0]), mna.n(self.node_names[1])
@@ -468,12 +491,37 @@ class Diode(Device):
         return True
 
     def _params(self) -> tuple[float, float, float, float, float]:
-        IS = self._mp("IS", 1e-14)
+        IS = self._is_temp()
         N = self._mp("N", 1.0)
         RS = self._mp("RS", 0.0)
         BV = self._mp("BV", 1e30)
         CJO = self._mp("CJO", 0.0)
         return IS, N, RS, BV, CJO
+
+    def _is_temp(self) -> float:
+        """Saturation current at the current temperature (SPICE IS temperature law).
+
+        ``IS(T) = IS0 * (T/Tnom)^(XTI/N) * exp( -Eg*q/(N*k) * (1/T - 1/Tnom) )`` with the silicon
+        bandgap ``Eg`` (1.11 eV), emission coefficient ``N``, and saturation-current temperature
+        exponent ``XTI`` (default 3). Combined with the temperature rise in the thermal voltage
+        ``Vt = kT/q``, this gives the textbook forward-drop tempco of about -2 mV/degC at fixed
+        current. At T == Tnom the scaling is exactly 1, so 27 degC behaviour is unchanged.
+        """
+        IS0 = self._mp("IS", 1e-14)
+        N = self._mp("N", 1.0)
+        XTI = self._mp("XTI", 3.0)
+        tk = self.temp_c + 273.15
+        tnomk = _TNOM_C + 273.15
+        if abs(tk - tnomk) < 1e-9 or IS0 <= 0.0:
+            return IS0
+        ratio = tk / tnomk
+        # Eg*q/k has units of Kelvin; Eg in eV -> multiply by q to get Joules, divide by k.
+        eg_term = _EG_SI * _Q / _K
+        try:
+            scale = (ratio ** (XTI / N)) * math.exp(-(eg_term / N) * (1.0 / tk - 1.0 / tnomk))
+        except (OverflowError, ValueError):
+            return IS0
+        return IS0 * scale
 
     def _linearize(self, vd: float) -> tuple[float, float]:
         """Return (Id, gd) for the junction (excluding RS) at diode voltage vd."""

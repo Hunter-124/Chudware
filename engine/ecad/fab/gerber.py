@@ -28,17 +28,22 @@ def _fmt(mm: float) -> str:
 # ── layer → file extension mapping ───────────────────────────────────────────
 
 _LAYER_EXT: dict[str, str] = {
-    "F.Cu": ".GTL",
-    "B.Cu": ".GBL",
-    "F.SilkS": ".GTO",
-    "B.SilkS": ".GBO",
-    "F.Mask": ".GTS",
-    "B.Mask": ".GBS",
-    "F.Paste": ".GTP",
-    "B.Paste": ".GBP",
-    "F.Fab": ".GGP",   # fab annotation (non-standard but common)
-    "B.Fab": ".GBP2",
+    # Standard Protel/KiCad copper + mask/silk/paste extensions (unique, fab-house standard)
+    "F.Cu": ".GTL",    # front copper (Gerber Top Layer)
+    "B.Cu": ".GBL",    # back copper  (Gerber Bottom Layer)
+    "F.SilkS": ".GTO", # front silkscreen
+    "B.SilkS": ".GBO", # back silkscreen
+    "F.Mask": ".GTS",  # front solder mask
+    "B.Mask": ".GBS",  # back solder mask
+    "F.Paste": ".GTP", # front paste
+    "B.Paste": ".GBP", # back paste
+    # Board outline
     "Edge.Cuts": ".GM1",
+    # Documentation / fab / courtyard layers — use distinct mechanical layer numbers
+    "F.Fab": ".GM2",   # front fab annotation
+    "B.Fab": ".GM3",   # back fab annotation
+    "F.CrtYd": ".GM4", # front courtyard
+    "B.CrtYd": ".GM5", # back courtyard
 }
 
 # Inner copper: In1.Cu → .G2, In2.Cu → .G3, ...

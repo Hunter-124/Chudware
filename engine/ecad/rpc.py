@@ -63,26 +63,58 @@ def _ecad_open(params: dict, _emit: EmitFn) -> dict:
     from engine.ecad import session as esess, schema
 
     p = pathlib.Path(path)
+    suffix = p.suffix.lower()
     warnings: list[str] = []
 
-    # Try engine.ecad.formats (the .ecad+ container) if it exists, else fall back to plain JSON.
     doc: dict | None = None
-    try:
-        from engine.ecad import formats  # type: ignore
-        doc, extra_warnings = formats.open(path)
-        warnings.extend(extra_warnings or [])
-    except ImportError:
-        pass  # formats module not yet built — use plain JSON below
-    except Exception as exc:  # noqa: BLE001
-        warnings.append(f"ecad.formats.open failed ({exc}); trying plain JSON")
 
-    if doc is None:
-        # Plain JSON fallback (also handles .kicad_sch / .kicad_pcb stubs in the future)
+    # Dispatch by extension so KiCad files route to their importers and .ecad+/.json
+    # fall through to formats.open / plain-JSON.
+    if suffix == ".kicad_sch":
         try:
-            raw = p.read_text(encoding="utf-8")
-            doc = json.loads(raw)
-        except Exception as exc:
-            raise OpError("io_error", f"cannot read '{path}': {exc}", {"path": path}) from exc
+            from engine.ecad import formats as _fmt  # type: ignore  (lazy)
+            doc = _fmt.import_kicad_sch(str(p))
+        except ImportError:
+            raise OpError("not_available",
+                          "engine.ecad.formats not available — cannot import .kicad_sch",
+                          {"path": path})
+        except Exception as exc:  # noqa: BLE001
+            raise OpError("io_error",
+                          f"import_kicad_sch failed for '{path}': {exc}",
+                          {"path": path}) from exc
+
+    elif suffix == ".kicad_pcb":
+        try:
+            from engine.ecad import formats as _fmt  # type: ignore
+            doc = _fmt.import_kicad_pcb(str(p))
+        except ImportError:
+            raise OpError("not_available",
+                          "engine.ecad.formats not available — cannot import .kicad_pcb",
+                          {"path": path})
+        except Exception as exc:  # noqa: BLE001
+            raise OpError("io_error",
+                          f"import_kicad_pcb failed for '{path}': {exc}",
+                          {"path": path}) from exc
+
+    else:
+        # .ecad+ / .ecad / .json and anything else: try formats.open first, plain JSON fallback.
+        try:
+            from engine.ecad import formats as _fmt  # type: ignore
+            doc, extra_warnings = _fmt.open(path)
+            warnings.extend(extra_warnings or [])
+        except ImportError:
+            pass  # formats module not yet built
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"ecad.formats.open failed ({exc}); trying plain JSON")
+
+        if doc is None:
+            try:
+                raw = p.read_text(encoding="utf-8")
+                doc = json.loads(raw)
+            except Exception as exc:
+                raise OpError("io_error",
+                              f"cannot read '{path}': {exc}",
+                              {"path": path}) from exc
 
     s = esess.open_session(doc, path=path)
     resp = esess.rebuild(s)
@@ -670,6 +702,68 @@ def _zone_fill_summary(board: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# ecad_design  {request, provider?, max_attempts?}
+#   -> DesignRun summary + doc_id
+# ---------------------------------------------------------------------------
+
+def _ecad_design(params: dict, _emit: EmitFn) -> dict:
+    """Run the autonomous ECAD orchestrator for *request*.
+
+    Lazy-imports engine.ecad.orchestrator so a missing dependency (numpy/scipy) degrades
+    gracefully. When provider is absent or cannot be resolved, passes provider=None so the
+    orchestrator uses the deterministic recipe fallback -- the run ALWAYS produces a verified
+    schematic.
+    """
+    request = str(_require(params, "request"))
+    max_attempts = int(params.get("max_attempts") or 3)
+
+    try:
+        from engine.ecad import orchestrator as _orch  # type: ignore
+    except ImportError as exc:
+        raise OpError("not_available",
+                      f"engine.ecad.orchestrator not available: {exc}",
+                      {"reason": "module not present", "feature": "ecad_design"}) from exc
+
+    # Resolve provider (best-effort; fall back to None so the recipe path is used).
+    provider = None
+    try:
+        from agent import config as _cfg  # type: ignore
+        provider = _cfg.get_provider()
+    except Exception:  # noqa: BLE001 - offline / unconfigured / missing module
+        pass
+
+    run: object = _orch.run_design(request, provider=provider, max_attempts=max_attempts)
+
+    # DesignRun is a dataclass; convert to dict.
+    try:
+        from dataclasses import asdict as _asdict
+        run_dict: dict = _asdict(run)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001
+        run_dict = dict(run.__dict__)  # type: ignore[union-attr]
+
+    # Summarise stages to save bandwidth -- keep ok/stage/detail/attempt; strip large prompts/raw.
+    stages_summary = [
+        {"stage": s.get("stage"), "ok": s.get("ok"), "detail": s.get("detail"),
+         "attempt": s.get("attempt", 0)}
+        for s in (run_dict.get("stages") or [])
+    ]
+
+    return {
+        "ok": bool(run_dict.get("ok")),
+        "doc_id": run_dict.get("doc_id"),
+        "stop_reason": run_dict.get("stop_reason"),
+        "recipe_used": run_dict.get("recipe_used"),
+        "revision": run_dict.get("revision", 0),
+        "ops_applied": run_dict.get("ops_applied", 0),
+        "stages": stages_summary,
+        "erc": run_dict.get("erc") or {},
+        "sim": run_dict.get("sim") or {},
+        "notes": run_dict.get("notes", ""),
+        "warnings": [],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Method + structured-error registration
 # ---------------------------------------------------------------------------
 
@@ -690,6 +784,7 @@ METHODS: dict[str, object] = {
     "ecad_update_from_sch": _ecad_update_from_sch,
     "ecad_autoroute": _ecad_autoroute,
     "ecad_fill_zones": _ecad_fill_zones,
+    "ecad_design": _ecad_design,
 }
 
 STRUCTURED_ERROR_METHODS: set[str] = set(METHODS.keys())

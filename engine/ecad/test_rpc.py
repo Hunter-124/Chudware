@@ -396,6 +396,60 @@ def test_autoroute_wrong_kind() -> None:
 # test_worker_registry_regression
 # ---------------------------------------------------------------------------
 
+def test_ecad_open_kicad_sch() -> None:
+    """ecad_open on a minimal inline KiCad schematic (written to a tmp file) must produce a
+    valid sch session. Also verifies .json plain-file dispatch still works."""
+    import json, pathlib, tempfile
+    from engine.ecad.rpc import METHODS
+
+    open_fn = METHODS["ecad_open"]
+
+    # ---- .kicad_sch dispatch ----
+    # Write a minimal KiCad schematic file.
+    minimal_sch = """\
+(kicad_sch (version 20230121) (generator eeschema)
+  (lib_symbols)
+  (wire (pts (xy 0 0) (xy 10 0)))
+)
+"""
+    with tempfile.TemporaryDirectory() as td:
+        sch_path = str(pathlib.Path(td) / "test.kicad_sch")
+        pathlib.Path(sch_path).write_text(minimal_sch, encoding="utf-8")
+        r = _call(open_fn, {"path": sch_path})
+        assert "doc_id" in r, f"ecad_open .kicad_sch: missing doc_id: {r}"
+        assert r.get("kind") == "sch", f"expected kind=sch, got {r.get('kind')}"
+        assert isinstance(r.get("warnings"), list), "warnings must be a list"
+        print(f"  ecad_open .kicad_sch -> doc_id={r['doc_id']!r} kind={r['kind']}")
+
+    # ---- .json plain-file dispatch (regression) ----
+    from engine.ecad.schema import new_schematic
+    doc = new_schematic("json_test")
+    with tempfile.TemporaryDirectory() as td:
+        json_path = str(pathlib.Path(td) / "test.json")
+        pathlib.Path(json_path).write_text(json.dumps(doc), encoding="utf-8")
+        r2 = _call(open_fn, {"path": json_path})
+        assert "doc_id" in r2, f"ecad_open .json: missing doc_id: {r2}"
+        print(f"  ecad_open .json -> doc_id={r2['doc_id']!r}")
+
+    print("  test_ecad_open_kicad_sch PASS")
+
+
+def test_ecad_design_rpc() -> None:
+    """ecad_design RPC must return ok + doc_id; recipe fallback used (no provider in CI)."""
+    from engine.ecad.rpc import METHODS
+
+    design_fn = METHODS["ecad_design"]
+    r = _call(design_fn, {"request": "5V divider with 2.5V output"})
+    assert r.get("ok"), (f"ecad_design RPC should succeed via recipe fallback; "
+                         f"got ok=False, r={r}")
+    assert r.get("doc_id"), "ecad_design RPC must return a doc_id"
+    assert isinstance(r.get("stages"), list) and r["stages"], "stages must be a non-empty list"
+    assert "erc" in r and "sim" in r, "ecad_design RPC must return erc + sim dicts"
+    print(f"  ecad_design RPC: ok={r['ok']} stop={r.get('stop_reason')!r} "
+          f"recipe={r.get('recipe_used')!r} stages={r['stages']}")
+    print("  test_ecad_design_rpc PASS")
+
+
 def test_worker_registry_regression() -> None:
     """Importing engine.worker must succeed and both doc_* and ecad_* must be present."""
     import importlib
@@ -409,7 +463,7 @@ def test_worker_registry_regression() -> None:
     # Check a sample of the expected ecad methods
     for expected in ("ecad_new", "ecad_apply_ops", "ecad_tree", "ecad_undo",
                      "ecad_redo", "ecad_export", "ecad_to_3d", "ecad_describe",
-                     "ecad_autoroute", "ecad_fill_zones"):
+                     "ecad_autoroute", "ecad_fill_zones", "ecad_design"):
         assert expected in w._METHODS, f"{expected} not in worker registry"
 
     # All ecad methods must also be in STRUCTURED_ERROR_METHODS
@@ -434,6 +488,8 @@ def main() -> None:
         test_describe,
         test_autoroute_and_fill_zones,
         test_autoroute_wrong_kind,
+        test_ecad_open_kicad_sch,
+        test_ecad_design_rpc,
         test_worker_registry_regression,
     ]
     failed = []

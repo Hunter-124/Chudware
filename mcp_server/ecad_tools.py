@@ -1273,6 +1273,116 @@ def register_ecad_tools(mcp) -> None:
             ],
         })
 
+    # ---------------------------------------------------------------- autonomous design
+
+    @mcp.tool()
+    def ecad_design(request: str) -> str:
+        """Autonomous ECAD design: natural-language request -> verified schematic + simulation.
+
+        Runs the full deterministic orchestrator pipeline (PLAN -> BUILD -> ERC -> SIMULATE ->
+        REPORT) and returns a summary with the doc_id, stage results, ERC counts, and sim
+        pass/fail. With a provider configured, the model proposes the topology; without one (or
+        if the provider is offline/unavailable) the closest built-in recipe is used so the
+        pipeline ALWAYS produces a verified schematic.
+
+        After this call the produced schematic becomes the active one -- ecad_status() and
+        ecad_simulate() operate on it immediately.
+
+        ``request`` is a plain-English design description, e.g.
+          '5V voltage divider with 2.5V output'
+          'LED driver for a red LED from a 3.3V supply'
+          'inverting op-amp with gain 10'
+        """
+        # Lazy-import so a missing scipy/numpy degrades gracefully.
+        try:
+            from engine.ecad import orchestrator as _orch  # type: ignore
+        except ImportError as exc:
+            return _err(f"orchestrator unavailable ({type(exc).__name__}: {exc})",
+                        hint="engine.ecad.orchestrator could not be imported "
+                             "(numpy/scipy may be missing). "
+                             "Build the schematic manually with ecad_place_symbol + ecad_wire.",
+                        next_actions=["ecad_new_schematic('mydesign')",
+                                      "ecad_find_part('resistor')"])
+
+        # Resolve the configured provider (best-effort; fall back to None -> recipe path).
+        provider = None
+        try:
+            from agent import config as _cfg  # type: ignore
+            provider = _cfg.get_provider()
+        except Exception:  # noqa: BLE001 -- offline / unconfigured / module absent
+            pass
+
+        try:
+            run = _orch.run_design(request, provider=provider)
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"ecad_design failed: {type(exc).__name__}: {exc}",
+                        hint="Check that engine.ecad.orchestrator and its deps are available.",
+                        next_actions=["ecad_status()"])
+
+        doc_id: str | None = run.doc_id
+
+        # Register the produced session as the active schematic so downstream tools work.
+        if doc_id is not None:
+            _ECAD["current_sch"] = doc_id
+            _ECAD["current"] = doc_id
+
+        # Summarise stages concisely.  run.stages is a list[dict] (asdict was called internally).
+        stages_raw = run.stages  # type: ignore[attr-defined]
+        stage_names = [
+            (s.get("stage") if isinstance(s, dict) else getattr(s, "stage", "?"))
+            for s in stages_raw
+        ]
+        erc = run.erc  # type: ignore[attr-defined]
+        sim = run.sim  # type: ignore[attr-defined]
+        recipe = run.recipe_used  # type: ignore[attr-defined]
+        stop = run.stop_reason  # type: ignore[attr-defined]
+        ok = bool(run.ok)  # type: ignore[attr-defined]
+
+        # Build a human summary of the sim result.
+        sim_line = ""
+        if sim:
+            probe = sim.get("probe", "")
+            got = sim.get("got")
+            exp = sim.get("expect")
+            passed = sim.get("pass", False)
+            if got is not None:
+                sim_line = (f"{probe}={got:.4g} (expect {exp}, "
+                            f"{'PASS' if passed else 'MISS'})")
+            elif sim.get("log"):
+                sim_line = sim["log"][-1] if sim["log"] else ""
+
+        hint = (f"Design '{request}' produced with stop_reason={stop!r}. "
+                + (f"Recipe fallback used: {recipe!r}. " if recipe else "")
+                + (f"ERC: {erc.get('errors', 0)} error(s), "
+                   f"{erc.get('warnings', 0)} warning(s). " if erc else "")
+                + (f"Sim: {sim_line}." if sim_line else "")
+                + (" Use ecad_status() to inspect the schematic."
+                   if doc_id else " No document was produced."))
+
+        next_actions: list[str] = []
+        if doc_id:
+            next_actions.append("ecad_status()  # inspect the generated schematic")
+            next_actions.append("ecad_simulate('op')  # re-run simulation or change params")
+        if erc and erc.get("errors", 0) > 0:
+            next_actions.insert(0,
+                "ecad_run_erc()  # investigate the ERC errors in the generated schematic")
+        if not next_actions:
+            next_actions = ["ecad_status()", "ecad_simulate('op')"]
+
+        return _dumps({
+            "ok": ok,
+            "doc_id": doc_id,
+            "stop_reason": stop,
+            "recipe_used": recipe,
+            "stages": stage_names,
+            "ops_applied": run.ops_applied,  # type: ignore[attr-defined]
+            "erc": erc,
+            "sim": sim,
+            "warnings": [],
+            "hint": hint,
+            "next_actions": next_actions,
+        })
+
     # tools registered; nothing to return.
 
 

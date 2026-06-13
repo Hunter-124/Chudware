@@ -30,6 +30,7 @@ import numpy as np
 import scipy.sparse
 import scipy.sparse.linalg
 
+from engine.sim import analysis_ext
 from engine.sim import devices as dev
 from engine.sim.devices import DeviceError, make_device, source_breakpoints
 
@@ -616,22 +617,30 @@ def mna_for(sim: _Sim) -> MnaSystem:
 # AC
 # =============================================================================
 
-def run_ac(sim: _Sim, an: dict, probes: list[str], log: list) -> tuple[dict, bool]:
+def _freq_grid(an: dict) -> np.ndarray:
+    """Build the frequency sweep grid from an AC/noise analysis spec (dec/oct/lin)."""
     sweep = an.get("sweep", "dec")
     points = int(an.get("points", 10))
     fstart = float(an.get("fstart", 1.0))
     fstop = float(an.get("fstop", 1e6))
-
+    if fstart <= 0.0:
+        fstart = 1.0
     if sweep == "dec":
         ndec = math.log10(fstop / fstart)
         nfreq = max(2, int(round(points * ndec)) + 1)
-        freqs = np.logspace(math.log10(fstart), math.log10(fstop), nfreq)
-    elif sweep == "oct":
+        return np.logspace(math.log10(fstart), math.log10(fstop), nfreq)
+    if sweep == "oct":
         noct = math.log2(fstop / fstart)
         nfreq = max(2, int(round(points * noct)) + 1)
-        freqs = np.logspace(math.log10(fstart), math.log10(fstop), nfreq)
-    else:  # lin
-        freqs = np.linspace(fstart, fstop, max(2, points))
+        return np.logspace(math.log10(fstart), math.log10(fstop), nfreq)
+    return np.linspace(fstart, fstop, max(2, points))
+
+
+def run_ac(sim: _Sim, an: dict, probes: list[str], log: list) -> tuple[dict, bool]:
+    sweep = an.get("sweep", "dec")
+    fstart = float(an.get("fstart", 1.0))
+    fstop = float(an.get("fstop", 1e6))
+    freqs = _freq_grid(an)
 
     # DC operating point for nonlinear device linearization.
     x_op = None
@@ -677,6 +686,21 @@ def run_ac(sim: _Sim, an: dict, probes: list[str], log: list) -> tuple[dict, boo
 
     log.append(f"ac: {len(freqs)} points {fstart}..{fstop} Hz ({sweep})")
     return {"x_f": list(map(float, freqs)), "mag": mag, "phase_deg": phase}, converged
+
+
+def run_noise(sim: _Sim, an: dict, probes_or_log, log: list = None) -> tuple[dict, bool]:
+    """Resistor-thermal noise analysis — thin wrapper that hands ``analysis_ext.run_noise`` the
+    circuit-internal callables it needs (new_system / solve_dc_op / probe eval / freq grid)."""
+    # Tolerate either (sim, an, log) or (sim, an, probes, log) call shapes.
+    if log is None:
+        log = probes_or_log
+    helpers = {
+        "new_system": sim.new_system,
+        "solve_dc_op": solve_dc_op,
+        "eval_probe": _eval_probe,
+        "freq_grid": _freq_grid,
+    }
+    return analysis_ext.run_noise(sim, an, log, helpers)
 
 
 # =============================================================================
@@ -759,6 +783,41 @@ def simulate(circuit: dict, study: dict) -> dict:
     if step_spec is not None:
         return _run_stepped(circuit, options, step_spec, inner_analyses, probes, log, t0)
 
+    # Monte-Carlo / temperature sweep wrap an inner analysis and re-invoke simulate per run. They
+    # are additive top-level analysis entries; detect and route before the normal per-analysis path.
+    mc_entries = [a for a in inner_analyses if a.get("type") == "mc"]
+    temp_entries = [a for a in inner_analyses if a.get("type") == "temp"]
+    if mc_entries:
+        an = mc_entries[0]
+        seed_default = int(study.get("seed", options.get("seed", 12345)))
+        result["mc"] = analysis_ext.run_monte_carlo(
+            circuit, options, an, probes, log, simulate, seed_default)
+        result["convergence"]["mc"] = result["mc"].get("runs", 0) > 0
+        # Run any remaining (non-mc) analyses on the nominal circuit too.
+        rest = [a for a in inner_analyses if a.get("type") not in ("mc",)]
+        if rest:
+            try:
+                sim = _Sim(circuit, options)
+                _run_analyses(sim, rest, probes, result, log)
+            except DeviceError as e:
+                log.append(f"build failed: {e}")
+        result["ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+        return result
+    if temp_entries:
+        an = temp_entries[0]
+        result["temp"] = analysis_ext.run_temp_sweep(
+            circuit, options, an, probes, log, simulate)
+        result["convergence"]["temp"] = bool(result["temp"].get("points"))
+        rest = [a for a in inner_analyses if a.get("type") not in ("temp",)]
+        if rest:
+            try:
+                sim = _Sim(circuit, options)
+                _run_analyses(sim, rest, probes, result, log)
+            except DeviceError as e:
+                log.append(f"build failed: {e}")
+        result["ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+        return result
+
     try:
         sim = _Sim(circuit, options)
     except DeviceError as e:
@@ -805,6 +864,30 @@ def _run_analyses(sim: "_Sim", analyses: list, probes: list[str],
                 out, ok = run_ac(sim, an, probes, log)
                 result["ac"] = out
                 result["convergence"]["ac"] = ok
+
+            elif atype == "four":
+                # Fourier/THD on a transient trace. Use a preceding tran result if present;
+                # otherwise run a tran from this spec's own tstep/tstop and analyze it.
+                tran_res = result.get("tran")
+                if tran_res is None:
+                    fprobe = an.get("probe")
+                    tprobes = list(probes)
+                    if fprobe and fprobe not in tprobes:
+                        tprobes = [fprobe] + tprobes
+                    tran_res, tok = run_tran(sim, an, tprobes, log)
+                    result["tran"] = tran_res
+                    result["convergence"]["tran"] = tok
+                four = analysis_ext.run_fourier(tran_res, an, log)
+                if four is not None:
+                    result["four"] = four
+                    result["convergence"]["four"] = True
+                else:
+                    result["convergence"]["four"] = False
+
+            elif atype == "noise":
+                out, ok = run_noise(sim, an, log)
+                result["noise"] = out
+                result["convergence"]["noise"] = ok
 
             else:
                 log.append(f"unknown analysis type '{atype}' — skipped")

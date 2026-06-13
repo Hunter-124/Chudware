@@ -67,7 +67,7 @@ def test_register() -> dict:
         "ecad_wire", "ecad_add_power", "ecad_label", "ecad_status", "ecad_run_erc",
         "ecad_simulate", "ecad_run_drc", "ecad_export", "ecad_to_3d",
         "ecad_update_from_sch", "ecad_autoroute", "ecad_add_zone", "ecad_fill_zones",
-        "ecad_sweep",
+        "ecad_sweep", "ecad_design",
     }
     missing = expected - set(mcp.tools)
     assert not missing, f"tools not registered: {missing}"
@@ -407,6 +407,42 @@ def test_export_guard(tools: dict) -> None:
     print("  [export_guard] PASS")
 
 
+def test_ecad_design(tools: dict) -> None:
+    """ecad_design('5V divider with 2.5V output') must return ok with a usable doc.
+
+    No provider is configured in the test environment, so the orchestrator uses its
+    deterministic recipe fallback. The produced doc must be accessible via ecad_status
+    and ecad_simulate (the active schematic is set by ecad_design).
+    """
+    d = _call(tools, "ecad_design", request="5V divider with 2.5V output")
+    _assert_context(d, "ecad_design")
+    assert d["ok"], (f"ecad_design should succeed (recipe fallback guarantees a result); "
+                     f"got ok=False, hint={d.get('hint')!r}")
+    assert d["doc_id"], "ecad_design must return a doc_id"
+    assert isinstance(d["stages"], list) and d["stages"], "stages list must be non-empty"
+    # recipe_used is set when the fallback is active (no provider in CI).
+    print(f"  ecad_design: stop_reason={d['stop_reason']!r} "
+          f"recipe={d.get('recipe_used')!r} stages={d['stages']}")
+
+    # ecad_status must now operate on the produced doc (active schematic set by ecad_design).
+    st = _call(tools, "ecad_status")
+    assert st["ok"] and st["kind"] == "sch", \
+        f"ecad_status after ecad_design should see a schematic, got {st}"
+    assert st["component_count"] >= 1, \
+        f"produced schematic should have at least one component, got {st['component_count']}"
+    print(f"  ecad_status after design: {st['summary']}")
+
+    # ecad_simulate must work on the produced doc without crashing.
+    sim = _call(tools, "ecad_simulate", analysis="op")
+    assert "ok" in sim, "ecad_simulate must return a payload"
+    # We accept both convergence and a clean 'no devices' response -- the key requirement is
+    # that it does not throw an exception and returns the context fields.
+    assert "hint" in sim and "next_actions" in sim, "ecad_simulate must return guidance"
+    print(f"  ecad_simulate after design: converged={sim.get('converged')} "
+          f"reading={sim.get('reading', 'n/a')!r}")
+    print("  [ecad_design] PASS")
+
+
 # --------------------------------------------------------------------------- runner
 
 
@@ -426,6 +462,7 @@ def main() -> None:
     test_sync_autoroute_zone_flow(tools)
     test_add_zone_unknown_net(tools)
     test_export_guard(tools)
+    test_ecad_design(tools)
     print("\nALL ECAD TOOL TESTS PASSED")
 
 

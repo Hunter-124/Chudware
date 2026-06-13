@@ -984,6 +984,192 @@ class Switch(Device):
         raise DeviceError("voltage-controlled switch (S) not yet modeled")
 
 
+# --------------------------------------------------------------------------- T (lossless line)
+
+@device("T")
+class TLine(Device):
+    """Ideal lossless transmission line (controlled-impedance interconnect).
+
+    SPICE ``T`` element: a two-port lossless line of characteristic impedance ``Z0`` and one-way
+    propagation delay ``TD``. ``nodes = [a+, a-, b+, b-]`` (port-A pair, port-B pair); the two
+    return nodes are usually ground. Params: ``{z0, td}`` (seconds) or ``{z0, freq, nl}`` where the
+    delay is derived as ``td = nl / freq`` (electrical length ``nl`` wavelengths at ``freq``).
+
+    **Transient model -- Branin method of characteristics (the classic lossless-line companion).**
+    Each port is, instantaneously, a resistor ``Z0`` to its own reference in series with a history
+    voltage source carrying the wave that left the *other* port one delay ``TD`` ago::
+
+        v_a(t) - Z0*i_a(t) = E_a(t) = 2*v_b(t-TD) - [ v_b(t-TD) - Z0*i_b(t-TD) ]
+                                    = v_b(t-TD) + Z0*i_b(t-TD)         (incident from B)
+        v_b(t) - Z0*i_b(t) = E_b(t) = v_a(t-TD) + Z0*i_a(t-TD)         (incident from A)
+
+    where ``i`` flows *into* each port. The delayed history is interpolated linearly between stored
+    samples (we keep the full ``(t, v_port, i_port)`` history per port), so an arbitrary timestep
+    works -- this is the honest model used: ideal lossless Branin with linear history interpolation
+    (no loss, no dispersion). Implemented with one MNA branch current per port (like the inductor),
+    so the port currents are exact unknowns rather than finite-difference estimates.
+
+    **DC.** A lossless line at DC is a pure ``Z0``-to-Z0 wire: ``E = v(t-TD) + Z0*i(t-TD)`` becomes
+    the static condition, which collapses to ``V(a)=V(b)``, ``i_a = -i_b`` -- i.e. an ideal pass
+    through (the line is a short for the differential signal, both ends at the same potential). We
+    stamp it as the static fixed point of the Branin equations: a ``Z0`` series resistor at each
+    port driven by the steady incident wave, which yields a DC wire. (SPICE convention: the line
+    passes DC.)
+
+    **AC.** Exact lossless two-port. With ``gamma*l = j*omega*TD`` (lossless -> purely imaginary),
+    the ABCD/admittance two-port of a line of impedance ``Z0`` is stamped exactly using
+    ``Y11=Y22 = 1/(Z0*tanh(j*beta*l))`` and ``Y12=Y21 = -1/(Z0*sinh(j*beta*l))``. This reproduces
+    the quarter-wave impedance inverter, flat input impedance for a matched termination, etc.
+    """
+
+    n_branches = 2  # one branch current per port (i into a+, i into b+)
+
+    # ---- parameters ----
+    def _z0_td(self) -> tuple[float, float]:
+        z0 = self._mp("z0", self._mp("Z0", 50.0))
+        if z0 <= 0.0:
+            z0 = 50.0
+        td = self.dparams.get("td", self.dparams.get("TD"))
+        if td is not None:
+            return float(z0), max(float(td), 0.0)
+        # {z0, freq, nl}: electrical length nl (in wavelengths) at freq -> td = nl / freq.
+        freq = self._mp("freq", self._mp("f", 0.0))
+        nl = self._mp("nl", self._mp("NL", 0.25))
+        if freq > 0.0:
+            return float(z0), nl / freq
+        return float(z0), 0.0
+
+    def _ports(self, mna: MnaLike):
+        ap = mna.n(self.node_names[0]); an = mna.n(self.node_names[1])
+        bp = mna.n(self.node_names[2]); bn = mna.n(self.node_names[3])
+        return ap, an, bp, bn
+
+    # ---- DC: lossless line passes DC (ideal Z0 wire, both ends equal) ----
+    def stamp_dc(self, mna: MnaLike, x: np.ndarray) -> None:
+        self.alloc_branches(mna)
+        ap, an, bp, bn = self._ports(mna)
+        bra, brb = self.branch_rows[0], self.branch_rows[1]
+        # Branch currents enter each port.
+        mna.stamp_G(ap, bra, 1.0); mna.stamp_G(an, bra, -1.0)
+        mna.stamp_G(bp, brb, 1.0); mna.stamp_G(bn, brb, -1.0)
+        # At DC the Branin incident waves settle to the steady values, giving V(a)=V(b) and
+        # i_a = -i_b: stamp the two constraint rows (ideal pass-through / Z0->wire limit).
+        # Row a: V(a) - V(b) = 0
+        mna.stamp_G(bra, ap, 1.0); mna.stamp_G(bra, an, -1.0)
+        mna.stamp_G(bra, bp, -1.0); mna.stamp_G(bra, bn, 1.0)
+        # Row b: i_a + i_b = 0  (KCL of an ideal lossless wire at DC)
+        mna.stamp_G(brb, bra, 1.0); mna.stamp_G(brb, brb, 1.0)
+
+    # ---- transient: Branin method of characteristics ----
+    def stamp_tran(self, mna: MnaLike, x: np.ndarray, dt: float, hist: dict) -> None:
+        self.alloc_branches(mna)
+        ap, an, bp, bn = self._ports(mna)
+        bra, brb = self.branch_rows[0], self.branch_rows[1]
+        z0, td = self._z0_td()
+        if td <= 0.0:
+            # Degenerate zero-delay line -> behave like a DC pass-through wire.
+            self.stamp_dc(mna, x)
+            return
+        t_now = hist.get("_t", 0.0)
+        st = hist.get(self.name, {})
+        # Incident wave arriving at each port now = wave that left the other port at t-td.
+        ea = self._incident(st, "b", z0, t_now - td)  # from B into A
+        eb = self._incident(st, "a", z0, t_now - td)  # from A into B
+
+        # KCL: branch currents enter the ports.
+        mna.stamp_G(ap, bra, 1.0); mna.stamp_G(an, bra, -1.0)
+        mna.stamp_G(bp, brb, 1.0); mna.stamp_G(bn, brb, -1.0)
+        # Port-A branch eq: V(a+) - V(a-) - Z0*i_a = Ea
+        mna.stamp_G(bra, ap, 1.0); mna.stamp_G(bra, an, -1.0)
+        mna.stamp_G(bra, bra, -z0)
+        mna.stamp_I(bra, ea)
+        # Port-B branch eq: V(b+) - V(b-) - Z0*i_b = Eb
+        mna.stamp_G(brb, bp, 1.0); mna.stamp_G(brb, bn, -1.0)
+        mna.stamp_G(brb, brb, -z0)
+        mna.stamp_I(brb, eb)
+
+    def _incident(self, st: dict, port: str, z0: float, t_delayed: float) -> float:
+        """Incident wave from ``port`` evaluated at the (possibly fractional) delayed time.
+
+        Branin: the wave launched at the far port at ``t-TD`` is ``v_far + Z0*i_far`` (i into the
+        port). History samples are ``(t, v, i)``; linearly interpolate. Before t=0 the line is
+        quiescent -> 0."""
+        samples = st.get(port)  # list of (t, v, i)
+        if not samples or t_delayed <= samples[0][0]:
+            return 0.0
+        if t_delayed >= samples[-1][0]:
+            t, v, i = samples[-1]
+            return v + z0 * i
+        # Binary-ish linear scan (histories are short relative to total steps near the front).
+        lo = 0
+        hi = len(samples) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if samples[mid][0] <= t_delayed:
+                lo = mid
+            else:
+                hi = mid
+        t0, v0, i0 = samples[lo]
+        t1, v1, i1 = samples[hi]
+        frac = (t_delayed - t0) / (t1 - t0) if t1 > t0 else 0.0
+        v = v0 + (v1 - v0) * frac
+        i = i0 + (i1 - i0) * frac
+        return v + z0 * i
+
+    def update_state(self, x: np.ndarray, dt: float, hist: dict) -> None:
+        ap, an, bp, bn = self._a, self._an, self._b, self._bn
+        bra, brb = self.branch_rows[0], self.branch_rows[1]
+        t_now = hist.get("_t", 0.0)
+        va = _xat(x, ap) - _xat(x, an)
+        vb = _xat(x, bp) - _xat(x, bn)
+        ia = _xat(x, bra)
+        ib = _xat(x, brb)
+        st = hist.setdefault(self.name, {})
+        st.setdefault("a", [(0.0, 0.0, 0.0)])
+        st.setdefault("b", [(0.0, 0.0, 0.0)])
+        # Overwrite the t=0 seed on the first real sample; else append.
+        for port, v, i in (("a", va, ia), ("b", vb, ib)):
+            lst = st[port]
+            if len(lst) == 1 and lst[0][0] == 0.0 and t_now > 0.0:
+                lst[0] = (t_now, v, i)
+            else:
+                lst.append((t_now, v, i))
+
+    def record_indices(self, mna: MnaLike) -> None:
+        self.alloc_branches(mna)
+        self._a = mna.n(self.node_names[0]); self._an = mna.n(self.node_names[1])
+        self._b = mna.n(self.node_names[2]); self._bn = mna.n(self.node_names[3])
+
+    # ---- AC: exact lossless two-port ----
+    def stamp_ac(self, mna: MnaLike, x_op: np.ndarray, omega: float) -> None:
+        self.alloc_branches(mna)
+        ap, an, bp, bn = self._ports(mna)
+        z0, td = self._z0_td()
+        # The AC two-port is stamped directly as node admittances, so the DC/transient port-current
+        # branch rows are unused here. Tie them off (I_branch = 0) so they do not leave singular
+        # zero rows in the complex MNA matrix.
+        for br in self.branch_rows:
+            mna.stamp_Gc(br, br, 1.0)
+        # Lossless: gamma*l = j*omega*td. Y-parameters of a line of length l:
+        #   Y11 = Y22 = coth(gamma l)/Z0 ;  Y12 = Y21 = -csch(gamma l)/Z0.
+        gl = 1j * omega * td
+        # Guard the near-DC singularity of coth/csch (gl -> 0) with a tiny offset.
+        if abs(gl) < 1e-15:
+            gl = 1e-15 + 0j
+        th = np.tanh(gl)
+        sh = np.sinh(gl)
+        y11 = (1.0 / (z0 * th))
+        y12 = (-1.0 / (z0 * sh))
+        # Stamp the 4-node admittance two-port (ports a+/a-, b+/b-) directly via complex G-stamps.
+        for (i, j, y) in (
+            (ap, ap, y11), (an, an, y11), (ap, an, -y11), (an, ap, -y11),
+            (bp, bp, y11), (bn, bn, y11), (bp, bn, -y11), (bn, bp, -y11),
+            (ap, bp, y12), (bp, ap, y12), (an, bn, y12), (bn, an, y12),
+            (ap, bn, -y12), (bn, ap, -y12), (an, bp, -y12), (bp, an, -y12),
+        ):
+            mna.stamp_Gc(i, j, y)
+
+
 # --------------------------------------------------------------------------- util
 
 def _xat(x: np.ndarray, i: int) -> float:

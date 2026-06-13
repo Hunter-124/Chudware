@@ -37,8 +37,8 @@ static std::unordered_map<std::string, std::string> s_LastUsed;
 // in its own (matching) scope.
 static std::string s_flyoutOpenReq;
 
-static const char* kRibbonTabs[] = {"Features", "Sketch", "Evaluate", "Simulation", "Assembly"};
-static constexpr int kRibbonTabCount = 5;
+static const char* kRibbonTabs[] = {"Features", "Sketch", "Evaluate", "Simulation", "Assembly", "PCB"};
+static constexpr int kRibbonTabCount = 6;  // Wave N: + "PCB" (AI-ECAD electrical design tab)
 
 // C25c FIX (defect 3): the Draw group gained a big "Ellipse" split button (sk_ellipse_big) as the
 // flyout parent, but the original small sk_ellipse row is still in the (append-only) table. Rendering

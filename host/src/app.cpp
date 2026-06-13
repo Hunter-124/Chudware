@@ -511,6 +511,8 @@ int run_gui(const char* screenshotPath) {
     st.wantRibbon = shot && shotMode && std::strcmp(shotMode, "ribbon") == 0;
     st.wantTree = shot && shotMode && std::strcmp(shotMode, "tree") == 0;
     st.wantM1 = shot && shotMode && std::strcmp(shotMode, "m1") == 0;  // C17 integration scenario
+    st.wantEcad = shot && shotMode && std::strcmp(shotMode, "ecad") == 0;  // Wave N: ECAD GUI shot
+    if (st.wantEcad) { st.showRibbon = true; st.ribbonTab = 5; }  // PCB tab forward
     st.wantSketch = shot && shotMode && std::strcmp(shotMode, "sketch") == 0;  // C18 sketch flow
     if (st.wantSketch) { st.showRibbon = true; st.ribbonTab = 1; }  // Sketch tab forward
     st.wantFea = shot && shotMode && std::strcmp(shotMode, "fea") == 0;       // C19 static study
@@ -1027,6 +1029,64 @@ int run_gui(const char* screenshotPath) {
             }
         }
 
+        // Wave N: ECAD GUI shot — build a verified design via the worker and load it into the
+        // editor mirror so the screenshot shows a live schematic/board (mirrors the wantTree flow).
+        // Default shows the schematic (always populated via the orchestrator's recipe fallback);
+        // AI_CAD_ECAD_KIND=pcb shows the laid-out + autorouted board instead.
+        if (st.wantEcad && !st.ecadShotDone && st.workerStarted) {
+            st.ecadShotDone = true;
+            auto ecall = [&](const char* m, const nlohmann::json& p, nlohmann::json& out) -> bool {
+                std::string e;
+                bool ok = st.worker.call(m, p, out, e, 60000);
+                std::printf("[ecad-shot] %s ok=%d%s\n", m, (int)ok,
+                            (out.is_object() && out.contains("code")) ? " (code-err)" : "");
+                std::fflush(stdout);
+                return ok && !(out.is_object() && out.contains("code"));
+            };
+            const char* kindEnv = std::getenv("AI_CAD_ECAD_KIND");
+            const bool wantPcb = kindEnv && std::strcmp(kindEnv, "pcb") == 0;
+            nlohmann::json r;
+            std::string showId;
+            if (wantPcb) {
+                // Build a small demo board explicitly: outline + two 0603 footprints (pads
+                // resolved from the library) + a routed track + a GND copper pour, then fill it.
+                if (ecall("ecad_new", {{"kind", "pcb"}}, r)) {
+                    const std::string pcbId = jstr(r, "doc_id");
+                    const int rev = jint(r, "revision");
+                    nlohmann::json ops = nlohmann::json::array();
+                    ops.push_back({{"op","pcb_set_outline"},{"closed",true},{"shapes",
+                        nlohmann::json::array({
+                            {{"type","line"},{"p1",{0,0}},  {"p2",{40,0}}},
+                            {{"type","line"},{"p1",{40,0}}, {"p2",{40,30}}},
+                            {{"type","line"},{"p1",{40,30}},{"p2",{0,30}}},
+                            {{"type","line"},{"p1",{0,30}}, {"p2",{0,0}}}})}});
+                    ops.push_back({{"op","pcb_add_footprint"},{"fpid","Resistor_SMD:R_0603"},
+                                   {"pos",{14,15}},{"ref","R1"},{"value","10k"}});
+                    ops.push_back({{"op","pcb_add_footprint"},{"fpid","Resistor_SMD:R_0603"},
+                                   {"pos",{26,15}},{"ref","R2"},{"value","10k"}});
+                    ops.push_back({{"op","pcb_add_track"},{"layer","F.Cu"},{"width",0.3},
+                                   {"p1",{15.6,15}},{"p2",{24.4,15}}});
+                    ops.push_back({{"op","pcb_add_zone"},{"net","GND"},{"layer","B.Cu"},{"polygon",
+                        nlohmann::json::array({ {1,1},{39,1},{39,29},{1,29} })}});
+                    ecall("ecad_apply_ops", {{"doc_id",pcbId},{"base_revision",rev},{"ops",ops}}, r);
+                    ecall("ecad_fill_zones", {{"doc_id", pcbId}}, r);
+                    showId = pcbId;
+                }
+            } else {
+                // AI design -> a verified divider schematic (recipe fallback; no model needed).
+                if (ecall("ecad_design", {{"request", "5V resistive divider with 2.5V output"}}, r))
+                    showId = jstr(r, "doc_id");
+            }
+            if (!showId.empty() && ecall("ecad_tree", {{"doc_id", showId}}, r)) {
+                st.ecadDocId = showId;
+                st.ecadRevision = jint(r, "revision");
+                ui::ecadEditorMirror().setDocId(showId);
+                ui::ecadEditorLoadResponse(r);
+                std::printf("[ecad-shot] showing %s rev=%d\n", showId.c_str(), st.ecadRevision);
+                std::fflush(stdout);
+            }
+        }
+
         // ---------- scripted scenarios (AI_CAD_SHOT=m1/sketch/asm/fea/evalmass/activity) ----------
         // Frame-driven state machines that issue scripted ops through the REAL worker, drive the
         // panels, and request per-step screenshots; extracted to ui::ScenarioRunner (ui/scenarios.cpp).
@@ -1239,7 +1299,8 @@ int run_gui(const char* screenshotPath) {
         // tree shot needs extra frames for the tree to repaint after async doc load
         // wantTree but !treeShotDone: keep waiting (up to 30 frames) for the worker to start
         // wantTree and treeShotDone: take the screenshot at frame 10 (tree has repainted)
-        const int shotFrame = st.wantTree ? (st.treeShotDone ? 10 : 30) : 6;
+        int shotFrame = st.wantTree ? (st.treeShotDone ? 10 : 30) : 6;
+        if (st.wantEcad) shotFrame = st.ecadShotDone ? 10 : 150;  // wait for worker+design, then settle
         if (shot && ++st.frame >= shotFrame) {
             std::vector<unsigned char> px(dw * dh * 4);
             glReadBuffer(GL_BACK);

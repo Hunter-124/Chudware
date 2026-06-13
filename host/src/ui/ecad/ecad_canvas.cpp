@@ -89,7 +89,7 @@ void EcadCanvas::zoomToFit(const EcadMirror& doc, const ImVec2& avail) {
     const float w = std::max(1.0f, mx.x - mn.x);
     const float h = std::max(1.0f, mx.y - mn.y);
     pan_ = {(mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f};
-    const float pad = 1.18f;  // ~9% margin each side
+    const float pad = 1.10f;  // ~5% margin each side (fill the canvas)
     const float zx = avail.x / (w * pad);
     const float zy = avail.y / (h * pad);
     pxPerMm_ = std::max(0.25f, std::min(zx, zy));

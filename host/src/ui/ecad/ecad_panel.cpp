@@ -165,6 +165,13 @@ void drawEcadEditor(AppState& st) {
     EcadEditorState& es = state();
     const ui::Palette& pal = ui::palette;
 
+    // Pop the ECAD tab forward the frame a document first appears (New Schematic/PCB, or a shot),
+    // so the editor surfaces instead of staying hidden behind the Viewport tab.
+    static bool prevHadDoc = false;
+    const bool hasDocNow = es.mirror.hasDoc();
+    if (hasDocNow && !prevHadDoc) ImGui::SetWindowFocus("ECAD");
+    prevHadDoc = hasDocNow;
+
     if (!ImGui::Begin("ECAD")) { ImGui::End(); return; }
 
     if (!es.mirror.hasDoc()) {
@@ -174,22 +181,24 @@ void drawEcadEditor(AppState& st) {
         return;
     }
 
-    // Header row: doc kind + name + toolbar toggles.
-    ImGui::TextColored(v4(pal.accent), "%s", es.mirror.isSch() ? "Schematic" : "PCB");
-    ImGui::SameLine();
-    ImGui::TextColored(v4(pal.text), "%s", es.mirror.name().c_str());
-    ImGui::SameLine();
+    // ---- header toolbar: doc badge + name + revision (left); view controls (right) ----
+    const float sc = ui::uiScale;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(v4(pal.accent), "%s", es.mirror.isSch() ? "SCHEMATIC" : "PCB LAYOUT");
+    ImGui::SameLine(0, 12 * sc);
+    ImGui::TextColored(v4(pal.text), "%s",
+                       es.mirror.name().empty() ? "(untitled)" : es.mirror.name().c_str());
+    ImGui::SameLine(0, 8 * sc);
     ImGui::TextColored(v4(pal.textDim), "rev %d", es.mirror.revision());
+    ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 160 * sc);
+    if (ImGui::SmallButton("Zoom Fit")) es.canvas.requestFit();
     ImGui::SameLine();
-    if (ImGui::SmallButton("Fit")) es.canvas.requestFit();
-    ImGui::SameLine();
-    ImGui::Checkbox("Layers/Nets", &es.showLeft);
+    ImGui::Checkbox(es.mirror.isPcb() ? "Layers" : "Nets", &es.showLeft);
 
     ImGui::Separator();
 
     // Reserve the bottom results strip; the rest splits left sub-panel | canvas.
-    const float sc = ui::uiScale;
-    const float bottomH = 150.0f * sc;
+    const float bottomH = 140.0f * sc;
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     const float mainH = avail.y - bottomH;
 

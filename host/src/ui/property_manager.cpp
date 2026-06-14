@@ -48,10 +48,22 @@ static std::string comboValue(const std::vector<PMField>& fields, const char* ke
 
 // Return true when the field's enableKey/enableVals condition is satisfied (always true when
 // enableKey is null). comingSoon fields are never enabled for interaction.
+// The gating value of the field named `key`, as a string token: a Combo yields its selected
+// option value; a Check yields "true"/"false". Lets a field be gated (enableKey/enableVals) on
+// either a sibling combo OR a sibling checkbox (e.g. thin-feature thickness on the "thin" check).
+static std::string enableSourceValue(const std::vector<PMField>& fields, const char* key) {
+    std::string c = comboValue(fields, key);
+    if (!c.empty()) return c;
+    for (const auto& f : fields)
+        if (f.def->kind == PMFieldKind::Check && std::strcmp(f.def->key, key) == 0)
+            return f.checkValue ? "true" : "false";
+    return c;
+}
+
 static bool fieldEnabled(const PMFieldDef& def, const std::vector<PMField>& fields) {
     if (def.comingSoon) return false;
     if (!def.enableKey)  return true;
-    std::string cur = comboValue(fields, def.enableKey);
+    std::string cur = enableSourceValue(fields, def.enableKey);
     std::string allowed = def.enableVals ? def.enableVals : "";
     if (allowed.empty()) return true;
     // Check if cur appears as a token in the pipe-separated allowed list.

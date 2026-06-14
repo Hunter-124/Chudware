@@ -628,6 +628,13 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
     p = feat.get("params", {})
     refs = feat.get("refs", {})
 
+    # The geometry-driven end targets (up_to_surface / offset_from_surface / up_to_vertex /
+    # up_to_body) live in refs.up_to (Dir1) / refs.up_to2 (Dir2) — a face/vertex/body selector,
+    # the SolidWorks-correct home now that the schema declares the slot. Fall back to
+    # params.up_to(2) for docs authored before the refs slot existed.
+    up_to_sel = refs.get("up_to") if refs.get("up_to") is not None else p.get("up_to")
+    up_to2_sel = refs.get("up_to2") if refs.get("up_to2") is not None else p.get("up_to2")
+
     mode = p.get("mode", "boss")
     end = p.get("end", "blind")
     end2 = p.get("end2", "none")
@@ -737,7 +744,7 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
             )
         if up_sel is None:
             raise FeatureError(
-                f"extrude: {end_cond} ({label}) needs a target — set params."
+                f"extrude: {end_cond} ({label}) needs a target — set refs."
                 f"{'up_to2' if label == 'dir2' else 'up_to'} to a face/vertex selector",
             )
         body = bodies[-1]
@@ -764,7 +771,7 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
     if end == "mid_plane":
         amount = depth / 2.0  # SW: depth = TOTAL height, half each side
     elif end in _SURFACE_ENDS:
-        amount = _geometry_amount(end, normal, p.get("up_to"), offset1, "dir1")
+        amount = _geometry_amount(end, normal, up_to_sel, offset1, "dir1")
         if abs(taper) > 1e-9:
             draft_ignored = True
     elif end == "up_to_body":
@@ -779,8 +786,8 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
         # The target is the running body (this codebase keeps a single running solid; there
         # is no body registry exposed to compilers). An optional params.up_to face selector
         # is resolved only to VALIDATE the pick names a real face of that body.
-        if p.get("up_to") is not None:
-            _resolve_target_entity(p.get("up_to"), bodies[-1], "face", "up_to")
+        if up_to_sel is not None:
+            _resolve_target_entity(up_to_sel, bodies[-1], "face", "up_to")
         up_to_body_target = bodies[-1]
     else:
         amount = _linear_amount(end, depth, normal)
@@ -801,7 +808,7 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
     end2_eff = end2
     if end2 != "none":
         if end2 in _SURFACE_ENDS:
-            amount2 = _geometry_amount(end2, normal * -1.0, p.get("up_to2"),
+            amount2 = _geometry_amount(end2, normal * -1.0, up_to2_sel,
                                        offset2_v, "dir2")
             end2_eff = "blind"
             if abs(taper) > 1e-9:

@@ -385,6 +385,39 @@ def test_up_to_surface_lands_on_face() -> None:
     print(f"[up_to_surface] probe vol={vols[0]:.1f} z[{bb.min.Z:.1f},{bb.max.Z:.1f}]")
 
 
+# ----------------------------------------------------------------- test 8b: up_to_surface via refs.up_to
+
+def test_up_to_surface_via_refs_slot() -> None:
+    """Same geometry/result as test 8, but the up-to target lives in refs.up_to (the
+    schema-declared slot the host PM form fills) instead of params.up_to. refs.up_to is the
+    canonical home; params.up_to remains a back-compat fallback. The probe must still land on
+    z=20, spanning z[20,40] (vol 2000) — proving the host's refs path drives the same geometry."""
+    doc = _doc([
+        _feat("f1", "plane", {"method": "offset", "offset": _dim(40.0)},
+              refs={"base": "plane.top"}),
+        _feat("f2", "box", {"length": _dim(40), "width": _dim(40), "height": _dim(20),
+                            "centered": False}, refs={"at": "origin"}),
+        _rect_sketch("f3", 15, 15, 10, 10, "f1"),
+        _feat("f4", "extrude", {
+            "mode": "boss", "end": "up_to_surface", "depth": _dim(1.0),
+            "flip": True, "merge": False,
+        }, refs={"profile": [_region_sel("f3", 20, 20, 100.0)],
+                 "up_to": _planar_face_sel(20, 20, 20, 1600.0)}),
+    ])
+    _assert_valid(doc)  # refs.up_to must validate as a _SEL_OR_DATUM face selector
+    res = compile_document(doc)
+    s = _status(res, "f4")
+    assert s["ok"], f"up_to_surface via refs.up_to failed: {s['error']}"
+    assert len(res.bodies) == 2, f"merge=False should make a 2nd body; got {len(res.bodies)}"
+    probe = min(res.bodies, key=lambda b: b.shape.volume)
+    assert abs(probe.shape.volume - 2000.0) / 2000.0 < 0.01, \
+        f"refs.up_to probe vol {probe.shape.volume:.1f} vs expected 2000 (should land on z=20)"
+    bb = probe.shape.bounding_box()
+    assert abs(bb.min.Z - 20.0) < 0.05 and abs(bb.max.Z - 40.0) < 0.05, \
+        f"probe should span z[20,40]; got z[{bb.min.Z:.2f},{bb.max.Z:.2f}]"
+    print(f"[up_to_surface-refs] probe vol={probe.shape.volume:.1f} z[{bb.min.Z:.1f},{bb.max.Z:.1f}]")
+
+
 # --------------------------------------------------------------------------- test 9: offset_from_surface
 
 def test_offset_from_surface_stops_past_face() -> None:

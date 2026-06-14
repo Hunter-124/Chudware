@@ -47,6 +47,14 @@ static PMFieldDef ComboL(const char* key, const char* label, const char* group,
     PMFieldDef f = Combo(key, label, group, options);
     f.comboLabels = labels; return f;
 }
+// ComboL enabled only when a sibling field (named enableKey) holds one of enableVals — works
+// against a sibling combo OR a checkbox ("true"/"false"), via fieldEnabled/enableSourceValue.
+static PMFieldDef ComboLIf(const char* key, const char* label, const char* group,
+                           const char* options, const char* labels,
+                           const char* enableKey, const char* enableVals) {
+    PMFieldDef f = ComboL(key, label, group, options, labels);
+    f.enableKey = enableKey; f.enableVals = enableVals; return f;
+}
 static PMFieldDef Check(const char* key, const char* label, const char* group, bool def) {
     PMFieldDef f; f.kind = PMFieldKind::Check; f.key = key; f.label = label;
     f.group = group; f.checkDefault = def; return f;
@@ -124,24 +132,41 @@ static const std::vector<PMFormDef>& forms() {
             Check ("centered", "Centered", "Cylinder", true),
         }},
         // --- extrude ---  mode/end/depth/flip/draft/draft_outward/merge ; profile[]
-        //   Direction 2: end2 / depth2 (C26-B engine; UI ready, errors gracefully before merge)
+        //   Direction 2: end2 / depth2. Geometry-driven ends (up_to_surface/offset_from_surface/
+        //   up_to_body/up_to_vertex) read a face/vertex/body target from refs.up_to(2) — the
+        //   "Up To" well (K_FACEVERT) gated on those ends; offset_from_surface adds an Offset dim.
+        //   Thin Feature (params.thin/thin_thickness/thin_side) extrudes a wall instead of a solid.
         { "extrude", "Extrude", "extrude_boss", {
             Well      ("profile",  "Profile",         "From",        K_FACE, true),
             ComboL    ("mode",     "Type",            "Direction 1", "boss|cut",
                                                                      "Boss|Cut"),
             ComboL    ("end",      "End Condition",   "Direction 1",
-                       "blind|mid_plane|through_all|up_to_next",
-                       "Blind|Mid Plane|Through All|Up To Next"),
+                       "blind|mid_plane|through_all|up_to_next|up_to_surface|offset_from_surface|up_to_body|up_to_vertex",
+                       "Blind|Mid Plane|Through All|Up To Next|Up To Surface|Offset From Surface|Up To Body|Up To Vertex"),
             DimIf     ("depth",    "Depth",           "Direction 1", 10.0,
                        "end", "blind|mid_plane"),
+            WellIf    ("up_to",    "Up To Reference", "Direction 1", K_FACEVERT, false,
+                       "end", "up_to_surface|offset_from_surface|up_to_body|up_to_vertex"),
+            DimIf     ("offset",   "Offset",          "Direction 1", 0.0,
+                       "end", "offset_from_surface"),
             Check     ("flip",     "Reverse direction","Direction 1", false),
             Angle     ("draft",    "Draft angle",     "Direction 1", 0.0),
             Check     ("draft_outward", "Draft outward","Direction 1", false),
             ComboL    ("end2",     "End Condition",   "Direction 2",
-                       "none|blind|through_all|up_to_next",
-                       "None|Blind|Through All|Up To Next"),
+                       "none|blind|through_all|up_to_next|up_to_surface|offset_from_surface|up_to_body|up_to_vertex",
+                       "None|Blind|Through All|Up To Next|Up To Surface|Offset From Surface|Up To Body|Up To Vertex"),
             DimIf     ("depth2",   "Depth",           "Direction 2", 10.0,
                        "end2", "blind"),
+            WellIf    ("up_to2",   "Up To Reference", "Direction 2", K_FACEVERT, false,
+                       "end2", "up_to_surface|offset_from_surface|up_to_body|up_to_vertex"),
+            DimIf     ("offset2",  "Offset",          "Direction 2", 0.0,
+                       "end2", "offset_from_surface"),
+            Check     ("thin",         "Thin Feature",  "Thin Feature", false),
+            DimIf     ("thin_thickness","Wall thickness","Thin Feature", 2.0,
+                       "thin", "true"),
+            ComboLIf  ("thin_side", "Wall side",       "Thin Feature",
+                       "one|two|mid", "One Direction|Two Directions|Mid-Plane",
+                       "thin", "true"),
             Check     ("merge",    "Merge result",    "Options",      true),
         }},
         // --- revolve ---  mode/angle/flip/merge ; profile[]/axis

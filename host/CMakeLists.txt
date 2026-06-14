@@ -106,6 +106,8 @@ add_executable(AI-CAD
   # --- C20b: assembly UI panels ---
   src/ui/asm_panels.cpp
   # --- end C20b ---
+  # --- Equations / Global Variables editor ---
+  src/ui/equations_dialog.cpp
   # --- C22b: Activity panel + prompt editor + orchestrator wiring ---
   src/ui/activity_panel.cpp
   # --- end C22b ---

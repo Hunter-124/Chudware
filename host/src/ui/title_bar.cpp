@@ -333,6 +333,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             }
             ImGui::MenuItem("Design Table", nullptr, &st.showDesignTablePanel);
             ImGui::MenuItem("Cut List", nullptr, &st.showCutListPanel);
+            ImGui::MenuItem("Equations", nullptr, &st.showEquations);
             ImGui::MenuItem("AI Panel", nullptr, &st.showAIPanel);
             ImGui::MenuItem("Viewport", nullptr, &st.showViewport);
             ImGui::Separator();

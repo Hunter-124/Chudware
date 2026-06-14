@@ -274,6 +274,8 @@ struct AppState {
     core::DocMirror docMirror;
     bool wantTree = false;   // AI_CAD_SHOT=tree: scripted doc-smoke flow + screenshot
     bool treeShotDone = false; // guard so doc smoke runs exactly once
+    bool wantEquations = false;   // AI_CAD_SHOT=equations: open the Equations editor + seed two globals
+    bool equationsShotDone = false; // guard so the equations seed runs exactly once
 
     // ---- Wave N: AI-ECAD document (worker ecad_* RPCs; the editor mirror lives in ecad_panel.cpp) ----
     std::string ecadDocId;          // open ECAD doc id ("" = none)
@@ -567,6 +569,10 @@ struct AppState {
     // Weldment Cut List panel (SolidWorks Weldment Cut List). Dockable "Cut List" window in the
     // right task pane; View > Cut List toggles it. Only meaningful for part docs with weldments.
     bool showCutListPanel = false;
+    // Equations / Global Variables editor (SolidWorks "Equations" dialog). A modeless window over
+    // doc.equations.globals; opened by double-clicking the FeatureManager "Equations" node or the
+    // View > Equations menu toggle. Add/edit -> eq_set, delete -> eq_delete (drawn in equations_dialog.cpp).
+    bool showEquations = false;
     int  aiInteraction = 0;       // 0=Design (new part) 1=Edit (orchestrator v2) 2=Chat
     bool focusActivityTab = false;  // one-shot: select the Activity tab (e.g. when a v2 run starts)
     bool showAbout = false, designStarted = false;

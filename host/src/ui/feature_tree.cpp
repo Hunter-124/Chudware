@@ -1273,6 +1273,9 @@ static void drawFeatureTreeBody(AppState& st,
                 treeIcon("equations", "[=]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                 ImGui::TreeNodeEx(eqLabel, f);
+                // Double-click the node to open the Equations / Global Variables editor (SolidWorks).
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                    st.showEquations = true;
             }
 
             // Material

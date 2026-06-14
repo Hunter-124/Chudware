@@ -74,6 +74,7 @@
 // --- C20b: assembly UI ---
 #include "ui/asm_panels.h"
 // --- end C20b ---
+#include "ui/equations_dialog.h"  // Equations / Global Variables editor
 #include "ui/scenarios.h"  // scripted screenshot/test scenarios (m1/sketch/asm/fea/evalmass/activity)
 
 #include <filesystem>      // Wave N: ecad export output dir + W14: flat-pattern DXF export
@@ -887,6 +888,9 @@ int run_gui(const char* screenshotPath) {
     st.wantPick = shot && shotMode && std::strcmp(shotMode, "pick") == 0;
     st.wantRibbon = shot && shotMode && std::strcmp(shotMode, "ribbon") == 0;
     st.wantTree = shot && shotMode && std::strcmp(shotMode, "tree") == 0;
+    // Equations editor shot — seed two globals + open the dialog once the worker is ready.
+    st.wantEquations = shot && shotMode && std::strcmp(shotMode, "equations") == 0;
+    if (st.wantEquations) { st.showFeatureTree = true; }  // keep the FeatureManager (Equations node) visible
     st.wantM1 = shot && shotMode && std::strcmp(shotMode, "m1") == 0;  // C17 integration scenario
     st.wantEcad = shot && shotMode && std::strcmp(shotMode, "ecad") == 0;  // Wave N: ECAD GUI shot
     if (st.wantEcad) { st.showRibbon = true; st.ribbonTab = AppState::RT_PCB; }  // PCB tab forward
@@ -1446,6 +1450,31 @@ int run_gui(const char* screenshotPath) {
             }
         }
 
+        // Equations shot: create a part, seed two globals via eq_set (width=20, height=width*1.5),
+        // then open the Equations editor so the dialog renders with rows (mirrors the wantTree flow).
+        // Runs once the worker is ready; the deferred screenshot (frame >= 10) gives the dialog
+        // a few frames to repaint with the seeded rows.
+        if (st.wantEquations && !st.equationsShotDone && st.workerStarted) {
+            st.equationsShotDone = true;
+            std::string err;
+            if (st.docMirror.newPart(st.worker, err)) {
+                auto r1 = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                    {{"op", "eq_set"}, {"name", "width"}, {"expr", "20"}}}));
+                std::printf("eq_set width: ok=%d rev=%d err=%s\n",
+                            (int)r1.ok, r1.revision, r1.error_message.c_str());
+                auto r2 = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                    {{"op", "eq_set"}, {"name", "height"}, {"expr", "width*1.5"}}}));
+                std::printf("eq_set height: ok=%d rev=%d err=%s\n",
+                            (int)r2.ok, r2.revision, r2.error_message.c_str());
+                std::fflush(stdout);
+                if (r2.ok && !r2.aicm_path.empty()) { std::string le; st.loadDocMesh(r2.aicm_path, le); }
+                st.showEquations = true;
+            } else {
+                std::printf("equations-shot: doc_new failed: %s\n", err.c_str());
+                std::fflush(stdout);
+            }
+        }
+
         // Wave N: ECAD GUI shot — build a verified design via the worker and load it into the
         // editor mirror so the screenshot shows a live schematic/board (mirrors the wantTree flow).
         // Default shows the schematic (always populated via the orchestrator's recipe fallback);
@@ -1840,6 +1869,11 @@ int run_gui(const char* screenshotPath) {
         // ---------- C20b: assembly panels (Insert / Mate / Explode / Interference / BOM) ----------
         asmPanels.draw(st);
 
+        // ---------- Equations / Global Variables editor (modeless; gated by st.showEquations) ----------
+        // Opened from the FeatureManager "Equations" node (double-click) or View > Equations. Lists
+        // doc.equations.globals; add/edit -> eq_set, delete -> eq_delete, then reloads the mesh.
+        ui::drawEquationsDialog(st);
+
         // Configurations now lives inside the left manager's ConfigurationManager tab, matching
         // the commercial CAD mental model instead of floating as a separate task-pane window.
 
@@ -1912,6 +1946,9 @@ int run_gui(const char* screenshotPath) {
         // wantTree but !treeShotDone: keep waiting (up to 30 frames) for the worker to start
         // wantTree and treeShotDone: take the screenshot at frame 10 (tree has repainted)
         int shotFrame = st.wantTree ? (st.treeShotDone ? 10 : 30) : 6;
+        // equations shot: wait (up to 30 frames) for the worker, then capture at frame 10 once the
+        // two globals are seeded and the dialog has repainted with its rows.
+        if (st.wantEquations) shotFrame = st.equationsShotDone ? 10 : 30;
         if (st.wantEcad) {
             if (!st.ecadShotDone)                                       shotFrame = 150;   // worker + design
             else if (st.wantFocusViewport > 0 || st.wantFocusEcad > 0)  shotFrame = 99999; // let focus settle

@@ -21,6 +21,28 @@ Overall backlog after this push: partial+missing went from 271 → **268** (26 r
 | **P3** | 45 | 5 | 40 |
 | **TOTAL** | **268** | **109** | **159** |
 
+## Update 2026-06-14 (host-exposure push) — commits 7f55296..916becd
+
+The "ENGINE DONE — host UI pending" rows above are now **host-done** (PM forms + ribbon wired,
+each visually verified via the `AI_CAD_SHOT=pmform`/`asm` headless harness). Closed this session:
+
+- **P0 closed (host done):** Extrude end conditions (up-to-surface/body/vertex + offset + thin; new
+  `refs.up_to` slot); all Surfacing host forms + a new **Surfaces ribbon tab** (15 `surf_*` commands);
+  **File > Export wired** (STEP/IGES/STL/3MF + flat DXF — `export_file` RPC); **plain STEP/IGES/STL/3MF
+  import** on open (doc_open routing fix); PropertyManager extrude end conditions.
+- **P1 closed (host done):** Revolve full set (end/dir2/thin); Sweep guides/twist/orientation; Loft
+  centerline/guides/tangency; Fillet **Face Fillet** + real tangent-propagation; Chamfer
+  angle×distance + vertex; Draft **parting-line/step** (new `refs.parting` slot); Mirror bodies+merge.
+- **Assemblies:** all **11 advanced/mechanical mates** registered in the schema (MATE_REF_COUNTS +
+  MATE_COUPLING_SPEC value-model: gear ratio / screw pitch / limit min-max) AND exposed in the
+  assembly mate form (Mechanical & Advanced section + 3rd ref well + type-aware params).
+- **UI quality:** angle fields now display `deg` (were `mm`); unit-less dims display bare numbers;
+  GUI sizing sweep cleared real chrome debt in 7 screen-space files (gui_lint scale 335 → 249, the
+  remainder being world-space draw-list false-positives).
+- **Still partial (deferred — real infra gaps):** Pattern instance-skip / vary-instance (needs a
+  list/grid PMFieldKind); Hole Wizard ANSI inch sizes (needs dynamic standard→size combos); Drawings
+  radial/diameter **host rendering** (engine done; `drawing_panel` rendering pending).
+
 **How to read priority.** P0 = blocks a core professional workflow or is a correctness
 defect (wrong geometry / silently-disabled UI). P1 = a daily-use capability a professional
 expects. P2 = important but with a workaround. P3 = niche or premium-tier.

@@ -53,8 +53,13 @@ from . import weldment as _weldment  # noqa: F401
 # split (divide a body by a planar tool into above/below pieces):
 from . import rib as _rib  # noqa: F401
 from . import split as _split  # noqa: F401
-# Surfacing foundation — planar surface canary (open-surface body, kind="surface"):
+# Surfacing — open-surface bodies (kind="surface"): planar canary + profile-driven surfaces
+# (extruded/revolved/swept/lofted side walls with no end caps).
 from . import surf_planar as _surf_planar  # noqa: F401
+from . import surf_extrude as _surf_extrude  # noqa: F401
+from . import surf_revolve as _surf_revolve  # noqa: F401
+from . import surf_sweep as _surf_sweep  # noqa: F401
+from . import surf_loft as _surf_loft  # noqa: F401
 
 __all__ = [
     "CompileContext",

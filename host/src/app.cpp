@@ -879,7 +879,7 @@ int run_gui(const char* screenshotPath) {
         st.chat.push_back(w);
     }
 
-    const char* shotMode = std::getenv("AI_CAD_SHOT");  // screenshot-only: settings|chat|assembly|plan|ribbon
+    const char* shotMode = std::getenv("AI_CAD_SHOT");  // screenshot-only: settings|chat|assembly|plan|ribbon|pmform
     st.wantSettings = shot && shotMode && std::strcmp(shotMode, "settings") == 0;
     st.wantChat = shot && shotMode && std::strcmp(shotMode, "chat") == 0;
     st.wantAssembly = shot && shotMode && std::strcmp(shotMode, "assembly") == 0;
@@ -913,6 +913,17 @@ int run_gui(const char* screenshotPath) {
             int t = std::atoi(tabEnv);
             if (t >= 0 && t <= 8) st.ribbonTab = t;
         }
+    }
+    // pmform shot: open a PropertyManager form headlessly for visual verification of its field
+    // layout/sizing. AI_CAD_PMCMD=<cmd_id> (e.g. "extrude", "surf_loft") selects which form; the
+    // left pane auto-switches to the PropertyManager tab when a form is active (see left_pane.cpp).
+    // openForCommand is safe pre-worker: with no doc the checkpoint is skipped and field init is pure.
+    if (shot && shotMode && std::strcmp(shotMode, "pmform") == 0) {
+        st.showRibbon = true;
+        st.showFeatureTree = true;  // ensure the left pane (which hosts the PM tab) is visible
+        if (const char* cmd = std::getenv("AI_CAD_PMCMD"))
+            if (*cmd && !propertyManager.openForCommand(st, cmd))
+                std::fprintf(stderr, "pmform: no form for command '%s'\n", cmd);
     }
     // wantTree doc smoke runs in the frame loop once the worker is ready (see below).
     if (st.wantPick) {

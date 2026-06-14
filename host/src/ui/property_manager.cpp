@@ -292,6 +292,18 @@ std::string pmFormatDim(double mm, bool ips, bool angle) {
 static inline bool pmFieldIsAngle(const PMFieldDef* d) {
     return d && d->unitLabel && std::strstr(d->unitLabel, "deg") != nullptr;
 }
+// A unit-less Dim (DimU: ratio/k-factor/twist turns) — empty unit label. Its value is a plain
+// number with NO length suffix and is never IPS-scaled.
+static inline bool pmFieldUnitless(const PMFieldDef* d) {
+    return d && d->unitLabel && d->unitLabel[0] == '\0';
+}
+// Format a Dim field's canonical value for its edit buffer / display, honouring the field's unit:
+// angle -> "<n>deg", unit-less -> bare "<n>", otherwise length via pmFormatDim (mm / inch).
+static std::string pmFieldValueText(const PMFieldDef* d, double v, bool ips) {
+    if (pmFieldIsAngle(d)) return pmFormatDim(v, ips, /*angle=*/true);
+    if (pmFieldUnitless(d)) { char b[48]; std::snprintf(b, sizeof(b), "%.4g", v); return b; }
+    return pmFormatDim(v, ips, /*angle=*/false);
+}
 
 // A dim value object {value, expr} for an op.
 static nlohmann::json dimJson(const PMField& f) {
@@ -315,7 +327,7 @@ static void initField(PMField& f, const PMFieldDef& d, bool ips) {
         case PMFieldKind::Dim: {
             f.dimValue = d.dimDefault;
             f.dimExpr.clear();
-            std::string disp = pmFormatDim(d.dimDefault, ips, pmFieldIsAngle(&d));
+            std::string disp = pmFieldValueText(&d, d.dimDefault, ips);
             std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
             break;
         }
@@ -572,7 +584,7 @@ void PropertyManager::presetFieldForShot(const std::string& key, const std::stri
             case PMFieldKind::Dim: {
                 try {
                     f.dimValue = std::stod(value); f.dimExpr.clear(); f.dimError.clear();
-                    std::string disp = pmFormatDim(f.dimValue, ips_, pmFieldIsAngle(f.def));
+                    std::string disp = pmFieldValueText(f.def, f.dimValue, ips_);
                     std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                 } catch (...) {}
                 break;
@@ -604,7 +616,7 @@ void PropertyManager::loadFromTree(AppState& st, const nlohmann::json& feature) 
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                     } else if (d.contains("value") && d["value"].is_number()) {
                         f.dimValue = d["value"].get<double>();
-                        std::string disp = pmFormatDim(f.dimValue, ips_, pmFieldIsAngle(f.def));
+                        std::string disp = pmFieldValueText(f.def, f.dimValue, ips_);
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                     }
                 }
@@ -753,7 +765,7 @@ std::vector<PMCalloutItem> PropertyManager::calloutItems(AppState& st) const {
         if (!fieldEnabled(*f.def, fields_)) continue;   // skip greyed / coming-soon dims
         PMCalloutItem it;
         it.label = f.def->label;
-        it.value = f.dimExpr.empty() ? pmFormatDim(f.dimValue, ips_, pmFieldIsAngle(f.def))
+        it.value = f.dimExpr.empty() ? pmFieldValueText(f.def, f.dimValue, ips_)
                                      : ("=" + f.dimExpr);
         it.hasAnchor = hasAnchor;
         if (hasAnchor) { it.anchor[0] = anchor[0]; it.anchor[1] = anchor[1]; it.anchor[2] = anchor[2]; }
@@ -1538,7 +1550,7 @@ void PropertyManager::drawBody(AppState& st) {
                 if (ImGui::SmallButton("-##step")) {
                     if (enabled && !f.def->comingSoon) {
                         f.dimValue = std::max(0.0, f.dimValue - 1.0);
-                        std::string disp = pmFormatDim(f.dimValue, useIps, pmFieldIsAngle(f.def));
+                        std::string disp = pmFieldValueText(f.def, f.dimValue, useIps);
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                         f.dimError.clear();
                         dirty_ = true;
@@ -1549,7 +1561,7 @@ void PropertyManager::drawBody(AppState& st) {
                 if (ImGui::SmallButton("+##step")) {
                     if (enabled && !f.def->comingSoon) {
                         f.dimValue += 1.0;
-                        std::string disp = pmFormatDim(f.dimValue, useIps, pmFieldIsAngle(f.def));
+                        std::string disp = pmFieldValueText(f.def, f.dimValue, useIps);
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                         f.dimError.clear();
                         dirty_ = true;
@@ -1563,7 +1575,7 @@ void PropertyManager::drawBody(AppState& st) {
                     float wheel = io.MouseWheel;
                     if (wheel != 0.0f && enabled && !f.def->comingSoon) {
                         f.dimValue = std::max(0.0, f.dimValue + (double)wheel);
-                        std::string disp = pmFormatDim(f.dimValue, useIps, pmFieldIsAngle(f.def));
+                        std::string disp = pmFieldValueText(f.def, f.dimValue, useIps);
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                         f.dimError.clear();
                         dirty_ = true;
@@ -1588,7 +1600,9 @@ void PropertyManager::drawBody(AppState& st) {
                         // degrees) and parse with angle=true so the "deg" suffix they now display
                         // round-trips and a stray length unit is rejected on them.
                         const bool isAngle = pmFieldIsAngle(f.def);
-                        const double bareScale = (useIps && !isAngle) ? 25.4 : 1.0;
+                        // angle + unit-less (ratio/k-factor/turns) values are never IPS-scaled.
+                        const bool unscaled = isAngle || pmFieldUnitless(f.def);
+                        const double bareScale = (useIps && !unscaled) ? 25.4 : 1.0;
                         if (pmParseDim(txt, mm, err, /*angle=*/isAngle, bareScale)) {
                             f.dimValue = mm; f.dimExpr.clear(); f.dimError.clear();
                             dirty_ = true; lastEditTime_ = ImGui::GetTime();
@@ -1601,7 +1615,7 @@ void PropertyManager::drawBody(AppState& st) {
                 if (enabled && !f.dimExpr.empty()) {
                     pushTextColor(pal.accent);
                     ImGui::Text(u8"= %s  (%s)", f.dimExpr.c_str(),
-                                pmFormatDim(f.dimValue, useIps, pmFieldIsAngle(f.def)).c_str());
+                                pmFieldValueText(f.def, f.dimValue, useIps).c_str());
                     ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Bound to equation '%s'", f.dimExpr.c_str());

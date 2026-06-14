@@ -188,13 +188,27 @@ static const std::vector<PMFormDef>& forms() {
         { "sweep", "Sweep", "sweep", {
             Well      ("profile", "Profile",      "Profile and Path", K_FACE, true),
             Well      ("path",    "Path",         "Profile and Path", K_EDGE, false),
+            Well      ("guides",  "Guide Curves", "Guide Curves",     K_EDGE, true),
+            ComboL    ("orientation", "Profile Orientation", "Options",
+                       "follow_path|frenet|keep_normal",
+                       "Follow Path|Frenet|Keep Normal"),
+            DimU      ("twist_turns",   "Twist (turns)",   "Options", 0.0),
+            Angle     ("twist_degrees", "Twist (degrees)", "Options", 0.0),
             ComboL    ("mode",    "Type",         "Options", "boss|cut", "Boss|Cut"),
             Check     ("merge",   "Merge result", "Options", true),
         }},
         // --- loft ---  mode/ruled/merge ; sections[] (>=2 ordered region selectors)
         //   Engine (loft.py): ThruSections through each section's outer wire, in list order.
         { "loft", "Loft", "loft", {
-            Well      ("sections","Profiles",     "Profiles", K_FACE, true),
+            Well      ("sections",  "Profiles",     "Profiles", K_FACE, true),
+            Well      ("centerline","Centerline",   "Centerline", K_EDGE, false),
+            Well      ("guides",    "Guide Curves", "Guide Curves", K_EDGE, true),
+            ComboL    ("tangency_start", "Start Constraint", "Tangency",
+                       "none|normal|tangent|curvature",
+                       "None|Normal To Profile|Tangent To Section|Curvature"),
+            ComboL    ("tangency_end",   "End Constraint",   "Tangency",
+                       "none|normal|tangent|curvature",
+                       "None|Normal To Profile|Tangent To Section|Curvature"),
             ComboL    ("mode",    "Type",         "Options", "boss|cut", "Boss|Cut"),
             Check     ("ruled",   "Ruled (straight transitions)", "Options", false),
             Check     ("merge",   "Merge result", "Options", true),
@@ -292,6 +306,8 @@ static const std::vector<PMFormDef>& forms() {
                       "plane.right|plane.front|plane.top",
                       "Right plane|Front plane|Top plane"),
             FeatWell ("features", "Features to Mirror", "Features to Mirror"),
+            Well     ("bodies",   "Bodies to Mirror",   "Bodies to Mirror", K_BODY, true),
+            Check    ("merge",    "Merge result",       "Options", true),
         }},
         // --- linear_pattern ---  dir1(+count/spacing), optional dir2, features[]
         //   Engine (pattern.py compile_linear_pattern): lays down a count1×count2 grid of the seed

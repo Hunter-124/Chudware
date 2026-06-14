@@ -46,7 +46,11 @@ enum class SketchTool {
     Arc3pt, Polygon, RectCenter, Point, Ellipse, Spline,
     // C54: tangent arc (starts tangent to a prior/selected entity's free endpoint) + Move/Copy
     // entities (engine op sketch_move; select then pick a from-point and a to-point):
-    ArcTangent, Move
+    ArcTangent, Move,
+    // Sketch Text (entity type "text"): one viewport click places the lower-left anchor, then a
+    // popup collects the string + cap height. Equation-Driven Curve (entity type "eq_curve"):
+    // no viewport pick — a popup collects x(t)/y(t) expressions + a t range (origin-relative).
+    Text, EqCurve
 };
 
 // C37-D: One constraint record from a sketch_enter/solve/drag response (worker_rpc.md §"constraints").
@@ -584,6 +588,33 @@ private:
     static bool tangentArcThrough(const ImVec2& start, const ImVec2& tdir, const ImVec2& end,
                                   float& cu, float& cv, float& rad,
                                   float& a0deg, float& a1deg, bool& ccw);
+
+    // ---- Sketch Text (entity type "text"; engine geometry already implemented) ----
+    // The SketchTool::Text arms a one-click placement: the next viewport left-click captures the
+    // lower-left anchor into textAnchorUV_ and opens this popup, which collects the string + cap
+    // height. OK emits {"type":"text","p":[u,v],"text":...,"height":...,"construction":false}
+    // (font omitted -> engine default). Esc/Cancel closes; empty text disables OK.
+    bool  textPopupOpen_ = false;
+    ImVec2 textPopupPos_{0, 0};
+    ImVec2 textAnchorUV_{0, 0};        // captured lower-left placement (sketch u,v)
+    char   textBuf_[256] = "OPEN";
+    float  textHeight_ = 10.0f;        // cap height mm (>0)
+    bool   textFocus_ = false;         // request keyboard focus on the string field next frame
+    void   drawTextPopup(AppState& st, bool& escHandled);
+
+    // ---- Equation-Driven Curve (entity type "eq_curve"; engine geometry already implemented) ----
+    // SketchTool::EqCurve opens this popup immediately (no viewport pick; the curve is origin-
+    // relative like SolidWorks). x(t)/y(t) are expression strings in t (radians); t1/t2 bound the
+    // parameter range. OK emits {"type":"eq_curve","xt":...,"yt":...,"t1":...,"t2":...,
+    // "construction":false}. A closed curve (e.g. cos/sin over 0..2pi) extrudes as a region.
+    bool  eqPopupOpen_ = false;
+    ImVec2 eqPopupPos_{0, 0};
+    char   eqXt_[128] = "5*cos(t)";
+    char   eqYt_[128] = "5*sin(t)";
+    float  eqT1_ = 0.0f;
+    float  eqT2_ = 6.2831853f;
+    bool   eqFocus_ = false;           // request keyboard focus on the x(t) field next frame
+    void   drawEqCurvePopup(AppState& st, bool& escHandled);
 
     // ---- C37-D Smart Dimension state machine ----
     // Pick buffer (separate from toolUV_): points/entities collected for the next dimension.

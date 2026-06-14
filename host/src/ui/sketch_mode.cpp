@@ -945,6 +945,13 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
         resetTool(); tool_ = SketchTool::Ellipse; return true;
     }
     if (cmdId == "sk_spline")          { resetTool(); tool_ = SketchTool::Spline;         return true; }
+    // Sketch Text — arm a one-click placement; the click opens the text popup (string + height).
+    if (cmdId == "sk_text")            { resetTool(); tool_ = SketchTool::Text;
+                                         textPopupOpen_ = false;                           return true; }
+    // Equation-Driven Curve — no viewport pick; open the x(t)/y(t)/range popup right away.
+    if (cmdId == "sk_spline_equation") { resetTool(); tool_ = SketchTool::EqCurve;
+                                         eqPopupOpen_ = true; eqPopupPos_ = ImGui::GetMousePos();
+                                         eqFocus_ = true;                                  return true; }
     // C42: Construction — immediate toggle on the current selection (engine op
     // sketch_toggle_construction). Not a tool: the selection survives (entity ids persist).
     if (cmdId == "sk_construction") {
@@ -1033,6 +1040,8 @@ const char* SketchMode::activeToolCmd() const {
         case SketchTool::Point:           return "sk_point";
         case SketchTool::Ellipse:         return "sk_ellipse_big";
         case SketchTool::Spline:          return "sk_spline";
+        case SketchTool::Text:            return "sk_text";
+        case SketchTool::EqCurve:         return "sk_spline_equation";
         default:                          return "";
     }
 }
@@ -1059,8 +1068,129 @@ void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSn
                                dimPopupOpen_ = false; dimError_.clear(); dimPopupDriven_ = false;
                                overDefOpen_ = false; overDefPendingCon_ = nullptr;   // C50f: add-path over-define dialog
                                editOverDefOpen_ = false; editOverDefOp_ = nullptr;   // C50f: edit-path over-define dialog
-                               relOverDefOpen_ = false; relOverDefOps_ = nullptr; relOverDefLabel_.clear(); }   // C50g
+                               relOverDefOpen_ = false; relOverDefOps_ = nullptr; relOverDefLabel_.clear();   // C50g
+                               textPopupOpen_ = false; textFocus_ = false;          // Sketch Text popup
+                               eqPopupOpen_ = false; eqFocus_ = false; }            // Eq-Driven Curve popup
 void SketchMode::cancelTool() { resetTool(); }
+
+// ---------------------------------------------------------------------------
+// Sketch Text + Equation-Driven Curve parameter popups (engine entities text / eq_curve)
+// ---------------------------------------------------------------------------
+
+// Sketch Text: a small borderless popup (mirrors the Add-Relation popup) collecting the string +
+// cap height for a "text" entity placed at the click-captured lower-left anchor (textAnchorUV_).
+// OK emits {"type":"text","construction":false,"p":[u,v],"text":...,"height":...} (font omitted ->
+// engine default, safer cross-machine). Empty text disables OK. Esc/Cancel closes; the tool stays
+// armed for another placement.
+void SketchMode::drawTextPopup(AppState& st, bool& escHandled) {
+    if (!textPopupOpen_) return;
+    const auto& pal = ui::palette;
+    ImGui::SetNextWindowPos(textPopupPos_, ImGuiCond_Appearing);
+    ImGui::SetNextWindowBgAlpha(0.98f);
+    if (ImGui::Begin("##SketchText", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
+        ImGui::TextUnformatted("Sketch Text");
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+        ImGui::TextUnformatted("Text");
+        ImGui::SetNextItemWidth(220);
+        if (textFocus_) { ImGui::SetKeyboardFocusHere(); textFocus_ = false; }
+        bool enter = ImGui::InputText("##textstr", textBuf_, sizeof(textBuf_),
+                                      ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SetNextItemWidth(120);
+        ImGui::InputFloat("Height (mm)", &textHeight_, 1.0f, 5.0f, "%.3f");
+        if (textHeight_ < 0.001f) textHeight_ = 0.001f;   // engine requires height > 0
+        ImGui::Separator();
+        const bool empty = (textBuf_[0] == '\0');
+        ImGui::BeginDisabled(empty);
+        bool ok = ImGui::Button("OK") || (enter && !empty);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        bool escPressed = ImGui::IsKeyPressed(ImGuiKey_Escape);
+        bool cancel = ImGui::Button("Cancel") || escPressed;
+        if (escPressed) escHandled = true;   // suppress the catch-all Esc (it would resetTool)
+        if (empty && enter)
+            st.toast(ui::ToastLevel::Info, "Text: enter a non-empty string");
+        if (ok && !empty) {
+            nlohmann::json ent = {{"type", "text"}, {"construction", false},
+                {"p", nlohmann::json::array({textAnchorUV_.x, textAnchorUV_.y})},
+                {"text", std::string(textBuf_)},
+                {"height", (double)textHeight_}};
+            addEntity(st, ent, nlohmann::json::array());
+            textPopupOpen_ = false;
+            resetTool(); tool_ = SketchTool::Text;   // stay armed for another placement (one-shot)
+        } else if (cancel) {
+            textPopupOpen_ = false;
+            // keep the tool armed so the next click can place again
+        }
+    }
+    ImGui::End();
+}
+
+// Equation-Driven Curve: a borderless popup collecting x(t)/y(t) expression strings + the t range
+// for an "eq_curve" entity (origin-relative; no viewport pick). OK emits
+// {"type":"eq_curve","construction":false,"xt":...,"yt":...,"t1":...,"t2":...}. Preset buttons fill
+// the fields with a circle / sine wave. A closed curve (cos/sin over 0..2pi) extrudes as a region.
+void SketchMode::drawEqCurvePopup(AppState& st, bool& escHandled) {
+    if (!eqPopupOpen_) return;
+    const auto& pal = ui::palette;
+    ImGui::SetNextWindowPos(eqPopupPos_, ImGuiCond_Appearing);
+    ImGui::SetNextWindowBgAlpha(0.98f);
+    if (ImGui::Begin("##SketchEqCurve", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
+        ImGui::TextUnformatted("Equation Driven Curve");
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+        // Presets fill the expression fields (parameter t in radians).
+        if (ImGui::SmallButton("Circle")) {
+            std::snprintf(eqXt_, sizeof(eqXt_), "5*cos(t)");
+            std::snprintf(eqYt_, sizeof(eqYt_), "5*sin(t)");
+            eqT1_ = 0.0f; eqT2_ = 6.2831853f;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Sine wave")) {
+            std::snprintf(eqXt_, sizeof(eqXt_), "t");
+            std::snprintf(eqYt_, sizeof(eqYt_), "5*sin(t)");
+            eqT1_ = 0.0f; eqT2_ = 6.2831853f;
+        }
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(220);
+        if (eqFocus_) { ImGui::SetKeyboardFocusHere(); eqFocus_ = false; }
+        ImGui::InputText("x(t)", eqXt_, sizeof(eqXt_));
+        ImGui::SetNextItemWidth(220);
+        ImGui::InputText("y(t)", eqYt_, sizeof(eqYt_));
+        ImGui::SetNextItemWidth(120);
+        ImGui::InputFloat("t start", &eqT1_, 0.0f, 0.0f, "%.6f");
+        ImGui::SetNextItemWidth(120);
+        ImGui::InputFloat("t end (rad)", &eqT2_, 0.0f, 0.0f, "%.6f");
+        ImGui::Separator();
+        const bool empty = (eqXt_[0] == '\0' || eqYt_[0] == '\0');
+        const bool badRange = (eqT2_ == eqT1_);
+        ImGui::BeginDisabled(empty || badRange);
+        bool ok = ImGui::Button("OK");
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        bool escPressed = ImGui::IsKeyPressed(ImGuiKey_Escape);
+        bool cancel = ImGui::Button("Cancel") || escPressed;
+        if (escPressed) escHandled = true;   // suppress the catch-all Esc (it would also resetTool)
+        if (ok && !empty && !badRange) {
+            nlohmann::json ent = {{"type", "eq_curve"}, {"construction", false},
+                {"xt", std::string(eqXt_)}, {"yt", std::string(eqYt_)},
+                {"t1", (double)eqT1_}, {"t2", (double)eqT2_}};
+            addEntity(st, ent, nlohmann::json::array());
+            eqPopupOpen_ = false;
+            resetTool();   // one entity per invocation, like Polygon/Ellipse
+        } else if (cancel) {
+            eqPopupOpen_ = false;
+            resetTool();
+        }
+    }
+    ImGui::End();
+}
 
 // C52: apply one sketch_fillet / sketch_chamfer op for the held corner (e1=corner1Id_, e2=line2).
 // The engine round-trips like every other sketch-editing op (applyOps -> loadDocMesh -> resolve).
@@ -5272,10 +5402,22 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             if (tanSnap) chip("T");
         }
 
-        // Click placement.
-        if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        // Click placement. EqCurve takes no viewport pick (origin-relative; its popup opens on the
+        // ribbon command). Text takes exactly one placement click and then defers to its popup, so
+        // suppress further captures while that popup is open.
+        if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            tool_ != SketchTool::EqCurve && !(tool_ == SketchTool::Text && textPopupOpen_)) {
             toolUV_.push_back(ImVec2(su, sv));
             toolSnaps_.push_back(snapH);
+            // Sketch Text — the single click captures the lower-left anchor; open the popup that
+            // collects the string + cap height. The entity is emitted from the popup's OK.
+            if (tool_ == SketchTool::Text && toolUV_.size() == 1) {
+                textAnchorUV_ = toolUV_[0];
+                textPopupPos_ = io.MousePos;
+                textPopupOpen_ = true;
+                textFocus_ = true;
+                toolUV_.clear(); toolSnaps_.clear();   // anchor stashed; stop click capture
+            } else
             // Tools that complete on a fixed number of clicks:
             // C54: Tangent Arc — ONE click places the end. The start + tangent come from the source
             // entity (resolved at click time). We commit an arc tangent to the source there, joined
@@ -5965,7 +6107,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          tool_ == SketchTool::RectCenter ? "Center Rectangle" :
                          tool_ == SketchTool::Point ? "Point" :
                          tool_ == SketchTool::Ellipse ? "Ellipse" :
-                         tool_ == SketchTool::Spline ? "Spline" : "";
+                         tool_ == SketchTool::Spline ? "Spline" :
+                         tool_ == SketchTool::Text ? "Text" :
+                         tool_ == SketchTool::EqCurve ? "Equation Driven Curve" : "";
         // Per-stage step prompt (status-bar style) for the multi-click variants.
         const size_t n = toolUV_.size();
         const char* step = nullptr;
@@ -6064,6 +6208,11 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             case SketchTool::Spline:
                 step = n < 2 ? "click points; Enter / right-click / double-click to finish"
                              : "click more points \xC2\xB7 Enter / right-click / double-click finishes"; break;
+            case SketchTool::Text:
+                step = textPopupOpen_ ? "type the text + height, then OK"
+                                      : "click to place the text"; break;
+            case SketchTool::EqCurve:
+                step = "enter x(t) / y(t) and the t range, then OK"; break;
             default: break;
         }
         std::string hint = std::string(tn) + (step ? std::string(" \xE2\x80\x94 ") + step : std::string());
@@ -6335,6 +6484,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         }
         ImGui::End();
     }
+
+    // ---- Sketch Text + Equation-Driven Curve parameter popups (engine entities text / eq_curve) ----
+    drawTextPopup(st, escHandled);
+    drawEqCurvePopup(st, escHandled);
 
     // ---- C50: Add Relation popup over an N-element selection (entities and/or point handles) ----
     // Classifies the snapshotted selection and offers the SolidWorks relations valid for it:

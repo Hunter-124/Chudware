@@ -11,10 +11,76 @@ with a JSON-path-ish locator so failures are actionable.
 
 from __future__ import annotations
 
+import ast
 import re
 from typing import Any
 
 from .equations import EquationError, expr_names, validate_expr
+
+# Equation-driven-curve expression grammar (used by the "eq_curve" sketch entity). This is a
+# RADIANS-convention parametric grammar distinct from the document-equation evaluator (which works
+# in degrees): the free variable is t (or x for the explicit form), and the whitelisted functions /
+# constants below are the SolidWorks "Equation Driven Curve" set. The single source of truth for
+# both validation (here) and sampling (features/sketch.py) is EQ_CURVE_FUNCS / EQ_CURVE_CONSTS.
+EQ_CURVE_FUNCS = {
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "sqrt", "exp", "log", "abs", "sinh", "cosh", "tanh", "pow",
+}
+EQ_CURVE_CONSTS = {"pi", "e"}
+
+
+_EQ_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod)
+
+
+def _eq_curve_check(node: ast.AST, var: str) -> str | None:
+    """Recursive AST whitelist for eq-curve expressions. Returns an error string or None."""
+    if isinstance(node, ast.Expression):
+        return _eq_curve_check(node.body, var)
+    if isinstance(node, ast.BinOp):
+        if not isinstance(node.op, _EQ_BINOPS):
+            return "operator not allowed"
+        return _eq_curve_check(node.left, var) or _eq_curve_check(node.right, var)
+    if isinstance(node, ast.UnaryOp):
+        if not isinstance(node.op, (ast.USub, ast.UAdd)):
+            return "operator not allowed"
+        return _eq_curve_check(node.operand, var)
+    if isinstance(node, ast.Constant):
+        if not isinstance(node.value, (int, float)) or isinstance(node.value, bool):
+            return "only numbers allowed"
+        return None
+    if isinstance(node, ast.Name):
+        if node.id == var or node.id in EQ_CURVE_CONSTS or node.id in EQ_CURVE_FUNCS:
+            return None
+        return (f"unknown name '{node.id}' (only '{var}', {sorted(EQ_CURVE_CONSTS)} and "
+                f"math functions allowed)")
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id not in EQ_CURVE_FUNCS:
+            return "unknown function"
+        if node.keywords:
+            return "keyword arguments not allowed"
+        for a in node.args:
+            err = _eq_curve_check(a, var)
+            if err:
+                return err
+        return None
+    return "construct not allowed"
+
+
+def validate_eq_curve_expr(expr: str, var: str = "t") -> str | None:
+    """Return an error string if *expr* is not a valid eq-curve expression, else None.
+
+    Allowed: numbers, the free variable *var*, the constants in EQ_CURVE_CONSTS, the functions in
+    EQ_CURVE_FUNCS, + - * / ** % (and ^), unary +/-, and parentheses. Nothing else parses — an
+    arbitrary identifier, attribute access, comprehension, or call to an unlisted name is rejected.
+    """
+    if not isinstance(expr, str) or not expr.strip():
+        return "empty expression"
+    try:
+        tree = ast.parse(expr.replace("^", "**"), mode="eval")
+    except SyntaxError as exc:
+        return f"syntax error: {exc.msg}"
+    return _eq_curve_check(tree, var)
+
 
 SCHEMA_PART = "aicad.part/1"
 SCHEMA_ASM = "aicad.asm/1"
@@ -68,6 +134,10 @@ ENTITY_FIELDS: dict[str, list[str]] = {
     "slot": ["p1", "p2", "width"],
     "arc_slot": ["center", "radius", "a0", "a1", "width"],  # C30-B: arc-spine slot
     "text": ["p", "text", "height"],
+    # Equation-driven curve (SolidWorks "Equation Driven Curve"). Parametric form is required:
+    # xt/yt are expression strings in variable t over [t1, t2]. An optional explicit form (yx in
+    # variable x over [x1, x2]) is mapped to the parametric form at compile time (xt=x, yt=yx).
+    "eq_curve": ["xt", "yt", "t1", "t2"],
 }
 
 # Entity type -> point sub-handles it exposes
@@ -83,6 +153,7 @@ _ENTITY_SUBS: dict[str, set[str]] = {
     "slot": {"p1", "p2"},
     "arc_slot": {"center", "start", "end"},  # C30-B: derived spine endpoints
     "text": {"p"},
+    "eq_curve": {"start", "end"},  # derived curve endpoints at t1 / t2
     # spline handled specially (p0..pN)
 }
 
@@ -343,9 +414,22 @@ def validate_entity(e: Any, where: str) -> list[str]:
         elif field == "text":
             if not isinstance(v, str):
                 errs.append(f"{where}.text: must be string")
-        else:  # radius, start, end, rx, ry, rot, width, height
+        elif field in ("xt", "yt"):
+            # Equation-driven-curve parametric expression in variable t. Grammar-checked here
+            # (numbers / t / + - * / ** / parens / whitelisted math funcs); free variable t is
+            # allowed and not flagged as an unknown global (it is bound at curve sampling time).
+            if not isinstance(v, str):
+                errs.append(f"{where}.{field}: must be an expression string")
+            else:
+                err = validate_eq_curve_expr(v)
+                if err:
+                    errs.append(f"{where}.{field}: {err}")
+        else:  # radius, start, end, rx, ry, rot, width, height, t1, t2
             if not _is_num(v):
                 errs.append(f"{where}.{field}: must be a number")
+    # Optional sketch-text font name (additive; absent => engine default font).
+    if etype == "text" and "font" in e and not isinstance(e["font"], (str, type(None))):
+        errs.append(f"{where}.font: must be a string or null")
     return errs
 
 

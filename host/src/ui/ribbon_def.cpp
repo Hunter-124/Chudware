@@ -85,7 +85,7 @@ static const RibbonCmd kCmds[] = {
     { "sk_spline",         "Spline",         "spline",          "Sketch",   "Draw",            true,  nullptr,          false },
     { "sk_ellipse",        "Ellipse",        "ellipse",         "Sketch",   "Draw",            false, nullptr,          false },
     { "sk_point",          "Point",          "point_ent",       "Sketch",   "Draw",            false, nullptr,          false },
-    { "sk_text",           "Text",           "text_ent",        "Sketch",   "Draw",            false, nullptr,          true  },
+    { "sk_text",           "Text",           "text_ent",        "Sketch",   "Draw",            false, nullptr,          false },
 
     // --- Group: Smart Dimension ---
     { "smart_dim",         "Smart Dim.",     "smart_dim",       "Sketch",   "Dimension",       true,  nullptr,          false },
@@ -205,7 +205,7 @@ static const RibbonCmd kCmds[] = {
     // --- Spline flyout (parent: sk_spline) ---
     { "sk_spline_style",     "Style Spline",    "spline_style",     "Sketch", "Draw", false, "sk_spline",      true  },
     { "sk_spline_surface",   "Spline on Surf.", "spline_surface",   "Sketch", "Draw", false, "sk_spline",      true  },
-    { "sk_spline_equation",  "Eq. Driven Crv.", "spline_equation",  "Sketch", "Draw", false, "sk_spline",      true  },
+    { "sk_spline_equation",  "Eq. Driven Crv.", "spline_equation",  "Sketch", "Draw", false, "sk_spline",      false },
 
     // --- Ellipse flyout (new big-button parent; original sk_ellipse small-btn kept for compat) ---
     // sk_ellipse_big is the split-button parent with sub-variants. W4-K: enabled (stretch=false) so

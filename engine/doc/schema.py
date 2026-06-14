@@ -212,8 +212,11 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
     "revolve": {"params": ["mode", "angle"], "refs": {"profile": (_SEL_LIST, True),
                                                       "axis": (_SEL_OR_DATUM, True)}},
     "sweep": {"params": ["mode"], "refs": {"profile": (_SEL_LIST, True),
-                                           "path": (_SEL_OR_DATUM, True)}},
-    "loft": {"params": ["mode"], "refs": {"sections": (_SEL_LIST, True)}},
+                                           "path": (_SEL_OR_DATUM, True),
+                                           "guides": (_SEL_LIST, False)}},
+    "loft": {"params": ["mode"], "refs": {"sections": (_SEL_LIST, True),
+                                          "centerline": (_SEL_OR_DATUM, False),
+                                          "guides": (_SEL_LIST, False)}},
     "helix": {"params": ["pitch", "height"], "refs": {"base": (_SEL_OR_DATUM, True)}},
     # fillet: edges/radius required only on the normal path; the full_round path
     # uses params.full_round + refs.middle_face (enforced in _validate_feature).

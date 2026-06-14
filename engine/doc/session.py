@@ -948,22 +948,40 @@ def asm_world_bodies(session: DocSession, explode: bool = False) -> list[tuple[s
 
 
 def asm_component_bodies(session: DocSession) -> list[dict]:
-    """Per-component local-shape list for BOM (name, source path, shape) — mass measured locally
-    (mass is transform-invariant, so no need to world-place)."""
+    """Per-REAL-component local-shape list for BOM (name, source path, shape, quantity) — mass
+    measured locally (mass is transform-invariant, so no need to world-place).
+
+    Synthetic component-pattern instances (assembly.py appends them to ``ares.bodies`` with a
+    ``"<seedcid>#<k>"`` component_id and ``body_id >= 1_000_000``) are NOT distinct line items:
+    SolidWorks rolls a patterned instance into its SEED part's quantity. So we SKIP the instances
+    here and instead carry, per real component, ``quantity = 1 + (number of pattern instances seeded
+    from it)`` — the BOM rolls that up by source. Skipping them also keeps the returned list indexed
+    1:1 with ``doc["components"]`` order, which the mass evaluator (worker._eval_active_shape) relies
+    on for its ``[body_id - 1]`` lookup."""
     if session.asm_result is None:
         _rebuild(session)
     ares = session.asm_result
     if ares is None:
         return []
+    # Count pattern instances seeded from each real component (component_id "<seedcid>#<k>").
+    instance_counts: dict[str, int] = {}
+    for body in ares.bodies:
+        cid = body.component_id
+        if "#" in cid:
+            seed = cid.split("#", 1)[0]
+            instance_counts[seed] = instance_counts.get(seed, 0) + 1
     out: list[dict] = []
     by_id = {c["id"]: c for c in session.doc.get("components", [])}
     for body in ares.bodies:
+        if "#" in body.component_id:
+            continue  # synthetic pattern instance — folded into its seed's quantity
         comp = by_id.get(body.component_id, {})
         out.append({
             "component": body.component_id,
             "name": body.name,
             "source": (comp.get("source") or {}).get("path", ""),
             "shape": body.shape_local,
+            "quantity": 1 + instance_counts.get(body.component_id, 0),
         })
     return out
 

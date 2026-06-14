@@ -112,6 +112,28 @@ struct DimDrag {
 };
 static DimDrag s_dim;
 
+// ---- Move-Component drag (drag a COMPONENT in an ASSEMBLY) ----------------------------------
+// When the open doc is an assembly and exactly one component body is selected, pressing on that
+// body's geometry starts a constrained move-component drag instead of an orbit. The cursor's
+// screen motion is projected onto the camera screen-plane at the component's world depth to form a
+// world-space TARGET point, which is fed to doc_solve_mates {drag:{component, target}}. The engine
+// soft-pulls that one component toward the target along its free DOF (mates re-seat the rest) and
+// bumps the revision once on the committed solve = one undo. Mirrors the push-pull live-drag
+// envelope: doc_checkpoint on press, transient solves during drag, revert + one final solve on
+// release (so the drag is a SINGLE undo step), revert on Esc/cancel. Owns the mouse while active.
+struct AsmDrag {
+    bool        active   = false;     // a move-component drag is in flight (owns the mouse)
+    std::string component;            // the component k-id being dragged
+    std::string checkpoint;           // doc_checkpoint id taken on press (for the single-undo commit)
+    ImVec2      pressPos = {0, 0};    // screen pos at press (drag origin)
+    Vec3        startPos;             // component world origin at press (transform translation)
+    Vec3        camR, camU;           // camera screen-right / screen-up (world) captured at press
+    float       worldPerPx = 1.0f;    // world(mm) per screen pixel at the component depth (at press)
+    ImVec2      lastSent = {1e30f, 1e30f};  // last cursor delta actually solved (throttle)
+    void reset() { *this = AsmDrag{}; }
+};
+static AsmDrag s_asmDrag;
+
 // One draggable dimension of the selected feature: the param key, its PM label, whether it is an
 // angle, the world anchor point (where the handle sits), and the unit world DIRECTION the value is
 // measured along (a length grows by +1 value per +1mm along dirW; an angle ignores dirW).
@@ -702,6 +724,97 @@ static void ppCancel(AppState& st) {
     s_pp.reset();
 }
 
+// ---- Move-Component drag helpers ------------------------------------------------------------
+
+// True when the mirror's open document is an assembly (aicad.asm/1). Mirrors feature_tree.cpp.
+static bool docIsAssembly(AppState& st) {
+    const auto& tree = st.docMirror.tree();
+    return tree.is_object() && tree.value("schema", std::string()) == "aicad.asm/1";
+}
+
+// The component object at a 1-based body ordinal in an assembly tree (body_id == component
+// ordinal; see engine assembly.py AsmBodyOut.body_id). Returns nullptr if out of range.
+static const nlohmann::json* asmComponentByOrdinal(AppState& st, uint32_t bodyId) {
+    const auto& tree = st.docMirror.tree();
+    if (!tree.is_object() || !tree.contains("components") || !tree["components"].is_array())
+        return nullptr;
+    const auto& comps = tree["components"];
+    if (bodyId < 1 || bodyId > comps.size()) return nullptr;
+    const auto& c = comps[bodyId - 1];
+    return c.is_object() ? &c : nullptr;
+}
+
+// Component world origin (the translation of its row-major 16-float transform). Falls back to the
+// cached body bbox centre, then origin. transform[3],[7],[11] are tx,ty,tz (row-major).
+static Vec3 asmComponentOrigin(AppState& st, const nlohmann::json* comp, uint32_t bodyId) {
+    if (comp && comp->contains("transform") && (*comp)["transform"].is_array() &&
+        (*comp)["transform"].size() == 16) {
+        const auto& t = (*comp)["transform"];
+        return Vec3(t[3].get<float>(), t[7].get<float>(), t[11].get<float>());
+    }
+    auto bit = st.bodyBBoxCache.find(bodyId);
+    if (bit != st.bodyBBoxCache.end()) {
+        const auto& b = bit->second;
+        return Vec3((b[0] + b[3]) * 0.5f, (b[1] + b[4]) * 0.5f, (b[2] + b[5]) * 0.5f);
+    }
+    return Vec3(0, 0, 0);
+}
+
+// Run ONE move-component solve at the given cursor delta from press (revert to checkpoint so
+// transient solves never compound, then solve with the drag target). On the committed sample the
+// engine's revision bump makes this drag a single undo step. `commit` is informational here (the
+// envelope is identical) — we always revert-then-solve so exactly one solve survives at the end.
+static void asmDragSample(AppState& st, const ImVec2& cur, bool /*commit*/) {
+    if (!st.docMirror.hasDoc() || s_asmDrag.component.empty()) return;
+    // Revert to the pre-drag checkpoint so each transient solve starts from the original pose.
+    if (!s_asmDrag.checkpoint.empty()) {
+        auto rv = st.docMirror.revert(st.worker, s_asmDrag.checkpoint);
+        if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
+    }
+    // Cursor delta -> world target: project onto the camera screen-plane at the component depth.
+    // dx along screen-right (+camR), dy DOWN the screen maps to -camU (screen y is down).
+    float dx = cur.x - s_asmDrag.pressPos.x;
+    float dy = cur.y - s_asmDrag.pressPos.y;
+    float k = s_asmDrag.worldPerPx;
+    Vec3 target(
+        s_asmDrag.startPos.x + (s_asmDrag.camR.x * dx - s_asmDrag.camU.x * dy) * k,
+        s_asmDrag.startPos.y + (s_asmDrag.camR.y * dx - s_asmDrag.camU.y * dy) * k,
+        s_asmDrag.startPos.z + (s_asmDrag.camR.z * dx - s_asmDrag.camU.z * dy) * k);
+    nlohmann::json params = {
+        {"doc_id", st.docMirror.docId()},
+        {"drag", {{"component", s_asmDrag.component},
+                  {"target", {target.x, target.y, target.z}}}}};
+    nlohmann::json res; std::string err;
+    if (!st.worker.call("doc_solve_mates", params, res, err)) {
+        st.toast(ui::ToastLevel::Error, "Move component failed: " + err);
+        return;
+    }
+    if (res.is_object() && res.contains("code")) {
+        st.toast(ui::ToastLevel::Error,
+                 "Move component: " + res.value("message", std::string()));
+        return;
+    }
+    // doc_solve_mates bumped the worker revision; resync the mirror so the tree (and the next
+    // checkpoint/undo bookkeeping) stays in step, then reload the re-tessellated mesh.
+    st.docMirror.resync(st.worker);
+    std::string aicm;
+    if (res.contains("tess") && res["tess"].is_object())
+        aicm = res["tess"].value("aicm_path", std::string());
+    if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
+    s_asmDrag.lastSent = cur;
+}
+
+// Cancel an in-flight move-component drag: revert to the checkpoint and clear state. No-op when no
+// drag is active.
+static void asmDragCancel(AppState& st) {
+    if (!s_asmDrag.active && s_asmDrag.checkpoint.empty()) { s_asmDrag.reset(); return; }
+    if (!s_asmDrag.checkpoint.empty() && st.docMirror.hasDoc()) {
+        auto rv = st.docMirror.revert(st.worker, s_asmDrag.checkpoint);
+        if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
+    }
+    s_asmDrag.reset();
+}
+
 // ---- Instant3D dimension-handle drag helpers ------------------------------------------------
 
 // Screen geometry for one dimension handle: project the world anchor to screen, derive the unit
@@ -921,6 +1034,20 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
         }
 
+        // Move-component drag safety net (mirrors the push-pull one): if a sketch / plane-pick / PM
+        // took over the mouse, or the doc is no longer an assembly, cancel (revert). If the LMB was
+        // released outside the viewport image, do one final solve (commit). No zombie state.
+        if (s_asmDrag.active) {
+            bool asmPmNow = st.propertyManager && st.propertyManager->active();
+            if (inSketch || st.sketchPlanePickActive || asmPmNow || !docIsAssembly(st)) {
+                asmDragCancel(st);
+            } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                asmDragSample(st, io.MousePos, /*commit=*/true);
+                s_asmDrag.active = false;
+                s_asmDrag.checkpoint.clear();
+            }
+        }
+
         // C37-C: consume st.zoomToBBoxRequested (one-shot from feature tree "Zoom to Feature").
         if (st.zoomToBBoxRequested) {
             st.zoomToBBoxRequested = false;
@@ -1080,12 +1207,88 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             if (s_zoomAreaArmed)
                 st.requestCursor(ui::CursorKind::Crosshair);
 
+            bool ppPmOpen = st.propertyManager && st.propertyManager->active();
+
+            // ---- Move-Component drag (assembly): press / drag / release -------------------------
+            // Active only when the open doc is an ASSEMBLY, a mesh is loaded, nothing else owns the
+            // mouse, and EXACTLY ONE component body is selected. Pressing on that component's
+            // geometry begins a constrained drag (doc_solve_mates {drag:{component, target}}); the
+            // engine soft-pulls it toward the cursor along its free DOF and re-seats the rest.
+            // Owns the mouse while active (orbit/pan/pick all skip while s_asmDrag.active). Runs
+            // BEFORE push-pull so it wins in assemblies; the push-pull/dim blocks below also gate on
+            // !s_asmDrag.active so the two gestures never fight.
+            if (st.hasDocMesh && docIsAssembly(st) && !st.sketchPlanePickActive && !ppPmOpen &&
+                !s_zoomAreaArmed) {
+                // Press: require a single-component selection and a press on its geometry.
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s_asmDrag.active &&
+                    st.selection.size() == 1) {
+                    const render::PickHit& h = st.selection.items().front().hit;
+                    if (h.valid()) {
+                        const nlohmann::json* comp = asmComponentByOrdinal(st, h.body_id);
+                        if (comp) {
+                            // Only the picked component starts a drag — and only if the user pressed
+                            // ON that component (the cursor's pick body matches the selection). This
+                            // keeps a press in empty space / on another body from hijacking an orbit.
+                            bool pressOnSel = st.hover.valid() && st.hover.body_id == h.body_id;
+                            std::string cid = comp->value("id", std::string());
+                            bool fixed = comp->value("fixed", false);
+                            if (pressOnSel && !cid.empty()) {
+                                if (fixed) {
+                                    st.toast(ui::ToastLevel::Warn,
+                                             "This component is fixed — float it to move (right-click "
+                                             "> Float).");
+                                } else {
+                                    // Camera basis + px->mm scale at the component depth, captured for
+                                    // the whole drag (R/U/worldPerPx already computed for this frame).
+                                    std::string cp = st.docMirror.hasDoc()
+                                                         ? st.docMirror.checkpoint(st.worker)
+                                                         : std::string();
+                                    s_asmDrag.reset();
+                                    s_asmDrag.active     = true;
+                                    s_asmDrag.component  = cid;
+                                    s_asmDrag.checkpoint = cp;
+                                    s_asmDrag.pressPos   = io.MousePos;
+                                    s_asmDrag.startPos    = asmComponentOrigin(st, comp, h.body_id);
+                                    s_asmDrag.camR        = R;
+                                    s_asmDrag.camU        = U;
+                                    s_asmDrag.worldPerPx  = worldPerPx;
+                                    s_asmDrag.lastSent    = ImVec2(1e30f, 1e30f);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Drag: project cursor motion to a world target and solve (throttled ~3px).
+                if (s_asmDrag.active && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    st.requestCursor(ui::CursorKind::Hand);
+                    cancelCameraAnimation();
+                    ImVec2 mp = io.MousePos;
+                    float ddx = mp.x - s_asmDrag.lastSent.x;
+                    float ddy = mp.y - s_asmDrag.lastSent.y;
+                    if (s_asmDrag.lastSent.x > 1e29f ||
+                        std::sqrt(ddx * ddx + ddy * ddy) >= 3.0f * ui::uiScale)
+                        asmDragSample(st, mp, /*commit=*/false);
+                }
+
+                // Release: one final solve (engine bumps revision = single undo) and clear state.
+                if (s_asmDrag.active && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                    asmDragSample(st, io.MousePos, /*commit=*/true);
+                    s_asmDrag.active = false;
+                    s_asmDrag.checkpoint.clear();
+                }
+
+                // Esc cancels the drag (revert to the pre-drag pose).
+                if (s_asmDrag.active && ImGui::IsKeyPressed(ImGuiKey_Escape))
+                    asmDragCancel(st);
+            }
+
             // ---- Instant3D push-pull: handle press / drag / release ----------------------------
             // Only when a doc mesh is loaded, no PM/sketch/zoom-area is owning the mouse, and the
             // press lands on the normal-axis handle of the single selected face. Owns the mouse for
             // its whole lifetime (orbit/pan/pick all skip while s_pp.active).
-            bool ppPmOpen = st.propertyManager && st.propertyManager->active();
-            if (st.hasDocMesh && !st.sketchPlanePickActive && !ppPmOpen && !s_zoomAreaArmed) {
+            if (st.hasDocMesh && !st.sketchPlanePickActive && !ppPmOpen && !s_zoomAreaArmed &&
+                !s_asmDrag.active) {
                 // Press: hit-test the handle arrow. We use the handle geometry computed for THIS
                 // frame's camera; the centroid screen pos + the two tips define a thick segment.
                 if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s_pp.active) {
@@ -1175,7 +1378,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // selection, body/edge pick, or multi-face), so the two gestures never fight. Owns the
             // mouse for its whole lifetime (orbit/pan/pick skip while s_dim.active).
             if (st.hasDocMesh && !st.sketchPlanePickActive && !ppPmOpen && !s_zoomAreaArmed &&
-                !s_pp.active) {
+                !s_pp.active && !s_asmDrag.active) {
                 // Press: hit-test every dimension handle of the selected feature.
                 if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s_dim.active) {
                     // Only offer dimension handles when NO single face is selected (that case is the
@@ -1277,8 +1480,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // Zoom-area mode intercepts left-drag above; skip orbit/pan if armed.
             // C37-C: only starts dragging once the 4px threshold is crossed (s_lmbDragActive).
             // Instant3D: a push-pull OR dimension drag owns the mouse — never orbit/pan while active.
-            if (!s_pp.active && !s_dim.active && !s_zoomAreaArmed && s_lmbDragActive &&
-                (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
+            if (!s_pp.active && !s_dim.active && !s_asmDrag.active && !s_zoomAreaArmed &&
+                s_lmbDragActive && (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
                 cancelCameraAnimation();
                 if (st.vpDragMode == 1) {
                     applyPan(io.MouseDelta.x, io.MouseDelta.y);

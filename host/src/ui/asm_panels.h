@@ -51,8 +51,15 @@ public:
     // when the Mate form is open. Returns true if a well consumed the pick.
     bool routeAsmPick(const nlohmann::json& selector, const std::string& component, int pickKind);
 
+    // Feed a picked COMPONENT id into the active Component Pattern form's component list (toggles
+    // membership). Called from the selection observer when the Pattern form is open. Returns true
+    // if the form consumed the pick.
+    bool routeAsmPatternPick(const std::string& component);
+
     // True while the Mate form is open (the selection observer routes picks to it then).
     bool mateFormActive() const { return mateOpen_; }
+    // True while the Component Pattern form is open (the selection observer routes component picks).
+    bool patternFormActive() const { return patternOpen_; }
 
     // --- scripted scenario helpers (AI_CAD_SHOT=asm) ---
     void openInsert()       { insertOpen_ = true; insertFocus_ = true; }
@@ -77,11 +84,16 @@ public:
 
 private:
     void beginMateForm();
+    void beginPatternForm();
     void drawInsert(AppState& st);
     void drawMateForm(AppState& st);
+    void drawPatternForm(AppState& st);
     void drawExplode(AppState& st);
     void drawInterference(AppState& st);
     void drawBom(AppState& st);
+    // Emit the component-pattern add_feature op + reload. Returns the solved aicm path (empty on
+    // error, errorOut filled).
+    bool addPattern(AppState& st, std::string& aicmOut, std::string& errorOut);
 
     void refreshInterference(AppState& st);
     void refreshBom(AppState& st);
@@ -108,6 +120,17 @@ private:
     bool aligned_ = true;                 // Align: true = Aligned, false = Anti-Aligned
     std::vector<char> dimBuf_{std::vector<char>(64, 0)};  // distance/angle value
     std::string mateError_;
+
+    // ---- Component Pattern form (linear / circular) ----
+    bool patternOpen_ = false, patternFocus_ = false;
+    int  patternKind_ = 0;                 // 0 = linear, 1 = circular
+    int  patternDir_  = 0;                 // index into the world direction/axis option table
+    std::vector<char> patternCountBuf_{std::vector<char>(32, 0)};    // count1 (linear) / count (circular)
+    std::vector<char> patternSpacingBuf_{std::vector<char>(32, 0)};  // spacing1 (mm) (linear)
+    std::vector<char> patternAngleBuf_{std::vector<char>(32, 0)};    // angle (deg) (circular)
+    bool patternEqual_ = true;             // equal_spacing (circular)
+    std::vector<std::string> patternComps_;  // picked seed component ids (membership toggled by pick)
+    std::string patternError_;
 
     // ---- Explode ----
     bool explodeOpen_ = false, explodeFocus_ = false;

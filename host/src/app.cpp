@@ -751,6 +751,14 @@ int run_gui(const char* screenshotPath) {
                     }
                     continue;  // handled (or failed) — skip the part-doc resolve path
                 }
+                // Component pattern form: a pick selects the seed COMPONENT (not a face/edge).
+                if (ap->patternFormActive()) {
+                    std::string comp;
+                    st.docMirror.resolvePickAsm(
+                        st.worker, item.hit.body_id, kindStr, item.hit.topo_id, comp, err);
+                    if (!comp.empty()) ap->routeAsmPatternPick(comp);
+                    continue;  // handled — skip the part-doc resolve path
+                }
             }
             // Body wells (boolean targets/tools): resolve the clicked element's OWNING body
             // (doc_resolve_pick kind="body" -> {kind:"body", owner_feature:...}) instead of the

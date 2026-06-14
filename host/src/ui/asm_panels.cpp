@@ -78,9 +78,12 @@ bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
     }
     if (cmdId == "asm_bom") { bomOpen_ = true; bomFocus_ = true; refreshBom(st); return true; }
     if (cmdId == "asm_move") {
-        // Move Component: viewport drag of a selected component = transform preview, then
-        // doc_solve_mates on release. The drag itself lives in viewport_panel (not owned here);
-        // this command just re-solves the current mates so a moved component re-seats.
+        // Move Component: the actual gesture is a constrained viewport drag — select a (floating)
+        // component, then drag it in the graphics area. The viewport owns that gesture
+        // (viewport_panel.cpp s_asmDrag): doc_checkpoint on press, transient doc_solve_mates
+        // {drag:{component, target}} during the drag, one final solve on release (single undo).
+        // The ribbon command itself just re-solves the current mates (so a manually-edited or
+        // newly-mated component re-seats) and points the user at the drag.
         if (st.docMirror.hasDoc()) {
             nlohmann::json res; std::string err;
             if (st.worker.call("doc_solve_mates", {{"doc_id", st.docMirror.docId()}}, res, err)) {
@@ -88,14 +91,14 @@ bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
                 if (res.contains("tess") && res["tess"].is_object())
                     aicm = res["tess"].value("aicm_path", std::string());
                 if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
-                st.addLog("[asm] move: re-solved mates");
+                st.addLog("[asm] move: re-solved mates — select a component and drag it in the "
+                          "viewport to reposition.");
             } else st.addLog("[err] asm_move: " + err);
         }
         return true;
     }
     if (cmdId == "asm_pattern") {
-        // Component patterns are a later-card (C24) item — note it so the command stays observable.
-        st.addLog("[asm] component pattern: deferred to C24");
+        beginPatternForm();
         return true;
     }
     return false;
@@ -104,6 +107,7 @@ bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
 void AsmPanels::draw(AppState& st) {
     drawInsert(st);
     drawMateForm(st);
+    drawPatternForm(st);
     drawExplode(st);
     drawInterference(st);
     drawBom(st);
@@ -355,6 +359,207 @@ void AsmPanels::drawMateForm(AppState& st) {
     }
     ImGui::End();
     if (!open) closeMateForm();
+}
+
+// ===========================================================================
+// Component Pattern (linear / circular)
+// ===========================================================================
+//
+// SolidWorks "Linear/Circular Component Pattern": pick one or more seed components, a direction (or
+// axis), and a count/spacing (or count/angle). Emits an add_feature op carrying an
+// asm_linear_pattern / asm_circular_pattern feature (schema FEATURE_SPECS) which the engine's
+// assembly compiler expands into synthetic instance bodies. The direction/axis for v1 are the
+// assembly WORLD/datum axes (engine assembly._world_axis_from_ref); model-edge picks are a
+// follow-up.
+
+// World direction/axis options the engine resolver (_world_axis_from_ref) accepts as plain strings.
+struct AsmDirOpt { const char* label; const char* ref; };
+static const AsmDirOpt kAsmDirOpts[] = {
+    {"X axis",          "axis.x"},
+    {"Y axis",          "axis.y"},
+    {"Z axis",          "axis.z"},
+    {"Front plane (Y)", "plane.front"},
+    {"Top plane (Z)",   "plane.top"},
+    {"Right plane (X)", "plane.right"},
+};
+
+void AsmPanels::beginPatternForm() {
+    patternOpen_ = true;
+    patternFocus_ = true;
+    patternKind_ = 0;
+    patternDir_ = 0;
+    patternEqual_ = true;
+    patternComps_.clear();
+    patternError_.clear();
+    std::memset(patternCountBuf_.data(), 0, patternCountBuf_.size());
+    std::strncpy(patternCountBuf_.data(), "3", patternCountBuf_.size() - 1);
+    std::memset(patternSpacingBuf_.data(), 0, patternSpacingBuf_.size());
+    std::strncpy(patternSpacingBuf_.data(), "20", patternSpacingBuf_.size() - 1);
+    std::memset(patternAngleBuf_.data(), 0, patternAngleBuf_.size());
+    std::strncpy(patternAngleBuf_.data(), "360", patternAngleBuf_.size() - 1);
+}
+
+bool AsmPanels::routeAsmPatternPick(const std::string& component) {
+    if (!patternOpen_ || component.empty()) return false;
+    // Toggle membership so a second pick on the same component removes it.
+    auto it = std::find(patternComps_.begin(), patternComps_.end(), component);
+    if (it == patternComps_.end()) patternComps_.push_back(component);
+    else                           patternComps_.erase(it);
+    return true;
+}
+
+bool AsmPanels::addPattern(AppState& st, std::string& aicmOut, std::string& errorOut) {
+    aicmOut.clear();
+    errorOut.clear();
+    if (!st.docMirror.hasDoc()) { errorOut = "No assembly open."; return false; }
+    if (patternComps_.empty()) { errorOut = "Pick at least one seed component."; return false; }
+
+    const char* dirRef = kAsmDirOpts[patternDir_].ref;
+    nlohmann::json comps = nlohmann::json::array();
+    for (const auto& c : patternComps_) comps.push_back(c);
+
+    nlohmann::json feature;
+    if (patternKind_ == 0) {  // linear
+        double count = 0, spacing = 0; std::string perr;
+        std::string ctxt(patternCountBuf_.data()), stxt(patternSpacingBuf_.data());
+        if (!pmParseDim(ctxt, count, perr, /*isAngle=*/false)) { errorOut = "count: " + perr; return false; }
+        if (!pmParseDim(stxt, spacing, perr, /*isAngle=*/false)) { errorOut = "spacing: " + perr; return false; }
+        feature = {
+            {"type", "asm_linear_pattern"}, {"name", "Component Pattern"}, {"suppressed", false},
+            {"params", {{"count1", {{"value", count}, {"expr", nullptr}}},
+                        {"spacing1", {{"value", spacing}, {"expr", nullptr}}}}},
+            {"refs", {{"dir1", dirRef}, {"components", comps}}}};
+    } else {                  // circular
+        double count = 0, angle = 0; std::string perr;
+        std::string ctxt(patternCountBuf_.data()), atxt(patternAngleBuf_.data());
+        if (!pmParseDim(ctxt, count, perr, /*isAngle=*/false)) { errorOut = "count: " + perr; return false; }
+        if (!pmParseDim(atxt, angle, perr, /*isAngle=*/true)) { errorOut = "angle: " + perr; return false; }
+        feature = {
+            {"type", "asm_circular_pattern"}, {"name", "Component Pattern"}, {"suppressed", false},
+            {"params", {{"count", {{"value", count}, {"expr", nullptr}}},
+                        {"angle", {{"value", angle}, {"expr", nullptr}}},
+                        {"equal_spacing", patternEqual_}}},
+            {"refs", {{"axis", dirRef}, {"components", comps}}}};
+    }
+
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+        {{"op", "add_feature"}, {"feature", feature}}}));
+    if (!r.ok) { errorOut = r.error_message; return false; }
+    aicmOut = r.aicm_path;
+    if (!aicmOut.empty()) { std::string le; st.loadDocMesh(aicmOut, le); }
+    return true;
+}
+
+void AsmPanels::drawPatternForm(AppState& st) {
+    if (!patternOpen_) return;
+    const auto& pal = ui::palette;
+    bool open = true;
+    ImGui::SetNextWindowSize(ImVec2(340 * ui::uiScale, 0), ImGuiCond_Appearing);
+    if (patternFocus_) { ImGui::SetNextWindowFocus(); patternFocus_ = false; }
+    if (ImGui::Begin("Component Pattern##asm", &open)) {
+        asmIcon("pattern", "[#]"); ImGui::SameLine(0, 6);
+        pushText(pal.text);
+        ImGui::TextUnformatted("Component Pattern");
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+
+        if (!st.docMirror.hasDoc()) {
+            pushText(pal.statusWarn);
+            ImGui::TextWrapped("No assembly open.");
+            ImGui::PopStyleColor();
+            ImGui::End();
+            if (!open) patternOpen_ = false;
+            return;
+        }
+
+        // ---- Pattern type ----
+        ImGui::TextUnformatted("Type:");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Linear", patternKind_ == 0)) patternKind_ = 0;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Circular", patternKind_ == 1)) patternKind_ = 1;
+
+        // ---- Direction / Axis (world/datum) ----
+        ImGui::Spacing();
+        ImGui::TextUnformatted(patternKind_ == 0 ? "Direction:" : "Axis:");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::BeginCombo("##asm_pat_dir", kAsmDirOpts[patternDir_].label)) {
+            for (int i = 0; i < (int)(sizeof(kAsmDirOpts) / sizeof(kAsmDirOpts[0])); ++i) {
+                bool sel = (patternDir_ == i);
+                if (ImGui::Selectable(kAsmDirOpts[i].label, sel)) patternDir_ = i;
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+
+        // ---- Count + spacing/angle ----
+        ImGui::Spacing();
+        if (patternKind_ == 0) {
+            ImGui::TextUnformatted("Instances (count):");
+            ImGui::SetNextItemWidth(120);
+            ImGui::InputText("##asm_pat_count", patternCountBuf_.data(), patternCountBuf_.size());
+            ImGui::TextUnformatted("Spacing (mm):");
+            ImGui::SetNextItemWidth(120);
+            ImGui::InputText("##asm_pat_spacing", patternSpacingBuf_.data(), patternSpacingBuf_.size());
+        } else {
+            ImGui::TextUnformatted("Instances (count):");
+            ImGui::SetNextItemWidth(120);
+            ImGui::InputText("##asm_pat_count", patternCountBuf_.data(), patternCountBuf_.size());
+            ImGui::TextUnformatted("Angle (deg):");
+            ImGui::SetNextItemWidth(120);
+            ImGui::InputText("##asm_pat_angle", patternAngleBuf_.data(), patternAngleBuf_.size());
+            ImGui::Checkbox("Equal spacing (fill angle)", &patternEqual_);
+        }
+
+        // ---- Seed components (filled by viewport / tree picks while this form is open) ----
+        ImGui::Spacing();
+        ImGui::SeparatorText("Components to Pattern");
+        if (patternComps_.empty()) {
+            pushText(pal.textDim);
+            ImGui::TextWrapped("Click components in the graphics area or the tree to add them.");
+            ImGui::PopStyleColor();
+        } else {
+            for (size_t i = 0; i < patternComps_.size(); ++i) {
+                ImGui::Bullet();
+                ImGui::TextUnformatted(componentName(st, patternComps_[i]).c_str());
+                ImGui::SameLine(ImGui::GetWindowWidth() - 40);
+                if (ImGui::SmallButton(("x##pc" + std::to_string(i)).c_str())) {
+                    patternComps_.erase(patternComps_.begin() + i);
+                    break;
+                }
+            }
+        }
+
+        if (!patternError_.empty()) {
+            ImGui::Spacing();
+            pushText(pal.statusErr);
+            ImGui::TextWrapped("%s", patternError_.c_str());
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::Separator();
+        bool ready = !patternComps_.empty();
+        if (!ready) ImGui::BeginDisabled();
+        if (ImGui::Button("Add##asm_pat", ImVec2(90, 0))) {
+            std::string aicm, err;
+            if (addPattern(st, aicm, err)) {
+                st.addLog("[asm] component pattern added (" +
+                          std::string(patternKind_ == 0 ? "linear" : "circular") + ", " +
+                          std::to_string(patternComps_.size()) + " seed(s))");
+                patternError_.clear();
+                // keep the form open for chaining; clear the seed picks
+                patternComps_.clear();
+            } else {
+                patternError_ = err;
+                st.addLog("[err] asm_pattern: " + err);
+            }
+        }
+        if (!ready) ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Close##asm_pat", ImVec2(90, 0))) patternOpen_ = false;
+    }
+    ImGui::End();
+    if (!open) patternOpen_ = false;
 }
 
 // ===========================================================================

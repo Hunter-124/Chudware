@@ -1285,7 +1285,9 @@ def drawing_bom(doc_id: str) -> dict:
         return {"rows": [], "is_assembly": True, "source_doc_id": s.source_doc_id,
                 "note": f"assembly introspection failed: {type(exc).__name__}: {exc}"}
 
-    # Group identical parts: same source path (or name when there is no path) is the same part.
+    # Group identical parts: same source path (or name when there is no path) is the same part. Each
+    # component contributes its own ``quantity`` (1 + its component-pattern instances) so a patterned
+    # part rolls its instances into ONE BOM row's quantity rather than spawning "peg#1", "peg#2" rows.
     groups: dict[str, dict] = {}
     order: list[str] = []
     for c in comps:
@@ -1297,7 +1299,7 @@ def drawing_bom(doc_id: str) -> dict:
             g = {"name": name, "source": source, "quantity": 0}
             groups[key] = g
             order.append(key)
-        g["quantity"] += 1
+        g["quantity"] += int(c.get("quantity", 1) or 1)
 
     rows = []
     for i, key in enumerate(order, start=1):

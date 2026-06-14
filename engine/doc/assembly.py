@@ -321,6 +321,167 @@ def _compound(bodies: list):
     return Compound(children=list(bodies))
 
 
+# --------------------------------------------------------------------------- component patterns
+#
+# Assembly component patterns (asm_linear_pattern / asm_circular_pattern) replicate one or more
+# SEED components (already placed by the mate solve) along a direction (linear) or about an axis
+# (circular), in the assembly WORLD frame. Each instance is a clone of the seed's local shape with
+# an extra world-frame placement PRE-multiplied onto the seed's solved transform.
+#
+# Instances are NOT components: they have no entry in doc["components"], take no part in the mate
+# solve, and are excluded from interference / BOM (which iterate doc["components"]). They carry
+# synthetic body_id / component_id values that cannot collide with real component ordinals
+# (body_id >= _PATTERN_BODY_BASE; component_id = "<seed>#<k>").
+
+
+_PATTERN_BODY_BASE = 1_000_000  # synthetic instance body_ids start here (never a component ordinal)
+
+
+def _feat_dim(params: dict, key: str, default: float) -> float:
+    """Read a feature param that is a {value, expr} dim or a bare number; fall back to default."""
+    v = params.get(key)
+    if isinstance(v, dict):
+        v = v.get("value")
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    return float(default)
+
+
+def _world_axis_from_ref(ref: Any) -> Optional[np.ndarray]:
+    """Resolve a direction/axis ref to a unit WORLD vector (datum/world-axis strings, v1).
+
+    Supported v1 forms (assembly world frame == datum frame):
+      "axis.x" / "axis.y" / "axis.z"            -> the world axis
+      "plane.front"/"plane.top"/"plane.right"   -> the plane NORMAL (front=XZ→Y, top=XY→Z, right=YZ→X)
+      a 3-vector list/tuple                      -> taken as a raw direction (normalised)
+    Model-edge / model-face picks are a follow-up (return None → caller reports it as dangling).
+    """
+    if ref is None:
+        return None
+    if isinstance(ref, (list, tuple)) and len(ref) == 3 \
+            and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in ref):
+        v = np.asarray(ref, dtype=float)
+    elif isinstance(ref, str):
+        s = ref.strip().lower()
+        axis_map = {"axis.x": [1, 0, 0], "axis.y": [0, 1, 0], "axis.z": [0, 0, 1],
+                    "x": [1, 0, 0], "y": [0, 1, 0], "z": [0, 0, 1]}
+        # Datum-plane normals: Z-up convention (front=XZ plane → +Y, top=XY → +Z, right=YZ → +X).
+        plane_normal = {"plane.front": [0, 1, 0], "plane.top": [0, 0, 1], "plane.right": [1, 0, 0],
+                        "front": [0, 1, 0], "top": [0, 0, 1], "right": [1, 0, 0]}
+        if s in axis_map:
+            v = np.asarray(axis_map[s], dtype=float)
+        elif s in plane_normal:
+            v = np.asarray(plane_normal[s], dtype=float)
+        else:
+            return None
+    else:
+        return None
+    n = np.linalg.norm(v)
+    if n < 1e-9:
+        return None
+    return v / n
+
+
+def _translate16(vec: np.ndarray) -> np.ndarray:
+    """A 4x4 pure-translation matrix for a world vector."""
+    M = np.eye(4)
+    M[0, 3], M[1, 3], M[2, 3] = float(vec[0]), float(vec[1]), float(vec[2])
+    return M
+
+
+def _rotation16_about_axis(axis_pt: np.ndarray, axis_dir: np.ndarray, angle_deg: float) -> np.ndarray:
+    """A 4x4 matrix rotating by angle_deg about the WORLD line (axis_pt, axis_dir)."""
+    a = axis_dir / (np.linalg.norm(axis_dir) or 1.0)
+    th = math.radians(angle_deg)
+    c, s = math.cos(th), math.sin(th)
+    x, y, z = float(a[0]), float(a[1]), float(a[2])
+    # Rodrigues rotation matrix.
+    Rm = np.array([
+        [c + x * x * (1 - c),     x * y * (1 - c) - z * s, x * z * (1 - c) + y * s],
+        [y * x * (1 - c) + z * s, c + y * y * (1 - c),     y * z * (1 - c) - x * s],
+        [z * x * (1 - c) - y * s, z * y * (1 - c) + x * s, c + z * z * (1 - c)],
+    ], dtype=float)
+    M = np.eye(4)
+    M[:3, :3] = Rm
+    # Rotate about a point not the origin: T(p) · R · T(-p).
+    p = np.asarray(axis_pt, dtype=float).reshape(3)
+    M[:3, 3] = p - Rm @ p
+    return M
+
+
+def _xform16_to_mat(xform16: list) -> np.ndarray:
+    return np.asarray(xform16, dtype=float).reshape(4, 4)
+
+
+def _mat_to_xform16(M: np.ndarray) -> list:
+    return [float(x) for x in M.reshape(16)]
+
+
+def _compile_component_patterns(doc: dict, placed: list, color_base: int) -> list:
+    """Expand asm_linear_pattern / asm_circular_pattern features into synthetic instance bodies.
+
+    `placed` is the list of solved component :class:`AsmBodyOut` (indexed by component_id via a map
+    we build here). Returns ONLY the new instance bodies (the caller appends them). Patterns with a
+    dangling direction/axis or unknown seed components are silently skipped (no instances) — they
+    surface via the feature_status the session layer reports, not here.
+    """
+    by_cid = {b.component_id: b for b in placed}
+    instances: list[AsmBodyOut] = []
+    body_id = _PATTERN_BODY_BASE
+    color_ord = color_base
+
+    for feat in doc.get("features", []) or []:
+        if not isinstance(feat, dict) or feat.get("suppressed"):
+            continue
+        ftype = feat.get("type")
+        if ftype not in ("asm_linear_pattern", "asm_circular_pattern"):
+            continue
+        refs = feat.get("refs", {}) or {}
+        params = feat.get("params", {}) or {}
+        seed_cids = [c for c in (refs.get("components") or []) if c in by_cid]
+        if not seed_cids:
+            continue
+
+        # Build the list of additional instance transforms (k = 1..count-1; instance 0 = the seed,
+        # already present). Each entry is a 4x4 world PRE-multiplier applied to the seed transform.
+        offsets: list[np.ndarray] = []
+        if ftype == "asm_linear_pattern":
+            count1 = max(1, int(round(_feat_dim(params, "count1", 2))))
+            spacing1 = _feat_dim(params, "spacing1", 10.0)
+            d1 = _world_axis_from_ref(refs.get("dir1"))
+            if d1 is None or count1 < 2:
+                continue
+            for k in range(1, count1):
+                offsets.append(_translate16(d1 * (spacing1 * k)))
+        else:  # asm_circular_pattern
+            count = max(1, int(round(_feat_dim(params, "count", 4))))
+            angle_total = _feat_dim(params, "angle", 360.0)
+            equal = bool(params.get("equal_spacing", True))
+            ax = _world_axis_from_ref(refs.get("axis"))
+            if ax is None or count < 2:
+                continue
+            step = (angle_total / count) if equal else angle_total
+            for k in range(1, count):
+                offsets.append(_rotation16_about_axis(np.zeros(3), ax, step * k))
+
+        for seed_cid in seed_cids:
+            seed = by_cid[seed_cid]
+            seed_mat = _xform16_to_mat(seed.transform)
+            for k, off in enumerate(offsets, start=1):
+                inst_mat = off @ seed_mat
+                color_ord += 1
+                instances.append(AsmBodyOut(
+                    body_id=body_id,
+                    component_id=f"{seed_cid}#{k}",
+                    name=f"{seed.name}#{k}",
+                    shape_local=seed.shape_local,
+                    transform=_mat_to_xform16(inst_mat),
+                    color=seed.color,
+                ))
+                body_id += 1
+    return instances
+
+
 def compile_assembly(doc: dict, base_dir: Optional[str] = None,
                      warm: Optional[dict] = None) -> AssemblyResult:
     """Compile an assembly: load components, resolve mate refs, solve mates, place bodies.
@@ -397,6 +558,15 @@ def compile_assembly(doc: dict, base_dir: Optional[str] = None,
             transform=list(xform),
             color=_component_color(ordinal - 1),
         ))
+
+    # --- component patterns ---------------------------------------------
+    # Expand asm_linear_pattern / asm_circular_pattern into synthetic instance bodies (NOT
+    # components: excluded from the mate solve + interference/BOM, which iterate doc["components"]).
+    try:
+        instances = _compile_component_patterns(doc, bodies, color_base=len(components))
+        bodies.extend(instances)
+    except Exception:  # noqa: BLE001 — a bad pattern must never sink the whole assembly rebuild
+        pass
 
     # merge dangling info into component_status
     for st in component_status:

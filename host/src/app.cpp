@@ -206,6 +206,32 @@ void ecadAiDesign(AppState& st, const std::string& request) {
              recipe.empty() ? "AI design ready" : ("AI design ready (recipe: " + recipe + ")"));
 }
 
+// Native circuit simulation (ecad_simulate): build an analysis study from st.ecadSimAnalysis
+// (0=Transient, 1=AC), run it on the worker, and stash the results payload so the ECAD plot panel
+// renders the waveforms. Only schematic docs simulate.
+void ecadSimulate(AppState& st) {
+    if (st.ecadDocId.empty()) { st.toast(ui::ToastLevel::Warn, "Open a schematic to simulate"); return; }
+    nlohmann::json study;
+    if (st.ecadSimAnalysis == 1) {
+        study = {{"analyses", {{ {"type", "ac"}, {"sweep", "dec"}, {"points", 20},
+                                 {"fstart", 10.0}, {"fstop", 1e6} }} }};
+    } else {
+        study = {{"analyses", {{ {"type", "tran"}, {"tstep", 5e-5}, {"tstop", 5e-3} }} }};
+    }
+    nlohmann::json res; std::string err;
+    if (!st.worker.call("ecad_simulate", {{"doc_id", st.ecadDocId}, {"study", study}}, res, err)) {
+        st.toast(ui::ToastLevel::Error, std::string("Simulate failed: ") + err);
+        return;
+    }
+    if (!jbool(res, "ok")) {
+        st.toast(ui::ToastLevel::Error, "Simulate: " + jstr(res, "error"));
+        return;
+    }
+    st.ecadSimResults = res.contains("results") ? res["results"] : nlohmann::json::object();
+    st.toast(ui::ToastLevel::Info, st.ecadSimAnalysis == 1 ? "Simulated (AC)" : "Simulated (transient)");
+    st.addLog("[ecad] simulate " + std::string(st.ecadSimAnalysis == 1 ? "ac" : "tran"));
+}
+
 // Route a PCB-tab ribbon command. New docs + doc-scoped analysis/exports run now; geometry-placing
 // ops need canvas-click placement / a PM form (logged so they stay observable).
 void ecadDispatch(AppState& st, const std::string& cmd) {
@@ -214,6 +240,7 @@ void ecadDispatch(AppState& st, const std::string& cmd) {
     if (cmd == "ecad_new_pcb")       { ecadNewDoc(st, "pcb"); return; }
     if (cmd == "ecad_run_erc")       { ecadDocRpc(st, "ecad_rebuild", "ERC updated"); return; }
     if (cmd == "ecad_run_drc")       { ecadDocRpc(st, "ecad_rebuild", "DRC updated"); return; }
+    if (cmd == "ecad_simulate")      { st.ecadSimGo = true; st.wantFocusEcad = 4; return; }
     if (cmd == "ecad_autoroute")     { ecadDocRpc(st, "ecad_autoroute", "Autoroute complete"); return; }
     if (cmd == "ecad_fill_zones")    { ecadDocRpc(st, "ecad_fill_zones", "Copper zones filled"); return; }
     if (cmd == "ecad_to_3d")         { ecadTo3d(st); return; }
@@ -1124,6 +1151,7 @@ int run_gui(const char* screenshotPath) {
             const bool wantEdit = kindEnv && std::strcmp(kindEnv, "editsch") == 0;
             const bool wantSelect = kindEnv && std::strcmp(kindEnv, "select") == 0;  // selection highlight
             const bool wantDel    = kindEnv && std::strcmp(kindEnv, "del") == 0;     // delete a symbol
+            const bool wantSim    = kindEnv && std::strcmp(kindEnv, "sim") == 0;     // simulate + plot
             nlohmann::json r;
             std::string showId;
             if (wantAi) {
@@ -1184,6 +1212,14 @@ int run_gui(const char* screenshotPath) {
                         showId = pcbId;         // show the board in the ECAD canvas
                     }
                 }
+            } else if (wantSim) {
+                // Native simulator demo: design a verified divider, then run a transient analysis so
+                // the shot plots its node voltages (V(IN)=5, V(VMID)=2.5) as distinct waveforms in the
+                // Simulation tab. (The built-in recipe sources are DC, so transient is the analysis
+                // that yields non-degenerate traces; AC stimulus is not configured in the recipes.)
+                if (ecall("ecad_design", {{"request", "5V resistive divider with 2.5V output"}}, r))
+                    showId = jstr(r, "doc_id");
+                st.ecadSimAnalysis = 0;  // Transient
             } else {
                 // AI design -> a verified divider schematic (recipe fallback; no model needed).
                 if (ecall("ecad_design", {{"request", "5V resistive divider with 2.5V output"}}, r))
@@ -1207,6 +1243,13 @@ int run_gui(const char* screenshotPath) {
                 if (wantDel)
                     std::printf("[ecad-shot] after delete: %d symbols\n",
                                 (int)ui::ecadEditorMirror().symbols().size());
+                if (wantSim) {
+                    // Run the sim now (blocking) so the screenshot captures the plotted curve. The
+                    // panel pops the Simulation tab forward the frame ecadSimResults first appears.
+                    ecadSimulate(st);
+                    std::printf("[ecad-shot] sim results present=%d\n",
+                                (int)(st.ecadSimResults.is_object() && !st.ecadSimResults.empty()));
+                }
                 std::fflush(stdout);
             }
         }
@@ -1361,6 +1404,7 @@ int run_gui(const char* screenshotPath) {
         ui::drawEcadEditor(st);   // Wave N: AI-ECAD 2D editor (launchpad until an ECAD doc loads)
         if (st.ecadAiGo) { st.ecadAiGo = false; ecadAiDesign(st, st.ecadAiRequest); }  // Wave P
         if (st.ecadOpsGo) { st.ecadOpsGo = false; ecadApplyOps(st, st.ecadPendingOps); }  // Wave Q
+        if (st.ecadSimGo) { st.ecadSimGo = false; ecadSimulate(st); }  // native simulator
 
         // ---------- C19: simulation panel + evaluate dialogs ----------
         simPanel.tick(st);          // drain SimClient progress + completion (loads overlays)

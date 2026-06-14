@@ -242,6 +242,9 @@ static const RibbonCmd kCmds[] = {
     { "ecad_fill_zones",    "Fill Zones",     "shell",           "PCB", "Board",      false, nullptr, false },
     { "ecad_run_drc",       "Run DRC",        "interference",    "PCB", "Board",      false, nullptr, false },
 
+    // --- Group: Analyze (native simulator) ---
+    { "ecad_simulate",      "Simulate",       "study_flow",      "PCB", "Analyze",    true,  nullptr, false },
+
     // --- Group: Outputs ---
     { "ecad_to_3d",         "Board to 3D",    "extrude_boss",    "PCB", "Outputs",    true,  nullptr, false },
     { "ecad_export_gerber", "Gerbers",        "ref_plane",       "PCB", "Outputs",    false, nullptr, false },

@@ -824,6 +824,37 @@ def _ecad_design(params: dict, _emit: EmitFn) -> dict:
 # Method + structured-error registration
 # ---------------------------------------------------------------------------
 
+def _ecad_simulate(params: dict, _emit: EmitFn) -> dict:
+    """Build the netlist -> SPICE circuit -> run a simulation; return traces for GUI plotting.
+
+    params: {doc_id, study?, sim_params?}. Default study is a 5 ms transient; probes default to all
+    node voltages (engine.sim.circuit). Returns {ok, results, warnings} or {ok:false, error}.
+    """
+    from engine.ecad import session as esess, schema
+
+    doc_id = str(_require(params, "doc_id"))
+    s = esess.get_session(doc_id)
+    if not schema.is_schematic(s.doc):
+        raise OpError("invalid_op", "ecad_simulate requires a sch document",
+                      {"reason": "wrong doc kind", "doc_id": doc_id})
+    try:
+        from engine.ecad import netlist as netlist_mod
+        from engine.sim import spice as spice_mod, circuit as circuit_mod
+    except ImportError as exc:
+        _not_available(f"simulation (missing module: {exc})")
+
+    nl = netlist_mod.build_netlist(s.doc)
+    circuit, warns = spice_mod.netlist_to_spice_circuit(nl, sim_params=params.get("sim_params"))
+    if not circuit.get("devices"):
+        return {"ok": False, "error": "no simulatable devices in the schematic", "warnings": warns}
+    study = params.get("study") or {"analyses": [{"type": "tran", "tstep": 5e-5, "tstop": 5e-3}]}
+    try:
+        results = circuit_mod.simulate(circuit, study)
+    except Exception as exc:  # noqa: BLE001 - report sim failure; never crash the worker
+        return {"ok": False, "error": f"sim failed: {exc}", "warnings": warns}
+    return {"ok": True, "results": results, "warnings": warns}
+
+
 METHODS: dict[str, object] = {
     "ecad_new": _ecad_new,
     "ecad_open": _ecad_open,
@@ -843,6 +874,7 @@ METHODS: dict[str, object] = {
     "ecad_fill_zones": _ecad_fill_zones,
     "ecad_design": _ecad_design,
     "ecad_dfm": _ecad_dfm,
+    "ecad_simulate": _ecad_simulate,
 }
 
 STRUCTURED_ERROR_METHODS: set[str] = set(METHODS.keys())

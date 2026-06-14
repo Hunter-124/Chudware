@@ -281,6 +281,11 @@ struct AppState {
     int         ecadTool = 0;               // ECAD canvas tool: 0=Select 1=Place 2=Route
     nlohmann::json ecadPendingOps;          // ops the ECAD canvas wants applied (place/route clicks)
     bool        ecadOpsGo = false;          // one-shot: apply ecadPendingOps via ecad_apply_ops
+    // Native simulator (ecad_simulate): the last result payload + a one-shot run trigger. The plot
+    // panel in ecad_panel.cpp renders ecadSimResults when non-empty (transient waveforms / AC bode).
+    nlohmann::json ecadSimResults;          // results object from the last ecad_simulate ({op,tran,ac,log})
+    bool        ecadSimGo = false;          // one-shot: run ecadSimulate(st) this frame
+    int         ecadSimAnalysis = 0;        // 0 = Transient, 1 = AC
 
     // ---- topology picking (C15) — id pass + overlays owned by run_gui; AppState borrows ----
     render::IdPass* idPass = nullptr;

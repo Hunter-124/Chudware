@@ -3,8 +3,11 @@
 
 #include "ecad_panel.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <string>
+#include <vector>
 
 #include "../../core/app_state.h"
 #include "../../ui_theme.h"
@@ -33,6 +36,10 @@ struct EcadEditorState {
     std::string selected;        // "<kind>:<id>" ("" = nothing), kind in {s,fp,w,t}
     bool  dragging = false;      // a left-drag-move of the selected sym/fp is in progress
     float dragDx = 0, dragDy = 0;  // live drag offset (world mm) for visual feedback
+    // Simulation plot: snapshot of the last results we plotted + the analysis that produced them,
+    // so the plot axes match the run (not the live combo) and we can pop the Sim tab on new results.
+    nlohmann::json lastSimResults;
+    int lastAnalysis = 0;
 };
 
 EcadEditorState& state() {
@@ -271,6 +278,208 @@ void drawLeftPanel(EcadEditorState& es) {
     }
 }
 
+// A distinct, theme-aware trace color per index (palette roles, like ecad_canvas::copperColor).
+ImU32 traceColor(int i) {
+    const ui::Palette& p = ui::palette;
+    switch (((i % 6) + 6) % 6) {
+        case 0:  return ui::Palette::toU32(p.accent);    // teal
+        case 1:  return ui::Palette::toU32(p.axisX);     // red
+        case 2:  return ui::Palette::toU32(p.axisY);     // green
+        case 3:  return ui::Palette::toU32(p.axisZ);     // blue
+        case 4:  return ui::Palette::toU32(p.statusWarn);// amber
+        default: return ui::Palette::toU32(p.statusErr); // orange
+    }
+}
+
+// One plotted trace: a label + the points (in DATA space) it samples. Filled by collectTraces.
+struct PlotTrace {
+    std::string name;
+    std::vector<float> x, y;
+};
+
+// Gather voltage traces from the sim results for the active analysis. Transient -> x=time(s),
+// y=volts. AC -> x=log10(freq Hz), y=magnitude in dB (20*log10(mag), guarded). I(...) current
+// traces are skipped (voltages are the priority for the waveform view). xLabel/yLabel describe
+// the axes for the caller. Returns false when there is nothing to plot.
+bool collectTraces(const nlohmann::json& results, int analysis,
+                   std::vector<PlotTrace>& out, std::string& xLabel, std::string& yLabel) {
+    out.clear();
+    auto wantTrace = [](const std::string& key) {
+        // Plot voltage nodes; skip current traces like "I(V1)".
+        return key.rfind("I(", 0) != 0 && key.rfind("i(", 0) != 0;
+    };
+    if (analysis == 1) {  // AC: Bode magnitude
+        xLabel = "log10(f / Hz)";
+        yLabel = "Magnitude (dB)";
+        if (!results.contains("ac") || !results["ac"].is_object()) return false;
+        const auto& ac = results["ac"];
+        if (!ac.contains("x_f") || !ac.contains("mag")) return false;
+        const auto& xf = ac["x_f"];
+        const auto& mag = ac["mag"];
+        if (!xf.is_array() || !mag.is_object()) return false;
+        for (auto it = mag.begin(); it != mag.end(); ++it) {
+            if (!it.value().is_array() || !wantTrace(it.key())) continue;
+            PlotTrace tr; tr.name = it.key();
+            const size_t n = std::min(xf.size(), it.value().size());
+            for (size_t i = 0; i < n; ++i) {
+                const double f = xf[i].is_number() ? xf[i].get<double>() : 0.0;
+                double m = it.value()[i].is_number() ? it.value()[i].get<double>() : 0.0;
+                if (f <= 0.0) continue;
+                if (m <= 1e-12) m = 1e-12;  // guard log of non-positive magnitude
+                double db = 20.0 * std::log10(m);
+                if (db < -120.0) db = -120.0;  // floor so a single near-zero sample can't flatten scale
+                tr.x.push_back((float)std::log10(f));
+                tr.y.push_back((float)db);
+            }
+            if (tr.x.size() >= 2) out.push_back(std::move(tr));
+        }
+    } else {  // Transient: voltage vs time
+        xLabel = "Time (s)";
+        yLabel = "Volts (V)";
+        if (!results.contains("tran") || !results["tran"].is_object()) return false;
+        const auto& tran = results["tran"];
+        if (!tran.contains("x_t") || !tran.contains("traces")) return false;
+        const auto& xt = tran["x_t"];
+        const auto& traces = tran["traces"];
+        if (!xt.is_array() || !traces.is_object()) return false;
+        for (auto it = traces.begin(); it != traces.end(); ++it) {
+            if (!it.value().is_array() || !wantTrace(it.key())) continue;
+            PlotTrace tr; tr.name = it.key();
+            const size_t n = std::min(xt.size(), it.value().size());
+            for (size_t i = 0; i < n; ++i) {
+                const double t = xt[i].is_number() ? xt[i].get<double>() : 0.0;
+                const double v = it.value()[i].is_number() ? it.value()[i].get<double>() : 0.0;
+                tr.x.push_back((float)t);
+                tr.y.push_back((float)v);
+            }
+            if (tr.x.size() >= 2) out.push_back(std::move(tr));
+        }
+    }
+    return !out.empty();
+}
+
+// ---- bottom area: simulation waveform plot ----
+// A bordered plot rect with labeled axes, each voltage trace an auto-scaled colored polyline, and a
+// legend (node name + color) in the top-right corner. Drawn into the current child window with the
+// window draw list. Falls back to a hint line when the results carry no plottable voltage traces.
+void drawSimPlot(const nlohmann::json& results, int analysis) {
+    const ui::Palette& pal = ui::palette;
+    const float sc = ui::uiScale;
+
+    std::vector<PlotTrace> traces;
+    std::string xLabel, yLabel;
+    if (!collectTraces(results, analysis, traces, xLabel, yLabel)) {
+        ImGui::TextColored(v4(pal.textDim),
+                           "Simulated, but no voltage traces to plot for this analysis.");
+        return;
+    }
+
+    ImGui::TextColored(v4(pal.accent), "%s",
+                       analysis == 1 ? "AC Sweep (Bode)" : "Transient Response");
+
+    // X range: full span across all traces. Y range: percentile-clipped so a few extreme outliers
+    // (e.g. an AC node that dips to ~0 magnitude -> a huge negative dB) can't flatten the curve.
+    float xMin = 1e30f, xMax = -1e30f;
+    std::vector<float> allY;
+    for (const auto& tr : traces) {
+        for (size_t i = 0; i < tr.x.size(); ++i) {
+            xMin = std::min(xMin, tr.x[i]); xMax = std::max(xMax, tr.x[i]);
+            allY.push_back(tr.y[i]);
+        }
+    }
+    if (xMax - xMin < 1e-12f) xMax = xMin + 1.0f;
+    std::sort(allY.begin(), allY.end());
+    auto pctl = [&](float q) {
+        if (allY.empty()) return 0.0f;
+        const float idx = q * (float)(allY.size() - 1);
+        const size_t lo = (size_t)idx;
+        const size_t hi = std::min(lo + 1, allY.size() - 1);
+        return allY[lo] + (allY[hi] - allY[lo]) * (idx - (float)lo);
+    };
+    float yMin = pctl(0.02f), yMax = pctl(0.98f);
+    if (yMax - yMin < 1e-6f) { yMax += 0.5f; yMin -= 0.5f; }
+    const float yPad = (yMax - yMin) * 0.08f;
+    yMin -= yPad; yMax += yPad;
+
+    // Plot rect inside the child, leaving room for axis labels.
+    const float lpad = 52 * sc, rpad = 12 * sc, tpad = 6 * sc, bpad = 22 * sc;
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const ImVec2 org = ImGui::GetCursorScreenPos();
+    const float plotW = std::max(40.0f, avail.x - lpad - rpad);
+    const float plotH = std::max(30.0f, avail.y - tpad - bpad);
+    const ImVec2 p0(org.x + lpad, org.y + tpad);
+    const ImVec2 p1(p0.x + plotW, p0.y + plotH);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 borderCol = ui::Palette::toU32(pal.textDim);
+    const ImU32 gridCol   = ui::Palette::toU32(pal.panelBg);  // faint gridlines
+    const ImU32 axisLblCol = ui::Palette::toU32(pal.textDim);
+
+    dl->AddRectFilled(p0, p1, ui::Palette::toU32(pal.windowBg));
+    // Light gridlines (4 vertical, 4 horizontal).
+    for (int g = 1; g < 4; ++g) {
+        const float fx = p0.x + plotW * (g / 4.0f);
+        const float fy = p0.y + plotH * (g / 4.0f);
+        dl->AddLine(ImVec2(fx, p0.y), ImVec2(fx, p1.y), gridCol, 1.0f);
+        dl->AddLine(ImVec2(p0.x, fy), ImVec2(p1.x, fy), gridCol, 1.0f);
+    }
+    dl->AddRect(p0, p1, borderCol);
+
+    auto toScreen = [&](float x, float y) {
+        const float sx = p0.x + (x - xMin) / (xMax - xMin) * plotW;
+        float sy = p1.y - (y - yMin) / (yMax - yMin) * plotH;
+        sy = std::max(p0.y, std::min(p1.y, sy));  // clamp outliers to the plot rect
+        return ImVec2(sx, sy);
+    };
+
+    // Zero line for transient (volts).
+    if (analysis != 1 && yMin < 0.0f && yMax > 0.0f) {
+        const ImVec2 z0 = toScreen(xMin, 0.0f), z1 = toScreen(xMax, 0.0f);
+        dl->AddLine(ImVec2(p0.x, z0.y), ImVec2(p1.x, z1.y), borderCol, 1.0f);
+    }
+
+    // Trace polylines.
+    for (size_t ti = 0; ti < traces.size(); ++ti) {
+        const PlotTrace& tr = traces[ti];
+        const ImU32 c = traceColor((int)ti);
+        std::vector<ImVec2> pts;
+        pts.reserve(tr.x.size());
+        for (size_t i = 0; i < tr.x.size(); ++i) pts.push_back(toScreen(tr.x[i], tr.y[i]));
+        if (pts.size() >= 2)
+            dl->AddPolyline(pts.data(), (int)pts.size(), c, ImDrawFlags_None, 1.8f);
+    }
+
+    // Axis min/max labels.
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.3g", yMax);
+    dl->AddText(ImVec2(org.x + 4 * sc, p0.y - 2 * sc), axisLblCol, buf);
+    std::snprintf(buf, sizeof(buf), "%.3g", yMin);
+    dl->AddText(ImVec2(org.x + 4 * sc, p1.y - 14 * sc), axisLblCol, buf);
+    std::snprintf(buf, sizeof(buf), "%.3g", xMin);
+    dl->AddText(ImVec2(p0.x, p1.y + 4 * sc), axisLblCol, buf);
+    std::snprintf(buf, sizeof(buf), "%.3g", xMax);
+    dl->AddText(ImVec2(p1.x - 40 * sc, p1.y + 4 * sc), axisLblCol, buf);
+    // X-axis title centered under the plot (between the min/max ticks); Y-axis title at mid-height.
+    const float xLblW = ImGui::CalcTextSize(xLabel.c_str()).x;
+    dl->AddText(ImVec2(p0.x + (plotW - xLblW) * 0.5f, p1.y + 4 * sc), axisLblCol, xLabel.c_str());
+    dl->AddText(ImVec2(org.x + 2 * sc, p0.y + plotH * 0.5f), axisLblCol, yLabel.c_str());
+
+    // Legend (top-right corner inside the plot).
+    float ly = p0.y + 4 * sc;
+    for (size_t ti = 0; ti < traces.size(); ++ti) {
+        const ImU32 c = traceColor((int)ti);
+        const float sw = ImGui::GetTextLineHeight();
+        const ImVec2 lp(p1.x - 110 * sc, ly);
+        dl->AddRectFilled(lp, ImVec2(lp.x + sw, lp.y + sw), c, 2.0f);
+        dl->AddText(ImVec2(lp.x + sw + 4 * sc, lp.y), ui::Palette::toU32(pal.text),
+                    traces[ti].name.c_str());
+        ly += sw + 3 * sc;
+    }
+
+    // Reserve the space we drew into so the child sizes correctly.
+    ImGui::Dummy(ImVec2(avail.x, avail.y));
+}
+
 // ---- bottom strip: ERC / DRC results ----
 void drawResultsStrip(AppState& st, EcadEditorState& es) {
     const ui::Palette& pal = ui::palette;
@@ -433,11 +642,25 @@ void drawEcadEditor(AppState& st) {
                 ? "Route: click points; Esc / right-click to finish"
                 : "Select: middle/right-drag to pan, wheel to zoom");
         }
+        // Native simulator controls (schematic only): an analysis selector + a Simulate button that
+        // fires ecad_simulate via the app loop (st.ecadSimGo). Results plot in the bottom strip.
+        if (es.mirror.isSch()) {
+            ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 240 * sc);
+            ImGui::SetNextItemWidth(110 * sc);
+            const char* kAnalyses[] = {"Transient", "AC"};
+            int analysis = st.ecadSimAnalysis;
+            if (ImGui::Combo("##ecadAnalysis", &analysis, kAnalyses, 2)) st.ecadSimAnalysis = analysis;
+            ImGui::SameLine();
+            if (ImGui::Button("Simulate", ImVec2(100 * sc, 0))) st.ecadSimGo = true;
+        }
     }
     ImGui::Separator();
 
-    // Reserve the bottom results strip; the rest splits left sub-panel | canvas.
-    const float bottomH = 140.0f * sc;
+    // Reserve the bottom results strip; the rest splits left sub-panel | canvas. Give the strip
+    // more room when there are sim results to plot so the waveform is readable.
+    const bool hasSimNow = es.mirror.isSch() && st.ecadSimResults.is_object() &&
+                           !st.ecadSimResults.empty();
+    const float bottomH = (hasSimNow ? 260.0f : 140.0f) * sc;
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     const float mainH = avail.y - bottomH;
 
@@ -471,9 +694,30 @@ void drawEcadEditor(AppState& st) {
     }
     ImGui::EndChild();
 
-    // Bottom results strip.
+    // Bottom area: ERC/DRC results, plus a Simulation waveform tab when results are present.
     ImGui::BeginChild("##ecadStrip", ImVec2(0, 0), ImGuiChildFlags_Border);
-    drawResultsStrip(st, es);
+    const bool haveSim = es.mirror.isSch() && st.ecadSimResults.is_object() &&
+                         !st.ecadSimResults.empty();
+    if (haveSim && ImGui::BeginTabBar("##ecadBottomTabs")) {
+        if (ImGui::BeginTabItem(es.mirror.isSch() ? "ERC" : "DRC")) {
+            drawResultsStrip(st, es);
+            ImGui::EndTabItem();
+        }
+        // Force the Simulation tab forward the frame results first appear (or change).
+        ImGuiTabItemFlags simFlags = ImGuiTabItemFlags_None;
+        if (es.lastSimResults != st.ecadSimResults) {
+            simFlags = ImGuiTabItemFlags_SetSelected;
+            es.lastSimResults = st.ecadSimResults;
+            es.lastAnalysis = st.ecadSimAnalysis;
+        }
+        if (ImGui::BeginTabItem("Simulation", nullptr, simFlags)) {
+            drawSimPlot(st.ecadSimResults, es.lastAnalysis);
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    } else {
+        drawResultsStrip(st, es);
+    }
     ImGui::EndChild();
 
     ImGui::End();

@@ -1033,6 +1033,19 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
     else if (t == "axis")    needWell = "a";          // datum axis primary reference
     else if (t == "point")   needWell = "target";     // datum point reference
     else if (t == "rib")     needWell = "profile";    // rib needs an open-contour sketch profile
+    // Surfacing — gate each surf feature on its primary (required) ref well, mirroring schema.py.
+    else if (t == "surf_extrude" || t == "surf_revolve" || t == "surf_sweep" ||
+             t == "surf_planar")        needWell = "profile";   // profile-driven surfaces
+    else if (t == "surf_loft")          needWell = "sections";  // ordered section profiles
+    else if (t == "surf_offset")        needWell = "faces";     // faces to offset
+    else if (t == "surf_ruled")         needWell = "edge_a";    // first ruling edge
+    else if (t == "surf_boundary")      needWell = "dir1";      // direction-1 curves
+    else if (t == "surf_fill")          needWell = "edges";     // bounding edge loop
+    else if (t == "surf_knit")          needWell = "surfaces";  // surface bodies to knit
+    else if (t == "surf_thicken")       needWell = "surface";   // the surface to thicken
+    else if (t == "surf_trim")          needWell = "surface";   // the surface being trimmed
+    else if (t == "surf_untrim" || t == "surf_delete_face" ||
+             t == "surf_replace_face")  needWell = "faces";     // target faces
     if (needWell) {
         for (const auto& f : fields)
             if ((f.def->kind == PMFieldKind::SelectorWell || f.def->kind == PMFieldKind::FeatureWell)

@@ -485,6 +485,101 @@ static const std::vector<PMFormDef>& forms() {
             ComboL   ("keep", "Resulting Bodies",    "Resulting Bodies",
                       "both|above|below", "Keep Both|Keep Above|Keep Below"),
         }},
+
+        // =====================================================================
+        // SURFACING — open-surface (kind="surface") features. cmd_id == feature
+        // type, so each routes straight through pmFormForCommand. Wells/params
+        // mirror engine/doc/schema.py FEATURE_TYPES surf_* exactly. _SEL_OR_DATUM
+        // slots (axis/path/surface/tool) use single-pick SelectorWells (the engine
+        // resolves a picked edge/face/datum); _SEL_LIST slots use multi wells.
+        // =====================================================================
+
+        // --- surf_extrude --- refs.profile[]; params end/depth. Mirrors the solid
+        //   extrude's profile well + end-condition combo + gated depth.
+        { "surf_extrude", "Extruded Surface", "extrude_boss", {
+            Well   ("profile", "Profile",       "Profile",   K_FACE, true),
+            ComboL ("end",     "End Condition", "Direction",
+                    "blind|mid_plane|through_all|up_to_next",
+                    "Blind|Mid Plane|Through All|Up To Next"),
+            DimIf  ("depth",   "Distance",      "Direction", 10.0, "end", "blind|mid_plane"),
+        }},
+        // --- surf_revolve --- refs.profile[]/axis; params angle.
+        { "surf_revolve", "Revolved Surface", "revolve_boss", {
+            Well  ("profile", "Profile", "Revolve", K_FACE, true),
+            Well  ("axis",    "Axis",    "Revolve", K_EDGE, false),
+            Angle ("angle",   "Angle",   "Revolve", 360.0),
+        }},
+        // --- surf_sweep --- refs.profile[]/path/guides[]; no params.
+        { "surf_sweep", "Swept Surface", "sweep", {
+            Well ("profile", "Profile",      "Profile and Path", K_FACE, true),
+            Well ("path",    "Path",         "Profile and Path", K_EDGE, false),
+            Well ("guides",  "Guide Curves", "Guide Curves",     K_EDGE, true),
+        }},
+        // --- surf_loft --- refs.sections[]/guides[]/centerline; no params.
+        { "surf_loft", "Lofted Surface", "loft", {
+            Well ("sections",   "Profiles",     "Profiles",     K_FACE, true),
+            Well ("guides",     "Guide Curves", "Guide Curves", K_EDGE, true),
+            Well ("centerline", "Centerline",   "Centerline",   K_EDGE, false),
+        }},
+        // --- surf_planar --- refs.profile[]; no params. A planar surface filling a
+        //   closed sketch contour or bounded by closed edges.
+        { "surf_planar", "Planar Surface", "plane", {
+            Well ("profile", "Bounding Entities", "Planar Surface", K_FACE, true),
+        }},
+        // --- surf_offset --- refs.faces[]; params distance.
+        { "surf_offset", "Offset Surface", "offset_ent", {
+            Well ("faces",    "Faces to Offset", "Offset Parameters", K_FACE, true),
+            Dim  ("distance", "Offset Distance", "Offset Parameters", 10.0),
+        }},
+        // --- surf_ruled --- refs.edge_a/edge_b (each one edge/curve); no params.
+        { "surf_ruled", "Ruled Surface", "shell", {
+            Well ("edge_a", "Edge 1", "Edge Selection", K_EDGE, false),
+            Well ("edge_b", "Edge 2", "Edge Selection", K_EDGE, false),
+        }},
+        // --- surf_boundary --- refs.dir1[] (required) / dir2[] (optional); no params.
+        //   Two direction curve sets blended into a boundary patch.
+        { "surf_boundary", "Boundary Surface", "boundary", {
+            Well ("dir1", "Direction 1 Curves", "Direction 1", K_EDGE, true),
+            Well ("dir2", "Direction 2 Curves", "Direction 2", K_EDGE, true),
+        }},
+        // --- surf_fill --- refs.edges[]; no params. Patch fills a bounded edge loop.
+        { "surf_fill", "Filled Surface", "boundary", {
+            Well ("edges", "Patch Boundary", "Fill Boundary", K_EDGE, true),
+        }},
+        // --- surf_knit --- refs.surfaces[] (multi surface bodies); no params.
+        //   Knit adjacent surface bodies into one. K_FACE so the user picks faces of
+        //   the surface bodies to knit (the engine resolves the owning surface bodies).
+        { "surf_knit", "Knit Surface", "combine", {
+            Well ("surfaces", "Surfaces to Knit", "Selections", K_FACE, true),
+        }},
+        // --- surf_thicken --- refs.surface (one surface body); params thickness.
+        { "surf_thicken", "Thicken", "extrude_boss", {
+            Well ("surface",   "Surface",   "Thicken Parameters", K_FACE, false),
+            Dim  ("thickness", "Thickness", "Thicken Parameters", 2.0),
+        }},
+        // --- surf_trim --- refs.surface/tool; params keep. Trim a surface with a
+        //   tool surface, keeping the inside or outside piece.
+        { "surf_trim", "Trim Surface", "trim", {
+            Well   ("surface", "Surface to Trim", "Trim", K_FACE, false),
+            Well   ("tool",    "Trim Tool",       "Trim", K_FACE, false),
+            ComboL ("keep",    "Keep Selection",  "Trim",
+                    "inside|outside", "Keep Inside|Keep Outside"),
+        }},
+        // --- surf_untrim --- refs.faces[]; no params. Restore a face's natural
+        //   (untrimmed) underlying surface.
+        { "surf_untrim", "Untrim Surface", "convert_ent", {
+            Well ("faces", "Faces to Untrim", "Untrim", K_FACE, true),
+        }},
+        // --- surf_delete_face --- refs.faces[]; no params. Remove faces from a body.
+        { "surf_delete_face", "Delete Face", "subtract", {
+            Well ("faces", "Faces to Delete", "Selections", K_FACE, true),
+        }},
+        // --- surf_replace_face --- refs.faces[]/surface; no params. Replace target
+        //   faces with a replacement surface body.
+        { "surf_replace_face", "Replace Face", "wrap", {
+            Well ("faces",   "Faces to Replace",  "Replace Face", K_FACE, true),
+            Well ("surface", "Replacement Surface","Replace Face", K_FACE, false),
+        }},
     };
     return kForms;
 }
@@ -538,6 +633,24 @@ const PMFormDef* pmFormForCommand(const std::string& cmdId, std::string& mode) {
     // the engine feature type.
     if (cmdId == "rib")               return pmFindForm("rib");
     if (cmdId == "split")             return pmFindForm("split");
+    // Surfacing — open-surface (kind="surface") features. ribbon cmd id == the engine feature
+    // type, so each routes straight through. Listed per-id so the feature-surface audit sees an
+    // explicit handler for every surf_ command.
+    if (cmdId == "surf_extrude")      return pmFindForm("surf_extrude");
+    if (cmdId == "surf_revolve")      return pmFindForm("surf_revolve");
+    if (cmdId == "surf_sweep")        return pmFindForm("surf_sweep");
+    if (cmdId == "surf_loft")         return pmFindForm("surf_loft");
+    if (cmdId == "surf_planar")       return pmFindForm("surf_planar");
+    if (cmdId == "surf_offset")       return pmFindForm("surf_offset");
+    if (cmdId == "surf_ruled")        return pmFindForm("surf_ruled");
+    if (cmdId == "surf_boundary")     return pmFindForm("surf_boundary");
+    if (cmdId == "surf_fill")         return pmFindForm("surf_fill");
+    if (cmdId == "surf_knit")         return pmFindForm("surf_knit");
+    if (cmdId == "surf_thicken")      return pmFindForm("surf_thicken");
+    if (cmdId == "surf_trim")         return pmFindForm("surf_trim");
+    if (cmdId == "surf_untrim")       return pmFindForm("surf_untrim");
+    if (cmdId == "surf_delete_face")  return pmFindForm("surf_delete_face");
+    if (cmdId == "surf_replace_face") return pmFindForm("surf_replace_face");
     // Primitive quick-start commands (AI-CAD extensions; not in the C14 ribbon but reachable
     // via the M1 scenario / future "Insert > Primitive" entries).
     if (cmdId == "box")           return pmFindForm("box");

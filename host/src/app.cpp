@@ -904,13 +904,14 @@ int run_gui(const char* screenshotPath) {
         st.showRibbon = true; st.ribbonTab = AppState::RT_Assembly;  // Assembly tab forward
         st.showActivityPanel = false;            // keep the FeatureManager (Mates folder) unobscured
     }
-    // ribbon shot: show Features tab by default; AI_CAD_TAB=<0..4> selects which tab to capture
-    // (0=Features 1=Sketch 2=Evaluate 3=Simulation 4=Assembly) for headless per-tab verification.
+    // ribbon shot: show Features tab by default; AI_CAD_TAB=<0..8> selects which tab to capture
+    // (0=Features 1=Sketch 2=Evaluate 3=Simulation 4=Assembly 5=Sheet Metal 6=Weldments 7=PCB
+    // 8=Surfaces) for headless per-tab verification. Upper bound tracks kRibbonTabCount-1.
     if (st.wantRibbon) {
         st.showRibbon = true; st.ribbonTab = AppState::RT_Features;
         if (const char* tabEnv = std::getenv("AI_CAD_TAB")) {
             int t = std::atoi(tabEnv);
-            if (t >= 0 && t <= 4) st.ribbonTab = t;
+            if (t >= 0 && t <= 8) st.ribbonTab = t;
         }
     }
     // wantTree doc smoke runs in the frame loop once the worker is ready (see below).

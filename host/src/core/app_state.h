@@ -579,6 +579,7 @@ struct AppState {
     enum RibbonTab {
         RT_Features   = 0, RT_Sketch     = 1, RT_Evaluate   = 2, RT_Simulation = 3,
         RT_Assembly   = 4, RT_SheetMetal = 5, RT_Weldments  = 6, RT_PCB        = 7,
+        RT_Surfaces   = 8,
     };
     bool showRibbon = true;        // View > Ribbon visibility toggle
     int  ribbonTab  = RT_Features; // active ribbon tab (one of RibbonTab); contextual on the doc

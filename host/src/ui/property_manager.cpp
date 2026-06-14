@@ -1282,7 +1282,7 @@ void PropertyManager::draw(AppState& st) {
 
         // C37-F: OK / Cancel buttons scaled by uiScale, with tooltips and green/red iconography.
         float btnW = 28.0f * ui::uiScale;
-        float pairW = btnW * 2 + 4;
+        float pairW = btnW * 2 + 4 * ui::uiScale;
         float rightX = ImGui::GetWindowContentRegionMax().x - pairW;
         float afterTitleX = ImGui::GetCursorPosX();
         if (rightX > afterTitleX + 6) {
@@ -1298,21 +1298,22 @@ void PropertyManager::draw(AppState& st) {
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
             ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
         {
-            // Use checkmark glyph if the atlas has one, else text fallback.
-            IconUV okIc = getIcon("ok", 20);
+            // Atlas glyph is "ok_check" / "cancel_x" (NOT "ok"/"cancel"); the text fallback uses
+            // ASCII because the loaded fonts don't cover U+2713/U+2717 (✓/✗ render as a notdef box).
+            IconUV okIc = getIcon("ok_check", 20);
             bool btnOk;
             if (okIc.valid) {
                 btnOk = ImGui::ImageButton("##pm_ok",
                     okIc.texId, ImVec2(btnW - 4, btnW - 4), okIc.uv0, okIc.uv1);
             } else {
-                btnOk = ImGui::Button(u8"✓##pm", ImVec2(btnW, 0));
+                btnOk = ImGui::Button("OK##pm", ImVec2(btnW, 0));
             }
             ok = btnOk;
         }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("OK (Enter)");
         ImGui::PopStyleColor(2);
 
-        ImGui::SameLine(0, 4);
+        ImGui::SameLine(0, 4 * ui::uiScale);
 
         // Cancel button — red/muted.
         ImGui::PushStyleColor(ImGuiCol_Button,
@@ -1320,13 +1321,13 @@ void PropertyManager::draw(AppState& st) {
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
             ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 0.7f));
         {
-            IconUV cancelIc = getIcon("cancel", 20);
+            IconUV cancelIc = getIcon("cancel_x", 20);
             bool btnCancel;
             if (cancelIc.valid) {
                 btnCancel = ImGui::ImageButton("##pm_cancel",
                     cancelIc.texId, ImVec2(btnW - 4, btnW - 4), cancelIc.uv0, cancelIc.uv1);
             } else {
-                btnCancel = ImGui::Button(u8"✗##pm", ImVec2(btnW, 0));
+                btnCancel = ImGui::Button("X##pm", ImVec2(btnW, 0));
             }
             cancel = cancel || btnCancel;
         }
@@ -1379,7 +1380,14 @@ void PropertyManager::draw(AppState& st) {
                 ImGui::PopStyleColor();
                 if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip("Not yet supported by engine");
-                ImGui::SetNextItemWidth(-1);
+                // Reserve room for the - / + step buttons so the InputText doesn't shove them past
+                // the pane's right edge (was SetNextItemWidth(-1), which let the steppers overflow
+                // / clip — the most visible "misplaced element" on the Extrude form).
+                {
+                    const ImGuiStyle& dimStl = ImGui::GetStyle();
+                    float stepBtnW = ImGui::CalcTextSize("+").x + dimStl.FramePadding.x * 2.0f;
+                    ImGui::SetNextItemWidth(-(stepBtnW * 2.0f + 9.0f * ui::uiScale));
+                }
 
                 // C37-F: SetKeyboardFocusHere on the very first editable Dim field when opening.
                 if (wantFocusFirstField_ && enabled && !f.def->comingSoon && !firstEditableDimSeen) {
@@ -1395,7 +1403,7 @@ void PropertyManager::draw(AppState& st) {
                 bool deact = ImGui::IsItemDeactivatedAfterEdit();
 
                 // C37-F: Step buttons (- / +) trigger immediate preview (no debounce).
-                ImGui::SameLine(0, 3);
+                ImGui::SameLine(0, 3 * ui::uiScale);
                 ImGui::PushStyleColor(ImGuiCol_Button,
                     ImVec4(pal.button[0], pal.button[1], pal.button[2], 1));
                 if (ImGui::SmallButton("-##step")) {
@@ -1408,7 +1416,7 @@ void PropertyManager::draw(AppState& st) {
                         lastEditTime_ = ImGui::GetTime() - kDebounceSec;  // fire immediately
                     }
                 }
-                ImGui::SameLine(0, 2);
+                ImGui::SameLine(0, 2 * ui::uiScale);
                 if (ImGui::SmallButton("+##step")) {
                     if (enabled && !f.def->comingSoon) {
                         f.dimValue += 1.0;

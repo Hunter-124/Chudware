@@ -262,7 +262,7 @@ static const RibbonCmd kCmds[] = {
     // =========================================================================
 
     // --- Group: New ---
-    { "ecad_ai_design",     "AI Design",      "ai_design",       "PCB", "New",        true,  nullptr, false },
+    { "ecad_ai_design",     "AI Design",      "ai_panel",        "PCB", "New",        true,  nullptr, false },
     { "ecad_new_sch",       "Schematic",      "sketch",          "PCB", "New",        true,  nullptr, false },
     { "ecad_new_pcb",       "PCB Layout",     "extrude_boss",    "PCB", "New",        true,  nullptr, false },
     { "ecad_open",          "Open",           "ref_plane",       "PCB", "New",        false, nullptr, false },

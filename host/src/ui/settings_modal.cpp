@@ -93,11 +93,13 @@ static void helpMarker(const char* desc) {
 }
 
 // Apply a dark/light theme immediately (settings.theme persists on Save) and sync the viewport
-// background. Shared by the General-tab theme control. scale is unknown here (1.0 is fine
-// post-init — applyTheme only uses it for rounding/padding metrics already set at startup).
+// background. Shared by the General-tab theme control. MUST pass st.scale: applyTheme re-seeds all
+// style-vars to base and only multiplies them by the scale argument (ScaleAllSizes) — passing 1.0f
+// on a HiDPI display collapses every padding/rounding to 100% while the pre-scaled fonts stay large,
+// and clobbers ui::uiScale, desyncing every custom-drawn widget. (Was hardcoded 1.0f — bug.)
 static void applyThemeNow(AppState& st, bool light) {
     ui::Theme next = light ? ui::Theme::Light : ui::Theme::Dark;
-    ui::applyTheme(next, 1.0f);
+    ui::applyTheme(next, st.scale);
     st.settings.theme = light ? "light" : "dark";
     if (st.renderer)
         st.renderer->setBackground(

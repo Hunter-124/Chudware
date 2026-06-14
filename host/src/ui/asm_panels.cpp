@@ -457,7 +457,7 @@ void AsmPanels::drawPatternForm(AppState& st) {
     ImGui::SetNextWindowSize(ImVec2(340 * ui::uiScale, 0), ImGuiCond_Appearing);
     if (patternFocus_) { ImGui::SetNextWindowFocus(); patternFocus_ = false; }
     if (ImGui::Begin("Component Pattern##asm", &open)) {
-        asmIcon("pattern", "[#]"); ImGui::SameLine(0, 6);
+        asmIcon("pattern_component", "[#]"); ImGui::SameLine(0, 6);
         pushText(pal.text);
         ImGui::TextUnformatted("Component Pattern");
         ImGui::PopStyleColor();

@@ -598,12 +598,31 @@ void drawEcadEditor(AppState& st) {
                        es.mirror.name().empty() ? "(untitled)" : es.mirror.name().c_str());
     ImGui::SameLine(0, 8 * sc);
     ImGui::TextColored(v4(pal.textDim), "rev %d", es.mirror.revision());
-    ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 160 * sc);
+    ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 270 * sc);
+    // History controls (worker ecad_undo / ecad_redo via one-shot flags consumed in the app loop).
+    if (ImGui::SmallButton("Undo")) st.ecadUndoGo = true;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Redo")) st.ecadRedoGo = true;
+    ImGui::SameLine(0, 12 * sc);
     if (ImGui::SmallButton("Zoom Fit")) es.canvas.requestFit();
     ImGui::SameLine();
     ImGui::Checkbox(es.mirror.isPcb() ? "Layers" : "Nets", &es.showLeft);
 
     ImGui::Separator();
+
+    // ---- keyboard history: Ctrl+Z = undo, Ctrl+Y / Ctrl+Shift+Z = redo ----
+    // GATED on the ECAD window (incl. its child windows) being focused so it never collides with the
+    // CAD doc's global Ctrl+Z (app.cpp), which fires whenever st.docMirror.hasDoc() regardless of
+    // focus. Skip while a text field has focus (the field owns its own edit history).
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::GetIO().WantTextInput) {
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z) ||
+            ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Y)) {
+            st.ecadRedoGo = true;
+        } else if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z)) {
+            st.ecadUndoGo = true;
+        }
+    }
 
     // ---- canvas tool toolbar (Wave Q): Select / Place / Route + the part to place ----
     {

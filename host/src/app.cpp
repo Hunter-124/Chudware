@@ -144,6 +144,39 @@ void ecadApplyOps(AppState& st, const nlohmann::json& ops) {
     ecadAdopt(st, res);
 }
 
+// Undo / Redo the current ECAD doc via the worker's history (ecad_undo / ecad_redo). Both return an
+// ops-response ({revision,kind,tree,compile}); we adopt it into the editor mirror like any other
+// mutation so the canvas + revision badge reflect the new history position. No-op without a doc.
+void ecadUndo(AppState& st) {
+    if (st.ecadDocId.empty()) return;
+    nlohmann::json res; std::string err;
+    if (!st.worker.call("ecad_undo", {{"doc_id", st.ecadDocId}}, res, err)) {
+        st.toast(ui::ToastLevel::Error, "ECAD undo: " + err);
+        return;
+    }
+    if (res.is_object() && res.contains("code")) {
+        st.toast(ui::ToastLevel::Warn, "ECAD undo: " + jstr(res, "message"));
+        return;
+    }
+    ecadAdopt(st, res);
+    st.toast(ui::ToastLevel::Info, "Undo");
+}
+
+void ecadRedo(AppState& st) {
+    if (st.ecadDocId.empty()) return;
+    nlohmann::json res; std::string err;
+    if (!st.worker.call("ecad_redo", {{"doc_id", st.ecadDocId}}, res, err)) {
+        st.toast(ui::ToastLevel::Error, "ECAD redo: " + err);
+        return;
+    }
+    if (res.is_object() && res.contains("code")) {
+        st.toast(ui::ToastLevel::Warn, "ECAD redo: " + jstr(res, "message"));
+        return;
+    }
+    ecadAdopt(st, res);
+    st.toast(ui::ToastLevel::Info, "Redo");
+}
+
 void ecadExport(AppState& st, const char* kind) {
     if (st.ecadDocId.empty()) { st.toast(ui::ToastLevel::Warn, "Open an ECAD document first"); return; }
     std::error_code ec;
@@ -1152,6 +1185,7 @@ int run_gui(const char* screenshotPath) {
             const bool wantSelect = kindEnv && std::strcmp(kindEnv, "select") == 0;  // selection highlight
             const bool wantDel    = kindEnv && std::strcmp(kindEnv, "del") == 0;     // delete a symbol
             const bool wantSim    = kindEnv && std::strcmp(kindEnv, "sim") == 0;     // simulate + plot
+            const bool wantUndo   = kindEnv && std::strcmp(kindEnv, "undo") == 0;    // history undo
             nlohmann::json r;
             std::string showId;
             if (wantAi) {
@@ -1212,6 +1246,24 @@ int run_gui(const char* screenshotPath) {
                         showId = pcbId;         // show the board in the ECAD canvas
                     }
                 }
+            } else if (wantUndo) {
+                // Undo demo: build a schematic in TWO separate op batches (so the worker records two
+                // undoable history steps), then below we load it and ecadUndo() once -> the second
+                // batch (the capacitor) is rolled back and the symbol count drops by one.
+                if (ecall("ecad_new", {{"kind", "sch"}}, r)) {
+                    const std::string id = jstr(r, "doc_id");
+                    int rev = jint(r, "revision");
+                    // Batch 1: place a resistor.
+                    nlohmann::json b1 = nlohmann::json::array();
+                    b1.push_back({{"op","sch_add_symbol"},{"libid","Device:R"},{"pos",{20,30}},{"value","10k"}});
+                    if (ecall("ecad_apply_ops", {{"doc_id",id},{"base_revision",rev},{"ops",b1}}, r))
+                        rev = jint(r, "revision");
+                    // Batch 2: place a capacitor (a distinct undoable step).
+                    nlohmann::json b2 = nlohmann::json::array();
+                    b2.push_back({{"op","sch_add_symbol"},{"libid","Device:C"},{"pos",{40,30}},{"value","100n"}});
+                    ecall("ecad_apply_ops", {{"doc_id",id},{"base_revision",rev},{"ops",b2}}, r);
+                    showId = id;
+                }
             } else if (wantSim) {
                 // Native simulator demo: design a verified RC low-pass and run an AC sweep so the shot
                 // plots its frequency-response rolloff in the Simulation tab. (ecad_simulate injects a
@@ -1242,6 +1294,15 @@ int run_gui(const char* screenshotPath) {
                 if (wantDel)
                     std::printf("[ecad-shot] after delete: %d symbols\n",
                                 (int)ui::ecadEditorMirror().symbols().size());
+                if (wantUndo) {
+                    // Undo the capacitor batch (the 2nd, most-recent history step). Confirm via the
+                    // editor mirror that the symbol count dropped by one (2 -> 1).
+                    const int before = (int)ui::ecadEditorMirror().symbols().size();
+                    ecadUndo(st);
+                    const int after = (int)ui::ecadEditorMirror().symbols().size();
+                    std::printf("[ecad-shot] undo: symbols %d -> %d (rev %d)\n",
+                                before, after, st.ecadRevision);
+                }
                 if (wantSim) {
                     // Run the sim now (blocking) so the screenshot captures the plotted curve. The
                     // panel pops the Simulation tab forward the frame ecadSimResults first appears.
@@ -1271,12 +1332,20 @@ int run_gui(const char* screenshotPath) {
         //   - skip while a text field has focus (the field owns Ctrl+Z for its own edit history),
         //   - skip while a sketch is active (sketch mode owns in-sketch undo in a later wave),
         //   - skip while a background job / v2 agent run is in flight (same canDoc gate the toolbar
-        //     uses), so we never mutate the doc under a running worker call.
+        //     uses), so we never mutate the doc under a running worker call,
+        //   - skip while the ECAD editor window is focused — that window owns Ctrl+Z for its own
+        //     history (ecadUndo/ecadRedo, gated inside drawEcadEditor) and must not also drive the
+        //     CAD doc's undo.
         {
             const bool canDoc = st.workerStarted && !st.job.running.load() && !st.agentV2Running;
             const bool textFocus = io.WantTextInput;
             const bool inSketchNow = sketchMode.active();
-            if (canDoc && !textFocus && !inSketchNow && st.docMirror.hasDoc() &&
+            bool ecadFocused = false;
+            if (ImGuiContext* g = ImGui::GetCurrentContext()) {
+                for (ImGuiWindow* w = g->NavWindow; w; w = w->ParentWindow)
+                    if (std::strcmp(w->Name, "ECAD") == 0) { ecadFocused = true; break; }
+            }
+            if (canDoc && !textFocus && !inSketchNow && !ecadFocused && st.docMirror.hasDoc() &&
                 (io.KeyCtrl || io.KeySuper)) {
                 if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
                     st.docRedo();
@@ -1404,6 +1473,8 @@ int run_gui(const char* screenshotPath) {
         if (st.ecadAiGo) { st.ecadAiGo = false; ecadAiDesign(st, st.ecadAiRequest); }  // Wave P
         if (st.ecadOpsGo) { st.ecadOpsGo = false; ecadApplyOps(st, st.ecadPendingOps); }  // Wave Q
         if (st.ecadSimGo) { st.ecadSimGo = false; ecadSimulate(st); }  // native simulator
+        if (st.ecadUndoGo) { st.ecadUndoGo = false; ecadUndo(st); }  // ECAD history undo
+        if (st.ecadRedoGo) { st.ecadRedoGo = false; ecadRedo(st); }  // ECAD history redo
 
         // ---------- C19: simulation panel + evaluate dialogs ----------
         simPanel.tick(st);          // drain SimClient progress + completion (loads overlays)

@@ -286,6 +286,8 @@ struct AppState {
     nlohmann::json ecadSimResults;          // results object from the last ecad_simulate ({op,tran,ac,log})
     bool        ecadSimGo = false;          // one-shot: run ecadSimulate(st) this frame
     int         ecadSimAnalysis = 0;        // 0 = Transient, 1 = AC
+    bool        ecadUndoGo = false;         // one-shot: run ecadUndo(st) this frame (ecad_undo RPC)
+    bool        ecadRedoGo = false;         // one-shot: run ecadRedo(st) this frame (ecad_redo RPC)
 
     // ---- topology picking (C15) — id pass + overlays owned by run_gui; AppState borrows ----
     render::IdPass* idPass = nullptr;

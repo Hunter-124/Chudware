@@ -67,5 +67,26 @@ inline float dockLeftMin()     { return px(180.0f); }
 inline float dockRightTarget() { return px(300.0f); }
 inline float dockRightMin()    { return px(200.0f); }
 
+// ---- overlay pills / chips (viewport HUD, sketch overlays, legend, view_selector tooltips) ------
+// Recurring pattern: a rounded translucent rect with a text label. See docs/GUI_SIZING_FIXPLAN.md.
+inline float chipRound()   { return rounding(6.0f); }   // standard overlay pill corner
+inline float chipRoundSm() { return rounding(4.0f); }
+inline float chipPadX()    { return px(12.0f); }        // pill horizontal text inset
+inline float chipPadY()    { return px(5.0f); }         // pill vertical text inset
+
+// ---- assembly panel forms (asm_panels.cpp) ----------------------------------------------------
+inline float asmBtnW()         { return px(90.0f); }    // Add/Close/Insert/Collapse buttons
+inline float asmInputW()       { return px(120.0f); }   // mate / pattern numeric fields
+inline float asmHeaderIconGap(){ return px(6.0f); }     // SameLine gap after a panel header icon
+
+// ---- ribbon chrome (widgets/ribbon.cpp) -------------------------------------------------------
+inline float ribbonBtnRound()    { return rounding(3.0f); }  // button + tab fill corner
+inline float ribbonSplitInset()  { return px(4.0f); }        // big-button split divider inset
+inline float ribbonSmSplitInset(){ return px(2.0f); }        // small-button + tab underline inset
+
+// ---- sketch canvas glyphs (sketch_mode.cpp, screen-px draw-list art) --------------------------
+inline float sketchHandleR()    { return px(3.0f); }    // entity endpoint / handle dot radius
+inline float sketchHoverRingR() { return px(6.0f); }    // hover highlight ring radius
+
 }  // namespace metrics
 }  // namespace ui

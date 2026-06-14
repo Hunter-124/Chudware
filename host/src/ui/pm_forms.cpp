@@ -64,6 +64,12 @@ static PMFieldDef Int(const char* key, const char* label, const char* group, dou
     PMFieldDef f; f.kind = PMFieldKind::Int; f.key = key; f.label = label;
     f.group = group; f.dimDefault = def; f.unitLabel = ""; return f;
 }
+// Free-form text param (e.g. pattern instances-to-skip "2:1, 3:0"). Emitted only when non-empty.
+static PMFieldDef Text(const char* key, const char* label, const char* group,
+                       const char* placeholder = nullptr) {
+    PMFieldDef f; f.kind = PMFieldKind::Text; f.key = key; f.label = label;
+    f.group = group; f.placeholder = placeholder; return f;
+}
 // Unitless Dim (real-valued, no "[mm]" suffix) — e.g. sheet-metal k-factor in 0..1.
 static PMFieldDef DimU(const char* key, const char* label, const char* group, double def) {
     PMFieldDef f = Dim(key, label, group, def); f.unitLabel = ""; return f;
@@ -342,6 +348,8 @@ static const std::vector<PMFormDef>& forms() {
             Int      ("count2",   "Instances",    "Direction 2", 1),
             Dim      ("spacing2", "Spacing",      "Direction 2", 20.0),
             FeatWell ("features", "Features to Pattern", "Features to Pattern"),
+            Text     ("skip",     "Instances to skip", "Instances to Skip",
+                      "grid cells i:j or indices, e.g. 2:1, 3:0"),
         }},
         // --- circular_pattern ---  axis + count/angle + equal_spacing, features[]
         //   Engine (pattern.py compile_circular_pattern): count instances about the axis; equal
@@ -354,6 +362,8 @@ static const std::vector<PMFormDef>& forms() {
             Angle    ("angle",    "Angle",        "Parameters", 360.0),
             Check    ("equal_spacing", "Equal spacing", "Parameters", true),
             FeatWell ("features", "Features to Pattern", "Features to Pattern"),
+            Text     ("skip",     "Instances to skip", "Instances to Skip",
+                      "ring indices (0=seed), e.g. 1, 3, 5"),
         }},
         // --- draft ---  angle + neutral plane + faces[]
         //   Engine (draft.py): tapers each selected face about the line where it meets the neutral

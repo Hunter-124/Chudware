@@ -39,7 +39,7 @@ namespace ui {
 //              "axis.x"/"plane.right") — for _SEL_OR_DATUM ref slots (pattern direction, mirror
 //              plane, draft neutral). FeatureWell  a list of feature ids (refs _FEAT_LIST) seeded
 //              from the FeatureManager selection — the features a pattern/mirror replicates.
-enum class PMFieldKind { Dim, SelectorWell, Combo, Check, Int, DatumRef, FeatureWell };
+enum class PMFieldKind { Dim, SelectorWell, Combo, Check, Int, DatumRef, FeatureWell, Text };
 
 // Which topology kinds a SelectorWell accepts (mirrors feature_params sel(kinds…)).
 struct PMSelKinds {
@@ -64,6 +64,9 @@ struct PMFieldDef {
     // Combo
     const char* comboOptions = nullptr;  // "boss|cut" — param values emitted to engine (first = default)
     const char* comboLabels  = nullptr;  // "Boss|Cut" — display labels; null = use comboOptions
+
+    // Text (free-form string param, e.g. pattern instances-to-skip "2:1, 3:0")
+    const char* placeholder = nullptr;   // greyed hint shown when the field is empty
 
     // Check
     bool checkDefault = false;
@@ -126,6 +129,9 @@ struct PMField {
 
     // Int (pattern counts)
     int intValue = 1;
+
+    // Text (free-form string param)
+    std::vector<char> textBuf{std::vector<char>(128, 0)};
 };
 
 // Parse a dim string to canonical units (mm; degrees when angle=true). Accepts SolidWorks-style

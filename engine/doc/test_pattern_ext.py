@@ -139,6 +139,29 @@ def test_linear_pattern_skip_one_grid_cell() -> None:
         f"skip should leave exactly one extra cylinder of material: {vol - vol_full:.1f} vs {_cyl(H):.1f}"
 
 
+def test_linear_pattern_skip_string_form() -> None:
+    """The PM form emits skip as a text string ("i:j" tokens); it must parse to the same cells as
+    the list form. Skipping "2:1" on a 3×2 grid → 4 placed / 1 skipped, identical to [[2,1]]."""
+    H = 20.0
+    base = _box("f1", 60.0, 40.0, H)
+    hole = _hole("f2", H, [[-15.0, -7.0]])
+    pat = _feat("f3", "linear_pattern", {
+        "count1": 3, "spacing1": _dim(15.0),
+        "count2": 2, "spacing2": _dim(14.0),
+        "skip": "2:1",  # string form (text field) — same cell as [[2, 1]]
+    }, refs={"dir1": "axis.x", "dir2": "axis.y", "features": ["f2"]})
+    doc = _doc([base, hole, pat])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f3")
+    assert s["ok"], f"string skip failed: {s.get('error')}"
+    assert abs(s["resolved"].get("_instances_placed", -1) - 4.0) < 1e-9, \
+        f"string skip '2:1' should place 4; got {s['resolved'].get('_instances_placed')}"
+    assert abs(s["resolved"].get("_instances_skipped", -1) - 1.0) < 1e-9, \
+        f"string skip '2:1' should skip 1; got {s['resolved'].get('_instances_skipped')}"
+    print("[pattern] linear skip string '2:1' == list [[2,1]] (4 placed, 1 skipped)")
+
+
 # --------------------------------------------------------------------------- 2: linear skip (1-D index)
 
 def test_linear_pattern_skip_bare_index_row() -> None:

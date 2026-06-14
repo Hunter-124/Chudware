@@ -49,6 +49,7 @@ output is byte-identical to the original behaviour when none are set:
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
 from build123d import Axis, Plane, Vector
@@ -203,10 +204,25 @@ def _parse_linear_skip(raw: Any) -> set[tuple[int, int]]:
     """Parse ``params.skip`` into a set of (i, j) grid cells to omit.
 
     Accepts a list whose items are either ``[i, j]`` pairs or bare linear indices ``i`` (→
-    ``(i, 0)``). Non-list / malformed input → empty set (no skips), so a bad value degrades to the
-    original full grid rather than raising.
+    ``(i, 0)``), OR a string the PM form's text field emits — comma/space-separated tokens, each
+    ``i:j`` (grid cell) or bare ``i`` (e.g. ``"1:1, 2:0, 4"``). Non-list / malformed input → empty
+    set (no skips), so a bad value degrades to the original full grid rather than raising.
     """
     cells: set[tuple[int, int]] = set()
+    if isinstance(raw, str):
+        parsed: list[Any] = []
+        for tok in re.split(r"[,\s]+", raw.strip()):
+            if not tok:
+                continue
+            if ":" in tok:
+                a, _, b = tok.partition(":")
+                parsed.append([a, b])       # list branch below float()s the strings
+            else:
+                try:
+                    parsed.append(float(tok))  # bare index → number (int/float branch handles it)
+                except ValueError:
+                    continue
+        raw = parsed
     if not isinstance(raw, (list, tuple)):
         return cells
     for item in raw:
@@ -221,13 +237,23 @@ def _parse_linear_skip(raw: Any) -> set[tuple[int, int]]:
 
 
 def _parse_circular_skip(raw: Any) -> set[int]:
-    """Parse ``params.skip`` into a set of ring instance indices (0-based, 0 = seed) to omit."""
+    """Parse ``params.skip`` into a set of ring instance indices (0-based, 0 = seed) to omit.
+
+    Accepts a list of indices OR a comma/space-separated string (the PM form's text field), e.g.
+    ``"1, 3, 5"``. Malformed input degrades to the empty set."""
     out: set[int] = set()
+    if isinstance(raw, str):
+        raw = [t for t in re.split(r"[,\s]+", raw.strip()) if t]
     if not isinstance(raw, (list, tuple)):
         return out
     for item in raw:
         if isinstance(item, (list, tuple)) and item:
             item = item[0]
+        if isinstance(item, str):
+            try:
+                item = float(item)
+            except ValueError:
+                continue
         if isinstance(item, (int, float)) and not isinstance(item, bool):
             out.add(int(round(float(item))))
     return out

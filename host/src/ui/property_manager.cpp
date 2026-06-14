@@ -335,6 +335,7 @@ static void initField(PMField& f, const PMFieldDef& d, bool ips) {
         case PMFieldKind::DatumRef: f.comboIndex = 0; break;
         case PMFieldKind::Check:   f.checkValue = d.checkDefault; break;
         case PMFieldKind::Int:     f.intValue = (int)(d.dimDefault + 0.5); break;
+        case PMFieldKind::Text:    f.textBuf.assign(128, 0); break;
         case PMFieldKind::SelectorWell:
         case PMFieldKind::FeatureWell: f.picks.clear(); f.wellActive = false; break;
     }
@@ -1011,6 +1012,13 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
             case PMFieldKind::Int:
                 params[key] = f.intValue;
                 break;
+            case PMFieldKind::Text: {
+                // Emit a free-form string param only when the user typed something (an empty skip
+                // field must NOT emit params.skip — the engine then patterns the full grid).
+                std::string txt = f.textBuf.data();
+                if (!txt.empty()) params[key] = txt;
+                break;
+            }
             case PMFieldKind::DatumRef: {
                 // The chosen combo OPTION value is a datum string ("axis.x"/"plane.right") emitted
                 // straight into refs (a _SEL_OR_DATUM slot accepts reserved datum strings).
@@ -1757,6 +1765,17 @@ void PropertyManager::drawBody(AppState& st) {
                         if (v < 1) v = 1;
                         f.intValue = v; dirty_ = true; lastEditTime_ = ImGui::GetTime();
                     }
+                }
+                break;
+            }
+            case PMFieldKind::Text: {
+                pushTextColor(pal.textDim);
+                ImGui::TextUnformatted(f.def->label);
+                ImGui::PopStyleColor();
+                ImGui::SetNextItemWidth(-1);
+                const char* hint = f.def->placeholder ? f.def->placeholder : "";
+                if (ImGui::InputTextWithHint("##text", hint, f.textBuf.data(), f.textBuf.size())) {
+                    if (enabled) { dirty_ = true; lastEditTime_ = ImGui::GetTime(); }
                 }
                 break;
             }

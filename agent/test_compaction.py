@@ -64,6 +64,7 @@ def test_compaction_helpers() -> None:
 class _OverflowThenOK(Provider):
     """Raises a context-overflow error until the (proxy) payload fits the budget."""
     name = "overflow-mock"
+    offline_safe = True  # in-process test double; makes no network calls
 
     def __init__(self, replies, budget, image_cost=8000):
         self._replies = replies

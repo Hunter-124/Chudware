@@ -3,6 +3,11 @@
 > Policy: the default distribution stays GPL-clean except where isolated below. Re-audit at every
 > wheelhouse rebuild (M10 gate). Today's posture: personal/local tool; revisit before any
 > commercial distribution.
+>
+> **Owner sign-off (2026-06-13):** clean-room / GPL-clean posture CONFIRMED. KiCad source is never
+> copied or reworded-then-disguised — features are reimplemented clean-room from documented behavior
+> and file formats only. ngspice is permitted as an optional, unmodified, subprocess-only backend
+> (mere aggregation — does not impose GPL on our code); the native MNA simulator remains primary.
 
 | dependency | license | role | posture |
 |---|---|---|---|

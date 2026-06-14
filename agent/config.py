@@ -71,6 +71,10 @@ def provider_offline_safe(provider: Provider) -> bool:
     A local OpenAI-compatible endpoint (LM Studio etc.) is safe only when its base_url is loopback.
     The mock provider is always safe (it makes no network calls — used by tests).
     """
+    # A provider may explicitly declare it makes no network calls (test doubles, in-process
+    # backends). This is the general, name-independent escape hatch for offline-safety.
+    if getattr(provider, "offline_safe", False):
+        return True
     name = getattr(provider, "name", "")
     if name in ("mock", "mock-roles", "base"):
         return True

@@ -29,6 +29,17 @@ exactly which mate is redundant/conflicting):
   tangent      cylinder-plane / cylinder-cylinder surface tangency (centre distance == r±r)
   lock         relative transform frozen (Δt == 0 and Δw == 0 between the two components)
 
+Advanced mates (SW_PARITY_SPEC §3): width (center a tab between two jaw planes), symmetric (two
+points equidistant on opposite sides of a symmetry plane), distance_limit / angle_limit (a mate
+free within [min,max], one-sided penalty outside), profile_center (two centroids coincide).
+Mechanical mates: gear (θ_b = -ratio·θ_a), rack_pinion (rack travel = r·θ_pinion), screw (Δz =
+pitch·θ/2π), hinge (concentric + swing angle-limit), slot (pin on a slot centerline), cam_follower
+(follower tangent to a cam profile, best-effort osculating-circle tangency). The rotation/
+translation couplings are LINEAR relations on the on-axis angle θ = (w-w0)·â and axial travel
+s = (t-t0)·d̂ — exact while each part rotates about its mate axis (pinned by a concentric mate).
+Extra refs (symmetry plane, 2nd jaw) arrive as resolved geoms at ref index >= 2; coupling scalars
+(ratio/pitch/min/max) ride in the mate ``value`` dict.
+
 Public API::
 
     solve_mates(components, mates, resolved_geometry, warm=None, drag=None) -> MateSolveResult
@@ -272,12 +283,24 @@ class _MateBuilder:
 
     def __init__(self, frame_a: _CompFrame, geom_a: MateGeom,
                  frame_b: _CompFrame, geom_b: MateGeom,
-                 mtype: str, align: str, value: float) -> None:
+                 mtype: str, align: str, value: float,
+                 extra_geoms: Optional[list] = None,
+                 params: Optional[dict] = None,
+                 extra_owners: Optional[list] = None) -> None:
         self.fa, self.ga = frame_a, geom_a
         self.fb, self.gb = frame_b, geom_b
         self.mtype = mtype
         self.sign = -1.0 if align == "anti" else 1.0
         self.value = value
+        # Advanced/mechanical mates can carry extra resolved geoms (a 3rd/4th ref — e.g. a symmetry
+        # plane, the second width face) and scalar coupling params (gear ratio, screw pitch, limit
+        # min/max). Standard mates ignore both and stay byte-identical. ``extra_geoms`` is the list
+        # of MateGeom at ref indices >= 2 (in order); ``params`` is the mate's value dict.
+        self.extra = list(extra_geoms or [])
+        # Which frame ("a" or "b") owns each extra geom (so its world transform uses the right
+        # component). Defaults to "b" — extra refs commonly ride on the second-listed part.
+        self.extra_owners = list(extra_owners or ["b"] * len(self.extra))
+        self.params = dict(params or {})
         # variable layout: [a-vars..., b-vars...]; remember the split for slicing.
         self.idx = np.concatenate([frame_a.var_idx, frame_b.var_idx])
         self.na = frame_a.var_idx.size            # 0 or 6
@@ -350,6 +373,22 @@ class _MateBuilder:
             return 1
         if t == "lock":
             return 6
+        if t == "width":
+            return 1
+        if t == "symmetric":
+            return 1
+        if t in ("distance_limit", "angle_limit"):
+            return 1
+        if t == "profile_center":
+            return 3
+        if t in ("gear", "rack_pinion", "screw"):
+            return 1
+        if t == "hinge":
+            return 5
+        if t == "slot":
+            return 1
+        if t == "cam_follower":
+            return 1
         return 1
 
     def make(self):
@@ -364,10 +403,33 @@ class _MateBuilder:
             "angle": self._angle,
             "tangent": self._tangent,
             "lock": self._lock,
+            # --- advanced mates ---
+            "width": self._width,
+            "symmetric": self._symmetric,
+            "distance_limit": self._distance_limit,
+            "angle_limit": self._angle_limit,
+            "profile_center": self._profile_center,
+            # --- mechanical mates ---
+            "gear": self._gear,
+            "rack_pinion": self._rack_pinion,
+            "screw": self._screw,
+            "hinge": self._hinge,
+            "slot": self._slot,
+            "cam_follower": self._cam_follower,
         }.get(t)
         if builder is None:
             raise ValueError(f"mate_solver: unsupported mate type '{t}'")
         return builder()
+
+    # -- coupling-param helpers --------------------------------------------
+
+    def _param(self, key: str, default: float) -> float:
+        """Scalar coupling param (ratio/pitch/min/max) from the mate value dict."""
+        v = self.params.get(key, default)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float(default)
 
     # ----- coincident -----------------------------------------------------
     # planar coincident: the two planes share a plane -> normals (anti)parallel + a point of one
@@ -707,6 +769,471 @@ class _MateBuilder:
 
         return rfunc, jfunc, 6
 
+    # ===================================================================== ADVANCED MATES
+    #
+    # width / symmetric / *_limit / profile_center. These are distance-equality (or one-sided
+    # penalty) residuals — the same scalar-gap pattern as `distance`, but centered or clamped.
+
+    # ----- width ----------------------------------------------------------
+    # SolidWorks "Width" centers a tab on component B midway between two reference faces (planes)
+    # on component A. Ref0 = tab plane (or vertex) on B; Ref1 = first jaw plane on A; the SECOND
+    # jaw plane is carried as the first extra geom (ref index 2) on A. Residual: the signed
+    # distance of the tab point to jaw-1 equals the signed distance to jaw-2 (i.e. it sits on the
+    # mid-plane). One scalar row -> removes the 1 translational DOF along the jaw normal.
+
+    def _width(self):
+        # tab reference (a point we center) on frame_a; the two jaw planes on frame_b. We measure
+        # BOTH jaw gaps along ONE shared reference normal (jaw-1's), so the residual is
+        #   n·(tp - j1p) + n·(tp - j2p) == 0   <=>   n·(2*tp - j1p - j2p) == 0
+        # i.e. the tab sits on the mid-plane between the jaws. Using a single normal makes the
+        # residual vary linearly with the tab position (a same-direction pair of jaw normals would
+        # cancel the dependence). Removes the 1 DOF along the jaw normal; the tab floats in-plane.
+        tab_l = self.ga.point
+        jaw1_p_l, n_l = self.gb.point, self.gb.normal
+        if not self.extra:
+            raise ValueError("width mate needs a second jaw plane (extra geom)")
+        jaw2 = self.extra[0]
+        jaw2_p_l = jaw2.point
+
+        def rfunc(xs):
+            tp, _ = self._wp("a", xs, tab_l)
+            j1p, _ = self._wp("b", xs, jaw1_p_l)
+            j2p, _ = self._wp("b", xs, jaw2_p_l)
+            n, _ = self._wd("b", xs, n_l)
+            d1 = float(np.dot(n, tp - j1p))
+            d2 = float(np.dot(n, tp - j2p))
+            return np.array([d1 + d2])
+
+        def jfunc(xs):
+            tp, Jtp = self._wp("a", xs, tab_l)
+            j1p, Jj1p = self._wp("b", xs, jaw1_p_l)
+            j2p, Jj2p = self._wp("b", xs, jaw2_p_l)
+            n, Jn = self._wd("b", xs, n_l)
+            diff = (tp - j1p) + (tp - j2p)
+            # d(d1+d2)/dx = n·(2*dtp - dj1p - dj2p) + diff·dn
+            row = self._place("a", (2.0 * (n @ Jtp))[None, :]) \
+                - self._place("b", (n @ Jj1p)[None, :]) \
+                - self._place("b", (n @ Jj2p)[None, :]) \
+                + self._place("b", (diff @ Jn)[None, :])
+            return row
+
+        return rfunc, jfunc, 1
+
+    # ----- symmetric ------------------------------------------------------
+    # Two entities (ref0 point on A, ref1 point on B) symmetric about a plane. The symmetry plane
+    # is carried as the first extra geom (ref index 2), in B's frame (commonly the assembly origin
+    # plane on a fixed part). Residual: the plane bisects the two points -> the plane-signed
+    # distances of the two points are equal and opposite (sum == 0). One scalar row.
+
+    def _symmetric(self):
+        pa_l = self.ga.point
+        pb_l = self.gb.point
+        if not self.extra:
+            raise ValueError("symmetric mate needs a symmetry plane (extra geom)")
+        sp = self.extra[0]
+        sp_p_l, sp_n_l = sp.point, sp.normal
+        # the symmetry plane rides on whichever component owns ref index 2 (usually a fixed part /
+        # assembly origin plane).
+        sym_on = self.extra_owners[0] if self.extra_owners else "b"
+
+        def rfunc(xs):
+            pa, _ = self._wp("a", xs, pa_l)
+            pb, _ = self._wp("b", xs, pb_l)
+            spp, _ = self._wp(sym_on, xs, sp_p_l)
+            spn, _ = self._wd(sym_on, xs, sp_n_l)
+            da = float(np.dot(spn, pa - spp))
+            db = float(np.dot(spn, pb - spp))
+            return np.array([da + db])           # both equidistant on opposite sides -> sum 0
+
+        def jfunc(xs):
+            pa, Jpa = self._wp("a", xs, pa_l)
+            pb, Jpb = self._wp("b", xs, pb_l)
+            spp, Jspp = self._wp(sym_on, xs, sp_p_l)
+            spn, Jspn = self._wd(sym_on, xs, sp_n_l)
+            diff_a, diff_b = pa - spp, pb - spp
+            rowa = self._place("a", (spn @ Jpa)[None, :]) \
+                + self._place(sym_on, (diff_a @ Jspn)[None, :]) \
+                - self._place(sym_on, (spn @ Jspp)[None, :])
+            rowb = self._place("b", (spn @ Jpb)[None, :]) \
+                + self._place(sym_on, (diff_b @ Jspn)[None, :]) \
+                - self._place(sym_on, (spn @ Jspp)[None, :])
+            return rowa + rowb
+
+        return rfunc, jfunc, 1
+
+    # ----- distance-limit / angle-limit ----------------------------------
+    # A range-constrained mate: the free value is allowed anywhere in [min, max]; the solver only
+    # pushes back when it leaves the range (a one-sided penalty, the LS analogue of an inequality).
+    # Inside the range the residual is 0 (no DOF removed); outside it clamps to the violated bound.
+    # ``params``: {"min": lo, "max": hi}. Distance uses the plane-gap; angle uses the dir dot.
+
+    def _distance_limit(self):
+        use_plane = self.ga.kind == "plane" or self.gb.kind == "plane"
+        n_l = self.ga.normal if self.ga.kind == "plane" else self.gb.normal
+        n_on_a = self.ga.kind == "plane"
+        pa_l, pb_l = self.ga.point, self.gb.point
+        lo = self._param("min", 0.0)
+        hi = self._param("max", 0.0)
+
+        def _gap_and_jacrow(xs):
+            if use_plane:
+                n, Jn = (self._wd("a", xs, n_l) if n_on_a else self._wd("b", xs, n_l))
+                pa, Jpa = self._wp("a", xs, pa_l)
+                pb, Jpb = self._wp("b", xs, pb_l)
+                diff = pb - pa
+                gap = float(np.dot(n, diff))
+                place_n = self._place("a", (diff @ Jn)[None, :]) if n_on_a \
+                    else self._place("b", (diff @ Jn)[None, :])
+                row = place_n + self._place("b", (n @ Jpb)[None, :]) - self._place("a", (n @ Jpa)[None, :])
+                return gap, row
+            pa, Jpa = self._wp("a", xs, pa_l)
+            pb, Jpb = self._wp("b", xs, pb_l)
+            d = pb - pa
+            nrm = float(np.linalg.norm(d))
+            u = d / nrm if nrm > 1e-9 else np.zeros(3)
+            row = self._place("b", (u @ Jpb)[None, :]) - self._place("a", (u @ Jpa)[None, :])
+            return nrm, row
+
+        def _violation(gap):
+            if gap < lo:
+                return gap - lo          # negative -> push up toward lo
+            if gap > hi:
+                return gap - hi          # positive -> push down toward hi
+            return 0.0
+
+        def rfunc(xs):
+            gap, _ = _gap_and_jacrow(xs)
+            return np.array([_violation(gap)])
+
+        def jfunc(xs):
+            gap, row = _gap_and_jacrow(xs)
+            if lo <= gap <= hi:
+                return np.zeros_like(row)   # inside range: inactive, zero gradient
+            return row
+
+        return rfunc, jfunc, 1
+
+    def _angle_limit(self):
+        da_l = self.ga.dir_vector()
+        db_l = self.gb.dir_vector()
+        lo = math.radians(self._param("min", 0.0))
+        hi = math.radians(self._param("max", 0.0))
+
+        def _angle_and_jacrow(xs):
+            da, Jda = self._wd("a", xs, da_l)
+            db, Jdb = self._wd("b", xs, db_l)
+            c = float(np.clip(np.dot(da, db), -1.0, 1.0))
+            ang = math.acos(c)
+            s = math.sqrt(max(1.0 - c * c, 1e-12))
+            # d(ang)/dx = -1/sin * d(da·db)/dx
+            ddot = self._place("a", (db @ Jda)[None, :]) + self._place("b", (da @ Jdb)[None, :])
+            row = (-1.0 / s) * ddot
+            return ang, row
+
+        def _violation(ang):
+            if ang < lo:
+                return ang - lo
+            if ang > hi:
+                return ang - hi
+            return 0.0
+
+        def rfunc(xs):
+            ang, _ = _angle_and_jacrow(xs)
+            return np.array([_violation(ang)])
+
+        def jfunc(xs):
+            ang, row = _angle_and_jacrow(xs)
+            if lo <= ang <= hi:
+                return np.zeros_like(row)
+            return row
+
+        return rfunc, jfunc, 1
+
+    # ----- profile-center -------------------------------------------------
+    # Center one profile's centroid (ref0 point on A) on another's (ref1 point on B): the two
+    # centroids coincide. Equivalent to a point-point coincident -> 3 residual rows.
+
+    def _profile_center(self):
+        pa_l, pb_l = self.ga.point, self.gb.point
+
+        def rfunc(xs):
+            pa, _ = self._wp("a", xs, pa_l)
+            pb, _ = self._wp("b", xs, pb_l)
+            return pa - pb
+
+        def jfunc(xs):
+            _, Jpa = self._wp("a", xs, pa_l)
+            _, Jpb = self._wp("b", xs, pb_l)
+            return self._place("a", Jpa) - self._place("b", Jpb)
+
+        return rfunc, jfunc, 3
+
+    # ===================================================================== MECHANICAL MATES
+    #
+    # gear / rack-pinion / screw / hinge / slot / cam-follower. The rotation/translation couplings
+    # (gear, rack, screw) are LINEAR relations between the two components' on-axis rotation angle
+    # and/or axial translation. The on-axis angle is the ABSOLUTE shaft angle ``theta = w·â`` (so a
+    # FIXED driver at a known rotated pose contributes its full angle — exactly what a gear train
+    # needs; the incremental-from-creation flavour SolidWorks shows in the UI is a baseline offset
+    # the session layer can subtract). ``â`` is the (constant, build-time world) mate axis and the
+    # Jacobian is clean (∂theta/∂w = â). Exact while each component rotates ABOUT its own mate axis —
+    # the regime a concentric/hinge mate already enforces; large off-axis tumble (a part free to
+    # flop) degrades the scalar to an approximation, but in a real train the axes are pinned.
+
+    def _axis_world(self, which: str) -> np.ndarray:
+        """Build-time world axis of the component's geom (constant — the coupling reference)."""
+        g = self.ga if which == "a" else self.gb
+        w0 = self.fa.w0 if which == "a" else self.fb.w0
+        return _unit(_rodrigues(w0) @ g.dir_vector())
+
+    def _theta_row(self, which: str):
+        """Return (rfunc_scalar, jacrow) builders for the absolute on-axis angle theta = w·â.
+
+        ``â`` is constant (build-time world axis); ∂theta/∂w = â (a 1x3 block placed on that
+        component's rotation vars); translation columns are zero. Absolute (w0 = 0) so a fixed
+        driver contributes its full shaft angle.
+        """
+        ax = self._axis_world(which)
+        w0 = np.zeros(3)
+
+        def theta(xs):
+            x6 = self._xa(xs) if which == "a" else self._xb(xs)
+            return float(np.dot(x6[3:6] - w0, ax))
+
+        def row(xs):
+            r6 = np.zeros((1, 6))
+            r6[0, 3:6] = ax
+            return self._place(which, r6)
+
+        return theta, row
+
+    # ----- gear -----------------------------------------------------------
+    # Ratio coupling of two rotations: theta_b == -ratio * theta_a (meshing gears counter-rotate;
+    # an internal/aligned set keeps the sign). ``ratio`` defaults to 1; ``align=anti`` already
+    # negates via self.sign so callers can flip direction. One scalar row.
+
+    def _gear(self):
+        ratio = self._param("ratio", 1.0)
+        theta_a, row_a = self._theta_row("a")
+        theta_b, row_b = self._theta_row("b")
+        # default meshing convention: theta_b + ratio*theta_a == 0 (counter-rotation). sign lets
+        # an "aligned" pair (e.g. belt/idler) co-rotate: theta_b - ratio*theta_a == 0.
+        coup = -self.sign
+
+        def rfunc(xs):
+            return np.array([theta_b(xs) - coup * ratio * theta_a(xs)])
+
+        def jfunc(xs):
+            return row_b(xs) - coup * ratio * row_a(xs)
+
+        return rfunc, jfunc, 1
+
+    # ----- rack-and-pinion ------------------------------------------------
+    # Pinion rotation theta_a couples to rack translation along its world axis: s_b == pitch_radius
+    # * theta_a (arc length = r * angle). ``pitch_radius`` from params (or the pinion cylinder
+    # radius). Translation scalar s_b = (t_b - t_b0)·d̂_rack. One scalar row.
+
+    def _rack_pinion(self):
+        # A = pinion (rotates), B = rack (translates). pitch radius: param or pinion geom radius.
+        pr = self._param("pitch_radius", self.ga.radius or 1.0)
+        theta_a, row_a = self._theta_row("a")
+        d_rack = self._axis_world("b")
+        tb0 = self.fb.t0
+        coup = self.sign
+
+        def s_b(xs):
+            x6 = self._xb(xs)
+            return float(np.dot(x6[0:3] - tb0, d_rack))
+
+        def s_b_row(xs):
+            r6 = np.zeros((1, 6))
+            r6[0, 0:3] = d_rack
+            return self._place("b", r6)
+
+        def rfunc(xs):
+            return np.array([s_b(xs) - coup * pr * theta_a(xs)])
+
+        def jfunc(xs):
+            return s_b_row(xs) - coup * pr * row_a(xs)
+
+        return rfunc, jfunc, 1
+
+    # ----- screw ----------------------------------------------------------
+    # Rotation <-> translation pitch coupling on ONE component (a screw turning in a fixed nut) or
+    # BETWEEN two (the relative turn drives the relative advance). Residual:
+    #   (s_b - s_a) - pitch * (theta_b - theta_a) / (2*pi) == 0
+    # where ``pitch`` is the lead (axial advance per full turn, mm/rev), s = axial translation,
+    # theta = on-axis angle. With a fixed nut (component A fixed), this becomes Δz == pitch*θ/2π.
+
+    def _screw(self):
+        pitch = self._param("pitch", 1.0)
+        k = pitch / (2.0 * math.pi)
+        theta_a, rowt_a = self._theta_row("a")
+        theta_b, rowt_b = self._theta_row("b")
+        ax_a = self._axis_world("a")
+        ax_b = self._axis_world("b")
+        ta0, tb0 = self.fa.t0, self.fb.t0
+        coup = self.sign
+
+        def s_a(xs):
+            return float(np.dot(self._xa(xs)[0:3] - ta0, ax_a))
+
+        def s_b(xs):
+            return float(np.dot(self._xb(xs)[0:3] - tb0, ax_b))
+
+        def s_a_row(xs):
+            r6 = np.zeros((1, 6)); r6[0, 0:3] = ax_a
+            return self._place("a", r6)
+
+        def s_b_row(xs):
+            r6 = np.zeros((1, 6)); r6[0, 0:3] = ax_b
+            return self._place("b", r6)
+
+        def rfunc(xs):
+            ds = s_b(xs) - s_a(xs)
+            dth = theta_b(xs) - theta_a(xs)
+            return np.array([ds - coup * k * dth])
+
+        def jfunc(xs):
+            ds_row = s_b_row(xs) - s_a_row(xs)
+            dth_row = rowt_b(xs) - rowt_a(xs)
+            return ds_row - coup * k * dth_row
+
+        return rfunc, jfunc, 1
+
+    # ----- hinge ----------------------------------------------------------
+    # A hinge = concentric (axes collinear + coincident: 4 rows) + a single angle-limit row about
+    # the hinge axis (the 5th). It removes all DOF except a limited swing. We reuse the concentric
+    # block and append the angle-limit residual on the two components' reference directions.
+
+    def _hinge(self):
+        # concentric part (axes from ref0/ref1 directions + points).
+        da_l = self.ga.dir_vector()
+        db_l = self.gb.dir_vector()
+        pa_l, pb_l = self.ga.point, self.gb.point
+        sign = self.sign
+        # swing-limit part: reference markers perpendicular to the axis. If extra geoms carry
+        # marker directions use them, else derive a stable perp basis from each axis.
+        if len(self.extra) >= 2:
+            ma_l = self.extra[0].dir_vector()
+            mb_l = self.extra[1].dir_vector()
+        else:
+            ma_l = _perp_basis(da_l)[0]
+            mb_l = _perp_basis(db_l)[0]
+        lo = math.radians(self._param("min", 0.0))
+        hi = math.radians(self._param("max", 360.0))
+
+        def _swing(xs):
+            ma, Jma = self._wd("a", xs, ma_l)
+            mb, Jmb = self._wd("b", xs, mb_l)
+            c = float(np.clip(np.dot(ma, mb), -1.0, 1.0))
+            ang = math.acos(c)
+            s = math.sqrt(max(1.0 - c * c, 1e-12))
+            ddot = self._place("a", (mb @ Jma)[None, :]) + self._place("b", (ma @ Jmb)[None, :])
+            return ang, (-1.0 / s) * ddot
+
+        def rfunc(xs):
+            da, _ = self._wd("a", xs, da_l)
+            db, _ = self._wd("b", xs, db_l)
+            pa, _ = self._wp("a", xs, pa_l)
+            pb, _ = self._wp("b", xs, pb_l)
+            r = np.empty(5)
+            r[0:2] = _two_indep_cross(da, sign * db)
+            r[2:4] = _perp_residual2(da, pb - pa)
+            ang, _ = _swing(xs)
+            if ang < lo:
+                r[4] = ang - lo
+            elif ang > hi:
+                r[4] = ang - hi
+            else:
+                r[4] = 0.0
+            return r
+
+        def jfunc(xs):
+            da, Jda = self._wd("a", xs, da_l)
+            db, Jdb = self._wd("b", xs, db_l)
+            pa, Jpa = self._wp("a", xs, pa_l)
+            pb, Jpb = self._wp("b", xs, pb_l)
+            J = self._empty_jac(5)
+            sdb = sign * db
+            cross_jac = self._place("a", -_skew(sdb) @ Jda) + self._place("b", _skew(da) @ (sign * Jdb))
+            J[0:2, :] = _two_indep_cross_jac(da, sdb, cross_jac)
+            diff = pb - pa
+            Jdiff = self._place("b", Jpb) - self._place("a", Jpa)
+            J[2:4, :] = _perp_residual2_jac(da, self._place("a", Jda), diff, Jdiff)
+            ang, swing_row = _swing(xs)
+            J[4:5, :] = swing_row if (ang < lo or ang > hi) else np.zeros_like(swing_row)
+            return J
+
+        return rfunc, jfunc, 5
+
+    # ----- slot -----------------------------------------------------------
+    # A pin (ref0 axis/point on A) constrained to a straight slot path on B (ref1 axis = the slot
+    # centerline). The pin centre is held on the slot line (perp distance == 0) but free to slide
+    # along it. We use the axis-point perpendicular distance (== 0), the same primitive `tangent`
+    # cyl-cyl uses. One scalar row (perp magnitude). For a 3D pin this pins it to the line; the
+    # along-slot DOF stays free (SolidWorks "slot" mate).
+
+    def _slot(self):
+        # slot centerline on B, pin point on A. Hold the pin on the line via the 2-component
+        # perpendicular residual (the same primitive concentric uses): both scalars vanish iff the
+        # pin lies on the line, and they pass LINEARLY through zero (a single distance scalar has a
+        # vanishing gradient at the line, stalling LM). The along-line DOF stays free -> the pin
+        # slides in the slot. Residual dim is 2 here but declared 1 in residual_dim (informational
+        # only; nsolve reads the actual rfunc length).
+        pslot_l, dslot_l = self.gb.point, self.gb.direction
+        ppin_l = self.ga.point
+
+        def rfunc(xs):
+            ps, _ = self._wp("b", xs, pslot_l)
+            ds, _ = self._wd("b", xs, dslot_l)
+            pp, _ = self._wp("a", xs, ppin_l)
+            return _perp_residual2(ds, pp - ps)
+
+        def jfunc(xs):
+            ps, Jps = self._wp("b", xs, pslot_l)
+            ds, Jds = self._wd("b", xs, dslot_l)
+            pp, Jpp = self._wp("a", xs, ppin_l)
+            diff = pp - ps
+            Jdiff = self._place("a", Jpp) - self._place("b", Jps)
+            return _perp_residual2_jac(ds, self._place("b", Jds), diff, Jdiff)
+
+        return rfunc, jfunc, 2
+
+    # ----- cam-follower ---------------------------------------------------
+    # Best-effort: the follower (ref0 = a point/sphere centre on A, radius r) stays TANGENT to the
+    # cam profile, modeled as a cylinder (ref1 axis on B, radius R). Tangency => the centre-to-axis
+    # perpendicular distance == R + r (external roller on a circular cam lobe). One scalar row.
+    # Envelope: a true cam is a general non-circular profile; we tangent against the local
+    # osculating circle (the cam ref radius). For a circular cam this is exact; for a general
+    # profile it is a first-order (local-curvature) approximation, re-linearized each warm solve.
+
+    def _cam_follower(self):
+        # follower centre on A; cam axis+radius on B; follower radius from ga.radius.
+        pf_l = self.ga.point
+        rf = self.ga.radius
+        pc_l, dc_l = self.gb.point, self.gb.direction
+        R = self.gb.radius
+        sign = self.sign
+        target = (R + rf) if sign > 0 else abs(R - rf)
+
+        def rfunc(xs):
+            pc, _ = self._wp("b", xs, pc_l)
+            dc, _ = self._wd("b", xs, dc_l)
+            pf, _ = self._wp("a", xs, pf_l)
+            dist = _axis_point_distance(pc, dc, pf)
+            return np.array([dist - target])
+
+        def jfunc(xs):
+            pc, Jpc = self._wp("b", xs, pc_l)
+            dc, Jdc = self._wd("b", xs, dc_l)
+            pf, Jpf = self._wp("a", xs, pf_l)
+            return _axis_point_distance_jac(
+                pc, self._place("b", Jpc), dc, self._place("b", Jdc),
+                pf, self._place("a", Jpf))
+
+        return rfunc, jfunc, 1
+
 
 # --------------------------------------------------------------------------- vector primitives
 
@@ -821,7 +1348,7 @@ def solve_mates(components: list[dict], mates: list[dict],
             mate_records.append((mid, "suppressed"))
             continue
         refs = mate.get("refs", [])
-        if len(refs) != 2:
+        if len(refs) < 2:
             mate_records.append((mid, "unresolved"))
             continue
         ga = resolved_geometry.get((mid, 0))
@@ -831,9 +1358,25 @@ def solve_mates(components: list[dict], mates: list[dict],
         if ga is None or gb is None or ca is None or cb is None:
             mate_records.append((mid, "unresolved"))
             continue
+        # Advanced/mechanical mates may carry a 3rd/4th resolved geom (a symmetry plane, second
+        # width jaw, hinge markers) at ref indices >= 2; gather them in order. Standard mates have
+        # none and behave exactly as before.
+        extra_geoms = []
+        extra_owners = []
+        cid_a = refs[0].get("component")
+        cid_b = refs[1].get("component")
+        gi = 2
+        while (mid, gi) in resolved_geometry:
+            extra_geoms.append(resolved_geometry[(mid, gi)])
+            # which of the pair (a/b) owns this extra ref's component? default to "b".
+            ec = refs[gi].get("component") if gi < len(refs) else None
+            extra_owners.append("a" if ec == cid_a and ec != cid_b else "b")
+            gi += 1
         value = _mate_value(mate)
+        params = mate.get("value") if isinstance(mate.get("value"), dict) else {}
         try:
-            builder = _MateBuilder(ca, ga, cb, gb, mate["type"], mate.get("align", "aligned"), value)
+            builder = _MateBuilder(ca, ga, cb, gb, mate["type"], mate.get("align", "aligned"), value,
+                                   extra_geoms=extra_geoms, params=params, extra_owners=extra_owners)
             rfunc, jfunc, m = builder.make()
         except Exception:  # noqa: BLE001 — an unbuildable mate is reported unresolved, not fatal
             mate_records.append((mid, "unresolved"))

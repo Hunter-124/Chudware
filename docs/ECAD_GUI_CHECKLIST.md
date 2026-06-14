@@ -67,8 +67,10 @@ the **PCB** ribbon tab to start. The ECAD editor is docked as a tab next to the 
 - [ ] Toggle the left **Layers** (board) / **Nets** (schematic) panel via the header checkbox.
 - [ ] The bottom **ERC** / **DRC** tab lists violations with messages; ratsnest airwires show unrouted
       nets on the board.
+- [ ] Click a violation row that has a location — the canvas pans + zooms to it and flashes a
+      crosshair marker (hover shows "Click to zoom to (x, y)").
 
 ---
 Headless equivalents (for scripted verification): `AI_CAD_SHOT=ecad` with `AI_CAD_ECAD_KIND=` one of
-`ai, sch, pcb, 3d, editsch, select, del, sim, undo, aiboard, rotate, aiboard3d, saveopen`
+`ai, sch, pcb, 3d, editsch, select, del, sim, undo, aiboard, rotate, aiboard3d, saveopen, violzoom`
 (+ `AI_CAD_THEME=dark|light`), run as `AI-CAD.exe --ui-screenshot out.png`.

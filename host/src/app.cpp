@@ -1306,6 +1306,7 @@ int run_gui(const char* screenshotPath) {
             const bool wantAiBoard3d = kindEnv && std::strcmp(kindEnv, "aiboard3d") == 0; // Wave X chain
             const bool wantRotate  = kindEnv && std::strcmp(kindEnv, "rotate") == 0;  // Wave W rotate
             const bool wantSaveOpen = kindEnv && std::strcmp(kindEnv, "saveopen") == 0; // Wave Y roundtrip
+            const bool wantViolZoom = kindEnv && std::strcmp(kindEnv, "violzoom") == 0; // Wave Z zoom-to-ERC
             nlohmann::json r;
             std::string showId;
             if (wantAiBoard || wantAiBoard3d) {
@@ -1328,9 +1329,10 @@ int run_gui(const char* screenshotPath) {
                 std::fflush(stdout);
             } else if (wantAi) {
                 st.wantFocusEcad = 6;   // surface the empty AI launchpad for the screenshot
-            } else if (wantEdit || wantSelect || wantDel || wantRotate) {
+            } else if (wantEdit || wantSelect || wantDel || wantRotate || wantViolZoom) {
                 // Exercise the Place/Route tools by applying the ops a user's clicks would produce.
-                // select/del/rotate reuse this schematic batch then drive selection/delete/rotate.
+                // select/del/rotate/violzoom reuse this schematic batch (it has unconnected pins ->
+                // ERC violations with locations) then drive selection/delete/rotate/zoom-to-violation.
                 if (ecall("ecad_new", {{"kind", "sch"}}, r)) {
                     const std::string id = jstr(r, "doc_id");
                     const int rev = jint(r, "revision");
@@ -1469,6 +1471,13 @@ int run_gui(const char* screenshotPath) {
                 if (wantDel)
                     std::printf("[ecad-shot] after delete: %d symbols\n",
                                 (int)ui::ecadEditorMirror().symbols().size());
+                if (wantViolZoom) {
+                    // Zoom-to-violation: pan/zoom the canvas to the first located ERC violation and
+                    // flash the marker — exactly what clicking a violation row does.
+                    const bool ok = ui::ecadEditorFocusFirstViolation();
+                    st.wantFocusEcad = 6;
+                    std::printf("[ecad-shot] violzoom: focused first located violation = %d\n", (int)ok);
+                }
                 if (wantUndo) {
                     // Undo the capacitor batch (the 2nd, most-recent history step). Confirm via the
                     // editor mirror that the symbol count dropped by one (2 -> 1).

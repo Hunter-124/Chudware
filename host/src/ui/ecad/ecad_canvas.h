@@ -50,6 +50,10 @@ public:
     void zoomToFit(const EcadMirror& doc, const ImVec2& avail);
     void requestFit() { wantFit_ = true; }  // defer a fit to the next draw (mirror may be empty now)
 
+    // Center the view on a world point (mm), ensure a readable zoom, and flash a pulsing marker there
+    // for a couple seconds. Used by "zoom to ERC/DRC violation" (clicking a violation row).
+    void focusOn(const EcadPt& w);
+
     // Camera accessors (mm/px).
     float zoom() const { return pxPerMm_; }
 
@@ -82,6 +86,8 @@ private:
     bool   inited_ = false;
     std::string selected_;         // "<kind>:<id>" of the highlighted entity ("" = none)
     float  dragDx_ = 0.0f, dragDy_ = 0.0f;  // live drag-move offset (world mm) for selected sym/fp
+    EcadPt focusLoc_{0, 0};        // "zoom to violation" marker location (world mm)
+    int    focusFrames_ = 0;       // frames the marker remains (counts down each draw; 0 = hidden)
 };
 
 }  // namespace ui

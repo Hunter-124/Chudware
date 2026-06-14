@@ -110,6 +110,10 @@ Build: `cmake -S host -B host/build -G "Visual Studio 17 2022" -A x64 && cmake -
   `TypeError: Object of type bytes is not JSON serializable` when the worker emitted the ecad_open
   response — now base64-encoded in `_extra_entries` (decoded on save). Verified `AI_CAD_ECAD_KIND=
   saveopen` (design → save .ecad+ → reopen; symbols 3→3 round-trip, response JSON-clean).
+- **Zoom to violation (Z):** clicking an ERC/DRC row in the results strip pans + zooms the canvas to
+  the violation's location and flashes a pulsing crosshair marker there (`EcadCanvas::focusOn`). Rows
+  with a location show a "Click to zoom to (x, y)" tooltip. Verified `AI_CAD_ECAD_KIND=violzoom`
+  (marker lands on the unconnected pin of a floating-net ERC error).
 
 **GUI follow-ups (not blocking):** full PropertyManager forms for the remaining ECAD op fields
 (footprint reassignment / DNP / sim-params — Ref/Value + rotate/flip are DONE); move the editor
@@ -119,8 +123,8 @@ mirror onto AppState for multi-doc.
 
 1. **GUI editor polish** — place/route/select/delete/move + AI launchpad + PCB→3D bridge +
    simulation plot (transient & AC) + undo/redo + one-click AI→routed board + Ref/Value property
-   inspector + rotate/flip + native Save/Open are DONE (Waves N–Y); remaining: PM forms for footprint
-   reassignment + per-field DNP/sim-params, multi-doc.
+   inspector + rotate/flip + native Save/Open + zoom-to-violation are DONE (Waves N–Z); remaining:
+   PM forms for footprint reassignment + per-field DNP/sim-params, multi-doc.
 2. **Full bus routing** (electrical): member labels already net correctly (KiCad's bus is largely a
    drawing convenience over labels); explicit bus-wire + bus-entry tap objects are a follow-up.
 3. **Advanced routing**: push-and-shove (router is eviction-based rip-up + maze, not negotiated-

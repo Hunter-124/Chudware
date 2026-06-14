@@ -609,8 +609,8 @@ void drawResultsStrip(AppState& st, EcadEditorState& es) {
         const EcadViolation& v = list[i];
         const ImVec4 c = (v.severity == "error") ? v4(pal.statusErr) : v4(pal.statusWarn);
         // One full-width selectable carrying the whole row; tint the text by the severity. Clicking
-        // logs (the scaffold). The permanent hook is a viewport "zoom to violation" using v.loc
-        // (guide §(e)). A unique ##id keeps ImGui ids stable across frames.
+        // a located violation pans + zooms the canvas to v.loc and flashes a marker there ("zoom to
+        // violation"). A unique ##id keeps ImGui ids stable across frames.
         char label[256];
         std::snprintf(label, sizeof(label), "[%s] %s%s%s##viol%zu",
                       v.severity.c_str(), v.rule.c_str(),
@@ -618,12 +618,16 @@ void drawResultsStrip(AppState& st, EcadEditorState& es) {
         ImGui::PushStyleColor(ImGuiCol_Text, c);
         const bool clicked = ImGui::Selectable(label);
         ImGui::PopStyleColor();
+        if (v.hasLoc && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Click to zoom to (%.2f, %.2f) mm", v.loc.x, v.loc.y);
         if (clicked) {
-            if (v.hasLoc)
-                st.addLog("[..] ECAD " + v.rule + " @ (" +
+            if (v.hasLoc) {
+                es.canvas.focusOn(v.loc);   // pan + zoom + flash the marker
+                st.addLog("[ecad] zoom to " + v.rule + " @ (" +
                           std::to_string(v.loc.x) + ", " + std::to_string(v.loc.y) + ")");
-            else
-                st.addLog("[..] ECAD " + v.rule);
+            } else {
+                st.addLog("[ecad] " + v.rule + " (no location)");
+            }
         }
     }
     if (list.empty())
@@ -638,6 +642,14 @@ void drawResultsStrip(AppState& st, EcadEditorState& es) {
 EcadMirror& ecadEditorMirror() { return state().mirror; }
 
 void ecadEditorSelect(const std::string& sel) { state().selected = sel; }
+
+bool ecadEditorFocusFirstViolation() {
+    EcadEditorState& es = state();
+    const auto& list = es.mirror.isSch() ? es.mirror.erc() : es.mirror.drc();
+    for (const auto& v : list)
+        if (v.hasLoc) { es.canvas.focusOn(v.loc); return true; }
+    return false;
+}
 
 void ecadEditorLoadResponse(const nlohmann::json& resp) {
     EcadEditorState& es = state();

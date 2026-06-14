@@ -51,4 +51,9 @@ void ecadEditorLoadResponse(const nlohmann::json& resp);
 // canvas haloes the matching symbol/footprint/wire/track on the next draw. (Select tool only.)
 void ecadEditorSelect(const std::string& sel);
 
+// Pan + zoom the canvas to the first ERC/DRC violation that has a location and flash a marker there
+// (what clicking a located violation row does). Returns false if no located violation exists. Lets a
+// headless shot exercise "zoom to violation" without a mouse.
+bool ecadEditorFocusFirstViolation();
+
 }  // namespace ui

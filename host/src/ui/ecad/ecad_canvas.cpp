@@ -116,6 +116,15 @@ void EcadCanvas::zoomToFit(const EcadMirror& doc, const ImVec2& avail) {
     inited_ = true;
 }
 
+void EcadCanvas::focusOn(const EcadPt& w) {
+    pan_ = w;                                  // pan so the point sits at the canvas centre
+    if (pxPerMm_ < 14.0f) pxPerMm_ = 14.0f;    // zoom in to a readable level if currently far out
+    wantFit_ = false;                          // don't let a pending fit clobber the pan
+    inited_ = true;
+    focusLoc_ = w;
+    focusFrames_ = 180;                         // flash the marker for ~3s of frames
+}
+
 void EcadCanvas::handleNavigation(const EcadCanvasIO& io, const ImVec2& avail) {
     if (!io.hovered) return;
     ImGuiIO& gio = ImGui::GetIO();
@@ -498,6 +507,19 @@ EcadCanvasIO EcadCanvas::draw(const EcadMirror& doc, const ImVec2& avail) {
     drawGrid(avail);
     if (doc.isSch())      drawSch(doc);
     else if (doc.isPcb()) drawPcb(doc);
+
+    // "Zoom to violation" marker: a pulsing crosshair-ring at focusLoc_ for a few seconds after a
+    // violation row is clicked, so the eye lands on the exact reported location.
+    if (focusFrames_ > 0) {
+        const ImVec2 s = toScreen(focusLoc_);
+        const float phase = static_cast<float>(180 - focusFrames_);
+        const float r = 11.0f + 5.0f * std::sin(phase * 0.18f);  // px, gentle pulse
+        const ImU32 c = col(ui::palette.statusErr, 0.95f);
+        dl_->AddCircle(s, r, c, 28, 2.5f);
+        dl_->AddLine(ImVec2(s.x - r - 5, s.y), ImVec2(s.x + r + 5, s.y), c, 1.5f);
+        dl_->AddLine(ImVec2(s.x, s.y - r - 5), ImVec2(s.x, s.y + r + 5), c, 1.5f);
+        focusFrames_--;
+    }
 
     dl_->PopClipRect();
     dl_ = nullptr;

@@ -72,11 +72,13 @@ static PMFieldDef DimU(const char* key, const char* label, const char* group, do
 static PMFieldDef Angle(const char* key, const char* label, const char* group, double def) {
     PMFieldDef f = Dim(key, label, group, def); f.unitLabel = " [deg]"; return f;
 }
-// Angle dim enabled only when a sibling Combo (named enableKey) holds one of enableVals.
+// Angle dim enabled only when a sibling field (named enableKey) holds one of enableVals.
+// omit=true drops the param entirely while disabled (so it can't drive an engine code path —
+// e.g. a stale chamfer angle must NOT force the distance-angle path on a symmetric chamfer).
 static PMFieldDef AngleIf(const char* key, const char* label, const char* group, double def,
-                          const char* enableKey, const char* enableVals) {
+                          const char* enableKey, const char* enableVals, bool omit = false) {
     PMFieldDef f = Angle(key, label, group, def);
-    f.enableKey = enableKey; f.enableVals = enableVals; return f;
+    f.enableKey = enableKey; f.enableVals = enableVals; f.omitWhenDisabled = omit; return f;
 }
 // A datum-reference combo whose chosen value is emitted as a refs string ("axis.x"/"plane.right").
 // For _SEL_OR_DATUM slots (pattern direction, mirror plane, draft neutral plane).
@@ -206,32 +208,48 @@ static const std::vector<PMFormDef>& forms() {
         //   "Middle Face" face well; the type combo also emits params.full_round=true (the engine
         //   reads params.full_round + refs.middle_face, ignoring edges/radius on that path).
         //   tangent_prop remains disabled "(coming soon)" for discoverability.
+        //   Face fillet (type=="face"): a rolling-ball blend between two face sets
+        //   (refs.face_set_a / face_set_b); the engine dispatches on type=="face". Tangent
+        //   propagation (params.tangent_propagation) auto-includes G1-continuous edges.
         { "fillet", "Fillet", "fillet", {
             WellIf    ("edges",      "Edges",              "Items to Fillet",    K_EDGE, true,
                        "type", "constant|variable"),
             WellIf    ("middle_face","Middle Face",        "Items to Fillet",    K_FACE, false,
                        "type", "full_round"),
+            WellIf    ("face_set_a", "Face Set 1",         "Items to Fillet",    K_FACE, true,
+                       "type", "face"),
+            WellIf    ("face_set_b", "Face Set 2",         "Items to Fillet",    K_FACE, true,
+                       "type", "face"),
             ComboL    ("type",       "Fillet Type",        "Fillet Parameters",
-                       "constant|variable|full_round",
-                       "Constant Size|Variable Size|Full Round"),
+                       "constant|variable|full_round|face",
+                       "Constant Size|Variable Size|Full Round|Face Fillet"),
             DimIf     ("radius",     "Radius",             "Fillet Parameters",  2.0,
-                       "type", "constant|variable"),
+                       "type", "constant|variable|face"),
             DimIf     ("radius2",    "End Radius",         "Fillet Parameters",  2.0,
                        "type", "variable"),
-            CheckSoon ("tangent_prop","Tangent propagation (coming soon)", "Fillet Parameters"),
+            Check     ("tangent_propagation","Tangent propagation","Fillet Parameters", false),
         }},
-        // --- chamfer ---  length / [length2] ; edges[]
-        //   C27-C: asymmetric chamfer. A Combo "kind" (symmetric|asymmetric) gates length2 via
-        //   the existing DimIf/enableKey mechanism — the only gating plumbing in this form system.
-        //   (Check has no gating constructor; a 2-entry Combo is the cleanest existing fit.)
-        //   Engine ignores "kind" param; length2=0/absent => symmetric path in dress.py.
+        // --- chamfer ---  length / [length2 | angle] ; edges[] | vertices[]
+        //   A single "type" combo (symmetric|asymmetric|distance_angle|vertex) drives which
+        //   fields show AND which dress.py path runs: type=="vertex" -> vertex chamfer
+        //   (refs.vertices); angle>0 -> distance-angle (refs.reference_face optional); length2>0
+        //   -> asymmetric; else symmetric. The path-selecting params (length2/angle) are
+        //   omitWhenDisabled so a stale value can't force the wrong path.
         { "chamfer", "Chamfer", "chamfer", {
-            Well    ("edges",    "Edges",                       "Items to Chamfer",   K_EDGE, true),
-            Dim     ("length",   "Distance",                    "Chamfer Parameters", 1.0),
-            ComboL  ("kind",     "Chamfer Type",                "Chamfer Parameters",
-                     "symmetric|asymmetric", "Symmetric|Asymmetric"),
-            DimIf   ("length2",  "Distance 2",                  "Chamfer Parameters", 1.0,
-                     "kind", "asymmetric"),
+            WellIf  ("edges",    "Edges",            "Items to Chamfer", K_EDGE, true,
+                     "type", "symmetric|asymmetric|distance_angle"),
+            WellIf  ("vertices", "Vertices",         "Items to Chamfer", K_VERTEX, true,
+                     "type", "vertex"),
+            ComboL  ("type",     "Chamfer Type",     "Chamfer Parameters",
+                     "symmetric|asymmetric|distance_angle|vertex",
+                     "Distance (Symmetric)|Distance (Asymmetric)|Angle-Distance|Vertex"),
+            Dim     ("length",   "Distance",         "Chamfer Parameters", 1.0),
+            DimIf   ("length2",  "Distance 2",       "Chamfer Parameters", 1.0,
+                     "type", "asymmetric", /*omit=*/true),
+            AngleIf ("angle",    "Angle",            "Chamfer Parameters", 45.0,
+                     "type", "distance_angle", /*omit=*/true),
+            WellIf  ("reference_face","Reference Face","Chamfer Parameters", K_FACE, false,
+                     "type", "distance_angle"),
         }},
         // --- shell ---  thickness/outward ; remove[]
         { "shell", "Shell", "shell", {

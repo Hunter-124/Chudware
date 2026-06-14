@@ -924,6 +924,21 @@ int run_gui(const char* screenshotPath) {
         if (const char* cmd = std::getenv("AI_CAD_PMCMD"))
             if (*cmd && !propertyManager.openForCommand(st, cmd))
                 std::fprintf(stderr, "pmform: no form for command '%s'\n", cmd);
+        // AI_CAD_PMSET="key=value;key2=value2" presets fields so type-gated rows render
+        // (e.g. "type=face" to show a fillet's face-set wells, "end=up_to_surface", "thin=true").
+        if (const char* setEnv = std::getenv("AI_CAD_PMSET")) {
+            std::string spec = setEnv;
+            size_t pos = 0;
+            while (pos < spec.size()) {
+                size_t semi = spec.find(';', pos);
+                std::string tok = spec.substr(pos, semi - pos);
+                size_t eq = tok.find('=');
+                if (eq != std::string::npos)
+                    propertyManager.presetFieldForShot(tok.substr(0, eq), tok.substr(eq + 1));
+                if (semi == std::string::npos) break;
+                pos = semi + 1;
+            }
+        }
     }
     // wantTree doc smoke runs in the frame loop once the worker is ready (see below).
     if (st.wantPick) {

@@ -141,7 +141,7 @@ struct PMField {
 bool pmParseDim(const std::string& text, double& outMm, std::string& err, bool angle = false,
                 double bareLengthScale = 1.0);
 // Format a canonical mm value for display, honouring IPS when ips==true.
-std::string pmFormatDim(double mm, bool ips);
+std::string pmFormatDim(double mm, bool ips, bool angle = false);
 
 // ---- in-viewport callouts (C27-A) -----------------------------------------
 
@@ -173,6 +173,11 @@ public:
     bool openForCommand(AppState& st, const std::string& cmdId);
     // Open the form for an existing feature, populated from its params/refs (tree "Edit").
     bool openForEdit(AppState& st, const std::string& featureId);
+
+    // Headless test hook (AI_CAD_SHOT=pmform): set a field's value by key so type-gated fields
+    // can be rendered for screenshot verification. value matches a Combo option, a Check
+    // ("true"/"false"/"1"/"0"), or a Dim/Int number. No-op if no field has that key.
+    void presetFieldForShot(const std::string& key, const std::string& value);
 
     // Draw the PM panel into the dock slot (called in place of the tree while active()).
     void draw(AppState& st);

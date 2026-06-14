@@ -279,11 +279,18 @@ bool pmParseDim(const std::string& raw, double& outMm, std::string& err, bool an
     return true;
 }
 
-std::string pmFormatDim(double mm, bool ips) {
+std::string pmFormatDim(double mm, bool ips, bool angle) {
     char buf[48];
-    if (ips) std::snprintf(buf, sizeof(buf), "%.4gin", mm / 25.4);
-    else     std::snprintf(buf, sizeof(buf), "%.4gmm", mm);
+    if (angle)    std::snprintf(buf, sizeof(buf), "%.4gdeg", mm);  // value already in degrees
+    else if (ips) std::snprintf(buf, sizeof(buf), "%.4gin", mm / 25.4);
+    else          std::snprintf(buf, sizeof(buf), "%.4gmm", mm);
     return buf;
+}
+
+// An angle-valued Dim field is tagged by a "deg" unit label (Angle/AngleIf helpers). Its value
+// is stored in degrees and must NOT carry the mm/inch length suffix.
+static inline bool pmFieldIsAngle(const PMFieldDef* d) {
+    return d && d->unitLabel && std::strstr(d->unitLabel, "deg") != nullptr;
 }
 
 // A dim value object {value, expr} for an op.
@@ -308,7 +315,7 @@ static void initField(PMField& f, const PMFieldDef& d, bool ips) {
         case PMFieldKind::Dim: {
             f.dimValue = d.dimDefault;
             f.dimExpr.clear();
-            std::string disp = pmFormatDim(d.dimDefault, ips);
+            std::string disp = pmFormatDim(d.dimDefault, ips, pmFieldIsAngle(&d));
             std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
             break;
         }
@@ -541,6 +548,44 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
     return true;
 }
 
+void PropertyManager::presetFieldForShot(const std::string& key, const std::string& value) {
+    if (!active_) return;
+    for (auto& f : fields_) {
+        if (!f.def->key || key != f.def->key) continue;
+        switch (f.def->kind) {
+            case PMFieldKind::Combo:
+            case PMFieldKind::DatumRef: {
+                std::string opts = f.def->comboOptions ? f.def->comboOptions : "";
+                int cur = 0; size_t start = 0;
+                while (start <= opts.size()) {
+                    size_t bar = opts.find('|', start);
+                    if (opts.substr(start, bar - start) == value) { f.comboIndex = cur; break; }
+                    ++cur;
+                    if (bar == std::string::npos) break;
+                    start = bar + 1;
+                }
+                break;
+            }
+            case PMFieldKind::Check:
+                f.checkValue = (value == "true" || value == "1" || value == "yes");
+                break;
+            case PMFieldKind::Dim: {
+                try {
+                    f.dimValue = std::stod(value); f.dimExpr.clear(); f.dimError.clear();
+                    std::string disp = pmFormatDim(f.dimValue, ips_, pmFieldIsAngle(f.def));
+                    std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
+                } catch (...) {}
+                break;
+            }
+            case PMFieldKind::Int:
+                try { f.intValue = std::stoi(value); } catch (...) {}
+                break;
+            default: break;
+        }
+        return;
+    }
+}
+
 void PropertyManager::loadFromTree(AppState& st, const nlohmann::json& feature) {
     (void)st;
     nlohmann::json params = feature.value("params", nlohmann::json::object());
@@ -559,7 +604,7 @@ void PropertyManager::loadFromTree(AppState& st, const nlohmann::json& feature) 
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                     } else if (d.contains("value") && d["value"].is_number()) {
                         f.dimValue = d["value"].get<double>();
-                        std::string disp = pmFormatDim(f.dimValue, ips_);
+                        std::string disp = pmFormatDim(f.dimValue, ips_, pmFieldIsAngle(f.def));
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                     }
                 }
@@ -708,7 +753,7 @@ std::vector<PMCalloutItem> PropertyManager::calloutItems(AppState& st) const {
         if (!fieldEnabled(*f.def, fields_)) continue;   // skip greyed / coming-soon dims
         PMCalloutItem it;
         it.label = f.def->label;
-        it.value = f.dimExpr.empty() ? pmFormatDim(f.dimValue, ips_)
+        it.value = f.dimExpr.empty() ? pmFormatDim(f.dimValue, ips_, pmFieldIsAngle(f.def))
                                      : ("=" + f.dimExpr);
         it.hasAnchor = hasAnchor;
         if (hasAnchor) { it.anchor[0] = anchor[0]; it.anchor[1] = anchor[1]; it.anchor[2] = anchor[2]; }
@@ -1025,12 +1070,24 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
         return false;
     }
 
+    // Fillet/chamfer have type-dependent primary wells: a fillet previews on edges
+    // (constant/variable) OR middle_face (full round) OR face_set_a (face fillet); a chamfer on
+    // edges (distance/angle) OR vertices (vertex chamfer). Ready as soon as any one is filled.
+    if (t == "fillet" || t == "chamfer") {
+        static const char* anyWell[] = {"edges", "middle_face", "face_set_a", "vertices"};
+        for (const auto& f : fields) {
+            if (f.def->kind != PMFieldKind::SelectorWell || f.picks.empty()) continue;
+            for (const char* k : anyWell)
+                if (std::strcmp(f.def->key, k) == 0) return true;
+        }
+        return false;
+    }
+
     // Selector-gated forms: a primary well (SelectorWell or FeatureWell) must have at least one
     // pick. Patterns gate on their FeatureWell; sweep on profile (path errors surface inline);
     // hole on the face; draft on the faces to taper.
     const char* needWell = nullptr;
-    if (t == "fillet" || t == "chamfer") needWell = "edges";
-    else if (t == "extrude" || t == "revolve" || t == "sweep") needWell = "profile";
+    if (t == "extrude" || t == "revolve" || t == "sweep") needWell = "profile";
     else if (t == "hole") needWell = "face";
     else if (t == "draft") needWell = "faces";
     else if (t == "linear_pattern" || t == "circular_pattern") needWell = "features";
@@ -1481,7 +1538,7 @@ void PropertyManager::drawBody(AppState& st) {
                 if (ImGui::SmallButton("-##step")) {
                     if (enabled && !f.def->comingSoon) {
                         f.dimValue = std::max(0.0, f.dimValue - 1.0);
-                        std::string disp = pmFormatDim(f.dimValue, useIps);
+                        std::string disp = pmFormatDim(f.dimValue, useIps, pmFieldIsAngle(f.def));
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                         f.dimError.clear();
                         dirty_ = true;
@@ -1492,7 +1549,7 @@ void PropertyManager::drawBody(AppState& st) {
                 if (ImGui::SmallButton("+##step")) {
                     if (enabled && !f.def->comingSoon) {
                         f.dimValue += 1.0;
-                        std::string disp = pmFormatDim(f.dimValue, useIps);
+                        std::string disp = pmFormatDim(f.dimValue, useIps, pmFieldIsAngle(f.def));
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                         f.dimError.clear();
                         dirty_ = true;
@@ -1506,7 +1563,7 @@ void PropertyManager::drawBody(AppState& st) {
                     float wheel = io.MouseWheel;
                     if (wheel != 0.0f && enabled && !f.def->comingSoon) {
                         f.dimValue = std::max(0.0, f.dimValue + (double)wheel);
-                        std::string disp = pmFormatDim(f.dimValue, useIps);
+                        std::string disp = pmFormatDim(f.dimValue, useIps, pmFieldIsAngle(f.def));
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                         f.dimError.clear();
                         dirty_ = true;
@@ -1527,12 +1584,12 @@ void PropertyManager::drawBody(AppState& st) {
                         double mm;
                         std::string err;
                         // A bare (unit-less) number follows the document length unit: mm in MMGS,
-                        // inch in IPS. Angle fields ([deg]) stay degrees in both systems, so they
-                        // keep the unit-less default scale. (angle stays false as before so an
-                        // explicit length suffix on any field still parses — existing behavior.)
-                        const bool isAngle = f.def->unitLabel && std::strstr(f.def->unitLabel, "deg");
+                        // inch in IPS. Angle fields ([deg]) stay degrees in both systems (bare =
+                        // degrees) and parse with angle=true so the "deg" suffix they now display
+                        // round-trips and a stray length unit is rejected on them.
+                        const bool isAngle = pmFieldIsAngle(f.def);
                         const double bareScale = (useIps && !isAngle) ? 25.4 : 1.0;
-                        if (pmParseDim(txt, mm, err, /*angle=*/false, bareScale)) {
+                        if (pmParseDim(txt, mm, err, /*angle=*/isAngle, bareScale)) {
                             f.dimValue = mm; f.dimExpr.clear(); f.dimError.clear();
                             dirty_ = true; lastEditTime_ = ImGui::GetTime();
                         } else {
@@ -1544,7 +1601,7 @@ void PropertyManager::drawBody(AppState& st) {
                 if (enabled && !f.dimExpr.empty()) {
                     pushTextColor(pal.accent);
                     ImGui::Text(u8"= %s  (%s)", f.dimExpr.c_str(),
-                                pmFormatDim(f.dimValue, useIps).c_str());
+                                pmFormatDim(f.dimValue, useIps, pmFieldIsAngle(f.def)).c_str());
                     ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Bound to equation '%s'", f.dimExpr.c_str());

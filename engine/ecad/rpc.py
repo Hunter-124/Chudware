@@ -848,6 +848,16 @@ def _ecad_simulate(params: dict, _emit: EmitFn) -> dict:
     if not circuit.get("devices"):
         return {"ok": False, "error": "no simulatable devices in the schematic", "warnings": warns}
     study = params.get("study") or {"analyses": [{"type": "tran", "tstep": 5e-5, "tstop": 5e-3}]}
+    # AC convenience: if an AC analysis is requested but no source carries an AC stimulus, drive the
+    # first independent voltage source with a unit AC source (the standard .ac input convention) so
+    # the frequency response is non-degenerate.
+    if any(isinstance(a, dict) and a.get("type") == "ac" for a in study.get("analyses", [])):
+        devs = circuit.get("devices", [])
+        if not any(isinstance(d.get("params"), dict) and d["params"].get("ac") for d in devs):
+            for d in devs:
+                if d.get("kind") == "V":
+                    d.setdefault("params", {})["ac"] = {"mag": 1.0, "phase": 0.0}
+                    break
     try:
         results = circuit_mod.simulate(circuit, study)
     except Exception as exc:  # noqa: BLE001 - report sim failure; never crash the worker

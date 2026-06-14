@@ -1213,13 +1213,12 @@ int run_gui(const char* screenshotPath) {
                     }
                 }
             } else if (wantSim) {
-                // Native simulator demo: design a verified divider, then run a transient analysis so
-                // the shot plots its node voltages (V(IN)=5, V(VMID)=2.5) as distinct waveforms in the
-                // Simulation tab. (The built-in recipe sources are DC, so transient is the analysis
-                // that yields non-degenerate traces; AC stimulus is not configured in the recipes.)
-                if (ecall("ecad_design", {{"request", "5V resistive divider with 2.5V output"}}, r))
+                // Native simulator demo: design a verified RC low-pass and run an AC sweep so the shot
+                // plots its frequency-response rolloff in the Simulation tab. (ecad_simulate injects a
+                // unit AC stimulus on the input source when the study is AC, so |H(f)| is meaningful.)
+                if (ecall("ecad_design", {{"request", "RC low-pass filter at 1kHz"}}, r))
                     showId = jstr(r, "doc_id");
-                st.ecadSimAnalysis = 0;  // Transient
+                st.ecadSimAnalysis = 1;  // AC sweep (frequency response)
             } else {
                 // AI design -> a verified divider schematic (recipe fallback; no model needed).
                 if (ecall("ecad_design", {{"request", "5V resistive divider with 2.5V output"}}, r))

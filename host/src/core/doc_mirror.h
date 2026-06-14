@@ -233,6 +233,12 @@ public:
     std::string exportDrawing(WorkerClient& w, const std::string& drawingDocId,
                               const std::string& path, const std::string& format, std::string& err);
 
+    // export_file: the ACTIVE document's solid bodies to `path` in `format` (step/iges/brep/stl/
+    // 3mf — see engine/doc/formats.py). Read-only passthrough on the mirror's current doc id;
+    // returns the written absolute path (empty on error, err filled).
+    std::string exportFile(WorkerClient& w, const std::string& path,
+                           const std::string& format, std::string& err);
+
     // Re-pull the document tree + revision from the worker (doc_tree) and fire the listener.
     // C24: the public face of the formerly-private resyncTree — callers that mutated the doc
     // out-of-band (sketch drag/commit/exit, a v2 agent run) use this to bring the mirror back in

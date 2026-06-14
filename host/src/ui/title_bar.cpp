@@ -224,6 +224,23 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
                 st.addLog("[doc] save failed: " + err);
             }
         };
+        // Export the active part's solid bodies to a neutral geometry format (engine export_file).
+        auto exportCadDoc = [&](const char* fmt, const char* ext, const char* filter) {
+            if (!st.docMirror.hasDoc()) return;
+            std::string suggest = treeString("name");
+            if (suggest.empty()) suggest = "Part1";
+            suggest += std::string(".") + ext;
+            std::string path = ui::saveFileDialog(filter, ext, suggest.c_str());
+            if (path.empty()) return;
+            std::string err;
+            std::string out = st.docMirror.exportFile(st.worker, path, fmt, err);
+            if (!out.empty()) {
+                st.toast(ui::ToastLevel::Info, "Exported " + fileBaseName(out));
+            } else {
+                st.toast(ui::ToastLevel::Error, "Export failed: " + err);
+                st.addLog("[doc] export failed: " + err);
+            }
+        };
         auto drawFileMenu = [&]() {
             if (ImGui::BeginMenu("New")) {
                 if (ImGui::MenuItem("Part")) newCadDoc(false);
@@ -244,10 +261,33 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, st.docMirror.hasDoc()))
                 saveCadDoc(true);
             if (ImGui::BeginMenu("Export", st.docMirror.hasDoc())) {
-                ImGui::MenuItem("STEP...", nullptr, false, false);
-                ImGui::MenuItem("STL...", nullptr, false, false);
-                ImGui::MenuItem("3MF...", nullptr, false, false);
-                ImGui::MenuItem("DXF...", nullptr, false, false);
+                if (ImGui::MenuItem("STEP..."))
+                    exportCadDoc("step", "step", "STEP (*.step)\0*.step\0All files (*.*)\0*.*\0");
+                if (ImGui::MenuItem("IGES..."))
+                    exportCadDoc("iges", "iges", "IGES (*.iges)\0*.iges\0All files (*.*)\0*.*\0");
+                if (ImGui::MenuItem("STL..."))
+                    exportCadDoc("stl", "stl", "STL (*.stl)\0*.stl\0All files (*.*)\0*.*\0");
+                if (ImGui::MenuItem("3MF..."))
+                    exportCadDoc("3mf", "3mf", "3MF (*.3mf)\0*.3mf\0All files (*.*)\0*.*\0");
+                ImGui::Separator();
+                // Flat-pattern DXF: sheet-metal parts with a flat pattern (clean error otherwise).
+                if (ImGui::MenuItem("DXF (flat pattern)...")) {
+                    std::string suggest = treeString("name");
+                    if (suggest.empty()) suggest = "Part1";
+                    suggest += ".dxf";
+                    std::string path = ui::saveFileDialog(
+                        "DXF (*.dxf)\0*.dxf\0All files (*.*)\0*.*\0", "dxf", suggest.c_str());
+                    if (!path.empty()) {
+                        std::string err;
+                        std::string out = st.docMirror.exportFlat(st.worker, path, "dxf", err);
+                        if (!out.empty())
+                            st.toast(ui::ToastLevel::Info, "Exported " + fileBaseName(out));
+                        else {
+                            st.toast(ui::ToastLevel::Error, "DXF export failed: " + err);
+                            st.addLog("[doc] flat dxf failed: " + err);
+                        }
+                    }
+                }
                 ImGui::EndMenu();
             }
             ImGui::Separator();

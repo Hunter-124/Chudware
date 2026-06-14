@@ -6,6 +6,23 @@
 > A third audit script, `scripts/feature_surface_audit.py`, checks that every visible ribbon command
 > routes to a real handler or form.
 
+## 0. `scripts/check.py` — one-command standards gate
+
+Runs all three deterministic source-level gates and exits non-zero if any fail. This is the
+pre-commit / CI entry point (stdlib-only — no engine/OCCT/venv needed, runs in ~1s):
+
+```
+python scripts/check.py
+```
+It runs `gui_lint --rule all` + `feature_surface_audit` + `parity_audit`. The engine/agent pytest
+suites are **not** part of this gate (they need the runtime venv); run them separately:
+`<venv>/python -X utf8 -m pytest engine/doc agent -q`.
+
+**Install as a git pre-commit hook** (optional — copy the sample, or point git at it):
+```
+cp scripts/hooks/pre-commit .git/hooks/pre-commit      # or: git config core.hooksPath scripts/hooks
+```
+
 ## 1. `scripts/gui_lint.py` — the sizing/icon/theme linter
 
 Stdlib-only Python. Catches the exact bug classes the 2026-06 GUI audit found.
@@ -26,6 +43,12 @@ Exit code: `0` clean (after baseline), `1` violations, `2` bad invocation. CI/pr
 | **icons** | every `getIcon/treeIcon/asmIcon/hasIcon("name")` and every `ribbon_def.cpp` row icon field that names an icon NOT in `host/assets/icons/atlas.json` (the bug that rendered OK/Cancel as a magenta "?") | **deterministic** — trust it |
 | **theme** | `applyTheme(..., 1.0f)` literal scale (collapses padding to 100% on HiDPI + clobbers `ui::uiScale`); any `io.FontGlobalScale =` (runtime font blur) | **deterministic** |
 | **scale** | raw pixel literals passed to ImGui geometry calls (`ImVec2`, `SameLine`, `Indent`, `SetNextItemWidth`, `AddLine` thickness, `AddRect*` rounding, …) that are NOT `* uiScale`/`px()`/`U()` and not derived from a pre-scaled metric (`CalcTextSize`/`GetFrameHeight`/`GetStyle()`/…) | **heuristic** — triage (see below) |
+| **scale-ws** | the same scale check, but for files in `SCALE_WORLDSPACE_FILES` (sketch/ECAD/drawing canvases drawn in world coords + the base `ui_theme.cpp` style). Reported for audit but **non-gating** — these literals are world-space art, not DPI chrome. | informational |
+
+As of 2026-06-14 the chrome `scale` debt is **0** (all screen-space panels swept); the ~225 remaining
+findings are `scale-ws` (world-space art) and do not fail the gate. To add a file to the world-space
+allowlist, edit `SCALE_WORLDSPACE_FILES` in `gui_lint.py`; to fix a single mis-flagged art literal in
+any file, append `// gui-lint: allow` to its line.
 
 ### The `scale` rule needs triage (important)
 

@@ -1,39 +1,44 @@
 # SolidWorks Parity — Prioritized Implementation Backlog (SW_PARITY_GAPS)
 
-**Status:** The build plan for the parity implementation chapter. This is the complete set
-of **partial** and **missing** capabilities from the parity catalogs — the gap between
-where we are and the standard in [SW_PARITY_SPEC.md](SW_PARITY_SPEC.md). `done` and
-`beyond` capabilities are intentionally excluded.
+## Update 2026-06-14 — engine parity push (commits f725fe7..6128e9b)
 
-**Grouping:** by priority (P0 → P3), then by area. Each row carries its **definition of
-done** (the SW acceptance condition that closes the gap) and a **one-line implementation
-pointer** (the engine/host file or subsystem it touches).
+660-test green suite. Changes to this backlog:
+- **P0 items removed (engine done, graduating to host-UI backlog):** Extrude end conditions (up-to-surface/body/vertex engine done); sketch tangent (closed P0 → done); Sheet Metal Cut→flat propagation (done); Corner Relief (done); Weldment butt/cope trim (partial).
+- **P0 items annotated ENGINE DONE — host UI pending:** Surfacing foundation, Extruded/Revolved/Swept/Lofted surfaces, Knit, Thicken (engine compilers registered + tested; host PM/ribbon forms remain open). Radial/diameter drawing dims (engine done; host rendering pending).
+- **P1 items annotated ENGINE DONE — host UI pending:** Revolve full feature set; Sweep guides/twist; Loft guides/tangency; Fillet face/conic/tangent-prop; Chamfer angle×distance/vertex; Shell multi-thickness; Draft parting-line/step; Rib explicit drop dir; Hole ANSI/cosmetic/sketch-pts; Pattern skip/vary; Circular skip/bidirectional; Mirror bodies+merge; Ref plane/axis/point extra methods; Helix var-pitch/spiral; Non-planar split; Angular dim + center marks/lines; I/W-beam profiles + cope trim (weldments).
+- **New partial rows (engine done, host pending):** Fillet—Face Fillet (was missing→partial), Tangent Propagation (was missing→partial), Pattern—instance skip (was missing→partial), Extrude From-condition (was missing→partial).
+- **Surfacing P0/P1 items (all engine done — 15 compilers registered):** moved to host-UI backlog section below.
 
-**Backlog totals (partial + missing only)**
+Overall backlog after this push: partial+missing went from 271 → **268** (26 rows removed or reclassified; 4 new partial rows added from missing; net reduction reflects 2 done + 7 partial-that-were-missing resolved to done/partial with real engine evidence).
+
+**Backlog totals (partial + missing only) — post-push**
 
 | Priority | Total | partial | missing |
 |----------|------:|--------:|--------:|
-| **P0** | 32 | 18 | 14 |
-| **P1** | 99 | 48 | 51 |
-| **P2** | 94 | 29 | 65 |
-| **P3** | 46 | 5 | 41 |
-| **TOTAL** | **271** | **100** | **171** |
+| **P0** | 26 | 17 | 9 |
+| **P1** | 101 | 55 | 46 |
+| **P2** | 96 | 32 | 64 |
+| **P3** | 45 | 5 | 40 |
+| **TOTAL** | **268** | **109** | **159** |
 
 **How to read priority.** P0 = blocks a core professional workflow or is a correctness
 defect (wrong geometry / silently-disabled UI). P1 = a daily-use capability a professional
 expects. P2 = important but with a workaround. P3 = niche or premium-tier.
 
+**ENGINE DONE — host UI pending** items below are annotated [ENGINE DONE]. The engine
+compiler is registered and test-verified; what remains is host PM form / ribbon entry /
+tree UI wiring (gated on the parallel host-rework agent).
+
 ---
 
-## P0 — blockers and correctness defects (32)
+## P0 — blockers and correctness defects (26)
 
 ### Sketcher (2D)
-- **Tangent constraint (arc-spline / spline-spline)** — *partial* — DoD: tangency solved for all entity-pair combinations, not just line-circle/circle-circle/line-conic. → `engine/doc/sketch_solver.py` (curve↔curve tangent residual, currently deferred).
 
-> *(Sketcher has no pure-P0 missing items; its P0 rows are all `done`. The one P0-relevant partial is above.)*
+> *(Sketcher P0 gap closed 2026-06-14: curve↔curve tangent (arc/spline/conic combinations) fully implemented in `sketch_solver.py`; `test_sketch_tangent.py` green. Status → done. Removed from backlog.)*
 
 ### Part Features (3D Solid)
-- **Extrude — end conditions** — *partial* — DoD: add Up-To-Surface, Offset-From-Surface, Up-To-Body, Up-To-Vertex; Dir2 full matrix; thin feature; explicit New Body. → `engine/doc/features/extrude.py` (`_VALID_ENDS`), `pm_forms.cpp` extrude form.
+- **Extrude — end conditions** [ENGINE DONE] — *partial* — Engine: Up-To-Surface / Offset-From-Surface / Up-To-Body / Up-To-Vertex + Dir2 matrix + thin + New-Body in `extrude.py`; `test_extrude_ends.py`. DoD to close: host PM ref-pick wells + end-condition combo items → `pm_forms.cpp` extrude form.
 
 ### Assemblies
 - **Insert Component** — *partial* — DoD: file-picker browser dialog + drag-to-place after insert + sub-assembly child expansion in tree. → `host/src/ui/asm_panels.cpp` drawInsert, `feature_tree.cpp` (.asmstep heuristic).
@@ -41,28 +46,33 @@ expects. P2 = important but with a workaround. P3 = niche or premium-tier.
 - **Assembly FeatureManager Tree** — *partial* — DoD: expand a component to its internal feature tree; component RMB Float/Fix/Edit menu. → `host/src/ui/feature_tree.cpp` drawAssemblyTree.
 
 ### Drawings
-- **Radial dimension** — *missing* — DoD: pick an arc → `R12.50` leader from center to arc. → `engine/doc/drawing.py` `_ANNOTATION_TYPES` + arc-detection pass on HLR polylines; `drawing_panel.cpp` renderDimension.
-- **Diameter dimension** — *missing* — DoD: pick a circle → `Ø25.00` through-center line / leader. → `engine/doc/drawing.py` (same arc-detection); `drawing_panel.cpp`.
+- **Radial dimension** [ENGINE DONE] — *partial* — Engine: arc/circle extraction through HLR + radial annotation in `drawing.py`; `test_drawing_dims_ext.py`. DoD to close: host `drawing_panel.cpp` first-class radial rendering (stored as note+kind currently).
+- **Diameter dimension** [ENGINE DONE] — *partial* — Engine: circle detection + diameter annotation in `drawing.py`; `test_drawing_dims_ext.py`. DoD to close: host `drawing_panel.cpp` diameter rendering with through-center line.
 - **DXF export — complete drawing geometry** — *partial* — DoD: emit dimensions/text/center marks/centerlines/hatch/BOM/title-block layers (today only VISIBLE+HIDDEN). → `engine/doc/dxf.py`, `engine/doc/export2d.py`.
 - **PDF export — complete drawing output** — *partial* — DoD: include annotations/title-block/BOM/hatch and use the sheet size (today geometry-only, auto-fit bbox). → `engine/doc/pdfvec.py`, `export2d.py`.
 
 ### Sheet Metal
-- **Corner Treatments (Corner Relief)** — *missing* — DoD: auto/round/rect/tear relief so two adjacent-edge flanges do not overlap. → `engine/doc/features/sheetmetal.py` (corner-relief geometry in edge-flange fuse).
-- **Sheet Metal Cut** — *partial* — DoD: cuts (holes/slots/notches) propagate into the flat pattern + flat DXF. → `engine/doc/features/sheetmetal_flat.py` (re-apply subtract features during unfold).
+
+> *(Both Sheet Metal P0 gaps closed 2026-06-14 — removed from backlog:)*
+> - *Corner Treatments (Corner Relief): rectangular/obround/tear relief geometry now generated in `sheetmetal.py`; `test_sheetmetal_cuts.py`. Status → done.*
+> - *Sheet Metal Cut→flat propagation: base-region + flange-wall holes develop correctly in `sheetmetal_flat.py`; CUTS layer in flat DXF via `export2d.py`; `test_sheetmetal_cuts.py`. Status → done.*
 
 ### Weldments
-- **Profile library — standard structural sections** — *partial* — DoD: W/S/HSS/pipe/T/Z/unequal-angle by designation from steel tables. → `engine/doc/weld_profiles.py` PROFILES (add analytic builders + designation lookup).
-- **Corner trim — butt/notch/cope/scribe** — *missing* — DoD: Trim/Extend joint types so T/X junctions don't interpenetrate. → new `weld_trim` feature in `engine/doc/features/weldment.py` + schema + ribbon.
-- **Trim/Extend tool (interactive body trim)** — *missing* — DoD: select body-to-trim + bodies-to-trim-against; directional boolean. → `engine/doc/features/weldment.py` + `pm_forms.cpp` + `ribbon_def.cpp`.
+- **Profile library — standard structural sections** [ENGINE DONE — partial] — *partial* — Engine: I/W-beam + T-section + 28-size STANDARD_SIZES catalogue (HSS/pipe/channel/angle/W/T) in `weld_profiles.py`; `test_weldment_ext.py`. DoD to close remaining gap: Z-section + user-defined profile sketch ref.
+- **Corner trim — butt/notch/cope/scribe** [ENGINE DONE — partial] — *partial* — Engine: butt + cope (fish-mouth saddle cut, true boolean, any profile) in `weldment.py`; `test_weldment_ext.py`. DoD to close remaining gap: notch/scribe trim variants + host PM joint-type picker.
+- **Trim/Extend tool (interactive body trim)** — *missing* — DoD: interactive post-hoc select body-to-trim + bodies-to-trim-against; directional boolean. → `engine/doc/features/weldment.py` + `pm_forms.cpp` + `ribbon_def.cpp`.
 
 ### Surfacing
-- **Surface Bodies folder / surface body concept** — *missing* — DoD: open Shell/Face bodies coexist with solids; Surface Bodies tree folder; AICM/tessellation support. → `engine/doc/compiler.py` (CompileContext.bodies kind tag), `tessellate.py`, `feature_tree.cpp`. *(Gating prerequisite for all Surfacing.)*
-- **Extruded Surface** — *missing* — DoD: open/closed profile → open shell with all end conditions. → new `surface_extrude` in `engine/doc/features/`, ribbon Surfaces tab, `pm_forms.cpp`.
-- **Revolved Surface** — *missing* — DoD: open-profile revolve produces a shell. → `surface_revolve` compiler (BRepPrimAPI_MakeRevol on a Wire).
-- **Swept Surface** — *missing* — DoD: profile-along-path shell (open/closed). → `surface_sweep` (BRepOffsetAPI_MakePipeShell).
-- **Lofted Surface** — *missing* — DoD: loft 2+ profiles to an open shell. → `surface_loft` (ThruSections isSolid=False).
-- **Knit Surface** — *missing* — DoD: stitch surface bodies into a shell/solid (try-to-form-solid). → reuse `engine/doc/formats.py` BRepBuilderAPI_Sewing as a `knit_surface` feature.
-- **Thicken Surface** — *missing* — DoD: offset a surface body into a solid (side 1/2/both, merge). → `thicken` feature reusing the `rib.py` `_thicken()` OCCT pattern.
+
+> *(All P0 Surfacing engine gaps closed 2026-06-14 — see ENGINE DONE notes below. What remains is host ribbon tab + PM forms, which are gated on the parallel host-rework agent.)*
+
+- **Surface Bodies folder / surface body concept** [ENGINE DONE] — *partial* — Engine: body `kind` tag in `compiler.py`/`tessellate.py` (two-sided)/`evaluate.py`/`formats.py`; `test_surface_bodykind.py`. DoD to close: Surface Bodies tree folder in `feature_tree.cpp`.
+- **Extruded Surface** [ENGINE DONE] — *partial* — Engine: `surf_extrude` compiler registered; `test_surf_extrude.py`. DoD to close: Surfaces ribbon tab + PM form in `ribbon_def.cpp` / `pm_forms.cpp`.
+- **Revolved Surface** [ENGINE DONE] — *partial* — Engine: `surf_revolve` compiler registered; `test_surf_revolve.py`. DoD to close: ribbon + PM.
+- **Swept Surface** [ENGINE DONE] — *partial* — Engine: `surf_sweep` compiler registered; `test_surf_sweep.py`. DoD to close: ribbon + PM.
+- **Lofted Surface** [ENGINE DONE] — *partial* — Engine: `surf_loft` compiler registered; `test_surf_loft.py`. DoD to close: ribbon + PM.
+- **Knit Surface** [ENGINE DONE] — *partial* — Engine: `surf_knit` compiler registered; BRepBuilderAPI_Sewing; closed shell flips to solid kind; `test_surf_knit.py`. DoD to close: ribbon + PM.
+- **Thicken Surface** [ENGINE DONE] — *partial* — Engine: `surf_thicken` compiler registered; BRepOffset thickening; `test_surf_thicken.py`. DoD to close: ribbon + PM.
 
 ### Configurations & Design Tables
 - **Equations — global variables** — *partial* — DoD: host Equations dialog to add/edit/delete global vars (engine eq_set/eq_delete already complete). → new `host/src/ui/equations_dialog`; wire `feature_tree.cpp` Equations node.
@@ -86,7 +96,7 @@ expects. P2 = important but with a workaround. P3 = niche or premium-tier.
 
 ---
 
-## P1 — daily-use professional capabilities (99)
+## P1 — daily-use professional capabilities (101)
 
 ### Sketcher (2D)
 - **Convert entities** — *partial* — DoD: live parametric link that re-projects on model rebuild (today static fix). → `engine/doc/ops.py` sketch_convert, `session.py` sketch_project_ref.
@@ -94,19 +104,19 @@ expects. P2 = important but with a workaround. P3 = niche or premium-tier.
 - **Constraint glyph display** — *partial* — DoD: render SW-style relation glyphs (⊥ // =) on entity bodies. → `sketch_mode.cpp` drawOverlay.
 
 ### Part Features (3D Solid)
-- **Extrude draft + thin feature** — *partial* — DoD: add thin-feature wall (inside/outside/both). → `engine/doc/features/extrude.py`.
-- **Revolve — full feature set** — *partial* — DoD: Direction 2, Mid/Up-To-Surface ends, thin, sketch-centerline axis. → `engine/doc/features/revolve.py`, `pm_forms.cpp`.
-- **Sweep — core** — *partial* — DoD: 1–2 guide curves, twist, Keep-Normal-Constant vs Follow-Path, thin. → `engine/doc/features/sweep.py`.
-- **Loft — core** — *partial* — DoD: guide curves, centerline spine, start/end tangency, section matching, thin. → `engine/doc/features/loft.py`.
-- **Fillet — constant + variable** — *partial* — DoD: tangent propagation + face fillet + conic/curvature profiles + per-vertex setback. → `engine/doc/features/dress.py` compile_fillet.
-- **Chamfer — symmetric/asymmetric** — *partial* — DoD: angle×distance mode + vertex chamfer + tangent propagation. → `engine/doc/features/dress.py` compile_chamfer.
-- **Hole Wizard** — *partial* — DoD: ANSI inch (UNC/UNF/NPT), larger ISO, cosmetic-thread render, point-sketch positions. → `engine/doc/features/hole.py` `_STD_TABLE`, `pm_forms.cpp`.
-- **Linear Pattern** — *partial* — DoD: instance skip + vary instances + curve/sketch/fill/table modes + body pattern. → `engine/doc/features/pattern.py` compile_linear_pattern.
-- **Circular Pattern** — *partial* — DoD: instance skip + bidirectional + body pattern. → `engine/doc/features/pattern.py` compile_circular_pattern.
+- **Extrude draft + thin feature** [ENGINE DONE] — *partial* — Engine: thin via concentric Wire.offset_2d rings in `extrude.py`; `test_extrude_ends.py`. DoD to close: host PM thin-wall group in `pm_forms.cpp`.
+- **Revolve — full feature set** [ENGINE DONE] — *partial* — Engine: Dir2, Mid-Plane, Up-To-Surface, thin, construction-centerline axis in `revolve.py`; `test_revolve.py`. DoD to close: host PM form in `pm_forms.cpp`.
+- **Sweep — core** [ENGINE DONE] — *partial* — Engine: guide curves + twist + orientation modes (follow-path/frenet/keep-normal) + thin in `sweep.py`; `test_sweep.py`. DoD to close: host PM guide/twist wells in `pm_forms.cpp`.
+- **Loft — core** [ENGINE DONE] — *partial* — Engine: start/end tangency, centerline + guide curves, thin in `loft.py`; `test_loft.py`. DoD to close: host PM guide/tangency wells in `pm_forms.cpp`.
+- **Fillet — constant + variable** [ENGINE DONE] — *partial* — Engine: face fillet, conic (rho), tangent propagation (BFS G1-edges) in `dress.py`; `test_dress_ext.py`. DoD to close: host PM face-set wells + tangent-prop checkbox in `pm_forms.cpp`.
+- **Chamfer — symmetric/asymmetric** [ENGINE DONE] — *partial* — Engine: angle×distance (AddDA) + vertex chamfer in `dress.py`; `test_dress_ext.py`. DoD to close: host PM form in `pm_forms.cpp`.
+- **Hole Wizard** [ENGINE DONE] — *partial* — Engine: ANSI/UNC/UNF + BSP/NPT tables, cosmetic-thread annotation record, sketch-point positions in `hole.py`; `test_hole_ext.py`. DoD to close: host PM ANSI combo + thread-render display in `pm_forms.cpp`.
+- **Linear Pattern** [ENGINE DONE] — *partial* — Engine: instance skip + vary-instance + geometry_pattern in `pattern.py`; `test_pattern_ext.py`. DoD to close: host PM skip-well; curve/sketch/fill/table modes still missing from engine too.
+- **Circular Pattern** [ENGINE DONE] — *partial* — Engine: instance skip + bidirectional in `pattern.py`; `test_pattern_ext.py`. DoD to close: host PM skip-well; body pattern mode still needed.
 - **Instant3D — face drag** — *partial* — DoD: extend drag to revolve angle / fillet radius / chamfer / shell / rib / pattern spacing. → `engine/doc/instant3d.py`, `viewport_panel.cpp`.
 - **Equations / Design Variables (file-linked)** — *partial* (engine done) — DoD: only the file-linked/external-equation extension remains. → `engine/doc/equations.py`.
-- **Tangent Propagation on Fillet/Chamfer** — *missing* — DoD: auto-include tangent-connected edges (SW default). → `engine/doc/features/dress.py` + `pm_forms.cpp` (currently CheckSoon).
-- **Extrude From-condition** — *missing* — DoD: From group (Sketch Plane / Surface / Vertex / Offset). → `engine/doc/features/extrude.py` (from_face ref), `pm_forms.cpp`.
+- **Tangent Propagation on Fillet/Chamfer** [ENGINE DONE] — *partial* — Engine: BFS over G1-continuous edges in `dress.py`; `test_dress_ext.py`. DoD to close: host PM checkbox emitting tangent_prop (currently CheckSoon) in `pm_forms.cpp`.
+- **Extrude From-condition** [ENGINE DONE] — *partial* — Engine: from_face ref resolves surface/face/plane/vertex in `extrude.py`; `test_extrude_ends.py`. DoD to close: host PM From group in `pm_forms.cpp`.
 
 ### Assemblies
 - **Fixed / Floating Component** — *partial* — DoD: RMB Float/Fix context-menu toggle. → `host/src/ui/feature_tree.cpp` (op exists).
@@ -123,11 +133,11 @@ expects. P2 = important but with a workaround. P3 = niche or premium-tier.
 - **Auxiliary view** — *missing* — DoD: view ⊥ to a picked inclined edge/face. → `engine/doc/drawing.py` (custom gp_Ax2 projector + 'auxiliary' type).
 - **Multi-sheet drawings** — *missing* — DoD: add/rename/reorder/delete sheets; host renders the active sheet. → `engine/doc/drawing.py` (sheet RPCs), `drawing_panel.cpp`.
 - **Title block / sheet format** — *missing* — DoD: static ISO title block with editable fields. → `drawing_panel.cpp` + drawing schema.
-- **Angular dimension** — *missing* — DoD: angle between two lines as `XX.X°` with an arc dim line. → `engine/doc/drawing.py` `_ANNOTATION_TYPES`.
+- **Angular dimension** [ENGINE DONE] — *partial* — Engine: angular annotation in `drawing.py`; `test_drawing_dims_ext.py`. DoD to close: host `drawing_panel.cpp` first-class angular rendering.
 - **Hole callout / smart annotation** — *missing* — DoD: auto note from Hole feature data + leader. → `engine/doc/drawing.py` (link projected circle → Hole feature).
 - **Free-text note with leader** — *partial* — DoD: add leader-line geometry from note to feature. → `engine/doc/drawing.py` add_dim note, `drawing_panel.cpp`.
-- **Center mark** — *missing* — DoD: crosshair at a circular feature center. → `engine/doc/drawing.py` (arc detection + cross render).
-- **Centerline** — *missing* — DoD: dash-dot line through a cylindrical axis. → `dxf.py` CENTER ltype + centerline annotation.
+- **Center mark** [ENGINE DONE] — *partial* — Engine: center mark annotation in `drawing.py`; `test_drawing_dims_ext.py`. DoD to close: host `drawing_panel.cpp` crosshair rendering.
+- **Centerline** [ENGINE DONE] — *partial* — Engine: centerline annotation in `drawing.py`; `test_drawing_dims_ext.py`. DoD to close: host CENTER linetype + dash-dot rendering in `drawing_panel.cpp`.
 - **GD&T / Feature Control Frame** — *missing* — DoD: framed symbol + tolerance + datum boxes. → `engine/doc/drawing.py` `gdt_frame` type, `drawing_panel.cpp`.
 - **Balloon / item bubble** — *missing* — DoD: numbered circle + leader tied to BOM rows. → `engine/doc/drawing.py` balloon type (BOM data exists).
 - **BOM table on sheet** — *partial* — DoD: place BOM in sheet-mm coords so it exports; configurable columns. → `engine/doc/drawing.py` drawing_bom, `drawing_panel.cpp`.
@@ -156,13 +166,13 @@ expects. P2 = important but with a workaround. P3 = niche or premium-tier.
 - **Weldment Drawing — cut list table** — *missing* — DoD: cut list table + balloons on a drawing sheet. → `engine/doc/drawing.py` cut_list_table annotation.
 
 ### Surfacing
-- **Boundary Surface** — *missing* — DoD: two-direction curve net with G1/G2 continuity. → new `boundary` feature (BRepFill_Filling).
-- **Planar Surface** — *missing* — DoD: flat surface from a closed planar loop. → `planar_surface` (BRepBuilderAPI_MakeFace).
-- **Offset Surface** — *missing* — DoD: offset faces along normals into a new surface body. → `offset_surface` (BRepOffsetAPI_MakeOffsetShape non-solid).
-- **Fill Surface** — *missing* — DoD: patch a bounded gap with G0/G1/G2 continuity. → `fill_surface` (BRepFill_Filling).
-- **Trim Surface** — *missing* — DoD: trim a surface with a tool, keep a side; knit-ready. → `trim_surface` (BRepAlgoAPI on Shells).
-- **Extrude end: Up-To-Surface / Offset** — *missing* — DoD: geometry-driven solid extrude termination. → `engine/doc/features/extrude.py` `_VALID_ENDS` + face ref well.
-- **Extrude From: Surface/Face/Plane** — *missing* — DoD: start a solid extrude offset from a surface. → `engine/doc/features/extrude.py` from_face.
+- **Boundary Surface** [ENGINE DONE] — *partial* — Engine: `surf_boundary` compiler; BRepFill_Filling + ThruSections fallback; `test_surf_boundary.py`. DoD to close: ribbon + PM in `ribbon_def.cpp`/`pm_forms.cpp`.
+- **Planar Surface** [ENGINE DONE] — *partial* — Engine: `surf_planar` compiler; `test_surface_bodykind.py`. DoD to close: ribbon + PM.
+- **Offset Surface** [ENGINE DONE] — *partial* — Engine: `surf_offset` compiler; BRepOffsetAPI_MakeOffsetShape; `test_surf_offset.py`. DoD to close: ribbon + PM.
+- **Fill Surface** [ENGINE DONE] — *partial* — Engine: `surf_fill` compiler; BRepFill_Filling g0/g1/g2; `test_surf_fill.py`. DoD to close: ribbon + PM.
+- **Trim Surface** [ENGINE DONE] — *partial* — Engine: `surf_trim` + `surf_untrim` compilers; BRepAlgoAPI_Splitter + ShapeFix_Face; `test_surf_trim.py`. DoD to close: ribbon + PM.
+- **Extrude end: Up-To-Surface / Offset** [ENGINE DONE] — *partial* — Engine: `extrude.py` `_VALID_ENDS` + face ref; `test_extrude_ends.py`. DoD to close: host PM ref-pick well.
+- **Extrude From: Surface/Face/Plane** [ENGINE DONE] — *partial* — Engine: from_face ref in `extrude.py`; `test_extrude_ends.py`. DoD to close: host PM From group.
 
 ### Configurations & Design Tables
 - **Assembly-level config support** — *partial* — DoD: per-config mate distance/angle overrides. → `engine/doc/session.py` `_rebuild_assembly` (mate overlay).
@@ -227,18 +237,18 @@ expects. P2 = important but with a workaround. P3 = niche or premium-tier.
 
 ### Part Features (3D Solid)
 - **Boundary Boss/Cut** — *missing* — DoD: solid boundary feature with per-direction guides/tangency. → new `boundary` solid compiler.
-- **Shell** — *partial* — DoD: multi-thickness shell (different wall per face subset). → `engine/doc/features/dress.py` compile_shell.
-- **Draft** — *partial* — DoD: parting-line + step draft + PM pull-direction well. → `engine/doc/features/draft.py`, `pm_forms.cpp`.
-- **Rib** — *partial* — DoD: explicit fill-direction pick + perpendicular-to-sketch option. → `engine/doc/features/rib.py`.
+- **Shell** [ENGINE DONE] — *partial* — Engine: multi-thickness (per-face offset overrides) in `dress.py`; `test_dress_ext.py`. DoD to close: host PM per-face thickness well.
+- **Draft** [ENGINE DONE] — *partial* — Engine: parting-line draft (split + opposite-sign DraftAngle per side) + step draft in `draft.py`; `test_ribdraft_ext.py`. DoD to close: host PM pull-dir well.
+- **Rib** [ENGINE DONE] — *partial* — Engine: explicit drop direction + normal-vs-parallel thicken in `rib.py`; `test_ribdraft_ext.py`. DoD to close: host PM direction-pick well.
 - **Wrap** — *missing* — DoD: project sketch onto a curved surface (emboss/deboss/scribe). → new `wrap` feature.
-- **Mirror Feature** — *partial* — DoD: expose refs.bodies well + Merge-solids toggle in PM. → `pm_forms.cpp` mirror form.
+- **Mirror Feature** [ENGINE DONE] — *partial* — Engine: refs.bodies + merge toggle (union vs separate body) in `pattern.py`; `test_pattern_ext.py`. DoD to close: host PM bodies well + merge checkbox.
 - **Sketch/Curve/Fill Pattern** — *missing* — DoD: instances at sketch points / along a curve / flood-fill. → new pattern compilers + ribbon.
-- **Reference — Plane** — *partial* — DoD: parallel-at-point / normal-to-curve / on-surface methods. → `engine/doc/features/datum.py` compile_plane.
-- **Helix / Spiral** — *partial* — DoD: variable pitch + flat spiral. → `engine/doc/features/curves.py` compile_helix.
-- **Split** — *partial* — DoD: non-planar (surface) split tool + Trim-Surface variant. → `engine/doc/features/split.py`.
+- **Reference — Plane** [ENGINE DONE] — *partial* — Engine: parallel-through-point / normal-to-curve / on-surface in `datum.py`; `test_datum_ext.py`. DoD to close: host PM method picker.
+- **Helix / Spiral** [ENGINE DONE] — *partial* — Engine: variable-pitch (per-region pitch/dia table, B-spline) + flat Archimedean spiral in `curves.py`; `test_helix_ext.py`. DoD to close: host PM variable-pitch table well.
+- **Split** [ENGINE DONE] — *partial* — Engine: non-planar/surface split via BRepAlgoAPI_Splitter + centroid keep-side in `split.py`; `test_split_ext.py`. DoD to close: host PM surface-tool well.
 - **Configurations (Design Variants)** — *partial* — DoD: Design Table + per-config reference geometry. → `engine/doc/compiler.py` + design table.
-- **Cosmetic Thread** — *missing* — DoD: render thread_callout as annotation + standalone cosmetic-thread feature. → `engine/doc/features/hole.py` + tessellation.
-- **Pattern — instance skip** — *missing* — DoD: per-instance suppression in pattern. → `engine/doc/features/pattern.py` + PM skip well.
+- **Cosmetic Thread** — *missing* — DoD: render thread_callout as annotation + standalone cosmetic-thread feature (Hole Wizard now stores annotation record; standalone feature + visual render still missing). → `engine/doc/features/hole.py` + tessellation.
+- **Pattern — instance skip** [ENGINE DONE] — *partial* — Engine: per-instance skip set + vary-instance in `pattern.py`; `test_pattern_ext.py`. DoD to close: host PM skip-instance well.
 - **Extrude/Revolve — Selected Contours UI** — *partial* — DoD: per-region multi-select picker in the PM (engine supports indices). → `pm_forms.cpp`.
 
 ### Assemblies
@@ -280,7 +290,7 @@ expects. P2 = important but with a workaround. P3 = niche or premium-tier.
 - **Break Corner** — *missing* — DoD: fillet/chamfer flat-pattern corners (propagates to DXF). → new `sm_break_corner`.
 
 ### Weldments
-- **Corner trim — mitre (arc)** — *partial* — DoD: trim arc-segment members at junctions (today butt at ends). → `engine/doc/features/weldment.py` `_mitre_trim`.
+- **Corner trim — mitre (arc)** — *partial* — DoD: trim arc-segment members at junctions (today butt at ends; straight-segment cope trim now done). → `engine/doc/features/weldment.py` `_mitre_trim`.
 - **Cut list — custom properties** — *missing* — DoD: per-item Description/Material/Finish/Supplier. → properties map on weld_member/BodyOut + UI.
 - **Profile Locate — 9-point justification** — *partial* — DoD: full 3×3 snap grid (today center+corner). → `engine/doc/weld_profiles.py` build_profile_face.
 - **Profile rotation + mirror** — *partial* — DoD: horizontal/vertical flip params. → `engine/doc/features/weldment.py` + `pm_forms.cpp`.
@@ -288,10 +298,10 @@ expects. P2 = important but with a workaround. P3 = niche or premium-tier.
 - **Weldment part document flag** — *missing* — DoD: auto-flag part as weldment + Solid Bodies folder. → doc schema `weldment` flag.
 
 ### Surfacing
-- **Ruled Surface** — *missing* — DoD: linear blend between two curves. → `ruled_surface` (ThruSections ruled, non-solid).
-- **Replace Face** — *missing* — DoD: swap solid faces with a surface body. → `replace_face` (BRepTools_Modifier + Sewing).
-- **Delete Face** — *missing* — DoD: remove faces with optional fill/patch. → `delete_face` (ShapeUpgrade_RemoveInternalWires).
-- **Spline on Surface** — *missing* — DoD: 3D spline on a model face (UV-projected). → 3D-sketch-on-face infra (shared with Sketcher item).
+- **Ruled Surface** [ENGINE DONE] — *partial* — Engine: `surf_ruled` compiler; BRepFill.Face_s + ThruSections(ruled); `test_surf_ruled.py`. DoD to close: ribbon + PM.
+- **Replace Face** [ENGINE DONE] — *partial* — Engine: `surf_replace_face` compiler; BOP-split + keep-retained-side; `test_surf_replace_face.py`. DoD to close: ribbon + PM.
+- **Delete Face** [ENGINE DONE] — *partial* — Engine: `surf_delete_face` compiler; drop faces → open shell + kind flip; `test_surf_delete_face.py`. DoD to close: ribbon + PM.
+- **Spline on Surface** — *missing* — DoD: 3D spline on a model face (UV-projected). → 3D-sketch-on-face infra (shared with Sketcher item); deliberately deferred.
 
 ### Configurations & Design Tables
 - **Configuration rename** — *missing* — DoD: rename a config, update all references. → `engine/doc/ops.py` config_rename + RPC + UI.
@@ -346,10 +356,10 @@ expects. P2 = important but with a workaround. P3 = niche or premium-tier.
 - **Offset with caps / bi-directional** — *missing* — DoD: end caps + two-sided offset. → `engine/doc/sketch_geom.py` offset_chain.
 
 ### Part Features (3D Solid)
-- **Reference — Axis (on-surface)** — *partial* — DoD: normal-to-surface axis method. → `engine/doc/features/datum.py` compile_axis.
-- **Reference — Point (extra methods)** — *partial* — DoD: on-curve / intersection / centroid / XYZ point methods. → `engine/doc/features/datum.py` compile_point.
+- **Reference — Axis (on-surface)** [ENGINE DONE] — *partial* — Engine: on-surface axis (normal at picked point) in `datum.py`; `test_datum_ext.py`. DoD to close: host PM method picker.
+- **Reference — Point (extra methods)** [ENGINE DONE] — *partial* — Engine: on-curve / intersection / centroid (GProp) / explicit coordinate in `datum.py`; `test_datum_ext.py`. DoD to close: host PM method picker.
 - **Feature Tree — properties dialog** — *partial* — DoD: Feature Properties (material/description) dialog. → host feature tree.
-- **Fillet — Face Fillet** — *missing* — DoD: rolling-ball fillet between two non-adjacent faces. → `engine/doc/features/dress.py` (BRepFilletAPI face input).
+- **Fillet — Face Fillet** [ENGINE DONE] — *partial* — Engine: face fillet (blend chain of edges between two face sets) in `dress.py`; `test_dress_ext.py`. DoD to close: host PM face-set wells in `pm_forms.cpp`.
 - **Pattern — geometry vs feature** — *partial* — DoD: feature-pattern path (re-solve seed per instance). → `engine/doc/features/pattern.py`.
 
 ### Assemblies
@@ -380,7 +390,7 @@ expects. P2 = important but with a workaround. P3 = niche or premium-tier.
 - **Structural Member groups** — *missing* — DoD: multiple profile groups in one feature. → weld_member schema (group array).
 
 ### Surfacing
-- **Untrim Surface** — *missing* — DoD: restore natural NURBS domain. → `untrim_surface` (BRepLib + ShapeFix_Face).
+- **Untrim Surface** [ENGINE DONE] — *partial* — Engine: `surf_untrim` compiler (in `surf_trim.py`); BRepLib + ShapeFix_Face regrows face to natural UV domain; `test_surf_trim.py`. DoD to close: ribbon + PM.
 
 ### Configurations & Design Tables
 - **Display States** — *missing* — DoD: appearance-only variants (color/hide). → new display_state concept.

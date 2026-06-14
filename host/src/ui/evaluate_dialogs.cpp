@@ -12,6 +12,11 @@
 
 namespace ui {
 
+// Zebra stripe density used by the Zebra Stripes control window. File-scope so it persists across
+// frames without adding a member to EvaluateDialogs (the class has a single instance). Matches the
+// renderer's default frequency; the slider (4..60) drives it live via Renderer::setZebra().
+static float gZebraFreq = 18.0f;
+
 // Format a linear value (canonical mm) for an evaluate readout in the active document units
 // (mm in MMGS, inch in IPS). Area/volume/mass/inertia stay in their canonical units below — only
 // pure LENGTH measures convert, mirroring SolidWorks (which reformats length, not the derived
@@ -131,9 +136,14 @@ bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "eval_thickness") { runFieldEval(st, "eval_thickness", nlohmann::json::object(), "Wall thickness", "mm"); return true; }
     if (cmdId == "eval_curvature") { runFieldEval(st, "eval_curvature", {{"kind", "mean"}}, "Mean curvature", "1/mm"); return true; }
     if (cmdId == "eval_zebra") {
-        // Zebra would need a striped-environment shader; deferred — note it and fall back.
-        openWindow_ = "zebra"; title_ = "Zebra Stripes"; errorText_ =
-            "Zebra striping is a shader feature deferred to a later card.";
+        // Zebra surface-continuity inspection: turn the renderer's striped-environment shader on
+        // and open a small control window (frequency slider + Turn Off). Closing the window — or
+        // pressing Turn Off — disables zebra so the user is never stuck in stripe mode.
+        errorText_.clear();
+        result_ = nlohmann::json::object();
+        pending_ = false;
+        if (st.renderer) st.renderer->setZebra(true, gZebraFreq);
+        openWindow_ = "zebra"; title_ = "Zebra Stripes";
         return true;
     }
     return false;
@@ -227,11 +237,26 @@ void EvaluateDialogs::draw(AppState& st) {
             ImGui::Text("Symmetric: %s", sym ? "yes" : "no");
             ImGui::Text("Deviation: %.3f mm3", result_.value("deviation_mm3", 0.0));
         } else if (openWindow_ == "zebra") {
-            ImGui::TextWrapped("Zebra striping is deferred to a later card.");
+            ImGui::TextWrapped("Surface-continuity inspection. Smooth, evenly-spaced stripes = a "
+                               "fair surface; stripes that kink = tangency (G1) break; stripes that "
+                               "jog/step = curvature (G2) break.");
+            ImGui::Spacing();
+            if (ImGui::SliderFloat("Stripe density", &gZebraFreq, 4.0f, 60.0f, "%.0f")) {
+                if (st.renderer) st.renderer->setZebra(true, gZebraFreq);
+            }
+            ImGui::Spacing();
+            if (ImGui::Button("Turn Off")) {
+                if (st.renderer) st.renderer->setZebra(false, gZebraFreq);
+                openWindow_.clear();
+            }
         }
     }
     ImGui::End();
-    if (!open) openWindow_.clear();
+    if (!open) {
+        // Closing the window must also exit stripe mode so the user isn't stuck in zebra shading.
+        if (openWindow_ == "zebra" && st.renderer) st.renderer->setZebra(false, gZebraFreq);
+        openWindow_.clear();
+    }
 }
 
 }  // namespace ui

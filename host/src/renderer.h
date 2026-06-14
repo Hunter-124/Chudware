@@ -72,6 +72,12 @@ public:
     void setGroundShadow(float r, float g, float b, float maxAlpha);
     // C30-C: RealView-style procedural environment reflections on shaded faces (0=off, 1=on).
     void setRealView(bool on) { realView_ = on; }
+    // Zebra stripes: SolidWorks surface-continuity inspection mode. When on, shaded faces render
+    // as if reflecting a black/white striped environment (uZebra/uZebraFreq in kFrag); the stripe
+    // pattern takes precedence over the scalar LUT and RealView. `freq` is the band density along
+    // the reflected-direction coordinate (typical 4..60). Default OFF.
+    void setZebra(bool on, float freq) { zebra_ = on; if (freq > 0.0f) zebraFreq_ = freq; }
+    bool zebraOn() const { return zebra_; }
     void setDisplayStyle(DisplayStyle s) { displayStyle_ = s; }
     DisplayStyle displayStyle() const { return displayStyle_; }
     void renderView(const std::string& view);            // "iso"|"front"|"right"|"top"
@@ -227,6 +233,8 @@ private:
     float defaultPart_[3] = {0.776f, 0.792f, 0.847f};
     float groundShadow_[4] = {0.20f, 0.22f, 0.26f, 0.35f};
     bool realView_ = true;  // C30-C: environment-reflection sheen (uRealView in kFrag)
+    bool zebra_ = false;        // Zebra surface-continuity stripe mode (uZebra in kFrag); default OFF
+    float zebraFreq_ = 18.0f;   // stripe band density along the reflected-direction coord
     DisplayStyle displayStyle_ = DisplayStyle::ShadedEdges;
     std::vector<Sub> subs_;
     Vec3 center_;

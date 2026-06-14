@@ -227,6 +227,9 @@ def _entity_to_edges(ent: dict) -> list[Any]:
         except Exception:  # noqa: BLE001
             return []
 
+    elif etype == "style_spline":
+        return _style_spline_edges(ent)
+
     elif etype == "ellipse":
         cx, cy = _to_vec2(ent["center"], "center")
         rx = float(ent["rx"])
@@ -520,6 +523,85 @@ def _eq_curve_edges(ent: dict) -> list[Any]:
         return [Edge.make_spline(vecs)]
     except Exception as exc:  # noqa: BLE001
         raise FeatureError(f"eq_curve: failed to build spline edge ({exc})") from exc
+
+
+# --------------------------------------------------------------------------- style spline
+
+
+def _style_spline_edges(ent: dict) -> list[Any]:
+    """Build a SolidWorks "Style Spline" edge from its CONTROL POLYGON (poles).
+
+    Unlike the ``spline`` entity (whose points are interpolated *through*), the
+    ``style_spline`` points are control poles: the curve starts at ``points[0]``,
+    ends at ``points[-1]``, is tangent to the first/last polygon legs, and lies
+    within the convex hull of the poles (a B-spline / Bezier defined by poles).
+
+    Primary path: a clamped degree-``min(3, n-1)`` B-spline built directly from
+    the poles via OCCT (``Geom_BSplineCurve`` + ``BRepBuilderAPI_MakeEdge``).
+    Fallback: a single Bezier whose control polygon is the poles
+    (``Edge.make_bezier``) — also a legitimate control-polygon curve.
+
+    A closed control polygon (first pole == last pole) yields a closed edge so
+    ``_detect_loops`` treats it as a one-edge region loop (it can extrude).
+    """
+    pts = ent.get("points", [])
+    if len(pts) < 2:
+        raise FeatureError("style_spline: needs >=2 control poles")
+    try:
+        poles = [(float(p[0]), float(p[1])) for p in pts]
+    except (TypeError, ValueError, IndexError) as exc:
+        raise FeatureError(f"style_spline: bad pole coordinate ({exc})") from exc
+
+    # Drop consecutive duplicate poles (degenerate legs the curve constructors reject),
+    # but PRESERVE an intentional closing pole (first == last) for region detection.
+    closed = (
+        len(poles) >= 3
+        and math.hypot(poles[0][0] - poles[-1][0], poles[0][1] - poles[-1][1]) < 1e-9
+    )
+    dedup: list[tuple[float, float]] = []
+    for px, py in poles:
+        if not dedup or math.hypot(px - dedup[-1][0], py - dedup[-1][1]) > 1e-12:
+            dedup.append((px, py))
+    if closed and (
+        math.hypot(dedup[0][0] - dedup[-1][0], dedup[0][1] - dedup[-1][1]) > 1e-12
+    ):
+        dedup.append(poles[0])
+    if len(dedup) < 2:
+        raise FeatureError("style_spline: control poles are degenerate (all coincide)")
+
+    # Primary: clamped B-spline directly from poles (degree adapts to pole count).
+    try:
+        from OCP.Geom import Geom_BSplineCurve
+        from OCP.TColgp import TColgp_Array1OfPnt
+        from OCP.TColStd import TColStd_Array1OfReal, TColStd_Array1OfInteger
+        from OCP.gp import gp_Pnt
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+
+        n = len(dedup)
+        degree = min(3, n - 1)
+        arr = TColgp_Array1OfPnt(1, n)
+        for i, (x, y) in enumerate(dedup, start=1):
+            arr.SetValue(i, gp_Pnt(x, y, 0.0))
+        # Clamped (open-uniform) knot vector: end multiplicities = degree+1 so the
+        # curve passes through the first/last poles and is tangent to the end legs.
+        n_knots = n - degree + 1
+        knots = TColStd_Array1OfReal(1, n_knots)
+        mults = TColStd_Array1OfInteger(1, n_knots)
+        for i in range(1, n_knots + 1):
+            knots.SetValue(i, float(i - 1))
+            mults.SetValue(i, 1)
+        mults.SetValue(1, degree + 1)
+        mults.SetValue(n_knots, degree + 1)
+        bs = Geom_BSplineCurve(arr, knots, mults, degree)
+        return [Edge(BRepBuilderAPI_MakeEdge(bs).Edge())]
+    except Exception:  # noqa: BLE001
+        # Fallback: single Bezier whose control polygon is the poles. Still a
+        # control-polygon curve (interpolates only the first/last poles).
+        try:
+            vecs = [Vector(px, py, 0) for px, py in dedup]
+            return [Edge.make_bezier(*vecs)]
+        except Exception as exc:  # noqa: BLE001
+            raise FeatureError(f"style_spline: failed to build edge ({exc})") from exc
 
 
 # --------------------------------------------------------------------------- sketch text glyphs

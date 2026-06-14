@@ -945,6 +945,8 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
         resetTool(); tool_ = SketchTool::Ellipse; return true;
     }
     if (cmdId == "sk_spline")          { resetTool(); tool_ = SketchTool::Spline;         return true; }
+    // Style Spline — click-collect control poles (same UX as Spline); emits "style_spline".
+    if (cmdId == "sk_spline_style")    { resetTool(); tool_ = SketchTool::StyleSpline;    return true; }
     // Sketch Text — arm a one-click placement; the click opens the text popup (string + height).
     if (cmdId == "sk_text")            { resetTool(); tool_ = SketchTool::Text;
                                          textPopupOpen_ = false;                           return true; }
@@ -1040,6 +1042,7 @@ const char* SketchMode::activeToolCmd() const {
         case SketchTool::Point:           return "sk_point";
         case SketchTool::Ellipse:         return "sk_ellipse_big";
         case SketchTool::Spline:          return "sk_spline";
+        case SketchTool::StyleSpline:     return "sk_spline_style";
         case SketchTool::Text:            return "sk_text";
         case SketchTool::EqCurve:         return "sk_spline_equation";
         default:                          return "";
@@ -1423,7 +1426,7 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfe
                 fn(e.id + ".center", e.center[0], e.center[1]);
             } else if (e.type == "point") {
                 fn(e.id + ".p", e.p1[0], e.p1[1]);
-            } else if (e.type == "spline") {  // C42: sub-handles p0..pN (sketch_solver convention)
+            } else if (e.type == "spline" || e.type == "style_spline") {  // C42: sub-handles p0..pN (sketch_solver convention; style_spline = control poles)
                 for (size_t i = 0; i < e.pts.size(); ++i)
                     fn(e.id + ".p" + std::to_string(i), e.pts[i].x, e.pts[i].y);
             }
@@ -1510,7 +1513,7 @@ int SketchMode::hitTestHandle(const ImVec2& s, std::string& handleOut, float& uO
             consider(e.id + ".center", e.center[0], e.center[1]);
         } else if (e.type == "point") {
             consider(e.id + ".p", e.p1[0], e.p1[1]);
-        } else if (e.type == "spline") {   // C42: draggable through-points p0..pN
+        } else if (e.type == "spline" || e.type == "style_spline") {   // C42: draggable through-points / control poles p0..pN
             for (size_t i = 0; i < e.pts.size(); ++i)
                 consider(e.id + ".p" + std::to_string(i), e.pts[i].x, e.pts[i].y);
         }
@@ -1561,8 +1564,9 @@ int SketchMode::hitTestEntity(const ImVec2& s, float maxPx) const {
         } else if (e.type == "point") {                       // C42: distance to the point itself
             ImVec2 p = uvToScreen(e.p1[0], e.p1[1]);
             d2 = (p.x - s.x) * (p.x - s.x) + (p.y - s.y) * (p.y - s.y);
-        } else if (e.type == "ellipse" || e.type == "spline") {
-            // C42: min distance to a sampled polyline (32-seg ellipse / spline through-points).
+        } else if (e.type == "ellipse" || e.type == "spline" || e.type == "style_spline") {
+            // C42: min distance to a sampled polyline (32-seg ellipse / spline through-points /
+            // style_spline control polygon — the displayed editable polyline, SW-style).
             auto seg2 = [&](ImVec2 a, ImVec2 b) {
                 float vx = b.x - a.x, vy = b.y - a.y;
                 float wx = s.x - a.x, wy = s.y - a.y;
@@ -1713,7 +1717,7 @@ void SketchMode::entityBoundaryUV(const SketchEntity& e, std::vector<ImVec2>& ou
             out.push_back(ImVec2(e.center[0] + (e.radius - hw) * std::cos(a),
                                  e.center[1] + (e.radius - hw) * std::sin(a)));
         }
-    } else if (e.type == "spline") {
+    } else if (e.type == "spline" || e.type == "style_spline") {
         for (const auto& q : e.pts) out.push_back(q);
     }
 }
@@ -1891,7 +1895,7 @@ void SketchMode::entityDragHandles(const SketchEntity& e,
         out.emplace_back(e.id + ".center", ImVec2(e.center[0], e.center[1]));
     } else if (e.type == "point") {
         out.emplace_back(e.id + ".p", ImVec2(e.p1[0], e.p1[1]));
-    } else if (e.type == "spline") {
+    } else if (e.type == "spline" || e.type == "style_spline") {
         for (size_t i = 0; i < e.pts.size(); ++i)
             out.emplace_back(e.id + ".p" + std::to_string(i), e.pts[i]);
     }
@@ -3172,8 +3176,8 @@ void SketchMode::drawGhosts(AppState& st, const ImVec2& imgMin, const ImVec2& im
                     u = e.center[0] + lx * ca - ly * sa;
                     v = e.center[1] + lx * sa + ly * ca;
                 }, 48);
-            } else if (e.type == "spline" && e.pts.size() >= 2) {
-                // C42: polyline through the solved through-points.
+            } else if ((e.type == "spline" || e.type == "style_spline") && e.pts.size() >= 2) {
+                // C42: polyline through the solved through-points (style_spline: control polygon).
                 for (size_t i = 1; i < e.pts.size(); ++i) {
                     ImVec2 a, b;
                     if (uv2s(e.pts[i - 1].x, e.pts[i - 1].y, a) && uv2s(e.pts[i].x, e.pts[i].y, b))
@@ -3869,8 +3873,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             }
             strokePoly(pts);
             dl->AddCircleFilled(uvToScreen(e.center[0], e.center[1]), 2.5f, cc);
-        } else if (e.type == "spline") {
-            // C42: polyline through the solved through-points + point markers.
+        } else if (e.type == "spline" || e.type == "style_spline") {
+            // C42: polyline through the through-points + point markers. For style_spline this is the
+            // control polygon (the editable poles, exactly as SW shows a Style Spline); the smooth
+            // by-poles curve is realized by the engine at use/extrude time.
             std::vector<ImVec2> pts; pts.reserve(e.pts.size());
             for (const auto& q : e.pts) pts.push_back(uvToScreen(q.x, q.y));
             strokePoly(pts);
@@ -5338,7 +5344,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
                     }
                 }
-            } else if (tool_ == SketchTool::Spline && n >= 1) {
+            } else if ((tool_ == SketchTool::Spline || tool_ == SketchTool::StyleSpline) && n >= 1) {
                 std::vector<ImVec2> pts(toolUV_.begin(), toolUV_.end());
                 pts.push_back(ImVec2(su, sv));
                 pl(pts);
@@ -5839,7 +5845,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
 
         // C42: Spline finishing — Enter / right-click / double-click commits (>= 2 points); a
         // right-click with fewer just drops the in-progress points (mirrors the Line-chain RMB).
-        if (tool_ == SketchTool::Spline) {
+        // Style Spline shares the exact same collect/finish UX (>= 2 poles) and only differs in the
+        // emitted entity type ("style_spline" — control poles, not interpolated through-points).
+        if (tool_ == SketchTool::Spline || tool_ == SketchTool::StyleSpline) {
             bool finish = false;
             if (imgHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
                 toolUV_.size() >= 3) {
@@ -5857,7 +5865,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             if (finish && toolUV_.size() >= 2) {
                 nlohmann::json pts = nlohmann::json::array();
                 for (const auto& q : toolUV_) pts.push_back(nlohmann::json::array({q.x, q.y}));
-                nlohmann::json ent = {{"type", "spline"}, {"points", pts}};
+                const char* entType = (tool_ == SketchTool::StyleSpline) ? "style_spline" : "spline";
+                nlohmann::json ent = {{"type", entType}, {"points", pts}};
                 addEntity(st, ent, nlohmann::json::array());
                 resetTool();
             }
@@ -5865,8 +5874,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // C37-D: right-click ends the current chain/segment but keeps the tool armed (SW muscle
         // memory: the Line tool drops its in-progress points and waits for a fresh first point).
         // mouse_gestures is disabled in-sketch (viewport_panel), so the RMB is free here; consume it.
-        // C42: Spline owns its RMB (finish/drop, handled above).
-        if (tool_ != SketchTool::Spline && imgHovered &&
+        // C42: Spline / Style Spline own their RMB (finish/drop, handled above).
+        if (tool_ != SketchTool::Spline && tool_ != SketchTool::StyleSpline && imgHovered &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
             toolUV_.clear(); toolSnaps_.clear(); chainPrevId_.clear();
         }
@@ -6108,6 +6117,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          tool_ == SketchTool::Point ? "Point" :
                          tool_ == SketchTool::Ellipse ? "Ellipse" :
                          tool_ == SketchTool::Spline ? "Spline" :
+                         tool_ == SketchTool::StyleSpline ? "Style Spline" :
                          tool_ == SketchTool::Text ? "Text" :
                          tool_ == SketchTool::EqCurve ? "Equation Driven Curve" : "";
         // Per-stage step prompt (status-bar style) for the multi-click variants.
@@ -6208,6 +6218,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             case SketchTool::Spline:
                 step = n < 2 ? "click points; Enter / right-click / double-click to finish"
                              : "click more points \xC2\xB7 Enter / right-click / double-click finishes"; break;
+            case SketchTool::StyleSpline:
+                step = n < 2 ? "click control poles; Enter / right-click / double-click to finish"
+                             : "click more poles \xC2\xB7 Enter / right-click / double-click finishes"; break;
             case SketchTool::Text:
                 step = textPopupOpen_ ? "type the text + height, then OK"
                                       : "click to place the text"; break;

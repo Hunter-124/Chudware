@@ -50,7 +50,10 @@ enum class SketchTool {
     // Sketch Text (entity type "text"): one viewport click places the lower-left anchor, then a
     // popup collects the string + cap height. Equation-Driven Curve (entity type "eq_curve"):
     // no viewport pick — a popup collects x(t)/y(t) expressions + a t range (origin-relative).
-    Text, EqCurve
+    Text, EqCurve,
+    // Style Spline (entity type "style_spline"): click-collect CONTROL POLES (a control polygon);
+    // the smooth curve is built by-poles in the engine. Same collect/finish UX as Spline.
+    StyleSpline
 };
 
 // C37-D: One constraint record from a sketch_enter/solve/drag response (worker_rpc.md §"constraints").

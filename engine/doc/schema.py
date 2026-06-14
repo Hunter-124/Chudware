@@ -131,6 +131,9 @@ ENTITY_FIELDS: dict[str, list[str]] = {
     "parabola": ["vertex", "focus", "t0", "t1"],
     "conic": ["p0", "p1", "apex", "rho"],
     "spline": ["points"],
+    # SolidWorks "Style Spline": points are CONTROL POLES (a control polygon),
+    # not interpolated through-points (cf. "spline"). Same field shape as spline.
+    "style_spline": ["points"],
     "slot": ["p1", "p2", "width"],
     "arc_slot": ["center", "radius", "a0", "a1", "width"],  # C30-B: arc-spine slot
     "text": ["p", "text", "height"],
@@ -154,7 +157,7 @@ _ENTITY_SUBS: dict[str, set[str]] = {
     "arc_slot": {"center", "start", "end"},  # C30-B: derived spine endpoints
     "text": {"p"},
     "eq_curve": {"start", "end"},  # derived curve endpoints at t1 / t2
-    # spline handled specially (p0..pN)
+    # spline and style_spline handled specially (p0..pN control-pole sub-handles)
 }
 
 # Constraint type -> (min_refs, max_refs, needs_value)
@@ -374,12 +377,13 @@ def _handle_targets_entity(handle: str, entities_by_id: dict[str, dict]) -> str 
     if not sub:
         return None
     etype = ent.get("type")
-    if etype == "spline":
+    if etype in ("spline", "style_spline"):
+        # Both expose p0..pN point sub-handles (style_spline's are its control poles).
         if re.match(r"^p\d+$", sub):
             npts = len(ent.get("points") or [])
             idx = int(sub[1:])
-            return None if idx < npts else f"spline point '{sub}' out of range"
-        return f"'{sub}' is not a spline handle"
+            return None if idx < npts else f"{etype} point '{sub}' out of range"
+        return f"'{sub}' is not a {etype} handle"
     subs = _ENTITY_SUBS.get(etype or "", set())
     if sub not in subs:
         return f"'{sub}' is not a handle of a {etype}"

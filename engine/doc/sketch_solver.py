@@ -2566,7 +2566,16 @@ def solve_sketch(
     var_map: Dict[str, np.ndarray] = {}
 
     for ent in entities_list:
-        var_map[ent["id"]] = _allocate_entity(sys, ent)
+        try:
+            var_map[ent["id"]] = _allocate_entity(sys, ent)
+        except Exception:
+            # Forward-tolerant (same posture as the per-constraint guard below): an unrecognized
+            # or malformed entity contributes NO variables (treated as fixed) instead of crashing
+            # the entire sketch solve. New sketch entity types should still be wired into
+            # _allocate_entity / _resolve_handle / the result-emission switch — but this guard means
+            # a missed wiring degrades to "that entity won't drag" rather than a hard crash that
+            # takes down every drag, dimension, and relation in the sketch.
+            var_map[ent["id"]] = sys.add_vars(0, [])
 
     # Register constraints
     for c in constraints_list:

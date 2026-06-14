@@ -75,3 +75,15 @@ def test_solver_coincident_to_eq_curve_endpoint() -> None:
     cons = [{"id": "c1", "type": "coincident", "refs": ["P1.p", "Q1.start"]}]
     sol = solve_sketch(_params(ents, cons), {})
     assert sol is not None
+
+
+def test_solver_forward_tolerant_to_unknown_entity() -> None:
+    """SYSTEMIC GUARD: a future/unknown sketch entity type must degrade to 0-DOF (treated as
+    fixed), NOT crash the whole solve — so a missed _allocate_entity wiring can't take down every
+    drag/dimension/relation in the sketch. A real line alongside it still solves normally."""
+    ents = [
+        {"id": "L1", "type": "line", "construction": False, "p1": [0.0, 0.0], "p2": [10.0, 0.0]},
+        {"id": "Z1", "type": "totally_new_future_entity", "construction": False, "blah": 1},
+    ]
+    sol = solve_sketch(_params(ents), {})
+    assert sol is not None

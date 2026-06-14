@@ -111,9 +111,11 @@ A sketch is a feature (`type:"sketch"`) with `refs.plane` = selector-or-datum an
 | `parabola` (S) | `vertex:[x,y]`, `focus:[x,y]`, `t0`, `t1` (drawn segment of a parabola; own frame `u=unit(focus−vertex)`, `w=perp(u)`, `f=\|focus−vertex\|`, point `P(t)=vertex+(t²/4f)·u+t·w`; `t0`/`t1` are signed `w`-extents) |
 | `conic` (S) | `p0:[x,y]`, `p1:[x,y]`, `apex:[x,y]`, `rho:0..1` (SolidWorks conic: endpoints + tangent-intersection `apex` + `rho`; rendered as rational quadratic Bézier with apex weight `w=rho/(1−rho)`) |
 | `spline` | `points:[[x,y],…]` (cubic through-points) |
+| `style_spline` (S) | `points:[[x,y],…]` (control **poles**: a clamped degree-`min(3,n−1)` B-spline by control polygon — interpolates only the first/last pole, tangent to the end legs, within the convex hull; distinct from `spline`, which interpolates through every point). Pole handles `p0…pN`. |
 | `slot` | `p1:[x,y]`, `p2:[x,y]`, `width:w` (straight slot, arc caps) |
 | `arc_slot` (S) | `center:[x,y]`, `radius:r`, `a0:deg`, `a1:deg`, `width:w` (arc-spine slot: spine = circular arc, center/radius, CCW `a0`→`a1` like `arc`; capsule of total width `w` around it. `radius − w/2 > 0` required) |
-| `text` (S) | `p:[x,y]`, `text:str`, `height:mm` |
+| `text` (S) | `p:[x,y]`, `text:str`, `height:mm` (`p` = lower-left; cap-height rescaled to `height`; build123d `Text` glyph faces, inner glyph holes preserved; optional `font:str?`. Solver: position-only (2 DOF)) |
+| `eq_curve` (S) | `xt:str`, `yt:str`, `t1`, `t2` (SolidWorks Equation-Driven Curve: parametric `x(t)/y(t)` expression strings over `[t1,t2]` in radians, safe-AST evaluated, sampled to a spline; closed forms extrude as a region. Explicit `yx`/`x1`/`x2` form also compiles. Solver: 0 DOF — equation-fixed; `start`/`end` are constant references at `t1`/`t2`) |
 
 All entities carry `construction:bool` (construction geometry never forms profile regions).
 

@@ -277,6 +277,33 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
     "asm_circular_pattern": {"params": ["count", "angle"],
                              "refs": {"axis": (_SEL_OR_DATUM, True),
                                       "components": (_COMP_LIST, True)}},
+    # Surfacing — open-surface body features (kind="surface"). Schema entries land here up front so
+    # later surfacing batches add only compilers, never touch the schema. surf_planar is the only
+    # one with a compiler today (the foundation canary); the rest validate but have no compiler yet.
+    "surf_extrude": {"params": ["end", "depth"], "refs": {"profile": (_SEL_LIST, True)}},
+    "surf_revolve": {"params": ["angle"], "refs": {"profile": (_SEL_LIST, True),
+                                                   "axis": (_SEL_OR_DATUM, True)}},
+    "surf_sweep": {"params": [], "refs": {"profile": (_SEL_LIST, True),
+                                          "path": (_SEL_OR_DATUM, True),
+                                          "guides": (_SEL_LIST, False)}},
+    "surf_loft": {"params": [], "refs": {"sections": (_SEL_LIST, True),
+                                         "guides": (_SEL_LIST, False),
+                                         "centerline": (_SEL_OR_DATUM, False)}},
+    "surf_planar": {"params": [], "refs": {"profile": (_SEL_LIST, True)}},
+    "surf_offset": {"params": ["distance"], "refs": {"faces": (_SEL_LIST, True)}},
+    "surf_ruled": {"params": [], "refs": {"edge_a": (_SEL_OR_DATUM, True),
+                                          "edge_b": (_SEL_OR_DATUM, True)}},
+    "surf_boundary": {"params": [], "refs": {"dir1": (_SEL_LIST, True),
+                                             "dir2": (_SEL_LIST, False)}},
+    "surf_fill": {"params": [], "refs": {"edges": (_SEL_LIST, True)}},
+    "surf_knit": {"params": [], "refs": {"surfaces": (_SEL_LIST, True)}},
+    "surf_thicken": {"params": ["thickness"], "refs": {"surface": (_SEL_OR_DATUM, True)}},
+    "surf_trim": {"params": ["keep"], "refs": {"surface": (_SEL_OR_DATUM, True),
+                                               "tool": (_SEL_OR_DATUM, True)}},
+    "surf_untrim": {"params": [], "refs": {"faces": (_SEL_LIST, True)}},
+    "surf_delete_face": {"params": [], "refs": {"faces": (_SEL_LIST, True)}},
+    "surf_replace_face": {"params": [], "refs": {"faces": (_SEL_LIST, True),
+                                                 "surface": (_SEL_OR_DATUM, True)}},
 }
 
 

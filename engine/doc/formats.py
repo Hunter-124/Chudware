@@ -80,6 +80,23 @@ def _shapes_to_export_list(session_bodies: list[tuple[str, Any]]) -> Any:
     return Compound(children=list(shapes))
 
 
+def _is_solid_shape(shape) -> bool:
+    """True iff *shape* contains at least one SOLID — the 3MF/lib3mf mesher needs a closed solid.
+
+    Open surface bodies (lone FACE / open SHELL) contain no SOLID and return False. Robust to OCP
+    errors (defaults to True so a non-surface body is never wrongly skipped)."""
+    raw = shape.wrapped if hasattr(shape, "wrapped") else shape
+    try:
+        from OCP.TopAbs import TopAbs_SOLID
+        from OCP.TopExp import TopExp
+        from OCP.TopTools import TopTools_IndexedMapOfShape
+        solids = TopTools_IndexedMapOfShape()
+        TopExp.MapShapes_s(raw, TopAbs_SOLID, solids)
+        return solids.Extent() > 0
+    except Exception:  # noqa: BLE001
+        return True
+
+
 # --------------------------------------------------------------------------- export
 
 
@@ -136,8 +153,19 @@ def export_document(
     elif fmt == "3mf":
         from build123d import Mesher
         m = Mesher()
+        added = 0
         for name, s in session_bodies:
+            # 3MF (via lib3mf) is a solid-mesh format — an open surface body has no enclosed
+            # volume to mesh, so skip it rather than emit a degenerate/closed-shell mesh. Other
+            # formats (STEP/IGES/BREP/STL) already accept shells, so they keep surface bodies.
+            if not _is_solid_shape(s):
+                continue
             m.add_shape(s)
+            added += 1
+        if added == 0:
+            raise ValueError(
+                "3MF export needs at least one solid body; all bodies are open surfaces "
+                "(export STEP/IGES/STL for surface bodies)")
         m.write(str(path))
 
     else:

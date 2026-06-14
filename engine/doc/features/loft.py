@@ -196,15 +196,20 @@ def _continuity_for(tangency: str) -> GeomAbs_Shape:
 
 
 def _build_thrusections(
-    wires: list[Wire], ruled: bool, smooth: bool, continuity: GeomAbs_Shape
-) -> Solid:
+    wires: list[Wire], ruled: bool, smooth: bool, continuity: GeomAbs_Shape,
+    is_solid: bool = True,
+):
     """Classic loft through ordered section wires via ``BRepOffsetAPI_ThruSections``.
 
     ``smooth`` (tangency requested) turns on the smoothing approximation with the given
     continuity so the surface leaves/enters its end sections tangentially rather than as a
     straight ruled span.
+
+    ``is_solid`` (default True) builds a capped Solid (the classic solid loft). Pass False to
+    build an open lofted SHELL (a SURFACE loft) — the first ThruSections arg is the OCCT
+    ``isSolid`` flag, so we thread it straight through. Solid callers keep True (byte-identical).
     """
-    builder = BRepOffsetAPI_ThruSections(True, ruled and not smooth, 1e-6)
+    builder = BRepOffsetAPI_ThruSections(is_solid, ruled and not smooth, 1e-6)
     if smooth:
         builder.SetSmoothing(True)
         builder.SetContinuity(continuity)
@@ -213,6 +218,9 @@ def _build_thrusections(
     builder.Build()
     if not builder.IsDone():
         raise FeatureError("loft: OCCT ThruSections failed (IsDone=False)")
+    if not is_solid:
+        from build123d import Shell
+        return _to_solid_normalized(Shell(builder.Shape()).clean())
     return _to_solid_normalized(Solid(builder.Shape()).clean())
 
 

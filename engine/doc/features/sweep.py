@@ -203,11 +203,15 @@ def _twisted_sections(path_wire: Wire, profile_wire: Wire, total_deg: float,
 
 
 def _pipe_shell(path_wire: Wire, profile: Face, *, orientation: str,
-                guide_wire: Wire | None, twist_deg: float) -> Solid:
+                guide_wire: Wire | None, twist_deg: float, make_solid: bool = True):
     """Advanced path: BRepOffsetAPI_MakePipeShell with guide/twist/orientation controls.
 
     ``profile`` is a face; we sweep its outer wire and let MakeSolid cap the ends. When a twist is
     requested we add rotated section copies along the spine; otherwise we add the single profile.
+
+    ``make_solid`` (default True) calls ``MakeSolid()`` to cap the swept shell into a closed Solid
+    — the classic solid-sweep behaviour. Pass False to skip the cap and return the open swept
+    Shell (a SURFACE sweep). Solid callers keep ``make_solid=True``, so their result is unchanged.
     """
     prof_wire = profile.outer_wire()
     mk = BRepOffsetAPI_MakePipeShell(path_wire.wrapped)
@@ -225,6 +229,9 @@ def _pipe_shell(path_wire: Wire, profile: Face, *, orientation: str,
     mk.Build()
     if not mk.IsDone():
         raise FeatureError("sweep: OCCT MakePipeShell failed (IsDone=False)")
+    if not make_solid:
+        from build123d import Shell
+        return Shell(mk.Shape()).clean()
     if not mk.MakeSolid():
         raise FeatureError(
             "sweep: MakePipeShell could not close the swept shell into a solid",

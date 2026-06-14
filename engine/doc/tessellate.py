@@ -142,6 +142,7 @@ def tessellate_body(
     ang_deflection: float = 0.35,
     metallic: float = 0.0,
     roughness: float = 0.5,
+    two_sided: bool = False,
 ) -> BodyTess:
     """Tessellate an OCP/build123d shape to AICM geometry.
 
@@ -157,6 +158,11 @@ def tessellate_body(
         sRGB triple in [0, 1].
     lin_deflection, ang_deflection:
         BRepMesh tolerances (mm, radians).
+    two_sided:
+        When True, after the normal triangle emit each triangle gets a reversed-winding
+        duplicate with a flipped normal, so an OPEN surface body renders from both sides
+        (an open shell otherwise vanishes when viewed from its back). Solid bodies leave this
+        False so their output is byte-identical to before.
     """
     # Accept both OCP shapes and build123d wrappers
     if hasattr(shape, "wrapped"):
@@ -204,31 +210,47 @@ def tessellate_body(
         trsf = loc.Transformation()
         is_identity = loc.IsIdentity()
 
-        base_vert = len(all_pos) // 3
         first_tri = len(all_idx) // 3
 
-        # Vertices + normals
-        for ni in range(1, tri.NbNodes() + 1):
-            nd = tri.Node(ni)
-            if not is_identity:
-                nd.Transform(trsf)
-            all_pos.extend([nd.X(), nd.Y(), nd.Z()])
-            nv = tri.Normal(ni)
-            if is_reversed:
-                all_nrm.extend([-nv.X(), -nv.Y(), -nv.Z()])
-            else:
-                all_nrm.extend([nv.X(), nv.Y(), nv.Z()])
+        def _emit_orientation(flip_normals: bool, reverse_winding: bool) -> None:
+            """Emit one copy of this face's vertices (+normals) and its triangles.
 
-        # Triangles (CCW outward after winding flip for REVERSED)
-        for ti in range(1, tri.NbTriangles() + 1):
-            n1, n2, n3 = tri.Triangle(ti).Get()
-            if is_reversed:
-                all_idx.extend([base_vert + n1 - 1, base_vert + n3 - 1, base_vert + n2 - 1])
-            else:
-                all_idx.extend([base_vert + n1 - 1, base_vert + n2 - 1, base_vert + n3 - 1])
+            ``flip_normals`` negates the per-vertex normal; ``reverse_winding`` swaps triangle
+            winding. The normal/winding-vs-REVERSED logic below is XOR-composed with these so the
+            two-sided second pass produces the geometric back face (flipped normal + reversed
+            winding) of the first pass.
+            """
+            base_vert = len(all_pos) // 3
+            for ni in range(1, tri.NbNodes() + 1):
+                nd = tri.Node(ni)
+                if not is_identity:
+                    nd.Transform(trsf)
+                all_pos.extend([nd.X(), nd.Y(), nd.Z()])
+                nv = tri.Normal(ni)
+                neg = is_reversed ^ flip_normals
+                if neg:
+                    all_nrm.extend([-nv.X(), -nv.Y(), -nv.Z()])
+                else:
+                    all_nrm.extend([nv.X(), nv.Y(), nv.Z()])
 
+            for ti in range(1, tri.NbTriangles() + 1):
+                n1, n2, n3 = tri.Triangle(ti).Get()
+                rev = is_reversed ^ reverse_winding
+                if rev:
+                    all_idx.extend([base_vert + n1 - 1, base_vert + n3 - 1, base_vert + n2 - 1])
+                else:
+                    all_idx.extend([base_vert + n1 - 1, base_vert + n2 - 1, base_vert + n3 - 1])
+
+        # First (front) pass — byte-identical to the single-sided emit.
+        _emit_orientation(flip_normals=False, reverse_winding=False)
+        # Second (back) pass for an open surface body: same vertices, flipped normals + reversed
+        # winding, so the surface is visible from behind.
+        if two_sided:
+            _emit_orientation(flip_normals=True, reverse_winding=True)
+
+        tri_count = tri.NbTriangles() * (2 if two_sided else 1)
         surf_type = _SURF_TYPE.get(BRepAdaptor_Surface(face).GetType(), 6)
-        face_recs.append(FaceRec(fi, first_tri, tri.NbTriangles(), surf_type))
+        face_recs.append(FaceRec(fi, first_tri, tri_count, surf_type))
         face_triangulations[face_map.FindKey(fi).__hash__()] = (tri, loc)
 
     pos_arr = np.array(all_pos, dtype=np.float32).reshape(-1, 3)

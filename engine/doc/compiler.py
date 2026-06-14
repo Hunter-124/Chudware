@@ -57,6 +57,10 @@ class BodyOut:
     name: str
     shape: Any  # build123d Solid / Compound
     color: list[float] | None = None
+    # Body kind — "solid" (default, every classic feature) or "surface" (open sheet body). Stamped
+    # in the assembly loop from the per-feature ``body_kinds`` map; downstream (tessellate /
+    # mass-props / export) branches on it. Defaults keep solid bodies byte-identical.
+    kind: str = "solid"
 
 
 @dataclass
@@ -119,6 +123,9 @@ class _CacheEntry:
     # per-body owner maps produced by this feature (keyed by body_id string)
     face_owners: dict[str, dict[int, str]] = field(default_factory=dict)
     edge_owners: dict[str, dict[int, str]] = field(default_factory=dict)
+    # the kind ("solid"|"surface") of the body this feature produced/replaced, keyed by id(shape)
+    # so a cache-hit restores the per-body kind without recompiling.
+    body_kinds: dict[int, str] = field(default_factory=dict)
 
 
 class CompileCache:
@@ -441,6 +448,9 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
     face_owners: dict[str, dict[int, str]] = {}
     edge_owners: dict[str, dict[int, str]] = {}
     body_ids: dict[int, str] = {}  # python id(shape) -> assigned body_id (stable per rebuild)
+    # python id(shape) -> body kind ("solid"|"surface"); mirrors body_ids. Only surface bodies are
+    # recorded here (a missing entry defaults to "solid"), so solid rebuilds stay byte-identical.
+    body_kinds: dict[int, str] = {}
     # the topo maps of the CURRENT top body, threaded into the next feature's diff
     prev_face_map: TopTools_IndexedMapOfShape | None = None
     prev_edge_map: TopTools_IndexedMapOfShape | None = None
@@ -513,6 +523,14 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
                 face_owners[bid_k] = dict(fo)
             for bid_k, eo in hit_entry.edge_owners.items():
                 edge_owners[bid_k] = dict(eo)
+            # Restore per-body kinds (surface bodies); re-key onto the LIVE shape ids so the
+            # assembly loop's id(shape) lookup hits. The cache stored kinds keyed by the cached
+            # shape's id; the cached shapes ARE the live ones (list copied by reference), so the
+            # ids already match — but we re-stamp by walking this feature's body list to be safe.
+            for shp in bodies:
+                k = hit_entry.body_kinds.get(id(shp))
+                if k is not None and k != "solid":
+                    body_kinds[id(shp)] = k
             # Feed the top-body maps into the NEXT feature's diff.
             top = _top_body(bodies)
             bid = _ensure_body_id(top) if top is not None else None
@@ -594,6 +612,10 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
             edge_owners[bid] = e_owners
             prev_face_map, prev_edge_map = f_map, e_map
             prev_face_owners, prev_edge_owners = f_owners, e_owners
+        # Record the body kind this feature produced/replaced (the top body it just built). Only
+        # non-solid kinds are stored; absent => "solid", keeping classic features byte-identical.
+        if top is not None and out.kind != "solid":
+            body_kinds[id(top)] = out.kind
 
         prev_key = feat_key
 
@@ -603,15 +625,21 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
             # overwritten on subsequent features, so we snapshot them here.
             stored_face = {bid_k: dict(fo) for bid_k, fo in face_owners.items()}
             stored_edge = {bid_k: dict(eo) for bid_k, eo in edge_owners.items()}
+            # Snapshot per-body kinds for the bodies this feature produced (keyed by id(shape),
+            # matching how the cache-hit path re-stamps them). Only non-solid bodies appear.
+            stored_kinds = {id(shp): body_kinds[id(shp)]
+                            for shp in bodies if id(shp) in body_kinds}
             cache.put(feat_key, _CacheEntry(
                 bodies=list(bodies), tool_body=out.tool_body,
                 datum=out.datum, status=dict(status), op=out.op,
-                face_owners=stored_face, edge_owners=stored_edge))
+                face_owners=stored_face, edge_owners=stored_edge,
+                body_kinds=stored_kinds))
 
     # --- assemble BodyOut list -------------------------------------------
     for shape in bodies:
         bid = _ensure_body_id(shape)
-        result.bodies.append(BodyOut(body_id=bid, name=bid, shape=shape, color=None))
+        kind = body_kinds.get(id(shape), "solid")
+        result.bodies.append(BodyOut(body_id=bid, name=bid, shape=shape, color=None, kind=kind))
     result.face_owners = {bo.body_id: face_owners.get(bo.body_id, {}) for bo in result.bodies}
     result.edge_owners = {bo.body_id: edge_owners.get(bo.body_id, {}) for bo in result.bodies}
 

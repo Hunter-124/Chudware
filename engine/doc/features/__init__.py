@@ -60,6 +60,11 @@ from . import surf_extrude as _surf_extrude  # noqa: F401
 from . import surf_revolve as _surf_revolve  # noqa: F401
 from . import surf_sweep as _surf_sweep  # noqa: F401
 from . import surf_loft as _surf_loft  # noqa: F401
+# Curve-net + offset surfaces (offset of faces, ruled blend, boundary/fill patches):
+from . import surf_offset as _surf_offset  # noqa: F401
+from . import surf_ruled as _surf_ruled  # noqa: F401
+from . import surf_boundary as _surf_boundary  # noqa: F401
+from . import surf_fill as _surf_fill  # noqa: F401
 
 __all__ = [
     "CompileContext",

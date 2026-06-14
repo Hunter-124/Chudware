@@ -313,7 +313,7 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     std::string mode;
     const PMFormDef* form = pmFormForCommand(cmdId, mode);
     if (!form) return false;
-    if (active_) close();   // a previous form is replaced (no commit)
+    if (active_ && !cancelEdits(st)) return false;   // replacing a PM must roll back previews first
 
     // C40: SolidWorks mode exclusion. Invoking a feature command while a sketch is being
     // edited EXITS the sketch first (its profile then pre-seeds extrude/revolve below);
@@ -333,6 +333,7 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     title_ = form->title;
     targetId_.clear();
     previewBatches_ = 0;
+    previewUndoGroupStarted_ = false;
     dirty_ = false;
     firstPreviewDone_ = false;
     lastEditTime_ = ImGui::GetTime();
@@ -495,7 +496,7 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
     std::string type = target->value("type", std::string());
     const PMFormDef* form = pmFindForm(type);
     if (!form) { st.addLog("[pm] no form for feature type '" + type + "'"); return false; }
-    if (active_) close();
+    if (active_ && !cancelEdits(st)) return false;
 
     active_ = true;
     editMode_ = true;
@@ -504,6 +505,7 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
     title_ = form->title;
     targetId_ = featureId;
     previewBatches_ = 0;
+    previewUndoGroupStarted_ = false;
     dirty_ = false;
     firstPreviewDone_ = true;   // the feature already exists; edits go straight to edit_feature
     lastEditTime_ = ImGui::GetTime();
@@ -1052,9 +1054,16 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
 
 // ---- preview / commit / cancel --------------------------------------------
 
-void PropertyManager::applyPreview(AppState& st) {
-    if (!st.docMirror.hasDoc() || !st.workerStarted) return;
-    if (!readyForPreview(form_, fields_)) { dirty_ = false; return; }
+bool PropertyManager::applyPreview(AppState& st) {
+    if (!st.docMirror.hasDoc() || !st.workerStarted) {
+        previewError_ = "Document runtime is not ready.";
+        return false;
+    }
+    if (!readyForPreview(form_, fields_)) {
+        previewError_ = "Select the required references and enter valid dimensions before accepting.";
+        dirty_ = false;
+        return false;
+    }
 
     // C37-F: Defensive check — if the target feature has vanished from the mirror tree (agent
     // run / external undo replaced the doc), close the PM rather than firing an edit_feature
@@ -1073,7 +1082,7 @@ void PropertyManager::applyPreview(AppState& st) {
             st.toast(ui::ToastLevel::Warn, "Feature " + targetId_ + " no longer exists — closing PM");
             st.addLog("[pm] tick: feature " + targetId_ + " vanished; closing PM");
             close();
-            return;
+            return false;
         }
     }
 
@@ -1086,13 +1095,17 @@ void PropertyManager::applyPreview(AppState& st) {
         ops.push_back({{"op", "add_feature"}, {"feature", feature}, {"before", nullptr}});
     } else {
         // Subsequent previews / edit-path: edit the existing feature in place.
-        if (targetId_.empty()) { dirty_ = false; return; }
+        if (targetId_.empty()) {
+            previewError_ = "Preview target was not created.";
+            dirty_ = false;
+            return false;
+        }
         ops.push_back({{"op", "edit_feature"}, {"id", targetId_},
                        {"params", feature.value("params", nlohmann::json::object())},
                        {"refs",   feature.value("refs",   nlohmann::json::object())}});
     }
 
-    auto resp = st.docMirror.applyOps(st.worker, ops);
+    auto resp = st.docMirror.applyOps(st.worker, ops, previewUndoGroupStarted_);
     if (!resp.ok) {
         // C38 (P4f): the inline previewError_ block in the PM body is the surface for a failed
         // debounced preview — do NOT toast here. Previews fire per-keystroke, so toasting each
@@ -1101,10 +1114,13 @@ void PropertyManager::applyPreview(AppState& st) {
         previewError_ = resp.error_message;
         st.addLog("[pm] preview failed: " + resp.error_message);
         dirty_ = false;
-        return;
+        return false;
     }
     previewError_.clear();  // C37-F: clear stale error on success
-    ++previewBatches_;
+    if (!previewUndoGroupStarted_) {
+        previewUndoGroupStarted_ = true;
+        ++previewBatches_;
+    }
     // The add-feature flow learns the new feature id from id_map ($0 -> fX).
     if (targetId_.empty() && resp.id_map.is_object()) {
         auto it = resp.id_map.find("$0");
@@ -1134,6 +1150,7 @@ void PropertyManager::applyPreview(AppState& st) {
         }
     }
     dirty_ = false;
+    return true;
 }
 
 void PropertyManager::tick(AppState& st) {
@@ -1147,14 +1164,29 @@ void PropertyManager::tick(AppState& st) {
 
 void PropertyManager::commit(AppState& st) {
     // Make sure the latest field state is reflected before committing.
-    if (dirty_ || !firstPreviewDone_) applyPreview(st);
+    if (!readyForPreview(form_, fields_)) {
+        previewError_ = "Select the required references and enter valid dimensions before accepting.";
+        st.addLog("[pm] OK blocked: form is not ready");
+        return;
+    }
+    if (dirty_ || !firstPreviewDone_) {
+        if (!applyPreview(st)) {
+            st.addLog("[pm] OK blocked: preview/apply failed");
+            return;
+        }
+    }
+    if (!previewError_.empty()) {
+        st.addLog("[pm] OK blocked: " + previewError_);
+        return;
+    }
     st.addLog("[pm] OK -> committed " + (targetId_.empty() ? std::string("(no geometry)") : targetId_));
     // The feature stays in the document; the tree returns on close.
     close();
 }
 
-void PropertyManager::cancelEdits(AppState& st) {
+bool PropertyManager::cancelEdits(AppState& st) {
     // C37-F: Single revert call replaces the old N-undo loop, eliminating the UI freeze.
+    bool ok = true;
     if (!checkpointId_.empty()) {
         auto r = st.docMirror.revert(st.worker, checkpointId_);
         if (r.ok) {
@@ -1164,18 +1196,22 @@ void PropertyManager::cancelEdits(AppState& st) {
         } else {
             st.toast(ui::ToastLevel::Error, "Cancel revert failed: " + r.error_message);
             st.addLog("[pm] Cancel revert failed: " + r.error_message);
+            ok = false;
         }
     } else {
         // Fallback: checkpoint wasn't available at open — use the undo loop.
         int n = previewBatches_;
         for (int i = 0; i < n; ++i) {
             auto r = st.docMirror.undo(st.worker);
-            if (!r.ok) { st.addLog("[pm] cancel undo failed: " + r.error_message); break; }
+            if (!r.ok) { st.addLog("[pm] cancel undo failed: " + r.error_message); ok = false; break; }
             if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
         }
-        st.addLog("[pm] Cancel -> undid " + std::to_string(n) + " preview batch(es) (no checkpoint)");
+        if (ok)
+            st.addLog("[pm] Cancel -> undid " + std::to_string(n) + " preview batch(es) (no checkpoint)");
     }
+    if (!ok) return false;
     close();
+    return true;
 }
 
 // ---- drawing --------------------------------------------------------------
@@ -1222,6 +1258,17 @@ void PropertyManager::draw(AppState& st) {
         }
     }
 
+    drawBody(st);
+    ImGui::End();
+}
+
+void PropertyManager::drawEmbedded(AppState& st) {
+    if (!active_) return;
+    if (st.ips() != ips_) { ips_ = st.ips(); reformatDimDisplays(); }
+    drawBody(st);
+}
+
+void PropertyManager::drawBody(AppState& st) {
     const auto& pal = ui::palette;
 
     // ---- C37-F: Keyboard policy -------------------------------------------
@@ -1343,8 +1390,8 @@ void PropertyManager::draw(AppState& st) {
 
         ImGui::Separator();
 
-        if (ok)     { commit(st);      ImGui::End(); return; }
-        if (cancel) { cancelEdits(st); ImGui::End(); return; }
+        if (ok)     { commit(st);      return; }
+        if (cancel) { cancelEdits(st); return; }
     }
 
     // ---- field rows grouped by `group`, collapsible ------------------------
@@ -1731,7 +1778,6 @@ void PropertyManager::draw(AppState& st) {
     pmWidgetActivePrevFrame_ = ImGui::IsAnyItemActive() &&
         ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
 
-    ImGui::End();
 }
 
 }  // namespace ui

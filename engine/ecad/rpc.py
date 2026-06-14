@@ -828,7 +828,8 @@ def _ecad_simulate(params: dict, _emit: EmitFn) -> dict:
     """Build the netlist -> SPICE circuit -> run a simulation; return traces for GUI plotting.
 
     params: {doc_id, study?, sim_params?}. Default study is a 5 ms transient; probes default to all
-    node voltages (engine.sim.circuit). Returns {ok, results, warnings} or {ok:false, error}.
+    node voltages (engine.sim.circuit). Returns the full solver envelope so callers can distinguish
+    "ran" from "converged" and surface the solver log.
     """
     from engine.ecad import session as esess, schema
 
@@ -862,7 +863,17 @@ def _ecad_simulate(params: dict, _emit: EmitFn) -> dict:
         results = circuit_mod.simulate(circuit, study)
     except Exception as exc:  # noqa: BLE001 - report sim failure; never crash the worker
         return {"ok": False, "error": f"sim failed: {exc}", "warnings": warns}
-    return {"ok": True, "results": results, "warnings": warns}
+    conv = results.get("convergence") if isinstance(results, dict) else {}
+    converged = bool(conv) and all(bool(v) for v in conv.values())
+    return {
+        "ok": True,
+        "converged": converged,
+        "results": results,
+        "warnings": warns,
+        "log": results.get("log", []) if isinstance(results, dict) else [],
+        "convergence": conv if isinstance(conv, dict) else {},
+        "ms": results.get("ms") if isinstance(results, dict) else None,
+    }
 
 
 METHODS: dict[str, object] = {

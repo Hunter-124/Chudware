@@ -113,6 +113,13 @@ def ensure_runtime(base_python: str | None = None, wheelhouse: Path | None = Non
 
     if not _imports_ok(py):
         return {"status": "error", "reason": "imports failed after install"}
+    # Optional local-AI payload. This is a no-op unless the release/source tree includes a
+    # `llamacpp` folder with llama-server.exe; status remains visible via installer.llamacpp.
+    try:
+        from installer import llamacpp
+        llamacpp.install_from_bundle()
+    except Exception:  # noqa: BLE001 - runtime provisioning must not fail because optional AI is absent
+        pass
     _write_stamp()
     return {"status": "ready", "reused": False, "python": str(py)}
 

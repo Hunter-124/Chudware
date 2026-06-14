@@ -3,6 +3,8 @@
 > Companion to [GUI_STYLE_GUIDE.md](GUI_STYLE_GUIDE.md). Two pieces of machine-enforcement so the
 > sizing standard is checkable, the backlog is enumerable, and dimensions live in one place:
 > `scripts/gui_lint.py` (the "typechecker") and `host/src/ui/metrics.h` (the central tokens).
+> A third audit script, `scripts/feature_surface_audit.py`, checks that every visible ribbon command
+> routes to a real handler or form.
 
 ## 1. `scripts/gui_lint.py` — the sizing/icon/theme linter
 
@@ -84,6 +86,8 @@ one-file edit, not a 25-file hunt.
 
 - **Pre-commit / CI:** run `python scripts/gui_lint.py --rule icons --rule theme` as a hard gate
   (deterministic, zero false positives), and `--rule scale --baseline …` as a ratchet.
+- **Feature-surface gate:** run `python scripts/feature_surface_audit.py`; any non-stretch ribbon
+  command that would fall through to the generic "no PM form yet" log is a release blocker.
 - **Startup assert (debug):** a `validateIconNames()` that checks the static icon tables against the
   atlas at launch, so a bad name trips in dev (complements the linter's static check). See
   GUI_AUDIT_FINDINGS §5.4.

@@ -92,6 +92,12 @@ static void helpMarker(const char* desc) {
     }
 }
 
+static void copySettingText(char* dst, size_t dstSize, const char* src) {
+    if (!dst || dstSize == 0) return;
+    std::fill(dst, dst + dstSize, 0);
+    std::strncpy(dst, src ? src : "", dstSize - 1);
+}
+
 // Apply a dark/light theme immediately (settings.theme persists on Save) and sync the viewport
 // background. Shared by the General-tab theme control. MUST pass st.scale: applyTheme re-seeds all
 // style-vars to base and only multiplies them by the scale argument (ScaleAllSizes) — passing 1.0f
@@ -189,19 +195,37 @@ void drawSettingsModal(AppState& st, bool busy) {
                         "%APPDATA%\\AI-CAD\\config.json.");
                 ImGui::Dummy(ImVec2(0, 4));
                 const char* provs[] = {"Anthropic (Claude)", "OpenAI",
-                                       "Local (OpenAI-compatible)"};
+                                       "Local (OpenAI-compatible)", "llama.cpp (managed local)"};
                 ImGui::SetNextItemWidth(-1);
-                ImGui::Combo("##prov", &settings.provider, provs, 3);
+                int prevProvider = settings.provider;
+                if (ImGui::Combo("##prov", &settings.provider, provs, 4) &&
+                    settings.provider != prevProvider) {
+                    if (settings.provider == 2) {
+                        copySettingText(settings.baseUrl, sizeof(settings.baseUrl),
+                                        "http://localhost:1234/v1");
+                        if (std::strstr(settings.model, ".gguf"))
+                            copySettingText(settings.model, sizeof(settings.model), "gemma-4-e4b");
+                        settings.vision = true;
+                    } else if (settings.provider == 3) {
+                        copySettingText(settings.baseUrl, sizeof(settings.baseUrl),
+                                        "http://127.0.0.1:1234/v1");
+                        if (!std::strstr(settings.model, ".gguf")) {
+                            copySettingText(settings.model, sizeof(settings.model),
+                                            "%APPDATA%\\AI-CAD\\models\\model.gguf");
+                        }
+                        settings.vision = false;
+                    }
+                }
                 ImGui::Dummy(ImVec2(0, 4));
-                ImGui::TextUnformatted("Model");
+                ImGui::TextUnformatted(settings.provider == 3 ? "GGUF model path" : "Model");
                 ImGui::SetNextItemWidth(-1);
                 ImGui::InputText("##model", settings.model, sizeof(settings.model));
-                if (settings.provider != 2) {
+                if (settings.provider == 0 || settings.provider == 1) {
                     ImGui::TextUnformatted("API key");
                     ImGui::SetNextItemWidth(-1);
                     ImGui::InputText("##key", settings.apiKey, sizeof(settings.apiKey),
                                      ImGuiInputTextFlags_Password);
-                } else {
+                } else if (settings.provider == 2) {
                     ImGui::TextUnformatted("Base URL");
                     ImGui::SetNextItemWidth(-1);
                     ImGui::InputText("##base", settings.baseUrl, sizeof(settings.baseUrl));
@@ -215,6 +239,17 @@ void drawSettingsModal(AppState& st, bool busy) {
                                "screenshot is sent back to the model so it can visually check the "
                                "part and self-correct. Only enable for multimodal local models — "
                                "a text-only model will error on image input.");
+                } else {
+                    ImGui::TextUnformatted("Base URL");
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputText("##llamabase", settings.baseUrl, sizeof(settings.baseUrl));
+                    ImGui::Checkbox("Model supports vision (send screenshots)",
+                                    &settings.vision);
+                    helpMarker("Managed llama.cpp launches a bundled or AppData-installed "
+                               "llama-server.exe on demand and talks to its local /v1 chat API. "
+                               "Put llama-server.exe under %APPDATA%\\AI-CAD\\llamacpp and a GGUF "
+                               "model under %APPDATA%\\AI-CAD\\models, or package those folders "
+                               "with the installer.");
                 }
                 // --- C35: local-only / offline mode (ITAR compliance) --- begin marked block ---
                 ImGui::Dummy(ImVec2(0, 8));

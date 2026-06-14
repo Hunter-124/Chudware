@@ -378,7 +378,8 @@ static void frameBBox(AppState& st, const float bboxMin[3], const float bboxMax[
         if (targetZoom > kMaxZoom) targetZoom = kMaxZoom;
         if (targetZoom < 1.0f) targetZoom = 1.0f;
     }
-    float pan[3] = {cx, cy, cz};
+    Vec3 mc = st.renderer ? st.renderer->modelCenter() : Vec3{0, 0, 0};
+    float pan[3] = {cx - mc.x, cy - mc.y, cz - mc.z};
     requestCameraAnimation(st, st.yaw, st.pitch, targetZoom, pan);
 }
 
@@ -535,7 +536,8 @@ static void normalToSelectionOrNearestAxis(AppState& st, bool inSketch) {
                 s_normalToPitch = pitchDeg;
 
                 // Pan to centroid so the face is centered on screen.
-                float pan[3] = {faceCx, faceCy, faceCz};
+                Vec3 mc = st.renderer ? st.renderer->modelCenter() : Vec3{0, 0, 0};
+                float pan[3] = {faceCx - mc.x, faceCy - mc.y, faceCz - mc.z};
                 requestCameraAnimation(st, yawDeg, pitchDeg, -1.0f, pan);
                 return;
             }
@@ -1080,6 +1082,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // ---- topology picking (C15): id pass + overlay highlights drawn over the shaded view ----
         const bool picking = st.hasDocMesh && st.idPass && st.overlays;
         if (picking) {
+            float clipN[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
+            float clipOff[3] = {0,0,0};
+            int clipCount = renderer.sectionClip(clipN, clipOff);
+            st.idPass->setSectionClip(clipCount, clipN, clipOff);
+            st.overlays->setSectionClip(clipCount, clipN, clipOff);
             // Render the R32UI id buffer for this exact camera frame so picks are pixel-accurate.
             st.idPass->render(renderer.camera());
             st.pickReady = true;
@@ -1778,14 +1785,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             ImGui::Separator();
             // C37-C item 3: wire the dead "View Selector (Space)" menu item to actually open the selector.
             if (ImGui::MenuItem("View Selector (Space)")) {
-                // Simulate a Space key press for the ViewSelector to catch in its next update().
-                // ViewSelector::update() checks imgHovered + !inSketch + Space key pressed.
-                // C38 (V1): only inject when the selector is NOT already up — Space toggles it, so
-                // injecting while it's open would instantly dismiss the box the user just asked for.
-                if (!s_viewSelector.active()) {
-                    ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, true);
-                    ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, false);
-                }
+                if (!s_viewSelector.active()) s_viewSelector.open();
             }
             ImGui::EndPopup();
         }
@@ -1917,12 +1917,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     ImGui::Separator();
                     // C37-C item 3: wire View Selector to actually open the selector widget.
                     if (ImGui::MenuItem("View Selector (Space)")) {
-                        // C38 (V1): don't inject Space when the selector is already up (Space toggles
-                        // it — re-injecting would instantly close the box the user just requested).
-                        if (!s_viewSelector.active()) {
-                            ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, true);
-                            ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, false);
-                        }
+                        if (!s_viewSelector.active()) s_viewSelector.open();
                     }
                     ImGui::EndPopup();
                 }

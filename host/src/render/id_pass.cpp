@@ -14,20 +14,35 @@ namespace {
 const char* kVertU = R"(#version 330 core
 layout(location=0) in vec3 aPos;
 uniform mat4 uMVP;
-void main(){ gl_Position = uMVP * vec4(aPos, 1.0); })";
+out vec3 vWorld;
+void main(){ vWorld = aPos; gl_Position = uMVP * vec4(aPos, 1.0); })";
 
 const char* kFragU = R"(#version 330 core
 uniform uint uId;
+uniform int uClipCount;
+uniform vec3 uClipN[3];
+uniform float uClipOff[3];
+in vec3 vWorld;
 out uint frag;
-void main(){ frag = uId; })";
+void main(){
+    for (int i = 0; i < uClipCount; ++i)
+        if (dot(vWorld, uClipN[i]) > uClipOff[i]) discard;
+    frag = uId;
+})";
 
 // RGBA8 fallback: same vertex shader, pack the 32-bit id into RGBA bytes (little-endian-ish:
 // r = low byte ... a = high byte). Readback reassembles. Only the low 24 bits carry topo data
 // and 8 bits body, so all 32 bits are meaningful — we use all four channels.
 const char* kFragRGBA = R"(#version 330 core
 uniform uint uId;
+uniform int uClipCount;
+uniform vec3 uClipN[3];
+uniform float uClipOff[3];
+in vec3 vWorld;
 out vec4 frag;
 void main(){
+    for (int i = 0; i < uClipCount; ++i)
+        if (dot(vWorld, uClipN[i]) > uClipOff[i]) discard;
     uint id = uId;
     float r = float(id & 0xFFu) / 255.0;
     float g = float((id >> 8u) & 0xFFu) / 255.0;
@@ -64,6 +79,16 @@ unsigned int linkProgram(const char* vs, const char* fs) {
 }  // namespace
 
 IdPass::~IdPass() { destroy(); }
+
+void IdPass::setSectionClip(int count, const float normals[3][3], const float offsets[3]) {
+    clipCount_ = count < 0 ? 0 : (count > 3 ? 3 : count);
+    for (int i = 0; i < clipCount_; ++i) {
+        clipNormals_[i][0] = normals[i][0];
+        clipNormals_[i][1] = normals[i][1];
+        clipNormals_[i][2] = normals[i][2];
+        clipOffsets_[i] = offsets[i];
+    }
+}
 
 void IdPass::destroy() {
     for (auto& f : faces_) {
@@ -223,6 +248,11 @@ void IdPass::render(const Renderer::CameraXform& cam) {
 
     glUseProgram(prog_);
     glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, cam.mvp.m);
+    glUniform1i(glGetUniformLocation(prog_, "uClipCount"), clipCount_);
+    if (clipCount_ > 0) {
+        glUniform3fv(glGetUniformLocation(prog_, "uClipN"), clipCount_, clipNormals_[0]);
+        glUniform1fv(glGetUniformLocation(prog_, "uClipOff"), clipCount_, clipOffsets_);
+    }
     int idLoc = glGetUniformLocation(prog_, "uId");
 
     // Faces first, pushed back so edges/verts win the depth test on coincident geometry.

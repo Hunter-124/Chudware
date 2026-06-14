@@ -27,6 +27,7 @@ public:
 
     // Highlight colors (RGBA, 0..1). hover = the single hovered item; selection = the picked set.
     void setColors(const float hover[4], const float selection[4]);
+    void setSectionClip(int count, const float normals[3][3], const float offsets[3]);
 
     // Draw the hovered item (pass an invalid PickHit to draw nothing) and every item in `sel`,
     // using the camera from the matching shaded frame. Renders into the currently-bound FBO
@@ -69,6 +70,9 @@ private:
     float selCol_[4] = {1.000f, 0.620f, 0.180f, 0.55f};        // amber wash
     // C37-C: feature-highlight color — slightly dimmer amber (same hue, lower alpha)
     float featHlCol_[4] = {1.000f, 0.620f, 0.180f, 0.30f};
+    int clipCount_ = 0;
+    float clipNormals_[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
+    float clipOffsets_[3] = {0,0,0};
 };
 
 }  // namespace render

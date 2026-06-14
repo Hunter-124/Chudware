@@ -434,10 +434,13 @@ bool Renderer::init(int width, int height, std::string& err) {
 
     buildLut();  // C19 result colormap ramp
     allocTargets();
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
         err = "framebuffer incomplete";
         return false;
     }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glEnable(GL_DEPTH_TEST);
     return true;
 }
@@ -736,6 +739,7 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
         glEnable(GL_POLYGON_OFFSET_FILL);
         glPolygonOffset(1.0f, 1.0f);
         if (hlr) glUniform1i(useScalarLoc, 0);
+        if (hlr) glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
         for (const auto& s : subs_) {
             if (!s.visible) continue;   // Solid Bodies: hidden body draws nothing
             bool useScalar = !hlr && colormap_ && s.hasScalar;
@@ -751,6 +755,7 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
             glBindVertexArray(s.vao);
             glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);
         }
+        if (hlr) glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glBindVertexArray(0);
         glDisable(GL_POLYGON_OFFSET_FILL);
     }
@@ -1024,6 +1029,16 @@ void Renderer::setSectionPlane(const float normal[3], float offset, bool enabled
     const float ns[1][3] = {{normal[0], normal[1], normal[2]}};
     const float offs[1] = {offset};
     setSectionPlanes(ns, offs, 1, capRgb, showCap);
+}
+
+int Renderer::sectionClip(float normals[3][3], float offsets[3]) const {
+    for (int i = 0; i < section_.count && i < kMaxSectionPlanes; ++i) {
+        normals[i][0] = section_.normals[i][0];
+        normals[i][1] = section_.normals[i][1];
+        normals[i][2] = section_.normals[i][2];
+        offsets[i] = section_.offsets[i];
+    }
+    return section_.count;
 }
 
 // Four world-space corners of a plane quad of half-extent e, centered at center_.

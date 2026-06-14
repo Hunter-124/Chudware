@@ -19,6 +19,7 @@
 | matplotlib | PSF-based | colormap LUTs only | ok |
 | lib3mf | BSD-2 | 3MF export | ok |
 | anthropic / openai / mcp / httpx | MIT/Apache | providers | ok |
+| llama.cpp (optional managed runtime) | MIT | local model server | ok; optional subprocess/server payload copied to `%APPDATA%\AI-CAD\llamacpp` when bundled |
 | Dear ImGui | MIT | UI | ok |
 | **ImGui Test Engine** | **dual: free for OSS/personal; paid for closed-source commercial** | dev-only GUI tests | vendored behind `AI_CAD_TESTS=ON`, NEVER shipped in dist; flag before commercialization |
 | GLFW / glad / nlohmann_json / stb | zlib / MIT / MIT | host | ok |

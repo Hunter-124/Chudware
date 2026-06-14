@@ -42,7 +42,8 @@ DEFAULT_ROOTS = [os.path.join(REPO, "host", "src")]
 
 # ---- helpers --------------------------------------------------------------------------------------
 
-SCALE_TOKENS = ("ui::uiScale", "uiScale", "rsc", "sc", "scale", "px(", "U(", "dpiS", "pxScale")
+SCALE_TOKENS = ("ui::uiScale", "uiScale", "rsc", "sc", "scale", "s", "S", "px(", "U(",
+                "ui::metrics::px(", "ui::metrics::U(", "dpiS", "pxScale")
 # Metric accessors whose result is already DPI-correct (pre-scaled fonts / scaled style).
 METRIC_TOKENS = ("CalcTextSize", "GetFrameHeight", "GetTextLineHeight", "GetContentRegion",
                  "GetFontSize", "GetStyle(", "CalcItemWidth", "GetWindowWidth", "GetWindowHeight",
@@ -63,6 +64,12 @@ PIXEL_MIN = 2.0
 
 NUM_RE = re.compile(r"(?<![\w.])(-?\d+\.?\d*)f?(?![\w.\d])")
 SUPPRESS_RE = re.compile(r"gui-lint:\s*(allow|ok)")
+SCALE_MUL_RE = re.compile(
+    r"(\*\s*(?:ui::uiScale|uiScale|rsc|sc|scale|s|S|dpiS|pxScale)\b)|"
+    r"((?:ui::uiScale|uiScale|rsc|sc|scale|s|S|dpiS|pxScale)\b\s*\*)|"
+    r"(?:ui::metrics::)?(?:px|U)\s*\("
+)
+COLOR_MACRO_RE = re.compile(r"\bIM_COL32\s*\([^)]*\)")
 
 
 def load_atlas_names(path: str) -> set[str]:
@@ -123,13 +130,27 @@ def literal_is_scaled(args: str, mstart: int, mend: int) -> bool:
     """True if the numeric literal at args[mstart:mend] is multiplied by a scale token, or the
     surrounding call clearly derives from a pre-scaled metric."""
     ctx = args[max(0, mstart - 16): min(len(args), mend + 16)]
-    if "*" in ctx and any(tok in ctx for tok in SCALE_TOKENS):
+    if SCALE_MUL_RE.search(ctx):
         return True
     # Lenient: if the whole call references a pre-scaled metric, assume the author is mixing
     # intentionally (these are rarer and noisier to flag); the audit covers the double-scale cases.
     if any(tok in args for tok in METRIC_TOKENS):
         return True
     return False
+
+
+def literal_is_ratio(args: str, mstart: int, mend: int) -> bool:
+    """Treat simple multiply/divide factors as ratios/counts, not pixel dimensions.
+
+    Examples: `hitR * 2`, `bw * 3.0f`, `(p0.y + p1.y) * 0.5f`. Raw offsets like `x + 2` still flag.
+    """
+    left = args[max(0, mstart - 3):mstart]
+    right = args[mend:min(len(args), mend + 3)]
+    return "*" in left or "*" in right or "/" in left or "/" in right
+
+
+def strip_color_macros(args: str) -> str:
+    return COLOR_MACRO_RE.sub("IM_COL32()", args)
 
 
 # ---- rules ----------------------------------------------------------------------------------------
@@ -180,12 +201,15 @@ def lint_file(path: str, atlas: set[str], rules: set[str], findings: list):
                 if func + "(" not in code:
                     continue
                 for args in extract_call_args(code, func):
+                    args = strip_color_macros(args)
                     for nm in NUM_RE.finditer(args):
                         try:
                             val = abs(float(nm.group(1)))
                         except ValueError:
                             continue
                         if val < PIXEL_MIN or val in SAFE_LITERALS:
+                            continue
+                        if literal_is_ratio(args, nm.start(), nm.end()):
                             continue
                         if literal_is_scaled(args, nm.start(), nm.end()):
                             continue

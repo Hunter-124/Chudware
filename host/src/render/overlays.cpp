@@ -12,12 +12,21 @@ namespace {
 const char* kVert = R"(#version 330 core
 layout(location=0) in vec3 aPos;
 uniform mat4 uMVP;
-void main(){ gl_Position = uMVP * vec4(aPos, 1.0); })";
+out vec3 vWorld;
+void main(){ vWorld = aPos; gl_Position = uMVP * vec4(aPos, 1.0); })";
 
 const char* kFrag = R"(#version 330 core
 uniform vec4 uColor;
+uniform int uClipCount;
+uniform vec3 uClipN[3];
+uniform float uClipOff[3];
+in vec3 vWorld;
 out vec4 frag;
-void main(){ frag = uColor; })";
+void main(){
+    for (int i = 0; i < uClipCount; ++i)
+        if (dot(vWorld, uClipN[i]) > uClipOff[i]) discard;
+    frag = uColor;
+})";
 
 unsigned int compile(unsigned int type, const char* src) {
     unsigned int s = glCreateShader(type);
@@ -67,6 +76,16 @@ void Overlays::setColors(const float hover[4], const float selection[4]) {
     for (int i = 0; i < 4; ++i) {
         hoverCol_[i] = hover[i];
         selCol_[i] = selection[i];
+    }
+}
+
+void Overlays::setSectionClip(int count, const float normals[3][3], const float offsets[3]) {
+    clipCount_ = count < 0 ? 0 : (count > 3 ? 3 : count);
+    for (int i = 0; i < clipCount_; ++i) {
+        clipNormals_[i][0] = normals[i][0];
+        clipNormals_[i][1] = normals[i][1];
+        clipNormals_[i][2] = normals[i][2];
+        clipOffsets_[i] = offsets[i];
     }
 }
 
@@ -204,6 +223,11 @@ void Overlays::drawFeatureHighlight(const Renderer::CameraXform& cam,
     if (faceKeys.empty() || !prog_) return;
     glUseProgram(prog_);
     glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, cam.mvp.m);
+    glUniform1i(glGetUniformLocation(prog_, "uClipCount"), clipCount_);
+    if (clipCount_ > 0) {
+        glUniform3fv(glGetUniformLocation(prog_, "uClipN"), clipCount_, clipNormals_[0]);
+        glUniform1fv(glGetUniformLocation(prog_, "uClipOff"), clipCount_, clipOffsets_);
+    }
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
     glEnable(GL_BLEND);
@@ -230,6 +254,11 @@ void Overlays::draw(const Renderer::CameraXform& cam, const PickHit& hover,
     if (!prog_) return;
     glUseProgram(prog_);
     glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, cam.mvp.m);
+    glUniform1i(glGetUniformLocation(prog_, "uClipCount"), clipCount_);
+    if (clipCount_ > 0) {
+        glUniform3fv(glGetUniformLocation(prog_, "uClipN"), clipCount_, clipNormals_[0]);
+        glUniform1fv(glGetUniformLocation(prog_, "uClipOff"), clipCount_, clipOffsets_);
+    }
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
 

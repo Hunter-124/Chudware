@@ -1,9 +1,17 @@
 {
-  "_comment": "Copy to %APPDATA%/AI-CAD/config.json and fill in. Or just set ANTHROPIC_API_KEY in your environment and skip this file.",
-  "provider": "anthropic",
-  "model": "claude-opus-4-8",
+  "_comment": "Copy to %APPDATA%/AI-CAD/config.json and fill in. Providers: anthropic, openai, llamacpp.",
+  "provider": "llamacpp",
+  "model": "local-gguf",
   "api_key": "sk-ant-...",
   "openai": {
     "base_url": null
+  },
+  "llamacpp": {
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model_path": "%APPDATA%/AI-CAD/models/model.gguf",
+    "auto_start": true,
+    "ctx_size": 8192,
+    "gpu_layers": -1,
+    "vision": false
   }
 }

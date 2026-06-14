@@ -103,7 +103,15 @@ bool ConfigPanel::runConfigOp(AppState& st, const std::string& method,
 void ConfigPanel::draw(AppState& st) {
     if (!st.showConfigPanel) return;
     if (!ImGui::Begin("Configurations", &st.showConfigPanel)) { ImGui::End(); return; }
+    drawBody(st);
+    ImGui::End();
+}
 
+void ConfigPanel::drawEmbedded(AppState& st) {
+    drawBody(st);
+}
+
+void ConfigPanel::drawBody(AppState& st) {
     const auto& pal = ui::palette;
     const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
     const ImVec4 dimCol(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1);
@@ -113,7 +121,6 @@ void ConfigPanel::draw(AppState& st) {
         ImGui::TextColored(dimCol, "Open a part or assembly to manage configurations.");
         cacheValid_ = false;
         addPromptOpen_ = false;
-        ImGui::End();
         return;
     }
 
@@ -200,7 +207,6 @@ void ConfigPanel::draw(AppState& st) {
     // ---- configuration list ----
     if (names_.empty()) {
         ImGui::TextColored(dimCol, "No configurations.");
-        ImGui::End();
         return;
     }
 
@@ -264,7 +270,6 @@ void ConfigPanel::draw(AppState& st) {
     }
     ImGui::EndChild();
 
-    ImGui::End();
 }
 
 }  // namespace ui

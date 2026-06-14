@@ -59,9 +59,9 @@ enum class Units { MMGS = 0, IPS = 1 };
 
 // ---------------- settings (AI provider) -> %APPDATA%/AI-CAD/config.json ----------------
 struct Settings {
-    int provider = 2;  // 0 = Anthropic, 1 = OpenAI, 2 = Local (OpenAI-compatible).
+    int provider = 2;  // 0 = Anthropic, 1 = OpenAI, 2 = Local OpenAI-compatible, 3 = managed llama.cpp.
                        // Default to a local LM Studio so the app is testable out of the box.
-    char model[128] = "gemma-4-e4b";
+    char model[512] = "gemma-4-e4b";
     char apiKey[256] = "";
     char baseUrl[256] = "http://localhost:1234/v1";
     bool vision = true;

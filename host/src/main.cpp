@@ -192,8 +192,14 @@ int main(int argc, char** argv) {
         std::printf("%s\n", log.c_str());
         return ok ? 0 : 1;
     }
-    if (argc >= 3 && std::strcmp(argv[1], "--ui-screenshot") == 0)
-        return run_gui(argv[2]);  // headless UI capture
+    if (argc >= 2 && std::strcmp(argv[1], "--ui-screenshot") == 0) {
+        // Headless UI capture. An explicit output path is optional; when omitted (the common
+        // smoke-test invocation `AI-CAD --ui-screenshot`), default to a PNG next to the exe so
+        // `shot` is still enabled and the capture-then-exit path runs (otherwise we'd fall
+        // through to interactive GUI mode and hang headlessly, never writing a PNG).
+        static std::string defShot = exeDir() + "\\ui_screenshot.png";
+        return run_gui(argc >= 3 ? argv[2] : defShot.c_str());
+    }
     // GUI opens immediately and provisions the runtime in-app (with progress) if needed.
     return run_gui(nullptr);
 }

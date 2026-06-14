@@ -10,7 +10,7 @@ $ErrorActionPreference = "Stop"
 $src = $PSScriptRoot
 Write-Host "==> Installing AI-CAD to $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-foreach ($item in @("AI-CAD.exe", "assets", "app", "wheelhouse", "python-embed", "requirements.txt")) {
+foreach ($item in @("AI-CAD.exe", "assets", "app", "wheelhouse", "python-embed", "requirements.txt", "llamacpp", "models")) {
     $p = Join-Path $src $item
     if (Test-Path $p) { Copy-Item $p -Destination $InstallDir -Recurse -Force }
 }

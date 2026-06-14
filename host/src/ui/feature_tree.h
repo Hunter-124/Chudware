@@ -18,6 +18,11 @@ namespace ui {
 void drawFeatureTree(AppState& st,
                      const std::function<void(const std::string& featureId)>& editCallback = {});
 
+// Draw only the FeatureManager contents into the current window/child. Used by the SolidWorks-style
+// left pane shell so the tree can be hosted beside Explorer / PropertyManager / Configurations tabs.
+void drawFeatureTreeEmbedded(AppState& st,
+                             const std::function<void(const std::string& featureId)>& editCallback = {});
+
 // W1-B (item 5): clear the tree's in-progress transient state (the inline-rename id + buffer and any
 // queued-but-unapplied tree ops). Called by AppState::clearViewportForNewDoc and any path that
 // replaces the DocMirror wholesale, so a fresh document never inherits a stale rename/op from the

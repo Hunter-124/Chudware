@@ -57,6 +57,7 @@
 #include "ui/property_manager.h"
 #include "ui/sketch_mode.h"   // C18
 #include "ui/config_panel.h"  // Configurations (SolidWorks ConfigurationManager)
+#include "ui/left_pane.h"    // SolidWorks-style Explorer/FM/PM/Config manager
 #include "ui/design_table_panel.h"  // Design Table (SolidWorks editable config grid)
 #include "ui/cutlist_panel.h"  // Weldment Cut List (SolidWorks Weldment Cut List)
 #include "ui/file_dialog.h"   // W14: native Save-As for 2D export (flat-pattern DXF)
@@ -130,13 +131,13 @@ void ecadDocRpc(AppState& st, const char* method, const char* okMsg) {
 
 // Apply an op batch to the current ECAD doc (canvas place/route edits) with the optimistic-
 // concurrency + stale-revision-resync discipline core/doc_mirror.cpp uses for the CAD doc.
-void ecadApplyOps(AppState& st, const nlohmann::json& ops) {
-    if (st.ecadDocId.empty() || !ops.is_array() || ops.empty()) return;
+bool ecadApplyOps(AppState& st, const nlohmann::json& ops) {
+    if (st.ecadDocId.empty() || !ops.is_array() || ops.empty()) return false;
     nlohmann::json res; std::string err;
     nlohmann::json params = {{"doc_id", st.ecadDocId}, {"base_revision", st.ecadRevision}, {"ops", ops}};
     if (!st.worker.call("ecad_apply_ops", params, res, err)) {
         st.toast(ui::ToastLevel::Error, "ECAD edit failed: " + err);
-        return;
+        return false;
     }
     if (res.is_object() && res.contains("code")) {
         if (jstr(res, "code") == "stale_revision") {
@@ -147,9 +148,10 @@ void ecadApplyOps(AppState& st, const nlohmann::json& ops) {
         } else {
             st.toast(ui::ToastLevel::Error, "ECAD: " + jstr(res, "message"));
         }
-        return;
+        return false;
     }
     ecadAdopt(st, res);
+    return true;
 }
 
 // Undo / Redo the current ECAD doc via the worker's history (ecad_undo / ecad_redo). Both return an
@@ -382,8 +384,20 @@ void ecadSimulate(AppState& st) {
         return;
     }
     st.ecadSimResults = res.contains("results") ? res["results"] : nlohmann::json::object();
-    st.toast(ui::ToastLevel::Info, st.ecadSimAnalysis == 1 ? "Simulated (AC)" : "Simulated (transient)");
-    st.addLog("[ecad] simulate " + std::string(st.ecadSimAnalysis == 1 ? "ac" : "tran"));
+    const bool converged = jbool(res, "converged");
+    if (converged) {
+        st.toast(ui::ToastLevel::Info, st.ecadSimAnalysis == 1 ? "Simulated (AC)" : "Simulated (transient)");
+    } else {
+        st.toast(ui::ToastLevel::Warn, "Simulation ran, but convergence warnings need review");
+    }
+    std::string line = "[ecad] simulate " + std::string(st.ecadSimAnalysis == 1 ? "ac" : "tran") +
+                       (converged ? " converged" : " not converged");
+    if (res.contains("convergence")) line += " " + res["convergence"].dump();
+    if (res.contains("ms") && !res["ms"].is_null()) line += " " + res["ms"].dump() + "ms";
+    st.addLog(line);
+    if (!converged && res.contains("log") && res["log"].is_array() && !res["log"].empty()) {
+        st.addLog("[ecad] sim log: " + res["log"].back().dump());
+    }
 }
 
 // Route a PCB-tab ribbon command. New docs + doc-scoped analysis/exports run now; geometry-placing
@@ -403,6 +417,20 @@ void ecadDispatch(AppState& st, const std::string& cmd) {
     if (cmd == "ecad_export_gerber") { ecadExport(st, "gerber"); return; }
     if (cmd == "ecad_export_drill")  { ecadExport(st, "drill"); return; }
     if (cmd == "ecad_export_bom")    { ecadExport(st, "bom"); return; }
+    if (cmd == "sch_annotate") {
+        if (st.ecadDocId.empty()) {
+            st.toast(ui::ToastLevel::Warn, "Open a schematic to annotate");
+            return;
+        }
+        bool ok = ecadApplyOps(st, nlohmann::json::array({
+            {{"op", "sch_annotate"}, {"scope", "all"}, {"mode", "reset"}}
+        }));
+        if (ok) {
+            st.toast(ui::ToastLevel::Info, "Schematic annotated");
+            st.wantFocusEcad = 4;
+        }
+        return;
+    }
     // Canvas tool modes (Wave Q): place a part / route on click.
     if (cmd == "sch_add_symbol" || cmd == "pcb_add_footprint") {
         st.ecadTool = 1; st.wantFocusEcad = 4;
@@ -1372,6 +1400,7 @@ int run_gui(const char* screenshotPath) {
                           ? rr.tree["features"].size() : 0));
                 std::fflush(stdout);
                 if (rr.ok && !rr.aicm_path.empty()) { std::string le; st.loadDocMesh(rr.aicm_path, le); }
+                st.wantFocusViewport = 6;
             } else {
                 std::printf("tree-shot: doc_new failed: %s\n", err.c_str());
                 std::fflush(stdout);
@@ -1704,7 +1733,7 @@ int run_gui(const char* screenshotPath) {
         float docTabsH = ui::drawDocTabs(st, barH + ribbonH);
 
         // ---------- dockspace host (between the title bar+ribbon and the status bar) ----------
-        const float statusH = 30.0f * scale;
+        const float statusH = ImGui::GetFrameHeight();
         const float dockTopY = barH + ribbonH + docTabsH;
         ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + dockTopY));
         ImGui::SetNextWindowSize(ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
@@ -1727,6 +1756,7 @@ int run_gui(const char* screenshotPath) {
             // SolidWorks's task pane defaulting to the first tab. Deferred one frame via a flag so
             // the docked windows exist before we focus.
             st.focusDesignTab = true;
+            if (!st.wantEcad) st.wantFocusViewport = 6;
         }
         ImGui::DockSpace(dockId, ImVec2(0, 0), ImGuiDockNodeFlags_None);
         ImGui::End();
@@ -1737,19 +1767,14 @@ int run_gui(const char* screenshotPath) {
         bool canRun = st.workerStarted && !busy;
 
         // ---------- panels ----------
-        // C17: the PropertyManager occupies the FeatureManager dock slot while a command is
-        // active; the tree returns when the PM closes (OK/Cancel). The tree's context-menu "Edit"
-        // reopens a PM form populated from the feature.
-        if (st.showFeatureTree) {
-            if (propertyManager.active()) {
-                propertyManager.tick(st);     // fire the debounced live preview if dirty
-                propertyManager.draw(st);
-            } else {
-                ui::drawFeatureTree(st, [&st, &propertyManager](const std::string& fid) {
-                    propertyManager.openForEdit(st, fid);
-                });
-            }
-        }
+        // SolidWorks-style left manager: Explorer / FeatureManager / PropertyManager /
+        // ConfigurationManager in one docked pane. A live PropertyManager auto-selects its tab.
+        if (propertyManager.active()) st.showFeatureTree = true;
+        propertyManager.tick(st);     // fire the debounced live preview if dirty
+        ui::drawLeftPane(st, propertyManager, configPanel,
+            [&st, &propertyManager](const std::string& fid) {
+                propertyManager.openForEdit(st, fid);
+            });
         // W3-H: unified AI Copilot pane (input-at-top + conversation; embeds the run tree
         // inline while a v2 run is active). st.activityPanel is still fed events via onEvent.
         ui::drawAIPanel(st, busy, canRun);
@@ -1776,10 +1801,8 @@ int run_gui(const char* screenshotPath) {
         // ---------- C20b: assembly panels (Insert / Mate / Explode / Interference / BOM) ----------
         asmPanels.draw(st);
 
-        // ---------- Configurations panel (SolidWorks ConfigurationManager) ----------
-        // Lists the active part/asm doc's configurations; activate/add/delete ingest the
-        // ops-response so the viewport + FeatureManager refresh. No-op unless st.showConfigPanel.
-        configPanel.draw(st);
+        // Configurations now lives inside the left manager's ConfigurationManager tab, matching
+        // the commercial CAD mental model instead of floating as a separate task-pane window.
 
         // ---------- Design Table panel (SolidWorks editable config grid) ----------
         // Editable spreadsheet over the active doc's configurations: rows=configs, columns=driven

@@ -176,6 +176,8 @@ public:
 
     // Draw the PM panel into the dock slot (called in place of the tree while active()).
     void draw(AppState& st);
+    // Draw only the PM form body into the current window/child. Used by the tabbed left pane.
+    void drawEmbedded(AppState& st);
 
     // Feed a resolved viewport pick into the active selector well (called from the selection
     // observer). Returns true if the pick was consumed (an active well accepted it).
@@ -221,7 +223,7 @@ public:
     // C43: public cancel — revert every preview batch to the open-time checkpoint and close.
     // Used by the ribbon dispatcher when a sketch command must displace an open form
     // (mutual exclusion: a PM and the plane-pick overlay must never coexist).
-    void cancelEdits(AppState& st); // Cancel: undo every preview batch
+    bool cancelEdits(AppState& st); // Cancel: undo every preview batch
 
     // C48: id of the IN-FLIGHT create-mode preview feature ("" when none / edit mode).
     // The sketch ghost renderer exempts this feature's sketch consumption so the profile
@@ -233,9 +235,10 @@ public:
 
 private:
     void close();
+    void drawBody(AppState& st);
     void commit(AppState& st);     // OK
     void buildOpFeature(nlohmann::json& feature) const;   // assemble {type,name,params,refs}
-    void applyPreview(AppState& st);  // add (first) or edit_feature; debounced
+    bool applyPreview(AppState& st);  // add (first) or edit_feature; debounced
     void loadFromTree(AppState& st, const nlohmann::json& feature);  // edit-path populate
     PMField* activeWell();
     // C51: the profile/sections well (first SelectorWell keyed "profile" or "sections").
@@ -257,6 +260,7 @@ private:
     std::vector<PMField> fields_;
 
     int previewBatches_ = 0;       // preview ops applied (fallback undo count if checkpoint failed)
+    bool previewUndoGroupStarted_ = false;  // true after the first undo snapshot for this PM
     bool dirty_ = false;           // a field changed since last preview
     double lastEditTime_ = 0.0;    // ImGui::GetTime() of the last field change (debounce)
     bool firstPreviewDone_ = false;

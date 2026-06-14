@@ -88,6 +88,9 @@ add_executable(AI-CAD
   # --- Configurations panel (SolidWorks ConfigurationManager) ---
   src/ui/config_panel.cpp
   # --- end Configurations ---
+  # --- SolidWorks-style tabbed left pane shell ---
+  src/ui/left_pane.cpp
+  # --- end left pane ---
   # --- Design Table panel (SolidWorks editable config grid) ---
   src/ui/design_table_panel.cpp
   # --- end Design Table ---

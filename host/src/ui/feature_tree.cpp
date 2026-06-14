@@ -1183,10 +1183,8 @@ static void drawFeatureManagerTopStrip(AppState& st) {
 
 // ---- main draw function ----
 
-void drawFeatureTree(AppState& st,
-                     const std::function<void(const std::string&)>& editCallback) {
-    if (!ImGui::Begin("FeatureManager")) { ImGui::End(); return; }
-
+static void drawFeatureTreeBody(AppState& st,
+                                const std::function<void(const std::string&)>& editCallback) {
     const auto& pal = ui::palette;
 
     // C24: SolidWorks-style top strip (tab row + compact doc toolbar), replacing the old wide
@@ -1936,7 +1934,18 @@ void drawFeatureTree(AppState& st,
     // C25: apply ops queued during drawing — safe now, nothing reads the tree json below.
     flushPendingTreeOps(st);
 
+}
+
+void drawFeatureTree(AppState& st,
+                     const std::function<void(const std::string&)>& editCallback) {
+    if (!ImGui::Begin("FeatureManager")) { ImGui::End(); return; }
+    drawFeatureTreeBody(st, editCallback);
     ImGui::End();
+}
+
+void drawFeatureTreeEmbedded(AppState& st,
+                             const std::function<void(const std::string&)>& editCallback) {
+    drawFeatureTreeBody(st, editCallback);
 }
 
 }  // namespace ui

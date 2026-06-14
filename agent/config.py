@@ -6,10 +6,11 @@ AI_CAD_PROVIDER=mock to guarantee no live model is called), while config.json is
 state. config.json shape:
 
     {
-      "provider": "anthropic",          // or "openai"
+      "provider": "anthropic",          // or "openai" / "llamacpp"
       "model": "claude-opus-4-8",
       "api_key": "sk-ant-...",          // optional; else read from env
-      "openai": {"base_url": "http://localhost:1234/v1"}
+      "openai": {"base_url": "http://localhost:1234/v1"},
+      "llamacpp": {"model_path": "%APPDATA%/AI-CAD/models/model.gguf"}
     }
 """
 from __future__ import annotations
@@ -84,6 +85,8 @@ def provider_offline_safe(provider: Provider) -> bool:
     if name == "openai":
         # No base_url means the real OpenAI cloud endpoint; otherwise check the host.
         return _host_is_loopback(base_url)
+    if name == "llamacpp":
+        return _host_is_loopback(base_url or DEFAULT_LOCAL_BASE_URL)
     # Unknown provider with a loopback base_url is allowed; anything else is refused.
     return _host_is_loopback(base_url)
 
@@ -133,6 +136,16 @@ def _resolve_provider(name: str | None, cfg: dict) -> Provider:
                 f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the OpenAI cloud "
                 f"provider is refused. Configure a local (loopback) base_url, or disable offline "
                 f"mode in Settings.")
+    if offline and name in ("llamacpp", "llama.cpp", "llama-cpp"):
+        lcfg = dict(cfg.get("llamacpp", {}) or {})
+        host = str(lcfg.get("host") or "127.0.0.1")
+        port = int(lcfg.get("port") or 1234)
+        base_url = lcfg.get("base_url") or f"http://{host}:{port}/v1"
+        if not _host_is_loopback(base_url):
+            raise OfflineModeError(
+                f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the managed "
+                f"llama.cpp endpoint {base_url!r} is not loopback, so it is refused before "
+                f"probing the server.")
 
     if not name:
         # Nothing configured: default to a local LM Studio (OpenAI-compatible) endpoint
@@ -182,5 +195,14 @@ def _resolve_provider(name: str | None, cfg: dict) -> Provider:
         return OpenAIProvider(api_key=key, model=cfg.get("model", DEFAULT_MODEL),
                               base_url=oai.get("base_url"),
                               supports_vision=oai.get("vision", True))
+
+    if name in ("llamacpp", "llama.cpp", "llama-cpp"):
+        from .providers.llamacpp_provider import LlamaCppProvider, DEFAULT_MODEL
+
+        lcfg = dict(cfg.get("llamacpp", {}) or {})
+        lcfg.setdefault("model", cfg.get("model") or DEFAULT_MODEL)
+        # Keep the endpoint explicit in the provider object so offline-safety and diagnostics name it.
+        lcfg.setdefault("base_url", DEFAULT_LOCAL_BASE_URL)
+        return LlamaCppProvider(lcfg, model=lcfg["model"])
 
     raise ValueError(f"Unknown provider: {name!r}")

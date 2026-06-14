@@ -16,15 +16,15 @@ namespace {
 
 struct PresetDef { const char* label; float n[3]; };
 const PresetDef kPresets[3] = {
-    {"Front", {0, 0, 1}},
-    {"Top",   {0, 1, 0}},
+    {"Front", {0, 1, 0}},
+    {"Top",   {0, 0, 1}},
     {"Right", {1, 0, 0}},
 };
 
 // Default axis-aligned normals for planes 0/1/2 (used by AI_CAD_SECTION=2/3).
 const float kAxisNormals[3][3] = {{1,0,0}, {0,1,0}, {0,0,1}};
 const SectionTool::Preset kAxisPresets[3] = {
-    SectionTool::Preset::Right, SectionTool::Preset::Top, SectionTool::Preset::Front
+    SectionTool::Preset::Right, SectionTool::Preset::Front, SectionTool::Preset::Top
 };
 
 bool projectPt(const float* m, const Vec3& w, ImVec2 vr0, ImVec2 vr1, ImVec2& out) {

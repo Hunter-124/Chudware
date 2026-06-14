@@ -65,7 +65,7 @@ def _provider_is_local(provider: Provider) -> bool:
     name = getattr(provider, "name", "")
     if name in ("mock", "mock-roles"):
         return True
-    if name == "openai":
+    if name in ("openai", "llamacpp"):
         return agent_config._host_is_loopback(getattr(provider, "base_url", None))
     return False
 
@@ -211,6 +211,10 @@ _EXEC_EDIT_BIAS = (
     '[{"op":"edit_feature","id":"f1","params":{"width":{"value":60,"expr":null}}}]) — '
     "NOT a new add_feature duplicate.")
 
+_EXEC_WORKFLOW_REMINDER = (
+    "LOCAL WORKFLOW: emit one JSON doc-op array for only this step. Use existing ids from "
+    "CURRENT DOC. If a required detail is missing, emit [] rather than inventing geometry.")
+
 
 def _doc_has_features(doc_summary: str) -> bool:
     return bool(doc_summary) and "(empty" not in doc_summary
@@ -241,7 +245,7 @@ def build_executor_prompt(step: Step, doc_summary: str, request: str,
 
     step_text = (f"STEP TO DO NOW:\ntype: {step.type}\n{step.desc}"
                  + (f"\nparams: {json.dumps(step.params)}" if step.params else ""))
-    parts = [f"REQUEST (overall): {request}", doc_summary, step_text]
+    parts = [f"REQUEST (overall): {request}", doc_summary, step_text, _EXEC_WORKFLOW_REMINDER]
     # Wave D: steer an edit-shaped step over an existing doc to edit_feature, not a duplicate.
     if _doc_has_features(doc_summary) and looks_like_edit(request):
         parts.append(_EXEC_EDIT_BIAS)

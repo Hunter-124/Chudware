@@ -135,7 +135,18 @@ def _doc_new(params: dict, _emit: EmitFn) -> dict:
 
 def _doc_open(params: dict, _emit: EmitFn) -> dict:
     from engine.doc import stepplus, session as docsess
-    s, warnings = stepplus.open(params["path"])
+    path = params["path"]
+    # Route by extension: AI-CAD's native ".step+" zip goes through stepplus.open; a plain neutral
+    # geometry file (.step/.stp/.iges/.igs/.brep/.stl/.3mf — the _EXT_TO_FORMAT set) is IMPORTED as
+    # a fresh part instead (stepplus.open only understands the .step+ container, so opening a plain
+    # STEP used to fail). The import path returns the same doc-state shape (doc_id/tree/revision).
+    from engine.doc.formats import _EXT_TO_FORMAT, _handler_import_file
+    if Path(path).suffix.lower() in _EXT_TO_FORMAT:
+        resp = _handler_import_file({"path": path}, _emit)
+        resp.setdefault("warnings", [])
+        resp.setdefault("drawings", [])
+        return resp
+    s, warnings = stepplus.open(path)
     resp = docsess.rebuild(s)
     resp["doc_id"] = s.doc_id
     resp["warnings"] = warnings

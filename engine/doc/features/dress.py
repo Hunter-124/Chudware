@@ -18,7 +18,14 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from build123d import fillet as b3d_fillet, chamfer as b3d_chamfer, offset, Solid, GeomType
+from build123d import (
+    fillet as b3d_fillet,
+    chamfer as b3d_chamfer,
+    offset,
+    Solid,
+    GeomType,
+    CenterOf,
+)
 from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet, BRepFilletAPI_MakeChamfer
 from OCP.BRepAdaptor import BRepAdaptor_Curve
 from OCP.BRepOffset import BRepOffset_MakeOffset, BRepOffset_Mode
@@ -116,6 +123,59 @@ def _resolve_with_hint_fallback(
     return None
 
 
+# describe_*-space index → unique body.edges()/body.faces() element mapping
+#
+# ``describe_edges`` / ``describe_faces`` enumerate the solid with a raw
+# ``TopExp_Explorer``, which visits each edge ONCE PER INCIDENT FACE — so a box
+# yields 24 edge-descriptors (and one descriptor per face occurrence) whereas
+# ``body.edges()`` de-duplicates to the 12 unique edges. The ``resolve`` index
+# therefore lives in the *wider* describe-space and must NOT be used to index the
+# de-duplicated ``body.edges()`` / ``body.faces()`` lists directly: a high-index
+# pick (e.g. a box's top-rim edge) raises ``IndexError`` or silently selects the
+# WRONG entity. We instead map the resolved descriptor back to the nearest unique
+# build123d element by midpoint/centroid distance — the same safeguard
+# ``_resolve_vertices`` already applies for duplicated box-corner vertices.
+#
+# The map tolerance is a small fraction of the bounding-box diagonal; the nearest
+# unique element should coincide with the descriptor essentially exactly (it is
+# the SAME geometric entity), so anything beyond the tolerance means the resolve
+# landed on geometry that no unique element reproduces — reported as dangling so
+# the caller surfaces a clean FeatureError with dangling_refs.
+_RESOLVE_MAP_TOL_FRAC = 1e-3
+
+
+def _mass_center(obj):
+    """Centre of mass of a build123d sub-shape, matching the describe convention.
+
+    ``describe_edges`` / ``describe_faces`` report the OCCT *centre of mass* (edge
+    ``LinearProperties`` midpoint / face ``SurfaceProperties`` centroid). build123d's
+    bare ``.center()`` defaults to ``CenterOf.GEOMETRY`` (bounding-box centre), which
+    diverges sharply for curved geometry — e.g. a cylindrical face's geometry centre
+    sits ON the surface (radius away from the axis) while its mass centre is on the
+    axis, matching the descriptor. We therefore compare against ``CenterOf.MASS`` so
+    the descriptor and the unique element coincide exactly. Falls back to GEOMETRY if
+    the kernel cannot compute a mass centre for a degenerate sub-shape.
+    """
+    try:
+        return obj.center(CenterOf.MASS)
+    except Exception:  # noqa: BLE001
+        return obj.center()
+
+
+def _nearest_by_centroid(objs: list, target) -> tuple[Any, float]:
+    """Return ``(nearest_obj, distance)`` minimising ``|mass_center(obj) - target|``."""
+    best = None
+    best_d2 = math.inf
+    tx, ty, tz = float(target[0]), float(target[1]), float(target[2])
+    for o in objs:
+        c = _mass_center(o)
+        d2 = (c.X - tx) ** 2 + (c.Y - ty) ** 2 + (c.Z - tz) ** 2
+        if d2 < best_d2:
+            best_d2 = d2
+            best = o
+    return best, math.sqrt(best_d2) if best is not None else math.inf
+
+
 def _resolve_edges(
     sel_list: list[dict[str, Any]],
     body,
@@ -125,11 +185,17 @@ def _resolve_edges(
     """Resolve a list of edge selectors against *body*.
 
     Returns ``(edge_objects, dangling_locators)``.
+
+    ``describe_edges`` enumerates one descriptor per incident face, so its index
+    space is wider than the de-duplicated ``body.edges()``. We therefore map each
+    resolved descriptor back to the nearest unique ``body.edges()`` edge by edge
+    midpoint rather than trusting the describe-space index (see module note above).
     """
     infos: list[TopoInfo] = _describe_with_owners(body.wrapped, "edge", ctx)
     diag = _bbox_diag(body)
 
-    edge_objs = body.edges()  # build123d edge list (index-aligned with infos)
+    edge_objs = body.edges()  # de-duplicated build123d edge list (unique edges)
+    tol = max(diag, 1.0) * _RESOLVE_MAP_TOL_FRAC
     resolved_edges: list = []
     dangling: list[str] = []
 
@@ -138,8 +204,16 @@ def _resolve_edges(
         if idx is None:
             rr = resolve(sel, infos, diag)
             dangling.append(f"{slot_name}[{i}]: {rr.dangling_reason}")
-        else:
-            resolved_edges.append(edge_objs[idx])
+            continue
+        target = infos[idx].centroid  # edge midpoint (LinearProperties centre of mass)
+        nearest, dist = _nearest_by_centroid(edge_objs, target)
+        if nearest is None or dist > tol:
+            dangling.append(
+                f"{slot_name}[{i}]: no unique edge within {tol:.4g} mm of the "
+                f"resolved descriptor (nearest {dist:.4g} mm)"
+            )
+            continue
+        resolved_edges.append(nearest)
 
     return resolved_edges, dangling
 
@@ -150,11 +224,19 @@ def _resolve_faces(
     slot_name: str,
     ctx=None,
 ) -> tuple[list, list[str]]:
-    """Resolve a list of face selectors against *body*."""
+    """Resolve a list of face selectors against *body*.
+
+    ``describe_faces`` enumerates faces in raw explorer order, whose index space
+    can be wider than the de-duplicated ``body.faces()``. We map each resolved
+    descriptor back to the nearest unique ``body.faces()`` face by face centroid
+    rather than indexing ``body.faces()`` with the describe-space index (see module
+    note above the edge resolver).
+    """
     infos = _describe_with_owners(body.wrapped, "face", ctx)
     diag = _bbox_diag(body)
 
-    face_objs = body.faces()
+    face_objs = body.faces()  # de-duplicated build123d face list (unique faces)
+    tol = max(diag, 1.0) * _RESOLVE_MAP_TOL_FRAC
     resolved_faces: list = []
     dangling: list[str] = []
 
@@ -163,8 +245,16 @@ def _resolve_faces(
         if idx is None:
             rr = resolve(sel, infos, diag)
             dangling.append(f"{slot_name}[{i}]: {rr.dangling_reason}")
-        else:
-            resolved_faces.append(face_objs[idx])
+            continue
+        target = infos[idx].centroid  # face centroid (SurfaceProperties centre of mass)
+        nearest, dist = _nearest_by_centroid(face_objs, target)
+        if nearest is None or dist > tol:
+            dangling.append(
+                f"{slot_name}[{i}]: no unique face within {tol:.4g} mm of the "
+                f"resolved descriptor (nearest {dist:.4g} mm)"
+            )
+            continue
+        resolved_faces.append(nearest)
 
     return resolved_faces, dangling
 

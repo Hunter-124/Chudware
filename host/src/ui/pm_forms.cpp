@@ -305,8 +305,12 @@ static const std::vector<PMFormDef>& forms() {
             ComboL  ("style",    "Type",             "Hole Type",
                      "simple|cbore|csink|tap", "Simple|Counterbore|Countersink|Tapped"),
             ComboL  ("standard", "Size",             "Hole Type",
-                     "M2|M2.5|M3|M4|M5|M6|M8|M10|M12|custom",
-                     "M2|M2.5|M3|M4|M5|M6|M8|M10|M12|Custom"),
+                     "M2|M2.5|M3|M4|M5|M6|M8|M10|M12|"
+                     "#4-40|#6-32|#8-32|#10-24|#10-32|1/4-20|1/4-28|5/16-18|3/8-16|1/2-13|"
+                     "NPT1/8|NPT1/4|NPT1/2|custom",
+                     "M2|M2.5|M3|M4|M5|M6|M8|M10|M12|"
+                     "#4-40 UNC|#6-32 UNC|#8-32 UNC|#10-24 UNC|#10-32 UNF|1/4-20 UNC|1/4-28 UNF|"
+                     "5/16-18 UNC|3/8-16 UNC|1/2-13 UNC|NPT 1/8|NPT 1/4|NPT 1/2|Custom"),
             DimIf   ("diameter", "Diameter",         "Hole Type", 6.6, "standard", "custom", true),
             AngleIf ("csink_angle", "C'Sink Angle",  "Hole Type", 90.0, "style", "csink"),
             ComboL  ("end",      "End Condition",    "End Condition",

@@ -65,6 +65,12 @@ from . import surf_offset as _surf_offset  # noqa: F401
 from . import surf_ruled as _surf_ruled  # noqa: F401
 from . import surf_boundary as _surf_boundary  # noqa: F401
 from . import surf_fill as _surf_fill  # noqa: F401
+# Surface->solid + surface editing (knit sew, thicken, trim/untrim, delete/replace face):
+from . import surf_knit as _surf_knit  # noqa: F401
+from . import surf_thicken as _surf_thicken  # noqa: F401
+from . import surf_trim as _surf_trim  # noqa: F401  # registers surf_trim + surf_untrim
+from . import surf_delete_face as _surf_delete_face  # noqa: F401
+from . import surf_replace_face as _surf_replace_face  # noqa: F401
 
 __all__ = [
     "CompileContext",

@@ -115,10 +115,33 @@ FACE_SURFS = {"plane", "cylinder", "cone", "sphere", "torus", "bspline", "other"
 EDGE_SURFS = {"line", "circle", "ellipse", "bspline", "other"}
 
 MATE_TYPES = {
+    # standard
     "coincident", "parallel", "perpendicular", "tangent",
     "concentric", "distance", "angle", "lock",
+    # advanced (SW_PARITY_SPEC §3) — width/symmetric carry a 3rd reference (jaw plane / symmetry
+    # plane); the *_limit pair clamp a distance/angle between min..max.
+    "width", "symmetric", "distance_limit", "angle_limit", "profile_center",
+    # mechanical — coupling relations driven by scalar params in the value object
+    "gear", "rack_pinion", "screw", "hinge", "slot", "cam_follower",
 }
+# Types whose ``value`` is a single dimension {value, expr} (offset distance / angle).
 MATE_VALUE_TYPES = {"distance", "angle"}
+# Mates needing more than the standard 2 references, as (min, max) ref counts. Extra refs (index
+# >= 2) are resolved as the solver's ``extra_geoms`` (mate_solver.py): width's 2nd jaw plane,
+# symmetric's symmetry plane, hinge's optional swing-limit markers. Default is exactly 2.
+MATE_REF_COUNTS = {
+    "width": (3, 4), "symmetric": (3, 3), "hinge": (2, 4),
+}
+# Coupling/limit mates whose ``value`` object carries scalar params (read by mate_solver._param).
+# spec = (required numeric keys, optional numeric keys). The "value" key, when present, is a dim.
+MATE_COUPLING_SPEC = {
+    "distance_limit": (["min", "max"], ["value"]),
+    "angle_limit":    (["min", "max"], ["value"]),
+    "gear":           (["ratio"], []),
+    "screw":          (["pitch"], []),
+    "rack_pinion":    ([], ["pitch_radius"]),
+    "hinge":          ([], ["min", "max"]),
+}
 
 # Entity type -> required fields beyond {id, type, construction}
 ENTITY_FIELDS: dict[str, list[str]] = {
@@ -970,8 +993,10 @@ def validate_assembly(doc: Any) -> list[str]:
         if not isinstance(m.get("suppressed"), bool):
             errs.append(f"{loc}.suppressed: required bool")
         refs = m.get("refs")
-        if not isinstance(refs, list) or len(refs) != 2:
-            errs.append(f"{loc}.refs: must be exactly 2 entries")
+        lo_r, hi_r = MATE_REF_COUNTS.get(mtype, (2, 2))
+        if not isinstance(refs, list) or not (lo_r <= len(refs) <= hi_r):
+            want = f"{lo_r}" if lo_r == hi_r else f"{lo_r}..{hi_r}"
+            errs.append(f"{loc}.refs: {mtype} takes {want} entries")
             refs = []
         for j, r in enumerate(refs):
             rloc = f"{loc}.refs[{j}]"
@@ -986,6 +1011,24 @@ def validate_assembly(doc: Any) -> list[str]:
                 errs.append(f"{loc}.value: required for {mtype}")
             else:
                 errs += validate_dim(m["value"], f"{loc}.value", globals_names)
+        elif mtype in MATE_COUPLING_SPEC:
+            # Coupling/limit mate: value is an object carrying scalar params (gear ratio, screw
+            # pitch, limit min/max). Required keys must be present + numeric; an optional "value"
+            # key is a dim. Defaults in mate_solver cover the rest.
+            req, opt = MATE_COUPLING_SPEC[mtype]
+            val = m.get("value")
+            if not isinstance(val, dict):
+                if req:
+                    errs.append(f"{loc}.value: {mtype} needs an object with {req}")
+            else:
+                for k in req:
+                    if not _is_num(val.get(k)):
+                        errs.append(f"{loc}.value.{k}: required number for {mtype}")
+                for k in opt:
+                    if val.get(k) is not None and not _is_num(val.get(k)):
+                        errs.append(f"{loc}.value.{k}: must be a number")
+                if isinstance(val.get("value"), (int, float)):
+                    errs += validate_dim(val, f"{loc}.value", globals_names)
         elif m.get("value") is not None:
             errs.append(f"{loc}.value: {mtype} must not carry a value")
 

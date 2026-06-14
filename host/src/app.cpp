@@ -1268,16 +1268,27 @@ int run_gui(const char* screenshotPath) {
             const bool wantSim    = kindEnv && std::strcmp(kindEnv, "sim") == 0;     // simulate + plot
             const bool wantUndo   = kindEnv && std::strcmp(kindEnv, "undo") == 0;    // history undo
             const bool wantAiBoard = kindEnv && std::strcmp(kindEnv, "aiboard") == 0; // Wave U one-click
+            const bool wantAiBoard3d = kindEnv && std::strcmp(kindEnv, "aiboard3d") == 0; // Wave X chain
             const bool wantRotate  = kindEnv && std::strcmp(kindEnv, "rotate") == 0;  // Wave W rotate
             nlohmann::json r;
             std::string showId;
-            if (wantAiBoard) {
+            if (wantAiBoard || wantAiBoard3d) {
                 // Wave U capstone: drive the full one-click flow (design -> populate -> outline ->
                 // autoroute). ecadAiBoard adopts the finished board into the editor mirror itself, so
                 // there is no showId to tree-load below; the screenshot captures the routed PCB.
                 ecadAiBoard(st, "5V resistive divider with 2.5V output");
                 std::printf("[ecad-shot] aiboard: doc=%s footprints=%d tracks(adopted)\n",
                             st.ecadDocId.c_str(), (int)ui::ecadEditorMirror().footprints().size());
+                if (wantAiBoard3d) {
+                    // Wave X: continue the seamless chain into the CAD 3D viewport -- export the
+                    // AI-designed board to STEP and import it as a solid part the user can build a
+                    // housing around. ecadTo3d surfaces the Viewport (wantFocusViewport). ecadAiBoard
+                    // just requested ECAD focus; cancel it so only the Viewport wins this frame (in
+                    // real use these are separate clicks, so the focus never contends).
+                    ecadTo3d(st);
+                    st.wantFocusEcad = 0;
+                    std::printf("[ecad-shot] aiboard3d: exported board -> CAD 3D part\n");
+                }
                 std::fflush(stdout);
             } else if (wantAi) {
                 st.wantFocusEcad = 6;   // surface the empty AI launchpad for the screenshot

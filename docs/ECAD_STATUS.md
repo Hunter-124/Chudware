@@ -98,6 +98,11 @@ Build: `cmake -S host -B host/build -G "Visual Studio 17 2022" -A x64 && cmake -
   `sch_edit_symbol` / `pcb_edit_footprint`. Keys are gated on canvas-hover + no text focus so they
   never fire while typing a value. Verified `AI_CAD_ECAD_KIND=rotate` (R1 turns vertical, R2 stays
   horizontal).
+- **Full AI→3D chain (X):** the whole vision composes in one flow — a natural-language request becomes
+  an AI-designed schematic → populated + routed PCB → a 3D board solid (substrate + component proxies)
+  in the CAD viewport, ready to design a housing around. Verified `AI_CAD_ECAD_KIND=aiboard3d` (AI
+  Board then Board-to-3D back to back; the 3D viewport shows the imported board part). This is the
+  end-to-end "design PCBs → 3D models → housing, with AI throughout" goal, demonstrated headlessly.
 
 **GUI follow-ups (not blocking):** full PropertyManager forms for the remaining ECAD op fields
 (angle/mirror/side/footprint assignment — Ref/Value editing is DONE via the inspector); move the

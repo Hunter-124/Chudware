@@ -68,7 +68,27 @@ tree is committed/stable. Work that is always safe: read-only analysis, new docs
 
 ## Sequencing logic
 
-1. **Now:** Chapter 2 (collision-free standards/audit) ▸ this is the active workflow.
-2. **On tree-stable:** execute the GUI chrome sizing sweep (Chapter 1 tail) + start Chapter 3 from
-   the gap backlog, per-area workflows, build+verify+commit each.
-3. **Continuous:** keep the checkers green; ratchet the sizing baseline down; regenerate assets.
+1. ✅ **Chapter 2** standards/audit landed (spec + gaps + `parity_audit.py`, collision-free).
+2. ✅ **Chapter 3 ENGINE LANE is collision-free** — engine (Python) work is verified by
+   `pytest engine/doc` (venv at `%APPDATA%/AI-CAD/runtime/venv`) and needs NO host build, so it does
+   NOT collide with the parallel agent's host tree. Driving it now in pytest-verified batches.
+3. **On tree-stable (host lane):** GUI chrome sizing sweep (Chapter 1 tail), PM forms exposing the
+   new engine options, file explorer, copy/paste, menu reorg, File>Export un-stub — gated on the
+   parallel agent committing its host/CMake work.
+4. **Continuous:** keep the checkers green; ratchet the sizing baseline; regenerate assets.
+
+## Progress log — Chapter 3 engine lane (pytest-verified, collision-free)
+
+| commit | parity gap closed |
+|---|---|
+| `f725fe7` | Part Features: extrude/revolve/sweep/loft full SW option matrix (+29 tests) |
+| `e595a9a` | Part Features: fillet/chamfer/shell + reference geometry + rib/draft |
+| `4d2383d` | Part Features: pattern skip/vary/bidirectional/mirror-bodies |
+| `682bf9f` | Drawings (radial/dia/angular dims), Sheet Metal (cut→flat + corner relief), Weldments (profiles + cope trim) |
+| `8028d94` | Sheet Metal flat-DXF CUTS layer |
+| (batch 4) | Hole Wizard (ANSI/UNC + cosmetic thread + sketch-point positions), Helix (variable pitch + flat spiral), non-planar Split, curve↔curve sketch tangent (P0) |
+
+Engine/doc suite green throughout (462 → ~620 tests). **Next engine P0: Surfacing** (0%, foundational
+— needs a surface-body concept distinct from solids); then FEA depth (tet10/local mesh/reactions),
+Parasolid import, advanced/mechanical assembly mates. Spec status rows + `parity_audit` re-sync after
+a batch of status updates (the spec still lists these as `partial`/`missing` until flipped).

@@ -219,14 +219,9 @@ def test_guide_curve_steers_section() -> None:
                     "guides": [_path_ref("f3")]}),
     ])
     _assert_valid(no_guide)
-    # NOTE: refs.guides is a NEW sweep ref slot. schema.py's _SPEC["sweep"] still allows only
-    # {profile, path}, so validate_part rejects the guides slot ("unknown ref slot for sweep").
-    # That one-line schema addition is a SHARED-FILE change outside this task's edit scope, so we
-    # compile the guide doc directly (the sweep compiler already accepts + applies guides). Once
-    # the schema lists "guides": (_SEL_LIST, False) for sweep, this can use _assert_valid too.
-    errs = validate_part(with_guide)
-    assert any("guides: unknown ref slot" in e for e in errs), \
-        "expected the only validation gap to be the not-yet-registered 'guides' slot; got: " + str(errs)
+    # refs.guides is now a registered sweep ref slot (schema.py's _SPEC["sweep"] lists "guides"),
+    # so the guide doc validates cleanly through the normal path — no expect-failure shim needed.
+    _assert_valid(with_guide)
     rn = compile_document(no_guide)
     rg = compile_document(with_guide)
     _assert_all_ok(rn, ("f1", "f2", "f3"))

@@ -1268,6 +1268,7 @@ int run_gui(const char* screenshotPath) {
             const bool wantSim    = kindEnv && std::strcmp(kindEnv, "sim") == 0;     // simulate + plot
             const bool wantUndo   = kindEnv && std::strcmp(kindEnv, "undo") == 0;    // history undo
             const bool wantAiBoard = kindEnv && std::strcmp(kindEnv, "aiboard") == 0; // Wave U one-click
+            const bool wantRotate  = kindEnv && std::strcmp(kindEnv, "rotate") == 0;  // Wave W rotate
             nlohmann::json r;
             std::string showId;
             if (wantAiBoard) {
@@ -1280,9 +1281,9 @@ int run_gui(const char* screenshotPath) {
                 std::fflush(stdout);
             } else if (wantAi) {
                 st.wantFocusEcad = 6;   // surface the empty AI launchpad for the screenshot
-            } else if (wantEdit || wantSelect || wantDel) {
+            } else if (wantEdit || wantSelect || wantDel || wantRotate) {
                 // Exercise the Place/Route tools by applying the ops a user's clicks would produce.
-                // select/del reuse this same schematic batch then drive selection/delete (below).
+                // select/del/rotate reuse this schematic batch then drive selection/delete/rotate.
                 if (ecall("ecad_new", {{"kind", "sch"}}, r)) {
                     const std::string id = jstr(r, "doc_id");
                     const int rev = jint(r, "revision");
@@ -1295,7 +1296,7 @@ int run_gui(const char* screenshotPath) {
                     ops.push_back({{"op","sch_add_wire"},{"pts",{{10,32},{32,32}}}});
                     ops.push_back({{"op","sch_add_wire"},{"pts",{{32,32},{54,32},{54,26}}}});
                     ecall("ecad_apply_ops", {{"doc_id",id},{"base_revision",rev},{"ops",ops}}, r);
-                    st.ecadTool = wantEdit ? 1 : 0;   // editsch shows Place; select/del use Select
+                    st.ecadTool = wantEdit ? 1 : 0;   // editsch shows Place; select/del/rotate use Select
                     showId = id;
                     if (wantDel) {
                         // Delete one symbol directly (what the Delete key emits) so the shot shows
@@ -1304,6 +1305,14 @@ int run_gui(const char* screenshotPath) {
                         nlohmann::json delOps = nlohmann::json::array();
                         delOps.push_back({{"op","sch_delete_symbol"},{"id","s2"}});  // the 2nd symbol (a 10k R)
                         ecall("ecad_apply_ops", {{"doc_id",id},{"base_revision",rev2},{"ops",delOps}}, r);
+                    }
+                    if (wantRotate) {
+                        // Rotate s2 (a 10k R) by 90 deg — exactly the op the Rotate button / R key
+                        // emits — so the shot shows the resistor turned on its side. Re-read revision.
+                        const int rev2 = jint(r, "revision");
+                        nlohmann::json rotOps = nlohmann::json::array();
+                        rotOps.push_back({{"op","sch_edit_symbol"},{"id","s2"},{"angle",90}});
+                        ecall("ecad_apply_ops", {{"doc_id",id},{"base_revision",rev2},{"ops",rotOps}}, r);
                     }
                 }
             } else if (wantPcb || want3d) {
@@ -1372,9 +1381,10 @@ int run_gui(const char* screenshotPath) {
                 ui::ecadEditorMirror().setDocId(showId);
                 ui::ecadEditorLoadResponse(r);
                 std::printf("[ecad-shot] showing %s rev=%d\n", showId.c_str(), st.ecadRevision);
-                if (wantSelect) {
-                    // Drive selection without a mouse so the shot shows the highlight halo. Pick a
-                    // real symbol id from the loaded mirror (the 2nd symbol when present).
+                if (wantSelect || wantRotate) {
+                    // Drive selection without a mouse so the shot shows the highlight halo (+ the
+                    // property inspector). Pick a real symbol id from the loaded mirror (the 2nd
+                    // symbol when present); for rotate this is s2 — the resistor we turned 90 deg.
                     const auto& syms = ui::ecadEditorMirror().symbols();
                     const std::string sel = "s:" + (syms.size() >= 2 ? syms[1].id
                                                     : (syms.empty() ? std::string("s1") : syms[0].id));

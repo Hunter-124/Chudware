@@ -137,6 +137,37 @@ bool selectedPos(const EcadMirror& m, const std::string& sel, EcadPt& out) {
     return false;
 }
 
+// Rotate (+90 deg CCW) or flip (mirror/side toggle) the selected symbol/footprint, emitting
+// sch_edit_symbol (angle/mirror) or pcb_edit_footprint (angle/side) through the shared
+// st.ecadPendingOps/ecadOpsGo path. No-op unless a symbol/footprint is selected. Reads the current
+// transform from the mirror so each press advances from the live value.
+void rotateOrFlipSelected(AppState& st, EcadEditorState& es, bool rotate) {
+    const auto c = es.selected.find(':');
+    if (c == std::string::npos) return;
+    const std::string kind = es.selected.substr(0, c), id = es.selected.substr(c + 1);
+    nlohmann::json op;
+    if (kind == "s") {
+        const EcadSymbol* sym = nullptr;
+        for (const auto& s : es.mirror.symbols()) if (s.id == id) { sym = &s; break; }
+        if (!sym) return;
+        op = {{"op", "sch_edit_symbol"}, {"id", id}};
+        if (rotate) op["angle"]  = std::fmod(sym->angle + 90.0f, 360.0f);
+        else        op["mirror"] = (sym->mirror == "none" ? "x" : "none");  // toggle horizontal flip
+    } else if (kind == "fp") {
+        const EcadFootprint* fp = nullptr;
+        for (const auto& f : es.mirror.footprints()) if (f.id == id) { fp = &f; break; }
+        if (!fp) return;
+        op = {{"op", "pcb_edit_footprint"}, {"id", id}};
+        if (rotate) op["angle"] = std::fmod(fp->angle + 90.0f, 360.0f);
+        else        op["side"]  = (fp->side == "top" ? "bottom" : "top");   // flip to the other side
+    } else {
+        return;  // wires/tracks don't rotate
+    }
+    nlohmann::json ops = nlohmann::json::array();
+    ops.push_back(op);
+    st.ecadPendingOps = ops; st.ecadOpsGo = true;
+}
+
 // Property inspector (Select tool): when a symbol/footprint is selected, expose its Ref + Value as
 // inline editable fields. The buffers reload from the mirror whenever the selection target changes
 // (tracked by es.editLoadedFor) so edits never bleed between parts. Committing (Enter or Apply) emits
@@ -185,6 +216,11 @@ bool drawPropInspector(AppState& st, EcadEditorState& es, float sc) {
         st.ecadPendingOps = ops; st.ecadOpsGo = true;
         es.editLoadedFor.clear();  // force a reload from the post-edit revision next frame
     }
+    // Orientation controls (also bound to R / F on the canvas — see handleSelectEdit).
+    ImGui::SameLine(0, 14 * sc);
+    if (ImGui::Button("Rotate (R)")) rotateOrFlipSelected(st, es, /*rotate=*/true);
+    ImGui::SameLine();
+    if (ImGui::Button(sch ? "Flip (F)" : "Flip side (F)")) rotateOrFlipSelected(st, es, false);
     return true;
 }
 
@@ -235,6 +271,14 @@ void handleSelectEdit(AppState& st, EcadEditorState& es, const EcadCanvasIO& io)
         return;  // a drag in progress consumes the interaction (no select-on-click)
     }
     es.dragDx = es.dragDy = 0.0f;
+
+    // ---- Rotate (R) / flip (F) the selected symbol/footprint. Gated on the canvas being hovered
+    // and no text field having focus, so the keys never fire while typing a Ref/Value (KiCad binds
+    // R = rotate, F = flip). ----
+    if (!es.selected.empty() && io.hovered && !ImGui::GetIO().WantTextInput) {
+        if (ImGui::IsKeyPressed(ImGuiKey_R)) { rotateOrFlipSelected(st, es, /*rotate=*/true);  return; }
+        if (ImGui::IsKeyPressed(ImGuiKey_F)) { rotateOrFlipSelected(st, es, /*rotate=*/false); return; }
+    }
 
     // ---- Delete the selected entity (only when the canvas is hovered, so the key doesn't fire
     // while typing elsewhere) ----

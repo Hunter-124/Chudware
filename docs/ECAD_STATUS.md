@@ -93,6 +93,11 @@ Build: `cmake -S host -B host/build -G "Visual Studio 17 2022" -A x64 && cmake -
   editor on its own toolbar row; Apply / Enter commits via `sch_edit_symbol` / `pcb_edit_footprint`.
   Buffers reload on selection change so edits never bleed between parts. Verified in
   `AI_CAD_ECAD_KIND=select` (R1 / 10k populate the fields) + headless op round-trip.
+- **Rotate / flip (W):** the selected part rotates +90° (R key or the inspector's Rotate button) and
+  flips (F key / Flip button — `mirror` toggle for symbols, `side` top/bottom for footprints), via
+  `sch_edit_symbol` / `pcb_edit_footprint`. Keys are gated on canvas-hover + no text focus so they
+  never fire while typing a value. Verified `AI_CAD_ECAD_KIND=rotate` (R1 turns vertical, R2 stays
+  horizontal).
 
 **GUI follow-ups (not blocking):** full PropertyManager forms for the remaining ECAD op fields
 (angle/mirror/side/footprint assignment — Ref/Value editing is DONE via the inspector); move the
@@ -102,8 +107,8 @@ editor mirror onto AppState for multi-doc; `ecad_open` file dialog.
 
 1. **GUI editor polish** — place/route/select/delete/move + AI launchpad + PCB→3D bridge +
    simulation plot (transient & AC) + undo/redo + one-click AI→routed board + Ref/Value property
-   inspector are DONE (Waves N–V); remaining: PM forms for the remaining op fields (angle/mirror/
-   side/footprint), multi-doc, `ecad_open` file dialog.
+   inspector + rotate/flip are DONE (Waves N–W); remaining: PM forms for footprint reassignment +
+   per-field DNP/sim-params, multi-doc, `ecad_open` file dialog.
 2. **Full bus routing** (electrical): member labels already net correctly (KiCad's bus is largely a
    drawing convenience over labels); explicit bus-wire + bus-entry tap objects are a follow-up.
 3. **Advanced routing**: push-and-shove (router is eviction-based rip-up + maze, not negotiated-

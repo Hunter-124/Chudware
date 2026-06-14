@@ -91,6 +91,7 @@ class SketchSolution:
     conflicting: List[str]               # constraint ids
     converged: bool
     state: SolveState
+    skipped_constraints: List[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +334,189 @@ def _conic_curve(xs, u):
     dnum = db0 * p0 + db1 * ap + db2 * p1
     dden = db0 + db1 + db2
     dP = (dnum * den - num * dden) / (den * den)
+    return P, dP
+
+
+# --- Curve evaluators for the remaining sketch primitives (curve↔curve tangent) -
+#
+# Same contract as the conic-family evaluators above: map an entity's variable
+# slice + a curve parameter to the world point P and the (un-normalized) tangent
+# dP/dparam. Used by the general curve↔curve tangent residual (_add_tangent_curve_
+# curve), which finds the mutual closest point of two curves and drives the gap to
+# zero. Range-free for arc (uses the full circle, like arc point_on/tangent today).
+
+
+def _circle_curve(xs, a):
+    """xs = [cx, cy, r]; a = angle in RADIANS. P(a), tangent dP/da."""
+    cx, cy, r = xs[0], xs[1], xs[2]
+    ca, sa = math.cos(a), math.sin(a)
+    P = np.array([cx + r * ca, cy + r * sa])
+    dP = np.array([-r * sa, r * ca])
+    return P, dP
+
+
+# arc shares the circle parameterization (first three vars are cx,cy,r); the a0/a1
+# trim vars are ignored (range-free), mirroring arc point_on / line↔arc tangent.
+_arc_curve = _circle_curve
+
+
+def _spline_segments(cv):
+    """Return the list of (x, y) control/through points from a flat var slice."""
+    n = len(cv) // 2
+    return [(float(cv[2 * i]), float(cv[2 * i + 1])) for i in range(n)]
+
+
+def _catmull_rom(pts, u):
+    """Catmull-Rom interpolating spline through `pts` (the `spline` entity model).
+
+    The curve passes through every point; u ∈ [0, n-1] is the global parameter (an
+    integer u = i lands exactly on pts[i]). Returns (P, dP/du). Uniform centripetal-
+    free Catmull-Rom — the standard 2D-sketcher interpolating spline; matches the
+    through-point semantics of Edge.make_spline closely enough for tangency (the
+    tangent direction at each interior knot is (pts[i+1]-pts[i-1])/2).
+    """
+    n = len(pts)
+    if n == 1:
+        return np.array(pts[0], dtype=float), np.array([0.0, 0.0])
+    if n == 2:
+        # straight segment
+        (x0, y0), (x1, y1) = pts[0], pts[1]
+        t = min(max(u, 0.0), 1.0)
+        P = np.array([x0 + (x1 - x0) * t, y0 + (y1 - y0) * t])
+        dP = np.array([x1 - x0, y1 - y0])
+        return P, dP
+    # clamp into [0, n-1], pick segment i (between pts[i] and pts[i+1])
+    u = min(max(u, 0.0), float(n - 1))
+    i = int(math.floor(u))
+    if i >= n - 1:
+        i = n - 2
+    t = u - i
+    # endpoint tangents via reflection (P[-1] = 2P0 - P1, P[n] = 2P_{n-1} - P_{n-2})
+    p0 = np.array(pts[i - 1], dtype=float) if i - 1 >= 0 else \
+        2.0 * np.array(pts[0], dtype=float) - np.array(pts[1], dtype=float)
+    p1 = np.array(pts[i], dtype=float)
+    p2 = np.array(pts[i + 1], dtype=float)
+    p3 = np.array(pts[i + 2], dtype=float) if i + 2 <= n - 1 else \
+        2.0 * np.array(pts[n - 1], dtype=float) - np.array(pts[n - 2], dtype=float)
+    t2 = t * t
+    t3 = t2 * t
+    # Catmull-Rom basis (tension 0.5)
+    P = 0.5 * ((2.0 * p1) +
+               (-p0 + p2) * t +
+               (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 +
+               (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
+    dPdt = 0.5 * ((-p0 + p2) +
+                  (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * (2.0 * t) +
+                  (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * (3.0 * t2))
+    return P, dPdt   # d/du == d/dt (uniform knot spacing of 1)
+
+
+def _bspline_poles(pts, u):
+    """Clamped cubic B-spline by control poles (the `style_spline` entity model).
+
+    Mirrors _style_spline_edges: degree = min(3, n-1), clamped (open-uniform) knots,
+    so the curve starts at pts[0], ends at pts[-1], tangent to the end legs. u ∈
+    [0, 1]. Returns (P, dP/du). Evaluated with de Boor (value) + the standard
+    B-spline derivative (difference of poles). Self-contained (no OCCT).
+    """
+    P_ctrl = [np.array(p, dtype=float) for p in pts]
+    n = len(P_ctrl)
+    if n == 1:
+        return P_ctrl[0], np.array([0.0, 0.0])
+    if n == 2:
+        t = min(max(u, 0.0), 1.0)
+        P = P_ctrl[0] + (P_ctrl[1] - P_ctrl[0]) * t
+        return P, (P_ctrl[1] - P_ctrl[0])
+    degree = min(3, n - 1)
+    # clamped knot vector, internal knots uniform on [0,1]
+    n_internal = n - degree - 1
+    knots = [0.0] * (degree + 1)
+    for j in range(1, n_internal + 1):
+        knots.append(j / (n_internal + 1))
+    knots += [1.0] * (degree + 1)
+    knots = np.array(knots, dtype=float)
+    uu = min(max(u, 0.0), 1.0 - 1e-12)
+
+    def _deboor_value(uval):
+        # find knot span k such that knots[k] <= uval < knots[k+1]
+        k = degree
+        while k < n - 1 and uu >= knots[k + 1]:
+            k += 1
+        # local pole copies
+        d = [P_ctrl[j + k - degree].copy() for j in range(degree + 1)]
+        for r in range(1, degree + 1):
+            for j in range(degree, r - 1, -1):
+                left = knots[j + k - degree]
+                right = knots[j + 1 + k - r]
+                denom = right - left
+                alpha = 0.0 if denom <= 1e-15 else (uval - left) / denom
+                d[j] = (1.0 - alpha) * d[j - 1] + alpha * d[j]
+        return d[degree]
+
+    h = 1e-6
+    P = _deboor_value(uu)
+    Pp = _deboor_value(min(uu + h, 1.0 - 1e-12))
+    Pm = _deboor_value(max(uu - h, 0.0))
+    dP = (Pp - Pm) / (2.0 * h)
+    return P, dP
+
+
+def _spline_curve(cv, u):
+    """Through-point spline P(u), dP/du. u ∈ [0, n-1]. See _catmull_rom."""
+    return _catmull_rom(_spline_segments(cv), u)
+
+
+def _style_spline_curve(cv, u):
+    """Control-pole spline P(u), dP/du. u ∈ [0, 1]. See _bspline_poles."""
+    return _bspline_poles(_spline_segments(cv), u)
+
+
+# Per-entity-type curve description for the generic curve↔curve tangent residual:
+#   (variable local indices used, evaluator(cv, p) -> (P, dP), scan(cv, n) -> params)
+# `cv` is x[var_idx] sliced to those local indices, in the listed order.
+
+def _curve_descriptor(etype: str, vidx: np.ndarray):
+    """Return (idx, eval_fn, scan_fn) for a curve entity, or None if unsupported.
+
+    idx: global variable indices the curve depends on (subset of the entity block).
+    eval_fn(cv, p): world point + tangent at param p.
+    scan_fn(cv, n): n sample params spanning the curve (for coarse closest search).
+    """
+    if etype in ("circle", "arc"):
+        idx = vidx[[0, 1, 2]]            # cx, cy, r  (range-free: ignore a0/a1)
+        return idx, _circle_curve, (lambda cv, n: np.linspace(0.0, 2.0 * math.pi, n))
+    if etype == "ellipse_arc":
+        idx = vidx[[0, 1, 2, 3, 4]]      # cx, cy, rx, ry, rot
+        return idx, _ellipse_arc_curve, (lambda cv, n: np.linspace(0.0, 2.0 * math.pi, n))
+    if etype == "parabola":
+        idx = vidx[[0, 1, 2, 3]]         # vx, vy, fx, fy
+        return idx, _parabola_curve, (lambda cv, n: np.linspace(-200.0, 200.0, n))
+    if etype == "conic":
+        idx = vidx[[0, 1, 2, 3, 4, 5, 6]]
+        return idx, _conic_curve, (lambda cv, n: np.linspace(0.0, 1.0, n))
+    if etype == "spline":
+        idx = vidx                        # all through-points
+        npts = len(idx) // 2
+        return idx, _spline_curve, (lambda cv, n: np.linspace(0.0, float(max(npts - 1, 1)), n))
+    if etype == "style_spline":
+        idx = vidx                        # all control poles
+        return idx, _style_spline_curve, (lambda cv, n: np.linspace(0.0, 1.0, n))
+    return None
+
+
+def _ellipse_arc_curve(cv, a):
+    """xs = [cx, cy, rx, ry, rot]; a = angle in RADIANS (un-rotated frame).
+
+    P(a) on the rotated ellipse + tangent dP/da. Range-free (ignores a0/a1 trim).
+    """
+    cx, cy, rx, ry, rot = cv[0], cv[1], cv[2], cv[3], cv[4]
+    rr = rot * _DEG
+    cr, sr = math.cos(rr), math.sin(rr)
+    ca, sa = math.cos(a), math.sin(a)
+    lx, ly = rx * ca, ry * sa
+    P = np.array([cx + cr * lx - sr * ly, cy + sr * lx + cr * ly])
+    dlx, dly = -rx * sa, ry * ca
+    dP = np.array([cr * dlx - sr * dly, sr * dlx + cr * dly])
     return P, dP
 
 
@@ -1024,6 +1208,9 @@ def _add_tangent(sys, cid, h0, h1, entities, var_map):
 
     curved = {"circle", "arc"}
     conics = {"ellipse_arc", "parabola", "conic"}
+    splines = {"spline", "style_spline"}
+    # Every entity type the generic curve↔curve residual can evaluate.
+    generic = curved | conics | splines
     if t0 == "line" and t1 in curved:
         _add_tangent_line_circle(sys, cid, eid0, eid1, entities, var_map)
     elif t0 in curved and t1 == "line":
@@ -1034,8 +1221,18 @@ def _add_tangent(sys, cid, h0, h1, entities, var_map):
         _add_tangent_line_conic(sys, cid, eid0, eid1, entities, var_map)
     elif t0 in conics and t1 == "line":
         _add_tangent_line_conic(sys, cid, eid1, eid0, entities, var_map)
+    elif t0 == "line" and t1 in splines:
+        _add_tangent_line_curve(sys, cid, eid0, eid1, entities, var_map)
+    elif t0 in splines and t1 == "line":
+        _add_tangent_line_curve(sys, cid, eid1, eid0, entities, var_map)
+    elif t0 in generic and t1 in generic:
+        # arc↔spline, spline↔spline, arc↔arc, circle↔arc/spline, conic↔spline, etc.
+        # One scalar residual = signed gap at the curves' mutual closest point (drives
+        # them to touch; parallel tangents follow automatically at a closest-approach
+        # point). circle↔circle/arc keeps its dedicated analytic branch above.
+        _add_tangent_curve_curve(sys, cid, eid0, eid1, entities, var_map)
     else:
-        # line-line, and curve↔curve / conic↔conic tangent stay deferred; skip.
+        # line-line tangent (ill-defined) stays deferred; skip.
         pass
 
 
@@ -1332,6 +1529,142 @@ def _extremum_param(curve, cv, nx, ny, scan):
         if abs(step) < 1e-12:
             break
     return p
+
+
+# ---------------------------------------------------------------------------
+# General curve↔curve (and line↔spline) tangency
+#
+# Tangency between two arbitrary curves is ONE scalar equation (it removes 1 DOF,
+# matching SolidWorks and the existing line↔circle / circle↔circle branches). The
+# residual is the SIGNED GAP between the curves at their mutual closest point:
+#
+#   find (p, q) minimizing |C0(p) - C1(q)|;  residual = (C0(p) - C1(q)) · n0
+#
+# where n0 is the unit normal of C0 at p. At a true closest-approach point the
+# connecting segment is perpendicular to BOTH tangents, so C0'(p) ∥ C1'(q)
+# automatically — driving the gap to zero yields a genuine tangency (touch +
+# parallel tangents), not a transverse crossing. This is the same trick the
+# line↔circle residual uses (distance−radius == signed gap to the center-line).
+#
+# The closest params are re-solved INSIDE the residual each evaluation (alternating
+# projection from a coarse scan seed); the Jacobian is central-difference. This
+# follows the parabola/conic point_on + line↔conic tangent precedent exactly.
+# ---------------------------------------------------------------------------
+
+
+def _mutual_closest(curve0, cv0, scan0, curve1, cv1, scan1, p_seed=None, q_seed=None):
+    """Params (p, q) at the mutual closest approach of two curves.
+
+    Coarse double scan for the closest sample pair (unless seeds are supplied),
+    then a few alternating closest-point projections (project C0's point onto C1,
+    then C1's point onto C0) which converge to the common-normal foot. Robust for
+    the convex/locally-convex contacts a tangency constraint targets.
+    """
+    if p_seed is None or q_seed is None:
+        ps = scan0(cv0, 25)
+        qs = scan1(cv1, 25)
+        # precompute C1 sample points once
+        q_pts = [curve1(cv1, q)[0] for q in qs]
+        best = float("inf")
+        bp, bq = ps[0], qs[0]
+        for p in ps:
+            P0 = curve0(cv0, p)[0]
+            for j, q in enumerate(qs):
+                Q1 = q_pts[j]
+                d = (P0[0] - Q1[0]) ** 2 + (P0[1] - Q1[1]) ** 2
+                if d < best:
+                    best, bp, bq = d, p, q
+        p, q = bp, bq
+    else:
+        p, q = p_seed, q_seed
+    # alternating projection refine
+    for _ in range(8):
+        P0 = curve0(cv0, p)[0]
+        q = _newton_project(lambda u: curve1(cv1, u), q, P0)
+        Q1 = curve1(cv1, q)[0]
+        p = _newton_project(lambda u: curve0(cv0, u), p, Q1)
+    return p, q
+
+
+def _curve_gap_residual(v, k0, k1, curve0, scan0, curve1, scan1):
+    """Signed gap between the two curves at their mutual closest point.
+
+    v = [cv0 (k0 vars), cv1 (k1 vars)]. Returns a (1,) array. The sign is taken
+    along C0's normal at its closest param, giving a smooth residual that changes
+    sign as the curves cross — exactly what Newton needs to settle onto contact.
+    """
+    cv0 = v[:k0]
+    cv1 = v[k0:k0 + k1]
+    p, q = _mutual_closest(curve0, cv0, scan0, curve1, cv1, scan1)
+    P0, dP0 = curve0(cv0, p)
+    Q1, _ = curve1(cv1, q)
+    L = math.hypot(dP0[0], dP0[1])
+    if L < 1e-12:
+        return np.array([math.hypot(P0[0] - Q1[0], P0[1] - Q1[1])])
+    nx, ny = -dP0[1] / L, dP0[0] / L
+    return np.array([(Q1[0] - P0[0]) * nx + (Q1[1] - P0[1]) * ny])
+
+
+def _add_tangent_curve_curve(sys, cid, eid0, eid1, entities, var_map):
+    """Tangency between two general curves (arc/circle/conic/spline, any pair).
+
+    Single scalar residual = signed gap at the mutual closest point (see module
+    block above). Numeric Jacobian. Range-free for trimmed curves (uses the full
+    underlying curve, matching arc/ellipse_arc point_on).
+    """
+    d0 = _curve_descriptor(entities[eid0]["type"], var_map[eid0])
+    d1 = _curve_descriptor(entities[eid1]["type"], var_map[eid1])
+    if d0 is None or d1 is None:
+        return   # unsupported entity type -> skip silently (forward-tolerant)
+    idx0, curve0, scan0 = d0
+    idx1, curve1, scan1 = d1
+    k0, k1 = len(idx0), len(idx1)
+    combined = np.concatenate([idx0, idx1])
+
+    def _r(xs):
+        return _curve_gap_residual(xs, k0, k1, curve0, scan0, curve1, scan1)
+
+    def _j(xs):
+        return _numeric_jac_1(
+            lambda v: _curve_gap_residual(v, k0, k1, curve0, scan0, curve1, scan1),
+            xs, k0 + k1)
+
+    sys.add_residual(_r, combined, _j, cid)
+
+
+def _add_tangent_line_curve(sys, cid, line_eid, curve_eid, entities, var_map):
+    """Tangency line ↔ spline (the line↔conic path covers conics; this covers the
+    spline families). Residual = signed perpendicular distance from the line to the
+    curve's extreme point in the line-normal direction (param where the curve
+    tangent ∥ the line). Numeric Jacobian. Mirrors _add_tangent_line_conic.
+    """
+    desc = _curve_descriptor(entities[curve_eid]["type"], var_map[curve_eid])
+    if desc is None:
+        return
+    eidx, curve, scan = desc
+    lidx = var_map[line_eid][[0, 1, 2, 3]]
+    ke = len(eidx)
+    combined = np.concatenate([lidx, eidx])
+
+    def _support_resid(v):
+        ax, ay, bx, by = v[0], v[1], v[2], v[3]
+        cv = v[4:4 + ke]
+        dxab, dyab = bx - ax, by - ay
+        L = math.hypot(dxab, dyab)
+        if L < 1e-12:
+            return np.array([0.0])
+        nx, ny = -dyab / L, dxab / L
+        p = _extremum_param(curve, cv, nx, ny, scan)
+        Q, _ = curve(cv, p)
+        return np.array([(Q[0] - ax) * nx + (Q[1] - ay) * ny])
+
+    def _r(xs):
+        return _support_resid(xs)
+
+    def _j(xs):
+        return _numeric_jac_1(_support_resid, xs, 4 + ke)
+
+    sys.add_residual(_r, combined, _j, cid)
 
 
 def _add_equal(sys, cid, h0, h1, entities, var_map):
@@ -1644,6 +1977,30 @@ def _add_fix(sys, cid, handle, entities, var_map):
             sys.add_residual(
                 lambda xs, _tx=px, _ty=py: np.array([xs[0] - _tx, xs[1] - _ty]),
                 idx, lambda xs: np.eye(2), cid)
+
+    elif etype in ("spline", "style_spline"):
+        # Spline/style-spline points are draggable [x,y] pairs (through-points /
+        # control poles). A bare ref pins EVERY point; a "pN" sub-handle pins one
+        # point to its current position. Without this, fix on a spline point was a
+        # silent no-op (the point stayed free) — which makes curve↔curve tangent on
+        # splines unusable (you fix an endpoint, then make it tangent). Linear
+        # residual over direct variables; identity Jacobian.
+        pts = ent.get("points", [])
+        if sub is None:
+            idx = var_map[eid]
+            tgt = np.array([c for p in pts for c in (float(p[0]), float(p[1]))],
+                           dtype=float)
+            sys.add_residual(
+                lambda xs, _t=tgt: xs - _t,
+                idx, lambda xs, _n=len(tgt): np.eye(_n), cid)
+        elif sub.startswith("p"):
+            k = int(sub[1:])
+            if 0 <= k < len(pts):
+                px, py = float(pts[k][0]), float(pts[k][1])
+                idx = var_map[eid][[2 * k, 2 * k + 1]]
+                sys.add_residual(
+                    lambda xs, _tx=px, _ty=py: np.array([xs[0] - _tx, xs[1] - _ty]),
+                    idx, lambda xs: np.eye(2), cid)
 
     elif etype in ("ellipse_arc", "parabola", "conic", "arc_slot"):
         # Generic fix on any resolvable handle (center/start/end/apex/vertex):
@@ -2578,13 +2935,15 @@ def solve_sketch(
             var_map[ent["id"]] = sys.add_vars(0, [])
 
     # Register constraints
+    skipped_constraints: list[dict] = []
     for c in constraints_list:
         try:
             _add_constraint(sys, c, entities, var_map, equations_env)
         except Exception as exc:
-            # Don't crash the whole solve on a single bad constraint; skip it
-            # (matches "forward tolerant" pattern from doc_schema conventions)
-            pass
+            cid = c.get("id") if isinstance(c, dict) else None
+            skipped_constraints.append({"id": str(cid or ""), "type": str(c.get("type", ""))
+                                        if isinstance(c, dict) else "",
+                                        "reason": str(exc)})
 
     # Per-entity doc-geometry signatures for warm-start gating (see SolveState.ent_sig).
     cur_sig = {e["id"]: json.dumps(e, sort_keys=True, default=str) for e in entities_list}
@@ -2634,6 +2993,7 @@ def solve_sketch(
         conflicting=[str(t) for t in analysis.conflicting_tags],
         converged=result.converged,
         state=state,
+        skipped_constraints=skipped_constraints,
     )
 
 
@@ -2696,12 +3056,15 @@ def drag(
     # handles (arc start/end) expose extra vars (cx, cy, r, a); soft-targeting
     # their leading center vars translates the curve, which is the desired drag.
     any_target = False
+    rejected_handles: list[str] = []
     for h, (tx, ty) in target_pairs:
         try:
             hidx, _hvf, _hjf = _resolve_handle(h, entities, var_map)
         except (KeyError, ValueError):
+            rejected_handles.append(str(h))
             continue
         if len(hidx) == 0:
+            rejected_handles.append(str(h))
             continue   # zero-var virtual handle (origin) — nothing to drag
         sys.soft_target(int(hidx[0]), tx, weight=0.01)
         if len(hidx) > 1:
@@ -2711,7 +3074,9 @@ def drag(
     if not any_target:
         # Nothing resolvable — return last known coords unchanged.
         entity_coords = _extract_entities(state.x, entities_list, var_map)
-        return {"entities": entity_coords, "statuses": {},
+        return {"ok": False, "error": "no drag targets resolved",
+                "rejected_handles": rejected_handles or [str(h) for h, _xy in target_pairs],
+                "entities": entity_coords, "statuses": {},
                 "converged": True, "budget_exceeded": False}
 
     # Use warm start from state if topology matches
@@ -2737,6 +3102,7 @@ def drag(
     # ran out of the interactive budget reports budget_exceeded so the host can keep
     # the preview transient instead of treating it as a settled solution. Existing
     # callers (session.sketch_drag) read only "entities"/"statuses" and are unaffected.
-    return {"entities": entity_coords, "statuses": statuses,
+    return {"ok": True, "entities": entity_coords, "statuses": statuses,
+            "rejected_handles": rejected_handles,
             "converged": bool(result.converged),
             "budget_exceeded": bool(result.budget_exceeded)}

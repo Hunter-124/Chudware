@@ -41,6 +41,10 @@ struct EcadEditorState {
     // between parts; committed via sch_edit_symbol / pcb_edit_footprint.
     char  editRef[64] = "";
     char  editValue[96] = "";
+    // Schematic-only extras: footprint assignment, do-not-populate, and free-form sim-params JSON.
+    char  editFootprint[128] = "";
+    bool  editDnp = false;
+    char  editSimParams[512] = "";  // sim_params as JSON text (parsed on Apply)
     std::string editLoadedFor;   // selection id the buffers were filled from ("" = stale/empty)
     // Simulation plot: snapshot of the last results we plotted + the analysis that produced them,
     // so the plot axes match the run (not the live combo) and we can pop the Sim tab on new results.
@@ -180,11 +184,13 @@ bool drawPropInspector(AppState& st, EcadEditorState& es, float sc) {
     const bool sch = (kind == "s"), pcb = (kind == "fp");
     if (!sch && !pcb) return false;  // wires/tracks have no Ref/Value to edit
 
-    // Locate the live ref/value (+ a lib label for context) from the mirror.
+    // Locate the live ref/value (+ a lib label for context) from the mirror. For schematic symbols we
+    // also keep the full EcadSymbol around so we can seed the footprint/dnp/sim-params fields.
     const std::string* ref = nullptr; const std::string* value = nullptr; std::string libLabel;
+    const EcadSymbol* sym = nullptr;  // sch only
     if (sch) {
         for (const auto& s : es.mirror.symbols())
-            if (s.id == id) { ref = &s.ref; value = &s.value; libLabel = s.libid; break; }
+            if (s.id == id) { sym = &s; ref = &s.ref; value = &s.value; libLabel = s.libid; break; }
     } else {
         for (const auto& fp : es.mirror.footprints())
             if (fp.id == id) { ref = &fp.ref; value = &fp.value; libLabel = fp.fpid; break; }
@@ -194,6 +200,18 @@ bool drawPropInspector(AppState& st, EcadEditorState& es, float sc) {
     if (es.editLoadedFor != es.selected) {  // (re)load buffers on selection change
         std::snprintf(es.editRef, sizeof(es.editRef), "%s", ref->c_str());
         std::snprintf(es.editValue, sizeof(es.editValue), "%s", value->c_str());
+        // Schematic-only buffers. sim_params is shown as compact JSON ("" when empty/absent).
+        if (sym) {
+            std::snprintf(es.editFootprint, sizeof(es.editFootprint), "%s", sym->footprint.c_str());
+            es.editDnp = sym->dnp;
+            const std::string spText =
+                (sym->simParams.is_object() && !sym->simParams.empty()) ? sym->simParams.dump() : "";
+            std::snprintf(es.editSimParams, sizeof(es.editSimParams), "%s", spText.c_str());
+        } else {
+            es.editFootprint[0] = '\0';
+            es.editDnp = false;
+            es.editSimParams[0] = '\0';
+        }
         es.editLoadedFor = es.selected;
     }
 
@@ -221,6 +239,80 @@ bool drawPropInspector(AppState& st, EcadEditorState& es, float sc) {
     if (ImGui::Button("Rotate (R)")) rotateOrFlipSelected(st, es, /*rotate=*/true);
     ImGui::SameLine();
     if (ImGui::Button(sch ? "Flip (F)" : "Flip side (F)")) rotateOrFlipSelected(st, es, false);
+
+    // ---- schematic-only extras: footprint assignment, DNP, sim-params ----
+    // PCB footprints already have their own fpid; these belong on the schematic symbol whose
+    // footprint/dnp/sim_params the engine's sch_edit_symbol patches (footprint/sim_params delete on
+    // JSON null, set on a string/object; dnp is a plain bool).
+    if (sch) {
+        // Footprint: an editable text field, pre-populated from a combo seeded with the same library
+        // the Place tool offers. Empty string -> send JSON null so the engine CLEARS the key.
+        ImGui::SetNextItemWidth(210 * sc);
+        bool fpCommit = ImGui::InputText("Footprint", es.editFootprint, sizeof(es.editFootprint),
+                                         ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        if (ImGui::BeginCombo("##fpPick", "Pick", ImGuiComboFlags_NoPreview)) {
+            static const char* kFps[] = {"Resistor_SMD:R_0603", "Capacitor_SMD:C_0603",
+                "Package_SO:SOIC-8", "Package_TO_SOT_SMD:SOT-23"};
+            for (auto* f : kFps)
+                if (ImGui::Selectable(f, std::string(es.editFootprint) == f)) {
+                    std::snprintf(es.editFootprint, sizeof(es.editFootprint), "%s", f);
+                    fpCommit = true;
+                }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pick a footprint from the library");
+        ImGui::SameLine();
+        if (ImGui::Button("Set##fp")) fpCommit = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Assign the footprint (blank clears it)");
+        if (fpCommit) {
+            nlohmann::json ops = nlohmann::json::array();
+            nlohmann::json op = {{"op", "sch_edit_symbol"}, {"id", id}};
+            // Empty -> null (delete the key); non-empty -> the string.
+            op["footprint"] = (es.editFootprint[0] == '\0') ? nlohmann::json(nullptr)
+                                                            : nlohmann::json(std::string(es.editFootprint));
+            ops.push_back(op);
+            st.ecadPendingOps = ops; st.ecadOpsGo = true;
+            es.editLoadedFor.clear();
+        }
+
+        // DNP (do-not-populate): a checkbox that commits immediately on toggle.
+        if (ImGui::Checkbox("DNP (do-not-populate)", &es.editDnp)) {
+            nlohmann::json ops = nlohmann::json::array();
+            ops.push_back({{"op", "sch_edit_symbol"}, {"id", id}, {"dnp", es.editDnp}});
+            st.ecadPendingOps = ops; st.ecadOpsGo = true;
+            es.editLoadedFor.clear();
+        }
+
+        // Sim-params: free-form JSON object edited as text, parsed on Apply. Blank -> null (clear).
+        ImGui::TextColored(v4(pal.textDim), "Sim params (JSON)");
+        ImGui::InputTextMultiline("##simParams", es.editSimParams, sizeof(es.editSimParams),
+                                  ImVec2(280 * sc, 48 * sc));
+        ImGui::SameLine();
+        if (ImGui::Button("Apply##sim")) {
+            const std::string txt(es.editSimParams);
+            // Trim leading/trailing whitespace to detect a truly empty field.
+            const auto first = txt.find_first_not_of(" \t\r\n");
+            const bool blank = (first == std::string::npos);
+            nlohmann::json parsed;
+            bool ok = true;
+            if (!blank) {
+                parsed = nlohmann::json::parse(txt, nullptr, /*allow_exceptions=*/false);
+                if (parsed.is_discarded() || !parsed.is_object()) ok = false;
+            }
+            if (!ok) {
+                st.addLog("[ecad] sim params: invalid JSON object — not applied");
+            } else {
+                nlohmann::json ops = nlohmann::json::array();
+                nlohmann::json op = {{"op", "sch_edit_symbol"}, {"id", id}};
+                op["sim_params"] = blank ? nlohmann::json(nullptr) : parsed;  // blank -> null (clear)
+                ops.push_back(op);
+                st.ecadPendingOps = ops; st.ecadOpsGo = true;
+                es.editLoadedFor.clear();
+            }
+        }
+    }
     return true;
 }
 

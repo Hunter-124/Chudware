@@ -161,6 +161,12 @@ void EcadMirror::parseSch(const nlohmann::json& tree, const nlohmann::json& comp
         sym.pos    = jptKey(s, "pos");
         sym.angle  = (float)jnum(s, "angle");
         sym.mirror = jstr(s, "mirror", "none");
+        sym.footprint = jstr(s, "footprint");  // "" if unassigned
+        sym.dnp    = jbool(s, "dnp");
+        {  // sim_params: keep the raw dict (free-form); leave as null if missing/non-object.
+            auto spIt = s.find("sim_params");
+            if (spIt != s.end() && spIt->is_object()) sym.simParams = *spIt;
+        }
         const int unit = (int)jnum(s, "unit", 1);
 
         // Resolve the lib_cache SymbolDef for body graphics + pins.

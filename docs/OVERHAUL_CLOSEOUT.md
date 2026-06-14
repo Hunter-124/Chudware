@@ -31,6 +31,28 @@ Baseline before this overhaul: `cf5f299` (the C51 sketched-feature checkpoint).
 - W20 Configurations — per-config param overrides + suppression (non-mutating compile overlay);
   switcher panel. W21 Design Table grid.
 
+**Post-roadmap follow-ups**
+- W3b Rib + Split features (last two greyed Features-tab buttons): rib = thicken an open contour →
+  trim/fuse support wall; split = divide body(ies) by a planar face/datum into above/below.
+- *Hollow-slot extrude bug* — `_detect_loops` now reverses end-matched edges so a decomposed slot
+  (2 lines + 2 cap arcs, as the Slot tool emits) winds consistently and is classified as a hole, not
+  filled material. *(User-reported bug.)*
+
+**W23 — greyed-button close-out sweep** (every remaining disabled ribbon command audited)
+- W23a Fix relation (one-click pin of selected sketch entities; engine `fix` was already
+  solver-backed) + Geometry Analysis un-greyed (its handler already mapped to the real `eval_check`).
+- W23c Zebra Stripes — real reflected-stripe GLSL surface-continuity mode (`uZebra`), replacing a
+  deferred stub; live density slider, exits cleanly.
+- W23b Sketch Text (build123d `Text`, cap-height-rescaled, glyph holes preserved) + Equation-Driven
+  Curve (safe-AST parametric `x(t)/y(t)`, spline interp). Engine + host tools.
+- W23d Style Spline (control-polygon B-spline by poles) + **solver hardening**: an adversarial check
+  found `_allocate_entity` raises on entity types it doesn't special-case and `solve_sketch` doesn't
+  wrap it — so an `eq_curve` (W23b) or `style_spline` in a live sketch crashed on the first drag.
+  Fixed across all three solver entity-dispatch sites (alloc / handle / emit).
+- The *only* remaining greyed command is **Spline on Surface** — deliberately deferred: it needs 3D-
+  sketch-on-face projection infrastructure (a curve constrained to lie on a model surface), a
+  separate focused effort, not a quick un-grey.
+
 ## Contract version-bump ledger (both additive — zero break for existing docs)
 
 | Change | Kind | Backward-compat proof |

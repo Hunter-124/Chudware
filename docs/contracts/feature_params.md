@@ -407,10 +407,43 @@ A plate closing the open END of a hollow member (a tube). SEPARATE weldment body
 - params: `source_path: str` · `format: "step"|"iges"|"brep"|"stl"` · `original_name: str?`
 - refs: — · bodies are frozen (no upstream params).
 
-## Stretch (schema-reserved): `rib`, `split`
+## Stretch: `rib`, `split` (implemented)
 
-`rib {params: thickness: dim, flip: bool; refs: profile: sel(region-open), …}` ·
-`split {refs: tool: sel(face, datum); params: keep: "both"|"above"|"below"}`
+### `rib`
+- params: `thickness: dim` (3) · `side: "both"|"one"` ("both"; both = the wall is centred on the
+  sketch, one = grown to one side) · `draft: dim` (0; tapers the rib sides) · `flip: bool` (false;
+  flips the one-sided thicken direction)
+- refs: `profile: [sel(region)]` — a region selector naming the SKETCH whose **open** contour (a
+  line, or a chain of lines/arcs near the gap it bridges) is the rib's silhouette trace. The PM
+  profile well emits a 1-list (parity with extrude); the engine reads that sketch's raw open
+  contour (NOT closed-region detection — a rib needs an open contour).
+- compiler: `features/rib.py::compile_rib`. Robust v1: lift the open contour into its sketch plane,
+  extrude it along the in-plane **drop direction** (perpendicular to the contour, toward the body's
+  bbox centre) by 1.5× the body diagonal to make the rib **silhouette** face; **thicken** that face
+  by `thickness` across the sketch-plane normal (centred for `both`, one-sided for `one`; `draft`
+  tapers via build123d `extrude(..., taper=)`); **trim** the slab to the body's bounding box and
+  **fuse** it to the running body. Gets a real connected rib on the common case (a line bridging two
+  wall tops of a U-channel — the rib touches both walls, fuse-verified by a volume increase). `op` =
+  "add"; `resolved`: `{thickness, draft, _rib_volume}`.
+- supported: an OPEN planar contour whose drop direction reaches the body (line, or open
+  line/arc chain). rejected (contained `FeatureError`): closed contour ("use an extrude/boss");
+  no existing body; a contour that adds no material inside the part envelope ("does not bridge the
+  body").
+- limitation: the trim is to the body BOUNDING BOX (not the exact body silhouette), so the fuse —
+  not the trim — defines the final rib boundary; the contour must overlap/bridge the existing walls.
+
+### `split`
+- params: `keep: "both"|"above"|"below"` ("both")
+- refs: `tool: sel(face[plane], datum)` — a planar model face or a datum plane that divides the
+  body. `+normal` of the plane defines "above".
+- compiler: `features/split.py::compile_split`. Realises the plane's two half-spaces as a large box
+  on the +normal side: per running body `above = body ∩ half_space`, `below = body − half_space`.
+  `keep="both"` → the body becomes TWO bodies; `above`/`below` → one. Every running body is split;
+  a body the plane misses passes through unchanged. `resolved`: `{_split_bodies, _pieces_kept,
+  keep_above, keep_below}`.
+- supported: a single planar tool through one or more running bodies. rejected (contained
+  `FeatureError`): no body; non-planar tool (via the plane resolver); a tool plane that intersects
+  no body ("does not intersect any body").
 
 ## PM form conventions (all features)
 

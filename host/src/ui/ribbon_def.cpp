@@ -39,7 +39,7 @@ static const RibbonCmd kCmds[] = {
     { "chamfer",           "Chamfer",        "chamfer",         "Features", "Dress-up",        true,  nullptr,          false },
     { "shell",             "Shell",          "shell",           "Features", "Dress-up",        true,  nullptr,          false },
     { "draft",             "Draft",          "draft",           "Features", "Dress-up",        false, nullptr,          false },
-    { "rib",               "Rib",            "rib",             "Features", "Dress-up",        false, nullptr,          true  },
+    { "rib",               "Rib",            "rib",             "Features", "Dress-up",        false, nullptr,          false },
 
     // --- Group: Hole ---
     { "hole_wizard",       "Hole Wizard",    "hole_wizard",     "Features", "Hole",            true,  nullptr,          false },
@@ -62,7 +62,7 @@ static const RibbonCmd kCmds[] = {
 
     // --- Group: Curves ---
     { "curve_helix",       "Helix",          "curve_helix",     "Features", "Curves",          true,  nullptr,          false },
-    { "split",             "Split",          "split",           "Features", "Curves",          false, nullptr,          true  },
+    { "split",             "Split",          "split",           "Features", "Curves",          false, nullptr,          false },
 
     // =========================================================================
     // Tab: Sketch

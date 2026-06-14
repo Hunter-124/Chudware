@@ -461,6 +461,30 @@ static const std::vector<PMFormDef>& forms() {
             DimU   ("overhang",  "Overhang",         "End Cap", 0.0),
             Dim    ("offset",    "Offset",           "End Cap", 0.0),
         }},
+        // --- rib (Dress-up / Stretch) --- engine features/rib.py. A thin support wall grown from an
+        //   OPEN sketch contour (a line/chain bridging the gap). The profile well is a region well
+        //   (key "profile" -> the viewport region picker fills it, like extrude), but the engine reads
+        //   the sketch's OPEN contour, not a closed region. thickness is the wall width; side centres
+        //   it (both) or grows to one side (one); draft tapers the sides; flip flips the one-sided dir.
+        { "rib", "Rib", "rib", {
+            Well   ("profile",   "Profile (open contour)", "Profile", K_FACE, true),
+            Dim    ("thickness", "Thickness",              "Rib",     3.0),
+            ComboL ("side",      "Thickness Side",         "Rib",
+                    "both|one", "Both (centered)|One Side"),
+            Angle  ("draft",     "Draft Angle",            "Rib",     0.0),
+            Check  ("flip",      "Reverse direction",      "Rib",     false),
+        }},
+        // --- split (Curves / Stretch) --- engine features/split.py. Divide the running body(ies) by a
+        //   planar tool into above/below pieces. The tool is a standard datum plane (DatumRef) OR a
+        //   picked planar model face (the Well shares the "tool" key and is LATER, so a pick overrides
+        //   the datum — last-wins in buildOpFeature). keep chooses which resulting piece(s) to keep.
+        { "split", "Split", "split", {
+            DatumRef ("tool", "Tool Plane",          "Trim/Split Tool",
+                      "plane.top|plane.front|plane.right", "Top plane|Front plane|Right plane"),
+            Well     ("tool", "…or pick a planar face", "Trim/Split Tool", K_FACE, false),
+            ComboL   ("keep", "Resulting Bodies",    "Resulting Bodies",
+                      "both|above|below", "Keep Both|Keep Above|Keep Below"),
+        }},
     };
     return kForms;
 }
@@ -510,6 +534,10 @@ const PMFormDef* pmFormForCommand(const std::string& cmdId, std::string& mode) {
     if (cmdId == "weld_member")       return pmFindForm("weld_member");
     if (cmdId == "weld_gusset")       return pmFindForm("weld_gusset");
     if (cmdId == "weld_end_cap")      return pmFindForm("weld_end_cap");
+    // Stretch — rib (thin wall from an open contour) + split (divide by a planar tool). cmd id ==
+    // the engine feature type.
+    if (cmdId == "rib")               return pmFindForm("rib");
+    if (cmdId == "split")             return pmFindForm("split");
     // Primitive quick-start commands (AI-CAD extensions; not in the C14 ribbon but reachable
     // via the M1 scenario / future "Insert > Primitive" entries).
     if (cmdId == "box")           return pmFindForm("box");

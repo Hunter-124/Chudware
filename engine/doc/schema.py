@@ -184,9 +184,11 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
     "weld_end_cap": {"params": [], "refs": {"face": (_SEL_OR_DATUM, True)}},
     "script": {"params": ["code"], "refs": {}},
     "import": {"params": ["source_path", "format"], "refs": {}},
-    # Stretch — schema-reserved (envelope accepted, no deep checks yet):
-    "rib": {"params": [], "refs": {}},
-    "split": {"params": [], "refs": {}},
+    # Stretch — rib (thin wall from an OPEN sketch contour) + split (divide a body by a planar tool).
+    # rib.profile is a region selector naming the sketch whose OPEN contour is the rib trace (the PM
+    # profile well emits a 1-list, like extrude). split.tool is a planar face or a datum plane.
+    "rib": {"params": [], "refs": {"profile": (_SEL_LIST, True)}},
+    "split": {"params": [], "refs": {"tool": (_SEL_OR_DATUM, True)}},
     # Assembly component patterns:
     "asm_linear_pattern": {"params": ["count1", "spacing1"],
                            "refs": {"dir1": (_SEL_OR_DATUM, True),

@@ -999,6 +999,10 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
     // feature list is a valid whole-body mirror.
     if (t == "mirror") return true;
 
+    // Split is ready as soon as it opens — the tool is a DatumRef (always set; an optional face pick
+    // overrides it). The engine errors cleanly if the chosen plane misses the part.
+    if (t == "split") return true;
+
     // Loft needs at least TWO section profiles before a preview is meaningful.
     if (t == "loft") {
         for (const auto& f : fields)
@@ -1026,6 +1030,7 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
     else if (t == "sm_jog")         needWell = "edge";     // jog needs a bend edge
     else if (t == "axis")    needWell = "a";          // datum axis primary reference
     else if (t == "point")   needWell = "target";     // datum point reference
+    else if (t == "rib")     needWell = "profile";    // rib needs an open-contour sketch profile
     if (needWell) {
         for (const auto& f : fields)
             if ((f.def->kind == PMFieldKind::SelectorWell || f.def->kind == PMFieldKind::FeatureWell)

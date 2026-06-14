@@ -49,6 +49,10 @@ from . import sheetmetal as _sheetmetal  # noqa: F401
 from . import sheetmetal_flat as _sheetmetal_flat  # noqa: F401
 # Weldments (structural profile swept along sketch segments → trimmed members + cut-list data):
 from . import weldment as _weldment  # noqa: F401
+# Stretch features (last two greyed Features-tab commands): rib (thin wall from an open contour) +
+# split (divide a body by a planar tool into above/below pieces):
+from . import rib as _rib  # noqa: F401
+from . import split as _split  # noqa: F401
 
 __all__ = [
     "CompileContext",

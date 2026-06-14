@@ -258,7 +258,9 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
     "shell": {"params": ["thickness"], "refs": {"remove": (_SEL_LIST, False)}},
     "draft": {"params": ["angle"], "refs": {"neutral": (_SEL_OR_DATUM, True),
                                             "pull": (_SEL_OR_DATUM, False),
-                                            "faces": (_SEL_LIST, True)}},
+                                            "faces": (_SEL_LIST, True),
+                                            # parting-line edges for parting_line / step modes
+                                            "parting": (_SEL_LIST, False)}},
     "hole": {"params": ["style", "end"], "refs": {"face": (_SEL_OR_DATUM, False),
                                                   "positions": (_SEL_LIST, False),
                                                   "positions_sketch": (_SEL_OR_DATUM, False),

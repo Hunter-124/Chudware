@@ -322,6 +322,27 @@ def test_parting_line_draft_tapers_both_sides_oppositely() -> None:
           f"parting widest (x {x_bot:.1f}<{x_part:.1f}>{x_top:.1f})")
 
 
+def test_parting_line_draft_via_refs_slot() -> None:
+    """Same parting-line draft as above, but the parting edges live in refs.parting (the
+    schema-declared slot the PM form fills) instead of params.parting — refs is canonical,
+    params is the back-compat fallback. The drafted result must still flag parting mode and
+    stay one body."""
+    doc = _doc([
+        _box("f1", 40.0, 40.0, 40.0, centered=False),
+        _feat("f2", "draft",
+              {"angle": _dim(8.0), "mode": "parting_line"},
+              refs={"neutral": "plane.top", "pull": "axis.z",
+                    "faces": [_x_wall_sel()], "parting": [_parting_edge_sel()]}),
+    ])
+    _assert_valid(doc)  # refs.parting must validate as a _SEL_LIST
+    res = compile_document(doc)
+    s = _status(res, "f2")
+    assert s["ok"], f"parting-line draft via refs.parting failed: {s['error']}"
+    assert abs(s["resolved"]["_mode_parting"] - 1.0) < 1e-9, "must flag parting mode"
+    assert len(res.bodies[-1].shape.solids()) == 1, "must stay one body"
+    print("[draft-parting-refs] refs.parting drives parting mode; one body")
+
+
 # --------------------------------------------------------------------------- test 7: step draft
 
 def test_step_draft_produces_a_step() -> None:

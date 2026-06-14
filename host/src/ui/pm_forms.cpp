@@ -344,12 +344,19 @@ static const std::vector<PMFormDef>& forms() {
         // --- draft ---  angle + neutral plane + faces[]
         //   Engine (draft.py): tapers each selected face about the line where it meets the neutral
         //   plane (OCCT DraftAngle). Pull direction defaults to the neutral plane normal.
+        //   mode (neutral_plane|parting_line|step): parting/step split each drafted face along a
+        //   parting line (refs.parting edges, gated on those modes) and taper the halves oppositely.
         { "draft", "Draft", "draft", {
+            ComboL   ("mode",    "Draft Type",    "Draft",
+                      "neutral_plane|parting_line|step",
+                      "Neutral Plane|Parting Line|Step"),
             Angle    ("angle",   "Draft Angle",   "Draft", 3.0),
             DatumRef ("neutral", "Neutral Plane", "Draft",
                       "plane.top|plane.front|plane.right",
                       "Top plane|Front plane|Right plane"),
             Well     ("faces",   "Faces to Draft", "Draft", K_FACE, true),
+            WellIf   ("parting", "Parting Line (edges)", "Draft", K_EDGE, true,
+                      "mode", "parting_line|step"),
         }},
         // --- helix (Curve) --- engine features/curves.py. Produces a sweep PATH (a Sweep can then
         //   reference this helix feature). v1 is "Height & Pitch"-defined; the engine derives turns

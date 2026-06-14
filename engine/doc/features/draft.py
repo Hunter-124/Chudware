@@ -371,10 +371,12 @@ def compile_draft(feat: dict, ctx: CompileContext) -> CompileOutput:
                                        "_mode_step": 0.0})
 
     # ---- parting-line / step draft ----
-    parting_sels = p.get("parting") or []
+    # refs.parting is the canonical home for the parting-line edge selectors (the PM form's well
+    # fills it); fall back to params.parting for docs authored before the refs slot existed.
+    parting_sels = refs.get("parting") or p.get("parting") or []
     if not isinstance(parting_sels, list) or not parting_sels:
         raise FeatureError(
-            "draft: params.parting (a list of edge selectors naming the parting line) is "
+            "draft: refs.parting (a list of edge selectors naming the parting line) is "
             "required for parting_line / step draft",
             dangling_refs=["parting: missing"])
 

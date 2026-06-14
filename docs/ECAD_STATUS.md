@@ -89,15 +89,21 @@ Build: `cmake -S host -B host/build -G "Visual Studio 17 2022" -A x64 && cmake -
   (`_DEFAULT_FOOTPRINTS` in `orchestrator.py`) so the board populates with real parts. Verified via
   `AI_CAD_ECAD_KIND=aiboard` (routed divider board: 2× R_0603 + outline + track). Hands off directly
   to **Board to 3D** for enclosure design — closing the schematic→PCB→3D→housing loop.
+- **Property inspector (V):** selecting a symbol/footprint (Select tool) shows an inline Ref + Value
+  editor on its own toolbar row; Apply / Enter commits via `sch_edit_symbol` / `pcb_edit_footprint`.
+  Buffers reload on selection change so edits never bleed between parts. Verified in
+  `AI_CAD_ECAD_KIND=select` (R1 / 10k populate the fields) + headless op round-trip.
 
-**GUI follow-ups (not blocking):** PropertyManager forms for ECAD ops (new `PMFieldKind`s — guide §f);
-move the editor mirror onto AppState for multi-doc; `ecad_open` file dialog.
+**GUI follow-ups (not blocking):** full PropertyManager forms for the remaining ECAD op fields
+(angle/mirror/side/footprint assignment — Ref/Value editing is DONE via the inspector); move the
+editor mirror onto AppState for multi-doc; `ecad_open` file dialog.
 
 ## Remaining work / known debt (prioritized)
 
 1. **GUI editor polish** — place/route/select/delete/move + AI launchpad + PCB→3D bridge +
-   simulation plot (transient & AC) + undo/redo + one-click AI→routed board are DONE (Waves N–U);
-   remaining: PropertyManager forms for ECAD ops, multi-doc, `ecad_open` file dialog.
+   simulation plot (transient & AC) + undo/redo + one-click AI→routed board + Ref/Value property
+   inspector are DONE (Waves N–V); remaining: PM forms for the remaining op fields (angle/mirror/
+   side/footprint), multi-doc, `ecad_open` file dialog.
 2. **Full bus routing** (electrical): member labels already net correctly (KiCad's bus is largely a
    drawing convenience over labels); explicit bus-wire + bus-entry tap objects are a follow-up.
 3. **Advanced routing**: push-and-shove (router is eviction-based rip-up + maze, not negotiated-

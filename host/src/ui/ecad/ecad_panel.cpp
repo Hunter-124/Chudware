@@ -36,6 +36,12 @@ struct EcadEditorState {
     std::string selected;        // "<kind>:<id>" ("" = nothing), kind in {s,fp,w,t}
     bool  dragging = false;      // a left-drag-move of the selected sym/fp is in progress
     float dragDx = 0, dragDy = 0;  // live drag offset (world mm) for visual feedback
+    // Property inspector buffers (the selected symbol/footprint's editable Ref + Value). Reloaded
+    // from the mirror whenever `selected` changes (tracked by editLoadedFor) so edits never bleed
+    // between parts; committed via sch_edit_symbol / pcb_edit_footprint.
+    char  editRef[64] = "";
+    char  editValue[96] = "";
+    std::string editLoadedFor;   // selection id the buffers were filled from ("" = stale/empty)
     // Simulation plot: snapshot of the last results we plotted + the analysis that produced them,
     // so the plot axes match the run (not the live combo) and we can pop the Sim tab on new results.
     nlohmann::json lastSimResults;
@@ -129,6 +135,57 @@ bool selectedPos(const EcadMirror& m, const std::string& sel, EcadPt& out) {
         for (const auto& fp : m.footprints()) if (fp.id == id) { out = fp.pos; return true; }
     }
     return false;
+}
+
+// Property inspector (Select tool): when a symbol/footprint is selected, expose its Ref + Value as
+// inline editable fields. The buffers reload from the mirror whenever the selection target changes
+// (tracked by es.editLoadedFor) so edits never bleed between parts. Committing (Enter or Apply) emits
+// sch_edit_symbol / pcb_edit_footprint through the same st.ecadPendingOps/ecadOpsGo path used by
+// drag/place/delete. Returns true if an inspector was drawn (so the caller skips the Select hint).
+bool drawPropInspector(AppState& st, EcadEditorState& es, float sc) {
+    const auto c = es.selected.find(':');
+    if (c == std::string::npos) return false;
+    const std::string kind = es.selected.substr(0, c), id = es.selected.substr(c + 1);
+    const bool sch = (kind == "s"), pcb = (kind == "fp");
+    if (!sch && !pcb) return false;  // wires/tracks have no Ref/Value to edit
+
+    // Locate the live ref/value (+ a lib label for context) from the mirror.
+    const std::string* ref = nullptr; const std::string* value = nullptr; std::string libLabel;
+    if (sch) {
+        for (const auto& s : es.mirror.symbols())
+            if (s.id == id) { ref = &s.ref; value = &s.value; libLabel = s.libid; break; }
+    } else {
+        for (const auto& fp : es.mirror.footprints())
+            if (fp.id == id) { ref = &fp.ref; value = &fp.value; libLabel = fp.fpid; break; }
+    }
+    if (!ref) return false;  // selection stale (just deleted) -> let the caller draw the hint
+
+    if (es.editLoadedFor != es.selected) {  // (re)load buffers on selection change
+        std::snprintf(es.editRef, sizeof(es.editRef), "%s", ref->c_str());
+        std::snprintf(es.editValue, sizeof(es.editValue), "%s", value->c_str());
+        es.editLoadedFor = es.selected;
+    }
+
+    const ui::Palette& pal = ui::palette;
+    ImGui::TextColored(v4(pal.accent), "%s", libLabel.empty() ? "Properties" : libLabel.c_str());
+    ImGui::SameLine(0, 10 * sc);
+    ImGui::SetNextItemWidth(80 * sc);
+    bool commit = ImGui::InputText("Ref", es.editRef, sizeof(es.editRef),
+                                   ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120 * sc);
+    commit |= ImGui::InputText("Value", es.editValue, sizeof(es.editValue),
+                               ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if (ImGui::Button("Apply")) commit = true;
+    if (commit) {
+        nlohmann::json ops = nlohmann::json::array();
+        ops.push_back({{"op", sch ? "sch_edit_symbol" : "pcb_edit_footprint"},
+                       {"id", id}, {"ref", es.editRef}, {"value", es.editValue}});
+        st.ecadPendingOps = ops; st.ecadOpsGo = true;
+        es.editLoadedFor.clear();  // force a reload from the post-edit revision next frame
+    }
+    return true;
 }
 
 // Select-tool interaction: pick/highlight on click, Delete to remove, left-drag to move a
@@ -670,7 +727,7 @@ void drawEcadEditor(AppState& st) {
         } else {
             ImGui::TextColored(v4(pal.textDim), st.ecadTool == 2
                 ? "Route: click points; Esc / right-click to finish"
-                : "Select: middle/right-drag to pan, wheel to zoom");
+                : "Select: click a part to edit; middle/right-drag to pan, wheel to zoom");
         }
         // Native simulator controls (schematic only): an analysis selector + a Simulate button that
         // fires ecad_simulate via the app loop (st.ecadSimGo). Results plot in the bottom strip.
@@ -684,6 +741,10 @@ void drawEcadEditor(AppState& st) {
             if (ImGui::Button("Simulate", ImVec2(100 * sc, 0))) st.ecadSimGo = true;
         }
     }
+    // Property inspector row (Select tool): edit the selected symbol/footprint's Ref/Value. On its
+    // own line so it never contends with the right-anchored Simulate controls. Draws nothing unless a
+    // symbol/footprint is selected, so the toolbar stays compact when picking wires/tracks/nothing.
+    if (st.ecadTool == 0) drawPropInspector(st, es, sc);
     ImGui::Separator();
 
     // Reserve the bottom results strip; the rest splits left sub-panel | canvas. Give the strip

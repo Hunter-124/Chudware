@@ -50,9 +50,9 @@ Files: `host/src/ui/widgets/ribbon.cpp`, `ribbon_def.cpp`, `title_bar.cpp`, `sta
 | 2.3 | High | `ribbon.cpp:534,1105` | ⬜ degraded big-as-small row is `26*s` tall but layout advances `sy` by `22*s` → rows overlap ~4*s | advance by actual row height |
 | 2.4 | Med | `ribbon.cpp:968,1257` | ⬜ overflow chevron width (`22*s`) computed but never subtracted from `availW` → chevron can land off-edge | reserve chevron when `totalW>availW` |
 | 2.5 | Med | `ribbon.cpp:886-925` | ⬜ tab strip has no overflow/wrap; 8 tabs (growing) run off-screen at high DPI / narrow window | add tab overflow (shrink-pad then `»`) |
-| 2.6 | Med | `title_bar.cpp:74-76` | ⬜ dock clamps fight scale: `leftFrac` ceiling 0.34 eats DPI growth at ≥1.5× (the W4-K fix is silently clipped) | clamp in px not fraction (see style guide §6) |
+| 2.6 | Med | `title_bar.cpp:74-76` | ✅ dock clamps fought scale: `leftFrac` ceiling 0.34 ate DPI growth at ≥1.5× | now clamped in px (`leftPx/rightPx`) |
 | 2.7 | Med | `title_bar.cpp:139,157` | ⬜ menu-zone reserves `4.0f`/`120.0f` unscaled → wordmark fit wrong at high DPI | `*s` |
-| 2.8 | Low | `title_bar.cpp:78` | ⬜ dead `consFrac` math (computed, `(void)`'d) | delete |
+| 2.8 | Low | `title_bar.cpp:78` | ✅ dead `consFrac` + unused `h` math (computed, `(void)`'d) | deleted |
 | 2.9 | Low | `ribbon.cpp:446,573,928,1116` | ⬜ split-button divider insets + all `AddLine(...,1.0f)` hairlines unscaled | `*s` / `max(1,1*s)` |
 | 2.10 | Low | `ribbon.cpp:647,1165,1210` | ⬜ flyout/overflow row metrics (28/20/8/6) duplicated inline in 3 places | hoist to named consts |
 | 2.11 | Low | `title_bar.cpp:17,135` | ⬜ caption-width DPI ramp duplicated verbatim, must hand-sync | one `captionButtonWidth(barH)` helper |
@@ -86,12 +86,12 @@ reference pattern). Rollback band `9*uiScale`. Badges = font glyphs.
 
 | # | Sev | Site | Problem | Fix |
 |---|---|---|---|---|
-| 4.1 | High | `feature_tree.cpp:54,57` + ~10 call sites | ⬜ tree icons never `*uiScale` → glyphs stay 16/20px while rows grow at HiDPI (tiny, misaligned) | bake `*uiScale` into `treeIcon` |
-| 4.2 | Med | `feature_tree.cpp:54-57` vs `403-407` | ⬜ header rows draw icons at 16, feature rows at 20 → ragged icon column | one tier (16*S) for all rows |
-| 4.3 | Med | `feature_tree.cpp:404,443,618` | ⬜ nested-sketch `Indent/Unindent(14.0f)` unscaled → flattened hierarchy at HiDPI | `14*S` or `IndentSpacing` |
-| 4.4 | Low | `feature_tree.cpp:1306,1320,1758` | ⬜ Solid Bodies / folders borrow `mates_folder` icon though `body_folder` exists | use `body_folder` |
-| 4.5 | Low | many | ⬜ icon↔label `SameLine(0,4)` and draw-list thickness/rounding (`2/2.5/3`) unscaled | `*S` |
-| 4.6 | Low | `feature_tree.cpp:1030,1043` | ⬜ rollback bar thin/subtle vs SW (ergonomic) | band `12*S`, line `3*S`, handle `28×8*S` |
+| 4.1 | High | `feature_tree.cpp:54,57` + ~10 call sites | ✅ tree icons never `*uiScale` → glyphs stayed 16/20px while rows grew at HiDPI | baked `*uiScale` into `treeIcon` |
+| 4.2 | Med | `feature_tree.cpp:54-57` vs `403-407` | ✅ header rows drew icons at 16, feature rows at 20 → ragged column | uniform 16*S for all rows |
+| 4.3 | Med | `feature_tree.cpp:404,443,618` | ✅ nested-sketch `Indent/Unindent(14.0f)` unscaled | now `14*S` |
+| 4.4 | Low | `feature_tree.cpp:1306,1320,1758` | ✅ Solid Bodies / folders borrowed `mates_folder` icon | now `body_folder` |
+| 4.5 | Low | many | ✅ icon↔label `SameLine(0,4)` and draw-list thickness/rounding (`2/2.5/3`) unscaled | now `*S` w/ `max(1,…)` floor |
+| 4.6 | Low | `feature_tree.cpp:1030,1043` | ✅ rollback bar thin/subtle vs SW | band `12*S`, line `2–3*S`, handle `28×8*S` |
 
 ## 5. Icon system
 Files: `host/src/ui/icons.{cpp,h}`, `host/assets/icons/atlas.json`, `host/assets/make_icons.py`.
@@ -112,10 +112,11 @@ placeholder + logs `[icons] unknown icon` once. Nothing cross-checks C++ name st
 
 ## Recommended fix order
 
-1. ✅ **Done this pass (committed):** 5.1–5.3 (4 broken icons), 1.1 (Settings theme-scale bug),
+1. ✅ **Done (committed `38013de`):** 5.1–5.3 (4 broken icons), 1.1 (Settings theme-scale bug),
    3.1/3.2 (PM OK/Cancel icons + Dim stepper overflow) — the user-visible breakage.
-2. **Next (mechanical, low-risk, High sev):** 4.1 tree-icon scaling, 2.6 dock-clamp px, 2.1–2.3
-   ribbon width/overlap math. One commit each, headless-verified.
+2. ✅ **Done (this pass):** 4.1–4.6 (FeatureManager tree DPI scaling: icons, indent, gaps,
+   strokes, rollback bar, `body_folder`), 2.6 + 2.8 (dock clamp in px + dead `consFrac`/`h`).
+   Remaining mechanical High: 2.1–2.3 ribbon width/overlap math (subtler — visual verify needed).
 3. **Then (Med, contained):** 5.4 icon-name validation guardrail, 3.3/3.4 PM button row + two-column
    grid, 2.4/2.5 ribbon + tab overflow, 1.2 runtime DPI handler.
 4. **Polish (Low):** the remaining unscaled literals, dead code, duplicated helpers.

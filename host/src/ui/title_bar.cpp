@@ -65,17 +65,14 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
 
     // Target pixel widths translated to fractions of the dockspace width.
     const float w = size.x > 1.0f ? size.x : 1440.0f;
-    const float h = size.y > 1.0f ? size.y : 800.0f;
-    // Tuned to maximize the central viewport: a compact FeatureManager, a single-tab-group task
-    // pane (Phase 4 consolidates Design/Activity/Console into one), and an unobtrusive console.
-    // W4-K: scale the target pixel widths by uiScale so the docks track the (pre-scaled) fonts —
-    // at 2x the framebuffer grows but text is ~2x wider, so a fixed-px dock clips tree labels.
+    // W4-K / GUI audit #2.6: clamp the dock widths in PIXELS, not in fixed fraction bounds. The
+    // target px scale by uiScale so the docks track the pre-scaled fonts; clamping the *fraction*
+    // with a fixed ceiling (the old 0.34/0.36) silently ate that DPI growth at >=1.5x and clipped
+    // tree labels — the very thing W4-K was meant to fix. See docs/GUI_STYLE_GUIDE.md §6.
     const float sc = ui::uiScale;
-    float leftFrac  = 258.0f * sc / w;  leftFrac  = leftFrac  < 0.13f ? 0.13f : (leftFrac  > 0.34f ? 0.34f : leftFrac);
-    float rightFrac = 300.0f * sc / w;  rightFrac = rightFrac < 0.15f ? 0.15f : (rightFrac > 0.36f ? 0.36f : rightFrac);
-    float consFrac  = 108.0f * sc / h;  consFrac  = consFrac  < 0.10f ? 0.10f : (consFrac  > 0.26f ? 0.26f : consFrac);
-
-    (void)consFrac;  // Console is now a tab inside the AI panel, not a bottom strip.
+    auto clampf = [](float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); };
+    float leftPx  = clampf(258.0f * sc, 180.0f * sc, 0.34f * w);  float leftFrac  = leftPx  / w;
+    float rightPx = clampf(300.0f * sc, 200.0f * sc, 0.36f * w);  float rightFrac = rightPx / w;
     ImGuiID main = root, left, right, rightBottom;
     // Left column = FeatureManager (full height).
     left  = ImGui::DockBuilderSplitNode(main, ImGuiDir_Left,  leftFrac,  nullptr, &main);

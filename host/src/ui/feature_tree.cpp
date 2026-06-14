@@ -54,7 +54,9 @@ namespace ui {
 static void treeIcon(const char* name, const char* fallback, float size = 16.0f, float alpha = 1.0f) {
     IconUV iv = getIcon(name, 20);
     if (iv.valid) {
-        ImGui::Image(iv.texId, ImVec2(size, size), iv.uv0, iv.uv1, ImVec4(1, 1, 1, alpha));
+        // #4.1: raw px literal — scale the drawn quad so the icon tracks DPI (fonts are pre-scaled).
+        float px = size * ui::uiScale;
+        ImGui::Image(iv.texId, ImVec2(px, px), iv.uv0, iv.uv1, ImVec4(1, 1, 1, alpha));
     } else {
         if (alpha < 1.0f) ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], alpha));
@@ -400,12 +402,14 @@ struct RowResult {
 static RowResult featureRow(RowCtx& c, AppState& st) {
     RowResult res;
     const std::string& fid = c.fid;
-    float iconW = 20.0f;
-    if (c.nested) ImGui::Indent(14.0f);   // sketch child indent (visual nesting)
+    // #4.2: feature rows now use the SAME logical 16px icon as headers/folders (was 20) so the icon
+    // column is uniform; treeIcon bakes in *uiScale.
+    float iconW = 16.0f;
+    if (c.nested) ImGui::Indent(14.0f * ui::uiScale);   // #4.3: scaled sketch child indent
     // C37-E (item 6): suppressed/rolled-back rows get a faded icon (clearer than just the [S] tag).
     float iconAlpha = c.suppressed ? 0.45f : (c.rolledBack ? 0.6f : 1.0f);
     treeIcon(c.iconName, c.iconFallback, iconW, iconAlpha);
-    ImGui::SameLine(0, 4);
+    ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5: scaled icon↔label gap
 
     // ---- inline rename editor (replaces the label while active) ----
     if (s_renamingId == fid) {
@@ -440,7 +444,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
                 }
             }
         }
-        if (c.nested) ImGui::Unindent(14.0f);
+        if (c.nested) ImGui::Unindent(14.0f * ui::uiScale);   // #4.3: balanced with the scaled Indent
         return res;
     }
 
@@ -493,7 +497,8 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         bool   after = ImGui::GetIO().MousePos.y > mid;
         float  ly = after ? rmax.y : rmin.y;
         ImGui::GetWindowDrawList()->AddLine(ImVec2(rmin.x, ly), ImVec2(rmax.x, ly),
-                                            ui::Palette::toU32(ui::palette.accent), 2.5f);
+                                            ui::Palette::toU32(ui::palette.accent),
+                                            std::max(1.0f, 2.5f * ui::uiScale));  // #4.5
         if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("FEATURE_ROW")) {
             std::string dragged(static_cast<const char*>(pl->Data));
             if (dragged != fid) {
@@ -615,7 +620,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         ImGui::SetTooltip("%s", tip.c_str());
     }
 
-    if (c.nested) ImGui::Unindent(14.0f);
+    if (c.nested) ImGui::Unindent(14.0f * ui::uiScale);   // #4.3: balanced with the scaled Indent
     return res;
 }
 
@@ -712,7 +717,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                     Palette::toU32(pal.treeRowAlt));
             }
             treeIcon(isAsm ? "assembly" : "part", isAsm ? "[A]" : "[P]", 16.0f);
-            ImGui::SameLine(0, 4);
+            ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
             // SolidWorks marks fixed components with a "(f)" prefix.
             std::string label = (fixed ? "(f) " : "") + cname;
             if (suppressed) label += " [S]";
@@ -728,7 +733,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
 
     // ---- Mates folder ----
     treeIcon("mates_folder", "[M]", 16.0f);
-    ImGui::SameLine(0, 4);
+    ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
     ImGuiTreeNodeFlags ff = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth;
     if (ImGui::TreeNodeEx("Mates##mates_folder", ff)) {
         if (tree.contains("mates") && tree["mates"].is_array()) {
@@ -755,7 +760,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                 if (msup) row += " [S]";
 
                 treeIcon("mate", "[m]", 16.0f);
-                ImGui::SameLine(0, 4);
+                ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                 if (msup) ImGui::PushStyleColor(ImGuiCol_Text,
                     ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.5f));
                 ImGuiTreeNodeFlags mf = ImGuiTreeNodeFlags_Leaf |
@@ -1027,7 +1032,7 @@ static void drawRollbackBarLine(AppState& st, bool enabled, const std::string& /
     ImVec2 r0 = ImGui::GetCursorScreenPos();
     float  w  = ImGui::GetContentRegionAvail().x;
     float  rsc = ui::uiScale;
-    float  barH = 9.0f * rsc;          // grabbable band height
+    float  barH = 12.0f * rsc;          // #4.6: thicker grabbable band height
     // An invisible button across the whole band gives us hover + active (drag) state.
     ImGui::PushID("##rollback_bar");
     ImGui::InvisibleButton("##rb", ImVec2(w, barH));
@@ -1040,10 +1045,10 @@ static void drawRollbackBarLine(AppState& st, bool enabled, const std::string& /
     float ly = r0.y + barH * 0.5f;
     ImU32 lineCol = ui::Palette::toU32((hovered || active) ? pal.accent : pal.accentMid);
     rdl->AddLine(ImVec2(r0.x, ly), ImVec2(r0.x + w, ly), lineCol,
-                 (hovered || active) ? 3.0f : 2.0f);
-    float hw = 22.0f * rsc, hh = 7.0f * rsc, hx = r0.x + (w - hw) * 0.5f;
+                 std::max(1.0f, (hovered || active) ? 3.0f * rsc : 2.0f * rsc));  // #4.6
+    float hw = 28.0f * rsc, hh = 8.0f * rsc, hx = r0.x + (w - hw) * 0.5f;  // #4.6: bigger handle
     rdl->AddRectFilled(ImVec2(hx, ly - hh * 0.5f), ImVec2(hx + hw, ly + hh * 0.5f),
-                       ui::Palette::toU32(pal.accent), 3.0f);
+                       ui::Palette::toU32(pal.accent), std::max(1.0f, 3.0f * rsc));  // #4.5
     if (hovered && !active)
         ImGui::SetTooltip("Rollback bar — drag up/down to roll the model back/forward,\n"
                           "or drop a feature here to move it to the end");
@@ -1051,7 +1056,7 @@ static void drawRollbackBarLine(AppState& st, bool enabled, const std::string& /
     // Drop target: a dragged feature row landing on the bar goes to the end (kept from C24).
     if (enabled && ImGui::BeginDragDropTarget()) {
         rdl->AddLine(ImVec2(r0.x, ly), ImVec2(r0.x + w, ly),
-                     ui::Palette::toU32(pal.accent), 2.5f);
+                     ui::Palette::toU32(pal.accent), std::max(1.0f, 2.5f * rsc));  // #4.5
         if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("FEATURE_ROW")) {
             std::string dragged(static_cast<const char*>(pl->Data));
             applyTreeOps(st, nlohmann::json::array(
@@ -1079,7 +1084,7 @@ static void drawFeatureManagerTopStrip(AppState& st) {
     };
     float tabBtn = 22.0f * ui::uiScale;
     for (int i = 0; i < 3; ++i) {
-        if (i) ImGui::SameLine(0, 2);
+        if (i) ImGui::SameLine(0, 2 * ui::uiScale);   // #4.5: scaled inter-tab gap
         ImGui::PushID(i + 7700);
         ImVec2 p0 = ImGui::GetCursorScreenPos();
         ImGui::InvisibleButton("##fmtab", ImVec2(tabBtn, tabBtn));
@@ -1087,10 +1092,14 @@ static void drawFeatureManagerTopStrip(AppState& st) {
         bool act = (i == 0);  // only the tree tab is functional
         if (act || hov)
             dl->AddRectFilled(p0, ImVec2(p0.x + tabBtn, p0.y + tabBtn),
-                              ui::Palette::toU32(act ? pal.ribbonTabActive : pal.buttonHovered), 3.0f);
-        if (act)
-            dl->AddLine(ImVec2(p0.x + 2, p0.y + tabBtn - 1), ImVec2(p0.x + tabBtn - 2, p0.y + tabBtn - 1),
-                        ui::Palette::toU32(pal.accent), 2.0f);
+                              ui::Palette::toU32(act ? pal.ribbonTabActive : pal.buttonHovered),
+                              std::max(1.0f, 3.0f * ui::uiScale));  // #4.5: scaled rounding
+        if (act) {
+            float in = 2.0f * ui::uiScale, dn = 1.0f * ui::uiScale;  // #4.5: scaled underline insets
+            dl->AddLine(ImVec2(p0.x + in, p0.y + tabBtn - dn),
+                        ImVec2(p0.x + tabBtn - in, p0.y + tabBtn - dn),
+                        ui::Palette::toU32(pal.accent), std::max(1.0f, 2.0f * ui::uiScale));
+        }
         IconUV iv = getIcon(kTabs[i].icon, 20);
         float iz = 16.0f * ui::uiScale, off = (tabBtn - iz) * 0.5f;
         dl->AddImage(iv.texId, ImVec2(p0.x + off, p0.y + off),
@@ -1264,7 +1273,7 @@ void drawFeatureTree(AppState& st,
                 char eqLabel[64];
                 std::snprintf(eqLabel, sizeof(eqLabel), "Equations (%d)##eqhdr", eqCount);
                 treeIcon("equations", "[=]", 16.0f);
-                ImGui::SameLine(0, 4);
+                ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                 ImGui::TreeNodeEx(eqLabel, f);
             }
 
@@ -1282,7 +1291,7 @@ void drawFeatureTree(AppState& st,
                     }
                 }
                 treeIcon("material", "[M]", 16.0f);
-                ImGui::SameLine(0, 4);
+                ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                 ImGui::TreeNodeEx(("##mat_" + mat).c_str(), f | ImGuiTreeNodeFlags_NoTreePushOnOpen);
                 ImGui::SameLine();
                 ImGui::PushStyleColor(ImGuiCol_Text,
@@ -1303,8 +1312,8 @@ void drawFeatureTree(AppState& st,
                 if (!isAsmDoc && st.hasDocMesh && nBodies >= 1) {
                     char hdr[64];
                     std::snprintf(hdr, sizeof(hdr), "Solid Bodies (%d)##solid_bodies", nBodies);
-                    treeIcon("mates_folder", "[F]", 16.0f);
-                    ImGui::SameLine(0, 4);
+                    treeIcon("body_folder", "[F]", 16.0f);   // #4.4: was borrowed "mates_folder"
+                    ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                     bool open = ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_DefaultOpen |
                                                        ImGuiTreeNodeFlags_SpanFullWidth);
                     if (open) {
@@ -1318,7 +1327,7 @@ void drawFeatureTree(AppState& st,
                                                     ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                                     ImGuiTreeNodeFlags_SpanFullWidth;
                             treeIcon("part", "[B]", 16.0f, hidden ? 0.45f : 1.0f);
-                            ImGui::SameLine(0, 4);
+                            ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                             if (hidden)
                                 ImGui::PushStyleColor(ImGuiCol_Text,
                                     ImVec4(pal.textDim[0], pal.textDim[1],
@@ -1381,7 +1390,7 @@ void drawFeatureTree(AppState& st,
                 if (st.planeEmphasis == pi) f |= ImGuiTreeNodeFlags_Selected;
                 bool hidden = !st.showPlane[pi];
                 treeIcon("plane", "[P]", 16.0f);
-                ImGui::SameLine(0, 4);
+                ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                 if (hidden)
                     ImGui::PushStyleColor(ImGuiCol_Text,
                         ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.55f));
@@ -1416,7 +1425,7 @@ void drawFeatureTree(AppState& st,
                                        ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                        ImGuiTreeNodeFlags_SpanFullWidth;
                 treeIcon("origin", "[O]", 16.0f);
-                ImGui::SameLine(0, 4);
+                ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                 ImGui::TreeNodeEx("Origin##origin", f);
             }
 
@@ -1671,7 +1680,8 @@ void drawFeatureTree(AppState& st,
                                 s_rbDropAfter = fid;  // drop the bar right after this feature
                                 ImGui::GetWindowDrawList()->AddLine(
                                     ImVec2(imn.x, imx.y), ImVec2(imx.x, imx.y),
-                                    ui::Palette::toU32(pal.accent), 2.5f);
+                                    ui::Palette::toU32(pal.accent),
+                                    std::max(1.0f, 2.5f * ui::uiScale));  // #4.5
                             } else if (my < imn.y && s_rbDropAfter.empty()) {
                                 // cursor above the first row → roll back before everything (to start)
                                 s_rbDropAfter = "\1start";
@@ -1755,8 +1765,8 @@ void drawFeatureTree(AppState& st,
                             if (folderOpen) { ImGui::TreePop(); folderOpen = false; }
                             openFolder = folder;
                             if (!folder.empty()) {
-                                treeIcon("mates_folder", "[F]", 16.0f);
-                                ImGui::SameLine(0, 4);
+                                treeIcon("body_folder", "[F]", 16.0f);   // #4.4: was "mates_folder"
+                                ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                                 folderOpen = ImGui::TreeNodeEx(
                                     (folder + "##fld_" + folder).c_str(),
                                     ImGuiTreeNodeFlags_DefaultOpen |

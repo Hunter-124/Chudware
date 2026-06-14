@@ -62,6 +62,19 @@ SAFE_LITERALS = {0.0, 1.0, -1.0}
 # A literal below this magnitude is treated as a ratio/multiplier (e.g. 0.5f, 0.3f) — not a pixel.
 PIXEL_MIN = 2.0
 
+# Files whose pixel literals are WORLD-SPACE draw-list art (canvas geometry drawn via a
+# world->screen transform, NOT DPI chrome) or the authored base ImGuiStyle (scaled once by
+# ScaleAllSizes). The scale rule produces only false positives here, so its findings in these files
+# are reported under the NON-GATING "scale-ws" rule instead of "scale" — visible for audit, but they
+# do not fail the gate. (Chrome exceptions inside these files can still be fixed; add a per-line
+# "// gui-lint: allow" if a specific art literal is mis-flagged elsewhere.)
+SCALE_WORLDSPACE_FILES = {
+    "host/src/ui/sketch_mode.cpp",        # 2D sketch canvas — world (model) coordinates
+    "host/src/ui/ecad/ecad_canvas.cpp",   # schematic / PCB canvas — world coordinates
+    "host/src/ui/drawing_panel.cpp",      # drawing sheet — paper-space coordinates
+    "host/src/ui_theme.cpp",              # base ImGuiStyle authored at 1.0x (ScaleAllSizes scales)
+}
+
 NUM_RE = re.compile(r"(?<![\w.])(-?\d+\.?\d*)f?(?![\w.\d])")
 SUPPRESS_RE = re.compile(r"gui-lint:\s*(allow|ok)")
 SCALE_MUL_RE = re.compile(
@@ -165,6 +178,8 @@ FONT_GLOBAL_RE = re.compile(r'FontGlobalScale\s*=')
 def lint_file(path: str, atlas: set[str], rules: set[str], findings: list):
     rel = os.path.relpath(path, REPO).replace(os.sep, "/")
     is_ribbon_def = rel.endswith("ribbon_def.cpp")
+    # World-space / base-style files report scale findings under the non-gating "scale-ws" rule.
+    scale_rule = "scale-ws" if rel in SCALE_WORLDSPACE_FILES else "scale"
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         lines = fh.readlines()
     for n, raw in enumerate(lines, 1):
@@ -213,7 +228,7 @@ def lint_file(path: str, atlas: set[str], rules: set[str], findings: list):
                             continue
                         if literal_is_scaled(args, nm.start(), nm.end()):
                             continue
-                        findings.append((rel, n, "scale",
+                        findings.append((rel, n, scale_rule,
                                          f'raw px literal {nm.group(1)} in {func}(...) not *uiScale',
                                          line.strip()))
 
@@ -282,7 +297,9 @@ def main(argv) -> int:
         print(f"\n{len(findings)} finding(s): "
               f"{', '.join(f'{k}={len(v)}' for k, v in sorted(by_rule.items())) or 'clean'}")
 
-    return 1 if findings else 0
+    # "scale-ws" (world-space draw-list art / base style) is informational, not a gate failure.
+    gating = [f for f in findings if f[2] != "scale-ws"]
+    return 1 if gating else 0
 
 
 if __name__ == "__main__":

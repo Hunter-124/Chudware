@@ -223,6 +223,7 @@ static const RibbonCmd kCmds[] = {
     { "ecad_new_sch",       "Schematic",      "sketch",          "PCB", "New",        true,  nullptr, false },
     { "ecad_new_pcb",       "PCB Layout",     "extrude_boss",    "PCB", "New",        true,  nullptr, false },
     { "ecad_open",          "Open",           "ref_plane",       "PCB", "New",        false, nullptr, false },
+    { "ecad_save",          "Save",           "ok_check",        "PCB", "New",        false, nullptr, false },
 
     // --- Group: Schematic ---
     { "sch_add_symbol",     "Place Symbol",   "point_ent",       "PCB", "Schematic",  true,  nullptr, false },

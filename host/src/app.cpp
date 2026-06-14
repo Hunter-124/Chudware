@@ -47,6 +47,7 @@
 #include "ui/viewport_panel.h"
 #include "ui/ecad/ecad_panel.h"   // Wave N: AI-ECAD 2D editor
 #include "ui/ecad/ecad_mirror.h"  // Wave N: complete type for EcadMirror::setDocId
+#include "ui/file_dialog.h"       // Wave Y: native Save As / Open dialogs for .ecad+
 #include "ui/icons.h"
 #include "ui/widgets/ribbon.h"
 #include "ui/ribbon_def.h"
@@ -187,6 +188,38 @@ void ecadExport(AppState& st, const char* kind) {
         return;
     st.toast(ui::ToastLevel::Info, std::string("Exported ") + kind + " -> ecad_out");
     st.addLog("[ecad] export " + std::string(kind) + " -> " + dir);
+}
+
+// Save the open ECAD document to a native `.ecad+` container (ZIP) via a Save As dialog; the worker's
+// ecad_save writes through engine.ecad.formats. Reuses the doc's current name as the suggested file.
+void ecadSaveDoc(AppState& st) {
+    if (st.ecadDocId.empty()) { st.toast(ui::ToastLevel::Warn, "Design or open an ECAD document to save"); return; }
+    const std::string name = ui::ecadEditorMirror().name();
+    const std::string path = ui::saveFileDialog(
+        "AI-ECAD design (*.ecad+)\0*.ecad+\0All files (*.*)\0*.*\0", "ecad+",
+        name.empty() ? "design" : name.c_str());
+    if (path.empty()) return;  // cancelled
+    nlohmann::json res;
+    if (!ecadCall(st, "ecad_save", {{"doc_id", st.ecadDocId}, {"path", path}}, res)) return;
+    const std::string saved = jstr(res, "path");
+    st.toast(ui::ToastLevel::Info, "Saved " + (saved.empty() ? path : saved));
+    st.addLog("[ecad] saved -> " + (saved.empty() ? path : saved));
+}
+
+// Open an ECAD document (native .ecad+ / .ecad / .json, or a KiCad .kicad_sch/.kicad_pcb which the
+// worker imports) via an Open dialog. The loaded doc adopts into the editor mirror and surfaces.
+void ecadOpenDoc(AppState& st) {
+    const std::string path = ui::openFileDialog(
+        "ECAD / KiCad files\0*.ecad+;*.ecad;*.json;*.kicad_sch;*.kicad_pcb\0"
+        "AI-ECAD design (*.ecad+)\0*.ecad+\0KiCad schematic (*.kicad_sch)\0*.kicad_sch\0"
+        "KiCad board (*.kicad_pcb)\0*.kicad_pcb\0All files (*.*)\0*.*\0");
+    if (path.empty()) return;  // cancelled
+    nlohmann::json res;
+    if (!ecadCall(st, "ecad_open", {{"path", path}}, res)) return;
+    ecadAdopt(st, res);          // sets ecadDocId/revision + loads the editor mirror
+    st.wantFocusEcad = 6;        // surface the editor with the freshly opened doc
+    st.toast(ui::ToastLevel::Info, "Opened " + path);
+    st.addLog("[ecad] opened " + path);
 }
 
 // The headline integration: export the current board to STEP, then IMPORT it into a live CAD part
@@ -352,6 +385,8 @@ void ecadDispatch(AppState& st, const std::string& cmd) {
     if (cmd == "ecad_ai_design")     { st.wantFocusEcad = 6; return; }  // surface the AI launchpad
     if (cmd == "ecad_new_sch")       { ecadNewDoc(st, "sch"); return; }
     if (cmd == "ecad_new_pcb")       { ecadNewDoc(st, "pcb"); return; }
+    if (cmd == "ecad_open")          { ecadOpenDoc(st); return; }   // Wave Y: open .ecad+/KiCad
+    if (cmd == "ecad_save")          { ecadSaveDoc(st); return; }   // Wave Y: save .ecad+
     if (cmd == "ecad_run_erc")       { ecadDocRpc(st, "ecad_rebuild", "ERC updated"); return; }
     if (cmd == "ecad_run_drc")       { ecadDocRpc(st, "ecad_rebuild", "DRC updated"); return; }
     if (cmd == "ecad_simulate")      { st.ecadSimGo = true; st.wantFocusEcad = 4; return; }
@@ -1270,6 +1305,7 @@ int run_gui(const char* screenshotPath) {
             const bool wantAiBoard = kindEnv && std::strcmp(kindEnv, "aiboard") == 0; // Wave U one-click
             const bool wantAiBoard3d = kindEnv && std::strcmp(kindEnv, "aiboard3d") == 0; // Wave X chain
             const bool wantRotate  = kindEnv && std::strcmp(kindEnv, "rotate") == 0;  // Wave W rotate
+            const bool wantSaveOpen = kindEnv && std::strcmp(kindEnv, "saveopen") == 0; // Wave Y roundtrip
             nlohmann::json r;
             std::string showId;
             if (wantAiBoard || wantAiBoard3d) {
@@ -1373,6 +1409,34 @@ int run_gui(const char* screenshotPath) {
                     b2.push_back({{"op","sch_add_symbol"},{"libid","Device:C"},{"pos",{40,30}},{"value","100n"}});
                     ecall("ecad_apply_ops", {{"doc_id",id},{"base_revision",rev},{"ops",b2}}, r);
                     showId = id;
+                }
+            } else if (wantSaveOpen) {
+                // Wave Y: exercise the GUI's exact Save -> Open RPC path (minus the modal dialog,
+                // which can't run headless). Design a divider schematic, ecad_save it to a temp
+                // .ecad+, ecad_open it back into a fresh session, and show the reopened doc. The
+                // before/after symbol counts must match for a clean round-trip.
+                if (ecall("ecad_design", {{"request", "5V resistive divider with 2.5V output"}}, r)) {
+                    const std::string srcId = jstr(r, "doc_id");
+                    nlohmann::json before;
+                    ecall("ecad_tree", {{"doc_id", srcId}}, before);
+                    const int nBefore = before.contains("tree") && before["tree"].contains("symbols")
+                                        ? (int)before["tree"]["symbols"].size() : -1;
+                    std::error_code ec;
+                    const std::string dir = appdataDir() + "\\AI-CAD\\ecad_out";
+                    std::filesystem::create_directories(dir, ec);
+                    const std::string path = dir + "\\roundtrip.ecad+";
+                    nlohmann::json sres;
+                    ecall("ecad_save", {{"doc_id", srcId}, {"path", path}}, sres);
+                    nlohmann::json ores;
+                    if (ecall("ecad_open", {{"path", path}}, ores)) {
+                        const std::string openedId = jstr(ores, "doc_id");
+                        const int nAfter = ores.contains("tree") && ores["tree"].contains("symbols")
+                                           ? (int)ores["tree"]["symbols"].size() : -1;
+                        std::printf("[ecad-shot] saveopen: symbols before=%d after=%d (%s)\n",
+                                    nBefore, nAfter, nBefore == nAfter ? "ROUND-TRIP OK" : "MISMATCH");
+                        showId = openedId;  // show the REOPENED doc
+                    }
+                    std::fflush(stdout);
                 }
             } else if (wantSim) {
                 // Native simulator demo: design a verified RC low-pass and run an AC sweep so the shot

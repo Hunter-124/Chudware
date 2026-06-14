@@ -27,6 +27,7 @@ KiCad importers
 """
 from __future__ import annotations
 
+import base64
 import datetime
 import io
 import json
@@ -115,13 +116,23 @@ def save(doc: dict, path: str | os.PathLike) -> str:
         except Exception:
             pass
 
-    # Extra entries forwarded from a previous open (forward-compat)
-    extra_entries: dict[str, bytes] = doc.get("_extra_entries", {}) or {}
+    # Extra entries forwarded from a previous open (forward-compat). open() stores them
+    # base64-encoded (str) for JSON-safety; decode back to bytes here for the ZIP. Tolerate
+    # raw bytes too, in case a caller injected entries directly.
+    def _as_bytes(v: object) -> bytes:
+        if isinstance(v, bytes):
+            return v
+        if isinstance(v, str):
+            return base64.b64decode(v)
+        raise TypeError(f"_extra_entries value must be str/bytes, got {type(v).__name__}")
+
+    extra_entries: dict[str, object] = doc.get("_extra_entries", {}) or {}
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
         # thumbnail FIRST + STORED (uncompressed) so shell previewers read it cheaply
-        thumb_data = extra_entries.get("thumbnail.png") or _placeholder_png()
+        _thumb = extra_entries.get("thumbnail.png")
+        thumb_data = _as_bytes(_thumb) if _thumb else _placeholder_png()
         zi = zipfile.ZipInfo("thumbnail.png")
         zi.compress_type = zipfile.ZIP_STORED
         zf.writestr(zi, thumb_data)
@@ -135,7 +146,7 @@ def save(doc: dict, path: str | os.PathLike) -> str:
         for name, data in extra_entries.items():
             if name in _KNOWN_ENTRIES:
                 continue
-            zf.writestr(name, data)
+            zf.writestr(name, _as_bytes(data))
 
     os.replace(tmp, path)
     return str(path)
@@ -206,16 +217,18 @@ def _open_ecad_plus(path: pathlib.Path, warnings: list[str]) -> tuple[dict, list
             raise ValueError("not a .ecad+ container: document.json missing")
         doc = json.loads(zf.read("document.json").decode("utf-8"))
 
-        # Preserve unknown entries for forward-compatible resave
-        extra: dict[str, bytes] = {}
+        # Preserve unknown entries for forward-compatible resave. Stored base64-encoded (str)
+        # rather than raw bytes so the doc stays JSON-serialisable across the worker boundary
+        # (the doc flows into ecad_open/tree responses; raw bytes there raise TypeError).
+        extra: dict[str, str] = {}
         for entry_name in names:
             if entry_name in _KNOWN_ENTRIES:
                 continue
-            extra[entry_name] = zf.read(entry_name)
+            extra[entry_name] = base64.b64encode(zf.read(entry_name)).decode("ascii")
 
         # Also carry the thumbnail so resave can reproduce it
         if "thumbnail.png" in names:
-            extra["thumbnail.png"] = zf.read("thumbnail.png")
+            extra["thumbnail.png"] = base64.b64encode(zf.read("thumbnail.png")).decode("ascii")
 
     # Stash extra entries inside the doc dict under a private key (non-schema key
     # — it starts with '_' so schema validators skip it; rpc.py passes the full doc

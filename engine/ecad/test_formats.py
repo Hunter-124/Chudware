@@ -6,6 +6,7 @@ Run:
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import pathlib
@@ -184,6 +185,12 @@ def test_ecad_plus_roundtrip() -> None:
         assert isinstance(doc2, dict), "open() did not return a dict"
         assert isinstance(warnings, list), "open() did not return warnings list"
 
+        # REGRESSION (Wave Y): the opened doc must be JSON-serialisable — the worker emits the
+        # ecad_open response as JSON, and _extra_entries used to carry raw bytes (thumbnail / unknown
+        # entries) which raised "Object of type bytes is not JSON serializable" over the RPC boundary.
+        # Entries are now base64 strings; json.dumps must succeed.
+        json.dumps(doc2)  # raises TypeError if any bytes leaked into the doc
+
         # Validate reopened
         errs2 = schema.validate_schematic(doc2)
         assert not errs2, f"Reopened doc invalid: {errs2}"
@@ -197,17 +204,19 @@ def test_ecad_plus_roundtrip() -> None:
         wires2 = doc2.get("wires", [])
         assert len(wires2) == 1, f"Expected 1 wire, got {len(wires2)}"
 
-        # Unknown entry preserved on resave
+        # Unknown entry preserved on resave (now base64-encoded str for JSON-safety; decode to compare)
         extra = doc2.get("_extra_entries", {})
         assert "future_data.bin" in extra, f"Unknown entry not preserved; extras: {list(extra)}"
-        assert extra["future_data.bin"] == unknown_entry, "Unknown entry content changed"
+        assert isinstance(extra["future_data.bin"], str), "extra entry should be a base64 str now"
+        assert base64.b64decode(extra["future_data.bin"]) == unknown_entry, "Unknown entry content changed"
 
-        # Resave with unknown entry still present
+        # Resave with unknown entry still present (base64 str round-trips back through save's decode)
         ecad_path2 = os.path.join(td, "test_sch_resave.ecad+")
         formats.save(doc2, ecad_path2)
         doc3, _ = formats.open(ecad_path2)
         extra3 = doc3.get("_extra_entries", {})
         assert "future_data.bin" in extra3, "Unknown entry lost after resave"
+        assert base64.b64decode(extra3["future_data.bin"]) == unknown_entry, "Unknown entry corrupted on resave"
 
     print("  test_ecad_plus_roundtrip PASS")
 

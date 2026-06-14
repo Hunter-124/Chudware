@@ -103,17 +103,24 @@ Build: `cmake -S host -B host/build -G "Visual Studio 17 2022" -A x64 && cmake -
   in the CAD viewport, ready to design a housing around. Verified `AI_CAD_ECAD_KIND=aiboard3d` (AI
   Board then Board-to-3D back to back; the 3D viewport shows the imported board part). This is the
   end-to-end "design PCBs → 3D models → housing, with AI throughout" goal, demonstrated headlessly.
+- **Save / Open (Y):** the PCB ribbon's Save/Open buttons now persist + reload native `.ecad+`
+  containers (Open also imports `.kicad_sch`/`.kicad_pcb`) via native Win32 dialogs →
+  `ecad_save`/`ecad_open`; the opened doc adopts into the editor. Fixed a real engine bug found here:
+  `formats.open` embedded raw `bytes` (thumbnail / unknown ZIP entries) in the doc, which raised
+  `TypeError: Object of type bytes is not JSON serializable` when the worker emitted the ecad_open
+  response — now base64-encoded in `_extra_entries` (decoded on save). Verified `AI_CAD_ECAD_KIND=
+  saveopen` (design → save .ecad+ → reopen; symbols 3→3 round-trip, response JSON-clean).
 
 **GUI follow-ups (not blocking):** full PropertyManager forms for the remaining ECAD op fields
-(angle/mirror/side/footprint assignment — Ref/Value editing is DONE via the inspector); move the
-editor mirror onto AppState for multi-doc; `ecad_open` file dialog.
+(footprint reassignment / DNP / sim-params — Ref/Value + rotate/flip are DONE); move the editor
+mirror onto AppState for multi-doc.
 
 ## Remaining work / known debt (prioritized)
 
 1. **GUI editor polish** — place/route/select/delete/move + AI launchpad + PCB→3D bridge +
    simulation plot (transient & AC) + undo/redo + one-click AI→routed board + Ref/Value property
-   inspector + rotate/flip are DONE (Waves N–W); remaining: PM forms for footprint reassignment +
-   per-field DNP/sim-params, multi-doc, `ecad_open` file dialog.
+   inspector + rotate/flip + native Save/Open are DONE (Waves N–Y); remaining: PM forms for footprint
+   reassignment + per-field DNP/sim-params, multi-doc.
 2. **Full bus routing** (electrical): member labels already net correctly (KiCad's bus is largely a
    drawing convenience over labels); explicit bus-wire + bus-entry tap objects are a follow-up.
 3. **Advanced routing**: push-and-shove (router is eviction-based rip-up + maze, not negotiated-

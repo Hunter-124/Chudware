@@ -71,6 +71,9 @@ struct EcadSymbol {
     float angle = 0.0f;        // deg CCW
     std::string mirror = "none";  // "none" | "x" | "y"
     bool power = false;        // lib_cache SymbolDef.power (VCC/GND etc.)
+    std::string footprint;     // assigned footprint id ("Resistor_SMD:R_0603"); "" if unassigned
+    bool dnp = false;          // do-not-populate flag (excluded from BOM/assembly)
+    nlohmann::json simParams;  // free-form sim_params dict (raw JSON; null/absent if none)
     std::vector<EcadSymGraphic> body;  // local-frame body graphics (transform at draw time)
     std::vector<EcadPin> pins;         // world-space pins
 };

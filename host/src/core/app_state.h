@@ -51,6 +51,12 @@ extern const char* kStarterCode;
 
 enum JobKind { JOB_BUILD, JOB_DESIGN, JOB_CHAT };
 
+// Document display/input unit system. The engine is canonical mm/deg; this is a HOST-only
+// concern that controls how lengths are FORMATTED for display and how a BARE number typed into
+// a dim field is interpreted. Angles stay in degrees in both systems (SolidWorks behavior).
+//   MMGS = millimeter / gram / second   IPS = inch / pound / second
+enum class Units { MMGS = 0, IPS = 1 };
+
 // ---------------- settings (AI provider) -> %APPDATA%/AI-CAD/config.json ----------------
 struct Settings {
     int provider = 2;  // 0 = Anthropic, 1 = OpenAI, 2 = Local (OpenAI-compatible).
@@ -64,6 +70,7 @@ struct Settings {
     int maxIters = 0;            // refine-pass cap per turn; 0 = automatic
     std::string systemPrompt;    // system prompt override; empty = built-in
     std::string theme = "dark";  // "dark" | "light" — persisted to config.json
+    Units units = Units::MMGS;   // document display/input unit system — persisted to config.json
 };
 
 std::string appdataDir();
@@ -291,6 +298,122 @@ struct AppState {
     bool        ecadUndoGo = false;         // one-shot: run ecadUndo(st) this frame (ecad_undo RPC)
     bool        ecadRedoGo = false;         // one-shot: run ecadRedo(st) this frame (ecad_redo RPC)
 
+    // ---- document tabs (SolidWorks/browser-style multi-document) ----
+    // The worker already keeps every open document alive in its registry (keyed by doc_id); the
+    // host stays SINGLE-document at the DocMirror level (one "active" doc view: tree, mesh,
+    // selection, caches). One DocTab per open doc records the minimum to re-point DocMirror on a
+    // switch + render the strip. Switching activates the doc in the worker (doc_rebuild → tree +
+    // mesh) and refreshes the viewport/tree/selection; per-tab camera is restored so each doc keeps
+    // its view. docTabs is empty only at the empty/start state (no document open).
+    // A tab is one of three kinds. Part/Assembly tabs are backed by a DocMirror part/asm session
+    // (docId is a doc_* worker id, the central area shows the 3D viewport). A Drawing tab is NOT a
+    // DocMirror doc — it is backed by a SEPARATE drawing registry id (drawingDocId) and the central
+    // area shows a 2D sheet instead of the 3D viewport. switchToTab/ensureActiveTab keep their hands
+    // off the mirror for Drawing tabs so the underlying part stays loaded behind the drawing.
+    struct DocTab {
+        enum class TabKind { Part, Assembly, Drawing };
+        TabKind     kind = TabKind::Part;
+        std::string docId;          // worker doc id (registry key) — empty for Drawing tabs
+        std::string title;          // display name (doc "name", "Part1"/"Assembly1")
+        bool        isAssembly = false;
+        bool        dirty = false;  // edits since last save (asterisk on the tab)
+        std::string path;           // last saved file path ("" = never saved)
+        // Saved camera so each tab keeps its own view across switches.
+        float yaw = 35, pitch = 28, zoom = 1.0f, pan[3] = {0, 0, 0};
+        bool  camValid = false;     // false until the first switch-away captures the live camera
+
+        // ---- Drawing tabs only (kind == Drawing) ----
+        std::string drawingDocId;       // drawing registry id (from drawing_new) — NOT a doc_* id
+        std::string sourceDocId;        // the part/asm doc this drawing projects from (for Rebuild)
+        nlohmann::json drawingDoc;      // cached drawing_get result {sheets:[{...views...}]}
+        // 2D sheet pan/zoom (persisted per tab). pxPerMm scales sheet-mm -> screen px; panPx is the
+        // screen-space offset of the sheet origin. needFit=true requests a one-shot fit-to-window.
+        float drawZoom = 0.0f;          // 0 = uninitialized -> triggers a fit on first show
+        float drawPanX = 0.0f, drawPanY = 0.0f;
+        bool  drawNeedFit = true;
+
+        // ---- W13: dimension tool + BOM (drawing tabs) ----
+        // The Dimension tool is a modal placement workflow owned by the 2D panel: arm it, then click
+        // near a view's projected polyline VERTEX to snap point a, then b, then a 3rd click sets the
+        // text position -> drawing_add_dim. Esc cancels. dimType is "linear_dim"|"aligned_dim".
+        bool        dimToolActive = false;     // armed: clicks place a dimension
+        std::string dimType = "linear_dim";    // which dimension the tool places
+        int         dimStage = 0;              // 0=pick a, 1=pick b, 2=pick text pos
+        std::string dimViewId;                 // view the in-progress dim is anchored to
+        float       dimAx = 0, dimAy = 0;      // picked point a (sheet mm)
+        float       dimBx = 0, dimBy = 0;      // picked point b (sheet mm)
+        std::string selAnnViewId;              // selected stored annotation (for Delete)
+        std::string selAnnId;
+        bool        bomVisible = false;        // show the BOM overlay table (assembly drawings)
+        nlohmann::json bomRows;                // cached drawing_bom result {rows, is_assembly, ...}
+        bool        bomFetched = false;        // have we fetched the BOM for this drawing yet
+
+        // ---- W15: Section + Detail view tools (drawing tabs) ----
+        // Section tool: arm it, then click two points across a parent view to drop a cutting line ->
+        // drawing_add_section{cut_line}. Detail tool: arm, click a center on a parent view then drag
+        // to set the radius -> drawing_add_detail. Both mirror the dimension tool's modal stages.
+        bool        sectionToolActive = false;  // armed: clicks place a cutting line
+        int         sectionStage = 0;           // 0=pick line start, 1=pick line end
+        std::string sectionViewId;              // parent view the cutting line is anchored to
+        float       sectionAx = 0, sectionAy = 0;  // cut-line start (sheet mm)
+        bool        detailToolActive = false;   // armed: click center + drag radius
+        int         detailStage = 0;            // 0=pick center, 1=drag radius
+        std::string detailViewId;               // parent view the detail circle is anchored to
+        float       detailCx = 0, detailCy = 0; // detail circle center (sheet mm)
+    };
+    std::vector<DocTab> docTabs;
+    int activeTab = -1;             // index into docTabs; -1 = no document open (start state)
+    // While true, the DocMirror listener does NOT mark the active tab dirty. Set around a tab
+    // switch / resync / fresh-doc activation (those fire the mirror's listener via doc_rebuild but
+    // are not user edits, so they must not light the unsaved-changes marker).
+    bool suppressTabDirty = false;
+
+    // ---- document-tab operations (implemented in core/doc_tabs.cpp via ui/doc_tabs) ----
+    // Append a tab for an already-created/opened worker doc and make it active (does NOT touch the
+    // worker — the caller already did doc_new/doc_open and the mirror points at it). Captures the
+    // current doc id from docMirror.
+    void addDocTab(bool isAssembly);
+    // Switch the active document to docTabs[idx]: safely exits any in-progress sketch/PM form,
+    // saves the leaving tab's camera, re-points DocMirror at idx's doc (doc_rebuild → tree+mesh),
+    // resets per-doc caches/selection/tree transients, reloads the mesh, restores idx's camera.
+    void switchToTab(int idx);
+    // Close docTabs[idx] (with the worker doc_close). If it was active, activates a neighbor; if it
+    // was the last tab, returns to the empty start state. Does NOT prompt — the caller decides.
+    void closeDocTab(int idx);
+    // Mark the active tab dirty (on any mutation) / clear it (on save). Safe with no active tab.
+    void markActiveTabDirty();
+    void clearActiveTabDirty();
+    // Refresh the active tab's cached title from the current doc tree (after a rename, etc.).
+    void syncActiveTabTitle();
+    // Index of the tab whose docId matches the mirror's current doc, or -1.
+    int  tabIndexForActiveDoc() const;
+    // Reconcile the tab strip with the mirror once per frame: if the mirror holds a document that
+    // has no tab yet (created by a path that doesn't open one itself — sketch auto-create, chat
+    // "new part", an agent v2 run, the assembly panel), append a tab for it and make it active.
+    // Also keeps the active title/kind fresh. Called from the per-frame draw before the strip.
+    void ensureActiveTab();
+
+    // ---- DRAWINGS module (host UI for the drawing engine RPCs) ----
+    // "Make Drawing": from the active PART/ASM tab, create a blank drawing (drawing_new), add the
+    // standard four views (front/top/right/iso) at a default layout, then open + activate a new
+    // Drawing tab caching the drawing_get result. No-op + toast when no part is open. All worker
+    // calls are guarded; a failure logs + toasts and leaves no half-open tab.
+    void makeDrawing();
+    // Re-fetch a Drawing tab's drawing_get (the engine reprojects from the live source part, so this
+    // is how edits to the source reflect). Called on tab activation and by the manual Rebuild button.
+    void refreshDrawingTab(int idx);
+    // W12+ — adopt an ALREADY-registered drawing (restored by doc_open from a .step+) into a new
+    // Drawing tab. Unlike makeDrawing (which creates a blank drawing + standard views), this just
+    // fetches drawing_get for an existing drawing id and opens its tab. Does NOT steal the active
+    // tab focus (the reopened part stays active). No-op + log on a failed fetch.
+    void adoptDrawingTab(const std::string& drawingDocId, const std::string& name,
+                         const std::string& sourceDocId);
+    // True when the active tab is a Drawing (the central area shows the 2D sheet, not the 3D view).
+    bool activeTabIsDrawing() const {
+        return activeTab >= 0 && activeTab < (int)docTabs.size() &&
+               docTabs[activeTab].kind == DocTab::TabKind::Drawing;
+    }
+
     // ---- topology picking (C15) — id pass + overlays owned by run_gui; AppState borrows ----
     render::IdPass* idPass = nullptr;
     render::Overlays* overlays = nullptr;
@@ -434,6 +557,16 @@ struct AppState {
     bool focusDesignTab = false;  // one-shot: focus the Design tab after a (re)layout
     // Consolidated AI panel (Design / Activity / Console as internal tabs). One dock window "AI".
     bool showAIPanel = true;
+    // Configurations panel (SolidWorks ConfigurationManager). Dockable "Configurations" window in
+    // the right task pane; View > Configurations toggles it. Only meaningful for part/asm docs.
+    bool showConfigPanel = false;
+    // Design Table panel (SolidWorks Design Table). Dockable "Design Table" window in the right
+    // task pane; View > Design Table toggles it. An editable grid (rows=configs, columns=driven
+    // params + per-feature suppression) over the same config_* RPCs the Configurations panel reads.
+    bool showDesignTablePanel = false;
+    // Weldment Cut List panel (SolidWorks Weldment Cut List). Dockable "Cut List" window in the
+    // right task pane; View > Cut List toggles it. Only meaningful for part docs with weldments.
+    bool showCutListPanel = false;
     int  aiInteraction = 0;       // 0=Design (new part) 1=Edit (orchestrator v2) 2=Chat
     bool focusActivityTab = false;  // one-shot: select the Activity tab (e.g. when a v2 run starts)
     bool showAbout = false, designStarted = false;
@@ -523,6 +656,12 @@ struct AppState {
 
     // W1-B: request a non-default cursor for THIS frame. The last request before end-of-frame wins.
     void requestCursor(ui::CursorKind k) { cursorRequest = k; }
+
+    // Active document-unit system helpers (single source of truth = settings.units). Every dim
+    // DISPLAY site routes ips() into pmFormatDim; every BARE-number dim INPUT site passes ips() as
+    // the default-unit so "1.5" means 1.5 in in IPS and 1.5 mm in MMGS. Angles stay in degrees.
+    bool ips() const { return settings.units == Units::IPS; }
+    void toggleUnits() { settings.units = ips() ? Units::MMGS : Units::IPS; }
 
     // Load an AICM tessellation file into the id pass + overlays (and clear the selection).
     // Requires a current GL context and st.idPass/st.overlays to be set. Returns false on

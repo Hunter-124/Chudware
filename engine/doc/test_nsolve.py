@@ -328,6 +328,232 @@ def test_performance_chain() -> None:
     return median
 
 
+# -- W5 interactive-guarantee gate (drag perf, last-good, multi-handle, determinism) ---
+#
+# These prove the contract the Instant3D drag-to-modify feature relies on at the
+# nsolve CORE level (sketch_solver.drag adds the entity wiring on top). Each prints
+# the MEASURED number so the orchestrator sees the real machine timing.
+
+
+def _grid_chain_system(n_cells: int, x_solved=None):
+    """Constrained chain of `n_cells` axis-aligned quads (4 lines each, coincident-
+    chained, h/v on every edge, first corner fixed) — ~16 vars/cell. Used to build a
+    ~200-unknown warm-draggable sketch at the solver-core level. If `x_solved` is given
+    it is ignored here (callers warm-start via solve(x0=...)). Returns (sys, var_index_of)
+    where var_index_of('cell', 'corner') maps to the (x) var index of a quad corner."""
+    sys = System()
+    # Each cell: corners c0(bl) c1(br) c2(tr) c3(tl) realized as 4 lines b,r,t,l.
+    # We store the 8 endpoint pairs as plain vars and tie them with coincident+h/v.
+    cells = []
+    for k in range(n_cells):
+        x0 = 10.0 * k
+        # 4 lines, each [p1x,p1y,p2x,p2y]; init as a unit square translated by x0.
+        b = sys.add_vars(4, [x0, 0.0, x0 + 10, 0.0])
+        r = sys.add_vars(4, [x0 + 10, 0.0, x0 + 10, 10.0])
+        t = sys.add_vars(4, [x0 + 10, 10.0, x0, 10.0])
+        l = sys.add_vars(4, [x0, 10.0, x0, 0.0])
+        cells.append((b, r, t, l))
+
+        def _coin(ia, ib, tag):
+            idx = [int(ia), int(ia) + 1, int(ib), int(ib) + 1]
+            sys.add_residual(lambda x: np.array([x[0] - x[2], x[1] - x[3]]),
+                             idx, lambda x: np.array([[1., 0., -1., 0.],
+                                                      [0., 1., 0., -1.]]), tag)
+
+        def _horiz(ia, ib, tag):
+            sys.add_residual(lambda x: np.array([x[0] - x[1]]), [int(ia) + 1, int(ib) + 1],
+                             lambda x: np.array([[1., -1.]]), tag)
+
+        def _vert(ia, ib, tag):
+            sys.add_residual(lambda x: np.array([x[0] - x[1]]), [int(ia), int(ib)],
+                             lambda x: np.array([[1., -1.]]), tag)
+
+        # b.p2==r.p1, r.p2==t.p1, t.p2==l.p1, l.p2==b.p1
+        _coin(b[2], r[0], f"co{k}0")
+        _coin(r[2], t[0], f"co{k}1")
+        _coin(t[2], l[0], f"co{k}2")
+        _coin(l[2], b[0], f"co{k}3")
+        _horiz(b[0], b[2], f"h{k}b")
+        _horiz(t[0], t[2], f"h{k}t")
+        _vert(r[0], r[2], f"v{k}r")
+        _vert(l[0], l[2], f"v{k}l")
+
+    # Fix the very first corner (cell0 bottom line p1).
+    b0 = cells[0][0]
+    _fix_point(sys, int(b0[0]), 0.0, 0.0, "fix0")
+    return sys, cells
+
+
+def test_w5_drag_perf_200_unknowns() -> None:
+    """W5.1 perf: a warm multi-handle drag solve on a ~200-unknown constrained sketch
+    completes well inside the interactive budget. Build, cold-solve, then time a
+    representative warm drag step (move 4 handles of one quad). Print the measured ms."""
+    sys, cells = _grid_chain_system(13)            # 13 * 16 = 208 vars
+    nvars = sys.n_vars
+    cold = sys.solve()
+    assert cold.converged, f"cold solve failed: maxr={cold.max_residual:.2e}"
+    x_solved = cold.x.copy()
+
+    # Representative drag: grab the 4 endpoints of cell-1's bottom+right lines and
+    # pull them by (+5, +3). Rebuild with soft targets, warm-start, time the solve.
+    def timed_drag():
+        s, c = _grid_chain_system(13)
+        b, r, t, l = c[1]
+        moves = [(int(b[2]), 5.0), (int(b[3]), 3.0), (int(r[0]), 5.0), (int(r[1]), 3.0)]
+        for idx, off in moves:
+            s.soft_target(idx, x_solved[idx] + off, weight=0.01)
+        t0 = time.perf_counter()
+        res = s.solve(x0=x_solved, tol=1e-10, max_iter=50, time_budget_ms=10.0)
+        return (time.perf_counter() - t0) * 1e3, res
+
+    # Warm up once (JIT-ish: fills sparse patterns / numpy caches), then measure.
+    timed_drag()
+    times, last = [], None
+    for _ in range(25):
+        dt, last = timed_drag()
+        times.append(dt)
+    med = statistics.median(times)
+    assert np.all(np.isfinite(last.x)), "drag produced non-finite coords"
+    assert last.max_residual <= 1e-6, f"hard constraints not held after drag: {last.max_residual:.2e}"
+    print(f"[w5_perf] {nvars} unknowns: warm multi-handle drag median={med:.3f} ms "
+          f"(min={min(times):.3f}, max={max(times):.3f}, n=25); hard_maxr={last.max_residual:.1e}")
+    # Target ~10 ms warm. Assert a sane upper bound that still proves interactivity on a
+    # slow CI box; the printed median is the real signal for the orchestrator.
+    assert med < 25.0, f"warm 200-unknown drag median {med:.3f} ms exceeds 25 ms bound"
+
+
+def test_w5_last_good_fallback_on_nonconvergence() -> None:
+    """W5.2 last-good: an IMPOSSIBLE drag target on a fully-constrained pair returns the
+    last good (finite, constraint-respecting) solution and signals non-convergence — never
+    NaN/Inf or corrupted geometry. Two contradictory hard dims also stay finite + flagged."""
+    # |AB| pinned to 10 with A fixed; drag B to an impossible spot — hard length wins,
+    # geometry stays on the radius-10 circle, finite, and a far cursor can't break it.
+    s = System()
+    A = s.add_vars(2, [0.0, 0.0])
+    B = s.add_vars(2, [10.0, 0.0])
+    _fix_point(s, int(A[0]), 0.0, 0.0, "fixA")
+    _distance(s, int(A[0]), int(B[0]), 10.0, "len10")
+    s.soft_target(int(B[0]), 1e6, weight=0.01)      # absurd cursor
+    s.soft_target(int(B[1]), 1e6, weight=0.01)
+    res = s.solve(x0=s._x0(None), tol=1e-10, max_iter=50)
+    bx, by = res.x[int(B[0])], res.x[int(B[1])]
+    assert np.all(np.isfinite(res.x)), "drag emitted non-finite coords"
+    assert abs(np.hypot(bx, by) - 10.0) < 1e-4, f"hard length corrupted under impossible drag: {np.hypot(bx, by)}"
+    assert res.converged, "hard constraint IS satisfiable here -> should converge (soft is a steer)"
+
+    # Now a genuinely contradictory HARD system: |AB|=10 AND |AB|=20 (A fixed).
+    s2 = System()
+    A = s2.add_vars(2, [0.0, 0.0])
+    B = s2.add_vars(2, [10.0, 0.0])
+    _fix_point(s2, int(A[0]), 0.0, 0.0, "fixA")
+    _distance(s2, int(A[0]), int(B[0]), 10.0, "d10")
+    _distance(s2, int(A[0]), int(B[0]), 20.0, "d20")
+    res2 = s2.solve(tol=1e-10, max_iter=50)
+    assert not res2.converged, "contradictory distances must not report converged"
+    assert np.all(np.isfinite(res2.x)), "non-convergent solve must still be finite (last good)"
+    # The settled point is a finite least-squares compromise, never garbage.
+    assert 5.0 < np.hypot(res2.x[int(B[0])], res2.x[int(B[1])]) < 25.0, "compromise is bounded/finite"
+
+    # Singular drag config: B coincident with A AND |AB|=5 — Jacobian rank-deficient at
+    # the start; the drag path must not divide-by-zero into NaN.
+    s3 = System()
+    A = s3.add_vars(2, [0.0, 0.0])
+    B = s3.add_vars(2, [0.0, 0.0])
+    _fix_point(s3, int(A[0]), 0.0, 0.0, "fixA")
+    _coincident(s3, int(A[0]), int(B[0]), "coin")
+    _distance(s3, int(A[0]), int(B[0]), 5.0, "d5")
+    s3.soft_target(int(B[0]), 50.0, weight=0.01)
+    res3 = s3.solve(x0=s3._x0(None), tol=1e-10, max_iter=50, time_budget_ms=10.0)
+    assert np.all(np.isfinite(res3.x)), "singular drag config produced non-finite coords"
+    assert not res3.converged, "coincident+distance(5) is unsatisfiable -> not converged"
+    print(f"[w5_lastgood] impossible-drag held |AB|=10; contradiction finite+flagged; "
+          f"singular finite (B={res3.x[int(B[0])]:.2f},{res3.x[int(B[1])]:.2f})")
+
+
+def test_w5_budget_exceeded_signal() -> None:
+    """W5.2b: a tight time budget that truncates a drag sets budget_exceeded=True and keeps
+    x finite; an unbudgeted (or generous) solve of the same system converges with the flag
+    clear. Distinguishes 'ran out of frame time' from a genuine conflict."""
+    N = 120
+    def build():
+        sys = System()
+        pts = [sys.add_vars(2, [float(k) * 0.3, 0.0]) for k in range(N)]   # bad init
+        _fix_point(sys, int(pts[0][0]), 0.0, 0.0, "fix0")
+        for k in range(N - 1):
+            ia, ib = int(pts[k][0]), int(pts[k + 1][0])
+            _distance(sys, ia, ib, 1.0, f"d{k}")
+            sys.add_residual(lambda x: np.array([x[0] - x[1]]), [ia + 1, ib + 1],
+                             lambda x: np.array([[1.0, -1.0]]), f"h{k}")
+        # add a soft target so the drag path (with budget) is exercised
+        sys.soft_target(int(pts[-1][0]), 200.0, weight=0.01)
+        return sys
+    tight = build().solve(tol=1e-12, max_iter=50, time_budget_ms=0.05)
+    assert tight.budget_exceeded, "0.05 ms budget must report budget_exceeded"
+    assert not tight.converged and np.all(np.isfinite(tight.x)), "budget cutoff must be finite, not converged"
+    generous = build().solve(tol=1e-9, max_iter=200, time_budget_ms=5000.0)
+    assert not generous.budget_exceeded, "a 5 s budget should not report budget_exceeded"
+    print(f"[w5_budget] tight: budget_exceeded={tight.budget_exceeded} conv={tight.converged}; "
+          f"generous: budget_exceeded={generous.budget_exceeded} conv={generous.converged}")
+
+
+def test_w5_multi_handle_drag_respects_all() -> None:
+    """W5.3 multi-handle: soft-targeting several points at once converges and respects every
+    handle. Pin 3 of a free 4-point chain's points to chosen spots; all 3 land on target and
+    the chain's (unconstrained) coincidence-free points stay finite."""
+    s = System()
+    P = [s.add_vars(2, [float(k), 0.0]) for k in range(4)]
+    _fix_point(s, int(P[0][0]), 0.0, 0.0, "fix0")
+    # unit-distance chain so there ARE hard constraints to respect simultaneously
+    for k in range(3):
+        _distance(s, int(P[k][0]), int(P[k + 1][0]), 1.0, f"d{k}")
+    targets = {1: (0.0, 1.0), 2: (0.0, 2.0), 3: (0.0, 3.0)}   # fold the chain straight up
+    for k, (tx, ty) in targets.items():
+        s.soft_target(int(P[k][0]), tx, weight=0.01)
+        s.soft_target(int(P[k][1]), ty, weight=0.01)
+    res = s.solve(x0=s._x0(None), tol=1e-10, max_iter=50)
+    assert res.converged, f"multi-handle drag failed to converge: maxr={res.max_residual:.2e}"
+    for k, (tx, ty) in targets.items():
+        gx, gy = res.x[int(P[k][0])], res.x[int(P[k][1])]
+        # each consecutive pair stays unit distance (hard), AND the handle reached its target
+        assert abs(gx - tx) < 1e-3 and abs(gy - ty) < 1e-3, \
+            f"handle P{k} did not reach target ({tx},{ty}): got ({gx:.4f},{gy:.4f})"
+    # verify all hard distances held
+    for k in range(3):
+        d = np.hypot(res.x[int(P[k][0])] - res.x[int(P[k + 1][0])],
+                     res.x[int(P[k][1])] - res.x[int(P[k + 1][1])])
+        assert abs(d - 1.0) < 1e-4, f"segment {k} length drifted: {d:.6f}"
+    print("[w5_multi] 3 simultaneous handles all reached target; all 3 unit segments held")
+
+
+def test_w5_determinism() -> None:
+    """W5.6 determinism: identical inputs -> bit-identical solutions across repeated solves,
+    for both the plain LM path and the soft-target drag path. No time/RNG leakage into x."""
+    def cold_chain():
+        s = System()
+        A = s.add_vars(2, [0.0, 0.0]); B = s.add_vars(2, [10.0, 0.0]); P = s.add_vars(2, [3.0, 4.0])
+        _fix_point(s, int(A[0]), 0.0, 0.0, "fixA")
+        _fix_point(s, int(B[0]), 10.0, 0.0, "fixB")
+        _point_on_line(s, int(P[0]), int(A[0]), int(B[0]), "P_on_AB")
+        _distance(s, int(P[0]), int(A[0]), 7.0, "d7")
+        return s.solve().x
+    base = cold_chain()
+    for _ in range(5):
+        assert np.array_equal(base, cold_chain()), "plain LM solve is not deterministic"
+
+    def drag_chain():
+        s = System()
+        A = s.add_vars(2, [0.0, 0.0]); B = s.add_vars(2, [10.0, 0.0])
+        _fix_point(s, int(A[0]), 0.0, 0.0, "fixA")
+        _distance(s, int(A[0]), int(B[0]), 10.0, "len10")
+        s.soft_target(int(B[0]), 20.0, weight=0.01); s.soft_target(int(B[1]), 5.0, weight=0.01)
+        # no time budget -> deterministic (a wall-clock budget could truncate differently)
+        return s.solve(x0=s._x0(None)).x
+    dbase = drag_chain()
+    for _ in range(5):
+        assert np.array_equal(dbase, drag_chain()), "drag-path solve is not deterministic"
+    print("[w5_determinism] plain + drag solves bit-identical across 5 repeats")
+
+
 def main() -> None:
     test_point_on_line_distance_and_warm_restart()
     test_dof_free_fixed_and_rectangle()
@@ -337,6 +563,11 @@ def main() -> None:
     test_time_budget_returns_best_so_far()
     test_empty_and_degenerate()
     median = test_performance_chain()
+    test_w5_drag_perf_200_unknowns()
+    test_w5_last_good_fallback_on_nonconvergence()
+    test_w5_budget_exceeded_signal()
+    test_w5_multi_handle_drag_respects_all()
+    test_w5_determinism()
     print(f"\nNSOLVE TESTS PASSED  (perf warm-solve median = {median:.3f} ms)")
 
 

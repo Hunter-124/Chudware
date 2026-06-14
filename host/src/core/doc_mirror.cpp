@@ -246,6 +246,60 @@ OpsResponse DocMirror::redo(WorkerClient& w) {
     return r;
 }
 
+// Instant3D push-pull (doc_push_pull). See the header for the live-drag envelope. -------------
+PushPullResult DocMirror::pushPull(WorkerClient& w, uint32_t body_id, uint32_t topo_id,
+                                   double distance, bool commit) {
+    PushPullResult r;
+    if (docId_.empty()) { r.error_code = "no_doc"; r.error_message = "no document open"; return r; }
+    nlohmann::json res;
+    std::string err;
+    nlohmann::json params = {
+        {"doc_id", docId_},
+        {"body_id", (int)body_id},
+        {"topo_id", (int)topo_id},
+        {"distance", distance},
+        {"commit", commit}
+    };
+    // A drag sample triggers a full rebuild; give it more headroom than the doc_* default.
+    if (!w.call("doc_push_pull", params, res, err, 60000)) {
+        r.error_code = "transport"; r.error_message = err; return r;
+    }
+    if (res.contains("code")) {
+        r.error_code = jstr(res, "code"); r.error_message = jstr(res, "message");
+        if (r.error_code == "stale_revision") resyncTree(w);
+        return r;
+    }
+    r.ok = true;
+    r.draggable = res.value("draggable", false);
+    r.reason        = jstr(res, "reason");
+    r.feature_id    = jstr(res, "feature_id");
+    r.feature_type  = jstr(res, "feature_type");
+    if (!r.draggable) return r;   // no doc mutation — nothing to ingest
+
+    r.committed = res.value("committed", false);
+    r.clamped   = res.value("clamped", false);
+    r.param     = jstr(res, "param");
+    r.axis      = jstr(res, "axis");
+    if (auto it = res.find("old_value"); it != res.end() && it->is_number())
+        r.old_value = it->get<double>();
+    if (auto it = res.find("new_value"); it != res.end() && it->is_number())
+        r.new_value = it->get<double>();
+    if (auto it = res.find("distance"); it != res.end() && it->is_number())
+        r.distance = it->get<double>();
+
+    // The draggable response embeds the same ops block apply_ops returns — ingest it so the mirror
+    // (revision/tree/owner_map) stays in step and the listener repaints the tree.
+    r.ops = parseOpsResponse(res);
+    if (r.ops.ok) {
+        revision_ = r.ops.revision;
+        if (!r.ops.tree.is_null()) tree_ = r.ops.tree;
+        if (!r.ops.feature_status.is_null()) featureStatus_ = r.ops.feature_status;
+        storeOwnerMap(r.ops.owner_map);
+        notify();
+    }
+    return r;
+}
+
 std::string DocMirror::resolvePick(WorkerClient& w, uint32_t body_id,
                                    const std::string& kind, uint32_t topo_id,
                                    std::string& err) {
@@ -320,6 +374,42 @@ bool DocMirror::open(WorkerClient& w, const std::string& path, std::string& err)
     revision_ = jint(res, "revision");
     if (res.contains("tree") && res["tree"].is_object()) tree_ = res["tree"];
     featureStatus_ = {};
+    // W12+ — stash any restored drawings so the open caller can re-create their Drawing tabs.
+    if (res.contains("drawings") && res["drawings"].is_array())
+        lastOpenedDrawings_ = res["drawings"];
+    else
+        lastOpenedDrawings_ = nlohmann::json::array();
+    notify();
+    return true;
+}
+
+bool DocMirror::activate(WorkerClient& w, const std::string& docId, std::string& aicmPath,
+                         std::string& err) {
+    aicmPath.clear();
+    if (docId.empty()) { err = "empty doc id"; return false; }
+    nlohmann::json res;
+    // A forced doc_rebuild does NOT bump the revision (session.rebuild) and returns the full
+    // ops-response: tree / revision / rebuild.feature_status / tess.aicm_path / owner_map. It is
+    // the one call that hands us a fresh mesh path for an arbitrary already-open doc, so the
+    // viewport can refresh on switch. (doc_tree alone has no tess block.)
+    if (!w.call("doc_rebuild", {{"doc_id", docId}}, res, err, 60000)) return false;
+    if (res.contains("code")) { err = jstr(res, "message"); return false; }
+    docId_ = docId;
+    revision_ = jint(res, "revision");
+    if (res.contains("tree") && res["tree"].is_object()) tree_ = res["tree"];
+    else tree_ = {};
+    featureStatus_ = {};
+    if (res.contains("rebuild") && res["rebuild"].is_object()) {
+        const auto& rb = res["rebuild"];
+        if (rb.contains("feature_status") && rb["feature_status"].is_array())
+            featureStatus_ = rb["feature_status"];
+    }
+    if (res.contains("owner_map") && res["owner_map"].is_object())
+        storeOwnerMap(res["owner_map"]);
+    else
+        storeOwnerMap(nlohmann::json());  // clear stale owner map from the previous doc
+    if (res.contains("tess") && res["tess"].is_object())
+        aicmPath = jstr(res["tess"], "aicm_path");
     notify();
     return true;
 }
@@ -330,6 +420,83 @@ nlohmann::json DocMirror::list(WorkerClient& w, std::string& err) {
     if (res.contains("code")) { err = jstr(res, "message"); return nlohmann::json::array(); }
     if (res.contains("docs") && res["docs"].is_array()) return res["docs"];
     return nlohmann::json::array();
+}
+
+// ---- Configurations -------------------------------------------------------
+
+OpsResponse DocMirror::callConfig(WorkerClient& w, const std::string& method,
+                                  const nlohmann::json& extraParams) {
+    OpsResponse r;
+    if (docId_.empty()) { r.error_code = "no_doc"; r.error_message = "no document open"; return r; }
+    nlohmann::json params = extraParams.is_object() ? extraParams : nlohmann::json::object();
+    params["doc_id"] = docId_;
+    nlohmann::json res;
+    std::string err;
+    // A config_activate/add/delete can trigger a full rebuild — give it the same headroom the
+    // tab-switch doc_rebuild uses rather than the doc_* default.
+    if (!w.call(method, params, res, err, 60000)) {
+        r.error_code = "transport"; r.error_message = err; return r;
+    }
+    if (res.contains("code")) {
+        r.error_code = jstr(res, "code"); r.error_message = jstr(res, "message");
+        if (r.error_code == "stale_revision") resyncTree(w);
+        return r;
+    }
+    // Same ops-response shape apply_ops returns — ingest it so the mirror (revision/tree/owner_map)
+    // stays in step with the now-active config and the listener repaints the tree.
+    r = parseOpsResponse(res);
+    if (r.ok) {
+        revision_ = r.revision;
+        if (!r.tree.is_null()) tree_ = r.tree;
+        if (!r.feature_status.is_null()) featureStatus_ = r.feature_status;
+        storeOwnerMap(r.owner_map);
+        notify();
+    }
+    return r;
+}
+
+nlohmann::json DocMirror::configList(WorkerClient& w, std::string& err) {
+    if (docId_.empty()) { err = "no document open"; return nlohmann::json(); }
+    nlohmann::json res;
+    if (!w.call("config_list", {{"doc_id", docId_}}, res, err)) return nlohmann::json();
+    if (res.contains("code")) { err = jstr(res, "message"); return nlohmann::json(); }
+    return res;
+}
+
+// ---- Weldments cut list ----------------------------------------------------
+
+nlohmann::json DocMirror::weldCutList(WorkerClient& w, std::string& err) {
+    if (docId_.empty()) { err = "no document open"; return nlohmann::json(); }
+    nlohmann::json res;
+    if (!w.call("weld_cut_list", {{"doc_id", docId_}}, res, err)) return nlohmann::json();
+    if (res.contains("code")) { err = jstr(res, "message"); return nlohmann::json(); }
+    return res;
+}
+
+// ---- 2D export (DXF / PDF) -------------------------------------------------
+
+std::string DocMirror::exportFlat(WorkerClient& w, const std::string& path,
+                                  const std::string& format, std::string& err) {
+    if (docId_.empty()) { err = "no document open"; return {}; }
+    nlohmann::json res;
+    if (!w.call("export_flat_dxf",
+                {{"doc_id", docId_}, {"path", path}, {"format", format}}, res, err, 60000))
+        return {};
+    // Structured-error methods return {code, message, detail} on failure.
+    if (res.contains("code")) { err = jstr(res, "message"); return {}; }
+    return jstr(res, "path");
+}
+
+std::string DocMirror::exportDrawing(WorkerClient& w, const std::string& drawingDocId,
+                                     const std::string& path, const std::string& format,
+                                     std::string& err) {
+    if (drawingDocId.empty()) { err = "no drawing open"; return {}; }
+    nlohmann::json res;
+    if (!w.call("export_drawing",
+                {{"doc_id", drawingDocId}, {"path", path}, {"format", format}}, res, err, 60000))
+        return {};
+    if (res.contains("code")) { err = jstr(res, "message"); return {}; }
+    return jstr(res, "path");
 }
 
 }  // namespace core

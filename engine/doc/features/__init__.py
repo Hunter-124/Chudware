@@ -43,6 +43,16 @@ from . import draft as _draft  # noqa: F401
 # Multi-body boolean (combine/subtract/intersect) and helix curve (sweep path source):
 from . import boolean as _boolean  # noqa: F401
 from . import curves as _curves  # noqa: F401
+# Sheet metal (base flange + edge flange with real bend geometry + bend-allowance records):
+from . import sheetmetal as _sheetmetal  # noqa: F401
+# Sheet-metal flat pattern (unfold the folded part into its developed blank + bend lines + outline):
+from . import sheetmetal_flat as _sheetmetal_flat  # noqa: F401
+# Weldments (structural profile swept along sketch segments → trimmed members + cut-list data):
+from . import weldment as _weldment  # noqa: F401
+# Stretch features (last two greyed Features-tab commands): rib (thin wall from an open contour) +
+# split (divide a body by a planar tool into above/below pieces):
+from . import rib as _rib  # noqa: F401
+from . import split as _split  # noqa: F401
 
 __all__ = [
     "CompileContext",

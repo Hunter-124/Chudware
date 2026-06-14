@@ -184,7 +184,9 @@ def _allocate_entity(sys: System, entity: dict) -> np.ndarray:
         w = entity["width"]
         return sys.add_vars(6, [cx, cy, r, a0, a1, w])
 
-    elif etype == "spline":
+    elif etype in ("spline", "style_spline"):
+        # spline = through-points; style_spline = control poles. Both store draggable
+        # [x0,y0, x1,y1, ...] point variables, so the solver treats them identically.
         pts = entity["points"]
         init = []
         for px, py in pts:
@@ -195,6 +197,10 @@ def _allocate_entity(sys: System, entity: dict) -> np.ndarray:
         # text has no geometric constraints; allocate position only
         px, py = entity["p"]
         return sys.add_vars(2, [px, py])
+
+    elif etype == "eq_curve":
+        # Equation-driven curve: the shape is fixed by its expressions; no draggable DOF.
+        return sys.add_vars(0, [])
 
     else:
         raise ValueError(f"Unknown entity type: {etype!r}")
@@ -562,8 +568,8 @@ def _resolve_handle(
         else:
             raise ValueError(f"Unknown sub-handle {sub!r} for arc_slot {eid}")
 
-    elif etype == "spline":
-        # variables: [x0,y0, x1,y1, ...]
+    elif etype in ("spline", "style_spline"):
+        # variables: [x0,y0, x1,y1, ...] (through-points for spline / control poles for style)
         if sub is None:
             # whole entity -> return first point as representative
             idx = vidx[[0, 1]]
@@ -577,13 +583,24 @@ def _resolve_handle(
                     lambda xs: np.array([xs[0], xs[1]]),
                     lambda xs: np.eye(2))
         else:
-            raise ValueError(f"Unknown sub-handle {sub!r} for spline {eid}")
+            raise ValueError(f"Unknown sub-handle {sub!r} for {etype} {eid}")
 
     elif etype == "text":
         idx = vidx[[0, 1]]
         return (idx,
                 lambda xs: np.array([xs[0], xs[1]]),
                 lambda xs: np.eye(2))
+
+    elif etype == "eq_curve":
+        # Equation-driven curve has no DOF; its start/end are FIXED references sampled at
+        # t1/t2 (constant value, zero-width Jacobian — same shape as the "origin" handle).
+        from engine.doc.features.sketch import _sample_eq_curve
+        pts = _sample_eq_curve(ent)
+        px, py = (pts[0] if sub in (None, "start") else pts[-1])
+        idx = np.zeros(0, dtype=np.int64)
+        return (idx,
+                lambda xs, _p=(float(px), float(py)): np.array([_p[0], _p[1]]),
+                lambda xs: np.zeros((2, 0)))
 
     else:
         raise ValueError(f"Unknown entity type {etype!r} for handle {handle!r}")
@@ -2249,13 +2266,15 @@ def _extract_entities(x: np.ndarray, entities_list: list, var_map: dict) -> Enti
                 "width": float(vals[5]),
             }
 
-        elif etype == "spline":
+        elif etype in ("spline", "style_spline"):
             n = len(vidx) // 2
             pts = [[float(vals[2*i]), float(vals[2*i+1])] for i in range(n)]
-            result[eid] = {"type": "spline", "points": pts}
+            result[eid] = {"type": etype, "points": pts}
 
         elif etype == "text":
             result[eid] = {"type": "text", "p": [float(vals[0]), float(vals[1])]}
+
+        # eq_curve has no variables (equation-driven, 0 DOF) -> nothing to write back.
 
     return result
 
@@ -2547,7 +2566,16 @@ def solve_sketch(
     var_map: Dict[str, np.ndarray] = {}
 
     for ent in entities_list:
-        var_map[ent["id"]] = _allocate_entity(sys, ent)
+        try:
+            var_map[ent["id"]] = _allocate_entity(sys, ent)
+        except Exception:
+            # Forward-tolerant (same posture as the per-constraint guard below): an unrecognized
+            # or malformed entity contributes NO variables (treated as fixed) instead of crashing
+            # the entire sketch solve. New sketch entity types should still be wired into
+            # _allocate_entity / _resolve_handle / the result-emission switch — but this guard means
+            # a missed wiring degrades to "that entity won't drag" rather than a hard crash that
+            # takes down every drag, dimension, and relation in the sketch.
+            var_map[ent["id"]] = sys.add_vars(0, [])
 
     # Register constraints
     for c in constraints_list:
@@ -2683,16 +2711,32 @@ def drag(
     if not any_target:
         # Nothing resolvable — return last known coords unchanged.
         entity_coords = _extract_entities(state.x, entities_list, var_map)
-        return {"entities": entity_coords, "statuses": {}}
+        return {"entities": entity_coords, "statuses": {},
+                "converged": True, "budget_exceeded": False}
 
     # Use warm start from state if topology matches
     x0 = state.x if state.n_vars == sys.n_vars else None
-    result = sys.solve(x0=x0, tol=1e-10, max_iter=50, time_budget_ms=10.0)
+    budget_ms = 10.0
+    result = sys.solve(x0=x0, tol=1e-10, max_iter=50, time_budget_ms=budget_ms)
     x = result.x
+
+    # Last-good fallback (W5): a non-converging or non-finite drag (impossible target,
+    # singular configuration, or budget cutoff) must never emit garbage coordinates.
+    # The solver already returns the best finite hard-feasible iterate; guard here too
+    # so a corrupt vector can never reach the host, falling back to the warm state.
+    if not np.all(np.isfinite(x)):
+        x = x0 if (x0 is not None and np.all(np.isfinite(x0))) else np.asarray(sys._init)
 
     analysis = sys.analyze(x)
     entity_coords = _extract_entities(x, entities_list, var_map)
     tmp_state = SolveState(x=x, var_map=var_map, n_vars=sys.n_vars)
     statuses = _compute_entity_statuses(x, entities_list, var_map, sys, analysis)
 
-    return {"entities": entity_coords, "statuses": statuses}
+    # Additive, back-compatible signals for the interactive UI: `converged` is the
+    # hard-constraint feasibility (the soft cursor pull never flips it); a drag that
+    # ran out of the interactive budget reports budget_exceeded so the host can keep
+    # the preview transient instead of treating it as a settled solution. Existing
+    # callers (session.sketch_drag) read only "entities"/"statuses" and are unaffected.
+    return {"entities": entity_coords, "statuses": statuses,
+            "converged": bool(result.converged),
+            "budget_exceeded": bool(result.budget_exceeded)}

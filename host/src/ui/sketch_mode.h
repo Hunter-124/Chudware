@@ -37,8 +37,23 @@ enum class SketchTool {
     EllipsePartial, Parabola, Conic,
     // C29-B sketch-editing tools (engine contract C29-A: sketch_trim/extend/offset ops):
     Trim, Extend, Offset,
+    // C52 sketch corner tools (engine ops sketch_fillet / sketch_chamfer; line-line corners):
+    SkFillet, SkChamfer,
+    // C53 sketch mirror / pattern / convert (engine ops sketch_mirror_entities /
+    // sketch_pattern_entities / sketch_convert):
+    Mirror, LinPattern, CircPattern, Convert,
     // C42: remaining draw tools (3-pt arc, polygon, center rect, point, ellipse, spline):
-    Arc3pt, Polygon, RectCenter, Point, Ellipse, Spline
+    Arc3pt, Polygon, RectCenter, Point, Ellipse, Spline,
+    // C54: tangent arc (starts tangent to a prior/selected entity's free endpoint) + Move/Copy
+    // entities (engine op sketch_move; select then pick a from-point and a to-point):
+    ArcTangent, Move,
+    // Sketch Text (entity type "text"): one viewport click places the lower-left anchor, then a
+    // popup collects the string + cap height. Equation-Driven Curve (entity type "eq_curve"):
+    // no viewport pick — a popup collects x(t)/y(t) expressions + a t range (origin-relative).
+    Text, EqCurve,
+    // Style Spline (entity type "style_spline"): click-collect CONTROL POLES (a control polygon);
+    // the smooth curve is built by-poles in the engine. Same collect/finish UX as Spline.
+    StyleSpline
 };
 
 // C37-D: One constraint record from a sketch_enter/solve/drag response (worker_rpc.md §"constraints").
@@ -505,6 +520,104 @@ private:
     float offsetDist_ = 10.0f;
     ImVec2 offsetOverlayPos_{0, 0};
     bool offsetFocusInput_ = false;   // request keyboard focus on the distance field next frame
+
+    // ---- C52 Sketch Fillet / Chamfer state (line-line corners; engine sketch_fillet/chamfer) ----
+    // Both tools pick two lines in turn. corner1Id_ holds the first picked line ("" = none yet);
+    // the second pick builds the op and applies it. radius/distance persist across corners and
+    // across invocations within the session (SolidWorks remembers the last value). They stay armed
+    // for another corner after each success; Esc clears the first pick (or exits if none held).
+    std::string corner1Id_;           // first picked line id ("" = waiting for line 1)
+    float skFilletRadius_ = 3.0f;     // mm, persisted
+    float skChamferDist_ = 3.0f;      // mm, persisted
+    // Apply one sketch_fillet/chamfer op (e1=corner1Id_, e2=line2) and refresh. On engine OpError
+    // the message is toasted, the sketch is untouched, and corner1Id_ is reset (pick a fresh pair).
+    void applyCornerOp(AppState& st, const std::string& line2);
+
+    // ---- C53 Mirror / Linear Pattern / Circular Pattern / Convert state ----
+    // Mirror + both patterns share an entity-selection stage (mpSel_, click to toggle, like the
+    // Offset chain). Mirror then picks a construction line; Linear/Circular collect numeric dims in
+    // an inline panel (count + spacing/angle) — Circular also picks a center point. Convert picks
+    // MODEL edges/faces in the viewport and projects each via sketch_convert (no selection stage).
+    std::vector<std::string> mpSel_;   // entities selected for mirror/pattern (in pick order)
+    // Stage machine (per active tool):
+    //   Mirror:  0=pick entities (Enter advances), 1=pick the mirror construction line.
+    //   LinPattern:  0=pick entities (Enter advances), 1=set count/spacing/dir in the panel.
+    //   CircPattern: 0=pick entities (Enter advances), 1=pick the center point, 2=panel.
+    int mpStage_ = 0;
+    int patternCount_ = 4;             // shared instance count (persisted)
+    float patternSpacing_ = 25.0f;     // linear: spacing (mm)
+    float patternAngle_ = 60.0f;       // circular: angle (deg) — total span when equalSpacing_
+    bool patternEqualSpacing_ = true;  // circular: angle is the full span shared equally
+    float patternDirU_ = 1.0f, patternDirV_ = 0.0f;   // linear direction (sketch u,v)
+    float patternCenterU_ = 0.0f, patternCenterV_ = 0.0f;  // circular center (sketch u,v)
+    // Apply the built sketch_mirror_entities / sketch_pattern_entities op + refresh (toast on error).
+    void applyMirrorOp(AppState& st, const std::string& lineId);
+    void applyPatternOp(AppState& st, bool circular);
+
+    // ---- C54 Move/Copy entities (engine op sketch_move) ----
+    // Reuses the mirror/pattern selection stage (mpSel_) for stage 0: click line/circle/arc entities
+    // to toggle them in the move set, Enter advances. Stage 1: click a FROM point (anchor), stage 2
+    // is the live drag to a TO point; the second click applies sketch_move {entities, dx, dy, copy}
+    // with delta = to - from. Holding Ctrl at the apply click sets copy=true (SolidWorks: Ctrl-drag
+    // copies). The from-point snaps to a vertex/center if near one. Esc backs out a stage.
+    ImVec2 moveFromUV_{0, 0};          // captured anchor (u,v) when stage 1 picks the from-point
+    bool moveCopy_ = false;            // copy mode (Ctrl held at the apply click), persisted as hint
+    // Apply the built sketch_move op (delta + copy flag) over mpSel_ + refresh (toast on error).
+    void applyMoveOp(AppState& st, float dx, float dy, bool copy);
+    // Apply one sketch_convert op for a model edge/face ref (already resolved to a selector JSON).
+    void applyConvertRef(AppState& st, const nlohmann::json& ref);
+
+    // ---- C54 Tangent Arc (draw an arc that starts tangent to a prior/selected entity) ----
+    // The start point is the FREE endpoint of a source entity (the most-recently-drawn entity, or
+    // the last selected one if a selection is held); the arc's start tangent direction equals the
+    // source entity's direction at that endpoint. The user then clicks the arc's end; we solve the
+    // unique tangent arc through (start, end) with that start tangent, and commit it with a
+    // `tangent` relation (arc<->source) + a `coincident` joining the shared endpoint so it stays
+    // tangent under drag. Source types: line (tangent along the segment) and arc/circle (tangent
+    // perpendicular to the radius). Re-resolved each frame while armed (snapped start highlighted).
+    // Returns false (no valid source) -> the tool falls back to a plain 3-pt-style arc.
+    struct TangentArcSrc {
+        std::string id;                 // source entity id ("" = none found)
+        std::string handle;             // shared endpoint handle on the source ("eN.p2"/"eN.start"/…)
+        ImVec2 start{0, 0};             // the free endpoint (u,v) = the arc start
+        ImVec2 tdir{1, 0};              // unit start tangent direction (u,v), pointing into the arc
+    };
+    // Resolve the tangent-arc source: the source entity nearest the cursor's pick, its endpoint
+    // nearest the cursor, and the outward tangent there. False when no line/arc/circle is available.
+    bool tangentArcSource(const ImVec2& cursorScreen, TangentArcSrc& out) const;
+    // Solve the arc tangent to `tdir` at `start` and passing through `end`: fills center/radius/
+    // start-angle/end-angle(deg)/ccw. Returns false when start==end or the geometry is degenerate
+    // (end lies on the tangent line through start -> infinite radius).
+    static bool tangentArcThrough(const ImVec2& start, const ImVec2& tdir, const ImVec2& end,
+                                  float& cu, float& cv, float& rad,
+                                  float& a0deg, float& a1deg, bool& ccw);
+
+    // ---- Sketch Text (entity type "text"; engine geometry already implemented) ----
+    // The SketchTool::Text arms a one-click placement: the next viewport left-click captures the
+    // lower-left anchor into textAnchorUV_ and opens this popup, which collects the string + cap
+    // height. OK emits {"type":"text","p":[u,v],"text":...,"height":...,"construction":false}
+    // (font omitted -> engine default). Esc/Cancel closes; empty text disables OK.
+    bool  textPopupOpen_ = false;
+    ImVec2 textPopupPos_{0, 0};
+    ImVec2 textAnchorUV_{0, 0};        // captured lower-left placement (sketch u,v)
+    char   textBuf_[256] = "OPEN";
+    float  textHeight_ = 10.0f;        // cap height mm (>0)
+    bool   textFocus_ = false;         // request keyboard focus on the string field next frame
+    void   drawTextPopup(AppState& st, bool& escHandled);
+
+    // ---- Equation-Driven Curve (entity type "eq_curve"; engine geometry already implemented) ----
+    // SketchTool::EqCurve opens this popup immediately (no viewport pick; the curve is origin-
+    // relative like SolidWorks). x(t)/y(t) are expression strings in t (radians); t1/t2 bound the
+    // parameter range. OK emits {"type":"eq_curve","xt":...,"yt":...,"t1":...,"t2":...,
+    // "construction":false}. A closed curve (e.g. cos/sin over 0..2pi) extrudes as a region.
+    bool  eqPopupOpen_ = false;
+    ImVec2 eqPopupPos_{0, 0};
+    char   eqXt_[128] = "5*cos(t)";
+    char   eqYt_[128] = "5*sin(t)";
+    float  eqT1_ = 0.0f;
+    float  eqT2_ = 6.2831853f;
+    bool   eqFocus_ = false;           // request keyboard focus on the x(t) field next frame
+    void   drawEqCurvePopup(AppState& st, bool& escHandled);
 
     // ---- C37-D Smart Dimension state machine ----
     // Pick buffer (separate from toolUV_): points/entities collected for the next dimension.

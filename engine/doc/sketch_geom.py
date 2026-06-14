@@ -35,6 +35,14 @@ class UnsupportedEntity(Exception):
         self.etype = etype
 
 
+class GeomError(Exception):
+    """Degenerate fillet/chamfer input (corner not found, radius/setback too large, …)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 # --------------------------------------------------------------------------- vector helpers
 
 
@@ -620,3 +628,122 @@ def _set_end(e, which, pt):
         c, r = _circle_params(e)
         ang = _angle_of(c, pt)
         e["start" if which == "start" else "end"] = ang % 360.0
+
+
+# --------------------------------------------------------------------------- fillet / chamfer
+#
+# Round (fillet) or bevel (chamfer) the corner where two LINE segments meet. We restrict to the
+# line-line case: that is the only pair the solver can keep tangent + closed with the relations
+# this module emits (line↔line tangent and curve↔curve tangent are NOT yet supported by the
+# solver — see doc_schema.md §3.3). line-arc / arc-arc raise GeomError so the op layer rejects
+# them cleanly instead of producing an unsolvable sketch.
+#
+# Each helper returns a plain dict describing how to splice the sketch; the op layer turns that
+# into entity edits + relations. No ids are assigned here.
+
+
+def _line_corner(la: dict, lb: dict):
+    """Geometry of the corner shared by two lines.
+
+    Returns ``(corner_xy, end_a, dir_a, end_b, dir_b)`` where ``end_a``/``end_b`` are the handle
+    names ('start'|'end' meaning p1|p2) of each line's endpoint AT the corner, and ``dir_a``/
+    ``dir_b`` are unit vectors pointing FROM the corner along each line (toward the far, surviving
+    end). Raises :class:`GeomError` when the lines are parallel or do not share a near corner.
+    """
+    if la.get("type") != "line" or lb.get("type") != "line":
+        raise GeomError("fillet/chamfer needs two line segments")
+    a1 = tuple(la["p1"]); a2 = tuple(la["p2"])
+    b1 = tuple(lb["p1"]); b2 = tuple(lb["p2"])
+    da = _sub(a2, a1); db = _sub(b2, b1)
+    if _len(da) < TOL or _len(db) < TOL:
+        raise GeomError("degenerate (zero-length) segment")
+    if abs(_cross(_norm(da), _norm(db))) < 1e-9:
+        raise GeomError("segments are parallel — no corner to round")
+
+    inter = _inter_line_line(la, lb)
+    if not inter:
+        raise GeomError("segments do not meet at a corner")
+    corner = inter[0][0]
+
+    # The corner endpoint of each line is whichever of its two ends sits closest to the
+    # intersection; the direction we keep points from the corner toward the FAR end.
+    def _pick(p_start, p_end):
+        ds = _len(_sub(p_start, corner))
+        de = _len(_sub(p_end, corner))
+        if ds <= de:
+            return "start", _norm(_sub(p_end, corner))   # corner at p1, grow toward p2
+        return "end", _norm(_sub(p_start, corner))       # corner at p2, grow toward p1
+
+    end_a, dir_a = _pick(a1, a2)
+    end_b, dir_b = _pick(b1, b2)
+    if dir_a == (0.0, 0.0) or dir_b == (0.0, 0.0):
+        raise GeomError("segments do not meet at a corner")
+    return corner, end_a, dir_a, end_b, dir_b
+
+
+def fillet_corner(la: dict, lb: dict, radius: float):
+    """Fillet (round) the corner of two lines with an arc of *radius*.
+
+    Returns ``{ta, tb, arc}`` where ``ta``/``tb`` are the trimmed corner points on line a/b (the
+    arc's tangent points) and ``arc`` is a full arc entity dict (center/radius/start/end/ccw)
+    spanning ta→tb. The arc is tangent to both lines and its endpoints are exactly ta and tb.
+    Raises :class:`GeomError` on degenerate input (parallel, no corner, radius too large)."""
+    if radius <= TOL:
+        raise GeomError("fillet radius must be positive")
+    corner, end_a, dir_a, end_b, dir_b = _line_corner(la, lb)
+
+    # Half-angle of the wedge between the two outgoing directions.
+    cos_t = max(-1.0, min(1.0, _dot(dir_a, dir_b)))
+    theta = math.acos(cos_t)
+    half = theta / 2.0
+    if half < 1e-6 or half > math.pi / 2 - 1e-9:
+        raise GeomError("corner angle too shallow to fillet")
+    setback = radius / math.tan(half)          # corner -> tangent point along each line
+    # The tangent points must lie on the DRAWN part of each segment (the surviving side).
+    far_a = _len(_sub(corner, _far_end(la, end_a)))
+    far_b = _len(_sub(corner, _far_end(lb, end_b)))
+    if setback > far_a - TOL or setback > far_b - TOL:
+        raise GeomError("radius too large for this corner")
+
+    ta = _add(corner, _scale(dir_a, setback))
+    tb = _add(corner, _scale(dir_b, setback))
+    # Arc center: along the inner bisector at distance radius/sin(half).
+    bis = _norm(_add(dir_a, dir_b))
+    if bis == (0.0, 0.0):
+        raise GeomError("corner angle too shallow to fillet")
+    center = _add(corner, _scale(bis, radius / math.sin(half)))
+
+    start_ang = _angle_of(center, ta)
+    end_ang = _angle_of(center, tb)
+    # Choose the winding (ccw flag) that draws the SHORT arc ta->tb (the fillet, never the
+    # reflex companion). The short arc subtends pi - theta <= pi, so pick the direction whose
+    # swept angle is the smaller of the two.
+    ccw_sweep = (end_ang - start_ang) % 360.0
+    ccw = ccw_sweep <= 180.0
+    arc = {"type": "arc", "center": [center[0], center[1]], "radius": radius,
+           "start": start_ang % 360.0, "end": end_ang % 360.0, "ccw": ccw}
+    return {"ta": [ta[0], ta[1]], "tb": [tb[0], tb[1]], "arc": arc,
+            "end_a": end_a, "end_b": end_b}
+
+
+def chamfer_corner(la: dict, lb: dict, dist_a: float, dist_b: float):
+    """Chamfer (bevel) the corner of two lines: trim each back by its setback and connect with a
+    line. Returns ``{ta, tb, end_a, end_b}`` — the trimmed corner points and which end of each
+    line they replace. The connecting line runs ta→tb. Raises :class:`GeomError` on degenerate
+    input (parallel, no corner, setback too large)."""
+    if dist_a <= TOL or dist_b <= TOL:
+        raise GeomError("chamfer setback must be positive")
+    corner, end_a, dir_a, end_b, dir_b = _line_corner(la, lb)
+    far_a = _len(_sub(corner, _far_end(la, end_a)))
+    far_b = _len(_sub(corner, _far_end(lb, end_b)))
+    if dist_a > far_a - TOL or dist_b > far_b - TOL:
+        raise GeomError("setback too large for this corner")
+    ta = _add(corner, _scale(dir_a, dist_a))
+    tb = _add(corner, _scale(dir_b, dist_b))
+    return {"ta": [ta[0], ta[1]], "tb": [tb[0], tb[1]],
+            "end_a": end_a, "end_b": end_b}
+
+
+def _far_end(line: dict, corner_end: str):
+    """The endpoint of *line* OPPOSITE the corner ('start' means corner at p1 -> far is p2)."""
+    return tuple(line["p2"]) if corner_end == "start" else tuple(line["p1"])

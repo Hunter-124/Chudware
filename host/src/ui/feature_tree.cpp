@@ -863,6 +863,11 @@ static void doSaveDoc(AppState& st, bool forceDialog) {
     std::string err;
     if (st.docMirror.save(st.worker, path, err)) {
         s_docPath = path;
+        // Multi-document: a successful save clears the active tab's unsaved marker and records the
+        // path so the tab tooltip / future Save reuses it.
+        st.clearActiveTabDirty();
+        if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
+            st.docTabs[st.activeTab].path = path;
         st.addLog("[doc] saved: " + path);
         st.toast(ui::ToastLevel::Info, "Saved " + pathBaseName(path));
     } else {
@@ -884,8 +889,32 @@ static void doSaveDoc(AppState& st, bool forceDialog) {
 static void applyOpenedDoc(AppState& st, const std::string& path) {
     st.clearViewportForNewDoc();   // resets viewport + tree transients (clears s_docPath too)
     s_docPath = path;
+    // Multi-document: an opened file lands in its own tab (DocMirror::open already pointed the
+    // mirror at the new worker doc). The tab is born clean (just-loaded == saved) with its path.
+    {
+        bool isAsm = jfld(st.docMirror.tree(), "schema") == "aicad.asm/1";
+        st.addDocTab(isAsm);
+        if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+            st.docTabs[st.activeTab].path = path;
+            st.docTabs[st.activeTab].dirty = false;
+        }
+    }
     st.addLog("[doc] opened: " + path + "  rev=" + std::to_string(st.docMirror.revision()));
     st.toast(ui::ToastLevel::Info, "Opened " + pathBaseName(path));
+    // W12+ — re-open any drawings the engine restored from this .step+ (their `source` already
+    // re-pointed to the just-opened part). Each becomes a Drawing tab ALONGSIDE the part tab (the
+    // part stays active). Tolerant: an empty/absent list is a no-op (a file with no drawings).
+    {
+        const nlohmann::json& drws = st.docMirror.lastOpenedDrawings();
+        if (drws.is_array() && !drws.empty()) {
+            for (const auto& d : drws) {
+                if (!d.is_object()) continue;
+                st.adoptDrawingTab(jfld(d, "doc_id"), jfld(d, "name"), jfld(d, "source_doc_id"));
+            }
+            st.toast(ui::ToastLevel::Info,
+                     "Restored " + std::to_string(drws.size()) + " drawing(s)");
+        }
+    }
     std::string base = pathBaseName(path);
     st.rpc.call("doc_rebuild", {{"doc_id", st.docMirror.docId()}},
         [&st, base](const core::RpcResult& r) {
@@ -1077,18 +1106,28 @@ static void drawFeatureManagerTopStrip(AppState& st) {
                     ImGui::GetStyle().ItemSpacing.x);
     if (toolbarIconBtn("fm_new", "new_doc", "New Part", canDoc) && canDoc) {
         std::string err;
-        if (st.docMirror.newPart(st.worker, err)) {
+        // Multi-document: New Part opens a NEW tab (it does not replace the current doc). The
+        // worker registry keeps the previous doc alive; addDocTab records this one and activates it.
+        st.suppressTabDirty = true;
+        bool ok = st.docMirror.newPart(st.worker, err);
+        st.suppressTabDirty = false;
+        if (ok) {
             st.addLog("[doc] new part  rev=" + std::to_string(st.docMirror.revision()));
             st.clearViewportForNewDoc();   // C34: fresh part = clean viewport (planes state)
+            st.addDocTab(/*isAssembly=*/false);
         }
         else st.addLog("[err] new part: " + err);
     }
     ImGui::SameLine(0, gap);
     if (toolbarIconBtn("fm_newasm", "assembly", "New Assembly", canDoc) && canDoc) {
         std::string err;
-        if (st.docMirror.newAssembly(st.worker, err)) {
+        st.suppressTabDirty = true;
+        bool ok = st.docMirror.newAssembly(st.worker, err);
+        st.suppressTabDirty = false;
+        if (ok) {
             st.addLog("[doc] new assembly  rev=" + std::to_string(st.docMirror.revision()));
             st.clearViewportForNewDoc();   // C34
+            st.addDocTab(/*isAssembly=*/true);
             st.showRibbon = true; st.ribbonTab = 4;
         } else st.addLog("[err] new assembly: " + err);
     }

@@ -214,6 +214,9 @@ def _entity_to_edges(ent: dict) -> list[Any]:
     elif etype == "arc_slot":
         return _arc_slot_edges(ent)
 
+    elif etype == "eq_curve":
+        return _eq_curve_edges(ent)
+
     elif etype == "spline":
         pts = ent.get("points", [])
         if len(pts) < 2:
@@ -223,6 +226,9 @@ def _entity_to_edges(ent: dict) -> list[Any]:
             return [Edge.make_spline(vecs)]
         except Exception:  # noqa: BLE001
             return []
+
+    elif etype == "style_spline":
+        return _style_spline_edges(ent)
 
     elif etype == "ellipse":
         cx, cy = _to_vec2(ent["center"], "center")
@@ -390,6 +396,280 @@ def _sample_conic(p0, p1, ap, w: float, n: int = 24) -> list[tuple[float, float]
     return out
 
 
+# --------------------------------------------------------------------------- equation-driven curve
+
+# Safe parametric-expression evaluator for the "eq_curve" entity (SolidWorks "Equation Driven
+# Curve"). RADIANS convention (so t in [0, 2*pi] sweeps a full revolution, matching SW): no eval of
+# arbitrary code — only numbers, the free variable, constants, the whitelisted functions below,
+# + - * / ** % and parentheses execute (grammar enforced by schema.validate_eq_curve_expr at
+# validation time and re-enforced here by the same AST whitelist).
+_EQ_CURVE_FUNCS = {
+    "sin": math.sin, "cos": math.cos, "tan": math.tan,
+    "asin": math.asin, "acos": math.acos, "atan": math.atan, "atan2": math.atan2,
+    "sqrt": math.sqrt, "exp": math.exp, "log": math.log, "abs": abs,
+    "sinh": math.sinh, "cosh": math.cosh, "tanh": math.tanh, "pow": math.pow,
+}
+_EQ_CURVE_CONSTS = {"pi": math.pi, "e": math.e}
+
+
+def _eq_eval(node, env: dict, var: str, expr: str) -> float:
+    import ast
+    if isinstance(node, ast.Expression):
+        return _eq_eval(node.body, env, var, expr)
+    if isinstance(node, ast.BinOp):
+        a = _eq_eval(node.left, env, var, expr)
+        b = _eq_eval(node.right, env, var, expr)
+        op = node.op
+        if isinstance(op, ast.Add):
+            return a + b
+        if isinstance(op, ast.Sub):
+            return a - b
+        if isinstance(op, ast.Mult):
+            return a * b
+        if isinstance(op, ast.Div):
+            return a / b
+        if isinstance(op, ast.Pow):
+            return a ** b
+        if isinstance(op, ast.Mod):
+            return a % b
+        raise FeatureError(f"eq_curve: operator not allowed in '{expr}'")
+    if isinstance(node, ast.UnaryOp):
+        v = _eq_eval(node.operand, env, var, expr)
+        return -v if isinstance(node.op, ast.USub) else v
+    if isinstance(node, ast.Constant):
+        return float(node.value)
+    if isinstance(node, ast.Name):
+        if node.id == var:
+            return float(env[var])
+        if node.id in _EQ_CURVE_CONSTS:
+            return _EQ_CURVE_CONSTS[node.id]
+        raise FeatureError(f"eq_curve: unknown name '{node.id}' in '{expr}'")
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id not in _EQ_CURVE_FUNCS:
+            raise FeatureError(f"eq_curve: unknown function in '{expr}'")
+        args = [_eq_eval(a, env, var, expr) for a in node.args]
+        return float(_EQ_CURVE_FUNCS[node.func.id](*args))
+    raise FeatureError(f"eq_curve: construct not allowed in '{expr}'")
+
+
+def _compile_eq_expr(expr: str, var: str):
+    """Parse + whitelist-check an eq-curve expression once; return an evaluator f(t)->float."""
+    import ast
+    try:
+        tree = ast.parse(str(expr).replace("^", "**"), mode="eval")
+    except SyntaxError as exc:
+        raise FeatureError(f"eq_curve: syntax error in '{expr}': {exc.msg}") from exc
+
+    def _f(value: float) -> float:
+        r = _eq_eval(tree, {var: value}, var, expr)
+        if not math.isfinite(r):
+            raise FeatureError(f"eq_curve: non-finite value from '{expr}' at {var}={value}")
+        return r
+
+    return _f
+
+
+def _sample_eq_curve(ent: dict, n: int = 160) -> list[tuple[float, float]]:
+    """Sample an equation-driven curve entity into XY points (sketch space).
+
+    Parametric form (required): xt/yt expressions in t over [t1, t2].
+    Explicit form (optional convenience): if ``yx`` is present, the curve is sampled as
+    (x, yx(x)) over [x1, x2] — i.e. mapped to the parametric form xt=x, yt=yx internally.
+    """
+    if ent.get("yx") is not None and ent.get("xt") is None:
+        # Explicit y = f(x) form.
+        yx = _compile_eq_expr(ent["yx"], "x")
+        x0 = float(ent.get("x1", ent.get("t1", 0.0)))
+        x1 = float(ent.get("x2", ent.get("t2", 1.0)))
+        if abs(x1 - x0) < 1e-12:
+            raise FeatureError("eq_curve: x1 and x2 must differ")
+        return [(x0 + (x1 - x0) * i / n, yx(x0 + (x1 - x0) * i / n)) for i in range(n + 1)]
+
+    xt = _compile_eq_expr(ent["xt"], "t")
+    yt = _compile_eq_expr(ent["yt"], "t")
+    t0 = float(ent["t1"])
+    t1 = float(ent["t2"])
+    if abs(t1 - t0) < 1e-12:
+        raise FeatureError("eq_curve: t1 and t2 must differ")
+    out: list[tuple[float, float]] = []
+    for i in range(n + 1):
+        t = t0 + (t1 - t0) * i / n
+        out.append((xt(t), yt(t)))
+    return out
+
+
+def _eq_curve_edges(ent: dict) -> list[Any]:
+    """Build a spline edge through the sampled equation-driven curve.
+
+    If the sampled endpoints coincide (a closed curve, e.g. a parametric circle), the spline is
+    built closed so _detect_loops treats it as a one-edge region loop (it can extrude). Matches the
+    existing ``spline`` entity's Edge.make_spline integration with edge-chaining/loop detection.
+    """
+    pts = _sample_eq_curve(ent)
+    # Drop consecutive duplicate samples (a constant expression or a cusp can repeat a point,
+    # which make_spline rejects).
+    dedup: list[tuple[float, float]] = []
+    for px, py in pts:
+        if not dedup or math.hypot(px - dedup[-1][0], py - dedup[-1][1]) > 1e-9:
+            dedup.append((px, py))
+    if len(dedup) < 2:
+        raise FeatureError("eq_curve: degenerate curve (all sampled points coincide)")
+    # If the curve closes on itself, snap the last point exactly onto the first so the spline edge
+    # reports closed (endpoint coincidence) for region detection.
+    if math.hypot(dedup[0][0] - dedup[-1][0], dedup[0][1] - dedup[-1][1]) < 1e-6:
+        dedup[-1] = dedup[0]
+    vecs = [Vector(px, py, 0) for px, py in dedup]
+    try:
+        return [Edge.make_spline(vecs)]
+    except Exception as exc:  # noqa: BLE001
+        raise FeatureError(f"eq_curve: failed to build spline edge ({exc})") from exc
+
+
+# --------------------------------------------------------------------------- style spline
+
+
+def _style_spline_edges(ent: dict) -> list[Any]:
+    """Build a SolidWorks "Style Spline" edge from its CONTROL POLYGON (poles).
+
+    Unlike the ``spline`` entity (whose points are interpolated *through*), the
+    ``style_spline`` points are control poles: the curve starts at ``points[0]``,
+    ends at ``points[-1]``, is tangent to the first/last polygon legs, and lies
+    within the convex hull of the poles (a B-spline / Bezier defined by poles).
+
+    Primary path: a clamped degree-``min(3, n-1)`` B-spline built directly from
+    the poles via OCCT (``Geom_BSplineCurve`` + ``BRepBuilderAPI_MakeEdge``).
+    Fallback: a single Bezier whose control polygon is the poles
+    (``Edge.make_bezier``) — also a legitimate control-polygon curve.
+
+    A closed control polygon (first pole == last pole) yields a closed edge so
+    ``_detect_loops`` treats it as a one-edge region loop (it can extrude).
+    """
+    pts = ent.get("points", [])
+    if len(pts) < 2:
+        raise FeatureError("style_spline: needs >=2 control poles")
+    try:
+        poles = [(float(p[0]), float(p[1])) for p in pts]
+    except (TypeError, ValueError, IndexError) as exc:
+        raise FeatureError(f"style_spline: bad pole coordinate ({exc})") from exc
+
+    # Drop consecutive duplicate poles (degenerate legs the curve constructors reject),
+    # but PRESERVE an intentional closing pole (first == last) for region detection.
+    closed = (
+        len(poles) >= 3
+        and math.hypot(poles[0][0] - poles[-1][0], poles[0][1] - poles[-1][1]) < 1e-9
+    )
+    dedup: list[tuple[float, float]] = []
+    for px, py in poles:
+        if not dedup or math.hypot(px - dedup[-1][0], py - dedup[-1][1]) > 1e-12:
+            dedup.append((px, py))
+    if closed and (
+        math.hypot(dedup[0][0] - dedup[-1][0], dedup[0][1] - dedup[-1][1]) > 1e-12
+    ):
+        dedup.append(poles[0])
+    if len(dedup) < 2:
+        raise FeatureError("style_spline: control poles are degenerate (all coincide)")
+
+    # Primary: clamped B-spline directly from poles (degree adapts to pole count).
+    try:
+        from OCP.Geom import Geom_BSplineCurve
+        from OCP.TColgp import TColgp_Array1OfPnt
+        from OCP.TColStd import TColStd_Array1OfReal, TColStd_Array1OfInteger
+        from OCP.gp import gp_Pnt
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+
+        n = len(dedup)
+        degree = min(3, n - 1)
+        arr = TColgp_Array1OfPnt(1, n)
+        for i, (x, y) in enumerate(dedup, start=1):
+            arr.SetValue(i, gp_Pnt(x, y, 0.0))
+        # Clamped (open-uniform) knot vector: end multiplicities = degree+1 so the
+        # curve passes through the first/last poles and is tangent to the end legs.
+        n_knots = n - degree + 1
+        knots = TColStd_Array1OfReal(1, n_knots)
+        mults = TColStd_Array1OfInteger(1, n_knots)
+        for i in range(1, n_knots + 1):
+            knots.SetValue(i, float(i - 1))
+            mults.SetValue(i, 1)
+        mults.SetValue(1, degree + 1)
+        mults.SetValue(n_knots, degree + 1)
+        bs = Geom_BSplineCurve(arr, knots, mults, degree)
+        return [Edge(BRepBuilderAPI_MakeEdge(bs).Edge())]
+    except Exception:  # noqa: BLE001
+        # Fallback: single Bezier whose control polygon is the poles. Still a
+        # control-polygon curve (interpolates only the first/last poles).
+        try:
+            vecs = [Vector(px, py, 0) for px, py in dedup]
+            return [Edge.make_bezier(*vecs)]
+        except Exception as exc:  # noqa: BLE001
+            raise FeatureError(f"style_spline: failed to build edge ({exc})") from exc
+
+
+# --------------------------------------------------------------------------- sketch text glyphs
+
+
+def _text_faces(ent: dict) -> list[Face]:
+    """Build filled glyph faces (in XY sketch space) for a ``text`` entity.
+
+    build123d's ``Text(font_size=...)`` does NOT map font_size directly to cap height, so the
+    rendered string is measured and uniformly scaled about its placement so the bounding-box
+    Y-extent equals the requested ``height`` (cap height in mm) within tolerance. Glyphs keep their
+    inner boundaries (the hole in O/A/D etc.), so each glyph extrudes as a proper ring. Placement
+    ``p`` is the lower-left of the (scaled) text bounding box. Raises FeatureError on empty text or
+    any glyph-construction failure (never crashes the whole compile)."""
+    from build123d import Text, Align
+
+    txt = ent.get("text")
+    if not isinstance(txt, str) or txt.strip() == "":
+        raise FeatureError("text entity: 'text' must be a non-empty string")
+    height = float(ent.get("height", 0.0))
+    if height <= 0:
+        raise FeatureError("text entity: 'height' must be positive")
+    px, py = _to_vec2(ent["p"], "p")
+    font = ent.get("font")
+
+    try:
+        kwargs: dict[str, Any] = {"font_size": height, "align": (Align.MIN, Align.MIN)}
+        if isinstance(font, str) and font.strip():
+            kwargs["font"] = font
+        try:
+            sk = Text(txt, **kwargs)
+        except Exception:  # noqa: BLE001
+            # Requested font unavailable on this machine — fall back to the engine default font so
+            # the geometry is deterministic across machines (the prompt's determinism requirement).
+            kwargs.pop("font", None)
+            sk = Text(txt, **kwargs)
+
+        faces = list(sk.faces())
+        if not faces:
+            raise FeatureError(f"text entity: '{txt}' produced no glyph faces")
+
+        # Measure actual rendered height and uniformly rescale so the bounding-box Y-extent equals
+        # the requested cap height (font_size != cap height in build123d). Scale about the bbox
+        # lower-left so the same point can then be translated to the placement p.
+        bb = sk.bounding_box()
+        cur_h = bb.max.Y - bb.min.Y
+        if cur_h <= 1e-9:
+            raise FeatureError(f"text entity: '{txt}' has zero height")
+        scale = height / cur_h
+
+        from OCP.gp import gp_Trsf, gp_Pnt
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+        trsf = gp_Trsf()
+        trsf.SetScale(gp_Pnt(bb.min.X, bb.min.Y, 0.0), scale)
+        scaled = [Face(BRepBuilderAPI_Transform(f.wrapped, trsf, True).Shape()) for f in faces]
+
+        # Translate so the scaled text's lower-left bbox corner lands exactly on placement p.
+        from build123d import Pos as _Pos
+        sb_minx = min(f.bounding_box().min.X for f in scaled)
+        sb_miny = min(f.bounding_box().min.Y for f in scaled)
+        dx, dy = px - sb_minx, py - sb_miny
+        return [_Pos(dx, dy, 0) * f for f in scaled]
+    except FeatureError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise FeatureError(f"text entity: glyph construction failed ({exc})") from exc
+
+
 # --------------------------------------------------------------------------- loop detection
 
 
@@ -449,41 +729,52 @@ def _detect_loops(edges: list) -> list[list]:
     for start_idx in range(n):
         if used[start_idx]:
             continue
-        chain: list[int] = [start_idx]
+        # Each chain entry is (edge index, reversed?) so a loop can be rebuilt head-to-tail.
+        chain: list[tuple[int, bool]] = [(start_idx, False)]
         used[start_idx] = True
         chain_closed = False
         loop_head = start_pts[start_idx]
 
         current_tip = end_pts[start_idx]
         while True:
-            # Find an unused edge whose start or end connects to current_tip
+            # Find an unused edge whose start or end connects to current_tip.
             found = -1
+            found_rev = False
             for j in range(n):
                 if used[j]:
                     continue
                 if _near(start_pts[j], current_tip):
-                    found = j
+                    found, found_rev = j, False
                     break
                 if _near(end_pts[j], current_tip):
-                    # Reverse the edge — build123d Edge.reversed()
-                    found = j
+                    found, found_rev = j, True   # matched by its END -> reverse it in the loop
                     break
             if found == -1:
                 break
-            chain.append(found)
+            chain.append((found, found_rev))
             used[found] = True
-            # Update tip — pick the end that is NOT the junction
-            if _near(start_pts[found], current_tip):
-                current_tip = end_pts[found]
-            else:
-                current_tip = start_pts[found]
+            # Advance the tip to the FAR end of the appended edge.
+            current_tip = start_pts[found] if found_rev else end_pts[found]
 
             if _near(current_tip, loop_head):
                 chain_closed = True
                 break
 
         if chain_closed:
-            loops.append([edges[i] for i in chain])
+            # Rebuild the loop as a consistently head-to-tail oriented chain: an edge matched by its
+            # END point is REVERSED so the wire winds continuously. Without this, a cap arc stored
+            # end-first (e.g. a decomposed slot's 2 lines + 2 arcs) left the loop inconsistently
+            # oriented, so _loop_polyline / Wire() mis-wound it and _orient_ccw flipped it the wrong
+            # way -> the even-odd logic ADDED the slot as material instead of subtracting it (the
+            # user-reported "slotted plate extrudes solid, with wedges" bug).
+            from OCP.TopoDS import TopoDS
+            loop = []
+            for idx, rev in chain:
+                e = edges[idx]
+                if rev:
+                    e = Edge(TopoDS.Edge_s(e.wrapped.Reversed()))
+                loop.append(e)
+            loops.append(loop)
 
     return loops
 
@@ -771,6 +1062,41 @@ def compute_regions(all_edges: list, plane: Plane) -> tuple[list[Face], list[dic
     return faces, descs
 
 
+# --------------------------------------------------------------------------- text regions
+
+
+def _text_regions(entities: list, plane: Plane) -> tuple[list[Face], list[dict[str, Any]]]:
+    """Build plane-space glyph FACES + region descriptors for every ``text`` entity.
+
+    Text glyphs are already filled faces (with inner boundaries preserved as holes), so they bypass
+    the loop/even-odd detection entirely and enter the region collection directly — each glyph
+    becomes one material region, flowing into the SAME profile collection extrude consumes (whole
+    sketch or indexed region). Faces are lifted from XY sketch space into 3-D plane space exactly
+    like _region_face does (``plane.location * face``). Raises FeatureError on bad text geometry."""
+    faces: list[Face] = []
+    descs: list[dict[str, Any]] = []
+    for ent in entities:
+        if ent.get("type") != "text" or ent.get("construction", False):
+            continue
+        for f in _text_faces(ent):  # may raise FeatureError (contained by the compiler core)
+            lifted = plane.location * f
+            desc = _region_descriptor(lifted, len(descs), plane=plane)
+            desc["depth"] = 0
+            desc["is_material"] = True
+            # Glyph outline in sketch-local 2-D for the viewport overlay (outer wire only; the
+            # inner hole is implicit in the face but not separately listed here).
+            try:
+                pts = [[float(v.X), float(v.Y)]
+                       for v in lifted.outer_wire().vertices()]
+            except Exception:  # noqa: BLE001
+                pts = []
+            desc["outer"] = pts
+            desc["holes"] = []
+            faces.append(lifted)
+            descs.append(desc)
+    return faces, descs
+
+
 # --------------------------------------------------------------------------- compiler
 
 
@@ -802,6 +1128,23 @@ def compile_sketch(feat: dict, ctx: CompileContext) -> CompileOutput:
     # nesting, hole subtraction, centroid sort and hint_index assignment.
     region_faces, region_descs = compute_regions(all_edges, plane)
 
+    # Text entities are already filled faces (glyph outlines with holes) — they don't participate
+    # in loop detection. Build them directly and merge into the region collection so a text profile
+    # extrudes into 3-D solids (one solid per glyph; O/A/D etc. keep their hole as a ring). Merged
+    # AFTER loop regions, then the combined list is re-sorted by centroid and re-indexed so region
+    # indices stay stable (whole-sketch + indexed picks both work for mixed sketches).
+    text_faces, text_descs = _text_regions(entities, plane)
+    if text_faces:
+        region_faces = list(region_faces) + text_faces
+        region_descs = list(region_descs) + text_descs
+        paired = sorted(zip(region_descs, region_faces),
+                        key=lambda p: (p[0]["centroid"][0], p[0]["centroid"][1]))
+        region_descs = [d for d, _ in paired]
+        region_faces = [f for _, f in paired]
+        for i, d in enumerate(region_descs):
+            d["hint_index"] = i
+            d["index"] = i
+
     # Store regions persistently via ctx.datums so extrude/revolve can access them
     # across feature boundaries (ctx is re-created per feature but datums is shared).
     # Use a sentinel Datum with kind "_sketch_regions" and a sub-dict payload as obj.
@@ -815,6 +1158,9 @@ def compile_sketch(feat: dict, ctx: CompileContext) -> CompileOutput:
         "descs": region_descs,
         "plane": plane,
         "all_edges": all_edges,
+        # Raw entity list (additive — weldments tags member paths by entity id; other consumers
+        # ignore it). Stored as-is so per-entity edges can be re-derived with their ids.
+        "entities": entities,
     }
 
     # Pseudo-body: compound of region faces for tessellation (C02/AICM).

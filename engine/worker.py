@@ -139,6 +139,13 @@ def _doc_open(params: dict, _emit: EmitFn) -> dict:
     resp = docsess.rebuild(s)
     resp["doc_id"] = s.doc_id
     resp["warnings"] = warnings
+    # W12+ — restore any embedded drawings as fresh drawing sessions (source re-pointed to this
+    # reopened doc) and surface them so the host can re-open their Drawing tabs. Additive +
+    # contained: a file with no drawings returns [], a malformed drawing json is skipped.
+    try:
+        resp["drawings"] = stepplus.restore_drawings(s)
+    except Exception:  # noqa: BLE001 — drawing restore must never break the part open
+        resp["drawings"] = []
     return resp
 
 
@@ -332,6 +339,66 @@ def _sketch_project_ref(params: dict, _emit: EmitFn) -> dict:
     from engine.doc import session as docsess
     s = docsess.get_session(params["doc_id"])
     return docsess.sketch_project_ref(s, params["sketch"], params.get("ref"))
+
+
+# =========================================================================== CONFIG config_* RPC
+#
+# Named configurations (param overrides + feature/component suppression). All config_* methods take
+# {doc_id, ...}. config_list is read-only; the rest mutate the doc (one undoable step) and return
+# the ops-response. config_activate / editing-the-active-config rebuild; editing an inactive config
+# is a metadata-only write that reuses the last build. Structured error envelope.
+
+
+def _weld_cut_list(params: dict, _emit: EmitFn) -> dict:
+    # Weldments cut list: aggregate the active part doc's weld_member structural members into a
+    # grouped cut-list table (read-only; ensures-built then reads the _weld_members side-channel).
+    # A doc with no weld_member features -> empty rows (not an error).
+    from engine.doc import session as docsess
+    from engine.doc import cutlist
+    return cutlist.cut_list_for_session(docsess.get_session(params["doc_id"]))
+
+
+def _config_list(params: dict, _emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    return docsess.config_list(docsess.get_session(params["doc_id"]))
+
+
+def _config_add(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.config_add(s, params["name"], params.get("copy_from"),
+                              emit=_doc_emit(emit))
+
+
+def _config_delete(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.config_delete(s, params["name"], emit=_doc_emit(emit))
+
+
+def _config_activate(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.config_activate(s, params["name"], emit=_doc_emit(emit))
+
+
+def _config_set_override(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    # value == null (and no clear flag) means CLEAR the override (use the base param value).
+    value = params.get("value")
+    clear = bool(params.get("clear", False)) or value is None
+    return docsess.config_set_override(s, params["name"], params["feature_id"],
+                                       params["param"], value, clear=clear,
+                                       emit=_doc_emit(emit))
+
+
+def _config_set_suppression(params: dict, emit: EmitFn) -> dict:
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.config_set_suppression(s, params["name"], params["feature_id"],
+                                          bool(params.get("suppressed", False)),
+                                          emit=_doc_emit(emit))
 
 
 # =========================================================================== eval_* RPC (C12)
@@ -689,6 +756,19 @@ from engine.doc import formats as _formats  # noqa: E402
 
 _METHODS.update(_formats.WORKER_METHODS)
 
+# Instant3D push-pull (drag-a-face-to-edit). Registered via its own WORKER_METHODS dict so the
+# literal above stays owned by the worker integrator.
+from engine.doc import instant3d as _instant3d  # noqa: E402
+
+_METHODS.update(_instant3d.WORKER_METHODS)
+
+# W12 DRAWINGS — 2D orthographic/iso views of a part/assembly via HLR. Its own WORKER_METHODS dict
+# (drawing_new / drawing_add_view / drawing_get / drawing_remove_view / drawing_set_view /
+# drawing_close) keeps the literal above frozen.
+from engine.doc import drawing as _drawing  # noqa: E402
+
+_METHODS.update(_drawing.WORKER_METHODS)
+
 # C22a orchestrator (M9) — registered via update so the shared _METHODS dict literal stays owned by
 # the worker integrator. agent_run_v2/agent_cancel/get_prompts_v2 keep the LEGACY plain-string error
 # shape (they are not in _STRUCTURED_ERROR_METHODS), matching agent_design.
@@ -713,13 +793,48 @@ _STRUCTURED_ERROR_METHODS = {
     "eval_symmetry", "eval_draft", "eval_thickness", "eval_curvature",
     "doc_export_step", "doc_face_points",  # C19
     "import_file", "export_file",  # C21
+    "doc_push_pull",  # Instant3D push-pull (drag a face)
+    # W12 drawings — all use the structured error envelope.
+    "drawing_new", "drawing_add_view", "drawing_remove_view", "drawing_set_view",
+    "drawing_get", "drawing_close",
+    # W13 drawing annotations + BOM.
+    "drawing_add_dim", "drawing_remove_annotation", "drawing_bom",
+    # W15 section + detail views.
+    "drawing_add_section", "drawing_add_detail",
 }
 
 # ---- ask mode (Wave D) — registered via update/add so the literals above stay frozen ----
 _METHODS.update({"agent_ask_v2": _agent_ask_v2})
 _STRUCTURED_ERROR_METHODS.add("agent_ask_v2")
 
-# === ECAD (Wave C2) ===
+# ---- CONFIG configurations — config_* RPCs (registered via update so the literal stays frozen) --
+_METHODS.update({
+    "config_list": _config_list,
+    "config_add": _config_add,
+    "config_delete": _config_delete,
+    "config_activate": _config_activate,
+    "config_set_override": _config_set_override,
+    "config_set_suppression": _config_set_suppression,
+})
+_STRUCTURED_ERROR_METHODS.update({
+    "config_list", "config_add", "config_delete", "config_activate",
+    "config_set_override", "config_set_suppression",
+})
+
+# ---- WELDMENTS cut list — read-only aggregation of weld_member members (structured error) ----
+_METHODS.update({"weld_cut_list": _weld_cut_list})
+_STRUCTURED_ERROR_METHODS.add("weld_cut_list")
+
+# ---- 2D EXPORT — drawing sheets + sheet-metal flat patterns to DXF/PDF (structured error) ----
+# export_drawing {doc_id(drawing), path, format:"dxf"|"pdf"} and
+# export_flat_dxf {doc_id(part), path, format?:"dxf"|"pdf"} register via their own WORKER_METHODS so
+# the literal above stays owned by the worker integrator.
+from engine.doc import export2d as _export2d  # noqa: E402
+
+_METHODS.update(_export2d.WORKER_METHODS)
+_STRUCTURED_ERROR_METHODS.update({"export_drawing", "export_flat_dxf"})
+
+# === ECAD (Wave C2) — AI-ECAD electrical design methods (schematic/PCB/sim/fab/3d) ===
 try:
     from engine.ecad.rpc import METHODS as _ECAD_METHODS, STRUCTURED_ERROR_METHODS as _ECAD_SEM
     _METHODS.update(_ECAD_METHODS)

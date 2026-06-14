@@ -43,7 +43,7 @@ enum class PMFieldKind { Dim, SelectorWell, Combo, Check, Int, DatumRef, Feature
 
 // Which topology kinds a SelectorWell accepts (mirrors feature_params sel(kinds…)).
 struct PMSelKinds {
-    bool face = false, edge = false, vertex = false;
+    bool face = false, edge = false, vertex = false, body = false;
 };
 
 // One row of a feature form (data-driven; one per param/ref in feature_params order).
@@ -131,10 +131,15 @@ struct PMField {
 // Parse a dim string to canonical units (mm; degrees when angle=true). Accepts SolidWorks-style
 // unit math: full +-*/() expressions with per-literal unit suffixes ("100mm+2in/0.5m",
 // "(3+1/8)in", "25.4/2"); a single TRAILING unit applies to the whole expression ("1/2in" =
-// half an inch). Length units: mm cm m um/µm in/" ft/' mil/thou; angle units: deg ° rad. Bare
-// numbers are document units (mm / deg). Returns true on success.
-// Leading "=" is NOT handled here (that is an expr binding, detected by the caller).
-bool pmParseDim(const std::string& text, double& outMm, std::string& err, bool angle = false);
+// half an inch). Length units: mm cm m um/µm in/" ft/' mil/thou; angle units: deg ° rad. Returns
+// true on success. Leading "=" is NOT handled here (that is an expr binding, detected by caller).
+//
+// bareLengthScale is the canonical-mm value of ONE bare (unit-less) length unit — the document's
+// active length unit. 1.0 = MMGS (a bare "1.5" means 1.5 mm); 25.4 = IPS (a bare "1.5" means
+// 1.5 in). It scales bare LENGTH literals only; literals carrying an explicit suffix (1.5mm, 2in)
+// always honour that suffix, and ANGLE values ignore it entirely (degrees in both systems).
+bool pmParseDim(const std::string& text, double& outMm, std::string& err, bool angle = false,
+                double bareLengthScale = 1.0);
 // Format a canonical mm value for display, honouring IPS when ips==true.
 std::string pmFormatDim(double mm, bool ips);
 
@@ -175,6 +180,16 @@ public:
     // Feed a resolved viewport pick into the active selector well (called from the selection
     // observer). Returns true if the pick was consumed (an active well accepted it).
     bool routePick(const nlohmann::json& selector, int pickKind /*render::PickKind*/);
+
+    // True when the active selector well wants BODY selectors (e.g. boolean targets/tools). The
+    // selection observer uses this to resolve the picked element's owning body (resolvePick
+    // kind="body") instead of the face/edge/vertex it clicked.
+    bool activeWellWantsBody() const;
+
+    // Human phrase for the active well's accepted topology ("edges", "faces or edges", …), or ""
+    // when no selector well is active. Used to toast feedback when a pick is rejected for the
+    // wrong kind (SolidWorks tells you what a field wants).
+    std::string activeWellKindHint() const;
 
     // ---- C51: sketched-feature region picking ----------------------------------------------
     // The viewport region picker (SketchMode::drawRegionPicker) drives these to render region
@@ -226,6 +241,12 @@ private:
     // C51: the profile/sections well (first SelectorWell keyed "profile" or "sections").
     PMField* profileWell();
     const PMField* profileWell() const;
+
+    // Active document-unit display state. Set from AppState.ips() at open; re-synced each draw so a
+    // live MMGS<->IPS toggle reformats every open Dim field's DISPLAY (the canonical mm dimValue is
+    // untouched). reformatDimDisplays() rewrites each non-expr dim buffer from its dimValue.
+    bool ips_ = false;
+    void reformatDimDisplays();
 
     bool active_ = false;
     bool editMode_ = false;        // true = reopened on an existing feature (no add op)

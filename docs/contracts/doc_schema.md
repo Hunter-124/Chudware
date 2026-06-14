@@ -1,7 +1,14 @@
-# Contract: Document Schema — `aicad.part/1` · `aicad.asm/1`
+# Contract: Document Schema — `aicad.part/1` · `aicad.asm/1` · `aicad.drawing/1`
 
 > Version 1. Changes require a schema-string bump and a migration note here.
 > Machine-checked by `engine/doc/schema.py`; fixtures in `docs/contracts/fixtures/`.
+>
+> **W12 minor version bump (additive).** A NEW top-level document kind `aicad.drawing/1`
+> (`DrawingDocument`, §8) is added — a 2D detailing document that projects a source part/assembly
+> into orthographic + isometric views via HLR. This is a **new schema string**, NOT a change to the
+> existing `aicad.part/1` / `aicad.asm/1` schemas (those are byte-for-byte unchanged and every
+> existing part/assembly document remains valid). `validate_document` now dispatches a third schema
+> string; readers that don't understand `aicad.drawing/1` reject it exactly like any unknown schema.
 >
 > **C35-overhaul migration (additive, no schema-string bump).** Three OPTIONAL fields are added;
 > every pre-overhaul document remains valid (the fields default to absent/null), so the schema
@@ -10,6 +17,15 @@
 > - `distance` constraints may carry `axis:"h"|"v"` (§3.3);
 > - the part/assembly document may carry `rollback_after: <feature id>|null` (the rollback bar, §1).
 > A future change to any EXISTING field's meaning would still require the schema-string bump.
+>
+> **CONFIG migration (additive, no schema-string bump).** Two OPTIONAL top-level fields are added to
+> `aicad.part/1` AND `aicad.asm/1` — `configurations` (a list) + `active_configuration` (a name); see
+> §9. They drive named part/assembly variants by per-config feature-param overrides + feature
+> (and, in assemblies, component) suppression. **ABSENT `configurations` is exactly today's
+> behavior**: the document compiles as a single implicit `"Default"` configuration and is
+> byte-identical to a pre-CONFIG rebuild — so every existing document remains valid and unchanged,
+> and the schema string stays `aicad.part/1` / `aicad.asm/1`. This is the SECOND additive doc-schema
+> version bump of the SolidWorks-class overhaul (the first being the C35-overhaul fields above).
 
 ## 0. Conventions
 
@@ -95,9 +111,11 @@ A sketch is a feature (`type:"sketch"`) with `refs.plane` = selector-or-datum an
 | `parabola` (S) | `vertex:[x,y]`, `focus:[x,y]`, `t0`, `t1` (drawn segment of a parabola; own frame `u=unit(focus−vertex)`, `w=perp(u)`, `f=\|focus−vertex\|`, point `P(t)=vertex+(t²/4f)·u+t·w`; `t0`/`t1` are signed `w`-extents) |
 | `conic` (S) | `p0:[x,y]`, `p1:[x,y]`, `apex:[x,y]`, `rho:0..1` (SolidWorks conic: endpoints + tangent-intersection `apex` + `rho`; rendered as rational quadratic Bézier with apex weight `w=rho/(1−rho)`) |
 | `spline` | `points:[[x,y],…]` (cubic through-points) |
+| `style_spline` (S) | `points:[[x,y],…]` (control **poles**: a clamped degree-`min(3,n−1)` B-spline by control polygon — interpolates only the first/last pole, tangent to the end legs, within the convex hull; distinct from `spline`, which interpolates through every point). Pole handles `p0…pN`. |
 | `slot` | `p1:[x,y]`, `p2:[x,y]`, `width:w` (straight slot, arc caps) |
 | `arc_slot` (S) | `center:[x,y]`, `radius:r`, `a0:deg`, `a1:deg`, `width:w` (arc-spine slot: spine = circular arc, center/radius, CCW `a0`→`a1` like `arc`; capsule of total width `w` around it. `radius − w/2 > 0` required) |
-| `text` (S) | `p:[x,y]`, `text:str`, `height:mm` |
+| `text` (S) | `p:[x,y]`, `text:str`, `height:mm` (`p` = lower-left; cap-height rescaled to `height`; build123d `Text` glyph faces, inner glyph holes preserved; optional `font:str?`. Solver: position-only (2 DOF)) |
+| `eq_curve` (S) | `xt:str`, `yt:str`, `t1`, `t2` (SolidWorks Equation-Driven Curve: parametric `x(t)/y(t)` expression strings over `[t1,t2]` in radians, safe-AST evaluated, sampled to a spline; closed forms extrude as a region. Explicit `yx`/`x1`/`x2` form also compiles. Solver: 0 DOF — equation-fixed; `start`/`end` are constant references at `t1`/`t2`) |
 
 All entities carry `construction:bool` (construction geometry never forms profile regions).
 
@@ -254,3 +272,130 @@ Normative geometry (Z-up, matching the existing engine/render conventions):
 - Readers MUST reject an unknown major schema string (`aicad.part/2`).
 - Readers MUST ignore unknown keys (forward-tolerant) and preserve them on resave when feasible.
 - Writers MUST emit every required key listed here.
+
+## 8. DrawingDocument (`aicad.drawing/1`, W12)
+
+A **drawing** is a 2D detailing document that projects a SOURCE part/assembly into orthographic +
+isometric views via hidden-line removal (HLR). It carries no features/equations/material — only a
+`source` reference and sheets of views. The projected 2D geometry is **not stored** in the document
+(it is recomputed from the source's current bodies on every `drawing_get`, so the drawing stays
+associative); the document only stores the view *definitions*.
+
+```json
+{
+  "schema": "aicad.drawing/1",
+  "id": "doc-…",
+  "name": "Bracket - Drawing",
+  "units": {"system": "MMGS"},
+  "source": "<source part/assembly doc id>",
+  "sheets": [
+    {
+      "id": "s1",
+      "size": "A3",
+      "views": [
+        {"id": "v1", "type": "base", "orientation": "front",
+         "scale": 1.0, "position": [100, 100], "show_hidden": true},
+        {"id": "v2", "type": "projected", "orientation": "top",
+         "scale": 1.0, "position": [100, 200], "show_hidden": true},
+        {"id": "v3", "type": "iso", "orientation": "iso",
+         "scale": 1.0, "position": [250, 200], "show_hidden": false}
+      ]
+    }
+  ]
+}
+```
+
+- `source` — the source doc to project. A **string** is an open source doc id (the live-session
+  form W12 uses) or a path; the **object** form `{path}` / `{doc_id}` is reserved for embedded
+  sources. The source must resolve to a part or assembly with compiled bodies at projection time.
+- `sheets` — non-empty list. Each sheet: `id` (`s<N>`), `size` (∈ `A4 A3 A2 A1 A0` ISO + `A B C D E`
+  ANSI), `views`. View `id`s (`v<N>`) are **document-unique** (not just per-sheet).
+- **View** = `{id, type, orientation, scale, position:[x,y], show_hidden}`:
+  - `type` ∈ `base` | `projected` | `iso`. `base` = the primary orthographic view; `projected` =
+    an ortho view folded off the base (front/top/right/…); `iso` = the standard isometric.
+  - `orientation` ∈ `front back top bottom left right iso`. An `iso` view MUST be orientation
+    `iso`; a `base`/`projected` view MUST NOT be `iso`.
+  - `scale` — positive float (drawn size ÷ true size). `position:[x,y]` — sheet-mm anchor of the
+    view's projected-origin. `show_hidden` — bool, draw hidden (dashed) edges.
+  - **Reserved (W13):** a view may carry `annotations:[…]` (list) and `label:str|null`.
+
+**Orientation → projection direction (Z-up, matches §5 reserved datums).** The orientation is the
+HLR line of sight; `front` looks along **+Y** (the viewer sits at −Y, exactly like `plane.front`'s
+−Y normal):
+
+| orientation | view dir (eye→model) | sheet +x | sheet +y |
+|---|---|---|---|
+| `front` | +Y | +X | +Z |
+| `back` | −Y | −X | +Z |
+| `top` | −Z | +X | +Y |
+| `bottom` | +Z | +X | −Y |
+| `right` | −X | +Y | +Z |
+| `left` | +X | −Y | +Z |
+| `iso` | −(1,1,1) (eye at (1,1,1)) | iso horizontal | world +Z up |
+
+Canonical units mm. A projection failure on one view is **contained**: that view comes back with
+`error:"<reason>"` and empty geometry; it never invalidates the other views or the document.
+
+The 2D view-geometry JSON shape (what `drawing_get` / `drawing_add_view` return per view) is
+normative in [worker_rpc.md §Drawings](worker_rpc.md). Implemented + machine-checked by
+`engine/doc/drawing.py` + `engine/doc/schema.py::validate_drawing`.
+
+## 9. Configurations (CONFIG — additive)
+
+A part (`aicad.part/1`) or assembly (`aicad.asm/1`) document MAY carry named **configurations** —
+variants of the one document driven by per-config feature-param overrides + feature (and, in
+assemblies, component) suppression. This is the SolidWorks "Configurations" feature.
+
+```json
+{
+  "schema": "aicad.part/1",
+  "…": "…",
+  "features": [ … ],
+  "configurations": [
+    {"name": "Default", "param_overrides": {}, "suppressions": {}},
+    {"name": "Small",
+     "param_overrides": {"f2.depth": {"value": 20, "expr": null}},
+     "suppressions": {"f3": true}},
+    {"name": "Large",
+     "param_overrides": {"f2.depth": {"value": 40, "expr": null}},
+     "suppressions": {}}
+  ],
+  "active_configuration": "Small"
+}
+```
+
+- `configurations` — OPTIONAL list. Each entry:
+  - `name` — non-empty, **unique** within the document. The display + lookup key.
+  - `param_overrides` — object keyed `"<feature_id>.<param_key>"`; the value REPLACES that feature's
+    stored `params[<param_key>]` when the config is active. The value is whatever the param holds —
+    a scalar (`int`/`bool`/`str`), an array, or a **dimension value** `{value, expr}` (dim-shaped
+    overrides are validated like any stored dim). The key's `<feature_id>` must exist and (for the
+    structural check) `<param_key>` must be a key of that feature's `params`.
+  - `suppressions` — object keyed by `<feature_id>` (and, in assemblies, `<component_id>` `k<N>`) →
+    `bool`. A `true` entry suppresses that feature/component **in addition to** its base
+    `suppressed` flag (the effective flag is `base.suppressed OR config.suppressions[id]`). A
+    `false`/absent entry does nothing. The id must exist.
+- `active_configuration` — OPTIONAL name of the active config. When `configurations` is present but
+  this is absent/unknown, the **first** configuration is active. When `configurations` is absent it
+  has no meaning (and validates only as a string-or-null).
+
+**Absent = implicit Default (byte-identical).** A document with no `configurations` (or an empty
+list) compiles as a single implicit configuration named `"Default"` with no overrides and no extra
+suppression — i.e. exactly the pre-CONFIG behavior. Such a document is byte-for-byte valid and
+compiles to identical geometry, status, and topology as before this version. The compiler echoes the
+active config name on its result (`"Default"` for config-less docs).
+
+**Compile semantics.** Activating a config recompiles the model with the active config's overrides +
+suppression applied to a **non-mutating overlay** of the stored feature list — the stored document is
+never edited. Everything else (equation resolution, per-feature caching, owner-tagging, tessellation)
+flows unchanged; the compile cache keys on the active config so switching configs recomputes only
+what changed and caches per-config (switching back is a cache hit). A config that fails to compile
+reports per-feature errors like any normal rebuild — it never crashes.
+
+**Persistence.** `configurations` + `active_configuration` are part of `document.json` and round-trip
+through `.step+` save/open. Reopening recompiles the active configuration.
+
+Implemented + machine-checked by `engine/doc/schema.py::_validate_configurations`,
+`engine/doc/compiler.py` (`resolve_active_config` / `apply_configuration_to_doc` /
+`_config_effective_features`), and `engine/doc/test_configurations.py`. The `config_*` worker RPCs
+that drive configurations live in [worker_rpc.md §Configurations](worker_rpc.md).

@@ -864,6 +864,529 @@ def _op_sketch_offset(doc, op, index, idgen, id_map):
         id_map[f"${index}#{k}"] = neid
 
 
+# ---- sketch fillet / chamfer (round/bevel the corner where two segments meet) ----
+#
+# Both mirror sketch_trim/extend/offset: resolve the two segment ids, run the pure 2D math in
+# sketch_geom, edit the two lines' corner endpoints back to the tangent/setback points, and insert
+# the connecting geometry (a tangent arc for fillet, a line for chamfer) with the relations that
+# keep the corner closed (coincident at both joins) and — for the fillet — tangent to both edges.
+# Only line-line corners are supported (the solver has no line-arc/arc-arc tangent yet); other
+# entity combinations raise a clean OpError. The id_map records the new entity under "$<index>".
+
+
+def _line_end_handle(eid: str, which: str) -> str:
+    """Map a geom end name ('start'|'end') to a line's point handle ('p1'|'p2')."""
+    return f"{eid}." + ("p1" if which == "start" else "p2")
+
+
+def _set_line_end(ent: dict, which: str, pt) -> None:
+    """Move a line entity's corner endpoint to *pt* ('start'->p1, 'end'->p2)."""
+    ent["p1" if which == "start" else "p2"] = [float(pt[0]), float(pt[1])]
+
+
+def _drop_corner_join(sk: dict, h1: str, h2: str) -> None:
+    """Drop any constraint that JOINED the two corner endpoints to each other (the original
+    coincident/coradial/midpoint/etc. at the sharp corner). That corner no longer exists — the
+    fillet/chamfer splits it into two distinct tangent points — so leaving the stale join would
+    pull the trimmed ends back together and undo the round/bevel at solve time. Constraints that
+    touch only ONE of the two handles (e.g. the next edge's own corner join) are preserved."""
+    params = sk.setdefault("params", {})
+    cons = params.setdefault("constraints", [])
+    kept = []
+    for c in cons:
+        refs = c.get("refs", []) or []
+        if h1 in refs and h2 in refs:
+            continue  # this constraint binds the two corner endpoints together -> drop it
+        kept.append(c)
+    params["constraints"] = kept
+
+
+def _op_sketch_fillet(doc, op, index, idgen, id_map):
+    from engine.doc import sketch_geom as geom
+
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    e1id = op.get("e1")
+    e2id = op.get("e2")
+    e1 = _find_entity(sk, e1id)
+    e2 = _find_entity(sk, e2id)
+    if e1 is None or e2 is None:
+        raise _invalid(index, "sketch_fillet requires existing 'e1' and 'e2' entity ids")
+    if e1id == e2id:
+        raise _invalid(index, "sketch_fillet: e1 and e2 must be different entities")
+    radius = op.get("radius")
+    if not isinstance(radius, (int, float)) or isinstance(radius, bool) or radius <= 0:
+        raise _invalid(index, "sketch_fillet requires a positive numeric 'radius'")
+
+    for ent in (e1, e2):
+        if ent.get("type") != "line":
+            raise OpError("unsupported_entity",
+                          f"op[{index}]: sketch_fillet supports line-line corners only "
+                          f"(got '{ent.get('type')}')",
+                          {"index": index, "reason": f"unsupported entity '{ent.get('type')}'"})
+
+    try:
+        res = geom.fillet_corner(_geom_view(e1), _geom_view(e2), float(radius))
+    except geom.GeomError as exc:
+        raise OpError("fillet_failed", f"op[{index}]: sketch_fillet — {exc.reason}",
+                      {"index": index, "reason": exc.reason})
+
+    # The sharp corner is gone — drop the original coincident that joined the two corner ends.
+    _drop_corner_join(sk, _line_end_handle(e1id, res["end_a"]),
+                      _line_end_handle(e2id, res["end_b"]))
+
+    # Trim each line back to its tangent point.
+    _set_line_end(e1, res["end_a"], res["ta"])
+    _set_line_end(e2, res["end_b"], res["tb"])
+
+    # Insert the tangent arc (ta -> tb).
+    aid = idgen.next("e")
+    arc = copy.deepcopy(res["arc"])
+    arc["id"] = aid
+    arc["construction"] = False
+    _sketch_entities(sk).append(arc)
+
+    # Relations: arc endpoints coincident with the trimmed line ends + tangent to both lines.
+    cons = sk["params"].setdefault("constraints", [])
+    cons.append({"id": idgen.next("c"), "type": "coincident",
+                 "refs": [f"{aid}.start", _line_end_handle(e1id, res["end_a"])]})
+    cons.append({"id": idgen.next("c"), "type": "coincident",
+                 "refs": [f"{aid}.end", _line_end_handle(e2id, res["end_b"])]})
+    cons.append({"id": idgen.next("c"), "type": "tangent", "refs": [aid, e1id]})
+    cons.append({"id": idgen.next("c"), "type": "tangent", "refs": [aid, e2id]})
+
+    id_map[f"${index}"] = aid
+
+
+def _op_sketch_chamfer(doc, op, index, idgen, id_map):
+    from engine.doc import sketch_geom as geom
+
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    e1id = op.get("e1")
+    e2id = op.get("e2")
+    e1 = _find_entity(sk, e1id)
+    e2 = _find_entity(sk, e2id)
+    if e1 is None or e2 is None:
+        raise _invalid(index, "sketch_chamfer requires existing 'e1' and 'e2' entity ids")
+    if e1id == e2id:
+        raise _invalid(index, "sketch_chamfer: e1 and e2 must be different entities")
+    distance = op.get("distance")
+    if not isinstance(distance, (int, float)) or isinstance(distance, bool) or distance <= 0:
+        raise _invalid(index, "sketch_chamfer requires a positive numeric 'distance'")
+    # Optional unequal setback on the second edge; defaults to equal.
+    distance2 = op.get("distance2")
+    if distance2 is None:
+        distance2 = distance
+    elif not isinstance(distance2, (int, float)) or isinstance(distance2, bool) or distance2 <= 0:
+        raise _invalid(index, "sketch_chamfer 'distance2' must be a positive number when given")
+
+    for ent in (e1, e2):
+        if ent.get("type") != "line":
+            raise OpError("unsupported_entity",
+                          f"op[{index}]: sketch_chamfer supports line-line corners only "
+                          f"(got '{ent.get('type')}')",
+                          {"index": index, "reason": f"unsupported entity '{ent.get('type')}'"})
+
+    try:
+        res = geom.chamfer_corner(_geom_view(e1), _geom_view(e2),
+                                  float(distance), float(distance2))
+    except geom.GeomError as exc:
+        raise OpError("chamfer_failed", f"op[{index}]: sketch_chamfer — {exc.reason}",
+                      {"index": index, "reason": exc.reason})
+
+    # The sharp corner is gone — drop the original coincident that joined the two corner ends.
+    _drop_corner_join(sk, _line_end_handle(e1id, res["end_a"]),
+                      _line_end_handle(e2id, res["end_b"]))
+
+    # Trim each line back to its setback point.
+    _set_line_end(e1, res["end_a"], res["ta"])
+    _set_line_end(e2, res["end_b"], res["tb"])
+
+    # Insert the connecting bevel line (ta -> tb).
+    lid = idgen.next("e")
+    line = {"id": lid, "type": "line", "construction": False,
+            "p1": [float(res["ta"][0]), float(res["ta"][1])],
+            "p2": [float(res["tb"][0]), float(res["tb"][1])]}
+    _sketch_entities(sk).append(line)
+
+    # Relations: bevel endpoints coincident with the trimmed line ends.
+    cons = sk["params"].setdefault("constraints", [])
+    cons.append({"id": idgen.next("c"), "type": "coincident",
+                 "refs": [f"{lid}.p1", _line_end_handle(e1id, res["end_a"])]})
+    cons.append({"id": idgen.next("c"), "type": "coincident",
+                 "refs": [f"{lid}.p2", _line_end_handle(e2id, res["end_b"])]})
+
+    id_map[f"${index}"] = lid
+
+
+# ---- C53: sketch mirror / pattern / convert (reserved-now, implemented here) ----
+#
+# All three mutate the active sketch's entity (and constraint) lists and flow through the normal
+# apply_ops rebuild path, like the trim/extend/offset/fillet/chamfer tools above. The pure 2D math
+# (reflection + the linear/circular step transforms) is inline here — it is small and entity-shaped,
+# unlike the curve splitting in sketch_geom. id_map records the FIRST new entity under "$<index>"
+# and any further new entities under "$<index>#1", "$<index>#2", ... (the flat string->string scheme
+# the offset/trim ops already use).
+#
+# Op request schemas (host ribbon dispatches to match these — see docs/contracts/doc_ops.md):
+#   sketch_mirror_entities  {sketch, entities:[id...], line:<construction-line entity id>}
+#   sketch_pattern_entities {sketch, mode:"linear", entities:[id...], dir:[dx,dy], count, spacing}
+#                           {sketch, mode:"circular", entities:[id...], center:[x,y], count, angle,
+#                                                     equal_spacing?:bool}
+#   sketch_convert          {sketch, refs:[ {datum|kind+selector}, ... ]}
+#
+# Supported entity types for mirror/pattern: line, circle, arc (the solver's first-class types). Any
+# other type in the selection raises a clean OpError("unsupported_entity") with NO mutation.
+
+_MP_SUPPORTED = ("line", "circle", "arc")
+
+
+def _reflect_point(pt, A, B):
+    """Reflect point *pt* across the infinite line through A and B (all [x, y] sequences)."""
+    import math as _m
+    ax, ay = float(A[0]), float(A[1])
+    bx, by = float(B[0]), float(B[1])
+    dx, dy = bx - ax, by - ay
+    L2 = dx * dx + dy * dy
+    if L2 < 1e-18:
+        raise OpError("mirror_failed", "mirror line is degenerate (zero length)",
+                      {"reason": "degenerate mirror line"})
+    px, py = float(pt[0]) - ax, float(pt[1]) - ay
+    # projection scalar of P onto the line direction
+    t = (px * dx + py * dy) / L2
+    # foot of perpendicular, then reflect
+    fx, fy = ax + t * dx, ay + t * dy
+    return [2.0 * fx - float(pt[0]), 2.0 * fy - float(pt[1])]
+
+
+def _reflect_angle_deg(ang, A, B):
+    """Reflect a direction angle (degrees) across the line direction (axis through A->B)."""
+    import math as _m
+    axis = _m.atan2(float(B[1]) - float(A[1]), float(B[0]) - float(A[0]))
+    return _m.degrees(2.0 * axis - _m.radians(float(ang)))
+
+
+def _mirror_entity(ent: dict, A, B) -> dict:
+    """Return the reflected geometry (no id/construction) of a line/circle/arc across line A->B."""
+    etype = ent.get("type")
+    if etype == "line":
+        return {"type": "line",
+                "p1": _reflect_point(ent["p1"], A, B),
+                "p2": _reflect_point(ent["p2"], A, B)}
+    if etype == "circle":
+        return {"type": "circle",
+                "center": _reflect_point(ent["center"], A, B),
+                "radius": float(ent["radius"])}
+    if etype == "arc":
+        # Reflection reverses orientation: the swept direction flips, so ccw flips and the
+        # start/end angles map through the axis (and swap roles to keep start->end sweep).
+        a0 = _reflect_angle_deg(ent["start"], A, B)
+        a1 = _reflect_angle_deg(ent["end"], A, B)
+        return {"type": "arc",
+                "center": _reflect_point(ent["center"], A, B),
+                "radius": float(ent["radius"]),
+                "start": a1, "end": a0,
+                "ccw": not bool(ent.get("ccw", True))}
+    raise OpError("unsupported_entity",
+                  f"mirror/pattern does not support entity type '{etype}'",
+                  {"reason": f"unsupported entity '{etype}'"})
+
+
+def _translate_entity(geom: dict, dx: float, dy: float) -> dict:
+    """Copy *geom* translated by (dx, dy). Geometry-only dict (no id/construction)."""
+    out = copy.deepcopy(geom)
+    etype = out.get("type")
+    if etype == "line":
+        out["p1"] = [out["p1"][0] + dx, out["p1"][1] + dy]
+        out["p2"] = [out["p2"][0] + dx, out["p2"][1] + dy]
+    else:  # circle / arc
+        out["center"] = [out["center"][0] + dx, out["center"][1] + dy]
+    return out
+
+
+def _rotate_entity(geom: dict, cx: float, cy: float, ang_deg: float) -> dict:
+    """Copy *geom* rotated by *ang_deg* about (cx, cy). Geometry-only dict (no id/construction)."""
+    import math as _m
+    a = _m.radians(ang_deg)
+    ca, sa = _m.cos(a), _m.sin(a)
+
+    def rot(p):
+        x, y = float(p[0]) - cx, float(p[1]) - cy
+        return [cx + x * ca - y * sa, cy + x * sa + y * ca]
+
+    out = copy.deepcopy(geom)
+    etype = out.get("type")
+    if etype == "line":
+        out["p1"] = rot(out["p1"])
+        out["p2"] = rot(out["p2"])
+    else:  # circle / arc
+        out["center"] = rot(out["center"])
+        if etype == "arc":
+            out["start"] = float(out["start"]) + ang_deg
+            out["end"] = float(out["end"]) + ang_deg
+    return out
+
+
+def _symmetric_pairs(etype: str, a: str, b: str):
+    """Point-handle pairs whose symmetric relation (about the mirror axis) keeps a<->b mirrored.
+    Returns a list of (handle_a, handle_b) plus a flag list of 'equal' pairs (radius equality)."""
+    if etype == "line":
+        return [(f"{a}.p1", f"{b}.p1"), (f"{a}.p2", f"{b}.p2")], False
+    if etype == "circle":
+        return [(f"{a}.center", f"{b}.center")], True
+    if etype == "arc":
+        return [(f"{a}.center", f"{b}.center"),
+                (f"{a}.start", f"{b}.start"),
+                (f"{a}.end", f"{b}.end")], True
+    return [], False
+
+
+def _op_sketch_mirror_entities(doc, op, index, idgen, id_map):
+    """Reflect the selected entities across a mirror line and add symmetric relations so the
+    mirrored copies stay tied to the originals (SolidWorks "Mirror Entities")."""
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    eids = op.get("entities")
+    if not (isinstance(eids, list) and eids):
+        raise _invalid(index, "sketch_mirror_entities requires a non-empty 'entities' id list")
+    line_id = op.get("line")
+    if not isinstance(line_id, str) or not line_id:
+        raise _invalid(index, "sketch_mirror_entities requires a 'line' (mirror line entity id)")
+    axis = _find_entity(sk, line_id)
+    if axis is None:
+        raise _invalid(index, f"sketch_mirror_entities: mirror line '{line_id}' not found")
+    if axis.get("type") != "line":
+        raise OpError("unsupported_entity",
+                      "sketch_mirror_entities: the mirror line must be a line entity",
+                      {"reason": f"mirror line is a '{axis.get('type')}'"})
+    A, B = axis["p1"], axis["p2"]
+
+    # Resolve + validate every selected entity FIRST (atomic: reject before any mutation).
+    sources: list[dict] = []
+    for e_id in eids:
+        if e_id == line_id:
+            raise _invalid(index, "sketch_mirror_entities: cannot mirror the mirror line itself")
+        ent = _find_entity(sk, e_id)
+        if ent is None:
+            raise _invalid(index, f"sketch_mirror_entities: entity '{e_id}' not found")
+        if ent.get("type") not in _MP_SUPPORTED:
+            raise OpError("unsupported_entity",
+                          f"op[{index}]: sketch_mirror_entities does not support entity type "
+                          f"'{ent.get('type')}'",
+                          {"index": index, "reason": f"unsupported entity '{ent.get('type')}'"})
+        sources.append(ent)
+
+    ents = _sketch_entities(sk)
+    cons = sk["params"].setdefault("constraints", [])
+    new_ids: list[str] = []
+    for ent in sources:
+        geom = _mirror_entity(ent, A, B)
+        neid = idgen.next("e")
+        new_ids.append(neid)
+        ents.append(_stamp_entity(geom, geom, neid, bool(ent.get("construction", False))))
+        # Symmetric relations: each original<->mirror point pair about the mirror line, plus an
+        # equal relation for the radius of circles/arcs (the symmetric pairs only tie positions).
+        pairs, needs_equal = _symmetric_pairs(ent["type"], ent["id"], neid)
+        for ha, hb in pairs:
+            cons.append({"id": idgen.next("c"), "type": "symmetric",
+                         "refs": [ha, hb, line_id]})
+        if needs_equal:
+            cons.append({"id": idgen.next("c"), "type": "equal",
+                         "refs": [ent["id"], neid]})
+
+    id_map[f"${index}"] = new_ids[0] if new_ids else ""
+    for k, neid in enumerate(new_ids[1:], start=1):
+        id_map[f"${index}#{k}"] = neid
+
+
+def _op_sketch_pattern_entities(doc, op, index, idgen, id_map):
+    """Linear or circular pattern of the selected entities. v1 copies are plain geometry (no
+    per-instance relations), like a SolidWorks geometry pattern. ``mode`` selects the kind."""
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    eids = op.get("entities")
+    if not (isinstance(eids, list) and eids):
+        raise _invalid(index, "sketch_pattern_entities requires a non-empty 'entities' id list")
+    mode = op.get("mode")
+    if mode not in ("linear", "circular"):
+        raise _invalid(index, "sketch_pattern_entities requires mode 'linear' or 'circular'")
+    count = op.get("count")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 2:
+        raise _invalid(index, "sketch_pattern_entities requires an integer 'count' >= 2")
+
+    # Resolve + validate the selection up front (atomic).
+    sources: list[dict] = []
+    for e_id in eids:
+        ent = _find_entity(sk, e_id)
+        if ent is None:
+            raise _invalid(index, f"sketch_pattern_entities: entity '{e_id}' not found")
+        if ent.get("type") not in _MP_SUPPORTED:
+            raise OpError("unsupported_entity",
+                          f"op[{index}]: sketch_pattern_entities does not support entity type "
+                          f"'{ent.get('type')}'",
+                          {"index": index, "reason": f"unsupported entity '{ent.get('type')}'"})
+        sources.append(ent)
+
+    # Build the per-step transform list (count-1 copies).
+    steps: list[tuple] = []  # ("t", dx, dy) | ("r", cx, cy, ang)
+    if mode == "linear":
+        d = op.get("dir")
+        if not (isinstance(d, list) and len(d) == 2
+                and all(isinstance(c, (int, float)) and not isinstance(c, bool) for c in d)):
+            raise _invalid(index, "sketch_pattern_entities (linear) requires 'dir': [dx, dy]")
+        spacing = op.get("spacing")
+        if not isinstance(spacing, (int, float)) or isinstance(spacing, bool):
+            raise _invalid(index, "sketch_pattern_entities (linear) requires a numeric 'spacing'")
+        import math as _m
+        nx, ny = float(d[0]), float(d[1])
+        L = _m.hypot(nx, ny)
+        if L < 1e-12:
+            raise _invalid(index, "sketch_pattern_entities (linear) 'dir' is zero-length")
+        nx, ny = nx / L, ny / L
+        for i in range(1, count):
+            steps.append(("t", nx * float(spacing) * i, ny * float(spacing) * i))
+    else:  # circular
+        center = op.get("center")
+        if not (isinstance(center, list) and len(center) == 2
+                and all(isinstance(c, (int, float)) and not isinstance(c, bool) for c in center)):
+            raise _invalid(index, "sketch_pattern_entities (circular) requires 'center': [x, y]")
+        angle = op.get("angle")
+        if not isinstance(angle, (int, float)) or isinstance(angle, bool):
+            raise _invalid(index, "sketch_pattern_entities (circular) requires a numeric 'angle'")
+        cx, cy = float(center[0]), float(center[1])
+        # equal_spacing: 'angle' is the TOTAL span shared equally (e.g. 360 for a full ring);
+        # otherwise 'angle' is the step BETWEEN consecutive instances.
+        equal = bool(op.get("equal_spacing", False))
+        step_ang = (float(angle) / count) if equal else float(angle)
+        for i in range(1, count):
+            steps.append(("r", cx, cy, step_ang * i))
+
+    ents = _sketch_entities(sk)
+    new_ids: list[str] = []
+    for tf in steps:
+        for ent in sources:
+            geom = _geom_view(ent)
+            if tf[0] == "t":
+                placed = _translate_entity(geom, tf[1], tf[2])
+            else:
+                placed = _rotate_entity(geom, tf[1], tf[2], tf[3])
+            neid = idgen.next("e")
+            new_ids.append(neid)
+            ents.append(_stamp_entity(placed, placed, neid,
+                                      bool(ent.get("construction", False))))
+
+    id_map[f"${index}"] = new_ids[0] if new_ids else ""
+    for k, neid in enumerate(new_ids[1:], start=1):
+        id_map[f"${index}#{k}"] = neid
+
+
+def _op_sketch_move(doc, op, index, idgen, id_map):
+    """Translate the selected entities by (dx, dy) — SolidWorks "Move/Copy Entities".
+
+    ``copy`` false (default): move IN PLACE — each entity's own geometry shifts by (dx, dy) and its
+    relations ride along (no new ids). ``copy`` true: the originals are left untouched and a single
+    translated copy of each is APPENDED (like a pattern with count=2, copies only). The plain
+    geometry copies carry no per-instance relations. Supported entity types: line, circle, arc."""
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    eids = op.get("entities")
+    if not (isinstance(eids, list) and eids):
+        raise _invalid(index, "sketch_move requires a non-empty 'entities' id list")
+    dx = op.get("dx")
+    dy = op.get("dy")
+    if not isinstance(dx, (int, float)) or isinstance(dx, bool):
+        raise _invalid(index, "sketch_move requires a numeric 'dx'")
+    if not isinstance(dy, (int, float)) or isinstance(dy, bool):
+        raise _invalid(index, "sketch_move requires a numeric 'dy'")
+    copy_flag = op.get("copy", False)
+    if not isinstance(copy_flag, bool):
+        raise _invalid(index, "sketch_move 'copy' must be a bool")
+
+    # Resolve + validate the selection up front (atomic: reject before any mutation).
+    sources: list[dict] = []
+    for e_id in eids:
+        ent = _find_entity(sk, e_id)
+        if ent is None:
+            raise _invalid(index, f"sketch_move: entity '{e_id}' not found")
+        if ent.get("type") not in _MP_SUPPORTED:
+            raise OpError("unsupported_entity",
+                          f"op[{index}]: sketch_move does not support entity type "
+                          f"'{ent.get('type')}'",
+                          {"index": index, "reason": f"unsupported entity '{ent.get('type')}'"})
+        sources.append(ent)
+
+    dxf, dyf = float(dx), float(dy)
+    if not copy_flag:
+        # In-place: shift each source entity's own geometry; constraints ride along untouched.
+        for ent in sources:
+            moved = _translate_entity(_geom_view(ent), dxf, dyf)
+            for k in moved:
+                ent[k] = moved[k]
+        id_map[f"${index}"] = sources[0]["id"] if sources else ""
+        return
+
+    # Copy: append one translated copy of each source (plain geometry, no relations).
+    ents = _sketch_entities(sk)
+    new_ids: list[str] = []
+    for ent in sources:
+        geom = _translate_entity(_geom_view(ent), dxf, dyf)
+        neid = idgen.next("e")
+        new_ids.append(neid)
+        ents.append(_stamp_entity(geom, geom, neid, bool(ent.get("construction", False))))
+
+    id_map[f"${index}"] = new_ids[0] if new_ids else ""
+    for k, neid in enumerate(new_ids[1:], start=1):
+        id_map[f"${index}#{k}"] = neid
+
+
+def _op_sketch_convert(doc, op, index, idgen, id_map):
+    """Project referenced model geometry (datum plane / planar face / model edge) onto the sketch
+    plane as real sketch entities (SolidWorks "Convert Entities"). Reuses session.sketch_project_ref
+    for the projection math, then appends each projected entity to the sketch. The projected geometry
+    is pinned with a whole-entity ``fix`` relation so it tracks the model (it is reference geometry,
+    not free sketch geometry)."""
+    from engine.doc import session as _sess
+
+    fid = _resolve_placeholder(op.get("sketch"), id_map, index)
+    sk = _find_sketch(doc, fid)
+    refs = op.get("refs")
+    if not (isinstance(refs, list) and refs):
+        raise _invalid(index, "sketch_convert requires a non-empty 'refs' list")
+
+    # sketch_project_ref needs a live DocSession to resolve the sketch plane + model topology. The
+    # op layer mutates a working copy of the doc; wrap it in a transient session so the projection
+    # sees the same geometry (it is read-only and never registered).
+    tmp = _sess.DocSession(doc_id="__convert_tmp__", doc=doc)
+    try:
+        projected = []
+        for i, ref in enumerate(refs):
+            res = _sess.sketch_project_ref(tmp, fid, ref)
+            projected.append(res["entity"])
+    except OpError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise OpError("convert_failed",
+                      f"op[{index}]: sketch_convert could not project a reference ({exc})",
+                      {"index": index, "reason": str(exc)})
+
+    ents = _sketch_entities(sk)
+    cons = sk["params"].setdefault("constraints", [])
+    new_ids: list[str] = []
+    for ent in projected:
+        if ent.get("type") == "point":
+            # A reference edge that projects to a single point — store it as a point entity.
+            geom = {"type": "point", "p": list(ent["p"])}
+        else:
+            geom = copy.deepcopy(ent)
+        neid = idgen.next("e")
+        new_ids.append(neid)
+        ents.append(_stamp_entity(geom, geom, neid, False))
+        # Pin the projected geometry whole (reference geometry tracks the model).
+        cons.append({"id": idgen.next("c"), "type": "fix", "refs": [neid]})
+
+    if not new_ids:
+        raise _invalid(index, "sketch_convert: nothing projected")
+    id_map[f"${index}"] = new_ids[0]
+    for k, neid in enumerate(new_ids[1:], start=1):
+        id_map[f"${index}#{k}"] = neid
+
+
 # ---- assembly ----
 
 
@@ -1016,9 +1539,12 @@ _OP_HANDLERS = {
     "sketch_trim": _op_sketch_trim,
     "sketch_extend": _op_sketch_extend,
     "sketch_offset": _op_sketch_offset,
-    "sketch_convert": _op_unsupported_m2,
-    "sketch_mirror_entities": _op_unsupported_m2,
-    "sketch_pattern_entities": _op_unsupported_m2,
+    "sketch_fillet": _op_sketch_fillet,
+    "sketch_chamfer": _op_sketch_chamfer,
+    "sketch_convert": _op_sketch_convert,                  # C53
+    "sketch_mirror_entities": _op_sketch_mirror_entities,  # C53
+    "sketch_pattern_entities": _op_sketch_pattern_entities,  # C53
+    "sketch_move": _op_sketch_move,                        # C54 (Move/Copy)
     "sketch_toggle_construction": _op_sketch_toggle_construction,  # C42
 }
 

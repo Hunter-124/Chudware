@@ -97,8 +97,12 @@ static const DimUnit kDimUnits[] = {
 
 // Tokenize a de-spaced, lowercased dim string. Returns false with err on a bad token.
 // unitCount/lastIsUnit report unit usage for the trailing-unit-applies-to-all rule.
+// bareLengthScale: canonical-mm value of one unit-less LENGTH literal (1.0 = MMGS, 25.4 = IPS).
+// A bare length literal (angle=false, no suffix) is scaled by it so "1.5" honours the doc unit;
+// literals with an explicit suffix and all angle values are unaffected.
 static bool dimTokenize(const std::string& s, bool angle, std::vector<DimTok>& out,
-                        int& unitCount, bool& endsWithUnit, std::string& err) {
+                        int& unitCount, bool& endsWithUnit, std::string& err,
+                        double bareLengthScale = 1.0) {
     unitCount = 0; endsWithUnit = false;
     size_t i = 0;
     while (i < s.size()) {
@@ -156,6 +160,9 @@ static bool dimTokenize(const std::string& s, bool angle, std::vector<DimTok>& o
                 i += n;
                 break;
             }
+            // Bare (unit-less) LENGTH literal: interpret in the document's active length unit
+            // (e.g. IPS -> a bare "1.5" is 1.5 in = 38.1 mm). Angles ignore this (degrees in both).
+            if (!t.hadUnit && !angle && bareLengthScale != 1.0) t.value *= bareLengthScale;
             endsWithUnit = t.hadUnit;
             out.push_back(t);
             continue;
@@ -212,7 +219,8 @@ struct DimEval {
 
 }  // namespace
 
-bool pmParseDim(const std::string& raw, double& outMm, std::string& err, bool angle) {
+bool pmParseDim(const std::string& raw, double& outMm, std::string& err, bool angle,
+                double bareLengthScale) {
     err.clear();
     std::string s;
     for (char c : raw) if (!std::isspace((unsigned char)c)) s += c;
@@ -240,9 +248,14 @@ bool pmParseDim(const std::string& raw, double& outMm, std::string& err, bool an
         }
     }
 
+    // When an explicit trailing unit governs the whole expression (wholeScale != 1.0), the bare
+    // literals that remain are scaled by that unit, NOT by the document default — so suppress the
+    // document bare-unit interpretation in that path.
+    const double bareScale = (wholeScale != 1.0) ? 1.0 : bareLengthScale;
+
     std::vector<DimTok> toks;
     int unitCount = 0; bool endsWithUnit = false;
-    if (!dimTokenize(s, angle, toks, unitCount, endsWithUnit, err)) return false;
+    if (!dimTokenize(s, angle, toks, unitCount, endsWithUnit, err, bareScale)) return false;
     if (toks.size() <= 1) { err = "empty"; return false; }
 
     DimEval ev{toks};
@@ -332,18 +345,29 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     if (checkpointId_.empty())
         st.addLog("[pm] checkpoint failed — Cancel will use undo loop fallback");
 
-    const bool useIps = false;  // M1: units display follows set_units; default MMGS.
+    ips_ = st.ips();   // document-unit display follows the active unit system (MMGS / IPS)
     fields_.clear();
     fields_.resize(form->fields.size());
     for (size_t i = 0; i < form->fields.size(); ++i)
-        initField(fields_[i], form->fields[i], useIps);
+        initField(fields_[i], form->fields[i], ips_);
 
-    // If a mode combo exists, preselect it from the command (boss/cut split button).
+    // If a mode/op combo exists, preselect it from the command (boss/cut split button; boolean
+    // combine/subtract/intersect). Match mode_ against the combo's option VALUES so any N-way combo
+    // works (not just boss/cut), falling back to index 0 (legacy "cut" -> 1).
     if (!mode_.empty()) {
         for (auto& f : fields_) {
-            if (f.def->kind == PMFieldKind::Combo && std::strcmp(f.def->key, "mode") == 0) {
-                f.comboIndex = (mode_ == "cut") ? 1 : 0;
+            if (f.def->kind != PMFieldKind::Combo) continue;
+            if (std::strcmp(f.def->key, "mode") != 0 && std::strcmp(f.def->key, "op") != 0) continue;
+            const std::string opts = f.def->comboOptions ? f.def->comboOptions : "";
+            int idx = -1, cur = 0; size_t start = 0;
+            while (start <= opts.size()) {
+                size_t bar = opts.find('|', start);
+                if (opts.substr(start, bar - start) == mode_) { idx = cur; break; }
+                ++cur;
+                if (bar == std::string::npos) break;
+                start = bar + 1;
             }
+            f.comboIndex = (idx >= 0) ? idx : ((mode_ == "cut") ? 1 : 0);
         }
     }
 
@@ -428,6 +452,31 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
         }
     }
 
+    // Weldments: seed the single "sketch" FeatureWell from a tree-selected SKETCH so a path picked
+    // before the command auto-fills (SolidWorks pre-select). Non-sketch selections are ignored —
+    // the user picks the path sketch in the FeatureManager then clicks "Add selected".
+    if (std::strcmp(form_->type, "weld_member") == 0) {
+        const std::string& sfid = st.selectedFeatureId;
+        if (!sfid.empty()) {
+            const nlohmann::json& tree = st.docMirror.tree();
+            std::string nm = sfid, ftype;
+            if (tree.is_object() && tree.contains("features") && tree["features"].is_array())
+                for (const auto& tf : tree["features"])
+                    if (tf.is_object() && tf.value("id", std::string()) == sfid) {
+                        nm = tf.value("name", sfid); ftype = tf.value("type", std::string()); break;
+                    }
+            if (ftype == "sketch")
+                for (auto& fld : fields_)
+                    if (fld.def->kind == PMFieldKind::FeatureWell &&
+                        std::strcmp(fld.def->key, "sketch") == 0) {
+                        PMSelEntry e; e.selector = sfid; e.label = nm;
+                        fld.picks.push_back(std::move(e));
+                        dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                        break;
+                    }
+        }
+    }
+
     st.addLog("[pm] open " + std::string(form_->type) +
               (mode_.empty() ? "" : " (" + mode_ + ")"));
     return true;
@@ -467,10 +516,11 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
     if (checkpointId_.empty())
         st.addLog("[pm] checkpoint failed — Cancel will use undo loop fallback");
 
+    ips_ = st.ips();   // document-unit display follows the active unit system (MMGS / IPS)
     fields_.clear();
     fields_.resize(form->fields.size());
     for (size_t i = 0; i < form->fields.size(); ++i)
-        initField(fields_[i], form->fields[i], false);
+        initField(fields_[i], form->fields[i], ips_);
 
     loadFromTree(st, *target);
     st.addLog("[pm] edit " + featureId + " (" + type + ")");
@@ -495,7 +545,7 @@ void PropertyManager::loadFromTree(AppState& st, const nlohmann::json& feature) 
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                     } else if (d.contains("value") && d["value"].is_number()) {
                         f.dimValue = d["value"].get<double>();
-                        std::string disp = pmFormatDim(f.dimValue, false);
+                        std::string disp = pmFormatDim(f.dimValue, ips_);
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                     }
                 }
@@ -552,15 +602,18 @@ void PropertyManager::loadFromTree(AppState& st, const nlohmann::json& feature) 
             }
             case PMFieldKind::FeatureWell: {
                 f.picks.clear();
-                if (refs.contains(key) && refs[key].is_array()) {
-                    const nlohmann::json& tree = feature;  // names resolved below from the doc tree
-                    (void)tree;
-                    for (const auto& s : refs[key]) {
-                        if (!s.is_string()) continue;
-                        std::string fid = s.get<std::string>();
-                        PMSelEntry e; e.selector = fid; e.label = fid;
-                        f.picks.push_back(std::move(e));
-                    }
+                // Multi wells (mirror/pattern) store an array of ids; a single-emit well
+                // (FeatWell1, e.g. weld_member.sketch) stores a bare id string. Accept both on
+                // the edit path so the well re-populates.
+                auto addFid = [&](const nlohmann::json& s) {
+                    if (!s.is_string()) return;
+                    std::string fid = s.get<std::string>();
+                    PMSelEntry e; e.selector = fid; e.label = fid;
+                    f.picks.push_back(std::move(e));
+                };
+                if (refs.contains(key)) {
+                    if (refs[key].is_array()) for (const auto& s : refs[key]) addFid(s);
+                    else addFid(refs[key]);
                 }
                 break;
             }
@@ -636,19 +689,33 @@ std::vector<PMCalloutItem> PropertyManager::calloutItems(AppState& st) const {
         }
     }
 
-    const bool useIps = false;  // M1 default MMGS (mirrors draw())
     for (const auto& f : fields_) {
         if (f.def->kind != PMFieldKind::Dim) continue;
         if (!fieldEnabled(*f.def, fields_)) continue;   // skip greyed / coming-soon dims
         PMCalloutItem it;
         it.label = f.def->label;
-        it.value = f.dimExpr.empty() ? pmFormatDim(f.dimValue, useIps)
+        it.value = f.dimExpr.empty() ? pmFormatDim(f.dimValue, ips_)
                                      : ("=" + f.dimExpr);
         it.hasAnchor = hasAnchor;
         if (hasAnchor) { it.anchor[0] = anchor[0]; it.anchor[1] = anchor[1]; it.anchor[2] = anchor[2]; }
         out.push_back(std::move(it));
     }
     return out;
+}
+
+// Live unit-toggle support: rewrite each non-expr Dim field's display buffer from its canonical
+// mm dimValue using the current ips_. Expr-bound fields keep their "=expr" text untouched; the
+// stored canonical value is never changed, so flipping units is purely cosmetic.
+void PropertyManager::reformatDimDisplays() {
+    for (auto& f : fields_) {
+        if (!f.def || f.def->kind != PMFieldKind::Dim) continue;
+        if (!f.dimExpr.empty()) continue;          // expr binding shown as "=expr"; leave it
+        if (f.def->unitLabel && f.def->unitLabel[0] == '\0') continue;  // unit-less field
+        if (f.def->unitLabel && std::strstr(f.def->unitLabel, "deg")) continue;  // angle: degrees both
+        std::string disp = pmFormatDim(f.dimValue, ips_);
+        std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
+        f.dimError.clear();
+    }
 }
 
 void PropertyManager::close() {
@@ -685,6 +752,9 @@ bool PropertyManager::routePick(const nlohmann::json& selector, int pickKind) {
     bool allowed = (k == render::PickKind::Face   && ak.face) ||
                    (k == render::PickKind::Edge   && ak.edge) ||
                    (k == render::PickKind::Vertex && ak.vertex);
+    // Body wells (boolean): the selection observer resolved a body selector (kind="body") from
+    // whatever element was clicked — accept it regardless of the underlying pick kind.
+    if (!allowed && ak.body && selector.value("kind", std::string()) == "body") allowed = true;
     if (!allowed) return false;
 
     // De-dup by hint_index + centroid (same element picked twice toggles off — SolidWorks).
@@ -712,6 +782,32 @@ bool PropertyManager::routePick(const nlohmann::json& selector, int pickKind) {
     well->wellDangling = false;
     dirty_ = true; lastEditTime_ = ImGui::GetTime();
     return true;
+}
+
+bool PropertyManager::activeWellWantsBody() const {
+    for (const auto& f : fields_)
+        if (f.def->kind == PMFieldKind::SelectorWell && f.wellActive)
+            return f.def->selKinds.body;
+    return false;
+}
+
+std::string PropertyManager::activeWellKindHint() const {
+    for (const auto& f : fields_) {
+        if (f.def->kind != PMFieldKind::SelectorWell || !f.wellActive) continue;
+        const PMSelKinds& k = f.def->selKinds;
+        std::vector<const char*> parts;
+        if (k.face)   parts.push_back("faces");
+        if (k.edge)   parts.push_back("edges");
+        if (k.vertex) parts.push_back("vertices");
+        if (k.body)   parts.push_back("bodies");
+        std::string s;
+        for (size_t i = 0; i < parts.size(); ++i) {
+            if (i) s += (i + 1 == parts.size()) ? " or " : ", ";
+            s += parts[i];
+        }
+        return s;
+    }
+    return "";
 }
 
 // ---- C51: sketched-feature region picking ---------------------------------
@@ -871,12 +967,19 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
                 break;
             }
             case PMFieldKind::FeatureWell: {
-                // Each pick's selector is a bare feature-id string; emit a _FEAT_LIST array. Omit the
-                // ref entirely when empty (mirror reads an absent list as a whole-body mirror).
+                // Each pick's selector is a bare feature-id string. selMulti (default) emits a
+                // _FEAT_LIST array (mirror/pattern). selMulti=false (FeatWell1) is SINGLE-EMIT:
+                // refs[key] = the bare id string (weld_member's path sketch wants one id, not an
+                // array). Omit the ref entirely when empty (mirror reads an absent list as a
+                // whole-body mirror; weld_member then dangles until a sketch is picked).
                 if (!f.picks.empty()) {
-                    nlohmann::json arr = nlohmann::json::array();
-                    for (const auto& p : f.picks) arr.push_back(p.selector);
-                    refs[key] = arr;
+                    if (f.def->selMulti) {
+                        nlohmann::json arr = nlohmann::json::array();
+                        for (const auto& p : f.picks) arr.push_back(p.selector);
+                        refs[key] = arr;
+                    } else {
+                        refs[key] = f.picks.front().selector;
+                    }
                 }
                 break;
             }
@@ -896,6 +999,10 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
     // feature list is a valid whole-body mirror.
     if (t == "mirror") return true;
 
+    // Split is ready as soon as it opens — the tool is a DatumRef (always set; an optional face pick
+    // overrides it). The engine errors cleanly if the chosen plane misses the part.
+    if (t == "split") return true;
+
     // Loft needs at least TWO section profiles before a preview is meaningful.
     if (t == "loft") {
         for (const auto& f : fields)
@@ -913,6 +1020,17 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
     else if (t == "hole") needWell = "face";
     else if (t == "draft") needWell = "faces";
     else if (t == "linear_pattern" || t == "circular_pattern") needWell = "features";
+    else if (t == "weld_member") needWell = "sketch";  // FeatureWell: path sketch must be picked
+    else if (t == "weld_gusset") needWell = "faces";   // two member faces forming the corner
+    else if (t == "weld_end_cap") needWell = "face";   // one member end face to close
+    else if (t == "boolean") needWell = "targets";   // need at least one target body
+    else if (t == "sm_base_flange") needWell = "profile";  // sheet-metal base needs a sketch region
+    else if (t == "sm_edge_flange") needWell = "edge";     // sheet-metal edge flange needs a bend edge
+    else if (t == "sm_hem")         needWell = "edge";     // hem needs a bend edge
+    else if (t == "sm_jog")         needWell = "edge";     // jog needs a bend edge
+    else if (t == "axis")    needWell = "a";          // datum axis primary reference
+    else if (t == "point")   needWell = "target";     // datum point reference
+    else if (t == "rib")     needWell = "profile";    // rib needs an open-contour sketch profile
     if (needWell) {
         for (const auto& f : fields)
             if ((f.def->kind == PMFieldKind::SelectorWell || f.def->kind == PMFieldKind::FeatureWell)
@@ -1082,6 +1200,11 @@ static const char* formDescription(const char* type) {
 void PropertyManager::draw(AppState& st) {
     if (!active_) return;
 
+    // Live unit-system toggle: if the document units changed while this form is open (e.g. the
+    // user clicked the status-bar MMGS/IPS cluster), reformat every open Dim field's DISPLAY from
+    // its canonical mm value. The stored value is unchanged — purely a display reformat.
+    if (st.ips() != ips_) { ips_ = st.ips(); reformatDimDisplays(); }
+
     // C37-F: Floating fallback — if the FeatureManager dock window isn't visible this frame
     // (dock closed or un-docked and minimised), draw the PM as an independent floating window
     // so it can never be invisibly active and trap keyboard/pick input.
@@ -1226,7 +1349,7 @@ void PropertyManager::draw(AppState& st) {
     // ---- field rows grouped by `group`, collapsible ------------------------
     const char* curGroup = nullptr;
     bool groupOpen = true;
-    bool useIps = false;   // M1 default MMGS
+    const bool useIps = ips_;   // document-unit display (set at open; re-synced above on toggle)
 
     // C37-F: track which Dim field is first/editable for SetKeyboardFocusHere.
     bool firstEditableDimSeen = false;
@@ -1323,7 +1446,13 @@ void PropertyManager::draw(AppState& st) {
                     } else {
                         double mm;
                         std::string err;
-                        if (pmParseDim(txt, mm, err)) {
+                        // A bare (unit-less) number follows the document length unit: mm in MMGS,
+                        // inch in IPS. Angle fields ([deg]) stay degrees in both systems, so they
+                        // keep the unit-less default scale. (angle stays false as before so an
+                        // explicit length suffix on any field still parses — existing behavior.)
+                        const bool isAngle = f.def->unitLabel && std::strstr(f.def->unitLabel, "deg");
+                        const double bareScale = (useIps && !isAngle) ? 25.4 : 1.0;
+                        if (pmParseDim(txt, mm, err, /*angle=*/false, bareScale)) {
                             f.dimValue = mm; f.dimExpr.clear(); f.dimError.clear();
                             dirty_ = true; lastEditTime_ = ImGui::GetTime();
                         } else {
@@ -1510,6 +1639,7 @@ void PropertyManager::draw(AppState& st) {
                 pushTextColor(pal.textDim);
                 ImGui::TextUnformatted(f.def->label);
                 ImGui::PopStyleColor();
+                const bool single = !f.def->selMulti;   // FeatWell1: holds exactly one feature id
                 std::string chip;
                 if (f.picks.empty()) chip = "(select a feature in the tree, then Add)";
                 else for (size_t k = 0; k < f.picks.size(); ++k) {
@@ -1519,7 +1649,8 @@ void PropertyManager::draw(AppState& st) {
                 ImGui::PushTextWrapPos(0.0f);
                 ImGui::TextUnformatted(chip.c_str());
                 ImGui::PopTextWrapPos();
-                // Add the currently tree-selected feature to the list.
+                // Add the currently tree-selected feature to the list. A single-emit well
+                // (selMulti=false) replaces its one pick instead of appending.
                 if (ImGui::SmallButton("Add selected")) {
                     const std::string& fid = st.selectedFeatureId;
                     if (!fid.empty()) {
@@ -1535,6 +1666,7 @@ void PropertyManager::draw(AppState& st) {
                                     if (tf.is_object() && tf.value("id", std::string()) == fid) {
                                         nm = tf.value("name", fid); break;
                                     }
+                            if (single) f.picks.clear();   // single well holds one id only
                             PMSelEntry e; e.selector = fid; e.label = nm;
                             f.picks.push_back(std::move(e));
                             dirty_ = true; lastEditTime_ = ImGui::GetTime();

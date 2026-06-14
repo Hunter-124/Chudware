@@ -80,6 +80,29 @@ def _bbox_diag(body) -> float:
         return 100.0
 
 
+def _describe_pool(kind: str, pool) -> list:
+    """One ``TopoInfo`` per *deduplicated* topology entity, index-aligned to *pool*.
+
+    A whole-shape ``describe_*`` walks raw ``TopExp`` occurrences, so a shared edge/vertex appears
+    multiple times (a box has 24 edge-occurrences for 12 edges, 48 vertices for 8). Those duplicates
+    score identically and dangle as "symmetric ambiguity". Describing each ``body.edges()`` /
+    ``body.vertices()`` entity individually yields one info per pickable entity whose list index
+    matches the pool, so ``resolve`` returns a usable index.
+    """
+    describer = {"face": describe_faces, "edge": describe_edges,
+                 "vertex": describe_vertices}[kind]
+    infos = []
+    for i, ent in enumerate(pool):
+        sub = describer(ent.wrapped)
+        if not sub:
+            continue
+        info = sub[0]
+        info.index = i
+        info.hint_index = i
+        infos.append(info)
+    return infos
+
+
 def _resolve_sel(sel: dict, body, kind: str, slot: str):
     """Resolve a face/edge/vertex selector to its build123d entity on *body*.
 
@@ -89,15 +112,8 @@ def _resolve_sel(sel: dict, body, kind: str, slot: str):
     """
     if not isinstance(sel, dict):
         raise FeatureError(f"{slot}: expected a {kind} selector, got {sel!r}")
-    if kind == "face":
-        infos = describe_faces(body.wrapped)
-        pool = body.faces()
-    elif kind == "edge":
-        infos = describe_edges(body.wrapped)
-        pool = body.edges()
-    else:
-        infos = describe_vertices(body.wrapped)
-        pool = body.vertices()
+    pool = {"face": body.faces, "edge": body.edges, "vertex": body.vertices}[kind]()
+    infos = _describe_pool(kind, pool)
 
     rr: ResolveResult = resolve(sel, infos, _bbox_diag(body))
     if rr.index is None:

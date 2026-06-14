@@ -289,10 +289,20 @@ configurable in UI; multi-plane caps render correctly with occlusion.
 
 ## 6. Feature tiers (the scope contract — anything not V1/S is a no without re-planning)
 
+> **SCOPE EXPANSION — C52+ overhaul (DELIVERED, 2026-06-12/13).** The user expanded V1 scope.
+> Now delivered beyond the original tiers: **Instant3D** (face push-pull + dimension-handle drag),
+> and the four big modules **Drawings** (HLR views, dimensions, BOM, DXF/PDF export),
+> **Sheet Metal** (base/edge flange + real bend allowance, flat-pattern unfold, flat DXF),
+> **Weldments** (structural members + mitre trim + cut list), **Configurations** (per-config param
+> overrides + suppression + design-table grid). Two additive doc-schema bumps: `aicad.drawing/1`
+> (new kind) and the optional `configurations[]` fields (byte-identical for config-less docs).
+> Still STRETCH/deferred: sheet-metal jog/hem/tab, weldment gusset/end-cap, pattern edge/cyl-axis
+> pickers, drawing `.step+` persistence, per-config mate values.
+
 - **Features tab V1**: extrude boss/cut, revolve, sweep, loft, fillet, chamfer, shell, draft,
   hole wizard, linear/circular pattern, mirror, ref plane/axis/point/CS, helix, combine/subtract/
-  intersect. **S**: boundary, rib, split, variable fillet, wrap-as-emboss. **Skip**: Instant3D,
-  advanced hole.
+  intersect. **S**: boundary, rib, split, variable fillet, wrap-as-emboss. **DELIVERED (C52+)**:
+  Instant3D (push-pull + dim-handle drag). **Skip**: advanced hole.
 - **Sketch tab V1**: full entity + relation + dimension set listed in M2, construction toggle,
   trim/extend/offset/convert/mirror/patterns/move-copy. **S**: text, perimeter circle.
 - **Assembly V1**: insert, 8 mate types, move/rotate, component patterns, interference, exploded

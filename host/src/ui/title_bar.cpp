@@ -102,6 +102,13 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
         // the task pane the first time they open (DockBuilderDockWindow matches by name).
         "Mass Properties", "Measure", "Section Properties", "Geometry Check", "Symmetry Check",
         "Zebra Stripes", "Draft angle", "Wall thickness", "Mean curvature",
+        // Configurations (SolidWorks ConfigurationManager) — lands in the task pane the first time
+        // it's toggled on so it surfaces as a tab rather than floating over the viewport.
+        "Configurations",
+        // Design Table — same task-pane slot so the editable config grid surfaces as a tab.
+        "Design Table",
+        // Weldment Cut List — same task-pane slot so it surfaces as a tab when toggled on.
+        "Cut List",
     };
     for (const char* d : dialogs) ImGui::DockBuilderDockWindow(d, rightBottom);
 
@@ -170,6 +177,9 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         auto drawViewMenu = [&]() {
             ImGui::MenuItem("Ribbon", nullptr, &st.showRibbon);
             ImGui::MenuItem("FeatureManager", nullptr, &st.showFeatureTree);
+            ImGui::MenuItem("Configurations", nullptr, &st.showConfigPanel);
+            ImGui::MenuItem("Design Table", nullptr, &st.showDesignTablePanel);
+            ImGui::MenuItem("Cut List", nullptr, &st.showCutListPanel);
             ImGui::MenuItem("AI Panel", nullptr, &st.showAIPanel);
             ImGui::MenuItem("Viewport", nullptr, &st.showViewport);
             ImGui::Separator();

@@ -68,6 +68,13 @@ add_executable(AI-CAD
   src/ui/feature_tree.cpp
   src/ui/file_dialog.cpp   # C41: native Win32 Save/Open dialogs
   # --- end C16 ---
+  # --- document tabs (multi-document strip + per-tab switching) ---
+  src/core/doc_tabs.cpp
+  src/ui/doc_tabs.cpp
+  # --- end document tabs ---
+  # --- DRAWINGS module: 2D sheet renderer for Drawing tabs ---
+  src/ui/drawing_panel.cpp
+  # --- end DRAWINGS ---
   # --- C39: async worker dispatch (per-frame drained callbacks on the GL thread) ---
   src/core/async_rpc.cpp
   # --- end C39 ---
@@ -78,6 +85,15 @@ add_executable(AI-CAD
   # --- C18: sketch mode UI ---
   src/ui/sketch_mode.cpp
   # --- end C18 ---
+  # --- Configurations panel (SolidWorks ConfigurationManager) ---
+  src/ui/config_panel.cpp
+  # --- end Configurations ---
+  # --- Design Table panel (SolidWorks editable config grid) ---
+  src/ui/design_table_panel.cpp
+  # --- end Design Table ---
+  # --- Weldment Cut List panel (SolidWorks Weldment Cut List) ---
+  src/ui/cutlist_panel.cpp
+  # --- end Cut List ---
   # --- C19: simulation + flow + evaluate UI ---
   src/core/sim_client.cpp
   src/ui/sim_panel.cpp

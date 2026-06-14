@@ -920,6 +920,22 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sk_extend")          { resetTool(); tool_ = SketchTool::Extend;         return true; }
     if (cmdId == "sk_offset_ent")      { resetTool(); tool_ = SketchTool::Offset;
                                          offsetStage_ = 0; offsetChain_.clear();           return true; }
+    // C52: line-line corner fillet / chamfer (radius/distance persist across invocations).
+    if (cmdId == "sk_fillet")          { resetTool(); tool_ = SketchTool::SkFillet;  corner1Id_.clear(); return true; }
+    if (cmdId == "sk_chamfer")         { resetTool(); tool_ = SketchTool::SkChamfer; corner1Id_.clear(); return true; }
+    // C53: mirror / linear+circular pattern / convert (numeric dims persist across invocations).
+    if (cmdId == "sk_mirror")          { resetTool(); tool_ = SketchTool::Mirror;
+                                         mpStage_ = 0; mpSel_.clear();                     return true; }
+    if (cmdId == "sk_lin_pattern")     { resetTool(); tool_ = SketchTool::LinPattern;
+                                         mpStage_ = 0; mpSel_.clear();                     return true; }
+    if (cmdId == "sk_circ_pattern")    { resetTool(); tool_ = SketchTool::CircPattern;
+                                         mpStage_ = 0; mpSel_.clear();                     return true; }
+    if (cmdId == "sk_convert_ent")     { resetTool(); tool_ = SketchTool::Convert;         return true; }
+    // C54: Move/Copy entities (engine op sketch_move) — reuses the mirror/pattern selection stage.
+    if (cmdId == "sk_move")            { resetTool(); tool_ = SketchTool::Move;
+                                         mpStage_ = 0; mpSel_.clear(); moveCopy_ = false;   return true; }
+    // C54: Tangent Arc — draws an arc starting tangent to a prior/selected entity's free endpoint.
+    if (cmdId == "sk_arc_tangent")     { resetTool(); tool_ = SketchTool::ArcTangent;      return true; }
     // C42: remaining draw tools.
     if (cmdId == "sk_arc_3pt")         { resetTool(); tool_ = SketchTool::Arc3pt;         return true; }
     if (cmdId == "sk_polygon")         { resetTool(); tool_ = SketchTool::Polygon;        return true; }
@@ -929,6 +945,15 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
         resetTool(); tool_ = SketchTool::Ellipse; return true;
     }
     if (cmdId == "sk_spline")          { resetTool(); tool_ = SketchTool::Spline;         return true; }
+    // Style Spline — click-collect control poles (same UX as Spline); emits "style_spline".
+    if (cmdId == "sk_spline_style")    { resetTool(); tool_ = SketchTool::StyleSpline;    return true; }
+    // Sketch Text — arm a one-click placement; the click opens the text popup (string + height).
+    if (cmdId == "sk_text")            { resetTool(); tool_ = SketchTool::Text;
+                                         textPopupOpen_ = false;                           return true; }
+    // Equation-Driven Curve — no viewport pick; open the x(t)/y(t)/range popup right away.
+    if (cmdId == "sk_spline_equation") { resetTool(); tool_ = SketchTool::EqCurve;
+                                         eqPopupOpen_ = true; eqPopupPos_ = ImGui::GetMousePos();
+                                         eqFocus_ = true;                                  return true; }
     // C42: Construction — immediate toggle on the current selection (engine op
     // sketch_toggle_construction). Not a tool: the selection survives (entity ids persist).
     if (cmdId == "sk_construction") {
@@ -960,6 +985,23 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
         relPopupPos_ = ImGui::GetMousePos();
         return true;
     }
+    if (cmdId == "sk_fix") {
+        // SolidWorks "Fix" relation as a one-click ribbon button: pin every selected entity/point
+        // (the engine `fix` constraint zeroes that entity's DOF — sketch_solver.py). This is the
+        // direct shortcut for the Fix that already lives in the Add-Relation popup; it routes
+        // through addRelationOps so an over-defining Fix surfaces the same "Over Defined" prompt.
+        if (selIds_.empty()) {
+            st.toast(ui::ToastLevel::Info, "Fix: select sketch entities or points first");
+            return true;
+        }
+        relPopupPos_ = ImGui::GetMousePos();   // anchor the over-def prompt at the cursor
+        nlohmann::json ops = nlohmann::json::array();
+        for (const auto& h : selIds_)
+            ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
+                {"constraint", {{"type", "fix"}, {"refs", nlohmann::json::array({h})}}}});
+        addRelationOps(st, ops, "Fix");
+        return true;
+    }
     return false;
 }
 
@@ -986,12 +1028,23 @@ const char* SketchMode::activeToolCmd() const {
         case SketchTool::Trim:            return "sk_trim";
         case SketchTool::Extend:          return "sk_extend";
         case SketchTool::Offset:          return "sk_offset_ent";
+        case SketchTool::SkFillet:        return "sk_fillet";
+        case SketchTool::SkChamfer:       return "sk_chamfer";
+        case SketchTool::Mirror:          return "sk_mirror";
+        case SketchTool::LinPattern:      return "sk_lin_pattern";
+        case SketchTool::CircPattern:     return "sk_circ_pattern";
+        case SketchTool::Convert:         return "sk_convert_ent";
+        case SketchTool::Move:            return "sk_move";
+        case SketchTool::ArcTangent:      return "sk_arc_tangent";
         case SketchTool::Arc3pt:          return "sk_arc_3pt";
         case SketchTool::Polygon:         return "sk_polygon";
         case SketchTool::RectCenter:      return "sk_rect_center";
         case SketchTool::Point:           return "sk_point";
         case SketchTool::Ellipse:         return "sk_ellipse_big";
         case SketchTool::Spline:          return "sk_spline";
+        case SketchTool::StyleSpline:     return "sk_spline_style";
+        case SketchTool::Text:            return "sk_text";
+        case SketchTool::EqCurve:         return "sk_spline_equation";
         default:                          return "";
     }
 }
@@ -1010,14 +1063,353 @@ void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSn
                                selRelIds_.clear(); hoverRelCid_.clear();
                                relPopupOpen_ = false; relIds_.clear();   // C42: relation popup too
                                offsetStage_ = 0; offsetChain_.clear(); offsetFocusInput_ = false;
+                               corner1Id_.clear();   // C52: drop a held first corner pick (keep radius/distance)
+                               mpStage_ = 0; mpSel_.clear();   // C53: drop mirror/pattern selection (keep dims)
                                // C37-D: clear the Smart Dimension state machine.
                                dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr;
                                dimType_.clear(); dimAxis_.clear(); dimEditCid_.clear();
                                dimPopupOpen_ = false; dimError_.clear(); dimPopupDriven_ = false;
                                overDefOpen_ = false; overDefPendingCon_ = nullptr;   // C50f: add-path over-define dialog
                                editOverDefOpen_ = false; editOverDefOp_ = nullptr;   // C50f: edit-path over-define dialog
-                               relOverDefOpen_ = false; relOverDefOps_ = nullptr; relOverDefLabel_.clear(); }   // C50g
+                               relOverDefOpen_ = false; relOverDefOps_ = nullptr; relOverDefLabel_.clear();   // C50g
+                               textPopupOpen_ = false; textFocus_ = false;          // Sketch Text popup
+                               eqPopupOpen_ = false; eqFocus_ = false; }            // Eq-Driven Curve popup
 void SketchMode::cancelTool() { resetTool(); }
+
+// ---------------------------------------------------------------------------
+// Sketch Text + Equation-Driven Curve parameter popups (engine entities text / eq_curve)
+// ---------------------------------------------------------------------------
+
+// Sketch Text: a small borderless popup (mirrors the Add-Relation popup) collecting the string +
+// cap height for a "text" entity placed at the click-captured lower-left anchor (textAnchorUV_).
+// OK emits {"type":"text","construction":false,"p":[u,v],"text":...,"height":...} (font omitted ->
+// engine default, safer cross-machine). Empty text disables OK. Esc/Cancel closes; the tool stays
+// armed for another placement.
+void SketchMode::drawTextPopup(AppState& st, bool& escHandled) {
+    if (!textPopupOpen_) return;
+    const auto& pal = ui::palette;
+    ImGui::SetNextWindowPos(textPopupPos_, ImGuiCond_Appearing);
+    ImGui::SetNextWindowBgAlpha(0.98f);
+    if (ImGui::Begin("##SketchText", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
+        ImGui::TextUnformatted("Sketch Text");
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+        ImGui::TextUnformatted("Text");
+        ImGui::SetNextItemWidth(220);
+        if (textFocus_) { ImGui::SetKeyboardFocusHere(); textFocus_ = false; }
+        bool enter = ImGui::InputText("##textstr", textBuf_, sizeof(textBuf_),
+                                      ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SetNextItemWidth(120);
+        ImGui::InputFloat("Height (mm)", &textHeight_, 1.0f, 5.0f, "%.3f");
+        if (textHeight_ < 0.001f) textHeight_ = 0.001f;   // engine requires height > 0
+        ImGui::Separator();
+        const bool empty = (textBuf_[0] == '\0');
+        ImGui::BeginDisabled(empty);
+        bool ok = ImGui::Button("OK") || (enter && !empty);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        bool escPressed = ImGui::IsKeyPressed(ImGuiKey_Escape);
+        bool cancel = ImGui::Button("Cancel") || escPressed;
+        if (escPressed) escHandled = true;   // suppress the catch-all Esc (it would resetTool)
+        if (empty && enter)
+            st.toast(ui::ToastLevel::Info, "Text: enter a non-empty string");
+        if (ok && !empty) {
+            nlohmann::json ent = {{"type", "text"}, {"construction", false},
+                {"p", nlohmann::json::array({textAnchorUV_.x, textAnchorUV_.y})},
+                {"text", std::string(textBuf_)},
+                {"height", (double)textHeight_}};
+            addEntity(st, ent, nlohmann::json::array());
+            textPopupOpen_ = false;
+            resetTool(); tool_ = SketchTool::Text;   // stay armed for another placement (one-shot)
+        } else if (cancel) {
+            textPopupOpen_ = false;
+            // keep the tool armed so the next click can place again
+        }
+    }
+    ImGui::End();
+}
+
+// Equation-Driven Curve: a borderless popup collecting x(t)/y(t) expression strings + the t range
+// for an "eq_curve" entity (origin-relative; no viewport pick). OK emits
+// {"type":"eq_curve","construction":false,"xt":...,"yt":...,"t1":...,"t2":...}. Preset buttons fill
+// the fields with a circle / sine wave. A closed curve (cos/sin over 0..2pi) extrudes as a region.
+void SketchMode::drawEqCurvePopup(AppState& st, bool& escHandled) {
+    if (!eqPopupOpen_) return;
+    const auto& pal = ui::palette;
+    ImGui::SetNextWindowPos(eqPopupPos_, ImGuiCond_Appearing);
+    ImGui::SetNextWindowBgAlpha(0.98f);
+    if (ImGui::Begin("##SketchEqCurve", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
+        ImGui::TextUnformatted("Equation Driven Curve");
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+        // Presets fill the expression fields (parameter t in radians).
+        if (ImGui::SmallButton("Circle")) {
+            std::snprintf(eqXt_, sizeof(eqXt_), "5*cos(t)");
+            std::snprintf(eqYt_, sizeof(eqYt_), "5*sin(t)");
+            eqT1_ = 0.0f; eqT2_ = 6.2831853f;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Sine wave")) {
+            std::snprintf(eqXt_, sizeof(eqXt_), "t");
+            std::snprintf(eqYt_, sizeof(eqYt_), "5*sin(t)");
+            eqT1_ = 0.0f; eqT2_ = 6.2831853f;
+        }
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(220);
+        if (eqFocus_) { ImGui::SetKeyboardFocusHere(); eqFocus_ = false; }
+        ImGui::InputText("x(t)", eqXt_, sizeof(eqXt_));
+        ImGui::SetNextItemWidth(220);
+        ImGui::InputText("y(t)", eqYt_, sizeof(eqYt_));
+        ImGui::SetNextItemWidth(120);
+        ImGui::InputFloat("t start", &eqT1_, 0.0f, 0.0f, "%.6f");
+        ImGui::SetNextItemWidth(120);
+        ImGui::InputFloat("t end (rad)", &eqT2_, 0.0f, 0.0f, "%.6f");
+        ImGui::Separator();
+        const bool empty = (eqXt_[0] == '\0' || eqYt_[0] == '\0');
+        const bool badRange = (eqT2_ == eqT1_);
+        ImGui::BeginDisabled(empty || badRange);
+        bool ok = ImGui::Button("OK");
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        bool escPressed = ImGui::IsKeyPressed(ImGuiKey_Escape);
+        bool cancel = ImGui::Button("Cancel") || escPressed;
+        if (escPressed) escHandled = true;   // suppress the catch-all Esc (it would also resetTool)
+        if (ok && !empty && !badRange) {
+            nlohmann::json ent = {{"type", "eq_curve"}, {"construction", false},
+                {"xt", std::string(eqXt_)}, {"yt", std::string(eqYt_)},
+                {"t1", (double)eqT1_}, {"t2", (double)eqT2_}};
+            addEntity(st, ent, nlohmann::json::array());
+            eqPopupOpen_ = false;
+            resetTool();   // one entity per invocation, like Polygon/Ellipse
+        } else if (cancel) {
+            eqPopupOpen_ = false;
+            resetTool();
+        }
+    }
+    ImGui::End();
+}
+
+// C52: apply one sketch_fillet / sketch_chamfer op for the held corner (e1=corner1Id_, e2=line2).
+// The engine round-trips like every other sketch-editing op (applyOps -> loadDocMesh -> resolve).
+// On an OpError (unsupported_entity / fillet_failed / chamfer_failed / invalid_op) the sketch is
+// NOT mutated; we toast the engine message and reset the first pick so the user starts a fresh
+// pair. On success the new arc/line appears and the sketch re-solves; we stay armed for the next
+// corner (SolidWorks keeps filleting until Esc).
+void SketchMode::applyCornerOp(AppState& st, const std::string& line2) {
+    const bool fillet = (tool_ == SketchTool::SkFillet);
+    nlohmann::json op = {{"op", fillet ? "sketch_fillet" : "sketch_chamfer"},
+                         {"sketch", fid_}, {"e1", corner1Id_}, {"e2", line2}};
+    if (fillet) op["radius"]   = skFilletRadius_;
+    else        op["distance"] = skChamferDist_;
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (!r.ok) {
+        // Engine refused (bad corner / unsupported entity): surface the message, keep tool armed.
+        std::string msg = r.error_message.empty()
+            ? std::string(fillet ? "Sketch fillet failed" : "Sketch chamfer failed")
+            : r.error_message;
+        st.addLog(std::string("[sketch] ") + (fillet ? "fillet" : "chamfer") + " failed: " + msg);
+        st.toast(ui::ToastLevel::Warn, msg);
+        corner1Id_.clear();   // start a fresh pair (match Offset's reset-on-error UX)
+        return;
+    }
+    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    resolve(st);              // refresh entities/statuses (same path as trim/extend/offset)
+    corner1Id_.clear();       // ready for the next corner; stay in the tool
+}
+
+// C53: apply sketch_mirror_entities (entities=mpSel_, line=lineId) and refresh. On engine OpError
+// the message is toasted and the selection is reset (SolidWorks lets you start a fresh mirror).
+void SketchMode::applyMirrorOp(AppState& st, const std::string& lineId) {
+    nlohmann::json eids = nlohmann::json::array();
+    for (const auto& id : mpSel_) eids.push_back(id);
+    nlohmann::json op = {{"op", "sketch_mirror_entities"}, {"sketch", fid_},
+                         {"entities", eids}, {"line", lineId}};
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (!r.ok) {
+        std::string msg = r.error_message.empty() ? std::string("Mirror failed") : r.error_message;
+        st.addLog("[sketch] mirror failed: " + msg);
+        st.toast(ui::ToastLevel::Warn, msg);
+    } else {
+        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        resolve(st);
+    }
+    mpStage_ = 0; mpSel_.clear();   // stay in the tool, ready for another mirror
+}
+
+// C53: apply sketch_pattern_entities (linear or circular) for the current selection + dims.
+void SketchMode::applyPatternOp(AppState& st, bool circular) {
+    nlohmann::json eids = nlohmann::json::array();
+    for (const auto& id : mpSel_) eids.push_back(id);
+    nlohmann::json op = {{"op", "sketch_pattern_entities"}, {"sketch", fid_},
+                         {"mode", circular ? "circular" : "linear"},
+                         {"entities", eids}, {"count", patternCount_}};
+    if (circular) {
+        op["center"] = nlohmann::json::array({patternCenterU_, patternCenterV_});
+        op["angle"] = patternAngle_;
+        op["equal_spacing"] = patternEqualSpacing_;
+    } else {
+        op["dir"] = nlohmann::json::array({patternDirU_, patternDirV_});
+        op["spacing"] = patternSpacing_;
+    }
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (!r.ok) {
+        std::string msg = r.error_message.empty() ? std::string("Pattern failed") : r.error_message;
+        st.addLog("[sketch] pattern failed: " + msg);
+        st.toast(ui::ToastLevel::Warn, msg);
+    } else {
+        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        resolve(st);
+    }
+    mpStage_ = 0; mpSel_.clear();   // stay in the tool, ready for another pattern
+}
+
+// C53: apply one sketch_convert op for a model edge/face ref (a {kind, selector} or {datum} object).
+void SketchMode::applyConvertRef(AppState& st, const nlohmann::json& ref) {
+    nlohmann::json op = {{"op", "sketch_convert"}, {"sketch", fid_},
+                         {"refs", nlohmann::json::array({ref})}};
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (!r.ok) {
+        std::string msg = r.error_message.empty() ? std::string("Convert failed") : r.error_message;
+        st.addLog("[sketch] convert failed: " + msg);
+        st.toast(ui::ToastLevel::Warn, msg);
+        return;
+    }
+    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    resolve(st);   // the projected entity appears; stay armed for more converts
+}
+
+// C54: apply sketch_move (translate or copy) for the current selection + delta.
+void SketchMode::applyMoveOp(AppState& st, float dx, float dy, bool copy) {
+    nlohmann::json eids = nlohmann::json::array();
+    for (const auto& id : mpSel_) eids.push_back(id);
+    nlohmann::json op = {{"op", "sketch_move"}, {"sketch", fid_},
+                         {"entities", eids}, {"dx", dx}, {"dy", dy}, {"copy", copy}};
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (!r.ok) {
+        std::string msg = r.error_message.empty() ? std::string("Move failed") : r.error_message;
+        st.addLog("[sketch] move failed: " + msg);
+        st.toast(ui::ToastLevel::Warn, msg);
+    } else {
+        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        resolve(st);
+    }
+    mpStage_ = 0; mpSel_.clear();   // stay in the tool, ready for another move
+}
+
+// C54: resolve the tangent-arc source — the line/circle/arc nearest the cursor, the endpoint of it
+// nearest the cursor (the arc start), and the unit tangent direction there (pointing into the arc).
+// Prefers the last selected entity, then the entity under the cursor, then the last drawn entity.
+bool SketchMode::tangentArcSource(const ImVec2& cursorScreen, TangentArcSrc& out) const {
+    const SketchEntity* src = nullptr;
+    // 1) a held selection wins (its last-picked entity is the source).
+    for (auto it = selIds_.rbegin(); it != selIds_.rend() && !src; ++it) {
+        const SketchEntity* e = entById(*it);
+        if (e && (e->type == "line" || e->type == "arc" || e->type == "circle")) src = e;
+    }
+    // 2) else the entity under the cursor.
+    if (!src) {
+        int h = hitTestEntity(cursorScreen);
+        if (h >= 0 && (ents_[h].type == "line" || ents_[h].type == "arc" ||
+                       ents_[h].type == "circle"))
+            src = &ents_[h];
+    }
+    // 3) else the most-recently-drawn supported entity (last in the list).
+    if (!src) {
+        for (auto it = ents_.rbegin(); it != ents_.rend() && !src; ++it)
+            if (it->type == "line" || it->type == "arc" || it->type == "circle") src = &*it;
+    }
+    if (!src) return false;
+
+    const float D2R = 3.14159265f / 180.0f;
+    if (src->type == "line") {
+        ImVec2 p1(src->p1[0], src->p1[1]), p2(src->p2[0], src->p2[1]);
+        ImVec2 s1 = uvToScreen(p1.x, p1.y), s2 = uvToScreen(p2.x, p2.y);
+        bool useP1 = std::hypot(s1.x - cursorScreen.x, s1.y - cursorScreen.y) <=
+                     std::hypot(s2.x - cursorScreen.x, s2.y - cursorScreen.y);
+        ImVec2 endpt = useP1 ? p1 : p2;
+        ImVec2 other = useP1 ? p2 : p1;
+        // Tangent continues the segment outward (away from the line body).
+        float dx = endpt.x - other.x, dy = endpt.y - other.y;
+        float L = std::hypot(dx, dy);
+        if (L < 1e-6f) return false;
+        out.id = src->id;
+        out.handle = src->id + (useP1 ? ".p1" : ".p2");
+        out.start = endpt;
+        out.tdir = ImVec2(dx / L, dy / L);
+        return true;
+    }
+    // arc / circle: tangent is perpendicular to the radius at the endpoint.
+    // A full circle has no free endpoint — fall back to the point on it nearest the cursor.
+    float a0 = src->start, a1 = src->end;
+    ImVec2 c(src->center[0], src->center[1]);
+    float rad = src->radius;
+    if (src->type == "arc") {
+        ImVec2 pa(c.x + rad * std::cos(a0 * D2R), c.y + rad * std::sin(a0 * D2R));
+        ImVec2 pb(c.x + rad * std::cos(a1 * D2R), c.y + rad * std::sin(a1 * D2R));
+        ImVec2 sa = uvToScreen(pa.x, pa.y), sb = uvToScreen(pb.x, pb.y);
+        bool useStart = std::hypot(sa.x - cursorScreen.x, sa.y - cursorScreen.y) <=
+                        std::hypot(sb.x - cursorScreen.x, sb.y - cursorScreen.y);
+        float ang = (useStart ? a0 : a1) * D2R;
+        ImVec2 endpt(c.x + rad * std::cos(ang), c.y + rad * std::sin(ang));
+        // Radial unit, then rotate +90 for the tangent; orient it along the arc's sweep so the new
+        // arc continues smoothly outward (ccw => +tangent at end / -tangent at start).
+        float rx = std::cos(ang), ry = std::sin(ang);
+        float tx = -ry, ty = rx;             // +90 rotation of the radial
+        bool ccw = src->ccw;
+        float sgn = (useStart ? -1.0f : 1.0f) * (ccw ? 1.0f : -1.0f);
+        out.id = src->id;
+        out.handle = src->id + (useStart ? ".start" : ".end");
+        out.start = endpt;
+        out.tdir = ImVec2(tx * sgn, ty * sgn);
+        return true;
+    }
+    // circle: nearest rim point to the cursor; tangent perpendicular to the radius (ccw sense).
+    float cu, cv; screenToUV(cursorScreen, cu, cv);
+    float ang = std::atan2(cv - c.y, cu - c.x);
+    ImVec2 endpt(c.x + rad * std::cos(ang), c.y + rad * std::sin(ang));
+    out.id = src->id;
+    out.handle = src->id;                    // whole-circle ref (no endpoint sub-handle)
+    out.start = endpt;
+    out.tdir = ImVec2(-std::sin(ang), std::cos(ang));   // ccw tangent
+    return true;
+}
+
+// C54: solve the arc tangent to `tdir` at `start`, passing through `end`. The center lies on the
+// line perpendicular to tdir at start (start + r*N). Requiring |C-end| == |C-start| == |r| gives
+// r = |end-start|^2 / (2 * (end-start)·N), with N the left-normal of tdir. Returns false when the
+// end is on the tangent line through start (denominator ~0 -> infinite radius) or coincident.
+bool SketchMode::tangentArcThrough(const ImVec2& start, const ImVec2& tdir, const ImVec2& end,
+                                   float& cu, float& cv, float& rad,
+                                   float& a0deg, float& a1deg, bool& ccw) {
+    float tx = tdir.x, ty = tdir.y;
+    float tl = std::hypot(tx, ty);
+    if (tl < 1e-9f) return false;
+    tx /= tl; ty /= tl;
+    float nx = -ty, ny = tx;                 // left-normal of the tangent
+    float ex = end.x - start.x, ey = end.y - start.y;
+    float d2 = ex * ex + ey * ey;
+    if (d2 < 1e-12f) return false;           // start == end
+    float denom = 2.0f * (ex * nx + ey * ny);
+    if (std::fabs(denom) < 1e-9f) return false;   // end on the tangent line -> straight, no arc
+    float r = d2 / denom;                    // signed radius (sign picks the side)
+    cu = start.x + r * nx;
+    cv = start.y + r * ny;
+    rad = std::fabs(r);
+    const float R2D = 57.29577951f;
+    a0deg = std::atan2(start.y - cv, start.x - cu) * R2D;
+    a1deg = std::atan2(end.y - cv, end.x - cu) * R2D;
+    // The sweep direction is set by the tangent: cross(radial_at_start, tangent) sign. radial at
+    // start is (start-center) = -r*N; tangent is T. ccw when cross(radial, T) > 0.
+    float radx = start.x - cu, rady = start.y - cv;
+    ccw = (radx * ty - rady * tx) > 0.0f;
+    return true;
+}
 
 void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfer* infer) const {
     snapHandle.clear();
@@ -1034,7 +1426,7 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfe
                 fn(e.id + ".center", e.center[0], e.center[1]);
             } else if (e.type == "point") {
                 fn(e.id + ".p", e.p1[0], e.p1[1]);
-            } else if (e.type == "spline") {  // C42: sub-handles p0..pN (sketch_solver convention)
+            } else if (e.type == "spline" || e.type == "style_spline") {  // C42: sub-handles p0..pN (sketch_solver convention; style_spline = control poles)
                 for (size_t i = 0; i < e.pts.size(); ++i)
                     fn(e.id + ".p" + std::to_string(i), e.pts[i].x, e.pts[i].y);
             }
@@ -1121,7 +1513,7 @@ int SketchMode::hitTestHandle(const ImVec2& s, std::string& handleOut, float& uO
             consider(e.id + ".center", e.center[0], e.center[1]);
         } else if (e.type == "point") {
             consider(e.id + ".p", e.p1[0], e.p1[1]);
-        } else if (e.type == "spline") {   // C42: draggable through-points p0..pN
+        } else if (e.type == "spline" || e.type == "style_spline") {   // C42: draggable through-points / control poles p0..pN
             for (size_t i = 0; i < e.pts.size(); ++i)
                 consider(e.id + ".p" + std::to_string(i), e.pts[i].x, e.pts[i].y);
         }
@@ -1172,8 +1564,9 @@ int SketchMode::hitTestEntity(const ImVec2& s, float maxPx) const {
         } else if (e.type == "point") {                       // C42: distance to the point itself
             ImVec2 p = uvToScreen(e.p1[0], e.p1[1]);
             d2 = (p.x - s.x) * (p.x - s.x) + (p.y - s.y) * (p.y - s.y);
-        } else if (e.type == "ellipse" || e.type == "spline") {
-            // C42: min distance to a sampled polyline (32-seg ellipse / spline through-points).
+        } else if (e.type == "ellipse" || e.type == "spline" || e.type == "style_spline") {
+            // C42: min distance to a sampled polyline (32-seg ellipse / spline through-points /
+            // style_spline control polygon — the displayed editable polyline, SW-style).
             auto seg2 = [&](ImVec2 a, ImVec2 b) {
                 float vx = b.x - a.x, vy = b.y - a.y;
                 float wx = s.x - a.x, wy = s.y - a.y;
@@ -1324,7 +1717,7 @@ void SketchMode::entityBoundaryUV(const SketchEntity& e, std::vector<ImVec2>& ou
             out.push_back(ImVec2(e.center[0] + (e.radius - hw) * std::cos(a),
                                  e.center[1] + (e.radius - hw) * std::sin(a)));
         }
-    } else if (e.type == "spline") {
+    } else if (e.type == "spline" || e.type == "style_spline") {
         for (const auto& q : e.pts) out.push_back(q);
     }
 }
@@ -1502,7 +1895,7 @@ void SketchMode::entityDragHandles(const SketchEntity& e,
         out.emplace_back(e.id + ".center", ImVec2(e.center[0], e.center[1]));
     } else if (e.type == "point") {
         out.emplace_back(e.id + ".p", ImVec2(e.p1[0], e.p1[1]));
-    } else if (e.type == "spline") {
+    } else if (e.type == "spline" || e.type == "style_spline") {
         for (size_t i = 0; i < e.pts.size(); ++i)
             out.emplace_back(e.id + ".p" + std::to_string(i), e.pts[i]);
     }
@@ -1771,10 +2164,18 @@ std::string SketchMode::statusLine() const {
 // ---------------------------------------------------------------------------
 
 namespace {
-// Format a length (mm) for a dimension label, mirroring pmFormatDim's mm path without the unit
-// suffix subtleties (we add the suffix ourselves). Trims trailing zeros.
+// Active document-unit display for the sketcher's on-canvas dimensions + Modify box. Set once per
+// frame from AppState.ips() at the top of drawOverlay so the free-function formatters below (which
+// have no AppState) follow the MMGS<->IPS toggle. Sketch measured values are canonical mm; angles
+// stay in degrees in both systems.
+bool g_skIps = false;
+const char* skLenUnit() { return g_skIps ? "in" : "mm"; }
+
+// Format a length (mm) for a dimension label in the active document length unit (mm / inch),
+// trimming trailing zeros. The unit suffix is added by the caller.
 std::string fmtLen(double mm) {
-    char b[48]; std::snprintf(b, sizeof(b), "%.2f", mm);
+    double v = g_skIps ? mm / 25.4 : mm;
+    char b[48]; std::snprintf(b, sizeof(b), g_skIps ? "%.4g" : "%.2f", v);
     std::string s(b);
     if (s.find('.') != std::string::npos) { while (s.back() == '0') s.pop_back(); if (s.back() == '.') s.pop_back(); }
     return s;
@@ -2330,7 +2731,10 @@ void SketchMode::dimCommit(AppState& st) {
     double mm = dimMeasured_;
     if (!isExpr) {
         std::string perr;
-        if (!pmParseDim(txt, mm, perr, dimIsAngle_)) { dimError_ = perr.empty() ? "bad value" : perr; return; }
+        // A bare value in the Modify box follows the document length unit (mm / inch); angles
+        // stay degrees. An explicit suffix the user types still wins via pmParseDim.
+        const double bareScale = (g_skIps && !dimIsAngle_) ? 25.4 : 1.0;
+        if (!pmParseDim(txt, mm, perr, dimIsAngle_, bareScale)) { dimError_ = perr.empty() ? "bad value" : perr; return; }
     }
     if (!dimEditCid_.empty()) {
         // Editing an EXISTING dim: sketch_set_dim. C50f: pre-flight the new value with sketch_probe
@@ -2772,8 +3176,8 @@ void SketchMode::drawGhosts(AppState& st, const ImVec2& imgMin, const ImVec2& im
                     u = e.center[0] + lx * ca - ly * sa;
                     v = e.center[1] + lx * sa + ly * ca;
                 }, 48);
-            } else if (e.type == "spline" && e.pts.size() >= 2) {
-                // C42: polyline through the solved through-points.
+            } else if ((e.type == "spline" || e.type == "style_spline") && e.pts.size() >= 2) {
+                // C42: polyline through the solved through-points (style_spline: control polygon).
                 for (size_t i = 1; i < e.pts.size(); ++i) {
                     ImVec2 a, b;
                     if (uv2s(e.pts[i - 1].x, e.pts[i - 1].y, a) && uv2s(e.pts[i].x, e.pts[i].y, b))
@@ -3077,6 +3481,9 @@ bool SketchMode::drawRegionPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMi
 void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, const ImVec2& imgMax,
                              int vw, int vh, bool imgHovered) {
     if (!st.renderer) return;
+    // Sketch dimensions + Modify box follow the document unit system (mm / inch); refreshed each
+    // frame so a status-bar units toggle reformats on-canvas dims and the Modify box live.
+    g_skIps = st.ips();
     const auto& pal = ui::palette;
 
     // ---- C37-D: SolidWorks plane-pick step (runs while !active_, before a sketch exists) ----
@@ -3466,8 +3873,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             }
             strokePoly(pts);
             dl->AddCircleFilled(uvToScreen(e.center[0], e.center[1]), 2.5f, cc);
-        } else if (e.type == "spline") {
-            // C42: polyline through the solved through-points + point markers.
+        } else if (e.type == "spline" || e.type == "style_spline") {
+            // C42: polyline through the through-points + point markers. For style_spline this is the
+            // control polygon (the editable poles, exactly as SW shows a Style Spline); the smooth
+            // by-poles curve is realized by the engine at use/extrude time.
             std::vector<ImVec2> pts; pts.reserve(e.pts.size());
             for (const auto& q : e.pts) pts.push_back(uvToScreen(q.x, q.y));
             strokePoly(pts);
@@ -4009,7 +4418,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // path (loadDocMesh + resolve), exactly like sketch_add_entity; op errors are logged and the
     // tool stays active. Esc exits.
     bool editTool = (tool_ == SketchTool::Trim || tool_ == SketchTool::Extend ||
-                     tool_ == SketchTool::Offset);
+                     tool_ == SketchTool::Offset ||
+                     tool_ == SketchTool::SkFillet || tool_ == SketchTool::SkChamfer ||
+                     tool_ == SketchTool::Mirror || tool_ == SketchTool::LinPattern ||
+                     tool_ == SketchTool::CircPattern || tool_ == SketchTool::Move);
     if (editTool) {
         int hovered = imgHovered ? hitTestEntity(io.MousePos) : -1;
 
@@ -4211,10 +4623,264 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 else cancelTool();
             }
         }
+
+        // ----- SKETCH FILLET / CHAMFER (C52): pick two lines; second pick builds the op. -----
+        // Engine handles LINE-LINE corners only (sketch_fillet radius / sketch_chamfer distance).
+        // The radius/distance numeric field lives in a small always-on overlay pinned top-left
+        // (drawn after the interaction pass) and persists across corners. On the second pick the op
+        // is applied; success appends the new arc/line + re-solves and we stay armed for another
+        // corner. A non-line pick toasts and is ignored. Esc clears a held first pick (or exits the
+        // tool if none is held).
+        else if (tool_ == SketchTool::SkFillet || tool_ == SketchTool::SkChamfer) {
+            const ImU32 ac = col(pal.accent, 0.95f);
+            const ImU32 hc = col(pal.hoverHighlight, 0.9f);
+            // Tint the already-picked first line in accent.
+            const SketchEntity* first = corner1Id_.empty() ? nullptr : entById(corner1Id_);
+            if (first && first->type == "line")
+                dl->AddLine(uvToScreen(first->p1[0], first->p1[1]),
+                            uvToScreen(first->p2[0], first->p2[1]), ac, 3.5f);
+            // Hover preview (faint) over the would-be-picked line (skip the already-picked one).
+            if (hovered >= 0 && ents_[hovered].type == "line" && ents_[hovered].id != corner1Id_) {
+                const SketchEntity& e = ents_[hovered];
+                dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), hc, 3.0f);
+            }
+            if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hovered >= 0) {
+                const SketchEntity& e = ents_[hovered];
+                if (e.type != "line") {
+                    const char* what = tool_ == SketchTool::SkFillet ? "Sketch Fillet" : "Sketch Chamfer";
+                    st.addLog(std::string("[sketch] ") + what + ": pick a line, not " + e.type);
+                    st.toast(ui::ToastLevel::Info,
+                             std::string(what) + " works on two lines — not " + e.type);
+                } else if (corner1Id_.empty()) {
+                    corner1Id_ = e.id;                 // first line picked; wait for the second
+                } else if (e.id == corner1Id_) {
+                    // Clicking the same line again deselects it (pick a different first line).
+                    corner1Id_.clear();
+                } else {
+                    applyCornerOp(st, e.id);           // second line: build + apply, then stay armed
+                }
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                escHandled = true;   // C41 (T1): clear a held first pick, else exit the tool
+                if (!corner1Id_.empty()) corner1Id_.clear();
+                else cancelTool();
+            }
+        }
+
+        // ----- C53 MIRROR / LINEAR PATTERN / CIRCULAR PATTERN: collect an entity selection -----
+        // Stage 0 collects line/circle/arc entities (click toggles, like the Offset chain). Enter
+        // advances: Mirror -> stage 1 pick a construction line (the mirror axis); Circular -> stage 1
+        // pick the center point; Linear -> stage 1 the numeric panel. The op is applied from the
+        // numeric panel / line pick (drawn after the interaction pass). Esc backs out a stage.
+        else if (tool_ == SketchTool::Mirror || tool_ == SketchTool::LinPattern ||
+                 tool_ == SketchTool::CircPattern) {
+            const ImU32 ac = col(pal.accent, 0.95f);
+            const ImU32 hc = col(pal.hoverHighlight, 0.9f);
+            auto inSel = [&](const std::string& id) {
+                return std::find(mpSel_.begin(), mpSel_.end(), id) != mpSel_.end();
+            };
+            auto strokeEnt = [&](const SketchEntity& e, ImU32 c, float th) {
+                if (e.type == "line")
+                    dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), c, th);
+                else if (e.type == "circle" || e.type == "arc") {
+                    float a0 = 0, a1 = 6.2831853f;
+                    if (e.type == "arc") {
+                        a0 = e.start * 3.14159265f / 180.0f; a1 = e.end * 3.14159265f / 180.0f;
+                        if (!e.ccw) { float t = a0; a0 = a1; a1 = t; }
+                        if (a1 < a0) a1 += 6.2831853f;
+                    }
+                    ImVec2 prev; int seg = 64;
+                    for (int i = 0; i <= seg; ++i) {
+                        float a = a0 + (a1 - a0) * (i / (float)seg);
+                        ImVec2 p = uvToScreen(e.center[0] + e.radius * std::cos(a),
+                                              e.center[1] + e.radius * std::sin(a));
+                        if (i) dl->AddLine(prev, p, c, th); prev = p;
+                    }
+                }
+            };
+            // Tint the current selection.
+            for (const auto& e : ents_) if (inSel(e.id)) strokeEnt(e, ac, 3.5f);
+
+            if (mpStage_ == 0) {
+                if (hovered >= 0 && !inSel(ents_[hovered].id)) strokeEnt(ents_[hovered], hc, 3.0f);
+                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hovered >= 0) {
+                    const SketchEntity& e = ents_[hovered];
+                    if (e.type != "line" && e.type != "circle" && e.type != "arc") {
+                        st.toast(ui::ToastLevel::Info,
+                                 "Mirror/Pattern works on lines, circles, and arcs — not " + e.type);
+                    } else {
+                        auto it = std::find(mpSel_.begin(), mpSel_.end(), e.id);
+                        if (it != mpSel_.end()) mpSel_.erase(it); else mpSel_.push_back(e.id);
+                    }
+                }
+                if (!mpSel_.empty() && ImGui::IsKeyPressed(ImGuiKey_Enter)) mpStage_ = 1;
+            } else if (tool_ == SketchTool::Mirror && mpStage_ == 1) {
+                // Pick the mirror line (must be a line entity; a construction line is the norm).
+                if (hovered >= 0 && ents_[hovered].type == "line" && !inSel(ents_[hovered].id))
+                    strokeEnt(ents_[hovered], hc, 3.0f);
+                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hovered >= 0) {
+                    const SketchEntity& e = ents_[hovered];
+                    if (e.type != "line")
+                        st.toast(ui::ToastLevel::Info, "Pick a line as the mirror axis, not " + e.type);
+                    else if (inSel(e.id))
+                        st.toast(ui::ToastLevel::Info, "The mirror line can't be one of the mirrored entities");
+                    else
+                        applyMirrorOp(st, e.id);   // build + apply, reset selection, stay armed
+                }
+            } else if (tool_ == SketchTool::CircPattern && mpStage_ == 1) {
+                // Pick the center point: snap to a vertex/center if near one, else the raw cursor.
+                std::string snapH; float su = mu, sv = mv;
+                snapPoint(su, sv, snapH);
+                dl->AddCircle(uvToScreen(su, sv), 5.0f, col(pal.accent, 0.95f), 16, 2.0f);
+                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    patternCenterU_ = su; patternCenterV_ = sv;
+                    mpStage_ = 2;   // advance to the numeric panel
+                }
+            }
+            // Visualize the chosen circular center while in the panel stage.
+            if (tool_ == SketchTool::CircPattern && mpStage_ == 2)
+                dl->AddCircle(uvToScreen(patternCenterU_, patternCenterV_), 5.0f,
+                              col(pal.accent, 0.95f), 16, 2.0f);
+
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                escHandled = true;
+                if (mpStage_ > 0) { mpStage_ = (tool_ == SketchTool::CircPattern) ? mpStage_ - 1 : 0; }
+                else cancelTool();
+            }
+        }
+
+        // ----- C54 MOVE/COPY: stage 0 collect entities (Enter advances) -> stage 1 pick a -----
+        // ----- FROM point -> stage 2 live drag to a TO point; the second click applies         -----
+        // ----- sketch_move {entities, dx, dy, copy} with delta = to - from. Ctrl => copy.       -----
+        else if (tool_ == SketchTool::Move) {
+            const ImU32 ac = col(pal.accent, 0.95f);
+            const ImU32 hc = col(pal.hoverHighlight, 0.9f);
+            auto inSel = [&](const std::string& id) {
+                return std::find(mpSel_.begin(), mpSel_.end(), id) != mpSel_.end();
+            };
+            auto strokeEnt = [&](const SketchEntity& e, ImU32 c, float th) {
+                if (e.type == "line")
+                    dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), c, th);
+                else if (e.type == "circle" || e.type == "arc") {
+                    float a0 = 0, a1 = 6.2831853f;
+                    if (e.type == "arc") {
+                        a0 = e.start * 3.14159265f / 180.0f; a1 = e.end * 3.14159265f / 180.0f;
+                        if (!e.ccw) { float t = a0; a0 = a1; a1 = t; }
+                        if (a1 < a0) a1 += 6.2831853f;
+                    }
+                    ImVec2 prev; int seg = 64;
+                    for (int i = 0; i <= seg; ++i) {
+                        float a = a0 + (a1 - a0) * (i / (float)seg);
+                        ImVec2 p = uvToScreen(e.center[0] + e.radius * std::cos(a),
+                                              e.center[1] + e.radius * std::sin(a));
+                        if (i) dl->AddLine(prev, p, c, th); prev = p;
+                    }
+                }
+            };
+            for (const auto& e : ents_) if (inSel(e.id)) strokeEnt(e, ac, 3.5f);
+
+            if (mpStage_ == 0) {
+                if (hovered >= 0 && !inSel(ents_[hovered].id)) strokeEnt(ents_[hovered], hc, 3.0f);
+                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hovered >= 0) {
+                    const SketchEntity& e = ents_[hovered];
+                    if (e.type != "line" && e.type != "circle" && e.type != "arc") {
+                        st.toast(ui::ToastLevel::Info,
+                                 "Move works on lines, circles, and arcs — not " + e.type);
+                    } else {
+                        auto it = std::find(mpSel_.begin(), mpSel_.end(), e.id);
+                        if (it != mpSel_.end()) mpSel_.erase(it); else mpSel_.push_back(e.id);
+                    }
+                }
+                if (!mpSel_.empty() && ImGui::IsKeyPressed(ImGuiKey_Enter)) mpStage_ = 1;
+            } else if (mpStage_ == 1) {
+                // Pick the FROM anchor (snap to a vertex/center if near one).
+                std::string snapH; float su = mu, sv = mv;
+                snapPoint(su, sv, snapH);
+                dl->AddCircle(uvToScreen(su, sv), 5.0f, ac, 16, 2.0f);
+                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    moveFromUV_ = ImVec2(su, sv);
+                    mpStage_ = 2;
+                }
+            } else if (mpStage_ == 2) {
+                // Live drag to the TO point; second click applies the move (Ctrl => copy).
+                std::string snapH; float su = mu, sv = mv;
+                snapPoint(su, sv, snapH);
+                bool copy = io.KeyCtrl;
+                dl->AddLine(uvToScreen(moveFromUV_.x, moveFromUV_.y), uvToScreen(su, sv),
+                            ac, 1.6f);
+                dl->AddCircle(uvToScreen(moveFromUV_.x, moveFromUV_.y), 4.0f, ac, 16, 1.6f);
+                // Ghost-preview the selection translated by the live delta.
+                float pdx = su - moveFromUV_.x, pdy = sv - moveFromUV_.y;
+                const ImU32 gc = col(pal.sketchUnder, 0.8f);
+                for (const auto& e : ents_) {
+                    if (!inSel(e.id)) continue;
+                    if (e.type == "line") {
+                        dl->AddLine(uvToScreen(e.p1[0] + pdx, e.p1[1] + pdy),
+                                    uvToScreen(e.p2[0] + pdx, e.p2[1] + pdy), gc, 2.0f);
+                    } else if (e.type == "circle" || e.type == "arc") {
+                        float a0 = 0, a1 = 6.2831853f;
+                        if (e.type == "arc") {
+                            a0 = e.start * 3.14159265f / 180.0f; a1 = e.end * 3.14159265f / 180.0f;
+                            if (!e.ccw) { float t = a0; a0 = a1; a1 = t; }
+                            if (a1 < a0) a1 += 6.2831853f;
+                        }
+                        ImVec2 prev; int seg = 64;
+                        for (int i = 0; i <= seg; ++i) {
+                            float a = a0 + (a1 - a0) * (i / (float)seg);
+                            ImVec2 p = uvToScreen(e.center[0] + pdx + e.radius * std::cos(a),
+                                                  e.center[1] + pdy + e.radius * std::sin(a));
+                            if (i) dl->AddLine(prev, p, gc, 2.0f); prev = p;
+                        }
+                    }
+                }
+                if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    applyMoveOp(st, su - moveFromUV_.x, sv - moveFromUV_.y, copy);
+                    // applyMoveOp resets the selection + stage 0 for another move.
+                }
+            }
+
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                escHandled = true;
+                if (mpStage_ > 0) mpStage_ = mpStage_ - 1;   // back out from to-pick -> from-pick -> select
+                else cancelTool();
+            }
+        }
+    }
+
+    // ---- C53 CONVERT ENTITIES: pick MODEL edges/faces in the viewport, project each into ----
+    // ---- the sketch (sketch_convert). Like Smart Dim's external-ref pick, but it applies the ----
+    // ---- op immediately and stays armed for more converts. Esc exits the tool. ----
+    if (tool_ == SketchTool::Convert) {
+        render::PickHit extHit{};
+        if (imgHovered && st.hasDocMesh && st.idPass) {
+            int px = (int)(io.MousePos.x - imgMin.x), py = (int)(io.MousePos.y - imgMin.y);
+            render::PickHit h = st.idPass->pickFinal(px, py, vw, vh);
+            if (h.valid() && (h.kind == render::PickKind::Edge || h.kind == render::PickKind::Face))
+                extHit = h;
+        }
+        st.hover = extHit;   // standard 3D hover highlight on the pickable edge/face
+        if (extHit.valid() && imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            std::string perr;
+            std::string selStr = st.docMirror.resolvePick(
+                st.worker, extHit.body_id,
+                extHit.kind == render::PickKind::Edge ? "edge" : "face", extHit.topo_id, perr);
+            nlohmann::json selJs;
+            if (!selStr.empty()) { try { selJs = nlohmann::json::parse(selStr); } catch (...) {} }
+            if (selJs.is_object()) {
+                applyConvertRef(st, nlohmann::json{
+                    {"kind", extHit.kind == render::PickKind::Edge ? "edge" : "face"},
+                    {"selector", selJs}});
+            } else {
+                st.toast(ui::ToastLevel::Warn, "Can't convert that geometry" +
+                         (perr.empty() ? std::string() : ": " + perr));
+            }
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { escHandled = true; cancelTool(); }
     }
 
     // ---- drawing tools: rubber-band preview + click handling ----
-    if (!editTool && tool_ != SketchTool::None && tool_ != SketchTool::SmartDim) {
+    if (!editTool && tool_ != SketchTool::None && tool_ != SketchTool::SmartDim &&
+        tool_ != SketchTool::Convert) {
         // Snap the live cursor for preview + inference glyphs (C49: point snap + midpoint/rim
         // snap + alignment inference, see snapPoint).
         float su = mu, sv = mv; std::string snapH;
@@ -4605,6 +5271,39 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         }
                     }
                 }
+            } else if (tool_ == SketchTool::ArcTangent) {
+                // C54: derive the source + free endpoint each frame; the arc starts there tangent to
+                // the source and sweeps to the live cursor. Highlight the snapped start; if no source
+                // exists we fall back to a plain 2-point chord (treated as a near-straight arc).
+                TangentArcSrc src;
+                if (tangentArcSource(io.MousePos, src)) {
+                    // bright dot on the tangent start + faint tangent direction tick
+                    ImVec2 sS = uvToScreen(src.start.x, src.start.y);
+                    dl->AddCircleFilled(sS, 4.0f, col(pal.accent, 0.95f));
+                    ImVec2 tEnd = uvToScreen(src.start.x + src.tdir.x * 6.0f,
+                                             src.start.y + src.tdir.y * 6.0f);
+                    dl->AddLine(sS, tEnd, col(pal.accent, 0.6f), 1.2f);
+                    float cu, cv, rad, a0, a1; bool ccw;
+                    if (tangentArcThrough(src.start, src.tdir, ImVec2(su, sv),
+                                          cu, cv, rad, a0, a1, ccw)) {
+                        if (a1 < a0) a1 += 360.0f;
+                        float lo = ccw ? a0 : a1, hi = ccw ? a1 : a0;
+                        if (hi < lo) hi += 360.0f;
+                        const float D2R = 3.14159265f / 180.0f;
+                        ImVec2 prev;
+                        for (int i = 0; i <= 48; ++i) {
+                            float a = (lo + (hi - lo) * (i / 48.0f)) * D2R;
+                            ImVec2 q = uvToScreen(cu + rad * std::cos(a), cv + rad * std::sin(a));
+                            if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                        }
+                    } else {
+                        // Degenerate (cursor on the tangent line): preview a straight chord.
+                        dl->AddLine(sS, sCur, uCol, 1.6f);
+                    }
+                } else {
+                    // No source -> behave like a 3-pt arc's first leg (rubber chord from cursor).
+                    dl->AddCircleFilled(sCur, 3.0f, uCol);
+                }
             } else if (tool_ == SketchTool::Polygon && n >= 1) {
                 ImVec2 ctr = toolUV_[0];
                 dl->AddCircleFilled(uvToScreen(ctr.x, ctr.y), 3.0f, uCol);
@@ -4645,7 +5344,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
                     }
                 }
-            } else if (tool_ == SketchTool::Spline && n >= 1) {
+            } else if ((tool_ == SketchTool::Spline || tool_ == SketchTool::StyleSpline) && n >= 1) {
                 std::vector<ImVec2> pts(toolUV_.begin(), toolUV_.end());
                 pts.push_back(ImVec2(su, sv));
                 pl(pts);
@@ -4709,12 +5408,62 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             if (tanSnap) chip("T");
         }
 
-        // Click placement.
-        if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        // Click placement. EqCurve takes no viewport pick (origin-relative; its popup opens on the
+        // ribbon command). Text takes exactly one placement click and then defers to its popup, so
+        // suppress further captures while that popup is open.
+        if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            tool_ != SketchTool::EqCurve && !(tool_ == SketchTool::Text && textPopupOpen_)) {
             toolUV_.push_back(ImVec2(su, sv));
             toolSnaps_.push_back(snapH);
+            // Sketch Text — the single click captures the lower-left anchor; open the popup that
+            // collects the string + cap height. The entity is emitted from the popup's OK.
+            if (tool_ == SketchTool::Text && toolUV_.size() == 1) {
+                textAnchorUV_ = toolUV_[0];
+                textPopupPos_ = io.MousePos;
+                textPopupOpen_ = true;
+                textFocus_ = true;
+                toolUV_.clear(); toolSnaps_.clear();   // anchor stashed; stop click capture
+            } else
             // Tools that complete on a fixed number of clicks:
-            if (tool_ == SketchTool::Line && toolUV_.size() == 2) {
+            // C54: Tangent Arc — ONE click places the end. The start + tangent come from the source
+            // entity (resolved at click time). We commit an arc tangent to the source there, joined
+            // by a coincident at the shared endpoint and a tangent relation (arc <-> source) so it
+            // stays tangent under drag. No source / degenerate geometry -> toast a hint and reset.
+            if (tool_ == SketchTool::ArcTangent && toolUV_.size() == 1) {
+                ImVec2 endPt = toolUV_[0];
+                TangentArcSrc src;
+                float cu, cv, rad, a0, a1; bool ccw;
+                if (!tangentArcSource(io.MousePos, src)) {
+                    st.toast(ui::ToastLevel::Info,
+                             "Tangent Arc: draw or select a line/arc first, then click the arc end");
+                    resetTool(); tool_ = SketchTool::ArcTangent;
+                } else if (!tangentArcThrough(src.start, src.tdir, endPt,
+                                              cu, cv, rad, a0, a1, ccw)) {
+                    st.toast(ui::ToastLevel::Info,
+                             "Tangent Arc: the end is on the tangent line (no arc) — pick a point off it");
+                    resetTool(); tool_ = SketchTool::ArcTangent;
+                } else {
+                    // The solved arc always sweeps start->end; store CCW with the matching angle order
+                    // (solver drops the ccw flag, so a false flag would re-render mirrored). When the
+                    // geometric sweep is CW, store the CCW arc end->start (same curve) and join the
+                    // source endpoint to whichever arc handle landed on the start.
+                    float sStart = a0, sEnd = a1;
+                    const char* startHandle = "$self.start";
+                    if (!ccw) { float t = sStart; sStart = sEnd; sEnd = t; startHandle = "$self.end"; }
+                    nlohmann::json ent = {{"type", "arc"},
+                        {"center", nlohmann::json::array({cu, cv})}, {"radius", rad},
+                        {"start", sStart}, {"end", sEnd}, {"ccw", true}};
+                    // Relations: coincident joining the source endpoint to the arc's start handle +
+                    // tangent(arc, source). For a whole-circle source there's no endpoint sub-handle
+                    // (src.handle == src.id) so we skip the coincident and keep only the tangent.
+                    nlohmann::json cs = nlohmann::json::array();
+                    if (src.handle != src.id)
+                        cs.push_back({{"type", "coincident"}, {"refs", {src.handle, startHandle}}});
+                    cs.push_back({{"type", "tangent"}, {"refs", {"$self", src.id}}});
+                    addEntity(st, ent, cs);
+                    resetTool(); tool_ = SketchTool::ArcTangent;   // stay armed for another tangent arc
+                }
+            } else if (tool_ == SketchTool::Line && toolUV_.size() == 2) {
                 ImVec2 p1 = toolUV_[0], p2 = toolUV_[1];
                 nlohmann::json cs = nlohmann::json::array();
                 // C49: a rim-snapped START whose placement direction matched gets the tangent too.
@@ -5096,7 +5845,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
 
         // C42: Spline finishing — Enter / right-click / double-click commits (>= 2 points); a
         // right-click with fewer just drops the in-progress points (mirrors the Line-chain RMB).
-        if (tool_ == SketchTool::Spline) {
+        // Style Spline shares the exact same collect/finish UX (>= 2 poles) and only differs in the
+        // emitted entity type ("style_spline" — control poles, not interpolated through-points).
+        if (tool_ == SketchTool::Spline || tool_ == SketchTool::StyleSpline) {
             bool finish = false;
             if (imgHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
                 toolUV_.size() >= 3) {
@@ -5114,7 +5865,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             if (finish && toolUV_.size() >= 2) {
                 nlohmann::json pts = nlohmann::json::array();
                 for (const auto& q : toolUV_) pts.push_back(nlohmann::json::array({q.x, q.y}));
-                nlohmann::json ent = {{"type", "spline"}, {"points", pts}};
+                const char* entType = (tool_ == SketchTool::StyleSpline) ? "style_spline" : "spline";
+                nlohmann::json ent = {{"type", entType}, {"points", pts}};
                 addEntity(st, ent, nlohmann::json::array());
                 resetTool();
             }
@@ -5122,8 +5874,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // C37-D: right-click ends the current chain/segment but keeps the tool armed (SW muscle
         // memory: the Line tool drops its in-progress points and waits for a fresh first point).
         // mouse_gestures is disabled in-sketch (viewport_panel), so the RMB is free here; consume it.
-        // C42: Spline owns its RMB (finish/drop, handled above).
-        if (tool_ != SketchTool::Spline && imgHovered &&
+        // C42: Spline / Style Spline own their RMB (finish/drop, handled above).
+        if (tool_ != SketchTool::Spline && tool_ != SketchTool::StyleSpline && imgHovered &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
             toolUV_.clear(); toolSnaps_.clear(); chainPrevId_.clear();
         }
@@ -5351,12 +6103,23 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          tool_ == SketchTool::Trim ? "Trim" :
                          tool_ == SketchTool::Extend ? "Extend" :
                          tool_ == SketchTool::Offset ? "Offset" :
+                         tool_ == SketchTool::SkFillet ? "Sketch Fillet" :
+                         tool_ == SketchTool::SkChamfer ? "Sketch Chamfer" :
+                         tool_ == SketchTool::Mirror ? "Mirror Entities" :
+                         tool_ == SketchTool::LinPattern ? "Linear Pattern" :
+                         tool_ == SketchTool::CircPattern ? "Circular Pattern" :
+                         tool_ == SketchTool::Convert ? "Convert Entities" :
+                         tool_ == SketchTool::Move ? "Move Entities" :
+                         tool_ == SketchTool::ArcTangent ? "Tangent Arc" :
                          tool_ == SketchTool::Arc3pt ? "3 Point Arc" :
                          tool_ == SketchTool::Polygon ? "Polygon" :
                          tool_ == SketchTool::RectCenter ? "Center Rectangle" :
                          tool_ == SketchTool::Point ? "Point" :
                          tool_ == SketchTool::Ellipse ? "Ellipse" :
-                         tool_ == SketchTool::Spline ? "Spline" : "";
+                         tool_ == SketchTool::Spline ? "Spline" :
+                         tool_ == SketchTool::StyleSpline ? "Style Spline" :
+                         tool_ == SketchTool::Text ? "Text" :
+                         tool_ == SketchTool::EqCurve ? "Equation Driven Curve" : "";
         // Per-stage step prompt (status-bar style) for the multi-click variants.
         const size_t n = toolUV_.size();
         const char* step = nullptr;
@@ -5409,6 +6172,38 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 step = offsetStage_ == 0 ? "click entities for the chain, then Enter"
                      : offsetStage_ == 1 ? "type the offset distance, Enter"
                      : "click the side to offset toward"; break;
+            case SketchTool::SkFillet: {
+                static char fb[64];
+                std::snprintf(fb, sizeof(fb), corner1Id_.empty()
+                                  ? "pick two lines (radius %.3g mm)"
+                                  : "pick the second line (radius %.3g mm)", skFilletRadius_);
+                step = fb; break;
+            }
+            case SketchTool::SkChamfer: {
+                static char cb[64];
+                std::snprintf(cb, sizeof(cb), corner1Id_.empty()
+                                  ? "pick two lines (distance %.3g mm)"
+                                  : "pick the second line (distance %.3g mm)", skChamferDist_);
+                step = cb; break;
+            }
+            case SketchTool::Mirror:
+                step = mpStage_ == 0 ? "click entities to mirror, then Enter"
+                                     : "click the mirror line (construction line)"; break;
+            case SketchTool::LinPattern:
+                step = mpStage_ == 0 ? "click entities to pattern, then Enter"
+                                     : "set count / spacing / direction, then Apply"; break;
+            case SketchTool::CircPattern:
+                step = mpStage_ == 0 ? "click entities to pattern, then Enter"
+                     : mpStage_ == 1 ? "click the pattern center point"
+                                     : "set count / angle, then Apply"; break;
+            case SketchTool::Convert:
+                step = "click a model edge or face to project into the sketch"; break;
+            case SketchTool::Move:
+                step = mpStage_ == 0 ? "click entities to move, then Enter"
+                     : mpStage_ == 1 ? "click the from point (anchor)"
+                                     : "click the to point \xC2\xB7 hold Ctrl to copy"; break;
+            case SketchTool::ArcTangent:
+                step = "click the arc end (it starts tangent to the prior/selected entity)"; break;
             case SketchTool::Arc3pt:
                 step = n == 0 ? "click arc start" : n == 1 ? "click arc end"
                      : "click a point on the arc"; break;
@@ -5423,6 +6218,14 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             case SketchTool::Spline:
                 step = n < 2 ? "click points; Enter / right-click / double-click to finish"
                              : "click more points \xC2\xB7 Enter / right-click / double-click finishes"; break;
+            case SketchTool::StyleSpline:
+                step = n < 2 ? "click control poles; Enter / right-click / double-click to finish"
+                             : "click more poles \xC2\xB7 Enter / right-click / double-click finishes"; break;
+            case SketchTool::Text:
+                step = textPopupOpen_ ? "type the text + height, then OK"
+                                      : "click to place the text"; break;
+            case SketchTool::EqCurve:
+                step = "enter x(t) / y(t) and the t range, then OK"; break;
             default: break;
         }
         std::string hint = std::string(tn) + (step ? std::string(" \xE2\x80\x94 ") + step : std::string());
@@ -5492,7 +6295,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
                          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
             const bool isAngle = dimIsAngle_;
-            const char* suffix = isAngle ? "\xC2\xB0" : "mm";
+            const char* suffix = isAngle ? "\xC2\xB0" : skLenUnit();
             // Friendly title + symbol per dim type.
             const char* title = dimType_ == "diameter" ? "\xE2\x8C\x80 Diameter"
                               : dimType_ == "radius"   ? "R Radius"
@@ -5503,7 +6306,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             ImGui::TextUnformatted(dimEditCid_.empty() ? title : (std::string("Edit ") + title).c_str());
             ImGui::PopStyleColor();
             {
-                std::string meas = isAngle ? fmtAng(dimMeasured_) : (fmtLen(dimMeasured_) + " mm");
+                std::string meas = isAngle ? fmtAng(dimMeasured_)
+                                           : (fmtLen(dimMeasured_) + " " + skLenUnit());
                 std::string lab = "now " + meas;
                 float w = ImGui::CalcTextSize(lab.c_str()).x;
                 ImGui::SameLine(0, 0);
@@ -5519,9 +6323,11 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             auto stepVal = [&](double delta) {
                 std::string txt = dimBuf_.data();
                 if (!txt.empty() && txt[0] == '=') return;   // don't mutate expressions
+                // Steps are one DISPLAY unit: in IPS a length step is 1 inch (= 25.4 mm canonical).
+                const double bareScale = (g_skIps && !isAngle) ? 25.4 : 1.0;
                 double cur = dimMeasured_; std::string perr;
-                if (pmParseDim(txt, cur, perr, isAngle)) {}  // parse current text if valid
-                cur += delta;
+                if (pmParseDim(txt, cur, perr, isAngle, bareScale)) {}  // parse current text if valid
+                cur += delta * ((isAngle) ? 1.0 : bareScale);
                 std::snprintf(dimBuf_.data(), dimBuf_.size(), "%s", fmtLen(cur).c_str());
             };
             const float btn = ImGui::GetFrameHeight();
@@ -5633,6 +6439,68 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         }
         ImGui::End();
     }
+
+    // ---- C52: Sketch Fillet / Chamfer numeric input (always shown while the tool is armed) ----
+    // A small always-on overlay near the status chip holds the radius (fillet) / distance (chamfer);
+    // the value persists across corners and invocations. Editing it never disturbs the pick state —
+    // the two lines are still picked by clicking in the viewport. Pinned top-left so it doesn't fight
+    // the cursor while the user clicks corners (unlike Offset's one-shot box near the cursor).
+    if (tool_ == SketchTool::SkFillet || tool_ == SketchTool::SkChamfer) {
+        const bool fillet = (tool_ == SketchTool::SkFillet);
+        ImGui::SetNextWindowPos(ImVec2(imgMin.x + 12, imgMin.y + 52), ImGuiCond_Appearing);
+        ImGui::SetNextWindowBgAlpha(0.98f);
+        if (ImGui::Begin(fillet ? "##SketchFilletParam" : "##SketchChamferParam", nullptr,
+                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::TextUnformatted(fillet ? "Fillet radius (mm)" : "Chamfer distance (mm)");
+            ImGui::SetNextItemWidth(120);
+            float* val = fillet ? &skFilletRadius_ : &skChamferDist_;
+            ImGui::InputFloat(fillet ? "##skfilletr" : "##skchamferd", val, 1.0f, 5.0f, "%.3f");
+            if (*val < 0.001f) *val = 0.001f;   // engine requires a strictly positive value
+        }
+        ImGui::End();
+    }
+
+    // ---- C53: Linear / Circular Pattern numeric panel (count + spacing/angle, then Apply) ----
+    // Shown once the entity selection is locked (Enter): Linear at stage 1, Circular at stage 2
+    // (after the center pick). The dims persist across invocations. Apply builds the op; Cancel
+    // backs out to re-pick. The viewport selection is frozen while the panel is up.
+    bool linPanel  = (tool_ == SketchTool::LinPattern  && mpStage_ == 1);
+    bool circPanel = (tool_ == SketchTool::CircPattern && mpStage_ == 2);
+    if (linPanel || circPanel) {
+        ImGui::SetNextWindowPos(ImVec2(imgMin.x + 12, imgMin.y + 52), ImGuiCond_Appearing);
+        ImGui::SetNextWindowBgAlpha(0.98f);
+        if (ImGui::Begin(linPanel ? "##SketchLinPattern" : "##SketchCircPattern", nullptr,
+                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::Text(linPanel ? "Linear Pattern (%d entities)" : "Circular Pattern (%d entities)",
+                        (int)mpSel_.size());
+            ImGui::Separator();
+            ImGui::SetNextItemWidth(120);
+            ImGui::InputInt("Count", &patternCount_);
+            if (patternCount_ < 2) patternCount_ = 2;   // engine requires count >= 2
+            if (linPanel) {
+                ImGui::SetNextItemWidth(120);
+                ImGui::InputFloat("Spacing (mm)", &patternSpacing_, 1.0f, 10.0f, "%.3f");
+                ImGui::SetNextItemWidth(180);
+                ImGui::InputFloat2("Direction (u,v)", &patternDirU_, "%.2f");
+            } else {
+                ImGui::SetNextItemWidth(120);
+                ImGui::InputFloat(patternEqualSpacing_ ? "Total angle (deg)" : "Step angle (deg)",
+                                  &patternAngle_, 1.0f, 15.0f, "%.2f");
+                ImGui::Checkbox("Equal spacing (full span)", &patternEqualSpacing_);
+            }
+            ImGui::Separator();
+            if (ImGui::Button("Apply")) applyPatternOp(st, circPanel);
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) { mpStage_ = circPanel ? 1 : 0; }
+        }
+        ImGui::End();
+    }
+
+    // ---- Sketch Text + Equation-Driven Curve parameter popups (engine entities text / eq_curve) ----
+    drawTextPopup(st, escHandled);
+    drawEqCurvePopup(st, escHandled);
 
     // ---- C50: Add Relation popup over an N-element selection (entities and/or point handles) ----
     // Classifies the snapshotted selection and offers the SolidWorks relations valid for it:

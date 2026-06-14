@@ -56,6 +56,10 @@ static PMFieldDef Int(const char* key, const char* label, const char* group, dou
     PMFieldDef f; f.kind = PMFieldKind::Int; f.key = key; f.label = label;
     f.group = group; f.dimDefault = def; f.unitLabel = ""; return f;
 }
+// Unitless Dim (real-valued, no "[mm]" suffix) — e.g. sheet-metal k-factor in 0..1.
+static PMFieldDef DimU(const char* key, const char* label, const char* group, double def) {
+    PMFieldDef f = Dim(key, label, group, def); f.unitLabel = ""; return f;
+}
 // Angle dim (shows "[deg]" instead of "[mm]"; value is plain degrees, like revolve's angle).
 static PMFieldDef Angle(const char* key, const char* label, const char* group, double def) {
     PMFieldDef f = Dim(key, label, group, def); f.unitLabel = " [deg]"; return f;
@@ -74,10 +78,17 @@ static PMFieldDef DatumRef(const char* key, const char* label, const char* group
     f.group = group; f.comboOptions = options; f.comboLabels = labels; return f;
 }
 // A feature-id list (refs _FEAT_LIST), seeded from the FeatureManager selection — the features a
-// pattern/mirror replicates.
+// pattern/mirror replicates. selMulti defaults true => emitted as refs[key] = [ids].
 static PMFieldDef FeatWell(const char* key, const char* label, const char* group) {
     PMFieldDef f; f.kind = PMFieldKind::FeatureWell; f.key = key; f.label = label;
     f.group = group; return f;
+}
+// SINGLE-feature-id FeatureWell: selMulti=false => buildOpFeature emits refs[key] = "<one id>"
+// (the bare string, not an array). For refs that take exactly one feature id, e.g.
+// weld_member's path sketch. The user fills it by selecting the sketch in the FeatureManager
+// tree and clicking "Add selected" (the well replaces any prior pick when single).
+static PMFieldDef FeatWell1(const char* key, const char* label, const char* group) {
+    PMFieldDef f = FeatWell(key, label, group); f.selMulti = false; return f;
 }
 // Check/Dim that is disabled and shows "(coming soon)" — discoverability only, never serialised.
 static PMFieldDef CheckSoon(const char* key, const char* label, const char* group) {
@@ -89,6 +100,10 @@ static PMFieldDef DimSoon(const char* key, const char* label, const char* group,
 static const PMSelKinds K_FACE   {true,  false, false};
 static const PMSelKinds K_EDGE   {false, true,  false};
 static const PMSelKinds K_VERTEX {false, false, true};
+static const PMSelKinds K_FEV    {true,  true,  true };   // face/edge/vertex (datum a / point target)
+static const PMSelKinds K_FACEEDGE {true, true,  false};  // face or edge (datum plane hinge / midplane #2)
+static const PMSelKinds K_FACEVERT {true, false, true};   // face or vertex (datum axis b)
+static const PMSelKinds K_BODY   {false, false, false, true};  // solid body (boolean targets/tools)
 
 // ----------------------------------------------------------------------------
 // The forms. Field order == feature_params.md order == PM tab order.
@@ -238,13 +253,19 @@ static const std::vector<PMFormDef>& forms() {
         // --- linear_pattern ---  dir1(+count/spacing), optional dir2, features[]
         //   Engine (pattern.py compile_linear_pattern): lays down a count1×count2 grid of the seed
         //   features' tool bodies (re-applying each boolean). count2=1 disables direction 2.
+        //   W2: an optional edge/planar-face Well shares each direction's ref key with the DatumRef.
+        //   Both emit refs[dir]; the Well is LATER in the form so a pick OVERRIDES the global-axis
+        //   datum (last-wins in buildOpFeature); empty Well => the axis combo's datum is used. The
+        //   engine (_resolve_direction) already resolves a model edge / planar face to a direction.
         { "linear_pattern", "Linear Pattern", "linear_pattern", {
             DatumRef ("dir1",     "Direction 1",  "Direction 1",
                       "axis.x|axis.y|axis.z", "X axis|Y axis|Z axis"),
+            Well     ("dir1",     "…or pick an edge", "Direction 1", K_FACEEDGE, false),
             Int      ("count1",   "Instances",    "Direction 1", 3),
             Dim      ("spacing1", "Spacing",      "Direction 1", 20.0),
             DatumRef ("dir2",     "Direction 2",  "Direction 2",
                       "axis.y|axis.x|axis.z", "Y axis|X axis|Z axis"),
+            Well     ("dir2",     "…or pick an edge", "Direction 2", K_FACEEDGE, false),
             Int      ("count2",   "Instances",    "Direction 2", 1),
             Dim      ("spacing2", "Spacing",      "Direction 2", 20.0),
             FeatWell ("features", "Features to Pattern", "Features to Pattern"),
@@ -255,6 +276,7 @@ static const std::vector<PMFormDef>& forms() {
         { "circular_pattern", "Circular Pattern", "circular_pattern", {
             DatumRef ("axis",     "Pattern Axis", "Parameters",
                       "axis.z|axis.x|axis.y", "Z axis|X axis|Y axis"),
+            Well     ("axis",     "…or pick edge/cyl face", "Parameters", K_FACEEDGE, false),
             Int      ("count",    "Instances",    "Parameters", 4),
             Angle    ("angle",    "Angle",        "Parameters", 360.0),
             Check    ("equal_spacing", "Equal spacing", "Parameters", true),
@@ -269,6 +291,199 @@ static const std::vector<PMFormDef>& forms() {
                       "plane.top|plane.front|plane.right",
                       "Top plane|Front plane|Right plane"),
             Well     ("faces",   "Faces to Draft", "Draft", K_FACE, true),
+        }},
+        // --- helix (Curve) --- engine features/curves.py. Produces a sweep PATH (a Sweep can then
+        //   reference this helix feature). v1 is "Height & Pitch"-defined; the engine derives turns
+        //   = height/pitch. radius defaults the coil radius when base is a datum plane.
+        { "helix", "Helix / Spiral", "curve_helix", {
+            DatumRef ("base",   "Axis Plane",       "Helix",
+                      "plane.top|plane.front|plane.right", "Top plane|Front plane|Right plane"),
+            Dim      ("radius", "Radius",           "Helix", 10.0),
+            Dim      ("pitch",  "Pitch",            "Helix", 5.0),
+            Dim      ("height", "Height",           "Helix", 20.0),
+            Angle    ("taper",  "Taper Angle",      "Helix", 0.0),
+            Angle    ("start_angle", "Start Angle", "Helix", 0.0),
+            Check    ("ccw",    "Counterclockwise", "Helix", true),
+        }},
+        // --- ref_plane (datum) --- engine datum.py compile_plane. method gates which refs apply:
+        //   offset/angle use base (+ second hinge for angle); three_point uses 3 vertices; midplane
+        //   uses base + second. base is a DatumRef (the 3 origin planes); second/points are picks.
+        { "plane", "Plane", "ref_plane", {
+            ComboL   ("method", "Type",            "First Reference",
+                      "offset|angle|three_point|midplane",
+                      "Offset|At Angle|Three Points|Mid Plane"),
+            DatumRef ("base",   "Reference",       "First Reference",
+                      "plane.top|plane.front|plane.right", "Top plane|Front plane|Right plane"),
+            DimIf    ("offset", "Offset Distance", "Parameters", 10.0, "method", "offset"),
+            AngleIf  ("angle",  "Angle",           "Parameters", 45.0, "method", "angle"),
+            WellIf   ("second", "Hinge / 2nd Plane","Second Reference", K_FACEEDGE, false,
+                      "method", "angle|midplane"),
+            WellIf   ("points", "Three Vertices",  "Points", K_VERTEX, true,
+                      "method", "three_point"),
+            Check    ("flip",   "Flip",            "Parameters", false),
+        }},
+        // --- ref_axis (datum) --- engine datum.py compile_axis. a = the primary reference (cyl
+        //   face / edge / vertex); b = the second vertex (two_points) or plane (plane_intersect).
+        { "axis", "Axis", "ref_axis", {
+            ComboL ("method", "Type",        "Reference",
+                    "cylinder|two_points|edge|plane_intersect",
+                    "Cylindrical Face|Two Points|Edge|Two Planes"),
+            Well   ("a",      "Reference 1", "Reference", K_FEV, false),
+            WellIf ("b",      "Reference 2", "Reference", K_FACEVERT, false,
+                    "method", "two_points|plane_intersect"),
+        }},
+        // --- ref_point (datum) --- engine datum.py compile_point. vertex/arc-center/on-face.
+        { "point", "Point", "ref_point", {
+            ComboL ("method", "Type",      "Reference",
+                    "vertex|center|on_face", "At Vertex|Arc/Circle Center|On Face"),
+            Well   ("target", "Reference", "Reference", K_FEV, false),
+        }},
+        // --- ref_csys (datum) --- engine datum.py compile_csys. origin + optional X/Y direction
+        //   edges (orthonormalized engine-side).
+        { "csys", "Coordinate System", "ref_csys", {
+            Well ("origin", "Origin",        "Coordinate System", K_VERTEX, false),
+            Well ("x_dir",  "X Axis (edge)", "Coordinate System", K_EDGE, false),
+            Well ("y_dir",  "Y Axis (edge)", "Coordinate System", K_EDGE, false),
+        }},
+        // --- boolean (Multi-body) --- engine features/boolean.py. op is preset from the ribbon
+        //   command (Combine/Subtract/Intersect), like extrude boss/cut. Body wells (K_BODY): a
+        //   pick resolves the clicked element's OWNING body (selection observer -> resolvePick body).
+        { "boolean", "Combine", "combine", {
+            ComboL ("op",         "Operation",          "Operation",
+                    "combine|subtract|intersect", "Add|Subtract|Common"),
+            Well   ("targets",    "Main / Target Bodies","Bodies", K_BODY, true),
+            Well   ("tools",      "Tool Bodies",        "Bodies", K_BODY, true),
+            Check  ("keep_tools", "Keep tool bodies",   "Options", false),
+        }},
+        // --- sm_base_flange (Sheet Metal) --- engine features/sheet_metal sm_base_flange. Profile is
+        //   a sketch region, resolved exactly like extrude's profile well (K_FACE, multi). thickness
+        //   drives the wall; k_factor (0..1, unitless) sets the bend-allowance neutral axis;
+        //   default_bend_radius seeds the inner radius (defaults to thickness engine-side).
+        { "sm_base_flange", "Base Flange", "extrude_boss", {
+            Well ("profile",            "Profile",            "Profile",          K_FACE, true),
+            Dim  ("thickness",          "Thickness",          "Sheet Metal Gauges", 2.0),
+            DimU ("k_factor",           "K-Factor",           "Sheet Metal Gauges", 0.45),
+            Dim  ("default_bend_radius","Bend Radius",        "Sheet Metal Gauges", 2.0),
+        }},
+        // --- sm_edge_flange (Sheet Metal) --- engine features/sheet_metal sm_edge_flange. The bend
+        //   edge is a single straight thickness-face edge (K_EDGE). angle 0..180 deg; length is the
+        //   flange wall; radius is the inner bend radius (defaults to thickness). position picks how
+        //   the flange aligns to the picked edge; flip mirrors the bend direction. k_factor is
+        //   inherited from the base flange — intentionally NOT on this form.
+        { "sm_edge_flange", "Edge Flange", "shell", {
+            Well   ("edge",     "Bend Edge",      "Flange",   K_EDGE, false),
+            Angle  ("angle",    "Angle",          "Flange",   90.0),
+            Dim    ("length",   "Length",         "Flange",   20.0),
+            Dim    ("radius",   "Bend Radius",    "Flange",   2.0),
+            ComboL ("position", "Flange Position","Flange",
+                    "material_inside|material_outside|bend_outside",
+                    "Material Inside|Material Outside|Bend Outside"),
+            Check  ("flip",     "Reverse direction","Flange", false),
+        }},
+        // --- sm_hem (Sheet Metal) --- engine features/sheet_metal sm_hem. Fold a straight thickness-
+        //   face edge back on itself. type picks closed (180° flat fold, tiny gap) / open (180° at a
+        //   real radius, visible standoff) / teardrop (curls past 180°). length is the hem return
+        //   wall; radius is the inner bend radius (defaults engine-side: ~T/2 for closed, T else).
+        //   flip mirrors the fold side. k_factor inherited from the base flange (not on this form).
+        { "sm_hem", "Hem", "shell", {
+            Well   ("edge",   "Bend Edge",      "Hem",   K_EDGE, false),
+            ComboL ("type",   "Hem Type",       "Hem",
+                    "closed|open|teardrop", "Closed|Open|Teardrop"),
+            Dim    ("length", "Length",         "Hem",   10.0),
+            Dim    ("radius", "Bend Radius",    "Hem",   2.0),
+            Check  ("flip",   "Reverse direction","Hem", false),
+        }},
+        // --- sm_jog (Sheet Metal) --- engine features/sheet_metal sm_jog. Two opposing bends that
+        //   step the flange to a parallel plane offset by the Z-step. angle is the jog bend angle
+        //   (0..90]; offset is the step height; length is the flat end flange; radius is the inner
+        //   bend radius (defaults to thickness). position aligns the first bend to the picked edge;
+        //   flip mirrors the bend direction. k_factor inherited from the base flange.
+        { "sm_jog", "Jog", "extrude_boss", {
+            Well   ("edge",     "Bend Edge",      "Jog",   K_EDGE, false),
+            Angle  ("angle",    "Angle",          "Jog",   90.0),
+            Dim    ("offset",   "Offset",         "Jog",   10.0),
+            Dim    ("length",   "Length",         "Jog",   20.0),
+            Dim    ("radius",   "Bend Radius",    "Jog",   2.0),
+            ComboL ("position", "Flange Position","Jog",
+                    "material_inside|material_outside|bend_outside",
+                    "Material Inside|Material Outside|Bend Outside"),
+            Check  ("flip",     "Reverse direction","Jog", false),
+        }},
+        // --- weld_member (Weldments / Structural Member) --- engine features weld_member. Sweeps a
+        //   library profile along the segments of ONE path sketch (refs.sketch = a single sketch
+        //   feature-id STRING, not an array — FeatWell1 single-emit). segments are OMITTED here so the
+        //   engine defaults to ALL sketch segments. The profile combo picks one of six library shapes;
+        //   each shape's dim keys are gated on that combo with omit=true so only the active profile's
+        //   dims are emitted (the engine's per-profile defaults drive the rest). thickness applies to
+        //   every profile. angle rotates the section; justify centres vs corner-aligns it to the path;
+        //   trim_corners miters where members meet.
+        { "weld_member", "Structural Member", "sweep", {
+            FeatWell1 ("sketch",  "Path Sketch",   "Selections"),
+            ComboL    ("profile", "Profile",       "Profile",
+                       "square_tube|rect_tube|round_tube|angle_L|flat_bar|c_channel",
+                       "Square Tube|Rect Tube|Round Tube|Angle (L)|Flat Bar|C-Channel"),
+            DimIf     ("size",    "Size",          "Profile", 20.0, "profile", "square_tube",          true),
+            DimIf     ("w",       "Width",         "Profile", 40.0, "profile", "rect_tube|c_channel|flat_bar", true),
+            DimIf     ("h",       "Height",        "Profile", 20.0, "profile", "rect_tube|c_channel",  true),
+            DimIf     ("od",      "Outer Dia.",    "Profile", 25.0, "profile", "round_tube",           true),
+            DimIf     ("leg",     "Leg",           "Profile", 25.0, "profile", "angle_L",              true),
+            Dim       ("thickness","Thickness",    "Profile", 2.0),
+            Angle     ("angle",   "Rotation",      "Settings", 0.0),
+            ComboL    ("justify", "Justify",       "Settings", "center|corner", "Center|Corner"),
+            Check     ("trim_corners", "Trim corners", "Settings", true),
+        }},
+        // --- weld_gusset (Weldments / Gusset) --- engine features/weldment weld_gusset. A triangular
+        //   (or polygonal cut-corner) reinforcing plate welded into the L-corner of two members. The
+        //   faces well takes TWO planar faces (one on each member at the corner — e.g. the two
+        //   members' top faces); the engine recovers each member axis from the pick and builds the
+        //   plate in the faces' shared plane. d1/d2 are the legs along each member; type picks the
+        //   plate shape; location shifts the plate ±½·thickness off the shared plane.
+        { "weld_gusset", "Gusset", "shell", {
+            Well   ("faces",     "Supporting Faces", "Selections", K_FACE, true),
+            Dim    ("thickness", "Thickness",        "Gusset",  5.0),
+            Dim    ("d1",        "Leg 1 (d1)",       "Gusset",  30.0),
+            Dim    ("d2",        "Leg 2 (d2)",       "Gusset",  30.0),
+            ComboL ("type",      "Profile",          "Gusset",
+                    "triangular|polygonal", "Triangular|Polygonal"),
+            ComboL ("location",  "Location",         "Settings",
+                    "centered|inner|outer", "Centered|Inner|Outer"),
+            Dim    ("offset",    "Offset",           "Settings", 0.0),
+        }},
+        // --- weld_end_cap (Weldments / End Cap) --- engine features/weldment weld_end_cap. A plate
+        //   closing the open END of a hollow member. The face well takes ONE planar member end face.
+        //   type: outer mounts a plate covering the whole tube end + overhang on the end face; inner
+        //   insets a plate matching the bore into the tube. offset shifts along the member axis.
+        { "weld_end_cap", "End Cap", "fillet", {
+            Well   ("face",      "End Face",         "Selections", K_FACE, false),
+            Dim    ("thickness", "Thickness",        "End Cap", 5.0),
+            ComboL ("type",      "Type",             "End Cap",
+                    "outer|inner", "Outer (on end)|Inner (inset)"),
+            DimU   ("overhang",  "Overhang",         "End Cap", 0.0),
+            Dim    ("offset",    "Offset",           "End Cap", 0.0),
+        }},
+        // --- rib (Dress-up / Stretch) --- engine features/rib.py. A thin support wall grown from an
+        //   OPEN sketch contour (a line/chain bridging the gap). The profile well is a region well
+        //   (key "profile" -> the viewport region picker fills it, like extrude), but the engine reads
+        //   the sketch's OPEN contour, not a closed region. thickness is the wall width; side centres
+        //   it (both) or grows to one side (one); draft tapers the sides; flip flips the one-sided dir.
+        { "rib", "Rib", "rib", {
+            Well   ("profile",   "Profile (open contour)", "Profile", K_FACE, true),
+            Dim    ("thickness", "Thickness",              "Rib",     3.0),
+            ComboL ("side",      "Thickness Side",         "Rib",
+                    "both|one", "Both (centered)|One Side"),
+            Angle  ("draft",     "Draft Angle",            "Rib",     0.0),
+            Check  ("flip",      "Reverse direction",      "Rib",     false),
+        }},
+        // --- split (Curves / Stretch) --- engine features/split.py. Divide the running body(ies) by a
+        //   planar tool into above/below pieces. The tool is a standard datum plane (DatumRef) OR a
+        //   picked planar model face (the Well shares the "tool" key and is LATER, so a pick overrides
+        //   the datum — last-wins in buildOpFeature). keep chooses which resulting piece(s) to keep.
+        { "split", "Split", "split", {
+            DatumRef ("tool", "Tool Plane",          "Trim/Split Tool",
+                      "plane.top|plane.front|plane.right", "Top plane|Front plane|Right plane"),
+            Well     ("tool", "…or pick a planar face", "Trim/Split Tool", K_FACE, false),
+            ComboL   ("keep", "Resulting Bodies",    "Resulting Bodies",
+                      "both|above|below", "Keep Both|Keep Above|Keep Below"),
         }},
     };
     return kForms;
@@ -301,6 +516,28 @@ const PMFormDef* pmFormForCommand(const std::string& cmdId, std::string& mode) {
     if (cmdId == "mirror_feature")   return pmFindForm("mirror");
     if (cmdId == "linear_pattern")   return pmFindForm("linear_pattern");
     if (cmdId == "circular_pattern") return pmFindForm("circular_pattern");
+    // Curves + reference geometry + multi-body booleans (W3/W4 — engine compilers now exist).
+    if (cmdId == "curve_helix")      return pmFindForm("helix");
+    if (cmdId == "ref_plane")        return pmFindForm("plane");
+    if (cmdId == "ref_axis")         return pmFindForm("axis");
+    if (cmdId == "ref_point")        return pmFindForm("point");
+    if (cmdId == "ref_csys")         return pmFindForm("csys");
+    if (cmdId == "boolean_combine")   { mode = "combine";   return pmFindForm("boolean"); }
+    if (cmdId == "boolean_subtract")  { mode = "subtract";  return pmFindForm("boolean"); }
+    if (cmdId == "boolean_intersect") { mode = "intersect"; return pmFindForm("boolean"); }
+    // Sheet Metal — ribbon cmd id == the engine feature type, so route straight through.
+    if (cmdId == "sm_base_flange")    return pmFindForm("sm_base_flange");
+    if (cmdId == "sm_edge_flange")    return pmFindForm("sm_edge_flange");
+    if (cmdId == "sm_hem")            return pmFindForm("sm_hem");
+    if (cmdId == "sm_jog")            return pmFindForm("sm_jog");
+    // Weldments — ribbon cmd id == the engine feature type.
+    if (cmdId == "weld_member")       return pmFindForm("weld_member");
+    if (cmdId == "weld_gusset")       return pmFindForm("weld_gusset");
+    if (cmdId == "weld_end_cap")      return pmFindForm("weld_end_cap");
+    // Stretch — rib (thin wall from an open contour) + split (divide by a planar tool). cmd id ==
+    // the engine feature type.
+    if (cmdId == "rib")               return pmFindForm("rib");
+    if (cmdId == "split")             return pmFindForm("split");
     // Primitive quick-start commands (AI-CAD extensions; not in the C14 ribbon but reachable
     // via the M1 scenario / future "Insert > Primitive" entries).
     if (cmdId == "box")           return pmFindForm("box");

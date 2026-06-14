@@ -66,6 +66,7 @@ void loadSettings(Settings& s) {
         s.maxIters = j.value("max_iters", 0);
         s.systemPrompt = j.value("system_prompt", "");
         s.theme = j.value("theme", "dark");
+        s.units = (j.value("units", std::string("mmgs")) == "ips") ? Units::IPS : Units::MMGS;
     } catch (...) {
     }
 }
@@ -91,6 +92,7 @@ void saveSettings(const Settings& s) {
     if (s.maxIters > 0) j["max_iters"] = s.maxIters;
     if (!s.systemPrompt.empty()) j["system_prompt"] = s.systemPrompt;
     j["theme"] = s.theme;
+    j["units"] = (s.units == Units::IPS) ? "ips" : "mmgs";
     try {
         std::filesystem::create_directories(appdataDir() + "\\AI-CAD");
         std::ofstream(configPath()) << j.dump(2);

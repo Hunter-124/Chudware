@@ -39,7 +39,7 @@ static const RibbonCmd kCmds[] = {
     { "chamfer",           "Chamfer",        "chamfer",         "Features", "Dress-up",        true,  nullptr,          false },
     { "shell",             "Shell",          "shell",           "Features", "Dress-up",        true,  nullptr,          false },
     { "draft",             "Draft",          "draft",           "Features", "Dress-up",        false, nullptr,          false },
-    { "rib",               "Rib",            "rib",             "Features", "Dress-up",        false, nullptr,          true  },
+    { "rib",               "Rib",            "rib",             "Features", "Dress-up",        false, nullptr,          false },
 
     // --- Group: Hole ---
     { "hole_wizard",       "Hole Wizard",    "hole_wizard",     "Features", "Hole",            true,  nullptr,          false },
@@ -62,7 +62,7 @@ static const RibbonCmd kCmds[] = {
 
     // --- Group: Curves ---
     { "curve_helix",       "Helix",          "curve_helix",     "Features", "Curves",          true,  nullptr,          false },
-    { "split",             "Split",          "split",           "Features", "Curves",          false, nullptr,          true  },
+    { "split",             "Split",          "split",           "Features", "Curves",          false, nullptr,          false },
 
     // =========================================================================
     // Tab: Sketch
@@ -78,14 +78,14 @@ static const RibbonCmd kCmds[] = {
     { "sk_circle",         "Circle",         "circle",          "Sketch",   "Draw",            true,  nullptr,          false },
     { "sk_arc_3pt",        "3-Pt Arc",       "arc_3pt",         "Sketch",   "Draw",            true,  nullptr,          false },
     { "sk_arc_center",     "Ctr. Arc",       "arc_center",      "Sketch",   "Draw",            false, "sk_arc_3pt",     false },
-    // C42 honesty: tangent arc has no SketchMode handler yet — greyed (Coming soon).
-    { "sk_arc_tangent",    "Tang. Arc",      "arc_tangent",     "Sketch",   "Draw",            false, "sk_arc_3pt",     true  },
+    // C54: tangent arc wired — starts tangent to the prior/selected entity's free endpoint.
+    { "sk_arc_tangent",    "Tang. Arc",      "arc_tangent",     "Sketch",   "Draw",            false, "sk_arc_3pt",     false },
     { "sk_polygon",        "Polygon",        "polygon",         "Sketch",   "Draw",            true,  nullptr,          false },
     { "sk_slot",           "Slot",           "slot",            "Sketch",   "Draw",            true,  nullptr,          false },
     { "sk_spline",         "Spline",         "spline",          "Sketch",   "Draw",            true,  nullptr,          false },
     { "sk_ellipse",        "Ellipse",        "ellipse",         "Sketch",   "Draw",            false, nullptr,          false },
     { "sk_point",          "Point",          "point_ent",       "Sketch",   "Draw",            false, nullptr,          false },
-    { "sk_text",           "Text",           "text_ent",        "Sketch",   "Draw",            false, nullptr,          true  },
+    { "sk_text",           "Text",           "text_ent",        "Sketch",   "Draw",            false, nullptr,          false },
 
     // --- Group: Smart Dimension ---
     { "smart_dim",         "Smart Dim.",     "smart_dim",       "Sketch",   "Dimension",       true,  nullptr,          false },
@@ -94,20 +94,24 @@ static const RibbonCmd kCmds[] = {
     { "sk_trim",           "Trim",           "trim",            "Sketch",   "Sketch Tools",    true,  nullptr,          false },
     { "sk_extend",         "Extend",         "extend",          "Sketch",   "Sketch Tools",    true,  nullptr,          false },
     { "sk_offset_ent",     "Offset",         "offset_ent",      "Sketch",   "Sketch Tools",    true,  nullptr,          false },
-    // C42 honesty: convert/mirror/patterns/move have no SketchMode handler (engine ops still
-    // schema-reserved _op_unsupported_m2) — greyed (Coming soon) instead of eating clicks.
-    { "sk_convert_ent",    "Convert",        "convert_ent",     "Sketch",   "Sketch Tools",    true,  nullptr,          true  },
+    // C52: line-line corner fillet / chamfer (engine ops sketch_fillet / sketch_chamfer).
+    { "sk_fillet",         "Sk. Fillet",     "fillet",          "Sketch",   "Sketch Tools",    false, nullptr,          false },
+    { "sk_chamfer",        "Sk. Chamfer",    "chamfer",         "Sketch",   "Sketch Tools",    false, nullptr,          false },
+    // C53: convert / mirror / linear+circular patterns wired to real engine ops
+    // (sketch_convert / sketch_mirror_entities / sketch_pattern_entities).
+    { "sk_convert_ent",    "Convert",        "convert_ent",     "Sketch",   "Sketch Tools",    true,  nullptr,          false },
     { "sk_construction",   "Construction",   "construction",    "Sketch",   "Sketch Tools",    false, nullptr,          false },
-    { "sk_mirror",         "Mirror",         "mirror_ent",      "Sketch",   "Sketch Tools",    false, nullptr,          true  },
-    { "sk_lin_pattern",    "Lin. Pattern",   "pattern_lin_ent", "Sketch",   "Sketch Tools",    false, nullptr,          true  },
-    { "sk_circ_pattern",   "Circ. Pattern",  "pattern_circ_ent","Sketch",   "Sketch Tools",    false, nullptr,          true  },
-    { "sk_move",           "Move",           "move_ent",        "Sketch",   "Sketch Tools",    false, nullptr,          true  },
+    { "sk_mirror",         "Mirror",         "mirror_ent",      "Sketch",   "Sketch Tools",    false, nullptr,          false },
+    { "sk_lin_pattern",    "Lin. Pattern",   "pattern_lin_ent", "Sketch",   "Sketch Tools",    false, nullptr,          false },
+    { "sk_circ_pattern",   "Circ. Pattern",  "pattern_circ_ent","Sketch",   "Sketch Tools",    false, nullptr,          false },
+    // C54: Move/Copy wired to the sketch_move engine op (select entities, from-pt -> to-pt delta).
+    { "sk_move",           "Move",           "move_ent",        "Sketch",   "Sketch Tools",    false, nullptr,          false },
 
     // --- Group: Relations ---
     // C42: sk_relations wired (Add Relation popup over the selection). sk_fix greyed — Fix is
     // reachable via that popup (single entity selected); a dedicated handler can enable it later.
     { "sk_relations",      "Relations",      "relations",       "Sketch",   "Relations",       true,  nullptr,          false },
-    { "sk_fix",            "Fix",            "fix",             "Sketch",   "Relations",       false, nullptr,          true  },
+    { "sk_fix",            "Fix",            "fix",             "Sketch",   "Relations",       false, nullptr,          false },
 
     // =========================================================================
     // Tab: Evaluate
@@ -122,13 +126,13 @@ static const RibbonCmd kCmds[] = {
     { "eval_draft",        "Draft Anlys.",   "draft_analysis",  "Evaluate", "Geometry",        true,  nullptr,          false },
     { "eval_thickness",    "Thickness",      "thickness",       "Evaluate", "Geometry",        true,  nullptr,          false },
     { "eval_curvature",    "Curvature",      "curvature",       "Evaluate", "Geometry",        true,  nullptr,          false },
-    { "eval_zebra",        "Zebra",          "zebra",           "Evaluate", "Geometry",        false, nullptr,          true  },
+    { "eval_zebra",        "Zebra",          "zebra",           "Evaluate", "Geometry",        false, nullptr,          false },
     { "eval_symmetry",     "Symmetry",       "symmetry_check",  "Evaluate", "Geometry",        false, nullptr,          false },
 
     // --- Group: Check ---
     { "eval_check",        "Check",          "check",           "Evaluate", "Geometry Check",  true,  nullptr,          false },
     { "eval_interference", "Interference",   "interference_eval","Evaluate","Geometry Check",  true,  nullptr,          false },
-    { "eval_geometry",     "Geometry Anlys.","geometry_analysis","Evaluate","Geometry Check",  false, nullptr,          true  },
+    { "eval_geometry",     "Geometry Anlys.","geometry_analysis","Evaluate","Geometry Check",  false, nullptr,          false },
 
     // =========================================================================
     // Tab: Simulation
@@ -199,9 +203,9 @@ static const RibbonCmd kCmds[] = {
     { "sk_slot_arc_ctr",     "Ctr. Arc Slot",   "slot_arc_ctr",     "Sketch", "Draw", false, "sk_slot",        false },
 
     // --- Spline flyout (parent: sk_spline) ---
-    { "sk_spline_style",     "Style Spline",    "spline_style",     "Sketch", "Draw", false, "sk_spline",      true  },
+    { "sk_spline_style",     "Style Spline",    "spline_style",     "Sketch", "Draw", false, "sk_spline",      false },
     { "sk_spline_surface",   "Spline on Surf.", "spline_surface",   "Sketch", "Draw", false, "sk_spline",      true  },
-    { "sk_spline_equation",  "Eq. Driven Crv.", "spline_equation",  "Sketch", "Draw", false, "sk_spline",      true  },
+    { "sk_spline_equation",  "Eq. Driven Crv.", "spline_equation",  "Sketch", "Draw", false, "sk_spline",      false },
 
     // --- Ellipse flyout (new big-button parent; original sk_ellipse small-btn kept for compat) ---
     // sk_ellipse_big is the split-button parent with sub-variants. W4-K: enabled (stretch=false) so
@@ -213,6 +217,45 @@ static const RibbonCmd kCmds[] = {
     { "sk_ellipse_partial",  "Partial Ellipse", "ellipse_partial",  "Sketch", "Draw", false, "sk_ellipse_big", false },
     { "sk_parabola",         "Parabola",        "parabola",         "Sketch", "Draw", false, "sk_ellipse_big", false },
     { "sk_conic",            "Conic",           "conic",            "Sketch", "Draw", false, "sk_ellipse_big", false },
+
+    // DRAWINGS module — "Make Drawing" entry point. Lives on the Evaluate tab (the produce-a-
+    // deliverable home) in its own group. From an open part it creates a drawing sheet with the
+    // standard four views and opens it as a Drawing tab. Reuses the section_props icon as a
+    // sheet-ish glyph until a dedicated drawing icon ships.
+    { "make_drawing",        "Make Drawing",    "section_props",    "Evaluate", "Drawing",        true,  nullptr,          false },
+
+    // =========================================================================
+    // Tab: Sheet Metal — base + edge flange drive the engine sm_* features.
+    // cmd_id == engine feature type (pmFormForCommand routes straight through).
+    // Icons reuse extrude_boss (base) and shell (edge); ribbon falls back gracefully.
+    // =========================================================================
+
+    // --- Group: Create ---
+    { "sm_base_flange",      "Base Flange",     "extrude_boss",     "Sheet Metal", "Create",      true,  nullptr,          false },
+    { "sm_edge_flange",      "Edge Flange",     "shell",            "Sheet Metal", "Create",      true,  nullptr,          false },
+    // Hem (fold an edge back on itself) + Jog (two bends -> a parallel offset step). cmd_id ==
+    // engine feature type (pmFormForCommand routes straight through). Icons reuse shell/extrude_boss.
+    { "sm_hem",              "Hem",             "shell",            "Sheet Metal", "Create",      true,  nullptr,          false },
+    { "sm_jog",              "Jog",             "extrude_boss",     "Sheet Metal", "Create",      true,  nullptr,          false },
+    // W16: one-click Flatten — adds the param-less sm_flat_pattern feature (handled in app.cpp).
+    { "sm_flat_pattern",     "Flatten",         "shell",            "Sheet Metal", "Flat Pattern",true,  nullptr,          false },
+    // W14: export the flat pattern (outline on layer OUTLINE + bend lines on layer BEND) to DXF.
+    // One-click command (no PM form) — handled in app.cpp like Flatten, via export_flat_dxf.
+    { "sm_export_flat_dxf",  "Export Flat DXF", "section_props",    "Sheet Metal", "Flat Pattern",true,  nullptr,          false },
+
+    // =========================================================================
+    // Tab: Weldments — sweeps a library profile along a path sketch's segments.
+    // cmd_id == engine feature type weld_member (pmFormForCommand routes straight through).
+    // Reuses the sweep icon (a structural member is a profile swept along a path).
+    // =========================================================================
+
+    // --- Group: Structural ---
+    { "weld_member",         "Structural Member","sweep",           "Weldments",   "Structural",  true,  nullptr,          false },
+
+    // --- Group: Dress --- gusset (corner plate) + end cap (closes a tube end). cmd_id == engine
+    // feature type (pmFormForCommand routes straight through). Reuse shell/fillet icons.
+    { "weld_gusset",         "Gusset",          "shell",            "Weldments",   "Dress",       true,  nullptr,          false },
+    { "weld_end_cap",        "End Cap",         "fillet",           "Weldments",   "Dress",       true,  nullptr,          false },
 
     // =========================================================================
     // Tab: PCB  (Wave N — AI-ECAD electrical design: schematic capture, PCB layout, sim)

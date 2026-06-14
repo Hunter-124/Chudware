@@ -1,7 +1,11 @@
 // AI-CAD Viewport panel — 3D orbit view + parts list + fit readout + overlays.
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <string>
+#include <vector>
 
 #include "imgui.h"
 
@@ -24,6 +28,7 @@
 #include "sketch_mode.h"   // C18
 #include "property_manager.h"  // C27-A: in-viewport parameter callouts
 #include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
+#include "drawing_panel.h"  // DRAWINGS: 2D sheet renderer for a Drawing tab
 
 namespace ui {
 
@@ -42,6 +47,248 @@ static ImVec2 s_zoomAreaP1 = {0, 0};  // drag current (screen)
 // C37-C: LMB drag-threshold state — suppress orbit micro-movement on click-selects.
 static bool   s_lmbDragActive  = false;  // true once the 4px threshold has been crossed
 static ImVec2 s_lmbDragOrigin  = {0, 0}; // screen position of the LMB press
+
+// ---- Instant3D push-pull (drag-to-modify a face) -------------------------------------------
+// When EXACTLY ONE face is selected we draw a normal-axis drag handle (a short ⟂ arrow + its
+// mirror) at the face centroid. Pressing on the arrow starts a push-pull drag instead of an orbit:
+// the cursor's screen motion is projected onto the face-normal's screen direction and converted
+// px→mm at the face depth, then fed to doc_push_pull through the checkpoint/revert envelope.
+struct PushPullDrag {
+    bool      active     = false;     // a push-pull drag is in flight (owns the mouse, no orbit)
+    uint32_t  bodyId     = 0;         // PickHit body (1-based) of the dragged face
+    uint32_t  topoId     = 0;         // picked FACE topo_id (1-based)
+    std::string checkpoint;           // doc_checkpoint id taken on press (for revert/cancel)
+    ImVec2    pressPos    = {0, 0};    // screen pos at press (drag origin)
+    float     nsx = 0, nsy = 0;       // unit screen-space direction of the face OUTWARD normal
+    float     worldPerPx  = 1.0f;     // world(mm) per screen pixel at the face depth (this frame)
+    double    lastApplied = 1e30f;    // last cumulative distance actually sent (skip dup samples)
+    double    curDist     = 0.0;      // current cumulative signed distance (mm)
+    // Live readout from the most recent draggable response (shown near the cursor).
+    bool        haveReadout = false;
+    std::string param;                // e.g. "depth"
+    double      newValue  = 0.0;
+    bool        clamped   = false;
+    // Persists across the frame so the readout chip can draw even on a no-op sample.
+    void reset() { *this = PushPullDrag{}; }
+};
+static PushPullDrag s_pp;
+
+// ---- Instant3D dimension-handle drag (drag a FEATURE'S DIMENSION) --------------------------
+// Complements the face push-pull (W8): when a FEATURE is selected (in the tree or via its
+// geometry) — even with NO PropertyManager form open — we render its key linear/angular
+// dimensions as draggable chips anchored near the feature's geometry. Dragging a dimension
+// handle sets that ONE param to a new ABSOLUTE value live via edit_feature, mirroring the PM
+// preview path: doc_checkpoint on press, then per sample doc_revert + applyOps(edit_feature with
+// the full params, one field changed) + loadDocMesh, and on release one committed edit_feature
+// (single undo entry). Esc cancels (revert). Throttled to one in-flight call.
+//
+// Which params are draggable is read from the PM-form field table (pm_forms): every enabled Dim
+// field whose param exists on the feature is a candidate. Angle dims (unitLabel " [deg]") drag in
+// degrees; length dims drag in mm using the same 1mm-world-probe px->scale as ppHandleGeometry.
+//
+// Precedence vs the W8 face arrow: the face arrow wins. The dimension handles are SUPPRESSED for
+// the feature whenever a single FACE is selected (that face shows the push-pull arrow). They show
+// when a feature is selected with no single drivable face under the cursor (tree selection, a
+// body/edge pick, or a multi-face selection). This keeps the two gestures from ever overlapping.
+struct DimDrag {
+    bool        active   = false;     // a dimension drag is in flight (owns the mouse, no orbit)
+    std::string featureId;            // the feature being edited
+    std::string param;                // the param key being driven ("depth"/"radius"/"angle"/…)
+    bool        angle    = false;     // true => value is degrees (drag maps px->deg)
+    std::string label;                // PM label ("Depth"/"Radius"/"Angle"/…)
+    std::string checkpoint;           // doc_checkpoint id taken on press (for revert/cancel)
+    nlohmann::json baseParams;        // the feature's params at press (full; one field changes)
+    nlohmann::json baseRefs;          // the feature's refs at press (emitted unchanged)
+    double      oldValue = 0.0;       // value before the drag
+    double      curValue = 0.0;       // current applied value
+    double      lastApplied = 1e30;   // last value actually sent (skip dup samples)
+    bool        clamped  = false;     // last sample hit the min/range clamp
+    ImVec2      pressPos = {0, 0};    // screen pos at press (drag origin)
+    float       dsx = 0, dsy = 0;     // unit screen-space drag direction (value grows along this)
+    float       worldPerPx = 1.0f;    // mm per screen px along the measured world direction
+    float       degPerPx   = 0.5f;    // deg per screen px (angle dims)
+    bool        haveReadout = false;  // show the readout chip
+    void reset() { *this = DimDrag{}; }
+};
+static DimDrag s_dim;
+
+// One draggable dimension of the selected feature: the param key, its PM label, whether it is an
+// angle, the world anchor point (where the handle sits), and the unit world DIRECTION the value is
+// measured along (a length grows by +1 value per +1mm along dirW; an angle ignores dirW).
+struct DimCandidate {
+    std::string param;
+    std::string label;
+    bool        angle = false;
+    double      value = 0.0;        // current stored value (mm or deg)
+    float       anchor[3] = {0, 0, 0};
+    Vec3        dirW;               // unit world direction the dim is measured along (length dims)
+};
+
+// Find the feature object (by id) in the mirror tree. Returns nullptr if absent / not a part doc.
+static const nlohmann::json* findFeature(const nlohmann::json& tree, const std::string& fid) {
+    if (fid.empty() || !tree.is_object()) return nullptr;
+    auto feat = tree.find("features");
+    if (feat == tree.end() || !feat->is_array()) return nullptr;
+    for (const auto& f : *feat)
+        if (f.is_object() && f.value("id", std::string()) == fid) return &f;
+    return nullptr;
+}
+
+// Current stored value of a dim-or-number param (resolves the {value,expr} shape or a bare number).
+// Returns false when absent, non-numeric, or expression-driven (a drag must never stomp an expr).
+static bool dimParamValue(const nlohmann::json& params, const std::string& key, double& out,
+                          bool& isExpr) {
+    isExpr = false;
+    auto it = params.find(key);
+    if (it == params.end()) return false;
+    if (it->is_object()) {
+        auto ev = it->find("expr");
+        if (ev != it->end() && ev->is_string() && !ev->get<std::string>().empty()) {
+            isExpr = true; return false;   // equation-driven — not draggable
+        }
+        auto vv = it->find("value");
+        if (vv == it->end() || !vv->is_number()) return false;
+        out = vv->get<double>(); return true;
+    }
+    if (it->is_number()) { out = it->get<double>(); return true; }
+    return false;
+}
+
+// World direction a given dim is measured along (length dims only; angle dims ignore it). The map
+// mirrors the box/extrude conventions the engine push-pull uses (x->length, y->width, z->height)
+// and falls back to world-X for "size" dims that have no principal axis (radius/thickness/diameter).
+static Vec3 dimWorldDir(const std::string& param) {
+    if (param == "width")                              return Vec3(0, 1, 0);
+    if (param == "height" || param == "depth" ||
+        param == "depth2" || param == "offset" ||
+        param == "pitch"  || param == "thickness")     return Vec3(0, 0, 1);
+    // length/radius/radius2/diameter/distance/spacing/dx/dy and any other size dim grow along +X.
+    return Vec3(1, 0, 0);
+}
+
+// World anchor for the selected feature's handles: the centre of the union AABB of the bodies the
+// feature owns (owner map), else any cached face/edge centroid the feature owns, else the scene
+// centre. Also returns a representative extent (half-diagonal) used to space the handles out.
+static bool featureAnchor(AppState& st, const std::string& fid, float out[3], float& extent) {
+    float bmin[3] = { 1e30f,  1e30f,  1e30f};
+    float bmax[3] = {-1e30f, -1e30f, -1e30f};
+    bool got = false;
+    auto grow = [&](const float* b /*6*/) {
+        for (int i = 0; i < 3; ++i) {
+            if (b[i]   < bmin[i]) bmin[i] = b[i];
+            if (b[i+3] > bmax[i]) bmax[i] = b[i+3];
+        }
+        got = true;
+    };
+    const auto& om = st.docMirror.ownerMap();
+    auto oit = om.find(fid);
+    if (oit != om.end()) {
+        for (uint32_t bodyId : oit->second.bodies) {
+            auto bit = st.bodyBBoxCache.find(bodyId);
+            if (bit != st.bodyBBoxCache.end()) grow(bit->second.data());
+        }
+        if (!got) {  // no body bbox (dress-up feature owns faces, not whole bodies): use its faces
+            for (const auto& bf : oit->second.faces) {
+                uint64_t key = ((uint64_t)bf.first << 32) | (uint64_t)bf.second;
+                auto fbit = st.faceBBoxCache.find(key);
+                if (fbit != st.faceBBoxCache.end()) grow(fbit->second.data());
+            }
+        }
+    }
+    if (got) {
+        out[0] = (bmin[0] + bmax[0]) * 0.5f;
+        out[1] = (bmin[1] + bmax[1]) * 0.5f;
+        out[2] = (bmin[2] + bmax[2]) * 0.5f;
+        float dx = bmax[0] - bmin[0], dy = bmax[1] - bmin[1], dz = bmax[2] - bmin[2];
+        extent = 0.5f * std::sqrt(dx*dx + dy*dy + dz*dz);
+        if (extent < 1.0f) extent = 1.0f;
+        return true;
+    }
+    // Whole-scene fallback (e.g. owner map not shipped): centre on the model.
+    if (st.renderer) {
+        out[0] = 0; out[1] = 0; out[2] = 0;   // pan-relative model centre is the orbit target
+        extent = st.renderer->modelRadius();
+        if (extent < 1.0f) extent = 1.0f;
+        return true;
+    }
+    return false;
+}
+
+// Build the draggable-dimension list for the selected feature, reusing the PM-form field table to
+// learn which params are dims and their labels/units. Skips greyed/conditional-off and expr-bound
+// dims, and any dim whose value the engine table drives (omitWhenDisabled while disabled). Returns
+// at most ~4 candidates (the dims a user actually drives) so the overlay stays readable.
+static std::vector<DimCandidate> dimCandidates(AppState& st) {
+    std::vector<DimCandidate> out;
+    const std::string& fid = st.selectedFeatureId;
+    if (fid.empty() || !st.docMirror.hasDoc()) return out;
+    const nlohmann::json& tree = st.docMirror.tree();
+    const nlohmann::json* feat = findFeature(tree, fid);
+    if (!feat) return out;
+    std::string type = feat->value("type", std::string());
+    const ui::PMFormDef* form = ui::pmFindForm(type);
+    if (!form) return out;
+    const nlohmann::json& params = feat->contains("params") && (*feat)["params"].is_object()
+                                       ? (*feat)["params"] : nlohmann::json::object();
+
+    float anchor[3]; float extent = 1.0f;
+    bool hasAnchor = featureAnchor(st, fid, anchor, extent);
+
+    // Resolve a Combo field's currently-selected value (to honour DimIf enable conditions).
+    auto comboValueOf = [&](const char* key) -> std::string {
+        if (!key) return std::string();
+        for (const auto& fd : form->fields) {
+            if (fd.kind != ui::PMFieldKind::Combo || std::strcmp(fd.key, key) != 0) continue;
+            // The stored param value (engine echoes the chosen enum); fall back to the first option.
+            auto it = params.find(key);
+            if (it != params.end() && it->is_string()) return it->get<std::string>();
+            if (fd.comboOptions) { std::string o(fd.comboOptions);
+                                   return o.substr(0, o.find('|')); }
+        }
+        return std::string();
+    };
+    auto enabled = [&](const ui::PMFieldDef& fd) -> bool {
+        if (fd.comingSoon) return false;
+        if (!fd.enableKey)  return true;
+        std::string cur = comboValueOf(fd.enableKey);
+        if (cur.empty()) return false;
+        std::string vals = fd.enableVals ? fd.enableVals : "";
+        // pipe-separated membership test
+        size_t p = 0;
+        while (p <= vals.size()) {
+            size_t e = vals.find('|', p);
+            std::string tok = vals.substr(p, e == std::string::npos ? std::string::npos : e - p);
+            if (tok == cur) return true;
+            if (e == std::string::npos) break;
+            p = e + 1;
+        }
+        return false;
+    };
+
+    int idx = 0;
+    for (const auto& fd : form->fields) {
+        if (fd.kind != ui::PMFieldKind::Dim) continue;   // only Dim/Angle rows (Int/Combo skipped)
+        if (!enabled(fd)) continue;
+        double val = 0.0; bool isExpr = false;
+        if (!dimParamValue(params, fd.key, val, isExpr)) continue;  // absent or expr-driven
+        bool isAngle = fd.unitLabel && std::strstr(fd.unitLabel, "deg");
+        DimCandidate c;
+        c.param = fd.key; c.label = fd.label; c.angle = isAngle; c.value = val;
+        c.dirW = dimWorldDir(fd.key);
+        if (hasAnchor) {
+            // Spread the handles around the anchor so chips/arrows don't stack: nudge each one a
+            // little further out along its own measured axis (or +Z for angles).
+            Vec3 d = isAngle ? Vec3(0, 0, 1) : c.dirW;
+            float off = extent * 0.6f + (float)idx * extent * 0.15f;
+            c.anchor[0] = anchor[0] + d.x * off;
+            c.anchor[1] = anchor[1] + d.y * off;
+            c.anchor[2] = anchor[2] + d.z * off;
+        }
+        out.push_back(std::move(c));
+        if (++idx >= 4) break;   // keep the overlay readable
+    }
+    return out;
+}
 
 // ---- C26-C / C37-C: Normal-To (Ctrl+8 / shortcut) -------------------------------------------
 // "Look straight at the selected face." If a face is selected and the C26-C normal cache has data
@@ -330,8 +577,247 @@ static void applyAppearanceFromViewport(AppState& st, const std::string& bodyKey
     }
 }
 
+// ---- Instant3D push-pull helpers -----------------------------------------------------------
+
+// Project a world point through the renderer's published MVP to viewport-screen pixels.
+// Returns false when the point is behind the camera. (Same column-major math the plane-label and
+// PM-callout overlays use.)
+static bool ppProject(const Renderer& renderer, const ImVec2& vr0, const ImVec2& vr1,
+                      int vw, int vh, const float w[3], ImVec2& out) {
+    const float* m = renderer.camera().mvp.m;  // column-major model->clip
+    float x = m[0]*w[0] + m[4]*w[1] + m[8]*w[2]  + m[12];
+    float y = m[1]*w[0] + m[5]*w[1] + m[9]*w[2]  + m[13];
+    float wc= m[3]*w[0] + m[7]*w[1] + m[11]*w[2] + m[15];
+    if (wc <= 1e-4f) return false;  // behind the camera
+    out.x = vr0.x + (x / wc * 0.5f + 0.5f) * (vw);
+    out.y = vr0.y + (1.0f - (y / wc * 0.5f + 0.5f)) * (vh);
+    (void)vr1;
+    return true;
+}
+
+// The push-pull handle for the single selected face: returns false when there is no single face
+// selected or the face has no cached normal/centroid. On success fills the centroid screen pos,
+// the two arrow tips (+normal and −normal) in screen space, the unit screen-space normal
+// direction, and the world-per-pixel scale at the face depth.
+static bool ppHandleGeometry(AppState& st, const Renderer& renderer, const ImVec2& vr0,
+                             const ImVec2& vr1, int vw, int vh, ImVec2& centroidSp,
+                             ImVec2& tipPos, ImVec2& tipNeg, float& nsx, float& nsy,
+                             float& worldPerPx, uint32_t& bodyId, uint32_t& topoId) {
+    if (st.selection.size() != 1) return false;
+    const render::PickHit& h = st.selection.items().front().hit;
+    if (!h.valid() || h.kind != render::PickKind::Face) return false;
+    uint64_t key = ((uint64_t)h.body_id << 32) | (uint64_t)h.topo_id;
+    auto it = st.faceNormalCache.find(key);
+    if (it == st.faceNormalCache.end()) return false;
+    const auto& v = it->second;  // {nx,ny,nz, cx,cy,cz}
+    float nx = v[0], ny = v[1], nz = v[2];
+    float nlen = std::sqrt(nx*nx + ny*ny + nz*nz);
+    if (nlen < 1e-6f) return false;
+    nx /= nlen; ny /= nlen; nz /= nlen;
+    float cx = v[3], cy = v[4], cz = v[5];
+
+    float C[3] = {cx, cy, cz};
+    if (!ppProject(renderer, vr0, vr1, vw, vh, C, centroidSp)) return false;
+
+    // world-per-pixel at the face depth: project a point one mm along the normal and measure the
+    // screen displacement. (Robust to perspective: uses the centroid's actual depth, not the orbit
+    // target plane.) Use a 1mm probe; if the normal is near edge-on the screen vector is tiny, so
+    // fall back to the camera-plane scale used by pan/zoom.
+    float Cp[3] = {cx + nx, cy + ny, cz + nz};
+    ImVec2 cpSp;
+    bool gotProbe = ppProject(renderer, vr0, vr1, vw, vh, Cp, cpSp);
+    float sdx = gotProbe ? (cpSp.x - centroidSp.x) : 0.0f;
+    float sdy = gotProbe ? (cpSp.y - centroidSp.y) : 0.0f;
+    float slen = std::sqrt(sdx*sdx + sdy*sdy);
+
+    if (slen > 1e-3f) {
+        nsx = sdx / slen; nsy = sdy / slen;
+        worldPerPx = 1.0f / slen;   // 1mm spans `slen` px => mm-per-px = 1/slen
+    } else {
+        // Face is nearly edge-on: derive a screen direction from the camera basis projection of the
+        // normal and fall back to the orbit-plane world-per-px (matches pan/zoom conversion).
+        const float deg = 3.14159265f / 180.0f;
+        const float fov = Renderer::kFovDeg * deg;
+        float zc = st.zoom < 0.05f ? 0.05f : st.zoom;
+        float dist = renderer.modelRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
+        worldPerPx = 2.0f * dist * std::tan(fov * 0.5f) / (float)(vh > 1 ? vh : 1);
+        // screen-space normal direction from the camera right/up basis.
+        float yr = st.yaw * deg, pr = st.pitch * deg;
+        Vec3 vdir(std::cos(pr) * std::sin(yr), -std::cos(pr) * std::cos(yr), std::sin(pr));
+        Vec3 worldUp = (std::fabs(pr) > 89.0f * deg) ? Vec3(0, 1, 0) : Vec3(0, 0, 1);
+        Vec3 V = normalize(vdir);
+        Vec3 R = normalize(cross(worldUp, V));
+        Vec3 U = normalize(cross(V, R));
+        Vec3 N(nx, ny, nz);
+        float rN = dot(R, N), uN = dot(U, N);
+        float l2 = std::sqrt(rN*rN + uN*uN);
+        if (l2 < 1e-4f) return false;  // truly edge-on AND parallel to view: no usable handle
+        // screen x is +R, screen y is -U (y down).
+        nsx = rN / l2; nsy = -uN / l2;
+    }
+
+    float armLenPx = 46.0f * ui::uiScale;  // arrow length in screen px
+    tipPos = ImVec2(centroidSp.x + nsx * armLenPx, centroidSp.y + nsy * armLenPx);
+    tipNeg = ImVec2(centroidSp.x - nsx * armLenPx, centroidSp.y - nsy * armLenPx);
+    bodyId = h.body_id; topoId = h.topo_id;
+    return true;
+}
+
+// Run ONE push-pull sample at the given cumulative distance (revert to checkpoint, then apply).
+// Returns false (and leaves s_pp.active as the caller set it) on a hard transport failure. On a
+// non-draggable first response the caller aborts the drag (handled at press time instead).
+static void ppApplySample(AppState& st, double cumulative, bool commit) {
+    if (!st.docMirror.hasDoc()) return;
+    // Revert to the pre-drag checkpoint so previews never compound, then apply the cumulative.
+    if (!s_pp.checkpoint.empty()) {
+        auto rv = st.docMirror.revert(st.worker, s_pp.checkpoint);
+        if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
+    }
+    auto r = st.docMirror.pushPull(st.worker, s_pp.bodyId, s_pp.topoId, cumulative, commit);
+    if (!r.ok) {
+        st.toast(ui::ToastLevel::Error, "Push-pull failed: " + r.error_message);
+        return;
+    }
+    if (!r.draggable) {
+        // Shouldn't happen mid-drag (we validated draggability on press), but guard anyway.
+        st.toast(ui::ToastLevel::Warn, "This face can't be dragged — " + r.reason);
+        return;
+    }
+    if (!r.ops.aicm_path.empty()) { std::string le; st.loadDocMesh(r.ops.aicm_path, le); }
+    s_pp.haveReadout = true;
+    s_pp.param    = r.param;
+    s_pp.newValue = r.new_value;
+    s_pp.clamped  = r.clamped;
+    s_pp.lastApplied = cumulative;
+}
+
+// Cancel an in-flight push-pull drag: revert to the checkpoint and clear all drag state. Safe to
+// call when no drag is active (no-op). Leaves NO zombie checkpoint/flag behind.
+static void ppCancel(AppState& st) {
+    if (!s_pp.active && s_pp.checkpoint.empty()) { s_pp.reset(); return; }
+    if (!s_pp.checkpoint.empty() && st.docMirror.hasDoc()) {
+        auto rv = st.docMirror.revert(st.worker, s_pp.checkpoint);
+        if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
+    }
+    s_pp.reset();
+}
+
+// ---- Instant3D dimension-handle drag helpers ------------------------------------------------
+
+// Screen geometry for one dimension handle: project the world anchor to screen, derive the unit
+// screen-space drag direction (along which the value GROWS), the two arrow tips, and the world(mm)
+// or deg per screen-pixel scale. For a LENGTH dim the px scale is the exact 1mm-world-probe used by
+// ppHandleGeometry (probe the anchor +1mm along dirW, measure screen displacement). For an ANGLE
+// dim the handle is laid horizontally on screen and a fixed deg/px maps drag to degrees.
+static bool dimHandleGeometry(AppState& st, const Renderer& renderer, const ImVec2& vr0,
+                              const ImVec2& vr1, int vw, int vh, const DimCandidate& c,
+                              ImVec2& anchorSp, ImVec2& tipPos, ImVec2& tipNeg,
+                              float& dsx, float& dsy, float& worldPerPx, float& degPerPx) {
+    float A[3] = {c.anchor[0], c.anchor[1], c.anchor[2]};
+    if (!ppProject(renderer, vr0, vr1, vw, vh, A, anchorSp)) return false;
+
+    if (c.angle) {
+        // Angle handle: horizontal on screen; a constant deg/px (SolidWorks-ish drag sensitivity).
+        dsx = 1.0f; dsy = 0.0f;
+        worldPerPx = 0.0f;
+        degPerPx = 0.5f;   // 720px == full turn
+    } else {
+        // Probe 1mm along the measured world direction; the screen displacement gives both the
+        // screen-space direction and the world-per-px scale at this depth (perspective-correct).
+        float P[3] = {A[0] + c.dirW.x, A[1] + c.dirW.y, A[2] + c.dirW.z};
+        ImVec2 pSp;
+        bool gotProbe = ppProject(renderer, vr0, vr1, vw, vh, P, pSp);
+        float sdx = gotProbe ? (pSp.x - anchorSp.x) : 0.0f;
+        float sdy = gotProbe ? (pSp.y - anchorSp.y) : 0.0f;
+        float slen = std::sqrt(sdx*sdx + sdy*sdy);
+        if (slen > 1e-3f) {
+            dsx = sdx / slen; dsy = sdy / slen;
+            worldPerPx = 1.0f / slen;       // 1mm spans `slen` px
+        } else {
+            // Direction is nearly edge-on to the screen: fall back to the orbit-plane scale and a
+            // screen-horizontal handle so the dim is still grabbable (rare; degenerate camera).
+            const float deg = 3.14159265f / 180.0f;
+            const float fov = Renderer::kFovDeg * deg;
+            float zc = st.zoom < 0.05f ? 0.05f : st.zoom;
+            float dist = renderer.modelRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
+            worldPerPx = 2.0f * dist * std::tan(fov * 0.5f) / (float)(vh > 1 ? vh : 1);
+            dsx = 1.0f; dsy = 0.0f;
+        }
+        degPerPx = 0.0f;
+    }
+    float armLenPx = 42.0f * ui::uiScale;
+    tipPos = ImVec2(anchorSp.x + dsx * armLenPx, anchorSp.y + dsy * armLenPx);
+    tipNeg = ImVec2(anchorSp.x - dsx * armLenPx, anchorSp.y - dsy * armLenPx);
+    return true;
+}
+
+// Apply ONE dimension sample, setting the dragged param to the given ABSOLUTE value via an
+// edit_feature on the FULL params snapshot (one field changed) — the PM preview path exactly.
+//
+// Because the value is absolute (always derived from the press-time baseParams), a preview never
+// compounds, so — unlike push-pull's delta envelope — previews need NO per-sample revert: each
+// preview just overwrites the same field. The undo envelope still yields "one undo":
+//   - PREVIEW (commit=false): applyOps(coalesce=true) — overwrite the field, push NO undo snapshot.
+//   - COMMIT  (commit=true) : doc_revert(checkpoint) [restores pre-drag, pushes the last-preview
+//                             state] then applyOps(coalesce=false) [pushes the pre-drag snapshot].
+//     The TOP of the undo stack after release is the pre-drag state, so one Ctrl+Z restores it.
+static void dimApplySample(AppState& st, double value, bool commit) {
+    if (!st.docMirror.hasDoc()) return;
+    if (commit && !s_dim.checkpoint.empty()) {
+        // Revert to pre-drag first so the committed edit_feature's pushed undo snapshot is the
+        // pre-drag doc (single-undo guarantee), matching the push-pull release envelope.
+        auto rv = st.docMirror.revert(st.worker, s_dim.checkpoint);
+        if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
+    }
+    // Build the edited params: copy the base params, set this one field to the new value. Preserve
+    // the {value,expr} dict shape the engine uses (expr stays null — we only drive bare dims).
+    nlohmann::json params = s_dim.baseParams;
+    auto it = params.find(s_dim.param);
+    if (it != params.end() && it->is_object()) {
+        (*it)["value"] = value;
+        (*it)["expr"]  = nullptr;
+    } else {
+        params[s_dim.param] = {{"value", value}, {"expr", nullptr}};
+    }
+    nlohmann::json ops = nlohmann::json::array();
+    ops.push_back({{"op", "edit_feature"}, {"id", s_dim.featureId},
+                   {"params", params}, {"refs", s_dim.baseRefs}});
+    auto resp = st.docMirror.applyOps(st.worker, ops, /*coalesce=*/!commit);
+    if (!resp.ok) {
+        st.toast(ui::ToastLevel::Error, "Edit dimension failed: " + resp.error_message);
+        return;
+    }
+    if (!resp.aicm_path.empty()) { std::string le; st.loadDocMesh(resp.aicm_path, le); }
+    s_dim.curValue = value;
+    s_dim.lastApplied = value;
+    s_dim.haveReadout = true;
+}
+
+// Cancel an in-flight dimension drag: revert to the checkpoint and clear all state. Safe when no
+// drag is active. Leaves NO zombie checkpoint/flag behind (mirrors ppCancel).
+static void dimCancel(AppState& st) {
+    if (!s_dim.active && s_dim.checkpoint.empty()) { s_dim.reset(); return; }
+    if (!s_dim.checkpoint.empty() && st.docMirror.hasDoc()) {
+        auto rv = st.docMirror.revert(st.worker, s_dim.checkpoint);
+        if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
+    }
+    s_dim.reset();
+}
+
 void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     Renderer& renderer = *st.renderer;
+
+    // ---------- DRAWINGS module: a Drawing tab hosts a 2D sheet in the SAME central dock window
+    // as the 3D viewport. Branch here BEFORE any 3D state is touched so part/asm behavior stays
+    // byte-identical and the dock layout is unchanged (the "Viewport" window just paints a sheet).
+    if (st.showViewport && st.activeTabIsDrawing()) {
+        if (ImGui::Begin("Viewport")) {
+            ui::drawDrawingSheet(st);
+        }
+        ImGui::End();
+        return;
+    }
+
     // C18: while a sketch is being edited the camera locks normal to the sketch plane and the
     // sketch tools own the mouse (no orbit, no topology picking).
     auto* sketch = st.sketchMode;
@@ -400,6 +886,39 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         if (st.propertyManager && st.propertyManager->active()) {
             s_zoomAreaArmed    = false;
             s_zoomAreaDragging = false;
+        }
+
+        // Instant3D push-pull safety net (runs every frame, regardless of hover): if a sketch /
+        // plane-pick / PM took over the mouse mid-drag, cancel (revert) so no zombie checkpoint/flag
+        // survives. If the LMB was released while the cursor was OUTSIDE the viewport image (the
+        // hover-gated release handler never ran), commit the drag at its last distance.
+        if (s_pp.active) {
+            bool ppPmNow = st.propertyManager && st.propertyManager->active();
+            if (inSketch || st.sketchPlanePickActive || ppPmNow) {
+                ppCancel(st);
+            } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                ppApplySample(st, s_pp.curDist, /*commit=*/true);
+                s_pp.active = false;
+                s_pp.checkpoint.clear();
+                s_pp.haveReadout = false;
+            }
+        }
+
+        // Instant3D dimension-drag safety net (mirrors the push-pull one): if a sketch / plane-pick /
+        // PM took over, or the selected feature changed/vanished mid-drag, cancel (revert). If the
+        // LMB was released outside the viewport image, commit at the last value. No zombie state.
+        if (s_dim.active) {
+            bool dimPmNow = st.propertyManager && st.propertyManager->active();
+            bool featGone = st.selectedFeatureId != s_dim.featureId ||
+                            findFeature(st.docMirror.tree(), s_dim.featureId) == nullptr;
+            if (inSketch || st.sketchPlanePickActive || dimPmNow || featGone) {
+                dimCancel(st);
+            } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                dimApplySample(st, s_dim.curValue, /*commit=*/true);
+                s_dim.active = false;
+                s_dim.checkpoint.clear();
+                s_dim.haveReadout = false;
+            }
         }
 
         // C37-C: consume st.zoomToBBoxRequested (one-shot from feature tree "Zoom to Feature").
@@ -561,10 +1080,204 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             if (s_zoomAreaArmed)
                 st.requestCursor(ui::CursorKind::Crosshair);
 
+            // ---- Instant3D push-pull: handle press / drag / release ----------------------------
+            // Only when a doc mesh is loaded, no PM/sketch/zoom-area is owning the mouse, and the
+            // press lands on the normal-axis handle of the single selected face. Owns the mouse for
+            // its whole lifetime (orbit/pan/pick all skip while s_pp.active).
+            bool ppPmOpen = st.propertyManager && st.propertyManager->active();
+            if (st.hasDocMesh && !st.sketchPlanePickActive && !ppPmOpen && !s_zoomAreaArmed) {
+                // Press: hit-test the handle arrow. We use the handle geometry computed for THIS
+                // frame's camera; the centroid screen pos + the two tips define a thick segment.
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s_pp.active) {
+                    ImVec2 cSp, tipP, tipN; float nsx, nsy, wpp; uint32_t bId, tId;
+                    if (ppHandleGeometry(st, renderer, vr0, vr1, vw, vh, cSp, tipP, tipN,
+                                         nsx, nsy, wpp, bId, tId)) {
+                        // Distance from the press point to the handle axis segment (centroid..tip,
+                        // both directions). A generous hit radius makes the thin arrow grabbable.
+                        ImVec2 mp = io.MousePos;
+                        float hitR = 10.0f * ui::uiScale;
+                        // Project press onto the infinite handle axis through the centroid.
+                        float dx = mp.x - cSp.x, dy = mp.y - cSp.y;
+                        float along = dx * nsx + dy * nsy;          // signed distance along the axis
+                        float perp  = std::fabs(dx * (-nsy) + dy * nsx);  // perpendicular distance
+                        float armLenPx = 46.0f * ui::uiScale;
+                        bool onAxis = perp <= hitR && std::fabs(along) <= armLenPx + hitR;
+                        // Also accept a direct hit near either arrowhead tip.
+                        auto nearTip = [&](const ImVec2& t) {
+                            float ddx = mp.x - t.x, ddy = mp.y - t.y;
+                            return std::sqrt(ddx*ddx + ddy*ddy) <= hitR * 1.6f;
+                        };
+                        if (onAxis || nearTip(tipP) || nearTip(tipN)) {
+                            // Validate draggability + take a checkpoint BEFORE mutating anything.
+                            std::string cp = st.docMirror.hasDoc()
+                                                 ? st.docMirror.checkpoint(st.worker) : std::string();
+                            auto probe = st.docMirror.pushPull(st.worker, bId, tId, 0.0, false);
+                            if (!probe.ok) {
+                                st.toast(ui::ToastLevel::Error,
+                                         "Push-pull failed: " + probe.error_message);
+                                if (!cp.empty()) st.docMirror.revert(st.worker, cp);
+                            } else if (!probe.draggable) {
+                                st.toast(ui::ToastLevel::Warn,
+                                         "This face can't be dragged — " + probe.reason);
+                                if (!cp.empty()) st.docMirror.revert(st.worker, cp);
+                            } else {
+                                // Begin the drag. The zero-distance probe left geometry unchanged.
+                                s_pp.reset();
+                                s_pp.active     = true;
+                                s_pp.bodyId     = bId;
+                                s_pp.topoId     = tId;
+                                s_pp.checkpoint = cp;
+                                s_pp.pressPos   = mp;
+                                s_pp.nsx = nsx; s_pp.nsy = nsy;
+                                s_pp.worldPerPx = wpp;
+                                s_pp.curDist    = 0.0;
+                                s_pp.lastApplied = 1e30f;
+                                s_pp.haveReadout = true;
+                                s_pp.param    = probe.param;
+                                s_pp.newValue = probe.old_value;  // value before the drag
+                                s_pp.clamped  = false;
+                            }
+                        }
+                    }
+                }
+
+                // Drag: convert cursor motion to a cumulative signed distance and apply a sample.
+                if (s_pp.active && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    st.requestCursor(ui::CursorKind::Crosshair);
+                    cancelCameraAnimation();
+                    float dx = io.MousePos.x - s_pp.pressPos.x;
+                    float dy = io.MousePos.y - s_pp.pressPos.y;
+                    float px = dx * s_pp.nsx + dy * s_pp.nsy;   // signed px along the normal axis
+                    double cumulative = (double)px * (double)s_pp.worldPerPx;
+                    s_pp.curDist = cumulative;
+                    // Throttle: only call the worker when the cumulative distance changed enough to
+                    // matter (~0.05mm), so a steady hold doesn't queue a backlog of rebuilds. The
+                    // call is synchronous, so at most one is ever in flight.
+                    if (std::fabs(cumulative - s_pp.lastApplied) >= 0.05)
+                        ppApplySample(st, cumulative, /*commit=*/false);
+                }
+
+                // Release: commit exactly one undo entry at the final distance.
+                if (s_pp.active && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                    ppApplySample(st, s_pp.curDist, /*commit=*/true);
+                    // Refresh the mirror tree (commit may have changed revision) and clear state.
+                    s_pp.active = false;
+                    s_pp.checkpoint.clear();
+                    // Keep the readout for one frame? No — clear; selection highlight remains.
+                    s_pp.haveReadout = false;
+                }
+            }
+
+            // ---- Instant3D dimension-handle drag: press / drag / release ------------------------
+            // Runs AFTER the push-pull block and is gated on !s_pp.active, so the FACE ARROW WINS
+            // when a single drivable face is selected (its press grabs the mouse first). Dimension
+            // handles are shown/hit only when a feature is selected with NO single face active (tree
+            // selection, body/edge pick, or multi-face), so the two gestures never fight. Owns the
+            // mouse for its whole lifetime (orbit/pan/pick skip while s_dim.active).
+            if (st.hasDocMesh && !st.sketchPlanePickActive && !ppPmOpen && !s_zoomAreaArmed &&
+                !s_pp.active) {
+                // Press: hit-test every dimension handle of the selected feature.
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s_dim.active) {
+                    // Only offer dimension handles when NO single face is selected (that case is the
+                    // push-pull arrow's domain). A multi-face / edge / body / tree selection — or no
+                    // topology selection at all but a selectedFeatureId — shows dim handles.
+                    bool singleFaceSel =
+                        st.selection.size() == 1 &&
+                        st.selection.items().front().hit.valid() &&
+                        st.selection.items().front().hit.kind == render::PickKind::Face;
+                    if (!singleFaceSel) {
+                        auto cands = dimCandidates(st);
+                        ImVec2 mp = io.MousePos;
+                        float hitR = 9.0f * ui::uiScale;
+                        float armLenPx = 42.0f * ui::uiScale;
+                        for (const auto& c : cands) {
+                            ImVec2 aSp, tipP, tipN; float dsx, dsy, wpp, dpp;
+                            if (!dimHandleGeometry(st, renderer, vr0, vr1, vw, vh, c, aSp, tipP,
+                                                   tipN, dsx, dsy, wpp, dpp))
+                                continue;
+                            float dx = mp.x - aSp.x, dy = mp.y - aSp.y;
+                            float along = dx * dsx + dy * dsy;
+                            float perp  = std::fabs(dx * (-dsy) + dy * dsx);
+                            bool onAxis = perp <= hitR && std::fabs(along) <= armLenPx + hitR;
+                            auto nearTip = [&](const ImVec2& t) {
+                                float ddx = mp.x - t.x, ddy = mp.y - t.y;
+                                return std::sqrt(ddx*ddx + ddy*ddy) <= hitR * 1.6f;
+                            };
+                            if (!(onAxis || nearTip(tipP) || nearTip(tipN))) continue;
+                            // Grab this handle. Snapshot the feature's params/refs at press so every
+                            // sample sets this one field to an ABSOLUTE value from the original
+                            // params (no compounding); the checkpoint backs the commit/cancel revert.
+                            const nlohmann::json* feat =
+                                findFeature(st.docMirror.tree(), st.selectedFeatureId);
+                            if (!feat) break;
+                            std::string cp = st.docMirror.checkpoint(st.worker);
+                            s_dim.reset();
+                            s_dim.active     = true;
+                            s_dim.featureId  = st.selectedFeatureId;
+                            s_dim.param      = c.param;
+                            s_dim.angle      = c.angle;
+                            s_dim.label      = c.label;
+                            s_dim.checkpoint = cp;
+                            s_dim.baseParams = feat->contains("params") && (*feat)["params"].is_object()
+                                                   ? (*feat)["params"] : nlohmann::json::object();
+                            s_dim.baseRefs   = feat->contains("refs") && (*feat)["refs"].is_object()
+                                                   ? (*feat)["refs"] : nlohmann::json::object();
+                            s_dim.oldValue   = c.value;
+                            s_dim.curValue   = c.value;
+                            s_dim.lastApplied = 1e30;
+                            s_dim.pressPos   = mp;
+                            s_dim.dsx = dsx; s_dim.dsy = dsy;
+                            s_dim.worldPerPx = wpp; s_dim.degPerPx = dpp;
+                            s_dim.haveReadout = true;
+                            s_dim.clamped = false;
+                            break;   // one handle per press
+                        }
+                    }
+                }
+
+                // Drag: convert cursor motion to an absolute value and apply a throttled sample.
+                if (s_dim.active && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    st.requestCursor(ui::CursorKind::Crosshair);
+                    cancelCameraAnimation();
+                    float dx = io.MousePos.x - s_dim.pressPos.x;
+                    float dy = io.MousePos.y - s_dim.pressPos.y;
+                    float px = dx * s_dim.dsx + dy * s_dim.dsy;   // signed px along the handle axis
+                    double newVal;
+                    if (s_dim.angle)
+                        newVal = s_dim.oldValue + (double)px * (double)s_dim.degPerPx;
+                    else
+                        newVal = s_dim.oldValue + (double)px * (double)s_dim.worldPerPx;
+                    // Clamp to a sane minimum (mirror the engine push-pull floor of 0.1mm; angles to
+                    // 1..360 deg). Flag clamped so the readout shows the limit.
+                    s_dim.clamped = false;
+                    if (s_dim.angle) {
+                        if (newVal < 1.0)   { newVal = 1.0;   s_dim.clamped = true; }
+                        if (newVal > 360.0) { newVal = 360.0; s_dim.clamped = true; }
+                    } else {
+                        if (newVal < 0.1)   { newVal = 0.1;   s_dim.clamped = true; }
+                    }
+                    s_dim.curValue = newVal;
+                    // Throttle: only call the worker when the value moved enough to matter (angles a
+                    // touch coarser). Synchronous call => at most one ever in flight.
+                    double thresh = s_dim.angle ? 0.25 : 0.05;
+                    if (std::fabs(newVal - s_dim.lastApplied) >= thresh)
+                        dimApplySample(st, newVal, /*commit=*/false);
+                }
+
+                // Release: commit exactly one undo entry at the final value.
+                if (s_dim.active && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                    dimApplySample(st, s_dim.curValue, /*commit=*/true);
+                    s_dim.active = false;
+                    s_dim.checkpoint.clear();
+                    s_dim.haveReadout = false;
+                }
+            }
+
             // Left-drag: orbit or pan depending on vpDragMode. Cancels any tween.
             // Zoom-area mode intercepts left-drag above; skip orbit/pan if armed.
             // C37-C: only starts dragging once the 4px threshold is crossed (s_lmbDragActive).
-            if (!s_zoomAreaArmed && s_lmbDragActive &&
+            // Instant3D: a push-pull OR dimension drag owns the mouse — never orbit/pan while active.
+            if (!s_pp.active && !s_dim.active && !s_zoomAreaArmed && s_lmbDragActive &&
                 (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
                 cancelCameraAnimation();
                 if (st.vpDragMode == 1) {
@@ -698,7 +1411,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // C25 W2-E: suppressed while the glass-box View Selector is up (it owns the click).
         // C37-C item 5: also suppressed while sketchPlanePickActive (the overlay owns the mouse).
         if (picking && !inSketch && !s_viewSelector.active() && !st.sketchPlanePickActive) {
-            if (imgHovered && !s_lmbDragActive && !regionPickerHot) {
+            // Instant3D: while a push-pull OR dimension drag owns the mouse, freeze hover and swallow
+            // the click so the press that grabbed the handle doesn't also re-select / clear.
+            if (imgHovered && !s_lmbDragActive && !regionPickerHot && !s_pp.active && !s_dim.active) {
                 int px = (int)(io.MousePos.x - vr0.x);
                 int py = (int)(io.MousePos.y - vr0.y);
                 st.hover = st.idPass->pickFinal(px, py, vw, vh);
@@ -709,18 +1424,24 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // Click = replace, Ctrl-click = toggle. Empty-space click clears.
             // C37-C item 3: guard against micro-orbit clicks — only fire if drag was not active.
             // C51: a click consumed by the region picker never falls through to model selection.
+            // Instant3D: a click that started a push-pull / dimension drag is NOT a selection.
             if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-                !s_lmbDragActive && !regionPickerHot) {
+                !s_lmbDragActive && !regionPickerHot && !s_pp.active && !s_dim.active) {
                 if (io.KeyCtrl) {
                     if (st.hover.valid()) st.selection.toggle(st.hover);
                 } else {
                     st.selection.selectOne(st.hover);  // clears if hover invalid
                 }
             }
-            // ESC clears the selection while the viewport is focused/hovered.
+            // ESC: during a push-pull / dimension drag, cancel it (revert) and DON'T clear the
+            // selection. Otherwise ESC clears the selection while the viewport is focused/hovered.
             // C37-C item 5: do NOT consume Esc while sketchPlanePickActive (guard above already
             // prevents this block from running in that case, so this Esc is safe).
-            if (imgHovered && ImGui::IsKeyPressed(ImGuiKey_Escape)) st.selection.clear();
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                if (s_pp.active) ppCancel(st);
+                else if (s_dim.active) dimCancel(st);
+                else if (imgHovered) st.selection.clear();
+            }
 
             // Status text: prefer the live hover, else the last selected item.
             if (st.hover.valid()) {
@@ -1155,6 +1876,174 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             vdl->AddRect(p0, p1b, overlayBord, 6.0f);
             vdl->AddText(ImVec2(p0.x + 10, p0.y + 5), overlayTxt,
                          st.pickStatus.c_str());
+        }
+
+        // ---- Instant3D push-pull handle + live readout ----
+        // Drawn whenever exactly one face is selected (with a cached normal) and no sketch/PM/
+        // plane-pick owns the view. The handle is a bidirectional accent arrow along the face
+        // outward normal; press it to drag-modify the face. While dragging, a readout chip near the
+        // cursor shows the driven param + new value (and a "clamped" hint at the limit).
+        {
+            bool ppPmOpen2 = st.propertyManager && st.propertyManager->active();
+            bool canShowHandle = st.hasDocMesh && !inSketch && !st.sketchPlanePickActive &&
+                                 !ppPmOpen2 && !s_viewSelector.active();
+            if (canShowHandle) {
+                ImVec2 cSp, tipP, tipN; float nsx, nsy, wpp; uint32_t bId, tId;
+                if (ppHandleGeometry(st, renderer, vr0, vr1, vw, vh, cSp, tipP, tipN,
+                                     nsx, nsy, wpp, bId, tId)) {
+                    const auto& vpal2 = ui::palette;
+                    const ImU32 acc  = ui::Palette::toU32(vpal2.accent);
+                    const ImU32 accS = ui::Palette::toU32(vpal2.accentSoft);
+                    float sc = ui::uiScale;
+                    bool dragging = s_pp.active;
+                    float lw = (dragging ? 3.0f : 2.2f) * sc;
+                    // Shaft (centroid -> +normal tip, and centroid -> -normal tip).
+                    vdl->AddLine(cSp, tipP, acc, lw);
+                    vdl->AddLine(cSp, tipN, acc, lw);
+                    // Arrowheads at both tips.
+                    auto arrowHead = [&](const ImVec2& tip, float dx, float dy) {
+                        float hl = 9.0f * sc, hw = 5.0f * sc;
+                        // back along the shaft from the tip, then +/- perpendicular.
+                        ImVec2 base(tip.x - dx * hl, tip.y - dy * hl);
+                        ImVec2 l(base.x - (-dy) * hw, base.y - (dx) * hw);
+                        ImVec2 r(base.x + (-dy) * hw, base.y + (dx) * hw);
+                        vdl->AddTriangleFilled(tip, l, r, acc);
+                    };
+                    arrowHead(tipP,  nsx,  nsy);
+                    arrowHead(tipN, -nsx, -nsy);
+                    // Hub at the centroid.
+                    vdl->AddCircleFilled(cSp, (dragging ? 4.0f : 3.0f) * sc, acc);
+                    vdl->AddCircle(cSp, (dragging ? 7.0f : 5.0f) * sc, accS, 0, 1.5f * sc);
+
+                    // Live readout chip near the cursor while dragging.
+                    if (dragging && s_pp.haveReadout) {
+                        // Title-case the param for display (depth -> "Depth").
+                        std::string label = s_pp.param.empty() ? std::string("Value") : s_pp.param;
+                        if (!label.empty()) label[0] = (char)std::toupper((unsigned char)label[0]);
+                        // Format the (mm) drag distance in the active document units (mm / inch).
+                        std::string txt = label + " " + ui::pmFormatDim(s_pp.newValue, st.ips());
+                        if (s_pp.clamped) txt += "  (min)";
+                        ImVec2 ts2 = ImGui::CalcTextSize(txt.c_str());
+                        float padX = 8.0f * sc, padY = 4.0f * sc;
+                        ImVec2 q0(io.MousePos.x + 16.0f * sc, io.MousePos.y + 16.0f * sc);
+                        ImVec2 q1(q0.x + ts2.x + padX * 2, q0.y + ts2.y + padY * 2);
+                        // keep inside the viewport rect
+                        if (q1.x > vr1.x - 4) { float w = q1.x - q0.x; q1.x = vr1.x - 4; q0.x = q1.x - w; }
+                        if (q1.y > vr1.y - 4) { float h = q1.y - q0.y; q1.y = vr1.y - 4; q0.y = q1.y - h; }
+                        vdl->AddRectFilled(q0, q1, overlayBg, 4.0f * sc);
+                        ImU32 chipBord = s_pp.clamped
+                            ? ImGui::ColorConvertFloat4ToU32(ImVec4(0.90f, 0.55f, 0.25f, 1.0f))
+                            : acc;
+                        vdl->AddRect(q0, q1, chipBord, 4.0f * sc);
+                        vdl->AddText(ImVec2(q0.x + padX, q0.y + padY), overlayTxt, txt.c_str());
+                    } else if (!dragging) {
+                        // Hint tooltip when hovering the handle (not dragging).
+                        ImVec2 mp = io.MousePos;
+                        float dxh = mp.x - cSp.x, dyh = mp.y - cSp.y;
+                        float perp  = std::fabs(dxh * (-nsy) + dyh * nsx);
+                        float along = std::fabs(dxh * nsx + dyh * nsy);
+                        float armLenPx = 46.0f * ui::uiScale;
+                        if (perp <= 10.0f * sc && along <= armLenPx + 10.0f * sc)
+                            ImGui::SetTooltip("Drag to push/pull this face");
+                    }
+                }
+            }
+        }
+
+        // ---- Instant3D dimension handles + live readout ----
+        // Drawn whenever a FEATURE is selected and NO single face is (that face's domain is the
+        // push-pull arrow above — clear precedence: the face arrow wins). Each draggable dim renders
+        // a small accent handle (a value chip on a short bidirectional arrow) anchored near the
+        // feature's geometry; press it to drag-edit that param. While dragging, the dragged chip
+        // shows "Depth 25.0 -> 31.5 mm" in the active units, and a "(min)" hint at the clamp.
+        {
+            bool dimPmOpen = st.propertyManager && st.propertyManager->active();
+            bool singleFaceSel =
+                st.selection.size() == 1 &&
+                st.selection.items().front().hit.valid() &&
+                st.selection.items().front().hit.kind == render::PickKind::Face;
+            bool canShowDim = st.hasDocMesh && !inSketch && !st.sketchPlanePickActive &&
+                              !dimPmOpen && !s_viewSelector.active() && !s_pp.active &&
+                              !singleFaceSel && !st.selectedFeatureId.empty();
+            if (canShowDim) {
+                auto cands = dimCandidates(st);
+                const auto& vpal2 = ui::palette;
+                const ImU32 acc  = ui::Palette::toU32(vpal2.accent);
+                const ImU32 accS = ui::Palette::toU32(vpal2.accentSoft);
+                float sc = ui::uiScale;
+                ImVec2 mp = io.MousePos;
+                for (const auto& c : cands) {
+                    ImVec2 aSp, tipP, tipN; float dsx, dsy, wpp, dpp;
+                    if (!dimHandleGeometry(st, renderer, vr0, vr1, vw, vh, c, aSp, tipP, tipN,
+                                           dsx, dsy, wpp, dpp))
+                        continue;
+                    bool isDragged = s_dim.active && s_dim.featureId == st.selectedFeatureId &&
+                                     s_dim.param == c.param;
+                    // While THIS dim is being dragged, suppress the static chips for the OTHER dims so
+                    // the view stays clean; the dragged dim keeps its handle + a live readout.
+                    if (s_dim.active && !isDragged) continue;
+
+                    float lw = (isDragged ? 3.0f : 2.0f) * sc;
+                    vdl->AddLine(aSp, tipP, acc, lw);
+                    vdl->AddLine(aSp, tipN, acc, lw);
+                    auto arrowHead = [&](const ImVec2& tip, float dx, float dy) {
+                        float hl = 8.0f * sc, hw = 4.5f * sc;
+                        ImVec2 base(tip.x - dx * hl, tip.y - dy * hl);
+                        ImVec2 l(base.x - (-dy) * hw, base.y - (dx) * hw);
+                        ImVec2 r(base.x + (-dy) * hw, base.y + (dx) * hw);
+                        vdl->AddTriangleFilled(tip, l, r, acc);
+                    };
+                    arrowHead(tipP,  dsx,  dsy);
+                    arrowHead(tipN, -dsx, -dsy);
+                    vdl->AddCircleFilled(aSp, (isDragged ? 4.0f : 3.0f) * sc, acc);
+                    vdl->AddCircle(aSp, (isDragged ? 7.0f : 5.0f) * sc, accS, 0, 1.5f * sc);
+
+                    // Label/value chip. Static = "Depth: 25mm"; dragged = "Depth 25.0 -> 31.5 mm".
+                    std::string label = c.label.empty() ? c.param : c.label;
+                    std::string txt;
+                    if (isDragged && s_dim.haveReadout) {
+                        std::string oldS = c.angle ? (std::to_string((int)std::lround(s_dim.oldValue)) + "°")
+                                                   : ui::pmFormatDim(s_dim.oldValue, st.ips());
+                        std::string newS = c.angle ? (std::to_string((int)std::lround(s_dim.curValue)) + "°")
+                                                   : ui::pmFormatDim(s_dim.curValue, st.ips());
+                        txt = label + " " + oldS + " -> " + newS;
+                        if (s_dim.clamped) txt += (c.angle ? "  (limit)" : "  (min)");
+                    } else {
+                        std::string vS = c.angle ? (std::to_string((int)std::lround(c.value)) + "°")
+                                                 : ui::pmFormatDim(c.value, st.ips());
+                        txt = label + ": " + vS;
+                    }
+                    ImVec2 ts2 = ImGui::CalcTextSize(txt.c_str());
+                    float padX = 7.0f * sc, padY = 3.5f * sc;
+                    // Static chip floats just past the +tip; the dragged chip follows the cursor.
+                    ImVec2 q0 = isDragged
+                        ? ImVec2(mp.x + 16.0f * sc, mp.y + 16.0f * sc)
+                        : ImVec2(tipP.x + 8.0f * sc, tipP.y - (ts2.y + padY * 2) * 0.5f);
+                    ImVec2 q1(q0.x + ts2.x + padX * 2, q0.y + ts2.y + padY * 2);
+                    // keep inside the viewport rect
+                    if (q1.x > vr1.x - 4) { float w = q1.x - q0.x; q1.x = vr1.x - 4; q0.x = q1.x - w; }
+                    if (q0.x < vr0.x + 4) { float w = q1.x - q0.x; q0.x = vr0.x + 4; q1.x = q0.x + w; }
+                    if (q1.y > vr1.y - 4) { float h = q1.y - q0.y; q1.y = vr1.y - 4; q0.y = q1.y - h; }
+                    if (q0.y < vr0.y + 4) { float h = q1.y - q0.y; q0.y = vr0.y + 4; q1.y = q0.y + h; }
+                    vdl->AddRectFilled(q0, q1, overlayBg, 4.0f * sc);
+                    ImU32 chipBord = (isDragged && s_dim.clamped)
+                        ? ImGui::ColorConvertFloat4ToU32(ImVec4(0.90f, 0.55f, 0.25f, 1.0f))
+                        : acc;
+                    vdl->AddRect(q0, q1, chipBord, 4.0f * sc);
+                    vdl->AddText(ImVec2(q0.x + padX, q0.y + padY), overlayTxt, txt.c_str());
+
+                    // Hover hint when not dragging and the cursor is over the handle.
+                    if (!s_dim.active) {
+                        float dxh = mp.x - aSp.x, dyh = mp.y - aSp.y;
+                        float perp  = std::fabs(dxh * (-dsy) + dyh * dsx);
+                        float along = std::fabs(dxh * dsx + dyh * dsy);
+                        float armLenPx = 42.0f * ui::uiScale;
+                        if (perp <= 9.0f * sc && along <= armLenPx + 9.0f * sc)
+                            ImGui::SetTooltip(c.angle ? "Drag to change this angle"
+                                                      : "Drag to change this dimension");
+                    }
+                }
+            }
         }
         // C25 W3-J: apply ground-shadow visibility (last call wins; app.cpp may set it per-frame
         // before viewport_panel runs — the ordering means this value wins for the rendered frame,

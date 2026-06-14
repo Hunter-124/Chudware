@@ -48,6 +48,8 @@ uniform float uClipOff[3];            // plane offsets
 uniform float uRealView;               // C30-C: 0 = off, 1 = environment reflections on
 uniform float uMetallic;               // C32-A: 0 = dielectric, 1 = metal
 uniform float uRoughness;              // C32-A: 0 = mirror, 1 = matte
+uniform int   uZebra;                  // Zebra: 1 = surface-continuity stripe mode on
+uniform float uZebraFreq;              // Zebra: stripe count along the reflected-direction band
 out vec4 frag;
 
 // C30-C: procedural studio environment sampled by a reflected direction R (Z-up world).
@@ -76,6 +78,33 @@ void main(){
     vec3 N = normalize(vN);
     vec3 V = normalize(uCamPos - vPos);
     if (dot(N, V) < 0.0) N = -N;            // two-sided
+
+    // Zebra stripes (SolidWorks surface-continuity inspection): render the surface as if it
+    // reflects a black/white striped environment. Stripe kinks reveal tangency (G1) breaks;
+    // stripe jogs reveal curvature (G2) breaks. Takes precedence over the scalar LUT and the
+    // RealView reflection path (it short-circuits before either runs), so zebra is exclusive.
+    // We reflect the view vector about the normal and form the stripe coordinate from the
+    // reflected direction's elevation (asin of the up component, world Z-up) — this lays the
+    // bands out as roughly horizontal rings that flow continuously across a smooth surface,
+    // which is the most legible orientation for reading continuity. fract() of (s * freq)
+    // makes the repeating bands; smoothstep on the distance from a band edge anti-aliases them
+    // (fwidth() is core in #version 330, so no extension is needed).
+    if (uZebra == 1) {
+        vec3 Rz   = reflect(-V, N);                       // reflected eye direction
+        float s   = asin(clamp(Rz.z, -1.0, 1.0));         // elevation of R (Z-up) -> stripe coord
+        float ph  = fract(s * uZebraFreq);                // 0..1 sawtooth along the band coord
+        float d   = abs(ph - 0.5);                        // 0 at band center, 0.5 at the edges
+        float aa  = max(fwidth(s * uZebraFreq), 1e-4);    // screen-space width of one phase unit
+        float band = smoothstep(0.25 - aa, 0.25 + aa, d); // 0 = dark stripe, 1 = light stripe
+        // Modulate lightly by the diffuse (key) term so the silhouette/shape still reads.
+        float lit  = 0.55 + 0.45 * max(dot(N, normalize(uKeyDir)), 0.0);
+        vec3 dark  = vec3(0.04);
+        vec3 light = vec3(0.97);
+        vec3 zc    = mix(dark, light, band) * lit;
+        frag = vec4(clamp(zc, 0.0, 1.0), 1.0);
+        return;
+    }
+
     vec3 srgbColor = uColor;
     if (uUseScalar == 1) {
         if (vScalar != vScalar) {           // NaN = no data -> neutral grey
@@ -697,6 +726,8 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
         }
     }
     glUniform1f(glGetUniformLocation(prog_, "uRealView"), realView_ ? 1.0f : 0.0f);  // C30-C
+    glUniform1i(glGetUniformLocation(prog_, "uZebra"), zebra_ ? 1 : 0);              // Zebra stripes
+    glUniform1f(glGetUniformLocation(prog_, "uZebraFreq"), zebraFreq_);
 
     // Solids, pushed back a touch so the feature edges win the depth test on top of them.
     // In HLR styles the faces are painted in the background color so they only occlude (depth) —
@@ -864,6 +895,7 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px) {
     glUniform1i(glGetUniformLocation(prog_, "uUseScalar"), 0);
     glUniform1i(glGetUniformLocation(prog_, "uClipCount"), 0);  // thumbnail: no section clip
     glUniform1f(glGetUniformLocation(prog_, "uRealView"), 1.0f);  // C30-C: reflections on in previews
+    glUniform1i(glGetUniformLocation(prog_, "uZebra"), 0);       // thumbnail: never striped
     int colorLoc = glGetUniformLocation(prog_, "uColor");
     int metallicLoc = glGetUniformLocation(prog_, "uMetallic");   // C32-A RealView material
     int roughnessLoc = glGetUniformLocation(prog_, "uRoughness");

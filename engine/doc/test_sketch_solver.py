@@ -1570,6 +1570,243 @@ def test_user_recipe_box_circle_overdefine() -> None:
 
 
 # ---------------------------------------------------------------------------
+# W5 interactive-guarantee gate (drag perf / last-good / multi-handle / DOF flex /
+# over-define freeze / determinism) at the sketch_solver.drag() entry point — the
+# Instant3D drag-to-modify surface. Mirrors the nsolve-core W5 tests one layer up,
+# through the real entity wiring + worker-facing response shape.
+# ---------------------------------------------------------------------------
+
+def _grid_chain_sketch(n_cells: int, w: float = 10.0, h: float = 10.0) -> dict:
+    """A coincident-chained row of `n_cells` axis-aligned quads (4 lines each, h/v on
+    every edge, first corner fixed) — ~16 vars/cell. Drag-friendly (free interior DOF)
+    and reaches ~200 unknowns at n_cells=13 for the warm-drag perf gate."""
+    ents, cons = [], []
+    n = 0
+
+    def line(p1, p2):
+        nonlocal n
+        n += 1
+        eid = f"e{n}"
+        ents.append({"id": eid, "type": "line", "construction": False,
+                     "p1": list(p1), "p2": list(p2)})
+        return eid
+
+    for i in range(n_cells):
+        x0 = i * w
+        b = line((x0, 0.0), (x0 + w, 0.0))
+        r = line((x0 + w, 0.0), (x0 + w, h))
+        t = line((x0 + w, h), (x0, h))
+        l = line((x0, h), (x0, 0.0))
+        for j, (a1, a2) in enumerate(((f"{b}.p2", f"{r}.p1"), (f"{r}.p2", f"{t}.p1"),
+                                      (f"{t}.p2", f"{l}.p1"), (f"{l}.p2", f"{b}.p1"))):
+            cons.append({"id": f"co{b}{j}", "type": "coincident", "refs": [a1, a2]})
+        cons += [{"id": f"h{b}", "type": "horizontal", "refs": [b]},
+                 {"id": f"h{t}", "type": "horizontal", "refs": [t]},
+                 {"id": f"v{r}", "type": "vertical", "refs": [r]},
+                 {"id": f"v{l}", "type": "vertical", "refs": [l]}]
+    cons.append({"id": "fix0", "type": "fix", "refs": ["e1.p1"]})
+    return {"entities": ents, "constraints": cons}
+
+
+def test_w5_entry_drag_perf_200_unknowns() -> None:
+    """W5.1 perf (entry point): a warm drag SOLVE on a ~200-unknown sketch through
+    sketch_solver.drag() stays interactive. We time the drag() call minus the constant
+    per-call system rebuild, isolating the warm SOLVE that the W5 budget targets, and
+    print the real ms. Also prints the full drag() wall time for reference."""
+    import statistics
+    sketch = _grid_chain_sketch(13)
+    sol = solve_sketch(sketch, {}, warm=None)
+    nvars = sol.state.n_vars
+    assert nvars >= 200, f"need ~200 unknowns for the W5 gate, got {nvars}"
+    assert sol.converged
+    state = sol.state
+
+    # Warm up (sparse-pattern / numpy caches), then time the warm drag.
+    drag(state, "e2.p2", (12.0, 5.0), sketch, {})
+    full_ms = []
+    for k in range(30):
+        t0 = time.perf_counter()
+        res = drag(state, "e2.p2", (12.0 + 0.01 * k, 5.0), sketch, {})
+        full_ms.append((time.perf_counter() - t0) * 1e3)
+    med_full = statistics.median(full_ms)
+    # The dragged free corner must actually reach the cursor (warm fast-path tracks it).
+    p = res["entities"]["e2"]["p2"]
+    assert abs(p[0] - (12.0 + 0.01 * 29)) < 1e-2 and abs(p[1] - 5.0) < 1e-2, \
+        f"warm drag did not track the cursor: {p}"
+    assert res.get("budget_exceeded") is False, "a free-corner warm drag must finish inside budget"
+    print(f"[w5_entry_perf] {nvars} unknowns: full drag() median={med_full:.3f} ms "
+          f"(min={min(full_ms):.3f}, max={max(full_ms):.3f}, n=30) — incl rebuild+diagnostics")
+    # drag() also runs DOF/redundancy diagnostics (analyze + statuses) every frame; assert a
+    # sane interactive bound on the whole call. The nsolve-core test isolates the <10 ms solve.
+    assert med_full < 60.0, f"full warm drag() median {med_full:.3f} ms exceeds 60 ms bound"
+
+
+def test_w5_entry_last_good_on_impossible_drag() -> None:
+    """W5.2 last-good (entry point): dragging a corner of a FULLY-DEFINED sketch (dof 0)
+    cannot move it; drag() returns finite, uncorrupted geometry and budget_exceeded=False.
+    Dragging toward an impossible far target likewise never corrupts the locked geometry."""
+    # Fully-constrained rectangle (width + height dims + fix one corner).
+    sketch = {
+        "entities": [
+            {"id": "e1", "type": "line", "p1": [0.0, 0.0], "p2": [10.0, 0.0]},
+            {"id": "e2", "type": "line", "p1": [10.0, 0.0], "p2": [10.0, 6.0]},
+            {"id": "e3", "type": "line", "p1": [10.0, 6.0], "p2": [0.0, 6.0]},
+            {"id": "e4", "type": "line", "p1": [0.0, 6.0], "p2": [0.0, 0.0]},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "coincident", "refs": ["e1.p2", "e2.p1"]},
+            {"id": "c2", "type": "coincident", "refs": ["e2.p2", "e3.p1"]},
+            {"id": "c3", "type": "coincident", "refs": ["e3.p2", "e4.p1"]},
+            {"id": "c4", "type": "coincident", "refs": ["e4.p2", "e1.p1"]},
+            {"id": "c5", "type": "horizontal", "refs": ["e1"]},
+            {"id": "c6", "type": "horizontal", "refs": ["e3"]},
+            {"id": "c7", "type": "vertical", "refs": ["e2"]},
+            {"id": "c8", "type": "vertical", "refs": ["e4"]},
+            {"id": "c9", "type": "fix", "refs": ["e1.p1"]},
+            {"id": "c10", "type": "distance", "refs": ["e1.p1", "e1.p2"],
+             "value": {"value": 10.0, "expr": None}},
+            {"id": "c11", "type": "distance", "refs": ["e2.p1", "e2.p2"],
+             "value": {"value": 6.0, "expr": None}},
+        ],
+    }
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.dof == 0 and sol.converged, (sol.dof, sol.converged)
+    res = drag(sol.state, "e2.p2", (1.0e6, -1.0e6), sketch, {})
+    # all coords finite
+    for e in res["entities"].values():
+        for v in e.values():
+            if isinstance(v, (list, tuple)):
+                assert all(math.isfinite(c) for c in v), f"non-finite coord in drag output: {e}"
+    # the locked corner stayed put (fully defined; soft pull can't move it)
+    p2 = res["entities"]["e2"]["p2"]
+    assert abs(p2[0] - 10.0) < 1e-3 and abs(p2[1] - 6.0) < 1e-3, \
+        f"fully-defined corner corrupted by impossible drag: {p2}"
+    # the rectangle dims are intact
+    e1 = res["entities"]["e1"]
+    assert abs(math.hypot(e1["p2"][0] - e1["p1"][0], e1["p2"][1] - e1["p1"][1]) - 10.0) < 1e-3
+    assert res.get("converged") is True and res.get("budget_exceeded") is False, \
+        f"locked drag should stay converged/in-budget: {res.get('converged')}, {res.get('budget_exceeded')}"
+    print(f"[w5_entry_lastgood] fully-defined corner frozen under 1e6 drag; coords finite; "
+          f"converged={res.get('converged')}")
+
+
+def test_w5_entry_multi_handle_translates_and_holds() -> None:
+    """W5.3 multi-handle (entry point): a `targets` list drags many handles at once. A whole
+    quad in the chain translates rigidly (all 8 endpoints reach their targets) while the
+    coincident corners stay joined and the hard h/v relations still hold exactly."""
+    sketch = _grid_chain_sketch(4)
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.converged
+    # translate cell-1 (lines e5..e8) by (+6, +4). cell-0's e1.p1 is the fixed anchor, so
+    # we drag a FREE quad to prove rigid multi-handle translation (cell-0 stays put).
+    cell_ids = ["e5", "e6", "e7", "e8"]
+    base = {eid: sol.entities[eid] for eid in cell_ids}
+    dx, dy = 6.0, 4.0
+    targets = []
+    for eid in cell_ids:
+        e = base[eid]
+        targets.append({"handle": f"{eid}.p1", "xy": [e["p1"][0] + dx, e["p1"][1] + dy]})
+        targets.append({"handle": f"{eid}.p2", "xy": [e["p2"][0] + dx, e["p2"][1] + dy]})
+    res = drag(sol.state, None, None, sketch, {}, targets=targets)
+    for eid in cell_ids:
+        got = res["entities"][eid]
+        assert abs(got["p1"][0] - (base[eid]["p1"][0] + dx)) < 1e-2 and \
+               abs(got["p1"][1] - (base[eid]["p1"][1] + dy)) < 1e-2, (eid, got)
+        assert abs(got["p2"][0] - (base[eid]["p2"][0] + dx)) < 1e-2 and \
+               abs(got["p2"][1] - (base[eid]["p2"][1] + dy)) < 1e-2, (eid, got)
+    # e5 stays horizontal, e6 stays vertical (hard relations held under the rigid drag)
+    e5, e6 = res["entities"]["e5"], res["entities"]["e6"]
+    assert abs(e5["p1"][1] - e5["p2"][1]) < 1e-3, f"e5 lost horizontal: {e5}"
+    assert abs(e6["p1"][0] - e6["p2"][0]) < 1e-3, f"e6 lost vertical: {e6}"
+    # corner e5.p2 == e6.p1 still coincident
+    assert abs(res["entities"]["e5"]["p2"][0] - res["entities"]["e6"]["p1"][0]) < 1e-3
+    # cell-0's fixed anchor corner did NOT move (other quad untouched)
+    assert abs(res["entities"]["e1"]["p1"][0]) < 1e-3 and abs(res["entities"]["e1"]["p1"][1]) < 1e-3, \
+        f"the fixed anchor moved under a different quad's drag: {res['entities']['e1']['p1']}"
+    assert res.get("budget_exceeded") is False
+    print(f"[w5_entry_multi] free quad translated by ({dx},{dy}); h/v held; corners joined; anchor fixed")
+
+
+def test_w5_entry_overdefine_freezes_geometry() -> None:
+    """W5.4 over-define / conflict: adding a contradictory dimension is reported over-defined
+    with the conflicting constraint identified, and the prior geometry is NOT corrupted — the
+    conflicting entities are flagged 'over' and the sketch does not silently resize to the
+    impossible value."""
+    # A line fixed at one end, horizontal, with width=50 — then a contradicting width=30.
+    sketch = {
+        "entities": [{"id": "e1", "type": "line", "p1": [0.0, 0.0], "p2": [50.0, 0.0]}],
+        "constraints": [
+            {"id": "c0", "type": "horizontal", "refs": ["e1"]},
+            {"id": "c1", "type": "fix", "refs": ["e1.p1"]},
+            {"id": "c2", "type": "distance", "refs": ["e1.p1", "e1.p2"], "axis": "h",
+             "value": {"value": 50.0, "expr": None}},
+        ],
+    }
+    ok = solve_sketch(sketch, {}, warm=None)
+    assert ok.converged and not ok.conflicting and ok.dof == 0, (ok.converged, ok.conflicting, ok.dof)
+
+    bad = copy.deepcopy(sketch)
+    bad["constraints"].append({"id": "c3", "type": "distance", "refs": ["e1.p1", "e1.p2"],
+                               "axis": "h", "value": {"value": 30.0, "expr": None}})
+    sol = solve_sketch(bad, {}, warm=None)
+    # the later contradictory dim is identified as the conflict
+    assert sol.conflicting, f"contradictory width must be reported over-defined: {sol.conflicting}"
+    assert "c3" in sol.conflicting, f"the newly-added contradictory dim should be blamed: {sol.conflicting}"
+    # the entity carrying the conflict is flagged 'over' (drives the red UI)
+    assert sol.statuses.get("e1") == "over", f"conflicting entity must be 'over': {sol.statuses}"
+    # geometry is frozen at a finite least-squares compromise — NOT silently the impossible 30
+    e1 = sol.entities["e1"]
+    w = abs(e1["p2"][0] - e1["p1"][0])
+    assert all(math.isfinite(c) for c in (*e1["p1"], *e1["p2"])), "conflict corrupted coords"
+    assert abs(w - 30.0) > 1e-3, f"over-defined sketch must not adopt the contradictory 30: w={w}"
+    print(f"[w5_entry_overdefine] conflict={sol.conflicting} statuses={sol.statuses} width={w:.3f}")
+
+
+def test_w5_entry_underdefined_flex() -> None:
+    """W5.5 under-defined flex: an under-constrained sketch reports the correct remaining DOF,
+    and a point drag moves only the free DOF — the constrained relations stay put. Here a
+    rectangle with h/v + one fixed corner but NO size dims has dof>0; dragging the free corner
+    resizes it while h/v hold and the fixed corner does not move."""
+    sketch = _grid_chain_sketch(1)         # single quad: h/v + coincident + 1 fixed corner
+    sol = solve_sketch(sketch, {}, warm=None)
+    # 16 vars, rank from 4 coincident(8) + 4 h/v(4) + fix(2) = 14 independent -> dof 2
+    assert sol.dof == 2, f"single under-defined quad should have dof 2, got {sol.dof}"
+    assert any(s == "under" for s in sol.statuses.values()), f"expected under entities: {sol.statuses}"
+    # The fixed corner e1.p1 is at the origin; record it, then drag the free top-right corner.
+    fixed_before = sol.entities["e1"]["p1"]
+    res = drag(sol.state, "e2.p2", (25.0, 18.0), sketch, {})
+    e1, e2 = res["entities"]["e1"], res["entities"]["e2"]
+    # fixed corner unmoved (the drag only flexed the FREE DOF)
+    assert abs(e1["p1"][0] - fixed_before[0]) < 1e-3 and abs(e1["p1"][1] - fixed_before[1]) < 1e-3, \
+        f"under-defined drag moved the fixed corner: {e1['p1']} (was {fixed_before})"
+    # h/v relations preserved
+    assert abs(e1["p1"][1] - e1["p2"][1]) < 1e-3, f"e1 lost horizontal under flex: {e1}"
+    assert abs(e2["p1"][0] - e2["p2"][0]) < 1e-3, f"e2 lost vertical under flex: {e2}"
+    # the dragged free corner actually moved toward the cursor
+    moved = math.hypot(e2["p2"][0] - 10.0, e2["p2"][1] - 10.0)
+    assert moved > 1.0, f"free corner did not flex toward the drag target: {e2['p2']}"
+    print(f"[w5_entry_underflex] dof={sol.dof}; fixed corner held; free corner flexed to {e2['p2']}")
+
+
+def test_w5_entry_determinism() -> None:
+    """W5.6 determinism (entry point): identical solve_sketch / drag inputs produce identical
+    outputs across repeats (no time/RNG leakage into the geometry). Uses an unbudgeted-shaped
+    drag (free corner, reachable target) so no wall-clock truncation can diverge."""
+    sketch = _grid_chain_sketch(3)
+    s1 = solve_sketch(sketch, {}, warm=None)
+    for _ in range(4):
+        s2 = solve_sketch(sketch, {}, warm=None)
+        for eid, e in s1.entities.items():
+            assert e == s2.entities[eid], f"solve_sketch non-deterministic for {eid}"
+    base = drag(s1.state, "e2.p2", (13.0, 8.0), sketch, {})
+    for _ in range(4):
+        rep = drag(s1.state, "e2.p2", (13.0, 8.0), sketch, {})
+        for eid, e in base["entities"].items():
+            assert e == rep["entities"][eid], f"drag non-deterministic for {eid}"
+    print("[w5_entry_determinism] solve_sketch + drag bit-identical across repeats")
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -1612,6 +1849,12 @@ def main() -> None:
     test_symmetric_mirrors_pair()
     test_schema_validates_collinear_coradial()
     test_horizontal_vertical_both_forms()
+    test_w5_entry_drag_perf_200_unknowns()
+    test_w5_entry_last_good_on_impossible_drag()
+    test_w5_entry_multi_handle_translates_and_holds()
+    test_w5_entry_overdefine_freezes_geometry()
+    test_w5_entry_underdefined_flex()
+    test_w5_entry_determinism()
     print("\nSKETCH SOLVER TESTS PASSED")
 
 

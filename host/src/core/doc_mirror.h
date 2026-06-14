@@ -44,6 +44,27 @@ struct OpsResponse {
     nlohmann::json owner_map;        // W1-B: raw "owner_map" object when present (else null)
 };
 
+// Instant3D push-pull result (doc_push_pull). Carries the push-pull verdict + readout fields on
+// TOP of an embedded OpsResponse (the revision/tree/tess/owner_map block, present only when the
+// face is draggable). When draggable==false NO doc mutation happened; `reason` explains why.
+struct PushPullResult {
+    bool        ok = false;          // transport/RPC succeeded (false => err in error_message)
+    bool        draggable = false;   // the picked face mapped to a single drivable param
+    bool        committed = false;   // this call pushed one undo entry (commit=true)
+    bool        clamped = false;     // the new value was clamped to the engine's min dimension
+    std::string reason;              // non-draggable reason (draggable==false)
+    std::string feature_id;          // owning feature id (when known)
+    std::string feature_type;        // box | extrude | cylinder | hole | plane | ...
+    std::string param;               // driven param name (length/width/height/depth/radius/...)
+    std::string axis;                // x|y|z|radial|axial|normal|n (informational)
+    double      old_value = 0.0;
+    double      new_value = 0.0;
+    double      distance = 0.0;      // the signed mm distance applied (echoed back)
+    std::string error_code;          // transport/rpc error code (empty on success)
+    std::string error_message;       // human-readable error
+    OpsResponse ops;                 // embedded ops-response (valid when draggable==true)
+};
+
 class DocMirror {
 public:
     // Listener called after every mutation that succeeds (on the calling thread).
@@ -67,6 +88,13 @@ public:
 
     // Last rebuild feature_status array from the worker response.
     const nlohmann::json& featureStatus() const { return featureStatus_; }
+
+    // W12+ — drawings restored by the most recent doc_open: an array of {doc_id, name,
+    // source_doc_id}, one per embedded drawing the engine re-registered (their `source` already
+    // re-pointed to THIS reopened doc). Empty for a file with no drawings. The open caller
+    // (applyOpenedDoc) reads this once to re-create the Drawing tabs, then it is reset on the next
+    // open/new. Additive + tolerant: stays empty if the engine omits the field.
+    const nlohmann::json& lastOpenedDrawings() const { return lastOpenedDrawings_; }
 
     // ---- W1-B (item 6): owner-map lookups ----
     // The parsed feature->topology map from the latest response that carried one. TOLERANT of the
@@ -123,6 +151,19 @@ public:
     OpsResponse undo(WorkerClient& w);
     OpsResponse redo(WorkerClient& w);
 
+    // Instant3D push-pull: drag a face of `body_id` (1-based PickHit body) whose picked FACE is
+    // `topo_id` (1-based TopExp face index) by `distance` mm SIGNED along the face outward normal.
+    // `commit` false = transient preview (no undo entry); true = exactly one undo entry on release.
+    // The host's live-drag envelope is: doc_checkpoint on press, then per sample doc_revert +
+    // pushPull(commit=false, cumulative) so previews never compound, and on release doc_revert +
+    // pushPull(commit=true, final). When the response is draggable, the embedded OpsResponse
+    // (result.ops) updates the mirror EXACTLY like applyOps (revision/tree/owner_map refreshed,
+    // listener fired) and result.ops.aicm_path drives loadDocMesh. When NOT draggable the document
+    // is unchanged and result.reason explains why. A longer timeout is used because the first drag
+    // sample triggers a full rebuild.
+    PushPullResult pushPull(WorkerClient& w, uint32_t body_id, uint32_t topo_id,
+                            double distance, bool commit);
+
     // C37-F: Checkpoint / revert helpers for the PropertyManager cancel path.
     // checkpoint() issues doc_checkpoint and returns the opaque checkpoint id string (empty on
     // failure). revert() issues doc_revert, parses the full ops-style response (tree / revision /
@@ -141,8 +182,56 @@ public:
     bool save(WorkerClient& w, const std::string& path, std::string& err);
     bool open(WorkerClient& w, const std::string& path, std::string& err);
 
+    // Document tabs: re-point this mirror at an ALREADY-open worker document (the worker keeps
+    // every doc alive in its registry). Issues a forced doc_rebuild for `docId` so the mirror
+    // gets the new doc's tree/revision/owner_map AND a fresh tess.aicm_path; fills *aicmPath with
+    // that mesh path (empty for an empty doc). Fires the listener so the tree repaints. Returns
+    // false (err set) if the doc id is unknown or the call fails. Used when switching tabs.
+    bool activate(WorkerClient& w, const std::string& docId, std::string& aicmPath,
+                  std::string& err);
+
     // List open docs (returns array or empty on error).
     nlohmann::json list(WorkerClient& w, std::string& err);
+
+    // ---- Configurations (SolidWorks ConfigurationManager) ----
+    // Generic config-op caller: issue `method` ({"config_add"|"config_delete"|"config_activate"|
+    // "config_set_override"|"config_set_suppression"}) with {doc_id, ...extraParams}. These all
+    // return the SAME ops-response shape applyOps does (revision/tree/rebuild/tess/owner_map), for
+    // the now-active config, so this ingests it EXACTLY like applyOps: updates revision/tree/
+    // feature_status/owner_map and fires the listener (so the FeatureManager tree repaints). The
+    // caller feeds the returned OpsResponse::aicm_path into AppState::loadDocMesh so the viewport
+    // updates. doc_id is injected automatically. No-op (no_doc) when no document is open.
+    OpsResponse callConfig(WorkerClient& w, const std::string& method,
+                           const nlohmann::json& extraParams);
+
+    // Read-only config listing (config_list): returns the raw result
+    // {configurations:[name...], active, detail:[{name, param_overrides, suppressions}]} or a null
+    // json on error (err filled). Does NOT mutate the mirror.
+    nlohmann::json configList(WorkerClient& w, std::string& err);
+
+    // ---- Weldments cut list (SolidWorks Weldment Cut List) ----
+    // Read-only passthrough of weld_cut_list: returns the raw result
+    // {rows:[{item, profile, description, length_mm, quantity, total_length_mm}],
+    //  total_members, total_length_mm, profiles:[...]} or a null json on error (err filled). A part
+    // with no weld_member features (or an assembly) returns an empty rows list — NOT an error. Does
+    // NOT mutate the mirror.
+    nlohmann::json weldCutList(WorkerClient& w, std::string& err);
+
+    // ---- 2D export (DXF / PDF) — drawing sheets + sheet-metal flat patterns (W14) ----
+    // Both are read-only passthroughs that DON'T touch the mirror. They forward to the worker and
+    // return the written absolute path (empty on error, err filled). `format` is "dxf" or "pdf".
+
+    // export_flat_dxf: the ACTIVE part's flat-pattern outline (layer OUTLINE) + bend lines (layer
+    // BEND) to `path`. Requires the open part to be sheet metal WITH a flat pattern (Flatten
+    // feature); a clean error otherwise. Uses the mirror's current doc id (the open part).
+    std::string exportFlat(WorkerClient& w, const std::string& path,
+                           const std::string& format, std::string& err);
+
+    // export_drawing: an open DRAWING's visible (layer VISIBLE) + hidden (layer HIDDEN) view
+    // geometry to `path`. `drawingDocId` is a drawing registry id (NOT the part doc this mirror
+    // tracks), so it's passed explicitly. Static-style: no mirror state is read or written.
+    std::string exportDrawing(WorkerClient& w, const std::string& drawingDocId,
+                              const std::string& path, const std::string& format, std::string& err);
 
     // Re-pull the document tree + revision from the worker (doc_tree) and fire the listener.
     // C24: the public face of the formerly-private resyncTree — callers that mutated the doc
@@ -171,6 +260,7 @@ private:
     int            revision_ = -1;
     nlohmann::json tree_;
     nlohmann::json featureStatus_;
+    nlohmann::json lastOpenedDrawings_ = nlohmann::json::array();  // W12+ doc_open "drawings"
     Listener       listener_;
     StaleCb        staleResyncCb_;  // W1-B: fired on stale_revision auto-resync
 

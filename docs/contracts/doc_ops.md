@@ -29,7 +29,7 @@ Response (also returned by `doc_undo`/`doc_redo`/`doc_rebuild`):
       {"id": "f5", "ok": false, "ms": 1.0, "error": "fillet failed: radius 12 exceeds…",
        "dangling_refs": ["edges[1]"]}
     ],
-    "doc_status": {"active_sketch": null, "mates": null}
+    "doc_status": {"active_sketch": null, "mates": null, "active_configuration": "Default"}
   },
   "tess": {"aicm_path": "…\\doc_6f0c_r18.aicm",
            "bodies": [{"body_id": 1, "name": "Body1", "color": [0.71,0.76,0.82]}]}
@@ -37,7 +37,9 @@ Response (also returned by `doc_undo`/`doc_redo`/`doc_rebuild`):
 ```
 
 - `doc_status.active_sketch`: `"under" | "full" | "over" | null`; `doc_status.mates`:
-  `"ok" | "over" | null` (assemblies).
+  `"ok" | "over" | null` (assemblies). `doc_status.active_configuration`: the name of the
+  configuration the returned geometry reflects (`"Default"` for documents without configurations —
+  doc_schema.md §9 / worker_rpc.md §2.2).
 - `id_map` maps batch placeholders (§3) to assigned ids.
 
 ## 2. Transactionality (normative)
@@ -94,10 +96,81 @@ Ops that create objects may be referenced by later ops **in the same batch** as 
 
 Geometry helpers (defined now; implemented M2 — same envelope, expand to entity edits server-side):
 `sketch_trim {sketch, entity, at:[x,y]}` · `sketch_extend {sketch, entity, end}` ·
-`sketch_offset {sketch, entities:[ids], distance, side}` ·
-`sketch_convert {sketch, edges:[Selector]}` (project model edges) ·
-`sketch_mirror_entities {sketch, entities:[ids], about: line id}` ·
-`sketch_pattern_entities {sketch, entities:[ids], kind: linear|circular, …dims}`
+`sketch_offset {sketch, entities:[ids], distance, side}`
+
+**Sketch mirror / pattern / convert (C53 — reflect / array / project the selection):**
+
+| op | fields |
+|---|---|
+| `sketch_mirror_entities` | `sketch`, `entities:[id…]` (line/circle/arc), `line` (construction-line entity id = mirror axis) |
+| `sketch_pattern_entities` | `sketch`, `mode:"linear"\|"circular"`, `entities:[id…]` (line/circle/arc), + per-mode dims |
+| `sketch_convert` | `sketch`, `refs:[Ref…]` where each Ref is `{datum:"front"\|"top"\|"right"}` or `{kind:"face"\|"edge", selector}` (same Ref shape as `sketch_project_ref`) |
+
+- **`sketch_mirror_entities`** reflects each selected entity across the mirror line and appends the
+  copies, then adds relations that keep each pair mirrored: per endpoint-pair `symmetric` (refs
+  `[orig.handle, copy.handle, line]`) — `p1`/`p2` for a line, `center` for a circle, `center`/`start`/
+  `end` for an arc — plus an `equal` (radius) for circles/arcs. Arc copies flip orientation (`ccw`).
+- **`sketch_pattern_entities`** (`mode:"linear"`) takes `dir:[dx,dy]` (normalized internally), integer
+  `count>=2`, numeric `spacing`; (`mode:"circular"`) takes `center:[x,y]`, integer `count>=2`, numeric
+  `angle`, optional `equal_spacing:bool`. `equal_spacing:true` shares `angle` equally across the ring
+  (`step = angle/count`, e.g. `360` → full ring); otherwise `angle` is the step BETWEEN consecutive
+  instances. It appends `count-1` PLAIN copies (no per-instance relations — a SolidWorks geometry
+  pattern); under-defined like fresh geometry.
+- **`sketch_convert`** projects each Ref onto the sketch plane via the same math as `sketch_project_ref`
+  (planes/planar faces → intersection line; linear edge → line or point; circular edge with axis ∥
+  the sketch normal → circle) and appends it as a real sketch entity pinned with a whole-entity `fix`
+  relation (reference geometry tracks the model).
+
+All three record the FIRST new entity under `$<index>` and any further new entities under
+`$<index>#1`, `$<index>#2`, … (the flat id_map scheme `sketch_offset`/`sketch_trim` use). Supported
+entity types for mirror/pattern are **line, circle, arc**; any other selected type raises
+`unsupported_entity`. Empty/zero-length `entities`/`refs`, a non-line mirror `line`, `count<2`, or a
+zero-length `dir` raise `invalid_op`. A reference that cannot be projected raises `convert_failed` (or
+the `unsupported_ref` it bubbles up). Like all op errors these reject the whole batch with no state
+change (§2).
+
+**Sketch move/copy (C54 — translate or duplicate the selection by a delta):**
+
+| op | fields |
+|---|---|
+| `sketch_move` | `sketch`, `entities:[id…]` (line/circle/arc), `dx`, `dy` (numeric delta), `copy:bool=false` |
+
+- **`copy:false`** (default) moves the selection **IN PLACE**: each entity's own geometry shifts by
+  `(dx, dy)` and its relations ride along — no new entities, the entity count is unchanged. The first
+  moved entity id is recorded under `$<index>`.
+- **`copy:true`** leaves the originals untouched and **appends one translated copy of each** selected
+  entity (a plain-geometry copy, no per-instance relations — like a 2-instance pattern minus the
+  original), so the entity count of the selection doubles. The first copy is recorded under
+  `$<index>`, the rest under `$<index>#1`, `$<index>#2`, … (the flat id_map scheme).
+
+Supported entity types are **line, circle, arc**; any other selected type raises `unsupported_entity`.
+An empty `entities`, an unknown `sketch`, a non-numeric `dx`/`dy`, or a non-bool `copy` raise
+`invalid_op`. Like all op errors these reject the whole batch with no state change (§2).
+
+**Sketch fillet / chamfer (round/bevel the corner where two LINE segments meet):**
+
+| op | fields |
+|---|---|
+| `sketch_fillet` | `sketch`, `e1`, `e2` (the two segment ids sharing/near a corner), `radius` (>0) |
+| `sketch_chamfer` | `sketch`, `e1`, `e2`, `distance` (>0 setback along e1), `distance2?` (>0 setback along e2; defaults to `distance` for an equal-leg bevel) |
+
+Both trim `e1` and `e2` back to the corner setback points and insert the connecting geometry,
+recording its new entity id under the op placeholder `$<index>`:
+- **`sketch_fillet`** inserts a tangent **arc** of `radius` and adds: `coincident` (arc.start ↔ the
+  trimmed e1 corner end), `coincident` (arc.end ↔ the trimmed e2 corner end), `tangent(arc, e1)`,
+  `tangent(arc, e2)`. (On an orthogonal corner the two tangents are geometrically implied by the
+  coincident joins, so the solver may flag one as *redundant* — benign, mirrors SolidWorks.)
+- **`sketch_chamfer`** inserts a connecting **line** and adds: `coincident` (line.p1 ↔ trimmed e1
+  end), `coincident` (line.p2 ↔ trimmed e2 end).
+
+Both first **drop the original coincident** that joined the two corner endpoints (the sharp corner
+is gone) so the new geometry is not pulled back together at solve time.
+
+**Supported:** line–line corners only. A non-line `e1`/`e2` raises `unsupported_entity` (the solver
+has no line↔arc / arc↔arc tangent yet — doc_schema.md §3.3). Degenerate input — parallel segments,
+no shared corner, or a `radius`/setback too large to fit between the corner and the segments' far
+ends — raises `fillet_failed` / `chamfer_failed` with NO mutation (the whole op-batch is rejected
+atomically, §2). Non-positive `radius`/`distance`, missing/identical `e1`/`e2` raise `invalid_op`.
 
 ### Assembly
 
@@ -116,6 +189,14 @@ Geometry helpers (defined now; implemented M2 — same envelope, expand to entit
 `unknown_doc` · `stale_revision {detail.current_revision}` · `invalid_op {detail.index,
 detail.reason}` · `dependency_exists {detail.dependents}` · `eq_in_use {detail.referencing}` ·
 `io_error` · `unsupported` · `internal`
+
+Sketch-geometry op codes (all carry `{detail.index, detail.reason}`): `unsupported_entity`
+(sketch_trim/extend/offset/fillet/chamfer/mirror/pattern hit a non-supported entity type) ·
+`extend_no_target` (sketch_extend found nothing ahead) · `fillet_failed` / `chamfer_failed`
+(degenerate corner: parallel, no corner, or radius/setback too large) · `mirror_failed`
+(degenerate mirror line) · `convert_failed` (sketch_convert could not project a ref) ·
+`unsupported_ref` (sketch_convert/project: parallel plane or unprojectable edge). Like all op errors
+these reject the whole batch with no state change (§2).
 
 `stale_revision` is the optimistic-concurrency signal: the GUI must resync (`doc_tree`) and replay
 user intent. Rebuild failures are NOT errors (see §2.3).

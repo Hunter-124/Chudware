@@ -19,8 +19,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -39,6 +41,7 @@
 #include "core/app_state.h"
 #include "core/jobs.h"
 #include "ui/console_panel.h"
+#include "ui/doc_tabs.h"
 #include "ui/feature_tree.h"
 #include "ui/legacy_chat.h"
 #include "ui/settings_modal.h"
@@ -53,6 +56,10 @@
 #include "ui/ribbon_def.h"
 #include "ui/property_manager.h"
 #include "ui/sketch_mode.h"   // C18
+#include "ui/config_panel.h"  // Configurations (SolidWorks ConfigurationManager)
+#include "ui/design_table_panel.h"  // Design Table (SolidWorks editable config grid)
+#include "ui/cutlist_panel.h"  // Weldment Cut List (SolidWorks Weldment Cut List)
+#include "ui/file_dialog.h"   // W14: native Save-As for 2D export (flat-pattern DXF)
 #include "ui/toast.h"         // W1-B: toast notifications
 #include "ui/cursors.h"       // W1-B: cursor manager
 // --- C19: simulation + flow + evaluate UI ---
@@ -68,7 +75,7 @@
 // --- end C20b ---
 #include "ui/scenarios.h"  // scripted screenshot/test scenarios (m1/sketch/asm/fea/evalmass/activity)
 
-#include <filesystem>      // Wave N: ecad export output dir
+#include <filesystem>      // Wave N: ecad export output dir + W14: flat-pattern DXF export
 
 // =====================================================================================
 // Wave N: AI-ECAD GUI command wiring. Creates/routes ECAD documents through the worker
@@ -413,6 +420,78 @@ void ecadDispatch(AppState& st, const std::string& cmd) {
 
 }  // namespace
 
+// W16: apply the param-less sm_flat_pattern feature (Sheet Metal "Flatten") + reload the mesh.
+// One-click feature (no PM form) — add_feature then loadDocMesh from the ops-response, like the
+// feature-tree op helper. The DocMirror listener refreshes the FeatureManager automatically.
+static void applyFlatPattern(AppState& st) {
+    if (!st.docMirror.hasDoc()) {
+        st.toast(ui::ToastLevel::Info, "Open a sheet metal part first");
+        return;
+    }
+    nlohmann::json ops = nlohmann::json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "sm_flat_pattern"}, {"name", "Flat-Pattern"},
+                                             {"params", nlohmann::json::object()}}}}});
+    auto r = st.docMirror.applyOps(st.worker, ops);
+    if (r.ok && !r.aicm_path.empty()) {
+        std::string le;
+        st.loadDocMesh(r.aicm_path, le);
+        st.toast(ui::ToastLevel::Info, "Flat pattern created");
+    } else if (!r.ok) {
+        st.toast(ui::ToastLevel::Warn,
+                 r.error_message.empty() ? std::string("Flatten failed") : r.error_message);
+    }
+}
+
+// W14: export the ACTIVE sheet-metal part's flat pattern to DXF (outline on layer OUTLINE, bend
+// lines on layer BEND). One-click Sheet Metal command (no PM form) — picks a path (native Save-As,
+// or cwd fallback when dialogs are disabled) then calls export_flat_dxf via DocMirror. The engine
+// computes the flat (fresh compile) and errors cleanly if the part has no flat pattern.
+static void exportFlatDxf(AppState& st) {
+    if (!st.docMirror.hasDoc()) {
+        st.toast(ui::ToastLevel::Info, "Open a sheet metal part first");
+        return;
+    }
+    // Suggested file name from the doc title.
+    std::string title = st.docMirror.tree().is_object()
+                            ? st.docMirror.tree().value("name", std::string("part"))
+                            : std::string("part");
+    std::string base;
+    for (char c : title) {
+        if (c == ' ') base += '_';
+        else if (std::isalnum((unsigned char)c) || c == '_' || c == '-') base += c;
+    }
+    if (base.empty()) base = "part";
+    base += "_flat";
+
+    const bool dialogsDisabled = std::getenv("AI_CAD_NO_FILE_DIALOGS") != nullptr;
+    std::string path;
+    if (dialogsDisabled) {
+        path = (std::filesystem::current_path() / (base + ".dxf")).string();
+    } else {
+        const char* filter = "DXF (*.dxf)\0*.dxf\0PDF (*.pdf)\0*.pdf\0All files (*.*)\0*.*\0";
+        path = ui::saveFileDialog(filter, "dxf", (base + ".dxf").c_str());
+        if (path.empty()) return;  // canceled
+    }
+    // Format follows the chosen extension (export_flat_dxf accepts dxf|pdf; defaults to the ext).
+    std::string fmt = "dxf";
+    if (path.size() >= 4) {
+        std::string tail = path.substr(path.size() - 4);
+        for (auto& ch : tail) ch = (char)std::tolower((unsigned char)ch);
+        if (tail == ".pdf") fmt = "pdf";
+    }
+
+    std::string err;
+    std::string written = st.docMirror.exportFlat(st.worker, path, fmt, err);
+    if (!written.empty()) {
+        st.addLog("[sm] exported flat " + fmt + ": " + written);
+        st.toast(ui::ToastLevel::Info, "Exported " + written);
+    } else {
+        st.addLog("[sm] export flat failed: " + err);
+        st.toast(ui::ToastLevel::Warn,
+                 err.empty() ? std::string("Export Flat DXF failed") : err);
+    }
+}
+
 int run_gui(const char* screenshotPath) {
     const bool shot = screenshotPath != nullptr;
     if (!glfwInit()) return 1;
@@ -536,6 +615,15 @@ int run_gui(const char* screenshotPath) {
     ui::SketchMode sketchMode;
     st.sketchMode = &sketchMode;
 
+    // Configurations panel (SolidWorks ConfigurationManager) — owned here, drawn each frame.
+    ui::ConfigPanel configPanel;
+
+    // Design Table panel (SolidWorks editable config grid) — owned here, drawn each frame.
+    ui::DesignTablePanel designTablePanel;
+
+    // Weldment Cut List panel (SolidWorks Weldment Cut List) — owned here, drawn each frame.
+    ui::CutListPanel cutListPanel;
+
     // --- C22b: ActivityPanel — owned here, borrowed via st.activityPanel (opaque void*). ---
     ui::ActivityPanel activityPanel;
     st.activityPanel = &activityPanel;
@@ -559,6 +647,9 @@ int run_gui(const char* screenshotPath) {
         if (propertyManager.active() && std::strcmp(cmd_id, "sketch_new") == 0)
             propertyManager.cancelEdits(st);
         if (sketchMode.onRibbonCommand(st, cmd_id)) return;       // C18 sketch tool handled
+        // DRAWINGS: "Make Drawing" creates a drawing + standard views from the active part and
+        // opens it as a Drawing tab (guarded; toasts if no part is open).
+        if (std::strcmp(cmd_id, "make_drawing") == 0) { st.makeDrawing(); return; }
         // C20b: Assembly tab + New Assembly route to the assembly panels first.
         {
             std::string cmd(cmd_id);
@@ -575,6 +666,8 @@ int run_gui(const char* screenshotPath) {
         if (propertyManager.openForCommand(st, cmd_id)) return;  // form opened
         // C19: Simulation tab -> sim panel; Evaluate tab -> evaluate dialogs.
         std::string cmd(cmd_id);
+        if (cmd == "sm_flat_pattern") { applyFlatPattern(st); return; }  // W16: one-click Flatten
+        if (cmd == "sm_export_flat_dxf") { exportFlatDxf(st); return; }  // W14: flat-pattern DXF
         if (cmd.rfind("sim_", 0) == 0 && simPanel.handleCommand(st, cmd)) return;
         if (cmd.rfind("eval_", 0) == 0 && evaluateDialogs.handleCommand(st, cmd)) return;
         std::printf("[ribbon] %s (no PM form)\n", cmd_id);
@@ -588,6 +681,7 @@ int run_gui(const char* screenshotPath) {
         if (propertyManager.active() && std::strcmp(cmd_id, "sketch_new") == 0)
             propertyManager.cancelEdits(st);
         if (sketchMode.onRibbonCommand(st, cmd_id)) return;
+        if (std::strcmp(cmd_id, "make_drawing") == 0) { st.makeDrawing(); return; }
         {
             std::string cmd(cmd_id);
             if ((cmd.rfind("asm_", 0) == 0 || cmd == "new_assembly") &&
@@ -602,6 +696,8 @@ int run_gui(const char* screenshotPath) {
         }
         if (propertyManager.openForCommand(st, cmd_id)) return;
         std::string cmd(cmd_id);
+        if (cmd == "sm_flat_pattern") { applyFlatPattern(st); return; }  // W16: one-click Flatten
+        if (cmd == "sm_export_flat_dxf") { exportFlatDxf(st); return; }  // W14: flat-pattern DXF
         if (cmd.rfind("sim_", 0) == 0 && simPanel.handleCommand(st, cmd)) return;
         if (cmd.rfind("eval_", 0) == 0 && evaluateDialogs.handleCommand(st, cmd)) return;
         std::printf("[ribbon] %s (no PM form)\n", cmd_id);
@@ -656,8 +752,15 @@ int run_gui(const char* screenshotPath) {
                     continue;  // handled (or failed) — skip the part-doc resolve path
                 }
             }
+            // Body wells (boolean targets/tools): resolve the clicked element's OWNING body
+            // (doc_resolve_pick kind="body" -> {kind:"body", owner_feature:...}) instead of the
+            // face/edge/vertex it landed on, so picking anywhere on a body selects that body.
+            const char* resolveKind = kindStr;
+            if (st.propertyManager && st.propertyManager->active() &&
+                st.propertyManager->activeWellWantsBody())
+                resolveKind = "body";
             std::string sel = st.docMirror.resolvePick(
-                st.worker, item.hit.body_id, kindStr, item.hit.topo_id, err);
+                st.worker, item.hit.body_id, resolveKind, item.hit.topo_id, err);
             if (!sel.empty()) {
                 item.selector = sel;
                 item.pending_resolve = false;
@@ -689,7 +792,14 @@ int run_gui(const char* screenshotPath) {
                     if (pm->active()) {
                         try {
                             nlohmann::json selObj = nlohmann::json::parse(sel);
-                            pm->routePick(selObj, (int)item.hit.kind);
+                            // Feedback when a pick is rejected for the wrong topology (the active
+                            // well wants a different kind) — otherwise the click is silently lost.
+                            if (!pm->routePick(selObj, (int)item.hit.kind)) {
+                                std::string hint = pm->activeWellKindHint();
+                                if (!hint.empty())
+                                    st.toast(ui::ToastLevel::Info,
+                                             "This field takes " + hint + " — that pick wasn't added");
+                            }
                         } catch (...) {}
                     }
                 }
@@ -712,6 +822,13 @@ int run_gui(const char* screenshotPath) {
         // go stale after a topology rebuild retags them. (docUndo/docRedo also refresh explicitly,
         // which is redundant-but-harmless; this listener covers the ops/resync paths.)
         ui::refreshFeatureHighlight(st);
+        // Document tabs: a real edit (applyOps/undo/redo/pushPull/revert) lights the active tab's
+        // unsaved-changes marker. Tab switches / fresh-doc activation / resyncs set suppressTabDirty
+        // so they don't falsely dirty a tab. Keep the cached title in step with renames, too.
+        if (!st.suppressTabDirty) {
+            st.markActiveTabDirty();
+            st.syncActiveTabTitle();
+        }
     });
 
     // W1-B (item 2/11): route otherwise-silent failures into the toast system.
@@ -1596,9 +1713,17 @@ int run_gui(const char* screenshotPath) {
         ui::setRibbonActiveCmd(sketchMode.activeToolCmd());
         float ribbonH = ui::drawRibbon(st.ribbonTab, st.showRibbon);
 
+        // ---------- document tab strip (browser/SolidWorks-style; under the ribbon) ----------
+        // Reconcile the strip with the mirror (adopt a doc created by a path that doesn't open its
+        // own tab — sketch auto-create, chat new-part, agent v2 run, assembly panel), then draw it.
+        // Shown whenever at least one document is open; zero-height in the empty start state so the
+        // single-document / no-document layout is unchanged.
+        st.ensureActiveTab();
+        float docTabsH = ui::drawDocTabs(st, barH + ribbonH);
+
         // ---------- dockspace host (between the title bar+ribbon and the status bar) ----------
         const float statusH = 30.0f * scale;
-        const float dockTopY = barH + ribbonH;
+        const float dockTopY = barH + ribbonH + docTabsH;
         ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + dockTopY));
         ImGui::SetNextWindowSize(ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
         ImGui::SetNextWindowViewport(vp->ID);
@@ -1668,6 +1793,22 @@ int run_gui(const char* screenshotPath) {
 
         // ---------- C20b: assembly panels (Insert / Mate / Explode / Interference / BOM) ----------
         asmPanels.draw(st);
+
+        // ---------- Configurations panel (SolidWorks ConfigurationManager) ----------
+        // Lists the active part/asm doc's configurations; activate/add/delete ingest the
+        // ops-response so the viewport + FeatureManager refresh. No-op unless st.showConfigPanel.
+        configPanel.draw(st);
+
+        // ---------- Design Table panel (SolidWorks editable config grid) ----------
+        // Editable spreadsheet over the active doc's configurations: rows=configs, columns=driven
+        // params + per-feature suppression. Cell edits write per-config overrides via the same
+        // config_* RPCs; editing the active row updates the viewport. No-op unless the flag is set.
+        designTablePanel.draw(st);
+
+        // ---------- Weldment Cut List panel (SolidWorks Weldment Cut List) ----------
+        // Read-only table of the active part's weld_member structural members grouped by
+        // profile + length into rows with quantities. No-op unless st.showCutListPanel.
+        cutListPanel.draw(st);
 
         // ---------- C15 pick-shot driver: simulate a center-screen pick ----------
         // The viewport panel rendered the id buffer for this frame's camera; pick its center,

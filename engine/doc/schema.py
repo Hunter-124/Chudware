@@ -11,13 +11,89 @@ with a JSON-path-ish locator so failures are actionable.
 
 from __future__ import annotations
 
+import ast
 import re
 from typing import Any
 
 from .equations import EquationError, expr_names, validate_expr
 
+# Equation-driven-curve expression grammar (used by the "eq_curve" sketch entity). This is a
+# RADIANS-convention parametric grammar distinct from the document-equation evaluator (which works
+# in degrees): the free variable is t (or x for the explicit form), and the whitelisted functions /
+# constants below are the SolidWorks "Equation Driven Curve" set. The single source of truth for
+# both validation (here) and sampling (features/sketch.py) is EQ_CURVE_FUNCS / EQ_CURVE_CONSTS.
+EQ_CURVE_FUNCS = {
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "sqrt", "exp", "log", "abs", "sinh", "cosh", "tanh", "pow",
+}
+EQ_CURVE_CONSTS = {"pi", "e"}
+
+
+_EQ_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod)
+
+
+def _eq_curve_check(node: ast.AST, var: str) -> str | None:
+    """Recursive AST whitelist for eq-curve expressions. Returns an error string or None."""
+    if isinstance(node, ast.Expression):
+        return _eq_curve_check(node.body, var)
+    if isinstance(node, ast.BinOp):
+        if not isinstance(node.op, _EQ_BINOPS):
+            return "operator not allowed"
+        return _eq_curve_check(node.left, var) or _eq_curve_check(node.right, var)
+    if isinstance(node, ast.UnaryOp):
+        if not isinstance(node.op, (ast.USub, ast.UAdd)):
+            return "operator not allowed"
+        return _eq_curve_check(node.operand, var)
+    if isinstance(node, ast.Constant):
+        if not isinstance(node.value, (int, float)) or isinstance(node.value, bool):
+            return "only numbers allowed"
+        return None
+    if isinstance(node, ast.Name):
+        if node.id == var or node.id in EQ_CURVE_CONSTS or node.id in EQ_CURVE_FUNCS:
+            return None
+        return (f"unknown name '{node.id}' (only '{var}', {sorted(EQ_CURVE_CONSTS)} and "
+                f"math functions allowed)")
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id not in EQ_CURVE_FUNCS:
+            return "unknown function"
+        if node.keywords:
+            return "keyword arguments not allowed"
+        for a in node.args:
+            err = _eq_curve_check(a, var)
+            if err:
+                return err
+        return None
+    return "construct not allowed"
+
+
+def validate_eq_curve_expr(expr: str, var: str = "t") -> str | None:
+    """Return an error string if *expr* is not a valid eq-curve expression, else None.
+
+    Allowed: numbers, the free variable *var*, the constants in EQ_CURVE_CONSTS, the functions in
+    EQ_CURVE_FUNCS, + - * / ** % (and ^), unary +/-, and parentheses. Nothing else parses — an
+    arbitrary identifier, attribute access, comprehension, or call to an unlisted name is rejected.
+    """
+    if not isinstance(expr, str) or not expr.strip():
+        return "empty expression"
+    try:
+        tree = ast.parse(expr.replace("^", "**"), mode="eval")
+    except SyntaxError as exc:
+        return f"syntax error: {exc.msg}"
+    return _eq_curve_check(tree, var)
+
+
 SCHEMA_PART = "aicad.part/1"
 SCHEMA_ASM = "aicad.asm/1"
+SCHEMA_DRAWING = "aicad.drawing/1"  # W12 — 2D orthographic/iso drawing of a source part/assembly
+
+# Drawing sheet sizes (ISO A-series + ANSI). Width/height (landscape) lookup lives in drawing.py;
+# the validator only checks the size token is one we know.
+SHEET_SIZES = {"A4", "A3", "A2", "A1", "A0", "A", "B", "C", "D", "E"}
+# Drawing view kinds + canonical orientations (Z-up: front looks +Y, top -Z, right -X — see
+# engine/doc/features/datum.py reserved_datums + drawing.py orientation table).
+VIEW_TYPES = {"base", "projected", "iso", "section", "detail"}
+VIEW_ORIENTATIONS = {"front", "back", "top", "bottom", "left", "right", "iso",
+                     "section", "detail"}
 
 RESERVED_DATUMS = {
     "origin",
@@ -55,9 +131,16 @@ ENTITY_FIELDS: dict[str, list[str]] = {
     "parabola": ["vertex", "focus", "t0", "t1"],
     "conic": ["p0", "p1", "apex", "rho"],
     "spline": ["points"],
+    # SolidWorks "Style Spline": points are CONTROL POLES (a control polygon),
+    # not interpolated through-points (cf. "spline"). Same field shape as spline.
+    "style_spline": ["points"],
     "slot": ["p1", "p2", "width"],
     "arc_slot": ["center", "radius", "a0", "a1", "width"],  # C30-B: arc-spine slot
     "text": ["p", "text", "height"],
+    # Equation-driven curve (SolidWorks "Equation Driven Curve"). Parametric form is required:
+    # xt/yt are expression strings in variable t over [t1, t2]. An optional explicit form (yx in
+    # variable x over [x1, x2]) is mapped to the parametric form at compile time (xt=x, yt=yx).
+    "eq_curve": ["xt", "yt", "t1", "t2"],
 }
 
 # Entity type -> point sub-handles it exposes
@@ -73,7 +156,8 @@ _ENTITY_SUBS: dict[str, set[str]] = {
     "slot": {"p1", "p2"},
     "arc_slot": {"center", "start", "end"},  # C30-B: derived spine endpoints
     "text": {"p"},
-    # spline handled specially (p0..pN)
+    "eq_curve": {"start", "end"},  # derived curve endpoints at t1 / t2
+    # spline and style_spline handled specially (p0..pN control-pole sub-handles)
 }
 
 # Constraint type -> (min_refs, max_refs, needs_value)
@@ -105,6 +189,7 @@ _SEL_LIST = "selector_list"
 _FEAT_LIST = "feature_id_list"
 _COMP_LIST = "component_id_list"
 _UV_LIST = "uv_list"               # list of [u,v] local-frame offsets (C33-A hole positions)
+_ENTITY_ID_LIST = "entity_id_list"  # list of sketch entity ids e<N> (weldment segment picks)
 
 # Feature type -> {"params": [required keys], "refs": {slot: (form, required)}}
 FEATURE_TYPES: dict[str, dict[str, Any]] = {
@@ -155,11 +240,29 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
                                       "bodies": (_SEL_LIST, False)}},
     "boolean": {"params": ["op"], "refs": {"targets": (_SEL_LIST, True),
                                            "tools": (_SEL_LIST, False)}},
+    # Sheet metal — base flange (sheet from a region) + edge flange (bent wall off an edge).
+    "sm_base_flange": {"params": [], "refs": {"profile": (_SEL_LIST, True)}},
+    "sm_edge_flange": {"params": [], "refs": {"edge": (_SEL_OR_DATUM, True)}},
+    # Hem (fold an edge back on itself) + jog (two bends -> a parallel offset step).
+    "sm_hem": {"params": [], "refs": {"edge": (_SEL_OR_DATUM, True)}},
+    "sm_jog": {"params": [], "refs": {"edge": (_SEL_OR_DATUM, True)}},
+    # Flat pattern (unfold) — operates on the running sheet-metal body + stored bend records.
+    "sm_flat_pattern": {"params": [], "refs": {}},
+    # Weldments — sweep a structural profile along sketch segments → members + cut-list data.
+    # refs.sketch is a sketch feature id; refs.segments (optional) is a list of entity ids.
+    "weld_member": {"params": ["profile"], "refs": {"sketch": (_SEL_OR_DATUM, True),
+                                                    "segments": (_ENTITY_ID_LIST, False)}},
+    # Weldment dress features — gusset (plate in an L-corner of two members) + end cap (plate
+    # closing a member's open end). Both resolve from picked planar faces on the member bodies.
+    "weld_gusset": {"params": [], "refs": {"faces": (_SEL_LIST, True)}},
+    "weld_end_cap": {"params": [], "refs": {"face": (_SEL_OR_DATUM, True)}},
     "script": {"params": ["code"], "refs": {}},
     "import": {"params": ["source_path", "format"], "refs": {}},
-    # Stretch — schema-reserved (envelope accepted, no deep checks yet):
-    "rib": {"params": [], "refs": {}},
-    "split": {"params": [], "refs": {}},
+    # Stretch — rib (thin wall from an OPEN sketch contour) + split (divide a body by a planar tool).
+    # rib.profile is a region selector naming the sketch whose OPEN contour is the rib trace (the PM
+    # profile well emits a 1-list, like extrude). split.tool is a planar face or a datum plane.
+    "rib": {"params": [], "refs": {"profile": (_SEL_LIST, True)}},
+    "split": {"params": [], "refs": {"tool": (_SEL_OR_DATUM, True)}},
     # Assembly component patterns:
     "asm_linear_pattern": {"params": ["count1", "spacing1"],
                            "refs": {"dir1": (_SEL_OR_DATUM, True),
@@ -274,12 +377,13 @@ def _handle_targets_entity(handle: str, entities_by_id: dict[str, dict]) -> str 
     if not sub:
         return None
     etype = ent.get("type")
-    if etype == "spline":
+    if etype in ("spline", "style_spline"):
+        # Both expose p0..pN point sub-handles (style_spline's are its control poles).
         if re.match(r"^p\d+$", sub):
             npts = len(ent.get("points") or [])
             idx = int(sub[1:])
-            return None if idx < npts else f"spline point '{sub}' out of range"
-        return f"'{sub}' is not a spline handle"
+            return None if idx < npts else f"{etype} point '{sub}' out of range"
+        return f"'{sub}' is not a {etype} handle"
     subs = _ENTITY_SUBS.get(etype or "", set())
     if sub not in subs:
         return f"'{sub}' is not a handle of a {etype}"
@@ -314,9 +418,22 @@ def validate_entity(e: Any, where: str) -> list[str]:
         elif field == "text":
             if not isinstance(v, str):
                 errs.append(f"{where}.text: must be string")
-        else:  # radius, start, end, rx, ry, rot, width, height
+        elif field in ("xt", "yt"):
+            # Equation-driven-curve parametric expression in variable t. Grammar-checked here
+            # (numbers / t / + - * / ** / parens / whitelisted math funcs); free variable t is
+            # allowed and not flagged as an unknown global (it is bound at curve sampling time).
+            if not isinstance(v, str):
+                errs.append(f"{where}.{field}: must be an expression string")
+            else:
+                err = validate_eq_curve_expr(v)
+                if err:
+                    errs.append(f"{where}.{field}: {err}")
+        else:  # radius, start, end, rx, ry, rot, width, height, t1, t2
             if not _is_num(v):
                 errs.append(f"{where}.{field}: must be a number")
+    # Optional sketch-text font name (additive; absent => engine default font).
+    if etype == "text" and "font" in e and not isinstance(e["font"], (str, type(None))):
+        errs.append(f"{where}.font: must be a string or null")
     return errs
 
 
@@ -513,6 +630,13 @@ def validate_feature(
                 for i, pt in enumerate(v):
                     if not _is_vec(pt, 2):
                         errs.append(f"{loc}[{i}]: must be [u,v] (two numbers)")
+        elif form == _ENTITY_ID_LIST:
+            if not isinstance(v, list) or not v:
+                errs.append(f"{loc}: must be a non-empty list of sketch entity ids")
+            else:
+                for i, s in enumerate(v):
+                    if not isinstance(s, str) or not re.match(r"^e\d+$", s):
+                        errs.append(f"{loc}[{i}]: '{s}' is not a sketch entity id (e<N>)")
         elif form == _COMP_LIST:
             comp = component_ids or set()
             if not isinstance(v, list) or not v:
@@ -596,6 +720,94 @@ def _validate_rollback(doc: dict, feature_ids: set[str]) -> list[str]:
     return []
 
 
+def _validate_configurations(doc: dict, features_by_id: dict[str, dict]) -> list[str]:
+    """Optional doc-level ``configurations`` + ``active_configuration`` (CONFIG version bump).
+
+    A part/assembly may carry NAMED configurations — variants of one document driven by per-config
+    feature-param overrides and/or feature suppression. The shape::
+
+        "configurations": [
+            {"name": str,
+             "param_overrides": {"<feature_id>.<param_key>": <value | {value, expr}>},
+             "suppressions": {"<feature_id>": bool}}
+        ],
+        "active_configuration": "<name>"
+
+    ABSENT ``configurations`` => exactly today's behavior (one implicit "Default" config). The
+    validator checks: names are non-empty + unique; ``active_configuration`` (when present) names a
+    real config; each override key is ``fid.param`` referencing an existing feature whose params
+    carry that key; each suppression key references an existing feature. ``param_overrides`` values
+    that look like dims (``{value, expr}``) are dim-validated. Errors are clean (no exception)."""
+    configs = doc.get("configurations")
+    if configs is None:
+        # active_configuration is meaningless without a configurations list; flag a stray pointer.
+        ac = doc.get("active_configuration")
+        if ac is not None and not isinstance(ac, str):
+            return ["active_configuration: must be a configuration name string or null"]
+        return []
+    if not isinstance(configs, list):
+        return ["configurations: must be a list"]
+
+    errs: list[str] = []
+    names: set[str] = set()
+    for i, cfg in enumerate(configs):
+        loc = f"configurations[{i}]"
+        if not isinstance(cfg, dict):
+            errs.append(f"{loc}: must be an object")
+            continue
+        name = cfg.get("name")
+        if not isinstance(name, str) or not name:
+            errs.append(f"{loc}.name: required non-empty string")
+        elif name in names:
+            errs.append(f"{loc}.name: duplicate '{name}'")
+        else:
+            names.add(name)
+
+        overrides = cfg.get("param_overrides", {})
+        if overrides is None:
+            overrides = {}
+        if not isinstance(overrides, dict):
+            errs.append(f"{loc}.param_overrides: must be an object")
+        else:
+            for key, val in overrides.items():
+                kloc = f"{loc}.param_overrides.{key}"
+                if not isinstance(key, str) or "." not in key:
+                    errs.append(f"{kloc}: key must be '<feature_id>.<param_key>'")
+                    continue
+                fid, _, pkey = key.partition(".")
+                feat = features_by_id.get(fid)
+                if feat is None:
+                    errs.append(f"{kloc}: feature '{fid}' does not exist")
+                    continue
+                params = feat.get("params")
+                if isinstance(params, dict) and pkey not in params:
+                    errs.append(f"{kloc}: feature '{fid}' has no param '{pkey}'")
+                # Dim-shaped override values get the same structural check as stored dims.
+                if isinstance(val, dict) and ("value" in val or "expr" in val):
+                    errs += validate_dim(val, kloc, set())
+
+        sup = cfg.get("suppressions", {})
+        if sup is None:
+            sup = {}
+        if not isinstance(sup, dict):
+            errs.append(f"{loc}.suppressions: must be an object")
+        else:
+            for fid, flag in sup.items():
+                sloc = f"{loc}.suppressions.{fid}"
+                if fid not in features_by_id:
+                    errs.append(f"{sloc}: feature '{fid}' does not exist")
+                if not isinstance(flag, bool):
+                    errs.append(f"{sloc}: must be a bool")
+
+    ac = doc.get("active_configuration")
+    if ac is not None:
+        if not isinstance(ac, str):
+            errs.append("active_configuration: must be a configuration name string or null")
+        elif ac not in names:
+            errs.append(f"active_configuration: '{ac}' is not a defined configuration")
+    return errs
+
+
 def _validate_common(doc: dict, schema: str) -> list[str]:
     errs: list[str] = []
     if doc.get("schema") != schema:
@@ -626,6 +838,7 @@ def validate_part(doc: Any) -> list[str]:
     earlier: set[str] = set(RESERVED_DATUMS)
     seen: set[str] = set()
     feat_ids: set[str] = set()
+    feats_by_id: dict[str, dict] = {}
     for i, f in enumerate(feats):
         fid = f.get("id") if isinstance(f, dict) else None
         loc = f"features[{i}]({fid})"
@@ -636,7 +849,10 @@ def validate_part(doc: Any) -> list[str]:
             seen.add(fid)
             earlier.add(fid)
             feat_ids.add(fid)
+            if isinstance(f, dict):
+                feats_by_id[fid] = f
     errs += _validate_rollback(doc, feat_ids)
+    errs += _validate_configurations(doc, feats_by_id)
     return errs
 
 
@@ -726,6 +942,7 @@ def validate_assembly(doc: Any) -> list[str]:
         feats = []
     earlier: set[str] = set(RESERVED_DATUMS)
     asm_feat_ids: set[str] = set()
+    asm_feats_by_id: dict[str, dict] = {}
     for i, f in enumerate(feats):
         fid = f.get("id") if isinstance(f, dict) else None
         errs += validate_feature(
@@ -734,7 +951,10 @@ def validate_assembly(doc: Any) -> list[str]:
         if isinstance(fid, str):
             earlier.add(fid)
             asm_feat_ids.add(fid)
+            if isinstance(f, dict):
+                asm_feats_by_id[fid] = f
     errs += _validate_rollback(doc, asm_feat_ids)
+    errs += _validate_configurations(doc, asm_feats_by_id)
 
     explode = doc.get("explode", [])
     if not isinstance(explode, list):
@@ -754,6 +974,160 @@ def validate_assembly(doc: Any) -> list[str]:
     return errs
 
 
+# --------------------------------------------------------------------------- drawing (W12)
+
+
+def _validate_view(v: Any, where: str) -> list[str]:
+    """A drawing View: {id, type, orientation, scale, position:[x,y], show_hidden}.
+
+    Optional reserved fields (W13): ``annotations`` (a list) and ``label`` (a string). W15 adds two
+    derived view types — ``section`` (a cut, oriented "section", carrying ``parent`` + a world
+    ``plane`` {normal, point} OR a 2D ``cut_line`` [[x,y],[x,y]] in the parent's sheet mm) and
+    ``detail`` (a magnified crop, oriented "detail", carrying ``parent`` + ``center`` [x,y] +
+    ``radius``). Geometry — whether the projection actually yields edges — is the projector's
+    concern (drawing.py), not the structural validator's.
+    """
+    errs: list[str] = []
+    if not isinstance(v, dict):
+        return [f"{where}: view must be an object"]
+    if not isinstance(v.get("id"), str) or not re.match(r"^v\d+$", v["id"]):
+        errs.append(f"{where}.id: must match v<N>")
+    vtype = v.get("type")
+    if vtype not in VIEW_TYPES:
+        errs.append(f"{where}.type: '{vtype}' not in {sorted(VIEW_TYPES)}")
+    if v.get("orientation") not in VIEW_ORIENTATIONS:
+        errs.append(f"{where}.orientation: '{v.get('orientation')}' not in {sorted(VIEW_ORIENTATIONS)}")
+    # An iso view must be oriented "iso"; an ortho (base/projected) view must not.
+    if vtype == "iso" and v.get("orientation") != "iso":
+        errs.append(f"{where}: an 'iso' view requires orientation 'iso'")
+    if vtype in ("base", "projected") and v.get("orientation") == "iso":
+        errs.append(f"{where}: orientation 'iso' is only valid for an 'iso' view")
+    # A section/detail view is oriented by its own keyword and references a parent view id.
+    if vtype == "section" and v.get("orientation") != "section":
+        errs.append(f"{where}: a 'section' view requires orientation 'section'")
+    if vtype == "detail" and v.get("orientation") != "detail":
+        errs.append(f"{where}: a 'detail' view requires orientation 'detail'")
+    if vtype in ("section", "detail"):
+        if not (isinstance(v.get("parent"), str) and re.match(r"^v\d+$", v["parent"])):
+            errs.append(f"{where}.parent: {vtype} view needs a parent view id (v<N>)")
+    if vtype == "section":
+        plane = v.get("plane")
+        cut_line = v.get("cut_line")
+        has_plane = (isinstance(plane, dict) and _is_vec(plane.get("normal"), 3)
+                     and _is_vec(plane.get("point"), 3))
+        has_line = (isinstance(cut_line, list) and len(cut_line) == 2
+                    and all(_is_vec(q, 2) for q in cut_line))
+        if not (has_plane or has_line):
+            errs.append(f"{where}: section needs a 'plane' {{normal,point}} or a 2D 'cut_line'")
+    if vtype == "detail":
+        if not _is_vec(v.get("center"), 2):
+            errs.append(f"{where}.center: detail view needs [x,y] (parent sheet mm)")
+        if not _is_num(v.get("radius")) or float(v.get("radius", 0)) <= 0:
+            errs.append(f"{where}.radius: detail view needs a positive radius")
+    if not _is_num(v.get("scale")) or float(v.get("scale", 0)) <= 0:
+        errs.append(f"{where}.scale: must be a positive number")
+    if not _is_vec(v.get("position"), 2):
+        errs.append(f"{where}.position: must be [x,y] (sheet mm)")
+    if not isinstance(v.get("show_hidden"), bool):
+        errs.append(f"{where}.show_hidden: required bool")
+    if "annotations" in v:
+        if not isinstance(v["annotations"], list):
+            errs.append(f"{where}.annotations: must be a list (W13 dimensions/notes)")
+        else:
+            for j, a in enumerate(v["annotations"]):
+                errs += _validate_annotation(a, f"{where}.annotations[{j}]")
+    if "label" in v and not isinstance(v["label"], (str, type(None))):
+        errs.append(f"{where}.label: must be a string or null")
+    return errs
+
+
+ANNOTATION_TYPES = {"linear_dim", "aligned_dim", "note"}
+
+
+def _validate_annotation(a: Any, where: str) -> list[str]:
+    """A drawing annotation: {id, type, a:[x,y], b:[x,y], pos:[x,y], value, text} (W13).
+
+    ``a``/``b`` are sheet-mm endpoints (point picks); ``pos`` is the text/leader anchor; ``value`` is
+    the measured MODEL length; ``text`` is the displayed string. A ``note`` may omit a/b (value 0).
+    """
+    errs: list[str] = []
+    if not isinstance(a, dict):
+        return [f"{where}: annotation must be an object"]
+    if not isinstance(a.get("id"), str) or not re.match(r"^a\d+$", a["id"]):
+        errs.append(f"{where}.id: must match a<N>")
+    atype = a.get("type")
+    if atype not in ANNOTATION_TYPES:
+        errs.append(f"{where}.type: '{atype}' not in {sorted(ANNOTATION_TYPES)}")
+    is_note = atype == "note"
+    for key in ("a", "b"):
+        if key in a and a[key] is not None and not _is_vec(a[key], 2):
+            errs.append(f"{where}.{key}: must be [x,y] (sheet mm)")
+        elif not is_note and a.get(key) is None:
+            errs.append(f"{where}.{key}: required for a dimension")
+    if "pos" in a and a["pos"] is not None and not _is_vec(a["pos"], 2):
+        errs.append(f"{where}.pos: must be [x,y] (sheet mm) or null")
+    if "value" in a and a["value"] is not None and not _is_num(a["value"]):
+        errs.append(f"{where}.value: must be a number")
+    if "text" in a and a["text"] is not None and not isinstance(a["text"], str):
+        errs.append(f"{where}.text: must be a string or null")
+    return errs
+
+
+def validate_drawing(doc: Any) -> list[str]:
+    """Validate a ``aicad.drawing/1`` document (W12).
+
+    A drawing is a 2D detailing document that PROJECTS a source part/assembly into orthographic +
+    isometric views. It carries no features/equations/material — only a ``source`` reference and a
+    list of sheets, each holding views.
+    """
+    if not isinstance(doc, dict):
+        return ["document must be a JSON object"]
+    errs = _validate_common(doc, SCHEMA_DRAWING)
+
+    # source: an open doc id (string) or an embedded source spec {path} / {doc_id}.
+    src = doc.get("source")
+    if isinstance(src, str):
+        if not src:
+            errs.append("source: must be a non-empty doc id / path string")
+    elif isinstance(src, dict):
+        if not (isinstance(src.get("path"), str) or isinstance(src.get("doc_id"), str)):
+            errs.append("source: object form must carry {path} or {doc_id}")
+    else:
+        errs.append("source: must be a source doc id string or {path}|{doc_id}")
+
+    sheets = doc.get("sheets")
+    if not isinstance(sheets, list) or not sheets:
+        errs.append("sheets: must be a non-empty list")
+        sheets = []
+    sheet_ids: set[str] = set()
+    view_ids: set[str] = set()
+    for i, sh in enumerate(sheets):
+        loc = f"sheets[{i}]"
+        if not isinstance(sh, dict):
+            errs.append(f"{loc}: must be an object")
+            continue
+        sid = sh.get("id")
+        if not isinstance(sid, str) or not re.match(r"^s\d+$", sid):
+            errs.append(f"{loc}.id: must match s<N>")
+        elif sid in sheet_ids:
+            errs.append(f"{loc}.id: duplicate '{sid}'")
+        else:
+            sheet_ids.add(sid)
+        if sh.get("size") not in SHEET_SIZES:
+            errs.append(f"{loc}.size: '{sh.get('size')}' not in {sorted(SHEET_SIZES)}")
+        views = sh.get("views")
+        if not isinstance(views, list):
+            errs.append(f"{loc}.views: must be a list")
+            views = []
+        for j, v in enumerate(views):
+            errs += _validate_view(v, f"{loc}.views[{j}]")
+            if isinstance(v, dict) and isinstance(v.get("id"), str):
+                if v["id"] in view_ids:
+                    errs.append(f"{loc}.views[{j}].id: duplicate '{v['id']}' (view ids are doc-unique)")
+                view_ids.add(v["id"])
+    return errs
+
+
 def validate_document(doc: Any) -> list[str]:
     """Dispatch on the schema string."""
     if not isinstance(doc, dict):
@@ -763,4 +1137,6 @@ def validate_document(doc: Any) -> list[str]:
         return validate_part(doc)
     if schema == SCHEMA_ASM:
         return validate_assembly(doc)
+    if schema == SCHEMA_DRAWING:
+        return validate_drawing(doc)
     return [f"schema: unknown '{schema}'"]

@@ -46,6 +46,15 @@ _APP_VERSION = "AI-CAD/M1"
 # Entries this module owns + rewrites on every save; everything else is preserved verbatim.
 _KNOWN_ENTRIES = {"thumbnail.png", "meta.json", "document.json", "geometry.step"}
 
+# W12+ drawing persistence: drawings live in their own ZIP folder, one JSON per drawing. They are
+# (re)written from the live drawing registry on every save and re-read on open, so any stale
+# ``drawings/*.json`` carried in ``extra_entries`` is dropped on resave (never written back blindly).
+_DRAWINGS_PREFIX = "drawings/"
+
+
+def _is_drawing_entry(name: str) -> bool:
+    return name.startswith(_DRAWINGS_PREFIX) and name.lower().endswith(".json")
+
 
 # --------------------------------------------------------------------------- thumbnail
 
@@ -106,6 +115,35 @@ def _export_geometry_step(session: DocSession) -> Optional[bytes]:
         return None
 
 
+# --------------------------------------------------------------------------- drawing embed
+
+
+def _collect_drawing_entries(session: DocSession) -> dict[str, bytes]:
+    """``{"drawings/<drawing_id>.json": <bytes>}`` for every open drawing of this document.
+
+    Pulled live from the drawing registry (engine.doc.drawing) by source doc_id. A document with no
+    drawings yields an empty dict, so its ``.step+`` is byte-for-byte what it was pre-drawings. The
+    drawing module is imported lazily + defensively: a registry hiccup must never break a part save.
+    """
+    try:
+        from engine.doc import drawing as drawmod
+    except Exception:  # noqa: BLE001
+        return {}
+    entries: dict[str, bytes] = {}
+    try:
+        sessions = drawmod.drawings_for_source(session.doc_id)
+    except Exception:  # noqa: BLE001
+        return {}
+    for ds in sessions:
+        try:
+            doc = drawmod.serialize_drawing(ds)
+            entries[f"{_DRAWINGS_PREFIX}{ds.doc_id}.json"] = json.dumps(
+                doc, indent=2).encode("utf-8")
+        except Exception:  # noqa: BLE001 — one bad drawing is skipped, never fails the part save
+            continue
+    return entries
+
+
 # --------------------------------------------------------------------------- save
 
 
@@ -134,6 +172,10 @@ def save(session: DocSession, path: str | os.PathLike) -> str:
     document = json.dumps(session.doc, indent=2).encode("utf-8")
     thumb = session.extra_entries.get("thumbnail.png") or _placeholder_png()
 
+    # W12+ — embed every open drawing whose `source` is this document. A DrawingDocument is pure
+    # JSON (view defs + annotations, no geometry), so it round-trips as `drawings/<id>.json`.
+    drawing_entries = _collect_drawing_entries(session)
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
         # thumbnail FIRST + STORED (uncompressed) so shell previewers read it cheaply.
@@ -144,9 +186,12 @@ def save(session: DocSession, path: str | os.PathLike) -> str:
         zf.writestr("document.json", document)
         if geometry is not None:
             zf.writestr("geometry.step", geometry)
-        # Preserve unknown entries (forward-compat) — never clobber the entries we own.
+        for entry_name, data in drawing_entries.items():
+            zf.writestr(entry_name, data)
+        # Preserve unknown entries (forward-compat) — never clobber the entries we own, and drop any
+        # stale `drawings/*.json` (we just wrote the live set above from the registry).
         for name, data in session.extra_entries.items():
-            if name in _KNOWN_ENTRIES:
+            if name in _KNOWN_ENTRIES or _is_drawing_entry(name):
                 continue
             zf.writestr(name, data)
 
@@ -222,6 +267,42 @@ def open(path: str | os.PathLike) -> tuple[DocSession, list[str]]:
             warnings.append(f"{len(failed)} feature(s) failed to rebuild: {failed}")
 
     return session, warnings
+
+
+def restore_drawings(session: DocSession) -> list[dict]:
+    """Re-register every embedded drawing of a just-opened part/asm session (W12+ persistence).
+
+    Reads each ``drawings/*.json`` carried on ``session.extra_entries`` (populated by :func:`open`,
+    and preserved through the frozen-geometry fallback), registers it as a FRESH DrawingSession via
+    :func:`engine.doc.drawing.register_restored_drawing`, and re-points its ``source`` to this
+    session's (new) doc_id so it projects against the reopened bodies. Returns one
+    ``{"doc_id", "name", "source_doc_id"}`` per restored drawing so the host can re-open its tab.
+
+    Fully contained: a malformed / non-drawing JSON entry is SKIPPED with a stderr log, never
+    failing the part open. Backward-compatible — a ``.step+`` with no ``drawings/`` returns ``[]``.
+    Call exactly once per top-level open (the component-load opens in assembly.py do NOT call this,
+    so a part used as an assembly component never spawns phantom drawing tabs).
+    """
+    import sys
+    from engine.doc.schema import SCHEMA_DRAWING
+
+    restored: list[dict] = []
+    for entry_name in sorted(session.extra_entries):
+        if not _is_drawing_entry(entry_name):
+            continue
+        try:
+            doc = json.loads(session.extra_entries[entry_name].decode("utf-8"))
+            if not isinstance(doc, dict) or doc.get("schema") != SCHEMA_DRAWING:
+                raise ValueError(f"not a {SCHEMA_DRAWING} document")
+            from engine.doc import drawing as drawmod
+            ds = drawmod.register_restored_drawing(doc, session.doc_id)
+        except Exception as exc:  # noqa: BLE001 — one bad drawing is skipped, never breaks the open
+            print(f"[stepplus] skipped malformed drawing '{entry_name}': "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            continue
+        restored.append({"doc_id": ds.doc_id, "name": ds.doc.get("name", "Drawing"),
+                         "source_doc_id": session.doc_id})
+    return restored
 
 
 def _frozen_geometry_fallback(

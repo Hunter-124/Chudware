@@ -255,8 +255,6 @@ def test_axis_plane_intersect_reserved() -> None:
     res = compile_document(doc)
     s = _status(res, "f1")
     assert s["ok"], f"plane_intersect failed: {s['error']}"
-    # Verify the registered datum axis direction is along X.
-    from engine.doc.features.datum import reserved_datums  # noqa: F401
     print("[axis-plane-intersect] XY ∩ XZ = X axis ok")
 
 

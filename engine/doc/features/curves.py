@@ -34,7 +34,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from build123d import Edge, Helix, Plane, Vector
+from build123d import Edge, Helix, Plane, Vector, Wire
 
 from .base import CompileContext, CompileOutput, Datum, FeatureError, register
 from engine.doc.selectors import describe_edges, describe_faces, resolve
@@ -167,6 +167,11 @@ def compile_helix(feat: dict, ctx: CompileContext) -> CompileOutput:
     edges: list[Edge] = list(wire.edges())
     if not edges:
         raise FeatureError("helix: produced no curve geometry")
+    # Normalise the Helix object to a plain Wire carrier (clean type for tool_body / AICM).
+    try:
+        wire = Wire(edges)
+    except Exception:  # noqa: BLE001
+        pass
 
     # Register into the _sketch_regions store so sweep can consume this helix as a path via
     # {"kind":"region","sketch":<this fid>}. Mirrors the sketch compiler's payload shape.

@@ -64,6 +64,10 @@ public:
     // --- scripted scenario helpers (AI_CAD_SHOT=asm) ---
     void openInsert()       { insertOpen_ = true; insertFocus_ = true; }
     void openMateForm()     { beginMateForm(); }
+    // Preselect a mate type for a headless shot (AI_CAD_MATETYPE=gear), so the type-aware
+    // parameter block renders. Mirrors PropertyManager::presetFieldForShot. No-op if the type
+    // is unknown; the mate form must already be open.
+    void presetMateTypeForShot(const std::string& type);
     void openInterference(AppState& st) { handleCommand(st, "asm_interference"); }
     void openBom(AppState& st)          { handleCommand(st, "asm_bom"); }
     // Insert a component by path directly (scenario / programmatic). Returns the new aicm path.
@@ -108,18 +112,31 @@ private:
 
     // ---- Mate form (PM-style) ----
     bool mateOpen_ = false, mateFocus_ = false;
-    int  activeWell_ = 0;                 // 0 or 1 — which well receives the next pick
+    int  activeWell_ = 0;                 // 0..2 — which well receives the next pick (2 = width/symmetric 3rd ref)
     struct MatePick {
         bool has = false;
         nlohmann::json selector;
         std::string component;            // component k-id
         std::string label;                // chip text ("base · Face")
         MateSurfKind surf = MateSurfKind::None;
-    } picks_[2];
-    int  mateType_ = 0;                   // index into the auto-suggested type list
+    } picks_[3];                          // [0],[1] standard; [2] is width's jaw / symmetric's plane
+    int  mateType_ = 0;                   // index into the auto-suggested STANDARD type list
+    // Explicit selected mate type. Set by BOTH the Standard suggested buttons (= suggestedMate())
+    // and the Mechanical/Advanced buttons. Empty => fall back to suggestedMate(). This is the
+    // single source of truth read by addMate / the parameter block / the Add gate.
+    std::string selectedMateType_;
     bool aligned_ = true;                 // Align: true = Aligned, false = Anti-Aligned
-    std::vector<char> dimBuf_{std::vector<char>(64, 0)};  // distance/angle value
+    std::vector<char> dimBuf_{std::vector<char>(64, 0)};   // distance / angle value (single dim)
+    std::vector<char> minBuf_{std::vector<char>(64, 0)};   // *_limit / hinge min
+    std::vector<char> maxBuf_{std::vector<char>(64, 0)};   // *_limit / hinge max
+    std::vector<char> ratioBuf_{std::vector<char>(64, 0)}; // gear ratio
+    std::vector<char> pitchBuf_{std::vector<char>(64, 0)}; // screw pitch (mm/rev)
+    std::vector<char> pitchRadBuf_{std::vector<char>(64, 0)};  // rack_pinion pitch radius (optional)
     std::string mateError_;
+    // The effective mate type for this frame (selectedMateType_ or the standard suggestion).
+    std::string effectiveMateType() const;
+    // True for types that consume a 3rd reference (width / symmetric).
+    static bool typeNeedsThirdRef(const std::string& t);
 
     // ---- Component Pattern form (linear / circular) ----
     bool patternOpen_ = false, patternFocus_ = false;

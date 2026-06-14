@@ -2,6 +2,7 @@
 #include "asm_panels.h"
 
 #include <algorithm>
+#include <cfloat>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -182,19 +183,48 @@ void AsmPanels::beginMateForm() {
     activeWell_ = 0;
     picks_[0] = MatePick{};
     picks_[1] = MatePick{};
+    picks_[2] = MatePick{};
     mateType_ = 0;
+    selectedMateType_.clear();
     aligned_ = true;
-    std::memset(dimBuf_.data(), 0, dimBuf_.size());
-    std::strncpy(dimBuf_.data(), "10", dimBuf_.size() - 1);
+    auto initBuf = [](std::vector<char>& b, const char* v) {
+        std::memset(b.data(), 0, b.size());
+        std::strncpy(b.data(), v, b.size() - 1);
+    };
+    initBuf(dimBuf_,      "10");
+    initBuf(minBuf_,      "0");
+    initBuf(maxBuf_,      "100");
+    initBuf(ratioBuf_,    "1");
+    initBuf(pitchBuf_,    "1");
+    initBuf(pitchRadBuf_, "");
     mateError_.clear();
 }
 
 void AsmPanels::closeMateForm() { mateOpen_ = false; }
 
+// The mate type acting this frame: an explicit Mechanical/Advanced pick (or a Standard pick that
+// also stamps selectedMateType_), else the surface-driven suggestion.
+std::string AsmPanels::effectiveMateType() const {
+    if (!selectedMateType_.empty()) return selectedMateType_;
+    return suggestedMate();
+}
+
+bool AsmPanels::typeNeedsThirdRef(const std::string& t) {
+    return t == "width" || t == "symmetric";
+}
+
+void AsmPanels::presetMateTypeForShot(const std::string& type) {
+    selectedMateType_ = type;
+    mateError_.clear();
+}
+
 bool AsmPanels::routeAsmPick(const nlohmann::json& selector, const std::string& component,
                              int /*pickKind*/) {
     if (!mateOpen_) return false;
+    // Width / symmetric expose a 3rd well (the jaw / symmetry plane); other types only have 2.
+    const int wellCount = typeNeedsThirdRef(effectiveMateType()) ? 3 : 2;
     int w = activeWell_;
+    if (w >= wellCount) w = 0;
     picks_[w].has = true;
     picks_[w].selector = selector;
     picks_[w].component = component;
@@ -203,10 +233,11 @@ bool AsmPanels::routeAsmPick(const nlohmann::json& selector, const std::string& 
     std::string kind = selector.value("kind", std::string("face"));
     std::string kindLabel = kind == "face" ? "Face" : kind == "edge" ? "Edge" : "Vert";
     picks_[w].label = component + " \xC2\xB7 " + kindLabel;  // middle dot
-    // Advance to the empty well (SolidWorks fills the second reference next).
-    if (!picks_[0].has) activeWell_ = 0;
-    else if (!picks_[1].has) activeWell_ = 1;
-    else activeWell_ = (w + 1) & 1;
+    // Advance to the next empty well (SolidWorks fills references in order).
+    activeWell_ = w;
+    for (int i = 0; i < wellCount; ++i)
+        if (!picks_[i].has) { activeWell_ = i; return true; }
+    activeWell_ = (w + 1) % wellCount;  // all full — cycle so a re-pick replaces
     return true;
 }
 
@@ -233,13 +264,59 @@ bool AsmPanels::addMate(AppState& st, const std::string& type, const std::string
     if (!st.docMirror.hasDoc()) return false;
     nlohmann::json mate = {
         {"type", type}, {"align", align}, {"suppressed", false}, {"value", nullptr}, {"refs", refs}};
-    // distance / angle / parallel-with-offset carry a value dim.
+    // ---- value object per the engine contract (schema.py MATE_VALUE_TYPES / MATE_COUPLING_SPEC) ----
+    // pmParseDim wrapper for one field; angle=true parses degrees. On failure mateError_ is set.
+    auto parseField = [&](std::vector<char>& buf, const char* label, bool angle,
+                          double& out) -> bool {
+        std::string txt(buf.data()); std::string perr;
+        if (!pmParseDim(txt, out, perr, angle)) { mateError_ = std::string(label) + ": " + perr; return false; }
+        return true;
+    };
     if (type == "distance" || type == "angle") {
-        double v = 0; std::string perr;
-        std::string txt(dimBuf_.data());
-        if (!pmParseDim(txt, v, perr, type == "angle")) { mateError_ = "value: " + perr; return false; }
+        // Single dimension {value, expr}.
+        double v = 0;
+        if (!parseField(dimBuf_, "value", type == "angle", v)) return false;
         mate["value"] = {{"value", v}, {"expr", nullptr}};
+    } else if (type == "distance_limit" || type == "angle_limit") {
+        // Required {min, max} (numeric scalars, NOT dims).
+        const bool angle = (type == "angle_limit");
+        double lo = 0, hi = 0;
+        if (!parseField(minBuf_, "min", angle, lo)) return false;
+        if (!parseField(maxBuf_, "max", angle, hi)) return false;
+        mate["value"] = {{"min", lo}, {"max", hi}};
+    } else if (type == "gear") {
+        double ratio = 1;
+        if (!parseField(ratioBuf_, "ratio", false, ratio)) return false;
+        mate["value"] = {{"ratio", ratio}};
+    } else if (type == "screw") {
+        double pitch = 1;
+        if (!parseField(pitchBuf_, "pitch", false, pitch)) return false;
+        mate["value"] = {{"pitch", pitch}};
+    } else if (type == "rack_pinion") {
+        // pitch_radius is OPTIONAL: blank -> value:null (engine derives from the pinion cylinder).
+        std::string txt(pitchRadBuf_.data());
+        bool blank = txt.find_first_not_of(" \t") == std::string::npos;
+        if (!blank) {
+            double pr = 0;
+            if (!parseField(pitchRadBuf_, "pitch_radius", false, pr)) return false;
+            mate["value"] = {{"pitch_radius", pr}};
+        }
+        // else leave value:null
+    } else if (type == "hinge") {
+        // min/max are OPTIONAL (defaults 0..360). Emit them when given (both buffers non-blank).
+        std::string lotxt(minBuf_.data()), hitxt(maxBuf_.data());
+        bool loBlank = lotxt.find_first_not_of(" \t") == std::string::npos;
+        bool hiBlank = hitxt.find_first_not_of(" \t") == std::string::npos;
+        if (!loBlank || !hiBlank) {
+            double lo = 0, hi = 360;
+            if (!loBlank && !parseField(minBuf_, "min", true, lo)) return false;
+            if (!hiBlank && !parseField(maxBuf_, "max", true, hi)) return false;
+            mate["value"] = {{"min", lo}, {"max", hi}};
+        }
+        // else leave value:null (engine defaults 0..360)
     }
+    // All other types (coincident/parallel/perpendicular/tangent/concentric/lock, slot,
+    // cam_follower, width, symmetric, profile_center) keep value:null.
     auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
         {{"op", "asm_add_mate"}, {"mate", mate}}}));
     if (!r.ok) { mateError_ = r.error_message; st.addLog("[err] add_mate: " + r.error_message); return false; }
@@ -255,7 +332,15 @@ void AsmPanels::drawMateForm(AppState& st) {
     if (!mateOpen_) return;
     const auto& pal = ui::palette;
     bool open = true;
+    // Place near the top-left of the work area on first appearance so the now-taller form (Standard
+    // + Mechanical/Advanced + param block) is fully on-screen, and cap the height to the viewport so
+    // overflow scrolls inside the window instead of clipping off the bottom edge.
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 24 * ui::uiScale,
+                                   vp->WorkPos.y + 96 * ui::uiScale), ImGuiCond_Appearing);
     ImGui::SetNextWindowSize(ImVec2(320 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0),
+                                        ImVec2(FLT_MAX, vp->WorkSize.y - 120 * ui::uiScale));
     if (mateFocus_) { ImGui::SetNextWindowFocus(); mateFocus_ = false; }
     if (ImGui::Begin("Mate##asm", &open)) {
         // header: icon + title + Add / Cancel (PM style)
@@ -265,16 +350,23 @@ void AsmPanels::drawMateForm(AppState& st) {
         ImGui::PopStyleColor();
         ImGui::Separator();
 
-        // ---- Mate Selections (two wells) ----
+        // The effective type drives the well count + the parameter block + the Add gate.
+        std::string type = effectiveMateType();
+        const int wellCount = typeNeedsThirdRef(type) ? 3 : 2;
+        if (activeWell_ >= wellCount) activeWell_ = 0;
+
+        // ---- Mate Selections (two or three wells) ----
         ImGui::SeparatorText("Mate Selections");
-        for (int i = 0; i < 2; ++i) {
+        static const char* const kWellHint[3] = {
+            "(pick a face/edge)", "(pick a face/edge)", "(pick the jaw / symmetry plane)"};
+        for (int i = 0; i < wellCount; ++i) {
             bool active = (activeWell_ == i);
             pushText(active ? pal.accent : pal.textDim);
             ImGui::Text("Reference %d", i + 1);
             ImGui::PopStyleColor();
             ImGui::SameLine();
             // The well: a selectable that, when clicked, becomes the active pick target.
-            std::string cell = picks_[i].has ? picks_[i].label : std::string("(pick a face/edge)");
+            std::string cell = picks_[i].has ? picks_[i].label : std::string(kWellHint[i]);
             ImVec4 wellBg = active
                 ? ImVec4(pal.accentSoft[0], pal.accentSoft[1], pal.accentSoft[2], 0.6f)
                 : ImVec4(pal.frameBg[0], pal.frameBg[1], pal.frameBg[2], 1.0f);
@@ -303,17 +395,64 @@ void AsmPanels::drawMateForm(AppState& st) {
         else if (bothCyl) { opts = kCylCyl;     nopts = 1; }
         else              { opts = kGeneric;    nopts = 4; }
         if (mateType_ >= nopts) mateType_ = 0;
+        // A standard button is highlighted only when the explicit selection matches its label
+        // (selecting a Mechanical/Advanced type deselects the standard row).
         for (int i = 0; i < nopts; ++i) {
             if (i) ImGui::SameLine();
-            bool sel = (mateType_ == i);
+            bool sel = selectedMateType_.empty()
+                ? (mateType_ == i)               // surface-suggest mode: highlight the cycled index
+                : (selectedMateType_ == opts[i]); // explicit mode: highlight the chosen standard type
             if (sel) ImGui::PushStyleColor(ImGuiCol_Button,
                 ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f));
             std::string label = opts[i];
             if (!label.empty()) label[0] = (char)std::toupper((unsigned char)label[0]);
-            if (ImGui::Button((label + "##mt" + std::to_string(i)).c_str())) mateType_ = i;
+            if (ImGui::Button((label + "##mt" + std::to_string(i)).c_str())) {
+                mateType_ = i;
+                selectedMateType_ = opts[i];   // standard buttons now also stamp the explicit type
+            }
             if (sel) ImGui::PopStyleColor();
         }
-        std::string type = suggestedMate();
+
+        // ---- Mechanical & Advanced Mates ----
+        ImGui::Spacing();
+        ImGui::SeparatorText("Mechanical & Advanced Mates");
+        struct AdvOpt { const char* label; const char* type; };
+        // Order groups mechanical (coupling), then limit, then advanced (geometry / 3rd-ref).
+        static const AdvOpt kAdvOpts[] = {
+            {"Gear",           "gear"},
+            {"Screw",          "screw"},
+            {"Rack & Pinion",  "rack_pinion"},
+            {"Distance Limit", "distance_limit"},
+            {"Angle Limit",    "angle_limit"},
+            {"Hinge",          "hinge"},
+            {"Slot",           "slot"},
+            {"Cam Follower",   "cam_follower"},
+            {"Profile Center", "profile_center"},
+            {"Width",          "width"},
+            {"Symmetric",      "symmetric"},
+        };
+        const float availW = ImGui::GetContentRegionAvail().x;
+        for (int i = 0; i < (int)(sizeof(kAdvOpts) / sizeof(kAdvOpts[0])); ++i) {
+            bool sel = (selectedMateType_ == kAdvOpts[i].type);
+            // Wrap onto a new row when the next button would overflow the form width.
+            if (i) {
+                float next = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x +
+                             ImGui::GetStyle().ItemSpacing.x +
+                             ImGui::CalcTextSize(kAdvOpts[i].label).x +
+                             ImGui::GetStyle().FramePadding.x * 2.0f;
+                if (next <= availW) ImGui::SameLine();
+            }
+            if (sel) ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f));
+            if (ImGui::Button((std::string(kAdvOpts[i].label) + "##adv" + std::to_string(i)).c_str())) {
+                selectedMateType_ = kAdvOpts[i].type;
+                mateError_.clear();
+                if (activeWell_ >= (typeNeedsThirdRef(selectedMateType_) ? 3 : 2)) activeWell_ = 0;
+            }
+            if (sel) ImGui::PopStyleColor();
+        }
+        // Re-read the effective type (a button click this frame may have changed it).
+        type = effectiveMateType();
 
         // ---- Align flip (SolidWorks "Aligned" / "Anti-Aligned") ----
         ImGui::Spacing();
@@ -325,12 +464,46 @@ void AsmPanels::drawMateForm(AppState& st) {
         ImGui::TextWrapped("Seating one face flat onto another is Anti-Aligned (the normals oppose).");
         ImGui::PopStyleColor();
 
-        // ---- distance / angle DimField ----
-        if (type == "distance" || type == "angle") {
-            ImGui::Spacing();
-            ImGui::TextUnformatted(type == "distance" ? "Distance:" : "Angle (deg):");
+        // ---- type-aware parameter block ----
+        // A labelled numeric field at the assembly input width. angle=true for degree-valued fields.
+        auto field = [](const char* label, std::vector<char>& buf, const char* id) {
+            ImGui::TextUnformatted(label);
             ImGui::SetNextItemWidth(ui::metrics::asmInputW());
-            ImGui::InputText("##asm_mate_dim", dimBuf_.data(), dimBuf_.size());
+            ImGui::InputText(id, buf.data(), buf.size());
+        };
+        bool paramsOk = true;  // gates the Add button for types with REQUIRED params
+        ImGui::Spacing();
+        if (type == "distance" || type == "angle") {
+            field(type == "distance" ? "Distance:" : "Angle (deg):", dimBuf_, "##asm_mate_dim");
+        } else if (type == "distance_limit" || type == "angle_limit") {
+            const bool angle = (type == "angle_limit");
+            field(angle ? "Min angle (deg):" : "Min distance (mm):", minBuf_, "##asm_mate_min");
+            field(angle ? "Max angle (deg):" : "Max distance (mm):", maxBuf_, "##asm_mate_max");
+            paramsOk = minBuf_[0] && maxBuf_[0];  // both required
+        } else if (type == "gear") {
+            field("Ratio:", ratioBuf_, "##asm_mate_ratio");
+            paramsOk = ratioBuf_[0];
+        } else if (type == "screw") {
+            field("Pitch (mm/rev):", pitchBuf_, "##asm_mate_pitch");
+            paramsOk = pitchBuf_[0];
+        } else if (type == "rack_pinion") {
+            field("Pitch radius (mm, optional):", pitchRadBuf_, "##asm_mate_pitchrad");
+            pushText(pal.textDim);
+            ImGui::TextWrapped("Leave blank to derive from the pinion's cylinder radius.");
+            ImGui::PopStyleColor();
+        } else if (type == "hinge") {
+            field("Min angle (deg, optional):", minBuf_, "##asm_mate_hmin");
+            field("Max angle (deg, optional):", maxBuf_, "##asm_mate_hmax");
+            pushText(pal.textDim);
+            ImGui::TextWrapped("Leave blank for the default 0..360 swing range.");
+            ImGui::PopStyleColor();
+        } else {
+            // width / symmetric / slot / cam_follower / profile_center carry no params.
+            pushText(pal.textDim);
+            ImGui::TextWrapped(typeNeedsThirdRef(type)
+                ? "Pick two faces/edges plus the jaw or symmetry plane (Reference 3)."
+                : "No parameters — this mate is geometry-driven.");
+            ImGui::PopStyleColor();
         }
 
         if (!mateError_.empty()) {
@@ -341,17 +514,21 @@ void AsmPanels::drawMateForm(AppState& st) {
         }
 
         ImGui::Separator();
-        bool ready = picks_[0].has && picks_[1].has;
+        // Gate on the required reference count (3 for width/symmetric, else 2) AND required params.
+        bool refsReady = true;
+        for (int i = 0; i < wellCount; ++i) if (!picks_[i].has) refsReady = false;
+        bool ready = refsReady && paramsOk;
         if (!ready) ImGui::BeginDisabled();
         if (ImGui::Button("Add##asm_mate", ImVec2(ui::metrics::asmBtnW(), 0))) {
             nlohmann::json refs = nlohmann::json::array();
-            for (int i = 0; i < 2; ++i)
+            for (int i = 0; i < wellCount; ++i)
                 refs.push_back({{"component", picks_[i].component}, {"selector", picks_[i].selector}});
             std::string aicm;
             if (addMate(st, type, aligned_ ? "aligned" : "anti", refs, aicm)) {
                 st.addLog("[asm] mate added: " + type + " (" + (aligned_ ? "aligned" : "anti") + ")");
                 // keep the form open for chaining more mates, reset selections
-                picks_[0] = MatePick{}; picks_[1] = MatePick{}; activeWell_ = 0; mateError_.clear();
+                picks_[0] = MatePick{}; picks_[1] = MatePick{}; picks_[2] = MatePick{};
+                activeWell_ = 0; mateError_.clear();
             }
         }
         if (!ready) ImGui::EndDisabled();

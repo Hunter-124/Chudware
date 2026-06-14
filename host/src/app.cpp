@@ -900,9 +900,21 @@ int run_gui(const char* screenshotPath) {
     if (st.wantActivity) { st.showActivityPanel = true; }
     // C20b: assembly shot — author base/peg parts, new assembly, insert + mate + interference.
     st.wantAsm = shot && shotMode && std::strcmp(shotMode, "asm") == 0;
+    // AI_CAD_MATEFORM: a lightweight Mate-form-only variant of the asm shot for visual verification
+    // of the mate PM (Standard + Mechanical/Advanced sections + the type-aware param block). It
+    // skips the heavy author/insert/mate state machine and just opens the Mate form so the generic
+    // frame-6 capture grabs it (mirrors the pmform scenario). AI_CAD_MATETYPE=<type> preselects a
+    // mechanical/advanced type (e.g. "gear") so its parameter field renders.
+    const bool wantMateForm = st.wantAsm && std::getenv("AI_CAD_MATEFORM") != nullptr;
     if (st.wantAsm) {
         st.showRibbon = true; st.ribbonTab = AppState::RT_Assembly;  // Assembly tab forward
         st.showActivityPanel = false;            // keep the FeatureManager (Mates folder) unobscured
+        if (wantMateForm) {
+            st.wantAsm = false;                  // suppress the scripted scenario; just show the form
+            asmPanels.openMateForm();
+            if (const char* mt = std::getenv("AI_CAD_MATETYPE"))
+                if (*mt) asmPanels.presetMateTypeForShot(mt);
+        }
     }
     // ribbon shot: show Features tab by default; AI_CAD_TAB=<0..8> selects which tab to capture
     // (0=Features 1=Sketch 2=Evaluate 3=Simulation 4=Assembly 5=Sheet Metal 6=Weldments 7=PCB

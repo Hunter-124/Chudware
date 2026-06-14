@@ -11,6 +11,7 @@
 #include "imgui.h"
 
 #include "activity_panel.h"
+#include "metrics.h"
 #include "../core/app_state.h"
 
 // --- platform includes for run directory listing ---
@@ -485,7 +486,7 @@ void ActivityPanel::drawRunTree(AppState& st, RunNode& run, bool live) {
         ImGui::PopStyleColor();
     }
 
-    ImGui::Dummy(ImVec2(0, 4));
+    ImGui::Dummy(ImVec2(0, ui::metrics::U()));
 
     for (auto& sn : run.stages) {
         bool isActive = live && sn.active;
@@ -539,7 +540,7 @@ void ActivityPanel::drawBody(AppState& st) {
         }
     }
     ImGui::Separator();
-    ImGui::Dummy(ImVec2(0, 4));
+    ImGui::Dummy(ImVec2(0, ui::metrics::U()));
 
     // ---- Content ----
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));

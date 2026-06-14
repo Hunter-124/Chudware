@@ -10,6 +10,7 @@
 #include "imgui.h"
 
 #include "icons.h"
+#include "metrics.h"
 #include "property_manager.h"   // pmParseDim / pmFormatDim (DimField parsing)
 
 #include "../core/app_state.h"
@@ -136,7 +137,7 @@ void AsmPanels::drawInsert(AppState& st) {
     ImGui::SetNextWindowSize(ImVec2(380 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (insertFocus_) { ImGui::SetNextWindowFocus(); insertFocus_ = false; }
     if (ImGui::Begin("Insert Component", &open)) {
-        asmIcon("insert_component", "[+]"); ImGui::SameLine(0, 6);
+        asmIcon("insert_component", "[+]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         ImGui::TextUnformatted("Insert a part into the assembly");
         ImGui::Spacing();
         if (!st.docMirror.hasDoc()) {
@@ -158,13 +159,13 @@ void AsmPanels::drawInsert(AppState& st) {
                 : "First component is fixed automatically (SolidWorks behaviour).");
             ImGui::PopStyleColor();
             ImGui::Spacing();
-            if (ImGui::Button("Insert", ImVec2(90, 0)) && insertPath_[0]) {
+            if (ImGui::Button("Insert", ImVec2(ui::metrics::asmBtnW(), 0)) && insertPath_[0]) {
                 std::string aicm;
                 if (insertComponent(st, insertPath_.data(), nullptr, aicm))
                     st.addLog("[asm] inserted: " + std::string(insertPath_.data()));
             }
             ImGui::SameLine();
-            if (ImGui::Button("Close", ImVec2(90, 0))) insertOpen_ = false;
+            if (ImGui::Button("Close", ImVec2(ui::metrics::asmBtnW(), 0))) insertOpen_ = false;
         }
     }
     ImGui::End();
@@ -258,7 +259,7 @@ void AsmPanels::drawMateForm(AppState& st) {
     if (mateFocus_) { ImGui::SetNextWindowFocus(); mateFocus_ = false; }
     if (ImGui::Begin("Mate##asm", &open)) {
         // header: icon + title + Add / Cancel (PM style)
-        asmIcon("mate", "[M]"); ImGui::SameLine(0, 6);
+        asmIcon("mate", "[M]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         pushText(pal.text);
         ImGui::TextUnformatted("Mate");
         ImGui::PopStyleColor();
@@ -328,7 +329,7 @@ void AsmPanels::drawMateForm(AppState& st) {
         if (type == "distance" || type == "angle") {
             ImGui::Spacing();
             ImGui::TextUnformatted(type == "distance" ? "Distance:" : "Angle (deg):");
-            ImGui::SetNextItemWidth(120);
+            ImGui::SetNextItemWidth(ui::metrics::asmInputW());
             ImGui::InputText("##asm_mate_dim", dimBuf_.data(), dimBuf_.size());
         }
 
@@ -342,7 +343,7 @@ void AsmPanels::drawMateForm(AppState& st) {
         ImGui::Separator();
         bool ready = picks_[0].has && picks_[1].has;
         if (!ready) ImGui::BeginDisabled();
-        if (ImGui::Button("Add##asm_mate", ImVec2(90, 0))) {
+        if (ImGui::Button("Add##asm_mate", ImVec2(ui::metrics::asmBtnW(), 0))) {
             nlohmann::json refs = nlohmann::json::array();
             for (int i = 0; i < 2; ++i)
                 refs.push_back({{"component", picks_[i].component}, {"selector", picks_[i].selector}});
@@ -355,7 +356,7 @@ void AsmPanels::drawMateForm(AppState& st) {
         }
         if (!ready) ImGui::EndDisabled();
         ImGui::SameLine();
-        if (ImGui::Button("Close##asm_mate", ImVec2(90, 0))) closeMateForm();
+        if (ImGui::Button("Close##asm_mate", ImVec2(ui::metrics::asmBtnW(), 0))) closeMateForm();
     }
     ImGui::End();
     if (!open) closeMateForm();
@@ -457,7 +458,7 @@ void AsmPanels::drawPatternForm(AppState& st) {
     ImGui::SetNextWindowSize(ImVec2(340 * ui::uiScale, 0), ImGuiCond_Appearing);
     if (patternFocus_) { ImGui::SetNextWindowFocus(); patternFocus_ = false; }
     if (ImGui::Begin("Component Pattern##asm", &open)) {
-        asmIcon("pattern_component", "[#]"); ImGui::SameLine(0, 6);
+        asmIcon("pattern_component", "[#]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         pushText(pal.text);
         ImGui::TextUnformatted("Component Pattern");
         ImGui::PopStyleColor();
@@ -496,17 +497,17 @@ void AsmPanels::drawPatternForm(AppState& st) {
         ImGui::Spacing();
         if (patternKind_ == 0) {
             ImGui::TextUnformatted("Instances (count):");
-            ImGui::SetNextItemWidth(120);
+            ImGui::SetNextItemWidth(ui::metrics::asmInputW());
             ImGui::InputText("##asm_pat_count", patternCountBuf_.data(), patternCountBuf_.size());
             ImGui::TextUnformatted("Spacing (mm):");
-            ImGui::SetNextItemWidth(120);
+            ImGui::SetNextItemWidth(ui::metrics::asmInputW());
             ImGui::InputText("##asm_pat_spacing", patternSpacingBuf_.data(), patternSpacingBuf_.size());
         } else {
             ImGui::TextUnformatted("Instances (count):");
-            ImGui::SetNextItemWidth(120);
+            ImGui::SetNextItemWidth(ui::metrics::asmInputW());
             ImGui::InputText("##asm_pat_count", patternCountBuf_.data(), patternCountBuf_.size());
             ImGui::TextUnformatted("Angle (deg):");
-            ImGui::SetNextItemWidth(120);
+            ImGui::SetNextItemWidth(ui::metrics::asmInputW());
             ImGui::InputText("##asm_pat_angle", patternAngleBuf_.data(), patternAngleBuf_.size());
             ImGui::Checkbox("Equal spacing (fill angle)", &patternEqual_);
         }
@@ -540,7 +541,7 @@ void AsmPanels::drawPatternForm(AppState& st) {
         ImGui::Separator();
         bool ready = !patternComps_.empty();
         if (!ready) ImGui::BeginDisabled();
-        if (ImGui::Button("Add##asm_pat", ImVec2(90, 0))) {
+        if (ImGui::Button("Add##asm_pat", ImVec2(ui::metrics::asmBtnW(), 0))) {
             std::string aicm, err;
             if (addPattern(st, aicm, err)) {
                 st.addLog("[asm] component pattern added (" +
@@ -556,7 +557,7 @@ void AsmPanels::drawPatternForm(AppState& st) {
         }
         if (!ready) ImGui::EndDisabled();
         ImGui::SameLine();
-        if (ImGui::Button("Close##asm_pat", ImVec2(90, 0))) patternOpen_ = false;
+        if (ImGui::Button("Close##asm_pat", ImVec2(ui::metrics::asmBtnW(), 0))) patternOpen_ = false;
     }
     ImGui::End();
     if (!open) patternOpen_ = false;
@@ -593,7 +594,7 @@ void AsmPanels::drawExplode(AppState& st) {
     ImGui::SetNextWindowSize(ImVec2(300 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (explodeFocus_) { ImGui::SetNextWindowFocus(); explodeFocus_ = false; }
     if (ImGui::Begin("Exploded View", &open)) {
-        asmIcon("exploded_view", "[X]"); ImGui::SameLine(0, 6);
+        asmIcon("exploded_view", "[X]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         ImGui::TextUnformatted("Explode factor");
         ImGui::Spacing();
         ImGui::SetNextItemWidth(-1);
@@ -604,9 +605,9 @@ void AsmPanels::drawExplode(AppState& st) {
         ImGui::TextWrapped("View-only — drag to slide components apart along their explode vectors.");
         ImGui::PopStyleColor();
         ImGui::Spacing();
-        if (ImGui::Button("Collapse", ImVec2(90, 0))) { explodeFactor_ = 0.0f; setExplode(st, false, 0.0f); }
+        if (ImGui::Button("Collapse", ImVec2(ui::metrics::asmBtnW(), 0))) { explodeFactor_ = 0.0f; setExplode(st, false, 0.0f); }
         ImGui::SameLine();
-        if (ImGui::Button("Exploded", ImVec2(90, 0))) { explodeFactor_ = 1.0f; setExplode(st, true, 1.0f); }
+        if (ImGui::Button("Exploded", ImVec2(ui::metrics::asmBtnW(), 0))) { explodeFactor_ = 1.0f; setExplode(st, true, 1.0f); }
     }
     ImGui::End();
     if (!open) explodeOpen_ = false;
@@ -657,7 +658,7 @@ void AsmPanels::drawInterference(AppState& st) {
     ImGui::SetNextWindowSize(ImVec2(420 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (interferenceFocus_) { ImGui::SetNextWindowFocus(); interferenceFocus_ = false; }
     if (ImGui::Begin("Interference Detection", &open)) {
-        asmIcon("interference", "[!]"); ImGui::SameLine(0, 6);
+        asmIcon("interference", "[!]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         ImGui::TextUnformatted("Component interference + clearance");
         ImGui::SameLine(ImGui::GetWindowWidth() - 80);
         if (ImGui::Button("Refresh")) refreshInterference(st);
@@ -776,7 +777,7 @@ void AsmPanels::drawBom(AppState& st) {
     ImGui::SetNextWindowSize(ImVec2(560 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (bomFocus_) { ImGui::SetNextWindowFocus(); bomFocus_ = false; }
     if (ImGui::Begin("Bill of Materials", &open)) {
-        asmIcon("bom", "[B]"); ImGui::SameLine(0, 6);
+        asmIcon("bom", "[B]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         ImGui::TextUnformatted("Components");
         ImGui::SameLine(ImGui::GetWindowWidth() - 80);
         if (ImGui::Button("Refresh")) refreshBom(st);
@@ -819,10 +820,10 @@ void AsmPanels::drawBom(AppState& st) {
 
         ImGui::Spacing();
         ImGui::TextUnformatted("Export CSV to:");
-        ImGui::SetNextItemWidth(-90);
+        ImGui::SetNextItemWidth(-ui::metrics::asmBtnW());
         ImGui::InputText("##bom_csv", bomCsvPath_.data(), bomCsvPath_.size());
         ImGui::SameLine();
-        if (ImGui::Button("Export", ImVec2(80, 0)) && bomCsvPath_[0]) {
+        if (ImGui::Button("Export", ImVec2(ui::metrics::px(80), 0)) && bomCsvPath_[0]) {
             FILE* f = std::fopen(bomCsvPath_.data(), "wb");
             if (f) {
                 std::fprintf(f, "Item,Part,Source,Qty,Mass_g,Volume_mm3\n");

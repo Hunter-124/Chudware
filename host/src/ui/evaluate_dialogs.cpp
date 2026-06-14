@@ -5,6 +5,7 @@
 
 #include "imgui.h"
 
+#include "metrics.h"
 #include "../core/app_state.h"
 #include "../renderer.h"
 #include "../ui_theme.h"
@@ -152,7 +153,7 @@ bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
 void EvaluateDialogs::draw(AppState& st) {
     if (openWindow_.empty()) return;
     bool open = true;
-    ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(340), 0), ImGuiCond_Appearing);
     if (ImGui::Begin(title_.c_str(), &open)) {
         if (pending_) {
             // C39: the eval is in flight on the dispatch thread; the result fills in when

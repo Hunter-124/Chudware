@@ -143,6 +143,58 @@ def _c_channel(h: float, w: float, thickness: float) -> Face:
     return _face_from(_polyline_wire(pts))
 
 
+def _i_beam(h: float, w: float, tw: float, tf: float) -> Face:
+    """Doubly-symmetric W / I-beam: depth ``h``, flange width ``w``, web thickness ``tw`` and
+    flange thickness ``tf``. Bounding box (w × h) centred on the origin.
+
+    The section is the classic 12-vertex I outline (two flanges joined by a central web). Drawn
+    with sharp corners (no fillets) — a faithful structural-area approximation of a rolled shape.
+    """
+    if tw <= 0 or tf <= 0:
+        raise ValueError(f"i_beam: web {tw} / flange {tf} thickness must be > 0")
+    if tw >= w:
+        raise ValueError(f"i_beam: web thickness {tw} must be < flange width {w}")
+    if 2 * tf >= h:
+        raise ValueError(f"i_beam: flange thickness {tf} too large for depth {h}")
+    hw, hh = w / 2.0, h / 2.0
+    hwt = tw / 2.0  # half web thickness
+    yf = hh - tf    # inner face of the top flange
+    # Walk the outline clockwise starting at the lower-left flange corner.
+    pts = [
+        (-hw, -hh), (hw, -hh),          # bottom of lower flange
+        (hw, -yf), (hwt, -yf),          # up the right side, in to the web
+        (hwt, yf), (hw, yf),            # up the web, out to the upper flange
+        (hw, hh), (-hw, hh),            # top of upper flange
+        (-hw, yf), (-hwt, yf),          # down the left side, in to the web
+        (-hwt, -yf), (-hw, -yf),        # down the web, out to the lower flange
+    ]
+    return _face_from(_polyline_wire(pts))
+
+
+def _t_section(h: float, w: float, tw: float, tf: float) -> Face:
+    """T-section: overall depth ``h``, flange width ``w``, web thickness ``tw``, flange thickness
+    ``tf``. The flange is the top bar; the web hangs down. Bounding box (w × h) centred on origin.
+    """
+    if tw <= 0 or tf <= 0:
+        raise ValueError(f"t_section: web {tw} / flange {tf} thickness must be > 0")
+    if tw >= w:
+        raise ValueError(f"t_section: web thickness {tw} must be < flange width {w}")
+    if tf >= h:
+        raise ValueError(f"t_section: flange thickness {tf} too large for depth {h}")
+    hw, hh = w / 2.0, h / 2.0
+    hwt = tw / 2.0
+    yf = hh - tf  # inner face of the flange
+    # Outline: flange across the top, web hanging from the middle. Start at lower-left of the web.
+    pts = [
+        (-hwt, -hh), (hwt, -hh),    # bottom of the web
+        (hwt, yf),                  # up the right side of the web to the flange underside
+        (hw, yf), (hw, hh),         # out to the right flange tip, up to the top
+        (-hw, hh), (-hw, yf),       # across the flange top, down the left tip
+        (-hwt, yf),                 # back in to the web
+    ]
+    return _face_from(_polyline_wire(pts))
+
+
 # --------------------------------------------------------------------------- registry
 
 
@@ -215,7 +267,80 @@ PROFILES: dict[str, ProfileSpec] = {
         area=lambda h, w, thickness: h * w - (h - 2 * thickness) * (w - thickness),
         envelope=lambda h, w, thickness: (w, h),
     ),
+    # W / I-beam — doubly symmetric: depth h, flange width w, web tw, flange tf.
+    # Area = web rectangle + the two flange overhangs = h·tw + 2·tf·(w − tw).
+    "i_beam": ProfileSpec(
+        "i_beam", {"h": 100.0, "w": 50.0, "tw": 5.0, "tf": 7.0},
+        builder=_i_beam,
+        area=lambda h, w, tw, tf: h * tw + 2.0 * tf * (w - tw),
+        envelope=lambda h, w, tw, tf: (w, h),
+    ),
+    # T-section — flange across the top, web hanging down.
+    # Area = flange bar + web below it = w·tf + tw·(h − tf).
+    "t_section": ProfileSpec(
+        "t_section", {"h": 60.0, "w": 60.0, "tw": 6.0, "tf": 6.0},
+        builder=_t_section,
+        area=lambda h, w, tw, tf: w * tf + tw * (h - tf),
+        envelope=lambda h, w, tw, tf: (w, h),
+    ),
 }
+
+
+# --------------------------------------------------------------------------- standard named sizes
+# A small catalogue of real-world standard structural sizes (mm), so the PM / agent can pick a
+# named member ("HSS 50x50x3") instead of typing four dimensions. Each entry maps a catalogue name
+# to ``(profile_name, dims)``. Sizes are nominal, metric, and intentionally representative — not an
+# exhaustive AISC/EN table. Use :func:`standard_size` to resolve one to (profile, dims).
+
+STANDARD_SIZES: dict[str, tuple[str, dict[str, float]]] = {
+    # HSS square tube (size × wall).
+    "HSS 40x40x3":  ("square_tube", {"size": 40.0, "thickness": 3.0}),
+    "HSS 50x50x3":  ("square_tube", {"size": 50.0, "thickness": 3.0}),
+    "HSS 50x50x5":  ("square_tube", {"size": 50.0, "thickness": 5.0}),
+    "HSS 80x80x5":  ("square_tube", {"size": 80.0, "thickness": 5.0}),
+    "HSS 100x100x6": ("square_tube", {"size": 100.0, "thickness": 6.0}),
+    # HSS rectangular tube (w × h × wall).
+    "HSS 60x40x3":  ("rect_tube", {"w": 60.0, "h": 40.0, "thickness": 3.0}),
+    "HSS 80x40x4":  ("rect_tube", {"w": 80.0, "h": 40.0, "thickness": 4.0}),
+    "HSS 100x50x5": ("rect_tube", {"w": 100.0, "h": 50.0, "thickness": 5.0}),
+    # Round pipe / tube (OD × wall).
+    "PIPE 21.3x2.8": ("round_tube", {"od": 21.3, "thickness": 2.8}),   # ~1/2" NPS sch40
+    "PIPE 33.4x3.4": ("round_tube", {"od": 33.4, "thickness": 3.4}),   # ~1" NPS sch40
+    "PIPE 48.3x3.7": ("round_tube", {"od": 48.3, "thickness": 3.7}),   # ~1-1/2" NPS sch40
+    "TUBE 25x2":    ("round_tube", {"od": 25.0, "thickness": 2.0}),
+    "TUBE 50x3":    ("round_tube", {"od": 50.0, "thickness": 3.0}),
+    # C-channel (depth × flange × wall).
+    "C 76x38x5":    ("c_channel", {"h": 76.0, "w": 38.0, "thickness": 5.0}),
+    "C 102x51x6":   ("c_channel", {"h": 102.0, "w": 51.0, "thickness": 6.0}),
+    "C 152x76x6":   ("c_channel", {"h": 152.0, "w": 76.0, "thickness": 6.0}),
+    # L equal angle (leg × wall).
+    "L 25x25x3":    ("angle_L", {"leg": 25.0, "thickness": 3.0}),
+    "L 40x40x4":    ("angle_L", {"leg": 40.0, "thickness": 4.0}),
+    "L 50x50x5":    ("angle_L", {"leg": 50.0, "thickness": 5.0}),
+    "L 75x75x6":    ("angle_L", {"leg": 75.0, "thickness": 6.0}),
+    # W / I-beam (depth × flange-width × web × flange).
+    "W 100x50":     ("i_beam", {"h": 100.0, "w": 50.0, "tw": 5.0, "tf": 7.0}),
+    "W 150x75":     ("i_beam", {"h": 150.0, "w": 75.0, "tw": 5.0, "tf": 7.0}),
+    "W 200x100":    ("i_beam", {"h": 200.0, "w": 100.0, "tw": 6.0, "tf": 9.0}),
+    "W 250x125":    ("i_beam", {"h": 250.0, "w": 125.0, "tw": 6.0, "tf": 9.0}),
+    # T-section (depth × flange-width × web × flange).
+    "T 60x60":      ("t_section", {"h": 60.0, "w": 60.0, "tw": 6.0, "tf": 6.0}),
+    "T 80x80":      ("t_section", {"h": 80.0, "w": 80.0, "tw": 8.0, "tf": 8.0}),
+}
+
+
+def standard_size_names() -> list[str]:
+    """All catalogue names, sorted."""
+    return sorted(STANDARD_SIZES)
+
+
+def standard_size(name: str) -> tuple[str, dict[str, float]]:
+    """Resolve a catalogue name to ``(profile_name, dims)``. Raises ``KeyError`` if unknown."""
+    spec = STANDARD_SIZES.get(name)
+    if spec is None:
+        raise KeyError(name)
+    profile, dims = spec
+    return profile, dict(dims)
 
 
 def profile_names() -> list[str]:

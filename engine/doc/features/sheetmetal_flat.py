@@ -82,6 +82,7 @@ from .extrude import _store_topo_owners, _to_solid_normalized
 # Keys the base/edge-flange compilers write (see sheetmetal.py).
 _SM_KEY = "_sheet_metal"
 _BEND_KEY = "_sheet_metal_bends"
+_RELIEF_KEY = "_sheet_metal_reliefs"
 # Key this feature writes for the later flat-DXF / flat-view wave.
 _FLAT_KEY = "_sheet_metal_flat"
 
@@ -268,6 +269,60 @@ def compile_sm_flat_pattern(feat: dict, ctx: CompileContext) -> CompileOutput:
     if getattr(flat, "volume", 0.0) <= 1e-9:
         raise FeatureError("sm_flat_pattern: produced an empty flat body")
 
+    # --- CUT PROPAGATION + CORNER RELIEF -------------------------------------------------------
+    # Carry every cut (punched hole / slot) and every corner-relief notch through the unfold so the
+    # flat blank + its DXF show them at the developed position.
+    #   * base-region holes already developed into the flat SOLID (the base broad face extrudes WITH
+    #     its inner wires) — we harvest those loops for the export.
+    #   * flange-WALL holes are re-developed onto the strip and cut from the flat solid.
+    #   * corner reliefs (recorded by the edge-flange compiler) are cut from the flat blank too.
+    cut_loops: list[list[list[float]]] = []
+    # A broad-face area floor: ignore the thin thickness strips, keep the real flat broad faces.
+    min_broad_area = max(4.0 * thickness * thickness, 1.0)
+
+    # Wall holes: develop + cut from the flat solid (must run BEFORE harvesting base loops so any
+    # wall hole that lands in the base plane is visible to the harvest).
+    for rec in bends:
+        ba_rec = float(rec["bend_allowance"])
+        try:
+            tools, loops = _wall_hole_loops(body, rec, n_base, face_pt, ba_rec)
+        except Exception:  # noqa: BLE001
+            tools, loops = [], []
+        for tool in tools:
+            try:
+                cut = _to_solid_normalized(flat - tool)
+                if getattr(cut, "volume", 0.0) < getattr(flat, "volume", 0.0) - 1e-9:
+                    flat = cut
+            except Exception:  # noqa: BLE001
+                pass
+        cut_loops.extend(loops)
+
+    # Corner reliefs developed into the flat blank.
+    relief_store = ctx.datums.get(_RELIEF_KEY)
+    reliefs = list(relief_store.obj) if (relief_store and relief_store.obj) else []
+    if reliefs:
+        try:
+            rtools, rloops = _relief_flat_loops(reliefs, n_base, face_pt, thickness)
+        except Exception:  # noqa: BLE001
+            rtools, rloops = [], []
+        for tool in rtools:
+            try:
+                cut = _to_solid_normalized(flat - tool)
+                if getattr(cut, "volume", 0.0) < getattr(flat, "volume", 0.0) - 1e-9:
+                    flat = cut
+            except Exception:  # noqa: BLE001
+                pass
+        cut_loops.extend(rloops)
+
+    flat = _to_solid_normalized(flat)
+
+    # Base-region holes (everything still showing as an inner wire on the flat broad face). This
+    # also picks up the wall holes + reliefs we just cut, so harvest is the single source of truth
+    # for what the blank's broad face actually carries — then merge with any wall loops the harvest
+    # could not see (a hole fully inside the developed strip away from the base face).
+    harvested = _base_region_cut_loops(flat, n_base, face_pt, min_broad_area)
+    cut_loops = _merge_cut_loops(harvested, cut_loops)
+
     # --- flat outline: the boundary edges of the flat sheet's largest broad face --------------
     outline = _flat_outline(flat, n_base)
 
@@ -284,6 +339,11 @@ def compile_sm_flat_pattern(feat: dict, ctx: CompileContext) -> CompileOutput:
         "thickness": thickness,
         "bend_lines": bend_lines_out,
         "outline": outline,
+        # CUT loops (holes / slots / corner-relief notches) developed into the flat blank. Each is a
+        # closed 3-D polyline on the base plane. ``export2d.flat_pattern_layers`` should draw these
+        # on a CUTS layer (one-line addition — see the module note); the flat SOLID already carries
+        # them as inner wires, so they are present regardless of the export wiring.
+        "cut_loops": cut_loops,
         "flat_area": flat_area,
         "flat_volume": flat_volume,
         "n_base": [n_base.X, n_base.Y, n_base.Z],
@@ -295,6 +355,7 @@ def compile_sm_flat_pattern(feat: dict, ctx: CompileContext) -> CompileOutput:
 
     resolved = {
         "bend_count": float(len(bends)),
+        "cut_count": float(len(cut_loops)),
         "thickness": thickness,
         "flat_area": flat_area,
         "flat_volume": flat_volume,
@@ -410,3 +471,270 @@ def _flat_outline(flat: Solid, n_base: Vector) -> list[list[float]]:
         except Exception:  # noqa: BLE001
             return []
     return pts
+
+
+# --------------------------------------------------------------------------- cut propagation
+#
+# A flat pattern must carry CUTS (punched holes / slots) through the unfold so every cut appears in
+# the flat blank at its developed position. Two cases:
+#
+#   * a cut in the BASE region — it already lands in the flat SOLID because ``_flat_base_block``
+#     extrudes the base broad face WITH its inner wires (holes). We just harvest those inner wires
+#     as developed loops so the export (DXF) carries them too.
+#   * a cut in a FLANGE WALL — the wall is dropped and replaced by a developed strip, so the cut
+#     must be RE-DEVELOPED: each point on the wall at distance ``d`` from the bend tangent maps to
+#     flat position ``tangent + length_dir·(BA + d)`` (the wall unrolls into the base plane). We
+#     find wall holes on the folded body, develop their loops, and cut them from the flat solid.
+
+
+def _discretize_wire(wire, max_seg_len: float = 1.0) -> list[Vector]:
+    """Sample a wire (hole/slot boundary) to an ordered list of 3-D points (arcs → polylines)."""
+    pts: list[Vector] = []
+    try:
+        edges = wire.order_edges() if hasattr(wire, "order_edges") else wire.edges()
+    except Exception:  # noqa: BLE001
+        edges = wire.edges()
+    for e in edges:
+        try:
+            length = float(e.length)
+        except Exception:  # noqa: BLE001
+            length = 0.0
+        nseg = max(1, int(math.ceil(length / max(max_seg_len, 1e-6))))
+        # Circles/curves need finer sampling; lines just need endpoints.
+        try:
+            is_line = (e.geom_type.name == "LINE")
+        except Exception:  # noqa: BLE001
+            is_line = False
+        if is_line:
+            nseg = 1
+        for i in range(nseg):
+            t = i / nseg
+            try:
+                p = e @ t
+                q = Vector(p.X, p.Y, p.Z)
+            except Exception:  # noqa: BLE001
+                vs = e.vertices()
+                q = Vector(vs[0].X, vs[0].Y, vs[0].Z)
+            if not pts or (q - pts[-1]).length > 1e-7:
+                pts.append(q)
+    # Close the loop.
+    if len(pts) >= 2 and (pts[0] - pts[-1]).length > 1e-7:
+        pts.append(pts[0])
+    return pts
+
+
+def _broad_faces(body, n_base: Vector, min_area: float):
+    """Planar faces whose normal ∥ n_base with area >= min_area (the broad faces of a region)."""
+    from build123d import GeomType
+    out = []
+    for f in body.faces():
+        try:
+            if f.geom_type != GeomType.PLANE:
+                continue
+            n = f.normal_at()
+            n = n * (1.0 / max(n.length, 1e-12))
+            if abs(abs(n.dot(n_base)) - 1.0) < 1e-4 and float(f.area) >= min_area:
+                out.append(f)
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _base_region_cut_loops(flat: Solid, n_base: Vector, face_pt: Vector,
+                           min_area: float) -> list[list[list[float]]]:
+    """Harvest every hole (inner wire) on the flat sheet's broad faces, projected to the base plane.
+
+    These are cuts that already developed into the flat SOLID (base-region holes survive the
+    ``_flat_base_block`` extrude). We return them as 3-D loops on the picked broad-face plane so the
+    DXF export draws them on the blank."""
+    loops: list[list[list[float]]] = []
+    # Take inner wires from the broad face that carries them (one side is enough — the hole is the
+    # same on both skins). Pick the broad face on the picked-face side (closest to face_pt).
+    faces = _broad_faces(flat, n_base, min_area)
+    if not faces:
+        return loops
+    # Deduplicate by side: a through-hole appears on BOTH broad faces; harvest from the side nearest
+    # face_pt only so we don't emit each hole twice.
+    target_side = min(faces, key=lambda f: abs((f.center() - face_pt).dot(n_base)))
+    side_sign = (target_side.center() - face_pt).dot(n_base)
+    for f in faces:
+        if ((f.center() - face_pt).dot(n_base)) * 1.0 - side_sign > 0.5:  # other skin
+            continue
+        if abs((f.center() - face_pt).dot(n_base) - side_sign) > 1e-3:
+            continue
+        try:
+            inners = f.inner_wires()
+        except Exception:  # noqa: BLE001
+            inners = []
+        for w in inners:
+            pts = _discretize_wire(w)
+            if len(pts) < 3:
+                continue
+            # Project onto the picked broad-face plane.
+            proj = [p - n_base * ((p - face_pt).dot(n_base)) for p in pts]
+            loops.append([[p.X, p.Y, p.Z] for p in proj])
+    return loops
+
+
+def _wall_hole_loops(body, rec: dict, n_base: Vector, face_pt: Vector,
+                     ba: float) -> tuple[list[Solid], list[list[list[float]]]]:
+    """Develop holes that lie in flange ``rec``'s WALL onto the flat, as (cut tools, loops).
+
+    The wall is the planar pair perpendicular to the base on the fold side. A hole on the wall sits
+    at some distance ``d`` along the wall from the bend tangent; unrolled, it maps to flat position
+    ``tangent + length_dir·(BA + d)`` keeping its position along the bend axis. We rebuild each hole
+    as a flat loop and a through-thickness cut tool so the flat SOLID carries it too.
+    """
+    from build123d import GeomType
+    e_dir = _v(rec["e_dir"]); length_dir = _v(rec["length_dir"]); fold_dir = _v(rec["fold_dir"])
+    e_dir = e_dir * (1.0 / max(e_dir.length, 1e-12))
+    length_dir = length_dir * (1.0 / max(length_dir.length, 1e-12))
+    fold_dir = fold_dir * (1.0 / max(fold_dir.length, 1e-12))
+    R = float(rec["radius"]); T = float(rec["thickness"])
+    angle = float(rec["angle"])
+    position = rec.get("position", "material_inside")
+    x0 = _setback(position, R, T)
+    p0 = _v(rec["bend_line"][0])
+    # Bend tangent line (on the base plane): where the bend region begins. Developed distance is
+    # measured along +length_dir from here: the bend develops to BA, the wall keeps its length.
+    tangent = p0 + length_dir * x0
+    tangent = tangent - n_base * ((tangent - face_pt).dot(n_base))  # on the base plane
+    # Physical drop the bend region consumes perpendicular to the base before the wall begins. For
+    # the canonical 90° material_inside bend the wall starts (R+T) below the base plane; in general
+    # the bend's perpendicular rise is (R+T)·sin(angle). Beyond that, the wall is straight and its
+    # surface-distance equals the developed distance past BA.
+    ang = math.radians(angle)
+    bend_drop = (R + T) * math.sin(ang) if angle < 179.999 else (R + T)
+    # The wall's broad-face normal is perpendicular to BOTH the base normal and e_dir, i.e. it lies
+    # in the (length_dir, fold_dir) plane rotated by the bend angle. We detect wall faces as planar
+    # faces whose normal is ⟂ n_base and ⟂ e_dir (a vertical wall for 90°), and NOT the base broad
+    # faces themselves.
+    tools: list[Solid] = []
+    loops: list[list[list[float]]] = []
+    seen_centroids: list[tuple[float, float, float]] = []
+
+    def _develop(pts: list[Vector]) -> list[Vector]:
+        out: list[Vector] = []
+        for p in pts:
+            rel = p - tangent
+            lat = rel.dot(e_dir)                 # bend-axis position is preserved by the unroll
+            drop = abs(rel.dot(n_base))          # perpendicular drop below the base plane
+            # The bend region (drop ≤ bend_drop) develops linearly to BA; the straight wall beyond
+            # develops 1:1.
+            if bend_drop > 1e-9 and drop <= bend_drop + 1e-9:
+                dev = ba * (drop / bend_drop)
+            else:
+                dev = ba + (drop - bend_drop)
+            out.append(tangent + e_dir * lat + length_dir * dev)
+        return out
+
+    for f in body.faces():
+        try:
+            if f.geom_type != GeomType.PLANE:
+                continue
+            n = f.normal_at(); n = n * (1.0 / max(n.length, 1e-12))
+            # A wall broad face: normal perpendicular to the base normal (not a base/parallel face)
+            # and perpendicular to the bend axis (so it is a wall of THIS flange, spanning e_dir).
+            if abs(n.dot(n_base)) > 1e-2 or abs(n.dot(e_dir)) > 1e-2:
+                continue
+            inners = f.inner_wires()
+        except Exception:  # noqa: BLE001
+            continue
+        if not inners:
+            continue
+        for w in inners:
+            pts = _discretize_wire(w)
+            if len(pts) < 3:
+                continue
+            flat_pts = _develop(pts)
+            if (flat_pts[0] - flat_pts[-1]).length > 1e-7:
+                flat_pts.append(flat_pts[0])
+            cx = sum(p.X for p in flat_pts) / len(flat_pts)
+            cy = sum(p.Y for p in flat_pts) / len(flat_pts)
+            cz = sum(p.Z for p in flat_pts) / len(flat_pts)
+            # A through-hole shows on BOTH wall skins; develop it from one skin only.
+            if any(math.dist((cx, cy, cz), s) <= max(0.5 * T, 0.5) for s in seen_centroids):
+                continue
+            seen_centroids.append((cx, cy, cz))
+            loops.append([[p.X, p.Y, p.Z] for p in flat_pts])
+            try:
+                tools.append(_loop_cut_tool(flat_pts, n_base, T))
+            except Exception:  # noqa: BLE001
+                pass
+    return tools, loops
+
+
+def _loop_cut_tool(loop_pts: list[Vector], n_base: Vector, thickness: float) -> Solid:
+    """A through-thickness prism over a closed loop (over-driven beyond both skins) — a cut tool."""
+    base = [p - n_base * (thickness + 1.0) for p in loop_pts]
+    # Drop near-coincident consecutive points (and the closing duplicate) so make_line never sees a
+    # zero-length segment.
+    clean: list[Vector] = []
+    for v in base:
+        if not clean or (v - clean[-1]).length > 1e-7:
+            clean.append(v)
+    if len(clean) >= 2 and (clean[0] - clean[-1]).length <= 1e-7:
+        clean.pop()
+    if len(clean) < 3:
+        raise FeatureError("sm_flat_pattern: degenerate cut loop")
+    edges = [Edge.make_line(clean[i], clean[(i + 1) % len(clean)]) for i in range(len(clean))]
+    wire = Wire(edges)
+    mf = BRepBuilderAPI_MakeFace(wire.wrapped, True)
+    if not mf.IsDone():
+        raise FeatureError("sm_flat_pattern: cut-loop face build failed")
+    face = Face(mf.Face())
+    vec = n_base * (2.0 * thickness + 2.0)
+    mk = BRepPrimAPI_MakePrism(face.wrapped, gp_Vec(vec.X, vec.Y, vec.Z), False, True)
+    if not mk.IsDone():
+        raise FeatureError("sm_flat_pattern: cut-loop prism build failed")
+    return Solid(mk.Shape()).clean()
+
+
+def _relief_flat_loops(reliefs: list[dict], n_base: Vector, face_pt: Vector,
+                       thickness: float) -> tuple[list[Solid], list[list[list[float]]]]:
+    """Corner-relief notches developed into the flat blank: (cut tools, loops).
+
+    Each relief record already carries the notch ``loop`` on the base plane (the edge-flange
+    compiler built it there). We project it to the picked broad-face plane and build a cut tool so
+    the flat blank shows the same relief notch the folded part has."""
+    tools: list[Solid] = []
+    loops: list[list[list[float]]] = []
+    for r in reliefs:
+        pts = [_v(p) for p in r.get("loop", [])]
+        if len(pts) < 3:
+            continue
+        proj = [p - n_base * ((p - face_pt).dot(n_base)) for p in pts]
+        loops.append([[p.X, p.Y, p.Z] for p in proj])
+        try:
+            tools.append(_loop_cut_tool(proj, n_base, thickness))
+        except Exception:  # noqa: BLE001
+            pass
+    return tools, loops
+
+
+def _loop_centroid(loop: list[list[float]]) -> tuple[float, float, float]:
+    n = max(len(loop), 1)
+    sx = sum(p[0] for p in loop) / n
+    sy = sum(p[1] for p in loop) / n
+    sz = sum(p[2] for p in loop) / n
+    return sx, sy, sz
+
+
+def _merge_cut_loops(primary: list[list[list[float]]],
+                     extra: list[list[list[float]]],
+                     tol: float = 1.0) -> list[list[list[float]]]:
+    """Union two cut-loop lists, dropping near-duplicate loops (same centroid within ``tol`` mm).
+
+    ``primary`` (harvested from the flat solid's broad face) is authoritative; ``extra`` (developed
+    wall/relief loops) is appended only when it is not already represented in ``primary``."""
+    out = list(primary)
+    cents = [_loop_centroid(lp) for lp in out]
+    for lp in extra:
+        if len(lp) < 3:
+            continue
+        c = _loop_centroid(lp)
+        dup = any(math.dist(c, pc) <= tol for pc in cents)
+        if not dup:
+            out.append(lp)
+            cents.append(c)
+    return out

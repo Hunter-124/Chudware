@@ -171,15 +171,29 @@ static const std::vector<PMFormDef>& forms() {
                        "thin", "true"),
             Check     ("merge",    "Merge result",    "Options",      true),
         }},
-        // --- revolve ---  mode/angle/flip/merge ; profile[]/axis
-        //   Engine (revolve.py): mode, angle, flip, merge — all exposed. No mid-plane in engine.
+        // --- revolve ---  mode/end/angle/flip/dir2/angle2/thin ; profile[]/axis
+        //   Engine (revolve.py): end one_direction|mid_plane|up_to_surface (up_to auto-trims to the
+        //   body, no target ref); Dir2 (params.dir2 + angle2 — angle2 omitWhenDisabled so it can't
+        //   force dir2 on); Thin Feature (thin/thin_thickness/thin_side inside|outside|both).
         { "revolve", "Revolve", "revolve_boss", {
-            Well  ("profile",  "Profile",        "From",      K_FACE, true),
-            Well  ("axis",     "Axis",           "From",      K_EDGE, false),
-            Combo ("mode",     "Type",           "Direction", "boss|cut"),
-            Angle ("angle",    "Angle",          "Direction", 360.0),
-            Check ("flip",     "Reverse direction", "Direction", false),
-            Check ("merge",    "Merge result",   "Options",   true),
+            Well   ("profile",  "Profile",        "From",        K_FACE, true),
+            Well   ("axis",     "Axis",           "From",        K_EDGE, false),
+            ComboL ("mode",     "Type",           "Direction 1", "boss|cut", "Boss|Cut"),
+            ComboL ("end",      "End Condition",  "Direction 1",
+                    "one_direction|mid_plane|up_to_surface",
+                    "One Direction|Mid Plane|Up To Surface"),
+            AngleIf("angle",    "Angle",          "Direction 1", 360.0,
+                    "end", "one_direction|mid_plane"),
+            Check  ("flip",     "Reverse direction", "Direction 1", false),
+            Check  ("dir2",     "Direction 2",    "Direction 2", false),
+            AngleIf("angle2",   "Angle",          "Direction 2", 360.0,
+                    "dir2", "true", /*omit=*/true),
+            Check  ("thin",         "Thin Feature",  "Thin Feature", false),
+            DimIf  ("thin_thickness","Wall thickness","Thin Feature", 2.0,
+                    "thin", "true"),
+            ComboLIf("thin_side", "Wall side",      "Thin Feature",
+                    "inside|outside|both", "Inside|Outside|Both", "thin", "true"),
+            Check  ("merge",    "Merge result",   "Options",     true),
         }},
         // --- sweep ---  mode/merge ; profile[] (region) + path (sketch chain or model edge)
         //   Engine (sweep.py): profile resolves like extrude (whole-sketch/index/centroid region or

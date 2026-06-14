@@ -976,6 +976,23 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
         relPopupPos_ = ImGui::GetMousePos();
         return true;
     }
+    if (cmdId == "sk_fix") {
+        // SolidWorks "Fix" relation as a one-click ribbon button: pin every selected entity/point
+        // (the engine `fix` constraint zeroes that entity's DOF — sketch_solver.py). This is the
+        // direct shortcut for the Fix that already lives in the Add-Relation popup; it routes
+        // through addRelationOps so an over-defining Fix surfaces the same "Over Defined" prompt.
+        if (selIds_.empty()) {
+            st.toast(ui::ToastLevel::Info, "Fix: select sketch entities or points first");
+            return true;
+        }
+        relPopupPos_ = ImGui::GetMousePos();   // anchor the over-def prompt at the cursor
+        nlohmann::json ops = nlohmann::json::array();
+        for (const auto& h : selIds_)
+            ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
+                {"constraint", {{"type", "fix"}, {"refs", nlohmann::json::array({h})}}}});
+        addRelationOps(st, ops, "Fix");
+        return true;
+    }
     return false;
 }
 

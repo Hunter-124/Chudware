@@ -111,7 +111,7 @@ static const RibbonCmd kCmds[] = {
     // C42: sk_relations wired (Add Relation popup over the selection). sk_fix greyed — Fix is
     // reachable via that popup (single entity selected); a dedicated handler can enable it later.
     { "sk_relations",      "Relations",      "relations",       "Sketch",   "Relations",       true,  nullptr,          false },
-    { "sk_fix",            "Fix",            "fix",             "Sketch",   "Relations",       false, nullptr,          true  },
+    { "sk_fix",            "Fix",            "fix",             "Sketch",   "Relations",       false, nullptr,          false },
 
     // =========================================================================
     // Tab: Evaluate
@@ -132,7 +132,7 @@ static const RibbonCmd kCmds[] = {
     // --- Group: Check ---
     { "eval_check",        "Check",          "check",           "Evaluate", "Geometry Check",  true,  nullptr,          false },
     { "eval_interference", "Interference",   "interference_eval","Evaluate","Geometry Check",  true,  nullptr,          false },
-    { "eval_geometry",     "Geometry Anlys.","geometry_analysis","Evaluate","Geometry Check",  false, nullptr,          true  },
+    { "eval_geometry",     "Geometry Anlys.","geometry_analysis","Evaluate","Geometry Check",  false, nullptr,          false },
 
     // =========================================================================
     // Tab: Simulation

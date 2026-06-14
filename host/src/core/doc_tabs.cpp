@@ -91,7 +91,7 @@ void AppState::switchToTab(int idx) {
     if (dst0.kind == DocTab::TabKind::Drawing) {
         activeTab = idx;
         animActive = false;
-        if (ribbonTab == 4) ribbonTab = 0;  // a drawing doesn't have the Assembly tab context
+        if (ribbonTab == RT_Assembly) ribbonTab = RT_Features;  // a drawing has no Assembly context
         refreshDrawingTab(idx);
         addLog("[tabs] switched to drawing '" + dst0.title + "' (" + dst0.drawingDocId + ")");
         return;
@@ -141,8 +141,8 @@ void AppState::switchToTab(int idx) {
     }
 
     // 7) Assembly docs want the Assembly ribbon tab forward (mirrors New Assembly behavior).
-    if (dst.isAssembly) { showRibbon = true; ribbonTab = 4; }
-    else if (ribbonTab == 4) ribbonTab = 0;  // a part doesn't have the Assembly tab context
+    if (dst.isAssembly) { showRibbon = true; ribbonTab = RT_Assembly; }
+    else if (ribbonTab == RT_Assembly) ribbonTab = RT_Features;  // a part has no Assembly context
 
     addLog("[tabs] switched to '" + dst.title + "' (doc " + dst.docId +
            ", rev " + std::to_string(docMirror.revision()) + ")");
@@ -332,7 +332,7 @@ void AppState::makeDrawing() {
     t.drawNeedFit = true;
     docTabs.push_back(std::move(t));
     activeTab = (int)docTabs.size() - 1;
-    if (ribbonTab == 4) ribbonTab = 0;
+    if (ribbonTab == RT_Assembly) ribbonTab = RT_Features;
     addLog("[draw] created drawing '" + drawingName + "' (" + drawingId + ", " +
            std::to_string(added) + " views) from " + sourceId);
     toast(ui::ToastLevel::Info, "Drawing created with " + std::to_string(added) + " views");

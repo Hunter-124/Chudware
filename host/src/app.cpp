@@ -634,13 +634,14 @@ int run_gui(const char* screenshotPath) {
     st.asmPanels = &asmPanels;
     // --- end C20b ---
 
-    // C17: ribbon dispatcher — replaces C14's default printf handler. A ribbon command opens the
-    // matching PM form (occupying the tree dock slot); commands without a form log a stub line so
-    // they remain observable until later cards wire them.
-    // C18: sketch-tab commands (sketch_new / sk_* / smart_dim / sketch_exit) route to SketchMode
-    // first so the sketch experience takes priority over any PM form for those ids.
-    ui::setRibbonCallback([&st, &propertyManager, &sketchMode, &simPanel,
-                           &evaluateDialogs, &asmPanels](const char* cmd_id) {
+    // C17/C18: SINGLE ribbon-command dispatcher. The ribbon callback and st.ribbonDispatch (used by
+    // the shortcut bar / gesture wheel) route through the SAME lambda so the two paths can never
+    // drift apart — they were previously hand-duplicated (Wave 1B unification).
+    //   - sketch-tab commands (sketch_new / sk_* / smart_dim / sketch_exit) go to SketchMode first
+    //     so the sketch experience takes priority over any PM form for those ids;
+    //   - commands without a form log a stub line so they stay observable until later cards wire them.
+    auto dispatchCmd = [&st, &propertyManager, &sketchMode, &simPanel,
+                        &evaluateDialogs, &asmPanels](const char* cmd_id) {
         // C43: starting a sketch while a PM form is open cancels the form first (revert
         // preview + close). Without this, plane-pick and the PM coexisted: the PM hid the
         // FeatureManager, both fought over the viewport mouse, and Esc couldn't untangle it.
@@ -673,37 +674,10 @@ int run_gui(const char* screenshotPath) {
         std::printf("[ribbon] %s (no PM form)\n", cmd_id);
         std::fflush(stdout);
         st.addLog(std::string("[ribbon] ") + cmd_id + " (no PM form yet)");
-    });
-    // C25: expose the same dispatcher to UI widgets (shortcut bar, gesture wheel).
-    st.ribbonDispatch = [&st, &propertyManager, &sketchMode, &simPanel,
-                         &evaluateDialogs, &asmPanels](const char* cmd_id) {
-        // C43: same PM-vs-sketch mutual exclusion as the ribbon callback above.
-        if (propertyManager.active() && std::strcmp(cmd_id, "sketch_new") == 0)
-            propertyManager.cancelEdits(st);
-        if (sketchMode.onRibbonCommand(st, cmd_id)) return;
-        if (std::strcmp(cmd_id, "make_drawing") == 0) { st.makeDrawing(); return; }
-        {
-            std::string cmd(cmd_id);
-            if ((cmd.rfind("asm_", 0) == 0 || cmd == "new_assembly") &&
-                asmPanels.handleCommand(st, cmd)) return;
-        }
-        // Wave N: AI-ECAD commands (ecad_/sch_/pcb_) route to the ECAD editor.
-        {
-            std::string ec(cmd_id);
-            if (ec.rfind("ecad_", 0) == 0 || ec.rfind("sch_", 0) == 0 || ec.rfind("pcb_", 0) == 0) {
-                ecadDispatch(st, ec); return;
-            }
-        }
-        if (propertyManager.openForCommand(st, cmd_id)) return;
-        std::string cmd(cmd_id);
-        if (cmd == "sm_flat_pattern") { applyFlatPattern(st); return; }  // W16: one-click Flatten
-        if (cmd == "sm_export_flat_dxf") { exportFlatDxf(st); return; }  // W14: flat-pattern DXF
-        if (cmd.rfind("sim_", 0) == 0 && simPanel.handleCommand(st, cmd)) return;
-        if (cmd.rfind("eval_", 0) == 0 && evaluateDialogs.handleCommand(st, cmd)) return;
-        std::printf("[ribbon] %s (no PM form)\n", cmd_id);
-        std::fflush(stdout);
-        st.addLog(std::string("[ribbon] ") + cmd_id + " (no PM form yet)");
     };
+    ui::setRibbonCallback(dispatchCmd);
+    // C25: expose the same dispatcher to UI widgets (shortcut bar, gesture wheel).
+    st.ribbonDispatch = dispatchCmd;
 
     loadSettings(st.settings);
     // editor buffer for the system-prompt override (Settings > Agent)
@@ -887,25 +861,25 @@ int run_gui(const char* screenshotPath) {
     st.wantTree = shot && shotMode && std::strcmp(shotMode, "tree") == 0;
     st.wantM1 = shot && shotMode && std::strcmp(shotMode, "m1") == 0;  // C17 integration scenario
     st.wantEcad = shot && shotMode && std::strcmp(shotMode, "ecad") == 0;  // Wave N: ECAD GUI shot
-    if (st.wantEcad) { st.showRibbon = true; st.ribbonTab = 5; }  // PCB tab forward
+    if (st.wantEcad) { st.showRibbon = true; st.ribbonTab = AppState::RT_PCB; }  // PCB tab forward
     st.wantSketch = shot && shotMode && std::strcmp(shotMode, "sketch") == 0;  // C18 sketch flow
-    if (st.wantSketch) { st.showRibbon = true; st.ribbonTab = 1; }  // Sketch tab forward
+    if (st.wantSketch) { st.showRibbon = true; st.ribbonTab = AppState::RT_Sketch; }  // Sketch tab forward
     st.wantFea = shot && shotMode && std::strcmp(shotMode, "fea") == 0;       // C19 static study
     st.wantEvalMass = shot && shotMode && std::strcmp(shotMode, "evalmass") == 0;  // C19 mass props
-    if (st.wantFea) { st.showRibbon = true; st.ribbonTab = 3; st.showSimPanel = true; }
+    if (st.wantFea) { st.showRibbon = true; st.ribbonTab = AppState::RT_Simulation; st.showSimPanel = true; }
     // C22b: activity shot — new part doc -> agent_run_v2 -> Activity panel -> Settings Agents tab
     st.wantActivity = shot && shotMode && std::strcmp(shotMode, "activity") == 0;
     if (st.wantActivity) { st.showActivityPanel = true; }
     // C20b: assembly shot — author base/peg parts, new assembly, insert + mate + interference.
     st.wantAsm = shot && shotMode && std::strcmp(shotMode, "asm") == 0;
     if (st.wantAsm) {
-        st.showRibbon = true; st.ribbonTab = 4;  // Assembly tab forward
+        st.showRibbon = true; st.ribbonTab = AppState::RT_Assembly;  // Assembly tab forward
         st.showActivityPanel = false;            // keep the FeatureManager (Mates folder) unobscured
     }
     // ribbon shot: show Features tab by default; AI_CAD_TAB=<0..4> selects which tab to capture
     // (0=Features 1=Sketch 2=Evaluate 3=Simulation 4=Assembly) for headless per-tab verification.
     if (st.wantRibbon) {
-        st.showRibbon = true; st.ribbonTab = 0;
+        st.showRibbon = true; st.ribbonTab = AppState::RT_Features;
         if (const char* tabEnv = std::getenv("AI_CAD_TAB")) {
             int t = std::atoi(tabEnv);
             if (t >= 0 && t <= 4) st.ribbonTab = t;
@@ -1713,8 +1687,8 @@ int run_gui(const char* screenshotPath) {
         {
             static bool s_wasInSketch = false;
             const bool nowInSketch = sketchMode.active();
-            if (nowInSketch && !s_wasInSketch)      st.ribbonTab = 1;   // Sketch
-            else if (!nowInSketch && s_wasInSketch) st.ribbonTab = 0;   // Features
+            if (nowInSketch && !s_wasInSketch)      st.ribbonTab = AppState::RT_Sketch;
+            else if (!nowInSketch && s_wasInSketch) st.ribbonTab = AppState::RT_Features;
             s_wasInSketch = nowInSketch;
         }
         // C40: accent-highlight the armed sketch tool's ribbon button.

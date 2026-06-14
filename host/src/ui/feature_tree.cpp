@@ -1128,7 +1128,7 @@ static void drawFeatureManagerTopStrip(AppState& st) {
             st.addLog("[doc] new assembly  rev=" + std::to_string(st.docMirror.revision()));
             st.clearViewportForNewDoc();   // C34
             st.addDocTab(/*isAssembly=*/true);
-            st.showRibbon = true; st.ribbonTab = 4;
+            st.showRibbon = true; st.ribbonTab = AppState::RT_Assembly;
         } else st.addLog("[err] new assembly: " + err);
     }
     ImGui::SameLine(0, gap);

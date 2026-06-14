@@ -573,9 +573,21 @@ struct AppState {
     int frame = 0;
 
     // ---- ribbon (C14) ----
+    // Wave 1A: named ribbon-tab indices — MUST match the order of kRibbonTabs[] in
+    // widgets/ribbon.cpp. Replaces the magic numbers that were scattered across the host (the PCB
+    // tab was being set to 5 in one place, which landed on "Sheet Metal").
+    enum RibbonTab {
+        RT_Features   = 0, RT_Sketch     = 1, RT_Evaluate   = 2, RT_Simulation = 3,
+        RT_Assembly   = 4, RT_SheetMetal = 5, RT_Weldments  = 6, RT_PCB        = 7,
+    };
     bool showRibbon = true;        // View > Ribbon visibility toggle
-    int  ribbonTab  = 0;           // 0=Features 1=Sketch 2=Evaluate 3=Simulation 4=Assembly (C20b)
+    int  ribbonTab  = RT_Features; // active ribbon tab (one of RibbonTab); contextual on the doc
     bool showFeatureTree = true;   // View > FeatureManager (C16)
+    // Wave 1D: SW-faithful tabbed LEFT pane — Explorer / FeatureManager / PropertyManager /
+    // Configurations as switchable tabs in one dock window. The PropertyManager auto-selects its
+    // tab while a command form is active; closing the form returns to the FeatureManager tab.
+    enum LeftPaneTab { LP_Explorer = 0, LP_FeatureManager = 1, LP_PropertyManager = 2, LP_Configurations = 3 };
+    int leftPaneTab = LP_FeatureManager;
 
     // ---- PropertyManager (C17) — occupies the tree dock slot while a command is active ----
     // W1-B: typed pointer (forward-declared above) so app_state.h stays free of the heavy

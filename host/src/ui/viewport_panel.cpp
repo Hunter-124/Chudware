@@ -966,8 +966,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             for (int pi2 = 0; pi2 < (int)st.asmParts.size(); ++pi2) {
                 ImGui::ColorButton(("##sw" + std::to_string(pi2)).c_str(), partColor(pi2),
                                    ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop,
-                                   ImVec2(12, 12));
-                ImGui::SameLine(0, 6);
+                                   ImVec2(12 * ui::uiScale, 12 * ui::uiScale));
+                ImGui::SameLine(0, 6 * ui::uiScale);
                 std::string lbl = st.asmParts[pi2].name + "##p" + std::to_string(pi2);
                 if (ImGui::RadioButton(lbl.c_str(), st.selectedPart == pi2)) {
                     st.selectedPart = pi2;
@@ -1832,7 +1832,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 ImU32 fill = active  ? ui::Palette::toU32(hpal.accentSoft) :
                              hov     ? ui::Palette::toU32(hpal.buttonHovered) : 0;
                 if (fill)
-                    hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn), fill, 3.0f);
+                    hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn), fill, 3.0f * s);
                 IconUV iv = ui::getIcon(iconName, 20);
                 float iz = 18.0f * s, off = (btn - iz) * 0.5f;
                 hdl->AddImage(iv.texId, ImVec2(bxi + off, byi + off),
@@ -1845,8 +1845,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // Separator tick between groups.
             auto huSep = [&](int afterIdx) {
                 float bxi = bx0 + padX + (float)afterIdx * (btn + gap);
-                hdl->AddLine(ImVec2(bxi + btn + gap * 0.5f, byi + 3),
-                             ImVec2(bxi + btn + gap * 0.5f, byi + btn - 3),
+                hdl->AddLine(ImVec2(bxi + btn + gap * 0.5f, byi + 3 * s),
+                             ImVec2(bxi + btn + gap * 0.5f, byi + btn - 3 * s),
                              ui::Palette::toU32(hpal.border), 1.0f);
             };
 
@@ -2056,12 +2056,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             vdl->AddRectFilled(p0, p1, overlayBg, (p1.y - p0.y) * 0.5f);
             vdl->AddRect(p0, p1, overlayBord, (p1.y - p0.y) * 0.5f);
             float pulse = 0.35f + 0.65f * (0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 5.0f));
-            vdl->AddCircleFilled(ImVec2(p0.x + 14, (p0.y + p1.y) * 0.5f), 4.0f,
+            vdl->AddCircleFilled(ImVec2(p0.x + 14 * ui::uiScale, (p0.y + p1.y) * 0.5f), 4.0f * ui::uiScale,
                                  ImGui::ColorConvertFloat4ToU32(
                                      ImVec4(vpal.accent[0], vpal.accent[1],
                                             vpal.accent[2], pulse)));
-            vdl->PushClipRect(p0, ImVec2(p1.x - 8, p1.y), true);
-            vdl->AddText(ImVec2(p0.x + 24, p0.y + 6), overlayTxt, lt.c_str());
+            vdl->PushClipRect(p0, ImVec2(p1.x - 8 * ui::uiScale, p1.y), true);
+            vdl->AddText(ImVec2(p0.x + 24 * ui::uiScale, p0.y + 6 * ui::uiScale), overlayTxt, lt.c_str());
             vdl->PopClipRect();
         }
         if (st.hasDocMesh && !st.pickStatus.empty()) {
@@ -2070,9 +2070,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             ImVec2 p1(vr1.x - 12, vr0.y + 12);
             ImVec2 p0(p1.x - ts.x - 20.0f, p1.y);
             ImVec2 p1b(p1.x, p1.y + ts.y + 10.0f);
-            vdl->AddRectFilled(p0, p1b, overlayBg, 6.0f);
-            vdl->AddRect(p0, p1b, overlayBord, 6.0f);
-            vdl->AddText(ImVec2(p0.x + 10, p0.y + 5), overlayTxt,
+            vdl->AddRectFilled(p0, p1b, overlayBg, 6.0f * ui::uiScale);
+            vdl->AddRect(p0, p1b, overlayBord, 6.0f * ui::uiScale);
+            vdl->AddText(ImVec2(p0.x + 10 * ui::uiScale, p0.y + 5 * ui::uiScale), overlayTxt,
                          st.pickStatus.c_str());
         }
 
@@ -2297,7 +2297,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     ImVec4(a.col[0], a.col[1], a.col[2], 0.95f));
                 vdl->AddLine(ImVec2(cx, cy), tip, col, 1.8f);
             }
-            vdl->AddCircleFilled(ImVec2(cx, cy), 2.4f, overlayTxt);
+            vdl->AddCircleFilled(ImVec2(cx, cy), 2.4f * ts, overlayTxt);
 
             // Draw buttons + labels on top.
             ImGui::PushID("##triad");
@@ -2340,8 +2340,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     ImVec4(a.col[0], a.col[1], a.col[2], 0.95f));
                 ImVec2 lp(tip.x - 3, tip.y - 7);
                 ImVec2 lts = ImGui::CalcTextSize(a.l);
-                vdl->AddRectFilled(ImVec2(lp.x - 2, lp.y - 1),
-                                   ImVec2(lp.x + lts.x + 2, lp.y + lts.y + 1), overlayBg, 2.0f);
+                vdl->AddRectFilled(ImVec2(lp.x - 2 * ts, lp.y - 1 * ts),
+                                   ImVec2(lp.x + lts.x + 2 * ts, lp.y + lts.y + 1 * ts), overlayBg, 2.0f * ts);
                 vdl->AddText(lp, col, a.l);
             }
             ImGui::PopID();
@@ -2356,8 +2356,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             ImVec2 ts = mf->CalcTextSizeA(fs, 1e30f, 0.0f, st.modelInfo.c_str());
             ImVec2 p0(vr0.x + 12, vr1.y - ts.y - 70.0f);
             ImVec2 p1(p0.x + ts.x + 20.0f, p0.y + ts.y + 10.0f);
-            vdl->AddRectFilled(p0, p1, overlayBg, 6.0f);
-            vdl->AddText(mf, fs, ImVec2(p0.x + 10, p0.y + 5),
+            vdl->AddRectFilled(p0, p1, overlayBg, 6.0f * ui::uiScale);
+            vdl->AddText(mf, fs, ImVec2(p0.x + 10 * ui::uiScale, p0.y + 5 * ui::uiScale),
                          overlayTxt, st.modelInfo.c_str());
         }
         // ---- reference-plane name chips (projected to screen) ----
@@ -2395,11 +2395,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 // overlap heavily near the origin; the labels are unambiguous).
                 bool chipHovered = st.sketchPlanePickActive &&
                                    ImGui::IsMouseHoveringRect(q0, q1);
-                vdl->AddRectFilled(q0, q1, overlayBg, 4.0f);
+                vdl->AddRectFilled(q0, q1, overlayBg, 4.0f * ui::uiScale);
                 vdl->AddRect(q0, q1, chipHovered ? ui::Palette::toU32(vpal.accent)
-                                                 : planeChipBord, 4.0f, 0,
+                                                 : planeChipBord, 4.0f * ui::uiScale, 0,
                              chipHovered ? 2.0f : 1.0f);
-                vdl->AddText(ImVec2(x0 + 6, y0 + 3), overlayTxt, nm);
+                vdl->AddText(ImVec2(x0 + 6 * ui::uiScale, y0 + 3 * ui::uiScale), overlayTxt, nm);
                 if (chipHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
                     st.sketchMode) {
                     static const char* kPlaneSel[3] = {"plane.front", "plane.top", "plane.right"};

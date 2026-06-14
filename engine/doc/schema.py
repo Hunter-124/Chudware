@@ -221,8 +221,12 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
     # fillet: edges/radius required only on the normal path; the full_round path
     # uses params.full_round + refs.middle_face (enforced in _validate_feature).
     "fillet": {"params": [], "refs": {"edges": (_SEL_LIST, False),
-                                      "middle_face": (_SEL_OR_DATUM, False)}},
-    "chamfer": {"params": ["length"], "refs": {"edges": (_SEL_LIST, True)}},
+                                      "middle_face": (_SEL_OR_DATUM, False),
+                                      "face_set_a": (_SEL_LIST, False),
+                                      "face_set_b": (_SEL_LIST, False)}},
+    "chamfer": {"params": ["length"], "refs": {"edges": (_SEL_LIST, False),
+                                               "vertices": (_SEL_LIST, False),
+                                               "reference_face": (_SEL_OR_DATUM, False)}},
     "shell": {"params": ["thickness"], "refs": {"remove": (_SEL_LIST, False)}},
     "draft": {"params": ["angle"], "refs": {"neutral": (_SEL_OR_DATUM, True),
                                             "pull": (_SEL_OR_DATUM, False),
@@ -589,15 +593,29 @@ def validate_feature(
         errs += _validate_sketch_params(params, f"{where}.params", globals_names)
 
     if ftype == "fillet":
-        # Conditional requiredness: full_round needs middle_face; else edges+radius.
+        # Conditional requiredness: full_round needs middle_face; face fillet needs two face
+        # sets; else edges + radius.
         if params.get("full_round"):
             if not refs.get("middle_face"):
                 errs.append(f"{where}.refs.middle_face: required for full_round fillet")
+        elif params.get("face_fillet"):
+            if not refs.get("face_set_a") or not refs.get("face_set_b"):
+                errs.append(f"{where}.refs.face_set_a/face_set_b: required for face fillet")
+            if "radius" not in params:
+                errs.append(f"{where}.params.radius: required for fillet")
         else:
             if "radius" not in params:
                 errs.append(f"{where}.params.radius: required for fillet")
             if not refs.get("edges"):
                 errs.append(f"{where}.refs.edges: required for fillet")
+
+    if ftype == "chamfer":
+        # Vertex chamfer needs vertices; otherwise the standard edge list.
+        if params.get("vertex_chamfer"):
+            if not refs.get("vertices"):
+                errs.append(f"{where}.refs.vertices: required for vertex chamfer")
+        elif not refs.get("edges"):
+            errs.append(f"{where}.refs.edges: required for chamfer")
 
     known_slots = spec["refs"]
     for slot, (form, required) in known_slots.items():

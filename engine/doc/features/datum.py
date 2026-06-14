@@ -165,6 +165,148 @@ def _edge_line_dir(edge, slot: str) -> tuple[Vector, Vector]:
     return Vector(p0), d
 
 
+def _curve_point_tangent(edge, *, fraction: float | None = None,
+                         param: float | None = None,
+                         near: Vector | None = None,
+                         slot: str = "curve") -> tuple[Vector, Vector]:
+    """(point, unit tangent) on a model edge's underlying curve.
+
+    Three ways to land on the curve (first non-None wins):
+      * ``param`` — a raw curve parameter (clamped to the edge's [first, last] range).
+      * ``fraction`` — 0..1 along that parameter range (0 = start, 1 = end).
+      * ``near`` — project a 3-D point onto the curve (nearest foot).
+
+    Uses ``BRepAdaptor_Curve`` for the param range + ``D1`` (point + first derivative); the tangent
+    is the normalised derivative. Falls back to a chord direction when the derivative is degenerate
+    (e.g. a curve whose D1 vanishes at the sampled parameter).
+    """
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnCurve
+    from OCP.gp import gp_Pnt, gp_Vec
+
+    ad = BRepAdaptor_Curve(edge.wrapped)
+    u0, u1 = ad.FirstParameter(), ad.LastParameter()
+    if param is not None:
+        u = max(u0, min(u1, float(param)))
+    elif near is not None:
+        try:
+            geom = ad.Curve().Curve()
+            proj = GeomAPI_ProjectPointOnCurve(gp_Pnt(near.X, near.Y, near.Z), geom)
+            u = proj.LowerDistanceParameter() if proj.NbPoints() > 0 else 0.5 * (u0 + u1)
+        except Exception:  # noqa: BLE001
+            u = 0.5 * (u0 + u1)
+        u = max(u0, min(u1, float(u)))
+    else:
+        fr = 0.5 if fraction is None else float(fraction)
+        fr = max(0.0, min(1.0, fr))
+        u = u0 + fr * (u1 - u0)
+
+    p = gp_Pnt()
+    dv = gp_Vec()
+    ad.D1(u, p, dv)
+    point = Vector(p.X(), p.Y(), p.Z())
+    tangent = Vector(dv.X(), dv.Y(), dv.Z())
+    if tangent.length < 1e-9:
+        # Degenerate derivative — use a chord toward the far end of the range.
+        far = ad.Value(u1 if abs(u - u0) < abs(u - u1) else u0)
+        tangent = Vector(far.X() - point.X, far.Y() - point.Y, far.Z() - point.Z)
+    if tangent.length < 1e-9:
+        raise FeatureError(f"{slot}: cannot evaluate a curve tangent (degenerate curve)")
+    return point, tangent.normalized()
+
+
+def _surface_point_normal(face, near: Vector, slot: str) -> tuple[Vector, Vector]:
+    """(surface point, unit outward normal) on a face nearest *near*.
+
+    Projects *near* onto the face's underlying ``Geom_Surface`` and evaluates the normal there via
+    ``GeomLProp_SLProps``. The normal is flipped to agree with the face's stored orientation (so a
+    reversed face still yields its true outward normal). For a planar face this is the constant plane
+    normal regardless of *near*.
+    """
+    from OCP.BRep import BRep_Tool
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+    from OCP.GeomLProp import GeomLProp_SLProps
+    from OCP.gp import gp_Pnt
+    from OCP.TopAbs import TopAbs_REVERSED
+
+    surf = BRep_Tool.Surface_s(face.wrapped)
+    proj = GeomAPI_ProjectPointOnSurf(gp_Pnt(near.X, near.Y, near.Z), surf)
+    if not proj.IsDone() or proj.NbPoints() < 1:
+        raise FeatureError(f"{slot}: could not project the point onto the surface")
+    u, v = proj.LowerDistanceParameters()
+    sp = proj.NearestPoint()
+    point = Vector(sp.X(), sp.Y(), sp.Z())
+    sl = GeomLProp_SLProps(surf, u, v, 1, 1e-7)
+    if not sl.IsNormalDefined():
+        raise FeatureError(f"{slot}: surface normal is undefined at the projected point")
+    n = sl.Normal()
+    normal = Vector(n.X(), n.Y(), n.Z())
+    if normal.length < 1e-9:
+        raise FeatureError(f"{slot}: degenerate surface normal")
+    try:
+        if face.wrapped.Orientation() == TopAbs_REVERSED:
+            normal = normal * -1.0
+    except Exception:  # noqa: BLE001
+        pass
+    return point, normal.normalized()
+
+
+def _body_centroid(body) -> Vector:
+    """Volume centre of mass of a solid body (its build123d ``Shape``)."""
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+
+    props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(body.wrapped, props)
+    cm = props.CentreOfMass()
+    return Vector(cm.X(), cm.Y(), cm.Z())
+
+
+def _face_centroid(face) -> Vector:
+    """Area centre of mass of a face."""
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+
+    props = GProp_GProps()
+    BRepGProp.SurfaceProperties_s(face.wrapped, props)
+    cm = props.CentreOfMass()
+    return Vector(cm.X(), cm.Y(), cm.Z())
+
+
+def _shape_shape_point(shape_a, shape_b, slot: str, *, what: str,
+                       touch_tol: float = 1e-4) -> Vector:
+    """The meeting point of two TopoDS shapes via ``BRepExtrema_DistShapeShape``.
+
+    This respects edge/face TRIMMING exactly (unlike a raw infinite-curve extrema, whose underlying
+    ``Geom`` parametrization need not align with the edge's): for shapes that touch, the minimal
+    distance is ~0 and the solution point IS the intersection; when the minimal distance exceeds
+    *touch_tol*, the shapes do not actually intersect and a contained error is raised.
+    """
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+
+    try:
+        d = BRepExtrema_DistShapeShape(shape_a, shape_b)
+    except Exception as exc:  # noqa: BLE001
+        raise FeatureError(f"{slot}: {what} distance computation failed ({exc})")
+    if not d.IsDone() or d.NbSolution() < 1:
+        raise FeatureError(f"{slot}: {what} have no common point")
+    if d.Value() > touch_tol:
+        raise FeatureError(
+            f"{slot}: {what} do not intersect (gap {d.Value():.4g} mm)")
+    p = d.PointOnShape1(1)
+    return Vector(p.X(), p.Y(), p.Z())
+
+
+def _curve_curve_point(edge_a, edge_b, slot: str) -> Vector:
+    """Intersection point of two model edges (trimming-respecting; errors if they don't meet)."""
+    return _shape_shape_point(edge_a.wrapped, edge_b.wrapped, slot, what="curves")
+
+
+def _curve_surface_point(edge, face, slot: str) -> Vector:
+    """Intersection point of a model edge with a face (trimming-respecting)."""
+    return _shape_shape_point(edge.wrapped, face.wrapped, slot, what="curve and surface")
+
+
 def _plane_of(ref: Any, ctx: CompileContext, body, slot: str) -> Plane:
     """Resolve a planar datum OR a planar face selector to a build123d ``Plane``."""
     if _is_datum_ref(ref):
@@ -282,6 +424,78 @@ def compile_plane(feat: dict, ctx: CompileContext) -> CompileOutput:
             raise FeatureError(f"plane three_point: failed to build plane: {exc}")
         return CompileOutput(bodies=list(ctx.bodies), datum=Datum("plane", plane, fid))
 
+    if method == "parallel_point":
+        # A plane PARALLEL to a base plane (datum or planar face), shifted so its origin sits on a
+        # picked point. Same orientation as the base; origin = the through-point.
+        body = ctx.bodies[-1] if ctx.bodies else None
+        base = _plane_of(refs.get("base", "plane.top"), ctx, body, "base")
+        pts_ref = refs.get("points")
+        if not isinstance(pts_ref, list) or not pts_ref:
+            raise FeatureError(
+                "plane parallel_point: refs.points[0] (a through-point) is required")
+        thru = _vertex_point(pts_ref[0], ctx, body, "points[0]")
+        try:
+            plane = Plane(origin=thru, x_dir=base.x_dir, z_dir=base.z_dir)
+        except Exception as exc:  # noqa: BLE001
+            raise FeatureError(f"plane parallel_point: failed to build plane: {exc}")
+        return CompileOutput(bodies=list(ctx.bodies), datum=Datum("plane", plane, fid))
+
+    if method == "normal_to_curve":
+        # A plane whose NORMAL is the tangent of a curve at a point (the classic "plane normal to
+        # an edge/curve" — used to start a sweep profile perpendicular to its path). The curve is
+        # refs.second (a model edge or a datum axis); the landing point is refs.points[0] (a vertex,
+        # projected onto the curve) OR params.fraction / params.t along the curve.
+        body = _last_body(ctx, "plane normal_to_curve")
+        curve = refs.get("second")
+        if curve is None:
+            raise FeatureError("plane normal_to_curve: refs.second (the curve edge) is required")
+        if _is_datum_ref(curve):
+            d = ctx.datum(curve)
+            if d.kind != "axis":
+                raise FeatureError("plane normal_to_curve: datum curve must be an axis")
+            origin = Vector(d.obj.position)
+            normal = Vector(d.obj.direction)
+            pts_ref = refs.get("points")
+            if isinstance(pts_ref, list) and pts_ref:
+                origin = _vertex_point(pts_ref[0], ctx, body, "points[0]")
+        else:
+            edge = _resolve_sel(curve, body, "edge", "second")
+            near = None
+            pts_ref = refs.get("points")
+            if isinstance(pts_ref, list) and pts_ref:
+                near = _vertex_point(pts_ref[0], ctx, body, "points[0]")
+            fraction = (ctx.dim(params, "fraction", None)
+                        if "fraction" in params else None)
+            param = ctx.dim(params, "t", None) if "t" in params else None
+            origin, normal = _curve_point_tangent(
+                edge, fraction=fraction, param=param, near=near, slot="second")
+        try:
+            plane = Plane(origin=origin, z_dir=normal)
+        except Exception as exc:  # noqa: BLE001
+            raise FeatureError(f"plane normal_to_curve: failed to build plane: {exc}")
+        return CompileOutput(bodies=list(ctx.bodies), datum=Datum("plane", plane, fid))
+
+    if method == "on_surface":
+        # A plane TANGENT to a surface at a point: z_dir = the surface normal at the projected
+        # point, origin = that surface point. refs.base is the face; refs.points[0] is the point to
+        # project (defaults to the face centroid).
+        body = _last_body(ctx, "plane on_surface")
+        face_ref = refs.get("base")
+        if face_ref is None or _is_datum_ref(face_ref):
+            raise FeatureError("plane on_surface: refs.base (a surface face) is required")
+        face = _resolve_sel(face_ref, body, "face", "base")
+        pts_ref = refs.get("points")
+        if isinstance(pts_ref, list) and pts_ref:
+            near = _vertex_point(pts_ref[0], ctx, body, "points[0]")
+        else:
+            near = _face_centroid(face)
+        origin, normal = _surface_point_normal(face, near, "base")
+        try:
+            plane = Plane(origin=origin, z_dir=normal)
+        except Exception as exc:  # noqa: BLE001
+            raise FeatureError(f"plane on_surface: failed to build plane: {exc}")
+        return CompileOutput(bodies=list(ctx.bodies), datum=Datum("plane", plane, fid))
+
     raise FeatureError(f"plane: unknown method '{method}'")
 
 
@@ -359,6 +573,51 @@ def compile_axis(feat: dict, ctx: CompileContext) -> CompileOutput:
         return CompileOutput(bodies=list(ctx.bodies),
                              datum=Datum("axis", Axis(point, direction), fid))
 
+    if method == "on_surface":
+        # An axis derived from a surface. Two sub-cases, by what refs.a is:
+        #   * a FACE — use the surface's intrinsic direction: a cylinder/cone gives its revolve
+        #     axis (through the face center); a planar face gives its normal (the extrude/pull
+        #     direction) through the face center.
+        #   * a POINT (vertex/datum) — combined with refs.b (a second on-surface point), the axis
+        #     is the line through the two points.
+        body = _last_body(ctx, "axis on_surface")
+        a = refs.get("a")
+        if a is None:
+            raise FeatureError(
+                "axis on_surface: refs.a (a surface face, or a point with refs.b) is required")
+        # Two-point form: a + b are both points.
+        b = refs.get("b")
+        a_is_point = _is_datum_ref(a) and ctx.datum(a).kind == "point" if _is_datum_ref(a) \
+            else (isinstance(a, dict) and a.get("kind") == "vertex")
+        if a_is_point or b is not None:
+            pa = _vertex_point(a, ctx, body, "a")
+            if b is None:
+                raise FeatureError("axis on_surface: a point ref.a needs refs.b (a second point)")
+            pb = _vertex_point(b, ctx, body, "b")
+            d = pb - pa
+            if d.length < 1e-9:
+                raise FeatureError("axis on_surface: coincident points")
+            return CompileOutput(bodies=list(ctx.bodies),
+                                 datum=Datum("axis", Axis(pa, d), fid))
+        # Face form.
+        if _is_datum_ref(a):
+            raise FeatureError("axis on_surface: datum ref.a must be a point (use refs.b for a 2nd)")
+        face = _resolve_sel(a, body, "face", "a")
+        from OCP.BRepAdaptor import BRepAdaptor_Surface
+        from OCP.GeomAbs import GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Plane
+        st = BRepAdaptor_Surface(face.wrapped).GetType()
+        if st in (GeomAbs_Cylinder, GeomAbs_Cone):
+            loc, direction = _face_axis(face, "a")
+        elif st == GeomAbs_Plane:
+            center = _face_centroid(face)
+            _, direction = _surface_point_normal(face, center, "a")
+            loc = center
+        else:
+            raise FeatureError(
+                "axis on_surface: face must be planar (normal) or cylindrical/conical (revolve axis)")
+        return CompileOutput(bodies=list(ctx.bodies),
+                             datum=Datum("axis", Axis(loc, direction), fid))
+
     raise FeatureError(f"axis: unknown method '{method}'")
 
 
@@ -371,7 +630,32 @@ def compile_point(feat: dict, ctx: CompileContext) -> CompileOutput:
     refs = feat.get("refs", {})
     fid = feat["id"]
     method = params.get("method", "vertex")
+
+    if method == "coordinate":
+        # An explicit XYZ point — no geometry reference needed (params.coordinate = [x, y, z], or
+        # the per-axis params x / y / z, defaulting to the origin).
+        coord = params.get("coordinate")
+        if isinstance(coord, (list, tuple)) and len(coord) >= 3:
+            try:
+                p = Vector(float(coord[0]), float(coord[1]), float(coord[2]))
+            except (TypeError, ValueError):
+                raise FeatureError("point coordinate: params.coordinate must be three numbers")
+        else:
+            p = Vector(ctx.dim(params, "x", 0.0),
+                       ctx.dim(params, "y", 0.0),
+                       ctx.dim(params, "z", 0.0))
+        return CompileOutput(bodies=list(ctx.bodies), datum=Datum("point", p, fid))
+
     target = refs.get("target")
+
+    if method == "centroid" and (params.get("body")
+                                 or (isinstance(target, dict) and target.get("kind") == "body")):
+        # Volume centre of mass of the whole running body — needs no target.
+        body = _last_body(ctx, "point centroid")
+        p = _body_centroid(body)
+        return CompileOutput(bodies=list(ctx.bodies),
+                             datum=Datum("point", Vector(p.X, p.Y, p.Z), fid))
+
     if target is None:
         raise FeatureError("point: refs.target is required")
 
@@ -427,6 +711,48 @@ def compile_point(feat: dict, ctx: CompileContext) -> CompileOutput:
             p = Vector(face.center())
         return CompileOutput(bodies=list(ctx.bodies),
                              datum=Datum("point", Vector(p.X, p.Y, p.Z), fid))
+
+    if method == "on_curve":
+        # A point AT a parameter / fraction along a curve. refs.target is a model edge; the landing
+        # is params.fraction (0..1 along the curve, default 0.5 = midpoint) or params.t (a raw
+        # curve parameter).
+        edge = _resolve_sel(target, body, "edge", "target")
+        fraction = ctx.dim(params, "fraction", None) if "fraction" in params else None
+        param = ctx.dim(params, "t", None) if "t" in params else None
+        p, _ = _curve_point_tangent(edge, fraction=fraction, param=param, slot="target")
+        return CompileOutput(bodies=list(ctx.bodies),
+                             datum=Datum("point", Vector(p.X, p.Y, p.Z), fid))
+
+    if method == "intersection":
+        # Intersection of refs.target (a curve edge) with params.other (a second curve edge OR a
+        # surface face). Curve-curve uses nearest-approach; curve-surface uses GeomAPI_IntCS.
+        edge = _resolve_sel(target, body, "edge", "target")
+        other = params.get("other")
+        if not isinstance(other, dict):
+            raise FeatureError(
+                "point intersection: params.other (a second edge or a face selector) is required")
+        okind = other.get("kind")
+        if okind == "edge":
+            edge2 = _resolve_sel(other, body, "edge", "other")
+            p = _curve_curve_point(edge, edge2, "other")
+        elif okind == "face":
+            face = _resolve_sel(other, body, "face", "other")
+            p = _curve_surface_point(edge, face, "other")
+        else:
+            raise FeatureError("point intersection: params.other must be an edge or face selector")
+        return CompileOutput(bodies=list(ctx.bodies),
+                             datum=Datum("point", Vector(p.X, p.Y, p.Z), fid))
+
+    if method == "centroid":
+        # Area centre of mass of a picked face. (The whole-body volume centroid — params.body or a
+        # body target — is handled earlier, before the target-required guard.)
+        if isinstance(target, dict) and target.get("kind") == "face":
+            face = _resolve_sel(target, body, "face", "target")
+            p = _face_centroid(face)
+            return CompileOutput(bodies=list(ctx.bodies),
+                                 datum=Datum("point", Vector(p.X, p.Y, p.Z), fid))
+        raise FeatureError(
+            "point centroid: target must be a face, or pass params.body for the body centroid")
 
     raise FeatureError(f"point: unknown method '{method}'")
 

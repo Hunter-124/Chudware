@@ -80,15 +80,24 @@ Build: `cmake -S host -B host/build -G "Visual Studio 17 2022" -A x64 && cmake -
 - **Simulation in the GUI (S):** a Simulate button + Transient/AC selector runs the native solver
   (`ecad_simulate` RPC) and plots V/I traces (transient) or a Bode magnitude rolloff (AC) in the
   editor's Simulation tab.
+- **Undo/redo in the GUI (T):** toolbar Undo/Redo buttons + Ctrl+Z / Ctrl+Y (focus-gated to the ECAD
+  window so they never collide with the CAD doc's history) drive the worker's `ecad_undo`/`ecad_redo`.
+- **One-click AI board (U):** an "AI Board" launchpad button chains the whole flow — `ecad_design`
+  (schematic) → `ecad_new` pcb → `ecad_update_from_sch` (populate footprints + bound nets) →
+  auto-sized rectangular `pcb_set_outline` (bbox over all pads + 5mm margin) → `ecad_autoroute` →
+  load the routed board into the editor. AI-designed schematics now carry footprints
+  (`_DEFAULT_FOOTPRINTS` in `orchestrator.py`) so the board populates with real parts. Verified via
+  `AI_CAD_ECAD_KIND=aiboard` (routed divider board: 2× R_0603 + outline + track). Hands off directly
+  to **Board to 3D** for enclosure design — closing the schematic→PCB→3D→housing loop.
 
 **GUI follow-ups (not blocking):** PropertyManager forms for ECAD ops (new `PMFieldKind`s — guide §f);
-ECAD undo/redo on Ctrl+Z/Y; move the editor mirror onto AppState for multi-doc; `ecad_open` file dialog.
+move the editor mirror onto AppState for multi-doc; `ecad_open` file dialog.
 
 ## Remaining work / known debt (prioritized)
 
 1. **GUI editor polish** — place/route/select/delete/move + AI launchpad + PCB→3D bridge +
-   simulation plot (transient & AC) are DONE (Waves N–S); remaining: PropertyManager forms for ECAD
-   ops, ECAD undo/redo (Ctrl+Z/Y), multi-doc, `ecad_open` file dialog.
+   simulation plot (transient & AC) + undo/redo + one-click AI→routed board are DONE (Waves N–U);
+   remaining: PropertyManager forms for ECAD ops, multi-doc, `ecad_open` file dialog.
 2. **Full bus routing** (electrical): member labels already net correctly (KiCad's bus is largely a
    drawing convenience over labels); explicit bus-wire + bus-entry tap objects are a follow-up.
 3. **Advanced routing**: push-and-shove (router is eviction-based rip-up + maze, not negotiated-

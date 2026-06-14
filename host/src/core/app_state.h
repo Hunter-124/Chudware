@@ -278,6 +278,8 @@ struct AppState {
     int         wantFocusEcad = 0;          // frames to keep forcing the ECAD tab forward (AI Design)
     std::string ecadAiRequest;              // NL circuit request from the ECAD launchpad
     bool        ecadAiGo = false;           // one-shot: run ecad_design(ecadAiRequest) this frame
+    bool        ecadAiBoardGo = false;      // one-shot: AI-design a schematic, then create+populate+
+                                            // outline+autoroute a board from it (reuses ecadAiRequest)
     int         ecadTool = 0;               // ECAD canvas tool: 0=Select 1=Place 2=Route
     nlohmann::json ecadPendingOps;          // ops the ECAD canvas wants applied (place/route clicks)
     bool        ecadOpsGo = false;          // one-shot: apply ecadPendingOps via ecad_apply_ops

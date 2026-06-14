@@ -582,6 +582,17 @@ void drawEcadEditor(AppState& st) {
             st.ecadAiRequest = aibuf;
             st.ecadAiGo = true;
         }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Generate a verified schematic from the description.");
+        ImGui::SameLine();
+        if (ImGui::Button("AI Board", ImVec2(110 * sc, 0))) {
+            // One-click all the way to a routed PCB: design the schematic, then populate +
+            // outline + autoroute a board from it (ecadAiBoard in the app loop).
+            st.ecadAiRequest = aibuf;
+            st.ecadAiBoardGo = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Schematic + populated, outlined, autorouted PCB - ready for Board to 3D.");
         ImGui::Dummy(ImVec2(0, 6 * sc));
         ImGui::TextColored(v4(pal.textDisabled),
             "examples:  inverting amp gain 10    RC low-pass 1kHz    555 astable");

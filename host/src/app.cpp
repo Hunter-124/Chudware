@@ -239,6 +239,87 @@ void ecadAiDesign(AppState& st, const std::string& request) {
              recipe.empty() ? "AI design ready" : ("AI design ready (recipe: " + recipe + ")"));
 }
 
+// One-click "AI Board": NL request -> AI designs a schematic -> a board is created, populated from
+// the schematic's netlist (real footprints + pads + bound nets), given an auto-sized rectangular
+// outline, and autorouted. The finished board is loaded into the ECAD editor. Each step is a blocking
+// worker RPC mirroring ecadAiDesign's shape; every ops-response is adopted into the editor mirror so
+// st.ecadDocId/revision track the board and the canvas reflects each stage.
+void ecadAiBoard(AppState& st, const std::string& request) {
+    if (request.empty()) return;
+    st.toast(ui::ToastLevel::Info, "AI Board: designing \"" + request + "\" ...");
+    st.addLog("[ecad] AI board: " + request);
+
+    // a. Design the schematic.
+    nlohmann::json res;
+    if (!ecadCall(st, "ecad_design", {{"request", request}}, res)) return;
+    const std::string schId = jstr(res, "doc_id");
+    if (schId.empty()) { st.toast(ui::ToastLevel::Warn, "AI board: design produced no schematic"); return; }
+    st.addLog("[ecad] AI board: schematic " + schId);
+
+    // b. New empty PCB doc (ecadAdopt tracks st.ecadDocId = pcbId + revision).
+    nlohmann::json pcbRes;
+    if (!ecadCall(st, "ecad_new", {{"kind", "pcb"}}, pcbRes)) return;
+    ecadAdopt(st, pcbRes);
+    const std::string pcbId = st.ecadDocId;
+    if (pcbId.empty()) { st.toast(ui::ToastLevel::Warn, "AI board: new board failed"); return; }
+
+    // c. Populate the board from the schematic netlist (places footprints with bound nets). The
+    //    response carries the populated board tree -> adopt so the mirror has the footprints.
+    nlohmann::json upd;
+    if (!ecadCall(st, "ecad_update_from_sch", {{"board_doc_id", pcbId}, {"sch_doc_id", schId}}, upd))
+        return;
+    ecadAdopt(st, upd);
+
+    // d. Auto-outline: axis-aligned bbox over every footprint pad's world position (inflated by the
+    //    pad half-extent so pads sit inside the edge), padded by ~5mm, applied as a 4-line rectangle.
+    {
+        const auto& fps = ui::ecadEditorMirror().footprints();
+        bool any = false;
+        float minX = 1e30f, minY = 1e30f, maxX = -1e30f, maxY = -1e30f;
+        for (const auto& fp : fps) {
+            for (const auto& pad : fp.pads) {
+                const float hx = 0.5f * pad.w, hy = 0.5f * pad.h;
+                minX = std::min(minX, pad.pos.x - hx); maxX = std::max(maxX, pad.pos.x + hx);
+                minY = std::min(minY, pad.pos.y - hy); maxY = std::max(maxY, pad.pos.y + hy);
+                any = true;
+            }
+            if (fp.pads.empty()) {  // footprint with no parsed pads -> fall back to its origin
+                minX = std::min(minX, fp.pos.x); maxX = std::max(maxX, fp.pos.x);
+                minY = std::min(minY, fp.pos.y); maxY = std::max(maxY, fp.pos.y);
+                any = true;
+            }
+        }
+        if (any) {
+            const float m = 5.0f;  // edge margin (mm)
+            minX -= m; minY -= m; maxX += m; maxY += m;
+            nlohmann::json shapes = nlohmann::json::array({
+                {{"type","line"},{"p1",{minX,minY}},{"p2",{maxX,minY}}},
+                {{"type","line"},{"p1",{maxX,minY}},{"p2",{maxX,maxY}}},
+                {{"type","line"},{"p1",{maxX,maxY}},{"p2",{minX,maxY}}},
+                {{"type","line"},{"p1",{minX,maxY}},{"p2",{minX,minY}}}});
+            nlohmann::json ops = nlohmann::json::array();
+            ops.push_back({{"op","pcb_set_outline"},{"closed",true},{"shapes",shapes}});
+            ecadApplyOps(st, ops);  // adopts the result (tracks revision)
+            st.addLog("[ecad] AI board: outline " +
+                      std::to_string((int)(maxX - minX)) + "x" + std::to_string((int)(maxY - minY)) + "mm");
+        } else {
+            st.addLog("[ecad] AI board: no footprints - skipping outline");
+        }
+    }
+
+    // e. Autoroute the ratsnest.
+    nlohmann::json route;
+    if (ecadCall(st, "ecad_autoroute", {{"doc_id", pcbId}}, route)) ecadAdopt(st, route);
+
+    // f. Final tree refresh -> ensure the editor shows the finished board.
+    nlohmann::json tree;
+    if (ecadCall(st, "ecad_tree", {{"doc_id", pcbId}}, tree)) ecadAdopt(st, tree);
+
+    st.wantFocusEcad = 6;  // surface the ECAD tab so the routed board is visible
+    st.toast(ui::ToastLevel::Info, "AI board ready - Board to 3D builds the enclosure");
+    st.addLog("[ecad] AI board ready: " + pcbId);
+}
+
 // Native circuit simulation (ecad_simulate): build an analysis study from st.ecadSimAnalysis
 // (0=Transient, 1=AC), run it on the worker, and stash the results payload so the ECAD plot panel
 // renders the waveforms. Only schematic docs simulate.
@@ -1186,9 +1267,18 @@ int run_gui(const char* screenshotPath) {
             const bool wantDel    = kindEnv && std::strcmp(kindEnv, "del") == 0;     // delete a symbol
             const bool wantSim    = kindEnv && std::strcmp(kindEnv, "sim") == 0;     // simulate + plot
             const bool wantUndo   = kindEnv && std::strcmp(kindEnv, "undo") == 0;    // history undo
+            const bool wantAiBoard = kindEnv && std::strcmp(kindEnv, "aiboard") == 0; // Wave U one-click
             nlohmann::json r;
             std::string showId;
-            if (wantAi) {
+            if (wantAiBoard) {
+                // Wave U capstone: drive the full one-click flow (design -> populate -> outline ->
+                // autoroute). ecadAiBoard adopts the finished board into the editor mirror itself, so
+                // there is no showId to tree-load below; the screenshot captures the routed PCB.
+                ecadAiBoard(st, "5V resistive divider with 2.5V output");
+                std::printf("[ecad-shot] aiboard: doc=%s footprints=%d tracks(adopted)\n",
+                            st.ecadDocId.c_str(), (int)ui::ecadEditorMirror().footprints().size());
+                std::fflush(stdout);
+            } else if (wantAi) {
                 st.wantFocusEcad = 6;   // surface the empty AI launchpad for the screenshot
             } else if (wantEdit || wantSelect || wantDel) {
                 // Exercise the Place/Route tools by applying the ops a user's clicks would produce.
@@ -1471,6 +1561,7 @@ int run_gui(const char* screenshotPath) {
         if (st.wantFocusEcad > 0) { ImGui::SetNextWindowFocus(); st.wantFocusEcad--; }
         ui::drawEcadEditor(st);   // Wave N: AI-ECAD 2D editor (launchpad until an ECAD doc loads)
         if (st.ecadAiGo) { st.ecadAiGo = false; ecadAiDesign(st, st.ecadAiRequest); }  // Wave P
+        if (st.ecadAiBoardGo) { st.ecadAiBoardGo = false; ecadAiBoard(st, st.ecadAiRequest); }  // Wave U
         if (st.ecadOpsGo) { st.ecadOpsGo = false; ecadApplyOps(st, st.ecadPendingOps); }  // Wave Q
         if (st.ecadSimGo) { st.ecadSimGo = false; ecadSimulate(st); }  // native simulator
         if (st.ecadUndoGo) { st.ecadUndoGo = false; ecadUndo(st); }  // ECAD history undo

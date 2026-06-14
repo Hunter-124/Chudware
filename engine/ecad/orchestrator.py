@@ -346,6 +346,21 @@ def _is_power_rail(net_name: str) -> bool:
     return bool(_POWER_RAIL_RE.match(net_name.strip()))
 
 
+# Default footprints by libid so AI-designed schematics are board-ready (the update-from-sch ->
+# autoroute -> 3D flow needs footprints). All fpids resolve in the clean-room starter library.
+# Sources / power symbols are intentionally absent (not placed on a board).
+_DEFAULT_FOOTPRINTS = {
+    "Device:R": "Resistor_SMD:R_0603",
+    "Device:C": "Capacitor_SMD:C_0603",
+    "Device:D": "Diode_SMD:D_SMA",
+    "Device:LED": "LED_SMD:LED_0805",
+    "Device:Q_NPN": "Package_TO_SOT_SMD:SOT-23",
+    "Device:Q_PNP": "Package_TO_SOT_SMD:SOT-23",
+    "Amplifier_Operational:OPAMP_dual": "Package_SO:SOIC-8",
+    "Timer:NE555": "Package_DIP:DIP-8",
+}
+
+
 def build_design(session: ecad_session.EcadSession, design: dict) -> dict:
     """Materialize *design* onto *session* via ECAD ops. Returns a build summary.
 
@@ -363,6 +378,9 @@ def build_design(session: ecad_session.EcadSession, design: dict) -> dict:
               "pos": _layout_pos(i)}
         if c.get("value") not in (None, ""):
             op["value"] = str(c["value"])
+        fp = c.get("footprint") or _DEFAULT_FOOTPRINTS.get(c["libid"])
+        if fp:
+            op["footprint"] = fp  # board-ready: update-from-sch can place a real footprint
         place_ops.append(op)
     resp = ecad_session.apply_ops(session, session.revision, place_ops)
     ops_applied = len(place_ops)

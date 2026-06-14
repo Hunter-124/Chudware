@@ -77,15 +77,18 @@ Build: `cmake -S host -B host/build -G "Visual Studio 17 2022" -A x64 && cmake -
 `docs/ECAD_UI_INTEGRATION.md` documents the wiring. NOTE: the worker runs STAGED app code at
 `%APPDATA%\AI-CAD\app` — engine edits need re-staging to reach a running GUI.
 
+- **Simulation in the GUI (S):** a Simulate button + Transient/AC selector runs the native solver
+  (`ecad_simulate` RPC) and plots V/I traces (transient) or a Bode magnitude rolloff (AC) in the
+  editor's Simulation tab.
+
 **GUI follow-ups (not blocking):** PropertyManager forms for ECAD ops (new `PMFieldKind`s — guide §f);
-ECAD undo/redo on Ctrl+Z/Y; move the editor mirror onto AppState for multi-doc; **simulation waveform
-plot** (run sim from the schematic and graph V/I traces); `ecad_open` file dialog.
+ECAD undo/redo on Ctrl+Z/Y; move the editor mirror onto AppState for multi-doc; `ecad_open` file dialog.
 
 ## Remaining work / known debt (prioritized)
 
-1. **GUI editor polish** — interactive place/route/select/delete/move is DONE (Waves Q/R); remaining:
-   a **simulation waveform plot** (run sim from the schematic, graph V/I traces — the engine already
-   computes them), PropertyManager forms for ECAD ops, ECAD undo/redo (Ctrl+Z/Y), multi-doc.
+1. **GUI editor polish** — place/route/select/delete/move + AI launchpad + PCB→3D bridge +
+   simulation plot (transient & AC) are DONE (Waves N–S); remaining: PropertyManager forms for ECAD
+   ops, ECAD undo/redo (Ctrl+Z/Y), multi-doc, `ecad_open` file dialog.
 2. **Full bus routing** (electrical): member labels already net correctly (KiCad's bus is largely a
    drawing convenience over labels); explicit bus-wire + bus-entry tap objects are a follow-up.
 3. **Advanced routing**: push-and-shove (router is eviction-based rip-up + maze, not negotiated-

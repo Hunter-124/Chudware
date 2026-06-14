@@ -350,11 +350,11 @@ void ViewSelector::draw(AppState& st, ImDrawList* dl, ImVec2 vr0, ImVec2 vr1) {
         const char* cap = z.view.name;
         ImVec2 ts = ImGui::CalcTextSize(cap);
         ImVec2 cp(io.MousePos.x + 14.0f * s, io.MousePos.y + 14.0f * s);
-        if (cp.x + ts.x + 12 > vr1.x) cp.x = vr1.x - ts.x - 12;
-        if (cp.y + ts.y + 8  > vr1.y) cp.y = vr1.y - ts.y - 8;
-        dl->AddRectFilled(cp, ImVec2(cp.x + ts.x + 12, cp.y + ts.y + 8), overlayBg, 4.0f);
-        dl->AddRect(cp, ImVec2(cp.x + ts.x + 12, cp.y + ts.y + 8), overlayBord, 4.0f);
-        dl->AddText(ImVec2(cp.x + 6, cp.y + 4), overlayTxt, cap);
+        if (cp.x + ts.x + 12 * s > vr1.x) cp.x = vr1.x - ts.x - 12 * s;
+        if (cp.y + ts.y + 8 * s  > vr1.y) cp.y = vr1.y - ts.y - 8 * s;
+        dl->AddRectFilled(cp, ImVec2(cp.x + ts.x + 12 * s, cp.y + ts.y + 8 * s), overlayBg, 4.0f * s);
+        dl->AddRect(cp, ImVec2(cp.x + ts.x + 12 * s, cp.y + ts.y + 8 * s), overlayBord, 4.0f * s);
+        dl->AddText(ImVec2(cp.x + 6 * s, cp.y + 4 * s), overlayTxt, cap);
     }
 
     // ---- C27-D: hover-preview thumbnail panel, top-right ----

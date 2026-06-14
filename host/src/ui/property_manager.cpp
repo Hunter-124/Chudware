@@ -1404,7 +1404,7 @@ void PropertyManager::drawBody(AppState& st) {
         if (ic.valid) {
             ImGui::Image(ic.texId, ImVec2(18.0f * ui::uiScale, 18.0f * ui::uiScale),
                          ic.uv0, ic.uv1);
-            ImGui::SameLine(0, 6);
+            ImGui::SameLine(0, 6 * ui::uiScale);
         }
         pushTextColor(pal.text);
         ImGui::TextUnformatted(title_.c_str());
@@ -1445,7 +1445,7 @@ void PropertyManager::drawBody(AppState& st) {
             bool btnOk;
             if (okIc.valid) {
                 btnOk = ImGui::ImageButton("##pm_ok",
-                    okIc.texId, ImVec2(btnW - 4, btnW - 4), okIc.uv0, okIc.uv1);
+                    okIc.texId, ImVec2(btnW - 4 * ui::uiScale, btnW - 4 * ui::uiScale), okIc.uv0, okIc.uv1);
             } else {
                 btnOk = ImGui::Button("OK##pm", ImVec2(btnW, 0));
             }
@@ -1466,7 +1466,7 @@ void PropertyManager::drawBody(AppState& st) {
             bool btnCancel;
             if (cancelIc.valid) {
                 btnCancel = ImGui::ImageButton("##pm_cancel",
-                    cancelIc.texId, ImVec2(btnW - 4, btnW - 4), cancelIc.uv0, cancelIc.uv1);
+                    cancelIc.texId, ImVec2(btnW - 4 * ui::uiScale, btnW - 4 * ui::uiScale), cancelIc.uv0, cancelIc.uv1);
             } else {
                 btnCancel = ImGui::Button("X##pm", ImVec2(btnW, 0));
             }

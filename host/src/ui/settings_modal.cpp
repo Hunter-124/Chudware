@@ -152,7 +152,7 @@ void drawSettingsModal(AppState& st, bool busy) {
         if (ImGui::BeginTabBar("##settabs")) {
             // ---- General tab: Document (units) + Display (theme) ----
             if (ImGui::BeginTabItem("General")) {
-                ImGui::Dummy(ImVec2(0, 2));
+                ImGui::Dummy(ImVec2(0, 2 * sc));
 
                 ImGui::SeparatorText("Document");
                 ImGui::TextUnformatted("Units");
@@ -174,7 +174,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 }
                 dimText("Changes how lengths display/parse everywhere (saved immediately).");
 
-                ImGui::Dummy(ImVec2(0, 8));
+                ImGui::Dummy(ImVec2(0, 8 * sc));
                 ImGui::SeparatorText("Display");
                 bool isLight = (ui::activeTheme == ui::Theme::Light);
                 if (ImGui::Checkbox("Light theme (SolidWorks-style)", &isLight))
@@ -184,16 +184,16 @@ void drawSettingsModal(AppState& st, bool busy) {
                 helpMarker("Switches the whole UI and viewport between the dark and light "
                            "(SolidWorks-style) palettes. Persists across restarts.");
 
-                ImGui::Dummy(ImVec2(0, 6));
+                ImGui::Dummy(ImVec2(0, 6 * sc));
                 dimText("All settings here are stored in %APPDATA%\\AI-CAD\\config.json.");
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("AI provider")) {
-                ImGui::Dummy(ImVec2(0, 2));
+                ImGui::Dummy(ImVec2(0, 2 * sc));
                 ImGui::SeparatorText("Provider");
                 dimText("Used by 'Design with AI' and chat. Stored in "
                         "%APPDATA%\\AI-CAD\\config.json.");
-                ImGui::Dummy(ImVec2(0, 4));
+                ImGui::Dummy(ImVec2(0, 4 * sc));
                 const char* provs[] = {"Anthropic (Claude)", "OpenAI",
                                        "Local (OpenAI-compatible)", "llama.cpp (managed local)"};
                 ImGui::SetNextItemWidth(-1);
@@ -216,7 +216,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         settings.vision = false;
                     }
                 }
-                ImGui::Dummy(ImVec2(0, 4));
+                ImGui::Dummy(ImVec2(0, 4 * sc));
                 ImGui::TextUnformatted(settings.provider == 3 ? "GGUF model path" : "Model");
                 ImGui::SetNextItemWidth(-1);
                 ImGui::InputText("##model", settings.model, sizeof(settings.model));
@@ -252,7 +252,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                "with the installer.");
                 }
                 // --- C35: local-only / offline mode (ITAR compliance) --- begin marked block ---
-                ImGui::Dummy(ImVec2(0, 8));
+                ImGui::Dummy(ImVec2(0, 8 * sc));
                 ImGui::SeparatorText("Privacy");
                 ImGui::Checkbox("Offline mode (local models only — no network egress)",
                                 &settings.offlineMode);
@@ -269,7 +269,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (ImGui::BeginTabItem("Agents", nullptr,
                                     jumpToAgents ? ImGuiTabItemFlags_SetSelected
                                                  : ImGuiTabItemFlags_None)) {
-                ImGui::Dummy(ImVec2(0, 2));
+                ImGui::Dummy(ImVec2(0, 2 * sc));
                 bool canFetch = st.workerStarted && !busy;
                 if (!s_promptsLoaded) {
                     if (canFetch) {
@@ -356,7 +356,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (ImGui::BeginTabItem("Agent", nullptr,
                                     st.wantSettings ? ImGuiTabItemFlags_SetSelected
                                                     : ImGuiTabItemFlags_None)) {
-                ImGui::Dummy(ImVec2(0, 2));
+                ImGui::Dummy(ImVec2(0, 2 * sc));
                 ImGui::SeparatorText("Build loop");
                 ImGui::Checkbox("Plan before building (recommended)", &settings.planMode);
                 helpMarker("Plan mode: before writing any CAD code the agent drafts a build plan "
@@ -366,21 +366,21 @@ void drawSettingsModal(AppState& st, bool busy) {
                 dimText("The agent first drafts a build plan - the parts, concrete "
                         "dimensions and features - shows it in the conversation, then "
                         "writes the CAD code against it.");
-                ImGui::Dummy(ImVec2(0, 4));
+                ImGui::Dummy(ImVec2(0, 4 * sc));
                 ImGui::TextUnformatted("Refine-pass cap per request");
                 helpMarker("Max iters: how many times the agent may re-build and refine a part in "
                            "one request before it must stop. 0 = automatic — it keeps going until "
                            "the render matches the request (or stabilizes), then stops on its own. "
                            "A small cap (e.g. 3) bounds cost/time on hard parts.");
-                ImGui::SetNextItemWidth(140);
+                ImGui::SetNextItemWidth(140 * sc);
                 ImGui::InputInt("##miters", &settings.maxIters);
                 if (settings.maxIters < 0) settings.maxIters = 0;
                 if (settings.maxIters > 64) settings.maxIters = 64;
                 ImGui::SameLine();
                 dimText("0 = automatic (stops once the render matches)");
-                ImGui::Dummy(ImVec2(0, 6));
+                ImGui::Dummy(ImVec2(0, 6 * sc));
                 ImGui::SeparatorText("System prompt");
-                ImGui::Dummy(ImVec2(0, 2));
+                ImGui::Dummy(ImVec2(0, 2 * sc));
                 ImGui::TextUnformatted("System prompt override");
                 dimText("Leave empty to use the built-in prompt (recommended). A custom "
                         "prompt fully replaces it - keep the `result`/`parts` contract "
@@ -447,10 +447,10 @@ void drawSettingsModal(AppState& st, bool busy) {
             sectionHeader(st.fonts.h1, "AI-CAD");
         }
         dimText("Parametric CAD, driven by AI.");
-        ImGui::Dummy(ImVec2(0, 4));
+        ImGui::Dummy(ImVec2(0, 4 * sc));
         ImGui::TextUnformatted("build123d + OpenCASCADE kernel");
         ImGui::TextUnformatted("GLFW / Dear ImGui / OpenGL");
-        ImGui::Dummy(ImVec2(0, 8));
+        ImGui::Dummy(ImVec2(0, 8 * sc));
         if (primaryButton("Close", ImVec2(110.0f * sc, 32.0f * sc))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }

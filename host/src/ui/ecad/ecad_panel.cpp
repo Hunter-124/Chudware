@@ -440,7 +440,7 @@ void drawLeftPanel(EcadEditorState& es) {
             const float s = ImGui::GetTextLineHeight();
             ImGui::GetWindowDrawList()->AddRectFilled(
                 p0, ImVec2(p0.x + s, p0.y + s), ui::Palette::toU32(&sw.x), 2.0f);
-            ImGui::Dummy(ImVec2(s + 6, s));
+            ImGui::Dummy(ImVec2(s + 6 * ui::uiScale, s));
             ImGui::SameLine();
             ImGui::TextColored(vis ? v4(pal.text) : v4(pal.textDisabled), "%s", ly.id.c_str());
             ImGui::PopID();
@@ -720,7 +720,7 @@ void drawSimPlot(const nlohmann::json& results, int analysis) {
         const ImU32 c = traceColor((int)ti);
         const float sw = ImGui::GetTextLineHeight();
         const ImVec2 lp(p1.x - 110 * sc, ly);
-        dl->AddRectFilled(lp, ImVec2(lp.x + sw, lp.y + sw), c, 2.0f);
+        dl->AddRectFilled(lp, ImVec2(lp.x + sw, lp.y + sw), c, 2.0f * ui::uiScale);
         dl->AddText(ImVec2(lp.x + sw + 4 * sc, lp.y), ui::Palette::toU32(pal.text),
                     traces[ti].name.c_str());
         ly += sw + 3 * sc;

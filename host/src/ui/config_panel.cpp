@@ -15,6 +15,7 @@
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
+#include "../ui_theme.h"   // ui::uiScale
 #include "property_manager.h"   // pmFormatDim — match the rest of the UI's dim formatting
 
 namespace ui {
@@ -240,7 +241,7 @@ void ConfigPanel::drawBody(AppState& st) {
             const nlohmann::json* d = nullptr;
             for (const auto& e : detail_)
                 if (e.is_object() && cjstr(e, "name") == name) { d = &e; break; }
-            ImGui::Indent(16.0f);
+            ImGui::Indent(16.0f * ui::uiScale);
             int shown = 0;
             if (d) {
                 auto ovIt = d->find("param_overrides");
@@ -264,7 +265,7 @@ void ConfigPanel::drawBody(AppState& st) {
             }
             if (shown == 0)
                 ImGui::TextColored(dimCol, "no overrides");
-            ImGui::Unindent(16.0f);
+            ImGui::Unindent(16.0f * ui::uiScale);
         }
         ImGui::PopID();
     }

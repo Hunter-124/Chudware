@@ -67,6 +67,12 @@ void loadSettings(Settings& s) {
         s.systemPrompt = j.value("system_prompt", "");
         s.theme = j.value("theme", "dark");
         s.units = (j.value("units", std::string("mmgs")) == "ips") ? Units::IPS : Units::MMGS;
+        // Wave 3: File Explorer workspace + Recent files.
+        s.workspaceDir = j.value("workspace_dir", std::string());
+        s.recentFiles.clear();
+        if (auto it = j.find("recent_files"); it != j.end() && it->is_array())
+            for (const auto& e : *it)
+                if (e.is_string()) s.recentFiles.push_back(e.get<std::string>());
     } catch (...) {
     }
 }
@@ -93,6 +99,9 @@ void saveSettings(const Settings& s) {
     if (!s.systemPrompt.empty()) j["system_prompt"] = s.systemPrompt;
     j["theme"] = s.theme;
     j["units"] = (s.units == Units::IPS) ? "ips" : "mmgs";
+    // Wave 3: File Explorer workspace + Recent files.
+    if (!s.workspaceDir.empty()) j["workspace_dir"] = s.workspaceDir;
+    j["recent_files"] = s.recentFiles;
     try {
         std::filesystem::create_directories(appdataDir() + "\\AI-CAD");
         std::ofstream(configPath()) << j.dump(2);
@@ -230,6 +239,30 @@ void AppState::addLog(const std::string& s) {
         return p && *p ? std::fopen(p, "a") : nullptr;
     }();
     if (tee) { std::fputs(s.c_str(), tee); std::fputc('\n', tee); std::fflush(tee); }
+}
+
+// Wave 3: record `path` as the most-recent file. De-dups (case-insensitive on Windows), moves an
+// existing entry to the front, caps at kRecentFilesMax, mirrors into settings, and persists to
+// config.json. A no-op for an empty path.
+void AppState::pushRecentFile(const std::string& path) {
+    if (path.empty()) return;
+    auto sameFile = [](const std::string& a, const std::string& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            char ca = a[i], cb = b[i];
+            if (ca == '/') ca = '\\';
+            if (cb == '/') cb = '\\';
+            if (std::tolower((unsigned char)ca) != std::tolower((unsigned char)cb)) return false;
+        }
+        return true;
+    };
+    recentFiles.erase(std::remove_if(recentFiles.begin(), recentFiles.end(),
+                                     [&](const std::string& e) { return sameFile(e, path); }),
+                      recentFiles.end());
+    recentFiles.insert(recentFiles.begin(), path);
+    if (recentFiles.size() > kRecentFilesMax) recentFiles.resize(kRecentFilesMax);
+    settings.recentFiles = recentFiles;   // mirror so saveSettings serializes the live list
+    saveSettings(settings);
 }
 
 // W1-B: post a transient toast. born is filled by drawToasts on the first frame it's seen (we can't

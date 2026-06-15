@@ -2121,4 +2121,48 @@ void drawFeatureTree(AppState& st,
     ImGui::End();
 }
 
+// ---- Wave 3: public Save/Open wrappers (the File menu + File Explorer reuse these) ----
+// The actual RPC/dialog/mesh-refresh logic lives in the file-local doSaveDoc / doOpenDoc /
+// applyOpenedDoc above; these thin wrappers expose it without duplicating any of it, and keep
+// s_docPath (the active doc's on-disk path) as the single source of truth.
+
+// Open a file by absolute path (no dialog). Used by the File Explorer double-click and the
+// Recent-files menu. Returns true on success; toasts + logs on failure (never throws).
+bool featureTreeOpenPath(AppState& st, const std::string& path) {
+    if (path.empty()) return false;
+    std::string err;
+    if (st.docMirror.open(st.worker, path, err)) {
+        applyOpenedDoc(st, path);   // s_docPath = path, new tab, mesh refresh, recent handled by caller
+        return true;
+    }
+    st.addLog("[err] open: " + err);
+    st.toast(ui::ToastLevel::Error, "Open failed: " + pathBaseName(path) + " — " + err);
+    return false;
+}
+
+// Native "Open..." dialog -> open. Returns the opened path (for Recent), or "" on cancel/failure.
+std::string featureTreeOpenDialog(AppState& st) {
+    if (fileDialogsDisabled()) {
+        st.toast(ui::ToastLevel::Info,
+                 "File dialogs disabled — use the path field below the tree");
+        return std::string();
+    }
+    std::string path = openFileDialog(kStepPlusFilter);
+    if (path.empty()) return std::string();   // canceled
+    return featureTreeOpenPath(st, path) ? path : std::string();
+}
+
+// Save the active doc. saveAs=true forces the "Save As..." dialog; otherwise a silent re-save to
+// the known path (dialog only on first save). Returns the path saved to (for Recent), or "" on
+// cancel/failure/no-doc.
+std::string featureTreeSaveDoc(AppState& st, bool saveAs) {
+    if (!st.docMirror.hasDoc()) return std::string();
+    doSaveDoc(st, /*forceDialog=*/saveAs);
+    return s_docPath;   // doSaveDoc updates s_docPath on success; unchanged on cancel/failure
+}
+
+// The active document's on-disk path ("" if the doc has never been saved). Lets the File menu grey
+// "Save As" vs. "Save" correctly and lets the Explorer highlight the open file.
+std::string featureTreeActivePath() { return s_docPath; }
+
 }  // namespace ui

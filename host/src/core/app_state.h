@@ -77,6 +77,11 @@ struct Settings {
     std::string systemPrompt;    // system prompt override; empty = built-in
     std::string theme = "dark";  // "dark" | "light" — persisted to config.json
     Units units = Units::MMGS;   // document display/input unit system — persisted to config.json
+    // Wave 3 (GUI rework): File Explorer workspace root + Recent files, persisted to config.json
+    // ("workspace_dir" / "recent_files"). Mirrored onto AppState at startup; AppState is the live
+    // copy the UI reads, Settings is what saveSettings serializes.
+    std::string workspaceDir;                  // "" = use the Documents/AI-CAD default
+    std::vector<std::string> recentFiles;      // most-recent-first, capped at AppState::kRecentFilesMax
 };
 
 std::string appdataDir();
@@ -716,6 +721,25 @@ struct AppState {
         }
     };
     Clipboard clipboard;
+
+    // ---- Wave 3 (GUI rework): File Explorer + Recent files (APPEND-ONLY) ----
+    // workspaceDir: the root directory the Explorer tab browses. Defaults to Documents/AI-CAD
+    // (created on first use); overridable and persisted to config.json ("workspace_dir").
+    std::string workspaceDir;
+    // recentFiles: most-recent-first list of absolute paths opened/saved, capped at kRecentFilesMax.
+    // Persisted to config.json ("recent_files"); shown under File > Recent Files and the Explorer
+    // "Recent" section. pushRecentFile() de-dups + caps + persists.
+    static constexpr size_t kRecentFilesMax = 10;
+    std::vector<std::string> recentFiles;
+    // One-shot request flags fired by the File menu (title_bar.cpp) and consumed in app.cpp's key/
+    // request pump on the GL thread — so the native file dialog opens with our window active and the
+    // open/save reuses feature_tree's helpers (which own s_docPath + the mesh refresh).
+    bool requestOpenDialog = false;   // File > Open... / Ctrl+O
+    bool requestSave       = false;   // File > Save / Ctrl+S
+    bool requestSaveAs     = false;   // File > Save As... / Ctrl+Shift+S
+    std::string requestOpenPath;      // File > Recent <path> (open this exact path next pump)
+    // De-dup + cap (most-recent-first) + persist a path into recentFiles. Defined in app_state.cpp.
+    void pushRecentFile(const std::string& path);
 
     // ---- the run_gui lambdas, now methods ----
     void addLog(const std::string& s);

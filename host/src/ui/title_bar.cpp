@@ -10,6 +10,9 @@
 #include "../renderer.h"
 #include "../ui_theme.h"   // ui::uiScale
 #include "doc_tabs.h"      // ui::openNewDocChooser (File > New)
+#include "feature_tree.h"  // Wave 3: ui::featureTreeActivePath (Save vs. Save As gating)
+
+#include <filesystem>      // Wave 3: Recent-files menu labels
 
 // ---------------- caption buttons (shared small ui helper) ----------------
 bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
@@ -111,14 +114,18 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
 
         auto drawFileMenu = [&]() {
             if (ImGui::MenuItem("New...", "Ctrl+N")) ui::openNewDocChooser();
-            // Open / Save / Save As live in feature_tree.cpp's file-local doSaveDoc/doOpenDoc and
-            // are not reachable as dispatch ids from here — greyed until a dispatch id or AppState
-            // flag exists. (Integrator: add st.requestOpen/requestSave/requestSaveAs flags to wire.)
-            ImGui::MenuItem("Open...", "Ctrl+O", false, false);
+            // Wave 3: Open / Save / Save As fire one-shot AppState request flags consumed by app.cpp's
+            // GL-thread pump, which reuses feature_tree's doOpenDoc/doSaveDoc (native dialog + RPC +
+            // mesh refresh) and records Recent. Doing the actual open/save on the pump (not here, mid
+            // menu draw) avoids a re-entrant doc swap during ImGui's menu walk.
+            const bool docSaved = !ui::featureTreeActivePath().empty();
+            if (ImGui::MenuItem("Open...", "Ctrl+O")) st.requestOpenDialog = true;
             ImGui::Separator();
-            ImGui::MenuItem("Save", "Ctrl+S", false, false);
-            ImGui::MenuItem("Save As...", nullptr, false, false);
-            ImGui::MenuItem("Save All", nullptr, false, false);
+            if (ImGui::MenuItem("Save", "Ctrl+S", false, hasDoc)) st.requestSave = true;
+            if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, hasDoc)) st.requestSaveAs = true;
+            // Save All: no multi-doc batch-save path exists; Save the active doc as the closest action.
+            if (ImGui::MenuItem("Save All", nullptr, false, hasDoc)) st.requestSave = true;
+            (void)docSaved;
             ImGui::Separator();
             if (ImGui::BeginMenu("Export", hasDoc)) {
                 // No reachable export dispatch ids today (Sheet-Metal flat-DXF is the only export
@@ -130,8 +137,22 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
                 ImGui::EndMenu();
             }
             ImGui::Separator();
-            // Recent Files — Wave 3 backing not present yet; greyed placeholder.
-            if (ImGui::BeginMenu("Recent Files", false)) { ImGui::EndMenu(); }
+            // Wave 3: Recent Files — backed by AppState::recentFiles (persisted to config.json).
+            // Choosing one queues requestOpenPath; app.cpp's pump opens it (CAD or ECAD by extension).
+            if (ImGui::BeginMenu("Recent Files", !st.recentFiles.empty())) {
+                for (const std::string& rp : st.recentFiles) {
+                    std::string name = std::filesystem::path(rp).filename().string();
+                    if (ImGui::MenuItem(name.c_str())) st.requestOpenPath = rp;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", rp.c_str());
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Clear Recent Files")) {
+                    st.recentFiles.clear();
+                    st.settings.recentFiles.clear();
+                    saveSettings(st.settings);
+                }
+                ImGui::EndMenu();
+            }
             ImGui::Separator();
             ImGui::MenuItem("Close", "Ctrl+W", false, false);  // per-tab close not reachable here
             if (ImGui::MenuItem("Quit", "Alt+F4")) glfwSetWindowShouldClose(win, 1);

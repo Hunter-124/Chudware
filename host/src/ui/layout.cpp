@@ -14,6 +14,7 @@
 #include "../ui_theme.h"   // ui::uiScale, ui::palette
 
 #include "feature_tree.h"       // drawFeatureTreeBody
+#include "file_explorer.h"      // Wave 3: drawFileExplorerBody (Explorer tab)
 #include "property_manager.h"   // PropertyManager::drawBody
 #include "icons.h"              // getIcon / IconUV
 
@@ -191,12 +192,8 @@ void drawLeftPane(AppState& st,
     ImGui::BeginChild("##lp_body", ImVec2(0, 0), ImGuiChildFlags_None);
     switch (st.leftPaneTab) {
         case kLeftPaneExplorer:
-            // Wave 3 plugs the workspace file browser in here (file_explorer.cpp). Stub for now.
-            ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
-            ImGui::TextColored(
-                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1),
-                "Workspace explorer — coming in Wave 3");
-            ImGui::PopTextWrapPos();
+            // Wave 3: the workspace file browser (file_explorer.cpp).
+            drawFileExplorerBody(st);
             break;
 
         case kLeftPanePropertyManager:

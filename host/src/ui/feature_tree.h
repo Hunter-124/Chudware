@@ -49,4 +49,16 @@ bool featureCopySelection(AppState& st);
 bool featureCutSelection(AppState& st);
 bool featurePasteSelection(AppState& st);
 
+// ---- Wave 3: Save/Open helpers, exposed so the File menu (title_bar.cpp) and the File Explorer
+// (file_explorer.cpp) reuse the existing dialog + RPC + mesh-refresh logic instead of duplicating
+// it. All are no-ops / return "" on cancel / failure and never throw.
+//   - featureTreeOpenPath:   open an absolute path directly (Explorer double-click / Recent).
+//   - featureTreeOpenDialog: native "Open..." dialog -> open; returns the opened path or "".
+//   - featureTreeSaveDoc:    Save (saveAs=false) / Save As (saveAs=true); returns the saved path or "".
+//   - featureTreeActivePath: the active doc's on-disk path ("" if never saved).
+bool        featureTreeOpenPath(AppState& st, const std::string& path);
+std::string featureTreeOpenDialog(AppState& st);
+std::string featureTreeSaveDoc(AppState& st, bool saveAs);
+std::string featureTreeActivePath();
+
 }  // namespace ui

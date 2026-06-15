@@ -68,6 +68,7 @@ add_executable(AI-CAD
   src/core/doc_mirror.cpp
   src/ui/feature_tree.cpp
   src/ui/file_dialog.cpp   # C41: native Win32 Save/Open dialogs
+  src/ui/file_explorer.cpp # Wave 3: File Explorer panel (workspace browser + recent)
   # --- end C16 ---
   # --- document tabs (multi-document strip + per-tab switching) ---
   src/core/doc_tabs.cpp

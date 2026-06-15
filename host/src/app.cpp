@@ -19,6 +19,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -43,6 +44,7 @@
 #include "ui/console_panel.h"
 #include "ui/doc_tabs.h"
 #include "ui/feature_tree.h"
+#include "ui/file_explorer.h"  // Wave 3: File Explorer + workspace/recent helpers
 #include "ui/layout.h"        // Wave 1C/1D: buildDefaultLayout + tabbed left pane (drawLeftPane)
 #include "ui/legacy_chat.h"
 #include "ui/settings_modal.h"
@@ -220,6 +222,19 @@ void ecadSaveDoc(AppState& st) {
     st.addLog("[ecad] saved -> " + (saved.empty() ? path : saved));
 }
 
+// Open an ECAD document by absolute path (Wave 3: the File Explorer / Recent route here for
+// .ecad+/.kicad_sch/.kicad_pcb files). The loaded doc adopts into the editor mirror and surfaces.
+void ecadOpenPath(AppState& st, const std::string& path) {
+    if (path.empty()) return;
+    nlohmann::json res;
+    if (!ecadCall(st, "ecad_open", {{"path", path}}, res)) return;
+    ecadAdopt(st, res);          // sets ecadDocId/revision + loads the editor mirror
+    st.wantFocusEcad = 6;        // surface the editor with the freshly opened doc
+    st.toast(ui::ToastLevel::Info, "Opened " + path);
+    st.addLog("[ecad] opened " + path);
+    st.pushRecentFile(path);     // Wave 3: record in Recent (persists to config.json)
+}
+
 // Open an ECAD document (native .ecad+ / .ecad / .json, or a KiCad .kicad_sch/.kicad_pcb which the
 // worker imports) via an Open dialog. The loaded doc adopts into the editor mirror and surfaces.
 void ecadOpenDoc(AppState& st) {
@@ -228,12 +243,7 @@ void ecadOpenDoc(AppState& st) {
         "AI-ECAD design (*.ecad+)\0*.ecad+\0KiCad schematic (*.kicad_sch)\0*.kicad_sch\0"
         "KiCad board (*.kicad_pcb)\0*.kicad_pcb\0All files (*.*)\0*.*\0");
     if (path.empty()) return;  // cancelled
-    nlohmann::json res;
-    if (!ecadCall(st, "ecad_open", {{"path", path}}, res)) return;
-    ecadAdopt(st, res);          // sets ecadDocId/revision + loads the editor mirror
-    st.wantFocusEcad = 6;        // surface the editor with the freshly opened doc
-    st.toast(ui::ToastLevel::Info, "Opened " + path);
-    st.addLog("[ecad] opened " + path);
+    ecadOpenPath(st, path);
 }
 
 // The headline integration: export the current board to STEP, then IMPORT it into a live CAD part
@@ -712,6 +722,13 @@ int run_gui(const char* screenshotPath) {
     // editor buffer for the system-prompt override (Settings > Agent)
     std::strncpy(st.spBuf.data(), st.settings.systemPrompt.c_str(), st.spBuf.size() - 1);
 
+    // Wave 3 (GUI rework): seed the File Explorer's live state from persisted settings and ensure the
+    // workspace directory exists (default <Documents>/AI-CAD). recentFiles/workspaceDir are the live
+    // copies the Explorer + File menu read; pushRecentFile() mirrors changes back into settings.
+    st.recentFiles  = st.settings.recentFiles;
+    st.workspaceDir = st.settings.workspaceDir;
+    ui::ensureWorkspaceDir(st);
+
     // Re-apply theme from persisted settings (env override already applied above; if a
     // saved setting differs, the persisted value wins unless env was set).
     {
@@ -888,6 +905,10 @@ int run_gui(const char* screenshotPath) {
     st.wantPick = shot && shotMode && std::strcmp(shotMode, "pick") == 0;
     st.wantRibbon = shot && shotMode && std::strcmp(shotMode, "ribbon") == 0;
     st.wantTree = shot && shotMode && std::strcmp(shotMode, "tree") == 0;
+    // Wave 3: explorer shot — force the tabbed left pane to the Explorer (File Explorer) tab so the
+    // headless screenshot captures the workspace file tree (otherwise it defaults to FeatureManager).
+    if (shot && shotMode && std::strcmp(shotMode, "explorer") == 0)
+        st.leftPaneTab = AppState::LP_Explorer;
     st.wantM1 = shot && shotMode && std::strcmp(shotMode, "m1") == 0;  // C17 integration scenario
     st.wantEcad = shot && shotMode && std::strcmp(shotMode, "ecad") == 0;  // Wave N: ECAD GUI shot
     if (st.wantEcad) { st.showRibbon = true; st.ribbonTab = AppState::RT_PCB; }  // PCB tab forward
@@ -1674,31 +1695,87 @@ int run_gui(const char* screenshotPath) {
                 ImGui::IsKeyPressed(ImGuiKey_N, false))
                 ui::openNewDocChooser();
 
-            // ---- Wave 4C/4D: global Ctrl+C / Ctrl+X / Ctrl+V copy/paste routing ----
-            // Guards mirror the undo/redo block: skip while a text field, the ECAD window, or a
-            // background/agent run owns input. NOT gated on inSketchNow here: when a sketch is
-            // active, SketchMode::drawOverlay owns Ctrl+C/V (it has the (u,v) context for the
-            // follow-cursor paste-placement), so the global router stands down and routes ONLY to the
-            // FeatureManager when no sketch is active. (Sketch copy/paste therefore never double-fires
-            // — exactly the inSketchNow skip the undo block uses.) Ctrl+Z/Y are handled above; we
-            // never touch them. Explorer-tab FILE copy/paste is Wave 3 — see the TODO below.
-            if (canDoc && !textFocus && !ecadFocused && (io.KeyCtrl || io.KeySuper) &&
-                !io.KeyShift) {
-                if (!inSketchNow) {
-                    // FeatureManager / left-pane selection copy/cut/paste.
-                    if (ImGui::IsKeyPressed(ImGuiKey_C, false)) {
-                        // TODO (Wave 3): when the Explorer tab is focused with a file selected, route
-                        // Ctrl+C to file copy instead. For now copy the selected feature(s).
-                        ui::featureCopySelection(st);
-                    } else if (ImGui::IsKeyPressed(ImGuiKey_X, false)) {
-                        ui::featureCutSelection(st);
-                    } else if (ImGui::IsKeyPressed(ImGuiKey_V, false)) {
-                        // TODO (Wave 3): Explorer-tab file paste hook goes here.
-                        ui::featurePasteSelection(st);
-                    }
-                }
-                // When inSketchNow: intentionally no-op — SketchMode::drawOverlay handles Ctrl+C/V.
+            // ---- Wave 3: Ctrl+O / Ctrl+S / Ctrl+Shift+S file shortcuts ----
+            // Set request flags consumed by the GL-thread file pump below (after the input block) so
+            // the native dialog opens with the doc swap off the ImGui input path. Skip while a text
+            // field or the ECAD window owns input (the ECAD editor has its own save). Ctrl+S/Shift+S
+            // require a live doc; Ctrl+O is always allowed.
+            if (!textFocus && !ecadFocused && (io.KeyCtrl || io.KeySuper)) {
+                if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_O, false))
+                    st.requestOpenDialog = true;
+                else if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S, false))
+                    st.requestSaveAs = true;
+                else if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S, false))
+                    st.requestSave = true;
             }
+
+            // ---- Wave 4C/4D + Wave 3: global Ctrl+C / Ctrl+X / Ctrl+V copy/paste routing ----
+            // Priority: Explorer tab active -> filesystem file copy/paste (Wave 3). Otherwise, when a
+            // sketch is active SketchMode::drawOverlay owns Ctrl+C/V (it has the (u,v) context), so the
+            // global router stands down; with no sketch active it routes to the FeatureManager
+            // selection (Wave 4C/4D). Guards mirror the undo block: skip while a text field or the
+            // ECAD window owns input. Ctrl+Z/Y are handled above; we never touch them.
+            if (!textFocus && !ecadFocused && (io.KeyCtrl || io.KeySuper) && !io.KeyShift) {
+                if (ui::fileExplorerActive(st)) {
+                    // Explorer-tab FILE copy/paste — no worker needed, so not gated on canDoc.
+                    if (ImGui::IsKeyPressed(ImGuiKey_C, false))      ui::fileExplorerCopySelection(st);
+                    else if (ImGui::IsKeyPressed(ImGuiKey_V, false)) ui::fileExplorerPaste(st);
+                    // Ctrl+X on files intentionally unsupported (no filesystem "cut" semantics).
+                } else if (canDoc && !inSketchNow) {
+                    // FeatureManager / left-pane selection copy/cut/paste.
+                    if (ImGui::IsKeyPressed(ImGuiKey_C, false))      ui::featureCopySelection(st);
+                    else if (ImGui::IsKeyPressed(ImGuiKey_X, false)) ui::featureCutSelection(st);
+                    else if (ImGui::IsKeyPressed(ImGuiKey_V, false)) ui::featurePasteSelection(st);
+                }
+                // When inSketchNow (and not Explorer): no-op — SketchMode::drawOverlay handles Ctrl+C/V.
+            }
+        }
+
+        // ---- Wave 3: file request pump (open/save/recent) ----
+        // Drains the one-shot flags the File menu (title_bar.cpp) and the Ctrl+O/S shortcuts set.
+        // Runs once per frame on the GL thread, OUTSIDE the ImGui input/menu walk, so the native
+        // dialog + DocMirror swap never re-enters a draw. Open paths are dispatched by extension:
+        // CAD -> featureTreeOpenPath, ECAD/KiCad -> ecadOpenPath. Each open/save records Recent.
+        // Gated on a live, idle worker (mirrors the FeatureManager toolbar's canDoc gate) so we never
+        // swap the doc under a running call; a queued request waits one frame rather than firing early.
+        if (st.requestOpenDialog || !st.requestOpenPath.empty() || st.requestSave || st.requestSaveAs) {
+            const bool fileReady = st.workerStarted && !st.job.running.load() && !st.agentV2Running;
+            if (!fileReady) {
+                // Drop save/recent requests (need a doc); keep open requests pending until ready.
+                if (st.requestSave || st.requestSaveAs)
+                    st.toast(ui::ToastLevel::Info, "Busy — try again in a moment");
+                st.requestSave = st.requestSaveAs = false;
+            } else {
+            if (st.requestOpenDialog) {
+                st.requestOpenDialog = false;
+                std::string opened = ui::featureTreeOpenDialog(st);
+                if (!opened.empty()) st.pushRecentFile(opened);
+            }
+            if (!st.requestOpenPath.empty()) {
+                std::string path = st.requestOpenPath;
+                st.requestOpenPath.clear();
+                std::string ext = std::filesystem::path(path).extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(),
+                               [](unsigned char c) { return (char)std::tolower(c); });
+                const bool isEcad = (ext == ".ecad+" || ext == ".ecad" ||
+                                     ext == ".kicad_sch" || ext == ".kicad_pcb");
+                if (isEcad) {
+                    ecadOpenPath(st, path);   // records Recent itself
+                } else if (ui::featureTreeOpenPath(st, path)) {
+                    st.pushRecentFile(path);
+                }
+            }
+            if (st.requestSave) {
+                st.requestSave = false;
+                std::string saved = ui::featureTreeSaveDoc(st, /*saveAs=*/false);
+                if (!saved.empty()) st.pushRecentFile(saved);
+            }
+            if (st.requestSaveAs) {
+                st.requestSaveAs = false;
+                std::string saved = ui::featureTreeSaveDoc(st, /*saveAs=*/true);
+                if (!saved.empty()) st.pushRecentFile(saved);
+            }
+            }  // fileReady
         }
 
         // Re-push palette-derived viewport visuals every frame so a runtime theme toggle (from the

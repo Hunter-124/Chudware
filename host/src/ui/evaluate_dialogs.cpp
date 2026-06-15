@@ -206,6 +206,26 @@ void EvaluateDialogs::draw(AppState& st) {
             }
         } else if (openWindow_ == "measure") {
             std::string kind = result_.value("kind", std::string("(none)"));
+            auto numAt = [&](const char* k, double& out) -> bool {
+                if (result_.contains(k) && result_[k].is_number()) { out = result_[k].get<double>(); return true; }
+                return false;
+            };
+            // One-line summary of this measurement (for the running History list, SW-style).
+            std::string summary; double v;
+            if (numAt("distance", v))    summary = "Distance " + evalLen(st, v);
+            else if (numAt("length", v)) summary = "Length " + evalLen(st, v);
+            else if (numAt("radius", v)) summary = "Radius " + evalLen(st, v) + " (Dia " + evalLen(st, 2.0 * v) + ")";
+            else if (numAt("area", v))   { char b[64]; std::snprintf(b, sizeof(b), "Area %.3f mm2", v); summary = b; }
+            else if (numAt("volume", v)) { char b[64]; std::snprintf(b, sizeof(b), "Volume %.3f mm3", v); summary = b; }
+            double ang;
+            if (numAt("angle", ang)) { char b[48]; std::snprintf(b, sizeof(b), "Angle %.3f deg", ang);
+                                       summary = summary.empty() ? std::string(b) : summary + ", " + b; }
+            // Accumulate: append each completed measurement exactly once (gen_ bumps per eval).
+            if (!pending_ && !summary.empty() && gen_ != measureLoggedGen_) {
+                measureLoggedGen_ = gen_;
+                measureLog_.push_back(summary);
+            }
+
             ImGui::Text("Kind: %s", kind.c_str());
             auto show = [&](const char* k, const char* unit) {
                 if (result_.contains(k) && result_[k].is_number())
@@ -218,9 +238,20 @@ void EvaluateDialogs::draw(AppState& st) {
                     ImGui::Text("%s: %s", k, evalLen(st, result_[k].get<double>()).c_str());
             };
             showLen("distance"); show("angle", "deg"); showLen("length");
-            show("area", "mm2"); showLen("radius"); show("volume", "mm3");
+            show("area", "mm2"); showLen("radius");
+            { double r; if (numAt("radius", r)) ImGui::Text("diameter: %s", evalLen(st, 2.0 * r).c_str()); }
+            show("volume", "mm3");
             if (kind == "(none)" || result_.empty())
                 ImGui::TextDisabled("Select 1-2 faces/edges/vertices, then Measure.");
+            // Running history (SolidWorks Measure accumulates) — newest first, with Clear.
+            if (!measureLog_.empty()) {
+                ImGui::SeparatorText("History");
+                if (ImGui::SmallButton("Clear")) { measureLog_.clear(); measureLoggedGen_ = -1; }
+                ImGui::BeginChild("##measlog", ImVec2(0, 120 * ui::uiScale), ImGuiChildFlags_Border);
+                for (size_t i = measureLog_.size(); i-- > 0; )
+                    ImGui::TextUnformatted(measureLog_[i].c_str());
+                ImGui::EndChild();
+            }
         } else if (openWindow_ == "section") {
             ImGui::Text("Area:     %.3f mm2", result_.value("area_mm2", 0.0));
             if (result_.contains("centroid") && result_["centroid"].is_array() &&

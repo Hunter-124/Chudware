@@ -263,11 +263,37 @@ def test_doc_formats_registry() -> None:
     from engine.doc.formats import _handler_doc_formats
     resp = _handler_doc_formats({}, lambda *a, **k: None)
     fmts = {f["fmt"]: f for f in resp["formats"]}
-    for need in ("step", "iges", "brep", "stl", "3mf", "obj", "ply", "gltf", "glb"):
+    for need in ("step", "iges", "brep", "stl", "3mf", "obj", "ply", "gltf", "glb", "3dm"):
         assert need in fmts, f"format '{need}' missing from registry"
     assert ".obj" in fmts["obj"]["exts"] and fmts["obj"]["lane"] == "mesh"
     assert fmts["step"]["lane"] == "brep"
     print(f"[formats] doc_formats registry exposes {len(fmts)} formats")
+
+
+def test_solidworks_parasolid_wiring() -> None:
+    """F5 wiring is CI-safe: proprietary formats are registered import-only, export raises, and the
+    OLE2 probe no-ops on a non-OLE file. Does NOT launch SolidWorks."""
+    from engine.doc.formats import _handler_doc_formats, _detect_format, export_document
+    from engine.doc.formats_solidworks import ole2_streams, solidworks_available
+    fmts = {f["fmt"]: f for f in _handler_doc_formats({}, lambda *a, **k: None)["formats"]}
+    for need in ("sldprt", "sldasm", "x_t", "x_b"):
+        assert need in fmts, f"proprietary format '{need}' missing from registry"
+        assert fmts[need]["can_import"] is True and fmts[need]["can_export"] is False, \
+            f"{need} should be import-only"
+    assert _detect_format("x.SLDPRT") == "sldprt" and _detect_format("p.x_b") == "x_b"
+    # Export of a proprietary format must raise a clear "export STEP" error (no SW needed).
+    import numpy as np
+    from engine.doc.mesh_body import MeshBody
+    mb = MeshBody(verts=np.zeros((3, 3), np.float32), tris=np.array([[0, 1, 2]], np.uint32))
+    tmp = os.path.join(tempfile.mkdtemp(), "x.sldprt")
+    try:
+        export_document([("b", mb)], tmp, "sldprt")
+        assert False, "sldprt export should raise"
+    except ValueError as exc:
+        assert "step" in str(exc).lower()
+    assert ole2_streams(__file__) == []          # not an OLE2 file → []
+    assert isinstance(solidworks_available(), bool)
+    print(f"[formats] SolidWorks/Parasolid wiring OK (sw_available={solidworks_available()})")
 
 
 # --------------------------------------------------------------------------- 2. import feature compiles + caches

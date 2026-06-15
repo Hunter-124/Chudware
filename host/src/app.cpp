@@ -614,7 +614,8 @@ static bool dropPathHasKnownExt(const std::string& path) {
     // plus the ECAD/KiCad family. The GL-thread pump branches CAD vs ECAD by extension.
     return ext == ".step+" || ext == ".step" || ext == ".stp" || ext == ".iges" || ext == ".igs" ||
            ext == ".brep"  || ext == ".stl"  || ext == ".3mf" || ext == ".obj"  || ext == ".ply"  ||
-           ext == ".gltf"  || ext == ".glb"  ||
+           ext == ".gltf"  || ext == ".glb"  || ext == ".3dm" ||
+           ext == ".sldprt" || ext == ".sldasm" || ext == ".x_t" || ext == ".x_b" ||  // experimental (SW COM)
            ext == ".ecad+" || ext == ".ecad" ||
            ext == ".kicad_sch" || ext == ".kicad_pcb";
 }

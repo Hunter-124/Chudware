@@ -63,6 +63,10 @@ _EXT_TO_FORMAT: dict[str, str] = {
     ".gltf": "gltf",
     ".glb": "glb",
     ".3dm": "3dm",
+    ".sldprt": "sldprt",
+    ".sldasm": "sldasm",
+    ".x_t": "x_t",
+    ".x_b": "x_b",
 }
 
 
@@ -97,6 +101,12 @@ FORMAT_REGISTRY: list[FormatInfo] = [
     FormatInfo("gltf", "glTF", [".gltf"], "mesh"),
     FormatInfo("glb", "glTF binary", [".glb"], "mesh"),
     FormatInfo("3dm", "Rhino", [".3dm"], "rhino"),
+    # Proprietary — import is experimental (SolidWorks COM → STEP, else preview/error); we never
+    # write these, so can_export is False (export STEP instead).
+    FormatInfo("sldprt", "SolidWorks part", [".sldprt"], "proprietary", can_export=False),
+    FormatInfo("sldasm", "SolidWorks assembly", [".sldasm"], "proprietary", can_export=False),
+    FormatInfo("x_t", "Parasolid (text)", [".x_t"], "proprietary", can_export=False),
+    FormatInfo("x_b", "Parasolid (binary)", [".x_b"], "proprietary", can_export=False),
 ]
 
 
@@ -230,6 +240,11 @@ def export_document(
     if fmt == "3dm":
         return _export_3dm(session_bodies, path)
 
+    if fmt in ("sldprt", "sldasm", "x_t", "x_b"):
+        raise ValueError(
+            f"writing {fmt.upper()} is not supported (proprietary closed format). Export STEP (.step) "
+            "instead — SolidWorks / NX / Parasolid tools import STEP losslessly.")
+
     raise ValueError(f"unsupported export format '{fmt}'")
 
 
@@ -270,6 +285,12 @@ def import_path(
         return _load_mesh_trimesh(path, fmt)
     elif fmt == "3dm":
         return _import_3dm(path)
+    elif fmt in ("sldprt", "sldasm"):
+        from engine.doc.formats_solidworks import import_solidworks
+        return import_solidworks(path)
+    elif fmt in ("x_t", "x_b"):
+        from engine.doc.formats_solidworks import import_parasolid
+        return import_parasolid(path)
     else:
         raise ValueError(f"unsupported import format '{fmt}'")
 

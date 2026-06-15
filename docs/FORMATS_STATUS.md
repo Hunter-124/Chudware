@@ -11,8 +11,8 @@ Tracks `docs/FORMATS_PLAN.md`. Engine venv: `%APPDATA%\AI-CAD\runtime\venv`.
 | F2 | B-rep polish: multi-solid STEP → separate named bodies | ✅ done |
 | F3 | Rhino `.3dm` via rhino3dm (mesh-level) | ✅ done |
 | F4 | Host UI: unified Open/Import filter, Import menu, expanded Export | ✅ done |
-| F5 | SolidWorks/Parasolid (experimental: SW-COM + OLE2 probe) | ⏳ next |
-| F6 | Polish, docs, convert-mesh-to-solid stretch | ⏳ pending |
+| F5 | SolidWorks/Parasolid: SW-COM→STEP (✅ validated) + OLE2 probe (RE stub) | ✅ done |
+| F6 | Polish, docs, convert-mesh-to-solid stretch | ⏳ optional |
 
 ## Live capability matrix
 
@@ -28,8 +28,31 @@ Tracks `docs/FORMATS_PLAN.md`. Engine venv: `%APPDATA%\AI-CAD\runtime\venv`.
 | `.ply` | ✅ | ✅ | mesh body |
 | `.gltf` `.glb` | ✅ | ✅ | mesh body |
 | `.3dm` | ✅ (mesh) | ✅ (mesh) | Rhino render meshes (NURBS not tessellated) |
-| `.sldprt` `.sldasm` | ⏳ F5 | STEP-out | experimental |
-| `.x_t` `.x_b` | ⏳ F5 | STEP-out | via SW-COM only |
+| `.sldprt` `.sldasm` | ✅ via SW-COM* | ✗ (export STEP) | needs SolidWorks installed |
+| `.x_t` `.x_b` | ✅ via SW-COM* | ✗ (export STEP) | needs SolidWorks installed |
+
+\* SolidWorks COM→STEP→import validated on SW 2025 (adapter-plate sample → 1 solid, vol 10888 mm³).
+Requires SolidWorks installed + licensed + `pywin32` in the engine runtime; otherwise a clear
+"export STEP" error. Modern `.sldprt` is a proprietary non-OLE2 container, so there is no
+standalone reader — the OLE2 preview-mesh probe is a research stub for legacy files only.
+
+## SolidWorks / Parasolid (F5, experimental)
+
+- **Import chain** (`engine/doc/formats_solidworks.py`): SolidWorks COM → STEP → B-rep lane;
+  else legacy-OLE2 preview mesh (stub); else a clear "export STEP" error. Parasolid (.x_t/.x_b)
+  goes through SW COM only.
+- **Finding (SW 2025):** modern `.sldprt` is **not** an OLE2 container (magic `7b ab b3 01`, not
+  `d0 cf 11 e0`) and not ZIP — it's an undocumented proprietary format. The `olefile` probe only
+  helps legacy (pre-~2015) files. So modern SW import relies on the **COM → STEP** path, which
+  requires SolidWorks installed + licensed + `pywin32` in the engine runtime.
+- **Test parts to create (for reverse-engineering the modern container / validating COM):**
+  1. A simple single-body part (one extruded boss) — `.sldprt`.
+  2. A multi-body part (2–3 separate bodies) — `.sldprt`.
+  3. A small assembly (2–3 components) — `.sldasm`.
+  4. The same simple part exported as Parasolid `.x_t` and `.x_b`.
+  5. Optionally the same part saved from an *older* SolidWorks (if available) to compare containers.
+  Drop them anywhere and point me at the folder; I'll use `ole2_streams()` + a hex probe to map the
+  layout and extend the importer.
 
 ## Notes / decisions
 

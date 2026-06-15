@@ -26,6 +26,7 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 import numpy as np
+import pytest
 import trimesh
 
 # Make sure the package root is importable when run directly
@@ -34,6 +35,38 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from engine.sim.lbm import run_wind_tunnel, FlowResult
+
+
+# ---------------------------------------------------------------------------
+# pytest fixtures
+# ---------------------------------------------------------------------------
+# Two tests below (test_flat_plate_vs_sphere, test_save_npz) take positional
+# arguments that the plain main() runner threads in by hand from the sphere
+# run.  Under pytest those parameter names are resolved as fixtures, so we
+# provide them here.  A single module-scoped sphere run feeds both, matching
+# the runner's intent (the sphere result computed by test_sphere_basic) without
+# changing any test body or assertion.
+
+@pytest.fixture(scope="module")
+def result() -> FlowResult:
+    """Sphere wind-tunnel result, shared by the fixture-consuming tests."""
+    stl = _make_sphere_stl(radius_mm=20.0)
+    try:
+        return run_wind_tunnel(
+            stl_path=stl,
+            direction=(1.0, 0.0, 0.0),
+            speed_mps=10.0,
+            preset="coarse",
+            max_steps=300,
+        )
+    finally:
+        os.unlink(stl)
+
+
+@pytest.fixture(scope="module")
+def sphere_drag(result: FlowResult) -> float:
+    """Drag of the shared sphere run (the baseline the cube must exceed)."""
+    return result.drag_n
 
 
 # ---------------------------------------------------------------------------

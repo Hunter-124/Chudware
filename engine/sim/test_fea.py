@@ -18,12 +18,29 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 # ── module-level temp dir so tests can share the STEP / mesh files ──────────
 _TMPDIR: tempfile.TemporaryDirectory | None = None
 _STEP_PATH: str = ""
 _MESH_CACHE = None  # engine.sim.mesher.MeshResult
+
+
+# ── pytest entry point ──────────────────────────────────────────────────────
+# These tests share module-level state (_STEP_PATH, _MESH_CACHE) that is
+# created by _setup_tmpdir().  The plain main() runner below calls that setup
+# explicitly, but under pytest the test_* functions are collected and run
+# directly, so without this fixture _STEP_PATH stays "" and mesh_step("")
+# raises ValueError("WindowsPath('.') has an empty name").  This autouse,
+# module-scoped fixture runs the same setup/teardown once for the module.
+@pytest.fixture(scope="module", autouse=True)
+def _fea_step_fixture():
+    _setup_tmpdir()
+    try:
+        yield
+    finally:
+        _teardown_tmpdir()
 
 
 def _setup_tmpdir() -> None:

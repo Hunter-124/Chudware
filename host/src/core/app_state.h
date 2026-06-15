@@ -738,6 +738,12 @@ struct AppState {
     bool requestSave       = false;   // File > Save / Ctrl+S
     bool requestSaveAs     = false;   // File > Save As... / Ctrl+Shift+S
     std::string requestOpenPath;      // File > Recent <path> (open this exact path next pump)
+    // Wave-5-fill: File > Export <fmt> sets requestExportFormat to one of the export_file format
+    // strings ("step"|"iges"|"stl"|"3mf"|"brep"); the GL-thread pump drains it (native Save-As +
+    // DocMirror::exportFile) so the dialog never re-enters the ImGui menu walk. File > Save All sets
+    // requestSaveAll; the pump iterates docTabs and saves each saveable doc.
+    std::string requestExportFormat;  // File > Export <fmt> (export the active doc next pump)
+    bool requestSaveAll = false;      // File > Save All (save every saveable doc next pump)
     // De-dup + cap (most-recent-first) + persist a path into recentFiles. Defined in app_state.cpp.
     void pushRecentFile(const std::string& path);
 

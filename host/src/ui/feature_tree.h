@@ -49,6 +49,17 @@ bool featureCopySelection(AppState& st);
 bool featureCutSelection(AppState& st);
 bool featurePasteSelection(AppState& st);
 
+// Wave-5-fill: Edit > Delete / Edit > Select All, exposed for the Edit menu (title_bar.cpp) and the
+// global Del / Ctrl+A key routing. Both mirror featureCutSelection's contract — call from app.cpp's
+// pre-draw key/menu pump (NOT mid tree-walk: delete applies a DocMirror op immediately, which
+// replaces the tree json the walk reads). Each is a no-op (returns false) without a live doc.
+//   - featureDeleteSelection: delete the FeatureManager selection (full multi-select if the primary
+//     is in it, else just the primary), via the same delete_feature op the context menu uses.
+//   - featureSelectAll: select every feature in the active part's FeatureManager (populates the
+//     multi-select with all feature ids from the doc tree). No-op for assemblies / empty docs.
+bool featureDeleteSelection(AppState& st);
+bool featureSelectAll(AppState& st);
+
 // ---- Wave 3: Save/Open helpers, exposed so the File menu (title_bar.cpp) and the File Explorer
 // (file_explorer.cpp) reuse the existing dialog + RPC + mesh-refresh logic instead of duplicating
 // it. All are no-ops / return "" on cancel / failure and never throw.

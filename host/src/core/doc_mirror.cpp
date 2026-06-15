@@ -499,4 +499,19 @@ std::string DocMirror::exportDrawing(WorkerClient& w, const std::string& drawing
     return jstr(res, "path");
 }
 
+// ---- General 3D export (export_file) --------------------------------------
+// Mirrors exportFlat/exportDrawing: a read-only worker passthrough that returns the written path.
+// A fresh compile + B-rep/mesh write can be slow, so it gets the same 60s headroom they use.
+std::string DocMirror::exportFile(WorkerClient& w, const std::string& docId,
+                                  const std::string& path, const std::string& format,
+                                  std::string& err) {
+    if (docId.empty()) { err = "no document open"; return {}; }
+    nlohmann::json res;
+    if (!w.call("export_file",
+                {{"doc_id", docId}, {"path", path}, {"format", format}}, res, err, 60000))
+        return {};
+    if (res.contains("code")) { err = jstr(res, "message"); return {}; }
+    return jstr(res, "path");
+}
+
 }  // namespace core

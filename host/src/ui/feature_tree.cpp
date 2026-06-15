@@ -319,6 +319,52 @@ bool featurePasteSelection(AppState& st) {
     return true;
 }
 
+// Wave-5-fill: Edit > Delete — delete the FeatureManager selection. Mirrors featureCutSelection
+// minus the copy: same delete_feature op (cascade:false) the row context menu and multi-delete use.
+// Runs OUTSIDE the tree walk (app.cpp's pump), so the immediate DocMirror call is safe. applyTreeOpsNow
+// surfaces an engine block (a downstream feature depends on this one) as a warning toast and leaves
+// the tree unchanged. No-op (false) without a live, idle doc or an eligible selection.
+bool featureDeleteSelection(AppState& st) {
+    if (!st.docMirror.hasDoc() || !st.workerStarted || st.job.running.load()) return false;
+    auto fids = featureCopySet(st);   // full multi-select if the primary is in it, else the primary
+    if (fids.empty()) return false;
+    nlohmann::json ops = nlohmann::json::array();
+    for (const auto& id : fids)
+        ops.push_back({{"op", "delete_feature"}, {"id", id}, {"cascade", false}});
+    applyTreeOpsNow(st, ops, "delete");
+    // Drop the now-deleted ids from the selection so a stale primary/multi-set can't linger (the tree
+    // walk also validates against the live tree, but clearing here keeps the menu's state honest).
+    for (const auto& id : fids) s_multiSel.erase(id);
+    st.selectedFeatureId.clear();
+    return true;
+}
+
+// Wave-5-fill: Edit > Select All — select every feature in the active part's FeatureManager. Reads
+// the doc tree's "features" array (the same source the tree-walk's `order` list is built from) and
+// puts every feature id into the multi-select, with the last as the primary so context-menu multi
+// actions light up. No-op (false) for assemblies (no flat feature history), empty docs, or no doc.
+bool featureSelectAll(AppState& st) {
+    if (!st.docMirror.hasDoc()) return false;
+    const nlohmann::json& tree = st.docMirror.tree();
+    if (!tree.is_object()) return false;
+    if (jfld(tree, "schema") == "aicad.asm/1") return false;  // assemblies have no feature history
+    auto feat = tree.find("features");
+    if (feat == tree.end() || !feat->is_array() || feat->empty()) return false;
+    s_multiSel.clear();
+    std::string last;
+    for (const auto& f : *feat) {
+        if (!f.is_object()) continue;
+        std::string id = jfld(f, "id");
+        if (id.empty()) continue;
+        s_multiSel.insert(id);
+        last = id;
+    }
+    if (s_multiSel.empty()) return false;
+    st.selectedFeatureId = last;        // primary = last feature (drives the multi-action gating)
+    refreshFeatureHighlight(st);        // light the primary's owned faces in the viewport
+    return true;
+}
+
 // ---- Wave 4C: deferred copy/cut/paste from the row CONTEXT MENU ----
 // copyFeatureToClipboard calls DocMirror::applyOps IMMEDIATELY (it needs the id_map bundle back
 // synchronously). That REPLACES the mirror's tree json — a use-after-free if invoked while the row

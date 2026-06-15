@@ -123,17 +123,25 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             ImGui::Separator();
             if (ImGui::MenuItem("Save", "Ctrl+S", false, hasDoc)) st.requestSave = true;
             if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, hasDoc)) st.requestSaveAs = true;
-            // Save All: no multi-doc batch-save path exists; Save the active doc as the closest action.
-            if (ImGui::MenuItem("Save All", nullptr, false, hasDoc)) st.requestSave = true;
+            // Wave-5-fill: Save All iterates docTabs on the GL-thread pump (saves each saveable
+            // part/assembly; never-saved docs prompt a Save-As one at a time). Enabled when any
+            // tab is open.
+            if (ImGui::MenuItem("Save All", nullptr, false, hasDoc)) st.requestSaveAll = true;
             (void)docSaved;
             ImGui::Separator();
-            if (ImGui::BeginMenu("Export", hasDoc)) {
-                // No reachable export dispatch ids today (Sheet-Metal flat-DXF is the only export
-                // path and it is tab-specific). Greyed placeholders until export ids/flags exist.
-                ImGui::MenuItem("STEP (.step)...", nullptr, false, false);
-                ImGui::MenuItem("STL (.stl)...", nullptr, false, false);
-                ImGui::MenuItem("3MF (.3mf)...", nullptr, false, false);
-                ImGui::MenuItem("DXF (.dxf)...", nullptr, false, false);
+            // Wave-5-fill: 3D export to the formats engine.doc.formats.export_document accepts. Only
+            // a part/assembly tab (a DocMirror-backed doc) can be exported — a Drawing/ECAD tab leaves
+            // the mirror pointed at the hidden part, so we gate on it explicitly. Each item sets a
+            // one-shot requestExportFormat drained on the GL thread (native Save-As + exportFile), so
+            // the dialog never re-enters this menu walk. (Drawing export stays on the 2D panel's own
+            // DXF/PDF button — exportDrawing needs the drawing registry id, not this part doc.)
+            const bool canExport3d = hasDoc && !st.activeTabIsDrawing() && !st.activeTabIsEcad();
+            if (ImGui::BeginMenu("Export", canExport3d)) {
+                if (ImGui::MenuItem("STEP (.step)...")) st.requestExportFormat = "step";
+                if (ImGui::MenuItem("IGES (.iges)...")) st.requestExportFormat = "iges";
+                if (ImGui::MenuItem("STL (.stl)..."))   st.requestExportFormat = "stl";
+                if (ImGui::MenuItem("3MF (.3mf)..."))   st.requestExportFormat = "3mf";
+                if (ImGui::MenuItem("BREP (.brep)...")) st.requestExportFormat = "brep";
                 ImGui::EndMenu();
             }
             ImGui::Separator();
@@ -167,9 +175,11 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             if (ImGui::MenuItem("Cut", "Ctrl+X", false, hasDoc))   st.ribbonDispatch("edit_cut");
             if (ImGui::MenuItem("Copy", "Ctrl+C", false, hasDoc))  st.ribbonDispatch("edit_copy");
             if (ImGui::MenuItem("Paste", "Ctrl+V", false, hasDoc)) st.ribbonDispatch("edit_paste");
-            // Delete / Select All have no reachable backing from here — greyed placeholders.
-            ImGui::MenuItem("Delete", "Del", false, false);
-            ImGui::MenuItem("Select All", "Ctrl+A", false, false);
+            // Wave-5-fill: Delete / Select All act on the FeatureManager selection via the unified
+            // dispatcher (edit_delete / edit_select_all). Delete removes the selected feature(s);
+            // Select All selects every feature in the active part's tree.
+            if (ImGui::MenuItem("Delete", "Del", false, hasDoc))       st.ribbonDispatch("edit_delete");
+            if (ImGui::MenuItem("Select All", "Ctrl+A", false, hasDoc)) st.ribbonDispatch("edit_select_all");
         };
 
         auto drawViewMenu = [&]() {

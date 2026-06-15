@@ -509,6 +509,56 @@ static void exportFlatDxf(AppState& st) {
     }
 }
 
+// Wave-5-fill: File > Export <fmt> — export the ACTIVE part/assembly's bodies to a 3D format
+// engine.doc.formats.export_document accepts ("step"|"iges"|"stl"|"3mf"|"brep"). Picks a path
+// (native Save-As, or a cwd fallback when dialogs are disabled) then calls export_file via
+// DocMirror. Mirrors exportFlatDxf's shape. Called only from the GL-thread request pump (the menu
+// sets st.requestExportFormat) so the native dialog never re-enters an ImGui menu walk.
+static void exportFile3d(AppState& st, const std::string& fmt) {
+    if (!st.docMirror.hasDoc()) {
+        st.toast(ui::ToastLevel::Info, "Open a part or assembly first");
+        return;
+    }
+    // Per-format extension + native-dialog filter.
+    const char* ext = "step";
+    const char* filter = "STEP (*.step)\0*.step;*.stp\0All files (*.*)\0*.*\0";
+    if (fmt == "iges")      { ext = "iges"; filter = "IGES (*.iges)\0*.iges;*.igs\0All files (*.*)\0*.*\0"; }
+    else if (fmt == "stl")  { ext = "stl";  filter = "STL (*.stl)\0*.stl\0All files (*.*)\0*.*\0"; }
+    else if (fmt == "3mf")  { ext = "3mf";  filter = "3MF (*.3mf)\0*.3mf\0All files (*.*)\0*.*\0"; }
+    else if (fmt == "brep") { ext = "brep"; filter = "BREP (*.brep)\0*.brep\0All files (*.*)\0*.*\0"; }
+
+    // Suggested base name from the doc title (alnum/_/-, spaces -> _).
+    std::string title = st.docMirror.tree().is_object()
+                            ? st.docMirror.tree().value("name", std::string("part"))
+                            : std::string("part");
+    std::string base;
+    for (char c : title) {
+        if (c == ' ') base += '_';
+        else if (std::isalnum((unsigned char)c) || c == '_' || c == '-') base += c;
+    }
+    if (base.empty()) base = "part";
+
+    const bool dialogsDisabled = std::getenv("AI_CAD_NO_FILE_DIALOGS") != nullptr;
+    std::string path;
+    if (dialogsDisabled) {
+        path = (std::filesystem::current_path() / (base + "." + ext)).string();
+    } else {
+        path = ui::saveFileDialog(filter, ext, (base + "." + ext).c_str());
+        if (path.empty()) return;  // canceled
+    }
+
+    std::string err;
+    std::string written = st.docMirror.exportFile(st.worker, st.docMirror.docId(), path, fmt, err);
+    if (!written.empty()) {
+        st.addLog("[export] " + fmt + ": " + written);
+        st.toast(ui::ToastLevel::Info, "Exported " + written);
+    } else {
+        st.addLog("[export] " + fmt + " failed: " + err);
+        st.toast(ui::ToastLevel::Warn,
+                 err.empty() ? ("Export " + fmt + " failed") : err);
+    }
+}
+
 int run_gui(const char* screenshotPath) {
     const bool shot = screenshotPath != nullptr;
     if (!glfwInit()) return 1;
@@ -685,6 +735,19 @@ int run_gui(const char* screenshotPath) {
                 sketchMode.sketchPasteBegin(st);
             else if (st.clipboard.kind == AppState::Clipboard::Kind::Feature)
                 ui::featurePasteSelection(st);
+            return;
+        }
+        // Wave-5-fill: Edit > Delete / Select All. Like cut/copy/paste these route through the SAME
+        // lambda the menu shares. featureDeleteSelection applies a DocMirror op immediately; that is
+        // safe here because the menu bar draws BEFORE the FeatureManager tree walk this frame, so no
+        // tree-json iteration is live. Both stand down while a sketch is active (SketchMode owns the
+        // sketch-entity Del / marquee); with no sketch they act on the FeatureManager selection.
+        if (std::strcmp(cmd_id, "edit_delete") == 0) {
+            if (!sketchMode.active()) ui::featureDeleteSelection(st);
+            return;
+        }
+        if (std::strcmp(cmd_id, "edit_select_all") == 0) {
+            if (!sketchMode.active()) ui::featureSelectAll(st);
             return;
         }
         // DRAWINGS: "Make Drawing" creates a drawing + standard views from the active part and
@@ -1738,13 +1801,16 @@ int run_gui(const char* screenshotPath) {
         // CAD -> featureTreeOpenPath, ECAD/KiCad -> ecadOpenPath. Each open/save records Recent.
         // Gated on a live, idle worker (mirrors the FeatureManager toolbar's canDoc gate) so we never
         // swap the doc under a running call; a queued request waits one frame rather than firing early.
-        if (st.requestOpenDialog || !st.requestOpenPath.empty() || st.requestSave || st.requestSaveAs) {
+        if (st.requestOpenDialog || !st.requestOpenPath.empty() || st.requestSave || st.requestSaveAs ||
+            st.requestSaveAll || !st.requestExportFormat.empty()) {
             const bool fileReady = st.workerStarted && !st.job.running.load() && !st.agentV2Running;
             if (!fileReady) {
-                // Drop save/recent requests (need a doc); keep open requests pending until ready.
-                if (st.requestSave || st.requestSaveAs)
+                // Drop save/export/recent requests (need a doc); keep open requests pending until ready.
+                if (st.requestSave || st.requestSaveAs || st.requestSaveAll ||
+                    !st.requestExportFormat.empty())
                     st.toast(ui::ToastLevel::Info, "Busy — try again in a moment");
-                st.requestSave = st.requestSaveAs = false;
+                st.requestSave = st.requestSaveAs = st.requestSaveAll = false;
+                st.requestExportFormat.clear();
             } else {
             if (st.requestOpenDialog) {
                 st.requestOpenDialog = false;
@@ -1774,6 +1840,56 @@ int run_gui(const char* screenshotPath) {
                 st.requestSaveAs = false;
                 std::string saved = ui::featureTreeSaveDoc(st, /*saveAs=*/true);
                 if (!saved.empty()) st.pushRecentFile(saved);
+            }
+            // Wave-5-fill: Save All — save every part/assembly tab. Tabs with a known path re-save
+            // silently to it (DocMirror::save needs the mirror pointed at the doc, so we switch to
+            // each first); the never-saved ACTIVE doc falls back to a Save-As prompt (a batch must
+            // not pop one dialog per untitled doc). Drawing/ECAD tabs are skipped (not DocMirror
+            // docs — they have their own save). The original active tab is restored afterward.
+            if (st.requestSaveAll) {
+                st.requestSaveAll = false;
+                const int origActive = st.activeTab;
+                int savedCount = 0, failCount = 0;
+                for (int i = 0; i < (int)st.docTabs.size(); ++i) {
+                    AppState::DocTab& tab = st.docTabs[i];
+                    if (tab.kind == AppState::DocTab::TabKind::Drawing ||
+                        tab.kind == AppState::DocTab::TabKind::Schematic ||
+                        tab.kind == AppState::DocTab::TabKind::PCB)
+                        continue;  // not a DocMirror-backed doc
+                    if (!tab.path.empty()) {
+                        st.switchToTab(i);   // re-point the mirror at this doc (no-op if already active)
+                        std::string err;
+                        if (st.docMirror.save(st.worker, tab.path, err)) {
+                            tab.dirty = false;
+                            st.pushRecentFile(tab.path);
+                            ++savedCount;
+                        } else {
+                            st.addLog("[doc] save-all failed for " + tab.path + ": " + err);
+                            ++failCount;
+                        }
+                    } else if (i == origActive) {
+                        // Untitled active doc: a Save-As prompt (sets tab.path + s_docPath on success).
+                        // Re-point the mirror at it first (a prior iteration may have switched away).
+                        st.switchToTab(i);
+                        std::string saved = ui::featureTreeSaveDoc(st, /*saveAs=*/false);
+                        if (!saved.empty()) { st.pushRecentFile(saved); ++savedCount; }
+                    }
+                    // Other untitled tabs are left for an explicit per-doc Save (no batch dialogs).
+                }
+                if (origActive >= 0 && origActive < (int)st.docTabs.size())
+                    st.switchToTab(origActive);   // restore the originally-active document
+                if (savedCount || failCount)
+                    st.toast(failCount ? ui::ToastLevel::Warn : ui::ToastLevel::Info,
+                             "Save All: " + std::to_string(savedCount) + " saved" +
+                             (failCount ? (", " + std::to_string(failCount) + " failed") : ""));
+                else
+                    st.toast(ui::ToastLevel::Info, "Save All: nothing to save");
+            }
+            // Wave-5-fill: Export <fmt> — native Save-As + DocMirror::exportFile for the active doc.
+            if (!st.requestExportFormat.empty()) {
+                std::string fmt = st.requestExportFormat;
+                st.requestExportFormat.clear();
+                exportFile3d(st, fmt);
             }
             }  // fileReady
         }

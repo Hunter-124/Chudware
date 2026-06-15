@@ -233,6 +233,15 @@ public:
     std::string exportDrawing(WorkerClient& w, const std::string& drawingDocId,
                               const std::string& path, const std::string& format, std::string& err);
 
+    // ---- General 3D export (STEP / IGES / STL / 3MF / BREP) — File > Export ----
+    // Read-only passthrough of export_file (engine/doc/formats.py:_handler_export_file): compiles
+    // the document `docId`'s bodies and writes them to `path` in `format`. `format` is one of the
+    // literal strings export_document accepts: "step" | "iges" | "stl" | "3mf" | "brep". Does NOT
+    // touch the mirror. Returns the written absolute path (worker echoes {path}), or "" on error
+    // (err filled). `docId` is passed explicitly so the caller controls which doc is exported.
+    std::string exportFile(WorkerClient& w, const std::string& docId,
+                           const std::string& path, const std::string& format, std::string& err);
+
     // Re-pull the document tree + revision from the worker (doc_tree) and fire the listener.
     // C24: the public face of the formerly-private resyncTree — callers that mutated the doc
     // out-of-band (sketch drag/commit/exit, a v2 agent run) use this to bring the mirror back in

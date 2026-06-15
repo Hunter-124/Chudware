@@ -26,6 +26,7 @@
 #include "../render/overlays.h"
 
 #include "sketch_mode.h"   // C18
+#include "dragdrop.h"      // kFileDragPayload (Explorer drag source -> viewport drop target)
 #include "property_manager.h"  // C27-A: in-viewport parameter callouts
 #include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
 #include "drawing_panel.h"  // DRAWINGS: 2D sheet renderer for a Drawing tab
@@ -1100,6 +1101,18 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         ImGui::Image((ImTextureID)(intptr_t)renderer.colorTexture(), ImVec2((float)vw, (float)vh),
                      ImVec2(0, 1), ImVec2(1, 0));
         ImVec2 vr0 = ImGui::GetItemRectMin(), vr1 = ImGui::GetItemRectMax();
+        // Drop TARGET (Wave 3A item 5): dropping an in-app Explorer file row onto the viewport opens
+        // it. The payload is the dragged file's absolute path (NUL-terminated); we hand it to the
+        // GL-thread request pump via st.requestOpenPath, which routes CAD vs ECAD by extension — the
+        // same safe deferred-open path the Explorer double-click and File menu use. (OS-level file
+        // drops from Windows Explorer are handled separately by the GLFW drop callback in app.cpp.)
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload(ui::kFileDragPayload)) {
+                if (pl->Data && pl->DataSize > 0)
+                    st.requestOpenPath = std::string(static_cast<const char*>(pl->Data));
+            }
+            ImGui::EndDragDropTarget();
+        }
         const bool imgHovered = ImGui::IsItemHovered();
         // C25 W2-D: camera navigation. All of it is suppressed while sketching (camera is
         // plane-locked) except the wheel zoom, which stays usable. Any drag-navigation cancels an

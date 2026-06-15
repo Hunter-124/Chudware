@@ -19,6 +19,7 @@
 #include "imgui.h"
 
 #include "file_explorer.h"
+#include "dragdrop.h"       // kFileDragPayload (Explorer drag source -> viewport drop target)
 #include "feature_tree.h"   // featureTreeOpenPath / featureTreeActivePath
 #include "icons.h"          // getIcon / IconUV
 #include "layout.h"         // kLeftPaneExplorer
@@ -214,6 +215,14 @@ static void drawFileRow(AppState& st, const fs::path& root, const fs::path& p, c
             s_currentFolder = p.parent_path().string();
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) requestOpen(st, p);
         }
+        // Drag SOURCE: dragging a known-extension row onto the viewport opens it (the viewport is the
+        // matching drop target). The payload is the absolute path INCLUDING its NUL terminator so the
+        // target can read it straight back as a C string. Drag preview = the filename.
+        if (isKnownExt(ext) && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+            ImGui::SetDragDropPayload(kFileDragPayload, pathStr.c_str(), pathStr.size() + 1);
+            ImGui::TextUnformatted(p.filename().string().c_str());
+            ImGui::EndDragDropSource();
+        }
         // context menu
         if (ImGui::BeginPopupContextItem("##fctx")) {
             s_selectedPath = pathStr;
@@ -343,6 +352,13 @@ static void drawRecentSection(AppState& st) {
                                   ImGuiSelectableFlags_AllowDoubleClick) &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && exists)
                 requestOpen(st, p);
+            // Drag a Recent row onto the viewport to open it (same payload as the tree rows).
+            if (exists && isKnownExt(lowerExt(p)) &&
+                ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+                ImGui::SetDragDropPayload(kFileDragPayload, rp.c_str(), rp.size() + 1);
+                ImGui::TextUnformatted(p.filename().string().c_str());
+                ImGui::EndDragDropSource();
+            }
             if (!exists) ImGui::PopStyleColor();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", rp.c_str());
             ImGui::PopID();

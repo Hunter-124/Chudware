@@ -559,6 +559,56 @@ static void exportFile3d(AppState& st, const std::string& fmt) {
     }
 }
 
+// ---- Wave 3A item 5: OS file drop (Windows Explorer -> our window) --------------------------
+// GLFW delivers OS file drops to a static callback. We reach AppState via the window user pointer
+// (set once in run_gui after AppState is constructed) and route the FIRST dropped path with a known
+// CAD/ECAD extension to the GL-thread request pump (st.requestOpenPath), exactly like the File
+// Explorer's double-click / drag-to-viewport. Routing CAD vs ECAD by extension is done by the pump.
+//
+// Behavior on a MULTI-file drop: open the first valid file and toast that the rest were ignored
+// (the pump is single-shot per frame; opening a doc swaps the active tab, so silently opening N
+// docs would be surprising). Unknown extensions are skipped; if none are openable we toast.
+//
+// We CHAIN the ImGui-GLFW backend's drop callback (captured at install time) so ImGui still sees the
+// drop too (it does nothing harmful with it, but chaining keeps the backend contract intact).
+static GLFWdropfun g_prevDropCallback = nullptr;
+
+static bool dropPathHasKnownExt(const std::string& path) {
+    std::string ext = std::filesystem::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return ext == ".step+" || ext == ".step" || ext == ".stp" || ext == ".iges" || ext == ".igs" ||
+           ext == ".stl"   || ext == ".3mf"  || ext == ".ecad+" || ext == ".ecad" ||
+           ext == ".kicad_sch" || ext == ".kicad_pcb";
+}
+
+static void onFileDrop(GLFWwindow* win, int count, const char** paths) {
+    if (g_prevDropCallback) g_prevDropCallback(win, count, paths);   // keep ImGui's backend in the loop
+    AppState* stp = static_cast<AppState*>(glfwGetWindowUserPointer(win));
+    if (!stp || count <= 0 || !paths) return;
+    AppState& st = *stp;
+    std::string first;
+    int known = 0;
+    for (int i = 0; i < count; ++i) {
+        if (!paths[i]) continue;
+        if (dropPathHasKnownExt(paths[i])) {
+            ++known;
+            if (first.empty()) first = paths[i];
+        }
+    }
+    if (first.empty()) {
+        st.toast(ui::ToastLevel::Warn, "Drop a CAD or ECAD file to open it");
+        return;
+    }
+    // Route the first valid file through the same deferred pump the menu/Explorer use.
+    st.requestOpenPath = first;
+    st.addLog("[dnd] OS drop -> " + first);
+    if (known > 1)
+        st.toast(ui::ToastLevel::Info,
+                 "Opening " + std::filesystem::path(first).filename().string() +
+                 " (dropped " + std::to_string(known) + " files; opening the first)");
+}
+
 int run_gui(const char* screenshotPath) {
     const bool shot = screenshotPath != nullptr;
     if (!glfwInit()) return 1;
@@ -666,6 +716,13 @@ int run_gui(const char* screenshotPath) {
     st.hitLayout = &hitLayout;
     st.idPass = &idPass;
     st.overlays = &overlays;
+
+    // Wave 3A item 5: OS file drop. Expose AppState to the static drop callback via the GLFW window
+    // user pointer (unused elsewhere), then install onFileDrop. glfwSetDropCallback returns the
+    // previously-installed callback (ImGui's GLFW backend registered one during InitForOpenGL); we
+    // chain to it from onFileDrop so the backend contract is preserved.
+    glfwSetWindowUserPointer(win, &st);
+    g_prevDropCallback = glfwSetDropCallback(win, onFileDrop);
 
     // C17: PropertyManager — owned here, borrowed via st.propertyManager (opaque void*).
     ui::PropertyManager propertyManager;

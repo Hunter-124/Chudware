@@ -34,6 +34,11 @@ private:
     std::string errorText_;      // set when the eval failed
     bool pending_ = false;       // C39: an eval is in flight (window shows "Computing...")
     int  gen_ = 0;               // C39: bumped per eval; stale callbacks are ignored
+
+    // Mass Properties material override: combo index into the density preset table + the live
+    // density (g/cm3) sent to eval_mass. Changing either re-runs the evaluation.
+    int   massMaterial_ = 0;     // 0 = Steel (matches the engine default 7.85)
+    float massDensity_  = 7.85f;
 };
 
 }  // namespace ui

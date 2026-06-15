@@ -110,7 +110,7 @@ void EvaluateDialogs::runFieldEval(AppState& st, const std::string& method,
 }
 
 bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
-    if (cmdId == "eval_mass_props") { runEval(st, "eval_mass", nlohmann::json::object()); openWindow_ = "mass"; title_ = "Mass Properties"; return true; }
+    if (cmdId == "eval_mass_props") { runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}}); openWindow_ = "mass"; title_ = "Mass Properties"; return true; }
     if (cmdId == "eval_measure") {
         nlohmann::json refs = selectionRefs(st);
         runEval(st, "eval_measure", {{"refs", refs}});
@@ -168,6 +168,27 @@ void EvaluateDialogs::draw(AppState& st) {
             ImGui::TextWrapped("%s", errorText_.c_str());
             ImGui::PopStyleColor();
         } else if (openWindow_ == "mass") {
+            // Material override — density (g/cm3) is forwarded to the engine's eval_mass; changing
+            // the material preset or the density re-runs the evaluation. Last preset = Custom.
+            static const struct { const char* name; float d; } kMaterials[] = {
+                {"Steel", 7.85f}, {"Stainless", 8.00f}, {"Aluminum", 2.70f}, {"Titanium", 4.51f},
+                {"Brass", 8.50f}, {"ABS plastic", 1.05f}, {"PLA", 1.24f}, {"Custom", 0.0f},
+            };
+            const int kCustom = (int)(sizeof(kMaterials) / sizeof(kMaterials[0])) - 1;
+            ImGui::SetNextItemWidth(140 * ui::uiScale);
+            if (ImGui::Combo("Material", &massMaterial_,
+                             "Steel\0Stainless\0Aluminum\0Titanium\0Brass\0ABS plastic\0PLA\0Custom\0")) {
+                if (massMaterial_ != kCustom) massDensity_ = kMaterials[massMaterial_].d;
+                runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}});
+            }
+            ImGui::SetNextItemWidth(140 * ui::uiScale);
+            if (ImGui::InputFloat("Density (g/cm3)", &massDensity_, 0.0f, 0.0f, "%.3f"))
+                massMaterial_ = kCustom;
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                if (massDensity_ < 0.0f) massDensity_ = 0.0f;
+                runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}});
+            }
+            ImGui::Separator();
             ImGui::Text("Volume:  %.3f mm3", result_.value("volume_mm3", 0.0));
             ImGui::Text("Mass:    %.3f g", result_.value("mass_g", 0.0));
             if (result_.contains("com") && result_["com"].is_array() && result_["com"].size() == 3)

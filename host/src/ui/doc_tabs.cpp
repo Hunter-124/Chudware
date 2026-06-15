@@ -13,15 +13,28 @@
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
 #include "../ui_theme.h"   // ui::uiScale, ui::palette
+#include "ecad/ecad_panel.h"  // Wave 2: New Schematic/PCB feed the editor mirror (ecadEditorMirror)
+#include "ecad/ecad_mirror.h" // Wave 2: complete EcadMirror type for setDocId in the chooser path
 
 namespace ui {
 
 // Deferred actions, applied after the strip finishes drawing (see header note).
 static int  s_switchTo   = -1;   // tab index to activate, or -1
 static int  s_closeIdx   = -1;   // tab index to close, or -1
-static bool s_newPart    = false;
+// Wave 2: the "+" New-Document chooser. The clicked menu item records which kind of doc to create;
+// the actual create+addTab runs after the strip is drawn (deferred, like switch/close), so it never
+// mutates docTabs mid-iteration. -1 = nothing requested this frame.
+enum class NewDocKind { None = -1, Part = 0, Assembly, Drawing, Schematic, PCB };
+static NewDocKind s_newDoc = NewDocKind::None;
 // Unsaved-changes prompt: the tab the user asked to close while it had unsaved edits.
 static int  s_confirmCloseIdx = -1;
+// Wave 2: set true to request the New-Document chooser popup open this frame (the "+" button click,
+// or a Ctrl+N hook from app.cpp via openNewDocChooser()). Consumed inside drawDocTabs.
+static bool s_openChooser = false;
+
+// Forward decls (definitions below drawDocTabs, which calls them).
+void createNewDoc(AppState& st, int kindOrd);
+void openNewDocChooser();
 
 // A single tab, placed explicitly at screen position (x, y0). Returns the tab WIDTH so the caller
 // can advance to the next tab. Records a deferred switch/close into the file statics. Layout:
@@ -131,7 +144,7 @@ float drawDocTabs(AppState& st, float topY) {
 
     s_switchTo = -1;
     s_closeIdx = -1;
-    s_newPart = false;
+    s_newDoc = NewDocKind::None;
 
     // Explicit x-cursor placement (no SameLine/Dummy bookkeeping): each tab is drawn at the running
     // x and returns its width. The strip never wraps; very many tabs just clip at the window edge.
@@ -143,7 +156,9 @@ float drawDocTabs(AppState& st, float topY) {
         x += drawOneTab(st, i, x, y0, barH) + gap;
     }
 
-    // "+" New Part button at the end of the strip.
+    // "+" New-Document button at the end of the strip — opens a chooser popup (Wave 2). Clicking it
+    // (or Ctrl+N via openNewDocChooser()) opens "##newdocmenu"; each item records a deferred
+    // NewDocKind applied after the strip is drawn (so docTabs isn't mutated mid-iteration).
     {
         float btn = barH;
         ImVec2 p0(x, y0);
@@ -160,8 +175,23 @@ float drawDocTabs(AppState& st, float topY) {
             ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
         dl->AddLine(ImVec2(c.x - g, c.y), ImVec2(c.x + g, c.y), col, 1.6f * s);
         dl->AddLine(ImVec2(c.x, c.y - g), ImVec2(c.x, c.y + g), col, 1.6f * s);
-        if (hov) ImGui::SetTooltip("New Part");
-        if (clicked) s_newPart = true;
+        if (hov) ImGui::SetTooltip("New document");
+        if (clicked || s_openChooser) { ImGui::OpenPopup("##newdocmenu"); s_openChooser = false; }
+        // Anchor the popup just under the "+" button.
+        ImGui::SetNextWindowPos(ImVec2(p0.x, p0.y + btn));
+        if (ImGui::BeginPopup("##newdocmenu")) {
+            if (ImGui::MenuItem("New Part"))      s_newDoc = NewDocKind::Part;
+            if (ImGui::MenuItem("New Assembly"))  s_newDoc = NewDocKind::Assembly;
+            // Make Drawing needs an active PART/ASM tab to project from; gray it out otherwise.
+            const bool canDraw = st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+                                 (st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Part ||
+                                  st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly);
+            if (ImGui::MenuItem("New Drawing", nullptr, false, canDraw)) s_newDoc = NewDocKind::Drawing;
+            ImGui::Separator();
+            if (ImGui::MenuItem("New Schematic")) s_newDoc = NewDocKind::Schematic;
+            if (ImGui::MenuItem("New PCB"))       s_newDoc = NewDocKind::PCB;
+            ImGui::EndPopup();
+        }
     }
 
     // ---- unsaved-changes confirmation prompt ----
@@ -208,25 +238,77 @@ float drawDocTabs(AppState& st, float topY) {
         st.switchToTab(s_switchTo);
         s_switchTo = -1;
     }
-    if (s_newPart) {
-        s_newPart = false;
-        std::string err;
-        // newPart fires the mirror listener (a doc change, not an edit); suppress the dirty marker
-        // so the new tab starts clean.
-        st.suppressTabDirty = true;
-        bool ok = st.docMirror.newPart(st.worker, err);
-        st.suppressTabDirty = false;
-        if (ok) {
-            st.addLog("[tabs] new part  rev=" + std::to_string(st.docMirror.revision()));
-            st.clearViewportForNewDoc();
-            st.addDocTab(/*isAssembly=*/false);
-        } else {
-            st.addLog("[err] new part: " + err);
-            st.toast(ui::ToastLevel::Error, "New part failed: " + err);
-        }
+    if (s_newDoc != NewDocKind::None) {
+        const NewDocKind kind = s_newDoc;
+        s_newDoc = NewDocKind::None;
+        createNewDoc(st, (int)kind);
     }
 
     return barH;
 }
+
+// Wave 2: New-Document chooser action — create the worker doc + open a matching tab. Part/Assembly
+// go through DocMirror (with the dirty-suppress discipline) + addDocTab; Drawing reuses makeDrawing;
+// Schematic/PCB call ecad_new directly and addEcadTab, feeding the editor mirror via the public ECAD
+// API. `kind` is a NewDocKind ordinal (0=Part,1=Assembly,2=Drawing,3=Schematic,4=PCB). Kept as a free
+// function (not a static) so app.cpp's Ctrl+N hook can request it via openNewDocChooser() instead.
+void createNewDoc(AppState& st, int kindOrd) {
+    const NewDocKind kind = (NewDocKind)kindOrd;
+    if (kind == NewDocKind::Part || kind == NewDocKind::Assembly) {
+        const bool asm_ = (kind == NewDocKind::Assembly);
+        std::string err;
+        // new{Part,Assembly} fires the mirror listener (a doc change, not an edit); suppress the
+        // dirty marker so the new tab starts clean.
+        st.suppressTabDirty = true;
+        bool ok = asm_ ? st.docMirror.newAssembly(st.worker, err)
+                       : st.docMirror.newPart(st.worker, err);
+        st.suppressTabDirty = false;
+        if (ok) {
+            st.addLog(std::string("[tabs] new ") + (asm_ ? "assembly" : "part") +
+                      "  rev=" + std::to_string(st.docMirror.revision()));
+            st.clearViewportForNewDoc();
+            st.addDocTab(/*isAssembly=*/asm_);
+            if (asm_) { st.showRibbon = true; st.ribbonTab = AppState::RT_Assembly; }
+        } else {
+            st.addLog(std::string("[err] new ") + (asm_ ? "assembly" : "part") + ": " + err);
+            st.toast(ui::ToastLevel::Error,
+                     std::string("New ") + (asm_ ? "assembly" : "part") + " failed: " + err);
+        }
+        return;
+    }
+    if (kind == NewDocKind::Drawing) {
+        st.makeDrawing();   // guards on an active part/asm tab itself + toasts if none
+        return;
+    }
+    if (kind == NewDocKind::Schematic || kind == NewDocKind::PCB) {
+        const char* ek = (kind == NewDocKind::PCB) ? "pcb" : "sch";
+        nlohmann::json res;
+        std::string err;
+        if (!st.worker.call("ecad_new", {{"kind", ek}}, res, err) ||
+            (res.is_object() && res.contains("code"))) {
+            const std::string msg = err.empty() && res.is_object()
+                                        ? res.value("message", std::string("engine error")) : err;
+            st.addLog(std::string("[err] new ecad ") + ek + ": " + msg);
+            st.toast(ui::ToastLevel::Error, std::string("New ") +
+                     (kind == NewDocKind::PCB ? "PCB" : "schematic") + " failed: " + msg);
+            return;
+        }
+        const std::string id = res.value("doc_id", std::string());
+        const int rev = (res.contains("revision") && res["revision"].is_number_integer())
+                            ? res["revision"].get<int>() : 0;
+        // Open the tab FIRST so it becomes active — the ECAD editor's state() resolver then targets
+        // this tab's per-document EcadEditorState before we load the worker response into the mirror.
+        st.addEcadTab(ek, id, rev, /*title=*/std::string());
+        if (!id.empty()) ui::ecadEditorMirror().setDocId(id);
+        ui::ecadEditorLoadResponse(res);   // {revision,kind,tree,compile} -> active tab's mirror
+        st.toast(ui::ToastLevel::Info,
+                 std::string("New ECAD ") + (kind == NewDocKind::PCB ? "board" : "schematic"));
+        return;
+    }
+}
+
+// Wave 2: request the New-Document chooser popup open on the next strip draw (e.g. a Ctrl+N hook in
+// app.cpp). Safe to call anytime; the flag is consumed inside drawDocTabs.
+void openNewDocChooser() { s_openChooser = true; }
 
 }  // namespace ui

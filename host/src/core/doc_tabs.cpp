@@ -18,6 +18,8 @@
 #include "../worker_client.h"
 #include "../ui/sketch_mode.h"        // exit a mid-edit sketch before switching
 #include "../ui/property_manager.h"   // cancel a mid-edit PM form before switching
+#include "../ui/ecad/ecad_panel.h"    // Wave 2: point the ECAD editor at the active Schematic/PCB tab
+#include "../ui/ecad/ecad_mirror.h"   // Wave 2: complete EcadMirror type for setDocId on switch
 
 // Safe JSON string accessor (local; avoids pulling the app_state.h jstr overloads here).
 static std::string jtab(const nlohmann::json& o, const char* k) {
@@ -62,11 +64,52 @@ static void exitActiveEdits(AppState& st) {
         st.propertyManager->cancelEdits(st);
 }
 
+// Wave 2 (GUI rework): open an already-created worker ECAD doc as a new Schematic/PCB tab + make it
+// active. The caller (the New-Document chooser / ribbon New Schematic|PCB) has already run ecad_new
+// and adopted the result into the editor mirror (st.ecadDocId/ecadRevision are set). This appends a
+// matching tab carrying that ecad id/revision and points the editor at it. The Drawing-tab discipline
+// applies: no DocMirror touch. exitActiveEdits first so no half-edited CAD state straddles the switch.
+void AppState::addEcadTab(const std::string& kind, const std::string& ecadDocId_,
+                          int ecadRevision_, const std::string& title) {
+    if (ecadDocId_.empty()) return;
+    exitActiveEdits(*this);
+    // Save the leaving 3D tab's camera (mirrors switchToTab step 2; skipped for drawing/ECAD tabs).
+    if (activeTab >= 0 && activeTab < (int)docTabs.size() &&
+        docTabs[activeTab].kind != DocTab::TabKind::Drawing &&
+        docTabs[activeTab].kind != DocTab::TabKind::Schematic &&
+        docTabs[activeTab].kind != DocTab::TabKind::PCB) {
+        DocTab& cur = docTabs[activeTab];
+        cur.yaw = yaw; cur.pitch = pitch; cur.zoom = zoom;
+        cur.pan[0] = pan[0]; cur.pan[1] = pan[1]; cur.pan[2] = pan[2];
+        cur.camValid = true;
+    }
+
+    DocTab t;
+    t.kind = (kind == "pcb") ? DocTab::TabKind::PCB : DocTab::TabKind::Schematic;
+    t.ecadDocId = ecadDocId_;
+    t.ecadRevision = ecadRevision_;
+    t.title = title.empty() ? (kind == "pcb" ? std::string("PCB1") : std::string("Schematic1"))
+                            : title;
+    docTabs.push_back(std::move(t));
+    activeTab = (int)docTabs.size() - 1;
+    // Keep the AppState reflection in step (app.cpp ECAD helpers read st.ecadDocId/ecadRevision).
+    ecadDocId = ecadDocId_;
+    ecadRevision = ecadRevision_;
+    animActive = false;
+    showRibbon = true;
+    ribbonTab = RT_PCB;
+    wantFocusEcad = 6;
+    addLog("[tabs] new ECAD " + kind + " tab '" + t.title + "' (" + ecadDocId_ + ")");
+}
+
 void AppState::switchToTab(int idx) {
     if (idx < 0 || idx >= (int)docTabs.size()) return;
-    // Already-active no-op early-out (part/asm: also require the mirror to match; drawing: index).
+    // Already-active no-op early-out (part/asm: also require the mirror to match; drawing/ECAD: by
+    // index, since they don't drive the DocMirror — their id lives in a separate worker registry).
     if (idx == activeTab) {
-        if (docTabs[idx].kind == DocTab::TabKind::Drawing) return;
+        if (docTabs[idx].kind == DocTab::TabKind::Drawing ||
+            docTabs[idx].kind == DocTab::TabKind::Schematic ||
+            docTabs[idx].kind == DocTab::TabKind::PCB) return;
         if (docMirror.docId() == docTabs[idx].docId) return;
     }
 
@@ -74,9 +117,12 @@ void AppState::switchToTab(int idx) {
     exitActiveEdits(*this);
 
     // 2) Save the LEAVING tab's camera so it keeps its own view (only meaningful for a 3D part/asm
-    //    tab — a Drawing tab's "camera" is its sheet pan/zoom, persisted live in the tab struct).
+    //    tab — a Drawing tab's "camera" is its sheet pan/zoom, and an ECAD tab's is its 2D canvas
+    //    pan/zoom, both persisted live in their own state; the 3D camera doesn't apply to either).
     if (activeTab >= 0 && activeTab < (int)docTabs.size() &&
-        docTabs[activeTab].kind != DocTab::TabKind::Drawing) {
+        docTabs[activeTab].kind != DocTab::TabKind::Drawing &&
+        docTabs[activeTab].kind != DocTab::TabKind::Schematic &&
+        docTabs[activeTab].kind != DocTab::TabKind::PCB) {
         DocTab& cur = docTabs[activeTab];
         cur.yaw = yaw; cur.pitch = pitch; cur.zoom = zoom;
         cur.pan[0] = pan[0]; cur.pan[1] = pan[1]; cur.pan[2] = pan[2];
@@ -91,9 +137,42 @@ void AppState::switchToTab(int idx) {
     if (dst0.kind == DocTab::TabKind::Drawing) {
         activeTab = idx;
         animActive = false;
-        if (ribbonTab == RT_Assembly) ribbonTab = RT_Features;  // a drawing has no Assembly context
+        // A drawing has no Assembly/PCB context; otherwise it keeps whatever ribbon was forward.
+        if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB) ribbonTab = RT_Features;
         refreshDrawingTab(idx);
         addLog("[tabs] switched to drawing '" + dst0.title + "' (" + dst0.drawingDocId + ")");
+        return;
+    }
+
+    // 2c) SCHEMATIC / PCB tab: like a Drawing, do NOT touch the DocMirror — an ECAD id lives in the
+    //     worker's separate ecad_* registry, and the central area shows the ECAD editor canvas (the
+    //     active part/asm stays loaded behind it). Point the editor at this tab's doc + revision and
+    //     refresh its mirror (ecad_tree) so the canvas reflects any out-of-band edits, then surface
+    //     the ECAD dock with the PCB ribbon forward. activeTab is set BEFORE the mirror load so the
+    //     ecad_panel state() resolver targets this tab's per-document EcadEditorState.
+    if (dst0.kind == DocTab::TabKind::Schematic || dst0.kind == DocTab::TabKind::PCB) {
+        activeTab = idx;
+        animActive = false;
+        ecadDocId   = dst0.ecadDocId;     // mirror the active ECAD doc onto AppState (app.cpp helpers)
+        ecadRevision = dst0.ecadRevision;
+        if (!ecadDocId.empty()) {
+            ui::ecadEditorMirror().setDocId(ecadDocId);
+            nlohmann::json tr;
+            std::string err;
+            if (worker.call("ecad_tree", {{"doc_id", ecadDocId}}, tr, err) &&
+                tr.is_object() && !tr.contains("code")) {
+                if (tr.contains("revision") && tr["revision"].is_number_integer())
+                    ecadRevision = tr["revision"].get<int>();
+                dst0.ecadRevision = ecadRevision;
+                ui::ecadEditorLoadResponse(tr);
+            } else if (!err.empty()) {
+                addLog("[tabs] ecad_tree on switch failed for " + ecadDocId + ": " + err);
+            }
+        }
+        showRibbon = true;
+        ribbonTab = RT_PCB;
+        wantFocusEcad = 6;                 // surface the ECAD editor dock (focus settles over frames)
+        addLog("[tabs] switched to ECAD '" + dst0.title + "' (" + dst0.ecadDocId + ")");
         return;
     }
 
@@ -140,9 +219,11 @@ void AppState::switchToTab(int idx) {
         pan[0] = dst.pan[0]; pan[1] = dst.pan[1]; pan[2] = dst.pan[2];
     }
 
-    // 7) Assembly docs want the Assembly ribbon tab forward (mirrors New Assembly behavior).
+    // 7) Contextual ribbon (Wave 2 2D): Assembly docs want the Assembly tab forward (mirrors New
+    //    Assembly). A Part has no Assembly/PCB context, so coming from either (e.g. switching from a
+    //    Schematic/PCB tab, or an assembly) snaps the ribbon back to Features.
     if (dst.isAssembly) { showRibbon = true; ribbonTab = RT_Assembly; }
-    else if (ribbonTab == RT_Assembly) ribbonTab = RT_Features;  // a part has no Assembly context
+    else if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB) ribbonTab = RT_Features;
 
     addLog("[tabs] switched to '" + dst.title + "' (doc " + dst.docId +
            ", rev " + std::to_string(docMirror.revision()) + ")");
@@ -161,6 +242,18 @@ void AppState::closeDocTab(int idx) {
         if (!closing.drawingDocId.empty() &&
             !worker.call("drawing_close", {{"doc_id", closing.drawingDocId}}, res, err))
             addLog("[tabs] drawing_close failed for " + closing.drawingDocId + ": " + err);
+    } else if (closing.kind == DocTab::TabKind::Schematic ||
+               closing.kind == DocTab::TabKind::PCB) {
+        // An ECAD tab lives in the worker's separate ecad_* registry, so it closes via
+        // ecad_close {doc_id: <ecad id>} (analogue of drawing_close for the drawing registry).
+        nlohmann::json res;
+        std::string err;
+        if (!closing.ecadDocId.empty() &&
+            !worker.call("ecad_close", {{"doc_id", closing.ecadDocId}}, res, err))
+            addLog("[tabs] ecad_close failed for " + closing.ecadDocId + ": " + err);
+        // If this was the doc the editor is pointing at, drop the AppState reflection so a stale id
+        // can't drive the panel after the tab is gone (a neighbor switch re-points it if needed).
+        if (ecadDocId == closing.ecadDocId) { ecadDocId.clear(); ecadRevision = -1; }
     } else {
         nlohmann::json res;
         std::string err;
@@ -213,6 +306,10 @@ void AppState::ensureActiveTab() {
     // re-pointed it), so the reconcile below would steal focus back to that part's tab. Leave the
     // drawing active — the central area is showing its 2D sheet.
     if (activeTabIsDrawing()) return;
+    // Wave 2: same for a Schematic/PCB tab — the DocMirror points at whatever part was last active
+    // behind the ECAD editor (or nothing), so reconciling would yank focus off the ECAD tab. The
+    // ECAD editor owns the center; leave the ECAD tab active.
+    if (activeTabIsEcad()) return;
     if (!docMirror.hasDoc()) return;          // empty start state — nothing to track
     int idx = tabIndexForActiveDoc();
     if (idx >= 0) {
@@ -234,6 +331,9 @@ void AppState::syncActiveTabTitle() {
     if (activeTab < 0 || activeTab >= (int)docTabs.size()) return;
     DocTab& t = docTabs[activeTab];
     if (t.kind == DocTab::TabKind::Drawing) return;  // drawing keeps its own name, not the mirror's
+    // Wave 2: ECAD tabs keep their own name too — their doc lives in the ecad_* registry, not the
+    // DocMirror, so the DocMirror tree's name (a part's) must not overwrite the schematic/PCB title.
+    if (t.kind == DocTab::TabKind::Schematic || t.kind == DocTab::TabKind::PCB) return;
     t.isAssembly = docMirror.tree().is_object() &&
                    (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
     t.title = docTitle(docMirror.tree(), t.isAssembly);

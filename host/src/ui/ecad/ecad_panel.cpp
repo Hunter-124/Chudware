@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <memory>   // Wave 2: std::make_shared<EcadEditorState> for per-DocTab editor state
 #include <string>
 #include <vector>
 
@@ -17,10 +18,11 @@
 
 namespace ui {
 
-namespace {
-
-// Scaffold-local editor state. In the permanent wiring these three move onto AppState (see
-// ECAD_UI_INTEGRATION.md §(e)); kept here so the scaffold honours the "do not edit AppState" rule.
+// Per-document ECAD editor state. Wave 2 (GUI rework) promoted this OFF the file-static singleton:
+// the per-document fields (mirror, canvas, selection, edit buffers) now live on each Schematic/PCB
+// DocTab (AppState::DocTab::ecadState, a shared_ptr<ui::EcadEditorState>) so multiple ECAD docs can
+// be open at once. The struct is in `namespace ui` (not the anonymous namespace) so app_state.h's
+// forward declaration `struct ui::EcadEditorState` matches; its full layout still lives ONLY here.
 struct EcadEditorState {
     EcadMirror mirror;
     EcadCanvas canvas;
@@ -52,9 +54,40 @@ struct EcadEditorState {
     int lastAnalysis = 0;
 };
 
-EcadEditorState& state() {
+namespace {
+
+// ---------------------------------------------------------------------------------------------
+// Active-document resolution. Wave 2 moved the editor state onto the active Schematic/PCB DocTab,
+// but the public accessors below (ecadEditorMirror / ecadEditorLoadResponse / ...) take no AppState.
+// drawEcadEditor(st) records the AppState each frame; state() then returns the active ECAD tab's
+// EcadEditorState (lazily allocating the DocTab's shared_ptr). A process-wide fallback covers the
+// no-tab paths (headless shots that set st.ecadDocId directly, or a call before the first draw).
+// ---------------------------------------------------------------------------------------------
+AppState* g_app = nullptr;  // set by drawEcadEditor(st) each frame; null before the first draw
+
+// The fallback used when no ECAD tab is active (or no AppState is known yet). Single-document ECAD
+// behaviour (the only case the scaffold ever exercised) is unchanged: with zero ECAD tabs every
+// accessor resolves here, exactly like the old file-static singleton.
+EcadEditorState& fallbackState() {
     static EcadEditorState s;
     return s;
+}
+
+// Resolve the EcadEditorState the panel + accessors operate on: the active Schematic/PCB tab's
+// (created on demand), else the process-wide fallback. Always returns a live reference.
+EcadEditorState& state() {
+    if (g_app) {
+        AppState& st = *g_app;
+        if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+            AppState::DocTab& t = st.docTabs[st.activeTab];
+            if (t.kind == AppState::DocTab::TabKind::Schematic ||
+                t.kind == AppState::DocTab::TabKind::PCB) {
+                if (!t.ecadState) t.ecadState = std::make_shared<EcadEditorState>();
+                return *t.ecadState;
+            }
+        }
+    }
+    return fallbackState();
 }
 
 ImVec4 v4(const float c[4], float a = 1.0f) { return ImVec4(c[0], c[1], c[2], c[3] * a); }
@@ -753,6 +786,7 @@ void ecadEditorLoadResponse(const nlohmann::json& resp) {
 }
 
 void drawEcadEditor(AppState& st) {
+    g_app = &st;                  // Wave 2: route state() to this frame's active ECAD tab
     EcadEditorState& es = state();
     const ui::Palette& pal = ui::palette;
     const float sc = ui::uiScale;

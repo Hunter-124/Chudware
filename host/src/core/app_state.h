@@ -44,7 +44,13 @@ class SketchMode;
 class SimPanel;
 class AsmPanels;
 class ActivityPanel;
+// Wave 2 (GUI rework): the per-document ECAD editor state (mirror + canvas + selection + edit
+// buffers) lives on each Schematic/PCB DocTab. Its full definition stays in ecad_panel.cpp (it
+// owns EcadMirror/EcadCanvas); AppState only needs an opaque pointer so app_state.h stays light.
+struct EcadEditorState;
 }  // namespace ui
+
+#include <memory>  // std::shared_ptr<ui::EcadEditorState> on each ECAD DocTab
 namespace core { class SimClient; }
 
 extern const char* kStarterCode;
@@ -311,9 +317,13 @@ struct AppState {
     // area shows a 2D sheet instead of the 3D viewport. switchToTab/ensureActiveTab keep their hands
     // off the mirror for Drawing tabs so the underlying part stays loaded behind the drawing.
     struct DocTab {
-        enum class TabKind { Part, Assembly, Drawing };
+        // Wave 2 (GUI rework): Schematic/PCB appended at the END so existing numeric ordinals
+        // (Part=0, Assembly=1, Drawing=2) don't shift. A Schematic/PCB tab is NOT a DocMirror doc:
+        // like Drawing it leaves the mirror untouched and carries its OWN id (ecadDocId) into the
+        // worker's ecad_* registry, with its per-document editor state on `ecadState` below.
+        enum class TabKind { Part, Assembly, Drawing, Schematic, PCB };
         TabKind     kind = TabKind::Part;
-        std::string docId;          // worker doc id (registry key) — empty for Drawing tabs
+        std::string docId;          // worker doc id (registry key) — empty for Drawing/ECAD tabs
         std::string title;          // display name (doc "name", "Part1"/"Assembly1")
         bool        isAssembly = false;
         bool        dirty = false;  // edits since last save (asterisk on the tab)
@@ -360,6 +370,17 @@ struct AppState {
         int         detailStage = 0;            // 0=pick center, 1=drag radius
         std::string detailViewId;               // parent view the detail circle is anchored to
         float       detailCx = 0, detailCy = 0; // detail circle center (sheet mm)
+
+        // ---- Schematic / PCB tabs only (kind == Schematic || PCB) ----
+        // An ECAD tab is backed by a SEPARATE worker registry (ecad_* RPCs), not the DocMirror.
+        // ecadDocId is the worker ecad doc id; ecadRevision is the optimistic-concurrency base.
+        // ecadState holds this document's editor view (EcadMirror + EcadCanvas + selection + edit
+        // buffers) so multiple ECAD docs can be open at once — the per-document fields that used to
+        // live in ecad_panel.cpp's file-static singleton. It is a shared_ptr to an opaque type whose
+        // full layout lives in ecad_panel.cpp; lazily created on first activation of the tab.
+        std::string ecadDocId;                  // worker ecad doc id (NOT a doc_* id) — ECAD tabs
+        int         ecadRevision = -1;          // last known ECAD revision for this doc
+        std::shared_ptr<ui::EcadEditorState> ecadState;  // per-document ECAD editor state
     };
     std::vector<DocTab> docTabs;
     int activeTab = -1;             // index into docTabs; -1 = no document open (start state)
@@ -413,6 +434,20 @@ struct AppState {
         return activeTab >= 0 && activeTab < (int)docTabs.size() &&
                docTabs[activeTab].kind == DocTab::TabKind::Drawing;
     }
+    // Wave 2: true when the active tab is a Schematic or PCB (the ECAD editor owns the center, like
+    // a Drawing tab the DocMirror is left untouched). Panels gated to a live CAD doc should also
+    // exclude this so they don't act on the part hiding behind the ECAD canvas.
+    bool activeTabIsEcad() const {
+        return activeTab >= 0 && activeTab < (int)docTabs.size() &&
+               (docTabs[activeTab].kind == DocTab::TabKind::Schematic ||
+                docTabs[activeTab].kind == DocTab::TabKind::PCB);
+    }
+    // Wave 2 (GUI rework): open a freshly-created worker ECAD doc (ecad_new sch|pcb) as a new
+    // Schematic/PCB tab + activate it. Implemented in core/doc_tabs.cpp; the worker call + mirror
+    // load happen via the app.cpp ECAD helpers, this just appends the tab and points the editor at
+    // it. kind is "sch" (Schematic) or "pcb" (PCB).
+    void addEcadTab(const std::string& kind, const std::string& ecadDocId,
+                    int ecadRevision, const std::string& title);
 
     // ---- topology picking (C15) — id pass + overlays owned by run_gui; AppState borrows ----
     render::IdPass* idPass = nullptr;

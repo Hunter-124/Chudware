@@ -21,4 +21,9 @@ namespace ui {
 // A pending close (X / middle-click) on a dirty tab raises a confirmation modal handled inside.
 float drawDocTabs(AppState& state, float topY);
 
+// Wave 2 (GUI rework): request the "+" New-Document chooser popup open on the next strip draw. The
+// chooser offers New Part / New Assembly / New Drawing / New Schematic / New PCB. Used by app.cpp's
+// Ctrl+N key hook (the "+" button opens it directly). No-op if the strip isn't drawn (no document).
+void openNewDocChooser();
+
 }  // namespace ui

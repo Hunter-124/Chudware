@@ -113,6 +113,12 @@ bool ecadCall(AppState& st, const char* method, const nlohmann::json& params, nl
 void ecadNewDoc(AppState& st, const char* kind) {
     nlohmann::json res;
     if (!ecadCall(st, "ecad_new", {{"kind", kind}}, res)) return;
+    // Wave 2 (GUI rework): open a first-class Schematic/PCB tab for the new doc and make it active
+    // BEFORE adopting, so ecadAdopt's mirror load (ecadEditorLoadResponse) lands in THIS tab's
+    // per-document EcadEditorState (the ecad_panel state() resolver targets the active ECAD tab).
+    const std::string id = jstr(res, "doc_id");
+    const int rev = jint(res, "revision");
+    st.addEcadTab(kind, id, rev, /*title=*/std::string());
     ecadAdopt(st, res);
     st.addLog(std::string("[ecad] new ") + kind + " doc " + st.ecadDocId);
     st.toast(ui::ToastLevel::Info,
@@ -1639,6 +1645,12 @@ int run_gui(const char* screenshotPath) {
                     st.docRedo();
                 }
             }
+            // Wave 2 (GUI rework): Ctrl+N opens the "+" New-Document chooser (Part/Assembly/Drawing/
+            // Schematic/PCB). Skip while a text field owns input. The chooser flag is consumed by the
+            // doc-tab strip's draw; it shows only when at least one document is already open.
+            if (!textFocus && (io.KeyCtrl || io.KeySuper) && !io.KeyShift &&
+                ImGui::IsKeyPressed(ImGuiKey_N, false))
+                ui::openNewDocChooser();
         }
 
         // Re-push palette-derived viewport visuals every frame so a runtime theme toggle (from the

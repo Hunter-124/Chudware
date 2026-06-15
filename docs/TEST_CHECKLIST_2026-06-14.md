@@ -81,6 +81,8 @@ Mates** section.
 - [ ] Mass Properties now has a **Material** preset (Steel/Aluminum/Titanium/Brass/ABS/PLA/…) + an
       editable **Density (g/cm³)**. Switch Steel→Aluminum → Mass drops ~2.9× (7.85→2.70). Editing
       density selects Custom.
+- [ ] Mass Properties also shows **Principal axes** (Px1/Px2/Px3 = principal moment + its unit axis
+      vector) below the inertia tensor — scroll the dialog if the pane is short.
 - [ ] Measure: a circular edge now also shows **diameter** (= 2×radius). Repeated measurements
       accumulate in a **History** list (newest first) with a **Clear** button.
 

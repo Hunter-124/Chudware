@@ -1042,7 +1042,22 @@ static bool toolbarIconBtn(const char* id, const char* iconName, const char* too
 // "apply a just-opened doc" seam that resets the viewport AND refreshes the geometry (the old
 // path-strip open updated the tree but never loaded the mesh).
 
+// Save filter: native AI-CAD part only (Save/Save As always write .step+).
 static const char* kStepPlusFilter = "AI-CAD part (*.step+)\0*.step+\0All files (*.*)\0*.*\0";
+
+// F4: Open/Import filter — every format the engine can import (see engine/doc/formats.py
+// FORMAT_REGISTRY / doc_formats RPC, the future dynamic source). A leading aggregate entry lets
+// the user see all CAD+mesh files at once, then grouped entries narrow by family, then All files.
+// Win32 common-dialog layout: NUL-separated "label\0patterns\0"... pairs, double-NUL terminated
+// (the C string literal's own trailing NUL supplies the final one).
+static const char* kImportFilter =
+    "All CAD & mesh files\0*.step+;*.step;*.stp;*.iges;*.igs;*.brep;*.stl;*.3mf;*.obj;*.ply;*.gltf;*.glb\0"
+    "AI-CAD part (*.step+)\0*.step+\0"
+    "STEP (*.step;*.stp)\0*.step;*.stp\0"
+    "IGES (*.iges;*.igs)\0*.iges;*.igs\0"
+    "BREP (*.brep)\0*.brep\0"
+    "Mesh (*.stl;*.obj;*.ply;*.3mf;*.gltf;*.glb)\0*.stl;*.obj;*.ply;*.3mf;*.gltf;*.glb\0"
+    "All files (*.*)\0*.*\0";
 
 static std::string pathBaseName(const std::string& p) {
     size_t cut = p.find_last_of("\\/");
@@ -1169,7 +1184,7 @@ static void doOpenDoc(AppState& st) {
                  "File dialogs disabled — use the path field below the tree");
         return;
     }
-    std::string path = openFileDialog(kStepPlusFilter);
+    std::string path = openFileDialog(kImportFilter);
     if (path.empty()) return;  // canceled
     std::string err;
     if (st.docMirror.open(st.worker, path, err)) {
@@ -2165,7 +2180,7 @@ std::string featureTreeOpenDialog(AppState& st) {
                  "File dialogs disabled — use the path field below the tree");
         return std::string();
     }
-    std::string path = openFileDialog(kStepPlusFilter);
+    std::string path = openFileDialog(kImportFilter);
     if (path.empty()) return std::string();   // canceled
     return featureTreeOpenPath(st, path) ? path : std::string();
 }

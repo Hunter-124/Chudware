@@ -62,6 +62,7 @@ _EXT_TO_FORMAT: dict[str, str] = {
     ".ply": "ply",
     ".gltf": "gltf",
     ".glb": "glb",
+    ".3dm": "3dm",
 }
 
 
@@ -95,6 +96,7 @@ FORMAT_REGISTRY: list[FormatInfo] = [
     FormatInfo("ply", "Stanford PLY", [".ply"], "mesh"),
     FormatInfo("gltf", "glTF", [".gltf"], "mesh"),
     FormatInfo("glb", "glTF binary", [".glb"], "mesh"),
+    FormatInfo("3dm", "Rhino", [".3dm"], "rhino"),
 ]
 
 
@@ -225,6 +227,9 @@ def export_document(
             return str(path)
         return _export_3mf_lib3mf(session_bodies, path)
 
+    if fmt == "3dm":
+        return _export_3dm(session_bodies, path)
+
     raise ValueError(f"unsupported export format '{fmt}'")
 
 
@@ -263,6 +268,8 @@ def import_path(
         return _import_3mf(path)
     elif fmt in ("obj", "ply", "gltf", "glb"):
         return _load_mesh_trimesh(path, fmt)
+    elif fmt == "3dm":
+        return _import_3dm(path)
     else:
         raise ValueError(f"unsupported import format '{fmt}'")
 
@@ -306,11 +313,20 @@ def _import_step(path: Path) -> list[tuple[str, Any]]:
     except Exception:  # noqa: BLE001
         pass
 
-    # Normalise: wrap single shape in list
-    if not hasattr(shape, "__iter__") or hasattr(shape, "wrapped"):
-        shapes = [shape]
-    else:
+    # Normalise to a list of shapes. A multi-solid STEP comes back as a single Compound; split it
+    # into one body PER SOLID (SolidWorks-parity multi-body import) and align XDE product names by
+    # index. A single-solid STEP keeps the whole shape as one body (byte-identical to before).
+    if hasattr(shape, "wrapped"):
+        solids = []
+        try:
+            solids = list(shape.solids())
+        except Exception:  # noqa: BLE001
+            solids = []
+        shapes = solids if len(solids) > 1 else [shape]
+    elif hasattr(shape, "__iter__"):
         shapes = list(shape)
+    else:
+        shapes = [shape]
 
     result: list[tuple[str, Any]] = []
     for i, s in enumerate(shapes, start=1):
@@ -534,6 +550,105 @@ def _export_mesh_trimesh(session_bodies: list[tuple[str, Any]], path: Path, fmt:
         raise ValueError("no mesh geometry to export")
     combined = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
     combined.export(str(path), file_type=_TRIMESH_EXPORT_TYPE.get(fmt, fmt))
+    return str(path)
+
+
+# -- Rhino lane (rhino3dm) -----------------------------------------------------
+# .3dm uses the OpenNURBS representation, separate from OCCT. rhino3dm (MIT) reads/writes it but has
+# NO mesher, so we operate at the MESH level: import every Mesh / Extrusion-mesh as a MeshBody, and
+# export bodies as render meshes. A NURBS/Brep-only .3dm cannot be tessellated by rhino3dm — we say
+# so and point the user at STEP. (True NURBS↔OCCT conversion is out of scope.)
+
+
+def _rhino_mesh_to_arrays(mesh):
+    """Convert a rhino3dm.Mesh to ``(verts (N,3) float32, tris (M,3) uint32)``; quads → 2 tris."""
+    import numpy as np
+    nv = len(mesh.Vertices)
+    verts = np.empty((nv, 3), dtype=np.float32)
+    for i in range(nv):
+        p = mesh.Vertices[i]
+        verts[i] = (p.X, p.Y, p.Z)
+    tris: list[tuple[int, int, int]] = []
+    for fi in range(len(mesh.Faces)):
+        f = tuple(mesh.Faces[fi])
+        a, b, c = int(f[0]), int(f[1]), int(f[2])
+        d = int(f[3]) if len(f) > 3 else c
+        tris.append((a, b, c))
+        if d != c:  # a real quad → second triangle
+            tris.append((a, c, d))
+    return verts, np.array(tris, dtype=np.uint32).reshape(-1, 3)
+
+
+def _import_3dm(path: Path) -> list[tuple[str, Any]]:
+    """Rhino .3dm → MeshBody per Mesh / Extrusion object (rhino3dm, MIT)."""
+    import rhino3dm as r
+
+    from engine.doc.mesh_body import MeshBody
+
+    model = r.File3dm.Read(str(path))
+    if model is None:
+        raise ValueError(f"could not read Rhino file '{path}'")
+
+    result: list[tuple[str, Any]] = []
+    skipped = 0
+    for obj in model.Objects:
+        g = obj.Geometry
+        mesh = None
+        if isinstance(g, r.Mesh):
+            mesh = g
+        elif isinstance(g, r.Extrusion):
+            try:
+                mesh = g.GetMesh(r.MeshType.Any)
+            except Exception:  # noqa: BLE001
+                mesh = None
+        if mesh is None or len(mesh.Vertices) == 0 or len(mesh.Faces) == 0:
+            skipped += 1
+            continue
+        verts, tris = _rhino_mesh_to_arrays(mesh)
+        name = None
+        try:
+            name = obj.Attributes.Name
+        except Exception:  # noqa: BLE001
+            name = None
+        name = name or f"{Path(path).stem}_{len(result) + 1}"
+        result.append((name, MeshBody(verts=verts, tris=tris, name=name)))
+
+    if not result:
+        raise ValueError(
+            f"'{path}' has no mesh geometry rhino3dm can read ({skipped} NURBS/Brep object(s) "
+            "skipped — rhino3dm has no mesher). Re-export from Rhino as STEP, or with render meshes.")
+    return result
+
+
+def _export_3dm(session_bodies: list[tuple[str, Any]], path: Path) -> str:
+    """Write bodies to a Rhino .3dm as render meshes (MeshBody direct; B-rep solid tessellated)."""
+    import numpy as np
+    import rhino3dm as r
+
+    from engine.doc.mesh_body import MeshBody
+
+    model = r.File3dm()
+    added = 0
+    for name, s in session_bodies:
+        if isinstance(s, MeshBody):
+            verts, tris = np.asarray(s.verts), np.asarray(s.tris)
+        else:
+            verts, tris = _shape_to_triangles(s)
+        if len(tris) == 0:
+            continue
+        m = r.Mesh()
+        for v in np.asarray(verts, dtype=np.float64):
+            m.Vertices.Add(float(v[0]), float(v[1]), float(v[2]))
+        for t in np.asarray(tris, dtype=np.int64):
+            m.Faces.AddFace(int(t[0]), int(t[1]), int(t[2]))
+        attr = r.ObjectAttributes()
+        attr.Name = str(name)
+        model.Objects.AddMesh(m, attr)
+        added += 1
+    if added == 0:
+        raise ValueError("3DM export: no mesh geometry to write")
+    if not model.Write(str(path), 0):
+        raise RuntimeError("rhino3dm File3dm.Write returned failure")
     return str(path)
 
 

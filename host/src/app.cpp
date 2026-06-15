@@ -537,11 +537,12 @@ static void exportFlatDxf(AppState& st) {
     }
 }
 
-// Wave-5-fill: File > Export <fmt> — export the ACTIVE part/assembly's bodies to a 3D format
-// engine.doc.formats.export_document accepts ("step"|"iges"|"stl"|"3mf"|"brep"). Picks a path
-// (native Save-As, or a cwd fallback when dialogs are disabled) then calls export_file via
-// DocMirror. Mirrors exportFlatDxf's shape. Called only from the GL-thread request pump (the menu
-// sets st.requestExportFormat) so the native dialog never re-enters an ImGui menu walk.
+// Wave-5-fill / F4: File > Export <fmt> — export the ACTIVE part/assembly's bodies to a 3D format
+// engine.doc.formats.export_document accepts ("step"|"iges"|"stl"|"3mf"|"brep"|"obj"|"ply"|"gltf"|
+// "glb"; see engine/doc/formats.py FORMAT_REGISTRY / doc_formats RPC). Picks a path (native Save-As,
+// or a cwd fallback when dialogs are disabled) then calls export_file via DocMirror. Mirrors
+// exportFlatDxf's shape. Called only from the GL-thread request pump (the menu sets
+// st.requestExportFormat) so the native dialog never re-enters an ImGui menu walk.
 static void exportFile3d(AppState& st, const std::string& fmt) {
     if (!st.docMirror.hasDoc()) {
         st.toast(ui::ToastLevel::Info, "Open a part or assembly first");
@@ -554,6 +555,10 @@ static void exportFile3d(AppState& st, const std::string& fmt) {
     else if (fmt == "stl")  { ext = "stl";  filter = "STL (*.stl)\0*.stl\0All files (*.*)\0*.*\0"; }
     else if (fmt == "3mf")  { ext = "3mf";  filter = "3MF (*.3mf)\0*.3mf\0All files (*.*)\0*.*\0"; }
     else if (fmt == "brep") { ext = "brep"; filter = "BREP (*.brep)\0*.brep\0All files (*.*)\0*.*\0"; }
+    else if (fmt == "obj")  { ext = "obj";  filter = "OBJ (*.obj)\0*.obj\0All files (*.*)\0*.*\0"; }
+    else if (fmt == "ply")  { ext = "ply";  filter = "PLY (*.ply)\0*.ply\0All files (*.*)\0*.*\0"; }
+    else if (fmt == "gltf") { ext = "gltf"; filter = "glTF (*.gltf)\0*.gltf\0All files (*.*)\0*.*\0"; }
+    else if (fmt == "glb")  { ext = "glb";  filter = "glTF binary (*.glb)\0*.glb\0All files (*.*)\0*.*\0"; }
 
     // Suggested base name from the doc title (alnum/_/-, spaces -> _).
     std::string title = st.docMirror.tree().is_object()
@@ -605,8 +610,12 @@ static bool dropPathHasKnownExt(const std::string& path) {
     std::string ext = std::filesystem::path(path).extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
+    // F4: every importable 3D format (see engine/doc/formats.py FORMAT_REGISTRY / doc_formats RPC)
+    // plus the ECAD/KiCad family. The GL-thread pump branches CAD vs ECAD by extension.
     return ext == ".step+" || ext == ".step" || ext == ".stp" || ext == ".iges" || ext == ".igs" ||
-           ext == ".stl"   || ext == ".3mf"  || ext == ".ecad+" || ext == ".ecad" ||
+           ext == ".brep"  || ext == ".stl"  || ext == ".3mf" || ext == ".obj"  || ext == ".ply"  ||
+           ext == ".gltf"  || ext == ".glb"  ||
+           ext == ".ecad+" || ext == ".ecad" ||
            ext == ".kicad_sch" || ext == ".kicad_pcb";
 }
 

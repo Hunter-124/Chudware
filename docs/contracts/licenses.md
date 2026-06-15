@@ -16,6 +16,7 @@
 | pyvista / VTK | MIT / BSD-3 | contact-sheet renders | ok |
 | trimesh | MIT | voxelize, ray casts, mesh import/export lane (STL/OBJ/PLY/glTF) | ok |
 | networkx | BSD-3 | trimesh scene-graph dep (multi-mesh OBJ/glTF import) | ok |
+| rhino3dm | MIT | Rhino .3dm import/export (mesh-level) | ok |
 | numpy / scipy | BSD-3 | math, solvers | ok |
 | matplotlib | PSF-based | colormap LUTs only | ok |
 | lib3mf | BSD-2 | 3MF import + export | ok |

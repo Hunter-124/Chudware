@@ -199,7 +199,7 @@ def test_export_import_3mf() -> None:
 # --------------------------------------------------------------------------- 1b. mesh-format breadth (F1)
 
 def test_mesh_formats_roundtrip() -> None:
-    """OBJ / PLY / glTF / GLB export a solid → re-import as a MeshBody with matching volume."""
+    """OBJ / PLY / glTF / GLB / 3DM export a solid → re-import as a MeshBody with matching volume."""
     from engine.doc.mesh_body import MeshBody
     s = docsess.new_session("part", "BoxForMesh")
     docsess.apply_ops(s, 0, [{"op": "add_feature", "feature": {
@@ -207,7 +207,7 @@ def test_mesh_formats_roundtrip() -> None:
         "params": {"length": _dim(20), "width": _dim(20), "height": _dim(20)}}}])
     bodies = _get_bodies(s)
     tmpdir = tempfile.mkdtemp()
-    for fmt in ("obj", "ply", "gltf", "glb"):
+    for fmt in ("obj", "ply", "gltf", "glb", "3dm"):
         path = os.path.join(tmpdir, f"box.{fmt}")
         export_document(bodies, path, fmt)
         assert os.path.getsize(path) > 50, f"{fmt} export produced no data"
@@ -235,6 +235,27 @@ def test_mesh_body_brep_export_rejected() -> None:
         except ValueError as exc:
             assert "mesh body" in str(exc).lower(), f"unexpected message: {exc}"
     print("[formats] mesh-body B-rep export correctly rejected for step/iges/brep")
+
+
+def test_multibody_step_splits() -> None:
+    """A multi-solid STEP imports as one body PER SOLID (SolidWorks-parity), not one lumped compound."""
+    s = docsess.new_session("part", "TwoBodies")
+    docsess.apply_ops(s, 0, [{"op": "add_feature", "feature": {
+        "type": "box", "name": "B1",
+        "params": {"length": _dim(10), "width": _dim(10), "height": _dim(10)}}}])
+    docsess.apply_ops(s, s.revision, [{"op": "add_feature", "feature": {
+        "type": "box", "name": "B2",
+        "params": {"length": _dim(6), "width": _dim(6), "height": _dim(6), "merge": False}}}])
+    bodies = _get_bodies(s)
+    assert len(bodies) == 2, f"expected a 2-body part, got {len(bodies)}"
+    tmpdir = tempfile.mkdtemp()
+    path = os.path.join(tmpdir, "two.step")
+    export_document(bodies, path, "step")
+    imported = import_path(path)
+    assert len(imported) == 2, f"multi-body STEP should split into 2 bodies, got {len(imported)}"
+    vols = sorted(round(sh.volume) for _, sh in imported)
+    assert vols == [216, 1000], f"unexpected body volumes {vols}"
+    print(f"[formats] multi-body STEP split -> {len(imported)} bodies vols={vols}")
 
 
 def test_doc_formats_registry() -> None:
@@ -474,6 +495,7 @@ def main() -> None:
     test_export_import_3mf()
     test_mesh_formats_roundtrip()
     test_mesh_body_brep_export_rejected()
+    test_multibody_step_splits()
     test_doc_formats_registry()
     test_import_feature_compiles_and_caches()
     test_stepplus_meta_passthrough()

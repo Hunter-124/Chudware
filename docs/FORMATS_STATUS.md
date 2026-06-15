@@ -8,10 +8,10 @@ Tracks `docs/FORMATS_PLAN.md`. Engine venv: `%APPDATA%\AI-CAD\runtime\venv`.
 |---|---|---|
 | F0 | Mesh-body foundation (MeshBody → AICM, mass-props, import/export plumbing) | ✅ done |
 | F1 | Mesh breadth: OBJ/PLY/glTF/GLB + FORMAT_REGISTRY + `doc_formats` RPC | ✅ done |
-| F2 | B-rep polish: multi-solid STEP names, IGES sew, BREP exact | ⏳ next |
-| F3 | Rhino `.3dm` via rhino3dm | ⏳ pending |
-| F4 | Host UI: unified Open filter, Import menu, expanded Export | ⏳ in progress |
-| F5 | SolidWorks/Parasolid (experimental: SW-COM + OLE2 probe) | ⏳ pending |
+| F2 | B-rep polish: multi-solid STEP → separate named bodies | ✅ done |
+| F3 | Rhino `.3dm` via rhino3dm (mesh-level) | ✅ done |
+| F4 | Host UI: unified Open/Import filter, Import menu, expanded Export | ✅ done |
+| F5 | SolidWorks/Parasolid (experimental: SW-COM + OLE2 probe) | ⏳ next |
 | F6 | Polish, docs, convert-mesh-to-solid stretch | ⏳ pending |
 
 ## Live capability matrix
@@ -27,7 +27,7 @@ Tracks `docs/FORMATS_PLAN.md`. Engine venv: `%APPDATA%\AI-CAD\runtime\venv`.
 | `.obj` | ✅ | ✅ | mesh body |
 | `.ply` | ✅ | ✅ | mesh body |
 | `.gltf` `.glb` | ✅ | ✅ | mesh body |
-| `.3dm` | ⏳ F3 | ⏳ F3 | B-rep + mesh |
+| `.3dm` | ✅ (mesh) | ✅ (mesh) | Rhino render meshes (NURBS not tessellated) |
 | `.sldprt` `.sldasm` | ⏳ F5 | STEP-out | experimental |
 | `.x_t` `.x_b` | ⏳ F5 | STEP-out | via SW-COM only |
 

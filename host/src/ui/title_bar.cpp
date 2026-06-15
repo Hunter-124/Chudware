@@ -121,6 +121,12 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             // menu draw) avoids a re-entrant doc swap during ImGui's menu walk.
             const bool docSaved = !ui::featureTreeActivePath().empty();
             if (ImGui::MenuItem("Open...", "Ctrl+O")) st.requestOpenDialog = true;
+            // F4: Import... — opens any importable format (STEP/IGES/BREP/STL/OBJ/PLY/3MF/glTF/GLB)
+            // via the SAME GL-thread pump as Open. The Open dialog's filter is already the broad
+            // importable-file filter (feature_tree's kImportFilter), and the engine's doc_open RPC
+            // branches by extension, so Import-as-new-doc needs no separate path today. (Future:
+            // merge-into-current-doc via the engine import_file `into` param — a doc_import RPC.)
+            if (ImGui::MenuItem("Import...")) st.requestOpenDialog = true;
             ImGui::Separator();
             if (ImGui::MenuItem("Save", "Ctrl+S", false, hasDoc)) st.requestSave = true;
             if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, hasDoc)) st.requestSaveAs = true;
@@ -140,9 +146,15 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             if (ImGui::BeginMenu("Export", canExport3d)) {
                 if (ImGui::MenuItem("STEP (.step)...")) st.requestExportFormat = "step";
                 if (ImGui::MenuItem("IGES (.iges)...")) st.requestExportFormat = "iges";
-                if (ImGui::MenuItem("STL (.stl)..."))   st.requestExportFormat = "stl";
-                if (ImGui::MenuItem("3MF (.3mf)..."))   st.requestExportFormat = "3mf";
                 if (ImGui::MenuItem("BREP (.brep)...")) st.requestExportFormat = "brep";
+                ImGui::Separator();
+                // F4: mesh-lane exports (engine export_file accepts these format strings too).
+                if (ImGui::MenuItem("STL (.stl)..."))   st.requestExportFormat = "stl";
+                if (ImGui::MenuItem("OBJ (.obj)..."))   st.requestExportFormat = "obj";
+                if (ImGui::MenuItem("PLY (.ply)..."))   st.requestExportFormat = "ply";
+                if (ImGui::MenuItem("3MF (.3mf)..."))   st.requestExportFormat = "3mf";
+                if (ImGui::MenuItem("glTF (.gltf)...")) st.requestExportFormat = "gltf";
+                if (ImGui::MenuItem("GLB (.glb)..."))   st.requestExportFormat = "glb";
                 ImGui::EndMenu();
             }
             ImGui::Separator();

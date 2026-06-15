@@ -1183,10 +1183,11 @@ static void drawFeatureManagerTopStrip(AppState& st) {
 
 // ---- main draw function ----
 
-void drawFeatureTree(AppState& st,
-                     const std::function<void(const std::string&)>& editCallback) {
-    if (!ImGui::Begin("FeatureManager")) { ImGui::End(); return; }
-
+// Wave 1D: the tree body WITHOUT Begin/End — the caller (drawFeatureTree wrapper, or the Wave 1D
+// drawLeftPane container) owns the surrounding window/child. Everything below was the interior of
+// the former drawFeatureTree(); the only change is the removed Begin/End at the top and bottom.
+void drawFeatureTreeBody(AppState& st,
+                         const std::function<void(const std::string&)>& editCallback) {
     const auto& pal = ui::palette;
 
     // C24: SolidWorks-style top strip (tab row + compact doc toolbar), replacing the old wide
@@ -1935,7 +1936,14 @@ void drawFeatureTree(AppState& st,
 
     // C25: apply ops queued during drawing — safe now, nothing reads the tree json below.
     flushPendingTreeOps(st);
+}
 
+// Thin compatibility wrapper (Wave 1D): the standalone FeatureManager dock window. The Wave 1D
+// tabbed left pane bypasses this and calls drawFeatureTreeBody() directly inside its container.
+void drawFeatureTree(AppState& st,
+                     const std::function<void(const std::string&)>& editCallback) {
+    if (!ImGui::Begin("FeatureManager")) { ImGui::End(); return; }
+    drawFeatureTreeBody(st, editCallback);
     ImGui::End();
 }
 

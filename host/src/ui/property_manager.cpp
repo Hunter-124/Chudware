@@ -1197,13 +1197,11 @@ static const char* formDescription(const char* type) {
     return "";
 }
 
+// Wave 1D: standalone wrapper — owns the FeatureManager-slot Begin/End plus the C37-F floating
+// fallback, then defers the form content to drawBody(). The Wave 1D tabbed left pane calls
+// drawBody() directly inside its "LeftPane" container child (no separate window).
 void PropertyManager::draw(AppState& st) {
     if (!active_) return;
-
-    // Live unit-system toggle: if the document units changed while this form is open (e.g. the
-    // user clicked the status-bar MMGS/IPS cluster), reformat every open Dim field's DISPLAY from
-    // its canonical mm value. The stored value is unchanged — purely a display reformat.
-    if (st.ips() != ips_) { ips_ = st.ips(); reformatDimDisplays(); }
 
     // C37-F: Floating fallback — if the FeatureManager dock window isn't visible this frame
     // (dock closed or un-docked and minimised), draw the PM as an independent floating window
@@ -1221,6 +1219,18 @@ void PropertyManager::draw(AppState& st) {
             ImGui::End(); return;
         }
     }
+    drawBody(st);
+    ImGui::End();
+}
+
+// Wave 1D: the form's inner content (no Begin/End). Caller owns the surrounding window/child.
+void PropertyManager::drawBody(AppState& st) {
+    if (!active_) return;
+
+    // Live unit-system toggle: if the document units changed while this form is open (e.g. the
+    // user clicked the status-bar MMGS/IPS cluster), reformat every open Dim field's DISPLAY from
+    // its canonical mm value. The stored value is unchanged — purely a display reformat.
+    if (st.ips() != ips_) { ips_ = st.ips(); reformatDimDisplays(); }
 
     const auto& pal = ui::palette;
 
@@ -1343,8 +1353,10 @@ void PropertyManager::draw(AppState& st) {
 
         ImGui::Separator();
 
-        if (ok)     { commit(st);      ImGui::End(); return; }
-        if (cancel) { cancelEdits(st); ImGui::End(); return; }
+        // Wave 1D: drawBody() does NOT own the window — early-out is a plain return; the caller
+        // (draw() or the LeftPane container) closes its own Begin/child.
+        if (ok)     { commit(st);      return; }
+        if (cancel) { cancelEdits(st); return; }
     }
 
     // ---- field rows grouped by `group`, collapsible ------------------------
@@ -1730,8 +1742,6 @@ void PropertyManager::draw(AppState& st) {
     // window-focus is PM-scoped — an active item in another window won't set this.
     pmWidgetActivePrevFrame_ = ImGui::IsAnyItemActive() &&
         ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
-
-    ImGui::End();
 }
 
 }  // namespace ui

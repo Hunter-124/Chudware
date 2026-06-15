@@ -175,7 +175,13 @@ public:
     bool openForEdit(AppState& st, const std::string& featureId);
 
     // Draw the PM panel into the dock slot (called in place of the tree while active()).
+    // Compatibility wrapper: handles the dock-visible / floating-fallback Begin/End, then calls
+    // drawBody(). The Wave 1D tabbed left pane calls drawBody() directly inside its own container.
     void draw(AppState& st);
+
+    // Wave 1D: the PM form's inner content WITHOUT its own Begin/End — the caller owns the window
+    // (the LeftPane container child, or draw()'s dock/floating window). No-op unless active().
+    void drawBody(AppState& st);
 
     // Feed a resolved viewport pick into the active selector well (called from the selection
     // observer). Returns true if the pick was consumed (an active well accepted it).

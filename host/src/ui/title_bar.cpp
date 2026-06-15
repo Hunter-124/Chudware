@@ -3,7 +3,6 @@
 #include <GLFW/glfw3.h>
 
 #include "imgui.h"
-#include "imgui_internal.h"
 
 #include "title_bar.h"
 
@@ -47,70 +46,10 @@ bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
     return clicked;
 }
 
-// C24: SolidWorks 2025 default arrangement.
-//   LEFT   = FeatureManager, full height ribbon->status (~280px). The PropertyManager swaps INTO
-//            this same dock slot during a command (both Begin "FeatureManager").
-//   RIGHT  = Task Pane (~340px): Design (AI panel) + Agent Activity as tabs, like SW's task pane.
-//            The floating command dialogs (Insert/Mate/Exploded/Interference/BOM, Mass Properties
-//            & friends, Simulation) dock as tabs into the bottom of this pane on first open so they
-//            never hide behind the central viewport node (the C20b NoBringToFrontOnFocus debt).
-//   BOTTOM = Console, a thin strip below the viewport (collapsed-feeling; SW has no console but we
-//            keep ours unobtrusive).
-//   CENTER = Viewport, as large as possible.
-// "Reset layout" rebuilds exactly this.
-void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
-    ImGui::DockBuilderRemoveNode(root);
-    ImGui::DockBuilderAddNode(root, ImGuiDockNodeFlags_DockSpace);
-    ImGui::DockBuilderSetNodeSize(root, size);
-
-    // Target pixel widths translated to fractions of the dockspace width.
-    const float w = size.x > 1.0f ? size.x : 1440.0f;
-    // W4-K / GUI audit #2.6: clamp the dock widths in PIXELS, not in fixed fraction bounds. The
-    // target px scale by uiScale so the docks track the pre-scaled fonts; clamping the *fraction*
-    // with a fixed ceiling (the old 0.34/0.36) silently ate that DPI growth at >=1.5x and clipped
-    // tree labels — the very thing W4-K was meant to fix. See docs/GUI_STYLE_GUIDE.md §6.
-    const float sc = ui::uiScale;
-    auto clampf = [](float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); };
-    float leftPx  = clampf(258.0f * sc, 180.0f * sc, 0.34f * w);  float leftFrac  = leftPx  / w;
-    float rightPx = clampf(300.0f * sc, 200.0f * sc, 0.36f * w);  float rightFrac = rightPx / w;
-    ImGuiID main = root, left, right, rightBottom;
-    // Left column = FeatureManager (full height).
-    left  = ImGui::DockBuilderSplitNode(main, ImGuiDir_Left,  leftFrac,  nullptr, &main);
-    // Right column = Task Pane (the consolidated AI panel), full height like SolidWorks.
-    right = ImGui::DockBuilderSplitNode(main, ImGuiDir_Right, rightFrac / (1.0f - leftFrac),
-                                        nullptr, &main);
-    // Bottom slice of the right pane holds the command dialogs as docked tabs.
-    rightBottom = ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.42f, nullptr, &right);
-
-    ImGui::DockBuilderDockWindow("FeatureManager", left);
-    // One task-pane window: Design / Activity / Console live as internal tabs.
-    ImGui::DockBuilderDockWindow("AI", right);
-    // Wave N/O: ECAD shares the central node with the Viewport (tabbed). Dock ECAD FIRST so the
-    // Viewport is the default-active tab (3D is the primary view); the ECAD tab pops forward on its
-    // own (SetNextWindowFocus) when an ECAD document is loaded.
-    ImGui::DockBuilderDockWindow("ECAD", main);
-    ImGui::DockBuilderDockWindow("Viewport", main);
-    // Command dialogs dock into the lower-right slot so they surface as tabs instead of floating
-    // behind the central node. They share one node (only one is typically open at a time).
-    const char* dialogs[] = {
-        "Simulation", "Insert Component", "Mate##asm", "Exploded View",
-        "Interference Detection", "Bill of Materials",
-        // Evaluate dialogs (titles set in evaluate_dialogs.cpp) — pre-registered so they land in
-        // the task pane the first time they open (DockBuilderDockWindow matches by name).
-        "Mass Properties", "Measure", "Section Properties", "Geometry Check", "Symmetry Check",
-        "Zebra Stripes", "Draft angle", "Wall thickness", "Mean curvature",
-        // Configurations (SolidWorks ConfigurationManager) — lands in the task pane the first time
-        // it's toggled on so it surfaces as a tab rather than floating over the viewport.
-        "Configurations",
-        // Design Table — same task-pane slot so the editable config grid surfaces as a tab.
-        "Design Table",
-        // Weldment Cut List — same task-pane slot so it surfaces as a tab when toggled on.
-        "Cut List",
-    };
-    for (const char* d : dialogs) ImGui::DockBuilderDockWindow(d, rightBottom);
-
-    ImGui::DockBuilderFinish(root);
-}
+// Wave 1C: buildDefaultLayout() moved to ui/layout.cpp — the default dock arrangement (slot names +
+// split ratios that "Reset layout" rebuilds) was never a title-bar concern. The "Reset layout" menu
+// items below just set st.resetLayout; app.cpp calls buildDefaultLayout() (global, declared in
+// app_state.h) on the next frame.
 
 namespace ui {
 

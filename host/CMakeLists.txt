@@ -53,6 +53,7 @@ add_executable(AI-CAD
   src/ui/appearance_common.cpp
   # --- end W1-B ---
   src/ui/title_bar.cpp
+  src/ui/layout.cpp   # Wave 1C/1D: dock layout (buildDefaultLayout) + tabbed left pane
   src/ui/status_bar.cpp
   src/ui/viewport_panel.cpp
   src/mesh.cpp

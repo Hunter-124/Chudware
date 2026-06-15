@@ -43,6 +43,7 @@
 #include "ui/console_panel.h"
 #include "ui/doc_tabs.h"
 #include "ui/feature_tree.h"
+#include "ui/layout.h"        // Wave 1C/1D: buildDefaultLayout + tabbed left pane (drawLeftPane)
 #include "ui/legacy_chat.h"
 #include "ui/settings_modal.h"
 #include "ui/status_bar.h"
@@ -1737,18 +1738,16 @@ int run_gui(const char* screenshotPath) {
         bool canRun = st.workerStarted && !busy;
 
         // ---------- panels ----------
-        // C17: the PropertyManager occupies the FeatureManager dock slot while a command is
-        // active; the tree returns when the PM closes (OK/Cancel). The tree's context-menu "Edit"
-        // reopens a PM form populated from the feature.
+        // Wave 1D: the SolidWorks-faithful tabbed LEFT pane (Explorer / FeatureManager /
+        // PropertyManager / Configurations). drawLeftPane routes the active tab body and auto-
+        // switches to the PropertyManager tab while a command form is active. We still tick the PM
+        // so the debounced live preview fires; the container draws the PM form body when active.
         if (st.showFeatureTree) {
-            if (propertyManager.active()) {
+            if (propertyManager.active())
                 propertyManager.tick(st);     // fire the debounced live preview if dirty
-                propertyManager.draw(st);
-            } else {
-                ui::drawFeatureTree(st, [&st, &propertyManager](const std::string& fid) {
-                    propertyManager.openForEdit(st, fid);
-                });
-            }
+            ui::drawLeftPane(st, [&st, &propertyManager](const std::string& fid) {
+                propertyManager.openForEdit(st, fid);
+            });
         }
         // W3-H: unified AI Copilot pane (input-at-top + conversation; embeds the run tree
         // inline while a v2 run is active). st.activityPanel is still fed events via onEvent.

@@ -122,16 +122,11 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             const bool docSaved = !ui::featureTreeActivePath().empty();
             if (ImGui::MenuItem("Open...", "Ctrl+O")) st.requestOpenDialog = true;
             // F4: Import... — opens any importable format (STEP/IGES/BREP/STL/OBJ/PLY/3MF/glTF/GLB)
-            // via the SAME GL-thread pump as Open. The Open dialog's filter is already the broad
-            // importable-file filter (feature_tree's kImportFilter), and the engine's doc_open RPC
-            // branches by extension, so Import-as-new-doc needs no separate path today. (Future:
-            // merge-into-current-doc via the engine import_file `into` param — a doc_import RPC.)
+            // via the SAME GL-thread pump as Open. The dialog's filter is the broad importable-file
+            // filter (feature_tree's kImportFilter), and the engine's doc_open RPC branches by
+            // extension. When the picked file is a MESH, the open path asks "import as a solid body?"
+            // (vs. graphics mesh) — see feature_tree's doOpenDoc / featureTreeOpenDialog.
             if (ImGui::MenuItem("Import...")) st.requestOpenDialog = true;
-            // Import as Solid: same GL-thread pump, but a mesh-only filter + the engine's doc_open
-            // `as_solid` flag, so an imported triangle mesh is sewn into a real B-rep solid (it can
-            // then be filleted/cut/booleaned). Mesh formats only — a no-op for B-rep (.step/.iges/
-            // .brep) sources, which already import as solids.
-            if (ImGui::MenuItem("Import as Solid...")) st.requestImportSolid = true;
             ImGui::Separator();
             if (ImGui::MenuItem("Save", "Ctrl+S", false, hasDoc)) st.requestSave = true;
             if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, hasDoc)) st.requestSaveAs = true;

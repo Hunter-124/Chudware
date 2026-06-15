@@ -786,6 +786,32 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
             }
         }
 
+        // "Convert to Solid Body": sew an imported mesh (STL/OBJ/PLY/3MF/glTF/3dm) into an OCCT solid
+        // so it can be cut/filleted/combined. Shown only for an `import` feature still in mesh form
+        // (as_solid not yet set). Flips the import's as_solid param; the rebuild re-sews it. (Engine:
+        // edit_feature -> import recompiles via mesh_solidify.) Deferred via applyTreeOps like the rest.
+        if (!multi) {
+            const nlohmann::json& tree = st.docMirror.tree();
+            if (tree.is_object() && tree.contains("features") && tree["features"].is_array()) {
+                for (const auto& f : tree["features"]) {
+                    if (!f.is_object() || f.value("id", std::string()) != fid) continue;
+                    if (f.value("type", std::string()) == "import") {
+                        const bool already = f.contains("params") && f["params"].is_object() &&
+                                             f["params"].value("as_solid", false);
+                        if (!already) {
+                            ImGui::Separator();
+                            if (ImGui::MenuItem("Convert to Solid Body")) {
+                                applyTreeOps(st, nlohmann::json::array({
+                                    {{"op", "edit_feature"}, {"id", fid},
+                                     {"params", {{"as_solid", true}}}}}), "convert to solid");
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
         if (c.convertCb && c.convertLabel) {
             ImGui::Separator();
             if (ImGui::MenuItem(c.convertLabel)) c.convertCb();
@@ -1043,41 +1069,10 @@ static bool toolbarIconBtn(const char* id, const char* iconName, const char* too
 // path-strip open updated the tree but never loaded the mesh).
 
 // Save filter: native AI-CAD part only (a silent Save / first-save always writes .step+).
+// Save As writes the native .step+ ONLY — non-native formats live under File > Export (the Win32
+// dialog appends the default extension regardless of the chosen filter, so a multi-format Save As
+// silently wrote .step+ anyway).
 static const char* kStepPlusFilter = "AI-CAD part (*.step+)\0*.step+\0All files (*.*)\0*.*\0";
-
-// Save-As filter (SolidWorks-style "save as other types"): native .step+ first (default), then the
-// neutral export formats. Picking a non-.step+ type EXPORTS via export_file instead of saving the
-// document — the active doc stays the .step+ (matches SW: "Save As" to STL/STEP exports a copy).
-static const char* kSaveAsFilter =
-    "AI-CAD part (*.step+)\0*.step+\0"
-    "STEP (*.step;*.stp)\0*.step;*.stp\0"
-    "STL (*.stl)\0*.stl\0"
-    "IGES (*.iges;*.igs)\0*.iges;*.igs\0"
-    "3MF (*.3mf)\0*.3mf\0"
-    "OBJ (*.obj)\0*.obj\0"
-    "PLY (*.ply)\0*.ply\0"
-    "glTF (*.gltf)\0*.gltf\0"
-    "glTF binary (*.glb)\0*.glb\0"
-    "BREP (*.brep)\0*.brep\0"
-    "All files (*.*)\0*.*\0";
-
-// Map a Save-As file extension to the engine export-format string, or "" for the native .step+
-// (and unknown extensions, which default to a native save).
-static std::string saveAsExportFormat(const std::string& path) {
-    std::string ext = std::filesystem::path(path).extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
-    if (ext == ".step" || ext == ".stp") return "step";
-    if (ext == ".stl")                   return "stl";
-    if (ext == ".iges" || ext == ".igs") return "iges";
-    if (ext == ".3mf")                   return "3mf";
-    if (ext == ".obj")                   return "obj";
-    if (ext == ".ply")                   return "ply";
-    if (ext == ".gltf")                  return "gltf";
-    if (ext == ".glb")                   return "glb";
-    if (ext == ".brep")                  return "brep";
-    return "";  // .step+ or unknown → native save
-}
 
 // F4: Open/Import filter — every format the engine can import (see engine/doc/formats.py
 // FORMAT_REGISTRY / doc_formats RPC, the future dynamic source). A leading aggregate entry lets
@@ -1095,12 +1090,17 @@ static const char* kImportFilter =
     "SolidWorks/Parasolid (*.sldprt;*.sldasm;*.x_t;*.x_b)\0*.sldprt;*.sldasm;*.x_t;*.x_b\0"
     "All files (*.*)\0*.*\0";
 
-// F4: "Import as Solid..." filter — ONLY the mesh formats the engine can sew into a B-rep solid via
-// doc_open's `as_solid` flag (the convertible set; B-rep sources are excluded since they already
-// import as solids). Same Win32 NUL-delimited layout as kImportFilter, All files last.
-static const char* kImportSolidFilter =
-    "Mesh as solid (*.stl;*.obj;*.ply;*.3mf;*.gltf;*.glb;*.3dm)\0*.stl;*.obj;*.ply;*.3mf;*.gltf;*.glb;*.3dm\0"
-    "All files (*.*)\0*.*\0";
+// Mesh import formats that can be sewn into a solid on import (engine doc_open `as_solid`). B-rep
+// sources (.step/.iges/.brep/.step+) already import as solids, so they are NOT here and never prompt.
+// When a mesh file is picked we ask the user "import as solid?" (ui::promptImportMeshAsSolid).
+static bool isMeshImportFormat(const std::string& path) {
+    size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos) return false;
+    std::string ext = path.substr(dot);
+    for (char& ch : ext) ch = (char)std::tolower((unsigned char)ch);
+    return ext == ".stl" || ext == ".obj" || ext == ".ply" || ext == ".3mf" ||
+           ext == ".gltf" || ext == ".glb" || ext == ".3dm";
+}
 
 static std::string pathBaseName(const std::string& p) {
     size_t cut = p.find_last_of("\\/");
@@ -1137,30 +1137,9 @@ static void doSaveDoc(AppState& st, bool forceDialog) {
         }
         std::string suggest = s_docPath.empty() ? suggestedSaveName(st)
                                                 : pathBaseName(s_docPath);
-        // "Save As..." offers all formats (SolidWorks-style type dropdown); a silent first-save
-        // sticks to the native .step+ filter.
-        path = forceDialog ? saveFileDialog(kSaveAsFilter, "step+", suggest.c_str())
-                           : saveFileDialog(kStepPlusFilter, "step+", suggest.c_str());
+        // Save / Save As always write the native .step+ (non-native formats are File > Export).
+        path = saveFileDialog(kStepPlusFilter, "step+", suggest.c_str());
         if (path.empty()) return;  // canceled
-    }
-
-    // SolidWorks-parity "Save As other type": a non-.step+ extension EXPORTS a copy (export_file)
-    // and leaves the working document (s_docPath / dirty flag) untouched — the doc is still the
-    // native .step+. Only a .step+ target saves the document itself.
-    std::string exportFmt = saveAsExportFormat(path);
-    if (!exportFmt.empty()) {
-        std::string eerr;
-        std::string written = st.docMirror.exportFile(st.worker, st.docMirror.docId(),
-                                                       path, exportFmt, eerr);
-        if (!written.empty()) {
-            st.addLog("[doc] exported " + exportFmt + ": " + written);
-            st.toast(ui::ToastLevel::Info, "Exported " + pathBaseName(written));
-        } else {
-            st.addLog("[err] export " + exportFmt + ": " + eerr);
-            st.toast(ui::ToastLevel::Error,
-                     eerr.empty() ? ("Export " + exportFmt + " failed") : eerr);
-        }
-        return;
     }
 
     std::string err;
@@ -1252,8 +1231,15 @@ static void doOpenDoc(AppState& st) {
     }
     std::string path = openFileDialog(kImportFilter);
     if (path.empty()) return;  // canceled
+    // Mesh files: ask whether to import as a solid (vs. graphics mesh). Non-mesh formats never prompt.
+    bool asSolid = false;
+    if (isMeshImportFormat(path)) {
+        int choice = ui::promptImportMeshAsSolid();
+        if (choice < 0) return;        // canceled
+        asSolid = (choice == 1);
+    }
     std::string err;
-    if (st.docMirror.open(st.worker, path, err)) {
+    if (st.docMirror.open(st.worker, path, err, asSolid)) {
         applyOpenedDoc(st, path);
     } else {
         st.addLog("[err] open: " + err);
@@ -2227,10 +2213,10 @@ void drawFeatureTree(AppState& st,
 
 // Open a file by absolute path (no dialog). Used by the File Explorer double-click and the
 // Recent-files menu. Returns true on success; toasts + logs on failure (never throws).
-bool featureTreeOpenPath(AppState& st, const std::string& path) {
+bool featureTreeOpenPath(AppState& st, const std::string& path, bool asSolid) {
     if (path.empty()) return false;
     std::string err;
-    if (st.docMirror.open(st.worker, path, err)) {
+    if (st.docMirror.open(st.worker, path, err, asSolid)) {
         applyOpenedDoc(st, path);   // s_docPath = path, new tab, mesh refresh, recent handled by caller
         return true;
     }
@@ -2248,31 +2234,14 @@ std::string featureTreeOpenDialog(AppState& st) {
     }
     std::string path = openFileDialog(kImportFilter);
     if (path.empty()) return std::string();   // canceled
-    return featureTreeOpenPath(st, path) ? path : std::string();
-}
-
-// Native "Import as Solid..." dialog -> open with asSolid=true. Mirrors featureTreeOpenDialog but
-// uses the mesh-only kImportSolidFilter and threads /*asSolid=*/true through DocMirror::open, so the
-// engine sews the picked triangle mesh into a real B-rep solid. The rest of the flow is identical:
-// applyOpenedDoc (new tab + viewport/mesh refresh) so the result shows as a normal solid body in the
-// tree/viewport. Returns the opened path (for Recent), or "" on cancel/failure.
-std::string featureTreeImportAsSolid(AppState& st) {
-    if (fileDialogsDisabled()) {
-        st.toast(ui::ToastLevel::Info,
-                 "File dialogs disabled — use the path field below the tree");
-        return std::string();
+    // Mesh files: ask whether to import as a solid (vs. graphics mesh). Non-mesh formats never prompt.
+    bool asSolid = false;
+    if (isMeshImportFormat(path)) {
+        int choice = ui::promptImportMeshAsSolid();
+        if (choice < 0) return std::string();   // canceled
+        asSolid = (choice == 1);
     }
-    std::string path = openFileDialog(kImportSolidFilter);
-    if (path.empty()) return std::string();   // canceled
-    std::string err;
-    if (st.docMirror.open(st.worker, path, err, /*asSolid=*/true)) {
-        applyOpenedDoc(st, path);   // s_docPath = path, new tab, mesh refresh (same seam as Open)
-        return path;
-    }
-    st.addLog("[err] import as solid: " + err);
-    st.toast(ui::ToastLevel::Error,
-             "Import as Solid failed: " + pathBaseName(path) + " — " + err);
-    return std::string();
+    return featureTreeOpenPath(st, path, asSolid) ? path : std::string();
 }
 
 // Save the active doc. saveAs=true forces the "Save As..." dialog; otherwise a silent re-save to

@@ -122,4 +122,16 @@ std::string openFileDialog(const char* filter) {
     return narrow(buf);
 }
 
+int promptImportMeshAsSolid() {
+    int r = MessageBoxW(
+        GetActiveWindow(),
+        L"Import this mesh as a solid body?\n\n"
+        L"Yes  —  convert it into a solid (editable B-rep: cut, fillet, combine)\n"
+        L"No   —  keep it as a graphics mesh (you can convert it later: "
+        L"right-click the import in the tree)",
+        L"Import Mesh", MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (r == IDCANCEL) return -1;
+    return (r == IDYES) ? 1 : 0;
+}
+
 }  // namespace ui

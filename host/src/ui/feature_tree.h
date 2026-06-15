@@ -64,14 +64,13 @@ bool featureSelectAll(AppState& st);
 // (file_explorer.cpp) reuse the existing dialog + RPC + mesh-refresh logic instead of duplicating
 // it. All are no-ops / return "" on cancel / failure and never throw.
 //   - featureTreeOpenPath:   open an absolute path directly (Explorer double-click / Recent).
-//   - featureTreeOpenDialog: native "Open..." dialog -> open; returns the opened path or "".
-//   - featureTreeImportAsSolid: native mesh-only dialog -> open with asSolid=true (engine sews the
-//     imported mesh into a B-rep solid); returns the opened path or "".
+//     asSolid=true sews a mesh import into a B-rep solid (the dialog path prompts the user for this).
+//   - featureTreeOpenDialog: native "Open..."/"Import..." dialog -> open; returns the opened path or
+//     "". For a mesh file it asks "import as solid?" first.
 //   - featureTreeSaveDoc:    Save (saveAs=false) / Save As (saveAs=true); returns the saved path or "".
 //   - featureTreeActivePath: the active doc's on-disk path ("" if never saved).
-bool        featureTreeOpenPath(AppState& st, const std::string& path);
+bool        featureTreeOpenPath(AppState& st, const std::string& path, bool asSolid = false);
 std::string featureTreeOpenDialog(AppState& st);
-std::string featureTreeImportAsSolid(AppState& st);
 std::string featureTreeSaveDoc(AppState& st, bool saveAs);
 std::string featureTreeActivePath();
 

@@ -61,13 +61,24 @@
 - errors: open profile (region detection failed); cut removes nothing (warn).
 
 #### `extrude` — C26-B additions (implemented; supersede where noted)
+- Start condition (W-overhaul): `start: "sketch_plane"|"offset"|"from_reference"|
+  "offset_from_reference"` ("sketch_plane") · `start_offset: dim` (0, used by `offset` and
+  `offset_from_reference`). `refs.start_ref: sel(face[plane], datum)` is required by the
+  reference start modes. V1 accepts only planar faces/datum planes parallel to the sketch plane;
+  non-planar targets produce a contained error.
 - `end` extended: now `"blind"|"through_all"|"mid_plane"|"up_to_next"`. `up_to_next` extrudes
   until the first surface of the existing body along the direction (requires a body — clean
   error `"extrude: up_to_next requires an existing body"` otherwise).
+- Reference end conditions (W-overhaul): `end` and `end2` also accept `"up_to_reference"` and
+  `"offset_from_reference"`. `refs.end_ref` / `refs.end2_ref` are planar face/datum targets;
+  `end_offset` / `end2_offset` are used only for the offset-from-reference variants. V1 requires
+  reference planes parallel to the profile plane and computes depth as signed distance along the
+  extrusion direction plus the optional offset.
 - Second direction (opposite of direction 1, which `flip` controls):
-  `end2: "none"|"blind"|"through_all"|"up_to_next"` ("none") · `depth2: dim` (10, used when
-  `end2 == "blind"`). When `end2 != "none"` a second tool is built from the same profiles along
-  the negated direction and applied together (boss: union both; cut: subtract both).
+  `end2: "none"|"blind"|"through_all"|"up_to_next"|"up_to_reference"|
+  "offset_from_reference"` ("none") · `depth2: dim` (10, used when `end2 == "blind"`). When
+  `end2 != "none"` a second tool is built from the same profiles along the negated direction and
+  applied together (boss: union both; cut: subtract both).
 - `mid_plane` semantics confirmed/normative: `depth` is the TOTAL height (±depth/2 each side of
   the sketch plane). (Implementation already did this; verified, kept.)
 - Draft is now IMPLEMENTED (no longer deferred) via build123d `extrude(..., taper=°)`

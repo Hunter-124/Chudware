@@ -384,6 +384,40 @@ def _feature_dependents_subset(doc: dict, fid: str, deleted: set[str]) -> bool:
     return bool(referenced & deleted)
 
 
+def _feature_references(feat: dict) -> set[str]:
+    """Feature ids referenced by *feat* through selectors, datum refs, or feature-id slots."""
+    referenced: set[str] = set()
+    refs = feat.get("refs", {}) or {}
+    _walk_selector_owners(refs, referenced)
+    for slot_val in refs.values():
+        if isinstance(slot_val, list):
+            referenced.update(x for x in slot_val if isinstance(x, str))
+        elif isinstance(slot_val, str):
+            referenced.add(slot_val)
+    referenced -= set(RESERVED_DATUMS)
+    return referenced
+
+
+def _validate_feature_order(doc: dict, feats: list[dict], index: int) -> None:
+    """Validate the full feature list so no feature appears before its dependencies."""
+    all_ids = {f.get("id") for f in feats if isinstance(f, dict)}
+    preceding: set[str] = set(RESERVED_DATUMS)
+    for feat in feats:
+        if not isinstance(feat, dict):
+            continue
+        fid = feat.get("id", "?")
+        missing = sorted(r for r in _feature_references(feat)
+                         if r in all_ids and r not in preceding)
+        if missing:
+            raise OpError(
+                "dependency_exists",
+                f"reorder would place '{fid}' before its dependencies {missing}",
+                {"feature": fid, "dependents": missing},
+            )
+        if isinstance(fid, str):
+            preceding.add(fid)
+
+
 def _op_reorder_feature(doc, op, index, idgen, id_map):
     fid = op.get("id")
     pos, feat = _find_feature(doc, fid)
@@ -401,21 +435,7 @@ def _op_reorder_feature(doc, op, index, idgen, id_map):
             raise _invalid(index, f"reorder_feature: before='{before}' not found")
         feats.insert(bpos, feat)
         new_pos = bpos
-    # Dependency validation: every feature this one references must still precede it.
-    referenced: set[str] = set()
-    _walk_selector_owners(feat.get("refs", {}) or {}, referenced)
-    for slot_val in (feat.get("refs", {}) or {}).values():
-        if isinstance(slot_val, list):
-            referenced.update(x for x in slot_val if isinstance(x, str))
-        elif isinstance(slot_val, str):
-            referenced.add(slot_val)
-    referenced -= set(RESERVED_DATUMS)
-    preceding = {f["id"] for f in feats[:new_pos] if isinstance(f, dict)}
-    missing = [r for r in referenced if r not in preceding and _find_feature(doc, r)[1] is not None]
-    if missing:
-        raise OpError("dependency_exists",
-                      f"reorder would place '{fid}' before its dependencies {missing}",
-                      {"dependents": missing})
+    _validate_feature_order(doc, feats, index)
 
 
 def _op_set_suppressed(doc, op, index, idgen, id_map):

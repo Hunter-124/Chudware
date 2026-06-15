@@ -554,6 +554,12 @@ struct AppState {
     std::vector<char> code{std::vector<char>(64 * 1024, 0)};
     std::vector<char> prompt{std::vector<char>(2048, 0)};
     std::vector<ChatMsg> chat;
+    std::vector<char> helpQuestion{std::vector<char>(2048, 0)};
+    std::string helpLastQuestion;
+    std::string helpAnswer;
+    std::string helpError;
+    std::string helpStatus;
+    bool helpBusy = false;
 
     // ---- current assembly (populated when a build/design returns multiple parts) ----
     std::vector<PartInfo> asmParts;
@@ -598,6 +604,7 @@ struct AppState {
     // C24: the right task pane (Design + Agent Activity tabs, SolidWorks-style). View > Task Pane.
     bool showTaskPane = true;
     bool focusDesignTab = false;  // one-shot: focus the Design tab after a (re)layout
+    bool focusHelpTab = false;    // one-shot: focus the AI pane's Help tab
     // Consolidated AI panel (Design / Activity / Console as internal tabs). One dock window "AI".
     bool showAIPanel = true;
     // Configurations panel (SolidWorks ConfigurationManager). Dockable "Configurations" window in
@@ -630,6 +637,8 @@ struct AppState {
     };
     bool showRibbon = true;        // View > Ribbon visibility toggle
     int  ribbonTab  = RT_Features; // active ribbon tab (one of RibbonTab); contextual on the doc
+    bool showSimulationTools = false; // View-gated advanced module; hidden from default ribbon
+    bool showPcbTools = false;        // View-gated ECAD module; hidden until requested/used
     bool showFeatureTree = true;   // View > FeatureManager (C16)
     // Wave 1D: SW-faithful tabbed LEFT pane — Explorer / FeatureManager / PropertyManager /
     // Configurations as switchable tabs in one dock window. The PropertyManager auto-selects its

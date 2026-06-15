@@ -21,6 +21,9 @@ SW-parity extension (P0 "Extrude — end conditions" / docs/SW_PARITY_GAPS.md):
 14. Dir2 up_to_surface (full end-condition matrix in the second direction).
 15. merge=False makes a NEW BODY instead of fusing.
 16. up_to_surface with no body / missing target -> clean contained errors.
+17. up_to_reference / offset_from_reference planar datum targets.
+18. start from_reference / offset_from_reference.
+19. non-planar reference targets fail cleanly.
 """
 
 from __future__ import annotations
@@ -113,6 +116,12 @@ def _vertex_sel(cx: float, cy: float, cz: float) -> dict:
 def _z_extent(res, body_index: int = 0) -> tuple[float, float]:
     bb = res.bodies[body_index].shape.bounding_box()
     return bb.min.Z, bb.max.Z
+
+
+def _cyl_face_sel(owner: str) -> dict:
+    return {"kind": "face", "surf": "cylinder", "centroid": [10.0, 0.0, 10.0],
+            "axis": [0.0, 0.0, 1.0], "area_or_len": 1200.0,
+            "owner_feature": owner, "hint_index": 0}
 
 
 # --------------------------------------------------------------------------- test 1: up_to_next boss
@@ -666,6 +675,93 @@ def test_up_to_surface_requires_body_and_target() -> None:
     print(f"[up_to_surface-errors] no-body + no-target both clean")
 
 
+# --------------------------------------------------------------------------- test 8-10: references
+
+def test_up_to_reference_datum_depth() -> None:
+    """A sketch on Top extruded up to datum plane z=15 has exactly 15mm height."""
+    doc = _doc([
+        _feat("f1", "plane", {"method": "offset", "offset": _dim(15.0)},
+              refs={"base": "plane.top"}),
+        _rect_sketch("f2", 0, 0, 20, 20, "plane.top"),
+        _feat("f3", "extrude", {
+            "mode": "boss", "end": "up_to_reference", "depth": _dim(99.0),
+            "flip": False, "draft": _dim(0.0), "draft_outward": False, "merge": True,
+        }, refs={"profile": [_region_sel("f2", 10, 10, 400.0)], "end_ref": "f1"}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f3")
+    assert s["ok"], s["error"]
+    vol = res.bodies[0].shape.volume
+    assert abs(vol - 20 * 20 * 15) < 0.5, f"up_to_reference volume {vol:.1f}"
+    assert abs(s["resolved"]["depth"] - 15.0) < 1e-6
+    print(f"[up_to_reference] datum z=15 depth={s['resolved']['depth']:.1f}")
+
+
+def test_offset_from_reference_datum_depth() -> None:
+    """Offset from reference moves the terminating plane by the signed offset."""
+    doc = _doc([
+        _feat("f1", "plane", {"method": "offset", "offset": _dim(20.0)},
+              refs={"base": "plane.top"}),
+        _rect_sketch("f2", 0, 0, 20, 20, "plane.top"),
+        _feat("f3", "extrude", {
+            "mode": "boss", "end": "offset_from_reference",
+            "end_offset": _dim(-5.0), "depth": _dim(99.0),
+            "flip": False, "draft": _dim(0.0), "draft_outward": False, "merge": True,
+        }, refs={"profile": [_region_sel("f2", 10, 10, 400.0)], "end_ref": "f1"}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f3")
+    assert s["ok"], s["error"]
+    assert abs(res.bodies[0].shape.volume - 20 * 20 * 15) < 0.5
+    assert abs(s["resolved"]["depth"] - 15.0) < 1e-6
+    assert abs(s["resolved"]["end_offset"] + 5.0) < 1e-6
+    print(f"[offset_from_reference] datum z=20 offset=-5 depth={s['resolved']['depth']:.1f}")
+
+
+def test_start_from_reference_and_offset() -> None:
+    """Start from datum + offset shifts the profile before a blind extrusion."""
+    doc = _doc([
+        _feat("f1", "plane", {"method": "offset", "offset": _dim(5.0)},
+              refs={"base": "plane.top"}),
+        _rect_sketch("f2", 0, 0, 20, 20, "plane.top"),
+        _feat("f3", "extrude", {
+            "mode": "boss", "start": "offset_from_reference", "start_offset": _dim(2.0),
+            "end": "blind", "depth": _dim(10.0),
+            "flip": False, "draft": _dim(0.0), "draft_outward": False, "merge": True,
+        }, refs={"profile": [_region_sel("f2", 10, 10, 400.0)], "start_ref": "f1"}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f3")
+    assert s["ok"], s["error"]
+    bb = res.bodies[0].shape.bounding_box()
+    assert abs(bb.min.Z - 7.0) < 0.05, f"start z {bb.min.Z:.3f}"
+    assert abs(bb.max.Z - 17.0) < 0.05, f"end z {bb.max.Z:.3f}"
+    assert abs(s["resolved"]["start_offset"] - 7.0) < 1e-6
+    print("[start_offset_from_reference] start z=7, blind depth=10")
+
+
+def test_reference_requires_planar_target() -> None:
+    """A cylindrical face cannot be used as an up-to-reference target in v1."""
+    doc = _doc([
+        _feat("f1", "cylinder", {"radius": _dim(10), "height": _dim(20),
+                                  "centered": False}, refs={"at": "origin"}),
+        _rect_sketch("f2", -5, -5, 10, 10, "plane.top"),
+        _feat("f3", "extrude", {
+            "mode": "boss", "end": "up_to_reference", "depth": _dim(10.0),
+            "flip": False, "draft": _dim(0.0), "draft_outward": False, "merge": True,
+        }, refs={"profile": [_region_sel("f2", 0, 0, 100.0)], "end_ref": _cyl_face_sel("f1")}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f3")
+    assert not s["ok"], "non-planar reference must fail"
+    assert "planar" in s["error"], s["error"]
+    print(f"[reference-nonplanar] clean error: {s['error'][:80]}")
+
+
 # --------------------------------------------------------------------------- main
 
 def main() -> None:
@@ -685,6 +781,10 @@ def main() -> None:
     test_dir2_up_to_surface_full_matrix()
     test_merge_false_makes_new_body()
     test_up_to_surface_requires_body_and_target()
+    test_up_to_reference_datum_depth()
+    test_offset_from_reference_datum_depth()
+    test_start_from_reference_and_offset()
+    test_reference_requires_planar_target()
     print("\nEXTRUDE-ENDS TESTS PASSED")
 
 

@@ -375,6 +375,17 @@ to force the decomposed local-model workflow, or `"full"`/`"standard"` to force 
 machine. The micro workflow decomposes into tiny single-step executor calls and applies/validates
 after each step, which keeps limited local models auditable and recoverable.
 
+`agent_ask_v2 {doc_id?, question}` → `{answer}`. Read-only help/QA against the current
+document digest; unknown or empty `doc_id` falls back to general CAD help.
+
+`agent_pm_assist_v1 {doc_id?, intent, form_schema, current, selected_refs?}` →
+`{answer, patches, activate_well, reveal_fields, highlights, questions}`. Read-only
+PropertyManager assist for `Select with AI`. The worker validates provider output against the
+form schema before returning it. `patches` contains only ordinary currently visible fields
+(`dim`, `combo`, `check`, `int`, `datum_ref`); topology refs are never invented. When a real pick
+is needed, `activate_well` names a selector well for the host to focus after any patches make it
+visible.
+
 ### Vendor parts
 Compliance-friendly supplier CAD cache. These methods do not scrape catalogs; a user download or an
 approved supplier API adapter supplies the CAD file, then the worker stores compact metadata under

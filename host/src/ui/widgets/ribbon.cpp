@@ -42,6 +42,12 @@ static const char* kRibbonTabs[] = {"Features", "Sketch", "Evaluate", "Simulatio
                                     "Sheet Metal", "Weldments", "PCB", "Surfaces"};
 static constexpr int kRibbonTabCount = 9;  // mechanical tabs + Wave N "PCB" + "Surfaces" (surfacing features)
 
+static bool ribbon_tabVisible(int tab, bool showSimulationTools, bool showPcbTools) {
+    if (tab == 3) return showSimulationTools;
+    if (tab == 7) return showPcbTools;
+    return true;
+}
+
 // C25c FIX (defect 3): the Draw group gained a big "Ellipse" split button (sk_ellipse_big) as the
 // flyout parent, but the original small sk_ellipse row is still in the (append-only) table. Rendering
 // both shows a duplicate "Ellipse". We hide the small row whenever its replacement big-button parent
@@ -136,7 +142,7 @@ static float ribbon_bigBtnW(const char* label, bool hasDrop) {
 // Mirrors the hit/draw geometry in ribbon_smBtn (icon + 4px gap + label + trailing pad).
 static float ribbon_smBtnW(const char* label) {
     float s = ui::uiScale;
-    return kSmIconSz * s + 4.0f * s + ImGui::CalcTextSize(label).x + 14.0f * s;
+    return kSmIconSz * s + 4.0f * s + ImGui::CalcTextSize(label).x + 10.0f * s;
 }
 
 // C25c FIX (defect 1): a small-button stack flows top->bottom then wraps into a new column.
@@ -872,9 +878,12 @@ void setRibbonActiveCmd(const char* cmd_id) {
     s_activeCmd = (cmd_id && *cmd_id) ? cmd_id : "";
 }
 
-float drawRibbon(int& activeTab, bool visible) {
+float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool showPcbTools) {
     if (!visible) return 0.0f;
     ribbon_seedDefaults();
+    if (activeTab < 0 || activeTab >= kRibbonTabCount ||
+        !ribbon_tabVisible(activeTab, showSimulationTools, showPcbTools))
+        activeTab = 0;
 
     float s      = ui::uiScale;
     float tabH   = kTabH  * s;
@@ -916,6 +925,7 @@ float drawRibbon(int& activeTab, bool visible) {
     float tabY = wPos.y + tabTopPad;
 
     for (int i = 0; i < kRibbonTabCount; ++i) {
+        if (!ribbon_tabVisible(i, showSimulationTools, showPcbTools)) continue;
         const char* tabLabel = kRibbonTabs[i];
         ImVec2 tsize  = ImGui::CalcTextSize(tabLabel);
         float  tw     = tsize.x + 22.0f * s;
@@ -992,9 +1002,10 @@ float drawRibbon(int& activeTab, bool visible) {
     }
 
     // --- C25-W3G: priority collapse assignment ---
-    // Available body width = viewport width minus chevron reserve (20px scaled)
-    float availW    = vp->Size.x - 8.0f * s;
+    // Available body width. Reserve the overflow chevron up front so it never lands off-edge once
+    // any group has to be hidden.
     float chevronW  = 22.0f * s;  // reserved for overflow '»' button
+    float availW    = vp->Size.x - 8.0f * s - chevronW;
 
     // Compute natural widths at COL_BIG (per-column small-zone measuring — defect 1)
     std::vector<float> natW(groups.size());

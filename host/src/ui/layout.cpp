@@ -43,9 +43,21 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     // with a fixed ceiling (the old 0.34/0.36) silently ate that DPI growth at >=1.5x and clipped
     // tree labels — the very thing W4-K was meant to fix. See docs/GUI_STYLE_GUIDE.md §6.
     const float sc = ui::uiScale;
+    // Grow panes for readability at HiDPI, but dampen the growth so the viewport remains the
+    // first-read area instead of being squeezed by two linear-DPI sidebars.
+    const float panelSc = 1.0f + (sc - 1.0f) * 0.55f;
     auto clampf = [](float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); };
-    float leftPx  = clampf(258.0f * sc, 180.0f * sc, 0.34f * w);  float leftFrac  = leftPx  / w;
-    float rightPx = clampf(300.0f * sc, 200.0f * sc, 0.36f * w);  float rightFrac = rightPx / w;
+    const float minCenterPx = clampf(420.0f * panelSc, 320.0f, 0.52f * w);
+    float leftPx  = clampf(258.0f * panelSc, 190.0f * panelSc, 0.28f * w);
+    float rightPx = clampf(320.0f * panelSc, 230.0f * panelSc, 0.32f * w);
+    const float sideMax = w - minCenterPx;
+    if (leftPx + rightPx > sideMax && sideMax > 0.0f) {
+        const float k = sideMax / (leftPx + rightPx);
+        leftPx *= k;
+        rightPx *= k;
+    }
+    float leftFrac  = leftPx  / w;
+    float rightFrac = rightPx / w;
     ImGuiID main = root, left, right, rightBottom;
     // Left column = LeftPane task pane (full height).
     left  = ImGui::DockBuilderSplitNode(main, ImGuiDir_Left,  leftFrac,  nullptr, &main);

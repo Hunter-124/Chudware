@@ -78,6 +78,47 @@ static bool fieldEnabled(const PMFieldDef& def, const std::vector<PMField>& fiel
     return false;
 }
 
+static std::vector<std::string> comboOptionsList(const PMFieldDef& def) {
+    std::vector<std::string> out;
+    std::string opts = def.comboOptions ? def.comboOptions : "";
+    size_t start = 0;
+    while (start <= opts.size()) {
+        size_t bar = opts.find('|', start);
+        out.push_back(opts.substr(start, bar - start));
+        if (bar == std::string::npos) break;
+        start = bar + 1;
+    }
+    return out;
+}
+
+static bool hasString(const std::vector<std::string>& xs, const char* key) {
+    if (!key) return false;
+    for (const auto& x : xs)
+        if (x == key) return true;
+    return false;
+}
+
+static const char* aiKindName(PMFieldKind k) {
+    switch (k) {
+        case PMFieldKind::Dim: return "dim";
+        case PMFieldKind::SelectorWell: return "selector";
+        case PMFieldKind::Combo: return "combo";
+        case PMFieldKind::Check: return "check";
+        case PMFieldKind::Int: return "int";
+        case PMFieldKind::DatumRef: return "datum_ref";
+        case PMFieldKind::FeatureWell: return "feature_well";
+    }
+    return "unknown";
+}
+
+// Conditional fields are hidden entirely until their controlling combo makes them relevant.
+// This keeps reference wells/offsets out of the user's way and prevents inactive params/refs from
+// being serialized into preview ops. comingSoon rows remain visible but disabled when ungated.
+static bool fieldVisible(const PMFieldDef& def, const std::vector<PMField>& fields) {
+    if (!def.enableKey) return true;
+    return fieldEnabled(def, fields);
+}
+
 // ---- dim parsing ----------------------------------------------------------
 // SolidWorks-style unit math (C50c): a dim field accepts a full arithmetic expression with
 // per-literal unit suffixes — "100mm+2in/0.5m", "(3+1/8)in", "25.4/2", "0.5m-3cm". Each unit
@@ -372,6 +413,10 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     previewError_.clear();
     focusedOnOpen_ = false;
     wantFocusFirstField_ = true;  // C37-F: focus first field on next draw
+    aiBusy_ = false;
+    aiMessage_.clear();
+    aiHighlights_.clear();
+    ++aiRequestSeq_;
 
     // C37-F: Take a checkpoint BEFORE any preview, so Cancel can revert with a single call.
     checkpointId_ = st.docMirror.hasDoc() ? st.docMirror.checkpoint(st.worker) : std::string();
@@ -544,6 +589,10 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
     previewError_.clear();
     focusedOnOpen_ = false;
     wantFocusFirstField_ = true;  // C37-F: focus first field on next draw
+    aiBusy_ = false;
+    aiMessage_.clear();
+    aiHighlights_.clear();
+    ++aiRequestSeq_;
 
     // C37-F: Take a checkpoint BEFORE any preview edit, so Cancel reverts with one call.
     checkpointId_ = st.docMirror.hasDoc() ? st.docMirror.checkpoint(st.worker) : std::string();
@@ -763,6 +812,7 @@ std::vector<PMCalloutItem> PropertyManager::calloutItems(AppState& st) const {
 
     for (const auto& f : fields_) {
         if (f.def->kind != PMFieldKind::Dim) continue;
+        if (!fieldVisible(*f.def, fields_)) continue;
         if (!fieldEnabled(*f.def, fields_)) continue;   // skip greyed / coming-soon dims
         PMCalloutItem it;
         it.label = f.def->label;
@@ -805,13 +855,18 @@ void PropertyManager::close() {
     focusedOnOpen_ = false;   // C37-F
     wantFocusFirstField_ = false; // C37-F
     previewError_.clear();    // C37-F
+    aiBusy_ = false;
+    aiMessage_.clear();
+    aiHighlights_.clear();
+    ++aiRequestSeq_;
 }
 
 // ---- selector wells -------------------------------------------------------
 
 PMField* PropertyManager::activeWell() {
     for (auto& f : fields_)
-        if (f.def->kind == PMFieldKind::SelectorWell && f.wellActive) return &f;
+        if (f.def->kind == PMFieldKind::SelectorWell && f.wellActive &&
+            fieldVisible(*f.def, fields_)) return &f;
     return nullptr;
 }
 
@@ -858,14 +913,16 @@ bool PropertyManager::routePick(const nlohmann::json& selector, int pickKind) {
 
 bool PropertyManager::activeWellWantsBody() const {
     for (const auto& f : fields_)
-        if (f.def->kind == PMFieldKind::SelectorWell && f.wellActive)
+        if (f.def->kind == PMFieldKind::SelectorWell && f.wellActive &&
+            fieldVisible(*f.def, fields_))
             return f.def->selKinds.body;
     return false;
 }
 
 std::string PropertyManager::activeWellKindHint() const {
     for (const auto& f : fields_) {
-        if (f.def->kind != PMFieldKind::SelectorWell || !f.wellActive) continue;
+        if (f.def->kind != PMFieldKind::SelectorWell || !f.wellActive ||
+            !fieldVisible(*f.def, fields_)) continue;
         const PMSelKinds& k = f.def->selKinds;
         std::vector<const char*> parts;
         if (k.face)   parts.push_back("faces");
@@ -984,6 +1041,7 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
         // params like extrude's depth on a through-all are still emitted — the engine ignores the
         // ones that don't apply, and the schema requires their presence.)
         if (f.def->comingSoon) continue;
+        if (!fieldVisible(*f.def, fields_)) continue;
         // Conditionally-omitted fields (e.g. hole.diameter when a non-custom standard is chosen):
         // dropping them lets the engine's table/defaults drive the value instead of an override.
         if (f.def->omitWhenDisabled && !fieldEnabled(*f.def, fields_)) continue;
@@ -1068,6 +1126,260 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
     if (!refs.empty()) feature["refs"] = refs;
 }
 
+nlohmann::json PropertyManager::buildAiAssistPayload(AppState& st) const {
+    nlohmann::json schema = {
+        {"type", form_ ? form_->type : ""},
+        {"title", title_},
+        {"mode", mode_},
+        {"fields", nlohmann::json::array()},
+    };
+    nlohmann::json current = {{"fields", nlohmann::json::object()}};
+
+    for (const auto& f : fields_) {
+        const bool visible = fieldVisible(*f.def, fields_);
+        const bool enabled = fieldEnabled(*f.def, fields_);
+        nlohmann::json sf = {
+            {"key", f.def->key},
+            {"label", f.def->label},
+            {"group", f.def->group},
+            {"kind", aiKindName(f.def->kind)},
+            {"visible", visible},
+            {"enabled", enabled},
+        };
+        if (f.def->kind == PMFieldKind::Combo || f.def->kind == PMFieldKind::DatumRef)
+            sf["options"] = comboOptionsList(*f.def);
+        if (f.def->kind == PMFieldKind::SelectorWell) {
+            sf["multi"] = f.def->selMulti;
+            sf["accepts"] = {
+                {"face", f.def->selKinds.face}, {"edge", f.def->selKinds.edge},
+                {"vertex", f.def->selKinds.vertex}, {"body", f.def->selKinds.body},
+            };
+        }
+        schema["fields"].push_back(sf);
+
+        nlohmann::json cf = {
+            {"kind", aiKindName(f.def->kind)},
+            {"visible", visible},
+            {"enabled", enabled},
+        };
+        switch (f.def->kind) {
+            case PMFieldKind::Dim:
+                cf["value"] = f.dimValue;
+                cf["text"] = std::string(f.dimBuf.data());
+                cf["error"] = f.dimError;
+                break;
+            case PMFieldKind::Combo:
+            case PMFieldKind::DatumRef:
+                cf["value"] = comboValue(fields_, f.def->key);
+                break;
+            case PMFieldKind::Check:
+                cf["value"] = f.checkValue;
+                break;
+            case PMFieldKind::Int:
+                cf["value"] = f.intValue;
+                break;
+            case PMFieldKind::SelectorWell:
+            case PMFieldKind::FeatureWell:
+                cf["count"] = (int)f.picks.size();
+                break;
+        }
+        current["fields"][f.def->key] = cf;
+    }
+
+    nlohmann::json selected = nlohmann::json::array();
+    for (const auto& item : st.selection.items()) {
+        if (item.selector.empty()) continue;
+        try {
+            selected.push_back(nlohmann::json::parse(item.selector));
+        } catch (...) {
+            selected.push_back(item.selector);
+        }
+    }
+
+    std::string intent = "Fill the active " + title_ +
+                         " PropertyManager. Prefer safe visible field patches, and activate a "
+                         "selector well when a real reference pick is needed.";
+    return {
+        {"doc_id", st.docMirror.docId()},
+        {"intent", intent},
+        {"form_schema", schema},
+        {"current", current},
+        {"selected_refs", selected},
+    };
+}
+
+void PropertyManager::requestAiAssist(AppState& st) {
+    if (!active_ || aiBusy_) return;
+    if (!st.workerStarted) {
+        st.toast(ui::ToastLevel::Warn, "Start the runtime before using Select with AI");
+        return;
+    }
+    aiBusy_ = true;
+    aiMessage_ = "AI is checking the visible options...";
+    aiHighlights_.clear();
+    const int seq = ++aiRequestSeq_;
+    nlohmann::json params = buildAiAssistPayload(st);
+    st.rpc.call("agent_pm_assist_v1", params, [this, &st, seq](const core::RpcResult& r) {
+        if (!active_ || seq != aiRequestSeq_) return;
+        aiBusy_ = false;
+        if (!r.ok) {
+            aiMessage_ = "AI assist failed: " + r.err;
+            st.toast(ui::ToastLevel::Error, aiMessage_);
+            return;
+        }
+        if (r.result.is_object() && r.result.contains("code")) {
+            aiMessage_ = "AI assist failed: " + r.result.value("message", std::string("worker error"));
+            st.toast(ui::ToastLevel::Error, aiMessage_);
+            return;
+        }
+        applyAiAssistResult(st, r.result, seq);
+    }, 120000);
+}
+
+void PropertyManager::applyAiAssistResult(AppState& st, const nlohmann::json& result, int requestSeq) {
+    if (!active_ || requestSeq != aiRequestSeq_ || !result.is_object()) return;
+    int patched = 0;
+    auto findVisible = [&](const std::string& key) -> PMField* {
+        for (auto& f : fields_)
+            if (key == f.def->key && fieldVisible(*f.def, fields_)) return &f;
+        return nullptr;
+    };
+
+    auto patches = result.find("patches");
+    if (patches != result.end() && patches->is_array()) {
+        for (const auto& p : *patches) {
+            if (!p.is_object()) continue;
+            std::string key = p.value("key", std::string());
+            PMField* f = findVisible(key);
+            if (!f) continue;
+            const auto& val = p["value"];
+            bool changed = false;
+            switch (f->def->kind) {
+                case PMFieldKind::Dim: {
+                    std::string text;
+                    if (val.is_number()) text = std::to_string(val.get<double>());
+                    else if (val.is_string()) text = val.get<std::string>();
+                    else if (val.is_object() && val.contains("expr") && val["expr"].is_string())
+                        text = "=" + val["expr"].get<std::string>();
+                    if (!text.empty()) {
+                        std::memset(f->dimBuf.data(), 0, f->dimBuf.size());
+                        std::strncpy(f->dimBuf.data(), text.c_str(), f->dimBuf.size() - 1);
+                        if (!text.empty() && text[0] == '=') {
+                            f->dimExpr = text.substr(1);
+                            f->dimError.clear();
+                            changed = true;
+                        } else {
+                            double v = 0.0; std::string err;
+                            bool angle = f->def->unitLabel && std::strstr(f->def->unitLabel, "deg");
+                            if (pmParseDim(text, v, err, angle, ips_ ? 25.4 : 1.0)) {
+                                f->dimValue = v;
+                                f->dimExpr.clear();
+                                f->dimError.clear();
+                                changed = true;
+                            } else {
+                                f->dimError = err;
+                            }
+                        }
+                    }
+                    break;
+                }
+                case PMFieldKind::Combo:
+                case PMFieldKind::DatumRef: {
+                    if (!val.is_string()) break;
+                    std::string want = val.get<std::string>();
+                    auto opts = comboOptionsList(*f->def);
+                    for (int i = 0; i < (int)opts.size(); ++i) {
+                        if (opts[i] == want) {
+                            if (f->comboIndex != i) {
+                                f->comboIndex = i;
+                                changed = true;
+                            }
+                            break;
+                        }
+                    }
+                    break;
+                }
+                case PMFieldKind::Check:
+                    if (val.is_boolean() && f->checkValue != val.get<bool>()) {
+                        f->checkValue = val.get<bool>();
+                        changed = true;
+                    }
+                    break;
+                case PMFieldKind::Int:
+                    if (val.is_number_integer() && f->intValue != val.get<int>()) {
+                        f->intValue = std::max(1, val.get<int>());
+                        changed = true;
+                    }
+                    break;
+                case PMFieldKind::SelectorWell:
+                case PMFieldKind::FeatureWell:
+                    break;  // AI never patches refs; it can only activate a well.
+            }
+            if (changed) ++patched;
+        }
+    }
+
+    aiHighlights_.clear();
+    auto hi = result.find("highlights");
+    if (hi != result.end() && hi->is_array()) {
+        for (const auto& h : *hi)
+            if (h.is_string()) aiHighlights_.push_back(h.get<std::string>());
+    }
+
+    bool activated = false;
+    std::string activate = result.value("activate_well", std::string());
+    if (!activate.empty()) {
+        PMField* w = findVisible(activate);
+        if (w && (w->def->kind == PMFieldKind::SelectorWell ||
+                  w->def->kind == PMFieldKind::FeatureWell)) {
+            for (auto& of : fields_)
+                if (of.def->kind == PMFieldKind::SelectorWell ||
+                    of.def->kind == PMFieldKind::FeatureWell)
+                    of.wellActive = false;
+            w->wellActive = true;
+            activated = true;
+            if (!hasString(aiHighlights_, w->def->key)) aiHighlights_.push_back(w->def->key);
+        }
+    }
+    if (!activated && patched > 0) {
+        for (auto& w : fields_) {
+            if (w.def->kind != PMFieldKind::SelectorWell) continue;
+            if (!fieldVisible(*w.def, fields_) || !w.picks.empty()) continue;
+            for (auto& of : fields_)
+                if (of.def->kind == PMFieldKind::SelectorWell ||
+                    of.def->kind == PMFieldKind::FeatureWell)
+                    of.wellActive = false;
+            w.wellActive = true;
+            activated = true;
+            if (!hasString(aiHighlights_, w.def->key)) aiHighlights_.push_back(w.def->key);
+            break;
+        }
+    }
+
+    aiMessage_ = result.value("answer", std::string());
+    auto qs = result.find("questions");
+    if (qs != result.end() && qs->is_array() && !qs->empty()) {
+        aiMessage_ += "\n";
+        int n = 1;
+        for (const auto& q : *qs) {
+            if (!q.is_object()) continue;
+            aiMessage_ += "\n" + std::to_string(n++) + ". " +
+                          q.value("prompt", std::string());
+        }
+    }
+    if (aiMessage_.empty()) {
+        if (patched || activated) aiMessage_ = "AI applied safe form guidance.";
+        else aiMessage_ = "AI did not find a safe automatic change.";
+    }
+    if (patched > 0) {
+        dirty_ = true;
+        lastEditTime_ = ImGui::GetTime();
+    }
+    st.toast(ui::ToastLevel::Info,
+             activated ? "AI selected the next reference well" :
+             patched > 0 ? "AI filled safe visible fields" : "AI guidance ready");
+}
+
 // C37-F: Minimum conditions for a preview RPC to be worth firing.
 // ALL forms now gate on this — box/cylinder need at least one Dim with a valid (>0) value
 // rather than firing immediately on open. Selector-based forms need their primary well filled.
@@ -1138,6 +1450,7 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
     if (needWell) {
         for (const auto& f : fields)
             if ((f.def->kind == PMFieldKind::SelectorWell || f.def->kind == PMFieldKind::FeatureWell)
+                && fieldVisible(*f.def, fields)
                 && std::strcmp(f.def->key, needWell) == 0)
                 return !f.picks.empty();
         return false;  // well not found
@@ -1148,6 +1461,7 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
     for (const auto& f : fields) {
         if (f.def->kind != PMFieldKind::Dim) continue;
         if (f.def->comingSoon) continue;
+        if (!fieldVisible(*f.def, fields)) continue;
         if (!f.dimError.empty()) return false;   // invalid input — don't fire
         if (f.dimValue > 0.0) return true;
     }
@@ -1428,23 +1742,28 @@ void PropertyManager::drawBody(AppState& st) {
             ImGui::PopStyleColor();
         }
 
-        // C37-F: OK / Cancel buttons scaled by uiScale, with tooltips and green/red iconography.
+        // C37-F/W-overhaul: OK / Cancel live on their own row. The old same-line placement
+        // estimated only the glyph width, while ImageButton adds frame padding; narrow docks then
+        // pushed the right button past the content rect. Reserve the full button frames here.
+        ImGui::Spacing();
+        const ImGuiStyle& pmStyle = ImGui::GetStyle();
+        const float gap = 6.0f * ui::uiScale;
+        const float gutter = pmStyle.ScrollbarSize + 6.0f * ui::uiScale;
+        const float rowStartX = ImGui::GetCursorPosX();
+        const float rowAvail = std::max(1.0f, ImGui::GetContentRegionAvail().x - gutter);
         float btnW = 28.0f * ui::uiScale;
-        float pairW = btnW * 2 + 4 * ui::uiScale;
-        float rightX = ImGui::GetWindowContentRegionMax().x - pairW;
-        float afterTitleX = ImGui::GetCursorPosX();
-        if (rightX > afterTitleX + 6) {
-            ImGui::SameLine(0, 0);
-            ImGui::SetCursorPosX(rightX);
-        } else {
-            ImGui::SetCursorPosX(rightX < 0 ? 0 : rightX);
-        }
+        if (btnW * 2.0f + gap > rowAvail)
+            btnW = std::max(20.0f * ui::uiScale, (rowAvail - gap) * 0.5f);
+        float pairW = btnW * 2.0f + gap;
+        ImGui::SetCursorPosX(rowStartX + std::max(0.0f, rowAvail - pairW));
 
         // OK button — green accent.
         ImGui::PushStyleColor(ImGuiCol_Button,
             ImVec4(pal.accentDim[0], pal.accentDim[1], pal.accentDim[2], 1));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
             ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                            ImVec2(4.0f * ui::uiScale, 4.0f * ui::uiScale));
         {
             // Atlas glyph is "ok_check" / "cancel_x" (NOT "ok"/"cancel"); the text fallback uses
             // ASCII because the loaded fonts don't cover U+2713/U+2717 (✓/✗ render as a notdef box).
@@ -1452,35 +1771,57 @@ void PropertyManager::drawBody(AppState& st) {
             bool btnOk;
             if (okIc.valid) {
                 btnOk = ImGui::ImageButton("##pm_ok",
-                    okIc.texId, ImVec2(btnW - 4 * ui::uiScale, btnW - 4 * ui::uiScale), okIc.uv0, okIc.uv1);
+                    okIc.texId, ImVec2(btnW - 8.0f * ui::uiScale, btnW - 8.0f * ui::uiScale),
+                    okIc.uv0, okIc.uv1);
             } else {
-                btnOk = ImGui::Button("OK##pm", ImVec2(btnW, 0));
+                btnOk = ImGui::Button("OK##pm", ImVec2(btnW, btnW));
             }
             ok = btnOk;
         }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("OK (Enter)");
+        ImGui::PopStyleVar();
         ImGui::PopStyleColor(2);
 
-        ImGui::SameLine(0, 4 * ui::uiScale);
+        ImGui::SameLine(0, gap);
 
         // Cancel button — red/muted.
         ImGui::PushStyleColor(ImGuiCol_Button,
             ImVec4(pal.button[0], pal.button[1], pal.button[2], 1));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
             ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 0.7f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                            ImVec2(4.0f * ui::uiScale, 4.0f * ui::uiScale));
         {
             IconUV cancelIc = getIcon("cancel_x", 20);
             bool btnCancel;
             if (cancelIc.valid) {
                 btnCancel = ImGui::ImageButton("##pm_cancel",
-                    cancelIc.texId, ImVec2(btnW - 4 * ui::uiScale, btnW - 4 * ui::uiScale), cancelIc.uv0, cancelIc.uv1);
+                    cancelIc.texId, ImVec2(btnW - 8.0f * ui::uiScale, btnW - 8.0f * ui::uiScale),
+                    cancelIc.uv0, cancelIc.uv1);
             } else {
-                btnCancel = ImGui::Button("X##pm", ImVec2(btnW, 0));
+                btnCancel = ImGui::Button("X##pm", ImVec2(btnW, btnW));
             }
             cancel = cancel || btnCancel;
         }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cancel (Esc)");
+        ImGui::PopStyleVar();
         ImGui::PopStyleColor(2);
+
+        ImGui::Spacing();
+        if (aiBusy_) ImGui::BeginDisabled();
+        if (ImGui::Button(aiBusy_ ? "AI is selecting..." : "Select with AI", ImVec2(-1, 0))) {
+            requestAiAssist(st);
+        }
+        if (aiBusy_) ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Ask AI to fill safe visible fields or activate the next reference well");
+        if (!aiMessage_.empty()) {
+            pushTextColor(aiBusy_ ? pal.textDim : pal.accent);
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+            ImGui::TextUnformatted(aiMessage_.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+        }
 
         // C37-F: Enter commits ONLY when the PM window is focused/hovered or a PM widget was
         // active this frame. This prevents Enter-in-chat from accidentally committing the form.
@@ -1507,6 +1848,7 @@ void PropertyManager::drawBody(AppState& st) {
 
     for (size_t i = 0; i < fields_.size(); ++i) {
         PMField& f = fields_[i];
+        if (!fieldVisible(*f.def, fields_)) continue;
         // New group header?
         if (!curGroup || std::strcmp(curGroup, f.def->group) != 0) {
             curGroup = f.def->group;
@@ -1519,9 +1861,14 @@ void PropertyManager::drawBody(AppState& st) {
         if (!enabled) ImGui::BeginDisabled();
 
         ImGui::PushID((int)i);
+        if (hasString(aiHighlights_, f.def->key)) {
+            pushTextColor(pal.accent);
+            ImGui::TextUnformatted("AI suggestion");
+            ImGui::PopStyleColor();
+        }
         switch (f.def->kind) {
             case PMFieldKind::Dim: {
-                pushTextColor(pal.textDim);
+                pushTextColor(enabled ? pal.text : pal.textDim);
                 // C37-F: unit suffix in label ("Radius [mm]"). A field may override it (angle =
                 // "[deg]"; an empty override = no suffix).
                 const char* unitSuffix = f.def->unitLabel ? f.def->unitLabel
@@ -1695,7 +2042,7 @@ void PropertyManager::drawBody(AppState& st) {
                     // Use accent with reduced alpha as the hint color.
                     ImGui::PushStyleColor(ImGuiCol_Text,
                         ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.75f));
-                    ImGui::TextUnformatted("Pick faces/edges in the viewport");
+                    ImGui::TextUnformatted("Pick in viewport");
                     ImGui::PopStyleColor();
                 }
                 if (f.wellDangling) {
@@ -1706,7 +2053,7 @@ void PropertyManager::drawBody(AppState& st) {
                 break;
             }
             case PMFieldKind::Combo: {
-                pushTextColor(pal.textDim);
+                pushTextColor(enabled ? pal.text : pal.textDim);
                 ImGui::TextUnformatted(f.def->label);
                 ImGui::PopStyleColor();
                 if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -1756,7 +2103,7 @@ void PropertyManager::drawBody(AppState& st) {
                 break;
             }
             case PMFieldKind::Int: {
-                pushTextColor(pal.textDim);
+                pushTextColor(enabled ? pal.text : pal.textDim);
                 ImGui::TextUnformatted(f.def->label);
                 ImGui::PopStyleColor();
                 ImGui::SetNextItemWidth(-1);
@@ -1770,7 +2117,7 @@ void PropertyManager::drawBody(AppState& st) {
                 break;
             }
             case PMFieldKind::Text: {
-                pushTextColor(pal.textDim);
+                pushTextColor(enabled ? pal.text : pal.textDim);
                 ImGui::TextUnformatted(f.def->label);
                 ImGui::PopStyleColor();
                 ImGui::SetNextItemWidth(-1);
@@ -1781,7 +2128,7 @@ void PropertyManager::drawBody(AppState& st) {
                 break;
             }
             case PMFieldKind::DatumRef: {
-                pushTextColor(pal.textDim);
+                pushTextColor(enabled ? pal.text : pal.textDim);
                 ImGui::TextUnformatted(f.def->label);
                 ImGui::PopStyleColor();
                 std::string lblSrc = f.def->comboLabels ? f.def->comboLabels

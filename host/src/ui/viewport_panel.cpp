@@ -1105,7 +1105,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             renderer.endOverlay();
         }
 
-        ImGui::Image((ImTextureID)(intptr_t)renderer.colorTexture(), ImVec2((float)vw, (float)vh),
+        ImGui::Image((ImTextureID)(intptr_t)renderer.resolvedColorTexture(),
+                     ImVec2((float)vw, (float)vh),
                      ImVec2(0, 1), ImVec2(1, 0));
         ImVec2 vr0 = ImGui::GetItemRectMin(), vr1 = ImGui::GetItemRectMax();
         // Drop TARGET (Wave 3A item 5): dropping an in-app Explorer file row onto the viewport opens

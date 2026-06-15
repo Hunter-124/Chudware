@@ -143,6 +143,37 @@ def test_reorder_dependency_validation() -> None:
     print("[ops] reorder: moving fillet before its owning box refused (dependency_exists)")
 
 
+def test_reorder_parent_after_child_refused() -> None:
+    """Moving a parent after a dependent must be refused by whole-list validation."""
+    doc = _blank()
+    doc, _ = apply_ops(doc, [_box_op()])
+    edge_sel = {"kind": "edge", "surf": "line", "centroid": [10.0, 10.0, 0.0],
+                "axis": [0.0, 0.0, 1.0], "area_or_len": 20.0, "owner_feature": "f1",
+                "hint_index": 0}
+    doc, _ = apply_ops(doc, [{"op": "add_feature", "feature": {
+        "type": "fillet", "name": "Fillet1",
+        "params": {"radius": {"value": 2.0, "expr": None}},
+        "refs": {"edges": [edge_sel]}}}])
+    try:
+        apply_ops(doc, [{"op": "reorder_feature", "id": "f1", "before": None}])
+        raise AssertionError("reorder f1 after dependent f2 must be refused")
+    except OpError as e:
+        assert e.code == "dependency_exists", e.to_envelope()
+        assert e.detail.get("feature") == "f2", e.to_envelope()
+    assert [f["id"] for f in doc["features"]] == ["f1", "f2"], "source doc remains unchanged"
+    print("[ops] reorder: moving parent after child refused by whole-list validation")
+
+
+def test_reorder_valid_independent_feature() -> None:
+    """Independent features can still be reordered."""
+    doc = _blank()
+    doc, _ = apply_ops(doc, [_box_op(name="Box1")])
+    doc, _ = apply_ops(doc, [_box_op(name="Box2")])
+    doc2, _ = apply_ops(doc, [{"op": "reorder_feature", "id": "f2", "before": "f1"}])
+    assert [f["id"] for f in doc2["features"]] == ["f2", "f1"]
+    print("[ops] reorder: independent features can move")
+
+
 # --------------------------------------------------------------------------- stale revision
 
 
@@ -304,6 +335,8 @@ def main() -> None:
     test_patch_edit_replaces_and_deletes()
     test_delete_dependency_refusal_and_cascade()
     test_reorder_dependency_validation()
+    test_reorder_parent_after_child_refused()
+    test_reorder_valid_independent_feature()
     test_stale_revision()
     test_eq_set_drives_and_eq_delete_in_use()
     test_cache_hit_face_owners_nonempty()

@@ -59,6 +59,11 @@ static PMFieldDef Check(const char* key, const char* label, const char* group, b
     PMFieldDef f; f.kind = PMFieldKind::Check; f.key = key; f.label = label;
     f.group = group; f.checkDefault = def; return f;
 }
+static PMFieldDef CheckIf(const char* key, const char* label, const char* group, bool def,
+                          const char* enableKey, const char* enableVals) {
+    PMFieldDef f = Check(key, label, group, def);
+    f.enableKey = enableKey; f.enableVals = enableVals; return f;
+}
 // Integer param (pattern instance counts). No unit suffix.
 static PMFieldDef Int(const char* key, const char* label, const char* group, double def) {
     PMFieldDef f; f.kind = PMFieldKind::Int; f.key = key; f.label = label;
@@ -146,29 +151,46 @@ static const std::vector<PMFormDef>& forms() {
         //   Thin Feature (params.thin/thin_thickness/thin_side) extrudes a wall instead of a solid.
         { "extrude", "Extrude", "extrude_boss", {
             Well      ("profile",  "Profile",         "From",        K_FACE, true),
+            ComboL    ("start",    "Start Condition", "From",
+                       "sketch_plane|offset|from_reference|offset_from_reference",
+                       "Sketch Plane|Offset|From Ref.|Offset Ref."),
+            WellIf    ("start_ref","Start Reference", "From",        K_FACE, false,
+                       "start", "from_reference|offset_from_reference"),
+            DimIf     ("start_offset", "Start Offset","From",        0.0,
+                       "start", "offset|offset_from_reference", true),
             ComboL    ("mode",     "Type",            "Direction 1", "boss|cut",
                                                                      "Boss|Cut"),
             ComboL    ("end",      "End Condition",   "Direction 1",
-                       "blind|mid_plane|through_all|up_to_next|up_to_surface|offset_from_surface|up_to_body|up_to_vertex",
-                       "Blind|Mid Plane|Through All|Up To Next|Up To Surface|Offset From Surface|Up To Body|Up To Vertex"),
+                       "blind|mid_plane|through_all|up_to_next|up_to_surface|offset_from_surface|up_to_body|up_to_vertex|up_to_reference|offset_from_reference",
+                       "Blind|Mid Plane|Through All|Up To Next|Up To Surface|Offset Surface|Up To Body|Up To Vertex|Up To Ref.|Offset Ref."),
             DimIf     ("depth",    "Depth",           "Direction 1", 10.0,
-                       "end", "blind|mid_plane"),
+                       "end", "blind|mid_plane", true),
             WellIf    ("up_to",    "Up To Reference", "Direction 1", K_FACEVERT, false,
                        "end", "up_to_surface|offset_from_surface|up_to_body|up_to_vertex"),
             DimIf     ("offset",   "Offset",          "Direction 1", 0.0,
-                       "end", "offset_from_surface"),
+                       "end", "offset_from_surface", true),
+            WellIf    ("end_ref",  "End Reference",   "Direction 1", K_FACE, false,
+                       "end", "up_to_reference|offset_from_reference"),
+            DimIf     ("end_offset","End Offset",      "Direction 1", 0.0,
+                       "end", "offset_from_reference", true),
             Check     ("flip",     "Reverse direction","Direction 1", false),
-            Angle     ("draft",    "Draft angle",     "Direction 1", 0.0),
-            Check     ("draft_outward", "Draft outward","Direction 1", false),
+            DimIf     ("draft",    "Draft angle",     "Direction 1", 0.0,
+                       "end", "blind|mid_plane", true),
+            CheckIf   ("draft_outward", "Draft outward","Direction 1", false,
+                       "end", "blind|mid_plane"),
             ComboL    ("end2",     "End Condition",   "Direction 2",
-                       "none|blind|through_all|up_to_next|up_to_surface|offset_from_surface|up_to_body|up_to_vertex",
-                       "None|Blind|Through All|Up To Next|Up To Surface|Offset From Surface|Up To Body|Up To Vertex"),
-            DimIf     ("depth2",   "Depth",           "Direction 2", 10.0,
-                       "end2", "blind"),
+                       "none|blind|through_all|up_to_next|up_to_surface|offset_from_surface|up_to_body|up_to_vertex|up_to_reference|offset_from_reference",
+                       "None|Blind|Through All|Up To Next|Up To Surface|Offset Surface|Up To Body|Up To Vertex|Up To Ref.|Offset Ref."),
             WellIf    ("up_to2",   "Up To Reference", "Direction 2", K_FACEVERT, false,
                        "end2", "up_to_surface|offset_from_surface|up_to_body|up_to_vertex"),
             DimIf     ("offset2",  "Offset",          "Direction 2", 0.0,
-                       "end2", "offset_from_surface"),
+                       "end2", "offset_from_surface", true),
+            WellIf    ("end2_ref", "End Reference",   "Direction 2", K_FACE, false,
+                       "end2", "up_to_reference|offset_from_reference"),
+            DimIf     ("end2_offset","End Offset",     "Direction 2", 0.0,
+                       "end2", "offset_from_reference", true),
+            DimIf     ("depth2",   "Depth",           "Direction 2", 10.0,
+                       "end2", "blind", true),
             Check     ("thin",         "Thin Feature",  "Thin Feature", false),
             DimIf     ("thin_thickness","Wall thickness","Thin Feature", 2.0,
                        "thin", "true"),

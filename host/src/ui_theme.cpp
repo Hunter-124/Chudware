@@ -266,8 +266,15 @@ void applyTheme(Theme t, float scale) {
     else
         fillDark(palette);
 
-    // Step 2: set ImGuiStyle
+    // Step 2: set ImGuiStyle. Reset first so runtime toggles and repair calls are
+    // idempotent; otherwise ScaleAllSizes and any roles not explicitly overwritten
+    // can inherit stale light/dark values.
     ImGuiStyle& s = ImGui::GetStyle();
+    s = ImGuiStyle();
+    if (t == Theme::Light)
+        ImGui::StyleColorsLight(&s);
+    else
+        ImGui::StyleColorsDark(&s);
 
     // --- shape: rounded + roomy (same for both themes) ---
     s.WindowRounding    = 9.0f;
@@ -289,7 +296,7 @@ void applyTheme(Theme t, float scale) {
     s.WindowBorderSize  = 1.0f;
     s.ChildBorderSize   = 1.0f;
     s.PopupBorderSize   = 1.0f;
-    s.FrameBorderSize   = 0.0f;
+    s.FrameBorderSize   = (t == Theme::Light) ? 1.0f : 0.0f;
     s.TabBorderSize     = 0.0f;
     s.WindowTitleAlign         = ImVec2(0.02f, 0.5f);
     s.WindowMenuButtonPosition = ImGuiDir_None;

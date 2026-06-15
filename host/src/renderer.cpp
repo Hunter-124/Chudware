@@ -3,6 +3,7 @@
 #include <glad/gl.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -195,6 +196,26 @@ void main(){
     frag = vec4(c, 1.0);
 })";
 
+const char* kResolveVert = R"(#version 330 core
+void main(){
+    vec2 pos = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);
+})";
+
+const char* kResolveFrag = R"(#version 330 core
+uniform sampler2D uSrc;
+uniform int uSS;
+out vec4 frag;
+void main(){
+    ivec2 dst = ivec2(gl_FragCoord.xy);
+    ivec2 base = dst * uSS;
+    vec4 acc = vec4(0.0);
+    for (int y = 0; y < uSS; ++y)
+        for (int x = 0; x < uSS; ++x)
+            acc += texelFetch(uSrc, base + ivec2(x, y), 0);
+    frag = acc / float(uSS * uSS);
+})";
+
 // Soft elliptical contact shadow on a virtual ground plane. The quad carries a planar uv in
 // [-1,1]; alpha falls off radially with a smooth shoulder so it reads as a diffuse blob.
 const char* kShadowVert = R"(#version 330 core
@@ -316,6 +337,8 @@ Renderer::~Renderer() {
     if (fbo_) glDeleteFramebuffers(1, &fbo_);
     if (colorTex_) glDeleteTextures(1, &colorTex_);
     if (depthRbo_) glDeleteRenderbuffers(1, &depthRbo_);
+    if (resolveFbo_) glDeleteFramebuffers(1, &resolveFbo_);
+    if (resolvedTex_) glDeleteTextures(1, &resolvedTex_);
     // C27-D: View Selector preview thumbnail target (lazily created; may be 0).
     if (thumbFbo_) glDeleteFramebuffers(1, &thumbFbo_);
     if (thumbTex_) glDeleteTextures(1, &thumbTex_);
@@ -323,6 +346,7 @@ Renderer::~Renderer() {
     if (prog_) glDeleteProgram(prog_);
     if (edgeProg_) glDeleteProgram(edgeProg_);
     if (bgProg_) glDeleteProgram(bgProg_);
+    if (resolveProg_) glDeleteProgram(resolveProg_);
     if (shadowProg_) glDeleteProgram(shadowProg_);
     if (planeProg_) glDeleteProgram(planeProg_);
     if (planeVbo_) glDeleteBuffers(1, &planeVbo_);
@@ -403,12 +427,15 @@ bool Renderer::init(int width, int height, std::string& err) {
     prog_ = linkProgram(kVert, kFrag);
     edgeProg_ = linkProgram(kEdgeVert, kEdgeFrag);
     bgProg_ = linkProgram(kBgVert, kBgFrag);
+    resolveProg_ = linkProgram(kResolveVert, kResolveFrag);
     shadowProg_ = linkProgram(kShadowVert, kShadowFrag);
     planeProg_ = linkProgram(kPlaneVert, kPlaneFrag);
     capProg_ = linkProgram(kCapVert, kCapFrag);
     int ok = 0;
     glGetProgramiv(prog_, GL_LINK_STATUS, &ok);
     if (!ok) { err = "program link failed"; return false; }
+    glGetProgramiv(resolveProg_, GL_LINK_STATUS, &ok);
+    if (!ok) { err = "resolve program link failed"; return false; }
 
     glGenVertexArrays(1, &bgVao_);
 
@@ -438,6 +465,13 @@ bool Renderer::init(int width, int height, std::string& err) {
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         err = "framebuffer incomplete";
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        return false;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, resolveFbo_);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        err = "resolve framebuffer incomplete";
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
         return false;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -449,11 +483,22 @@ void Renderer::allocTargets() {
     if (!fbo_) glGenFramebuffers(1, &fbo_);
     if (!colorTex_) glGenTextures(1, &colorTex_);
     if (!depthRbo_) glGenRenderbuffers(1, &depthRbo_);
+    if (!resolveFbo_) glGenFramebuffers(1, &resolveFbo_);
+    if (!resolvedTex_) glGenTextures(1, &resolvedTex_);
 
     glBindTexture(GL_TEXTURE_2D, colorTex_);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sw_, sh_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glBindTexture(GL_TEXTURE_2D, resolvedTex_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w_, h_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     // W3-I: packed depth+stencil so the section cap can be stencil-masked.
     glBindRenderbuffer(GL_RENDERBUFFER, depthRbo_);
@@ -463,7 +508,10 @@ void Renderer::allocTargets() {
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTex_, 0);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER,
                               depthRbo_);
+    glBindFramebuffer(GL_FRAMEBUFFER, resolveFbo_);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, resolvedTex_, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    resolvedDirty_ = true;
 }
 
 void Renderer::resize(int width, int height) {
@@ -640,6 +688,7 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
 static constexpr float kEmptySceneRadius = 35.0f;
 
 void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
+    const auto renderT0 = std::chrono::steady_clock::now();
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
     glViewport(0, 0, sw_, sh_);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -807,6 +856,15 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     drawReferencePlanes(mvp);
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    const auto renderT1 = std::chrono::steady_clock::now();
+    timing_.frame += 1;
+    timing_.renderMs = std::chrono::duration<double, std::milli>(renderT1 - renderT0).count();
+    timing_.resolveMs = 0.0;
+    timing_.width = w_;
+    timing_.height = h_;
+    timing_.ssWidth = sw_;
+    timing_.ssHeight = sh_;
+    resolvedDirty_ = true;
 }
 
 // C27-D: render the current meshes from a candidate orientation into a small dedicated FBO and
@@ -1221,6 +1279,7 @@ void Renderer::beginOverlay() {
 
 void Renderer::endOverlay() {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    resolvedDirty_ = true;
 }
 
 void Renderer::renderView(const std::string& view) {
@@ -1240,27 +1299,70 @@ void Renderer::renderOrbit(float yawDeg, float pitchDeg, float zoom, const float
     drawCurrent(yawDeg, pitchDeg, zoom);
 }
 
+void Renderer::resolveColorTexture() const {
+    if (!resolvedDirty_ || !resolveFbo_ || !resolvedTex_ || !colorTex_ || !resolveProg_) return;
+
+    const auto resolveT0 = std::chrono::steady_clock::now();
+
+    GLint prevFbo = 0, prevViewport[4] = {0, 0, 0, 0}, prevProgram = 0;
+    GLint prevActiveTex = 0, prevTex0 = 0;
+    GLboolean prevDepthTest = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean prevBlend = glIsEnabled(GL_BLEND);
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+    glGetIntegerv(GL_VIEWPORT, prevViewport);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prevProgram);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActiveTex);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex0);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, resolveFbo_);
+    glViewport(0, 0, w_, h_);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glUseProgram(resolveProg_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, colorTex_);
+    glUniform1i(glGetUniformLocation(resolveProg_, "uSrc"), 0);
+    glUniform1i(glGetUniformLocation(resolveProg_, "uSS"), SS);
+    glBindVertexArray(bgVao_);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBindVertexArray(0);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+    glUseProgram((GLuint)prevProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prevTex0);
+    glActiveTexture((GLenum)prevActiveTex);
+    if (prevDepthTest) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (prevBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+
+    const auto resolveT1 = std::chrono::steady_clock::now();
+    timing_.resolveMs =
+        std::chrono::duration<double, std::milli>(resolveT1 - resolveT0).count();
+    resolvedDirty_ = false;
+}
+
+unsigned int Renderer::resolvedColorTexture() const {
+    resolveColorTexture();
+    return resolvedTex_;
+}
+
 std::vector<unsigned char> Renderer::readRGBA() const {
-    std::vector<unsigned char> ss(sw_ * sh_ * 4);
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+    resolveColorTexture();
+
+    std::vector<unsigned char> glPixels(w_ * h_ * 4);
+    glBindFramebuffer(GL_FRAMEBUFFER, resolveFbo_);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, sw_, sh_, GL_RGBA, GL_UNSIGNED_BYTE, ss.data());
+    glReadPixels(0, 0, w_, h_, GL_RGBA, GL_UNSIGNED_BYTE, glPixels.data());
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    // Box-downsample SSxSS -> 1, and flip vertically (GL origin is bottom-left).
+    // The texture is already box-resolved to final size; just flip vertically to top-left origin.
     std::vector<unsigned char> out(w_ * h_ * 4);
     for (int y = 0; y < h_; ++y) {
-        for (int x = 0; x < w_; ++x) {
-            int acc[4] = {0, 0, 0, 0};
-            for (int dy = 0; dy < SS; ++dy)
-                for (int dx = 0; dx < SS; ++dx) {
-                    int sx = x * SS + dx, sy = y * SS + dy;
-                    const unsigned char* p = &ss[(sy * sw_ + sx) * 4];
-                    for (int c = 0; c < 4; ++c) acc[c] += p[c];
-                }
-            unsigned char* d = &out[((h_ - 1 - y) * w_ + x) * 4];
-            for (int c = 0; c < 4; ++c) d[c] = (unsigned char)(acc[c] / (SS * SS));
-        }
+        const unsigned char* src = &glPixels[y * w_ * 4];
+        unsigned char* dst = &out[(h_ - 1 - y) * w_ * 4];
+        std::copy(src, src + w_ * 4, dst);
     }
     return out;
 }

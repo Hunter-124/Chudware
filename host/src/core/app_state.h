@@ -756,6 +756,10 @@ struct AppState {
     // request pump on the GL thread — so the native file dialog opens with our window active and the
     // open/save reuses feature_tree's helpers (which own s_docPath + the mesh refresh).
     bool requestOpenDialog = false;   // File > Open... / Ctrl+O
+    // File > Import as Solid... — like requestOpenDialog but uses a mesh-only filter and passes
+    // asSolid=true so the engine sews a mesh import into a B-rep solid (mesh formats only; no-op
+    // for B-rep). Drained on the same GL-thread pump as the other one-shot file requests.
+    bool requestImportSolid = false;  // File > Import as Solid...
     bool requestSave       = false;   // File > Save / Ctrl+S
     bool requestSaveAs     = false;   // File > Save As... / Ctrl+Shift+S
     std::string requestOpenPath;      // File > Recent <path> (open this exact path next pump)

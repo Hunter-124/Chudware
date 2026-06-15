@@ -366,9 +366,13 @@ bool DocMirror::save(WorkerClient& w, const std::string& path, std::string& err)
     return true;
 }
 
-bool DocMirror::open(WorkerClient& w, const std::string& path, std::string& err) {
+bool DocMirror::open(WorkerClient& w, const std::string& path, std::string& err, bool asSolid) {
     nlohmann::json res;
-    if (!w.call("doc_open", {{"path", path}}, res, err)) return false;
+    // Default (asSolid==false) keeps the request byte-identical to the historic {"path": path} shape;
+    // only when asSolid is set do we add the optional engine flag that sews a mesh import into a solid.
+    nlohmann::json params = {{"path", path}};
+    if (asSolid) params["as_solid"] = true;
+    if (!w.call("doc_open", params, res, err)) return false;
     if (res.contains("code")) { err = jstr(res, "message"); return false; }
     docId_ = jstr(res, "doc_id");
     revision_ = jint(res, "revision");

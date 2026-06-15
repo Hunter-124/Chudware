@@ -1061,6 +1061,13 @@ static const char* kImportFilter =
     "SolidWorks/Parasolid (*.sldprt;*.sldasm;*.x_t;*.x_b)\0*.sldprt;*.sldasm;*.x_t;*.x_b\0"
     "All files (*.*)\0*.*\0";
 
+// F4: "Import as Solid..." filter — ONLY the mesh formats the engine can sew into a B-rep solid via
+// doc_open's `as_solid` flag (the convertible set; B-rep sources are excluded since they already
+// import as solids). Same Win32 NUL-delimited layout as kImportFilter, All files last.
+static const char* kImportSolidFilter =
+    "Mesh as solid (*.stl;*.obj;*.ply;*.3mf;*.gltf;*.glb;*.3dm)\0*.stl;*.obj;*.ply;*.3mf;*.gltf;*.glb;*.3dm\0"
+    "All files (*.*)\0*.*\0";
+
 static std::string pathBaseName(const std::string& p) {
     size_t cut = p.find_last_of("\\/");
     return cut == std::string::npos ? p : p.substr(cut + 1);
@@ -2185,6 +2192,30 @@ std::string featureTreeOpenDialog(AppState& st) {
     std::string path = openFileDialog(kImportFilter);
     if (path.empty()) return std::string();   // canceled
     return featureTreeOpenPath(st, path) ? path : std::string();
+}
+
+// Native "Import as Solid..." dialog -> open with asSolid=true. Mirrors featureTreeOpenDialog but
+// uses the mesh-only kImportSolidFilter and threads /*asSolid=*/true through DocMirror::open, so the
+// engine sews the picked triangle mesh into a real B-rep solid. The rest of the flow is identical:
+// applyOpenedDoc (new tab + viewport/mesh refresh) so the result shows as a normal solid body in the
+// tree/viewport. Returns the opened path (for Recent), or "" on cancel/failure.
+std::string featureTreeImportAsSolid(AppState& st) {
+    if (fileDialogsDisabled()) {
+        st.toast(ui::ToastLevel::Info,
+                 "File dialogs disabled — use the path field below the tree");
+        return std::string();
+    }
+    std::string path = openFileDialog(kImportSolidFilter);
+    if (path.empty()) return std::string();   // canceled
+    std::string err;
+    if (st.docMirror.open(st.worker, path, err, /*asSolid=*/true)) {
+        applyOpenedDoc(st, path);   // s_docPath = path, new tab, mesh refresh (same seam as Open)
+        return path;
+    }
+    st.addLog("[err] import as solid: " + err);
+    st.toast(ui::ToastLevel::Error,
+             "Import as Solid failed: " + pathBaseName(path) + " — " + err);
+    return std::string();
 }
 
 // Save the active doc. saveAs=true forces the "Save As..." dialog; otherwise a silent re-save to

@@ -2005,7 +2005,8 @@ int run_gui(const char* screenshotPath) {
         // CAD -> featureTreeOpenPath, ECAD/KiCad -> ecadOpenPath. Each open/save records Recent.
         // Gated on a live, idle worker (mirrors the FeatureManager toolbar's canDoc gate) so we never
         // swap the doc under a running call; a queued request waits one frame rather than firing early.
-        if (st.requestOpenDialog || !st.requestOpenPath.empty() || st.requestSave || st.requestSaveAs ||
+        if (st.requestOpenDialog || st.requestImportSolid || !st.requestOpenPath.empty() ||
+            st.requestSave || st.requestSaveAs ||
             st.requestSaveAll || !st.requestExportFormat.empty()) {
             const bool fileReady = st.workerStarted && !st.job.running.load() && !st.agentV2Running;
             if (!fileReady) {
@@ -2019,6 +2020,14 @@ int run_gui(const char* screenshotPath) {
             if (st.requestOpenDialog) {
                 st.requestOpenDialog = false;
                 std::string opened = ui::featureTreeOpenDialog(st);
+                if (!opened.empty()) st.pushRecentFile(opened);
+            }
+            // File > Import as Solid... — mesh-only native dialog -> DocMirror::open(asSolid=true) so
+            // the engine sews the imported mesh into a B-rep solid. Same one-shot drain + Recent
+            // recording as Open; the heavy lifting (filter + asSolid flag) lives in the helper.
+            if (st.requestImportSolid) {
+                st.requestImportSolid = false;
+                std::string opened = ui::featureTreeImportAsSolid(st);
                 if (!opened.empty()) st.pushRecentFile(opened);
             }
             if (!st.requestOpenPath.empty()) {

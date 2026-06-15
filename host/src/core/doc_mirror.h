@@ -179,8 +179,12 @@ public:
                             std::string& err);
 
     // Save / open (.step+ path). On open: updates docId/revision/tree.
+    // asSolid (optional): when true the doc_open request carries {"as_solid": true} so a mesh-format
+    // source (.stl/.obj/.ply/.3mf/.gltf/.glb/.3dm) is sewn into a real B-rep solid by the engine
+    // instead of imported as a graphics body (no-op / ignored for B-rep sources). Default false
+    // keeps the request byte-identical for every existing caller.
     bool save(WorkerClient& w, const std::string& path, std::string& err);
-    bool open(WorkerClient& w, const std::string& path, std::string& err);
+    bool open(WorkerClient& w, const std::string& path, std::string& err, bool asSolid = false);
 
     // Document tabs: re-point this mirror at an ALREADY-open worker document (the worker keeps
     // every doc alive in its registry). Issues a forced doc_rebuild for `docId` so the mirror

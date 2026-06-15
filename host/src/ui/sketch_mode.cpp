@@ -1666,11 +1666,6 @@ int SketchMode::hitTestHandle(const ImVec2& s, std::string& handleOut, float& uO
         float d2 = dx * dx + dy * dy;
         if (d2 < best) { best = d2; handleOut = handle; uOut = eu; vOut = ev; hit = 1; }
     };
-    // The sketch origin (0,0) is a real, pickable point handle so it can be selected and given
-    // relations (coincident / horizontal / vertical / point_on …) against other geometry. It is a
-    // virtual entity — not in ents_ — and the engine resolves the bare ref "origin" to a fixed
-    // (0,0). It is fixed, so it is selectable but never draggable (see the drag-promotion guard).
-    consider("origin", 0.0f, 0.0f);
     for (const auto& e : ents_) {
         if (e.type == "line" || e.type == "slot") {
             consider(e.id + ".p1", e.p1[0], e.p1[1]);
@@ -1685,6 +1680,13 @@ int SketchMode::hitTestHandle(const ImVec2& s, std::string& handleOut, float& uO
                 consider(e.id + ".p" + std::to_string(i), e.pts[i].x, e.pts[i].y);
         }
     }
+    // The sketch origin (0,0) is a real, pickable point handle so it can be selected and given
+    // relations (coincident / horizontal / vertical / point_on …) against other geometry. It is a
+    // virtual entity — not in ents_ — and the engine resolves the bare ref "origin" to a fixed (0,0).
+    // Considered LAST so a real vertex sitting exactly on the origin wins the tie (strict d2<best);
+    // the origin is then picked only when no geometry handle is nearer. It is fixed, so it is
+    // selectable but never promotes to a drag (see the drag-promotion guard).
+    consider("origin", 0.0f, 0.0f);
     return hit;
 }
 

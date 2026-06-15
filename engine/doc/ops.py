@@ -29,6 +29,7 @@ import re
 from typing import Any
 
 from engine.doc.schema import (
+    FEATURE_ID_RE,
     RESERVED_DATUMS,
     validate_document,
 )
@@ -1509,6 +1510,477 @@ def _op_sketch_toggle_construction(doc, op, index, idgen, id_map):
     raise _invalid(index, f"sketch_toggle_construction: entity '{eid}' not found")
 
 
+# ---- Wave 4A/4B: feature + sketch-entity copy/paste ----------------------------------------
+#
+# Copy/paste moves features (with their dependency closure) or loose sketch entities between
+# documents via a portable, id-free "bundle" (kind ``aicad.feature_bundle/1``). The design keeps
+# the op layer pure: copy_feature is READ-ONLY (no doc mutation) and surfaces its bundle through the
+# id_map side-channel (``$bundle`` / ``$bundle:<op-index>``); paste_feature re-ids the bundle and
+# appends through the SAME rollback-bar-aware path _op_add_feature uses.
+#
+# Bundle format (aicad.feature_bundle/1):
+#   { "kind": "aicad.feature_bundle/1",
+#     "source_doc_id":   <str|null>,        # provenance only (derived-link + cross-doc resolve)
+#     "source_doc_name": <str|null>,
+#     "root": "$0",                          # placeholder of the copied (root) feature
+#     "feature_order": ["$0", "$1", ...],    # DEPENDENCY-FIRST build order (deps before dependents)
+#     "features": { "$k": <feature> },       # id stripped; in-closure refs -> placeholders
+#     "external_refs":   ["f7", ...],        # referenced SOURCE ids NOT in the closure
+#     "external_datums": {"f7": "Datum1"} }  # source datum feature id -> its name (cross-doc reuse)
+#
+# Inside a bundled feature the id is removed; feature-id refs in the closure become ``$k``;
+# sketch entity ids become ``~e0,~e1,...``; constraint ids become ``~c0,~c1,...``. Refs that point
+# OUT of the closure keep their raw source id and are listed in ``external_refs`` (a datum among
+# them is additionally recorded in ``external_datums`` by name, so paste can reuse a same-named
+# datum in the target).
+
+_FEATURE_PLACEHOLDER_RE = re.compile(r"^\$(\d+)$")
+
+
+def _feature_refs_closure(doc: dict, root_fid: str) -> tuple[list[str], set[str]]:
+    """Walk every feature *root_fid* (transitively) references — selectors' ``owner_feature``,
+    datum/region refs, and ``_FEAT_LIST`` feature-id slots — restricted to real features in *doc*
+    (reserved datums excluded). Returns ``(order, in_closure)`` where *order* is dependency-first
+    (deps precede dependents) and ends with the root; *in_closure* is the set of included ids."""
+    in_closure: set[str] = set()
+
+    def direct_refs(fid: str) -> set[str]:
+        _, feat = _find_feature(doc, fid)
+        if feat is None:
+            return set()
+        refs = feat.get("refs", {}) or {}
+        out: set[str] = set()
+        _walk_selector_owners(refs, out)
+        for slot_val in refs.values():
+            if isinstance(slot_val, list):
+                out.update(x for x in slot_val if isinstance(x, str))
+            elif isinstance(slot_val, str):
+                out.add(slot_val)
+        # only real features in this doc count toward the closure
+        out -= set(RESERVED_DATUMS)
+        return {r for r in out if _find_feature(doc, r)[1] is not None}
+
+    def visit(fid: str) -> None:
+        if fid in in_closure:
+            return
+        in_closure.add(fid)
+        for dep in direct_refs(fid):
+            visit(dep)
+
+    visit(root_fid)
+    # Dependency-first order = the document's own feature order filtered to the closure (the doc is
+    # already a valid topological order: a feature's refs always precede it).
+    order = [f["id"] for f in _features(doc)
+             if isinstance(f, dict) and f.get("id") in in_closure]
+    return order, in_closure
+
+
+def _stamp_bundle_refs(refs: Any, fid_to_ph: dict[str, str], external_refs: set[str]) -> Any:
+    """Deep-copy *refs* with every in-closure source feature id rewritten to its placeholder.
+    Out-of-closure ids are left raw and recorded in *external_refs*. Handles selectors
+    (``owner_feature``), datum refs (string or ``{kind:datum,feature}``), region refs
+    (``{kind:region,sketch}``), and ``_FEAT_LIST`` slots (lists of feature ids)."""
+    def remap_fid(fid: str) -> str:
+        if fid in fid_to_ph:
+            return fid_to_ph[fid]
+        if fid not in RESERVED_DATUMS and FEATURE_ID_RE.match(fid):
+            external_refs.add(fid)
+        return fid
+
+    def walk(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            out: dict = {}
+            kind = obj.get("kind")
+            for k, v in obj.items():
+                if kind in ("face", "edge", "vertex", "body") and k == "owner_feature" \
+                        and isinstance(v, str):
+                    out[k] = remap_fid(v)
+                elif kind == "datum" and k == "feature" and isinstance(v, str):
+                    out[k] = remap_fid(v)
+                elif kind == "region" and k == "sketch" and isinstance(v, str):
+                    out[k] = remap_fid(v)
+                else:
+                    out[k] = walk(v)
+            return out
+        if isinstance(obj, list):
+            return [walk(v) for v in obj]
+        if isinstance(obj, str):
+            # bare datum id / feature-id-list entry
+            if obj in RESERVED_DATUMS:
+                return obj
+            if FEATURE_ID_RE.match(obj):
+                return remap_fid(obj)
+        return obj
+
+    return walk(copy.deepcopy(refs or {}))
+
+
+def _stamp_bundle_feature(feat: dict, fid_to_ph: dict[str, str],
+                          external_refs: set[str]) -> dict:
+    """Return a portable copy of *feat*: id removed, refs placeholdered, and (for sketches) entity
+    ids -> ``~e<n>`` and constraint ids -> ``~c<n>`` with internal handles rewritten in lockstep."""
+    out = copy.deepcopy(feat)
+    out.pop("id", None)
+    out["refs"] = _stamp_bundle_refs(out.get("refs", {}), fid_to_ph, external_refs)
+    if out.get("type") == "sketch":
+        params = out.setdefault("params", {})
+        ents = params.get("entities", []) or []
+        cons = params.get("constraints", []) or []
+        eid_map: dict[str, str] = {}
+        for i, ent in enumerate(ents):
+            if isinstance(ent, dict) and isinstance(ent.get("id"), str):
+                eid_map[ent["id"]] = f"~e{i}"
+        for i, ent in enumerate(ents):
+            if isinstance(ent, dict):
+                ent["id"] = f"~e{i}"
+        for i, con in enumerate(cons):
+            if isinstance(con, dict):
+                con["id"] = f"~c{i}"
+                con["refs"] = [_remap_handle(h, eid_map) for h in (con.get("refs", []) or [])]
+    return out
+
+
+def _remap_handle(handle: Any, eid_map: dict[str, str]) -> Any:
+    """Rewrite the base of a sketch handle (``e3`` / ``e3.p1``) through *eid_map*."""
+    if isinstance(handle, str):
+        base, dot, sub = handle.partition(".")
+        if base in eid_map:
+            return eid_map[base] + (dot + sub if dot else "")
+    return handle
+
+
+def _op_copy_feature(doc, op, index, idgen, id_map):
+    """READ-ONLY: package feature ``id`` (and, by default, its full reference closure) into a
+    portable bundle. The bundle is returned via the id_map side-channel under ``$bundle`` (and
+    ``$bundle:<index>`` when several copy_feature ops appear in one batch). No document mutation.
+
+    ``include_dependencies`` (default true): walk the FULL reference closure (every feature this one
+    transitively references via selectors / datum / region / pattern-feature-list refs) so the
+    paste is self-contained. When false, only the root feature is bundled and every referenced
+    feature is flagged in ``external_refs`` (datums additionally in ``external_datums`` by name) for
+    cross-doc resolution at paste time."""
+    fid = op.get("id")
+    _, feat = _find_feature(doc, fid)
+    if feat is None:
+        raise _invalid(index, f"copy_feature: '{fid}' not found")
+    inc = op.get("include_dependencies", True)
+    if not isinstance(inc, bool):
+        raise _invalid(index, "copy_feature.include_dependencies must be a bool")
+
+    if inc:
+        order, in_closure = _feature_refs_closure(doc, fid)
+    else:
+        order, in_closure = [fid], {fid}
+
+    # placeholder per included feature, in dependency-first order
+    fid_to_ph = {f: f"${i}" for i, f in enumerate(order)}
+    external_refs: set[str] = set()
+    features: dict[str, dict] = {}
+    for src_fid in order:
+        _, f = _find_feature(doc, src_fid)
+        features[fid_to_ph[src_fid]] = _stamp_bundle_feature(f, fid_to_ph, external_refs)
+
+    # Map each external datum source id -> its name so paste can reuse a same-named datum.
+    external_datums: dict[str, str] = {}
+    for ext in external_refs:
+        _, ef = _find_feature(doc, ext)
+        if ef is not None and ef.get("type") in ("plane", "axis", "point", "csys"):
+            external_datums[ext] = ef.get("name") or ext
+
+    bundle = {
+        "kind": "aicad.feature_bundle/1",
+        "source_doc_id": doc.get("id"),
+        "source_doc_name": doc.get("name"),
+        "root": fid_to_ph[fid],
+        "feature_order": list(fid_to_ph.values()),
+        "features": features,
+        "external_refs": sorted(external_refs),
+        "external_datums": external_datums,
+    }
+    id_map["$bundle"] = bundle
+    id_map[f"$bundle:{index}"] = bundle
+
+
+def _bundle_or_invalid(op, index) -> dict:
+    """Validate the inbound bundle shape (shared by paste_feature / paste_feature_as_derived)."""
+    bundle = op.get("bundle")
+    if not isinstance(bundle, dict):
+        raise _invalid(index, "paste requires a 'bundle' object")
+    if bundle.get("kind") != "aicad.feature_bundle/1":
+        raise _invalid(index, "bundle.kind must be 'aicad.feature_bundle/1'")
+    order = bundle.get("feature_order")
+    feats = bundle.get("features")
+    if not isinstance(order, list) or not order:
+        raise _invalid(index, "bundle.feature_order must be a non-empty list")
+    if not isinstance(feats, dict):
+        raise _invalid(index, "bundle.features must be an object")
+    for ph in order:
+        if ph not in feats or not isinstance(feats.get(ph), dict):
+            raise _invalid(index, f"bundle.features is missing feature for '{ph}'")
+    if bundle.get("root") not in order:
+        raise _invalid(index, "bundle.root must appear in feature_order")
+    return bundle
+
+
+def _target_datum_by_name(doc: dict, name: str) -> str | None:
+    """Find a same-named datum feature (plane/axis/point/csys) in *doc*; else a reserved id."""
+    if name in RESERVED_DATUMS:
+        return name
+    for f in _features(doc):
+        if isinstance(f, dict) and f.get("type") in ("plane", "axis", "point", "csys") \
+                and f.get("name") == name:
+            return f.get("id")
+    return None
+
+
+def _resolve_paste_refs(refs: Any, ph_to_fid: dict[str, str], bundle: dict,
+                        doc: dict) -> Any:
+    """Re-link a pasted feature's refs against the TARGET doc (selectors.md — never a silent wrong
+    pick). In-closure placeholders -> the freshly-assigned target ids. Out-of-closure ids:
+      * topology selector (face/edge/vertex/body) -> ``owner_feature=null`` + ``external`` marker so
+        the compiler dangles for re-pick;
+      * datum -> reuse a same-named target datum (Top/Front/Right/custom) else downgrade to a
+        schema-valid plane selector + ``external{...,unresolved:true}``;
+      * region -> keep the (dangling) source sketch id + ``external`` marker.
+    ``_FEAT_LIST`` slots keep only in-closure (re-id'd) features; external feature ids are dropped
+    from the list (they cannot satisfy the schema's precede-rule) and surface as build-time gaps."""
+    src_doc_id = bundle.get("source_doc_id")
+    src_doc_name = bundle.get("source_doc_name")
+    external_datums = bundle.get("external_datums", {}) or {}
+
+    def ext_marker(owner=None, **extra) -> dict:
+        m = {"doc_id": src_doc_id, "doc_name": src_doc_name, "owner_feature": owner}
+        m.update(extra)
+        return m
+
+    def walk(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            kind = obj.get("kind")
+            if kind in ("face", "edge", "vertex", "body"):
+                ow = obj.get("owner_feature")
+                out = copy.deepcopy(obj)
+                if isinstance(ow, str) and ow in ph_to_fid:
+                    out["owner_feature"] = ph_to_fid[ow]
+                elif isinstance(ow, str):
+                    # cross-doc topology: detach + flag for re-pick (compiler dangles).
+                    out["owner_feature"] = None
+                    out["external"] = ext_marker(owner=ow)
+                return out
+            if kind == "datum":
+                fe = obj.get("feature")
+                out = copy.deepcopy(obj)
+                if isinstance(fe, str) and fe in ph_to_fid:
+                    out["feature"] = ph_to_fid[fe]
+                elif isinstance(fe, str):
+                    return _resolve_datum(fe, external_datums, doc, src_doc_id, src_doc_name)
+                return out
+            if kind == "region":
+                out = copy.deepcopy(obj)
+                sk = obj.get("sketch")
+                if isinstance(sk, str) and sk in ph_to_fid:
+                    out["sketch"] = ph_to_fid[sk]
+                elif isinstance(sk, str):
+                    out["external"] = ext_marker(owner=sk)  # dangling source sketch id kept
+                return out
+            return {k: walk(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            resolved = [walk(v) for v in obj]
+            # _FEAT_LIST slots are lists of bare placeholder/feature-id strings: keep only the ones
+            # that resolved to a real pasted feature (external feature ids can't pass validation).
+            if obj and all(isinstance(v, str) for v in obj):
+                kept = [ph_to_fid[v] for v in obj if v in ph_to_fid]
+                if kept != obj:  # this was a feature-id list with external members
+                    return kept
+            return resolved
+        if isinstance(obj, str):
+            if obj in ph_to_fid:
+                return ph_to_fid[obj]
+            if obj in RESERVED_DATUMS:
+                return obj
+            if FEATURE_ID_RE.match(obj):
+                # bare datum-id ref pointing out of closure -> same-named reuse or downgrade.
+                return _resolve_datum(obj, external_datums, doc, src_doc_id, src_doc_name)
+        return obj
+
+    return walk(copy.deepcopy(refs or {}))
+
+
+def _resolve_datum(src_id: str, external_datums: dict, doc: dict,
+                   src_doc_id, src_doc_name):
+    """Resolve an out-of-closure datum ref. Reuse a same-named target datum (returning a datum
+    selector or reserved-id string); else downgrade to a schema-valid plane selector flagged
+    unresolved (the host re-links cross-doc datums in a follow-up)."""
+    name = external_datums.get(src_id)
+    if name is not None:
+        match = _target_datum_by_name(doc, name)
+        if match in RESERVED_DATUMS:
+            return match  # bare reserved id is schema-valid wherever sel-or-datum is allowed
+        if match is not None:
+            return {"kind": "datum", "feature": match}
+    # No reuse: schema-valid fallback plane + unresolved marker for host re-link.
+    return {"kind": "datum", "feature": "plane.front",
+            "external": {"doc_id": src_doc_id, "doc_name": src_doc_name,
+                         "owner_feature": src_id, "unresolved": True}}
+
+
+def _paste_features(doc, bundle, idgen, derived: bool):
+    """Re-id every bundled feature, resolve refs against *doc*, and append through the same
+    rollback-bar-aware path _op_add_feature uses. Returns the ordered list of new feature ids
+    (dependency-first; the root is whichever placeholder bundle.root names)."""
+    order = bundle["feature_order"]
+    feats = bundle["features"]
+    ph_to_fid = {ph: idgen.next("f") for ph in order}
+    new_ids: list[str] = []
+    for ph in order:
+        src = feats[ph]
+        new_fid = ph_to_fid[ph]
+        feat = _new_feature_envelope(src, new_fid)
+        feat["refs"] = _resolve_paste_refs(src.get("refs", {}), ph_to_fid, bundle, doc)
+        if feat.get("type") == "sketch":
+            _reid_pasted_sketch(feat, idgen)
+        if derived:
+            feat["derived_from"] = {
+                "doc_id": bundle.get("source_doc_id"),
+                "doc_name": bundle.get("source_doc_name"),
+                "feature": ph,  # source placeholder (the host re-links to the live source id)
+            }
+        _append_feature(doc, feat)
+        new_ids.append(new_fid)
+    return ph_to_fid, new_ids
+
+
+def _reid_pasted_sketch(feat: dict, idgen: _IdGen) -> None:
+    """Assign fresh ``e<N>``/``c<N>`` ids to a pasted sketch's entities/constraints (replacing the
+    bundle's ``~e``/``~c`` placeholders) and re-point every constraint handle in lockstep."""
+    params = feat.setdefault("params", {})
+    eid_map: dict[str, str] = {}
+    for ent in params.get("entities", []) or []:
+        if isinstance(ent, dict):
+            neid = idgen.next("e")
+            eid_map[ent.get("id")] = neid
+            ent["id"] = neid
+    for con in params.get("constraints", []) or []:
+        if isinstance(con, dict):
+            con["id"] = idgen.next("c")
+            con["refs"] = [_remap_handle(h, eid_map) for h in (con.get("refs", []) or [])]
+
+
+def _append_feature(doc: dict, feat: dict) -> None:
+    """Append *feat* honoring the rollback bar (mirrors _op_add_feature's append branch)."""
+    feats = _features(doc)
+    rb = doc.get("rollback_after")
+    bar_pos, bar_feat = (_find_feature(doc, rb) if rb else (None, None))
+    if bar_feat is not None and bar_pos < len(feats) - 1:
+        feats.insert(bar_pos + 1, feat)
+        doc["rollback_after"] = feat["id"]
+    else:
+        feats.append(feat)
+
+
+def _op_paste_feature(doc, op, index, idgen, id_map):
+    """Re-id a bundle and append it (with refs resolved against this doc). The root feature's new id
+    is recorded under ``$<index>``; every pasted feature is enumerated under ``$<index>#k`` in
+    dependency-first order. ``target_doc_id`` is accepted (and ignored) for symmetry with the host
+    API — paste always targets the doc this op batch runs against."""
+    bundle = _bundle_or_invalid(op, index)
+    ph_to_fid, new_ids = _paste_features(doc, bundle, idgen, derived=False)
+    id_map[f"${index}"] = ph_to_fid[bundle["root"]]
+    for k, nid in enumerate(new_ids):
+        id_map[f"${index}#{k}"] = nid
+
+
+def _op_paste_feature_as_derived(doc, op, index, idgen, id_map):
+    """Like paste_feature, but stamps a ``derived_from`` link ({doc_id, doc_name, feature}) on each
+    pasted feature. This is a ONE-TIME resolve+stamp: the geometry is copied independently now and
+    the link is metadata only — LIVE re-link to the source document (so edits propagate) is a
+    host-side follow-up (Wave 4C/4D). ``source_doc_id`` is accepted for symmetry and recorded into
+    the stamp when the bundle did not carry its own provenance."""
+    bundle = _bundle_or_invalid(op, index)
+    if op.get("source_doc_id") is not None and bundle.get("source_doc_id") is None:
+        bundle = {**bundle, "source_doc_id": op.get("source_doc_id")}
+    ph_to_fid, new_ids = _paste_features(doc, bundle, idgen, derived=True)
+    id_map[f"${index}"] = ph_to_fid[bundle["root"]]
+    for k, nid in enumerate(new_ids):
+        id_map[f"${index}#{k}"] = nid
+
+
+def _op_sketch_paste_entities(doc, op, index, idgen, id_map):
+    """Paste a bundle of sketch entities (+ their constraints) into ``sketch``, shifted by
+    (offset_x, offset_y), with FRESH ids. Constraints internal to the pasted set are kept (their
+    handles re-pointed to the new entity ids); constraints that reference any entity OUTSIDE the set
+    (or the origin / model geometry) are DROPPED — a pasted selection carries only its own internal
+    relations (cf. sketch_move copy=true, which keeps none). Records the first new entity id under
+    ``$<index>`` and the rest under ``$<index>#k``."""
+    sk = _find_sketch(doc, _resolve_placeholder(op.get("sketch"), id_map, index))
+    eb = op.get("entities_bundle")
+    if not isinstance(eb, dict):
+        raise _invalid(index, "sketch_paste_entities requires an 'entities_bundle' object")
+    src_ents = eb.get("entities")
+    if not isinstance(src_ents, list) or not src_ents:
+        raise _invalid(index, "entities_bundle.entities must be a non-empty list")
+    src_cons = eb.get("constraints", []) or []
+    if not isinstance(src_cons, list):
+        raise _invalid(index, "entities_bundle.constraints must be a list")
+    dx = op.get("offset_x")
+    dy = op.get("offset_y")
+    if not isinstance(dx, (int, float)) or isinstance(dx, bool):
+        raise _invalid(index, "sketch_paste_entities requires a numeric 'offset_x'")
+    if not isinstance(dy, (int, float)) or isinstance(dy, bool):
+        raise _invalid(index, "sketch_paste_entities requires a numeric 'offset_y'")
+    dxf, dyf = float(dx), float(dy)
+
+    # Assign fresh ids and shift geometry. The internal set = exactly the entities we paste.
+    eid_map: dict[str, str] = {}
+    new_entities: list[dict] = []
+    for src in src_ents:
+        if not isinstance(src, dict) or not isinstance(src.get("id"), str):
+            raise _invalid(index, "entities_bundle.entities: each entity needs an 'id'")
+        neid = idgen.next("e")
+        eid_map[src["id"]] = neid
+        geom = _shift_entity_any(src, dxf, dyf)
+        geom["id"] = neid
+        geom["construction"] = bool(src.get("construction", False))
+        new_entities.append(geom)
+
+    ents = _sketch_entities(sk)
+    ents.extend(new_entities)
+
+    # Keep only constraints whose handles ALL land inside the pasted set (drop external/origin refs).
+    cons = sk["params"].setdefault("constraints", [])
+    for con in src_cons:
+        if not isinstance(con, dict):
+            continue
+        handles = con.get("refs", []) or []
+        if handles and all(_handle_base(h) in eid_map for h in handles):
+            nc = copy.deepcopy(con)
+            nc["id"] = idgen.next("c")
+            nc["refs"] = [_remap_handle(h, eid_map) for h in handles]
+            cons.append(nc)
+
+    new_ids = [e["id"] for e in new_entities]
+    id_map[f"${index}"] = new_ids[0] if new_ids else ""
+    for k, neid in enumerate(new_ids[1:], start=1):
+        id_map[f"${index}#{k}"] = neid
+
+
+def _shift_entity_any(src: dict, dx: float, dy: float) -> dict:
+    """Deep-copy a sketch entity of ANY type shifted by (dx, dy) (id/construction stripped — the
+    caller restamps them). Translates every point-shaped field the entity vocabulary uses."""
+    out = {k: copy.deepcopy(v) for k, v in src.items() if k not in ("id", "construction")}
+
+    def shift_pt(p):
+        if isinstance(p, list) and len(p) == 2 and all(isinstance(c, (int, float)) for c in p):
+            return [float(p[0]) + dx, float(p[1]) + dy]
+        return p
+
+    for key in ("p", "p1", "p2", "center", "vertex", "focus", "apex", "p0"):
+        if key in out:
+            out[key] = shift_pt(out[key])
+    if isinstance(out.get("points"), list):
+        out["points"] = [shift_pt(p) for p in out["points"]]
+    return out
+
+
 _OP_HANDLERS = {
     "add_feature": _op_add_feature,
     "edit_feature": _op_edit_feature,
@@ -1546,6 +2018,10 @@ _OP_HANDLERS = {
     "sketch_pattern_entities": _op_sketch_pattern_entities,  # C53
     "sketch_move": _op_sketch_move,                        # C54 (Move/Copy)
     "sketch_toggle_construction": _op_sketch_toggle_construction,  # C42
+    "copy_feature": _op_copy_feature,                      # Wave 4A (read-only bundle)
+    "paste_feature": _op_paste_feature,                    # Wave 4A
+    "paste_feature_as_derived": _op_paste_feature_as_derived,  # Wave 4A
+    "sketch_paste_entities": _op_sketch_paste_entities,    # Wave 4B
 }
 
 

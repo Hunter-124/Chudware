@@ -184,6 +184,50 @@ atomically, §2). Non-positive `radius`/`distance`, missing/identical `e1`/`e2` 
 | `asm_delete_mate` | `id` |
 | `asm_set_explode` | `steps:[{component, vector:[3], distance}]` (whole-list replace) |
 
+### Copy/paste (Wave 4A/4B)
+
+Move features (with their dependency closure) or loose sketch entities between documents via a
+portable, id-free **bundle** (`kind: "aicad.feature_bundle/1"`). `copy_feature` is **read-only**
+(no doc mutation) and returns its bundle through the `id_map` side-channel; the paste ops re-id and
+append through the same rollback-bar-aware path as `add_feature`.
+
+| op | fields | notes |
+|---|---|---|
+| `copy_feature` | `id`, `include_dependencies:bool=true` | **read-only**. Packages the feature (and, by default, its full reference closure) into a bundle returned at `id_map["$bundle"]` (and `id_map["$bundle:<op-index>"]` for multi-copy batches). With `include_dependencies=false`, only the root is bundled; every referenced feature is flagged in `external_refs` (datums also in `external_datums` by name). |
+| `paste_feature` | `bundle`, `target_doc_id?` | re-ids the bundle and appends it; refs resolved against THIS doc (the batch's target — `target_doc_id` is accepted for host-API symmetry and ignored). Root's new id → `id_map["$<index>"]`; every pasted feature enumerated `id_map["$<index>#k"]` (dependency-first). |
+| `paste_feature_as_derived` | `bundle`, `source_doc_id?` | like `paste_feature` + stamps `derived_from:{doc_id,doc_name,feature}` on each pasted feature. **One-time** resolve+stamp (geometry copied independently now); LIVE re-link to the source doc is a host-side follow-up. |
+| `sketch_paste_entities` | `sketch`, `entities_bundle:{entities:[…], constraints:[…]}`, `offset_x`, `offset_y` | deep-copies the entities shifted by `(offset_x, offset_y)` with fresh `e<N>` ids. Constraints internal to the pasted set are kept (handles re-pointed); constraints referencing any entity OUTSIDE the set (or the origin/model) are **dropped**. First new id → `$<index>`, rest → `$<index>#k`. |
+
+**Bundle format (`aicad.feature_bundle/1`):**
+
+```
+{ "kind": "aicad.feature_bundle/1",
+  "source_doc_id":   <str|null>,        // provenance (derived-link + cross-doc resolve)
+  "source_doc_name": <str|null>,
+  "root": "$k",                          // placeholder of the copied (root) feature
+  "feature_order": ["$0","$1",…],        // dependency-first build order (deps before dependents)
+  "features": { "$k": <feature> },       // id stripped; in-closure refs → placeholders
+  "external_refs":   ["f7",…],           // referenced SOURCE ids NOT in the closure
+  "external_datums": {"f7":"Datum1"} }   // source datum id → name (cross-doc datum reuse)
+```
+
+Inside a bundled feature: the `id` is removed; feature-id refs in the closure → `$0,$1,…`; sketch
+entity ids → `~e0,~e1,…`; constraint ids → `~c0,~c1,…` (handles rewritten in lockstep). Refs that
+point OUT of the closure keep their raw source id and are listed in `external_refs`.
+
+**Cross-doc ref resolution at paste** (selectors.md — *never a silent wrong pick*):
+- **Topology** selector (face/edge/vertex/body) from source topology → `owner_feature=null` + an
+  `external:{doc_id,doc_name,owner_feature}` marker so the compiler dangles for re-pick.
+- **Datum** ref → reuse a same-named datum in the target (Top/Front/Right/custom — by `name`),
+  else downgrade to a schema-valid plane selector (`plane.front`) + `external:{…,unresolved:true}`.
+- **Region** ref → keep the source sketch id (dangling) + `external` marker. **Sketch** refs in the
+  closure → deep-copied to fresh ids with internal constraints preserved.
+- `_FEAT_LIST` slots (pattern/mirror `features`) keep only in-closure (re-id'd) members; external
+  feature ids are dropped from the list (they cannot satisfy the schema precede-rule).
+
+A bundle whose `kind`/`feature_order`/`features`/`root` is missing or malformed raises `invalid_op`
+with no state change (§2).
+
 ## 5. Error codes (RPC error envelope `{code, message, detail}`)
 
 `unknown_doc` · `stale_revision {detail.current_revision}` · `invalid_op {detail.index,

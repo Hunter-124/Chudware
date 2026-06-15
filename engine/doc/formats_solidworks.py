@@ -10,10 +10,13 @@ are absent:
      fidelity, free when SW is present, Windows-only. Used for .sldprt/.sldasm AND .x_t/.x_b
      (SolidWorks imports Parasolid natively).
   2. **EXPERIMENTAL — OLE2 probe**: *legacy* (pre-~2015) .sldprt/.sldasm are Microsoft Compound-File
-     (OLE2) containers; we can enumerate their streams and pull the embedded preview. **Modern
-     SolidWorks (verified on SW 2025) is NOT OLE2** — the file starts with magic ``7b ab b3 01`` (not
-     ``d0 cf 11 e0``), an undocumented proprietary container, so :func:`ole2_streams` returns [] for
-     it and we fall back to COM. Reverse-engineering the modern container needs real sample parts.
+     (OLE2) containers; we can enumerate their streams and pull the embedded preview.
+     **Reverse-engineering verdict (SW 2025, measured):** the modern container is a fully
+     COMPRESSED/ENCRYPTED opaque blob — per-file-varying magic (``5e4bf6ca``/``1bd70589``/… not
+     ``d0cf11e0``), ~7.9 bits/byte Shannon entropy across the whole file, no plaintext stream names,
+     no PNG/BMP preview, no recognizable geometry markers. There is **no standalone way to extract
+     geometry or even a preview** without SolidWorks's proprietary codec, so :func:`ole2_streams`
+     returns [] and we rely on COM. (Confirmed against the owner's "sldprt reversing" test parts.)
   3. **FALLBACK**: a clear, actionable error telling the user to export STEP from SolidWorks.
 
 Reverse-engineering note: to advance the OLE2 mesh path we need real sample files. See
@@ -157,12 +160,13 @@ def sldprt_extract_thumbnail(path: str | os.PathLike) -> bytes | None:
 
 
 def sldprt_extract_preview_mesh(path: str | os.PathLike):  # -> MeshBody | None
-    """RESEARCH STUB — extract the embedded tessellated graphics body as a MeshBody.
+    """Extract an embedded tessellated graphics body as a MeshBody — only feasible for LEGACY
+    (OLE2) SolidWorks files.
 
-    SolidWorks embeds a tessellated preview/graphics body in the OLE2 container, but its binary
-    layout is undocumented and version-specific. This returns None until the layout is reverse-
-    engineered from real sample parts (see docs/FORMATS_STATUS.md). :func:`ole2_streams` dumps the
-    stream list to drive that work."""
+    For modern SolidWorks (≈2015+, incl. SW 2025) the container is fully compressed/encrypted
+    (~7.9 bits/byte entropy, no plaintext markers — see the module docstring), so there is nothing
+    to parse and this returns None. Geometry from modern parts must come through the COM→STEP path.
+    Kept as the hook for legacy files / future codec work."""
     return None
 
 

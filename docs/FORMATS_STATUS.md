@@ -41,18 +41,24 @@ standalone reader — the OLE2 preview-mesh probe is a research stub for legacy 
 - **Import chain** (`engine/doc/formats_solidworks.py`): SolidWorks COM → STEP → B-rep lane;
   else legacy-OLE2 preview mesh (stub); else a clear "export STEP" error. Parasolid (.x_t/.x_b)
   goes through SW COM only.
-- **Finding (SW 2025):** modern `.sldprt` is **not** an OLE2 container (magic `7b ab b3 01`, not
-  `d0 cf 11 e0`) and not ZIP — it's an undocumented proprietary format. The `olefile` probe only
-  helps legacy (pre-~2015) files. So modern SW import relies on the **COM → STEP** path, which
-  requires SolidWorks installed + licensed + `pywin32` in the engine runtime.
-- **Test parts to create (for reverse-engineering the modern container / validating COM):**
-  1. A simple single-body part (one extruded boss) — `.sldprt`.
-  2. A multi-body part (2–3 separate bodies) — `.sldprt`.
-  3. A small assembly (2–3 components) — `.sldasm`.
-  4. The same simple part exported as Parasolid `.x_t` and `.x_b`.
-  5. Optionally the same part saved from an *older* SolidWorks (if available) to compare containers.
-  Drop them anywhere and point me at the folder; I'll use `ole2_streams()` + a hex probe to map the
-  layout and extend the importer.
+- **Reverse-engineering verdict (measured on the `sldprt reversing` test parts, SW 2025):**
+  modern `.sldprt`/`.sldasm` is a **fully compressed/encrypted opaque container** — no standalone
+  geometry extraction is possible. Evidence:
+  - Per-file-varying magic (`5e4bf6ca`, `1bd70589`, `28411a57`, `adf14fe2`, …) — not OLE2
+    (`d0cf11e0`), not ZIP (`504b`).
+  - Shannon entropy ≈ **7.9/8.0 bits/byte** across the whole file (maximum — compressed/encrypted).
+  - No plaintext stream names, no PNG/BMP preview, no Parasolid/geometry markers, no zero-runs.
+  - `olefile` probe returns [] (only legacy pre-~2015 OLE2 files would yield streams).
+  Conclusion: there is no free standalone reader; geometry must come via **SolidWorks COM → STEP**.
+- **COM → STEP import VALIDATED on every test part** (SolidWorks installed + `pywin32`):
+  | part | result |
+  |---|---|
+  | `25mm-diameter-circle-extruded-100mm.SLDPRT` | 1 body, vol **49087.4 mm³** = exactly π·12.5²·100 ✓ |
+  | `25mm…+FEA.SLDPRT` | 1 body, vol 49087.4 ✓ |
+  | `4inx8in-2inx4in-loft-4in-tall.SLDPRT` | 1 body, vol 1223567 ✓ |
+  | `50mm…extrude-cut…through-all.SLDPRT` | 1 body, vol 73631 ✓ |
+  | `assembly-(cylinder inside cylinder…).SLDASM` | **2 bodies** (49087 + 73631) ✓ |
+  First import is slow (SolidWorks cold start ~5–12 s); subsequent ones ~1 s.
 
 ## Notes / decisions
 

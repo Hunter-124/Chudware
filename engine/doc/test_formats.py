@@ -258,6 +258,43 @@ def test_multibody_step_splits() -> None:
     print(f"[formats] multi-body STEP split -> {len(imported)} bodies vols={vols}")
 
 
+def test_import_mesh_as_solid() -> None:
+    """The import-time 'convert to solid' option sews a mesh into an OCCT solid (vol-accurate)."""
+    from engine.doc.mesh_body import MeshBody
+    from engine.doc.mesh_solidify import solidify
+    from engine.doc.formats import _handler_import_file
+
+    s = docsess.new_session("part", "BoxForSolidify")
+    docsess.apply_ops(s, 0, [{"op": "add_feature", "feature": {
+        "type": "box", "name": "Box1",
+        "params": {"length": _dim(20), "width": _dim(20), "height": _dim(20)}}}])
+    bodies = _get_bodies(s)
+    tmpdir = tempfile.mkdtemp()
+    stl = os.path.join(tmpdir, "box.stl")
+    export_document(bodies, stl, "stl")
+
+    # Default import -> graphics mesh body.
+    r_mesh = _handler_import_file({"path": stl}, lambda *a, **k: None)
+    from engine.doc.session import get_session, _solid_bodies
+    bm = _solid_bodies(get_session(r_mesh["doc_id"]).last_result)[0]
+    assert bm.kind == "mesh" and isinstance(bm.shape, MeshBody)
+
+    # as_solid import -> real B-rep solid with matching volume.
+    r_solid = _handler_import_file({"path": stl, "as_solid": True}, lambda *a, **k: None)
+    bs = _solid_bodies(get_session(r_solid["doc_id"]).last_result)[0]
+    assert bs.kind == "solid" and not isinstance(bs.shape, MeshBody), "as_solid must yield a B-rep solid"
+    rel_err = abs(bs.shape.volume - _box_volume()) / _box_volume()
+    assert rel_err < 0.001, f"solidified volume err {rel_err:.4f} (vol={bs.shape.volume:.1f})"
+    assert bs.shape.is_valid, "solidified body must be a valid solid"
+
+    # solidify() returns None for a non-closeable (single-triangle) mesh -> caller keeps the mesh.
+    import numpy as np
+    open_mesh = MeshBody(verts=np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], np.float32),
+                         tris=np.array([[0, 1, 2]], np.uint32))
+    assert solidify(open_mesh) is None, "an open single triangle cannot become a solid"
+    print(f"[formats] import-as-solid: mesh->solid vol={bs.shape.volume:.1f} err={rel_err:.5f}")
+
+
 def test_doc_formats_registry() -> None:
     """The doc_formats RPC returns the import/export matrix the host builds its filters from."""
     from engine.doc.formats import _handler_doc_formats
@@ -522,6 +559,7 @@ def main() -> None:
     test_mesh_formats_roundtrip()
     test_mesh_body_brep_export_rejected()
     test_multibody_step_splits()
+    test_import_mesh_as_solid()
     test_doc_formats_registry()
     test_import_feature_compiles_and_caches()
     test_stepplus_meta_passthrough()

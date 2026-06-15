@@ -3,9 +3,12 @@
 Params
 ------
 * ``source_path: str``   — absolute or repo-relative path to the source geometry file.
-* ``format: "step"|"iges"|"brep"|"stl"``   — explicit format (auto-detected from extension
+* ``format: "step"|"iges"|"brep"|"stl"|...``   — explicit format (auto-detected from extension
   when absent from the params dict).
 * ``original_name: str?``   — display name for the feature; overrides the file stem.
+* ``as_solid: bool?``   — for mesh sources (STL/OBJ/PLY/3MF/glTF/3dm), sew the triangle soup into
+  an OCCT solid on import (SolidWorks "Convert to Solid Body"). Falls back to a mesh body per-body
+  if it can't be closed into a valid solid.
 
 Behaviour
 ---------
@@ -50,7 +53,14 @@ def compile_import(feat: dict, ctx: CompileContext) -> CompileOutput:  # noqa: A
     #   * a MeshBody triangle soup (STL / OBJ / PLY / 3MF / glTF) — ``.wrapped`` is None but it
     #     tessellates directly via tessellate_mesh_body, so it IS a valid renderable body now.
     # Only a genuinely-empty (None) result is skipped.
+    #
+    # ``as_solid`` (import-time option / SolidWorks "Convert to Solid Body"): when true, each mesh
+    # body is sewn into an OCCT solid (mesh_solidify.solidify) so it can be filleted/cut/booleaned.
+    # If a particular mesh can't be closed into a valid solid, it falls back to a mesh body (the
+    # import still succeeds, just stays a graphics body).
     from engine.doc.mesh_body import MeshBody
+
+    as_solid = bool(params.get("as_solid"))
 
     new_bodies = list(ctx.bodies)
     skipped = 0
@@ -60,6 +70,13 @@ def compile_import(feat: dict, ctx: CompileContext) -> CompileOutput:  # noqa: A
             skipped += 1
             continue
         if isinstance(shape, MeshBody):
+            if as_solid:
+                from engine.doc.mesh_solidify import solidify
+                solid = solidify(shape)
+                if solid is not None:
+                    new_bodies.append(solid)   # now a real B-rep solid (kind="solid")
+                    continue
+                # conversion failed → keep the mesh body so the import still succeeds
             new_bodies.append(shape)
             has_mesh = True
             continue

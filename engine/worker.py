@@ -142,7 +142,9 @@ def _doc_open(params: dict, _emit: EmitFn) -> dict:
     # STEP used to fail). The import path returns the same doc-state shape (doc_id/tree/revision).
     from engine.doc.formats import _EXT_TO_FORMAT, _handler_import_file
     if Path(path).suffix.lower() in _EXT_TO_FORMAT:
-        resp = _handler_import_file({"path": path}, _emit)
+        # as_solid (optional): convert a mesh source to an OCCT solid on import (host's
+        # "Import as Solid" option). Ignored for B-rep sources (already solids).
+        resp = _handler_import_file({"path": path, "as_solid": params.get("as_solid")}, _emit)
         resp.setdefault("warnings", [])
         resp.setdefault("drawings", [])
         return resp

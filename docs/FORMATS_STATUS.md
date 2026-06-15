@@ -12,7 +12,7 @@ Tracks `docs/FORMATS_PLAN.md`. Engine venv: `%APPDATA%\AI-CAD\runtime\venv`.
 | F3 | Rhino `.3dm` via rhino3dm (mesh-level) | ✅ done |
 | F4 | Host UI: unified Open/Import filter, Import menu, expanded Export | ✅ done |
 | F5 | SolidWorks/Parasolid: SW-COM→STEP (✅ validated) + OLE2 probe (RE stub) | ✅ done |
-| F6 | Polish, docs, convert-mesh-to-solid stretch | ⏳ optional |
+| F6 | Convert mesh→solid: engine `solidify` + import `as_solid` ✅; host "Import as Solid" menu | 🔨 host wiring |
 
 ## Live capability matrix
 

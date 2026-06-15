@@ -732,16 +732,20 @@ def _handler_import_file(params: dict, emit: EmitFn) -> dict:
     # re-append the whole file once per body (N×N bodies for an N-body STEP / multi-mesh 3MF).
     fmt = _detect_format(path) if not params.get("format") else params["format"]
     feat_name = Path(path).name if len(bodies) > 1 else (bodies[0][0] or Path(path).stem)
+    feat_params = {
+        "source_path": str(path),
+        "format": fmt,
+        "original_name": feat_name,
+    }
+    # Import-time "convert to solid" option (host passes as_solid for mesh files).
+    if params.get("as_solid"):
+        feat_params["as_solid"] = True
     ops = [{
         "op": "add_feature",
         "feature": {
             "type": "import",
             "name": feat_name,
-            "params": {
-                "source_path": str(path),
-                "format": fmt,
-                "original_name": feat_name,
-            },
+            "params": feat_params,
             "refs": {},
         },
     }]

@@ -9,6 +9,7 @@
 #include "imgui.h"
 
 #include "doc_tabs.h"
+#include "metrics.h"
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
@@ -72,7 +73,8 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
                                  : ui::Palette::toU32(pal.headerBg));
     dl->AddRectFilled(p0, p1, bg, 4.0f * s, ImDrawFlags_RoundCornersTop);
     if (active)
-        dl->AddLine(ImVec2(p0.x + 2, p0.y + 1), ImVec2(p1.x - 2, p0.y + 1),
+        dl->AddLine(ImVec2(p0.x + ui::metrics::px(2), p0.y + ui::metrics::px(1)),
+                    ImVec2(p1.x - ui::metrics::px(2), p0.y + ui::metrics::px(1)),
                     ui::Palette::toU32(pal.accent), 2.0f * s);
     else  // thin separator on the right edge of inactive tabs
         dl->AddLine(ImVec2(p1.x - 0.5f, p0.y + 4 * s), ImVec2(p1.x - 0.5f, p1.y - 4 * s),
@@ -210,13 +212,13 @@ float drawDocTabs(AppState& st, float topY) {
         ImGui::Text("\"%s\" has unsaved changes.", name.c_str());
         ImGui::TextUnformatted("Close it anyway? Your edits will be lost.");
         ImGui::Spacing();
-        if (ImGui::Button("Close without saving", ImVec2(180 * s, 0))) {
+        if (ImGui::Button("Close without saving", ImVec2(ui::metrics::px(180), 0))) {
             s_closeIdx = s_confirmCloseIdx;
             s_confirmCloseIdx = -1;
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(90 * s, 0))) {
+        if (ImGui::Button("Cancel", ImVec2(ui::metrics::px(90), 0))) {
             s_confirmCloseIdx = -1;
             ImGui::CloseCurrentPopup();
         }

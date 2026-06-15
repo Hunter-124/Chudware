@@ -574,6 +574,7 @@ def _op_sketch_add_entity(doc, op, index, idgen, id_map):
         c = copy.deepcopy(con)
         c["id"] = idgen.next("c")
         c["refs"] = [_sub_self(r, eid) for r in (c.get("refs", []) or [])]
+        _validate_sketch_constraint(c, index)
         sk["params"].setdefault("constraints", []).append(c)
     id_map[f"${index}"] = eid
 
@@ -625,8 +626,51 @@ def _op_sketch_add_constraint(doc, op, index, idgen, id_map):
         raise _invalid(index, "sketch_add_constraint requires a 'constraint' object")
     c = copy.deepcopy(con)
     c["id"] = idgen.next("c")
+    _validate_sketch_constraint(c, index)
     sk.setdefault("params", {}).setdefault("constraints", []).append(c)
     id_map[f"${index}"] = c["id"]
+
+
+_CONSTRAINT_REF_COUNTS = {
+    "coincident": (2, 2),
+    "horizontal": (1, 2),
+    "vertical": (1, 2),
+    "parallel": (2, 2),
+    "perpendicular": (2, 2),
+    "tangent": (2, 2),
+    "collinear": (2, 2),
+    "equal": (2, 2),
+    "concentric": (2, 2),
+    "coradial": (2, 2),
+    "midpoint": (2, 2),
+    "symmetric": (3, 3),
+    "fix": (1, 1),
+    "point_on": (2, 2),
+    "distance": (2, 2),
+    "angle": (2, 2),
+    "radius": (1, 1),
+    "diameter": (1, 1),
+}
+_DIM_CONSTRAINT_TYPES = {"distance", "angle", "radius", "diameter"}
+
+
+def _validate_sketch_constraint(con: dict, index: int) -> None:
+    ctype = con.get("type")
+    if not isinstance(ctype, str) or ctype not in _CONSTRAINT_REF_COUNTS:
+        raise _invalid(index, f"unsupported sketch constraint type '{ctype}'")
+    refs = con.get("refs")
+    if not isinstance(refs, list) or not all(isinstance(r, str) and r for r in refs):
+        raise _invalid(index, f"sketch constraint '{ctype}' requires string refs")
+    lo, hi = _CONSTRAINT_REF_COUNTS[ctype]
+    if len(refs) < lo or len(refs) > hi:
+        want = str(lo) if lo == hi else f"{lo}-{hi}"
+        raise _invalid(index, f"sketch constraint '{ctype}' requires {want} refs")
+    if ctype in _DIM_CONSTRAINT_TYPES:
+        val = con.get("value")
+        if not isinstance(val, dict) or ("value" not in val and "expr" not in val):
+            raise _invalid(index, f"dimension constraint '{ctype}' requires a value object")
+    if "driven" in con and not isinstance(con.get("driven"), bool):
+        raise _invalid(index, "sketch constraint driven flag must be a bool")
 
 
 def _op_sketch_delete_constraint(doc, op, index, idgen, id_map):

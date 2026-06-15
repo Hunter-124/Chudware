@@ -163,6 +163,29 @@ Clamping the *fraction* with fixed bounds (the current bug) silently eats the DP
   pattern — copy it).
 - Rollback bar: band/hit `12*S`, line `3*S` hover / `2*S` idle, handle `28*S × 8*S`.
 
+### Left manager pane
+- The docked window id is `FeatureManager##LeftPane`: the visible label stays familiar while the
+  internal id remains stable for DockBuilder.
+- Vertical tab rail width `42*S`; each tab is a fixed `36*S × 36*S` square with `4*S` vertical
+  rhythm. The active tab indicator is `3*S` wide and inset `6*S` from the tab top/bottom.
+- Tab glyphs use atlas icons at `20*S`; Explorer/file rows use `16*S` icons with `4*S` icon-label
+  gaps. Hover/active fills use palette colors, never hardcoded theme-specific text colors.
+- The body region is a separate child that fills all remaining width. Manager content must be drawn
+  through embedded body functions (`drawFeatureTreeEmbedded`, `PropertyManager::drawEmbedded`,
+  `ConfigPanel::drawEmbedded`) so tabs do not create nested top-level windows.
+- Explorer file lists live in a bordered child; long paths go in wrapped/dim text or tooltips so
+  they never resize the dock.
+- Opening a PropertyManager form forces the left pane visible and auto-selects the PM tab; closing
+  it returns to FeatureManager. This is behavioral UI contract, not visual polish.
+
+### Menu bar
+- The top-level menu families are CAD-standard: File, Edit, View, Insert, Tools, Window, Help.
+- Menu entries should call the same dispatcher as ribbon buttons (`AppState::ribbonDispatch`) unless
+  they are document/window commands with a single existing AppState path. Do not add parallel command
+  implementations for menu-only behavior.
+- Disabled menu items are allowed for visible roadmap affordances, but enabled items must execute or
+  open the correct manager tab. No enabled placeholder commands.
+
 ### PropertyManager forms
 - **Two-column rows**: fixed label column `labelW = 96*S`, then `SameLine(labelW)` +
   `SetNextItemWidth(-1)` for the input (SolidWorks-style aligned `label : value`).

@@ -284,10 +284,12 @@ def _write_aicm(session: DocSession, result: CompileResult) -> tuple[str, list[d
         else:
             color = tuple(bo.color) if bo.color else _DEFAULT_COLOR
         bt = tess.tessellate_body(bo.shape, body_id=i, name=bo.name or f"Body{i}", color=color,
-                                  metallic=metallic, roughness=roughness)
+                                  metallic=metallic, roughness=roughness,
+                                  two_sided=(bo.kind == "surface"))
         body_tesses.append(bt)
         bodies_meta.append({"body_id": i, "name": bo.name or f"Body{i}", "color": list(color),
-                            "owner_key": key, "metallic": metallic, "roughness": roughness})
+                            "owner_key": key, "metallic": metallic, "roughness": roughness,
+                            "kind": bo.kind})
 
     aicm = _aicm_path(session.doc_id, session.revision)
     tess.write_aicm_file(aicm, body_tesses)
@@ -1568,6 +1570,7 @@ def _solve_active(session: DocSession, sketch_feat: dict, warm) -> dict:
         "dof": int(sol.dof),
         "conflicting": list(sol.conflicting),
         "redundant": list(sol.redundant),
+        "skipped_constraints": list(getattr(sol, "skipped_constraints", [])),
         "rejected": rejected,
     }
 
@@ -1597,6 +1600,7 @@ def sketch_enter(session: DocSession, sketch_fid: str) -> dict:
         "status": st.last_overall_status,
         "conflicting": packed["conflicting"],
         "redundant": packed["redundant"],
+        "skipped_constraints": packed["skipped_constraints"],
         "solve_rejected": packed["rejected"],
         "constraints": _sketch_constraints(feat, packed["entity_map"]),
     }
@@ -1617,6 +1621,7 @@ def sketch_overview(session: DocSession, sketch_fid: str) -> dict:
         "plane_frame": _plane_frame(plane),
         "status": _overall_status(packed["statuses"], packed["dof"],
                                   packed["conflicting"], packed["redundant"]),
+        "skipped_constraints": packed["skipped_constraints"],
     }
 
 
@@ -1740,13 +1745,28 @@ def sketch_probe(session: DocSession, sketch_fid: str, action: dict) -> dict:
         if target is None:
             return {"ok": False, "error": f"set_dim: constraint '{cid}' not found"}
         # Mirror ops._op_sketch_set_dim's value/expr/driven handling on the copy.
+        touched = False
         if sd.get("expr") is not None:
             cur = target.get("value") if isinstance(target.get("value"), dict) else {"value": 0.0}
             target["value"] = {"value": cur.get("value", 0.0), "expr": sd["expr"]}
+            touched = True
         elif sd.get("value") is not None:
             target["value"] = {"value": float(sd["value"]), "expr": None}
+            touched = True
+        if "placement" in sd:
+            if sd["placement"] is None:
+                target.pop("placement", None)
+            elif isinstance(sd["placement"], list) and len(sd["placement"]) == 2:
+                target["placement"] = [float(sd["placement"][0]), float(sd["placement"][1])]
+            else:
+                return {"ok": False, "error": "set_dim.placement must be [u, v] or null"}
+            touched = True
         if sd.get("driven") is not None:
             target["driven"] = bool(sd["driven"])
+            touched = True
+        if not touched:
+            return {"ok": False, "error": "set_dim requires 'value', 'expr', "
+                    "'placement', or 'driven'"}
     elif "delete_constraint" in action:
         dc = action["delete_constraint"]
         if not isinstance(dc, dict) or "id" not in dc:
@@ -1813,6 +1833,7 @@ def sketch_solve(session: DocSession, sketch_fid: str) -> dict:
         "status": st.last_overall_status,
         "conflicting": packed["conflicting"],
         "redundant": packed["redundant"],
+        "skipped_constraints": packed["skipped_constraints"],
         "solve_rejected": packed["rejected"],
         "constraints": _sketch_constraints(feat, packed["entity_map"]),
     }
@@ -1836,6 +1857,9 @@ def sketch_drag(session: DocSession, sketch_fid: str, handle: str, xy,
     params = feat.get("params", {}) or {}
     target = (float(xy[0]), float(xy[1])) if xy is not None else None
     res = _drag(st.solve_state, handle, target, params, env, targets=targets)
+    if not res.get("ok", True):
+        return {"ok": False, "error": res.get("error") or "drag target did not resolve",
+                "rejected_handles": res.get("rejected_handles", [])}
     # Pack entities with ids + construction flags for the host.
     entities = []
     for eid, coords in res["entities"].items():

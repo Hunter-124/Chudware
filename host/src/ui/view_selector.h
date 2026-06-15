@@ -23,6 +23,12 @@ public:
 
     // True while the glass box is shown — hook code uses this to suppress normal click-picking.
     bool active() const { return m_active; }
+    void open() {
+        m_active = true;
+        m_hoverZone = -1;
+        m_hoverDwell = 0.0f;
+        m_previewReady = false;
+    }
 
 private:
     void close() { m_active = false; m_hoverZone = -1; }

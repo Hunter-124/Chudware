@@ -90,6 +90,7 @@ public:
     // W2-D: bounding radius of the loaded model (1 if none). The viewport input code uses it to
     // convert a screen-space pan drag (px) into a world-space offset (matches drawCurrent's FOV/dist).
     float modelRadius() const { return radius_; }
+    Vec3 modelCenter() const { return center_; }
     static constexpr float kFovDeg = 35.0f;  // shared with drawCurrent's projection
 
     // ---- reference planes (Front=XY, Top=XZ, Right=YZ) ----
@@ -118,6 +119,7 @@ public:
     void setSectionPlane(const float normal[3], float offset, bool enabled,
                          const float capRgb[3], bool showCap);
     bool sectionEnabled() const { return section_.count > 0; }
+    int sectionClip(float normals[3][3], float offsets[3]) const;
 
     // ---- C19 result colormap + deformation ----
     // When colormap mode is on, bodies that carry a per-vertex scalar render through the LUT.

@@ -48,10 +48,22 @@ static std::string comboValue(const std::vector<PMField>& fields, const char* ke
 
 // Return true when the field's enableKey/enableVals condition is satisfied (always true when
 // enableKey is null). comingSoon fields are never enabled for interaction.
+// The gating value of the field named `key`, as a string token: a Combo yields its selected
+// option value; a Check yields "true"/"false". Lets a field be gated (enableKey/enableVals) on
+// either a sibling combo OR a sibling checkbox (e.g. thin-feature thickness on the "thin" check).
+static std::string enableSourceValue(const std::vector<PMField>& fields, const char* key) {
+    std::string c = comboValue(fields, key);
+    if (!c.empty()) return c;
+    for (const auto& f : fields)
+        if (f.def->kind == PMFieldKind::Check && std::strcmp(f.def->key, key) == 0)
+            return f.checkValue ? "true" : "false";
+    return c;
+}
+
 static bool fieldEnabled(const PMFieldDef& def, const std::vector<PMField>& fields) {
     if (def.comingSoon) return false;
     if (!def.enableKey)  return true;
-    std::string cur = comboValue(fields, def.enableKey);
+    std::string cur = enableSourceValue(fields, def.enableKey);
     std::string allowed = def.enableVals ? def.enableVals : "";
     if (allowed.empty()) return true;
     // Check if cur appears as a token in the pipe-separated allowed list.
@@ -267,11 +279,30 @@ bool pmParseDim(const std::string& raw, double& outMm, std::string& err, bool an
     return true;
 }
 
-std::string pmFormatDim(double mm, bool ips) {
+std::string pmFormatDim(double mm, bool ips, bool angle) {
     char buf[48];
-    if (ips) std::snprintf(buf, sizeof(buf), "%.4gin", mm / 25.4);
-    else     std::snprintf(buf, sizeof(buf), "%.4gmm", mm);
+    if (angle)    std::snprintf(buf, sizeof(buf), "%.4gdeg", mm);  // value already in degrees
+    else if (ips) std::snprintf(buf, sizeof(buf), "%.4gin", mm / 25.4);
+    else          std::snprintf(buf, sizeof(buf), "%.4gmm", mm);
     return buf;
+}
+
+// An angle-valued Dim field is tagged by a "deg" unit label (Angle/AngleIf helpers). Its value
+// is stored in degrees and must NOT carry the mm/inch length suffix.
+static inline bool pmFieldIsAngle(const PMFieldDef* d) {
+    return d && d->unitLabel && std::strstr(d->unitLabel, "deg") != nullptr;
+}
+// A unit-less Dim (DimU: ratio/k-factor/twist turns) — empty unit label. Its value is a plain
+// number with NO length suffix and is never IPS-scaled.
+static inline bool pmFieldUnitless(const PMFieldDef* d) {
+    return d && d->unitLabel && d->unitLabel[0] == '\0';
+}
+// Format a Dim field's canonical value for its edit buffer / display, honouring the field's unit:
+// angle -> "<n>deg", unit-less -> bare "<n>", otherwise length via pmFormatDim (mm / inch).
+static std::string pmFieldValueText(const PMFieldDef* d, double v, bool ips) {
+    if (pmFieldIsAngle(d)) return pmFormatDim(v, ips, /*angle=*/true);
+    if (pmFieldUnitless(d)) { char b[48]; std::snprintf(b, sizeof(b), "%.4g", v); return b; }
+    return pmFormatDim(v, ips, /*angle=*/false);
 }
 
 // A dim value object {value, expr} for an op.
@@ -296,7 +327,7 @@ static void initField(PMField& f, const PMFieldDef& d, bool ips) {
         case PMFieldKind::Dim: {
             f.dimValue = d.dimDefault;
             f.dimExpr.clear();
-            std::string disp = pmFormatDim(d.dimDefault, ips);
+            std::string disp = pmFieldValueText(&d, d.dimDefault, ips);
             std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
             break;
         }
@@ -304,6 +335,7 @@ static void initField(PMField& f, const PMFieldDef& d, bool ips) {
         case PMFieldKind::DatumRef: f.comboIndex = 0; break;
         case PMFieldKind::Check:   f.checkValue = d.checkDefault; break;
         case PMFieldKind::Int:     f.intValue = (int)(d.dimDefault + 0.5); break;
+        case PMFieldKind::Text:    f.textBuf.assign(128, 0); break;
         case PMFieldKind::SelectorWell:
         case PMFieldKind::FeatureWell: f.picks.clear(); f.wellActive = false; break;
     }
@@ -313,7 +345,7 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     std::string mode;
     const PMFormDef* form = pmFormForCommand(cmdId, mode);
     if (!form) return false;
-    if (active_) close();   // a previous form is replaced (no commit)
+    if (active_ && !cancelEdits(st)) return false;   // replacing a PM must roll back previews first
 
     // C40: SolidWorks mode exclusion. Invoking a feature command while a sketch is being
     // edited EXITS the sketch first (its profile then pre-seeds extrude/revolve below);
@@ -333,6 +365,7 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     title_ = form->title;
     targetId_.clear();
     previewBatches_ = 0;
+    previewUndoGroupStarted_ = false;
     dirty_ = false;
     firstPreviewDone_ = false;
     lastEditTime_ = ImGui::GetTime();
@@ -495,7 +528,7 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
     std::string type = target->value("type", std::string());
     const PMFormDef* form = pmFindForm(type);
     if (!form) { st.addLog("[pm] no form for feature type '" + type + "'"); return false; }
-    if (active_) close();
+    if (active_ && !cancelEdits(st)) return false;
 
     active_ = true;
     editMode_ = true;
@@ -504,6 +537,7 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
     title_ = form->title;
     targetId_ = featureId;
     previewBatches_ = 0;
+    previewUndoGroupStarted_ = false;
     dirty_ = false;
     firstPreviewDone_ = true;   // the feature already exists; edits go straight to edit_feature
     lastEditTime_ = ImGui::GetTime();
@@ -527,6 +561,44 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
     return true;
 }
 
+void PropertyManager::presetFieldForShot(const std::string& key, const std::string& value) {
+    if (!active_) return;
+    for (auto& f : fields_) {
+        if (!f.def->key || key != f.def->key) continue;
+        switch (f.def->kind) {
+            case PMFieldKind::Combo:
+            case PMFieldKind::DatumRef: {
+                std::string opts = f.def->comboOptions ? f.def->comboOptions : "";
+                int cur = 0; size_t start = 0;
+                while (start <= opts.size()) {
+                    size_t bar = opts.find('|', start);
+                    if (opts.substr(start, bar - start) == value) { f.comboIndex = cur; break; }
+                    ++cur;
+                    if (bar == std::string::npos) break;
+                    start = bar + 1;
+                }
+                break;
+            }
+            case PMFieldKind::Check:
+                f.checkValue = (value == "true" || value == "1" || value == "yes");
+                break;
+            case PMFieldKind::Dim: {
+                try {
+                    f.dimValue = std::stod(value); f.dimExpr.clear(); f.dimError.clear();
+                    std::string disp = pmFieldValueText(f.def, f.dimValue, ips_);
+                    std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
+                } catch (...) {}
+                break;
+            }
+            case PMFieldKind::Int:
+                try { f.intValue = std::stoi(value); } catch (...) {}
+                break;
+            default: break;
+        }
+        return;
+    }
+}
+
 void PropertyManager::loadFromTree(AppState& st, const nlohmann::json& feature) {
     (void)st;
     nlohmann::json params = feature.value("params", nlohmann::json::object());
@@ -545,7 +617,7 @@ void PropertyManager::loadFromTree(AppState& st, const nlohmann::json& feature) 
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                     } else if (d.contains("value") && d["value"].is_number()) {
                         f.dimValue = d["value"].get<double>();
-                        std::string disp = pmFormatDim(f.dimValue, ips_);
+                        std::string disp = pmFieldValueText(f.def, f.dimValue, ips_);
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                     }
                 }
@@ -694,7 +766,7 @@ std::vector<PMCalloutItem> PropertyManager::calloutItems(AppState& st) const {
         if (!fieldEnabled(*f.def, fields_)) continue;   // skip greyed / coming-soon dims
         PMCalloutItem it;
         it.label = f.def->label;
-        it.value = f.dimExpr.empty() ? pmFormatDim(f.dimValue, ips_)
+        it.value = f.dimExpr.empty() ? pmFieldValueText(f.def, f.dimValue, ips_)
                                      : ("=" + f.dimExpr);
         it.hasAnchor = hasAnchor;
         if (hasAnchor) { it.anchor[0] = anchor[0]; it.anchor[1] = anchor[1]; it.anchor[2] = anchor[2]; }
@@ -940,6 +1012,13 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
             case PMFieldKind::Int:
                 params[key] = f.intValue;
                 break;
+            case PMFieldKind::Text: {
+                // Emit a free-form string param only when the user typed something (an empty skip
+                // field must NOT emit params.skip — the engine then patterns the full grid).
+                std::string txt = f.textBuf.data();
+                if (!txt.empty()) params[key] = txt;
+                break;
+            }
             case PMFieldKind::DatumRef: {
                 // The chosen combo OPTION value is a datum string ("axis.x"/"plane.right") emitted
                 // straight into refs (a _SEL_OR_DATUM slot accepts reserved datum strings).
@@ -1011,12 +1090,24 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
         return false;
     }
 
+    // Fillet/chamfer have type-dependent primary wells: a fillet previews on edges
+    // (constant/variable) OR middle_face (full round) OR face_set_a (face fillet); a chamfer on
+    // edges (distance/angle) OR vertices (vertex chamfer). Ready as soon as any one is filled.
+    if (t == "fillet" || t == "chamfer") {
+        static const char* anyWell[] = {"edges", "middle_face", "face_set_a", "vertices"};
+        for (const auto& f : fields) {
+            if (f.def->kind != PMFieldKind::SelectorWell || f.picks.empty()) continue;
+            for (const char* k : anyWell)
+                if (std::strcmp(f.def->key, k) == 0) return true;
+        }
+        return false;
+    }
+
     // Selector-gated forms: a primary well (SelectorWell or FeatureWell) must have at least one
     // pick. Patterns gate on their FeatureWell; sweep on profile (path errors surface inline);
     // hole on the face; draft on the faces to taper.
     const char* needWell = nullptr;
-    if (t == "fillet" || t == "chamfer") needWell = "edges";
-    else if (t == "extrude" || t == "revolve" || t == "sweep") needWell = "profile";
+    if (t == "extrude" || t == "revolve" || t == "sweep") needWell = "profile";
     else if (t == "hole") needWell = "face";
     else if (t == "draft") needWell = "faces";
     else if (t == "linear_pattern" || t == "circular_pattern") needWell = "features";
@@ -1031,6 +1122,19 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
     else if (t == "axis")    needWell = "a";          // datum axis primary reference
     else if (t == "point")   needWell = "target";     // datum point reference
     else if (t == "rib")     needWell = "profile";    // rib needs an open-contour sketch profile
+    // Surfacing — gate each surf feature on its primary (required) ref well, mirroring schema.py.
+    else if (t == "surf_extrude" || t == "surf_revolve" || t == "surf_sweep" ||
+             t == "surf_planar")        needWell = "profile";   // profile-driven surfaces
+    else if (t == "surf_loft")          needWell = "sections";  // ordered section profiles
+    else if (t == "surf_offset")        needWell = "faces";     // faces to offset
+    else if (t == "surf_ruled")         needWell = "edge_a";    // first ruling edge
+    else if (t == "surf_boundary")      needWell = "dir1";      // direction-1 curves
+    else if (t == "surf_fill")          needWell = "edges";     // bounding edge loop
+    else if (t == "surf_knit")          needWell = "surfaces";  // surface bodies to knit
+    else if (t == "surf_thicken")       needWell = "surface";   // the surface to thicken
+    else if (t == "surf_trim")          needWell = "surface";   // the surface being trimmed
+    else if (t == "surf_untrim" || t == "surf_delete_face" ||
+             t == "surf_replace_face")  needWell = "faces";     // target faces
     if (needWell) {
         for (const auto& f : fields)
             if ((f.def->kind == PMFieldKind::SelectorWell || f.def->kind == PMFieldKind::FeatureWell)
@@ -1052,9 +1156,16 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
 
 // ---- preview / commit / cancel --------------------------------------------
 
-void PropertyManager::applyPreview(AppState& st) {
-    if (!st.docMirror.hasDoc() || !st.workerStarted) return;
-    if (!readyForPreview(form_, fields_)) { dirty_ = false; return; }
+bool PropertyManager::applyPreview(AppState& st) {
+    if (!st.docMirror.hasDoc() || !st.workerStarted) {
+        previewError_ = "Document runtime is not ready.";
+        return false;
+    }
+    if (!readyForPreview(form_, fields_)) {
+        previewError_ = "Select the required references and enter valid dimensions before accepting.";
+        dirty_ = false;
+        return false;
+    }
 
     // C37-F: Defensive check — if the target feature has vanished from the mirror tree (agent
     // run / external undo replaced the doc), close the PM rather than firing an edit_feature
@@ -1073,7 +1184,7 @@ void PropertyManager::applyPreview(AppState& st) {
             st.toast(ui::ToastLevel::Warn, "Feature " + targetId_ + " no longer exists — closing PM");
             st.addLog("[pm] tick: feature " + targetId_ + " vanished; closing PM");
             close();
-            return;
+            return false;
         }
     }
 
@@ -1086,13 +1197,17 @@ void PropertyManager::applyPreview(AppState& st) {
         ops.push_back({{"op", "add_feature"}, {"feature", feature}, {"before", nullptr}});
     } else {
         // Subsequent previews / edit-path: edit the existing feature in place.
-        if (targetId_.empty()) { dirty_ = false; return; }
+        if (targetId_.empty()) {
+            previewError_ = "Preview target was not created.";
+            dirty_ = false;
+            return false;
+        }
         ops.push_back({{"op", "edit_feature"}, {"id", targetId_},
                        {"params", feature.value("params", nlohmann::json::object())},
                        {"refs",   feature.value("refs",   nlohmann::json::object())}});
     }
 
-    auto resp = st.docMirror.applyOps(st.worker, ops);
+    auto resp = st.docMirror.applyOps(st.worker, ops, previewUndoGroupStarted_);
     if (!resp.ok) {
         // C38 (P4f): the inline previewError_ block in the PM body is the surface for a failed
         // debounced preview — do NOT toast here. Previews fire per-keystroke, so toasting each
@@ -1101,10 +1216,13 @@ void PropertyManager::applyPreview(AppState& st) {
         previewError_ = resp.error_message;
         st.addLog("[pm] preview failed: " + resp.error_message);
         dirty_ = false;
-        return;
+        return false;
     }
     previewError_.clear();  // C37-F: clear stale error on success
-    ++previewBatches_;
+    if (!previewUndoGroupStarted_) {
+        previewUndoGroupStarted_ = true;
+        ++previewBatches_;
+    }
     // The add-feature flow learns the new feature id from id_map ($0 -> fX).
     if (targetId_.empty() && resp.id_map.is_object()) {
         auto it = resp.id_map.find("$0");
@@ -1134,6 +1252,7 @@ void PropertyManager::applyPreview(AppState& st) {
         }
     }
     dirty_ = false;
+    return true;
 }
 
 void PropertyManager::tick(AppState& st) {
@@ -1147,14 +1266,29 @@ void PropertyManager::tick(AppState& st) {
 
 void PropertyManager::commit(AppState& st) {
     // Make sure the latest field state is reflected before committing.
-    if (dirty_ || !firstPreviewDone_) applyPreview(st);
+    if (!readyForPreview(form_, fields_)) {
+        previewError_ = "Select the required references and enter valid dimensions before accepting.";
+        st.addLog("[pm] OK blocked: form is not ready");
+        return;
+    }
+    if (dirty_ || !firstPreviewDone_) {
+        if (!applyPreview(st)) {
+            st.addLog("[pm] OK blocked: preview/apply failed");
+            return;
+        }
+    }
+    if (!previewError_.empty()) {
+        st.addLog("[pm] OK blocked: " + previewError_);
+        return;
+    }
     st.addLog("[pm] OK -> committed " + (targetId_.empty() ? std::string("(no geometry)") : targetId_));
     // The feature stays in the document; the tree returns on close.
     close();
 }
 
-void PropertyManager::cancelEdits(AppState& st) {
+bool PropertyManager::cancelEdits(AppState& st) {
     // C37-F: Single revert call replaces the old N-undo loop, eliminating the UI freeze.
+    bool ok = true;
     if (!checkpointId_.empty()) {
         auto r = st.docMirror.revert(st.worker, checkpointId_);
         if (r.ok) {
@@ -1164,18 +1298,22 @@ void PropertyManager::cancelEdits(AppState& st) {
         } else {
             st.toast(ui::ToastLevel::Error, "Cancel revert failed: " + r.error_message);
             st.addLog("[pm] Cancel revert failed: " + r.error_message);
+            ok = false;
         }
     } else {
         // Fallback: checkpoint wasn't available at open — use the undo loop.
         int n = previewBatches_;
         for (int i = 0; i < n; ++i) {
             auto r = st.docMirror.undo(st.worker);
-            if (!r.ok) { st.addLog("[pm] cancel undo failed: " + r.error_message); break; }
+            if (!r.ok) { st.addLog("[pm] cancel undo failed: " + r.error_message); ok = false; break; }
             if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
         }
-        st.addLog("[pm] Cancel -> undid " + std::to_string(n) + " preview batch(es) (no checkpoint)");
+        if (ok)
+            st.addLog("[pm] Cancel -> undid " + std::to_string(n) + " preview batch(es) (no checkpoint)");
     }
+    if (!ok) return false;
     close();
+    return true;
 }
 
 // ---- drawing --------------------------------------------------------------
@@ -1273,7 +1411,7 @@ void PropertyManager::drawBody(AppState& st) {
         if (ic.valid) {
             ImGui::Image(ic.texId, ImVec2(18.0f * ui::uiScale, 18.0f * ui::uiScale),
                          ic.uv0, ic.uv1);
-            ImGui::SameLine(0, 6);
+            ImGui::SameLine(0, 6 * ui::uiScale);
         }
         pushTextColor(pal.text);
         ImGui::TextUnformatted(title_.c_str());
@@ -1314,7 +1452,7 @@ void PropertyManager::drawBody(AppState& st) {
             bool btnOk;
             if (okIc.valid) {
                 btnOk = ImGui::ImageButton("##pm_ok",
-                    okIc.texId, ImVec2(btnW - 4, btnW - 4), okIc.uv0, okIc.uv1);
+                    okIc.texId, ImVec2(btnW - 4 * ui::uiScale, btnW - 4 * ui::uiScale), okIc.uv0, okIc.uv1);
             } else {
                 btnOk = ImGui::Button("OK##pm", ImVec2(btnW, 0));
             }
@@ -1335,7 +1473,7 @@ void PropertyManager::drawBody(AppState& st) {
             bool btnCancel;
             if (cancelIc.valid) {
                 btnCancel = ImGui::ImageButton("##pm_cancel",
-                    cancelIc.texId, ImVec2(btnW - 4, btnW - 4), cancelIc.uv0, cancelIc.uv1);
+                    cancelIc.texId, ImVec2(btnW - 4 * ui::uiScale, btnW - 4 * ui::uiScale), cancelIc.uv0, cancelIc.uv1);
             } else {
                 btnCancel = ImGui::Button("X##pm", ImVec2(btnW, 0));
             }
@@ -1421,7 +1559,7 @@ void PropertyManager::drawBody(AppState& st) {
                 if (ImGui::SmallButton("-##step")) {
                     if (enabled && !f.def->comingSoon) {
                         f.dimValue = std::max(0.0, f.dimValue - 1.0);
-                        std::string disp = pmFormatDim(f.dimValue, useIps);
+                        std::string disp = pmFieldValueText(f.def, f.dimValue, useIps);
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                         f.dimError.clear();
                         dirty_ = true;
@@ -1432,7 +1570,7 @@ void PropertyManager::drawBody(AppState& st) {
                 if (ImGui::SmallButton("+##step")) {
                     if (enabled && !f.def->comingSoon) {
                         f.dimValue += 1.0;
-                        std::string disp = pmFormatDim(f.dimValue, useIps);
+                        std::string disp = pmFieldValueText(f.def, f.dimValue, useIps);
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                         f.dimError.clear();
                         dirty_ = true;
@@ -1446,7 +1584,7 @@ void PropertyManager::drawBody(AppState& st) {
                     float wheel = io.MouseWheel;
                     if (wheel != 0.0f && enabled && !f.def->comingSoon) {
                         f.dimValue = std::max(0.0, f.dimValue + (double)wheel);
-                        std::string disp = pmFormatDim(f.dimValue, useIps);
+                        std::string disp = pmFieldValueText(f.def, f.dimValue, useIps);
                         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
                         f.dimError.clear();
                         dirty_ = true;
@@ -1467,12 +1605,14 @@ void PropertyManager::drawBody(AppState& st) {
                         double mm;
                         std::string err;
                         // A bare (unit-less) number follows the document length unit: mm in MMGS,
-                        // inch in IPS. Angle fields ([deg]) stay degrees in both systems, so they
-                        // keep the unit-less default scale. (angle stays false as before so an
-                        // explicit length suffix on any field still parses — existing behavior.)
-                        const bool isAngle = f.def->unitLabel && std::strstr(f.def->unitLabel, "deg");
-                        const double bareScale = (useIps && !isAngle) ? 25.4 : 1.0;
-                        if (pmParseDim(txt, mm, err, /*angle=*/false, bareScale)) {
+                        // inch in IPS. Angle fields ([deg]) stay degrees in both systems (bare =
+                        // degrees) and parse with angle=true so the "deg" suffix they now display
+                        // round-trips and a stray length unit is rejected on them.
+                        const bool isAngle = pmFieldIsAngle(f.def);
+                        // angle + unit-less (ratio/k-factor/turns) values are never IPS-scaled.
+                        const bool unscaled = isAngle || pmFieldUnitless(f.def);
+                        const double bareScale = (useIps && !unscaled) ? 25.4 : 1.0;
+                        if (pmParseDim(txt, mm, err, /*angle=*/isAngle, bareScale)) {
                             f.dimValue = mm; f.dimExpr.clear(); f.dimError.clear();
                             dirty_ = true; lastEditTime_ = ImGui::GetTime();
                         } else {
@@ -1484,7 +1624,7 @@ void PropertyManager::drawBody(AppState& st) {
                 if (enabled && !f.dimExpr.empty()) {
                     pushTextColor(pal.accent);
                     ImGui::Text(u8"= %s  (%s)", f.dimExpr.c_str(),
-                                pmFormatDim(f.dimValue, useIps).c_str());
+                                pmFieldValueText(f.def, f.dimValue, useIps).c_str());
                     ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Bound to equation '%s'", f.dimExpr.c_str());
@@ -1626,6 +1766,17 @@ void PropertyManager::drawBody(AppState& st) {
                         if (v < 1) v = 1;
                         f.intValue = v; dirty_ = true; lastEditTime_ = ImGui::GetTime();
                     }
+                }
+                break;
+            }
+            case PMFieldKind::Text: {
+                pushTextColor(pal.textDim);
+                ImGui::TextUnformatted(f.def->label);
+                ImGui::PopStyleColor();
+                ImGui::SetNextItemWidth(-1);
+                const char* hint = f.def->placeholder ? f.def->placeholder : "";
+                if (ImGui::InputTextWithHint("##text", hint, f.textBuf.data(), f.textBuf.size())) {
+                    if (enabled) { dirty_ = true; lastEditTime_ = ImGui::GetTime(); }
                 }
                 break;
             }

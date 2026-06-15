@@ -25,6 +25,8 @@ public:
     // main loop. Pulls config_list lazily and caches it; gated to part/asm documents (shows a
     // "no part" hint for drawing tabs / no document).
     void draw(AppState& st);
+    // Draw only the ConfigurationManager contents into the current window/child.
+    void drawEmbedded(AppState& st);
 
     // Force a re-pull of config_list on the next draw (e.g. after an external doc change). The panel
     // ALSO auto-invalidates when the mirror's doc id or revision differs from the cached snapshot,
@@ -35,6 +37,7 @@ private:
     // (Re)pull config_list into the cache for the active doc. Guarded; toasts + leaves the old cache
     // on failure. Records the doc id + revision the cache reflects so staleness is auto-detected.
     void refresh(AppState& st);
+    void drawBody(AppState& st);
 
     // Wrapper around DocMirror::callConfig: ingests the ops-response (viewport mesh reload from
     // aicm_path) and invalidates the cache. Returns true on success; toasts + returns false on error.

@@ -76,6 +76,7 @@
 // --- C20b: assembly UI ---
 #include "ui/asm_panels.h"
 // --- end C20b ---
+#include "ui/equations_dialog.h"  // Equations / Global Variables editor
 #include "ui/scenarios.h"  // scripted screenshot/test scenarios (m1/sketch/asm/fea/evalmass/activity)
 
 #include <filesystem>      // Wave N: ecad export output dir + W14: flat-pattern DXF export
@@ -139,13 +140,13 @@ void ecadDocRpc(AppState& st, const char* method, const char* okMsg) {
 
 // Apply an op batch to the current ECAD doc (canvas place/route edits) with the optimistic-
 // concurrency + stale-revision-resync discipline core/doc_mirror.cpp uses for the CAD doc.
-void ecadApplyOps(AppState& st, const nlohmann::json& ops) {
-    if (st.ecadDocId.empty() || !ops.is_array() || ops.empty()) return;
+bool ecadApplyOps(AppState& st, const nlohmann::json& ops) {
+    if (st.ecadDocId.empty() || !ops.is_array() || ops.empty()) return false;
     nlohmann::json res; std::string err;
     nlohmann::json params = {{"doc_id", st.ecadDocId}, {"base_revision", st.ecadRevision}, {"ops", ops}};
     if (!st.worker.call("ecad_apply_ops", params, res, err)) {
         st.toast(ui::ToastLevel::Error, "ECAD edit failed: " + err);
-        return;
+        return false;
     }
     if (res.is_object() && res.contains("code")) {
         if (jstr(res, "code") == "stale_revision") {
@@ -156,9 +157,10 @@ void ecadApplyOps(AppState& st, const nlohmann::json& ops) {
         } else {
             st.toast(ui::ToastLevel::Error, "ECAD: " + jstr(res, "message"));
         }
-        return;
+        return false;
     }
     ecadAdopt(st, res);
+    return true;
 }
 
 // Undo / Redo the current ECAD doc via the worker's history (ecad_undo / ecad_redo). Both return an
@@ -399,8 +401,20 @@ void ecadSimulate(AppState& st) {
         return;
     }
     st.ecadSimResults = res.contains("results") ? res["results"] : nlohmann::json::object();
-    st.toast(ui::ToastLevel::Info, st.ecadSimAnalysis == 1 ? "Simulated (AC)" : "Simulated (transient)");
-    st.addLog("[ecad] simulate " + std::string(st.ecadSimAnalysis == 1 ? "ac" : "tran"));
+    const bool converged = jbool(res, "converged");
+    if (converged) {
+        st.toast(ui::ToastLevel::Info, st.ecadSimAnalysis == 1 ? "Simulated (AC)" : "Simulated (transient)");
+    } else {
+        st.toast(ui::ToastLevel::Warn, "Simulation ran, but convergence warnings need review");
+    }
+    std::string line = "[ecad] simulate " + std::string(st.ecadSimAnalysis == 1 ? "ac" : "tran") +
+                       (converged ? " converged" : " not converged");
+    if (res.contains("convergence")) line += " " + res["convergence"].dump();
+    if (res.contains("ms") && !res["ms"].is_null()) line += " " + res["ms"].dump() + "ms";
+    st.addLog(line);
+    if (!converged && res.contains("log") && res["log"].is_array() && !res["log"].empty()) {
+        st.addLog("[ecad] sim log: " + res["log"].back().dump());
+    }
 }
 
 // Route a PCB-tab ribbon command. New docs + doc-scoped analysis/exports run now; geometry-placing
@@ -420,6 +434,20 @@ void ecadDispatch(AppState& st, const std::string& cmd) {
     if (cmd == "ecad_export_gerber") { ecadExport(st, "gerber"); return; }
     if (cmd == "ecad_export_drill")  { ecadExport(st, "drill"); return; }
     if (cmd == "ecad_export_bom")    { ecadExport(st, "bom"); return; }
+    if (cmd == "sch_annotate") {
+        if (st.ecadDocId.empty()) {
+            st.toast(ui::ToastLevel::Warn, "Open a schematic to annotate");
+            return;
+        }
+        bool ok = ecadApplyOps(st, nlohmann::json::array({
+            {{"op", "sch_annotate"}, {"scope", "all"}, {"mode", "reset"}}
+        }));
+        if (ok) {
+            st.toast(ui::ToastLevel::Info, "Schematic annotated");
+            st.wantFocusEcad = 4;
+        }
+        return;
+    }
     // Canvas tool modes (Wave Q): place a part / route on click.
     if (cmd == "sch_add_symbol" || cmd == "pcb_add_footprint") {
         st.ecadTool = 1; st.wantFocusEcad = 4;
@@ -739,8 +767,11 @@ int run_gui(const char* screenshotPath) {
     ui::SketchMode sketchMode;
     st.sketchMode = &sketchMode;
 
-    // Configurations panel (SolidWorks ConfigurationManager) — owned here, drawn each frame.
+    // Configurations panel (SolidWorks ConfigurationManager) — owned here. The Configurations
+    // left-pane tab renders it (ConfigPanel::drawEmbedded) via st.configPanel; there is no
+    // standalone dock window for it anymore.
     ui::ConfigPanel configPanel;
+    st.configPanel = &configPanel;
 
     // Design Table panel (SolidWorks editable config grid) — owned here, drawn each frame.
     ui::DesignTablePanel designTablePanel;
@@ -1017,7 +1048,7 @@ int run_gui(const char* screenshotPath) {
         st.chat.push_back(w);
     }
 
-    const char* shotMode = std::getenv("AI_CAD_SHOT");  // screenshot-only: settings|chat|assembly|plan|ribbon
+    const char* shotMode = std::getenv("AI_CAD_SHOT");  // screenshot-only: settings|chat|assembly|plan|ribbon|pmform
     st.wantSettings = shot && shotMode && std::strcmp(shotMode, "settings") == 0;
     st.wantChat = shot && shotMode && std::strcmp(shotMode, "chat") == 0;
     st.wantAssembly = shot && shotMode && std::strcmp(shotMode, "assembly") == 0;
@@ -1029,6 +1060,9 @@ int run_gui(const char* screenshotPath) {
     // headless screenshot captures the workspace file tree (otherwise it defaults to FeatureManager).
     if (shot && shotMode && std::strcmp(shotMode, "explorer") == 0)
         st.leftPaneTab = AppState::LP_Explorer;
+    // Equations editor shot — seed two globals + open the dialog once the worker is ready.
+    st.wantEquations = shot && shotMode && std::strcmp(shotMode, "equations") == 0;
+    if (st.wantEquations) { st.showFeatureTree = true; }  // keep the FeatureManager (Equations node) visible
     st.wantM1 = shot && shotMode && std::strcmp(shotMode, "m1") == 0;  // C17 integration scenario
     st.wantEcad = shot && shotMode && std::strcmp(shotMode, "ecad") == 0;  // Wave N: ECAD GUI shot
     if (st.wantEcad) { st.showRibbon = true; st.ribbonTab = AppState::RT_PCB; }  // PCB tab forward
@@ -1042,17 +1076,56 @@ int run_gui(const char* screenshotPath) {
     if (st.wantActivity) { st.showActivityPanel = true; }
     // C20b: assembly shot — author base/peg parts, new assembly, insert + mate + interference.
     st.wantAsm = shot && shotMode && std::strcmp(shotMode, "asm") == 0;
+    // AI_CAD_MATEFORM: a lightweight Mate-form-only variant of the asm shot for visual verification
+    // of the mate PM (Standard + Mechanical/Advanced sections + the type-aware param block). It
+    // skips the heavy author/insert/mate state machine and just opens the Mate form so the generic
+    // frame-6 capture grabs it (mirrors the pmform scenario). AI_CAD_MATETYPE=<type> preselects a
+    // mechanical/advanced type (e.g. "gear") so its parameter field renders.
+    const bool wantMateForm = st.wantAsm && std::getenv("AI_CAD_MATEFORM") != nullptr;
     if (st.wantAsm) {
         st.showRibbon = true; st.ribbonTab = AppState::RT_Assembly;  // Assembly tab forward
         st.showActivityPanel = false;            // keep the FeatureManager (Mates folder) unobscured
+        if (wantMateForm) {
+            st.wantAsm = false;                  // suppress the scripted scenario; just show the form
+            asmPanels.openMateForm();
+            if (const char* mt = std::getenv("AI_CAD_MATETYPE"))
+                if (*mt) asmPanels.presetMateTypeForShot(mt);
+        }
     }
-    // ribbon shot: show Features tab by default; AI_CAD_TAB=<0..4> selects which tab to capture
-    // (0=Features 1=Sketch 2=Evaluate 3=Simulation 4=Assembly) for headless per-tab verification.
+    // ribbon shot: show Features tab by default; AI_CAD_TAB=<0..8> selects which tab to capture
+    // (0=Features 1=Sketch 2=Evaluate 3=Simulation 4=Assembly 5=Sheet Metal 6=Weldments 7=PCB
+    // 8=Surfaces) for headless per-tab verification. Upper bound tracks kRibbonTabCount-1.
     if (st.wantRibbon) {
         st.showRibbon = true; st.ribbonTab = AppState::RT_Features;
         if (const char* tabEnv = std::getenv("AI_CAD_TAB")) {
             int t = std::atoi(tabEnv);
-            if (t >= 0 && t <= 4) st.ribbonTab = t;
+            if (t >= 0 && t <= 8) st.ribbonTab = t;
+        }
+    }
+    // pmform shot: open a PropertyManager form headlessly for visual verification of its field
+    // layout/sizing. AI_CAD_PMCMD=<cmd_id> (e.g. "extrude", "surf_loft") selects which form; the
+    // left pane auto-switches to the PropertyManager tab when a form is active (see left_pane.cpp).
+    // openForCommand is safe pre-worker: with no doc the checkpoint is skipped and field init is pure.
+    if (shot && shotMode && std::strcmp(shotMode, "pmform") == 0) {
+        st.showRibbon = true;
+        st.showFeatureTree = true;  // ensure the left pane (which hosts the PM tab) is visible
+        if (const char* cmd = std::getenv("AI_CAD_PMCMD"))
+            if (*cmd && !propertyManager.openForCommand(st, cmd))
+                std::fprintf(stderr, "pmform: no form for command '%s'\n", cmd);
+        // AI_CAD_PMSET="key=value;key2=value2" presets fields so type-gated rows render
+        // (e.g. "type=face" to show a fillet's face-set wells, "end=up_to_surface", "thin=true").
+        if (const char* setEnv = std::getenv("AI_CAD_PMSET")) {
+            std::string spec = setEnv;
+            size_t pos = 0;
+            while (pos < spec.size()) {
+                size_t semi = spec.find(';', pos);
+                std::string tok = spec.substr(pos, semi - pos);
+                size_t eq = tok.find('=');
+                if (eq != std::string::npos)
+                    propertyManager.presetFieldForShot(tok.substr(0, eq), tok.substr(eq + 1));
+                if (semi == std::string::npos) break;
+                pos = semi + 1;
+            }
         }
     }
     // wantTree doc smoke runs in the frame loop once the worker is ready (see below).
@@ -1542,8 +1615,34 @@ int run_gui(const char* screenshotPath) {
                           ? rr.tree["features"].size() : 0));
                 std::fflush(stdout);
                 if (rr.ok && !rr.aicm_path.empty()) { std::string le; st.loadDocMesh(rr.aicm_path, le); }
+                st.wantFocusViewport = 6;
             } else {
                 std::printf("tree-shot: doc_new failed: %s\n", err.c_str());
+                std::fflush(stdout);
+            }
+        }
+
+        // Equations shot: create a part, seed two globals via eq_set (width=20, height=width*1.5),
+        // then open the Equations editor so the dialog renders with rows (mirrors the wantTree flow).
+        // Runs once the worker is ready; the deferred screenshot (frame >= 10) gives the dialog
+        // a few frames to repaint with the seeded rows.
+        if (st.wantEquations && !st.equationsShotDone && st.workerStarted) {
+            st.equationsShotDone = true;
+            std::string err;
+            if (st.docMirror.newPart(st.worker, err)) {
+                auto r1 = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                    {{"op", "eq_set"}, {"name", "width"}, {"expr", "20"}}}));
+                std::printf("eq_set width: ok=%d rev=%d err=%s\n",
+                            (int)r1.ok, r1.revision, r1.error_message.c_str());
+                auto r2 = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                    {{"op", "eq_set"}, {"name", "height"}, {"expr", "width*1.5"}}}));
+                std::printf("eq_set height: ok=%d rev=%d err=%s\n",
+                            (int)r2.ok, r2.revision, r2.error_message.c_str());
+                std::fflush(stdout);
+                if (r2.ok && !r2.aicm_path.empty()) { std::string le; st.loadDocMesh(r2.aicm_path, le); }
+                st.showEquations = true;
+            } else {
+                std::printf("equations-shot: doc_new failed: %s\n", err.c_str());
                 std::fflush(stdout);
             }
         }
@@ -2015,7 +2114,7 @@ int run_gui(const char* screenshotPath) {
         float docTabsH = ui::drawDocTabs(st, barH + ribbonH);
 
         // ---------- dockspace host (between the title bar+ribbon and the status bar) ----------
-        const float statusH = 30.0f * scale;
+        const float statusH = ImGui::GetFrameHeight();
         const float dockTopY = barH + ribbonH + docTabsH;
         ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + dockTopY));
         ImGui::SetNextWindowSize(ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
@@ -2038,6 +2137,7 @@ int run_gui(const char* screenshotPath) {
             // SolidWorks's task pane defaulting to the first tab. Deferred one frame via a flag so
             // the docked windows exist before we focus.
             st.focusDesignTab = true;
+            if (!st.wantEcad) st.wantFocusViewport = 6;
         }
         ImGui::DockSpace(dockId, ImVec2(0, 0), ImGuiDockNodeFlags_None);
         ImGui::End();
@@ -2052,6 +2152,8 @@ int run_gui(const char* screenshotPath) {
         // PropertyManager / Configurations). drawLeftPane routes the active tab body and auto-
         // switches to the PropertyManager tab while a command form is active. We still tick the PM
         // so the debounced live preview fires; the container draws the PM form body when active.
+        // A live PropertyManager forces the left pane open so its form is never invisibly active.
+        if (propertyManager.active()) st.showFeatureTree = true;
         if (st.showFeatureTree) {
             if (propertyManager.active())
                 propertyManager.tick(st);     // fire the debounced live preview if dirty
@@ -2085,10 +2187,13 @@ int run_gui(const char* screenshotPath) {
         // ---------- C20b: assembly panels (Insert / Mate / Explode / Interference / BOM) ----------
         asmPanels.draw(st);
 
-        // ---------- Configurations panel (SolidWorks ConfigurationManager) ----------
-        // Lists the active part/asm doc's configurations; activate/add/delete ingest the
-        // ops-response so the viewport + FeatureManager refresh. No-op unless st.showConfigPanel.
-        configPanel.draw(st);
+        // ---------- Equations / Global Variables editor (modeless; gated by st.showEquations) ----------
+        // Opened from the FeatureManager "Equations" node (double-click) or View > Equations. Lists
+        // doc.equations.globals; add/edit -> eq_set, delete -> eq_delete, then reloads the mesh.
+        ui::drawEquationsDialog(st);
+
+        // Configurations now lives inside the left manager's ConfigurationManager tab, matching
+        // the commercial CAD mental model instead of floating as a separate task-pane window.
 
         // ---------- Design Table panel (SolidWorks editable config grid) ----------
         // Editable spreadsheet over the active doc's configurations: rows=configs, columns=driven
@@ -2159,6 +2264,9 @@ int run_gui(const char* screenshotPath) {
         // wantTree but !treeShotDone: keep waiting (up to 30 frames) for the worker to start
         // wantTree and treeShotDone: take the screenshot at frame 10 (tree has repainted)
         int shotFrame = st.wantTree ? (st.treeShotDone ? 10 : 30) : 6;
+        // equations shot: wait (up to 30 frames) for the worker, then capture at frame 10 once the
+        // two globals are seeded and the dialog has repainted with its rows.
+        if (st.wantEquations) shotFrame = st.equationsShotDone ? 10 : 30;
         if (st.wantEcad) {
             if (!st.ecadShotDone)                                       shotFrame = 150;   // worker + design
             else if (st.wantFocusViewport > 0 || st.wantFocusEcad > 0)  shotFrame = 99999; // let focus settle

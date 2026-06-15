@@ -295,6 +295,35 @@ static const RibbonCmd kCmds[] = {
     { "ecad_export_drill",  "Drill",          "hole_wizard",     "PCB", "Outputs",    false, nullptr, false },
     { "ecad_export_bom",    "BOM",            "bom",             "PCB", "Outputs",    false, nullptr, false },
 
+    // =========================================================================
+    // Tab: Surfaces — open-surface (kind="surface") body features. cmd_id == the
+    // engine feature type, so pmFormForCommand routes each one straight through.
+    // Icons reuse existing atlas glyphs (no new icon names — gui_lint --rule icons
+    // must stay clean): extrude_boss / revolve_boss / sweep / loft / plane / offset_ent
+    // / boundary / combine / trim / convert_ent / subtract / wrap / shell.
+    // =========================================================================
+
+    // --- Group: Create --- surfaces grown from sketch profiles / sections.
+    { "surf_extrude",       "Extruded Surf.", "extrude_boss",    "Surfaces", "Create", true,  nullptr, false },
+    { "surf_revolve",       "Revolved Surf.", "revolve_boss",    "Surfaces", "Create", true,  nullptr, false },
+    { "surf_sweep",         "Swept Surf.",    "sweep",           "Surfaces", "Create", true,  nullptr, false },
+    { "surf_loft",          "Lofted Surf.",   "loft",            "Surfaces", "Create", true,  nullptr, false },
+    { "surf_planar",        "Planar Surf.",   "plane",           "Surfaces", "Create", true,  nullptr, false },
+
+    // --- Group: Curves & Patches --- derived surfaces from faces / edges / curves.
+    { "surf_offset",        "Offset Surf.",   "offset_ent",      "Surfaces", "Curves & Patches", true,  nullptr, false },
+    { "surf_ruled",         "Ruled Surf.",    "shell",           "Surfaces", "Curves & Patches", true,  nullptr, false },
+    { "surf_boundary",      "Boundary Surf.", "boundary",        "Surfaces", "Curves & Patches", true,  nullptr, false },
+    { "surf_fill",          "Filled Surf.",   "boundary",        "Surfaces", "Curves & Patches", false, nullptr, false },
+
+    // --- Group: Edit --- knit/thicken/trim and face-level surface edits.
+    { "surf_knit",          "Knit Surf.",     "combine",         "Surfaces", "Edit",   true,  nullptr, false },
+    { "surf_thicken",       "Thicken",        "extrude_boss",    "Surfaces", "Edit",   true,  nullptr, false },
+    { "surf_trim",          "Trim Surf.",     "trim",            "Surfaces", "Edit",   true,  nullptr, false },
+    { "surf_untrim",        "Untrim Surf.",   "convert_ent",     "Surfaces", "Edit",   false, nullptr, false },
+    { "surf_delete_face",   "Delete Face",    "subtract",        "Surfaces", "Edit",   false, nullptr, false },
+    { "surf_replace_face",  "Replace Face",   "wrap",            "Surfaces", "Edit",   false, nullptr, false },
+
 };
 // clang-format on
 

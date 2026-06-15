@@ -16,6 +16,7 @@
 #include "feature_tree.h"       // drawFeatureTreeBody
 #include "file_explorer.h"      // Wave 3: drawFileExplorerBody (Explorer tab)
 #include "property_manager.h"   // PropertyManager::drawBody
+#include "config_panel.h"       // ConfigPanel::drawEmbedded (live Configurations tab)
 #include "icons.h"              // getIcon / IconUV
 
 // C24: SolidWorks 2025 default arrangement.
@@ -204,7 +205,11 @@ void drawLeftPane(AppState& st,
             break;
 
         case kLeftPaneConfigurations:
-            drawConfigurationsBody(st);
+            // User chose the live ConfigurationManager (config_* RPCs) for this tab. ConfigPanel is
+            // owned by run_gui and borrowed via st.configPanel; drawEmbedded renders its contents
+            // without a Begin/End. Fall back to the at-rest single-config body if it's unset.
+            if (st.configPanel) st.configPanel->drawEmbedded(st);
+            else                drawConfigurationsBody(st);
             break;
 
         case kLeftPaneFeatureManager:

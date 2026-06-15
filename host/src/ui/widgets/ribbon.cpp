@@ -11,6 +11,7 @@
 #include "../icons.h"
 #include "../../ui_theme.h"   // ui::palette, ui::Palette
 #include "../ribbon_def.h"    // RibbonCmd, getRibbonCmds
+#include "../metrics.h"       // ui::metrics::px/U/stroke/rounding + ribbon tokens
 
 #include <cmath>
 #include <cstdio>
@@ -38,8 +39,8 @@ static std::unordered_map<std::string, std::string> s_LastUsed;
 static std::string s_flyoutOpenReq;
 
 static const char* kRibbonTabs[] = {"Features", "Sketch", "Evaluate", "Simulation", "Assembly",
-                                    "Sheet Metal", "Weldments", "PCB"};
-static constexpr int kRibbonTabCount = 8;  // mechanical tabs + Wave N "PCB" (AI-ECAD electrical design)
+                                    "Sheet Metal", "Weldments", "PCB", "Surfaces"};
+static constexpr int kRibbonTabCount = 9;  // mechanical tabs + Wave N "PCB" + "Surfaces" (surfacing features)
 
 // C25c FIX (defect 3): the Draw group gained a big "Ellipse" split button (sk_ellipse_big) as the
 // flyout parent, but the original small sk_ellipse row is still in the (append-only) table. Rendering
@@ -118,14 +119,17 @@ static float ribbon_wrapLabel(const char* label, std::string& l1, std::string& l
 }
 
 // Width of a big button in screen pixels.
+// §2.1: ribbon_wrapLabel returns a CalcTextSize result (already screen-px / DPI-scaled), so the
+// label width is computed entirely in screen px (kBigLblPad scaled once) and clamped against the
+// screen-px min/max bounds. Mixing the screen-px text with *s once would double-scale the label.
 static float ribbon_bigBtnW(const char* label, bool hasDrop) {
     float s = ui::uiScale;
     std::string l1, l2;
-    float lblW = ribbon_wrapLabel(label, l1, l2) + kBigLblPad * 2.0f;
-    float base = kBigBtnW;
-    if (lblW > base) base = lblW;
-    if (base > kBigBtnMaxW) base = kBigBtnMaxW;
-    return base * s + (hasDrop ? kDropArrowW * s : 0.0f);
+    float lblWScreen = ribbon_wrapLabel(label, l1, l2) + kBigLblPad * 2.0f * s;
+    float base = kBigBtnW * s;
+    if (lblWScreen > base) base = lblWScreen;
+    if (base > kBigBtnMaxW * s) base = kBigBtnMaxW * s;
+    return base + (hasDrop ? kDropArrowW * s : 0.0f);
 }
 
 // Width of a small button in screen pixels.
@@ -426,9 +430,11 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     if (ribbon_isActive(cmd_id)) {
         ImDrawList* adl = ImGui::GetWindowDrawList();
         adl->AddRectFilled(p0, ImVec2(p0.x + bw, p0.y + bh),
-                           ui::Palette::toU32(ui::palette.accentSoft), 3.0f);
+                           ui::Palette::toU32(ui::palette.accentSoft),
+                           ui::metrics::ribbonBtnRound());
         adl->AddRect(p0, ImVec2(p0.x + bw, p0.y + bh),
-                     ui::Palette::toU32(ui::palette.accent), 3.0f, 0, 1.5f);
+                     ui::Palette::toU32(ui::palette.accent),
+                     ui::metrics::ribbonBtnRound(), 0, ui::metrics::stroke(1.5f));
     }
 
     if (hasDrop) {
@@ -439,12 +445,14 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         ImDrawList* dl = ImGui::GetWindowDrawList();
         if ((mainHov || dropHov) && enabled) {
             ImU32 hBg = ui::Palette::toU32(ui::palette.buttonHovered);
-            dl->AddRectFilled(p0, ImVec2(p0.x + bw, p0.y + bh), hBg, 3.0f);
+            dl->AddRectFilled(p0, ImVec2(p0.x + bw, p0.y + bh), hBg,
+                              ui::metrics::ribbonBtnRound());
         }
         {
             float lx = p0.x + mainW;
-            dl->AddLine(ImVec2(lx, p0.y + 4), ImVec2(lx, p0.y + bh - 4),
-                        ui::Palette::toU32(ui::palette.border), 1.0f);
+            float inset = ui::metrics::ribbonSplitInset();
+            dl->AddLine(ImVec2(lx, p0.y + inset), ImVec2(lx, p0.y + bh - inset),
+                        ui::Palette::toU32(ui::palette.border), ui::metrics::stroke(1.0f));
         }
         {
             float ax = p0.x + mainW + kArrowW * s * 0.5f;
@@ -462,7 +470,8 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         if (mainHov && enabled) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             ImU32 hBg = ui::Palette::toU32(ui::palette.buttonHovered);
-            dl->AddRectFilled(p0, ImVec2(p0.x + bw, p0.y + bh), hBg, 3.0f);
+            dl->AddRectFilled(p0, ImVec2(p0.x + bw, p0.y + bh), hBg,
+                              ui::metrics::ribbonBtnRound());
         }
     }
 
@@ -525,12 +534,18 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     return clicked && enabled;
 }
 
+// §2.3: the height of a degraded "big-as-small" row (fit ~3 per body zone, floored at the small
+// row height). Layout MUST advance sy by this value, not kSmRowH*s, or these taller rows overlap.
+static float ribbon_bigBtnAsSmallRowH() {
+    float s = ui::uiScale;
+    return ImMax(snap((kBodyH - kCaptionH) * s / 3.0f), kSmRowH * s);
+}
+
 // Draw a big button degraded to small-row layout (icon + side label, one row height).
 static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
                                   const char* label, bool enabled, bool hasDrop) {
     float s      = ui::uiScale;
-    float rowH   = snap((kBodyH - kCaptionH) * s / 3.0f);  // fit ~3 per body zone
-    rowH = ImMax(rowH, kSmRowH * s);
+    float rowH   = ribbon_bigBtnAsSmallRowH();  // fit ~3 per body zone, floored at kSmRowH
     float iconSz = snap(kSmIconSz * s);
     float lblW   = ImGui::CalcTextSize(label).x;
     float totalW = iconSz + 4.0f * s + lblW + (hasDrop ? kDropArrowW * s : 0.0f) + 10.0f * s;
@@ -555,9 +570,11 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
     if (ribbon_isActive(cmd_id)) {
         ImDrawList* adl = ImGui::GetWindowDrawList();
         adl->AddRectFilled(p0, ImVec2(p0.x + totalW, p0.y + rowH),
-                           ui::Palette::toU32(ui::palette.accentSoft), 3.0f);
+                           ui::Palette::toU32(ui::palette.accentSoft),
+                           ui::metrics::ribbonBtnRound());
         adl->AddRect(p0, ImVec2(p0.x + totalW, p0.y + rowH),
-                     ui::Palette::toU32(ui::palette.accent), 3.0f, 0, 1.5f);
+                     ui::Palette::toU32(ui::palette.accent),
+                     ui::metrics::ribbonBtnRound(), 0, ui::metrics::stroke(1.5f));
     }
 
     if (hasDrop) {
@@ -567,11 +584,13 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
         ImDrawList* dl = ImGui::GetWindowDrawList();
         if ((mainHov || dropHov) && enabled)
             dl->AddRectFilled(p0, ImVec2(p0.x + totalW, p0.y + rowH),
-                              ui::Palette::toU32(ui::palette.buttonHovered), 3.0f);
+                              ui::Palette::toU32(ui::palette.buttonHovered),
+                              ui::metrics::ribbonBtnRound());
         {
             float lx = p0.x + mainW;
-            dl->AddLine(ImVec2(lx, p0.y + 2), ImVec2(lx, p0.y + rowH - 2),
-                        ui::Palette::toU32(ui::palette.border), 1.0f);
+            float inset = ui::metrics::ribbonSmSplitInset();
+            dl->AddLine(ImVec2(lx, p0.y + inset), ImVec2(lx, p0.y + rowH - inset),
+                        ui::Palette::toU32(ui::palette.border), ui::metrics::stroke(1.0f));
         }
         {
             float ax = p0.x + mainW + kDropArrowW * s * 0.5f;
@@ -588,7 +607,8 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
         if (mainHov && enabled) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             dl->AddRectFilled(p0, ImVec2(p0.x + totalW, p0.y + rowH),
-                              ui::Palette::toU32(ui::palette.buttonHovered), 3.0f);
+                              ui::Palette::toU32(ui::palette.buttonHovered),
+                              ui::metrics::ribbonBtnRound());
         }
     }
 
@@ -691,7 +711,8 @@ static const char* ribbon_flyoutPopup(const char* parentId,
 
             if (rowHov && scEnabled)
                 dl->AddRectFilled(cp0, ImVec2(cp0.x + popW, cp0.y + rowH),
-                                  ui::Palette::toU32(ui::palette.buttonHovered), 3.0f);
+                                  ui::Palette::toU32(ui::palette.buttonHovered),
+                                  ui::metrics::ribbonBtnRound());
 
             {
                 float ix = snap(cp0.x + padX);
@@ -743,7 +764,9 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
     float s      = ui::uiScale;
     float rowH   = kSmRowH * s;
     float iconSz = kSmIconSz * s;
-    float totalW = iconSz + ImGui::CalcTextSize(label).x + 10.0f * s;
+    // §2.2: drive the drawn/hit width from the SAME helper the packer measures with, so measure
+    // and draw never disagree (previously the helper returned text+18*s but this drew text+10*s).
+    float totalW = ribbon_smBtnW(label);
 
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     ImGui::PushID(cmd_id);
@@ -762,14 +785,17 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
     if (ribbon_isActive(cmd_id)) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->AddRectFilled(p0, ImVec2(p0.x + totalW, p0.y + rowH),
-                          ui::Palette::toU32(ui::palette.accentSoft), 3.0f);
+                          ui::Palette::toU32(ui::palette.accentSoft),
+                          ui::metrics::ribbonBtnRound());
         dl->AddRect(p0, ImVec2(p0.x + totalW, p0.y + rowH),
-                    ui::Palette::toU32(ui::palette.accent), 3.0f, 0, 1.5f);
+                    ui::Palette::toU32(ui::palette.accent),
+                    ui::metrics::ribbonBtnRound(), 0, ui::metrics::stroke(1.5f));
     }
     if (hov && enabled) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->AddRectFilled(p0, ImVec2(p0.x + totalW, p0.y + rowH),
-                          ui::Palette::toU32(ui::palette.buttonHovered), 3.0f);
+                          ui::Palette::toU32(ui::palette.buttonHovered),
+                          ui::metrics::ribbonBtnRound());
     }
 
     {
@@ -814,7 +840,8 @@ static bool ribbon_overflowChevron(float x, float y, float bh) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     if (hov)
         dl->AddRectFilled(p0, ImVec2(p0.x + btnW, p0.y + bh),
-                          ui::Palette::toU32(ui::palette.buttonHovered), 3.0f);
+                          ui::Palette::toU32(ui::palette.buttonHovered),
+                          ui::metrics::ribbonBtnRound());
     ImU32 tCol = ui::Palette::toU32(ui::palette.text);
     float cx = p0.x + btnW * 0.5f;
     float cy = p0.y + bh * 0.5f;
@@ -906,13 +933,14 @@ float drawRibbon(int& activeTab, bool visible) {
         if (isAct || tabHov) {
             ImU32 bg = isAct ? Palette::toU32(palette.ribbonTabActive)
                              : Palette::toU32(palette.buttonHovered);
-            dl->AddRectFilled(tp0, tp1, bg, 3.0f,
+            dl->AddRectFilled(tp0, tp1, bg, ui::metrics::ribbonBtnRound(),
                 isAct ? ImDrawFlags_RoundCornersTop : 0);
         }
         if (isAct) {
-            dl->AddLine(ImVec2(tp0.x + 2, tp1.y - 1),
-                        ImVec2(tp1.x - 2, tp1.y - 1),
-                        Palette::toU32(palette.accent), 2.0f);
+            float tabInset = ui::metrics::ribbonSmSplitInset();
+            dl->AddLine(ImVec2(tp0.x + tabInset, tp1.y - ui::metrics::px(1.0f)),
+                        ImVec2(tp1.x - tabInset, tp1.y - ui::metrics::px(1.0f)),
+                        Palette::toU32(palette.accent), ui::metrics::stroke(2.0f));
         }
         ImVec4 lc = (isAct || tabHov)
             ? ImVec4(palette.text[0],    palette.text[1],    palette.text[2],    palette.text[3])
@@ -927,7 +955,7 @@ float drawRibbon(int& activeTab, bool visible) {
 
     dl->AddLine(ImVec2(wPos.x,              wPos.y + tabH),
                 ImVec2(wPos.x + vp->Size.x, wPos.y + tabH),
-                Palette::toU32(palette.border), 1.0f);
+                Palette::toU32(palette.border), ui::metrics::stroke(1.0f));
 
     // --- Build group list ---
     int cmdCount = 0;
@@ -1102,7 +1130,8 @@ float drawRibbon(int& activeTab, bool visible) {
                     } else {
                         ribbon_smBtn(cmd->cmd_id, cmd->icon, cmd->label, !cmd->stretch);
                     }
-                    sy += kSmRowH * s;
+                    // §2.3: degraded big rows are taller than kSmRowH — advance by the actual height.
+                    sy += (idx < nBig) ? ribbon_bigBtnAsSmallRowH() : kSmRowH * s;
                 }
                 sx += col.width;
             }
@@ -1113,8 +1142,10 @@ float drawRibbon(int& activeTab, bool visible) {
             ImVec2 cwinPos = ImGui::GetWindowPos();
             float  sepX    = snap(cwinPos.x + curX + grpW - kGroupPadX * s * 0.5f);
             ImU32  sepCol  = Palette::toU32(palette.border);
-            dl->AddLine(ImVec2(sepX, cwinPos.y + 4),
-                        ImVec2(sepX, cwinPos.y + bodyH2 - 4), sepCol, 1.0f);
+            float  sepInset = ui::metrics::ribbonSplitInset();
+            dl->AddLine(ImVec2(sepX, cwinPos.y + sepInset),
+                        ImVec2(sepX, cwinPos.y + bodyH2 - sepInset), sepCol,
+                        ui::metrics::stroke(1.0f));
 
             // Defect 2: centered caption. grpW already includes a caption-width floor, so labels
             // such as "Dimension" never truncate at COL_BIG/COL_SMALL. The clip rect is a safety
@@ -1182,7 +1213,8 @@ float drawRibbon(int& activeTab, bool visible) {
                     ImDrawList* odl = ImGui::GetWindowDrawList();
                     if (rowHov && enabled)
                         odl->AddRectFilled(cp0, ImVec2(cp0.x + popW, cp0.y + rowH),
-                                           ui::Palette::toU32(ui::palette.buttonHovered), 3.0f);
+                                           ui::Palette::toU32(ui::palette.buttonHovered),
+                                           ui::metrics::ribbonBtnRound());
                     {
                         float ix = snap(cp0.x + padX);
                         float iy = snap(cp0.y + (rowH - iconSz) * 0.5f);
@@ -1227,7 +1259,8 @@ float drawRibbon(int& activeTab, bool visible) {
                     ImDrawList* odl = ImGui::GetWindowDrawList();
                     if (rowHov && enabled)
                         odl->AddRectFilled(cp0, ImVec2(cp0.x + popW, cp0.y + rowH),
-                                           ui::Palette::toU32(ui::palette.buttonHovered), 3.0f);
+                                           ui::Palette::toU32(ui::palette.buttonHovered),
+                                           ui::metrics::ribbonBtnRound());
                     {
                         float ix = snap(cp0.x + padX);
                         float iy = snap(cp0.y + (rowH - iconSz) * 0.5f);

@@ -135,7 +135,18 @@ def _doc_new(params: dict, _emit: EmitFn) -> dict:
 
 def _doc_open(params: dict, _emit: EmitFn) -> dict:
     from engine.doc import stepplus, session as docsess
-    s, warnings = stepplus.open(params["path"])
+    path = params["path"]
+    # Route by extension: AI-CAD's native ".step+" zip goes through stepplus.open; a plain neutral
+    # geometry file (.step/.stp/.iges/.igs/.brep/.stl/.3mf — the _EXT_TO_FORMAT set) is IMPORTED as
+    # a fresh part instead (stepplus.open only understands the .step+ container, so opening a plain
+    # STEP used to fail). The import path returns the same doc-state shape (doc_id/tree/revision).
+    from engine.doc.formats import _EXT_TO_FORMAT, _handler_import_file
+    if Path(path).suffix.lower() in _EXT_TO_FORMAT:
+        resp = _handler_import_file({"path": path}, _emit)
+        resp.setdefault("warnings", [])
+        resp.setdefault("drawings", [])
+        return resp
+    s, warnings = stepplus.open(path)
     resp = docsess.rebuild(s)
     resp["doc_id"] = s.doc_id
     resp["warnings"] = warnings
@@ -652,9 +663,20 @@ def _agent_run_v2(params: dict, emit_event: EmitFn) -> dict:
         emit_event(ev)
 
     # C35: route to the MICRO-ORCHESTRATION profile for small-context local models (decompose ->
-    # per-step execute + python verify). Falls back to the full v2 machine otherwise.
+    # per-step execute + python verify). Falls back to the full v2 machine otherwise. The RPC
+    # options may explicitly request a workflow/profile; this keeps the documented worker surface
+    # aligned with the actual dispatcher.
     from agent.orchestrator import micro
-    use_micro = micro.should_engage(provider, config.load_config())
+    agent_cfg = config.load_config()
+    workflow = str(options.get("workflow") or options.get("profile") or "").strip().lower()
+    if workflow in ("micro", "local", "small-context", "small_context", "tiny"):
+        agent_cfg["micro_mode"] = True
+    elif workflow in ("full", "standard", "machine"):
+        agent_cfg["micro_mode"] = False
+    elif workflow not in ("", "auto"):
+        raise ValueError("agent_run_v2 options.workflow must be auto, micro, or full")
+    use_micro = micro.should_engage(provider, agent_cfg)
+    options["workflow"] = "micro" if use_micro else "full"
 
     try:
         if use_micro:
@@ -842,6 +864,12 @@ from engine.doc import export2d as _export2d  # noqa: E402
 
 _METHODS.update(_export2d.WORKER_METHODS)
 _STRUCTURED_ERROR_METHODS.update({"export_drawing", "export_flat_dxf"})
+
+# ---- Supplier/vendor parts cache + import features (structured error) ----
+from engine import vendor_parts as _vendor_parts  # noqa: E402
+
+_METHODS.update(_vendor_parts.WORKER_METHODS)
+_STRUCTURED_ERROR_METHODS.update(_vendor_parts.WORKER_METHODS.keys())
 
 # === ECAD (Wave C2) — AI-ECAD electrical design methods (schematic/PCB/sim/fab/3d) ===
 try:

@@ -26,6 +26,27 @@ Result: one connected solid; the rib touches the walls it bridges (fuse-verified
 increase). Limitation: the contour must be planar + open and its drop direction must actually reach
 the body (a contour drawn away from the part adds a dangling rib → caught as "added no material").
 Closed profile / no body / non-intersecting are contained :class:`FeatureError`.
+
+SolidWorks-parity options (SW_PARITY_SPEC §2 Rib)
+-------------------------------------------------
+* **Explicit drop / extrusion direction** (``thicken="parallel"`` only) — by default the in-plane
+  drop direction is *inferred* (the perpendicular pointing at the body centre). SolidWorks lets you
+  flip / pick it. We honour an explicit pick when given:
+    - ``params.drop_dir`` — a literal 3-vector ``[x,y,z]`` (or ``{"x","y","z"}``) the contour drops
+      along. It is projected onto the sketch plane (the rib silhouette must stay planar) and used
+      verbatim; ``params.drop_flip`` reverses it.
+    - ``params.drop_ref`` — a *direction reference* (datum axis/plane, linear model edge, or planar
+      face normal), resolved through the pattern direction machinery and likewise in-plane-projected.
+  When neither is given the legacy inference is used unchanged.
+* **Extrusion-direction mode** ``params.thicken`` — SolidWorks' Rib has two ways the material grows
+  relative to the sketch plane:
+    - ``"parallel"`` (default, legacy) grows the rib PARALLEL TO THE SKETCH: the contour drops along
+      an IN-PLANE direction and is thickened ACROSS the sketch-plane normal (the legacy rib; the
+      explicit drop pick above applies here).
+    - ``"normal"`` grows the rib NORMAL TO THE SKETCH: the contour drops along the SKETCH-PLANE
+      NORMAL (perpendicular to the sketch) and is thickened IN-PLANE (perpendicular to the contour) —
+      SolidWorks' "Normal to Sketch" rib, for a contour drawn on/near a face whose rib grows straight
+      off the sketch plane. ``side`` (both/one) + ``draft`` + ``flip`` apply in both modes.
 """
 
 from __future__ import annotations
@@ -37,8 +58,30 @@ from build123d import extrude as b3d_extrude
 
 from .base import CompileContext, CompileOutput, FeatureError, register
 from .extrude import _body_bbox_diag, _store_topo_owners, _to_solid_normalized
+from .pattern import _resolve_direction
 
 _VALID_SIDES = ("both", "one")
+_VALID_THICKEN = ("parallel", "normal")
+
+
+def _vec_from_param(v: Any) -> Vector | None:
+    """Coerce a literal direction param (``[x,y,z]`` list/tuple or ``{"x","y","z"}`` dict) to a
+    Vector, or return None if it is not a literal vector (so a ref can be tried instead)."""
+    if isinstance(v, (list, tuple)) and len(v) == 3 and all(
+            isinstance(c, (int, float)) and not isinstance(c, bool) for c in v):
+        return Vector(float(v[0]), float(v[1]), float(v[2]))
+    if isinstance(v, dict) and all(k in v for k in ("x", "y", "z")):
+        try:
+            return Vector(float(v["x"]), float(v["y"]), float(v["z"]))
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def _project_into_plane(vec: Vector, normal: Vector) -> Vector:
+    """Project ``vec`` onto the plane with the given unit ``normal`` (drop the out-of-plane part)."""
+    n = normal.normalized()
+    return vec - n * vec.dot(n)
 
 
 def _resolve_open_contour(sel: Any, ctx: CompileContext) -> tuple[list[Edge], Any]:
@@ -130,6 +173,11 @@ def compile_rib(feat: dict, ctx: CompileContext) -> CompileOutput:
         raise FeatureError(f"rib: unknown side '{side}' (expected 'both' or 'one')")
     draft = ctx.dim(p, "draft", 0.0) if p.get("draft") is not None else 0.0
     flip = bool(p.get("flip", False))
+    thicken = p.get("thicken", "parallel")
+    if thicken not in _VALID_THICKEN:
+        raise FeatureError(
+            f"rib: unknown thicken '{thicken}' (expected 'parallel' or 'normal')")
+    drop_flip = bool(p.get("drop_flip", False))
 
     bodies = list(ctx.bodies)
     if not bodies:
@@ -164,33 +212,95 @@ def compile_rib(feat: dict, ctx: CompileContext) -> CompileOutput:
     cdir = chord.normalized()
     normal = Vector(plane.z_dir).normalized()
 
-    # Drop direction: in-plane, perpendicular to the contour, pointing toward the body interior.
-    perp = normal.cross(cdir)
-    if perp.length < 1e-9:
-        raise FeatureError("rib: could not derive a drop direction (contour parallel to normal?)")
-    perp = perp.normalized()
+    # Drop / extrusion direction + thickening axis. SolidWorks' Rib has two *extrusion-direction*
+    # modes (``params.thicken``) that decide how the material grows relative to the sketch plane:
+    #
+    #   - "parallel" (default, legacy): the rib material grows PARALLEL TO THE SKETCH — the contour
+    #     is dropped along an IN-PLANE direction (perpendicular to the contour, toward the body) and
+    #     thickened ACROSS the sketch-plane normal.
+    #   - "normal": the rib material grows NORMAL TO THE SKETCH — the contour is dropped along the
+    #     SKETCH-PLANE NORMAL (perpendicular to the sketch) and thickened IN-PLANE (perpendicular to
+    #     the contour). This is SW's "Normal to Sketch" rib, used when the contour is drawn on/near a
+    #     face and the rib grows straight off the sketch plane.
+    #
+    # ``drop_dir`` / ``drop_ref`` give an EXPLICIT drop pick (parallel mode only — it is projected
+    # into the sketch plane); ``drop_flip`` reverses whichever drop direction is used.
+    explicit: Vector | None = None
+    if p.get("drop_dir") is not None:
+        explicit = _vec_from_param(p.get("drop_dir"))
+        if explicit is None:
+            raise FeatureError(
+                "rib: params.drop_dir must be a 3-vector [x,y,z] (or {x,y,z})")
+    elif p.get("drop_ref") is not None:
+        try:
+            explicit = _resolve_direction(p.get("drop_ref"), ctx)
+        except FeatureError as exc:
+            raise FeatureError(f"rib: drop direction reference did not resolve: {exc}",
+                               dangling_refs=["drop_ref: " + str(exc)])
+
     bc = body.bounding_box().center()
     mid = (a + b) * 0.5
     toward = Vector(bc.X, bc.Y, bc.Z) - mid
-    if perp.dot(toward) < 0.0:
-        perp = perp * -1.0
+
+    if thicken == "normal":
+        # Drop straight off the sketch plane (along its normal); orient toward the body, thicken
+        # in-plane perpendicular to the contour. An explicit drop pick is not meaningful here (the
+        # drop is fixed to the sketch normal); honour only the flip.
+        if explicit is not None:
+            raise FeatureError(
+                "rib: params.drop_dir/drop_ref only apply to thicken='parallel' (in 'normal' mode "
+                "the rib drops along the sketch normal)")
+        perp = Vector(normal)
+        if perp.dot(toward) < 0.0:
+            perp = perp * -1.0
+        if drop_flip:
+            perp = perp * -1.0
+        t_axis = normal.cross(cdir)            # in-plane, perpendicular to the contour
+        if t_axis.length < 1e-9:
+            t_axis = normal.cross(perp)
+        if t_axis.length < 1e-9:
+            t_axis = Vector(normal)
+        t_axis = t_axis.normalized()
+    elif explicit is not None:
+        # Explicit in-plane drop pick (parallel mode).
+        perp = _project_into_plane(explicit, normal)
+        if perp.length < 1e-9:
+            raise FeatureError(
+                "rib: the picked drop direction is parallel to the sketch normal "
+                "(it has no in-plane component to drop the rib along)")
+        perp = perp.normalized()
+        if drop_flip:
+            perp = perp * -1.0
+        t_axis = normal
+    else:
+        # Legacy inference: in-plane, perpendicular to the contour, pointing toward the body interior.
+        perp = normal.cross(cdir)
+        if perp.length < 1e-9:
+            raise FeatureError(
+                "rib: could not derive a drop direction (contour parallel to normal?)")
+        perp = perp.normalized()
+        if perp.dot(toward) < 0.0:
+            perp = perp * -1.0
+        if drop_flip:
+            perp = perp * -1.0
+        t_axis = normal
 
     diag = _body_bbox_diag(body)
     reach = diag * 1.5
 
     # Build the rib slab. For each contour edge: extrude it along the drop direction into a
-    # SILHOUETTE face (the rib's side profile, in the sketch plane), then THICKEN that face across
-    # the sketch-plane normal to `thickness`. Per-edge handling (vs one Wire) is what makes an open
+    # SILHOUETTE face (the rib's side profile, in the sketch plane), then THICKEN that face along
+    # the thickening axis to `thickness`. Per-edge handling (vs one Wire) is what makes an open
     # line OR an open line/arc chain work — `Face.extrude` accepts an Edge, not a multi-edge Wire.
     taper = draft if abs(draft) > 1e-9 else 0.0
 
     def _thicken(sil_face) -> Any:
         if side == "one":
-            tdir = normal * (-1.0 if flip else 1.0)
+            tdir = t_axis * (-1.0 if flip else 1.0)
             return b3d_extrude(sil_face, amount=thickness, dir=tdir, taper=taper, mode=Mode.PRIVATE)
         half = thickness / 2.0
-        s_fwd = b3d_extrude(sil_face, amount=half, dir=normal, taper=taper, mode=Mode.PRIVATE)
-        s_rev = b3d_extrude(sil_face, amount=half, dir=normal * -1.0, taper=taper, mode=Mode.PRIVATE)
+        s_fwd = b3d_extrude(sil_face, amount=half, dir=t_axis, taper=taper, mode=Mode.PRIVATE)
+        s_rev = b3d_extrude(sil_face, amount=half, dir=t_axis * -1.0, taper=taper, mode=Mode.PRIVATE)
         return s_fwd + s_rev
 
     slab: Any = None
@@ -247,5 +357,10 @@ def compile_rib(feat: dict, ctx: CompileContext) -> CompileOutput:
     return CompileOutput(
         bodies=bodies, tool_body=slab, op="add",
         resolved={"thickness": thickness, "draft": taper,
-                  "_rib_volume": float(new_vol - old_vol)},
+                  "_rib_volume": float(new_vol - old_vol),
+                  # Echo resolved drop direction + thicken mode so callers / tests can verify the
+                  # explicit pick was honoured (1.0 = an explicit drop dir was used).
+                  "_drop_x": float(perp.X), "_drop_y": float(perp.Y), "_drop_z": float(perp.Z),
+                  "_thicken_normal": 1.0 if thicken == "normal" else 0.0,
+                  "_drop_explicit": 1.0 if explicit is not None else 0.0},
     )

@@ -43,6 +43,7 @@ std::string appdataDir() {
     return std::string(a ? a : ".");
 }
 std::string configPath() { return appdataDir() + "\\AI-CAD\\config.json"; }
+const char* kDefaultLlamaModelPath = "%APPDATA%\\AI-CAD\\models\\model.gguf";
 
 void loadSettings(Settings& s) {
     std::ifstream f(configPath());
@@ -52,12 +53,22 @@ void loadSettings(Settings& s) {
         f >> j;
         std::string prov = j.value("provider", "anthropic");
         auto oai = j.value("openai", nlohmann::json::object());
+        auto llama = j.value("llamacpp", nlohmann::json::object());
         std::string base = oai.value("base_url", "");
         bool hasBase = !base.empty();
-        s.provider = (prov == "anthropic") ? 0 : (hasBase ? 2 : 1);
-        std::strncpy(s.model, j.value("model", "").c_str(), sizeof(s.model) - 1);
+        if (prov == "anthropic") s.provider = 0;
+        else if (prov == "llamacpp" || prov == "llama.cpp" || prov == "llama-cpp") s.provider = 3;
+        else s.provider = hasBase ? 2 : 1;
+        std::string model = j.value("model", "");
+        if (s.provider == 3) model = llama.value("model_path", model);
+        if (s.provider == 3 && model.empty()) model = kDefaultLlamaModelPath;
+        std::strncpy(s.model, model.c_str(), sizeof(s.model) - 1);
         std::strncpy(s.apiKey, j.value("api_key", "").c_str(), sizeof(s.apiKey) - 1);
-        if (hasBase) {
+        if (s.provider == 3) {
+            std::string lbase = llama.value("base_url", "http://127.0.0.1:1234/v1");
+            std::strncpy(s.baseUrl, lbase.c_str(), sizeof(s.baseUrl) - 1);
+            s.vision = llama.value("vision", false);
+        } else if (hasBase) {
             std::strncpy(s.baseUrl, base.c_str(), sizeof(s.baseUrl) - 1);
             s.vision = oai.value("vision", false);
         }
@@ -87,11 +98,20 @@ void saveSettings(const Settings& s) {
         j["provider"] = "openai";
         j["model"] = s.model[0] ? s.model : "gpt-4o";
         j["api_key"] = s.apiKey;
-    } else {
+    } else if (s.provider == 2) {
         j["provider"] = "openai";
         j["model"] = s.model;
         j["api_key"] = s.apiKey[0] ? s.apiKey : "lm-studio";
         j["openai"] = {{"base_url", s.baseUrl}, {"vision", s.vision}};
+    } else {
+        j["provider"] = "llamacpp";
+        j["model"] = "local-gguf";
+        j["llamacpp"] = {
+            {"base_url", s.baseUrl[0] ? s.baseUrl : "http://127.0.0.1:1234/v1"},
+            {"model_path", s.model[0] ? s.model : kDefaultLlamaModelPath},
+            {"auto_start", true},
+            {"vision", s.vision}
+        };
     }
     j["offline_mode"] = s.offlineMode;
     j["plan_mode"] = s.planMode;

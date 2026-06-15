@@ -638,6 +638,214 @@ def _make_bend_record(fid: str, angle_deg: float, inner_radius: float, thickness
 # Bend-record container key (shared with the edge flange + read by sheetmetal_flat).
 _BEND_KEY = "_sheet_metal_bends"
 
+# Corner-relief container key (written by the edge flange when two adjacent flanges meet at a
+# corner; read by sheetmetal_flat so the relief notch develops into the flat blank too).
+_RELIEF_KEY = "_sheet_metal_reliefs"
+
+_VALID_RELIEFS = ("rectangular", "obround", "tear", "rect", "round", "none")
+
+
+# --------------------------------------------------------------------------- corner relief
+
+
+def _shared_corner(rec_a: dict, rec_b: dict, tol: float = 1e-4) -> Vector | None:
+    """Return the shared bend-line endpoint (the inside corner) of two flanges, or ``None``.
+
+    Two adjacent edge flanges that meet at a corner have bend lines that share one endpoint. The
+    relief notch is cut at that corner so the two folded walls do not overlap/interfere."""
+    pts_a = [_pt(rec_a["bend_line"][0]), _pt(rec_a["bend_line"][1])]
+    pts_b = [_pt(rec_b["bend_line"][0]), _pt(rec_b["bend_line"][1])]
+    best = None
+    best_d = tol
+    for pa in pts_a:
+        for pb in pts_b:
+            d = (pa - pb).length
+            if d <= best_d:
+                best_d = d
+                best = (pa + pb) * 0.5
+    return best
+
+
+def _pt(seq) -> Vector:
+    return Vector(float(seq[0]), float(seq[1]), float(seq[2]))
+
+
+def _adjacent_flanges(rec_a: dict, rec_b: dict) -> bool:
+    """True when two flanges are ADJACENT (perpendicular bend lines sharing a corner).
+
+    Adjacent flanges fold off perpendicular edges of the same base region; their walls would
+    collide at the shared corner without a relief. Parallel flanges (opposite edges) never need
+    a corner relief, so we require the bend-line directions to be roughly perpendicular AND the
+    flanges to share a corner point."""
+    if _shared_corner(rec_a, rec_b) is None:
+        return False
+    ea = _pt(rec_a["e_dir"])
+    eb = _pt(rec_b["e_dir"])
+    la = ea.length
+    lb = eb.length
+    if la < 1e-9 or lb < 1e-9:
+        return False
+    ea = ea * (1.0 / la)
+    eb = eb * (1.0 / lb)
+    return abs(ea.dot(eb)) < 0.2  # ~perpendicular bend lines (< ~78° dot)
+
+
+def _relief_loop_2d(size: float, kind: str, nseg: int = 16) -> list[tuple[float, float]]:
+    """The relief-notch profile in a local 2-D frame (corner at origin, legs along +x/+y).
+
+    The notch removes a square ``size`` × ``size`` bite out of the inside corner. The three SW
+    relief styles differ in the inner shape:
+      * ``rectangular`` — a square notch (two straight legs).
+      * ``obround``     — a square whose inner corner is rounded to a semicircle (a slot end).
+      * ``tear``        — a small tear-shaped (quarter-round) relief that just clears the bends.
+    All are returned as a closed CCW polygon of ``(x, y)`` points with the open mouth along the two
+    legs meeting at the corner (origin)."""
+    kind = "rectangular" if kind == "rect" else ("obround" if kind == "round" else kind)
+    s = size
+
+    def _dedup(seq: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        out: list[tuple[float, float]] = []
+        for q in seq:
+            if not out or math.hypot(q[0] - out[-1][0], q[1] - out[-1][1]) > 1e-9:
+                out.append(q)
+        return out
+
+    if kind == "obround":
+        # Square mouth, inner corner rounded by a radius = s/2 centred at (s/2, s/2).
+        r = s / 2.0
+        cx, cy = s / 2.0, s / 2.0
+        pts: list[tuple[float, float]] = [(s, 0.0)]
+        # half arc from (s, s/2) sweeping the far rounded corner back toward (s/2, s)
+        for i in range(nseg + 1):
+            a = (-math.pi / 2.0) + math.pi * (i / nseg)  # -90° .. +90°
+            pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+        pts.append((0.0, s))
+        return _dedup(pts)
+    if kind == "tear":
+        # A quarter-round tear: arc of radius s from the corner, clipped to the two legs.
+        pts = [(s, 0.0)]
+        for i in range(nseg + 1):
+            a = (math.pi / 2.0) * (i / nseg)
+            pts.append((s * math.cos(a), s * math.sin(a)))
+        pts.append((0.0, s))
+        return _dedup(pts)
+    # rectangular (default): the square notch.
+    return [(s, 0.0), (s, s), (0.0, s)]
+
+
+def _leg_into_part(rec: dict, corner: Vector) -> Vector:
+    """Unit direction along ``rec``'s bend line, pointing AWAY from ``corner`` (into the part).
+
+    The relief notch's legs run along the two adjacent bend lines toward the shared base region, so
+    the notch removes the overlapping bend material rather than reaching outside the blank."""
+    p0 = _pt(rec["bend_line"][0])
+    p1 = _pt(rec["bend_line"][1])
+    far = p1 if (p1 - corner).length >= (p0 - corner).length else p0
+    d = far - corner
+    if d.length < 1e-9:
+        d = _pt(rec["e_dir"])
+    return d * (1.0 / max(d.length, 1e-12))
+
+
+def _relief_record(corner: Vector, rec_a: dict, rec_b: dict, size: float, kind: str) -> dict:
+    """Build a relief record: the corner point, an in-plane 2-D frame, and the notch loop.
+
+    The relief lives on the base broad plane. Its local frame ``(u, v)`` runs along the two adjacent
+    BEND LINES, pointing from the shared corner INTO the base region, so the notch's legs straddle
+    the corner where the two flanges' bend zones overlap (matching SolidWorks' corner relief).
+    """
+    u = _leg_into_part(rec_a, corner)
+    v = _leg_into_part(rec_b, corner)
+    # Drop any component of v along u so (u, v) is an orthonormal in-plane frame.
+    v = v - u * v.dot(u)
+    if v.length < 1e-9:
+        # Degenerate (parallel) — fall back to length_dir of A as the second axis.
+        v = _pt(rec_a["length_dir"])
+        v = v - u * v.dot(u)
+    v = v * (1.0 / max(v.length, 1e-12))
+    loop2d = _relief_loop_2d(size, kind)
+    loop3d = [[(corner + u * x + v * y).X, (corner + u * x + v * y).Y, (corner + u * x + v * y).Z]
+              for (x, y) in loop2d]
+    return {
+        "corner": [corner.X, corner.Y, corner.Z],
+        "u": [u.X, u.Y, u.Z],
+        "v": [v.X, v.Y, v.Z],
+        "size": size,
+        "kind": kind,
+        "loop": loop3d,
+        "features": [rec_a.get("feature", "?"), rec_b.get("feature", "?")],
+    }
+
+
+def _relief_size(thickness: float, radius: float) -> float:
+    """SW corner-relief size ≈ material thickness + bend radius (the wall footprint at the corner).
+
+    A relief must clear the bend region of BOTH adjacent walls; the inside-corner footprint each
+    wall projects onto the base is ~ (radius + thickness), so a notch of that size removes the
+    overlap. We use ``thickness + radius`` (SW's default proportional relief)."""
+    return max(thickness + radius, 1.5 * thickness)
+
+
+def _build_relief_tool(relief: dict, n_base: Vector, thickness: float) -> Solid:
+    """A through-thickness cutting tool for the relief notch (the loop prism, over-driven in ±n)."""
+    loop = [_pt(p) for p in relief["loop"]]
+    # Over-drive the cut beyond both broad faces so the boolean clears the sheet cleanly.
+    base = [p - n_base * (thickness + 1.0) for p in loop]
+    face = _make_face_from_pts(base)
+    return _prism(face, n_base * (2.0 * thickness + 2.0))
+
+
+def _apply_corner_reliefs(ctx: CompileContext, fid: str, body, new_rec: dict,
+                          kind: str) -> tuple[Any, list[dict]]:
+    """Cut a corner relief wherever the just-added flange ``new_rec`` is adjacent to an earlier one.
+
+    Returns ``(possibly-cut body, [relief records])``. A no-op (returns body unchanged + []) when
+    ``kind == 'none'`` or no adjacent flange shares a corner."""
+    if kind == "none":
+        return body, []
+    store = ctx.datums.get(_BEND_KEY)
+    prior = list(store.obj) if (store and store.obj) else []
+    # Base-plane normal from the new flange's frame (e_dir × length_dir).
+    e_dir = _pt(new_rec["e_dir"]); length_dir = _pt(new_rec["length_dir"])
+    e_dir = e_dir * (1.0 / max(e_dir.length, 1e-12))
+    length_dir = length_dir * (1.0 / max(length_dir.length, 1e-12))
+    n_base = e_dir.cross(length_dir)
+    n_base = n_base * (1.0 / max(n_base.length, 1e-12))
+    thickness = float(new_rec["thickness"])
+
+    reliefs: list[dict] = []
+    result = body
+    for other in prior:
+        if other is new_rec or other.get("feature") == new_rec.get("feature"):
+            continue
+        if not _adjacent_flanges(new_rec, other):
+            continue
+        corner = _shared_corner(new_rec, other)
+        if corner is None:
+            continue
+        size = _relief_size(thickness, max(float(new_rec["radius"]), float(other["radius"])))
+        rec = _relief_record(corner, new_rec, other, size, kind)
+        try:
+            tool = _build_relief_tool(rec, n_base, thickness)
+            cut = result - tool
+            cut = _to_solid_normalized(cut)
+            # Only keep the cut if it actually removed material (the relief overlapped the corner).
+            if getattr(cut, "volume", 0.0) < getattr(result, "volume", 0.0) - 1e-9:
+                result = cut
+                reliefs.append(rec)
+        except Exception:  # noqa: BLE001
+            # A relief that fails to build must not break the (already valid) flange.
+            continue
+    return result, reliefs
+
+
+def _append_relief_records(ctx: CompileContext, recs: list[dict]) -> None:
+    if not recs:
+        return
+    if _RELIEF_KEY not in ctx.datums:
+        ctx.datums[_RELIEF_KEY] = Datum(kind=_RELIEF_KEY, obj=[], feature_id="__sys__")
+    ctx.datums[_RELIEF_KEY].obj.extend(recs)
+
 
 # --------------------------------------------------------------------------- edge flange
 
@@ -669,6 +877,7 @@ def compile_sm_edge_flange(feat: dict, ctx: CompileContext) -> CompileOutput:
     k_factor = ctx.dim(p, "k_factor", k_default)
     position = p.get("position", "material_inside")
     flip = bool(p.get("flip", False))
+    relief_kind = p.get("corner_relief", "rectangular")
 
     if inner_radius <= 0.0:
         raise FeatureError("sm_edge_flange: bend radius must be > 0")
@@ -679,6 +888,10 @@ def compile_sm_edge_flange(feat: dict, ctx: CompileContext) -> CompileOutput:
     if position not in _VALID_POSITIONS:
         raise FeatureError(
             f"sm_edge_flange: position must be one of {_VALID_POSITIONS}"
+        )
+    if relief_kind not in _VALID_RELIEFS:
+        raise FeatureError(
+            f"sm_edge_flange: corner_relief must be one of {_VALID_RELIEFS}"
         )
 
     # Resolve the bend edge against the running body (reuse the dress-up edge resolver so
@@ -766,12 +979,6 @@ def compile_sm_edge_flange(feat: dict, ctx: CompileContext) -> CompileOutput:
             "sm_edge_flange: flange added no material (degenerate placement?)",
         )
 
-    bodies[-1] = result
-    _store_topo_owners(ctx, fid, result, target)
-
-    # Carry the sheet context forward so subsequent flanges still inherit it.
-    _set_sheet_context(ctx, fid, thickness, k_factor, radius_default)
-
     # --- bend record for the future flat pattern ---
     ba = bend_allowance(angle_deg, inner_radius, thickness, k_factor)
     bd = bend_deduction(angle_deg, inner_radius, thickness, k_factor)
@@ -797,11 +1004,27 @@ def compile_sm_edge_flange(feat: dict, ctx: CompileContext) -> CompileOutput:
         "length_dir": [length_dir.X, length_dir.Y, length_dir.Z],
         "fold_dir": [fold_dir.X, fold_dir.Y, fold_dir.Z],
     }
-    # Persist bend records on a ctx datum so the (future) flat-pattern feature can read them.
-    _BEND_KEY = "_sheet_metal_bends"
+    # --- corner relief: where this flange is ADJACENT to an earlier one (perpendicular bend lines
+    # sharing a corner), the two folded walls would overlap. Cut a relief notch at the shared corner
+    # BEFORE recording the new bend, so the prior set excludes this flange. The flat pattern reads
+    # the stored relief records and develops the same notch into the blank.
+    relief_recs: list[dict] = []
+    if relief_kind != "none":
+        result, relief_recs = _apply_corner_reliefs(ctx, fid, result, bend_record, relief_kind)
+    if getattr(result, "volume", 0.0) <= 1e-9:
+        raise FeatureError("sm_edge_flange: corner relief consumed the flange (degenerate)")
+
+    bodies[-1] = result
+    _store_topo_owners(ctx, fid, result, target)
+
+    # Carry the sheet context forward so subsequent flanges still inherit it.
+    _set_sheet_context(ctx, fid, thickness, k_factor, radius_default)
+
+    # Persist bend + relief records on ctx datums for the flat-pattern feature.
     if _BEND_KEY not in ctx.datums:
         ctx.datums[_BEND_KEY] = Datum(kind=_BEND_KEY, obj=[], feature_id="__sys__")
     ctx.datums[_BEND_KEY].obj.append(bend_record)
+    _append_relief_records(ctx, relief_recs)
 
     return CompileOutput(
         bodies=bodies, tool_body=flange, op="add",
@@ -813,6 +1036,7 @@ def compile_sm_edge_flange(feat: dict, ctx: CompileContext) -> CompileOutput:
             "bend_allowance": ba,
             "bend_deduction": bd,
             "neutral_radius": neutral_radius,
+            "corner_reliefs": float(len(relief_recs)),
             "volume": float(getattr(result, "volume", 0.0) or 0.0),
         },
     )

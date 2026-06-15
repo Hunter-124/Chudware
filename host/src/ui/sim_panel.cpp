@@ -9,6 +9,7 @@
 
 #include "imgui.h"
 
+#include "metrics.h"
 #include "../core/app_state.h"
 #include "../core/sim_client.h"
 #include "../bootstrap.h"
@@ -414,7 +415,7 @@ void SimPanel::drawStaticForm(AppState& st, Study& s) {
     ImGui::Spacing();
     bool busy = st.simClient && st.simClient->busy();
     if (busy) ImGui::BeginDisabled();
-    if (ImGui::Button("Run", ImVec2(120, 0))) runStaticOrModal(st, s);
+    if (ImGui::Button("Run", ImVec2(ui::metrics::px(120), 0))) runStaticOrModal(st, s);
     if (busy) ImGui::EndDisabled();
 
     drawResultControls(st, s);
@@ -442,7 +443,7 @@ void SimPanel::drawModalForm(AppState& st, Study& s) {
 
     bool busy = st.simClient && st.simClient->busy();
     if (busy) ImGui::BeginDisabled();
-    if (ImGui::Button("Run", ImVec2(120, 0))) runStaticOrModal(st, s);
+    if (ImGui::Button("Run", ImVec2(ui::metrics::px(120), 0))) runStaticOrModal(st, s);
     if (busy) ImGui::EndDisabled();
 
     if (s.hasResult) { ImGui::Separator(); ImGui::TextWrapped("%s", s.summary.c_str()); }
@@ -470,13 +471,13 @@ void SimPanel::drawFlowForm(AppState& st, Study& s) {
 
     bool busy = st.simClient && st.simClient->busy();
     if (busy) ImGui::BeginDisabled();
-    if (ImGui::Button("Run", ImVec2(120, 0))) runFlow(st, s);
+    if (ImGui::Button("Run", ImVec2(ui::metrics::px(120), 0))) runFlow(st, s);
     if (busy) ImGui::EndDisabled();
 
     // Live drag sparkline.
     if (!s.dragTrace.empty()) {
         ImGui::PlotLines("Drag trace", s.dragTrace.data(), (int)s.dragTrace.size(),
-                         0, nullptr, FLT_MAX, FLT_MAX, ImVec2(0, 60));
+                         0, nullptr, FLT_MAX, FLT_MAX, ImVec2(0, ui::metrics::px(60)));
     }
 
     if (s.hasResult) {

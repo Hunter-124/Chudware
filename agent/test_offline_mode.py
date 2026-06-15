@@ -8,6 +8,8 @@ Matrix:
   * offline + Anthropic cloud   -> refused (OfflineModeError naming the setting)
   * offline + OpenAI cloud      -> refused
   * offline + localhost endpoint-> allowed
+  * offline + managed llama.cpp -> allowed when pointed at loopback
+  * offline + remote llama.cpp  -> refused before provider/server construction
   * offline + remote endpoint   -> refused
   * offline OFF                  -> everything resolves as before
   * the assert_offline_safe guard refuses a non-local provider when the flag is set
@@ -53,6 +55,13 @@ def test_offline_refuses_remote_endpoint() -> None:
     print("[offline] remote endpoint refused")
 
 
+def test_offline_refuses_remote_llamacpp_before_probe() -> None:
+    _expect_refused({"offline_mode": True, "provider": "llamacpp",
+                     "llamacpp": {"base_url": "http://remote.example:1234/v1"}},
+                    "remote managed llama.cpp endpoint under offline")
+    print("[offline] remote managed llama.cpp refused before probe")
+
+
 def test_offline_allows_localhost() -> None:
     # localhost / 127.0.0.1 / ::1 are the only allowed hosts.
     for host in ("http://localhost:1234/v1", "http://127.0.0.1:5000/v1", "http://[::1]:8080/v1"):
@@ -67,6 +76,24 @@ def test_offline_allows_default_local() -> None:
     prov = config.get_provider(cfg={"offline_mode": True})
     assert config.provider_offline_safe(prov), "default local provider must be offline-safe"
     print("[offline] default local provider allowed")
+
+
+def test_offline_allows_managed_llamacpp() -> None:
+    prov = config.get_provider(cfg={
+        "offline_mode": True,
+        "provider": "llamacpp",
+        "llamacpp": {
+            "base_url": "http://127.0.0.1:1234/v1",
+            "auto_start": False,
+            "model_path": "%APPDATA%/AI-CAD/models/model.gguf",
+        },
+    })
+    assert prov.name == "llamacpp"
+    assert config.provider_offline_safe(prov), "managed llama.cpp must be offline-safe"
+    from agent.orchestrator import micro
+    assert micro.should_engage(prov, {"micro_mode": "auto"}), \
+        "managed llama.cpp should use the small-local-model path by default"
+    print("[offline] managed llama.cpp allowed")
 
 
 def test_offline_off_allows_everything() -> None:
@@ -104,8 +131,10 @@ def main() -> None:
     test_offline_refuses_cloud_anthropic()
     test_offline_refuses_cloud_openai()
     test_offline_refuses_remote_endpoint()
+    test_offline_refuses_remote_llamacpp_before_probe()
     test_offline_allows_localhost()
     test_offline_allows_default_local()
+    test_offline_allows_managed_llamacpp()
     test_offline_off_allows_everything()
     test_assert_offline_safe_guard()
     print("\nOFFLINE MODE (C35) TESTS PASSED")

@@ -39,7 +39,7 @@ namespace ui {
 //              "axis.x"/"plane.right") — for _SEL_OR_DATUM ref slots (pattern direction, mirror
 //              plane, draft neutral). FeatureWell  a list of feature ids (refs _FEAT_LIST) seeded
 //              from the FeatureManager selection — the features a pattern/mirror replicates.
-enum class PMFieldKind { Dim, SelectorWell, Combo, Check, Int, DatumRef, FeatureWell };
+enum class PMFieldKind { Dim, SelectorWell, Combo, Check, Int, DatumRef, FeatureWell, Text };
 
 // Which topology kinds a SelectorWell accepts (mirrors feature_params sel(kinds…)).
 struct PMSelKinds {
@@ -64,6 +64,9 @@ struct PMFieldDef {
     // Combo
     const char* comboOptions = nullptr;  // "boss|cut" — param values emitted to engine (first = default)
     const char* comboLabels  = nullptr;  // "Boss|Cut" — display labels; null = use comboOptions
+
+    // Text (free-form string param, e.g. pattern instances-to-skip "2:1, 3:0")
+    const char* placeholder = nullptr;   // greyed hint shown when the field is empty
 
     // Check
     bool checkDefault = false;
@@ -126,6 +129,9 @@ struct PMField {
 
     // Int (pattern counts)
     int intValue = 1;
+
+    // Text (free-form string param)
+    std::vector<char> textBuf{std::vector<char>(128, 0)};
 };
 
 // Parse a dim string to canonical units (mm; degrees when angle=true). Accepts SolidWorks-style
@@ -141,7 +147,7 @@ struct PMField {
 bool pmParseDim(const std::string& text, double& outMm, std::string& err, bool angle = false,
                 double bareLengthScale = 1.0);
 // Format a canonical mm value for display, honouring IPS when ips==true.
-std::string pmFormatDim(double mm, bool ips);
+std::string pmFormatDim(double mm, bool ips, bool angle = false);
 
 // ---- in-viewport callouts (C27-A) -----------------------------------------
 
@@ -173,6 +179,11 @@ public:
     bool openForCommand(AppState& st, const std::string& cmdId);
     // Open the form for an existing feature, populated from its params/refs (tree "Edit").
     bool openForEdit(AppState& st, const std::string& featureId);
+
+    // Headless test hook (AI_CAD_SHOT=pmform): set a field's value by key so type-gated fields
+    // can be rendered for screenshot verification. value matches a Combo option, a Check
+    // ("true"/"false"/"1"/"0"), or a Dim/Int number. No-op if no field has that key.
+    void presetFieldForShot(const std::string& key, const std::string& value);
 
     // Draw the PM panel into the dock slot (called in place of the tree while active()).
     // Compatibility wrapper: handles the dock-visible / floating-fallback Begin/End, then calls
@@ -227,7 +238,7 @@ public:
     // C43: public cancel — revert every preview batch to the open-time checkpoint and close.
     // Used by the ribbon dispatcher when a sketch command must displace an open form
     // (mutual exclusion: a PM and the plane-pick overlay must never coexist).
-    void cancelEdits(AppState& st); // Cancel: undo every preview batch
+    bool cancelEdits(AppState& st); // Cancel: undo every preview batch
 
     // C48: id of the IN-FLIGHT create-mode preview feature ("" when none / edit mode).
     // The sketch ghost renderer exempts this feature's sketch consumption so the profile
@@ -241,7 +252,7 @@ private:
     void close();
     void commit(AppState& st);     // OK
     void buildOpFeature(nlohmann::json& feature) const;   // assemble {type,name,params,refs}
-    void applyPreview(AppState& st);  // add (first) or edit_feature; debounced
+    bool applyPreview(AppState& st);  // add (first) or edit_feature; debounced
     void loadFromTree(AppState& st, const nlohmann::json& feature);  // edit-path populate
     PMField* activeWell();
     // C51: the profile/sections well (first SelectorWell keyed "profile" or "sections").
@@ -263,6 +274,7 @@ private:
     std::vector<PMField> fields_;
 
     int previewBatches_ = 0;       // preview ops applied (fallback undo count if checkpoint failed)
+    bool previewUndoGroupStarted_ = false;  // true after the first undo snapshot for this PM
     bool dirty_ = false;           // a field changed since last preview
     double lastEditTime_ = 0.0;    // ImGui::GetTime() of the last field change (debounce)
     bool firstPreviewDone_ = false;

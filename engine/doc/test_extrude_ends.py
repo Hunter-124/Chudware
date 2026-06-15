@@ -10,6 +10,17 @@ Pytest-style (also importable as plain functions). Covers:
 5. taper (draft) changes the top-face area in the right direction (inward narrows).
 6. draft_outward flips the sign (top grows).
 7. mid_plane total depth == depth (half each side).
+
+SW-parity extension (P0 "Extrude — end conditions" / docs/SW_PARITY_GAPS.md):
+8.  up_to_surface lands the profile exactly on a referenced planar face.
+9.  offset_from_surface stops a signed offset past/short of the surface.
+10. up_to_vertex lands on the plane through a referenced vertex.
+11. up_to_body passes the profile THROUGH a referenced body to its far surface.
+12. thin one-side wall = ring volume (perimeter inset by thickness).
+13. thin two-side wall straddles the loop (±½ thickness).
+14. Dir2 up_to_surface (full end-condition matrix in the second direction).
+15. merge=False makes a NEW BODY instead of fusing.
+16. up_to_surface with no body / missing target -> clean contained errors.
 """
 
 from __future__ import annotations
@@ -82,6 +93,26 @@ def _top_face_sel(owner: str, cx: float, cy: float, z: float, area: float) -> di
     return {"kind": "face", "surf": "plane", "centroid": [cx, cy, z],
             "axis": [0.0, 0.0, 1.0], "area_or_len": area,
             "owner_feature": owner, "hint_index": 0}
+
+
+def _planar_face_sel(cx: float, cy: float, z: float, area: float,
+                     axis: list | None = None) -> dict:
+    """A planar-face selector (for params.up_to / up_to2 surface targets)."""
+    return {"kind": "face", "surf": "plane", "centroid": [cx, cy, z],
+            "axis": axis or [0.0, 0.0, 1.0], "area_or_len": area,
+            "owner_feature": None, "hint_index": 0}
+
+
+def _vertex_sel(cx: float, cy: float, cz: float) -> dict:
+    """A vertex selector (for params.up_to vertex targets)."""
+    return {"kind": "vertex", "surf": None, "centroid": [cx, cy, cz],
+            "axis": None, "area_or_len": None,
+            "owner_feature": None, "hint_index": 0}
+
+
+def _z_extent(res, body_index: int = 0) -> tuple[float, float]:
+    bb = res.bodies[body_index].shape.bounding_box()
+    return bb.min.Z, bb.max.Z
 
 
 # --------------------------------------------------------------------------- test 1: up_to_next boss
@@ -314,6 +345,327 @@ def test_mid_plane_total_depth_equals_depth() -> None:
     print(f"[mid_plane] vol={vol:.1f} z-extent={z_extent:.2f} (total depth = 12)")
 
 
+# --------------------------------------------------------------------------- test 8: up_to_surface
+
+def test_up_to_surface_lands_on_face() -> None:
+    """A 40x40x20 block at z[0,20]. A 10x10 probe on a datum plane at z=40, extruded DOWN
+    (flip) with end=up_to_surface targeting the block TOP face (z=20), must land exactly on
+    z=20 — the new body spans z[20,40] (10x10x20 = 2000 mm3). merge=False keeps it separate
+    so the assert is unambiguous."""
+    doc = _doc([
+        _feat("f1", "plane", {"method": "offset", "offset": _dim(40.0)},
+              refs={"base": "plane.top"}),
+        _feat("f2", "box", {"length": _dim(40), "width": _dim(40), "height": _dim(20),
+                            "centered": False}, refs={"at": "origin"}),
+        _rect_sketch("f3", 15, 15, 10, 10, "f1"),
+        _feat("f4", "extrude", {
+            "mode": "boss", "end": "up_to_surface", "depth": _dim(1.0),
+            "flip": True, "merge": False,
+            "up_to": _planar_face_sel(20, 20, 20, 1600.0),
+        }, refs={"profile": [_region_sel("f3", 20, 20, 100.0)]}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    for fid in ("f2", "f3", "f4"):
+        s = _status(res, fid)
+        assert s["ok"], f"{fid} failed: {s['error']}"
+    assert len(res.bodies) == 2, f"merge=False should make a 2nd body; got {len(res.bodies)}"
+    # The new (probe) body is the one whose volume is ~2000.
+    vols = sorted(b.shape.volume for b in res.bodies)
+    assert abs(vols[0] - 2000.0) / 2000.0 < 0.01, \
+        f"up_to_surface probe vol {vols[0]:.1f} vs expected 2000 (should land on z=20)"
+    # resolved depth == 20 (40 - 20)
+    assert abs(_status(res, "f4")["resolved"].get("depth", 0.0) - 20.0) < 1e-3, \
+        f"resolved depth should be 20; got {_status(res, 'f4')['resolved'].get('depth')}"
+    # probe body straddles z[20,40]
+    probe = min(res.bodies, key=lambda b: b.shape.volume)
+    bb = probe.shape.bounding_box()
+    assert abs(bb.min.Z - 20.0) < 0.05 and abs(bb.max.Z - 40.0) < 0.05, \
+        f"probe should span z[20,40]; got z[{bb.min.Z:.2f},{bb.max.Z:.2f}]"
+    print(f"[up_to_surface] probe vol={vols[0]:.1f} z[{bb.min.Z:.1f},{bb.max.Z:.1f}]")
+
+
+# ----------------------------------------------------------------- test 8b: up_to_surface via refs.up_to
+
+def test_up_to_surface_via_refs_slot() -> None:
+    """Same geometry/result as test 8, but the up-to target lives in refs.up_to (the
+    schema-declared slot the host PM form fills) instead of params.up_to. refs.up_to is the
+    canonical home; params.up_to remains a back-compat fallback. The probe must still land on
+    z=20, spanning z[20,40] (vol 2000) — proving the host's refs path drives the same geometry."""
+    doc = _doc([
+        _feat("f1", "plane", {"method": "offset", "offset": _dim(40.0)},
+              refs={"base": "plane.top"}),
+        _feat("f2", "box", {"length": _dim(40), "width": _dim(40), "height": _dim(20),
+                            "centered": False}, refs={"at": "origin"}),
+        _rect_sketch("f3", 15, 15, 10, 10, "f1"),
+        _feat("f4", "extrude", {
+            "mode": "boss", "end": "up_to_surface", "depth": _dim(1.0),
+            "flip": True, "merge": False,
+        }, refs={"profile": [_region_sel("f3", 20, 20, 100.0)],
+                 "up_to": _planar_face_sel(20, 20, 20, 1600.0)}),
+    ])
+    _assert_valid(doc)  # refs.up_to must validate as a _SEL_OR_DATUM face selector
+    res = compile_document(doc)
+    s = _status(res, "f4")
+    assert s["ok"], f"up_to_surface via refs.up_to failed: {s['error']}"
+    assert len(res.bodies) == 2, f"merge=False should make a 2nd body; got {len(res.bodies)}"
+    probe = min(res.bodies, key=lambda b: b.shape.volume)
+    assert abs(probe.shape.volume - 2000.0) / 2000.0 < 0.01, \
+        f"refs.up_to probe vol {probe.shape.volume:.1f} vs expected 2000 (should land on z=20)"
+    bb = probe.shape.bounding_box()
+    assert abs(bb.min.Z - 20.0) < 0.05 and abs(bb.max.Z - 40.0) < 0.05, \
+        f"probe should span z[20,40]; got z[{bb.min.Z:.2f},{bb.max.Z:.2f}]"
+    print(f"[up_to_surface-refs] probe vol={probe.shape.volume:.1f} z[{bb.min.Z:.1f},{bb.max.Z:.1f}]")
+
+
+# --------------------------------------------------------------------------- test 9: offset_from_surface
+
+def test_offset_from_surface_stops_past_face() -> None:
+    """Same geometry as test 8 but end=offset_from_surface with offset=+5 — the probe stops
+    5 mm PAST the surface (z=20) along the (downward) direction, i.e. at z=15. Span z[15,40]
+    = 25 mm, volume 10x10x25 = 2500."""
+    doc = _doc([
+        _feat("f1", "plane", {"method": "offset", "offset": _dim(40.0)},
+              refs={"base": "plane.top"}),
+        _feat("f2", "box", {"length": _dim(40), "width": _dim(40), "height": _dim(20),
+                            "centered": False}, refs={"at": "origin"}),
+        _rect_sketch("f3", 15, 15, 10, 10, "f1"),
+        _feat("f4", "extrude", {
+            "mode": "boss", "end": "offset_from_surface", "depth": _dim(1.0),
+            "offset": _dim(5.0), "flip": True, "merge": False,
+            "up_to": _planar_face_sel(20, 20, 20, 1600.0),
+        }, refs={"profile": [_region_sel("f3", 20, 20, 100.0)]}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f4")
+    assert s["ok"], f"offset_from_surface failed: {s['error']}"
+    probe = min(res.bodies, key=lambda b: b.shape.volume)
+    vol = probe.shape.volume
+    assert abs(vol - 2500.0) / 2500.0 < 0.01, \
+        f"offset_from_surface vol {vol:.1f} vs expected 2500 (20mm + 5mm offset)"
+    bb = probe.shape.bounding_box()
+    assert abs(bb.min.Z - 15.0) < 0.05, \
+        f"offset should reach z=15 (5mm past z=20); got zmin={bb.min.Z:.2f}"
+    assert abs(s["resolved"].get("offset", 0.0) - 5.0) < 1e-6, "resolved.offset should be 5"
+    # offset_from_surface must differ from plain up_to_surface (which would stop at z=20).
+    assert bb.min.Z < 20.0 - 1e-3, "offset must push past the surface"
+    print(f"[offset_from_surface] vol={vol:.1f} zmin={bb.min.Z:.1f} (5mm past z=20)")
+
+
+# --------------------------------------------------------------------------- test 10: up_to_vertex
+
+def test_up_to_vertex_lands_on_vertex_plane() -> None:
+    """A 40x40x25 block has top corner vertices at z=25. A 10x10 probe on plane.top (z=0)
+    extruded UP with end=up_to_vertex targeting a top vertex (0,0,25) lands on the plane
+    z=25 — volume 10x10x25 = 2500."""
+    doc = _doc([
+        _feat("f2", "box", {"length": _dim(40), "width": _dim(40), "height": _dim(25),
+                            "centered": False}, refs={"at": "origin"}),
+        _rect_sketch("f3", 15, 15, 10, 10, "plane.top"),
+        _feat("f4", "extrude", {
+            "mode": "boss", "end": "up_to_vertex", "depth": _dim(1.0),
+            "flip": False, "merge": False,
+            "up_to": _vertex_sel(0, 0, 25),
+        }, refs={"profile": [_region_sel("f3", 20, 20, 100.0)]}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f4")
+    assert s["ok"], f"up_to_vertex failed: {s['error']}"
+    probe = min(res.bodies, key=lambda b: b.shape.volume)
+    vol = probe.shape.volume
+    assert abs(vol - 2500.0) / 2500.0 < 0.01, \
+        f"up_to_vertex vol {vol:.1f} vs expected 2500"
+    bb = probe.shape.bounding_box()
+    assert abs(bb.max.Z - 25.0) < 0.05, f"probe top should reach z=25; got {bb.max.Z:.2f}"
+    assert abs(s["resolved"].get("depth", 0.0) - 25.0) < 1e-3, "resolved depth should be 25"
+    print(f"[up_to_vertex] vol={vol:.1f} top z={bb.max.Z:.1f}")
+
+
+# --------------------------------------------------------------------------- test 11: up_to_body
+
+def test_up_to_body_passes_through_body() -> None:
+    """A 40x40x20 block sits at z[10,30] (built on a datum at z=10). A 10x10 probe on
+    plane.top (z=0) extruded UP with end=up_to_body passes THROUGH the block to its far
+    surface (z=30) — span z[0,30], volume 10x10x30 = 3000. This is distinct from up_to_next,
+    which would stop at the NEAR surface z=10 (vol 1000)."""
+    doc = _doc([
+        _feat("f1", "plane", {"method": "offset", "offset": _dim(10.0)},
+              refs={"base": "plane.top"}),
+        _feat("f2", "box", {"length": _dim(40), "width": _dim(40), "height": _dim(20),
+                            "centered": False}, refs={"at": "f1"}),
+        _rect_sketch("f3", 15, 15, 10, 10, "plane.top"),
+        _feat("f4", "extrude", {
+            "mode": "boss", "end": "up_to_body", "depth": _dim(1.0),
+            "flip": False, "merge": False,
+        }, refs={"profile": [_region_sel("f3", 20, 20, 100.0)]}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f4")
+    assert s["ok"], f"up_to_body failed: {s['error']}"
+    probe = min(res.bodies, key=lambda b: b.shape.volume)
+    vol = probe.shape.volume
+    assert abs(vol - 3000.0) / 3000.0 < 0.02, \
+        f"up_to_body vol {vol:.1f} vs expected 3000 (passes through to z=30)"
+    bb = probe.shape.bounding_box()
+    assert abs(bb.max.Z - 30.0) < 0.1, f"probe should reach the far surface z=30; got {bb.max.Z:.2f}"
+    # Must reach BEYOND the near surface (z=10) — otherwise it's up_to_next, not up_to_body.
+    assert bb.max.Z > 10.0 + 1e-3, "up_to_body must pass the near surface"
+    print(f"[up_to_body] vol={vol:.1f} top z={bb.max.Z:.1f} (through to far surface)")
+
+
+# --------------------------------------------------------------------------- test 12/13: thin feature
+
+def test_thin_one_side_ring_volume() -> None:
+    """Thin extrude, one-side (inside) wall: a 20x20 profile with thin_thickness=2 extruded
+    blind 10 -> a square tube. Wall = 20x20 outer minus 16x16 inner = 144 mm2 * 10 = 1440."""
+    doc = _doc([
+        _rect_sketch("f1", 0, 0, 20, 20, "plane.top"),
+        _feat("f2", "extrude", {
+            "mode": "boss", "end": "blind", "depth": _dim(10.0),
+            "thin": True, "thin_thickness": _dim(2.0), "thin_side": "one",
+            "flip": False, "merge": True,
+        }, refs={"profile": [_region_sel("f1", 10, 10, 400.0)]}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f2")
+    assert s["ok"], f"thin one-side failed: {s['error']}"
+    vol = res.bodies[0].shape.volume
+    expected = (20.0 * 20.0 - 16.0 * 16.0) * 10.0  # 144 * 10 = 1440
+    assert abs(vol - expected) / expected < 0.02, \
+        f"thin one-side vol {vol:.1f} vs expected {expected}"
+    # A thin wall removes material vs a solid extrude (4000) — the defining property.
+    assert vol < 4000.0 * 0.9, "thin wall must be much less than a solid extrude"
+    assert abs(s["resolved"].get("thin_thickness", 0.0) - 2.0) < 1e-6
+    print(f"[thin-one] vol={vol:.1f} (expected {expected}, solid would be 4000)")
+
+
+def test_thin_two_side_straddles_loop() -> None:
+    """Thin extrude, two-side wall: thickness=2 straddles the 20x20 loop (±1) -> outer 22x22,
+    inner 18x18, ring 22^2-18^2 = 160 * 10 = 1600. The outer footprint grows to 22x22, which
+    a one-side (inside) wall never does — the discriminating check."""
+    doc = _doc([
+        _rect_sketch("f1", 0, 0, 20, 20, "plane.top"),
+        _feat("f2", "extrude", {
+            "mode": "boss", "end": "blind", "depth": _dim(10.0),
+            "thin": True, "thin_thickness": _dim(2.0), "thin_side": "two",
+            "flip": False, "merge": True,
+        }, refs={"profile": [_region_sel("f1", 10, 10, 400.0)]}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f2")
+    assert s["ok"], f"thin two-side failed: {s['error']}"
+    vol = res.bodies[0].shape.volume
+    expected = (22.0 * 22.0 - 18.0 * 18.0) * 10.0  # 160 * 10 = 1600
+    assert abs(vol - expected) / expected < 0.02, \
+        f"thin two-side vol {vol:.1f} vs expected {expected}"
+    # Two-side grows the outer footprint to 22x22 (straddles ±1).
+    bb = res.bodies[0].shape.bounding_box()
+    assert abs((bb.max.X - bb.min.X) - 22.0) < 0.1, \
+        f"two-side outer width should be 22; got {bb.max.X - bb.min.X:.2f}"
+    print(f"[thin-two] vol={vol:.1f} outer width={bb.max.X - bb.min.X:.1f} (expected {expected})")
+
+
+# --------------------------------------------------------------------------- test 14: Dir2 surface
+
+def test_dir2_up_to_surface_full_matrix() -> None:
+    """The full end-condition matrix in Direction 2: Dir1 blind +5 (up to z=5), Dir2
+    up_to_surface DOWN onto a block top face at z=-10. Result spans z[-10,5] = 15 mm,
+    volume 10x10x15 = 1500. The block sits below at z[-30,-10] so the probe never fuses with
+    it (merge=False)."""
+    doc = _doc([
+        _feat("f1", "plane", {"method": "offset", "offset": _dim(-10.0)},
+              refs={"base": "plane.top"}),
+        _feat("f2", "box", {"length": _dim(40), "width": _dim(40), "height": _dim(20),
+                            "centered": False, "flip": True}, refs={"at": "f1"}),
+        _rect_sketch("f3", 15, 15, 10, 10, "plane.top"),
+        _feat("f4", "extrude", {
+            "mode": "boss", "end": "blind", "depth": _dim(5.0),
+            "end2": "up_to_surface", "depth2": _dim(1.0), "merge": False,
+            "up_to2": _planar_face_sel(20, 20, -10, 1600.0),
+        }, refs={"profile": [_region_sel("f3", 20, 20, 100.0)]}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    s = _status(res, "f4")
+    assert s["ok"], f"Dir2 up_to_surface failed: {s['error']}"
+    probe = min(res.bodies, key=lambda b: b.shape.volume)
+    vol = probe.shape.volume
+    assert abs(vol - 1500.0) / 1500.0 < 0.02, \
+        f"Dir2 up_to_surface vol {vol:.1f} vs expected 1500"
+    bb = probe.shape.bounding_box()
+    assert abs(bb.min.Z + 10.0) < 0.05 and abs(bb.max.Z - 5.0) < 0.05, \
+        f"probe should span z[-10,5]; got z[{bb.min.Z:.2f},{bb.max.Z:.2f}]"
+    assert abs(s["resolved"].get("depth2", 0.0) - 10.0) < 1e-3, \
+        f"resolved.depth2 should be 10; got {s['resolved'].get('depth2')}"
+    print(f"[dir2-surface] vol={vol:.1f} z[{bb.min.Z:.1f},{bb.max.Z:.1f}]")
+
+
+# --------------------------------------------------------------------------- test 15: new body
+
+def test_merge_false_makes_new_body() -> None:
+    """A base box + a non-overlapping blind boss with merge=False yields TWO bodies (the
+    boss is a New Body, not fused). With merge=True (and overlap) it would be one body."""
+    doc = _doc([
+        _feat("f1", "box", {"length": _dim(20), "width": _dim(20), "height": _dim(10),
+                            "centered": False}, refs={"at": "origin"}),
+        _rect_sketch("f2", 0, 0, 20, 20, "plane.top"),  # same footprint, would overlap
+        _feat("f3", "extrude", {
+            "mode": "boss", "end": "blind", "depth": _dim(10.0),
+            "flip": False, "merge": False,
+        }, refs={"profile": [_region_sel("f2", 10, 10, 400.0)]}),
+    ])
+    _assert_valid(doc)
+    res = compile_document(doc)
+    assert _status(res, "f3")["ok"], f"new-body extrude failed: {_status(res, 'f3')['error']}"
+    assert len(res.bodies) == 2, \
+        f"merge=False should yield 2 bodies; got {len(res.bodies)}"
+    # The op is still 'add' (it appends a body), and the new body is the 4000-volume boss.
+    vols = sorted(b.shape.volume for b in res.bodies)
+    assert abs(vols[1] - 4000.0) < 1.0, f"new body should be 4000; got {vols[1]:.1f}"
+    print(f"[new-body] {len(res.bodies)} bodies, vols={[round(v,1) for v in vols]}")
+
+
+# --------------------------------------------------------------------------- test 16: errors
+
+def test_up_to_surface_requires_body_and_target() -> None:
+    """up_to_surface with no body -> clean error; and with a body but no params.up_to ->
+    clean 'needs a target' error. Both contained (ok:false), never crashing the rebuild."""
+    # (a) no body
+    doc_a = _doc([
+        _rect_sketch("f1", 0, 0, 20, 20, "plane.top"),
+        _feat("f2", "extrude", {
+            "mode": "boss", "end": "up_to_surface", "depth": _dim(10.0),
+            "up_to": _planar_face_sel(10, 10, 30, 400.0),
+        }, refs={"profile": [_region_sel("f1", 10, 10, 400.0)]}),
+    ])
+    _assert_valid(doc_a)
+    res_a = compile_document(doc_a)
+    s_a = _status(res_a, "f2")
+    assert not s_a["ok"], "up_to_surface with no body should fail"
+    assert "requires an existing body" in s_a["error"], f"got: {s_a['error']}"
+
+    # (b) body present, but no up_to target
+    doc_b = _doc([
+        _feat("f0", "box", {"length": _dim(40), "width": _dim(40), "height": _dim(20),
+                            "centered": False}, refs={"at": "origin"}),
+        _rect_sketch("f1", 60, 60, 20, 20, "plane.top"),  # off to the side
+        _feat("f2", "extrude", {
+            "mode": "boss", "end": "up_to_surface", "depth": _dim(10.0),
+        }, refs={"profile": [_region_sel("f1", 70, 70, 400.0)]}),
+    ])
+    _assert_valid(doc_b)
+    res_b = compile_document(doc_b)
+    s_b = _status(res_b, "f2")
+    assert not s_b["ok"], "up_to_surface with no target should fail"
+    assert "needs a target" in s_b["error"], f"got: {s_b['error']}"
+    print(f"[up_to_surface-errors] no-body + no-target both clean")
+
+
 # --------------------------------------------------------------------------- main
 
 def main() -> None:
@@ -324,6 +676,15 @@ def main() -> None:
     test_taper_inward_narrows_top()
     test_taper_outward_grows_top()
     test_mid_plane_total_depth_equals_depth()
+    test_up_to_surface_lands_on_face()
+    test_offset_from_surface_stops_past_face()
+    test_up_to_vertex_lands_on_vertex_plane()
+    test_up_to_body_passes_through_body()
+    test_thin_one_side_ring_volume()
+    test_thin_two_side_straddles_loop()
+    test_dir2_up_to_surface_full_matrix()
+    test_merge_false_makes_new_body()
+    test_up_to_surface_requires_body_and_target()
     print("\nEXTRUDE-ENDS TESTS PASSED")
 
 

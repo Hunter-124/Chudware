@@ -47,6 +47,14 @@ static PMFieldDef ComboL(const char* key, const char* label, const char* group,
     PMFieldDef f = Combo(key, label, group, options);
     f.comboLabels = labels; return f;
 }
+// ComboL enabled only when a sibling field (named enableKey) holds one of enableVals — works
+// against a sibling combo OR a checkbox ("true"/"false"), via fieldEnabled/enableSourceValue.
+static PMFieldDef ComboLIf(const char* key, const char* label, const char* group,
+                           const char* options, const char* labels,
+                           const char* enableKey, const char* enableVals) {
+    PMFieldDef f = ComboL(key, label, group, options, labels);
+    f.enableKey = enableKey; f.enableVals = enableVals; return f;
+}
 static PMFieldDef Check(const char* key, const char* label, const char* group, bool def) {
     PMFieldDef f; f.kind = PMFieldKind::Check; f.key = key; f.label = label;
     f.group = group; f.checkDefault = def; return f;
@@ -56,6 +64,12 @@ static PMFieldDef Int(const char* key, const char* label, const char* group, dou
     PMFieldDef f; f.kind = PMFieldKind::Int; f.key = key; f.label = label;
     f.group = group; f.dimDefault = def; f.unitLabel = ""; return f;
 }
+// Free-form text param (e.g. pattern instances-to-skip "2:1, 3:0"). Emitted only when non-empty.
+static PMFieldDef Text(const char* key, const char* label, const char* group,
+                       const char* placeholder = nullptr) {
+    PMFieldDef f; f.kind = PMFieldKind::Text; f.key = key; f.label = label;
+    f.group = group; f.placeholder = placeholder; return f;
+}
 // Unitless Dim (real-valued, no "[mm]" suffix) — e.g. sheet-metal k-factor in 0..1.
 static PMFieldDef DimU(const char* key, const char* label, const char* group, double def) {
     PMFieldDef f = Dim(key, label, group, def); f.unitLabel = ""; return f;
@@ -64,11 +78,13 @@ static PMFieldDef DimU(const char* key, const char* label, const char* group, do
 static PMFieldDef Angle(const char* key, const char* label, const char* group, double def) {
     PMFieldDef f = Dim(key, label, group, def); f.unitLabel = " [deg]"; return f;
 }
-// Angle dim enabled only when a sibling Combo (named enableKey) holds one of enableVals.
+// Angle dim enabled only when a sibling field (named enableKey) holds one of enableVals.
+// omit=true drops the param entirely while disabled (so it can't drive an engine code path —
+// e.g. a stale chamfer angle must NOT force the distance-angle path on a symmetric chamfer).
 static PMFieldDef AngleIf(const char* key, const char* label, const char* group, double def,
-                          const char* enableKey, const char* enableVals) {
+                          const char* enableKey, const char* enableVals, bool omit = false) {
     PMFieldDef f = Angle(key, label, group, def);
-    f.enableKey = enableKey; f.enableVals = enableVals; return f;
+    f.enableKey = enableKey; f.enableVals = enableVals; f.omitWhenDisabled = omit; return f;
 }
 // A datum-reference combo whose chosen value is emitted as a refs string ("axis.x"/"plane.right").
 // For _SEL_OR_DATUM slots (pattern direction, mirror plane, draft neutral plane).
@@ -124,35 +140,66 @@ static const std::vector<PMFormDef>& forms() {
             Check ("centered", "Centered", "Cylinder", true),
         }},
         // --- extrude ---  mode/end/depth/flip/draft/draft_outward/merge ; profile[]
-        //   Direction 2: end2 / depth2 (C26-B engine; UI ready, errors gracefully before merge)
+        //   Direction 2: end2 / depth2. Geometry-driven ends (up_to_surface/offset_from_surface/
+        //   up_to_body/up_to_vertex) read a face/vertex/body target from refs.up_to(2) — the
+        //   "Up To" well (K_FACEVERT) gated on those ends; offset_from_surface adds an Offset dim.
+        //   Thin Feature (params.thin/thin_thickness/thin_side) extrudes a wall instead of a solid.
         { "extrude", "Extrude", "extrude_boss", {
             Well      ("profile",  "Profile",         "From",        K_FACE, true),
             ComboL    ("mode",     "Type",            "Direction 1", "boss|cut",
                                                                      "Boss|Cut"),
             ComboL    ("end",      "End Condition",   "Direction 1",
-                       "blind|mid_plane|through_all|up_to_next",
-                       "Blind|Mid Plane|Through All|Up To Next"),
+                       "blind|mid_plane|through_all|up_to_next|up_to_surface|offset_from_surface|up_to_body|up_to_vertex",
+                       "Blind|Mid Plane|Through All|Up To Next|Up To Surface|Offset From Surface|Up To Body|Up To Vertex"),
             DimIf     ("depth",    "Depth",           "Direction 1", 10.0,
                        "end", "blind|mid_plane"),
+            WellIf    ("up_to",    "Up To Reference", "Direction 1", K_FACEVERT, false,
+                       "end", "up_to_surface|offset_from_surface|up_to_body|up_to_vertex"),
+            DimIf     ("offset",   "Offset",          "Direction 1", 0.0,
+                       "end", "offset_from_surface"),
             Check     ("flip",     "Reverse direction","Direction 1", false),
-            Dim       ("draft",    "Draft angle",     "Direction 1", 0.0),
+            Angle     ("draft",    "Draft angle",     "Direction 1", 0.0),
             Check     ("draft_outward", "Draft outward","Direction 1", false),
             ComboL    ("end2",     "End Condition",   "Direction 2",
-                       "none|blind|through_all|up_to_next",
-                       "None|Blind|Through All|Up To Next"),
+                       "none|blind|through_all|up_to_next|up_to_surface|offset_from_surface|up_to_body|up_to_vertex",
+                       "None|Blind|Through All|Up To Next|Up To Surface|Offset From Surface|Up To Body|Up To Vertex"),
             DimIf     ("depth2",   "Depth",           "Direction 2", 10.0,
                        "end2", "blind"),
+            WellIf    ("up_to2",   "Up To Reference", "Direction 2", K_FACEVERT, false,
+                       "end2", "up_to_surface|offset_from_surface|up_to_body|up_to_vertex"),
+            DimIf     ("offset2",  "Offset",          "Direction 2", 0.0,
+                       "end2", "offset_from_surface"),
+            Check     ("thin",         "Thin Feature",  "Thin Feature", false),
+            DimIf     ("thin_thickness","Wall thickness","Thin Feature", 2.0,
+                       "thin", "true"),
+            ComboLIf  ("thin_side", "Wall side",       "Thin Feature",
+                       "one|two|mid", "One Direction|Two Directions|Mid-Plane",
+                       "thin", "true"),
             Check     ("merge",    "Merge result",    "Options",      true),
         }},
-        // --- revolve ---  mode/angle/flip/merge ; profile[]/axis
-        //   Engine (revolve.py): mode, angle, flip, merge — all exposed. No mid-plane in engine.
+        // --- revolve ---  mode/end/angle/flip/dir2/angle2/thin ; profile[]/axis
+        //   Engine (revolve.py): end one_direction|mid_plane|up_to_surface (up_to auto-trims to the
+        //   body, no target ref); Dir2 (params.dir2 + angle2 — angle2 omitWhenDisabled so it can't
+        //   force dir2 on); Thin Feature (thin/thin_thickness/thin_side inside|outside|both).
         { "revolve", "Revolve", "revolve_boss", {
-            Well  ("profile",  "Profile",        "From",      K_FACE, true),
-            Well  ("axis",     "Axis",           "From",      K_EDGE, false),
-            Combo ("mode",     "Type",           "Direction", "boss|cut"),
-            Dim   ("angle",    "Angle",          "Direction", 360.0),
-            Check ("flip",     "Reverse direction", "Direction", false),
-            Check ("merge",    "Merge result",   "Options",   true),
+            Well   ("profile",  "Profile",        "From",        K_FACE, true),
+            Well   ("axis",     "Axis",           "From",        K_EDGE, false),
+            ComboL ("mode",     "Type",           "Direction 1", "boss|cut", "Boss|Cut"),
+            ComboL ("end",      "End Condition",  "Direction 1",
+                    "one_direction|mid_plane|up_to_surface",
+                    "One Direction|Mid Plane|Up To Surface"),
+            AngleIf("angle",    "Angle",          "Direction 1", 360.0,
+                    "end", "one_direction|mid_plane"),
+            Check  ("flip",     "Reverse direction", "Direction 1", false),
+            Check  ("dir2",     "Direction 2",    "Direction 2", false),
+            AngleIf("angle2",   "Angle",          "Direction 2", 360.0,
+                    "dir2", "true", /*omit=*/true),
+            Check  ("thin",         "Thin Feature",  "Thin Feature", false),
+            DimIf  ("thin_thickness","Wall thickness","Thin Feature", 2.0,
+                    "thin", "true"),
+            ComboLIf("thin_side", "Wall side",      "Thin Feature",
+                    "inside|outside|both", "Inside|Outside|Both", "thin", "true"),
+            Check  ("merge",    "Merge result",   "Options",     true),
         }},
         // --- sweep ---  mode/merge ; profile[] (region) + path (sketch chain or model edge)
         //   Engine (sweep.py): profile resolves like extrude (whole-sketch/index/centroid region or
@@ -161,13 +208,27 @@ static const std::vector<PMFormDef>& forms() {
         { "sweep", "Sweep", "sweep", {
             Well      ("profile", "Profile",      "Profile and Path", K_FACE, true),
             Well      ("path",    "Path",         "Profile and Path", K_EDGE, false),
+            Well      ("guides",  "Guide Curves", "Guide Curves",     K_EDGE, true),
+            ComboL    ("orientation", "Profile Orientation", "Options",
+                       "follow_path|frenet|keep_normal",
+                       "Follow Path|Frenet|Keep Normal"),
+            DimU      ("twist_turns",   "Twist (turns)",   "Options", 0.0),
+            Angle     ("twist_degrees", "Twist (degrees)", "Options", 0.0),
             ComboL    ("mode",    "Type",         "Options", "boss|cut", "Boss|Cut"),
             Check     ("merge",   "Merge result", "Options", true),
         }},
         // --- loft ---  mode/ruled/merge ; sections[] (>=2 ordered region selectors)
         //   Engine (loft.py): ThruSections through each section's outer wire, in list order.
         { "loft", "Loft", "loft", {
-            Well      ("sections","Profiles",     "Profiles", K_FACE, true),
+            Well      ("sections",  "Profiles",     "Profiles", K_FACE, true),
+            Well      ("centerline","Centerline",   "Centerline", K_EDGE, false),
+            Well      ("guides",    "Guide Curves", "Guide Curves", K_EDGE, true),
+            ComboL    ("tangency_start", "Start Constraint", "Tangency",
+                       "none|normal|tangent|curvature",
+                       "None|Normal To Profile|Tangent To Section|Curvature"),
+            ComboL    ("tangency_end",   "End Constraint",   "Tangency",
+                       "none|normal|tangent|curvature",
+                       "None|Normal To Profile|Tangent To Section|Curvature"),
             ComboL    ("mode",    "Type",         "Options", "boss|cut", "Boss|Cut"),
             Check     ("ruled",   "Ruled (straight transitions)", "Options", false),
             Check     ("merge",   "Merge result", "Options", true),
@@ -181,32 +242,48 @@ static const std::vector<PMFormDef>& forms() {
         //   "Middle Face" face well; the type combo also emits params.full_round=true (the engine
         //   reads params.full_round + refs.middle_face, ignoring edges/radius on that path).
         //   tangent_prop remains disabled "(coming soon)" for discoverability.
+        //   Face fillet (type=="face"): a rolling-ball blend between two face sets
+        //   (refs.face_set_a / face_set_b); the engine dispatches on type=="face". Tangent
+        //   propagation (params.tangent_propagation) auto-includes G1-continuous edges.
         { "fillet", "Fillet", "fillet", {
             WellIf    ("edges",      "Edges",              "Items to Fillet",    K_EDGE, true,
                        "type", "constant|variable"),
             WellIf    ("middle_face","Middle Face",        "Items to Fillet",    K_FACE, false,
                        "type", "full_round"),
+            WellIf    ("face_set_a", "Face Set 1",         "Items to Fillet",    K_FACE, true,
+                       "type", "face"),
+            WellIf    ("face_set_b", "Face Set 2",         "Items to Fillet",    K_FACE, true,
+                       "type", "face"),
             ComboL    ("type",       "Fillet Type",        "Fillet Parameters",
-                       "constant|variable|full_round",
-                       "Constant Size|Variable Size|Full Round"),
+                       "constant|variable|full_round|face",
+                       "Constant Size|Variable Size|Full Round|Face Fillet"),
             DimIf     ("radius",     "Radius",             "Fillet Parameters",  2.0,
-                       "type", "constant|variable"),
+                       "type", "constant|variable|face"),
             DimIf     ("radius2",    "End Radius",         "Fillet Parameters",  2.0,
                        "type", "variable"),
-            CheckSoon ("tangent_prop","Tangent propagation (coming soon)", "Fillet Parameters"),
+            Check     ("tangent_propagation","Tangent propagation","Fillet Parameters", false),
         }},
-        // --- chamfer ---  length / [length2] ; edges[]
-        //   C27-C: asymmetric chamfer. A Combo "kind" (symmetric|asymmetric) gates length2 via
-        //   the existing DimIf/enableKey mechanism — the only gating plumbing in this form system.
-        //   (Check has no gating constructor; a 2-entry Combo is the cleanest existing fit.)
-        //   Engine ignores "kind" param; length2=0/absent => symmetric path in dress.py.
+        // --- chamfer ---  length / [length2 | angle] ; edges[] | vertices[]
+        //   A single "type" combo (symmetric|asymmetric|distance_angle|vertex) drives which
+        //   fields show AND which dress.py path runs: type=="vertex" -> vertex chamfer
+        //   (refs.vertices); angle>0 -> distance-angle (refs.reference_face optional); length2>0
+        //   -> asymmetric; else symmetric. The path-selecting params (length2/angle) are
+        //   omitWhenDisabled so a stale value can't force the wrong path.
         { "chamfer", "Chamfer", "chamfer", {
-            Well    ("edges",    "Edges",                       "Items to Chamfer",   K_EDGE, true),
-            Dim     ("length",   "Distance",                    "Chamfer Parameters", 1.0),
-            ComboL  ("kind",     "Chamfer Type",                "Chamfer Parameters",
-                     "symmetric|asymmetric", "Symmetric|Asymmetric"),
-            DimIf   ("length2",  "Distance 2",                  "Chamfer Parameters", 1.0,
-                     "kind", "asymmetric"),
+            WellIf  ("edges",    "Edges",            "Items to Chamfer", K_EDGE, true,
+                     "type", "symmetric|asymmetric|distance_angle"),
+            WellIf  ("vertices", "Vertices",         "Items to Chamfer", K_VERTEX, true,
+                     "type", "vertex"),
+            ComboL  ("type",     "Chamfer Type",     "Chamfer Parameters",
+                     "symmetric|asymmetric|distance_angle|vertex",
+                     "Distance (Symmetric)|Distance (Asymmetric)|Angle-Distance|Vertex"),
+            Dim     ("length",   "Distance",         "Chamfer Parameters", 1.0),
+            DimIf   ("length2",  "Distance 2",       "Chamfer Parameters", 1.0,
+                     "type", "asymmetric", /*omit=*/true),
+            AngleIf ("angle",    "Angle",            "Chamfer Parameters", 45.0,
+                     "type", "distance_angle", /*omit=*/true),
+            WellIf  ("reference_face","Reference Face","Chamfer Parameters", K_FACE, false,
+                     "type", "distance_angle"),
         }},
         // --- shell ---  thickness/outward ; remove[]
         { "shell", "Shell", "shell", {
@@ -228,8 +305,12 @@ static const std::vector<PMFormDef>& forms() {
             ComboL  ("style",    "Type",             "Hole Type",
                      "simple|cbore|csink|tap", "Simple|Counterbore|Countersink|Tapped"),
             ComboL  ("standard", "Size",             "Hole Type",
-                     "M2|M2.5|M3|M4|M5|M6|M8|M10|M12|custom",
-                     "M2|M2.5|M3|M4|M5|M6|M8|M10|M12|Custom"),
+                     "M2|M2.5|M3|M4|M5|M6|M8|M10|M12|"
+                     "#4-40|#6-32|#8-32|#10-24|#10-32|1/4-20|1/4-28|5/16-18|3/8-16|1/2-13|"
+                     "NPT1/8|NPT1/4|NPT1/2|custom",
+                     "M2|M2.5|M3|M4|M5|M6|M8|M10|M12|"
+                     "#4-40 UNC|#6-32 UNC|#8-32 UNC|#10-24 UNC|#10-32 UNF|1/4-20 UNC|1/4-28 UNF|"
+                     "5/16-18 UNC|3/8-16 UNC|1/2-13 UNC|NPT 1/8|NPT 1/4|NPT 1/2|Custom"),
             DimIf   ("diameter", "Diameter",         "Hole Type", 6.6, "standard", "custom", true),
             AngleIf ("csink_angle", "C'Sink Angle",  "Hole Type", 90.0, "style", "csink"),
             ComboL  ("end",      "End Condition",    "End Condition",
@@ -249,6 +330,8 @@ static const std::vector<PMFormDef>& forms() {
                       "plane.right|plane.front|plane.top",
                       "Right plane|Front plane|Top plane"),
             FeatWell ("features", "Features to Mirror", "Features to Mirror"),
+            Well     ("bodies",   "Bodies to Mirror",   "Bodies to Mirror", K_BODY, true),
+            Check    ("merge",    "Merge result",       "Options", true),
         }},
         // --- linear_pattern ---  dir1(+count/spacing), optional dir2, features[]
         //   Engine (pattern.py compile_linear_pattern): lays down a count1×count2 grid of the seed
@@ -269,6 +352,8 @@ static const std::vector<PMFormDef>& forms() {
             Int      ("count2",   "Instances",    "Direction 2", 1),
             Dim      ("spacing2", "Spacing",      "Direction 2", 20.0),
             FeatWell ("features", "Features to Pattern", "Features to Pattern"),
+            Text     ("skip",     "Instances to skip", "Instances to Skip",
+                      "grid cells i:j or indices, e.g. 2:1, 3:0"),
         }},
         // --- circular_pattern ---  axis + count/angle + equal_spacing, features[]
         //   Engine (pattern.py compile_circular_pattern): count instances about the axis; equal
@@ -281,16 +366,25 @@ static const std::vector<PMFormDef>& forms() {
             Angle    ("angle",    "Angle",        "Parameters", 360.0),
             Check    ("equal_spacing", "Equal spacing", "Parameters", true),
             FeatWell ("features", "Features to Pattern", "Features to Pattern"),
+            Text     ("skip",     "Instances to skip", "Instances to Skip",
+                      "ring indices (0=seed), e.g. 1, 3, 5"),
         }},
         // --- draft ---  angle + neutral plane + faces[]
         //   Engine (draft.py): tapers each selected face about the line where it meets the neutral
         //   plane (OCCT DraftAngle). Pull direction defaults to the neutral plane normal.
+        //   mode (neutral_plane|parting_line|step): parting/step split each drafted face along a
+        //   parting line (refs.parting edges, gated on those modes) and taper the halves oppositely.
         { "draft", "Draft", "draft", {
+            ComboL   ("mode",    "Draft Type",    "Draft",
+                      "neutral_plane|parting_line|step",
+                      "Neutral Plane|Parting Line|Step"),
             Angle    ("angle",   "Draft Angle",   "Draft", 3.0),
             DatumRef ("neutral", "Neutral Plane", "Draft",
                       "plane.top|plane.front|plane.right",
                       "Top plane|Front plane|Right plane"),
             Well     ("faces",   "Faces to Draft", "Draft", K_FACE, true),
+            WellIf   ("parting", "Parting Line (edges)", "Draft", K_EDGE, true,
+                      "mode", "parting_line|step"),
         }},
         // --- helix (Curve) --- engine features/curves.py. Produces a sweep PATH (a Sweep can then
         //   reference this helix feature). v1 is "Height & Pitch"-defined; the engine derives turns
@@ -485,6 +579,101 @@ static const std::vector<PMFormDef>& forms() {
             ComboL   ("keep", "Resulting Bodies",    "Resulting Bodies",
                       "both|above|below", "Keep Both|Keep Above|Keep Below"),
         }},
+
+        // =====================================================================
+        // SURFACING — open-surface (kind="surface") features. cmd_id == feature
+        // type, so each routes straight through pmFormForCommand. Wells/params
+        // mirror engine/doc/schema.py FEATURE_TYPES surf_* exactly. _SEL_OR_DATUM
+        // slots (axis/path/surface/tool) use single-pick SelectorWells (the engine
+        // resolves a picked edge/face/datum); _SEL_LIST slots use multi wells.
+        // =====================================================================
+
+        // --- surf_extrude --- refs.profile[]; params end/depth. Mirrors the solid
+        //   extrude's profile well + end-condition combo + gated depth.
+        { "surf_extrude", "Extruded Surface", "extrude_boss", {
+            Well   ("profile", "Profile",       "Profile",   K_FACE, true),
+            ComboL ("end",     "End Condition", "Direction",
+                    "blind|mid_plane|through_all|up_to_next",
+                    "Blind|Mid Plane|Through All|Up To Next"),
+            DimIf  ("depth",   "Distance",      "Direction", 10.0, "end", "blind|mid_plane"),
+        }},
+        // --- surf_revolve --- refs.profile[]/axis; params angle.
+        { "surf_revolve", "Revolved Surface", "revolve_boss", {
+            Well  ("profile", "Profile", "Revolve", K_FACE, true),
+            Well  ("axis",    "Axis",    "Revolve", K_EDGE, false),
+            Angle ("angle",   "Angle",   "Revolve", 360.0),
+        }},
+        // --- surf_sweep --- refs.profile[]/path/guides[]; no params.
+        { "surf_sweep", "Swept Surface", "sweep", {
+            Well ("profile", "Profile",      "Profile and Path", K_FACE, true),
+            Well ("path",    "Path",         "Profile and Path", K_EDGE, false),
+            Well ("guides",  "Guide Curves", "Guide Curves",     K_EDGE, true),
+        }},
+        // --- surf_loft --- refs.sections[]/guides[]/centerline; no params.
+        { "surf_loft", "Lofted Surface", "loft", {
+            Well ("sections",   "Profiles",     "Profiles",     K_FACE, true),
+            Well ("guides",     "Guide Curves", "Guide Curves", K_EDGE, true),
+            Well ("centerline", "Centerline",   "Centerline",   K_EDGE, false),
+        }},
+        // --- surf_planar --- refs.profile[]; no params. A planar surface filling a
+        //   closed sketch contour or bounded by closed edges.
+        { "surf_planar", "Planar Surface", "plane", {
+            Well ("profile", "Bounding Entities", "Planar Surface", K_FACE, true),
+        }},
+        // --- surf_offset --- refs.faces[]; params distance.
+        { "surf_offset", "Offset Surface", "offset_ent", {
+            Well ("faces",    "Faces to Offset", "Offset Parameters", K_FACE, true),
+            Dim  ("distance", "Offset Distance", "Offset Parameters", 10.0),
+        }},
+        // --- surf_ruled --- refs.edge_a/edge_b (each one edge/curve); no params.
+        { "surf_ruled", "Ruled Surface", "shell", {
+            Well ("edge_a", "Edge 1", "Edge Selection", K_EDGE, false),
+            Well ("edge_b", "Edge 2", "Edge Selection", K_EDGE, false),
+        }},
+        // --- surf_boundary --- refs.dir1[] (required) / dir2[] (optional); no params.
+        //   Two direction curve sets blended into a boundary patch.
+        { "surf_boundary", "Boundary Surface", "boundary", {
+            Well ("dir1", "Direction 1 Curves", "Direction 1", K_EDGE, true),
+            Well ("dir2", "Direction 2 Curves", "Direction 2", K_EDGE, true),
+        }},
+        // --- surf_fill --- refs.edges[]; no params. Patch fills a bounded edge loop.
+        { "surf_fill", "Filled Surface", "boundary", {
+            Well ("edges", "Patch Boundary", "Fill Boundary", K_EDGE, true),
+        }},
+        // --- surf_knit --- refs.surfaces[] (multi surface bodies); no params.
+        //   Knit adjacent surface bodies into one. K_FACE so the user picks faces of
+        //   the surface bodies to knit (the engine resolves the owning surface bodies).
+        { "surf_knit", "Knit Surface", "combine", {
+            Well ("surfaces", "Surfaces to Knit", "Selections", K_FACE, true),
+        }},
+        // --- surf_thicken --- refs.surface (one surface body); params thickness.
+        { "surf_thicken", "Thicken", "extrude_boss", {
+            Well ("surface",   "Surface",   "Thicken Parameters", K_FACE, false),
+            Dim  ("thickness", "Thickness", "Thicken Parameters", 2.0),
+        }},
+        // --- surf_trim --- refs.surface/tool; params keep. Trim a surface with a
+        //   tool surface, keeping the inside or outside piece.
+        { "surf_trim", "Trim Surface", "trim", {
+            Well   ("surface", "Surface to Trim", "Trim", K_FACE, false),
+            Well   ("tool",    "Trim Tool",       "Trim", K_FACE, false),
+            ComboL ("keep",    "Keep Selection",  "Trim",
+                    "inside|outside", "Keep Inside|Keep Outside"),
+        }},
+        // --- surf_untrim --- refs.faces[]; no params. Restore a face's natural
+        //   (untrimmed) underlying surface.
+        { "surf_untrim", "Untrim Surface", "convert_ent", {
+            Well ("faces", "Faces to Untrim", "Untrim", K_FACE, true),
+        }},
+        // --- surf_delete_face --- refs.faces[]; no params. Remove faces from a body.
+        { "surf_delete_face", "Delete Face", "subtract", {
+            Well ("faces", "Faces to Delete", "Selections", K_FACE, true),
+        }},
+        // --- surf_replace_face --- refs.faces[]/surface; no params. Replace target
+        //   faces with a replacement surface body.
+        { "surf_replace_face", "Replace Face", "wrap", {
+            Well ("faces",   "Faces to Replace",  "Replace Face", K_FACE, true),
+            Well ("surface", "Replacement Surface","Replace Face", K_FACE, false),
+        }},
     };
     return kForms;
 }
@@ -538,6 +727,24 @@ const PMFormDef* pmFormForCommand(const std::string& cmdId, std::string& mode) {
     // the engine feature type.
     if (cmdId == "rib")               return pmFindForm("rib");
     if (cmdId == "split")             return pmFindForm("split");
+    // Surfacing — open-surface (kind="surface") features. ribbon cmd id == the engine feature
+    // type, so each routes straight through. Listed per-id so the feature-surface audit sees an
+    // explicit handler for every surf_ command.
+    if (cmdId == "surf_extrude")      return pmFindForm("surf_extrude");
+    if (cmdId == "surf_revolve")      return pmFindForm("surf_revolve");
+    if (cmdId == "surf_sweep")        return pmFindForm("surf_sweep");
+    if (cmdId == "surf_loft")         return pmFindForm("surf_loft");
+    if (cmdId == "surf_planar")       return pmFindForm("surf_planar");
+    if (cmdId == "surf_offset")       return pmFindForm("surf_offset");
+    if (cmdId == "surf_ruled")        return pmFindForm("surf_ruled");
+    if (cmdId == "surf_boundary")     return pmFindForm("surf_boundary");
+    if (cmdId == "surf_fill")         return pmFindForm("surf_fill");
+    if (cmdId == "surf_knit")         return pmFindForm("surf_knit");
+    if (cmdId == "surf_thicken")      return pmFindForm("surf_thicken");
+    if (cmdId == "surf_trim")         return pmFindForm("surf_trim");
+    if (cmdId == "surf_untrim")       return pmFindForm("surf_untrim");
+    if (cmdId == "surf_delete_face")  return pmFindForm("surf_delete_face");
+    if (cmdId == "surf_replace_face") return pmFindForm("surf_replace_face");
     // Primitive quick-start commands (AI-CAD extensions; not in the C14 ribbon but reachable
     // via the M1 scenario / future "Insert > Primitive" entries).
     if (cmdId == "box")           return pmFindForm("box");

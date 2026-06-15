@@ -40,6 +40,7 @@ namespace render { class IdPass; class Overlays; }
 // pointer member, so the headers are NOT pulled in here (app_state.h stays GL-light).
 namespace ui {
 class PropertyManager;
+class ConfigPanel;
 class SketchMode;
 class SimPanel;
 class AsmPanels;
@@ -65,9 +66,9 @@ enum class Units { MMGS = 0, IPS = 1 };
 
 // ---------------- settings (AI provider) -> %APPDATA%/AI-CAD/config.json ----------------
 struct Settings {
-    int provider = 2;  // 0 = Anthropic, 1 = OpenAI, 2 = Local (OpenAI-compatible).
+    int provider = 2;  // 0 = Anthropic, 1 = OpenAI, 2 = Local OpenAI-compatible, 3 = managed llama.cpp.
                        // Default to a local LM Studio so the app is testable out of the box.
-    char model[128] = "gemma-4-e4b";
+    char model[512] = "gemma-4-e4b";
     char apiKey[256] = "";
     char baseUrl[256] = "http://localhost:1234/v1";
     bool vision = true;
@@ -285,6 +286,8 @@ struct AppState {
     core::DocMirror docMirror;
     bool wantTree = false;   // AI_CAD_SHOT=tree: scripted doc-smoke flow + screenshot
     bool treeShotDone = false; // guard so doc smoke runs exactly once
+    bool wantEquations = false;   // AI_CAD_SHOT=equations: open the Equations editor + seed two globals
+    bool equationsShotDone = false; // guard so the equations seed runs exactly once
 
     // ---- Wave N: AI-ECAD document (worker ecad_* RPCs; the editor mirror lives in ecad_panel.cpp) ----
     std::string ecadDocId;          // open ECAD doc id ("" = none)
@@ -607,6 +610,10 @@ struct AppState {
     // Weldment Cut List panel (SolidWorks Weldment Cut List). Dockable "Cut List" window in the
     // right task pane; View > Cut List toggles it. Only meaningful for part docs with weldments.
     bool showCutListPanel = false;
+    // Equations / Global Variables editor (SolidWorks "Equations" dialog). A modeless window over
+    // doc.equations.globals; opened by double-clicking the FeatureManager "Equations" node or the
+    // View > Equations menu toggle. Add/edit -> eq_set, delete -> eq_delete (drawn in equations_dialog.cpp).
+    bool showEquations = false;
     int  aiInteraction = 0;       // 0=Design (new part) 1=Edit (orchestrator v2) 2=Chat
     bool focusActivityTab = false;  // one-shot: select the Activity tab (e.g. when a v2 run starts)
     bool showAbout = false, designStarted = false;
@@ -619,6 +626,7 @@ struct AppState {
     enum RibbonTab {
         RT_Features   = 0, RT_Sketch     = 1, RT_Evaluate   = 2, RT_Simulation = 3,
         RT_Assembly   = 4, RT_SheetMetal = 5, RT_Weldments  = 6, RT_PCB        = 7,
+        RT_Surfaces   = 8,
     };
     bool showRibbon = true;        // View > Ribbon visibility toggle
     int  ribbonTab  = RT_Features; // active ribbon tab (one of RibbonTab); contextual on the doc
@@ -633,6 +641,10 @@ struct AppState {
     // W1-B: typed pointer (forward-declared above) so app_state.h stays free of the heavy
     // ui/property_manager.h include while every borrow site drops its static_cast.
     ui::PropertyManager* propertyManager = nullptr;   // owned by run_gui
+    // Configurations left-pane tab (SolidWorks ConfigurationManager). The live ConfigPanel is owned
+    // by run_gui and borrowed here so ui::drawLeftPane's Configurations case can render it
+    // (ConfigPanel::drawEmbedded). Null until run_gui wires it.
+    ui::ConfigPanel* configPanel = nullptr;           // owned by run_gui
 
     // ---- C19: simulation + result-overlay UI state ----
     core::SimClient* simClient = nullptr;  // owned by run_gui

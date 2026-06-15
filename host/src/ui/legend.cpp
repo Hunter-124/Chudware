@@ -6,6 +6,7 @@
 
 #include "imgui.h"
 
+#include "metrics.h"
 #include "../core/app_state.h"
 #include "../ui_theme.h"
 
@@ -56,18 +57,18 @@ void drawLegend(AppState& st, ImDrawList* dl, const ImVec2& r0, const ImVec2& r1
     const ImU32 txt = ui::Palette::toU32(pal.overlayText);
 
     // Geometry: a tall thin bar near the right edge, vertically centred-ish in the lower half.
-    const float barW = 18.0f;
-    const float barH = 200.0f;
-    const float pad = 8.0f;
-    const float labelW = 64.0f;
+    const float barW   = ui::metrics::px(18);
+    const float barH   = ui::metrics::px(200);
+    const float pad    = ui::metrics::px(8);
+    const float labelW = ui::metrics::px(64);
 
     float boxW = barW + labelW + pad * 3.0f;
-    float boxH = barH + pad * 3.0f + 18.0f;  // + title row
-    ImVec2 b1(r1.x - 12.0f, r1.y - 12.0f);
+    float boxH = barH + pad * 3.0f + ui::metrics::px(18);  // + title row
+    ImVec2 b1(r1.x - ui::metrics::px(12), r1.y - ui::metrics::px(12));
     ImVec2 b0(b1.x - boxW, b1.y - boxH);
 
-    dl->AddRectFilled(b0, b1, bg, 6.0f);
-    dl->AddRect(b0, b1, bord, 6.0f);
+    dl->AddRectFilled(b0, b1, bg, ui::metrics::chipRound());
+    dl->AddRect(b0, b1, bord, ui::metrics::chipRound());
 
     // Title row.
     std::string title = st.legendTitle.empty() ? std::string("Result") : st.legendTitle;
@@ -93,8 +94,8 @@ void drawLegend(AppState& st, ImDrawList* dl, const ImVec2& r0, const ImVec2& r1
     auto label = [&](float frac, float value) {
         std::string s = fmtNum(value);
         float y = barTL.y + barH * (1.0f - frac);
-        dl->AddLine(ImVec2(barBR.x, y), ImVec2(barBR.x + 4, y), txt);
-        dl->AddText(ImVec2(barBR.x + 7, y - 7), txt, s.c_str());
+        dl->AddLine(ImVec2(barBR.x, y), ImVec2(barBR.x + ui::metrics::px(4), y), txt);
+        dl->AddText(ImVec2(barBR.x + ui::metrics::px(7), y - ui::metrics::px(7)), txt, s.c_str());
     };
     label(1.0f, vmax);
     label(0.5f, (vmin + vmax) * 0.5f);

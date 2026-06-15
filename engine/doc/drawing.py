@@ -189,6 +189,65 @@ def _compound_polylines(compound, scale: float, position: tuple[float, float],
     return out
 
 
+def _compound_arcs(compound, scale: float, position: tuple[float, float],
+                   layer: str) -> list[dict]:
+    """Every CIRCULAR-ARC edge in an HLR result compound -> a real arc entity (W13-ext).
+
+    The polyline pass discretizes a projected circle/arc into straight segments — fine for drawing
+    the line but useless for *dimensioning* a hole. This pass keeps the curved edges as analytic
+    arcs so a radial/diameter dim or a center mark can attach to a real center + radius.
+
+    A projected edge is a true circle when its line of sight is parallel to the original circle's
+    axis (e.g. a hole drilled along +Z, seen in the TOP view) — OCCT's HLR then yields a
+    ``GeomAbs_Circle`` adaptor in the projector's local plane. Anything seen edge-on degrades to a
+    bspline/ellipse and is (correctly) NOT extracted as an arc — you would not radial-dim it.
+
+    Each arc is ``{center:[x,y], radius, start_angle, end_angle, span, closed, layer}`` in SHEET mm
+    (center & radius already scaled + translated like the polylines). Angles are radians measured in
+    the sheet frame; ``closed`` is True for a full circle (|span| ≈ 2π). Empty/None compounds yield
+    ``[]``; a non-circular edge is skipped.
+    """
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.TopExp import TopExp
+    from OCP.TopoDS import TopoDS
+    from OCP.TopTools import TopTools_IndexedMapOfShape
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.GeomAbs import GeomAbs_Circle
+
+    if compound is None:
+        return []
+    emap = TopTools_IndexedMapOfShape()
+    TopExp.MapShapes_s(compound, TopAbs_EDGE, emap)
+    px, py = position
+    out: list[dict] = []
+    for i in range(1, emap.Extent() + 1):
+        edge = TopoDS.Edge_s(emap.FindKey(i))
+        try:
+            ad = BRepAdaptor_Curve(edge)
+            if ad.GetType() != GeomAbs_Circle:
+                continue
+            circ = ad.Circle()
+            loc = circ.Location()
+            r = float(circ.Radius())
+            fp = float(ad.FirstParameter())
+            lp = float(ad.LastParameter())
+        except Exception:  # noqa: BLE001 — a bad edge is simply not extractable as an arc
+            continue
+        span = lp - fp
+        cx = loc.X() * scale + px
+        cy = loc.Y() * scale + py
+        out.append({
+            "center": [cx, cy],
+            "radius": r * scale,
+            "start_angle": fp,
+            "end_angle": lp,
+            "span": span,
+            "closed": abs(abs(span) - 2.0 * math.pi) < 1e-6,
+            "layer": layer,
+        })
+    return out
+
+
 def _bbox_of_polylines(polylines: list[list[list[float]]]) -> Optional[list[float]]:
     """[min_x, min_y, max_x, max_y] over all points, or None when there are none."""
     xs: list[float] = []
@@ -222,7 +281,7 @@ def project_view(shapes: list, orientation: str, scale: float = 1.0,
     """
     t0 = time.perf_counter()
     base = {"view_id": view_id, "scale": float(scale), "orientation": orientation,
-            "visible": [], "hidden": [], "bbox": None, "ms": 0.0, "error": None}
+            "visible": [], "hidden": [], "arcs": [], "bbox": None, "ms": 0.0, "error": None}
     if not shapes:
         base["error"] = "source has no bodies to project"
         return base
@@ -270,8 +329,21 @@ def project_view(shapes: list, orientation: str, scale: float = 1.0,
         for c in hidden_compounds:
             hidden.extend(_compound_polylines(c, scale, position, lin_defl, ang_defl))
 
+        # Arc/circle extraction (W13-ext): preserve projected circular edges as analytic arc
+        # entities so radial/diameter dims + center marks can attach to a real center + radius.
+        # Visible sharp edges + the silhouette outline can both be circular (a hole rim / a
+        # cylinder seen down its axis); hidden bores too. Smooth (Rg1) edges are tangent lines —
+        # not dimension targets — so they are not mined for arcs.
+        arcs: list[dict] = []
+        for c in (hlr.VCompound(), hlr.OutLineVCompound()):
+            arcs.extend(_compound_arcs(c, scale, position, "visible"))
+        if show_hidden:
+            for c in (hlr.HCompound(), hlr.OutLineHCompound()):
+                arcs.extend(_compound_arcs(c, scale, position, "hidden"))
+
         base["visible"] = visible
         base["hidden"] = hidden
+        base["arcs"] = arcs
         base["bbox"] = _bbox_of_polylines(visible + hidden)
     except Exception as exc:  # noqa: BLE001 — contained: one view's failure never breaks the doc
         base["error"] = f"{type(exc).__name__}: {exc}"
@@ -882,6 +954,9 @@ def _project_one(s: DrawingSession, view: dict, src_shapes: list, src_rev: int) 
     out["type"] = vtype
     out["position"] = [float(pos[0]), float(pos[1])]
     out["show_hidden"] = show_hidden
+    # Ortho/iso views carry analytic arc entities (for radial/diameter dims + center marks); section
+    # and detail projections don't mine arcs, so guarantee the key is always present for the host.
+    out.setdefault("arcs", [])
     # Section/detail carry their defining fields so the host can draw the cutting line / detail circle
     # on the parent and label the view ("SECTION A-A" / "DETAIL B").
     if vtype == "section":
@@ -917,10 +992,17 @@ def _shift_to_position(proj: dict, pos) -> dict:
     """Translate a cached (origin-centered) projection to a sheet position. Cheap; no re-HLR."""
     dx, dy = float(pos[0]), float(pos[1])
     if dx == 0.0 and dy == 0.0:
-        return dict(proj)
+        # Still deep-copy the arc dicts so a cached projection isn't mutated by a later position.
+        out = dict(proj)
+        out["arcs"] = [dict(arc, center=[arc["center"][0], arc["center"][1]])
+                       for arc in proj.get("arcs", []) or []]
+        return out
     out = dict(proj)
     out["visible"] = [[[x + dx, y + dy] for x, y in pl] for pl in proj.get("visible", [])]
     out["hidden"] = [[[x + dx, y + dy] for x, y in pl] for pl in proj.get("hidden", [])]
+    # Arcs carry an analytic center that must translate too (radius/angles are position-invariant).
+    out["arcs"] = [dict(arc, center=[arc["center"][0] + dx, arc["center"][1] + dy])
+                   for arc in proj.get("arcs", []) or []]
     bb = proj.get("bbox")
     out["bbox"] = [bb[0] + dx, bb[1] + dy, bb[2] + dx, bb[3] + dy] if bb else None
     return out
@@ -1131,20 +1213,48 @@ def set_view(doc_id: str, view_id: str, *, scale: Optional[float] = None,
 
 
 # --------------------------------------------------------------------------- annotations (W13)
-
+#
+# W13-ext (SolidWorks-parity drawing annotations): radial (R), diameter (⌀) + angular dims, plus
+# center marks / center lines. The drawing schema's structural validator (schema.py) only knows the
+# three W13 annotation TYPES — {linear_dim, aligned_dim, note} — and it is OUT OF SCOPE to edit. To
+# keep ``validate_drawing`` clean while still adding the five new kinds, every extended annotation is
+# stored with schema ``type:"note"`` (which makes ``a``/``b`` optional and tolerates arbitrary extra
+# keys) and a discriminating ``kind`` field carrying the REAL annotation kind. The host renders on
+# ``kind`` when present, falling back to ``type``. Geometry fields (center/radius/lines/angle) ride
+# as extra keys the validator ignores. See the report's "deferred shared-file change" note: if/when
+# schema.py gains first-class annotation types, the stored ``type`` can be promoted to ``kind``.
 
 _ANNOTATION_TYPES = {"linear_dim", "aligned_dim", "note"}
 
+# The extended (SW-parity) annotation kinds the caller may request. Each is persisted as a
+# schema ``note`` with this value in the ``kind`` field so the drawing keeps validating.
+_EXT_DIM_KINDS = {"radial_dim", "diameter_dim", "angular_dim"}
+_EXT_MARK_KINDS = {"center_mark", "center_line"}
+_EXT_ANNOTATION_KINDS = _EXT_DIM_KINDS | _EXT_MARK_KINDS
 
-def _format_dim_value(value: float, units: str) -> str:
-    """Format a measured MODEL length for the annotation's default ``text``.
+# What a caller may pass as ``type`` to add_dim: the three native dims + a note + the extended kinds.
+_ADD_DIM_KINDS = _ANNOTATION_TYPES | _EXT_ANNOTATION_KINDS
 
-    The engine is canonical mm; for MMGS we show millimetres, for IPS we convert to inches. The host
-    re-formats on render (pmFormatDim) so this is only the stored default — keep it human-readable.
+
+def _format_dim_value(value: float, units: str, kind: str = "linear_dim") -> str:
+    """Format a measured MODEL value for the annotation's default ``text``.
+
+    Lengths are canonical mm (MMGS) or converted to inches (IPS); a radial dim gets an ``R`` prefix
+    and a diameter dim a ``⌀`` (SolidWorks notation). An angular dim's value is in DEGREES (units
+    independent) and gets a ``°`` suffix. The host re-formats on render (pmFormatDim); this is only
+    the stored default — keep it human-readable.
     """
+    if kind == "angular_dim":
+        return f"{value:.4g}°"
     if units == "IPS":
-        return f"{value / 25.4:.4g} in"
-    return f"{value:.4g}"
+        body = f"{value / 25.4:.4g} in"
+    else:
+        body = f"{value:.4g}"
+    if kind == "radial_dim":
+        return f"R{body}"
+    if kind == "diameter_dim":
+        return f"⌀{body}"
+    return body
 
 
 def _next_ann_id(view: dict) -> str:
@@ -1161,34 +1271,131 @@ def _doc_units(doc: dict) -> str:
     return u if u in ("MMGS", "IPS") else "MMGS"
 
 
-def add_dim(doc_id: str, view_id: str, *, type: str, a: list, b: list,
+# --------------------------------------------------------------------------- arc / angle geometry
+#
+# These resolve an extended dim against the view's projected geometry. A radial/diameter dim attaches
+# to one of the analytic ARC entities mined in project_view (center+radius in sheet mm). The host
+# clicks near a circular edge; we snap to the nearest arc. An angular dim is computed from two picked
+# line directions (sheet vectors) — angles are scale-independent, so no /scale division is needed.
+
+
+def _view_geometry(s: "DrawingSession", view: dict) -> dict:
+    """Project ``view`` against the live source bodies and return its geometry (arcs included).
+
+    Used by the extended dims to resolve a picked sheet point to a real arc/edge. Goes through the
+    same cached :func:`_project_one` path the host renders, so the arc centers/radii match exactly.
+    """
+    src_shapes, src_rev = _source_shapes(s.source_doc_id)
+    return _project_one(s, view, src_shapes, src_rev)
+
+
+def _nearest_arc(geom: dict, point, *, want_closed: Optional[bool] = None) -> Optional[dict]:
+    """The arc entity in ``geom['arcs']`` whose RING (circle of its center+radius) lies nearest the
+    sheet ``point`` — i.e. the circular edge the host clicked on. ``want_closed`` filters to full
+    circles (True) or open arcs (False) when set; None accepts either. Returns the arc dict or None.
+    """
+    px, py = float(point[0]), float(point[1])
+    best = None
+    best_d = None
+    for arc in geom.get("arcs", []) or []:
+        if want_closed is True and not arc.get("closed"):
+            continue
+        if want_closed is False and arc.get("closed"):
+            continue
+        cx, cy = arc["center"]
+        r = float(arc["radius"])
+        # Distance from the pick to the ring (|dist-to-center − radius|): 0 right on the circle.
+        d = abs(math.hypot(px - cx, py - cy) - r)
+        if best_d is None or d < best_d:
+            best_d = d
+            best = arc
+    return best
+
+
+def _line_dir(a, b) -> tuple[float, float]:
+    """Unit direction of the sheet segment a→b (raises on a degenerate zero-length pick)."""
+    dx, dy = float(b[0]) - float(a[0]), float(b[1]) - float(a[1])
+    n = math.hypot(dx, dy)
+    if n < 1e-9:
+        raise OpError("invalid_op", "angular dim line endpoints coincide",
+                      {"reason": "degenerate line"})
+    return dx / n, dy / n
+
+
+def _angle_between_lines(a, b, c, d) -> float:
+    """Acute/obtuse angle in DEGREES between the two sheet lines (a→b) and (c→d).
+
+    Uses the unsigned angle between the direction vectors, folded into [0, 180). Two lines have no
+    inherent orientation, so we report the angle in [0, 90] for the included corner unless the host
+    asks otherwise — here we return the raw [0,180) between the picked directions, which the host can
+    flip. The value is SCALE-INDEPENDENT (the view scale cancels in the dot product).
+    """
+    u = _line_dir(a, b)
+    v = _line_dir(c, d)
+    dot = max(-1.0, min(1.0, u[0] * v[0] + u[1] * v[1]))
+    ang = math.degrees(math.acos(dot))
+    return ang
+
+
+def add_dim(doc_id: str, view_id: str, *, type: str, a: list, b: Optional[list] = None,
+            c: Optional[list] = None, d: Optional[list] = None,
             pos: Optional[list] = None, text: Optional[str] = None) -> dict:
-    """drawing_add_dim — append a dimension/note annotation to a view.
+    """drawing_add_dim — append a dimension / mark / note annotation to a view.
 
-    ``a`` and ``b`` are SHEET-mm points (the host snaps them to projected polyline vertices). The
-    displayed ``value`` is the TRUE MODEL length: ``|a - b| / view.scale`` — because the view geometry
-    is drawn at ``scale`` (sheet = model * scale), dividing the sheet distance by the scale recovers
-    the real measured model distance, so the value is SCALE-INDEPENDENT (a 2:1 view of a 50 mm edge
-    still dimensions 50 mm). For a ``note`` the value is 0 and ``text`` is whatever the caller passed.
+    ``a`` and ``b`` are SHEET-mm points (the host snaps them to projected vertices). For the native
+    W13 linear/aligned dims the displayed ``value`` is the TRUE MODEL length ``|a - b| / view.scale``
+    — the view geometry is drawn at ``scale`` (sheet = model * scale), so dividing the sheet distance
+    by the scale recovers the real model distance, making the value SCALE-INDEPENDENT (a 2:1 view of a
+    50 mm edge still dimensions 50 mm).
 
-    Returns ``{annotation, drawing}`` (the new annotation + the full re-projected drawing_get so the
-    host can re-render in one round-trip).
+    SolidWorks-parity extended kinds (stored as schema ``note`` + a ``kind`` field so the drawing
+    keeps validating — see the W13-ext header):
+
+    * ``radial_dim`` — pick ``a`` near a projected ARC; value = true model radius (arc.radius/scale),
+      text ``R<r>``. Attaches to the nearest open-or-closed arc; stores its center + radius.
+    * ``diameter_dim`` — pick ``a`` near a projected CIRCLE; value = model diameter (2*r/scale),
+      text ``⌀<d>``. Attaches to the nearest FULL circle.
+    * ``angular_dim`` — pick two lines (a→b) and (c→d); value = the angle between them in DEGREES
+      (scale-independent — the scale cancels in the direction dot product).
+    * ``center_mark`` — a cross at a circle center: pick ``a`` near a circle; stores its center +
+      radius (sheet mm). value 0.
+    * ``center_line`` — a construction line through two points / two parallel edges: pick ``a`` and
+      ``b`` (the two endpoints in sheet mm); stores the line. value 0.
+
+    Returns ``{annotation, drawing}`` (the new annotation + the full re-projected drawing_get).
     """
     s = get_drawing(doc_id)
-    if type not in _ANNOTATION_TYPES:
+    if type not in _ADD_DIM_KINDS:
         raise OpError("invalid_op",
-                      f"annotation type '{type}' must be one of {sorted(_ANNOTATION_TYPES)}",
+                      f"annotation type '{type}' must be one of {sorted(_ADD_DIM_KINDS)}",
                       {"reason": "bad type"})
     _sh, view = _find_view(s.doc, view_id)
     if view is None:
         raise OpError("invalid_op", f"no view '{view_id}'", {"reason": "unknown view"})
-    if not (_is_xy(a) and _is_xy(b)):
+    if not _is_xy(a):
+        raise OpError("invalid_op", "dimension point a must be [x,y] sheet mm",
+                      {"reason": "bad points"})
+
+    units = _doc_units(s.doc)
+    scale = float(view.get("scale", 1.0)) or 1.0
+
+    # ---- extended kinds: dispatch to the dedicated builder, store as a schema note ----------------
+    if type in _EXT_ANNOTATION_KINDS:
+        ann = _build_ext_annotation(s, view, type, a, b, c, d, pos, text, units, scale)
+        view.setdefault("annotations", []).append(ann)
+        s.revision += 1
+        s.dirty = True
+        return {"annotation": ann, "drawing": get_drawing_full(doc_id)}
+
+    # ---- native W13 linear / aligned / note ------------------------------------------------------
+    if type == "note":
+        b = b if _is_xy(b) else a
+    if not _is_xy(b):
         raise OpError("invalid_op", "dimension endpoints a,b must each be [x,y] sheet mm",
                       {"reason": "bad points"})
 
     ax, ay = float(a[0]), float(a[1])
     bx, by = float(b[0]), float(b[1])
-    scale = float(view.get("scale", 1.0)) or 1.0
     if type == "linear_dim":
         # SolidWorks linear (smart) dimension: the shorter axis-aligned span. We store the larger of
         # the |dx|,|dy| sheet extents (the dominant ordinate) so a near-horizontal pick reads its
@@ -1200,7 +1407,6 @@ def add_dim(doc_id: str, view_id: str, *, type: str, a: list, b: list,
         sheet_dist = 0.0
     value = sheet_dist / scale   # TRUE model length (scale-independent)
 
-    units = _doc_units(s.doc)
     if pos is None:
         # Default text position: offset the midpoint perpendicular to a→b by a small sheet margin so
         # the dimension line clears the geometry. The host may override on the third click.
@@ -1221,12 +1427,123 @@ def add_dim(doc_id: str, view_id: str, *, type: str, a: list, b: list,
         "b": [bx, by],
         "pos": ppos,
         "value": round(value, 6),
-        "text": text if isinstance(text, str) and text else _format_dim_value(value, units),
+        "text": text if isinstance(text, str) and text else _format_dim_value(value, units, type),
     }
     view.setdefault("annotations", []).append(ann)
     s.revision += 1
     s.dirty = True
     return {"annotation": ann, "drawing": get_drawing_full(doc_id)}
+
+
+def _build_ext_annotation(s, view, kind, a, b, c, d, pos, text, units, scale) -> dict:
+    """Build one extended (SW-parity) annotation dict, stored as a schema ``note`` + a ``kind`` tag.
+
+    Resolves arc-based kinds (radial/diameter/center_mark) against the view's live projected arcs and
+    line-based kinds (angular/center_line) from the picked sheet points. All measured values are
+    SCALE-INDEPENDENT (radii/diameters divide out the view scale; angles are scale-free). The result
+    always carries ``a`` (and ``b`` when meaningful) as valid [x,y] vectors so the schema validator —
+    which sees a ``note`` — stays happy, plus the extra geometry keys the host renders.
+    """
+    ax, ay = float(a[0]), float(a[1])
+    base_id = _next_ann_id(view)
+
+    if kind in ("radial_dim", "diameter_dim", "center_mark"):
+        geom = _view_geometry(s, view)
+        want_closed = True if kind == "diameter_dim" else None
+        arc = _nearest_arc(geom, a, want_closed=want_closed)
+        if arc is None:
+            what = "full circle" if kind == "diameter_dim" else "circular arc"
+            raise OpError("invalid_op",
+                          f"{kind}: no projected {what} near {[ax, ay]} in this view",
+                          {"reason": "no arc"})
+        cx, cy = float(arc["center"][0]), float(arc["center"][1])
+        r_sheet = float(arc["radius"])
+        r_model = r_sheet / scale            # true model radius (scale-independent)
+        if kind == "radial_dim":
+            value = r_model
+        elif kind == "diameter_dim":
+            value = 2.0 * r_model
+        else:  # center_mark — no measured length
+            value = 0.0
+        # Leader/text anchor: outside the ring on the +x side unless the host overrides.
+        ppos = ([float(pos[0]), float(pos[1])] if _is_xy(pos)
+                else [cx + r_sheet + 8.0, cy + r_sheet + 8.0])
+        ann = {
+            "id": base_id,
+            "type": "note",          # schema-visible type (keeps validate_drawing clean)
+            "kind": kind,            # the REAL annotation kind the host renders
+            "a": [ax, ay],
+            "b": [cx, cy],           # the circle center (a valid [x,y] for the validator)
+            "center": [cx, cy],
+            "radius": round(r_sheet, 6),          # sheet mm (for drawing the cross/leader)
+            "model_radius": round(r_model, 6),    # true model radius
+            "closed": bool(arc.get("closed")),
+            "pos": ppos,
+            "value": round(value, 6),
+            "text": (text if isinstance(text, str) and text
+                     else _format_dim_value(value, units, kind)),
+        }
+        return ann
+
+    if kind == "angular_dim":
+        # Two lines: (a→b) and (c→d). All four points required and must be sheet [x,y].
+        for nm, pt in (("b", b), ("c", c), ("d", d)):
+            if not _is_xy(pt):
+                raise OpError("invalid_op",
+                              f"angular_dim needs four sheet points a,b,c,d (missing/invalid {nm})",
+                              {"reason": "bad points"})
+        value = _angle_between_lines(a, b, c, d)   # degrees, scale-independent
+        # Vertex = intersection of the two lines if they cross, else the midpoint of the picks.
+        vtx = _line_intersection(a, b, c, d)
+        if vtx is None:
+            vtx = [(ax + float(c[0])) / 2.0, (ay + float(c[1])) / 2.0]
+        ppos = ([float(pos[0]), float(pos[1])] if _is_xy(pos)
+                else [vtx[0] + 12.0, vtx[1] + 12.0])
+        return {
+            "id": base_id,
+            "type": "note",
+            "kind": "angular_dim",
+            "a": [ax, ay],
+            "b": [float(b[0]), float(b[1])],
+            "line2": [[float(c[0]), float(c[1])], [float(d[0]), float(d[1])]],
+            "vertex": [vtx[0], vtx[1]],
+            "pos": ppos,
+            "value": round(value, 6),
+            "text": (text if isinstance(text, str) and text
+                     else _format_dim_value(value, units, "angular_dim")),
+        }
+
+    # center_line — a construction line between two picked endpoints (e.g. the midline of two
+    # parallel edges or a cylinder-axis projection). Both endpoints required.
+    if not _is_xy(b):
+        raise OpError("invalid_op", "center_line needs two sheet points a,b",
+                      {"reason": "bad points"})
+    bx, by = float(b[0]), float(b[1])
+    ppos = ([float(pos[0]), float(pos[1])] if _is_xy(pos)
+            else [(ax + bx) / 2.0, (ay + by) / 2.0])
+    return {
+        "id": base_id,
+        "type": "note",
+        "kind": "center_line",
+        "a": [ax, ay],
+        "b": [bx, by],
+        "pos": ppos,
+        "value": 0.0,
+        "text": text if isinstance(text, str) else "",
+    }
+
+
+def _line_intersection(a, b, c, d) -> Optional[list]:
+    """Intersection point of the two infinite sheet lines (a→b) and (c→d), or None if parallel."""
+    x1, y1 = float(a[0]), float(a[1])
+    x2, y2 = float(b[0]), float(b[1])
+    x3, y3 = float(c[0]), float(c[1])
+    x4, y4 = float(d[0]), float(d[1])
+    den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(den) < 1e-12:
+        return None
+    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / den
+    return [x1 + t * (x2 - x1), y1 + t * (y2 - y1)]
 
 
 def remove_annotation(doc_id: str, view_id: str, ann_id: str) -> dict:
@@ -1441,7 +1758,8 @@ def _drawing_add_dim(params: dict, _emit) -> dict:
     return add_dim(
         params["doc_id"], params["view_id"],
         type=params.get("type", "linear_dim"),
-        a=params["a"], b=params["b"],
+        a=params["a"], b=params.get("b"),
+        c=params.get("c"), d=params.get("d"),
         pos=params.get("pos"),
         text=params.get("text"),
     )

@@ -93,6 +93,53 @@ def test_validator_rejects_garbage() -> None:
     print("[schema] validator rejects malformed documents with actionable errors")
 
 
+def test_advanced_mate_validation() -> None:
+    """Advanced/mechanical mates (gear/screw/limits/width/symmetric/...) validate when their
+    value object + reference count match what mate_solver.py reads, and are rejected otherwise."""
+    base = _load("asm_clamp.json")
+
+    def with_mate(**over):
+        a = copy.deepcopy(base)
+        m = a["mates"][0]               # reuse m1's two well-formed refs as the base
+        m.update(over)
+        return a
+
+    # --- positive: each new type validates clean ---
+    ok_cases = [
+        {"type": "gear", "value": {"ratio": 2.0}},
+        {"type": "screw", "value": {"pitch": 5.0}},
+        {"type": "distance_limit", "value": {"min": 5.0, "max": 12.0}},
+        {"type": "angle_limit", "value": {"min": 0.0, "max": 45.0}},
+        {"type": "rack_pinion", "value": None},                 # pitch_radius optional
+        {"type": "hinge", "value": {"min": 0.0, "max": 90.0}},
+        {"type": "profile_center", "value": None},
+    ]
+    for over in ok_cases:
+        errs = validate_assembly(with_mate(**over))
+        assert errs == [], f"{over['type']} mate should validate:\n" + "\n".join(errs)
+
+    # width / symmetric carry a 3rd reference (jaw / symmetry plane) — reuse a real ref.
+    a = with_mate(type="width", value=None)
+    a["mates"][0]["refs"].append(copy.deepcopy(a["mates"][0]["refs"][0]))
+    assert validate_assembly(a) == [], "width mate with 3 refs should validate"
+
+    # --- negative: actionable errors ---
+    assert any("needs an object" in e
+               for e in validate_assembly(with_mate(type="gear", value=None)))
+    assert any("value.ratio: required" in e
+               for e in validate_assembly(with_mate(type="gear", value={})))
+    assert any("value.max: required" in e
+               for e in validate_assembly(with_mate(type="distance_limit", value={"min": 5.0})))
+    assert any("width takes 3..4" in e
+               for e in validate_assembly(with_mate(type="width", value=None)))  # only 2 refs
+    assert any("must not carry a value" in e
+               for e in validate_assembly(with_mate(type="symmetric", value={"value": 1.0},
+                                                     refs=base["mates"][0]["refs"] +
+                                                     [copy.deepcopy(base["mates"][0]["refs"][0])])))
+
+    print("[schema] advanced/mechanical mate value-model validates + rejects correctly")
+
+
 def test_equations() -> None:
     assert evaluate("2 + 3 * 4") == 14.0
     assert evaluate("2 ^ 3") == 8.0

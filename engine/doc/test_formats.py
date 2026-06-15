@@ -385,6 +385,32 @@ def test_frozen_geometry_fallback() -> None:
           f"err={rel_err:.5f}")
 
 
+def test_doc_open_routes_plain_step_to_import() -> None:
+    """doc_open on a PLAIN neutral file (.step) must IMPORT it as a fresh part — stepplus.open
+    only reads the .step+ zip container, so this used to fail. Round-trips a box: export to a
+    plain .step, then doc_open it and assert one imported body + a usable doc_id."""
+    from engine.worker import _doc_open
+    from engine.doc.formats import _handler_export_file
+    from engine.doc.session import get_session, _rebuild, _solid_bodies
+
+    s = docsess.new_session("part", "Src")
+    docsess.apply_ops(s, 0, [{"op": "add_feature", "feature": {
+        "type": "box", "name": "Box1",
+        "params": {"length": _dim(20), "width": _dim(20), "height": _dim(20)}}}])
+    td = tempfile.mkdtemp()
+    step = os.path.join(td, "part.step")
+    _handler_export_file({"doc_id": s.doc_id, "path": step, "format": "step"}, lambda *a, **k: None)
+    assert os.path.getsize(step) > 0
+
+    resp = _doc_open({"path": step}, lambda *a, **k: None)
+    did = resp.get("doc_id")
+    assert did, "doc_open(.step) returned no doc_id"
+    opened = get_session(did)
+    res = opened.last_result or _rebuild(opened)
+    assert len(_solid_bodies(res)) >= 1, "doc_open(.step) imported no bodies"
+    print(f"[doc_open] plain .step -> imported {len(_solid_bodies(res))} body(ies) into {did}")
+
+
 # --------------------------------------------------------------------------- main
 
 def main() -> None:
@@ -396,6 +422,7 @@ def main() -> None:
     test_import_feature_compiles_and_caches()
     test_stepplus_meta_passthrough()
     test_frozen_geometry_fallback()
+    test_doc_open_routes_plain_step_to_import()
     print("\nFORMATS TESTS PASSED")
 
 

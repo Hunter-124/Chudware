@@ -365,10 +365,27 @@ continuous. The flat-pattern geometry is surfaced on `CompileResult.sheet_metal_
 `ctx.datums["_sheet_metal_flat"]` side-channel, then projected to 2D using the stored `n_base`.
 
 ### AI (M9)
-`agent_run_v2 {request, doc_id, options?:{max_stage_attempts?, plan?, roles_override?}}`
+`agent_run_v2 {request, doc_id, options?:{max_stage_attempts?, plan?, roles_override?, workflow?}}`
 → streams events.md orchestrator events → `{run_id, status, stop_reason, revision}` ·
 `get_prompts` (v2 result: `{prompts:[{role, path, override_path, text, overridden}]}`) ·
 `agent_cancel {run_id}` → best-effort stop at the next stage boundary.
+
+`options.workflow`/`options.profile`: `"auto"` (default), `"micro"`/`"local"`/`"small-context"`
+to force the decomposed local-model workflow, or `"full"`/`"standard"` to force the normal v2
+machine. The micro workflow decomposes into tiny single-step executor calls and applies/validates
+after each step, which keeps limited local models auditable and recoverable.
+
+### Vendor parts
+Compliance-friendly supplier CAD cache. These methods do not scrape catalogs; a user download or an
+approved supplier API adapter supplies the CAD file, then the worker stores compact metadata under
+the app data vendor cache for local AI workflows.
+
+| method | params → result |
+|---|---|
+| `vendor_part_register_local_cad` | `{supplier, part_number, cad_path, description?, product_url?, specs?, source?, copy_file?}` → cached vendor part record. Supported import formats: STEP/STP, IGES/IGS, BREP, STL. |
+| `vendor_part_list` | `{supplier?, query?}` → `{parts:[...]}` |
+| `vendor_part_context` | `{limit?, query?}` → `{count, parts, llm_context, capabilities}` compact enough to inject into local-model prompts. |
+| `vendor_part_insert` | `{supplier, part_number, doc_id?/into?, base_revision?, name?}` → normal doc ops response after adding an `import` feature with vendor metadata preserved in feature params. |
 
 ## 3. Sim worker (`engine/sim/worker.py`, separate process, spawned on demand)
 

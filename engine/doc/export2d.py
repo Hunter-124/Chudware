@@ -168,8 +168,19 @@ def flat_pattern_layers(flat_record: dict) -> tuple[dict, int]:
                all(isinstance(pt, list) and len(pt) >= 3 for pt in seg):
                 bend_segs.append([_to_2d(seg[0], u, v), _to_2d(seg[1], u, v)])
 
-    layers: dict = {"OUTLINE": [outline2d] if len(outline2d) >= 2 else [], "BEND": bend_segs}
-    n = len(layers["OUTLINE"]) + len(bend_segs)
+    # Cut/hole loops developed into the blank (base-region + bend-developed wall holes) go on a
+    # separate CUTS layer so punched features actually appear in the flat DXF/PDF.
+    cut_polys: list = []
+    for loop in flat_record.get("cut_loops", []) or []:
+        pts = [_to_2d(p, u, v) for p in loop if isinstance(p, list) and len(p) >= 3]
+        if len(pts) >= 2:
+            if pts[0] != pts[-1]:
+                pts = pts + [pts[0]]   # close the loop
+            cut_polys.append(pts)
+
+    layers: dict = {"OUTLINE": [outline2d] if len(outline2d) >= 2 else [], "BEND": bend_segs,
+                    "CUTS": cut_polys}
+    n = len(layers["OUTLINE"]) + len(bend_segs) + len(cut_polys)
     return layers, n
 
 

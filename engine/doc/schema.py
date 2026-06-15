@@ -115,10 +115,33 @@ FACE_SURFS = {"plane", "cylinder", "cone", "sphere", "torus", "bspline", "other"
 EDGE_SURFS = {"line", "circle", "ellipse", "bspline", "other"}
 
 MATE_TYPES = {
+    # standard
     "coincident", "parallel", "perpendicular", "tangent",
     "concentric", "distance", "angle", "lock",
+    # advanced (SW_PARITY_SPEC §3) — width/symmetric carry a 3rd reference (jaw plane / symmetry
+    # plane); the *_limit pair clamp a distance/angle between min..max.
+    "width", "symmetric", "distance_limit", "angle_limit", "profile_center",
+    # mechanical — coupling relations driven by scalar params in the value object
+    "gear", "rack_pinion", "screw", "hinge", "slot", "cam_follower",
 }
+# Types whose ``value`` is a single dimension {value, expr} (offset distance / angle).
 MATE_VALUE_TYPES = {"distance", "angle"}
+# Mates needing more than the standard 2 references, as (min, max) ref counts. Extra refs (index
+# >= 2) are resolved as the solver's ``extra_geoms`` (mate_solver.py): width's 2nd jaw plane,
+# symmetric's symmetry plane, hinge's optional swing-limit markers. Default is exactly 2.
+MATE_REF_COUNTS = {
+    "width": (3, 4), "symmetric": (3, 3), "hinge": (2, 4),
+}
+# Coupling/limit mates whose ``value`` object carries scalar params (read by mate_solver._param).
+# spec = (required numeric keys, optional numeric keys). The "value" key, when present, is a dim.
+MATE_COUPLING_SPEC = {
+    "distance_limit": (["min", "max"], ["value"]),
+    "angle_limit":    (["min", "max"], ["value"]),
+    "gear":           (["ratio"], []),
+    "screw":          (["pitch"], []),
+    "rack_pinion":    ([], ["pitch_radius"]),
+    "hinge":          ([], ["min", "max"]),
+}
 
 # Entity type -> required fields beyond {id, type, construction}
 ENTITY_FIELDS: dict[str, list[str]] = {
@@ -208,22 +231,36 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
     "sphere": {"params": ["radius"], "refs": {"at": (_SEL_OR_DATUM, False)}},
     "cone": {"params": ["r1", "r2", "height"], "refs": {"at": (_SEL_OR_DATUM, False)}},
     "torus": {"params": ["major_r", "minor_r"], "refs": {"at": (_SEL_OR_DATUM, False)}},
-    "extrude": {"params": ["mode", "end", "depth"], "refs": {"profile": (_SEL_LIST, True)}},
+    "extrude": {"params": ["mode", "end", "depth"],
+                "refs": {"profile": (_SEL_LIST, True),
+                         # geometry-driven end targets (up_to_surface/offset_from_surface/
+                         # up_to_vertex/up_to_body); a face/vertex/body selector, per direction.
+                         "up_to": (_SEL_OR_DATUM, False),
+                         "up_to2": (_SEL_OR_DATUM, False)}},
     "revolve": {"params": ["mode", "angle"], "refs": {"profile": (_SEL_LIST, True),
                                                       "axis": (_SEL_OR_DATUM, True)}},
     "sweep": {"params": ["mode"], "refs": {"profile": (_SEL_LIST, True),
-                                           "path": (_SEL_OR_DATUM, True)}},
-    "loft": {"params": ["mode"], "refs": {"sections": (_SEL_LIST, True)}},
+                                           "path": (_SEL_OR_DATUM, True),
+                                           "guides": (_SEL_LIST, False)}},
+    "loft": {"params": ["mode"], "refs": {"sections": (_SEL_LIST, True),
+                                          "centerline": (_SEL_OR_DATUM, False),
+                                          "guides": (_SEL_LIST, False)}},
     "helix": {"params": ["pitch", "height"], "refs": {"base": (_SEL_OR_DATUM, True)}},
     # fillet: edges/radius required only on the normal path; the full_round path
     # uses params.full_round + refs.middle_face (enforced in _validate_feature).
     "fillet": {"params": [], "refs": {"edges": (_SEL_LIST, False),
-                                      "middle_face": (_SEL_OR_DATUM, False)}},
-    "chamfer": {"params": ["length"], "refs": {"edges": (_SEL_LIST, True)}},
+                                      "middle_face": (_SEL_OR_DATUM, False),
+                                      "face_set_a": (_SEL_LIST, False),
+                                      "face_set_b": (_SEL_LIST, False)}},
+    "chamfer": {"params": ["length"], "refs": {"edges": (_SEL_LIST, False),
+                                               "vertices": (_SEL_LIST, False),
+                                               "reference_face": (_SEL_OR_DATUM, False)}},
     "shell": {"params": ["thickness"], "refs": {"remove": (_SEL_LIST, False)}},
     "draft": {"params": ["angle"], "refs": {"neutral": (_SEL_OR_DATUM, True),
                                             "pull": (_SEL_OR_DATUM, False),
-                                            "faces": (_SEL_LIST, True)}},
+                                            "faces": (_SEL_LIST, True),
+                                            # parting-line edges for parting_line / step modes
+                                            "parting": (_SEL_LIST, False)}},
     "hole": {"params": ["style", "end"], "refs": {"face": (_SEL_OR_DATUM, False),
                                                   "positions": (_SEL_LIST, False),
                                                   "positions_sketch": (_SEL_OR_DATUM, False),
@@ -270,6 +307,33 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
     "asm_circular_pattern": {"params": ["count", "angle"],
                              "refs": {"axis": (_SEL_OR_DATUM, True),
                                       "components": (_COMP_LIST, True)}},
+    # Surfacing — open-surface body features (kind="surface"). Schema entries land here up front so
+    # later surfacing batches add only compilers, never touch the schema. surf_planar is the only
+    # one with a compiler today (the foundation canary); the rest validate but have no compiler yet.
+    "surf_extrude": {"params": ["end", "depth"], "refs": {"profile": (_SEL_LIST, True)}},
+    "surf_revolve": {"params": ["angle"], "refs": {"profile": (_SEL_LIST, True),
+                                                   "axis": (_SEL_OR_DATUM, True)}},
+    "surf_sweep": {"params": [], "refs": {"profile": (_SEL_LIST, True),
+                                          "path": (_SEL_OR_DATUM, True),
+                                          "guides": (_SEL_LIST, False)}},
+    "surf_loft": {"params": [], "refs": {"sections": (_SEL_LIST, True),
+                                         "guides": (_SEL_LIST, False),
+                                         "centerline": (_SEL_OR_DATUM, False)}},
+    "surf_planar": {"params": [], "refs": {"profile": (_SEL_LIST, True)}},
+    "surf_offset": {"params": ["distance"], "refs": {"faces": (_SEL_LIST, True)}},
+    "surf_ruled": {"params": [], "refs": {"edge_a": (_SEL_OR_DATUM, True),
+                                          "edge_b": (_SEL_OR_DATUM, True)}},
+    "surf_boundary": {"params": [], "refs": {"dir1": (_SEL_LIST, True),
+                                             "dir2": (_SEL_LIST, False)}},
+    "surf_fill": {"params": [], "refs": {"edges": (_SEL_LIST, True)}},
+    "surf_knit": {"params": [], "refs": {"surfaces": (_SEL_LIST, True)}},
+    "surf_thicken": {"params": ["thickness"], "refs": {"surface": (_SEL_OR_DATUM, True)}},
+    "surf_trim": {"params": ["keep"], "refs": {"surface": (_SEL_OR_DATUM, True),
+                                               "tool": (_SEL_OR_DATUM, True)}},
+    "surf_untrim": {"params": [], "refs": {"faces": (_SEL_LIST, True)}},
+    "surf_delete_face": {"params": [], "refs": {"faces": (_SEL_LIST, True)}},
+    "surf_replace_face": {"params": [], "refs": {"faces": (_SEL_LIST, True),
+                                                 "surface": (_SEL_OR_DATUM, True)}},
 }
 
 
@@ -586,15 +650,29 @@ def validate_feature(
         errs += _validate_sketch_params(params, f"{where}.params", globals_names)
 
     if ftype == "fillet":
-        # Conditional requiredness: full_round needs middle_face; else edges+radius.
+        # Conditional requiredness: full_round needs middle_face; face fillet needs two face
+        # sets; else edges + radius.
         if params.get("full_round"):
             if not refs.get("middle_face"):
                 errs.append(f"{where}.refs.middle_face: required for full_round fillet")
+        elif params.get("face_fillet"):
+            if not refs.get("face_set_a") or not refs.get("face_set_b"):
+                errs.append(f"{where}.refs.face_set_a/face_set_b: required for face fillet")
+            if "radius" not in params:
+                errs.append(f"{where}.params.radius: required for fillet")
         else:
             if "radius" not in params:
                 errs.append(f"{where}.params.radius: required for fillet")
             if not refs.get("edges"):
                 errs.append(f"{where}.refs.edges: required for fillet")
+
+    if ftype == "chamfer":
+        # Vertex chamfer needs vertices; otherwise the standard edge list.
+        if params.get("vertex_chamfer"):
+            if not refs.get("vertices"):
+                errs.append(f"{where}.refs.vertices: required for vertex chamfer")
+        elif not refs.get("edges"):
+            errs.append(f"{where}.refs.edges: required for chamfer")
 
     known_slots = spec["refs"]
     for slot, (form, required) in known_slots.items():
@@ -917,8 +995,10 @@ def validate_assembly(doc: Any) -> list[str]:
         if not isinstance(m.get("suppressed"), bool):
             errs.append(f"{loc}.suppressed: required bool")
         refs = m.get("refs")
-        if not isinstance(refs, list) or len(refs) != 2:
-            errs.append(f"{loc}.refs: must be exactly 2 entries")
+        lo_r, hi_r = MATE_REF_COUNTS.get(mtype, (2, 2))
+        if not isinstance(refs, list) or not (lo_r <= len(refs) <= hi_r):
+            want = f"{lo_r}" if lo_r == hi_r else f"{lo_r}..{hi_r}"
+            errs.append(f"{loc}.refs: {mtype} takes {want} entries")
             refs = []
         for j, r in enumerate(refs):
             rloc = f"{loc}.refs[{j}]"
@@ -933,6 +1013,24 @@ def validate_assembly(doc: Any) -> list[str]:
                 errs.append(f"{loc}.value: required for {mtype}")
             else:
                 errs += validate_dim(m["value"], f"{loc}.value", globals_names)
+        elif mtype in MATE_COUPLING_SPEC:
+            # Coupling/limit mate: value is an object carrying scalar params (gear ratio, screw
+            # pitch, limit min/max). Required keys must be present + numeric; an optional "value"
+            # key is a dim. Defaults in mate_solver cover the rest.
+            req, opt = MATE_COUPLING_SPEC[mtype]
+            val = m.get("value")
+            if not isinstance(val, dict):
+                if req:
+                    errs.append(f"{loc}.value: {mtype} needs an object with {req}")
+            else:
+                for k in req:
+                    if not _is_num(val.get(k)):
+                        errs.append(f"{loc}.value.{k}: required number for {mtype}")
+                for k in opt:
+                    if val.get(k) is not None and not _is_num(val.get(k)):
+                        errs.append(f"{loc}.value.{k}: must be a number")
+                if isinstance(val.get("value"), (int, float)):
+                    errs += validate_dim(val, f"{loc}.value", globals_names)
         elif m.get("value") is not None:
             errs.append(f"{loc}.value: {mtype} must not carry a value")
 

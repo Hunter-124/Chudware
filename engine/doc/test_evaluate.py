@@ -83,6 +83,17 @@ def test_mass_props_steel_cube() -> None:
         f"Izz={Izz:.2f} expected ≈{I_expected_g_mm2:.2f} g·mm²"
     )
 
+    # Principal moments: a cube's three are equal (≈ m·a²/6), ascending; axes are orthonormal.
+    pm = result["principal_moments"]
+    assert len(pm) == 3 and pm == sorted(pm), f"principal_moments must be 3, ascending: {pm}"
+    for p in pm:
+        assert _rel_close(p, I_expected_g_mm2, 2.0), f"principal moment {p:.1f} != {I_expected_g_mm2:.1f}"
+    axes = result["principal_axes"]
+    assert len(axes) == 3 and all(len(a) == 3 for a in axes), "principal_axes must be 3x3"
+    for a in axes:
+        n = (a[0] ** 2 + a[1] ** 2 + a[2] ** 2) ** 0.5
+        assert abs(n - 1.0) < 1e-6, f"principal axis not unit length: {a}"
+
     print(f"test_mass_props_steel_cube: PASS  volume={result['volume_mm3']:.1f} mm³, "
           f"mass={result['mass_g']:.3f} g, Ixx={Ixx:.1f} g·mm²")
 

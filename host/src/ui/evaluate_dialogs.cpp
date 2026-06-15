@@ -5,6 +5,7 @@
 
 #include "imgui.h"
 
+#include "metrics.h"
 #include "../core/app_state.h"
 #include "../renderer.h"
 #include "../ui_theme.h"
@@ -109,7 +110,7 @@ void EvaluateDialogs::runFieldEval(AppState& st, const std::string& method,
 }
 
 bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
-    if (cmdId == "eval_mass_props") { runEval(st, "eval_mass", nlohmann::json::object()); openWindow_ = "mass"; title_ = "Mass Properties"; return true; }
+    if (cmdId == "eval_mass_props") { runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}}); openWindow_ = "mass"; title_ = "Mass Properties"; return true; }
     if (cmdId == "eval_measure") {
         nlohmann::json refs = selectionRefs(st);
         runEval(st, "eval_measure", {{"refs", refs}});
@@ -152,7 +153,7 @@ bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
 void EvaluateDialogs::draw(AppState& st) {
     if (openWindow_.empty()) return;
     bool open = true;
-    ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(340), 0), ImGuiCond_Appearing);
     if (ImGui::Begin(title_.c_str(), &open)) {
         if (pending_) {
             // C39: the eval is in flight on the dispatch thread; the result fills in when
@@ -167,6 +168,27 @@ void EvaluateDialogs::draw(AppState& st) {
             ImGui::TextWrapped("%s", errorText_.c_str());
             ImGui::PopStyleColor();
         } else if (openWindow_ == "mass") {
+            // Material override — density (g/cm3) is forwarded to the engine's eval_mass; changing
+            // the material preset or the density re-runs the evaluation. Last preset = Custom.
+            static const struct { const char* name; float d; } kMaterials[] = {
+                {"Steel", 7.85f}, {"Stainless", 8.00f}, {"Aluminum", 2.70f}, {"Titanium", 4.51f},
+                {"Brass", 8.50f}, {"ABS plastic", 1.05f}, {"PLA", 1.24f}, {"Custom", 0.0f},
+            };
+            const int kCustom = (int)(sizeof(kMaterials) / sizeof(kMaterials[0])) - 1;
+            ImGui::SetNextItemWidth(140 * ui::uiScale);
+            if (ImGui::Combo("Material", &massMaterial_,
+                             "Steel\0Stainless\0Aluminum\0Titanium\0Brass\0ABS plastic\0PLA\0Custom\0")) {
+                if (massMaterial_ != kCustom) massDensity_ = kMaterials[massMaterial_].d;
+                runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}});
+            }
+            ImGui::SetNextItemWidth(140 * ui::uiScale);
+            if (ImGui::InputFloat("Density (g/cm3)", &massDensity_, 0.0f, 0.0f, "%.3f"))
+                massMaterial_ = kCustom;
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                if (massDensity_ < 0.0f) massDensity_ = 0.0f;
+                runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}});
+            }
+            ImGui::Separator();
             ImGui::Text("Volume:  %.3f mm3", result_.value("volume_mm3", 0.0));
             ImGui::Text("Mass:    %.3f g", result_.value("mass_g", 0.0));
             if (result_.contains("com") && result_["com"].is_array() && result_["com"].size() == 3)
@@ -182,8 +204,43 @@ void EvaluateDialogs::draw(AppState& st) {
                     ImGui::Text("%12.2f %12.2f %12.2f",
                                 I[r*3+0].get<double>(), I[r*3+1].get<double>(), I[r*3+2].get<double>());
             }
+            // Principal moments of inertia (g.mm2) + their axes (unit vectors at the CoM).
+            if (result_.contains("principal_moments") && result_["principal_moments"].is_array() &&
+                result_["principal_moments"].size() == 3 &&
+                result_.contains("principal_axes") && result_["principal_axes"].is_array() &&
+                result_["principal_axes"].size() == 3) {
+                ImGui::SeparatorText("Principal axes (g.mm2)");
+                const auto& Pm = result_["principal_moments"];
+                const auto& Pa = result_["principal_axes"];
+                for (int i = 0; i < 3; ++i) {
+                    if (!Pa[i].is_array() || Pa[i].size() != 3) continue;
+                    ImGui::Text("Px%d %12.2f  [% .3f % .3f % .3f]", i + 1,
+                                Pm[i].get<double>(),
+                                Pa[i][0].get<double>(), Pa[i][1].get<double>(), Pa[i][2].get<double>());
+                }
+            }
         } else if (openWindow_ == "measure") {
             std::string kind = result_.value("kind", std::string("(none)"));
+            auto numAt = [&](const char* k, double& out) -> bool {
+                if (result_.contains(k) && result_[k].is_number()) { out = result_[k].get<double>(); return true; }
+                return false;
+            };
+            // One-line summary of this measurement (for the running History list, SW-style).
+            std::string summary; double v;
+            if (numAt("distance", v))    summary = "Distance " + evalLen(st, v);
+            else if (numAt("length", v)) summary = "Length " + evalLen(st, v);
+            else if (numAt("radius", v)) summary = "Radius " + evalLen(st, v) + " (Dia " + evalLen(st, 2.0 * v) + ")";
+            else if (numAt("area", v))   { char b[64]; std::snprintf(b, sizeof(b), "Area %.3f mm2", v); summary = b; }
+            else if (numAt("volume", v)) { char b[64]; std::snprintf(b, sizeof(b), "Volume %.3f mm3", v); summary = b; }
+            double ang;
+            if (numAt("angle", ang)) { char b[48]; std::snprintf(b, sizeof(b), "Angle %.3f deg", ang);
+                                       summary = summary.empty() ? std::string(b) : summary + ", " + b; }
+            // Accumulate: append each completed measurement exactly once (gen_ bumps per eval).
+            if (!pending_ && !summary.empty() && gen_ != measureLoggedGen_) {
+                measureLoggedGen_ = gen_;
+                measureLog_.push_back(summary);
+            }
+
             ImGui::Text("Kind: %s", kind.c_str());
             auto show = [&](const char* k, const char* unit) {
                 if (result_.contains(k) && result_[k].is_number())
@@ -196,9 +253,20 @@ void EvaluateDialogs::draw(AppState& st) {
                     ImGui::Text("%s: %s", k, evalLen(st, result_[k].get<double>()).c_str());
             };
             showLen("distance"); show("angle", "deg"); showLen("length");
-            show("area", "mm2"); showLen("radius"); show("volume", "mm3");
+            show("area", "mm2"); showLen("radius");
+            { double r; if (numAt("radius", r)) ImGui::Text("diameter: %s", evalLen(st, 2.0 * r).c_str()); }
+            show("volume", "mm3");
             if (kind == "(none)" || result_.empty())
                 ImGui::TextDisabled("Select 1-2 faces/edges/vertices, then Measure.");
+            // Running history (SolidWorks Measure accumulates) — newest first, with Clear.
+            if (!measureLog_.empty()) {
+                ImGui::SeparatorText("History");
+                if (ImGui::SmallButton("Clear")) { measureLog_.clear(); measureLoggedGen_ = -1; }
+                ImGui::BeginChild("##measlog", ImVec2(0, 120 * ui::uiScale), ImGuiChildFlags_Border);
+                for (size_t i = measureLog_.size(); i-- > 0; )
+                    ImGui::TextUnformatted(measureLog_[i].c_str());
+                ImGui::EndChild();
+            }
         } else if (openWindow_ == "section") {
             ImGui::Text("Area:     %.3f mm2", result_.value("area_mm2", 0.0));
             if (result_.contains("centroid") && result_["centroid"].is_array() &&

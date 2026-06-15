@@ -64,11 +64,20 @@ def mass_props(
         com         : [x, y, z]  mm
         inertia     : [9 floats]  kg·mm² (row-major Ixx Ixy Ixz ...)
         material    : {"density_g_cm3": ...}
+
+    SURFACE bodies (open shells / lone faces — not SOLID/COMPSOLID, or solids whose volume is
+    ≈0 while their surface area is positive) have no enclosed volume, so this returns an AREA
+    report instead: ``{"is_surface": True, "area_mm2", "volume_mm3": 0.0, "mass_g": 0.0,
+    "com": <surface centroid>, "inertia": [0]*9, "material": {...}}``. The solid path below is
+    untouched, so solid mass-props stay byte-identical.
     """
     raw = _unwrap(shape)
 
     # Linear density conversion: 1 g/cm³ = 1e-3 g/mm³
     density_g_mm3 = density_g_cm3 * 1e-3
+
+    if _is_surface_shape(raw):
+        return _surface_props(raw, density_g_cm3)
 
     props = GProp_GProps()
     BRepGProp.VolumeProperties_s(raw, props)
@@ -87,11 +96,76 @@ def mass_props(
         for col in range(1, 4):
             inertia.append(inertia_mat.Value(row, col) * density_g_mm3)
 
+    # Principal moments + axes: eigendecomposition of the (symmetric) inertia tensor. eigh returns
+    # ascending eigenvalues (principal moments, g·mm²) and orthonormal eigenvectors (the principal
+    # axes, as columns). Each principal_axes[i] is a unit axis vector aligned with principal_moments[i].
+    import numpy as np
+    I_mat = np.array(inertia, dtype=float).reshape(3, 3)
+    I_mat = 0.5 * (I_mat + I_mat.T)  # kill fp asymmetry before eigh
+    evals, evecs = np.linalg.eigh(I_mat)
+    principal_moments = [float(v) for v in evals]
+    principal_axes = [[float(evecs[r, c]) for r in range(3)] for c in range(3)]
+
     return {
         "volume_mm3": float(volume_mm3),
         "mass_g": float(mass_g),
         "com": [float(v) for v in com],
         "inertia": [float(v) for v in inertia],
+        "principal_moments": principal_moments,
+        "principal_axes": principal_axes,
+        "material": {"density_g_cm3": float(density_g_cm3)},
+    }
+
+
+def _is_surface_shape(raw) -> bool:
+    """True when *raw* has no enclosed volume — an open SHELL / lone FACE, or a SOLID whose
+    VolumeProperties mass is ≈0 while its SurfaceProperties area is positive.
+
+    A SOLID/COMPSOLID with real volume returns False (the classic mass path). Anything else
+    (FACE, SHELL, or a degenerate solid) is treated as a surface so mass_props never divides a
+    zero volume or reports a spurious mass. Robust to OCP errors (defaults to solid path)."""
+    from OCP.TopAbs import TopAbs_COMPSOLID, TopAbs_SOLID
+    try:
+        stype = raw.ShapeType()
+    except Exception:  # noqa: BLE001
+        return False
+    if stype in (TopAbs_SOLID, TopAbs_COMPSOLID):
+        # A true solid still might be a degenerate sheet (vol≈0, area>0) — treat that as surface.
+        try:
+            vp = GProp_GProps()
+            BRepGProp.VolumeProperties_s(raw, vp)
+            sp = GProp_GProps()
+            BRepGProp.SurfaceProperties_s(raw, sp)
+            return abs(vp.Mass()) < 1e-9 and sp.Mass() > 1e-9
+        except Exception:  # noqa: BLE001
+            return False
+    # A COMPOUND may wrap solids — only call it a surface when it has no solid sub-shape.
+    from OCP.TopAbs import TopAbs_COMPOUND
+    if stype == TopAbs_COMPOUND:
+        try:
+            solids = TopTools_IndexedMapOfShape()
+            TopExp.MapShapes_s(raw, TopAbs_SOLID, solids)
+            if solids.Extent() > 0:
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+    # FACE / SHELL / WIRE / solid-free compound → surface report.
+    return True
+
+
+def _surface_props(raw, density_g_cm3: float) -> dict:
+    """Area report for a surface body: area (mm²), surface centroid, zero volume/mass/inertia."""
+    sp = GProp_GProps()
+    BRepGProp.SurfaceProperties_s(raw, sp)
+    area_mm2 = float(sp.Mass())  # unit-density surface "mass" = area
+    com_pt = sp.CentreOfMass()
+    return {
+        "is_surface": True,
+        "area_mm2": area_mm2,
+        "volume_mm3": 0.0,
+        "mass_g": 0.0,
+        "com": [float(com_pt.X()), float(com_pt.Y()), float(com_pt.Z())],
+        "inertia": [0.0] * 9,
         "material": {"density_g_cm3": float(density_g_cm3)},
     }
 

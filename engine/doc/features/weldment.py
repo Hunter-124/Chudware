@@ -24,12 +24,14 @@ bodies (an assembly of members) so each is individually addressable for the futu
 Params
 ------
 - ``profile``: a library profile name (``square_tube`` | ``rect_tube`` | ``round_tube`` |
-  ``angle_L`` | ``flat_bar`` | ``c_channel``).
+  ``angle_L`` | ``flat_bar`` | ``c_channel`` | ``i_beam`` | ``t_section``).
 - per-profile dimension keys (mm), e.g. ``size``/``thickness`` for ``square_tube`` — any missing
   key falls back to the library default.
 - ``angle``: rotation of the profile about the path (deg, default 0).
 - ``justify``: ``"center"`` (default) | ``"corner"`` — SolidWorks "Locate Profile" extremes.
-- ``trim_corners``: bool (default true) — mitre-trim members that share a sketch vertex.
+- ``trim_corners``: bool (default true) — trim members that meet at a joint.
+- ``joint``: ``"miter"`` (default) | ``"butt"`` | ``"cope"`` — SolidWorks "Trim/Extend" joint type
+  (see "Corner trim" below). Only applies when ``trim_corners`` is true.
 
 Refs
 ----
@@ -38,14 +40,30 @@ Refs
 
 Corner trim (joint type)
 ------------------------
-Where two members meet at a shared sketch vertex we cut BOTH with the **mitre plane** through the
-vertex: the plane that bisects the angle between the two segment directions (its normal is the
-bisector of the two outgoing tangents). Each member is subtracted by the half-space on the OTHER
-member's side, so neither crosses the mitre plane — a clean, mutual mitre with no interference.
-This is robust for coplanar straight segments meeting at a vertex (the common weldment-frame case).
-Limitations: only straight (line) segments are mitred (arcs are swept but butt at their ends);
-a vertex shared by 3+ members trims each adjacent pair independently (the result is well-defined
-but not a single fitted gusset); near-collinear members (≈180°) are left untrimmed.
+``joint`` selects how meeting members are trimmed (SolidWorks "Trim/Extend"):
+
+* ``miter`` (default) — where two members meet at a shared sketch vertex we cut BOTH with the
+  **mitre plane** through the vertex: the plane that bisects the angle between the two segment
+  directions (its normal is the bisector of the two outgoing tangents). Each member is subtracted by
+  the half-space on the OTHER member's side, so neither crosses the mitre plane — a clean, mutual
+  mitre with no interference. Robust for coplanar straight segments meeting at a vertex.
+* ``butt`` — one member runs through and the other is trimmed: the trimmed member's end is
+  **square-cut against the through member's near face** so it stops flush at the through member's
+  outer surface (no interpenetration, a flat butt joint). The through member stays full.
+* ``cope`` — like butt, but the trimmed member's end is cut to the **actual contour** of the
+  through member by boolean-subtracting the through member's solid (a fish-mouth / saddle cut — what
+  a fabricator flame-cuts so a round tube laps cleanly onto another). The through member stays full.
+
+Through vs trimmed for butt/cope: a member whose endpoint lands on the INTERIOR of another member's
+span (a T-joint) is the trimmed one and the spanned member is the through member; at a shared-vertex
+corner the LONGER member runs through and the shorter is trimmed (a robust default — SolidWorks lets
+the user choose either side).
+
+Limitations: only straight (line) members are trimmed (arcs are swept but butt at their ends);
+a vertex shared by 3+ members trims each adjacent pair independently (well-defined but not a single
+fitted gusset); near-collinear members (≈180°) are left untrimmed. The butt cut's set-back uses the
+section's bounding-box half-diagonal, so for a non-axis-aligned approach it may leave a hair of
+clearance rather than a perfectly flush contact — it never interpenetrates.
 
 Cut-list data
 -------------
@@ -258,6 +276,195 @@ def _subtract_halfspace(solid: Solid, point: Vector, outward: Vector, reach: flo
         return solid
 
 
+# ----------------------------------------------------------------- corner trim (butt / cope)
+#
+# SolidWorks "Trim/Extend" lets a member be *butt* or *cope* trimmed where it meets another:
+#   * butt — the trimmed member is square-cut against the flat NEAR FACE of the through member
+#     (its end stops at the through member's outer surface; no interpenetration, a small gap-free
+#     square cut).
+#   * cope (a.k.a. coped / fish-mouth) — the trimmed member's end is cut to the actual CONTOUR of
+#     the through member it laps onto (boolean-subtract the through member's solid), so a round
+#     tube coping onto a round tube gets the saddle cut a real fabricator would flame-cut.
+#
+# Through vs trimmed: one member runs FULL (the "through" member), the other is the one trimmed
+# back. We resolve this per joint:
+#   * end-to-mid (T): a member whose endpoint lands on the INTERIOR of another member's span is
+#     trimmed; the spanned member is the through member (unambiguous).
+#   * shared endpoint (L/X corner): the LONGER member is taken as the through member and the
+#     shorter one is trimmed against it (a robust default; SW lets the user pick either side).
+
+
+def _axis_param_of_point(m: dict[str, Any], pt: Vector) -> float:
+    """Parametric position (0=start..1=end) of ``pt`` projected onto member ``m``'s axis."""
+    a = m["start"]
+    b = m["end"]
+    ab = b - a
+    L2 = ab.dot(ab)
+    if L2 < 1e-18:
+        return 0.0
+    return (pt - a).dot(ab) / L2
+
+
+def _point_on_axis(m: dict[str, Any], pt: Vector) -> tuple[bool, float]:
+    """Is ``pt`` (approximately) ON member ``m``'s straight axis line, and at what 0..1 param?
+
+    Returns ``(on_segment_interior, t)``. ``on_segment_interior`` is True only when the foot of the
+    perpendicular lies strictly between the ends (so an endpoint touch is NOT counted as interior).
+    """
+    a = m["start"]
+    b = m["end"]
+    ab = b - a
+    L = ab.length
+    if L < 1e-9:
+        return (False, 0.0)
+    t = max(0.0, min(1.0, (pt - a).dot(ab) / (L * L)))
+    foot = a + ab * t
+    perp = (pt - foot).length
+    # "on the axis" within a generous tolerance (members share a sketch plane / exact coords).
+    on_line = perp < 1e-4
+    interior = on_line and (0.02 < t < 0.98)
+    return (interior, t)
+
+
+def _through_trimmed(mi: dict[str, Any], mj: dict[str, Any], near) -> tuple[dict | None, dict | None, Vector | None]:
+    """Classify a joint between members ``mi`` and ``mj``.
+
+    Returns ``(through, trimmed, joint_point)`` or ``(None, None, None)`` if they do not meet.
+    Handles end-to-mid (T) joints and shared-endpoint (L/X) joints.
+    """
+    # End-to-mid: does one member's endpoint land on the OTHER member's interior span?
+    for ender, spanner in ((mi, mj), (mj, mi)):
+        for ep in (ender["start"], ender["end"]):
+            interior, _t = _point_on_axis(spanner, ep)
+            if interior:
+                return spanner, ender, Vector(ep)
+
+    # Shared endpoint (corner): the longer member runs through, the shorter is trimmed.
+    shared, _ti, _tj = _shared_vertex_tangents(mi, mj, near)
+    if shared is not None:
+        if mi["length"] >= mj["length"]:
+            return mi, mj, Vector(shared)
+        return mj, mi, Vector(shared)
+    return None, None, None
+
+
+def _butt_cut(trimmed: dict[str, Any], through: dict[str, Any], joint: Vector,
+              reach: float) -> Solid:
+    """Square-cut the ``trimmed`` member against the NEAR FACE of the ``through`` member.
+
+    The cut plane is perpendicular to the trimmed member's axis (a square cut) and positioned at the
+    through member's outer surface on the side the trimmed member approaches from, so the trimmed
+    end stops flush against the through member instead of crossing into it.
+    """
+    # Trimmed member axis, oriented to point FROM the trimmed member's far end TOWARD the joint
+    # (the direction the trimmed member grows into the through member).
+    axis = (trimmed["end"] - trimmed["start"])
+    if axis.length < 1e-9:
+        return trimmed["solid"]
+    axis = axis.normalized()
+    # Make `into` point toward the through member from the trimmed member's body.
+    far_end = trimmed["start"] if (trimmed["end"] - joint).length < (trimmed["start"] - joint).length else trimmed["end"]
+    into = (joint - far_end)
+    if into.dot(axis) < 0:
+        axis = axis * -1.0
+    # Half-extent of the through member across the joint: distance from the through axis to the
+    # joint along the trimmed member's approach. Position the square cut at the through member's
+    # near surface = joint pulled back by that half-extent along the approach direction.
+    half = _through_half_extent(through, axis)
+    cut_at = joint - axis * half
+    # Remove everything PAST the cut plane (the +axis side = into the through member).
+    return _subtract_halfspace(trimmed["solid"], cut_at, axis, reach)
+
+
+def _through_half_extent(through: dict[str, Any], approach: Vector) -> float:
+    """Distance from the through member's axis to its outer surface, measured along ``approach``.
+
+    Approximated from the through member's section envelope projected onto the approach direction
+    (resolved into the plane perpendicular to the through axis). For the common right-angle frame
+    this is just half the relevant envelope dimension.
+    """
+    env = through.get("env")
+    if not env:
+        return 0.0
+    w, h = env
+    taxis = (through["end"] - through["start"])
+    if taxis.length < 1e-9:
+        return max(w, h) / 2.0
+    taxis = taxis.normalized()
+    # Component of the approach direction perpendicular to the through axis.
+    perp = approach - taxis * approach.dot(taxis)
+    if perp.length < 1e-9:
+        return max(w, h) / 2.0
+    # Conservative: use the half-diagonal of the envelope so the cut clears the surface for any
+    # in-plane orientation (a slight over-pull-back is harmless — the members still touch closely
+    # and never interpenetrate).
+    return 0.5 * math.hypot(w, h)
+
+
+def _cope_cut(trimmed: dict[str, Any], through_solid: Solid) -> Solid:
+    """Cope (fish-mouth) cut: boolean-subtract the ``through`` member's solid from the ``trimmed``
+    member, so the trimmed end takes the exact contour of the through member it laps onto."""
+    try:
+        result = trimmed["solid"] - through_solid
+        result = _to_solid_normalized(result)
+        # A boolean cut can split the member into pieces (rare for a clean lap); keep the largest.
+        try:
+            solids = result.solids()
+        except Exception:  # noqa: BLE001
+            solids = []
+        if len(solids) > 1:
+            result = max(solids, key=lambda s: getattr(s, "volume", 0.0))
+        if getattr(result, "volume", 0.0) <= 1e-9:
+            return trimmed["solid"]  # cut would have erased the member — leave it
+        return result
+    except Exception:  # noqa: BLE001
+        return trimmed["solid"]
+
+
+def _butt_cope_trim(members: list[dict[str, Any]], reach: float, mode: str) -> None:
+    """Butt- or cope-trim members at their joints, mutating each member dict's ``solid`` in place.
+
+    ``mode`` is ``"butt"`` or ``"cope"``. For each meeting pair we classify a through/trimmed member
+    and cut the trimmed one. Cope subtracts the through member's ORIGINAL (untrimmed) solid so the
+    contour is faithful regardless of trim order; butt squares the trimmed end off at the through
+    member's near surface. Best-effort per pair (a kernel hiccup leaves that member untouched).
+    """
+    _EPS = 1e-6
+
+    def _near(a: Vector, b: Vector) -> bool:
+        return (a - b).length < 1e-4
+
+    # Snapshot the original solids so cope subtraction is independent of how a member was itself
+    # already trimmed by an earlier pair.
+    for m in members:
+        m.setdefault("orig_solid", m["solid"])
+
+    n = len(members)
+    for i in range(n):
+        mi = members[i]
+        if not mi.get("straight"):
+            continue
+        for j in range(i + 1, n):
+            mj = members[j]
+            if not mj.get("straight"):
+                continue
+            through, trimmed, joint = _through_trimmed(mi, mj, _near)
+            if through is None or trimmed is None or joint is None:
+                continue
+            # Skip a near-collinear (straight-through) pair — nothing to trim.
+            ta = (through["end"] - through["start"])
+            tb = (trimmed["end"] - trimmed["start"])
+            if ta.length < _EPS or tb.length < _EPS:
+                continue
+            cosang = abs(ta.normalized().dot(tb.normalized()))
+            if cosang > 0.999:
+                continue
+            if mode == "cope":
+                trimmed["solid"] = _cope_cut(trimmed, through["orig_solid"])
+            else:  # butt
+                trimmed["solid"] = _butt_cut(trimmed, through, joint, reach)
+
+
 # --------------------------------------------------------------------------- compiler
 
 
@@ -277,6 +484,14 @@ def compile_weld_member(feat: dict, ctx: CompileContext) -> CompileOutput:
         raise FeatureError(f"weld_member: unknown justify '{justify}' (center|corner)")
     angle = ctx.dim(p, "angle", 0.0) if p.get("angle") is not None else 0.0
     trim_corners = bool(p.get("trim_corners", True))
+    # Joint (Trim/Extend) type: how members are trimmed where they meet.
+    #   "miter" (default) — mutual mitre at a shared vertex (legacy behaviour).
+    #   "butt"            — the trimmed member is square-cut against the through member's face.
+    #   "cope"            — the trimmed member is cut to the through member's contour (fish-mouth).
+    joint = p.get("joint", "miter")
+    if joint not in ("miter", "butt", "cope"):
+        raise FeatureError(
+            f"weld_member: unknown joint '{joint}' (miter|butt|cope)")
 
     sid = refs.get("sketch")
     if not isinstance(sid, str) or not sid:
@@ -297,6 +512,10 @@ def compile_weld_member(feat: dict, ctx: CompileContext) -> CompileOutput:
     try:
         face_local, dims, area = build_profile_face(
             profile, p, justify=justify, angle=angle)
+        # Section bounding-box envelope (w, h) — used by butt trim to find the through member's
+        # near-surface offset. Resolved from the same dims the face was built from.
+        from engine.doc.weld_profiles import get_profile
+        env = get_profile(profile).envelope(dims)
     except KeyError as exc:  # noqa: BLE001
         raise FeatureError(f"weld_member: unknown profile {exc}")
     except ValueError as exc:  # noqa: BLE001
@@ -316,14 +535,18 @@ def compile_weld_member(feat: dict, ctx: CompileContext) -> CompileOutput:
         members.append({
             "segment_id": eid, "solid": solid, "length": length,
             "start": start, "end": end, "t_start": t_start, "t_end": t_end,
-            "straight": straight, "area": area,
+            "straight": straight, "area": area, "env": env,
         })
 
-    # Mitre-trim shared corners (best-effort; never fails the feature).
+    # Trim shared corners / joints (best-effort; never fails the feature). The joint type selects
+    # mitre (mutual bevel), butt (square-cut to the through member's face) or cope (fish-mouth).
     if trim_corners and len(members) > 1:
         try:
             reach = max_len * 4.0
-            _mitre_trim(members, reach)
+            if joint == "miter":
+                _mitre_trim(members, reach)
+            else:
+                _butt_cope_trim(members, reach, joint)
         except Exception:  # noqa: BLE001
             pass  # leave members untrimmed on any trim error
 

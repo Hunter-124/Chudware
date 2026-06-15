@@ -96,6 +96,9 @@ class CompileOutput:
       boolean. ``None`` defaults to ``"add"`` in the core (primitives, bosses).
     - ``datum``: a :class:`Datum` to register (datum features only).
     - ``resolved``: resolved dim values to echo back in feature_status (``{param: float}``).
+    - ``kind``: the body kind this feature produced/replaced — ``"solid"`` (default, every
+      pre-surfacing feature) or ``"surface"`` (open/sheet surface bodies). The core stamps it
+      onto the BodyOut it produced so tessellation / mass-props / export branch on it.
     """
 
     bodies: list[Any] = field(default_factory=list)
@@ -103,6 +106,7 @@ class CompileOutput:
     op: str | None = None
     datum: Datum | None = None
     resolved: dict[str, float] = field(default_factory=dict)
+    kind: str = "solid"
 
 
 # --------------------------------------------------------------------------- context

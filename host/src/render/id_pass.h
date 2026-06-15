@@ -73,6 +73,10 @@ public:
     // and clearViewportForNewDoc() clears it.
     void setHiddenBodies(const std::set<uint32_t>& bodyIds) { hidden_ = bodyIds; }
 
+    // Keep picking in lock-step with Section View. A fragment is pickable only inside every
+    // active section half-space: dot(world, normal[i]) <= offset[i].
+    void setSectionClip(int count, const float normals[3][3], const float offsets[3]);
+
 private:
     // True when the encoded id belongs to a hidden body (body id lives in bits [31:24]).
     bool bodyHidden(uint32_t encoded) const {
@@ -111,6 +115,9 @@ private:
     std::vector<EdgeDraw> edges_;
     VertDraw verts_;  // all bodies' brep verts in one buffer; ids drawn one point at a time
     std::set<uint32_t> hidden_;  // AICM body ids hidden in the viewport (skip in render())
+    int clipCount_ = 0;
+    float clipNormals_[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
+    float clipOffsets_[3] = {0,0,0};
 };
 
 }  // namespace render

@@ -18,6 +18,9 @@ ROOT = appdata_root()
 RUNTIME = ROOT / "runtime"          # isolated python + wheels
 CACHE = ROOT / "cache"              # per-model outputs (stl/step/png)
 CONFIG = ROOT / "config.json"       # provider keys + settings
+LLAMACPP = ROOT / "llamacpp"        # optional managed llama.cpp server payload
+MODELS = ROOT / "models"            # user / bundled GGUF models
+VENDOR_PARTS = ROOT / "vendor_parts"  # approved/manual supplier CAD + metadata cache
 
 
 def model_dir(name: str) -> Path:

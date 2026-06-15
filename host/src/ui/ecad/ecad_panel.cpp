@@ -473,7 +473,7 @@ void drawLeftPanel(EcadEditorState& es) {
             const float s = ImGui::GetTextLineHeight();
             ImGui::GetWindowDrawList()->AddRectFilled(
                 p0, ImVec2(p0.x + s, p0.y + s), ui::Palette::toU32(&sw.x), 2.0f);
-            ImGui::Dummy(ImVec2(s + 6, s));
+            ImGui::Dummy(ImVec2(s + 6 * ui::uiScale, s));
             ImGui::SameLine();
             ImGui::TextColored(vis ? v4(pal.text) : v4(pal.textDisabled), "%s", ly.id.c_str());
             ImGui::PopID();
@@ -584,6 +584,60 @@ bool collectTraces(const nlohmann::json& results, int analysis,
     return !out.empty();
 }
 
+void drawSimMetadata(const nlohmann::json& results) {
+    const ui::Palette& pal = ui::palette;
+    if (!results.is_object()) return;
+
+    if (results.contains("convergence") && results["convergence"].is_object()) {
+        std::string summary;
+        bool allOk = true;
+        for (auto it = results["convergence"].begin(); it != results["convergence"].end(); ++it) {
+            const bool ok = it.value().is_boolean() ? it.value().get<bool>() : false;
+            allOk = allOk && ok;
+            if (!summary.empty()) summary += "  ";
+            summary += it.key() + std::string(ok ? ": ok" : ": review");
+        }
+        ImGui::TextColored(v4(allOk ? pal.statusOk : pal.statusWarn), "%s", summary.c_str());
+    }
+    if (results.contains("ms") && results["ms"].is_number()) {
+        ImGui::SameLine();
+        ImGui::TextColored(v4(pal.textDim), "%.2f ms", results["ms"].get<double>());
+    }
+    if (results.contains("log") && results["log"].is_array() && !results["log"].empty()) {
+        const auto& last = results["log"].back();
+        std::string msg = last.is_string() ? last.get<std::string>() : last.dump();
+        ImGui::TextWrapped("%s", msg.c_str());
+    }
+}
+
+bool drawScalarResults(const nlohmann::json& results) {
+    const ui::Palette& pal = ui::palette;
+    const char* keys[] = {"op", "dc", "tf", "noise", "four"};
+    for (const char* key : keys) {
+        if (!results.contains(key) || !results[key].is_object()) continue;
+        ImGui::TextColored(v4(pal.accent), "%s", key);
+        if (ImGui::BeginTable("##simScalarResults", 2,
+                              ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg)) {
+            ImGui::TableSetupColumn("Signal");
+            ImGui::TableSetupColumn("Value");
+            ImGui::TableHeadersRow();
+            int shown = 0;
+            for (auto it = results[key].begin(); it != results[key].end() && shown < 16; ++it, ++shown) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(it.key().c_str());
+                ImGui::TableSetColumnIndex(1);
+                std::string val = it.value().is_number() ? std::to_string(it.value().get<double>())
+                                                         : it.value().dump();
+                ImGui::TextUnformatted(val.c_str());
+            }
+            ImGui::EndTable();
+        }
+        return true;
+    }
+    return false;
+}
+
 // ---- bottom area: simulation waveform plot ----
 // A bordered plot rect with labeled axes, each voltage trace an auto-scaled colored polyline, and a
 // legend (node name + color) in the top-right corner. Drawn into the current child window with the
@@ -592,9 +646,12 @@ void drawSimPlot(const nlohmann::json& results, int analysis) {
     const ui::Palette& pal = ui::palette;
     const float sc = ui::uiScale;
 
+    drawSimMetadata(results);
+
     std::vector<PlotTrace> traces;
     std::string xLabel, yLabel;
     if (!collectTraces(results, analysis, traces, xLabel, yLabel)) {
+        if (drawScalarResults(results)) return;
         ImGui::TextColored(v4(pal.textDim),
                            "Simulated, but no voltage traces to plot for this analysis.");
         return;
@@ -696,7 +753,7 @@ void drawSimPlot(const nlohmann::json& results, int analysis) {
         const ImU32 c = traceColor((int)ti);
         const float sw = ImGui::GetTextLineHeight();
         const ImVec2 lp(p1.x - 110 * sc, ly);
-        dl->AddRectFilled(lp, ImVec2(lp.x + sw, lp.y + sw), c, 2.0f);
+        dl->AddRectFilled(lp, ImVec2(lp.x + sw, lp.y + sw), c, 2.0f * ui::uiScale);
         dl->AddText(ImVec2(lp.x + sw + 4 * sc, lp.y), ui::Palette::toU32(pal.text),
                     traces[ti].name.c_str());
         ly += sw + 3 * sc;

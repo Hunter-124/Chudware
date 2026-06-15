@@ -11,6 +11,7 @@
 #include "../ui_theme.h"   // ui::uiScale
 #include "doc_tabs.h"      // ui::openNewDocChooser (File > New)
 #include "feature_tree.h"  // Wave 3: ui::featureTreeActivePath (Save vs. Save As gating)
+#include "property_manager.h"  // View > PropertyManager checkmark queries PropertyManager::active()
 
 #include <filesystem>      // Wave 3: Recent-files menu labels
 
@@ -38,8 +39,8 @@ bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
         dl->AddLine(ImVec2(c.x - s, c.y), ImVec2(c.x + s, c.y), fg, th);
     } else if (kind == BTN_MAX) {
         if (maximized) {  // restore: two stacked squares
-            dl->AddRect(ImVec2(c.x - s + 2, c.y - s), ImVec2(c.x + s, c.y + s - 2), fg, 0, 0, th);
-            dl->AddRect(ImVec2(c.x - s, c.y - s + 2), ImVec2(c.x + s - 2, c.y + s), fg, 0, 0, th);
+            dl->AddRect(ImVec2(c.x - s + 2 * ui::uiScale, c.y - s), ImVec2(c.x + s, c.y + s - 2 * ui::uiScale), fg, 0, 0, th);
+            dl->AddRect(ImVec2(c.x - s, c.y - s + 2 * ui::uiScale), ImVec2(c.x + s - 2 * ui::uiScale, c.y + s), fg, 0, 0, th);
         } else {
             dl->AddRect(ImVec2(c.x - s, c.y - s), ImVec2(c.x + s, c.y + s), fg, 0, 0, th);
         }
@@ -165,7 +166,6 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             ImGui::MenuItem("Close", "Ctrl+W", false, false);  // per-tab close not reachable here
             if (ImGui::MenuItem("Quit", "Alt+F4")) glfwSetWindowShouldClose(win, 1);
         };
-
         auto drawEditMenu = [&]() {
             if (ImGui::MenuItem("Undo", "Ctrl+Z", false, hasDoc)) st.docUndo();
             if (ImGui::MenuItem("Redo", "Ctrl+Y", false, hasDoc)) st.docRedo();
@@ -184,10 +184,30 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
 
         auto drawViewMenu = [&]() {
             ImGui::MenuItem("Ribbon", nullptr, &st.showRibbon);
-            ImGui::MenuItem("FeatureManager", nullptr, &st.showFeatureTree);
-            ImGui::MenuItem("Configurations", nullptr, &st.showConfigPanel);
+            if (ImGui::MenuItem("FeatureManager", nullptr,
+                                st.showFeatureTree && st.leftPaneTab == AppState::LP_FeatureManager)) {
+                st.showFeatureTree = true;
+                st.leftPaneTab = AppState::LP_FeatureManager;
+            }
+            if (ImGui::MenuItem("PropertyManager", nullptr,
+                                st.showFeatureTree && st.leftPaneTab == AppState::LP_PropertyManager,
+                                st.propertyManager && st.propertyManager->active())) {
+                st.showFeatureTree = true;
+                st.leftPaneTab = AppState::LP_PropertyManager;
+            }
+            if (ImGui::MenuItem("ConfigurationManager", nullptr,
+                                st.showFeatureTree && st.leftPaneTab == AppState::LP_Configurations)) {
+                st.showFeatureTree = true;
+                st.leftPaneTab = AppState::LP_Configurations;
+            }
+            if (ImGui::MenuItem("Explorer", nullptr,
+                                st.showFeatureTree && st.leftPaneTab == AppState::LP_Explorer)) {
+                st.showFeatureTree = true;
+                st.leftPaneTab = AppState::LP_Explorer;
+            }
             ImGui::MenuItem("Design Table", nullptr, &st.showDesignTablePanel);
             ImGui::MenuItem("Cut List", nullptr, &st.showCutListPanel);
+            ImGui::MenuItem("Equations", nullptr, &st.showEquations);
             ImGui::MenuItem("AI Panel", nullptr, &st.showAIPanel);
             ImGui::MenuItem("Viewport", nullptr, &st.showViewport);
             ImGui::Separator();
@@ -206,7 +226,6 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             ImGui::Separator();
             if (ImGui::MenuItem("Reset layout")) st.resetLayout = true;
         };
-
         auto drawInsertMenu = [&]() {
             if (ImGui::BeginMenu("Feature", hasDoc)) {
                 if (ImGui::MenuItem("Extrude Boss/Base")) st.ribbonDispatch("extrude_boss");
@@ -258,8 +277,8 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             if (ImGui::MenuItem("Weldments"))   st.ribbonDispatch("weld_member");
             if (ImGui::MenuItem("ECAD / PCB"))  st.ribbonDispatch("ecad_new_sch");
             ImGui::Separator();
-            // Equations editor has no ribbon dispatch id / flag reachable from here — greyed.
-            ImGui::MenuItem("Equations...", nullptr, false, false);
+            // Equations / Global Variables editor (grafted from codex): opens the modeless dialog.
+            if (ImGui::MenuItem("Equations...")) st.showEquations = true;
             ImGui::Separator();
             if (ImGui::MenuItem("Options...")) st.openSettings = true;
             if (ImGui::MenuItem("Repair / install runtime", nullptr, false,
@@ -275,7 +294,6 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             ImGui::Separator();
             ImGui::MenuItem("Close All", nullptr, false, false);
         };
-
         auto drawHelpMenu = [&]() {
             if (ImGui::MenuItem("About AI-CAD")) st.showAbout = true;
             // Documentation / Keyboard Shortcuts have no backing yet — greyed placeholders.

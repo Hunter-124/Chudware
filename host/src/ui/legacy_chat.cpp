@@ -12,6 +12,7 @@
 #include "imgui.h"
 
 #include "legacy_chat.h"
+#include "metrics.h"          // ui::metrics::px/U/asmHeaderIconGap
 #include "activity_panel.h"  // C22b: for casting st.activityPanel
 #include "console_panel.h"   // drawConsoleBody for the consolidated AI panel's Console tab
 
@@ -43,7 +44,7 @@ void sectionHeader(ImFont* f, const char* text) {
     if (f) ImGui::PushFont(f);
     ImGui::TextUnformatted(text);
     if (f) ImGui::PopFont();
-    ImGui::Dummy(ImVec2(0, 2));
+    ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
 }
 void dimText(const char* t) {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
@@ -178,11 +179,11 @@ void drawPlanCard(const PlanInfo& plan, const ui::Fonts& fonts) {
     for (size_t i = 0; i < plan.parts.size(); ++i) {
         const PlanPart& p = plan.parts[i];
         ImGui::PushID((int)i);
-        ImGui::Dummy(ImVec2(0, 2));
+        ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
         ImGui::ColorButton("##pdot", partColor((int)i),
                            ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop,
-                           ImVec2(10, 10));
-        ImGui::SameLine(0, 7);
+                           ImVec2(10 * ui::uiScale, 10 * ui::uiScale));
+        ImGui::SameLine(0, 7 * ui::uiScale);
         ImGui::PushFont(fonts.medium);
         ImGui::TextUnformatted(p.name.c_str());
         ImGui::PopFont();
@@ -206,7 +207,7 @@ void drawPlanCard(const PlanInfo& plan, const ui::Fonts& fonts) {
         ImGui::PopID();
     }
     if (!plan.fit.empty()) {
-        ImGui::Dummy(ImVec2(0, 2));
+        ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
         dimText(("Fit: " + plan.fit).c_str());
     }
     ImGui::EndChild();
@@ -241,7 +242,7 @@ namespace ui {
 static void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     const auto& pal = ui::palette;
     const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
-    ImGui::Dummy(ImVec2(0, 2));
+    ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
     ImGui::PushStyleColor(ImGuiCol_ChildBg,
         ImVec4(pal.stepCardBg[0], pal.stepCardBg[1], pal.stepCardBg[2], pal.stepCardBg[3]));
     ImGui::BeginChild("##stepcard", ImVec2(0, 0),
@@ -374,7 +375,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     if (m.running) {
         // Inline live status: a simple braille spinner + the current phase, then a thin
         // accent progress bar so the pane reads as "working" at a glance.
-        ImGui::Dummy(ImVec2(0, 2));
+        ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
         static const char* kSpin[] = {"|", "/", "-", "\\"};
         int sp = (int)(ImGui::GetTime() * 8.0) & 3;
         ImGui::TextColored(accentCol, "%s", kSpin[sp]);
@@ -412,7 +413,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     if (st.logoIcon.id) {
         float h = ImGui::GetTextLineHeight();
         ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(h, h));
-        ImGui::SameLine(0, 6);
+        ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
     }
     ImGui::PushFont(st.fonts.h2);
     ImGui::TextUnformatted("AI-CAD Copilot");
@@ -618,7 +619,7 @@ static void drawRuntimeBanner(AppState& st) {
     }
     ImGui::EndChild();
     ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, 4));
+    ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
 }
 
 // ---- unified AI Copilot pane ----
@@ -664,7 +665,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     if (ImGui::IsItemHovered() && !canStart && !canRun)
         ImGui::SetTooltip("Runtime/worker not ready yet.");
 
-    ImGui::Dummy(ImVec2(0, 4));
+    ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
     ImGui::Separator();
 
     // ---- CONVERSATION — newest at bottom, auto-scroll. Empty-state suggestion chips. ----
@@ -672,7 +673,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     bool conversationEmpty = true;
     for (const ChatMsg& m : st.chat) if (m.fromUser) { conversationEmpty = false; break; }
     if (conversationEmpty) {
-        ImGui::Dummy(ImVec2(0, 4));
+        ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
         dimText("Try:");
         static const char* kExamples[] = {
             "a GoPro tripod mount adapter",
@@ -726,12 +727,12 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             ImGui::TextWrapped("%s", m.text.c_str());
             ImGui::EndChild();
             ImGui::PopStyleColor(2);
-            ImGui::Dummy(ImVec2(0, 6));
+            ImGui::Dummy(ImVec2(0, 6 * ui::uiScale));
             ImGui::PopID();
             continue;
         }
         drawAssistantTurn(st, m, fonts, logW);
-        ImGui::Dummy(ImVec2(0, 8));
+        ImGui::Dummy(ImVec2(0, 8 * ui::uiScale));
         ImGui::PopID();
     }
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 6) ImGui::SetScrollHereY(1.0f);

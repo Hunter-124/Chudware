@@ -4,6 +4,7 @@
 
 #include "imgui.h"
 
+#include "metrics.h"
 #include "status_bar.h"
 
 #include "../core/app_state.h"
@@ -38,7 +39,7 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
         ImVec2(dp0.x + dr + 1, dp0.y + ImGui::GetTextLineHeight() * 0.55f), dr,
         ImGui::ColorConvertFloat4ToU32(sc));
     sc.w = 1.0f;
-    ImGui::Dummy(ImVec2(dr * 2 + 8, 0));
+    ImGui::Dummy(ImVec2(dr * 2 + ui::metrics::px(8), 0));
     ImGui::SameLine();
     ImGui::TextColored(sc, "%s", st.status.c_str());
     // C18: while editing a sketch, show "Under/Fully/Over Defined + DOF" tinted by status.

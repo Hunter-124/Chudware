@@ -40,6 +40,19 @@ def stage_app(dst: Path) -> None:
     shutil.copy2(REPO / "requirements.txt", app / "requirements.txt")
 
 
+def stage_optional_payloads(dst: Path) -> dict:
+    staged: dict[str, bool] = {}
+    for name in ("llamacpp", "models"):
+        src = REPO / name
+        if src.exists():
+            shutil.copytree(src, dst / name, dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            staged[name] = True
+        else:
+            staged[name] = False
+    return staged
+
+
 def stage_wheels(dst: Path) -> dict:
     wh = dst / "wheelhouse"
     wh.mkdir(parents=True, exist_ok=True)
@@ -74,6 +87,7 @@ def build(out: Path, skip_wheels: bool, with_python: bool, make_zip: bool) -> di
 
     stage_app(dst)
     manifest["components"]["app"] = True
+    manifest["components"].update(stage_optional_payloads(dst))
 
     shutil.copy2(REPO / "installer" / "install.ps1", dst / "install.ps1")
     shutil.copy2(REPO / "installer" / "uninstall.ps1", dst / "uninstall.ps1")

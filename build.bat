@@ -84,6 +84,12 @@ for %%P in (engine agent mcp_server installer) do (
   robocopy "%ROOT%\%%P" "%DIST%\app\%%P" /MIR /XD __pycache__ build samples /XF *.pyc /NFL /NDL /NJH /NJS /NP >nul
   if errorlevel 8 goto :fail
 )
+for %%P in (llamacpp models) do (
+  if exist "%ROOT%\%%P" (
+    robocopy "%ROOT%\%%P" "%DIST%\%%P" /MIR /XD __pycache__ /XF *.pyc /NFL /NDL /NJH /NJS /NP >nul
+    if errorlevel 8 goto :fail
+  )
+)
 copy /y "%ROOT%\requirements.txt" "%DIST%\app\requirements.txt" >nul || goto :fail
 copy /y "%ROOT%\requirements.txt" "%DIST%\requirements.txt" >nul
 

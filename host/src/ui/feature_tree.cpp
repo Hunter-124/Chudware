@@ -1042,8 +1042,42 @@ static bool toolbarIconBtn(const char* id, const char* iconName, const char* too
 // "apply a just-opened doc" seam that resets the viewport AND refreshes the geometry (the old
 // path-strip open updated the tree but never loaded the mesh).
 
-// Save filter: native AI-CAD part only (Save/Save As always write .step+).
+// Save filter: native AI-CAD part only (a silent Save / first-save always writes .step+).
 static const char* kStepPlusFilter = "AI-CAD part (*.step+)\0*.step+\0All files (*.*)\0*.*\0";
+
+// Save-As filter (SolidWorks-style "save as other types"): native .step+ first (default), then the
+// neutral export formats. Picking a non-.step+ type EXPORTS via export_file instead of saving the
+// document — the active doc stays the .step+ (matches SW: "Save As" to STL/STEP exports a copy).
+static const char* kSaveAsFilter =
+    "AI-CAD part (*.step+)\0*.step+\0"
+    "STEP (*.step;*.stp)\0*.step;*.stp\0"
+    "STL (*.stl)\0*.stl\0"
+    "IGES (*.iges;*.igs)\0*.iges;*.igs\0"
+    "3MF (*.3mf)\0*.3mf\0"
+    "OBJ (*.obj)\0*.obj\0"
+    "PLY (*.ply)\0*.ply\0"
+    "glTF (*.gltf)\0*.gltf\0"
+    "glTF binary (*.glb)\0*.glb\0"
+    "BREP (*.brep)\0*.brep\0"
+    "All files (*.*)\0*.*\0";
+
+// Map a Save-As file extension to the engine export-format string, or "" for the native .step+
+// (and unknown extensions, which default to a native save).
+static std::string saveAsExportFormat(const std::string& path) {
+    std::string ext = std::filesystem::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    if (ext == ".step" || ext == ".stp") return "step";
+    if (ext == ".stl")                   return "stl";
+    if (ext == ".iges" || ext == ".igs") return "iges";
+    if (ext == ".3mf")                   return "3mf";
+    if (ext == ".obj")                   return "obj";
+    if (ext == ".ply")                   return "ply";
+    if (ext == ".gltf")                  return "gltf";
+    if (ext == ".glb")                   return "glb";
+    if (ext == ".brep")                  return "brep";
+    return "";  // .step+ or unknown → native save
+}
 
 // F4: Open/Import filter — every format the engine can import (see engine/doc/formats.py
 // FORMAT_REGISTRY / doc_formats RPC, the future dynamic source). A leading aggregate entry lets
@@ -1103,9 +1137,32 @@ static void doSaveDoc(AppState& st, bool forceDialog) {
         }
         std::string suggest = s_docPath.empty() ? suggestedSaveName(st)
                                                 : pathBaseName(s_docPath);
-        path = saveFileDialog(kStepPlusFilter, "step+", suggest.c_str());
+        // "Save As..." offers all formats (SolidWorks-style type dropdown); a silent first-save
+        // sticks to the native .step+ filter.
+        path = forceDialog ? saveFileDialog(kSaveAsFilter, "step+", suggest.c_str())
+                           : saveFileDialog(kStepPlusFilter, "step+", suggest.c_str());
         if (path.empty()) return;  // canceled
     }
+
+    // SolidWorks-parity "Save As other type": a non-.step+ extension EXPORTS a copy (export_file)
+    // and leaves the working document (s_docPath / dirty flag) untouched — the doc is still the
+    // native .step+. Only a .step+ target saves the document itself.
+    std::string exportFmt = saveAsExportFormat(path);
+    if (!exportFmt.empty()) {
+        std::string eerr;
+        std::string written = st.docMirror.exportFile(st.worker, st.docMirror.docId(),
+                                                       path, exportFmt, eerr);
+        if (!written.empty()) {
+            st.addLog("[doc] exported " + exportFmt + ": " + written);
+            st.toast(ui::ToastLevel::Info, "Exported " + pathBaseName(written));
+        } else {
+            st.addLog("[err] export " + exportFmt + ": " + eerr);
+            st.toast(ui::ToastLevel::Error,
+                     eerr.empty() ? ("Export " + exportFmt + " failed") : eerr);
+        }
+        return;
+    }
+
     std::string err;
     if (st.docMirror.save(st.worker, path, err)) {
         s_docPath = path;

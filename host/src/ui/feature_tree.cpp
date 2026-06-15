@@ -1291,45 +1291,14 @@ static void drawFeatureManagerTopStrip(AppState& st) {
     const auto& pal = ui::palette;
     bool canDoc = st.workerStarted && !st.job.running.load();
 
-    // --- tab strip (tree | properties | configurations) ---
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    struct Tab { const char* icon; const char* tip; };
-    static const Tab kTabs[] = {
-        {"history",  "Feature tree"},
-        {"material", "Properties"},
-        {"settings", "Configurations"},
-    };
-    float tabBtn = 22.0f * ui::uiScale;
-    for (int i = 0; i < 3; ++i) {
-        if (i) ImGui::SameLine(0, 2 * ui::uiScale);   // #4.5: scaled inter-tab gap
-        ImGui::PushID(i + 7700);
-        ImVec2 p0 = ImGui::GetCursorScreenPos();
-        ImGui::InvisibleButton("##fmtab", ImVec2(tabBtn, tabBtn));
-        bool hov = ImGui::IsItemHovered();
-        bool act = (i == 0);  // only the tree tab is functional
-        if (act || hov)
-            dl->AddRectFilled(p0, ImVec2(p0.x + tabBtn, p0.y + tabBtn),
-                              ui::Palette::toU32(act ? pal.ribbonTabActive : pal.buttonHovered),
-                              std::max(1.0f, 3.0f * ui::uiScale));  // #4.5: scaled rounding
-        if (act) {
-            float in = 2.0f * ui::uiScale, dn = 1.0f * ui::uiScale;  // #4.5: scaled underline insets
-            dl->AddLine(ImVec2(p0.x + in, p0.y + tabBtn - dn),
-                        ImVec2(p0.x + tabBtn - in, p0.y + tabBtn - dn),
-                        ui::Palette::toU32(pal.accent), std::max(1.0f, 2.0f * ui::uiScale));
-        }
-        IconUV iv = getIcon(kTabs[i].icon, 20);
-        float iz = 16.0f * ui::uiScale, off = (tabBtn - iz) * 0.5f;
-        dl->AddImage(iv.texId, ImVec2(p0.x + off, p0.y + off),
-                     ImVec2(p0.x + off + iz, p0.y + off + iz), iv.uv0, iv.uv1,
-                     act ? IM_COL32(255,255,255,255) : IM_COL32(190,190,190,180));
-        if (hov) ImGui::SetTooltip("%s", kTabs[i].tip);
-        ImGui::PopID();
-    }
-    // right-aligned document toolbar
+    // W5C: the old tree/Properties/Configurations stub tabs were removed here — they were visual
+    // decoration that duplicated the real vertical tab strip in the LeftPane container (layout.cpp
+    // drawLeftPane). This strip now hosts only the functional document toolbar + "Name & group".
+    // --- right-aligned document toolbar (first item on the line, so position it absolutely) ---
     float nBtns = 6.0f, gap = 2.0f * ui::uiScale, bw = 24.0f * ui::uiScale;
     float toolW = nBtns * bw + (nBtns - 1) * gap;
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - toolW + ImGui::GetCursorPosX() -
-                    ImGui::GetStyle().ItemSpacing.x);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                         std::max(0.0f, ImGui::GetContentRegionAvail().x - toolW));
     if (toolbarIconBtn("fm_new", "new_doc", "New Part", canDoc) && canDoc) {
         std::string err;
         // Multi-document: New Part opens a NEW tab (it does not replace the current doc). The

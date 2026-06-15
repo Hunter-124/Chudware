@@ -61,7 +61,14 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
         ImGui::Text("|  %s", st.livePhase.c_str());
         ImGui::PopStyleColor();
     }
-    // ---- right cluster (SolidWorks order): units | editing-mode | provider/model ----
+    // W5C: pick / selection label (e.g. "Face 12 of Body1") — shown when not editing a sketch
+    // (a sketch shows its DOF status instead). The label is maintained on hover/selection change.
+    if (!(st.sketchMode && st.sketchMode->active()) && !st.pickStatus.empty()) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1),
+                           "|  %s", st.pickStatus.c_str());
+    }
+    // ---- right cluster (SolidWorks order): view-style | units | editing-mode | provider/model ----
     // C24: SW shows the unit system ("MMGS"/"IPS") and "Editing Part"/"Editing Assembly" near the
     // right edge of the status bar; we mirror that, with the provider/model summary furthest right
     // (click anywhere on it to open Settings).
@@ -84,15 +91,29 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     const char* unitsTxt = st.ips() ? "IPS" : "MMGS";
     const char* editTxt  = st.docMirror.hasDoc()
                          ? (isAsm ? "Editing Assembly" : "Editing Part") : "";
+    // W5C: current display style (mirrors viewport_panel's DisplayStyle order: 0=Shaded
+    // 1=ShadedEdges 2=HLR 3=HLV 4=Wireframe). Shown only when a document is open.
+    static const char* kViewStyle[] = {"Shaded", "Shaded + Edges", "Hidden Lines",
+                                        "Hidden Visible", "Wireframe"};
+    const char* vsTxt = st.docMirror.hasDoc()
+        ? kViewStyle[(st.displayStyle >= 0 && st.displayStyle < 5) ? st.displayStyle : 1] : "";
     std::string sep = "    |    ";
     float ptw   = ImGui::CalcTextSize(ptxt.c_str()).x;
     float uniw  = ImGui::CalcTextSize(unitsTxt).x;
     float editw = editTxt[0] ? ImGui::CalcTextSize(editTxt).x : 0.0f;
+    float vsw   = vsTxt[0] ? ImGui::CalcTextSize(vsTxt).x : 0.0f;
     float sepw  = ImGui::CalcTextSize(sep.c_str()).x;
-    float total = uniw + sepw + (editw > 0 ? editw + sepw : 0.0f) + ptw;
+    float total = (vsw > 0 ? vsw + sepw : 0.0f) + uniw + sepw +
+                  (editw > 0 ? editw + sepw : 0.0f) + ptw;
     ImGui::SameLine(ImGui::GetWindowWidth() - total - 16.0f * dpiS);
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1));
+    // --- view-style token (read-only label; the viewport HUD / context menu changes it).
+    if (vsTxt[0]) {
+        ImGui::TextUnformatted(vsTxt);
+        ImGui::SameLine(0, 0); ImGui::TextUnformatted(sep.c_str());
+        ImGui::SameLine(0, 0);
+    }
     // --- units token: its own clickable item so it can toggle independently of the provider link.
     ImGui::TextUnformatted(unitsTxt);
     bool unitsHovered = ImGui::IsItemHovered();

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import copy
 import re
+import uuid
 from typing import Any
 
 from engine.doc.schema import (
@@ -1649,28 +1650,25 @@ def _remap_handle(handle: Any, eid_map: dict[str, str]) -> Any:
     return handle
 
 
-def _op_copy_feature(doc, op, index, idgen, id_map):
-    """READ-ONLY: package feature ``id`` (and, by default, its full reference closure) into a
-    portable bundle. The bundle is returned via the id_map side-channel under ``$bundle`` (and
-    ``$bundle:<index>`` when several copy_feature ops appear in one batch). No document mutation.
+def build_feature_bundle(doc: dict, fid: str, include_dependencies: bool = True) -> dict:
+    """Package feature ``fid`` (and, by default, its full reference closure) into a portable
+    ``aicad.feature_bundle/1`` bundle. Pure read — no mutation of *doc*. Raises ``OpError`` if *fid*
+    is not a feature in *doc*. This is the shared bundle builder used by both copy_feature (the
+    read-only op) and session.refresh_derived (the live cross-doc re-pull); keeping it in one place
+    guarantees a refresh re-runs the EXACT copy path the original paste used.
 
-    ``include_dependencies`` (default true): walk the FULL reference closure (every feature this one
-    transitively references via selectors / datum / region / pattern-feature-list refs) so the
-    paste is self-contained. When false, only the root feature is bundled and every referenced
-    feature is flagged in ``external_refs`` (datums additionally in ``external_datums`` by name) for
-    cross-doc resolution at paste time."""
-    fid = op.get("id")
+    ``include_dependencies`` (default True): walk the FULL reference closure (every feature this one
+    transitively references via selectors / datum / region / pattern-feature-list refs) so the paste
+    is self-contained. When False, only the root is bundled and every referenced feature is flagged
+    in ``external_refs`` (datums additionally in ``external_datums`` by name)."""
     _, feat = _find_feature(doc, fid)
     if feat is None:
-        raise _invalid(index, f"copy_feature: '{fid}' not found")
-    inc = op.get("include_dependencies", True)
-    if not isinstance(inc, bool):
-        raise _invalid(index, "copy_feature.include_dependencies must be a bool")
-
-    if inc:
-        order, in_closure = _feature_refs_closure(doc, fid)
+        raise OpError("invalid_op", f"feature '{fid}' not found",
+                      {"reason": f"unknown feature {fid}"})
+    if include_dependencies:
+        order, _in_closure = _feature_refs_closure(doc, fid)
     else:
-        order, in_closure = [fid], {fid}
+        order = [fid]
 
     # placeholder per included feature, in dependency-first order
     fid_to_ph = {f: f"${i}" for i, f in enumerate(order)}
@@ -1687,7 +1685,7 @@ def _op_copy_feature(doc, op, index, idgen, id_map):
         if ef is not None and ef.get("type") in ("plane", "axis", "point", "csys"):
             external_datums[ext] = ef.get("name") or ext
 
-    bundle = {
+    return {
         "kind": "aicad.feature_bundle/1",
         "source_doc_id": doc.get("id"),
         "source_doc_name": doc.get("name"),
@@ -1696,7 +1694,32 @@ def _op_copy_feature(doc, op, index, idgen, id_map):
         "features": features,
         "external_refs": sorted(external_refs),
         "external_datums": external_datums,
+        # placeholder -> the LIVE source feature id it was bundled from. Provenance only (the bundle
+        # is otherwise id-free): paste_feature_as_derived records it into each derived feature's
+        # ``derived_from.source_feature`` so a later live refresh (session.refresh_derived) can find
+        # the current source feature by id even after re-id. Append-only; paste_feature ignores it.
+        "source_ids": {fid_to_ph[src]: src for src in order},
     }
+
+
+def _op_copy_feature(doc, op, index, idgen, id_map):
+    """READ-ONLY: package feature ``id`` (and, by default, its full reference closure) into a
+    portable bundle. The bundle is returned via the id_map side-channel under ``$bundle`` (and
+    ``$bundle:<index>`` when several copy_feature ops appear in one batch). No document mutation.
+
+    ``include_dependencies`` (default true): walk the FULL reference closure (every feature this one
+    transitively references via selectors / datum / region / pattern-feature-list refs) so the
+    paste is self-contained. When false, only the root feature is bundled and every referenced
+    feature is flagged in ``external_refs`` (datums additionally in ``external_datums`` by name) for
+    cross-doc resolution at paste time."""
+    fid = op.get("id")
+    inc = op.get("include_dependencies", True)
+    if not isinstance(inc, bool):
+        raise _invalid(index, "copy_feature.include_dependencies must be a bool")
+    _, feat = _find_feature(doc, fid)
+    if feat is None:
+        raise _invalid(index, f"copy_feature: '{fid}' not found")
+    bundle = build_feature_bundle(doc, fid, include_dependencies=inc)
     id_map["$bundle"] = bundle
     id_map[f"$bundle:{index}"] = bundle
 
@@ -1823,12 +1846,21 @@ def _resolve_datum(src_id: str, external_datums: dict, doc: dict,
                          "owner_feature": src_id, "unresolved": True}}
 
 
-def _paste_features(doc, bundle, idgen, derived: bool):
+def _paste_features(doc, bundle, idgen, derived: bool, *, group: str | None = None,
+                    stamp_extra: dict | None = None):
     """Re-id every bundled feature, resolve refs against *doc*, and append through the same
     rollback-bar-aware path _op_add_feature uses. Returns the ordered list of new feature ids
-    (dependency-first; the root is whichever placeholder bundle.root names)."""
+    (dependency-first; the root is whichever placeholder bundle.root names).
+
+    When ``derived``: every pasted feature is stamped ``derived_from`` (doc_id/doc_name + the source
+    placeholder, plus the LIVE source feature id under ``source_feature`` when the bundle carries the
+    ``source_ids`` map, and a shared ``group`` so a later refresh can replace the whole closure as a
+    unit — see session.refresh_derived). ``stamp_extra`` (optional) merges extra keys into every
+    stamp (used by refresh to re-pin the source revision)."""
     order = bundle["feature_order"]
     feats = bundle["features"]
+    source_ids = bundle.get("source_ids", {}) or {}
+    grp = group or ("dg-" + uuid.uuid4().hex[:10])
     ph_to_fid = {ph: idgen.next("f") for ph in order}
     new_ids: list[str] = []
     for ph in order:
@@ -1839,11 +1871,18 @@ def _paste_features(doc, bundle, idgen, derived: bool):
         if feat.get("type") == "sketch":
             _reid_pasted_sketch(feat, idgen)
         if derived:
-            feat["derived_from"] = {
+            stamp = {
                 "doc_id": bundle.get("source_doc_id"),
                 "doc_name": bundle.get("source_doc_name"),
-                "feature": ph,  # source placeholder (the host re-links to the live source id)
+                "feature": ph,  # source placeholder (id-free bundle provenance)
+                # LIVE source feature id (when the bundle recorded it) so refresh can find the
+                # current source definition by id even after the source doc re-ids around it.
+                "source_feature": source_ids.get(ph),
+                "group": grp,   # shared across the whole pasted closure for unit refresh
             }
+            if stamp_extra:
+                stamp.update(stamp_extra)
+            feat["derived_from"] = stamp
         _append_feature(doc, feat)
         new_ids.append(new_fid)
     return ph_to_fid, new_ids
@@ -1902,6 +1941,123 @@ def _op_paste_feature_as_derived(doc, op, index, idgen, id_map):
     id_map[f"${index}"] = ph_to_fid[bundle["root"]]
     for k, nid in enumerate(new_ids):
         id_map[f"${index}#{k}"] = nid
+
+
+# ---- live derived refresh (cross-document re-pull) -----------------------------------------
+#
+# A derived feature carries ``derived_from = {doc_id, doc_name, feature(placeholder),
+# source_feature(live id), group}``. When the SOURCE feature changes, the derived copy is stale.
+# session.refresh_derived fetches the live source via the session registry, re-bundles it with the
+# SAME copy path (build_feature_bundle), and calls :func:`refresh_derived_group` to splice the fresh
+# definition back over the existing derived features IN PLACE — preserving each derived feature's id
+# and tree position. This module stays registry-blind: the session layer fetches the source bundle
+# and hands it in here. The op layer only knows how to map a fresh bundle onto an existing group.
+
+
+def _group_members(doc: dict, group: str) -> list[tuple[int, dict]]:
+    """(position, feature) for every feature whose ``derived_from.group`` == *group*, in doc order."""
+    out: list[tuple[int, dict]] = []
+    for i, f in enumerate(_features(doc)):
+        if isinstance(f, dict):
+            df = f.get("derived_from")
+            if isinstance(df, dict) and df.get("group") == group:
+                out.append((i, f))
+    return out
+
+
+def refresh_derived_group(doc: dict, group: str, bundle: dict, idgen: _IdGen) -> dict:
+    """Splice a FRESH source bundle over an existing derived *group* IN PLACE (mutates *doc*).
+
+    Each existing group member is matched to a bundle placeholder by its recorded
+    ``derived_from.source_feature`` (the live source id the placeholder was bundled from). Matched
+    members are REBUILT in place — id + tree position kept, params/refs/name/type replaced from the
+    re-resolved bundle, the ``derived_from`` stamp refreshed (and ``derived_stale`` cleared). Bundle
+    placeholders with NO existing match (a feature added to the source closure since the first paste)
+    are pasted as new derived features (appended). Existing members whose ``source_feature`` no
+    longer appears in the bundle (the source feature was deleted, or dropped out of the closure) are
+    marked ``derived_stale`` and LEFT in place with their last-good definition (never silently
+    removed — selectors.md "never silently wrong").
+
+    Returns ``{"refreshed": [fid...], "added": [fid...], "stale": [fid...]}``.
+    """
+    order = bundle["feature_order"]
+    feats = bundle["features"]
+    source_ids = bundle.get("source_ids", {}) or {}
+    grp_doc_id = bundle.get("source_doc_id")
+    grp_doc_name = bundle.get("source_doc_name")
+
+    members = _group_members(doc, group)
+    # Map live-source-id -> existing target feature (the derived copy of that source feature).
+    by_source: dict[str, dict] = {}
+    for _pos, f in members:
+        sf = (f.get("derived_from") or {}).get("source_feature")
+        if isinstance(sf, str):
+            by_source.setdefault(sf, f)
+
+    # Placeholder -> the TARGET feature id it resolves to: an existing matched member keeps its id;
+    # an unmatched (new) placeholder gets a fresh id. This map drives in-closure ref re-resolution
+    # so the rebuilt features cross-reference each other (and the new ones) by their target ids.
+    ph_to_fid: dict[str, str] = {}
+    ph_is_new: dict[str, bool] = {}
+    for ph in order:
+        src_fid = source_ids.get(ph)
+        existing = by_source.get(src_fid) if isinstance(src_fid, str) else None
+        if existing is not None:
+            ph_to_fid[ph] = existing["id"]
+            ph_is_new[ph] = False
+        else:
+            ph_to_fid[ph] = idgen.next("f")
+            ph_is_new[ph] = True
+
+    refreshed: list[str] = []
+    added: list[str] = []
+    for ph in order:
+        src = feats[ph]
+        target_fid = ph_to_fid[ph]
+        stamp = {
+            "doc_id": grp_doc_id,
+            "doc_name": grp_doc_name,
+            "feature": ph,
+            "source_feature": source_ids.get(ph),
+            "group": group,
+        }
+        if ph_is_new[ph]:
+            # New source feature in the closure: paste as a fresh derived feature (append).
+            feat = _new_feature_envelope(src, target_fid)
+            feat["refs"] = _resolve_paste_refs(src.get("refs", {}), ph_to_fid, bundle, doc)
+            if feat.get("type") == "sketch":
+                _reid_pasted_sketch(feat, idgen)
+            feat["derived_from"] = stamp
+            _append_feature(doc, feat)
+            added.append(target_fid)
+        else:
+            # Rebuild in place: keep id + tree position, replace the definition.
+            _, existing = _find_feature(doc, target_fid)
+            rebuilt = _new_feature_envelope(src, target_fid)
+            rebuilt["refs"] = _resolve_paste_refs(src.get("refs", {}), ph_to_fid, bundle, doc)
+            if rebuilt.get("type") == "sketch":
+                _reid_pasted_sketch(rebuilt, idgen)
+            # Preserve the existing feature's user-facing name (a derived copy may have been renamed
+            # in the target) but otherwise swap the whole definition.
+            rebuilt["name"] = existing.get("name", rebuilt.get("name"))
+            existing.clear()
+            existing.update(rebuilt)
+            existing["derived_from"] = stamp
+            existing.pop("derived_stale", None)
+            refreshed.append(target_fid)
+
+    # Existing members whose source feature is gone from the fresh bundle: mark stale, keep as-is.
+    fresh_sources = {source_ids.get(ph) for ph in order}
+    stale: list[str] = []
+    for _pos, f in members:
+        if f["id"] in refreshed:
+            continue
+        sf = (f.get("derived_from") or {}).get("source_feature")
+        if sf not in fresh_sources:
+            f["derived_stale"] = {"reason": "source_feature_deleted", "source_feature": sf,
+                                  "doc_id": grp_doc_id, "doc_name": grp_doc_name}
+            stale.append(f["id"])
+    return {"refreshed": refreshed, "added": added, "stale": stale}
 
 
 def _op_sketch_paste_entities(doc, op, index, idgen, id_map):

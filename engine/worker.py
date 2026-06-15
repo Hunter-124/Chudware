@@ -233,6 +233,14 @@ def _doc_revert(params: dict, emit: EmitFn) -> dict:
 #   explode offsets applied; view-only, no revision bump).
 
 
+def _doc_refresh_derived(params: dict, emit: EmitFn) -> dict:
+    # Re-pull cross-doc derived-paste features from their live source document(s).
+    # id omitted -> refresh every derived group in the doc; id given -> that group only.
+    from engine.doc import session as docsess
+    s = docsess.get_session(params["doc_id"])
+    return docsess.refresh_derived(s, id=params.get("id"), emit=_doc_emit(emit))
+
+
 def _doc_solve_mates(params: dict, emit: EmitFn) -> dict:
     from engine.doc import session as docsess
     s = docsess.get_session(params["doc_id"])
@@ -723,6 +731,7 @@ _METHODS = {
     "doc_resolve_pick": _doc_resolve_pick,
     "doc_checkpoint": _doc_checkpoint,
     "doc_revert": _doc_revert,
+    "doc_refresh_derived": _doc_refresh_derived,  # cross-doc derived-paste live relink
     # Assembly (C20)
     "doc_solve_mates": _doc_solve_mates,
     "doc_set_explode_state": _doc_set_explode_state,
@@ -782,7 +791,7 @@ _METHODS.update({
 _STRUCTURED_ERROR_METHODS = {
     "doc_new", "doc_open", "doc_save", "doc_close", "doc_list", "doc_apply_ops",
     "doc_undo", "doc_redo", "doc_tree", "doc_rebuild", "doc_resolve_pick",
-    "doc_checkpoint", "doc_revert",
+    "doc_checkpoint", "doc_revert", "doc_refresh_derived",
     "doc_solve_mates", "doc_set_explode_state",  # C20
     "sketch_enter", "sketch_solve", "sketch_probe", "sketch_drag", "sketch_drag_commit",
     "sketch_exit",

@@ -392,3 +392,160 @@ def test_session_mixed_batch_still_bumps_and_is_undoable():
     # Undoable: a single undo reverts the mixed batch back to just Box1.
     ur = docsess.undo(s)
     assert [f.get("name") for f in ur["tree"]["features"]] == ["Box1"]
+
+
+# --------------------------------------------------------------------------- Wave 4C derived relink
+#
+# Cross-document derived-paste LIVE relink (engine.doc.session.refresh_derived). paste_feature_as_-
+# derived copies a feature (+ closure) from a SOURCE doc and stamps a derived_from link (now also
+# carrying the live source feature id + a shared group). refresh_derived re-pulls the definition
+# from the live source session and splices it over the derived copy IN PLACE (id + tree position
+# preserved), so a source-side edit propagates on demand — SolidWorks derived-part behavior.
+#
+# Failure handling (selectors.md "never silently wrong"): a CLOSED source doc or a DELETED source
+# feature leaves the derived copy at its last-good definition and marks it derived_stale; no crash.
+
+
+def _new_source_with_extrude(name="Src", depth=10.0):
+    """A live source SESSION holding f1 = rect sketch, f2 = blind extrude (depth)."""
+    s = docsess.new_session("part", name)
+    docsess.apply_ops(s, s.revision, [
+        {"op": "add_feature", "feature": _strip_id(_rect_sketch("X"))}])  # -> f1
+    docsess.apply_ops(s, s.revision, [
+        {"op": "add_feature", "feature": _strip_id(_extrude("Y", "f1", depth=depth))}])  # -> f2
+    return s
+
+
+def _strip_id(feat):
+    """add_feature.feature carries no id (the engine assigns one). Drop the fixture's literal id and
+    repoint the extrude's region ref at the freshly-assigned upstream sketch id (always f1 here)."""
+    f = copy.deepcopy(feat)
+    f.pop("id", None)
+    return f
+
+
+def _derived_paste(target, source):
+    """Copy source's root extrude (f2) and paste it as DERIVED into target. The host stamps the live
+    source session doc_id so refresh can find it. Returns the bundle + paste ops-response."""
+    cm = docsess.apply_ops(source, source.revision, [{"op": "copy_feature", "id": "f2"}])
+    bundle = cm["id_map"]["$bundle"]
+    resp = docsess.apply_ops(target, target.revision, [
+        {"op": "paste_feature_as_derived", "bundle": bundle, "source_doc_id": source.doc_id}])
+    return bundle, resp
+
+
+def test_derived_stamp_carries_source_feature_and_group():
+    src = _new_source_with_extrude(depth=10.0)
+    tgt = docsess.new_session("part", "Tgt")
+    bundle, resp = _derived_paste(tgt, src)
+    # The bundle now records the placeholder -> live source id map.
+    assert bundle["source_ids"][bundle["root"]] == "f2"
+    derived = [f for f in resp["tree"]["features"] if f.get("derived_from")]
+    assert len(derived) == 2  # sketch + extrude closure
+    groups = {f["derived_from"]["group"] for f in derived}
+    assert len(groups) == 1  # one paste => one group
+    by_src = {f["derived_from"]["source_feature"]: f for f in derived}
+    assert set(by_src) == {"f1", "f2"}          # both linked to their live source ids
+    assert by_src["f2"]["type"] == "extrude"
+
+
+def test_refresh_derived_pulls_source_dimension_change():
+    src = _new_source_with_extrude(depth=10.0)
+    tgt = docsess.new_session("part", "Tgt")
+    _, resp = _derived_paste(tgt, src)
+    derived_extrude = next(f for f in resp["tree"]["features"]
+                           if f.get("derived_from") and f["type"] == "extrude")
+    d_id = derived_extrude["id"]
+    assert derived_extrude["params"]["depth"]["value"] == 10.0
+    vol_before = _vol(tgt.doc)
+    rev_before = tgt.revision
+
+    # Edit the SOURCE extrude depth 10 -> 25.
+    docsess.apply_ops(src, src.revision, [
+        {"op": "edit_feature", "id": "f2", "params": {"depth": _dim(25.0)}}])
+    # Target is still stale until refreshed.
+    assert _feat(tgt.doc, d_id)["params"]["depth"]["value"] == 10.0
+
+    rr = docsess.refresh_derived(tgt)
+    # The derived copy now reflects the source change — SAME id + position preserved.
+    refreshed = _feat(tgt.doc, d_id)
+    assert refreshed["params"]["depth"]["value"] == 25.0
+    assert refreshed["derived_from"]["source_feature"] == "f2"
+    assert "derived_stale" not in refreshed
+    # New volume = 2.5x (depth 10 -> 25 on the same 20x20 profile).
+    vol_after = _vol(tgt.doc)
+    assert abs(vol_after / vol_before - 2.5) < 0.02
+    # Mutating: revision bumped + one undoable step.
+    assert tgt.revision == rev_before + 1
+    assert rr["derived"]["groups"][0]["status"] == "refreshed"
+    # A single undo reverts the refresh back to depth 10.
+    docsess.undo(tgt)
+    assert _feat(tgt.doc, d_id)["params"]["depth"]["value"] == 10.0
+
+
+def test_refresh_derived_source_closed_is_safe_noop_with_stale_marker():
+    src = _new_source_with_extrude(depth=10.0)
+    tgt = docsess.new_session("part", "Tgt")
+    _, resp = _derived_paste(tgt, src)
+    d_id = next(f["id"] for f in resp["tree"]["features"]
+                if f.get("derived_from") and f["type"] == "extrude")
+    last_good_depth = _feat(tgt.doc, d_id)["params"]["depth"]["value"]
+
+    # Close the SOURCE document. Refresh must NOT crash; it leaves last-good + a stale marker.
+    assert docsess.close_session(src.doc_id) is True
+    rr = docsess.refresh_derived(tgt)
+    refreshed = _feat(tgt.doc, d_id)
+    assert refreshed["params"]["depth"]["value"] == last_good_depth   # unchanged (last-resolved)
+    assert refreshed["derived_stale"]["reason"] == "source_doc_closed"
+    assert rr["derived"]["groups"][0]["status"] == "source_doc_closed"
+
+
+def test_refresh_derived_source_feature_deleted_marks_stale_no_crash():
+    src = _new_source_with_extrude(depth=10.0)
+    tgt = docsess.new_session("part", "Tgt")
+    _, resp = _derived_paste(tgt, src)
+    d_id = next(f["id"] for f in resp["tree"]["features"]
+                if f.get("derived_from") and f["type"] == "extrude")
+    last_good_depth = _feat(tgt.doc, d_id)["params"]["depth"]["value"]
+
+    # Delete the ENTIRE source closure (delete f1 cascade -> drops f1 sketch AND its dependent f2
+    # extrude). No member's source feature survives, so refresh cannot re-bundle the group at all:
+    # the whole group is marked stale, kept at last-good, no crash.
+    docsess.apply_ops(src, src.revision, [
+        {"op": "delete_feature", "id": "f1", "cascade": True}])
+    assert all(f["id"] not in ("f1", "f2") for f in src.doc["features"])
+    rr = docsess.refresh_derived(tgt)
+    refreshed = _feat(tgt.doc, d_id)
+    assert refreshed["params"]["depth"]["value"] == last_good_depth
+    assert refreshed["derived_stale"]["reason"] == "source_feature_deleted"
+    assert rr["derived"]["groups"][0]["status"] == "source_feature_deleted"
+
+
+def test_refresh_derived_no_derived_features_is_noop():
+    s = docsess.new_session("part", "Plain")
+    docsess.apply_ops(s, s.revision, [_box_op()])
+    rev = s.revision
+    rr = docsess.refresh_derived(s)
+    assert rr["derived"]["groups"] == []
+    assert s.revision == rev                       # no phantom revision bump
+    assert len(s.undo_stack) == 1                  # only the box add; refresh pushed nothing
+
+
+def test_refresh_derived_by_id_targets_only_that_group():
+    src = _new_source_with_extrude(depth=10.0)
+    tgt = docsess.new_session("part", "Tgt")
+    _, resp = _derived_paste(tgt, src)
+    d_id = next(f["id"] for f in resp["tree"]["features"]
+                if f.get("derived_from") and f["type"] == "extrude")
+    docsess.apply_ops(src, src.revision, [
+        {"op": "edit_feature", "id": "f2", "params": {"depth": _dim(30.0)}}])
+    rr = docsess.refresh_derived(tgt, id=d_id)
+    assert _feat(tgt.doc, d_id)["params"]["depth"]["value"] == 30.0
+    assert len(rr["derived"]["groups"]) == 1
+
+    # A non-derived id is a clean invalid_op.
+    s2 = docsess.new_session("part", "P2")
+    docsess.apply_ops(s2, s2.revision, [_box_op()])
+    with pytest.raises(docsess.OpError) as ei:
+        docsess.refresh_derived(s2, id="f1")
+    assert ei.value.code == "invalid_op"

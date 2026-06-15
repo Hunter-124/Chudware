@@ -588,6 +588,251 @@ def revert(session: DocSession, checkpoint_id: str, emit: EmitFn | None = None) 
     return _ops_response(session, result, {})
 
 
+# =========================================================================== Wave 4C derived relink
+#
+# Cross-document derived-paste LIVE relink. paste_feature_as_derived (engine.doc.ops) does a ONE-TIME
+# resolve+stamp: it copies a feature (and its closure) from a SOURCE document and stamps each pasted
+# feature with ``derived_from = {doc_id, doc_name, feature, source_feature, group}``. SolidWorks
+# derived-part behavior is that when the SOURCE feature changes, the derived copy UPDATES.
+#
+# refresh_derived is the on-demand re-pull (Option A — an explicit "Rebuild derived" the host calls,
+# e.g. on doc re-open or a toolbar button). It is honest SW-ish behavior without a fragile
+# auto-cascade across sessions: a derived feature re-pulls its definition from the LIVE source
+# document only when asked. It is a MUTATING operation — it pushes one undo snapshot and bumps the
+# revision exactly like an op batch, so a single Ctrl+Z reverts a refresh.
+#
+# Auto-on-rebuild (Option B) was rejected: _rebuild is the pure compile path (compile_document over
+# session.doc) and is registry-blind. Reaching into OTHER sessions from inside compile to re-pull
+# definitions would (a) couple the compiler to the live session registry, (b) risk reentrancy /
+# cross-session ordering hazards (a source whose own rebuild has not run yet), and (c) cannot bump
+# the revision / push undo from within compile. refresh_derived keeps the cross-session fetch in the
+# session layer where get_session lives and where the mutate-bump-rebuild cadence already exists.
+#
+# Failure handling (selectors.md "never silently wrong"):
+#   * source doc CLOSED/absent (get_session miss)  -> that group is left at its last-resolved
+#     definition and marked ``derived_stale`` ({reason:"source_doc_closed"}); no crash.
+#   * source FEATURE deleted in the source doc      -> the group's root cannot be bundled, so the
+#     group is left as-is and marked ``derived_stale`` ({reason:"source_feature_deleted"}); the
+#     per-feature splice (ops.refresh_derived_group) also marks any closure member whose source id
+#     vanished. No crash.
+
+
+def _derived_groups(doc: dict) -> dict[str, dict]:
+    """Map each derived ``group`` id present in *doc* to a descriptor
+    ``{group, source_doc_id, source_doc_name, members:[{id, source_feature, is_root}]}``.
+
+    A group is the set of features pasted by ONE ``paste_feature_as_derived`` call (they share the
+    ``derived_from.group`` stamp). Each member also carries the live ``source_feature`` id it was
+    bundled from; :func:`_group_root_source` recovers which one is the closure root for re-bundling."""
+    groups: dict[str, dict] = {}
+    for f in doc.get("features", []) or []:
+        if not isinstance(f, dict):
+            continue
+        df = f.get("derived_from")
+        if not isinstance(df, dict):
+            continue
+        grp = df.get("group")
+        if not isinstance(grp, str):
+            continue
+        rec = groups.setdefault(grp, {
+            "group": grp,
+            "source_doc_id": df.get("doc_id"),
+            "source_doc_name": df.get("doc_name"),
+            "members": [],
+        })
+        rec["members"].append({"id": f.get("id"),
+                               "source_feature": df.get("source_feature"),
+                               "is_root": bool(df.get("is_root"))})
+    return groups
+
+
+def _group_root_source(group_rec: dict, source_doc: dict) -> str | None:
+    """The source feature id to re-bundle a group from: the member whose source feature is the
+    dependency-CLOSURE ROOT in the source doc — i.e. the one that (transitively) references every
+    other member's source feature. We recover it by re-walking each still-present candidate's
+    closure in the source doc and picking the one whose closure COVERS the most of the group's
+    source features (the original paste bundled the root's full closure, so the root's closure is a
+    superset of the others'). Ties break to the larger closure (the deeper root)."""
+    from engine.doc.ops import _feature_refs_closure
+    src_ids = [m["source_feature"] for m in group_rec["members"]
+               if isinstance(m.get("source_feature"), str)]
+    if not src_ids:
+        return None
+    src_set = set(src_ids)
+    best: str | None = None
+    best_key = (-1, -1)
+    for cand in src_ids:
+        if _find_feature_in(source_doc, cand) is None:
+            continue
+        try:
+            _order, closure = _feature_refs_closure(source_doc, cand)
+        except Exception:  # noqa: BLE001
+            continue
+        key = (len(src_set & closure), len(closure))
+        if key > best_key:
+            best_key = key
+            best = cand
+    return best
+
+
+def _find_feature_in(doc: dict, fid: str):
+    for f in doc.get("features", []) or []:
+        if isinstance(f, dict) and f.get("id") == fid:
+            return f
+    return None
+
+
+def _resolve_source_session(source_doc_id) -> "DocSession | None":
+    """Find the live source session for a derived link's ``source_doc_id``.
+
+    The host stamps ``source_doc_id`` from whatever it knows the source by. Two id spaces exist: the
+    SESSION registry key (``session.doc_id``, the worker's ``doc_id``) and the DOCUMENT's internal
+    id (``doc["id"]``, what build_feature_bundle records by default). We resolve against BOTH so a
+    refresh works regardless of which the host stamped — and returns None (source closed/absent) if
+    neither matches, so the caller can mark the group stale rather than crash."""
+    if not source_doc_id:
+        return None
+    s = _REGISTRY.get(source_doc_id)
+    if s is not None:
+        return s
+    for cand in _REGISTRY.values():
+        if cand.doc.get("id") == source_doc_id:
+            return cand
+    return None
+
+
+def _mark_group_stale(session: DocSession, group: str, reason: str,
+                      detail: dict | None = None) -> list[str]:
+    """Stamp ``derived_stale`` on every member of *group* in the session doc (no geometry change)."""
+    marked: list[str] = []
+    for f in session.doc.get("features", []) or []:
+        if not isinstance(f, dict):
+            continue
+        df = f.get("derived_from")
+        if isinstance(df, dict) and df.get("group") == group:
+            f["derived_stale"] = {"reason": reason, **(detail or {})}
+            marked.append(f.get("id"))
+    return marked
+
+
+def refresh_derived(session: DocSession, id: str | None = None,
+                    emit: EmitFn | None = None) -> dict:
+    """Re-pull derived feature definitions from their LIVE source documents (Wave 4C).
+
+    ``id`` (optional): refresh only the derived group that feature ``id`` belongs to. When omitted,
+    refresh EVERY derived group in the document. Each group's source feature (and its closure) is
+    re-bundled from the live source session and spliced back over the existing derived features in
+    place (ids + tree positions preserved) via :func:`engine.doc.ops.refresh_derived_group`.
+
+    Mutating: pushes one undo snapshot, bumps the revision, and rebuilds — like any op batch.
+    Returns the ops-response with an extra ``derived`` block summarizing what changed per group.
+
+    Never crashes on a missing source: a closed source doc or a deleted source feature leaves the
+    derived group at its last-good definition and stamps ``derived_stale`` (selectors.md)."""
+    from engine.doc.ops import build_feature_bundle, refresh_derived_group, _IdGen
+
+    groups = _derived_groups(session.doc)
+
+    if id is not None:
+        # Validate the targeted feature is derived FIRST (independent of whether the doc has other
+        # derived groups), then narrow to just its group.
+        target = _find_feature_in(session.doc, id)
+        df = target.get("derived_from") if isinstance(target, dict) else None
+        if not (isinstance(df, dict) and isinstance(df.get("group"), str)
+                and df["group"] in groups):
+            raise OpError("invalid_op",
+                          f"refresh_derived: feature '{id}' is not a derived feature",
+                          {"reason": "not derived", "id": id})
+        groups = {df["group"]: groups[df["group"]]}
+
+    if not groups:
+        # Nothing derived — a cheap no-op rebuild (no revision bump), still a full response.
+        result = _rebuild(session, emit)
+        resp = _ops_response(session, result, {})
+        resp["derived"] = {"groups": [], "note": "no derived features in document"}
+        return resp
+
+    # Snapshot once up front so the whole multi-group refresh is a SINGLE undo step.
+    session._push_undo()
+    idgen = _IdGen(session.doc)
+    summaries: list[dict] = []
+    any_change = False
+
+    for grp, rec in groups.items():
+        src_doc_id = rec.get("source_doc_id")
+        # 1) Source doc closed/absent -> mark stale, leave last-good.
+        src_session = _resolve_source_session(src_doc_id)
+        if src_session is None:
+            marked = _mark_group_stale(session, grp, "source_doc_closed",
+                                       {"doc_id": src_doc_id,
+                                        "doc_name": rec.get("source_doc_name")})
+            any_change = any_change or bool(marked)
+            summaries.append({"group": grp, "status": "source_doc_closed",
+                              "source_doc_id": src_doc_id, "stale": marked})
+            continue
+
+        # 2) Source feature deleted -> the group's root cannot be bundled. Mark stale, leave as-is.
+        root_src = _group_root_source(rec, src_session.doc)
+        if root_src is None or _find_feature_in(src_session.doc, root_src) is None:
+            marked = _mark_group_stale(session, grp, "source_feature_deleted",
+                                       {"doc_id": src_doc_id,
+                                        "doc_name": rec.get("source_doc_name")})
+            any_change = any_change or bool(marked)
+            summaries.append({"group": grp, "status": "source_feature_deleted",
+                              "source_doc_id": src_doc_id, "stale": marked})
+            continue
+
+        # 3) Re-bundle from the live source root and splice it over the group in place.
+        try:
+            bundle = build_feature_bundle(src_session.doc, root_src, include_dependencies=True)
+            res = refresh_derived_group(session.doc, grp, bundle, idgen)
+        except OpError as exc:
+            marked = _mark_group_stale(session, grp, "refresh_failed",
+                                       {"doc_id": src_doc_id, "error": exc.message})
+            any_change = any_change or bool(marked)
+            summaries.append({"group": grp, "status": "refresh_failed",
+                              "source_doc_id": src_doc_id, "error": exc.message,
+                              "stale": marked})
+            continue
+        any_change = True
+        summaries.append({"group": grp, "status": "refreshed", "source_doc_id": src_doc_id,
+                          **res})
+
+    # Validate the spliced document (mirror ops.apply_ops' resulting-doc validation). On failure,
+    # ROLL BACK (pop the snapshot we just pushed, restore the prior doc) and raise — no half-applied
+    # refresh ever commits.
+    from engine.doc.schema import validate_document
+    errs = validate_document(session.doc)
+    if errs:
+        import json
+        prior = session.undo_stack.pop()
+        session.doc = json.loads(prior)
+        raise OpError("invalid_op",
+                      "refresh_derived produced an invalid document: " + "; ".join(errs[:5]),
+                      {"reason": errs[0] if errs else "invalid document", "all_errors": errs})
+
+    if not any_change:
+        # Pure no-op (e.g. every group already stale and unchanged): drop the undo snapshot we
+        # pushed and don't bump the revision — refresh should not record a phantom step.
+        session.undo_stack.pop()
+        result = _rebuild(session, emit)
+        resp = _ops_response(session, result, {})
+        resp["derived"] = {"groups": summaries}
+        return resp
+
+    # The spliced features may newly profile a sketch region whose upstream sketch would be a cache
+    # hit (same targeted clear apply_ops uses for region-selector batches).
+    session.compile_cache.clear()
+    if session.active_sketch is not None:
+        session.active_sketch.solve_state = None
+    session.revision += 1
+    session.dirty = True
+    result = _rebuild(session, emit)
+    resp = _ops_response(session, result, {})
+    resp["derived"] = {"groups": summaries}
+    return resp
+
+
 # =========================================================================== C20 assembly methods
 #
 # Re-solve mates (doc_solve_mates) and explode-state toggle (doc_set_explode_state). solve_mates

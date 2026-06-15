@@ -195,7 +195,7 @@ append through the same rollback-bar-aware path as `add_feature`.
 |---|---|---|
 | `copy_feature` | `id`, `include_dependencies:bool=true` | **read-only**. Packages the feature (and, by default, its full reference closure) into a bundle returned at `id_map["$bundle"]` (and `id_map["$bundle:<op-index>"]` for multi-copy batches). With `include_dependencies=false`, only the root is bundled; every referenced feature is flagged in `external_refs` (datums also in `external_datums` by name). |
 | `paste_feature` | `bundle`, `target_doc_id?` | re-ids the bundle and appends it; refs resolved against THIS doc (the batch's target — `target_doc_id` is accepted for host-API symmetry and ignored). Root's new id → `id_map["$<index>"]`; every pasted feature enumerated `id_map["$<index>#k"]` (dependency-first). |
-| `paste_feature_as_derived` | `bundle`, `source_doc_id?` | like `paste_feature` + stamps `derived_from:{doc_id,doc_name,feature}` on each pasted feature. **One-time** resolve+stamp (geometry copied independently now); LIVE re-link to the source doc is a host-side follow-up. |
+| `paste_feature_as_derived` | `bundle`, `source_doc_id?` | like `paste_feature` + stamps `derived_from:{doc_id,doc_name,feature,source_feature,group}` on each pasted feature (`source_feature` = the live source id the placeholder was bundled from; `group` = a shared id over the whole pasted closure). The paste itself is still a **one-time** resolve; the live re-pull is `refresh_derived` (Wave 4C, below). `source_doc_id` overrides the bundle's `source_doc_id` when the bundle carries none (the host stamps the live **source session doc_id** here so a later refresh can find it). |
 | `sketch_paste_entities` | `sketch`, `entities_bundle:{entities:[…], constraints:[…]}`, `offset_x`, `offset_y` | deep-copies the entities shifted by `(offset_x, offset_y)` with fresh `e<N>` ids. Constraints internal to the pasted set are kept (handles re-pointed); constraints referencing any entity OUTSIDE the set (or the origin/model) are **dropped**. First new id → `$<index>`, rest → `$<index>#k`. |
 
 **Bundle format (`aicad.feature_bundle/1`):**
@@ -208,7 +208,9 @@ append through the same rollback-bar-aware path as `add_feature`.
   "feature_order": ["$0","$1",…],        // dependency-first build order (deps before dependents)
   "features": { "$k": <feature> },       // id stripped; in-closure refs → placeholders
   "external_refs":   ["f7",…],           // referenced SOURCE ids NOT in the closure
-  "external_datums": {"f7":"Datum1"} }   // source datum id → name (cross-doc datum reuse)
+  "external_datums": {"f7":"Datum1"},    // source datum id → name (cross-doc datum reuse)
+  "source_ids": {"$0":"f1","$1":"f2"} }  // placeholder → live SOURCE feature id (provenance for
+                                         //   derived-link refresh; paste_feature ignores it)
 ```
 
 Inside a bundled feature: the `id` is removed; feature-id refs in the closure → `$0,$1,…`; sketch
@@ -227,6 +229,49 @@ point OUT of the closure keep their raw source id and are listed in `external_re
 
 A bundle whose `kind`/`feature_order`/`features`/`root` is missing or malformed raises `invalid_op`
 with no state change (§2).
+
+### Derived live relink (Wave 4C)
+
+`refresh_derived` re-pulls a derived feature's definition from its **live source document** —
+SolidWorks derived-part behavior, where editing the source updates the derived copy. It is a
+**session-level operation** (not a pure doc op in this table): it needs the live session registry to
+reach the source document, so the worker dispatches it to `engine.doc.session.refresh_derived`
+(alongside `solve_mates` / `config_*` / `revert`), NOT through `apply_ops`. It is **on-demand** (a
+"Rebuild derived" the host calls, e.g. on re-open) rather than an auto-cascade across sessions —
+honest behavior with no cross-session rebuild-ordering or reentrancy hazard.
+
+| call | params | notes |
+|---|---|---|
+| `refresh_derived` | `doc_id`, `id?` | With `id`, refresh only the derived group that feature `id` belongs to (a non-derived `id` → `invalid_op`); without `id`, refresh **every** derived group. **Mutating**: one undo snapshot + revision bump (a single Ctrl+Z reverts a refresh), then rebuild. |
+
+**Flow** (per group — a group = the features pasted by one `paste_feature_as_derived` call, sharing
+`derived_from.group`):
+1. Resolve the live source session from `derived_from.doc_id` (matched against either the session
+   registry key **or** the document's internal `doc["id"]`, so it works regardless of which the host
+   stamped).
+2. Recover the group's source **closure root** (the member whose `source_feature` closure in the
+   source doc covers the group) and re-bundle it with the SAME `build_feature_bundle` copy path the
+   original `copy_feature` used — so cross-doc refs re-resolve exactly as the paste did (the rules
+   above).
+3. Splice the fresh bundle over the existing derived features **in place**: each member matched to a
+   bundle placeholder by its recorded `source_feature` keeps its **id + tree position**, and its
+   params/refs/type are replaced (its user-facing `name` is preserved). New source-closure features
+   are appended (also stamped derived); members whose source feature vanished are marked stale.
+
+**Response**: the normal ops-response plus a `derived:{groups:[{group, status, …}]}` block; per-group
+`status` ∈ `refreshed` (with `{refreshed:[fid…], added:[fid…], stale:[fid…]}`) · `source_doc_closed`
+· `source_feature_deleted` · `refresh_failed` (with `{stale:[fid…]}`).
+
+**Failure handling** (selectors.md — *never silently wrong*, never crash):
+- **Source doc closed/absent** (`get_session` miss) → the group is left at its last-resolved
+  definition and every member stamped `derived_stale:{reason:"source_doc_closed", doc_id, doc_name}`.
+- **Source feature deleted** (closure root gone) → the group is left as-is and stamped
+  `derived_stale:{reason:"source_feature_deleted", …}`. When only PART of the closure was deleted,
+  surviving members refresh and the orphaned member is individually marked stale.
+- A refresh that would yield an invalid document **rolls back** (the pushed undo snapshot is popped,
+  the prior doc restored) and raises `invalid_op` — no half-applied refresh commits.
+- A pure no-op refresh (e.g. every group already stale and unchanged) drops its undo snapshot and
+  does **not** bump the revision.
 
 ## 5. Error codes (RPC error envelope `{code, message, detail}`)
 

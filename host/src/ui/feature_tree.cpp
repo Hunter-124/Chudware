@@ -224,6 +224,149 @@ static float       s_apprMetallic = 0.0f, s_apprRoughness = 0.5f;
 // change (featureTreeResetTransient), so a New Part never inherits the previous doc's path.
 static std::string s_docPath;
 
+// ---- Wave 4C: FeatureManager copy / cut / paste ----------------------------------------------
+// copy_feature is READ-ONLY (no doc mutation) but the engine's session-level apply_ops still bumps
+// the revision + pushes an undo snapshot + marks the session dirty (there is no read-only fast path
+// at the worker level). We therefore wrap the copy in suppressTabDirty so it does NOT light the tab's
+// unsaved marker, and we skip the (unchanged) mesh reload — the mirror's revision advances in
+// lockstep so the next real edit is never stale. The portable bundle comes back via the op-result
+// id_map side-channel ("$bundle"). include_dependencies defaults true so the paste is self-contained
+// (the engine resolves cross-doc external refs at paste time).
+//
+// Returns true if at least one feature's bundle was captured into st.clipboard.
+static bool copyFeatureToClipboard(AppState& st, const std::vector<std::string>& fids) {
+    if (fids.empty() || !st.docMirror.hasDoc() || !st.workerStarted) return false;
+    if (st.job.running.load()) return false;   // same canDoc gate the tree mutations use
+    std::vector<nlohmann::json> bundles;
+    bool prevSuppress = st.suppressTabDirty;
+    st.suppressTabDirty = true;   // copy is read-only — don't dirty the tab on the phantom rev bump
+    for (const auto& fid : fids) {
+        nlohmann::json ops = nlohmann::json::array({
+            {{"op", "copy_feature"}, {"id", fid}, {"include_dependencies", true}}});
+        auto resp = st.docMirror.applyOps(st.worker, ops);
+        if (!resp.ok) {
+            st.addLog("[copy] copy_feature failed: " + resp.error_message);
+            continue;
+        }
+        // The bundle rides the id_map side-channel. "$bundle" is the last copy's bundle;
+        // "$bundle:0" is this batch's (we send one copy_feature per batch, so index 0).
+        if (resp.id_map.is_object()) {
+            if (resp.id_map.contains("$bundle") && resp.id_map["$bundle"].is_object())
+                bundles.push_back(resp.id_map["$bundle"]);
+            else if (resp.id_map.contains("$bundle:0") && resp.id_map["$bundle:0"].is_object())
+                bundles.push_back(resp.id_map["$bundle:0"]);
+        }
+    }
+    st.suppressTabDirty = prevSuppress;
+    if (bundles.empty()) {
+        st.toast(ui::ToastLevel::Warn, "Copy failed");
+        return false;
+    }
+    st.clipboard.clear();
+    st.clipboard.kind = AppState::Clipboard::Kind::Feature;
+    st.clipboard.srcDocId = st.docMirror.docId();
+    st.clipboard.payloads = std::move(bundles);
+    st.addLog("[copy] " + std::to_string(st.clipboard.payloads.size()) + " feature bundle(s)");
+    st.toast(ui::ToastLevel::Info,
+             "Copied " + std::to_string(st.clipboard.payloads.size()) + " feature(s)");
+    return true;
+}
+
+// The set of feature ids a Copy/Cut should act on: the full multi-selection if the primary is part
+// of it, else just the primary. Mirrors the context menu's `multi` rule.
+static std::vector<std::string> featureCopySet(AppState& st) {
+    std::vector<std::string> fids;
+    if (s_multiSel.size() > 1 && !st.selectedFeatureId.empty() &&
+        s_multiSel.count(st.selectedFeatureId) > 0) {
+        for (const auto& id : s_multiSel) fids.push_back(id);
+    } else if (!st.selectedFeatureId.empty()) {
+        fids.push_back(st.selectedFeatureId);
+    }
+    return fids;
+}
+
+// Wave 4D: public entry points so app.cpp's global Ctrl+C/X/V routing + the "edit_*" dispatcher ids
+// can drive FeatureManager copy/cut/paste without reaching into this TU's file-statics. These run
+// OUTSIDE the tree walk (app.cpp's pre-draw key handler), so the immediate DocMirror calls are safe
+// (nothing is iterating the tree json). Each is a no-op (returns false) without an eligible
+// selection / clipboard / live doc.
+bool featureCopySelection(AppState& st) {
+    return copyFeatureToClipboard(st, featureCopySet(st));
+}
+bool featureCutSelection(AppState& st) {
+    auto fids = featureCopySet(st);
+    if (!copyFeatureToClipboard(st, fids)) return false;
+    // Cut = copy then delete (the same delete op the context menu / multi-delete uses). The engine
+    // blocks the delete if a downstream feature depends on it (reported as a warning by
+    // applyTreeOpsNow); the copy still stuck on the clipboard, so the user can paste it elsewhere.
+    nlohmann::json ops = nlohmann::json::array();
+    for (const auto& id : fids)
+        ops.push_back({{"op", "delete_feature"}, {"id", id}, {"cascade", false}});
+    applyTreeOpsNow(st, ops, "cut");
+    return true;
+}
+bool featurePasteSelection(AppState& st) {
+    if (st.clipboard.kind != AppState::Clipboard::Kind::Feature ||
+        st.clipboard.payloads.empty())
+        return false;
+    if (!st.docMirror.hasDoc() || !st.workerStarted || st.job.running.load()) return false;
+    nlohmann::json ops = nlohmann::json::array();
+    for (const auto& bundle : st.clipboard.payloads)
+        ops.push_back({{"op", "paste_feature"}, {"bundle", bundle}});
+    applyTreeOpsNow(st, ops, "paste");
+    st.toast(ui::ToastLevel::Info,
+             "Pasted " + std::to_string(st.clipboard.payloads.size()) + " feature(s)");
+    return true;
+}
+
+// ---- Wave 4C: deferred copy/cut/paste from the row CONTEXT MENU ----
+// copyFeatureToClipboard calls DocMirror::applyOps IMMEDIATELY (it needs the id_map bundle back
+// synchronously). That REPLACES the mirror's tree json — a use-after-free if invoked while the row
+// walk is still iterating that json (the same hazard applyTreeOps defers around). So the context
+// menu only RECORDS a request here; flushPendingClipboard() runs it after the tree walk, next to
+// flushPendingTreeOps. The captured fid set is snapshotted so a later selection change can't move it.
+enum class ClipReq { None, Copy, Cut, Paste };
+static ClipReq                  s_clipReq = ClipReq::None;
+static std::vector<std::string> s_clipReqFids;
+
+static void requestClipboard(ClipReq req, std::vector<std::string> fids) {
+    s_clipReq = req;
+    s_clipReqFids = std::move(fids);
+}
+
+static void flushPendingClipboard(AppState& st) {
+    if (s_clipReq == ClipReq::None) return;
+    ClipReq req = s_clipReq;
+    std::vector<std::string> fids = std::move(s_clipReqFids);
+    s_clipReq = ClipReq::None;
+    s_clipReqFids.clear();
+    switch (req) {
+        case ClipReq::Copy:
+            copyFeatureToClipboard(st, fids);
+            break;
+        case ClipReq::Cut:
+            if (copyFeatureToClipboard(st, fids)) {
+                nlohmann::json ops = nlohmann::json::array();
+                for (const auto& id : fids)
+                    ops.push_back({{"op", "delete_feature"}, {"id", id}, {"cascade", false}});
+                applyTreeOpsNow(st, ops, "cut");
+            }
+            break;
+        case ClipReq::Paste:
+            if (st.clipboard.kind == AppState::Clipboard::Kind::Feature &&
+                !st.clipboard.payloads.empty()) {
+                nlohmann::json ops = nlohmann::json::array();
+                for (const auto& bundle : st.clipboard.payloads)
+                    ops.push_back({{"op", "paste_feature"}, {"bundle", bundle}});
+                applyTreeOpsNow(st, ops, "paste");
+                st.toast(ui::ToastLevel::Info,
+                         "Pasted " + std::to_string(st.clipboard.payloads.size()) + " feature(s)");
+            }
+            break;
+        default: break;
+    }
+}
+
 // W1-B (item 5): drop the tree's in-progress transient state on a doc change. Declared in
 // feature_tree.h; called from AppState::clearViewportForNewDoc and wholesale-replace paths.
 void featureTreeResetTransient() {
@@ -238,6 +381,8 @@ void featureTreeResetTransient() {
     s_apprBody.clear();
     s_apprOpen = false;
     s_docPath.clear();                  // C41: a fresh/replaced doc has no file path yet
+    s_clipReq = ClipReq::None;          // Wave 4C: drop any unflushed copy/cut/paste request
+    s_clipReqFids.clear();              // (the clipboard payload itself survives a doc switch)
 }
 
 // ---- C26: appearance color-picker popup ----
@@ -538,6 +683,32 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         if (ImGui::MenuItem("Remove from folder")) {
             applyTreeOps(st, nlohmann::json::array({
                 {{"op", "set_folder"}, {"id", fid}, {"folder", ""}}}), "set_folder");
+        }
+
+        // ---- Wave 4C: Copy / Cut / Paste ----
+        // The copy set is the whole multi-selection when this row is part of it, else just this row.
+        // Recorded as a deferred request (run after the tree walk) because the copy's DocMirror call
+        // replaces the tree json this menu sits inside. Paste enables only when a feature bundle is
+        // on the clipboard.
+        ImGui::Separator();
+        {
+            std::vector<std::string> copySet;
+            if (multi) for (const auto& id : s_multiSel) copySet.push_back(id);
+            else copySet.push_back(fid);
+            std::string copyLabel = multi
+                ? ("Copy " + std::to_string((int)copySet.size()) + " features\tCtrl+C")
+                : std::string("Copy\tCtrl+C");
+            std::string cutLabel = multi
+                ? ("Cut " + std::to_string((int)copySet.size()) + " features\tCtrl+X")
+                : std::string("Cut\tCtrl+X");
+            if (ImGui::MenuItem(copyLabel.c_str())) requestClipboard(ClipReq::Copy, copySet);
+            if (ImGui::MenuItem(cutLabel.c_str()))  requestClipboard(ClipReq::Cut, copySet);
+            bool canPaste = st.clipboard.kind == AppState::Clipboard::Kind::Feature &&
+                            !st.clipboard.payloads.empty();
+            if (!canPaste) ImGui::BeginDisabled();
+            if (ImGui::MenuItem("Paste\tCtrl+V"))
+                requestClipboard(ClipReq::Paste, std::vector<std::string>{});
+            if (!canPaste) ImGui::EndDisabled();
         }
 
         ImGui::Separator();
@@ -1936,6 +2107,9 @@ void drawFeatureTreeBody(AppState& st,
 
     // C25: apply ops queued during drawing — safe now, nothing reads the tree json below.
     flushPendingTreeOps(st);
+    // Wave 4C: run any copy/cut/paste requested from a row context menu (deferred to here because
+    // the copy's DocMirror call replaces the tree json the menu was drawn over).
+    flushPendingClipboard(st);
 }
 
 // Thin compatibility wrapper (Wave 1D): the standalone FeatureManager dock window. The Wave 1D

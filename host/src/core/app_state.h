@@ -691,6 +691,32 @@ struct AppState {
     ui::CursorKind cursorRequest = ui::CursorKind::Default;
     bool imguiCursorSuspended = false;  // tracks whether we toggled NoMouseCursorChange last frame
 
+    // ---- Wave 4C: copy/paste clipboard (FeatureManager + sketch entities) ----
+    // Single source of truth for Ctrl+C/X/V across the FeatureManager and the sketch editor; also
+    // driven by the "edit_copy" / "edit_cut" / "edit_paste" dispatcher ids the menu bar fires. Holds
+    // the last copied payload as parsed JSON + a tag for what kind it is, so the matching paste path
+    // (paste_feature vs sketch_paste_entities) knows how to consume it. Cross-doc aware: srcDocId
+    // records the source doc (the feature-bundle engine ops resolve external refs against the target
+    // doc, so a paste into a DIFFERENT doc just works — the host only passes the bundle on).
+    //   - Feature: `payloads` holds one `aicad.feature_bundle/1` per copied feature (copy_feature's
+    //     id_map["$bundle"]); multi-select copy stores several, pasted in order.
+    //   - SketchEntities: `payload` is an entities bundle {entities:[...], constraints:[...]} and
+    //     copyOriginU/copyOriginV is the sketch-coord anchor used to compute the paste offset.
+    struct Clipboard {
+        enum class Kind { None, Feature, SketchEntities };
+        Kind kind = Kind::None;
+        std::string srcDocId;                 // doc the copy came from ("" = unknown / same doc)
+        std::vector<nlohmann::json> payloads; // Feature: one bundle per copied feature
+        nlohmann::json payload;               // SketchEntities: {entities, constraints}
+        float copyOriginU = 0.0f, copyOriginV = 0.0f;  // SketchEntities: paste-offset anchor
+        bool empty() const { return kind == Kind::None; }
+        void clear() {
+            kind = Kind::None; srcDocId.clear(); payloads.clear();
+            payload = nlohmann::json(); copyOriginU = copyOriginV = 0.0f;
+        }
+    };
+    Clipboard clipboard;
+
     // ---- the run_gui lambdas, now methods ----
     void addLog(const std::string& s);
     void startSetup(bool force);

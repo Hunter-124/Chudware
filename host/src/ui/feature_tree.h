@@ -37,4 +37,16 @@ void featureTreeResetTransient();
 // rebuild (docUndo/docRedo in app_state.cpp, and the central DocMirror listener in app.cpp).
 void refreshFeatureHighlight(AppState& st);
 
+// Wave 4C/4D: FeatureManager copy / cut / paste, driven by the global Ctrl+C/X/V routing and the
+// "edit_copy" / "edit_cut" / "edit_paste" dispatcher ids. Call from app.cpp's pre-draw key handler
+// (NOT mid tree-walk — these apply ops immediately). Each acts on the FeatureManager selection
+// (the full multi-select if the primary is in it, else just the primary) and is a no-op (returns
+// false) without an eligible selection / clipboard / live doc.
+//   - featureCopySelection: copy the selected feature(s) into st.clipboard (read-only engine op).
+//   - featureCutSelection:  copy, then delete the selected feature(s).
+//   - featurePasteSelection: append st.clipboard's feature bundle(s) into the active doc.
+bool featureCopySelection(AppState& st);
+bool featureCutSelection(AppState& st);
+bool featurePasteSelection(AppState& st);
+
 }  // namespace ui

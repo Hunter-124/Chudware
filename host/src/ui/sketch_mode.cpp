@@ -403,6 +403,165 @@ bool SketchMode::isSelected(const std::string& id) const {
     return std::find(selIds_.begin(), selIds_.end(), id) != selIds_.end();
 }
 
+// ---- Wave 4C/4D: sketch entity copy / paste -------------------------------------------------
+// The base entity id behind a selection handle ("e3.p2" -> "e3"; a bare "e3" -> "e3").
+static std::string skBaseId(const std::string& handle) {
+    return handle.substr(0, handle.find('.'));
+}
+
+bool SketchMode::sketchHasSelection() const {
+    return active_ && !selIds_.empty();
+}
+
+// The active sketch feature's raw params object in the live doc tree (entities + constraints with
+// EVERY field intact — richer than the parsed SketchEntity). nullptr if the sketch isn't found.
+static const nlohmann::json* sketchParamsInTree(AppState& st, const std::string& fid) {
+    const nlohmann::json& tree = st.docMirror.tree();
+    if (!tree.is_object()) return nullptr;
+    auto fa = tree.find("features");
+    if (fa == tree.end() || !fa->is_array()) return nullptr;
+    for (const auto& f : *fa) {
+        if (!f.is_object()) continue;
+        if (f.value("id", std::string()) != fid) continue;
+        auto p = f.find("params");
+        return (p != f.end() && p->is_object()) ? &(*p) : nullptr;
+    }
+    return nullptr;
+}
+
+// Copy the selected entities (+ their internal constraints) into st.clipboard as an entities bundle.
+// Entities are pulled RAW from the doc tree so all type-specific fields survive the round-trip; the
+// constraint set keeps only relations whose every handle references a SELECTED entity (external /
+// origin relations are dropped — the engine drops them at paste anyway). copyOrigin = the min-corner
+// of the selected geometry in sketch (u,v), so paste can offset relative to a stable anchor.
+bool SketchMode::sketchCopySelection(AppState& st) {
+    if (!active_ || selIds_.empty()) return false;
+    const nlohmann::json* params = sketchParamsInTree(st, fid_);
+    if (!params) { st.toast(ui::ToastLevel::Warn, "Copy: sketch not found"); return false; }
+
+    // Selected base entity ids (deduped, preserving the raw-entity order below).
+    std::unordered_map<std::string, bool> wanted;
+    for (const auto& h : selIds_) wanted[skBaseId(h)] = true;
+
+    nlohmann::json entities = nlohmann::json::array();
+    auto ents = params->find("entities");
+    if (ents != params->end() && ents->is_array()) {
+        for (const auto& e : *ents) {
+            if (!e.is_object()) continue;
+            std::string id = e.value("id", std::string());
+            if (!id.empty() && wanted.count(id)) entities.push_back(e);
+        }
+    }
+    if (entities.empty()) { st.toast(ui::ToastLevel::Warn, "Nothing to copy"); return false; }
+
+    // Internal constraints only: every handle base must be a copied entity.
+    nlohmann::json constraints = nlohmann::json::array();
+    auto cons = params->find("constraints");
+    if (cons != params->end() && cons->is_array()) {
+        for (const auto& c : *cons) {
+            if (!c.is_object()) continue;
+            auto refs = c.find("refs");
+            if (refs == c.end() || !refs->is_array() || refs->empty()) continue;
+            bool allInternal = true;
+            for (const auto& r : *refs) {
+                if (!r.is_string() || !wanted.count(skBaseId(r.get<std::string>()))) {
+                    allInternal = false; break;
+                }
+            }
+            if (allInternal) constraints.push_back(c);
+        }
+    }
+
+    // Copy-origin = min (u,v) corner of the selected entities (from the solved coords we already
+    // hold). Gives a stable, intuitive anchor so the paste preview tracks the cursor naturally.
+    bool any = false;
+    float mnU = 0, mnV = 0;
+    auto acc = [&](float u, float v) {
+        if (!any) { mnU = u; mnV = v; any = true; }
+        else { if (u < mnU) mnU = u; if (v < mnV) mnV = v; }
+    };
+    for (const auto& e : ents_) {
+        if (!wanted.count(e.id)) continue;
+        acc(e.p1[0], e.p1[1]); acc(e.p2[0], e.p2[1]);
+        acc(e.center[0], e.center[1]);
+        for (const auto& q : e.pts) acc(q.x, q.y);
+    }
+
+    st.clipboard.clear();
+    st.clipboard.kind = AppState::Clipboard::Kind::SketchEntities;
+    st.clipboard.srcDocId = st.docMirror.docId();
+    st.clipboard.payload = nlohmann::json{{"entities", entities}, {"constraints", constraints}};
+    st.clipboard.copyOriginU = any ? mnU : 0.0f;
+    st.clipboard.copyOriginV = any ? mnV : 0.0f;
+    st.addLog("[sketch] copied " + std::to_string(entities.size()) + " entit(ies)");
+    st.toast(ui::ToastLevel::Info,
+             "Copied " + std::to_string(entities.size()) + " sketch entit(ies)");
+    return true;
+}
+
+// Arm the paste-placement mode from a SketchEntities clipboard. The pasted outlines then follow the
+// cursor (drawPastePreview) until the next viewport click commits, or Esc cancels. Snapshots the
+// bundle + anchor so a later clipboard change can't disturb the in-progress placement.
+bool SketchMode::sketchPasteBegin(AppState& st) {
+    if (!active_) return false;
+    if (st.clipboard.kind != AppState::Clipboard::Kind::SketchEntities) return false;
+    const nlohmann::json& pl = st.clipboard.payload;
+    if (!pl.is_object() || !pl.contains("entities") || !pl["entities"].is_array() ||
+        pl["entities"].empty())
+        return false;
+    // Cancel any armed drawing tool / Smart-Dim pick so placement owns the next click cleanly.
+    resetTool();
+    pasteBundle_ = pl;
+    pasteAnchorUV_ = ImVec2(st.clipboard.copyOriginU, st.clipboard.copyOriginV);
+    pastePlacing_ = true;
+    st.toast(ui::ToastLevel::Info, "Click to place pasted entities (Esc to cancel)");
+    return true;
+}
+
+// Commit the pasted bundle shifted by (offsetX, offsetY) via the sketch_paste_entities op. Routed
+// through the normal ops path (revision bump + undo) like sketch_add_entity, then re-solve so the
+// new geometry shows. Op errors are toasted and leave the sketch untouched.
+void SketchMode::commitPasteEntities(AppState& st, float offsetX, float offsetY) {
+    if (!pasteBundle_.is_object()) { pastePlacing_ = false; return; }
+    nlohmann::json op = {
+        {"op", "sketch_paste_entities"},
+        {"sketch", fid_},
+        {"entities_bundle", pasteBundle_},
+        {"offset_x", offsetX},
+        {"offset_y", offsetY},
+    };
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    pastePlacing_ = false;
+    pasteBundle_ = nlohmann::json();
+    if (!r.ok) { st.toast(ui::ToastLevel::Error, "Paste: " + r.error_message); return; }
+    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    resolve(st);
+    st.addLog("[sketch] pasted entities (dx=" + std::to_string(offsetX) +
+              ", dy=" + std::to_string(offsetY) + ")");
+}
+
+// Follow-cursor preview of the paste bundle: parse its raw entities, translate them by
+// (cursorUV - anchor), and stroke each outline in the accent color. The cursor delta is computed in
+// sketch (u,v) so the preview lands exactly where the commit op will place the geometry.
+void SketchMode::drawPastePreview(AppState& st, ImDrawList* dl, const ImVec2& cursor) {
+    if (!pasteBundle_.is_object() || !basisOk_) return;
+    (void)st;
+    float cu = 0, cv = 0; screenToUV(cursor, cu, cv);
+    float du = cu - pasteAnchorUV_.x, dv = cv - pasteAnchorUV_.y;
+    // Parse the bundle entities into temporary SketchEntity records, then shift each in (u,v).
+    std::vector<SketchEntity> preview;
+    nlohmann::json wrap = nlohmann::json{{"entities", pasteBundle_["entities"]}};
+    parseEntities(wrap, preview);
+    const ImU32 c = col(ui::palette.accent, 0.9f);
+    for (auto& e : preview) {
+        e.p1[0] += du; e.p1[1] += dv;
+        e.p2[0] += du; e.p2[1] += dv;
+        e.center[0] += du; e.center[1] += dv;
+        for (auto& q : e.pts) { q.x += du; q.y += dv; }
+        strokeEntityOutline(dl, e, c, std::max(1.5f, 2.0f * ui::uiScale));
+    }
+}
+
 // C38 (S1): resolve a stored entity id to its CURRENT index in ents_ (-1 if gone). DimPicks store
 // the id (stable) rather than the index (refilled by applyEnterResult/resolve mid-pick).
 int SketchMode::entIndexById(const std::string& id) const {
@@ -1073,7 +1232,8 @@ void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSn
                                editOverDefOpen_ = false; editOverDefOp_ = nullptr;   // C50f: edit-path over-define dialog
                                relOverDefOpen_ = false; relOverDefOps_ = nullptr; relOverDefLabel_.clear();   // C50g
                                textPopupOpen_ = false; textFocus_ = false;          // Sketch Text popup
-                               eqPopupOpen_ = false; eqFocus_ = false; }            // Eq-Driven Curve popup
+                               eqPopupOpen_ = false; eqFocus_ = false;              // Eq-Driven Curve popup
+                               pastePlacing_ = false; pasteBundle_ = nlohmann::json(); }  // Wave 4C paste-placement
 void SketchMode::cancelTool() { resetTool(); }
 
 // ---------------------------------------------------------------------------
@@ -3645,6 +3805,27 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         }
     }
 
+    // ---- Wave 4C/4D: sketch entity copy / paste keyboard routing ----
+    // Ctrl+C copies the current selection; Ctrl+V arms paste-placement from a SketchEntities
+    // clipboard. Suppressed while a text field owns input, while placement is already in progress
+    // (Ctrl+V then is a no-op), and (Ctrl+C) only when there's a selection. The Ctrl+X/cut path is
+    // intentionally NOT bound here — deleting sketch entities already has Delete; copy+delete on
+    // Ctrl+X would surprise. The global app router only forwards Ctrl+C/V to sketch mode.
+    if (!io.WantTextInput && io.KeyCtrl && !pastePlacing_) {
+        if (ImGui::IsKeyPressed(ImGuiKey_C, false) && !selIds_.empty())
+            sketchCopySelection(st);
+        else if (ImGui::IsKeyPressed(ImGuiKey_V, false) &&
+                 st.clipboard.kind == AppState::Clipboard::Kind::SketchEntities)
+            sketchPasteBegin(st);
+    }
+
+    // ---- Wave 4C/4D: paste-placement mode (preview drawn at the END so the existing geometry still
+    // renders underneath). While placing we suppress all tool/selection INTERACTION by treating the
+    // canvas as not-hovered, so a placement click never also selects/places — but grid + entities +
+    // dimensions still draw normally below. The follow-cursor preview + commit/cancel run after the
+    // geometry pass (search "paste-placement preview").
+    if (pastePlacing_) imgHovered = false;
+
     // C41 (T1): Esc consumption flag. The specific Esc behaviors that KEEP the tool armed
     // (Smart Dim pick-buffer clear, Offset stage back-out, Modify box close) set this so the
     // hover-independent catch-all at the end of drawOverlay doesn't also disarm the tool.
@@ -6037,6 +6218,41 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // Smart Dimension was the only in-sketch writer of st.hover (model-ref picking); clear a
         // stale highlight once the tool disarms (the viewport's own picking is off in-sketch).
         st.hover = render::PickHit{};
+    }
+
+    // ---- Wave 4C/4D: paste-placement preview (drawn LAST, on top of the existing geometry) ----
+    // imgHovered was forced false above so no tool/selection interaction consumed the placement
+    // click. The follow-cursor outline preview is shifted by (cursor - copyOrigin); a left-click over
+    // the canvas commits the paste at that offset, Esc cancels. We re-derive canvas-hover from the
+    // image rect (the suppressed imgHovered can't be reused for the commit click).
+    if (pastePlacing_) {
+        st.requestCursor(ui::CursorKind::Crosshair);
+        drawPastePreview(st, dl, io.MousePos);
+        const char* banner = "Click to place \xE2\x80\x94 Esc to cancel";
+        ImVec2 bts = ImGui::CalcTextSize(banner);
+        float bcx = (imgMin.x + imgMax.x) * 0.5f;
+        ImVec2 b0(bcx - bts.x * 0.5f - 14, imgMin.y + 52.0f * ui::uiScale);
+        ImVec2 b1(bcx + bts.x * 0.5f + 14, b0.y + bts.y + 12);
+        dl->AddRectFilled(b0, b1, col(pal.overlayBg), 6.0f);
+        dl->AddRect(b0, b1, col(pal.overlayBorder), 6.0f);
+        dl->AddText(ImVec2(b0.x + 14, b0.y + 6), col(pal.overlayText), banner);
+        bool overCanvas = ImGui::IsMouseHoveringRect(imgMin, imgMax);
+        // Exclude the ✓/✗ confirmation corner (top-right) so a click there doesn't also commit the
+        // paste — same geometry the top-of-function corner block uses to steal hover from tools.
+        {
+            const float sz = 30.0f, pad = 12.0f;
+            ImVec2 okMin(imgMax.x - pad - sz, imgMin.y + pad), okMax(okMin.x + sz, okMin.y + sz);
+            ImVec2 cxMin(okMin.x, okMax.y + 6), cxMax(cxMin.x + sz, cxMin.y + sz);
+            if (ImGui::IsMouseHoveringRect(okMin, okMax) || ImGui::IsMouseHoveringRect(cxMin, cxMax))
+                overCanvas = false;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            pastePlacing_ = false; pasteBundle_ = nlohmann::json();
+            st.toast(ui::ToastLevel::Info, "Paste cancelled");
+        } else if (overCanvas && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            float cu = 0, cv = 0; screenToUV(io.MousePos, cu, cv);
+            commitPasteEntities(st, cu - pasteAnchorUV_.x, cv - pasteAnchorUV_.y);
+        }
     }
 
     dl->PopClipRect();

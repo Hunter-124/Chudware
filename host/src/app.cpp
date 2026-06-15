@@ -655,6 +655,28 @@ int run_gui(const char* screenshotPath) {
         if (propertyManager.active() && std::strcmp(cmd_id, "sketch_new") == 0)
             propertyManager.cancelEdits(st);
         if (sketchMode.onRibbonCommand(st, cmd_id)) return;       // C18 sketch tool handled
+        // Wave 4C/4D: Edit-menu copy / cut / paste. The menu bar fires these ids; they route exactly
+        // like the global Ctrl+C/X/V keys (sketch first when active, else the FeatureManager). Copy
+        // routed AFTER onRibbonCommand so an armed sketch tool doesn't swallow "edit_copy" — these
+        // ids are never sketch-tool ids, so onRibbonCommand returns false for them.
+        if (std::strcmp(cmd_id, "edit_copy") == 0) {
+            if (sketchMode.active()) { if (sketchMode.sketchHasSelection()) sketchMode.sketchCopySelection(st); }
+            else ui::featureCopySelection(st);
+            return;
+        }
+        if (std::strcmp(cmd_id, "edit_cut") == 0) {
+            // Sketch mode has no cut (Delete removes entities); cut applies to the FeatureManager.
+            if (!sketchMode.active()) ui::featureCutSelection(st);
+            return;
+        }
+        if (std::strcmp(cmd_id, "edit_paste") == 0) {
+            if (sketchMode.active() &&
+                st.clipboard.kind == AppState::Clipboard::Kind::SketchEntities)
+                sketchMode.sketchPasteBegin(st);
+            else if (st.clipboard.kind == AppState::Clipboard::Kind::Feature)
+                ui::featurePasteSelection(st);
+            return;
+        }
         // DRAWINGS: "Make Drawing" creates a drawing + standard views from the active part and
         // opens it as a Drawing tab (guarded; toasts if no part is open).
         if (std::strcmp(cmd_id, "make_drawing") == 0) { st.makeDrawing(); return; }
@@ -1651,6 +1673,32 @@ int run_gui(const char* screenshotPath) {
             if (!textFocus && (io.KeyCtrl || io.KeySuper) && !io.KeyShift &&
                 ImGui::IsKeyPressed(ImGuiKey_N, false))
                 ui::openNewDocChooser();
+
+            // ---- Wave 4C/4D: global Ctrl+C / Ctrl+X / Ctrl+V copy/paste routing ----
+            // Guards mirror the undo/redo block: skip while a text field, the ECAD window, or a
+            // background/agent run owns input. NOT gated on inSketchNow here: when a sketch is
+            // active, SketchMode::drawOverlay owns Ctrl+C/V (it has the (u,v) context for the
+            // follow-cursor paste-placement), so the global router stands down and routes ONLY to the
+            // FeatureManager when no sketch is active. (Sketch copy/paste therefore never double-fires
+            // — exactly the inSketchNow skip the undo block uses.) Ctrl+Z/Y are handled above; we
+            // never touch them. Explorer-tab FILE copy/paste is Wave 3 — see the TODO below.
+            if (canDoc && !textFocus && !ecadFocused && (io.KeyCtrl || io.KeySuper) &&
+                !io.KeyShift) {
+                if (!inSketchNow) {
+                    // FeatureManager / left-pane selection copy/cut/paste.
+                    if (ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+                        // TODO (Wave 3): when the Explorer tab is focused with a file selected, route
+                        // Ctrl+C to file copy instead. For now copy the selected feature(s).
+                        ui::featureCopySelection(st);
+                    } else if (ImGui::IsKeyPressed(ImGuiKey_X, false)) {
+                        ui::featureCutSelection(st);
+                    } else if (ImGui::IsKeyPressed(ImGuiKey_V, false)) {
+                        // TODO (Wave 3): Explorer-tab file paste hook goes here.
+                        ui::featurePasteSelection(st);
+                    }
+                }
+                // When inSketchNow: intentionally no-op — SketchMode::drawOverlay handles Ctrl+C/V.
+            }
         }
 
         // Re-push palette-derived viewport visuals every frame so a runtime theme toggle (from the

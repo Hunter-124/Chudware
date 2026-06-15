@@ -162,6 +162,19 @@ public:
     // True when the Smart Dimension tool is armed and collecting picks (feature_tree uses this to
     // route a datum-plane click here instead of toggling plane visibility).
     bool smartDimPicking() const;
+
+    // ---- Wave 4C/4D: sketch entity copy / paste ----
+    // Driven by the global Ctrl+C / Ctrl+V routing (app.cpp) + the "edit_copy"/"edit_paste"
+    // dispatcher ids while a sketch is active. Copy serializes the selected entities (+ their
+    // internal constraints) into st.clipboard as an entities bundle, snapshotting a copy-origin
+    // anchor (min-corner of the selection in sketch u,v). Paste enters a "paste placement" mode: the
+    // pasted outlines follow the cursor; the next viewport click commits sketch_paste_entities with
+    // offset = (click - copy-origin), keeping the pasted set's internal relations. Esc cancels the
+    // placement. All are no-ops without an active sketch / selection / matching clipboard.
+    bool sketchHasSelection() const;          // at least one entity selected (Ctrl+C is meaningful)
+    bool sketchCopySelection(AppState& st);   // selection -> st.clipboard (entities bundle)
+    bool sketchPasteBegin(AppState& st);      // arm paste-placement from a SketchEntities clipboard
+    bool pastePlacing() const { return pastePlacing_; }   // true while placing pasted entities
     // Datum plane (0=front 1=top 2=right) clicked in the tree while Smart Dimension is armed:
     // project its intersection line with the sketch plane and add it as a dimension pick.
     void addPlaneDimRef(AppState& st, int planeIdx);
@@ -430,6 +443,18 @@ private:
     // pruned of vanished ids on every applyEnterResult refill.
     std::vector<std::string> selIds_;
     bool isSelected(const std::string& id) const;
+
+    // ---- Wave 4C/4D: paste-placement state ----
+    // pastePlacing_ is true between sketchPasteBegin() and the placement click (or Esc). The pasted
+    // outlines are previewed at (cursor - pasteAnchorUV_) each frame; the commit click sends
+    // sketch_paste_entities with offset = cursorUV - pasteAnchorUV_. The bundle to paste + its anchor
+    // are snapshotted off st.clipboard at begin so a later clipboard change can't disturb the preview.
+    bool pastePlacing_ = false;
+    nlohmann::json pasteBundle_;            // {entities, constraints} being placed
+    ImVec2 pasteAnchorUV_{0, 0};            // copy-origin in sketch (u,v) (preview/offset base)
+    void commitPasteEntities(AppState& st, float offsetX, float offsetY);
+    // Draw the follow-cursor preview of the paste bundle (outlines shifted by cursor - anchor).
+    void drawPastePreview(AppState& st, ImDrawList* dl, const ImVec2& cursor);
 
     // ---- C51: box (rubber-band) selection ----
     // Dragging from empty canvas rubber-bands a selection rectangle (SolidWorks style):

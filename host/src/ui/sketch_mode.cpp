@@ -1122,8 +1122,10 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
             return true;
         }
         nlohmann::json ops = nlohmann::json::array();
-        for (const auto& id : selIds_)
+        for (const auto& id : selIds_) {
+            if (id == "origin") continue;   // the virtual origin has no construction state
             ops.push_back({{"op", "sketch_toggle_construction"}, {"sketch", fid_}, {"id", id}});
+        }
         auto r = st.docMirror.applyOps(st.worker, ops);
         if (!r.ok) st.toast(ui::ToastLevel::Error, "Construction: " + r.error_message);
         else {
@@ -1664,6 +1666,11 @@ int SketchMode::hitTestHandle(const ImVec2& s, std::string& handleOut, float& uO
         float d2 = dx * dx + dy * dy;
         if (d2 < best) { best = d2; handleOut = handle; uOut = eu; vOut = ev; hit = 1; }
     };
+    // The sketch origin (0,0) is a real, pickable point handle so it can be selected and given
+    // relations (coincident / horizontal / vertical / point_on …) against other geometry. It is a
+    // virtual entity — not in ents_ — and the engine resolves the bare ref "origin" to a fixed
+    // (0,0). It is fixed, so it is selectable but never draggable (see the drag-promotion guard).
+    consider("origin", 0.0f, 0.0f);
     for (const auto& e : ents_) {
         if (e.type == "line" || e.type == "slot") {
             consider(e.id + ".p1", e.p1[0], e.p1[1]);
@@ -3860,10 +3867,14 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     }
 
     // ---- sketch origin marker (always visible, SolidWorks red L-arrows at (0,0)) ----
-    // The origin is real geometry: snapPoint and the Smart Dimension hit-test both expose it as
-    // the "origin" handle, so entities can be anchored / dimensioned to it.
+    // The origin is real, pickable geometry: snapPoint, hitTestHandle and the Smart Dimension hit-
+    // test all expose it as the "origin" handle, so entities can be anchored / dimensioned to it and
+    // relations added between it and other sketch geometry. When selected it renders in the accent
+    // color with a filled selection ring (matching selected entities), red otherwise.
     {
-        const ImU32 oc = col(pal.statusErr, 0.95f);
+        const bool oSel = isSelected("origin");
+        const ImU32 oc = oSel ? col(pal.accent) : col(pal.statusErr, 0.95f);
+        const float th = oSel ? 2.6f : 1.8f;
         ImVec2 o = uvToScreen(0, 0);
         // unit u/v directions in screen space (normalized axis deltas)
         auto unit = [](ImVec2 d) {
@@ -3874,11 +3885,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         const float len = 22.0f * ui::uiScale;
         ImVec2 tu(o.x + du.x * len, o.y + du.y * len);
         ImVec2 tv(o.x + dv.x * len, o.y + dv.y * len);
-        dl->AddLine(o, tu, oc, 1.8f);
-        dl->AddLine(o, tv, oc, 1.8f);
+        if (oSel) dl->AddCircleFilled(o, 5.5f * ui::uiScale, col(pal.accent, 0.30f), 16);
+        dl->AddLine(o, tu, oc, th);
+        dl->AddLine(o, tv, oc, th);
         arrowHead(dl, tu, du.x, du.y, 7.0f, oc);
         arrowHead(dl, tv, dv.x, dv.y, 7.0f, oc);
-        dl->AddCircle(o, 3.5f, oc, 12, 1.8f);
+        dl->AddCircle(o, 3.5f, oc, 12, th);
     }
 
     // ---- C51: closed-profile region shading (under the entities) ----
@@ -4352,6 +4364,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             std::vector<std::string> done;
             for (const auto& sel : selIds_) {
                 std::string base = sel.substr(0, sel.find('.'));
+                if (base == "origin") continue;   // the virtual origin can't be deleted
                 if (std::find(done.begin(), done.end(), base) != done.end()) continue;
                 done.push_back(base);
                 ops.push_back({{"op", "sketch_delete_entity"}, {"sketch", fid_}, {"id", base}});
@@ -4471,8 +4484,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 boxArmed_ = true; boxStart_ = io.MousePos; boxCtrl_ = io.KeyCtrl;   // empty canvas
             }
         }
-        // Armed handle: promote to a real (single-point reshape) drag past the threshold.
-        if (dragArmed_ && !dragging_ && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        // Armed handle: promote to a real (single-point reshape) drag past the threshold. The
+        // origin is fixed at (0,0) — it stays armed (never promotes), so releasing simply selects it.
+        if (dragArmed_ && !dragging_ && pendingHandle_ != "origin" &&
+            ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
             if (std::hypot(io.MousePos.x - dragDownPos_.x, io.MousePos.y - dragDownPos_.y) > 4.0f) {
                 dragging_ = true; dragHandle_ = pendingHandle_; dragFrame_ = -1; dragArmed_ = false;
             }
@@ -6726,13 +6741,17 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // midpoint; 2 same-kind subjects + 1 line -> symmetric (axis last). Pair relations chain to the
     // first ref (e0~e1, e0~e2, …); symmetric uses an explicit ordered [a,b,axis] ref list.
     if (relPopupOpen_) {
-        for (const auto& h : relIds_)
-            if (!entById(h.substr(0, h.find('.')))) { relPopupOpen_ = false; relIds_.clear(); break; }
+        for (const auto& h : relIds_) {
+            const std::string base = h.substr(0, h.find('.'));
+            // "origin" is the virtual fixed-origin handle (not in ents_) — keep it, don't purge.
+            if (base != "origin" && !entById(base)) { relPopupOpen_ = false; relIds_.clear(); break; }
+        }
     }
     if (relPopupOpen_) {
         // Classify: a handle with a '.' (or a bare point entity) is a POINT; bare line/circle ids
-        // are entities. (Centers select as "eN.center" = point.)
-        auto isPointHandle = [&](const std::string& h) {
+        // are entities. (Centers select as "eN.center" = point.) The bare "origin" is a point too.
+        auto isPointHandle = [&](const std::string& h) -> bool {
+            if (h == "origin") return true;
             if (h.find('.') != std::string::npos) return true;
             const SketchEntity* e = entById(h);
             return e && e->type == "point";
@@ -6842,7 +6861,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 if (subs.size() == 2 && !axis.empty())
                     emitOrdered("Symmetric (across line)", "symmetric", {subs[0], subs[1], axis});
             } else if (n == 1) {
-                emit("Fix", "fix", 'e');
+                // The origin is implicitly fixed; "Fix" on it would be a dead no-op constraint.
+                if (relIds_[0] != "origin") emit("Fix", "fix", 'e');
             }
             if (!any) ImGui::TextDisabled("No relations for this selection");
             ImGui::Separator();

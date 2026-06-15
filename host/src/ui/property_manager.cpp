@@ -1429,9 +1429,20 @@ void PropertyManager::drawBody(AppState& st) {
         }
 
         // C37-F: OK / Cancel buttons scaled by uiScale, with tooltips and green/red iconography.
-        float btnW = 28.0f * ui::uiScale;
-        float pairW = btnW * 2 + 4 * ui::uiScale;
-        float rightX = ImGui::GetWindowContentRegionMax().x - pairW;
+        // The pair is right-aligned to the pane's content edge. ImGui::ImageButton adds
+        // style.FramePadding on EVERY side, so a button's full width is imgSz + 2*FramePadding.x.
+        // Sizing the image as (btnW - 2*FramePadding.x) makes each button occupy exactly btnW, so
+        // the reservation below matches reality — otherwise the Cancel button overflows / clips off
+        // the right edge (the reported bug). Also clamp rightX so it can never run past the edge.
+        const ImGuiStyle& hdrStl = ImGui::GetStyle();
+        const float btnW = 28.0f * ui::uiScale;
+        const float gapW = 4.0f * ui::uiScale;
+        float imgSz = btnW - 2.0f * hdrStl.FramePadding.x;
+        if (imgSz < 8.0f * ui::uiScale) imgSz = 8.0f * ui::uiScale;
+        const float pairW = btnW * 2.0f + gapW;
+        const float edgeX = ImGui::GetWindowContentRegionMax().x;
+        // Keep a hair of margin (2px) so rounding never pushes the last button past the edge.
+        float rightX = edgeX - pairW - 2.0f * ui::uiScale;
         float afterTitleX = ImGui::GetCursorPosX();
         if (rightX > afterTitleX + 6) {
             ImGui::SameLine(0, 0);
@@ -1452,7 +1463,7 @@ void PropertyManager::drawBody(AppState& st) {
             bool btnOk;
             if (okIc.valid) {
                 btnOk = ImGui::ImageButton("##pm_ok",
-                    okIc.texId, ImVec2(btnW - 4 * ui::uiScale, btnW - 4 * ui::uiScale), okIc.uv0, okIc.uv1);
+                    okIc.texId, ImVec2(imgSz, imgSz), okIc.uv0, okIc.uv1);
             } else {
                 btnOk = ImGui::Button("OK##pm", ImVec2(btnW, 0));
             }
@@ -1461,7 +1472,7 @@ void PropertyManager::drawBody(AppState& st) {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("OK (Enter)");
         ImGui::PopStyleColor(2);
 
-        ImGui::SameLine(0, 4 * ui::uiScale);
+        ImGui::SameLine(0, gapW);
 
         // Cancel button — red/muted.
         ImGui::PushStyleColor(ImGuiCol_Button,
@@ -1473,7 +1484,7 @@ void PropertyManager::drawBody(AppState& st) {
             bool btnCancel;
             if (cancelIc.valid) {
                 btnCancel = ImGui::ImageButton("##pm_cancel",
-                    cancelIc.texId, ImVec2(btnW - 4 * ui::uiScale, btnW - 4 * ui::uiScale), cancelIc.uv0, cancelIc.uv1);
+                    cancelIc.texId, ImVec2(imgSz, imgSz), cancelIc.uv0, cancelIc.uv1);
             } else {
                 btnCancel = ImGui::Button("X##pm", ImVec2(btnW, 0));
             }

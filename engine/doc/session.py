@@ -281,11 +281,22 @@ def _write_aicm(session: DocSession, result: CompileResult) -> tuple[str, list[d
         rgb, metallic, roughness = _appearance_material(appearances.get(key))
         if rgb is not None:
             color = rgb
+        elif bo.color:
+            color = tuple(bo.color)
+        elif getattr(bo.shape, "color", None):
+            color = tuple(bo.shape.color)  # MeshBody carries its source color (e.g. 3MF/PLY)
         else:
-            color = tuple(bo.color) if bo.color else _DEFAULT_COLOR
-        bt = tess.tessellate_body(bo.shape, body_id=i, name=bo.name or f"Body{i}", color=color,
-                                  metallic=metallic, roughness=roughness,
-                                  two_sided=(bo.kind == "surface"))
+            color = _DEFAULT_COLOR
+        # FORMATS_PLAN.md §2 D1: an imported mesh body (kind=="mesh", shape is a MeshBody) has no
+        # OCCT topology, so it goes straight to AICM via tessellate_mesh_body (no BRepMesh).
+        from engine.doc.mesh_body import MeshBody
+        if isinstance(bo.shape, MeshBody):
+            bt = tess.tessellate_mesh_body(bo.shape, body_id=i, name=bo.name or f"Body{i}",
+                                           color=color, metallic=metallic, roughness=roughness)
+        else:
+            bt = tess.tessellate_body(bo.shape, body_id=i, name=bo.name or f"Body{i}", color=color,
+                                      metallic=metallic, roughness=roughness,
+                                      two_sided=(bo.kind == "surface"))
         body_tesses.append(bt)
         bodies_meta.append({"body_id": i, "name": bo.name or f"Body{i}", "color": list(color),
                             "owner_key": key, "metallic": metallic, "roughness": roughness,

@@ -58,7 +58,49 @@ _EXT_TO_FORMAT: dict[str, str] = {
     ".brep": "brep",
     ".stl": "stl",
     ".3mf": "3mf",
+    ".obj": "obj",
+    ".ply": "ply",
+    ".gltf": "gltf",
+    ".glb": "glb",
 }
+
+
+# --------------------------------------------------------------------------- format registry (D4)
+# Single source of truth for the format matrix. The host derives its Open/Import/Export filters
+# from this via the ``doc_formats`` RPC, so the UI never drifts from what the engine can do.
+#   lane:  "brep" (OCCT solids) | "mesh" (triangle soup → MeshBody) | "native" (.step+)
+class FormatInfo:
+    __slots__ = ("fmt", "label", "exts", "lane", "can_import", "can_export")
+
+    def __init__(self, fmt, label, exts, lane, can_import=True, can_export=True):
+        self.fmt = fmt
+        self.label = label
+        self.exts = exts            # list of extensions incl. leading dot, primary first
+        self.lane = lane
+        self.can_import = can_import
+        self.can_export = can_export
+
+    def as_dict(self) -> dict:
+        return {"fmt": self.fmt, "label": self.label, "exts": list(self.exts), "lane": self.lane,
+                "can_import": self.can_import, "can_export": self.can_export}
+
+
+FORMAT_REGISTRY: list[FormatInfo] = [
+    FormatInfo("step", "STEP", [".step", ".stp"], "brep"),
+    FormatInfo("iges", "IGES", [".iges", ".igs"], "brep"),
+    FormatInfo("brep", "BREP (OpenCASCADE)", [".brep"], "brep"),
+    FormatInfo("stl", "STL", [".stl"], "mesh"),
+    FormatInfo("3mf", "3MF", [".3mf"], "mesh"),
+    FormatInfo("obj", "Wavefront OBJ", [".obj"], "mesh"),
+    FormatInfo("ply", "Stanford PLY", [".ply"], "mesh"),
+    FormatInfo("gltf", "glTF", [".gltf"], "mesh"),
+    FormatInfo("glb", "glTF binary", [".glb"], "mesh"),
+]
+
+
+def list_formats() -> list[dict]:
+    """The format matrix as plain dicts (for the ``doc_formats`` RPC / host filter generation)."""
+    return [fi.as_dict() for fi in FORMAT_REGISTRY]
 
 
 def _detect_format(path: str | os.PathLike) -> str:
@@ -122,56 +164,68 @@ def export_document(
     str
         The resolved absolute path that was written.
     """
+    from engine.doc.mesh_body import MeshBody
+
     path = Path(path)
     fmt = format or _detect_format(path)
     fmt = fmt.lower()
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    shape = _shapes_to_export_list(session_bodies)
+    has_mesh = any(isinstance(s, MeshBody) for _, s in session_bodies)
 
-    if fmt == "step":
-        from build123d import export_step
-        export_step(shape, str(path))
-
-    elif fmt == "iges":
-        from OCP.IGESControl import IGESControl_Writer
-        w = IGESControl_Writer()
-        w.AddShape(shape.wrapped)
-        w.ComputeModel()
-        ok = w.Write(str(path))
-        if not ok:
-            raise RuntimeError("IGES writer returned failure")
-
-    elif fmt == "brep":
-        from build123d import export_brep
-        export_brep(shape, str(path))
-
-    elif fmt == "stl":
-        from build123d import export_stl
-        export_stl(shape, str(path))
-
-    elif fmt == "3mf":
-        from build123d import Mesher
-        m = Mesher()
-        added = 0
-        for name, s in session_bodies:
-            # 3MF (via lib3mf) is a solid-mesh format — an open surface body has no enclosed
-            # volume to mesh, so skip it rather than emit a degenerate/closed-shell mesh. Other
-            # formats (STEP/IGES/BREP/STL) already accept shells, so they keep surface bodies.
-            if not _is_solid_shape(s):
-                continue
-            m.add_shape(s)
-            added += 1
-        if added == 0:
+    # --- B-rep formats (OCCT) — cannot carry a topology-free mesh body ----------------------
+    if fmt in ("step", "iges", "brep"):
+        if has_mesh:
             raise ValueError(
-                "3MF export needs at least one solid body; all bodies are open surfaces "
-                "(export STEP/IGES/STL for surface bodies)")
-        m.write(str(path))
+                f"a mesh body (imported STL/OBJ/PLY/3MF/glTF) cannot be exported to {fmt.upper()} — "
+                "it has no B-rep topology. Export STL, OBJ, PLY, 3MF, or glTF instead.")
+        shape = _shapes_to_export_list(session_bodies)
+        if fmt == "step":
+            from build123d import export_step
+            export_step(shape, str(path))
+        elif fmt == "iges":
+            from OCP.IGESControl import IGESControl_Writer
+            w = IGESControl_Writer()
+            w.AddShape(shape.wrapped)
+            w.ComputeModel()
+            if not w.Write(str(path)):
+                raise RuntimeError("IGES writer returned failure")
+        else:  # brep
+            from build123d import export_brep
+            export_brep(shape, str(path))
+        return str(path)
 
-    else:
-        raise ValueError(f"unsupported export format '{fmt}'")
+    # --- mesh formats — MeshBody goes straight out; B-rep solids get tessellated -----------
+    if fmt in ("stl", "obj", "ply", "gltf", "glb"):
+        # Pure-solid STL keeps the proven build123d path (byte-identical to before); any mesh body
+        # (or the F1 mesh-only formats) route through the unified trimesh writer.
+        if fmt == "stl" and not has_mesh:
+            from build123d import export_stl
+            export_stl(_shapes_to_export_list(session_bodies), str(path))
+            return str(path)
+        return _export_mesh_trimesh(session_bodies, path, fmt)
 
-    return str(path)
+    if fmt == "3mf":
+        if not has_mesh:
+            from build123d import Mesher
+            m = Mesher()
+            added = 0
+            for _name, s in session_bodies:
+                # 3MF (via lib3mf) is a solid-mesh format — an open surface body has no enclosed
+                # volume to mesh, so skip it rather than emit a degenerate mesh.
+                if not _is_solid_shape(s):
+                    continue
+                m.add_shape(s)
+                added += 1
+            if added == 0:
+                raise ValueError(
+                    "3MF export needs at least one solid body; all bodies are open surfaces "
+                    "(export STEP/IGES/STL for surface bodies)")
+            m.write(str(path))
+            return str(path)
+        return _export_3mf_lib3mf(session_bodies, path)
+
+    raise ValueError(f"unsupported export format '{fmt}'")
 
 
 # --------------------------------------------------------------------------- import
@@ -207,6 +261,8 @@ def import_path(
         return _import_stl(path)
     elif fmt == "3mf":
         return _import_3mf(path)
+    elif fmt in ("obj", "ply", "gltf", "glb"):
+        return _load_mesh_trimesh(path, fmt)
     else:
         raise ValueError(f"unsupported import format '{fmt}'")
 
@@ -306,15 +362,20 @@ def _import_brep(path: Path) -> list[tuple[str, Any]]:
 
 
 def _import_stl(path: Path) -> list[tuple[str, Any]]:
-    from build123d import import_stl
-    shape = import_stl(str(path))
-    return [("Body1", shape)]
+    """STL → one MeshBody (triangle soup). STL has no topology, so it is never a B-rep solid."""
+    return _load_mesh_trimesh(path, "stl")
 
 
 def _import_3mf(path: Path) -> list[tuple[str, Any]]:
-    """Import 3MF via lib3mf — returns one entry per mesh with a volume computed from triangles."""
+    """3MF → one MeshBody per mesh object via **lib3mf** (BSD, already bundled).
+
+    lib3mf is purpose-built for 3MF and needs no scene-graph deps (trimesh's 3MF path pulls in
+    networkx + lxml). Build-item transforms are not yet applied (single-object 3MF is the common
+    case); F1 adds transform + color/material fidelity."""
     import lib3mf
     import numpy as np
+
+    from engine.doc.mesh_body import MeshBody
 
     wrapper = lib3mf.Wrapper()
     model = wrapper.CreateModel()
@@ -327,41 +388,153 @@ def _import_3mf(path: Path) -> list[tuple[str, Any]]:
     while mesh_iter.MoveNext():
         idx += 1
         mesh = mesh_iter.GetCurrentMeshObject()
-        vc = mesh.GetVertexCount()
-        tc = mesh.GetTriangleCount()
-        verts = [mesh.GetVertex(j) for j in range(vc)]
-        tris = [mesh.GetTriangle(j) for j in range(tc)]
-        name = mesh.GetName() or f"Body{idx}"
+        if mesh.GetTriangleCount() == 0:
+            continue
+        gv = mesh.GetVertices()
+        gi = mesh.GetTriangleIndices()
+        verts = np.array([[v.Coordinates[0], v.Coordinates[1], v.Coordinates[2]] for v in gv],
+                         dtype=np.float32)
+        tris = np.array([[t.Indices[0], t.Indices[1], t.Indices[2]] for t in gi], dtype=np.uint32)
+        name = mesh.GetName() or f"{Path(path).stem}_{idx}"
+        result.append((name, MeshBody(verts=verts, tris=tris, name=name)))
 
-        # Build a pseudo-shape with a .volume property computed from the mesh (divergence
-        # theorem: V = 1/6 * |Σ v0·(v1×v2)|).
-        vol = 0.0
-        for tri in tris:
-            idxs = tri.Indices
-            v0 = np.array([verts[idxs[0]].Coordinates[k] for k in range(3)])
-            v1 = np.array([verts[idxs[1]].Coordinates[k] for k in range(3)])
-            v2 = np.array([verts[idxs[2]].Coordinates[k] for k in range(3)])
-            vol += float(np.dot(v0, np.cross(v1, v2)))
-        vol = abs(vol) / 6.0
-
-        # Return a thin wrapper so callers can call .volume
-        result.append((name, _MeshShapeProxy(vol, verts, tris)))
-
+    if not result:
+        raise ValueError(f"no mesh objects found in 3MF '{path}'")
     return result
 
 
-class _MeshShapeProxy:
-    """Minimal proxy returned for 3MF/STL mesh bodies that don't have an OCCT solid."""
+def _export_3mf_lib3mf(session_bodies: list[tuple[str, Any]], path: Path) -> str:
+    """Write bodies to 3MF via lib3mf (BSD). MeshBody goes out directly; a B-rep solid is
+    tessellated first. One 3MF mesh object + build item per body."""
+    import lib3mf
+    import numpy as np
 
-    def __init__(self, volume: float, verts: list, tris: list) -> None:
-        self.volume = volume
-        self._verts = verts
-        self._tris = tris
-        # Satisfy callers that check `.wrapped` (will be None — no OCCT solid)
-        self.wrapped = None
+    from engine.doc.mesh_body import MeshBody
 
-    def __repr__(self) -> str:
-        return f"<MeshShapeProxy volume={self.volume:.1f}>"
+    wrapper = lib3mf.Wrapper()
+    model = wrapper.CreateModel()
+    identity = wrapper.GetIdentityTransform()
+    added = 0
+    for name, s in session_bodies:
+        if isinstance(s, MeshBody):
+            verts, tris = np.asarray(s.verts), np.asarray(s.tris)
+        else:
+            verts, tris = _shape_to_triangles(s)
+        if len(tris) == 0:
+            continue
+        mo = model.AddMeshObject()
+        mo.SetName(str(name))
+        ps = []
+        for v in np.asarray(verts, dtype=np.float64):
+            p = lib3mf.Position()
+            p.Coordinates = (float(v[0]), float(v[1]), float(v[2]))
+            ps.append(p)
+        ts = []
+        for t in np.asarray(tris, dtype=np.int64):
+            tri = lib3mf.Triangle()
+            tri.Indices = (int(t[0]), int(t[1]), int(t[2]))
+            ts.append(tri)
+        mo.SetGeometry(ps, ts)
+        model.AddBuildItem(mo, identity)
+        added += 1
+    if added == 0:
+        raise ValueError("3MF export: no mesh geometry to write")
+    model.QueryWriter("3mf").WriteToFile(str(path))
+    return str(path)
+
+
+# -- unified mesh lane (trimesh) ----------------------------------------------
+# All mesh formats (STL / OBJ / PLY / 3MF / glTF) share one trimesh-backed reader → MeshBody and
+# one trimesh-backed writer. trimesh (MIT, already a dependency) reads/writes every one of these
+# robustly; the resulting MeshBody renders + re-exports through the FORMATS_PLAN §2 D1 pipeline.
+
+
+def _trimesh_color(geom) -> tuple | None:
+    """Best-effort representative sRGB triple in [0,1] from a trimesh geometry's visual, else None."""
+    try:
+        vis = getattr(geom, "visual", None)
+        main = getattr(vis, "main_color", None)
+        if main is not None and len(main) >= 3:
+            return (float(main[0]) / 255.0, float(main[1]) / 255.0, float(main[2]) / 255.0)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _load_mesh_trimesh(path: Path, fmt: str | None = None) -> list[tuple[str, Any]]:
+    """Load a mesh file via trimesh → ``list[(name, MeshBody)]``.
+
+    Handles a single ``Trimesh`` and a multi-geometry ``Scene`` (OBJ groups, 3MF build items,
+    glTF nodes) — for a Scene the node transforms are baked so every body is world-placed."""
+    import numpy as np
+    import trimesh
+
+    from engine.doc.mesh_body import MeshBody
+
+    stem = Path(path).stem
+    loaded = trimesh.load(str(path), force=None)
+    result: list[tuple[str, Any]] = []
+
+    def _add(geom, name: str) -> None:
+        faces = getattr(geom, "faces", None)
+        if faces is None or len(faces) == 0:
+            return
+        verts = np.asarray(geom.vertices, dtype=np.float32)
+        tris = np.asarray(geom.faces, dtype=np.uint32)
+        result.append((name, MeshBody(verts=verts, tris=tris, name=name,
+                                      color=_trimesh_color(geom))))
+
+    if isinstance(loaded, trimesh.Scene):
+        geoms = loaded.dump(concatenate=False)  # node transforms baked → world space
+        for i, geom in enumerate(geoms, start=1):
+            gname = None
+            try:
+                gname = geom.metadata.get("name")
+            except Exception:  # noqa: BLE001
+                gname = None
+            _add(geom, gname or f"{stem}_{i}")
+    elif isinstance(loaded, trimesh.Trimesh):
+        _add(loaded, stem)
+
+    if not result:
+        raise ValueError(f"no triangle mesh found in '{path}' ({fmt or 'mesh'})")
+    return result
+
+
+# trimesh export file_type per format key.
+_TRIMESH_EXPORT_TYPE: dict[str, str] = {
+    "stl": "stl", "3mf": "3mf", "obj": "obj", "ply": "ply", "gltf": "gltf", "glb": "glb",
+}
+
+
+def _shape_to_triangles(shape):
+    """Tessellate a build123d / OCCT shape to ``(verts (N,3), tris (M,3))`` for mesh export."""
+    from engine.doc import tessellate as tess
+    bt = tess.tessellate_body(shape, body_id=0, name="x", color=(0.5, 0.5, 0.5))
+    return bt.pos, bt.idx
+
+
+def _export_mesh_trimesh(session_bodies: list[tuple[str, Any]], path: Path, fmt: str) -> str:
+    """Write all bodies (MeshBody or B-rep solid) to a mesh format via trimesh."""
+    import numpy as np
+    import trimesh
+
+    from engine.doc.mesh_body import MeshBody
+
+    meshes = []
+    for _name, s in session_bodies:
+        if isinstance(s, MeshBody):
+            v, f = np.asarray(s.verts), np.asarray(s.tris)
+        else:
+            v, f = _shape_to_triangles(s)  # B-rep solid → triangulated for the mesh format
+        if len(f):
+            meshes.append(trimesh.Trimesh(vertices=np.asarray(v, dtype=np.float64),
+                                          faces=np.asarray(f, dtype=np.int64), process=False))
+    if not meshes:
+        raise ValueError("no mesh geometry to export")
+    combined = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
+    combined.export(str(path), file_type=_TRIMESH_EXPORT_TYPE.get(fmt, fmt))
+    return str(path)
 
 
 # --------------------------------------------------------------------------- compiler cache key
@@ -418,23 +591,24 @@ def _handler_import_file(params: dict, emit: EmitFn) -> dict:
     else:
         session = new_session("part", name=Path(path).stem)
 
-    # Build add_feature ops for each body
+    # ONE import feature per file — the import compiler appends *every* body found in the source
+    # (compile_import → _cached_import returns all of them). Emitting one feature per body would
+    # re-append the whole file once per body (N×N bodies for an N-body STEP / multi-mesh 3MF).
     fmt = _detect_format(path) if not params.get("format") else params["format"]
-    ops = []
-    for name, _shape in bodies:
-        ops.append({
-            "op": "add_feature",
-            "feature": {
-                "type": "import",
-                "name": name,
-                "params": {
-                    "source_path": str(path),
-                    "format": fmt,
-                    "original_name": name,
-                },
-                "refs": {},
+    feat_name = Path(path).name if len(bodies) > 1 else (bodies[0][0] or Path(path).stem)
+    ops = [{
+        "op": "add_feature",
+        "feature": {
+            "type": "import",
+            "name": feat_name,
+            "params": {
+                "source_path": str(path),
+                "format": fmt,
+                "original_name": feat_name,
             },
-        })
+            "refs": {},
+        },
+    }]
 
     response = sess_apply_ops(session, None, ops, emit)
     response["doc_id"] = session.doc_id
@@ -484,8 +658,17 @@ def _handler_export_file(params: dict, emit: EmitFn) -> dict:  # noqa: ARG001
     return {"path": out_path}
 
 
+def _handler_doc_formats(params: dict, emit: EmitFn) -> dict:  # noqa: ARG001
+    """Worker handler for ``doc_formats`` — the import/export format matrix (D4).
+
+    The host builds its File ▸ Open / Import / Export filters from this so the UI never lists a
+    format the engine can't handle (and vice-versa). Returns ``{"formats": [FormatInfo, ...]}``."""
+    return {"formats": list_formats()}
+
+
 # The orchestrator wires these via: _METHODS.update(formats.WORKER_METHODS)
 WORKER_METHODS: dict[str, Callable] = {
     "import_file": _handler_import_file,
     "export_file": _handler_export_file,
+    "doc_formats": _handler_doc_formats,
 }

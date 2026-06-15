@@ -97,8 +97,11 @@ class CompileOutput:
     - ``datum``: a :class:`Datum` to register (datum features only).
     - ``resolved``: resolved dim values to echo back in feature_status (``{param: float}``).
     - ``kind``: the body kind this feature produced/replaced — ``"solid"`` (default, every
-      pre-surfacing feature) or ``"surface"`` (open/sheet surface bodies). The core stamps it
-      onto the BodyOut it produced so tessellation / mass-props / export branch on it.
+      pre-surfacing feature), ``"surface"`` (open/sheet surface bodies), or ``"mesh"`` (an imported
+      triangle-soup :class:`~engine.doc.mesh_body.MeshBody`). The core stamps it onto the BodyOut it
+      produced so tessellation / mass-props / export branch on it. NOTE: the core also force-stamps
+      ``"mesh"`` by *type* (``isinstance(shape, MeshBody)``) so multi-body mesh imports are all
+      flagged even though this per-feature hint only marks the top body.
     """
 
     bodies: list[Any] = field(default_factory=list)

@@ -636,10 +636,19 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
                 body_kinds=stored_kinds))
 
     # --- assemble BodyOut list -------------------------------------------
+    # A MeshBody (imported triangle soup, FORMATS_PLAN.md §2 D1) is always kind="mesh", detected by
+    # type so multi-body mesh imports are all flagged (the per-feature `kind` hint only stamps the
+    # top body). The carrier color rides along so the appearance default can pick it up.
+    from engine.doc.mesh_body import MeshBody
     for shape in bodies:
         bid = _ensure_body_id(shape)
-        kind = body_kinds.get(id(shape), "solid")
-        result.bodies.append(BodyOut(body_id=bid, name=bid, shape=shape, color=None, kind=kind))
+        if isinstance(shape, MeshBody):
+            kind = "mesh"
+            color = list(shape.color) if shape.color else None
+        else:
+            kind = body_kinds.get(id(shape), "solid")
+            color = None
+        result.bodies.append(BodyOut(body_id=bid, name=bid, shape=shape, color=color, kind=kind))
     result.face_owners = {bo.body_id: face_owners.get(bo.body_id, {}) for bo in result.bodies}
     result.edge_owners = {bo.body_id: edge_owners.get(bo.body_id, {}) for bo in result.bodies}
 

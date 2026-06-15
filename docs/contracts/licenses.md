@@ -14,10 +14,11 @@
 | build123d | Apache-2.0 | kernel | ok |
 | cadquery-ocp / OCCT | LGPL-2.1 (OCCT excepted) | B-rep kernel | ok (dynamic) |
 | pyvista / VTK | MIT / BSD-3 | contact-sheet renders | ok |
-| trimesh | MIT | voxelize, ray casts | ok |
+| trimesh | MIT | voxelize, ray casts, mesh import/export lane (STL/OBJ/PLY/glTF) | ok |
+| networkx | BSD-3 | trimesh scene-graph dep (multi-mesh OBJ/glTF import) | ok |
 | numpy / scipy | BSD-3 | math, solvers | ok |
 | matplotlib | PSF-based | colormap LUTs only | ok |
-| lib3mf | BSD-2 | 3MF export | ok |
+| lib3mf | BSD-2 | 3MF import + export | ok |
 | anthropic / openai / mcp / httpx | MIT/Apache | providers | ok |
 | llama.cpp (optional managed runtime) | MIT | local model server | ok; optional subprocess/server payload copied to `%APPDATA%\AI-CAD\llamacpp` when bundled |
 | Dear ImGui | MIT | UI | ok |

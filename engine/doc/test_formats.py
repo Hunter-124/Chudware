@@ -196,6 +196,59 @@ def test_export_import_3mf() -> None:
     print(f"[formats] 3MF export->import vol={vol:.1f} err={rel_err:.5f}")
 
 
+# --------------------------------------------------------------------------- 1b. mesh-format breadth (F1)
+
+def test_mesh_formats_roundtrip() -> None:
+    """OBJ / PLY / glTF / GLB export a solid → re-import as a MeshBody with matching volume."""
+    from engine.doc.mesh_body import MeshBody
+    s = docsess.new_session("part", "BoxForMesh")
+    docsess.apply_ops(s, 0, [{"op": "add_feature", "feature": {
+        "type": "box", "name": "Box1",
+        "params": {"length": _dim(20), "width": _dim(20), "height": _dim(20)}}}])
+    bodies = _get_bodies(s)
+    tmpdir = tempfile.mkdtemp()
+    for fmt in ("obj", "ply", "gltf", "glb"):
+        path = os.path.join(tmpdir, f"box.{fmt}")
+        export_document(bodies, path, fmt)
+        assert os.path.getsize(path) > 50, f"{fmt} export produced no data"
+        imported = import_path(path)
+        assert imported, f"{fmt} import returned no bodies"
+        mb = imported[0][1]
+        assert isinstance(mb, MeshBody), f"{fmt} should import as a MeshBody, got {type(mb)}"
+        rel_err = abs(mb.volume - _box_volume()) / _box_volume()
+        assert rel_err < 0.02, f"{fmt} volume err {rel_err:.4f} (vol={mb.volume:.1f})"
+        print(f"[formats] {fmt} export->import vol={mb.volume:.1f} tris={mb.triangle_count} "
+              f"err={rel_err:.5f}")
+
+
+def test_mesh_body_brep_export_rejected() -> None:
+    """A topology-free MeshBody cannot be exported to a B-rep format — clear error, no silent junk."""
+    from engine.doc.mesh_body import MeshBody
+    import numpy as np
+    mb = MeshBody(verts=np.array([[0, 0, 0], [10, 0, 0], [0, 10, 0]], dtype=np.float32),
+                  tris=np.array([[0, 1, 2]], dtype=np.uint32), name="Tri")
+    tmpdir = tempfile.mkdtemp()
+    for fmt in ("step", "iges", "brep"):
+        try:
+            export_document([("Tri", mb)], os.path.join(tmpdir, f"x.{fmt}"), fmt)
+            assert False, f"{fmt} export of a mesh body should have raised"
+        except ValueError as exc:
+            assert "mesh body" in str(exc).lower(), f"unexpected message: {exc}"
+    print("[formats] mesh-body B-rep export correctly rejected for step/iges/brep")
+
+
+def test_doc_formats_registry() -> None:
+    """The doc_formats RPC returns the import/export matrix the host builds its filters from."""
+    from engine.doc.formats import _handler_doc_formats
+    resp = _handler_doc_formats({}, lambda *a, **k: None)
+    fmts = {f["fmt"]: f for f in resp["formats"]}
+    for need in ("step", "iges", "brep", "stl", "3mf", "obj", "ply", "gltf", "glb"):
+        assert need in fmts, f"format '{need}' missing from registry"
+    assert ".obj" in fmts["obj"]["exts"] and fmts["obj"]["lane"] == "mesh"
+    assert fmts["step"]["lane"] == "brep"
+    print(f"[formats] doc_formats registry exposes {len(fmts)} formats")
+
+
 # --------------------------------------------------------------------------- 2. import feature compiles + caches
 
 def _import_feature_doc(step_path: str) -> dict:
@@ -419,6 +472,9 @@ def main() -> None:
     test_export_import_iges()
     test_export_import_stl()
     test_export_import_3mf()
+    test_mesh_formats_roundtrip()
+    test_mesh_body_brep_export_rejected()
+    test_doc_formats_registry()
     test_import_feature_compiles_and_caches()
     test_stepplus_meta_passthrough()
     test_frozen_geometry_fallback()

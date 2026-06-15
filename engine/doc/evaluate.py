@@ -71,6 +71,13 @@ def mass_props(
     "com": <surface centroid>, "inertia": [0]*9, "material": {...}}``. The solid path below is
     untouched, so solid mass-props stay byte-identical.
     """
+    # FORMATS_PLAN.md §2 D1: an imported MeshBody has no OCCT shape (.wrapped is None), so the
+    # BRepGProp path below would crash on None. Compute volume / mass / centroid from its triangles
+    # instead (inertia is reported as zeros + inertia_approx — a dumb mesh carries no exact tensor).
+    from engine.doc.mesh_body import MeshBody, mesh_mass_props
+    if isinstance(shape, MeshBody):
+        return mesh_mass_props(shape.verts, shape.tris, density_g_cm3)
+
     raw = _unwrap(shape)
 
     # Linear density conversion: 1 g/cm³ = 1e-3 g/mm³

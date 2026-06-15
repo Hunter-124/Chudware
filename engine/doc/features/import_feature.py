@@ -45,28 +45,37 @@ def compile_import(feat: dict, ctx: CompileContext) -> CompileOutput:  # noqa: A
         raise FeatureError(f"import: no bodies found in '{source_path}'")
 
     # Frozen bodies: carry prior bodies forward, append each imported shape as an extra body.
-    # Skip mesh proxies (3MF / raw-face-mesh shapes that have no OCCT topology) — the
-    # tessellation layer (session._write_aicm) cannot handle them.  Feature_params.md lists
-    # "step|iges|brep|stl" as supported; STL comes back as a build123d Face (has .wrapped);
-    # 3MF is export-only for the import feature type.
+    # Two kinds of body can come back (FORMATS_PLAN.md §2):
+    #   * an OCCT B-rep shape (STEP / IGES / BREP) — has a non-None ``.wrapped``;
+    #   * a MeshBody triangle soup (STL / OBJ / PLY / 3MF / glTF) — ``.wrapped`` is None but it
+    #     tessellates directly via tessellate_mesh_body, so it IS a valid renderable body now.
+    # Only a genuinely-empty (None) result is skipped.
+    from engine.doc.mesh_body import MeshBody
+
     new_bodies = list(ctx.bodies)
     skipped = 0
+    has_mesh = False
     for _name, shape in body_pairs:
         if shape is None:
             skipped += 1
             continue
-        wrapped = getattr(shape, "wrapped", "sentinel")
-        if wrapped is None:
-            # Mesh proxy — skip with a count so we can warn.
+        if isinstance(shape, MeshBody):
+            new_bodies.append(shape)
+            has_mesh = True
+            continue
+        if getattr(shape, "wrapped", "sentinel") is None:
+            # Unknown proxy with no OCCT topology and not a MeshBody — cannot tessellate.
             skipped += 1
             continue
         new_bodies.append(shape)
 
-    if not new_bodies and skipped:
+    if len(new_bodies) == len(ctx.bodies):
         raise FeatureError(
-            f"import: all {skipped} imported bodies are mesh-only (no OCCT solid); "
-            "use a STEP, BREP, or IGES source for solid import.",
-            hint="3MF and raw-STL mesh sources cannot be used as import feature bodies.",
+            f"import: no usable bodies in '{source_path}' ({skipped} skipped).",
+            hint="The file produced no OCCT solid or mesh body.",
         )
 
-    return CompileOutput(bodies=new_bodies, tool_body=None, datum=None, resolved={})
+    # A mesh import has no parametric history; flag the produced body as kind="mesh". (The compiler
+    # core also force-stamps mesh bodies by type, so multi-body mesh imports are covered regardless.)
+    return CompileOutput(bodies=new_bodies, tool_body=None, datum=None, resolved={},
+                         kind="mesh" if has_mesh else "solid")

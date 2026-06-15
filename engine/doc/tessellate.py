@@ -131,6 +131,43 @@ def _chunk(fourcc: bytes, payload: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Hidden-edge filter (seam + degenerate edges are topology, not visible edges)
+# ---------------------------------------------------------------------------
+def _is_hidden_edge(edge, anc_map) -> bool:
+    """True if *edge* is a seam or degenerate edge that should not be drawn as a model edge.
+
+    A *seam* edge is the curve where a periodic surface (cylinder/cone/torus/sphere) wraps its
+    u-parameter back to its start — it bounds a single face on both sides. ``BRep_Tool.IsClosed``
+    is the canonical test (the edge carries two pcurves on that one face). A *degenerate* edge is a
+    zero-length curve collapsing to a point (a cone apex, a sphere pole). Neither is a feature line
+    the user expects to see on a smooth body, so we skip them when emitting edge polylines.
+    """
+    try:
+        if BRep_Tool.Degenerated_s(edge):
+            return True
+    except Exception:
+        pass
+    if not anc_map.Contains(edge):
+        return False
+    faces_list = anc_map.FindFromKey(edge)
+    if faces_list.IsEmpty():
+        return False
+    # A seam edge's only neighbour is the periodic face it wraps, so checking the first ancestor is
+    # sufficient; iterate defensively in case OCCT lists more than one.
+    try:
+        faces = list(faces_list)
+    except Exception:
+        faces = [faces_list.First()]
+    for fs in faces:
+        try:
+            if BRep_Tool.IsClosed_s(edge, TopoDS.Face_s(fs)):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Tessellate one OCP shape into a BodyTess
 # ---------------------------------------------------------------------------
 def tessellate_body(
@@ -270,6 +307,15 @@ def tessellate_body(
         first_pt = len(edge_pts_list) // 3
         pts_for_edge: list[float] = []
 
+        # Skip non-model edges: seam edges of periodic faces (the "vertical line" running up a
+        # cylinder/cone/torus where the surface's u-parametrization wraps back on itself) and
+        # degenerate edges (the apex of a cone, the poles of a sphere — zero-length curves). These
+        # are real B-rep topology but are NOT visible model edges, so SolidWorks-class viewers do
+        # not draw them. We still record the edge with zero points so edge indices stay stable.
+        if _is_hidden_edge(edge, anc_map):
+            edge_recs.append(EdgeRec(ei, first_pt, 0, 4))
+            continue
+
         # Try PolygonOnTriangulation via any adjacent face
         if anc_map.Contains(edge):
             faces_list = anc_map.FindFromKey(edge)
@@ -336,6 +382,108 @@ def tessellate_body(
         edges=edge_recs,
         edge_pts=edge_pts_arr,
         verts=vert_recs,
+        metallic=float(metallic),
+        roughness=float(roughness),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mesh-body tessellation (FORMATS_PLAN.md §2 D1) — a triangle soup straight to AICM,
+# bypassing BRepMesh. Used for imported STL / OBJ / PLY / 3MF / glTF (and Rhino / SolidWorks
+# mesh fallbacks). A MeshBody has no OCCT topology, so there are no per-face/edge B-rep records:
+# one FaceRec spans all triangles, and the wireframe is the mesh's naked + sharp-dihedral edges.
+# ---------------------------------------------------------------------------
+def _mesh_wire_edges(
+    verts: np.ndarray,
+    tris: np.ndarray,
+    angle_deg: float = 35.0,
+    max_tris: int = 300_000,
+    max_edges: int = 200_000,
+) -> tuple[np.ndarray, list[EdgeRec]]:
+    """Extract the drawn wireframe of a triangle mesh: every *naked* edge (used by one triangle)
+    plus every *sharp* edge (shared by two triangles whose dihedral angle exceeds ``angle_deg``).
+
+    Each drawn edge becomes a 2-point polyline. Returns ``(edge_pts (2K,3) float32, [EdgeRec]*K)``.
+    Skips extraction (shaded-only, no wireframe) above ``max_tris`` / ``max_edges`` so a huge import
+    stays responsive."""
+    from engine.doc.mesh_body import face_normals
+
+    if len(tris) == 0 or len(tris) > max_tris:
+        return np.zeros((0, 3), dtype=np.float32), []
+
+    # All 3 undirected edges of every triangle, sorted per-row so (a,b)==(b,a) collide.
+    e = np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]], axis=0).astype(np.int64)
+    e.sort(axis=1)
+    tri_of = np.tile(np.arange(len(tris), dtype=np.int64), 3)
+
+    order = np.lexsort((e[:, 1], e[:, 0]))
+    ek = e[order]
+    et = tri_of[order]
+    # Group boundaries where the (sorted) edge key changes.
+    changed = np.any(ek[1:] != ek[:-1], axis=1)
+    starts = np.concatenate([[0], np.nonzero(changed)[0] + 1])
+    ends = np.concatenate([starts[1:], [len(ek)]])
+    counts = ends - starts
+
+    keys = ek[starts]  # one (a,b) per unique edge
+
+    naked = counts == 1
+    shared = counts == 2
+    other = counts > 2  # non-manifold — always draw
+
+    drawn_mask = naked | other
+    if np.any(shared):
+        tn = face_normals(verts, tris)
+        s_starts = starts[shared]
+        ta = et[s_starts]
+        tb = et[s_starts + 1]
+        dots = np.clip(np.einsum("ij,ij->i", tn[ta], tn[tb]), -1.0, 1.0)
+        sharp = np.degrees(np.arccos(dots)) > angle_deg
+        shared_idx = np.nonzero(shared)[0]
+        drawn_mask = drawn_mask.copy()
+        drawn_mask[shared_idx] = sharp
+
+    drawn = keys[drawn_mask]
+    if len(drawn) == 0 or len(drawn) > max_edges:
+        return np.zeros((0, 3), dtype=np.float32), []
+
+    p0 = verts[drawn[:, 0]]
+    p1 = verts[drawn[:, 1]]
+    edge_pts = np.stack([p0, p1], axis=1).reshape(-1, 3).astype(np.float32)
+    edge_recs = [EdgeRec(edge_id=i + 1, first_pt=2 * i, pt_count=2, curve_type=0)
+                 for i in range(len(drawn))]
+    return edge_pts, edge_recs
+
+
+def tessellate_mesh_body(
+    mesh,
+    body_id: int,
+    name: str,
+    color: tuple[float, float, float],
+    metallic: float = 0.0,
+    roughness: float = 0.5,
+) -> BodyTess:
+    """Tessellate a :class:`engine.doc.mesh_body.MeshBody` directly into AICM geometry.
+
+    Unlike :func:`tessellate_body` this does NOT run ``BRepMesh`` — the triangles ARE the mesh. It
+    emits one FaceRec spanning all triangles (so a pick selects the whole body), area-weighted
+    per-vertex normals for smooth shading, and the naked + sharp-dihedral wireframe."""
+    verts = np.asarray(mesh.verts, dtype=np.float32).reshape(-1, 3)
+    tris = np.asarray(mesh.tris, dtype=np.uint32).reshape(-1, 3)
+    nrm = np.asarray(mesh.vertex_normals(), dtype=np.float32).reshape(-1, 3)
+    faces = [FaceRec(face_id=1, first_tri=0, tri_count=int(len(tris)), surf_type=6)]
+    edge_pts, edge_recs = _mesh_wire_edges(verts, tris)
+    return BodyTess(
+        body_id=body_id,
+        name=name,
+        color=color,
+        pos=verts,
+        nrm=nrm,
+        idx=tris,
+        faces=faces,
+        edges=edge_recs,
+        edge_pts=edge_pts,
+        verts=[],
         metallic=float(metallic),
         roughness=float(roughness),
     )

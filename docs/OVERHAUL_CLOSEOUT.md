@@ -67,10 +67,17 @@ C26-B extrude additions).
 ## Regression state (close-out)
 
 - **Core `engine/doc`: 377 passed** — every wave added pytest-collectable tests to the gate.
-- Broad `engine + agent`: **429 passed**. The only failures are **pre-existing/environmental**,
+  (As of the GUI-rework session: **470 passed**, incl. Wave 4A/4B copy/paste ops.)
+- Broad `engine + agent`: **429 passed**. The only failures were **pre-existing/environmental**,
   identical to the pre-overhaul baseline and outside any code this overhaul touched:
   `engine/sim/test_fea.py` (3, gmsh `WindowsPath`), `engine/sim/test_lbm.py` (2 errors),
   `agent/test_compaction.py` (2, offline-mode config). **The overhaul introduced zero regressions.**
+- **UPDATE (GUI-rework session, 2026-06-14):** those reds are now resolved. The `engine/sim`
+  ones were a *misdiagnosis* — not gmsh/environmental but the house-style `main()` runner threading
+  shared state (meshed STEP path; sphere-drag result) that pytest collection never executes; fixed
+  with module-scoped fixtures (no skips, no weakened asserts) → **`engine/sim` 60 passed**. The
+  `agent/test_compaction.py` pair was already fixed by commit 5551635 (`offline_safe=True` escape
+  hatch); the line above was stale → **`agent` 40 passed**.
 - Host compiles clean every wave; `dist\AI-CAD` synced.
 
 ## Known stretch / deferred (honest)

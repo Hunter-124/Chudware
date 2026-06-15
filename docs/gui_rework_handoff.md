@@ -19,12 +19,22 @@
 
 **Regression at handoff:** host `build.bat host` exit 0; `--ui-screenshot` exit 0 (default / `AI_CAD_SHOT=tree|m1|ecad|explorer`). engine/doc **473**, engine/sim **60**, agent **40** — all green.
 
-## Deferred (honest)
-- **Wave 5C** theme/spacing DPI pass — intentionally skipped this round (touches too many files to run parallel-safe); a focused later pass.
-- File **Export** menu (STEP/STL/3MF/DXF) + **Save All** + **Recent** beyond config — greyed/minimal; need exporter dispatch ids / multi-doc save.
-- Explorer **drag-drop into viewport** (plan 3A.5).
-- Copy/paste **cross-doc derived live-relink** (`paste_feature_as_derived` is one-time resolve + `derived_from` metadata; live propagation is a host follow-up).
-- Wave 5 suggested AppState request flags for `edit_delete`/`select_all`/export — un-grey those Edit/Tools items later.
+## Deferred items — follow-up round (DONE 2026-06-15)
+The deferred items below were tackled after the 5-wave plan landed (engine⟂host parallel streams):
+- `6dbdc6b` **cross-doc derived live-relink** — `session.refresh_derived(id?)` re-pulls derived-paste
+  features from their live source doc; worker RPC `doc_refresh_derived`. (479 passed.)
+- `0d78843` **File > Export** (STEP/IGES/STL/3MF/BREP via `DocMirror::exportFile`→`export_file` RPC) +
+  **Save All** + **Edit > Delete / Select All** (un-greyed; `featureDeleteSelection`/`featureSelectAll`).
+- `bf9f760` **drag-drop to open** — OS file drop (chained `glfwSetDropCallback`) + Explorer→viewport
+  ImGui drag/drop, both via the `requestOpenPath` pump.
+
+### Still deferred (honest)
+- **Wave 5C** theme/spacing DPI pass — **deferred to post-merge**: the sizing design-system
+  (`scripts/gui_lint.py` + `host/src/ui/metrics.h`) lives on the `codex/gui-overhual` lane, NOT master.
+  A freehand pass now would be lower-quality and duplicate/conflict; do it after branch reconciliation.
+- **Host trigger for `refresh_derived`** — the engine mechanism + RPC exist; a FeatureManager
+  "Rebuild Derived" context-menu item (and a "Paste as Derived" entry point) is a small host follow-up.
+- File **Export for Drawing/ECAD tabs** (those keep their own DXF/PDF/Gerber paths); multi-untitled **Save All**.
 
 ## Process notes for the next session (IMPORTANT)
 - **Agent `isolation: 'worktree'` branches from a STALE base here** — all worktrees came up at `3b78d79` (the merge-base with `codex/gui-overhual`), **92 commits behind master**. Two agents "succeeded" against it; their diffs would have reverted master. **Do NOT use worktree isolation in this repo** — run agents NON-isolated in the main tree.

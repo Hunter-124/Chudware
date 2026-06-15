@@ -174,7 +174,7 @@ static const RibbonCmd kCmds[] = {
 
     // --- Group: Evaluate ---
     { "asm_interference",  "Interference",   "interference",     "Assembly", "Evaluate",        true,  nullptr,          false },
-    { "asm_bom",           "Bill of Mat.",   "bom",              "Assembly", "Evaluate",        true,  nullptr,          false },
+    { "asm_bom",           "BOM",            "bom",              "Assembly", "Evaluate",        true,  nullptr,          false },
 
     // --- Group: Display ---
     { "asm_explode",       "Exploded View",  "exploded_view",    "Assembly", "Display",         true,  nullptr,          false },

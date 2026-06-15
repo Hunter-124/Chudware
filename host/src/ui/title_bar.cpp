@@ -9,6 +9,7 @@
 #include "../core/app_state.h"
 #include "../renderer.h"
 #include "../ui_theme.h"   // ui::uiScale
+#include "doc_tabs.h"      // ui::openNewDocChooser (File > New)
 
 // ---------------- caption buttons (shared small ui helper) ----------------
 bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
@@ -101,15 +102,55 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         const float collapseThreshold = 700.0f * s;
         hitLayout.menuLeft = (int)ImGui::GetCursorScreenPos().x;
 
-        auto drawAiCadMenu = [&]() {
-            if (ImGui::MenuItem("Settings...")) st.openSettings = true;
-            if (ImGui::MenuItem("Repair / install runtime", nullptr, false,
-                                !st.setupRunning.load() && !st.job.running.load()))
-                st.startSetup(true);
-            if (ImGui::MenuItem("Reset layout")) st.resetLayout = true;
+        // Wave 5A: SolidWorks-standard 7-menu bar (File / Edit / View / Insert / Tools /
+        // Window / Help). Items wire to existing AppState flags, AppState methods, or the unified
+        // ribbon dispatcher (st.ribbonDispatch — any string id is compile-safe; unknown ids just
+        // log a stub). Items with no reachable backing from this TU are drawn disabled (greyed) —
+        // see the agent report for the exact list. A document-open guard gates doc-dependent items.
+        const bool hasDoc = (st.activeTab >= 0);
+
+        auto drawFileMenu = [&]() {
+            if (ImGui::MenuItem("New...", "Ctrl+N")) ui::openNewDocChooser();
+            // Open / Save / Save As live in feature_tree.cpp's file-local doSaveDoc/doOpenDoc and
+            // are not reachable as dispatch ids from here — greyed until a dispatch id or AppState
+            // flag exists. (Integrator: add st.requestOpen/requestSave/requestSaveAs flags to wire.)
+            ImGui::MenuItem("Open...", "Ctrl+O", false, false);
             ImGui::Separator();
+            ImGui::MenuItem("Save", "Ctrl+S", false, false);
+            ImGui::MenuItem("Save As...", nullptr, false, false);
+            ImGui::MenuItem("Save All", nullptr, false, false);
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Export", hasDoc)) {
+                // No reachable export dispatch ids today (Sheet-Metal flat-DXF is the only export
+                // path and it is tab-specific). Greyed placeholders until export ids/flags exist.
+                ImGui::MenuItem("STEP (.step)...", nullptr, false, false);
+                ImGui::MenuItem("STL (.stl)...", nullptr, false, false);
+                ImGui::MenuItem("3MF (.3mf)...", nullptr, false, false);
+                ImGui::MenuItem("DXF (.dxf)...", nullptr, false, false);
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            // Recent Files — Wave 3 backing not present yet; greyed placeholder.
+            if (ImGui::BeginMenu("Recent Files", false)) { ImGui::EndMenu(); }
+            ImGui::Separator();
+            ImGui::MenuItem("Close", "Ctrl+W", false, false);  // per-tab close not reachable here
             if (ImGui::MenuItem("Quit", "Alt+F4")) glfwSetWindowShouldClose(win, 1);
         };
+
+        auto drawEditMenu = [&]() {
+            if (ImGui::MenuItem("Undo", "Ctrl+Z", false, hasDoc)) st.docUndo();
+            if (ImGui::MenuItem("Redo", "Ctrl+Y", false, hasDoc)) st.docRedo();
+            ImGui::Separator();
+            // edit_cut/edit_copy/edit_paste dispatch ids are being registered by a parallel agent
+            // this round; dispatching by string is compile-safe regardless (no-op + log if absent).
+            if (ImGui::MenuItem("Cut", "Ctrl+X", false, hasDoc))   st.ribbonDispatch("edit_cut");
+            if (ImGui::MenuItem("Copy", "Ctrl+C", false, hasDoc))  st.ribbonDispatch("edit_copy");
+            if (ImGui::MenuItem("Paste", "Ctrl+V", false, hasDoc)) st.ribbonDispatch("edit_paste");
+            // Delete / Select All have no reachable backing from here — greyed placeholders.
+            ImGui::MenuItem("Delete", "Del", false, false);
+            ImGui::MenuItem("Select All", "Ctrl+A", false, false);
+        };
+
         auto drawViewMenu = [&]() {
             ImGui::MenuItem("Ribbon", nullptr, &st.showRibbon);
             ImGui::MenuItem("FeatureManager", nullptr, &st.showFeatureTree);
@@ -134,22 +175,103 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             ImGui::Separator();
             if (ImGui::MenuItem("Reset layout")) st.resetLayout = true;
         };
+
+        auto drawInsertMenu = [&]() {
+            if (ImGui::BeginMenu("Feature", hasDoc)) {
+                if (ImGui::MenuItem("Extrude Boss/Base")) st.ribbonDispatch("extrude_boss");
+                if (ImGui::MenuItem("Revolve Boss/Base")) st.ribbonDispatch("revolve_boss");
+                if (ImGui::MenuItem("Sweep"))             st.ribbonDispatch("sweep_boss");
+                if (ImGui::MenuItem("Loft"))              st.ribbonDispatch("loft_boss");
+                ImGui::Separator();
+                if (ImGui::MenuItem("Fillet"))            st.ribbonDispatch("fillet");
+                if (ImGui::MenuItem("Chamfer"))           st.ribbonDispatch("chamfer");
+                if (ImGui::MenuItem("Shell"))             st.ribbonDispatch("shell");
+                if (ImGui::MenuItem("Draft"))             st.ribbonDispatch("draft");
+                if (ImGui::MenuItem("Rib"))               st.ribbonDispatch("rib");
+                ImGui::EndMenu();
+            }
+            if (ImGui::MenuItem("Sketch")) st.ribbonDispatch("sketch_new");
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Reference Geometry", hasDoc)) {
+                if (ImGui::MenuItem("Plane"))             st.ribbonDispatch("ref_plane");
+                if (ImGui::MenuItem("Axis"))             st.ribbonDispatch("ref_axis");
+                if (ImGui::MenuItem("Point"))            st.ribbonDispatch("ref_point");
+                if (ImGui::MenuItem("Coordinate System")) st.ribbonDispatch("ref_csys");
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Pattern/Mirror", hasDoc)) {
+                if (ImGui::MenuItem("Linear Pattern"))   st.ribbonDispatch("linear_pattern");
+                if (ImGui::MenuItem("Circular Pattern")) st.ribbonDispatch("circular_pattern");
+                if (ImGui::MenuItem("Mirror"))           st.ribbonDispatch("mirror_feature");
+                ImGui::EndMenu();
+            }
+            if (ImGui::MenuItem("Hole Wizard", nullptr, false, hasDoc)) st.ribbonDispatch("hole_wizard");
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Assembly")) {
+                if (ImGui::MenuItem("Insert Component")) st.ribbonDispatch("asm_insert");
+                if (ImGui::MenuItem("Mate"))             st.ribbonDispatch("asm_mate");
+                ImGui::EndMenu();
+            }
+        };
+
+        auto drawToolsMenu = [&]() {
+            if (ImGui::BeginMenu("Evaluate", hasDoc)) {
+                if (ImGui::MenuItem("Measure"))         st.ribbonDispatch("eval_measure");
+                if (ImGui::MenuItem("Mass Properties")) st.ribbonDispatch("eval_mass_props");
+                if (ImGui::MenuItem("Section Properties")) st.ribbonDispatch("eval_section_props");
+                ImGui::EndMenu();
+            }
+            if (ImGui::MenuItem("Simulation")) st.ribbonDispatch("sim_new_static");
+            ImGui::Separator();
+            if (ImGui::MenuItem("Sheet Metal")) st.ribbonDispatch("sm_base_flange");
+            if (ImGui::MenuItem("Weldments"))   st.ribbonDispatch("weld_member");
+            if (ImGui::MenuItem("ECAD / PCB"))  st.ribbonDispatch("ecad_new_sch");
+            ImGui::Separator();
+            // Equations editor has no ribbon dispatch id / flag reachable from here — greyed.
+            ImGui::MenuItem("Equations...", nullptr, false, false);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Options...")) st.openSettings = true;
+            if (ImGui::MenuItem("Repair / install runtime", nullptr, false,
+                                !st.setupRunning.load() && !st.job.running.load()))
+                st.startSetup(true);
+        };
+
+        auto drawWindowMenu = [&]() {
+            // Multi-window tiling has no backing (single OS window + dockspace). Greyed placeholders.
+            ImGui::MenuItem("Tile Horizontally", nullptr, false, false);
+            ImGui::MenuItem("Tile Vertically", nullptr, false, false);
+            ImGui::MenuItem("Cascade", nullptr, false, false);
+            ImGui::Separator();
+            ImGui::MenuItem("Close All", nullptr, false, false);
+        };
+
         auto drawHelpMenu = [&]() {
             if (ImGui::MenuItem("About AI-CAD")) st.showAbout = true;
+            // Documentation / Keyboard Shortcuts have no backing yet — greyed placeholders.
+            ImGui::MenuItem("Documentation", nullptr, false, false);
+            ImGui::MenuItem("Keyboard Shortcuts", nullptr, false, false);
         };
 
         if (winW < collapseThreshold) {
-            // Collapsed: single "Menu" top-level item with all submenus
+            // Collapsed: single "Menu" top-level item with all submenus (narrow-window rollup).
             if (ImGui::BeginMenu("Menu")) {
-                if (ImGui::BeginMenu("AI-CAD")) { drawAiCadMenu(); ImGui::EndMenu(); }
-                if (ImGui::BeginMenu("View"))   { drawViewMenu();  ImGui::EndMenu(); }
-                if (ImGui::BeginMenu("Help"))   { drawHelpMenu();  ImGui::EndMenu(); }
+                if (ImGui::BeginMenu("File"))   { drawFileMenu();   ImGui::EndMenu(); }
+                if (ImGui::BeginMenu("Edit"))   { drawEditMenu();   ImGui::EndMenu(); }
+                if (ImGui::BeginMenu("View"))   { drawViewMenu();   ImGui::EndMenu(); }
+                if (ImGui::BeginMenu("Insert")) { drawInsertMenu(); ImGui::EndMenu(); }
+                if (ImGui::BeginMenu("Tools"))  { drawToolsMenu();  ImGui::EndMenu(); }
+                if (ImGui::BeginMenu("Window")) { drawWindowMenu(); ImGui::EndMenu(); }
+                if (ImGui::BeginMenu("Help"))   { drawHelpMenu();   ImGui::EndMenu(); }
                 ImGui::EndMenu();
             }
         } else {
-            if (ImGui::BeginMenu("AI-CAD")) { drawAiCadMenu(); ImGui::EndMenu(); }
-            if (ImGui::BeginMenu("View"))   { drawViewMenu();  ImGui::EndMenu(); }
-            if (ImGui::BeginMenu("Help"))   { drawHelpMenu();  ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("File"))   { drawFileMenu();   ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Edit"))   { drawEditMenu();   ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("View"))   { drawViewMenu();   ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Insert")) { drawInsertMenu(); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Tools"))  { drawToolsMenu();  ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Window")) { drawWindowMenu(); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Help"))   { drawHelpMenu();   ImGui::EndMenu(); }
         }
         hitLayout.menuRight = (int)ImGui::GetItemRectMax().x;
 

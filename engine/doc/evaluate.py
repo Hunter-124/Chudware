@@ -96,11 +96,23 @@ def mass_props(
         for col in range(1, 4):
             inertia.append(inertia_mat.Value(row, col) * density_g_mm3)
 
+    # Principal moments + axes: eigendecomposition of the (symmetric) inertia tensor. eigh returns
+    # ascending eigenvalues (principal moments, g·mm²) and orthonormal eigenvectors (the principal
+    # axes, as columns). Each principal_axes[i] is a unit axis vector aligned with principal_moments[i].
+    import numpy as np
+    I_mat = np.array(inertia, dtype=float).reshape(3, 3)
+    I_mat = 0.5 * (I_mat + I_mat.T)  # kill fp asymmetry before eigh
+    evals, evecs = np.linalg.eigh(I_mat)
+    principal_moments = [float(v) for v in evals]
+    principal_axes = [[float(evecs[r, c]) for r in range(3)] for c in range(3)]
+
     return {
         "volume_mm3": float(volume_mm3),
         "mass_g": float(mass_g),
         "com": [float(v) for v in com],
         "inertia": [float(v) for v in inertia],
+        "principal_moments": principal_moments,
+        "principal_axes": principal_axes,
         "material": {"density_g_cm3": float(density_g_cm3)},
     }
 

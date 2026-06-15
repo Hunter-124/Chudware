@@ -204,6 +204,21 @@ void EvaluateDialogs::draw(AppState& st) {
                     ImGui::Text("%12.2f %12.2f %12.2f",
                                 I[r*3+0].get<double>(), I[r*3+1].get<double>(), I[r*3+2].get<double>());
             }
+            // Principal moments of inertia (g.mm2) + their axes (unit vectors at the CoM).
+            if (result_.contains("principal_moments") && result_["principal_moments"].is_array() &&
+                result_["principal_moments"].size() == 3 &&
+                result_.contains("principal_axes") && result_["principal_axes"].is_array() &&
+                result_["principal_axes"].size() == 3) {
+                ImGui::SeparatorText("Principal axes (g.mm2)");
+                const auto& Pm = result_["principal_moments"];
+                const auto& Pa = result_["principal_axes"];
+                for (int i = 0; i < 3; ++i) {
+                    if (!Pa[i].is_array() || Pa[i].size() != 3) continue;
+                    ImGui::Text("Px%d %12.2f  [% .3f % .3f % .3f]", i + 1,
+                                Pm[i].get<double>(),
+                                Pa[i][0].get<double>(), Pa[i][1].get<double>(), Pa[i][2].get<double>());
+                }
+            }
         } else if (openWindow_ == "measure") {
             std::string kind = result_.value("kind", std::string("(none)"));
             auto numAt = [&](const char* k, double& out) -> bool {

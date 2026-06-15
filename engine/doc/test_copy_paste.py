@@ -307,3 +307,88 @@ def test_garbage_bundle_is_invalid_op():
         with pytest.raises(O.OpError) as e2:
             O.apply_ops(doc, [{"op": "paste_feature", **bad}])
         assert e2.value.code == "invalid_op"
+
+
+# --------------------------------------------------------------------------- read-only fast-path
+#
+# copy_feature is a read-only doc op: through the SESSION layer (engine.doc.session.apply_ops, the
+# worker's op-application path) an all-read-only batch must NOT push an undo snapshot, must NOT bump
+# the revision, and must NOT mark the doc dirty — while still executing the op and returning its
+# $bundle result. A MIXED batch (copy_feature + a real mutating op) keeps the normal behavior
+# (snapshot + bump + dirty), so it is undoable.
+
+from engine.doc import session as docsess  # noqa: E402
+
+
+def _box_op(l=20, w=20, h=20, name="Box1"):
+    return {"op": "add_feature", "feature": {
+        "type": "box", "name": name,
+        "params": {"length": _dim(l), "width": _dim(w), "height": _dim(h)}}}
+
+
+def test_is_readonly_batch_classification():
+    # Pure copy batches are read-only; empty / mixed / unknown batches are not.
+    assert O.is_readonly_batch([{"op": "copy_feature", "id": "f1"}]) is True
+    assert O.is_readonly_batch([{"op": "copy_feature", "id": "f1"},
+                                {"op": "copy_feature", "id": "f2"}]) is True
+    assert O.is_readonly_batch([]) is False
+    assert O.is_readonly_batch([{"op": "copy_feature", "id": "f1"}, _box_op()]) is False
+    assert O.is_readonly_batch([_box_op()]) is False
+    assert O.is_readonly_batch([{"op": "nope"}]) is False
+    assert O.is_readonly_batch("not a list") is False
+
+
+def test_session_copy_feature_no_revision_no_undo_no_dirty():
+    s = docsess.new_session("part", "ReadOnlyCopy")
+    # One real edit so there is a non-trivial revision + an undo step to (not) disturb.
+    r = docsess.apply_ops(s, s.revision, [_box_op()])
+    rev_after_box = r["revision"]
+    assert rev_after_box == 1
+    assert s.dirty is True
+    undo_depth = len(s.undo_stack)
+    assert undo_depth == 1
+    doc_before = copy.deepcopy(s.doc)
+    s.dirty = False  # simulate a freshly-saved doc; a pure copy must NOT re-dirty it
+
+    # Copy the box. Read-only fast-path: revision unchanged, no undo pushed, doc stays clean.
+    resp = docsess.apply_ops(s, s.revision, [{"op": "copy_feature", "id": "f1"}])
+    assert resp["revision"] == rev_after_box          # UNCHANGED revision in the envelope
+    assert s.revision == rev_after_box                # and on the session
+    assert len(s.undo_stack) == undo_depth            # no phantom undo step
+    assert s.dirty is False                           # not re-marked dirty
+    assert s.doc == doc_before                        # document untouched
+    # The bundle result still comes back exactly as before.
+    bundle = resp["id_map"]["$bundle"]
+    assert bundle["kind"] == "aicad.feature_bundle/1"
+    assert bundle["features"][bundle["root"]]["type"] == "box"
+
+    # And an immediately-following undo reverts the REAL prior edit (the box), proving the copy did
+    # not consume the undo slot. (Box add was the only undoable step.)
+    ur = docsess.undo(s)
+    assert all(f.get("type") != "box" for f in ur["tree"]["features"])
+    assert ur["tree"]["features"] == []
+
+
+def test_session_mixed_batch_still_bumps_and_is_undoable():
+    s = docsess.new_session("part", "MixedBatch")
+    docsess.apply_ops(s, s.revision, [_box_op(name="Box1")])
+    rev0 = s.revision
+    undo0 = len(s.undo_stack)
+
+    # MIXED batch: a copy of the existing box PLUS a real add of a second box. This must behave like
+    # any mutating batch — bump the revision, push an undo step, mark dirty — AND still return the
+    # copy bundle.
+    resp = docsess.apply_ops(s, s.revision, [
+        {"op": "copy_feature", "id": "f1"},
+        _box_op(name="Box2")])
+    assert resp["revision"] == rev0 + 1               # revision bumped
+    assert s.revision == rev0 + 1
+    assert len(s.undo_stack) == undo0 + 1             # one undo step recorded
+    assert s.dirty is True
+    assert resp["id_map"]["$bundle"]["kind"] == "aicad.feature_bundle/1"  # bundle still returned
+    names = [f.get("name") for f in resp["tree"]["features"]]
+    assert names == ["Box1", "Box2"]                  # the mutating op took effect
+
+    # Undoable: a single undo reverts the mixed batch back to just Box1.
+    ur = docsess.undo(s)
+    assert [f.get("name") for f in ur["tree"]["features"]] == ["Box1"]

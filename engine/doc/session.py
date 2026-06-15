@@ -29,7 +29,7 @@ from typing import Any, Callable, Optional
 
 from engine import paths
 from engine.doc.compiler import CompileCache, CompileResult, compile_document
-from engine.doc.ops import OpError, apply_ops as _apply_ops_to_doc
+from engine.doc.ops import OpError, apply_ops as _apply_ops_to_doc, is_readonly_batch
 from engine.doc import selectors as sel
 from engine.doc import tessellate as tess
 
@@ -443,6 +443,17 @@ def apply_ops(session: DocSession, base_revision: int | None, ops: list[dict],
                       {"current_revision": session.revision})
 
     new_doc, id_map = _apply_ops_to_doc(session.doc, ops)  # raises OpError on any failure
+
+    # Read-only fast-path: a batch made up ENTIRELY of read-only ops (e.g. copy_feature) produces no
+    # document change — it only surfaces a result through the id_map side-channel (``$bundle``). For
+    # such a batch we skip the undo snapshot, the revision bump, and the dirty flag, and we keep the
+    # live session.doc untouched (new_doc is a byte-identical deep copy). The op(s) still ran, so the
+    # id_map result is returned exactly as before, and the response carries the UNCHANGED revision —
+    # so a copy records no phantom undo step / revision and leaves the doc clean. A MIXED batch (any
+    # mutating op present) falls through to the normal commit below (snapshot + bump + dirty).
+    if is_readonly_batch(ops):
+        result = _rebuild(session, emit)
+        return _ops_response(session, result, id_map)
 
     # Commit: snapshot the OLD doc for undo (unless coalescing into the prior step), swap in the
     # new doc, bump revision.

@@ -2025,6 +2025,25 @@ _OP_HANDLERS = {
 }
 
 
+# Ops that NEVER mutate the document — they execute against a working copy and surface their result
+# only through the id_map side-channel (e.g. copy_feature's ``$bundle``). A batch made up entirely
+# of these is a pure read: the session layer can skip the undo snapshot, the revision bump, and the
+# dirty flag (see engine.doc.session.apply_ops). A MIXED batch (any non-read-only op) is treated as
+# mutating. Membership here is the single source of truth for "this op cannot change the doc".
+READONLY_OPS: frozenset[str] = frozenset({"copy_feature"})
+
+
+def is_readonly_batch(ops: list[dict]) -> bool:
+    """True iff *ops* is non-empty and EVERY op is a known read-only op (``READONLY_OPS``).
+
+    An empty batch returns False (there is nothing to read; the session treats it as an ordinary —
+    mutating — apply, preserving prior behavior). An op with an unknown/missing name is NOT
+    read-only, so a batch containing it is mutating (it will raise during application anyway)."""
+    if not isinstance(ops, list) or not ops:
+        return False
+    return all(isinstance(op, dict) and op.get("op") in READONLY_OPS for op in ops)
+
+
 # --------------------------------------------------------------------------- public entry
 
 

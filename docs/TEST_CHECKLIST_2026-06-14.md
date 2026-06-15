@@ -77,10 +77,12 @@ Mates** section.
       the global rebuilds the model.
 - [ ] Delete a global that a feature uses → a clean "in use" toast, not a crash.
 
-## 6. Evaluate ▸ Mass Properties
+## 6. Evaluate ▸ Mass Properties / Measure
 - [ ] Mass Properties now has a **Material** preset (Steel/Aluminum/Titanium/Brass/ABS/PLA/…) + an
       editable **Density (g/cm³)**. Switch Steel→Aluminum → Mass drops ~2.9× (7.85→2.70). Editing
       density selects Custom.
+- [ ] Measure: a circular edge now also shows **diameter** (= 2×radius). Repeated measurements
+      accumulate in a **History** list (newest first) with a **Clear** button.
 
 ## 7. Chrome / sizing (quick visual)
 - [ ] Settings dialog, title-bar caption buttons, the view-cube, the viewport HUD toolbar + nav gizmo,

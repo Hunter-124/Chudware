@@ -662,7 +662,7 @@ int run_gui(const char* screenshotPath) {
 
     float xs = 1.0f, ys = 1.0f;
     glfwGetWindowContentScale(win, &xs, &ys);
-    float scale = shot ? 1.0f : xs;
+    float scale = shot ? 1.0f : (xs > ys ? xs : ys);
     // AI_CAD_SCALE overrides the content scale (incl. in screenshot mode) so HiDPI layout can be
     // reproduced/verified headlessly. Clamped to a sane range.
     if (const char* envScale = std::getenv("AI_CAD_SCALE")) {
@@ -851,6 +851,7 @@ int run_gui(const char* screenshotPath) {
         {
             std::string ec(cmd_id);
             if (ec.rfind("ecad_", 0) == 0 || ec.rfind("sch_", 0) == 0 || ec.rfind("pcb_", 0) == 0) {
+                st.showPcbTools = true;
                 ecadDispatch(st, ec); return;
             }
         }
@@ -859,7 +860,10 @@ int run_gui(const char* screenshotPath) {
         std::string cmd(cmd_id);
         if (cmd == "sm_flat_pattern") { applyFlatPattern(st); return; }  // W16: one-click Flatten
         if (cmd == "sm_export_flat_dxf") { exportFlatDxf(st); return; }  // W14: flat-pattern DXF
-        if (cmd.rfind("sim_", 0) == 0 && simPanel.handleCommand(st, cmd)) return;
+        if (cmd.rfind("sim_", 0) == 0) {
+            st.showSimulationTools = true;
+            if (simPanel.handleCommand(st, cmd)) return;
+        }
         if (cmd.rfind("eval_", 0) == 0 && evaluateDialogs.handleCommand(st, cmd)) return;
         std::printf("[ribbon] %s (no PM form)\n", cmd_id);
         std::fflush(stdout);
@@ -1065,12 +1069,17 @@ int run_gui(const char* screenshotPath) {
     if (st.wantEquations) { st.showFeatureTree = true; }  // keep the FeatureManager (Equations node) visible
     st.wantM1 = shot && shotMode && std::strcmp(shotMode, "m1") == 0;  // C17 integration scenario
     st.wantEcad = shot && shotMode && std::strcmp(shotMode, "ecad") == 0;  // Wave N: ECAD GUI shot
-    if (st.wantEcad) { st.showRibbon = true; st.ribbonTab = AppState::RT_PCB; }  // PCB tab forward
+    if (st.wantEcad) { st.showPcbTools = true; st.showRibbon = true; st.ribbonTab = AppState::RT_PCB; }  // PCB tab forward
     st.wantSketch = shot && shotMode && std::strcmp(shotMode, "sketch") == 0;  // C18 sketch flow
     if (st.wantSketch) { st.showRibbon = true; st.ribbonTab = AppState::RT_Sketch; }  // Sketch tab forward
     st.wantFea = shot && shotMode && std::strcmp(shotMode, "fea") == 0;       // C19 static study
     st.wantEvalMass = shot && shotMode && std::strcmp(shotMode, "evalmass") == 0;  // C19 mass props
-    if (st.wantFea) { st.showRibbon = true; st.ribbonTab = AppState::RT_Simulation; st.showSimPanel = true; }
+    if (st.wantFea) {
+        st.showSimulationTools = true;
+        st.showRibbon = true;
+        st.ribbonTab = AppState::RT_Simulation;
+        st.showSimPanel = true;
+    }
     // C22b: activity shot — new part doc -> agent_run_v2 -> Activity panel -> Settings Agents tab
     st.wantActivity = shot && shotMode && std::strcmp(shotMode, "activity") == 0;
     if (st.wantActivity) { st.showActivityPanel = true; }
@@ -1279,6 +1288,30 @@ int run_gui(const char* screenshotPath) {
     // (ui/scenarios.cpp). tick() advances the active scenario before each frame; endFrame()
     // handles the captures and the scenario-driven swap+continue / swap+break at loop bottom.
     ui::ScenarioRunner scenarios(propertyManager, simPanel, evaluateDialogs, activityPanel);
+
+    auto desiredThemeForFrame = [&st]() {
+        if (const char* envTheme = std::getenv("AI_CAD_THEME")) {
+            if (std::strcmp(envTheme, "light") == 0) return ui::Theme::Light;
+            if (std::strcmp(envTheme, "dark") == 0) return ui::Theme::Dark;
+        }
+        return (st.settings.theme == "light") ? ui::Theme::Light : ui::Theme::Dark;
+    };
+    auto styleColorMatchesRole = [](const ImVec4& c, const float* role) {
+        return std::fabs(c.x - role[0]) < 0.006f &&
+               std::fabs(c.y - role[1]) < 0.006f &&
+               std::fabs(c.z - role[2]) < 0.006f &&
+               std::fabs(c.w - role[3]) < 0.006f;
+    };
+    auto ensureFrameTheme = [&]() {
+        const ui::Theme desired = desiredThemeForFrame();
+        const ImVec4* colors = ImGui::GetStyle().Colors;
+        const bool staleColors =
+            !styleColorMatchesRole(colors[ImGuiCol_WindowBg], ui::palette.windowBg) ||
+            !styleColorMatchesRole(colors[ImGuiCol_ChildBg],  ui::palette.panelBg) ||
+            !styleColorMatchesRole(colors[ImGuiCol_FrameBg],  ui::palette.frameBg);
+        if (desired != ui::activeTheme || staleColors)
+            ui::applyTheme(desired, scale);
+    };
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
@@ -1871,6 +1904,11 @@ int run_gui(const char* screenshotPath) {
         // panels, and request per-step screenshots; extracted to ui::ScenarioRunner (ui/scenarios.cpp).
         scenarios.tick(st);
 
+        // Keep theme state coherent across runtime toggles, screenshot scenarios, and any accidental
+        // style leak. This runs before NewFrame so docked panes cannot inherit a stale light surface
+        // while the saved/active theme says dark.
+        ensureFrameTheme();
+
         bool busy = st.job.running.load();
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -2080,6 +2118,10 @@ int run_gui(const char* screenshotPath) {
                 st.designStarted = true;  // show the conversation takeover
 
         }
+        // Screenshot verification captures after a few frames; keep the settings popup request
+        // alive long enough that ImGui opens it even if the first frame is consumed by layout init.
+        if (shot && st.wantSettings && st.frame <= 5)
+            st.openSettings = true;
 
         // ---------- custom title bar (our own; the OS title bar is stripped) ----------
         ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -2103,7 +2145,8 @@ int run_gui(const char* screenshotPath) {
         }
         // C40: accent-highlight the armed sketch tool's ribbon button.
         ui::setRibbonActiveCmd(sketchMode.activeToolCmd());
-        float ribbonH = ui::drawRibbon(st.ribbonTab, st.showRibbon);
+        float ribbonH = ui::drawRibbon(st.ribbonTab, st.showRibbon,
+                                       st.showSimulationTools, st.showPcbTools);
 
         // ---------- document tab strip (browser/SolidWorks-style; under the ribbon) ----------
         // Reconcile the strip with the mirror (adopt a doc created by a path that doesn't open its
@@ -2114,7 +2157,7 @@ int run_gui(const char* screenshotPath) {
         float docTabsH = ui::drawDocTabs(st, barH + ribbonH);
 
         // ---------- dockspace host (between the title bar+ribbon and the status bar) ----------
-        const float statusH = ImGui::GetFrameHeight();
+        const float statusH = ImGui::GetTextLineHeight() + 12.0f * scale;
         const float dockTopY = barH + ribbonH + docTabsH;
         ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + dockTopY));
         ImGui::SetNextWindowSize(ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
@@ -2152,11 +2195,13 @@ int run_gui(const char* screenshotPath) {
         // PropertyManager / Configurations). drawLeftPane routes the active tab body and auto-
         // switches to the PropertyManager tab while a command form is active. We still tick the PM
         // so the debounced live preview fires; the container draws the PM form body when active.
-        // A live PropertyManager forces the left pane open so its form is never invisibly active.
-        if (propertyManager.active()) st.showFeatureTree = true;
+        // A live PropertyManager forces the left pane open so its form is visible, but the preview
+        // tick is independent of that pane state to avoid invisible active commands.
+        if (propertyManager.active()) {
+            propertyManager.tick(st);
+            st.showFeatureTree = true;
+        }
         if (st.showFeatureTree) {
-            if (propertyManager.active())
-                propertyManager.tick(st);     // fire the debounced live preview if dirty
             ui::drawLeftPane(st, [&st, &propertyManager](const std::string& fid) {
                 propertyManager.openForEdit(st, fid);
             });
@@ -2170,8 +2215,13 @@ int run_gui(const char* screenshotPath) {
         activityPanel.draw(st);
         if (st.wantFocusViewport > 0) { ImGui::SetNextWindowFocus(); st.wantFocusViewport--; }
         ui::drawViewportPanel(st, io, busy);
-        if (st.wantFocusEcad > 0) { ImGui::SetNextWindowFocus(); st.wantFocusEcad--; }
-        ui::drawEcadEditor(st);   // Wave N: AI-ECAD 2D editor (launchpad until an ECAD doc loads)
+        if (st.wantFocusEcad > 0) {
+            st.showPcbTools = true;
+            ImGui::SetNextWindowFocus();
+            st.wantFocusEcad--;
+        }
+        if (st.showPcbTools || !st.ecadDocId.empty())
+            ui::drawEcadEditor(st);   // Wave N: AI-ECAD 2D editor
         if (st.ecadAiGo) { st.ecadAiGo = false; ecadAiDesign(st, st.ecadAiRequest); }  // Wave P
         if (st.ecadAiBoardGo) { st.ecadAiBoardGo = false; ecadAiBoard(st, st.ecadAiRequest); }  // Wave U
         if (st.ecadOpsGo) { st.ecadOpsGo = false; ecadApplyOps(st, st.ecadPendingOps); }  // Wave Q

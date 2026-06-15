@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <string>
 
 #include "imgui.h"
@@ -436,6 +437,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
 static void drawModeRow(AppState& st) {
     const auto& pal = ui::palette;
     bool hasDoc = st.docMirror.hasDoc();
+    const float sc = ui::uiScale;
     const char* kModes[] = {"Design new", "Edit part", "Ask"};
     const char* kModeTips[] = {
         "Design new — describe a new part and the AI models it from scratch.",
@@ -444,13 +446,15 @@ static void drawModeRow(AppState& st) {
     };
     float avail = ImGui::GetContentRegionAvail().x;
     const ImGuiStyle& style = ImGui::GetStyle();
+    const ImVec2 compactPad(8.0f * sc, 4.0f * sc);
 
     // Lay out the three pills; wrap onto the next line when the running width would overflow.
     float x = 0.0f;
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, compactPad);
     for (int i = 0; i < 3; ++i) {
         bool active = (st.aiInteraction == i);
         bool disabled = (i == 1 && !hasDoc);   // Edit requires a doc
-        float w = ImGui::CalcTextSize(kModes[i]).x + style.FramePadding.x * 2.0f;
+        float w = ImGui::CalcTextSize(kModes[i]).x + compactPad.x * 2.0f;
         if (i > 0) {
             if (x + style.ItemSpacing.x + w <= avail) { ImGui::SameLine(); x += style.ItemSpacing.x; }
             else { x = 0.0f; }  // wrap
@@ -463,33 +467,35 @@ static void drawModeRow(AppState& st) {
         if (disabled) ImGui::EndDisabled();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kModeTips[i]);
     }
+    ImGui::PopStyleVar();
     if (st.aiInteraction == 1 && !hasDoc) st.aiInteraction = 0;   // fall back when no doc
     st.agentV2 = (st.aiInteraction == 1);                         // Edit == orchestrator v2
 
     // Model/provider label — clicking opens Settings (do not duplicate settings UI here).
-    const char* provNames[] = {"Anthropic", "OpenAI", "Local"};
-    const char* prov = provNames[(st.settings.provider >= 0 && st.settings.provider < 3)
+    const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp"};
+    const char* prov = provNames[(st.settings.provider >= 0 && st.settings.provider < 4)
                                      ? st.settings.provider : 2];
     char label[160];
-    std::snprintf(label, sizeof(label), "%s : %s", prov, st.settings.model);
-    // Right-align the model label on its own line so the mode pills never collide with it.
+    std::snprintf(label, sizeof(label), "%s / %s", prov,
+                  st.settings.model[0] ? st.settings.model : "default");
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, compactPad);
     ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-    if (ImGui::SmallButton(label)) st.openSettings = true;
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Model & provider — click to open Settings.");
-    // Supervised/Autopilot toggle: sits next to the model label, but wraps to its own line when
-    // the pane is too narrow (e.g. at 2x scale) so neither label clips at the right edge.
     bool supervised = st.settings.planMode;
     const char* toggleLbl = supervised ? "Supervised" : "Autopilot";
-    float toggleW = ImGui::CalcTextSize(toggleLbl).x + style.FramePadding.x * 2.0f;
-    float rowEndX = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + ImGui::GetScrollX();
-    float paneRight = ImGui::GetContentRegionMax().x;
-    if (rowEndX + style.ItemSpacing.x + toggleW <= paneRight) ImGui::SameLine();
+    float toggleW = ImGui::CalcTextSize(toggleLbl).x + compactPad.x * 2.0f;
+    float modelW = ImGui::GetContentRegionAvail().x;
+    bool sameLineToggle = modelW > toggleW + style.ItemSpacing.x + 96.0f * sc;
+    if (sameLineToggle) modelW -= toggleW + style.ItemSpacing.x;
+    if (ImGui::Button(label, ImVec2(modelW, 0))) st.openSettings = true;
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Model & provider - click to open Settings.\n%s", label);
+    if (sameLineToggle) ImGui::SameLine();
     if (supervised) ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.accentMid));
-    if (ImGui::SmallButton(toggleLbl))
+    if (ImGui::Button(toggleLbl, ImVec2(sameLineToggle ? toggleW : -1.0f, 0)))
         st.settings.planMode = !st.settings.planMode;
     if (supervised) ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("%s", supervised
             ? "Supervised: the AI plans first and shows the plan before building. Click for Autopilot."
@@ -600,6 +606,162 @@ static void submitTurn(AppState& st, const std::string& text) {
     }
 }
 
+static bool hasNonSpace(const char* text) {
+    if (!text) return false;
+    for (const unsigned char* p = (const unsigned char*)text; *p; ++p)
+        if (!std::isspace(*p)) return true;
+    return false;
+}
+
+static void copyToBuffer(std::vector<char>& buf, const char* text) {
+    if (buf.empty()) return;
+    std::memset(buf.data(), 0, buf.size());
+    if (text) std::strncpy(buf.data(), text, buf.size() - 1);
+}
+
+static std::string rpcErrorText(const core::RpcResult& r) {
+    if (!r.ok) return r.err.empty() ? "worker call failed" : r.err;
+    if (r.result.is_object() && r.result.contains("code"))
+        return r.result.value("message", std::string("worker error"));
+    return std::string();
+}
+
+static void submitHelpQuestion(AppState& st, const std::string& question) {
+    if (!hasNonSpace(question.c_str())) return;
+    if (!st.workerStarted) {
+        st.helpError = "Runtime is not ready yet.";
+        st.helpStatus = "Runtime not ready.";
+        return;
+    }
+    if (st.helpBusy) return;
+    st.helpBusy = true;
+    st.helpLastQuestion = question;
+    st.helpAnswer.clear();
+    st.helpError.clear();
+    st.helpStatus = "Asking...";
+    st.addLog("[..] help: " + question);
+    nlohmann::json params = {
+        {"doc_id", st.docMirror.hasDoc() ? st.docMirror.docId() : std::string()},
+        {"question", question}};
+    st.rpc.call("agent_ask_v2", params, [&st](const core::RpcResult& r) {
+        st.helpBusy = false;
+        std::string err = rpcErrorText(r);
+        if (!err.empty()) {
+            st.helpError = err;
+            st.helpAnswer.clear();
+            st.helpStatus = "Ask failed.";
+            st.status = "Help failed.";
+            st.statusKind = 2;
+            st.addLog("[err] help: " + err);
+            return;
+        }
+        st.helpAnswer = r.result.value("answer", std::string());
+        if (st.helpAnswer.empty()) st.helpAnswer = "(no answer)";
+        st.helpError.clear();
+        st.helpStatus = "Ready.";
+        st.status = "Ready.";
+        st.statusKind = 0;
+    }, 300000);
+}
+
+static void drawHelpTab(AppState& st, bool canRun) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    bool workerReady = st.workerStarted && canRun && !st.agentV2Running;
+
+    ImGui::Dummy(ImVec2(0, 2));
+    ImGui::PushFont(st.fonts.medium);
+    ImGui::TextUnformatted("AI Help");
+    ImGui::PopFont();
+    dimText("Ask about the current part, feature tree, dimensions, or CAD workflow. Help mode is read-only.");
+
+    ImGui::Dummy(ImVec2(0, 4));
+    const char* examples[] = {
+        "What features are in this part?",
+        "Why is my sketch under defined?",
+        "How should I change this without breaking downstream features?",
+    };
+    float avail = ImGui::GetContentRegionAvail().x;
+    const ImGuiStyle& style = ImGui::GetStyle();
+    float rowW = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+        float w = ImGui::CalcTextSize(examples[i]).x + style.FramePadding.x * 2.0f;
+        if (i > 0) {
+            if (rowW + style.ItemSpacing.x + w <= avail) {
+                ImGui::SameLine();
+                rowW += style.ItemSpacing.x;
+            } else {
+                rowW = 0.0f;
+            }
+        }
+        rowW += w;
+        if (ImGui::SmallButton(examples[i])) copyToBuffer(st.helpQuestion, examples[i]);
+    }
+
+    if (!st.selectedFeatureId.empty()) {
+        ImGui::Dummy(ImVec2(0, 3));
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::Text("Selected feature: %s", st.selectedFeatureId.c_str());
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Ask about selection")) {
+            std::string q = "Explain feature " + st.selectedFeatureId +
+                            " and suggest safe edits I can make to it.";
+            copyToBuffer(st.helpQuestion, q.c_str());
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0, 6));
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputTextMultiline("##help_question", st.helpQuestion.data(), st.helpQuestion.size(),
+                              ImVec2(-1, ImGui::GetTextLineHeight() * 3.0f));
+    if (st.helpQuestion[0] == 0) {
+        ImVec2 mn = ImGui::GetItemRectMin();
+        ImGui::GetWindowDrawList()->AddText(
+            ImVec2(mn.x + ImGui::GetStyle().FramePadding.x * 2,
+                   mn.y + ImGui::GetStyle().FramePadding.y),
+            ui::Palette::toU32(pal.textDisabled), "Ask for help with this model...");
+    }
+    bool ctrlEnter = ImGui::IsItemFocused() && ImGui::GetIO().KeyCtrl &&
+                     ImGui::IsKeyPressed(ImGuiKey_Enter, false);
+    bool hasQuestion = hasNonSpace(st.helpQuestion.data());
+    bool canAsk = workerReady && hasQuestion && !st.helpBusy;
+    if (!canAsk) ImGui::BeginDisabled();
+    bool ask = primaryButton(st.helpBusy ? "Asking..." : "Ask Help", ImVec2(-1, 32.0f * sc));
+    if (!canAsk) ImGui::EndDisabled();
+    if ((ask || ctrlEnter) && canAsk) submitHelpQuestion(st, std::string(st.helpQuestion.data()));
+    if (ImGui::IsItemHovered() && !workerReady)
+        ImGui::SetTooltip("Runtime/worker must be ready and no design/edit run can be active.");
+
+    ImGui::Dummy(ImVec2(0, 8));
+    if (st.helpBusy) {
+        static const char* kSpin[] = {"|", "/", "-", "\\"};
+        int sp = (int)(ImGui::GetTime() * 8.0) & 3;
+        ImGui::TextColored(ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1),
+                           "%s Asking the AI helper...", kSpin[sp]);
+    } else if (!st.helpStatus.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::TextUnformatted(st.helpStatus.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    if (!st.helpError.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(pal.errSystem[0], pal.errSystem[1], pal.errSystem[2], 1));
+        ImGui::TextWrapped("I couldn't answer that: %s", st.helpError.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (!st.helpLastQuestion.empty() || !st.helpAnswer.empty()) {
+        ImGui::SeparatorText("Answer");
+        if (!st.helpLastQuestion.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+            ImGui::TextWrapped("Q: %s", st.helpLastQuestion.c_str());
+            ImGui::PopStyleColor();
+        }
+        if (!st.helpAnswer.empty()) drawProseBox("##help_answer", st.helpAnswer, 260.0f * sc);
+    }
+}
+
 // ---- runtime-not-ready banner (kept from the old Design body) ----
 static void drawRuntimeBanner(AppState& st) {
     if (st.workerStarted) return;
@@ -633,6 +795,9 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     drawCopilotHeader(st, busy);
     ImGui::Separator();
     drawRuntimeBanner(st);
+
+    if (ImGui::BeginTabBar("##ai_tabs")) {
+    if (ImGui::BeginTabItem("Design")) {
 
     // ---- INPUT AT TOP — always visible, multiline; Ctrl+Enter sends, Enter = newline ----
     ImGui::SetNextItemWidth(-1);
@@ -676,24 +841,15 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
         dimText("Try:");
         static const char* kExamples[] = {
-            "a GoPro tripod mount adapter",
-            "a vented Raspberry Pi 5 case with a snap-on lid",
+            "GoPro tripod adapter",
+            "Raspberry Pi 5 vented case",
             "an M3 hex standoff, 25mm tall",
         };
-        // max 3 chips, laid on one row but wrapping (not clipping) on a narrow pane.
-        float availChips = ImGui::GetContentRegionAvail().x;
-        const ImGuiStyle& cs = ImGui::GetStyle();
-        float cx = 0.0f;
         for (int ei = 0; ei < 3; ++ei) {
-            float cw = ImGui::CalcTextSize(kExamples[ei]).x + cs.FramePadding.x * 2.0f;
-            if (ei > 0) {
-                if (cx + cs.ItemSpacing.x + cw <= availChips) {
-                    ImGui::SameLine(); cx += cs.ItemSpacing.x;
-                } else { cx = 0.0f; }
-            }
-            cx += cw;
-            if (ImGui::SmallButton(kExamples[ei]))
+            ImGui::PushID(ei);
+            if (ImGui::Button(kExamples[ei], ImVec2(-1, 0)))
                 std::strncpy(st.prompt.data(), kExamples[ei], st.prompt.size() - 1);
+            ImGui::PopID();
         }
     }
 
@@ -790,6 +946,18 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         ImGui::BeginChild("##consolebody", ImVec2(0, 160 * ui::uiScale), ImGuiChildFlags_Border);
         drawConsoleBody(st);
         ImGui::EndChild();
+    }
+
+    ImGui::EndTabItem();
+    }
+    ImGuiTabItemFlags helpFlags = st.focusHelpTab ? ImGuiTabItemFlags_SetSelected
+                                                   : ImGuiTabItemFlags_None;
+    if (ImGui::BeginTabItem("Help", nullptr, helpFlags)) {
+        drawHelpTab(st, canRun);
+        ImGui::EndTabItem();
+    }
+    st.focusHelpTab = false;
+    ImGui::EndTabBar();
     }
 
     ImGui::End();

@@ -1,5 +1,5 @@
-"""Extrude feature compiler — boss/cut, blind/through_all/mid_plane/up_to_next + the
-SolidWorks geometry-driven end conditions, full Dir2, thin feature, and merge/new-body.
+"""Extrude feature compiler — boss/cut, start refs, reference/surface/body end modes,
+full Dir2, thin feature, and merge/new-body.
 
 feature_params.md §Sketched features > extrude.
 
@@ -8,7 +8,9 @@ Profile source:
   using ``resolve_region``.
 - ``{"kind":"face",...}`` → resolved via describe_faces + resolve (face selector).
 
-End conditions (direction 1 = first profile face normal, flipped by ``flip``):
+Start and end conditions (direction 1 = first profile face normal, flipped by ``flip``):
+- ``start`` = sketch_plane|offset|from_reference|offset_from_reference. Reference starts are
+  v1-limited to planar datum/face references parallel to the sketch plane.
 - ``blind`` = ``depth`` along the direction.
 - ``through_all`` = 1.05× combined bounding-box extent in the extrude direction.
 - ``mid_plane`` = ±depth/2 each side (SolidWorks: ``depth`` is the TOTAL height).
@@ -34,6 +36,8 @@ End conditions (direction 1 = first profile face normal, flipped by ``flip``):
 single ``profile`` slot; a face/vertex selector is just a dict and resolves against the
 running body with the same ``describe_* + resolve`` machinery the datum/hole compilers use.
 (A dedicated ``refs.up_to`` slot would be cleaner — noted as a deferred schema change.)
+- ``up_to_reference`` / ``offset_from_reference`` = a planar datum/face reference parallel to
+  the profile plane; the tool depth is the signed distance to that plane plus optional offset.
 
 Second direction (``end2`` != "none") builds a second tool from the same profiles along
 the *negated* direction with its own end-condition logic (the FULL matrix: blind /
@@ -293,19 +297,79 @@ def _to_solid_normalized(shape) -> Any:
 # --------------------------------------------------------------------------- extrude
 
 
+_VALID_STARTS = ("sketch_plane", "offset", "from_reference", "offset_from_reference")
 _VALID_ENDS = (
     "blind", "through_all", "mid_plane", "up_to_next",
     "up_to_surface", "offset_from_surface", "up_to_body", "up_to_vertex",
+    "up_to_reference", "offset_from_reference",
 )
 _VALID_ENDS2 = (
     "none", "blind", "through_all", "up_to_next",
     "up_to_surface", "offset_from_surface", "up_to_body", "up_to_vertex",
+    "up_to_reference", "offset_from_reference",
 )
 
-# End conditions whose stop is GEOMETRY-driven (depend on a referenced target rather than a
-# linear depth). Draft greys out for these (SolidWorks behavior), matching through_all.
+# End conditions whose stop is geometry/reference-driven rather than a simple editable distance.
 _GEOMETRY_ENDS = ("up_to_next", "up_to_surface", "offset_from_surface",
-                  "up_to_body", "up_to_vertex")
+                  "up_to_body", "up_to_vertex",
+                  "up_to_reference", "offset_from_reference")
+
+
+def _is_datum_ref(ref: Any) -> bool:
+    return isinstance(ref, str) or (isinstance(ref, dict) and ref.get("kind") == "datum")
+
+
+def _resolve_plane_ref(ref: Any, ctx: CompileContext, slot: str) -> Plane:
+    """Resolve a planar datum or planar face selector for extrude start/end references."""
+    if ref is None:
+        raise FeatureError(f"extrude: refs.{slot} is required for the selected condition")
+    if _is_datum_ref(ref):
+        d = ctx.datum(ref)
+        if d.kind != "plane":
+            raise FeatureError(
+                f"extrude: refs.{slot} must be a planar datum/face, got datum kind '{d.kind}'"
+            )
+        return d.obj
+    if not isinstance(ref, dict) or ref.get("kind") != "face":
+        raise FeatureError(f"extrude: refs.{slot} must be a planar face or datum plane")
+    if ref.get("surf") not in (None, "plane"):
+        raise FeatureError(f"extrude: refs.{slot} must be planar; got {ref.get('surf')!r}")
+    if not ctx.bodies:
+        raise FeatureError(f"extrude: refs.{slot} face selector requires an existing body")
+    body = ctx.bodies[-1]
+    infos = describe_faces(body.wrapped)
+    rr = resolve(ref, infos, _body_bbox_diag(body))
+    if rr.index is None:
+        raise FeatureError(
+            f"extrude: refs.{slot} selector dangling — {rr.dangling_reason}",
+            dangling_refs=[f"{slot}: {rr.dangling_reason}"],
+        )
+    face = body.faces()[rr.index]
+    try:
+        return Plane(face)
+    except Exception:  # noqa: BLE001
+        try:
+            return Plane(origin=face.center(), z_dir=face.normal_at())
+        except Exception as exc:  # noqa: BLE001
+            raise FeatureError(f"extrude: refs.{slot} face is not planar ({exc})")
+
+
+def _parallel_plane_distance(face: Face, direction: Vector, plane: Plane, slot: str) -> float:
+    """Signed distance from *face* to *plane* along *direction*; requires parallel planes."""
+    try:
+        n = Vector(plane.z_dir)
+        n_len = max(n.length, 1e-12)
+        d = Vector(direction)
+        d_len = max(d.length, 1e-12)
+        align = abs(n.dot(d) / (n_len * d_len))
+    except Exception:  # noqa: BLE001
+        align = 0.0
+    if align < 0.999:
+        raise FeatureError(
+            f"extrude: refs.{slot} plane must be parallel to the profile plane in v1",
+            hint="choose a datum/planar face parallel to the sketch, or use Blind/Through All",
+        )
+    return Vector(direction).dot(Vector(plane.origin) - Vector(face.center()))
 
 
 def _up_to_next_cut_tool(face: Face, direction: Vector, body) -> Any:
@@ -636,16 +700,22 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
     up_to2_sel = refs.get("up_to2") if refs.get("up_to2") is not None else p.get("up_to2")
 
     mode = p.get("mode", "boss")
+    start = p.get("start", "sketch_plane")
     end = p.get("end", "blind")
     end2 = p.get("end2", "none")
     flip = p.get("flip", False)
     merge = p.get("merge", True)
 
+    if start not in _VALID_STARTS:
+        raise FeatureError(f"extrude: unknown start '{start}'")
     if end not in _VALID_ENDS:
         raise FeatureError(f"extrude: unknown end '{end}'")
     if end2 not in _VALID_ENDS2:
         raise FeatureError(f"extrude: unknown end2 '{end2}'")
 
+    start_offset = ctx.dim(p, "start_offset", 0.0)
+    end_offset = ctx.dim(p, "end_offset", 0.0)
+    end2_offset = ctx.dim(p, "end2_offset", 0.0)
     depth = ctx.dim(p, "depth", 10.0)    # blind & mid_plane (dir 1)
     depth2 = ctx.dim(p, "depth2", 10.0)  # blind (dir 2)
 
@@ -705,6 +775,19 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
         normal = normal * -1.0
 
     fid = feat.get("id", "?")
+
+    # Start condition. Move every profile face to the selected start plane before tool creation.
+    start_shift = 0.0
+    if start == "offset":
+        start_shift = start_offset
+    elif start in ("from_reference", "offset_from_reference"):
+        plane = _resolve_plane_ref(refs.get("start_ref"), ctx, "start_ref")
+        start_shift = _parallel_plane_distance(face0, normal, plane, "start_ref")
+        if start == "offset_from_reference":
+            start_shift += start_offset
+    if abs(start_shift) > 1e-12:
+        profile_faces = [f.translate(normal * start_shift) for f in profile_faces]
+        face0 = profile_faces[0]
 
     def _linear_amount(end_cond: str, blind_depth: float, dir_vec: Vector) -> float:
         """Linear distance for blind/through_all. up_to_next/up_to_body ignore amount."""
@@ -767,6 +850,15 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
 
     _SURFACE_ENDS = ("up_to_surface", "offset_from_surface", "up_to_vertex")
 
+    def _reference_amount(end_cond: str, dir_vec: Vector, slot: str, offset: float) -> float | None:
+        if end_cond not in ("up_to_reference", "offset_from_reference"):
+            return None
+        plane = _resolve_plane_ref(refs.get(slot), ctx, slot)
+        amount = _parallel_plane_distance(face0, dir_vec, plane, slot)
+        if end_cond == "offset_from_reference":
+            amount += offset
+        return amount
+
     # --- direction-1 amount (or mid_plane half-depth) ---
     if end == "mid_plane":
         amount = depth / 2.0  # SW: depth = TOTAL height, half each side
@@ -790,8 +882,9 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
             _resolve_target_entity(up_to_sel, bodies[-1], "face", "up_to")
         up_to_body_target = bodies[-1]
     else:
-        amount = _linear_amount(end, depth, normal)
-        if end in ("through_all", "up_to_next") and abs(taper) > 1e-9:
+        ref_amount = _reference_amount(end, normal, "end_ref", end_offset)
+        amount = ref_amount if ref_amount is not None else _linear_amount(end, depth, normal)
+        if end not in ("blind", "mid_plane") and abs(taper) > 1e-9:
             draft_ignored = True  # SW greys draft here
     if end not in ("up_to_next", "up_to_body") and amount <= 0.0:
         raise FeatureError(f"extrude: effective depth {amount:.3g} must be > 0")
@@ -815,6 +908,11 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
                 draft_ignored = True
         elif end2 == "up_to_body":
             amount2 = 0.0
+            if abs(taper) > 1e-9:
+                draft_ignored = True
+        elif end2 in ("up_to_reference", "offset_from_reference"):
+            amount2 = _reference_amount(end2, normal * -1.0,
+                                        "end2_ref", end2_offset) or 0.0
             if abs(taper) > 1e-9:
                 draft_ignored = True
         else:
@@ -866,6 +964,10 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
     tool_solid = _to_solid_normalized(tool_solid)
 
     resolved: dict[str, float | str] = {"depth": amount, "taper": taper1}
+    if start != "sketch_plane":
+        resolved["start_offset"] = start_shift
+    if end == "offset_from_reference":
+        resolved["end_offset"] = end_offset
     if end2 != "none":
         resolved["depth2"] = amount2
     if thin:
@@ -874,9 +976,11 @@ def compile_extrude(feat: dict, ctx: CompileContext) -> CompileOutput:
         resolved["offset"] = offset1
     if end2 == "offset_from_surface":
         resolved["offset2"] = offset2_v
+    if end2 == "offset_from_reference":
+        resolved["end2_offset"] = end2_offset
     if draft_ignored:
         resolved["_draft_note"] = (
-            "draft ignored (not supported for through_all / up_to_* ends)")
+            "draft ignored (not supported for through_all / up_to_* / reference ends)")
 
     # Apply to the running body. merge=False (or no existing body) makes a NEW BODY: the
     # extrusion is appended to the body list instead of fusing — SolidWorks "Merge result"

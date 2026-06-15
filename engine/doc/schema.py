@@ -231,12 +231,16 @@ FEATURE_TYPES: dict[str, dict[str, Any]] = {
     "sphere": {"params": ["radius"], "refs": {"at": (_SEL_OR_DATUM, False)}},
     "cone": {"params": ["r1", "r2", "height"], "refs": {"at": (_SEL_OR_DATUM, False)}},
     "torus": {"params": ["major_r", "minor_r"], "refs": {"at": (_SEL_OR_DATUM, False)}},
-    "extrude": {"params": ["mode", "end", "depth"],
+    "extrude": {"params": ["mode"],
                 "refs": {"profile": (_SEL_LIST, True),
                          # geometry-driven end targets (up_to_surface/offset_from_surface/
                          # up_to_vertex/up_to_body); a face/vertex/body selector, per direction.
                          "up_to": (_SEL_OR_DATUM, False),
-                         "up_to2": (_SEL_OR_DATUM, False)}},
+                         "up_to2": (_SEL_OR_DATUM, False),
+                         # planar start/end references for reference-driven start/end modes.
+                         "start_ref": (_SEL_OR_DATUM, False),
+                         "end_ref": (_SEL_OR_DATUM, False),
+                         "end2_ref": (_SEL_OR_DATUM, False)}},
     "revolve": {"params": ["mode", "angle"], "refs": {"profile": (_SEL_LIST, True),
                                                       "axis": (_SEL_OR_DATUM, True)}},
     "sweep": {"params": ["mode"], "refs": {"profile": (_SEL_LIST, True),

@@ -211,6 +211,17 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             ImGui::MenuItem("AI Panel", nullptr, &st.showAIPanel);
             ImGui::MenuItem("Viewport", nullptr, &st.showViewport);
             ImGui::Separator();
+            if (ImGui::MenuItem("Simulation tools", nullptr, st.showSimulationTools)) {
+                st.showSimulationTools = !st.showSimulationTools;
+                if (st.showSimulationTools) { st.showRibbon = true; st.ribbonTab = AppState::RT_Simulation; }
+                else if (st.ribbonTab == AppState::RT_Simulation) st.ribbonTab = AppState::RT_Features;
+            }
+            if (ImGui::MenuItem("PCB / electronics tools", nullptr, st.showPcbTools)) {
+                st.showPcbTools = !st.showPcbTools;
+                if (st.showPcbTools) { st.showRibbon = true; st.ribbonTab = AppState::RT_PCB; }
+                else if (st.ribbonTab == AppState::RT_PCB) st.ribbonTab = AppState::RT_Features;
+            }
+            ImGui::Separator();
             bool isLight = (ui::activeTheme == ui::Theme::Light);
             if (ImGui::MenuItem("Light theme (SolidWorks-style)", nullptr, isLight)) {
                 ui::Theme next = isLight ? ui::Theme::Dark : ui::Theme::Light;
@@ -295,6 +306,10 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             ImGui::MenuItem("Close All", nullptr, false, false);
         };
         auto drawHelpMenu = [&]() {
+            if (ImGui::MenuItem("AI Help")) {
+                st.showAIPanel = true;
+                st.focusHelpTab = true;
+            }
             if (ImGui::MenuItem("About AI-CAD")) st.showAbout = true;
             // Documentation / Keyboard Shortcuts have no backing yet — greyed placeholders.
             ImGui::MenuItem("Documentation", nullptr, false, false);

@@ -48,7 +48,15 @@ public:
         float radius = 1.0f;
         int ssWidth = 0, ssHeight = 0;  // supersampled framebuffer size (matches colorTexture)
     };
+    struct Timing {
+        unsigned int frame = 0;
+        double renderMs = 0.0;
+        double resolveMs = 0.0;
+        int width = 0, height = 0;
+        int ssWidth = 0, ssHeight = 0;
+    };
     const CameraXform& camera() const { return cam_; }
+    const Timing& timing() const { return timing_; }
     int supersample() const { return SS; }
 
     // Bind the studio color framebuffer + supersampled viewport so the C15 overlays can draw
@@ -144,6 +152,9 @@ public:
     unsigned int renderThumbnail(float yawDeg, float pitchDeg, int px);
 
     std::vector<unsigned char> readRGBA() const;         // final w*h*4, top-left origin
+    // Final-size box-resolved texture. This is the intended on-screen presentation target; the raw
+    // supersampled colorTexture() remains available for internal passes that draw into the SS FBO.
+    unsigned int resolvedColorTexture() const;
     unsigned int colorTexture() const { return colorTex_; }
     int width() const { return w_; }
     int height() const { return h_; }
@@ -189,11 +200,16 @@ private:
     void freeSubs();
     void buildLut();              // C19: build the SW-style jet LUT texture (lazy)
     void uploadDeformed(Sub& s);  // C19: re-upload displaced positions for the current scale
+    void resolveColorTexture() const;  // SS colorTex_ -> final-size resolvedTex_ by box filter
 
     static constexpr int SS = 3;  // supersample factor for anti-aliasing (3x for crisp thin edges)
     int w_ = 0, h_ = 0;           // final size
     int sw_ = 0, sh_ = 0;         // supersampled size
     unsigned int fbo_ = 0, colorTex_ = 0, depthRbo_ = 0;
+    mutable unsigned int resolveFbo_ = 0, resolvedTex_ = 0;
+    unsigned int resolveProg_ = 0;
+    mutable bool resolvedDirty_ = true;
+    mutable Timing timing_;
     // C27-D: dedicated small offscreen target for the View Selector preview thumbnail. Lazily
     // allocated on the first renderThumbnail() call; reallocated only when the requested px changes.
     unsigned int thumbFbo_ = 0, thumbTex_ = 0, thumbDepth_ = 0;

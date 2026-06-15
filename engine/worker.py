@@ -734,6 +734,24 @@ def _agent_ask_v2(params: dict, _emit_event: EmitFn) -> dict:
     return {"answer": ask.answer_question(question, session, provider)}
 
 
+def _agent_pm_assist_v1(params: dict, _emit_event: EmitFn) -> dict:
+    from agent import config, pm_assist
+
+    session = None
+    doc_id = params.get("doc_id") or ""
+    if doc_id:
+        try:
+            from engine.doc import session as docsess
+            session = docsess.get_session(doc_id)
+        except Exception:  # noqa: BLE001 — PM assist can still answer from form context
+            session = None
+    try:
+        provider = config.get_provider()
+    except Exception:  # noqa: BLE001 — pm_assist has a deterministic fallback path
+        provider = None
+    return pm_assist.assist_property_manager(params, session, provider)
+
+
 _METHODS = {
     "ping": _ping,
     "run_model": _run_model,
@@ -835,8 +853,9 @@ _STRUCTURED_ERROR_METHODS = {
 }
 
 # ---- ask mode (Wave D) — registered via update/add so the literals above stay frozen ----
-_METHODS.update({"agent_ask_v2": _agent_ask_v2})
+_METHODS.update({"agent_ask_v2": _agent_ask_v2, "agent_pm_assist_v1": _agent_pm_assist_v1})
 _STRUCTURED_ERROR_METHODS.add("agent_ask_v2")
+_STRUCTURED_ERROR_METHODS.add("agent_pm_assist_v1")
 
 # ---- CONFIG configurations — config_* RPCs (registered via update so the literal stays frozen) --
 _METHODS.update({

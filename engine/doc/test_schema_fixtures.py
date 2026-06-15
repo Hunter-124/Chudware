@@ -55,8 +55,10 @@ def test_validator_rejects_garbage() -> None:
     assert any("not a feature type" in e for e in validate_part(d))
 
     d = copy.deepcopy(base)
-    del d["features"][1]["params"]["depth"]
-    assert any("params.depth: required" in e for e in validate_part(d))
+    # extrude's only REQUIRED param is now "mode" (depth/end became optional when the
+    # reference-driven end-condition modes landed — depth is validated by the compiler per mode).
+    del d["features"][1]["params"]["mode"]
+    assert any("params.mode: required" in e for e in validate_part(d))
 
     d = copy.deepcopy(base)
     d["features"][0]["params"]["constraints"][0]["refs"] = ["e1.bogus", "e2.p1"]

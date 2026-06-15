@@ -120,16 +120,24 @@ namespace ui {
 void drawSettingsModal(AppState& st, bool busy) {
     Settings& settings = st.settings;
 
-    // ---------- Settings modal ----------
+    // ---------- Settings window ----------
+    static bool s_settingsOpen = false;
     if (st.openSettings) {
-        ImGui::OpenPopup("Settings");
+        s_settingsOpen = true;
         st.openSettings = false;
     }
     float sc = ui::uiScale;
-    ImGui::SetNextWindowSize(ImVec2(580.0f * sc, 640.0f * sc), ImGuiCond_Appearing);
-    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
-                            ImVec2(0.5f, 0.5f));
-    if (ImGui::BeginPopupModal("Settings", nullptr, ImGuiWindowFlags_NoResize)) {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float margin = 28.0f * sc;
+    const float maxW = std::max(360.0f * sc, vp->WorkSize.x - margin * 2.0f);
+    const float maxH = std::max(420.0f * sc, vp->WorkSize.y - margin * 2.0f);
+    const float winW = std::min(680.0f * sc, maxW);
+    const float winH = std::min(720.0f * sc, maxH);
+    if (s_settingsOpen) {
+        ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Appearing);
+        ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        if (ImGui::Begin("Settings", &s_settingsOpen,
+                         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking)) {
         // C22b: if a pending prompt role was requested, load prompts and jump to Agents tab.
         bool jumpToAgents = false;
         if (!st.pendingPromptRole.empty() && st.workerStarted) {
@@ -145,10 +153,12 @@ void drawSettingsModal(AppState& st, bool busy) {
             jumpToAgents = true;
         }
 
-        // tab content scrolls in its own region; Save/Cancel stay pinned at the bottom
+        // Tab content scrolls in its own region; Save/Cancel stay pinned at the bottom.
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+        const float footerH = ImGui::GetFrameHeightWithSpacing() + 20.0f * sc;
         ImGui::BeginChild("##settabsarea",
-                          ImVec2(0, ImGui::GetContentRegionAvail().y - 52.0f * sc));
+                          ImVec2(0, std::max(120.0f * sc,
+                                             ImGui::GetContentRegionAvail().y - footerH)));
         if (ImGui::BeginTabBar("##settabs")) {
             // ---- General tab: Document (units) + Display (theme) ----
             if (ImGui::BeginTabItem("General")) {
@@ -188,10 +198,10 @@ void drawSettingsModal(AppState& st, bool busy) {
                 dimText("All settings here are stored in %APPDATA%\\AI-CAD\\config.json.");
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("AI provider")) {
+            if (ImGui::BeginTabItem("AI")) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
-                ImGui::SeparatorText("Provider");
-                dimText("Used by 'Design with AI' and chat. Stored in "
+                ImGui::SeparatorText("Provider & model");
+                dimText("Used by Design, Edit, and Help. Stored in "
                         "%APPDATA%\\AI-CAD\\config.json.");
                 ImGui::Dummy(ImVec2(0, 4 * sc));
                 const char* provs[] = {"Anthropic (Claude)", "OpenAI",
@@ -221,18 +231,26 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ImGui::SetNextItemWidth(-1);
                 ImGui::InputText("##model", settings.model, sizeof(settings.model));
                 if (settings.provider == 0 || settings.provider == 1) {
+                    ImGui::Dummy(ImVec2(0, 8 * sc));
+                    ImGui::SeparatorText("Credentials");
                     ImGui::TextUnformatted("API key");
                     ImGui::SetNextItemWidth(-1);
                     ImGui::InputText("##key", settings.apiKey, sizeof(settings.apiKey),
                                      ImGuiInputTextFlags_Password);
                 } else if (settings.provider == 2) {
+                    ImGui::Dummy(ImVec2(0, 8 * sc));
+                    ImGui::SeparatorText("Connection");
                     ImGui::TextUnformatted("Base URL");
                     ImGui::SetNextItemWidth(-1);
                     ImGui::InputText("##base", settings.baseUrl, sizeof(settings.baseUrl));
+                    ImGui::Dummy(ImVec2(0, 4));
+                    ImGui::SeparatorText("Credentials");
                     ImGui::TextUnformatted("API key (optional)");
                     ImGui::SetNextItemWidth(-1);
                     ImGui::InputText("##lkey", settings.apiKey, sizeof(settings.apiKey),
                                      ImGuiInputTextFlags_Password);
+                    ImGui::Dummy(ImVec2(0, 8));
+                    ImGui::SeparatorText("Capabilities");
                     ImGui::Checkbox("Model supports vision (send screenshots)",
                                     &settings.vision);
                     helpMarker("Let the agent SEE its own renders: each iteration's contact-sheet "
@@ -266,7 +284,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ImGui::EndTabItem();
             }
             // --- C22b: Agents tab (role prompt editor) --- begin marked block ---
-            if (ImGui::BeginTabItem("Agents", nullptr,
+            if (ImGui::BeginTabItem("Prompts", nullptr,
                                     jumpToAgents ? ImGuiTabItemFlags_SetSelected
                                                  : ImGuiTabItemFlags_None)) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
@@ -325,8 +343,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                                               : "(differs from built-in: shorter)");
                         }
                         ImGui::PushFont(st.fonts.mono);
-                        float edH = ImGui::GetContentRegionAvail().y - 38;
-                        if (edH < 100) edH = 100;
+                        float edH = ImGui::GetContentRegionAvail().y - 38.0f * sc;
+                        if (edH < 100.0f * sc) edH = 100.0f * sc;
                         ImGui::InputTextMultiline("##prompted", pr.buf.data(), pr.buf.size(),
                                                   ImVec2(-1, edH));
                         ImGui::PopFont();
@@ -353,11 +371,11 @@ void drawSettingsModal(AppState& st, bool busy) {
             }
             // --- end C22b marked block ---
 
-            if (ImGui::BeginTabItem("Agent", nullptr,
+            if (ImGui::BeginTabItem("Advanced", nullptr,
                                     st.wantSettings ? ImGuiTabItemFlags_SetSelected
                                                     : ImGuiTabItemFlags_None)) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
-                ImGui::SeparatorText("Build loop");
+                ImGui::SeparatorText("Run behavior");
                 ImGui::Checkbox("Plan before building (recommended)", &settings.planMode);
                 helpMarker("Plan mode: before writing any CAD code the agent drafts a build plan "
                            "(the parts, their concrete dimensions and the feature list) and shows "
@@ -367,19 +385,20 @@ void drawSettingsModal(AppState& st, bool busy) {
                         "dimensions and features - shows it in the conversation, then "
                         "writes the CAD code against it.");
                 ImGui::Dummy(ImVec2(0, 4 * sc));
+                ImGui::SeparatorText("Iteration budget");
                 ImGui::TextUnformatted("Refine-pass cap per request");
                 helpMarker("Max iters: how many times the agent may re-build and refine a part in "
                            "one request before it must stop. 0 = automatic — it keeps going until "
                            "the render matches the request (or stabilizes), then stops on its own. "
                            "A small cap (e.g. 3) bounds cost/time on hard parts.");
-                ImGui::SetNextItemWidth(140 * sc);
+                ImGui::SetNextItemWidth(140.0f * sc);
                 ImGui::InputInt("##miters", &settings.maxIters);
                 if (settings.maxIters < 0) settings.maxIters = 0;
                 if (settings.maxIters > 64) settings.maxIters = 64;
                 ImGui::SameLine();
                 dimText("0 = automatic (stops once the render matches)");
                 ImGui::Dummy(ImVec2(0, 6 * sc));
-                ImGui::SeparatorText("System prompt");
+                ImGui::SeparatorText("Prompt override");
                 ImGui::Dummy(ImVec2(0, 2 * sc));
                 ImGui::TextUnformatted("System prompt override");
                 dimText("Leave empty to use the built-in prompt (recommended). A custom "
@@ -420,15 +439,16 @@ void drawSettingsModal(AppState& st, bool busy) {
             settings.systemPrompt = st.spBuf.data();
             saveSettings(settings);
             st.addLog("[ok] saved settings");
-            ImGui::CloseCurrentPopup();
+            s_settingsOpen = false;
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel", ImVec2(100.0f * sc, 34.0f * sc))) {
             std::fill(st.spBuf.begin(), st.spBuf.end(), 0);  // discard edits
             std::strncpy(st.spBuf.data(), settings.systemPrompt.c_str(), st.spBuf.size() - 1);
-            ImGui::CloseCurrentPopup();
+            s_settingsOpen = false;
         }
-        ImGui::EndPopup();
+        }
+        ImGui::End();
     }
 
     // ---------- About modal ----------

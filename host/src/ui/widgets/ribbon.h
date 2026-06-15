@@ -23,7 +23,7 @@ void setRibbonActiveCmd(const char* cmd_id);
 // Begin the ribbon bar: reserves a full-width child window of height ribbonH.
 // Returns the outer height consumed (pass to dockspace as top offset).
 // activeTab: which tab index is selected (in/out).
-float drawRibbon(int& activeTab, bool visible);
+float drawRibbon(int& activeTab, bool visible, bool showSimulationTools = true, bool showPcbTools = true);
 
 // Returns the ribbon height in pixels for layout math.
 float ribbonHeight();

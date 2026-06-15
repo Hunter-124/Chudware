@@ -253,6 +253,9 @@ private:
     void commit(AppState& st);     // OK
     void buildOpFeature(nlohmann::json& feature) const;   // assemble {type,name,params,refs}
     bool applyPreview(AppState& st);  // add (first) or edit_feature; debounced
+    nlohmann::json buildAiAssistPayload(AppState& st) const;
+    void requestAiAssist(AppState& st);
+    void applyAiAssistResult(AppState& st, const nlohmann::json& result, int requestSeq);
     void loadFromTree(AppState& st, const nlohmann::json& feature);  // edit-path populate
     PMField* activeWell();
     // C51: the profile/sections well (first SelectorWell keyed "profile" or "sections").
@@ -297,6 +300,13 @@ private:
     // Replaces the prior-frame, ANY-window ImGui::IsAnyItemActive() read that let Enter in unrelated
     // panels commit the PM.
     bool pmWidgetActivePrevFrame_ = false;
+
+    // Select-with-AI state. Responses are request-sequenced so a late result from a closed or
+    // superseded form cannot patch the wrong command.
+    bool aiBusy_ = false;
+    int aiRequestSeq_ = 0;
+    std::string aiMessage_;
+    std::vector<std::string> aiHighlights_;
 };
 
 }  // namespace ui

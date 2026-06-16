@@ -538,13 +538,19 @@ void add_distance(System& sys, const std::string& cid, const std::string& h0,
 
     if (ax == "h" || ax == "v") {
         int comp = (ax == "h") ? 0 : 1;
+        // Axis-aligned gap: residual = |Delta_comp| + Sum(s*r) - d. The rim
+        // adjustment is applied OUTSIDE the abs (a scalar offset on the gap),
+        // matching the aligned (no-axis) case and the Python oracle
+        // (_add_distance). Applying it per-point inside the abs would give a
+        // different residual whenever a radius variable is free.
         sys.add_residual(
             [av, bv, k0, k1, comp, r0col, r1col, s0, s1, d](const VectorXd& xs) {
                 Vector2d P0 = av(vhead(xs, k0));
                 Vector2d P1 = bv(vseg(xs, k0, k1));
-                double a_ = P0(comp) + (r0col >= 0 ? s0 * xs(r0col) : 0.0);
-                double b_ = P1(comp) + (r1col >= 0 ? s1 * xs(r1col) : 0.0);
-                return r1(std::abs(a_ - b_) - d);
+                double adj = 0.0;
+                if (r0col >= 0) adj += s0 * xs(r0col);
+                if (r1col >= 0) adj += s1 * xs(r1col);
+                return r1(std::abs(P0(comp) - P1(comp)) + adj - d);
             },
             combined,
             [av, bv, aj, bj, k0, k1, kb, comp, r0col, r1col, s0, s1, ncols](
@@ -553,14 +559,13 @@ void add_distance(System& sys, const std::string& cid, const std::string& h0,
                 Vector2d P1 = bv(vseg(xs, k0, k1));
                 MatrixXd J0 = aj(vhead(xs, k0));
                 MatrixXd J1 = bj(vseg(xs, k0, k1));
-                double a_ = P0(comp) + (r0col >= 0 ? s0 * xs(r0col) : 0.0);
-                double b_ = P1(comp) + (r1col >= 0 ? s1 * xs(r1col) : 0.0);
-                double sgn = (a_ - b_) >= 0 ? 1.0 : -1.0;
+                double delta = P0(comp) - P1(comp);
+                double sgn = delta >= 0 ? 1.0 : -1.0;
                 MatrixXd J = MatrixXd::Zero(1, ncols);
                 if (k0) J.block(0, 0, 1, k0) = sgn * J0.row(comp);
                 if (k1) J.block(0, k0, 1, k1) = -sgn * J1.row(comp);
-                if (r0col >= 0) J(0, r0col) = sgn * s0;
-                if (r1col >= 0) J(0, r1col) = -sgn * s1;
+                if (r0col >= 0) J(0, r0col) = s0;
+                if (r1col >= 0) J(0, r1col) = s1;
                 return J;
             },
             cid);

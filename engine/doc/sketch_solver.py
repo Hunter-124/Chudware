@@ -2447,7 +2447,17 @@ def _add_distance(sys, cid, h0, h1, d, entities, var_map, axis=None, cond=None):
             dx = P0[0]-P1[0]; dy = P0[1]-P1[1]
             d = math.hypot(dx, dy)
             if d < 1e-12:
-                return np.zeros((1, kb + len(sgns)))
+                # Coincident centers (e.g. a wall-thickness dim on concentric
+                # circles): the center-to-center direction is 0/0, so the
+                # position columns are undefined. But the rim adjustment's radius
+                # partials (D + s*r - d) are still well-defined and carry the
+                # constraint — keep them live so Newton can satisfy the gap by
+                # changing the radii instead of stranding (same degeneracy class
+                # as BUG-1). Mirrors core/sketch add_distance verbatim.
+                J = np.zeros((1, kb + len(sgns)))
+                for j, s in enumerate(sgns):
+                    J[0, kb + j] = s
+                return J
             dir_ = np.array([dx/d, dy/d])  # (2,)
             J = np.zeros((1, kb + len(sgns)))
             J[0, :k0] = dir_ @ J0

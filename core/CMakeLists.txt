@@ -174,6 +174,7 @@ if(AICAD_WITH_OCCT)
     geom/booleans.cpp
     geom/dress.cpp
     geom/transform.cpp
+    geom/hole.cpp
     geom/aicm.cpp)
   target_include_directories(aicad_geom_occt PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -338,6 +339,34 @@ if(AICAD_WITH_OCCT)
   add_test(NAME mirror COMMAND test_mirror)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(mirror PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- A5: hole feature compiler — drill simple/cbore/csink bores into a body ---
+  # core/doc/document.cpp's hole branch drills hole(s) at position(s) on a FACE-
+  # SELECTOR-resolved planar face, building a cylinder/cbore/csink tool per position
+  # (geom/hole.cpp: make_hole_tool), unioning them, and cutting the union from the
+  # body — the SolidWorks Hole Wizard multi-position behaviour, simplified (no thread
+  # tables / cosmetic threads / grid / sketch positions), ported from
+  # engine/doc/features/hole.py. The test round-trips four hole documents (simple-
+  # through, cbore-through, csink-through, multi-position) through the host AICM loader
+  # (the contract oracle) and asserts analytic, OCCT-version-independent invariants
+  # (face counts incl. the bore cylinder / csink cone, bbox, mesh volume). Same wiring
+  # as test_mirror; aicad_doc carries the OCCT toolkits transitively via aicad_geom_occt.
+  add_executable(test_hole
+    tests/test_hole.cpp)
+  target_include_directories(test_hole PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+  target_link_libraries(test_hole PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_hole PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+  set_target_properties(test_hole PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME hole COMMAND test_hole)
+  # Same OCCT DLL PATH prepend so the test can load TKernel et al.
+  set_tests_properties(hole PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- Wave 2 milestone: the SELECTOR system — stable refs into B-rep topology --
   # core/doc/selectors.{h,cpp} turns picked topology into a geometric fingerprint

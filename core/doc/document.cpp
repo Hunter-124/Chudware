@@ -29,7 +29,12 @@
 #include <Eigen/Dense>
 
 #include <BRepAdaptor_Surface.hxx>
+#include <BRepBndLib.hxx>
+#include <BRepGProp.hxx>
+#include <Bnd_Box.hxx>
+#include <GProp_GProps.hxx>
 #include <GeomAbs_SurfaceType.hxx>
+#include <TopAbs.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
@@ -41,6 +46,7 @@
 #include "geom/booleans.h"
 #include "geom/dress.h"
 #include "geom/features.h"
+#include "geom/hole.h"
 #include "geom/plane.h"
 #include "geom/profile.h"
 #include "geom/tessellate.h"
@@ -529,6 +535,155 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     // consumed, so BOTH survive.
                     results[id] = SolidResult{reflected};
                 }
+                solid_order.push_back(id);
+                st.ok = true;
+
+            } else if (type == "hole") {
+                // Drill simple / cbore / csink hole(s) into a referenced solid at
+                // position(s) on a FACE-SELECTOR-resolved planar face. One tool per
+                // position is built, all unioned, then cut from the body in a single
+                // boolean (one feature, N holes — SolidWorks Hole Wizard, simplified:
+                // no thread tables / cosmetic threads / grid / sketch positions). Port
+                // of engine/doc/features/hole.py's geometry core in the id-ref model.
+                const std::string body_id = req_str(feat, "body");
+                const TopoDS_Shape& body = require_solid(results, body_id, "body");
+
+                // --- resolve the target planar face (a {"kind":"face"} selector) ---
+                auto face_it = feat.find("face");
+                if (face_it == feat.end() || !face_it->is_object())
+                    throw std::runtime_error(
+                        "hole: 'face' selector is required (the planar face to drill into)");
+                aicad::doc::FacePicks fp =
+                    aicad::doc::resolve_face_picks(body, *face_it, "face");
+                if (!fp.dangling.empty()) {
+                    std::string msg = "hole: face selector dangling: ";
+                    for (std::size_t k = 0; k < fp.dangling.size(); ++k) {
+                        if (k) msg += "; ";
+                        msg += fp.dangling[k];
+                    }
+                    throw std::runtime_error(msg);
+                }
+                if (fp.faces.empty())
+                    throw std::runtime_error("hole: target face not resolved");
+                const TopoDS_Face& face = fp.faces[0];
+
+                BRepAdaptor_Surface surf(face);
+                if (surf.GetType() != GeomAbs_Plane)
+                    throw std::runtime_error("hole: target face is not planar");
+                gp_Pln pln = surf.Plane();
+
+                // --- face frame (origin + x/y in-plane + outward normal) ---
+                gp_Pnt o = pln.Location();
+                gp_Dir xd = pln.XAxis().Direction();
+                gp_Dir yd = pln.YAxis().Direction();
+                gp_Dir nd = pln.Axis().Direction();
+                Eigen::Vector3d origin(o.X(), o.Y(), o.Z());
+                Eigen::Vector3d xdir(xd.X(), xd.Y(), xd.Z());
+                Eigen::Vector3d ydir(yd.X(), yd.Y(), yd.Z());
+                Eigen::Vector3d normal(nd.X(), nd.Y(), nd.Z());
+                // OUTWARD-NORMAL CORRECTION: a face stored REVERSED in the solid has its
+                // geometric normal pointing INTO the material, so flip it to point OUT
+                // of the solid. drill_dir then points INTO the material (the watch-point:
+                // get this wrong and the cut removes nothing).
+                if (face.Orientation() == TopAbs_REVERSED) normal = -normal;
+                const Eigen::Vector3d drill_dir = -normal;
+
+                // --- positions: [u,v] face-local mm pairs; default = face centre ---
+                std::vector<std::pair<double, double>> uv;
+                auto pos_it = feat.find("positions");
+                if (pos_it != feat.end() && pos_it->is_array() && !pos_it->empty()) {
+                    for (std::size_t k = 0; k < pos_it->size(); ++k) {
+                        const json& p = (*pos_it)[k];
+                        if (!p.is_array() || p.size() < 2)
+                            throw std::runtime_error(
+                                "hole: positions[" + std::to_string(k) + "] must be [u, v]");
+                        uv.emplace_back(p[0].get<double>(), p[1].get<double>());
+                    }
+                } else {
+                    uv.emplace_back(0.0, 0.0);  // back-compat single hole at face centre
+                }
+
+                // --- style ---
+                const std::string style_s = feat.value("style", std::string("simple"));
+                ::geom::HoleStyle style;
+                if (style_s == "simple")      style = ::geom::HoleStyle::Simple;
+                else if (style_s == "cbore")  style = ::geom::HoleStyle::Cbore;
+                else if (style_s == "csink")  style = ::geom::HoleStyle::Csink;
+                else throw std::runtime_error("hole: unknown style '" + style_s + "'");
+
+                // --- dims ---
+                ::geom::HoleDims dims;
+                dims.diameter = num_or_expr(feat.at("diameter"), env);
+                if (!(dims.diameter > 0.0))
+                    throw std::runtime_error("hole: diameter must be > 0");
+                if (style == ::geom::HoleStyle::Cbore) {
+                    dims.cbore_d = num_or_expr(feat.at("cbore_d"), env);
+                    dims.cbore_depth = num_or_expr(feat.at("cbore_depth"), env);
+                    if (!(dims.cbore_d > dims.diameter))
+                        throw std::runtime_error("hole: cbore_d must be larger than diameter");
+                    if (!(dims.cbore_depth > 0.0))
+                        throw std::runtime_error("hole: cbore_depth must be > 0");
+                } else if (style == ::geom::HoleStyle::Csink) {
+                    dims.csink_d = num_or_expr(feat.at("csink_d"), env);
+                    dims.csink_angle_deg = feat.contains("csink_angle")
+                        ? num_or_expr(feat.at("csink_angle"), env) : 90.0;
+                    if (!(dims.csink_d > dims.diameter))
+                        throw std::runtime_error("hole: csink_d must be larger than diameter");
+                    if (!(dims.csink_angle_deg > 0.0 && dims.csink_angle_deg < 180.0))
+                        throw std::runtime_error("hole: csink_angle must be in (0, 180)");
+                }
+
+                // --- end condition -> shaft depth ---
+                const std::string end = feat.value("end", std::string("through_all"));
+                double depth;
+                if (end == "through_all") {
+                    // Over-length so the bore fully penetrates; the cut only removes the
+                    // in-body part, so over-length is harmless.
+                    depth = aicad::doc::bbox_diag(body) * 1.1;
+                } else if (end == "blind") {
+                    depth = num_or_expr(feat.at("depth"), env);
+                    if (!(depth > 0.0))
+                        throw std::runtime_error("hole: blind depth must be > 0");
+                } else {
+                    throw std::runtime_error("hole: unknown end '" + end + "'");
+                }
+
+                // --- build every position's tool, union into one, then cut ---
+                const double lift = 0.05;  // tool mouth sits just above the face
+                ::geom::HoleDims tool_dims = dims;
+                tool_dims.depth = depth + lift;
+
+                TopoDS_Shape tool_union;
+                for (const auto& p : uv) {
+                    Eigen::Vector3d world = origin + p.first * xdir + p.second * ydir;
+                    Eigen::Vector3d lifted = world + lift * normal;  // just above the face
+                    TopoDS_Shape t =
+                        ::geom::make_hole_tool(lifted, drill_dir, style, tool_dims);
+                    if (t.IsNull())
+                        throw std::runtime_error("hole: failed to build a hole tool");
+                    tool_union = tool_union.IsNull() ? t : ::geom::fuse(tool_union, t);
+                    if (tool_union.IsNull())
+                        throw std::runtime_error("hole: tool union (fuse) failed");
+                }
+
+                TopoDS_Shape out = ::geom::cut(body, tool_union);
+                if (out.IsNull())
+                    throw std::runtime_error("hole: boolean cut produced an empty shape");
+
+                // MATERIAL-REMOVED GUARD (mirror hole.py): a cut that removed nothing
+                // means the positions miss the face/body or the drill went the wrong
+                // way — surface it as a clear per-feature error, not a silent no-op.
+                GProp_GProps gp_before, gp_after;
+                BRepGProp::VolumeProperties(body, gp_before);
+                BRepGProp::VolumeProperties(out, gp_after);
+                if (std::abs(gp_after.Mass() - gp_before.Mass()) < 1e-9)
+                    throw std::runtime_error(
+                        "hole removed no material (positions may fall outside the face/body)");
+
+                // The drilled solid REPLACES the body (SolidWorks-style): the bored
+                // solid is the body's new current state in the tree.
+                consumed.insert(body_id);
+                results[id] = SolidResult{out};
                 solid_order.push_back(id);
                 st.ok = true;
 

@@ -163,17 +163,25 @@ if(AICAD_WITH_OCCT)
   set_tests_properties(occt_smoke PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- Wave 2 geom kernel: OCCT tessellation -> AICM emitter -----------------
-  # tessellate.cpp + features.cpp (OCCT) on top of the OCCT-free aicm.cpp writer.
+  # tessellate.cpp + features.cpp + profile.cpp (OCCT) on top of the OCCT-free
+  # aicm.cpp writer. profile.cpp compiles solved sketches (nlohmann::json) into
+  # planar faces (lifted via aicad_geom's SketchPlane), so this lib now also links
+  # aicad_geom (SketchPlane/Eigen) and nlohmann_json.
   add_library(aicad_geom_occt STATIC
     geom/tessellate.cpp
     geom/features.cpp
+    geom/profile.cpp
     geom/aicm.cpp)
   target_include_directories(aicad_geom_occt PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
-  # Modelling toolkits for box/prism (TKPrim), polygon->face->wire (TKBRep/TKTopAlgo),
-  # adaptors + GCPnts (TKGeomBase/TKGeomAlgo), mesh (TKMesh), healing (TKShHealing).
+  # Modelling toolkits for box/prism (TKPrim), revolve (TKPrim), polygon->face->wire
+  # (TKBRep/TKTopAlgo), adaptors + GC_MakeArcOfCircle (TKGeomBase/TKGeomAlgo), mesh
+  # (TKMesh), healing (TKShHealing). aicad_geom brings SketchPlane + Eigen3::Eigen;
+  # nlohmann_json for the solved-entity dicts profile.cpp consumes.
   target_link_libraries(aicad_geom_occt PUBLIC
+    aicad_geom
+    nlohmann_json::nlohmann_json
     TKernel TKMath TKG2d TKG3d TKGeomBase TKGeomAlgo
     TKBRep TKTopAlgo TKPrim TKMesh TKShHealing)
 
@@ -195,4 +203,26 @@ if(AICAD_WITH_OCCT)
   add_test(NAME geom_aicm COMMAND test_geom_aicm)
   # Same OCCT DLL PATH prepend as occt_smoke so the test can load TKernel et al.
   set_tests_properties(geom_aicm PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- Wave 2 milestone: solved sketch -> profile -> extrude/revolve ---------
+  # End-to-end: aicad::sketch::solve_sketch -> faces_from_solved_sketch ->
+  # extrude_face/revolve_face -> tessellate -> write_aicm -> HOST render::parseAicm.
+  # Links aicad_sketch for solve_sketch (aicad_geom_occt already brings the geom
+  # kernel + aicad_geom + nlohmann_json transitively).
+  add_executable(test_profile_extrude
+    tests/test_profile_extrude.cpp)
+  target_include_directories(test_profile_extrude PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+  target_link_libraries(test_profile_extrude PRIVATE
+    aicad_geom_occt aicad_sketch aicad_geom)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_profile_extrude PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+  set_target_properties(test_profile_extrude PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME profile_extrude COMMAND test_profile_extrude)
+  # Same OCCT DLL PATH prepend so the test can load TKernel et al.
+  set_tests_properties(profile_extrude PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 endif()

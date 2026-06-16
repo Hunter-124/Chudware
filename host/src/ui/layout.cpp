@@ -262,11 +262,10 @@ void drawLeftPane(AppState& st,
     }
     ImGui::EndChild();
 
-    // Breathing room between the icon rail and the body content so the FeatureManager block sits
-    // away from the Explorer/FeatureManager/PropertyManager/Configurations rail instead of crowding
-    // it. (Left gap only — the body itself fills to the right edge, see below.)
-    const float bodyInset = 12.0f * S;
-    ImGui::SameLine(0, bodyInset);
+    // Body sits flush against the rail; the symmetric WindowPadding pushed below supplies EQUAL
+    // breathing room on both sides (gap from the rail == gap from the panel's right edge) so every
+    // manager tab is evenly spaced instead of crowding the rail or leaning toward the right edge.
+    ImGui::SameLine(0, 0);
 
     // ---- active tab body ----
     const char* title = "Feature Manager";
@@ -282,10 +281,21 @@ void drawLeftPane(AppState& st,
         titleIcon = "settings";
     }
 
-    // Body fills to the panel's right edge (scrollbar flush with the edge — no dead space past it).
-    // The left gap from the rail (bodyInset via SameLine) supplies the breathing room; the header
-    // is still centered at the panel's TRUE center below, independent of the body width.
-    ImGui::BeginChild("##lp_body", ImVec2(0, 0), ImGuiChildFlags_None);
+    // Equal left/right margins via symmetric WindowPadding + a slim scrollbar. When the form
+    // overflows, ImGui reserves a vertical scrollbar on the right, which would make the right gap
+    // (padding + scrollbar) wider than the left (padding) — exactly the lopsided look on the tall
+    // Extrude PropertyManager. We mirror it by indenting the content by the scrollbar width while
+    // scrolling, so the gap from the rail equals the gap from the panel edge in BOTH states.
+    // s_bodyScrolled samples last frame's scroll state (queried just before EndChild).
+    static bool s_bodyScrolled = false;
+    const float bodyPad = 12.0f * S;
+    const float sbSize  = 8.0f * S;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(bodyPad, ImGui::GetStyle().WindowPadding.y));
+    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, sbSize);
+    ImGui::BeginChild("##lp_body", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
+    const bool bodyIndented = s_bodyScrolled;
+    if (bodyIndented) ImGui::Indent(sbSize);   // balance the right-side scrollbar gutter
     IconUV headIcon = getIcon(titleIcon, 20);
     const float iconSz = headIcon.valid ? 20.0f * S : 0.0f;
     const float iconGap = headIcon.valid ? 6.0f * S : 0.0f;
@@ -331,7 +341,10 @@ void drawLeftPane(AppState& st,
             drawFeatureTreeBody(st, editCallback);
             break;
     }
+    s_bodyScrolled = ImGui::GetScrollMaxY() > 0.0f;   // remembered for next frame's indent balance
+    if (bodyIndented) ImGui::Unindent(sbSize);
     ImGui::EndChild();
+    ImGui::PopStyleVar(2);   // WindowPadding + ScrollbarSize pushed before the body child
 
     ImGui::End();
 }

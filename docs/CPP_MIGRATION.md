@@ -75,7 +75,8 @@ number of non-matching fixtures (0 = full parity), so it doubles as a CI gate.
 & "$env:APPDATA\AI-CAD\runtime\venv\Scripts\python.exe" tools\cpp_parity.py
 ```
 
-Current: **3/3** (box, cylinder, washer — sketch→extrude on canonical input).
+Current: **24/24** — the full common solid-modeling feature set on canonical host
+input, gated on exact BRep volume (see the DONE table below).
 
 ## Feature parity gap list (C++ core vs Python `engine/doc`)
 
@@ -84,34 +85,48 @@ subset** with **id-string refs** (not the full selector objects the host sends f
 Instant3D drag / assembly). Cutover order is roughly Tier A → B; ECAD / sim / agent
 (Tiers B/C) are later epics.
 
+**Solid-modeling features: DONE — 24/24 geometric parity** (`tools/cpp_parity.py`,
+exact BRep-volume gate, on canonical host input):
+
 | Feature / subsystem        | Python                                  | C++ core            | Status |
 |----------------------------|------------------------------------------|---------------------|--------|
-| sketch → extrude           | `features/extrude.py`                     | `geom/features.cpp` | ported (subset: depth/mid-plane; no start/end modes, thin, taper, dir-2) |
-| sketch → revolve           | `features/revolve.py`                     | `geom/features.cpp` | ported (subset: angle; no thin) |
-| boolean fuse/cut/common    | `features/boolean.py`                     | `geom/booleans.cpp` | ported |
-| fillet / chamfer           | `features/dress.py`                       | `geom/dress.cpp` + `doc/picks.cpp` | ported (edge selector + dir filter) |
-| linear / circular pattern  | `features/pattern.py`                     | `geom/transform.cpp`| ported (geometry-pattern, id-ref) |
-| mirror                     | `features/pattern.py` / mirror            | `geom/transform.cpp`| ported |
-| hole (simple/cbore/csink)  | `features/hole.py`                        | `geom/hole.cpp`     | ported (subset: no thread tables / cosmetic threads / grid / sketch positions) |
-| selectors (B-rep refs)     | `selectors.py`                            | `doc/selectors.cpp` | ported (resolve §3; `resolve_region` NOT ported) |
-| **loft**                   | `features/loft.py`                        | —                   | TODO |
-| **sweep**                  | `features/sweep.py`                       | —                   | TODO |
-| **rib**                    | `features/rib.py`                         | —                   | TODO |
-| **draft**                  | `features/draft.py`                       | —                   | TODO |
-| **shell / thicken**        | `features/surf_thicken.py` etc.           | —                   | TODO |
-| **sheet metal**            | `features/sheetmetal*.py`                 | —                   | TODO |
-| **surfacing (12 ops)**     | `features/surf_*.py`                       | —                   | TODO |
-| **datums / curves**        | `features/datum.py`, `curves.py`          | —                   | TODO |
-| **primitives**             | `features/primitives.py`                  | partial (box)       | TODO |
-| **split / import / weldment** | `features/{split,import_feature,weldment}.py` | —             | TODO |
-| **doc session / ops / undo** | `doc/session.py`, `document.py`         | —                   | TODO (needed before `doc_apply_ops`/`doc_new` cut over) |
-| **equations.evaluate (full)** | `doc/{equations,evaluate}.py`          | `util/expr.cpp` (subset) | partial |
-| **tessellate**             | `doc/tessellate.py`                       | `geom/tessellate.cpp` | ported |
-| **drawing / dxf / pdf / stepplus** | `doc/{drawing,dxf,pdfvec,stepplus}.py` | —              | TODO |
-| **formats (STEP/IGES/STL/…)** | `doc/formats.py`                       | —                   | TODO |
-| **ECAD (full)**            | `engine/ecad/*`                           | —                   | TODO (epic) |
-| **sim (FEA/CFD/SPICE)**    | `engine/sim/*`                            | —                   | TODO (epic; CUDA) |
-| **agent / MCP / providers**| `agent/*`, `mcp_server/*`                 | —                   | TODO (epic; needs C++ LLM client) |
+| primitives box/cyl/sphere/cone/torus | `features/primitives.py`        | `geom/features.cpp` | DONE (centered; `at` placement deferred) |
+| sketch → extrude (boss/cut)| `features/extrude.py`                     | `geom/features.cpp` | DONE (blind/through_all/mid_plane; thin/taper/dir-2 deferred) |
+| sketch → revolve           | `features/revolve.py`                     | `geom/features.cpp` | DONE (angle/axis datum; thin deferred) |
+| sweep                      | `features/sweep.py`                       | `geom/features.cpp` | DONE (MakePipe path; guides/twist/thin deferred) |
+| loft                       | `features/loft.py`                        | `geom/features.cpp` | DONE (ThruSections; guides/centerline deferred) |
+| rib                        | `features/rib.py`                         | `geom/features.cpp` | DONE (parallel/centered; normal-mode/draft deferred) |
+| boolean fuse/cut/common    | `features/boolean.py`                     | `geom/booleans.cpp` | DONE |
+| fillet / chamfer           | `features/dress.py`                       | `geom/dress.cpp` + `doc/picks.cpp` | DONE (edge selector) |
+| shell                      | `features/dress.py` (shell)               | `geom/dress.cpp`    | DONE (remove-faces; thickness overrides deferred) |
+| draft                      | `features/draft.py`                       | `geom/dress.cpp`    | DONE (neutral-plane mode; parting_line/step deferred) |
+| hole (simple/cbore/csink)  | `features/hole.py`                        | `geom/hole.cpp`     | DONE (no threads/grid/sketch-positions) |
+| linear / circular pattern  | `features/pattern.py`                     | `geom/transform.cpp`| DONE (geometry-pattern; cut-seed op deferred) |
+| mirror                     | `features/pattern.py` mirror              | `geom/transform.cpp`| DONE (datum/face plane) |
+| datum plane (offset)       | `features/datum.py`                       | `doc/document.cpp`  | DONE (offset method; 3-pt/angled deferred) |
+| selectors (B-rep refs)     | `selectors.py`                            | `doc/selectors.cpp` | DONE (resolve §3; `resolve_region` deferred) |
+| tessellate                 | `doc/tessellate.py`                       | `geom/tessellate.cpp` | DONE |
+
+**Remaining (the larger epics — not yet started):**
+
+| Feature / subsystem        | Python                                  | Status |
+|----------------------------|------------------------------------------|--------|
+| **doc session / ops / undo** | `doc/session.py`, `document.py`         | TODO — the stateful layer needed before `doc_new`/`doc_apply_ops`/`doc_undo` cut over (today only the diagnostic `doc_compile_cpp` recompile path exists) |
+| **sheet metal**            | `features/sheetmetal*.py`                 | TODO (epic) |
+| **surfacing (12 ops)**     | `features/surf_*.py`                       | TODO (epic) |
+| **datums / curves (rest)** | `features/datum.py`, `curves.py`          | TODO (axis/point/csys/3-pt plane, projected curves) |
+| **split / import / weldment** | `features/{split,import_feature,weldment}.py` | TODO |
+| **equations.evaluate (full)** | `doc/{equations,evaluate}.py`          | partial (`util/expr.cpp`) |
+| **drawing / dxf / pdf / stepplus** | `doc/{drawing,dxf,pdfvec,stepplus}.py` | TODO |
+| **formats (STEP/IGES/STL/…)** | `doc/formats.py`                       | TODO |
+| **ECAD (full)**            | `engine/ecad/*`                           | TODO (epic) |
+| **sim (FEA/CFD/SPICE)**    | `engine/sim/*`                            | TODO (epic; CUDA) |
+| **agent / MCP / providers**| `agent/*`, `mcp_server/*`                 | TODO (epic; needs C++ LLM client) |
+
+**Cutover note:** the C++ core now MATCHES on the solid-feature recompile, but
+production routing still requires the doc session/ops/undo layer (so `doc_apply_ops`
+can be served in-process). That layer is the next cutover prerequisite; until then
+the strangler runs in diagnostic/parity mode.
 
 ## Build / test quick ref
 

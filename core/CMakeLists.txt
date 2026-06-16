@@ -171,19 +171,22 @@ if(AICAD_WITH_OCCT)
     geom/tessellate.cpp
     geom/features.cpp
     geom/profile.cpp
+    geom/booleans.cpp
+    geom/dress.cpp
     geom/aicm.cpp)
   target_include_directories(aicad_geom_occt PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   # Modelling toolkits for box/prism (TKPrim), revolve (TKPrim), polygon->face->wire
   # (TKBRep/TKTopAlgo), adaptors + GC_MakeArcOfCircle (TKGeomBase/TKGeomAlgo), mesh
-  # (TKMesh), healing (TKShHealing). aicad_geom brings SketchPlane + Eigen3::Eigen;
-  # nlohmann_json for the solved-entity dicts profile.cpp consumes.
+  # (TKMesh), healing (TKShHealing). booleans.cpp adds Fuse/Cut/Common (TKBO) and
+  # dress.cpp adds MakeFillet/MakeChamfer (TKFillet). aicad_geom brings SketchPlane +
+  # Eigen3::Eigen; nlohmann_json for the solved-entity dicts profile.cpp consumes.
   target_link_libraries(aicad_geom_occt PUBLIC
     aicad_geom
     nlohmann_json::nlohmann_json
     TKernel TKMath TKG2d TKG3d TKGeomBase TKGeomAlgo
-    TKBRep TKTopAlgo TKPrim TKMesh TKShHealing)
+    TKBRep TKTopAlgo TKPrim TKMesh TKShHealing TKBO TKFillet)
 
   # Verification: tessellate -> write_aicm -> HOST render::parseAicm round-trip.
   add_executable(test_geom_aicm
@@ -225,4 +228,25 @@ if(AICAD_WITH_OCCT)
   add_test(NAME profile_extrude COMMAND test_profile_extrude)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(profile_extrude PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- Wave 2 milestone: boolean + dress-up ops compose into real parts ------
+  # End-to-end: make_box/extrude_face base -> fuse/cut/common (booleans.h) +
+  # fillet/chamfer (dress.h) -> tessellate -> write_aicm -> HOST render::parseAicm.
+  # Same wiring as test_profile_extrude (aicad_geom_occt now carries TKBO/TKFillet).
+  add_executable(test_ops
+    tests/test_ops.cpp)
+  target_include_directories(test_ops PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+  target_link_libraries(test_ops PRIVATE
+    aicad_geom_occt aicad_sketch aicad_geom)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_ops PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+  set_target_properties(test_ops PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME ops COMMAND test_ops)
+  # Same OCCT DLL PATH prepend so the test can load TKernel et al.
+  set_tests_properties(ops PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 endif()

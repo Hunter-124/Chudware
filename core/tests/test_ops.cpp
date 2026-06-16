@@ -1,0 +1,341 @@
+// Wave 2 milestone verification: the modeling OPERATIONS that turn single profiles
+// into real multi-feature parts — boolean fuse/cut/common (geom/booleans.h) and
+// dress-up fillet/chamfer (geom/dress.h) — composed and round-tripped through the
+// HOST loader (host/src/render/aicm_loader = the contract oracle).
+//
+// It follows the EXACT round-trip pattern of test_profile_extrude.cpp: build a base
+// shape with geom::make_box / geom::extrude_face, apply an op, tessellate -> AICM ->
+// render::parseAicm, then assert TIGHT, ANALYTIC, OCCT-version-INDEPENDENT invariants:
+// the exact solid volume (BRepGProp) the op must produce, plus the surf_type face
+// stats that prove the new geometry (hole walls, fillet cylinders, chamfer planes)
+// physically exists. The assertions ARE the product, in the SolidWorks-parity
+// discipline of the rewrite — they are NOT weakened to pass.
+//
+// Case 6 is the payoff: extrude a base block, CUT a through-hole, then FILLET the
+// outer vertical edges — three ops composing into one part with both the hole's
+// cylinder face and the fillet cylinder faces present in the final tessellation.
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest/doctest.h>
+
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
+
+#include <BRepBuilderAPI_Transform.hxx>
+#include <BRepGProp.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
+#include <GProp_GProps.hxx>
+#include <TopoDS_Face.hxx>
+#include <TopoDS_Shape.hxx>
+#include <gp_Ax2.hxx>
+#include <gp_Dir.hxx>
+#include <gp_Pnt.hxx>
+#include <gp_Trsf.hxx>
+#include <gp_Vec.hxx>
+
+#include "geom/aicm.h"
+#include "geom/booleans.h"
+#include "geom/dress.h"
+#include "geom/features.h"
+#include "geom/tessellate.h"
+#include "aicm_loader.h"  // host loader (host/src/render on the include path)
+
+namespace {
+
+// ---- round-trip helper (identical contract to test_profile_extrude.cpp) -----
+struct Loaded {
+    render::DocMesh doc;
+    std::vector<uint8_t> bytes;
+};
+
+Loaded roundtrip(const TopoDS_Shape& shape, const std::string& name,
+                 const float color[3]) {
+    aicm::AicmBody body = geom::tessellate_body(shape, 1, name, color);
+    std::vector<aicm::AicmBody> bodies{body};
+    std::vector<uint8_t> bytes = aicm::write_aicm(bodies);
+
+    render::DocMesh doc;
+    std::string err;
+    bool ok = render::parseAicm(bytes.data(), bytes.size(), doc, err);
+    REQUIRE_MESSAGE(ok, "host loader rejected AICM: " << err);
+    return {std::move(doc), std::move(bytes)};
+}
+
+void check_common(const render::BodyMesh& b) {
+    CHECK(b.pos.size() == 3ull * b.n_verts);
+    CHECK(b.nrm.size() == 3ull * b.n_verts);
+    CHECK(b.idx.size() == 3ull * b.n_tris);
+    for (uint32_t i : b.idx) CHECK(i < b.n_verts);
+    uint32_t running = 0;
+    for (const render::FaceRange& f : b.faces) {
+        CHECK(f.first_tri == running);
+        running += f.tri_count;
+    }
+    CHECK(running == b.n_tris);
+    const uint32_t total_pts = static_cast<uint32_t>(b.edge_pts.size() / 3);
+    for (const render::EdgeSegment& e : b.edges) {
+        CHECK(e.first_pt + e.pt_count <= total_pts);
+    }
+}
+
+void bbox(const render::BodyMesh& b, double lo[3], double hi[3]) {
+    for (int k = 0; k < 3; ++k) {
+        lo[k] = std::numeric_limits<double>::max();
+        hi[k] = -std::numeric_limits<double>::max();
+    }
+    for (uint32_t v = 0; v < b.n_verts; ++v) {
+        for (int k = 0; k < 3; ++k) {
+            double c = b.pos[3ull * v + k];
+            if (c < lo[k]) lo[k] = c;
+            if (c > hi[k]) hi[k] = c;
+        }
+    }
+}
+
+double solid_volume(const TopoDS_Shape& s) {
+    GProp_GProps p;
+    BRepGProp::VolumeProperties(s, p);
+    return p.Mass();
+}
+
+int count_surf(const render::BodyMesh& b, uint8_t surf_type) {
+    int n = 0;
+    for (const render::FaceRange& f : b.faces)
+        if (f.surf_type == surf_type) ++n;
+    return n;
+}
+
+// Translate a shape by (dx,dy,dz) — used to position the second box / the cut cylinder.
+TopoDS_Shape translated(const TopoDS_Shape& s, double dx, double dy, double dz) {
+    gp_Trsf t;
+    t.SetTranslation(gp_Vec(dx, dy, dz));
+    return BRepBuilderAPI_Transform(s, t, true).Shape();
+}
+
+// A cylinder of radius `r`, length `h`, with its base centre at `base` and its axis
+// along +Z (BRepPrimAPI_MakeCylinder on a gp_Ax2). Used as the cut tool for through
+// holes — precise axis control is easier here than lifting a solved circle, and the
+// spec explicitly allows BRepPrimAPI_MakeCylinder for the boolean cases.
+TopoDS_Shape cylinder_z(const gp_Pnt& base, double r, double h) {
+    gp_Ax2 ax(base, gp_Dir(0.0, 0.0, 1.0));
+    return BRepPrimAPI_MakeCylinder(ax, r, h).Shape();
+}
+
+constexpr double PI = 3.14159265358979323846;
+
+}  // namespace
+
+// 1. FUSE two overlapping boxes. Box A: 20x20x20 at the origin. Box B: 20x20x20
+//    translated by (+10,+10,+10) -> the two overlap in a 10x10x10 cube. The union
+//    volume must be V_A + V_B - V_overlap = 8000 + 8000 - 1000 = 15000, and the
+//    result must be a SINGLE solid (one shell -> a connected body).
+TEST_CASE("fuse: two overlapping boxes -> union volume, single solid") {
+    const double S = 20.0, OFF = 10.0;
+    TopoDS_Shape a = geom::make_box(S, S, S);
+    TopoDS_Shape b = translated(geom::make_box(S, S, S), OFF, OFF, OFF);
+
+    TopoDS_Shape u = geom::fuse(a, b);
+    REQUIRE_FALSE(u.IsNull());
+
+    const float color[3] = {0.71f, 0.76f, 0.82f};
+    Loaded ld = roundtrip(u, "Fuse", color);
+    REQUIRE(ld.doc.bodies.size() == 1);
+    const render::BodyMesh& bm = ld.doc.bodies[0];
+    check_common(bm);
+
+    const double overlap = OFF * OFF * OFF;                    // 10x10x10 = 1000
+    const double expected = S * S * S + S * S * S - overlap;   // 15000
+    const double vol = solid_volume(u);
+    double lo[3], hi[3];
+    bbox(bm, lo, hi);
+    MESSAGE("fuse: faces=" << bm.faces.size() << " planar=" << count_surf(bm, 0)
+            << " volume=" << vol << " (expected " << expected << ")"
+            << " bbox=" << (hi[0]-lo[0]) << "x" << (hi[1]-lo[1]) << "x" << (hi[2]-lo[2]));
+
+    CHECK(vol == doctest::Approx(expected).epsilon(1e-3));
+    // The union of two overlapping boxes is one connected solid: an L-shaped step
+    // block, all-planar, with the staircase union bbox spanning 0..(S+OFF) on each axis.
+    for (const render::FaceRange& f : bm.faces) CHECK(f.surf_type == 0);  // all planar
+    CHECK((hi[0] - lo[0]) == doctest::Approx(S + OFF).epsilon(1e-4));
+    CHECK((hi[1] - lo[1]) == doctest::Approx(S + OFF).epsilon(1e-4));
+    CHECK((hi[2] - lo[2]) == doctest::Approx(S + OFF).epsilon(1e-4));
+}
+
+// 2. CUT a box minus a fully-penetrating cylinder -> a drilled block. Box 30x30x20 at
+//    the origin; cylinder r=6, axis +Z through the centre, length 20 (flush through the
+//    top & bottom faces). Volume = box - pi r^2 h = 30*30*20 - pi*36*20. The hole wall
+//    must appear as a cylindrical face (surf_type==1) in the tessellation.
+TEST_CASE("cut: box minus a through-cylinder -> drilled hole, cyl wall present") {
+    const double W = 30.0, H = 30.0, D = 20.0, R = 6.0;
+    TopoDS_Shape box = geom::make_box(W, H, D);
+    // Base at the box's centre on the bottom face; full depth D so it exits the top.
+    TopoDS_Shape drill = cylinder_z(gp_Pnt(W / 2, H / 2, 0.0), R, D);
+
+    TopoDS_Shape part = geom::cut(box, drill);
+    REQUIRE_FALSE(part.IsNull());
+
+    const float color[3] = {0.6f, 0.6f, 0.6f};
+    Loaded ld = roundtrip(part, "Cut", color);
+    REQUIRE(ld.doc.bodies.size() == 1);
+    const render::BodyMesh& bm = ld.doc.bodies[0];
+    check_common(bm);
+
+    const double expected = W * H * D - PI * R * R * D;
+    const double vol = solid_volume(part);
+    MESSAGE("cut: faces=" << bm.faces.size() << " cylinder=" << count_surf(bm, 1)
+            << " planar=" << count_surf(bm, 0)
+            << " volume=" << vol << " (expected " << expected << ")");
+
+    CHECK(vol == doctest::Approx(expected).epsilon(1e-3));
+    CHECK(count_surf(bm, 1) >= 1);  // the cylindrical hole wall
+    CHECK(count_surf(bm, 0) >= 6);  // the box's 6 planar faces survive (2 with a hole)
+}
+
+// 3. COMMON of two overlapping boxes -> exactly the shared volume. Same geometry as
+//    case 1 (A at origin, B at +10,+10,+10), so the intersection is precisely the
+//    10x10x10 overlap cube: volume = 1000, a 6-plane box spanning 10..20 on each axis.
+TEST_CASE("common: two overlapping boxes -> exact overlap cube") {
+    const double S = 20.0, OFF = 10.0;
+    TopoDS_Shape a = geom::make_box(S, S, S);
+    TopoDS_Shape b = translated(geom::make_box(S, S, S), OFF, OFF, OFF);
+
+    TopoDS_Shape x = geom::common(a, b);
+    REQUIRE_FALSE(x.IsNull());
+
+    const float color[3] = {0.5f, 0.55f, 0.6f};
+    Loaded ld = roundtrip(x, "Common", color);
+    REQUIRE(ld.doc.bodies.size() == 1);
+    const render::BodyMesh& bm = ld.doc.bodies[0];
+    check_common(bm);
+
+    const double expected = OFF * OFF * OFF;  // 10x10x10 = 1000
+    const double vol = solid_volume(x);
+    double lo[3], hi[3];
+    bbox(bm, lo, hi);
+    MESSAGE("common: faces=" << bm.faces.size() << " planar=" << count_surf(bm, 0)
+            << " volume=" << vol << " (expected " << expected << ")"
+            << " bbox=" << (hi[0]-lo[0]) << "x" << (hi[1]-lo[1]) << "x" << (hi[2]-lo[2]));
+
+    CHECK(vol == doctest::Approx(expected).epsilon(1e-4));
+    // The intersection is an axis-aligned cube: 6 planar faces, OFF on a side.
+    CHECK(bm.faces.size() == 6);
+    for (const render::FaceRange& f : bm.faces) CHECK(f.surf_type == 0);
+    CHECK((hi[0] - lo[0]) == doctest::Approx(OFF).epsilon(1e-4));
+    CHECK((hi[1] - lo[1]) == doctest::Approx(OFF).epsilon(1e-4));
+    CHECK((hi[2] - lo[2]) == doctest::Approx(OFF).epsilon(1e-4));
+}
+
+// 4. FILLET the 4 vertical edges of a box (dir=+Z) by radius r. Each vertical edge
+//    becomes a quarter-cylinder, replacing a square corner column (side r, area r^2)
+//    with a quarter-disc (area pi r^2 / 4). The 4 corners together remove
+//    (4 - pi) r^2 of cross-section over the full depth D: volume = W*H*D - (4-pi) r^2 D.
+//    The round must introduce >= 4 cylindrical faces (one per filleted edge).
+TEST_CASE("fillet: 4 vertical box edges -> rounded corners, cyl faces present") {
+    const double W = 40.0, H = 30.0, D = 20.0, R = 5.0;  // R well under H/2, W/2
+    TopoDS_Shape box = geom::make_box(W, H, D);
+
+    TopoDS_Shape part = geom::fillet_edges(box, R, Eigen::Vector3d(0, 0, 1));
+    REQUIRE_FALSE(part.IsNull());
+
+    const float color[3] = {0.4f, 0.5f, 0.6f};
+    Loaded ld = roundtrip(part, "Fillet", color);
+    REQUIRE(ld.doc.bodies.size() == 1);
+    const render::BodyMesh& bm = ld.doc.bodies[0];
+    check_common(bm);
+
+    const double expected = W * H * D - (4.0 - PI) * R * R * D;
+    const double vol = solid_volume(part);
+    double lo[3], hi[3];
+    bbox(bm, lo, hi);
+    MESSAGE("fillet: faces=" << bm.faces.size() << " cylinder=" << count_surf(bm, 1)
+            << " planar=" << count_surf(bm, 0)
+            << " volume=" << vol << " (expected " << expected << ")"
+            << " bbox=" << (hi[0]-lo[0]) << "x" << (hi[1]-lo[1]) << "x" << (hi[2]-lo[2]));
+
+    CHECK(vol == doctest::Approx(expected).epsilon(1e-3));
+    CHECK(count_surf(bm, 1) >= 4);  // 4 quarter-cylinder corner faces
+    // Rounding stays within the original box bbox (corners removed, extents unchanged).
+    CHECK((hi[0] - lo[0]) == doctest::Approx(W).epsilon(1e-4));
+    CHECK((hi[1] - lo[1]) == doctest::Approx(H).epsilon(1e-4));
+    CHECK((hi[2] - lo[2]) == doctest::Approx(D).epsilon(1e-4));
+}
+
+// 5. CHAMFER the 4 vertical edges of a box (dir=+Z) by setback d. Each vertical edge
+//    loses a right-triangular prism of cross-section 1/2 d^2; 4 corners remove 2 d^2
+//    over the depth D: volume = W*H*D - 2 d^2 D. The bevel must introduce new PLANAR
+//    faces (one per chamfered edge) so the face count exceeds the plain box's 6.
+TEST_CASE("chamfer: 4 vertical box edges -> beveled corners, extra planar faces") {
+    const double W = 40.0, H = 30.0, D = 20.0, DD = 5.0;
+    TopoDS_Shape box = geom::make_box(W, H, D);
+
+    TopoDS_Shape part = geom::chamfer_edges(box, DD, Eigen::Vector3d(0, 0, 1));
+    REQUIRE_FALSE(part.IsNull());
+
+    const float color[3] = {0.55f, 0.5f, 0.45f};
+    Loaded ld = roundtrip(part, "Chamfer", color);
+    REQUIRE(ld.doc.bodies.size() == 1);
+    const render::BodyMesh& bm = ld.doc.bodies[0];
+    check_common(bm);
+
+    const double expected = W * H * D - 2.0 * DD * DD * D;
+    const double vol = solid_volume(part);
+    MESSAGE("chamfer: faces=" << bm.faces.size() << " planar=" << count_surf(bm, 0)
+            << " cylinder=" << count_surf(bm, 1)
+            << " volume=" << vol << " (expected " << expected << ")");
+
+    CHECK(vol == doctest::Approx(expected).epsilon(1e-3));
+    // A chamfer is all-planar; the 4 new bevel facets push the face count above 6.
+    CHECK(bm.faces.size() > 6);
+    CHECK(count_surf(bm, 0) >= 10);  // 6 box faces (4 truncated) + 4 bevel facets
+    CHECK(count_surf(bm, 1) == 0);   // no curved faces from a chamfer
+}
+
+// 6. COMPOSED MULTI-FEATURE PART (the payoff). Build a base block, CUT a through-hole
+//    (a bore), then FILLET the outer vertical edges. This proves the ops COMPOSE into a
+//    real part: the final volume = box - pi r_hole^2 D - (4 - pi) r_fillet^2 D, and the
+//    tessellation carries BOTH the hole's cylinder wall AND the 4 fillet cylinder faces
+//    (>= 5 cylindrical faces total).
+TEST_CASE("composed: block + through-hole + filleted outer edges -> real part") {
+    const double W = 50.0, H = 40.0, D = 25.0;
+    const double R_HOLE = 8.0, R_FILLET = 6.0;
+
+    // Base block (built through the prism path, like a real extrude feature).
+    TopoDS_Shape block = geom::extrude_rect(W, H, D);
+
+    // Bore a clean through-hole on the +Z axis at the block centre.
+    TopoDS_Shape drill = cylinder_z(gp_Pnt(W / 2, H / 2, 0.0), R_HOLE, D);
+    TopoDS_Shape bored = geom::cut(block, drill);
+    REQUIRE_FALSE(bored.IsNull());
+
+    // Round the 4 outer vertical edges. The inner hole wall is curved, so the dir=+Z
+    // line filter selects ONLY the 4 straight outer vertical edges — not the bore.
+    TopoDS_Shape part = geom::fillet_edges(bored, R_FILLET, Eigen::Vector3d(0, 0, 1));
+    REQUIRE_FALSE(part.IsNull());
+
+    const float color[3] = {0.71f, 0.76f, 0.82f};
+    Loaded ld = roundtrip(part, "Part", color);
+    REQUIRE(ld.doc.bodies.size() == 1);
+    const render::BodyMesh& bm = ld.doc.bodies[0];
+    check_common(bm);
+
+    const double expected = W * H * D
+                          - PI * R_HOLE * R_HOLE * D
+                          - (4.0 - PI) * R_FILLET * R_FILLET * D;
+    const double vol = solid_volume(part);
+    double lo[3], hi[3];
+    bbox(bm, lo, hi);
+    MESSAGE("composed: faces=" << bm.faces.size() << " cylinder=" << count_surf(bm, 1)
+            << " planar=" << count_surf(bm, 0)
+            << " volume=" << vol << " (expected " << expected << ")"
+            << " bbox=" << (hi[0]-lo[0]) << "x" << (hi[1]-lo[1]) << "x" << (hi[2]-lo[2]));
+
+    CHECK(vol == doctest::Approx(expected).epsilon(1e-3));
+    // >= 5 cylindrical faces: 1 hole wall + 4 fillet quarter-cylinders.
+    CHECK(count_surf(bm, 1) >= 5);
+    // Outer extents are unchanged (the fillets only remove the corners, the hole is interior).
+    CHECK((hi[0] - lo[0]) == doctest::Approx(W).epsilon(1e-4));
+    CHECK((hi[1] - lo[1]) == doctest::Approx(H).epsilon(1e-4));
+    CHECK((hi[2] - lo[2]) == doctest::Approx(D).epsilon(1e-4));
+}

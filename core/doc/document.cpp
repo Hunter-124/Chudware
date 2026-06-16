@@ -347,6 +347,11 @@ json normalize_feature(const json& raw) {
     }
     if (type == "chamfer" && f.contains("length") && !f.contains("distance"))
         f["distance"] = f["length"];
+    // hole: the canonical explicit [u,v] list is refs.points; the C++ hole branch
+    // reads "positions" (refs.positions in the canonical schema is a vertex-selector
+    // list, a different thing — not yet ported).
+    if (type == "hole" && f.contains("points") && !f.contains("positions"))
+        f["positions"] = f["points"];
     return f;
 }
 
@@ -373,6 +378,14 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         for (auto it = solid_order.rbegin(); it != solid_order.rend(); ++it)
             if (!consumed.count(*it)) return *it;
         return std::string();
+    };
+    // The body a dress/hole/mirror feature targets: an explicit "body" id (the
+    // simplified model) or, for canonical features that carry no body ref, the
+    // current top body. Empty when neither exists -> the branch raises a clear error.
+    auto body_ref = [&](const json& feat) -> std::string {
+        if (feat.contains("body") && feat["body"].is_string())
+            return feat["body"].get<std::string>();
+        return current_solid_id();
     };
 
     const json empty = json::array();
@@ -532,7 +545,9 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 st.ok = true;
 
             } else if (type == "fillet" || type == "chamfer") {
-                const std::string body_id = req_str(feat, "body");
+                const std::string body_id = body_ref(feat);
+                if (body_id.empty())
+                    throw std::runtime_error(type + ": no body ref and no current body");
                 const TopoDS_Shape& body = require_solid(results, body_id, "body");
                 std::optional<Eigen::Vector3d> dir = opt_vec3(feat, "dir");
 
@@ -707,7 +722,9 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // The plane comes from a FACE SELECTOR ({"kind":"face",...} resolved
                 // against the body's live topology) or an explicit plane_point/normal —
                 // the simplified id-ref port of engine/doc/features/pattern.py::compile_mirror.
-                const std::string body_id = req_str(feat, "body");
+                const std::string body_id = body_ref(feat);
+                if (body_id.empty())
+                    throw std::runtime_error(type + ": no body ref and no current body");
                 const TopoDS_Shape& body = require_solid(results, body_id, "body");
 
                 // Resolve the mirror plane to (point, unit normal).
@@ -773,7 +790,9 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // boolean (one feature, N holes — SolidWorks Hole Wizard, simplified:
                 // no thread tables / cosmetic threads / grid / sketch positions). Port
                 // of engine/doc/features/hole.py's geometry core in the id-ref model.
-                const std::string body_id = req_str(feat, "body");
+                const std::string body_id = body_ref(feat);
+                if (body_id.empty())
+                    throw std::runtime_error(type + ": no body ref and no current body");
                 const TopoDS_Shape& body = require_solid(results, body_id, "body");
 
                 // --- resolve the target planar face (a {"kind":"face"} selector) ---

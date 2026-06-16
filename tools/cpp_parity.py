@@ -151,6 +151,49 @@ def fixtures():
         _sketch("sc", "plane.top", ce2, cc2), _extrude("bc", "sc", 10.0),
         _sketch("si", "plane.top", ie, ic), _extrude("xc", "si", mode="cut", end="through_all")]}
 
+    # ---- selector-driven features (fillet/chamfer/hole/mirror) on a 40x30x20 box ----
+    # The edge/face selectors carry a geometric fingerprint that resolves on BOTH
+    # engines (same scored matcher); the base geometry fixes the centroids below.
+    def _sel_base():
+        e, c = _rect(0, 0, 40, 30)
+        return [_sketch("s1", "plane.top", e, c), _extrude("f2", "s1", 20.0)]
+    edge_sel = {"kind": "edge", "surf": "line", "centroid": [0.0, 0.0, 10.0],
+                "axis": [0.0, 0.0, 1.0], "area_or_len": 20.0,
+                "owner_feature": None, "hint_index": 0}
+    face_sel = {"kind": "face", "surf": "plane", "centroid": [20.0, 15.0, 20.0],
+                "axis": [0.0, 0.0, 1.0], "area_or_len": 1200.0,
+                "owner_feature": None, "hint_index": 5}
+
+    out["fillet"] = {"features": _sel_base() + [
+        {"id": "f3", "type": "fillet", "params": {"radius": {"value": 3, "expr": None}},
+         "refs": {"edges": [edge_sel]}}]}
+    out["chamfer"] = {"features": _sel_base() + [
+        {"id": "f3", "type": "chamfer", "params": {"length": {"value": 3, "expr": None}},
+         "refs": {"edges": [edge_sel]}}]}
+    out["hole"] = {"features": _sel_base() + [
+        {"id": "f3", "type": "hole",
+         "params": {"style": "simple", "end": "through_all", "standard": "custom",
+                    "diameter": {"value": 6, "expr": None}},
+         "refs": {"face": face_sel, "points": [[0, 0]]}}]}
+    # mirror about the reserved YZ plane (x=0); box touches x=0 -> contiguous, V doubles.
+    out["mirror"] = {"features": _sel_base() + [
+        {"id": "f3", "type": "mirror", "params": {}, "refs": {"plane": "plane.right"}}]}
+
+    # linear pattern: 3 abutting 10-cubes along +X -> contiguous, V=3000.
+    le, lc = _rect(0, 0, 10, 10)
+    out["linear_pattern"] = {"features": [
+        _sketch("s1", "plane.top", le, lc), _extrude("f2", "s1", 10.0),
+        {"id": "f3", "type": "linear_pattern",
+         "params": {"count1": {"value": 3, "expr": None}, "spacing1": {"value": 10, "expr": None}},
+         "refs": {"dir1": "axis.x", "features": ["f2"]}}]}
+    # circular pattern: a cube offset +X, 4 copies about Z over 360 degrees.
+    qe, qc = _rect(20, -5, 10, 10)
+    out["circular_pattern"] = {"features": [
+        _sketch("s1", "plane.top", qe, qc), _extrude("f2", "s1", 10.0),
+        {"id": "f3", "type": "circular_pattern",
+         "params": {"count": {"value": 4, "expr": None}, "angle": {"value": 360, "expr": None}},
+         "refs": {"axis": "axis.z", "features": ["f2"]}}]}
+
     return out
 
 

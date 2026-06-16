@@ -39,6 +39,7 @@
 #include "geom/plane.h"
 #include "geom/profile.h"
 #include "geom/tessellate.h"
+#include "geom/transform.h"
 #include "geom/aicm.h"
 #include "sketch/sketch.h"
 #include "util/expr.h"
@@ -51,6 +52,12 @@ using EnvMap = std::map<std::string, double>;
 namespace {
 
 constexpr double TWO_PI = 6.28318530717958647692;
+constexpr double PI = 3.14159265358979323846;
+
+// Degrees -> radians. The circular_pattern angle is in DEGREES (SolidWorks +
+// pattern.py convention), so its per-step rotation is converted here before the
+// kernel's rotate_copy (which, like revolve_face, takes radians).
+inline double radians(double deg) { return deg * PI / 180.0; }
 
 // -------------------------------------------------------------------- result kinds
 // A sketch result: the planar faces solved for the sketch, plus the plane they live
@@ -343,6 +350,114 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 consumed.insert(body_id);
 
                 results[id] = SolidResult{out};
+                solid_order.push_back(id);
+                st.ok = true;
+
+            } else if (type == "linear_pattern") {
+                // Replicate a seed solid on a 1-D row (or 2-D grid) and fuse the copies
+                // into one body. Instance (0,0) IS the seed already present, so we only
+                // place the additional cells and union each onto the running result —
+                // the geometry-pattern strategy of pattern.py, in the simplified id-ref
+                // model (no CompileContext / tool_bodies / skip / vary / bidirectional).
+                const std::string seed_id = req_str(feat, "seed");
+                const TopoDS_Shape& seed = require_solid(results, seed_id, "seed");
+
+                const int count1 =
+                    static_cast<int>(std::lround(num_or_expr(feat.at("count1"), env)));
+                if (count1 < 1)
+                    throw std::runtime_error("linear pattern count1 must be >= 1");
+                const double spacing1 = num_or_expr(feat.at("spacing1"), env);
+                Eigen::Vector3d dir1 = req_vec3(feat, "dir1");
+                if (!(dir1.norm() > 1e-12))
+                    throw std::runtime_error("linear pattern dir1 has zero length");
+                dir1.normalize();
+
+                // Optional second direction -> a 2-D grid. Absent dir2 keeps count2 = 1.
+                const bool has_dir2 = feat.contains("dir2");
+                int count2 = 1;
+                double spacing2 = 0.0;
+                Eigen::Vector3d dir2(0.0, 0.0, 0.0);
+                if (has_dir2) {
+                    count2 = feat.contains("count2")
+                        ? static_cast<int>(std::lround(num_or_expr(feat.at("count2"), env)))
+                        : 1;
+                    if (count2 < 1)
+                        throw std::runtime_error("linear pattern count2 must be >= 1");
+                    spacing2 = feat.contains("spacing2")
+                        ? num_or_expr(feat.at("spacing2"), env) : 0.0;
+                    dir2 = req_vec3(feat, "dir2");
+                    if (!(dir2.norm() > 1e-12))
+                        throw std::runtime_error("linear pattern dir2 has zero length");
+                    dir2.normalize();
+                }
+
+                if (count1 * count2 < 2)
+                    throw std::runtime_error("linear pattern needs at least 2 instances");
+
+                // Lay copies at i*spacing1*dir1 (+ j*spacing2*dir2). Instance (0,0) is
+                // the seed, already in `result`. The result body keyed under THIS pattern
+                // feature id is the owner the roadmap's "pattern copies inherit the
+                // pattern feature's owner id" refers to in this simplified model.
+                TopoDS_Shape res = seed;
+                for (int i = 0; i < count1; ++i) {
+                    for (int j = 0; j < count2; ++j) {
+                        if (i == 0 && j == 0) continue;  // the seed instance
+                        Eigen::Vector3d offset = dir1 * (i * spacing1);
+                        if (has_dir2) offset += dir2 * (j * spacing2);
+                        TopoDS_Shape copy = ::geom::translate_copy(seed, offset);
+                        res = ::geom::fuse(res, copy);
+                        if (res.IsNull())
+                            throw std::runtime_error("linear pattern instance fuse failed");
+                    }
+                }
+
+                // The seed is absorbed into the pattern result (a SW pattern owns its
+                // instances), so it no longer survives as a standalone body.
+                consumed.insert(seed_id);
+
+                results[id] = SolidResult{res};
+                solid_order.push_back(id);
+                st.ok = true;
+
+            } else if (type == "circular_pattern") {
+                // Replicate a seed solid around an axis and fuse the copies into one
+                // body. k=0 is the seed (already present); copies k=1..count-1 are
+                // rotated by step_deg*k about the axis. Mirrors pattern.py's geometry
+                // strategy in the simplified id-ref model.
+                const std::string seed_id = req_str(feat, "seed");
+                const TopoDS_Shape& seed = require_solid(results, seed_id, "seed");
+
+                const int count =
+                    static_cast<int>(std::lround(num_or_expr(feat.at("count"), env)));
+                if (count < 2)
+                    throw std::runtime_error("circular pattern count must be >= 2");
+
+                // Angle is in DEGREES (SolidWorks + pattern.py convention) — note this
+                // DIFFERS from revolve's angle, which is radians.
+                const double angle_deg = feat.contains("angle")
+                    ? num_or_expr(feat.at("angle"), env) : 360.0;
+                const bool equal_spacing = feat.value("equal_spacing", true);
+                // equal_spacing: instances fill the total angle (a full 360 wraps
+                // cleanly); otherwise `angle` is the increment between instances.
+                const double step_deg = equal_spacing ? angle_deg / count : angle_deg;
+
+                const Eigen::Vector3d axis_pt = req_vec3(feat, "axis_pt");
+                const Eigen::Vector3d axis_dir = req_vec3(feat, "axis_dir");
+
+                TopoDS_Shape res = seed;
+                for (int k = 1; k < count; ++k) {
+                    TopoDS_Shape copy = ::geom::rotate_copy(
+                        seed, axis_pt, axis_dir, radians(step_deg * k));
+                    res = ::geom::fuse(res, copy);
+                    if (res.IsNull())
+                        throw std::runtime_error("circular pattern instance fuse failed");
+                }
+
+                // The seed is absorbed into the pattern result (a SW pattern owns its
+                // instances), so it no longer survives standalone.
+                consumed.insert(seed_id);
+
+                results[id] = SolidResult{res};
                 solid_order.push_back(id);
                 st.ok = true;
 

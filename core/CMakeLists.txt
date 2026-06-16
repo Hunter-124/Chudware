@@ -173,6 +173,7 @@ if(AICAD_WITH_OCCT)
     geom/profile.cpp
     geom/booleans.cpp
     geom/dress.cpp
+    geom/transform.cpp
     geom/aicm.cpp)
   target_include_directories(aicad_geom_occt PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -286,6 +287,31 @@ if(AICAD_WITH_OCCT)
   add_test(NAME document COMMAND test_document)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(document PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- A3: pattern feature compilers — linear_pattern / circular_pattern ------
+  # core/doc/document.cpp's pattern branches REPLICATE a referenced seed solid with
+  # rigid transforms (geom/transform.cpp: translate_copy / rotate_copy) and FUSE the
+  # copies into one body (the geometry-pattern strategy of engine/doc/features/pattern.py,
+  # in the simplified id-ref model). The test round-trips a linear + a circular pattern
+  # document through the host AICM loader (the contract oracle) and asserts analytic,
+  # OCCT-version-independent invariants (face counts, bbox, mesh volume). Same wiring as
+  # test_document; aicad_doc carries the OCCT toolkits transitively via aicad_geom_occt.
+  add_executable(test_pattern
+    tests/test_pattern.cpp)
+  target_include_directories(test_pattern PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+  target_link_libraries(test_pattern PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_pattern PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+  set_target_properties(test_pattern PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME pattern COMMAND test_pattern)
+  # Same OCCT DLL PATH prepend so the test can load TKernel et al.
+  set_tests_properties(pattern PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- Wave 2 milestone: the SELECTOR system — stable refs into B-rep topology --
   # core/doc/selectors.{h,cpp} turns picked topology into a geometric fingerprint

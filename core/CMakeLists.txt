@@ -249,4 +249,39 @@ if(AICAD_WITH_OCCT)
   add_test(NAME ops COMMAND test_ops)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(ops PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- Wave 2 milestone: the document model — a rebuildable feature tree ------
+  # core/doc/document.cpp orchestrates solve_sketch -> faces_from_solved_sketch ->
+  # extrude/revolve -> fuse/cut/common -> fillet/chamfer into a part, keyed by
+  # feature id, and RE-RUNS on a parameter edit (the parametric payoff). It links
+  # aicad_geom_occt (the OCCT kernel + aicad_geom + nlohmann_json, transitively),
+  # aicad_sketch (solve_sketch), and aicad_util (the expr evaluator for expr dims).
+  add_library(aicad_doc STATIC
+    doc/document.cpp)
+  target_include_directories(aicad_doc PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(aicad_doc PUBLIC
+    aicad_geom_occt aicad_sketch aicad_geom aicad_util
+    nlohmann_json::nlohmann_json)
+
+  # Verification: compile a document -> write_aicm -> HOST render::parseAicm, with
+  # the parametric-rebuild case (same doc, two envs -> two solids). Same wiring as
+  # test_ops; aicad_doc carries the OCCT toolkits transitively via aicad_geom_occt.
+  add_executable(test_document
+    tests/test_document.cpp)
+  target_include_directories(test_document PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+  target_link_libraries(test_document PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_document PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+  set_target_properties(test_document PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME document COMMAND test_document)
+  # Same OCCT DLL PATH prepend so the test can load TKernel et al.
+  set_tests_properties(document PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 endif()

@@ -99,6 +99,17 @@ def _revolve(fid, sketch_fid, axis_datum, angle_deg):
             "refs": {"profile": [{"kind": "region", "sketch": sketch_fid}], "axis": axis_datum}}
 
 
+def _plane_offset(fid, base_datum, offset):
+    return {"id": fid, "type": "plane",
+            "params": {"method": "offset", "offset": {"value": offset, "expr": None}},
+            "refs": {"base": base_datum}}
+
+
+def _loft(fid, section_fids):
+    return {"id": fid, "type": "loft", "params": {"mode": "boss"},
+            "refs": {"sections": [{"kind": "region", "sketch": s} for s in section_fids]}}
+
+
 def _boolean(fid, op, target_fid, tool_fid):
     # op is the canonical name (combine/subtract/intersect); targets/tools are body
     # selectors carrying owner_feature (the earlier feature that built that body).
@@ -205,6 +216,16 @@ def fixtures():
         {"id": "f3", "type": "circular_pattern",
          "params": {"count": {"value": 4, "expr": None}, "angle": {"value": 360, "expr": None}},
          "refs": {"axis": "axis.z", "features": ["f2"]}}]}
+
+    # loft: 20x20 section on XY -> 10x10 section on an offset plane 40 above ->
+    # square frustum, V = h/3*(A1+A2+sqrt(A1*A2)) = 40/3*(400+100+200) = 9333.33.
+    lo_e, lo_c = _rect(-10, -10, 20, 20)
+    hi_e, hi_c = _rect(-5, -5, 10, 10)
+    out["loft"] = {"features": [
+        _plane_offset("f1", "plane.top", 40.0),
+        _sketch("f2", "plane.top", lo_e, lo_c),
+        _sketch("f3", "f1", hi_e, hi_c),
+        _loft("f4", ["f2", "f3"])]}
 
     return out
 

@@ -3,9 +3,12 @@
 // geom::tessellate_body. Used by core/tests/test_geom_aicm.cpp.
 #pragma once
 
+#include <vector>
+
 #include <Eigen/Dense>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
+#include <TopoDS_Wire.hxx>
 
 namespace geom {
 
@@ -30,5 +33,12 @@ TopoDS_Shape extrude_face(const TopoDS_Face& face, const Eigen::Vector3d& dir,
 // A profile offset from the axis sweeps a tube/annulus (matches revolve.py).
 TopoDS_Shape revolve_face(const TopoDS_Face& face, const Eigen::Vector3d& axis_pt,
                           const Eigen::Vector3d& axis_dir, double angle_rad);
+
+// Loft a solid through an ordered list of section wires (BRepOffsetAPI_ThruSections,
+// isSolid=true). `ruled` makes straight transitions between sections; otherwise a
+// smoothed surface. Needs >= 2 wires, ordered + consistently oriented along the loft
+// direction. Empty shape on kernel failure. Port of engine/doc/features/loft.py's
+// plain ThruSections path (guides/centerline/thin deferred).
+TopoDS_Shape loft_sections(const std::vector<TopoDS_Wire>& sections, bool ruled);
 
 }  // namespace geom

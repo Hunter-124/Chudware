@@ -3,6 +3,7 @@
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
+#include <BRepOffsetAPI_ThruSections.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
@@ -55,6 +56,21 @@ TopoDS_Shape revolve_face(const TopoDS_Face& face, const Eigen::Vector3d& axis_p
     gp_Ax1 axis(gp_Pnt(axis_pt.x(), axis_pt.y(), axis_pt.z()),
                 gp_Dir(axis_dir.x(), axis_dir.y(), axis_dir.z()));
     return BRepPrimAPI_MakeRevol(face, axis, angle_rad).Shape();
+}
+
+TopoDS_Shape loft_sections(const std::vector<TopoDS_Wire>& sections, bool ruled) {
+    if (sections.size() < 2) return TopoDS_Shape();
+    // isSolid=true caps the ends so the loft is a closed solid; pres3d default tol.
+    BRepOffsetAPI_ThruSections mk(/*isSolid=*/Standard_True,
+                                  /*ruled=*/ruled ? Standard_True : Standard_False,
+                                  /*pres3d=*/1.0e-6);
+    for (const TopoDS_Wire& w : sections) {
+        if (w.IsNull()) return TopoDS_Shape();
+        mk.AddWire(w);
+    }
+    mk.Build();
+    if (!mk.IsDone()) return TopoDS_Shape();
+    return mk.Shape();
 }
 
 }  // namespace geom

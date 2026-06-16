@@ -31,6 +31,7 @@
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
+#include <BRepTools.hxx>
 #include <Bnd_Box.hxx>
 #include <GProp_GProps.hxx>
 #include <GeomAbs_SurfaceType.hxx>
@@ -83,7 +84,13 @@ struct SolidResult {
     TopoDS_Shape shape;
 };
 
-using FeatureResult = std::variant<SketchResult, SolidResult>;
+// A datum-plane result: a SketchPlane a later sketch can be built on (e.g. an
+// offset plane for a loft section). Never tessellates; not a body.
+struct PlaneResult {
+    aicad::geom::SketchPlane plane;
+};
+
+using FeatureResult = std::variant<SketchResult, SolidResult, PlaneResult>;
 
 // -------------------------------------------------------------------- env parsing
 // Flatten the env json object into name -> double. Non-numeric entries are skipped
@@ -428,14 +435,76 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (!sol.converged)
                     throw std::runtime_error("sketch did not converge");
 
-                aicad::geom::SketchPlane plane =
-                    plane_from_name(str_field(feat, "plane", "top"));
+                // The sketch plane is a reserved datum NAME ("top"/"front"/"right")
+                // OR a prior `plane` feature id (e.g. an offset datum plane).
+                const std::string pref = str_field(feat, "plane", "top");
+                aicad::geom::SketchPlane plane;
+                auto pit = results.find(pref);
+                if (pit != results.end() &&
+                    std::holds_alternative<PlaneResult>(pit->second))
+                    plane = std::get<PlaneResult>(pit->second).plane;
+                else
+                    plane = plane_from_name(pref);
                 std::vector<TopoDS_Face> faces =
                     aicad::geom::faces_from_solved_sketch(sol.entities, plane);
                 if (faces.empty())
                     throw std::runtime_error("sketch produced no closed-loop faces");
 
                 results[id] = SketchResult{std::move(faces), plane};
+                st.ok = true;
+
+            } else if (type == "plane") {
+                // Datum plane: offset from a base plane along its normal (the case
+                // loft needs for sections at different heights). Other plane methods
+                // (3-point, angled) are deferred. Stores a SketchPlane keyed by id.
+                const std::string method = feat.value("method", std::string("offset"));
+                std::string bref = str_field(feat, "base", "top");
+                if (bref.rfind("plane.", 0) == 0) bref = bref.substr(6);
+                aicad::geom::SketchPlane base;
+                auto bit = results.find(bref);
+                if (bit != results.end() &&
+                    std::holds_alternative<PlaneResult>(bit->second))
+                    base = std::get<PlaneResult>(bit->second).plane;
+                else
+                    base = plane_from_name(bref);
+
+                aicad::geom::SketchPlane p = base;
+                if (method == "offset") {
+                    const double off =
+                        feat.contains("offset") ? num_or_expr(feat.at("offset"), env) : 0.0;
+                    p.origin = base.origin + base.normal * off;
+                } else {
+                    throw std::runtime_error("plane: method '" + method + "' not supported");
+                }
+                results[id] = PlaneResult{p};
+                st.ok = true;
+
+            } else if (type == "loft") {
+                // Loft a solid through >= 2 section profiles (region selectors naming
+                // sketches). Each section -> its first face's outer wire -> ThruSections.
+                auto sit = feat.find("sections");
+                if (sit == feat.end() || !sit->is_array() || sit->size() < 2)
+                    throw std::runtime_error("loft needs >= 2 sections");
+                std::vector<TopoDS_Wire> wires;
+                for (const json& s : *sit) {
+                    const std::string sk = selector_owner_id(s);
+                    if (sk.empty())
+                        throw std::runtime_error("loft: malformed section selector");
+                    const SketchResult& src = require_sketch(results, sk, sk.c_str());
+                    if (src.faces.empty())
+                        throw std::runtime_error("loft: section '" + sk + "' has no face");
+                    TopoDS_Wire w = BRepTools::OuterWire(src.faces.front());
+                    if (w.IsNull())
+                        throw std::runtime_error("loft: section '" + sk + "' has no outer wire");
+                    wires.push_back(w);
+                }
+                const bool ruled = feat.value("ruled", false);
+                TopoDS_Shape solid = ::geom::loft_sections(wires, ruled);
+                if (solid.IsNull())
+                    throw std::runtime_error("loft produced an empty solid");
+
+                results[id] = SolidResult{solid};
+                solid_order.push_back(id);
                 st.ok = true;
 
             } else if (type == "extrude") {

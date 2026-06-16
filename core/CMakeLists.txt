@@ -53,11 +53,18 @@ add_library(aicad_geom STATIC
 target_include_directories(aicad_geom PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_geom PUBLIC Eigen3::Eigen)
 
+# --- libaicad util (dimension-expression arithmetic evaluator) ---------------
+# C++ port of engine/doc/equations.py (the `evaluate` entry point) so the sketch
+# solver's resolve_dim() matches the Python oracle for expr:"A*B"-style dims.
+add_library(aicad_util STATIC
+  util/expr.cpp)
+target_include_directories(aicad_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
 # --- libaicad sketch (parameterization + constraints over the solver core) ---
 add_library(aicad_sketch STATIC
   sketch/sketch.cpp)
 target_include_directories(aicad_sketch PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_sketch PUBLIC aicad_solver nlohmann_json::nlohmann_json)
+target_link_libraries(aicad_sketch PUBLIC aicad_solver aicad_util nlohmann_json::nlohmann_json)
 
 # --- sketch_cli (differential-harness driver; see tools/solver_diff.py) -------
 # Reads { "sketch":{...}, "env":{...} } from argv[1] (or stdin if "-") and prints
@@ -93,3 +100,11 @@ target_link_libraries(test_plane PRIVATE aicad_geom)
 set_target_properties(test_plane PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME plane COMMAND test_plane)
+
+add_executable(test_expr
+  tests/test_expr.cpp)
+target_include_directories(test_expr PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_expr PRIVATE aicad_util)
+set_target_properties(test_expr PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME expr COMMAND test_expr)

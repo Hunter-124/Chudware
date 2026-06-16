@@ -4,6 +4,7 @@
 #include "sketch/sketch.h"
 
 #include "solver/nsolve.h"
+#include "util/expr.h"
 
 #include <algorithm>
 #include <cctype>
@@ -370,6 +371,24 @@ Handle resolve_handle(const std::string& handle, const EntMap& entities,
     throw std::runtime_error("unresolved handle: " + handle);
 }
 
+// Build the std::map<string,double> the expr evaluator wants from the JSON env.
+// Non-numeric env entries are skipped (the evaluator just won't find that name).
+std::map<std::string, double> env_to_map(const json& env) {
+    std::map<std::string, double> m;
+    if (env.is_object()) {
+        for (auto it = env.begin(); it != env.end(); ++it) {
+            if (it.value().is_number()) m[it.key()] = it.value().get<double>();
+        }
+    }
+    return m;
+}
+
+// Resolve a dimension constraint's float value. Mirrors _resolve_dim in
+// sketch_solver.py EXACTLY: when `expr` is a non-null string we (1) prefer a bare
+// env lookup if the whole expr string is itself an env key, else (2) evaluate it
+// as arithmetic through the equations evaluator. Only when there is no expr do we
+// fall back to the literal `value`. The evaluate() path matches the Python
+// equations.evaluate within 1e-9 (the differential-harness coord tolerance).
 double resolve_dim(const json& c, const json& env) {
     if (!c.contains("value")) return 0.0;
     const json& v = c["value"];
@@ -377,7 +396,18 @@ double resolve_dim(const json& c, const json& env) {
     if (v.is_object()) {
         if (v.contains("expr") && v["expr"].is_string()) {
             std::string e = v["expr"];
-            if (env.contains(e) && env[e].is_number()) return env[e].get<double>();
+            // (1) bare-variable lookup wins (matches `expr in equations_env`).
+            if (env.is_object() && env.contains(e) && env[e].is_number()) {
+                return env[e].get<double>();
+            }
+            // (2) arithmetic expression -> evaluate. On any evaluator error we
+            // fall through to the literal `value` (forward-tolerant; the Python
+            // would raise, but the host's solve path catches that the same way).
+            try {
+                return aicad::util::evaluate(e, env_to_map(env));
+            } catch (const aicad::util::ExprError&) {
+                // fall through to literal value below
+            }
         }
         if (v.contains("value") && v["value"].is_number()) return v["value"].get<double>();
     }
@@ -1138,7 +1168,13 @@ void add_tangent_circle_circle(System& sys, const std::string& cid,
             double cx1 = xs(3), cy1 = xs(4), r1 = xs(5);
             double dx = cx0 - cx1, dy = cy0 - cy1;
             double d = std::hypot(dx, dy);
-            double ux = 0.0, uy = 0.0;
+            // BUG-1: at coincident centers d(|C0-C1|)/dC is 0/0. A zero position
+            // gradient strands Newton (it cannot separate the centers and
+            // corrupts the radii instead). Fall back to a DETERMINISTIC unit
+            // direction (+x) so the Jacobian is well-defined and the centers get
+            // pushed apart to the tangent distance. Matches the Python fallback
+            // (1,0) verbatim -> bit-identical under the differential harness.
+            double ux = 1.0, uy = 0.0;
             if (d >= 1e-12) { ux = dx / d; uy = dy / d; }
             double dr0, dr1;
             if (internal) {

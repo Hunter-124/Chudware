@@ -28,7 +28,7 @@ expert) before treating any DIVERGE as a confirmed bug.
 | F4b_near_zero_length_line | 4 – Near-degenerate | AGREE | Solver correct |
 | F4c_near_parallel_lines_angle | 4 – Near-degenerate | DIVERGE | Fixture expect wrong (dof=1 is correct for 2-DOF/1-constraint) |
 | F4d_circle_radius_near_zero | 4 – Near-degenerate | AGREE | Solver correct |
-| F4e_coincident_circle_centers_tangent | 4 – Near-degenerate | DIVERGE | **LIKELY REAL BUG** — degenerate Jacobian at d=0 |
+| F4e_coincident_circle_centers_tangent | 4 – Near-degenerate | ~~DIVERGE~~ **RESOLVED** | BUG-1 fixed: deterministic +x fallback direction at d=0 |
 | F5a_fully_defined_base | 5 – Over/under | AGREE | Solver correct |
 | F5b_remove_dim_under | 5 – Over/under | AGREE | Solver correct |
 | F5c_duplicate_dim_redundant | 5 – Over/under | AGREE | Solver correct (c12 flagged redundant) |
@@ -149,12 +149,35 @@ reference to one of the lines.
 
 ---
 
-### F4e — Coincident circle centers with tangent (LIKELY REAL BUG)
+### F4e — Coincident circle centers with tangent (BUG-1 — RESOLVED 2026-06-15)
+
+**Status**: FIXED. The degenerate-Jacobian guard at d=0 now uses a deterministic
+fallback unit direction (+x) in BOTH engines (`_add_tangent_circle_circle` in
+`engine/doc/sketch_solver.py` and `add_tangent_circle_circle` in
+`core/sketch/sketch.cpp`). Newton now has a position gradient and separates the
+centers cleanly. Regression guard fixture: `corpus/hardening_tangent_cc_coincident.json`
+(passes Python↔C++ parity: dof=0, converged=True, conflicting=[]).
+
+**Resolved geometry to confirm against SolidWorks** (guard fixture: e1 = circle
+r=10 fixed at origin; e2 = circle r=5 starting at the SAME center (0,0); centers
+kept horizontal; internal tangent applied):
+  - **Branch selected**: INTERNAL (at d=0, |r0-r1|=5 is nearer than r0+r1=15).
+  - **Final center separation**: d = 5.0 = |r0-r1| (exact internal tangency).
+  - **Final centers**: e1 stays at (0,0); e2 moves to **(-5, 0)** — the inner
+    circle nests inside the outer and touches it on the -x side. The sign (-x vs
+    +x) is a deterministic artifact of the d=0 fallback (+x) direction interacting
+    with the horizontal constraint and the LM step; both ±x are geometrically valid
+    internal-tangency solutions. SolidWorks may land on either side depending on
+    its own degenerate perturbation; the load-bearing facts to confirm are the
+    SEPARATION (5 = |r0-r1|) and the INTERNAL branch.
+  - dof=0, converged=True, no conflicting/redundant.
+
+--- Historical record (pre-fix) ---
 
 **SW expected**: converged=True, dof=0, internal tangency, centers separate by 5 (|r0-r1|=5).  
-**Python actual**: converged=False, dof=1, conflicting=['c4'] (tangent), centers stay at (0,0),
-radii collapse to (13.33, 11.67) as a least-squares compromise.  
-**Verdict**: DIVERGE. **HIGH CONFIDENCE REAL BUG.**
+**Python actual (before fix)**: converged=False, dof=1, conflicting=['c4'] (tangent), centers
+stayed at (0,0), radii collapsed to (13.33, 11.67) as a least-squares compromise.  
+**Verdict (before fix)**: DIVERGE. **HIGH CONFIDENCE REAL BUG.**
 
 **Root cause analysis**: In `_add_tangent_circle_circle`, the internal branch is selected correctly
 (`internal=True` because d0=0 and |0-5|=5 < |0-25|=25). The residual at the initial position is
@@ -182,14 +205,15 @@ fallback direction (e.g., +x) when `d=0`.
 when the two circle centers coincide. The Jacobian's positional rows are zero at d=0, so Newton
 can never move the centers apart.
 
-**Fix hint**: At `d < epsilon`, choose a fallback direction `ux=1, uy=0` (or use the
-horizontal-constraint direction) rather than `ux=uy=0`. This gives Newton a gradient to separate
-the centers. Alternatively, the Jacobian should add a small regularization term proportional to
-(r0+r1) in the position components when d is near zero.
+**Fix applied (2026-06-15)**: At `d < 1e-12` both engines now choose the deterministic fallback
+direction `ux=1, uy=0` rather than `ux=uy=0`. This gives Newton a position gradient to separate
+the centers. The fallback is identical in Python and C++, so the two stay bit-for-bit at parity
+(the guard fixture confirms it).
 
 **Action for owner**: Reproduce in SolidWorks: draw two concentric circles (centers exactly
-coincident), apply tangent relation. SW should move one center by |r0-r1|. If Python solver fails
-this, confirm as a bug.
+coincident), apply a tangent relation, internal arrangement. SW should move one center by
+|r0-r1| (here 5). Confirm the SEPARATION (5) and INTERNAL branch match; the ±x side is
+implementation-defined at the exact degeneracy.
 
 ---
 
@@ -232,14 +256,17 @@ length separately and use coincidents to form the rectangle.
 
 ### Priority 1 — HIGH CONFIDENCE (submit to owner for SW validation)
 
-**BUG-1: Tangent circle-circle Jacobian degeneracy at d=0 (F4e)**  
-File: `F4e_coincident_circle_centers_tangent.json`  
-When two circles share coincident centers and a tangent constraint is applied, the solver returns
-zero position Jacobians and cannot separate the centers. It instead corrupts the radii via
-least-squares. SolidWorks should cleanly separate the centers to |r0-r1|.  
-Code location: `_add_tangent_circle_circle`, the `if d < 1e-12: ux, uy = 0.0, 0.0` guard in the
-Jacobian function. A fallback direction is needed.  
-**Confidence: HIGH.**
+**BUG-1: Tangent circle-circle Jacobian degeneracy at d=0 (F4e) — RESOLVED 2026-06-15**  
+File: `F4e_coincident_circle_centers_tangent.json` (guard: `corpus/hardening_tangent_cc_coincident.json`)  
+When two circles shared coincident centers and a tangent constraint was applied, the solver returned
+zero position Jacobians and could not separate the centers — it corrupted the radii via least-squares
+instead. **Fixed**: the `if d < 1e-12` guard in the circle-circle tangent Jacobian now uses a
+deterministic `ux=1, uy=0` fallback (identical in Python `_add_tangent_circle_circle` and C++
+`add_tangent_circle_circle`), so Newton separates the centers to |r0-r1| (internal) / r0+r1 (external).
+Now converges at dof=0 with the centers 5 apart (internal). See the F4e detail above for the geometry
+the SW expert should confirm.  
+**Confidence: HIGH.** Remaining owner action: confirm the SW separation/branch match (the ±x side is
+implementation-defined at the exact degeneracy).
 
 ### Priority 2 — FIXTURE DESIGN ISSUES (need re-authoring; not solver bugs)
 

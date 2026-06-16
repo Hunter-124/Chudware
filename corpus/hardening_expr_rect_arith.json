@@ -1,0 +1,30 @@
+{
+  "name": "hardening_expr_rect_arith",
+  "_note": "Expression-arithmetic parity: a closed rectangle whose width dim is expr:\"A*B\" (=30*4=120) and height dim is expr:\"H/2\" (=100/2=50). Neither \"A*B\" nor \"H/2\" is itself an env key, so resolve_dim MUST evaluate the arithmetic through the equations evaluator (not a bare lookup). dof=0; proves the C++ expr evaluator matches Python for * and /.",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [120.0, 0.0]},
+      {"id": "e2", "type": "line", "construction": false, "p1": [120.0, 0.0], "p2": [120.0, 50.0]},
+      {"id": "e3", "type": "line", "construction": false, "p1": [120.0, 50.0], "p2": [0.0, 50.0]},
+      {"id": "e4", "type": "line", "construction": false, "p1": [0.0, 50.0], "p2": [0.0, 0.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "coincident", "refs": ["e1.p2", "e2.p1"]},
+      {"id": "c2", "type": "coincident", "refs": ["e2.p2", "e3.p1"]},
+      {"id": "c3", "type": "coincident", "refs": ["e3.p2", "e4.p1"]},
+      {"id": "c4", "type": "coincident", "refs": ["e4.p2", "e1.p1"]},
+      {"id": "c5", "type": "horizontal", "refs": ["e1"]},
+      {"id": "c6", "type": "horizontal", "refs": ["e3"]},
+      {"id": "c7", "type": "vertical", "refs": ["e2"]},
+      {"id": "c8", "type": "vertical", "refs": ["e4"]},
+      {"id": "c9", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "c10", "type": "distance", "refs": ["e1.p1", "e1.p2"], "value": {"value": 0.0, "expr": "A*B"}, "driven": false},
+      {"id": "c11", "type": "distance", "refs": ["e2.p1", "e2.p2"], "value": {"value": 0.0, "expr": "H/2"}, "driven": false}
+    ]
+  },
+  "env": {"A": 30.0, "B": 4.0, "H": 100.0},
+  "expect": {
+    "converged": true,
+    "dof": 0
+  }
+}

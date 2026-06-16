@@ -1,0 +1,19 @@
+{
+  "name": "hardening_expr_pi_circle",
+  "_note": "Expression-arithmetic parity using the pi constant + sqrt + nested arithmetic. A circle fixed to the origin: radius dim = expr:\"C/(2*pi)\" (circumference -> radius; C=2*pi*10 in env so r=10), and the center is pinned to the origin by horizontal/vertical distances = expr:\"sqrt(0)\" (=0). None of these expr strings is an env key, so resolve_dim must evaluate them. dof=0; proves pi, parentheses, division, and sqrt all match Python.",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "circle", "construction": false, "center": [5.0, 5.0], "radius": 7.0}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "distance", "refs": ["origin", "e1.center"], "axis": "h", "value": {"value": 0.0, "expr": "sqrt(0)"}, "driven": false},
+      {"id": "c2", "type": "distance", "refs": ["origin", "e1.center"], "axis": "v", "value": {"value": 0.0, "expr": "sqrt(0)"}, "driven": false},
+      {"id": "c3", "type": "radius", "refs": ["e1"], "value": {"value": 0.0, "expr": "C/(2*pi)"}, "driven": false}
+    ]
+  },
+  "env": {"C": 62.83185307179586},
+  "expect": {
+    "converged": true,
+    "dof": 0
+  }
+}

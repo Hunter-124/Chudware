@@ -79,16 +79,9 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         // Available horizontal space for brand + menus (leave caption buttons on the right).
         const float menuZoneR = winW - captionZoneW - 4.0f;
 
-        // brand mark on the left
-        const float iconH = barH * 0.52f;
-        if (st.logoIcon.id) {
-            ImGui::SetCursorPosX(12.0f * s);
-            ImGui::SetCursorPosY((barH - iconH) * 0.5f);
-            ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(iconH, iconH));
-            ImGui::SameLine(0, 9.0f * s);
-        } else {
-            ImGui::SetCursorPosX(14.0f * s);
-        }
+        // Brand mark: the wordmark asset already includes the cube, so do not draw logoIcon beside
+        // it or the app starts with a doubled-up logo.
+        ImGui::SetCursorPosX(12.0f * s);
         const Tex& wm = (ui::activeTheme == ui::Theme::Light && st.wordmarkDark.id)
                             ? st.wordmarkDark : st.wordmark;
         if (wm.id) {
@@ -98,7 +91,14 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             if (ImGui::GetCursorPosX() + wmW + 18.0f * s < menuZoneR - 120.0f) {
                 ImGui::SetCursorPosY((barH - wmH) * 0.5f);
                 ImGui::Image((ImTextureID)(intptr_t)wm.id, ImVec2(wmW, wmH));
-                ImGui::SameLine(0, 18.0f * s);
+                ImGui::SameLine(0, 22.0f * s);
+            }
+        } else if (st.logoIcon.id) {
+            const float iconH = barH * 0.52f;
+            if (ImGui::GetCursorPosX() + iconH + 18.0f * s < menuZoneR - 120.0f) {
+                ImGui::SetCursorPosY((barH - iconH) * 0.5f);
+                ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(iconH, iconH));
+                ImGui::SameLine(0, 22.0f * s);
             }
         }
 
@@ -114,7 +114,18 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         const bool hasDoc = (st.activeTab >= 0);
 
         auto drawFileMenu = [&]() {
-            if (ImGui::MenuItem("New...", "Ctrl+N")) ui::openNewDocChooser();
+            if (ImGui::BeginMenu("New")) {
+                if (ImGui::MenuItem("Part", "Ctrl+N")) ui::createNewDoc(st, 0);
+                if (ImGui::MenuItem("Assembly"))       ui::createNewDoc(st, 1);
+                const bool canDraw = st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+                    (st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Part ||
+                     st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly);
+                if (ImGui::MenuItem("Drawing", nullptr, false, canDraw)) ui::createNewDoc(st, 2);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Schematic"))      ui::createNewDoc(st, 3);
+                if (ImGui::MenuItem("PCB"))            ui::createNewDoc(st, 4);
+                ImGui::EndMenu();
+            }
             // Wave 3: Open / Save / Save As fire one-shot AppState request flags consumed by app.cpp's
             // GL-thread pump, which reuses feature_tree's doOpenDoc/doSaveDoc (native dialog + RPC +
             // mesh refresh) and records Recent. Doing the actual open/save on the pump (not here, mid
@@ -303,7 +314,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             // Equations / Global Variables editor (grafted from codex): opens the modeless dialog.
             if (ImGui::MenuItem("Equations...")) st.showEquations = true;
             ImGui::Separator();
-            if (ImGui::MenuItem("Options...")) st.openSettings = true;
+            if (ImGui::MenuItem("Options...")) st.focusSettingsTab = true;
             if (ImGui::MenuItem("Repair / install runtime", nullptr, false,
                                 !st.setupRunning.load() && !st.job.running.load()))
                 st.startSetup(true);

@@ -648,6 +648,23 @@ void PropertyManager::presetFieldForShot(const std::string& key, const std::stri
     }
 }
 
+bool PropertyManager::dragSetDim(const std::string& key, double value) {
+    if (!active_) return false;
+    for (auto& f : fields_) {
+        if (f.def->kind != PMFieldKind::Dim || !f.def->key || key != f.def->key) continue;
+        if (!fieldVisible(*f.def, fields_) || !fieldEnabled(*f.def, fields_)) return false;
+        f.dimValue = value;
+        f.dimExpr.clear();
+        f.dimError.clear();
+        std::string disp = pmFieldValueText(f.def, f.dimValue, ips_);
+        std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
+        dirty_ = true;
+        lastEditTime_ = ImGui::GetTime() - kDebounceSec;  // preview immediately (like the steppers)
+        return true;
+    }
+    return false;
+}
+
 void PropertyManager::loadFromTree(AppState& st, const nlohmann::json& feature) {
     (void)st;
     nlohmann::json params = feature.value("params", nlohmann::json::object());
@@ -1649,6 +1666,45 @@ static const char* formDescription(const char* type) {
     return "";
 }
 
+static bool pmCompactLabel(const char* label, const char* suffix,
+                           const Palette& pal, bool enabled) {
+    const float S = ui::uiScale;
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const bool inlineRow = avail >= 220.0f * S;
+    float labelW = avail * 0.40f;
+    labelW = std::max(112.0f * S, std::min(labelW, 138.0f * S));
+
+    pushTextColor(enabled ? pal.text : pal.textDim);
+    if (inlineRow) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::Text("%s%s", label, suffix ? suffix : "");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s%s", label, suffix ? suffix : "");
+        ImGui::SameLine(labelW);
+        return true;
+    }
+
+    ImGui::Text("%s%s", label, suffix ? suffix : "");
+    ImGui::PopStyleColor();
+    return false;
+}
+
+static bool pmSectionHeader(const char* label, const Palette& pal) {
+    if (!label || !label[0]) return true;
+    const float S = ui::uiScale;
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(9.0f * S, 4.0f * S));
+    ImGui::PushStyleColor(ImGuiCol_Header,
+        ImVec4(pal.frameBg[0], pal.frameBg[1], pal.frameBg[2], 1));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered,
+        ImVec4(pal.buttonHovered[0], pal.buttonHovered[1], pal.buttonHovered[2], 1));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive,
+        ImVec4(pal.accentSoft[0], pal.accentSoft[1], pal.accentSoft[2], pal.accentSoft[3]));
+    bool open = ImGui::CollapsingHeader(label, ImGuiTreeNodeFlags_DefaultOpen);
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar();
+    return open;
+}
+
 // Wave 1D: standalone wrapper — owns the FeatureManager-slot Begin/End plus the C37-F floating
 // fallback, then defers the form content to drawBody(). The Wave 1D tabbed left pane calls
 // drawBody() directly inside its "LeftPane" container child (no separate window).
@@ -1719,19 +1775,66 @@ void PropertyManager::drawBody(AppState& st) {
         }
     }
 
-    // ---- header: feature icon + title + description -----------------------
+    // ---- header: compact command bar --------------------------------------
     {
+        const float S = ui::uiScale;
+        const ImGuiStyle& pmStyle = ImGui::GetStyle();
+        const float gap = 6.0f * S;
+        float btnW = 28.0f * S;
+        const float rowStartX = ImGui::GetCursorPosX();
+        const float rowAvail = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+        if (btnW * 2.0f + gap > rowAvail)
+            btnW = std::max(20.0f * S, (rowAvail - gap) * 0.5f);
+        const float actionW = btnW * 2.0f + gap;
+
+        auto drawHeaderAction = [&](const char* id, const char* iconName,
+                                    const char* fallback, bool positive,
+                                    const char* tooltip) -> bool {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                positive ? ImVec4(pal.accentDim[0], pal.accentDim[1], pal.accentDim[2], 1)
+                         : ImVec4(pal.button[0], pal.button[1], pal.button[2], 1));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                positive ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)
+                         : ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 0.7f));
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * S, 4.0f * S));
+            IconUV actionIc = getIcon(iconName, 20);
+            bool pressed = false;
+            if (actionIc.valid) {
+                pressed = ImGui::ImageButton(id, actionIc.texId,
+                    ImVec2(btnW - 8.0f * S, btnW - 8.0f * S), actionIc.uv0, actionIc.uv1);
+            } else {
+                pressed = ImGui::Button(fallback, ImVec2(btnW, btnW));
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(2);
+            return pressed;
+        };
+
         IconUV ic = getIcon(form_->icon, 20);
         if (ic.valid) {
-            ImGui::Image(ic.texId, ImVec2(18.0f * ui::uiScale, 18.0f * ui::uiScale),
+            ImGui::Image(ic.texId, ImVec2(18.0f * S, 18.0f * S),
                          ic.uv0, ic.uv1);
-            ImGui::SameLine(0, 6 * ui::uiScale);
+            ImGui::SameLine(0, 6.0f * S);
         }
+        ImGui::AlignTextToFramePadding();
         pushTextColor(pal.text);
         ImGui::TextUnformatted(title_.c_str());
         ImGui::PopStyleColor();
 
-        // C37-F: One-line command description beneath the title.
+        const bool inlineActions = rowAvail >= 150.0f * S;
+        if (inlineActions) {
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(rowStartX + std::max(0.0f, rowAvail - actionW));
+        } else {
+            ImGui::Spacing();
+            ImGui::SetCursorPosX(rowStartX + std::max(0.0f, rowAvail - actionW));
+        }
+        ok = drawHeaderAction("##pm_ok", "ok_check", "OK##pm", true, "OK (Enter)");
+        ImGui::SameLine(0, gap);
+        cancel = cancel || drawHeaderAction("##pm_cancel", "cancel_x", "X##pm",
+                                            false, "Cancel (Esc)");
+
         const char* desc = formDescription(form_->type);
         if (desc && desc[0]) {
             pushTextColor(pal.textDim);
@@ -1741,71 +1844,6 @@ void PropertyManager::drawBody(AppState& st) {
             ImGui::PopTextWrapPos();
             ImGui::PopStyleColor();
         }
-
-        // C37-F/W-overhaul: OK / Cancel live on their own row. The old same-line placement
-        // estimated only the glyph width, while ImageButton adds frame padding; narrow docks then
-        // pushed the right button past the content rect. Reserve the full button frames here.
-        ImGui::Spacing();
-        const ImGuiStyle& pmStyle = ImGui::GetStyle();
-        const float gap = 6.0f * ui::uiScale;
-        const float gutter = pmStyle.ScrollbarSize + 6.0f * ui::uiScale;
-        const float rowStartX = ImGui::GetCursorPosX();
-        const float rowAvail = std::max(1.0f, ImGui::GetContentRegionAvail().x - gutter);
-        float btnW = 28.0f * ui::uiScale;
-        if (btnW * 2.0f + gap > rowAvail)
-            btnW = std::max(20.0f * ui::uiScale, (rowAvail - gap) * 0.5f);
-        float pairW = btnW * 2.0f + gap;
-        ImGui::SetCursorPosX(rowStartX + std::max(0.0f, rowAvail - pairW));
-
-        // OK button — green accent.
-        ImGui::PushStyleColor(ImGuiCol_Button,
-            ImVec4(pal.accentDim[0], pal.accentDim[1], pal.accentDim[2], 1));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-            ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                            ImVec2(4.0f * ui::uiScale, 4.0f * ui::uiScale));
-        {
-            // Atlas glyph is "ok_check" / "cancel_x" (NOT "ok"/"cancel"); the text fallback uses
-            // ASCII because the loaded fonts don't cover U+2713/U+2717 (✓/✗ render as a notdef box).
-            IconUV okIc = getIcon("ok_check", 20);
-            bool btnOk;
-            if (okIc.valid) {
-                btnOk = ImGui::ImageButton("##pm_ok",
-                    okIc.texId, ImVec2(btnW - 8.0f * ui::uiScale, btnW - 8.0f * ui::uiScale),
-                    okIc.uv0, okIc.uv1);
-            } else {
-                btnOk = ImGui::Button("OK##pm", ImVec2(btnW, btnW));
-            }
-            ok = btnOk;
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("OK (Enter)");
-        ImGui::PopStyleVar();
-        ImGui::PopStyleColor(2);
-
-        ImGui::SameLine(0, gap);
-
-        // Cancel button — red/muted.
-        ImGui::PushStyleColor(ImGuiCol_Button,
-            ImVec4(pal.button[0], pal.button[1], pal.button[2], 1));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-            ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 0.7f));
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                            ImVec2(4.0f * ui::uiScale, 4.0f * ui::uiScale));
-        {
-            IconUV cancelIc = getIcon("cancel_x", 20);
-            bool btnCancel;
-            if (cancelIc.valid) {
-                btnCancel = ImGui::ImageButton("##pm_cancel",
-                    cancelIc.texId, ImVec2(btnW - 8.0f * ui::uiScale, btnW - 8.0f * ui::uiScale),
-                    cancelIc.uv0, cancelIc.uv1);
-            } else {
-                btnCancel = ImGui::Button("X##pm", ImVec2(btnW, btnW));
-            }
-            cancel = cancel || btnCancel;
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cancel (Esc)");
-        ImGui::PopStyleVar();
-        ImGui::PopStyleColor(2);
 
         ImGui::Spacing();
         if (aiBusy_) ImGui::BeginDisabled();
@@ -1841,18 +1879,45 @@ void PropertyManager::drawBody(AppState& st) {
     // ---- field rows grouped by `group`, collapsible ------------------------
     const char* curGroup = nullptr;
     bool groupOpen = true;
+    bool groupCardOpen = false;
     const bool useIps = ips_;   // document-unit display (set at open; re-synced above on toggle)
 
     // C37-F: track which Dim field is first/editable for SetKeyboardFocusHere.
     bool firstEditableDimSeen = false;
+
+    auto closeGroupCard = [&]() {
+        if (!groupCardOpen) return;
+        ImGui::EndChild();
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(2);
+        ImGui::PopID();
+        ImGui::Dummy(ImVec2(0, 6.0f * ui::uiScale));
+        groupCardOpen = false;
+    };
 
     for (size_t i = 0; i < fields_.size(); ++i) {
         PMField& f = fields_[i];
         if (!fieldVisible(*f.def, fields_)) continue;
         // New group header?
         if (!curGroup || std::strcmp(curGroup, f.def->group) != 0) {
+            closeGroupCard();
             curGroup = f.def->group;
-            groupOpen = ImGui::CollapsingHeader(curGroup, ImGuiTreeNodeFlags_DefaultOpen);
+            groupOpen = pmSectionHeader(curGroup, pal);
+            if (groupOpen) {
+                ImGui::PushID(curGroup);
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                                    ImVec2(9.0f * ui::uiScale, 8.0f * ui::uiScale));
+                ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                                    ImVec2(7.0f * ui::uiScale, 7.0f * ui::uiScale));
+                ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                    ImVec4(pal.panelBg[0], pal.panelBg[1], pal.panelBg[2], 1));
+                ImGui::PushStyleColor(ImGuiCol_Border,
+                    ImVec4(pal.border[0], pal.border[1], pal.border[2], 0.85f));
+                ImGui::BeginChild("##pm_group_card", ImVec2(0, 0),
+                                  ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY |
+                                  ImGuiChildFlags_AlwaysUseWindowPadding);
+                groupCardOpen = true;
+            }
         }
         if (!groupOpen) continue;
 
@@ -1868,13 +1933,11 @@ void PropertyManager::drawBody(AppState& st) {
         }
         switch (f.def->kind) {
             case PMFieldKind::Dim: {
-                pushTextColor(enabled ? pal.text : pal.textDim);
                 // C37-F: unit suffix in label ("Radius [mm]"). A field may override it (angle =
                 // "[deg]"; an empty override = no suffix).
                 const char* unitSuffix = f.def->unitLabel ? f.def->unitLabel
                                                           : (useIps ? " [in]" : " [mm]");
-                ImGui::Text("%s%s", f.def->label, unitSuffix);
-                ImGui::PopStyleColor();
+                pmCompactLabel(f.def->label, unitSuffix, pal, enabled);
                 if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip("Not yet supported by engine");
                 // Reserve room for the - / + step buttons so the InputText doesn't shove them past
@@ -2007,24 +2070,42 @@ void PropertyManager::drawBody(AppState& st) {
                     : (f.wellActive
                         ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)
                         : ImVec4(pal.border[0], pal.border[1], pal.border[2], pal.border[3]));
-                // C37-F: thicker border on active wells for clearer active-state visual.
-                ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, f.wellActive ? 2.0f : 1.0f);
-                ImGui::PushStyleColor(ImGuiCol_Border, border);
-                ImGui::PushStyleColor(ImGuiCol_Button,
-                    f.wellActive ? ImVec4(pal.accentSoft[0], pal.accentSoft[1],
-                                          pal.accentSoft[2], pal.accentSoft[3])
-                                 : ImVec4(pal.frameBg[0], pal.frameBg[1], pal.frameBg[2], 1));
-                if (ImGui::Button((chip + "##well").c_str(), ImVec2(-1, 0))) {
+                const float S = ui::uiScale;
+                const float availW = ImGui::GetContentRegionAvail().x;
+                const float textPadX = 10.0f * S;
+                const float textPadY = 7.0f * S;
+                const float wrapW = std::max(40.0f * S, availW - textPadX * 2.0f);
+                ImVec2 chipText = ImGui::CalcTextSize(chip.c_str(), nullptr, false, wrapW);
+                float wellH = std::max(ImGui::GetFrameHeight(), chipText.y + textPadY * 2.0f);
+
+                ImVec2 wp0 = ImGui::GetCursorScreenPos();
+                ImVec2 wp1(wp0.x + availW, wp0.y + wellH);
+                if (ImGui::InvisibleButton("##well", ImVec2(availW, wellH))) {
                     // Activate this well; deactivate others.
                     for (auto& o : fields_)
                         if (o.def->kind == PMFieldKind::SelectorWell) o.wellActive = false;
                     f.wellActive = true;
                 }
-                ImGui::PopStyleColor(2);
-                ImGui::PopStyleVar();
+                const bool wellHovered = ImGui::IsItemHovered();
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                ImVec4 fill = f.wellActive
+                    ? ImVec4(pal.accentSoft[0], pal.accentSoft[1], pal.accentSoft[2], pal.accentSoft[3])
+                    : (wellHovered
+                        ? ImVec4(pal.frameBgHovered[0], pal.frameBgHovered[1],
+                                 pal.frameBgHovered[2], pal.frameBgHovered[3])
+                        : ImVec4(pal.frameBg[0], pal.frameBg[1], pal.frameBg[2], 1));
+                dl->AddRectFilled(wp0, wp1, ImGui::ColorConvertFloat4ToU32(fill),
+                                  6.0f * S);
+                dl->AddRect(wp0, wp1, ImGui::ColorConvertFloat4ToU32(border), 6.0f * S, 0,
+                            f.wellActive ? std::max(1.0f, 2.0f * S)
+                                          : std::max(1.0f, 1.0f * S));
+                ImU32 chipCol = f.picks.empty() ? ui::Palette::toU32(pal.textDim)
+                                                : ui::Palette::toU32(pal.text);
+                dl->AddText(nullptr, 0.0f, ImVec2(wp0.x + textPadX, wp0.y + textPadY),
+                            chipCol, chip.c_str(), nullptr, wrapW);
 
                 // C37-F: tooltip on the well button.
-                if (ImGui::IsItemHovered()) {
+                if (wellHovered) {
                     if (f.wellActive)
                         ImGui::SetTooltip("Active — pick faces/edges in the viewport");
                     else if (!f.picks.empty())
@@ -2053,9 +2134,7 @@ void PropertyManager::drawBody(AppState& st) {
                 break;
             }
             case PMFieldKind::Combo: {
-                pushTextColor(enabled ? pal.text : pal.textDim);
-                ImGui::TextUnformatted(f.def->label);
-                ImGui::PopStyleColor();
+                pmCompactLabel(f.def->label, "", pal, enabled);
                 if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip("Not yet supported by engine");
                 // Build display labels (comboLabels if provided, else fall back to comboOptions).
@@ -2103,9 +2182,7 @@ void PropertyManager::drawBody(AppState& st) {
                 break;
             }
             case PMFieldKind::Int: {
-                pushTextColor(enabled ? pal.text : pal.textDim);
-                ImGui::TextUnformatted(f.def->label);
-                ImGui::PopStyleColor();
+                pmCompactLabel(f.def->label, "", pal, enabled);
                 ImGui::SetNextItemWidth(-1);
                 int v = f.intValue;
                 if (ImGui::InputInt("##int", &v)) {
@@ -2117,9 +2194,7 @@ void PropertyManager::drawBody(AppState& st) {
                 break;
             }
             case PMFieldKind::Text: {
-                pushTextColor(enabled ? pal.text : pal.textDim);
-                ImGui::TextUnformatted(f.def->label);
-                ImGui::PopStyleColor();
+                pmCompactLabel(f.def->label, "", pal, enabled);
                 ImGui::SetNextItemWidth(-1);
                 const char* hint = f.def->placeholder ? f.def->placeholder : "";
                 if (ImGui::InputTextWithHint("##text", hint, f.textBuf.data(), f.textBuf.size())) {
@@ -2128,9 +2203,7 @@ void PropertyManager::drawBody(AppState& st) {
                 break;
             }
             case PMFieldKind::DatumRef: {
-                pushTextColor(enabled ? pal.text : pal.textDim);
-                ImGui::TextUnformatted(f.def->label);
-                ImGui::PopStyleColor();
+                pmCompactLabel(f.def->label, "", pal, enabled);
                 std::string lblSrc = f.def->comboLabels ? f.def->comboLabels
                                    : (f.def->comboOptions ? f.def->comboOptions : "");
                 std::vector<std::string> labels; { size_t s = 0;
@@ -2204,6 +2277,7 @@ void PropertyManager::drawBody(AppState& st) {
 
         if (!enabled) ImGui::EndDisabled();
     }
+    closeGroupCard();
 
     // C38 (P3f): After iterating all fields on the first draw after open, mark the focus request
     // handled UNCONDITIONALLY. Previously this only cleared when an editable Dim field was seen, so a

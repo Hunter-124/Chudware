@@ -44,7 +44,7 @@ inline float treeIndent()  { return px(14.0f); }   // nested-entity indent step
 inline float treeToolBtn() { return px(24.0f); }   // square toolbar icon button
 
 // ---- PropertyManager forms --------------------------------------------------------------------
-inline float pmLabelCol()  { return px(96.0f); }   // fixed label column width (two-column rows)
+inline float pmLabelCol()  { return px(116.0f); }  // fixed label column width (two-column rows)
 inline float pmOkBtn()     { return px(28.0f); }   // OK / Cancel button size
 
 // ---- ribbon -----------------------------------------------------------------------------------
@@ -62,8 +62,8 @@ inline float statusBarPadX()  { return px(14.0f); }
 inline float statusBarPadY()  { return px(5.0f); }
 
 // ---- dock default target widths (clamp in PIXELS, see buildDefaultLayout) ----------------------
-inline float dockLeftTarget()  { return px(258.0f); }
-inline float dockLeftMin()     { return px(180.0f); }
+inline float dockLeftTarget()  { return px(360.0f); }
+inline float dockLeftMin()     { return px(250.0f); }
 inline float dockRightTarget() { return px(300.0f); }
 inline float dockRightMin()    { return px(200.0f); }
 

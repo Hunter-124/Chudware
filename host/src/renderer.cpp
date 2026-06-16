@@ -51,6 +51,7 @@ uniform float uMetallic;               // C32-A: 0 = dielectric, 1 = metal
 uniform float uRoughness;              // C32-A: 0 = mirror, 1 = matte
 uniform int   uZebra;                  // Zebra: 1 = surface-continuity stripe mode on
 uniform float uZebraFreq;              // Zebra: stripe count along the reflected-direction band
+uniform float uAlpha;                  // edit-preview ghosting: 1 = opaque, < 1 = translucent
 out vec4 frag;
 
 // C30-C: procedural studio environment sampled by a reflected direction R (Z-up world).
@@ -168,7 +169,7 @@ void main(){
         c += envRefl * fresV * k;
     }
     c = pow(max(c, 0.0), vec3(1.0 / 2.2));  // linear -> sRGB
-    frag = vec4(c, 1.0);
+    frag = vec4(c, uAlpha);
 })";
 
 const char* kBgVert = R"(#version 330 core
@@ -534,6 +535,14 @@ void Renderer::freeSubs() {
     subs_.clear();
 }
 
+void Renderer::setPreviewIsolation(const std::vector<uint64_t>& editFaceKeys, float alpha) {
+    previewFaces_.clear();
+    if (alpha >= 1.0f || editFaceKeys.empty()) { previewAlpha_ = 1.0f; return; }
+    previewAlpha_ = alpha < 0.0f ? 0.0f : alpha;
+    previewFaces_.reserve(editFaceKeys.size());
+    for (uint64_t k : editFaceKeys) previewFaces_.insert(k);
+}
+
 // Re-upload a Sub's positions (and edge lines) as base + deformScale_ * disp. No-op if the body
 // carries no displacement field.
 void Renderer::uploadDeformed(Sub& s) {
@@ -591,6 +600,12 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
         s.color[2] = unset ? defaultPart_[2] : part.color[2];
         s.metallic = part.metallic;     // C32-A RealView material
         s.roughness = part.roughness;
+        // Per-feature preview isolation: keep the body id + face triangle-runs (sorted by first_tri
+        // so adjacent same-class faces can be merged into one draw range during the split pass).
+        s.body_id = part.body_id;
+        s.faces = part.faces;
+        std::sort(s.faces.begin(), s.faces.end(),
+                  [](const FaceSpan& a, const FaceSpan& b) { return a.first_tri < b.first_tri; });
         // C19: keep CPU copies so the deform slider can re-upload displaced positions.
         s.basePos = m.positions;
         s.baseEdge = m.edgeLines;
@@ -780,6 +795,39 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     glUniform1f(glGetUniformLocation(prog_, "uRealView"), realView_ ? 1.0f : 0.0f);  // C30-C
     glUniform1i(glGetUniformLocation(prog_, "uZebra"), zebra_ ? 1 : 0);              // Zebra stripes
     glUniform1f(glGetUniformLocation(prog_, "uZebraFreq"), zebraFreq_);
+    int alphaLoc = glGetUniformLocation(prog_, "uAlpha");
+    // Per-feature edit-preview isolation: when a feature is being previewed (previewAlpha_ < 1 with a
+    // non-empty owned-face set) ONLY that feature's faces draw translucent, in a second pass over the
+    // opaque model. HLR forces everything opaque (its faces only write depth, no color).
+    const bool isolate = (previewAlpha_ < 0.999f) && !previewFaces_.empty() && !hlr;
+
+    // Draw the faces of `s` whose membership in the edited-feature set equals `editing`, as a few
+    // merged contiguous index ranges (s.faces is sorted by first_tri, so neighbours coalesce). A body
+    // with no face metadata is one whole non-editing range (drawn only in the opaque pass).
+    auto drawSubFaces = [&](const Sub& s, bool editing) {
+        if (s.faces.empty()) {
+            if (!editing) glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);
+            return;
+        }
+        const uint64_t hi = (uint64_t)s.body_id << 32;
+        size_t i = 0;
+        while (i < s.faces.size()) {
+            bool inSet = previewFaces_.count(hi | s.faces[i].face_id) != 0;
+            if (inSet != editing) { ++i; continue; }
+            uint32_t first = s.faces[i].first_tri;
+            uint32_t count = s.faces[i].tri_count;
+            size_t j = i + 1;
+            while (j < s.faces.size() &&
+                   (previewFaces_.count(hi | s.faces[j].face_id) != 0) == editing &&
+                   s.faces[j].first_tri == first + count) {
+                count += s.faces[j].tri_count;
+                ++j;
+            }
+            glDrawElements(GL_TRIANGLES, (GLsizei)(count * 3), GL_UNSIGNED_INT,
+                           (const void*)((size_t)first * 3 * sizeof(unsigned int)));
+            i = j;
+        }
+    };
 
     // Solids, pushed back a touch so the feature edges win the depth test on top of them.
     // In HLR styles the faces are painted in the background color so they only occlude (depth) —
@@ -789,6 +837,9 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
         glPolygonOffset(1.0f, 1.0f);
         if (hlr) glUniform1i(useScalarLoc, 0);
         if (hlr) glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+
+        // Pass 1 — opaque: every body's faces, minus the edited feature's when isolating.
+        glUniform1f(alphaLoc, 1.0f);
         for (const auto& s : subs_) {
             if (!s.visible) continue;   // Solid Bodies: hidden body draws nothing
             bool useScalar = !hlr && colormap_ && s.hasScalar;
@@ -802,9 +853,37 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
             glUniform1f(metallicLoc, s.metallic);    // C32-A per-body RealView material
             glUniform1f(roughnessLoc, s.roughness);
             glBindVertexArray(s.vao);
-            glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);
+            if (isolate) drawSubFaces(s, /*editing=*/false);
+            else         glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);
         }
         if (hlr) glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+        // Pass 2 — translucent: ONLY the edited feature's faces, as a uniform coloured ghost over the
+        // opaque model (SolidWorks-style edit preview). The faces are drawn in a fixed amber TINT —
+        // not the body's own shade — so the in-progress feature reads as a clearly-marked preview.
+        // Depth-WRITE is OFF so every layer blends evenly and the whole feature is consistently
+        // see-through (depth-write ON made the nearest face read opaque while only the far side showed
+        // through). Depth-TEST stays on, so opaque geometry IN FRONT still correctly hides it.
+        if (isolate) {
+            const float tint[3] = {0.98f, 0.55f, 0.12f};   // amber/orange preview ghost
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+            glUniform1i(useScalarLoc, 0);                  // a flat tint, never the FEA colormap
+            glUniform1f(alphaLoc, previewAlpha_);
+            glUniform3f(colorLoc, tint[0], tint[1], tint[2]);
+            glUniform1f(metallicLoc, 0.0f);                // matte dielectric for a clean tint
+            glUniform1f(roughnessLoc, 0.5f);
+            for (const auto& s : subs_) {
+                if (!s.visible || s.faces.empty()) continue;
+                glBindVertexArray(s.vao);
+                drawSubFaces(s, /*editing=*/true);
+            }
+            glUniform1f(alphaLoc, 1.0f);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+
         glBindVertexArray(0);
         glDisable(GL_POLYGON_OFFSET_FILL);
     }
@@ -959,6 +1038,7 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px) {
     glUniform1i(glGetUniformLocation(prog_, "uClipCount"), 0);  // thumbnail: no section clip
     glUniform1f(glGetUniformLocation(prog_, "uRealView"), 1.0f);  // C30-C: reflections on in previews
     glUniform1i(glGetUniformLocation(prog_, "uZebra"), 0);       // thumbnail: never striped
+    glUniform1f(glGetUniformLocation(prog_, "uAlpha"), 1.0f);    // thumbnail: always opaque
     int colorLoc = glGetUniformLocation(prog_, "uColor");
     int metallicLoc = glGetUniformLocation(prog_, "uMetallic");   // C32-A RealView material
     int roughnessLoc = glGetUniformLocation(prog_, "uRoughness");

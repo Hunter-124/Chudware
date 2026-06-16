@@ -19,6 +19,7 @@
 
 #include "../core/app_state.h"
 #include "../core/jobs.h"
+#include "../ui_theme.h"
 
 #include "../worker_client.h"
 
@@ -471,7 +472,7 @@ static void drawModeRow(AppState& st) {
     if (st.aiInteraction == 1 && !hasDoc) st.aiInteraction = 0;   // fall back when no doc
     st.agentV2 = (st.aiInteraction == 1);                         // Edit == orchestrator v2
 
-    // Model/provider label — clicking opens Settings (do not duplicate settings UI here).
+    // Model/provider label — clicking jumps to the Settings tab in this same task pane.
     const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp"};
     const char* prov = provNames[(st.settings.provider >= 0 && st.settings.provider < 4)
                                      ? st.settings.provider : 2];
@@ -486,10 +487,10 @@ static void drawModeRow(AppState& st) {
     float modelW = ImGui::GetContentRegionAvail().x;
     bool sameLineToggle = modelW > toggleW + style.ItemSpacing.x + 96.0f * sc;
     if (sameLineToggle) modelW -= toggleW + style.ItemSpacing.x;
-    if (ImGui::Button(label, ImVec2(modelW, 0))) st.openSettings = true;
+    if (ImGui::Button(label, ImVec2(modelW, 0))) st.focusSettingsTab = true;
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Model & provider - click to open Settings.\n%s", label);
+        ImGui::SetTooltip("Model & provider - click to open the Settings tab.\n%s", label);
     if (sameLineToggle) ImGui::SameLine();
     if (supervised) ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.accentMid));
     if (ImGui::Button(toggleLbl, ImVec2(sameLineToggle ? toggleW : -1.0f, 0)))
@@ -500,6 +501,101 @@ static void drawModeRow(AppState& st) {
         ImGui::SetTooltip("%s", supervised
             ? "Supervised: the AI plans first and shows the plan before building. Click for Autopilot."
             : "Autopilot: the AI builds without stopping to confirm. Click for Supervised.");
+}
+
+static void drawInlineSettingsTab(AppState& st, bool busy) {
+    Settings& settings = st.settings;
+    const auto& pal = ui::palette;
+    const float S = ui::uiScale;
+    const char* provs[] = {"Anthropic (Claude)", "OpenAI",
+                           "Local (OpenAI-compatible)", "llama.cpp (managed local)"};
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * S, 8.0f * S));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImVec4(pal.panelBg[0], pal.panelBg[1], pal.panelBg[2], 1));
+    ImGui::BeginChild("##settings_quick", ImVec2(0, 0), ImGuiChildFlags_Border);
+
+    ImGui::PushFont(st.fonts.medium);
+    ImGui::TextUnformatted("AI Settings");
+    ImGui::PopFont();
+    dimText("Provider, model, privacy, and common run behavior.");
+    ImGui::Separator();
+
+    ImGui::TextUnformatted("Provider");
+    ImGui::SetNextItemWidth(-1);
+    int prevProvider = settings.provider;
+    if (ImGui::Combo("##provider", &settings.provider, provs, 4) &&
+        settings.provider != prevProvider) {
+        if (settings.provider == 2) {
+            std::strncpy(settings.baseUrl, "http://localhost:1234/v1",
+                         sizeof(settings.baseUrl) - 1);
+            if (std::strstr(settings.model, ".gguf"))
+                std::strncpy(settings.model, "gemma-4-e4b", sizeof(settings.model) - 1);
+            settings.vision = true;
+        } else if (settings.provider == 3) {
+            std::strncpy(settings.baseUrl, "http://127.0.0.1:1234/v1",
+                         sizeof(settings.baseUrl) - 1);
+            if (!std::strstr(settings.model, ".gguf"))
+                std::strncpy(settings.model, "%APPDATA%\\AI-CAD\\models\\model.gguf",
+                             sizeof(settings.model) - 1);
+            settings.vision = false;
+        }
+    }
+
+    ImGui::TextUnformatted(settings.provider == 3 ? "GGUF model path" : "Model");
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputText("##model_quick", settings.model, sizeof(settings.model));
+
+    if (settings.provider == 0 || settings.provider == 1) {
+        ImGui::TextUnformatted("API key");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##api_quick", settings.apiKey, sizeof(settings.apiKey),
+                         ImGuiInputTextFlags_Password);
+    } else {
+        ImGui::TextUnformatted("Base URL");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##base_quick", settings.baseUrl, sizeof(settings.baseUrl));
+        ImGui::Checkbox("Model supports vision", &settings.vision);
+    }
+
+    ImGui::SeparatorText("Behavior");
+    ImGui::Checkbox("Plan before building", &settings.planMode);
+    ImGui::Checkbox("Offline mode (local models only)", &settings.offlineMode);
+    int units = st.ips() ? 1 : 0;
+    if (ImGui::RadioButton("MMGS", &units, 0)) settings.units = Units::MMGS;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("IPS", &units, 1)) settings.units = Units::IPS;
+
+    bool light = (ui::activeTheme == ui::Theme::Light);
+    if (ImGui::Checkbox("Light theme", &light)) {
+        ui::Theme next = light ? ui::Theme::Light : ui::Theme::Dark;
+        ui::applyTheme(next, st.scale);
+        settings.theme = light ? "light" : "dark";
+        if (st.renderer)
+            st.renderer->setBackground(
+                ui::palette.viewportTop[0], ui::palette.viewportTop[1],
+                ui::palette.viewportTop[2], ui::palette.viewportBottom[0],
+                ui::palette.viewportBottom[1], ui::palette.viewportBottom[2]);
+    }
+
+    if (busy) ImGui::BeginDisabled();
+    if (primaryButton("Save settings", ImVec2(-1, 32.0f * S))) {
+        settings.systemPrompt = st.spBuf.data();
+        saveSettings(settings);
+        st.settings.recentFiles = st.recentFiles;
+        st.addLog("[ok] saved settings");
+        st.toast(ui::ToastLevel::Info, "Settings saved");
+    }
+    if (busy) ImGui::EndDisabled();
+    if (ImGui::Button("Advanced settings...", ImVec2(-1, 0))) st.openSettings = true;
+    if (ImGui::Button("Repair / install runtime", ImVec2(-1, 0)) &&
+        !st.setupRunning.load() && !st.job.running.load()) {
+        st.startSetup(true);
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
 }
 
 // Launch the active turn for `text` according to the current mode (Design/Edit/Ask). Pushes
@@ -669,13 +765,13 @@ static void drawHelpTab(AppState& st, bool canRun) {
     const float sc = ui::uiScale;
     bool workerReady = st.workerStarted && canRun && !st.agentV2Running;
 
-    ImGui::Dummy(ImVec2(0, 2));
+    ImGui::Dummy(ImVec2(0, 2 * sc));
     ImGui::PushFont(st.fonts.medium);
     ImGui::TextUnformatted("AI Help");
     ImGui::PopFont();
     dimText("Ask about the current part, feature tree, dimensions, or CAD workflow. Help mode is read-only.");
 
-    ImGui::Dummy(ImVec2(0, 4));
+    ImGui::Dummy(ImVec2(0, 4 * sc));
     const char* examples[] = {
         "What features are in this part?",
         "Why is my sketch under defined?",
@@ -699,7 +795,7 @@ static void drawHelpTab(AppState& st, bool canRun) {
     }
 
     if (!st.selectedFeatureId.empty()) {
-        ImGui::Dummy(ImVec2(0, 3));
+        ImGui::Dummy(ImVec2(0, 3 * sc));
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
         ImGui::Text("Selected feature: %s", st.selectedFeatureId.c_str());
         ImGui::PopStyleColor();
@@ -711,10 +807,11 @@ static void drawHelpTab(AppState& st, bool canRun) {
         }
     }
 
-    ImGui::Dummy(ImVec2(0, 6));
+    ImGui::Dummy(ImVec2(0, 6 * sc));
     ImGui::SetNextItemWidth(-1);
     ImGui::InputTextMultiline("##help_question", st.helpQuestion.data(), st.helpQuestion.size(),
-                              ImVec2(-1, ImGui::GetTextLineHeight() * 3.0f));
+                              ImVec2(-1, ImGui::GetTextLineHeight() * 3.0f),
+                              ImGuiInputTextFlags_NoHorizontalScroll);
     if (st.helpQuestion[0] == 0) {
         ImVec2 mn = ImGui::GetItemRectMin();
         ImGui::GetWindowDrawList()->AddText(
@@ -733,7 +830,7 @@ static void drawHelpTab(AppState& st, bool canRun) {
     if (ImGui::IsItemHovered() && !workerReady)
         ImGui::SetTooltip("Runtime/worker must be ready and no design/edit run can be active.");
 
-    ImGui::Dummy(ImVec2(0, 8));
+    ImGui::Dummy(ImVec2(0, 8 * sc));
     if (st.helpBusy) {
         static const char* kSpin[] = {"|", "/", "-", "\\"};
         int sp = (int)(ImGui::GetTime() * 8.0) & 3;
@@ -797,12 +894,15 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     drawRuntimeBanner(st);
 
     if (ImGui::BeginTabBar("##ai_tabs")) {
-    if (ImGui::BeginTabItem("Design")) {
+    ImGuiTabItemFlags designFlags = st.focusDesignTab ? ImGuiTabItemFlags_SetSelected
+                                                       : ImGuiTabItemFlags_None;
+    if (ImGui::BeginTabItem("Design", nullptr, designFlags)) {
 
     // ---- INPUT AT TOP — always visible, multiline; Ctrl+Enter sends, Enter = newline ----
     ImGui::SetNextItemWidth(-1);
     ImGui::InputTextMultiline("##aiprompt", st.prompt.data(), st.prompt.size(),
-                              ImVec2(-1, ImGui::GetTextLineHeight() * 2.4f));
+                              ImVec2(-1, ImGui::GetTextLineHeight() * 2.4f),
+                              ImGuiInputTextFlags_NoHorizontalScroll);
     // Ctrl+Enter sends (only while the input is focused); plain Enter inserts a newline.
     bool ctrlEnter = ImGui::IsItemFocused() && ImGui::GetIO().KeyCtrl &&
                      ImGui::IsKeyPressed(ImGuiKey_Enter, false);
@@ -956,7 +1056,15 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         drawHelpTab(st, canRun);
         ImGui::EndTabItem();
     }
+    ImGuiTabItemFlags settingsFlags = st.focusSettingsTab ? ImGuiTabItemFlags_SetSelected
+                                                           : ImGuiTabItemFlags_None;
+    if (ImGui::BeginTabItem("Settings", nullptr, settingsFlags)) {
+        drawInlineSettingsTab(st, busy);
+        ImGui::EndTabItem();
+    }
+    st.focusDesignTab = false;
     st.focusHelpTab = false;
+    st.focusSettingsTab = false;
     ImGui::EndTabBar();
     }
 

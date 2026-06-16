@@ -1,5 +1,6 @@
 // AI-CAD Viewport panel — 3D orbit view + parts list + fit readout + overlays.
 #include <cctype>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -8,6 +9,7 @@
 #include <vector>
 
 #include "imgui.h"
+#include "imgui_internal.h"   // GetWindowDockNode + DockNodeBeginAmendTabBar (tab-bar "+" New file)
 
 #include "viewport_panel.h"
 
@@ -30,6 +32,7 @@
 #include "property_manager.h"  // C27-A: in-viewport parameter callouts
 #include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
 #include "drawing_panel.h"  // DRAWINGS: 2D sheet renderer for a Drawing tab
+#include "doc_tabs.h"
 
 namespace ui {
 
@@ -38,6 +41,279 @@ static MouseGestures s_gestures;
 static ShortcutBar   s_shortcutBar;
 static ViewSelector  s_viewSelector;   // C25 W2-E: glass-box view selector (Space)
 static SectionTool   s_sectionTool;    // C25 W3-J: section-view (impl owned by section_tool agent)
+
+enum class NewDocStage { Root, Drawing, Simulation };
+
+static bool        s_newDocLauncherOpen = false;
+static NewDocStage s_newDocStage = NewDocStage::Root;
+
+static ImU32 withAlpha(const float rgba[4], float alpha) {
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(rgba[0], rgba[1], rgba[2], alpha));
+}
+
+static void drawNewDocPreview(ImDrawList* dl, ImVec2 p0, ImVec2 p1, int kind) {
+    const auto& pal = ui::palette;
+    const float S = ui::uiScale;
+    const ImU32 accent = Palette::toU32(pal.accent);
+    const ImU32 accentDim = Palette::toU32(pal.accentDim);
+    const ImU32 border = withAlpha(pal.border, 0.95f);
+    const ImU32 textDim = withAlpha(pal.textDim, 0.70f);
+    const ImU32 pane = withAlpha(pal.headerBg, 0.82f);
+    dl->AddRectFilled(p0, p1, pane, 5.0f * S);
+    dl->AddRect(p0, p1, border, 5.0f * S, 0, std::max(1.0f, 1.0f * S));
+
+    ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
+    float w = p1.x - p0.x, h = p1.y - p0.y;
+    if (kind == 0) { // part
+        ImVec2 a(c.x - w * 0.26f, c.y - h * 0.04f), b(c.x + w * 0.20f, c.y + h * 0.24f);
+        ImVec2 off(w * 0.12f, -h * 0.18f);
+        ImVec2 ao(a.x + off.x, a.y + off.y);
+        ImVec2 bo(b.x + off.x, b.y + off.y);
+        ImVec2 topRight(b.x + off.x, a.y + off.y);
+        ImVec2 botLeft(a.x + off.x, b.y + off.y);
+        dl->AddQuadFilled(ao, topRight, bo, botLeft,
+                          withAlpha(pal.accent, 0.26f));
+        dl->AddQuadFilled(a, ImVec2(b.x, a.y), b, ImVec2(a.x, b.y), withAlpha(pal.text, 0.20f));
+        dl->AddLine(a, ao, accent, 1.4f * S);
+        dl->AddLine(ImVec2(b.x, a.y), topRight, accent, 1.4f * S);
+        dl->AddLine(b, bo, accent, 1.4f * S);
+        ImVec2 cubePts[] = {ao, topRight, bo, botLeft, ao};
+        dl->AddPolyline(cubePts, 5, accent, 0, 1.4f * S);
+    } else if (kind == 1) { // assembly
+        dl->AddRectFilled(ImVec2(c.x - w * 0.34f, c.y - h * 0.08f),
+                          ImVec2(c.x - w * 0.02f, c.y + h * 0.20f), withAlpha(pal.accent, 0.28f), 3.0f * S);
+        dl->AddRectFilled(ImVec2(c.x + w * 0.04f, c.y - h * 0.22f),
+                          ImVec2(c.x + w * 0.33f, c.y + h * 0.06f), withAlpha(pal.text, 0.18f), 3.0f * S);
+        dl->AddLine(ImVec2(c.x - w * 0.02f, c.y + h * 0.02f),
+                    ImVec2(c.x + w * 0.04f, c.y - h * 0.08f), accent, 2.0f * S);
+        dl->AddCircle(c, 4.0f * S, accent, 18, 1.8f * S);
+    } else if (kind == 2) { // drawing
+        ImVec2 s0(c.x - w * 0.34f, c.y - h * 0.28f), s1(c.x + w * 0.34f, c.y + h * 0.28f);
+        dl->AddRectFilled(s0, s1, withAlpha(pal.text, 0.10f), 2.0f * S);
+        dl->AddRect(s0, s1, border, 2.0f * S, 0, 1.1f * S);
+        dl->AddCircle(ImVec2(c.x - w * 0.11f, c.y - h * 0.03f), 13.0f * S, accent, 24, 1.4f * S);
+        dl->AddRect(ImVec2(c.x + w * 0.08f, c.y - h * 0.12f),
+                    ImVec2(c.x + w * 0.25f, c.y + h * 0.05f), accentDim, 2.0f * S, 0, 1.2f * S);
+        dl->AddLine(ImVec2(s0.x + 9.0f * S, s1.y - 14.0f * S),
+                    ImVec2(s1.x - 9.0f * S, s1.y - 14.0f * S), textDim, 1.0f * S);
+    } else if (kind == 3 || kind == 5) { // simulation/stress
+        ImVec2 beam0(c.x - w * 0.34f, c.y - h * 0.02f), beam1(c.x + w * 0.34f, c.y + h * 0.15f);
+        const ImU32 hot = IM_COL32(242, 99, 78, 180);
+        const ImU32 mid = IM_COL32(245, 190, 66, 170);
+        const ImU32 cold = IM_COL32(45, 212, 191, 150);
+        dl->AddRectFilledMultiColor(beam0, beam1, hot, mid, cold, cold);
+        dl->AddRect(beam0, beam1, border, 2.0f * S, 0, 1.1f * S);
+        for (int i = 0; i < 3; ++i) {
+            float x = c.x - w * 0.22f + i * w * 0.22f;
+            dl->AddLine(ImVec2(x, c.y - h * 0.30f), ImVec2(x, beam0.y - 2.0f * S), accent, 1.5f * S);
+            dl->AddTriangleFilled(ImVec2(x - 4.0f * S, beam0.y - 4.0f * S),
+                                  ImVec2(x + 4.0f * S, beam0.y - 4.0f * S),
+                                  ImVec2(x, beam0.y + 4.0f * S), accent);
+        }
+    } else if (kind == 4) { // pcb
+        ImVec2 b0(c.x - w * 0.34f, c.y - h * 0.23f), b1(c.x + w * 0.34f, c.y + h * 0.24f);
+        dl->AddRectFilled(b0, b1, IM_COL32(22, 116, 95, 170), 5.0f * S);
+        dl->AddRect(b0, b1, accent, 5.0f * S, 0, 1.2f * S);
+        for (int i = 0; i < 4; ++i) {
+            float x = b0.x + (i + 1) * (b1.x - b0.x) / 5.0f;
+            dl->AddCircleFilled(ImVec2(x, c.y - h * 0.08f), 4.0f * S, IM_COL32(230, 205, 112, 210));
+            dl->AddLine(ImVec2(x, c.y - h * 0.08f), ImVec2(c.x, c.y + h * 0.14f),
+                        IM_COL32(230, 205, 112, 190), 1.3f * S);
+        }
+    } else if (kind == 6) { // fluids
+        ImVec2 ch0(c.x - w * 0.34f, c.y - h * 0.18f), ch1(c.x + w * 0.34f, c.y + h * 0.18f);
+        dl->AddRect(ch0, ch1, border, 8.0f * S, 0, 1.2f * S);
+        for (int i = 0; i < 4; ++i) {
+            float y = ch0.y + (i + 1) * (ch1.y - ch0.y) / 5.0f;
+            dl->PathClear();
+            dl->PathLineTo(ImVec2(ch0.x + 8.0f * S, y));
+            dl->PathBezierCubicCurveTo(ImVec2(c.x - 16.0f * S, y - 12.0f * S),
+                                       ImVec2(c.x + 16.0f * S, y + 12.0f * S),
+                                       ImVec2(ch1.x - 8.0f * S, y));
+            dl->PathStroke(accent, 0, 1.5f * S);
+        }
+    } else if (kind == 7) { // electrical
+        dl->AddCircleFilled(ImVec2(c.x - w * 0.20f, c.y), 9.0f * S, accentDim);
+        dl->AddCircleFilled(ImVec2(c.x + w * 0.22f, c.y - h * 0.12f), 9.0f * S, accentDim);
+        ImVec2 tracePts[] = {ImVec2(c.x - w * 0.20f, c.y), ImVec2(c.x - w * 0.02f, c.y),
+                             ImVec2(c.x + w * 0.06f, c.y - h * 0.12f),
+                             ImVec2(c.x + w * 0.22f, c.y - h * 0.12f)};
+        dl->AddPolyline(tracePts, 4, accent, 0, 2.0f * S);
+        ImVec2 boltPts[] = {ImVec2(c.x - 5.0f * S, c.y - h * 0.25f),
+                            ImVec2(c.x + 5.0f * S, c.y - 4.0f * S),
+                            ImVec2(c.x - 2.0f * S, c.y - 4.0f * S),
+                            ImVec2(c.x + 8.0f * S, c.y + h * 0.22f)};
+        dl->AddPolyline(boltPts, 4, IM_COL32(245, 190, 66, 230), 0, 2.0f * S);
+    }
+}
+
+static bool newDocTile(const char* id, const char* title, const char* desc,
+                       int previewKind, ImVec2 size) {
+    const auto& pal = ui::palette;
+    const float S = ui::uiScale;
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, size);
+    bool hovered = ImGui::IsItemHovered();
+    bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    ImVec2 p1(p0.x + size.x, p0.y + size.y);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 fill = Palette::toU32(hovered ? pal.buttonHovered : pal.frameBg);
+    dl->AddRectFilled(p0, p1, fill, 7.0f * S);
+    dl->AddRect(p0, p1, Palette::toU32(hovered ? pal.accentMid : pal.border),
+                7.0f * S, 0, std::max(1.0f, hovered ? 1.5f * S : 1.0f * S));
+    ImVec2 pv0(p0.x + 9.0f * S, p0.y + 9.0f * S);
+    ImVec2 pv1(p1.x - 9.0f * S, p0.y + size.y * 0.58f);
+    drawNewDocPreview(dl, pv0, pv1, previewKind);
+    ImVec2 ts = ImGui::CalcTextSize(title);
+    dl->AddText(ImVec2(p0.x + 12.0f * S, pv1.y + 9.0f * S), Palette::toU32(pal.text), title);
+    dl->AddText(ImVec2(p0.x + 12.0f * S, pv1.y + 30.0f * S),
+                withAlpha(pal.textDim, 0.95f), desc);
+    if (hovered)
+        dl->AddLine(ImVec2(p0.x + 12.0f * S, p1.y - 10.0f * S),
+                    ImVec2(p0.x + 12.0f * S + std::min(ts.x, size.x - 24.0f * S), p1.y - 10.0f * S),
+                    Palette::toU32(pal.accent), 2.0f * S);
+    return clicked;
+}
+
+static void drawNewDocumentPopup(AppState& st);
+
+// The "New file" affordance lives in the central dock node's TAB BAR, to the RIGHT of the "Viewport"
+// tab (browser / SolidWorks "+ new" convention) rather than as a full-width band below the tab.
+// Amends the docked tab bar with a trailing "+ New file" button; this must be called AFTER the host
+// window's End() because DockNodeBeginAmendTabBar re-enters the host window + tab-bar scope. The click
+// only flags s_newDocLauncherOpen — the create-new modal is hosted inside the Viewport window by
+// drawNewDocumentPopup (which opens the popup when it sees the flag), keeping OpenPopup/BeginPopup in
+// the same ID scope. Safe no-op when the window is floating (node == nullptr / no tab bar).
+static void drawViewportNewFileTab(AppState& st, ImGuiDockNode* node) {
+    (void)st;
+    if (!node) return;
+    if (!ImGui::DockNodeBeginAmendTabBar(node)) return;
+    ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(ui::palette.accent));
+    if (ImGui::TabItemButton("+ New file##vp_new_file_tab",
+                             ImGuiTabItemFlags_Trailing | ImGuiTabItemFlags_NoTooltip)) {
+        s_newDocLauncherOpen = true;
+        s_newDocStage = NewDocStage::Root;
+    }
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Create a new document");
+    ImGui::DockNodeEndAmendTabBar();
+}
+
+static void closeNewDocPopup() {
+    s_newDocLauncherOpen = false;
+    s_newDocStage = NewDocStage::Root;
+    ImGui::CloseCurrentPopup();
+}
+
+static void runSimulationChoice(AppState& st, const char* cmd) {
+    st.showSimulationTools = true;
+    st.showRibbon = true;
+    st.ribbonTab = AppState::RT_Simulation;
+    st.showSimPanel = true;
+    if (st.ribbonDispatch) st.ribbonDispatch(cmd);
+}
+
+static void drawNewDocumentPopup(AppState& st) {
+    const auto& pal = ui::palette;
+    const float S = ui::uiScale;
+    if (s_newDocLauncherOpen) ImGui::OpenPopup("Create New##viewport_new_doc");
+    ImGui::SetNextWindowSize(ImVec2(690.0f * S, 430.0f * S), ImGuiCond_Appearing);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f * S, 14.0f * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f * S, 10.0f * S));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, Palette::toU32(pal.popupBg));
+    if (ImGui::BeginPopupModal("Create New##viewport_new_doc", nullptr,
+                               ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoResize)) {
+        const char* title = s_newDocStage == NewDocStage::Root ? "Create new file" :
+                            s_newDocStage == NewDocStage::Drawing ? "Drawing source" :
+                            "Simulation type";
+        const char* sub = s_newDocStage == NewDocStage::Root
+            ? "Choose a workspace. Each tile opens the matching document or setup flow."
+            : s_newDocStage == NewDocStage::Drawing
+                ? "Drawings are generated from an active part or assembly source model."
+                : "Start a study and surface the simulation tools.";
+        ImGui::TextUnformatted(title);
+        ImGui::TextColored(ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1), "%s", sub);
+        ImGui::Separator();
+
+        const float gap = 10.0f * S;
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const int cols = (avail > 600.0f * S) ? 3 : 2;
+        const float tileW = (avail - gap * (cols - 1)) / cols;
+        const float tileH = 132.0f * S;
+        int i = 0;
+        auto next = [&]() {
+            if (++i % cols != 0) ImGui::SameLine(0, gap);
+        };
+        auto finish = [&]() {
+            closeNewDocPopup();
+        };
+
+        if (s_newDocStage == NewDocStage::Root) {
+            if (newDocTile("##new_part", "Part", "Parametric 3D model", 0, ImVec2(tileW, tileH))) {
+                ui::createNewDoc(st, 0); finish();
+            } next();
+            if (newDocTile("##new_assembly", "Assembly", "Components and mates", 1, ImVec2(tileW, tileH))) {
+                ui::createNewDoc(st, 1); finish();
+            } next();
+            if (newDocTile("##new_drawing", "Drawing", "Projected shop sheet", 2, ImVec2(tileW, tileH))) {
+                s_newDocStage = NewDocStage::Drawing;
+            } next();
+            if (newDocTile("##new_sim", "Simulation", "Stress, flow, electrical", 3, ImVec2(tileW, tileH))) {
+                s_newDocStage = NewDocStage::Simulation;
+            } next();
+            if (newDocTile("##new_pcb", "PCB", "Board layout workspace", 4, ImVec2(tileW, tileH))) {
+                st.showPcbTools = true; st.showRibbon = true; st.ribbonTab = AppState::RT_PCB;
+                ui::createNewDoc(st, 4); finish();
+            }
+        } else if (s_newDocStage == NewDocStage::Drawing) {
+            if (newDocTile("##drawing_active", "From active model", "Use current part/assembly", 2, ImVec2(tileW, tileH))) {
+                ui::createNewDoc(st, 2); finish();
+            } next();
+            if (newDocTile("##drawing_part", "New source part", "Start model first", 0, ImVec2(tileW, tileH))) {
+                ui::createNewDoc(st, 0);
+                st.toast(ui::ToastLevel::Info, "Model the part, then create its drawing.");
+                finish();
+            } next();
+            if (newDocTile("##drawing_assembly", "New source assembly", "Build assembly first", 1, ImVec2(tileW, tileH))) {
+                ui::createNewDoc(st, 1);
+                st.toast(ui::ToastLevel::Info, "Build the assembly, then create its drawing.");
+                finish();
+            }
+        } else {
+            if (newDocTile("##sim_stress", "Stress FEA", "Static structural study", 5, ImVec2(tileW, tileH))) {
+                runSimulationChoice(st, "sim_new_static"); finish();
+            } next();
+            if (newDocTile("##sim_fluids", "Fluids", "Flow field study", 6, ImVec2(tileW, tileH))) {
+                runSimulationChoice(st, "sim_new_flow"); finish();
+            } next();
+            if (newDocTile("##sim_electrical", "Electrical", "Circuit simulation", 7, ImVec2(tileW, tileH))) {
+                st.showPcbTools = true; st.showRibbon = true; st.ribbonTab = AppState::RT_PCB;
+                ui::createNewDoc(st, 3);
+                st.ecadSimAnalysis = 0;
+                st.toast(ui::ToastLevel::Info, "Schematic created. Add sources, then run electrical simulation.");
+                finish();
+            }
+        }
+
+        ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 42.0f * S);
+        if (s_newDocStage != NewDocStage::Root) {
+            if (ImGui::Button("Back", ImVec2(92.0f * S, 0))) s_newDocStage = NewDocStage::Root;
+            ImGui::SameLine();
+        }
+        if (ImGui::Button("Cancel", ImVec2(92.0f * S, 0))) closeNewDocPopup();
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+}
+
+// Lenient pan clamp: stop the model's bounding sphere from drifting fully out of the viewport while
+// panning / zoom-to-cursor, WITHOUT being so tight you can't push an edge feature past center to
+// inspect it. kPanLeniency is the extra travel (in model radii) allowed past the view edge — any
+// surface point can still reach screen-center. Rollback: set kClampPan = false to restore the old
+// free-pan behavior. (Intentionally not "tight": the model may sit mostly off-screen at high zoom.)
+static constexpr bool  kClampPan    = true;
+static constexpr float kPanLeniency = 1.25f;
 
 // C25 W3-J: zoom-area mode state.
 static bool  s_zoomAreaArmed = false;
@@ -96,6 +372,7 @@ struct DimDrag {
     std::string featureId;            // the feature being edited
     std::string param;                // the param key being driven ("depth"/"radius"/"angle"/…)
     bool        angle    = false;     // true => value is degrees (drag maps px->deg)
+    bool        allowZero = false;    // 0 is a valid value (draft/twist/offset) => drag floor is 0
     std::string label;                // PM label ("Depth"/"Radius"/"Angle"/…)
     std::string checkpoint;           // doc_checkpoint id taken on press (for revert/cancel)
     nlohmann::json baseParams;        // the feature's params at press (full; one field changes)
@@ -142,6 +419,7 @@ struct DimCandidate {
     std::string param;
     std::string label;
     bool        angle = false;
+    bool        allowZero = false;  // 0 is a valid value (draft/twist/offset) -> drag floor is 0
     double      value = 0.0;        // current stored value (mm or deg)
     float       anchor[3] = {0, 0, 0};
     Vec3        dirW;               // unit world direction the dim is measured along (length dims)
@@ -241,9 +519,8 @@ static bool featureAnchor(AppState& st, const std::string& fid, float out[3], fl
 // learn which params are dims and their labels/units. Skips greyed/conditional-off and expr-bound
 // dims, and any dim whose value the engine table drives (omitWhenDisabled while disabled). Returns
 // at most ~4 candidates (the dims a user actually drives) so the overlay stays readable.
-static std::vector<DimCandidate> dimCandidates(AppState& st) {
+static std::vector<DimCandidate> dimCandidates(AppState& st, const std::string& fid) {
     std::vector<DimCandidate> out;
-    const std::string& fid = st.selectedFeatureId;
     if (fid.empty() || !st.docMirror.hasDoc()) return out;
     const nlohmann::json& tree = st.docMirror.tree();
     const nlohmann::json* feat = findFeature(tree, fid);
@@ -297,6 +574,10 @@ static std::vector<DimCandidate> dimCandidates(AppState& st) {
         bool isAngle = fd.unitLabel && std::strstr(fd.unitLabel, "deg");
         DimCandidate c;
         c.param = fd.key; c.label = fd.label; c.angle = isAngle; c.value = val;
+        // A dim whose form default is 0 (draft angle, sweep twist, extrude offsets) is one where 0
+        // is a legitimate value — so dragging it must be able to reach 0 rather than clamping to the
+        // size floor (0.1mm / 1deg) that protects genuine size dims (depth/radius/revolve angle).
+        c.allowZero = (fd.dimDefault == 0.0);
         c.dirW = dimWorldDir(fd.key);
         if (hasAnchor) {
             // Spread the handles around the anchor so chips/arrows don't stack: nudge each one a
@@ -867,67 +1148,28 @@ static bool dimHandleGeometry(AppState& st, const Renderer& renderer, const ImVe
     return true;
 }
 
-// Apply ONE dimension sample, setting the dragged param to the given ABSOLUTE value via an
-// edit_feature on the FULL params snapshot (one field changed) — the PM preview path exactly.
-//
-// Because the value is absolute (always derived from the press-time baseParams), a preview never
-// compounds, so — unlike push-pull's delta envelope — previews need NO per-sample revert: each
-// preview just overwrites the same field. The undo envelope still yields "one undo":
-//   - PREVIEW (commit=false): applyOps(coalesce=true) — overwrite the field, push NO undo snapshot.
-//   - COMMIT  (commit=true) : doc_revert(checkpoint) [restores pre-drag, pushes the last-preview
-//                             state] then applyOps(coalesce=false) [pushes the pre-drag snapshot].
-//     The TOP of the undo stack after release is the pre-drag state, so one Ctrl+Z restores it.
-static void dimApplySample(AppState& st, double value, bool commit) {
-    if (!st.docMirror.hasDoc()) return;
-    if (commit && !s_dim.checkpoint.empty()) {
-        // Revert to pre-drag first so the committed edit_feature's pushed undo snapshot is the
-        // pre-drag doc (single-undo guarantee), matching the push-pull release envelope.
-        auto rv = st.docMirror.revert(st.worker, s_dim.checkpoint);
-        if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
-    }
-    // Build the edited params: copy the base params, set this one field to the new value. Preserve
-    // the {value,expr} dict shape the engine uses (expr stays null — we only drive bare dims).
-    nlohmann::json params = s_dim.baseParams;
-    auto it = params.find(s_dim.param);
-    if (it != params.end() && it->is_object()) {
-        (*it)["value"] = value;
-        (*it)["expr"]  = nullptr;
-    } else {
-        params[s_dim.param] = {{"value", value}, {"expr", nullptr}};
-    }
-    nlohmann::json ops = nlohmann::json::array();
-    ops.push_back({{"op", "edit_feature"}, {"id", s_dim.featureId},
-                   {"params", params}, {"refs", s_dim.baseRefs}});
-    auto resp = st.docMirror.applyOps(st.worker, ops, /*coalesce=*/!commit);
-    if (!resp.ok) {
-        st.toast(ui::ToastLevel::Error, "Edit dimension failed: " + resp.error_message);
-        return;
-    }
-    if (!resp.aicm_path.empty()) { std::string le; st.loadDocMesh(resp.aicm_path, le); }
-    s_dim.curValue = value;
-    s_dim.lastApplied = value;
-    s_dim.haveReadout = true;
-}
-
-// Cancel an in-flight dimension drag: revert to the checkpoint and clear all state. Safe when no
-// drag is active. Leaves NO zombie checkpoint/flag behind (mirrors ppCancel).
-static void dimCancel(AppState& st) {
-    if (!s_dim.active && s_dim.checkpoint.empty()) { s_dim.reset(); return; }
-    if (!s_dim.checkpoint.empty() && st.docMirror.hasDoc()) {
-        auto rv = st.docMirror.revert(st.worker, s_dim.checkpoint);
-        if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
-    }
-    s_dim.reset();
-}
+// (The dimension drag now feeds the open PropertyManager field directly via dragSetDim(); the old
+// independent edit_feature/checkpoint sample+cancel helpers were removed with that rework — the PM
+// owns the live preview and the single OK/Cancel commit, so there is no separate doc op to manage.)
 
 void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     Renderer& renderer = *st.renderer;
+    auto viewportTitle = [&]() {
+        if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+            const auto& tab = st.docTabs[st.activeTab];
+            std::string label = tab.title.empty() ? std::string("Untitled") : tab.title;
+            if (tab.dirty) label += "*";
+            return label + " - Viewport###Viewport";
+        }
+        return std::string("Viewport###Viewport");
+    };
 
     // ---------- DRAWINGS module: a Drawing tab hosts a 2D sheet in the SAME central dock window
     // as the 3D viewport. Branch here BEFORE any 3D state is touched so part/asm behavior stays
     // byte-identical and the dock layout is unchanged (the "Viewport" window just paints a sheet).
     if (st.showViewport && st.activeTabIsDrawing()) {
-        if (ImGui::Begin("Viewport")) {
+        const std::string title = viewportTitle();
+        if (ImGui::Begin(title.c_str())) {
             ui::drawDrawingSheet(st);
         }
         ImGui::End();
@@ -941,11 +1183,13 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
 
     // ---------- Viewport ----------
     if (st.showViewport) {
-    if (ImGui::Begin("Viewport"))
+    const std::string title = viewportTitle();
+    ImGuiDockNode* vpDockNode = nullptr;   // captured inside Begin, used to amend the tab bar post-End
+    if (ImGui::Begin(title.c_str()))
     {
-        // C24: the view-orientation presets moved into the centered heads-up toolbar drawn over the
-        // viewport image (below), SolidWorks-style. Nothing is drawn here at the panel top so the
-        // 3D view starts flush against the ribbon.
+        vpDockNode = ImGui::GetWindowDockNode();
+        drawNewDocumentPopup(st);   // host the create-new modal; the "+ New file" trigger lives in
+                                    // the dock tab bar (drawViewportNewFileTab, after End()).
 
         // ---- assembly fit readout + parts list (multi-part builds only) ----
         if (!st.asmParts.empty()) {
@@ -1020,19 +1264,18 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
         }
 
-        // Instant3D dimension-drag safety net (mirrors the push-pull one): if a sketch / plane-pick /
-        // PM took over, or the selected feature changed/vanished mid-drag, cancel (revert). If the
-        // LMB was released outside the viewport image, commit at the last value. No zombie state.
+        // Instant3D dimension-drag safety net: the drag is valid only while its feature's PM stays
+        // open. If the PM closed / switched feature, or a sketch / plane-pick took over, drop the
+        // drag (the PM owns the field value + the commit, so there is nothing to revert). If the LMB
+        // was released outside the viewport image, leave the last value in the PM field. No zombie.
         if (s_dim.active) {
-            bool dimPmNow = st.propertyManager && st.propertyManager->active();
-            bool featGone = st.selectedFeatureId != s_dim.featureId ||
-                            findFeature(st.docMirror.tree(), s_dim.featureId) == nullptr;
-            if (inSketch || st.sketchPlanePickActive || dimPmNow || featGone) {
-                dimCancel(st);
+            bool pmOk = st.propertyManager && st.propertyManager->active() &&
+                        st.propertyManager->targetId() == s_dim.featureId;
+            if (inSketch || st.sketchPlanePickActive || !pmOk) {
+                s_dim.reset();
             } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-                dimApplySample(st, s_dim.curValue, /*commit=*/true);
+                st.propertyManager->dragSetDim(s_dim.param, s_dim.curValue);
                 s_dim.active = false;
-                s_dim.checkpoint.clear();
                 s_dim.haveReadout = false;
             }
         }
@@ -1078,6 +1321,26 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // rendering. Sketch mode hard-locks the camera, so cancel/skip the tween while sketching.
         if (inSketch) cancelCameraAnimation();
         else          tickCameraAnimation(st);
+        // SolidWorks-style ghosted edit preview: while a feature's PropertyManager is open and
+        // previewing a part (not sketching), the feature currently being created/edited renders
+        // translucent while the rest of the model stays opaque — so the in-progress feature reads
+        // as a ghost. The owner map gives the exact (body,face) set that feature owns; we hand those
+        // keys to the renderer, which draws just those faces in a second translucent pass.
+        bool pmPreviewing = st.propertyManager && st.propertyManager->active() &&
+                            st.hasDocMesh && !inSketch && !docIsAssembly(st);
+        if (pmPreviewing && !st.propertyManager->targetId().empty()) {
+            std::vector<uint64_t> editKeys;
+            const auto& om = st.docMirror.ownerMap();
+            auto oit = om.find(st.propertyManager->targetId());
+            if (oit != om.end()) {
+                editKeys.reserve(oit->second.faces.size());
+                for (const auto& bf : oit->second.faces)
+                    editKeys.push_back(((uint64_t)bf.first << 32) | (uint64_t)bf.second);
+            }
+            renderer.setPreviewIsolation(editKeys, 0.40f);
+        } else {
+            renderer.clearPreviewIsolation();
+        }
         renderer.renderOrbit(st.yaw, st.pitch, st.zoom, st.pan);
 
         // ---- topology picking (C15): id pass + overlay highlights drawn over the shaded view ----
@@ -1095,8 +1358,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             renderer.beginOverlay();
             // C37-C item 4: draw feature-highlight faces first (underneath selection/hover) using
             // a slightly dimmer tint. Empty vector is zero-cost. Stale keys after rebuild are
-            // silently skipped inside drawFeatureHighlight.
-            if (!st.featureHighlightFaces.empty())
+            // silently skipped inside drawFeatureHighlight. Suppressed while a PM edit preview is
+            // ghosting: the translucent feature already marks itself, and an opaque tint on top of
+            // the ghost would read muddy.
+            if (!st.featureHighlightFaces.empty() && !pmPreviewing)
                 st.overlays->drawFeatureHighlight(renderer.camera(), st.featureHighlightFaces);
             std::vector<render::PickHit> selHits;
             selHits.reserve(st.selection.size());
@@ -1143,12 +1408,32 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             Vec3 R = normalize(cross(worldUp, V));   // screen-right in world space
             Vec3 U = normalize(cross(V, R));         // screen-up in world space
 
+            // Lenient pan clamp (see kClampPan/kPanLeniency). pan is the world-space offset of the
+            // look-at target from the model center, so |pan| is exactly how far the model center
+            // sits from screen-center. Cap it at one view-half (so the model edge reaches the
+            // viewport border) plus kPanLeniency model-radii (so any surface point can pass center).
+            auto clampPan = [&]() {
+                if (!kClampPan) return;
+                const float sceneR = renderer.modelRadius();
+                if (sceneR <= 1e-5f) return;
+                // Recompute from the LIVE zoom (the wheel handler mutates st.zoom after `dist` above).
+                float zl = st.zoom < 0.05f ? 0.05f : st.zoom;
+                float distL = sceneR / std::sin(fov * 0.5f) * 1.05f / zl;
+                const float viewHalf = distL * std::tan(fov * 0.5f);  // world half-height at target
+                const float maxPan   = viewHalf + sceneR * kPanLeniency;
+                float pl = std::sqrt(st.pan[0]*st.pan[0] + st.pan[1]*st.pan[1] + st.pan[2]*st.pan[2]);
+                if (pl > maxPan && pl > 1e-6f) {
+                    float k = maxPan / pl;
+                    st.pan[0] *= k; st.pan[1] *= k; st.pan[2] *= k;
+                }
+            };
             auto applyPan = [&](float ddx, float ddy) {
                 // Drag right (ddx>0) moves the model right -> target shifts left (-R). Drag down
                 // (ddy>0, screen y is down) moves the model down -> target shifts up (+U).
                 st.pan[0] += (-R.x * ddx + U.x * ddy) * worldPerPx;
                 st.pan[1] += (-R.y * ddx + U.y * ddy) * worldPerPx;
                 st.pan[2] += (-R.z * ddx + U.z * ddy) * worldPerPx;
+                clampPan();
             };
             auto clampPitch = [&]() {
                 st.pitch = st.pitch > 89 ? 89 : (st.pitch < -89 ? -89 : st.pitch);
@@ -1393,73 +1678,59 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
 
             // ---- Instant3D dimension-handle drag: press / drag / release ------------------------
-            // Runs AFTER the push-pull block and is gated on !s_pp.active, so the FACE ARROW WINS
-            // when a single drivable face is selected (its press grabs the mouse first). Dimension
-            // handles are shown/hit only when a feature is selected with NO single face active (tree
-            // selection, body/edge pick, or multi-face), so the two gestures never fight. Owns the
-            // mouse for its whole lifetime (orbit/pan/pick skip while s_dim.active).
-            if (st.hasDocMesh && !st.sketchPlanePickActive && !ppPmOpen && !s_zoomAreaArmed &&
+            // ONLY while a feature's PropertyManager is open (creating/editing) — never on a passive
+            // FeatureManager-tree highlight. The handles drive the feature being previewed
+            // (pm->targetId()); a drag sets the matching PM field and fires the PM's live preview, so
+            // the on-screen drag and the form field are ONE edit — the PM's OK/Cancel owns the single
+            // commit/undo (no separate doc op or checkpoint here). The face push-pull is suppressed
+            // while the PM is open, so the two gestures never fight.
+            const bool pmDimActive = ppPmOpen && st.propertyManager &&
+                                     st.propertyManager->hasPreviewTarget();
+            const std::string dimFid = pmDimActive ? st.propertyManager->targetId() : std::string();
+            if (st.hasDocMesh && !st.sketchPlanePickActive && pmDimActive && !s_zoomAreaArmed &&
                 !s_pp.active && !s_asmDrag.active) {
-                // Press: hit-test every dimension handle of the selected feature.
+                // Press: hit-test every dimension handle of the feature under edit.
                 if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s_dim.active) {
-                    // Only offer dimension handles when NO single face is selected (that case is the
-                    // push-pull arrow's domain). A multi-face / edge / body / tree selection — or no
-                    // topology selection at all but a selectedFeatureId — shows dim handles.
-                    bool singleFaceSel =
-                        st.selection.size() == 1 &&
-                        st.selection.items().front().hit.valid() &&
-                        st.selection.items().front().hit.kind == render::PickKind::Face;
-                    if (!singleFaceSel) {
-                        auto cands = dimCandidates(st);
-                        ImVec2 mp = io.MousePos;
-                        float hitR = 9.0f * ui::uiScale;
-                        float armLenPx = 42.0f * ui::uiScale;
-                        for (const auto& c : cands) {
-                            ImVec2 aSp, tipP, tipN; float dsx, dsy, wpp, dpp;
-                            if (!dimHandleGeometry(st, renderer, vr0, vr1, vw, vh, c, aSp, tipP,
-                                                   tipN, dsx, dsy, wpp, dpp))
-                                continue;
-                            float dx = mp.x - aSp.x, dy = mp.y - aSp.y;
-                            float along = dx * dsx + dy * dsy;
-                            float perp  = std::fabs(dx * (-dsy) + dy * dsx);
-                            bool onAxis = perp <= hitR && std::fabs(along) <= armLenPx + hitR;
-                            auto nearTip = [&](const ImVec2& t) {
-                                float ddx = mp.x - t.x, ddy = mp.y - t.y;
-                                return std::sqrt(ddx*ddx + ddy*ddy) <= hitR * 1.6f;
-                            };
-                            if (!(onAxis || nearTip(tipP) || nearTip(tipN))) continue;
-                            // Grab this handle. Snapshot the feature's params/refs at press so every
-                            // sample sets this one field to an ABSOLUTE value from the original
-                            // params (no compounding); the checkpoint backs the commit/cancel revert.
-                            const nlohmann::json* feat =
-                                findFeature(st.docMirror.tree(), st.selectedFeatureId);
-                            if (!feat) break;
-                            std::string cp = st.docMirror.checkpoint(st.worker);
-                            s_dim.reset();
-                            s_dim.active     = true;
-                            s_dim.featureId  = st.selectedFeatureId;
-                            s_dim.param      = c.param;
-                            s_dim.angle      = c.angle;
-                            s_dim.label      = c.label;
-                            s_dim.checkpoint = cp;
-                            s_dim.baseParams = feat->contains("params") && (*feat)["params"].is_object()
-                                                   ? (*feat)["params"] : nlohmann::json::object();
-                            s_dim.baseRefs   = feat->contains("refs") && (*feat)["refs"].is_object()
-                                                   ? (*feat)["refs"] : nlohmann::json::object();
-                            s_dim.oldValue   = c.value;
-                            s_dim.curValue   = c.value;
-                            s_dim.lastApplied = 1e30;
-                            s_dim.pressPos   = mp;
-                            s_dim.dsx = dsx; s_dim.dsy = dsy;
-                            s_dim.worldPerPx = wpp; s_dim.degPerPx = dpp;
-                            s_dim.haveReadout = true;
-                            s_dim.clamped = false;
-                            break;   // one handle per press
-                        }
+                    auto cands = dimCandidates(st, dimFid);
+                    ImVec2 mp = io.MousePos;
+                    float hitR = 9.0f * ui::uiScale;
+                    float armLenPx = 42.0f * ui::uiScale;
+                    for (const auto& c : cands) {
+                        ImVec2 aSp, tipP, tipN; float dsx, dsy, wpp, dpp;
+                        if (!dimHandleGeometry(st, renderer, vr0, vr1, vw, vh, c, aSp, tipP,
+                                               tipN, dsx, dsy, wpp, dpp))
+                            continue;
+                        float dx = mp.x - aSp.x, dy = mp.y - aSp.y;
+                        float along = dx * dsx + dy * dsy;
+                        float perp  = std::fabs(dx * (-dsy) + dy * dsx);
+                        bool onAxis = perp <= hitR && std::fabs(along) <= armLenPx + hitR;
+                        auto nearTip = [&](const ImVec2& t) {
+                            float ddx = mp.x - t.x, ddy = mp.y - t.y;
+                            return std::sqrt(ddx*ddx + ddy*ddy) <= hitR * 1.6f;
+                        };
+                        if (!(onAxis || nearTip(tipP) || nearTip(tipN))) continue;
+                        // Grab this handle. The drag feeds the PM field — no doc op / checkpoint here;
+                        // the PM owns the live preview and the single OK/Cancel commit.
+                        s_dim.reset();
+                        s_dim.active      = true;
+                        s_dim.featureId   = dimFid;
+                        s_dim.param       = c.param;
+                        s_dim.angle       = c.angle;
+                        s_dim.allowZero   = c.allowZero;
+                        s_dim.label       = c.label;
+                        s_dim.oldValue    = c.value;
+                        s_dim.curValue    = c.value;
+                        s_dim.lastApplied = 1e30;
+                        s_dim.pressPos    = mp;
+                        s_dim.dsx = dsx; s_dim.dsy = dsy;
+                        s_dim.worldPerPx = wpp; s_dim.degPerPx = dpp;
+                        s_dim.haveReadout = true;
+                        s_dim.clamped = false;
+                        break;   // one handle per press
                     }
                 }
 
-                // Drag: convert cursor motion to an absolute value and apply a throttled sample.
+                // Drag: convert cursor motion to an absolute value and push it into the PM field.
                 if (s_dim.active && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                     st.requestCursor(ui::CursorKind::Crosshair);
                     cancelCameraAnimation();
@@ -1472,27 +1743,32 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     else
                         newVal = s_dim.oldValue + (double)px * (double)s_dim.worldPerPx;
                     // Clamp to a sane minimum (mirror the engine push-pull floor of 0.1mm; angles to
-                    // 1..360 deg). Flag clamped so the readout shows the limit.
+                    // 1..360 deg). Flag clamped so the readout shows the limit. Dims where 0 is a
+                    // valid value (draft angle, sweep twist, offsets) floor at 0 instead — otherwise
+                    // a draft set by dragging could never be dragged back to 0 (no taper).
                     s_dim.clamped = false;
                     if (s_dim.angle) {
-                        if (newVal < 1.0)   { newVal = 1.0;   s_dim.clamped = true; }
+                        double lo = s_dim.allowZero ? 0.0 : 1.0;
+                        if (newVal < lo)    { newVal = lo;    s_dim.clamped = true; }
                         if (newVal > 360.0) { newVal = 360.0; s_dim.clamped = true; }
                     } else {
-                        if (newVal < 0.1)   { newVal = 0.1;   s_dim.clamped = true; }
+                        double lo = s_dim.allowZero ? 0.0 : 0.1;
+                        if (newVal < lo)    { newVal = lo;    s_dim.clamped = true; }
                     }
                     s_dim.curValue = newVal;
-                    // Throttle: only call the worker when the value moved enough to matter (angles a
-                    // touch coarser). Synchronous call => at most one ever in flight.
+                    // Throttle: only update the PM field when the value moved enough to matter (angles
+                    // a touch coarser). The PM's debounced preview rebuilds from the field.
                     double thresh = s_dim.angle ? 0.25 : 0.05;
-                    if (std::fabs(newVal - s_dim.lastApplied) >= thresh)
-                        dimApplySample(st, newVal, /*commit=*/false);
+                    if (std::fabs(newVal - s_dim.lastApplied) >= thresh &&
+                        st.propertyManager->dragSetDim(s_dim.param, newVal))
+                        s_dim.lastApplied = newVal;
                 }
 
-                // Release: commit exactly one undo entry at the final value.
+                // Release: leave the final value in the PM field (its OK button commits it). The drag
+                // never wrote a doc op of its own, so there is nothing to commit/undo here.
                 if (s_dim.active && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-                    dimApplySample(st, s_dim.curValue, /*commit=*/true);
+                    st.propertyManager->dragSetDim(s_dim.param, s_dim.curValue);
                     s_dim.active = false;
-                    s_dim.checkpoint.clear();
                     s_dim.haveReadout = false;
                 }
             }
@@ -1561,6 +1837,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     st.pan[0] += ( R.x * cxp - U.x * cyp) * k;
                     st.pan[1] += ( R.y * cxp - U.y * cyp) * k;
                     st.pan[2] += ( R.z * cxp - U.z * cyp) * k;
+                    clampPan();   // keep the model from drifting fully out of view as we zoom in
                 }
             }
         } else if (imgHovered && inSketch) {
@@ -1663,7 +1940,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // prevents this block from running in that case, so this Esc is safe).
             if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
                 if (s_pp.active) ppCancel(st);
-                else if (s_dim.active) dimCancel(st);
+                else if (s_dim.active) {
+                    // Cancel the in-progress dim drag: restore the field to its press-time value
+                    // (the PM re-previews) and end the drag. The PM itself stays open.
+                    if (st.propertyManager) st.propertyManager->dragSetDim(s_dim.param, s_dim.oldValue);
+                    s_dim.reset();
+                }
                 else if (imgHovered) st.selection.clear();
             }
 
@@ -1931,7 +2213,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     ImGui::Separator();
                     // C37-C item 3: wire View Selector to actually open the selector widget.
                     if (ImGui::MenuItem("View Selector (Space)")) {
-                        if (!s_viewSelector.active()) s_viewSelector.open();
+                        if (!s_viewSelector.active()) s_viewSelector.openFramed(st);
                     }
                     ImGui::EndPopup();
                 }
@@ -2169,16 +2451,15 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // feature's geometry; press it to drag-edit that param. While dragging, the dragged chip
         // shows "Depth 25.0 -> 31.5 mm" in the active units, and a "(min)" hint at the clamp.
         {
-            bool dimPmOpen = st.propertyManager && st.propertyManager->active();
-            bool singleFaceSel =
-                st.selection.size() == 1 &&
-                st.selection.items().front().hit.valid() &&
-                st.selection.items().front().hit.kind == render::PickKind::Face;
+            // Dimension handles render ONLY while a feature's PM is open (creating/editing) — they
+            // drive pm->targetId(), not the tree selection. Never shown on a passive tree highlight.
+            const std::string dimRenderFid =
+                (st.propertyManager && st.propertyManager->hasPreviewTarget())
+                    ? st.propertyManager->targetId() : std::string();
             bool canShowDim = st.hasDocMesh && !inSketch && !st.sketchPlanePickActive &&
-                              !dimPmOpen && !s_viewSelector.active() && !s_pp.active &&
-                              !singleFaceSel && !st.selectedFeatureId.empty();
+                              !s_viewSelector.active() && !s_pp.active && !dimRenderFid.empty();
             if (canShowDim) {
-                auto cands = dimCandidates(st);
+                auto cands = dimCandidates(st, dimRenderFid);
                 const auto& vpal2 = ui::palette;
                 const ImU32 acc  = ui::Palette::toU32(vpal2.accent);
                 const ImU32 accS = ui::Palette::toU32(vpal2.accentSoft);
@@ -2189,7 +2470,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     if (!dimHandleGeometry(st, renderer, vr0, vr1, vw, vh, c, aSp, tipP, tipN,
                                            dsx, dsy, wpp, dpp))
                         continue;
-                    bool isDragged = s_dim.active && s_dim.featureId == st.selectedFeatureId &&
+                    bool isDragged = s_dim.active && s_dim.featureId == dimRenderFid &&
                                      s_dim.param == c.param;
                     // While THIS dim is being dragged, suppress the static chips for the OTHER dims so
                     // the view stays clean; the dragged dim keeps its handle + a live readout.
@@ -2498,6 +2779,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         }  // end overlay colors scope
     }
     ImGui::End();
+    // "+ New file" button to the RIGHT of the Viewport tab — amends the central dock node's tab bar,
+    // so it must run after the window's End() (it re-enters the host window/tab-bar scope).
+    drawViewportNewFileTab(st, vpDockNode);
     }
 }
 

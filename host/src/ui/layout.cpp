@@ -19,6 +19,9 @@
 #include "config_panel.h"       // ConfigPanel::drawEmbedded (live Configurations tab)
 #include "icons.h"              // getIcon / IconUV
 
+#include <algorithm>
+#include <cstdio>
+
 // C24: SolidWorks 2025 default arrangement.
 //   LEFT   = LeftPane (the SW task pane: Explorer / FeatureManager / PropertyManager /
 //            Configurations as a vertical icon-tab strip), full height ribbon->status (~280px). The
@@ -48,8 +51,8 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     const float panelSc = 1.0f + (sc - 1.0f) * 0.55f;
     auto clampf = [](float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); };
     const float minCenterPx = clampf(420.0f * panelSc, 320.0f, 0.52f * w);
-    float leftPx  = clampf(258.0f * panelSc, 190.0f * panelSc, 0.28f * w);
-    float rightPx = clampf(320.0f * panelSc, 230.0f * panelSc, 0.32f * w);
+    float leftPx  = clampf(360.0f * panelSc, 250.0f * panelSc, 0.34f * w);
+    float rightPx = clampf(380.0f * panelSc, 270.0f * panelSc, 0.36f * w);
     const float sideMax = w - minCenterPx;
     if (leftPx + rightPx > sideMax && sideMax > 0.0f) {
         const float k = sideMax / (leftPx + rightPx);
@@ -67,8 +70,8 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     // Bottom slice of the right pane holds the command dialogs as docked tabs.
     rightBottom = ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.42f, nullptr, &right);
 
-    // Wave 1D: the left slot now hosts the tabbed task-pane window "LeftPane" (was "FeatureManager").
-    ImGui::DockBuilderDockWindow("LeftPane", left);
+    // Wave 1D: visible dock label stays familiar while the internal id is stable.
+    ImGui::DockBuilderDockWindow("FeatureManager##LeftPane", left);
     // One task-pane window: Design / Activity / Console live as internal tabs.
     ImGui::DockBuilderDockWindow("AI", right);
     // Wave N/O: ECAD shares the central node with the Viewport (tabbed). Dock ECAD FIRST so the
@@ -76,6 +79,7 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     // own (SetNextWindowFocus) when an ECAD document is loaded.
     ImGui::DockBuilderDockWindow("ECAD", main);
     ImGui::DockBuilderDockWindow("Viewport", main);
+    ImGui::DockBuilderDockWindow("Viewport###Viewport", main);
     // Command dialogs dock into the lower-right slot so they surface as tabs instead of floating
     // behind the central node. They share one node (only one is typically open at a time).
     const char* dialogs[] = {
@@ -100,6 +104,67 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
 
 namespace ui {
 
+static ImVec4 roleColor(const float role[4]) {
+    return ImVec4(role[0], role[1], role[2], role[3]);
+}
+
+static bool drawManagerTabButton(const char* id,
+                                 const char* icon,
+                                 const char* fallback,
+                                 const char* tip,
+                                 bool selected,
+                                 bool pmAttention,
+                                 float btn,
+                                 float glyph) {
+    const auto& pal = ui::palette;
+    const float S = ui::uiScale;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImVec2 p1(p0.x + btn, p0.y + btn);
+
+    ImGui::PushID(id);
+    bool clicked = ImGui::InvisibleButton("##lp_tab", ImVec2(btn, btn));
+    bool hovered = ImGui::IsItemHovered();
+
+    ImU32 fill = 0;
+    if (selected) fill = ui::Palette::toU32(pal.ribbonTabActive);
+    else if (hovered) fill = ui::Palette::toU32(pal.buttonHovered);
+    if (fill) dl->AddRectFilled(p0, p1, fill, 7.0f * S);
+
+    if (selected) {
+        dl->AddRectFilled(ImVec2(p0.x, p0.y + 6.0f * S),
+                          ImVec2(p0.x + 3.0f * S, p1.y - 6.0f * S),
+                          ui::Palette::toU32(pal.accent), 2.0f * S);
+        dl->AddRect(p0, p1, ui::Palette::toU32(pal.accentSoft), 7.0f * S, 0,
+                    std::max(1.0f, 1.0f * S));
+    }
+
+    IconUV ic = getIcon(icon, 20);
+    if (ic.valid) {
+        float ix = p0.x + (btn - glyph) * 0.5f;
+        float iy = p0.y + (btn - glyph) * 0.5f;
+        ImVec4 tint = selected ? roleColor(pal.text) : roleColor(pal.textDim);
+        if (pmAttention && !selected) tint = roleColor(pal.accent);
+        dl->AddImage(ic.texId, ImVec2(ix, iy), ImVec2(ix + glyph, iy + glyph),
+                     ic.uv0, ic.uv1, ImGui::ColorConvertFloat4ToU32(tint));
+    } else {
+        ImVec2 ts = ImGui::CalcTextSize(fallback);
+        ImU32 tc = selected ? ui::Palette::toU32(pal.text) : ui::Palette::toU32(pal.textDim);
+        dl->AddText(ImVec2(p0.x + (btn - ts.x) * 0.5f, p0.y + (btn - ts.y) * 0.5f),
+                    tc, fallback);
+    }
+
+    if (pmAttention) {
+        float r = 3.0f * S;
+        dl->AddCircleFilled(ImVec2(p1.x - 6.0f * S, p0.y + 6.0f * S), r,
+                            ui::Palette::toU32(pal.statusWarn));
+    }
+
+    if (hovered) ImGui::SetTooltip("%s", tip);
+    ImGui::PopID();
+    return clicked;
+}
+
 // ---- Configurations tab body (no Begin/End) -------------------------------
 // The part-document engine has no named-configuration schema yet (config_* RPCs exist for the
 // dockable ConfigPanel, but parts ship a single implicit configuration). Render the implicit
@@ -117,7 +182,7 @@ void drawConfigurationsBody(AppState& st) {
 
     // Implicit single configuration: bold accent dot + "[Active]" tag (SolidWorks bolds the active).
     ImGui::PushStyleColor(ImGuiCol_Text, accentCol);
-    ImGui::TextUnformatted(u8"\xe2\x97\x8f  Default");   // bullet + name
+    ImGui::TextUnformatted("*  Default");
     ImGui::PopStyleColor();
     ImGui::SameLine();
     ImGui::TextColored(dimCol, "[Active]");
@@ -127,8 +192,8 @@ void drawConfigurationsBody(AppState& st) {
     ImGui::Spacing();
     ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
     ImGui::TextColored(dimCol,
-        "Named configurations and design tables are coming in a later wave. The "
-        "Configurations / Design Table windows (View menu) cover config editing for now.");
+        "Use Design Table for editable configuration values. The active configuration is "
+        "mirrored here so the left manager stays the single place to inspect model state.");
     ImGui::PopTextWrapPos();
 }
 
@@ -152,57 +217,94 @@ void drawLeftPane(AppState& st,
     }
     s_pmWasActive = pmActive;
 
-    if (!ImGui::Begin("LeftPane")) { ImGui::End(); return; }
+    if (!ImGui::Begin("FeatureManager##LeftPane")) { ImGui::End(); return; }
 
     const auto& pal = ui::palette;
     const float S = ui::uiScale;
 
+    // True horizontal center of the WHOLE pane (icon rail + body), captured BEFORE the rail child so
+    // the FeatureManager header can be centered across the full panel. Centering only within the body
+    // (right of the rail) left the header sitting slightly left of the panel's true center.
+    const ImVec2 paneOrigin  = ImGui::GetCursorScreenPos();
+    const float  paneInnerW  = ImGui::GetContentRegionAvail().x;
+    const float  paneCenterX = paneOrigin.x + paneInnerW * 0.5f;
+
     // ---- vertical icon-tab strip (SolidWorks style: small icons stacked on the left edge) ----
     struct TabDef { int id; const char* icon; const char* fallback; const char* tip; };
     static const TabDef kTabs[] = {
-        { kLeftPaneExplorer,        "body_folder", "[E]", "Explorer" },
-        { kLeftPaneFeatureManager,  "history",     "[F]", "FeatureManager" },
-        { kLeftPanePropertyManager, "material",    "[P]", "PropertyManager" },
-        { kLeftPaneConfigurations,  "settings",    "[C]", "Configurations" },
+        { kLeftPaneExplorer,        "body_folder", "E", "Explorer" },
+        { kLeftPaneFeatureManager,  "history",     "F", "Feature Manager" },
+        { kLeftPanePropertyManager, "material",    "P", "Property Manager" },
+        { kLeftPaneConfigurations,  "settings",    "C", "Configurations" },
     };
 
-    const float btn = 28.0f * S;          // square tab button (matches FM toolbar button tier)
-    const float glyph = 18.0f * S;        // toolbar glyph tier
-    const float gap = 2.0f * S;
+    const float btn = 36.0f * S;
+    const float glyph = 20.0f * S;
+    const float gap = 4.0f * S;
     const ImGuiStyle& style = ImGui::GetStyle();
-    const float stripW = btn + style.WindowPadding.x;   // icon column + a little breathing room
+    const float stripW = btn + 8.0f * S;
 
     ImGui::BeginChild("##lp_tabstrip", ImVec2(stripW, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 rail0 = ImGui::GetWindowPos();
+    ImVec2 rail1(rail0.x + stripW, rail0.y + ImGui::GetWindowHeight());
+    dl->AddRectFilled(rail0, rail1, ui::Palette::toU32(pal.headerBg));
+    ImGui::SetCursorPos(ImVec2(4.0f * S, 6.0f * S));
     for (const TabDef& t : kTabs) {
         const bool selected = (st.leftPaneTab == t.id);
-        if (selected) {
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                ImVec4(pal.accentDim[0], pal.accentDim[1], pal.accentDim[2], 1));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
-        }
-        ImGui::PushID(t.id);
-        IconUV ic = getIcon(t.icon, 20);
-        bool clicked;
-        if (ic.valid) {
-            clicked = ImGui::ImageButton("##lp_tab", ic.texId, ImVec2(glyph, glyph),
-                                         ic.uv0, ic.uv1);
-        } else {
-            clicked = ImGui::Button(t.fallback, ImVec2(btn, btn));
-        }
-        if (clicked) st.leftPaneTab = t.id;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", t.tip);
-        ImGui::PopID();
-        if (selected) ImGui::PopStyleColor(2);
+        const bool attention = (t.id == kLeftPanePropertyManager && pmActive);
+        char idBuf[16];
+        std::snprintf(idBuf, sizeof(idBuf), "%d", t.id);
+        if (drawManagerTabButton(idBuf, t.icon, t.fallback, t.tip, selected, attention, btn, glyph))
+            st.leftPaneTab = t.id;
         ImGui::Dummy(ImVec2(0, gap));
     }
     ImGui::EndChild();
 
-    ImGui::SameLine(0, 0);
+    // Breathing room between the icon rail and the body content so the FeatureManager block sits
+    // away from the Explorer/FeatureManager/PropertyManager/Configurations rail instead of crowding
+    // it. (Left gap only — the body itself fills to the right edge, see below.)
+    const float bodyInset = 12.0f * S;
+    ImGui::SameLine(0, bodyInset);
 
     // ---- active tab body ----
+    const char* title = "Feature Manager";
+    const char* titleIcon = "history";
+    if (st.leftPaneTab == kLeftPaneExplorer) {
+        title = "Explorer";
+        titleIcon = "body_folder";
+    } else if (st.leftPaneTab == kLeftPanePropertyManager && pmActive) {
+        title = "Property Manager";
+        titleIcon = "material";
+    } else if (st.leftPaneTab == kLeftPaneConfigurations) {
+        title = "Configurations";
+        titleIcon = "settings";
+    }
+
+    // Body fills to the panel's right edge (scrollbar flush with the edge — no dead space past it).
+    // The left gap from the rail (bodyInset via SameLine) supplies the breathing room; the header
+    // is still centered at the panel's TRUE center below, independent of the body width.
     ImGui::BeginChild("##lp_body", ImVec2(0, 0), ImGuiChildFlags_None);
+    IconUV headIcon = getIcon(titleIcon, 20);
+    const float iconSz = headIcon.valid ? 20.0f * S : 0.0f;
+    const float iconGap = headIcon.valid ? 6.0f * S : 0.0f;
+    const float titleW = ImGui::CalcTextSize(title).x;
+    const float groupW = iconSz + iconGap + titleW;
+    // Center the header at the pane's TRUE horizontal center (captured in screen space above),
+    // mapped into this body child's local cursor X; clamp so it never sits left of the body padding.
+    const float localCur = ImGui::GetCursorPosX();
+    const float titleX = std::max(localCur,
+        localCur + (paneCenterX - groupW * 0.5f - ImGui::GetCursorScreenPos().x));
+    ImGui::SetCursorPosX(titleX);
+    if (headIcon.valid) {
+        ImGui::Image(headIcon.texId, ImVec2(iconSz, iconSz), headIcon.uv0, headIcon.uv1);
+        ImGui::SameLine(0, iconGap);
+    }
+    ImGui::PushFont(st.fonts.medium);
+    ImGui::TextUnformatted(title);
+    ImGui::PopFont();
+    ImGui::Separator();
     switch (st.leftPaneTab) {
         case kLeftPaneExplorer:
             // Wave 3: the workspace file browser (file_explorer.cpp).

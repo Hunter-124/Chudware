@@ -26,4 +26,8 @@ float drawDocTabs(AppState& state, float topY);
 // Ctrl+N key hook (the "+" button opens it directly). No-op if the strip isn't drawn (no document).
 void openNewDocChooser();
 
+// Create a document directly from menus/toolbars without drawing the old document strip.
+// kind: 0=Part, 1=Assembly, 2=Drawing, 3=Schematic, 4=PCB.
+void createNewDoc(AppState& state, int kind);
+
 }  // namespace ui

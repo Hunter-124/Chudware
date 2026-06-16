@@ -2589,27 +2589,48 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
     if (c.axis == "h")      B.y = A.y;   // horizontal: ignore vertical delta
     else if (c.axis == "v") B.x = A.x;   // vertical
 
-    // Arc conditions: a "min"/"max" circle ref visually attaches at its near/far RIM point along
-    // the measurement direction instead of the center (matches the engine's ∓r adjustment).
-    {
-        auto condShift = [&](size_t i, ImVec2& P, const ImVec2& other) {
-            if (c.cond.size() <= i || c.refs.size() <= i) return;
-            const std::string& cd = c.cond[i];
-            if (cd != "min" && cd != "max") return;
-            const SketchEntity* e = entById(baseId(c.refs[i]));
-            if (!e || (e->type != "circle" && e->type != "arc")) return;
-            ImVec2 cc = uvToScreen(e->center[0], e->center[1]);
-            ImVec2 rimRef = uvToScreen(e->center[0] + e->radius, e->center[1]);
-            float rpx = std::hypot(rimRef.x - cc.x, rimRef.y - cc.y);
-            float ddx = other.x - P.x, ddy = other.y - P.y;
-            float LL = std::hypot(ddx, ddy);
-            if (LL < 1e-3f) return;
-            float sgn = (cd == "min") ? 1.0f : -1.0f;
-            P.x += ddx / LL * rpx * sgn; P.y += ddy / LL * rpx * sgn;
-        };
-        ImVec2 A0 = A, B0 = B;
-        condShift(0, A, B0);
-        condShift(1, B, A0);
+    // Arc conditions: a "min"/"max" circle ref attaches at its rim instead of the centre. A
+    // DIRECTIONAL (h/v) dimension attaches at the TANGENT LINE — centre±r along the axis (matches
+    // the engine's coordinate-based tangent-line residual; works for concentric/nested circles
+    // where the old "toward/away the other centre" shift collapsed to nothing). An ALIGNED
+    // dimension uses the near/far rim along the A->B centre line (engine adds ±r to the scalar gap).
+    if (!c.cond.empty()) {
+        const bool directional = (c.axis == "h" || c.axis == "v");
+        if (directional) {
+            auto tangent = [&](size_t i, ImVec2& P) {
+                if (c.cond.size() <= i || c.refs.size() <= i) return;
+                const std::string& cd = c.cond[i];
+                if (cd != "min" && cd != "max") return;
+                const SketchEntity* e = entById(baseId(c.refs[i]));
+                if (!e || (e->type != "circle" && e->type != "arc")) return;
+                float s = (cd == "min") ? -1.0f : 1.0f;
+                float ru = e->center[0] + (c.axis == "h" ? s * e->radius : 0.0f);
+                float rv = e->center[1] + (c.axis == "v" ? s * e->radius : 0.0f);
+                P = uvToScreen(ru, rv);
+            };
+            tangent(0, A); tangent(1, B);
+            if (c.axis == "h")      B.y = A.y;   // re-collapse onto the axis after the rim shift
+            else if (c.axis == "v") B.x = A.x;
+        } else {
+            auto condShift = [&](size_t i, ImVec2& P, const ImVec2& other) {
+                if (c.cond.size() <= i || c.refs.size() <= i) return;
+                const std::string& cd = c.cond[i];
+                if (cd != "min" && cd != "max") return;
+                const SketchEntity* e = entById(baseId(c.refs[i]));
+                if (!e || (e->type != "circle" && e->type != "arc")) return;
+                ImVec2 cc = uvToScreen(e->center[0], e->center[1]);
+                ImVec2 rimRef = uvToScreen(e->center[0] + e->radius, e->center[1]);
+                float rpx = std::hypot(rimRef.x - cc.x, rimRef.y - cc.y);
+                float ddx = other.x - P.x, ddy = other.y - P.y;
+                float LL = std::hypot(ddx, ddy);
+                if (LL < 1e-3f) return;
+                float sgn = (cd == "min") ? 1.0f : -1.0f;
+                P.x += ddx / LL * rpx * sgn; P.y += ddy / LL * rpx * sgn;
+            };
+            ImVec2 A0 = A, B0 = B;
+            condShift(0, A, B0);
+            condShift(1, B, A0);
+        }
     }
 
     // Dimension line passes through the placement point, parallel to A->B; extension lines run from
@@ -2710,8 +2731,9 @@ bool SketchMode::hoveredLineMidpoint(const ImVec2& s, float& mu, float& mv) cons
 // Build the pending dimension from the current pick buffer + the live cursor. Returns true when the
 // picks form a valid combo (and dimPending_/dimType_/dimMeasured_ are filled). cu,cv = cursor uv (for
 // the h/v/aligned variant choice on point-point).
-bool SketchMode::dimBuildPending(const ImVec2& cursor, float cu, float cv) {
-    dimHasPending_ = false; dimAxis_.clear();
+bool SketchMode::dimBuildPending(const ImVec2& cursor, float cu, float cv, bool keepAxis) {
+    dimHasPending_ = false;
+    if (!keepAxis) dimAxis_.clear();
     // C38 (S1): resolve every pick's stored id to a CURRENT entity ptr. If any entity-pick has
     // vanished from ents_ (refilled mid-pick), bail — the combo is no longer valid.
     auto entOf = [&](const DimPick& p) -> const SketchEntity* {
@@ -2802,17 +2824,23 @@ bool SketchMode::dimBuildPending(const ImVec2& cursor, float cu, float cv) {
         if (aPt && bPt) {        // point/circle <-> point/circle distance (variant chosen at place)
             float au, av, bu, bv; handleUV(a, au, av); handleUV(b, bu, bv);
             // SolidWorks variant by cursor zone: beyond the vertical span -> horizontal; beyond the
-            // horizontal span -> vertical; inside both -> aligned.
-            float ymin = std::fmin(av, bv), ymax = std::fmax(av, bv);
-            float xmin = std::fmin(au, bu), xmax = std::fmax(au, bu);
-            if (cv < ymin || cv > ymax) dimAxis_ = "h";
-            else if (cu < xmin || cu > xmax) dimAxis_ = "v";
-            else dimAxis_.clear();
+            // horizontal span -> vertical; inside both -> aligned. keepAxis re-runs (Modify-box arc
+            // condition change) leave the already-placed axis untouched.
+            if (!keepAxis) {
+                float ymin = std::fmin(av, bv), ymax = std::fmax(av, bv);
+                float xmin = std::fmin(au, bu), xmax = std::fmax(au, bu);
+                if (cv < ymin || cv > ymax) dimAxis_ = "h";
+                else if (cu < xmin || cu > xmax) dimAxis_ = "v";
+                else dimAxis_.clear();
+            }
+            // h/v is a DIRECTIONAL tangent-line distance: each circle's rim offset attaches to its
+            // own centre coordinate (engine _add_distance h/v branch), so a concentric/nested
+            // wall thickness is |(au+adjA) - (bu+adjB)| rather than |Δ| - rA - rB (which would
+            // shove the circles apart). Aligned keeps the centre-line sum.
             double m;
-            if (dimAxis_ == "h") m = std::fabs(bu - au);
-            else if (dimAxis_ == "v") m = std::fabs(bv - av);
-            else m = std::hypot(bu - au, bv - av);
-            m += condAdj(a) + condAdj(b);          // min/max arc conditions shift by the radii
+            if (dimAxis_ == "h")      m = std::fabs((au + condAdj(a)) - (bu + condAdj(b)));
+            else if (dimAxis_ == "v") m = std::fabs((av + condAdj(a)) - (bv + condAdj(b)));
+            else m = std::hypot(bu - au, bv - av) + condAdj(a) + condAdj(b);
             dimType_ = "distance"; dimMeasured_ = m;
             dimPending_ = {{"type", "distance"},
                            {"refs", nlohmann::json::array({refOf(a), refOf(b)})}};
@@ -6588,28 +6616,22 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     const SketchEntity* ce = entById(p.entId);
                     if (!ce || (ce->type != "circle" && ce->type != "arc")) continue;
                     int cur = p.cond == "min" ? 1 : p.cond == "max" ? 2 : 0;
-                    double adjOld = cur == 1 ? -(double)ce->radius : cur == 2 ? (double)ce->radius : 0.0;
                     ImGui::SetNextItemWidth(150 * sc);
                     std::string lbl = std::string(shown == 0 ? "Arc condition" : "Arc condition 2")
                                       + "##cond" + p.entId;
                     if (ImGui::Combo(lbl.c_str(), &cur, kConds, 3)) {
-                        double adjNew = cur == 1 ? -(double)ce->radius : cur == 2 ? (double)ce->radius : 0.0;
                         p.cond = cur == 1 ? "min" : cur == 2 ? "max" : "center";
-                        dimMeasured_ += adjNew - adjOld;
                         condChanged = true;
                     }
                     ++shown;
                 }
-                if (condChanged && dimPending_.contains("refs")) {
-                    nlohmann::json cond = nlohmann::json::array();
-                    for (const auto& rr : dimPending_["refs"]) {
-                        std::string rs = rr.get<std::string>();
-                        std::string cv = "center";
-                        for (const auto& p : dimPicks_)
-                            if (!p.isPoint && p.entId == rs && !p.cond.empty()) cv = p.cond;
-                        cond.push_back(cv);
-                    }
-                    dimPending_["cond"] = cond;
+                if (condChanged) {
+                    // Re-derive refs/cond AND the measured value from the updated picks, keeping the
+                    // already-chosen axis. This routes through the same tangent-line math as the
+                    // live preview, so min/max on overlapping or concentric circles reads correctly
+                    // (the old incremental "+= adjNew - adjOld" assumed the additive centre-line
+                    // model and was wrong for the directional h/v case).
+                    dimBuildPending(dimPopupPos_, dimPlaceU_, dimPlaceV_, /*keepAxis=*/true);
                     std::snprintf(dimBuf_.data(), dimBuf_.size(), "%s", fmtLen(dimMeasured_).c_str());
                 }
             }

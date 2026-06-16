@@ -1,7 +1,7 @@
 {
   "atlas_px": [
     56,
-    4964
+    5134
   ],
   "cell": {
     "app@32": {
@@ -1588,171 +1588,231 @@
       "w": 20,
       "h": 20
     },
-    "rect_3pt_corner@32": {
+    "copy@32": {
       "x": 0,
       "y": 4489,
       "w": 32,
       "h": 32
     },
-    "rect_3pt_corner@20": {
+    "copy@20": {
       "x": 34,
       "y": 4495,
       "w": 20,
       "h": 20
     },
-    "rect_3pt_center@32": {
+    "paste@32": {
       "x": 0,
       "y": 4523,
       "w": 32,
       "h": 32
     },
-    "rect_3pt_center@20": {
+    "paste@20": {
       "x": 34,
       "y": 4529,
       "w": 20,
       "h": 20
     },
-    "parallelogram@32": {
+    "delete@32": {
       "x": 0,
       "y": 4557,
       "w": 32,
       "h": 32
     },
-    "parallelogram@20": {
+    "delete@20": {
       "x": 34,
       "y": 4563,
       "w": 20,
       "h": 20
     },
-    "circle_perimeter@32": {
+    "folder_new@32": {
       "x": 0,
       "y": 4591,
       "w": 32,
       "h": 32
     },
-    "circle_perimeter@20": {
+    "folder_new@20": {
       "x": 34,
       "y": 4597,
       "w": 20,
       "h": 20
     },
-    "slot_ctr_str@32": {
+    "refresh@32": {
       "x": 0,
       "y": 4625,
       "w": 32,
       "h": 32
     },
-    "slot_ctr_str@20": {
+    "refresh@20": {
       "x": 34,
       "y": 4631,
       "w": 20,
       "h": 20
     },
-    "slot_arc_3pt@32": {
+    "rect_3pt_corner@32": {
       "x": 0,
       "y": 4659,
       "w": 32,
       "h": 32
     },
-    "slot_arc_3pt@20": {
+    "rect_3pt_corner@20": {
       "x": 34,
       "y": 4665,
       "w": 20,
       "h": 20
     },
-    "slot_arc_ctr@32": {
+    "rect_3pt_center@32": {
       "x": 0,
       "y": 4693,
       "w": 32,
       "h": 32
     },
-    "slot_arc_ctr@20": {
+    "rect_3pt_center@20": {
       "x": 34,
       "y": 4699,
       "w": 20,
       "h": 20
     },
-    "spline_style@32": {
+    "parallelogram@32": {
       "x": 0,
       "y": 4727,
       "w": 32,
       "h": 32
     },
-    "spline_style@20": {
+    "parallelogram@20": {
       "x": 34,
       "y": 4733,
       "w": 20,
       "h": 20
     },
-    "spline_surface@32": {
+    "circle_perimeter@32": {
       "x": 0,
       "y": 4761,
       "w": 32,
       "h": 32
     },
-    "spline_surface@20": {
+    "circle_perimeter@20": {
       "x": 34,
       "y": 4767,
       "w": 20,
       "h": 20
     },
-    "spline_equation@32": {
+    "slot_ctr_str@32": {
       "x": 0,
       "y": 4795,
       "w": 32,
       "h": 32
     },
-    "spline_equation@20": {
+    "slot_ctr_str@20": {
       "x": 34,
       "y": 4801,
       "w": 20,
       "h": 20
     },
-    "ellipse_partial@32": {
+    "slot_arc_3pt@32": {
       "x": 0,
       "y": 4829,
       "w": 32,
       "h": 32
     },
-    "ellipse_partial@20": {
+    "slot_arc_3pt@20": {
       "x": 34,
       "y": 4835,
       "w": 20,
       "h": 20
     },
-    "parabola@32": {
+    "slot_arc_ctr@32": {
       "x": 0,
       "y": 4863,
       "w": 32,
       "h": 32
     },
-    "parabola@20": {
+    "slot_arc_ctr@20": {
       "x": 34,
       "y": 4869,
       "w": 20,
       "h": 20
     },
-    "conic@32": {
+    "spline_style@32": {
       "x": 0,
       "y": 4897,
       "w": 32,
       "h": 32
     },
-    "conic@20": {
+    "spline_style@20": {
       "x": 34,
       "y": 4903,
       "w": 20,
       "h": 20
     },
-    "hide_show_eye@32": {
+    "spline_surface@32": {
       "x": 0,
       "y": 4931,
       "w": 32,
       "h": 32
     },
-    "hide_show_eye@20": {
+    "spline_surface@20": {
       "x": 34,
       "y": 4937,
+      "w": 20,
+      "h": 20
+    },
+    "spline_equation@32": {
+      "x": 0,
+      "y": 4965,
+      "w": 32,
+      "h": 32
+    },
+    "spline_equation@20": {
+      "x": 34,
+      "y": 4971,
+      "w": 20,
+      "h": 20
+    },
+    "ellipse_partial@32": {
+      "x": 0,
+      "y": 4999,
+      "w": 32,
+      "h": 32
+    },
+    "ellipse_partial@20": {
+      "x": 34,
+      "y": 5005,
+      "w": 20,
+      "h": 20
+    },
+    "parabola@32": {
+      "x": 0,
+      "y": 5033,
+      "w": 32,
+      "h": 32
+    },
+    "parabola@20": {
+      "x": 34,
+      "y": 5039,
+      "w": 20,
+      "h": 20
+    },
+    "conic@32": {
+      "x": 0,
+      "y": 5067,
+      "w": 32,
+      "h": 32
+    },
+    "conic@20": {
+      "x": 34,
+      "y": 5073,
+      "w": 20,
+      "h": 20
+    },
+    "hide_show_eye@32": {
+      "x": 0,
+      "y": 5101,
+      "w": 32,
+      "h": 32
+    },
+    "hide_show_eye@20": {
+      "x": 34,
+      "y": 5107,
       "w": 20,
       "h": 20
     }

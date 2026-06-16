@@ -495,6 +495,13 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err) {
         pm.mesh = meshFromBody(b);
         pm.color[0] = b.color[0]; pm.color[1] = b.color[1]; pm.color[2] = b.color[2];
         pm.metallic = b.metallic; pm.roughness = b.roughness;  // C32-A RealView material
+        // Per-feature edit-preview isolation: carry the body id + per-face triangle runs so the
+        // renderer can draw a single feature's faces translucent. meshFromBody copies b.idx
+        // verbatim, so each FaceRange's first_tri/tri_count still index this body's EBO 1:1.
+        pm.body_id = b.body_id;
+        pm.faces.reserve(b.faces.size());
+        for (const auto& fr : b.faces)
+            pm.faces.push_back({fr.face_id, fr.first_tri, fr.tri_count});
         // First scalar field for this body (von Mises / |u| / thickness / …).
         for (const auto& sc : doc.scalars) {
             if (sc.body_id == b.body_id && sc.values.size() == b.n_verts) {

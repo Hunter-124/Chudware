@@ -667,7 +667,10 @@ int run_gui(const char* screenshotPath) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
-    static std::string iniPath = appdataDir() + "\\AI-CAD\\imgui.ini";
+    // GUI rework layout schema. The old imgui.ini can contain dock IDs/window placements from
+    // pre-rework names, which restores the FeatureManager into the center and leaves Viewport as a
+    // floating orphan. Use a versioned ini so stale dock layouts cannot override buildDefaultLayout.
+    static std::string iniPath = appdataDir() + "\\AI-CAD\\imgui_gui_v2.ini";
     io.IniFilename = shot ? nullptr : iniPath.c_str();
 
     float xs = 1.0f, ys = 1.0f;
@@ -1955,12 +1958,11 @@ int run_gui(const char* screenshotPath) {
                     st.docRedo();
                 }
             }
-            // Wave 2 (GUI rework): Ctrl+N opens the "+" New-Document chooser (Part/Assembly/Drawing/
-            // Schematic/PCB). Skip while a text field owns input. The chooser flag is consumed by the
-            // doc-tab strip's draw; it shows only when at least one document is already open.
+            // Ctrl+N creates a new part directly. The old "+" chooser lived in the removed document
+            // strip; full document-type creation is still available from File > New.
             if (!textFocus && (io.KeyCtrl || io.KeySuper) && !io.KeyShift &&
                 ImGui::IsKeyPressed(ImGuiKey_N, false))
-                ui::openNewDocChooser();
+                ui::createNewDoc(st, 0);
 
             // ---- Wave 3: Ctrl+O / Ctrl+S / Ctrl+Shift+S file shortcuts ----
             // Set request flags consumed by the GL-thread file pump below (after the input block) so
@@ -2157,15 +2159,14 @@ int run_gui(const char* screenshotPath) {
         // C40: accent-highlight the armed sketch tool's ribbon button.
         ui::setRibbonActiveCmd(sketchMode.activeToolCmd());
         float ribbonH = ui::drawRibbon(st.ribbonTab, st.showRibbon,
-                                       st.showSimulationTools, st.showPcbTools);
+                                       st.showSimulationTools, st.showPcbTools, barH);
 
-        // ---------- document tab strip (browser/SolidWorks-style; under the ribbon) ----------
-        // Reconcile the strip with the mirror (adopt a doc created by a path that doesn't open its
-        // own tab — sketch auto-create, chat new-part, agent v2 run, assembly panel), then draw it.
-        // Shown whenever at least one document is open; zero-height in the empty start state so the
-        // single-document / no-document layout is unchanged.
+        // ---------- active document reconciliation ----------
+        // The old browser-style document strip used to live under the ribbon. That wasted a full
+        // horizontal band, so document identity now lives in the central Viewport dock tab; keep the
+        // reconciliation step, but give the reclaimed height back to the dockspace.
         st.ensureActiveTab();
-        float docTabsH = ui::drawDocTabs(st, barH + ribbonH);
+        float docTabsH = 0.0f;
 
         // ---------- dockspace host (between the title bar+ribbon and the status bar) ----------
         const float statusH = ImGui::GetTextLineHeight() + 12.0f * scale;
@@ -2182,7 +2183,9 @@ int run_gui(const char* screenshotPath) {
             ImGuiWindowFlags_NoDocking;
         ImGui::Begin("##DockHost", nullptr, hostFlags);
         ImGui::PopStyleVar(3);
-        ImGuiID dockId = ImGui::GetID("AICADDock");
+        // Versioned dockspace ID pairs with imgui_gui_v2.ini. Changing this intentionally forces
+        // one clean DockBuilder layout after major window/dock identity changes.
+        ImGuiID dockId = ImGui::GetID("AICADDockV2");
         if ((!st.layoutInit && ImGui::DockBuilderGetNode(dockId) == nullptr) || st.resetLayout) {
             buildDefaultLayout(dockId, ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
             st.layoutInit = true;

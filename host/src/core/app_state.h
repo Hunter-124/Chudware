@@ -605,6 +605,7 @@ struct AppState {
     bool showTaskPane = true;
     bool focusDesignTab = false;  // one-shot: focus the Design tab after a (re)layout
     bool focusHelpTab = false;    // one-shot: focus the AI pane's Help tab
+    bool focusSettingsTab = false; // one-shot: focus the AI pane's Settings tab
     // Consolidated AI panel (Design / Activity / Console as internal tabs). One dock window "AI".
     bool showAIPanel = true;
     // Configurations panel (SolidWorks ConfigurationManager). Dockable "Configurations" window in

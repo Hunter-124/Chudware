@@ -185,6 +185,15 @@ public:
     // ("true"/"false"/"1"/"0"), or a Dim/Int number. No-op if no field has that key.
     void presetFieldForShot(const std::string& key, const std::string& value);
 
+    // Viewport Instant3D coupling: while the PM is open, dragging an on-screen dimension handle sets
+    // the matching Dim/Angle field to `value` (canonical mm/deg) and schedules the live preview — so
+    // the drag flows through the SAME edit path as typing in the field (one source of truth, the PM's
+    // OK/Cancel owns the commit/undo). Returns true if a visible+enabled Dim field `key` took it.
+    bool dragSetDim(const std::string& key, double value);
+    // True once the create-mode preview feature exists or in edit mode — i.e. there is a concrete
+    // feature whose dimensions the viewport may show drag handles for.
+    bool hasPreviewTarget() const { return active_ && !targetId_.empty(); }
+
     // Draw the PM panel into the dock slot (called in place of the tree while active()).
     // Compatibility wrapper: handles the dock-visible / floating-fallback Begin/End, then calls
     // drawBody(). The Wave 1D tabbed left pane calls drawBody() directly inside its own container.

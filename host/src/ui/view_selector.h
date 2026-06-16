@@ -29,6 +29,9 @@ public:
         m_hoverDwell = 0.0f;
         m_previewReady = false;
     }
+    // Open AND animate the camera to frame the whole box with the model centered (zoom-to-fit +
+    // recenter, orientation kept). Preferred entry point — keeps the box from opening off-screen.
+    void openFramed(AppState& st);
 
 private:
     void close() { m_active = false; m_hoverZone = -1; }

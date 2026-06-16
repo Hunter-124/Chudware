@@ -878,7 +878,8 @@ void setRibbonActiveCmd(const char* cmd_id) {
     s_activeCmd = (cmd_id && *cmd_id) ? cmd_id : "";
 }
 
-float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool showPcbTools) {
+float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool showPcbTools,
+                 float titleBarH) {
     if (!visible) return 0.0f;
     ribbon_seedDefaults();
     if (activeTab < 0 || activeTab >= kRibbonTabCount ||
@@ -891,7 +892,10 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     float totalH = tabH + bodyH2 + 8.0f * s;
 
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    float titleBarH   = ImGui::GetFrameHeight();
+    // Use the caller-provided ACTUAL title-bar height. The old self-computed GetFrameHeight() used
+    // the default frame padding, but drawTitleBar pushes a taller FramePadding.y, so the ribbon was
+    // positioned ~2*(padDelta) px too high and clipped its tab strip up under the menu bar.
+    if (titleBarH < 0.0f) titleBarH = ImGui::GetFrameHeight();
 
     ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + titleBarH));
     ImGui::SetNextWindowSize(ImVec2(vp->Size.x, totalH));
@@ -919,8 +923,8 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     ImVec2      wPos = ImGui::GetWindowPos();
 
     // --- Tab strip ---
-    float tabTopPad = 3.0f * s;
-    float tabBtnH   = tabH - tabTopPad;
+    float tabTopPad = 0.0f;
+    float tabBtnH   = tabH;
     float tabX = wPos.x + 6.0f * s;
     float tabY = wPos.y + tabTopPad;
 
@@ -955,9 +959,9 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         ImVec4 lc = (isAct || tabHov)
             ? ImVec4(palette.text[0],    palette.text[1],    palette.text[2],    palette.text[3])
             : ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], palette.textDim[3]);
+        const float textY = snap(tp0.y + (tabBtnH - tsize.y) * 0.5f - 1.0f * s);
         dl->AddText(nullptr, 0.0f,
-                    ImVec2(tp0.x + (tw - tsize.x) * 0.5f,
-                           tp0.y + (tabBtnH - tsize.y) * 0.5f),
+                    ImVec2(snap(tp0.x + (tw - tsize.x) * 0.5f), textY),
                     ImGui::ColorConvertFloat4ToU32(lc), tabLabel);
 
         tabX += tw + 2.0f * s;

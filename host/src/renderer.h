@@ -3,7 +3,9 @@
 // The same color texture is displayed live in the ImGui viewport. Multi-part assemblies
 // render each body in its own color (matching the engine's contact-sheet palette).
 #pragma once
+#include <cstdint>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "math.h"
@@ -26,8 +28,19 @@ public:
     // thickness, …) and a per-vertex displacement (FEA deformed shape). When the renderer's
     // colormap mode is on AND `scalar` is populated (one value per vertex), the body draws through
     // the LUT instead of its flat color; `disp` is applied on the CPU at the current deform scale.
+    // One picking face = a contiguous run of triangles in the body's index buffer (mirrors
+    // render::FaceRange). Carried through so the shaded pass can draw a single feature's faces
+    // translucent (per-feature edit-preview isolation) while the rest of the body stays opaque.
+    struct FaceSpan {
+        uint32_t face_id = 0;
+        uint32_t first_tri = 0;
+        uint32_t tri_count = 0;
+    };
+
     struct PartMesh {
         Mesh mesh;
+        uint32_t body_id = 0;             // AICM body id (matches the owner-map (body<<32)|face keys)
+        std::vector<FaceSpan> faces;      // per-face triangle runs (empty = whole body opaque only)
         float color[3] = {0.62f, 0.70f, 0.80f};
         // C32-A RealView material (0 metallic / 0.5 roughness == dielectric plastic, the C30 look).
         float metallic = 0.0f;
@@ -88,6 +101,13 @@ public:
     bool zebraOn() const { return zebra_; }
     void setDisplayStyle(DisplayStyle s) { displayStyle_ = s; }
     DisplayStyle displayStyle() const { return displayStyle_; }
+    // SolidWorks-style per-feature edit preview: while a feature's PropertyManager is open, ONLY the
+    // faces owned by that feature draw translucent (a real shaded pass at `alpha`), so the in-progress
+    // feature reads as a ghost over the rest of the model — which stays fully opaque. `editFaceKeys`
+    // are (body_id<<32)|face_id keys (the owner map's face set for the edited feature). Pass an empty
+    // set (or alpha >= 1) to clear isolation and render everything opaque.
+    void setPreviewIsolation(const std::vector<uint64_t>& editFaceKeys, float alpha);
+    void clearPreviewIsolation() { previewFaces_.clear(); previewAlpha_ = 1.0f; }
     void renderView(const std::string& view);            // "iso"|"front"|"right"|"top"
     void renderOrbit(float yawDeg, float pitchDeg, float zoom);
     // W2-D: orbit with a world-space pan offset added to the look-at target. The orbit center
@@ -180,6 +200,8 @@ private:
         unsigned int edgeVao = 0, vboEdge = 0;
         unsigned int vboScalar = 0;   // C19: per-vertex scalar attribute (location 2); 0 = none
         int idxCount = 0, edgeVerts = 0;
+        uint32_t body_id = 0;                 // AICM body id (for per-feature preview isolation)
+        std::vector<FaceSpan> faces;          // per-face triangle runs, sorted by first_tri
         float color[3] = {0.62f, 0.70f, 0.80f};
         float metallic = 0.0f, roughness = 0.5f;  // C32-A RealView material
         // CPU-side copies kept so the deform slider can re-upload displaced positions.
@@ -251,6 +273,8 @@ private:
     float defaultPart_[3] = {0.776f, 0.792f, 0.847f};
     float groundShadow_[4] = {0.20f, 0.22f, 0.26f, 0.35f};
     bool realView_ = true;  // C30-C: environment-reflection sheen (uRealView in kFrag)
+    float previewAlpha_ = 1.0f; // < 1 ghosts the edited feature's faces (per-feature edit preview)
+    std::unordered_set<uint64_t> previewFaces_;  // (body<<32)|face keys to ghost; empty = none
     bool zebra_ = false;        // Zebra surface-continuity stripe mode (uZebra in kFrag); default OFF
     float zebraFreq_ = 18.0f;   // stripe band density along the reflected-direction coord
     DisplayStyle displayStyle_ = DisplayStyle::ShadedEdges;

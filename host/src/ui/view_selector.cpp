@@ -17,7 +17,16 @@ namespace {
 
 // ---- box geometry constants (pre-scale; geometry is in world units, scaled to the model) ----
 constexpr float kBoxScale  = 1.35f;   // box half-extent = bounding radius * this
-constexpr float kChamfer   = 0.22f;   // corner truncation as a fraction of the half-extent
+constexpr float kChamfer   = 0.275f;  // corner truncation as a fraction of the half-extent.
+                                      // Drives the iso "corner" click triangles — bumped ~25%
+                                      // (0.22 -> 0.275) so the iso targets are easier to hit.
+
+// Zoom the camera animates to when the selector opens, so the WHOLE truncated box is framed with
+// margin and the model sits centered inside it. zoom=1 frames the model's bounding sphere (radius
+// R); the box has half-extent kBoxScale*R, whose silhouette circum-radius peaks at ~2*halfExtent
+// when viewed edge-on. Framing 1.95*kBoxScale*R (edge-on worst case, trimmed a touch for the
+// chamfer) guarantees no clipping at any orientation; in iso the box then sits at ~70% of the view.
+constexpr float kSelectorFitZoom = 1.0f / (1.95f * kBoxScale);
 
 // A standard view: caption + the yaw/pitch the camera animates to (degrees).
 struct ViewAngle { const char* name; float yaw, pitch; };
@@ -126,7 +135,10 @@ bool buildZones(Renderer& renderer, ImVec2 vr0, ImVec2 vr1,
     const float h = cam.radius * kBoxScale;
     if (h <= 1e-5f) return false;
     const float c = h * kChamfer;
-    const Vec3  C = cam.center;
+    // Anchor the box to the MODEL center, not cam.center (= the orbit target, modelCenter + pan).
+    // With zoom-to-cursor the pan is nonzero, so using the target would let the box drift away from
+    // the model on screen; the model is always built around modelCenter(), so the box must be too.
+    const Vec3  C = renderer.modelCenter();
     const Vec3  eye = cam.eye;
     const float* m = cam.mvp.m;   // column-major model->clip
 
@@ -216,17 +228,27 @@ bool buildZones(Renderer& renderer, ImVec2 vr0, ImVec2 vr1,
 
 }  // namespace
 
+// ---- open + frame --------------------------------------------------------------
+// Open the selector AND animate the camera so the whole box is framed with the model centered:
+// keep the current orientation, recenter (pan -> 0), and zoom out to kSelectorFitZoom. Used by the
+// Space activation and the HUD "View Selector" menu item, so both entry points frame identically.
+void ViewSelector::openFramed(AppState& st) {
+    open();
+    const float zeroPan[3] = {0.0f, 0.0f, 0.0f};
+    requestCameraAnimation(st, st.yaw, st.pitch, kSelectorFitZoom, zeroPan);
+}
+
 // ---- update --------------------------------------------------------------------
 void ViewSelector::update(AppState& st, Renderer& renderer, bool imgHovered, bool inSketch,
                           ImVec2 vr0, ImVec2 vr1) {
     ImGuiIO& io = ImGui::GetIO();
 
     if (!m_active) {
-        // Activate on Space while the viewport is hovered, not typing, not sketching.
+        // Activate on Space while the viewport is hovered, not typing, not sketching. Opening also
+        // frames the glass box (zoom-to-fit + recenter) so it never opens spilled off-screen.
         if (imgHovered && !inSketch && !io.WantTextInput &&
             ImGui::IsKeyPressed(ImGuiKey_Space) && !cameraAnimating()) {
-            m_active = true;
-            m_hoverZone = -1;
+            openFramed(st);
         }
         return;
     }

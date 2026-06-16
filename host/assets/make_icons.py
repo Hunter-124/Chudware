@@ -56,6 +56,7 @@ CONTRACT_NAMES: list[str] = [
     # General
     "ok_check", "cancel_x", "settings", "save", "open", "new_doc",
     "undo", "redo", "theme_toggle", "ai_panel", "activity", "prompt_edit",
+    "copy", "paste", "delete", "folder_new", "refresh",
     # C25: sketch flyout variant icons (append-only)
     "rect_3pt_corner", "rect_3pt_center", "parallelogram",
     "circle_perimeter",
@@ -1726,6 +1727,64 @@ def draw_prompt_edit(d, cell, p):
     d.line([(s*0.22, s*0.56), (s*0.45, s*0.56)], fill=p.stroke, width=lw)
     # cursor
     d.line([(s*0.65, s*0.38), (s*0.65, s*0.62)], fill=p.accent, width=lw*2)
+
+@icon("copy")
+def draw_copy(d, cell, p):
+    """Two overlapping sheets."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rounded_rectangle([s*0.18, s*0.26, s*0.66, s*0.82], radius=int(s*0.04),
+                         outline=p.stroke, width=lw)
+    d.rounded_rectangle([s*0.34, s*0.14, s*0.82, s*0.70], radius=int(s*0.04),
+                         outline=p.accent, width=lw)
+    d.line([(s*0.44, s*0.34), (s*0.72, s*0.34)], fill=p.accent, width=lw)
+    d.line([(s*0.44, s*0.48), (s*0.70, s*0.48)], fill=p.accent, width=lw)
+
+@icon("paste")
+def draw_paste(d, cell, p):
+    """Clipboard with a sheet."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rounded_rectangle([s*0.20, s*0.22, s*0.80, s*0.86], radius=int(s*0.06),
+                         outline=p.stroke, width=lw)
+    d.rounded_rectangle([s*0.36, s*0.10, s*0.64, s*0.28], radius=int(s*0.05),
+                         outline=p.accent, width=lw)
+    d.line([(s*0.32, s*0.45), (s*0.68, s*0.45)], fill=p.accent, width=lw)
+    d.line([(s*0.32, s*0.60), (s*0.62, s*0.60)], fill=p.accent, width=lw)
+
+@icon("delete")
+def draw_delete(d, cell, p):
+    """Trash can."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.line([(s*0.24, s*0.28), (s*0.76, s*0.28)], fill=p.err, width=lw)
+    d.line([(s*0.40, s*0.18), (s*0.60, s*0.18)], fill=p.err, width=lw)
+    d.rounded_rectangle([s*0.30, s*0.32, s*0.70, s*0.84], radius=int(s*0.04),
+                         outline=p.stroke, width=lw)
+    for x in [0.42, 0.50, 0.58]:
+        d.line([(s*x, s*0.42), (s*x, s*0.74)], fill=p.stroke, width=max(1, lw//2))
+
+@icon("folder_new")
+def draw_folder_new(d, cell, p):
+    """Folder with plus mark."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rounded_rectangle([s*0.10, s*0.32, s*0.90, s*0.82], radius=int(s*0.05),
+                         outline=p.stroke, width=lw)
+    d.rectangle([s*0.10, s*0.25, s*0.45, s*0.36], outline=p.stroke, width=lw)
+    plus_sign(d, s*0.64, s*0.58, s*0.14, p.accent, lw)
+
+@icon("refresh")
+def draw_refresh(d, cell, p):
+    """Circular refresh arrows."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx, cy = s/2, s/2
+    r = s*0.30
+    arc_segment(d, cx, cy, r, 25, 185, p.stroke, lw)
+    arrow(d, cx - r*0.98, cy, cx - r*0.88, cy - r*0.22, p.stroke, lw)
+    arc_segment(d, cx, cy, r, 205, 365, p.accent, lw)
+    arrow(d, cx + r*0.98, cy, cx + r*0.88, cy + r*0.22, p.accent, lw)
 
 # ---------------------------------------------------------------------------
 # C25: sketch flyout variant icons

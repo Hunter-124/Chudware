@@ -219,7 +219,10 @@ private:
     bool dimHitTest(const ImVec2& s, DimPick& out) const;       // point-priority then entity
     // C50: (u,v) midpoint of the line under the cursor (Smart Dim hover marker), or false.
     bool hoveredLineMidpoint(const ImVec2& s, float& mu, float& mv) const;
-    bool dimBuildPending(const ImVec2& cursor, float cu, float cv);  // picks -> dimPending_ (+axis)
+    // picks -> dimPending_ (+axis). keepAxis=true preserves the current dimAxis_ instead of
+    // re-deriving it from the cursor zone (used when re-running after an arc-condition change in
+    // the Modify box, where the dimension is already placed and its axis must not flip).
+    bool dimBuildPending(const ImVec2& cursor, float cu, float cv, bool keepAxis = false);
     void dimOpenModify(const ImVec2& at);                       // open Modify box for dimPending_
     void dimCommit(AppState& st);                               // apply the Modify box value/expr
     // C50g: hit-test geometry for one dimension annotation, populated by drawDimension. SolidWorks

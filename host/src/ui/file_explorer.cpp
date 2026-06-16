@@ -101,6 +101,36 @@ static void drawIcon(const char* name) {
     }
 }
 
+static bool toolbarIconButton(const char* id, const char* icon, const char* tip, bool enabled = true) {
+    const float S = ui::uiScale;
+    const float btn = 28.0f * S;
+    const float glyph = 18.0f * S;
+    const auto& pal = ui::palette;
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImVec2 p1(p0.x + btn, p0.y + btn);
+
+    ImGui::PushID(id);
+    if (!enabled) ImGui::BeginDisabled();
+    bool clicked = ImGui::InvisibleButton("##fx_tool", ImVec2(btn, btn));
+    bool hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
+    if (!enabled) ImGui::EndDisabled();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (hovered && enabled)
+        dl->AddRectFilled(p0, p1, ui::Palette::toU32(pal.buttonHovered), 5.0f * S);
+    IconUV ic = getIcon(icon, 20);
+    if (ic.valid) {
+        float ix = p0.x + (btn - glyph) * 0.5f;
+        float iy = p0.y + (btn - glyph) * 0.5f;
+        ImVec4 tint(pal.text[0], pal.text[1], pal.text[2], enabled ? 1.0f : 0.35f);
+        dl->AddImage(ic.texId, ImVec2(ix, iy), ImVec2(ix + glyph, iy + glyph),
+                     ic.uv0, ic.uv1, ImGui::ColorConvertFloat4ToU32(tint));
+    }
+    if (hovered) ImGui::SetTooltip("%s", tip);
+    ImGui::PopID();
+    return clicked && enabled;
+}
+
 // ---- workspace resolution ------------------------------------------------
 void ensureWorkspaceDir(AppState& st) {
     if (st.workspaceDir.empty()) {
@@ -180,6 +210,24 @@ static bool doPaste(AppState& st, const fs::path& root, const fs::path& destDir)
     st.toast(ui::ToastLevel::Info, "Pasted " + dest.filename().string());
     s_selectedPath = dest.string();
     return true;
+}
+
+static void createNewFolder(AppState& st, const fs::path& root, const fs::path& dir) {
+    if (!withinWorkspace(root, dir)) {
+        st.toast(ui::ToastLevel::Warn, "New Folder blocked outside the workspace");
+        return;
+    }
+    std::error_code e2;
+    int n = 1;
+    fs::path cand = dir / "New Folder";
+    while (fs::exists(cand, e2)) cand = dir / ("New Folder " + std::to_string(++n));
+    if (fs::create_directory(cand, e2)) {
+        s_pendingNewFolder = cand.string();
+        s_currentFolder = dir.string();
+        st.addLog("[explorer] new folder " + cand.string());
+    } else {
+        st.toast(ui::ToastLevel::Error, "New Folder failed");
+    }
 }
 
 // ---- open dispatch --------------------------------------------------------
@@ -281,15 +329,7 @@ static void drawDirNode(AppState& st, const fs::path& root, const fs::path& dir,
         s_selectedPath = dir.string();
         s_currentFolder = dir.string();
         if (ImGui::MenuItem("New Folder")) {
-            // de-dup folder name ("New Folder", "New Folder 2", ...).
-            std::error_code e2; int n = 1; fs::path cand = dir / "New Folder";
-            while (fs::exists(cand, e2)) cand = dir / ("New Folder " + std::to_string(++n));
-            if (fs::create_directory(cand, e2)) {
-                s_pendingNewFolder = cand.string();
-                st.addLog("[explorer] new folder " + cand.string());
-            } else {
-                st.toast(ui::ToastLevel::Error, "New Folder failed");
-            }
+            createNewFolder(st, root, dir);
         }
         if (ImGui::MenuItem("Paste", "Ctrl+V", false, !s_clipboardPath.empty()))
             doPaste(st, root, dir);
@@ -419,12 +459,35 @@ void drawFileExplorerBody(AppState& st) {
         s_pendingNewFolder.clear();
     }
 
-    // Header toolbar: workspace path + a Refresh affordance (the tree relists every frame, so this is
-    // mostly a label; New Folder lives in the root context menu).
+    fs::path current = s_currentFolder.empty() ? root : fs::path(s_currentFolder);
+    std::error_code curEc;
+    if (!fs::is_directory(current, curEc)) current = current.parent_path();
+    if (current.empty() || !withinWorkspace(root, current)) current = root;
+
+    const bool selectedFile = !s_selectedPath.empty() &&
+        fs::is_regular_file(fs::path(s_selectedPath), curEc) &&
+        isKnownExt(lowerExt(fs::path(s_selectedPath)));
+
+    if (toolbarIconButton("open", "open", "Open selected file", selectedFile))
+        requestOpen(st, fs::path(s_selectedPath));
+    ImGui::SameLine(0, 3.0f * ui::uiScale);
+    if (toolbarIconButton("new_folder", "folder_new", "New folder"))
+        createNewFolder(st, root, current);
+    ImGui::SameLine(0, 3.0f * ui::uiScale);
+    if (toolbarIconButton("paste", "paste", "Paste into current folder", !s_clipboardPath.empty()))
+        doPaste(st, root, current);
+    ImGui::SameLine(0, 3.0f * ui::uiScale);
+    if (toolbarIconButton("refresh", "refresh", "Refresh"))
+        st.toast(ui::ToastLevel::Info, "Explorer refreshed");
+
+    ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
-    ImGui::TextWrapped("%s", st.workspaceDir.c_str());
+    std::string folderName = current.filename().string();
+    if (folderName.empty()) folderName = current.string();
+    ImGui::TextUnformatted(folderName.c_str());
     ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", current.string().c_str());
     ImGui::Separator();
 
     drawRecentSection(st);

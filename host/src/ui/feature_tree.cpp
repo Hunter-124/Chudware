@@ -512,6 +512,12 @@ static void clearFeatureHighlight(AppState& st) {
     st.featureHighlightFaces.clear();
 }
 
+static void clearTreeFeatureSelection(AppState& st) {
+    st.selectedFeatureId.clear();
+    s_multiSel.clear();
+    clearFeatureHighlight(st);
+}
+
 // C38 (T1): public re-backfill of the feature highlight from the CURRENT owner map. The owner map's
 // face tags are rebuilt on every applyOps/undo/redo/resync, so a previously-populated
 // featureHighlightFaces (captured at click time) points at stale face ids and tints the wrong faces
@@ -643,7 +649,6 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         ImGuiTreeNodeFlags_Leaf |
         ImGuiTreeNodeFlags_NoTreePushOnOpen |
         ImGuiTreeNodeFlags_SpanFullWidth;
-    if (c.selected) flags |= ImGuiTreeNodeFlags_Selected;
 
     // Suppressed → dim heavily. Rolled back → dim + italic-ish look (we cannot truly italicize a
     // default font, so we use the lighter dim + the "(Rolled back)" cue in the badge/tooltip).
@@ -660,7 +665,13 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     if (c.suppressed) label += " [S]";
     label += "##ft_" + fid;
 
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(3.0f * ui::uiScale, 3.0f * ui::uiScale));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0, 0, 0, 0));
     ImGui::TreeNodeEx(label.c_str(), flags);
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar();
 
     if (dim) ImGui::PopStyleColor();
 
@@ -709,6 +720,9 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     if (ImGui::BeginPopupContextItem(("##ctx_" + fid).c_str())) {
         bool isSketch = c.iconName && std::strcmp(c.iconName, "sketch_node") == 0;
         bool multi    = s_multiSel.size() > 1 && s_multiSel.count(fid) > 0;
+        if (c.selected && ImGui::MenuItem("Deselect"))
+            clearTreeFeatureSelection(st);
+        if (c.selected) ImGui::Separator();
         if (!c.canDoc) ImGui::BeginDisabled();   // gate every mutating item while an agent run is busy
 
         if (isSketch) {
@@ -850,18 +864,8 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
 
     featureBadge(c.fs.ok, !c.fs.error.empty(), c.fs.error, c.fs.dangling, c.rolledBack);
 
-    // ---- rich tooltip (type · status · compile ms · owner body count) ----
-    if (itemHovered && !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-        std::string tip = "Type: " + (c.type.empty() ? std::string("feature") : c.type);
-        if (c.suppressed) tip += "\nStatus: Suppressed";
-        else if (c.rolledBack) tip += "\nStatus: Rolled back (after the bar)";
-        else if (!c.fs.ok) tip += "\nStatus: Error" + (c.fs.error.empty() ? "" : (" — " + c.fs.error));
-        else if (!c.fs.dangling.empty()) tip += "\nStatus: Dangling references";
-        else tip += "\nStatus: OK";
-        if (c.fs.ms >= 0.0) { char b[48]; std::snprintf(b, sizeof(b), "\nCompile: %.2f ms", c.fs.ms); tip += b; }
-        tip += "\nBodies owned: " + std::to_string(c.ownerBodyCount);
-        ImGui::SetTooltip("%s", tip.c_str());
-    }
+    // The status badge owns detailed status/error hover text. Keeping the row itself quiet avoids
+    // tooltip cards covering selected rows while the user is trying to scan or drag the tree.
 
     if (c.nested) ImGui::Unindent(14.0f * ui::uiScale);   // #4.3: balanced with the scaled Indent
     return res;
@@ -1361,11 +1365,12 @@ static void drawFeatureManagerTopStrip(AppState& st) {
     // W5C: the old tree/Properties/Configurations stub tabs were removed here — they were visual
     // decoration that duplicated the real vertical tab strip in the LeftPane container (layout.cpp
     // drawLeftPane). This strip now hosts only the functional document toolbar + "Name & group".
-    // --- right-aligned document toolbar (first item on the line, so position it absolutely) ---
+    // --- centered document toolbar (first item on the line, so position it absolutely) ---
     float nBtns = 6.0f, gap = 2.0f * ui::uiScale, bw = 24.0f * ui::uiScale;
     float toolW = nBtns * bw + (nBtns - 1) * gap;
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                         std::max(0.0f, ImGui::GetContentRegionAvail().x - toolW));
+    float startX = ImGui::GetCursorPosX();
+    float availX = ImGui::GetContentRegionAvail().x;
+    ImGui::SetCursorPosX(startX + std::max(0.0f, (availX - toolW) * 0.5f));
     if (toolbarIconBtn("fm_new", "new_doc", "New Part", canDoc) && canDoc) {
         std::string err;
         // Multi-document: New Part opens a NEW tab (it does not replace the current doc). The
@@ -1539,22 +1544,30 @@ void drawFeatureTreeBody(AppState& st,
                 ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_Leaf |
                                        ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                        ImGuiTreeNodeFlags_SpanFullWidth;
-                std::string mat = "Material (none)";
+                std::string matKey;
                 if (tree.is_object()) {
                     auto m = tree.find("material");
                     if (m != tree.end() && m->is_object()) {
                         std::string key = jfld(*m, "key");
-                        if (!key.empty()) mat = "Material: " + key;
+                        if (!key.empty()) matKey = key;
                     }
                 }
                 treeIcon("material", "[M]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
-                ImGui::TreeNodeEx(("##mat_" + mat).c_str(), f | ImGuiTreeNodeFlags_NoTreePushOnOpen);
+                ImGui::TreeNodeEx("##mat_hdr", f | ImGuiTreeNodeFlags_NoTreePushOnOpen);
                 ImGui::SameLine();
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                    ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1.0f));
-                ImGui::TextUnformatted(mat.c_str());
-                ImGui::PopStyleColor();
+                ImGui::TextUnformatted("Material");
+                if (!matKey.empty()) {
+                    ImGui::SameLine();
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1.0f));
+                    ImGui::TextUnformatted(matKey.c_str());
+                    ImGui::PopStyleColor();
+                }
+                if (ImGui::IsItemHovered()) {
+                    if (matKey.empty()) ImGui::SetTooltip("No material assigned");
+                    else ImGui::SetTooltip("Material: %s", matKey.c_str());
+                }
             }
 
             // ---- Solid Bodies folder (per-body hide/show, SolidWorks-style) ----
@@ -1853,17 +1866,32 @@ void drawFeatureTreeBody(AppState& st,
                         bool rolledBack = fs.rolledBack;   // authoritative (engine sets it)
                         bool sel = (selectedFeatureId == fid) || s_multiSel.count(fid) > 0;
 
-                        // Row backgrounds (alt stripe + selection highlight).
+                        // Row backgrounds: subtle striping plus a restrained selected-row card.
+                        // Avoid ImGui's TreeNode selected paint here; it was stacking with our
+                        // viewport highlight and made selected features look heavy and smeared.
                         ImVec2 rowMin = ImGui::GetCursorScreenPos();
                         float availW = ImGui::GetContentRegionAvail().x;
-                        ImVec2 rowMax(rowMin.x + availW,
-                                      rowMin.y + ImGui::GetTextLineHeightWithSpacing());
+                        const float S = ui::uiScale;
+                        const float rowH = ImGui::GetTextLineHeight() + 8.0f * S;
+                        ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
+                        ImDrawList* rowDl = ImGui::GetWindowDrawList();
                         if (rowIdx % 2 == 0)
-                            ImGui::GetWindowDrawList()->AddRectFilled(rowMin, rowMax,
-                                Palette::toU32(pal.treeRowAlt));
+                            rowDl->AddRectFilled(rowMin, rowMax, Palette::toU32(pal.treeRowAlt));
                         if (sel) {
-                            ImGui::GetWindowDrawList()->AddRectFilled(rowMin, rowMax,
-                                Palette::toU32(pal.treeRowSelected));
+                            ImVec2 cardMin(rowMin.x + 2.0f * S, rowMin.y + 1.0f * S);
+                            ImVec2 cardMax(rowMax.x - 3.0f * S, rowMax.y - 1.0f * S);
+                            ImVec4 fill(pal.accentSoft[0], pal.accentSoft[1],
+                                        pal.accentSoft[2], 0.38f);
+                            rowDl->AddRectFilled(cardMin, cardMax,
+                                                 ImGui::ColorConvertFloat4ToU32(fill),
+                                                 4.0f * S);
+                            rowDl->AddRect(cardMin, cardMax,
+                                           Palette::toU32(pal.border), 4.0f * S, 0,
+                                           std::max(1.0f, 1.0f * S));
+                            rowDl->AddRectFilled(ImVec2(cardMin.x, cardMin.y + 3.0f * S),
+                                                 ImVec2(cardMin.x + 3.0f * S,
+                                                        cardMax.y - 3.0f * S),
+                                                 Palette::toU32(pal.accent), 2.0f * S);
                             if (selectedFeatureId == fid && st.treeScrollToSelection) {
                                 ImGui::SetScrollHereY(0.5f);
                                 st.treeScrollToSelection = false;
@@ -1926,6 +1954,16 @@ void drawFeatureTreeBody(AppState& st,
                         ctx.editCallback = &editCallback;
 
                         RowResult rr = featureRow(ctx, st);
+                        if (rr.hovered && !sel && !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                            ImVec2 imn = ImGui::GetItemRectMin();
+                            ImVec2 imx = ImGui::GetItemRectMax();
+                            ImVec2 hovMin(imn.x + 2.0f * S, imn.y + 1.0f * S);
+                            ImVec2 hovMax(imx.x - 3.0f * S, imx.y - 1.0f * S);
+                            ImVec4 hoverCol(pal.accent[0], pal.accent[1], pal.accent[2], 0.45f);
+                            ImGui::GetWindowDrawList()->AddRect(
+                                hovMin, hovMax, ImGui::ColorConvertFloat4ToU32(hoverCol),
+                                4.0f * S, 0, std::max(1.0f, 1.0f * S));
+                        }
 
                         // ---- rollback-bar drag hit-test (item 4) ----
                         // While the bar is being dragged, find which row's gap the cursor is over so
@@ -1980,14 +2018,18 @@ void drawFeatureTreeBody(AppState& st,
                                               s_lastClickTime > 0 &&
                                               (now - s_lastClickTime) > 0.4 &&
                                               (now - s_lastClickTime) < 2.0);
-                            selectedFeatureId = fid;
-                            s_multiSel.clear();
-                            selectFeatureInViewport(st, fid);
                             if (armRename) {
                                 s_renamingId = fid;
                                 std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", fname.c_str());
                                 s_lastClickTime = -1.0;
+                            } else if (selectedFeatureId == fid && s_multiSel.empty()) {
+                                clearTreeFeatureSelection(st);
+                                s_lastClickId.clear();
+                                s_lastClickTime = -1.0;
                             } else {
+                                selectedFeatureId = fid;
+                                s_multiSel.clear();
+                                selectFeatureInViewport(st, fid);
                                 s_lastClickId = fid;
                                 s_lastClickTime = now;
                             }
@@ -2117,6 +2159,19 @@ void drawFeatureTreeBody(AppState& st,
         }
     }
 
+    if (!st.selectedFeatureId.empty() || !s_multiSel.empty()) {
+        const bool treeFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        const bool treeHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows |
+                                                        ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+        if (treeFocused && !ImGui::GetIO().WantTextInput &&
+            ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            clearTreeFeatureSelection(st);
+        } else if (treeHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                   !ImGui::IsAnyItemHovered() && !ImGui::IsAnyItemActive()) {
+            clearTreeFeatureSelection(st);
+        }
+    }
+
     ImGui::PopStyleColor();  // ChildBg
 
     // C37-E (item 3): per-row "Appearance..." picker. The row's context menu stashed the target body
@@ -2181,12 +2236,16 @@ void drawFeatureTreeBody(AppState& st,
                 ImGui::SetTooltip("%s", s_docPath.c_str());
             bool canSave = st.docMirror.hasDoc();
             if (!canSave) ImGui::BeginDisabled();
-            if (ImGui::Button("Save")) doSaveDoc(st, /*forceDialog=*/false);
-            ImGui::SameLine();
-            if (ImGui::Button("Save As...")) doSaveDoc(st, /*forceDialog=*/true);
+            {
+                const ImGuiStyle& style = ImGui::GetStyle();
+                const float gap = style.ItemSpacing.x;
+                const float halfW = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
+                if (ImGui::Button("Save", ImVec2(halfW, 0))) doSaveDoc(st, /*forceDialog=*/false);
+                ImGui::SameLine(0, gap);
+                if (ImGui::Button("Save As...", ImVec2(halfW, 0))) doSaveDoc(st, /*forceDialog=*/true);
+            }
             if (!canSave) ImGui::EndDisabled();
-            ImGui::SameLine();
-            if (ImGui::Button("Open...")) doOpenDoc(st);
+            if (ImGui::Button("Open...", ImVec2(-1, 0))) doOpenDoc(st);
         }
     }
 

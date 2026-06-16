@@ -23,7 +23,12 @@ void setRibbonActiveCmd(const char* cmd_id);
 // Begin the ribbon bar: reserves a full-width child window of height ribbonH.
 // Returns the outer height consumed (pass to dockspace as top offset).
 // activeTab: which tab index is selected (in/out).
-float drawRibbon(int& activeTab, bool visible, bool showSimulationTools = true, bool showPcbTools = true);
+// titleBarH: the ACTUAL custom title-bar height (from drawTitleBar's barHOut) so the ribbon docks
+// directly under it. Pass <0 to fall back to ImGui::GetFrameHeight() — but note that fallback uses
+// the default frame padding, which underestimates the title bar (it is drawn with a taller padding)
+// and would tuck the ribbon up under the menu bar, clipping the tab strip into the top edge.
+float drawRibbon(int& activeTab, bool visible, bool showSimulationTools = true,
+                 bool showPcbTools = true, float titleBarH = -1.0f);
 
 // Returns the ribbon height in pixels for layout math.
 float ribbonHeight();

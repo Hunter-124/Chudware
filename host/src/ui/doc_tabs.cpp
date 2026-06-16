@@ -1,5 +1,5 @@
 // Document tab strip — see doc_tabs.h. Renders the open documents as browser-style tabs and routes
-// click→switch, X/middle-click→close (with an unsaved-changes prompt), and "+"→New Part. All
+// click→switch, X/middle-click→close (with an unsaved-changes prompt), and "+"→New chooser. All
 // mutations to AppState::docTabs are DEFERRED until after the strip is fully drawn (we iterate the
 // vector while drawing), mirroring the feature tree's s_pendingTreeOps discipline so a switch/close
 // never invalidates the loop it fires from.
@@ -9,6 +9,7 @@
 #include "imgui.h"
 
 #include "doc_tabs.h"
+#include "icons.h"
 #include "metrics.h"
 
 #include "../core/app_state.h"
@@ -37,6 +38,18 @@ static bool s_openChooser = false;
 void createNewDoc(AppState& st, int kindOrd);
 void openNewDocChooser();
 
+static const char* docIconName(const AppState::DocTab& t) {
+    using K = AppState::DocTab::TabKind;
+    switch (t.kind) {
+        case K::Assembly: return "assembly";
+        case K::Drawing: return "section_props";
+        case K::Schematic: return "ai_panel";
+        case K::PCB: return "ai_panel";
+        case K::Part:
+        default: return "part";
+    }
+}
+
 // A single tab, placed explicitly at screen position (x, y0). Returns the tab WIDTH so the caller
 // can advance to the next tab. Records a deferred switch/close into the file statics. Layout:
 // [ title (dirty *) × ]. The whole pill switches; the × hot-zone (submitted on top) closes.
@@ -54,8 +67,10 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float padX = 12.0f * s;
     float closeW = 18.0f * s;
+    float iconSz = 16.0f * s;
+    float iconGap = 6.0f * s;
     float textW = ImGui::CalcTextSize(label.c_str()).x;
-    float tabW = padX + textW + 6.0f * s + closeW + padX * 0.5f;
+    float tabW = padX + iconSz + iconGap + textW + 6.0f * s + closeW + padX * 0.5f;
     float tabH = barH;
 
     ImVec2 p0(x, y0);
@@ -82,7 +97,16 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
 
     // Title text.
     const float* textCol = active ? pal.text : pal.textDim;
-    dl->AddText(ImVec2(p0.x + padX, p0.y + (tabH - ImGui::GetFontSize()) * 0.5f),
+    IconUV ic = getIcon(docIconName(t), 20);
+    if (ic.valid) {
+        ImVec4 tint(textCol[0], textCol[1], textCol[2], active ? 1.0f : 0.78f);
+        float iy = p0.y + (tabH - iconSz) * 0.5f;
+        dl->AddImage(ic.texId, ImVec2(p0.x + padX, iy),
+                     ImVec2(p0.x + padX + iconSz, iy + iconSz),
+                     ic.uv0, ic.uv1, ImGui::ColorConvertFloat4ToU32(tint));
+    }
+    dl->AddText(ImVec2(p0.x + padX + iconSz + iconGap,
+                       p0.y + (tabH - ImGui::GetFontSize()) * 0.5f),
                 ImGui::ColorConvertFloat4ToU32(ImVec4(textCol[0], textCol[1], textCol[2], 1)),
                 label.c_str());
 
@@ -172,11 +196,20 @@ float drawDocTabs(AppState& st, float topY) {
             dl->AddRectFilled(p0, ImVec2(p0.x + btn, p0.y + btn),
                               ui::Palette::toU32(pal.buttonHovered), 4.0f * s);
         ImVec2 c(p0.x + btn * 0.5f, p0.y + btn * 0.5f);
-        float g = btn * 0.2f;
-        ImU32 col = ImGui::ColorConvertFloat4ToU32(
-            ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
-        dl->AddLine(ImVec2(c.x - g, c.y), ImVec2(c.x + g, c.y), col, 1.6f * s);
-        dl->AddLine(ImVec2(c.x, c.y - g), ImVec2(c.x, c.y + g), col, 1.6f * s);
+        IconUV plus = getIcon("new_doc", 20);
+        if (plus.valid) {
+            float iz = 18.0f * s;
+            ImVec4 tint(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1);
+            dl->AddImage(plus.texId, ImVec2(c.x - iz * 0.5f, c.y - iz * 0.5f),
+                         ImVec2(c.x + iz * 0.5f, c.y + iz * 0.5f),
+                         plus.uv0, plus.uv1, ImGui::ColorConvertFloat4ToU32(tint));
+        } else {
+            float g = btn * 0.2f;
+            ImU32 col = ImGui::ColorConvertFloat4ToU32(
+                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
+            dl->AddLine(ImVec2(c.x - g, c.y), ImVec2(c.x + g, c.y), col, 1.6f * s);
+            dl->AddLine(ImVec2(c.x, c.y - g), ImVec2(c.x, c.y + g), col, 1.6f * s);
+        }
         if (hov) ImGui::SetTooltip("New document");
         if (clicked || s_openChooser) { ImGui::OpenPopup("##newdocmenu"); s_openChooser = false; }
         // Anchor the popup just under the "+" button.

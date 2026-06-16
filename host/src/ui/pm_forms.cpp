@@ -174,7 +174,7 @@ static const std::vector<PMFormDef>& forms() {
             DimIf     ("end_offset","End Offset",      "Direction 1", 0.0,
                        "end", "offset_from_reference", true),
             Check     ("flip",     "Reverse direction","Direction 1", false),
-            DimIf     ("draft",    "Draft angle",     "Direction 1", 0.0,
+            AngleIf   ("draft",    "Draft angle",     "Direction 1", 0.0,
                        "end", "blind|mid_plane", true),
             CheckIf   ("draft_outward", "Draft outward","Direction 1", false,
                        "end", "blind|mid_plane"),

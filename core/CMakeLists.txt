@@ -420,4 +420,42 @@ if(AICAD_WITH_OCCT)
   add_test(NAME picks COMMAND test_picks)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(picks PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- libaicad: the C ABI SHARED library (the host-integration seam) ---------
+  # api/libaicad.{h,cpp} exposes a flat C ABI (aicad_call/aicad_free/
+  # aicad_abi_version) over aicad::doc::compile_document so the host can LoadLibrary
+  # this DLL at runtime and route ported methods to the in-process C++ core (the
+  # strangler seam; see docs/CPP_MIGRATION.md). Built as a SEPARATE libaicad.dll
+  # (user's choice) so OCCT stays OUT of the host exe and the link is reversible.
+  # aicad_doc (STATIC) drags in the whole OCCT geom kernel transitively, so the DLL
+  # imports the TK* toolkit DLLs — staged next to it by aicad_occt_copy_dlls.
+  add_library(aicad SHARED
+    api/libaicad.cpp)
+  target_include_directories(aicad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_definitions(aicad PRIVATE AICAD_BUILD_DLL)
+  target_link_libraries(aicad PRIVATE aicad_doc)
+  set_target_properties(aicad PROPERTIES
+    OUTPUT_NAME libaicad   # -> libaicad.dll + libaicad.lib (the host loads by this name)
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  # Stage the OCCT toolkit + 3rdparty (jemalloc/tbb) DLLs next to libaicad.dll so
+  # its imports resolve when it is loaded from the same directory.
+  aicad_occt_copy_dlls(aicad)
+
+  # --- aicad_probe: load libaicad.dll the way the HOST will (LoadLibrary) ------
+  # Links NEITHER the core static libs NOR OCCT — only nlohmann_json. It dlopens
+  # libaicad.dll, exercises ping + doc_compile_cpp + the unknown-method fallback
+  # signal, and asserts a real box compile produced AICM bytes. This isolates and
+  # validates the entire runtime-load + OCCT-DLL-discovery story before any host
+  # code changes.
+  add_executable(aicad_probe api/aicad_probe.cpp)
+  target_include_directories(aicad_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(aicad_probe PRIVATE nlohmann_json::nlohmann_json)
+  set_target_properties(aicad_probe PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_dependencies(aicad_probe aicad)  # DLL built + OCCT DLLs staged before the probe runs
+  add_test(NAME probe COMMAND aicad_probe)
+  # Same OCCT DLL PATH prepend as the other OCCT tests, as a backup to the staged DLLs.
+  set_tests_properties(probe PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 endif()

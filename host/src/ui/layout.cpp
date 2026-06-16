@@ -244,18 +244,27 @@ void drawLeftPane(AppState& st,
     const ImGuiStyle& style = ImGui::GetStyle();
     const float stripW = btn + 8.0f * S;
 
+    // Zero the child's WindowPadding so the rail background (drawn from GetWindowPos) and the button
+    // column share one origin — otherwise the default padding offsets the buttons from the rail bg.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::BeginChild("##lp_tabstrip", ImVec2(stripW, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar);
+    ImGui::PopStyleVar();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 rail0 = ImGui::GetWindowPos();
     ImVec2 rail1(rail0.x + stripW, rail0.y + ImGui::GetWindowHeight());
     dl->AddRectFilled(rail0, rail1, ui::Palette::toU32(pal.headerBg));
-    ImGui::SetCursorPos(ImVec2(4.0f * S, 6.0f * S));
+    // Center the square button in the rail. SetCursorPosX must be set PER button: ImGui resets X to
+    // the line start after each Dummy, so a single SetCursorPos before the loop would only offset the
+    // first icon (the others would snap to x=0), producing the off-center / zig-zag look.
+    const float btnX = (stripW - btn) * 0.5f;
+    ImGui::SetCursorPosY(6.0f * S);
     for (const TabDef& t : kTabs) {
         const bool selected = (st.leftPaneTab == t.id);
         const bool attention = (t.id == kLeftPanePropertyManager && pmActive);
         char idBuf[16];
         std::snprintf(idBuf, sizeof(idBuf), "%d", t.id);
+        ImGui::SetCursorPosX(btnX);
         if (drawManagerTabButton(idBuf, t.icon, t.fallback, t.tip, selected, attention, btn, glyph))
             st.leftPaneTab = t.id;
         ImGui::Dummy(ImVec2(0, gap));

@@ -30,6 +30,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <sstream>
 #include <string>
 
@@ -70,6 +71,57 @@ int main(int argc, char** argv) {
         input = json::parse(text);
     } catch (const std::exception& e) {
         return fail(std::string("JSON parse error: ") + e.what());
+    }
+
+    // Measure mode (tools/measure_diff.py): input
+    //   {"mode":"measure","constraint":{...},"entity_coords":{...}}
+    // -> {"value": <number|null>}. The default (absent/"solve") mode is unchanged.
+    if (input.value("mode", std::string("solve")) == "measure") {
+        const json constraint = input.value("constraint", json::object());
+        const json entity_coords = input.value("entity_coords", json::object());
+        std::optional<double> v;
+        try {
+            v = aicad::sketch::measure_constraint(constraint, entity_coords);
+        } catch (const std::exception& e) {
+            return fail(std::string("measure_constraint threw: ") + e.what());
+        }
+        json out;
+        out["value"] = v ? json(*v) : json(nullptr);
+        std::cout << out.dump() << std::endl;
+        return 0;
+    }
+
+    // Warm-start mode (tools/warm_diff.py): input
+    //   {"mode":"warm","sketch":{...},"after":{...optional},"env":{...}}
+    // cold-solves `sketch` to build a state, then warm-solves `after` (defaults to
+    // `sketch`) from that state. Output:
+    //   {"warm":{entities,converged}, "cold":{entities,converged},
+    //    "decision":{entity id -> "warm"|"cold"}}
+    if (input.value("mode", std::string("solve")) == "warm") {
+        const json env = input.value("env", json::object());
+        const json base = input.value("sketch", json::object());
+        const json after = input.contains("after") ? input["after"] : base;
+        try {
+            // 1) cold-solve the base sketch (no warm).
+            auto cold0 = aicad::sketch::solve_sketch(base, env);
+            // 2) cold-solve `after` standalone (the reference answer).
+            auto cold_after = aicad::sketch::solve_sketch(after, env);
+            // 3) warm-solve `after` from the base state.
+            auto warm = aicad::sketch::solve_sketch(after, env, cold0.state);
+            auto decision = aicad::sketch::warm_gate_decision(after, cold0.state);
+
+            json out;
+            out["warm"] = {{"entities", warm.entities}, {"converged", warm.converged}};
+            out["cold"] = {{"entities", cold_after.entities},
+                           {"converged", cold_after.converged}};
+            json dec = json::object();
+            for (const auto& kv : decision) dec[kv.first] = kv.second;
+            out["decision"] = dec;
+            std::cout << out.dump() << std::endl;
+            return 0;
+        } catch (const std::exception& e) {
+            return fail(std::string("warm solve threw: ") + e.what());
+        }
     }
 
     const json sketch = input.value("sketch", json::object());

@@ -66,6 +66,14 @@ public:
     int n_vars() const { return static_cast<int>(init_.size()); }
     int n_residuals();
 
+    // The registered initial-guess vector (the `sys._init` the Python warm-start
+    // path copies as its cold base before overlaying per-entity warm values).
+    Eigen::VectorXd init_vector() const {
+        Eigen::VectorXd x(static_cast<int>(init_.size()));
+        for (size_t i = 0; i < init_.size(); ++i) x(static_cast<int>(i)) = init_[i];
+        return x;
+    }
+
     // Allocate n variables; return their contiguous index vector. `init` (length
     // n, or empty for zeros) seeds the initial guess. Indices are stable for the
     // lifetime of the system. The returned vector is what callers hand to

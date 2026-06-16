@@ -100,6 +100,14 @@ set_target_properties(test_sketch PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME sketch COMMAND test_sketch)
 
+add_executable(test_drag
+  tests/test_drag.cpp)
+target_include_directories(test_drag PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_drag PRIVATE aicad_sketch)
+set_target_properties(test_drag PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME drag COMMAND test_drag)
+
 add_executable(test_plane
   tests/test_plane.cpp)
 target_include_directories(test_plane PRIVATE ${doctest_SOURCE_DIR})

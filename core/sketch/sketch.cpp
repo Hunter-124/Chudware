@@ -12,8 +12,10 @@
 #include <functional>
 #include <initializer_list>
 #include <limits>
+#include <optional>
 #include <set>
 #include <stdexcept>
+#include <utility>
 
 namespace aicad::sketch {
 namespace {
@@ -2085,9 +2087,103 @@ std::map<std::string, std::string> compute_statuses(
     return statuses;
 }
 
+// ---- measurement (port of _handle_point / _line_endpoints / _measure_cond_adj /
+//      measure_constraint) ----------------------------------------------------
+//
+// These read SOLVED entity coords (the extract_entities / SketchSolution::entities
+// dict), NOT the solver variable vector. A point handle resolves to a world (x,y);
+// helpers return std::nullopt where the Python returns None (dangling refs).
+
+const std::set<std::string> kDimensionalTypes = {"distance", "angle", "radius",
+                                                 "diameter"};
+
+// World (x, y) of a point handle against SOLVED entity coords. nullopt if it cannot
+// be resolved (dangling). Port of _handle_point.
+std::optional<Vector2d> handle_point(const std::string& handle, const json& coords) {
+    std::string eid = handle, sub;
+    bool has_sub = false;
+    auto dot = handle.find('.');
+    if (dot != std::string::npos) {
+        eid = handle.substr(0, dot);
+        sub = handle.substr(dot + 1);
+        has_sub = true;
+    }
+    if (!coords.contains(eid)) {
+        if (eid == "origin") return Vector2d(0.0, 0.0);  // virtual fixed origin
+        return std::nullopt;
+    }
+    const json& ent = coords.at(eid);
+    std::string et = ent.value("type", std::string());
+    auto as_pt = [](const json& a) { return Vector2d(num(a[0]), num(a[1])); };
+    if (et == "point") return as_pt(ent.at("p"));
+    if (et == "line") {
+        if (!has_sub || sub == "p1") return as_pt(ent.at("p1"));
+        if (sub == "p2") return as_pt(ent.at("p2"));
+        if (sub == "mid") {
+            Vector2d a = as_pt(ent.at("p1")), b = as_pt(ent.at("p2"));
+            return Vector2d((a(0) + b(0)) * 0.5, (a(1) + b(1)) * 0.5);
+        }
+    }
+    if (et == "circle" || et == "arc" || et == "ellipse" || et == "ellipse_arc" ||
+        et == "arc_slot") {
+        bool has_center = ent.contains("center");
+        if ((!has_sub || sub == "center") && has_center) return as_pt(ent.at("center"));
+        if (et == "arc" && (sub == "start" || sub == "end")) {
+            double cx = num(ent["center"][0]), cy = num(ent["center"][1]);
+            double r = num(ent["radius"]);
+            double a = (sub == "start" ? num(ent["start"]) : num(ent["end"]));
+            double ar = a * kDeg;
+            return Vector2d(cx + r * std::cos(ar), cy + r * std::sin(ar));
+        }
+    }
+    if (et == "slot") {
+        if (!has_sub || sub == "p1") return as_pt(ent.at("p1"));
+        if (sub == "p2") return as_pt(ent.at("p2"));
+    }
+    return std::nullopt;
+}
+
+// (p1, p2) of a line entity referenced by a (possibly sub-less) handle, or nullopt.
+// Port of _line_endpoints.
+std::optional<std::pair<Vector2d, Vector2d>> line_endpoints(const std::string& handle,
+                                                            const json& coords) {
+    std::string eid = handle.substr(0, handle.find('.'));
+    if (!coords.contains(eid)) return std::nullopt;
+    const json& ent = coords.at(eid);
+    if (ent.value("type", std::string()) != "line") return std::nullopt;
+    return std::make_pair(Vector2d(num(ent["p1"][0]), num(ent["p1"][1])),
+                          Vector2d(num(ent["p2"][0]), num(ent["p2"][1])));
+}
+
+// Σ adj of a distance constraint's arc-conditions against SOLVED coords (C50).
+// Mirrors _measure_cond_adj: only a BARE circle/arc entity-id ref honors its
+// "min"/"max" condition (adj = -r / +r); everything else contributes 0.
+double measure_cond_adj(const json& constraint, const std::vector<std::string>& refs,
+                        const json& coords) {
+    if (!constraint.contains("cond") || !constraint["cond"].is_array()) return 0.0;
+    const json& cond = constraint["cond"];
+    double adj = 0.0;
+    int n = std::min<int>(2, std::min<int>(static_cast<int>(refs.size()),
+                                           static_cast<int>(cond.size())));
+    for (int i = 0; i < n; ++i) {
+        if (!cond[i].is_string()) continue;
+        std::string c = cond[i].get<std::string>();
+        const std::string& h = refs[i];
+        if ((c != "min" && c != "max") || h.find('.') != std::string::npos) continue;
+        if (!coords.contains(h)) continue;
+        const json& ent = coords.at(h);
+        std::string t = ent.value("type", std::string());
+        if (t != "circle" && t != "arc") continue;
+        double r = ent.contains("radius") ? num(ent["radius"]) : 0.0;
+        adj += (c == "min") ? -r : r;
+    }
+    return adj;
+}
+
 }  // namespace
 
-SketchSolution solve_sketch(const json& sketch, const json& env) {
+SketchSolution solve_sketch(const json& sketch, const json& env,
+                            const std::optional<SolveState>& warm) {
     json entities_list = sketch.value("entities", json::array());
     json constraints_list = sketch.value("constraints", json::array());
 
@@ -2117,8 +2213,45 @@ SketchSolution solve_sketch(const json& sketch, const json& env) {
         }
     }
 
+    // Per-entity doc-geometry signatures for warm-start gating (port of the
+    // SolveState.ent_sig path). nlohmann::json::dump() serializes object keys in
+    // sorted order, mirroring json.dumps(e, sort_keys=True); equal entities produce
+    // equal strings and a rewritten entity produces a different one, which is all the
+    // warm/cold gate needs (byte-identity with Python is NOT required).
+    std::map<std::string, std::string> cur_sig;
+    for (const auto& e : entities_list) cur_sig[e["id"]] = e.dump();
+
+    // Determine the warm-start vector. Warm values are applied PER ENTITY and only
+    // while that entity's doc geometry is unchanged since the warm state was built
+    // (matching widx, matching var count, matching signature). Mirrors solve_sketch's
+    // warm path exactly: legacy states without signatures fall back to whole-vector.
+    std::optional<Eigen::VectorXd> x0;
+    if (warm) {
+        if (warm->ent_sig.empty()) {
+            if (warm->n_vars == sys.n_vars()) x0 = warm->x;
+        } else {
+            Eigen::VectorXd base = sys.init_vector();
+            for (const auto& kv : var_map) {
+                const std::string& eid = kv.first;
+                const std::vector<int>& idx = kv.second;
+                auto wit = warm->var_map.find(eid);
+                if (wit == warm->var_map.end()) continue;
+                const std::vector<int>& widx = wit->second;
+                if (widx.size() != idx.size()) continue;
+                auto sit = warm->ent_sig.find(eid);
+                std::string wsig = (sit != warm->ent_sig.end()) ? sit->second
+                                                                : std::string();
+                auto cit = cur_sig.find(eid);
+                std::string csig = (cit != cur_sig.end()) ? cit->second : std::string();
+                if (wsig != csig) continue;  // doc geometry changed -> cold-start this entity
+                for (size_t i = 0; i < idx.size(); ++i) base(idx[i]) = warm->x(widx[i]);
+            }
+            x0 = base;
+        }
+    }
+
     SketchSolution sol;
-    auto res = sys.solve(std::nullopt, 1e-10, 50);
+    auto res = sys.solve(x0, 1e-10, 50);
     sol.x = res.x;
     sol.converged = res.converged;
     sol.var_map = var_map;
@@ -2152,7 +2285,286 @@ SketchSolution solve_sketch(const json& sketch, const json& env) {
     }
     sol.statuses = compute_statuses(res.x, entities_list, var_map, n, J,
                                     sol.conflicting, tag_vars);
+
+    // Opaque warm-start state for the next solve / drag.
+    sol.state.x = res.x;
+    sol.state.var_map = var_map;
+    sol.state.n_vars = sys.n_vars();
+    sol.state.ent_sig = cur_sig;
     return sol;
+}
+
+SketchSolution solve_sketch(const json& sketch, const json& env) {
+    return solve_sketch(sketch, env, std::nullopt);
+}
+
+std::map<std::string, std::string> warm_gate_decision(const json& sketch,
+                                                      const SolveState& warm) {
+    json entities_list = sketch.value("entities", json::array());
+    System sys;
+    VarMap var_map;
+    for (const auto& e : entities_list) {
+        try {
+            var_map[e["id"]] = allocate_entity(sys, e);
+        } catch (...) {
+            var_map[e["id"]] = sys.add_vars(0, {});
+        }
+    }
+    std::map<std::string, std::string> cur_sig;
+    for (const auto& e : entities_list) cur_sig[e["id"]] = e.dump();
+
+    std::map<std::string, std::string> decision;
+    bool legacy = warm.ent_sig.empty();
+    for (const auto& e : entities_list) {
+        std::string eid = e["id"];
+        if (legacy) {
+            // Legacy whole-vector behavior: warm iff total var counts match.
+            decision[eid] = (warm.n_vars == sys.n_vars()) ? "warm" : "cold";
+            continue;
+        }
+        const std::vector<int>& idx = var_map.at(eid);
+        auto wit = warm.var_map.find(eid);
+        if (wit == warm.var_map.end() || wit->second.size() != idx.size()) {
+            decision[eid] = "cold";
+            continue;
+        }
+        auto sit = warm.ent_sig.find(eid);
+        std::string wsig = (sit != warm.ent_sig.end()) ? sit->second : std::string();
+        auto cit = cur_sig.find(eid);
+        std::string csig = (cit != cur_sig.end()) ? cit->second : std::string();
+        decision[eid] = (wsig == csig) ? "warm" : "cold";
+    }
+    return decision;
+}
+
+// Current solved measurement for a DIMENSIONAL constraint. Port of measure_constraint.
+std::optional<double> measure_constraint(const json& constraint,
+                                         const json& entity_coords) {
+    std::string ctype = constraint.value("type", std::string());
+    std::vector<std::string> refs;
+    if (constraint.contains("refs") && constraint["refs"].is_array())
+        for (const auto& r : constraint["refs"])
+            if (r.is_string()) refs.push_back(r.get<std::string>());
+
+    if (kDimensionalTypes.find(ctype) == kDimensionalTypes.end()) return std::nullopt;
+
+    auto eid0 = [&]() -> std::string {
+        if (refs.empty()) return std::string();
+        const std::string& h = refs[0];
+        return h.substr(0, h.find('.'));
+    };
+
+    if (ctype == "radius") {
+        std::string eid = eid0();
+        if (!eid.empty() && entity_coords.contains(eid)) {
+            const json& ent = entity_coords.at(eid);
+            std::string t = ent.value("type", std::string());
+            if (t == "circle" || t == "arc") return num(ent["radius"]);
+            if (t == "slot" || t == "arc_slot") return num(ent["width"]) / 2.0;  // cap radius
+        }
+        return std::nullopt;
+    }
+
+    if (ctype == "diameter") {
+        std::string eid = eid0();
+        if (!eid.empty() && entity_coords.contains(eid)) {
+            const json& ent = entity_coords.at(eid);
+            std::string t = ent.value("type", std::string());
+            if (t == "circle" || t == "arc") return num(ent["radius"]) * 2.0;
+            if (t == "slot" || t == "arc_slot") return num(ent["width"]);  // slot width
+        }
+        return std::nullopt;
+    }
+
+    if (ctype == "angle") {
+        if (refs.size() < 2) return std::nullopt;
+        auto la = line_endpoints(refs[0], entity_coords);
+        auto lb = line_endpoints(refs[1], entity_coords);
+        if (!la || !lb) return std::nullopt;
+        double ux = la->second(0) - la->first(0), uy = la->second(1) - la->first(1);
+        double vx = lb->second(0) - lb->first(0), vy = lb->second(1) - lb->first(1);
+        double cross = ux * vy - uy * vx;
+        double dot = ux * vx + uy * vy;
+        double theta = std::atan2(std::abs(cross), dot) * (180.0 / kPi);
+        // atan2(|cross|, dot) already lies in [0, 180]; fmod folds 180 back to 0.
+        double m = std::fmod(theta, 180.0);
+        if (m < 0.0) m += 180.0;
+        return m;
+    }
+
+    if (ctype == "distance") {
+        if (refs.size() < 2) return std::nullopt;
+        auto is_line = [&](const std::string& h) {
+            std::string eid = h.substr(0, h.find('.'));
+            if (!entity_coords.contains(eid)) return false;
+            return entity_coords.at(eid).value("type", std::string()) == "line" &&
+                   h.find('.') == std::string::npos;
+        };
+        double adj = measure_cond_adj(constraint, refs, entity_coords);
+        if (is_line(refs[0]) || is_line(refs[1])) {
+            const std::string& line_h = is_line(refs[0]) ? refs[0] : refs[1];
+            const std::string& pt_h = is_line(refs[0]) ? refs[1] : refs[0];
+            auto le = line_endpoints(line_h, entity_coords);
+            auto P = handle_point(pt_h, entity_coords);
+            if (!le || !P) return std::nullopt;
+            double ax = le->first(0), ay = le->first(1);
+            double bx = le->second(0), by = le->second(1);
+            double dxab = bx - ax, dyab = by - ay;
+            double L = std::hypot(dxab, dyab);
+            if (L < 1e-12)
+                return std::hypot((*P)(0) - ax, (*P)(1) - ay) + adj;
+            double cross = dxab * ((*P)(1) - ay) - dyab * ((*P)(0) - ax);
+            return std::abs(cross) / L + adj;
+        }
+        auto P0 = handle_point(refs[0], entity_coords);
+        auto P1 = handle_point(refs[1], entity_coords);
+        if (!P0 || !P1) return std::nullopt;
+        std::string axis;
+        if (constraint.contains("axis") && constraint["axis"].is_string())
+            axis = constraint["axis"].get<std::string>();
+        std::string axis_l = axis;
+        std::transform(axis_l.begin(), axis_l.end(), axis_l.begin(),
+                       [](unsigned char ch) { return std::tolower(ch); });
+        // Axis dimension: |Δu| + Σadj (the SAME additive Σadj the aligned/radial case
+        // uses below), NOT a per-coordinate rim projection. Verbatim with the oracle's
+        // current axis branch (`abs(P0[0]-P1[0]) + adj` / `abs(P0[1]-P1[1]) + adj`).
+        if (axis_l == "h") return std::abs((*P0)(0) - (*P1)(0)) + adj;
+        if (axis_l == "v") return std::abs((*P0)(1) - (*P1)(1)) + adj;
+        return std::hypot((*P0)(0) - (*P1)(0), (*P0)(1) - (*P1)(1)) + adj;
+    }
+
+    return std::nullopt;
+}
+
+json drag(const SolveState& state, const std::string& handle,
+          const std::pair<double, double>& target_xy, const json& sketch,
+          const json& env, const json& targets) {
+    json entities_list = sketch.value("entities", json::array());
+    json constraints_list = sketch.value("constraints", json::array());
+
+    EntMap entities;
+    for (const auto& e : entities_list) entities[e["id"]] = e;
+
+    System sys;
+    VarMap var_map;
+    for (const auto& e : entities_list) {
+        try {
+            var_map[e["id"]] = allocate_entity(sys, e);
+        } catch (...) {
+            var_map[e["id"]] = sys.add_vars(0, {});
+        }
+    }
+    for (const auto& c : constraints_list) {
+        try {
+            add_constraint(sys, c, entities, var_map, env);
+        } catch (...) {
+            // forward-tolerant
+        }
+    }
+
+    // Normalize to a list of (handle, (tx, ty)). The single-handle call becomes a
+    // one-element list. `targets` (when given) wins over handle/target_xy.
+    std::vector<std::pair<std::string, std::pair<double, double>>> target_pairs;
+    if (targets.is_array() && !targets.empty()) {
+        for (const auto& t : targets) {
+            std::string h;
+            json xy;
+            if (t.is_object()) {
+                if (t.contains("handle") && t["handle"].is_string())
+                    h = t["handle"].get<std::string>();
+                if (t.contains("xy")) xy = t["xy"];
+            } else if (t.is_array() && t.size() == 2) {
+                if (t[0].is_string()) h = t[0].get<std::string>();
+                xy = t[1];
+            }
+            if (h.empty() || !xy.is_array() || xy.size() < 2) continue;
+            target_pairs.emplace_back(h, std::make_pair(num(xy[0]), num(xy[1])));
+        }
+    } else if (!handle.empty()) {
+        target_pairs.emplace_back(handle, target_xy);
+    }
+
+    // Soft-target each resolvable handle's first two (x, y) variables (weight 0.01).
+    bool any_target = false;
+    std::vector<std::string> rejected_handles;
+    for (const auto& tp : target_pairs) {
+        const std::string& h = tp.first;
+        double tx = tp.second.first, ty = tp.second.second;
+        Handle hd;
+        try {
+            hd = resolve_handle(h, entities, var_map);
+        } catch (...) {
+            rejected_handles.push_back(h);
+            continue;
+        }
+        if (hd.idx.empty()) {
+            rejected_handles.push_back(h);  // zero-var virtual handle (origin)
+            continue;
+        }
+        sys.soft_target(hd.idx[0], tx, 0.01);
+        if (hd.idx.size() > 1) sys.soft_target(hd.idx[1], ty, 0.01);
+        any_target = true;
+    }
+
+    if (!any_target) {
+        json entity_coords = extract_entities(state.x, entities_list, var_map);
+        json rej = json::array();
+        if (!rejected_handles.empty()) {
+            for (const auto& h : rejected_handles) rej.push_back(h);
+        } else {
+            for (const auto& tp : target_pairs) rej.push_back(tp.first);
+        }
+        return json{{"ok", false}, {"error", "no drag targets resolved"},
+                    {"rejected_handles", rej}, {"entities", entity_coords},
+                    {"statuses", json::object()}, {"converged", true},
+                    {"budget_exceeded", false}};
+    }
+
+    // Warm start from state if the topology matches.
+    std::optional<Eigen::VectorXd> x0;
+    if (state.n_vars == sys.n_vars()) x0 = state.x;
+    double budget_ms = 10.0;
+    auto res = sys.solve(x0, 1e-10, 50, budget_ms);
+    Eigen::VectorXd x = res.x;
+
+    // Last-good fallback: a non-finite drag vector must never reach the caller.
+    bool finite = x.allFinite();
+    if (!finite) {
+        if (x0 && x0->allFinite())
+            x = *x0;
+        else
+            x = sys.init_vector();
+    }
+
+    auto analysis = sys.analyze(x);
+    json entity_coords = extract_entities(x, entities_list, var_map);
+    int n = sys.n_vars();
+    MatrixXd J = sys.real_jacobian(x);
+    std::map<std::string, std::vector<int>> tag_vars;  // (statuses below; empty refs ok)
+    for (const auto& c : constraints_list) {
+        if (!c.contains("id")) continue;
+        std::string cid = c["id"];
+        std::vector<int> vars;
+        if (c.contains("refs"))
+            for (const auto& r : c["refs"]) {
+                std::string hh = r.get<std::string>();
+                std::string eid = hh.substr(0, hh.find('.'));
+                auto it = var_map.find(eid);
+                if (it != var_map.end())
+                    vars.insert(vars.end(), it->second.begin(), it->second.end());
+            }
+        tag_vars[cid] = vars;
+    }
+    auto statuses_map = compute_statuses(x, entities_list, var_map, n, J,
+                                         analysis.conflicting_tags, tag_vars);
+    json statuses = json::object();
+    for (const auto& kv : statuses_map) statuses[kv.first] = kv.second;
+
+    json rej = json::array();
+    for (const auto& h : rejected_handles) rej.push_back(h);
+    return json{{"ok", true}, {"entities", entity_coords}, {"statuses", statuses},
+                {"rejected_handles", rej}, {"converged", res.converged},
+                {"budget_exceeded", res.budget_exceeded}};
 }
 
 }  // namespace aicad::sketch

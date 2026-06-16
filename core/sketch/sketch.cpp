@@ -968,22 +968,23 @@ void add_distance(System& sys, const std::string& cid, const std::string& h0,
 
     if (ax == "h" || ax == "v") {
         int comp = (ax == "h") ? 0 : 1;
-        // Axis-aligned gap between the (possibly rim-offset) points along ONE
-        // coordinate: residual = |(u0 + s0*r0) - (u1 + s1*r1)| - d. For an axis
-        // dimension the rim sits at the point's coordinate +/- its radius, so each
-        // min/max condition is folded into ITS OWN coordinate INSIDE the abs (a
-        // horizontal/vertical rim projection), NOT added to the scalar gap like the
-        // aligned (radial) branch -- that would mix a full radius into an axis gap
-        // and give a nonsensical (e.g. negative) radius for concentric circles.
-        // Matches the Python oracle _add_distance axis branch verbatim; the C++
-        // unit test "distance axis-h rim wall on concentric circles" pins r=15.
+        // Axis-aligned gap: residual = |Delta_comp| + Sum(s*r) - d. The rim
+        // adjustment is applied OUTSIDE the abs (a scalar offset on the centre-gap),
+        // matching the aligned (radial) branch and the Python oracle _add_distance.
+        // For the realistic separated case this gives the true facing near/far-rim
+        // gap (|Du| - r0 - r1 for [min,min]); a per-coordinate (inside-the-abs) form
+        // would instead pick the same-side rim of both circles and report the wrong
+        // gap. NOTE: the degenerate concentric+axis+cond case (|Du|=0) is an
+        // unsatisfiable request with positive radii; see logs/agentB-blockers.md for
+        // the SW-validation note on the axis rim convention.
         sys.add_residual(
             [av, bv, k0, k1, comp, r0col, r1col, s0, s1, d](const VectorXd& xs) {
                 Vector2d P0 = av(vhead(xs, k0));
                 Vector2d P1 = bv(vseg(xs, k0, k1));
-                double a_ = P0(comp) + (r0col >= 0 ? s0 * xs(r0col) : 0.0);
-                double b_ = P1(comp) + (r1col >= 0 ? s1 * xs(r1col) : 0.0);
-                return r1(std::abs(a_ - b_) - d);
+                double adj = 0.0;
+                if (r0col >= 0) adj += s0 * xs(r0col);
+                if (r1col >= 0) adj += s1 * xs(r1col);
+                return r1(std::abs(P0(comp) - P1(comp)) + adj - d);
             },
             combined,
             [av, bv, aj, bj, k0, k1, kb, comp, r0col, r1col, s0, s1, ncols](
@@ -992,14 +993,13 @@ void add_distance(System& sys, const std::string& cid, const std::string& h0,
                 Vector2d P1 = bv(vseg(xs, k0, k1));
                 MatrixXd J0 = aj(vhead(xs, k0));
                 MatrixXd J1 = bj(vseg(xs, k0, k1));
-                double a_ = P0(comp) + (r0col >= 0 ? s0 * xs(r0col) : 0.0);
-                double b_ = P1(comp) + (r1col >= 0 ? s1 * xs(r1col) : 0.0);
-                double sgn = (a_ - b_) >= 0 ? 1.0 : -1.0;
+                double delta = P0(comp) - P1(comp);
+                double sgn = delta >= 0 ? 1.0 : -1.0;
                 MatrixXd J = MatrixXd::Zero(1, ncols);
                 if (k0) J.block(0, 0, 1, k0) = sgn * J0.row(comp);
                 if (k1) J.block(0, k0, 1, k1) = -sgn * J1.row(comp);
-                if (r0col >= 0) J(0, r0col) = sgn * s0;
-                if (r1col >= 0) J(0, r1col) = -sgn * s1;
+                if (r0col >= 0) J(0, r0col) = s0;
+                if (r1col >= 0) J(0, r1col) = s1;
                 return J;
             },
             cid);

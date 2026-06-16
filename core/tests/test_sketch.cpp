@@ -348,11 +348,16 @@ TEST_CASE("distance cond min drives near-rim gap (point-circle)") {
 }
 
 TEST_CASE("distance axis-h rim wall on concentric circles stays put") {
+    // Wall thickness as an axis-h dimension between concentric circles: outer
+    // far rim (max) to inner near rim (min). Additive (radial-consistent) form:
+    // |Dx| + s0*r0 + s1*r1 - d = 0 + 20 - r2 - 5 -> r2 = 15. Centres stay put.
+    // (cond [min,min] here would be the degenerate concentric overlap; see the
+    // SW-validation note in logs/agentB-blockers.md.)
     json s;
     s["entities"] = json::array({circle("e1", 0, 0, 20), circle("e2", 0, 0, 12)});
     json dc = dim("c4", "distance", {"e1", "e2"}, 5.0);
     dc["axis"] = "h";
-    dc["cond"] = json::array({"min", "min"});
+    dc["cond"] = json::array({"max", "min"});
     s["constraints"] = json::array({
         rel("c1", "coincident", {"e1.center", "origin"}),
         rel("c2", "concentric", {"e1", "e2"}),

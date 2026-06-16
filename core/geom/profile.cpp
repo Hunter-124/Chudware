@@ -340,4 +340,16 @@ std::vector<TopoDS_Face> faces_from_solved_sketch(
     return faces;
 }
 
+TopoDS_Wire wire_from_solved_sketch(
+    const nlohmann::json& solved_entities, const SketchPlane& plane) {
+    if (!solved_entities.is_object()) return TopoDS_Wire();
+    std::vector<TopoDS_Edge> edges;
+    for (auto it = solved_entities.begin(); it != solved_entities.end(); ++it) {
+        SketchEdge se;
+        if (build_edge(it.value(), plane, se)) edges.push_back(se.edge);
+    }
+    if (edges.empty()) return TopoDS_Wire();
+    return make_wire(edges);  // connects head-to-tail in entity order (open or closed)
+}
+
 }  // namespace aicad::geom

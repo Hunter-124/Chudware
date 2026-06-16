@@ -25,6 +25,7 @@
 
 #include <nlohmann/json.hpp>
 #include <TopoDS_Face.hxx>
+#include <TopoDS_Wire.hxx>
 
 #include "geom/plane.h"
 
@@ -40,6 +41,13 @@ namespace aicad::geom {
 // (no valid region face) an empty vector is returned — never throws across the
 // API boundary.
 std::vector<TopoDS_Face> faces_from_solved_sketch(
+    const nlohmann::json& solved_entities, const SketchPlane& plane);
+
+// Build a single (open OR closed) wire from a sketch's raw non-construction edges,
+// lifted onto `plane`, in entity order — the SPINE/PATH a sweep follows and the
+// open trace a rib rides (where faces_from_solved_sketch's closed-loop assembly
+// does not apply). Returns a null wire if no edge builds or they do not connect.
+TopoDS_Wire wire_from_solved_sketch(
     const nlohmann::json& solved_entities, const SketchPlane& plane);
 
 }  // namespace aicad::geom

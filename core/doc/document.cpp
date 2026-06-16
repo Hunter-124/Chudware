@@ -77,6 +77,7 @@ inline double radians(double deg) { return deg * PI / 180.0; }
 struct SketchResult {
     std::vector<TopoDS_Face> faces;
     aicad::geom::SketchPlane plane;
+    nlohmann::json entities;  // solved entities (for a sweep path / rib trace wire)
 };
 
 // A solid-body result.
@@ -447,10 +448,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     plane = plane_from_name(pref);
                 std::vector<TopoDS_Face> faces =
                     aicad::geom::faces_from_solved_sketch(sol.entities, plane);
-                if (faces.empty())
-                    throw std::runtime_error("sketch produced no closed-loop faces");
-
-                results[id] = SketchResult{std::move(faces), plane};
+                // NB: an open sketch (no closed loop) is NOT an error here — it is a
+                // valid path/trace for a sweep/rib. A consuming feature that needs a
+                // face (extrude/revolve) raises if faces is empty.
+                results[id] = SketchResult{std::move(faces), plane, sol.entities};
                 st.ok = true;
 
             } else if (type == "plane") {
@@ -627,6 +628,43 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 }
                 if (solid.IsNull())
                     throw std::runtime_error("revolve produced no solid");
+
+                results[id] = SolidResult{solid};
+                solid_order.push_back(id);
+                st.ok = true;
+
+            } else if (type == "sweep") {
+                // Sweep profile region face(s) along a path sketch's raw wire
+                // (BRepOffsetAPI_MakePipe). Port of engine/doc/features/sweep.py's
+                // MakePipe fast path (guides/twist/orientation/thin deferred).
+                const std::string prof = req_str(feat, "profile");
+                const SketchResult& src = require_sketch(results, prof, prof.c_str());
+                if (src.faces.empty())
+                    throw std::runtime_error("sweep: profile sketch has no closed face");
+
+                auto pit = feat.find("path");
+                if (pit == feat.end())
+                    throw std::runtime_error("sweep: a 'path' ref is required");
+                const std::string path_id = selector_owner_id(*pit);
+                if (path_id.empty())
+                    throw std::runtime_error("sweep: malformed path ref");
+                const SketchResult& pathsk = require_sketch(results, path_id, "path");
+                TopoDS_Wire spine =
+                    aicad::geom::wire_from_solved_sketch(pathsk.entities, pathsk.plane);
+                if (spine.IsNull())
+                    throw std::runtime_error("sweep: path sketch produced no wire");
+
+                TopoDS_Shape solid;
+                for (const TopoDS_Face& f : src.faces) {
+                    TopoDS_Shape pipe = ::geom::sweep_face(f, spine);
+                    if (pipe.IsNull())
+                        throw std::runtime_error("sweep produced an empty solid");
+                    solid = solid.IsNull() ? pipe : ::geom::fuse(solid, pipe);
+                    if (solid.IsNull())
+                        throw std::runtime_error("sweep region fuse failed");
+                }
+                if (solid.IsNull())
+                    throw std::runtime_error("sweep produced no solid");
 
                 results[id] = SolidResult{solid};
                 solid_order.push_back(id);

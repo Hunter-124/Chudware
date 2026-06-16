@@ -42,6 +42,12 @@ TopoDS_Shape make_sphere(double r);                         // centered at origi
 TopoDS_Shape make_cone_centered(double r1, double r2, double h);  // axis +Z, centered
 TopoDS_Shape make_torus(double major_r, double minor_r);   // axis +Z, centered
 
+// Sweep a planar profile face along a spine wire (BRepOffsetAPI_MakePipe). The
+// profile should sit at the spine start, roughly perpendicular to its tangent.
+// Empty shape on kernel failure. Port of engine/doc/features/sweep.py's MakePipe
+// fast path (guides/twist/orientation/thin deferred).
+TopoDS_Shape sweep_face(const TopoDS_Face& profile, const TopoDS_Wire& spine);
+
 // Loft a solid through an ordered list of section wires (BRepOffsetAPI_ThruSections,
 // isSolid=true). `ruled` makes straight transitions between sections; otherwise a
 // smoothed surface. Needs >= 2 wires, ordered + consistently oriented along the loft

@@ -3,6 +3,7 @@
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
+#include <BRepOffsetAPI_MakePipe.hxx>
 #include <BRepOffsetAPI_ThruSections.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCone.hxx>
@@ -89,6 +90,14 @@ TopoDS_Shape make_torus(double major_r, double minor_r) {
     if (!(major_r > 0 && minor_r > 0)) return TopoDS_Shape();
     gp_Ax2 ax(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1));
     return BRepPrimAPI_MakeTorus(ax, major_r, minor_r).Shape();
+}
+
+TopoDS_Shape sweep_face(const TopoDS_Face& profile, const TopoDS_Wire& spine) {
+    if (profile.IsNull() || spine.IsNull()) return TopoDS_Shape();
+    BRepOffsetAPI_MakePipe mk(spine, profile);
+    mk.Build();
+    if (!mk.IsDone()) return TopoDS_Shape();
+    return mk.Shape();
 }
 
 TopoDS_Shape loft_sections(const std::vector<TopoDS_Wire>& sections, bool ruled) {

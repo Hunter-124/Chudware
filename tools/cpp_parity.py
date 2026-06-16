@@ -227,6 +227,19 @@ def fixtures():
         _sketch("f3", "f1", hi_e, hi_c),
         _loft("f4", ["f2", "f3"])]}
 
+    # sweep: a circle (r=5) on XY swept along a +Z line of length 40 -> cylinder,
+    # V = pi*25*40 = 1000*pi. Path is an OPEN sketch (single fixed line) on plane.front.
+    prof_e = [_circle("e1", 0, 0, 5)]
+    prof_c = [_rel("c1", "fix", ["e1.center"]), _dim("c2", "radius", ["e1"], 5)]
+    path_e = [_line("e1", 0, 0, 0, 40)]
+    path_c = [_rel("f1", "fix", ["e1.p1"]), _rel("f2", "fix", ["e1.p2"])]
+    out["sweep"] = {"features": [
+        _sketch("s1", "plane.top", prof_e, prof_c),
+        _sketch("s2", "plane.front", path_e, path_c),
+        {"id": "f3", "type": "sweep", "params": {"mode": "boss"},
+         "refs": {"profile": [{"kind": "region", "sketch": "s1"}],
+                  "path": {"kind": "region", "sketch": "s2"}}}]}
+
     # base primitives (centered on origin).
     def _prim(fid, ptype, params):
         return {"id": fid, "type": ptype,

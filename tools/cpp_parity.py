@@ -179,6 +179,18 @@ def fixtures():
     out["mirror"] = {"features": _sel_base() + [
         {"id": "f3", "type": "mirror", "params": {}, "refs": {"plane": "plane.right"}}]}
 
+    # shell: hollow the box to a 2mm wall, open the top face -> 1 body.
+    out["shell"] = {"features": _sel_base() + [
+        {"id": "f3", "type": "shell", "params": {"thickness": {"value": 2, "expr": None}},
+         "refs": {"remove": [face_sel]}}]}
+    # draft: taper the +X face 10 degrees about the XY (plane.top) neutral -> 1 body.
+    xface_sel = {"kind": "face", "surf": "plane", "centroid": [40.0, 15.0, 10.0],
+                 "axis": [1.0, 0.0, 0.0], "area_or_len": 600.0,
+                 "owner_feature": None, "hint_index": 0}
+    out["draft"] = {"features": _sel_base() + [
+        {"id": "f3", "type": "draft", "params": {"angle": {"value": 10, "expr": None}},
+         "refs": {"neutral": "plane.top", "faces": [xface_sel]}}]}
+
     # linear pattern: 3 abutting 10-cubes along +X -> contiguous, V=3000.
     le, lc = _rect(0, 0, 10, 10)
     out["linear_pattern"] = {"features": [

@@ -34,6 +34,7 @@
 
 #include <Eigen/Dense>
 #include <TopoDS_Edge.hxx>
+#include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 
 namespace geom {
@@ -58,5 +59,22 @@ TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
                           const std::vector<TopoDS_Edge>& edges);
 TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
                            const std::vector<TopoDS_Edge>& edges);
+
+// --- shell (hollow to a wall) + draft (taper faces) — port of dress.py/draft.py ---
+
+// Hollow `body` to a wall of thickness `t`. `remove` faces become the open mouths of
+// the shell (empty -> a fully-closed hollow); `outward` thickens outward (+t) instead
+// of the SolidWorks default inward (-t). BRepOffsetAPI_MakeThickSolid (MakeThickSolidByJoin
+// with offset sign per `outward`). Empty shape on kernel failure.
+TopoDS_Shape shell_solid(const TopoDS_Shape& body, double t, bool outward,
+                         const std::vector<TopoDS_Face>& remove);
+
+// Taper the given `faces` of `body` by `angle_rad` about the neutral plane
+// (`neutral_pt`, `neutral_n`), pulled along `pull` (BRepOffsetAPI_DraftAngle::Add per
+// face). Each face tilts about the line where it meets the neutral plane. Empty shape
+// on kernel failure. (neutral_plane mode only; parting_line/step are deferred.)
+TopoDS_Shape draft_faces(const TopoDS_Shape& body, const std::vector<TopoDS_Face>& faces,
+                         const Eigen::Vector3d& neutral_pt, const Eigen::Vector3d& neutral_n,
+                         const Eigen::Vector3d& pull, double angle_rad);
 
 }  // namespace geom

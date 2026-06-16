@@ -196,7 +196,10 @@ if(AICAD_WITH_OCCT)
     aicad_geom
     nlohmann_json::nlohmann_json
     TKernel TKMath TKG2d TKG3d TKGeomBase TKGeomAlgo
-    TKBRep TKTopAlgo TKPrim TKMesh TKShHealing TKBO TKFillet)
+    TKBRep TKTopAlgo TKPrim TKMesh TKShHealing TKBO TKFillet
+    # TKOffset: shell (BRepOffsetAPI_MakeThickSolid) + draft (BRepOffsetAPI_DraftAngle)
+    # + loft (BRepOffsetAPI_ThruSections).
+    TKOffset)
 
   # Verification: tessellate -> write_aicm -> HOST render::parseAicm round-trip.
   add_executable(test_geom_aicm

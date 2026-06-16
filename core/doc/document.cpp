@@ -328,9 +328,22 @@ json normalize_feature(const json& raw) {
                 } else {
                     f["plane"] = val;  // a face-selector object passes through
                 }
+            } else if (slot == "neutral") {
+                // draft neutral plane: a reserved datum -> point+normal; a face
+                // selector passes through for the branch to resolve.
+                if (auto pn = plane_pt_normal_from_datum(val)) {
+                    f["plane_point"] = {pn->first.x(), pn->first.y(), pn->first.z()};
+                    f["plane_normal"] = {pn->second.x(), pn->second.y(), pn->second.z()};
+                } else {
+                    f["neutral"] = val;
+                }
+            } else if (slot == "pull") {
+                if (auto ax = axis_from_datum(val))
+                    f["pull_dir"] = {ax->second.x(), ax->second.y(), ax->second.z()};
+                else
+                    f["pull"] = val;
             } else if (slot == "face" || slot == "edges" || slot == "remove" ||
-                       slot == "faces" || slot == "neutral" || slot == "pull" ||
-                       slot == "sections") {
+                       slot == "faces" || slot == "sections") {
                 f[slot] = val;  // selector(-list) refs pass through to their branch
             } else {
                 f[slot] = val;  // a/b/body/seed/... pass through
@@ -929,6 +942,106 @@ CompileResult compile_document(const json& doc, const json& env_json) {
 
                 // The drilled solid REPLACES the body (SolidWorks-style): the bored
                 // solid is the body's new current state in the tree.
+                consumed.insert(body_id);
+                results[id] = SolidResult{out};
+                solid_order.push_back(id);
+                st.ok = true;
+
+            } else if (type == "shell") {
+                // Hollow the current body to a wall thickness, opening any `remove`
+                // faces (face selectors). Port of engine/doc/features/dress.py shell.
+                const std::string body_id = body_ref(feat);
+                if (body_id.empty())
+                    throw std::runtime_error("shell: no body ref and no current body");
+                const TopoDS_Shape& body = require_solid(results, body_id, "body");
+                const double t = num_or_expr(feat.at("thickness"), env);
+                if (!(t > 0.0))
+                    throw std::runtime_error("shell thickness must be > 0");
+
+                std::vector<TopoDS_Face> remove;
+                auto rm = feat.find("remove");
+                if (rm != feat.end() &&
+                    (rm->is_object() || (rm->is_array() && !rm->empty()))) {
+                    aicad::doc::FacePicks fp =
+                        aicad::doc::resolve_face_picks(body, *rm, "remove");
+                    if (!fp.dangling.empty()) {
+                        std::string msg = "shell: remove selector dangling: ";
+                        for (std::size_t k = 0; k < fp.dangling.size(); ++k) {
+                            if (k) msg += "; ";
+                            msg += fp.dangling[k];
+                        }
+                        throw std::runtime_error(msg);
+                    }
+                    remove = std::move(fp.faces);
+                }
+
+                const bool outward = feat.value("outward", false);
+                TopoDS_Shape out = ::geom::shell_solid(body, t, outward, remove);
+                if (out.IsNull())
+                    throw std::runtime_error("shell produced an empty shape");
+                consumed.insert(body_id);
+                results[id] = SolidResult{out};
+                solid_order.push_back(id);
+                st.ok = true;
+
+            } else if (type == "draft") {
+                // Taper the selected faces about a neutral plane (datum or face) by an
+                // angle (degrees). Port of engine/doc/features/draft.py neutral_plane mode.
+                const std::string body_id = body_ref(feat);
+                if (body_id.empty())
+                    throw std::runtime_error("draft: no body ref and no current body");
+                const TopoDS_Shape& body = require_solid(results, body_id, "body");
+                const double angle = radians(num_or_expr(feat.at("angle"), env));
+                if (!(std::abs(angle) > 0.0))
+                    throw std::runtime_error("draft angle must be non-zero");
+
+                // Neutral plane: a reserved datum (normalize set plane_point/normal) or
+                // a face selector under "neutral".
+                Eigen::Vector3d npt, nnl;
+                if (feat.contains("plane_point") && feat.contains("plane_normal")) {
+                    npt = req_vec3(feat, "plane_point");
+                    nnl = req_vec3(feat, "plane_normal");
+                } else {
+                    auto nit = feat.find("neutral");
+                    if (nit == feat.end() || !nit->is_object())
+                        throw std::runtime_error("draft: a 'neutral' plane (datum or face) is required");
+                    aicad::doc::FacePicks fp =
+                        aicad::doc::resolve_face_picks(body, *nit, "neutral");
+                    if (!fp.dangling.empty() || fp.faces.empty())
+                        throw std::runtime_error("draft: neutral face not resolved");
+                    BRepAdaptor_Surface surf(fp.faces[0]);
+                    if (surf.GetType() != GeomAbs_Plane)
+                        throw std::runtime_error("draft: neutral face is not planar");
+                    gp_Pln pln = surf.Plane();
+                    gp_Pnt loc = pln.Location();
+                    gp_Dir nd = pln.Axis().Direction();
+                    npt = Eigen::Vector3d(loc.X(), loc.Y(), loc.Z());
+                    nnl = Eigen::Vector3d(nd.X(), nd.Y(), nd.Z());
+                }
+                // Pull defaults to the neutral normal (SolidWorks default).
+                Eigen::Vector3d pull = opt_vec3(feat, "pull_dir").value_or(nnl);
+
+                auto fit = feat.find("faces");
+                if (fit == feat.end() ||
+                    !(fit->is_object() || (fit->is_array() && !fit->empty())))
+                    throw std::runtime_error("draft: 'faces' selector(s) required");
+                aicad::doc::FacePicks fp =
+                    aicad::doc::resolve_face_picks(body, *fit, "faces");
+                if (!fp.dangling.empty()) {
+                    std::string msg = "draft: faces selector dangling: ";
+                    for (std::size_t k = 0; k < fp.dangling.size(); ++k) {
+                        if (k) msg += "; ";
+                        msg += fp.dangling[k];
+                    }
+                    throw std::runtime_error(msg);
+                }
+                if (fp.faces.empty())
+                    throw std::runtime_error("draft: no faces resolved");
+
+                TopoDS_Shape out =
+                    ::geom::draft_faces(body, fp.faces, npt, nnl, pull, angle);
+                if (out.IsNull())
+                    throw std::runtime_error("draft produced an empty shape");
                 consumed.insert(body_id);
                 results[id] = SolidResult{out};
                 solid_order.push_back(id);

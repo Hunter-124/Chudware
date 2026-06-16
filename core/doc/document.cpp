@@ -97,14 +97,24 @@ EnvMap parse_env(const json& env) {
     return m;
 }
 
-// A numeric param that may be a raw number OR a string expression evaluated against
-// `env` (mirrors the sketch solver's resolve_dim: a string is fed to the arithmetic
-// evaluator, a number is taken verbatim). Throws on a bad expression / wrong type —
+// A numeric param that may be (a) a raw number, (b) a string expression, or (c) the
+// CANONICAL dim object {"value": <num>, "expr": <string|null>} the host sends for
+// every dimensioned param (radius/length/diameter/angle/depth/count/spacing...).
+// Mirrors the Python ctx.dim resolve contract: prefer a non-empty expr (evaluated
+// against env), else the numeric value. Throws on a bad expression / wrong shape —
 // the per-feature try/catch turns that into an error status.
 double num_or_expr(const json& v, const EnvMap& env) {
     if (v.is_number()) return v.get<double>();
     if (v.is_string()) return aicad::util::evaluate(v.get<std::string>(), env);
-    throw std::runtime_error("param is neither a number nor an expression string");
+    if (v.is_object()) {
+        auto e = v.find("expr");
+        if (e != v.end() && e->is_string() && !e->get<std::string>().empty())
+            return aicad::util::evaluate(e->get<std::string>(), env);
+        auto val = v.find("value");
+        if (val != v.end() && val->is_number()) return val->get<double>();
+        throw std::runtime_error("dim object has neither a usable 'expr' nor numeric 'value'");
+    }
+    throw std::runtime_error("param is neither a number, expression, nor a dim object");
 }
 
 // Optional [x,y,z] -> Eigen::Vector3d. Returns nullopt when the key is absent or
@@ -178,6 +188,62 @@ std::string req_str(const json& feat, const char* key) {
     return it->get<std::string>();
 }
 
+// A reserved axis datum ("axis.x/y/z", or {"kind":"datum","feature":"axis.z"}) ->
+// (point on axis, unit direction). nullopt for anything else (a topology selector
+// axis is not yet supported here). All reserved axes pass through the world origin
+// (engine/doc/features/datum.py reserved_datums), Z-up.
+std::optional<std::pair<Eigen::Vector3d, Eigen::Vector3d>> axis_from_datum(const json& ref) {
+    std::string name;
+    if (ref.is_string()) {
+        name = ref.get<std::string>();
+    } else if (ref.is_object() && ref.value("kind", std::string()) == "datum" &&
+               ref.contains("feature") && ref["feature"].is_string()) {
+        name = ref["feature"].get<std::string>();
+    } else {
+        return std::nullopt;
+    }
+    const Eigen::Vector3d o(0, 0, 0);
+    if (name == "axis.x") return std::make_pair(o, Eigen::Vector3d(1, 0, 0));
+    if (name == "axis.y") return std::make_pair(o, Eigen::Vector3d(0, 1, 0));
+    if (name == "axis.z") return std::make_pair(o, Eigen::Vector3d(0, 0, 1));
+    return std::nullopt;
+}
+
+// A reserved plane datum ("plane.top/front/right" or the bare "top"/"front"/"right",
+// or {"kind":"datum","feature":"plane.top"}) -> (point, normal), reusing the
+// SketchPlane frames so the signs match the rest of the C++ (top=+Z, front=-Y,
+// right=+X). nullopt for anything else (a face-selector plane is handled separately).
+std::optional<std::pair<Eigen::Vector3d, Eigen::Vector3d>> plane_pt_normal_from_datum(
+    const json& ref) {
+    std::string name;
+    if (ref.is_string()) {
+        name = ref.get<std::string>();
+    } else if (ref.is_object() && ref.value("kind", std::string()) == "datum" &&
+               ref.contains("feature") && ref["feature"].is_string()) {
+        name = ref["feature"].get<std::string>();
+    } else {
+        return std::nullopt;
+    }
+    if (name.rfind("plane.", 0) == 0) name = name.substr(6);
+    if (name != "top" && name != "front" && name != "right") return std::nullopt;
+    aicad::geom::SketchPlane p = plane_from_name(name);
+    return std::make_pair(p.origin, p.normal);
+}
+
+// Extract the owning feature id from a body/region selector entry or a bare id
+// string. A canonical body selector is {"kind":"body","owner_feature":"fN"}; a
+// region selector carries "sketch"; the simplified model passes a bare id string.
+std::string selector_owner_id(const json& sel) {
+    if (sel.is_string()) return sel.get<std::string>();
+    if (sel.is_object()) {
+        if (sel.contains("owner_feature") && sel["owner_feature"].is_string())
+            return sel["owner_feature"].get<std::string>();
+        if (sel.contains("sketch") && sel["sketch"].is_string())
+            return sel["sketch"].get<std::string>();
+    }
+    return std::string();
+}
+
 // A canonical extrude/revolve `profile` ref is a SEL_LIST of region selectors
 // {"kind":"region","sketch":fid,...} (engine/doc/features/extrude.py). In the
 // simplified id-ref model a profile is just the sketch's feature id string. Map
@@ -208,6 +274,7 @@ json canonical_profile_to_id(const json& profile) {
 // dashboard + the host feed REAL canonical trees into the ported subset.
 json normalize_feature(const json& raw) {
     json f = json::object();
+    const std::string type = raw.value("type", std::string());
     // 1. Copy top-level scalar/other keys (the flat shape & metadata like id/type).
     for (auto it = raw.begin(); it != raw.end(); ++it) {
         if (it.key() == "params" || it.key() == "refs") continue;
@@ -224,19 +291,62 @@ json normalize_feature(const json& raw) {
         for (auto it = r.begin(); it != r.end(); ++it) {
             const std::string& slot = it.key();
             const json& val = it.value();
-            if (slot == "plane" && val.is_string()) {
-                // sketch plane datum: "plane.top" -> "top" (a face-selector plane,
-                // e.g. for mirror, is an OBJECT and passes through unchanged below).
-                std::string p = val.get<std::string>();
-                if (p.rfind("plane.", 0) == 0) p = p.substr(6);
-                f["plane"] = p;
-            } else if (slot == "profile") {
+            if (slot == "profile") {
                 f["profile"] = canonical_profile_to_id(val);
+            } else if (slot == "axis") {
+                // revolve / circular_pattern axis: a reserved datum -> axis_pt/axis_dir.
+                if (auto ax = axis_from_datum(val)) {
+                    f["axis_pt"] = {ax->first.x(), ax->first.y(), ax->first.z()};
+                    f["axis_dir"] = {ax->second.x(), ax->second.y(), ax->second.z()};
+                } else {
+                    f["axis"] = val;  // leave for a clearer error / future selector port
+                }
+            } else if (slot == "dir1" || slot == "dir2") {
+                // linear_pattern direction: a reserved axis datum -> a unit vec3.
+                if (auto ax = axis_from_datum(val))
+                    f[slot] = {ax->second.x(), ax->second.y(), ax->second.z()};
+                else
+                    f[slot] = val;
+            } else if (slot == "targets") {
+                if (val.is_array() && !val.empty()) f["a"] = selector_owner_id(val.front());
+            } else if (slot == "tools") {
+                if (val.is_array() && !val.empty()) f["b"] = selector_owner_id(val.front());
+            } else if (slot == "features") {
+                // pattern/mirror replicate a LIST of feature ids; the simplified C++
+                // model patterns a single seed -> take the first.
+                if (val.is_array() && !val.empty()) f["seed"] = selector_owner_id(val.front());
+            } else if (slot == "plane") {
+                if (type == "sketch" && val.is_string()) {
+                    // sketch plane datum "plane.top" -> the plane NAME "top".
+                    std::string p = val.get<std::string>();
+                    if (p.rfind("plane.", 0) == 0) p = p.substr(6);
+                    f["plane"] = p;
+                } else if (auto pn = plane_pt_normal_from_datum(val)) {
+                    // mirror/draft about a reserved datum plane -> point + normal.
+                    f["plane_point"] = {pn->first.x(), pn->first.y(), pn->first.z()};
+                    f["plane_normal"] = {pn->second.x(), pn->second.y(), pn->second.z()};
+                } else {
+                    f["plane"] = val;  // a face-selector object passes through
+                }
+            } else if (slot == "face" || slot == "edges" || slot == "remove" ||
+                       slot == "faces" || slot == "neutral" || slot == "pull" ||
+                       slot == "sections") {
+                f[slot] = val;  // selector(-list) refs pass through to their branch
             } else {
-                f[slot] = val;  // a/b/body/seed/edges/face/plane-object pass through
+                f[slot] = val;  // a/b/body/seed/... pass through
             }
         }
     }
+    // 4. Param vocabulary translation: the canonical boolean op names map to the
+    // kernel's fuse/cut/common; chamfer's canonical "length" is the C++ "distance".
+    if (type == "boolean" && f.contains("op") && f["op"].is_string()) {
+        const std::string op = f["op"].get<std::string>();
+        if (op == "combine") f["op"] = "fuse";
+        else if (op == "subtract") f["op"] = "cut";
+        else if (op == "intersect") f["op"] = "common";
+    }
+    if (type == "chamfer" && f.contains("length") && !f.contains("distance"))
+        f["distance"] = f["length"];
     return f;
 }
 
@@ -254,6 +364,16 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     // Surviving solid ids in first-produced order, so the final body_id assignment
     // (1..N) and AICM body order are deterministic across rebuilds.
     std::vector<std::string> solid_order;
+
+    // The "current top body": the most-recently-produced solid not yet consumed.
+    // Canonical features that omit an explicit body/seed ref (fillet/chamfer/hole/
+    // shell/draft/mirror/pattern, and extrude-cut) operate on it (SolidWorks "the
+    // running body"). Returns "" when no solid exists yet.
+    auto current_solid_id = [&]() -> std::string {
+        for (auto it = solid_order.rbegin(); it != solid_order.rend(); ++it)
+            if (!consumed.count(*it)) return *it;
+        return std::string();
+    };
 
     const json empty = json::array();
     const json& features = doc.contains("features") ? doc.at("features") : empty;
@@ -295,13 +415,35 @@ CompileResult compile_document(const json& doc, const json& env_json) {
             } else if (type == "extrude") {
                 const std::string prof = req_str(feat, "profile");
                 const SketchResult& src = require_sketch(results, prof, prof.c_str());
-                const double depth = num_or_expr(feat.at("depth"), env);
-                if (!(depth > 0.0))
-                    throw std::runtime_error("extrude depth must be > 0");
-                const bool mid_plane = feat.value("mid_plane", false);
-                // Default the prism direction to the source sketch plane's normal.
+                // Canonical mode: "cut" subtracts the prism from the current body;
+                // anything else ("new"/"boss"/"add") builds a standalone boss.
+                const std::string mode = feat.value("mode", std::string("new"));
+                const bool is_cut = (mode == "cut");
+                // Canonical end condition: "blind" (depth), "through_all" (penetrate
+                // the body both ways), "mid_plane" (centered). Simplified shape uses
+                // depth + optional mid_plane bool.
+                const std::string end = feat.value("end", std::string("blind"));
+                bool mid_plane = feat.value("mid_plane", false) || end == "mid_plane";
                 Eigen::Vector3d dir =
                     opt_vec3(feat, "dir").value_or(src.plane.normal);
+
+                // For a cut / through_all we size against the current body.
+                const std::string tgt_id = is_cut ? current_solid_id() : std::string();
+                double depth;
+                if (end == "through_all") {
+                    if (tgt_id.empty())
+                        throw std::runtime_error("extrude through_all requires an existing body");
+                    const TopoDS_Shape& tb = require_solid(results, tgt_id, "target");
+                    const double diag = aicad::doc::bbox_diag(tb);
+                    if (!(diag > 0.0))
+                        throw std::runtime_error("extrude through_all: body has no extent");
+                    depth = diag * 2.2;   // span the whole body...
+                    mid_plane = true;     // ...both directions from the sketch plane
+                } else {
+                    depth = num_or_expr(feat.at("depth"), env);
+                    if (!(depth > 0.0))
+                        throw std::runtime_error("extrude depth must be > 0");
+                }
 
                 // Extrude each region face; fuse multiple regions into one solid.
                 TopoDS_Shape solid;
@@ -316,7 +458,23 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (solid.IsNull())
                     throw std::runtime_error("extrude produced no solid");
 
-                results[id] = SolidResult{solid};
+                if (is_cut) {
+                    if (tgt_id.empty())
+                        throw std::runtime_error("extrude cut requires an existing body");
+                    const TopoDS_Shape& tgt = require_solid(results, tgt_id, "target");
+                    TopoDS_Shape out = ::geom::cut(tgt, solid);
+                    if (out.IsNull())
+                        throw std::runtime_error("extrude cut produced an empty shape");
+                    GProp_GProps gb, ga;
+                    BRepGProp::VolumeProperties(tgt, gb);
+                    BRepGProp::VolumeProperties(out, ga);
+                    if (std::abs(ga.Mass() - gb.Mass()) < 1e-9)
+                        throw std::runtime_error("extrude cut removed no material");
+                    consumed.insert(tgt_id);
+                    results[id] = SolidResult{out};
+                } else {
+                    results[id] = SolidResult{solid};
+                }
                 solid_order.push_back(id);
                 st.ok = true;
 
@@ -325,8 +483,12 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 const SketchResult& src = require_sketch(results, prof, prof.c_str());
                 const Eigen::Vector3d axis_pt = req_vec3(feat, "axis_pt");
                 const Eigen::Vector3d axis_dir = req_vec3(feat, "axis_dir");
-                const double angle =
-                    feat.contains("angle") ? num_or_expr(feat.at("angle"), env) : TWO_PI;
+                // Canonical revolve angle is in DEGREES (SolidWorks/Python); the
+                // kernel revolve_face takes radians. (No existing test drives the
+                // revolve branch, so aligning to the canonical degree contract is safe.)
+                const double angle_deg =
+                    feat.contains("angle") ? num_or_expr(feat.at("angle"), env) : 360.0;
+                const double angle = radians(angle_deg);
                 if (!(std::abs(angle) > 0.0))
                     throw std::runtime_error("revolve angle must be non-zero");
 

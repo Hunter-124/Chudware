@@ -80,10 +80,31 @@ def _sketch(fid, plane_datum, ents, cons):
             "refs": {"plane": plane_datum}}
 
 
-def _extrude(fid, sketch_fid, depth):
-    return {"id": fid, "type": "extrude",
-            "params": {"mode": "new", "depth": depth},
+def _extrude(fid, sketch_fid, depth=None, mode="new", end="blind", merge=None):
+    # depth is a canonical dim object {value,expr} (exercises num_or_expr dim handling).
+    params = {"mode": mode}
+    if merge is not None:
+        params["merge"] = merge
+    if end == "through_all":
+        params["end"] = "through_all"
+    else:
+        params["depth"] = {"value": depth, "expr": None}
+    return {"id": fid, "type": "extrude", "params": params,
             "refs": {"profile": [{"kind": "region", "sketch": sketch_fid}]}}
+
+
+def _revolve(fid, sketch_fid, axis_datum, angle_deg):
+    return {"id": fid, "type": "revolve",
+            "params": {"mode": "boss", "angle": {"value": angle_deg, "expr": None}},
+            "refs": {"profile": [{"kind": "region", "sketch": sketch_fid}], "axis": axis_datum}}
+
+
+def _boolean(fid, op, target_fid, tool_fid):
+    # op is the canonical name (combine/subtract/intersect); targets/tools are body
+    # selectors carrying owner_feature (the earlier feature that built that body).
+    return {"id": fid, "type": "boolean", "params": {"op": op},
+            "refs": {"targets": [{"kind": "body", "owner_feature": target_fid}],
+                     "tools": [{"kind": "body", "owner_feature": tool_fid}]}}
 
 
 def fixtures():
@@ -103,6 +124,32 @@ def fixtures():
     cc = [_dim("hc", "radius", ["h1"], 8)]
     out["washer"] = {"features": [
         _sketch("s1", "plane.top", re + ce, rc + cc), _extrude("x1", "s1", 10.0)]}
+
+    # revolve: rect (x 5..15, y 0..10) on XY revolved 360 about Y -> annulus
+    # r=5,R=15,h=10, V = pi(R^2-r^2)h = 2000*pi.
+    rev_e, rev_c = _rect(5, 0, 10, 10)
+    out["revolve"] = {"features": [
+        _sketch("s1", "plane.top", rev_e, rev_c), _revolve("r1", "s1", "axis.y", 360.0)]}
+
+    # boolean: two 20x20x10 boxes overlapping by 10x20x10=2000; merge:false keeps
+    # each a separate body so the boolean has two operands.
+    ae, ac = _rect(0, 0, 20, 20)
+    be, bc = _rect(10, 0, 20, 20)
+    def _two_box_then(op):
+        return {"features": [
+            _sketch("sa", "plane.top", ae, ac), _extrude("ba", "sa", 10.0, merge=False),
+            _sketch("sb", "plane.top", be, bc), _extrude("bb", "sb", 10.0, merge=False),
+            _boolean("bo", op, "ba", "bb")]}
+    out["boolean_combine"] = _two_box_then("combine")     # V = 6000
+    out["boolean_subtract"] = _two_box_then("subtract")   # V = 2000
+    out["boolean_intersect"] = _two_box_then("intersect")  # V = 2000
+
+    # extrude cut: 20x20x10 box, then a 10x10 inner profile cut through_all -> V=3000.
+    ce2, cc2 = _rect(0, 0, 20, 20)
+    ie, ic = _rect(5, 5, 10, 10)
+    out["extrude_cut"] = {"features": [
+        _sketch("sc", "plane.top", ce2, cc2), _extrude("bc", "sc", 10.0),
+        _sketch("si", "plane.top", ie, ic), _extrude("xc", "si", mode="cut", end="through_all")]}
 
     return out
 

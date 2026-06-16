@@ -116,6 +116,29 @@ set_target_properties(test_expr PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME expr COMMAND test_expr)
 
+# --- libaicad geom-aicm (OCCT-free AICM v1 writer) ---------------------------
+# The encoder half of engine/doc/tessellate.py, kept OCCT-free so it builds and
+# unit-tests in the default (AICAD_WITH_OCCT=OFF) configuration too. The OCCT
+# tessellator below links this same lib.
+add_library(aicad_aicm STATIC
+  geom/aicm.cpp)
+target_include_directories(aicad_aicm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(test_aicm
+  tests/test_aicm_writer.cpp)
+# Include the host loader's OWN directory (host/src/render), NOT host/src — the
+# latter contains a project-local math.h that shadows the CRT <math.h> and breaks
+# the standard <cmath>/<cstdlib> headers (MSVC C2039 'sinhf' etc.).
+target_include_directories(test_aicm PRIVATE
+  ${doctest_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+target_link_libraries(test_aicm PRIVATE aicad_aicm)
+target_sources(test_aicm PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+set_target_properties(test_aicm PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME aicm COMMAND test_aicm)
+
 # --- Wave 2: OCCT geometry kernel (opt-in) -----------------------------------
 if(AICAD_WITH_OCCT)
   include(ProvisionOCCT)
@@ -138,4 +161,38 @@ if(AICAD_WITH_OCCT)
     list(APPEND _occt_envmod "PATH=path_list_prepend:${_b}")
   endforeach()
   set_tests_properties(occt_smoke PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- Wave 2 geom kernel: OCCT tessellation -> AICM emitter -----------------
+  # tessellate.cpp + features.cpp (OCCT) on top of the OCCT-free aicm.cpp writer.
+  add_library(aicad_geom_occt STATIC
+    geom/tessellate.cpp
+    geom/features.cpp
+    geom/aicm.cpp)
+  target_include_directories(aicad_geom_occt PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  # Modelling toolkits for box/prism (TKPrim), polygon->face->wire (TKBRep/TKTopAlgo),
+  # adaptors + GCPnts (TKGeomBase/TKGeomAlgo), mesh (TKMesh), healing (TKShHealing).
+  target_link_libraries(aicad_geom_occt PUBLIC
+    TKernel TKMath TKG2d TKG3d TKGeomBase TKGeomAlgo
+    TKBRep TKTopAlgo TKPrim TKMesh TKShHealing)
+
+  # Verification: tessellate -> write_aicm -> HOST render::parseAicm round-trip.
+  add_executable(test_geom_aicm
+    tests/test_geom_aicm.cpp)
+  # host/src/render (the loader's dir) — NOT host/src, whose math.h shadows the
+  # CRT <math.h> and breaks <cmath>/<cstdlib> under MSVC.
+  target_include_directories(test_geom_aicm PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+  target_link_libraries(test_geom_aicm PRIVATE aicad_geom_occt)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_geom_aicm PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+  set_target_properties(test_geom_aicm PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME geom_aicm COMMAND test_geom_aicm)
+  # Same OCCT DLL PATH prepend as occt_smoke so the test can load TKernel et al.
+  set_tests_properties(geom_aicm PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 endif()

@@ -1,0 +1,19 @@
+{
+  "name": "ported_tangent_circle_circle_external",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "circle", "construction": false, "center": [0.0, 0.0], "radius": 5.0},
+      {"id": "e2", "type": "circle", "construction": false, "center": [12.0, 0.0], "radius": 4.0}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1"]},
+      {"id": "c2", "type": "fix", "refs": ["e2.center"]},
+      {"id": "c3", "type": "tangent", "refs": ["e1", "e2"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0
+  }
+}

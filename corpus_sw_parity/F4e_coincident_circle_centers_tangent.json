@@ -1,0 +1,28 @@
+{
+  "name": "F4e_coincident_circle_centers_tangent",
+  "sw_rationale": "Family 4 (Near-degenerate). Two circles that start with coincident centers (both at origin, r1=10, r2=15) and are given a tangent constraint. Internal tangency (|C0-C1|=|r0-r1|=5) and external tangency (distance=25) are both valid, but since the centers coincide, |C0-C1|=0 which is neither. SolidWorks picks INTERNAL tangency when the circles overlap (since the circles overlap at zero center distance, they are 'inside' each other). The tangent should drive the center distance to |r0-r1|=5. Expected: centers differ by 5 (horizontal, since only h-constraint anchors direction), solver converged. This tests the near-degenerate Jacobian case (d=0 -> ux=uy=0). Confidence MEDIUM (exact direction is unconstrained; we only pin one axis).",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "circle", "construction": false, "center": [0.0, 0.0], "radius": 15.0},
+      {"id": "e2", "type": "circle", "construction": false, "center": [0.0, 0.0], "radius": 10.0}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.center"]},
+      {"id": "c2", "type": "radius", "refs": ["e1"],
+       "value": {"value": 15.0, "expr": null}, "driven": false},
+      {"id": "c3", "type": "radius", "refs": ["e2"],
+       "value": {"value": 10.0, "expr": null}, "driven": false},
+      {"id": "c4", "type": "tangent", "refs": ["e1", "e2"]},
+      {"id": "c5", "type": "horizontal", "refs": ["e1.center", "e2.center"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "statuses": {"e1": "full", "e2": "full"},
+    "redundant": [],
+    "conflicting": [],
+    "_coord_notes": "Internal tangency: |C0-C1| = |15-10| = 5. e1 center stays at (0,0). e2 center moves to (5,0) or (-5,0). The Jacobian at d=0 is degenerate (ux=uy=0) — this is the near-degenerate test. Solver must not NaN."
+  }
+}

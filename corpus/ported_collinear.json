@@ -1,0 +1,20 @@
+{
+  "name": "ported_collinear",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [10.0, 0.0]},
+      {"id": "e2", "type": "line", "construction": false, "p1": [20.0, 0.0], "p2": [30.0, 0.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1"]},
+      {"id": "c2", "type": "collinear", "refs": ["e1", "e2"]},
+      {"id": "c3", "type": "distance", "refs": ["e1.p1", "e2.p1"], "value": {"value": 20.0, "expr": null}, "driven": false},
+      {"id": "c4", "type": "distance", "refs": ["e2.p1", "e2.p2"], "value": {"value": 10.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0
+  }
+}

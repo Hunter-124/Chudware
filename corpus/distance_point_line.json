@@ -1,0 +1,20 @@
+{
+  "name": "distance_point_line",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [-20.0, 0.0], "p2": [20.0, 0.0]},
+      {"id": "e2", "type": "point", "construction": false, "p": [0.0, 4.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "c2", "type": "fix", "refs": ["e1.p2"]},
+      {"id": "c3", "type": "vertical", "refs": ["e1.p1", "e2"]},
+      {"id": "c4", "type": "distance", "refs": ["e2", "e1"], "value": {"value": 7.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0
+  }
+}

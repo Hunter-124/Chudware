@@ -1,0 +1,32 @@
+{
+  "name": "F3c_arc_endpoint_chain_no_reverse",
+  "sw_rationale": "Family 3 (Arc direction). An arc (CCW, start=0, end=90, r=10) whose start is coincident to a fixed line endpoint and whose end is coincident to another fixed point. After solving, the arc must have start=0 (touching (10,0)) and end=90 (touching (0,10)). If the solver accidentally reverses start/end, the coincident residuals would be satisfied with start pointing to (0,10) and end to (10,0) — a different topology. SolidWorks holds the user-intended orientation. Expected: start angle remains ~0 (or equivalent), end ~90. Confidence HIGH.",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "arc", "construction": false,
+       "center": [0.0, 0.0], "radius": 10.0, "start": 0.0, "end": 90.0, "ccw": true},
+      {"id": "e2", "type": "line", "construction": false, "p1": [10.0, 0.0], "p2": [20.0, 0.0]},
+      {"id": "e3", "type": "line", "construction": false, "p1": [0.0, 10.0], "p2": [0.0, 20.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.center"]},
+      {"id": "c2", "type": "radius", "refs": ["e1"],
+       "value": {"value": 10.0, "expr": null}, "driven": false},
+      {"id": "c3", "type": "fix", "refs": ["e2.p1"]},
+      {"id": "c4", "type": "fix", "refs": ["e2.p2"]},
+      {"id": "c5", "type": "fix", "refs": ["e3.p1"]},
+      {"id": "c6", "type": "fix", "refs": ["e3.p2"]},
+      {"id": "c7", "type": "coincident", "refs": ["e1.start", "e2.p1"]},
+      {"id": "c8", "type": "coincident", "refs": ["e1.end", "e3.p1"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "statuses": {"e1": "full", "e2": "full", "e3": "full"},
+    "redundant": [],
+    "conflicting": [],
+    "_coord_notes": "Arc start angle must be ~0 deg (pointing to (10,0)), end must be ~90 deg (pointing to (0,10)). The arc winding must not reverse."
+  }
+}

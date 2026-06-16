@@ -1,0 +1,30 @@
+{
+  "name": "F3a_arc_ccw_preserved",
+  "sw_rationale": "Family 3 (Arc direction). A CCW arc starting at 30 deg, ending at 150 deg, radius 20. Fix the center at origin, fix start and end endpoints via coincident to fixed points. After solving, arc angles must remain in the CCW ordering (start < end within [0,360) interpreted as CCW sweep from 30 to 150 = 120 deg sweep). SolidWorks never reverses arc winding when constraints are satisfied. Expected: center=(0,0), r=20, start~30, end~150, both endpoints on the circle at their initial positions. The start point is at (20*cos30, 20*sin30) = (17.32, 10), end at (20*cos150, 20*sin150) = (-17.32, 10). Confidence HIGH that winding is preserved, HIGH for coords.",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "arc", "construction": false,
+       "center": [0.0, 0.0], "radius": 20.0, "start": 30.0, "end": 150.0, "ccw": true},
+      {"id": "ps", "type": "point", "construction": false, "p": [17.321, 10.0]},
+      {"id": "pe", "type": "point", "construction": false, "p": [-17.321, 10.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.center"]},
+      {"id": "c2", "type": "radius", "refs": ["e1"],
+       "value": {"value": 20.0, "expr": null}, "driven": false},
+      {"id": "c3", "type": "fix", "refs": ["ps"]},
+      {"id": "c4", "type": "fix", "refs": ["pe"]},
+      {"id": "c5", "type": "coincident", "refs": ["e1.start", "ps"]},
+      {"id": "c6", "type": "coincident", "refs": ["e1.end", "pe"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "statuses": {"e1": "full", "ps": "full", "pe": "full"},
+    "redundant": [],
+    "conflicting": [],
+    "_coord_notes": "Arc center=(0,0), r=20, start=30deg, end=150deg. CCW sweep. Start point=(17.321,10), end=(-17.321,10). The arc angles must NOT swap to start=150/end=30 (CW)."
+  }
+}

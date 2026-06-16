@@ -1,0 +1,20 @@
+{
+  "name": "ported_distance_axis_hv",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "circle", "construction": false, "center": [0.0, 0.0], "radius": 20.0},
+      {"id": "e2", "type": "circle", "construction": false, "center": [0.0, 0.0], "radius": 12.0}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "coincident", "refs": ["e1.center", "origin"]},
+      {"id": "c2", "type": "concentric", "refs": ["e1", "e2"]},
+      {"id": "c3", "type": "diameter", "refs": ["e1"], "value": {"value": 40.0, "expr": null}, "driven": false},
+      {"id": "c4", "type": "distance", "refs": ["e1", "e2"], "axis": "h", "cond": ["min", "min"], "value": {"value": 5.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "ported_polar_point",
+  "sketch": {
+    "entities": [
+      {"id": "ref", "type": "line", "construction": true, "p1": [0.0, 0.0], "p2": [10.0, 0.0]},
+      {"id": "spoke", "type": "line", "construction": true, "p1": [0.0, 0.0], "p2": [8.0, 1.0]},
+      {"id": "p", "type": "point", "construction": false, "p": [8.0, 1.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["ref.p1"]},
+      {"id": "c2", "type": "fix", "refs": ["ref.p2"]},
+      {"id": "c3", "type": "fix", "refs": ["spoke.p1"]},
+      {"id": "c4", "type": "distance", "refs": ["spoke.p1", "spoke.p2"], "value": {"value": 10.0, "expr": null}, "driven": false},
+      {"id": "c5", "type": "angle", "refs": ["ref", "spoke"], "value": {"value": 30.0, "expr": null}, "driven": false},
+      {"id": "c6", "type": "coincident", "refs": ["p", "spoke.p2"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0
+  }
+}

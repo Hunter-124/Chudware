@@ -1,0 +1,14 @@
+{
+  "name": "ported_ellipse_arc_handles",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "ellipse_arc", "construction": false, "center": [2.0, 1.0], "rx": 10.0, "ry": 6.0, "rot": 0.0, "a0": 0.0, "a1": 90.0},
+      {"id": "p", "type": "point", "construction": false, "p": [12.0, 1.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.center"]},
+      {"id": "c2", "type": "coincident", "refs": ["p", "e1.start"]}
+    ]
+  },
+  "env": {}
+}

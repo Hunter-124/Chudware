@@ -1,0 +1,38 @@
+{
+  "name": "F1b_triangle_apex_below",
+  "sw_rationale": "Family 1 (Solution branch / triangle flip). Same geometry as F1a but apex p3 starts BELOW the base at (30,-35). With the same constraints the solver must stay on the BELOW branch. Expected: p3.y ~ -26.458. SolidWorks locks to nearest branch; this verifies that the solver does NOT flip both F1a and F1b to the same solution. Confidence: HIGH for branch direction, MEDIUM for exact coord.",
+  "sketch": {
+    "entities": [
+      {"id": "p1", "type": "point", "construction": false, "p": [0.0, 0.0]},
+      {"id": "p2", "type": "point", "construction": false, "p": [60.0, 0.0]},
+      {"id": "p3", "type": "point", "construction": false, "p": [30.0, -35.0]},
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [60.0, 0.0]},
+      {"id": "e2", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [30.0, -35.0]},
+      {"id": "e3", "type": "line", "construction": false, "p1": [60.0, 0.0], "p2": [30.0, -35.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["p1"]},
+      {"id": "c2", "type": "fix", "refs": ["p2"]},
+      {"id": "c3", "type": "coincident", "refs": ["e1.p1", "p1"]},
+      {"id": "c4", "type": "coincident", "refs": ["e1.p2", "p2"]},
+      {"id": "c5", "type": "coincident", "refs": ["e2.p1", "p1"]},
+      {"id": "c6", "type": "coincident", "refs": ["e2.p2", "p3"]},
+      {"id": "c7", "type": "coincident", "refs": ["e3.p1", "p2"]},
+      {"id": "c8", "type": "coincident", "refs": ["e3.p2", "p3"]},
+      {"id": "c9", "type": "horizontal", "refs": ["e1"]},
+      {"id": "c10", "type": "equal", "refs": ["e2", "e3"]},
+      {"id": "c11", "type": "distance", "refs": ["e2.p1", "e2.p2"],
+       "value": {"value": 40.0, "expr": null}, "driven": false},
+      {"id": "c12", "type": "vertical", "refs": ["e2.p2", "e1.mid"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "statuses": {"p1": "full", "p2": "full", "p3": "full", "e1": "full", "e2": "full", "e3": "full"},
+    "redundant": [],
+    "conflicting": [],
+    "_coord_notes": "apex p3 must be BELOW base: p3.y < 0. p3 ~ (30, -26.458). Must NOT flip to +26.458."
+  }
+}

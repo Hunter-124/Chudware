@@ -1,0 +1,21 @@
+{
+  "name": "ported_symmetric",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "point", "construction": false, "p": [2.0, 3.0]},
+      {"id": "e2", "type": "point", "construction": false, "p": [7.0, -1.0]},
+      {"id": "axis", "type": "line", "construction": true, "p1": [5.0, 0.0], "p2": [5.0, 10.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["axis.p1"]},
+      {"id": "c2", "type": "fix", "refs": ["axis.p2"]},
+      {"id": "c3", "type": "fix", "refs": ["e1"]},
+      {"id": "c4", "type": "symmetric", "refs": ["e1", "e2", "axis"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0
+  }
+}

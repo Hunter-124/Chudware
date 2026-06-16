@@ -1,0 +1,20 @@
+{
+  "name": "ported_distance_cond_point_circle",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "point", "construction": false, "p": [0.0, 0.0]},
+      {"id": "e2", "type": "circle", "construction": false, "center": [20.0, 0.0], "radius": 5.0}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1"]},
+      {"id": "c2", "type": "radius", "refs": ["e2"], "value": {"value": 5.0, "expr": null}, "driven": false},
+      {"id": "c3", "type": "horizontal", "refs": ["e1", "e2.center"]},
+      {"id": "c4", "type": "distance", "refs": ["e1", "e2"], "value": {"value": 10.0, "expr": null}, "cond": ["center", "min"], "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0
+  }
+}

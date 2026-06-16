@@ -1,0 +1,18 @@
+{
+  "name": "origin_distance",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "point", "construction": false, "p": [10.0, 3.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "distance", "refs": ["origin", "e1"], "value": {"value": 25.0, "expr": null}, "driven": false},
+      {"id": "c2", "type": "horizontal", "refs": ["origin", "e1"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "statuses": {"e1": "full"}
+  }
+}

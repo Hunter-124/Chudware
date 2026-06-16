@@ -1,0 +1,24 @@
+{
+  "name": "F4b_near_zero_length_line",
+  "sw_rationale": "Family 4 (Near-degenerate). A line with p1=(0,0) fixed, p2 initially at (0.0001, 0.0002) — near-zero length. A distance constraint drives the length to exactly 0.01mm. SolidWorks handles micro-geometry gracefully (used in chamfer profiles etc.). Expected: converged=true, dof=0, line length = 0.01, no NaN. Confidence HIGH for convergence, HIGH for length. The direction is unconstrained so p2 can be anywhere on a circle of r=0.01.",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [0.0001, 0.0002]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "c2", "type": "distance", "refs": ["e1.p1", "e1.p2"],
+       "value": {"value": 0.01, "expr": null}, "driven": false},
+      {"id": "c3", "type": "horizontal", "refs": ["e1"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "statuses": {"e1": "full"},
+    "redundant": [],
+    "conflicting": [],
+    "_coord_notes": "e1 must be horizontal length 0.01. p2 = (0.01, 0). No NaN/Inf."
+  }
+}

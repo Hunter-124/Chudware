@@ -1,0 +1,17 @@
+{
+  "name": "concentric_arcs",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "arc", "construction": false, "center": [0.0, 0.0], "radius": 10.0, "start": 0.0, "end": 90.0, "ccw": true},
+      {"id": "e2", "type": "arc", "construction": false, "center": [1.0, 1.0], "radius": 15.0, "start": 0.0, "end": 90.0, "ccw": true}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.center"]},
+      {"id": "c2", "type": "concentric", "refs": ["e1", "e2"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true
+  }
+}

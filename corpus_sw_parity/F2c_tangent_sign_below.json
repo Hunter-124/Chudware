@@ -1,0 +1,27 @@
+{
+  "name": "F2c_tangent_sign_below",
+  "sw_rationale": "Family 2 (Tangent sign). Same as F2b but circle starts BELOW the line: initial center (0,-14). Tangent must settle on center.y=-10 (below-line branch). Expected center = (0,-10). Together with F2b this pair verifies the solver does not always snap to the same branch. Confidence HIGH.",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [-40.0, 0.0], "p2": [40.0, 0.0]},
+      {"id": "e2", "type": "circle", "construction": false, "center": [0.0, -14.0], "radius": 10.0}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "c2", "type": "fix", "refs": ["e1.p2"]},
+      {"id": "c3", "type": "vertical", "refs": ["e1.p1", "e2.center"]},
+      {"id": "c4", "type": "radius", "refs": ["e2"],
+       "value": {"value": 10.0, "expr": null}, "driven": false},
+      {"id": "c5", "type": "tangent", "refs": ["e1", "e2"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "statuses": {"e1": "full", "e2": "full"},
+    "redundant": [],
+    "conflicting": [],
+    "_coord_notes": "center must be (0, -10), NOT (0,+10). Circle is below line. Branch held by initial center.y=-14 < 0."
+  }
+}

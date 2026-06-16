@@ -1,0 +1,21 @@
+{
+  "name": "fix_whole_entities",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [10.0, 0.0]},
+      {"id": "e2", "type": "circle", "construction": false, "center": [0.0, 20.0], "radius": 5.0},
+      {"id": "e3", "type": "arc", "construction": false, "center": [40.0, 0.0], "radius": 8.0, "start": 10.0, "end": 80.0, "ccw": true}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1"]},
+      {"id": "c2", "type": "fix", "refs": ["e2"]},
+      {"id": "c3", "type": "fix", "refs": ["e3"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "statuses": {"e1": "full", "e2": "full", "e3": "full"}
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "ported_angle",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [10.0, 0.0]},
+      {"id": "e2", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [8.0, 1.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "c2", "type": "fix", "refs": ["e1.p2"]},
+      {"id": "c3", "type": "fix", "refs": ["e2.p1"]},
+      {"id": "c4", "type": "distance", "refs": ["e2.p1", "e2.p2"], "value": {"value": 10.0, "expr": null}, "driven": false},
+      {"id": "c5", "type": "angle", "refs": ["e1", "e2"], "value": {"value": 30.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0
+  }
+}

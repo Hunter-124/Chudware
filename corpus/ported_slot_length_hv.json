@@ -1,0 +1,19 @@
+{
+  "name": "ported_slot_length_hv",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "slot", "construction": false, "p1": [0.0, 0.0], "p2": [40.0, 2.0], "width": 10.0}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "c2", "type": "horizontal", "refs": ["e1"]},
+      {"id": "c3", "type": "distance", "refs": ["e1.p1", "e1.p2"], "value": {"value": 55.0, "expr": null}, "driven": false},
+      {"id": "c4", "type": "radius", "refs": ["e1"], "value": {"value": 6.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "ported_arc_slot_handles",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "arc_slot", "construction": false, "center": [0.0, 0.0], "radius": 20.0, "a0": 0.0, "a1": 90.0, "width": 8.0},
+      {"id": "p", "type": "point", "construction": false, "p": [20.0, 0.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.center"]},
+      {"id": "c2", "type": "coincident", "refs": ["p", "e1.start"]},
+      {"id": "c3", "type": "diameter", "refs": ["e1"], "value": {"value": 8.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {}
+}

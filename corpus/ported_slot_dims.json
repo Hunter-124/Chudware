@@ -1,0 +1,18 @@
+{
+  "name": "ported_slot_dims",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "slot", "construction": false, "p1": [0.0, 0.0], "p2": [40.0, 0.0], "width": 10.0}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "c2", "type": "fix", "refs": ["e1.p2"]},
+      {"id": "c3", "type": "diameter", "refs": ["e1"], "value": {"value": 16.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0
+  }
+}

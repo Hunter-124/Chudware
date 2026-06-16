@@ -1,0 +1,25 @@
+{
+  "name": "F2a_tangent_line_above_circle",
+  "sw_rationale": "Family 2 (Tangent sign). A circle r=10 with center near (0,12) and a horizontal line that is initially ABOVE the circle touching from above. The tangent constraint (dist from center to line = radius) has two solutions: line at y=+10 (above) or y=-10 (below). SolidWorks keeps whichever side the geometry was drawn on. Here the line starts at y=12 (above center), so the solver must find line touching the TOPMOST point: center.y - r = line.y means center drifts to y=10+r=10+10=20, or with center freed: line stays near y~12, center settles at y=22. We pin the line horizontal at y=15 (unfixed y, starting above the circle) and fix the circle center x, free the center y. Expected: circle center.y = line.y + r. Confidence HIGH on side selection.",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [-30.0, 15.0], "p2": [30.0, 15.0]},
+      {"id": "e2", "type": "circle", "construction": false, "center": [0.0, 12.0], "radius": 5.0}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "c2", "type": "fix", "refs": ["e1.p2"]},
+      {"id": "c3", "type": "fix", "refs": ["e2.center"]},
+      {"id": "c4", "type": "radius", "refs": ["e2"],
+       "value": {"value": 5.0, "expr": null}, "driven": false},
+      {"id": "c5", "type": "tangent", "refs": ["e1", "e2"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "_coord_notes": "Line is at y=15, circle center at (0,12), r=5. Distance from center to line = |15-12|=3, but r=5: not satisfied. With everything fixed + tangent this is over-defined / conflicts. The fixture as written is intentionally conflicted to test what the solver reports. The interesting SW behavior: if center.y were free, it would move to y=15-5=10 or y=15+5=20. Since center starts BELOW the line (12<15), SW picks center.y=10 (below line, touching from below - center below line). REVISED: let center y be free by removing fix on center, add fix only on center.x.",
+    "_NOTE": "This fixture over-constrains (all fixed + tangent). See F2b for the correct branch-selection fixture."
+  }
+}

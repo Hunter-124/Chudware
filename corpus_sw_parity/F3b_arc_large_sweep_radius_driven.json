@@ -1,0 +1,24 @@
+{
+  "name": "F3b_arc_large_sweep_radius_driven",
+  "sw_rationale": "Family 3 (Arc direction). An arc with a large CCW sweep (start=200, end=340 = 140 deg sweep, passing through the bottom). Radius changed from initial 15 to driven 25 via a radius constraint. The arc center is fixed, radius is free. After solve: center stays at origin, r=25, and the arc endpoints move outward proportionally while the angles (and thus winding) stay the same. SolidWorks never changes start/end angles when only radius is constrained. Expected: center=(0,0), r=25, start=200, end=340 (angles unchanged). Confidence HIGH.",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "arc", "construction": false,
+       "center": [0.0, 0.0], "radius": 15.0, "start": 200.0, "end": 340.0, "ccw": true}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.center"]},
+      {"id": "c2", "type": "radius", "refs": ["e1"],
+       "value": {"value": 25.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "statuses": {"e1": "full"},
+    "redundant": [],
+    "conflicting": [],
+    "_coord_notes": "center=(0,0), r=25. Angles must stay start=200, end=340. No angle flip. Start point ~ (25*cos200, 25*sin200) ~ (-23.49,-8.55). End point ~ (25*cos340, 25*sin340) ~ (23.49,-8.55)."
+  }
+}

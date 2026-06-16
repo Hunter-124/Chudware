@@ -1,0 +1,25 @@
+{
+  "name": "parallel_perpendicular",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [10.0, 0.0]},
+      {"id": "e2", "type": "line", "construction": false, "p1": [0.0, 5.0], "p2": [9.0, 6.0]},
+      {"id": "e3", "type": "line", "construction": false, "p1": [2.0, -3.0], "p2": [3.0, 4.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "c2", "type": "fix", "refs": ["e1.p2"]},
+      {"id": "c3", "type": "fix", "refs": ["e2.p1"]},
+      {"id": "c4", "type": "fix", "refs": ["e3.p1"]},
+      {"id": "c5", "type": "parallel", "refs": ["e2", "e1"]},
+      {"id": "c6", "type": "perpendicular", "refs": ["e3", "e1"]},
+      {"id": "c7", "type": "distance", "refs": ["e2.p1", "e2.p2"], "value": {"value": 12.0, "expr": null}, "driven": false},
+      {"id": "c8", "type": "distance", "refs": ["e3.p1", "e3.p2"], "value": {"value": 8.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0
+  }
+}

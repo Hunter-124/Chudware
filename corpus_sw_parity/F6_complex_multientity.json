@@ -1,0 +1,49 @@
+{
+  "name": "F6_complex_multientity",
+  "sw_rationale": "Family 6 (Complex multi-entity). A bracket-like profile: 2 horizontal lines, 2 vertical lines, 1 diagonal, 2 arcs (fillet at a corner, large arc for a boss), 1 circle (bolt hole). All chained with coincidents, h/v, tangent, concentric, radius, distance dims. Should solve to dof=0 with all entities 'full'. This is the 'it should just work' test for a realistic SW sketch. Geometry: bottom line (0,0)-(100,0), right vertical (100,0)-(100,60), top horizontal (100,60)-(0,60), left vertical (0,60)-(0,0). Plus a fillet arc at bottom-right corner r=10 (tangent to bottom line and right vertical), a circle centered at (50,30) r=12 (bolt hole). Total ~10 entities, fully constrained. Confidence HIGH for dof=0 if all coincidents/tangents are correct.",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [90.0, 0.0]},
+      {"id": "e2", "type": "arc", "construction": false,
+       "center": [90.0, 10.0], "radius": 10.0, "start": 270.0, "end": 0.0, "ccw": true},
+      {"id": "e3", "type": "line", "construction": false, "p1": [100.0, 10.0], "p2": [100.0, 60.0]},
+      {"id": "e4", "type": "line", "construction": false, "p1": [100.0, 60.0], "p2": [0.0, 60.0]},
+      {"id": "e5", "type": "line", "construction": false, "p1": [0.0, 60.0], "p2": [0.0, 0.0]},
+      {"id": "e6", "type": "circle", "construction": false, "center": [50.0, 30.0], "radius": 12.0}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "c2", "type": "horizontal", "refs": ["e1"]},
+      {"id": "c3", "type": "vertical", "refs": ["e3"]},
+      {"id": "c4", "type": "horizontal", "refs": ["e4"]},
+      {"id": "c5", "type": "vertical", "refs": ["e5"]},
+      {"id": "c6", "type": "coincident", "refs": ["e1.p2", "e2.start"]},
+      {"id": "c7", "type": "coincident", "refs": ["e2.end", "e3.p1"]},
+      {"id": "c8", "type": "coincident", "refs": ["e3.p2", "e4.p1"]},
+      {"id": "c9", "type": "coincident", "refs": ["e4.p2", "e5.p1"]},
+      {"id": "c10", "type": "coincident", "refs": ["e5.p2", "e1.p1"]},
+      {"id": "c11", "type": "tangent", "refs": ["e1", "e2"]},
+      {"id": "c12", "type": "tangent", "refs": ["e2", "e3"]},
+      {"id": "c13", "type": "radius", "refs": ["e2"],
+       "value": {"value": 10.0, "expr": null}, "driven": false},
+      {"id": "c14", "type": "distance", "refs": ["e1.p1", "e3.p2"],
+       "value": {"value": 100.0, "expr": null}, "driven": false},
+      {"id": "c15", "type": "distance", "refs": ["e5.p1", "e5.p2"],
+       "value": {"value": 60.0, "expr": null}, "driven": false},
+      {"id": "c16", "type": "distance", "refs": ["e1.p1", "e1.p2"],
+       "value": {"value": 90.0, "expr": null}, "driven": false},
+      {"id": "c17", "type": "fix", "refs": ["e6.center"]},
+      {"id": "c18", "type": "radius", "refs": ["e6"],
+       "value": {"value": 12.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "statuses": {"e1": "full", "e2": "full", "e3": "full", "e4": "full", "e5": "full", "e6": "full"},
+    "redundant": [],
+    "conflicting": [],
+    "_coord_notes": "Rectangle 100x60 with fillet arc r=10 at bottom-right. e2 arc center at (90,10), tangent to e1 (horizontal) and e3 (vertical). Circle bolt-hole at (50,30) r=12. All entities fully defined. This is the 'should just work' complex sketch."
+  }
+}

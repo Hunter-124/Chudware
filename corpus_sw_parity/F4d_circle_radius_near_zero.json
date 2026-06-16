@@ -1,0 +1,23 @@
+{
+  "name": "F4d_circle_radius_near_zero",
+  "sw_rationale": "Family 4 (Near-degenerate). A circle constrained to radius 0.001 (near-zero). SolidWorks allows sub-millimeter circles (used in sketch fillets of very small features). The solver must converge without division-by-zero. Expected: converged=true, r=0.001, no NaN. Confidence HIGH for convergence behavior (graceful handling).",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "circle", "construction": false, "center": [0.0, 0.0], "radius": 5.0}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.center"]},
+      {"id": "c2", "type": "radius", "refs": ["e1"],
+       "value": {"value": 0.001, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "statuses": {"e1": "full"},
+    "redundant": [],
+    "conflicting": [],
+    "_coord_notes": "circle center=(0,0), r=0.001. Must not NaN or diverge."
+  }
+}

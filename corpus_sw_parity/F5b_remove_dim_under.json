@@ -1,0 +1,33 @@
+{
+  "name": "F5b_remove_dim_under",
+  "sw_rationale": "Family 5 - remove the width dimension (c10) from F5a. Expected: dof=1. SolidWorks marks the entities that contribute the free DOF as 'under'. In this case the width direction is free: e1 and e3 (horizontal lines) lack a length constraint, so the width of the rect can vary. SolidWorks would mark the horizontal lines as under-defined. Confidence HIGH for dof=1. MEDIUM for which exact entities are 'under' (depends on solver DOF attribution).",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [80.0, 0.0]},
+      {"id": "e2", "type": "line", "construction": false, "p1": [80.0, 0.0], "p2": [80.0, 50.0]},
+      {"id": "e3", "type": "line", "construction": false, "p1": [80.0, 50.0], "p2": [0.0, 50.0]},
+      {"id": "e4", "type": "line", "construction": false, "p1": [0.0, 50.0], "p2": [0.0, 0.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "coincident", "refs": ["e1.p2", "e2.p1"]},
+      {"id": "c2", "type": "coincident", "refs": ["e2.p2", "e3.p1"]},
+      {"id": "c3", "type": "coincident", "refs": ["e3.p2", "e4.p1"]},
+      {"id": "c4", "type": "coincident", "refs": ["e4.p2", "e1.p1"]},
+      {"id": "c5", "type": "horizontal", "refs": ["e1"]},
+      {"id": "c6", "type": "horizontal", "refs": ["e3"]},
+      {"id": "c7", "type": "vertical", "refs": ["e2"]},
+      {"id": "c8", "type": "vertical", "refs": ["e4"]},
+      {"id": "c9", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "c11", "type": "distance", "refs": ["e2.p1", "e2.p2"],
+       "value": {"value": 50.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 1,
+    "redundant": [],
+    "conflicting": [],
+    "_coord_notes": "Width is free, height constrained to 50. At least one entity should have status='under'. SolidWorks flags e1 and e3 as under since their x-extent is unconstrained."
+  }
+}

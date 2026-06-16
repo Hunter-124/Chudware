@@ -1,0 +1,38 @@
+{
+  "name": "F5c_duplicate_dim_redundant",
+  "sw_rationale": "Family 5 - add a duplicate width dimension (c12, same value 80) on top of the fully defined F5a. Expected: dof=0, one of {c10, c12} in redundant list, no conflicting. SolidWorks marks the second dim as 'driven' and shows it in parentheses in the sketch. The solver should still converge and agree on the value. Confidence HIGH for redundant detection, HIGH for dof=0 and converged.",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [80.0, 0.0]},
+      {"id": "e2", "type": "line", "construction": false, "p1": [80.0, 0.0], "p2": [80.0, 50.0]},
+      {"id": "e3", "type": "line", "construction": false, "p1": [80.0, 50.0], "p2": [0.0, 50.0]},
+      {"id": "e4", "type": "line", "construction": false, "p1": [0.0, 50.0], "p2": [0.0, 0.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "coincident", "refs": ["e1.p2", "e2.p1"]},
+      {"id": "c2", "type": "coincident", "refs": ["e2.p2", "e3.p1"]},
+      {"id": "c3", "type": "coincident", "refs": ["e3.p2", "e4.p1"]},
+      {"id": "c4", "type": "coincident", "refs": ["e4.p2", "e1.p1"]},
+      {"id": "c5", "type": "horizontal", "refs": ["e1"]},
+      {"id": "c6", "type": "horizontal", "refs": ["e3"]},
+      {"id": "c7", "type": "vertical", "refs": ["e2"]},
+      {"id": "c8", "type": "vertical", "refs": ["e4"]},
+      {"id": "c9", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "c10", "type": "distance", "refs": ["e1.p1", "e1.p2"],
+       "value": {"value": 80.0, "expr": null}, "driven": false},
+      {"id": "c11", "type": "distance", "refs": ["e2.p1", "e2.p2"],
+       "value": {"value": 50.0, "expr": null}, "driven": false},
+      {"id": "c12", "type": "distance", "refs": ["e1.p1", "e1.p2"],
+       "value": {"value": 80.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "statuses": {"e1": "full", "e2": "full", "e3": "full", "e4": "full"},
+    "redundant": ["c10_or_c12"],
+    "conflicting": [],
+    "_coord_notes": "Either c10 or c12 must appear in redundant. Both have value=80 so no conflict. SolidWorks turns the redundant one into a driven (grey) dimension."
+  }
+}

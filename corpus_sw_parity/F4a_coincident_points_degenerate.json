@@ -1,0 +1,23 @@
+{
+  "name": "F4a_coincident_points_degenerate",
+  "sw_rationale": "Family 4 (Near-degenerate). Two points with a coincident constraint: p1 at (0,0) fixed, p2 free, initially near p1 at (0.001, 0.001). After solve both must be at (0,0). SolidWorks handles this gracefully with no NaN output. Expected: converged=true, dof=0, both points at (0,0). Confidence HIGH.",
+  "sketch": {
+    "entities": [
+      {"id": "p1", "type": "point", "construction": false, "p": [0.0, 0.0]},
+      {"id": "p2", "type": "point", "construction": false, "p": [0.001, 0.001]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["p1"]},
+      {"id": "c2", "type": "coincident", "refs": ["p1", "p2"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "statuses": {"p1": "full", "p2": "full"},
+    "redundant": [],
+    "conflicting": [],
+    "_coord_notes": "Both points at (0,0). No garbage coords."
+  }
+}

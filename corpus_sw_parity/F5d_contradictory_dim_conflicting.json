@@ -1,0 +1,37 @@
+{
+  "name": "F5d_contradictory_dim_conflicting",
+  "sw_rationale": "Family 5 - add a contradictory width dimension (c12=90, conflicting with c10=80) on top of the fully defined F5a. Expected: at least one of {c10, c12} in conflicting list, solver may or may not converge cleanly. SolidWorks highlights both conflicting dimensions in yellow. The geometric result is undefined (least-squares compromise). Confidence HIGH for conflicting detection.",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [80.0, 0.0]},
+      {"id": "e2", "type": "line", "construction": false, "p1": [80.0, 0.0], "p2": [80.0, 50.0]},
+      {"id": "e3", "type": "line", "construction": false, "p1": [80.0, 50.0], "p2": [0.0, 50.0]},
+      {"id": "e4", "type": "line", "construction": false, "p1": [0.0, 50.0], "p2": [0.0, 0.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "coincident", "refs": ["e1.p2", "e2.p1"]},
+      {"id": "c2", "type": "coincident", "refs": ["e2.p2", "e3.p1"]},
+      {"id": "c3", "type": "coincident", "refs": ["e3.p2", "e4.p1"]},
+      {"id": "c4", "type": "coincident", "refs": ["e4.p2", "e1.p1"]},
+      {"id": "c5", "type": "horizontal", "refs": ["e1"]},
+      {"id": "c6", "type": "horizontal", "refs": ["e3"]},
+      {"id": "c7", "type": "vertical", "refs": ["e2"]},
+      {"id": "c8", "type": "vertical", "refs": ["e4"]},
+      {"id": "c9", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "c10", "type": "distance", "refs": ["e1.p1", "e1.p2"],
+       "value": {"value": 80.0, "expr": null}, "driven": false},
+      {"id": "c11", "type": "distance", "refs": ["e2.p1", "e2.p2"],
+       "value": {"value": 50.0, "expr": null}, "driven": false},
+      {"id": "c12", "type": "distance", "refs": ["e1.p1", "e1.p2"],
+       "value": {"value": 90.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": false,
+    "dof": 0,
+    "redundant": [],
+    "_conflicting_note": "c10 (width=80) and c12 (width=90) directly contradict each other. SolidWorks flags BOTH in yellow. The solver's conflicting list must be non-empty and contain at least one of {c10, c12}. Confidence HIGH.",
+    "_coord_notes": "Width is indeterminate between 80 and 90. converged may be false or solver may settle at a compromise ~85."
+  }
+}

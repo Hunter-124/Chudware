@@ -1,0 +1,21 @@
+{
+  "name": "point_on_line",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [10.0, 0.0]},
+      {"id": "e2", "type": "point", "construction": false, "p": [5.0, 3.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "c2", "type": "fix", "refs": ["e1.p2"]},
+      {"id": "c3", "type": "point_on", "refs": ["e2", "e1"]},
+      {"id": "c4", "type": "distance", "refs": ["e1.p1", "e2"], "value": {"value": 6.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "statuses": {"e1": "full", "e2": "full"}
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "ported_spline_fix",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "spline", "construction": false, "points": [[0.0, 0.0], [10.0, 5.0], [20.0, 0.0], [30.0, 5.0]]},
+      {"id": "p", "type": "point", "construction": false, "p": [11.0, 6.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1"]},
+      {"id": "c2", "type": "coincident", "refs": ["p", "e1.p1"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0
+  }
+}

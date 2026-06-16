@@ -1,0 +1,35 @@
+{
+  "name": "F5a_fully_defined_base",
+  "sw_rationale": "Family 5 (Over/under-defined transitions) - BASE fully defined sketch. A rectangle: 4 lines, h/v constraints, coincidents, fix one corner, width=80 height=50. This is the fully defined baseline from which F5b (remove dim), F5c (redundant dim), F5d (conflicting dim) derive. Expected: dof=0, all entities full, converged. Confidence VERY HIGH (matches existing bracket test).",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [80.0, 0.0]},
+      {"id": "e2", "type": "line", "construction": false, "p1": [80.0, 0.0], "p2": [80.0, 50.0]},
+      {"id": "e3", "type": "line", "construction": false, "p1": [80.0, 50.0], "p2": [0.0, 50.0]},
+      {"id": "e4", "type": "line", "construction": false, "p1": [0.0, 50.0], "p2": [0.0, 0.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "coincident", "refs": ["e1.p2", "e2.p1"]},
+      {"id": "c2", "type": "coincident", "refs": ["e2.p2", "e3.p1"]},
+      {"id": "c3", "type": "coincident", "refs": ["e3.p2", "e4.p1"]},
+      {"id": "c4", "type": "coincident", "refs": ["e4.p2", "e1.p1"]},
+      {"id": "c5", "type": "horizontal", "refs": ["e1"]},
+      {"id": "c6", "type": "horizontal", "refs": ["e3"]},
+      {"id": "c7", "type": "vertical", "refs": ["e2"]},
+      {"id": "c8", "type": "vertical", "refs": ["e4"]},
+      {"id": "c9", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "c10", "type": "distance", "refs": ["e1.p1", "e1.p2"],
+       "value": {"value": 80.0, "expr": null}, "driven": false},
+      {"id": "c11", "type": "distance", "refs": ["e2.p1", "e2.p2"],
+       "value": {"value": 50.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "statuses": {"e1": "full", "e2": "full", "e3": "full", "e4": "full"},
+    "redundant": [],
+    "conflicting": []
+  }
+}

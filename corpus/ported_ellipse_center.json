@@ -1,0 +1,19 @@
+{
+  "name": "ported_ellipse_center",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "ellipse", "construction": false, "center": [3.0, 4.0], "rx": 10.0, "ry": 6.0, "rot": 0.0},
+      {"id": "p", "type": "point", "construction": false, "p": [3.0, 4.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["p"]},
+      {"id": "c2", "type": "coincident", "refs": ["p", "e1.center"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 3,
+    "statuses": {"e1": "under", "p": "full"}
+  }
+}

@@ -79,4 +79,11 @@ nlohmann::json make_selector(const TopoInfo& info);
 ResolveResult resolve(const nlohmann::json& selector,
                       const std::vector<TopoInfo>& candidates, double bbox_diag);
 
+// Score candidate against `selector` per contract §3 (lower is better). Port of
+// selectors.py::_score_candidate. Exposed (vs. the resolve()-internal scorer) so the
+// kernel-aware pick resolution (doc/picks.cpp) can re-score the same-kind candidates
+// for the hint_index fallback exactly as the Python oracle does.
+double score_candidate(const nlohmann::json& selector, const TopoInfo& candidate,
+                       double bbox_diag);
+
 }  // namespace aicad::doc

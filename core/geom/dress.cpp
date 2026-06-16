@@ -1,6 +1,7 @@
 #include "geom/dress.h"
 
 #include <cmath>
+#include <vector>
 
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepFilletAPI_MakeChamfer.hxx>
@@ -80,6 +81,32 @@ TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
     }
     if (added == 0) return TopoDS_Shape();
 
+    mk.Build();
+    if (!mk.IsDone()) return TopoDS_Shape();
+    return mk.Shape();
+}
+
+// --- explicit-edge overloads ---
+// The doc model's edge-selector path: `edges` are already the unique body edges
+// resolved by doc/picks::resolve_edge_picks, so we just Add() each to the builder (no
+// re-enumeration, no dir filter). Empty `edges` -> empty shape (nothing to do).
+
+TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
+                          const std::vector<TopoDS_Edge>& edges) {
+    if (edges.empty()) return TopoDS_Shape();
+    BRepFilletAPI_MakeFillet mk(shape);
+    for (const TopoDS_Edge& edge : edges) mk.Add(r, edge);
+    mk.Build();
+    if (!mk.IsDone()) return TopoDS_Shape();
+    return mk.Shape();
+}
+
+TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
+                           const std::vector<TopoDS_Edge>& edges) {
+    if (edges.empty()) return TopoDS_Shape();
+    BRepFilletAPI_MakeChamfer mk(shape);
+    // Symmetric chamfer: the single-distance Add(d, edge) sets both legs to d.
+    for (const TopoDS_Edge& edge : edges) mk.Add(d, edge);
     mk.Build();
     if (!mk.IsDone()) return TopoDS_Shape();
     return mk.Shape();

@@ -258,7 +258,8 @@ if(AICAD_WITH_OCCT)
   # aicad_sketch (solve_sketch), and aicad_util (the expr evaluator for expr dims).
   add_library(aicad_doc STATIC
     doc/document.cpp
-    doc/selectors.cpp)
+    doc/selectors.cpp
+    doc/picks.cpp)
   target_include_directories(aicad_doc PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
@@ -306,4 +307,28 @@ if(AICAD_WITH_OCCT)
   add_test(NAME selectors COMMAND test_selectors)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(selectors PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- A2: edge-selector pick resolution (doc/picks.cpp) ---------------------
+  # core/doc/picks.cpp resolves edge selectors against a live B-rep body (the two-
+  # stage describe_edges -> hint-fallback resolve -> nearest-unique-edge mapping ported
+  # from engine/doc/features/dress.py) so the fillet/chamfer compilers accept an EDGE
+  # SELECTOR (not just the dir filter), and a dangling selector becomes a per-feature
+  # error status. The test round-trips a fillet-by-selector document through the host
+  # AICM loader (the contract oracle), exactly like test_document. Same wiring.
+  add_executable(test_picks
+    tests/test_picks.cpp)
+  target_include_directories(test_picks PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+  target_link_libraries(test_picks PRIVATE
+    aicad_doc aicad_geom_occt aicad_geom)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_picks PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+  set_target_properties(test_picks PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME picks COMMAND test_picks)
+  # Same OCCT DLL PATH prepend so the test can load TKernel et al.
+  set_tests_properties(picks PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 endif()

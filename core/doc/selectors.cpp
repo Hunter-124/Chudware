@@ -228,10 +228,10 @@ nlohmann::json make_selector(const TopoInfo& info) {
 
 // --------------------------------------------------------------------------- resolution
 
-namespace {
-
 // Score candidate `c` against selector `sel` per contract §3. Lower is better.
-// Port of _score_candidate: bbox_diag normalises the centroid distance.
+// Port of _score_candidate: bbox_diag normalises the centroid distance. PUBLIC (see
+// selectors.h) so doc/picks.cpp can re-score same-kind candidates for the hint
+// fallback; resolve() below still calls it unqualified (same namespace).
 double score_candidate(const nlohmann::json& sel, const TopoInfo& c, double bbox_diag) {
     // Centroid distance term (always present).
     const auto& sc = sel.at("centroid");
@@ -271,6 +271,8 @@ double score_candidate(const nlohmann::json& sel, const TopoInfo& c, double bbox
     }
     return 0.55 * dc + 0.3 * ar + 0.15 * tm;
 }
+
+namespace {
 
 // Format a double like Python's f"{x:.4f}" (fixed, 4 decimals) for reason strings.
 std::string fmt4(double x) {

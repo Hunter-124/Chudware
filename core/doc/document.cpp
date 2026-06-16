@@ -28,9 +28,11 @@
 
 #include <Eigen/Dense>
 
+#include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 
+#include "doc/picks.h"
 #include "geom/booleans.h"
 #include "geom/dress.h"
 #include "geom/features.h"
@@ -288,17 +290,50 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 const TopoDS_Shape& body = require_solid(results, body_id, "body");
                 std::optional<Eigen::Vector3d> dir = opt_vec3(feat, "dir");
 
+                // An "edges" key (a single selector object, or a non-empty json array of
+                // selectors) routes to the edge-SELECTOR path: each selector is resolved
+                // against the body's live B-rep topology (doc/picks::resolve_edge_picks).
+                // A dangling selector throws (-> per-feature error status, the never-raise
+                // contract). When "edges" is absent the legacy `dir`-filter path runs
+                // unchanged.
+                auto edges_it = feat.find("edges");
+                const bool has_edge_sel =
+                    edges_it != feat.end() &&
+                    (edges_it->is_object() ||
+                     (edges_it->is_array() && !edges_it->empty()));
+
+                std::optional<std::vector<TopoDS_Edge>> picked;
+                if (has_edge_sel) {
+                    aicad::doc::EdgePicks picks =
+                        aicad::doc::resolve_edge_picks(body, *edges_it);
+                    if (!picks.dangling.empty()) {
+                        std::string msg = type + ": " +
+                            std::to_string(picks.dangling.size()) +
+                            " edge selector(s) dangling: ";
+                        for (std::size_t k = 0; k < picks.dangling.size(); ++k) {
+                            if (k) msg += "; ";
+                            msg += picks.dangling[k];
+                        }
+                        throw std::runtime_error(msg);
+                    }
+                    if (picks.edges.empty())
+                        throw std::runtime_error(type + ": no edges resolved");
+                    picked = std::move(picks.edges);
+                }
+
                 TopoDS_Shape out;
                 if (type == "fillet") {
                     const double radius = num_or_expr(feat.at("radius"), env);
                     if (!(radius > 0.0))
                         throw std::runtime_error("fillet radius must be > 0");
-                    out = ::geom::fillet_edges(body, radius, dir);
+                    out = picked ? ::geom::fillet_edges(body, radius, *picked)
+                                 : ::geom::fillet_edges(body, radius, dir);
                 } else {
                     const double distance = num_or_expr(feat.at("distance"), env);
                     if (!(distance > 0.0))
                         throw std::runtime_error("chamfer distance must be > 0");
-                    out = ::geom::chamfer_edges(body, distance, dir);
+                    out = picked ? ::geom::chamfer_edges(body, distance, *picked)
+                                 : ::geom::chamfer_edges(body, distance, dir);
                 }
                 if (out.IsNull())
                     throw std::runtime_error(type + " produced an empty shape");

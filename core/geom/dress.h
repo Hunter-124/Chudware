@@ -30,8 +30,10 @@
 #pragma once
 
 #include <optional>
+#include <vector>
 
 #include <Eigen/Dense>
+#include <TopoDS_Edge.hxx>
 #include <TopoDS_Shape.hxx>
 
 namespace geom {
@@ -47,5 +49,14 @@ TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
 // failure.
 TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
                            std::optional<Eigen::Vector3d> dir = std::nullopt);
+
+// --- explicit-edge overloads (the doc model's edge-selector path) ---
+// Round/bevel EXACTLY the given `edges` (already resolved against the body's topology
+// by doc/picks::resolve_edge_picks). Each edge is Add()ed to the builder once; gates on
+// IsDone(). Empty shape on kernel failure OR when `edges` is empty (nothing to do).
+TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
+                          const std::vector<TopoDS_Edge>& edges);
+TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
+                           const std::vector<TopoDS_Edge>& edges);
 
 }  // namespace geom

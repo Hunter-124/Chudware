@@ -39,6 +39,16 @@ def _poly_circle(cx, cy, r, a0=0.0, a1=360.0, n=72):
     return pts
 
 
+def _arc_seg(cx, cy, r, d0, d1, n=24):
+    """Sample a circular arc from angle d0 to d1 (degrees, SIGNED — no 360 wrap),
+    so callers control the sweep direction. d0<d1 sweeps CCW, d0>d1 sweeps CW."""
+    pts = []
+    for i in range(n + 1):
+        a = math.radians(d0 + (d1 - d0) * i / n)
+        pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    return pts
+
+
 def _slot_outline(p1, p2, w):
     (x1, y1), (x2, y2) = p1, p2
     dx, dy = x2 - x1, y2 - y1
@@ -46,11 +56,14 @@ def _slot_outline(p1, p2, w):
     ux, uy = dx / L, dy / L
     nx, ny = -uy, ux
     hr = w / 2.0
-    a0 = math.degrees(math.atan2(ny, nx))
+    a0 = math.degrees(math.atan2(ny, nx))  # angle of the +normal direction
+    # CCW outline: top rail p1->p2, right cap (+n -> +u -> -n), bottom rail p2->p1,
+    # left cap (-n -> -u -> +n). Caps bulge OUTWARD (CW arc = decreasing angle), so
+    # the half-circles open past the spine ends instead of pinching inward.
     pts = [(x1 + nx * hr, y1 + ny * hr), (x2 + nx * hr, y2 + ny * hr)]
-    pts += _poly_circle(x2, y2, hr, a0, a0 - 180, 24)
+    pts += _arc_seg(x2, y2, hr, a0, a0 - 180, 24)
     pts += [(x1 - nx * hr, y1 - ny * hr)]
-    pts += _poly_circle(x1, y1, hr, a0 + 180, a0, 24)
+    pts += _arc_seg(x1, y1, hr, a0 + 180, a0, 24)
     return pts
 
 
@@ -171,11 +184,11 @@ def main():
 
     # Curated, self-contained gallery for inline viewing.
     curated = [
-        "bracket_full", "bracket_parametric_100", "tangent_line_circle",
-        "concentric_circle_diameter", "ported_angle", "ported_symmetric",
-        "ported_slot_dims", "ported_polar_point",
-        "ported_tangent_circle_circle_external", "ported_distance_cond_concentric_wall",
-        "distance_point_line", "equal_lines",
+        "bracket_full", "ported_slot_dims", "tangent_line_circle",
+        "complex_circle_in_circle_in_square", "complex_nested_circles_origin",
+        "complex_nested_circles_fixed_corner", "complex_hexagon", "complex_pentagon",
+        "complex_l_bracket", "complex_bolt_circle_plate", "complex_arc_slot_frame",
+        "ported_tangent_circle_circle_external",
     ]
     blocks = []
     for name in curated:

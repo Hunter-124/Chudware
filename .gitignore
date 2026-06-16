@@ -6,6 +6,12 @@ __pycache__/
 # C++ host build output (parallel agent build dirs included)
 host/build*/
 
+# C++ core build tree (CMake FetchContent deps + binaries; regenerate with cmake)
+core/build/
+
+# Test caches
+.pytest_cache/
+
 # Release artifacts (regenerate with installer/build_release.py)
 dist/
 
@@ -19,3 +25,10 @@ imgui.ini
 scratch/
 
 .claude/
+
+# Large local reference / research drops (kept locally, never committed)
+kicad/
+AI-gooning/
+sldprt reversing/
+.codex/
+_shot_*.png

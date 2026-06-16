@@ -1,0 +1,49 @@
+{
+  "name": "complex_bolt_circle_plate",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [-50.0, -50.0], "p2": [50.0, -50.0]},
+      {"id": "e2", "type": "line", "construction": false, "p1": [50.0, -50.0], "p2": [50.0, 50.0]},
+      {"id": "e3", "type": "line", "construction": false, "p1": [50.0, 50.0], "p2": [-50.0, 50.0]},
+      {"id": "e4", "type": "line", "construction": false, "p1": [-50.0, 50.0], "p2": [-50.0, -50.0]},
+      {"id": "diag", "type": "line", "construction": true, "p1": [-50.0, -50.0], "p2": [50.0, 50.0]},
+      {"id": "ht", "type": "circle", "construction": false, "center": [0.0, 35.0], "radius": 6.0},
+      {"id": "hb", "type": "circle", "construction": false, "center": [0.0, -35.0], "radius": 6.0},
+      {"id": "hr", "type": "circle", "construction": false, "center": [35.0, 0.0], "radius": 6.0},
+      {"id": "hl", "type": "circle", "construction": false, "center": [-35.0, 0.0], "radius": 6.0}
+    ],
+    "constraints": [
+      {"id": "k1", "type": "coincident", "refs": ["e1.p2", "e2.p1"]},
+      {"id": "k2", "type": "coincident", "refs": ["e2.p2", "e3.p1"]},
+      {"id": "k3", "type": "coincident", "refs": ["e3.p2", "e4.p1"]},
+      {"id": "k4", "type": "coincident", "refs": ["e4.p2", "e1.p1"]},
+      {"id": "h1", "type": "horizontal", "refs": ["e1"]},
+      {"id": "h2", "type": "horizontal", "refs": ["e3"]},
+      {"id": "v1", "type": "vertical", "refs": ["e2"]},
+      {"id": "v2", "type": "vertical", "refs": ["e4"]},
+      {"id": "d1", "type": "coincident", "refs": ["diag.p1", "e1.p1"]},
+      {"id": "d2", "type": "coincident", "refs": ["diag.p2", "e3.p1"]},
+      {"id": "ctr", "type": "coincident", "refs": ["diag.mid", "origin"]},
+      {"id": "w", "type": "distance", "refs": ["e1.p1", "e1.p2"], "value": {"value": 100.0, "expr": null}, "driven": false},
+      {"id": "hgt", "type": "distance", "refs": ["e2.p1", "e2.p2"], "value": {"value": 100.0, "expr": null}, "driven": false},
+      {"id": "tv", "type": "vertical", "refs": ["origin", "ht.center"]},
+      {"id": "tr", "type": "distance", "refs": ["origin", "ht.center"], "value": {"value": 35.0, "expr": null}, "driven": false},
+      {"id": "bv", "type": "vertical", "refs": ["origin", "hb.center"]},
+      {"id": "br", "type": "distance", "refs": ["origin", "hb.center"], "value": {"value": 35.0, "expr": null}, "driven": false},
+      {"id": "rh", "type": "horizontal", "refs": ["origin", "hr.center"]},
+      {"id": "rr", "type": "distance", "refs": ["origin", "hr.center"], "value": {"value": 35.0, "expr": null}, "driven": false},
+      {"id": "lh", "type": "horizontal", "refs": ["origin", "hl.center"]},
+      {"id": "lr", "type": "distance", "refs": ["origin", "hl.center"], "value": {"value": 35.0, "expr": null}, "driven": false},
+      {"id": "eq1", "type": "equal", "refs": ["ht", "hb"]},
+      {"id": "eq2", "type": "equal", "refs": ["hb", "hr"]},
+      {"id": "eq3", "type": "equal", "refs": ["hr", "hl"]},
+      {"id": "dia", "type": "diameter", "refs": ["ht"], "value": {"value": 12.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": []
+  }
+}

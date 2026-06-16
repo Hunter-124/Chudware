@@ -1,0 +1,39 @@
+{
+  "name": "complex_circle_in_circle_in_square",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [100.0, 0.0]},
+      {"id": "e2", "type": "line", "construction": false, "p1": [100.0, 0.0], "p2": [100.0, 100.0]},
+      {"id": "e3", "type": "line", "construction": false, "p1": [100.0, 100.0], "p2": [0.0, 100.0]},
+      {"id": "e4", "type": "line", "construction": false, "p1": [0.0, 100.0], "p2": [0.0, 0.0]},
+      {"id": "diag", "type": "line", "construction": true, "p1": [0.0, 0.0], "p2": [100.0, 100.0]},
+      {"id": "co", "type": "circle", "construction": false, "center": [50.0, 50.0], "radius": 38.0},
+      {"id": "ci", "type": "circle", "construction": false, "center": [50.0, 50.0], "radius": 18.0}
+    ],
+    "constraints": [
+      {"id": "k1", "type": "coincident", "refs": ["e1.p2", "e2.p1"]},
+      {"id": "k2", "type": "coincident", "refs": ["e2.p2", "e3.p1"]},
+      {"id": "k3", "type": "coincident", "refs": ["e3.p2", "e4.p1"]},
+      {"id": "k4", "type": "coincident", "refs": ["e4.p2", "e1.p1"]},
+      {"id": "h1", "type": "horizontal", "refs": ["e1"]},
+      {"id": "h2", "type": "horizontal", "refs": ["e3"]},
+      {"id": "v1", "type": "vertical", "refs": ["e2"]},
+      {"id": "v2", "type": "vertical", "refs": ["e4"]},
+      {"id": "fc", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "w", "type": "distance", "refs": ["e1.p1", "e1.p2"], "value": {"value": 100.0, "expr": null}, "driven": false},
+      {"id": "hgt", "type": "distance", "refs": ["e2.p1", "e2.p2"], "value": {"value": 100.0, "expr": null}, "driven": false},
+      {"id": "d1", "type": "coincident", "refs": ["diag.p1", "e1.p1"]},
+      {"id": "d2", "type": "coincident", "refs": ["diag.p2", "e3.p1"]},
+      {"id": "ctr", "type": "coincident", "refs": ["co.center", "diag.mid"]},
+      {"id": "do", "type": "diameter", "refs": ["co"], "value": {"value": 76.0, "expr": null}, "driven": false},
+      {"id": "cc", "type": "concentric", "refs": ["co", "ci"]},
+      {"id": "di", "type": "diameter", "refs": ["ci"], "value": {"value": 36.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": []
+  }
+}

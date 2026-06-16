@@ -2,13 +2,21 @@
 
 Source tree: `kicad/` (KiCad master). Survey date: 2026-06-15.
 
-> **LICENSE WARNING — read first.** Contrary to the initial assumption that KiCad is
-> "BSD, use it for anything," **KiCad's application code and its geometry/math library
-> (`libs/kimath`) are GPL-2/3-or-later** — every file header carries a GPL notice.
-> We **cannot copy** GPL-licensed files into this engine; we may only **study the
-> algorithms and clean-room reimplement** them. Only a handful of *bundled thirdparty*
-> libraries are permissive and directly vendorable (see table). KiCad also has **no
-> parametric constraint solver** — our `nsolve`/sketch solver has no KiCad analog to borrow.
+> **LICENSE — read first.** KiCad's application code and geometry/math library
+> (`libs/kimath`) are **GPL-2/3-or-later** (every file header carries a GPL notice) — it is
+> NOT BSD. BUT: GPL copyleft is triggered by **distribution**, not by use. GPLv2 §0 / GPLv3 §2
+> permit unlimited **private/internal** use and modification with no source-release obligation.
+> So:
+> - **Internal-only tool (not distributed): we MAY copy / link / vendor KiCad GPL code freely.**
+> - **If the program is ever distributed or sold:** the GPL code makes the whole combined work
+>   GPL (must offer source under GPL) — at that point we'd have to relicense the product GPL or
+>   remove the GPL-derived code. To preserve the option to ship/sell/close-source later, keep the
+>   hot geometry clean-room now; otherwise borrow directly.
+>
+> Project stance (current): internal use — borrowing KiCad geometry is on the table. Revisit if
+> distribution becomes a goal. Independent of license, `libs/kimath` is entangled with wxWidgets +
+> KiCad-wide headers, so a few primitives are about as quick to reimplement as to extract. KiCad has
+> **no parametric constraint solver** — our `nsolve`/sketch solver has no KiCad analog regardless.
 
 ## 1. License table (what we may actually use)
 
@@ -66,7 +74,7 @@ Source tree: `kicad/` (KiCad master). Survey date: 2026-06-15.
 
 ## 6. Bottom line
 
-KiCad gives us **algorithm references** (geometry primitives, ECAD format/connectivity/DRC) to
-clean-room reimplement, plus **two vendorable permissive libs** (Clipper2, Delaunator) for later.
-It gives us **nothing** for the constraint solver. Treat all `libs/kimath` and app code as
-read-only reference; never copy GPL source into `core/`.
+KiCad gives us **geometry primitives** (VECTOR2/SEG/SHAPE_ARC/CIRCLE/…) and **ECAD format/
+connectivity/DRC** code, plus two permissive libs (Clipper2, Delaunator). For **internal use we may
+borrow it directly** (GPL allows private use); if distribution is ever planned, treat `libs/kimath`
++ app code as clean-room reference instead. It gives us **nothing** for the constraint solver.

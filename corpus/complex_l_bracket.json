@@ -1,0 +1,38 @@
+{
+  "name": "complex_l_bracket",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [60.0, 0.0]},
+      {"id": "e2", "type": "line", "construction": false, "p1": [60.0, 0.0], "p2": [60.0, 20.0]},
+      {"id": "e3", "type": "line", "construction": false, "p1": [60.0, 20.0], "p2": [20.0, 20.0]},
+      {"id": "e4", "type": "line", "construction": false, "p1": [20.0, 20.0], "p2": [20.0, 50.0]},
+      {"id": "e5", "type": "line", "construction": false, "p1": [20.0, 50.0], "p2": [0.0, 50.0]},
+      {"id": "e6", "type": "line", "construction": false, "p1": [0.0, 50.0], "p2": [0.0, 0.0]}
+    ],
+    "constraints": [
+      {"id": "k1", "type": "coincident", "refs": ["e1.p2", "e2.p1"]},
+      {"id": "k2", "type": "coincident", "refs": ["e2.p2", "e3.p1"]},
+      {"id": "k3", "type": "coincident", "refs": ["e3.p2", "e4.p1"]},
+      {"id": "k4", "type": "coincident", "refs": ["e4.p2", "e5.p1"]},
+      {"id": "k5", "type": "coincident", "refs": ["e5.p2", "e6.p1"]},
+      {"id": "k6", "type": "coincident", "refs": ["e6.p2", "e1.p1"]},
+      {"id": "h1", "type": "horizontal", "refs": ["e1"]},
+      {"id": "h3", "type": "horizontal", "refs": ["e3"]},
+      {"id": "h5", "type": "horizontal", "refs": ["e5"]},
+      {"id": "v2", "type": "vertical", "refs": ["e2"]},
+      {"id": "v4", "type": "vertical", "refs": ["e4"]},
+      {"id": "v6", "type": "vertical", "refs": ["e6"]},
+      {"id": "fc", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "d1", "type": "distance", "refs": ["e1.p1", "e1.p2"], "value": {"value": 60.0, "expr": null}, "driven": false},
+      {"id": "d2", "type": "distance", "refs": ["e2.p1", "e2.p2"], "value": {"value": 20.0, "expr": null}, "driven": false},
+      {"id": "d3", "type": "distance", "refs": ["e3.p1", "e3.p2"], "value": {"value": 40.0, "expr": null}, "driven": false},
+      {"id": "d4", "type": "distance", "refs": ["e4.p1", "e4.p2"], "value": {"value": 30.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": []
+  }
+}

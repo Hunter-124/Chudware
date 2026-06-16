@@ -1,0 +1,56 @@
+{
+  "name": "complex_arc_slot_frame",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [120.0, 0.0]},
+      {"id": "e2", "type": "line", "construction": false, "p1": [120.0, 0.0], "p2": [120.0, 90.0]},
+      {"id": "e3", "type": "line", "construction": false, "p1": [120.0, 90.0], "p2": [0.0, 90.0]},
+      {"id": "e4", "type": "line", "construction": false, "p1": [0.0, 90.0], "p2": [0.0, 0.0]},
+      {"id": "cMid", "type": "circle", "construction": false, "center": [60.0, 45.0], "radius": 20.0},
+      {"id": "cInner", "type": "circle", "construction": false, "center": [60.0, 45.0], "radius": 14.0},
+      {"id": "tanLine", "type": "line", "construction": true, "p1": [10.0, 70.0], "p2": [50.0, 70.0]},
+      {"id": "cTan", "type": "circle", "construction": false, "center": [30.0, 80.0], "radius": 10.0},
+      {"id": "cExtA", "type": "circle", "construction": false, "center": [95.0, 25.0], "radius": 12.0},
+      {"id": "cExtB", "type": "circle", "construction": false, "center": [95.0, 55.0], "radius": 18.0},
+      {"id": "arcEnd", "type": "arc", "construction": false, "center": [20.0, 20.0], "radius": 15.0, "start": 200.0, "end": 340.0, "ccw": true},
+      {"id": "cArcTan", "type": "circle", "construction": false, "center": [20.0, -10.0], "radius": 15.0}
+    ],
+    "constraints": [
+      {"id": "k1", "type": "coincident", "refs": ["e1.p2", "e2.p1"]},
+      {"id": "k2", "type": "coincident", "refs": ["e2.p2", "e3.p1"]},
+      {"id": "k3", "type": "coincident", "refs": ["e3.p2", "e4.p1"]},
+      {"id": "k4", "type": "coincident", "refs": ["e4.p2", "e1.p1"]},
+      {"id": "h1", "type": "horizontal", "refs": ["e1"]},
+      {"id": "h2", "type": "horizontal", "refs": ["e3"]},
+      {"id": "v1", "type": "vertical", "refs": ["e2"]},
+      {"id": "v2", "type": "vertical", "refs": ["e4"]},
+      {"id": "fc", "type": "fix", "refs": ["e1.p1"]},
+      {"id": "w", "type": "distance", "refs": ["e1.p1", "e1.p2"], "value": {"value": 120.0, "expr": null}, "driven": false},
+      {"id": "hgt", "type": "distance", "refs": ["e2.p1", "e2.p2"], "value": {"value": 90.0, "expr": null}, "driven": false},
+
+      {"id": "mx", "type": "distance", "refs": ["cMid.center", "e4"], "value": {"value": 60.0, "expr": null}, "driven": false},
+      {"id": "my", "type": "distance", "refs": ["cMid.center", "e1"], "value": {"value": 45.0, "expr": null}, "driven": false},
+      {"id": "md", "type": "diameter", "refs": ["cMid"], "value": {"value": 40.0, "expr": null}, "driven": false},
+      {"id": "cc", "type": "concentric", "refs": ["cMid", "cInner"]},
+      {"id": "wall", "type": "distance", "refs": ["cMid", "cInner"], "value": {"value": 6.0, "expr": null}, "cond": ["max", "min"], "driven": false},
+
+      {"id": "tlfix", "type": "fix", "refs": ["tanLine"]},
+      {"id": "ctc", "type": "fix", "refs": ["cTan.center"]},
+      {"id": "tl_tan", "type": "tangent", "refs": ["tanLine", "cTan"]},
+
+      {"id": "afix", "type": "fix", "refs": ["cExtA"]},
+      {"id": "bc", "type": "fix", "refs": ["cExtB.center"]},
+      {"id": "ext_tan", "type": "tangent", "refs": ["cExtA", "cExtB"]},
+
+      {"id": "arcfix", "type": "fix", "refs": ["arcEnd"]},
+      {"id": "atc", "type": "fix", "refs": ["cArcTan.center"]},
+      {"id": "arc_tan", "type": "tangent", "refs": ["arcEnd", "cArcTan"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": []
+  }
+}

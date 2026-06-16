@@ -257,7 +257,8 @@ if(AICAD_WITH_OCCT)
   # aicad_geom_occt (the OCCT kernel + aicad_geom + nlohmann_json, transitively),
   # aicad_sketch (solve_sketch), and aicad_util (the expr evaluator for expr dims).
   add_library(aicad_doc STATIC
-    doc/document.cpp)
+    doc/document.cpp
+    doc/selectors.cpp)
   target_include_directories(aicad_doc PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
@@ -284,4 +285,25 @@ if(AICAD_WITH_OCCT)
   add_test(NAME document COMMAND test_document)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(document PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- Wave 2 milestone: the SELECTOR system — stable refs into B-rep topology --
+  # core/doc/selectors.{h,cpp} turns picked topology into a geometric fingerprint
+  # (kind/surf/centroid/axis/area/owner/hint) and re-resolves it against rebuilt
+  # topology with the §3 scored best-match (margin rule refuses to guess on
+  # symmetric ambiguity). The test has two groups: PURE resolution (hand-built
+  # TopoInfo proving §3/§5 with hand-computed scores) and OCCT describers + an
+  # end-to-end resolve that survives a dimension change. No host AICM loader
+  # needed; links aicad_doc (carries selectors.cpp) + the OCCT kernel.
+  add_executable(test_selectors
+    tests/test_selectors.cpp)
+  target_include_directories(test_selectors PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_selectors PRIVATE
+    aicad_doc aicad_geom_occt aicad_geom)
+  set_target_properties(test_selectors PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME selectors COMMAND test_selectors)
+  # Same OCCT DLL PATH prepend so the test can load TKernel et al.
+  set_tests_properties(selectors PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 endif()

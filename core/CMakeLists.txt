@@ -12,6 +12,13 @@ if(MSVC)
   add_compile_options(/utf-8 /MP)
 endif()
 
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+# Wave 2: provision + link the OCCT 3D B-rep kernel. OFF keeps the fast solver
+# build (Wave 1) self-contained; -DAICAD_WITH_OCCT=ON auto-downloads OCCT and
+# builds the geometry kernel + smoke test (see cmake/ProvisionOCCT.cmake).
+option(AICAD_WITH_OCCT "Provision + link the OCCT geometry kernel (Wave 2)" OFF)
+
 include(FetchContent)
 
 # --- Eigen (header-only linear algebra; replaces numpy/scipy.linalg) ---------
@@ -108,3 +115,27 @@ target_link_libraries(test_expr PRIVATE aicad_util)
 set_target_properties(test_expr PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME expr COMMAND test_expr)
+
+# --- Wave 2: OCCT geometry kernel (opt-in) -----------------------------------
+if(AICAD_WITH_OCCT)
+  include(ProvisionOCCT)
+  # Smoke test: box -> volume (BRepGProp) -> tessellation (BRepMesh). Proves the
+  # auto-provisioned kernel is found, linked, and runnable end to end.
+  add_executable(occt_smoke geom/occt_smoke.cpp)
+  target_include_directories(occt_smoke PRIVATE ${OpenCASCADE_INCLUDE_DIR})
+  # Minimal toolkit set for box + volume (BRepGProp) + mesh (BRepMesh) — avoids
+  # forcing the Tcl/VTK/visualization DLLs to load at startup.
+  target_link_libraries(occt_smoke PRIVATE
+    TKernel TKMath TKG2d TKG3d TKGeomBase TKGeomAlgo TKBRep TKTopAlgo TKPrim TKMesh)
+  set_target_properties(occt_smoke PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME occt_smoke COMMAND occt_smoke)
+  # Prepend the OCCT toolkit + 3rdparty DLL dirs to PATH for the test run, via
+  # ENVIRONMENT_MODIFICATION path_list_prepend (handles the path separator
+  # correctly — a plain ENVIRONMENT "PATH=a;b" would be mangled by CMake's list ;).
+  set(_occt_envmod "PATH=path_list_prepend:${OCCT_DLL_DIR}")
+  foreach(_b ${OCCT_3RDPARTY_BINS})
+    list(APPEND _occt_envmod "PATH=path_list_prepend:${_b}")
+  endforeach()
+  set_tests_properties(occt_smoke PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+endif()

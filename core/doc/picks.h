@@ -34,6 +34,7 @@
 #include <nlohmann/json.hpp>
 
 #include <TopoDS_Edge.hxx>
+#include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 
 #include "doc/selectors.h"
@@ -64,5 +65,22 @@ struct EdgePicks {
 // fallback -> nearest-unique-edge mapping (see header note). Dangling reasons are
 // accumulated under the slot name "edges".
 EdgePicks resolve_edge_picks(const TopoDS_Shape& shape, const nlohmann::json& selectors);
+
+// The result of resolving a list of face selectors against a body: the unique faces
+// that resolved, plus one human-readable reason string per dangling selector.
+struct FacePicks {
+    std::vector<TopoDS_Face> faces;
+    std::vector<std::string> dangling;  // "<slot>[i]: <reason>"
+};
+
+// Resolve face selectors against `shape` — the FACE counterpart of resolve_edge_picks
+// (the mirror feature's plane comes from a picked planar face). Per selector:
+// describe_faces(shape) -> resolve_with_hint_fallback -> nearest-unique-face mapping
+// (reusing the generic centroid-mapping helper with TopAbs_FACE). Unlike edges, a
+// solid's faces enumerate ONCE each (describe_faces is already de-duplicated), so the
+// hint fallback is rarely needed, but the path is identical for robustness. Dangling
+// reasons are accumulated under the given `slot` name (e.g. "plane[0]: <reason>").
+FacePicks resolve_face_picks(const TopoDS_Shape& shape, const nlohmann::json& selectors,
+                             const std::string& slot = "faces");
 
 }  // namespace aicad::doc

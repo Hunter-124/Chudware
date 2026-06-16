@@ -28,9 +28,14 @@
 
 #include <Eigen/Dense>
 
+#include <BRepAdaptor_Surface.hxx>
+#include <GeomAbs_SurfaceType.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
+#include <gp_Dir.hxx>
+#include <gp_Pln.hxx>
+#include <gp_Pnt.hxx>
 
 #include "doc/picks.h"
 #include "geom/booleans.h"
@@ -458,6 +463,72 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 consumed.insert(seed_id);
 
                 results[id] = SolidResult{res};
+                solid_order.push_back(id);
+                st.ok = true;
+
+            } else if (type == "mirror") {
+                // Reflect a referenced solid body across a plane, then either FUSE the
+                // reflection into the body (merge:true, the default — SolidWorks "Mirror
+                // bodies" with Merge on) or keep it as a SEPARATE new body (merge:false).
+                // The plane comes from a FACE SELECTOR ({"kind":"face",...} resolved
+                // against the body's live topology) or an explicit plane_point/normal —
+                // the simplified id-ref port of engine/doc/features/pattern.py::compile_mirror.
+                const std::string body_id = req_str(feat, "body");
+                const TopoDS_Shape& body = require_solid(results, body_id, "body");
+
+                // Resolve the mirror plane to (point, unit normal).
+                Eigen::Vector3d point, normal;
+                auto plane_it = feat.find("plane");
+                const bool face_plane =
+                    plane_it != feat.end() && plane_it->is_object() &&
+                    plane_it->value("kind", std::string()) == "face";
+                if (face_plane) {
+                    aicad::doc::FacePicks fp =
+                        aicad::doc::resolve_face_picks(body, *plane_it, "plane");
+                    if (!fp.dangling.empty()) {
+                        std::string msg = "mirror: plane selector dangling: ";
+                        for (std::size_t k = 0; k < fp.dangling.size(); ++k) {
+                            if (k) msg += "; ";
+                            msg += fp.dangling[k];
+                        }
+                        throw std::runtime_error(msg);
+                    }
+                    if (fp.faces.empty())
+                        throw std::runtime_error("mirror: plane face not resolved");
+                    BRepAdaptor_Surface surf(fp.faces[0]);
+                    if (surf.GetType() != GeomAbs_Plane)
+                        throw std::runtime_error("mirror: selected face is not planar");
+                    gp_Pln pln = surf.Plane();
+                    gp_Pnt loc = pln.Location();
+                    gp_Dir dir = pln.Axis().Direction();
+                    point = Eigen::Vector3d(loc.X(), loc.Y(), loc.Z());
+                    normal = Eigen::Vector3d(dir.X(), dir.Y(), dir.Z());
+                } else {
+                    point = req_vec3(feat, "plane_point");
+                    normal = req_vec3(feat, "plane_normal");
+                    if (!(normal.norm() > 1e-12))
+                        throw std::runtime_error("mirror: plane_normal has zero length");
+                    normal.normalize();
+                }
+
+                TopoDS_Shape reflected = ::geom::mirror_copy(body, point, normal);
+                if (reflected.IsNull())
+                    throw std::runtime_error("mirror produced an empty reflection");
+
+                const bool merge = feat.value("merge", true);
+                if (merge) {
+                    // Union the reflection into the body; the body is consumed (the
+                    // merged solid is its new current state in the tree).
+                    TopoDS_Shape out = ::geom::fuse(body, reflected);
+                    if (out.IsNull())
+                        throw std::runtime_error("mirror union (fuse) produced an empty shape");
+                    consumed.insert(body_id);
+                    results[id] = SolidResult{out};
+                } else {
+                    // The reflection is a NEW standalone body; the original body is NOT
+                    // consumed, so BOTH survive.
+                    results[id] = SolidResult{reflected};
+                }
                 solid_order.push_back(id);
                 st.ok = true;
 

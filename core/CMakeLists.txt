@@ -313,6 +313,32 @@ if(AICAD_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(pattern PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- A4: mirror feature compiler — reflect a body about a plane ------------
+  # core/doc/document.cpp's mirror branch reflects a referenced seed solid across a
+  # plane (a FACE SELECTOR or an explicit plane_point/normal) via a mirror gp_Trsf
+  # (geom/transform.cpp: mirror_copy) and either FUSES the reflection into the body
+  # (merge:true, default) or keeps it as a separate body (merge:false). The test
+  # round-trips an explicit-plane merge, a face-selector merge, and a no-merge
+  # document through the host AICM loader (the contract oracle) and asserts analytic,
+  # OCCT-version-independent invariants (face counts, bbox, mesh volume). Same wiring
+  # as test_pattern; aicad_doc carries the OCCT toolkits transitively via aicad_geom_occt.
+  add_executable(test_mirror
+    tests/test_mirror.cpp)
+  target_include_directories(test_mirror PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+  target_link_libraries(test_mirror PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_mirror PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+  set_target_properties(test_mirror PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME mirror COMMAND test_mirror)
+  # Same OCCT DLL PATH prepend so the test can load TKernel et al.
+  set_tests_properties(mirror PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- Wave 2 milestone: the SELECTOR system — stable refs into B-rep topology --
   # core/doc/selectors.{h,cpp} turns picked topology into a geometric fingerprint
   # (kind/surf/centroid/axis/area/owner/hint) and re-resolves it against rebuilt

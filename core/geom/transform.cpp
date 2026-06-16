@@ -7,6 +7,7 @@
 
 #include <BRepBuilderAPI_Transform.hxx>
 #include <gp_Ax1.hxx>
+#include <gp_Ax2.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
@@ -31,6 +32,20 @@ TopoDS_Shape rotate_copy(const TopoDS_Shape& s, const Eigen::Vector3d& axis_pt,
                 gp_Dir(axis_dir.x(), axis_dir.y(), axis_dir.z()));
     gp_Trsf t;
     t.SetRotation(axis, angle_rad);
+    return BRepBuilderAPI_Transform(s, t, /*copy=*/true).Shape();
+}
+
+// Mirror-copy: build a reflection gp_Trsf about the gp_Ax2 whose origin is the plane
+// point and whose main Direction is the plane normal (so SetMirror(gp_Ax2) reflects
+// across the plane), then make a fresh transformed copy of the shape (copy=true keeps
+// `s` untouched). A mirror is a reflection (negative-determinant) transform; OCCT's
+// BRepBuilderAPI_Transform produces a valid reflected solid.
+TopoDS_Shape mirror_copy(const TopoDS_Shape& s, const Eigen::Vector3d& plane_point,
+                         const Eigen::Vector3d& plane_normal) {
+    gp_Ax2 ax(gp_Pnt(plane_point.x(), plane_point.y(), plane_point.z()),
+              gp_Dir(plane_normal.x(), plane_normal.y(), plane_normal.z()));
+    gp_Trsf t;
+    t.SetMirror(ax);
     return BRepBuilderAPI_Transform(s, t, /*copy=*/true).Shape();
 }
 

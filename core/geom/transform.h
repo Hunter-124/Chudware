@@ -32,4 +32,13 @@ TopoDS_Shape translate_copy(const TopoDS_Shape& s, const Eigen::Vector3d& v);
 TopoDS_Shape rotate_copy(const TopoDS_Shape& s, const Eigen::Vector3d& axis_pt,
                          const Eigen::Vector3d& axis_dir, double angle_rad);
 
+// Mirror-copy: return a fresh copy of `s` reflected across the plane through
+// `plane_point` perpendicular to `plane_normal` (gp_Trsf::SetMirror(gp_Ax2) +
+// BRepBuilderAPI_Transform copy). The gp_Ax2's main Direction is the plane normal,
+// so a mirror about that axis-system reflects across the plane. The input is left
+// unmodified — used for the doc model's mirror feature compiler. `plane_normal` must
+// be non-degenerate (it need not be unit-length; gp_Dir normalises it).
+TopoDS_Shape mirror_copy(const TopoDS_Shape& s, const Eigen::Vector3d& plane_point,
+                         const Eigen::Vector3d& plane_normal);
+
 }  // namespace geom

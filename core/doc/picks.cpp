@@ -28,6 +28,7 @@
 #include <TopTools_IndexedMapOfShape.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
+#include <TopoDS_Face.hxx>
 #include <gp_Pnt.hxx>
 
 namespace aicad::doc {
@@ -213,6 +214,46 @@ EdgePicks resolve_edge_picks(const TopoDS_Shape& shape, const nlohmann::json& se
             continue;
         }
         out.edges.push_back(TopoDS::Edge(near));
+    }
+
+    return out;
+}
+
+// --------------------------------------------------------------------- resolve_face_picks
+
+FacePicks resolve_face_picks(const TopoDS_Shape& shape, const nlohmann::json& selectors,
+                             const std::string& slot) {
+    FacePicks out;
+    const std::vector<nlohmann::json> sel_list = as_selector_list(selectors);
+
+    // A solid's faces enumerate once each (describe_faces is de-duplicated), so face
+    // resolution is unambiguous; we still route through the same hint-fallback +
+    // nearest-unique-face mapping as edges for a single, consistent code path.
+    const std::vector<TopoInfo> infos = describe_faces(shape);
+    const double diag = bbox_diag(shape);
+    const double tol = std::max(diag, 1.0) * kResolveMapTolFrac;
+
+    for (std::size_t i = 0; i < sel_list.size(); ++i) {
+        const nlohmann::json& sel = sel_list[i];
+        std::optional<int> idx = resolve_with_hint_fallback(sel, infos, diag);
+        if (!idx.has_value()) {
+            ResolveResult rr = resolve(sel, infos, diag);
+            std::string reason = rr.dangling_reason.value_or(std::string("unresolved"));
+            out.dangling.push_back(slot + "[" + std::to_string(i) + "]: " + reason);
+            continue;
+        }
+        // The resolved descriptor's centroid (face centre) -> nearest unique face.
+        const Eigen::Vector3d& target = infos[*idx].centroid;
+        double dist = std::numeric_limits<double>::infinity();
+        TopoDS_Shape near = nearest_unique_subshape(shape, TopAbs_FACE, target, tol, dist);
+        if (near.IsNull()) {
+            out.dangling.push_back(
+                slot + "[" + std::to_string(i) + "]: no unique face within " +
+                fmt4g(tol) + " mm of the resolved descriptor (nearest " +
+                fmt4g(dist) + " mm)");
+            continue;
+        }
+        out.faces.push_back(TopoDS::Face(near));
     }
 
     return out;

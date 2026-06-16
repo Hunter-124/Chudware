@@ -227,6 +227,16 @@ def fixtures():
         _sketch("f3", "f1", hi_e, hi_c),
         _loft("f4", ["f2", "f3"])]}
 
+    # base primitives (centered on origin).
+    def _prim(fid, ptype, params):
+        return {"id": fid, "type": ptype,
+                "params": {k: {"value": v, "expr": None} for k, v in params.items()}}
+    out["prim_box"] = {"features": [_prim("f1", "box", {"length": 30, "width": 20, "height": 10})]}
+    out["prim_cylinder"] = {"features": [_prim("f1", "cylinder", {"radius": 10, "height": 25})]}
+    out["prim_sphere"] = {"features": [_prim("f1", "sphere", {"radius": 12})]}
+    out["prim_cone"] = {"features": [_prim("f1", "cone", {"r1": 10, "r2": 4, "height": 20})]}
+    out["prim_torus"] = {"features": [_prim("f1", "torus", {"major_r": 20, "minor_r": 5})]}
+
     return out
 
 

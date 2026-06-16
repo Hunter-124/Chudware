@@ -5,11 +5,16 @@
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepOffsetAPI_ThruSections.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepPrimAPI_MakeCone.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
+#include <BRepPrimAPI_MakeSphere.hxx>
+#include <BRepPrimAPI_MakeTorus.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Wire.hxx>
+#include <gp_Ax2.hxx>
 #include <gp_Ax1.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
@@ -56,6 +61,34 @@ TopoDS_Shape revolve_face(const TopoDS_Face& face, const Eigen::Vector3d& axis_p
     gp_Ax1 axis(gp_Pnt(axis_pt.x(), axis_pt.y(), axis_pt.z()),
                 gp_Dir(axis_dir.x(), axis_dir.y(), axis_dir.z()));
     return BRepPrimAPI_MakeRevol(face, axis, angle_rad).Shape();
+}
+
+TopoDS_Shape make_box_centered(double l, double w, double h) {
+    if (!(l > 0 && w > 0 && h > 0)) return TopoDS_Shape();
+    return BRepPrimAPI_MakeBox(gp_Pnt(-l / 2, -w / 2, -h / 2), l, w, h).Shape();
+}
+
+TopoDS_Shape make_cylinder_centered(double r, double h) {
+    if (!(r > 0 && h > 0)) return TopoDS_Shape();
+    gp_Ax2 ax(gp_Pnt(0, 0, -h / 2), gp_Dir(0, 0, 1));
+    return BRepPrimAPI_MakeCylinder(ax, r, h).Shape();
+}
+
+TopoDS_Shape make_sphere(double r) {
+    if (!(r > 0)) return TopoDS_Shape();
+    return BRepPrimAPI_MakeSphere(gp_Pnt(0, 0, 0), r).Shape();
+}
+
+TopoDS_Shape make_cone_centered(double r1, double r2, double h) {
+    if (!(h > 0) || r1 < 0 || r2 < 0 || (r1 == 0 && r2 == 0)) return TopoDS_Shape();
+    gp_Ax2 ax(gp_Pnt(0, 0, -h / 2), gp_Dir(0, 0, 1));
+    return BRepPrimAPI_MakeCone(ax, r1, r2, h).Shape();
+}
+
+TopoDS_Shape make_torus(double major_r, double minor_r) {
+    if (!(major_r > 0 && minor_r > 0)) return TopoDS_Shape();
+    gp_Ax2 ax(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1));
+    return BRepPrimAPI_MakeTorus(ax, major_r, minor_r).Shape();
 }
 
 TopoDS_Shape loft_sections(const std::vector<TopoDS_Wire>& sections, bool ruled) {

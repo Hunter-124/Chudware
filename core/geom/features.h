@@ -34,6 +34,14 @@ TopoDS_Shape extrude_face(const TopoDS_Face& face, const Eigen::Vector3d& dir,
 TopoDS_Shape revolve_face(const TopoDS_Face& face, const Eigen::Vector3d& axis_pt,
                           const Eigen::Vector3d& axis_dir, double angle_rad);
 
+// --- primitives (centered on the origin, matching engine/doc/features/primitives.py
+//     default Align.CENTER) — the SolidWorks base-primitive features. ---
+TopoDS_Shape make_box_centered(double l, double w, double h);
+TopoDS_Shape make_cylinder_centered(double r, double h);   // axis +Z, z in [-h/2, h/2]
+TopoDS_Shape make_sphere(double r);                         // centered at origin
+TopoDS_Shape make_cone_centered(double r1, double r2, double h);  // axis +Z, centered
+TopoDS_Shape make_torus(double major_r, double minor_r);   // axis +Z, centered
+
 // Loft a solid through an ordered list of section wires (BRepOffsetAPI_ThruSections,
 // isSolid=true). `ruled` makes straight transitions between sections; otherwise a
 // smoothed surface. Needs >= 2 wires, ordered + consistently oriented along the loft

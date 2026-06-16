@@ -507,6 +507,35 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 solid_order.push_back(id);
                 st.ok = true;
 
+            } else if (type == "box" || type == "cylinder" || type == "sphere" ||
+                       type == "cone" || type == "torus") {
+                // Base primitives, centered on the origin (the SolidWorks/Python
+                // default; the `at` placement datum is deferred). Port of
+                // engine/doc/features/primitives.py.
+                TopoDS_Shape solid;
+                if (type == "box") {
+                    solid = ::geom::make_box_centered(num_or_expr(feat.at("length"), env),
+                                                      num_or_expr(feat.at("width"), env),
+                                                      num_or_expr(feat.at("height"), env));
+                } else if (type == "cylinder") {
+                    solid = ::geom::make_cylinder_centered(num_or_expr(feat.at("radius"), env),
+                                                           num_or_expr(feat.at("height"), env));
+                } else if (type == "sphere") {
+                    solid = ::geom::make_sphere(num_or_expr(feat.at("radius"), env));
+                } else if (type == "cone") {
+                    solid = ::geom::make_cone_centered(num_or_expr(feat.at("r1"), env),
+                                                       num_or_expr(feat.at("r2"), env),
+                                                       num_or_expr(feat.at("height"), env));
+                } else {  // torus
+                    solid = ::geom::make_torus(num_or_expr(feat.at("major_r"), env),
+                                               num_or_expr(feat.at("minor_r"), env));
+                }
+                if (solid.IsNull())
+                    throw std::runtime_error(type + " produced an empty solid");
+                results[id] = SolidResult{solid};
+                solid_order.push_back(id);
+                st.ok = true;
+
             } else if (type == "extrude") {
                 const std::string prof = req_str(feat, "profile");
                 const SketchResult& src = require_sketch(results, prof, prof.c_str());

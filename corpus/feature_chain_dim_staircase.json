@@ -1,0 +1,38 @@
+{
+  "name": "feature_chain_dim_staircase",
+  "sketch": {
+    "entities": [
+      {"id": "l0", "type": "line", "construction": false, "p1": [0.0, 0.0], "p2": [10.0, 0.0]},
+      {"id": "l1", "type": "line", "construction": false, "p1": [10.0, 0.0], "p2": [10.0, 8.0]},
+      {"id": "l2", "type": "line", "construction": false, "p1": [10.0, 8.0], "p2": [22.0, 8.0]},
+      {"id": "l3", "type": "line", "construction": false, "p1": [22.0, 8.0], "p2": [22.0, 16.0]},
+      {"id": "l4", "type": "line", "construction": false, "p1": [22.0, 16.0], "p2": [34.0, 16.0]}
+    ],
+    "constraints": [
+      {"id": "k0", "type": "coincident", "refs": ["l0.p2", "l1.p1"]},
+      {"id": "k1", "type": "coincident", "refs": ["l1.p2", "l2.p1"]},
+      {"id": "k2", "type": "coincident", "refs": ["l2.p2", "l3.p1"]},
+      {"id": "k3", "type": "coincident", "refs": ["l3.p2", "l4.p1"]},
+
+      {"id": "anchor", "type": "coincident", "refs": ["l0.p1", "origin"]},
+
+      {"id": "ho0", "type": "horizontal", "refs": ["l0"]},
+      {"id": "ve1", "type": "vertical", "refs": ["l1"]},
+      {"id": "ho2", "type": "horizontal", "refs": ["l2"]},
+      {"id": "ve3", "type": "vertical", "refs": ["l3"]},
+      {"id": "ho4", "type": "horizontal", "refs": ["l4"]},
+
+      {"id": "run0", "type": "distance", "refs": ["l0.p1", "l0.p2"], "axis": "h", "value": {"value": 10.0, "expr": null}, "driven": false},
+      {"id": "rise0", "type": "distance", "refs": ["l1.p1", "l1.p2"], "axis": "v", "value": {"value": 8.0, "expr": null}, "driven": false},
+      {"id": "run1", "type": "distance", "refs": ["l2.p1", "l2.p2"], "axis": "h", "value": {"value": 12.0, "expr": null}, "driven": false},
+      {"id": "rise1", "type": "distance", "refs": ["l3.p1", "l3.p2"], "axis": "v", "value": {"value": 8.0, "expr": null}, "driven": false},
+      {"id": "run2", "type": "distance", "refs": ["l4.p1", "l4.p2"], "axis": "h", "value": {"value": 12.0, "expr": null}, "driven": false}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": []
+  }
+}

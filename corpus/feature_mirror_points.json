@@ -1,0 +1,29 @@
+{
+  "name": "feature_mirror_points",
+  "sketch": {
+    "entities": [
+      {"id": "axis", "type": "line", "construction": true, "p1": [0.0, 0.0], "p2": [0.0, 40.0]},
+      {"id": "L1", "type": "point", "construction": false, "p": [-30.0, 10.0]},
+      {"id": "L2", "type": "point", "construction": false, "p": [-15.0, 25.0]},
+      {"id": "R1", "type": "point", "construction": false, "p": [25.0, 8.0]},
+      {"id": "R2", "type": "point", "construction": false, "p": [12.0, 22.0]}
+    ],
+    "constraints": [
+      {"id": "ax0", "type": "coincident", "refs": ["axis.p1", "origin"]},
+      {"id": "ax1", "type": "vertical", "refs": ["axis"]},
+      {"id": "axlen", "type": "distance", "refs": ["axis.p1", "axis.p2"], "value": {"value": 40.0, "expr": null}, "driven": false},
+      {"id": "l1x", "type": "distance", "refs": ["origin", "L1"], "axis": "h", "value": {"value": 30.0, "expr": null}, "driven": false},
+      {"id": "l1y", "type": "distance", "refs": ["origin", "L1"], "axis": "v", "value": {"value": 10.0, "expr": null}, "driven": false},
+      {"id": "l2x", "type": "distance", "refs": ["origin", "L2"], "axis": "h", "value": {"value": 15.0, "expr": null}, "driven": false},
+      {"id": "l2y", "type": "distance", "refs": ["origin", "L2"], "axis": "v", "value": {"value": 25.0, "expr": null}, "driven": false},
+      {"id": "sym1", "type": "symmetric", "refs": ["L1", "R1", "axis"]},
+      {"id": "sym2", "type": "symmetric", "refs": ["L2", "R2", "axis"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": []
+  }
+}

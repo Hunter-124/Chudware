@@ -1,0 +1,41 @@
+{
+  "name": "feature_circular_pattern_tri",
+  "sketch": {
+    "entities": [
+      {"id": "s0", "type": "line", "construction": true, "p1": [0.0, 0.0], "p2": [0.0, 25.0]},
+      {"id": "s1", "type": "line", "construction": true, "p1": [0.0, 0.0], "p2": [-21.650635, -12.5]},
+      {"id": "s2", "type": "line", "construction": true, "p1": [0.0, 0.0], "p2": [21.650635, -12.5]},
+
+      {"id": "h0", "type": "circle", "construction": false, "center": [0.0, 25.0], "radius": 3.0},
+      {"id": "h1", "type": "circle", "construction": false, "center": [-21.650635, -12.5], "radius": 4.0},
+      {"id": "h2", "type": "circle", "construction": false, "center": [21.650635, -12.5], "radius": 2.0}
+    ],
+    "constraints": [
+      {"id": "o0", "type": "coincident", "refs": ["s0.p1", "origin"]},
+      {"id": "o1", "type": "coincident", "refs": ["s1.p1", "origin"]},
+      {"id": "o2", "type": "coincident", "refs": ["s2.p1", "origin"]},
+
+      {"id": "r0", "type": "distance", "refs": ["s0.p1", "s0.p2"], "value": {"value": 25.0, "expr": null}, "driven": false},
+      {"id": "r1", "type": "distance", "refs": ["s1.p1", "s1.p2"], "value": {"value": 25.0, "expr": null}, "driven": false},
+      {"id": "r2", "type": "distance", "refs": ["s2.p1", "s2.p2"], "value": {"value": 25.0, "expr": null}, "driven": false},
+
+      {"id": "base", "type": "vertical", "refs": ["s0"]},
+      {"id": "a01", "type": "angle", "refs": ["s0", "s1"], "value": {"value": 120.0, "expr": null}, "driven": false},
+      {"id": "a12", "type": "angle", "refs": ["s1", "s2"], "value": {"value": 120.0, "expr": null}, "driven": false},
+
+      {"id": "c0", "type": "coincident", "refs": ["h0.center", "s0.p2"]},
+      {"id": "c1", "type": "coincident", "refs": ["h1.center", "s1.p2"]},
+      {"id": "c2", "type": "coincident", "refs": ["h2.center", "s2.p2"]},
+
+      {"id": "dia", "type": "diameter", "refs": ["h0"], "value": {"value": 6.0, "expr": null}, "driven": false},
+      {"id": "eq01", "type": "equal", "refs": ["h0", "h1"]},
+      {"id": "eq12", "type": "equal", "refs": ["h1", "h2"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": []
+  }
+}

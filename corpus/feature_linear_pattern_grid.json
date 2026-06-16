@@ -1,0 +1,43 @@
+{
+  "name": "feature_linear_pattern_grid",
+  "sketch": {
+    "entities": [
+      {"id": "g00", "type": "circle", "construction": false, "center": [10.0, 10.0], "radius": 3.0},
+      {"id": "g01", "type": "circle", "construction": false, "center": [29.0, 11.0], "radius": 2.0},
+      {"id": "g02", "type": "circle", "construction": false, "center": [51.0, 9.0], "radius": 4.0},
+      {"id": "g10", "type": "circle", "construction": false, "center": [11.0, 38.0], "radius": 2.5},
+      {"id": "g11", "type": "circle", "construction": false, "center": [31.0, 41.0], "radius": 3.5},
+      {"id": "g12", "type": "circle", "construction": false, "center": [49.0, 39.0], "radius": 1.5}
+    ],
+    "constraints": [
+      {"id": "x0", "type": "distance", "refs": ["origin", "g00.center"], "axis": "h", "value": {"value": 10.0, "expr": null}, "driven": false},
+      {"id": "y0", "type": "distance", "refs": ["origin", "g00.center"], "axis": "v", "value": {"value": 10.0, "expr": null}, "driven": false},
+
+      {"id": "hr0a", "type": "horizontal", "refs": ["g00.center", "g01.center"]},
+      {"id": "hr0b", "type": "horizontal", "refs": ["g01.center", "g02.center"]},
+      {"id": "hr1a", "type": "horizontal", "refs": ["g10.center", "g11.center"]},
+      {"id": "hr1b", "type": "horizontal", "refs": ["g11.center", "g12.center"]},
+
+      {"id": "vc0", "type": "vertical", "refs": ["g00.center", "g10.center"]},
+      {"id": "vc1", "type": "vertical", "refs": ["g01.center", "g11.center"]},
+      {"id": "vc2", "type": "vertical", "refs": ["g02.center", "g12.center"]},
+
+      {"id": "px0", "type": "distance", "refs": ["g00.center", "g01.center"], "axis": "h", "value": {"value": 20.0, "expr": null}, "driven": false},
+      {"id": "px1", "type": "distance", "refs": ["g01.center", "g02.center"], "axis": "h", "value": {"value": 20.0, "expr": null}, "driven": false},
+      {"id": "py", "type": "distance", "refs": ["g00.center", "g10.center"], "axis": "v", "value": {"value": 30.0, "expr": null}, "driven": false},
+
+      {"id": "dia", "type": "diameter", "refs": ["g00"], "value": {"value": 6.0, "expr": null}, "driven": false},
+      {"id": "eq1", "type": "equal", "refs": ["g00", "g01"]},
+      {"id": "eq2", "type": "equal", "refs": ["g01", "g02"]},
+      {"id": "eq3", "type": "equal", "refs": ["g02", "g10"]},
+      {"id": "eq4", "type": "equal", "refs": ["g10", "g11"]},
+      {"id": "eq5", "type": "equal", "refs": ["g11", "g12"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": []
+  }
+}

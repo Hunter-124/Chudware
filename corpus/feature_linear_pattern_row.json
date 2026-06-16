@@ -1,0 +1,31 @@
+{
+  "name": "feature_linear_pattern_row",
+  "sketch": {
+    "entities": [
+      {"id": "c0", "type": "circle", "construction": false, "center": [10.0, 15.0], "radius": 4.0},
+      {"id": "c1", "type": "circle", "construction": false, "center": [33.0, 16.0], "radius": 3.0},
+      {"id": "c2", "type": "circle", "construction": false, "center": [60.0, 14.0], "radius": 5.0},
+      {"id": "c3", "type": "circle", "construction": false, "center": [86.0, 15.5], "radius": 2.0}
+    ],
+    "constraints": [
+      {"id": "x0", "type": "distance", "refs": ["origin", "c0.center"], "axis": "h", "value": {"value": 10.0, "expr": null}, "driven": false},
+      {"id": "y0", "type": "distance", "refs": ["origin", "c0.center"], "axis": "v", "value": {"value": 15.0, "expr": null}, "driven": false},
+      {"id": "h01", "type": "horizontal", "refs": ["c0.center", "c1.center"]},
+      {"id": "h12", "type": "horizontal", "refs": ["c1.center", "c2.center"]},
+      {"id": "h23", "type": "horizontal", "refs": ["c2.center", "c3.center"]},
+      {"id": "p01", "type": "distance", "refs": ["c0.center", "c1.center"], "axis": "h", "value": {"value": 25.0, "expr": null}, "driven": false},
+      {"id": "p12", "type": "distance", "refs": ["c1.center", "c2.center"], "axis": "h", "value": {"value": 25.0, "expr": null}, "driven": false},
+      {"id": "p23", "type": "distance", "refs": ["c2.center", "c3.center"], "axis": "h", "value": {"value": 25.0, "expr": null}, "driven": false},
+      {"id": "dia", "type": "diameter", "refs": ["c0"], "value": {"value": 8.0, "expr": null}, "driven": false},
+      {"id": "eq01", "type": "equal", "refs": ["c0", "c1"]},
+      {"id": "eq12", "type": "equal", "refs": ["c1", "c2"]},
+      {"id": "eq23", "type": "equal", "refs": ["c2", "c3"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": []
+  }
+}

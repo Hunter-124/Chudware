@@ -12,6 +12,10 @@ core/build/
 # Test caches
 .pytest_cache/
 
+# Generated PNG raster renders (binary; regenerate with tools/render_sketches.py).
+# The text SVGs in corpus_render/ are kept for diffable visual reference.
+corpus_render/png/
+
 # Release artifacts (regenerate with installer/build_release.py)
 dist/
 

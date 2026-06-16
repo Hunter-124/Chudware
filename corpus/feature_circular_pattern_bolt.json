@@ -1,0 +1,62 @@
+{
+  "name": "feature_circular_pattern_bolt",
+  "sketch": {
+    "entities": [
+      {"id": "s0", "type": "line", "construction": true, "p1": [0.0, 0.0], "p2": [40.0, 0.0]},
+      {"id": "s1", "type": "line", "construction": true, "p1": [0.0, 0.0], "p2": [20.0, 34.641016]},
+      {"id": "s2", "type": "line", "construction": true, "p1": [0.0, 0.0], "p2": [-20.0, 34.641016]},
+      {"id": "s3", "type": "line", "construction": true, "p1": [0.0, 0.0], "p2": [-40.0, 0.0]},
+      {"id": "s4", "type": "line", "construction": true, "p1": [0.0, 0.0], "p2": [-20.0, -34.641016]},
+      {"id": "s5", "type": "line", "construction": true, "p1": [0.0, 0.0], "p2": [20.0, -34.641016]},
+
+      {"id": "h0", "type": "circle", "construction": false, "center": [40.0, 0.0], "radius": 5.0},
+      {"id": "h1", "type": "circle", "construction": false, "center": [20.0, 34.641016], "radius": 4.0},
+      {"id": "h2", "type": "circle", "construction": false, "center": [-20.0, 34.641016], "radius": 6.0},
+      {"id": "h3", "type": "circle", "construction": false, "center": [-40.0, 0.0], "radius": 3.0},
+      {"id": "h4", "type": "circle", "construction": false, "center": [-20.0, -34.641016], "radius": 5.5},
+      {"id": "h5", "type": "circle", "construction": false, "center": [20.0, -34.641016], "radius": 4.5}
+    ],
+    "constraints": [
+      {"id": "o0", "type": "coincident", "refs": ["s0.p1", "origin"]},
+      {"id": "o1", "type": "coincident", "refs": ["s1.p1", "origin"]},
+      {"id": "o2", "type": "coincident", "refs": ["s2.p1", "origin"]},
+      {"id": "o3", "type": "coincident", "refs": ["s3.p1", "origin"]},
+      {"id": "o4", "type": "coincident", "refs": ["s4.p1", "origin"]},
+      {"id": "o5", "type": "coincident", "refs": ["s5.p1", "origin"]},
+
+      {"id": "r0", "type": "distance", "refs": ["s0.p1", "s0.p2"], "value": {"value": 40.0, "expr": null}, "driven": false},
+      {"id": "r1", "type": "distance", "refs": ["s1.p1", "s1.p2"], "value": {"value": 40.0, "expr": null}, "driven": false},
+      {"id": "r2", "type": "distance", "refs": ["s2.p1", "s2.p2"], "value": {"value": 40.0, "expr": null}, "driven": false},
+      {"id": "r3", "type": "distance", "refs": ["s3.p1", "s3.p2"], "value": {"value": 40.0, "expr": null}, "driven": false},
+      {"id": "r4", "type": "distance", "refs": ["s4.p1", "s4.p2"], "value": {"value": 40.0, "expr": null}, "driven": false},
+      {"id": "r5", "type": "distance", "refs": ["s5.p1", "s5.p2"], "value": {"value": 40.0, "expr": null}, "driven": false},
+
+      {"id": "base", "type": "horizontal", "refs": ["s0"]},
+      {"id": "a01", "type": "angle", "refs": ["s0", "s1"], "value": {"value": 60.0, "expr": null}, "driven": false},
+      {"id": "a12", "type": "angle", "refs": ["s1", "s2"], "value": {"value": 60.0, "expr": null}, "driven": false},
+      {"id": "a23", "type": "angle", "refs": ["s2", "s3"], "value": {"value": 60.0, "expr": null}, "driven": false},
+      {"id": "a34", "type": "angle", "refs": ["s3", "s4"], "value": {"value": 60.0, "expr": null}, "driven": false},
+      {"id": "a45", "type": "angle", "refs": ["s4", "s5"], "value": {"value": 60.0, "expr": null}, "driven": false},
+
+      {"id": "c0", "type": "coincident", "refs": ["h0.center", "s0.p2"]},
+      {"id": "c1", "type": "coincident", "refs": ["h1.center", "s1.p2"]},
+      {"id": "c2", "type": "coincident", "refs": ["h2.center", "s2.p2"]},
+      {"id": "c3", "type": "coincident", "refs": ["h3.center", "s3.p2"]},
+      {"id": "c4", "type": "coincident", "refs": ["h4.center", "s4.p2"]},
+      {"id": "c5", "type": "coincident", "refs": ["h5.center", "s5.p2"]},
+
+      {"id": "dia", "type": "diameter", "refs": ["h0"], "value": {"value": 10.0, "expr": null}, "driven": false},
+      {"id": "eq01", "type": "equal", "refs": ["h0", "h1"]},
+      {"id": "eq12", "type": "equal", "refs": ["h1", "h2"]},
+      {"id": "eq23", "type": "equal", "refs": ["h2", "h3"]},
+      {"id": "eq34", "type": "equal", "refs": ["h3", "h4"]},
+      {"id": "eq45", "type": "equal", "refs": ["h4", "h5"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": []
+  }
+}

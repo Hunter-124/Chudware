@@ -1,0 +1,26 @@
+{
+  "name": "feature_mirror_holes",
+  "sketch": {
+    "entities": [
+      {"id": "axis", "type": "line", "construction": true, "p1": [0.0, 0.0], "p2": [0.0, 50.0]},
+      {"id": "hL", "type": "circle", "construction": false, "center": [-20.0, 30.0], "radius": 5.0},
+      {"id": "hR", "type": "circle", "construction": false, "center": [18.0, 28.0], "radius": 3.0}
+    ],
+    "constraints": [
+      {"id": "ax0", "type": "coincident", "refs": ["axis.p1", "origin"]},
+      {"id": "ax1", "type": "vertical", "refs": ["axis"]},
+      {"id": "axlen", "type": "distance", "refs": ["axis.p1", "axis.p2"], "value": {"value": 50.0, "expr": null}, "driven": false},
+      {"id": "lx", "type": "distance", "refs": ["origin", "hL.center"], "axis": "h", "value": {"value": 20.0, "expr": null}, "driven": false},
+      {"id": "ly", "type": "distance", "refs": ["origin", "hL.center"], "axis": "v", "value": {"value": 30.0, "expr": null}, "driven": false},
+      {"id": "dia", "type": "diameter", "refs": ["hL"], "value": {"value": 10.0, "expr": null}, "driven": false},
+      {"id": "eq", "type": "equal", "refs": ["hL", "hR"]},
+      {"id": "sym", "type": "symmetric", "refs": ["hL.center", "hR.center", "axis"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": []
+  }
+}

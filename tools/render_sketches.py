@@ -27,6 +27,15 @@ os.makedirs(OUT, exist_ok=True)
 # Status -> stroke color (SolidWorks-ish: black fully defined, blue under, red over).
 COL = {"full": "#111827", "under": "#2563eb", "over": "#dc2626"}
 
+# Optional PNG rasterization (lets us eyeball a true image, not just SVG text).
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _HAVE_MPL = True
+except Exception:
+    _HAVE_MPL = False
+
 
 def _poly_circle(cx, cy, r, a0=0.0, a1=360.0, n=72):
     pts = []
@@ -158,6 +167,35 @@ def render_svg(name, sol, W=360, H=320, pad=26):
     return "\n".join(out)
 
 
+def render_png(name, sol):
+    """Rasterize a solved sketch to corpus_render/png/<name>.png via matplotlib."""
+    if not _HAVE_MPL:
+        return
+    fig, ax = plt.subplots(figsize=(3.4, 3.0), dpi=120)
+    ax.axhline(0, color="#e5e7eb", lw=0.8, zorder=0)
+    ax.axvline(0, color="#e5e7eb", lw=0.8, zorder=0)
+    for eid, ent in sol.entities.items():
+        status = sol.statuses.get(eid, "full")
+        col = COL.get(status, "#111827")
+        cons = bool(ent.get("construction"))
+        polys, pts = entity_drawables(eid, ent, status)
+        for pl in polys:
+            if len(pl) >= 2:
+                ax.plot([p[0] for p in pl], [p[1] for p in pl], color=col,
+                        lw=1.5, ls="--" if cons else "-")
+        if pts:
+            ax.scatter([p[0] for p in pts], [p[1] for p in pts], color=col, s=9, zorder=3)
+    ax.set_aspect("equal")
+    ax.margins(0.12)
+    ax.set_title(name, fontsize=8)
+    ax.tick_params(labelsize=6)
+    pdir = os.path.join(OUT, "png")
+    os.makedirs(pdir, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(os.path.join(pdir, name + ".png"))
+    plt.close(fig)
+
+
 def main():
     files = sorted(glob.glob(os.path.join(REPO, "corpus", "*.json")))
     files += sorted(glob.glob(os.path.join(REPO, "corpus_sw_parity", "*.json")))
@@ -178,17 +216,17 @@ def main():
         svg = render_svg(name, sol)
         with open(os.path.join(OUT, name + ".svg"), "w", encoding="utf-8") as f:
             f.write(svg)
+        render_png(name, sol)
         cards[name] = (svg, sol.dof, sol.converged,
                        len(sol.conflicting) > 0)
     print(f"rendered {len(cards)} sketches -> corpus_render/")
 
     # Curated, self-contained gallery for inline viewing.
     curated = [
-        "bracket_full", "ported_slot_dims", "tangent_line_circle",
-        "complex_circle_in_circle_in_square", "complex_nested_circles_origin",
-        "complex_nested_circles_fixed_corner", "complex_hexagon", "complex_pentagon",
-        "complex_l_bracket", "complex_bolt_circle_plate", "complex_arc_slot_frame",
-        "ported_tangent_circle_circle_external",
+        "complex_bolt_circle_plate", "feature_mirror_holes",
+        "feature_linear_pattern_grid", "feature_circular_pattern_bolt",
+        "feature_circular_pattern_tri", "feature_chain_dim_staircase",
+        "feature_expr_dim_driven", "complex_hexagon",
     ]
     blocks = []
     for name in curated:

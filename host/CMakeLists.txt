@@ -66,6 +66,7 @@ add_executable(AI-CAD
   # --- end C15 ---
   # --- C16: feature tree + doc mirror ---
   src/core/doc_mirror.cpp
+  src/core/cpp_core.cpp    # strangler seam: runtime-load libaicad.dll (the C++ core)
   src/ui/feature_tree.cpp
   src/ui/file_dialog.cpp   # C41: native Win32 Save/Open dialogs
   src/ui/file_explorer.cpp # Wave 3: File Explorer panel (workspace browser + recent)

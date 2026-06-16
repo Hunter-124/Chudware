@@ -2398,6 +2398,10 @@ def _add_distance(sys, cid, h0, h1, d, entities, var_map, axis=None, cond=None):
                 sgns.append(s)
         combined = np.concatenate([idx0, idx1] + rparts)
         kb = k0 + k1
+        # Column of each ref's radius variable within `combined` (or None). The
+        # radii were appended in (h0, h1) order for refs whose cond sign != 0.
+        r0col = kb if s0 else None
+        r1col = (kb + (1 if s0 else 0)) if s1 else None
         _d = float(d)
         ax = (axis or None)
         if isinstance(ax, str):
@@ -2407,28 +2411,39 @@ def _add_distance(sys, cid, h0, h1, d, entities, var_map, axis=None, cond=None):
             return sum(s * xs[kb + j] for j, s in enumerate(sgns))
 
         if ax in ("h", "v"):
-            # Axis-aligned gap: residual = |Δcoord| - d (coord = u for "h", v for "v"). Smooth via a
-            # signed residual whose sign tracks the current gap (avoids the abs() kink at the root;
-            # mirrors how the angle residual uses a signed atan2 with a fixed sign per evaluation).
+            # Axis-aligned gap between the (possibly rim-offset) points along ONE
+            # coordinate: residual = |（u0 + s0·r0) - (u1 + s1·r1)| - d  (u = x for
+            # "h", y for "v"). For an axis dimension the rim sits at the point's
+            # coordinate ± its radius, so each min/max condition is folded into ITS
+            # OWN coordinate INSIDE the abs (a horizontal/vertical rim projection),
+            # NOT added to the scalar gap like the aligned (radial) branch — that
+            # would mix a full radius into an axis gap and give a nonsensical
+            # (e.g. negative) radius for concentric circles. Sign tracks the current
+            # gap (avoids the abs() kink at the root).
             comp = 0 if ax == "h" else 1   # which coordinate (x=u, y=v)
 
             def _r(xs):
                 P0 = vf0(xs[:k0])
                 P1 = vf1(xs[k0:k0+k1])
-                return np.array([abs(P0[comp] - P1[comp]) + _adj(xs) - _d])
+                a_ = P0[comp] + (s0 * xs[r0col] if r0col is not None else 0.0)
+                b_ = P1[comp] + (s1 * xs[r1col] if r1col is not None else 0.0)
+                return np.array([abs(a_ - b_) - _d])
 
             def _j(xs):
                 P0 = vf0(xs[:k0])
                 P1 = vf1(xs[k0:k0+k1])
                 J0 = jf0(xs[:k0])
                 J1 = jf1(xs[k0:k0+k1])
-                delta = P0[comp] - P1[comp]
-                sgn = 1.0 if delta >= 0 else -1.0
+                a_ = P0[comp] + (s0 * xs[r0col] if r0col is not None else 0.0)
+                b_ = P1[comp] + (s1 * xs[r1col] if r1col is not None else 0.0)
+                sgn = 1.0 if (a_ - b_) >= 0 else -1.0
                 J = np.zeros((1, kb + len(sgns)))
                 J[0, :k0] = sgn * J0[comp, :]
                 J[0, k0:kb] = -sgn * J1[comp, :]
-                for j, s in enumerate(sgns):
-                    J[0, kb + j] = s
+                if r0col is not None:
+                    J[0, r0col] = sgn * s0
+                if r1col is not None:
+                    J[0, r1col] = -sgn * s1
                 return J
 
             sys.add_residual(_r, combined, _j, cid)

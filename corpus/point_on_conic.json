@@ -1,0 +1,17 @@
+{
+  "name": "point_on_conic",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "conic", "construction": false, "p0": [0.0, 0.0], "p1": [20.0, 0.0], "apex": [10.0, 8.0], "rho": 0.5},
+      {"id": "p", "type": "point", "construction": false, "p": [10.0, 4.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.start"]},
+      {"id": "c2", "type": "fix", "refs": ["e1.end"]},
+      {"id": "c3", "type": "fix", "refs": ["e1.apex"]},
+      {"id": "c4", "type": "fix", "refs": ["p"]},
+      {"id": "c5", "type": "point_on", "refs": ["p", "e1"]}
+    ]
+  },
+  "env": {}
+}

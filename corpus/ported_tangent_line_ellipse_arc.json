@@ -1,0 +1,25 @@
+{
+  "name": "ported_tangent_line_ellipse_arc",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "ellipse_arc", "construction": false, "center": [0.0, 0.0], "rx": 10.0, "ry": 6.0, "rot": 0.0, "a0": 0.0, "a1": 90.0},
+      {"id": "L", "type": "line", "construction": false, "p1": [-15.0, 9.0], "p2": [15.0, 9.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.center"]},
+      {"id": "c2", "type": "fix", "refs": ["e1.start"]},
+      {"id": "c3", "type": "fix", "refs": ["e1.end"]},
+      {"id": "c4", "type": "horizontal", "refs": ["L"]},
+      {"id": "c5", "type": "distance", "refs": ["origin", "L.p1"], "axis": "h", "value": {"value": 15.0, "expr": null}, "driven": false},
+      {"id": "c6", "type": "distance", "refs": ["L.p1", "L.p2"], "axis": "h", "value": {"value": 30.0, "expr": null}, "driven": false},
+      {"id": "c7", "type": "tangent", "refs": ["L", "e1"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 1,
+    "conflicting": [],
+    "statuses": {"e1": "under", "L": "full"}
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "ported_tangent_line_conic",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "conic", "construction": false, "p0": [-12.0, 0.0], "p1": [12.0, 0.0], "apex": [0.0, 8.0], "rho": 0.5},
+      {"id": "L", "type": "line", "construction": false, "p1": [-15.0, 7.0], "p2": [15.0, 7.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.start"]},
+      {"id": "c2", "type": "fix", "refs": ["e1.end"]},
+      {"id": "c3", "type": "fix", "refs": ["e1.apex"]},
+      {"id": "c4", "type": "fix", "refs": ["L.p1"]},
+      {"id": "c5", "type": "fix", "refs": ["L.p2"]},
+      {"id": "c6", "type": "tangent", "refs": ["L", "e1"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": [],
+    "statuses": {"e1": "full", "L": "full"}
+  }
+}

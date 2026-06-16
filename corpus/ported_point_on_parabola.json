@@ -1,0 +1,23 @@
+{
+  "name": "ported_point_on_parabola",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "parabola", "construction": false, "vertex": [0.0, 0.0], "focus": [0.0, 4.0], "t0": -20.0, "t1": 20.0},
+      {"id": "p", "type": "point", "construction": false, "p": [6.0, 7.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.vertex"]},
+      {"id": "c2", "type": "fix", "refs": ["e1.start"]},
+      {"id": "c3", "type": "fix", "refs": ["e1.end"]},
+      {"id": "c4", "type": "distance", "refs": ["e1.vertex", "p"], "axis": "h", "value": {"value": 6.0, "expr": null}, "driven": false},
+      {"id": "c5", "type": "point_on", "refs": ["p", "e1"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": [],
+    "statuses": {"e1": "full", "p": "full"}
+  }
+}

@@ -24,7 +24,8 @@ using Eigen::Vector2d;
 using Eigen::VectorXd;
 using aicad::solver::System;
 
-constexpr double kDeg = 3.14159265358979323846 / 180.0;
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kDeg = kPi / 180.0;
 
 using ValFn = std::function<Vector2d(const VectorXd&)>;
 using JacFn = std::function<MatrixXd(const VectorXd&)>;
@@ -235,6 +236,435 @@ MatrixXd arc_slot_pt_jac(const VectorXd& xs) {
     J << 1.0, 0.0, std::cos(ar), -r * std::sin(ar) * kDeg,
          0.0, 1.0, std::sin(ar), r * std::cos(ar) * kDeg;
     return J;
+}
+
+// ---- curve evaluators + numeric closest-point infrastructure ----------------
+//
+// Verbatim port of sketch_solver.py's conic/spline curve evaluators and the
+// numeric projection helpers used by point_on (conics) and the line-conic /
+// line-spline / curve-curve tangency residuals. Each evaluator maps an entity's
+// variable slice `cv` + a curve parameter to (P, dP/dparam). Range-free: the
+// trim vars (a0/a1, t0/t1) are ignored, mirroring how arc/circle point_on uses
+// the full circle today.
+
+using CurvePair = std::pair<Vector2d, Vector2d>;
+using CurveFn = std::function<CurvePair(const VectorXd&, double)>;
+using ScanFn = std::function<VectorXd(const VectorXd&, int)>;
+
+// numpy linspace(lo, hi, n) (endpoints inclusive).
+VectorXd linspace(double lo, double hi, int n) {
+    VectorXd v(n);
+    if (n == 1) {
+        v(0) = lo;
+        return v;
+    }
+    for (int i = 0; i < n; ++i) v(i) = lo + (hi - lo) * (static_cast<double>(i) / (n - 1));
+    return v;
+}
+
+// Central-difference Jacobian of a scalar residual rfn(x)->double over n vars.
+// Port of _numeric_jac_1: h = 1e-6 * max(1, |xs[i]|); J = (r(x+h)-r(x-h))/(2h).
+MatrixXd numeric_jac_1(const std::function<double(const VectorXd&)>& rfn,
+                       const VectorXd& xs) {
+    int n = static_cast<int>(xs.size());
+    MatrixXd J(1, n);
+    for (int i = 0; i < n; ++i) {
+        double h = 1e-6 * std::max(1.0, std::abs(xs(i)));
+        VectorXd xp = xs, xm = xs;
+        xp(i) += h;
+        xm(i) -= h;
+        J(0, i) = (rfn(xp) - rfn(xm)) / (2.0 * h);
+    }
+    return J;
+}
+
+// xs = [vx, vy, fx, fy]; P(t) = vertex + (t^2/4f)*u + t*w; tangent dP/dt.
+// Port of _parabola_curve.
+CurvePair parabola_curve(const VectorXd& xs, double t) {
+    double vx = xs(0), vy = xs(1), fx = xs(2), fy = xs(3);
+    double dx = fx - vx, dy = fy - vy;
+    double f = std::hypot(dx, dy);
+    if (f < 1e-12) return {Vector2d(vx, vy), Vector2d(0.0, 1.0)};
+    double ux = dx / f, uy = dy / f;
+    double wx = -uy, wy = ux;
+    double s = (t * t) / (4.0 * f);
+    Vector2d P(vx + s * ux + t * wx, vy + s * uy + t * wy);
+    double dsd = (2.0 * t) / (4.0 * f);
+    Vector2d dP(dsd * ux + wx, dsd * uy + wy);
+    return {P, dP};
+}
+
+// xs = [p0x,p0y,p1x,p1y,apx,apy,rho]; rational quadratic Bezier on u in [0,1].
+// Port of _conic_curve.
+CurvePair conic_curve(const VectorXd& xs, double u) {
+    Vector2d p0(xs(0), xs(1));
+    Vector2d p1(xs(2), xs(3));
+    Vector2d ap(xs(4), xs(5));
+    double rho = xs(6);
+    rho = std::min(std::max(rho, 1e-6), 1.0 - 1e-6);
+    double w = rho / (1.0 - rho);
+    double b0 = (1.0 - u) * (1.0 - u);
+    double b1 = 2.0 * (1.0 - u) * u * w;
+    double b2 = u * u;
+    double den = b0 + b1 + b2;
+    Vector2d num = b0 * p0 + b1 * ap + b2 * p1;
+    Vector2d P = num / den;
+    double db0 = -2.0 * (1.0 - u);
+    double db1 = 2.0 * w * (1.0 - 2.0 * u);
+    double db2 = 2.0 * u;
+    Vector2d dnum = db0 * p0 + db1 * ap + db2 * p1;
+    double dden = db0 + db1 + db2;
+    Vector2d dP = (dnum * den - num * dden) / (den * den);
+    return {P, dP};
+}
+
+// xs = [cx, cy, r]; a = angle in RADIANS. Port of _circle_curve (== _arc_curve).
+CurvePair circle_curve(const VectorXd& xs, double a) {
+    double cx = xs(0), cy = xs(1), r = xs(2);
+    double ca = std::cos(a), sa = std::sin(a);
+    return {Vector2d(cx + r * ca, cy + r * sa), Vector2d(-r * sa, r * ca)};
+}
+
+// xs = [cx, cy, rx, ry, rot]; a = angle in RADIANS (un-rotated frame).
+// Port of _ellipse_arc_curve. rot is in DEGREES (kDeg == _DEG).
+CurvePair ellipse_arc_curve(const VectorXd& cv, double a) {
+    double cx = cv(0), cy = cv(1), rx = cv(2), ry = cv(3), rot = cv(4);
+    double rr = rot * kDeg;
+    double cr = std::cos(rr), sr = std::sin(rr);
+    double ca = std::cos(a), sa = std::sin(a);
+    double lx = rx * ca, ly = ry * sa;
+    Vector2d P(cx + cr * lx - sr * ly, cy + sr * lx + cr * ly);
+    double dlx = -rx * sa, dly = ry * ca;
+    Vector2d dP(cr * dlx - sr * dly, sr * dlx + cr * dly);
+    return {P, dP};
+}
+
+// Return the list of (x,y) control/through points from a flat var slice.
+// Port of _spline_segments.
+std::vector<Vector2d> spline_segments(const VectorXd& cv) {
+    int n = static_cast<int>(cv.size()) / 2;
+    std::vector<Vector2d> pts;
+    pts.reserve(n);
+    for (int i = 0; i < n; ++i) pts.emplace_back(cv(2 * i), cv(2 * i + 1));
+    return pts;
+}
+
+// Catmull-Rom interpolating spline through `pts`. u in [0, n-1]. Port of
+// _catmull_rom.
+CurvePair catmull_rom(const std::vector<Vector2d>& pts, double u) {
+    int n = static_cast<int>(pts.size());
+    if (n == 1) return {pts[0], Vector2d(0.0, 0.0)};
+    if (n == 2) {
+        double t = std::min(std::max(u, 0.0), 1.0);
+        Vector2d P(pts[0](0) + (pts[1](0) - pts[0](0)) * t,
+                   pts[0](1) + (pts[1](1) - pts[0](1)) * t);
+        Vector2d dP(pts[1](0) - pts[0](0), pts[1](1) - pts[0](1));
+        return {P, dP};
+    }
+    u = std::min(std::max(u, 0.0), static_cast<double>(n - 1));
+    int i = static_cast<int>(std::floor(u));
+    if (i >= n - 1) i = n - 2;
+    double t = u - i;
+    Vector2d p0 = (i - 1 >= 0) ? pts[i - 1] : (2.0 * pts[0] - pts[1]);
+    Vector2d p1 = pts[i];
+    Vector2d p2 = pts[i + 1];
+    Vector2d p3 = (i + 2 <= n - 1) ? pts[i + 2] : (2.0 * pts[n - 1] - pts[n - 2]);
+    double t2 = t * t, t3 = t2 * t;
+    Vector2d P = 0.5 * ((2.0 * p1) + (-p0 + p2) * t +
+                        (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 +
+                        (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
+    Vector2d dP = 0.5 * ((-p0 + p2) +
+                         (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * (2.0 * t) +
+                         (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * (3.0 * t2));
+    return {P, dP};
+}
+
+// Clamped cubic B-spline by control poles. u in [0, 1]. Port of _bspline_poles.
+CurvePair bspline_poles(const std::vector<Vector2d>& pts, double u) {
+    int n = static_cast<int>(pts.size());
+    if (n == 1) return {pts[0], Vector2d(0.0, 0.0)};
+    if (n == 2) {
+        double t = std::min(std::max(u, 0.0), 1.0);
+        Vector2d P = pts[0] + (pts[1] - pts[0]) * t;
+        return {P, Vector2d(pts[1] - pts[0])};
+    }
+    int degree = std::min(3, n - 1);
+    int n_internal = n - degree - 1;
+    std::vector<double> knots;
+    for (int j = 0; j < degree + 1; ++j) knots.push_back(0.0);
+    for (int j = 1; j < n_internal + 1; ++j)
+        knots.push_back(static_cast<double>(j) / (n_internal + 1));
+    for (int j = 0; j < degree + 1; ++j) knots.push_back(1.0);
+    double uu = std::min(std::max(u, 0.0), 1.0 - 1e-12);
+
+    auto deboor_value = [&](double uval) -> Vector2d {
+        int k = degree;
+        while (k < n - 1 && uu >= knots[k + 1]) ++k;
+        std::vector<Vector2d> d;
+        d.reserve(degree + 1);
+        for (int j = 0; j < degree + 1; ++j) d.push_back(pts[j + k - degree]);
+        for (int r = 1; r < degree + 1; ++r) {
+            for (int j = degree; j >= r; --j) {
+                double left = knots[j + k - degree];
+                double right = knots[j + 1 + k - r];
+                double denom = right - left;
+                double alpha = (denom <= 1e-15) ? 0.0 : (uval - left) / denom;
+                d[j] = (1.0 - alpha) * d[j - 1] + alpha * d[j];
+            }
+        }
+        return d[degree];
+    };
+
+    double h = 1e-6;
+    Vector2d P = deboor_value(uu);
+    Vector2d Pp = deboor_value(std::min(uu + h, 1.0 - 1e-12));
+    Vector2d Pm = deboor_value(std::max(uu - h, 0.0));
+    Vector2d dP = (Pp - Pm) / (2.0 * h);
+    return {P, dP};
+}
+
+// Through-point spline P(u), dP/du. u in [0, n-1]. Port of _spline_curve.
+CurvePair spline_curve(const VectorXd& cv, double u) {
+    return catmull_rom(spline_segments(cv), u);
+}
+
+// Control-pole spline P(u), dP/du. u in [0, 1]. Port of _style_spline_curve.
+CurvePair style_spline_curve(const VectorXd& cv, double u) {
+    return bspline_poles(spline_segments(cv), u);
+}
+
+// xs = [cx,cy,rx,ry,rot]; signed implicit value of the rotated ellipse at P,
+// scaled to length units. Port of _ellipse_implicit.
+double ellipse_implicit(const VectorXd& xs, const Vector2d& P) {
+    double cx = xs(0), cy = xs(1), rx = xs(2), ry = xs(3), rot = xs(4);
+    double rr = rot * kDeg;
+    double cr = std::cos(rr), sr = std::sin(rr);
+    double dxp = P(0) - cx, dyp = P(1) - cy;
+    double qx = cr * dxp + sr * dyp;
+    double qy = -sr * dxp + cr * dyp;
+    rx = (std::abs(rx) > 1e-9) ? rx : 1e-9;
+    ry = (std::abs(ry) > 1e-9) ? ry : 1e-9;
+    double rad = std::hypot(qx / rx, qy / ry);
+    double r_mean = 0.5 * (std::abs(rx) + std::abs(ry));
+    return (rad - 1.0) * r_mean;
+}
+
+// Exact line<->ellipse tangency residual via the support function. Port of
+// _ellipse_line_support. line = [ax,ay,bx,by]; ell = [cx,cy,rx,ry,rot].
+double ellipse_line_support(const VectorXd& line, const VectorXd& ell) {
+    double ax = line(0), ay = line(1), bx = line(2), by = line(3);
+    double cx = ell(0), cy = ell(1), rx = ell(2), ry = ell(3), rot = ell(4);
+    double dxab = bx - ax, dyab = by - ay;
+    double L = std::hypot(dxab, dyab);
+    if (L < 1e-12) return 0.0;
+    double nx = -dyab / L, ny = dxab / L;
+    double rr = rot * kDeg;
+    double cr = std::cos(rr), sr = std::sin(rr);
+    double nlx = cr * nx + sr * ny;
+    double nly = -sr * nx + cr * ny;
+    double support = std::hypot(rx * nlx, ry * nly);
+    double dist = std::abs((cx - ax) * nx + (cy - ay) * ny);
+    return dist - support;
+}
+
+// Signed perpendicular offset of P from curve point Q with tangent dQ. Port of
+// _signed_offset.
+double signed_offset(const Vector2d& P, const Vector2d& Q, const Vector2d& dQ) {
+    double L = std::hypot(dQ(0), dQ(1));
+    if (L < 1e-12) return std::hypot(P(0) - Q(0), P(1) - Q(1));
+    double nx = -dQ(1) / L, ny = dQ(0) / L;
+    return (P(0) - Q(0)) * nx + (P(1) - Q(1)) * ny;
+}
+
+// Refine the closest-point param: root of g(p)=(C(p)-P).C'(p)=0 via Newton.
+// Port of _newton_project (12 iters; internal h=1e-4).
+double newton_project(const std::function<CurvePair(double)>& curve_fn, double p0,
+                      const Vector2d& P, int iters = 12) {
+    double p = p0;
+    for (int it = 0; it < iters; ++it) {
+        CurvePair cur = curve_fn(p);
+        Vector2d Q = cur.first, dQ = cur.second;
+        Vector2d diff(Q(0) - P(0), Q(1) - P(1));
+        double g = diff(0) * dQ(0) + diff(1) * dQ(1);
+        double h = 1e-4;
+        Vector2d dQp = curve_fn(p + h).second;
+        Vector2d dQm = curve_fn(p - h).second;
+        Vector2d ddQ = (dQp - dQm) / (2.0 * h);
+        double gp = dQ(0) * dQ(0) + dQ(1) * dQ(1) + diff(0) * ddQ(0) + diff(1) * ddQ(1);
+        if (std::abs(gp) < 1e-14) break;
+        double step = g / gp;
+        p -= step;
+        if (std::abs(step) < 1e-12) break;
+    }
+    return p;
+}
+
+// Param t minimizing |P - parabola(t)|: 81-sample scan over [-200,200] + Newton.
+// Port of _parabola_project.
+double parabola_project(const VectorXd& cv, const Vector2d& P, double t0 = -200.0,
+                        double t1 = 200.0) {
+    double best_t = t0, best_d = std::numeric_limits<double>::infinity();
+    for (int k = 0; k < 81; ++k) {
+        double t = t0 + (t1 - t0) * k / 80.0;
+        Vector2d Q = parabola_curve(cv, t).first;
+        double d = (P(0) - Q(0)) * (P(0) - Q(0)) + (P(1) - Q(1)) * (P(1) - Q(1));
+        if (d < best_d) {
+            best_d = d;
+            best_t = t;
+        }
+    }
+    return newton_project([&](double t) { return parabola_curve(cv, t); }, best_t, P);
+}
+
+// Param u in [0,1] minimizing |P - conic(u)|: 41-sample scan + Newton, clamped.
+// Port of _conic_project.
+double conic_project(const VectorXd& cv, const Vector2d& P) {
+    double best_u = 0.0, best_d = std::numeric_limits<double>::infinity();
+    for (int k = 0; k < 41; ++k) {
+        double u = k / 40.0;
+        Vector2d Q = conic_curve(cv, u).first;
+        double d = (P(0) - Q(0)) * (P(0) - Q(0)) + (P(1) - Q(1)) * (P(1) - Q(1));
+        if (d < best_d) {
+            best_d = d;
+            best_u = u;
+        }
+    }
+    double u = newton_project([&](double uu) { return conic_curve(cv, uu); }, best_u, P);
+    return std::min(std::max(u, 0.0), 1.0);
+}
+
+// Param p where the curve tangent is parallel to a line (tangent.n = 0). Coarse
+// 41-sample scan for the extreme point in +n, then 12 Newton iters (h=1e-4).
+// Port of _extremum_param.
+double extremum_param(const CurveFn& curve, const VectorXd& cv, double nx, double ny,
+                      const ScanFn& scan) {
+    VectorXd pts = scan(cv, 41);
+    double best_p = pts(0), best_proj = -std::numeric_limits<double>::infinity();
+    for (int i = 0; i < pts.size(); ++i) {
+        Vector2d Q = curve(cv, pts(i)).first;
+        double proj = Q(0) * nx + Q(1) * ny;
+        if (proj > best_proj) {
+            best_proj = proj;
+            best_p = pts(i);
+        }
+    }
+    double p = best_p;
+    for (int it = 0; it < 12; ++it) {
+        Vector2d dQ = curve(cv, p).second;
+        double g = dQ(0) * nx + dQ(1) * ny;
+        double h = 1e-4;
+        Vector2d dQp = curve(cv, p + h).second;
+        Vector2d dQm = curve(cv, p - h).second;
+        double ddg = ((dQp(0) - dQm(0)) * nx + (dQp(1) - dQm(1)) * ny) / (2.0 * h);
+        if (std::abs(ddg) < 1e-14) break;
+        double step = g / ddg;
+        p -= step;
+        if (std::abs(step) < 1e-12) break;
+    }
+    return p;
+}
+
+// Params (p, q) at the mutual closest approach of two curves: 25x25 coarse scan
+// then 8 alternating closest-point projections. Port of _mutual_closest.
+std::pair<double, double> mutual_closest(const CurveFn& curve0, const VectorXd& cv0,
+                                         const ScanFn& scan0, const CurveFn& curve1,
+                                         const VectorXd& cv1, const ScanFn& scan1) {
+    VectorXd ps = scan0(cv0, 25);
+    VectorXd qs = scan1(cv1, 25);
+    std::vector<Vector2d> q_pts;
+    q_pts.reserve(qs.size());
+    for (int j = 0; j < qs.size(); ++j) q_pts.push_back(curve1(cv1, qs(j)).first);
+    double best = std::numeric_limits<double>::infinity();
+    double bp = ps(0), bq = qs(0);
+    for (int i = 0; i < ps.size(); ++i) {
+        Vector2d P0 = curve0(cv0, ps(i)).first;
+        for (int j = 0; j < qs.size(); ++j) {
+            const Vector2d& Q1 = q_pts[j];
+            double d = (P0(0) - Q1(0)) * (P0(0) - Q1(0)) +
+                       (P0(1) - Q1(1)) * (P0(1) - Q1(1));
+            if (d < best) {
+                best = d;
+                bp = ps(i);
+                bq = qs(j);
+            }
+        }
+    }
+    double p = bp, q = bq;
+    for (int it = 0; it < 8; ++it) {
+        Vector2d P0 = curve0(cv0, p).first;
+        q = newton_project([&](double u) { return curve1(cv1, u); }, q, P0);
+        Vector2d Q1 = curve1(cv1, q).first;
+        p = newton_project([&](double u) { return curve0(cv0, u); }, p, Q1);
+    }
+    return {p, q};
+}
+
+// Signed gap between the two curves at their mutual closest point. v = [cv0, cv1]
+// (k0 + k1 vars). Returns a scalar. Port of _curve_gap_residual.
+double curve_gap_residual(const VectorXd& v, int k0, int k1, const CurveFn& curve0,
+                          const ScanFn& scan0, const CurveFn& curve1,
+                          const ScanFn& scan1) {
+    VectorXd cv0 = v.head(k0);
+    VectorXd cv1 = v.segment(k0, k1);
+    auto pq = mutual_closest(curve0, cv0, scan0, curve1, cv1, scan1);
+    double p = pq.first, q = pq.second;
+    CurvePair c0 = curve0(cv0, p);
+    Vector2d P0 = c0.first, dP0 = c0.second;
+    Vector2d Q1 = curve1(cv1, q).first;
+    double L = std::hypot(dP0(0), dP0(1));
+    if (L < 1e-12) return std::hypot(P0(0) - Q1(0), P0(1) - Q1(1));
+    double nx = -dP0(1) / L, ny = dP0(0) / L;
+    return (Q1(0) - P0(0)) * nx + (Q1(1) - P0(1)) * ny;
+}
+
+// Per-entity-type curve description for the generic curve<->curve tangent
+// residual. Port of _curve_descriptor. Returns false (ok=false) for an
+// unsupported entity type.
+struct CurveDescriptor {
+    bool ok = false;
+    std::vector<int> idx;  // global variable indices the curve depends on
+    CurveFn eval;
+    ScanFn scan;
+};
+
+CurveDescriptor curve_descriptor(const std::string& etype,
+                                 const std::vector<int>& vidx) {
+    CurveDescriptor d;
+    if (etype == "circle" || etype == "arc") {
+        d.ok = true;
+        d.idx = pick(vidx, {0, 1, 2});
+        d.eval = circle_curve;
+        d.scan = [](const VectorXd&, int n) { return linspace(0.0, 2.0 * kPi, n); };
+    } else if (etype == "ellipse_arc") {
+        d.ok = true;
+        d.idx = pick(vidx, {0, 1, 2, 3, 4});
+        d.eval = ellipse_arc_curve;
+        d.scan = [](const VectorXd&, int n) { return linspace(0.0, 2.0 * kPi, n); };
+    } else if (etype == "parabola") {
+        d.ok = true;
+        d.idx = pick(vidx, {0, 1, 2, 3});
+        d.eval = parabola_curve;
+        d.scan = [](const VectorXd&, int n) { return linspace(-200.0, 200.0, n); };
+    } else if (etype == "conic") {
+        d.ok = true;
+        d.idx = pick(vidx, {0, 1, 2, 3, 4, 5, 6});
+        d.eval = conic_curve;
+        d.scan = [](const VectorXd&, int n) { return linspace(0.0, 1.0, n); };
+    } else if (etype == "spline") {
+        d.ok = true;
+        d.idx = vidx;
+        int npts = static_cast<int>(vidx.size()) / 2;
+        d.eval = spline_curve;
+        d.scan = [npts](const VectorXd&, int n) {
+            return linspace(0.0, static_cast<double>(std::max(npts - 1, 1)), n);
+        };
+    } else if (etype == "style_spline") {
+        d.ok = true;
+        d.idx = vidx;
+        d.eval = style_spline_curve;
+        d.scan = [](const VectorXd&, int n) { return linspace(0.0, 1.0, n); };
+    }
+    return d;
 }
 
 // ---- handle resolution ------------------------------------------------------
@@ -538,19 +968,22 @@ void add_distance(System& sys, const std::string& cid, const std::string& h0,
 
     if (ax == "h" || ax == "v") {
         int comp = (ax == "h") ? 0 : 1;
-        // Axis-aligned gap: residual = |Delta_comp| + Sum(s*r) - d. The rim
-        // adjustment is applied OUTSIDE the abs (a scalar offset on the gap),
-        // matching the aligned (no-axis) case and the Python oracle
-        // (_add_distance). Applying it per-point inside the abs would give a
-        // different residual whenever a radius variable is free.
+        // Axis-aligned gap between the (possibly rim-offset) points along ONE
+        // coordinate: residual = |(u0 + s0*r0) - (u1 + s1*r1)| - d. For an axis
+        // dimension the rim sits at the point's coordinate +/- its radius, so each
+        // min/max condition is folded into ITS OWN coordinate INSIDE the abs (a
+        // horizontal/vertical rim projection), NOT added to the scalar gap like the
+        // aligned (radial) branch -- that would mix a full radius into an axis gap
+        // and give a nonsensical (e.g. negative) radius for concentric circles.
+        // Matches the Python oracle _add_distance axis branch verbatim; the C++
+        // unit test "distance axis-h rim wall on concentric circles" pins r=15.
         sys.add_residual(
             [av, bv, k0, k1, comp, r0col, r1col, s0, s1, d](const VectorXd& xs) {
                 Vector2d P0 = av(vhead(xs, k0));
                 Vector2d P1 = bv(vseg(xs, k0, k1));
-                double adj = 0.0;
-                if (r0col >= 0) adj += s0 * xs(r0col);
-                if (r1col >= 0) adj += s1 * xs(r1col);
-                return r1(std::abs(P0(comp) - P1(comp)) + adj - d);
+                double a_ = P0(comp) + (r0col >= 0 ? s0 * xs(r0col) : 0.0);
+                double b_ = P1(comp) + (r1col >= 0 ? s1 * xs(r1col) : 0.0);
+                return r1(std::abs(a_ - b_) - d);
             },
             combined,
             [av, bv, aj, bj, k0, k1, kb, comp, r0col, r1col, s0, s1, ncols](
@@ -559,13 +992,14 @@ void add_distance(System& sys, const std::string& cid, const std::string& h0,
                 Vector2d P1 = bv(vseg(xs, k0, k1));
                 MatrixXd J0 = aj(vhead(xs, k0));
                 MatrixXd J1 = bj(vseg(xs, k0, k1));
-                double delta = P0(comp) - P1(comp);
-                double sgn = delta >= 0 ? 1.0 : -1.0;
+                double a_ = P0(comp) + (r0col >= 0 ? s0 * xs(r0col) : 0.0);
+                double b_ = P1(comp) + (r1col >= 0 ? s1 * xs(r1col) : 0.0);
+                double sgn = (a_ - b_) >= 0 ? 1.0 : -1.0;
                 MatrixXd J = MatrixXd::Zero(1, ncols);
                 if (k0) J.block(0, 0, 1, k0) = sgn * J0.row(comp);
                 if (k1) J.block(0, k0, 1, k1) = -sgn * J1.row(comp);
-                if (r0col >= 0) J(0, r0col) = s0;
-                if (r1col >= 0) J(0, r1col) = s1;
+                if (r0col >= 0) J(0, r0col) = sgn * s0;
+                if (r1col >= 0) J(0, r1col) = -sgn * s1;
                 return J;
             },
             cid);
@@ -712,7 +1146,65 @@ void add_point_on(System& sys, const std::string& cid, const std::string& point_
                 return J;
             },
             cid);
+        return;
     }
+    if (t == "ellipse_arc") {
+        // Implicit rotated-ellipse residual; ignores a0/a1 trim (full ellipse),
+        // mirroring the arc/circle point_on convention. Port of _add_point_on.
+        std::vector<int> eidx = pick(var_map.at(eid), {0, 1, 2, 3, 4});
+        std::vector<int> combined = concat(p.idx, eidx);
+        constexpr int ke = 5;
+        sys.add_residual(
+            [pv, kp, ke](const VectorXd& xs) {
+                Vector2d P = pv(vhead(xs, kp));
+                return r1(ellipse_implicit(vseg(xs, kp, ke), P));
+            },
+            combined,
+            [pv, kp, ke](const VectorXd& xs) {
+                return numeric_jac_1(
+                    [pv, kp, ke](const VectorXd& v) {
+                        return ellipse_implicit(vseg(v, kp, ke), pv(vhead(v, kp)));
+                    },
+                    xs);
+            },
+            cid);
+        return;
+    }
+    if (t == "parabola") {
+        // Closest-param projection: residual = signed offset of P from the curve
+        // along the normal at the projected param t*. Port of _add_point_on.
+        std::vector<int> eidx = pick(var_map.at(eid), {0, 1, 2, 3});
+        std::vector<int> combined = concat(p.idx, eidx);
+        constexpr int ke = 4;
+        auto rfn = [pv, kp, ke](const VectorXd& v) {
+            Vector2d P = pv(vhead(v, kp));
+            VectorXd cv = vseg(v, kp, ke);
+            double t_ = parabola_project(cv, P);
+            CurvePair qd = parabola_curve(cv, t_);
+            return signed_offset(P, qd.first, qd.second);
+        };
+        sys.add_residual(
+            [rfn](const VectorXd& xs) { return r1(rfn(xs)); }, combined,
+            [rfn](const VectorXd& xs) { return numeric_jac_1(rfn, xs); }, cid);
+        return;
+    }
+    if (t == "conic") {
+        std::vector<int> eidx = pick(var_map.at(eid), {0, 1, 2, 3, 4, 5, 6});
+        std::vector<int> combined = concat(p.idx, eidx);
+        constexpr int ke = 7;
+        auto rfn = [pv, kp, ke](const VectorXd& v) {
+            Vector2d P = pv(vhead(v, kp));
+            VectorXd cv = vseg(v, kp, ke);
+            double u = conic_project(cv, P);
+            CurvePair qd = conic_curve(cv, u);
+            return signed_offset(P, qd.first, qd.second);
+        };
+        sys.add_residual(
+            [rfn](const VectorXd& xs) { return r1(rfn(xs)); }, combined,
+            [rfn](const VectorXd& xs) { return numeric_jac_1(rfn, xs); }, cid);
+        return;
+    }
+    // else: unsupported entity type for point_on -- skip silently.
 }
 
 void add_fix(System& sys, const std::string& cid, const std::string& handle,
@@ -1195,6 +1687,110 @@ void add_tangent_circle_circle(System& sys, const std::string& cid,
         cid);
 }
 
+// Tangency line <-> conic-family curve. For ellipse_arc this is EXACT via the
+// support function; for parabola/conic it is the numeric closest-distance.
+// Numeric Jacobian. Port of _add_tangent_line_conic.
+void add_tangent_line_conic(System& sys, const std::string& cid,
+                            const std::string& line_eid, const std::string& conic_eid,
+                            const EntMap& entities, const VarMap& var_map) {
+    const std::string etype = entities.at(conic_eid).at("type");
+    std::vector<int> lidx = pick(var_map.at(line_eid), {0, 1, 2, 3});
+
+    if (etype == "ellipse_arc") {
+        std::vector<int> eidx = pick(var_map.at(conic_eid), {0, 1, 2, 3, 4});
+        std::vector<int> combined = concat(lidx, eidx);
+        auto rfn = [](const VectorXd& v) {
+            return ellipse_line_support(v.head(4), v.segment(4, 5));
+        };
+        sys.add_residual(
+            [rfn](const VectorXd& xs) { return r1(rfn(xs)); }, combined,
+            [rfn](const VectorXd& xs) { return numeric_jac_1(rfn, xs); }, cid);
+        return;
+    }
+
+    CurveFn curve;
+    ScanFn scan;
+    std::vector<int> eidx;
+    if (etype == "parabola") {
+        eidx = pick(var_map.at(conic_eid), {0, 1, 2, 3});
+        curve = parabola_curve;
+        scan = [](const VectorXd&, int n) { return linspace(-200.0, 200.0, n); };
+    } else {  // conic
+        eidx = pick(var_map.at(conic_eid), {0, 1, 2, 3, 4, 5, 6});
+        curve = conic_curve;
+        scan = [](const VectorXd&, int n) { return linspace(0.0, 1.0, n); };
+    }
+    int ke = static_cast<int>(eidx.size());
+    std::vector<int> combined = concat(lidx, eidx);
+    auto rfn = [curve, scan, ke](const VectorXd& v) -> double {
+        double ax = v(0), ay = v(1), bx = v(2), by = v(3);
+        VectorXd cv = v.segment(4, ke);
+        double dxab = bx - ax, dyab = by - ay;
+        double L = std::hypot(dxab, dyab);
+        if (L < 1e-12) return 0.0;
+        double nx = -dyab / L, ny = dxab / L;
+        double p = extremum_param(curve, cv, nx, ny, scan);
+        Vector2d Q = curve(cv, p).first;
+        return (Q(0) - ax) * nx + (Q(1) - ay) * ny;
+    };
+    sys.add_residual(
+        [rfn](const VectorXd& xs) { return r1(rfn(xs)); }, combined,
+        [rfn](const VectorXd& xs) { return numeric_jac_1(rfn, xs); }, cid);
+}
+
+// Tangency line <-> spline (the spline families; the line<->conic path covers
+// conics). Residual = signed perpendicular distance from the line to the curve's
+// extreme point in the line-normal direction. Port of _add_tangent_line_curve.
+void add_tangent_line_curve(System& sys, const std::string& cid,
+                            const std::string& line_eid, const std::string& curve_eid,
+                            const EntMap& entities, const VarMap& var_map) {
+    CurveDescriptor desc =
+        curve_descriptor(entities.at(curve_eid).at("type"), var_map.at(curve_eid));
+    if (!desc.ok) return;
+    CurveFn curve = desc.eval;
+    ScanFn scan = desc.scan;
+    std::vector<int> eidx = desc.idx;
+    std::vector<int> lidx = pick(var_map.at(line_eid), {0, 1, 2, 3});
+    int ke = static_cast<int>(eidx.size());
+    std::vector<int> combined = concat(lidx, eidx);
+    auto rfn = [curve, scan, ke](const VectorXd& v) -> double {
+        double ax = v(0), ay = v(1), bx = v(2), by = v(3);
+        VectorXd cv = v.segment(4, ke);
+        double dxab = bx - ax, dyab = by - ay;
+        double L = std::hypot(dxab, dyab);
+        if (L < 1e-12) return 0.0;
+        double nx = -dyab / L, ny = dxab / L;
+        double p = extremum_param(curve, cv, nx, ny, scan);
+        Vector2d Q = curve(cv, p).first;
+        return (Q(0) - ax) * nx + (Q(1) - ay) * ny;
+    };
+    sys.add_residual(
+        [rfn](const VectorXd& xs) { return r1(rfn(xs)); }, combined,
+        [rfn](const VectorXd& xs) { return numeric_jac_1(rfn, xs); }, cid);
+}
+
+// Tangency between two general curves (any pair among circle/arc/conic/spline,
+// excluding line-circle and circle-circle handled above). Single scalar residual
+// = signed gap at the mutual closest point. Numeric Jacobian. Range-free for
+// trimmed curves. Port of _add_tangent_curve_curve.
+void add_tangent_curve_curve(System& sys, const std::string& cid,
+                             const std::string& eid0, const std::string& eid1,
+                             const EntMap& entities, const VarMap& var_map) {
+    CurveDescriptor d0 = curve_descriptor(entities.at(eid0).at("type"), var_map.at(eid0));
+    CurveDescriptor d1 = curve_descriptor(entities.at(eid1).at("type"), var_map.at(eid1));
+    if (!d0.ok || !d1.ok) return;  // unsupported entity type -> skip silently
+    CurveFn curve0 = d0.eval, curve1 = d1.eval;
+    ScanFn scan0 = d0.scan, scan1 = d1.scan;
+    int k0 = static_cast<int>(d0.idx.size()), k1 = static_cast<int>(d1.idx.size());
+    std::vector<int> combined = concat(d0.idx, d1.idx);
+    auto rfn = [k0, k1, curve0, scan0, curve1, scan1](const VectorXd& v) {
+        return curve_gap_residual(v, k0, k1, curve0, scan0, curve1, scan1);
+    };
+    sys.add_residual(
+        [rfn](const VectorXd& xs) { return r1(rfn(xs)); }, combined,
+        [rfn](const VectorXd& xs) { return numeric_jac_1(rfn, xs); }, cid);
+}
+
 // Points h0 and h1 symmetric about an axis line (2 residuals: midpoint on axis +
 // (P-Q) perpendicular to axis). Port of _add_symmetric.
 void add_symmetric(System& sys, const std::string& cid, const std::string& h0,
@@ -1299,15 +1895,35 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
     } else if (ctype == "tangent") {
         std::string e0 = eid_of(refs[0]), e1 = eid_of(refs[1]);
         std::string t0 = entities.at(e0).at("type"), t1 = entities.at(e1).at("type");
-        bool curved0 = (t0 == "circle" || t0 == "arc");
-        bool curved1 = (t1 == "circle" || t1 == "arc");
+        auto is_curved = [](const std::string& t) { return t == "circle" || t == "arc"; };
+        auto is_conic = [](const std::string& t) {
+            return t == "ellipse_arc" || t == "parabola" || t == "conic";
+        };
+        auto is_spline = [](const std::string& t) {
+            return t == "spline" || t == "style_spline";
+        };
+        auto is_generic = [&](const std::string& t) {
+            return is_curved(t) || is_conic(t) || is_spline(t);
+        };
+        bool curved0 = is_curved(t0), curved1 = is_curved(t1);
+        // Mirror Python _add_tangent dispatch order verbatim.
         if (t0 == "line" && curved1)
             add_tangent_line_circle(sys, cid, e0, e1, var_map);
         else if (curved0 && t1 == "line")
             add_tangent_line_circle(sys, cid, e1, e0, var_map);
         else if (curved0 && curved1)
             add_tangent_circle_circle(sys, cid, e0, e1, entities, var_map);
-        // line-conic / curve-curve tangency deferred (no conic/spline entities here)
+        else if (t0 == "line" && is_conic(t1))
+            add_tangent_line_conic(sys, cid, e0, e1, entities, var_map);
+        else if (is_conic(t0) && t1 == "line")
+            add_tangent_line_conic(sys, cid, e1, e0, entities, var_map);
+        else if (t0 == "line" && is_spline(t1))
+            add_tangent_line_curve(sys, cid, e0, e1, entities, var_map);
+        else if (is_spline(t0) && t1 == "line")
+            add_tangent_line_curve(sys, cid, e1, e0, entities, var_map);
+        else if (is_generic(t0) && is_generic(t1))
+            add_tangent_curve_curve(sys, cid, e0, e1, entities, var_map);
+        // line-line tangent (ill-defined) stays deferred; skip.
     } else if (ctype == "distance") {
         std::string axis;
         if (c.contains("axis") && c["axis"].is_string()) axis = c["axis"].get<std::string>();

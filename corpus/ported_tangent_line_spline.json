@@ -1,0 +1,23 @@
+{
+  "name": "ported_tangent_line_spline",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "spline", "construction": false, "points": [[-12.0, 0.0], [-6.0, 7.0], [0.0, 9.0], [6.0, 7.0], [12.0, 0.0]]},
+      {"id": "L", "type": "line", "construction": false, "p1": [-15.0, 11.0], "p2": [15.0, 11.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1"]},
+      {"id": "c2", "type": "horizontal", "refs": ["L"]},
+      {"id": "c3", "type": "distance", "refs": ["origin", "L.p1"], "axis": "h", "value": {"value": 15.0, "expr": null}, "driven": false},
+      {"id": "c4", "type": "distance", "refs": ["L.p1", "L.p2"], "axis": "h", "value": {"value": 30.0, "expr": null}, "driven": false},
+      {"id": "c5", "type": "tangent", "refs": ["L", "e1"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": [],
+    "statuses": {"e1": "full", "L": "full"}
+  }
+}

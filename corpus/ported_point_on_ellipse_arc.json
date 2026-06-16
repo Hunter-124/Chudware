@@ -1,0 +1,23 @@
+{
+  "name": "ported_point_on_ellipse_arc",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "ellipse_arc", "construction": false, "center": [0.0, 0.0], "rx": 10.0, "ry": 6.0, "rot": 0.0, "a0": 0.0, "a1": 90.0},
+      {"id": "p", "type": "point", "construction": false, "p": [7.0, 5.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.center"]},
+      {"id": "c2", "type": "fix", "refs": ["e1.start"]},
+      {"id": "c3", "type": "fix", "refs": ["e1.end"]},
+      {"id": "c4", "type": "distance", "refs": ["e1.center", "p"], "axis": "v", "value": {"value": 4.0, "expr": null}, "driven": false},
+      {"id": "c5", "type": "point_on", "refs": ["p", "e1"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 1,
+    "conflicting": [],
+    "statuses": {"e1": "under", "p": "under"}
+  }
+}

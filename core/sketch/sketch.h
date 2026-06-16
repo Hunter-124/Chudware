@@ -9,13 +9,18 @@
 // extraction; conic-family derived handles carry their chain-rule Jacobians).
 // Constraints coincident, horizontal, vertical, parallel, perpendicular,
 // collinear, coradial, concentric, equal (line/slot length + circle/arc radius),
-// midpoint, symmetric, angle, point_on(line/circle/arc), fix (whole-entity +
-// sub-handle + conic-family handle pin), tangent(line-circle + circle-circle),
-// distance (point-point aligned + axis h/v, point-line, and the C50 min/max rim
-// cond with radius as a variable), radius, diameter (incl. slot width mapping).
-// Polar (r, theta) placement = angle + distance-to-origin. DEFERRED (numeric
-// closest-point projection): point_on/tangent on conics + splines. Unknown
-// entities/constraints are skipped forward-tolerantly, exactly like the Python.
+// midpoint, symmetric, angle, point_on(line/circle/arc + numeric closest-point
+// projection on ellipse_arc/parabola/conic), fix (whole-entity + sub-handle +
+// conic-family handle pin), tangent(line-circle + circle-circle + line-conic
+// [ellipse_arc exact support / parabola+conic numeric] + line-spline + general
+// curve-curve via mutual-closest signed gap), distance (point-point aligned +
+// axis h/v, point-line, and the C50 min/max rim cond with radius as a variable),
+// radius, diameter (incl. slot width mapping). Polar (r, theta) placement = angle
+// + distance-to-origin. The numeric closest-point projections (conic/spline
+// point_on + tangent) match the Python scan resolutions / Newton iteration counts
+// / finite-difference steps verbatim for differential-harness parity. Line-line
+// tangent stays deferred (ill-defined). Unknown entities/constraints are skipped
+// forward-tolerantly, exactly like the Python.
 #pragma once
 
 #include <nlohmann/json.hpp>

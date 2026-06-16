@@ -1,0 +1,23 @@
+{
+  "name": "ported_tangent_curve_curve",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "ellipse_arc", "construction": false, "center": [0.0, 0.0], "rx": 10.0, "ry": 6.0, "rot": 0.0, "a0": 0.0, "a1": 90.0},
+      {"id": "c", "type": "circle", "construction": false, "center": [22.0, 0.0], "radius": 8.0}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.center"]},
+      {"id": "c2", "type": "fix", "refs": ["e1.start"]},
+      {"id": "c3", "type": "fix", "refs": ["e1.end"]},
+      {"id": "c4", "type": "fix", "refs": ["c.center"]},
+      {"id": "c5", "type": "tangent", "refs": ["c", "e1"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 1,
+    "conflicting": [],
+    "statuses": {"e1": "under", "c": "full"}
+  }
+}

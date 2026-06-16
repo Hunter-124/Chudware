@@ -1,0 +1,17 @@
+{
+  "name": "point_on_ellipse_arc",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "ellipse_arc", "construction": false, "center": [2.0, 1.0], "rx": 10.0, "ry": 6.0, "rot": 0.0, "a0": 0.0, "a1": 90.0},
+      {"id": "p", "type": "point", "construction": false, "p": [9.071067811865476, 5.242640687119286]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.center"]},
+      {"id": "c2", "type": "fix", "refs": ["e1.start"]},
+      {"id": "c3", "type": "fix", "refs": ["e1.end"]},
+      {"id": "c4", "type": "fix", "refs": ["p"]},
+      {"id": "c5", "type": "point_on", "refs": ["p", "e1"]}
+    ]
+  },
+  "env": {}
+}

@@ -1,0 +1,25 @@
+{
+  "name": "ported_tangent_line_parabola",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "parabola", "construction": false, "vertex": [0.0, 0.0], "focus": [0.0, 3.0], "t0": -12.0, "t1": 12.0},
+      {"id": "L", "type": "line", "construction": false, "p1": [-14.0, -5.0], "p2": [14.0, -5.0]}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1.vertex"]},
+      {"id": "c2", "type": "fix", "refs": ["e1.start"]},
+      {"id": "c3", "type": "fix", "refs": ["e1.end"]},
+      {"id": "c4", "type": "horizontal", "refs": ["L"]},
+      {"id": "c5", "type": "distance", "refs": ["origin", "L.p1"], "axis": "h", "value": {"value": 14.0, "expr": null}, "driven": false},
+      {"id": "c6", "type": "distance", "refs": ["L.p1", "L.p2"], "axis": "h", "value": {"value": 28.0, "expr": null}, "driven": false},
+      {"id": "c7", "type": "tangent", "refs": ["L", "e1"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": [],
+    "statuses": {"e1": "full", "L": "full"}
+  }
+}

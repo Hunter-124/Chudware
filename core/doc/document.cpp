@@ -178,6 +178,68 @@ std::string req_str(const json& feat, const char* key) {
     return it->get<std::string>();
 }
 
+// A canonical extrude/revolve `profile` ref is a SEL_LIST of region selectors
+// {"kind":"region","sketch":fid,...} (engine/doc/features/extrude.py). In the
+// simplified id-ref model a profile is just the sketch's feature id string. Map
+// the canonical list to that id (the first region selector's sketch) so the
+// existing profile path resolves it. A bare string passes through (simplified
+// shape). Other selector kinds (face profiles) are not yet supported here.
+json canonical_profile_to_id(const json& profile) {
+    if (profile.is_string()) return profile;  // already simplified
+    if (profile.is_array() && !profile.empty()) {
+        const json& sel = profile.front();
+        if (sel.is_string()) return sel;
+        if (sel.is_object() && sel.contains("sketch") && sel["sketch"].is_string())
+            return sel["sketch"];
+    }
+    if (profile.is_object() && profile.contains("sketch") && profile["sketch"].is_string())
+        return profile["sketch"];
+    return profile;  // leave as-is -> the profile resolver will raise a clear error
+}
+
+// SCHEMA CONVERGENCE (docs/CPP_MIGRATION.md): accept BOTH the host's canonical
+// feature shape — {id, type, params:{...}, refs:{slot:<sel|datum>}} per
+// engine/doc/schema.py — and the simplified flat shape the early C++ tests use.
+// We normalize to the flat shape the per-feature compilers already read: params
+// and refs are merged to top level, and the two structural divergences are
+// translated (plane datum "plane.top" -> "top"; region-selector profile list ->
+// sketch id). A feature already in the flat shape (no params/refs) passes through
+// unchanged, so the existing tests stay byte-identical. This lets the parity
+// dashboard + the host feed REAL canonical trees into the ported subset.
+json normalize_feature(const json& raw) {
+    json f = json::object();
+    // 1. Copy top-level scalar/other keys (the flat shape & metadata like id/type).
+    for (auto it = raw.begin(); it != raw.end(); ++it) {
+        if (it.key() == "params" || it.key() == "refs") continue;
+        f[it.key()] = it.value();
+    }
+    // 2. Merge canonical params -> top level.
+    if (raw.contains("params") && raw["params"].is_object()) {
+        for (auto it = raw["params"].begin(); it != raw["params"].end(); ++it)
+            f[it.key()] = it.value();
+    }
+    // 3. Merge / translate canonical refs -> top level.
+    if (raw.contains("refs") && raw["refs"].is_object()) {
+        const json& r = raw["refs"];
+        for (auto it = r.begin(); it != r.end(); ++it) {
+            const std::string& slot = it.key();
+            const json& val = it.value();
+            if (slot == "plane" && val.is_string()) {
+                // sketch plane datum: "plane.top" -> "top" (a face-selector plane,
+                // e.g. for mirror, is an OBJECT and passes through unchanged below).
+                std::string p = val.get<std::string>();
+                if (p.rfind("plane.", 0) == 0) p = p.substr(6);
+                f["plane"] = p;
+            } else if (slot == "profile") {
+                f["profile"] = canonical_profile_to_id(val);
+            } else {
+                f[slot] = val;  // a/b/body/seed/edges/face/plane-object pass through
+            }
+        }
+    }
+    return f;
+}
+
 }  // namespace
 
 // ----------------------------------------------------------------- compile_document
@@ -196,7 +258,11 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     const json empty = json::array();
     const json& features = doc.contains("features") ? doc.at("features") : empty;
 
-    for (const json& feat : features.is_array() ? features : empty) {
+    for (const json& raw : features.is_array() ? features : empty) {
+        // Accept the host's canonical {params,refs} shape OR the simplified flat
+        // shape, normalizing to flat so the compilers below read either (see
+        // normalize_feature / docs/CPP_MIGRATION.md schema convergence).
+        const json feat = normalize_feature(raw);
         const std::string id = feat.value("id", std::string("?"));
         const std::string type = feat.value("type", std::string(""));
 

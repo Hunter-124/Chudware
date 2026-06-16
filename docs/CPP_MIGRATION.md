@@ -40,18 +40,42 @@ is deleted.
   loads it via `LoadLibrary` exactly as the host will and round-trips a real box
   compile → AICM bytes. ctest `probe` green. **No host change yet, fully reversible.**
 
-- **Step 2 — host loads libaicad + diagnostic RPC (DONE/IN PROGRESS).**
+- **Step 2 — host loads libaicad + diagnostic RPC (DONE).**
   `host/src/core/cpp_core.{h,cpp}` `LoadLibrary`s the DLL (compile-only in the host
-  build — no OCCT link). A diagnostic `doc_compile_cpp` runs the C++ core
-  in-process on demand and returns AICM + statuses, leaving the **production Python
-  path untouched**. Behind `AI_CAD_CPP_PARITY=1`, after each Python `doc_rebuild`
-  the host also runs the C++ compile on the same tree and logs a parity line.
-  `tools/cpp_parity.py` builds a Python-vs-C++ dashboard over saved part trees.
+  build — no OCCT link). A diagnostic compile runs the C++ core in-process on demand
+  and returns AICM + statuses, leaving the **production Python path untouched**.
+  Behind `AI_CAD_CPP_PARITY=1`, after each successful `applyOps` + the `activate`
+  (doc_rebuild) refresh, the host also runs the C++ compile on the same tree and
+  logs a `[cpp-parity]` line. Verified live (`AI_CAD_SHOT=m1`).
+
+- **Step 2.5 — schema convergence (IN PROGRESS).** The host sends the CANONICAL
+  feature shape (`{id,type,params:{...},refs:{slot:<sel|datum>}}`, engine/doc/
+  schema.py); the early C++ compiler read a SIMPLIFIED flat shape. `compile_document`
+  now `normalize_feature()`s both into the flat form, translating the two structural
+  divergences (sketch plane datum `plane.top`→`top`; region-selector profile list
+  → sketch id). **sketch → extrude on canonical input now matches Python**
+  (`tools/cpp_parity.py`: box/cylinder/washer 3/3). REMAINING canonical mapping:
+  extrude `mode` add/cut (needs a target-body boolean), revolve axis refs, boolean
+  `targets`/`tools` (vs simplified a/b), canonical fillet/chamfer/hole/pattern/
+  mirror selector refs. Each lands as the matching feature is ported.
 
 - **Step 3+ — cut over per feature, delete Python per wave.** A method/feature is
   cut over only once its C++ implementation passes the parity dashboard for the
   relevant corpus. The corresponding Python is deleted in the same commit. Track
   progress in the gap list below.
+
+## Parity dashboard
+
+`tools/cpp_parity.py` (run under the venv) compiles a fixture set through BOTH the
+Python oracle (`engine.doc.compiler.compile_document`) and the C++ core
+(`libaicad.dll` via ctypes), and diffs per-feature ok + body count. Exit code =
+number of non-matching fixtures (0 = full parity), so it doubles as a CI gate.
+
+```
+& "$env:APPDATA\AI-CAD\runtime\venv\Scripts\python.exe" tools\cpp_parity.py
+```
+
+Current: **3/3** (box, cylinder, washer — sketch→extrude on canonical input).
 
 ## Feature parity gap list (C++ core vs Python `engine/doc`)
 

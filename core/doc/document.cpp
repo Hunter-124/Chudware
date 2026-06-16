@@ -28,10 +28,13 @@
 
 #include <Eigen/Dense>
 
+#include <BRep_Tool.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
 #include <BRepTools.hxx>
+#include <TopExp.hxx>
+#include <TopoDS_Vertex.hxx>
 #include <Bnd_Box.hxx>
 #include <GProp_GProps.hxx>
 #include <GeomAbs_SurfaceType.hxx>
@@ -667,6 +670,70 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     throw std::runtime_error("sweep produced no solid");
 
                 results[id] = SolidResult{solid};
+                solid_order.push_back(id);
+                st.ok = true;
+
+            } else if (type == "rib") {
+                // Thin support wall grown from an OPEN sketch contour: silhouette
+                // dropped in-plane toward the body, thickened across the sketch
+                // normal, trimmed to the body bbox, fused. Port of the parallel/
+                // centered path of engine/doc/features/rib.py.
+                const std::string body_id = body_ref(feat);
+                if (body_id.empty())
+                    throw std::runtime_error("rib: no body ref and no current body");
+                const TopoDS_Shape& body = require_solid(results, body_id, "body");
+                const double thickness =
+                    feat.contains("thickness") ? num_or_expr(feat.at("thickness"), env) : 3.0;
+                if (!(thickness > 0.0))
+                    throw std::runtime_error("rib thickness must be > 0");
+
+                const std::string prof = req_str(feat, "profile");
+                const SketchResult& src = require_sketch(results, prof, prof.c_str());
+                TopoDS_Wire contour =
+                    aicad::geom::wire_from_solved_sketch(src.entities, src.plane);
+                if (contour.IsNull())
+                    throw std::runtime_error("rib: profile sketch produced no contour");
+
+                // Body bbox -> center (for the inward drop) + a clip box (+5 margin).
+                Bnd_Box bb;
+                BRepBndLib::Add(body, bb);
+                double xmn, ymn, zmn, xmx, ymx, zmx;
+                bb.Get(xmn, ymn, zmn, xmx, ymx, zmx);
+                Eigen::Vector3d bc((xmn + xmx) / 2, (ymn + ymx) / 2, (zmn + zmx) / 2);
+
+                TopoDS_Vertex v1, v2;
+                TopExp::Vertices(contour, v1, v2);
+                if (v1.IsNull() || v2.IsNull())
+                    throw std::runtime_error("rib: contour is closed (a rib needs an open contour)");
+                gp_Pnt q1 = BRep_Tool::Pnt(v1), q2 = BRep_Tool::Pnt(v2);
+                Eigen::Vector3d mid((q1.X() + q2.X()) / 2, (q1.Y() + q2.Y()) / 2,
+                                    (q1.Z() + q2.Z()) / 2);
+                Eigen::Vector3d toward = bc - mid;
+                const double reach = aicad::doc::bbox_diag(body) * 1.5;
+
+                TopoDS_Shape slab = ::geom::make_rib_slab(contour, src.plane.normal,
+                                                          toward, thickness, reach);
+                if (slab.IsNull())
+                    throw std::runtime_error("rib: could not build the rib slab");
+
+                // Trim the slab to the body bbox (+5) so the drop doesn't dangle.
+                TopoDS_Shape clip = ::geom::make_box_at(xmn - 5, ymn - 5, zmn - 5,
+                                                        (xmx - xmn) + 10, (ymx - ymn) + 10,
+                                                        (zmx - zmn) + 10);
+                TopoDS_Shape trimmed = ::geom::common(slab, clip);
+                if (trimmed.IsNull()) trimmed = slab;  // keep untrimmed; fuse still works
+
+                GProp_GProps gb, ga;
+                BRepGProp::VolumeProperties(body, gb);
+                TopoDS_Shape out = ::geom::fuse(body, trimmed);
+                if (out.IsNull())
+                    throw std::runtime_error("rib: fusing the rib to the body failed");
+                BRepGProp::VolumeProperties(out, ga);
+                if (ga.Mass() - gb.Mass() <= 1e-6)
+                    throw std::runtime_error("rib added no material (contour must bridge the body)");
+
+                consumed.insert(body_id);
+                results[id] = SolidResult{out};
                 solid_order.push_back(id);
                 st.ok = true;
 

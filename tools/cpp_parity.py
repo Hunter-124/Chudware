@@ -74,6 +74,24 @@ def _rect(x0, y0, w, h):
 # ("plane.top"); extrude.refs.profile = a SEL_LIST of region selectors
 # {"kind":"region","sketch":fid}. This is the shape the host actually sends and
 # the C++ core must converge to (see docs/CPP_MIGRATION.md "schema convergence").
+def _polyline(pts, closed=True, prefix="e"):
+    # Lines connecting consecutive points, chained by coincident constraints; the
+    # first point is fixed. Under-defined but solves to the drawn coordinates (both
+    # engines), which is all a profile/contour needs.
+    ents, cons = [], []
+    n = len(pts)
+    segs = n if closed else n - 1
+    for i in range(segs):
+        a, b = pts[i], pts[(i + 1) % n]
+        ents.append(_line(f"{prefix}{i}", a[0], a[1], b[0], b[1]))
+    for i in range(segs - 1):
+        cons.append(_rel(f"k{i}", "coincident", [f"{prefix}{i}.p2", f"{prefix}{i+1}.p1"]))
+    if closed:
+        cons.append(_rel("kc", "coincident", [f"{prefix}{segs-1}.p2", f"{prefix}0.p1"]))
+    cons.append(_rel("fx", "fix", [f"{prefix}0.p1"]))
+    return ents, cons
+
+
 def _sketch(fid, plane_datum, ents, cons):
     return {"id": fid, "type": "sketch",
             "params": {"entities": ents, "constraints": cons},
@@ -239,6 +257,18 @@ def fixtures():
         {"id": "f3", "type": "sweep", "params": {"mode": "boss"},
          "refs": {"profile": [{"kind": "region", "sketch": "s1"}],
                   "path": {"kind": "region", "sketch": "s2"}}}]}
+
+    # rib: a U-channel (closed U cross-section on plane.front, extruded 20), then an
+    # open line bridging the notch grown into a rib wall. Volume must INCREASE (the
+    # geometric volume gate makes this a real test of the rib geometry).
+    u_pts = [(0, 0), (40, 0), (40, 30), (30, 30), (30, 10), (10, 10), (10, 30), (0, 30)]
+    u_e, u_c = _polyline(u_pts, closed=True, prefix="u")
+    rib_e, rib_c = _polyline([(10, 20), (30, 20)], closed=False, prefix="r")
+    out["rib"] = {"features": [
+        _sketch("f1", "plane.front", u_e, u_c), _extrude("f2", "f1", 20.0),
+        _sketch("f3", "plane.front", rib_e, rib_c),
+        {"id": "f4", "type": "rib", "params": {"thickness": {"value": 4, "expr": None}},
+         "refs": {"profile": [{"kind": "region", "sketch": "f3"}]}}]}
 
     # base primitives (centered on origin).
     def _prim(fid, ptype, params):

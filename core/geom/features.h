@@ -42,6 +42,19 @@ TopoDS_Shape make_sphere(double r);                         // centered at origi
 TopoDS_Shape make_cone_centered(double r1, double r2, double h);  // axis +Z, centered
 TopoDS_Shape make_torus(double major_r, double minor_r);   // axis +Z, centered
 
+// Build a rib slab from an OPEN contour wire (the rib's top trace): each contour
+// edge is extruded along the in-plane drop direction (perpendicular to the contour,
+// flipped toward `toward`) by `reach` into a silhouette face, then thickened to
+// `thickness` centered on the sketch plane (along `normal`). Returns the unfused,
+// untrimmed slab (the caller trims to the body bbox + fuses). Empty on failure.
+// Port of the parallel/centered path of engine/doc/features/rib.py.
+TopoDS_Shape make_rib_slab(const TopoDS_Wire& contour, const Eigen::Vector3d& normal,
+                           const Eigen::Vector3d& toward, double thickness, double reach);
+
+// An axis-aligned box with min corner at (x,y,z) and size dx x dy x dz (for bbox
+// clipping). Empty on non-positive size.
+TopoDS_Shape make_box_at(double x, double y, double z, double dx, double dy, double dz);
+
 // Sweep a planar profile face along a spine wire (BRepOffsetAPI_MakePipe). The
 // profile should sit at the spine start, roughly perpendicular to its tangent.
 // Empty shape on kernel failure. Port of engine/doc/features/sweep.py's MakePipe

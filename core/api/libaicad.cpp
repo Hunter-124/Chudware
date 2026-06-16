@@ -109,6 +109,7 @@ int handle_compile(const json& params, char** out_json) {
     return emit(json{
                     {"ok", res.ok},
                     {"body_count", res.body_count},
+                    {"volume", res.volume},
                     {"statuses", statuses},
                     {"aicm_path", aicm_path},
                     {"aicm_bytes", static_cast<uint64_t>(res.aicm.size())},

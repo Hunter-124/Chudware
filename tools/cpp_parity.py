@@ -285,18 +285,32 @@ class CppCore:
 
 
 # --------------------------------------------------------------------------- oracle
-def python_compile(doc: dict) -> tuple[dict[str, bool], int, str | None]:
-    """Run the Python production compiler. Returns (id->ok, body_count, error)."""
+def python_compile(doc: dict):
+    """Run the Python production compiler. Returns (id->ok, body_count, volume, error)."""
     try:
         from engine.doc.compiler import compile_document  # noqa: WPS433
     except Exception as exc:  # pragma: no cover
-        return {}, 0, f"import engine failed: {exc}"
+        return {}, 0, 0.0, f"import engine failed: {exc}"
     try:
         res = compile_document(doc)
     except Exception as exc:
-        return {}, 0, f"compile raised: {exc}"
+        return {}, 0, 0.0, f"compile raised: {exc}"
     status = {s["id"]: bool(s.get("ok")) for s in res.feature_status}
-    return status, len(res.bodies), None
+
+    def _vol(shape) -> float:
+        # A body's shape is a single Solid (has .volume) OR a ShapeList of disjoint
+        # solids (e.g. a disjoint pattern) -> sum the parts.
+        try:
+            return float(shape.volume)
+        except Exception:
+            pass
+        try:
+            return float(sum(float(s.volume) for s in shape))
+        except Exception:
+            return 0.0
+
+    vol = sum(_vol(b.shape) for b in res.bodies)
+    return status, len(res.bodies), vol, None
 
 
 # --------------------------------------------------------------------------- main
@@ -318,15 +332,17 @@ def main() -> int:
 
     fx = fixtures()
     name_w = max(len(n) for n in fx)
-    print(f"\n{'fixture'.ljust(name_w)}  {'py(ok/feat,bodies)':>20}  {'cpp(ok/feat,bodies)':>20}  verdict")
-    print("-" * (name_w + 50))
+    print(f"\n{'fixture'.ljust(name_w)}  {'py(ok,bodies,vol)':>22}  {'cpp(ok,bodies,vol)':>22}  verdict")
+    print("-" * (name_w + 56))
 
+    VOL_TOL = 1e-3  # relative volume tolerance (tessellation-independent: exact BRep volume)
     mismatches = 0
     for name, doc in fx.items():
-        py_status, py_bodies, py_err = python_compile(doc)
+        py_status, py_bodies, py_vol, py_err = python_compile(doc)
         rc, cpp = core.call("doc_compile_cpp", {"doc": doc})
         cpp_status = {s["id"]: bool(s.get("ok")) for s in cpp.get("statuses", [])}
         cpp_bodies = cpp.get("body_count", 0)
+        cpp_vol = float(cpp.get("volume", 0.0))
 
         py_ok = sum(1 for v in py_status.values() if v)
         cpp_ok = sum(1 for v in cpp_status.values() if v)
@@ -341,12 +357,15 @@ def main() -> int:
                 diffs.append(fid)
         if py_bodies != cpp_bodies:
             diffs.append(f"bodies {py_bodies}!={cpp_bodies}")
+        denom = max(abs(py_vol), 1.0)
+        if abs(py_vol - cpp_vol) / denom > VOL_TOL:
+            diffs.append(f"vol {py_vol:.1f}!={cpp_vol:.1f}")
 
         verdict = "MATCH" if not diffs else "DIFF: " + ", ".join(diffs)
         if diffs:
             mismatches += 1
-        print(f"{name.ljust(name_w)}  {f'{py_ok}/{len(py_status)},{py_bodies}':>20}"
-              f"  {f'{cpp_ok}/{len(cpp_status)},{cpp_bodies}':>20}  {verdict}")
+        print(f"{name.ljust(name_w)}  {f'{py_ok}/{len(py_status)},{py_bodies},{py_vol:.0f}':>22}"
+              f"  {f'{cpp_ok}/{len(cpp_status)},{cpp_bodies},{cpp_vol:.0f}':>22}  {verdict}")
 
     print(f"\n[parity] {len(fx) - mismatches}/{len(fx)} fixtures at full parity")
     return mismatches

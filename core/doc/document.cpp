@@ -1212,6 +1212,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         try {
             bodies.push_back(::geom::tessellate_body(shape, body_num, sid, color));
             ++body_num;
+            // Accumulate the exact solid volume (geometry-level parity signal).
+            GProp_GProps gp;
+            BRepGProp::VolumeProperties(shape, gp);
+            result.volume += gp.Mass();
         } catch (...) {
             // A tessellation failure must not crash the rebuild; skip this body.
         }

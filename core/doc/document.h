@@ -55,6 +55,7 @@ struct CompileResult {
     std::vector<FeatureStatus> statuses;  // one per feature, in tree order
     std::vector<uint8_t> aicm;            // serialized SURVIVING solid bodies (write_aicm)
     int body_count = 0;                   // surviving solids after the whole tree
+    double volume = 0.0;                  // total solid volume of surviving bodies (mm^3)
     bool ok = false;                      // true iff every feature compiled ok
 };
 

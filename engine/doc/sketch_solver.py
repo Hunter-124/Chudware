@@ -1390,7 +1390,13 @@ def _add_tangent_circle_circle(sys, cid, eid0, eid1, entities, var_map):
         dx = cx0 - cx1; dy = cy0 - cy1
         d = math.hypot(dx, dy)
         if d < 1e-12:
-            ux, uy = 0.0, 0.0
+            # BUG-1: at coincident centers d(|C0-C1|)/dC is 0/0. A zero position
+            # gradient strands Newton (it cannot separate the centers and
+            # corrupts the radii instead). Fall back to a DETERMINISTIC unit
+            # direction (+x) so the Jacobian is well-defined and the centers get
+            # pushed apart to the tangent distance. Matches the C++ fallback
+            # (1,0) verbatim -> bit-identical under the differential harness.
+            ux, uy = 1.0, 0.0
         else:
             ux, uy = dx/d, dy/d
         if internal:

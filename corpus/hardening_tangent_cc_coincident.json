@@ -1,0 +1,22 @@
+{
+  "name": "hardening_tangent_cc_coincident",
+  "_note": "BUG-1 regression guard. Two circles drawn with EXACTLY coincident centers, then an internal circle-circle tangent is applied. At d=0 the distance direction (C1-C0)/|C1-C0| is 0/0; without a deterministic fallback the position Jacobian is null and Newton cannot separate the centers (it corrupts the radii instead). With the (1,0) fallback the inner circle's center is pushed along +x to the |r0-r1| internal-tangency distance. e1 fully fixed (center+radius), e2 radius pinned at 5, centers kept horizontal -> dof=0. Expected: e2.center=(5,0), internal tangency |r0-r1|=5.",
+  "sketch": {
+    "entities": [
+      {"id": "e1", "type": "circle", "construction": false, "center": [0.0, 0.0], "radius": 10.0},
+      {"id": "e2", "type": "circle", "construction": false, "center": [0.0, 0.0], "radius": 5.0}
+    ],
+    "constraints": [
+      {"id": "c1", "type": "fix", "refs": ["e1"]},
+      {"id": "c2", "type": "radius", "refs": ["e2"], "value": {"value": 5.0, "expr": null}, "driven": false},
+      {"id": "c3", "type": "horizontal", "refs": ["e1.center", "e2.center"]},
+      {"id": "c4", "type": "tangent", "refs": ["e1", "e2"]}
+    ]
+  },
+  "env": {},
+  "expect": {
+    "converged": true,
+    "dof": 0,
+    "conflicting": []
+  }
+}

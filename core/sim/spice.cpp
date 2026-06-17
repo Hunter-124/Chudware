@@ -325,11 +325,17 @@ bool kind_is_nonlinear(const std::string& kind) {
 // Stamp the static linear devices common to DC and transient (R, V, I, E, G); the
 // reactive devices (C, L) are stamped by the caller (DC-open/short vs companion).
 void stamp_linear(const Setup& s, Mna& mna, const json& d, double t,
-                  const std::map<std::string, double>& src_scale) {
+                  const std::map<std::string, double>& src_scale,
+                  const std::map<std::string, double>& src_override) {
     const std::string kind = d.value("kind", std::string());
     const std::string name = d.value("name", std::string());
     const json& nodes = d.contains("nodes") ? d["nodes"] : json::array();
     auto N = [&](int k) { return (k < (int)nodes.size()) ? s.n(nodes[k].get<std::string>()) : -1; };
+    // Forced DC value for a swept independent source (.dc) — ignores the waveform.
+    auto src_val = [&](double tt) -> double {
+        auto ov = src_override.find(name);
+        return ov != src_override.end() ? ov->second : source_value_t(d, tt);
+    };
     if (kind == "R") {
         double r = dev_value(d, 0.0);
         if (std::abs(r) < 1e-12) r = 1e-9;
@@ -339,10 +345,10 @@ void stamp_linear(const Setup& s, Mna& mna, const json& d, double t,
     } else if (kind == "V") {
         int a = N(0), b = N(1), br = s.branch_of.at(name);
         mna.G(a, br, 1.0); mna.G(b, br, -1.0); mna.G(br, a, 1.0); mna.G(br, b, -1.0);
-        mna.I(br, source_value_t(d, t) * src_scale_of(src_scale, name));
+        mna.I(br, src_val(t) * src_scale_of(src_scale, name));
     } else if (kind == "I") {
         int a = N(0), b = N(1);
-        double i = source_value_t(d, t) * src_scale_of(src_scale, name);
+        double i = src_val(t) * src_scale_of(src_scale, name);
         mna.I(a, -i); mna.I(b, i);
     } else if (kind == "E") {
         int op = N(0), on = N(1), cp = N(2), cn = N(3), br = s.branch_of.at(name);
@@ -994,6 +1000,7 @@ json spice_simulate(const json& circuit, const json& study) {
     // device kind, "" on success.
     auto stamp_all_dc = [&](Mna& mna, const std::vector<double>& x,
                             const std::map<std::string, double>& src_scale,
+                            const std::map<std::string, double>& src_override,
                             double gmin_floor) -> std::string {
         mna.reset();
         if (gmin_floor > 0)
@@ -1007,7 +1014,7 @@ json spice_simulate(const json& circuit, const json& study) {
                 mna.G(a, br, 1.0); mna.G(b, br, -1.0); mna.G(br, a, 1.0); mna.G(br, b, -1.0);
             } else if (kind == "R" || kind == "V" || kind == "I" || kind == "E" || kind == "G" ||
                        kind == "F" || kind == "H" || kind == "OPAMP") {
-                stamp_linear(s, mna, d, 0.0, src_scale);
+                stamp_linear(s, mna, d, 0.0, src_scale, src_override);
             } else if (kind_is_nonlinear(kind)) {
                 stamp_nonlinear_dc(s, mna, d, x, last_vd);
             } else if (kind == "B") {
@@ -1025,10 +1032,11 @@ json spice_simulate(const json& circuit, const json& study) {
     // Damped Newton DC solve at a given gmin floor + source scale (circuit.py::_newton_dc).
     auto newton_dc = [&](Mna& mna, const std::vector<double>& x0,
                          double gmin_floor, const std::map<std::string, double>& src_scale,
+                         const std::map<std::string, double>& src_override,
                          std::vector<double>& out, std::string& err) -> bool {
         std::vector<double> x = x0;
         for (int it = 1; it <= s.maxiter; ++it) {
-            err = stamp_all_dc(mna, x, src_scale, gmin_floor);
+            err = stamp_all_dc(mna, x, src_scale, src_override, gmin_floor);
             if (!err.empty()) return false;
             std::vector<double> xnew;
             if (!solve_dense(mna, xnew)) { err = "matrix singular"; return false; }
@@ -1056,14 +1064,17 @@ json spice_simulate(const json& circuit, const json& study) {
     };
 
     // DC operating point with gmin- then source-stepping fallback (circuit.py::solve_dc_op).
-    auto solve_dc_op = [&](std::vector<double>& out) -> bool {
+    // `x_guess` warm-starts the direct attempt (sweep continuation); `src_override` forces DC
+    // values on swept sources (.dc). Empty args reproduce the plain operating-point solve.
+    auto solve_dc_op_full = [&](std::vector<double>& out, const std::vector<double>& x_guess,
+                                const std::map<std::string, double>& src_override) -> bool {
         Mna mna(dim);
-        std::vector<double> x0(dim, 0.0);
+        std::vector<double> x0 = (int)x_guess.size() == dim ? x_guess : std::vector<double>(dim, 0.0);
         std::map<std::string, double> base_scale;
 
         // 1. Direct attempt.
         std::string err;
-        if (newton_dc(mna, x0, gmin, base_scale, out, err) && err.empty()) {
+        if (newton_dc(mna, x0, gmin, base_scale, src_override, out, err) && err.empty()) {
             log("op: converged");
             return true;
         }
@@ -1078,7 +1089,7 @@ json spice_simulate(const json& circuit, const json& study) {
         while (gstep >= gmin / 10.0) {
             std::vector<double> xs;
             std::string e;
-            if (newton_dc(mna, x, gstep, base_scale, xs, e) && e.empty()) {
+            if (newton_dc(mna, x, gstep, base_scale, src_override, xs, e) && e.empty()) {
                 x = xs;
                 if (gstep <= gmin) { gok = true; break; }
                 gstep /= 10.0;
@@ -1090,7 +1101,7 @@ json spice_simulate(const json& circuit, const json& study) {
         if (gok) {
             std::vector<double> xs;
             std::string e;
-            if (newton_dc(mna, x, gmin, base_scale, xs, e) && e.empty()) {
+            if (newton_dc(mna, x, gmin, base_scale, src_override, xs, e) && e.empty()) {
                 log("op: gmin stepping converged");
                 out = xs;
                 return true;
@@ -1112,12 +1123,16 @@ json spice_simulate(const json& circuit, const json& study) {
             for (const std::string& nm : src_names) scale[nm] = alpha;
             std::vector<double> xs;
             std::string e;
-            if (!newton_dc(mna, xss, gmin, scale, xs, e) || !e.empty()) { all_ok = false; break; }
+            if (!newton_dc(mna, xss, gmin, scale, src_override, xs, e) || !e.empty()) { all_ok = false; break; }
             xss = xs;
         }
         if (all_ok) { log("op: source stepping converged"); out = xss; return true; }
         log("op: all DC convergence strategies failed");
         return false;
+    };
+    static const std::map<std::string, double> kNoOverride;
+    auto solve_dc_op = [&](std::vector<double>& out) -> bool {
+        return solve_dc_op_full(out, {}, kNoOverride);
     };
 
     const json& analyses = study.contains("analyses") && study["analyses"].is_array()
@@ -1142,6 +1157,47 @@ json spice_simulate(const json& circuit, const json& study) {
                 for (const json& pr : probes) op[pr.get<std::string>()] = std::nan("");
                 result["op"] = op;
             }
+        } else if (atype == "dc") {
+            // ---- DC sweep: step an independent V/I source, re-solving with continuation ----
+            std::string src = a.value("source", std::string());
+            double start = as_num(a.value("start", json(0.0)), 0.0);
+            double stop = as_num(a.value("stop", json(0.0)), 0.0);
+            double dflt_step = (stop - start) / 50.0;
+            double step = as_num(a.value("step", json(dflt_step)), dflt_step);
+            if (step == 0.0) { step = dflt_step != 0.0 ? dflt_step : 1.0; }
+            int n = (int)std::lround((stop - start) / step) + 1;
+            std::vector<double> xs;
+            for (int i = 0; i < n; ++i) xs.push_back(start + i * step);
+            bool found = false;
+            for (const json& d : devices) {
+                std::string k = d.value("kind", std::string());
+                if (d.value("name", std::string()) == src && (k == "V" || k == "I")) found = true;
+            }
+            std::map<std::string, std::vector<double>> traces;
+            for (const json& pr : probes) traces[pr.get<std::string>()];
+            bool converged = found;
+            if (!found) log("dc: source '" + src + "' not found (V/I sweep only)");
+            std::vector<double> guess;
+            if (found) {
+                for (double xv : xs) {
+                    std::map<std::string, double> ov{{src, xv}};
+                    std::vector<double> x;
+                    if (!solve_dc_op_full(x, guess, ov)) {
+                        converged = false;
+                        for (const json& pr : probes) traces[pr.get<std::string>()].push_back(std::nan(""));
+                        continue;
+                    }
+                    guess = x;
+                    for (const json& pr : probes) {
+                        json v = eval_probe(s, x, pr.get<std::string>());
+                        traces[pr.get<std::string>()].push_back(v.is_number() ? v.get<double>() : std::nan(""));
+                    }
+                }
+            }
+            json dcj = {{"sweep", src}, {"x", xs}, {"traces", json::object()}};
+            for (const json& pr : probes) dcj["traces"][pr.get<std::string>()] = traces[pr.get<std::string>()];
+            result["dc"] = dcj;
+            result["convergence"]["dc"] = converged;
         } else if (atype == "tran") {
             // ---- transient (trapezoidal + BE bootstrap), inner Newton for nonlinear ----
             double tstep = as_num(a.value("tstep", json(1e-6)), 1e-6);
@@ -1239,7 +1295,7 @@ json spice_simulate(const json& circuit, const json& study) {
                         if (it != b_expr.end())
                             stamp_behavioral(s, mna, d, xw, t, *it->second, b_src_type(d));
                     } else {
-                        stamp_linear(s, mna, d, t, no_scale);  // R/V/I/E/G at time t
+                        stamp_linear(s, mna, d, t, no_scale, no_scale);  // R/V/I/E/G at time t
                     }
                 }
             };

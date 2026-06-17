@@ -577,6 +577,57 @@ def main() -> int:
     else:
         print(f"  {'opamp inverting':<24} MATCH  (V(OUT)={float(cv):.4g}, |gain|={float(vc[0]):.4g})")
 
+    # ---- DC sweep (.dc): step a V source, re-solving with warm-start continuation. A linear
+    # divider sweep + a nonlinear diode I-V curve. Both engines walk the same swept grid through
+    # the same (Newton) DC solve seeded by the previous point -> the full sweep matches.
+    dc_cases = [
+        ("dc divider sweep", {
+            "nodes": ["0", "IN", "OUT"],
+            "devices": [
+                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0, "params": {}},
+                {"kind": "R", "name": "R1", "nodes": ["IN", "OUT"], "value": 1000.0, "params": {}},
+                {"kind": "R", "name": "R2", "nodes": ["OUT", "0"], "value": 3000.0, "params": {}}],
+            "models": {}, "params": {}},
+         {"analyses": [{"type": "dc", "source": "V1", "start": 0.0, "stop": 10.0, "step": 1.0}],
+          "probes": ["V(OUT)", "I(V1)"]}),
+        ("dc diode I-V", {
+            "nodes": ["0", "IN", "OUT"],
+            "devices": [
+                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0, "params": {}},
+                {"kind": "R", "name": "R1", "nodes": ["IN", "OUT"], "value": 100.0, "params": {}},
+                {"kind": "D", "name": "D1", "nodes": ["OUT", "0"], "value": None,
+                 "model": "DD", "params": {}}],
+            "models": {"DD": {"IS": 2.52e-9, "N": 1.752, "RS": 0.568}},
+            "params": {"TEMP": 27}},
+         {"analyses": [{"type": "dc", "source": "V1", "start": 0.0, "stop": 1.0, "step": 0.05}],
+          "probes": ["V(OUT)", "I(V1)"]}),
+    ]
+    for label, circuit, study in dc_cases:
+        checks += 1
+        ro = simulate(circuit, study)
+        rc, rcpp = core.call("sim_spice", {"circuit": circuit, "study": study})
+        diffs = []
+        if not (ro["convergence"].get("dc") and rcpp.get("convergence", {}).get("dc")):
+            diffs.append("dc did not converge")
+        xp = np.asarray(ro["dc"]["x"], dtype=np.float64)
+        xc = np.asarray(rcpp.get("dc", {}).get("x", []), dtype=np.float64)
+        if xp.shape != xc.shape:
+            diffs.append(f"sweep grid len {xp.shape}!={xc.shape}")
+        else:
+            for pr in study["probes"]:
+                vp = np.asarray(ro["dc"]["traces"][pr], dtype=np.float64)
+                vc = np.asarray(rcpp["dc"]["traces"][pr], dtype=np.float64)
+                scale = max(float(np.max(np.abs(vp))), 1e-9)
+                dmax = float(np.max(np.abs(vp - vc)))
+                if dmax / scale > 1e-6:
+                    diffs.append(f"{pr} max|d|={dmax:.2e} (rel {dmax/scale:.1e})")
+        if diffs:
+            print(f"  {('dc ' + label):<24} DIFF: {'; '.join(diffs)[:100]}")
+            mism += 1
+        else:
+            last = float(np.asarray(rcpp["dc"]["traces"][study["probes"][0]])[-1])
+            print(f"  {('dc ' + label):<24} MATCH  ({len(xc)} pts, {study['probes'][0]}[-1]={last:.4g})")
+
     print(f"\n[spice-parity] {checks - mism}/{checks} circuit cases at full parity")
     return mism
 

@@ -29,6 +29,7 @@
 #include "doc/document.h"
 #include "doc/session.h"
 #include "doc/validate.h"
+#include "sim/fea_static.h"
 
 using nlohmann::json;
 
@@ -149,6 +150,38 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
         }
         if (m == "doc_compile_cpp") {
             return handle_compile(params, out_json);
+        }
+        if (m == "sim_fea_static") {
+            // Linear-static FEA (engine/sim/fea_static.py parity probe). Params carry an
+            // ALREADY-RESOLVED problem: points[n*3], tets[m*4], E_mpa, nu, yield_mpa,
+            // fixed_nodes[], nodal_forces[n*3]. Returns displacement/von_mises/summary.
+            auto getd = [&](const char* k) {
+                std::vector<double> v;
+                if (params.contains(k) && params[k].is_array())
+                    for (const auto& x : params[k]) v.push_back(x.get<double>());
+                return v;
+            };
+            auto geti = [&](const char* k) {
+                std::vector<int> v;
+                if (params.contains(k) && params[k].is_array())
+                    for (const auto& x : params[k]) v.push_back(x.get<int>());
+                return v;
+            };
+            aicad::sim::FeaStaticResult r = aicad::sim::fea_static_solve(
+                getd("points"), geti("tets"), params.value("E_mpa", 0.0),
+                params.value("nu", 0.0), params.value("yield_mpa", 250.0),
+                geti("fixed_nodes"), getd("nodal_forces"));
+            if (!r.ok) return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
+            return emit(json{{"ok", true},
+                             {"displacement", r.displacement},
+                             {"disp_magnitude", r.disp_magnitude},
+                             {"von_mises", r.von_mises},
+                             {"n_dof", r.n_dof},
+                             {"summary",
+                              {{"max_von_mises_mpa", r.max_von_mises_mpa},
+                               {"max_disp_mm", r.max_disp_mm},
+                               {"min_fos", r.min_fos}}}},
+                        out_json, 0);
         }
         if (m == "doc_validate") {
             // DIAGNOSTIC: structural-validate a document tree (schema.validate_document

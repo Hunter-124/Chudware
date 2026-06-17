@@ -84,6 +84,23 @@ add_library(aicad_util STATIC
   util/expr.cpp)
 target_include_directories(aicad_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+# --- libaicad sim (simulation solvers) ---------------------------------------
+# C++ port of engine/sim. FEA static linear elasticity first (tet4 + Eigen::SparseLU,
+# the oracle is engine/sim/fea_static.py); modal / LBM / SPICE follow. OCCT-free —
+# pure Eigen — so it builds in the standalone config too. CUDA acceleration is a
+# later layer on top of these correct CPU cores.
+add_library(aicad_sim STATIC
+  sim/fea_static.cpp)
+target_include_directories(aicad_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_sim PUBLIC Eigen3::Eigen)
+
+add_executable(test_sim tests/test_sim.cpp)
+target_include_directories(test_sim PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_sim PRIVATE aicad_sim)
+set_target_properties(test_sim PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME sim COMMAND test_sim)
+
 # --- libaicad sketch (parameterization + constraints over the solver core) ---
 add_library(aicad_sketch STATIC
   sketch/sketch.cpp)
@@ -465,7 +482,7 @@ if(AICAD_WITH_OCCT)
     api/libaicad.cpp)
   target_include_directories(aicad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_definitions(aicad PRIVATE AICAD_BUILD_DLL)
-  target_link_libraries(aicad PRIVATE aicad_doc)
+  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim)
   set_target_properties(aicad PROPERTIES
     OUTPUT_NAME libaicad   # -> libaicad.dll + libaicad.lib (the host loads by this name)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

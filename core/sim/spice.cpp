@@ -300,6 +300,19 @@ double src_scale_of(const std::map<std::string, double>& sc, const std::string& 
     return it == sc.end() ? 1.0 : it->second;
 }
 
+// Resolve an F/H/B control reference to its MNA branch row. The Python MnaSystem keys branch
+// rows as "{name}#0"; the host/parser may instead pass the bare source name. Accept both forms
+// so the C++ core is a superset of the oracle's lookup (the oracle requires the "#0" form).
+int find_branch(const Setup& s, const std::string& ctrl) {
+    auto it = s.branch_of.find(ctrl);
+    if (it != s.branch_of.end()) return it->second;
+    if (ctrl.size() > 2 && ctrl.substr(ctrl.size() - 2) == "#0") {
+        it = s.branch_of.find(ctrl.substr(0, ctrl.size() - 2));
+        if (it != s.branch_of.end()) return it->second;
+    }
+    return -1;
+}
+
 inline double xat(const std::vector<double>& x, int i) {
     return (i < 0 || i >= (int)x.size()) ? 0.0 : x[i];
 }
@@ -341,6 +354,37 @@ void stamp_linear(const Setup& s, Mna& mna, const json& d, double t,
         int op = N(0), on = N(1), cp = N(2), cn = N(3);
         double gm = dev_value(d, 1.0);
         mna.G(op, cp, gm); mna.G(op, cn, -gm); mna.G(on, cp, -gm); mna.G(on, cn, gm);
+    } else if (kind == "F") {  // CCCS: mirror the control V-source branch current * gain
+        int op = N(0), on = N(1);
+        std::string ctrl = params_of(d).value("control", d.value("model", std::string()));
+        double gain = (d.contains("value") && d["value"].is_number()) ? d["value"].get<double>()
+                                                                       : mp(d, s.models, "gain", 1.0);
+        int cbr = find_branch(s, ctrl);
+        if (cbr >= 0) { mna.G(op, cbr, gain); mna.G(on, cbr, -gain); }
+    } else if (kind == "H") {  // CCVS: V(op,on) = r * I(control)
+        int op = N(0), on = N(1), br = s.branch_of.at(name);
+        std::string ctrl = params_of(d).value("control", d.value("model", std::string()));
+        double r = (d.contains("value") && d["value"].is_number()) ? d["value"].get<double>()
+                                                                    : mp(d, s.models, "gain", 1.0);
+        mna.G(op, br, 1.0); mna.G(on, br, -1.0);
+        mna.G(br, op, 1.0); mna.G(br, on, -1.0);
+        int cbr = find_branch(s, ctrl);
+        if (cbr >= 0) mna.G(br, cbr, -r);
+    } else if (kind == "OPAMP") {  // ideal (virtual short) or finite-gain VCVS
+        int ip = N(0), inn = N(1), out = N(2);
+        int ref = nodes.size() > 3 ? N(3) : -1;
+        int br = s.branch_of.at(name);
+        mna.G(out, br, 1.0);
+        if (ref >= 0) mna.G(ref, br, -1.0);
+        bool ideal = mp(d, s.models, "gbw", 0.0) <= 0.0 && mp(d, s.models, "gain", 0.0) <= 0.0;
+        if (ideal) {
+            mna.G(br, ip, 1.0); mna.G(br, inn, -1.0);
+        } else {
+            double A = mp(d, s.models, "gain", 1e6);
+            mna.G(br, out, 1.0);
+            if (ref >= 0) mna.G(br, ref, -1.0);
+            mna.G(br, ip, -A); mna.G(br, inn, A);
+        }
     }
 }
 
@@ -857,7 +901,7 @@ json spice_simulate(const json& circuit, const json& study) {
     int dim = idx;
     for (const json& d : devices) {
         std::string kind = d.value("kind", std::string());
-        if (kind == "V" || kind == "L" || kind == "E")
+        if (kind == "V" || kind == "L" || kind == "E" || kind == "H" || kind == "OPAMP")
             s.branch_of[d.value("name", std::string())] = dim++;
         else if (kind == "B" && b_src_type(d) == "V")  // behavioral voltage source owns a branch
             s.branch_of[d.value("name", std::string())] = dim++;
@@ -961,7 +1005,8 @@ json spice_simulate(const json& circuit, const json& study) {
             if (kind == "L") {          // ideal short
                 int a = N_of(d, 0), b = N_of(d, 1), br = s.branch_of.at(d.value("name", std::string()));
                 mna.G(a, br, 1.0); mna.G(b, br, -1.0); mna.G(br, a, 1.0); mna.G(br, b, -1.0);
-            } else if (kind == "R" || kind == "V" || kind == "I" || kind == "E" || kind == "G") {
+            } else if (kind == "R" || kind == "V" || kind == "I" || kind == "E" || kind == "G" ||
+                       kind == "F" || kind == "H" || kind == "OPAMP") {
                 stamp_linear(s, mna, d, 0.0, src_scale);
             } else if (kind_is_nonlinear(kind)) {
                 stamp_nonlinear_dc(s, mna, d, x, last_vd);
@@ -1375,6 +1420,40 @@ json spice_simulate(const json& circuit, const json& study) {
                         int op = N(d, 0), on = N(d, 1), cp = N(d, 2), cn = N(d, 3);
                         cd gm(dev_value(d, 1.0), 0.0);
                         G(op, cp, gm); G(op, cn, -gm); G(on, cp, -gm); G(on, cn, gm);
+                    } else if (kind == "F") {
+                        std::string ctrl = params_of(d).value("control", d.value("model", std::string()));
+                        double gain = (d.contains("value") && d["value"].is_number())
+                                          ? d["value"].get<double>() : mp(d, s.models, "gain", 1.0);
+                        int cbr = find_branch(s, ctrl);
+                        if (cbr >= 0) { G(a0, cbr, cd(gain, 0.0)); G(b0, cbr, cd(-gain, 0.0)); }
+                    } else if (kind == "H") {
+                        int br = s.branch_of.at(name);
+                        std::string ctrl = params_of(d).value("control", d.value("model", std::string()));
+                        double r = (d.contains("value") && d["value"].is_number())
+                                       ? d["value"].get<double>() : mp(d, s.models, "gain", 1.0);
+                        G(a0, br, 1.0); G(b0, br, -1.0); G(br, a0, 1.0); G(br, b0, -1.0);
+                        int cbr = find_branch(s, ctrl);
+                        if (cbr >= 0) G(br, cbr, cd(-r, 0.0));
+                    } else if (kind == "OPAMP") {
+                        int ip = N(d, 0), inn = N(d, 1), out = N(d, 2);
+                        int ref = d["nodes"].size() > 3 ? N(d, 3) : -1;
+                        int br = s.branch_of.at(name);
+                        G(out, br, 1.0);
+                        if (ref >= 0) G(ref, br, -1.0);
+                        double gbw = mp(d, s.models, "gbw", 0.0), gain = mp(d, s.models, "gain", 0.0);
+                        if (gbw <= 0.0 && gain <= 0.0) {  // ideal nulling
+                            G(br, ip, 1.0); G(br, inn, -1.0);
+                        } else {
+                            double A0 = gain > 0 ? gain : (gbw > 0 ? gbw : 1e6);
+                            cd Aw(A0, 0.0);
+                            if (gbw > 0 && A0 > 0) {
+                                double wp = 2.0 * kPi * gbw / A0;
+                                Aw = cd(A0, 0.0) / (cd(1.0, 0.0) + cd(0.0, omega / wp));
+                            }
+                            G(br, out, 1.0);
+                            if (ref >= 0) G(br, ref, -1.0);
+                            G(br, ip, -Aw); G(br, inn, Aw);
+                        }
                     } else if (kind == "B") {
                         // Small-signal: keep the FD-Jacobian coupling about x_op, drop the DC offset.
                         auto it = b_expr.find(name);

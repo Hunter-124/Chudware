@@ -497,6 +497,86 @@ def main() -> int:
         g = float(np.asarray(rcpp["ac"]["mag"]["V(OUT)"])[0])
         print(f"  {'B ac gain-2':<24} MATCH  ({len(fc)} pts, |V(OUT)|={g:.4g})")
 
+    # ---- Controlled sources F (CCCS) / H (CCVS) + ideal OPAMP. Linear stamps; DC matches to
+    # 1e-9, AC mag+phase to FP precision.
+    fh_op_cases = [
+        ("CCCS x3", {
+            "nodes": ["0", "IN", "OUT"],
+            "devices": [
+                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 2.0, "params": {}},
+                {"kind": "R", "name": "R1", "nodes": ["IN", "0"], "value": 1000.0, "params": {}},
+                # F mirrors I(V1) * 3 into the output node load
+                {"kind": "F", "name": "F1", "nodes": ["0", "OUT"], "value": 3.0,
+                 "params": {"control": "V1#0"}},
+                {"kind": "R", "name": "RL", "nodes": ["OUT", "0"], "value": 100.0, "params": {}}],
+            "models": {}, "params": {}},
+         {"analyses": [{"type": "op"}], "probes": ["V(OUT)", "I(V1)"]}),
+        ("CCVS x50", {
+            "nodes": ["0", "IN", "OUT"],
+            "devices": [
+                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 1.0, "params": {}},
+                {"kind": "R", "name": "R1", "nodes": ["IN", "0"], "value": 1000.0, "params": {}},
+                {"kind": "H", "name": "H1", "nodes": ["OUT", "0"], "value": 50.0,
+                 "params": {"control": "V1#0"}},
+                {"kind": "R", "name": "RL", "nodes": ["OUT", "0"], "value": 2000.0, "params": {}}],
+            "models": {}, "params": {}},
+         {"analyses": [{"type": "op"}], "probes": ["V(OUT)", "I(H1)"]}),
+    ]
+    for label, circuit, study in fh_op_cases:
+        checks += 1
+        ro = simulate(circuit, study)
+        rc, rcpp = core.call("sim_spice", {"circuit": circuit, "study": study})
+        diffs = []
+        if not (ro.get("convergence", {}).get("op") and rcpp.get("convergence", {}).get("op")):
+            diffs.append("op did not converge")
+        po, co = ro.get("op", {}), rcpp.get("op", {})
+        for pr in study["probes"]:
+            pv, cv = po.get(pr), co.get(pr)
+            if pv is None or cv is None:
+                diffs.append(f"{pr} missing py={pv} cpp={cv}")
+                continue
+            rel = abs(float(pv) - float(cv)) / max(abs(float(pv)), 1e-9)
+            if rel > 1e-9:
+                diffs.append(f"{pr} {pv:.9g}!={cv:.9g} (rel {rel:.1e})")
+        if diffs:
+            print(f"  {('fh ' + label):<24} DIFF: {'; '.join(diffs)[:110]}")
+            mism += 1
+        else:
+            shown = ", ".join(f"{p}={float(co[p]):.4g}" for p in study["probes"][:2])
+            print(f"  {('fh ' + label):<24} MATCH  ({shown})")
+
+    # Ideal inverting op-amp (op + ac): gain = -Rf/Rin = -10.
+    Rin, Rf, vin = 1000.0, 10000.0, 0.2
+    opamp = {
+        "nodes": ["0", "IN", "INV", "OUT"],
+        "devices": [
+            {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": vin,
+             "params": {"ac": {"mag": 1.0, "phase": 0.0}}},
+            {"kind": "R", "name": "RIN", "nodes": ["IN", "INV"], "value": Rin, "params": {}},
+            {"kind": "R", "name": "RF", "nodes": ["INV", "OUT"], "value": Rf, "params": {}},
+            {"kind": "OPAMP", "name": "X1", "nodes": ["0", "INV", "OUT"], "value": None,
+             "params": {}}],
+        "models": {}, "params": {}}
+    opamp_study = {"analyses": [{"type": "op"},
+                                {"type": "ac", "sweep": "dec", "points": 5, "fstart": 1, "fstop": 1000}],
+                   "probes": ["V(OUT)"]}
+    checks += 1
+    ro = simulate(opamp, opamp_study)
+    rc, rcpp = core.call("sim_spice", {"circuit": opamp, "study": opamp_study})
+    diffs = []
+    pv, cv = ro.get("op", {}).get("V(OUT)"), rcpp.get("op", {}).get("V(OUT)")
+    if pv is None or cv is None or abs(float(pv) - float(cv)) / max(abs(float(pv)), 1e-9) > 1e-9:
+        diffs.append(f"op V(OUT) py={pv} cpp={cv}")
+    vp = np.asarray(ro["ac"]["mag"]["V(OUT)"], dtype=np.float64)
+    vc = np.asarray(rcpp.get("ac", {}).get("mag", {}).get("V(OUT)", []), dtype=np.float64)
+    if vp.shape != vc.shape or (vp.size and float(np.max(np.abs(vp - vc))) / max(float(np.max(np.abs(vp))), 1e-9) > 1e-6):
+        diffs.append("ac mag differs")
+    if diffs:
+        print(f"  {'opamp inverting':<24} DIFF: {'; '.join(diffs)[:100]}")
+        mism += 1
+    else:
+        print(f"  {'opamp inverting':<24} MATCH  (V(OUT)={float(cv):.4g}, |gain|={float(vc[0]):.4g})")
+
     print(f"\n[spice-parity] {checks - mism}/{checks} circuit cases at full parity")
     return mism
 

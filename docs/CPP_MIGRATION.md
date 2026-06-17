@@ -149,7 +149,7 @@ exact BRep-volume gate, on canonical host input):
 | **drawing / dxf / pdf / stepplus** | `doc/{drawing,dxf,pdfvec,stepplus}.py` | TODO |
 | **formats (STEP/IGES/STL/…)** | `doc/formats.py`                       | TODO |
 | **ECAD (full)**            | `engine/ecad/*`                           | TODO (epic) |
-| **sim (FEA/CFD/SPICE)**    | `engine/sim/*`                            | TODO (epic; CUDA) |
+| **sim (FEA/CFD/SPICE)**    | `engine/sim/*`                            | STARTED — FEA static+modal (P22/P23, `core/sim/fea_*.cpp`, `cpp_sim_parity` 4/4); SPICE linear DC/tran/AC (P24–P26) + nonlinear DC/tran (P27: Diode/BJT/MOSFET + Newton with gmin- & source-stepping, `core/sim/spice.cpp`, `cpp_spice_parity` 15/15). TODO: SPICE mutual-L (K) / behavioral (B) / subckt / netlist parser; LBM CFD (CUDA); gmsh mesher; host-route the `sim_*` RPCs to the C++ core |
 | **agent / MCP / providers**| `agent/*`, `mcp_server/*`                 | TODO (epic; needs C++ LLM client) |
 
 **Cutover note:** the C++ core now MATCHES on the solid-feature recompile, but

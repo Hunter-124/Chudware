@@ -31,6 +31,7 @@
 #include "doc/validate.h"
 #include "sim/fea_modal.h"
 #include "sim/fea_static.h"
+#include "sim/spice.h"
 
 using nlohmann::json;
 
@@ -212,6 +213,13 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                              {"n_nodes", r.n_nodes},
                              {"n_dof", r.n_dof}},
                         out_json, 0);
+        }
+        if (m == "sim_spice") {
+            // Native MNA circuit sim (engine/sim/circuit.py parity probe; linear DC for
+            // now). Params: {circuit:{...}, study:{...}}. Returns the sim.md result shape.
+            const json& circ = params.contains("circuit") ? params["circuit"] : json::object();
+            const json& study = params.contains("study") ? params["study"] : json::object();
+            return emit(aicad::sim::spice_simulate(circ, study), out_json, 0);
         }
         if (m == "doc_validate") {
             // DIAGNOSTIC: structural-validate a document tree (schema.validate_document

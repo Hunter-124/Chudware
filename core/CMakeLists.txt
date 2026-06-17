@@ -102,10 +102,11 @@ target_include_directories(aicad_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # later layer on top of these correct CPU cores.
 add_library(aicad_sim STATIC
   sim/fea_static.cpp
-  sim/fea_modal.cpp)
+  sim/fea_modal.cpp
+  sim/spice.cpp)
 target_include_directories(aicad_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(aicad_sim PRIVATE ${spectra_SOURCE_DIR}/include)
-target_link_libraries(aicad_sim PUBLIC Eigen3::Eigen)
+target_link_libraries(aicad_sim PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_json)
 
 add_executable(test_sim tests/test_sim.cpp)
 target_include_directories(test_sim PRIVATE ${doctest_SOURCE_DIR})

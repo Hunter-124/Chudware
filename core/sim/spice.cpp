@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <complex>
 #include <map>
 #include <set>
 #include <string>
@@ -138,6 +139,50 @@ void source_breakpoints(const json& d, double tstop, std::set<double>& out) {
             }
         }
     }
+}
+
+// Complex AC excitation (magnitude/phase) of an independent source — devices.py::_ac_phasor.
+std::complex<double> ac_phasor(const json& d) {
+    const json& p = params_of(d);
+    auto from = [](const json& a) {
+        double mag = as_num(a.value("mag", json(1.0)), 1.0);
+        double ph = as_num(a.value("phase", json(0.0)), 0.0) * kPi / 180.0;
+        return std::polar(mag, ph);
+    };
+    if (p.contains("ac") && p["ac"].is_object()) return from(p["ac"]);
+    if (p.contains("waveform") && p["waveform"].is_object() && p["waveform"].contains("ac") &&
+        p["waveform"]["ac"].is_object())
+        return from(p["waveform"]["ac"]);
+    return {0.0, 0.0};
+}
+
+// AC/noise frequency sweep grid (dec/oct/lin) — circuit.py::_freq_grid.
+std::vector<double> freq_grid(const json& an) {
+    std::string sweep = an.value("sweep", std::string("dec"));
+    int points = (int)as_num(an.value("points", json(10)), 10);
+    double fstart = as_num(an.value("fstart", json(1.0)), 1.0);
+    double fstop = as_num(an.value("fstop", json(1e6)), 1e6);
+    if (fstart <= 0.0) fstart = 1.0;
+    std::vector<double> out;
+    auto logspace = [&](double a, double b, int n) {
+        for (int i = 0; i < n; ++i) {
+            double t = n > 1 ? (double)i / (n - 1) : 0.0;
+            out.push_back(std::pow(10.0, a + (b - a) * t));
+        }
+    };
+    if (sweep == "dec") {
+        double ndec = std::log10(fstop / fstart);
+        int nf = std::max(2, (int)std::lround(points * ndec) + 1);
+        logspace(std::log10(fstart), std::log10(fstop), nf);
+    } else if (sweep == "oct") {
+        double noct = std::log2(fstop / fstart);
+        int nf = std::max(2, (int)std::lround(points * noct) + 1);
+        logspace(std::log10(fstart), std::log10(fstop), nf);
+    } else {
+        int n = std::max(2, points);
+        for (int i = 0; i < n; ++i) out.push_back(fstart + (fstop - fstart) * (double)i / (n - 1));
+    }
+    return out;
 }
 
 // Per-reactive-device transient history (uncoupled C / L).
@@ -503,6 +548,104 @@ json spice_simulate(const json& circuit, const json& study) {
             result["tran"] = tr;
             result["convergence"]["tran"] = converged;
             did_tran = true;
+        } else if (atype == "ac") {
+            // ---- linear AC sweep: complex MNA (G + jwC) per frequency ----
+            std::vector<double> freqs = freq_grid(a);
+            std::map<std::string, std::vector<double>> mag, phase;
+            for (const json& pr : probes) { mag[pr.get<std::string>()]; phase[pr.get<std::string>()]; }
+            bool ac_ok = true;
+            using cd = std::complex<double>;
+            auto N = [&](const json& d, int k) {
+                const json& nodes = d["nodes"];
+                return (k < (int)nodes.size()) ? s.n(nodes[k].get<std::string>()) : -1;
+            };
+            for (double f : freqs) {
+                double omega = 2.0 * kPi * f;
+                Eigen::MatrixXcd A = Eigen::MatrixXcd::Zero(dim, dim);
+                Eigen::VectorXcd z = Eigen::VectorXcd::Zero(dim);
+                auto G = [&](int i, int j, cd v) { if (i >= 0 && j >= 0) A(i, j) += v; };
+                auto Iz = [&](int i, cd v) { if (i >= 0) z(i) += v; };
+                if (gmin > 0)
+                    for (int i = 0; i < s.n_nodes; ++i) G(i, i, cd(gmin, 0));
+                for (const json& d : devices) {
+                    std::string kind = d.value("kind", std::string());
+                    std::string name = d.value("name", std::string());
+                    int a0 = N(d, 0), b0 = N(d, 1);
+                    if (kind == "R") {
+                        double r = dev_value(d, 0.0);
+                        if (std::abs(r) < 1e-12) r = 1e-9;
+                        cd g(1.0 / r, 0.0);
+                        G(a0, a0, g); G(b0, b0, g); G(a0, b0, -g); G(b0, a0, -g);
+                    } else if (kind == "C") {
+                        cd y(0.0, omega * dev_value(d, 0.0));
+                        G(a0, a0, y); G(b0, b0, y); G(a0, b0, -y); G(b0, a0, -y);
+                    } else if (kind == "L") {
+                        int br = s.branch_of.at(name);
+                        G(a0, br, 1.0); G(b0, br, -1.0); G(br, a0, 1.0); G(br, b0, -1.0);
+                        G(br, br, cd(0.0, -omega * dev_value(d, 0.0)));  // -jwL
+                    } else if (kind == "V") {
+                        int br = s.branch_of.at(name);
+                        G(a0, br, 1.0); G(b0, br, -1.0); G(br, a0, 1.0); G(br, b0, -1.0);
+                        Iz(br, ac_phasor(d));
+                    } else if (kind == "I") {
+                        cd ph = ac_phasor(d);
+                        Iz(a0, -ph); Iz(b0, ph);
+                    } else if (kind == "E") {
+                        int op = N(d, 0), on = N(d, 1), cp = N(d, 2), cn = N(d, 3), br = s.branch_of.at(name);
+                        cd gain(dev_value(d, 1.0), 0.0);
+                        G(op, br, 1.0); G(on, br, -1.0); G(br, op, 1.0); G(br, on, -1.0);
+                        G(br, cp, -gain); G(br, cn, gain);
+                    } else if (kind == "G") {
+                        int op = N(d, 0), on = N(d, 1), cp = N(d, 2), cn = N(d, 3);
+                        cd gm(dev_value(d, 1.0), 0.0);
+                        G(op, cp, gm); G(op, cn, -gm); G(on, cp, -gm); G(on, cn, gm);
+                    }
+                }
+                Eigen::VectorXcd xv = A.partialPivLu().solve(z);
+                bool fin = xv.allFinite();
+                if (!fin) ac_ok = false;
+                std::vector<cd> xc(dim);
+                for (int i = 0; i < dim; ++i) xc[i] = fin ? xv(i) : cd(0, 0);
+                auto cval = [&](int i) -> cd { return (i < 0 || i >= dim) ? cd(0, 0) : xc[i]; };
+                for (const json& pr : probes) {
+                    std::string p = trim(pr.get<std::string>());
+                    std::string up = upper(p);
+                    cd v(0, 0);
+                    bool got = false;
+                    if (up.rfind("V(", 0) == 0 && p.back() == ')') {
+                        std::string inner = p.substr(2, p.size() - 3);
+                        auto comma = inner.find(',');
+                        if (comma == std::string::npos) {
+                            int i = s.nodeRow(inner);
+                            if (i != -2) { v = cval(i); got = true; }
+                        } else {
+                            v = cval(s.nodeRow(trim(inner.substr(0, comma)))) -
+                                cval(s.nodeRow(trim(inner.substr(comma + 1))));
+                            got = true;
+                        }
+                    } else if (up.rfind("I(", 0) == 0 && p.back() == ')') {
+                        auto bit = s.branch_of.find(trim(p.substr(2, p.size() - 3)));
+                        if (bit != s.branch_of.end()) { v = cval(bit->second); got = true; }
+                    } else {
+                        int i = s.nodeRow(p);
+                        if (i != -2) { v = cval(i); got = true; }
+                    }
+                    if (got && fin) {
+                        mag[pr.get<std::string>()].push_back(std::abs(v));
+                        phase[pr.get<std::string>()].push_back(std::atan2(v.imag(), v.real()) * 180.0 / kPi);
+                    } else {
+                        mag[pr.get<std::string>()].push_back(std::nan(""));
+                        phase[pr.get<std::string>()].push_back(std::nan(""));
+                    }
+                }
+            }
+            json acj = {{"x_f", freqs}, {"mag", json::object()}, {"phase_deg", json::object()}};
+            for (const json& pr : probes) {
+                acj["mag"][pr.get<std::string>()] = mag[pr.get<std::string>()];
+                acj["phase_deg"][pr.get<std::string>()] = phase[pr.get<std::string>()];
+            }
+            result["ac"] = acj;
+            result["convergence"]["ac"] = ac_ok;
         } else {
             result["convergence"][atype] = false;
             log(atype + ": analysis not yet ported to the C++ core (linear DC + transient only)");

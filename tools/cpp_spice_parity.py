@@ -184,6 +184,58 @@ def main() -> int:
             fin = float(np.asarray(rcpp["tran"]["traces"][pr0])[-1])
             print(f"  {('tran ' + label):<24} MATCH  ({len(tc)} pts, {pr0}[-1]={fin:.4g})")
 
+    # ---- AC sweep (complex MNA): RC low-pass + RLC band response. Magnitude + phase across
+    # the whole frequency grid match the Python oracle to FP precision (same complex solve).
+    ac_cases = [
+        ("RC low-pass", {
+            "nodes": ["0", "IN", "OUT"],
+            "devices": [
+                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0,
+                 "params": {"ac": {"mag": 1.0, "phase": 0.0}}},
+                {"kind": "R", "name": "R1", "nodes": ["IN", "OUT"], "value": 1000.0, "params": {}},
+                {"kind": "C", "name": "C1", "nodes": ["OUT", "0"], "value": 1e-6, "params": {}}]},
+         {"analyses": [{"type": "ac", "sweep": "dec", "points": 10, "fstart": 1.0, "fstop": 1e5}],
+          "probes": ["V(OUT)"]}),
+        ("RLC bandpass", {
+            "nodes": ["0", "IN", "MID", "OUT"],
+            "devices": [
+                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0,
+                 "params": {"ac": {"mag": 1.0, "phase": 0.0}}},
+                {"kind": "R", "name": "R1", "nodes": ["IN", "MID"], "value": 50.0, "params": {}},
+                {"kind": "L", "name": "L1", "nodes": ["MID", "OUT"], "value": 1e-3, "params": {}},
+                {"kind": "C", "name": "C1", "nodes": ["OUT", "0"], "value": 1e-6, "params": {}}]},
+         {"analyses": [{"type": "ac", "sweep": "dec", "points": 8, "fstart": 10.0, "fstop": 1e6}],
+          "probes": ["V(OUT)"]}),
+    ]
+    for label, circuit, study in ac_cases:
+        checks += 1
+        ro = simulate(circuit, study)
+        rc, rcpp = core.call("sim_spice", {"circuit": circuit, "study": study})
+        diffs = []
+        if not (ro["convergence"].get("ac") and rcpp.get("convergence", {}).get("ac")):
+            diffs.append("ac did not converge")
+        fp = np.asarray(ro["ac"]["x_f"], dtype=np.float64)
+        fc = np.asarray(rcpp.get("ac", {}).get("x_f", []), dtype=np.float64)
+        if fp.shape != fc.shape:
+            diffs.append(f"freq grid len {fp.shape}!={fc.shape}")
+        else:
+            for pr in study["probes"]:
+                for key in ("mag", "phase_deg"):
+                    vp = np.asarray(ro["ac"][key][pr], dtype=np.float64)
+                    vc = np.asarray(rcpp["ac"][key][pr], dtype=np.float64)
+                    scale = max(float(np.max(np.abs(vp))), 1e-9)
+                    dmax = float(np.max(np.abs(vp - vc)))
+                    if dmax / scale > 1e-6:
+                        diffs.append(f"{pr}.{key} max|d|={dmax:.2e}")
+        if diffs:
+            print(f"  {('ac ' + label):<24} DIFF: {'; '.join(diffs)[:100]}")
+            mism += 1
+        else:
+            # report the -3dB point for the RC case
+            mags = np.asarray(rcpp["ac"]["mag"][study["probes"][0]])
+            i3 = int(np.argmin(np.abs(mags - 0.70710678)))
+            print(f"  {('ac ' + label):<24} MATCH  ({len(fc)} pts, ~-3dB @ {fc[i3]:.0f} Hz)")
+
     print(f"\n[spice-parity] {checks - mism}/{checks} circuit cases at full parity")
     return mism
 

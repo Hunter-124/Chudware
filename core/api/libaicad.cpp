@@ -27,6 +27,7 @@
 #include <nlohmann/json.hpp>
 
 #include "doc/document.h"
+#include "doc/session.h"
 
 using nlohmann::json;
 
@@ -146,6 +147,38 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
         }
         if (m == "doc_compile_cpp") {
             return handle_compile(params, out_json);
+        }
+        // --- stateful document session RPCs (aicad::doc::session) ---------------
+        // Each returns the host's ops-response JSON. An OpError becomes a nonzero
+        // return carrying the {code,message,detail} envelope (so the host can treat
+        // it as a structured error / fall back to Python).
+        try {
+            if (m == "doc_new")
+                return emit(aicad::doc::doc_new(params.value("kind", std::string("part")),
+                                                params.value("name", std::string())),
+                            out_json, 0);
+            if (m == "doc_apply_ops")
+                return emit(aicad::doc::doc_apply_ops(
+                                params.value("doc_id", std::string()),
+                                params.contains("base_revision") && params["base_revision"].is_number()
+                                    ? params["base_revision"].get<long>() : -1,
+                                params.contains("ops") ? params["ops"] : json::array(),
+                                params.value("coalesce", false)),
+                            out_json, 0);
+            if (m == "doc_undo")
+                return emit(aicad::doc::doc_undo(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "doc_redo")
+                return emit(aicad::doc::doc_redo(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "doc_tree")
+                return emit(aicad::doc::doc_tree(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "doc_rebuild")
+                return emit(aicad::doc::doc_rebuild(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "doc_close")
+                return emit(json{{"closed", aicad::doc::doc_close(params.value("doc_id", std::string()))}},
+                            out_json, 0);
+        } catch (const aicad::doc::OpError& oe) {
+            // Structured error envelope (matches the Python worker's doc_* errors).
+            return emit(oe.envelope(), out_json, 3);
         }
         // Unknown to the C++ core -> nonzero so the host falls back to Python.
         return emit(json{{"error", "unknown method: " + m}}, out_json, 2);

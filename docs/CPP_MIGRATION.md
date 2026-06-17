@@ -111,7 +111,7 @@ exact BRep-volume gate, on canonical host input):
 
 | Feature / subsystem        | Python                                  | Status |
 |----------------------------|------------------------------------------|--------|
-| **doc session / ops / undo** | `doc/session.py`, `document.py`         | TODO — the stateful layer needed before `doc_new`/`doc_apply_ops`/`doc_undo` cut over (today only the diagnostic `doc_compile_cpp` recompile path exists) |
+| **doc session / ops / undo** | `doc/session.py`, `doc/ops.py`        | STARTED — `core/doc/session.{h,cpp}` ports DocSession + the core op vocabulary; `libaicad` serves `doc_new`/`doc_apply_ops`/`doc_undo`/`doc_redo`/`doc_tree`/`doc_rebuild`/`doc_close`. `tools/cpp_session_parity.py` 5/5 (add/edit/undo/redo/stale_revision) vs Python session. **Remaining:** advanced sketch ops (trim/fillet/offset/mirror/pattern/convert), assembly ops, configurations, copy/paste/derived, full `validate_document`, `owner_map` topology, rollback-bar compile. The C++ session deliberately does NOT reproduce the Python session's compile-cache region quirk (editing a downstream depth leaves the profile dangling) — it always recompiles, which is the SolidWorks-correct behavior. |
 | **sheet metal**            | `features/sheetmetal*.py`                 | TODO (epic) |
 | **surfacing (12 ops)**     | `features/surf_*.py`                       | TODO (epic) |
 | **datums / curves (rest)** | `features/datum.py`, `curves.py`          | TODO (axis/point/csys/3-pt plane, projected curves) |

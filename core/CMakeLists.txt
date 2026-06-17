@@ -272,7 +272,8 @@ if(AICAD_WITH_OCCT)
   add_library(aicad_doc STATIC
     doc/document.cpp
     doc/selectors.cpp
-    doc/picks.cpp)
+    doc/picks.cpp
+    doc/session.cpp)
   target_include_directories(aicad_doc PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})

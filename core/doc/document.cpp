@@ -427,6 +427,14 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         st.id = id;
         st.type = type;
 
+        // A SUPPRESSED feature contributes no geometry but is OK (mirrors the Python
+        // compiler: status ok, no body, topology unchanged). Skip it cleanly.
+        if (raw.value("suppressed", false) || feat.value("suppressed", false)) {
+            st.ok = true;
+            result.statuses.push_back(std::move(st));
+            continue;
+        }
+
         // Per-feature compile wrapped so an OCCT/eval throw becomes an error status,
         // never a crash (compile_document never-raises contract).
         try {

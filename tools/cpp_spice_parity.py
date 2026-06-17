@@ -414,6 +414,89 @@ def main() -> int:
     else:
         print(f"  {'K ac transformer':<24} MATCH  ({len(fc)} pts)")
 
+    # ---- Behavioral sources (B): nonlinear V/I expressions. Both engines run the same Newton
+    # loop with an identical central-difference Jacobian over the controlling rows, so the
+    # converged DC point matches tightly (1e-6 rel). AC linearizes about the op point.
+    b_op_cases = [
+        ("B-V squarer", {
+            "nodes": ["0", "IN", "OUT"],
+            "devices": [
+                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 2.0, "params": {}},
+                {"kind": "B", "name": "B1", "nodes": ["OUT", "0"], "value": None,
+                 "params": {"btype": "V", "expr": "V(IN)*V(IN)"}},
+                {"kind": "R", "name": "RL", "nodes": ["OUT", "0"], "value": 1000.0, "params": {}}],
+            "models": {}, "params": {}},
+         {"analyses": [{"type": "op"}], "probes": ["V(OUT)"]}),
+        ("B-I behavioral diode", {
+            "nodes": ["0", "IN", "A"],
+            "devices": [
+                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 5.0, "params": {}},
+                {"kind": "R", "name": "R1", "nodes": ["IN", "A"], "value": 1000.0, "params": {}},
+                {"kind": "B", "name": "B1", "nodes": ["A", "0"], "value": None,
+                 "params": {"btype": "I", "expr": "1e-9*(exp(V(A)/0.025852)-1)"}}],
+            "models": {}, "params": {}},
+         {"analyses": [{"type": "op"}], "probes": ["V(A)"]}),
+    ]
+    for label, circuit, study in b_op_cases:
+        checks += 1
+        ro = simulate(circuit, study)
+        rc, rcpp = core.call("sim_spice", {"circuit": circuit, "study": study})
+        diffs = []
+        if not (ro.get("convergence", {}).get("op") and rcpp.get("convergence", {}).get("op")):
+            diffs.append(f"convergence op py={ro.get('convergence')} cpp={rcpp.get('convergence')}")
+        po, co = ro.get("op", {}), rcpp.get("op", {})
+        for pr in study["probes"]:
+            pv, cv = po.get(pr), co.get(pr)
+            if pv is None or cv is None:
+                diffs.append(f"{pr} missing py={pv} cpp={cv}")
+                continue
+            rel = abs(float(pv) - float(cv)) / max(abs(float(pv)), 1e-9)
+            if rel > 1e-6:
+                diffs.append(f"{pr} {pv:.9g}!={cv:.9g} (rel {rel:.1e})")
+        if diffs:
+            print(f"  {('B ' + label):<24} DIFF: {'; '.join(diffs)[:110]}")
+            mism += 1
+        else:
+            shown = ", ".join(f"{p}={float(co[p]):.4g}" for p in study["probes"][:2])
+            print(f"  {('B ' + label):<24} MATCH  ({shown})")
+
+    # B-V AC: linear V=2*V(IN) behaves as a gain-2 VCVS; |V(OUT)| flat at 2 across the band.
+    b_ac = {
+        "nodes": ["0", "IN", "OUT"],
+        "devices": [
+            {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0,
+             "params": {"ac": {"mag": 1.0, "phase": 0.0}}},
+            {"kind": "B", "name": "B1", "nodes": ["OUT", "0"], "value": None,
+             "params": {"btype": "V", "expr": "2*V(IN)"}},
+            {"kind": "R", "name": "RL", "nodes": ["OUT", "0"], "value": 1000.0, "params": {}}],
+        "models": {}, "params": {}}
+    b_ac_study = {"analyses": [{"type": "ac", "sweep": "dec", "points": 5, "fstart": 1.0,
+                                "fstop": 1e4}], "probes": ["V(OUT)"]}
+    checks += 1
+    ro = simulate(b_ac, b_ac_study)
+    rc, rcpp = core.call("sim_spice", {"circuit": b_ac, "study": b_ac_study})
+    diffs = []
+    if not (ro["convergence"].get("ac") and rcpp.get("convergence", {}).get("ac")):
+        diffs.append("ac did not converge")
+    fp = np.asarray(ro["ac"]["x_f"], dtype=np.float64)
+    fc = np.asarray(rcpp.get("ac", {}).get("x_f", []), dtype=np.float64)
+    if fp.shape != fc.shape:
+        diffs.append(f"freq grid len {fp.shape}!={fc.shape}")
+    else:
+        for key in ("mag", "phase_deg"):
+            vp = np.asarray(ro["ac"][key]["V(OUT)"], dtype=np.float64)
+            vc = np.asarray(rcpp["ac"][key]["V(OUT)"], dtype=np.float64)
+            scale = max(float(np.max(np.abs(vp))), 1e-9)
+            dmax = float(np.max(np.abs(vp - vc)))
+            if dmax / scale > 1e-6:
+                diffs.append(f"V(OUT).{key} max|d|={dmax:.2e}")
+    if diffs:
+        print(f"  {'B ac gain-2':<24} DIFF: {'; '.join(diffs)[:100]}")
+        mism += 1
+    else:
+        g = float(np.asarray(rcpp["ac"]["mag"]["V(OUT)"])[0])
+        print(f"  {'B ac gain-2':<24} MATCH  ({len(fc)} pts, |V(OUT)|={g:.4g})")
+
     print(f"\n[spice-parity] {checks - mism}/{checks} circuit cases at full parity")
     return mism
 

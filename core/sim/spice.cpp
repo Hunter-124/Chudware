@@ -16,7 +16,9 @@
 #include <cctype>
 #include <cmath>
 #include <complex>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <map>
 #include <set>
 #include <string>
@@ -516,6 +518,276 @@ void stamp_nonlinear_dc(const Setup& s, Mna& mna, const json& d, const std::vect
     else if (kind == "M") stamp_mosfet_dc(s, mna, d, x);
 }
 
+// ---- behavioral source expression evaluator (B) — devices.py::_SafeExpr ----------------
+// A safe recursive-descent evaluator for the whitelisted grammar: numeric literals, parens,
+// unary +/-, binary + - * / ** (^ aliased to **), the math functions sin/cos/tan/exp/log/ln/
+// sqrt/abs/tanh/min/max/pow (radians, SPICE convention), the tokens time/t/pi/e, and the probe
+// calls V(node), V(a,b), I(name). Precedence + associativity match CPython's grammar
+// (** right-assoc and binds tighter than unary minus on its left). Dependencies are recorded so
+// the Behavioral device can build its finite-difference Jacobian over exactly the rows it reads.
+
+struct BEnv {
+    std::function<double(const std::string&)> v_node;
+    std::function<double(const std::string&, const std::string&)> v_pair;
+    std::function<double(const std::string&)> i_src;
+    double time = 0.0;
+};
+
+struct SafeExpr {
+    bool ok = false;
+    std::string err;
+    std::vector<std::string> v_nodes;
+    std::vector<std::pair<std::string, std::string>> v_pairs;
+    std::vector<std::string> i_srcs;
+    bool uses_time = false;
+    std::function<double(const BEnv&)> fn;
+
+    // -- tokenizer --
+    struct Tok { int kind; std::string text; double num; };  // kind: 0 num, 1 ident, 2 op, 3 end
+    std::vector<Tok> toks;
+    std::size_t ti = 0;
+
+    explicit SafeExpr(const std::string& expr) {
+        if (!tokenize(expr)) return;
+        fn = parseExpr();
+        if (!err.empty()) { fn = nullptr; return; }
+        if (toks[ti].kind != 3) { err = "trailing tokens"; fn = nullptr; return; }
+        ok = true;
+    }
+
+    bool tokenize(const std::string& e) {
+        std::size_t i = 0;
+        while (i < e.size()) {
+            char c = e[i];
+            if (std::isspace((unsigned char)c)) { ++i; continue; }
+            if (std::isdigit((unsigned char)c) || c == '.') {
+                std::size_t j = i;
+                while (j < e.size() && (std::isdigit((unsigned char)e[j]) || e[j] == '.')) ++j;
+                if (j < e.size() && (e[j] == 'e' || e[j] == 'E')) {
+                    ++j;
+                    if (j < e.size() && (e[j] == '+' || e[j] == '-')) ++j;
+                    while (j < e.size() && std::isdigit((unsigned char)e[j])) ++j;
+                }
+                toks.push_back({0, "", std::stod(e.substr(i, j - i))});
+                i = j;
+            } else if (std::isalpha((unsigned char)c) || c == '_') {
+                std::size_t j = i;
+                while (j < e.size() && (std::isalnum((unsigned char)e[j]) || e[j] == '_')) ++j;
+                toks.push_back({1, e.substr(i, j - i), 0.0});
+                i = j;
+            } else if (c == '*' && i + 1 < e.size() && e[i + 1] == '*') {
+                toks.push_back({2, "**", 0.0}); i += 2;
+            } else if (c == '^') {
+                toks.push_back({2, "**", 0.0}); ++i;
+            } else if (std::string("+-*/(),").find(c) != std::string::npos) {
+                toks.push_back({2, std::string(1, c), 0.0}); ++i;
+            } else {
+                err = std::string("bad char '") + c + "'";
+                return false;
+            }
+        }
+        toks.push_back({3, "", 0.0});
+        return true;
+    }
+
+    const Tok& cur() { return toks[ti]; }
+    bool isOp(const char* o) { return cur().kind == 2 && cur().text == o; }
+
+    using F = std::function<double(const BEnv&)>;
+
+    F parseExpr() { return parseAddSub(); }
+
+    F parseAddSub() {
+        F left = parseMulDiv();
+        while (!err.empty() ? false : (isOp("+") || isOp("-"))) {
+            std::string op = cur().text; ++ti;
+            F right = parseMulDiv();
+            if (op == "+") left = [l = left, r = right](const BEnv& e) { return l(e) + r(e); };
+            else left = [l = left, r = right](const BEnv& e) { return l(e) - r(e); };
+        }
+        return left;
+    }
+    F parseMulDiv() {
+        F left = parseFactor();
+        while (err.empty() && (isOp("*") || isOp("/"))) {
+            std::string op = cur().text; ++ti;
+            F right = parseFactor();
+            if (op == "*") left = [l = left, r = right](const BEnv& e) { return l(e) * r(e); };
+            else left = [l = left, r = right](const BEnv& e) {
+                double a = l(e), b = r(e);
+                if (b == 0.0) return a != 0.0 ? a / 1e-30 : 0.0;  // ZeroDivision guard (devices.py)
+                return a / b;
+            };
+        }
+        return left;
+    }
+    F parseFactor() {
+        if (isOp("+")) { ++ti; return parseFactor(); }
+        if (isOp("-")) { ++ti; F o = parseFactor(); return [o](const BEnv& e) { return -o(e); }; }
+        return parsePower();
+    }
+    F parsePower() {
+        F base = parsePrimary();
+        if (isOp("**")) {
+            ++ti;
+            F exp = parseFactor();  // right operand allows unary -> right-assoc
+            return [base, exp](const BEnv& e) { return std::pow(base(e), exp(e)); };
+        }
+        return base;
+    }
+    F parsePrimary() {
+        const Tok& t = cur();
+        if (t.kind == 0) { double v = t.num; ++ti; return [v](const BEnv&) { return v; }; }
+        if (isOp("(")) {
+            ++ti;
+            F inner = parseExpr();
+            if (!isOp(")")) { if (err.empty()) err = "expected ')'"; return nullptr; }
+            ++ti;
+            return inner;
+        }
+        if (t.kind == 1) {
+            std::string name = t.text; ++ti;
+            if (isOp("(")) return parseCall(name);
+            if (name == "time" || name == "t") { uses_time = true; return [](const BEnv& e) { return e.time; }; }
+            if (name == "pi") return [](const BEnv&) { return kPi; };
+            if (name == "e") return [](const BEnv&) { return std::exp(1.0); };
+            err = "unknown name '" + name + "'";
+            return nullptr;
+        }
+        err = "unexpected token";
+        return nullptr;
+    }
+    // Parse the argument of a probe: a bare ident or a numeric node label.
+    std::string probeArg() {
+        const Tok& t = cur();
+        if (t.kind == 1) { std::string n = t.text; ++ti; return n; }
+        if (t.kind == 0) {
+            double v = t.num; ++ti;
+            if (v == std::floor(v)) return std::to_string((long long)v);
+            std::string s = std::to_string(v); return s;
+        }
+        err = "bad probe argument";
+        return "";
+    }
+    F parseCall(const std::string& name) {
+        ++ti;  // consume '('
+        if (name == "V") {
+            std::string a = probeArg();
+            if (isOp(",")) {
+                ++ti;
+                std::string b = probeArg();
+                if (!isOp(")")) { if (err.empty()) err = "expected ')'"; return nullptr; }
+                ++ti;
+                v_pairs.push_back({a, b});
+                return [a, b](const BEnv& e) { return e.v_pair(a, b); };
+            }
+            if (!isOp(")")) { if (err.empty()) err = "expected ')'"; return nullptr; }
+            ++ti;
+            v_nodes.push_back(a);
+            return [a](const BEnv& e) { return e.v_node(a); };
+        }
+        if (name == "I") {
+            std::string a = probeArg();
+            if (!isOp(")")) { if (err.empty()) err = "expected ')'"; return nullptr; }
+            ++ti;
+            i_srcs.push_back(a);
+            return [a](const BEnv& e) { return e.i_src(a); };
+        }
+        // math functions
+        std::vector<F> args;
+        if (!isOp(")")) {
+            args.push_back(parseExpr());
+            while (isOp(",")) { ++ti; args.push_back(parseExpr()); }
+        }
+        if (!isOp(")")) { if (err.empty()) err = "expected ')'"; return nullptr; }
+        ++ti;
+        auto one = [&](double (*f)(double)) -> F {
+            if (args.size() != 1) { err = name + " takes 1 arg"; return nullptr; }
+            F a = args[0]; return [a, f](const BEnv& e) { return f(a(e)); };
+        };
+        if (name == "sin") return one([](double v) { return std::sin(v); });
+        if (name == "cos") return one([](double v) { return std::cos(v); });
+        if (name == "tan") return one([](double v) { return std::tan(v); });
+        if (name == "exp") return one([](double v) { return std::exp(v); });
+        if (name == "log" || name == "ln") return one([](double v) { return std::log(v); });
+        if (name == "sqrt") return one([](double v) { return std::sqrt(v); });
+        if (name == "abs") return one([](double v) { return std::fabs(v); });
+        if (name == "tanh") return one([](double v) { return std::tanh(v); });
+        if (name == "min" || name == "max" || name == "pow") {
+            if (args.size() != 2) { err = name + " takes 2 args"; return nullptr; }
+            F a = args[0], b = args[1];
+            if (name == "min") return [a, b](const BEnv& e) { return std::min(a(e), b(e)); };
+            if (name == "max") return [a, b](const BEnv& e) { return std::max(a(e), b(e)); };
+            return [a, b](const BEnv& e) { return std::pow(a(e), b(e)); };
+        }
+        err = "unknown function '" + name + "'";
+        return nullptr;
+    }
+};
+
+std::string b_src_type(const json& d) {
+    std::string bt = upper(params_of(d).value("btype", std::string("V")));
+    return bt == "I" ? "I" : "V";
+}
+
+double eval_b(const SafeExpr& sx, const Setup& s, const std::vector<double>& x, double t) {
+    BEnv env;
+    env.v_node = [&](const std::string& nm) { return xat(x, s.n(nm)); };
+    env.v_pair = [&](const std::string& a, const std::string& b) { return xat(x, s.n(a)) - xat(x, s.n(b)); };
+    env.i_src = [&](const std::string& sn) {
+        auto it = s.branch_of.find(sn);
+        return it != s.branch_of.end() ? xat(x, it->second) : 0.0;
+    };
+    env.time = t;
+    return sx.fn(env);
+}
+
+// Controlling matrix rows the B expression reads (node rows + branch rows), de-duplicated,
+// ground dropped — devices.py::Behavioral._ctrl_rows.
+std::vector<int> b_ctrl_rows(const SafeExpr& sx, const Setup& s) {
+    std::vector<int> rows;
+    std::set<int> seen;
+    auto add = [&](int r) { if (r >= 0 && !seen.count(r)) { seen.insert(r); rows.push_back(r); } };
+    for (const auto& nm : sx.v_nodes) add(s.n(nm));
+    for (const auto& pr : sx.v_pairs) { add(s.n(pr.first)); add(s.n(pr.second)); }
+    for (const auto& sn : sx.i_srcs) {
+        auto it = s.branch_of.find(sn);
+        if (it != s.branch_of.end()) add(it->second);
+    }
+    return rows;
+}
+
+// Newton companion of a behavioral V=/I= source (DC + transient) — Behavioral._stamp_companion.
+void stamp_behavioral(const Setup& s, Mna& mna, const json& d, const std::vector<double>& x,
+                      double t, const SafeExpr& sx, const std::string& src_type) {
+    const json& nodes = d["nodes"];
+    int op = s.n(nodes[0].get<std::string>()), on = s.n(nodes[1].get<std::string>());
+    std::vector<int> rows = b_ctrl_rows(sx, s);
+    double f0 = eval_b(sx, s, x, t);
+    std::map<int, double> partials;
+    std::vector<double> xv = x;
+    for (int r : rows) {
+        double x0 = xv[r];
+        double h = 1e-6 * std::abs(x0) + 1e-9;
+        xv[r] = x0 + h; double fp = eval_b(sx, s, xv, t);
+        xv[r] = x0 - h; double fm = eval_b(sx, s, xv, t);
+        xv[r] = x0;
+        partials[r] = (fp - fm) / (2.0 * h);
+    }
+    double offset = f0;
+    for (const auto& kv : partials) offset -= kv.second * xat(x, kv.first);
+    if (src_type == "V") {
+        int br = s.branch_of.at(d.value("name", std::string()));
+        mna.G(op, br, 1.0); mna.G(on, br, -1.0);
+        mna.G(br, op, 1.0); mna.G(br, on, -1.0);
+        for (const auto& kv : partials) mna.G(br, kv.first, -kv.second);
+        mna.I(br, offset);
+    } else {  // I = f(x)
+        for (const auto& kv : partials) { mna.G(op, kv.first, kv.second); mna.G(on, kv.first, -kv.second); }
+        mna.I(op, -offset); mna.I(on, offset);
+    }
+}
+
 // Probe evaluation (V(node)/V(a,b)/I(name)) — circuit.py::_eval_probe.
 json eval_probe(const Setup& s, const std::vector<double>& x, const std::string& probe) {
     auto val = [&](int i) -> double { return (i < 0 || i >= (int)x.size()) ? 0.0 : x[i]; };
@@ -587,6 +859,8 @@ json spice_simulate(const json& circuit, const json& study) {
         std::string kind = d.value("kind", std::string());
         if (kind == "V" || kind == "L" || kind == "E")
             s.branch_of[d.value("name", std::string())] = dim++;
+        else if (kind == "B" && b_src_type(d) == "V")  // behavioral voltage source owns a branch
+            s.branch_of[d.value("name", std::string())] = dim++;
     }
     s.dim = dim;
 
@@ -604,9 +878,25 @@ json spice_simulate(const json& circuit, const json& study) {
     s.vntol = as_num(options.value("vntol", json(1e-6)), 1e-6);
     s.maxiter = (int)as_num(options.value("maxiter", json(100)), 100);
 
+    // Behavioral (B) expression parse cache (parsed once per device, like devices.py). A B with a
+    // malformed expression is treated as unbuildable (error surfaced via the DC stamp path).
+    std::map<std::string, std::shared_ptr<SafeExpr>> b_expr;
+    std::string b_build_err;
+    for (const json& d : devices) {
+        if (d.value("kind", std::string()) != "B") continue;
+        std::string name = d.value("name", std::string());
+        std::string expr = params_of(d).value("expr", std::string());
+        if (expr.empty()) { b_build_err = name + ": behavioral source needs V=/I= expression"; continue; }
+        auto sx = std::make_shared<SafeExpr>(expr);
+        if (!sx->ok) { b_build_err = name + ": " + sx->err; continue; }
+        b_expr[name] = sx;
+    }
+
     bool has_nonlinear = false;
-    for (const json& d : devices)
-        if (kind_is_nonlinear(d.value("kind", std::string()))) has_nonlinear = true;
+    for (const json& d : devices) {
+        std::string kind = d.value("kind", std::string());
+        if (kind_is_nonlinear(kind) || kind == "B") has_nonlinear = true;
+    }
 
     // Mutual-inductance couplings from K cards (devices.py::KCoupling.link). Each K names two
     // inductors + a coefficient k; M = k*sqrt(L1*L2) registered on BOTH inductors so each
@@ -675,6 +965,11 @@ json spice_simulate(const json& circuit, const json& study) {
                 stamp_linear(s, mna, d, 0.0, src_scale);
             } else if (kind_is_nonlinear(kind)) {
                 stamp_nonlinear_dc(s, mna, d, x, last_vd);
+            } else if (kind == "B") {
+                std::string name = d.value("name", std::string());
+                auto it = b_expr.find(name);
+                if (it == b_expr.end()) return b_build_err.empty() ? (name + ": behavioral build failed") : b_build_err;
+                stamp_behavioral(s, mna, d, x, 0.0, *it->second, b_src_type(d));
             } else {
                 return "device kind '" + kind + "' not yet ported to the C++ DC core";
             }
@@ -894,6 +1189,10 @@ json spice_simulate(const json& circuit, const json& study) {
                                 mna.I(a0, ieq); mna.I(b0, -ieq);
                             }
                         }
+                    } else if (kind == "B") {
+                        auto it = b_expr.find(name);
+                        if (it != b_expr.end())
+                            stamp_behavioral(s, mna, d, xw, t, *it->second, b_src_type(d));
                     } else {
                         stamp_linear(s, mna, d, t, no_scale);  // R/V/I/E/G at time t
                     }
@@ -1076,6 +1375,32 @@ json spice_simulate(const json& circuit, const json& study) {
                         int op = N(d, 0), on = N(d, 1), cp = N(d, 2), cn = N(d, 3);
                         cd gm(dev_value(d, 1.0), 0.0);
                         G(op, cp, gm); G(op, cn, -gm); G(on, cp, -gm); G(on, cn, gm);
+                    } else if (kind == "B") {
+                        // Small-signal: keep the FD-Jacobian coupling about x_op, drop the DC offset.
+                        auto it = b_expr.find(name);
+                        if (it != b_expr.end()) {
+                            const SafeExpr& sx = *it->second;
+                            std::vector<int> rows = b_ctrl_rows(sx, s);
+                            std::vector<double> xv = x_op;
+                            std::map<int, double> partials;
+                            for (int r : rows) {
+                                double x0 = xv[r], h = 1e-6 * std::abs(x0) + 1e-9;
+                                xv[r] = x0 + h; double fp = eval_b(sx, s, xv, 0.0);
+                                xv[r] = x0 - h; double fm = eval_b(sx, s, xv, 0.0);
+                                xv[r] = x0;
+                                partials[r] = (fp - fm) / (2.0 * h);
+                            }
+                            if (b_src_type(d) == "V") {
+                                int br = s.branch_of.at(name);
+                                G(a0, br, 1.0); G(b0, br, -1.0); G(br, a0, 1.0); G(br, b0, -1.0);
+                                for (const auto& kv : partials) G(br, kv.first, cd(-kv.second, 0.0));
+                            } else {
+                                for (const auto& kv : partials) {
+                                    G(a0, kv.first, cd(kv.second, 0.0));
+                                    G(b0, kv.first, cd(-kv.second, 0.0));
+                                }
+                            }
+                        }
                     }
                 }
                 Eigen::VectorXcd xv = A.partialPivLu().solve(z);

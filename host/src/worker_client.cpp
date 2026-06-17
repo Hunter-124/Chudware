@@ -18,9 +18,26 @@ namespace {
 // to the C++ core too — the id prefix IS the commit-at-doc_new marker, giving an
 // all-or-nothing-per-document cutover with no separate routing state. Flag OFF (default)
 // is byte-for-byte today's behavior: every call goes to the Python worker.
+// The C++ core is now the DEFAULT engine for new PART documents. Set AI_CAD_CPP_DOCS=0
+// to force the legacy Python worker for everything (the pre-cutover behavior).
 bool cppDocsFlag() {
     const char* f = std::getenv("AI_CAD_CPP_DOCS");
-    return f && f[0] && f[0] != '0';
+    if (f && f[0]) return f[0] != '0';  // explicit override (1=on, 0=off)
+    return true;                        // default: route new parts to the C++ core
+}
+
+// Methods that MINT a new document (vs. operate on an existing one). For these the C++
+// core has not created a session yet when it reports "unsupported", so the host can
+// safely fall back to the Python worker (no mid-document engine switch).
+bool isMintingMethod(const std::string& method, const json& params) {
+    if (method == "doc_new" || method == "doc_open") return true;
+    if (method == "import_file") {
+        auto into = params.is_object() ? params.find("into") : params.end();
+        const bool hasInto = params.is_object() && into != params.end() && into->is_string() &&
+                             !into->get<std::string>().empty();
+        return !hasInto;  // import into a NEW doc mints; import into an existing doc does not
+    }
+    return false;
 }
 bool routeDocToCpp(const std::string& method, const json& params) {
     if (method == "doc_compile_cpp" || method == "doc_validate") return false;  // diagnostics
@@ -39,16 +56,19 @@ bool routeDocToCpp(const std::string& method, const json& params) {
                 return true;
         }
     }
-    // doc_new / doc_open / import_file (no `into`) MINT a fresh doc -> route to C++ only
-    // when the flag is set. import_file with `into` set is handled by the prefix check
-    // above (it appends to whichever engine owns that doc).
-    if ((method == "doc_new" || method == "doc_open") && cppDocsFlag()) return true;
-    if (method == "import_file" && cppDocsFlag()) {
-        auto into = params.is_object() ? params.find("into") : params.end();
-        const bool hasInto = into != params.end() && into->is_string() &&
-                             !into->get<std::string>().empty();
-        if (!hasInto) return true;  // minting a new doc
+    // doc_new / doc_open / import_file (no `into`) MINT a fresh doc -> route to C++ when
+    // the flag is on. The C++ core handles only PART documents, so a doc_new that names
+    // an assembly stays on Python; a doc_open of a non-part container is detected by the
+    // core (code "unsupported") and falls back below. import_file with `into` is handled
+    // by the prefix check above (it appends to whichever engine owns that doc).
+    if (!cppDocsFlag()) return false;
+    if (method == "doc_new") {
+        const std::string kind = params.is_object() ? params.value("kind", std::string("part"))
+                                                     : std::string("part");
+        return kind.empty() || kind == "part";
     }
+    if (method == "doc_open") return true;  // core rejects non-parts -> host falls back
+    if (isMintingMethod(method, params)) return true;  // import_file minting a new doc
     return false;
 }
 std::wstring widen(const std::string& s) {
@@ -210,21 +230,30 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
     // never created this doc), so an unported method surfaces a clear error rather than
     // silently misrouting. The diagnostic parity probe in doc_mirror is unaffected.
     if (routeDocToCpp(method, params)) {
+        const bool minting = isMintingMethod(method, params);
         std::string cerr;
         if (core::cpp_core().call(method, params, result, cerr))
             return true;  // handled (aicad_call rc==0); `result` holds the ops-response
-        // Nonzero rc: a structured OpError carries {code,message,detail} in `result` —
-        // mirror the Python structured-error contract (round-trip OK, method reported an
-        // error: return true so doc_mirror reads result["code"]).
+        // Nonzero rc: a structured OpError carries {code,message,detail} in `result`.
         if (result.is_object() && result.contains("code")) {
-            err = result.value("message", std::string("cpp-core error"));
-            return true;
+            // A MINTING call the core declined as "unsupported" (e.g. doc_open of an
+            // assembly container) created no C++ doc — fall back to the Python worker
+            // instead of surfacing the error (no mid-document engine switch happens).
+            if (!(minting && result.value("code", std::string()) == "unsupported")) {
+                err = result.value("message", std::string("cpp-core error"));
+                return true;  // structured error reported (round-trip OK)
+            }
+            // else: fall through to the Python worker path below
+        } else if (!minting) {
+            // Hard failure (DLL missing / a throw) on a call bound to an EXISTING C++
+            // doc — there is no Python doc to fall back to, so fail loudly.
+            err = "cpp-core (" + method + "): " + cerr;
+            if (errorSink_) errorSink_(method, err);
+            return false;
         }
-        // Hard failure (method not ported to C++, DLL missing, or a throw). There is no
-        // Python doc to fall back to, so fail loudly.
-        err = "cpp-core (" + method + "): " + cerr;
-        if (errorSink_) errorSink_(method, err);
-        return false;
+        // Minting-call fallback: the core could not mint this doc (unsupported kind or
+        // the core DLL is unavailable) — continue to the Python worker path below so
+        // document creation never hard-breaks when C++ is the default engine.
     }
     if (!running_) {
         err = "worker not started";

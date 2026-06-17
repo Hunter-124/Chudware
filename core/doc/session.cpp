@@ -1620,6 +1620,18 @@ json doc_open(const std::string& path) {
     std::lock_guard<std::mutex> lk(g_mtx);
     StepPlusDoc loaded = stepplus_open(path);  // throws OpError on a bad file
 
+    // Only PART documents are handled by the C++ core. A non-part container (e.g. an
+    // assembly) is rejected BEFORE a session is created — code "unsupported" — so the
+    // host's minting-call fallback can route the open to the Python worker instead (no
+    // C++ doc exists yet, so the fallback is clean / not a mid-doc switch).
+    const std::string schema =
+        loaded.doc.is_object() ? loaded.doc.value("schema", std::string()) : std::string();
+    if (!schema.empty() && schema != "aicad.part/1")
+        throw OpError("unsupported",
+                      "doc_open: the C++ core handles only part documents (got schema '" +
+                          schema + "')",
+                      {{"schema", schema}, {"reason", "unsupported document kind"}});
+
     Session s;
     s.doc_id = new_doc_id();
     s.doc = std::move(loaded.doc);

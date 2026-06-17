@@ -414,11 +414,13 @@ private:
     void addPolyLoop(AppState& st, const std::vector<ImVec2>& corners, bool equalEdges);
     // C51: emit a straight slot as REAL geometry — 2 side lines + 2 cap arcs + 1 construction
     // centerline — joined by coincident endpoints (closure), the centerline ends coincident with
-    // the arc centers, and equal cap radii. SolidWorks-style: every piece is individually
-    // selectable + dimensionable (dimension to an arc center, shift-pick two sides for a relation).
-    // Only these NON-redundant relations are emitted (tangent/parallel come back redundant in our
-    // solver and would flag a false over-define), so the fresh slot is under-defined like any new
-    // sketch geometry — the user dimensions it. p1/p2 are the spine (arc-center) endpoints.
+    // the arc centers, equal cap radii, and each side tangent to both caps. SolidWorks-style:
+    // every piece is individually selectable + dimensionable (dimension to an arc center,
+    // shift-pick two sides for a relation). The fresh slot stays under-defined (position/angle/
+    // length/width free) until the user dimensions it. The tangent relations were once omitted
+    // because our solver reports an endpoint-coincident tangent as redundant and the session then
+    // flagged a false over-define; that is fixed (a redundant geometric relation no longer
+    // over-defines — see engine/doc/session.py), so they are restored. p1/p2 = spine endpoints.
     void addDecomposedSlot(AppState& st, const ImVec2& p1, const ImVec2& p2, float width);
     // C42: Polygon tool side count (set with number keys 3-9 while the tool is armed).
     int polySides_ = 6;

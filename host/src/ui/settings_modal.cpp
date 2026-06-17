@@ -13,6 +13,7 @@
 #include "settings_modal.h"
 
 #include "../core/app_state.h"
+#include "../core/cpp_core.h"
 #include "../renderer.h"
 
 // ---- C22b prompt editor state ----
@@ -193,6 +194,24 @@ void drawSettingsModal(AppState& st, bool busy) {
                 dimText("(saved immediately)");
                 helpMarker("Switches the whole UI and viewport between the dark and light "
                            "(SolidWorks-style) palettes. Persists across restarts.");
+
+                ImGui::Dummy(ImVec2(0, 8 * sc));
+                ImGui::SeparatorText("Engine");
+                // Production routing is still the Python worker for every doc op (see
+                // worker_client.cpp); the C++ core (libaicad) is loaded for diagnostic/parity
+                // only. Hardcode the active engine as Python until the cutover lands; flip this
+                // when a "route to cpp" path exists.
+                ImGui::TextUnformatted("Active engine: Python worker (subprocess)");
+                helpMarker("The C++ core (libaicad.dll) is the in-progress migration target. It "
+                           "currently runs in diagnostic/parity mode alongside the Python worker, "
+                           "which still handles all production document operations. This row will "
+                           "show the C++ core as active once the cutover lands.");
+                if (core::cpp_core().available()) {
+                    dimText(("C++ core: libaicad.dll loaded (ABI " +
+                             core::cpp_core().abiVersion() + ")").c_str());
+                } else {
+                    dimText("C++ core: not loaded");
+                }
 
                 ImGui::Dummy(ImVec2(0, 6 * sc));
                 dimText("All settings here are stored in %APPDATA%\\AI-CAD\\config.json.");

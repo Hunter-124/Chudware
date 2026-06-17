@@ -1235,6 +1235,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         renderer.resize(vw, vh);
         // C18: hard-lock the camera normal to the sketch plane while editing a sketch.
         if (inSketch) { float ly, lp; if (sketch->cameraLock(ly, lp)) { st.yaw = ly; st.pitch = lp; } }
+        // Freeze the bbox-derived camera framing while editing a sketch: real-time rebuilds of a
+        // downstream feature (e.g. the extrude that consumes this sketch) must not re-frame the
+        // view on every added entity. Geometry still updates live; the view stays normal-to-plane
+        // at a stable zoom (no fit-to-view "bouncing"). Unfreezes on exit so the model reframes
+        // normally again. Manual zoom/pan (st.zoom/st.pan) still work — only auto-framing is held.
+        renderer.setFramingFrozen(inSketch);
         // C37-C: reset zoom-area state on mode transitions (avoids cross-mode state leak).
         // Check at frame start: if sketch mode OR plane-pick activated, disarm zoom-area.
         if (inSketch || st.sketchPlanePickActive) {

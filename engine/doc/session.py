@@ -1469,11 +1469,43 @@ def _plane_frame(plane) -> list:
     return [v for row in rows for v in row]
 
 
+# Dimensional constraint types. A redundant *driving* dim among these over-defines the
+# sketch; geometric relations (everything else) do not. Also used by the add-constraint probe.
+_DIM_TYPES = frozenset({"distance", "angle", "radius", "diameter", "length"})
+
+
+def _redundant_overdefines(redundant: list | None,
+                           constraints_by_id: dict | None) -> bool:
+    """True iff the redundant set contains a redundant *driving dimension*.
+
+    SolidWorks parity: a consistent-but-redundant driving dimension still over-defines the
+    sketch (the user must make it driven). A redundant geometric RELATION must NOT: our
+    linearized rank test can flag a genuinely independent relation as redundant when its
+    gradient momentarily aligns with another at the current solution — the textbook case is
+    a tangent at the tangent point, whose gradient coincides with a coincident / point-on
+    there (true DOF drops but the linearization is rank-deficient). Escalating that to Over
+    Defined painted freshly-drawn tangent and closed/chained geometry red for no reason, and
+    forced the host to drop pre-snapped tangent/parallel relations to dodge it. Such relations
+    stay (reported in `redundant` as a warning) and DOF governs the definition state. With no
+    type map we cannot tell a relation from a dim, so we do NOT over-define — callers pass it.
+    """
+    if not redundant or not constraints_by_id:
+        return False
+    for cid in redundant:
+        c = constraints_by_id.get(cid)
+        if isinstance(c, dict) and c.get("type") in _DIM_TYPES and not c.get("driven", False):
+            return True
+    return False
+
+
 def _overall_status(statuses: dict, dof: int, conflicting: list,
-                    redundant: list | None = None) -> str:
-    # SolidWorks parity: a redundant DRIVING dim makes the sketch Over Defined even when the
-    # values are consistent (driven dims never reach the solver, so they can't appear here).
-    if conflicting or redundant or any(s == "over" for s in statuses.values()):
+                    redundant: list | None = None,
+                    constraints_by_id: dict | None = None) -> str:
+    # Over Defined when a constraint genuinely conflicts, an entity is individually flagged
+    # over, OR a redundant DRIVING dimension exists (see _redundant_overdefines for why a
+    # redundant geometric relation deliberately does NOT over-define).
+    if (conflicting or _redundant_overdefines(redundant, constraints_by_id)
+            or any(s == "over" for s in statuses.values())):
         return "over"
     if dof <= 0:
         return "full"
@@ -1581,6 +1613,10 @@ def _solve_active(session: DocSession, sketch_feat: dict, warm) -> dict:
         "dof": int(sol.dof),
         "conflicting": list(sol.conflicting),
         "redundant": list(sol.redundant),
+        # id -> constraint dict, so _overall_status can tell a redundant driving dim (over-
+        # defines) from a redundant geometric relation (does not).
+        "constraints_by_id": {c.get("id"): c for c in params.get("constraints", [])
+                              if isinstance(c, dict)},
         "skipped_constraints": list(getattr(sol, "skipped_constraints", [])),
         "rejected": rejected,
     }
@@ -1599,7 +1635,8 @@ def sketch_enter(session: DocSession, sketch_fid: str) -> dict:
     st.last_entities = packed["entity_map"]
     st.last_statuses = packed["statuses"]
     st.last_overall_status = _overall_status(packed["statuses"], packed["dof"],
-                                             packed["conflicting"], packed["redundant"])
+                                             packed["conflicting"], packed["redundant"],
+                                             packed["constraints_by_id"])
     st.plane_frame = frame
     session.active_sketch = st
 
@@ -1631,7 +1668,8 @@ def sketch_overview(session: DocSession, sketch_fid: str) -> dict:
         "dof": packed["dof"],
         "plane_frame": _plane_frame(plane),
         "status": _overall_status(packed["statuses"], packed["dof"],
-                                  packed["conflicting"], packed["redundant"]),
+                                  packed["conflicting"], packed["redundant"],
+                                  packed["constraints_by_id"]),
         "skipped_constraints": packed["skipped_constraints"],
     }
 
@@ -1692,7 +1730,7 @@ def sketch_regions(session: DocSession, sketch_fid: str) -> dict:
 
 # Dimensional constraint types — adding one of these consumes a DOF, so dof_after >= dof_before
 # means the new dimension was absorbed by an already-determined system (i.e. it over-defines).
-_PROBE_DIM_TYPES = frozenset({"distance", "angle", "radius", "diameter", "length"})
+_PROBE_DIM_TYPES = _DIM_TYPES
 _PROBE_CID = "__probe__"
 
 
@@ -1800,9 +1838,13 @@ def sketch_probe(session: DocSession, sketch_fid: str, action: dict) -> dict:
     # OR the system no longer converges (contradictory value — note contradictions can read
     # POSITIVE dof: QR counts their rank deficiency as slack, so don't gate on dof here; same
     # rule as the _solve_active rejection test).
+    # A redundant probe over-defines only when it's a driving DIMENSION; a geometric relation
+    # flagged redundant (e.g. a tangent at the tangent point — see _redundant_overdefines) must
+    # NOT block placement, otherwise the host has to drop pre-snapped tangent/parallel relations.
+    cons_by_id = {c.get("id"): c for c in params.get("constraints", []) if isinstance(c, dict)}
     would = (
         _PROBE_CID in conflicting
-        or _PROBE_CID in redundant
+        or (probe_is_dim and _PROBE_CID in redundant)
         or (probe_is_dim and dof_after >= dof_before)
         or not after.converged
         or bool(conflicting)
@@ -1810,7 +1852,8 @@ def sketch_probe(session: DocSession, sketch_fid: str, action: dict) -> dict:
 
     return {
         "ok": True,
-        "status": _overall_status(dict(after.statuses), dof_after, conflicting, redundant),
+        "status": _overall_status(dict(after.statuses), dof_after, conflicting, redundant,
+                                  cons_by_id),
         "dof_before": dof_before,
         "dof_after": dof_after,
         "converged": bool(after.converged),
@@ -1835,7 +1878,8 @@ def sketch_solve(session: DocSession, sketch_fid: str) -> dict:
     st.last_entities = packed["entity_map"]
     st.last_statuses = packed["statuses"]
     st.last_overall_status = _overall_status(packed["statuses"], packed["dof"],
-                                             packed["conflicting"], packed["redundant"])
+                                             packed["conflicting"], packed["redundant"],
+                                             packed["constraints_by_id"])
     return {
         "entities": packed["entities"],
         "statuses": packed["statuses"],

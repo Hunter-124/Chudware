@@ -856,6 +856,17 @@ void SketchMode::addDecomposedSlot(AppState& st, const ImVec2& p1, const ImVec2&
     con({{"type", "coincident"}, {"refs", {sp + ".p1", c1 + ".center"}}});  // centerline -> centers
     con({{"type", "coincident"}, {"refs", {sp + ".p2", c2 + ".center"}}});
     con({{"type", "equal"}, {"refs", {c1, c2}}});                           // uniform cap radius
+    // SolidWorks-style slot: each side line is tangent to BOTH end caps so the capsule shape
+    // holds under drag (and the sides stay parallel — implied by the 4 tangents + equal radii,
+    // so no explicit parallel is emitted). These were previously omitted because our solver's
+    // linearized rank test reports a tangent whose contact point coincides with the shared
+    // endpoint as "redundant", and the session then flagged the slot falsely Over Defined. That
+    // is fixed (engine/doc/session.py: a redundant geometric relation no longer over-defines —
+    // only a redundant driving dimension does), so the real tangency relations are restored.
+    con({{"type", "tangent"}, {"refs", {l1, c1}}});
+    con({{"type", "tangent"}, {"refs", {l1, c2}}});
+    con({{"type", "tangent"}, {"refs", {l2, c1}}});
+    con({{"type", "tangent"}, {"refs", {l2, c2}}});
     resolve(st);
 }
 

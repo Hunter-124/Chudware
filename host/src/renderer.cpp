@@ -677,7 +677,12 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
             bbMax.z = std::fmax(bbMax.z, m.bbMax.z);
         }
     }
-    if (!first) {
+    // While framing is frozen (sketch editing), keep the camera frame stable so live rebuilds of
+    // downstream features don't re-frame the view ("bouncing"). Geometry above was still uploaded;
+    // only the bbox-derived center_/radius_ are held.
+    if (framingFrozen_) {
+        // keep center_/radius_ from before entering sketch mode
+    } else if (!first) {
         center_ = Vec3((bbMin.x + bbMax.x) * 0.5f, (bbMin.y + bbMax.y) * 0.5f,
                        (bbMin.z + bbMax.z) * 0.5f);
         Vec3 half(bbMax.x - center_.x, bbMax.y - center_.y, bbMax.z - center_.z);

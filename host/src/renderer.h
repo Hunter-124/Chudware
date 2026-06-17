@@ -82,6 +82,12 @@ public:
     void resize(int width, int height);
     void setMesh(const Mesh& m);                          // single body, neutral color
     void setMeshes(const std::vector<PartMesh>& parts);   // multi-body, per-part colors
+    // While framing is frozen, setMeshes() updates the geometry but PRESERVES center_/radius_,
+    // so real-time rebuilds (e.g. a downstream extrude recomputing while a sketch is edited) do
+    // not re-frame the camera. Used to stop the view "bouncing" during sketch editing — the view
+    // stays normal-to-plane at a stable zoom while geometry updates live underneath.
+    void setFramingFrozen(bool f) { framingFrozen_ = f; }
+    bool framingFrozen() const { return framingFrozen_; }
     void setBackground(float tr, float tg, float tb, float br, float bg, float bb);
     // 3-stop vertical background gradient (top / mid-band ~55% / bottom floor glow).
     void setBackground3(const float top[3], const float mid[3], const float bot[3]);
@@ -287,5 +293,6 @@ private:
     // C19 colormap / deformation state.
     bool colormap_ = false;
     float deformScale_ = 0.0f;
+    bool framingFrozen_ = false;   // when true, setMeshes() keeps center_/radius_ (no re-frame)
     unsigned int lutTex_ = 0;  // 256x1 RGB jet ramp
 };

@@ -614,12 +614,15 @@ json spice_simulate(const json& circuit, const json& study) {
     };
 
     // Stamp the full DC system about working point x (gmin floor + linear + nonlinear).
-    // Returns an error string for an unported device kind, "" on success.
+    // `gmin_floor` is the node-to-ground conductance for this solve (ramped by gmin stepping);
+    // the devices keep their own option-gmin floors. Returns an error string for an unported
+    // device kind, "" on success.
     auto stamp_all_dc = [&](Mna& mna, const std::vector<double>& x,
-                            const std::map<std::string, double>& src_scale) -> std::string {
+                            const std::map<std::string, double>& src_scale,
+                            double gmin_floor) -> std::string {
         mna.reset();
-        if (gmin > 0)
-            for (int i = 0; i < s.n_nodes; ++i) mna.G(i, i, gmin);
+        if (gmin_floor > 0)
+            for (int i = 0; i < s.n_nodes; ++i) mna.G(i, i, gmin_floor);
         for (const json& d : devices) {
             std::string kind = d.value("kind", std::string());
             if (kind == "C") continue;  // open at DC
@@ -637,13 +640,13 @@ json spice_simulate(const json& circuit, const json& study) {
         return "";
     };
 
-    // Damped Newton DC solve at a given source scale (circuit.py::_newton_dc).
+    // Damped Newton DC solve at a given gmin floor + source scale (circuit.py::_newton_dc).
     auto newton_dc = [&](Mna& mna, const std::vector<double>& x0,
-                         const std::map<std::string, double>& src_scale,
+                         double gmin_floor, const std::map<std::string, double>& src_scale,
                          std::vector<double>& out, std::string& err) -> bool {
         std::vector<double> x = x0;
         for (int it = 1; it <= s.maxiter; ++it) {
-            err = stamp_all_dc(mna, x, src_scale);
+            err = stamp_all_dc(mna, x, src_scale, gmin_floor);
             if (!err.empty()) return false;
             std::vector<double> xnew;
             if (!solve_dense(mna, xnew)) { err = "matrix singular"; return false; }
@@ -678,35 +681,59 @@ json spice_simulate(const json& circuit, const json& study) {
 
         // 1. Direct attempt.
         std::string err;
-        if (newton_dc(mna, x0, base_scale, out, err) && err.empty()) {
+        if (newton_dc(mna, x0, gmin, base_scale, out, err) && err.empty()) {
             log("op: converged");
             return true;
         }
         if (!has_nonlinear) { log("op: linear solve failed — " + err); return false; }
 
-        // 2. gmin stepping (note: this prototype keeps gmin fixed at the option value; the
-        // staged ramp is reserved for circuits the direct attempt can't crack — the gated
-        // devices converge directly).
-        log("op: direct Newton failed (" + err + "); trying source stepping");
+        // 2. gmin stepping: ramp the node-to-ground floor from 1e-2 down to the option gmin,
+        // warm-starting each level from the previous solution (circuit.py::solve_dc_op).
+        log("op: direct Newton failed (" + err + "); trying gmin stepping");
+        double gstep = 1e-2;
+        std::vector<double> x = x0;
+        bool gok = false;
+        while (gstep >= gmin / 10.0) {
+            std::vector<double> xs;
+            std::string e;
+            if (newton_dc(mna, x, gstep, base_scale, xs, e) && e.empty()) {
+                x = xs;
+                if (gstep <= gmin) { gok = true; break; }
+                gstep /= 10.0;
+            } else {
+                gstep *= 1.5;
+                if (gstep > 1.0) break;
+            }
+        }
+        if (gok) {
+            std::vector<double> xs;
+            std::string e;
+            if (newton_dc(mna, x, gmin, base_scale, xs, e) && e.empty()) {
+                log("op: gmin stepping converged");
+                out = xs;
+                return true;
+            }
+        }
 
         // 3. Source stepping.
+        log("op: gmin stepping failed; trying source stepping");
         std::vector<std::string> src_names;
         for (const json& d : devices) {
             std::string kind = d.value("kind", std::string());
             if (kind == "V" || kind == "I") src_names.push_back(d.value("name", std::string()));
         }
         std::vector<double> steps = {0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0};
-        std::vector<double> x(dim, 0.0);
+        std::vector<double> xss(dim, 0.0);
         bool all_ok = true;
         for (double alpha : steps) {
             std::map<std::string, double> scale;
             for (const std::string& nm : src_names) scale[nm] = alpha;
             std::vector<double> xs;
             std::string e;
-            if (!newton_dc(mna, x, scale, xs, e) || !e.empty()) { all_ok = false; break; }
-            x = xs;
+            if (!newton_dc(mna, xss, gmin, scale, xs, e) || !e.empty()) { all_ok = false; break; }
+            xss = xs;
         }
-        if (all_ok) { log("op: source stepping converged"); out = x; return true; }
+        if (all_ok) { log("op: source stepping converged"); out = xss; return true; }
         log("op: all DC convergence strategies failed");
         return false;
     };

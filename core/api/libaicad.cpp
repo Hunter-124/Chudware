@@ -112,6 +112,7 @@ int handle_compile(const json& params, char** out_json) {
                     {"body_count", res.body_count},
                     {"volume", res.volume},
                     {"statuses", statuses},
+                    {"owner_map", res.owner_map.is_null() ? json::object() : res.owner_map},
                     {"aicm_path", aicm_path},
                     {"aicm_bytes", static_cast<uint64_t>(res.aicm.size())},
                 },

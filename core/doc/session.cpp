@@ -482,7 +482,7 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
     resp["revision"] = s.revision;
     resp["id_map"] = id_map;
     resp["tree"] = s.doc;
-    resp["owner_map"] = json::object();  // topology owner map deferred
+    resp["owner_map"] = r.owner_map.is_null() ? json::object() : r.owner_map;
     if (with_tess) {
         resp["rebuild"] = {{"feature_status", fs},
                            {"doc_status", {{"active_sketch", nullptr},
@@ -597,10 +597,12 @@ json doc_redo(const std::string& doc_id) {
 json doc_tree(const std::string& doc_id) {
     std::lock_guard<std::mutex> lk(g_mtx);
     Session& s = require_session(doc_id);
+    // No revision bump / no tess, but DO carry the owner_map (host picking) — recompute.
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     json resp;
     resp["revision"] = s.revision;
     resp["tree"] = s.doc;
-    resp["owner_map"] = json::object();
+    resp["owner_map"] = r.owner_map.is_null() ? json::object() : r.owner_map;
     return resp;
 }
 

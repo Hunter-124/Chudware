@@ -56,6 +56,11 @@ struct CompileResult {
     std::vector<uint8_t> aicm;            // serialized SURVIVING solid bodies (write_aicm)
     int body_count = 0;                   // surviving solids after the whole tree
     double volume = 0.0;                  // total solid volume of surviving bodies (mm^3)
+    // Per-creating-feature topology map (host picking): {fid: {bodies:[ordinal...],
+    // faces:[[ordinal,topo_id]...], edges:[...]}} with 1-based AICM body ordinal +
+    // 1-based TopExp topo index. Empty for an all-error compile. (Linear single-chain
+    // attribution; matches engine/doc/session.py::_owner_map for the common case.)
+    nlohmann::json owner_map;
     bool ok = false;                      // true iff every feature compiled ok
 };
 

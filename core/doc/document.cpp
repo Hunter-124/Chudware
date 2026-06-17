@@ -34,6 +34,7 @@
 #include <BRepGProp.hxx>
 #include <BRepTools.hxx>
 #include <TopExp.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <Bnd_Box.hxx>
 #include <GProp_GProps.hxx>
@@ -394,6 +395,11 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     // (1..N) and AICM body order are deterministic across rebuilds.
     std::vector<std::string> solid_order;
 
+    // The body each MODIFYING feature derived from (fillet/shell/boolean/... -> its
+    // input solid id). Empty/absent for a CREATING feature (extrude boss/revolve/
+    // sweep/loft/primitive build a fresh body). Drives the owner-map topology diff.
+    std::map<std::string, std::string> source_of;
+
     // The "current top body": the most-recently-produced solid not yet consumed.
     // Canonical features that omit an explicit body/seed ref (fillet/chamfer/hole/
     // shell/draft/mirror/pattern, and extrude-cut) operate on it (SolidWorks "the
@@ -607,6 +613,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     if (std::abs(ga.Mass() - gb.Mass()) < 1e-9)
                         throw std::runtime_error("extrude cut removed no material");
                     consumed.insert(tgt_id);
+                    source_of[id] = tgt_id;  // owner-map: cut derives from the target body
                     results[id] = SolidResult{out};
                 } else {
                     results[id] = SolidResult{solid};
@@ -741,6 +748,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     throw std::runtime_error("rib added no material (contour must bridge the body)");
 
                 consumed.insert(body_id);
+                source_of[id] = body_id;  // owner-map: derives from the input body
                 results[id] = SolidResult{out};
                 solid_order.push_back(id);
                 st.ok = true;
@@ -763,6 +771,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // a and b were merged/subtracted — they no longer survive standalone.
                 consumed.insert(a_id);
                 consumed.insert(b_id);
+                source_of[id] = a_id;  // owner-map: result derives from the first target
 
                 results[id] = SolidResult{out};
                 solid_order.push_back(id);
@@ -892,6 +901,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // The seed is absorbed into the pattern result (a SW pattern owns its
                 // instances), so it no longer survives as a standalone body.
                 consumed.insert(seed_id);
+                source_of[id] = seed_id;  // owner-map: pattern derives from the seed body
 
                 results[id] = SolidResult{res};
                 solid_order.push_back(id);
@@ -934,6 +944,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // The seed is absorbed into the pattern result (a SW pattern owns its
                 // instances), so it no longer survives standalone.
                 consumed.insert(seed_id);
+                source_of[id] = seed_id;  // owner-map: pattern derives from the seed body
 
                 results[id] = SolidResult{res};
                 solid_order.push_back(id);
@@ -1154,6 +1165,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // The drilled solid REPLACES the body (SolidWorks-style): the bored
                 // solid is the body's new current state in the tree.
                 consumed.insert(body_id);
+                source_of[id] = body_id;  // owner-map: derives from the input body
                 results[id] = SolidResult{out};
                 solid_order.push_back(id);
                 st.ok = true;
@@ -1191,6 +1203,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (out.IsNull())
                     throw std::runtime_error("shell produced an empty shape");
                 consumed.insert(body_id);
+                source_of[id] = body_id;  // owner-map: derives from the input body
                 results[id] = SolidResult{out};
                 solid_order.push_back(id);
                 st.ok = true;
@@ -1254,6 +1267,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (out.IsNull())
                     throw std::runtime_error("draft produced an empty shape");
                 consumed.insert(body_id);
+                source_of[id] = body_id;  // owner-map: derives from the input body
                 results[id] = SolidResult{out};
                 solid_order.push_back(id);
                 st.ok = true;
@@ -1298,6 +1312,72 @@ CompileResult compile_document(const json& doc, const json& env_json) {
 
     result.body_count = static_cast<int>(bodies.size());
     result.aicm = aicm::write_aicm(bodies);
+
+    // -------------------------------------------------- owner map (host picking)
+    // Per surviving body, tag each face/edge with the feature that created it: diff
+    // the body's topology against the body it derived from (source_of) by TShape
+    // identity (existing topology keeps its owner; NEW topology is this feature's).
+    // Then invert into {fid:{bodies,faces,edges}} keyed by the AICM body ordinal +
+    // 1-based TopExp topo index (port of engine/doc/session.py::_owner_map).
+    {
+        std::map<std::string, std::map<int, std::string>> face_owners, edge_owners;
+        for (const std::string& sid : solid_order) {  // sources precede dependents
+            if (!std::holds_alternative<SolidResult>(results.at(sid))) continue;
+            const TopoDS_Shape& shape = std::get<SolidResult>(results.at(sid)).shape;
+            if (shape.IsNull()) continue;
+            TopTools_IndexedMapOfShape fm, em;
+            TopExp::MapShapes(shape, TopAbs_FACE, fm);
+            TopExp::MapShapes(shape, TopAbs_EDGE, em);
+            const std::string src = source_of.count(sid) ? source_of[sid] : std::string();
+            const bool has_src = !src.empty() && results.count(src) &&
+                                 std::holds_alternative<SolidResult>(results.at(src)) &&
+                                 !std::get<SolidResult>(results.at(src)).shape.IsNull();
+            TopTools_IndexedMapOfShape sfm, sem;
+            if (has_src) {
+                const TopoDS_Shape& ss = std::get<SolidResult>(results.at(src)).shape;
+                TopExp::MapShapes(ss, TopAbs_FACE, sfm);
+                TopExp::MapShapes(ss, TopAbs_EDGE, sem);
+            }
+            std::map<int, std::string> fo, eo;
+            for (int i = 1; i <= fm.Extent(); ++i) {
+                if (has_src && sfm.Contains(fm.FindKey(i))) {
+                    int pi = sfm.FindIndex(fm.FindKey(i));
+                    auto& s = face_owners[src];
+                    auto it = s.find(pi);
+                    fo[i] = (it != s.end()) ? it->second : sid;
+                } else fo[i] = sid;
+            }
+            for (int i = 1; i <= em.Extent(); ++i) {
+                if (has_src && sem.Contains(em.FindKey(i))) {
+                    int pi = sem.FindIndex(em.FindKey(i));
+                    auto& s = edge_owners[src];
+                    auto it = s.find(pi);
+                    eo[i] = (it != s.end()) ? it->second : sid;
+                } else eo[i] = sid;
+            }
+            face_owners[sid] = std::move(fo);
+            edge_owners[sid] = std::move(eo);
+        }
+        json om = json::object();
+        auto ensure = [&](const std::string& fid) -> json& {
+            if (!om.contains(fid))
+                om[fid] = {{"bodies", json::array()}, {"faces", json::array()}, {"edges", json::array()}};
+            return om[fid];
+        };
+        for (const aicm::AicmBody& b : bodies) {  // ordinal = b.body_id (AICM order)
+            const std::string& sid = b.name;
+            std::set<std::string> body_owners;
+            for (const auto& kv : face_owners[sid]) {
+                ensure(kv.second)["faces"].push_back({b.body_id, kv.first});
+                body_owners.insert(kv.second);
+            }
+            for (const auto& kv : edge_owners[sid])
+                ensure(kv.second)["edges"].push_back({b.body_id, kv.first});
+            for (const std::string& fid : body_owners)
+                ensure(fid)["bodies"].push_back(b.body_id);
+        }
+        result.owner_map = std::move(om);
+    }
 
     // ok iff every feature compiled cleanly.
     result.ok = true;

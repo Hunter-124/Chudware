@@ -50,11 +50,18 @@ set(OCCT_DLL_DIR "${_occt_home}/win64/vc14/bin" CACHE PATH "OCCT toolkit DLLs" F
 # The 3rdparty deps our geom/mesh path actually loads. jemalloc + tbb are
 # TKernel's allocator/threading backends (mandatory); freetype/freeimage cover the
 # font/image paths used elsewhere. Note jemalloc's dir is named `jemalloc-vc14-64`.
+# ffmpeg (avcodec/avformat/avutil/swscale) + openvr are IMPORT-TABLE deps of TKService,
+# which the data-exchange toolkits (TKDESTEP/TKDEIGES/TKDESTL -> TKDE/TKXCAF -> ... ->
+# TKService) link transitively: the DLLs must be loadable for libaicad to load, even
+# though the headless import/export path never records video or drives a VR display.
 set(OCCT_3RDPARTY_BINS "")
-foreach(_dep jemalloc tbb freetype freeimage)
+foreach(_dep jemalloc tbb freetype freeimage ffmpeg)
   file(GLOB _d "${_occt_3p}/${_dep}-*/bin")
   list(APPEND OCCT_3RDPARTY_BINS ${_d})
 endforeach()
+# openvr ships its DLL under bin/win64 (not bin) — glob that nested layout.
+file(GLOB _ovr "${_occt_3p}/openvr-*/bin/win64")
+list(APPEND OCCT_3RDPARTY_BINS ${_ovr})
 
 # Deploy the release DLLs next to a target's exe (for the shipped host later).
 function(aicad_occt_copy_dlls tgt)

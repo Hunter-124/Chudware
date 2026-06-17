@@ -28,6 +28,7 @@
 
 #include <Eigen/Dense>
 
+#include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepBndLib.hxx>
@@ -40,6 +41,7 @@
 #include <GProp_GProps.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <TopAbs.hxx>
+#include <TopoDS_Compound.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
@@ -47,6 +49,7 @@
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
 
+#include "doc/formats.h"  // import_bodies / detect_format (the import feature)
 #include "doc/picks.h"
 #include "doc/selectors.h"
 #include "doc/session.h"  // OpError (plan_push_pull's structured out-of-range errors)
@@ -624,6 +627,42 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (solid.IsNull())
                     throw std::runtime_error(type + " produced an empty solid");
                 results[id] = SolidResult{solid};
+                solid_order.push_back(id);
+                st.ok = true;
+
+            } else if (type == "import") {
+                // Import a neutral B-rep file as a frozen body (engine/doc/features/
+                // import_feature.py). Read the file via OCCT, then carry all imported
+                // solids forward. Multi-body files become ONE compound body here (the
+                // single-body case — the common one — is exact; total volume matches
+                // the Python oracle either way; per-solid splitting is deferred).
+                const std::string src_path = str_field(feat, "source_path", "");
+                if (src_path.empty())
+                    throw std::runtime_error("import feature missing 'source_path'");
+                std::string ifmt = str_field(feat, "format", "");
+                if (ifmt.empty()) ifmt = detect_format(src_path);
+                std::vector<std::pair<std::string, TopoDS_Shape>> imported;
+                try {
+                    imported = import_bodies(src_path, ifmt);
+                } catch (const OpError& oe) {
+                    throw std::runtime_error("import failed for '" + src_path + "': " + oe.what());
+                }
+                std::vector<TopoDS_Shape> solids;
+                for (auto& [name, shp] : imported)
+                    if (!shp.IsNull()) solids.push_back(shp);
+                if (solids.empty())
+                    throw std::runtime_error("import: no usable bodies in '" + src_path + "'");
+                TopoDS_Shape body;
+                if (solids.size() == 1) {
+                    body = solids.front();
+                } else {
+                    TopoDS_Compound comp;
+                    BRep_Builder bb;
+                    bb.MakeCompound(comp);
+                    for (const TopoDS_Shape& s : solids) bb.Add(comp, s);
+                    body = comp;
+                }
+                results[id] = SolidResult{body};
                 solid_order.push_back(id);
                 st.ok = true;
 

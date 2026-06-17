@@ -96,6 +96,18 @@ nlohmann::json doc_resolve_pick(const std::string& doc_id, int body_id,
 nlohmann::json doc_push_pull(const std::string& doc_id, int body_id, int topo_id,
                              double distance, bool commit);
 
+// Export the document's surviving solid bodies to `path` in `fmt` (step/iges/brep/stl)
+// via OCCT. Returns {"path": <abs>}. Throws OpError("export_failed") on no bodies / an
+// unsupported format / a writer failure (engine.doc.formats export_file).
+nlohmann::json doc_export_file(const std::string& doc_id, const std::string& path,
+                               const std::string& fmt);
+
+// Import a neutral B-rep file (step/iges/brep) as a new `import` feature. With `into`
+// (a doc id) it appends to that session; otherwise it creates a new part session.
+// Returns the ops-response + "doc_id" (engine.doc.formats import_file).
+nlohmann::json doc_import_file(const std::string& path, const std::string& into,
+                               bool as_solid, const std::string& fmt);
+
 // Persist the session to `path` (or its current path if `path` is empty) as a
 // .step+ container. Clears the dirty flag, records the path. Returns {"path": ...}.
 // Throws OpError("io_error") if no path is available, or on a write failure.

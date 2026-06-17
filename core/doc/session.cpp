@@ -23,6 +23,7 @@
 #include <optional>
 
 #include "doc/document.h"
+#include "doc/formats.h"
 #include "doc/sketch_geom.h"
 #include "doc/stepplus.h"
 #include "doc/validate.h"
@@ -1165,35 +1166,14 @@ json config_commit(Session& s, json&& working) {
     return ops_response(s, r, json::object(), /*with_tess=*/true);
 }
 
-}  // namespace
-
-// ----------------------------------------------------------------- public API
-json doc_new(const std::string& kind, const std::string& name) {
-    if (!kind.empty() && kind != "part")
-        throw OpError("unsupported", "doc_new: only 'part' documents are supported in the C++ core",
-                      {{"kind", kind}});
-    std::lock_guard<std::mutex> lk(g_mtx);
-    Session s;
-    s.doc_id = new_doc_id();
-    s.doc = blank_part(s.doc_id, name);
-    s.revision = 0;
-    Session& stored = g_sessions[s.doc_id] = std::move(s);
-    CompileResult r = compile_document(stored.doc, env_from_doc(stored.doc));
-    json resp = ops_response(stored, r, json::object(), /*with_tess=*/true);
-    resp["doc_id"] = stored.doc_id;
-    return resp;
-}
-
-json doc_apply_ops(const std::string& doc_id, long base_revision, const json& ops, bool coalesce) {
-    std::lock_guard<std::mutex> lk(g_mtx);
-    Session& s = require_session(doc_id);
+// Apply an op batch to a session that the caller already holds g_mtx for (the shared
+// transactional core of doc_apply_ops; doc_import_file reuses it).
+json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coalesce) {
     if (base_revision >= 0 && base_revision != s.revision)
         throw OpError("stale_revision",
                       "base_revision " + std::to_string(base_revision) + " != current " +
                           std::to_string(s.revision),
                       {{"current_revision", s.revision}});
-
-    // Transactional: apply to a working copy; throw leaves the session untouched.
     if (!ops.is_array())
         throw OpError("invalid_op", "ops must be a list", {{"index", -1}, {"reason", "ops not a list"}});
     json working = s.doc;
@@ -1202,8 +1182,6 @@ json doc_apply_ops(const std::string& doc_id, long base_revision, const json& op
     for (std::size_t i = 0; i < ops.size(); ++i)
         apply_one(working, ops[i], i, gen, id_map);
 
-    // Resulting-document validation (doc_ops.md §2.1): reject batches that produce an
-    // invalid doc — same contract as the Python apply_ops (schema.validate_document).
     std::vector<std::string> errs = validate_document(working);
     if (!errs.empty()) {
         std::string joined;
@@ -1219,9 +1197,38 @@ json doc_apply_ops(const std::string& doc_id, long base_revision, const json& op
     s.doc = std::move(working);
     s.revision += 1;
     s.dirty = true;
-
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     return ops_response(s, r, id_map, /*with_tess=*/true);
+}
+
+// Create + register a blank part session, returning a reference (caller holds g_mtx).
+Session& new_part_session_locked(const std::string& name) {
+    Session s;
+    s.doc_id = new_doc_id();
+    s.doc = blank_part(s.doc_id, name);
+    s.revision = 0;
+    return g_sessions[s.doc_id] = std::move(s);
+}
+
+}  // namespace
+
+// ----------------------------------------------------------------- public API
+json doc_new(const std::string& kind, const std::string& name) {
+    if (!kind.empty() && kind != "part")
+        throw OpError("unsupported", "doc_new: only 'part' documents are supported in the C++ core",
+                      {{"kind", kind}});
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& stored = new_part_session_locked(name);
+    CompileResult r = compile_document(stored.doc, env_from_doc(stored.doc));
+    json resp = ops_response(stored, r, json::object(), /*with_tess=*/true);
+    resp["doc_id"] = stored.doc_id;
+    return resp;
+}
+
+json doc_apply_ops(const std::string& doc_id, long base_revision, const json& ops, bool coalesce) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    return apply_ops_locked(s, base_revision, ops, coalesce);
 }
 
 json doc_undo(const std::string& doc_id) {
@@ -1552,6 +1559,47 @@ json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double d
     out["committed"] = commit;
     merge(out, ops_response(s, r, json::object(), /*with_tess=*/true));
     return out;
+}
+
+json doc_export_file(const std::string& doc_id, const std::string& path, const std::string& fmt) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    if (path.empty())
+        throw OpError("invalid_op", "export_file: 'path' is required", {{"reason", "missing path"}});
+    if (fmt.empty())
+        throw OpError("invalid_op", "export_file: 'format' is required", {{"reason", "missing format"}});
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    if (r.shapes.empty())
+        throw OpError("export_failed", "export_file: document has no bodies to export",
+                      {{"doc_id", doc_id}});
+    std::string out = export_bodies(r.shapes, path, fmt);  // throws export_failed on a writer error
+    return json{{"path", out}};
+}
+
+json doc_import_file(const std::string& path, const std::string& into, bool as_solid,
+                     const std::string& fmt) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (path.empty())
+        throw OpError("invalid_op", "import_file: 'path' is required", {{"reason", "missing path"}});
+    // Resolve the format up front so a bad extension errors before we touch a session.
+    const std::string f = fmt.empty() ? detect_format(path) : fmt;
+    const std::string stem = std::filesystem::path(path).stem().string();
+
+    json params = {{"source_path", path}, {"format", f}, {"original_name", stem}};
+    if (as_solid) params["as_solid"] = true;
+    json ops = json::array({json{
+        {"op", "add_feature"},
+        {"feature", {{"type", "import"}, {"name", stem}, {"params", params}, {"refs", json::object()}}}}});
+
+    Session* s = nullptr;
+    if (!into.empty())
+        s = &require_session(into);  // append to an existing C++ session
+    else
+        s = &new_part_session_locked(stem.empty() ? std::string("Imported") : stem);
+
+    json resp = apply_ops_locked(*s, -1, ops, /*coalesce=*/false);
+    resp["doc_id"] = s->doc_id;
+    return resp;
 }
 
 json doc_save(const std::string& doc_id, const std::string& path) {

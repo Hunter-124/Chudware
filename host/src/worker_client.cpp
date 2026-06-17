@@ -30,13 +30,25 @@ bool routeDocToCpp(const std::string& method, const json& params) {
     // doc_id and belong to the same document. An unported method then fails loud in the
     // core (no Python doc to fall back to), surfacing the gap rather than misrouting.
     if (params.is_object()) {
-        auto it = params.find("doc_id");
-        if (it != params.end() && it->is_string() &&
-            it->get<std::string>().rfind("doc-cpp", 0) == 0)
-            return true;
+        // doc_id (most doc_* / config_* / export_*) or `into` (import_file appends to a
+        // doc) carrying a doc-cpp prefix binds the call to the C++-backed document.
+        for (const char* key : {"doc_id", "into"}) {
+            auto it = params.find(key);
+            if (it != params.end() && it->is_string() &&
+                it->get<std::string>().rfind("doc-cpp", 0) == 0)
+                return true;
+        }
     }
-    // doc_new / doc_open mint a fresh doc -> route to C++ only when the flag is set.
+    // doc_new / doc_open / import_file (no `into`) MINT a fresh doc -> route to C++ only
+    // when the flag is set. import_file with `into` set is handled by the prefix check
+    // above (it appends to whichever engine owns that doc).
     if ((method == "doc_new" || method == "doc_open") && cppDocsFlag()) return true;
+    if (method == "import_file" && cppDocsFlag()) {
+        auto into = params.is_object() ? params.find("into") : params.end();
+        const bool hasInto = into != params.end() && into->is_string() &&
+                             !into->get<std::string>().empty();
+        if (!hasInto) return true;  // minting a new doc
+    }
     return false;
 }
 std::wstring widen(const std::string& s) {

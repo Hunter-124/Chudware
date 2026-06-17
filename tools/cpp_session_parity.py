@@ -619,6 +619,80 @@ def main() -> int:
     pp_total += 1
     mism += 0 if bad_ok else 1
 
+    # 4j) Formats (export_file / import_file): a C++-exported neutral B-rep file re-imports
+    # (through the Python oracle AND back through the C++ core) to the SAME volume; a Python-
+    # exported file imports into a C++ doc to the same volume. NEVER byte-compare (OCCT 7.9.3
+    # output != the oracle's 7.8.x). Box = 30x20x10 = 6000 mm^3.
+    import tempfile
+    from engine.doc import formats as _fmt
+    BOXV = 30.0 * 20.0 * 10.0
+    fmt_total = 0
+
+    def py_import_volume(p):
+        v = 0.0
+        for _n, s in _fmt.import_path(p):
+            try:
+                v += float(s.volume)
+            except Exception:  # noqa: BLE001
+                pass
+        return v
+
+    def py_export_box(p, fmt):
+        e = py_session(); e.apply(0, _box_ops())
+        from engine.doc.session import _rebuild, _solid_bodies
+        result = e.s.last_result or _rebuild(e.s)
+        sb = [(bo.name or f"Body{i}", bo.shape) for i, bo in enumerate(_solid_bodies(result), 1)]
+        _fmt.export_document(sb, p, fmt)
+
+    with tempfile.TemporaryDirectory() as td:
+        ce = CppS(core); ce.apply(0, _box_ops())
+        # C++ export -> Python oracle import -> volume parity (best-effort per backend).
+        for ext, fmt, band in [("step", "step", 1e-3), ("brep", "brep", 1e-3),
+                               ("iges", "iges", 2e-2), ("stl", "stl", 1e-2)]:
+            p = str(Path(td) / f"cpp_box.{ext}")
+            rc, ev = core.call("export_file", {"doc_id": ce.doc_id, "path": p, "format": fmt})
+            if rc != 0 or not Path(ev.get("path", "")).exists():
+                print(f"  {('fmt C++export ' + fmt):<28} DIFF: export rc={rc} {str(ev)[:50]}")
+                fmt_total += 1; mism += 1; continue
+            try:
+                pv = py_import_volume(p)
+            except Exception as exc:  # noqa: BLE001 — optional oracle backend (trimesh/…) missing
+                print(f"  {('fmt C++export->py ' + fmt):<28} SKIP ({type(exc).__name__})")
+                continue
+            fmt_total += 1
+            ok = abs(pv - BOXV) / BOXV <= band
+            print(f"  {('fmt C++export->py ' + fmt):<28} {'MATCH' if ok else f'DIFF vol {pv:.1f}!=6000'}")
+            mism += 0 if ok else 1
+
+        # C++ STEP round-trip: export then import back into a fresh C++ doc.
+        fmt_total += 1
+        sp = str(Path(td) / "rt.step")
+        core.call("export_file", {"doc_id": ce.doc_id, "path": sp, "format": "step"})
+        rc, iv = core.call("import_file", {"path": sp})
+        rtv = float(iv.get("volume", 0.0)) if rc == 0 else -1.0
+        rt_ok = (rc == 0 and abs(rtv - BOXV) / BOXV <= 1e-3 and
+                 str(iv.get("doc_id", "")).startswith("doc-cpp"))
+        print(f"  {'fmt C++ STEP round-trip':<28} {'MATCH' if rt_ok else f'DIFF rc={rc} vol={rtv}'}")
+        mism += 0 if rt_ok else 1
+
+        # Python-exported STEP imports into a C++ doc with matching volume.
+        fmt_total += 1
+        pp = str(Path(td) / "py_box.step")
+        py_export_box(pp, "step")
+        rc, iv = core.call("import_file", {"path": pp})
+        cv = float(iv.get("volume", 0.0)) if rc == 0 else -1.0
+        py_ok = rc == 0 and abs(cv - BOXV) / BOXV <= 1e-3
+        print(f"  {'fmt py->C++import STEP':<28} {'MATCH' if py_ok else f'DIFF rc={rc} vol={cv}'}")
+        mism += 0 if py_ok else 1
+
+        # Unsupported export format fails loud (export_failed), not a silent wrong file.
+        fmt_total += 1
+        rc, bad = core.call("export_file",
+                            {"doc_id": ce.doc_id, "path": str(Path(td) / "x.3mf"), "format": "3mf"})
+        unsupp_ok = rc != 0 and bad.get("code") == "export_failed"
+        print(f"  {'fmt unsupported->error':<28} {'MATCH' if unsupp_ok else 'DIFF: ' + str(bad)[:60]}")
+        mism += 0 if unsupp_ok else 1
+
     # 5) stale_revision guard (base 0 now stale)
     rc, cr = core.call("doc_apply_ops", {"doc_id": cpp.doc_id, "base_revision": 0, "ops": []})
     code = cr.get("code") or cr.get("detail", {})
@@ -626,7 +700,7 @@ def main() -> int:
     print(f"  {'stale_revision guard':<28} {'MATCH' if ok else 'DIFF: ' + str(cr)}")
     mism += 0 if ok else 1
 
-    total = 12 + adv_total + cfg_total + pp_total
+    total = 12 + adv_total + cfg_total + pp_total + fmt_total
     print(f"\n[session-parity] {total - mism}/{total} steps at full parity")
     return mism
 

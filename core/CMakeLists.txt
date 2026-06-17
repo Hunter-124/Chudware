@@ -216,7 +216,13 @@ if(AICAD_WITH_OCCT)
     TKBRep TKTopAlgo TKPrim TKMesh TKShHealing TKBO TKFillet
     # TKOffset: shell (BRepOffsetAPI_MakeThickSolid) + draft (BRepOffsetAPI_DraftAngle)
     # + loft (BRepOffsetAPI_ThruSections).
-    TKOffset)
+    TKOffset
+    # Data-exchange (doc/formats.cpp): the NON-CAF control classes only — STEPControl_*
+    # (TKDESTEP), IGESControl_* (TKDEIGES), StlAPI_Writer (TKDESTL) over the XS base
+    # (TKXSBase). Deliberately NOT the unified DE_Wrapper framework (TKDE/TKDECascade)
+    # nor the OCAF/XCAF document stack (TKXCAF/TKLCAF/TKCDF) — those drag visualization /
+    # heavier 3rdparty runtime DLLs the loader would then need staged.
+    TKDESTEP TKDEIGES TKDESTL TKXSBase)
 
   # Verification: tessellate -> write_aicm -> HOST render::parseAicm round-trip.
   add_executable(test_geom_aicm
@@ -293,7 +299,8 @@ if(AICAD_WITH_OCCT)
     doc/session.cpp
     doc/sketch_geom.cpp
     doc/stepplus.cpp
-    doc/validate.cpp)
+    doc/validate.cpp
+    doc/formats.cpp)
   target_include_directories(aicad_doc PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})

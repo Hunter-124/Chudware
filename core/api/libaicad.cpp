@@ -28,6 +28,7 @@
 
 #include "doc/document.h"
 #include "doc/session.h"
+#include "doc/validate.h"
 
 using nlohmann::json;
 
@@ -148,6 +149,16 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
         }
         if (m == "doc_compile_cpp") {
             return handle_compile(params, out_json);
+        }
+        if (m == "doc_validate") {
+            // DIAGNOSTIC: structural-validate a document tree (schema.validate_document
+            // parity probe). Accepts {"doc":{...}} or a top-level {"features":[...]}.
+            json doc;
+            if (params.contains("doc")) doc = params["doc"];
+            else if (params.contains("features")) doc = params;
+            else return emit_error("doc_validate: params need a 'doc' object", out_json);
+            std::vector<std::string> errs = aicad::doc::validate_document(doc);
+            return emit(json{{"ok", errs.empty()}, {"errors", errs}}, out_json, 0);
         }
         // --- stateful document session RPCs (aicad::doc::session) ---------------
         // Each returns the host's ops-response JSON. An OpError becomes a nonzero

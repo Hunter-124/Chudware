@@ -25,6 +25,7 @@
 #include "doc/document.h"
 #include "doc/sketch_geom.h"
 #include "doc/stepplus.h"
+#include "doc/validate.h"
 #include "util/expr.h"
 
 namespace aicad::doc {
@@ -1115,13 +1116,26 @@ json doc_apply_ops(const std::string& doc_id, long base_revision, const json& op
                       {{"current_revision", s.revision}});
 
     // Transactional: apply to a working copy; throw leaves the session untouched.
+    if (!ops.is_array())
+        throw OpError("invalid_op", "ops must be a list", {{"index", -1}, {"reason", "ops not a list"}});
     json working = s.doc;
     json id_map = json::object();
     IdGen gen(working);
-    const json empty = json::array();
-    const json& batch = ops.is_array() ? ops : empty;
-    for (std::size_t i = 0; i < batch.size(); ++i)
-        apply_one(working, batch[i], i, gen, id_map);
+    for (std::size_t i = 0; i < ops.size(); ++i)
+        apply_one(working, ops[i], i, gen, id_map);
+
+    // Resulting-document validation (doc_ops.md §2.1): reject batches that produce an
+    // invalid doc — same contract as the Python apply_ops (schema.validate_document).
+    std::vector<std::string> errs = validate_document(working);
+    if (!errs.empty()) {
+        std::string joined;
+        for (std::size_t i = 0; i < errs.size() && i < 5; ++i) {
+            if (i) joined += "; ";
+            joined += errs[i];
+        }
+        throw OpError("invalid_op", "resulting document failed validation: " + joined,
+                      {{"index", -1}, {"reason", errs.front()}, {"all_errors", errs}});
+    }
 
     if (!coalesce) push_undo(s);
     s.doc = std::move(working);

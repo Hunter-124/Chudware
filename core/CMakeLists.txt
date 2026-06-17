@@ -292,7 +292,8 @@ if(AICAD_WITH_OCCT)
     doc/picks.cpp
     doc/session.cpp
     doc/sketch_geom.cpp
-    doc/stepplus.cpp)
+    doc/stepplus.cpp
+    doc/validate.cpp)
   target_include_directories(aicad_doc PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})

@@ -343,6 +343,77 @@ def main() -> int:
         vmax = float(np.max(np.asarray(rcpp["tran"]["traces"]["V(OUT)"])))
         print(f"  {'nl tran rectifier':<24} MATCH  ({len(tc)} pts, V(OUT)max={vmax:.4g})")
 
+    # ---- Mutual inductance (K): a coupled transformer, transient + AC. The inductor branch
+    # equations carry the M*di_other/dt cross terms (transient) and -jwM (AC) on both engines,
+    # so the coupled traces / sweeps match to FP precision.
+    Lp, Ls, kc = 1e-3, 1e-3, 0.8
+    xfmr = {
+        "nodes": ["0", "IN", "P", "S"],
+        "devices": [
+            {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0,
+             "params": {"waveform": _wf("PULSE", v1=0.0, v2=1.0, td=0.0, tr=1e-7, tf=1e-7,
+                                        pw=2e-4, per=0.0), "ac": {"mag": 1.0, "phase": 0.0}}},
+            {"kind": "R", "name": "RP", "nodes": ["IN", "P"], "value": 50.0, "params": {}},
+            {"kind": "L", "name": "L1", "nodes": ["P", "0"], "value": Lp, "params": {"ic": 0.0}},
+            {"kind": "L", "name": "L2", "nodes": ["S", "0"], "value": Ls, "params": {"ic": 0.0}},
+            {"kind": "R", "name": "RL", "nodes": ["S", "0"], "value": 1000.0, "params": {}},
+            {"kind": "K", "name": "K1", "nodes": [], "value": kc,
+             "params": {"inductors": ["L1", "L2"]}}],
+        "models": {}, "params": {}}
+    # transient
+    checks += 1
+    xt_study = {"analyses": [{"type": "tran", "tstep": 1e-6, "tstop": 4e-4, "uic": True}],
+                "probes": ["V(S)", "I(L1)", "I(L2)"]}
+    ro = simulate(xfmr, xt_study)
+    rc, rcpp = core.call("sim_spice", {"circuit": xfmr, "study": xt_study})
+    diffs = []
+    if not (ro["convergence"].get("tran") and rcpp.get("convergence", {}).get("tran")):
+        diffs.append("tran did not converge")
+    tp = np.asarray(ro["tran"]["x_t"], dtype=np.float64)
+    tc = np.asarray(rcpp.get("tran", {}).get("x_t", []), dtype=np.float64)
+    if tp.shape != tc.shape:
+        diffs.append(f"time grid len {tp.shape}!={tc.shape}")
+    else:
+        for pr in xt_study["probes"]:
+            vp = np.asarray(ro["tran"]["traces"][pr], dtype=np.float64)
+            vc = np.asarray(rcpp["tran"]["traces"][pr], dtype=np.float64)
+            scale = max(float(np.max(np.abs(vp))), 1e-9)
+            dmax = float(np.max(np.abs(vp - vc)))
+            if dmax / scale > 1e-6:
+                diffs.append(f"{pr} max|d|={dmax:.2e} (rel {dmax/scale:.1e})")
+    if diffs:
+        print(f"  {'K tran transformer':<24} DIFF: {'; '.join(diffs)[:100]}")
+        mism += 1
+    else:
+        vs = float(np.max(np.abs(np.asarray(rcpp["tran"]["traces"]["V(S)"]))))
+        print(f"  {'K tran transformer':<24} MATCH  ({len(tc)} pts, |V(S)|max={vs:.4g})")
+    # AC
+    checks += 1
+    xa_study = {"analyses": [{"type": "ac", "sweep": "dec", "points": 8, "fstart": 100.0,
+                              "fstop": 1e6}], "probes": ["V(S)"]}
+    ro = simulate(xfmr, xa_study)
+    rc, rcpp = core.call("sim_spice", {"circuit": xfmr, "study": xa_study})
+    diffs = []
+    if not (ro["convergence"].get("ac") and rcpp.get("convergence", {}).get("ac")):
+        diffs.append("ac did not converge")
+    fp = np.asarray(ro["ac"]["x_f"], dtype=np.float64)
+    fc = np.asarray(rcpp.get("ac", {}).get("x_f", []), dtype=np.float64)
+    if fp.shape != fc.shape:
+        diffs.append(f"freq grid len {fp.shape}!={fc.shape}")
+    else:
+        for key in ("mag", "phase_deg"):
+            vp = np.asarray(ro["ac"][key]["V(S)"], dtype=np.float64)
+            vc = np.asarray(rcpp["ac"][key]["V(S)"], dtype=np.float64)
+            scale = max(float(np.max(np.abs(vp))), 1e-9)
+            dmax = float(np.max(np.abs(vp - vc)))
+            if dmax / scale > 1e-6:
+                diffs.append(f"V(S).{key} max|d|={dmax:.2e}")
+    if diffs:
+        print(f"  {'K ac transformer':<24} DIFF: {'; '.join(diffs)[:100]}")
+        mism += 1
+    else:
+        print(f"  {'K ac transformer':<24} MATCH  ({len(fc)} pts)")
+
     print(f"\n[spice-parity] {checks - mism}/{checks} circuit cases at full parity")
     return mism
 

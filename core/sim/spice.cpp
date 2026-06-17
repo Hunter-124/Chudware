@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cmath>
 #include <complex>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -227,13 +228,15 @@ std::vector<double> freq_grid(const json& an) {
     return out;
 }
 
-// Per-reactive-device transient history (uncoupled C / L; diode junction cap).
+// Per-reactive-device transient history (uncoupled C / L; diode junction cap; mutual L).
 struct TranState {
     double v = 0.0;       // previous terminal voltage
     double i = 0.0;       // previous branch/companion current
     double ldidt = 0.0;   // L*di/dt (inductor self term)
     double vcap = 0.0;    // diode junction-cap previous voltage
     double icap = 0.0;    // diode junction-cap previous current
+    double i_at_step = 0.0;                  // current snapshot at stamp time (mutual coupling)
+    std::map<std::string, double> mdidt;     // M*di_other/dt per coupled neighbour
 };
 
 // Shared circuit setup: node index, branch rows, device list.
@@ -605,6 +608,44 @@ json spice_simulate(const json& circuit, const json& study) {
     for (const json& d : devices)
         if (kind_is_nonlinear(d.value("kind", std::string()))) has_nonlinear = true;
 
+    // Mutual-inductance couplings from K cards (devices.py::KCoupling.link). Each K names two
+    // inductors + a coefficient k; M = k*sqrt(L1*L2) registered on BOTH inductors so each
+    // inductor's branch equation gains the M*di_other/dt cross term.
+    std::map<std::string, double> inductor_L;
+    for (const json& d : devices)
+        if (d.value("kind", std::string()) == "L")
+            inductor_L[d.value("name", std::string())] = dev_value(d, 0.0);
+    std::map<std::string, std::vector<std::pair<std::string, double>>> couplings;
+    for (const json& d : devices) {
+        if (d.value("kind", std::string()) != "K") continue;
+        const json& p = params_of(d);
+        if (!p.contains("inductors") || !p["inductors"].is_array() || p["inductors"].size() < 2)
+            continue;
+        std::string n1 = p["inductors"][0].get<std::string>();
+        std::string n2 = p["inductors"][1].get<std::string>();
+        auto i1 = inductor_L.find(n1), i2 = inductor_L.find(n2);
+        if (i1 == inductor_L.end() || i2 == inductor_L.end() || n1 == n2) continue;
+        double k = dev_value(d, std::numeric_limits<double>::quiet_NaN());
+        if (std::isnan(k)) k = as_num(p.value("k", p.value("K", json(1.0))), 1.0);
+        k = std::max(-1.0, std::min(1.0, k));
+        double m = k * std::sqrt(std::max(i1->second, 0.0) * std::max(i2->second, 0.0));
+        // Avoid double-registering the same neighbour (duplicate K cards) — last write wins.
+        auto upsert = [&](const std::string& a, const std::string& b, double mm) {
+            auto& vec = couplings[a];
+            for (auto& pr : vec)
+                if (pr.first == b) { pr.second = mm; return; }
+            vec.push_back({b, mm});
+        };
+        upsert(n1, n2, m);
+        upsert(n2, n1, m);
+    }
+    auto couplings_of = [&](const std::string& name)
+        -> const std::vector<std::pair<std::string, double>>& {
+        static const std::vector<std::pair<std::string, double>> empty;
+        auto it = couplings.find(name);
+        return it == couplings.end() ? empty : it->second;
+    };
+
     // Per-device persistent state (diode RS inner-Newton seed) carried across iterations/steps.
     std::map<std::string, double> last_vd;
 
@@ -626,6 +667,7 @@ json spice_simulate(const json& circuit, const json& study) {
         for (const json& d : devices) {
             std::string kind = d.value("kind", std::string());
             if (kind == "C") continue;  // open at DC
+            if (kind == "K") continue;  // relational coupling — stamps nothing itself
             if (kind == "L") {          // ideal short
                 int a = N_of(d, 0), b = N_of(d, 1), br = s.branch_of.at(d.value("name", std::string()));
                 mna.G(a, br, 1.0); mna.G(b, br, -1.0); mna.G(br, a, 1.0); mna.G(br, b, -1.0);
@@ -819,11 +861,23 @@ json spice_simulate(const json& circuit, const json& study) {
                     } else if (kind == "L") {
                         int a0 = N_of(d, 0), b0 = N_of(d, 1), br = s.branch_of.at(name);
                         double L = dev_value(d, 0.0);
-                        const TranState& h = st[name];
-                        double req = trap ? 2.0 * L / dt : L / dt;
-                        double veq = trap ? -(req * h.i + h.ldidt) : -req * h.i;
+                        TranState& h = st[name];
+                        double i_prev = h.i, ldidt_prev = h.ldidt;
+                        h.i_at_step = i_prev;  // stable snapshot for a neighbour's update_state
                         mna.G(a0, br, 1.0); mna.G(b0, br, -1.0);
+                        double req = trap ? 2.0 * L / dt : L / dt;
+                        double veq = trap ? -(req * i_prev + ldidt_prev) : -req * i_prev;
                         mna.G(br, a0, 1.0); mna.G(br, b0, -1.0); mna.G(br, br, -req);
+                        // Mutual terms: each coupled neighbour adds M*di_other/dt.
+                        for (const auto& cp : couplings_of(name)) {
+                            int obr = s.branch_of.at(cp.first);
+                            double m = cp.second;
+                            double i_other_prev = st[cp.first].i;
+                            double mdidt_prev = h.mdidt.count(cp.first) ? h.mdidt.at(cp.first) : 0.0;
+                            double reqm = trap ? 2.0 * m / dt : m / dt;
+                            veq -= trap ? (reqm * i_other_prev + mdidt_prev) : reqm * i_other_prev;
+                            mna.G(br, obr, -reqm);
+                        }
                         mna.I(br, veq);
                     } else if (kind_is_nonlinear(kind)) {
                         stamp_nonlinear_dc(s, mna, d, xw, last_vd);
@@ -863,6 +917,17 @@ json spice_simulate(const json& circuit, const json& study) {
                         double v = xat(xn, N_of(d, 0)) - xat(xn, N_of(d, 1));
                         double i = xat(xn, br);
                         double ldidt_new = trap ? 2.0 * L / dt * (i - h.i) - h.ldidt : L / dt * (i - h.i);
+                        // Advance each mutual flux-derivative voltage M*di_other/dt likewise. The
+                        // neighbour's previous current uses its stamp-time snapshot (order-stable).
+                        for (const auto& cp : couplings_of(name)) {
+                            double m = cp.second;
+                            const TranState& oh = st[cp.first];
+                            double i_other = xat(xn, s.branch_of.at(cp.first));
+                            double i_other_prev = oh.i_at_step;  // snapshot taken at stamp time
+                            double mdidt_prev = h.mdidt.count(cp.first) ? h.mdidt.at(cp.first) : 0.0;
+                            h.mdidt[cp.first] = trap ? 2.0 * m / dt * (i_other - i_other_prev) - mdidt_prev
+                                                     : m / dt * (i_other - i_other_prev);
+                        }
                         h.i = i; h.v = v; h.ldidt = ldidt_new;
                     } else if (kind == "D") {
                         double CJO = mp(d, s.models, "CJO", 0.0);
@@ -993,6 +1058,8 @@ json spice_simulate(const json& circuit, const json& study) {
                         int br = s.branch_of.at(name);
                         G(a0, br, 1.0); G(b0, br, -1.0); G(br, a0, 1.0); G(br, b0, -1.0);
                         G(br, br, cd(0.0, -omega * dev_value(d, 0.0)));  // -jwL
+                        for (const auto& cp : couplings_of(name))  // -jwM I_other
+                            G(br, s.branch_of.at(cp.first), cd(0.0, -omega * cp.second));
                     } else if (kind == "V") {
                         int br = s.branch_of.at(name);
                         G(a0, br, 1.0); G(b0, br, -1.0); G(br, a0, 1.0); G(br, b0, -1.0);

@@ -242,6 +242,15 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 params.value("kind", std::string()),
                                 params.value("topo_id", 0)),
                             out_json, 0);
+            if (m == "doc_push_pull")
+                return emit(aicad::doc::doc_push_pull(
+                                params.value("doc_id", std::string()),
+                                params.value("body_id", 0),
+                                params.value("topo_id", 0),
+                                params.contains("distance") && params["distance"].is_number()
+                                    ? params["distance"].get<double>() : 0.0,
+                                params.value("commit", false)),
+                            out_json, 0);
         } catch (const aicad::doc::OpError& oe) {
             // Structured error envelope (matches the Python worker's doc_* errors).
             return emit(oe.envelope(), out_json, 3);

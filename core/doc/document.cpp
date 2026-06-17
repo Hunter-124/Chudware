@@ -49,6 +49,7 @@
 
 #include "doc/picks.h"
 #include "doc/selectors.h"
+#include "doc/session.h"  // OpError (plan_push_pull's structured out-of-range errors)
 #include "geom/booleans.h"
 #include "geom/dress.h"
 #include "geom/features.h"
@@ -1494,6 +1495,288 @@ nlohmann::json resolve_pick(const json& doc, const json& env, int body_id,
         }
     }
     return aicad::doc::make_pick_selector(shape, kind, topo_id, owner);
+}
+
+// --------------------------------------------------------------- push-pull (Instant3D)
+// Port of engine/doc/instant3d.py plan_edit + helpers. NEVER mutates the doc.
+namespace {
+
+constexpr double kPpMinDim = 0.1;        // smallest length/depth/radius a drag may leave (mm)
+constexpr double kPpParallelTol = 0.966;  // |cos| >= this (~15deg) counts a normal as axis-aligned
+
+std::optional<double> pp_dim_value(const json& feat, const std::string& key) {
+    if (!feat.contains("params") || !feat["params"].is_object()) return std::nullopt;
+    const json& p = feat["params"];
+    auto it = p.find(key);
+    if (it == p.end()) return std::nullopt;
+    const json* val = it->is_object() ? (it->contains("value") ? &(*it)["value"] : nullptr) : &*it;
+    if (!val || val->is_boolean() || !val->is_number()) return std::nullopt;
+    return val->get<double>();
+}
+
+bool pp_has_expr(const json& feat, const std::string& key) {
+    if (!feat.contains("params") || !feat["params"].is_object()) return false;
+    auto it = feat["params"].find(key);
+    if (it == feat["params"].end() || !it->is_object()) return false;
+    auto e = it->find("expr");
+    return e != it->end() && e->is_string() && !e->get<std::string>().empty();
+}
+
+std::string pp_axis_label(const std::optional<Eigen::Vector3d>& axis) {
+    if (!axis) return "";
+    Eigen::Vector3d a = *axis;
+    double n = a.norm();
+    if (n > 1e-12) a /= n;
+    const std::pair<const char*, Eigen::Vector3d> bases[] = {
+        {"x", {1, 0, 0}}, {"y", {0, 1, 0}}, {"z", {0, 0, 1}}};
+    for (const auto& [lbl, base] : bases)
+        if (std::abs(a.dot(base)) >= kPpParallelTol) return lbl;
+    return "";
+}
+
+const json* pp_feature_by_id(const json& doc, const std::string& fid) {
+    if (!doc.contains("features") || !doc["features"].is_array()) return nullptr;
+    for (const json& f : doc["features"])
+        if (f.is_object() && f.value("id", std::string()) == fid) return &f;
+    return nullptr;
+}
+
+// The extrude direction (= owning sketch's plane normal) for a blind extrude, or
+// nullopt when it can't be resolved cheaply (a datum-plane sketch) — in which case
+// the caller skips the cap/side-wall test, exactly as the Python _extrude_axis does.
+std::optional<Eigen::Vector3d> pp_extrude_axis(const json& doc, const json& feat) {
+    if (!feat.contains("refs") || !feat["refs"].is_object()) return std::nullopt;
+    const json& refs = feat["refs"];
+    if (!refs.contains("profile") || !refs["profile"].is_array()) return std::nullopt;
+    std::string sketch_fid;
+    for (const json& p : refs["profile"])
+        if (p.is_object() && p.value("kind", std::string()) == "region" &&
+            p.contains("sketch") && p["sketch"].is_string()) {
+            sketch_fid = p["sketch"].get<std::string>();
+            break;
+        }
+    if (sketch_fid.empty()) return std::nullopt;
+    const json* sfeat = pp_feature_by_id(doc, sketch_fid);
+    if (!sfeat) return std::nullopt;
+    std::string pref = "top";
+    if (sfeat->contains("refs") && (*sfeat)["refs"].is_object() &&
+        (*sfeat)["refs"].value("plane", json()).is_string())
+        pref = (*sfeat)["refs"]["plane"].get<std::string>();
+    else if (sfeat->contains("params") && (*sfeat)["params"].is_object() &&
+             (*sfeat)["params"].value("plane", json()).is_string())
+        pref = (*sfeat)["params"]["plane"].get<std::string>();
+    if (pref.rfind("plane.", 0) == 0) pref = pref.substr(6);
+    if (pref != "top" && pref != "front" && pref != "right") return std::nullopt;
+    return plane_from_name(pref).normal;
+}
+
+// Fill new_value/clamped for a length-style param (instant3d.py _length_plan); sets
+// draggable=false+reason when the param is expr-driven.
+void pp_length_plan(PushPullPlan& plan, const json& feat, const std::string& key, double old,
+                    double distance, const std::string& axis_lbl) {
+    if (pp_has_expr(feat, key)) {
+        plan.draggable = false;
+        plan.reason = "param '" + key + "' is equation-driven (expr) — edit the equation instead";
+        return;
+    }
+    double nv = old + distance;
+    bool clamped = false;
+    if (nv < kPpMinDim) { nv = kPpMinDim; clamped = true; }
+    plan.draggable = true;
+    plan.param = key;
+    plan.old_value = old;
+    plan.new_value = nv;
+    plan.clamped = clamped;
+    plan.axis = axis_lbl;
+    plan.has_axis = !axis_lbl.empty();
+}
+
+void pp_set_not_draggable(PushPullPlan& plan, const std::string& reason) {
+    plan.draggable = false;
+    plan.reason = reason;
+}
+
+// plan_edit dispatch on the face surface + feature type -> the single drivable param.
+void pp_plan_edit(const json& doc, const json& feat, const TopoInfo& info, double distance,
+                  PushPullPlan& plan) {
+    const std::string& ftype = plan.ftype;
+    const std::string surf = info.surf.value_or("");
+
+    if (surf == "plane") {
+        // An offset/midplane datum's planar face moves with its offset param.
+        if (ftype == "plane" && pp_dim_value(feat, "offset").has_value()) {
+            const std::string key = "offset";
+            if (pp_has_expr(feat, key)) {
+                pp_set_not_draggable(plan, "param 'offset' is equation-driven (expr)");
+                return;
+            }
+            double old = *pp_dim_value(feat, key);
+            plan.draggable = true;
+            plan.param = key;
+            plan.old_value = old;
+            plan.new_value = old + distance;  // offset is unclamped (can go negative)
+            plan.clamped = false;
+            plan.axis = "normal";
+            plan.has_axis = true;
+            return;
+        }
+        // _plan_for_planar
+        std::string axis_lbl = pp_axis_label(info.axis);
+        if (ftype == "box") {
+            if (axis_lbl.empty()) {
+                pp_set_not_draggable(plan, "box face normal is not aligned to a principal axis");
+                return;
+            }
+            const std::string key = axis_lbl == "x" ? "length" : axis_lbl == "y" ? "width" : "height";
+            double old = pp_dim_value(feat, key).value_or(20.0);
+            pp_length_plan(plan, feat, key, old, distance, axis_lbl);
+            return;
+        }
+        if (ftype == "cylinder" || ftype == "cone") {
+            double old = pp_dim_value(feat, "height").value_or(20.0);
+            pp_length_plan(plan, feat, "height", old, distance, axis_lbl.empty() ? "axial" : axis_lbl);
+            return;
+        }
+        if (ftype == "extrude") {
+            const json& p = feat.contains("params") && feat["params"].is_object() ? feat["params"]
+                                                                                  : json::object();
+            std::string end = p.is_object() ? p.value("end", std::string("blind")) : "blind";
+            if (end != "blind") {
+                pp_set_not_draggable(
+                    plan, "extrude end condition '" + end + "' has no single blind-depth param to drag");
+                return;
+            }
+            std::optional<Eigen::Vector3d> ext_axis = pp_extrude_axis(doc, feat);
+            if (ext_axis && info.axis) {
+                Eigen::Vector3d a = *info.axis;
+                double n = a.norm();
+                if (n > 1e-12) a /= n;
+                if (std::abs(a.dot(*ext_axis)) < kPpParallelTol) {
+                    pp_set_not_draggable(plan,
+                        "dragged face is a side wall of the extrude (normal perpendicular to the "
+                        "extrude axis), not a depth cap");
+                    return;
+                }
+            }
+            double old = pp_dim_value(feat, "depth").value_or(10.0);
+            pp_length_plan(plan, feat, "depth", old, distance, axis_lbl.empty() ? "n" : axis_lbl);
+            return;
+        }
+        pp_set_not_draggable(plan, "planar face of feature type '" + ftype + "' is not push-pull drivable");
+        return;
+    }
+    if (surf == "cylinder") {
+        if (ftype == "cylinder") {
+            const std::string key = "radius";
+            if (pp_has_expr(feat, key)) {
+                pp_set_not_draggable(plan, "param 'radius' is equation-driven (expr)");
+                return;
+            }
+            double old = pp_dim_value(feat, key).value_or(10.0);
+            double nv = old + distance;
+            bool clamped = false;
+            if (nv < kPpMinDim) { nv = kPpMinDim; clamped = true; }
+            plan.draggable = true;
+            plan.param = key;
+            plan.old_value = old;
+            plan.new_value = nv;
+            plan.clamped = clamped;
+            plan.axis = "radial";
+            plan.has_axis = true;
+            return;
+        }
+        if (ftype == "hole") {
+            const json& p = feat.contains("params") && feat["params"].is_object() ? feat["params"]
+                                                                                  : json::object();
+            std::string standard = p.is_object() && p.contains("standard") && p["standard"].is_string()
+                                       ? p["standard"].get<std::string>() : "custom";
+            if (standard != "custom") {
+                pp_set_not_draggable(plan,
+                    "hole bore is driven by standard '" + standard + "', not a free diameter");
+                return;
+            }
+            const std::string key = "diameter";
+            if (pp_has_expr(feat, key)) {
+                pp_set_not_draggable(plan, "param 'diameter' is equation-driven (expr)");
+                return;
+            }
+            double old = pp_dim_value(feat, key).value_or(3.4);
+            double nv = old + 2.0 * distance;  // radial change doubles the diameter
+            bool clamped = false;
+            if (nv < kPpMinDim) { nv = kPpMinDim; clamped = true; }
+            plan.draggable = true;
+            plan.param = key;
+            plan.old_value = old;
+            plan.new_value = nv;
+            plan.clamped = clamped;
+            plan.axis = "radial";
+            plan.has_axis = true;
+            return;
+        }
+        pp_set_not_draggable(plan, "cylindrical face of feature type '" + ftype + "' is not push-pull drivable");
+        return;
+    }
+    if (ftype == "revolve") {
+        pp_set_not_draggable(plan, "revolve is angle-driven; dragging a revolved face is not a push-pull");
+        return;
+    }
+    pp_set_not_draggable(plan, "face surface '" + surf + "' of feature '" + ftype +
+                                   "' maps to no single push-pull param");
+}
+
+}  // namespace
+
+PushPullPlan plan_push_pull(const json& doc, const json& env, int body_id, int topo_id,
+                            double distance) {
+    PushPullPlan plan;
+    if (doc.is_object() && doc.value("schema", std::string()) == "aicad.asm/1")
+        throw OpError("invalid_op", "doc_push_pull: not supported on assemblies", {{"reason", "assembly"}});
+
+    CompileResult r = compile_document(doc, env);
+    const int nbodies = static_cast<int>(r.shapes.size());
+    if (body_id < 1 || body_id > nbodies)
+        throw OpError("invalid_op",
+                      "body_id " + std::to_string(body_id) + " out of range (1.." +
+                          std::to_string(nbodies) + ")",
+                      {{"reason", "bad body_id"}});
+    const TopoDS_Shape& shape = r.shapes[body_id - 1];
+    std::vector<TopoInfo> infos = describe_faces(shape);
+    const int nfaces = static_cast<int>(infos.size());
+    if (topo_id < 1 || topo_id > nfaces)
+        throw OpError("invalid_op",
+                      "topo_id " + std::to_string(topo_id) + " out of range (1.." +
+                          std::to_string(nfaces) + ") for faces",
+                      {{"reason", "bad topo_id"}});
+    const TopoInfo& info = infos[topo_id - 1];
+
+    // Owner = the feature owning (body_id, topo_id) per the owner map (same scan as
+    // resolve_pick; FACE describe order == MapShapes order, so topo_id aligns).
+    std::optional<std::string> owner;
+    if (r.owner_map.is_object()) {
+        for (auto it = r.owner_map.begin(); it != r.owner_map.end() && !owner; ++it) {
+            const json& rec = it.value();
+            if (!rec.contains("faces") || !rec["faces"].is_array()) continue;
+            for (const json& pr : rec["faces"])
+                if (pr.is_array() && pr.size() == 2 && pr[0].get<int>() == body_id &&
+                    pr[1].get<int>() == topo_id) {
+                    owner = it.key();
+                    break;
+                }
+        }
+    }
+    if (!owner) {
+        pp_set_not_draggable(plan, "picked face has no owning feature in the owner map");
+        return plan;
+    }
+    plan.owner_fid = *owner;
+    const json* feat = pp_feature_by_id(doc, *owner);
+    if (!feat) {
+        pp_set_not_draggable(plan, "owner feature '" + *owner + "' not found in the document");
+        return plan;
+    }
+    plan.ftype = feat->value("type", std::string());
+    pp_plan_edit(doc, *feat, info, distance, plan);
+    return plan;
 }
 
 }  // namespace aicad::doc

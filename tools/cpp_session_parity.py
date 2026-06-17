@@ -535,6 +535,90 @@ def main() -> int:
     mism += cfg_mism[0]
     cfg_total = 13
 
+    # 4h) Instant3D push-pull (doc_push_pull): drag each face of a body and compare the
+    # planned param + new value. Face enumeration order can differ between the OCCT-direct
+    # primitive and build123d's, so we compare the order-independent MULTISET of plan tuples
+    # over all of a body's faces — both engines must drive the SAME params to the SAME values.
+    from engine.doc import instant3d as _i3d
+
+    def _box_ops():
+        return [{"op": "add_feature", "feature": {"type": "box", "name": "Box1", "params": {
+            "length": {"value": 30, "expr": None}, "width": {"value": 20, "expr": None},
+            "height": {"value": 10, "expr": None}}}}]
+
+    def _cyl_ops():
+        return [{"op": "add_feature", "feature": {"type": "cylinder", "name": "Cyl1", "params": {
+            "radius": {"value": 10, "expr": None}, "height": {"value": 25, "expr": None}}}}]
+
+    def _sphere_ops():
+        return [{"op": "add_feature", "feature": {"type": "sphere", "name": "Sph1",
+                 "params": {"radius": {"value": 12, "expr": None}}}}]
+
+    def pp_tuple(r):
+        ov, nv = r.get("old_value"), r.get("new_value")
+        return (bool(r.get("draggable")), r.get("param"), r.get("axis"),
+                None if ov is None else round(float(ov), 4),
+                None if nv is None else round(float(nv), 4),
+                None if r.get("clamped") is None else bool(r.get("clamped")))
+
+    def py_pp(ops, tid, dist):
+        e = py_session(); e.apply(0, ops)
+        return _i3d.push_pull(e.s, 1, tid, float(dist), False)
+
+    def cpp_pp(ops, tid, dist):
+        e = CppS(core); e.apply(0, ops)
+        rc, r = core.call("doc_push_pull",
+                          {"doc_id": e.doc_id, "body_id": 1, "topo_id": tid, "distance": dist})
+        return r
+
+    def pp_multiset(ops, n, dist, src):
+        rows = [pp_tuple(src(ops, tid, dist)) for tid in range(1, n + 1)]
+        return sorted(rows, key=lambda t: (str(t[1]), str(t[2]), -1e9 if t[3] is None else t[3]))
+
+    pp_total = 0
+    for label, ops, n, dist in [
+        ("box +3 (l/w/h)", _box_ops(), 6, 3.0),
+        ("box -1000 (clamp 0.1)", _box_ops(), 6, -1000.0),
+        ("cylinder +2 (r + h)", _cyl_ops(), 3, 2.0),
+        ("sphere (not draggable)", _sphere_ops(), 1, 5.0),
+        ("extrude cap=depth/wall=no", rect_then_extrude(10.0), 6, 4.0),
+    ]:
+        pp_total += 1
+        try:
+            pm = pp_multiset(ops, n, dist, py_pp)
+            cm = pp_multiset(ops, n, dist, cpp_pp)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {('pp ' + label):<28} DIFF: raised {type(exc).__name__}: {exc}")
+            mism += 1
+            continue
+        if pm == cm:
+            print(f"  {('pp ' + label):<28} MATCH")
+        else:
+            # show the first differing tuple for a compact message
+            extra = [t for t in cm if t not in pm][:1] or [t for t in pm if t not in cm][:1]
+            print(f"  {('pp ' + label):<28} DIFF: {extra}")
+            mism += 1
+
+    # 4i) push-pull edge cases driven by topo/body bounds + zero-distance preview.
+    ppe = CppS(core); ppe.apply(0, _box_ops())
+    ppy = py_session(); ppy.apply(0, _box_ops())
+    # zero-distance: draggable, new == old, no mutation beyond a rebuild
+    rc, cz = core.call("doc_push_pull",
+                       {"doc_id": ppe.doc_id, "body_id": 1, "topo_id": 1, "distance": 0.0})
+    pz = _i3d.push_pull(ppy.s, 1, 1, 0.0, False)
+    zero_ok = (pp_tuple(cz) == pp_tuple(pz) and cz.get("draggable") and
+               abs(float(cz["new_value"]) - float(cz["old_value"])) < 1e-9)
+    print(f"  {'pp zero-distance preview':<28} {'MATCH' if zero_ok else 'DIFF: ' + str(cz)[:80]}")
+    pp_total += 1
+    mism += 0 if zero_ok else 1
+    # out-of-range body/topo -> structured invalid_op on both
+    rc, bad = core.call("doc_push_pull",
+                        {"doc_id": ppe.doc_id, "body_id": 9, "topo_id": 1, "distance": 1.0})
+    bad_ok = (rc != 0 and bad.get("code") == "invalid_op")
+    print(f"  {'pp bad body_id':<28} {'MATCH' if bad_ok else 'DIFF: ' + str(bad)[:80]}")
+    pp_total += 1
+    mism += 0 if bad_ok else 1
+
     # 5) stale_revision guard (base 0 now stale)
     rc, cr = core.call("doc_apply_ops", {"doc_id": cpp.doc_id, "base_revision": 0, "ops": []})
     code = cr.get("code") or cr.get("detail", {})
@@ -542,7 +626,7 @@ def main() -> int:
     print(f"  {'stale_revision guard':<28} {'MATCH' if ok else 'DIFF: ' + str(cr)}")
     mism += 0 if ok else 1
 
-    total = 12 + adv_total + cfg_total
+    total = 12 + adv_total + cfg_total + pp_total
     print(f"\n[session-parity] {total - mism}/{total} steps at full parity")
     return mism
 

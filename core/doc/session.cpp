@@ -1459,6 +1459,101 @@ json doc_resolve_pick(const std::string& doc_id, int body_id, const std::string&
     return json{{"selector", sel}};
 }
 
+json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double distance,
+                   bool commit) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    // plan_push_pull compiles + resolves the face owner (throws OpError on a bad
+    // body_id/topo_id), never mutating the doc.
+    PushPullPlan plan = plan_push_pull(s.doc, env_from_doc(s.doc), body_id, topo_id, distance);
+
+    // The draggable plan fields (axis is JSON null when not axis-aligned).
+    auto add_plan_fields = [&](json& out) {
+        out["feature_id"] = plan.owner_fid;
+        out["feature_type"] = plan.ftype;
+        out["param"] = plan.param;
+        out["axis"] = plan.has_axis ? json(plan.axis) : json(nullptr);
+        out["old_value"] = plan.old_value;
+        out["new_value"] = plan.new_value;
+        out["distance"] = distance;
+        out["clamped"] = plan.clamped;
+    };
+    auto merge = [](json& out, const json& resp) {
+        for (auto it = resp.begin(); it != resp.end(); ++it) out[it.key()] = it.value();
+    };
+
+    if (!plan.draggable) {
+        json out = {{"ok", true}, {"draggable", false}, {"reason", plan.reason}};
+        if (!plan.owner_fid.empty()) out["feature_id"] = plan.owner_fid;
+        if (!plan.ftype.empty()) out["feature_type"] = plan.ftype;
+        return out;
+    }
+
+    // A zero-distance drag is a no-op preview: report the plan + a fresh rebuild, no
+    // mutation / no revision bump.
+    if (std::abs(plan.new_value - plan.old_value) < 1e-12) {
+        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        json out = {{"ok", true}, {"draggable", true}};
+        add_plan_fields(out);
+        merge(out, ops_response(s, r, json::object(), /*with_tess=*/true));
+        return out;
+    }
+
+    // Apply the param delta on a working copy (transactional — a throw leaves the
+    // session untouched). Keep a dim object's shape; clear any stale expr.
+    const std::string pre_snapshot = s.doc.dump();
+    json working = s.doc;
+    json* nf = find_feature(working, plan.owner_fid);
+    if (!nf) {  // owner came from the owner map, so this should not happen
+        json out = {{"ok", true}, {"draggable", false},
+                    {"reason", "owner feature '" + plan.owner_fid + "' vanished before edit"},
+                    {"feature_id", plan.owner_fid}, {"feature_type", plan.ftype}};
+        return out;
+    }
+    if (!nf->contains("params") || !(*nf)["params"].is_object()) (*nf)["params"] = json::object();
+    json& p = (*nf)["params"];
+    if (p.contains(plan.param) && p[plan.param].is_object()) {
+        p[plan.param]["value"] = plan.new_value;
+        p[plan.param]["expr"] = nullptr;
+    } else {
+        p[plan.param] = {{"value", plan.new_value}, {"expr", nullptr}};
+    }
+
+    // Commit pushes ONE undo entry of the pre-edit doc; a transient preview pushes none.
+    if (commit) {
+        s.undo_stack.push_back(pre_snapshot);
+        if (s.undo_stack.size() > kUndoLimit) s.undo_stack.erase(s.undo_stack.begin());
+        s.redo_stack.clear();
+    }
+    s.doc = std::move(working);
+    s.revision += 1;
+    s.dirty = true;
+
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+
+    // A value that collapses the body (no surviving solid) rolls back fully — the body
+    // stays at its last valid size (instant3d.py _result_is_degenerate / _rollback_edit).
+    if (r.body_count == 0) {
+        s.doc = json::parse(pre_snapshot);
+        s.revision += 1;  // the rollback is itself a revision step (Python contract)
+        if (commit && !s.undo_stack.empty() && s.undo_stack.back() == pre_snapshot)
+            s.undo_stack.pop_back();
+        CompileResult rb = compile_document(s.doc, env_from_doc(s.doc));
+        json out = {{"ok", true}, {"draggable", false},
+                    {"reason", "the new value removes all material (the body would vanish) — "
+                               "drag limited to the last valid size"},
+                    {"feature_id", plan.owner_fid}, {"feature_type", plan.ftype}};
+        merge(out, ops_response(s, rb, json::object(), /*with_tess=*/true));
+        return out;
+    }
+
+    json out = {{"ok", true}, {"draggable", true}};
+    add_plan_fields(out);
+    out["committed"] = commit;
+    merge(out, ops_response(s, r, json::object(), /*with_tess=*/true));
+    return out;
+}
+
 json doc_save(const std::string& doc_id, const std::string& path) {
     std::lock_guard<std::mutex> lk(g_mtx);
     Session& s = require_session(doc_id);

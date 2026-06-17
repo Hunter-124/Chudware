@@ -81,6 +81,30 @@ struct CompileResult {
 // that is the parametric-rebuild payoff.
 CompileResult compile_document(const nlohmann::json& doc, const nlohmann::json& env);
 
+// One push-pull plan: which feature/param a dragged face drives + the new value
+// (port of engine/doc/instant3d.py plan_edit). `draggable==false` carries a `reason`.
+struct PushPullPlan {
+    bool draggable = false;
+    std::string reason;       // why not draggable (when draggable==false)
+    std::string owner_fid;    // owning feature id ("" if the face has no owner)
+    std::string ftype;        // owning feature type
+    std::string param;        // drivable param key (when draggable)
+    double old_value = 0.0;
+    double new_value = 0.0;
+    bool clamped = false;     // new_value was limited to the 0.1mm floor
+    std::string axis;         // axis label x/y/z/radial/normal/n/axial ("" = none)
+    bool has_axis = false;    // false -> emit axis as JSON null
+};
+
+// Plan a push-pull drag of face (1-based body_id, 1-based topo_id) by `distance` mm.
+// Compiles `doc`, resolves the picked face's owning feature from the owner map, and
+// dispatches on the face surface + feature type to the single drivable length/radius/
+// offset param. NEVER mutates the doc. Throws OpError("invalid_op") for an out-of-range
+// body_id/topo_id or an assembly (mirrors instant3d.py _resolve_face_owner); otherwise
+// returns a plan whose `draggable` flag tells the caller whether to apply it.
+PushPullPlan plan_push_pull(const nlohmann::json& doc, const nlohmann::json& env,
+                            int body_id, int topo_id, double distance);
+
 // Resolve a host PICK into a re-resolvable selector: compile `doc`, take the surviving
 // body at 1-based `body_id`, and describe its `kind` ("face"/"edge"/"vertex") sub-shape
 // at 1-based `topo_id` (TopExp::MapShapes numbering = the host's pick ids), tagging the

@@ -87,6 +87,15 @@ nlohmann::json doc_config_set_suppression(const std::string& doc_id, const std::
 nlohmann::json doc_resolve_pick(const std::string& doc_id, int body_id,
                                 const std::string& kind, int topo_id);
 
+// Instant3D push-pull: drag face (1-based body_id, 1-based topo_id) by `distance` mm
+// along its outward normal. Plans the drivable feature param (plan_push_pull), and on
+// a real change applies it, rebuilds, and returns the plan fields + ops-response. A
+// non-drivable face returns {draggable:false, reason}; a value that would collapse the
+// body rolls back. `commit` (default false = transient preview) pushes one undo entry.
+// Port of engine/doc/instant3d.py push_pull. Throws OpError for a bad body_id/topo_id.
+nlohmann::json doc_push_pull(const std::string& doc_id, int body_id, int topo_id,
+                             double distance, bool commit);
+
 // Persist the session to `path` (or its current path if `path` is empty) as a
 // .step+ container. Clears the dirty flag, records the path. Returns {"path": ...}.
 // Throws OpError("io_error") if no path is available, or on a write failure.

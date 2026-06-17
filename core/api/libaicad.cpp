@@ -196,6 +196,39 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 return emit(aicad::doc::doc_revert(params.value("doc_id", std::string()),
                                                    params.value("checkpoint", std::string())),
                             out_json, 0);
+            if (m == "config_list")
+                return emit(aicad::doc::doc_config_list(params.value("doc_id", std::string())),
+                            out_json, 0);
+            if (m == "config_add")
+                return emit(aicad::doc::doc_config_add(
+                                params.value("doc_id", std::string()),
+                                params.value("name", std::string()),
+                                params.contains("copy_from") ? params["copy_from"] : json(nullptr)),
+                            out_json, 0);
+            if (m == "config_delete")
+                return emit(aicad::doc::doc_config_delete(params.value("doc_id", std::string()),
+                                                          params.value("name", std::string())),
+                            out_json, 0);
+            if (m == "config_activate")
+                return emit(aicad::doc::doc_config_activate(params.value("doc_id", std::string()),
+                                                            params.value("name", std::string())),
+                            out_json, 0);
+            if (m == "config_set_override")
+                return emit(aicad::doc::doc_config_set_override(
+                                params.value("doc_id", std::string()),
+                                params.value("name", std::string()),
+                                params.value("feature_id", std::string()),
+                                params.value("param", std::string()),
+                                params.contains("value") ? params["value"] : json(nullptr),
+                                params.value("clear", false)),
+                            out_json, 0);
+            if (m == "config_set_suppression")
+                return emit(aicad::doc::doc_config_set_suppression(
+                                params.value("doc_id", std::string()),
+                                params.value("name", std::string()),
+                                params.value("feature_id", std::string()),
+                                params.value("suppressed", false)),
+                            out_json, 0);
             if (m == "doc_save")
                 return emit(aicad::doc::doc_save(params.value("doc_id", std::string()),
                                                  params.value("path", std::string())),

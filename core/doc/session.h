@@ -66,6 +66,22 @@ nlohmann::json doc_list();
 nlohmann::json doc_checkpoint(const std::string& doc_id);
 nlohmann::json doc_revert(const std::string& doc_id, const std::string& checkpoint_id);
 
+// Named configurations (engine.doc.session config_*). config_list is read-only
+// ({configurations, active, detail}); the mutators edit the doc's configurations
+// list, validate the result, push one undo step, bump the revision, recompile the
+// active config, and return the ops-response. A bad name / duplicate / last-config
+// delete / invalid override throws OpError("invalid_op").
+nlohmann::json doc_config_list(const std::string& doc_id);
+nlohmann::json doc_config_add(const std::string& doc_id, const std::string& name,
+                              const nlohmann::json& copy_from);
+nlohmann::json doc_config_delete(const std::string& doc_id, const std::string& name);
+nlohmann::json doc_config_activate(const std::string& doc_id, const std::string& name);
+nlohmann::json doc_config_set_override(const std::string& doc_id, const std::string& name,
+                                       const std::string& feature_id, const std::string& param,
+                                       const nlohmann::json& value, bool clear);
+nlohmann::json doc_config_set_suppression(const std::string& doc_id, const std::string& name,
+                                          const std::string& feature_id, bool suppressed);
+
 // Resolve a viewport pick (1-based body ordinal + kind + 1-based MapShapes topo id)
 // into a selector json {selector: {...}}. Throws OpError("unknown_doc"/...).
 nlohmann::json doc_resolve_pick(const std::string& doc_id, int body_id,

@@ -66,6 +66,10 @@ struct CompileResult {
     // Lets a caller describe a picked body's topology (doc_resolve_pick).
     std::vector<TopoDS_Shape> shapes;
     bool ok = false;                      // true iff every feature compiled ok
+    // The active configuration whose overrides/suppressions this compile reflects
+    // ("Default" for a config-less doc). Surfaced in the ops-response doc_status so
+    // the host's config switcher knows which config the geometry matches.
+    std::string active_configuration = "Default";
 };
 
 // Compile a document into geometry. `doc` = {"features":[ ... ]}. `env` maps

@@ -384,6 +384,70 @@ json normalize_feature(const json& raw) {
 }  // namespace
 
 // ----------------------------------------------------------------- compile_document
+// --------------------------------------------------------------------------- configurations
+// Pick the active configuration: {name, config-or-null}. A config-less doc compiles as
+// the implicit "Default" (null config). Otherwise active_configuration selects by name;
+// a missing/unknown pointer falls back to the FIRST config (SolidWorks always has one
+// active). Mirrors compiler.py::resolve_active_config.
+std::pair<std::string, const json*> resolve_active_config(const json& doc) {
+    static const char* kDefault = "Default";
+    if (!doc.contains("configurations") || !doc["configurations"].is_array() ||
+        doc["configurations"].empty())
+        return {kDefault, nullptr};
+    const json& configs = doc["configurations"];
+    std::string active = doc.value("active_configuration", std::string());
+    if (!active.empty()) {
+        for (const json& c : configs)
+            if (c.is_object() && c.value("name", std::string()) == active) return {active, &c};
+    }
+    const json& first = configs[0];
+    std::string name = first.is_object() ? first.value("name", std::string()) : std::string();
+    return {name.empty() ? kDefault : name, first.is_object() ? &first : nullptr};
+}
+
+// Overlay the active config onto `features` and return a NEW effective list: per
+// feature, suppressed |= config.suppressions[fid] and params[key] replaced by
+// config.param_overrides["fid.key"]. config==null returns features unchanged.
+// Mirrors compiler.py::_config_effective_features.
+json config_effective_features(const json& features, const json* config) {
+    if (!config) return features;
+    const json overrides = config->contains("param_overrides") && (*config)["param_overrides"].is_object()
+                               ? (*config)["param_overrides"] : json::object();
+    const json suppressions = config->contains("suppressions") && (*config)["suppressions"].is_object()
+                                  ? (*config)["suppressions"] : json::object();
+    if (overrides.empty() && suppressions.empty()) return features;
+
+    // Bucket overrides by feature id: {fid: {param_key: value}}.
+    std::map<std::string, json> by_fid;
+    for (auto it = overrides.begin(); it != overrides.end(); ++it) {
+        const std::string& key = it.key();
+        auto dot = key.find('.');
+        if (dot == std::string::npos) continue;
+        by_fid[key.substr(0, dot)][key.substr(dot + 1)] = it.value();
+    }
+    json out = json::array();
+    for (const json& feat : features) {
+        if (!feat.is_object()) { out.push_back(feat); continue; }
+        const std::string fid = feat.value("id", std::string());
+        auto pit = by_fid.find(fid);
+        const bool has_param = pit != by_fid.end();
+        const bool has_sup = suppressions.contains(fid);
+        if (!has_param && !has_sup) { out.push_back(feat); continue; }
+        json ef = feat;
+        if (has_sup)
+            ef["suppressed"] = feat.value("suppressed", false) || suppressions[fid].get<bool>();
+        if (has_param) {
+            json params = feat.contains("params") && feat["params"].is_object() ? feat["params"]
+                                                                                : json::object();
+            for (auto it = pit->second.begin(); it != pit->second.end(); ++it)
+                params[it.key()] = it.value();
+            ef["params"] = params;
+        }
+        out.push_back(ef);
+    }
+    return out;
+}
+
 CompileResult compile_document(const json& doc, const json& env_json) {
     CompileResult result;
     const EnvMap env = parse_env(env_json);
@@ -420,7 +484,14 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     };
 
     const json empty = json::array();
-    const json& features = doc.contains("features") ? doc.at("features") : empty;
+    const json& base_features = doc.contains("features") ? doc.at("features") : empty;
+
+    // Configuration overlay: compile the ACTIVE config's effective features (param
+    // overrides + suppression). A config-less doc returns the base list unchanged.
+    auto [active_cfg_name, active_cfg] = resolve_active_config(doc);
+    result.active_configuration = active_cfg_name;
+    const json features = config_effective_features(base_features.is_array() ? base_features : empty,
+                                                    active_cfg);
 
     for (const json& raw : features.is_array() ? features : empty) {
         // Accept the host's canonical {params,refs} shape OR the simplified flat

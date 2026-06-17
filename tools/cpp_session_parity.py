@@ -479,6 +479,62 @@ def main() -> int:
     print(f"  {'revert bad checkpoint':<28} {'MATCH' if bad_ok else 'DIFF: ' + str(bad)}")
     mism += 0 if bad_ok else 1
 
+    # 4g) Named configurations (config_*): drive the SAME config edits through both engines.
+    # The KEY parity signal is VOLUME — activating a config must apply its param overrides +
+    # suppressions to the geometry identically. config_list is read-only (compared field-by-
+    # field); the mutators return ops-responses (compared via compare(), incl. volume).
+    pyg, cppg = py_session(), CppS(core)
+    pyg.apply(0, rect_then_extrude(10.0))   # f1 sketch + f2 extrude -> 40x30x10 box, rev->1
+    cppg.apply(0, rect_then_extrude(10.0))
+    cfg_mism = [0]
+
+    def cfg_list_cmp(label):
+        pr = _ls.config_list(pyg.s)
+        rc, cr = core.call("config_list", {"doc_id": cppg.doc_id})
+        if pr != cr:
+            print(f"  {('cfg ' + label):<28} DIFF: {str(pr)[:60]} != {str(cr)[:60]}")
+            cfg_mism[0] += 1
+        else:
+            print(f"  {('cfg ' + label):<28} MATCH")
+
+    def cfg_op(label, method, py_kwargs, cpp_params, vol_check=True):
+        pr = getattr(_ls, method)(pyg.s, **py_kwargs, emit=None)
+        rc, cr = core.call(method, {"doc_id": cppg.doc_id, **cpp_params})
+        cfg_mism[0] += compare("cfg " + label, pyg, cppg, pr, cr, vol_check=vol_check)
+
+    def cfg_err(label, method, cpp_params):
+        rc, cr = core.call(method, {"doc_id": cppg.doc_id, **cpp_params})
+        ok = (rc != 0 and cr.get("code") == "invalid_op")
+        print(f"  {('cfg ' + label):<28} {'MATCH' if ok else 'DIFF: ' + str(cr)[:80]}")
+        cfg_mism[0] += 0 if ok else 1
+
+    cfg_list_cmp("list (config-less)")                                   # implicit Default
+    cfg_op("add Tall", "config_add",
+           {"name": "Tall"}, {"name": "Tall"})                          # materializes Default+Tall
+    cfg_op("override Tall.f2 (inactive)", "config_set_override",
+           {"name": "Tall", "feature_id": "f2", "param": "depth", "value": {"value": 25.0, "expr": None}},
+           {"name": "Tall", "feature_id": "f2", "param": "depth", "value": {"value": 25.0, "expr": None}})
+    cfg_op("activate Tall", "config_activate",
+           {"name": "Tall"}, {"name": "Tall"})                          # vol 12000 -> 30000
+    cfg_op("activate Default", "config_activate",
+           {"name": "Default"}, {"name": "Default"})                    # vol -> 12000
+    cfg_op("suppress f2 on Default", "config_set_suppression",
+           {"name": "Default", "feature_id": "f2", "suppressed": True},
+           {"name": "Default", "feature_id": "f2", "suppressed": True})  # body vanishes, vol -> 0
+    cfg_op("un-suppress f2 on Default", "config_set_suppression",
+           {"name": "Default", "feature_id": "f2", "suppressed": False},
+           {"name": "Default", "feature_id": "f2", "suppressed": False})  # vol -> 12000
+    cfg_list_cmp("list (Default+Tall)")
+    cfg_op("delete Tall", "config_delete",
+           {"name": "Tall"}, {"name": "Tall"})
+    cfg_err("add duplicate Default", "config_add", {"name": "Default"})
+    cfg_err("delete last (Default)", "config_delete", {"name": "Default"})
+    cfg_err("activate unknown", "config_activate", {"name": "Nope"})
+    cfg_err("override bad feature id", "config_set_override",
+            {"name": "Default", "feature_id": "fZ", "param": "depth", "value": 5})
+    mism += cfg_mism[0]
+    cfg_total = 13
+
     # 5) stale_revision guard (base 0 now stale)
     rc, cr = core.call("doc_apply_ops", {"doc_id": cpp.doc_id, "base_revision": 0, "ops": []})
     code = cr.get("code") or cr.get("detail", {})
@@ -486,7 +542,7 @@ def main() -> int:
     print(f"  {'stale_revision guard':<28} {'MATCH' if ok else 'DIFF: ' + str(cr)}")
     mism += 0 if ok else 1
 
-    total = 12 + adv_total
+    total = 12 + adv_total + cfg_total
     print(f"\n[session-parity] {total - mism}/{total} steps at full parity")
     return mism
 

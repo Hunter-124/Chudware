@@ -23,10 +23,12 @@ bool cppDocsFlag() {
     return f && f[0] && f[0] != '0';
 }
 bool routeDocToCpp(const std::string& method, const json& params) {
-    if (method.rfind("doc_", 0) != 0) return false;  // only doc_* methods
     if (method == "doc_compile_cpp" || method == "doc_validate") return false;  // diagnostics
-    // A C++-backed doc carries a doc-cpp id -> all its calls go to C++ (even if the flag
-    // was since toggled off, so a live doc keeps its engine for its whole lifetime).
+    // A C++-backed doc carries a doc-cpp id -> EVERY call operating on it routes to the
+    // C++ core for that doc's whole lifetime (even if the flag was since toggled off).
+    // This is NOT limited to doc_* — config_* / weld_* / export_* / etc. all carry the
+    // doc_id and belong to the same document. An unported method then fails loud in the
+    // core (no Python doc to fall back to), surfacing the gap rather than misrouting.
     if (params.is_object()) {
         auto it = params.find("doc_id");
         if (it != params.end() && it->is_string() &&

@@ -1066,7 +1066,7 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
         resp["rebuild"] = {{"feature_status", fs},
                            {"doc_status", {{"active_sketch", nullptr},
                                            {"mates", nullptr},
-                                           {"active_configuration", "Default"}}}};
+                                           {"active_configuration", r.active_configuration}}}};
         std::string aicm_path;
         if (!r.aicm.empty()) {
             std::filesystem::path target = aicm_file(s.doc_id, s.revision);
@@ -1096,6 +1096,73 @@ void push_undo(Session& s) {
     if (s.undo_stack.size() > kUndoLimit)
         s.undo_stack.erase(s.undo_stack.begin());
     s.redo_stack.clear();
+}
+
+// ----------------------------------------------------------------- configurations
+// The active config name with the implicit-Default + first-config fallbacks
+// (mirrors session.py::_config_active_name -> compiler.resolve_active_config).
+std::string config_active_name(const json& doc) {
+    if (!doc.contains("configurations") || !doc["configurations"].is_array() ||
+        doc["configurations"].empty())
+        return "Default";
+    const json& configs = doc["configurations"];
+    std::string active = doc.value("active_configuration", std::string());
+    if (!active.empty())
+        for (const json& c : configs)
+            if (c.is_object() && c.value("name", std::string()) == active) return active;
+    const json& first = configs[0];
+    std::string name = first.is_object() ? first.value("name", std::string()) : std::string();
+    return name.empty() ? std::string("Default") : name;
+}
+
+// The doc's configurations array, materializing the implicit Default on first edit
+// (session.py::_ensure_configs). Returns a reference into doc.
+json& ensure_configs(json& doc) {
+    if (!doc.contains("configurations") || !doc["configurations"].is_array())
+        doc["configurations"] = json::array();
+    json& configs = doc["configurations"];
+    if (configs.empty()) {
+        configs.push_back({{"name", "Default"}, {"param_overrides", json::object()},
+                           {"suppressions", json::object()}});
+        if (!doc.contains("active_configuration")) doc["active_configuration"] = "Default";
+    }
+    return configs;
+}
+
+// The config named `name`, or throw invalid_op (session.py::_find_config).
+json& find_config(json& doc, const std::string& name) {
+    if (doc.contains("configurations") && doc["configurations"].is_array())
+        for (json& c : doc["configurations"])
+            if (c.is_object() && c.value("name", std::string()) == name) return c;
+    throw OpError("invalid_op", "no configuration named '" + name + "'",
+                  {{"reason", "unknown configuration"}, {"name", name}});
+}
+
+// Validate the edited working doc; throw invalid_op listing the errors if broken
+// (session.py::_validate_or_rollback — here the caller works on a COPY, so a throw
+// leaves the live session untouched without an explicit rollback).
+void validate_config_edit(const json& working) {
+    std::vector<std::string> errs = validate_document(working);
+    if (errs.empty()) return;
+    std::string joined;
+    for (std::size_t i = 0; i < errs.size() && i < 5; ++i) {
+        if (i) joined += "; ";
+        joined += errs[i];
+    }
+    throw OpError("invalid_op", "configuration edit produced an invalid document: " + joined,
+                  {{"reason", "invalid configuration"}, {"errors", errs}});
+}
+
+// Commit a validated config edit: push one undo step, swap in the working doc, bump
+// the revision, recompile, and return the ops-response (session.py::_config_commit;
+// the C++ session always recompiles, so rebuild_needed is moot — same geometry).
+json config_commit(Session& s, json&& working) {
+    push_undo(s);
+    s.doc = std::move(working);
+    s.revision += 1;
+    s.dirty = true;
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    return ops_response(s, r, json::object(), /*with_tess=*/true);
 }
 
 }  // namespace
@@ -1252,6 +1319,136 @@ json doc_revert(const std::string& doc_id, const std::string& checkpoint_id) {
     s.dirty = true;
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     return ops_response(s, r, json::object(), /*with_tess=*/true);
+}
+
+json doc_config_list(const std::string& doc_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json names = json::array();
+    std::string active;
+    const json& configs = s.doc.contains("configurations") ? s.doc["configurations"] : json();
+    if (configs.is_array() && !configs.empty()) {
+        for (const json& c : configs)
+            if (c.is_object()) names.push_back(c.value("name", json(nullptr)));
+        active = config_active_name(s.doc);
+    } else {
+        names.push_back("Default");
+        active = "Default";
+    }
+    json detail = json::array();
+    if (configs.is_array())
+        for (const json& c : configs)
+            if (c.is_object())
+                detail.push_back({{"name", c.value("name", json(nullptr))},
+                                  {"param_overrides", c.contains("param_overrides") && c["param_overrides"].is_object()
+                                                          ? c["param_overrides"] : json::object()},
+                                  {"suppressions", c.contains("suppressions") && c["suppressions"].is_object()
+                                                       ? c["suppressions"] : json::object()}});
+    if (detail.empty())
+        detail.push_back({{"name", "Default"}, {"param_overrides", json::object()},
+                          {"suppressions", json::object()}});
+    return json{{"configurations", names}, {"active", active}, {"detail", detail}};
+}
+
+json doc_config_add(const std::string& doc_id, const std::string& name, const json& copy_from) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    if (name.empty())
+        throw OpError("invalid_op", "config_add: 'name' must be a non-empty string",
+                      {{"reason", "bad name"}});
+    json working = s.doc;
+    json& configs = ensure_configs(working);
+    for (const json& c : configs)
+        if (c.is_object() && c.value("name", std::string()) == name)
+            throw OpError("invalid_op", "config_add: configuration '" + name + "' already exists",
+                          {{"reason", "duplicate name"}, {"name", name}});
+    json overrides = json::object();
+    json suppressions = json::object();
+    if (copy_from.is_string()) {
+        json& src = find_config(working, copy_from.get<std::string>());
+        if (src.contains("param_overrides") && src["param_overrides"].is_object())
+            overrides = src["param_overrides"];
+        if (src.contains("suppressions") && src["suppressions"].is_object())
+            suppressions = src["suppressions"];
+    }
+    configs.push_back({{"name", name}, {"param_overrides", overrides}, {"suppressions", suppressions}});
+    validate_config_edit(working);
+    return config_commit(s, std::move(working));
+}
+
+json doc_config_delete(const std::string& doc_id, const std::string& name) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json working = s.doc;
+    const bool have = working.contains("configurations") && working["configurations"].is_array() &&
+                      !working["configurations"].empty();
+    if (!have)
+        throw OpError("invalid_op", "config_delete: no configuration '" + name + "' to delete",
+                      {{"reason", "no configurations"}});
+    json& configs = working["configurations"];
+    bool exists = false;
+    for (const json& c : configs)
+        if (c.is_object() && c.value("name", std::string()) == name) { exists = true; break; }
+    if (!exists)
+        throw OpError("invalid_op", "config_delete: no configuration named '" + name + "'",
+                      {{"reason", "unknown configuration"}, {"name", name}});
+    if (configs.size() == 1)
+        throw OpError("invalid_op", "config_delete: cannot delete the only configuration",
+                      {{"reason", "last configuration"}});
+    bool was_active = config_active_name(working) == name;
+    json kept = json::array();
+    for (const json& c : configs)
+        if (!(c.is_object() && c.value("name", std::string()) == name)) kept.push_back(c);
+    working["configurations"] = kept;
+    if (was_active)
+        working["active_configuration"] = kept[0].value("name", std::string());
+    validate_config_edit(working);
+    return config_commit(s, std::move(working));
+}
+
+json doc_config_activate(const std::string& doc_id, const std::string& name) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json working = s.doc;
+    ensure_configs(working);
+    find_config(working, name);  // throws if unknown
+    working["active_configuration"] = name;
+    validate_config_edit(working);
+    return config_commit(s, std::move(working));
+}
+
+json doc_config_set_override(const std::string& doc_id, const std::string& name,
+                             const std::string& feature_id, const std::string& param,
+                             const json& value, bool clear) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json working = s.doc;
+    json& cfg = find_config(working, name);
+    if (!cfg.contains("param_overrides") || !cfg["param_overrides"].is_object())
+        cfg["param_overrides"] = json::object();
+    const std::string key = feature_id + "." + param;
+    if (clear || value.is_null())
+        cfg["param_overrides"].erase(key);
+    else
+        cfg["param_overrides"][key] = value;
+    validate_config_edit(working);
+    return config_commit(s, std::move(working));
+}
+
+json doc_config_set_suppression(const std::string& doc_id, const std::string& name,
+                                const std::string& feature_id, bool suppressed) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json working = s.doc;
+    json& cfg = find_config(working, name);
+    if (!cfg.contains("suppressions") || !cfg["suppressions"].is_object())
+        cfg["suppressions"] = json::object();
+    if (suppressed)
+        cfg["suppressions"][feature_id] = true;
+    else
+        cfg["suppressions"].erase(feature_id);
+    validate_config_edit(working);
+    return config_commit(s, std::move(working));
 }
 
 json doc_resolve_pick(const std::string& doc_id, int body_id, const std::string& kind,

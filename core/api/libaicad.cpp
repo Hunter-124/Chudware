@@ -29,6 +29,7 @@
 #include "doc/document.h"
 #include "doc/session.h"
 #include "doc/validate.h"
+#include "sim/fea_modal.h"
 #include "sim/fea_static.h"
 
 using nlohmann::json;
@@ -181,6 +182,35 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                               {{"max_von_mises_mpa", r.max_von_mises_mpa},
                                {"max_disp_mm", r.max_disp_mm},
                                {"min_fos", r.min_fos}}}},
+                        out_json, 0);
+        }
+        if (m == "sim_fea_modal") {
+            // Modal FEA (engine/sim/fea_modal.py parity probe). Params: points[n*3],
+            // tets[m*4], E_mpa, nu, density_g_cm3, fixed_nodes[], n_modes. Returns
+            // freqs_hz[] + mode_shapes[n_modes*n*3].
+            auto getd = [&](const char* k) {
+                std::vector<double> v;
+                if (params.contains(k) && params[k].is_array())
+                    for (const auto& x : params[k]) v.push_back(x.get<double>());
+                return v;
+            };
+            auto geti = [&](const char* k) {
+                std::vector<int> v;
+                if (params.contains(k) && params[k].is_array())
+                    for (const auto& x : params[k]) v.push_back(x.get<int>());
+                return v;
+            };
+            aicad::sim::FeaModalResult r = aicad::sim::fea_modal_solve(
+                getd("points"), geti("tets"), params.value("E_mpa", 0.0),
+                params.value("nu", 0.0), params.value("density_g_cm3", 0.0),
+                geti("fixed_nodes"), params.value("n_modes", 6));
+            if (!r.ok) return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
+            return emit(json{{"ok", true},
+                             {"freqs_hz", r.freqs_hz},
+                             {"mode_shapes", r.mode_shapes},
+                             {"n_modes", r.n_modes},
+                             {"n_nodes", r.n_nodes},
+                             {"n_dof", r.n_dof}},
                         out_json, 0);
         }
         if (m == "doc_validate") {

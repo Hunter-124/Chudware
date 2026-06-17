@@ -54,6 +54,17 @@ target_include_directories(aicad_miniz PUBLIC ${miniz_SOURCE_DIR})
 set_property(TARGET aicad_miniz PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
+# --- Spectra (header-only eigensolvers over Eigen; modal FEA shift-invert) ----
+# Like doctest, point SOURCE_SUBDIR at a non-existent subdir so MakeAvailable only
+# POPULATES it (we add ${spectra_SOURCE_DIR}/include to the path) and skips Spectra's
+# own CMake (avoids any cmake_minimum_required friction under CMake 4.x).
+FetchContent_Declare(spectra
+  GIT_REPOSITORY https://github.com/yixuan/spectra.git
+  GIT_TAG v1.0.1
+  GIT_SHALLOW TRUE
+  SOURCE_SUBDIR _no_cmake_)
+FetchContent_MakeAvailable(spectra)
+
 # --- doctest (C++ unit tests; header-only) -----------------------------------
 # Point SOURCE_SUBDIR at the header folder (no CMakeLists there) so MakeAvailable
 # populates but skips doctest's own ancient cmake_minimum_required(3.0), which
@@ -90,8 +101,10 @@ target_include_directories(aicad_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # pure Eigen — so it builds in the standalone config too. CUDA acceleration is a
 # later layer on top of these correct CPU cores.
 add_library(aicad_sim STATIC
-  sim/fea_static.cpp)
+  sim/fea_static.cpp
+  sim/fea_modal.cpp)
 target_include_directories(aicad_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(aicad_sim PRIVATE ${spectra_SOURCE_DIR}/include)
 target_link_libraries(aicad_sim PUBLIC Eigen3::Eigen)
 
 add_executable(test_sim tests/test_sim.cpp)

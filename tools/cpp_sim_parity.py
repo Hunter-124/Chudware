@@ -153,7 +153,44 @@ def main() -> int:
             print(f"  {label:<26} MATCH  (max_disp={ro.summary['max_disp_mm']:.4f}mm, "
                   f"max_vm={ro.summary['max_von_mises_mpa']:.1f}MPa)")
 
-    print(f"\n[sim-parity] {checks - mism}/{checks} FEA-static cases at full parity")
+    # --- Modal FEA: compare the lowest natural frequencies (the robust eigen-invariant;
+    # mode shapes carry sign/normalization + degenerate-subspace ambiguity). Same
+    # cantilever, fixed at x=0. ARPACK (scipy eigsh) vs Spectra shift-invert should agree
+    # to a few 1e-4 on well-separated modes.
+    from engine.sim.fea_modal import run_modal
+    for (L, W, H, nx, ny, nz, nmodes, label) in [
+        (100.0, 10.0, 10.0, 10, 2, 2, 6, "modal cantilever 6"),
+        (50.0, 10.0, 10.0, 6, 2, 2, 4, "modal stub 4"),
+    ]:
+        pts, tets = make_beam(L, W, H, nx, ny, nz)
+        mesh = MeshResult(points=pts, tets=tets, mesh_path="", char_len_mm=0.0,
+                          n_nodes=len(pts), n_elems=len(tets))
+        material = {"E_mpa": 200000.0, "nu": 0.29, "density_g_cm3": 7.87, "yield_mpa": 370.0}
+        fix_pts = pts[pts[:, 0] < 1e-6]
+        fixtures = [FaceSet(points=fix_pts, tol_mm=1e-4)]
+        rmo = run_modal(mesh, material, fixtures, n_modes=nmodes)
+        fixed_nodes = _nodes_in_faceset(pts, fixtures[0]).tolist()
+        rc, rcm = core.call("sim_fea_modal", {
+            "points": pts.ravel().tolist(), "tets": tets.ravel().tolist(),
+            "E_mpa": 200000.0, "nu": 0.29, "density_g_cm3": 7.87,
+            "fixed_nodes": fixed_nodes, "n_modes": nmodes})
+        checks += 1
+        if rc != 0 or not rcm.get("ok"):
+            print(f"  {label:<26} DIFF: cpp solve failed rc={rc} {str(rcm)[:60]}")
+            mism += 1
+            continue
+        pf = np.asarray(rmo.freqs_hz, dtype=np.float64)
+        cf = np.asarray(rcm["freqs_hz"], dtype=np.float64)
+        n = min(len(pf), len(cf))
+        rel = max((abs(pf[i] - cf[i]) / max(abs(pf[i]), 1.0)) for i in range(n)) if n else 1.0
+        if n >= min(nmodes, 4) and rel <= 1e-3:
+            print(f"  {label:<26} MATCH  (f1..f3 = "
+                  f"{', '.join(f'{x:.1f}' for x in pf[:3])} Hz)")
+        else:
+            print(f"  {label:<26} DIFF: n={n} relerr={rel:.2e} py={pf[:n]} cpp={cf[:n]}")
+            mism += 1
+
+    print(f"\n[sim-parity] {checks - mism}/{checks} sim cases at full parity")
     return mism
 
 

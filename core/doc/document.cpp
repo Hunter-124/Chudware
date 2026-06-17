@@ -48,6 +48,7 @@
 #include <gp_Pnt.hxx>
 
 #include "doc/picks.h"
+#include "doc/selectors.h"
 #include "geom/booleans.h"
 #include "geom/dress.h"
 #include "geom/features.h"
@@ -1300,6 +1301,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         if (shape.IsNull()) continue;
         try {
             bodies.push_back(::geom::tessellate_body(shape, body_num, sid, color));
+            result.shapes.push_back(shape);  // AICM order: shapes[i] <-> body ordinal i+1
             ++body_num;
             // Accumulate the exact solid volume (geometry-level parity signal).
             GProp_GProps gp;
@@ -1385,6 +1387,32 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         if (!s.ok) { result.ok = false; break; }
 
     return result;
+}
+
+// ----------------------------------------------------------------- resolve_pick
+nlohmann::json resolve_pick(const json& doc, const json& env, int body_id,
+                            const std::string& kind, int topo_id) {
+    CompileResult r = compile_document(doc, env);
+    if (body_id < 1 || body_id > static_cast<int>(r.shapes.size()))
+        return json(nullptr);
+    const TopoDS_Shape& shape = r.shapes[body_id - 1];
+
+    // Owner = the feature that owns (body_id, topo_id) of this kind, from the map.
+    std::optional<std::string> owner;
+    const char* arrkey = (kind == "face") ? "faces" : (kind == "edge") ? "edges" : nullptr;
+    if (arrkey && r.owner_map.is_object()) {
+        for (auto it = r.owner_map.begin(); it != r.owner_map.end() && !owner; ++it) {
+            const json& rec = it.value();
+            if (!rec.contains(arrkey) || !rec[arrkey].is_array()) continue;
+            for (const json& pr : rec[arrkey])
+                if (pr.is_array() && pr.size() == 2 &&
+                    pr[0].get<int>() == body_id && pr[1].get<int>() == topo_id) {
+                    owner = it.key();
+                    break;
+                }
+        }
+    }
+    return aicad::doc::make_pick_selector(shape, kind, topo_id, owner);
 }
 
 }  // namespace aicad::doc

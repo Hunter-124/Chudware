@@ -54,4 +54,9 @@ nlohmann::json doc_tree(const std::string& doc_id);     // no rebuild, no rev bu
 nlohmann::json doc_rebuild(const std::string& doc_id);  // forced rebuild, no rev bump
 bool doc_close(const std::string& doc_id);
 
+// Resolve a viewport pick (1-based body ordinal + kind + 1-based MapShapes topo id)
+// into a selector json {selector: {...}}. Throws OpError("unknown_doc"/...).
+nlohmann::json doc_resolve_pick(const std::string& doc_id, int body_id,
+                                const std::string& kind, int topo_id);
+
 }  // namespace aicad::doc

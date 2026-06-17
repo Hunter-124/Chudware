@@ -38,6 +38,7 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include <TopoDS_Shape.hxx>
 
 namespace aicad::doc {
 
@@ -61,6 +62,9 @@ struct CompileResult {
     // 1-based TopExp topo index. Empty for an all-error compile. (Linear single-chain
     // attribution; matches engine/doc/session.py::_owner_map for the common case.)
     nlohmann::json owner_map;
+    // The surviving solid shapes in AICM body order (shapes[i] <-> body ordinal i+1).
+    // Lets a caller describe a picked body's topology (doc_resolve_pick).
+    std::vector<TopoDS_Shape> shapes;
     bool ok = false;                      // true iff every feature compiled ok
 };
 
@@ -72,5 +76,13 @@ struct CompileResult {
 // with the SAME `doc` and DIFFERENT `env` to re-run the tree into new geometry —
 // that is the parametric-rebuild payoff.
 CompileResult compile_document(const nlohmann::json& doc, const nlohmann::json& env);
+
+// Resolve a host PICK into a re-resolvable selector: compile `doc`, take the surviving
+// body at 1-based `body_id`, and describe its `kind` ("face"/"edge"/"vertex") sub-shape
+// at 1-based `topo_id` (TopExp::MapShapes numbering = the host's pick ids), tagging the
+// owning feature from the owner map. Returns the selector json, or null if out of range.
+// Port of engine/doc/session.py::resolve_pick.
+nlohmann::json resolve_pick(const nlohmann::json& doc, const nlohmann::json& env,
+                            int body_id, const std::string& kind, int topo_id);
 
 }  // namespace aicad::doc

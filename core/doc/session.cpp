@@ -618,4 +618,12 @@ bool doc_close(const std::string& doc_id) {
     return g_sessions.erase(doc_id) > 0;
 }
 
+json doc_resolve_pick(const std::string& doc_id, int body_id, const std::string& kind,
+                      int topo_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json sel = resolve_pick(s.doc, env_from_doc(s.doc), body_id, kind, topo_id);
+    return json{{"selector", sel}};
+}
+
 }  // namespace aicad::doc

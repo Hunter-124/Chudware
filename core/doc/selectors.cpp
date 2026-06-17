@@ -29,7 +29,9 @@
 #include <GeomAbs_CurveType.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <TopAbs.hxx>
+#include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
@@ -224,6 +226,28 @@ nlohmann::json make_selector(const TopoInfo& info) {
     sel["owner_feature"] = info.owner ? nlohmann::json(*info.owner) : nlohmann::json(nullptr);
     sel["hint_index"] = info.hint_index;
     return sel;
+}
+
+// --------------------------------------------------------------------------- make_pick_selector
+
+nlohmann::json make_pick_selector(const TopoDS_Shape& shape, const std::string& kind,
+                                  int topo_id, std::optional<std::string> owner) {
+    if (shape.IsNull()) return nlohmann::json(nullptr);
+    // EXACT port of engine/doc/session.py::resolve_pick: describe the body's sub-shapes
+    // (the same TopExp_Explorer enumeration the host's pick topo_id indexes) and take
+    // entry topo_id-1, stamping the owner from the compiler's owner map + hint_index.
+    std::vector<TopoInfo> infos;
+    if (kind == "face") infos = describe_faces(shape);
+    else if (kind == "edge") infos = describe_edges(shape);
+    else if (kind == "vertex") infos = describe_vertices(shape);
+    else return nlohmann::json(nullptr);
+    if (topo_id < 1 || topo_id > static_cast<int>(infos.size()))
+        return nlohmann::json(nullptr);
+
+    TopoInfo info = infos[topo_id - 1];
+    if (owner) info.owner = owner;
+    info.hint_index = topo_id - 1;
+    return make_selector(info);
 }
 
 // --------------------------------------------------------------------------- resolution

@@ -177,6 +177,13 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             if (m == "doc_close")
                 return emit(json{{"closed", aicad::doc::doc_close(params.value("doc_id", std::string()))}},
                             out_json, 0);
+            if (m == "doc_resolve_pick")
+                return emit(aicad::doc::doc_resolve_pick(
+                                params.value("doc_id", std::string()),
+                                params.value("body_id", 0),
+                                params.value("kind", std::string()),
+                                params.value("topo_id", 0)),
+                            out_json, 0);
         } catch (const aicad::doc::OpError& oe) {
             // Structured error envelope (matches the Python worker's doc_* errors).
             return emit(oe.envelope(), out_json, 3);

@@ -75,6 +75,14 @@ std::vector<TopoInfo> describe_vertices(const TopoDS_Shape& shape,
 // surf, centroid[3], axis[3]|null, area_or_len|null, owner_feature|null, hint_index.
 nlohmann::json make_selector(const TopoInfo& info);
 
+// Build a selector for a host PICK: the sub-shape of `kind` ("face"/"edge"/"vertex")
+// at the 1-based TopExp::MapShapes index `topo_id` (the same numbering the AICM
+// tessellator + owner_map use, so it matches the host's pick ids). `owner` is the
+// owning feature id (or nullopt). Returns null if topo_id is out of range. Used by
+// doc_resolve_pick to turn a viewport pick into a re-resolvable selector.
+nlohmann::json make_pick_selector(const TopoDS_Shape& shape, const std::string& kind,
+                                  int topo_id, std::optional<std::string> owner);
+
 // Resolve a selector against candidates per contract §3 (verbatim from selectors.py).
 ResolveResult resolve(const nlohmann::json& selector,
                       const std::vector<TopoInfo>& candidates, double bbox_diag);

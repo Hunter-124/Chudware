@@ -59,4 +59,13 @@ bool doc_close(const std::string& doc_id);
 nlohmann::json doc_resolve_pick(const std::string& doc_id, int body_id,
                                 const std::string& kind, int topo_id);
 
+// Persist the session to `path` (or its current path if `path` is empty) as a
+// .step+ container. Clears the dirty flag, records the path. Returns {"path": ...}.
+// Throws OpError("io_error") if no path is available, or on a write failure.
+nlohmann::json doc_save(const std::string& doc_id, const std::string& path);
+
+// Open a .step+ container at `path` into a FRESH session, rebuild it, and return the
+// ops-response + "doc_id" + "warnings". Throws OpError("io_error") on a bad file.
+nlohmann::json doc_open(const std::string& path);
+
 }  // namespace aicad::doc

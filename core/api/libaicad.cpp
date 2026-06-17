@@ -177,6 +177,12 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             if (m == "doc_close")
                 return emit(json{{"closed", aicad::doc::doc_close(params.value("doc_id", std::string()))}},
                             out_json, 0);
+            if (m == "doc_save")
+                return emit(aicad::doc::doc_save(params.value("doc_id", std::string()),
+                                                 params.value("path", std::string())),
+                            out_json, 0);
+            if (m == "doc_open")
+                return emit(aicad::doc::doc_open(params.value("path", std::string())), out_json, 0);
             if (m == "doc_resolve_pick")
                 return emit(aicad::doc::doc_resolve_pick(
                                 params.value("doc_id", std::string()),

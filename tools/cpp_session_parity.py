@@ -274,6 +274,48 @@ def main() -> int:
     else:
         print(f"  {'resolve_pick (faces strict)':<28} MATCH{pick_notes}")
 
+    # 4d) .step+ doc_save / doc_open round-trip (P12). Build a box, save it through the
+    # C++ session, reopen it (fresh doc_id), and require the SAME feature tree + SAME
+    # volume. Cross-check that the Python stepplus.open of the C++-written file yields the
+    # same document.json tree (the container is a valid .step+ both engines understand).
+    import tempfile
+    cpp4 = CppS(core)
+    src = cpp4.apply(0, rect_then_extrude(12.0))
+    src_feats = feat_ids(src)
+    src_vol = cpp4.vol(src)
+    rt_diffs = []
+    rt_note = ""
+    with tempfile.TemporaryDirectory() as td:
+        spath = str(Path(td) / "roundtrip.step+")
+        rc, sv = core.call("doc_save", {"doc_id": cpp4.doc_id, "path": spath})
+        if rc != 0 or not Path(sv.get("path", "")).exists():
+            rt_diffs.append(f"save failed rc={rc} {sv}")
+        else:
+            rc, ov = core.call("doc_open", {"path": spath})
+            if rc != 0:
+                rt_diffs.append(f"open failed rc={rc} {ov}")
+            else:
+                if feat_ids(ov) != src_feats:
+                    rt_diffs.append(f"feat_ids {feat_ids(ov)}!={src_feats}")
+                if abs(float(ov.get("volume", 0.0)) - src_vol) / max(abs(src_vol), 1.0) > 1e-3:
+                    rt_diffs.append(f"vol {ov.get('volume')}!={src_vol:.1f}")
+                # Cross-engine: Python opens the C++-written .step+ and rebuilds it.
+                try:
+                    from engine.doc import stepplus as pystep
+                    ps, pw = pystep.open(spath)
+                    py_feats = [f.get("id") for f in ps.doc.get("features", [])]
+                    if py_feats != src_feats:
+                        rt_diffs.append(f"py-open feat_ids {py_feats}!={src_feats}")
+                    else:
+                        rt_note = "  [python stepplus.open of the C++ file: tree matches]"
+                except Exception as exc:  # noqa: BLE001
+                    rt_diffs.append(f"py-open raised {type(exc).__name__}: {exc}")
+    if rt_diffs:
+        print(f"  {'.step+ save/open round-trip':<28} DIFF: {'; '.join(rt_diffs)[:120]}")
+        mism += 1
+    else:
+        print(f"  {'.step+ save/open round-trip':<28} MATCH{rt_note}")
+
     # 5) stale_revision guard (base 0 now stale)
     rc, cr = core.call("doc_apply_ops", {"doc_id": cpp.doc_id, "base_revision": 0, "ops": []})
     code = cr.get("code") or cr.get("detail", {})
@@ -281,7 +323,7 @@ def main() -> int:
     print(f"  {'stale_revision guard':<28} {'MATCH' if ok else 'DIFF: ' + str(cr)}")
     mism += 0 if ok else 1
 
-    total = 7
+    total = 8
     print(f"\n[session-parity] {total - mism}/{total} steps at full parity")
     return mism
 

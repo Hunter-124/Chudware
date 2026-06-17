@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "doc/document.h"
+#include "doc/stepplus.h"
 #include "util/expr.h"
 
 namespace aicad::doc {
@@ -36,6 +37,8 @@ struct Session {
     std::vector<std::string> undo_stack;  // JSON snapshots (newest at back)
     std::vector<std::string> redo_stack;
     bool dirty = false;
+    std::string path;                                  // current .step+ path (or empty)
+    std::map<std::string, std::string> extra_entries;  // unknown .step+ entries (verbatim)
 };
 
 constexpr std::size_t kUndoLimit = 100;
@@ -624,6 +627,58 @@ json doc_resolve_pick(const std::string& doc_id, int body_id, const std::string&
     Session& s = require_session(doc_id);
     json sel = resolve_pick(s.doc, env_from_doc(s.doc), body_id, kind, topo_id);
     return json{{"selector", sel}};
+}
+
+json doc_save(const std::string& doc_id, const std::string& path) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    const std::string target = !path.empty() ? path : s.path;
+    if (target.empty())
+        throw OpError("io_error",
+                      "doc_save: no path given and document has no current path",
+                      {{"reason", "missing path"}});
+    std::string out = stepplus_save(s.doc, target, s.extra_entries);
+    s.path = out;
+    s.dirty = false;
+    return json{{"path", out}};
+}
+
+json doc_open(const std::string& path) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    StepPlusDoc loaded = stepplus_open(path);  // throws OpError on a bad file
+
+    Session s;
+    s.doc_id = new_doc_id();
+    s.doc = std::move(loaded.doc);
+    s.revision = 0;
+    s.path = path;
+    s.extra_entries = std::move(loaded.extra);
+    // Stamp the document's own id to the new session id (mirrors blank_part).
+    if (s.doc.is_object()) s.doc["id"] = s.doc_id;
+    Session& stored = g_sessions[s.doc_id] = std::move(s);
+
+    CompileResult r = compile_document(stored.doc, env_from_doc(stored.doc));
+    json resp = ops_response(stored, r, json::object(), /*with_tess=*/true);
+    resp["doc_id"] = stored.doc_id;
+
+    // Warnings: container load notes + per-feature rebuild failures (the non-total-
+    // failure branch of the Python oracle; frozen-geometry fallback is deferred).
+    json warnings = json::array();
+    for (const std::string& w : loaded.warnings) warnings.push_back(w);
+    std::vector<std::string> failed;
+    for (const FeatureStatus& st : r.statuses)
+        if (!st.ok) failed.push_back(st.id);
+    if (!failed.empty()) {
+        std::string msg = std::to_string(failed.size()) + " feature(s) failed to rebuild: [";
+        for (std::size_t i = 0; i < failed.size(); ++i) {
+            if (i) msg += ", ";
+            msg += "'" + failed[i] + "'";
+        }
+        msg += "]";
+        warnings.push_back(msg);
+    }
+    resp["warnings"] = warnings;
+    return resp;
 }
 
 }  // namespace aicad::doc

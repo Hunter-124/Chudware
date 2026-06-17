@@ -37,6 +37,23 @@ FetchContent_Declare(json
   URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
 FetchContent_MakeAvailable(json)
 
+# --- miniz (ZIP read+write for the .step+ container) -------------------------
+# The amalgamated release ships miniz.c/miniz.h with no CMakeLists at the root, so
+# Populate (not MakeAvailable) it and build a tiny static lib ourselves. CMake's
+# file(ARCHIVE_EXTRACT) is extract-only — insufficient for save().
+FetchContent_Declare(miniz
+  URL https://github.com/richgel999/miniz/releases/download/3.0.2/miniz-3.0.2.zip)
+FetchContent_GetProperties(miniz)
+if(NOT miniz_POPULATED)
+  FetchContent_Populate(miniz)
+endif()
+add_library(aicad_miniz STATIC ${miniz_SOURCE_DIR}/miniz.c)
+target_include_directories(aicad_miniz PUBLIC ${miniz_SOURCE_DIR})
+# Match the dynamic CRT the rest of the core + the DLL use (silences LNK4098 and keeps
+# miniz's malloc/free on the same heap as the DLL that calls mz_free).
+set_property(TARGET aicad_miniz PROPERTY
+  MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+
 # --- doctest (C++ unit tests; header-only) -----------------------------------
 # Point SOURCE_SUBDIR at the header folder (no CMakeLists there) so MakeAvailable
 # populates but skips doctest's own ancient cmake_minimum_required(3.0), which
@@ -273,12 +290,14 @@ if(AICAD_WITH_OCCT)
     doc/document.cpp
     doc/selectors.cpp
     doc/picks.cpp
-    doc/session.cpp)
+    doc/session.cpp
+    doc/stepplus.cpp)
   target_include_directories(aicad_doc PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(aicad_doc PUBLIC
     aicad_geom_occt aicad_sketch aicad_geom aicad_util
+    aicad_miniz
     nlohmann_json::nlohmann_json)
 
   # Verification: compile a document -> write_aicm -> HOST render::parseAicm, with

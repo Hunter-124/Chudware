@@ -64,6 +64,26 @@ is deleted.
   relevant corpus. The corresponding Python is deleted in the same commit. Track
   progress in the gap list below.
 
+- **P16 — host routing switch (LANDED, opt-in).** `WorkerClient::call`
+  (host/src/worker_client.cpp) now routes `doc_*` calls to the in-process C++ core
+  (`core::cpp_core()` → libaicad.dll) instead of the Python worker, **per document**:
+  a doc created in the C++ core carries a `doc-cpp…` id, so every subsequent `doc_*`
+  with that id routes to C++ too — the id prefix IS the commit-at-`doc_new` marker, so
+  there's no separate routing state and **no mid-doc Python fallback** (an unported
+  method fails loudly rather than misrouting). Gated by env **`AI_CAD_CPP_DOCS`** (OFF
+  by default = byte-for-byte the Python path; ON routes new docs to C++). A structured
+  `OpError` is surfaced with the same `{code,message,detail}` contract as the Python
+  worker. **Validated headless** (`AI_CAD_SHOT=m1`, `AI_CAD_CPP_DOCS=1`): the full
+  workflow — `doc_new`→box→fillet→shell→edit→`doc_save`→`doc_open` — ran entirely on the
+  C++ core (`doc_id=doc-cpp00000001`, exit 0) and the save/open round-trip kept the tree
+  intact (3 features), where the Python path reported a reopen TREE MISMATCH. The C++
+  doc methods implemented: `doc_new`/`doc_apply_ops`/`doc_undo`/`doc_redo`/`doc_tree`/
+  `doc_rebuild`/`doc_close`/`doc_resolve_pick`/`doc_save`/`doc_open`. NOT yet ported (a
+  doc that uses one of these while routed to C++ fails loud, so keep the flag OFF for
+  those flows until ported): `doc_push_pull` (Instant3D drag), `doc_checkpoint`/
+  `doc_revert`, `doc_list` (won't enumerate C++ docs), config_*/weld_*/export_*. Python
+  is NOT deleted yet — that waits until full method coverage makes the flag the default.
+
 ## Parity dashboard
 
 `tools/cpp_parity.py` (run under the venv) compiles a fixture set through BOTH the

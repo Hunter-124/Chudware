@@ -6,10 +6,37 @@
 #include <string>
 
 #include "bootstrap.h"
+#include "core/cpp_core.h"  // P16: route C++-backed documents in-process to libaicad
 
 using nlohmann::json;
 
 namespace {
+
+// --- P16: per-document cutover routing to the pure-C++ core (libaicad) -------
+// Opt-in via env AI_CAD_CPP_DOCS (non-empty, not "0"). A document CREATED in the C++
+// core gets a "doc-cpp..." id, so every subsequent doc_* call carrying that id routes
+// to the C++ core too — the id prefix IS the commit-at-doc_new marker, giving an
+// all-or-nothing-per-document cutover with no separate routing state. Flag OFF (default)
+// is byte-for-byte today's behavior: every call goes to the Python worker.
+bool cppDocsFlag() {
+    const char* f = std::getenv("AI_CAD_CPP_DOCS");
+    return f && f[0] && f[0] != '0';
+}
+bool routeDocToCpp(const std::string& method, const json& params) {
+    if (method.rfind("doc_", 0) != 0) return false;  // only doc_* methods
+    if (method == "doc_compile_cpp" || method == "doc_validate") return false;  // diagnostics
+    // A C++-backed doc carries a doc-cpp id -> all its calls go to C++ (even if the flag
+    // was since toggled off, so a live doc keeps its engine for its whole lifetime).
+    if (params.is_object()) {
+        auto it = params.find("doc_id");
+        if (it != params.end() && it->is_string() &&
+            it->get<std::string>().rfind("doc-cpp", 0) == 0)
+            return true;
+    }
+    // doc_new / doc_open mint a fresh doc -> route to C++ only when the flag is set.
+    if ((method == "doc_new" || method == "doc_open") && cppDocsFlag()) return true;
+    return false;
+}
 std::wstring widen(const std::string& s) {
     if (s.empty()) return L"";
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
@@ -162,6 +189,27 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
     std::lock_guard<std::mutex> lk(callMtx_);
     if (abort_.load()) {  // C39: app is tearing down — intentional, no errorSink toast
         err = "aborted";
+        return false;
+    }
+    // P16: route C++-backed documents to the in-process core (libaicad) instead of the
+    // Python worker. All-or-nothing per document (NO mid-doc Python fallback — Python
+    // never created this doc), so an unported method surfaces a clear error rather than
+    // silently misrouting. The diagnostic parity probe in doc_mirror is unaffected.
+    if (routeDocToCpp(method, params)) {
+        std::string cerr;
+        if (core::cpp_core().call(method, params, result, cerr))
+            return true;  // handled (aicad_call rc==0); `result` holds the ops-response
+        // Nonzero rc: a structured OpError carries {code,message,detail} in `result` —
+        // mirror the Python structured-error contract (round-trip OK, method reported an
+        // error: return true so doc_mirror reads result["code"]).
+        if (result.is_object() && result.contains("code")) {
+            err = result.value("message", std::string("cpp-core error"));
+            return true;
+        }
+        // Hard failure (method not ported to C++, DLL missing, or a throw). There is no
+        // Python doc to fall back to, so fail loudly.
+        err = "cpp-core (" + method + "): " + cerr;
+        if (errorSink_) errorSink_(method, err);
         return false;
     }
     if (!running_) {

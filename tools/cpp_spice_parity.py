@@ -84,7 +84,9 @@ def main() -> int:
     ]
 
     mism = 0
+    checks = 0
     for label, circuit, study in cases:
+        checks += 1
         ro = simulate(circuit, study)
         rc, rcpp = core.call("sim_spice", {"circuit": circuit, "study": study})
         diffs = []
@@ -107,7 +109,82 @@ def main() -> int:
             shown = ", ".join(f"{p}={float(co[p]):.4g}" for p in study["probes"][:2])
             print(f"  {label:<24} MATCH  ({shown})")
 
-    print(f"\n[spice-parity] {len(cases) - mism}/{len(cases)} DC cases at full parity")
+    # ---- Transient (trapezoidal): RC step, RL step, RLC ring. Same dt schedule + BE
+    # bootstrap + breakpoints on both sides -> the time grid + traces match to FP precision.
+    import numpy as np
+
+    def _wf(kind, **kw):
+        d = {"type": kind}
+        d.update(kw)
+        return d
+
+    tran_cases = []
+    R, C = 1000.0, 1e-6
+    tau = R * C
+    tran_cases.append(("RC step", {
+        "nodes": ["0", "IN", "OUT"],
+        "devices": [
+            {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0,
+             "params": {"waveform": _wf("PULSE", v1=0.0, v2=5.0, td=0.0, tr=1e-9, tf=1e-9, pw=1.0, per=0.0)}},
+            {"kind": "R", "name": "R1", "nodes": ["IN", "OUT"], "value": R, "params": {}},
+            {"kind": "C", "name": "C1", "nodes": ["OUT", "0"], "value": C, "params": {"ic": 0.0}}]},
+        {"analyses": [{"type": "tran", "tstep": tau / 200, "tstop": 5 * tau, "uic": True}],
+         "probes": ["V(OUT)"]}))
+    Rl, Ll = 100.0, 0.1
+    taul = Ll / Rl
+    tran_cases.append(("RL step", {
+        "nodes": ["0", "IN", "MID"],
+        "devices": [
+            {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0,
+             "params": {"waveform": _wf("PULSE", v1=0.0, v2=5.0, td=0.0, tr=1e-12, tf=1e-12, pw=1.0, per=0.0)}},
+            {"kind": "R", "name": "R1", "nodes": ["IN", "MID"], "value": Rl, "params": {}},
+            {"kind": "L", "name": "L1", "nodes": ["MID", "0"], "value": Ll, "params": {"ic": 0.0}}]},
+        {"analyses": [{"type": "tran", "tstep": taul / 200, "tstop": 5 * taul, "uic": True}],
+         "probes": ["I(L1)"]}))
+    import math
+    Rr, Lr, Cr = 20.0, 1e-3, 1e-6
+    period = 2 * math.pi / (1.0 / math.sqrt(Lr * Cr))
+    tran_cases.append(("RLC ring", {
+        "nodes": ["0", "IN", "MID", "OUT"],
+        "devices": [
+            {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0,
+             "params": {"waveform": _wf("PULSE", v1=0.0, v2=1.0, td=0.0, tr=1e-9, tf=1e-9, pw=1.0, per=0.0)}},
+            {"kind": "R", "name": "R1", "nodes": ["IN", "MID"], "value": Rr, "params": {}},
+            {"kind": "L", "name": "L1", "nodes": ["MID", "OUT"], "value": Lr, "params": {"ic": 0.0}},
+            {"kind": "C", "name": "C1", "nodes": ["OUT", "0"], "value": Cr, "params": {"ic": 0.0}}]},
+        {"analyses": [{"type": "tran", "tstep": period / 200, "tstop": 10 * period, "uic": True}],
+         "probes": ["V(OUT)"]}))
+
+    for label, circuit, study in tran_cases:
+        checks += 1
+        ro = simulate(circuit, study)
+        rc, rcpp = core.call("sim_spice", {"circuit": circuit, "study": study})
+        diffs = []
+        if not (ro["convergence"].get("tran") and rcpp.get("convergence", {}).get("tran")):
+            diffs.append("tran did not converge")
+        tp = np.asarray(ro["tran"]["x_t"], dtype=np.float64)
+        tc = np.asarray(rcpp.get("tran", {}).get("x_t", []), dtype=np.float64)
+        if tp.shape != tc.shape:
+            diffs.append(f"time grid len {tp.shape}!={tc.shape}")
+        elif tp.size and float(np.max(np.abs(tp - tc))) / max(float(tp[-1]), 1e-12) > 1e-9:
+            diffs.append("time grid values differ")
+        else:
+            for pr in study["probes"]:
+                vp = np.asarray(ro["tran"]["traces"][pr], dtype=np.float64)
+                vc = np.asarray(rcpp["tran"]["traces"][pr], dtype=np.float64)
+                scale = max(float(np.max(np.abs(vp))), 1e-9)
+                dmax = float(np.max(np.abs(vp - vc)))
+                if dmax / scale > 1e-6:
+                    diffs.append(f"{pr} trace max|d|={dmax:.2e} (rel {dmax/scale:.1e})")
+        if diffs:
+            print(f"  {('tran ' + label):<24} DIFF: {'; '.join(diffs)[:100]}")
+            mism += 1
+        else:
+            pr0 = study["probes"][0]
+            fin = float(np.asarray(rcpp["tran"]["traces"][pr0])[-1])
+            print(f"  {('tran ' + label):<24} MATCH  ({len(tc)} pts, {pr0}[-1]={fin:.4g})")
+
+    print(f"\n[spice-parity] {checks - mism}/{checks} circuit cases at full parity")
     return mism
 
 

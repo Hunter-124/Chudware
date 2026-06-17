@@ -628,6 +628,235 @@ def main() -> int:
             last = float(np.asarray(rcpp["dc"]["traces"][study["probes"][0]])[-1])
             print(f"  {('dc ' + label):<24} MATCH  ({len(xc)} pts, {study['probes'][0]}[-1]={last:.4g})")
 
+    # ---- .tf (transfer function): DC gain, input resistance, output resistance. Computed on the
+    # network linearized at the DC op via the complex AC stamping path at omega=0. Linear networks
+    # match to 1e-9 rel; the nonlinear (op-amp) case to 1e-6.
+    tf_cases = [
+        ("tf divider V-src", {
+            "nodes": ["IN", "OUT", "0"],
+            "devices": [
+                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 10.0, "params": {}},
+                {"kind": "R", "name": "R1", "nodes": ["IN", "OUT"], "value": 1000.0, "params": {}},
+                {"kind": "R", "name": "R2", "nodes": ["OUT", "0"], "value": 2000.0, "params": {}}]},
+         {"analyses": [{"type": "tf", "output": "V(OUT)", "source": "V1"}], "probes": []}, 1e-9),
+        ("tf I-src transimped", {
+            "nodes": ["A", "0"],
+            "devices": [
+                {"kind": "I", "name": "I1", "nodes": ["0", "A"], "value": 0.0, "params": {}},
+                {"kind": "R", "name": "R1", "nodes": ["A", "0"], "value": 5000.0, "params": {}}]},
+         {"analyses": [{"type": "tf", "output": "V(A)", "source": "I1"}], "probes": []}, 1e-9),
+        ("tf inverting opamp", {
+            "nodes": ["0", "IN", "INV", "OUT"],
+            "devices": [
+                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.2, "params": {}},
+                {"kind": "R", "name": "RIN", "nodes": ["IN", "INV"], "value": 1000.0, "params": {}},
+                {"kind": "R", "name": "RF", "nodes": ["INV", "OUT"], "value": 10000.0, "params": {}},
+                {"kind": "OPAMP", "name": "X1", "nodes": ["0", "INV", "OUT"], "value": None, "params": {}}],
+            "models": {}, "params": {}},
+         {"analyses": [{"type": "tf", "output": "V(OUT)", "source": "V1"}], "probes": []}, 1e-9),
+    ]
+    for label, circuit, study, tol in tf_cases:
+        checks += 1
+        ro = simulate(circuit, study)
+        rc, rcpp = core.call("sim_spice", {"circuit": circuit, "study": study})
+        diffs = []
+        if not (ro["convergence"].get("tf") and rcpp.get("convergence", {}).get("tf")):
+            diffs.append("tf did not converge")
+        pt, ct = ro.get("tf", {}), rcpp.get("tf", {})
+        for k in ("gain", "rin", "rout"):
+            pv, cv = pt.get(k), ct.get(k)
+            if pv is None or cv is None:
+                diffs.append(f"{k} missing py={pv} cpp={cv}")
+                continue
+            if not (math.isfinite(pv) and math.isfinite(cv)):
+                if pv != cv:
+                    diffs.append(f"{k} py={pv} cpp={cv}")
+                continue
+            rel = abs(float(pv) - float(cv)) / max(abs(float(pv)), 1e-9)
+            if rel > tol:
+                diffs.append(f"{k} {pv:.9g}!={cv:.9g} (rel {rel:.1e})")
+        if diffs:
+            print(f"  {('tf ' + label):<24} DIFF: {'; '.join(diffs)[:100]}")
+            mism += 1
+        else:
+            print(f"  {('tf ' + label):<24} MATCH  (gain={float(ct['gain']):.4g}, "
+                  f"rin={float(ct['rin']):.4g}, rout={float(ct['rout']):.4g})")
+
+    # ---- .noise (resistor thermal): output-noise PSD + integrated RMS via the AC transfer
+    # impedance from each resistor. Same complex MNA + trapezoid integral on both engines.
+    noise_cases = [
+        ("noise RC low-pass", {
+            "nodes": ["0", "IN", "OUT"],
+            "devices": [
+                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0,
+                 "params": {"ac": {"mag": 1.0, "phase": 0.0}}},
+                {"kind": "R", "name": "R1", "nodes": ["IN", "OUT"], "value": 1000.0, "params": {}},
+                {"kind": "C", "name": "C1", "nodes": ["OUT", "0"], "value": 1e-6, "params": {}}],
+            "params": {"TEMP": 27}},
+         {"analyses": [{"type": "noise", "output": "V(OUT)", "sweep": "dec", "points": 10,
+                        "fstart": 1.0, "fstop": 1e5}], "probes": []}),
+        ("noise two-R divider", {
+            "nodes": ["0", "IN", "OUT"],
+            "devices": [
+                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0,
+                 "params": {"ac": {"mag": 1.0, "phase": 0.0}}},
+                {"kind": "R", "name": "R1", "nodes": ["IN", "OUT"], "value": 4700.0, "params": {}},
+                {"kind": "R", "name": "R2", "nodes": ["OUT", "0"], "value": 10000.0, "params": {}}],
+            "params": {"TEMP": 27}},
+         {"analyses": [{"type": "noise", "output": "V(OUT)", "sweep": "lin", "points": 20,
+                        "fstart": 1.0, "fstop": 1e4}], "probes": []}),
+    ]
+    for label, circuit, study in noise_cases:
+        checks += 1
+        ro = simulate(circuit, study)
+        rc, rcpp = core.call("sim_spice", {"circuit": circuit, "study": study})
+        diffs = []
+        if not (ro["convergence"].get("noise") and rcpp.get("convergence", {}).get("noise")):
+            diffs.append("noise did not converge")
+        pn, cn = ro.get("noise", {}), rcpp.get("noise", {})
+        fp = np.asarray(pn.get("x_f", []), dtype=np.float64)
+        fc = np.asarray(cn.get("x_f", []), dtype=np.float64)
+        if fp.shape != fc.shape:
+            diffs.append(f"freq grid {fp.shape}!={fc.shape}")
+        else:
+            for key in ("onoise_spectrum", "onoise_psd"):
+                vp = np.asarray(pn.get(key, []), dtype=np.float64)
+                vc = np.asarray(cn.get(key, []), dtype=np.float64)
+                scale = max(float(np.max(np.abs(vp))) if vp.size else 0.0, 1e-30)
+                dmax = float(np.max(np.abs(vp - vc))) if vp.shape == vc.shape and vp.size else 1.0
+                if dmax / scale > 1e-6:
+                    diffs.append(f"{key} max|d|={dmax:.2e}")
+            rp, rcv = float(pn.get("total_noise_rms", 0.0)), float(cn.get("total_noise_rms", 0.0))
+            if abs(rp - rcv) / max(abs(rp), 1e-30) > 1e-6:
+                diffs.append(f"total_rms {rp:.4g}!={rcv:.4g}")
+            for rn, pv in pn.get("per_resistor", {}).items():
+                cv = cn.get("per_resistor", {}).get(rn)
+                if cv is None or abs(float(pv) - float(cv)) / max(abs(float(pv)), 1e-30) > 1e-6:
+                    diffs.append(f"per_resistor[{rn}] py={pv} cpp={cv}")
+        if diffs:
+            print(f"  {('noise ' + label):<24} DIFF: {'; '.join(diffs)[:100]}")
+            mism += 1
+        else:
+            print(f"  {('noise ' + label):<24} MATCH  ({len(fc)} pts, "
+                  f"rms={float(cn['total_noise_rms']):.4g} Vrms)")
+
+    # ---- .four (Fourier / THD): on a diode half-wave rectifier transient. Direct DFT matching
+    # numpy.fft.rfft binning + single-sided amplitude scaling; THD% over the resolvable harmonics.
+    _freqf = 1000.0
+    _perf = 1.0 / _freqf
+    four_circ = {
+        "nodes": ["0", "IN", "OUT"],
+        "devices": [
+            {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0,
+             "params": {"waveform": _wf("SIN", vo=0.0, va=5.0, f=_freqf, td=0.0, theta=0.0)}},
+            {"kind": "D", "name": "D1", "nodes": ["IN", "OUT"], "value": None,
+             "model": "DR", "params": {}},
+            {"kind": "R", "name": "RL", "nodes": ["OUT", "0"], "value": 1000.0, "params": {}},
+            {"kind": "C", "name": "CL", "nodes": ["OUT", "0"], "value": 1e-7, "params": {"ic": 0.0}}],
+        "models": {"DR": {"IS": 2.52e-9, "N": 1.752, "RS": 0.568}}, "params": {"TEMP": 27}}
+    four_study = {"analyses": [{"type": "four", "f0": _freqf, "probe": "V(OUT)",
+                                "tstep": _perf / 200, "tstop": 4 * _perf, "uic": True}],
+                  "probes": ["V(OUT)"]}
+    checks += 1
+    ro = simulate(four_circ, four_study)
+    rc, rcpp = core.call("sim_spice", {"circuit": four_circ, "study": four_study})
+    diffs = []
+    if not (ro["convergence"].get("four") and rcpp.get("convergence", {}).get("four")):
+        diffs.append("four did not converge")
+    pf, cf = ro.get("four", {}), rcpp.get("four", {})
+    for k in ("f0", "dc", "thd_pct"):
+        pv, cv = pf.get(k), cf.get(k)
+        if pv is None or cv is None or abs(float(pv) - float(cv)) / max(abs(float(pv)), 1e-12) > 1e-6:
+            diffs.append(f"{k} py={pv} cpp={cv}")
+    ph, ch = pf.get("harmonics", []), cf.get("harmonics", [])
+    if len(ph) != len(ch):
+        diffs.append(f"nharm {len(ph)}!={len(ch)}")
+    else:
+        for (pn_, pm, pp), (cn_, cm, cp) in zip(ph, ch):
+            if pn_ != cn_ or abs(pm - cm) / max(abs(pm), 1e-12) > 1e-6:
+                diffs.append(f"H{pn_} mag {pm:.4g}!={cm:.4g}")
+                break
+    if diffs:
+        print(f"  {'four rectifier THD':<24} DIFF: {'; '.join(diffs)[:100]}")
+        mism += 1
+    else:
+        print(f"  {'four rectifier THD':<24} MATCH  (THD={float(cf['thd_pct']):.4f}%, "
+              f"H1={float(cf['harmonics'][0][1]):.4g})")
+
+    # ---- .temp (temperature sweep): diode clamp at -40/25/85 C. Diode IS + Vt are temp-aware,
+    # so V(OUT) moves with temperature; deterministic, matches the oracle exactly (1e-6).
+    temp_circ = {
+        "nodes": ["0", "IN", "OUT"],
+        "devices": [
+            {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 5.0, "params": {}},
+            {"kind": "R", "name": "R1", "nodes": ["IN", "OUT"], "value": 1000.0, "params": {}},
+            {"kind": "D", "name": "D1", "nodes": ["OUT", "0"], "value": None, "model": "DD", "params": {}}],
+        "models": {"DD": {"IS": 2.52e-9, "N": 1.752, "RS": 0.568}}, "params": {"TEMP": 27}}
+    temp_study = {"analyses": [{"type": "temp", "values": [-40.0, 25.0, 85.0],
+                               "analysis": {"type": "op"}}], "probes": ["V(OUT)"]}
+    checks += 1
+    ro = simulate(temp_circ, temp_study)
+    rc, rcpp = core.call("sim_spice", {"circuit": temp_circ, "study": temp_study})
+    diffs = []
+    if not (ro["convergence"].get("temp") and rcpp.get("convergence", {}).get("temp")):
+        diffs.append("temp did not converge")
+    pp, cp = ro.get("temp", {}).get("points", []), rcpp.get("temp", {}).get("points", [])
+    if len(pp) != len(cp):
+        diffs.append(f"npoints {len(pp)}!={len(cp)}")
+    else:
+        for a, b in zip(pp, cp):
+            if abs(float(a["temp"]) - float(b["temp"])) > 1e-9:
+                diffs.append("temp value differs")
+                break
+            pv, cv = a["op"]["V(OUT)"], b["op"]["V(OUT)"]
+            if abs(float(pv) - float(cv)) / max(abs(float(pv)), 1e-9) > 1e-6:
+                diffs.append(f"V(OUT)@{a['temp']} {pv:.6g}!={cv:.6g}")
+    if diffs:
+        print(f"  {'temp diode sweep':<24} DIFF: {'; '.join(diffs)[:100]}")
+        mism += 1
+    else:
+        vs = ", ".join(f"{p['temp']:.0f}C={float(p['op']['V(OUT)']):.4g}" for p in cp)
+        print(f"  {'temp diode sweep':<24} MATCH  ({vs})")
+
+    # ---- .step (parameter sweep): step R2 of a divider; the inner op re-runs per value. Each run
+    # is an independent build, so the swept value takes effect cleanly — runs match the oracle.
+    step_circ = {
+        "nodes": ["IN", "OUT", "0"],
+        "devices": [
+            {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 10.0, "params": {}},
+            {"kind": "R", "name": "R1", "nodes": ["IN", "OUT"], "value": 1000.0, "params": {}},
+            {"kind": "R", "name": "R2", "nodes": ["OUT", "0"], "value": 2000.0, "params": {}}]}
+    step_study = {"analyses": [{"type": "step", "param": "R2", "values": [1000.0, 2000.0, 4000.0]},
+                               {"type": "op"}], "probes": ["V(OUT)"]}
+    checks += 1
+    ro = simulate(step_circ, step_study)
+    rc, rcpp = core.call("sim_spice", {"circuit": step_circ, "study": step_study})
+    diffs = []
+    if not (ro["convergence"].get("step") and rcpp.get("convergence", {}).get("step")):
+        diffs.append("step did not converge")
+    ps, cs = ro.get("step", {}), rcpp.get("step", {})
+    if ps.get("param") != cs.get("param"):
+        diffs.append(f"param {ps.get('param')}!={cs.get('param')}")
+    pv = np.asarray(ps.get("values", []), dtype=np.float64)
+    cv = np.asarray(cs.get("values", []), dtype=np.float64)
+    if pv.shape != cv.shape or (pv.size and float(np.max(np.abs(pv - cv))) > 1e-9):
+        diffs.append("values differ")
+    pr, cr = ps.get("runs", []), cs.get("runs", [])
+    if len(pr) != len(cr):
+        diffs.append(f"nruns {len(pr)}!={len(cr)}")
+    else:
+        for a, b in zip(pr, cr):
+            av, bv = a["op"]["V(OUT)"], b["op"]["V(OUT)"]
+            if abs(float(av) - float(bv)) / max(abs(float(av)), 1e-9) > 1e-6:
+                diffs.append(f"run@{a['value']} {av:.6g}!={bv:.6g}")
+                break
+    if diffs:
+        print(f"  {'step R2 divider':<24} DIFF: {'; '.join(diffs)[:100]}")
+        mism += 1
+    else:
+        vs = ", ".join(f"{r['value']:.0f}={float(r['op']['V(OUT)']):.4g}" for r in cr)
+        print(f"  {'step R2 divider':<24} MATCH  ({vs})")
+
     print(f"\n[spice-parity] {checks - mism}/{checks} circuit cases at full parity")
     return mism
 

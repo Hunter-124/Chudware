@@ -1135,13 +1135,295 @@ json spice_simulate(const json& circuit, const json& study) {
         return solve_dc_op_full(out, {}, kNoOverride);
     };
 
+    using cd = std::complex<double>;
+    // Reusable complex-MNA stamp (mirrors devices.py::stamp_ac). Builds A (and, when
+    // `null_sources` is false, the independent-source RHS z) about DC working point `x_op` at
+    // `omega`. Shared by the `ac`, `tf`, and `noise` analyses. With `null_sources=true` the matrix
+    // alone is built (every independent V/I source nulled — a shorted V, an opened I), which is the
+    // network .tf/.noise inject test currents into.
+    auto stamp_ac_complex = [&](Eigen::MatrixXcd& A, Eigen::VectorXcd& z, double omega,
+                                const std::vector<double>& x_op, bool null_sources) {
+        A.setZero();
+        z.setZero();
+        auto G = [&](int i, int j, cd v) { if (i >= 0 && j >= 0) A(i, j) += v; };
+        auto Iz = [&](int i, cd v) { if (i >= 0) z(i) += v; };
+        auto N = [&](const json& d, int k) {
+            const json& nodes = d["nodes"];
+            return (k < (int)nodes.size()) ? s.n(nodes[k].get<std::string>()) : -1;
+        };
+        // No gmin floor: the Python AC/tf/noise stamping path (devices.py::stamp_ac) does not add
+        // a node-to-ground gmin conductance — only the DC/transient real-MNA paths do. Matching
+        // that here keeps the linear .tf/.ac results bit-tight to the oracle.
+        for (const json& d : devices) {
+            std::string kind = d.value("kind", std::string());
+            std::string name = d.value("name", std::string());
+            int a0 = N(d, 0), b0 = N(d, 1);
+            if (kind == "R") {
+                double r = dev_value(d, 0.0);
+                if (std::abs(r) < 1e-12) r = 1e-9;
+                cd g(1.0 / r, 0.0);
+                G(a0, a0, g); G(b0, b0, g); G(a0, b0, -g); G(b0, a0, -g);
+            } else if (kind == "C") {
+                cd y(0.0, omega * dev_value(d, 0.0));
+                G(a0, a0, y); G(b0, b0, y); G(a0, b0, -y); G(b0, a0, -y);
+            } else if (kind == "L") {
+                int br = s.branch_of.at(name);
+                G(a0, br, 1.0); G(b0, br, -1.0); G(br, a0, 1.0); G(br, b0, -1.0);
+                G(br, br, cd(0.0, -omega * dev_value(d, 0.0)));  // -jwL
+                for (const auto& cp : couplings_of(name))  // -jwM I_other
+                    G(br, s.branch_of.at(cp.first), cd(0.0, -omega * cp.second));
+            } else if (kind == "V") {
+                int br = s.branch_of.at(name);
+                G(a0, br, 1.0); G(b0, br, -1.0); G(br, a0, 1.0); G(br, b0, -1.0);
+                if (!null_sources) Iz(br, ac_phasor(d));
+            } else if (kind == "I") {
+                if (!null_sources) { cd ph = ac_phasor(d); Iz(a0, -ph); Iz(b0, ph); }
+            } else if (kind == "E") {
+                int op = N(d, 0), on = N(d, 1), cp = N(d, 2), cn = N(d, 3), br = s.branch_of.at(name);
+                cd gain(dev_value(d, 1.0), 0.0);
+                G(op, br, 1.0); G(on, br, -1.0); G(br, op, 1.0); G(br, on, -1.0);
+                G(br, cp, -gain); G(br, cn, gain);
+            } else if (kind == "G") {
+                int op = N(d, 0), on = N(d, 1), cp = N(d, 2), cn = N(d, 3);
+                cd gm(dev_value(d, 1.0), 0.0);
+                G(op, cp, gm); G(op, cn, -gm); G(on, cp, -gm); G(on, cn, gm);
+            } else if (kind == "F") {
+                std::string ctrl = params_of(d).value("control", d.value("model", std::string()));
+                double gain = (d.contains("value") && d["value"].is_number())
+                                  ? d["value"].get<double>() : mp(d, s.models, "gain", 1.0);
+                int cbr = find_branch(s, ctrl);
+                if (cbr >= 0) { G(a0, cbr, cd(gain, 0.0)); G(b0, cbr, cd(-gain, 0.0)); }
+            } else if (kind == "H") {
+                int br = s.branch_of.at(name);
+                std::string ctrl = params_of(d).value("control", d.value("model", std::string()));
+                double r = (d.contains("value") && d["value"].is_number())
+                               ? d["value"].get<double>() : mp(d, s.models, "gain", 1.0);
+                G(a0, br, 1.0); G(b0, br, -1.0); G(br, a0, 1.0); G(br, b0, -1.0);
+                int cbr = find_branch(s, ctrl);
+                if (cbr >= 0) G(br, cbr, cd(-r, 0.0));
+            } else if (kind == "OPAMP") {
+                int ip = N(d, 0), inn = N(d, 1), out = N(d, 2);
+                int ref = d["nodes"].size() > 3 ? N(d, 3) : -1;
+                int br = s.branch_of.at(name);
+                G(out, br, 1.0);
+                if (ref >= 0) G(ref, br, -1.0);
+                double gbw = mp(d, s.models, "gbw", 0.0), gain = mp(d, s.models, "gain", 0.0);
+                if (gbw <= 0.0 && gain <= 0.0) {  // ideal nulling
+                    G(br, ip, 1.0); G(br, inn, -1.0);
+                } else {
+                    double A0 = gain > 0 ? gain : (gbw > 0 ? gbw : 1e6);
+                    cd Aw(A0, 0.0);
+                    if (gbw > 0 && A0 > 0) {
+                        double wp = 2.0 * kPi * gbw / A0;
+                        Aw = cd(A0, 0.0) / (cd(1.0, 0.0) + cd(0.0, omega / wp));
+                    }
+                    G(br, out, 1.0);
+                    if (ref >= 0) G(br, ref, -1.0);
+                    G(br, ip, -Aw); G(br, inn, Aw);
+                }
+            } else if (kind == "B") {
+                // Small-signal: keep the FD-Jacobian coupling about x_op, drop the DC offset.
+                auto it = b_expr.find(name);
+                if (it != b_expr.end()) {
+                    const SafeExpr& sx = *it->second;
+                    std::vector<int> rows = b_ctrl_rows(sx, s);
+                    std::vector<double> xv = x_op;
+                    std::map<int, double> partials;
+                    for (int r : rows) {
+                        double x0 = xv[r], h = 1e-6 * std::abs(x0) + 1e-9;
+                        xv[r] = x0 + h; double fp = eval_b(sx, s, xv, 0.0);
+                        xv[r] = x0 - h; double fm = eval_b(sx, s, xv, 0.0);
+                        xv[r] = x0;
+                        partials[r] = (fp - fm) / (2.0 * h);
+                    }
+                    if (b_src_type(d) == "V") {
+                        int br = s.branch_of.at(name);
+                        G(a0, br, 1.0); G(b0, br, -1.0); G(br, a0, 1.0); G(br, b0, -1.0);
+                        for (const auto& kv : partials) G(br, kv.first, cd(-kv.second, 0.0));
+                    } else {
+                        for (const auto& kv : partials) {
+                            G(a0, kv.first, cd(kv.second, 0.0));
+                            G(b0, kv.first, cd(-kv.second, 0.0));
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    // Evaluate a probe on a complex solution vector (V(node)/V(a,b)/I(name)). Returns {value, got}.
+    auto eval_probe_complex = [&](const std::vector<cd>& xc, const std::string& probe,
+                                  bool& got) -> cd {
+        auto cval = [&](int i) -> cd { return (i < 0 || i >= (int)xc.size()) ? cd(0, 0) : xc[i]; };
+        std::string p = trim(probe);
+        std::string up = upper(p);
+        got = false;
+        if (up.rfind("V(", 0) == 0 && !p.empty() && p.back() == ')') {
+            std::string inner = p.substr(2, p.size() - 3);
+            auto comma = inner.find(',');
+            if (comma == std::string::npos) {
+                int i = s.nodeRow(inner);
+                if (i != -2) { got = true; return cval(i); }
+                return cd(0, 0);
+            }
+            got = true;
+            return cval(s.nodeRow(trim(inner.substr(0, comma)))) -
+                   cval(s.nodeRow(trim(inner.substr(comma + 1))));
+        }
+        if (up.rfind("I(", 0) == 0 && !p.empty() && p.back() == ')') {
+            auto bit = s.branch_of.find(trim(p.substr(2, p.size() - 3)));
+            if (bit != s.branch_of.end()) { got = true; return cval(bit->second); }
+            return cd(0, 0);
+        }
+        int i = s.nodeRow(p);
+        if (i != -2) { got = true; return cval(i); }
+        return cd(0, 0);
+    };
+
     const json& analyses = study.contains("analyses") && study["analyses"].is_array()
                                ? study["analyses"] : empty_arr;
     const json& probes = study.contains("probes") && study["probes"].is_array()
                              ? study["probes"] : empty_arr;
 
-    for (const json& a : analyses) {
+    // ---- .step / mc / temp: re-run the inner analyses on a modified circuit, once per value.
+    // These mirror circuit.py::simulate's top-level routing: a `step` spec wraps the remaining
+    // analyses; `mc`/`temp` entries are additive. Each re-invokes spice_simulate on a modified
+    // circuit JSON (matching the oracle's deep-copy-and-resimulate semantics exactly).
+
+    // Resolve the swept values from a step spec (circuit.py::_step_values).
+    auto step_values = [](const json& spec) -> std::vector<double> {
+        std::vector<double> out;
+        if (spec.contains("values") && spec["values"].is_array()) {
+            for (const auto& v : spec["values"]) out.push_back(v.get<double>());
+            return out;
+        }
+        double start = as_num(spec.value("start", json(0.0)), 0.0);
+        double stop = as_num(spec.value("stop", json(0.0)), 0.0);
+        double step = as_num(spec.value("step", json(0.0)), 0.0);
+        if (step == 0.0) return {start};
+        int n = (int)std::lround((stop - start) / step) + 1;
+        for (int i = 0; i < std::max(n, 1); ++i) out.push_back(start + i * step);
+        return out;
+    };
+    // Apply a stepped parameter to a circuit JSON in place (circuit.py::_apply_step_param).
+    auto apply_step_param = [](json& circ, const std::string& param, double value) {
+        bool hit = false;
+        if (circ.contains("devices") && circ["devices"].is_array())
+            for (json& d : circ["devices"])
+                if (d.value("name", std::string()) == param) { d["value"] = value; hit = true; }
+        if (hit) return;
+        json& params = circ["params"];
+        if (!params.is_object()) params = json::object();
+        for (const std::string& key : {param, upper(param), lower(param)})
+            if (params.contains(key)) { params[key] = value; return; }
+        params[param] = value;
+    };
+
+    // Detect a step spec (top-level study["step"] OR an analysis entry {"type":"step"}).
+    json step_spec = nullptr;
+    json inner_analyses = analyses;
+    if (study.contains("step") && study["step"].is_object()) {
+        step_spec = study["step"];
+    } else {
+        json filtered = json::array();
+        for (const json& a : analyses) {
+            if (step_spec.is_null() && a.value("type", std::string()) == "step") step_spec = a;
+            else if (a.value("type", std::string()) != "step") filtered.push_back(a);
+        }
+        if (!step_spec.is_null()) inner_analyses = filtered;
+    }
+
+    if (!step_spec.is_null()) {
+        std::string param = step_spec.value("param", std::string());
+        std::vector<double> values = step_values(step_spec);
+        json runs = json::array();
+        bool all_ok = true;
+        json vlog = json::array();
+        for (double v : values) vlog.push_back(v);
+        log("step: sweeping '" + param + "' over " + std::to_string(values.size()) + " values");
+        for (double v : values) {
+            json c = circuit;
+            apply_step_param(c, param, v);
+            json sub_study = {{"analyses", inner_analyses}, {"probes", probes}};
+            if (study.contains("options")) sub_study["options"] = study["options"];
+            json sub = spice_simulate(c, sub_study);
+            json run = {{"value", v}, {"convergence", sub.value("convergence", json::object())},
+                        {"log", sub.value("log", json::array())}};
+            for (const char* k : {"op", "dc", "tran", "ac", "tf", "four", "noise"})
+                if (sub.contains(k)) run[k] = sub[k];
+            for (auto& kv : run["convergence"].items())
+                if (!kv.value().get<bool>()) all_ok = false;
+            runs.push_back(run);
+        }
+        result["step"] = {{"param", param}, {"values", values}, {"runs", runs}};
+        result["convergence"]["step"] = all_ok;
+        return result;
+    }
+
+    // mc / temp additive entries.
+    json mc_spec = nullptr, temp_spec = nullptr;
+    for (const json& a : inner_analyses) {
+        std::string t = a.value("type", std::string());
+        if (mc_spec.is_null() && t == "mc") mc_spec = a;
+        if (temp_spec.is_null() && t == "temp") temp_spec = a;
+    }
+
+    if (!temp_spec.is_null()) {
+        // Temperature sweep (analysis_ext.py::run_temp_sweep): rebuild + re-run per TEMP value.
+        std::vector<double> temps;
+        if (temp_spec.contains("values") && temp_spec["values"].is_array()) {
+            for (const auto& v : temp_spec["values"]) temps.push_back(v.get<double>());
+        } else {
+            double start = as_num(temp_spec.value("start", json(27.0)), 27.0);
+            double stop = as_num(temp_spec.value("stop", json(27.0)), 27.0);
+            double step = as_num(temp_spec.value("step", json(0.0)), 0.0);
+            temps = {start};
+            if (step != 0.0) {
+                int n = (int)std::lround((stop - start) / step) + 1;
+                temps.clear();
+                for (int i = 0; i < std::max(n, 1); ++i) temps.push_back(start + i * step);
+            }
+        }
+        json inner = temp_spec.contains("analysis") && temp_spec["analysis"].is_object()
+                         ? temp_spec["analysis"] : json{{"type", "op"}};
+        json points = json::array();
+        for (double tc : temps) {
+            json c = circuit;
+            if (!c["params"].is_object()) c["params"] = json::object();
+            c["params"]["TEMP"] = tc;
+            json opt = study.contains("options") && study["options"].is_object()
+                           ? study["options"] : json::object();
+            opt["temp"] = tc;
+            json sub_study = {{"analyses", json::array({inner})}, {"probes", probes},
+                             {"options", opt}};
+            json res = spice_simulate(c, sub_study);
+            json entry = {{"temp", tc}};
+            for (const char* k : {"op", "dc", "tran", "ac", "convergence"})
+                if (res.contains(k)) entry[k] = res[k];
+            points.push_back(entry);
+        }
+        log("temp: swept " + std::to_string(temps.size()) + " points");
+        result["temp"] = {{"values", temps}, {"points", points}};
+        result["convergence"]["temp"] = !points.empty();
+        // Run any remaining (non-temp) analyses on the nominal circuit too.
+        json rest = json::array();
+        for (const json& a : inner_analyses)
+            if (a.value("type", std::string()) != "temp") rest.push_back(a);
+        if (!rest.empty()) {
+            json sub_study = {{"analyses", rest}, {"probes", probes}};
+            if (study.contains("options")) sub_study["options"] = study["options"];
+            json sub = spice_simulate(circuit, sub_study);
+            for (const char* k : {"op", "dc", "tran", "ac", "tf", "four", "noise"})
+                if (sub.contains(k)) result[k] = sub[k];
+            for (auto& kv : sub.value("convergence", json::object()).items())
+                result["convergence"][kv.key()] = kv.value();
+        }
+        return result;
+    }
+
+    for (const json& a : inner_analyses) {
         std::string atype = a.value("type", std::string());
+        if (atype == "step" || atype == "mc" || atype == "temp") continue;
         if (atype == "op") {
             std::vector<double> x;
             bool ok = solve_dc_op(x);
@@ -1429,144 +1711,19 @@ json spice_simulate(const json& circuit, const json& study) {
             std::map<std::string, std::vector<double>> mag, phase;
             for (const json& pr : probes) { mag[pr.get<std::string>()]; phase[pr.get<std::string>()]; }
             bool ac_ok = true;
-            using cd = std::complex<double>;
-            auto N = [&](const json& d, int k) {
-                const json& nodes = d["nodes"];
-                return (k < (int)nodes.size()) ? s.n(nodes[k].get<std::string>()) : -1;
-            };
+            Eigen::MatrixXcd A(dim, dim);
+            Eigen::VectorXcd z(dim);
             for (double f : freqs) {
                 double omega = 2.0 * kPi * f;
-                Eigen::MatrixXcd A = Eigen::MatrixXcd::Zero(dim, dim);
-                Eigen::VectorXcd z = Eigen::VectorXcd::Zero(dim);
-                auto G = [&](int i, int j, cd v) { if (i >= 0 && j >= 0) A(i, j) += v; };
-                auto Iz = [&](int i, cd v) { if (i >= 0) z(i) += v; };
-                if (gmin > 0)
-                    for (int i = 0; i < s.n_nodes; ++i) G(i, i, cd(gmin, 0));
-                for (const json& d : devices) {
-                    std::string kind = d.value("kind", std::string());
-                    std::string name = d.value("name", std::string());
-                    int a0 = N(d, 0), b0 = N(d, 1);
-                    if (kind == "R") {
-                        double r = dev_value(d, 0.0);
-                        if (std::abs(r) < 1e-12) r = 1e-9;
-                        cd g(1.0 / r, 0.0);
-                        G(a0, a0, g); G(b0, b0, g); G(a0, b0, -g); G(b0, a0, -g);
-                    } else if (kind == "C") {
-                        cd y(0.0, omega * dev_value(d, 0.0));
-                        G(a0, a0, y); G(b0, b0, y); G(a0, b0, -y); G(b0, a0, -y);
-                    } else if (kind == "L") {
-                        int br = s.branch_of.at(name);
-                        G(a0, br, 1.0); G(b0, br, -1.0); G(br, a0, 1.0); G(br, b0, -1.0);
-                        G(br, br, cd(0.0, -omega * dev_value(d, 0.0)));  // -jwL
-                        for (const auto& cp : couplings_of(name))  // -jwM I_other
-                            G(br, s.branch_of.at(cp.first), cd(0.0, -omega * cp.second));
-                    } else if (kind == "V") {
-                        int br = s.branch_of.at(name);
-                        G(a0, br, 1.0); G(b0, br, -1.0); G(br, a0, 1.0); G(br, b0, -1.0);
-                        Iz(br, ac_phasor(d));
-                    } else if (kind == "I") {
-                        cd ph = ac_phasor(d);
-                        Iz(a0, -ph); Iz(b0, ph);
-                    } else if (kind == "E") {
-                        int op = N(d, 0), on = N(d, 1), cp = N(d, 2), cn = N(d, 3), br = s.branch_of.at(name);
-                        cd gain(dev_value(d, 1.0), 0.0);
-                        G(op, br, 1.0); G(on, br, -1.0); G(br, op, 1.0); G(br, on, -1.0);
-                        G(br, cp, -gain); G(br, cn, gain);
-                    } else if (kind == "G") {
-                        int op = N(d, 0), on = N(d, 1), cp = N(d, 2), cn = N(d, 3);
-                        cd gm(dev_value(d, 1.0), 0.0);
-                        G(op, cp, gm); G(op, cn, -gm); G(on, cp, -gm); G(on, cn, gm);
-                    } else if (kind == "F") {
-                        std::string ctrl = params_of(d).value("control", d.value("model", std::string()));
-                        double gain = (d.contains("value") && d["value"].is_number())
-                                          ? d["value"].get<double>() : mp(d, s.models, "gain", 1.0);
-                        int cbr = find_branch(s, ctrl);
-                        if (cbr >= 0) { G(a0, cbr, cd(gain, 0.0)); G(b0, cbr, cd(-gain, 0.0)); }
-                    } else if (kind == "H") {
-                        int br = s.branch_of.at(name);
-                        std::string ctrl = params_of(d).value("control", d.value("model", std::string()));
-                        double r = (d.contains("value") && d["value"].is_number())
-                                       ? d["value"].get<double>() : mp(d, s.models, "gain", 1.0);
-                        G(a0, br, 1.0); G(b0, br, -1.0); G(br, a0, 1.0); G(br, b0, -1.0);
-                        int cbr = find_branch(s, ctrl);
-                        if (cbr >= 0) G(br, cbr, cd(-r, 0.0));
-                    } else if (kind == "OPAMP") {
-                        int ip = N(d, 0), inn = N(d, 1), out = N(d, 2);
-                        int ref = d["nodes"].size() > 3 ? N(d, 3) : -1;
-                        int br = s.branch_of.at(name);
-                        G(out, br, 1.0);
-                        if (ref >= 0) G(ref, br, -1.0);
-                        double gbw = mp(d, s.models, "gbw", 0.0), gain = mp(d, s.models, "gain", 0.0);
-                        if (gbw <= 0.0 && gain <= 0.0) {  // ideal nulling
-                            G(br, ip, 1.0); G(br, inn, -1.0);
-                        } else {
-                            double A0 = gain > 0 ? gain : (gbw > 0 ? gbw : 1e6);
-                            cd Aw(A0, 0.0);
-                            if (gbw > 0 && A0 > 0) {
-                                double wp = 2.0 * kPi * gbw / A0;
-                                Aw = cd(A0, 0.0) / (cd(1.0, 0.0) + cd(0.0, omega / wp));
-                            }
-                            G(br, out, 1.0);
-                            if (ref >= 0) G(br, ref, -1.0);
-                            G(br, ip, -Aw); G(br, inn, Aw);
-                        }
-                    } else if (kind == "B") {
-                        // Small-signal: keep the FD-Jacobian coupling about x_op, drop the DC offset.
-                        auto it = b_expr.find(name);
-                        if (it != b_expr.end()) {
-                            const SafeExpr& sx = *it->second;
-                            std::vector<int> rows = b_ctrl_rows(sx, s);
-                            std::vector<double> xv = x_op;
-                            std::map<int, double> partials;
-                            for (int r : rows) {
-                                double x0 = xv[r], h = 1e-6 * std::abs(x0) + 1e-9;
-                                xv[r] = x0 + h; double fp = eval_b(sx, s, xv, 0.0);
-                                xv[r] = x0 - h; double fm = eval_b(sx, s, xv, 0.0);
-                                xv[r] = x0;
-                                partials[r] = (fp - fm) / (2.0 * h);
-                            }
-                            if (b_src_type(d) == "V") {
-                                int br = s.branch_of.at(name);
-                                G(a0, br, 1.0); G(b0, br, -1.0); G(br, a0, 1.0); G(br, b0, -1.0);
-                                for (const auto& kv : partials) G(br, kv.first, cd(-kv.second, 0.0));
-                            } else {
-                                for (const auto& kv : partials) {
-                                    G(a0, kv.first, cd(kv.second, 0.0));
-                                    G(b0, kv.first, cd(-kv.second, 0.0));
-                                }
-                            }
-                        }
-                    }
-                }
+                stamp_ac_complex(A, z, omega, x_op, /*null_sources=*/false);
                 Eigen::VectorXcd xv = A.partialPivLu().solve(z);
                 bool fin = xv.allFinite();
                 if (!fin) ac_ok = false;
                 std::vector<cd> xc(dim);
                 for (int i = 0; i < dim; ++i) xc[i] = fin ? xv(i) : cd(0, 0);
-                auto cval = [&](int i) -> cd { return (i < 0 || i >= dim) ? cd(0, 0) : xc[i]; };
                 for (const json& pr : probes) {
-                    std::string p = trim(pr.get<std::string>());
-                    std::string up = upper(p);
-                    cd v(0, 0);
                     bool got = false;
-                    if (up.rfind("V(", 0) == 0 && p.back() == ')') {
-                        std::string inner = p.substr(2, p.size() - 3);
-                        auto comma = inner.find(',');
-                        if (comma == std::string::npos) {
-                            int i = s.nodeRow(inner);
-                            if (i != -2) { v = cval(i); got = true; }
-                        } else {
-                            v = cval(s.nodeRow(trim(inner.substr(0, comma)))) -
-                                cval(s.nodeRow(trim(inner.substr(comma + 1))));
-                            got = true;
-                        }
-                    } else if (up.rfind("I(", 0) == 0 && p.back() == ')') {
-                        auto bit = s.branch_of.find(trim(p.substr(2, p.size() - 3)));
-                        if (bit != s.branch_of.end()) { v = cval(bit->second); got = true; }
-                    } else {
-                        int i = s.nodeRow(p);
-                        if (i != -2) { v = cval(i); got = true; }
-                    }
+                    cd v = eval_probe_complex(xc, pr.get<std::string>(), got);
                     if (got && fin) {
                         mag[pr.get<std::string>()].push_back(std::abs(v));
                         phase[pr.get<std::string>()].push_back(std::atan2(v.imag(), v.real()) * 180.0 / kPi);
@@ -1583,6 +1740,305 @@ json spice_simulate(const json& circuit, const json& study) {
             }
             result["ac"] = acj;
             result["convergence"]["ac"] = ac_ok;
+        } else if (atype == "tf") {
+            // ---- small-signal transfer function (.tf): gain, rin, rout (circuit.py::run_tf) ----
+            std::string output = a.contains("output") && a["output"].is_string()
+                                     ? a["output"].get<std::string>() : "V(OUT)";
+            std::string source = a.value("source", std::string());
+            auto nan_tf = [&]() {
+                result["tf"] = {{"gain", std::nan("")}, {"rin", std::nan("")},
+                                {"rout", std::nan("")}, {"output", output}, {"source", source}};
+            };
+
+            std::vector<double> x_op(dim, 0.0);
+            if (has_nonlinear) {
+                if (!solve_dc_op(x_op)) { x_op.assign(dim, 0.0); log("tf: DC op for linearization failed"); }
+            }
+
+            // Resolve the output node pair (V(node) or V(a,b)). Only voltage outputs are valid.
+            int oi = -1, oj = -1;
+            {
+                std::string p = trim(output), up = upper(p);
+                if (up.rfind("I(", 0) == 0) {  // only voltage outputs are meaningful for .tf
+                    log("tf: output '" + output + "' must be a voltage probe V(node) or V(a,b)");
+                    nan_tf();
+                    result["convergence"]["tf"] = false;
+                    continue;
+                }
+                if (up.rfind("V(", 0) == 0 && p.back() == ')') {
+                    std::string inner = p.substr(2, p.size() - 3);
+                    auto comma = inner.find(',');
+                    if (comma == std::string::npos) { oi = s.nodeRow(trim(inner)); oj = -1; }
+                    else { oi = s.nodeRow(trim(inner.substr(0, comma)));
+                           oj = s.nodeRow(trim(inner.substr(comma + 1))); }
+                } else { oi = s.nodeRow(p); oj = -1; }
+                if (oi == -2) oi = -1;
+                if (oj == -2) oj = -1;
+            }
+
+            // Locate the source device (must be an independent V or I).
+            const json* src_dev = nullptr;
+            for (const json& d : devices)
+                if (d.value("name", std::string()) == source) { src_dev = &d; break; }
+            std::string src_kind = src_dev ? src_dev->value("kind", std::string()) : "";
+            if (!src_dev || (src_kind != "V" && src_kind != "I")) {
+                log("tf: source '" + source + "' must name an independent V or I source");
+                nan_tf();
+                result["convergence"]["tf"] = false;
+                continue;
+            }
+            int sa = s.n((*src_dev)["nodes"][0].get<std::string>());
+            int sb = s.n((*src_dev)["nodes"][1].get<std::string>());
+
+            Eigen::MatrixXcd A(dim, dim);
+            Eigen::VectorXcd z(dim);
+            auto read_pair = [&](const std::vector<cd>& xc, int i, int j) -> cd {
+                auto cval = [&](int k) -> cd { return (k < 0 || k >= (int)xc.size()) ? cd(0, 0) : xc[k]; };
+                return cval(i) - cval(j);
+            };
+            bool tf_ok = true;
+            double gain = std::nan(""), rin = std::nan(""), rout = std::nan("");
+
+            // --- gain + rin: unit drive of the chosen source, all others nulled ---
+            stamp_ac_complex(A, z, 0.0, x_op, /*null_sources=*/true);
+            if (src_kind == "V") {
+                z(s.branch_of.at(source)) += cd(1.0, 0.0);  // unit voltage on its branch RHS
+            } else {  // I: inject 1 A into the from-node, out of the to-node
+                if (sa >= 0) z(sa) += cd(1.0, 0.0);
+                if (sb >= 0) z(sb) += cd(-1.0, 0.0);
+            }
+            {
+                Eigen::VectorXcd xv = A.partialPivLu().solve(z);
+                if (!xv.allFinite()) { tf_ok = false; log("tf: gain solve singular"); }
+                else {
+                    std::vector<cd> xc(dim);
+                    for (int i = 0; i < dim; ++i) xc[i] = xv(i);
+                    cd out_v = read_pair(xc, oi, oj);
+                    gain = (out_v / cd(1.0, 0.0)).real();
+                    if (src_kind == "V") {
+                        cd i_src = (s.branch_of.at(source) < dim) ? xc[s.branch_of.at(source)] : cd(0, 0);
+                        cd i_delivered = -i_src;
+                        rin = std::abs(i_delivered) > 0 ? (cd(1.0, 0.0) / i_delivered).real()
+                                                        : std::numeric_limits<double>::infinity();
+                    } else {
+                        cd v_src = read_pair(xc, sa, sb);
+                        rin = v_src.real();
+                    }
+                }
+            }
+
+            // --- rout: all independent sources nulled, 1 A test current across the output nodes ---
+            stamp_ac_complex(A, z, 0.0, x_op, /*null_sources=*/true);
+            if (oi >= 0) z(oi) += cd(1.0, 0.0);
+            if (oj >= 0) z(oj) += cd(-1.0, 0.0);
+            {
+                Eigen::VectorXcd xv = A.partialPivLu().solve(z);
+                if (!xv.allFinite()) { tf_ok = false; log("tf: rout solve singular"); }
+                else {
+                    std::vector<cd> xc(dim);
+                    for (int i = 0; i < dim; ++i) xc[i] = xv(i);
+                    rout = read_pair(xc, oi, oj).real();
+                }
+            }
+
+            result["tf"] = {{"gain", gain}, {"rin", rin}, {"rout", rout},
+                            {"output", output}, {"source", source}};
+            result["convergence"]["tf"] = tf_ok;
+        } else if (atype == "noise") {
+            // ---- resistor-thermal output noise (analysis_ext.py::run_noise) ----
+            std::string output = a.contains("output") && a["output"].is_string()
+                                     ? a["output"].get<std::string>() : "V(OUT)";
+            std::vector<double> freqs = freq_grid(a);
+            double tkelvin = s.temp_c + 273.15;
+            double four_kt = 4.0 * kBoltz * tkelvin;
+
+            // Resistors + their tempco-free resistance (devices use _r(); here R has no tempco
+            // unless tc1/tc2 are present — match the device value path).
+            struct ResNode { std::string name; int a, b; double r; };
+            std::vector<ResNode> resnodes;
+            for (const json& d : devices)
+                if (d.value("kind", std::string()) == "R") {
+                    int a0 = s.n(d["nodes"][0].get<std::string>());
+                    int b0 = s.n(d["nodes"][1].get<std::string>());
+                    double r = dev_value(d, 0.0);
+                    if (std::abs(r) < 1e-12) r = 1e-9;
+                    resnodes.push_back({d.value("name", std::string()), a0, b0, r});
+                }
+
+            if (resnodes.empty()) {
+                json zeros = json::array();
+                for (std::size_t i = 0; i < freqs.size(); ++i) zeros.push_back(0.0);
+                result["noise"] = {{"x_f", freqs}, {"output", output},
+                                   {"onoise_spectrum", zeros}, {"total_noise_rms", 0.0},
+                                   {"per_resistor", json::object()}};
+                result["convergence"]["noise"] = true;
+                log("noise: no resistors -> no thermal-noise sources modeled");
+                continue;
+            }
+
+            std::vector<double> x_op(dim, 0.0);
+            if (has_nonlinear) { if (!solve_dc_op(x_op)) x_op.assign(dim, 0.0); }
+
+            std::vector<double> onoise_psd(freqs.size(), 0.0);
+            std::map<std::string, std::vector<double>> per_spec;
+            for (const auto& rn : resnodes) per_spec[rn.name] = std::vector<double>(freqs.size(), 0.0);
+            bool noise_ok = true;
+            Eigen::MatrixXcd A(dim, dim);
+            Eigen::VectorXcd z(dim);
+            for (std::size_t fi = 0; fi < freqs.size(); ++fi) {
+                double omega = 2.0 * kPi * freqs[fi];
+                for (const auto& rn : resnodes) {
+                    if (rn.r <= 0.0) continue;
+                    // NB: the Python oracle (analysis_ext.run_noise) stamps EVERY device's AC
+                    // contribution — INCLUDING independent-source excitations — then adds the 1 A
+                    // test injection across R_k. It does NOT null the sources first. We mirror that
+                    // (null_sources=false) so the transfer impedance matches bit-for-bit, even
+                    // though a textbook noise analysis would zero the sources.
+                    stamp_ac_complex(A, z, omega, x_op, /*null_sources=*/false);
+                    if (rn.a >= 0) z(rn.a) += cd(1.0, 0.0);
+                    if (rn.b >= 0) z(rn.b) += cd(-1.0, 0.0);
+                    Eigen::VectorXcd xv = A.partialPivLu().solve(z);
+                    if (!xv.allFinite()) { noise_ok = false; continue; }
+                    std::vector<cd> xc(dim);
+                    for (int i = 0; i < dim; ++i) xc[i] = xv(i);
+                    bool got = false;
+                    cd ztrans = eval_probe_complex(xc, output, got);
+                    if (!got) continue;
+                    double contrib = std::norm(ztrans) * (four_kt / rn.r);  // |Z|^2 * 4kT/R
+                    per_spec[rn.name][fi] = contrib;
+                    onoise_psd[fi] += contrib;
+                }
+            }
+
+            // Integrated RMS over the band: sqrt(trapezoid integral of PSD over f).
+            auto trapz = [&](const std::vector<double>& y) -> double {
+                double acc = 0.0;
+                for (std::size_t i = 0; i + 1 < freqs.size(); ++i)
+                    acc += 0.5 * (y[i] + y[i + 1]) * (freqs[i + 1] - freqs[i]);
+                return acc;
+            };
+            double total_var = freqs.size() >= 2 ? trapz(onoise_psd) : 0.0;
+            double total_rms = std::sqrt(std::max(total_var, 0.0));
+            json per_res = json::object();
+            for (const auto& rn : resnodes) {
+                double var = freqs.size() >= 2 ? trapz(per_spec[rn.name]) : 0.0;
+                per_res[rn.name] = std::sqrt(std::max(var, 0.0));
+            }
+            std::vector<double> onoise_density(freqs.size());
+            for (std::size_t i = 0; i < freqs.size(); ++i)
+                onoise_density[i] = std::sqrt(std::max(onoise_psd[i], 0.0));
+
+            result["noise"] = {{"x_f", freqs}, {"output", output},
+                               {"onoise_spectrum", onoise_density}, {"onoise_psd", onoise_psd},
+                               {"total_noise_rms", total_rms}, {"per_resistor", per_res},
+                               {"temp_c", s.temp_c}};
+            result["convergence"]["noise"] = noise_ok;
+        } else if (atype == "four") {
+            // ---- Fourier / THD on a transient trace (analysis_ext.py::run_fourier) ----
+            // Use a preceding tran result if present; else run a tran from this spec's own
+            // tstep/tstop (recursively, matching circuit.py::_run_analyses).
+            json tran_res;
+            if (result.contains("tran")) {
+                tran_res = result["tran"];
+            } else {
+                std::string fprobe = a.value("probe", std::string());
+                json tprobes = probes;
+                if (!fprobe.empty()) {
+                    bool present = false;
+                    for (const auto& p : tprobes) if (p.get<std::string>() == fprobe) present = true;
+                    if (!present) { json np = json::array({fprobe}); for (const auto& p : tprobes) np.push_back(p); tprobes = np; }
+                }
+                json tan = a; tan["type"] = "tran";
+                json sub_study = {{"analyses", json::array({tan})}, {"probes", tprobes}};
+                if (study.contains("options")) sub_study["options"] = study["options"];
+                json sub = spice_simulate(circuit, sub_study);
+                tran_res = sub.value("tran", json::object());
+                result["tran"] = tran_res;
+                result["convergence"]["tran"] = sub.value("convergence", json::object()).value("tran", false);
+            }
+
+            // -- run_fourier --
+            bool four_ok = false;
+            do {
+                if (!tran_res.is_object() || tran_res.empty()) { log("four: no transient result to analyze"); break; }
+                double f0 = as_num(a.value("f0", json(0.0)), 0.0);
+                if (f0 <= 0.0) { log("four: f0 must be > 0"); break; }
+                std::string probe = a.value("probe", std::string());
+                const json& traces = tran_res.value("traces", json::object());
+                if (probe.empty()) { if (!traces.empty()) probe = traces.begin().key(); }
+                if (probe.empty() || !traces.contains(probe)) { log("four: probe not in transient traces"); break; }
+                int nharm = (int)as_num(a.value("nharm", json(9)), 9);
+                nharm = std::max(1, std::min(nharm, 64));
+
+                std::vector<double> t, y;
+                for (const auto& v : tran_res.value("x_t", json::array())) t.push_back(v.get<double>());
+                for (const auto& v : traces[probe]) y.push_back(v.get<double>());
+                if (t.size() < 4 || y.size() != t.size()) { log("four: transient trace too short for Fourier"); break; }
+
+                double period = 1.0 / f0;
+                double tspan = t.back() - t.front();
+                if (tspan < period) { log("four: trace span shorter than one period"); break; }
+                int max_periods = (int)(tspan / period);
+                int periods = (int)as_num(a.value("periods", json(max_periods)), max_periods);
+                periods = std::max(1, std::min(periods, max_periods));
+                double t_end = t.back();
+                double t_start = t_end - periods * period;
+
+                int samples_per_period = 1, target = 4 * (nharm + 1);
+                while (samples_per_period < target) samples_per_period *= 2;
+                int nfft = samples_per_period * periods;
+
+                // Uniform grid over exactly `periods` periods (exclude duplicate endpoint), then
+                // linear interpolation (numpy.interp) onto it.
+                std::vector<double> yg(nfft);
+                for (int k = 0; k < nfft; ++k) {
+                    double tk = t_start + (t_end - t_start) * (double)k / (double)nfft;
+                    // np.interp: clamp outside, linear inside.
+                    double val;
+                    if (tk <= t.front()) val = y.front();
+                    else if (tk >= t.back()) val = y.back();
+                    else {
+                        std::size_t lo = 0, hi = t.size() - 1;
+                        while (hi - lo > 1) { std::size_t mid = (lo + hi) / 2; if (t[mid] <= tk) lo = mid; else hi = mid; }
+                        double f = t[hi] > t[lo] ? (tk - t[lo]) / (t[hi] - t[lo]) : 0.0;
+                        val = y[lo] + (y[hi] - y[lo]) * f;
+                    }
+                    yg[k] = val;
+                }
+
+                // Direct DFT (rfft): bins 0..nfft/2. mags = |spec| * 2/nfft (DC halved).
+                int nbins = nfft / 2 + 1;
+                std::vector<double> mags(nbins), phases(nbins);
+                double scale = 2.0 / nfft;
+                for (int kk = 0; kk < nbins; ++kk) {
+                    cd acc(0, 0);
+                    double w = -2.0 * kPi * kk / nfft;
+                    for (int nn = 0; nn < nfft; ++nn) acc += yg[nn] * std::polar(1.0, w * nn);
+                    mags[kk] = std::abs(acc) * scale;
+                    phases[kk] = std::atan2(acc.imag(), acc.real()) * 180.0 / kPi;
+                }
+                if (!mags.empty()) mags[0] *= 0.5;
+
+                double dc = mags.empty() ? 0.0 : mags[0];
+                json harmonics = json::array();
+                std::vector<double> h_amps;
+                for (int nn = 1; nn <= nharm; ++nn) {
+                    int bin_idx = nn * periods;
+                    if (bin_idx >= (int)mags.size()) break;
+                    harmonics.push_back(json::array({nn, mags[bin_idx], phases[bin_idx]}));
+                    h_amps.push_back(mags[bin_idx]);
+                }
+                if (h_amps.empty()) { log("four: no harmonics resolvable from trace"); break; }
+                double h1 = h_amps[0], rest = 0.0;
+                for (std::size_t i = 1; i < h_amps.size(); ++i) rest += h_amps[i] * h_amps[i];
+                rest = std::sqrt(rest);
+                double thd_pct = h1 > 1e-30 ? rest / h1 * 100.0 : 0.0;
+
+                result["four"] = {{"probe", probe}, {"f0", f0}, {"dc", dc},
+                                  {"harmonics", harmonics}, {"thd_pct", thd_pct}};
+                four_ok = true;
+            } while (false);
+            result["convergence"]["four"] = four_ok;
         } else {
             result["convergence"][atype] = false;
             log(atype + ": analysis not yet ported to the C++ core");

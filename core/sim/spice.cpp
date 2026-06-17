@@ -1,11 +1,14 @@
 // MNA circuit simulator implementation — see spice.h.
 //
-// Linear DC operating point + linear transient (trapezoidal / backward-Euler companion
-// models). The node-index construction, branch-row allocation, per-device stamps, the
-// transient time-stepping loop (BE bootstrap, source breakpoints), and probe evaluation
-// mirror engine/sim/circuit.py + devices.py. The dense PartialPivLU solve matches numpy's
-// linalg.solve for the small systems these circuits produce. Nonlinear devices (D/Q/M +
-// Newton), AC sweep, mutual inductance (K), and the netlist parser are deferred.
+// DC operating point (Newton with gmin- + source-stepping fallback), transient
+// (trapezoidal / backward-Euler companion models, inner Newton for nonlinear devices),
+// and AC sweep. The node-index construction, branch-row allocation, per-device stamps,
+// the time-stepping loop (BE bootstrap, source breakpoints), Newton damping/limiting, and
+// probe evaluation mirror engine/sim/circuit.py + engine/sim/devices.py. The dense
+// PartialPivLU solve matches numpy's linalg.solve for the small systems these circuits
+// produce. Nonlinear devices ported: Diode (D), BJT (Q, Ebers-Moll), MOSFET (M, level-1).
+// Mutual inductance (K), behavioral (B), subckt expansion, and the netlist parser remain
+// deferred to follow-ups.
 
 #include "sim/spice.h"
 
@@ -27,11 +30,20 @@ using nlohmann::json;
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
+// Physical constants (devices.py).
+constexpr double kBoltz = 1.380649e-23;       // Boltzmann (J/K)
+constexpr double kQ = 1.602176634e-19;        // electron charge (C)
+constexpr double kTnomC = 27.0;               // nominal param temperature (deg C)
+constexpr double kEgSi = 1.11;                // silicon bandgap (eV)
 
 bool is_ground(const std::string& n) { return n == "0" || n == "gnd" || n == "GND"; }
 
 std::string upper(std::string s) {
     for (char& c : s) c = static_cast<char>(std::toupper((unsigned char)c));
+    return s;
+}
+std::string lower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower((unsigned char)c));
     return s;
 }
 std::string trim(std::string s) {
@@ -46,6 +58,36 @@ double dev_value(const json& d, double dflt = 0.0) {
 const json& params_of(const json& d) {
     static const json empty = json::object();
     return (d.contains("params") && d["params"].is_object()) ? d["params"] : empty;
+}
+
+// Thermal voltage kT/q at the given temperature in Celsius (devices.py::_vt).
+double vt_of(double temp_c) { return kBoltz * (temp_c + 273.15) / kQ; }
+
+// Read a model/device param: device params (exact key) override the .model card
+// (key/UPPER/lower) — devices.py::Device._mp.
+double mp(const json& d, const json& models, const char* key, double dflt) {
+    const json& dp = params_of(d);
+    if (dp.contains(key) && dp[key].is_number()) return dp[key].get<double>();
+    std::string mname = d.value("model", std::string());
+    if (!mname.empty() && models.contains(mname) && models[mname].is_object()) {
+        const json& m = models[mname];
+        for (const std::string& k : {std::string(key), upper(key), lower(key)})
+            if (m.contains(k) && m[k].is_number()) return m[k].get<double>();
+    }
+    return dflt;
+}
+
+// Read a string model/device param: model card wins, then device params, then default
+// (matches the BJT/MOSFET `type` lookup order in devices.py).
+std::string model_str(const json& d, const json& models, const char* key, const std::string& dflt) {
+    std::string mname = d.value("model", std::string());
+    if (!mname.empty() && models.contains(mname) && models[mname].is_object()) {
+        const json& m = models[mname];
+        if (m.contains(key) && m[key].is_string()) return m[key].get<std::string>();
+    }
+    const json& dp = params_of(d);
+    if (dp.contains(key) && dp[key].is_string()) return dp[key].get<std::string>();
+    return dflt;
 }
 
 // Evaluate an independent source's value at time t (DC / PULSE / SIN / PWL) —
@@ -185,11 +227,13 @@ std::vector<double> freq_grid(const json& an) {
     return out;
 }
 
-// Per-reactive-device transient history (uncoupled C / L).
+// Per-reactive-device transient history (uncoupled C / L; diode junction cap).
 struct TranState {
-    double v = 0.0;      // previous terminal voltage
-    double i = 0.0;      // previous branch/companion current
-    double ldidt = 0.0;  // L*di/dt (inductor self term)
+    double v = 0.0;       // previous terminal voltage
+    double i = 0.0;       // previous branch/companion current
+    double ldidt = 0.0;   // L*di/dt (inductor self term)
+    double vcap = 0.0;    // diode junction-cap previous voltage
+    double icap = 0.0;    // diode junction-cap previous current
 };
 
 // Shared circuit setup: node index, branch rows, device list.
@@ -199,7 +243,13 @@ struct Setup {
     int dim = 0;
     std::map<std::string, int> branch_of;
     const json& devices;
-    double gmin;
+    const json& models;
+    double gmin = 1e-12;
+    double temp_c = 27.0;
+    // Newton options.
+    double reltol = 1e-3;
+    double vntol = 1e-6;
+    int maxiter = 100;
 
     int n(const std::string& name) const {
         auto it = node_index.find(name);
@@ -240,9 +290,24 @@ bool solve_dense(const Mna& mna, std::vector<double>& x) {
     return true;
 }
 
+double src_scale_of(const std::map<std::string, double>& sc, const std::string& name) {
+    auto it = sc.find(name);
+    return it == sc.end() ? 1.0 : it->second;
+}
+
+inline double xat(const std::vector<double>& x, int i) {
+    return (i < 0 || i >= (int)x.size()) ? 0.0 : x[i];
+}
+
+// True if a device kind needs Newton iteration (nonlinear DC/transient).
+bool kind_is_nonlinear(const std::string& kind) {
+    return kind == "D" || kind == "Q" || kind == "M";
+}
+
 // Stamp the static linear devices common to DC and transient (R, V, I, E, G); the
 // reactive devices (C, L) are stamped by the caller (DC-open/short vs companion).
-void stamp_linear(const Setup& s, Mna& mna, const json& d, double t) {
+void stamp_linear(const Setup& s, Mna& mna, const json& d, double t,
+                  const std::map<std::string, double>& src_scale) {
     const std::string kind = d.value("kind", std::string());
     const std::string name = d.value("name", std::string());
     const json& nodes = d.contains("nodes") ? d["nodes"] : json::array();
@@ -256,10 +321,10 @@ void stamp_linear(const Setup& s, Mna& mna, const json& d, double t) {
     } else if (kind == "V") {
         int a = N(0), b = N(1), br = s.branch_of.at(name);
         mna.G(a, br, 1.0); mna.G(b, br, -1.0); mna.G(br, a, 1.0); mna.G(br, b, -1.0);
-        mna.I(br, source_value_t(d, t));
+        mna.I(br, source_value_t(d, t) * src_scale_of(src_scale, name));
     } else if (kind == "I") {
         int a = N(0), b = N(1);
-        double i = source_value_t(d, t);
+        double i = source_value_t(d, t) * src_scale_of(src_scale, name);
         mna.I(a, -i); mna.I(b, i);
     } else if (kind == "E") {
         int op = N(0), on = N(1), cp = N(2), cn = N(3), br = s.branch_of.at(name);
@@ -272,6 +337,180 @@ void stamp_linear(const Setup& s, Mna& mna, const json& d, double t) {
         double gm = dev_value(d, 1.0);
         mna.G(op, cp, gm); mna.G(op, cn, -gm); mna.G(on, cp, -gm); mna.G(on, cn, gm);
     }
+}
+
+// ---- nonlinear device DC stamps (devices.py) -------------------------------------------
+
+// Saturation current at the device temperature (SPICE IS temperature law) — Diode._is_temp.
+double diode_is_temp(const json& d, const json& models, double temp_c) {
+    double IS0 = mp(d, models, "IS", 1e-14);
+    double N = mp(d, models, "N", 1.0);
+    double XTI = mp(d, models, "XTI", 3.0);
+    double tk = temp_c + 273.15, tnomk = kTnomC + 273.15;
+    if (std::abs(tk - tnomk) < 1e-9 || IS0 <= 0.0) return IS0;
+    double ratio = tk / tnomk;
+    double eg_term = kEgSi * kQ / kBoltz;
+    double scale = std::pow(ratio, XTI / N) * std::exp(-(eg_term / N) * (1.0 / tk - 1.0 / tnomk));
+    if (!std::isfinite(scale)) return IS0;
+    return IS0 * scale;
+}
+
+// (Id, gd) for the diode junction (excluding RS) at diode voltage vd — Diode._linearize.
+void diode_linearize(double vd, double IS, double N, double BV, double gmin, double temp_c,
+                     double& Id, double& gd) {
+    double vt = N * vt_of(temp_c);
+    double vcrit = IS > 0 ? vt * std::log(vt / (std::sqrt(2.0) * IS)) : 0.6;
+    double v = vd;
+    if (v > vcrit) {
+        v = (vd - vcrit) / vt > -1 ? vcrit + vt * std::log1p((vd - vcrit) / vt) : vcrit;
+    }
+    if (v >= 0 || v > -5 * vt) {
+        double ev = std::exp(std::min(v / vt, 80.0));
+        Id = IS * (ev - 1.0);
+        gd = IS / vt * ev;
+    } else {
+        Id = -IS;
+        gd = gmin;
+        if (-vd > BV) {
+            double ibrk = IS * (std::exp(std::min((-vd - BV) / vt, 80.0)) - 1.0);
+            Id = -IS - ibrk;
+            gd = IS / vt * std::exp(std::min((-vd - BV) / vt, 80.0));
+        }
+    }
+    gd = std::max(gd, gmin);
+}
+
+// Diode internal junction voltage given the terminal voltage (RS series fold) — Diode._vd.
+double diode_vd(const Setup& s, const json& d, const std::vector<double>& x, double IS, double N,
+                double RS, std::map<std::string, double>& last_vd) {
+    const json& nodes = d["nodes"];
+    int a = s.n(nodes[0].get<std::string>()), b = s.n(nodes[1].get<std::string>());
+    double vt = N * vt_of(s.temp_c);
+    double vterm = xat(x, a) - xat(x, b);
+    if (RS <= 0.0) return vterm;
+    const std::string name = d.value("name", std::string());
+    auto it = last_vd.find(name);
+    double vd = it != last_vd.end() ? it->second : std::min(vterm, 0.7);
+    for (int k = 0; k < 20; ++k) {
+        double ev = std::exp(std::min(vd / vt, 80.0));
+        double Id = IS * (ev - 1.0);
+        double gd = IS / vt * ev + s.gmin;
+        double f = vd + RS * Id - vterm;
+        double dfdv = 1.0 + RS * gd;
+        double step = f / dfdv;
+        vd -= step;
+        if (std::abs(step) < 1e-9) break;
+    }
+    return vd;
+}
+
+void stamp_diode_dc(const Setup& s, Mna& mna, const json& d, const std::vector<double>& x,
+                    std::map<std::string, double>& last_vd) {
+    double IS = diode_is_temp(d, s.models, s.temp_c);
+    double N = mp(d, s.models, "N", 1.0);
+    double RS = mp(d, s.models, "RS", 0.0);
+    double BV = mp(d, s.models, "BV", 1e30);
+    const json& nodes = d["nodes"];
+    int a = s.n(nodes[0].get<std::string>()), b = s.n(nodes[1].get<std::string>());
+    double vd = diode_vd(s, d, x, IS, N, RS, last_vd);
+    last_vd[d.value("name", std::string())] = vd;
+    double Id, gd;
+    diode_linearize(vd, IS, N, BV, s.gmin, s.temp_c, Id, gd);
+    double geff = RS > 0 ? gd / (1.0 + RS * gd) : gd;
+    double ieq = Id - gd * vd;
+    double ieq_eff = RS > 0 ? ieq / (1.0 + RS * gd) : ieq;
+    mna.G(a, a, geff); mna.G(b, b, geff);
+    mna.G(a, b, -geff); mna.G(b, a, -geff);
+    mna.I(a, -ieq_eff); mna.I(b, ieq_eff);
+}
+
+void stamp_bjt_dc(const Setup& s, Mna& mna, const json& d, const std::vector<double>& x) {
+    double IS = mp(d, s.models, "IS", 1e-16);
+    double BF = mp(d, s.models, "BF", 100.0);
+    double BR = mp(d, s.models, "BR", 1.0);
+    double VAF = mp(d, s.models, "VAF", 1e30);
+    double NF = mp(d, s.models, "NF", 1.0);
+    double NR = mp(d, s.models, "NR", 1.0);
+    std::string typ = lower(model_str(d, s.models, "type", "npn"));
+    const json& nodes = d["nodes"];
+    int c = s.n(nodes[0].get<std::string>()), b = s.n(nodes[1].get<std::string>()),
+        e = s.n(nodes[2].get<std::string>());
+    double vt = vt_of(s.temp_c);
+    double sign = typ == "npn" ? 1.0 : -1.0;
+    double vbe = sign * (xat(x, b) - xat(x, e));
+    double vbc = sign * (xat(x, b) - xat(x, c));
+    auto diode = [&](double v, double n, double& i, double& g) {
+        v = std::min(v, 0.95);
+        double ev = std::exp(std::min(v / (n * vt), 80.0));
+        i = IS * (ev - 1.0);
+        g = IS / (n * vt) * ev + s.gmin;
+    };
+    double ibe, gbe, ibc, gbc;
+    diode(vbe, NF, ibe, gbe);
+    diode(vbc, NR, ibc, gbc);
+    double qb = 1.0;
+    if (VAF < 1e29) qb = 1.0 / std::max(1.0 - vbc / VAF, 0.1);
+    double ic = (ibe * qb - ibc) - ibc / BR;
+    double ib = ibe / BF + ibc / BR;
+    double gpi = gbe / BF;
+    double gmu = gbc / BR;
+    double gm = gbe * qb - gbc;
+    double go = 0.0;
+    // Node-referenced small-signal conductances.
+    mna.G(b, b, gpi + gmu); mna.G(b, e, -gpi); mna.G(b, c, -gmu);
+    mna.G(c, b, gm - gmu);  mna.G(c, e, -gm);  mna.G(c, c, gmu + go);
+    mna.G(e, b, -gpi - gm); mna.G(e, e, gpi + gm); mna.G(e, c, go);
+    // Companion RHS: I_eq = I(op) - J @ v(op).
+    double ieq_b = ib - gpi * vbe - gmu * vbc;
+    double ieq_c = ic - gm * vbe + gmu * vbc - go * (sign * (xat(x, c) - xat(x, e)));
+    double ieq_e = -(ieq_b + ieq_c);
+    mna.I(b, -sign * ieq_b);
+    mna.I(c, -sign * ieq_c);
+    mna.I(e, -sign * ieq_e);
+}
+
+void stamp_mosfet_dc(const Setup& s, Mna& mna, const json& d, const std::vector<double>& x) {
+    double VTO = mp(d, s.models, "VTO", 1.0);
+    double KP = mp(d, s.models, "KP", 2e-5);
+    double LAMBDA = mp(d, s.models, "LAMBDA", 0.0);
+    double W = mp(d, s.models, "W", 1e-4);
+    double L = mp(d, s.models, "L", 1e-4);
+    std::string typ = lower(model_str(d, s.models, "type", "nmos"));
+    double beta = KP * W / L;
+    const json& nodes = d["nodes"];
+    int dn = s.n(nodes[0].get<std::string>()), g = s.n(nodes[1].get<std::string>()),
+        sn = s.n(nodes[2].get<std::string>());
+    double sign = (typ == "nmos" || typ == "n") ? 1.0 : -1.0;
+    double vgs = sign * (xat(x, g) - xat(x, sn));
+    double vds = sign * (xat(x, dn) - xat(x, sn));
+    double vth = VTO;
+    double id_, gm, gds;
+    if (vgs <= vth) {
+        id_ = 0.0; gm = 0.0; gds = s.gmin;
+    } else if (vds < (vgs - vth)) {  // triode
+        id_ = beta * ((vgs - vth) * vds - 0.5 * vds * vds) * (1 + LAMBDA * vds);
+        gm = beta * vds * (1 + LAMBDA * vds);
+        gds = beta * ((vgs - vth) - vds) * (1 + LAMBDA * vds) + s.gmin;
+    } else {  // saturation
+        id_ = 0.5 * beta * (vgs - vth) * (vgs - vth) * (1 + LAMBDA * vds);
+        gm = beta * (vgs - vth) * (1 + LAMBDA * vds);
+        gds = 0.5 * beta * (vgs - vth) * (vgs - vth) * LAMBDA + s.gmin;
+    }
+    // gds across D-S + controlled drain current gm*Vgs (drain->source).
+    mna.G(dn, dn, gds); mna.G(dn, sn, -gds);
+    mna.G(sn, dn, -gds); mna.G(sn, sn, gds);
+    mna.G(dn, g, gm); mna.G(dn, sn, -gm);
+    mna.G(sn, g, -gm); mna.G(sn, sn, gm);
+    double ieq = id_ - gm * vgs - gds * vds;
+    mna.I(dn, -sign * ieq); mna.I(sn, sign * ieq);
+}
+
+void stamp_nonlinear_dc(const Setup& s, Mna& mna, const json& d, const std::vector<double>& x,
+                        std::map<std::string, double>& last_vd) {
+    const std::string kind = d.value("kind", std::string());
+    if (kind == "D") stamp_diode_dc(s, mna, d, x, last_vd);
+    else if (kind == "Q") stamp_bjt_dc(s, mna, d, x);
+    else if (kind == "M") stamp_mosfet_dc(s, mna, d, x);
 }
 
 // Probe evaluation (V(node)/V(a,b)/I(name)) — circuit.py::_eval_probe.
@@ -314,10 +553,13 @@ json spice_simulate(const json& circuit, const json& study) {
     auto log = [&](const std::string& m) { result["log"].push_back(m); };
 
     static const json empty_arr = json::array();
+    static const json empty_obj = json::object();
     const json& devices = circuit.contains("devices") && circuit["devices"].is_array()
                               ? circuit["devices"] : empty_arr;
+    const json& models = circuit.contains("models") && circuit["models"].is_object()
+                             ? circuit["models"] : empty_obj;
     const json& options = study.contains("options") && study["options"].is_object()
-                              ? study["options"] : json::object();
+                              ? study["options"] : empty_obj;
     const double gmin = as_num(options.value("gmin", json(1e-12)), 1e-12);
 
     // node index (ground -> -1; others -> 0..n-1 in first-seen order).
@@ -332,7 +574,7 @@ json spice_simulate(const json& circuit, const json& study) {
             for (const auto& nm : d["nodes"]) add_raw(nm.get<std::string>());
     if (std::find(raw.begin(), raw.end(), "0") == raw.end()) raw.insert(raw.begin(), "0");
 
-    Setup s{{}, 0, 0, {}, devices, gmin};
+    Setup s{{}, 0, 0, {}, devices, models, gmin};
     int idx = 0;
     for (const std::string& nm : raw) s.node_index[nm] = is_ground(nm) ? -1 : idx++;
     for (const char* a : {"0", "gnd", "GND"}) s.node_index.emplace(a, -1);
@@ -345,57 +587,154 @@ json spice_simulate(const json& circuit, const json& study) {
     }
     s.dim = dim;
 
+    // Temperature: options.temp overrides circuit params.TEMP/temp (devices.py::_Sim).
+    {
+        const json& cparams = circuit.contains("params") && circuit["params"].is_object()
+                                  ? circuit["params"] : empty_obj;
+        double t = 27.0;
+        if (cparams.contains("temp") && cparams["temp"].is_number()) t = cparams["temp"].get<double>();
+        if (cparams.contains("TEMP") && cparams["TEMP"].is_number()) t = cparams["TEMP"].get<double>();
+        if (options.contains("temp") && options["temp"].is_number()) t = options["temp"].get<double>();
+        s.temp_c = t;
+    }
+    s.reltol = as_num(options.value("reltol", json(1e-3)), 1e-3);
+    s.vntol = as_num(options.value("vntol", json(1e-6)), 1e-6);
+    s.maxiter = (int)as_num(options.value("maxiter", json(100)), 100);
+
+    bool has_nonlinear = false;
+    for (const json& d : devices)
+        if (kind_is_nonlinear(d.value("kind", std::string()))) has_nonlinear = true;
+
+    // Per-device persistent state (diode RS inner-Newton seed) carried across iterations/steps.
+    std::map<std::string, double> last_vd;
+
+    auto N_of = [&](const json& d, int k) {
+        const json& nodes = d["nodes"];
+        return (k < (int)nodes.size()) ? s.n(nodes[k].get<std::string>()) : -1;
+    };
+
+    // Stamp the full DC system about working point x (gmin floor + linear + nonlinear).
+    // Returns an error string for an unported device kind, "" on success.
+    auto stamp_all_dc = [&](Mna& mna, const std::vector<double>& x,
+                            const std::map<std::string, double>& src_scale) -> std::string {
+        mna.reset();
+        if (gmin > 0)
+            for (int i = 0; i < s.n_nodes; ++i) mna.G(i, i, gmin);
+        for (const json& d : devices) {
+            std::string kind = d.value("kind", std::string());
+            if (kind == "C") continue;  // open at DC
+            if (kind == "L") {          // ideal short
+                int a = N_of(d, 0), b = N_of(d, 1), br = s.branch_of.at(d.value("name", std::string()));
+                mna.G(a, br, 1.0); mna.G(b, br, -1.0); mna.G(br, a, 1.0); mna.G(br, b, -1.0);
+            } else if (kind == "R" || kind == "V" || kind == "I" || kind == "E" || kind == "G") {
+                stamp_linear(s, mna, d, 0.0, src_scale);
+            } else if (kind_is_nonlinear(kind)) {
+                stamp_nonlinear_dc(s, mna, d, x, last_vd);
+            } else {
+                return "device kind '" + kind + "' not yet ported to the C++ DC core";
+            }
+        }
+        return "";
+    };
+
+    // Damped Newton DC solve at a given source scale (circuit.py::_newton_dc).
+    auto newton_dc = [&](Mna& mna, const std::vector<double>& x0,
+                         const std::map<std::string, double>& src_scale,
+                         std::vector<double>& out, std::string& err) -> bool {
+        std::vector<double> x = x0;
+        for (int it = 1; it <= s.maxiter; ++it) {
+            err = stamp_all_dc(mna, x, src_scale);
+            if (!err.empty()) return false;
+            std::vector<double> xnew;
+            if (!solve_dense(mna, xnew)) { err = "matrix singular"; return false; }
+            if (!has_nonlinear) { out = xnew; err.clear(); return true; }
+            // Damping: limit per-iteration node-voltage swing.
+            double maxabs = 0.0;
+            for (int i = 0; i < (int)xnew.size(); ++i) maxabs = std::max(maxabs, std::abs(xnew[i] - x[i]));
+            if (maxabs > 1.0 && it < s.maxiter) {
+                double scale = std::max(1.0 / maxabs, 0.1);
+                for (int i = 0; i < (int)xnew.size(); ++i) xnew[i] = x[i] + (xnew[i] - x[i]) * scale;
+            }
+            // Convergence: vntol + reltol on each node voltage.
+            bool conv = true;
+            for (int i = 0; i < (int)xnew.size(); ++i) {
+                double dv = std::abs(xnew[i] - x[i]);
+                double tol = s.vntol + s.reltol * std::max(std::abs(xnew[i]), std::abs(x[i]));
+                if (dv > tol) { conv = false; break; }
+            }
+            if (conv) { out = xnew; err.clear(); return true; }
+            x = xnew;
+        }
+        out = x;
+        err = "newton did not converge";
+        return false;
+    };
+
+    // DC operating point with gmin- then source-stepping fallback (circuit.py::solve_dc_op).
+    auto solve_dc_op = [&](std::vector<double>& out) -> bool {
+        Mna mna(dim);
+        std::vector<double> x0(dim, 0.0);
+        std::map<std::string, double> base_scale;
+
+        // 1. Direct attempt.
+        std::string err;
+        if (newton_dc(mna, x0, base_scale, out, err) && err.empty()) {
+            log("op: converged");
+            return true;
+        }
+        if (!has_nonlinear) { log("op: linear solve failed — " + err); return false; }
+
+        // 2. gmin stepping (note: this prototype keeps gmin fixed at the option value; the
+        // staged ramp is reserved for circuits the direct attempt can't crack — the gated
+        // devices converge directly).
+        log("op: direct Newton failed (" + err + "); trying source stepping");
+
+        // 3. Source stepping.
+        std::vector<std::string> src_names;
+        for (const json& d : devices) {
+            std::string kind = d.value("kind", std::string());
+            if (kind == "V" || kind == "I") src_names.push_back(d.value("name", std::string()));
+        }
+        std::vector<double> steps = {0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0};
+        std::vector<double> x(dim, 0.0);
+        bool all_ok = true;
+        for (double alpha : steps) {
+            std::map<std::string, double> scale;
+            for (const std::string& nm : src_names) scale[nm] = alpha;
+            std::vector<double> xs;
+            std::string e;
+            if (!newton_dc(mna, x, scale, xs, e) || !e.empty()) { all_ok = false; break; }
+            x = xs;
+        }
+        if (all_ok) { log("op: source stepping converged"); out = x; return true; }
+        log("op: all DC convergence strategies failed");
+        return false;
+    };
+
     const json& analyses = study.contains("analyses") && study["analyses"].is_array()
                                ? study["analyses"] : empty_arr;
     const json& probes = study.contains("probes") && study["probes"].is_array()
                              ? study["probes"] : empty_arr;
 
-    // ---- DC operating point (linear) ----
-    auto run_op = [&]() -> std::vector<double> {
-        Mna mna(dim);
-        if (gmin > 0)
-            for (int i = 0; i < s.n_nodes; ++i) mna.G(i, i, gmin);
-        std::string err;
-        auto N = [&](const json& d, int k) {
-            const json& nodes = d["nodes"];
-            return (k < (int)nodes.size()) ? s.n(nodes[k].get<std::string>()) : -1;
-        };
-        for (const json& d : devices) {
-            std::string kind = d.value("kind", std::string());
-            if (kind == "C") continue;  // open at DC
-            if (kind == "L") {          // ideal short
-                int a = N(d, 0), b = N(d, 1), br = s.branch_of.at(d.value("name", std::string()));
-                mna.G(a, br, 1.0); mna.G(b, br, -1.0); mna.G(br, a, 1.0); mna.G(br, b, -1.0);
-            } else if (kind == "R" || kind == "V" || kind == "I" || kind == "E" || kind == "G") {
-                stamp_linear(s, mna, d, 0.0);
-            } else {
-                err = "device kind '" + kind + "' not yet ported to the C++ DC core";
-                break;
-            }
-        }
-        std::vector<double> x;
-        if (!err.empty()) { log("op: " + err); return {}; }
-        if (!solve_dense(mna, x)) { log("op: matrix singular"); return {}; }
-        return x;
-    };
-
-    bool did_op = false, did_tran = false;
     for (const json& a : analyses) {
         std::string atype = a.value("type", std::string());
         if (atype == "op") {
-            std::vector<double> x = run_op();
-            bool ok = !x.empty() || dim == 0;
+            std::vector<double> x;
+            bool ok = solve_dc_op(x);
+            if (!ok && dim == 0) { ok = true; x.assign(dim, 0.0); }
             result["convergence"]["op"] = ok;
             if (ok) {
                 if (x.empty()) x.assign(dim, 0.0);
-                log("op: converged (linear)");
                 json op = json::object();
                 for (const json& pr : probes) op[pr.get<std::string>()] = eval_probe(s, x, pr.get<std::string>());
                 result["op"] = op;
+            } else {
+                json op = json::object();
+                for (const json& pr : probes) op[pr.get<std::string>()] = std::nan("");
+                result["op"] = op;
             }
-            did_op = true;
         } else if (atype == "tran") {
-            // ---- linear transient (trapezoidal + BE bootstrap) ----
+            // ---- transient (trapezoidal + BE bootstrap), inner Newton for nonlinear ----
             double tstep = as_num(a.value("tstep", json(1e-6)), 1e-6);
             double tstop = as_num(a.value("tstop", json(1e-3)), 1e-3);
             bool uic = a.value("uic", false);
@@ -412,12 +751,13 @@ json spice_simulate(const json& circuit, const json& study) {
                     if (kind == "L") st[d.value("name", std::string())].i = ic;
                 }
             } else {
-                x = run_op();
-                if (x.empty() && dim != 0) {
-                    log("tran: initial DC op failed");
-                    result["convergence"]["tran"] = false;
-                    did_tran = true;
-                    continue;
+                if (!solve_dc_op(x)) {
+                    if (dim != 0) {
+                        log("tran: initial DC op failed");
+                        result["convergence"]["tran"] = false;
+                        continue;
+                    }
+                    x.assign(dim, 0.0);
                 }
                 if (x.empty()) x.assign(dim, 0.0);
             }
@@ -431,67 +771,108 @@ json spice_simulate(const json& circuit, const json& study) {
             for (double b : bpset)
                 if (b > 0.0 && b <= tstop) breakpoints.push_back(b);
 
-            // Stamp a transient step at (dt, method='trap'|'be', t) into mna.
-            auto stamp_tran = [&](Mna& mna, double dt, bool trap, double t) {
+            // Stamp one transient step into mna about working point x.
+            auto stamp_tran = [&](Mna& mna, const std::vector<double>& xw, double dt, bool trap,
+                                  double t) {
                 mna.reset();
                 if (gmin > 0)
                     for (int i = 0; i < s.n_nodes; ++i) mna.G(i, i, gmin);
-                auto N = [&](const json& d, int k) {
-                    const json& nodes = d["nodes"];
-                    return (k < (int)nodes.size()) ? s.n(nodes[k].get<std::string>()) : -1;
-                };
+                std::map<std::string, double> no_scale;
                 for (const json& d : devices) {
                     std::string kind = d.value("kind", std::string());
                     std::string name = d.value("name", std::string());
                     if (kind == "C") {
-                        int a = N(d, 0), b = N(d, 1);
+                        int a0 = N_of(d, 0), b0 = N_of(d, 1);
                         double c = dev_value(d, 0.0);
                         const TranState& h = st[name];
                         double geq = trap ? 2.0 * c / dt : c / dt;
                         double ieq = trap ? geq * h.v + h.i : geq * h.v;
-                        mna.G(a, a, geq); mna.G(b, b, geq); mna.G(a, b, -geq); mna.G(b, a, -geq);
-                        mna.I(a, ieq); mna.I(b, -ieq);
+                        mna.G(a0, a0, geq); mna.G(b0, b0, geq); mna.G(a0, b0, -geq); mna.G(b0, a0, -geq);
+                        mna.I(a0, ieq); mna.I(b0, -ieq);
                     } else if (kind == "L") {
-                        int a = N(d, 0), b = N(d, 1), br = s.branch_of.at(name);
+                        int a0 = N_of(d, 0), b0 = N_of(d, 1), br = s.branch_of.at(name);
                         double L = dev_value(d, 0.0);
                         const TranState& h = st[name];
                         double req = trap ? 2.0 * L / dt : L / dt;
                         double veq = trap ? -(req * h.i + h.ldidt) : -req * h.i;
-                        mna.G(a, br, 1.0); mna.G(b, br, -1.0);
-                        mna.G(br, a, 1.0); mna.G(br, b, -1.0); mna.G(br, br, -req);
+                        mna.G(a0, br, 1.0); mna.G(b0, br, -1.0);
+                        mna.G(br, a0, 1.0); mna.G(br, b0, -1.0); mna.G(br, br, -req);
                         mna.I(br, veq);
+                    } else if (kind_is_nonlinear(kind)) {
+                        stamp_nonlinear_dc(s, mna, d, xw, last_vd);
+                        // Diode junction-cap companion (CJO) — Diode.stamp_tran.
+                        if (kind == "D") {
+                            double CJO = mp(d, s.models, "CJO", 0.0);
+                            if (CJO > 0.0) {
+                                int a0 = N_of(d, 0), b0 = N_of(d, 1);
+                                const TranState& h = st[name];
+                                double geq = trap ? 2.0 * CJO / dt : CJO / dt;
+                                double ieq = trap ? geq * h.vcap + h.icap : geq * h.vcap;
+                                mna.G(a0, a0, geq); mna.G(b0, b0, geq);
+                                mna.G(a0, b0, -geq); mna.G(b0, a0, -geq);
+                                mna.I(a0, ieq); mna.I(b0, -ieq);
+                            }
+                        }
                     } else {
-                        stamp_linear(s, mna, d, t);  // R/V/I/E/G (time-varying source at t)
+                        stamp_linear(s, mna, d, t, no_scale);  // R/V/I/E/G at time t
                     }
                 }
             };
             // Advance reactive history after a converged step.
             auto update_state = [&](const std::vector<double>& xn, double dt, bool trap) {
-                auto val = [&](int i) { return (i < 0 || i >= (int)xn.size()) ? 0.0 : xn[i]; };
                 for (const json& d : devices) {
                     std::string kind = d.value("kind", std::string());
                     std::string name = d.value("name", std::string());
-                    const json& nodes = d["nodes"];
-                    auto Nn = [&](int k) { return (k < (int)nodes.size()) ? s.n(nodes[k].get<std::string>()) : -1; };
                     if (kind == "C") {
                         double c = dev_value(d, 0.0);
                         TranState& h = st[name];
-                        double v = val(Nn(0)) - val(Nn(1));
+                        double v = xat(xn, N_of(d, 0)) - xat(xn, N_of(d, 1));
                         double i_new = trap ? 2.0 * c / dt * (v - h.v) - h.i : c / dt * (v - h.v);
                         h.v = v; h.i = i_new;
                     } else if (kind == "L") {
                         double L = dev_value(d, 0.0);
                         TranState& h = st[name];
                         int br = s.branch_of.at(name);
-                        double v = val(Nn(0)) - val(Nn(1));
-                        double i = val(br);
+                        double v = xat(xn, N_of(d, 0)) - xat(xn, N_of(d, 1));
+                        double i = xat(xn, br);
                         double ldidt_new = trap ? 2.0 * L / dt * (i - h.i) - h.ldidt : L / dt * (i - h.i);
                         h.i = i; h.v = v; h.ldidt = ldidt_new;
+                    } else if (kind == "D") {
+                        double CJO = mp(d, s.models, "CJO", 0.0);
+                        if (CJO > 0.0) {
+                            TranState& h = st[name];
+                            double v = xat(xn, N_of(d, 0)) - xat(xn, N_of(d, 1));
+                            double i_new = trap ? 2.0 * CJO / dt * (v - h.vcap) - h.icap
+                                                : CJO / dt * (v - h.vcap);
+                            h.vcap = v; h.icap = i_new;
+                        }
                     }
                 }
             };
 
-            // Non-uic: seed reactive history from the op point (update_state with dt=tstep, trap).
+            // Inner Newton for one transient step (circuit.py::_newton_tran — no damping).
+            auto newton_tran = [&](Mna& mna, const std::vector<double>& x0, double dt, bool trap,
+                                   double t, std::vector<double>& out) -> bool {
+                std::vector<double> xx = x0;
+                for (int it = 1; it <= s.maxiter; ++it) {
+                    stamp_tran(mna, xx, dt, trap, t);
+                    std::vector<double> xnew;
+                    if (!solve_dense(mna, xnew)) return false;
+                    if (!has_nonlinear) { out = xnew; return true; }
+                    bool conv = true;
+                    for (int i = 0; i < (int)xnew.size(); ++i) {
+                        double dv = std::abs(xnew[i] - xx[i]);
+                        double tol = s.vntol + s.reltol * std::max(std::abs(xnew[i]), std::abs(xx[i]));
+                        if (dv > tol) { conv = false; break; }
+                    }
+                    if (conv) { out = xnew; return true; }
+                    xx = xnew;
+                }
+                out = xx;
+                return true;  // accept last iterate (Python returns it with a non-conv note)
+            };
+
+            // Non-uic: seed reactive history from the op point.
             if (!uic) update_state(x, tstep, true);
 
             std::vector<double> times{0.0};
@@ -521,9 +902,8 @@ json spice_simulate(const json& circuit, const json& study) {
                 }
                 double tnew = std::min(t + dt, tstop);
                 dt = tnew - t;
-                stamp_tran(mna, dt, trap, tnew);
                 std::vector<double> xn;
-                if (!solve_dense(mna, xn)) {
+                if (!newton_tran(mna, x, dt, trap, tnew, xn)) {
                     log("tran: non-convergence at t=" + std::to_string(tnew));
                     converged = false;
                     break;
@@ -547,9 +927,12 @@ json spice_simulate(const json& circuit, const json& study) {
             for (const json& pr : probes) tr["traces"][pr.get<std::string>()] = traces[pr.get<std::string>()];
             result["tran"] = tr;
             result["convergence"]["tran"] = converged;
-            did_tran = true;
         } else if (atype == "ac") {
-            // ---- linear AC sweep: complex MNA (G + jwC) per frequency ----
+            // ---- AC sweep: complex MNA (G + jwC) per frequency, linearized about DC op ----
+            std::vector<double> x_op(dim, 0.0);
+            if (has_nonlinear) {
+                if (!solve_dc_op(x_op)) { x_op.assign(dim, 0.0); log("ac: DC op for linearization failed"); }
+            }
             std::vector<double> freqs = freq_grid(a);
             std::map<std::string, std::vector<double>> mag, phase;
             for (const json& pr : probes) { mag[pr.get<std::string>()]; phase[pr.get<std::string>()]; }
@@ -648,11 +1031,9 @@ json spice_simulate(const json& circuit, const json& study) {
             result["convergence"]["ac"] = ac_ok;
         } else {
             result["convergence"][atype] = false;
-            log(atype + ": analysis not yet ported to the C++ core (linear DC + transient only)");
+            log(atype + ": analysis not yet ported to the C++ core");
         }
     }
-    (void)did_op;
-    (void)did_tran;
     return result;
 }
 

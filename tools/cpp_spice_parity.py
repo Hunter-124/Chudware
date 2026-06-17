@@ -236,6 +236,113 @@ def main() -> int:
             i3 = int(np.argmin(np.abs(mags - 0.70710678)))
             print(f"  {('ac ' + label):<24} MATCH  ({len(fc)} pts, ~-3dB @ {fc[i3]:.0f} Hz)")
 
+    # ---- Nonlinear DC (Newton): diode clamp, common-emitter BJT bias, NMOS bias. Both
+    # engines run the same Newton loop (same junction limiting + damping) over the same dense
+    # solves, so the converged operating point matches tightly (1e-6 rel).
+    nl_op_cases = [
+        ("diode clamp", {
+            "nodes": ["0", "IN", "OUT"],
+            "devices": [
+                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 5.0, "params": {}},
+                {"kind": "R", "name": "R1", "nodes": ["IN", "OUT"], "value": 1000.0, "params": {}},
+                {"kind": "D", "name": "D1", "nodes": ["OUT", "0"], "value": None,
+                 "model": "D1N4148", "params": {}}],
+            "models": {"D1N4148": {"IS": 2.52e-9, "N": 1.752, "RS": 0.568}},
+            "params": {"TEMP": 27}},
+         {"analyses": [{"type": "op"}], "probes": ["V(OUT)", "I(V1)"]}),
+        ("common-emitter bias", {
+            "nodes": ["0", "VCC", "B", "C"],
+            "devices": [
+                {"kind": "V", "name": "VCC", "nodes": ["VCC", "0"], "value": 12.0, "params": {}},
+                {"kind": "R", "name": "RB", "nodes": ["VCC", "B"], "value": 470000.0, "params": {}},
+                {"kind": "R", "name": "RC", "nodes": ["VCC", "C"], "value": 2200.0, "params": {}},
+                {"kind": "Q", "name": "Q1", "nodes": ["C", "B", "0"], "value": None,
+                 "model": "QN", "params": {}}],
+            "models": {"QN": {"type": "npn", "IS": 1e-15, "BF": 200.0, "BR": 1.0, "VAF": 100.0}},
+            "params": {"TEMP": 27}},
+         {"analyses": [{"type": "op"}], "probes": ["V(C)", "V(B)", "I(VCC)"]}),
+        ("nmos diode-connected", {
+            "nodes": ["0", "DD", "D"],
+            "devices": [
+                {"kind": "V", "name": "VDD", "nodes": ["DD", "0"], "value": 5.0, "params": {}},
+                {"kind": "R", "name": "RD", "nodes": ["DD", "D"], "value": 1000.0, "params": {}},
+                # gate tied to drain (diode-connected) -> always saturation when on
+                {"kind": "M", "name": "M1", "nodes": ["D", "D", "0"], "value": None,
+                 "model": "NM", "params": {}}],
+            "models": {"NM": {"type": "nmos", "VTO": 1.0, "KP": 5e-4, "LAMBDA": 0.02,
+                              "W": 1e-4, "L": 1e-5}},
+            "params": {"TEMP": 27}},
+         {"analyses": [{"type": "op"}], "probes": ["V(D)", "I(VDD)"]}),
+    ]
+    for label, circuit, study in nl_op_cases:
+        checks += 1
+        ro = simulate(circuit, study)
+        rc, rcpp = core.call("sim_spice", {"circuit": circuit, "study": study})
+        diffs = []
+        if not (ro.get("convergence", {}).get("op") and rcpp.get("convergence", {}).get("op")):
+            diffs.append(f"convergence op py={ro.get('convergence')} cpp={rcpp.get('convergence')}")
+        po, co = ro.get("op", {}), rcpp.get("op", {})
+        for pr in study["probes"]:
+            pv, cv = po.get(pr), co.get(pr)
+            if pv is None or cv is None:
+                diffs.append(f"{pr} missing py={pv} cpp={cv}")
+                continue
+            rel = abs(float(pv) - float(cv)) / max(abs(float(pv)), 1e-9)
+            if rel > 1e-6:
+                diffs.append(f"{pr} {pv:.9g}!={cv:.9g} (rel {rel:.1e})")
+        if diffs:
+            print(f"  {('nl ' + label):<24} DIFF: {'; '.join(diffs)[:110]}")
+            mism += 1
+        else:
+            shown = ", ".join(f"{p}={float(co[p]):.4g}" for p in study["probes"][:2])
+            print(f"  {('nl ' + label):<24} MATCH  ({shown})")
+
+    # ---- Nonlinear transient (Newton per step): diode half-wave rectifier. A SIN source
+    # through a series diode into an RC load; the diode rectifies the negative half-cycles.
+    # Same Newton path + junction limiting on both engines -> the trace matches to FP precision.
+    import math as _math
+    freq = 1000.0
+    period = 1.0 / freq
+    rect = {
+        "nodes": ["0", "IN", "OUT"],
+        "devices": [
+            {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0,
+             "params": {"waveform": _wf("SIN", vo=0.0, va=5.0, f=freq, td=0.0, theta=0.0)}},
+            {"kind": "D", "name": "D1", "nodes": ["IN", "OUT"], "value": None,
+             "model": "DR", "params": {}},
+            {"kind": "R", "name": "RL", "nodes": ["OUT", "0"], "value": 1000.0, "params": {}},
+            {"kind": "C", "name": "CL", "nodes": ["OUT", "0"], "value": 1e-7, "params": {"ic": 0.0}}],
+        "models": {"DR": {"IS": 2.52e-9, "N": 1.752, "RS": 0.568}},
+        "params": {"TEMP": 27}}
+    rect_study = {"analyses": [{"type": "tran", "tstep": period / 200, "tstop": 3 * period,
+                                "uic": True}], "probes": ["V(OUT)", "V(IN)"]}
+    checks += 1
+    ro = simulate(rect, rect_study)
+    rc, rcpp = core.call("sim_spice", {"circuit": rect, "study": rect_study})
+    diffs = []
+    if not (ro["convergence"].get("tran") and rcpp.get("convergence", {}).get("tran")):
+        diffs.append("tran did not converge")
+    tp = np.asarray(ro["tran"]["x_t"], dtype=np.float64)
+    tc = np.asarray(rcpp.get("tran", {}).get("x_t", []), dtype=np.float64)
+    if tp.shape != tc.shape:
+        diffs.append(f"time grid len {tp.shape}!={tc.shape}")
+    elif tp.size and float(np.max(np.abs(tp - tc))) / max(float(tp[-1]), 1e-12) > 1e-9:
+        diffs.append("time grid values differ")
+    else:
+        for pr in rect_study["probes"]:
+            vp = np.asarray(ro["tran"]["traces"][pr], dtype=np.float64)
+            vc = np.asarray(rcpp["tran"]["traces"][pr], dtype=np.float64)
+            scale = max(float(np.max(np.abs(vp))), 1e-9)
+            dmax = float(np.max(np.abs(vp - vc)))
+            if dmax / scale > 1e-6:
+                diffs.append(f"{pr} trace max|d|={dmax:.2e} (rel {dmax/scale:.1e})")
+    if diffs:
+        print(f"  {'nl tran rectifier':<24} DIFF: {'; '.join(diffs)[:100]}")
+        mism += 1
+    else:
+        vmax = float(np.max(np.asarray(rcpp["tran"]["traces"]["V(OUT)"])))
+        print(f"  {'nl tran rectifier':<24} MATCH  ({len(tc)} pts, V(OUT)max={vmax:.4g})")
+
     print(f"\n[spice-parity] {checks - mism}/{checks} circuit cases at full parity")
     return mism
 

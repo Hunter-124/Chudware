@@ -151,12 +151,19 @@ def compare(label, py, cpp, py_resp, cpp_resp, vol_check=True, owner_strict=True
             if owner_strict:
                 diffs.append("owner_map mismatch")
             else:
-                # Known limitation: exact face/edge attribution through a MODIFY op
-                # (fillet/chamfer/boolean/...) needs OCCT Modified/Generated history
-                # plumbed through each kernel op; the C++ core currently attributes a
-                # modified body's topology to the modifying feature. Additive/single-
-                # feature owner_map is exact. Flagged, not failed.
+                # The exact (body, topo_index) tuples differ ONLY by the OCCT-vs-build123d
+                # MapShapes enumeration ORDER (the same shape-construction artifact as the
+                # edge resolve_pick) — a legitimate, flagged divergence. The ATTRIBUTION
+                # itself is gated strictly below by per-feature counts.
                 pass
+        # P14: per-feature owner COUNTS (order-independent) must match EXACTLY — this
+        # catches a wrong attribution (e.g. a dress feature owning the whole body because
+        # source_of was unset) without depending on the topo-index enumeration order.
+        def counts(om):
+            return {k: (len(v.get("faces", [])), len(v.get("edges", [])), len(v.get("bodies", [])))
+                    for k, v in om.items()}
+        if counts(py_resp["owner_map"]) != counts(cpp_resp["owner_map"]):
+            diffs.append(f"owner counts {counts(py_resp['owner_map'])}!={counts(cpp_resp['owner_map'])}")
     # Flag (do not fail) where the Python SESSION status diverges from ground truth.
     note = ""
     if session_status(py_resp) != truth:
@@ -167,7 +174,7 @@ def compare(label, py, cpp, py_resp, cpp_resp, vol_check=True, owner_strict=True
                         "faces": sorted(map(tuple, v.get("faces", []))),
                         "edges": sorted(map(tuple, v.get("edges", [])))} for k, v in om.items()}
         if _n(py_resp["owner_map"]) != _n(cpp_resp["owner_map"]) and not owner_strict:
-            note += "  [owner_map: modify-op attribution coarser than Python (OCCT history TODO)]"
+            note += "  [owner_map: per-feature counts exact; (body,index) tuples differ by OCCT-vs-build123d enum order]"
     verdict = "MATCH" if not diffs else "DIFF: " + "; ".join(diffs)
     print(f"  {label:<28} {verdict}{note}")
     return 0 if not diffs else 1

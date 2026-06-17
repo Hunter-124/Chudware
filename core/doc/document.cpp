@@ -834,9 +834,13 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     throw std::runtime_error(type + " produced an empty shape");
 
                 // Dress-up REPLACES the source body (SolidWorks-style): the rounded /
-                // beveled solid is the current state of that body in the tree.
+                // beveled solid is the current state of that body in the tree. Recording
+                // `source_of` here (it was previously omitted) is what lets the owner-map
+                // diff keep the unchanged faces with the ORIGINAL feature instead of
+                // attributing the whole body to this dress feature (P14).
                 consumed.insert(body_id);
 
+                source_of[id] = body_id;  // owner-map: derives from the input body
                 results[id] = SolidResult{out};
                 solid_order.push_back(id);
                 st.ok = true;
@@ -1340,6 +1344,12 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 TopExp::MapShapes(ss, TopAbs_FACE, sfm);
                 TopExp::MapShapes(ss, TopAbs_EDGE, sem);
             }
+            // Owner diff by TShape IDENTITY: a result face/edge that survived UNCHANGED
+            // (same TShape) keeps its source owner; a MODIFIED or NEW one belongs to this
+            // feature (matches the Python build123d attribution — a fillet owns every face
+            // it regenerated, not just the new round). The load-bearing requirement is that
+            // a MODIFYING feature has a `source_of` so this diff runs at all (the fillet/
+            // chamfer branch sets it; without it the whole body was attributed to the op).
             std::map<int, std::string> fo, eo;
             for (int i = 1; i <= fm.Extent(); ++i) {
                 if (has_src && sfm.Contains(fm.FindKey(i))) {

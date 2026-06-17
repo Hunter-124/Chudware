@@ -19,7 +19,11 @@
 #include <string>
 #include <vector>
 
+#include <cmath>
+#include <optional>
+
 #include "doc/document.h"
+#include "doc/sketch_geom.h"
 #include "doc/stepplus.h"
 #include "util/expr.h"
 
@@ -390,6 +394,558 @@ void op_sketch_toggle_construction(json& doc, const json& op, const json& id_map
     throw OpError("invalid_op", "sketch_toggle_construction: no entity '" + eid + "'");
 }
 
+// ----------------------------------------------------------- advanced sketch ops
+// 2D tools (trim/extend/offset/fillet/chamfer/mirror/pattern/move) — port of the
+// engine/doc/ops.py handlers over the engine/doc/sketch_geom curve math. Each mutates
+// the sketch's entity + constraint lists and flows through the normal rebuild.
+namespace sg = aicad::doc::sketchgeom;
+
+constexpr double kDeg = 3.14159265358979323846 / 180.0;
+constexpr double kRad = 180.0 / 3.14159265358979323846;
+
+// A geom-only view of a stored entity (drops id/construction; sketch_geom shape).
+json geom_view(const json& ent) {
+    json o = json::object();
+    for (auto it = ent.begin(); it != ent.end(); ++it)
+        if (it.key() != "id" && it.key() != "construction") o[it.key()] = it.value();
+    return o;
+}
+json stamp_entity(const json& geom, const std::string& eid, bool construction) {
+    json o = geom;
+    o["id"] = eid;
+    o["construction"] = construction;
+    return o;
+}
+std::string handle_base(const std::string& h) {
+    auto p = h.find('.');
+    return p == std::string::npos ? h : h.substr(0, p);
+}
+void drop_constraints_touching(json& sk, const std::set<std::string>& eids) {
+    json& cons = sk["params"]["constraints"];
+    json kept = json::array();
+    for (const json& c : cons) {
+        bool touch = false;
+        if (c.contains("refs") && c["refs"].is_array())
+            for (const json& h : c["refs"])
+                if (h.is_string() && eids.count(handle_base(h.get<std::string>()))) { touch = true; break; }
+        if (!touch) kept.push_back(c);
+    }
+    cons = kept;
+}
+json* find_sketch_entity(json& sk, const std::string& eid) {
+    for (json& e : sk["params"]["entities"])
+        if (e.value("id", std::string()) == eid) return &e;
+    return nullptr;
+}
+[[noreturn]] void unsupported_entity(std::size_t idx, const std::string& op_name,
+                                     const std::string& etype) {
+    throw OpError("unsupported_entity",
+                  "op[" + std::to_string(idx) + "]: " + op_name +
+                      " does not support entity type '" + etype + "'",
+                  {{"index", idx}, {"reason", "unsupported entity '" + etype + "'"}});
+}
+
+void op_sketch_trim(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+    json& sk = require_sketch_feature(doc, op, id_map);
+    const std::string eid = op.value("entity", std::string());
+    json& ents = sk["params"]["entities"];
+    json* target = find_sketch_entity(sk, eid);
+    if (!target) throw OpError("invalid_op", "sketch_trim: entity '" + eid + "' not found");
+    if (!op.contains("point") || !op["point"].is_array() || op["point"].size() != 2)
+        throw OpError("invalid_op", "sketch_trim requires 'point': [u, v]");
+    double px = op["point"][0].get<double>(), py = op["point"][1].get<double>();
+    std::size_t pos = 0;
+    for (std::size_t i = 0; i < ents.size(); ++i)
+        if (ents[i].value("id", std::string()) == eid) { pos = i; break; }
+    bool construction = target->value("construction", false);
+    std::vector<json> others;
+    for (const json& e : ents)
+        if (e.value("id", std::string()) != eid && !e.value("construction", false))
+            others.push_back(geom_view(e));
+    std::vector<json> spans;
+    try {
+        spans = sg::split_entity(geom_view(*target), others, px, py);
+    } catch (const sg::UnsupportedEntity& exc) {
+        throw OpError("unsupported_entity",
+                      "op[" + std::to_string(idx) + "]: sketch_trim involves an unsupported entity (" +
+                          exc.etype + ")",
+                      {{"index", idx}, {"reason", "unsupported entity '" + exc.etype + "'"}});
+    }
+    if (spans.empty()) {
+        json kept = json::array();
+        for (const json& e : ents)
+            if (e.value("id", std::string()) != eid) kept.push_back(e);
+        ents = kept;
+        drop_constraints_touching(sk, {eid});
+        id_map["$" + std::to_string(idx)] = "";
+        return;
+    }
+    std::vector<json> new_ents;
+    new_ents.push_back(stamp_entity(spans[0], eid, construction));
+    std::vector<std::string> extra_ids;
+    for (std::size_t i = 1; i < spans.size(); ++i) {
+        std::string neid = gen.next("e");
+        extra_ids.push_back(neid);
+        new_ents.push_back(stamp_entity(spans[i], neid, construction));
+    }
+    json spliced = json::array();
+    for (std::size_t i = 0; i < ents.size(); ++i) {
+        if (i == pos)
+            for (const json& ne : new_ents) spliced.push_back(ne);
+        else
+            spliced.push_back(ents[i]);
+    }
+    ents = spliced;
+    drop_constraints_touching(sk, {eid});
+    id_map["$" + std::to_string(idx)] = eid;
+    for (std::size_t k = 0; k < extra_ids.size(); ++k)
+        id_map["$" + std::to_string(idx) + "#" + std::to_string(k + 1)] = extra_ids[k];
+}
+
+void op_sketch_extend(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+    (void)gen;
+    json& sk = require_sketch_feature(doc, op, id_map);
+    const std::string eid = op.value("entity", std::string());
+    json* target = find_sketch_entity(sk, eid);
+    if (!target) throw OpError("invalid_op", "sketch_extend: entity '" + eid + "' not found");
+    const std::string end = op.value("end", std::string());
+    if (end != "start" && end != "end")
+        throw OpError("invalid_op", "sketch_extend requires 'end': 'start' | 'end'");
+    std::vector<json> others;
+    for (const json& e : sk["params"]["entities"])
+        if (e.value("id", std::string()) != eid && !e.value("construction", false))
+            others.push_back(geom_view(e));
+    std::optional<json> new_geom;
+    try {
+        new_geom = sg::extend_entity(geom_view(*target), end, others);
+    } catch (const sg::UnsupportedEntity& exc) {
+        throw OpError("unsupported_entity",
+                      "op[" + std::to_string(idx) + "]: sketch_extend involves an unsupported entity (" +
+                          exc.etype + ")",
+                      {{"index", idx}, {"reason", "unsupported entity '" + exc.etype + "'"}});
+    }
+    if (!new_geom)
+        throw OpError("extend_no_target",
+                      "op[" + std::to_string(idx) + "]: sketch_extend found nothing to extend '" + eid + "' to",
+                      {{"index", idx}, {"reason", "no target ahead of the extended end"}});
+    std::string id = (*target)["id"].get<std::string>();
+    bool construction = target->value("construction", false);
+    json updated = *new_geom;
+    updated["id"] = id;
+    updated["construction"] = construction;
+    *target = updated;
+    id_map["$" + std::to_string(idx)] = eid;
+}
+
+void op_sketch_offset(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+    json& sk = require_sketch_feature(doc, op, id_map);
+    if (!op.contains("entities") || !op["entities"].is_array() || op["entities"].empty())
+        throw OpError("invalid_op", "sketch_offset requires a non-empty 'entities' id list");
+    if (!op.contains("distance") || !op["distance"].is_number())
+        throw OpError("invalid_op", "sketch_offset requires a numeric 'distance'");
+    if (!op.contains("side") || !op["side"].is_array() || op["side"].size() != 2)
+        throw OpError("invalid_op", "sketch_offset requires 'side': [u, v]");
+    double distance = op["distance"].get<double>();
+    double sx = op["side"][0].get<double>(), sy = op["side"][1].get<double>();
+    std::vector<json> chain;
+    for (const json& e_id : op["entities"]) {
+        json* ent = find_sketch_entity(sk, e_id.get<std::string>());
+        if (!ent)
+            throw OpError("invalid_op", "sketch_offset: entity '" + e_id.get<std::string>() + "' not found");
+        chain.push_back(geom_view(*ent));
+    }
+    std::vector<json> out;
+    bool closed = false;
+    try {
+        out = sg::offset_chain(chain, distance, sx, sy);
+        closed = sg::chain_is_closed(chain);
+    } catch (const sg::UnsupportedEntity& exc) {
+        throw OpError("unsupported_entity",
+                      "op[" + std::to_string(idx) + "]: sketch_offset involves an unsupported entity (" +
+                          exc.etype + ")",
+                      {{"index", idx}, {"reason", "unsupported entity '" + exc.etype + "'"}});
+    }
+    json& ents = sk["params"]["entities"];
+    json& cons = sk["params"]["constraints"];
+    std::vector<std::string> new_ids;
+    std::vector<std::string> new_types;
+    for (const json& span : out) {
+        std::string neid = gen.next("e");
+        new_ids.push_back(neid);
+        new_types.push_back(span.value("type", std::string()));
+        ents.push_back(stamp_entity(span, neid, false));
+    }
+    auto end_handle = [&](std::size_t i, const std::string& which) -> std::string {
+        if (new_types[i] == "line") return new_ids[i] + (which == "start" ? ".p1" : ".p2");
+        return new_ids[i] + "." + which;
+    };
+    int n = (int)new_ids.size();
+    int joints = (closed && n > 1) ? n : n - 1;
+    for (int i = 0; i < joints; ++i) {
+        int a = i, b = (i + 1) % n;
+        cons.push_back({{"id", gen.next("c")}, {"type", "coincident"},
+                        {"refs", {end_handle(a, "end"), end_handle(b, "start")}}});
+    }
+    id_map["$" + std::to_string(idx)] = new_ids.empty() ? std::string() : new_ids[0];
+    for (std::size_t k = 1; k < new_ids.size(); ++k)
+        id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = new_ids[k];
+}
+
+// Map a geom end name ('start'|'end') to a line's point handle ('p1'|'p2').
+std::string line_end_handle(const std::string& eid, const std::string& which) {
+    return eid + (which == "start" ? ".p1" : ".p2");
+}
+void set_line_end(json& ent, const std::string& which, const json& ptj) {
+    ent[which == "start" ? "p1" : "p2"] = {ptj[0].get<double>(), ptj[1].get<double>()};
+}
+// Drop any constraint that JOINED the two corner endpoints to each other.
+void drop_corner_join(json& sk, const std::string& h1, const std::string& h2) {
+    json& cons = sk["params"]["constraints"];
+    json kept = json::array();
+    for (const json& c : cons) {
+        bool has1 = false, has2 = false;
+        if (c.contains("refs") && c["refs"].is_array())
+            for (const json& r : c["refs"])
+                if (r.is_string()) {
+                    if (r.get<std::string>() == h1) has1 = true;
+                    if (r.get<std::string>() == h2) has2 = true;
+                }
+        if (has1 && has2) continue;
+        kept.push_back(c);
+    }
+    cons = kept;
+}
+
+void op_sketch_fillet(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+    json& sk = require_sketch_feature(doc, op, id_map);
+    const std::string e1id = op.value("e1", std::string()), e2id = op.value("e2", std::string());
+    json* e1 = find_sketch_entity(sk, e1id);
+    json* e2 = find_sketch_entity(sk, e2id);
+    if (!e1 || !e2)
+        throw OpError("invalid_op", "sketch_fillet requires existing 'e1' and 'e2' entity ids");
+    if (e1id == e2id)
+        throw OpError("invalid_op", "sketch_fillet: e1 and e2 must be different entities");
+    if (!op.contains("radius") || !op["radius"].is_number() || op["radius"].get<double>() <= 0)
+        throw OpError("invalid_op", "sketch_fillet requires a positive numeric 'radius'");
+    double radius = op["radius"].get<double>();
+    for (json* ent : {e1, e2})
+        if (ent->value("type", std::string()) != "line")
+            unsupported_entity(idx, "sketch_fillet supports line-line corners only — got", ent->value("type", std::string()));
+    json res;
+    try {
+        res = sg::fillet_corner(geom_view(*e1), geom_view(*e2), radius);
+    } catch (const sg::GeomError& exc) {
+        throw OpError("fillet_failed", "op[" + std::to_string(idx) + "]: sketch_fillet — " + exc.reason,
+                      {{"index", idx}, {"reason", exc.reason}});
+    }
+    drop_corner_join(sk, line_end_handle(e1id, res["end_a"].get<std::string>()),
+                     line_end_handle(e2id, res["end_b"].get<std::string>()));
+    set_line_end(*e1, res["end_a"].get<std::string>(), res["ta"]);
+    set_line_end(*e2, res["end_b"].get<std::string>(), res["tb"]);
+    const std::string aid = gen.next("e");
+    json arc = res["arc"];
+    arc["id"] = aid;
+    arc["construction"] = false;
+    sk["params"]["entities"].push_back(arc);
+    json& cons = sk["params"]["constraints"];
+    cons.push_back({{"id", gen.next("c")}, {"type", "coincident"},
+                    {"refs", {aid + ".start", line_end_handle(e1id, res["end_a"].get<std::string>())}}});
+    cons.push_back({{"id", gen.next("c")}, {"type", "coincident"},
+                    {"refs", {aid + ".end", line_end_handle(e2id, res["end_b"].get<std::string>())}}});
+    cons.push_back({{"id", gen.next("c")}, {"type", "tangent"}, {"refs", {aid, e1id}}});
+    cons.push_back({{"id", gen.next("c")}, {"type", "tangent"}, {"refs", {aid, e2id}}});
+    id_map["$" + std::to_string(idx)] = aid;
+}
+
+void op_sketch_chamfer(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+    json& sk = require_sketch_feature(doc, op, id_map);
+    const std::string e1id = op.value("e1", std::string()), e2id = op.value("e2", std::string());
+    json* e1 = find_sketch_entity(sk, e1id);
+    json* e2 = find_sketch_entity(sk, e2id);
+    if (!e1 || !e2)
+        throw OpError("invalid_op", "sketch_chamfer requires existing 'e1' and 'e2' entity ids");
+    if (e1id == e2id)
+        throw OpError("invalid_op", "sketch_chamfer: e1 and e2 must be different entities");
+    if (!op.contains("distance") || !op["distance"].is_number() || op["distance"].get<double>() <= 0)
+        throw OpError("invalid_op", "sketch_chamfer requires a positive numeric 'distance'");
+    double distance = op["distance"].get<double>();
+    double distance2 = distance;
+    if (op.contains("distance2") && !op["distance2"].is_null()) {
+        if (!op["distance2"].is_number() || op["distance2"].get<double>() <= 0)
+            throw OpError("invalid_op", "sketch_chamfer 'distance2' must be a positive number when given");
+        distance2 = op["distance2"].get<double>();
+    }
+    for (json* ent : {e1, e2})
+        if (ent->value("type", std::string()) != "line")
+            unsupported_entity(idx, "sketch_chamfer supports line-line corners only — got", ent->value("type", std::string()));
+    json res;
+    try {
+        res = sg::chamfer_corner(geom_view(*e1), geom_view(*e2), distance, distance2);
+    } catch (const sg::GeomError& exc) {
+        throw OpError("chamfer_failed", "op[" + std::to_string(idx) + "]: sketch_chamfer — " + exc.reason,
+                      {{"index", idx}, {"reason", exc.reason}});
+    }
+    drop_corner_join(sk, line_end_handle(e1id, res["end_a"].get<std::string>()),
+                     line_end_handle(e2id, res["end_b"].get<std::string>()));
+    set_line_end(*e1, res["end_a"].get<std::string>(), res["ta"]);
+    set_line_end(*e2, res["end_b"].get<std::string>(), res["tb"]);
+    const std::string lid = gen.next("e");
+    json line = {{"id", lid}, {"type", "line"}, {"construction", false},
+                 {"p1", {res["ta"][0].get<double>(), res["ta"][1].get<double>()}},
+                 {"p2", {res["tb"][0].get<double>(), res["tb"][1].get<double>()}}};
+    sk["params"]["entities"].push_back(line);
+    json& cons = sk["params"]["constraints"];
+    cons.push_back({{"id", gen.next("c")}, {"type", "coincident"},
+                    {"refs", {lid + ".p1", line_end_handle(e1id, res["end_a"].get<std::string>())}}});
+    cons.push_back({{"id", gen.next("c")}, {"type", "coincident"},
+                    {"refs", {lid + ".p2", line_end_handle(e2id, res["end_b"].get<std::string>())}}});
+    id_map["$" + std::to_string(idx)] = lid;
+}
+
+// ---- inline 2D transforms for mirror / pattern / move ----
+const std::set<std::string> kMpSupported = {"line", "circle", "arc"};
+
+std::array<double, 2> reflect_point(const json& ptj, const std::array<double, 2>& A,
+                                    const std::array<double, 2>& B) {
+    double ax = A[0], ay = A[1], bx = B[0], by = B[1];
+    double dx = bx - ax, dy = by - ay, L2 = dx * dx + dy * dy;
+    if (L2 < 1e-18)
+        throw OpError("mirror_failed", "mirror line is degenerate (zero length)",
+                      {{"reason", "degenerate mirror line"}});
+    double pxv = ptj[0].get<double>(), pyv = ptj[1].get<double>();
+    double px0 = pxv - ax, py0 = pyv - ay;
+    double t = (px0 * dx + py0 * dy) / L2;
+    double fx = ax + t * dx, fy = ay + t * dy;
+    return {2.0 * fx - pxv, 2.0 * fy - pyv};
+}
+double reflect_angle_deg(double ang, const std::array<double, 2>& A, const std::array<double, 2>& B) {
+    double axis = std::atan2(B[1] - A[1], B[0] - A[0]);
+    return (2.0 * axis - ang * kDeg) * kRad;
+}
+json mirror_entity(const json& ent, const std::array<double, 2>& A, const std::array<double, 2>& B) {
+    std::string t = ent.value("type", std::string());
+    if (t == "line") {
+        auto p1 = reflect_point(ent["p1"], A, B);
+        auto p2 = reflect_point(ent["p2"], A, B);
+        return {{"type", "line"}, {"p1", {p1[0], p1[1]}}, {"p2", {p2[0], p2[1]}}};
+    }
+    if (t == "circle") {
+        auto c = reflect_point(ent["center"], A, B);
+        return {{"type", "circle"}, {"center", {c[0], c[1]}}, {"radius", ent["radius"].get<double>()}};
+    }
+    if (t == "arc") {
+        double a0 = reflect_angle_deg(ent["start"].get<double>(), A, B);
+        double a1 = reflect_angle_deg(ent["end"].get<double>(), A, B);
+        auto c = reflect_point(ent["center"], A, B);
+        return {{"type", "arc"}, {"center", {c[0], c[1]}}, {"radius", ent["radius"].get<double>()},
+                {"start", a1}, {"end", a0}, {"ccw", !ent.value("ccw", true)}};
+    }
+    throw OpError("unsupported_entity", "mirror/pattern does not support entity type '" + t + "'",
+                  {{"reason", "unsupported entity '" + t + "'"}});
+}
+json translate_entity(const json& geom, double dx, double dy) {
+    json out = geom;
+    std::string t = out.value("type", std::string());
+    if (t == "line") {
+        out["p1"] = {out["p1"][0].get<double>() + dx, out["p1"][1].get<double>() + dy};
+        out["p2"] = {out["p2"][0].get<double>() + dx, out["p2"][1].get<double>() + dy};
+    } else {
+        out["center"] = {out["center"][0].get<double>() + dx, out["center"][1].get<double>() + dy};
+    }
+    return out;
+}
+json rotate_entity(const json& geom, double cx, double cy, double ang_deg) {
+    double a = ang_deg * kDeg, ca = std::cos(a), sa = std::sin(a);
+    auto rot = [&](const json& p) -> json {
+        double x = p[0].get<double>() - cx, y = p[1].get<double>() - cy;
+        return json::array({cx + x * ca - y * sa, cy + x * sa + y * ca});
+    };
+    json out = geom;
+    std::string t = out.value("type", std::string());
+    if (t == "line") {
+        out["p1"] = rot(out["p1"]);
+        out["p2"] = rot(out["p2"]);
+    } else {
+        out["center"] = rot(out["center"]);
+        if (t == "arc") {
+            out["start"] = out["start"].get<double>() + ang_deg;
+            out["end"] = out["end"].get<double>() + ang_deg;
+        }
+    }
+    return out;
+}
+// Point-handle pairs whose symmetric relation keeps a<->b mirrored, + radius-equal flag.
+std::pair<std::vector<std::pair<std::string, std::string>>, bool>
+symmetric_pairs(const std::string& etype, const std::string& a, const std::string& b) {
+    if (etype == "line")
+        return {{{a + ".p1", b + ".p1"}, {a + ".p2", b + ".p2"}}, false};
+    if (etype == "circle")
+        return {{{a + ".center", b + ".center"}}, true};
+    if (etype == "arc")
+        return {{{a + ".center", b + ".center"}, {a + ".start", b + ".start"}, {a + ".end", b + ".end"}}, true};
+    return {{}, false};
+}
+
+void op_sketch_mirror_entities(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+    json& sk = require_sketch_feature(doc, op, id_map);
+    if (!op.contains("entities") || !op["entities"].is_array() || op["entities"].empty())
+        throw OpError("invalid_op", "sketch_mirror_entities requires a non-empty 'entities' id list");
+    const std::string line_id = op.value("line", std::string());
+    if (line_id.empty())
+        throw OpError("invalid_op", "sketch_mirror_entities requires a 'line' (mirror line entity id)");
+    json* axis = find_sketch_entity(sk, line_id);
+    if (!axis)
+        throw OpError("invalid_op", "sketch_mirror_entities: mirror line '" + line_id + "' not found");
+    if (axis->value("type", std::string()) != "line")
+        throw OpError("unsupported_entity", "sketch_mirror_entities: the mirror line must be a line entity",
+                      {{"reason", "mirror line is a '" + axis->value("type", std::string()) + "'"}});
+    std::array<double, 2> A = {(*axis)["p1"][0].get<double>(), (*axis)["p1"][1].get<double>()};
+    std::array<double, 2> B = {(*axis)["p2"][0].get<double>(), (*axis)["p2"][1].get<double>()};
+    std::vector<json> sources;
+    for (const json& e_id : op["entities"]) {
+        const std::string sid = e_id.get<std::string>();
+        if (sid == line_id)
+            throw OpError("invalid_op", "sketch_mirror_entities: cannot mirror the mirror line itself");
+        json* ent = find_sketch_entity(sk, sid);
+        if (!ent)
+            throw OpError("invalid_op", "sketch_mirror_entities: entity '" + sid + "' not found");
+        if (!kMpSupported.count(ent->value("type", std::string())))
+            unsupported_entity(idx, "sketch_mirror_entities", ent->value("type", std::string()));
+        sources.push_back(*ent);
+    }
+    json& ents = sk["params"]["entities"];
+    json& cons = sk["params"]["constraints"];
+    std::vector<std::string> new_ids;
+    for (const json& ent : sources) {
+        json geom = mirror_entity(ent, A, B);
+        std::string neid = gen.next("e");
+        new_ids.push_back(neid);
+        ents.push_back(stamp_entity(geom, neid, ent.value("construction", false)));
+        auto [pairs, needs_equal] = symmetric_pairs(ent.value("type", std::string()),
+                                                    ent.value("id", std::string()), neid);
+        for (auto& [ha, hb] : pairs)
+            cons.push_back({{"id", gen.next("c")}, {"type", "symmetric"}, {"refs", {ha, hb, line_id}}});
+        if (needs_equal)
+            cons.push_back({{"id", gen.next("c")}, {"type", "equal"},
+                            {"refs", {ent.value("id", std::string()), neid}}});
+    }
+    id_map["$" + std::to_string(idx)] = new_ids.empty() ? std::string() : new_ids[0];
+    for (std::size_t k = 1; k < new_ids.size(); ++k)
+        id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = new_ids[k];
+}
+
+void op_sketch_pattern_entities(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+    json& sk = require_sketch_feature(doc, op, id_map);
+    if (!op.contains("entities") || !op["entities"].is_array() || op["entities"].empty())
+        throw OpError("invalid_op", "sketch_pattern_entities requires a non-empty 'entities' id list");
+    const std::string mode = op.value("mode", std::string());
+    if (mode != "linear" && mode != "circular")
+        throw OpError("invalid_op", "sketch_pattern_entities requires mode 'linear' or 'circular'");
+    if (!op.contains("count") || !op["count"].is_number_integer() || op["count"].get<int>() < 2)
+        throw OpError("invalid_op", "sketch_pattern_entities requires an integer 'count' >= 2");
+    int count = op["count"].get<int>();
+    std::vector<json> sources;
+    for (const json& e_id : op["entities"]) {
+        json* ent = find_sketch_entity(sk, e_id.get<std::string>());
+        if (!ent)
+            throw OpError("invalid_op",
+                          "sketch_pattern_entities: entity '" + e_id.get<std::string>() + "' not found");
+        if (!kMpSupported.count(ent->value("type", std::string())))
+            unsupported_entity(idx, "sketch_pattern_entities", ent->value("type", std::string()));
+        sources.push_back(*ent);
+    }
+    // Per-step transforms: ("t", dx, dy) | ("r", cx, cy, ang).
+    struct Step { bool rot; double a, b, c; };
+    std::vector<Step> steps;
+    if (mode == "linear") {
+        if (!op.contains("dir") || !op["dir"].is_array() || op["dir"].size() != 2 ||
+            !op["dir"][0].is_number() || !op["dir"][1].is_number())
+            throw OpError("invalid_op", "sketch_pattern_entities (linear) requires 'dir': [dx, dy]");
+        if (!op.contains("spacing") || !op["spacing"].is_number())
+            throw OpError("invalid_op", "sketch_pattern_entities (linear) requires a numeric 'spacing'");
+        double nx = op["dir"][0].get<double>(), ny = op["dir"][1].get<double>();
+        double spacing = op["spacing"].get<double>();
+        double L = std::hypot(nx, ny);
+        if (L < 1e-12)
+            throw OpError("invalid_op", "sketch_pattern_entities (linear) 'dir' is zero-length");
+        nx /= L; ny /= L;
+        for (int i = 1; i < count; ++i) steps.push_back({false, nx * spacing * i, ny * spacing * i, 0.0});
+    } else {
+        if (!op.contains("center") || !op["center"].is_array() || op["center"].size() != 2 ||
+            !op["center"][0].is_number() || !op["center"][1].is_number())
+            throw OpError("invalid_op", "sketch_pattern_entities (circular) requires 'center': [x, y]");
+        if (!op.contains("angle") || !op["angle"].is_number())
+            throw OpError("invalid_op", "sketch_pattern_entities (circular) requires a numeric 'angle'");
+        double cx = op["center"][0].get<double>(), cy = op["center"][1].get<double>();
+        double angle = op["angle"].get<double>();
+        bool equal = op.value("equal_spacing", false);
+        double step_ang = equal ? (angle / count) : angle;
+        for (int i = 1; i < count; ++i) steps.push_back({true, cx, cy, step_ang * i});
+    }
+    json& ents = sk["params"]["entities"];
+    std::vector<std::string> new_ids;
+    for (const Step& tf : steps) {
+        for (const json& ent : sources) {
+            json geom = geom_view(ent);
+            json placed = tf.rot ? rotate_entity(geom, tf.a, tf.b, tf.c)
+                                 : translate_entity(geom, tf.a, tf.b);
+            std::string neid = gen.next("e");
+            new_ids.push_back(neid);
+            ents.push_back(stamp_entity(placed, neid, ent.value("construction", false)));
+        }
+    }
+    id_map["$" + std::to_string(idx)] = new_ids.empty() ? std::string() : new_ids[0];
+    for (std::size_t k = 1; k < new_ids.size(); ++k)
+        id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = new_ids[k];
+}
+
+void op_sketch_move(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+    json& sk = require_sketch_feature(doc, op, id_map);
+    if (!op.contains("entities") || !op["entities"].is_array() || op["entities"].empty())
+        throw OpError("invalid_op", "sketch_move requires a non-empty 'entities' id list");
+    if (!op.contains("dx") || !op["dx"].is_number())
+        throw OpError("invalid_op", "sketch_move requires a numeric 'dx'");
+    if (!op.contains("dy") || !op["dy"].is_number())
+        throw OpError("invalid_op", "sketch_move requires a numeric 'dy'");
+    double dx = op["dx"].get<double>(), dy = op["dy"].get<double>();
+    bool copy_flag = false;
+    if (op.contains("copy")) {
+        if (!op["copy"].is_boolean()) throw OpError("invalid_op", "sketch_move 'copy' must be a bool");
+        copy_flag = op["copy"].get<bool>();
+    }
+    std::vector<std::string> source_ids;
+    for (const json& e_id : op["entities"]) {
+        json* ent = find_sketch_entity(sk, e_id.get<std::string>());
+        if (!ent)
+            throw OpError("invalid_op", "sketch_move: entity '" + e_id.get<std::string>() + "' not found");
+        if (!kMpSupported.count(ent->value("type", std::string())))
+            unsupported_entity(idx, "sketch_move", ent->value("type", std::string()));
+        source_ids.push_back(e_id.get<std::string>());
+    }
+    if (!copy_flag) {
+        for (const std::string& sid : source_ids) {
+            json* ent = find_sketch_entity(sk, sid);
+            json moved = translate_entity(geom_view(*ent), dx, dy);
+            for (auto it = moved.begin(); it != moved.end(); ++it) (*ent)[it.key()] = it.value();
+        }
+        id_map["$" + std::to_string(idx)] = source_ids.empty() ? std::string() : source_ids[0];
+        return;
+    }
+    json& ents = sk["params"]["entities"];
+    std::vector<std::string> new_ids;
+    for (const std::string& sid : source_ids) {
+        json* ent = find_sketch_entity(sk, sid);
+        bool construction = ent->value("construction", false);
+        json geom = translate_entity(geom_view(*ent), dx, dy);
+        std::string neid = gen.next("e");
+        new_ids.push_back(neid);
+        ents.push_back(stamp_entity(geom, neid, construction));
+    }
+    id_map["$" + std::to_string(idx)] = new_ids.empty() ? std::string() : new_ids[0];
+    for (std::size_t k = 1; k < new_ids.size(); ++k)
+        id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = new_ids[k];
+}
+
 // Dispatch one op against the working doc.
 void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     if (!op.is_object() || !op.contains("op") || !op["op"].is_string())
@@ -437,6 +993,14 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
     else if (k == "sketch_delete_constraint")   op_sketch_delete_constraint(doc, op, id_map);
     else if (k == "sketch_set_dim")             op_sketch_set_dim(doc, op, id_map);
     else if (k == "sketch_toggle_construction") op_sketch_toggle_construction(doc, op, id_map);
+    else if (k == "sketch_trim")                op_sketch_trim(doc, op, idx, gen, id_map);
+    else if (k == "sketch_extend")              op_sketch_extend(doc, op, idx, gen, id_map);
+    else if (k == "sketch_offset")              op_sketch_offset(doc, op, idx, gen, id_map);
+    else if (k == "sketch_fillet")              op_sketch_fillet(doc, op, idx, gen, id_map);
+    else if (k == "sketch_chamfer")             op_sketch_chamfer(doc, op, idx, gen, id_map);
+    else if (k == "sketch_mirror_entities")     op_sketch_mirror_entities(doc, op, idx, gen, id_map);
+    else if (k == "sketch_pattern_entities")    op_sketch_pattern_entities(doc, op, idx, gen, id_map);
+    else if (k == "sketch_move")                op_sketch_move(doc, op, idx, gen, id_map);
     else
         throw OpError("unsupported", "op[" + std::to_string(idx) + "]: unknown op '" + k + "'",
                       {{"index", idx}, {"reason", "not ported"}});

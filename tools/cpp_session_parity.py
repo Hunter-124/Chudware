@@ -274,6 +274,106 @@ def main() -> int:
     else:
         print(f"  {'resolve_pick (faces strict)':<28} MATCH{pick_notes}")
 
+    # 4d-adv) Advanced sketch ops (P13): trim / extend / offset / fillet / chamfer /
+    # mirror_entities / pattern_entities / move. Drive the SAME op batch through both
+    # engines and compare the resulting sketch entities + constraints (canonical, float-
+    # rounded) + the id_map. Both ports share the algorithm and the e/c id allocator, so a
+    # faithful port is an EXACT structural match.
+    def _ent(etype, **fields):
+        e = {"type": etype, "construction": fields.pop("construction", False)}
+        e.update(fields)
+        return {"op": "sketch_add_entity", "sketch": "$0", "entity": e}
+
+    def _sketch_setup(*add_ops):
+        return [{"op": "add_feature", "feature": {"type": "sketch", "name": "S",
+                 "params": {"entities": [], "constraints": []},
+                 "refs": {"plane": "plane.top"}}}, *add_ops]
+
+    def roundjson(x, nd=6):
+        if isinstance(x, bool):
+            return x
+        if isinstance(x, float):
+            return round(x, nd)
+        if isinstance(x, dict):
+            return {k: roundjson(v, nd) for k, v in x.items()}
+        if isinstance(x, list):
+            return [roundjson(v, nd) for v in x]
+        return x
+
+    def adv_canon(resp):
+        sk = resp["tree"]["features"][0]
+        p = sk.get("params", {})
+        return roundjson({"entities": p.get("entities", []),
+                          "constraints": p.get("constraints", [])})
+
+    adv_cases = [
+        # offset a closed rectangle inward (chain of 4 lines -> 4 offset lines + joints)
+        ("sketch_offset", _sketch_setup(
+            _ent("line", p1=[0, 0], p2=[40, 0]), _ent("line", p1=[40, 0], p2=[40, 30]),
+            _ent("line", p1=[40, 30], p2=[0, 30]), _ent("line", p1=[0, 30], p2=[0, 0])),
+         {"op": "sketch_offset", "sketch": "f1", "entities": ["e1", "e2", "e3", "e4"],
+          "distance": 5.0, "side": [20, 15]}),
+        # mirror two lines across a construction line
+        ("sketch_mirror_entities", _sketch_setup(
+            _ent("line", p1=[0, 0], p2=[10, 0]), _ent("line", p1=[0, 5], p2=[10, 5]),
+            _ent("line", p1=[5, -5], p2=[5, 15], construction=True)),
+         {"op": "sketch_mirror_entities", "sketch": "f1", "entities": ["e1", "e2"], "line": "e3"}),
+        # linear pattern of a circle
+        ("sketch_pattern_entities/linear", _sketch_setup(
+            _ent("circle", center=[0, 0], radius=5)),
+         {"op": "sketch_pattern_entities", "sketch": "f1", "entities": ["e1"],
+          "mode": "linear", "dir": [1, 0], "spacing": 20, "count": 3}),
+        # circular pattern of a circle
+        ("sketch_pattern_entities/circular", _sketch_setup(
+            _ent("circle", center=[20, 0], radius=5)),
+         {"op": "sketch_pattern_entities", "sketch": "f1", "entities": ["e1"],
+          "mode": "circular", "center": [0, 0], "angle": 360, "count": 4, "equal_spacing": True}),
+        # fillet a 90deg corner of two lines
+        ("sketch_fillet", _sketch_setup(
+            _ent("line", p1=[0, 0], p2=[40, 0]), _ent("line", p1=[40, 0], p2=[40, 30])),
+         {"op": "sketch_fillet", "sketch": "f1", "e1": "e1", "e2": "e2", "radius": 8.0}),
+        # chamfer the same corner (unequal setbacks)
+        ("sketch_chamfer", _sketch_setup(
+            _ent("line", p1=[0, 0], p2=[40, 0]), _ent("line", p1=[40, 0], p2=[40, 30])),
+         {"op": "sketch_chamfer", "sketch": "f1", "e1": "e1", "e2": "e2",
+          "distance": 6.0, "distance2": 10.0}),
+        # trim a line at a crossing
+        ("sketch_trim", _sketch_setup(
+            _ent("line", p1=[0, 0], p2=[40, 0]), _ent("line", p1=[20, -10], p2=[20, 10])),
+         {"op": "sketch_trim", "sketch": "f1", "entity": "e1", "point": [10, 0]}),
+        # extend a line to meet another
+        ("sketch_extend", _sketch_setup(
+            _ent("line", p1=[0, 0], p2=[10, 0]), _ent("line", p1=[20, -10], p2=[20, 10])),
+         {"op": "sketch_extend", "sketch": "f1", "entity": "e1", "end": "end"}),
+        # move a circle in place
+        ("sketch_move/inplace", _sketch_setup(_ent("circle", center=[0, 0], radius=5)),
+         {"op": "sketch_move", "sketch": "f1", "entities": ["e1"], "dx": 15, "dy": 7}),
+        # move a circle as a copy
+        ("sketch_move/copy", _sketch_setup(_ent("circle", center=[0, 0], radius=5)),
+         {"op": "sketch_move", "sketch": "f1", "entities": ["e1"], "dx": 15, "dy": 0, "copy": True}),
+    ]
+    for label, setup, adv in adv_cases:
+        pe, ce = py_session(), CppS(core)
+        pe.apply(0, setup)
+        ce.apply(0, setup)
+        pr = pe.apply(1, [adv])
+        cr = ce.apply(1, [adv])
+        diffs = []
+        if pr.get("id_map") != cr.get("id_map"):
+            diffs.append(f"id_map {pr.get('id_map')}!={cr.get('id_map')}")
+        pc, cc = adv_canon(pr), adv_canon(cr)
+        if pc != cc:
+            # find first differing key for a compact message
+            for key in ("entities", "constraints"):
+                if pc.get(key) != cc.get(key):
+                    diffs.append(f"{key} differ")
+        if diffs:
+            print(f"  {('adv ' + label):<28} DIFF: {'; '.join(diffs)[:140]}")
+            mism += 1
+        else:
+            print(f"  {('adv ' + label):<28} MATCH")
+    adv_total = len(adv_cases)
+
     # 4d) .step+ doc_save / doc_open round-trip (P12). Build a box, save it through the
     # C++ session, reopen it (fresh doc_id), and require the SAME feature tree + SAME
     # volume. Cross-check that the Python stepplus.open of the C++-written file yields the
@@ -323,7 +423,7 @@ def main() -> int:
     print(f"  {'stale_revision guard':<28} {'MATCH' if ok else 'DIFF: ' + str(cr)}")
     mism += 0 if ok else 1
 
-    total = 8
+    total = 8 + adv_total
     print(f"\n[session-parity] {total - mism}/{total} steps at full parity")
     return mism
 

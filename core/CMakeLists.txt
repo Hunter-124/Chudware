@@ -291,6 +291,7 @@ if(AICAD_WITH_OCCT)
     doc/selectors.cpp
     doc/picks.cpp
     doc/session.cpp
+    doc/sketch_geom.cpp
     doc/stepplus.cpp)
   target_include_directories(aicad_doc PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

@@ -44,6 +44,7 @@ struct Session {
     bool dirty = false;
     std::string path;                                  // current .step+ path (or empty)
     std::map<std::string, std::string> extra_entries;  // unknown .step+ entries (verbatim)
+    std::map<std::string, std::string> checkpoints;    // PM-cancel snapshots: id -> doc JSON
 };
 
 constexpr std::size_t kUndoLimit = 100;
@@ -51,6 +52,16 @@ constexpr std::size_t kUndoLimit = 100;
 std::mutex g_mtx;
 std::map<std::string, Session> g_sessions;
 std::atomic<unsigned long long> g_doc_seq{1};
+std::atomic<unsigned long long> g_ckpt_seq{1};
+
+std::string new_checkpoint_id() {
+    // Opaque, unique-per-process id (Python uses a uuid4 prefix; the value is only
+    // ever round-tripped back through doc_revert, so any unique token is faithful).
+    unsigned long long n = g_ckpt_seq.fetch_add(1);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "ckpt-%010llx", n);
+    return std::string(buf);
+}
 
 std::string new_doc_id() {
     unsigned long long n = g_doc_seq.fetch_add(1);
@@ -1197,6 +1208,50 @@ json doc_rebuild(const std::string& doc_id) {
 bool doc_close(const std::string& doc_id) {
     std::lock_guard<std::mutex> lk(g_mtx);
     return g_sessions.erase(doc_id) > 0;
+}
+
+json doc_list() {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    json docs = json::array();
+    for (const auto& [id, s] : g_sessions) {
+        const std::string schema = s.doc.is_object() ? s.doc.value("schema", std::string()) : std::string();
+        docs.push_back({
+            {"doc_id", s.doc_id},
+            {"name", s.doc.is_object() ? s.doc.value("name", s.doc_id) : s.doc_id},
+            {"kind", schema == "aicad.asm/1" ? "assembly" : "part"},
+            {"path", s.path.empty() ? json(nullptr) : json(s.path)},
+            {"revision", s.revision},
+            {"dirty", s.dirty},
+        });
+    }
+    return json{{"docs", docs}};
+}
+
+json doc_checkpoint(const std::string& doc_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    const std::string cid = new_checkpoint_id();
+    s.checkpoints[cid] = s.doc.dump();
+    return json{{"checkpoint", cid}};
+}
+
+json doc_revert(const std::string& doc_id, const std::string& checkpoint_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    auto it = s.checkpoints.find(checkpoint_id);
+    if (it == s.checkpoints.end())
+        throw OpError("invalid_op", "no such checkpoint '" + checkpoint_id + "'",
+                      {{"reason", "unknown checkpoint"}, {"checkpoint", checkpoint_id}});
+    // One undo entry of the pre-revert state (a single undo restores it); clear redo
+    // like any edit. Then swap in the snapshot, rebuild, and bump the revision.
+    s.undo_stack.push_back(s.doc.dump());
+    if (s.undo_stack.size() > kUndoLimit) s.undo_stack.erase(s.undo_stack.begin());
+    s.redo_stack.clear();
+    s.doc = json::parse(it->second);
+    s.revision += 1;
+    s.dirty = true;
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    return ops_response(s, r, json::object(), /*with_tess=*/true);
 }
 
 json doc_resolve_pick(const std::string& doc_id, int body_id, const std::string& kind,

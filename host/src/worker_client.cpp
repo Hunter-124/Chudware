@@ -252,6 +252,20 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
         }
         if (j.value("ok", false)) {
             result = j.value("result", json::object());
+            // P-session: doc_list must enumerate BOTH engines during the mixed-cutover
+            // phase. The Python worker only knows its own docs; append the C++ core's
+            // open sessions. Gated on available() — the DLL only loads once a C++-backed
+            // doc exists, so when the cutover flag is off this is byte-for-byte today's
+            // behavior (no C++ docs, no merge).
+            if (method == "doc_list" && core::cpp_core().available() &&
+                result.is_object() && result.contains("docs") && result["docs"].is_array()) {
+                json cppList;
+                std::string cerr;
+                if (core::cpp_core().call("doc_list", json::object(), cppList, cerr) &&
+                    cppList.is_object() && cppList.contains("docs") && cppList["docs"].is_array()) {
+                    for (auto& d : cppList["docs"]) result["docs"].push_back(d);
+                }
+            }
             return true;
         }
         // Protocol-2 methods report errors as a structured envelope {code,message,detail}.

@@ -54,6 +54,18 @@ nlohmann::json doc_tree(const std::string& doc_id);     // no rebuild, no rev bu
 nlohmann::json doc_rebuild(const std::string& doc_id);  // forced rebuild, no rev bump
 bool doc_close(const std::string& doc_id);
 
+// Enumerate the open C++ sessions: {"docs":[{doc_id,name,kind,path,revision,dirty}]}.
+// Mirrors engine.doc.session.list_sessions (metadata only — no compile).
+nlohmann::json doc_list();
+
+// PropertyManager-cancel checkpoints (engine.doc.session.checkpoint/revert).
+// doc_checkpoint deep-snapshots the current doc and returns {"checkpoint": id}.
+// doc_revert restores the snapshot, pushes ONE undo entry of the pre-revert doc,
+// rebuilds, bumps the revision, and returns the ops-response. Checkpoints are
+// per-session and cleared on close. A bad id throws OpError("invalid_op").
+nlohmann::json doc_checkpoint(const std::string& doc_id);
+nlohmann::json doc_revert(const std::string& doc_id, const std::string& checkpoint_id);
+
 // Resolve a viewport pick (1-based body ordinal + kind + 1-based MapShapes topo id)
 // into a selector json {selector: {...}}. Throws OpError("unknown_doc"/...).
 nlohmann::json doc_resolve_pick(const std::string& doc_id, int body_id,

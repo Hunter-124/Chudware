@@ -423,6 +423,62 @@ def main() -> int:
     else:
         print(f"  {'.step+ save/open round-trip':<28} MATCH{rt_note}")
 
+    # 4e) doc_list (P-session): both engines enumerate their open sessions with the same
+    # per-doc metadata schema {doc_id,name,kind,path,revision,dirty}. The doc_ids and the
+    # exact registry contents differ between engines (each created its own docs), so we
+    # compare the metadata of the SAME logical doc: build a named part on each side, then
+    # require its doc_list entry to carry the same name/kind/path/dirty/revision + field set.
+    from engine.doc import session as _ls
+    _lp = _ls.new_session("part")
+    _ls.apply_ops(_lp, 0, rect_then_extrude(8.0), None)
+    py_entry = next((d for d in _ls.list_sessions() if d["doc_id"] == _lp.doc_id), None)
+    rc, cl = core.call("doc_new", {"kind": "part"})
+    cpp_lid = cl["doc_id"]
+    core.call("doc_apply_ops", {"doc_id": cpp_lid, "base_revision": 0, "ops": rect_then_extrude(8.0)})
+    rc, lst = core.call("doc_list", {})
+    cpp_entry = next((d for d in lst.get("docs", []) if d["doc_id"] == cpp_lid), None)
+    list_diffs = []
+    if py_entry is None or cpp_entry is None:
+        list_diffs.append(f"missing entry py={py_entry} cpp={cpp_entry}")
+    else:
+        if set(py_entry.keys()) != set(cpp_entry.keys()):
+            list_diffs.append(f"keys {sorted(py_entry)}!={sorted(cpp_entry)}")
+        for f in ("name", "kind", "path", "dirty", "revision"):
+            if py_entry.get(f) != cpp_entry.get(f):
+                list_diffs.append(f"{f} {py_entry.get(f)!r}!={cpp_entry.get(f)!r}")
+    if list_diffs:
+        print(f"  {'doc_list metadata':<28} DIFF: {'; '.join(list_diffs)[:120]}")
+        mism += 1
+    else:
+        print(f"  {'doc_list metadata':<28} MATCH")
+
+    # 4f) doc_checkpoint / doc_revert (PM-cancel): build a box, checkpoint, edit the depth,
+    # then revert to the checkpoint. Both engines must restore the checkpointed tree+volume,
+    # bump the revision, and leave ONE undo entry (a single undo returns to the pre-revert
+    # state). Drive the identical sequence through both and compare at each step.
+    pyk, cpk = py_session(), CppS(core)
+    pyk.apply(0, rect_then_extrude(10.0))
+    cpk.apply(0, rect_then_extrude(10.0))
+    py_cid = _ls.checkpoint(pyk.s)["checkpoint"]
+    rc, cc = core.call("doc_checkpoint", {"doc_id": cpk.doc_id})
+    cpp_cid = cc["checkpoint"]
+    # edit depth 10 -> 25 on both (rev 1 -> 2)
+    edit2 = [{"op": "edit_feature", "id": "f2", "params": {"depth": {"value": 25.0, "expr": None}}}]
+    pyk.apply(1, edit2)
+    cpk.apply(1, edit2)
+    # revert to the checkpoint (rev 2 -> 3, depth back to 10)
+    pr = _ls.revert(pyk.s, py_cid, emit=None)
+    rc, cr = core.call("doc_revert", {"doc_id": cpk.doc_id, "checkpoint": cpp_cid})
+    mism += compare("checkpoint+revert", pyk, cpk, pr, cr)
+    # a single undo after revert returns to the PRE-revert (depth=25) state
+    pru, cru = pyk.undo(), cpk.undo()
+    mism += compare("undo after revert", pyk, cpk, pru, cru)
+    # reverting to a bogus checkpoint is a structured invalid_op on both
+    rc, bad = core.call("doc_revert", {"doc_id": cpk.doc_id, "checkpoint": "ckpt-nope"})
+    bad_ok = (rc != 0 and bad.get("code") == "invalid_op")
+    print(f"  {'revert bad checkpoint':<28} {'MATCH' if bad_ok else 'DIFF: ' + str(bad)}")
+    mism += 0 if bad_ok else 1
+
     # 5) stale_revision guard (base 0 now stale)
     rc, cr = core.call("doc_apply_ops", {"doc_id": cpp.doc_id, "base_revision": 0, "ops": []})
     code = cr.get("code") or cr.get("detail", {})
@@ -430,7 +486,7 @@ def main() -> int:
     print(f"  {'stale_revision guard':<28} {'MATCH' if ok else 'DIFF: ' + str(cr)}")
     mism += 0 if ok else 1
 
-    total = 8 + adv_total
+    total = 12 + adv_total
     print(f"\n[session-parity] {total - mism}/{total} steps at full parity")
     return mism
 

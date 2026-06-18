@@ -286,12 +286,20 @@ if(AICAD_WITH_OCCT)
     # TKOffset: shell (BRepOffsetAPI_MakeThickSolid) + draft (BRepOffsetAPI_DraftAngle)
     # + loft (BRepOffsetAPI_ThruSections).
     TKOffset
-    # Data-exchange (doc/formats.cpp): the NON-CAF control classes only — STEPControl_*
-    # (TKDESTEP), IGESControl_* (TKDEIGES), StlAPI_Writer (TKDESTL) over the XS base
-    # (TKXSBase). Deliberately NOT the unified DE_Wrapper framework (TKDE/TKDECascade)
-    # nor the OCAF/XCAF document stack (TKXCAF/TKLCAF/TKCDF) — those drag visualization /
-    # heavier 3rdparty runtime DLLs the loader would then need staged.
-    TKDESTEP TKDEIGES TKDESTL TKXSBase)
+    # Data-exchange (doc/formats.cpp): the NON-CAF control classes — STEPControl_*
+    # (TKDESTEP), IGESControl_* (TKDEIGES), StlAPI_Writer + RWStl (TKDESTL) over the XS
+    # base (TKXSBase).
+    TKDESTEP TKDEIGES TKDESTL TKXSBase
+    # Mesh lane (P27): OCCT 7.9.3 splits the mesh readers/writers into per-format DE
+    # toolkits — RWObj is in TKDEOBJ, RWGltf in TKDEGLTF, RWStl in TKDESTL (above), all
+    # over the RWMesh base in TKRWMesh. The glTF reader/writer are XCAF-document-based
+    # (RWGltf_CafReader/Writer), so we also bring the OCAF/XCAF stack (TKXCAF/TKLCAF/
+    # TKCDF + the Bin persistence drivers TKBin/TKBinL/TKBinXCAF that XCAFApp_Application
+    # ::NewDocument("BinXCAF") needs). OBJ/STL import use the non-CAF Poly_Triangulation
+    # API (RWObj::ReadFile / RWStl::ReadFile); OBJ/PLY export use hand writers. All these
+    # toolkit DLLs are already staged by aicad_occt_copy_dlls (copy_directory of the
+    # whole OCCT bin dir).
+    TKRWMesh TKDEOBJ TKDEGLTF TKXCAF TKLCAF TKCDF TKBin TKBinL TKBinXCAF)
 
   # Verification: tessellate -> write_aicm -> HOST render::parseAicm round-trip.
   add_executable(test_geom_aicm

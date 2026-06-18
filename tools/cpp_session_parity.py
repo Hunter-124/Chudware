@@ -637,6 +637,27 @@ def main() -> int:
                 pass
         return v
 
+    def py_import_mesh_invariant(p):
+        """Robust mesh invariant from a Python(trimesh/OCCT) import of a mesh file:
+        (triangle_count, volume, bbox_lo, bbox_hi) summed/unioned over all bodies."""
+        import numpy as _np  # noqa: PLC0415
+        tris = 0
+        vol = 0.0
+        lo = hi = None
+        for _n, mb in _fmt.import_path(p):
+            t = getattr(mb, "tris", None)
+            if t is None:
+                continue
+            tris += int(len(t))
+            try:
+                vol += float(mb.volume)
+            except Exception:  # noqa: BLE001
+                pass
+            blo, bhi = mb.bbox()
+            lo = blo if lo is None else tuple(min(a, b) for a, b in zip(lo, blo))
+            hi = bhi if hi is None else tuple(max(a, b) for a, b in zip(hi, bhi))
+        return tris, vol, (lo or (0, 0, 0)), (hi or (0, 0, 0))
+
     def py_export_box(p, fmt):
         e = py_session(); e.apply(0, _box_ops())
         from engine.doc.session import _rebuild, _solid_bodies
@@ -674,6 +695,63 @@ def main() -> int:
                  str(iv.get("doc_id", "")).startswith("doc-cpp"))
         print(f"  {'fmt C++ STEP round-trip':<28} {'MATCH' if rt_ok else f'DIFF rc={rc} vol={rtv}'}")
         mism += 0 if rt_ok else 1
+
+        # ---- MESH lane (P27): OBJ / PLY / glTF / GLB --------------------------------
+        # The box solid (30x20x10) tessellates to a deterministic 12-triangle cuboid
+        # mesh, bbox (-15,-10,-5)..(15,10,5), enclosed volume 6000. Mesh formats are
+        # approximate across libs, so we gate the ROBUST INVARIANT — triangle COUNT +
+        # bbox + (closed-mesh) VOLUME — never a byte compare. Triangle count is the
+        # tessellation invariant (a box is 12 tris regardless of writer/reader); vertex
+        # count is NOT gated (welded 8 vs split 24 differs by writer, both valid).
+        BOX_TRIS = 12
+        BOX_LO, BOX_HI = (-15.0, -10.0, -5.0), (15.0, 10.0, 5.0)
+
+        def bbox_close(lo, hi, tol=1e-3):
+            return (all(abs(a - b) <= tol for a, b in zip(lo, BOX_LO)) and
+                    all(abs(a - b) <= tol for a, b in zip(hi, BOX_HI)))
+
+        for ext, fmt in [("obj", "obj"), ("ply", "ply"), ("gltf", "gltf"), ("glb", "glb")]:
+            # (a) C++ export -> Python(trimesh/OCCT) import: count + bbox + volume.
+            fmt_total += 1
+            p = str(Path(td) / f"cpp_box.{ext}")
+            rc, ev = core.call("export_file", {"doc_id": ce.doc_id, "path": p, "format": fmt})
+            if rc != 0 or not Path(ev.get("path", "")).exists():
+                print(f"  {('fmt C++export->py ' + fmt):<28} DIFF: export rc={rc} {str(ev)[:40]}")
+                mism += 1
+            else:
+                try:
+                    tris, vol, lo, hi = py_import_mesh_invariant(p)
+                    ok = (tris == BOX_TRIS and bbox_close(lo, hi) and
+                          abs(vol - BOXV) / BOXV <= 1e-3)
+                    verdict = ("MATCH" if ok else
+                               f"DIFF tris={tris} vol={vol:.1f} bbox={tuple(round(x,2) for x in lo)}"
+                               f"..{tuple(round(x,2) for x in hi)}")
+                    print(f"  {('fmt C++export->py ' + fmt):<28} {verdict}")
+                    mism += 0 if ok else 1
+                except Exception as exc:  # noqa: BLE001 — optional oracle backend missing
+                    print(f"  {('fmt C++export->py ' + fmt):<28} SKIP ({type(exc).__name__})")
+
+            # (b) C++ mesh round-trip: export -> import back into a fresh C++ doc -> volume.
+            fmt_total += 1
+            rc, iv = core.call("import_file", {"path": p})
+            rtv = float(iv.get("volume", 0.0)) if rc == 0 else -1.0
+            rt_ok = rc == 0 and abs(rtv - BOXV) / BOXV <= 1e-3
+            print(f"  {('fmt C++ ' + fmt + ' round-trip'):<28} {'MATCH' if rt_ok else f'DIFF rc={rc} vol={rtv}'}")
+            mism += 0 if rt_ok else 1
+
+            # (c) Python export -> C++ import -> volume parity.
+            fmt_total += 1
+            pp = str(Path(td) / f"py_box.{ext}")
+            try:
+                py_export_box(pp, fmt)
+            except Exception as exc:  # noqa: BLE001 — optional oracle backend missing
+                print(f"  {('fmt py->C++import ' + fmt):<28} SKIP ({type(exc).__name__})")
+            else:
+                rc, iv = core.call("import_file", {"path": pp})
+                cv = float(iv.get("volume", 0.0)) if rc == 0 else -1.0
+                py_ok = rc == 0 and abs(cv - BOXV) / BOXV <= 1e-3
+                print(f"  {('fmt py->C++import ' + fmt):<28} {'MATCH' if py_ok else f'DIFF rc={rc} vol={cv}'}")
+                mism += 0 if py_ok else 1
 
         # Python-exported STEP imports into a C++ doc with matching volume.
         fmt_total += 1

@@ -454,6 +454,8 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             }
             if (m == "ecad_impedance")
                 return emit(aicad::ecad::ecad_impedance(params), out_json, 0);
+            if (m == "ecad_export")
+                return emit(aicad::ecad::ecad_export(params), out_json, 0);
         } catch (const aicad::ecad::OpError& oe) {
             return emit(oe.envelope(), out_json, 3);
         }

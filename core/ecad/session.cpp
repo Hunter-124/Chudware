@@ -15,6 +15,7 @@
 #include "ecad/dfm.h"
 #include "ecad/drc.h"
 #include "ecad/erc.h"
+#include "ecad/fabformats.h"
 #include "ecad/impedance.h"
 #include "ecad/netlist.h"
 #include "ecad/schema.h"
@@ -327,6 +328,53 @@ json ecad_dfm_board(const json& board, const json& rules) {
         throw OpError("invalid_op", "ecad_dfm requires a pcb document",
                       {{"reason", "wrong doc kind"}});
     return dfm_response(board, rules);
+}
+
+json ecad_export(const json& params) {
+    std::string kind = params.value("kind", std::string());
+    json opts = params.contains("opts") && params["opts"].is_object() ? params["opts"]
+                                                                       : json::object();
+
+    // resolve the board doc: stateless inline `board` wins (parity-harness path),
+    // else the session document.
+    json board;
+    if (params.contains("board") && params["board"].is_object()) {
+        board = params["board"];
+    } else {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        Session& s = require_session(params.value("doc_id", std::string()));
+        board = s.doc;
+    }
+
+    if (kind == "gerber" || kind == "drill" || kind == "bom" || kind == "cpl") {
+        if (!schema::is_board(board))
+            throw OpError("invalid_op", kind + " export requires a pcb document",
+                          {{"reason", "wrong doc kind"}});
+    } else {
+        throw OpError("invalid_op", "ecad_export: unknown kind '" + kind + "'", {{"kind", kind}});
+    }
+
+    json files = json::object();
+    if (kind == "gerber") {
+        for (auto& kv : fab::write_gerbers(board)) files[kv.first] = kv.second;
+    } else if (kind == "drill") {
+        for (auto& kv : fab::write_drill(board)) files[kv.first] = kv.second;
+    } else if (kind == "bom") {
+        std::string fmt = opts.value("fmt", std::string("csv"));
+        bool excl = opts.contains("exclude_dnp") && opts["exclude_dnp"].is_boolean()
+                        ? opts["exclude_dnp"].get<bool>()
+                        : true;
+        files["bom"] = fab::write_bom(board, fmt, excl);
+    } else if (kind == "cpl") {
+        bool excl_tht = opts.contains("exclude_tht") && opts["exclude_tht"].is_boolean()
+                            ? opts["exclude_tht"].get<bool>()
+                            : true;
+        bool excl_virt = opts.contains("exclude_virtual") && opts["exclude_virtual"].is_boolean()
+                             ? opts["exclude_virtual"].get<bool>()
+                             : true;
+        files["cpl"] = fab::write_placement(board, excl_tht, excl_virt);
+    }
+    return json{{"files", files}};
 }
 
 json ecad_impedance(const json& params) {

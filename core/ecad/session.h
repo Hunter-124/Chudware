@@ -46,6 +46,15 @@ nlohmann::json ecad_dfm(const std::string& doc_id, const nlohmann::json& rules);
 // Stateless variant: run DFM over an inline board doc (parity harness path).
 nlohmann::json ecad_dfm_board(const nlohmann::json& board, const nlohmann::json& rules);
 
+// ecad_export {kind, board|doc_id, opts?} -> fabrication output.
+//   kind: "gerber" | "drill" | "bom" | "cpl"  (pcb only)
+// Returns {"files": {<logical-key>: <file-text>}} where the logical key is the
+// gerber layer_id ("F.Cu", ...), "pth"/"npth" for drill, or "bom"/"cpl" for the
+// single-file CSV/JSON outputs. A stateless `board` (parity-harness path) takes
+// precedence over `doc_id`. Throws OpError("invalid_op") for non-pcb docs or
+// unknown kinds. The file CONTENT is byte-identical to engine/ecad/fab/*.
+nlohmann::json ecad_export(const nlohmann::json& params);
+
 // ecad_impedance {mode, ...geom} -> the impedance.cpp calculator result.
 // mode: "microstrip" | "stripline" | "coplanar" | "diff_pair" | "track".
 // For "track", params carry {doc_id, track_or_net}. The other modes carry

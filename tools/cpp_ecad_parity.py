@@ -996,6 +996,141 @@ def main() -> int:
     cmp_imp("track by net name", _eimp.track_impedance(bsi, "SIG"),
             cpp.call("ecad_impedance", {"mode": "track", "board": bsi, "track_or_net": "SIG"}), _TK)
 
+    # ---- 20) FAB OUTPUT parity: Gerber / Excellon / BOM / CPL ----------------
+    # Fixtures + expected text come from engine/ecad/test_fab.py (_make_test_board)
+    # plus extra boards exercising roundrect aperture macros, oval-drill G85 slots,
+    # BOM user-field columns, and a non-default origin. Python fab writers are
+    # called DIRECTLY (engine.ecad.fab) to get the ground-truth text; C++ exposes
+    # ecad_export {kind, board, opts?} -> {"files": {key: text}} (stateless inline
+    # board path, mirroring ecad_dfm {board}). Every file is compared BYTE-FOR-BYTE
+    # after normalize().
+    #
+    # normalize() — the ONLY allowed transform, applied IDENTICALLY to both
+    # engines' text: there is NOTHING non-deterministic in these formats (no
+    # timestamps, no generator version string, no uuid; both engines fix '\n' line
+    # endings and integer-scaled coordinates). normalize() therefore only strips a
+    # single trailing newline so a comparison never trips on EOF-newline handling —
+    # it does NOT touch apertures, D-codes, coordinates, regions, tool tables or any
+    # other load-bearing content.
+    from engine.ecad.fab import (write_gerbers as _py_write_gerbers,
+                                  write_gerber_layer as _py_write_gerber_layer,
+                                  write_drill as _py_write_drill,
+                                  write_bom as _py_write_bom,
+                                  write_placement as _py_write_placement)
+    from engine.ecad.test_fab import _make_test_board as _py_make_test_board
+
+    def normalize(text: str) -> str:
+        # strip exactly one trailing '\n' (EOF-newline; deterministic on both sides)
+        return text[:-1] if text.endswith("\n") else text
+
+    def cmp_fab_file(label, py_text, cpp_text):
+        ok = normalize(py_text) == normalize(cpp_text)
+        if ok:
+            print(f"  {label:<46} MATCH")
+        else:
+            # show first differing line for diagnosis
+            pl = normalize(py_text).splitlines()
+            cl = normalize(cpp_text).splitlines()
+            firstdiff = "len " + f"{len(pl)}!={len(cl)}"
+            for i, (a, b) in enumerate(zip(pl, cl)):
+                if a != b:
+                    firstdiff = f"line {i+1}: py={a!r} cpp={b!r}"
+                    break
+            print(f"  {label:<46} DIFF: {firstdiff[:150]}")
+        return step(0 if ok else 1)
+
+    def cpp_export(kind, board, opts=None):
+        p = {"kind": kind, "board": board}
+        if opts is not None:
+            p["opts"] = opts
+        return cpp.call("ecad_export", p)["files"]
+
+    def run_fab(label, board):
+        # gerber: compare every populated layer (the Python write_gerbers writes
+        # files keyed by layer_id; we compare CONTENT per layer)
+        cpp_g = cpp_export("gerber", board)
+        from engine.ecad.schema import copper_layer_ids as _cli
+        n_cu = board["stackup"]["copper_layers"]
+        layers = list(_cli(n_cu)) + ["F.SilkS", "B.SilkS", "F.Mask", "B.Mask",
+                                     "F.Paste", "B.Paste", "F.Fab", "B.Fab", "Edge.Cuts"]
+        for lid in layers:
+            py_text = _py_write_gerber_layer(board, lid)
+            cmp_fab_file(f"{label} gerber {lid}", py_text, cpp_g.get(lid, ""))
+        # drill (pth + npth)
+        cpp_d = cpp_export("drill", board)
+        import tempfile, os as _os
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _py_write_drill(board, tmp)
+            for key in ("pth", "npth"):
+                with open(paths[key], encoding="utf-8") as f:
+                    py_text = f.read()
+                cmp_fab_file(f"{label} drill {key}", py_text, cpp_d.get(key, ""))
+        # bom csv + json
+        cpp_bom_csv = cpp_export("bom", board, {"fmt": "csv"})["bom"]
+        cmp_fab_file(f"{label} bom csv", _py_write_bom(board, fmt="csv"), cpp_bom_csv)
+        cpp_bom_json = cpp_export("bom", board, {"fmt": "json"})["bom"]
+        cmp_fab_file(f"{label} bom json", _py_write_bom(board, fmt="json"), cpp_bom_json)
+        # cpl
+        cpp_cpl = cpp_export("cpl", board)["cpl"]
+        cmp_fab_file(f"{label} cpl", _py_write_placement(board), cpp_cpl)
+
+    # 20a the canonical test_fab board (SMD rects, THT round drills, via, GND pour
+    #     region, rect outline, bottom-side SMD, virtual+dnp exclusions)
+    run_fab("testboard", _py_make_test_board())
+
+    # 20b roundrect aperture macro board (RNDRCT %AM outline polygon — the most
+    #     float-sensitive path: 36 cos/sin vertices formatted %.6f) + user-field BOM
+    def _roundrect_board():
+        from engine.ecad.schema import new_board as _nb
+        b = _nb("RR Board")  # note the space -> board_name underscored, but content only
+        b["origin"] = [1.0, 2.0]  # non-zero origin exercises board_xy subtraction
+        b["nets"] = [{"name": "GND", "class": "default"}, {"name": "VCC", "class": "default"}]
+        b["footprints"] = [
+            {"id": "fp1", "fpid": "R_0603", "ref": "R1", "value": "1k",
+             "pos": [10.0, 10.0], "angle": 0.0, "side": "top", "attr": "smd",
+             "fields": {"MPN": "RC0603", "Tol": "1%"},
+             "pads": [
+                 {"id": "p1", "number": "1", "pos": [-0.8, 0.0], "angle": 0.0,
+                  "shape": "roundrect", "size": [0.9, 0.95], "roundrect_ratio": 0.25,
+                  "type": "smd", "layers": ["F.Cu", "F.Mask", "F.Paste"], "drill": None,
+                  "net": "GND", "pin": "1"},
+                 {"id": "p2", "number": "2", "pos": [0.8, 0.0], "angle": 0.0,
+                  "shape": "roundrect", "size": [0.9, 0.95], "roundrect_ratio": 0.25,
+                  "type": "smd", "layers": ["F.Cu", "F.Mask", "F.Paste"], "drill": None,
+                  "net": "VCC", "pin": "2"},
+             ], "graphics": [], "model_3d": None, "linked_symbol": None},
+            {"id": "fp2", "fpid": "R_0603", "ref": "R2", "value": "1k",
+             "pos": [20.0, 12.0], "angle": 90.0, "side": "top", "attr": "smd",
+             "fields": {"MPN": "RC0603", "Tol": "1%"},
+             "pads": [
+                 {"id": "p3", "number": "1", "pos": [-0.8, 0.0], "angle": 0.0,
+                  "shape": "roundrect", "size": [0.9, 0.95], "roundrect_ratio": 0.25,
+                  "type": "smd", "layers": ["F.Cu", "F.Mask", "F.Paste"], "drill": None,
+                  "net": "GND", "pin": "1"},
+             ], "graphics": [], "model_3d": None, "linked_symbol": None},
+        ]
+        return b
+    run_fab("roundrect", _roundrect_board())
+
+    # 20c oval-drill G85 slot board (Excellon slot path) + an oval (O,) aperture
+    def _oval_board():
+        from engine.ecad.schema import new_board as _nb
+        b = _nb("Oval Board")
+        b["nets"] = [{"name": "GND", "class": "default"}]
+        b["footprints"] = [
+            {"id": "fp1", "fpid": "Conn", "ref": "J1", "value": "C",
+             "pos": [10.0, 10.0], "angle": 30.0, "side": "top", "attr": "tht",
+             "pads": [
+                 {"id": "p1", "number": "1", "pos": [0.0, 0.0], "angle": 0.0,
+                  "shape": "oval", "size": [2.0, 1.0], "type": "tht",
+                  "layers": ["F.Cu", "B.Cu", "F.Mask", "B.Mask"],
+                  "drill": {"diameter": 0.9, "shape": "oval", "offset": [0, 0]},
+                  "net": "GND", "pin": "1"},
+             ], "graphics": [], "model_3d": None, "linked_symbol": None},
+        ]
+        return b
+    run_fab("ovaldrill", _oval_board())
+
     print(f"\n[ecad-parity] {total - mism}/{total} steps at full parity")
     return mism
 

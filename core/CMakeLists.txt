@@ -124,6 +124,7 @@ add_library(aicad_ecad STATIC
   ecad/dfm.cpp
   ecad/impedance.cpp
   ecad/zonefill.cpp
+  ecad/fabformats.cpp
   ecad/session.cpp)
 target_include_directories(aicad_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_ecad PUBLIC nlohmann_json::nlohmann_json)

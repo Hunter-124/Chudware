@@ -45,6 +45,7 @@
 #include "agent/state.h"
 #include "doc/document.h"
 #include "doc/export2d.h"
+#include "doc/drawing_session.h"
 #include "doc/session.h"
 #include "doc/validate.h"
 #include "ecad/autoroute.h"
@@ -1361,6 +1362,92 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                                          params.value("format", std::string())),
                             out_json, 0);
             }
+            // --- STATEFUL DrawingSession lifecycle (engine/doc/drawing.py) -----
+            // A live drawing doc that projects a source part tree through the same
+            // HLR path on every fetch (associative). Mirrors the doc_* / ecad_*
+            // session registries: an OpError becomes a nonzero {code,message,detail}.
+            auto opt = [&](const char* k) -> json {
+                return params.contains(k) ? params[k] : json(nullptr);
+            };
+            if (m == "drawing_new") {
+                json src;
+                if (params.contains("source_doc")) src = params["source_doc"];
+                else if (params.contains("doc")) src = params["doc"];
+                else if (params.contains("features")) src = params;
+                else throw aicad::doc::OpError("invalid_op",
+                                               "drawing_new: params need a 'source_doc' (or 'doc')");
+                json env = params.contains("env") ? params["env"] : json::object();
+                return emit(aicad::doc::drawing_new(src, env, params.value("name", std::string())),
+                            out_json, 0);
+            }
+            if (m == "drawing_set_source") {
+                json src;
+                if (params.contains("source_doc")) src = params["source_doc"];
+                else if (params.contains("doc")) src = params["doc"];
+                else throw aicad::doc::OpError("invalid_op",
+                                               "drawing_set_source: params need a 'source_doc'");
+                json env = params.contains("env") ? params["env"] : json::object();
+                return emit(aicad::doc::drawing_set_source(params.value("doc_id", std::string()),
+                                                           src, env),
+                            out_json, 0);
+            }
+            if (m == "drawing_add_view")
+                return emit(aicad::doc::drawing_add_view(
+                                params.value("doc_id", std::string()),
+                                params.value("type", std::string()),
+                                params.value("orientation", std::string("front")),
+                                params.value("sheet_id", std::string()),
+                                opt("scale"), opt("position"), opt("show_hidden")),
+                            out_json, 0);
+            if (m == "drawing_add_section")
+                return emit(aicad::doc::drawing_add_section(
+                                params.value("doc_id", std::string()),
+                                params.value("parent_view_id", std::string()),
+                                opt("plane"), opt("cut_line"), opt("label"), opt("scale"),
+                                opt("position"), params.value("sheet_id", std::string()),
+                                opt("show_hidden")),
+                            out_json, 0);
+            if (m == "drawing_add_detail")
+                return emit(aicad::doc::drawing_add_detail(
+                                params.value("doc_id", std::string()),
+                                params.value("parent_view_id", std::string()),
+                                opt("center"),
+                                params.contains("radius") && params["radius"].is_number()
+                                    ? params["radius"].get<double>() : 0.0,
+                                opt("scale"), opt("label"), opt("position"),
+                                params.value("sheet_id", std::string()), opt("show_hidden")),
+                            out_json, 0);
+            if (m == "drawing_remove_view")
+                return emit(aicad::doc::drawing_remove_view(params.value("doc_id", std::string()),
+                                                            params.value("view_id", std::string())),
+                            out_json, 0);
+            if (m == "drawing_set_view")
+                return emit(aicad::doc::drawing_set_view(
+                                params.value("doc_id", std::string()),
+                                params.value("view_id", std::string()),
+                                opt("scale"), opt("position"), opt("orientation"),
+                                opt("show_hidden")),
+                            out_json, 0);
+            if (m == "drawing_add_dim")
+                return emit(aicad::doc::drawing_add_dim(
+                                params.value("doc_id", std::string()),
+                                params.value("view_id", std::string()),
+                                params.value("type", std::string("linear_dim")),
+                                opt("a"), opt("b"), opt("c"), opt("d"), opt("pos"), opt("text")),
+                            out_json, 0);
+            if (m == "drawing_remove_annotation")
+                return emit(aicad::doc::drawing_remove_annotation(
+                                params.value("doc_id", std::string()),
+                                params.value("view_id", std::string()),
+                                params.value("ann_id", std::string())),
+                            out_json, 0);
+            if (m == "drawing_get")
+                return emit(aicad::doc::drawing_get(params.value("doc_id", std::string())),
+                            out_json, 0);
+            if (m == "drawing_close")
+                return emit(json{{"closed", aicad::doc::drawing_close(
+                                                params.value("doc_id", std::string()))}},
+                            out_json, 0);
         } catch (const aicad::doc::OpError& oe) {
             // Structured error envelope (matches the Python worker's doc_* errors).
             return emit(oe.envelope(), out_json, 3);

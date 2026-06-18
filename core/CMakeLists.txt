@@ -438,7 +438,8 @@ if(AICAD_WITH_OCCT)
     doc/formats.cpp
     doc/dxf.cpp
     doc/pdfvec.cpp
-    doc/export2d.cpp)
+    doc/export2d.cpp
+    doc/drawing_session.cpp)
   target_include_directories(aicad_doc PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})

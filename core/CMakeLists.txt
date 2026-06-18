@@ -110,6 +110,18 @@ target_include_directories(aicad_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(aicad_sim PRIVATE ${spectra_SOURCE_DIR}/include)
 target_link_libraries(aicad_sim PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_json)
 
+# --- libaicad ecad (ECAD document model: schema + ops + session) -------------
+# C++ port of engine/ecad (schema.py + ops.py + session.py). OCCT-free — the
+# ECAD doc/ops layer is pure JSON (like aicad_sim) — so it builds in the
+# standalone config and stays fast + isolated. Netlist/ERC/DRC/autoroute/Gerber/
+# 3D are DEFERRED to later waves.
+add_library(aicad_ecad STATIC
+  ecad/schema.cpp
+  ecad/ops.cpp
+  ecad/session.cpp)
+target_include_directories(aicad_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_ecad PUBLIC nlohmann_json::nlohmann_json)
+
 add_executable(test_sim tests/test_sim.cpp)
 target_include_directories(test_sim PRIVATE ${doctest_SOURCE_DIR})
 target_link_libraries(test_sim PRIVATE aicad_sim)
@@ -502,7 +514,7 @@ if(AICAD_WITH_OCCT)
     api/libaicad.cpp)
   target_include_directories(aicad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_definitions(aicad PRIVATE AICAD_BUILD_DLL)
-  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim)
+  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad)
   set_target_properties(aicad PROPERTIES
     OUTPUT_NAME libaicad   # -> libaicad.dll + libaicad.lib (the host loads by this name)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

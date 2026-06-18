@@ -428,6 +428,43 @@ def fixtures():
                     "d1": {"value": 30.0, "expr": None}, "d2": {"value": 30.0, "expr": None}},
          "refs": {"faces": [gtop1, gtop2]}}]}
 
+    # ---- corner trim: two members meeting at an L-corner (miter / butt / cope) ----
+    # Two square-tube members sharing the vertex at the origin: one along +X (len 100),
+    # one along +Y (len 100). square_tube size=20 t=2 -> area 144, untrimmed each
+    # V=14400 (sum 28800). The trim removes the corner overlap so the oracle's TOTAL
+    # volume drops below 28800; the gate compares the C++ total volume to that exact
+    # oracle value (OCCT-version-independent: same kernel boolean both engines). Body
+    # count stays 2 (members are separate bodies). The no-trim case is the regression
+    # guard: trim_corners=False must keep the full 28800.
+    corner_e = [_line("e1", 0, 0, 100, 0), _line("e2", 0, 0, 0, 100)]
+    corner_c = [_rel("f1", "fix", ["e1.p2"]), _rel("f2", "fix", ["e2.p2"]),
+                _rel("f3", "coincident", ["e1.p1", "e2.p1"])]
+    out["weld_corner_notrim"] = {"features": [
+        _sketch("s1", "plane.top", corner_e, corner_c),
+        _weld_member("m1", "s1", "square_tube", {"size": 20.0, "thickness": 2.0},
+                     trim_corners=False)]}
+    # miter (default joint): both members cut by the bisecting mitre plane.
+    out["weld_corner_miter"] = {"features": [
+        _sketch("s1", "plane.top", corner_e, corner_c),
+        _weld_member("m1", "s1", "square_tube", {"size": 20.0, "thickness": 2.0},
+                     trim_corners=True)]}
+    # butt: the (equal-length -> first/longer) through member stays full, the other is
+    # square-cut against the through member's near face.
+    out["weld_corner_butt"] = {"features": [
+        _sketch("s1", "plane.top", corner_e, corner_c),
+        {"id": "m1", "type": "weld_member",
+         "params": {"profile": "square_tube", "justify": "center", "trim_corners": True,
+                    "joint": "butt", "size": 20.0, "thickness": 2.0},
+         "refs": {"sketch": "s1"}}]}
+    # cope: the trimmed member's end is cut to the through member's contour (boolean
+    # subtract of the through solid).
+    out["weld_corner_cope"] = {"features": [
+        _sketch("s1", "plane.top", corner_e, corner_c),
+        {"id": "m1", "type": "weld_member",
+         "params": {"profile": "square_tube", "justify": "center", "trim_corners": True,
+                    "joint": "cope", "size": 20.0, "thickness": 2.0},
+         "refs": {"sketch": "s1"}}]}
+
     # ---- split (engine/doc/features/split.py, planar tool path) ------------------
     # A 30x20x25 box (V=15000) split by a datum plane (plane.top offset 10). keep=both
     # -> TWO solids (the z[0,10] piece 6000 + the z[10,25] piece 9000, total 15000, the

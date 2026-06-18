@@ -37,7 +37,8 @@ namespace geom {
 // writes the analytic cross-section area to `area_out`.
 TopoDS_Face weld_profile_face(const std::string& profile, const nlohmann::json& params,
                               const std::string& justify, double angle,
-                              double& area_out, std::string& error);
+                              double& area_out, std::string& error,
+                              double* env_w_out = nullptr, double* env_h_out = nullptr);
 
 // True if `name` is a known library profile.
 bool weld_profile_known(const std::string& name);
@@ -50,6 +51,29 @@ TopoDS_Shape weld_sweep_member(const TopoDS_Face& face_local,
                                const TopoDS_Edge& path_edge,
                                const Eigen::Vector3d& start,
                                const Eigen::Vector3d& tangent);
+
+// ---- corner trim (weldment.py _mitre_trim / _butt_cope_trim) ---------------
+// One structural member as the trim sees it: the swept solid plus the straight
+// axis geometry the oracle stores on each member dict.
+struct WeldMember {
+    TopoDS_Shape solid;        // mutated in place by the trim
+    Eigen::Vector3d start;     // world-space segment start
+    Eigen::Vector3d end;       // world-space segment end
+    Eigen::Vector3d t_start;   // unit tangent at start (into the member)
+    Eigen::Vector3d t_end;     // unit tangent at end
+    double length = 0.0;
+    bool straight = true;      // a line member (only lines are trimmed)
+    double env_w = 0.0;        // section bounding-box envelope (w, h)
+    double env_h = 0.0;
+};
+
+// Trim members that meet at a joint, mutating each member's `solid` in place.
+// `joint` ∈ "miter" | "butt" | "cope" (mirrors the oracle's three Trim/Extend
+// modes); `reach` sizes the half-space cut box (oracle uses max_len*4). Best
+// effort: a kernel hiccup leaves the offending member untouched, exactly like
+// the oracle's contained try/except. No-op for <2 members.
+void weld_corner_trim(std::vector<WeldMember>& members, double reach,
+                      const std::string& joint);
 
 // ---- gusset plate (weldment.py weld_gusset) --------------------------------
 // Closest point between two infinite lines L1=(p1+s*d1), L2=(p2+t*d2) — the

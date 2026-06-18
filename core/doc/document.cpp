@@ -2343,11 +2343,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // SEPARATE body per segment (an assembly of members). Port of
                 // engine/doc/features/weldment.py::compile_weld_member.
                 //
-                // PARITY NOTE: corner trimming (miter/butt/cope) is NOT ported — the
-                // C++ fixtures use members that do not share a vertex (or a single
-                // member), so trim_corners is a no-op and each member's volume is the
-                // exact swept prism area*length. A trimmed-corner fixture would need
-                // the boolean half-space / cope ops ported; flagged out-of-scope here.
+                // Corner trimming (miter/butt/cope) is ported: where straight members
+                // meet at a shared vertex or a T-joint they are trimmed to match the
+                // oracle (see ::geom::weld_corner_trim). trim_corners=false leaves each
+                // member's volume the exact swept prism area*length.
                 const std::string profile = feat.value("profile", std::string("square_tube"));
                 if (!::geom::weld_profile_known(profile))
                     throw std::runtime_error("weld_member: unknown profile '" + profile + "'");
@@ -2356,6 +2355,11 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     throw std::runtime_error("weld_member: unknown justify '" + justify + "'");
                 const double angle = feat.contains("angle") && !feat.at("angle").is_null()
                     ? num_or_expr(feat.at("angle"), env) : 0.0;
+                const bool trim_corners = feat.value("trim_corners", true);
+                const std::string joint = feat.value("joint", std::string("miter"));
+                if (joint != "miter" && joint != "butt" && joint != "cope")
+                    throw std::runtime_error("weld_member: unknown joint '" + joint +
+                                             "' (miter|butt|cope)");
 
                 // The source sketch (its raw segments become the member paths).
                 const std::string sid = req_str(feat, "sketch");
@@ -2371,17 +2375,17 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 }
 
                 // Build the profile face once (local frame); reused per segment.
-                double area = 0.0;
+                double area = 0.0, env_w = 0.0, env_h = 0.0;
                 std::string perr;
                 TopoDS_Face face_local = ::geom::weld_profile_face(
-                    profile, feat, justify, angle, area, perr);
+                    profile, feat, justify, angle, area, perr, &env_w, &env_h);
                 if (face_local.IsNull())
                     throw std::runtime_error("weld_member: " + perr);
 
                 // Resolve (entity_id, world-space line edge) pairs to sweep along.
                 // Only straight LINE segments are swept (the ported subset); a closed
                 // or construction entity is skipped, exactly like the oracle.
-                struct Seg { std::string eid; TopoDS_Edge edge; Eigen::Vector3d start, tangent; };
+                struct Seg { std::string eid; TopoDS_Edge edge; Eigen::Vector3d start, end, tangent; };
                 std::vector<Seg> segs;
                 const json& ents = src.entities;
                 if (ents.is_object()) {
@@ -2404,6 +2408,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         sg.eid = eid;
                         sg.edge = me.Edge();
                         sg.start = wa;
+                        sg.end = wb;
                         sg.tangent = (wb - wa).normalized();
                         segs.push_back(std::move(sg));
                     }
@@ -2411,10 +2416,12 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (segs.empty())
                     throw std::runtime_error("weld_member: sketch has no usable segments to sweep along");
 
-                // One SEPARATE surviving body per member. Store each under a synthetic
-                // id (feature_id#k) so the surviving-body set + count + total volume
-                // match the oracle (which appends each member to ctx.bodies).
-                int k = 0;
+                // Sweep one member solid per segment, carrying the straight-axis
+                // geometry the corner trim needs (mirrors weldment.py building the
+                // `members` dicts before _mitre_trim / _butt_cope_trim).
+                std::vector<::geom::WeldMember> members;
+                members.reserve(segs.size());
+                double max_len = 1.0;
                 for (const Seg& sg : segs) {
                     TopoDS_Shape member =
                         ::geom::weld_sweep_member(face_local, sg.edge, sg.start, sg.tangent);
@@ -2424,8 +2431,38 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     BRepGProp::VolumeProperties(member, gm);
                     if (gm.Mass() <= 1e-9)
                         throw std::runtime_error("weld_member: produced an empty member solid");
+                    ::geom::WeldMember wm;
+                    wm.solid = member;
+                    wm.start = sg.start;
+                    wm.end = sg.end;
+                    // A line member: start/end tangents are the segment direction.
+                    wm.t_start = sg.tangent;
+                    wm.t_end = sg.tangent;
+                    wm.length = (sg.end - sg.start).norm();
+                    wm.straight = true;  // only line segments are swept here
+                    wm.env_w = env_w;
+                    wm.env_h = env_h;
+                    max_len = std::max(max_len, wm.length);
+                    members.push_back(std::move(wm));
+                }
+
+                // Trim shared corners / joints (best-effort; never fails the feature).
+                // reach = max_len*4 matches the oracle's half-space sizing.
+                if (trim_corners && members.size() > 1) {
+                    try {
+                        ::geom::weld_corner_trim(members, max_len * 4.0, joint);
+                    } catch (...) {
+                        // leave members untrimmed on any trim error (oracle parity)
+                    }
+                }
+
+                // One SEPARATE surviving body per member. Store each under a synthetic
+                // id (feature_id#k) so the surviving-body set + count + total volume
+                // match the oracle (which appends each member to ctx.bodies).
+                int k = 0;
+                for (::geom::WeldMember& wm : members) {
                     std::string mid = id + "#" + std::to_string(k++);
-                    results[mid] = SolidResult{member};
+                    results[mid] = SolidResult{wm.solid};
                     solid_order.push_back(mid);
                 }
                 st.ok = true;

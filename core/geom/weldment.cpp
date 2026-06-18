@@ -6,6 +6,8 @@
 // the oracle EXACTLY so the resulting BRep volume matches the differential gate.
 #include "geom/weldment.h"
 
+#include "geom/booleans.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -20,6 +22,7 @@
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepGProp.hxx>
 #include <BRepOffsetAPI_MakePipe.hxx>
+#include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepTools.hxx>
 #include <GProp_GProps.hxx>
@@ -209,7 +212,8 @@ bool weld_profile_known(const std::string& name) {
 
 TopoDS_Face weld_profile_face(const std::string& profile, const nlohmann::json& params,
                               const std::string& justify, double angle,
-                              double& area_out, std::string& error) {
+                              double& area_out, std::string& error,
+                              double* env_w_out, double* env_h_out) {
     TopoDS_Face f;
     double area = 0.0, ew = 0.0, eh = 0.0;
     bool ok = false;
@@ -237,6 +241,8 @@ TopoDS_Face weld_profile_face(const std::string& profile, const nlohmann::json& 
         f = TopoDS::Face(BRepBuilderAPI_Transform(f, tr, true).Shape());
     }
     area_out = area;
+    if (env_w_out) *env_w_out = ew;
+    if (env_h_out) *env_h_out = eh;
     return f;
 }
 
@@ -268,6 +274,238 @@ TopoDS_Shape weld_sweep_member(const TopoDS_Face& face_local,
     mk.Build();
     if (!mk.IsDone()) return TopoDS_Shape();
     return mk.Shape();
+}
+
+namespace {
+
+// Volume of a shape (0 on null) — used by the trim's "would erase the member"
+// guard, mirroring the oracle's getattr(result,'volume',0) <= 1e-9 check.
+double shape_volume(const TopoDS_Shape& s) {
+    if (s.IsNull()) return 0.0;
+    GProp_GProps g;
+    BRepGProp::VolumeProperties(s, g);
+    return g.Mass();
+}
+
+// A large box whose near face passes through `point` with outward `normal`: the
+// SOLID on the +normal side. Subtracting it removes everything past the plane.
+// Mirrors weldment.py::_half_space (make_box(2r,2r,2r).translate(-r,-r,0) placed
+// so its -Z face is on the plane and the body extends +n). Built directly in the
+// plane frame (corner at origin - u*r - v*r, axes u,v,n) — identical span:
+// u,v∈[-r,r], n∈[0,2r].
+TopoDS_Shape half_space_solid(const Eigen::Vector3d& point,
+                              const Eigen::Vector3d& normal, double reach) {
+    Eigen::Vector3d n = normal.normalized();
+    // Pick any unit u ⟂ n, then v = n × u (orthonormal frame; box is symmetric in
+    // u,v so the exact choice is irrelevant to the cut result).
+    Eigen::Vector3d ref = std::abs(n.dot(Eigen::Vector3d(1, 0, 0))) > 0.9
+                              ? Eigen::Vector3d(0, 1, 0)
+                              : Eigen::Vector3d(1, 0, 0);
+    Eigen::Vector3d u = (ref - n * ref.dot(n)).normalized();
+    Eigen::Vector3d v = n.cross(u);
+    Eigen::Vector3d corner = point - u * reach - v * reach;
+    gp_Ax2 frame(gp_Pnt(corner.x(), corner.y(), corner.z()),
+                 gp_Dir(n.x(), n.y(), n.z()), gp_Dir(u.x(), u.y(), u.z()));
+    return BRepPrimAPI_MakeBox(frame, 2 * reach, 2 * reach, 2 * reach).Shape();
+}
+
+// Subtract the half-space (point, outward-normal) from `solid`. On any hiccup, or
+// if the cut would erase the member, return `solid` unchanged (oracle
+// _subtract_halfspace: trim is best-effort, never fails the feature).
+TopoDS_Shape subtract_halfspace(const TopoDS_Shape& solid, const Eigen::Vector3d& point,
+                                const Eigen::Vector3d& outward, double reach) {
+    TopoDS_Shape hs = half_space_solid(point, outward, reach);
+    if (hs.IsNull()) return solid;
+    TopoDS_Shape result = ::geom::cut(solid, hs);
+    if (result.IsNull() || shape_volume(result) <= 1e-9) return solid;
+    return result;
+}
+
+inline bool near_pt(const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
+    return (a - b).norm() < 1e-4;
+}
+
+// If members i and j share an endpoint, return true and the (vertex, outgoing
+// tangent into i, outgoing tangent into j). Mirrors _shared_vertex_tangents.
+bool shared_vertex_tangents(const WeldMember& mi, const WeldMember& mj,
+                            Eigen::Vector3d& vtx, Eigen::Vector3d& ti, Eigen::Vector3d& tj) {
+    struct Cand { Eigen::Vector3d vi, tin_i, vj, tin_j; };
+    const Cand cands[4] = {
+        {mi.start, mi.t_start, mj.start, mj.t_start},
+        {mi.start, mi.t_start, mj.end, -mj.t_end},
+        {mi.end, -mi.t_end, mj.start, mj.t_start},
+        {mi.end, -mi.t_end, mj.end, -mj.t_end},
+    };
+    for (const Cand& c : cands) {
+        if (near_pt(c.vi, c.vj)) {
+            vtx = c.vi; ti = c.tin_i; tj = c.tin_j;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Is `pt` on member m's straight axis interior (foot strictly between ends)?
+// Mirrors _point_on_axis (perp<1e-4, 0.02<t<0.98).
+bool point_on_axis_interior(const WeldMember& m, const Eigen::Vector3d& pt) {
+    Eigen::Vector3d ab = m.end - m.start;
+    double L = ab.norm();
+    if (L < 1e-9) return false;
+    double t = std::max(0.0, std::min(1.0, (pt - m.start).dot(ab) / (L * L)));
+    Eigen::Vector3d foot = m.start + ab * t;
+    double perp = (pt - foot).norm();
+    return perp < 1e-4 && (0.02 < t && t < 0.98);
+}
+
+// Distance from the through member's axis to its outer surface along `approach`
+// (oracle _through_half_extent: conservative half-diagonal of the envelope).
+double through_half_extent(const WeldMember& through, const Eigen::Vector3d& approach) {
+    double w = through.env_w, h = through.env_h;
+    if (w <= 0.0 && h <= 0.0) return 0.0;
+    Eigen::Vector3d taxis = through.end - through.start;
+    if (taxis.norm() < 1e-9) return std::max(w, h) / 2.0;
+    taxis.normalize();
+    Eigen::Vector3d perp = approach - taxis * approach.dot(taxis);
+    if (perp.norm() < 1e-9) return std::max(w, h) / 2.0;
+    return 0.5 * std::hypot(w, h);
+}
+
+// --- miter (mutual bevel at a shared vertex), oracle _mitre_trim ---
+void mitre_trim(std::vector<WeldMember>& members, double reach) {
+    constexpr double EPS = 1e-6;
+    const std::size_t n = members.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!members[i].straight) continue;
+        for (std::size_t j = i + 1; j < n; ++j) {
+            if (!members[j].straight) continue;
+            Eigen::Vector3d shared, ti, tj;
+            if (!shared_vertex_tangents(members[i], members[j], shared, ti, tj)) continue;
+            ti.normalize();
+            tj.normalize();
+            double cosang = std::max(-1.0, std::min(1.0, ti.dot(tj)));
+            double ang = std::acos(cosang) * 180.0 / PI;
+            if (ang > 179.0 || ang < 1.0) continue;  // near-collinear / overlapping
+            Eigen::Vector3d bis = ti + tj;
+            if (bis.norm() < 1e-9) continue;
+            // Remove the side toward the OTHER member's tangent from each.
+            Eigen::Vector3d ni = tj - ti;  // points from i's side toward j's side
+            Eigen::Vector3d nj = ti - tj;
+            if (ni.norm() > EPS)
+                members[i].solid = subtract_halfspace(members[i].solid, shared, ni, reach);
+            if (nj.norm() > EPS)
+                members[j].solid = subtract_halfspace(members[j].solid, shared, nj, reach);
+        }
+    }
+}
+
+// Classify a joint: returns true and fills (through_idx, trimmed_idx, joint).
+// Mirrors _through_trimmed (T-joint: endpoint on other's interior; else shared
+// vertex with the longer member running through).
+bool through_trimmed(const std::vector<WeldMember>& members, std::size_t i, std::size_t j,
+                     std::size_t& through, std::size_t& trimmed, Eigen::Vector3d& joint) {
+    const WeldMember& mi = members[i];
+    const WeldMember& mj = members[j];
+    // End-to-mid: does one member's endpoint land on the OTHER's interior span?
+    const std::pair<std::size_t, std::size_t> pairs[2] = {{i, j}, {j, i}};
+    for (auto [ei, si] : pairs) {
+        const WeldMember& ender = members[ei];
+        const WeldMember& spanner = members[si];
+        for (const Eigen::Vector3d& ep : {ender.start, ender.end}) {
+            if (point_on_axis_interior(spanner, ep)) {
+                through = si; trimmed = ei; joint = ep;
+                return true;
+            }
+        }
+    }
+    // Shared endpoint: the longer member runs through, the shorter is trimmed.
+    Eigen::Vector3d shared, ti, tj;
+    if (shared_vertex_tangents(mi, mj, shared, ti, tj)) {
+        if (mi.length >= mj.length) { through = i; trimmed = j; }
+        else { through = j; trimmed = i; }
+        joint = shared;
+        return true;
+    }
+    return false;
+}
+
+// Square-cut the trimmed member against the through member's near face
+// (oracle _butt_cut).
+TopoDS_Shape butt_cut(const WeldMember& trimmed, const WeldMember& through,
+                      const Eigen::Vector3d& joint, double reach) {
+    Eigen::Vector3d axis = trimmed.end - trimmed.start;
+    if (axis.norm() < 1e-9) return trimmed.solid;
+    axis.normalize();
+    Eigen::Vector3d far_end =
+        (trimmed.end - joint).norm() < (trimmed.start - joint).norm() ? trimmed.start
+                                                                      : trimmed.end;
+    Eigen::Vector3d into = joint - far_end;
+    if (into.dot(axis) < 0) axis = -axis;
+    double half = through_half_extent(through, axis);
+    Eigen::Vector3d cut_at = joint - axis * half;
+    return subtract_halfspace(trimmed.solid, cut_at, axis, reach);
+}
+
+// Cope (fish-mouth): boolean-subtract the through member's ORIGINAL solid
+// (oracle _cope_cut, keeping the largest piece on a split).
+TopoDS_Shape cope_cut(const WeldMember& trimmed, const TopoDS_Shape& through_solid) {
+    TopoDS_Shape result = ::geom::cut(trimmed.solid, through_solid);
+    if (result.IsNull()) return trimmed.solid;
+    // A cut can split the member; keep the largest solid piece.
+    std::vector<TopoDS_Shape> solids;
+    for (TopExp_Explorer ex(result, TopAbs_SOLID); ex.More(); ex.Next())
+        solids.push_back(ex.Current());
+    if (solids.size() > 1) {
+        TopoDS_Shape best = solids.front();
+        double bestv = shape_volume(best);
+        for (const TopoDS_Shape& s : solids) {
+            double v = shape_volume(s);
+            if (v > bestv) { bestv = v; best = s; }
+        }
+        result = best;
+    }
+    if (shape_volume(result) <= 1e-9) return trimmed.solid;
+    return result;
+}
+
+// --- butt / cope, oracle _butt_cope_trim ---
+void butt_cope_trim(std::vector<WeldMember>& members, double reach, const std::string& mode) {
+    constexpr double EPS = 1e-6;
+    // Snapshot original solids so cope subtraction is independent of trim order.
+    std::vector<TopoDS_Shape> orig;
+    orig.reserve(members.size());
+    for (const WeldMember& m : members) orig.push_back(m.solid);
+
+    const std::size_t n = members.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!members[i].straight) continue;
+        for (std::size_t j = i + 1; j < n; ++j) {
+            if (!members[j].straight) continue;
+            std::size_t through_i, trimmed_i;
+            Eigen::Vector3d joint;
+            if (!through_trimmed(members, i, j, through_i, trimmed_i, joint)) continue;
+            Eigen::Vector3d ta = members[through_i].end - members[through_i].start;
+            Eigen::Vector3d tb = members[trimmed_i].end - members[trimmed_i].start;
+            if (ta.norm() < EPS || tb.norm() < EPS) continue;
+            double cosang = std::abs(ta.normalized().dot(tb.normalized()));
+            if (cosang > 0.999) continue;  // near-collinear
+            if (mode == "cope")
+                members[trimmed_i].solid = cope_cut(members[trimmed_i], orig[through_i]);
+            else
+                members[trimmed_i].solid =
+                    butt_cut(members[trimmed_i], members[through_i], joint, reach);
+        }
+    }
+}
+
+}  // namespace
+
+void weld_corner_trim(std::vector<WeldMember>& members, double reach,
+                      const std::string& joint) {
+    if (members.size() < 2) return;
+    if (joint == "miter")
+        mitre_trim(members, reach);
+    else
+        butt_cope_trim(members, reach, joint);
 }
 
 Eigen::Vector3d weld_closest_point_between_lines(const Eigen::Vector3d& p1,

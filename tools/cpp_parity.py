@@ -732,6 +732,61 @@ def fixtures():
          "refs": {"points": [_datum("pa"), _datum("pb"), _datum("pc")]}},
         _sketch("s1", "pl", dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]}
 
+    # ====================================================================
+    # P55p: the last datum sub-cases that need OCCT surface-projection /
+    # curve-tangent. plane.on_surface (z_dir = surface normal at a projected
+    # point), plane.normal_to_curve (z_dir = curve tangent at a landing point),
+    # axis.on_surface (a face's revolve axis / planar normal, OR a 2-point line).
+    # Each is consumed by a plane->boss (or angle-hinge) consumer so the resolved
+    # datum origin/normal/direction is gated by the boss's volume + body count
+    # (OCCT-version-independent), the established datum-parity bar above.
+    # ====================================================================
+
+    # ---- datum plane via plane.on_surface on the TOP planar face (z=20): the
+    # tangent plane IS that z=20 plane (origin = projected point, normal = +Z).
+    # A 20x20 boss extruded 5 on it (V=2000) gates the surface projection + normal.
+    # 2 bodies, total 26000.
+    out["datum_plane_on_surface"] = {"features": _sel_datum_base() + [
+        {"id": "pl", "type": "plane", "params": {"method": "on_surface"},
+         "refs": {"base": sd_top}},
+        _sketch("s1", "pl", dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]}
+
+    # ---- datum plane via plane.normal_to_curve on the picked bottom +X edge: the
+    # plane's normal is the edge tangent (+X), its origin the curve landing point
+    # (the edge midpoint [20,0,0]). A 20x20 boss extruded 5 on that plane (V=2000)
+    # is invariant to the in-plane frame; the SAME curve-tangent on both engines is
+    # the gate (point + tangent via BRepAdaptor_Curve D1). 2 bodies, total 26000.
+    out["datum_plane_normal_to_curve"] = {"features": _sel_datum_base() + [
+        {"id": "pl", "type": "plane", "params": {"method": "normal_to_curve"},
+         "refs": {"second": sd_edge}},
+        _sketch("s1", "pl", dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]}
+
+    # ---- datum axis via axis.on_surface on the TOP planar face: the axis is the
+    # surface normal (+Z) through the face area centroid [20,15,20]. Routed as the
+    # hinge of an angle plane (tilt plane.front 45 about the +Z axis) -> a 20x20
+    # boss (V=2000), the proven axis-datum consumer path. Gates the planar-face
+    # normal axis (direction + location). 2 bodies, total 26000.
+    out["datum_axis_on_surface_face"] = {"features": _sel_datum_base() + [
+        {"id": "ax", "type": "axis", "params": {"method": "on_surface"},
+         "refs": {"a": sd_top}},
+        {"id": "pl", "type": "plane",
+         "params": {"method": "angle", "angle": {"value": 45.0, "expr": None}},
+         "refs": {"base": "plane.front", "second": _datum("ax")}},
+        _sketch("s1", "pl", dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]}
+
+    # ---- datum axis via axis.on_surface TWO-POINT form: two point datums (picked
+    # corners (0,0,0) and (40,0,0)) -> a line along +X at the origin. Routed as the
+    # hinge of an angle plane (tilt plane.top 30 about it) -> a 20x20 boss (V=2000).
+    # Gates the two-point on-surface axis (direction + location). 2 bodies, 26000.
+    out["datum_axis_on_surface_points"] = {"features": _sel_datum_base() + [
+        _point_vertex("pa", sd_v0), _point_vertex("pb", sd_v1),
+        {"id": "ax", "type": "axis", "params": {"method": "on_surface"},
+         "refs": {"a": _datum("pa"), "b": _datum("pb")}},
+        {"id": "pl", "type": "plane",
+         "params": {"method": "angle", "angle": {"value": 30.0, "expr": None}},
+         "refs": {"base": "plane.top", "second": _datum("ax")}},
+        _sketch("s1", "pl", dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]}
+
     # ---- curve: constant-pitch helix consumed as a sweep path ----------------------
     # A circle (r=2) on plane.top swept along a helix (pitch 5, height 20, radius 10)
     # -> a coiled tube. The C++ helix replicates build123d Edge.make_helix exactly

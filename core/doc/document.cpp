@@ -63,6 +63,10 @@
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
 #include <Geom_Surface.hxx>
+#include <Geom_Curve.hxx>
+#include <GeomAPI_ProjectPointOnSurf.hxx>
+#include <GeomAPI_ProjectPointOnCurve.hxx>
+#include <GeomLProp_SLProps.hxx>
 
 #include "doc/formats.h"  // import_bodies / detect_format (the import feature)
 #include "doc/picks.h"
@@ -730,6 +734,84 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         return {Eigen::Vector3d(loc.X(), loc.Y(), loc.Z()),
                 Eigen::Vector3d(dr.X(), dr.Y(), dr.Z())};
     };
+    // (point, unit tangent) on a model edge's underlying curve — datum.py
+    // ::_curve_point_tangent. Landing on the curve (first non-null wins): a raw curve
+    // parameter (clamped to the edge range), a 0..1 fraction along that range, or the
+    // nearest foot of a 3-D point projected onto the curve. Uses BRepAdaptor_Curve D1
+    // (point + first derivative); falls back to a chord toward the far end when the
+    // derivative is degenerate. Throws on a fully degenerate tangent.
+    auto curve_point_tangent =
+        [](const TopoDS_Edge& edge, std::optional<double> fraction,
+           std::optional<double> param, std::optional<Eigen::Vector3d> near_pt,
+           const char* slot) -> std::pair<Eigen::Vector3d, Eigen::Vector3d> {
+        BRepAdaptor_Curve ad(edge);
+        const double u0 = ad.FirstParameter();
+        const double u1 = ad.LastParameter();
+        double u;
+        if (param) {
+            u = std::max(u0, std::min(u1, *param));
+        } else if (near_pt) {
+            u = 0.5 * (u0 + u1);
+            try {
+                Handle(Geom_Curve) geom = ad.Curve().Curve();
+                if (!geom.IsNull()) {
+                    GeomAPI_ProjectPointOnCurve proj(
+                        gp_Pnt(near_pt->x(), near_pt->y(), near_pt->z()), geom);
+                    if (proj.NbPoints() > 0) u = proj.LowerDistanceParameter();
+                }
+            } catch (...) { /* keep midpoint fallback */ }
+            u = std::max(u0, std::min(u1, u));
+        } else {
+            double fr = fraction ? *fraction : 0.5;
+            fr = std::max(0.0, std::min(1.0, fr));
+            u = u0 + fr * (u1 - u0);
+        }
+        gp_Pnt p;
+        gp_Vec dv;
+        ad.D1(u, p, dv);
+        Eigen::Vector3d point(p.X(), p.Y(), p.Z());
+        Eigen::Vector3d tangent(dv.X(), dv.Y(), dv.Z());
+        if (tangent.norm() < 1e-9) {
+            gp_Pnt far_pt = ad.Value(std::abs(u - u0) < std::abs(u - u1) ? u1 : u0);
+            tangent = Eigen::Vector3d(far_pt.X() - point.x(), far_pt.Y() - point.y(),
+                                      far_pt.Z() - point.z());
+        }
+        if (tangent.norm() < 1e-9)
+            throw std::runtime_error(std::string(slot) +
+                ": cannot evaluate a curve tangent (degenerate curve)");
+        return {point, tangent.normalized()};
+    };
+    // (surface point, unit outward normal) on a face nearest `near` — datum.py
+    // ::_surface_point_normal. Projects `near` onto the face's Geom_Surface
+    // (GeomAPI_ProjectPointOnSurf), evaluates the normal at the projected UV via
+    // GeomLProp_SLProps, then flips it to agree with the face's stored orientation
+    // (a reversed face still yields its true outward normal). For a planar face this
+    // is the constant plane normal regardless of `near`.
+    auto surface_point_normal =
+        [](const TopoDS_Face& face, const Eigen::Vector3d& near_pt, const char* slot)
+        -> std::pair<Eigen::Vector3d, Eigen::Vector3d> {
+        Handle(Geom_Surface) surf = BRep_Tool::Surface(face);
+        if (surf.IsNull())
+            throw std::runtime_error(std::string(slot) + ": face has no surface");
+        GeomAPI_ProjectPointOnSurf proj(gp_Pnt(near_pt.x(), near_pt.y(), near_pt.z()), surf);
+        if (!proj.IsDone() || proj.NbPoints() < 1)
+            throw std::runtime_error(std::string(slot) +
+                ": could not project the point onto the surface");
+        Standard_Real u, v;
+        proj.LowerDistanceParameters(u, v);
+        gp_Pnt sp = proj.NearestPoint();
+        Eigen::Vector3d point(sp.X(), sp.Y(), sp.Z());
+        GeomLProp_SLProps sl(surf, u, v, 1, 1e-7);
+        if (!sl.IsNormalDefined())
+            throw std::runtime_error(std::string(slot) +
+                ": surface normal is undefined at the projected point");
+        gp_Dir n = sl.Normal();
+        Eigen::Vector3d normal(n.X(), n.Y(), n.Z());
+        if (normal.norm() < 1e-9)
+            throw std::runtime_error(std::string(slot) + ": degenerate surface normal");
+        if (face.Orientation() == TopAbs_REVERSED) normal = -normal;
+        return {point, normal.normalized()};
+    };
     // A planar face -> (origin, outward normal), respecting the face orientation, so a
     // datum plane can be built on it. Mirrors datum.py::_plane_of's Plane(face) path:
     // build123d uses the face centroid as the plane origin + the orientation-aware
@@ -858,9 +940,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // base plane — datum or face — about a datum-axis OR picked-edge hinge),
                 // three_point (through three point datums OR picked vertices),
                 // parallel_point (base datum/face orientation through a point datum or
-                // picked vertex). on_surface / normal_to_curve remain deferred (they need
-                // surface-projection / curve-tangent evaluation). Stores a SketchPlane
-                // keyed by id; a downstream sketch+extrude gates it.
+                // picked vertex), normal_to_curve (z_dir = a curve tangent at a landing
+                // point, via D1 / curve-projection), on_surface (z_dir = a surface normal
+                // at a projected point, via GeomAPI_ProjectPointOnSurf + GeomLProp_SLProps).
+                // Stores a SketchPlane keyed by id; a downstream sketch+extrude gates it.
                 const std::string method = feat.value("method", std::string("offset"));
 
                 if (method == "offset") {
@@ -953,6 +1036,64 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     p.origin = thru;
                     results[id] = PlaneResult{p};
 
+                } else if (method == "normal_to_curve") {
+                    // A plane whose NORMAL is the tangent of a curve at a landing point
+                    // (datum.py normal_to_curve). The curve is refs.second: a datum axis
+                    // (origin/dir straight from the axis, optionally re-origined to
+                    // refs.points[0]) OR a picked model edge (point+tangent via D1, landed
+                    // by points[0] projected onto the curve / params.fraction / params.t).
+                    if (!feat.contains("second"))
+                        throw std::runtime_error(
+                            "plane normal_to_curve: refs.second (the curve edge) is required");
+                    const json& cref = feat.at("second");
+                    Eigen::Vector3d origin, normal;
+                    auto pit = feat.find("points");
+                    const bool have_pt =
+                        pit != feat.end() && pit->is_array() && !pit->empty();
+                    if (is_datum_ref(cref)) {
+                        auto ax = resolve_axis_ref(cref);
+                        if (!ax)
+                            throw std::runtime_error(
+                                "plane normal_to_curve: datum curve must be an axis");
+                        origin = ax->first;
+                        normal = ax->second;
+                        if (have_pt) origin = vertex_point((*pit)[0], "points[0]");
+                    } else {
+                        TopoDS_Edge edge = resolve_edge_sel(cref, "second");
+                        std::optional<Eigen::Vector3d> near_pt;
+                        if (have_pt) near_pt = vertex_point((*pit)[0], "points[0]");
+                        std::optional<double> fraction;
+                        if (feat.contains("fraction"))
+                            fraction = num_or_expr(feat.at("fraction"), env);
+                        std::optional<double> param;
+                        if (feat.contains("t")) param = num_or_expr(feat.at("t"), env);
+                        std::tie(origin, normal) =
+                            curve_point_tangent(edge, fraction, param, near_pt, "second");
+                    }
+                    results[id] = PlaneResult{aicad::geom::SketchPlane::from(origin, normal)};
+
+                } else if (method == "on_surface") {
+                    // A plane TANGENT to a surface at a point: z_dir = the surface normal at
+                    // the projected point, origin = that surface point (datum.py on_surface).
+                    // refs.base is the face; refs.points[0] is the point to project (defaults
+                    // to the face area centroid).
+                    if (!feat.contains("base") || is_datum_ref(feat.at("base")))
+                        throw std::runtime_error(
+                            "plane on_surface: refs.base (a surface face) is required");
+                    TopoDS_Face face = resolve_face_sel(feat.at("base"), "base");
+                    Eigen::Vector3d near_pt;
+                    auto pit = feat.find("points");
+                    if (pit != feat.end() && pit->is_array() && !pit->empty()) {
+                        near_pt = vertex_point((*pit)[0], "points[0]");
+                    } else {
+                        GProp_GProps props;
+                        BRepGProp::SurfaceProperties(face, props);
+                        gp_Pnt cm = props.CentreOfMass();
+                        near_pt = Eigen::Vector3d(cm.X(), cm.Y(), cm.Z());
+                    }
+                    auto [origin, normal] = surface_point_normal(face, near_pt, "base");
+                    results[id] = PlaneResult{aicad::geom::SketchPlane::from(origin, normal)};
+
                 } else {
                     throw std::runtime_error("plane: method '" + method + "' not supported");
                 }
@@ -963,8 +1104,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // two_points (line through two point datums OR picked vertices), cylinder
                 // (a picked cylindrical/conical face's revolve axis OR a datum-axis pass-
                 // through), edge (a picked straight model edge OR a datum-axis pass-
-                // through), plane_intersect (the line shared by two planar datums/faces).
-                // Stores an AxisResult; a downstream revolve about this axis gates it.
+                // through), plane_intersect (the line shared by two planar datums/faces),
+                // on_surface (a face's revolve axis / planar normal, OR the line through
+                // two on-surface points). Stores an AxisResult; a downstream revolve about
+                // this axis gates it.
                 const std::string method = feat.value("method", std::string("two_points"));
                 if (method == "two_points") {
                     Eigen::Vector3d a = vertex_point(feat.at("a"), "a");
@@ -1012,9 +1155,78 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     Eigen::Vector3d rhs(na.dot(pa.origin), nb.dot(pb.origin), 0.0);
                     Eigen::Vector3d pt = A.fullPivLu().solve(rhs);
                     results[id] = AxisResult{pt, dir.normalized()};
+                } else if (method == "on_surface") {
+                    // An axis derived from a surface (datum.py axis on_surface). Two forms:
+                    //   * two-point — refs.a is a point/vertex datum (or refs.b is present):
+                    //     the axis is the line through the two on-surface points.
+                    //   * face — refs.a is a face: a cylinder/cone gives its revolve axis
+                    //     through the face axis location; a planar face gives its normal
+                    //     through the face area centroid.
+                    if (!feat.contains("a"))
+                        throw std::runtime_error(
+                            "axis on_surface: refs.a (a surface face, or a point with refs.b) "
+                            "is required");
+                    const json& aref = feat.at("a");
+                    const bool has_b = feat.contains("b");
+                    bool a_is_point;
+                    if (is_datum_ref(aref)) {
+                        // a point datum resolves; an axis/plane datum does not.
+                        std::string fid;
+                        if (aref.is_string()) fid = aref.get<std::string>();
+                        else if (aref.is_object() && aref.contains("feature") &&
+                                 aref["feature"].is_string())
+                            fid = aref["feature"].get<std::string>();
+                        a_is_point = (fid == "origin");
+                        if (!a_is_point && !fid.empty()) {
+                            auto it = results.find(fid);
+                            a_is_point = it != results.end() &&
+                                std::holds_alternative<PointResult>(it->second);
+                        }
+                    } else {
+                        a_is_point = aref.is_object() &&
+                            aref.value("kind", std::string()) == "vertex";
+                    }
+                    if (a_is_point || has_b) {
+                        Eigen::Vector3d pa = vertex_point(aref, "a");
+                        if (!has_b)
+                            throw std::runtime_error(
+                                "axis on_surface: a point ref.a needs refs.b (a second point)");
+                        Eigen::Vector3d pb = vertex_point(feat.at("b"), "b");
+                        Eigen::Vector3d d = pb - pa;
+                        if (d.norm() < 1e-9)
+                            throw std::runtime_error("axis on_surface: coincident points");
+                        results[id] = AxisResult{pa, d.normalized()};
+                    } else {
+                        if (is_datum_ref(aref))
+                            throw std::runtime_error(
+                                "axis on_surface: datum ref.a must be a point (use refs.b "
+                                "for a 2nd)");
+                        TopoDS_Face face = resolve_face_sel(aref, "a");
+                        BRepAdaptor_Surface ad(face);
+                        GeomAbs_SurfaceType st = ad.GetType();
+                        Eigen::Vector3d loc, dir;
+                        if (st == GeomAbs_Cylinder || st == GeomAbs_Cone) {
+                            std::tie(loc, dir) = face_axis(face, "a");
+                        } else if (st == GeomAbs_Plane) {
+                            GProp_GProps props;
+                            BRepGProp::SurfaceProperties(face, props);
+                            gp_Pnt cm = props.CentreOfMass();
+                            Eigen::Vector3d center(cm.X(), cm.Y(), cm.Z());
+                            auto pn = surface_point_normal(face, center, "a");
+                            loc = center;
+                            dir = pn.second;
+                        } else {
+                            throw std::runtime_error(
+                                "axis on_surface: face must be planar (normal) or "
+                                "cylindrical/conical (revolve axis)");
+                        }
+                        if (dir.norm() < 1e-9)
+                            throw std::runtime_error("axis on_surface: degenerate axis");
+                        results[id] = AxisResult{loc, dir.normalized()};
+                    }
                 } else {
-                    // accept a datum-axis pass-through for any other method (e.g. on_surface
-                    // with a datum), else flag a clear unsupported-method error.
+                    // accept a datum-axis pass-through for any other method, else flag a
+                    // clear unsupported-method error.
                     auto ax = feat.contains("a") ? resolve_axis_ref(feat.at("a"))
                                                  : std::nullopt;
                     if (ax) {

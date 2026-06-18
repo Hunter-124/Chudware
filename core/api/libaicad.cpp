@@ -31,6 +31,7 @@
 #include "doc/validate.h"
 #include "sim/fea_modal.h"
 #include "sim/fea_static.h"
+#include "sim/lbm.h"
 #include "sim/netlist.h"
 #include "sim/spice.h"
 
@@ -231,6 +232,53 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                    ? params["netlist"].get<std::string>()
                                    : std::string();
             return emit(aicad::sim::parse_netlist(deck), out_json, 0);
+        }
+        if (m == "sim_lbm") {
+            // D3Q19 BGK LBM wind-tunnel kernel (engine/sim/lbm.py parity probe). The
+            // trimesh voxelization is NOT done here: the caller passes an ALREADY-
+            // precomputed solid mask + lattice params + step count so this isolates the
+            // lattice numerics (the eventual CUDA payload). Contract:
+            //   mask : {"nx","ny","nz","solid":[flat (Nx,Ny,Nz) row-major 0/1 ints]}
+            //          solid[(x*Ny+y)*Nz+z] != 0 => solid cell.
+            //   params : {"u_lat","tau0","voxel_mm","dx_m","dt_s","rho_air"}
+            //   n_steps : number of LBM time steps.
+            // Returns: {"ok", nx,ny,nz, ux,uy,uz,rho (flat (Nx,Ny,Nz) row-major),
+            //           cd, drag_n, lift_n, frontal_area_mm2, steps_run, diverged}.
+            const json& mask = params.contains("mask") ? params["mask"] : json::object();
+            const json& pp = params.contains("params") ? params["params"] : json::object();
+            int nx = mask.value("nx", 0);
+            int ny = mask.value("ny", 0);
+            int nz = mask.value("nz", 0);
+            std::vector<uint8_t> solid;
+            if (mask.contains("solid") && mask["solid"].is_array()) {
+                solid.reserve(mask["solid"].size());
+                for (const auto& v : mask["solid"]) solid.push_back(v.get<int>() ? 1 : 0);
+            }
+            aicad::sim::LbmParams lp;
+            lp.u_lat = pp.value("u_lat", 0.05);
+            lp.tau0 = pp.value("tau0", 1.0);
+            lp.voxel_mm = pp.value("voxel_mm", 1.0);
+            lp.dx_m = pp.value("dx_m", 1.0e-3);
+            lp.dt_s = pp.value("dt_s", 1.0e-6);
+            lp.rho_air = pp.value("rho_air", 1.225);
+            int n_steps = params.value("n_steps", 0);
+            aicad::sim::LbmResult r = aicad::sim::lbm_run(solid, nx, ny, nz, lp, n_steps);
+            if (!r.ok) return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
+            return emit(json{{"ok", true},
+                             {"nx", r.nx},
+                             {"ny", r.ny},
+                             {"nz", r.nz},
+                             {"ux", r.ux},
+                             {"uy", r.uy},
+                             {"uz", r.uz},
+                             {"rho", r.rho},
+                             {"cd", r.cd},
+                             {"drag_n", r.drag_n},
+                             {"lift_n", r.lift_n},
+                             {"frontal_area_mm2", r.frontal_area_mm2},
+                             {"steps_run", r.steps_run},
+                             {"diverged", r.diverged}},
+                        out_json, 0);
         }
         if (m == "doc_validate") {
             // DIAGNOSTIC: structural-validate a document tree (schema.validate_document

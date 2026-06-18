@@ -34,6 +34,7 @@
 #include "agent/config.h"
 #include "agent/events.h"
 #include "agent/machine.h"
+#include "agent/micro.h"
 #include "agent/paths.h"
 #include "agent/ops_emit.h"
 #include "agent/providers.h"
@@ -580,6 +581,78 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             json result = aicad::agent::run_design(request, doc_id, provider, cb, options);
             result["events"] = *captured;
             return emit(std::move(result), out_json, 0);
+        }
+        if (m == "agent_run_micro") {
+            // MICRO-ORCHESTRATION run: {request, doc_id, provider:{...}, options?} ->
+            // {run_id, status, stop_reason, revision, doc_id, events:[...]}. Parallels
+            // agent_run_design (P54a).
+            std::string request = params.value("request", std::string());
+            std::string doc_id = params.value("doc_id", std::string());
+            json provider = params.contains("provider") ? params["provider"] : json::object();
+            json options = params.contains("options") ? params["options"] : json::object();
+            auto captured = std::make_shared<json>(json::array());
+            aicad::agent::EmitFnMicro cb = [captured](const json& ev) {
+                captured->push_back(ev);
+            };
+            json result =
+                aicad::agent::run_micro_design(request, doc_id, provider, cb, options);
+            result["events"] = *captured;
+            return emit(std::move(result), out_json, 0);
+        }
+        if (m == "agent_should_engage") {
+            // Pure: {provider:{name,base_url?,context_tokens?}, cfg:{micro_mode?,
+            // context_tokens?}} -> {engage:bool}.
+            json provider = params.contains("provider") ? params["provider"] : json::object();
+            json cfg = params.contains("cfg") ? params["cfg"] : json::object();
+            return emit(json{{"engage", aicad::agent::should_engage(provider, cfg)}}, out_json, 0);
+        }
+        if (m == "agent_micro_normalize_steps") {
+            // Pure: {raw:[...]} -> {steps:[{type,desc,params}, ...]}.
+            aicad::agent::ojson raw = params.contains("raw")
+                                          ? aicad::agent::ojson::parse(params["raw"].dump())
+                                          : aicad::agent::ojson(nullptr);
+            std::vector<aicad::agent::Step> steps = aicad::agent::normalize_steps(raw);
+            json out = json::array();
+            for (const auto& s : steps)
+                out.push_back(json{{"type", s.type}, {"desc", s.desc},
+                                   {"params", json::parse(s.params.dump())}});
+            return emit(json{{"steps", out}}, out_json, 0);
+        }
+        if (m == "agent_micro_summarize_doc") {
+            // Pure: {tree, volume?} -> {summary}. volume present => "volume=N" head.
+            aicad::agent::ojson tree =
+                params.contains("tree") ? aicad::agent::ojson::parse(params["tree"].dump())
+                                        : aicad::agent::ojson::object();
+            std::optional<double> vol;
+            if (params.contains("volume") && params["volume"].is_number())
+                vol = params["volume"].get<double>();
+            return emit(json{{"summary", aicad::agent::summarize_doc(tree, vol)}}, out_json, 0);
+        }
+        if (m == "agent_micro_verify_step") {
+            // Pure: {step:{type,desc,params}, tree, feature_status, vol_before?, vol_after?}
+            // -> {verified, notes}.
+            aicad::agent::Step step;
+            if (params.contains("step") && params["step"].is_object()) {
+                const json& sp = params["step"];
+                step.type = sp.value("type", std::string());
+                step.desc = sp.value("desc", std::string());
+                if (sp.contains("params") && sp["params"].is_object())
+                    step.params = aicad::agent::ojson::parse(sp["params"].dump());
+            }
+            aicad::agent::ojson tree =
+                params.contains("tree") ? aicad::agent::ojson::parse(params["tree"].dump())
+                                        : aicad::agent::ojson::object();
+            aicad::agent::ojson fs =
+                params.contains("feature_status")
+                    ? aicad::agent::ojson::parse(params["feature_status"].dump())
+                    : aicad::agent::ojson::array();
+            std::optional<double> vb, va;
+            if (params.contains("vol_before") && params["vol_before"].is_number())
+                vb = params["vol_before"].get<double>();
+            if (params.contains("vol_after") && params["vol_after"].is_number())
+                va = params["vol_after"].get<double>();
+            aicad::agent::VerifyResult vr = aicad::agent::verify_step(step, tree, fs, vb, va);
+            return emit(json{{"verified", vr.verified}, {"notes", vr.notes}}, out_json, 0);
         }
         if (m == "sim_fea_static") {
             // Linear-static FEA (engine/sim/fea_static.py parity probe). Params carry an

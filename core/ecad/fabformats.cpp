@@ -281,10 +281,30 @@ std::string write_gerber_layer(const json& board, const std::string& layer_id) {
                 auto [x1, y1] = bxy(getf(track["p1"][0]), getf(track["p1"][1]));
                 auto [x2, y2] = bxy(getf(track["p2"][0]), getf(track["p2"][1]));
                 ops.push_back({0, d, x1, y1, x2, y2, {}});
+            } else if (kind == "arc") {
+                // Arc track: the oracle (engine/ecad/fab/gerber.py) does NOT emit
+                // G02/G03 circular interpolation — it tessellates the arc into short
+                // chord strokes (one stroke per ~5° step) at the track aperture, so the
+                // port mirrors that chord-stroke approximation exactly.
+                int d = ap.get_or_add_track(getf(track["width"]));
+                double cx = getf(track["center"][0]), cy = getf(track["center"][1]);
+                double a0 = (track.contains("a0") ? getf(track["a0"]) : 0.0) * kPi / 180.0;
+                double a1 = (track.contains("a1") ? getf(track["a1"]) : 90.0) * kPi / 180.0;
+                double da = a1 - a0;
+                // n = max(4, int(abs(da) / radians(5)))  — int() truncates toward zero
+                int n = std::max(4, static_cast<int>(std::abs(da) / (5.0 * kPi / 180.0)));
+                // radius from p1 to center (constant; oracle recomputes it per point)
+                double r = std::sqrt(std::pow(getf(track["p1"][0]) - cx, 2) +
+                                     std::pow(getf(track["p1"][1]) - cy, 2));
+                std::vector<std::pair<double, double>> pts;
+                for (int i = 0; i <= n; ++i) {
+                    double a = a0 + da * i / n;
+                    pts.push_back(bxy(cx + r * std::cos(a), cy + r * std::sin(a)));
+                }
+                for (size_t i = 0; i + 1 < pts.size(); ++i)
+                    ops.push_back({0, d, pts[i].first, pts[i].second, pts[i + 1].first,
+                                   pts[i + 1].second, {}});
             }
-            // arc tracks: oracle's arc path uses fields (center/a0/a1) absent from the
-            // schema's p1/p2/mid arc model — both engines emit nothing for those here;
-            // none of the parity fixtures carry arc tracks. (Deferred — see report.)
         }
 
     // vias

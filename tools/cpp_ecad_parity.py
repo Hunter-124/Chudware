@@ -1138,6 +1138,33 @@ def main() -> int:
         return b
     run_fab("ovaldrill", _oval_board())
 
+    # 20d arc-track Gerber board: a kind:"arc" track (center/a0/a1/p1, the oracle
+    #     tessellates it into ~5°-step chord strokes — see engine/ecad/fab/gerber.py)
+    #     PLUS a straight kind:"segment" track to prove the existing path is
+    #     unregressed. Non-zero origin exercises board_xy on every chord vertex; a 270°
+    #     sweep + a sub-20° sweep (which floors to the n=4 minimum) cover both the
+    #     general step count and the max(4,...) clamp.
+    def _arc_track_board():
+        from engine.ecad.schema import new_board as _nb
+        b = _nb("Arc Track Board")
+        b["origin"] = [1.5, 2.5]
+        b["nets"] = [{"name": "GND", "class": "default"}]
+        b["tracks"] = [
+            # 270° CCW quarter-skip arc, radius 5 about (10,10): p1 = start on the arc
+            {"id": "t1", "net": "GND", "layer": "F.Cu", "width": 0.25, "kind": "arc",
+             "center": [10.0, 10.0], "a0": 0.0, "a1": 270.0, "p1": [15.0, 10.0],
+             "p2": [10.0, 15.0]},
+            # tiny 18° sweep -> int(18/5)=3 -> clamped to n=4 (max(4,...) path)
+            {"id": "t2", "net": "GND", "layer": "F.Cu", "width": 0.2, "kind": "arc",
+             "center": [30.0, 5.0], "a0": 0.0, "a1": 18.0, "p1": [33.0, 5.0],
+             "p2": [32.85, 5.93]},
+            # plain straight segment (regression guard)
+            {"id": "t3", "net": "GND", "layer": "F.Cu", "width": 0.25, "kind": "segment",
+             "p1": [0.0, 0.0], "p2": [10.0, 0.0]},
+        ]
+        return b
+    run_fab("arctrack", _arc_track_board())
+
     # ---- 21) AUTOROUTER parity: engine.ecad.autoroute vs core/ecad/autoroute.cpp ----
     # Fixtures mirror engine/ecad/test_autoroute.py + test_autoroute2.py (small
     # boards with a few nets to route). The Python oracle autoroute() / route_diff_pair()

@@ -18,12 +18,20 @@ namespace {
 // to the C++ core too — the id prefix IS the commit-at-doc_new marker, giving an
 // all-or-nothing-per-document cutover with no separate routing state. Flag OFF (default)
 // is byte-for-byte today's behavior: every call goes to the Python worker.
-// The C++ core is now the DEFAULT engine for new PART documents. Set AI_CAD_CPP_DOCS=0
-// to force the legacy Python worker for everything (the pre-cutover behavior).
+//
+// DEFAULT OFF (2026-06-18): the C++ doc engine handles the ops-build pipeline (doc_apply_ops:
+// extrude/fillet/pattern/...), but does NOT yet implement the interactive doc surface —
+// SKETCH MODE (sketch_enter/solve/probe/drag/exit, doc_sketch_overview/regions,
+// sketch_project_ref) or the EVALUATE suite (eval_mass/measure/section_props/interference/
+// check/symmetry/draft/thickness/curvature), plus doc_refresh_derived / doc_solve_mates /
+// doc_set_explode_state. On a doc-cpp doc those fail loud ("unknown method"). Until they are
+// ported, documents stay on the mature Python engine. Set AI_CAD_CPP_DOCS=1 to opt a session
+// into the C++ doc engine (parts that only use the ops pipeline). FLIP BACK TO DEFAULT-ON once
+// the sketch + evaluate surface is ported (and re-delete the v2 agent Python — see git log).
 bool cppDocsFlag() {
     const char* f = std::getenv("AI_CAD_CPP_DOCS");
     if (f && f[0]) return f[0] != '0';  // explicit override (1=on, 0=off)
-    return true;                        // default: route new parts to the C++ core
+    return false;                       // default: mature Python doc engine (C++ doc gaps, above)
 }
 
 // Methods that MINT a new document (vs. operate on an existing one). For these the C++
@@ -82,7 +90,11 @@ bool routeDocToCpp(const std::string& method, const json& params) {
 bool cppAgentFlag() {
     const char* f = std::getenv("AI_CAD_CPP_AGENT");
     if (f && f[0]) return f[0] != '0';  // explicit override (1=on, 0=force Python)
-    return true;                        // default ON: v2 agent runs on the C++ core
+    // DEFAULT OFF (2026-06-18): the C++ agent drives a C++-backed (doc-cpp) doc session, but
+    // documents default to the Python engine now (see cppDocsFlag — C++ doc engine lacks sketch
+    // mode + evaluate). The agent must run on the SAME engine as the doc it edits, so it stays
+    // Python until the doc engine is the C++ default again. Only routes to C++ for doc-cpp docs.
+    return false;
 }
 
 // Is the active document a C++-backed ("doc-cpp") session? For agent_run_v2 /

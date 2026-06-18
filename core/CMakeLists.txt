@@ -319,6 +319,7 @@ if(AICAD_WITH_OCCT)
     geom/curves.cpp
     geom/ecad_3d.cpp
     doc/drawing.cpp
+    sim/overlay.cpp
     geom/aicm.cpp)
   target_include_directories(aicad_geom_occt PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

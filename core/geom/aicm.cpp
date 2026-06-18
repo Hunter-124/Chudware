@@ -109,7 +109,16 @@ std::vector<uint8_t> encode_vert(const AicmBody& bt) {
     return p;
 }
 
-// Append one length-prefixed chunk: fourcc[4] · u64 payload_len · payload.
+// Build one length-prefixed chunk: fourcc[4] · u64 payload_len · payload.
+std::vector<uint8_t> make_chunk(const char fourcc[4], const std::vector<uint8_t>& payload) {
+    std::vector<uint8_t> c;
+    c.insert(c.end(), fourcc, fourcc + 4);
+    put_u64(c, static_cast<uint64_t>(payload.size()));
+    c.insert(c.end(), payload.begin(), payload.end());
+    return c;
+}
+
+// Append one length-prefixed chunk in place (header chunk emit).
 void emit_chunk(std::vector<uint8_t>& out, const char fourcc[4],
                 const std::vector<uint8_t>& payload) {
     out.insert(out.end(), fourcc, fourcc + 4);
@@ -119,13 +128,68 @@ void emit_chunk(std::vector<uint8_t>& out, const char fourcc[4],
 
 }  // namespace
 
-std::vector<uint8_t> write_aicm(const std::vector<AicmBody>& bodies) {
+// --- Overlay chunk encoders (mirror tessellate.py scalar_chunk/disp_chunk/lines_chunk) ---
+
+std::vector<uint8_t> scalar_chunk(uint32_t body_id, const std::string& name,
+                                  const std::vector<float>& values, float vmin, float vmax) {
+    std::vector<uint8_t> p;
+    put_u32(p, body_id);
+    put_str(p, name);
+    put_f32(p, vmin);
+    put_f32(p, vmax);
+    put_u32(p, static_cast<uint32_t>(values.size()));
+    put_f32_array(p, values);
+    return make_chunk("SCLR", p);
+}
+
+std::vector<uint8_t> disp_chunk(uint32_t body_id, float scale_hint,
+                                const std::vector<float>& vectors) {
+    std::vector<uint8_t> p;
+    put_u32(p, body_id);
+    put_f32(p, scale_hint);
+    // n = floor(len/3), mirroring tessellate.py disp_chunk (vec flattened, n = len//3).
+    put_u32(p, static_cast<uint32_t>(vectors.size() / 3));
+    // Only the first 3*n floats are written (tessellate.py packs vec.tobytes() of the
+    // flattened array, which is 3*n long once reshaped through (n,3); a non-multiple of
+    // 3 trailing remainder is dropped). Match that exactly.
+    const size_t n3 = (vectors.size() / 3) * 3;
+    for (size_t i = 0; i < n3; ++i) put_f32(p, vectors[i]);
+    return make_chunk("DISP", p);
+}
+
+std::vector<uint8_t> lines_chunk(const std::string& name,
+                                 const std::vector<std::vector<float>>& polylines,
+                                 const std::vector<std::vector<float>>* scalars) {
+    std::vector<uint8_t> p;
+    put_str(p, name);
+    put_u32(p, static_cast<uint32_t>(polylines.size()));
+    uint32_t total_pts = 0;
+    for (const auto& pl : polylines) {
+        uint32_t n = static_cast<uint32_t>(pl.size() / 3);
+        put_u32(p, n);
+        total_pts += n;
+    }
+    put_u32(p, total_pts);
+    for (const auto& pl : polylines) {
+        const size_t n3 = (pl.size() / 3) * 3;
+        for (size_t i = 0; i < n3; ++i) put_f32(p, pl[i]);
+    }
+    const uint8_t has_scalar = scalars ? 1 : 0;
+    put_u8(p, has_scalar);
+    if (scalars) {
+        for (const auto& s : *scalars) put_f32_array(p, s);
+    }
+    return make_chunk("LINS", p);
+}
+
+std::vector<uint8_t> write_aicm(const std::vector<AicmBody>& bodies,
+                                const std::vector<std::vector<uint8_t>>& extra_chunks) {
     std::vector<uint8_t> out;
-    // Header: "AICM" · version=1 · chunk_count (4 per body).
+    // Header: "AICM" · version=1 · chunk_count (4 per body + the extra chunks).
     const char magic[4] = {'A', 'I', 'C', 'M'};
     out.insert(out.end(), magic, magic + 4);
     put_u32(out, 1);
-    put_u32(out, static_cast<uint32_t>(bodies.size() * 4));
+    put_u32(out, static_cast<uint32_t>(bodies.size() * 4 + extra_chunks.size()));
 
     for (const AicmBody& bt : bodies) {
         emit_chunk(out, "BODY", encode_body(bt));
@@ -133,11 +197,16 @@ std::vector<uint8_t> write_aicm(const std::vector<AicmBody>& bodies) {
         emit_chunk(out, "EDGE", encode_edge(bt));
         emit_chunk(out, "VERT", encode_vert(bt));
     }
+    // Append pre-encoded extra chunks (SCLR/DISP/LINS) after the body chunks — exactly
+    // as tessellate.py: all_chunks = body_chunks + list(extra_chunks).
+    for (const std::vector<uint8_t>& ec : extra_chunks)
+        out.insert(out.end(), ec.begin(), ec.end());
     return out;
 }
 
-bool write_aicm_file(const std::string& path, const std::vector<AicmBody>& bodies) {
-    std::vector<uint8_t> blob = write_aicm(bodies);
+bool write_aicm_file(const std::string& path, const std::vector<AicmBody>& bodies,
+                     const std::vector<std::vector<uint8_t>>& extra_chunks) {
+    std::vector<uint8_t> blob = write_aicm(bodies, extra_chunks);
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) return false;
     size_t want = blob.size();

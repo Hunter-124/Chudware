@@ -50,6 +50,7 @@
 #include "ecad/autoroute.h"
 #include "ecad/recipes.h"
 #include "ecad/session.h"
+#include "geom/aicm.h"
 #include "geom/ecad_3d.h"
 #include "sim/fea_modal.h"
 #include "sim/fea_run.h"
@@ -57,6 +58,7 @@
 #include "sim/lbm.h"
 #include "sim/mesher.h"
 #include "sim/netlist.h"
+#include "sim/overlay.h"
 #include "sim/spice.h"
 
 using nlohmann::json;
@@ -81,6 +83,33 @@ int emit(json&& j, char** out_json, int rc) {
 
 int emit_error(const std::string& msg, char** out_json) {
     return emit(json{{"error", msg}}, out_json, 1);
+}
+
+// Flatten a JSON numeric array — accepts nested ([[x,y,z],...]) OR already-flat
+// ([x,y,z,...]) — into a flat double vector. Used by the overlay/map handlers.
+std::vector<double> flat_doubles(const json& j) {
+    std::vector<double> v;
+    if (!j.is_array()) return v;
+    for (const auto& x : j) {
+        if (x.is_array()) {
+            for (const auto& c : x) v.push_back(c.get<double>());
+        } else {
+            v.push_back(x.get<double>());
+        }
+    }
+    return v;
+}
+
+// Hex-encode a byte blob (lowercase) for the chunk-bytes diagnostic handlers.
+std::string to_hex(const std::vector<uint8_t>& b) {
+    static const char* hexd = "0123456789abcdef";
+    std::string s;
+    s.reserve(b.size() * 2);
+    for (uint8_t c : b) {
+        s.push_back(hexd[c >> 4]);
+        s.push_back(hexd[c & 0xF]);
+    }
+    return s;
 }
 
 // Choose where to write the AICM bytes. Honour an explicit params["aicm_out"]
@@ -1048,7 +1077,36 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             // Returns {ok, displacement, disp_magnitude, von_mises, n_dof, summary,
             // solver_notes}. (overlay/npz are display-only and out of scope here.)
             const json& study = params.contains("study") ? params["study"] : json::object();
-            return emit(aicad::sim::fea_run_static(study), out_json, 0);
+            json res = aicad::sim::fea_run_static(study);
+            // P55b: when the study carries a STEP path, ALSO package a display overlay
+            // (best-effort — mirrors the Python worker _static_overlay_path; an overlay
+            // failure NEVER fails the solve). Existing result fields are untouched.
+            if (res.value("ok", false) && study.contains("step_path") &&
+                study["step_path"].is_string()) {
+                const std::string step_path = study["step_path"].get<std::string>();
+                if (std::filesystem::exists(step_path) && res.contains("von_mises")) {
+                    std::vector<double> vol = flat_doubles(study.value("points", json::array()));
+                    if (vol.empty()) {
+                        // Inline points absent: re-mesh to recover the volume node coords
+                        // (the solve already meshed; this just re-derives the cloud — the
+                        // mesh is deterministic so node coords match the solved result).
+                        double density = study.value("density", 0.5);
+                        aicad::sim::MeshOut mo = aicad::sim::mesh_step(step_path, density);
+                        if (mo.ok) vol = mo.points;
+                    }
+                    std::vector<double> vm = flat_doubles(res.value("von_mises", json::array()));
+                    std::vector<double> dm = flat_doubles(res.value("disp_magnitude", json::array()));
+                    std::vector<double> dv = flat_doubles(res.value("displacement", json::array()));
+                    double yield_mpa = 250.0;
+                    if (study.contains("material") && study["material"].is_object())
+                        yield_mpa = study["material"].value("yield_mpa", 250.0);
+                    json summary = res.contains("summary") ? res["summary"] : json::object();
+                    std::string ov =
+                        aicad::sim::static_overlay(step_path, vol, vm, dm, dv, yield_mpa, summary);
+                    if (!ov.empty()) res["overlay_aicm"] = ov;
+                }
+            }
+            return emit(std::move(res), out_json, 0);
         }
         if (m == "sim_run_modal") {
             // P50b: combined mesh + fixture-resolve + modal solve. Params:
@@ -1056,7 +1114,98 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             // mode_shapes, n_modes, n_nodes, n_dof}.
             const json& study = params.contains("study") ? params["study"] : json::object();
             int n_modes = params.value("n_modes", 6);
-            return emit(aicad::sim::fea_run_modal(study, n_modes), out_json, 0);
+            json res = aicad::sim::fea_run_modal(study, n_modes);
+            // P55b: when the study carries a STEP path, ALSO package a display overlay
+            // for mode 0 (best-effort — mirrors the Python worker _modal_overlay_path;
+            // an overlay failure NEVER fails the solve). Existing fields are untouched.
+            if (res.value("ok", false) && study.contains("step_path") &&
+                study["step_path"].is_string()) {
+                const std::string step_path = study["step_path"].get<std::string>();
+                if (std::filesystem::exists(step_path) && res.contains("mode_shapes") &&
+                    res["mode_shapes"].is_array() && !res["mode_shapes"].empty() &&
+                    res.contains("freqs_hz") && res["freqs_hz"].is_array() &&
+                    !res["freqs_hz"].empty()) {
+                    std::vector<double> vol = flat_doubles(study.value("points", json::array()));
+                    if (vol.empty() && study.contains("step_path")) {
+                        // Inline points absent: re-mesh to get the volume node coords.
+                        double density = study.value("density", 0.5);
+                        aicad::sim::MeshOut mo = aicad::sim::mesh_step(step_path, density);
+                        if (mo.ok) vol = mo.points;
+                    }
+                    std::vector<double> mode0 = flat_doubles(res["mode_shapes"][0]);
+                    double freq = res["freqs_hz"][0].get<double>();
+                    std::string ov = aicad::sim::modal_overlay(step_path, vol, mode0, freq);
+                    if (!ov.empty()) res["overlay_aicm"] = ov;
+                }
+            }
+            return emit(std::move(res), out_json, 0);
+        }
+        if (m == "aicm_scalar_chunk") {
+            // DIAGNOSTIC (byte-contract proof): return the SCLR chunk bytes (hex) for a
+            // crafted (body_id, name, values, vmin, vmax) so the gate can byte-compare
+            // against engine.doc.tessellate.scalar_chunk.
+            uint32_t body_id = params.value("body_id", 1u);
+            std::string name = params.value("name", std::string());
+            std::vector<double> vals_d = flat_doubles(params.value("values", json::array()));
+            std::vector<float> vals(vals_d.begin(), vals_d.end());
+            float vmin = static_cast<float>(params.value("vmin", 0.0));
+            float vmax = static_cast<float>(params.value("vmax", 0.0));
+            std::vector<uint8_t> bytes = aicm::scalar_chunk(body_id, name, vals, vmin, vmax);
+            return emit(json{{"hex", to_hex(bytes)}}, out_json, 0);
+        }
+        if (m == "aicm_disp_chunk") {
+            // DIAGNOSTIC: return the DISP chunk bytes (hex) for crafted (body_id,
+            // scale_hint, vectors) — byte-compares against tessellate.disp_chunk.
+            uint32_t body_id = params.value("body_id", 1u);
+            float scale_hint = static_cast<float>(params.value("scale_hint", 1.0));
+            std::vector<double> vec_d = flat_doubles(params.value("vectors", json::array()));
+            std::vector<float> vec(vec_d.begin(), vec_d.end());
+            std::vector<uint8_t> bytes = aicm::disp_chunk(body_id, scale_hint, vec);
+            return emit(json{{"hex", to_hex(bytes)}}, out_json, 0);
+        }
+        if (m == "sim_map_to_surface") {
+            // DIAGNOSTIC (map value-parity): nearest-volume-node mapping. Accepts
+            // {surf:[[x,y,z]...], vol:[[x,y,z]...], values:[...]| [[...]...], dim?}.
+            // dim is inferred from values shape when omitted (3 if nested triples, else 1).
+            std::vector<double> surf = flat_doubles(params.value("surf", json::array()));
+            std::vector<double> vol = flat_doubles(params.value("vol", json::array()));
+            const json& vj = params.value("values", json::array());
+            int dim = 1;
+            if (params.contains("dim") && params["dim"].is_number()) {
+                dim = params["dim"].get<int>();
+            } else if (vj.is_array() && !vj.empty() && vj[0].is_array()) {
+                dim = static_cast<int>(vj[0].size());
+            }
+            std::vector<double> values = flat_doubles(vj);
+            std::vector<double> mapped = aicad::sim::map_to_surface(surf, vol, values, dim);
+            return emit(json{{"mapped", mapped}, {"dim", dim}}, out_json, 0);
+        }
+        if (m == "sim_static_overlay") {
+            // P55b: package a static-result overlay AICM from a STEP + volume results.
+            // {step_path, points[n*3], von_mises[n], disp_magnitude[n],
+            //  displacement[n*3], yield_mpa?, summary?} -> {overlay_aicm}.
+            const std::string step_path = params.value("step_path", std::string());
+            std::vector<double> pts = flat_doubles(params.value("points", json::array()));
+            std::vector<double> vm = flat_doubles(params.value("von_mises", json::array()));
+            std::vector<double> dm = flat_doubles(params.value("disp_magnitude", json::array()));
+            std::vector<double> dv = flat_doubles(params.value("displacement", json::array()));
+            double yield_mpa = params.value("yield_mpa", 250.0);
+            json summary = params.contains("summary") ? params["summary"] : json::object();
+            std::string ov =
+                aicad::sim::static_overlay(step_path, pts, vm, dm, dv, yield_mpa, summary);
+            if (ov.empty()) return emit_error("sim_static_overlay: overlay packaging failed", out_json);
+            return emit(json{{"overlay_aicm", ov}}, out_json, 0);
+        }
+        if (m == "sim_modal_overlay") {
+            // P55b: package a single-mode modal overlay AICM.
+            // {step_path, points[n*3], mode_shape[n*3], freq_hz?} -> {overlay_aicm}.
+            const std::string step_path = params.value("step_path", std::string());
+            std::vector<double> pts = flat_doubles(params.value("points", json::array()));
+            std::vector<double> shp = flat_doubles(params.value("mode_shape", json::array()));
+            double freq_hz = params.value("freq_hz", 0.0);
+            std::string ov = aicad::sim::modal_overlay(step_path, pts, shp, freq_hz);
+            if (ov.empty()) return emit_error("sim_modal_overlay: overlay packaging failed", out_json);
+            return emit(json{{"overlay_aicm", ov}}, out_json, 0);
         }
         if (m == "doc_validate") {
             // DIAGNOSTIC: structural-validate a document tree (schema.validate_document

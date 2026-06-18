@@ -66,10 +66,35 @@ struct AicmBody {
     uint32_t total_edge_pts() const { return static_cast<uint32_t>(edge_pts.size() / 3); }
 };
 
-// Serialize a list of bodies to an AICM v1 byte blob (deterministic).
-std::vector<uint8_t> write_aicm(const std::vector<AicmBody>& bodies);
+// --- Overlay chunk encoders (mirror engine/doc/tessellate.py scalar/disp/lines) ---
+// Each returns a complete length-prefixed chunk (fourcc[4] · u64 len · payload),
+// ready to pass in write_aicm's extra_chunks. The host's render/aicm_loader is the
+// consumer (SCLR/DISP/LINS branches).
+//
+// SCLR payload: u32 body_id · str name · f32 vmin · f32 vmax · u32 count · f32[count]
+std::vector<uint8_t> scalar_chunk(uint32_t body_id, const std::string& name,
+                                  const std::vector<float>& values, float vmin, float vmax);
+
+// DISP payload: u32 body_id · f32 scale_hint · u32 n · f32[3*n]  (vectors is flat 3*n)
+std::vector<uint8_t> disp_chunk(uint32_t body_id, float scale_hint,
+                                const std::vector<float>& vectors);
+
+// LINS payload: str name · u32 n_lines · u32[n_lines] pts_per_line · u32 total_pts ·
+//   f32[3*total_pts] · u8 has_scalar · (f32[total_pts] scalars iff has_scalar).
+// `polylines` is a list of flat 3*Ni point arrays; `scalars` (when non-null, one Ni
+// per polyline) sets has_scalar=1 and appends the concatenated per-point scalars.
+std::vector<uint8_t> lines_chunk(const std::string& name,
+                                 const std::vector<std::vector<float>>& polylines,
+                                 const std::vector<std::vector<float>>* scalars = nullptr);
+
+// Serialize a list of bodies to an AICM v1 byte blob (deterministic). Any
+// pre-encoded `extra_chunks` (SCLR/DISP/LINS …) are appended after the body chunks
+// and counted in the header chunk_count — exactly as tessellate.py's write_aicm.
+std::vector<uint8_t> write_aicm(const std::vector<AicmBody>& bodies,
+                                const std::vector<std::vector<uint8_t>>& extra_chunks = {});
 
 // Convenience: serialize and write to a file. Returns false on open/write failure.
-bool write_aicm_file(const std::string& path, const std::vector<AicmBody>& bodies);
+bool write_aicm_file(const std::string& path, const std::vector<AicmBody>& bodies,
+                     const std::vector<std::vector<uint8_t>>& extra_chunks = {});
 
 }  // namespace aicm

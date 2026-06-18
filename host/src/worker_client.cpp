@@ -108,6 +108,35 @@ bool routeAgentToCpp(const std::string& method, const json& params) {
     std::string lerr;
     return core::cpp_core().ensureLoaded(lerr);
 }
+// --- C++ SIM (FEA) routing (opt-in, default OFF) ----------------------------
+// Route the host's FEA simulation RPCs (sim_mesh / sim_run_static / sim_run_modal)
+// to the pure-C++ core (libaicad) instead of the Python sim worker. MIRRORS the
+// agent seam but is DEFAULT OFF: unless AI_CAD_CPP_SIM is set (and != "0") every sim
+// call goes to the Python sim worker exactly as today. sim_run_flow (LBM/CFD) and
+// sim_cancel are NEVER routed — they stay Python.
+//
+// The host's send-shape for sim_run_static/sim_run_modal is already the C++ contract
+// ({study:{step_path, density, material, fixtures, loads}} + n_modes for modal), so no
+// params translation is needed here. The C++ result carries summary + overlay_aicm,
+// which is exactly what sim_panel consumes (it never reads results_npz/solve_time_s,
+// the two fields the C++ result omits) — so the result is byte-compatible for display.
+bool cppSimFlag() {
+    const char* f = std::getenv("AI_CAD_CPP_SIM");
+    return f && f[0] && f[0] != '0';  // explicit opt-in only (default OFF)
+}
+
+bool routeSimToCpp(const std::string& method, const json& /*params*/) {
+    if (!cppSimFlag()) return false;
+    if (!(method == "sim_mesh" || method == "sim_run_static" || method == "sim_run_modal"))
+        return false;  // sim_run_flow (LBM) + sim_cancel + everything else stays Python
+    if (!core::cpp_core().available()) {
+        // Lazily try to load the core DLL; if it can't load, fall through to Python so
+        // sim never hard-breaks. ensureLoaded is idempotent (loads once).
+        std::string lerr;
+        if (!core::cpp_core().ensureLoaded(lerr)) return false;
+    }
+    return true;
+}
 std::wstring widen(const std::string& s) {
     if (s.empty()) return L"";
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
@@ -322,6 +351,30 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
         }
         // Hard failure (DLL throw / load race): do NOT hard-break the agent — fall through
         // to the Python worker path below so the in-app AI keeps working.
+    }
+    // C++ SIM (FEA) routing (opt-in via AI_CAD_CPP_SIM, default OFF). Run the FEA mesh /
+    // static / modal RPCs in-process against libaicad. The host already sends the C++
+    // {study:{...}} contract verbatim, so params pass through unchanged; the result carries
+    // summary + overlay_aicm (what sim_panel reads). Default OFF => routeSimToCpp() returns
+    // false and this block is skipped (byte-for-byte today's Python sim path).
+    if (routeSimToCpp(method, params)) {
+        std::string cerr;
+        json cppResult;
+        if (core::cpp_core().call(method, params, cppResult, cerr)) {
+            result = std::move(cppResult);  // ok: result holds {summary, overlay_aicm, ...}
+            return true;
+        }
+        // The core reported a STRUCTURED error envelope ({code,message,detail}). Surface it
+        // the same way the doc/agent seam does: deliver it in `result` and return true (the
+        // round-trip succeeded, the METHOD reported an error). SimClient::launch reads
+        // result.contains("code") to mark the job failed with the message.
+        if (cppResult.is_object() && cppResult.contains("code")) {
+            result = std::move(cppResult);
+            err = result.value("message", std::string("cpp-sim error"));
+            return true;
+        }
+        // Hard failure (DLL throw / load race after the available() check): do NOT hard-break
+        // sim — fall through to the Python sim worker path below so analysis keeps working.
     }
     // P16: route C++-backed documents to the in-process core (libaicad) instead of the
     // Python worker. All-or-nothing per document (NO mid-doc Python fallback — Python

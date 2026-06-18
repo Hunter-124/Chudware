@@ -280,6 +280,64 @@ def fixtures():
     out["prim_cone"] = {"features": [_prim("f1", "cone", {"r1": 10, "r2": 4, "height": 20})]}
     out["prim_torus"] = {"features": [_prim("f1", "torus", {"major_r": 20, "minor_r": 5})]}
 
+    # ---- sheet metal (engine/doc/features/sheetmetal.py + sheetmetal_flat.py) ----
+    # A 60x40 base sheet (thickness 2, k 0.45) -> V = 4800. Bend ops fold a wall off
+    # edge[2] of the base sheet: the long straight edge at (30,0,0) along +X (the y=0
+    # thickness face's bottom boundary). The edge selector carries the geometric
+    # fingerprint + hint_index=2 so BOTH engines' scored matcher resolves it to that
+    # SAME unique edge (the describe-space duplicate co-ranking is broken by the hint).
+    sm_e, sm_c = _rect(0, 0, 60, 40)
+
+    def _base_flange(fid, sketch_fid, thickness=2.0, k=0.45):
+        return {"id": fid, "type": "sm_base_flange",
+                "params": {"thickness": {"value": thickness, "expr": None},
+                           "k_factor": {"value": k, "expr": None}},
+                "refs": {"profile": [{"kind": "region", "sketch": sketch_fid}]}}
+
+    sm_edge_sel = {"kind": "edge", "surf": "line", "centroid": [30.0, 0.0, 0.0],
+                   "axis": [1.0, 0.0, 0.0], "area_or_len": 60.0,
+                   "owner_feature": None, "hint_index": 2}
+
+    # base flange alone: V = 60*40*2 = 4800.
+    out["sm_base_flange"] = {"features": [
+        _sketch("s1", "plane.top", sm_e, sm_c), _base_flange("b1", "s1")]}
+
+    # base + 90 degree edge flange (wall 20, radius 2, material_inside): V = 7470.563.
+    sm_edge_flange = {"id": "e1", "type": "sm_edge_flange",
+                      "params": {"angle": {"value": 90.0, "expr": None},
+                                 "length": {"value": 20.0, "expr": None},
+                                 "radius": {"value": 2.0, "expr": None},
+                                 "position": "material_inside", "flip": False,
+                                 "corner_relief": "rectangular"},
+                      "refs": {"edge": sm_edge_sel}}
+    out["sm_edge_flange"] = {"features": [
+        _sketch("s1", "plane.top", sm_e, sm_c), _base_flange("b1", "s1"), sm_edge_flange]}
+
+    # base + closed hem (fold the edge 180 back on itself): V = 6752.605.
+    sm_hem = {"id": "h1", "type": "sm_hem", "params": {"type": "closed", "flip": False},
+              "refs": {"edge": sm_edge_sel}}
+    out["sm_hem"] = {"features": [
+        _sketch("s1", "plane.top", sm_e, sm_c), _base_flange("b1", "s1"), sm_hem]}
+
+    # base + jog (two 90 bends -> a parallel offset step): V = 9048.907.
+    sm_jog = {"id": "j1", "type": "sm_jog",
+              "params": {"angle": {"value": 90.0, "expr": None},
+                         "offset": {"value": 10.0, "expr": None},
+                         "length": {"value": 20.0, "expr": None},
+                         "radius": {"value": 2.0, "expr": None},
+                         "position": "material_inside", "flip": False},
+              "refs": {"edge": sm_edge_sel}}
+    out["sm_jog"] = {"features": [
+        _sketch("s1", "plane.top", sm_e, sm_c), _base_flange("b1", "s1"), sm_jog]}
+
+    # base + edge flange, then UNFOLD to the flat pattern (developed blank). The flat
+    # solid's volume is its OWN construction (base block + developed strip BA+wall),
+    # NOT the folded volume: V = 7266.637.
+    sm_flat = {"id": "fp1", "type": "sm_flat_pattern", "params": {}, "refs": {}}
+    out["sm_flat_pattern"] = {"features": [
+        _sketch("s1", "plane.top", sm_e, sm_c), _base_flange("b1", "s1"),
+        sm_edge_flange, sm_flat]}
+
     return out
 
 

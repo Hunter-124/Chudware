@@ -35,6 +35,7 @@
 #include <BRepGProp.hxx>
 #include <BRepTools.hxx>
 #include <TopExp.hxx>
+#include <TopExp_Explorer.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <Bnd_Box.hxx>
@@ -59,6 +60,7 @@
 #include "geom/hole.h"
 #include "geom/plane.h"
 #include "geom/profile.h"
+#include "geom/sheetmetal.h"
 #include "geom/tessellate.h"
 #include "geom/transform.h"
 #include "geom/aicm.h"
@@ -297,10 +299,17 @@ json normalize_feature(const json& raw) {
         if (it.key() == "params" || it.key() == "refs") continue;
         f[it.key()] = it.value();
     }
-    // 2. Merge canonical params -> top level.
+    // 2. Merge canonical params -> top level. A param named "type" (the sm_hem
+    // sub-type "closed"/"open"/"teardrop") would clobber the feature's own "type"
+    // key — remap it to "hem_type" so the feature type survives the flatten.
     if (raw.contains("params") && raw["params"].is_object()) {
-        for (auto it = raw["params"].begin(); it != raw["params"].end(); ++it)
+        for (auto it = raw["params"].begin(); it != raw["params"].end(); ++it) {
+            if (it.key() == "type" || it.key() == "id") {
+                f["hem_type"] = it.value();
+                continue;
+            }
             f[it.key()] = it.value();
+        }
     }
     // 3. Merge / translate canonical refs -> top level.
     if (raw.contains("refs") && raw["refs"].is_object()) {
@@ -360,7 +369,7 @@ json normalize_feature(const json& raw) {
                 else
                     f["pull"] = val;
             } else if (slot == "face" || slot == "edges" || slot == "remove" ||
-                       slot == "faces" || slot == "sections") {
+                       slot == "faces" || slot == "sections" || slot == "edge") {
                 f[slot] = val;  // selector(-list) refs pass through to their branch
             } else {
                 f[slot] = val;  // a/b/body/seed/... pass through
@@ -468,6 +477,18 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     // input solid id). Empty/absent for a CREATING feature (extrude boss/revolve/
     // sweep/loft/primitive build a fresh body). Drives the owner-map topology diff.
     std::map<std::string, std::string> source_of;
+
+    // --- sheet-metal part state (the C++ analogue of the oracle's ctx.datums
+    // _sheet_metal / _sheet_metal_bends). A base flange establishes the part as
+    // sheet metal (thickness / k-factor / default bend radius); later edge flanges /
+    // hems / jogs inherit it and each appends a bend record the flat pattern reads. ---
+    struct SheetCtx {
+        bool active = false;
+        double thickness = 0.0;
+        double k_factor = 0.0;
+        double default_bend_radius = 0.0;
+    } sheet_ctx;
+    std::vector<::geom::BendRecord> bend_records;
 
     // The "current top body": the most-recently-produced solid not yet consumed.
     // Canonical features that omit an explicit body/seed ref (fillet/chamfer/hole/
@@ -1385,6 +1406,285 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 consumed.insert(body_id);
                 source_of[id] = body_id;  // owner-map: derives from the input body
                 results[id] = SolidResult{out};
+                solid_order.push_back(id);
+                st.ok = true;
+
+            } else if (type == "sm_base_flange") {
+                // Base flange — extrude a sketch region by `thickness` to make the
+                // base sheet. Establishes the part as sheet metal (stores thickness /
+                // k-factor / default bend radius so later flanges inherit them). Port
+                // of engine/doc/features/sheetmetal.py::compile_sm_base_flange.
+                const std::string prof = req_str(feat, "profile");
+                const SketchResult& src = require_sketch(results, prof, prof.c_str());
+                if (src.faces.empty())
+                    throw std::runtime_error("sm_base_flange: profile sketch has no closed face");
+
+                const double thickness = num_or_expr(feat.at("thickness"), env);
+                const double k_factor = feat.contains("k_factor")
+                    ? num_or_expr(feat.at("k_factor"), env) : 0.45;
+                const double default_bend_radius = feat.contains("default_bend_radius")
+                    ? num_or_expr(feat.at("default_bend_radius"), env) : thickness;
+                if (!(thickness > 0.0))
+                    throw std::runtime_error("sm_base_flange: thickness must be > 0");
+                if (!(k_factor >= 0.0 && k_factor <= 1.0))
+                    throw std::runtime_error("sm_base_flange: k_factor must be in 0..1");
+
+                // Extrude each region face along its plane normal by thickness, union.
+                TopoDS_Shape sheet;
+                for (const TopoDS_Face& fc : src.faces) {
+                    TopoDS_Shape piece =
+                        ::geom::extrude_face(fc, src.plane.normal, thickness, false);
+                    if (piece.IsNull())
+                        throw std::runtime_error("sm_base_flange: extrude failed");
+                    sheet = sheet.IsNull() ? piece : ::geom::fuse(sheet, piece);
+                    if (sheet.IsNull())
+                        throw std::runtime_error("sm_base_flange: region fuse failed");
+                }
+                if (sheet.IsNull())
+                    throw std::runtime_error("sm_base_flange: produced no solid");
+
+                sheet_ctx.active = true;
+                sheet_ctx.thickness = thickness;
+                sheet_ctx.k_factor = k_factor;
+                sheet_ctx.default_bend_radius = default_bend_radius;
+
+                results[id] = SolidResult{sheet};
+                solid_order.push_back(id);
+                st.ok = true;
+
+            } else if (type == "sm_edge_flange" || type == "sm_hem" ||
+                       type == "sm_jog") {
+                // Bent walls off a straight bend edge of the sheet's thickness face.
+                // Each resolves the SAME bend-edge frame (sm_bend_frame) and builds a
+                // true bend+wall (edge flange) or constant-thickness strip (hem / jog)
+                // solid, fused to the running sheet, then appends a bend record for
+                // the flat pattern. Ports of compile_sm_edge_flange / _hem / _jog.
+                if (!sheet_ctx.active)
+                    throw std::runtime_error(type + ": part is not sheet metal — add a base flange first");
+                const std::string body_id = current_solid_id();
+                if (body_id.empty())
+                    throw std::runtime_error(type + ": no sheet body — add a base flange first");
+                const TopoDS_Shape& body = require_solid(results, body_id, "body");
+                const double thickness = sheet_ctx.thickness;
+                const double k_default = sheet_ctx.k_factor;
+                const double radius_default = sheet_ctx.default_bend_radius;
+
+                // Resolve the single straight bend edge (reuse the dress edge picker).
+                auto edge_it = feat.find("edge");
+                if (edge_it == feat.end())
+                    throw std::runtime_error(type + ": refs.edge is required (the bend line)");
+                aicad::doc::EdgePicks picks =
+                    aicad::doc::resolve_edge_picks(body, *edge_it);
+                if (!picks.dangling.empty()) {
+                    std::string msg = type + ": edge selector dangling: ";
+                    for (std::size_t k = 0; k < picks.dangling.size(); ++k) {
+                        if (k) msg += "; ";
+                        msg += picks.dangling[k];
+                    }
+                    throw std::runtime_error(msg);
+                }
+                if (picks.edges.empty())
+                    throw std::runtime_error(type + ": bend edge not resolved");
+
+                ::geom::BendFrame fr =
+                    ::geom::sm_bend_frame(body, picks.edges[0], thickness);
+                if (!fr.ok) throw std::runtime_error(fr.error);
+
+                const bool flip = feat.value("flip", false);
+                Eigen::Vector3d fold_dir = fr.n_broad * (flip ? -1.0 : 1.0);
+                fold_dir.normalize();
+
+                TopoDS_Shape tool;
+                double rec_angle = 0.0, rec_radius = 0.0, rec_wall = 0.0;
+                std::string rec_position = "material_inside";
+                // A jog appends TWO bend records (the up bend + the back bend).
+                std::vector<::geom::BendRecord> new_recs;
+
+                if (type == "sm_edge_flange") {
+                    const double angle_deg = feat.contains("angle")
+                        ? num_or_expr(feat.at("angle"), env) : 90.0;
+                    const double wall = feat.contains("length")
+                        ? num_or_expr(feat.at("length"), env) : 20.0;
+                    const double inner_radius = feat.contains("radius")
+                        ? num_or_expr(feat.at("radius"), env) : radius_default;
+                    const double k_factor = feat.contains("k_factor")
+                        ? num_or_expr(feat.at("k_factor"), env) : k_default;
+                    const std::string position = feat.value("position", std::string("material_inside"));
+                    if (!(inner_radius > 0.0))
+                        throw std::runtime_error("sm_edge_flange: bend radius must be > 0");
+                    if (!(wall > 0.0))
+                        throw std::runtime_error("sm_edge_flange: flange length must be > 0");
+                    if (!(std::abs(angle_deg) >= 1e-6 && std::abs(angle_deg) < 180.0))
+                        throw std::runtime_error("sm_edge_flange: angle must be in (0, 180) degrees");
+
+                    tool = ::geom::sm_edge_flange_solid(
+                        fr.p_start, fr.e_dir, fr.length_dir, fold_dir, fr.edge_length,
+                        thickness, inner_radius, angle_deg, wall, position);
+                    rec_angle = angle_deg; rec_radius = inner_radius; rec_wall = wall;
+                    rec_position = position;
+                    ::geom::BendRecord rec;
+                    rec.angle = angle_deg; rec.radius = inner_radius;
+                    rec.thickness = thickness;
+                    rec.bend_allowance = ::geom::sm_bend_allowance(angle_deg, inner_radius,
+                                                                   thickness, k_factor);
+                    rec.wall_length = wall; rec.position = position;
+                    rec.p_start = fr.p_start; rec.p_end = fr.p_end;
+                    rec.e_dir = fr.e_dir; rec.length_dir = fr.length_dir;
+                    new_recs.push_back(rec);
+
+                } else if (type == "sm_hem") {
+                    const std::string htype = feat.value("hem_type", std::string("closed"));
+                    if (htype != "closed" && htype != "open" && htype != "teardrop")
+                        throw std::runtime_error("sm_hem: type must be closed|open|teardrop");
+                    double length = feat.contains("length")
+                        ? num_or_expr(feat.at("length"), env) : 5.0 * thickness;
+                    const double radius_default_hem =
+                        (htype == "closed") ? (thickness / 2.0) : thickness;
+                    const double inner_radius = feat.contains("radius")
+                        ? num_or_expr(feat.at("radius"), env) : radius_default_hem;
+                    const double k_factor = feat.contains("k_factor")
+                        ? num_or_expr(feat.at("k_factor"), env) : k_default;
+                    if (!(inner_radius > 0.0))
+                        throw std::runtime_error("sm_hem: bend radius must be > 0");
+                    length = std::max(length, 1.5 * thickness);
+
+                    const double bend_angle = (htype == "teardrop") ? 235.0 : 180.0;
+                    const double Rc = inner_radius + thickness / 2.0;
+                    const double start_x = -(inner_radius + thickness);
+                    const double start_y = -thickness / 2.0;
+                    const double pre_run = inner_radius + thickness;
+                    std::vector<::geom::StripOp> ops = {
+                        {::geom::StripOp::Run, pre_run, 0.0, true},
+                        {::geom::StripOp::Bend, bend_angle, Rc, true},
+                        {::geom::StripOp::Run, length, 0.0, true}};
+                    tool = ::geom::sm_strip_from_centerline(
+                        fr.p_start, fr.e_dir, fr.length_dir, fold_dir, fr.edge_length,
+                        thickness, ops, start_x, start_y);
+                    rec_angle = bend_angle; rec_radius = inner_radius; rec_wall = length;
+                    ::geom::BendRecord rec;
+                    rec.angle = bend_angle; rec.radius = inner_radius;
+                    rec.thickness = thickness;
+                    rec.bend_allowance = ::geom::sm_bend_allowance(bend_angle, inner_radius,
+                                                                   thickness, k_factor);
+                    rec.wall_length = length; rec.position = "material_inside";
+                    rec.p_start = fr.p_start; rec.p_end = fr.p_end;
+                    rec.e_dir = fr.e_dir; rec.length_dir = fr.length_dir;
+                    new_recs.push_back(rec);
+
+                } else {  // sm_jog
+                    const double angle_deg = feat.contains("angle")
+                        ? num_or_expr(feat.at("angle"), env) : 90.0;
+                    const double offset = feat.contains("offset")
+                        ? num_or_expr(feat.at("offset"), env) : 10.0;
+                    const double wall = feat.contains("length")
+                        ? num_or_expr(feat.at("length"), env) : 20.0;
+                    const double inner_radius = feat.contains("radius")
+                        ? num_or_expr(feat.at("radius"), env) : radius_default;
+                    const double k_factor = feat.contains("k_factor")
+                        ? num_or_expr(feat.at("k_factor"), env) : k_default;
+                    const std::string position = feat.value("position", std::string("material_inside"));
+                    if (!(inner_radius > 0.0))
+                        throw std::runtime_error("sm_jog: bend radius must be > 0");
+                    if (!(wall > 0.0))
+                        throw std::runtime_error("sm_jog: flange length must be > 0");
+                    if (!(std::abs(angle_deg) >= 1e-6 && std::abs(angle_deg) <= 90.0 + 1e-6))
+                        throw std::runtime_error("sm_jog: angle must be in (0, 90] degrees");
+
+                    const double ang = radians(angle_deg);
+                    const double Rc = inner_radius + thickness / 2.0;
+                    const double bend_rise = 2.0 * Rc * (1.0 - std::cos(ang));
+                    const double needed = offset - bend_rise;
+                    double connector = (std::sin(ang) > 1e-6) ? needed / std::sin(ang) : 0.0;
+                    if (connector < 0.0) connector = 0.05 * thickness;
+
+                    double x0;
+                    if (position == "material_inside")       x0 = -(inner_radius + thickness);
+                    else if (position == "material_outside") x0 = -inner_radius;
+                    else                                     x0 = 0.0;
+                    double pre_run = -x0;
+                    if (pre_run < 0) pre_run = 0.0;
+                    const double start_x = x0;
+                    const double start_y = -thickness / 2.0;
+                    std::vector<::geom::StripOp> ops = {
+                        {::geom::StripOp::Run, pre_run + thickness, 0.0, true},
+                        {::geom::StripOp::Bend, angle_deg, Rc, true},
+                        {::geom::StripOp::Run, connector, 0.0, true},
+                        {::geom::StripOp::Bend, angle_deg, Rc, false},
+                        {::geom::StripOp::Run, wall, 0.0, true}};
+                    tool = ::geom::sm_strip_from_centerline(
+                        fr.p_start, fr.e_dir, fr.length_dir, fold_dir, fr.edge_length,
+                        thickness, ops, start_x, start_y);
+                    rec_angle = angle_deg; rec_radius = inner_radius; rec_wall = wall;
+                    rec_position = position;
+                    // up bend (wall = connector) + back bend (wall = length).
+                    for (double w : {connector, wall}) {
+                        ::geom::BendRecord rec;
+                        rec.angle = angle_deg; rec.radius = inner_radius;
+                        rec.thickness = thickness;
+                        rec.bend_allowance = ::geom::sm_bend_allowance(angle_deg, inner_radius,
+                                                                       thickness, k_factor);
+                        rec.wall_length = w; rec.position = position;
+                        rec.p_start = fr.p_start; rec.p_end = fr.p_end;
+                        rec.e_dir = fr.e_dir; rec.length_dir = fr.length_dir;
+                        new_recs.push_back(rec);
+                    }
+                }
+                (void)rec_angle; (void)rec_radius; (void)rec_wall; (void)rec_position;
+
+                if (tool.IsNull())
+                    throw std::runtime_error(type + ": geometry build failed");
+                GProp_GProps gt;
+                BRepGProp::VolumeProperties(tool, gt);
+                if (gt.Mass() <= 1e-9)
+                    throw std::runtime_error(type + ": produced an empty solid");
+
+                TopoDS_Shape fused = ::geom::fuse(body, tool);
+                if (fused.IsNull())
+                    throw std::runtime_error(type + ": fuse to sheet failed");
+                // A valid wall shares a face with the sheet -> ONE connected solid.
+                int nsolids = 0;
+                for (TopExp_Explorer sx(fused, TopAbs_SOLID); sx.More(); sx.Next()) ++nsolids;
+                if (nsolids > 1)
+                    throw std::runtime_error(type + ": result is not connected to the sheet");
+                GProp_GProps gb, ga;
+                BRepGProp::VolumeProperties(body, gb);
+                BRepGProp::VolumeProperties(fused, ga);
+                if (ga.Mass() <= gb.Mass() + 1e-9)
+                    throw std::runtime_error(type + ": added no material (degenerate placement?)");
+
+                for (const ::geom::BendRecord& r : new_recs) bend_records.push_back(r);
+                consumed.insert(body_id);
+                source_of[id] = body_id;
+                results[id] = SolidResult{fused};
+                solid_order.push_back(id);
+                st.ok = true;
+
+            } else if (type == "sm_flat_pattern") {
+                // Unfold the running sheet-metal body into its FLAT PATTERN (developed
+                // blank): rebuild the flat base from the largest broad face + add one
+                // developed strip (BA + wall) per bend record. Port of
+                // engine/doc/features/sheetmetal_flat.py::compile_sm_flat_pattern.
+                if (!sheet_ctx.active)
+                    throw std::runtime_error("sm_flat_pattern: the active body is not sheet metal");
+                const std::string body_id = current_solid_id();
+                if (body_id.empty())
+                    throw std::runtime_error("sm_flat_pattern: no body to flatten");
+                const TopoDS_Shape& body = require_solid(results, body_id, "body");
+                if (bend_records.empty())
+                    throw std::runtime_error("sm_flat_pattern: the part has no bends to unfold");
+
+                TopoDS_Shape flat = ::geom::sm_flat_pattern_solid(
+                    body, sheet_ctx.thickness, bend_records);
+                if (flat.IsNull())
+                    throw std::runtime_error("sm_flat_pattern: produced an empty flat body");
+                GProp_GProps gf;
+                BRepGProp::VolumeProperties(flat, gf);
+                if (gf.Mass() <= 1e-9)
+                    throw std::runtime_error("sm_flat_pattern: produced an empty flat body");
+
+                consumed.insert(body_id);
+                source_of[id] = body_id;
+                results[id] = SolidResult{flat};
                 solid_order.push_back(id);
                 st.ok = true;
 

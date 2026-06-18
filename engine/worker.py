@@ -625,27 +625,133 @@ def _eval_curvature(params: dict, _emit: EmitFn) -> dict:
 
 # =========================================================================== C22a orchestrator (M9)
 #
-# MIGRATED TO THE C++ CORE (libaicad). The v2 AI agent — agent_run_v2 (design), agent_ask_v2
-# (ask), agent_pm_assist_v1 (PM assist) and get_prompts_v2 (prompt catalog) — now runs
-# in-process in the C++ core, which the host routes to by default (AI_CAD_CPP_AGENT on). The
-# Python orchestrator/ask/pm_assist modules were deleted after a final differential-parity pass
-# (orch 20 / micro 65 / assist 87 / agent-support 163 all MATCH). The LEGACY agent_design
-# code-gen path (above) stays in Python (agent/loop.py executes build123d code). agent_cancel
-# remains as a harmless no-op for any run not tracked in this process (the C++ core owns v2 run
-# lifecycles now).
+# The deterministic AI orchestrator (agent/orchestrator). agent_run_v2 runs a design against an
+# OPEN doc session, streaming the events.md §3 hierarchy (run/stage/agent_call/agent_output/
+# stage_result/run_finished) via the per-request emit fn. agent_cancel flags a run for best-effort
+# cancel (checked at stage boundaries). get_prompts_v2 exposes the per-role editable prompts. The
+# legacy agent_design path (above) is untouched.
 
-# Active orchestrator runs: run_id -> control. Retained for agent_cancel; normally empty now.
+# Active orchestrator runs: run_id -> RunControl (cooperative cancel flag).
 _RUNS: dict = {}
 
 
+def _agent_run_v2(params: dict, emit_event: EmitFn) -> dict:
+    from agent import config
+    from agent.orchestrator import run as orun
+    from agent.orchestrator.machine import RunControl
+    from engine.doc import session as docsess
+    from dataclasses import asdict
+
+    request = params["request"]
+    s = docsess.get_session(params["doc_id"])
+    provider = config.get_provider()
+    options = dict(params.get("options") or {})
+    control = RunControl()
+    run_id = options.get("run_id")
+    if run_id:
+        _RUNS[run_id] = control
+    options["control"] = control
+
+    seen_ids: set = set()
+
+    def _register_then_emit(ev: dict) -> None:
+        # The first event (run_started) carries the generated run_id; register the control under it
+        # so agent_cancel can find a run that didn't pass an explicit id.
+        rid = ev.get("run_id")
+        if rid:
+            seen_ids.add(rid)
+            if rid not in _RUNS:
+                _RUNS[rid] = control
+        emit_event(ev)
+
+    # C35: route to the MICRO-ORCHESTRATION profile for small-context local models (decompose ->
+    # per-step execute + python verify). Falls back to the full v2 machine otherwise. The RPC
+    # options may explicitly request a workflow/profile; this keeps the documented worker surface
+    # aligned with the actual dispatcher.
+    from agent.orchestrator import micro
+    agent_cfg = config.load_config()
+    workflow = str(options.get("workflow") or options.get("profile") or "").strip().lower()
+    if workflow in ("micro", "local", "small-context", "small_context", "tiny"):
+        agent_cfg["micro_mode"] = True
+    elif workflow in ("full", "standard", "machine"):
+        agent_cfg["micro_mode"] = False
+    elif workflow not in ("", "auto"):
+        raise ValueError("agent_run_v2 options.workflow must be auto, micro, or full")
+    use_micro = micro.should_engage(provider, agent_cfg)
+    options["workflow"] = "micro" if use_micro else "full"
+
+    try:
+        if use_micro:
+            result = micro.run_micro_design(request, s, provider,
+                                            emit=_register_then_emit, options=options)
+        else:
+            result = orun.run_design(request, s, provider,
+                                     emit=_register_then_emit, options=options)
+        seen_ids.add(result.run_id)
+        return asdict(result)
+    finally:
+        for rid in seen_ids:
+            _RUNS.pop(rid, None)
+        if run_id:
+            _RUNS.pop(run_id, None)
+
+
 def _agent_cancel(params: dict, _emit_event: EmitFn) -> dict:
-    """Best-effort cancel: flag the run if this process tracks it (it no longer drives v2 runs)."""
+    """Best-effort cancel: flag the run; the machine checks the flag at the next stage boundary."""
     run_id = params["run_id"]
     control = _RUNS.get(run_id)
     if control is None:
         return {"cancelled": False, "reason": "unknown or finished run"}
     control.cancelled = True
     return {"cancelled": True}
+
+
+def _get_prompts_v2(_params: dict, _emit_event: EmitFn) -> dict:
+    """Per-role editable prompt records for the GUI prompt editor (diff vs built-in, reset)."""
+    from agent.orchestrator import roles
+    return {"prompts": roles.get_prompts_v2()}
+
+
+# =========================================================================== ask mode (Wave D)
+#
+# agent_ask_v2 {doc_id, question} -> {answer}: answers a QUESTION about the open part WITHOUT
+# mutating anything. Thin adapter — the prompt assembly + single provider call live in
+# agent/ask.py (testable without the worker subprocess). A missing/empty/unknown doc_id is
+# handled gracefully: the assistant answers about general CAD usage instead of erroring.
+
+
+def _agent_ask_v2(params: dict, _emit_event: EmitFn) -> dict:
+    from agent import ask, config
+
+    question = params["question"]
+    session = None
+    doc_id = params.get("doc_id") or ""
+    if doc_id:
+        try:
+            from engine.doc import session as docsess
+            session = docsess.get_session(doc_id)
+        except Exception:  # noqa: BLE001 — unknown doc => answer about general usage
+            session = None
+    provider = config.get_provider()
+    return {"answer": ask.answer_question(question, session, provider)}
+
+
+def _agent_pm_assist_v1(params: dict, _emit_event: EmitFn) -> dict:
+    from agent import config, pm_assist
+
+    session = None
+    doc_id = params.get("doc_id") or ""
+    if doc_id:
+        try:
+            from engine.doc import session as docsess
+            session = docsess.get_session(doc_id)
+        except Exception:  # noqa: BLE001 — PM assist can still answer from form context
+            session = None
+    try:
+        provider = config.get_provider()
+    except Exception:  # noqa: BLE001 — pm_assist has a deterministic fallback path
+        provider = None
+    return pm_assist.assist_property_manager(params, session, provider)
 
 
 _METHODS = {
@@ -714,10 +820,13 @@ from engine.doc import drawing as _drawing  # noqa: E402
 
 _METHODS.update(_drawing.WORKER_METHODS)
 
-# C22a orchestrator (M9) — agent_run_v2 / get_prompts_v2 migrated to the C++ core (libaicad);
-# only the no-op agent_cancel remains in Python (the C++ core owns v2 run lifecycles now).
+# C22a orchestrator (M9) — registered via update so the shared _METHODS dict literal stays owned by
+# the worker integrator. agent_run_v2/agent_cancel/get_prompts_v2 keep the LEGACY plain-string error
+# shape (they are not in _STRUCTURED_ERROR_METHODS), matching agent_design.
 _METHODS.update({
+    "agent_run_v2": _agent_run_v2,
     "agent_cancel": _agent_cancel,
+    "get_prompts_v2": _get_prompts_v2,
 })
 
 # Methods that emit the structured error envelope {code, message, detail} on failure.
@@ -745,7 +854,10 @@ _STRUCTURED_ERROR_METHODS = {
     "drawing_add_section", "drawing_add_detail",
 }
 
-# ---- ask mode (Wave D) — agent_ask_v2 / agent_pm_assist_v1 migrated to the C++ core (libaicad). --
+# ---- ask mode (Wave D) — registered via update/add so the literals above stay frozen ----
+_METHODS.update({"agent_ask_v2": _agent_ask_v2, "agent_pm_assist_v1": _agent_pm_assist_v1})
+_STRUCTURED_ERROR_METHODS.add("agent_ask_v2")
+_STRUCTURED_ERROR_METHODS.add("agent_pm_assist_v1")
 
 # ---- CONFIG configurations — config_* RPCs (registered via update so the literal stays frozen) --
 _METHODS.update({

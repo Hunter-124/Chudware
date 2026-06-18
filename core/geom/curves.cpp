@@ -13,10 +13,10 @@
 #include <Geom_Surface.hxx>
 #include <Geom2d_Line.hxx>
 #include <Geom2d_TrimmedCurve.hxx>
-#include <GeomAPI_PointsToBSpline.hxx>
+#include <GeomAPI_Interpolate.hxx>
 #include <Geom_BSplineCurve.hxx>
 #include <GeomAbs_Shape.hxx>
-#include <TColgp_Array1OfPnt.hxx>
+#include <TColgp_HArray1OfPnt.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
 #include <gp_Ax1.hxx>
@@ -83,11 +83,18 @@ TopoDS_Wire make_helix(double pitch, double height, double radius, double cone_a
 TopoDS_Wire make_spline_wire(const std::vector<std::array<double, 3>>& pts) {
     if (pts.size() < 2) return TopoDS_Wire();
     try {
-        TColgp_Array1OfPnt arr(1, static_cast<int>(pts.size()));
+        // build123d Edge.make_spline INTERPOLATES through every point via
+        // GeomAPI_Interpolate (periodic=false, tol=1e-6) — NOT an approximating
+        // PointsToBSpline fit. Match it exactly so the swept-solid volume of a
+        // variable-pitch helix / flat spiral agrees with the oracle to full tolerance.
+        Handle(TColgp_HArray1OfPnt) arr =
+            new TColgp_HArray1OfPnt(1, static_cast<int>(pts.size()));
         for (size_t i = 0; i < pts.size(); ++i)
-            arr.SetValue(static_cast<int>(i) + 1, gp_Pnt(pts[i][0], pts[i][1], pts[i][2]));
-        GeomAPI_PointsToBSpline fit(arr);
-        Handle(Geom_BSplineCurve) curve = fit.Curve();
+            arr->SetValue(static_cast<int>(i) + 1, gp_Pnt(pts[i][0], pts[i][1], pts[i][2]));
+        GeomAPI_Interpolate interp(arr, Standard_False, 1.0e-6);
+        interp.Perform();
+        if (!interp.IsDone()) return TopoDS_Wire();
+        Handle(Geom_BSplineCurve) curve = interp.Curve();
         if (curve.IsNull()) return TopoDS_Wire();
         BRepBuilderAPI_MakeEdge mk(curve);
         if (!mk.IsDone()) return TopoDS_Wire();

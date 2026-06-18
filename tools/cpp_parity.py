@@ -521,6 +521,27 @@ def fixtures():
          "refs": {"profile": [{"kind": "region", "sketch": "s1"}],
                   "path": {"kind": "region", "sketch": "hx"}}}]}
 
+    # ---- curve: VARIABLE-pitch helix (pitch_table) consumed as a sweep path ---------
+    # Same r=2 circle swept along a variable-pitch helix whose pitch_table ramps pitch
+    # 5->10 and diameter 16->24 over 6 turns. Both engines build the path as a B-spline
+    # sampled 48/turn through the SAME analytic curve (piecewise-linear radius +
+    # trapezoidal-integrated height), so the swept tube's exact BRep volume matches to
+    # full tolerance. Regression-guards the variable-pitch port against the oracle.
+    vx_prof_e = [_circle("e1", 0, 0, 2)]
+    vx_prof_c = [_rel("c1", "fix", ["e1.center"]), _dim("c2", "radius", ["e1"], 2)]
+    out["helix_varpitch_sweep"] = {"features": [
+        _sketch("s1", "plane.top", vx_prof_e, vx_prof_c),
+        {"id": "hx", "type": "helix",
+         "params": {"pitch_table": [
+             {"turn": 0, "pitch": 5,  "dia": 16},
+             {"turn": 3, "pitch": 5,  "dia": 16},
+             {"turn": 6, "pitch": 10, "dia": 24},
+         ]},
+         "refs": {"base": "plane.top"}},
+        {"id": "sw", "type": "sweep", "params": {"mode": "boss"},
+         "refs": {"profile": [{"kind": "region", "sketch": "s1"}],
+                  "path": {"kind": "region", "sketch": "hx"}}}]}
+
     # ---- import feature (engine/doc/features/import_feature.py, B-rep path) --------
     # Export a known 30x20x10 box (V=6000) to a temp STEP, then import it as a frozen
     # body feature on BOTH engines and compare volume. Skipped if build123d's STEP

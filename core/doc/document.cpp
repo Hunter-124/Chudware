@@ -18,6 +18,7 @@
 
 #include "doc/document.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
@@ -908,8 +909,8 @@ CompileResult compile_document(const json& doc, const json& env_json) {
             } else if (type == "helix") {
                 // Curve feature (engine/doc/features/curves.py): build a helix / flat
                 // spiral / variable-pitch wire in the base local frame. Ported:
-                // constant-pitch helix (incl. taper + start_angle + handedness) and the
-                // flat Archimedean spiral. Variable-pitch (pitch_table) is deferred.
+                // constant-pitch helix (incl. taper + start_angle + handedness), the
+                // flat Archimedean spiral, and variable-pitch (pitch_table).
                 // refs.base = a datum plane / csys (origin + axis); standalone helices
                 // fall back to the `radius` param. Stores a CurveResult a sweep consumes.
                 const json bref = feat.contains("base") ? feat.at("base") : json("plane.top");
@@ -920,9 +921,6 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         "picks not yet ported here)");
                 aicad::geom::SketchPlane base = *bp;
 
-                if (feat.contains("pitch_table"))
-                    throw std::runtime_error("helix: variable-pitch (pitch_table) not yet ported");
-
                 const double start_angle =
                     feat.contains("start_angle") ? num_or_expr(feat.at("start_angle"), env) : 0.0;
                 const bool ccw = feat.value("ccw", true);
@@ -931,7 +929,148 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                      feat["shape"].get<std::string>() == "spiral");
 
                 TopoDS_Wire local_wire;
-                if (is_spiral) {
+                if (feat.contains("pitch_table")) {
+                    // Variable pitch — mirror curves.py _parse_pitch_table /
+                    // _interp_radius / _integrate_height + _build_variable_pitch.
+                    // Rows are {turn,pitch,dia|diameter|radius} mappings OR bare
+                    // [turn,pitch,dia?] lists; each scalar may be a {value,expr} dim
+                    // (matching _scalar: read 'value' if object, else a bare number).
+                    const double default_radius =
+                        feat.contains("radius") ? num_or_expr(feat.at("radius"), env) : 10.0;
+                    const json& table = feat.at("pitch_table");
+                    if (!table.is_array() || table.empty())
+                        throw std::runtime_error("helix: pitch_table must be a non-empty list of rows");
+
+                    // _scalar: a dim {value,...} reads its numeric 'value'; otherwise a bare number.
+                    auto cell_scalar = [](const json& v) -> double {
+                        const json& src = v.is_object() ? v.value("value", json()) : v;
+                        if (!src.is_number())
+                            throw std::runtime_error("helix: expected a numeric value in pitch_table");
+                        return src.get<double>();
+                    };
+
+                    // (turn, pitch, radius_or_nan) before fill.
+                    std::vector<std::array<double, 3>> raw_rows;
+                    for (size_t i = 0; i < table.size(); ++i) {
+                        const json& row = table[i];
+                        double turn, pitch, rad = std::numeric_limits<double>::quiet_NaN();
+                        if (row.is_object()) {
+                            if (!row.contains("turn") || !row.contains("pitch"))
+                                throw std::runtime_error(
+                                    "helix: pitch_table row needs 'turn' and 'pitch' keys");
+                            turn = cell_scalar(row.at("turn"));
+                            pitch = cell_scalar(row.at("pitch"));
+                            if (row.contains("dia") && !row.at("dia").is_null())
+                                rad = cell_scalar(row.at("dia")) / 2.0;
+                            else if (row.contains("diameter") && !row.at("diameter").is_null())
+                                rad = cell_scalar(row.at("diameter")) / 2.0;
+                            else if (row.contains("radius") && !row.at("radius").is_null())
+                                rad = cell_scalar(row.at("radius"));
+                        } else if (row.is_array()) {
+                            if (row.size() < 2)
+                                throw std::runtime_error(
+                                    "helix: pitch_table row needs at least [turn, pitch]");
+                            turn = cell_scalar(row[0]);
+                            pitch = cell_scalar(row[1]);
+                            if (row.size() >= 3 && !row[2].is_null())
+                                rad = cell_scalar(row[2]) / 2.0;
+                        } else {
+                            throw std::runtime_error(
+                                "helix: pitch_table row must be a mapping or list");
+                        }
+                        if (!(pitch > 0.0))
+                            throw std::runtime_error("helix: pitch_table row pitch must be > 0");
+                        if (turn < 0.0)
+                            throw std::runtime_error("helix: pitch_table row turn must be >= 0");
+                        raw_rows.push_back({turn, pitch, rad});
+                    }
+
+                    // Stable sort by turn (matches Python list.sort stability).
+                    std::stable_sort(raw_rows.begin(), raw_rows.end(),
+                                     [](const std::array<double, 3>& a,
+                                        const std::array<double, 3>& b) { return a[0] < b[0]; });
+                    // Collapse exact-duplicate turn keys to the last row given for that turn.
+                    std::vector<std::array<double, 3>> rows;
+                    for (const auto& r : raw_rows) {
+                        if (!rows.empty() && std::abs(rows.back()[0] - r[0]) < 1e-12)
+                            rows.back() = r;
+                        else
+                            rows.push_back(r);
+                    }
+                    if (rows.size() < 2)
+                        throw std::runtime_error(
+                            "helix: pitch_table needs at least two distinct turn rows");
+                    if (rows[0][0] > 1e-9)
+                        rows.insert(rows.begin(), {0.0, rows[0][1], rows[0][2]});
+
+                    // Forward-fill radii. Seed = first explicit radius (if any) else default.
+                    double first_explicit = std::numeric_limits<double>::quiet_NaN();
+                    for (const auto& r : rows)
+                        if (!std::isnan(r[2])) { first_explicit = r[2]; break; }
+                    double running = std::isnan(first_explicit) ? default_radius : first_explicit;
+                    for (auto& r : rows) {
+                        if (!std::isnan(r[2])) {
+                            if (!(r[2] > 0.0))
+                                throw std::runtime_error(
+                                    "helix: pitch_table radius/diameter must be > 0");
+                            running = r[2];
+                        }
+                        r[2] = running;
+                    }
+
+                    const double total_turns = rows.back()[0];
+                    if (!(total_turns > 0.0))
+                        throw std::runtime_error(
+                            "helix: pitch_table must span a positive number of turns");
+
+                    // Piecewise-linear radius at `turn` (clamped to table range).
+                    auto interp_radius = [&rows](double turn) -> double {
+                        if (turn <= rows.front()[0]) return rows.front()[2];
+                        if (turn >= rows.back()[0]) return rows.back()[2];
+                        for (size_t k = 0; k + 1 < rows.size(); ++k) {
+                            double t0 = rows[k][0], t1 = rows[k + 1][0];
+                            if (t0 <= turn && turn <= t1) {
+                                if (t1 - t0 < 1e-12) return rows[k + 1][2];
+                                double f = (turn - t0) / (t1 - t0);
+                                return rows[k][2] + f * (rows[k + 1][2] - rows[k][2]);
+                            }
+                        }
+                        return rows.back()[2];
+                    };
+                    // Cumulative axial height = trapezoidal integral of pitch over turn.
+                    auto integrate_height = [&rows](double turn) -> double {
+                        if (turn <= rows.front()[0]) return 0.0;
+                        double z = 0.0;
+                        for (size_t k = 0; k + 1 < rows.size(); ++k) {
+                            double t0 = rows[k][0], t1 = rows[k + 1][0];
+                            double p0 = rows[k][1], p1 = rows[k + 1][1];
+                            if (turn <= t0) break;
+                            double seg_end = std::min(turn, t1);
+                            if (seg_end <= t0) continue;
+                            double span = seg_end - t0;
+                            double p_end = (t1 - t0 < 1e-12)
+                                ? p1 : p0 + (seg_end - t0) / (t1 - t0) * (p1 - p0);
+                            z += 0.5 * (p0 + p_end) * span;
+                        }
+                        if (turn > rows.back()[0])
+                            z += rows.back()[1] * (turn - rows.back()[0]);
+                        return z;
+                    };
+
+                    const double sign = ccw ? 1.0 : -1.0;
+                    const double a0 = radians(start_angle);
+                    int n = std::max(2, (int)std::ceil(total_turns * 48));
+                    std::vector<std::array<double, 3>> pts;
+                    pts.reserve(n + 1);
+                    for (int i = 0; i <= n; ++i) {
+                        double turn = total_turns * i / n;
+                        double ang = a0 + sign * 2.0 * PI * turn;
+                        double r = interp_radius(turn);
+                        double z = integrate_height(turn);
+                        pts.push_back({r * std::cos(ang), r * std::sin(ang), z});
+                    }
+                    local_wire = ::geom::make_spline_wire(pts);
+                } else if (is_spiral) {
                     double pitch = feat.contains("pitch") ? num_or_expr(feat.at("pitch"), env) : 5.0;
                     if (!(pitch > 0.0)) throw std::runtime_error("helix: spiral pitch must be > 0");
                     double turns = feat.contains("turns") ? num_or_expr(feat.at("turns"), env) : 0.0;

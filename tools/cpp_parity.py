@@ -733,6 +733,62 @@ def fixtures():
         _sketch("s1", "pl", dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]}
 
     # ====================================================================
+    # P55q: the final point datum sub-methods that need OCCT projection /
+    # intersection. on_face (a Plane(face) uv lift), on_curve (a point at a
+    # fraction/param along a curve, via BRepAdaptor_Curve), intersection (the
+    # nearest-approach point of two curves OR a curve and a surface, via
+    # BRepExtrema_DistShapeShape). Each point is CONSUMED as a vertex of a
+    # three_point plane + a 20x20 boss (V=2000) so the resolved point's exact
+    # position is gated by the boss's volume + body count (the established,
+    # OCCT-version-independent datum-parity bar above). After this the datum
+    # POINT feature is fully ported (no point sub-case left).
+    # ====================================================================
+
+    # ---- datum POINT via on_face with a uv offset, consumed as one vertex of a
+    # three_point plane. The point sits on the TOP planar face (z=20, area centroid
+    # [20,15,20], Plane(face) x_dir=+X / y_dir=+Y) at uv=[3,-4] -> world [23,11,20].
+    # Two coordinate points complete the (flat z=20) plane; a 20x20 boss on it
+    # (V=2000) gates the on_face uv lift (origin + u*x_dir + v*y_dir). 2 bodies,
+    # total 26000. If the uv lift diverged the plane would tilt and the boss volume
+    # would differ identically on both engines, so any mismatch fails the gate.
+    out["datum_point_on_face_uv_plane"] = {"features": _sel_datum_base() + [
+        {"id": "pa", "type": "point", "params": {"method": "on_face", "uv": [3.0, -4.0]},
+         "refs": {"target": sd_top}},
+        _point("pb", 40, 0, 20), _point("pc", 0, 30, 20),
+        {"id": "pl", "type": "plane", "params": {"method": "three_point"},
+         "refs": {"points": [_datum("pa"), _datum("pb"), _datum("pc")]}},
+        _sketch("s1", "pl", dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]}
+
+    # ---- datum POINT via on_curve at fraction 0.5 along the picked bottom +X edge
+    # (sd_edge spans x[0,40] at y=0,z=0 -> midpoint [20,0,0]), consumed as a
+    # three_point vertex with two coord points (all z=0) -> the z=0 plane + a 20x20
+    # boss (V=2000). Gates the curve landing (BRepAdaptor_Curve at fr=0.5). 2 bodies.
+    out["datum_point_on_curve_plane"] = {"features": _sel_datum_base() + [
+        {"id": "pa", "type": "point",
+         "params": {"method": "on_curve", "fraction": {"value": 0.5, "expr": None}},
+         "refs": {"target": sd_edge}},
+        _point("pb", 40, 0, 0), _point("pc", 0, 30, 0),
+        {"id": "pl", "type": "plane", "params": {"method": "three_point"},
+         "refs": {"points": [_datum("pa"), _datum("pb"), _datum("pc")]}},
+        _sketch("s1", "pl", dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]}
+
+    # ---- datum POINT via intersection of two picked bottom edges that share a
+    # corner: the +X edge (sd_edge, y=0,z=0) and the +Y edge (x=0,z=0) meet at
+    # (0,0,0) (BRepExtrema_DistShapeShape nearest approach, distance ~0). Consumed
+    # as a three_point vertex with two coord points (z=0) -> the z=0 plane + a 20x20
+    # boss (V=2000). Gates the curve-curve intersection point. 2 bodies, 26000.
+    sd_edge_y = {"kind": "edge", "surf": "line", "centroid": [0.0, 15.0, 0.0],
+                 "axis": [0.0, 1.0, 0.0], "area_or_len": 30.0,
+                 "owner_feature": None, "hint_index": 0}
+    out["datum_point_intersection_plane"] = {"features": _sel_datum_base() + [
+        {"id": "pa", "type": "point", "params": {"method": "intersection", "other": sd_edge_y},
+         "refs": {"target": sd_edge}},
+        _point("pb", 40, 0, 0), _point("pc", 0, 30, 0),
+        {"id": "pl", "type": "plane", "params": {"method": "three_point"},
+         "refs": {"points": [_datum("pa"), _datum("pb"), _datum("pc")]}},
+        _sketch("s1", "pl", dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]}
+
+    # ====================================================================
     # P55p: the last datum sub-cases that need OCCT surface-projection /
     # curve-tangent. plane.on_surface (z_dir = surface normal at a projected
     # point), plane.normal_to_curve (z_dir = curve tangent at a landing point),

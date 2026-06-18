@@ -39,6 +39,7 @@
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
+#include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepTools.hxx>
 #include <TopExp.hxx>
@@ -812,6 +813,25 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         if (face.Orientation() == TopAbs_REVERSED) normal = -normal;
         return {point, normal.normalized()};
     };
+    // The meeting point of two TopoDS shapes via BRepExtrema_DistShapeShape — datum.py
+    // ::_shape_shape_point. Respects edge/face TRIMMING exactly: when the shapes touch
+    // the minimal distance is ~0 and the solution point IS the intersection; a gap above
+    // `touch_tol` (1e-4 mm) means the shapes do not actually meet -> contained error.
+    // Returns PointOnShape1(1), matching the oracle.
+    auto shape_shape_point =
+        [](const TopoDS_Shape& a, const TopoDS_Shape& b, const char* slot,
+           const char* what) -> Eigen::Vector3d {
+        constexpr double kTouchTol = 1e-4;
+        BRepExtrema_DistShapeShape d(a, b);
+        if (!d.IsDone() || d.NbSolution() < 1)
+            throw std::runtime_error(std::string(slot) + ": " + what +
+                                     " have no common point");
+        if (d.Value() > kTouchTol)
+            throw std::runtime_error(std::string(slot) + ": " + what +
+                                     " do not intersect");
+        gp_Pnt p = d.PointOnShape1(1);
+        return Eigen::Vector3d(p.X(), p.Y(), p.Z());
+    };
     // A planar face -> (origin, outward normal), respecting the face orientation, so a
     // datum plane can be built on it. Mirrors datum.py::_plane_of's Plane(face) path:
     // build123d uses the face centroid as the plane origin + the orientation-aware
@@ -1242,9 +1262,12 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // Datum point (engine/doc/features/datum.py compile_point). Ported:
                 // coordinate (explicit XYZ), a point/vertex-datum target pass-through,
                 // and the selector-driven methods vertex (a picked vertex), center (a
-                // picked circular edge's arc centre or a picked face's centre), and
-                // centroid (the whole-body volume centroid, or a picked face's area
-                // centroid). Stores a PointResult.
+                // picked circular edge's arc centre or a picked face's centre), centroid
+                // (the whole-body volume centroid, or a picked face's area centroid),
+                // on_face (a face's Plane(face) uv lift, or its centre), on_curve (a point
+                // at params.t / params.fraction along a curve), and intersection (the
+                // nearest-approach point of a curve with a second curve or a surface).
+                // Stores a PointResult. The datum-point feature is now fully ported.
                 const std::string method = feat.value("method", std::string("vertex"));
                 auto tit = feat.find("target");
                 const bool target_is_datum =
@@ -1313,6 +1336,70 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     BRepGProp::SurfaceProperties(f, props);
                     gp_Pnt cm = props.CentreOfMass();
                     results[id] = PointResult{Eigen::Vector3d(cm.X(), cm.Y(), cm.Z())};
+                } else if (method == "on_face") {
+                    // A point on a face: with params.uv -> the in-plane (u,v) lift of the
+                    // face's Plane(face) frame (origin = area centroid); without uv -> the
+                    // face centre. A non-planar face has no Plane(face) and falls back to
+                    // the centre regardless of uv. Mirrors datum.py compile_point on_face.
+                    TopoDS_Face f = resolve_face_sel(*tit, "target");
+                    auto uvit = feat.find("uv");
+                    const bool have_uv =
+                        uvit != feat.end() && uvit->is_array() && uvit->size() >= 2;
+                    Eigen::Vector3d p;
+                    BRepAdaptor_Surface ad(f);
+                    if (ad.GetType() == GeomAbs_Plane && have_uv) {
+                        // Planar face + uv -> lift on the orientation-aware plane frame
+                        // (face_plane builds origin=centroid, axes matching Plane(face)).
+                        aicad::geom::SketchPlane pl = face_plane(f, "target");
+                        const double u = (*uvit)[0].get<double>();
+                        const double v = (*uvit)[1].get<double>();
+                        p = pl.lift(Eigen::Vector2d(u, v));
+                    } else {
+                        // No uv (or non-planar) -> the face area centroid (face.center()).
+                        GProp_GProps props;
+                        BRepGProp::SurfaceProperties(f, props);
+                        gp_Pnt cm = props.CentreOfMass();
+                        p = Eigen::Vector3d(cm.X(), cm.Y(), cm.Z());
+                    }
+                    results[id] = PointResult{p};
+                } else if (method == "on_curve") {
+                    // A point AT a parameter / fraction along a model edge's curve. params.t
+                    // (a raw curve parameter, clamped) wins; else params.fraction (0..1 along
+                    // the edge range, default 0.5 = midpoint). datum.py _curve_point_tangent.
+                    TopoDS_Edge e = resolve_edge_sel(*tit, "target");
+                    std::optional<double> param;
+                    if (feat.contains("t")) param = num_or_expr(feat.at("t"), env);
+                    std::optional<double> fraction;
+                    if (feat.contains("fraction"))
+                        fraction = num_or_expr(feat.at("fraction"), env);
+                    auto [pt, tan] =
+                        curve_point_tangent(e, fraction, param, std::nullopt, "target");
+                    (void)tan;
+                    results[id] = PointResult{pt};
+                } else if (method == "intersection") {
+                    // Intersection of refs.target (a curve edge) with params.other (a second
+                    // curve edge OR a surface face), via BRepExtrema_DistShapeShape nearest
+                    // approach (trimming-respecting; errors if they do not meet within tol).
+                    // datum.py _curve_curve_point / _curve_surface_point.
+                    TopoDS_Edge e = resolve_edge_sel(*tit, "target");
+                    auto oit = feat.find("other");
+                    if (oit == feat.end() || !oit->is_object())
+                        throw std::runtime_error(
+                            "point intersection: params.other (a second edge or a face "
+                            "selector) is required");
+                    const std::string okind = oit->value("kind", std::string());
+                    Eigen::Vector3d p;
+                    if (okind == "edge") {
+                        TopoDS_Edge e2 = resolve_edge_sel(*oit, "other");
+                        p = shape_shape_point(e, e2, "other", "curves");
+                    } else if (okind == "face") {
+                        TopoDS_Face f = resolve_face_sel(*oit, "other");
+                        p = shape_shape_point(e, f, "other", "curve and surface");
+                    } else {
+                        throw std::runtime_error(
+                            "point intersection: params.other must be an edge or face selector");
+                    }
+                    results[id] = PointResult{p};
                 } else {
                     throw std::runtime_error(
                         "point: method '" + method + "' needs a geometry selector (not yet ported)");

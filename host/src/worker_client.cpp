@@ -81,7 +81,8 @@ bool routeDocToCpp(const std::string& method, const json& params) {
 // a Python doc (e.g. an assembly) falls through to Python.
 bool cppAgentFlag() {
     const char* f = std::getenv("AI_CAD_CPP_AGENT");
-    return f && f[0] && f[0] != '0';  // explicit opt-in only (default OFF)
+    if (f && f[0]) return f[0] != '0';  // explicit override (1=on, 0=force Python)
+    return true;                        // default ON: v2 agent runs on the C++ core
 }
 
 // Is the active document a C++-backed ("doc-cpp") session? For agent_run_v2 /
@@ -122,7 +123,8 @@ bool routeAgentToCpp(const std::string& method, const json& params) {
 // the two fields the C++ result omits) — so the result is byte-compatible for display.
 bool cppSimFlag() {
     const char* f = std::getenv("AI_CAD_CPP_SIM");
-    return f && f[0] && f[0] != '0';  // explicit opt-in only (default OFF)
+    if (f && f[0]) return f[0] != '0';  // explicit override (1=on, 0=force Python)
+    return true;                        // default ON: FEA mesh/static/modal on the C++ core
 }
 
 bool routeSimToCpp(const std::string& method, const json& /*params*/) {

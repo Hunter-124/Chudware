@@ -222,8 +222,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                         dimText(("(" + std::string(env) + ")").c_str());
                     };
                     routeRow("Documents",  flagOn("AI_CAD_CPP_DOCS",  true),  "AI_CAD_CPP_DOCS");
-                    routeRow("Simulation", flagOn("AI_CAD_CPP_SIM",   false), "AI_CAD_CPP_SIM");
-                    routeRow("AI agent",   flagOn("AI_CAD_CPP_AGENT", false), "AI_CAD_CPP_AGENT");
+                    routeRow("Simulation", flagOn("AI_CAD_CPP_SIM",   true),  "AI_CAD_CPP_SIM");
+                    routeRow("AI agent",   flagOn("AI_CAD_CPP_AGENT", true),  "AI_CAD_CPP_AGENT");
                     routeRow("ECAD",       flagOn("AI_CAD_CPP_ECAD",  false), "AI_CAD_CPP_ECAD");
                 } else {
                     ImGui::TextUnformatted("Active engine: Python worker (subprocess)");

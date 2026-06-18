@@ -78,6 +78,19 @@ if /i not "%MODE%"=="app" (
   copy /y "%EXE%" "%DIST%\AI-CAD.exe" >nul || goto :fail
   robocopy "%ROOT%\host\assets" "%DIST%\assets" /MIR /XF Rubik-VF.ttf make_logo.py /XD __pycache__ /NFL /NDL /NJH /NJS /NP >nul
   if errorlevel 8 goto :fail
+  rem --- stage the C++ core (libaicad.dll + its OCCT/gmsh sibling DLLs) next to
+  rem     the exe so the host loads the in-process C++ engine with NO env override
+  rem     (AI_CAD_LIBAICAD). This is the production engine for parts / sim / agent.
+  set "CORE_BIN=%ROOT%\core\build-occt\bin\Release"
+  if exist "%ROOT%\core\build-occt\bin\Release\libaicad.dll" (
+    echo [build] staging C++ core DLLs from core\build-occt\bin\Release ...
+    robocopy "%ROOT%\core\build-occt\bin\Release" "%DIST%" *.dll /NFL /NDL /NJH /NJS /NP >nul
+    if errorlevel 8 goto :fail
+  ) else (
+    echo [build] WARNING: core\build-occt\bin\Release\libaicad.dll not found -- C++ core NOT staged.
+    echo [build]          The app will fall back to the Python worker. Build the core with:
+    echo [build]          cmake --build core\build-occt --config Release
+  )
 )
 
 for %%P in (engine agent mcp_server installer) do (

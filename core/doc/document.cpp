@@ -1653,19 +1653,55 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (!(std::abs(angle) > 0.0))
                     throw std::runtime_error("revolve angle must be non-zero");
 
-                TopoDS_Shape solid;
+                // Build the revolve tool (union all profile region revolves).
+                TopoDS_Shape tool;
                 for (const TopoDS_Face& f : src.faces) {
                     TopoDS_Shape rev = ::geom::revolve_face(f, axis_pt, axis_dir, angle);
                     if (rev.IsNull())
                         throw std::runtime_error("revolve produced an empty solid");
-                    solid = solid.IsNull() ? rev : ::geom::fuse(solid, rev);
-                    if (solid.IsNull())
+                    tool = tool.IsNull() ? rev : ::geom::fuse(tool, rev);
+                    if (tool.IsNull())
                         throw std::runtime_error("revolve region fuse failed");
                 }
-                if (solid.IsNull())
+                if (tool.IsNull())
                     throw std::runtime_error("revolve produced no solid");
 
-                results[id] = SolidResult{solid};
+                // Apply to the running body, matching engine/doc/features/revolve.py:
+                //   mode default "boss"; merge default True. With no existing body OR
+                //   merge=False (SolidWorks "Merge result" unticked) OR mode=="new",
+                //   the revolve is a NEW standalone body (cut errors — needs a body).
+                //   Otherwise it combines with the CURRENT top body the SAME way the
+                //   extrude path does: cut -> target - tool, boss/add -> target + tool;
+                //   the target body is consumed (owner-map derives the result from it).
+                const std::string rmode = feat.value("mode", std::string("boss"));
+                const bool rmerge = feat.value("merge", true);
+                const std::string rtgt =
+                    (rmode == "new" || !rmerge) ? std::string() : current_solid_id();
+
+                if (rtgt.empty()) {
+                    if (rmode == "cut")
+                        throw std::runtime_error(
+                            "revolve: cut mode requires an existing body to subtract from");
+                    results[id] = SolidResult{tool};
+                } else {
+                    const TopoDS_Shape& target = require_solid(results, rtgt, "target");
+                    TopoDS_Shape out = (rmode == "cut")
+                        ? ::geom::cut(target, tool)
+                        : ::geom::fuse(target, tool);
+                    if (out.IsNull())
+                        throw std::runtime_error(
+                            std::string("revolve boolean ") + rmode + " produced an empty shape");
+                    if (rmode == "cut") {
+                        GProp_GProps gb, ga;
+                        BRepGProp::VolumeProperties(target, gb);
+                        BRepGProp::VolumeProperties(out, ga);
+                        if (std::abs(ga.Mass() - gb.Mass()) < 1e-9)
+                            throw std::runtime_error("revolve cut removed no material");
+                    }
+                    consumed.insert(rtgt);
+                    source_of[id] = rtgt;  // owner-map: result derives from the target body
+                    results[id] = SolidResult{out};
+                }
                 solid_order.push_back(id);
                 st.ok = true;
 

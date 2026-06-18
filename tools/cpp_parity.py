@@ -111,9 +111,11 @@ def _extrude(fid, sketch_fid, depth=None, mode="new", end="blind", merge=None):
             "refs": {"profile": [{"kind": "region", "sketch": sketch_fid}]}}
 
 
-def _revolve(fid, sketch_fid, axis_datum, angle_deg):
-    return {"id": fid, "type": "revolve",
-            "params": {"mode": "boss", "angle": {"value": angle_deg, "expr": None}},
+def _revolve(fid, sketch_fid, axis_datum, angle_deg, mode="boss", merge=None):
+    params = {"mode": mode, "angle": {"value": angle_deg, "expr": None}}
+    if merge is not None:
+        params["merge"] = merge
+    return {"id": fid, "type": "revolve", "params": params,
             "refs": {"profile": [{"kind": "region", "sketch": sketch_fid}], "axis": axis_datum}}
 
 
@@ -159,6 +161,43 @@ def fixtures():
     rev_e, rev_c = _rect(5, 0, 10, 10)
     out["revolve"] = {"features": [
         _sketch("s1", "plane.top", rev_e, rev_c), _revolve("r1", "s1", "axis.y", 360.0)]}
+
+    # revolve boss MERGE onto an existing body (P55m): the revolve mode=boss (merge
+    # default True) must FUSE into the running body the way the oracle does — NOT add a
+    # second body. Base = a circle r=10 extruded 10 (cylinder along +Z, V=1000*pi),
+    # then a rect x[0,15] y[0,20] revolved 360 about axis.y -> a r=15 cylinder along +Y
+    # that OVERLAPS the base; the boss fuses into it -> ONE body. The union volume is the
+    # SAME OCCT boolean on both engines, so the total volume + body count (1) is the gate.
+    rbm_e, rbm_c = _rect(0, 0, 15, 20)
+    out["revolve_boss_merge"] = {"features": [
+        _sketch("sb", "plane.top", [_circle("e1", 0, 0, 10)],
+                [_rel("c1", "fix", ["e1.center"]), _dim("c2", "radius", ["e1"], 10)]),
+        _extrude("bx", "sb", 10.0),
+        _sketch("s1", "plane.top", rbm_e, rbm_c), _revolve("r1", "s1", "axis.y", 360.0)]}
+
+    # revolve CUT into an existing body (P55m): base = circle r=15 extruded 20 (cylinder
+    # along +Z), then a rect x[0,5] y[0,20] revolved 360 about axis.y -> a r=5 cylinder
+    # along +Y that bores through the base; mode=cut subtracts it -> ONE body, volume
+    # reduced by the same OCCT boolean on both engines. Gates the cut->subtract path.
+    rcu_e, rcu_c = _rect(0, 0, 5, 20)
+    out["revolve_cut"] = {"features": [
+        _sketch("sb", "plane.top", [_circle("e1", 0, 0, 15)],
+                [_rel("c1", "fix", ["e1.center"]), _dim("c2", "radius", ["e1"], 15)]),
+        _extrude("bx", "sb", 20.0),
+        _sketch("s1", "plane.top", rcu_e, rcu_c),
+        _revolve("r1", "s1", "axis.y", 360.0, mode="cut")]}
+
+    # revolve mode=new / merge=False -> a SEPARATE body (regression guard for the
+    # standalone path): same base cylinder, then the same boss but merge:false keeps it a
+    # distinct body -> TWO bodies. Total volume = base + the standalone revolve (disjoint
+    # sum is the SAME on both engines).
+    rnb_e, rnb_c = _rect(20, 0, 10, 20)  # x[20,30]: a r=20..30 annulus along +Y, disjoint from the r=10 base
+    out["revolve_new_body"] = {"features": [
+        _sketch("sb", "plane.top", [_circle("e1", 0, 0, 10)],
+                [_rel("c1", "fix", ["e1.center"]), _dim("c2", "radius", ["e1"], 10)]),
+        _extrude("bx", "sb", 10.0),
+        _sketch("s1", "plane.top", rnb_e, rnb_c),
+        _revolve("r1", "s1", "axis.y", 360.0, merge=False)]}
 
     # boolean: two 20x20x10 boxes overlapping by 10x20x10=2000; merge:false keeps
     # each a separate body so the boolean has two operands.

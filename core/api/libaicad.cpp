@@ -37,6 +37,7 @@
 #include "sim/fea_modal.h"
 #include "sim/fea_static.h"
 #include "sim/lbm.h"
+#include "sim/mesher.h"
 #include "sim/netlist.h"
 #include "sim/spice.h"
 
@@ -298,6 +299,27 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                              {"frontal_area_mm2", r.frontal_area_mm2},
                              {"steps_run", r.steps_run},
                              {"diverged", r.diverged}},
+                        out_json, 0);
+        }
+        if (m == "sim_mesh") {
+            // gmsh tet4 mesher (engine/sim/mesher.py parity probe). Wraps the SAME
+            // libgmsh 4.15.2 as the Python oracle, so the mesh is bit-identical.
+            // Params: {"step_path": "<path>", "density": <float, default 0.5>}.
+            // Returns points[n*3], tets[m*4] (0-based), char_len_mm, n_nodes, n_elems.
+            std::string step_path = params.contains("step_path") && params["step_path"].is_string()
+                                        ? params["step_path"].get<std::string>()
+                                        : std::string();
+            if (step_path.empty())
+                return emit_error("sim_mesh: 'step_path' (string) is required", out_json);
+            double density = params.value("density", 0.5);
+            aicad::sim::MeshOut r = aicad::sim::mesh_step(step_path, density);
+            if (!r.ok) return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
+            return emit(json{{"ok", true},
+                             {"points", r.points},
+                             {"tets", r.tets},
+                             {"char_len_mm", r.char_len_mm},
+                             {"n_nodes", r.n_nodes},
+                             {"n_elems", r.n_elems}},
                         out_json, 0);
         }
         if (m == "doc_validate") {

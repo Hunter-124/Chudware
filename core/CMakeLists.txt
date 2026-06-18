@@ -226,6 +226,24 @@ add_test(NAME aicm COMMAND test_aicm)
 # --- Wave 2: OCCT geometry kernel (opt-in) -----------------------------------
 if(AICAD_WITH_OCCT)
   include(ProvisionOCCT)
+
+  # --- P50: gmsh tet mesher (GPL — confined to the OCCT-on build) ------------
+  # Provision the SAME libgmsh 4.15.2 the Python oracle (engine/sim/mesher.py)
+  # wraps, so the C++ tet mesh is bit-identical. gmsh.h lives ONLY in mesher.cpp
+  # (mesher.h is gmsh-free); aicad_mesh links the SDK import lib. The dynamic CRT
+  # matches aicad_miniz / the DLL (same heap as the gmsh runtime).
+  include(ProvisionGmsh)
+  add_library(aicad_mesh STATIC sim/mesher.cpp)
+  target_include_directories(aicad_mesh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_include_directories(aicad_mesh PRIVATE ${GMSH_INCLUDE_DIR})
+  # GMSH_DLL makes gmsh.h's GMSH_API decorate the prototypes __declspec(dllimport)
+  # so they resolve against the SDK import lib (gmsh.dll.lib). PUBLIC so the import
+  # lib propagates onto the final link line of the `aicad` DLL that consumes this
+  # static lib (a STATIC lib's link deps aren't pulled in transitively otherwise).
+  target_compile_definitions(aicad_mesh PRIVATE GMSH_DLL)
+  target_link_libraries(aicad_mesh PUBLIC ${GMSH_IMPORT_LIB})
+  set_property(TARGET aicad_mesh PROPERTY
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
   # Smoke test: box -> volume (BRepGProp) -> tessellation (BRepMesh). Proves the
   # auto-provisioned kernel is found, linked, and runnable end to end.
   add_executable(occt_smoke geom/occt_smoke.cpp)
@@ -545,7 +563,7 @@ if(AICAD_WITH_OCCT)
     api/libaicad.cpp)
   target_include_directories(aicad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_definitions(aicad PRIVATE AICAD_BUILD_DLL)
-  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad)
+  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_mesh)
   set_target_properties(aicad PROPERTIES
     OUTPUT_NAME libaicad   # -> libaicad.dll + libaicad.lib (the host loads by this name)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
@@ -554,6 +572,8 @@ if(AICAD_WITH_OCCT)
   # Stage the OCCT toolkit + 3rdparty (jemalloc/tbb) DLLs next to libaicad.dll so
   # its imports resolve when it is loaded from the same directory.
   aicad_occt_copy_dlls(aicad)
+  # Stage gmsh.dll too (aicad_mesh's runtime dep, imported by libaicad.dll).
+  aicad_gmsh_copy_dll(aicad)
 
   # --- aicad_probe: load libaicad.dll the way the HOST will (LoadLibrary) ------
   # Links NEITHER the core static libs NOR OCCT — only nlohmann_json. It dlopens

@@ -1352,6 +1352,58 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 params.contains("max_n") && params["max_n"].is_number()
                                     ? params["max_n"].get<int>() : 400),
                             out_json, 0);
+            // --- C18 interactive sketch mode (engine/doc/session.py sketch_*) ---
+            // The worker passes the sketch feature id under "sketch".
+            if (m == "sketch_enter")
+                return emit(aicad::doc::doc_sketch_enter(
+                                params.value("doc_id", std::string()),
+                                params.value("sketch", std::string())),
+                            out_json, 0);
+            if (m == "sketch_solve")
+                return emit(aicad::doc::doc_sketch_solve(
+                                params.value("doc_id", std::string()),
+                                params.value("sketch", std::string())),
+                            out_json, 0);
+            if (m == "doc_sketch_overview")
+                return emit(aicad::doc::doc_sketch_overview(
+                                params.value("doc_id", std::string()),
+                                params.value("sketch", std::string())),
+                            out_json, 0);
+            if (m == "doc_sketch_regions")
+                return emit(aicad::doc::doc_sketch_regions(
+                                params.value("doc_id", std::string()),
+                                params.value("sketch", std::string())),
+                            out_json, 0);
+            if (m == "sketch_drag")
+                return emit(aicad::doc::doc_sketch_drag(
+                                params.value("doc_id", std::string()),
+                                params.value("sketch", std::string()),
+                                params.value("handle", std::string()),
+                                params.contains("xy") ? params["xy"] : json(nullptr),
+                                params.contains("targets") ? params["targets"] : json(nullptr)),
+                            out_json, 0);
+            if (m == "sketch_drag_commit")
+                return emit(aicad::doc::doc_sketch_drag_commit(
+                                params.value("doc_id", std::string()),
+                                params.value("sketch", std::string())),
+                            out_json, 0);
+            if (m == "sketch_exit")
+                return emit(aicad::doc::doc_sketch_exit(
+                                params.value("doc_id", std::string()),
+                                params.value("sketch", std::string())),
+                            out_json, 0);
+            if (m == "sketch_probe")
+                return emit(aicad::doc::doc_sketch_probe(
+                                params.value("doc_id", std::string()),
+                                params.value("sketch", std::string()),
+                                params.contains("action") ? params["action"] : json::object()),
+                            out_json, 0);
+            if (m == "sketch_project_ref")
+                return emit(aicad::doc::doc_sketch_project_ref(
+                                params.value("doc_id", std::string()),
+                                params.value("sketch", std::string()),
+                                params.contains("ref") ? params["ref"] : json(nullptr)),
+                            out_json, 0);
             if (m == "eval_mass")
                 return emit(aicad::doc::doc_eval_mass(
                                 params.value("doc_id", std::string()),

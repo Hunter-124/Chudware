@@ -212,4 +212,42 @@ nlohmann::json doc_save(const std::string& doc_id, const std::string& path);
 // ops-response + "doc_id" + "warnings". Throws OpError("io_error") on a bad file.
 nlohmann::json doc_open(const std::string& path);
 
+// C18 interactive sketch mode — port of engine/doc/session.py sketch_* (warm-started
+// over aicad::sketch::solve_sketch). One sketch is "entered" at a time (active_sketch
+// on the session). enter/solve/drag/drag_commit/exit/overview/regions/probe.
+//
+// sketch_enter: resolve plane, cold-solve, store warm state -> {entities, statuses,
+//   dof, plane_frame, status, conflicting, redundant, skipped_constraints,
+//   solve_rejected, constraints}.
+// sketch_solve: warm re-solve the active sketch -> same shape.
+// sketch_drag: transient warm-started drag (NO revision bump) -> {entities, statuses,
+//   solve_rejected, constraints} or {ok:false, error, rejected_handles}.
+// sketch_drag_commit: persist dragged coords as one undoable sketch_edit_entity batch
+//   -> the ops-response (+ constraints).
+// sketch_exit: persist last-solved coords, clear active_sketch, rebuild -> ops-response.
+// sketch_overview: read-only solved snapshot (never touches active_sketch).
+// sketch_probe: over-define pre-flight on a copy (read-only) -> {ok, status,
+//   dof_before, dof_after, converged, conflicting, redundant, would_over_define}.
+// sketch_regions: read-only closed-loop region enumeration -> {plane_frame, bbox_diag,
+//   regions:[{index, centroid, area, depth, is_material, outer, holes, tris}]}.
+nlohmann::json doc_sketch_enter(const std::string& doc_id, const std::string& sketch_fid);
+nlohmann::json doc_sketch_solve(const std::string& doc_id, const std::string& sketch_fid);
+nlohmann::json doc_sketch_overview(const std::string& doc_id, const std::string& sketch_fid);
+nlohmann::json doc_sketch_regions(const std::string& doc_id, const std::string& sketch_fid);
+nlohmann::json doc_sketch_drag(const std::string& doc_id, const std::string& sketch_fid,
+                               const std::string& handle, const nlohmann::json& xy,
+                               const nlohmann::json& targets);
+nlohmann::json doc_sketch_drag_commit(const std::string& doc_id, const std::string& sketch_fid);
+nlohmann::json doc_sketch_exit(const std::string& doc_id, const std::string& sketch_fid);
+nlohmann::json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
+                                const nlohmann::json& action);
+
+// sketch_project_ref: read-only projection of a datum plane / planar face / model edge
+// into the sketch's (u,v) plane (engine/doc/session.py sketch_project_ref). `ref` is
+// {"datum":...} or {"kind":"face|edge","selector":{...}}; returns {entity, source}.
+// face/edge selectors resolve against the LAST solid body (single-body parts; the
+// oracle's multi-body best-match is deferred). Throws OpError/unsupported_ref.
+nlohmann::json doc_sketch_project_ref(const std::string& doc_id, const std::string& sketch_fid,
+                                      const nlohmann::json& ref);
+
 }  // namespace aicad::doc

@@ -26,6 +26,10 @@
 #include <optional>
 
 #include <BRepMesh_IncrementalMesh.hxx>
+#include <BRepBuilderAPI_MakeEdge.hxx>
+#include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepBuilderAPI_MakeWire.hxx>
+#include <GC_MakeArcOfCircle.hxx>
 #include <BRepTools.hxx>
 #include <BRep_Tool.hxx>
 #include <Bnd_Box.hxx>
@@ -82,7 +86,9 @@
 #include "doc/validate.h"
 #include "geom/aicm.h"
 #include "geom/plane.h"
+#include "geom/profile.h"
 #include "geom/tessellate.h"
+#include "sketch/sketch.h"
 #include "util/expr.h"
 
 namespace aicad::doc {
@@ -92,6 +98,20 @@ using nlohmann::json;
 namespace {
 
 // ----------------------------------------------------------------- session store
+// C18 active-sketch interaction state — C++ port of session.py::_SketchState. One
+// sketch is "entered" at a time; sketch_enter populates it, solve/drag warm-start
+// across it, sketch_exit clears it. solve_state is the warm SolveState (nullopt ==
+// cold); a doc mutation (apply_ops/undo/redo/revert) resets it to nullopt so a warm
+// state is never reused across a doc edit (session.py: active_sketch.solve_state = None).
+struct SketchState {
+    std::string sketch_fid;
+    std::optional<aicad::sketch::SolveState> solve_state;  // warm start (nullopt == cold)
+    json last_entities = json::object();   // id -> solved coord dict (entity_map form)
+    json last_statuses = json::object();   // id -> "under"|"full"|"over"
+    std::string last_overall_status;       // "under"|"full"|"over"
+    std::vector<double> plane_frame;       // 16 floats, row-major
+};
+
 struct Session {
     std::string doc_id;
     json doc;
@@ -102,6 +122,7 @@ struct Session {
     std::string path;                                  // current .step+ path (or empty)
     std::map<std::string, std::string> extra_entries;  // unknown .step+ entries (verbatim)
     std::map<std::string, std::string> checkpoints;    // PM-cancel snapshots: id -> doc JSON
+    std::optional<SketchState> active_sketch;          // C18 sketch-edit lifecycle
 };
 
 constexpr std::size_t kUndoLimit = 100;
@@ -1120,8 +1141,11 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
     resp["tree"] = s.doc;
     resp["owner_map"] = r.owner_map.is_null() ? json::object() : r.owner_map;
     if (with_tess) {
+        json active_sketch_status = nullptr;
+        if (s.active_sketch && !s.active_sketch->last_overall_status.empty())
+            active_sketch_status = s.active_sketch->last_overall_status;
         resp["rebuild"] = {{"feature_status", fs},
-                           {"doc_status", {{"active_sketch", nullptr},
+                           {"doc_status", {{"active_sketch", active_sketch_status},
                                            {"mates", nullptr},
                                            {"active_configuration", r.active_configuration}}}};
         std::string aicm_path;
@@ -1218,6 +1242,7 @@ json config_commit(Session& s, json&& working) {
     s.doc = std::move(working);
     s.revision += 1;
     s.dirty = true;
+    if (s.active_sketch) s.active_sketch->solve_state.reset();  // session.py::_config_commit
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     return ops_response(s, r, json::object(), /*with_tess=*/true);
 }
@@ -1264,6 +1289,246 @@ Session& new_part_session_locked(const std::string& name) {
     s.doc = blank_part(s.doc_id, name);
     s.revision = 0;
     return g_sessions[s.doc_id] = std::move(s);
+}
+
+// ============================================================ C18 sketch helpers
+// C++ port of the active-sketch interaction core in engine/doc/session.py.
+
+// session.py::_find_sketch_feature — locate a "sketch" feature by id (throws on a
+// missing id / non-sketch). Returns a reference into s.doc["features"].
+json& find_sketch_feature(Session& s, const std::string& fid) {
+    if (s.doc.contains("features") && s.doc["features"].is_array())
+        for (json& f : s.doc["features"])
+            if (f.is_object() && f.value("id", std::string()) == fid) {
+                if (f.value("type", std::string()) != "sketch")
+                    throw OpError("invalid_op", "feature '" + fid + "' is not a sketch",
+                                  {{"reason", "not a sketch"}});
+                return f;
+            }
+    throw OpError("invalid_op", "no sketch feature '" + fid + "'", {{"reason", "unknown sketch"}});
+}
+
+// The sketch feature's params dict ({entities, constraints}). Host canonical shape
+// stores them under "params"; a flat fallback reads them off the feature directly.
+json sketch_params(const json& feat) {
+    if (feat.contains("params") && feat["params"].is_object()) return feat["params"];
+    json p = json::object();
+    p["entities"] = feat.contains("entities") ? feat["entities"] : json::array();
+    p["constraints"] = feat.contains("constraints") ? feat["constraints"] : json::array();
+    return p;
+}
+
+// session.py::_resolve_sketch_plane — resolve refs.plane to a SketchPlane. Reserved
+// datums ("plane.top/front/right" or bare "top/front/right") map to the factory
+// frames; a plane-FEATURE id (offset/midplane/etc.) is resolved by recompiling the
+// doc and reading that feature's plane — but compile_document does not surface the
+// per-feature plane, so for now non-reserved refs fall back to the reserved name
+// match (the interactive fixtures sketch on reserved planes). Throws on no plane ref.
+aicad::geom::SketchPlane resolve_sketch_plane(Session& s, const json& feat) {
+    json plane_ref;
+    if (feat.contains("refs") && feat["refs"].is_object() && feat["refs"].contains("plane"))
+        plane_ref = feat["refs"]["plane"];
+    else if (feat.contains("plane"))
+        plane_ref = feat["plane"];
+    if (plane_ref.is_null())
+        throw OpError("invalid_op", "sketch has no refs.plane", {{"reason", "no plane"}});
+    std::string name;
+    if (plane_ref.is_string()) name = plane_ref.get<std::string>();
+    else if (plane_ref.is_object() && plane_ref.value("kind", std::string()) == "datum" &&
+             plane_ref.contains("feature") && plane_ref["feature"].is_string())
+        name = plane_ref["feature"].get<std::string>();
+    std::string bare = name;
+    if (bare.rfind("plane.", 0) == 0) bare = bare.substr(6);
+    if (bare == "front") return aicad::geom::SketchPlane::front();
+    if (bare == "right") return aicad::geom::SketchPlane::right();
+    return aicad::geom::SketchPlane::top();
+}
+
+// session.py::_plane_frame — 16-float row-major matrix mapping sketch (u,v,0,1) ->
+// world. Columns are x_dir(uAxis), y_dir(vAxis), z_dir(normal), origin; rows 0..2
+// are the affine rows, row 3 is [0,0,0,1].
+std::vector<double> plane_frame(const aicad::geom::SketchPlane& p) {
+    std::vector<double> out;
+    out.reserve(16);
+    for (int i = 0; i < 3; ++i) {
+        out.push_back(p.uAxis[i]);
+        out.push_back(p.vAxis[i]);
+        out.push_back(p.normal[i]);
+        out.push_back(p.origin[i]);
+    }
+    out.insert(out.end(), {0.0, 0.0, 0.0, 1.0});
+    return out;
+}
+
+// session.py::_DIM_TYPES — a redundant DRIVING dim over-defines; geometric relations
+// don't (see _redundant_overdefines for the SW-parity rationale).
+bool is_dim_type(const std::string& t) {
+    return t == "distance" || t == "angle" || t == "radius" || t == "diameter" || t == "length";
+}
+
+// session.py::_redundant_overdefines — true iff the redundant set contains a redundant
+// driving dimension (a redundant geometric relation deliberately does NOT over-define).
+bool redundant_overdefines(const std::vector<std::string>& redundant,
+                           const json& constraints_by_id) {
+    if (redundant.empty() || !constraints_by_id.is_object()) return false;
+    for (const std::string& cid : redundant) {
+        if (!constraints_by_id.contains(cid)) continue;
+        const json& c = constraints_by_id[cid];
+        if (c.is_object() && is_dim_type(c.value("type", std::string())) &&
+            !c.value("driven", false))
+            return true;
+    }
+    return false;
+}
+
+// session.py::_overall_status — under|full|over classification.
+std::string overall_status(const json& statuses, int dof,
+                           const std::vector<std::string>& conflicting,
+                           const std::vector<std::string>& redundant,
+                           const json& constraints_by_id) {
+    bool any_over = false;
+    if (statuses.is_object())
+        for (auto it = statuses.begin(); it != statuses.end(); ++it)
+            if (it.value().is_string() && it.value().get<std::string>() == "over") any_over = true;
+    if (!conflicting.empty() || redundant_overdefines(redundant, constraints_by_id) || any_over)
+        return "over";
+    if (dof <= 0) return "full";
+    return "under";
+}
+
+// session.py::_doc_entity_coords — freeze map: entity id -> stored coords (same key
+// shape solve_sketch returns), stripping id/construction bookkeeping.
+json doc_entity_coords(const json& params) {
+    json out = json::object();
+    if (params.contains("entities") && params["entities"].is_array())
+        for (const json& e : params["entities"]) {
+            if (!e.is_object() || !e.contains("id")) continue;
+            json rec = json::object();
+            for (auto it = e.begin(); it != e.end(); ++it)
+                if (it.key() != "id" && it.key() != "construction") rec[it.key()] = it.value();
+            out[e["id"].get<std::string>()] = rec;
+        }
+    return out;
+}
+
+// session.py::_sketch_constraints — pack every constraint for the host's dimension
+// annotations: {id, type, refs, value, expr, driven, placement, measured, [axis], [cond]}.
+json sketch_constraints(const json& feat, const json& entity_coords) {
+    json out = json::array();
+    json params = sketch_params(feat);
+    if (!params.contains("constraints") || !params["constraints"].is_array()) return out;
+    for (const json& c : params["constraints"]) {
+        if (!c.is_object()) continue;
+        const json* val_obj = (c.contains("value") && c["value"].is_object()) ? &c["value"] : nullptr;
+        json rec;
+        rec["id"] = c.contains("id") ? c["id"] : json(nullptr);
+        rec["type"] = c.contains("type") ? c["type"] : json(nullptr);
+        rec["refs"] = (c.contains("refs") && c["refs"].is_array()) ? c["refs"] : json::array();
+        rec["value"] = val_obj && val_obj->contains("value") ? (*val_obj)["value"] : json(nullptr);
+        rec["expr"] = val_obj && val_obj->contains("expr") ? (*val_obj)["expr"] : json(nullptr);
+        rec["driven"] = c.value("driven", false);
+        rec["placement"] = c.contains("placement") ? c["placement"] : json(nullptr);
+        rec["measured"] = nullptr;
+        if (c.contains("axis") && c["axis"].is_string() && !c["axis"].get<std::string>().empty())
+            rec["axis"] = c["axis"];
+        if (c.contains("cond") && c["cond"].is_array()) rec["cond"] = c["cond"];
+        auto m = aicad::sketch::measure_constraint(c, entity_coords);
+        if (m) rec["measured"] = *m;
+        out.push_back(std::move(rec));
+    }
+    return out;
+}
+
+// Packed result of session.py::_solve_active (minus plane_frame). `warm` is the
+// active-sketch warm state (nullopt for a cold solve). On a REJECTED solve
+// (conflicting non-empty OR not converged) geometry is frozen at the doc's current
+// coords and warm state is cleared.
+struct SolveActive {
+    std::optional<aicad::sketch::SolveState> state;  // nullopt when rejected
+    json entities;          // list of coord dicts carrying id + construction
+    json entity_map;        // id -> coord dict
+    json statuses;          // id -> "under"|"full"|"over"
+    int dof = 0;
+    std::vector<std::string> conflicting;
+    std::vector<std::string> redundant;
+    json constraints_by_id;
+    std::vector<std::string> skipped_constraints;
+    bool rejected = false;
+};
+
+SolveActive solve_active(Session& s, const json& feat,
+                         const std::optional<aicad::sketch::SolveState>& warm) {
+    json env = env_from_doc(s.doc);
+    json params = sketch_params(feat);
+    json sk;
+    sk["entities"] = params.contains("entities") ? params["entities"] : json::array();
+    sk["constraints"] = params.contains("constraints") ? params["constraints"] : json::array();
+
+    aicad::sketch::SketchSolution sol = aicad::sketch::solve_sketch(sk, env, warm);
+
+    SolveActive out;
+    out.rejected = !sol.conflicting.empty() || !sol.converged;
+    out.conflicting = sol.conflicting;
+    out.redundant = sol.redundant;
+    out.dof = sol.dof;
+    out.statuses = json::object();
+    for (const auto& kv : sol.statuses) out.statuses[kv.first] = kv.second;
+
+    json coord_map = out.rejected ? doc_entity_coords(params) : sol.entities;
+    out.entity_map = coord_map;
+
+    // construction flag lookup
+    auto construction_of = [&](const std::string& eid) -> bool {
+        if (params.contains("entities") && params["entities"].is_array())
+            for (const json& e : params["entities"])
+                if (e.is_object() && e.value("id", std::string()) == eid)
+                    return e.value("construction", false);
+        return false;
+    };
+    json entities = json::array();
+    for (auto it = coord_map.begin(); it != coord_map.end(); ++it) {
+        json rec = it.value();
+        rec["id"] = it.key();
+        rec["construction"] = construction_of(it.key());
+        entities.push_back(std::move(rec));
+    }
+    out.entities = std::move(entities);
+
+    out.constraints_by_id = json::object();
+    if (params.contains("constraints") && params["constraints"].is_array())
+        for (const json& c : params["constraints"])
+            if (c.is_object() && c.contains("id"))
+                out.constraints_by_id[c["id"].get<std::string>()] = c;
+
+    out.skipped_constraints.clear();  // C++ solver has no skipped_constraints field
+
+    out.state = out.rejected ? std::optional<aicad::sketch::SolveState>{} : sol.state;
+    return out;
+}
+
+// std::vector<std::string> -> json array helper.
+json strvec_json(const std::vector<std::string>& v) {
+    json a = json::array();
+    for (const std::string& s : v) a.push_back(s);
+    return a;
+}
+
+// Build the sketch_enter/sketch_solve result dict from a packed SolveActive +
+// plane_frame + overall status (session.py sketch_enter/sketch_solve shape).
+json sketch_result(const json& feat, const SolveActive& packed,
+                   const std::vector<double>& frame, const std::string& status) {
+    json r;
+    r["entities"] = packed.entities;
+    r["statuses"] = packed.statuses;
+    r["dof"] = packed.dof;
+    r["plane_frame"] = frame;
+    r["status"] = status;
+    r["conflicting"] = strvec_json(packed.conflicting);
+    r["redundant"] = strvec_json(packed.redundant);
+    r["skipped_constraints"] = strvec_json(packed.skipped_constraints);
+    r["solve_rejected"] = packed.rejected;
+    r["constraints"] = sketch_constraints(feat, packed.entity_map);
+    return r;
 }
 
 }  // namespace
@@ -1334,6 +1599,9 @@ json doc_undo(const std::string& doc_id) {
     s.undo_stack.pop_back();
     s.revision += 1;  // undo bumps the revision forward (Python contract)
     s.dirty = true;
+    // C50: drop warm sketch state so the next solve COLD-solves the restored seeds
+    // (session.py: active_sketch.solve_state = None on undo/redo).
+    if (s.active_sketch) s.active_sketch->solve_state.reset();
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     return ops_response(s, r, json::object(), /*with_tess=*/true);
 }
@@ -1349,6 +1617,7 @@ json doc_redo(const std::string& doc_id) {
     s.redo_stack.pop_back();
     s.revision += 1;
     s.dirty = true;
+    if (s.active_sketch) s.active_sketch->solve_state.reset();  // C50 (see doc_undo)
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     return ops_response(s, r, json::object(), /*with_tess=*/true);
 }
@@ -2885,6 +3154,920 @@ json doc_open(const std::string& path) {
     }
     resp["warnings"] = warnings;
     return resp;
+}
+
+// ============================================================ C18 sketch RPCs
+// Port of engine/doc/session.py sketch_enter/solve/drag/drag_commit/exit/overview/
+// regions/probe/project_ref. doc_id-keyed; operate on the per-session active_sketch.
+
+json doc_sketch_enter(const std::string& doc_id, const std::string& sketch_fid) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json& feat = find_sketch_feature(s, sketch_fid);
+    aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
+    std::vector<double> frame = plane_frame(plane);
+
+    SolveActive packed = solve_active(s, feat, std::nullopt);
+    SketchState st;
+    st.sketch_fid = sketch_fid;
+    st.solve_state = packed.state;
+    st.last_entities = packed.entity_map;
+    st.last_statuses = packed.statuses;
+    st.last_overall_status = overall_status(packed.statuses, packed.dof, packed.conflicting,
+                                            packed.redundant, packed.constraints_by_id);
+    st.plane_frame = frame;
+    s.active_sketch = std::move(st);
+
+    return sketch_result(feat, packed, frame, s.active_sketch->last_overall_status);
+}
+
+json doc_sketch_solve(const std::string& doc_id, const std::string& sketch_fid) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json& feat = find_sketch_feature(s, sketch_fid);
+    std::optional<aicad::sketch::SolveState> warm;
+    if (s.active_sketch && s.active_sketch->sketch_fid == sketch_fid)
+        warm = s.active_sketch->solve_state;
+    SolveActive packed = solve_active(s, feat, warm);
+    if (!s.active_sketch || s.active_sketch->sketch_fid != sketch_fid) {
+        aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
+        SketchState st;
+        st.sketch_fid = sketch_fid;
+        st.plane_frame = plane_frame(plane);
+        s.active_sketch = std::move(st);
+    }
+    s.active_sketch->solve_state = packed.state;
+    s.active_sketch->last_entities = packed.entity_map;
+    s.active_sketch->last_statuses = packed.statuses;
+    s.active_sketch->last_overall_status =
+        overall_status(packed.statuses, packed.dof, packed.conflicting, packed.redundant,
+                       packed.constraints_by_id);
+    return sketch_result(feat, packed, s.active_sketch->plane_frame,
+                         s.active_sketch->last_overall_status);
+}
+
+json doc_sketch_overview(const std::string& doc_id, const std::string& sketch_fid) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json& feat = find_sketch_feature(s, sketch_fid);
+    aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
+    SolveActive packed = solve_active(s, feat, std::nullopt);  // never touches active_sketch
+    json r;
+    r["entities"] = packed.entities;
+    r["statuses"] = packed.statuses;
+    r["dof"] = packed.dof;
+    r["plane_frame"] = plane_frame(plane);
+    r["status"] = overall_status(packed.statuses, packed.dof, packed.conflicting,
+                                 packed.redundant, packed.constraints_by_id);
+    r["skipped_constraints"] = strvec_json(packed.skipped_constraints);
+    return r;
+}
+
+json doc_sketch_drag(const std::string& doc_id, const std::string& sketch_fid,
+                     const std::string& handle, const json& xy, const json& targets) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json& feat = find_sketch_feature(s, sketch_fid);
+    // Not entered (or stale / cold) — enter implicitly so drag is still serviceable.
+    if (!s.active_sketch || s.active_sketch->sketch_fid != sketch_fid ||
+        !s.active_sketch->solve_state) {
+        aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
+        std::vector<double> frame = plane_frame(plane);
+        SolveActive packed = solve_active(s, feat, std::nullopt);
+        SketchState st;
+        st.sketch_fid = sketch_fid;
+        st.solve_state = packed.state;
+        st.last_entities = packed.entity_map;
+        st.last_statuses = packed.statuses;
+        st.last_overall_status = overall_status(packed.statuses, packed.dof, packed.conflicting,
+                                                packed.redundant, packed.constraints_by_id);
+        st.plane_frame = frame;
+        s.active_sketch = std::move(st);
+    }
+    if (!s.active_sketch->solve_state)
+        throw OpError("invalid_op", "sketch could not be solved for drag",
+                      {{"reason", "no solve state"}});
+
+    json env = env_from_doc(s.doc);
+    json params = sketch_params(feat);
+    json sk;
+    sk["entities"] = params.contains("entities") ? params["entities"] : json::array();
+    sk["constraints"] = params.contains("constraints") ? params["constraints"] : json::array();
+
+    std::pair<double, double> target_xy{0.0, 0.0};
+    if (xy.is_array() && xy.size() == 2)
+        target_xy = {xy[0].get<double>(), xy[1].get<double>()};
+    json res = aicad::sketch::drag(*s.active_sketch->solve_state, handle, target_xy, sk, env,
+                                   targets.is_null() ? json() : targets);
+
+    if (res.is_object() && res.contains("ok") && !res["ok"].get<bool>()) {
+        json err;
+        err["ok"] = false;
+        err["error"] = res.contains("error") && !res["error"].is_null()
+                           ? res["error"] : json("drag target did not resolve");
+        err["rejected_handles"] = res.contains("rejected_handles") ? res["rejected_handles"]
+                                                                    : json::array();
+        return err;
+    }
+
+    const json& res_entities = res["entities"];
+    auto construction_of = [&](const std::string& eid) -> bool {
+        if (params.contains("entities") && params["entities"].is_array())
+            for (const json& e : params["entities"])
+                if (e.is_object() && e.value("id", std::string()) == eid)
+                    return e.value("construction", false);
+        return false;
+    };
+    json entities = json::array();
+    for (auto it = res_entities.begin(); it != res_entities.end(); ++it) {
+        json rec = it.value();
+        rec["id"] = it.key();
+        rec["construction"] = construction_of(it.key());
+        entities.push_back(std::move(rec));
+    }
+    // Remember dragged coords so commit can persist them (transient; no warm churn).
+    s.active_sketch->last_entities = res_entities;
+    s.active_sketch->last_statuses = res.contains("statuses") ? res["statuses"] : json::object();
+
+    json out;
+    out["entities"] = entities;
+    out["statuses"] = res.contains("statuses") ? res["statuses"] : json::object();
+    out["solve_rejected"] = false;
+    out["constraints"] = sketch_constraints(feat, res_entities);
+    return out;
+}
+
+json doc_sketch_drag_commit(const std::string& doc_id, const std::string& sketch_fid) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json& feat = find_sketch_feature(s, sketch_fid);
+
+    json coords;
+    if (s.active_sketch && s.active_sketch->sketch_fid == sketch_fid &&
+        s.active_sketch->last_entities.is_object() && !s.active_sketch->last_entities.empty())
+        coords = s.active_sketch->last_entities;
+    else {
+        // Nothing dragged — re-solve and persist solved positions (idempotent commit).
+        std::optional<aicad::sketch::SolveState> warm =
+            s.active_sketch ? s.active_sketch->solve_state : std::nullopt;
+        SolveActive packed = solve_active(s, feat, warm);
+        coords = packed.entity_map;
+    }
+
+    // Build one sketch_edit_entity op per entity (patch minus "type").
+    json ops = json::array();
+    for (auto it = coords.begin(); it != coords.end(); ++it) {
+        json patch = json::object();
+        for (auto kit = it.value().begin(); kit != it.value().end(); ++kit)
+            if (kit.key() != "type") patch[kit.key()] = kit.value();
+        ops.push_back({{"op", "sketch_edit_entity"}, {"sketch", sketch_fid},
+                       {"id", it.key()}, {"params", patch}});
+    }
+
+    json resp = apply_ops_locked(s, -1, ops, /*coalesce=*/false);
+
+    // Re-solve so warm state matches the freshly persisted doc + refresh constraints.
+    if (s.active_sketch && s.active_sketch->sketch_fid == sketch_fid) {
+        try {
+            json& feat2 = find_sketch_feature(s, sketch_fid);
+            std::optional<aicad::sketch::SolveState> warm = s.active_sketch->solve_state;
+            SolveActive packed = solve_active(s, feat2, warm);
+            s.active_sketch->solve_state = packed.state;
+            s.active_sketch->last_entities = packed.entity_map;
+            s.active_sketch->last_statuses = packed.statuses;
+            s.active_sketch->last_overall_status =
+                overall_status(packed.statuses, packed.dof, packed.conflicting,
+                               packed.redundant, packed.constraints_by_id);
+            // Refresh the doc_status.active_sketch now the status is up to date.
+            if (resp.contains("rebuild") && resp["rebuild"].is_object())
+                resp["rebuild"]["doc_status"]["active_sketch"] =
+                    s.active_sketch->last_overall_status;
+            resp["constraints"] = sketch_constraints(feat2, packed.entity_map);
+        } catch (...) { /* fall through to the fallback below */ }
+    }
+    if (!resp.contains("constraints")) {
+        json& feat2 = find_sketch_feature(s, sketch_fid);
+        json ec = s.active_sketch ? s.active_sketch->last_entities : json::object();
+        resp["constraints"] = sketch_constraints(feat2, ec);
+    }
+    return resp;
+}
+
+json doc_sketch_exit(const std::string& doc_id, const std::string& sketch_fid) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json& feat = find_sketch_feature(s, sketch_fid);
+
+    if (s.active_sketch && s.active_sketch->sketch_fid == sketch_fid &&
+        s.active_sketch->last_entities.is_object() && !s.active_sketch->last_entities.empty()) {
+        const json& coords = s.active_sketch->last_entities;
+        // Persist last-solved coords IN PLACE; bump revision only if anything changed.
+        push_undo(s);
+        bool changed = false;
+        // Write back into the feature's entities array (canonical params or flat).
+        json* entities_ptr = nullptr;
+        if (feat.contains("params") && feat["params"].is_object() &&
+            feat["params"].contains("entities") && feat["params"]["entities"].is_array())
+            entities_ptr = &feat["params"]["entities"];
+        else if (feat.contains("entities") && feat["entities"].is_array())
+            entities_ptr = &feat["entities"];
+        if (entities_ptr)
+            for (json& ent : *entities_ptr) {
+                if (!ent.is_object() || !ent.contains("id")) continue;
+                std::string eid = ent["id"].get<std::string>();
+                if (!coords.contains(eid)) continue;
+                const json& c = coords[eid];
+                for (auto kit = c.begin(); kit != c.end(); ++kit) {
+                    if (kit.key() == "type") continue;
+                    if (!ent.contains(kit.key()) || ent[kit.key()] != kit.value()) {
+                        ent[kit.key()] = kit.value();
+                        changed = true;
+                    }
+                }
+            }
+        if (changed) {
+            s.revision += 1;
+            s.dirty = true;
+        } else {
+            s.undo_stack.pop_back();  // nothing changed — no phantom undo step
+        }
+    }
+    s.active_sketch.reset();
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    return ops_response(s, r, json::object(), /*with_tess=*/true);
+}
+
+namespace {
+
+// ---- doc_sketch_regions support (port of sketch.py compute_regions descriptors) ----
+// Loop detection mirrors geom/profile.cpp; here we also build region DESCRIPTORS
+// (centroid/area from the OCCT face surface properties, outer/holes polylines, depth/
+// is_material) and return EVERY loop as a region (material + void), sorted by centroid.
+
+struct RegEdge {
+    TopoDS_Edge edge;
+    Eigen::Vector2d p_start, p_end;
+    bool closed = false;
+    // densely sampled 2D polyline of the edge (for outer/holes overlay), start..end.
+    std::vector<Eigen::Vector2d> samples;
+};
+
+constexpr double kRegEps = 1e-6;
+
+bool reg_near(const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
+    return std::abs(a.x() - b.x()) < kRegEps && std::abs(a.y() - b.y()) < kRegEps;
+}
+
+gp_Pnt reg_lift(const aicad::geom::SketchPlane& pl, const Eigen::Vector2d& uv) {
+    Eigen::Vector3d w = pl.lift(uv);
+    return gp_Pnt(w.x(), w.y(), w.z());
+}
+
+bool reg_build_edge(const json& ent, const aicad::geom::SketchPlane& pl, RegEdge& out) {
+    if (!ent.is_object() || !ent.contains("type")) return false;
+    if (ent.value("construction", false)) return false;
+    const std::string t = ent["type"];
+    try {
+        if (t == "line") {
+            Eigen::Vector2d a(ent["p1"][0], ent["p1"][1]), b(ent["p2"][0], ent["p2"][1]);
+            if (reg_near(a, b)) return false;
+            BRepBuilderAPI_MakeEdge mk(reg_lift(pl, a), reg_lift(pl, b));
+            if (!mk.IsDone()) return false;
+            out.edge = mk.Edge(); out.p_start = a; out.p_end = b; out.closed = false;
+            out.samples = {a, b};
+            return true;
+        }
+        if (t == "circle") {
+            Eigen::Vector2d c(ent["center"][0], ent["center"][1]);
+            double r = ent["radius"];
+            if (r <= kRegEps) return false;
+            gp_Ax2 ax(reg_lift(pl, c), gp_Dir(pl.normal.x(), pl.normal.y(), pl.normal.z()),
+                      gp_Dir(pl.uAxis.x(), pl.uAxis.y(), pl.uAxis.z()));
+            BRepBuilderAPI_MakeEdge mk(gp_Circ(ax, r));
+            if (!mk.IsDone()) return false;
+            out.edge = mk.Edge(); out.p_start = c; out.p_end = c; out.closed = true;
+            int n = 64;
+            for (int i = 0; i < n; ++i) {
+                double a = 2.0 * M_PI * i / n;
+                out.samples.emplace_back(c.x() + r * std::cos(a), c.y() + r * std::sin(a));
+            }
+            return true;
+        }
+        if (t == "arc") {
+            Eigen::Vector2d c(ent["center"][0], ent["center"][1]);
+            double r = ent["radius"];
+            double a0 = ent["start"], a1 = ent["end"];
+            if (r <= kRegEps) return false;
+            double sweep = a1 - a0;
+            while (sweep <= 0.0) sweep += 2.0 * M_PI;
+            double amid = a0 + 0.5 * sweep;
+            Eigen::Vector2d ps(c.x() + r * std::cos(a0), c.y() + r * std::sin(a0));
+            Eigen::Vector2d pe(c.x() + r * std::cos(a1), c.y() + r * std::sin(a1));
+            Eigen::Vector2d pm(c.x() + r * std::cos(amid), c.y() + r * std::sin(amid));
+            GC_MakeArcOfCircle mkarc(reg_lift(pl, ps), reg_lift(pl, pm), reg_lift(pl, pe));
+            if (!mkarc.IsDone()) return false;
+            BRepBuilderAPI_MakeEdge mk(mkarc.Value());
+            if (!mk.IsDone()) return false;
+            out.edge = mk.Edge(); out.p_start = ps; out.p_end = pe; out.closed = false;
+            int n = 16;
+            for (int i = 0; i <= n; ++i) {
+                double a = a0 + sweep * i / n;
+                out.samples.emplace_back(c.x() + r * std::cos(a), c.y() + r * std::sin(a));
+            }
+            return true;
+        }
+    } catch (...) { return false; }
+    return false;
+}
+
+struct RegLoop {
+    std::vector<TopoDS_Edge> edges;
+    std::vector<Eigen::Vector2d> poly;  // ordered loop polyline (2D, for containment + overlay)
+};
+
+double reg_signed_area(const std::vector<Eigen::Vector2d>& p) {
+    const size_t n = p.size();
+    if (n < 3) return 0.0;
+    double a = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const Eigen::Vector2d& p0 = p[i];
+        const Eigen::Vector2d& p1 = p[(i + 1) % n];
+        a += p0.x() * p1.y() - p1.x() * p0.y();
+    }
+    return 0.5 * a;
+}
+
+Eigen::Vector2d reg_poly_centroid(const std::vector<Eigen::Vector2d>& p) {
+    const size_t n = p.size();
+    Eigen::Vector2d mean(0, 0);
+    for (const auto& q : p) mean += q;
+    if (n) mean /= double(n);
+    double a = reg_signed_area(p);
+    if (n < 3 || std::abs(a) < 1e-12) return mean;
+    double cx = 0, cy = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const Eigen::Vector2d& p0 = p[i];
+        const Eigen::Vector2d& p1 = p[(i + 1) % n];
+        double cross = p0.x() * p1.y() - p1.x() * p0.y();
+        cx += (p0.x() + p1.x()) * cross;
+        cy += (p0.y() + p1.y()) * cross;
+    }
+    return {cx / (6.0 * a), cy / (6.0 * a)};
+}
+
+bool reg_point_in_poly(const Eigen::Vector2d& pt, const std::vector<Eigen::Vector2d>& poly) {
+    const size_t n = poly.size();
+    if (n < 3) return false;
+    bool inside = false;
+    size_t j = n - 1;
+    for (size_t i = 0; i < n; ++i) {
+        double xi = poly[i].x(), yi = poly[i].y(), xj = poly[j].x(), yj = poly[j].y();
+        if (((yi > pt.y()) != (yj > pt.y())) &&
+            (pt.x() < (xj - xi) * (pt.y() - yi) / (yj - yi + 1e-30) + xi))
+            inside = !inside;
+        j = i;
+    }
+    return inside;
+}
+
+std::vector<RegLoop> reg_detect_loops(const std::vector<RegEdge>& edges) {
+    std::vector<RegLoop> loops;
+    const size_t n = edges.size();
+    std::vector<bool> used(n, false);
+    for (size_t i = 0; i < n; ++i) {
+        if (!edges[i].closed) continue;
+        used[i] = true;
+        RegLoop lp;
+        lp.edges.push_back(edges[i].edge);
+        lp.poly = edges[i].samples;
+        loops.push_back(std::move(lp));
+    }
+    for (size_t start = 0; start < n; ++start) {
+        if (used[start]) continue;
+        struct Step { size_t idx; bool rev; };
+        std::vector<Step> chain{{start, false}};
+        used[start] = true;
+        const Eigen::Vector2d head = edges[start].p_start;
+        Eigen::Vector2d tip = edges[start].p_end;
+        bool closed = false;
+        while (true) {
+            long found = -1; bool frev = false;
+            for (size_t j = 0; j < n; ++j) {
+                if (used[j]) continue;
+                if (reg_near(edges[j].p_start, tip)) { found = (long)j; frev = false; break; }
+                if (reg_near(edges[j].p_end, tip)) { found = (long)j; frev = true; break; }
+            }
+            if (found < 0) break;
+            chain.push_back({(size_t)found, frev});
+            used[found] = true;
+            tip = frev ? edges[found].p_start : edges[found].p_end;
+            if (reg_near(tip, head)) { closed = true; break; }
+        }
+        if (!closed) continue;
+        RegLoop lp;
+        for (const Step& st : chain) {
+            TopoDS_Edge e = edges[st.idx].edge;
+            if (st.rev) e = TopoDS::Edge(e.Reversed());
+            lp.edges.push_back(e);
+            // polyline: edge samples in walk direction, excluding the duplicated joint.
+            std::vector<Eigen::Vector2d> seg = edges[st.idx].samples;
+            if (st.rev) std::reverse(seg.begin(), seg.end());
+            for (size_t k = 0; k + 1 < seg.size(); ++k) lp.poly.push_back(seg[k]);
+        }
+        loops.push_back(std::move(lp));
+    }
+    return loops;
+}
+
+TopoDS_Wire reg_make_wire(const std::vector<TopoDS_Edge>& edges) {
+    BRepBuilderAPI_MakeWire mk;
+    for (const TopoDS_Edge& e : edges) mk.Add(e);
+    if (!mk.IsDone()) return TopoDS_Wire();
+    return mk.Wire();
+}
+
+// CCW-orient a loop's edges (matching _orient_ccw); reverse if signed area < 0.
+std::vector<TopoDS_Edge> reg_orient_ccw(const RegLoop& lp) {
+    if (reg_signed_area(lp.poly) >= 0.0) return lp.edges;
+    std::vector<TopoDS_Edge> out;
+    for (auto it = lp.edges.rbegin(); it != lp.edges.rend(); ++it)
+        out.push_back(TopoDS::Edge(it->Reversed()));
+    return out;
+}
+
+// Build a region face = outer loop minus its direct child (hole) loops.
+TopoDS_Face reg_region_face(const RegLoop& outer, const std::vector<const RegLoop*>& holes) {
+    TopoDS_Wire ow = reg_make_wire(reg_orient_ccw(outer));
+    if (ow.IsNull()) return TopoDS_Face();
+    BRepBuilderAPI_MakeFace mf(ow, true);
+    for (const RegLoop* h : holes) {
+        TopoDS_Wire hw = reg_make_wire(reg_orient_ccw(*h));
+        if (hw.IsNull()) continue;
+        mf.Add(TopoDS::Wire(hw.Reversed()));
+    }
+    if (!mf.IsDone()) return TopoDS_Face();
+    return mf.Face();
+}
+
+// (area_or_len, centroid[u,v]) from a face's surface properties, centroid projected
+// into the plane's local frame (sketch.py _region_descriptor).
+void reg_face_descriptor(const TopoDS_Face& face, const aicad::geom::SketchPlane& pl,
+                         double& area, double& cu, double& cv) {
+    area = 0.0; cu = 0.0; cv = 0.0;
+    try {
+        GProp_GProps props;
+        BRepGProp::SurfaceProperties(face, props);
+        area = props.Mass();
+        gp_Pnt cm = props.CentreOfMass();
+        Eigen::Vector3d diff(cm.X() - pl.origin.x(), cm.Y() - pl.origin.y(),
+                             cm.Z() - pl.origin.z());
+        cu = diff.dot(pl.uAxis);
+        cv = diff.dot(pl.vAxis);
+    } catch (...) {}
+}
+
+// Hole-aware 2D triangulation of a region face in sketch-local (u,v) coords
+// (sketch.py region_triangles_2d).
+json reg_region_triangles_2d(const TopoDS_Face& face, const aicad::geom::SketchPlane& pl) {
+    json out = json::array();
+    try {
+        BRepMesh_IncrementalMesh(face, 0.25, false, 0.5, true).Perform();
+        TopLoc_Location loc;
+        Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
+        if (tri.IsNull()) return out;
+        gp_Trsf trsf = loc.Transformation();
+        bool ident = loc.IsIdentity();
+        auto uv = [&](int i) -> std::array<double, 2> {
+            gp_Pnt nd = tri->Node(i);
+            if (!ident) nd.Transform(trsf);
+            Eigen::Vector3d d(nd.X() - pl.origin.x(), nd.Y() - pl.origin.y(),
+                              nd.Z() - pl.origin.z());
+            return {d.dot(pl.uAxis), d.dot(pl.vAxis)};
+        };
+        std::vector<std::array<double, 2>> nodes;
+        nodes.reserve(tri->NbNodes());
+        for (int i = 1; i <= tri->NbNodes(); ++i) nodes.push_back(uv(i));
+        for (int ti = 1; ti <= tri->NbTriangles(); ++ti) {
+            int a, b, c;
+            tri->Triangle(ti).Get(a, b, c);
+            out.push_back(json::array({json::array({nodes[a - 1][0], nodes[a - 1][1]}),
+                                       json::array({nodes[b - 1][0], nodes[b - 1][1]}),
+                                       json::array({nodes[c - 1][0], nodes[c - 1][1]})}));
+        }
+    } catch (...) {}
+    return out;
+}
+
+json poly_to_json(const std::vector<Eigen::Vector2d>& p) {
+    json a = json::array();
+    for (const auto& q : p) a.push_back(json::array({q.x(), q.y()}));
+    return a;
+}
+
+}  // namespace
+
+json doc_sketch_regions(const std::string& doc_id, const std::string& sketch_fid) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json& feat = find_sketch_feature(s, sketch_fid);
+    aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
+
+    // Solve the sketch to get current entity coords (regions are computed on the
+    // SOLVED geometry, same as session.py sketch_regions builds edges off entities).
+    SolveActive packed = solve_active(s, feat, std::nullopt);
+    const json& solved = packed.entity_map;  // id -> coord dict
+
+    // Build region edges from non-construction solved entities.
+    std::vector<RegEdge> edges;
+    for (auto it = solved.begin(); it != solved.end(); ++it) {
+        RegEdge re;
+        // re-attach type from the entity record (solve output carries the params).
+        json ent = it.value();
+        if (!ent.contains("type")) {
+            // recover type from the stored params
+            json params = sketch_params(feat);
+            if (params.contains("entities") && params["entities"].is_array())
+                for (const json& e : params["entities"])
+                    if (e.is_object() && e.value("id", std::string()) == it.key()) {
+                        if (e.contains("type")) ent["type"] = e["type"];
+                        if (e.contains("construction")) ent["construction"] = e["construction"];
+                        break;
+                    }
+        }
+        if (reg_build_edge(ent, plane, re)) edges.push_back(std::move(re));
+    }
+
+    std::vector<RegLoop> loops = reg_detect_loops(edges);
+    const size_t n = loops.size();
+
+    std::vector<double> areas(n);
+    std::vector<Eigen::Vector2d> cents(n);
+    for (size_t i = 0; i < n; ++i) {
+        areas[i] = std::abs(reg_signed_area(loops[i].poly));
+        cents[i] = reg_poly_centroid(loops[i].poly);
+    }
+    std::vector<int> depth(n, 0), parent(n, -1);
+    for (size_t i = 0; i < n; ++i) {
+        double best_area = 0.0; int best = -1;
+        for (size_t j = 0; j < n; ++j) {
+            if (i == j || areas[j] <= areas[i]) continue;
+            if (reg_point_in_poly(cents[i], loops[j].poly)) {
+                depth[i]++;
+                if (best < 0 || areas[j] < best_area) { best_area = areas[j]; best = (int)j; }
+            }
+        }
+        parent[i] = best;
+    }
+    std::vector<std::vector<int>> children(n);
+    for (size_t i = 0; i < n; ++i)
+        if (parent[i] >= 0) children[parent[i]].push_back((int)i);
+
+    // Region descriptors (every loop, material + void). Paired with their face.
+    struct Reg { json desc; };
+    std::vector<Reg> regs;
+    for (size_t i = 0; i < n; ++i) {
+        std::vector<const RegLoop*> holes;
+        for (int c : children[i]) holes.push_back(&loops[c]);
+        TopoDS_Face face = reg_region_face(loops[i], holes);
+        if (face.IsNull()) continue;
+        double area, cu, cv;
+        reg_face_descriptor(face, plane, area, cu, cv);
+        json desc;
+        desc["centroid"] = json::array({cu, cv});
+        desc["area"] = area;
+        desc["depth"] = depth[i];
+        desc["is_material"] = (depth[i] % 2 == 0);
+        desc["outer"] = poly_to_json(loops[i].poly);
+        json holes_j = json::array();
+        for (int c : children[i]) holes_j.push_back(poly_to_json(loops[c].poly));
+        desc["holes"] = holes_j;
+        desc["tris"] = reg_region_triangles_2d(face, plane);
+        regs.push_back({std::move(desc)});
+    }
+
+    // Sort by centroid (u, then v) for stable indices; stamp index.
+    std::sort(regs.begin(), regs.end(), [](const Reg& a, const Reg& b) {
+        double au = a.desc["centroid"][0], bu = b.desc["centroid"][0];
+        if (au != bu) return au < bu;
+        return double(a.desc["centroid"][1]) < double(b.desc["centroid"][1]);
+    });
+    json regions = json::array();
+    for (size_t i = 0; i < regs.size(); ++i) {
+        regs[i].desc["index"] = (int)i;
+        regions.push_back(regs[i].desc);
+    }
+
+    // bbox_diag: span of all outer coords * sqrt(2), floored (session.py sketch_regions).
+    std::vector<double> coords;
+    for (const json& r : regions)
+        for (const json& pt : r["outer"]) { coords.push_back(pt[0]); coords.push_back(pt[1]); }
+    double span = 100.0;
+    if (!coords.empty()) {
+        double mn = coords[0], mx = coords[0];
+        for (double c : coords) { mn = std::min(mn, c); mx = std::max(mx, c); }
+        span = mx - mn;
+    }
+    double diag = std::max(span * std::sqrt(2.0), 1e-3);
+
+    json out;
+    out["plane_frame"] = plane_frame(plane);
+    out["bbox_diag"] = diag;
+    out["regions"] = regions;
+    return out;
+}
+
+json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
+                      const json& action) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    // The probe operates on the ACTIVE sketch (same context sketch_solve uses).
+    json* featp = nullptr;
+    try {
+        featp = &find_sketch_feature(s, sketch_fid);
+    } catch (const OpError&) {
+        return json{{"ok", false}, {"error", "no sketch feature '" + sketch_fid + "'"}};
+    }
+    json& feat = *featp;
+    if (!s.active_sketch || s.active_sketch->sketch_fid != sketch_fid)
+        return json{{"ok", false},
+                    {"error", "sketch '" + sketch_fid + "' is not the active sketch"}};
+    if (!action.is_object() || action.size() != 1)
+        return json{{"ok", false}, {"error", "action must be exactly one of "
+                    "add_constraint / set_dim / delete_constraint"}};
+
+    json env = env_from_doc(s.doc);
+    json base_params = sketch_params(feat);
+    json base_sk;
+    base_sk["entities"] = base_params.contains("entities") ? base_params["entities"] : json::array();
+    base_sk["constraints"] =
+        base_params.contains("constraints") ? base_params["constraints"] : json::array();
+
+    // COLD baseline solve of the unmodified copy for dof_before.
+    aicad::sketch::SketchSolution before = aicad::sketch::solve_sketch(base_sk, env, std::nullopt);
+    int dof_before = before.dof;
+
+    // Deep-copy and mutate the COPY only.
+    json params = base_sk;
+    if (!params.contains("entities") || !params["entities"].is_array())
+        params["entities"] = json::array();
+    if (!params.contains("constraints") || !params["constraints"].is_array())
+        params["constraints"] = json::array();
+    json& cons = params["constraints"];
+
+    static const std::string kProbeCid = "__probe__";
+    bool probe_is_dim = false;
+
+    if (action.contains("add_constraint")) {
+        const json& con = action["add_constraint"];
+        if (!con.is_object())
+            return json{{"ok", false}, {"error", "add_constraint requires a constraint object"}};
+        json c = con;
+        c["id"] = kProbeCid;
+        probe_is_dim = is_dim_type(c.value("type", std::string()));
+        cons.push_back(std::move(c));
+    } else if (action.contains("set_dim")) {
+        const json& sd = action["set_dim"];
+        if (!sd.is_object() || !sd.contains("id"))
+            return json{{"ok", false}, {"error", "set_dim requires an 'id'"}};
+        std::string cid = sd["id"].get<std::string>();
+        json* target = nullptr;
+        for (json& c : cons)
+            if (c.is_object() && c.value("id", std::string()) == cid) { target = &c; break; }
+        if (!target)
+            return json{{"ok", false}, {"error", "set_dim: constraint '" + cid + "' not found"}};
+        bool touched = false;
+        if (sd.contains("expr") && !sd["expr"].is_null()) {
+            double cur = (target->contains("value") && (*target)["value"].is_object() &&
+                          (*target)["value"].contains("value"))
+                             ? (*target)["value"]["value"].get<double>() : 0.0;
+            (*target)["value"] = {{"value", cur}, {"expr", sd["expr"]}};
+            touched = true;
+        } else if (sd.contains("value") && !sd["value"].is_null()) {
+            (*target)["value"] = {{"value", sd["value"].get<double>()}, {"expr", nullptr}};
+            touched = true;
+        }
+        if (sd.contains("placement")) {
+            if (sd["placement"].is_null()) {
+                target->erase("placement");
+            } else if (sd["placement"].is_array() && sd["placement"].size() == 2) {
+                (*target)["placement"] = {sd["placement"][0].get<double>(),
+                                          sd["placement"][1].get<double>()};
+            } else {
+                return json{{"ok", false}, {"error", "set_dim.placement must be [u, v] or null"}};
+            }
+            touched = true;
+        }
+        if (sd.contains("driven") && !sd["driven"].is_null()) {
+            (*target)["driven"] = sd["driven"].get<bool>();
+            touched = true;
+        }
+        if (!touched)
+            return json{{"ok", false},
+                        {"error", "set_dim requires 'value', 'expr', 'placement', or 'driven'"}};
+    } else if (action.contains("delete_constraint")) {
+        const json& dc = action["delete_constraint"];
+        if (!dc.is_object() || !dc.contains("id"))
+            return json{{"ok", false}, {"error", "delete_constraint requires an 'id'"}};
+        std::string cid = dc["id"].get<std::string>();
+        bool found = false;
+        json kept = json::array();
+        for (const json& c : cons)
+            if (c.is_object() && c.value("id", std::string()) == cid) found = true;
+            else kept.push_back(c);
+        if (!found)
+            return json{{"ok", false}, {"error", "delete_constraint: '" + cid + "' not found"}};
+        params["constraints"] = kept;
+    } else {
+        return json{{"ok", false}, {"error", "unknown action; expected add_constraint / "
+                    "set_dim / delete_constraint"}};
+    }
+
+    aicad::sketch::SketchSolution after = aicad::sketch::solve_sketch(params, env, std::nullopt);
+    int dof_after = after.dof;
+    const std::vector<std::string>& conflicting = after.conflicting;
+    const std::vector<std::string>& redundant = after.redundant;
+
+    json cons_by_id = json::object();
+    for (const json& c : params["constraints"])
+        if (c.is_object() && c.contains("id"))
+            cons_by_id[c["id"].get<std::string>()] = c;
+
+    auto in = [](const std::vector<std::string>& v, const std::string& x) {
+        for (const std::string& s : v) if (s == x) return true;
+        return false;
+    };
+    bool would = in(conflicting, kProbeCid) ||
+                 (probe_is_dim && in(redundant, kProbeCid)) ||
+                 (probe_is_dim && dof_after >= dof_before) ||
+                 !after.converged || !conflicting.empty();
+
+    json statuses = json::object();
+    for (const auto& kv : after.statuses) statuses[kv.first] = kv.second;
+
+    json out;
+    out["ok"] = true;
+    out["status"] = overall_status(statuses, dof_after, conflicting, redundant, cons_by_id);
+    out["dof_before"] = dof_before;
+    out["dof_after"] = dof_after;
+    out["converged"] = after.converged;
+    out["conflicting"] = strvec_json(conflicting);
+    out["redundant"] = strvec_json(redundant);
+    out["would_over_define"] = would;
+    return out;
+}
+
+namespace {
+
+// Intersection of plane (O2,n2) with the sketch plane (O1,u,v,n1) in sketch (u,v)
+// coords. Returns (p_near, t): line point nearest the sketch origin + unit direction.
+// Throws unsupported_ref when the planes are parallel (session.py::_plane_plane_line_uv).
+std::pair<Eigen::Vector2d, Eigen::Vector2d> plane_plane_line_uv(
+    const Eigen::Vector3d& O1, const Eigen::Vector3d& u, const Eigen::Vector3d& v,
+    const Eigen::Vector3d& n1, const Eigen::Vector3d& O2, Eigen::Vector3d n2) {
+    n2 = n2 / std::max(n2.norm(), 1e-30);
+    Eigen::Vector3d d3 = n1.cross(n2);
+    double L = d3.norm();
+    if (L < 1e-9)
+        throw OpError("unsupported_ref", "plane is parallel to the sketch plane",
+                      {{"reason", "parallel planes"}});
+    double c1 = n1.dot(O1), c2 = n2.dot(O2), k = n1.dot(n2);
+    double denom = 1.0 - k * k;
+    Eigen::Vector3d P0 = ((c1 - c2 * k) * n1 + (c2 - c1 * k) * n2) / denom;
+    Eigen::Vector2d p0((P0 - O1).dot(u), (P0 - O1).dot(v));
+    Eigen::Vector3d t3 = d3 / L;
+    Eigen::Vector2d t(t3.dot(u), t3.dot(v));
+    t = t / std::max(t.norm(), 1e-30);
+    Eigen::Vector2d p_near = p0 - p0.dot(t) * t;
+    return {p_near, t};
+}
+
+}  // namespace
+
+// session.py::sketch_project_ref — project a datum plane / planar face / model edge
+// into a sketch's (u,v) plane. READ-ONLY (no mutation, no rev bump, no rebuild).
+// `ref` is {"datum":"front|top|right"} or {"kind":"face|edge","selector":{...}}.
+json doc_sketch_project_ref(const std::string& doc_id, const std::string& sketch_fid,
+                            const json& ref) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json& feat = find_sketch_feature(s, sketch_fid);
+    aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
+    Eigen::Vector3d O1 = plane.origin, u = plane.uAxis, v = plane.vAxis, n1 = plane.normal;
+
+    if (!ref.is_object() || (!ref.contains("datum") && !ref.contains("kind")))
+        throw OpError("invalid_op",
+                      "sketch_project_ref: 'ref' must carry 'datum' or 'kind'+'selector'",
+                      {{"reason", "bad ref"}});
+
+    auto uv = [&](const Eigen::Vector3d& P) -> json {
+        Eigen::Vector3d d = P - O1;
+        return json::array({d.dot(u), d.dot(v)});
+    };
+
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+
+    // ---- datum plane -> intersection line ----
+    if (ref.contains("datum")) {
+        std::string name = ref["datum"].get<std::string>();
+        if (name.rfind("plane.", 0) != 0) name = "plane." + name;
+        gp_Pln pln = eval_resolve_plane(name);  // throws on non-reserved datum
+        Eigen::Vector3d O2(pln.Location().X(), pln.Location().Y(), pln.Location().Z());
+        gp_Dir nd = pln.Axis().Direction();
+        Eigen::Vector3d n2(nd.X(), nd.Y(), nd.Z());
+        auto [p_near, t] = plane_plane_line_uv(O1, u, v, n1, O2, n2);
+        double diag = 0.0;
+        for (const TopoDS_Shape& sh : r.shapes) diag = std::max(diag, sim_bbox_diag(sh));
+        double half = std::max(2.0 * diag, 100.0);
+        Eigen::Vector2d p1 = p_near - half * t, p2 = p_near + half * t;
+        return json{{"entity", {{"type", "line"},
+                                {"p1", json::array({p1.x(), p1.y()})},
+                                {"p2", json::array({p2.x(), p2.y()})}}},
+                    {"source", name}};
+    }
+
+    std::string kind = ref.value("kind", std::string());
+    if (r.shapes.empty())
+        throw OpError("invalid_op", "sketch_project_ref: no solid bodies",
+                      {{"reason", "no solid bodies"}});
+    // Resolve against the LAST body (single-body parts; multi-body best-match deferred).
+    const TopoDS_Shape& body = r.shapes.back();
+    double diag = sim_bbox_diag(body);
+    json sel = ref.contains("selector") ? ref["selector"] : json(nullptr);
+
+    if (kind == "face") {
+        TopoDS_Shape sub = eval_resolve_ref(sel, body, diag);
+        TopoDS_Face face = TopoDS::Face(sub);
+        BRepAdaptor_Surface ad(face);
+        if (ad.GetType() != GeomAbs_Plane)
+            throw OpError("unsupported_ref",
+                          "sketch_project_ref: only planar faces can be projected",
+                          {{"reason", "non-planar face"}});
+        GProp_GProps props;
+        BRepGProp::SurfaceProperties(face, props);
+        gp_Pnt cm = props.CentreOfMass();
+        gp_Dir nd = ad.Plane().Axis().Direction();
+        auto [p_near, t] = plane_plane_line_uv(O1, u, v, n1,
+                                               Eigen::Vector3d(cm.X(), cm.Y(), cm.Z()),
+                                               Eigen::Vector3d(nd.X(), nd.Y(), nd.Z()));
+        // Span by the face's projected vertices, +5 mm pad.
+        std::vector<double> ss;
+        TopTools_IndexedMapOfShape vmap;
+        TopExp::MapShapes(face, TopAbs_VERTEX, vmap);
+        for (int i = 1; i <= vmap.Extent(); ++i) {
+            gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(vmap(i)));
+            Eigen::Vector3d d(p.X() - O1.x(), p.Y() - O1.y(), p.Z() - O1.z());
+            Eigen::Vector2d duv(d.dot(u), d.dot(v));
+            ss.push_back((duv - p_near).dot(t));
+        }
+        if (ss.empty()) ss.push_back(0.0);
+        double lo = *std::min_element(ss.begin(), ss.end()) - 5.0;
+        double hi = *std::max_element(ss.begin(), ss.end()) + 5.0;
+        Eigen::Vector2d p1 = p_near + lo * t, p2 = p_near + hi * t;
+        return json{{"entity", {{"type", "line"},
+                                {"p1", json::array({p1.x(), p1.y()})},
+                                {"p2", json::array({p2.x(), p2.y()})}}},
+                    {"source", "planar face"}};
+    }
+
+    if (kind == "edge") {
+        TopoDS_Shape sub = eval_resolve_ref(sel, body, diag);
+        TopoDS_Edge edge = TopoDS::Edge(sub);
+        BRepAdaptor_Curve ad(edge);
+        GeomAbs_CurveType ct = ad.GetType();
+        if (ct == GeomAbs_Line) {
+            gp_Pnt Pa = ad.Value(ad.FirstParameter());
+            gp_Pnt Pb = ad.Value(ad.LastParameter());
+            json a = uv(Eigen::Vector3d(Pa.X(), Pa.Y(), Pa.Z()));
+            json b = uv(Eigen::Vector3d(Pb.X(), Pb.Y(), Pb.Z()));
+            double dx = double(a[0]) - double(b[0]), dy = double(a[1]) - double(b[1]);
+            if (std::hypot(dx, dy) < 1e-6)
+                return json{{"entity", {{"type", "point"}, {"p", a}}},
+                            {"source", "linear edge (projects to a point)"}};
+            return json{{"entity", {{"type", "line"}, {"p1", a}, {"p2", b}}},
+                        {"source", "linear edge"}};
+        }
+        if (ct == GeomAbs_Circle) {
+            gp_Circ circ = ad.Circle();
+            gp_Dir axd = circ.Axis().Direction();
+            Eigen::Vector3d ax3(axd.X(), axd.Y(), axd.Z());
+            ax3 = ax3 / std::max(ax3.norm(), 1e-30);
+            if (std::abs(ax3.dot(n1)) <= 1.0 - 1e-6)
+                throw OpError("unsupported_ref",
+                              "edge type not supported for sketch projection",
+                              {{"reason", "circle axis not parallel to the sketch normal"}});
+            gp_Pnt loc = circ.Location();
+            return json{{"entity", {{"type", "circle"},
+                                    {"center", uv(Eigen::Vector3d(loc.X(), loc.Y(), loc.Z()))},
+                                    {"radius", circ.Radius()}}},
+                        {"source", "circular edge"}};
+        }
+        throw OpError("unsupported_ref", "edge type not supported for sketch projection",
+                      {{"reason", "unsupported curve type"}});
+    }
+
+    throw OpError("invalid_op",
+                  "sketch_project_ref: ref kind '" + kind + "' must be face|edge",
+                  {{"reason", "bad kind"}});
 }
 
 }  // namespace aicad::doc

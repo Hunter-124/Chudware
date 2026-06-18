@@ -6,6 +6,8 @@
 
 #include "doc/session.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cstdint>
@@ -22,8 +24,25 @@
 #include <cmath>
 #include <optional>
 
+#include <BRepMesh_IncrementalMesh.hxx>
+#include <BRepTools.hxx>
+#include <BRep_Tool.hxx>
+#include <Bnd_Box.hxx>
+#include <BRepBndLib.hxx>
+#include <Poly_Triangulation.hxx>
+#include <Standard_Failure.hxx>
+#include <TopLoc_Location.hxx>
+#include <TopExp_Explorer.hxx>
+#include <TopAbs.hxx>
+#include <TopoDS.hxx>
+#include <TopoDS_Face.hxx>
+#include <TopoDS_Shape.hxx>
+#include <gp_Pnt.hxx>
+#include <gp_Trsf.hxx>
+
 #include "doc/document.h"
 #include "doc/formats.h"
+#include "doc/selectors.h"
 #include "doc/sketch_geom.h"
 #include "doc/stepplus.h"
 #include "doc/validate.h"
@@ -1501,6 +1520,153 @@ json doc_resolve_pick(const std::string& doc_id, int body_id, const std::string&
     Session& s = require_session(doc_id);
     json sel = resolve_pick(s.doc, env_from_doc(s.doc), body_id, kind, topo_id);
     return json{{"selector", sel}};
+}
+
+// ----------------------------------------------------------------- C19 sim bridge
+// Port of engine/sim/bridge.py (the doc-side sim-input producers). doc_export_step
+// writes the session's surviving solid bodies to a STEP (or STL) file for the FEA
+// mesher / CFD voxeliser; doc_face_points resolves a face selector against the LAST
+// body and samples that face's triangulation nodes in WORLD space. Both rebuild the
+// document on demand (compile_document is the C++ equivalent of session.last_result /
+// _ensure_built — a fresh compile yields the same surviving bodies).
+
+namespace {
+
+// bbox diagonal of `shape`, floored at 1e-3, matching engine/sim/bridge.py::_bbox_diag.
+// That helper takes build123d's shape.bounding_box(), which (optimal=True default) uses
+// BRepBndLib::AddOptimal — the PRECISE bounding box, NOT the coarse BRepBndLib::Add that
+// picks.cpp::bbox_diag uses. AddOptimal first cleans any cached mesh (BRepTools::Clean),
+// exactly as BoundBox.from_topo_ds does. Floor 1e-3; returns 100.0 on a void/failed box,
+// mirroring the Python except-branch.
+double sim_bbox_diag(const TopoDS_Shape& shape) {
+    try {
+        BRepTools::Clean(shape);  // drop any cached triangulation (matches from_topo_ds)
+        Bnd_Box box;
+        BRepBndLib::AddOptimal(shape, box);
+        if (box.IsVoid()) return 100.0;
+        double xmin, ymin, zmin, xmax, ymax, zmax;
+        box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+        double dx = xmax - xmin, dy = ymax - ymin, dz = zmax - zmin;
+        double d = std::sqrt(dx * dx + dy * dy + dz * dz);
+        return std::max(d, 1e-3);
+    } catch (const Standard_Failure&) {
+        return 100.0;
+    }
+}
+
+// Sample a face's triangulation nodes in WORLD space — port of bridge.py::
+// _sample_face_nodes. BRepMesh_IncrementalMesh(shape, 0.5, false, 0.5, true) ensures a
+// triangulation; BRep_Tool::Triangulation yields the Poly_Triangulation; nodes are
+// transformed by the location when it is not the identity. Returns an empty vector when
+// there is no triangulation.
+std::vector<std::array<double, 3>> sample_face_nodes(const TopoDS_Face& face) {
+    BRepMesh_IncrementalMesh mesher(face, 0.5, Standard_False, 0.5, Standard_True);
+    mesher.Perform();
+
+    TopLoc_Location loc;
+    Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
+    std::vector<std::array<double, 3>> out;
+    if (tri.IsNull()) return out;
+
+    const gp_Trsf trsf = loc.Transformation();
+    const bool is_identity = loc.IsIdentity();
+    out.reserve(static_cast<std::size_t>(tri->NbNodes()));
+    for (int ni = 1; ni <= tri->NbNodes(); ++ni) {
+        gp_Pnt nd = tri->Node(ni);
+        if (!is_identity) nd.Transform(trsf);
+        out.push_back({nd.X(), nd.Y(), nd.Z()});
+    }
+    return out;
+}
+
+}  // namespace
+
+json doc_export_step(const std::string& doc_id, const std::string& path) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    if (r.shapes.empty())
+        throw OpError("export_failed", "document has no solid bodies to export",
+                      {{"doc_id", doc_id}});
+    // Format follows the extension: .stl (case-insensitive) -> binary STL, else STEP.
+    // export_bodies handles single-body-as-is / multi-body-compound (as_compound) and
+    // parent-dir creation, matching bridge.py::export_step.
+    std::string suffix = std::filesystem::path(path).extension().string();
+    std::transform(suffix.begin(), suffix.end(), suffix.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const std::string fmt = (suffix == ".stl") ? "stl" : "step";
+    std::string out = export_bodies(r.shapes, path, fmt);
+    return json{{"path", out}};
+}
+
+json doc_face_points(const std::string& doc_id, const json& selector, int max_n) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+
+    if (!selector.is_object() || selector.value("kind", std::string()) != "face")
+        throw OpError("invalid_op", "face_points requires a face selector");
+
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    if (r.shapes.empty())
+        throw OpError("invalid_op", "document has no bodies", {{"doc_id", doc_id}});
+
+    // Resolve against the LAST body's faces (bridge.py policy: bodies[-1]).
+    const TopoDS_Shape& shape = r.shapes.back();
+    const double diag = sim_bbox_diag(shape);
+
+    std::vector<TopoInfo> infos = describe_faces(shape);
+    ResolveResult rr = resolve(selector, infos, diag);
+    if (!rr.index.has_value())
+        throw OpError("invalid_op",
+                      "face selector dangling: " +
+                          rr.dangling_reason.value_or(std::string("unresolved")));
+
+    // elems[index]: the index'th face in TopExp_Explorer(TopAbs_FACE) order — the SAME
+    // enumeration describe_faces uses, so rr.index maps directly (build123d's
+    // shape.faces() likewise enumerates faces in TopExp_Explorer order).
+    TopoDS_Face face;
+    {
+        int idx = 0;
+        bool found = false;
+        for (TopExp_Explorer exp(shape, TopAbs_FACE); exp.More(); exp.Next(), ++idx) {
+            if (idx == *rr.index) {
+                face = TopoDS::Face(exp.Current());
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            throw OpError("invalid_op", "face selector dangling: index out of range");
+    }
+
+    std::vector<std::array<double, 3>> pts = sample_face_nodes(face);
+
+    if (pts.empty()) {
+        // Fall back to the selector's centroid (a 3-list) so the solver has one anchor.
+        const json& c = selector.contains("centroid") ? selector.at("centroid") : json();
+        if (c.is_array() && c.size() == 3 && c[0].is_number() && c[1].is_number() &&
+            c[2].is_number()) {
+            pts.push_back({c[0].get<double>(), c[1].get<double>(), c[2].get<double>()});
+        } else {
+            throw OpError("invalid_op", "face has no triangulation nodes to sample");
+        }
+    }
+
+    // Down-sample to <= max_n with a uniform stride: stride = (n + max_n - 1) // max_n;
+    // pts = pts[::stride][:max_n].
+    if (static_cast<int>(pts.size()) > max_n) {
+        const int n = static_cast<int>(pts.size());
+        const int stride = (n + max_n - 1) / max_n;
+        std::vector<std::array<double, 3>> ds;
+        for (int i = 0; i < n && static_cast<int>(ds.size()) < max_n; i += stride)
+            ds.push_back(pts[static_cast<std::size_t>(i)]);
+        pts = std::move(ds);
+    }
+
+    json points = json::array();
+    for (const auto& p : pts) points.push_back({p[0], p[1], p[2]});
+    const double tol_mm = std::max(0.5, diag * 0.02);
+    return json{{"points", points}, {"tol_mm", tol_mm}};
 }
 
 json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double distance,

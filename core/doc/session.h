@@ -104,6 +104,23 @@ nlohmann::json doc_resolve_pick(const std::string& doc_id, int body_id,
 nlohmann::json doc_push_pull(const std::string& doc_id, int body_id, int topo_id,
                              double distance, bool commit);
 
+// C19 sim bridge — produce sim INPUTS from the live doc session (port of
+// engine/sim/bridge.py via engine/worker.py _doc_export_step / _doc_face_points).
+//
+// doc_export_step: write the surviving solid bodies to `path` for the mesher. The
+// format follows the extension (.stl -> binary STL, else STEP/AP214). Single body
+// exports as-is; multiple bodies combine into a compound. Returns {"path": <abs>}.
+// Throws OpError("export_failed", "document has no solid bodies to export") on empty.
+nlohmann::json doc_export_step(const std::string& doc_id, const std::string& path);
+
+// doc_face_points: resolve the face `selector` (kind=="face") against the LAST body's
+// faces and sample that face's triangulation nodes in WORLD space, down-sampled to at
+// most `max_n` points (uniform stride). Returns {"points": [[x,y,z],...], "tol_mm":
+// max(0.5, diag*0.02)}. Throws OpError on a non-face selector / no bodies / a dangling
+// face / no triangulation nodes (falling back to the selector centroid first).
+nlohmann::json doc_face_points(const std::string& doc_id, const nlohmann::json& selector,
+                               int max_n = 400);
+
 // Export the document's surviving solid bodies to `path` in `fmt` (step/iges/brep/stl)
 // via OCCT. Returns {"path": <abs>}. Throws OpError("export_failed") on no bodies / an
 // unsupported format / a writer failure (engine.doc.formats export_file).

@@ -1339,6 +1339,18 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                     ? params["distance"].get<double>() : 0.0,
                                 params.value("commit", false)),
                             out_json, 0);
+            if (m == "doc_export_step")
+                return emit(aicad::doc::doc_export_step(
+                                params.value("doc_id", std::string()),
+                                params.value("path", std::string())),
+                            out_json, 0);
+            if (m == "doc_face_points")
+                return emit(aicad::doc::doc_face_points(
+                                params.value("doc_id", std::string()),
+                                params.contains("selector") ? params["selector"] : json(nullptr),
+                                params.contains("max_n") && params["max_n"].is_number()
+                                    ? params["max_n"].get<int>() : 400),
+                            out_json, 0);
             if (m == "export_file")
                 return emit(aicad::doc::doc_export_file(params.value("doc_id", std::string()),
                                                         params.value("path", std::string()),

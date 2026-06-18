@@ -30,6 +30,7 @@
 #include "doc/session.h"
 #include "doc/validate.h"
 #include "ecad/autoroute.h"
+#include "ecad/recipes.h"
 #include "ecad/session.h"
 #include "geom/ecad_3d.h"
 #include "sim/fea_modal.h"
@@ -481,6 +482,45 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 return emit(aicad::ecad::ecad_impedance(params), out_json, 0);
             if (m == "ecad_export")
                 return emit(aicad::ecad::ecad_export(params), out_json, 0);
+            if (m == "ecad_save")
+                return emit(aicad::ecad::ecad_save(params.value("doc_id", std::string()),
+                                                   params.value("path", std::string())),
+                            out_json, 0);
+            if (m == "ecad_open")
+                return emit(aicad::ecad::ecad_open(params.value("path", std::string())), out_json, 0);
+            if (m == "ecad_update_from_sch") {
+                // Stateless inline path (parity harness): {board, sch_netlist, prune?,
+                // place_origin?} -> sync's {mutated_board, report}. Else the stateful
+                // path over two open sessions.
+                json place = params.contains("place_origin") ? params["place_origin"] : json(nullptr);
+                if (params.contains("board") && params["board"].is_object())
+                    return emit(aicad::ecad::ecad_update_from_sch_inline(
+                                    params["board"],
+                                    params.contains("sch_netlist") ? params["sch_netlist"]
+                                                                    : json::object(),
+                                    params.value("prune", false), place),
+                                out_json, 0);
+                return emit(aicad::ecad::ecad_update_from_sch(
+                                params.value("board_doc_id", std::string()),
+                                params.value("sch_doc_id", std::string()),
+                                params.value("prune", false), place,
+                                params.contains("base_revision") && params["base_revision"].is_number()
+                                    ? params["base_revision"].get<long>() : -1),
+                            out_json, 0);
+            }
+            // Deterministic recipe generators (engine/ecad/recipes.py). The LLM
+            // orchestrator (engine/ecad/orchestrator.py / the ecad_design RPC) is
+            // DEFERRED to the agent/LLM epic; only the pure recipe builders are ported.
+            if (m == "ecad_recipe")
+                return emit(aicad::ecad::recipes::build(
+                                params.value("name", std::string()),
+                                params.contains("params") ? params["params"] : json::object()),
+                            out_json, 0);
+            if (m == "ecad_recipes_all")
+                return emit(aicad::ecad::recipes::all_recipes(), out_json, 0);
+            if (m == "ecad_closest_recipe")
+                return emit(aicad::ecad::recipes::closest_recipe(params.value("request", std::string())),
+                            out_json, 0);
         } catch (const aicad::ecad::OpError& oe) {
             return emit(oe.envelope(), out_json, 3);
         }

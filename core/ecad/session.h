@@ -36,6 +36,33 @@ bool ecad_close(const std::string& doc_id);
 // when engine.ecad.describe is absent).
 nlohmann::json ecad_describe(const std::string& doc_id);
 
+// ecad_save {doc_id, path?} -> {"path": <final path>}. Writes the open session's
+// document as a .ecad+ ZIP container (engine/ecad/rpc.py::_ecad_save +
+// engine/ecad/formats.save). Uses the session's current path when `path` is empty;
+// throws OpError("io_error") if neither is available.
+nlohmann::json ecad_save(const std::string& doc_id, const std::string& path);
+
+// ecad_open {path} -> ops-response + "doc_id" + "warnings". Opens a .ecad+ container
+// (engine/ecad/rpc.py::_ecad_open + formats.open), registers a session around the
+// parsed document, rebuilds (compile), and returns the full response. KiCad S-expr
+// imports are DEFERRED (the host routes .kicad_sch/.kicad_pcb to Python).
+nlohmann::json ecad_open(const std::string& path);
+
+// ecad_update_from_sch {board_doc_id, sch_doc_id, prune?, place_origin?,
+// base_revision?} -> board ops-response + "report" + "doc_id". Cross-document
+// back-annotation (engine/ecad/rpc.py::_ecad_update_from_sch + engine/ecad/sync):
+// build the schematic's netlist, reconcile the board, swap the new board into the
+// board session (one revision bump, undo snapshot, recompile), attach the report.
+nlohmann::json ecad_update_from_sch(const std::string& board_doc_id, const std::string& sch_doc_id,
+                                    bool prune, const nlohmann::json& place_origin,
+                                    long base_revision);
+
+// Stateless variant for the parity harness: reconcile an inline board against an
+// inline schematic netlist (no sessions). Returns sync's {mutated_board, report}.
+nlohmann::json ecad_update_from_sch_inline(const nlohmann::json& board,
+                                           const nlohmann::json& sch_netlist, bool prune,
+                                           const nlohmann::json& place_origin);
+
 // ecad_schema {kind?} -> the empty document for the given kind (cheap diagnostic).
 nlohmann::json ecad_schema(const std::string& kind);
 

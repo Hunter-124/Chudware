@@ -126,9 +126,15 @@ add_library(aicad_ecad STATIC
   ecad/impedance.cpp
   ecad/zonefill.cpp
   ecad/fabformats.cpp
+  ecad/library.cpp
+  ecad/recipes.cpp
+  ecad/sync.cpp
+  ecad/container.cpp
   ecad/session.cpp)
 target_include_directories(aicad_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_ecad PUBLIC nlohmann_json::nlohmann_json)
+# aicad_miniz is the ZIP read/write lib (shared with the .step+ container) — the
+# .ecad+ container (container.cpp) writes/reads its archive through it.
+target_link_libraries(aicad_ecad PUBLIC nlohmann_json::nlohmann_json aicad_miniz)
 
 add_executable(test_sim tests/test_sim.cpp)
 target_include_directories(test_sim PRIVATE ${doctest_SOURCE_DIR})

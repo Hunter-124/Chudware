@@ -42,6 +42,13 @@ def norm_tree(tree: dict) -> dict:
     import copy
     t = copy.deepcopy(tree)
     t["id"] = "<id>"
+    # `linked_sch` is a board's back-link to the SOURCE SCHEMATIC's session id,
+    # set by ecad_update_from_sch. That id is engine-specific by construction
+    # (Python uuid4 vs C++ "ecadcpp..."), exactly like the doc's own `id`, so it is
+    # pinned for the cross-engine compare. It is null on every other doc, so this
+    # is a no-op except after a stateful update-from-sch.
+    if isinstance(t, dict) and "linked_sch" in t and t.get("linked_sch") is not None:
+        t["linked_sch"] = "<sch_id>"
     return t
 
 
@@ -1452,6 +1459,332 @@ def main() -> int:
     _ref = _py_ref and _cpp_ref
     print(f"  {'threed empty-outline refused':<40} {'MATCH' if _ref else 'DIFF: not refused'}")
     step(0 if _ref else 1)
+
+    # ---- 23) CONTAINER round-trip + cross-engine parity (.ecad+ save/open) ----
+    # The ECAD container is a ZIP (engine/ecad/formats.py / core/ecad/container.cpp).
+    # DEFLATE is non-deterministic, so we NEVER byte-compare the archive. We gate the
+    # ROUND-TRIPPED document instead: build a doc via ops (both engines hold an
+    # identical tree — proven above), save it with each engine, then open the file
+    # with BOTH engines and compare the reopened document.json trees EXACTLY. The
+    # cross-engine cells (Python opens the C++-saved file and vice-versa) prove the
+    # container is interoperable, exactly like cpp_session_parity does for .step+.
+    import tempfile as _ctmp
+    import os as _cos
+
+    def _norm_doc(doc):
+        """Canonicalize a reopened ECAD doc for compare: pin the random `id` and
+        drop the private `_extra_entries` (Python stashes opened unknown entries
+        there; the C++ open carries them on the session, not in the doc tree)."""
+        import copy as _copy
+        d = _copy.deepcopy(doc)
+        if isinstance(d, dict):
+            d["id"] = "<id>"
+            d.pop("_extra_entries", None)
+        return d
+
+    def _open_doc_py(path):
+        # engine.ecad.formats.open -> (doc, warnings); fall back already handled.
+        from engine.ecad import formats as _fmt
+        doc, _w = _fmt.open(path)
+        return doc
+
+    def _open_doc_cpp(path):
+        return cpp.call("ecad_open", {"path": path})["tree"]
+
+    def container_roundtrip(label, kind, batch):
+        """Build a doc via ops on each engine, then exercise the 4-way matrix:
+        {save by py, save by cpp} x {open by py, open by cpp}, all docs equal."""
+        pp, cc = new(kind, label)
+        pid, cid = pp["doc_id"], cc["doc_id"]
+        if batch:
+            apply(pid, cid, 0, batch)
+        with _ctmp.TemporaryDirectory() as td:
+            py_path = _cos.path.join(td, f"{label}_py.ecad+")
+            cpp_path = _cos.path.join(td, f"{label}_cpp.ecad+")
+            # save with each engine
+            r_py = py.call("ecad_save", {"doc_id": pid, "path": py_path})
+            r_cpp = cpp.call("ecad_save", {"doc_id": cid, "path": cpp_path})
+            ok_paths = (_cos.path.exists(r_py.get("path", py_path))
+                        and _cos.path.exists(r_cpp.get("path", cpp_path)))
+            print(f"  {('container ' + label + ' save'):<40} "
+                  f"{'MATCH' if ok_paths else 'DIFF: a save produced no file'}")
+            step(0 if ok_paths else 1)
+            # The source-of-truth document = the C++ doc tree right after ops (==
+            # python's, proven by the build steps), normalized.
+            truth = _norm_doc(cpp.call("ecad_tree", {"doc_id": cid})["tree"])
+            # 4-way open matrix
+            matrix = [
+                ("py-open py-file", _open_doc_py(py_path)),
+                ("cpp-open py-file", _open_doc_cpp(py_path)),
+                ("py-open cpp-file", _open_doc_py(cpp_path)),
+                ("cpp-open cpp-file", _open_doc_cpp(cpp_path)),
+            ]
+            for cell, reopened in matrix:
+                got = _norm_doc(reopened)
+                ok = (got == truth)
+                if not ok:
+                    diffs = []
+                    for k in sorted(set(got) | set(truth)):
+                        if got.get(k) != truth.get(k):
+                            diffs.append(f"tree.{k}")
+                    print(f"  {('container ' + label + ' ' + cell):<40} "
+                          f"DIFF: {'; '.join(diffs)[:90]}")
+                else:
+                    print(f"  {('container ' + label + ' ' + cell):<40} MATCH")
+                step(0 if ok else 1)
+
+    # 23a a schematic with a placed symbol + wire (also exercises the netlist.json snapshot).
+    container_roundtrip("sch_doc", "sch", [
+        {"op": "sch_add_symbol", "libid": "Device:R", "pos": [10.0, 10.0], "def": RDEF, "ref": "R1"},
+        {"op": "sch_add_wire", "pts": [[0.0, 0.0], [10.0, 0.0]]},
+    ])
+    # 23b a board with an outline + footprint + track + zone.
+    fp_def_c = {"fpid": "R_0603", "value": "10k", "attr": "smd", "pads": [
+        {"id": "p1", "number": "1", "pos": [-0.8, 0.0], "angle": 0.0, "shape": "roundrect",
+         "size": [0.9, 0.95], "type": "smd", "layers": ["F.Cu", "F.Mask", "F.Paste"], "net": "GND"},
+    ]}
+    container_roundtrip("pcb_doc", "pcb", [
+        {"op": "pcb_set_outline", "shapes": [
+            {"type": "line", "p1": [0.0, 0.0], "p2": [50.0, 0.0]},
+            {"type": "line", "p1": [50.0, 0.0], "p2": [50.0, 40.0]},
+            {"type": "line", "p1": [50.0, 40.0], "p2": [0.0, 40.0]},
+            {"type": "line", "p1": [0.0, 40.0], "p2": [0.0, 0.0]}], "closed": True},
+        {"op": "pcb_add_footprint", "fpid": "R_0603", "pos": [10.0, 10.0], "ref": "R1", "def": fp_def_c},
+        {"op": "pcb_add_track", "net": "GND", "layer": "F.Cu", "p1": [10.0, 10.0], "p2": [20.0, 10.0]},
+    ])
+    # 23c an empty schematic (minimal doc — exercises the bare container).
+    container_roundtrip("empty_sch", "sch", [])
+
+    # ---- 24) SYNC parity: engine.ecad.sync vs core/ecad/sync.cpp -------------
+    # Back-annotation (update_board_from_sch). Both engines build the schematic via
+    # ops (identical tree, proven above), each side builds the netlist + runs sync,
+    # and we compare the reconciled board + report EXACTLY. The C++ stateless inline
+    # path takes {board, sch_netlist} and returns {mutated_board, report}; the Python
+    # oracle is engine.ecad.sync.update_board_from_sch with the SAME inputs. The
+    # schematic netlist (component refs/footprints/pins) drives id allocation, grid
+    # placement, ref-sorted iteration, net registration + the report — all load-bearing.
+    from engine.ecad import sync as _esync  # noqa: E402
+    from engine.ecad.netlist import build_netlist as _ebuild_netlist  # noqa: E402
+
+    def cmp_sync(label, sch_batch, *, prune=False, place_origin=None, second_pass=False):
+        # build the SAME schematic on both engines (proves input parity), then build
+        # the netlist on the PY side and feed it inline to both sync impls.
+        ps, cs = new("sch", label + "_sch")
+        psid, csid = ps["doc_id"], cs["doc_id"]
+        # seed lib_cache defs via inline `def` on each add op (already in sch_batch).
+        apply(psid, csid, 0, sch_batch)
+        sch_doc = cpp.call("ecad_tree", {"doc_id": csid})["tree"]  # == py tree (proven)
+        nl = _ebuild_netlist(sch_doc)
+        nl = dict(nl, id=sch_doc.get("id"))
+
+        board = schema_new_board(label + "_pcb")
+        # python sync
+        py_out = _esync.update_board_from_sch(board, nl, place_origin=place_origin, prune=prune)
+        # cpp sync (stateless inline)
+        p = {"board": board, "sch_netlist": nl, "prune": prune}
+        if place_origin is not None:
+            p["place_origin"] = place_origin
+        cpp_out = cpp.call("ecad_update_from_sch", p)
+
+        diffs = []
+        if py_out["report"] != cpp_out.get("report"):
+            pr, cr = py_out["report"], cpp_out.get("report") or {}
+            for k in sorted(set(pr) | set(cr)):
+                if pr.get(k) != cr.get(k):
+                    diffs.append(f"report.{k} (py={str(pr.get(k))[:40]} cpp={str(cr.get(k))[:40]})")
+        if py_out["mutated_board"] != cpp_out.get("mutated_board"):
+            pb, cb = py_out["mutated_board"], cpp_out.get("mutated_board") or {}
+            for k in sorted(set(pb) | set(cb)):
+                if pb.get(k) != cb.get(k):
+                    diffs.append(f"board.{k}")
+        ok = not diffs
+        print(f"  {('sync ' + label):<40} {'MATCH' if ok else 'DIFF: ' + '; '.join(diffs)[:120]}")
+        step(0 if ok else 1)
+
+        if second_pass:
+            # idempotency: re-run sync on the RESULT board (both engines) -> identical.
+            board2 = py_out["mutated_board"]
+            py2 = _esync.update_board_from_sch(board2, nl, place_origin=place_origin, prune=prune)
+            p2 = {"board": board2, "sch_netlist": nl, "prune": prune}
+            if place_origin is not None:
+                p2["place_origin"] = place_origin
+            cpp2 = cpp.call("ecad_update_from_sch", p2)
+            ok2 = (py2["report"] == cpp2.get("report")
+                   and py2["mutated_board"] == cpp2.get("mutated_board"))
+            print(f"  {('sync ' + label + ' idempotent'):<40} "
+                  f"{'MATCH' if ok2 else 'DIFF: 2nd-pass report/board differ'}")
+            step(0 if ok2 else 1)
+
+    # schema.new_board for fresh boards (the input the sync mutates a copy of).
+    from engine.ecad.schema import new_board as schema_new_board  # noqa: E402
+    from engine.ecad.library.starter import SYMBOLS as _STARTER_SYMBOLS  # noqa: E402
+
+    # Real symbol defs (so the netlist binds pins exactly as the oracle's test does).
+    import copy as _ccopy
+    _VSRC = _ccopy.deepcopy(_STARTER_SYMBOLS["Simulation_SPICE:V_source"])
+    _RDEV = _ccopy.deepcopy(_STARTER_SYMBOLS["Device:R"])
+    _GNDS = _ccopy.deepcopy(_STARTER_SYMBOLS["power:GND"])
+
+    # 24a the divider scenario from test_sync.py (V1/R1/MID/R2/GND), R1/R2 -> R_0603.
+    divider_batch = [
+        {"op": "sch_add_symbol", "libid": "Simulation_SPICE:V_source", "pos": [0.0, 0.0],
+         "ref": "V1", "value": "5", "def": _VSRC},
+        {"op": "sch_add_symbol", "libid": "Device:R", "pos": [20.0, 5.0], "ref": "R1",
+         "value": "10k", "footprint": "Resistor_SMD:R_0603", "def": _RDEV},
+        {"op": "sch_add_symbol", "libid": "Device:R", "pos": [40.0, 5.0], "ref": "R2",
+         "value": "10k", "footprint": "Resistor_SMD:R_0603", "def": _RDEV},
+        {"op": "sch_add_power", "net": "+5V", "pos": [0.0, 5.08]},
+        {"op": "sch_add_power", "net": "+5V", "pos": [14.92, 5.0]},
+        {"op": "sch_add_label", "text": "MID", "pos": [25.08, 5.0], "scope": "local"},
+        {"op": "sch_add_label", "text": "MID", "pos": [34.92, 5.0], "scope": "local"},
+        {"op": "sch_add_power", "net": "GND", "pos": [0.0, -5.08]},
+        {"op": "sch_add_power", "net": "GND", "pos": [45.08, 5.0]},
+        {"op": "sch_add_symbol", "libid": "power:GND", "pos": [45.08, 2.46], "def": _GNDS},
+    ]
+    cmp_sync("divider", divider_batch, second_pass=True)
+    # 24b same, with prune=True (no removals expected — all refs present).
+    cmp_sync("divider_prune", divider_batch, prune=True)
+    # 24c same, with an explicit place_origin (shifts the grid placement of added fps).
+    cmp_sync("divider_origin", divider_batch, place_origin=[100.0, 50.0])
+    # 24d dnp + unresolved (test_dnp_and_unresolved): R1 dnp (skip), R2 bogus fpid (unresolved).
+    cmp_sync("dnp_unresolved", [
+        {"op": "sch_add_symbol", "libid": "Device:R", "pos": [0.0, 0.0], "ref": "R1",
+         "footprint": "Resistor_SMD:R_0603", "dnp": True, "def": _RDEV},
+        {"op": "sch_add_symbol", "libid": "Device:R", "pos": [10.0, 0.0], "ref": "R2",
+         "footprint": "NoSuchLib:NoSuchFp", "def": _RDEV},
+    ])
+    # 24e a mixed-footprint board (cap + diode + led -> different starter footprints resolved).
+    _CDEV = _ccopy.deepcopy(_STARTER_SYMBOLS["Device:C"])
+    cmp_sync("mixed_fps", [
+        {"op": "sch_add_symbol", "libid": "Device:R", "pos": [0.0, 0.0], "ref": "R1",
+         "footprint": "Resistor_SMD:R_0805", "def": _RDEV},
+        {"op": "sch_add_symbol", "libid": "Device:C", "pos": [10.0, 0.0], "ref": "C1",
+         "footprint": "Capacitor_SMD:C_0603", "def": _CDEV},
+        {"op": "sch_add_symbol", "libid": "Device:R", "pos": [20.0, 0.0], "ref": "R2",
+         "footprint": "Resistor_SMD:R_0402", "def": _RDEV},
+    ])
+
+    # ---- 24f) SYNC parity via the STATEFUL RPC (ecad_update_from_sch over sessions) --
+    # Mirrors test_sync.py::test_rpc_update_from_sch: both docs open in each engine's
+    # registry, one call back-annotates the board. Compare the full ops-response
+    # (revision/kind/tree/report) EXACTLY, plus the idempotent 2nd call.
+    def cmp_sync_rpc(label, sch_batch):
+        # open the schematic in BOTH engines + apply the build batch
+        ps, cs = new("sch", label + "_sch")
+        psid, csid = ps["doc_id"], cs["doc_id"]
+        apply(psid, csid, 0, sch_batch)
+        # fresh boards in both engines
+        pb, cb = new("pcb", label + "_pcb")
+        pbid, cbid = pb["doc_id"], cb["doc_id"]
+        base = pb["revision"]
+        pr = py.call("ecad_update_from_sch",
+                     {"board_doc_id": pbid, "sch_doc_id": psid, "base_revision": base})
+        cr = cpp.call("ecad_update_from_sch",
+                      {"board_doc_id": cbid, "sch_doc_id": csid, "base_revision": base})
+        step(cmp_resp(f"sync rpc {label}", pr, cr))
+        # report.linked_sch is the source-schematic session id (engine-specific),
+        # so normalize it before comparing the reports (same rationale as the tree).
+        def _norm_rep(rep):
+            r = dict(rep or {})
+            if r.get("linked_sch") is not None:
+                r["linked_sch"] = "<sch_id>"
+            return r
+        ok_rep = (_norm_rep(pr.get("report")) == _norm_rep(cr.get("report")))
+        print(f"  {('sync rpc ' + label + ' report'):<40} "
+              f"{'MATCH' if ok_rep else 'DIFF: report differ'}")
+        step(0 if ok_rep else 1)
+        # idempotent 2nd call (apply against the new revision)
+        pr2 = py.call("ecad_update_from_sch",
+                      {"board_doc_id": pbid, "sch_doc_id": psid, "base_revision": pr["revision"]})
+        cr2 = cpp.call("ecad_update_from_sch",
+                       {"board_doc_id": cbid, "sch_doc_id": csid, "base_revision": cr["revision"]})
+        step(cmp_resp(f"sync rpc {label} idem", pr2, cr2))
+
+    cmp_sync_rpc("divider", divider_batch)
+
+    # ---- 25) RECIPE parity: engine.ecad.recipes vs core/ecad/recipes.cpp -----
+    # The four parametric recipes + closest_recipe are pure deterministic generators
+    # (closed-form designs; no RNG), so they gate EXACTLY. Compare the full design
+    # dict (components/nets/study/notes/request/name) byte-for-byte via json.dumps.
+    # The LLM ORCHESTRATOR that consumes these (engine/ecad/orchestrator.py /
+    # ecad_design) is DEFERRED to the agent/LLM epic — it drives a provider.
+    from engine.ecad import recipes as _erecipes  # noqa: E402
+    import json as _rjson  # noqa: E402
+
+    def cmp_recipe(label, py_design, cpp_design):
+        ok = _rjson.dumps(py_design, sort_keys=True) == _rjson.dumps(cpp_design, sort_keys=True)
+        if not ok:
+            diffs = []
+            for k in sorted(set(py_design) | set(cpp_design)):
+                if (_rjson.dumps(py_design.get(k), sort_keys=True)
+                        != _rjson.dumps(cpp_design.get(k), sort_keys=True)):
+                    diffs.append(k)
+            print(f"  {('recipe ' + label):<40} DIFF: {'; '.join(diffs)[:90]}")
+        else:
+            print(f"  {('recipe ' + label):<40} MATCH")
+        step(0 if ok else 1)
+
+    # 25a the four recipes at defaults + a spread of parameters.
+    cmp_recipe("voltage_divider default", _erecipes.voltage_divider(),
+               cpp.call("ecad_recipe", {"name": "voltage_divider"}))
+    cmp_recipe("voltage_divider 12->3.3", _erecipes.voltage_divider(12.0, 3.3),
+               cpp.call("ecad_recipe", {"name": "voltage_divider", "params": {"vin": 12.0, "vout": 3.3}}))
+    cmp_recipe("voltage_divider 3.3->1.8", _erecipes.voltage_divider(3.3, 1.8),
+               cpp.call("ecad_recipe", {"name": "voltage_divider", "params": {"vin": 3.3, "vout": 1.8}}))
+    cmp_recipe("rc_lowpass default", _erecipes.rc_lowpass(),
+               cpp.call("ecad_recipe", {"name": "rc_lowpass"}))
+    cmp_recipe("rc_lowpass 10kHz", _erecipes.rc_lowpass(10000.0),
+               cpp.call("ecad_recipe", {"name": "rc_lowpass", "params": {"fc": 10000.0}}))
+    cmp_recipe("rc_lowpass 159Hz", _erecipes.rc_lowpass(159.0),
+               cpp.call("ecad_recipe", {"name": "rc_lowpass", "params": {"fc": 159.0}}))
+    cmp_recipe("inverting_amp default", _erecipes.inverting_amp(),
+               cpp.call("ecad_recipe", {"name": "inverting_amp"}))
+    cmp_recipe("inverting_amp gain47", _erecipes.inverting_amp(47.0),
+               cpp.call("ecad_recipe", {"name": "inverting_amp", "params": {"gain": 47.0}}))
+    cmp_recipe("inverting_amp gain2.5", _erecipes.inverting_amp(2.5),
+               cpp.call("ecad_recipe", {"name": "inverting_amp", "params": {"gain": 2.5}}))
+    cmp_recipe("rc_555_astable default", _erecipes.rc_555_astable(),
+               cpp.call("ecad_recipe", {"name": "rc_555_astable"}))
+    cmp_recipe("rc_555_astable 1kHz", _erecipes.rc_555_astable(1000.0),
+               cpp.call("ecad_recipe", {"name": "rc_555_astable", "params": {"freq": 1000.0}}))
+    cmp_recipe("rc_555_astable 2Hz", _erecipes.rc_555_astable(2.0),
+               cpp.call("ecad_recipe", {"name": "rc_555_astable", "params": {"freq": 2.0}}))
+
+    # 25b all_recipes() (the planner few-shot set — every default design, in order).
+    py_all = _erecipes.all_recipes()
+    cpp_all = cpp.call("ecad_recipes_all", {})
+    ok_all = _rjson.dumps(py_all, sort_keys=True) == _rjson.dumps(cpp_all, sort_keys=True)
+    print(f"  {'recipe all_recipes':<40} {'MATCH' if ok_all else 'DIFF: all_recipes differ'}")
+    step(0 if ok_all else 1)
+
+    # 25c closest_recipe() keyword scoring + numeric extraction (the deterministic
+    #     fallback selector). A spread of requests exercising each recipe + numerics.
+    closest_reqs = [
+        "a 5V resistive divider with 2.5V output",
+        "make me a voltage divider",
+        "an inverting amplifier, gain 10",
+        "inverting amp with a gain of 47",
+        "an RC low-pass filter with a 1000Hz cutoff",
+        "a low pass filter 2.2khz corner",
+        "a 555 astable oscillator at about 2Hz",
+        "blink an LED with a timer",
+        "a 12V to 3.3V divider",
+        "something with an op-amp",
+        "gain of 100",
+        "just a filter please",
+        "potential divider 9v",
+        "an oscillator",
+    ]
+    for req in closest_reqs:
+        py_c = _erecipes.closest_recipe(req)
+        cpp_c = cpp.call("ecad_closest_recipe", {"request": req})
+        ok = _rjson.dumps(py_c, sort_keys=True) == _rjson.dumps(cpp_c, sort_keys=True)
+        lbl = ("closest: " + req)[:38]
+        if not ok:
+            print(f"  {lbl:<40} DIFF: py={py_c.get('name')} cpp={cpp_c.get('name')}")
+        else:
+            print(f"  {lbl:<40} MATCH ({py_c.get('name')})")
+        step(0 if ok else 1)
 
     print(f"\n[ecad-parity] {total - mism}/{total} steps at full parity")
     return mism

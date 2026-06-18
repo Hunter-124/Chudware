@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "ecad/container.h"
 #include "ecad/dfm.h"
 #include "ecad/drc.h"
 #include "ecad/erc.h"
@@ -19,6 +20,7 @@
 #include "ecad/impedance.h"
 #include "ecad/netlist.h"
 #include "ecad/schema.h"
+#include "ecad/sync.h"
 #include "ecad/zonefill.h"
 
 namespace aicad::ecad {
@@ -38,6 +40,7 @@ struct Session {
     std::vector<std::string> undo_stack;  // canonical JSON snapshots (doc only)
     std::vector<std::string> redo_stack;
     json last_compile = nullptr;
+    std::map<std::string, std::string> extra_entries;  // unknown .ecad+ entries (verbatim)
 };
 
 std::mutex g_mtx;
@@ -375,6 +378,140 @@ json ecad_export(const json& params) {
         files["cpl"] = fab::write_placement(board, excl_tht, excl_virt);
     }
     return json{{"files", files}};
+}
+
+// ------------------------------------------------------------------- save / open
+
+json ecad_save(const std::string& doc_id, const std::string& path) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    const std::string target = !path.empty() ? path : s.path;
+    if (target.empty())
+        throw OpError("io_error",
+                      "ecad_save: no path given and document has no current path",
+                      {{"reason", "missing path"}});
+    std::string out = ecad_container_save(s.doc, target, s.extra_entries);
+    s.path = out;
+    s.dirty = false;
+    return json{{"path", out}};
+}
+
+json ecad_open(const std::string& path) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadContainerDoc loaded = ecad_container_open(path);  // throws OpError on a bad file
+
+    if (!(schema::is_schematic(loaded.doc) || schema::is_board(loaded.doc))) {
+        std::string sch = loaded.doc.is_object() ? loaded.doc.value("schema", std::string()) : "";
+        throw OpError("invalid_op", "not an ECAD document (" + sch + ")",
+                      {{"reason", "unknown schema"}});
+    }
+
+    Session s;
+    s.doc_id = new_doc_id();
+    s.doc = loaded.doc;            // open_session deep-copies the doc
+    s.doc["id"] = s.doc_id;        // Python uses uuid4; the session id is faithful here
+    s.revision = 0;
+    s.path = path;
+    s.extra_entries = std::move(loaded.extra);
+    Session& stored = g_sessions[s.doc_id] = std::move(s);
+
+    // ecad_open -> rebuild() (no op application, no rev bump) + doc_id + warnings.
+    json resp = ops_response(stored, json::object(), json::array());
+    resp["doc_id"] = stored.doc_id;
+    json warnings = json::array();
+    for (const std::string& w : loaded.warnings) warnings.push_back(w);
+    resp["warnings"] = warnings;
+    return resp;
+}
+
+// ------------------------------------------------------------- update_from_sch
+
+namespace {
+// swap_doc (engine/ecad/session.py::swap_doc): validate -> undo snapshot -> swap ->
+// rev+1 -> compile -> ops-response (empty id_map). Caller holds g_mtx.
+json swap_doc_locked(Session& s, const json& new_doc, long base_revision, const json& warnings) {
+    if (base_revision >= 0 && base_revision != s.revision)
+        throw OpError("stale_revision",
+                      "base_revision " + std::to_string(base_revision) + " != current " +
+                          std::to_string(s.revision),
+                      {{"current_revision", s.revision}});
+    std::vector<std::string> errs = schema::validate(new_doc);
+    if (!errs.empty()) {
+        std::string joined;
+        for (std::size_t i = 0; i < errs.size() && i < 5; ++i) {
+            if (i) joined += "; ";
+            joined += errs[i];
+        }
+        throw OpError("invalid_op", "resulting document failed validation: " + joined,
+                      {{"reason", errs.empty() ? "invalid document" : errs[0]}});
+    }
+    push_undo(s);
+    s.doc = new_doc;  // deep copy (value semantics)
+    s.revision += 1;
+    s.dirty = true;
+    return ops_response(s, json::object(), warnings);
+}
+}  // namespace
+
+json ecad_update_from_sch(const std::string& board_doc_id, const std::string& sch_doc_id, bool prune,
+                          const json& place_origin, long base_revision) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& board_s = require_session(board_doc_id);
+    Session& sch_s = require_session(sch_doc_id);
+
+    if (!schema::is_board(board_s.doc))
+        throw OpError("invalid_op", "ecad_update_from_sch: board_doc_id is not a pcb document",
+                      {{"reason", "wrong doc kind"}, {"doc_id", board_doc_id}});
+    if (!schema::is_schematic(sch_s.doc))
+        throw OpError("invalid_op", "ecad_update_from_sch: sch_doc_id is not a sch document",
+                      {{"reason", "wrong doc kind"}, {"doc_id", sch_doc_id}});
+
+    json netlist = build_netlist(sch_s.doc);
+    // Carry the schematic's id so sync records board.linked_sch = the source schematic.
+    netlist["id"] = sch_s.doc.contains("id") ? sch_s.doc["id"] : json(nullptr);
+
+    json result = update_board_from_sch(board_s.doc, netlist,
+                                        place_origin.is_null() ? json(nullptr) : place_origin, prune);
+    json report = result["report"];
+
+    json warnings = json::array();
+    if (report.contains("unresolved") && report["unresolved"].is_array() &&
+        !report["unresolved"].empty()) {
+        std::string msg = "unresolved footprints (no def found): ";
+        bool first = true;
+        for (const auto& pr : report["unresolved"]) {
+            if (!first) msg += ", ";
+            first = false;
+            msg += pr[0].get<std::string>() + "(" + pr[1].get<std::string>() + ")";
+        }
+        warnings.push_back(msg);
+    }
+    if (report.contains("removed") && report["removed"].is_array() && !report["removed"].empty() &&
+        !prune) {
+        std::string msg = "footprints no longer in schematic (not pruned): ";
+        bool first = true;
+        for (const auto& r : report["removed"]) {
+            if (!first) msg += ", ";
+            first = false;
+            msg += r.get<std::string>();
+        }
+        warnings.push_back(msg);
+    }
+
+    json resp = swap_doc_locked(board_s, result["mutated_board"], base_revision,
+                                warnings.empty() ? json::array() : warnings);
+    resp["report"] = report;
+    resp["doc_id"] = board_doc_id;
+    return resp;
+}
+
+json ecad_update_from_sch_inline(const json& board, const json& sch_netlist, bool prune,
+                                 const json& place_origin) {
+    if (!schema::is_board(board))
+        throw OpError("invalid_op", "ecad_update_from_sch: board is not a pcb document",
+                      {{"reason", "wrong doc kind"}});
+    return update_board_from_sch(board, sch_netlist,
+                                 place_origin.is_null() ? json(nullptr) : place_origin, prune);
 }
 
 json ecad_impedance(const json& params) {

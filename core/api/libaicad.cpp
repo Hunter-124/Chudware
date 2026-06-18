@@ -29,6 +29,7 @@
 #include "doc/document.h"
 #include "doc/session.h"
 #include "doc/validate.h"
+#include "ecad/autoroute.h"
 #include "ecad/session.h"
 #include "sim/fea_modal.h"
 #include "sim/fea_static.h"
@@ -450,6 +451,20 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 if (params.contains("board") && params["board"].is_object())
                     return emit(aicad::ecad::ecad_dfm_board(params["board"], rules), out_json, 0);
                 return emit(aicad::ecad::ecad_dfm(params.value("doc_id", std::string()), rules),
+                            out_json, 0);
+            }
+            if (m == "ecad_autoroute" && params.contains("board") && params["board"].is_object()) {
+                // Stateless inline-board path (parity harness): returns the PURE
+                // {tracks, vias, report} of engine.ecad.autoroute.autoroute(board, opts).
+                json opts = params.contains("opts") ? params["opts"] : json(nullptr);
+                return emit(aicad::ecad::autoroute(params["board"], opts), out_json, 0);
+            }
+            if (m == "ecad_route_diff_pair" && params.contains("board") &&
+                params["board"].is_object()) {
+                json opts = params.contains("opts") ? params["opts"] : json(nullptr);
+                return emit(aicad::ecad::route_diff_pair(params["board"],
+                                                         params.value("net_p", std::string()),
+                                                         params.value("net_n", std::string()), opts),
                             out_json, 0);
             }
             if (m == "ecad_impedance")

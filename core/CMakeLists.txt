@@ -121,6 +121,7 @@ add_library(aicad_ecad STATIC
   ecad/netlist.cpp
   ecad/erc.cpp
   ecad/drc.cpp
+  ecad/autoroute.cpp
   ecad/dfm.cpp
   ecad/impedance.cpp
   ecad/zonefill.cpp

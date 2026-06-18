@@ -1131,6 +1131,222 @@ def main() -> int:
         return b
     run_fab("ovaldrill", _oval_board())
 
+    # ---- 21) AUTOROUTER parity: engine.ecad.autoroute vs core/ecad/autoroute.cpp ----
+    # Fixtures mirror engine/ecad/test_autoroute.py + test_autoroute2.py (small
+    # boards with a few nets to route). The Python oracle autoroute() / route_diff_pair()
+    # are PURE (return fresh {tracks, vias, report}); C++ exposes the SAME pure path
+    # via ecad_autoroute {board, opts?} / ecad_route_diff_pair {board, net_p, net_n, opts?}.
+    #
+    # GATE: EXACT. The router is fully deterministic — fixed shortest-first net order,
+    # a Lee/A* over a heapq of (f, g, node) tuples whose ties resolve on the totally-
+    # ordered node tuple, deterministic rip-up order, and sorted set/dict iteration.
+    # test_autoroute.py::test_determinism asserts byte-identical output across runs, so
+    # there is no RNG / hash-order nondeterminism to reproduce. We therefore compare the
+    # routed tracks + vias + the full report dict BYTE-FOR-BYTE (json.dumps sort_keys).
+    import json  # noqa: E402  (local import; harness uses local json elsewhere too)
+    from engine.ecad import schema as _arsch  # noqa: E402
+    from engine.ecad.autoroute import (autoroute as _py_autoroute,  # noqa: E402
+                                       route_diff_pair as _py_route_diff_pair)
+
+    def _ar_board(name="rt"):
+        return _arsch.new_board(name)
+
+    def _ar_add_net(b, name, klass="default"):
+        if not any(n.get("name") == name for n in b["nets"]):
+            b["nets"].append({"name": name, "class": klass})
+
+    def _ar_pad(pid, pos, net, size=(0.6, 0.6), shape="circle", layer="F.Cu"):
+        return {"id": pid, "number": "1", "pos": list(pos), "angle": 0.0, "shape": shape,
+                "size": list(size), "type": "smd", "layers": [layer], "drill": None, "net": net}
+
+    def _ar_fp(fid, pos, pads, side="top"):
+        return {"id": fid, "fpid": "Test:FP", "ref": fid.upper(), "value": "", "pos": list(pos),
+                "angle": 0.0, "side": side, "pads": pads, "graphics": [], "model_3d": None,
+                "attr": "smd", "linked_symbol": None}
+
+    def _ar_outline(b, w, h, x0=0.0, y0=0.0):
+        x1, y1 = x0 + w, y0 + h
+        b["outline"] = {"shapes": [
+            {"type": "line", "p1": [x0, y0], "p2": [x1, y0]},
+            {"type": "line", "p1": [x1, y0], "p2": [x1, y1]},
+            {"type": "line", "p1": [x1, y1], "p2": [x0, y1]},
+            {"type": "line", "p1": [x0, y1], "p2": [x0, y0]}], "closed": True}
+
+    def _ar_one_layer(b):
+        b["stackup"]["copper_layers"] = 1
+        b["stackup"]["layers"] = [{"id": "F.Cu", "type": "copper", "thickness": 0.035}]
+
+    def cmp_autoroute(label, board, opts=None):
+        py = _py_autoroute(board, opts or {})
+        p = {"board": board}
+        if opts is not None:
+            p["opts"] = opts
+        cp = cpp.call("ecad_autoroute", p)
+        diffs = []
+        if json.dumps(py["tracks"], sort_keys=True) != json.dumps(cp.get("tracks"), sort_keys=True):
+            diffs.append(f"tracks (py={len(py['tracks'])} cpp={len(cp.get('tracks') or [])})")
+        if json.dumps(py["vias"], sort_keys=True) != json.dumps(cp.get("vias"), sort_keys=True):
+            diffs.append(f"vias (py={len(py['vias'])} cpp={len(cp.get('vias') or [])})")
+        if json.dumps(py["report"], sort_keys=True) != json.dumps(cp.get("report"), sort_keys=True):
+            pr, cr = py["report"], cp.get("report") or {}
+            for k in sorted(set(pr) | set(cr)):
+                if json.dumps(pr.get(k), sort_keys=True) != json.dumps(cr.get(k), sort_keys=True):
+                    diffs.append(f"report.{k} (py={str(pr.get(k))[:60]} cpp={str(cr.get(k))[:60]})")
+        ok = not diffs
+        print(f"  {('autoroute ' + label):<40} {'MATCH' if ok else 'DIFF: ' + '; '.join(diffs)[:170]}")
+        return step(0 if ok else 1)
+
+    def cmp_diff_pair(label, board, net_p, net_n, opts=None):
+        py = _py_route_diff_pair(board, net_p, net_n, opts or {})
+        p = {"board": board, "net_p": net_p, "net_n": net_n}
+        if opts is not None:
+            p["opts"] = opts
+        cp = cpp.call("ecad_route_diff_pair", p)
+        ok = (json.dumps(py["tracks"], sort_keys=True) == json.dumps(cp.get("tracks"), sort_keys=True)
+              and json.dumps(py["vias"], sort_keys=True) == json.dumps(cp.get("vias"), sort_keys=True)
+              and json.dumps(py["report"], sort_keys=True) == json.dumps(cp.get("report"),
+                                                                          sort_keys=True))
+        if ok:
+            print(f"  {('diff_pair ' + label):<40} MATCH")
+        else:
+            d = []
+            if json.dumps(py["tracks"], sort_keys=True) != json.dumps(cp.get("tracks"), sort_keys=True):
+                d.append(f"tracks (py={len(py['tracks'])} cpp={len(cp.get('tracks') or [])})")
+            if json.dumps(py["vias"], sort_keys=True) != json.dumps(cp.get("vias"), sort_keys=True):
+                d.append("vias")
+            if json.dumps(py["report"], sort_keys=True) != json.dumps(cp.get("report"), sort_keys=True):
+                d.append(f"report (py={py['report']} cpp={cp.get('report')})")
+            print(f"  {('diff_pair ' + label):<40} DIFF: {'; '.join(d)[:170]}")
+        return step(0 if ok else 1)
+
+    # 21a two-net board (test_autoroute._two_net_board): SIG long span + VCC short.
+    def _two_net_board():
+        b = _ar_board()
+        _ar_add_net(b, "SIG"); _ar_add_net(b, "VCC")
+        _ar_outline(b, 40.0, 30.0)
+        b["footprints"] = [
+            _ar_fp("fp1", (8.0, 15.0), [_ar_pad("p1", (0.0, 2.0), "SIG"),
+                                        _ar_pad("p2", (0.0, -2.0), "VCC")]),
+            _ar_fp("fp2", (20.0, 8.0), [_ar_pad("p3", (0.0, 0.0), "VCC")]),
+            _ar_fp("fp3", (32.0, 18.0), [_ar_pad("p4", (0.0, 0.0), "SIG")]),
+        ]
+        return b
+    cmp_autoroute("two_net default", _two_net_board())
+    cmp_autoroute("two_net ripup0", _two_net_board(), {"ripup_passes": 0})
+
+    # 21b id allocation seeded (test_id_allocation): counters must start past t7/v3.
+    b = _two_net_board()
+    b["tracks"] = [{"id": "t7", "net": "SIG", "layer": "F.Cu", "width": 0.25,
+                    "kind": "segment", "p1": [0.0, 0.0], "p2": [0.0, 1.0]}]
+    b["vias"] = [{"id": "v3", "net": "SIG", "at": [0.0, 0.0], "drill": 0.4, "diameter": 0.8,
+                  "layers": ["F.Cu", "B.Cu"], "type": "through"}]
+    cmp_autoroute("id_allocation seeded", b)
+
+    # 21c tight two-net board (test_tight_board_clean): obstacle halo weaving.
+    b = _ar_board()
+    _ar_add_net(b, "A"); _ar_add_net(b, "B")
+    _ar_outline(b, 20.0, 16.0)
+    b["footprints"] = [
+        _ar_fp("fp1", (4.0, 8.0), [_ar_pad("p1", (0.0, 1.5), "A"), _ar_pad("p2", (0.0, -1.5), "B")]),
+        _ar_fp("fp2", (16.0, 8.0), [_ar_pad("p3", (0.0, 1.5), "A"), _ar_pad("p4", (0.0, -1.5), "B")]),
+    ]
+    cmp_autoroute("tight_board", b)
+
+    # 21d unroutable net walled off on both layers (test_unroutable_reported).
+    b = _ar_board()
+    _ar_add_net(b, "NET"); _ar_add_net(b, "WALL")
+    _ar_outline(b, 30.0, 30.0)
+    b["footprints"] = [
+        _ar_fp("fsrc", (3.0, 15.0), [_ar_pad("src", (0.0, 0.0), "NET")]),
+        _ar_fp("ftgt", (15.0, 15.0), [_ar_pad("tgt", (0.0, 0.0), "NET", size=(0.4, 0.4))]),
+    ]
+    x0, y0, x1, y1 = 13.0, 13.0, 17.0, 17.0
+    box = [((x0, y0), (x1, y0)), ((x1, y0), (x1, y1)),
+           ((x1, y1), (x0, y1)), ((x0, y1), (x0, y0))]
+    tracks = []; tid = 1
+    for layer in ("F.Cu", "B.Cu"):
+        for (p1, p2) in box:
+            tracks.append({"id": f"t{tid}", "net": "WALL", "layer": layer, "width": 1.0,
+                           "kind": "segment", "p1": list(p1), "p2": list(p2)})
+            tid += 1
+    b["tracks"] = tracks
+    cmp_autoroute("unroutable_walled", b)
+
+    # 21e rip-up board (test_autoroute2._ripup_board): greedy fails Y; rip-up rescues both.
+    def _ripup_board():
+        b = _ar_board("ripup")
+        _ar_one_layer(b)
+        for n in ("X", "Y", "WALL"):
+            _ar_add_net(b, n)
+        _ar_outline(b, 40.0, 30.0)
+        gh = 1.1
+        tr = []; tid = 1
+        for (a, c) in [(0.0, 15.0 - gh), (15.0 + gh, 30.0)]:
+            tr.append({"id": f"t{tid}", "net": "WALL", "layer": "F.Cu", "width": 1.0,
+                       "kind": "segment", "p1": [20.0, a], "p2": [20.0, c]}); tid += 1
+        tr.append({"id": f"t{tid}", "net": "WALL", "layer": "F.Cu", "width": 1.0,
+                   "kind": "segment", "p1": [20.0, 15.0 + gh], "p2": [26.0, 15.0 + gh]}); tid += 1
+        tr.append({"id": f"t{tid}", "net": "WALL", "layer": "F.Cu", "width": 1.0,
+                   "kind": "segment", "p1": [20.0, 15.0 - gh], "p2": [26.0, 15.0 - gh]}); tid += 1
+        b["tracks"] = tr
+        b["footprints"] = [
+            _ar_fp("yl", (6.0, 15.0), [_ar_pad("yl", (0.0, 0.0), "Y", size=(0.4, 0.4))]),
+            _ar_fp("yr", (34.0, 15.0), [_ar_pad("yr", (0.0, 0.0), "Y", size=(0.4, 0.4))]),
+            _ar_fp("xa", (23.0, 11.0), [_ar_pad("xa", (0.0, 0.0), "X", size=(0.4, 0.4))]),
+            _ar_fp("xb", (23.0, 19.0), [_ar_pad("xb", (0.0, 0.0), "X", size=(0.4, 0.4))]),
+        ]
+        return b
+    cmp_autoroute("ripup greedy(ripup0)", _ripup_board(), {"ripup_passes": 0})
+    cmp_autoroute("ripup passes3", _ripup_board(), {"ripup_passes": 3})
+    cmp_autoroute("ripup default", _ripup_board())
+
+    # 21f differential pair board (test_autoroute2._diff_pair_board): coupled + matched.
+    def _diff_pair_board(diff_gap=0.25, track_width=0.2, pad_sep=0.75, length=28.0):
+        b = _ar_board("diffpair")
+        _ar_one_layer(b)
+        _ar_add_net(b, "CLK_P"); _ar_add_net(b, "CLK_N")
+        b["net_classes"]["default"]["diff_gap"] = diff_gap
+        b["net_classes"]["default"]["track_width"] = track_width
+        _ar_outline(b, 40.0, 20.0)
+        h = pad_sep / 2.0
+        x0 = 6.0; x1 = x0 + length; sz = (0.2, 0.2)
+        b["footprints"] = [
+            _ar_fp("f1", (x0, 10.0), [_ar_pad("p1", (0.0, h), "CLK_P", sz),
+                                      _ar_pad("p2", (0.0, -h), "CLK_N", sz)]),
+            _ar_fp("f2", (x1, 10.0), [_ar_pad("p3", (0.0, h), "CLK_P", sz),
+                                      _ar_pad("p4", (0.0, -h), "CLK_N", sz)]),
+        ]
+        return b
+    cmp_autoroute("diff_pair autodetect", _diff_pair_board(diff_gap=0.25, track_width=0.2,
+                                                           pad_sep=0.5))
+    cmp_diff_pair("clk coupled+matched", _diff_pair_board(diff_gap=0.25, track_width=0.2,
+                                                          pad_sep=0.5), "CLK_P", "CLK_N")
+
+    # 21g diff-pair length-match meander (test_diff_pair_length_match_meander): N longer.
+    def _dpskew_board():
+        b = _ar_board("dpskew")
+        _ar_one_layer(b)
+        _ar_add_net(b, "CLK_P"); _ar_add_net(b, "CLK_N")
+        b["net_classes"]["default"]["diff_gap"] = 0.25
+        b["net_classes"]["default"]["track_width"] = 0.2
+        _ar_outline(b, 40.0, 24.0)
+        sz = (0.2, 0.2)
+        b["footprints"] = [
+            _ar_fp("f1", (6.0, 12.0), [_ar_pad("p1", (0.0, 0.375), "CLK_P", sz),
+                                       _ar_pad("p2", (0.0, -0.375), "CLK_N", sz)]),
+            _ar_fp("f2", (34.0, 12.375), [_ar_pad("p3", (0.0, 0.0), "CLK_P", sz)]),
+            _ar_fp("f3", (34.0, 4.0), [_ar_pad("p4", (0.0, 0.0), "CLK_N", sz)]),
+        ]
+        return b
+    cmp_diff_pair("skew no-match", _dpskew_board(), "CLK_P", "CLK_N", {"length_tol": 999.0})
+    cmp_diff_pair("skew matched", _dpskew_board(), "CLK_P", "CLK_N", {"length_tol": 0.2})
+
+    # 21h edge inputs: non-board + single isolated pad (nothing to route).
+    cmp_autoroute("nonboard", {"schema": "aicad.sch/1"})
+    b = _ar_board(); _ar_add_net(b, "X")
+    b["footprints"] = [_ar_fp("fp1", (5.0, 5.0), [_ar_pad("p1", (0.0, 0.0), "X")])]
+    cmp_autoroute("single_pad", b)
+
     print(f"\n[ecad-parity] {total - mism}/{total} steps at full parity")
     return mism
 

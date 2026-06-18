@@ -32,6 +32,27 @@
 #include "lib3mf_dynamic.hpp"
 #endif
 
+// openNURBS (Rhino .3dm read/write) — CONFINED to this TU, guarded by
+// AICAD_WITH_OPENNURBS. opennurbs.h is the single umbrella header; it pulls in
+// <windows.h> itself on Win32. NOMINMAX (so its includes don't redefine
+// min/max) is set above when lib3mf is enabled; set it here too for an
+// openNURBS-only build. The static lib (opennurbsStatic) carries the bundled
+// zlib + Win32 system libs. We read the STORED ON_Mesh (m_V float32 / m_F
+// quad/tri) — the SAME data the rhino3dm wheel exposes — so extraction is
+// bit-identical to the Python oracle.
+#ifdef AICAD_WITH_OPENNURBS
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+// opennurbs.h is fine with the lean Win32 surface; it does not use the codepage
+// helpers the lib3mf binding needs.
+#endif
+#endif
+#include "opennurbs.h"
+#endif
+
 #include "doc/formats.h"
 
 #include <algorithm>
@@ -252,6 +273,159 @@ void write_3mf_meshes(const std::vector<NamedMesh>& meshes, const std::string& p
     model->QueryWriter("3mf")->WriteToFile(path);
 }
 #endif  // AICAD_WITH_LIB3MF
+
+#ifdef AICAD_WITH_OPENNURBS
+// A named mesh pulled out of a .3dm object — the C++ analogue of the oracle's
+// (name, MeshBody(verts float32, tris uint32)) tuple. verts live in MeshData as
+// doubles, but the source is ON_3fPoint (float32, m_V), so every value widens
+// exactly and a float32 reconstruction on the gate side is bit-identical to the
+// oracle's np.float32 verts.
+struct OnNamedMesh {
+    std::string name;
+    MeshData mesh;
+};
+
+// Triangulate one ON_Mesh EXACTLY as engine/doc/formats.py::_rhino_mesh_to_arrays:
+//   verts = float32 [(V.x, V.y, V.z) for each m_V]
+//   for each face: a,b,c = vi[0..2], d = vi[3]; emit (a,b,c); if d != c emit (a,c,d)
+// rhino3dm's Faces[fi] always yields a 4-tuple (vi[0..3]); a triangle has
+// vi[3]==vi[2], so the quad test reduces to vi[3] != vi[2] — IDENTICAL to the
+// oracle's `d != c`.
+MeshData on_mesh_to_arrays(const ON_Mesh& mesh) {
+    MeshData out;
+    const int nv = mesh.m_V.Count();
+    out.verts.reserve(static_cast<std::size_t>(nv) * 3);
+    for (int i = 0; i < nv; ++i) {
+        const ON_3fPoint& p = mesh.m_V[i];  // float32, exactly like rhino3dm's mesh.Vertices[i]
+        out.verts.push_back(static_cast<double>(p.x));
+        out.verts.push_back(static_cast<double>(p.y));
+        out.verts.push_back(static_cast<double>(p.z));
+    }
+    const int nf = mesh.m_F.Count();
+    out.tris.reserve(static_cast<std::size_t>(nf) * 6);
+    for (int fi = 0; fi < nf; ++fi) {
+        const ON_MeshFace& f = mesh.m_F[fi];
+        const uint32_t a = static_cast<uint32_t>(f.vi[0]);
+        const uint32_t b = static_cast<uint32_t>(f.vi[1]);
+        const uint32_t c = static_cast<uint32_t>(f.vi[2]);
+        const uint32_t d = static_cast<uint32_t>(f.vi[3]);
+        out.tris.push_back(a);
+        out.tris.push_back(b);
+        out.tris.push_back(c);
+        if (d != c) {  // a real quad → second triangle (a, c, d)
+            out.tris.push_back(a);
+            out.tris.push_back(c);
+            out.tris.push_back(d);
+        }
+    }
+    return out;
+}
+
+// Read every mesh-bearing object out of a .3dm, BIT-IDENTICAL to
+// engine/doc/formats.py::_import_3dm. Iterates model objects in the SAME order
+// rhino3dm's `model.Objects` does — ONX_ModelComponentIterator over
+// ON_ModelComponent::Type::ModelGeometry (manifest order; RenderLights, which
+// follow in rhino3dm's order, carry no mesh and are skipped anyway). For each
+// object: if the geometry is an ON_Mesh, use it; if an ON_Extrusion, pull its
+// CACHED render mesh (ON::any_mesh — the same stored mesh GetMesh(MeshType.Any)
+// returns; NO meshing is performed); skip when there is no mesh / 0 verts / 0
+// faces. Name = the object attribute name, else "<stem>_<n>".
+std::vector<OnNamedMesh> read_3dm_objects(const std::string& path) {
+    ONX_Model model;
+    if (!model.Read(path.c_str(), nullptr))
+        throw OpError("import_failed", "could not read Rhino file '" + path + "'",
+                      {{"path", path}, {"format", "3dm"}});
+
+    const std::string stem = std::filesystem::path(path).stem().string();
+    std::vector<OnNamedMesh> out;
+    ONX_ModelComponentIterator it(model, ON_ModelComponent::Type::ModelGeometry);
+    for (ON_ModelComponentReference cref = it.FirstComponentReference();
+         !cref.IsEmpty(); cref = it.NextComponentReference()) {
+        const ON_ModelGeometryComponent* gc =
+            ON_ModelGeometryComponent::Cast(cref.ModelComponent());
+        if (nullptr == gc) continue;
+        const ON_Geometry* g = gc->Geometry(nullptr);
+        if (nullptr == g) continue;
+
+        const ON_Mesh* mesh = ON_Mesh::Cast(g);
+        if (nullptr == mesh) {
+            const ON_Extrusion* ext = ON_Extrusion::Cast(g);
+            if (nullptr != ext)
+                mesh = ext->m_mesh_cache.Mesh(ON::any_mesh);  // cached render mesh; no generation
+        }
+        if (nullptr == mesh || mesh->m_V.Count() == 0 || mesh->m_F.Count() == 0)
+            continue;  // matches the oracle's skip (no mesh / 0 verts / 0 faces)
+
+        OnNamedMesh nm;
+        const ON_3dmObjectAttributes* attrs = gc->Attributes(nullptr);
+        std::string name;
+        if (nullptr != attrs && attrs->m_name.IsNotEmpty()) {
+            // ON_wString -> UTF-8, matching the Python str the oracle reads from
+            // obj.Attributes.Name. ON_String(const ON_wString&) does the UTF-16->UTF-8
+            // conversion.
+            ON_String s(attrs->m_name);
+            if (s.Array() != nullptr && s.Length() > 0)
+                name.assign(s.Array(), static_cast<std::size_t>(s.Length()));
+        }
+        if (name.empty())
+            name = stem + "_" + std::to_string(out.size() + 1);
+        nm.name = name;
+        nm.mesh = on_mesh_to_arrays(*mesh);
+        out.push_back(std::move(nm));
+    }
+
+    if (out.empty())
+        throw OpError("import_failed",
+                      "'" + path + "' has no mesh geometry rhino3dm can read "
+                      "(NURBS/Brep objects need re-export from Rhino as STEP, or with render meshes)",
+                      {{"path", path}, {"format", "3dm"}});
+    return out;
+}
+
+// Write named meshes to a .3dm, mirroring engine/doc/formats.py::_export_3dm:
+// one ON_Mesh per body (vertices via SetVertex(ON_3fPoint) == float32, faces via
+// SetTriangle), added with ON_3dmObjectAttributes(name) and written with
+// ONX_Model::Write(version=0). Skips empty meshes; the version-0 archive is the
+// same the rhino3dm File3dm.Write(path, 0) produces.
+void write_3dm_meshes(const std::vector<OnNamedMesh>& meshes, const std::string& path) {
+    ONX_Model model;
+    int added = 0;
+    for (const OnNamedMesh& nm : meshes) {
+        const MeshData& m = nm.mesh;
+        if (m.triangle_count() == 0) continue;
+        ON_Mesh on_mesh;
+        const std::size_t nv = m.vertex_count();
+        for (std::size_t i = 0; i < nv; ++i) {
+            // float32 store, exactly like rhino3dm's Mesh.Vertices.Add(x,y,z)
+            // (which builds an ON_3fPoint(float,float,float)).
+            on_mesh.SetVertex(static_cast<int>(i),
+                              ON_3fPoint(static_cast<float>(m.verts[3 * i]),
+                                         static_cast<float>(m.verts[3 * i + 1]),
+                                         static_cast<float>(m.verts[3 * i + 2])));
+        }
+        const std::size_t nt = m.triangle_count();
+        for (std::size_t i = 0; i < nt; ++i) {
+            // SetTriangle(idx, a, b, c) is the ON-level equivalent of rhino3dm's
+            // Mesh.Faces.AddFace(a,b,c) -> SetQuad(idx,a,b,c,c): a tri with vi[3]==vi[2].
+            on_mesh.SetTriangle(static_cast<int>(i),
+                                static_cast<int>(m.tris[3 * i]),
+                                static_cast<int>(m.tris[3 * i + 1]),
+                                static_cast<int>(m.tris[3 * i + 2]));
+        }
+        ON_3dmObjectAttributes attr;
+        ON_wString wname(nm.name.c_str());  // UTF-8 (char) -> ON_wString
+        attr.m_name = wname;
+        model.AddModelGeometryComponent(&on_mesh, &attr);
+        ++added;
+    }
+    if (added == 0)
+        throw OpError("export_failed", "3DM export: no mesh geometry to write",
+                      {{"format", "3dm"}, {"path", path}});
+    if (!model.Write(path.c_str(), 0))
+        throw OpError("export_failed", "openNURBS ONX_Model::Write returned failure",
+                      {{"format", "3dm"}, {"path", path}});
+}
+#endif  // AICAD_WITH_OPENNURBS
 
 }  // namespace
 
@@ -671,6 +845,26 @@ MeshData read_mesh(const std::string& path, const std::string& fmt) {
                       {{"format", fmt}, {"path", path}});
 #endif
     }
+    if (fmt == "3dm") {
+#ifdef AICAD_WITH_OPENNURBS
+        // Concatenate every 3dm mesh object into one soup (re-basing indices) for
+        // the generic single-mesh read_mesh contract; import_bodies handles 3dm
+        // per-object to match the oracle's one-MeshBody-per-object naming.
+        std::vector<OnNamedMesh> objs = read_3dm_objects(path);
+        MeshData mesh;
+        for (const OnNamedMesh& nm : objs) {
+            const uint32_t base = static_cast<uint32_t>(mesh.vertex_count());
+            mesh.verts.insert(mesh.verts.end(), nm.mesh.verts.begin(), nm.mesh.verts.end());
+            for (uint32_t i : nm.mesh.tris) mesh.tris.push_back(base + i);
+        }
+        return mesh;
+#else
+        throw OpError("import_failed",
+                      "3DM import requires openNURBS — rebuild core with the SDK provisioned "
+                      "(-DAICAD_WITH_OCCT=ON pulls in ProvisionOpenNURBS).",
+                      {{"format", fmt}, {"path", path}});
+#endif
+    }
     throw OpError("import_failed", "read_mesh: unsupported mesh format '" + fmt + "'",
                   {{"format", fmt}, {"path", path}});
 }
@@ -686,6 +880,17 @@ std::vector<std::pair<std::string, MeshData>> read_mesh_raw(const std::string& p
 #else
         throw OpError("import_failed",
                       "3MF read_mesh_raw requires lib3mf — rebuild with the SDK provisioned.",
+                      {{"format", fmt}, {"path", path}});
+#endif
+    }
+    if (fmt == "3dm") {
+#ifdef AICAD_WITH_OPENNURBS
+        for (OnNamedMesh& nm : read_3dm_objects(path))
+            out.emplace_back(nm.name, std::move(nm.mesh));
+        return out;
+#else
+        throw OpError("import_failed",
+                      "3DM read_mesh_raw requires openNURBS — rebuild with the SDK provisioned.",
                       {{"format", fmt}, {"path", path}});
 #endif
     }
@@ -836,12 +1041,29 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
                           {{"format", fmt}, {"reason", "lib3mf not provisioned"}});
 #endif
         }
-        if (fmt == "3dm")
+        if (fmt == "3dm") {
+#ifdef AICAD_WITH_OPENNURBS
+            // Tessellate each body (Python BRepMesh defaults via shape_to_mesh) into
+            // one named ON_Mesh object, mirroring _export_3dm (one AddMesh per body).
+            // Export parity is gated as a ROUND-TRIP (the OCCT tessellation differs
+            // from the oracle's), not byte/mesh-identical.
+            std::vector<OnNamedMesh> meshes;
+            for (std::size_t i = 0; i < bodies.size(); ++i) {
+                if (bodies[i].IsNull()) continue;
+                OnNamedMesh nm;
+                nm.name = "Body" + std::to_string(i + 1);
+                nm.mesh = shape_to_mesh(bodies[i]);
+                if (nm.mesh.triangle_count() > 0) meshes.push_back(std::move(nm));
+            }
+            write_3dm_meshes(meshes, out);
+            return out;
+#else
             throw OpError("export_failed",
-                          "3DM (Rhino) export is not supported by the C++ core: OCCT 7.9.3 ships "
-                          "no OpenNURBS writer; the Python oracle uses rhino3dm. Export STEP/STL "
-                          "instead.",
-                          {{"format", fmt}, {"reason", "no OCCT 3dm support"}});
+                          "3DM export requires openNURBS — rebuild core with the SDK provisioned "
+                          "(-DAICAD_WITH_OCCT=ON pulls in ProvisionOpenNURBS).",
+                          {{"format", fmt}, {"reason", "openNURBS not provisioned"}});
+#endif
+        }
     } catch (const OpError&) {
         throw;
     } catch (const std::exception& e) {
@@ -960,11 +1182,34 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
                           {{"format", fmt}, {"reason", "lib3mf not provisioned"}});
 #endif
         }
-        if (fmt == "3dm")
+        if (fmt == "3dm") {
+#ifdef AICAD_WITH_OPENNURBS
+            // 3dm via openNURBS: one body per mesh object (matching _import_3dm),
+            // each sewn into a shell/solid (the same as_solid path as the other mesh
+            // formats). Body names follow the oracle: the object attribute name, else
+            // "<stem>_<idx>". The raw vertex/triangle extraction is BIT-IDENTICAL to
+            // the Python rhino3dm path (both read the SAME stored ON_Mesh m_V/m_F).
+            std::vector<OnNamedMesh> objs = read_3dm_objects(path);
+            if (objs.empty())
+                throw OpError("import_failed", "no mesh objects found in 3DM '" + path + "'",
+                              {{"path", path}, {"format", fmt}});
+            std::vector<std::pair<std::string, TopoDS_Shape>> out;
+            for (const OnNamedMesh& nm : objs) {
+                TopoDS_Shape shape = mesh_to_shape(nm.mesh);
+                if (shape.IsNull())
+                    throw OpError("import_failed",
+                                  "3DM object '" + nm.name + "' could not be sewn into a body",
+                                  {{"path", path}, {"format", fmt}});
+                out.emplace_back(nm.name, shape);
+            }
+            return out;
+#else
             throw OpError("import_failed",
-                          "3DM (Rhino) import is not supported by the C++ core: OCCT 7.9.3 ships "
-                          "no OpenNURBS reader; the Python oracle uses rhino3dm.",
-                          {{"format", fmt}, {"reason", "no OCCT 3dm support"}});
+                          "3DM import requires openNURBS — rebuild core with the SDK provisioned "
+                          "(-DAICAD_WITH_OCCT=ON pulls in ProvisionOpenNURBS).",
+                          {{"format", fmt}, {"reason", "openNURBS not provisioned"}});
+#endif
+        }
     } catch (const OpError&) {
         throw;
     } catch (const std::exception& e) {

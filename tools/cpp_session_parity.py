@@ -780,13 +780,23 @@ def main() -> int:
         print(f"  {'fmt C++ 3mf round-trip':<28} {'MATCH' if tmf_rt_ok else f'DIFF rc={rc} vol={rtv}'}")
         mism += 0 if tmf_rt_ok else 1
 
-        # An actually-unsupported export format (3dm) still fails loud (export_failed).
+        # 3DM (Rhino) export is now supported (P55s, via openNURBS): exports
+        # successfully + the written file exists. (3DM bit-parity is gated
+        # separately in tools/cpp_3dm_parity.py.)
         fmt_total += 1
-        rc, bad = core.call("export_file",
-                            {"doc_id": ce.doc_id, "path": str(Path(td) / "x.3dm"), "format": "3dm"})
-        unsupp_ok = rc != 0 and bad.get("code") == "export_failed"
-        print(f"  {'fmt unsupported->error':<28} {'MATCH' if unsupp_ok else 'DIFF: ' + str(bad)[:60]}")
-        mism += 0 if unsupp_ok else 1
+        p3dm = str(Path(td) / "cpp_box.3dm")
+        rc, ev = core.call("export_file", {"doc_id": ce.doc_id, "path": p3dm, "format": "3dm"})
+        tdm_ok = rc == 0 and Path(ev.get("path", "")).exists()
+        print(f"  {'fmt C++export 3dm':<28} {'MATCH' if tdm_ok else 'DIFF: ' + str(ev)[:60]}")
+        mism += 0 if tdm_ok else 1
+
+        # 3DM round-trip: re-import the C++-exported 3DM back into a C++ doc -> box volume.
+        fmt_total += 1
+        rc, iv = core.call("import_file", {"path": p3dm})
+        tdm_rtv = float(iv.get("volume", 0.0)) if rc == 0 else -1.0
+        tdm_rt_ok = rc == 0 and abs(tdm_rtv - BOXV) / BOXV <= 1e-3
+        print(f"  {'fmt C++ 3dm round-trip':<28} {'MATCH' if tdm_rt_ok else f'DIFF rc={rc} vol={tdm_rtv}'}")
+        mism += 0 if tdm_rt_ok else 1
 
     # 5) stale_revision guard (base 0 now stale)
     rc, cr = core.call("doc_apply_ops", {"doc_id": cpp.doc_id, "base_revision": 0, "ops": []})

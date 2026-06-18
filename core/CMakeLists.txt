@@ -279,6 +279,14 @@ if(AICAD_WITH_OCCT)
   # include dir, and lib3mf.dll is staged next to libaicad.dll below.
   include(ProvisionLib3mf)
 
+  # --- P55s: openNURBS (Rhino .3dm read/write) — MIT-ish, built FROM SOURCE ---
+  # Provision + build opennurbsStatic from the SAME rhino3dm v8.17.0 the Python
+  # oracle (engine/doc/formats.py) wraps via the `rhino3dm 8.17.0` wheel, so the
+  # .3dm mesh extraction (ON_Mesh m_V float32 + m_F quad/tri) is bit-identical.
+  # opennurbs.h lives ONLY in doc/formats.cpp; aicad_doc compiles with
+  # AICAD_WITH_OPENNURBS + the include dir and links opennurbsStatic below.
+  include(ProvisionOpenNURBS)
+
   # P50b: sim/fea_run.cpp (the combined mesh+resolve+solve glue) joins the mesher
   # target — it is the only sim source that needs the mesher, and adding it here
   # keeps the gmsh confinement intact (fea_run.h itself is gmsh-free). aicad_mesh
@@ -459,9 +467,17 @@ if(AICAD_WITH_OCCT)
   # not leak onto aicad_doc's public include interface.
   target_include_directories(aicad_doc PRIVATE ${LIB3MF_INCLUDE_DIR})
   target_compile_definitions(aicad_doc PRIVATE AICAD_WITH_LIB3MF)
+  # openNURBS (.3dm): the opennurbs include dir + the enabling define, PRIVATE so
+  # opennurbs.h stays confined to formats.cpp's TU; opennurbsStatic is linked
+  # PUBLIC so it propagates onto the final libaicad DLL link line. UNICODE/_UNICODE
+  # are required by opennurbs.h (its ON_wString APIs assume the wide CRT) — set
+  # PRIVATE on aicad_doc so only this lib's TUs see them.
+  target_include_directories(aicad_doc PRIVATE ${OPENNURBS_INCLUDE_DIR})
+  target_compile_definitions(aicad_doc PRIVATE AICAD_WITH_OPENNURBS UNICODE _UNICODE)
   target_link_libraries(aicad_doc PUBLIC
     aicad_geom_occt aicad_sketch aicad_geom aicad_util
     aicad_miniz
+    opennurbsStatic
     nlohmann_json::nlohmann_json)
 
   # Verification: compile a document -> write_aicm -> HOST render::parseAicm, with

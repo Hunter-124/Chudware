@@ -27,6 +27,7 @@
 #include <nlohmann/json.hpp>
 
 #include "doc/document.h"
+#include "doc/export2d.h"
 #include "doc/session.h"
 #include "doc/validate.h"
 #include "ecad/autoroute.h"
@@ -411,6 +412,32 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                                         params.value("as_solid", false),
                                                         params.value("format", std::string())),
                             out_json, 0);
+            // --- 2D DRAWING projection + export (engine/doc/drawing.py + export2d.py) ---
+            // STATELESS diagnostic form (the strangler parity probe): compile a part
+            // tree + project its views via OCCT HLR, or pool the views to DXF/PDF.
+            if (m == "doc_drawing_views") {
+                json doc;
+                if (params.contains("doc")) doc = params["doc"];
+                else if (params.contains("features")) doc = params;
+                else throw aicad::doc::OpError("invalid_op",
+                                               "doc_drawing_views: params need a 'doc' object");
+                json env = params.contains("env") ? params["env"] : json::object();
+                json views = params.contains("views") ? params["views"] : json::array();
+                return emit(aicad::doc::drawing_views(doc, env, views), out_json, 0);
+            }
+            if (m == "export2d_drawing") {
+                json doc;
+                if (params.contains("doc")) doc = params["doc"];
+                else if (params.contains("features")) doc = params;
+                else throw aicad::doc::OpError("invalid_op",
+                                               "export2d_drawing: params need a 'doc' object");
+                json env = params.contains("env") ? params["env"] : json::object();
+                json views = params.contains("views") ? params["views"] : json::array();
+                return emit(aicad::doc::export2d_drawing(doc, env, views,
+                                                         params.value("path", std::string()),
+                                                         params.value("format", std::string())),
+                            out_json, 0);
+            }
         } catch (const aicad::doc::OpError& oe) {
             // Structured error envelope (matches the Python worker's doc_* errors).
             return emit(oe.envelope(), out_json, 3);

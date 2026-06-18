@@ -264,6 +264,7 @@ if(AICAD_WITH_OCCT)
     geom/surfacing.cpp
     geom/curves.cpp
     geom/ecad_3d.cpp
+    doc/drawing.cpp
     geom/aicm.cpp)
   target_include_directories(aicad_geom_occt PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -279,6 +280,9 @@ if(AICAD_WITH_OCCT)
     nlohmann_json::nlohmann_json
     TKernel TKMath TKG2d TKG3d TKGeomBase TKGeomAlgo
     TKBRep TKTopAlgo TKPrim TKMesh TKShHealing TKBO TKFillet
+    # TKHLR: hidden-line removal (HLRBRep_Algo / HLRBRep_HLRToShape) for the 2D
+    # drawing projection (doc/drawing.cpp; engine/doc/drawing.py oracle).
+    TKHLR
     # TKOffset: shell (BRepOffsetAPI_MakeThickSolid) + draft (BRepOffsetAPI_DraftAngle)
     # + loft (BRepOffsetAPI_ThruSections).
     TKOffset
@@ -365,7 +369,10 @@ if(AICAD_WITH_OCCT)
     doc/sketch_geom.cpp
     doc/stepplus.cpp
     doc/validate.cpp
-    doc/formats.cpp)
+    doc/formats.cpp
+    doc/dxf.cpp
+    doc/pdfvec.cpp
+    doc/export2d.cpp)
   target_include_directories(aicad_doc PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})

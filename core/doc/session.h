@@ -116,6 +116,12 @@ nlohmann::json doc_export_file(const std::string& doc_id, const std::string& pat
 nlohmann::json doc_import_file(const std::string& path, const std::string& into,
                                bool as_solid, const std::string& fmt);
 
+// STATELESS diagnostic: read a mesh file into its RAW per-object meshes (no sewing) and
+// return {"objects": [{"name", "verts":[x,y,z,...], "tris":[i,j,k,...]}, ...]}. Used by
+// the 3MF bit-parity gate to compare the C++ lib3mf extraction against the Python oracle
+// (engine.doc.formats._import_3mf). `fmt` defaults to detect_format(path) when empty.
+nlohmann::json mesh_read_raw(const std::string& path, const std::string& fmt);
+
 // Persist the session to `path` (or its current path if `path` is empty) as a
 // .step+ container. Clears the dirty flag, records the path. Returns {"path": ...}.
 // Throws OpError("io_error") if no path is available, or on a write failure.

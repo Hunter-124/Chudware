@@ -1350,6 +1350,10 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                                         params.value("as_solid", false),
                                                         params.value("format", std::string())),
                             out_json, 0);
+            if (m == "mesh_read_raw")
+                return emit(aicad::doc::mesh_read_raw(params.value("path", std::string()),
+                                                      params.value("format", std::string())),
+                            out_json, 0);
             // --- 2D DRAWING projection + export (engine/doc/drawing.py + export2d.py) ---
             // STATELESS diagnostic form (the strangler parity probe): compile a part
             // tree + project its views via OCCT HLR, or pool the views to DXF/PDF.

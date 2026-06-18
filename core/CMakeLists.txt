@@ -269,6 +269,16 @@ if(AICAD_WITH_OCCT)
   # (mesher.h is gmsh-free); aicad_mesh links the SDK import lib. The dynamic CRT
   # matches aicad_miniz / the DLL (same heap as the gmsh runtime).
   include(ProvisionGmsh)
+
+  # --- P55r: lib3mf 3MF reader/writer (BSD — clean to link/distribute) -------
+  # Provision the SAME lib3mf 2.5.0 the Python oracle (engine/doc/formats.py)
+  # wraps via the `lib3mf` wheel, so the 3MF mesh extraction (vertex coords +
+  # triangle indices) is bit-identical. The header-only CppDynamic binding lives
+  # ONLY in doc/formats.cpp and dlopens lib3mf.dll at runtime (no import lib on
+  # the link line); aicad_doc compiles with AICAD_WITH_LIB3MF + the binding's
+  # include dir, and lib3mf.dll is staged next to libaicad.dll below.
+  include(ProvisionLib3mf)
+
   # P50b: sim/fea_run.cpp (the combined mesh+resolve+solve glue) joins the mesher
   # target — it is the only sim source that needs the mesher, and adding it here
   # keeps the gmsh confinement intact (fea_run.h itself is gmsh-free). aicad_mesh
@@ -444,6 +454,11 @@ if(AICAD_WITH_OCCT)
   target_include_directories(aicad_doc PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
+  # 3MF (doc/formats.cpp): the lib3mf CppDynamic binding header + the enabling
+  # define, PRIVATE so the binding stays confined to formats.cpp's TU and does
+  # not leak onto aicad_doc's public include interface.
+  target_include_directories(aicad_doc PRIVATE ${LIB3MF_INCLUDE_DIR})
+  target_compile_definitions(aicad_doc PRIVATE AICAD_WITH_LIB3MF)
   target_link_libraries(aicad_doc PUBLIC
     aicad_geom_occt aicad_sketch aicad_geom aicad_util
     aicad_miniz
@@ -616,6 +631,9 @@ if(AICAD_WITH_OCCT)
   aicad_occt_copy_dlls(aicad)
   # Stage gmsh.dll too (aicad_mesh's runtime dep, imported by libaicad.dll).
   aicad_gmsh_copy_dll(aicad)
+  # Stage lib3mf.dll next to libaicad.dll so the CppDynamic binding in
+  # doc/formats.cpp can loadLibrary it at runtime (3MF read/write).
+  aicad_lib3mf_copy_dll(aicad)
 
   # --- aicad_probe: load libaicad.dll the way the HOST will (LoadLibrary) ------
   # Links NEITHER the core static libs NOR OCCT — only nlohmann_json. It dlopens

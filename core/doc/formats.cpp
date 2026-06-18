@@ -7,6 +7,31 @@
 // re-imports a C++-written file through the Python oracle (trimesh) and compares the
 // ROBUST mesh invariant (vertex/triangle count + bbox + volume) — never a byte compare.
 
+// lib3mf (3MF read/write) — CONFINED to this TU. We use the header-only
+// CppDynamic binding, which dlopens lib3mf.dll at runtime (CWrapper::loadLibrary)
+// — no import lib on the link line, MSVC-safe, exactly like the Python lib3mf
+// wheel (both wrap the SAME lib3mf.dll C ABI 2.5.0, so the mesh extraction is
+// bit-identical). Guarded by AICAD_WITH_LIB3MF so a build without the SDK
+// provisioned still compiles (the 3MF paths then fall through to the loud "not
+// supported" errors below).
+//
+// IMPORTANT: <windows.h> must be included FULL (no WIN32_LEAN_AND_MEAN) and
+// BEFORE the OCCT headers, because (1) the binding calls MultiByteToWideChar /
+// CP_UTF8 (winnls.h), which the lean macro strips, and (2) OCCT headers define
+// WIN32_LEAN_AND_MEAN, which would poison a later include. Pulling it in first
+// guarantees the full Win32 surface for the binding.
+#ifdef AICAD_WITH_LIB3MF
+#ifdef _WIN32
+// NOMINMAX: windows.h otherwise defines min()/max() macros that collide with
+// std::max({...}) in the PLY reader below.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+#include "lib3mf_dynamic.hpp"
+#endif
+
 #include "doc/formats.h"
 
 #include <algorithm>
@@ -99,6 +124,134 @@ std::string abs_path(const std::string& path) {
     std::filesystem::path p = std::filesystem::absolute(path, ec);
     return ec ? path : p.string();
 }
+
+#ifdef AICAD_WITH_LIB3MF
+// A named mesh extracted from a 3MF mesh object — the C++ analogue of the
+// oracle's (name, MeshBody(verts, tris)) tuple. Vertices are float32 (Lib3MF
+// sPosition.m_Coordinates is Lib3MF_single == float), triangle indices uint32
+// (sTriangle.m_Indices is Lib3MF_uint32) — IDENTICAL element types to the Python
+// _import_3mf path, which builds np.float32 verts + np.uint32 tris from the very
+// same lib3mf structs.
+struct NamedMesh {
+    std::string name;
+    MeshData mesh;  // verts stored as doubles, but the source floats round-trip exactly
+};
+
+// Load lib3mf.dll. The CppDynamic binding LoadLibraryW's the given filename; we
+// pass the DLL beside THIS module (libaicad.dll) so the staged copy is found
+// regardless of the process CWD. Falls back to the bare name (PATH search).
+Lib3MF::PWrapper load_lib3mf() {
+    std::string dll_path = "lib3mf.dll";
+#ifdef _WIN32
+    HMODULE self = nullptr;
+    if (::GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(&load_lib3mf), &self) &&
+        self) {
+        char buf[MAX_PATH] = {0};
+        DWORD n = ::GetModuleFileNameA(self, buf, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            std::filesystem::path p(buf);
+            std::filesystem::path beside = p.parent_path() / "lib3mf.dll";
+            if (std::filesystem::exists(beside)) dll_path = beside.string();
+        }
+    }
+#endif
+    try {
+        return Lib3MF::CWrapper::loadLibrary(dll_path);
+    } catch (const std::exception& e) {
+        throw OpError("import_failed",
+                      std::string("3MF: could not load lib3mf.dll (") + e.what() + ")",
+                      {{"reason", "lib3mf load failed"}, {"dll", dll_path}});
+    }
+}
+
+// Read every mesh object out of a .3mf, BIT-IDENTICAL to engine/doc/formats.py
+// ::_import_3mf: iterate the model's mesh objects in file order, skip empty ones,
+// pull GetVertices()/GetTriangleIndices(), name = GetName() or "<stem>_<idx>".
+std::vector<NamedMesh> read_3mf_objects(const std::string& path) {
+    Lib3MF::PWrapper wrapper = load_lib3mf();
+    Lib3MF::PModel model = wrapper->CreateModel();
+    Lib3MF::PReader reader = model->QueryReader("3mf");
+    reader->ReadFromFile(path);
+
+    const std::string stem = std::filesystem::path(path).stem().string();
+    std::vector<NamedMesh> out;
+    Lib3MF::PMeshObjectIterator it = model->GetMeshObjects();
+    int idx = 0;
+    while (it->MoveNext()) {
+        ++idx;
+        Lib3MF::PMeshObject mesh = it->GetCurrentMeshObject();
+        if (mesh->GetTriangleCount() == 0) continue;  // matches the oracle's skip
+        std::vector<Lib3MF::sPosition> gv;
+        std::vector<Lib3MF::sTriangle> gi;
+        mesh->GetVertices(gv);
+        mesh->GetTriangleIndices(gi);
+        NamedMesh nm;
+        std::string nm_name = mesh->GetName();
+        nm.name = nm_name.empty() ? (stem + "_" + std::to_string(idx)) : nm_name;
+        nm.mesh.verts.reserve(gv.size() * 3);
+        for (const Lib3MF::sPosition& v : gv) {
+            // m_Coordinates is float32; widen to double for MeshData — the value is
+            // preserved exactly (every float is representable as a double), so a
+            // float32 reconstruction on the gate side is bit-identical to numpy's.
+            nm.mesh.verts.push_back(static_cast<double>(v.m_Coordinates[0]));
+            nm.mesh.verts.push_back(static_cast<double>(v.m_Coordinates[1]));
+            nm.mesh.verts.push_back(static_cast<double>(v.m_Coordinates[2]));
+        }
+        nm.mesh.tris.reserve(gi.size() * 3);
+        for (const Lib3MF::sTriangle& t : gi) {
+            nm.mesh.tris.push_back(t.m_Indices[0]);
+            nm.mesh.tris.push_back(t.m_Indices[1]);
+            nm.mesh.tris.push_back(t.m_Indices[2]);
+        }
+        out.push_back(std::move(nm));
+    }
+    return out;
+}
+
+// Write named meshes to a .3mf, mirroring engine/doc/formats.py::_export_3mf_lib3mf:
+// one AddMeshObject + AddBuildItem(identity) per body; SetName; SetGeometry with
+// the positions (float) and triangles (uint32). Skips empty meshes.
+void write_3mf_meshes(const std::vector<NamedMesh>& meshes, const std::string& path) {
+    Lib3MF::PWrapper wrapper = load_lib3mf();
+    Lib3MF::PModel model = wrapper->CreateModel();
+    Lib3MF::sTransform identity = wrapper->GetIdentityTransform();
+    int added = 0;
+    for (const NamedMesh& nm : meshes) {
+        const MeshData& m = nm.mesh;
+        if (m.triangle_count() == 0) continue;
+        Lib3MF::PMeshObject mo = model->AddMeshObject();
+        mo->SetName(nm.name);
+        std::vector<Lib3MF::sPosition> ps;
+        ps.reserve(m.vertex_count());
+        for (std::size_t i = 0; i < m.vertex_count(); ++i) {
+            Lib3MF::sPosition p;
+            p.m_Coordinates[0] = static_cast<Lib3MF_single>(m.verts[3 * i]);
+            p.m_Coordinates[1] = static_cast<Lib3MF_single>(m.verts[3 * i + 1]);
+            p.m_Coordinates[2] = static_cast<Lib3MF_single>(m.verts[3 * i + 2]);
+            ps.push_back(p);
+        }
+        std::vector<Lib3MF::sTriangle> ts;
+        ts.reserve(m.triangle_count());
+        for (std::size_t i = 0; i < m.triangle_count(); ++i) {
+            Lib3MF::sTriangle t;
+            t.m_Indices[0] = m.tris[3 * i];
+            t.m_Indices[1] = m.tris[3 * i + 1];
+            t.m_Indices[2] = m.tris[3 * i + 2];
+            ts.push_back(t);
+        }
+        mo->SetGeometry(ps, ts);
+        model->AddBuildItem(mo.get(), identity);
+        ++added;
+    }
+    if (added == 0)
+        throw OpError("export_failed", "3MF export: no mesh geometry to write",
+                      {{"format", "3mf"}, {"path", path}});
+    model->QueryWriter("3mf")->WriteToFile(path);
+}
+#endif  // AICAD_WITH_LIB3MF
 
 }  // namespace
 
@@ -498,8 +651,48 @@ MeshData read_mesh(const std::string& path, const std::string& fmt) {
     }
     if (fmt == "ply") return read_ply(path);
     if (fmt == "gltf" || fmt == "glb") return read_gltf(path);
+    if (fmt == "3mf") {
+#ifdef AICAD_WITH_LIB3MF
+        // Concatenate every 3MF mesh object into one soup (re-basing indices) for
+        // the generic single-mesh read_mesh contract; import_bodies handles 3mf
+        // per-object to match the oracle's one-MeshBody-per-object naming.
+        std::vector<NamedMesh> objs = read_3mf_objects(path);
+        MeshData mesh;
+        for (const NamedMesh& nm : objs) {
+            const uint32_t base = static_cast<uint32_t>(mesh.vertex_count());
+            mesh.verts.insert(mesh.verts.end(), nm.mesh.verts.begin(), nm.mesh.verts.end());
+            for (uint32_t i : nm.mesh.tris) mesh.tris.push_back(base + i);
+        }
+        return mesh;
+#else
+        throw OpError("import_failed",
+                      "3MF import requires lib3mf — rebuild core with the SDK provisioned "
+                      "(-DAICAD_WITH_OCCT=ON pulls in ProvisionLib3mf).",
+                      {{"format", fmt}, {"path", path}});
+#endif
+    }
     throw OpError("import_failed", "read_mesh: unsupported mesh format '" + fmt + "'",
                   {{"format", fmt}, {"path", path}});
+}
+
+std::vector<std::pair<std::string, MeshData>> read_mesh_raw(const std::string& path,
+                                                            const std::string& fmt) {
+    std::vector<std::pair<std::string, MeshData>> out;
+    if (fmt == "3mf") {
+#ifdef AICAD_WITH_LIB3MF
+        for (NamedMesh& nm : read_3mf_objects(path))
+            out.emplace_back(nm.name, std::move(nm.mesh));
+        return out;
+#else
+        throw OpError("import_failed",
+                      "3MF read_mesh_raw requires lib3mf — rebuild with the SDK provisioned.",
+                      {{"format", fmt}, {"path", path}});
+#endif
+    }
+    // Other mesh formats are single-soup: one entry named after the file stem.
+    const std::string stem = std::filesystem::path(path).stem().string();
+    out.emplace_back(stem, read_mesh(path, fmt));
+    return out;
 }
 
 // --------------------------------------------------------------------------- mesh_to_shape
@@ -620,12 +813,29 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
             write_gltf(bodies, out, /*binary=*/true);
             return out;
         }
-        if (fmt == "3mf")
+        if (fmt == "3mf") {
+#ifdef AICAD_WITH_LIB3MF
+            // Tessellate each body (Python BRepMesh defaults via shape_to_mesh) into
+            // one named 3MF mesh object, mirroring _export_3mf_lib3mf (one mesh object
+            // + build item per body). Export parity is gated as a ROUND-TRIP (the OCCT
+            // tessellation differs from the oracle's), not byte/mesh-identical.
+            std::vector<NamedMesh> meshes;
+            for (std::size_t i = 0; i < bodies.size(); ++i) {
+                if (bodies[i].IsNull()) continue;
+                NamedMesh nm;
+                nm.name = "Body" + std::to_string(i + 1);
+                nm.mesh = shape_to_mesh(bodies[i]);
+                if (nm.mesh.triangle_count() > 0) meshes.push_back(std::move(nm));
+            }
+            write_3mf_meshes(meshes, out);
+            return out;
+#else
             throw OpError("export_failed",
-                          "3MF export is not supported by the C++ core: OCCT 7.9.3 ships no "
-                          "3MF writer; the Python oracle uses lib3mf. Export STL/OBJ/PLY/glTF "
-                          "instead.",
-                          {{"format", fmt}, {"reason", "no OCCT 3MF support"}});
+                          "3MF export requires lib3mf — rebuild core with the SDK provisioned "
+                          "(-DAICAD_WITH_OCCT=ON pulls in ProvisionLib3mf).",
+                          {{"format", fmt}, {"reason", "lib3mf not provisioned"}});
+#endif
+        }
         if (fmt == "3dm")
             throw OpError("export_failed",
                           "3DM (Rhino) export is not supported by the C++ core: OCCT 7.9.3 ships "
@@ -722,11 +932,34 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
                               {{"path", path}, {"format", fmt}});
             return name_bodies(split_solids(shape));
         }
-        if (fmt == "3mf")
+        if (fmt == "3mf") {
+#ifdef AICAD_WITH_LIB3MF
+            // 3MF via lib3mf: one body per mesh object (matching _import_3mf), each
+            // sewn into a shell/solid (the same as_solid path as the other mesh
+            // formats). Body names follow the oracle: the 3MF object name, else
+            // "<stem>_<idx>". The raw vertex/triangle extraction is BIT-IDENTICAL to
+            // the Python lib3mf path (both wrap lib3mf 2.5.0).
+            std::vector<NamedMesh> objs = read_3mf_objects(path);
+            if (objs.empty())
+                throw OpError("import_failed", "no mesh objects found in 3MF '" + path + "'",
+                              {{"path", path}, {"format", fmt}});
+            std::vector<std::pair<std::string, TopoDS_Shape>> out;
+            for (const NamedMesh& nm : objs) {
+                TopoDS_Shape shape = mesh_to_shape(nm.mesh);
+                if (shape.IsNull())
+                    throw OpError("import_failed",
+                                  "3MF object '" + nm.name + "' could not be sewn into a body",
+                                  {{"path", path}, {"format", fmt}});
+                out.emplace_back(nm.name, shape);
+            }
+            return out;
+#else
             throw OpError("import_failed",
-                          "3MF import is not supported by the C++ core: OCCT 7.9.3 ships no "
-                          "3MF reader; the Python oracle uses lib3mf.",
-                          {{"format", fmt}, {"reason", "no OCCT 3MF support"}});
+                          "3MF import requires lib3mf — rebuild core with the SDK provisioned "
+                          "(-DAICAD_WITH_OCCT=ON pulls in ProvisionLib3mf).",
+                          {{"format", fmt}, {"reason", "lib3mf not provisioned"}});
+#endif
+        }
         if (fmt == "3dm")
             throw OpError("import_failed",
                           "3DM (Rhino) import is not supported by the C++ core: OCCT 7.9.3 ships "

@@ -1639,6 +1639,24 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
     return resp;
 }
 
+json mesh_read_raw(const std::string& path, const std::string& fmt) {
+    if (path.empty())
+        throw OpError("invalid_op", "mesh_read_raw: 'path' is required",
+                      {{"reason", "missing path"}});
+    if (!std::filesystem::exists(path))
+        throw OpError("import_failed", "mesh_read_raw: file not found: " + path, {{"path", path}});
+    const std::string f = fmt.empty() ? detect_format(path) : fmt;
+    json objects = json::array();
+    for (const auto& [name, m] : read_mesh_raw(path, f)) {
+        json o;
+        o["name"] = name;
+        o["verts"] = m.verts;  // 3*N doubles (float32 source widened — exact)
+        o["tris"] = m.tris;    // 3*M uint32 (0-based)
+        objects.push_back(std::move(o));
+    }
+    return json{{"objects", std::move(objects)}, {"format", f}};
+}
+
 json doc_save(const std::string& doc_id, const std::string& path) {
     std::lock_guard<std::mutex> lk(g_mtx);
     Session& s = require_session(doc_id);

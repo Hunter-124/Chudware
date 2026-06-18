@@ -763,10 +763,27 @@ def main() -> int:
         print(f"  {'fmt py->C++import STEP':<28} {'MATCH' if py_ok else f'DIFF rc={rc} vol={cv}'}")
         mism += 0 if py_ok else 1
 
-        # Unsupported export format fails loud (export_failed), not a silent wrong file.
+        # 3MF export is now supported (P55r, via lib3mf): exports successfully + the
+        # written file exists. (3MF bit-parity is gated separately in tools/cpp_3mf_parity.py.)
+        fmt_total += 1
+        p3mf = str(Path(td) / "cpp_box.3mf")
+        rc, ev = core.call("export_file", {"doc_id": ce.doc_id, "path": p3mf, "format": "3mf"})
+        tmf_ok = rc == 0 and Path(ev.get("path", "")).exists()
+        print(f"  {'fmt C++export 3mf':<28} {'MATCH' if tmf_ok else 'DIFF: ' + str(ev)[:60]}")
+        mism += 0 if tmf_ok else 1
+
+        # 3MF round-trip: re-import the C++-exported 3MF back into a C++ doc -> box volume.
+        fmt_total += 1
+        rc, iv = core.call("import_file", {"path": p3mf})
+        rtv = float(iv.get("volume", 0.0)) if rc == 0 else -1.0
+        tmf_rt_ok = rc == 0 and abs(rtv - BOXV) / BOXV <= 1e-3
+        print(f"  {'fmt C++ 3mf round-trip':<28} {'MATCH' if tmf_rt_ok else f'DIFF rc={rc} vol={rtv}'}")
+        mism += 0 if tmf_rt_ok else 1
+
+        # An actually-unsupported export format (3dm) still fails loud (export_failed).
         fmt_total += 1
         rc, bad = core.call("export_file",
-                            {"doc_id": ce.doc_id, "path": str(Path(td) / "x.3mf"), "format": "3mf"})
+                            {"doc_id": ce.doc_id, "path": str(Path(td) / "x.3dm"), "format": "3dm"})
         unsupp_ok = rc != 0 and bad.get("code") == "export_failed"
         print(f"  {'fmt unsupported->error':<28} {'MATCH' if unsupp_ok else 'DIFF: ' + str(bad)[:60]}")
         mism += 0 if unsupp_ok else 1

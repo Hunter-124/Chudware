@@ -48,8 +48,16 @@ struct MeshData {
 MeshData shape_to_mesh(const TopoDS_Shape& shape);
 
 // Read a mesh file into a triangle soup (no sewing). Supported fmt: stl/obj/ply/gltf/
-// glb. Throws OpError("import_failed") on an unsupported format or a read failure.
+// glb/3mf. Throws OpError("import_failed") on an unsupported format or a read failure.
 MeshData read_mesh(const std::string& path, const std::string& fmt);
+
+// Read a mesh file into its RAW per-object (name, triangle-soup) list — NO sewing,
+// NO concatenation, NO welding. For 3MF this is one entry per mesh object, the exact
+// shape the Python oracle's _import_3mf returns. Used by the bit-parity gate to
+// compare the raw lib3mf extraction (vertex coords + triangle indices + names) against
+// the Python lib3mf path. Other mesh formats return a single ("<stem>", soup) entry.
+std::vector<std::pair<std::string, MeshData>> read_mesh_raw(const std::string& path,
+                                                            const std::string& fmt);
 
 // Build a TopoDS_Shape from a triangle soup: sew the triangles into a shell, then
 // promote to a SOLID when the shell is closed (the "as_solid" path). Returns the sewn

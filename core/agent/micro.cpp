@@ -242,7 +242,7 @@ void dump_default(const ojson& j, std::string& out) {
 }
 
 // json.dumps(obj) with DEFAULT separators (", " / ": ").
-std::string py_json_dumps_default(const ojson& obj) {
+std::string py_json_dumps_default_local(const ojson& obj) {
     std::string out;
     dump_default(obj, out);
     return out;
@@ -606,7 +606,7 @@ ExecutorPrompt build_executor_prompt(const Step& step, const std::string& doc_su
     if (!cheat.empty()) system += "\n\n---\nCHEAT-SHEET for this step:\n" + cheat;
 
     std::string step_text = "STEP TO DO NOW:\ntype: " + step.type + "\n" + step.desc;
-    if (!step.params.empty()) step_text += "\nparams: " + py_json_dumps_default(step.params);
+    if (!step.params.empty()) step_text += "\nparams: " + py_json_dumps_default_local(step.params);
 
     std::string doc_summary = doc_summary_in;
     // parts: [REQUEST, doc_summary, step_text, workflow] (+ edit-bias) (+ error).

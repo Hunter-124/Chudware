@@ -41,10 +41,11 @@ int est_tokens(const std::string& text) {
 // --------------------------------------------------------------------------- ojson.dumps port
 namespace {
 
-// Python ojson.dumps string escaping (ensure_ascii=True): escapes ", \, control
-// chars via \b \t \n \f \r, other <0x20 via \u00XX, and all >=0x7f via \uXXXX
-// (surrogate pairs for astral code points). Input is UTF-8.
-void dump_string(const std::string& s, std::string& out) {
+// Python ojson.dumps string escaping: escapes ", \, control chars via
+// \b \t \n \f \r, other <0x20 via \u00XX. When `ensure_ascii` (the default),
+// all >=0x7f are emitted as \uXXXX (surrogate pairs for astral code points);
+// otherwise non-ASCII UTF-8 bytes pass through literally. Input is UTF-8.
+void dump_string(const std::string& s, std::string& out, bool ensure_ascii) {
     out += '"';
     size_t i = 0;
     const size_t n = s.size();
@@ -65,6 +66,11 @@ void dump_string(const std::string& s, std::string& out) {
             continue;
         }
         if (c < 0x80) {  // plain ASCII
+            out += static_cast<char>(c);
+            ++i;
+            continue;
+        }
+        if (!ensure_ascii) {  // pass the raw UTF-8 byte through unescaped
             out += static_cast<char>(c);
             ++i;
             continue;
@@ -93,6 +99,7 @@ void dump_string(const std::string& s, std::string& out) {
     }
     out += '"';
 }
+void dump_string(const std::string& s, std::string& out) { dump_string(s, out, true); }
 
 // Python repr(float) shortest round-tripping representation, then mapped to
 // ojson.dumps output (inf/nan -> Infinity/-Infinity/NaN; integral floats keep
@@ -234,6 +241,68 @@ std::string py_json_dumps_indent0(const ojson& obj) {
     dump_value(obj, out);
     return out;
 }
+
+namespace {
+// Single-line dump with the DEFAULT json.dumps separators (", " item, ": " key).
+// `ensure_ascii` controls non-ASCII escaping in strings.
+void dump_value_default(const ojson& j, std::string& out, bool ensure_ascii) {
+    switch (j.type()) {
+        case ojson::value_t::null:
+            out += "null";
+            break;
+        case ojson::value_t::boolean:
+            out += j.get<bool>() ? "true" : "false";
+            break;
+        case ojson::value_t::string:
+            dump_string(j.get<std::string>(), out, ensure_ascii);
+            break;
+        case ojson::value_t::number_integer:
+            out += std::to_string(j.get<long long>());
+            break;
+        case ojson::value_t::number_unsigned:
+            out += std::to_string(j.get<unsigned long long>());
+            break;
+        case ojson::value_t::number_float:
+            out += dump_double(j.get<double>());
+            break;
+        case ojson::value_t::array: {
+            out += '[';
+            bool first = true;
+            for (const auto& e : j) {
+                if (!first) out += ", ";
+                first = false;
+                dump_value_default(e, out, ensure_ascii);
+            }
+            out += ']';
+            break;
+        }
+        case ojson::value_t::object: {
+            out += '{';
+            bool first = true;
+            for (auto it = j.begin(); it != j.end(); ++it) {
+                if (!first) out += ", ";
+                first = false;
+                dump_string(it.key(), out, ensure_ascii);
+                out += ": ";
+                dump_value_default(it.value(), out, ensure_ascii);
+            }
+            out += '}';
+            break;
+        }
+        default:
+            out += "null";
+            break;
+    }
+}
+}  // namespace
+
+std::string py_json_dumps_default(const ojson& obj, bool ensure_ascii) {
+    std::string out;
+    dump_value_default(obj, out, ensure_ascii);
+    return out;
+}
+
+std::string py_float_repr(double v) { return dump_double(v); }
 
 // --------------------------------------------------------------------------- ledger
 

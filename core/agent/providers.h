@@ -96,6 +96,18 @@ private:
     json by_role_;  // {role: [reply, ...]}
 };
 
+// --- assist provider (ask.py / pm_assist.py single-call helper) -------------
+// Build a single-call completion fn from a mock descriptor for the in-app assists.
+// Supports {name:"mock", replies:[...]} (flat MockProvider, last repeats),
+// {name:"mock", by_role:{role:[...]}} (RoleScriptedProvider, routed on the system
+// prompt's ROLE: line), and {error:"..."} (signals a provider error via *err,
+// like the Python except branch). Any other descriptor routes through complete().
+// The returned fn ignores `err` for the ask path; pm_assist reads it.
+#include <functional>
+using AssistCompleteFn =
+    std::function<std::string(const std::string& system, const std::string& body, std::string* err)>;
+AssistCompleteFn make_assist_provider(const json& descriptor);
+
 // --- high-level dispatch ----------------------------------------------------
 // complete(): pick anthropic vs openai/llamacpp, build the request, http_post,
 // parse. provider is "anthropic"|"openai"|"llamacpp"|"mock". cfg may carry

@@ -38,6 +38,15 @@ int est_tokens(const std::string& text);
 // "," item separator, empty {}/[] stay on one line, ensure_ascii \uXXXX escapes.
 std::string py_json_dumps_indent0(const ojson& obj);
 
+// Replicates Python json.dumps with the DEFAULT separators (", " / ": ") on ONE
+// line. ensure_ascii toggles \uXXXX escaping of non-ASCII (False keeps UTF-8
+// bytes literal). Object key iteration follows the (insertion-ordered) ojson.
+std::string py_json_dumps_default(const ojson& obj, bool ensure_ascii = true);
+
+// CPython repr()/str() of a double — the shortest round-tripping decimal, with
+// the fixed-vs-scientific rule and trailing ".0" for integral floats.
+std::string py_float_repr(double v);
+
 // --------------------------------------------------------------------------- ledger
 
 // Per-stage attempt counts + the running error signatures (identical-failure stop).

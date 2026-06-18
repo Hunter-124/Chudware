@@ -31,10 +31,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include "agent/ask.h"
 #include "agent/config.h"
 #include "agent/events.h"
 #include "agent/machine.h"
 #include "agent/micro.h"
+#include "agent/pm_assist.h"
 #include "agent/paths.h"
 #include "agent/ops_emit.h"
 #include "agent/providers.h"
@@ -653,6 +655,122 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 va = params["vol_after"].get<double>();
             aicad::agent::VerifyResult vr = aicad::agent::verify_step(step, tree, fs, vb, va);
             return emit(json{{"verified", vr.verified}, {"notes", vr.notes}}, out_json, 0);
+        }
+        // --- P54b: in-app LLM assists (agent/ask.py + agent/pm_assist.py) ---
+        // All re-parse params_json as ordered_json so doc/form_schema/current
+        // key order survives end-to-end (matching Python dict insertion order).
+        if (m == "agent_build_doc_context") {
+            using ojson = nlohmann::ordered_json;
+            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
+            ojson doc = op.contains("doc") ? op["doc"] : ojson(nullptr);
+            std::string doc_id = op.value("doc_id", std::string("?"));
+            long rev = op.contains("revision") && op["revision"].is_number()
+                           ? op["revision"].get<long>()
+                           : 0;
+            ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
+            return emit(json{{"text", aicad::agent::build_doc_context(doc, doc_id, rev, fs)}},
+                        out_json, 0);
+        }
+        if (m == "agent_build_ask_prompt") {
+            using ojson = nlohmann::ordered_json;
+            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
+            std::string question = op.value("question", std::string());
+            ojson doc = op.contains("doc") ? op["doc"] : ojson(nullptr);
+            std::string doc_id = op.value("doc_id", std::string("?"));
+            long rev = op.contains("revision") && op["revision"].is_number()
+                           ? op["revision"].get<long>()
+                           : 0;
+            ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
+            aicad::agent::AskPrompt ap =
+                aicad::agent::build_ask_prompt(question, doc, doc_id, rev, fs);
+            return emit(json{{"system", ap.system}, {"body", ap.body}}, out_json, 0);
+        }
+        if (m == "agent_answer_question") {
+            using ojson = nlohmann::ordered_json;
+            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
+            std::string question = op.value("question", std::string());
+            ojson doc = op.contains("doc") ? op["doc"] : ojson(nullptr);
+            std::string doc_id = op.value("doc_id", std::string("?"));
+            long rev = op.contains("revision") && op["revision"].is_number()
+                           ? op["revision"].get<long>()
+                           : 0;
+            ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
+            // Mock provider: scripted replies (flat list) or by_role routing.
+            json prov = params.contains("provider") ? params["provider"] : json::object();
+            auto provider = aicad::agent::make_assist_provider(prov);
+            std::string answer = aicad::agent::answer_question(
+                question, doc, doc_id, rev, fs,
+                [&](const std::string& sys, const std::string& body) {
+                    std::string err;
+                    return provider(sys, body, &err);  // ask path ignores err
+                });
+            return emit(json{{"answer", answer}}, out_json, 0);
+        }
+        if (m == "agent_pm_extract_json") {
+            std::string reply = params.value("reply", std::string());
+            aicad::agent::ojson plan = aicad::agent::pm_extract_json(reply);
+            return emit(json{{"plan", json::parse(plan.dump())}}, out_json, 0);
+        }
+        if (m == "agent_pm_coerce") {
+            using ojson = nlohmann::ordered_json;
+            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
+            ojson field = op.contains("field") ? op["field"] : ojson::object();
+            ojson value = op.contains("value") ? op["value"] : ojson(nullptr);
+            ojson v = aicad::agent::pm_coerce_patch_value(field, value);
+            return emit(json{{"value", json::parse(v.dump())}}, out_json, 0);
+        }
+        if (m == "agent_pm_validate_plan") {
+            using ojson = nlohmann::ordered_json;
+            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
+            ojson plan = op.contains("plan") ? op["plan"] : ojson::object();
+            ojson fs = op.contains("form_schema") ? op["form_schema"] : ojson::object();
+            ojson cur = op.contains("current") ? op["current"] : ojson::object();
+            ojson v = aicad::agent::pm_validate_plan(plan, fs, cur);
+            return emit(json{{"validated", json::parse(v.dump())}}, out_json, 0);
+        }
+        if (m == "agent_pm_heuristic_plan") {
+            using ojson = nlohmann::ordered_json;
+            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
+            ojson fs = op.contains("form_schema") ? op["form_schema"] : ojson::object();
+            ojson cur = op.contains("current") ? op["current"] : ojson::object();
+            std::string intent = op.value("intent", std::string());
+            ojson v = aicad::agent::pm_heuristic_plan(fs, cur, intent);
+            return emit(json{{"plan", json::parse(v.dump())}}, out_json, 0);
+        }
+        if (m == "agent_pm_build_prompt") {
+            using ojson = nlohmann::ordered_json;
+            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
+            ojson prm = op.contains("params") ? op["params"] : ojson::object();
+            ojson doc = op.contains("doc") ? op["doc"] : ojson(nullptr);
+            std::string doc_id = op.value("doc_id", std::string("?"));
+            long rev = op.contains("revision") && op["revision"].is_number()
+                           ? op["revision"].get<long>()
+                           : 0;
+            ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
+            aicad::agent::PmAssistPrompt pp =
+                aicad::agent::build_pm_assist_prompt(prm, doc, doc_id, rev, fs);
+            return emit(json{{"system", pp.system}, {"body", pp.body}}, out_json, 0);
+        }
+        if (m == "agent_pm_assist") {
+            using ojson = nlohmann::ordered_json;
+            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
+            ojson prm = op.contains("params") ? op["params"] : ojson::object();
+            ojson doc = op.contains("doc") ? op["doc"] : ojson(nullptr);
+            std::string doc_id = op.value("doc_id", std::string("?"));
+            long rev = op.contains("revision") && op["revision"].is_number()
+                           ? op["revision"].get<long>()
+                           : 0;
+            ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
+            json prov = params.contains("provider") ? params["provider"] : json::object();
+            bool has_provider = params.contains("provider") && !params["provider"].is_null();
+            aicad::agent::PmCompleteFn cb = nullptr;
+            if (has_provider) {
+                auto provider = aicad::agent::make_assist_provider(prov);
+                cb = [provider](const std::string& sys, const std::string& body,
+                                std::string* err) { return provider(sys, body, err); };
+            }
+            ojson v = aicad::agent::assist_property_manager(prm, doc, doc_id, rev, fs, cb);
+            return emit(json{{"validated", json::parse(v.dump())}}, out_json, 0);
         }
         if (m == "sim_fea_static") {
             // Linear-static FEA (engine/sim/fea_static.py parity probe). Params carry an

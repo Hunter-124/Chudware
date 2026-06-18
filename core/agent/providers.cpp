@@ -2,6 +2,7 @@
 #include "agent/providers.h"
 
 #include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -361,6 +362,44 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
 
     res.error = "unknown provider: " + provider;
     return res;
+}
+
+// --------------------------------------------------------------------------- assist provider
+AssistCompleteFn make_assist_provider(const json& descriptor) {
+    json d = descriptor;
+    // {error:"..."} -> signals a provider error (the except branch in the oracle).
+    if (d.contains("error") && d["error"].is_string() && !d["error"].get<std::string>().empty()) {
+        std::string err = d["error"].get<std::string>();
+        return [err](const std::string&, const std::string&, std::string* e) -> std::string {
+            if (e) *e = err;
+            return std::string();
+        };
+    }
+    std::string name = d.value("name", std::string());
+    if (name == "mock" && d.contains("by_role") && d["by_role"].is_object()) {
+        auto rp = std::make_shared<RoleScriptedProvider>(d["by_role"]);
+        return [rp](const std::string& system, const std::string&, std::string*) -> std::string {
+            return rp->complete(system);
+        };
+    }
+    if (name == "mock") {
+        std::vector<std::string> replies;
+        if (d.contains("replies") && d["replies"].is_array())
+            for (const auto& r : d["replies"]) replies.push_back(r.get<std::string>());
+        auto mp = std::make_shared<MockProvider>(std::move(replies));
+        return [mp](const std::string&, const std::string&, std::string*) -> std::string {
+            return mp->complete();
+        };
+    }
+    // Real provider: route a single completion through complete() (live network).
+    json cfg = d;
+    return [name, cfg](const std::string& system, const std::string& body,
+                       std::string* e) -> std::string {
+        json messages = json::array({user_message(json::array({text_part(body)}))});
+        CompleteResult cr = complete(name, cfg, system, messages, 1024);
+        if (!cr.error.empty() && e) *e = cr.error;
+        return cr.text;
+    };
 }
 
 }  // namespace agent

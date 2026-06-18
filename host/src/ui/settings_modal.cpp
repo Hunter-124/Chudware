@@ -1,6 +1,7 @@
 // AI-CAD Settings modal (AI provider + Agent + Agents-prompt-editor tabs) and the About modal.
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -197,19 +198,40 @@ void drawSettingsModal(AppState& st, bool busy) {
 
                 ImGui::Dummy(ImVec2(0, 8 * sc));
                 ImGui::SeparatorText("Engine");
-                // Production routing is still the Python worker for every doc op (see
-                // worker_client.cpp); the C++ core (libaicad) is loaded for diagnostic/parity
-                // only. Hardcode the active engine as Python until the cutover lands; flip this
-                // when a "route to cpp" path exists.
-                ImGui::TextUnformatted("Active engine: Python worker (subprocess)");
-                helpMarker("The C++ core (libaicad.dll) is the in-progress migration target. It "
-                           "currently runs in diagnostic/parity mode alongside the Python worker, "
-                           "which still handles all production document operations. This row will "
-                           "show the C++ core as active once the cutover lands.");
+                // Reflect the REAL strangler-seam state (see worker_client.cpp): once the C++
+                // core (libaicad.dll) loads, doc ops route to it by default (AI_CAD_CPP_DOCS,
+                // default ON); sim/agent/ecad are explicit opt-ins. These mirror the flag reads
+                // in worker_client.cpp — keep the defaults in sync if they change there.
+                auto flagOn = [](const char* name, bool dflt) {
+                    const char* f = std::getenv(name);
+                    if (f && f[0]) return f[0] != '0';
+                    return dflt;
+                };
                 if (core::cpp_core().available()) {
+                    ImGui::TextUnformatted("Active engine: C++ core (libaicad.dll) + Python worker");
+                    helpMarker("The in-process C++ core is loaded. New part documents run on it; "
+                               "assemblies and legacy/code-exec operations still use the Python "
+                               "worker. Per-subsystem routing is shown below and is controlled by "
+                               "the AI_CAD_CPP_* environment variables (set a flag to 1 to route "
+                               "that subsystem to C++, 0 to force Python).");
                     dimText(("C++ core: libaicad.dll loaded (ABI " +
                              core::cpp_core().abiVersion() + ")").c_str());
+                    auto routeRow = [&](const char* label, bool on, const char* env) {
+                        ImGui::BulletText("%s: %s", label, on ? "C++ core" : "Python worker");
+                        ImGui::SameLine();
+                        dimText(("(" + std::string(env) + ")").c_str());
+                    };
+                    routeRow("Documents",  flagOn("AI_CAD_CPP_DOCS",  true),  "AI_CAD_CPP_DOCS");
+                    routeRow("Simulation", flagOn("AI_CAD_CPP_SIM",   false), "AI_CAD_CPP_SIM");
+                    routeRow("AI agent",   flagOn("AI_CAD_CPP_AGENT", false), "AI_CAD_CPP_AGENT");
+                    routeRow("ECAD",       flagOn("AI_CAD_CPP_ECAD",  false), "AI_CAD_CPP_ECAD");
                 } else {
+                    ImGui::TextUnformatted("Active engine: Python worker (subprocess)");
+                    helpMarker("The C++ core (libaicad.dll) is NOT loaded, so every operation uses "
+                               "the Python worker. To load it, set the AI_CAD_LIBAICAD environment "
+                               "variable to the built DLL (core/build-occt/bin/Release/libaicad.dll) "
+                               "or stage that DLL next to AI-CAD.exe, then restart. Once loaded, new "
+                               "part documents route to the C++ core automatically.");
                     dimText("C++ core: not loaded");
                 }
 

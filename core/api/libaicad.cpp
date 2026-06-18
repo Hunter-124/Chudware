@@ -16,6 +16,7 @@
 
 #include "api/libaicad.h"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -1385,6 +1386,34 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 return emit(aicad::doc::doc_eval_measure(
                                 params.value("doc_id", std::string()),
                                 params.contains("refs") ? params["refs"] : json::array()),
+                            out_json, 0);
+            if (m == "eval_draft") {
+                std::array<double, 3> pull{0.0, 0.0, 1.0};
+                if (params.contains("pull") && params["pull"].is_array() &&
+                    params["pull"].size() == 3) {
+                    for (int i = 0; i < 3; ++i) pull[i] = params["pull"][i].get<double>();
+                }
+                return emit(aicad::doc::doc_eval_draft(
+                                params.value("doc_id", std::string()),
+                                params.contains("body") && params["body"].is_number()
+                                    ? params["body"].get<int>() : 0,
+                                pull,
+                                params.contains("angle_deg") && params["angle_deg"].is_number()
+                                    ? params["angle_deg"].get<double>() : 0.0),
+                            out_json, 0);
+            }
+            if (m == "eval_curvature")
+                return emit(aicad::doc::doc_eval_curvature(
+                                params.value("doc_id", std::string()),
+                                params.contains("body") && params["body"].is_number()
+                                    ? params["body"].get<int>() : 0,
+                                params.value("kind", std::string("mean"))),
+                            out_json, 0);
+            if (m == "eval_thickness")
+                return emit(aicad::doc::doc_eval_thickness(
+                                params.value("doc_id", std::string()),
+                                params.contains("body") && params["body"].is_number()
+                                    ? params["body"].get<int>() : 0),
                             out_json, 0);
             if (m == "export_file")
                 return emit(aicad::doc::doc_export_file(params.value("doc_id", std::string()),

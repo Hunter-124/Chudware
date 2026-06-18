@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <regex>
@@ -64,7 +65,10 @@
 #include <GCPnts_AbscissaPoint.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <GeomAbs_CurveType.hxx>
+#include <ShapeAnalysis_Surface.hxx>
+#include <Geom_Surface.hxx>
 #include <gp_Circ.hxx>
+#include <gp_Pnt2d.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Vertex.hxx>
 
@@ -76,7 +80,9 @@
 #include "doc/sketch_geom.h"
 #include "doc/stepplus.h"
 #include "doc/validate.h"
+#include "geom/aicm.h"
 #include "geom/plane.h"
+#include "geom/tessellate.h"
 #include "util/expr.h"
 
 namespace aicad::doc {
@@ -2348,6 +2354,319 @@ json doc_eval_measure(const std::string& doc_id, const json& refs) {
 
     if (shapes.size() == 1) return eval_measure_single(shapes[0]);
     return eval_measure_pair(shapes[0], shapes[1]);
+}
+
+// ----------------------------------------------------------- Evaluate field methods
+// Ports of engine/doc/evaluate.py {draft_field, curvature_field, thickness_field} via the
+// worker.py _eval_draft/_eval_curvature/_eval_thickness handlers. Unlike the analytic eval
+// methods these tessellate the active body, compute a per-vertex SCALAR field, write it to a
+// temp .aicm file (a SCLR chunk on the tessellated body) and return {"aicm_path": <path>}.
+// Mirrors worker.py::_eval_write_field_aicm: tessellate (body_id=1) -> chunk_fn(tess,shape)
+// -> write_aicm_file(tmp, [tess], extra_chunks=[chunk]).
+
+namespace {
+
+// Pick the active (or selected) body shape (mirrors eval_active_shape, but the field
+// handlers always go through _eval_active_shape with the same body_id semantics).
+const TopoDS_Shape& field_active_shape(const CompileResult& r, const std::string& doc_id,
+                                       int body_id) {
+    return eval_active_shape(r, doc_id, body_id);
+}
+
+// Tessellate `shape` (body_id=1, name `name`, default deflections matching tessellate.py)
+// and return the AicmBody — the C++ equivalent of worker.py's tess.tessellate_body call.
+aicm::AicmBody field_tessellate(const TopoDS_Shape& shape, const std::string& name) {
+    const float color[3] = {0.71f, 0.76f, 0.82f};
+    return ::geom::tessellate_body(shape, 1, name.empty() ? std::string("Body1") : name, color);
+}
+
+// Write the tessellated body + a single SCLR chunk to a fresh temp .aicm path; return it.
+std::string field_write_temp_aicm(const aicm::AicmBody& body,
+                                  const std::vector<uint8_t>& chunk) {
+    namespace fs = std::filesystem;
+    static std::atomic<unsigned long long> seq{1};
+    unsigned long long n = seq.fetch_add(1);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "aicad-field-%llx-%llx.aicm",
+                  static_cast<unsigned long long>(
+                      reinterpret_cast<std::uintptr_t>(&body) & 0xffffffffULL),
+                  n);
+    fs::path tmp = fs::temp_directory_path() / buf;
+    if (!aicm::write_aicm_file(tmp.string(), {body}, {chunk}))
+        throw OpError("invalid_op", "failed to write field aicm to temp",
+                      {{"reason", "aicm write failed"}});
+    return tmp.string();
+}
+
+// Per-vertex unit normal from the body's flat nrm buffer (3*i..3*i+2), normalized like the
+// oracle (nrm / max(|nrm|, eps)). vi is 0-based.
+inline void field_vertex_normal(const aicm::AicmBody& body, std::size_t vi, double out[3]) {
+    double x = body.nrm[3 * vi + 0];
+    double y = body.nrm[3 * vi + 1];
+    double z = body.nrm[3 * vi + 2];
+    double len = std::sqrt(x * x + y * y + z * z);
+    double inv = (len > 1e-12) ? 1.0 / len : 1.0;
+    out[0] = x * inv;
+    out[1] = y * inv;
+    out[2] = z * inv;
+}
+
+// engine/doc/evaluate.py::_moller_trumbore_all — for each ray, the smallest positive t
+// (distance along a UNIT direction) to a triangle of the mesh; inf if no hit. Ported 1:1
+// (same EPS=1e-10, u/v barycentric bounds, t>EPS guard). directions are unit vectors.
+std::vector<double> field_moller_trumbore_all(const std::vector<float>& pos,
+                                              const std::vector<uint32_t>& idx,
+                                              const std::vector<std::array<double, 3>>& origins,
+                                              const std::vector<std::array<double, 3>>& dirs) {
+    constexpr double EPS = 1e-10;
+    const std::size_t n_rays = origins.size();
+    const std::size_t n_tris = idx.size() / 3;
+    std::vector<double> dist(n_rays, std::numeric_limits<double>::infinity());
+
+    auto vtx = [&](uint32_t i, double out[3]) {
+        out[0] = pos[3 * i + 0];
+        out[1] = pos[3 * i + 1];
+        out[2] = pos[3 * i + 2];
+    };
+    auto cross = [](const double a[3], const double b[3], double o[3]) {
+        o[0] = a[1] * b[2] - a[2] * b[1];
+        o[1] = a[2] * b[0] - a[0] * b[2];
+        o[2] = a[0] * b[1] - a[1] * b[0];
+    };
+    auto dot = [](const double a[3], const double b[3]) {
+        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    };
+
+    // Precompute triangle edges (matches the oracle's V0/E1/E2 layout).
+    std::vector<std::array<double, 3>> V0(n_tris), E1(n_tris), E2(n_tris);
+    for (std::size_t t = 0; t < n_tris; ++t) {
+        double v0[3], v1[3], v2[3];
+        vtx(idx[3 * t + 0], v0);
+        vtx(idx[3 * t + 1], v1);
+        vtx(idx[3 * t + 2], v2);
+        V0[t] = {v0[0], v0[1], v0[2]};
+        E1[t] = {v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]};
+        E2[t] = {v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]};
+    }
+
+    for (std::size_t ri = 0; ri < n_rays; ++ri) {
+        const double d[3] = {dirs[ri][0], dirs[ri][1], dirs[ri][2]};
+        const double o[3] = {origins[ri][0], origins[ri][1], origins[ri][2]};
+        double best = std::numeric_limits<double>::infinity();
+        for (std::size_t t = 0; t < n_tris; ++t) {
+            const double e1[3] = {E1[t][0], E1[t][1], E1[t][2]};
+            const double e2[3] = {E2[t][0], E2[t][1], E2[t][2]};
+            double h[3];
+            cross(d, e2, h);
+            double a = dot(e1, h);
+            if (std::abs(a) <= EPS) continue;
+            double inv_a = 1.0 / a;
+            const double s[3] = {o[0] - V0[t][0], o[1] - V0[t][1], o[2] - V0[t][2]};
+            double u = inv_a * dot(s, h);
+            if (u < 0.0 || u > 1.0) continue;
+            double q[3];
+            cross(s, e1, q);
+            double v = inv_a * dot(q, d);
+            if (v < 0.0 || u + v > 1.0) continue;
+            double tval = inv_a * dot(e2, q);
+            if (tval > EPS && tval < best) best = tval;
+        }
+        dist[ri] = best;
+    }
+    return dist;
+}
+
+}  // namespace
+
+// engine/doc/evaluate.py::draft_field. Per-vertex draft angle = degrees(arcsin(clip(n·pull,
+// -1,1))) for the normalized vertex normal n and normalized pull. chunk name "draft".
+json doc_eval_draft(const std::string& doc_id, int body_id, const std::array<double, 3>& pull_in,
+                    double /*angle_deg*/) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    const TopoDS_Shape& shape = field_active_shape(r, doc_id, body_id);
+    const std::string name = (body_id >= 1 && body_id <= static_cast<int>(r.bodies_info.size()))
+                                 ? r.bodies_info[static_cast<std::size_t>(body_id - 1)].name
+                             : (!r.bodies_info.empty() ? r.bodies_info.back().name : std::string());
+    aicm::AicmBody body = field_tessellate(shape, name);
+
+    double pull[3] = {pull_in[0], pull_in[1], pull_in[2]};
+    double plen = std::sqrt(pull[0] * pull[0] + pull[1] * pull[1] + pull[2] * pull[2]);
+    double pinv = 1.0 / (plen + 1e-12);  // oracle: pull / (norm + 1e-12)
+    pull[0] *= pinv;
+    pull[1] *= pinv;
+    pull[2] *= pinv;
+
+    const std::size_t n = body.n_verts();
+    std::vector<float> values(n, 0.0f);
+    float vmin = std::numeric_limits<float>::infinity();
+    float vmax = -std::numeric_limits<float>::infinity();
+    bool any_finite = false;
+    for (std::size_t i = 0; i < n; ++i) {
+        double nrm[3];
+        field_vertex_normal(body, i, nrm);
+        double cos_t = nrm[0] * pull[0] + nrm[1] * pull[1] + nrm[2] * pull[2];
+        if (cos_t < -1.0) cos_t = -1.0;
+        if (cos_t > 1.0) cos_t = 1.0;
+        float draft = static_cast<float>(std::asin(cos_t) * (180.0 / 3.14159265358979323846));
+        values[i] = draft;
+        if (std::isfinite(draft)) {
+            any_finite = true;
+            vmin = std::min(vmin, draft);
+            vmax = std::max(vmax, draft);
+        }
+    }
+    if (!any_finite) {
+        vmin = -90.0f;
+        vmax = 90.0f;
+    }
+
+    auto chunk = aicm::scalar_chunk(body.body_id, "draft", values, vmin, vmax);
+    return json{{"aicm_path", field_write_temp_aicm(body, chunk)}};
+}
+
+// engine/doc/evaluate.py::curvature_field. Re-mesh (BRepMesh 0.1) to match the oracle's face
+// ordering, then per-vertex principal curvatures via BRepLProp_SLProps at the vertex's UV
+// (projected via ShapeAnalysis_Surface::ValueOfUV). kind: mean=(k1+k2)/2, gaussian=k1*k2,
+// max=max(|k1|,|k2|). chunk name "curvature_<kind>". Verts with no defined curvature stay NaN.
+json doc_eval_curvature(const std::string& doc_id, int body_id, const std::string& kind) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    const TopoDS_Shape& shape = field_active_shape(r, doc_id, body_id);
+    const std::string name = (body_id >= 1 && body_id <= static_cast<int>(r.bodies_info.size()))
+                                 ? r.bodies_info[static_cast<std::size_t>(body_id - 1)].name
+                             : (!r.bodies_info.empty() ? r.bodies_info.back().name : std::string());
+    aicm::AicmBody body = field_tessellate(shape, name);
+
+    const std::size_t n_verts = body.n_verts();
+    const float NaNf = std::numeric_limits<float>::quiet_NaN();
+    std::vector<float> values(n_verts, NaNf);
+
+    // Re-mesh + build the same 1-based face map tessellate_body used (the oracle remeshes
+    // raw at (0.1,False,0.5,True) before mapping faces — FaceRec.face_id is this 1-based idx).
+    BRepMesh_IncrementalMesh(shape, 0.1, Standard_False, 0.5, Standard_True).Perform();
+    TopTools_IndexedMapOfShape face_map;
+    TopExp::MapShapes(shape, TopAbs_FACE, face_map);
+
+    for (const aicm::FaceRec& fr : body.faces) {
+        const int fi = static_cast<int>(fr.face_id);  // 1-based into face_map
+        if (fi < 1 || fi > face_map.Extent() || fr.tri_count == 0) continue;
+        TopoDS_Face face = TopoDS::Face(face_map.FindKey(fi));
+        BRepAdaptor_Surface sa(face);
+
+        // Vertex set of this face = unique indices over its triangle range in the flat idx
+        // buffer ([first_tri*3 .. (first_tri+tri_count)*3)). Matches the oracle's
+        // np.unique(tess.idx[tri_start:tri_end]).
+        std::size_t lo = static_cast<std::size_t>(fr.first_tri) * 3;
+        std::size_t hi = static_cast<std::size_t>(fr.first_tri + fr.tri_count) * 3;
+        if (hi > body.idx.size()) hi = body.idx.size();
+
+        TopLoc_Location loc;
+        Handle(Geom_Surface) occ_surf = BRep_Tool::Surface(face, loc);
+        if (occ_surf.IsNull()) continue;
+        ShapeAnalysis_Surface sas(occ_surf);
+
+        double u_first = sa.FirstUParameter(), u_last = sa.LastUParameter();
+        double v_first = sa.FirstVParameter(), v_last = sa.LastVParameter();
+
+        std::set<uint32_t> seen;
+        for (std::size_t k = lo; k < hi; ++k) {
+            uint32_t vi = body.idx[k];
+            if (vi >= n_verts || !seen.insert(vi).second) continue;
+            gp_Pnt p3d(body.pos[3 * vi + 0], body.pos[3 * vi + 1], body.pos[3 * vi + 2]);
+            gp_Pnt2d uv = sas.ValueOfUV(p3d, 1e-3);
+            double u = std::max(u_first, std::min(u_last, uv.X()));
+            double v = std::max(v_first, std::min(v_last, uv.Y()));
+            try {
+                BRepLProp_SLProps sl(sa, u, v, 2, 1e-7);
+                if (sl.IsCurvatureDefined()) {
+                    double k1 = sl.MinCurvature();
+                    double k2 = sl.MaxCurvature();
+                    double val;
+                    if (kind == "gaussian")
+                        val = k1 * k2;
+                    else if (kind == "max")
+                        val = std::max(std::abs(k1), std::abs(k2));
+                    else
+                        val = (k1 + k2) / 2.0;
+                    values[vi] = static_cast<float>(val);
+                }
+            } catch (const Standard_Failure&) {
+            }
+        }
+    }
+
+    float vmin = 0.0f, vmax = 0.0f;
+    bool any = false;
+    for (float v : values) {
+        if (std::isfinite(v)) {
+            if (!any) {
+                vmin = vmax = v;
+                any = true;
+            } else {
+                vmin = std::min(vmin, v);
+                vmax = std::max(vmax, v);
+            }
+        }
+    }
+
+    auto chunk = aicm::scalar_chunk(body.body_id, "curvature_" + kind, values, vmin, vmax);
+    return json{{"aicm_path", field_write_temp_aicm(body, chunk)}};
+}
+
+// engine/doc/evaluate.py::thickness_field. Per-vertex inward-raycast wall thickness: from each
+// vertex offset 1e-3 along -normal, cast -normal and take the first re-intersection distance
+// (minus the offset). The oracle's primary path is trimesh BVH; we port the deterministic
+// Moller-Trumbore FALLBACK (_moller_trumbore_all). chunk name "thickness". NOTE: parity here is
+// PHYSICAL (a tolerance band), not bit-exact — the oracle's BVH runs on a divergent mesh.
+json doc_eval_thickness(const std::string& doc_id, int body_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    const TopoDS_Shape& shape = field_active_shape(r, doc_id, body_id);
+    const std::string name = (body_id >= 1 && body_id <= static_cast<int>(r.bodies_info.size()))
+                                 ? r.bodies_info[static_cast<std::size_t>(body_id - 1)].name
+                             : (!r.bodies_info.empty() ? r.bodies_info.back().name : std::string());
+    aicm::AicmBody body = field_tessellate(shape, name);
+
+    const std::size_t n = body.n_verts();
+    const float NaNf = std::numeric_limits<float>::quiet_NaN();
+    std::vector<float> values(n, NaNf);
+
+    constexpr double OFFSET = 1e-3;
+    std::vector<std::array<double, 3>> origins(n), dirs(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        double nrm[3];
+        field_vertex_normal(body, i, nrm);
+        origins[i] = {body.pos[3 * i + 0] - nrm[0] * OFFSET,
+                      body.pos[3 * i + 1] - nrm[1] * OFFSET,
+                      body.pos[3 * i + 2] - nrm[2] * OFFSET};
+        dirs[i] = {-nrm[0], -nrm[1], -nrm[2]};  // inward (unit, since normal is unit)
+    }
+
+    std::vector<double> hits = field_moller_trumbore_all(body.pos, body.idx, origins, dirs);
+
+    float vmin = 0.0f, vmax = 0.0f;
+    bool any = false;
+    for (std::size_t i = 0; i < n; ++i) {
+        double d = hits[i];
+        if (std::isfinite(d) && d > OFFSET) {
+            float t = static_cast<float>(d - OFFSET);
+            values[i] = t;
+            if (!any) {
+                vmin = vmax = t;
+                any = true;
+            } else {
+                vmin = std::min(vmin, t);
+                vmax = std::max(vmax, t);
+            }
+        }
+    }
+
+    auto chunk = aicm::scalar_chunk(body.body_id, "thickness", values, vmin, vmax);
+    return json{{"aicm_path", field_write_temp_aicm(body, chunk)}};
 }
 
 json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double distance,

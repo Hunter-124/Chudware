@@ -18,6 +18,7 @@
 // validation, and the owner_map topology are DEFERRED (owner_map returns {}).
 #pragma once
 
+#include <array>
 #include <stdexcept>
 #include <string>
 
@@ -161,6 +162,28 @@ nlohmann::json doc_eval_interference(const std::string& doc_id);
 // single-entity measure (length/radius/area/point/volume); 2 refs -> pair measure
 // (distance + optional angle). Throws OpError on no bodies / a dangling ref / a bad count.
 nlohmann::json doc_eval_measure(const std::string& doc_id, const nlohmann::json& refs);
+
+// Evaluate FIELD — per-vertex DRAFT-ANGLE field of the active body (port of evaluate.py::
+// draft_field via worker.py::_eval_draft). Tessellates the body, computes per-vertex
+// draft = degrees(arcsin(clip(n·pull,-1,1))), writes a SCLR "draft" chunk to a temp .aicm
+// file and returns {"aicm_path": <path>}. body_id 1-based, <=0 = LAST. `pull` is the
+// (unnormalized) pull direction; `angle_deg` is the informational draft threshold.
+nlohmann::json doc_eval_draft(const std::string& doc_id, int body_id,
+                              const std::array<double, 3>& pull, double angle_deg);
+
+// Evaluate FIELD — per-vertex CURVATURE field of the active body (port of evaluate.py::
+// curvature_field via worker.py::_eval_curvature). kind = "mean"|"gaussian"|"max". Re-meshes
+// + evaluates BRepLProp_SLProps at each vertex's projected UV; writes a SCLR "curvature_<kind>"
+// chunk to a temp .aicm and returns {"aicm_path": <path>}. body_id 1-based, <=0 = LAST.
+nlohmann::json doc_eval_curvature(const std::string& doc_id, int body_id,
+                                  const std::string& kind);
+
+// Evaluate FIELD — per-vertex WALL-THICKNESS field of the active body (port of evaluate.py::
+// thickness_field via worker.py::_eval_thickness). Inward-raycasts (-normal) from each vertex
+// via a Moller-Trumbore raycaster (the oracle's deterministic fallback); writes a SCLR
+// "thickness" chunk to a temp .aicm and returns {"aicm_path": <path>}. body_id 1-based, <=0 =
+// LAST. Parity is PHYSICAL (tolerance band), not bit-exact (oracle uses trimesh BVH).
+nlohmann::json doc_eval_thickness(const std::string& doc_id, int body_id);
 
 // Export the document's surviving solid bodies to `path` in `fmt` (step/iges/brep/stl)
 // via OCCT. Returns {"path": <abs>}. Throws OpError("export_failed") on no bodies / an

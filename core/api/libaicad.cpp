@@ -35,6 +35,7 @@
 #include "ecad/session.h"
 #include "geom/ecad_3d.h"
 #include "sim/fea_modal.h"
+#include "sim/fea_run.h"
 #include "sim/fea_static.h"
 #include "sim/lbm.h"
 #include "sim/mesher.h"
@@ -321,6 +322,24 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                              {"n_nodes", r.n_nodes},
                              {"n_elems", r.n_elems}},
                         out_json, 0);
+        }
+        if (m == "sim_run_static") {
+            // P50b: combined mesh + BC-resolve + linear-static solve (the glue on
+            // top of sim_mesh + sim_fea_static). Params: {"study": {...}} where the
+            // study is the host's shape — step_path|points/tets, density, material,
+            // fixtures:[{points,tol_mm}], loads:[{faces,type,vector|magnitude}].
+            // Returns {ok, displacement, disp_magnitude, von_mises, n_dof, summary,
+            // solver_notes}. (overlay/npz are display-only and out of scope here.)
+            const json& study = params.contains("study") ? params["study"] : json::object();
+            return emit(aicad::sim::fea_run_static(study), out_json, 0);
+        }
+        if (m == "sim_run_modal") {
+            // P50b: combined mesh + fixture-resolve + modal solve. Params:
+            // {"study": {...}, "n_modes": <int, default 6>}. Returns {ok, freqs_hz,
+            // mode_shapes, n_modes, n_nodes, n_dof}.
+            const json& study = params.contains("study") ? params["study"] : json::object();
+            int n_modes = params.value("n_modes", 6);
+            return emit(aicad::sim::fea_run_modal(study, n_modes), out_json, 0);
         }
         if (m == "doc_validate") {
             // DIAGNOSTIC: structural-validate a document tree (schema.validate_document

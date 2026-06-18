@@ -233,7 +233,11 @@ if(AICAD_WITH_OCCT)
   # (mesher.h is gmsh-free); aicad_mesh links the SDK import lib. The dynamic CRT
   # matches aicad_miniz / the DLL (same heap as the gmsh runtime).
   include(ProvisionGmsh)
-  add_library(aicad_mesh STATIC sim/mesher.cpp)
+  # P50b: sim/fea_run.cpp (the combined mesh+resolve+solve glue) joins the mesher
+  # target — it is the only sim source that needs the mesher, and adding it here
+  # keeps the gmsh confinement intact (fea_run.h itself is gmsh-free). aicad_mesh
+  # gains a PUBLIC dep on aicad_sim so fea_run.cpp can call the FEA solvers.
+  add_library(aicad_mesh STATIC sim/mesher.cpp sim/fea_run.cpp)
   target_include_directories(aicad_mesh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_include_directories(aicad_mesh PRIVATE ${GMSH_INCLUDE_DIR})
   # GMSH_DLL makes gmsh.h's GMSH_API decorate the prototypes __declspec(dllimport)
@@ -241,7 +245,7 @@ if(AICAD_WITH_OCCT)
   # lib propagates onto the final link line of the `aicad` DLL that consumes this
   # static lib (a STATIC lib's link deps aren't pulled in transitively otherwise).
   target_compile_definitions(aicad_mesh PRIVATE GMSH_DLL)
-  target_link_libraries(aicad_mesh PUBLIC ${GMSH_IMPORT_LIB})
+  target_link_libraries(aicad_mesh PUBLIC ${GMSH_IMPORT_LIB} aicad_sim nlohmann_json::nlohmann_json)
   set_property(TARGET aicad_mesh PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
   # Smoke test: box -> volume (BRepGProp) -> tessellation (BRepMesh). Proves the

@@ -22,6 +22,12 @@ extern const char* kDefaultLocalModel;     // "gemma-4-e4b"
 extern const char* kDefaultLocalBaseUrl;   // "http://localhost:1234/v1"
 extern const char* kOfflineSetting;        // "offline_mode"
 
+// Load the ambient user config (paths_config() == %APPDATA%/AI-CAD/config.json).
+// Mirrors agent/config.py load_config(): parse the file if it exists, returning {}
+// on a missing file or any parse error (never throws). This is the SAME config the
+// Python agent reads, so a config-resolved provider matches the Python behavior.
+json load_config();
+
 // bool(cfg.get("offline_mode", False)).
 bool offline_enabled(const json& cfg);
 

@@ -71,6 +71,43 @@ bool routeDocToCpp(const std::string& method, const json& params) {
     if (isMintingMethod(method, params)) return true;  // import_file minting a new doc
     return false;
 }
+// --- C++ AGENT routing (opt-in, default OFF) --------------------------------
+// Route the in-app AI-agent RPCs (agent_run_v2 / agent_ask_v2 / agent_pm_assist_v1 /
+// get_prompts_v2) to the pure-C++ core (libaicad) instead of the Python worker. This
+// MIRRORS the doc_* seam but is DEFAULT OFF: unless AI_CAD_CPP_AGENT is set (and != "0")
+// the app behaves byte-for-byte as today (every agent call goes to the Python worker).
+// The legacy agent_design loop is NOT routed (stays Python). The C++ agent drives a
+// C++-backed ("doc-cpp") doc session, so we only route when the active doc is C++-backed;
+// a Python doc (e.g. an assembly) falls through to Python.
+bool cppAgentFlag() {
+    const char* f = std::getenv("AI_CAD_CPP_AGENT");
+    return f && f[0] && f[0] != '0';  // explicit opt-in only (default OFF)
+}
+
+// Is the active document a C++-backed ("doc-cpp") session? For agent_run_v2 /
+// agent_ask_v2 the host passes the active doc_id directly in params; agent_pm_assist_v1
+// carries it too. get_prompts_v2 has no doc and is always safe to route (read-only).
+bool agentDocIsCpp(const std::string& method, const json& params) {
+    if (method == "get_prompts_v2") return true;  // doc-independent (prompt catalog)
+    if (!params.is_object()) return false;
+    auto it = params.find("doc_id");
+    if (it == params.end() || !it->is_string()) return false;
+    return it->get<std::string>().rfind("doc-cpp", 0) == 0;
+}
+
+bool routeAgentToCpp(const std::string& method, const json& params) {
+    if (!cppAgentFlag()) return false;
+    if (!(method == "agent_run_v2" || method == "agent_ask_v2" ||
+          method == "agent_pm_assist_v1" || method == "get_prompts_v2"))
+        return false;  // agent_design (legacy) + everything else stays Python
+    if (!agentDocIsCpp(method, params)) return false;  // only C++-backed docs (or doc-indep)
+    // Ensure the core DLL is loadable before committing to the C++ path. ensureLoaded is
+    // idempotent (loads once); if it can't load, fall through to the Python worker so the
+    // agent never hard-breaks. For a doc-cpp doc the DLL is already loaded (it minted the
+    // doc); for get_prompts_v2 this triggers the lazy load on first use.
+    std::string lerr;
+    return core::cpp_core().ensureLoaded(lerr);
+}
 std::wstring widen(const std::string& s) {
     if (s.empty()) return L"";
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
@@ -224,6 +261,67 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
     if (abort_.load()) {  // C39: app is tearing down — intentional, no errorSink toast
         err = "aborted";
         return false;
+    }
+    // C++ AGENT routing (opt-in via AI_CAD_CPP_AGENT, default OFF). Translate the in-app
+    // agent RPCs to the libaicad agent methods and run them in-process. Default OFF =>
+    // routeAgentToCpp() returns false and this whole block is skipped (today's behavior).
+    if (routeAgentToCpp(method, params)) {
+        std::string cerr;
+        json cppResult;
+        bool ok = false;
+        if (method == "agent_run_v2") {
+            // {request, doc_id, ...} -> agent_run {request, doc_id, options:<passthrough>}.
+            // The C++ core resolves the provider from config.json and picks micro vs design.
+            json p = {{"request", params.value("request", std::string())},
+                      {"doc_id", params.value("doc_id", std::string())}};
+            // Pass through any run options the host may carry (budgets/run_id/control).
+            json options = json::object();
+            for (const char* k : {"options", "budgets", "run_id", "control"}) {
+                auto it = params.find(k);
+                if (it != params.end()) {
+                    if (std::string(k) == "options" && it->is_object()) options = *it;
+                    else options[k] = *it;
+                }
+            }
+            if (!options.empty()) p["options"] = options;
+            ok = core::cpp_core().call("agent_run", p, cppResult, cerr);
+            // Replay captured events through onEvent so the Copilot/Activity pane updates.
+            // (Batched after the run for this opt-in v1 — live streaming is a later step.)
+            if (ok && onEvent && cppResult.is_object() && cppResult.contains("events") &&
+                cppResult["events"].is_array()) {
+                for (const auto& ev : cppResult["events"]) onEvent(ev);
+            }
+        } else if (method == "agent_ask_v2") {
+            // {question, doc_id, ...} -> agent_answer_question {question, doc_id}.
+            json p = {{"question", params.value("question", std::string())},
+                      {"doc_id", params.value("doc_id", std::string())}};
+            ok = core::cpp_core().call("agent_answer_question", p, cppResult, cerr);
+        } else if (method == "agent_pm_assist_v1") {
+            // The host's PM payload (doc_id, intent, form_schema, current, selected_refs)
+            // IS the params object the C++ assist expects under "params".
+            json p = {{"params", params}, {"doc_id", params.value("doc_id", std::string())}};
+            ok = core::cpp_core().call("agent_pm_assist", p, cppResult, cerr);
+            // C++ returns {validated:{...}}; the host consumes the assist result object
+            // directly (patches/activate_well/...). Unwrap so the caller sees the same
+            // shape the Python agent_pm_assist_v1 returns.
+            if (ok && cppResult.is_object() && cppResult.contains("validated"))
+                cppResult = cppResult["validated"];
+        } else if (method == "get_prompts_v2") {
+            // -> agent_get_prompts_v2 {} (C++ default/env resolves the prompts dir).
+            ok = core::cpp_core().call("agent_get_prompts_v2", json::object(), cppResult, cerr);
+        }
+        if (ok) {
+            result = std::move(cppResult);
+            return true;
+        }
+        // C++ reported a structured error: surface it like the doc path (round-trip OK).
+        if (cppResult.is_object() && cppResult.contains("code")) {
+            result = cppResult;
+            err = cppResult.value("message", std::string("cpp-agent error"));
+            return true;
+        }
+        // Hard failure (DLL throw / load race): do NOT hard-break the agent — fall through
+        // to the Python worker path below so the in-app AI keeps working.
     }
     // P16: route C++-backed documents to the in-process core (libaicad) instead of the
     // Python worker. All-or-nothing per document (NO mid-doc Python fallback — Python

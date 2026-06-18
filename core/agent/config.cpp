@@ -5,6 +5,10 @@
 #include <array>
 #include <cctype>
 #include <cstdlib>
+#include <fstream>
+#include <sstream>
+
+#include "agent/paths.h"
 
 namespace aicad {
 namespace agent {
@@ -12,6 +16,25 @@ namespace agent {
 const char* kDefaultLocalModel = "gemma-4-e4b";
 const char* kDefaultLocalBaseUrl = "http://localhost:1234/v1";
 const char* kOfflineSetting = "offline_mode";
+
+// load_config — mirror agent/config.py load_config(): read paths_config()
+// (%APPDATA%/AI-CAD/config.json) and parse it. Returns {} on a missing file or any
+// parse error (matching the Python try/except that swallows failures).
+json load_config() {
+    std::error_code ec;
+    auto p = paths_config();
+    if (!std::filesystem::exists(p, ec)) return json::object();
+    try {
+        std::ifstream fh(p, std::ios::binary);
+        if (!fh) return json::object();
+        std::ostringstream ss;
+        ss << fh.rdbuf();
+        json j = json::parse(ss.str());
+        return j.is_object() ? j : json::object();
+    } catch (...) {
+        return json::object();
+    }
+}
 
 namespace {
 

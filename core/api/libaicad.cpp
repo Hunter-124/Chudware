@@ -164,6 +164,52 @@ int handle_compile(const json& params, char** out_json) {
                 out_json, 0);
 }
 
+// P54b host-ergonomics: when an assist caller (agent_answer_question / agent_pm_assist)
+// passes a live C++ doc_id but omits the explicit doc / revision / feature_status, read
+// them from that live session so the host can send just {question|params, doc_id}. The
+// existing explicit-params path (the gates pass doc/revision/feature_status inline) is
+// untouched: each field is filled ONLY when absent. doc_id "?" / empty / not a live
+// session leaves everything as-is (the gate behavior). Best-effort — any failure to read
+// the session is swallowed so the assist still runs from whatever was provided.
+//   `op` is the ordered_json params; mutated in place. `doc_id` is the resolved id.
+void hydrate_assist_from_session(nlohmann::ordered_json& op, const std::string& doc_id) {
+    using ojson = nlohmann::ordered_json;
+    if (doc_id.empty() || doc_id == "?") return;
+    const bool need_doc = !op.contains("doc") || op["doc"].is_null();
+    const bool need_rev = !(op.contains("revision") && op["revision"].is_number());
+    const bool need_fs = !op.contains("feature_status");
+    if (!need_doc && !need_rev && !need_fs) return;
+    try {
+        // doc_tree -> {revision, tree}. Throws OpError for an unknown doc.
+        json t = aicad::doc::doc_tree(doc_id);
+        if (need_doc && t.contains("tree"))
+            op["doc"] = ojson::parse(t["tree"].dump());
+        if (need_rev && t.contains("revision") && t["revision"].is_number())
+            op["revision"] = t["revision"].get<long>();
+        if (need_fs) {
+            // feature_status lives in the rebuild response (doc_rebuild forces a
+            // recompile without bumping the revision).
+            json rb = aicad::doc::doc_rebuild(doc_id);
+            if (rb.contains("rebuild") && rb["rebuild"].contains("feature_status"))
+                op["feature_status"] = ojson::parse(rb["rebuild"]["feature_status"].dump());
+        }
+    } catch (...) {
+        // Unknown/closed doc or read failure: leave op untouched (run from provided data).
+    }
+}
+
+// P54b host-ergonomics: resolve the assist provider from the ambient config.json when
+// the caller did not pass one (the host sends bare {question|params, doc_id}). Returns
+// the descriptor to feed make_assist_provider. On a config-provider refusal/resolution
+// failure, returns {error:...} (the caller may surface it). The gates always pass an
+// explicit provider, so this fallback never runs under them.
+nlohmann::json resolve_assist_provider(const nlohmann::json& params) {
+    if (params.contains("provider") && !params["provider"].is_null())
+        return params["provider"];  // explicit (gate mock / host override)
+    json cfg = aicad::agent::load_config();
+    return aicad::agent::resolve_provider(std::nullopt, cfg, nlohmann::json::object());
+}
+
 }  // namespace
 
 extern "C" {
@@ -568,6 +614,62 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             result["events"] = captured;
             return emit(std::move(result), out_json, 0);
         }
+        if (m == "agent_run") {
+            // HOST-ERGONOMIC entry: {request, doc_id, options?, provider?}.
+            // The host sends just {request, doc_id}; the core resolves everything:
+            //   1) provider — if params.provider is absent/empty, resolve from the
+            //      ambient config.json (load_config) via resolve_provider, honoring
+            //      offline mode (resolve_provider returns {error} on a refusal). An
+            //      explicit provider descriptor (the gates' mock) is passed through.
+            //   2) micro-vs-design — should_engage(resolved-provider-cfg, cfg) picks
+            //      run_micro_design vs run_design.
+            // Returns the RunResult + events:[...], OR {ok:false, error} on a provider
+            // refusal/resolution failure (no run started).
+            std::string request = params.value("request", std::string());
+            std::string doc_id = params.value("doc_id", std::string());
+            json options = params.contains("options") ? params["options"] : json::object();
+
+            // ---- provider resolution ----
+            json provider;
+            const bool explicit_provider = params.contains("provider") &&
+                                           params["provider"].is_object() &&
+                                           !params["provider"].empty();
+            json cfg = aicad::agent::load_config();
+            if (explicit_provider) {
+                provider = params["provider"];  // pass-through (gate mock / host override)
+            } else {
+                // Resolve from config.json over the live process env (the same inputs
+                // the Python agent uses). resolve_provider applies the offline guard.
+                json resolved = aicad::agent::resolve_provider(std::nullopt, cfg, json::object());
+                if (resolved.is_object() && resolved.contains("error")) {
+                    return emit(json{{"ok", false},
+                                     {"error", resolved.value("error", std::string("provider resolution failed"))}},
+                                out_json, 0);
+                }
+                provider = resolved;
+            }
+
+            // ---- micro vs design ----
+            // should_engage reads provider.{name,base_url,context_tokens} + cfg
+            // .{micro_mode,context_tokens}. The resolved descriptor carries name/
+            // base_url; cfg is the ambient config.json (so micro_mode is honored).
+            bool micro = aicad::agent::should_engage(provider, cfg);
+
+            auto captured = std::make_shared<json>(json::array());
+            json result;
+            if (micro) {
+                aicad::agent::EmitFnMicro cb = [captured](const json& ev) {
+                    captured->push_back(ev);
+                };
+                result = aicad::agent::run_micro_design(request, doc_id, provider, cb, options);
+            } else {
+                aicad::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
+                result = aicad::agent::run_design(request, doc_id, provider, cb, options);
+            }
+            result["events"] = *captured;
+            result["engaged"] = micro ? "micro" : "design";  // diagnostic: which profile ran
+            return emit(std::move(result), out_json, 0);
+        }
         if (m == "agent_run_design") {
             // LIVE end-to-end run: {request, doc_id, provider:{...}, options?} ->
             // {run_id, status, stop_reason, revision, doc_id, events:[...]}. The
@@ -689,14 +791,23 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             using ojson = nlohmann::ordered_json;
             ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
             std::string question = op.value("question", std::string());
-            ojson doc = op.contains("doc") ? op["doc"] : ojson(nullptr);
             std::string doc_id = op.value("doc_id", std::string("?"));
+            // P54b host-ergonomics: hydrate doc/revision/feature_status from the live
+            // C++ session when not passed explicitly (host sends just {question, doc_id}).
+            hydrate_assist_from_session(op, doc_id);
+            ojson doc = op.contains("doc") ? op["doc"] : ojson(nullptr);
             long rev = op.contains("revision") && op["revision"].is_number()
                            ? op["revision"].get<long>()
                            : 0;
             ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
-            // Mock provider: scripted replies (flat list) or by_role routing.
-            json prov = params.contains("provider") ? params["provider"] : json::object();
+            // Provider: explicit descriptor (gate mock) OR resolved from config.json when
+            // the host omits it. On an offline refusal, answer with a clear note.
+            json prov = resolve_assist_provider(params);
+            if (prov.is_object() && prov.contains("error")) {
+                return emit(json{{"answer", std::string("I can't answer that right now: ") +
+                                                prov.value("error", std::string("provider unavailable"))}},
+                            out_json, 0);
+            }
             auto provider = aicad::agent::make_assist_provider(prov);
             std::string answer = aicad::agent::answer_question(
                 question, doc, doc_id, rev, fs,
@@ -755,16 +866,27 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             using ojson = nlohmann::ordered_json;
             ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
             ojson prm = op.contains("params") ? op["params"] : ojson::object();
-            ojson doc = op.contains("doc") ? op["doc"] : ojson(nullptr);
             std::string doc_id = op.value("doc_id", std::string("?"));
+            // P54b host-ergonomics: hydrate doc/revision/feature_status from the live
+            // C++ session when not passed explicitly (host sends just {params, doc_id}).
+            hydrate_assist_from_session(op, doc_id);
+            ojson doc = op.contains("doc") ? op["doc"] : ojson(nullptr);
             long rev = op.contains("revision") && op["revision"].is_number()
                            ? op["revision"].get<long>()
                            : 0;
             ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
-            json prov = params.contains("provider") ? params["provider"] : json::object();
-            bool has_provider = params.contains("provider") && !params["provider"].is_null();
+            // Provider: explicit descriptor (gate path) OR resolved from config.json when
+            // the host omits it. An EXPLICIT descriptor is always honored as-is (the gate's
+            // {error:"boom"} mock signals a provider that raises — NOT a config refusal). On
+            // the config-fallback path, a refusal/resolution failure ({error}) or an empty
+            // descriptor leaves cb=nullptr so assist falls back to its heuristic plan.
+            bool has_explicit = params.contains("provider") && !params["provider"].is_null();
             aicad::agent::PmCompleteFn cb = nullptr;
-            if (has_provider) {
+            json prov = has_explicit ? params["provider"] : resolve_assist_provider(params);
+            bool usable = has_explicit
+                              ? !prov.is_null()
+                              : (prov.is_object() && !prov.contains("error") && !prov.empty());
+            if (usable) {
                 auto provider = aicad::agent::make_assist_provider(prov);
                 cb = [provider](const std::string& sys, const std::string& body,
                                 std::string* err) { return provider(sys, body, err); };

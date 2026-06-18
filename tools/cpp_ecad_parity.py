@@ -1967,16 +1967,16 @@ def main() -> int:
     cmp_to_3d_doc("rect+fp+via", to3d_batch)
 
     # 26e ecad_simulate: the schematic->SPICE translation (netlist_to_spice_circuit).
-    #     FLAGGED GAP: the oracle resolves each component's sim model from the STARTER
-    #     SYMBOL library (engine/ecad/library/starter.py SYMBOLS[libid].sim) when the
-    #     component carries no inline "sim"; that symbol sim-library is NOT ported to the
-    #     C++ core (core/ecad/library.cpp ports only footprints). engine.ecad.netlist's
-    #     build_netlist does NOT carry "sim" onto components, so a schematic doc's
-    #     ecad_simulate on the C++ side yields an EMPTY circuit (-> {ok:false}).
+    #     The oracle resolves each component's sim model from the STARTER SYMBOL library
+    #     (engine/ecad/library/starter.py SYMBOLS[libid].sim) when the component carries
+    #     no inline "sim". That symbol sim-table is NOW ported to the C++ core
+    #     (core/sim/netlist.cpp::symbol_sim_table — the `sim` dict + pin name->number map
+    #     for every SYMBOLS entry that has a `sim` field), so a LIBRARY-ONLY schematic
+    #     (no inline sim) resolves identically on both engines.
     #
-    #     What IS ported + gated here: netlist_to_spice_circuit for components carrying an
-    #     INLINE "sim" mapping (the realistic agent/recipe path), + the full MNA simulate.
-    #     We feed an identical netlist dict (with inline sim) to BOTH engines'
+    #     Gated here: netlist_to_spice_circuit for (a) components carrying an INLINE "sim"
+    #     mapping (proves inline precedence) and (b) LIBRARY-ONLY components resolved by
+    #     libid, + the full MNA simulate. We feed identical netlist dicts to BOTH engines'
     #     netlist_to_spice_circuit, compare the Circuit + warnings, then run BOTH simulators
     #     and compare node voltages within the established spice rel tol.
     from engine.sim.spice import netlist_to_spice_circuit as _py_nl2c  # noqa: E402
@@ -2069,13 +2069,57 @@ def main() -> int:
     dnp_nl["components"][1]["dnp"] = True
     cmp_nl2c("divider dnp-skip", dnp_nl)
     # 26e-iii a component with no inline sim AND a libid absent from the starter SYMBOL
-    #         library -> BOTH engines emit "no sim model — skipped" (the only nosim case
-    #         where the engines agree, since the SYMBOLS-library fallback is NOT ported —
-    #         the FLAGGED gap; a libid the library DOES know would resolve on Python only).
+    #         library -> BOTH engines emit "no sim model — skipped".
     nosim_nl = _sim_netlist_divider()
     del nosim_nl["components"][2]["sim"]
     nosim_nl["components"][2]["libid"] = "NoSuchLib:NoSuchPart"
     cmp_nl2c("divider nosim-skip(unknown libid)", nosim_nl)
+
+    # 26e-iv LIBRARY-ONLY divider: NO inline "sim" on any component — every model spec +
+    #        pin_order resolves from the starter SYMBOL library (Device:R [1,2],
+    #        Simulation_SPICE:V_source [+,-]) on BOTH engines (the P55f port). V1's pins are
+    #        keyed by the symbol's pin names ("+"/"-") since its library pin_order is name-
+    #        based. Same Circuit + op-point voltages must come out of both engines.
+    lib_divider = {
+        "components": [
+            {"ref": "V1", "libid": "Simulation_SPICE:V_source", "value": "5", "dnp": False,
+             "pins": {"+": "VIN", "-": "0"}},
+            {"ref": "R1", "libid": "Device:R", "value": "10k", "dnp": False,
+             "pins": {"1": "VIN", "2": "MID"}},
+            {"ref": "R2", "libid": "Device:R", "value": "10k", "dnp": False,
+             "pins": {"1": "MID", "2": "0"}},
+        ],
+        "nets": {}, "by_pin": {}, "warnings": [],
+    }
+    cmp_simulate("divider op (library-only)", lib_divider, op_study)
+
+    # 26e-v precedence: a LIBRARY-ONLY component whose libid resolves to a DIFFERENT
+    #        model than an (intentionally wrong) inline sim would — prove the inline sim
+    #        wins. R1 carries an inline sim {model:C} (capacitor) while its libid Device:R
+    #        would resolve to {model:R}. Both engines must honour the inline sim (kind 'C').
+    prec_nl = _sim_netlist_divider()
+    prec_nl["components"][1]["sim"] = {"model": "C", "pin_order": ["1", "2"]}
+    cmp_nl2c("inline-sim precedence over libid", prec_nl)
+
+    # 26e-vi LIBRARY-ONLY diode + BJT + L: a single-source loop using starter symbols with
+    #        NO inline sim — exercises pin-NAME pin_order (Device:D [A,K]) + value folding +
+    #        the model-kind map (D->D). Circuit/devices/warnings must match the oracle.
+    diode_nl = {
+        "components": [
+            {"ref": "V1", "libid": "Simulation_SPICE:V_source", "value": "5", "dnp": False,
+             "pins": {"+": "VIN", "-": "0"}},
+            {"ref": "R1", "libid": "Device:R", "value": "1k", "dnp": False,
+             "pins": {"1": "VIN", "2": "A"}},
+            {"ref": "D1", "libid": "Device:D", "value": "D", "dnp": False,
+             "pins": {"A": "A", "K": "0"}},
+            {"ref": "Q1", "libid": "Device:Q_NPN", "value": "Q", "dnp": False,
+             "pins": {"B": "A", "C": "VIN", "E": "0"}},
+            {"ref": "L1", "libid": "Device:L", "value": "10u", "dnp": False,
+             "pins": {"1": "VIN", "2": "0"}},
+        ],
+        "nets": {}, "by_pin": {}, "warnings": [],
+    }
+    cmp_nl2c("library-only diode+bjt+L (pin-name order)", diode_nl)
 
     print(f"\n[ecad-parity] {total - mism}/{total} steps at full parity")
     return mism

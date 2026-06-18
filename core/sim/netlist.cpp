@@ -888,6 +888,85 @@ std::string model_to_kind(const std::string& model_name, const std::string& ref)
     return "X";
 }
 
+// ---------------------------------------------------------------------------
+// Starter SYMBOL sim-library port  (engine/ecad/library/starter.py SYMBOLS[].sim)
+//
+// The Python oracle, when a component carries no inline "sim", falls back to the
+// starter symbol library: it reads SYMBOLS[libid]["sim"] for the SPICE model spec
+// and builds a pin-name->pin-number map from SYMBOLS[libid]["pins"] (used when a
+// sim.pin_order entry is a pin NAME rather than a number-keyed netlist pin).
+//
+// That table is reproduced here as a self-contained map so aicad_sim stays free of
+// any dependency on aicad_ecad (aicad_ecad already depends on aicad_sim — adding
+// the reverse edge would be a cycle). Only the two fields the resolver consumes are
+// ported: the `sim` dict and the pin name->number map. Every SYMBOLS entry that has
+// a `sim` field is covered (R/C/C_pol/L/D/LED/Zener/Q_NPN/Q_PNP/NMOS/PMOS/OPAMP_dual/
+// NE555/power-rails/V_source/I_source/Switch).
+struct SymbolSim {
+    json sim;                                       // SYMBOLS[libid]["sim"]
+    std::vector<std::pair<std::string, std::string>> name_to_num;  // pin name -> number
+};
+
+const std::map<std::string, SymbolSim>& symbol_sim_table() {
+    static const std::map<std::string, SymbolSim> t = [] {
+        std::map<std::string, SymbolSim> m;
+        // Two-terminal passives: pins numbered "1"/"2", both named "~".
+        json rc_order = json::array({"1", "2"});
+        m["Device:R"]     = {json{{"model", "R"}, {"pin_order", rc_order}}, {{"~", "2"}}};
+        m["Device:C"]     = {json{{"model", "C"}, {"pin_order", rc_order}}, {{"~", "2"}}};
+        m["Device:C_pol"] = {json{{"model", "C"}, {"pin_order", rc_order}}, {{"+", "1"}, {"-", "2"}}};
+        m["Device:L"]     = {json{{"model", "L"}, {"pin_order", rc_order}}, {{"~", "2"}}};
+        // Diodes: pins numbered "K"/"A" (number == name), pin_order [A, K].
+        json d_order = json::array({"A", "K"});
+        m["Device:D"]     = {json{{"model", "D"}, {"pin_order", d_order}}, {{"K", "K"}, {"A", "A"}}};
+        m["Device:LED"]   = {json{{"model", "D"}, {"pin_order", d_order}}, {{"K", "K"}, {"A", "A"}}};
+        m["Device:Zener"] = {json{{"model", "D"}, {"pin_order", d_order}}, {{"K", "K"}, {"A", "A"}}};
+        // BJTs: pins numbered "B"/"C"/"E" (number == name), pin_order [B, C, E].
+        json q_order = json::array({"B", "C", "E"});
+        m["Device:Q_NPN"] = {json{{"model", "NPN"}, {"pin_order", q_order}},
+                             {{"B", "B"}, {"C", "C"}, {"E", "E"}}};
+        m["Device:Q_PNP"] = {json{{"model", "PNP"}, {"pin_order", q_order}},
+                             {{"B", "B"}, {"C", "C"}, {"E", "E"}}};
+        // MOSFETs: pins numbered "G"/"D"/"S" (number == name), pin_order [G, D, S].
+        json fet_order = json::array({"G", "D", "S"});
+        m["Device:NMOS"] = {json{{"model", "NMOS"}, {"pin_order", fet_order}},
+                            {{"G", "G"}, {"D", "D"}, {"S", "S"}}};
+        m["Device:PMOS"] = {json{{"model", "PMOS"}, {"pin_order", fet_order}},
+                            {{"G", "G"}, {"D", "D"}, {"S", "S"}}};
+        // Dual op-amp: number-keyed pins (1,2,3,5,6,7,8,4) with NAMEd pin_order.
+        // name->number from the symbol's pins (later pins win on duplicate names,
+        // mirroring Python's dict build order: unit2 IN-/IN+/OUT, then V+/V-).
+        m["Amplifier_Operational:OPAMP_dual"] = {
+            json{{"model", "OPAMP"},
+                 {"pin_order", json::array({"IN+", "IN-", "V+", "V-", "OUT"})}},
+            {{"IN-", "5"}, {"IN+", "6"}, {"OUT", "7"}, {"V+", "8"}, {"V-", "4"}}};
+        // NE555 SUBCKT: number-keyed pins 1..8 with NAMEd pin_order.
+        m["Timer:NE555"] = {
+            json{{"model", "SUBCKT"},
+                 {"subckt", "NE555"},
+                 {"pin_order", json::array({"GND", "TRIG", "OUT", "RST", "CV", "THR", "DIS", "VCC"})}},
+            {{"GND", "1"}, {"TRIG", "2"}, {"OUT", "3"}, {"RST", "4"},
+             {"CV", "5"}, {"THR", "6"}, {"DIS", "7"}, {"VCC", "8"}}};
+        // Power rails: single pin "1"; sim has only a model marker (skipped silently).
+        m["power:GND"]  = {json{{"model", "GND"}},  {{"GND", "1"}}};
+        m["power:VCC"]  = {json{{"model", "VCC"}},  {{"VCC", "1"}}};
+        m["power:+5V"]  = {json{{"model", "+5V"}},  {{"+5V", "1"}}};
+        m["power:+3V3"] = {json{{"model", "+3V3"}}, {{"+3V3", "1"}}};
+        m["power:-5V"]  = {json{{"model", "-5V"}},  {{"-5V", "1"}}};
+        // Sources: number-keyed pins "+"/"-" (number == name), pin_order [+, -].
+        json src_order = json::array({"+", "-"});
+        m["Simulation_SPICE:V_source"] = {json{{"model", "V"}, {"pin_order", src_order}},
+                                          {{"+", "+"}, {"-", "-"}}};
+        m["Simulation_SPICE:I_source"] = {json{{"model", "I"}, {"pin_order", src_order}},
+                                          {{"+", "+"}, {"-", "-"}}};
+        // SPST switch: pins "1"/"2", names A/B, pin_order [1, 2].
+        m["Device:Switch"] = {json{{"model", "S"}, {"pin_order", rc_order}},
+                              {{"A", "1"}, {"B", "2"}}};
+        return m;
+    }();
+    return t;
+}
+
 // spice._resolve_subckt_name: pick the built-in subckt name for a SUBCKT/OPAMP part.
 std::string resolve_subckt_name(const std::string& model_name, const json& sim) {
     if (model_name == "OPAMP") return "OPAMP";
@@ -954,10 +1033,13 @@ json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
             continue;
         }
 
-        // Resolve sim dict — prefer one carried on the component. The SYMBOLS-library
-        // fallback (by libid) is NOT ported (see header) -> skip with the oracle's
-        // exact "no sim model — skipped" wording.
+        // Resolve sim dict — prefer one carried on the component, then fall back to the
+        // starter SYMBOL library (symbol_sim_table) by libid, EXACTLY as the oracle does
+        // (engine/sim/spice.py: comp.get("sim") or SYMBOLS[libid]["sim"]).
+        const std::map<std::string, SymbolSim>& sym_tbl = symbol_sim_table();
+        auto sym_it = sym_tbl.find(libid);
         json sim = comp.contains("sim") && comp["sim"].is_object() ? comp["sim"] : json(nullptr);
+        if (sim.is_null() && sym_it != sym_tbl.end()) sim = sym_it->second.sim;
         if (sim.is_null()) {
             warn_msgs.push_back(ref + " (" + libid + "): no sim model — skipped");
             continue;
@@ -976,10 +1058,13 @@ json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
                 pin_order.push_back(po.is_string() ? po.get<std::string>() : po.dump());
 
         // A sim.pin_order entry may be a pin NUMBER (matching the number-keyed netlist
-        // pins) OR a pin NAME. The Python oracle builds name->number from the SymbolDef;
-        // here the component may carry an optional "pin_name_to_number" map (the
-        // SYMBOLS library is not ported). Absent the map, only number entries resolve.
+        // pins) OR a pin NAME. The Python oracle builds name->number from the SymbolDef
+        // (SYMBOLS[libid]["pins"]); reproduce that from the symbol_sim_table. A component
+        // may ALSO carry an optional "pin_name_to_number" override (applied on top, for
+        // libids the starter library doesn't know).
         std::map<std::string, std::string> name_to_num;
+        if (sym_it != sym_tbl.end())
+            for (const auto& kv : sym_it->second.name_to_num) name_to_num[kv.first] = kv.second;
         if (comp.contains("pin_name_to_number") && comp["pin_name_to_number"].is_object())
             for (auto it = comp["pin_name_to_number"].begin();
                  it != comp["pin_name_to_number"].end(); ++it)

@@ -23,18 +23,19 @@ nlohmann::json parse_netlist(const std::string& text);
 // Map a schematic netlist (engine/ecad/netlist.py::build_netlist output, per
 // netlist.md §1) into a (Circuit, warnings) pair — C++ port of
 // engine/sim/spice.py::netlist_to_spice_circuit. Each component that carries a
-// "sim" mapping is converted to a Device; nodes are ordered by sim["pin_order"]
-// (a pin-NAME entry resolves against the number-keyed netlist pins via the
-// component's optional "pin_name_to_number" map); net "GND"/"0" -> node "0".
+// "sim" mapping (OR resolvable from the starter SYMBOL library by libid) is
+// converted to a Device; nodes are ordered by sim["pin_order"] (a pin-NAME entry
+// resolves against the number-keyed netlist pins via the symbol's name->number map,
+// or the component's optional "pin_name_to_number" override); net "GND"/"0" -> "0".
 // SUBCKT/OPAMP-backed parts emit an X instance expanded against the built-in
 // subckt library. `sim_params` is folded into Circuit["params"].
 //
-// IMPORTANT (parity scope): the Python oracle, when a component has no inline
-// "sim", falls back to the STARTER SYMBOL LIBRARY (engine/ecad/library/starter.py
-// SYMBOLS[libid].sim). That symbol-library sim table is NOT ported to the C++
-// core (core/ecad/library.cpp ports only footprints), so a component WITHOUT an
-// inline "sim" yields a "no sim model — skipped" warning here. Callers that need
-// library-resolved sim models must carry the resolved "sim" on the component.
+// Sim-model resolution mirrors the Python oracle exactly: an INLINE "sim" mapping
+// on the component takes precedence; absent that, the component's sim model is
+// resolved from the starter SYMBOL library (engine/ecad/library/starter.py
+// SYMBOLS[libid].sim), ported to core/sim/netlist.cpp::symbol_sim_table(). A
+// component with neither an inline sim nor a known libid yields the oracle's exact
+// "no sim model — skipped" warning.
 //
 // Returns {"circuit": <Circuit dict>, "warnings": [ ... ]}.
 nlohmann::json netlist_to_spice_circuit(const nlohmann::json& netlist,

@@ -946,6 +946,92 @@ def main() -> int:
         vb = float(np.max(np.abs(np.asarray(rcpp["tran"]["traces"]["V(B)"]))))
         print(f"  {'T tran matched line':<24} MATCH  ({len(tc)} pts, |V(B)|max={vb:.4g})")
 
+    # ---- numpy RNG bit-parity proof (drives the Monte-Carlo "mc" analysis). The C++
+    # NumpyGenerator (core/sim/numpy_rng.{h,cpp}) replicates SeedSequence + PCG64 +
+    # standard_normal bit-for-bit; assert its draw sequence == np.random.default_rng(seed)
+    # .standard_normal(size=K) for several seeds. Equal to FP repr (rel 1e-15 / atol 1e-300).
+    K = 20
+    for seed in (0, 1, 42, 12345, 2**32 - 1, 2**32 + 7, 987654321):
+        checks += 1
+        exp = np.random.default_rng(seed).standard_normal(size=K)
+        rc, rcpp = core.call("sim_numpy_normal", {"seed": seed, "n": K})
+        got = np.asarray(rcpp.get("draws", []), dtype=np.float64)
+        diffs = []
+        if got.shape != exp.shape:
+            diffs.append(f"len {got.shape}!={exp.shape}")
+        else:
+            dmax = float(np.max(np.abs(got - exp))) if K else 0.0
+            # bit-exact: identical float64 values -> dmax is exactly 0.0
+            if not np.array_equal(got, exp):
+                diffs.append(f"max|d|={dmax:.3e} (NOT bit-exact)")
+        if diffs:
+            print(f"  {('rng seed=' + str(seed)):<24} DIFF: {'; '.join(diffs)[:90]}")
+            mism += 1
+        else:
+            print(f"  {('rng seed=' + str(seed)):<24} MATCH  (bit-exact {K} draws)")
+
+    # ---- Monte-Carlo end-to-end (mc): RC divider, perturb R by 1% tol, 50 runs. Same numpy
+    # draws -> same perturbed values -> same MNA solves (already spice-parity), so the per-run
+    # values[] and mean/std(ddof=1)/min/max match the oracle tightly (~1e-9).
+    mc_cases = [
+        ("mc R-divider op", {
+            "nodes": ["IN", "OUT", "0"],
+            "devices": [
+                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 10.0, "params": {}},
+                {"kind": "R", "name": "R1", "nodes": ["IN", "OUT"], "value": 1000.0, "params": {}},
+                {"kind": "R", "name": "R2", "nodes": ["OUT", "0"], "value": 2000.0, "params": {}}]},
+         {"analyses": [{"type": "mc", "runs": 50, "tol": {"R": 0.01},
+                        "analysis": {"type": "op"}, "probe": "V(OUT)", "seed": 7}],
+          "probes": ["V(OUT)"]}),
+        ("mc RC tran final", {
+            "nodes": ["0", "IN", "OUT"],
+            "devices": [
+                {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0,
+                 "params": {"waveform": _wf("PULSE", v1=0.0, v2=5.0, td=0.0, tr=1e-9, tf=1e-9,
+                                            pw=1.0, per=0.0)}},
+                {"kind": "R", "name": "R1", "nodes": ["IN", "OUT"], "value": 1000.0, "params": {}},
+                {"kind": "C", "name": "C1", "nodes": ["OUT", "0"], "value": 1e-6,
+                 "params": {"ic": 0.0}}]},
+         {"analyses": [{"type": "mc", "runs": 30, "tol": {"R": 0.02, "C": 0.05},
+                        "analysis": {"type": "tran", "tstep": 1e-6 * 1000 / 50,
+                                     "tstop": 5e-3, "uic": True},
+                        "probe": "V(OUT)", "seed": 123}],
+          "probes": ["V(OUT)"]}),
+    ]
+    for label, circuit, study in mc_cases:
+        checks += 1
+        ro = simulate(circuit, study)
+        rc, rcpp = core.call("sim_spice", {"circuit": circuit, "study": study})
+        diffs = []
+        if not (ro["convergence"].get("mc") and rcpp.get("convergence", {}).get("mc")):
+            diffs.append("mc did not converge")
+        pmc, cmc = ro.get("mc", {}), rcpp.get("mc", {})
+        if pmc.get("runs") != cmc.get("runs"):
+            diffs.append(f"runs {pmc.get('runs')}!={cmc.get('runs')}")
+        vp = np.asarray(pmc.get("values", []), dtype=np.float64)
+        vc = np.asarray(cmc.get("values", []), dtype=np.float64)
+        if vp.shape != vc.shape:
+            diffs.append(f"values len {vp.shape}!={vc.shape}")
+        elif vp.size:
+            scale = max(float(np.max(np.abs(vp))), 1e-12)
+            dmax = float(np.max(np.abs(vp - vc)))
+            if dmax / scale > 1e-9:
+                diffs.append(f"values max|d|={dmax:.2e} (rel {dmax/scale:.1e})")
+        for k in ("mean", "std", "min", "max"):
+            pv, cv = pmc.get(k), cmc.get(k)
+            if pv is None or cv is None:
+                diffs.append(f"{k} missing py={pv} cpp={cv}")
+                continue
+            rel = abs(float(pv) - float(cv)) / max(abs(float(pv)), 1e-12)
+            if rel > 1e-9:
+                diffs.append(f"{k} {float(pv):.9g}!={float(cv):.9g} (rel {rel:.1e})")
+        if diffs:
+            print(f"  {label:<24} DIFF: {'; '.join(diffs)[:100]}")
+            mism += 1
+        else:
+            print(f"  {label:<24} MATCH  (runs={cmc['runs']}, mean={float(cmc['mean']):.5g}, "
+                  f"std={float(cmc['std']):.4g})")
+
     print(f"\n[spice-parity] {checks - mism}/{checks} circuit cases at full parity")
     return mism
 

@@ -60,6 +60,7 @@
 #include "sim/lbm.h"
 #include "sim/mesher.h"
 #include "sim/netlist.h"
+#include "sim/numpy_rng.h"
 #include "sim/overlay.h"
 #include "sim/spice.h"
 
@@ -992,6 +993,19 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             const json& circ = params.contains("circuit") ? params["circuit"] : json::object();
             const json& study = params.contains("study") ? params["study"] : json::object();
             return emit(aicad::sim::spice_simulate(circ, study), out_json, 0);
+        }
+        if (m == "sim_numpy_normal") {
+            // DIAGNOSTIC: bit-exact-parity probe for the numpy RNG that drives the Monte-Carlo
+            // (mc) SPICE analysis. Params: {"seed": int, "n": int}. Returns
+            // {"draws": [...]} == np.random.default_rng(seed).standard_normal(size=n).
+            long long seed = params.contains("seed") && params["seed"].is_number()
+                                 ? params["seed"].get<long long>() : 0;
+            int n = params.contains("n") && params["n"].is_number()
+                        ? params["n"].get<int>() : 0;
+            aicad::sim::NumpyGenerator rng(static_cast<uint64_t>(seed));
+            json draws = json::array();
+            for (int i = 0; i < n; ++i) draws.push_back(rng.standard_normal());
+            return emit(json{{"draws", draws}}, out_json, 0);
         }
         if (m == "sim_netlist_parse") {
             // DIAGNOSTIC: parse a SPICE netlist deck text into the Circuit dict

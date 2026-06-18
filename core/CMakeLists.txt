@@ -104,6 +104,7 @@ add_library(aicad_sim STATIC
   sim/fea_static.cpp
   sim/fea_modal.cpp
   sim/spice.cpp
+  sim/numpy_rng.cpp
   sim/netlist.cpp
   sim/lbm.cpp)
 target_include_directories(aicad_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

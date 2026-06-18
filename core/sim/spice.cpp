@@ -12,6 +12,8 @@
 
 #include "sim/spice.h"
 
+#include "sim/numpy_rng.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -1487,6 +1489,167 @@ json spice_simulate(const json& circuit, const json& study) {
         json rest = json::array();
         for (const json& a : inner_analyses)
             if (a.value("type", std::string()) != "temp") rest.push_back(a);
+        if (!rest.empty()) {
+            json sub_study = {{"analyses", rest}, {"probes", probes}};
+            if (study.contains("options")) sub_study["options"] = study["options"];
+            json sub = spice_simulate(circuit, sub_study);
+            for (const char* k : {"op", "dc", "tran", "ac", "tf", "four", "noise"})
+                if (sub.contains(k)) result[k] = sub[k];
+            for (auto& kv : sub.value("convergence", json::object()).items())
+                result["convergence"][kv.key()] = kv.value();
+        }
+        return result;
+    }
+
+    if (!mc_spec.is_null()) {
+        // Monte-Carlo tolerance (analysis_ext.py::run_monte_carlo). Each run deep-copies the
+        // circuit, perturbs every eligible device value by value*(1 + tol_kind * z) with one
+        // numpy standard_normal() draw per eligible device per run (device-order draw stream),
+        // runs the inner analysis, and collects the probe scalar. The numpy RNG is replicated
+        // bit-exactly (core/sim/numpy_rng.{h,cpp}) so the draws — hence the whole study —
+        // match default_rng(seed).
+        const json& an = mc_spec;
+        int runs = (int)as_num(an.value("runs", json(100)), 100);
+        runs = std::max(1, std::min(runs, 100000));
+        json inner = an.contains("analysis") && an["analysis"].is_object()
+                         ? an["analysis"] : json{{"type", "op"}};
+        std::string probe;
+        if (an.contains("probe") && an["probe"].is_string()) probe = an["probe"].get<std::string>();
+        else if (!probes.empty() && probes[0].is_string()) probe = probes[0].get<std::string>();
+
+        // tol: float -> {R,C,L: that float}; dict -> per-kind float; else the default tol.
+        std::map<std::string, double> tol;
+        const json& tol_spec = an.contains("tol") ? an["tol"] : json(nullptr);
+        if (tol_spec.is_number()) {
+            double t = tol_spec.get<double>();
+            tol = {{"R", t}, {"C", t}, {"L", t}};
+        } else if (tol_spec.is_object()) {
+            for (auto& kv : tol_spec.items()) tol[kv.key()] = as_num(kv.value(), 0.0);
+        } else {
+            tol = {{"R", 0.01}, {"C", 0.05}, {"L", 0.05}, {"V", 0.0}, {"I", 0.0}};
+        }
+
+        // seed = int(an.get("seed", seed_default)); seed_default = study/options "seed" or 12345.
+        long long seed_default = 12345;
+        if (options.contains("seed") && options["seed"].is_number())
+            seed_default = (long long)as_num(options["seed"], 12345);
+        if (study.contains("seed") && study["seed"].is_number())
+            seed_default = (long long)as_num(study["seed"], (double)seed_default);
+        long long seed = an.contains("seed") && an["seed"].is_number()
+                             ? (long long)as_num(an["seed"], (double)seed_default)
+                             : seed_default;
+
+        if (probe.empty()) {
+            log("mc: no probe specified and none default");
+            result["mc"] = {{"values", json::array()}, {"mean", std::nan("")},
+                            {"std", std::nan("")}, {"min", std::nan("")},
+                            {"max", std::nan("")}, {"runs", 0}};
+            result["convergence"]["mc"] = false;
+            return result;
+        }
+
+        // Extract the key scalar for `probe` from a single inner result, priority
+        // op -> tran final -> ac peak -> dc final (analysis_ext.py::_scalar_from_result).
+        auto scalar_from_result = [&](const json& res) -> std::pair<double, bool> {
+            if (res.contains("op") && res["op"].is_object() && res["op"].contains(probe)) {
+                const json& v = res["op"][probe];
+                if (v.is_number()) { double d = v.get<double>();
+                    if (std::isfinite(d)) return {d, true}; }
+            }
+            if (res.contains("tran") && res["tran"].is_object()) {
+                const json& tr = res["tran"].value("traces", json::object());
+                if (tr.contains(probe) && tr[probe].is_array() && !tr[probe].empty()) {
+                    const json& v = tr[probe].back();
+                    if (v.is_number()) { double d = v.get<double>();
+                        if (std::isfinite(d)) return {d, true}; }
+                }
+            }
+            if (res.contains("ac") && res["ac"].is_object()) {
+                const json& mag = res["ac"].value("mag", json::object());
+                if (mag.contains(probe) && mag[probe].is_array() && !mag[probe].empty()) {
+                    double best = -std::numeric_limits<double>::infinity();
+                    bool any = false;
+                    for (const json& m : mag[probe])
+                        if (m.is_number()) { double d = m.get<double>();
+                            if (std::isfinite(d)) { best = std::max(best, d); any = true; } }
+                    if (any) return {best, true};
+                }
+            }
+            if (res.contains("dc") && res["dc"].is_object()) {
+                const json& tr = res["dc"].value("traces", json::object());
+                if (tr.contains(probe) && tr[probe].is_array() && !tr[probe].empty()) {
+                    double last = 0.0; bool any = false;
+                    for (const json& v : tr[probe])
+                        if (v.is_number()) { double d = v.get<double>();
+                            if (std::isfinite(d)) { last = d; any = true; } }
+                    if (any) return {last, true};
+                }
+            }
+            return {0.0, false};
+        };
+
+        NumpyGenerator rng(static_cast<uint64_t>(seed));
+        std::vector<double> values;
+        int n_ok = 0;
+        json inner_probes = json::array({probe});
+        for (int run = 0; run < runs; ++run) {
+            json c = circuit;
+            if (c.contains("devices") && c["devices"].is_array()) {
+                for (json& d : c["devices"]) {
+                    std::string kind = d.value("kind", std::string());
+                    auto it = tol.find(kind);
+                    double t = (it == tol.end()) ? 0.0 : it->second;
+                    if (t == 0.0) continue;            // tol[kind] falsy -> skip (no draw)
+                    if (!d.contains("value")) continue;
+                    const json& vj = d["value"];
+                    if (vj.is_null()) continue;        // v is None -> skip (no draw)
+                    double fv;
+                    if (vj.is_number()) fv = vj.get<double>();
+                    else if (vj.is_string()) {
+                        try { fv = std::stod(vj.get<std::string>()); }
+                        catch (...) { continue; }       // non-numeric -> skip (no draw)
+                    } else continue;
+                    double z = rng.standard_normal();
+                    d["value"] = fv * (1.0 + t * z);
+                }
+            }
+            json sub_study = {{"analyses", json::array({inner})}, {"probes", inner_probes}};
+            if (study.contains("options")) sub_study["options"] = study["options"];
+            json res = spice_simulate(c, sub_study);
+            auto [sc, got] = scalar_from_result(res);
+            if (got && std::isfinite(sc)) { values.push_back(sc); ++n_ok; }
+        }
+
+        if (values.empty()) {
+            log("mc: " + std::to_string(runs) + " runs produced no finite samples for " + probe);
+            result["mc"] = {{"values", json::array()}, {"mean", std::nan("")},
+                            {"std", std::nan("")}, {"min", std::nan("")},
+                            {"max", std::nan("")}, {"runs", 0}, {"probe", probe},
+                            {"seed", seed}};
+            result["convergence"]["mc"] = false;
+        } else {
+            // numpy mean / std(ddof=1) / min / max.
+            double sum = 0.0, vmin = values[0], vmax = values[0];
+            for (double v : values) { sum += v; vmin = std::min(vmin, v); vmax = std::max(vmax, v); }
+            double mean = sum / (double)values.size();
+            double stddev = 0.0;
+            if (values.size() > 1) {
+                double ss = 0.0;
+                for (double v : values) { double d = v - mean; ss += d * d; }
+                stddev = std::sqrt(ss / (double)(values.size() - 1));  // ddof=1
+            }
+            json tol_out = json::object();
+            for (auto& kv : tol) tol_out[kv.first] = kv.second;
+            result["mc"] = {{"probe", probe}, {"seed", seed}, {"runs", n_ok},
+                            {"values", values}, {"mean", mean}, {"std", stddev},
+                            {"min", vmin}, {"max", vmax}, {"tol", tol_out}};
+            result["convergence"]["mc"] = n_ok > 0;
+        }
+
+        // Run any remaining (non-mc) analyses on the nominal circuit too.
+        json rest = json::array();
+        for (const json& a : inner_analyses)
+            if (a.value("type", std::string()) != "mc") rest.push_back(a);
         if (!rest.empty()) {
             json sub_study = {{"analyses", rest}, {"probes", probes}};
             if (study.contains("options")) sub_study["options"] = study["options"];

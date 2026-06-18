@@ -208,6 +208,27 @@ add_library(aicad_aicm STATIC
   geom/aicm.cpp)
 target_include_directories(aicad_aicm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+# --- libaicad agent (LLM provider layer; WinHTTP TLS, OCCT-free) -------------
+# P51: C++ port of agent/providers/*.py — the request builders + response parsers
+# for Anthropic / OpenAI-compatible / llama.cpp / mock providers, plus a native
+# WinHTTP POST (no libcurl/OpenSSL). Top-level (NOT inside if(AICAD_WITH_OCCT)) so
+# it builds in both configs. Dynamic CRT to match aicad_miniz / the DLL heap.
+add_library(aicad_agent STATIC
+  agent/http.cpp
+  agent/providers.cpp)
+target_include_directories(aicad_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_agent PUBLIC nlohmann_json::nlohmann_json winhttp)
+set_property(TARGET aicad_agent PROPERTY
+  MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+
+add_executable(test_agent
+  tests/test_agent.cpp)
+target_include_directories(test_agent PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_agent PRIVATE aicad_agent)
+set_target_properties(test_agent PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME agent COMMAND test_agent)
+
 add_executable(test_aicm
   tests/test_aicm_writer.cpp)
 # Include the host loader's OWN directory (host/src/render), NOT host/src — the
@@ -567,7 +588,7 @@ if(AICAD_WITH_OCCT)
     api/libaicad.cpp)
   target_include_directories(aicad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_definitions(aicad PRIVATE AICAD_BUILD_DLL)
-  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_mesh)
+  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_mesh aicad_agent)
   set_target_properties(aicad PROPERTIES
     OUTPUT_NAME libaicad   # -> libaicad.dll + libaicad.lib (the host loads by this name)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

@@ -26,6 +26,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "agent/providers.h"
 #include "doc/document.h"
 #include "doc/export2d.h"
 #include "doc/session.h"
@@ -176,6 +177,83 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
         }
         if (m == "doc_compile_cpp") {
             return handle_compile(params, out_json);
+        }
+        // --- P51: agent/LLM provider layer diagnostics (no live network) -------
+        // These let the Python parity gate inspect request construction + response
+        // parsing of the C++ provider port WITHOUT a live POST.
+        if (m == "agent_build_request") {
+            // {provider, model?, system?, messages, max_tokens?, base_url?} ->
+            // {url, headers, body}. Pure (no network). headers as an object.
+            std::string provider = params.value("provider", std::string());
+            std::string system = params.value("system", std::string());
+            int max_tokens = params.value("max_tokens", 8000);
+            json messages = params.contains("messages") ? params["messages"] : json::array();
+            aicad::agent::BuiltRequest req;
+            if (provider == "anthropic") {
+                std::string model = params.value("model",
+                                                 std::string(aicad::agent::kAnthropicDefaultModel));
+                req = aicad::agent::anthropic_build_request(model, system, messages, max_tokens);
+            } else if (provider == "openai" || provider == "llamacpp") {
+                std::string def = provider == "llamacpp" ? std::string("local-gguf")
+                                                         : std::string(aicad::agent::kOpenAIDefaultModel);
+                std::string model = params.value("model", def);
+                std::string base_url = params.value("base_url", std::string());
+                req = aicad::agent::openai_build_request(model, system, messages, max_tokens,
+                                                         base_url);
+            } else {
+                return emit_error("agent_build_request: unknown provider: " + provider, out_json);
+            }
+            json headers = json::object();
+            for (const auto& h : req.headers) headers[h.first] = h.second;
+            return emit(json{{"url", req.url}, {"headers", headers}, {"body", req.body_json}},
+                        out_json, 0);
+        }
+        if (m == "agent_parse_response") {
+            // {provider, response} -> {text, thinking?}.
+            std::string provider = params.value("provider", std::string());
+            json resp = params.contains("response") ? params["response"] : json::object();
+            if (provider == "anthropic") {
+                aicad::agent::ParsedReply pr = aicad::agent::anthropic_parse_response(resp);
+                return emit(json{{"text", pr.text}, {"thinking", pr.thinking}}, out_json, 0);
+            }
+            if (provider == "openai" || provider == "llamacpp") {
+                aicad::agent::ParsedReply pr = aicad::agent::openai_parse_response(resp);
+                return emit(json{{"text", pr.text}}, out_json, 0);
+            }
+            return emit_error("agent_parse_response: unknown provider: " + provider, out_json);
+        }
+        if (m == "agent_b64_file") {
+            // {path} -> {b64}. base64.standard_b64encode of the file bytes.
+            std::string path = params.value("path", std::string());
+            std::string b64 = aicad::agent::base64_encode(aicad::agent::read_file_bytes(path));
+            return emit(json{{"b64", b64}}, out_json, 0);
+        }
+        if (m == "agent_normalize_base_url") {
+            // {base_url} -> {base_url} (the normalized form). Pure helper probe.
+            std::string base_url = params.value("base_url", std::string());
+            return emit(json{{"base_url", aicad::agent::openai_normalize_base_url(base_url)}},
+                        out_json, 0);
+        }
+        if (m == "agent_complete") {
+            // {provider, cfg?, system?, messages?, max_tokens?} -> {text, thinking, error}.
+            // For provider:"mock" this is fully offline (scripted replies in cfg.replies).
+            // For anthropic/openai/llamacpp it performs a LIVE http_post (the gate only
+            // drives this when an API key is present).
+            std::string provider = params.value("provider", std::string());
+            json cfg = params.contains("cfg") ? params["cfg"] : json::object();
+            std::string system = params.value("system", std::string());
+            json messages = params.contains("messages") ? params["messages"] : json::array();
+            int max_tokens = params.value("max_tokens", 8000);
+            aicad::agent::CompleteResult cr =
+                aicad::agent::complete(provider, cfg, system, messages, max_tokens);
+            return emit(json{{"text", cr.text}, {"thinking", cr.thinking}, {"error", cr.error}},
+                        out_json, cr.error.empty() ? 0 : 0);
+        }
+        if (m == "agent_role_of") {
+            // {system} -> {role}. RoleScriptedProvider role sniffer probe.
+            std::string system = params.value("system", std::string());
+            return emit(json{{"role", aicad::agent::RoleScriptedProvider::role_of(system)}},
+                        out_json, 0);
         }
         if (m == "sim_fea_static") {
             // Linear-static FEA (engine/sim/fea_static.py parity probe). Params carry an

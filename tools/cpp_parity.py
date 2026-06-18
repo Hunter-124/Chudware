@@ -428,6 +428,114 @@ def fixtures():
                     "d1": {"value": 30.0, "expr": None}, "d2": {"value": 30.0, "expr": None}},
          "refs": {"faces": [gtop1, gtop2]}}]}
 
+    # ---- split (engine/doc/features/split.py, planar tool path) ------------------
+    # A 30x20x25 box (V=15000) split by a datum plane (plane.top offset 10). keep=both
+    # -> TWO solids (the z[0,10] piece 6000 + the z[10,25] piece 9000, total 15000, the
+    # planar split's defining property: pieces sum to the original). keep=above keeps
+    # only the +normal (z>10) piece, V=9000. Gated on exact per-body + total volume.
+    sp_e, sp_c = _rect(0, 0, 30, 20)
+    def _split_base():
+        return [_sketch("s1", "plane.top", sp_e, sp_c), _extrude("x1", "s1", 25.0),
+                _plane_offset("p1", "plane.top", 10.0)]
+    def _split(keep):
+        return {"id": "sp", "type": "split", "params": {"keep": keep},
+                "refs": {"tool": {"kind": "datum", "feature": "p1"}}}
+    out["split_both"] = {"features": _split_base() + [_split("both")]}    # 2 bodies, 15000
+    out["split_above"] = {"features": _split_base() + [_split("above")]}  # 1 body, 9000
+
+    # ---- datum point / coordinate (engine/doc/features/datum.py compile_point) ----
+    def _point(fid, x, y, z):
+        return {"id": fid, "type": "point",
+                "params": {"method": "coordinate", "coordinate": [x, y, z]}, "refs": {}}
+    def _datum(fid):
+        return {"kind": "datum", "feature": fid}
+
+    # ---- datum plane: midplane (between plane.top and an offset plane 20) ----------
+    # The midplane sits at z=10; a 20x20 sketch on it extruded 5 -> a 2000 boss. The
+    # boss volume (2000) + its placement encode the midplane's correctness; gated on
+    # the matching solid the same way the loft fixture gates the offset plane.
+    dp_e, dp_c = _rect(0, 0, 20, 20)
+    out["datum_plane_midplane"] = {"features": [
+        _plane_offset("p2", "plane.top", 20.0),
+        {"id": "pm", "type": "plane", "params": {"method": "midplane"},
+         "refs": {"base": "plane.top", "second": _datum("p2")}},
+        _sketch("s1", "pm", dp_e, dp_c), _extrude("x1", "s1", 5.0)]}
+
+    # ---- datum plane: angle / three_point / parallel_point -------------------------
+    # The oracle's angle/three_point/parallel_point compilers resolve against the last
+    # body (ctx.bodies), so each fixture seeds a 10x10x5 base block (merge:false -> a
+    # separate operand) first; the datum-driven 20x20x5 boss (V=2000) is then built ON
+    # the new plane. Total V=2500 (block 500 + boss 2000), 2 bodies. The boss is built
+    # by the SAME OCCT extrude through the SAME datum on both engines, so its volume +
+    # body count is the gate (matches probe: py==cpp exactly).
+    blk_e, blk_c = _rect(0, 0, 10, 10)
+    def _datum_base():
+        return [_sketch("sb", "plane.top", blk_e, blk_c),
+                _extrude("bx", "sb", 5.0, merge=False)]
+    def _datum_boss(plane_fid):
+        return [_sketch("s1", plane_fid, dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]
+
+    out["datum_plane_angle"] = {"features": _datum_base() + [
+        {"id": "pl", "type": "plane", "params": {"method": "angle", "angle": {"value": 30.0, "expr": None}},
+         "refs": {"base": "plane.top", "second": "axis.x"}}] + _datum_boss("pl")}
+
+    out["datum_plane_three_point"] = {"features": _datum_base() + [
+        _point("pa", 0, 0, 5), _point("pb", 20, 0, 5), _point("pc", 0, 20, 5),
+        {"id": "pl", "type": "plane", "params": {"method": "three_point"},
+         "refs": {"points": [_datum("pa"), _datum("pb"), _datum("pc")]}}] + _datum_boss("pl")}
+
+    out["datum_plane_parallel_point"] = {"features": _datum_base() + [
+        _point("pa", 3, 4, 12),
+        {"id": "pl", "type": "plane", "params": {"method": "parallel_point"},
+         "refs": {"base": "plane.top", "points": [_datum("pa")]}}] + _datum_boss("pl")}
+
+    # ---- datum axis: two_points, consumed by a revolve about it --------------------
+    # Two point datums on the Y axis -> a datum axis (0,0,0)->(0,1,0). A rect (x 5..15,
+    # y 0..10) revolved 360 about that axis -> annulus r=5,R=15,h=10, V=2000*pi. The
+    # revolve's volume encodes the axis (location + direction); the SAME revolve about
+    # the SAME datum axis on both engines is the gate.
+    rev_e2, rev_c2 = _rect(5, 0, 10, 10)
+    out["datum_axis_revolve"] = {"features": [
+        _point("pa", 0, 0, 0), _point("pb", 0, 1, 0),
+        {"id": "ax", "type": "axis", "params": {"method": "two_points"},
+         "refs": {"a": _datum("pa"), "b": _datum("pb")}},
+        _sketch("s1", "plane.top", rev_e2, rev_c2),
+        {"id": "r1", "type": "revolve",
+         "params": {"mode": "boss", "angle": {"value": 360.0, "expr": None}},
+         "refs": {"profile": [{"kind": "region", "sketch": "s1"}], "axis": _datum("ax")}}]}
+
+    # ---- curve: constant-pitch helix consumed as a sweep path ----------------------
+    # A circle (r=2) on plane.top swept along a helix (pitch 5, height 20, radius 10)
+    # -> a coiled tube. The C++ helix replicates build123d Edge.make_helix exactly
+    # (Geom_CylindricalSurface + wrapped 2D line + BuildCurves3d), so the swept solid's
+    # volume matches the oracle to full tolerance (probe: py==cpp on the exact value).
+    hx_prof_e = [_circle("e1", 0, 0, 2)]
+    hx_prof_c = [_rel("c1", "fix", ["e1.center"]), _dim("c2", "radius", ["e1"], 2)]
+    out["helix_sweep"] = {"features": [
+        _sketch("s1", "plane.top", hx_prof_e, hx_prof_c),
+        {"id": "hx", "type": "helix",
+         "params": {"pitch": {"value": 5.0, "expr": None}, "height": {"value": 20.0, "expr": None},
+                    "radius": {"value": 10.0, "expr": None}},
+         "refs": {"base": "plane.top"}},
+        {"id": "sw", "type": "sweep", "params": {"mode": "boss"},
+         "refs": {"profile": [{"kind": "region", "sketch": "s1"}],
+                  "path": {"kind": "region", "sketch": "hx"}}}]}
+
+    # ---- import feature (engine/doc/features/import_feature.py, B-rep path) --------
+    # Export a known 30x20x10 box (V=6000) to a temp STEP, then import it as a frozen
+    # body feature on BOTH engines and compare volume. Skipped if build123d's STEP
+    # export is unavailable (keeps the harness runnable without the heavy export deps).
+    try:
+        import tempfile
+        from build123d import Box, export_step  # noqa: WPS433
+        step_path = str(Path(tempfile.gettempdir()) / "aicad_parity_import_box.step")
+        export_step(Box(30, 20, 10), step_path)
+        out["import_step"] = {"features": [
+            {"id": "im", "type": "import",
+             "params": {"source_path": step_path, "format": "step"}, "refs": {}}]}
+    except Exception:  # pragma: no cover - export unavailable
+        pass
+
     return out
 
 

@@ -1231,6 +1231,43 @@ json doc_apply_ops(const std::string& doc_id, long base_revision, const json& op
     return apply_ops_locked(s, base_revision, ops, coalesce);
 }
 
+json doc_dry_run_ops(const std::string& doc_id, const json& ops) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& live = require_session(doc_id);
+    // Clone the live doc into a scratch session; apply_ops_locked there so the live
+    // session (and its revision/undo stacks) is never touched. base_revision = -1
+    // skips the optimistic-concurrency guard (matches ops_emit.dry_run, which builds
+    // the would-be document directly off the doc dict with no revision check).
+    Session scratch;
+    scratch.doc_id = live.doc_id;  // any value; never registered/persisted.
+    scratch.doc = live.doc;        // deep copy of the feature tree json.
+    scratch.revision = live.revision;
+    try {
+        apply_ops_locked(scratch, -1, ops, /*coalesce=*/true);
+        return json{{"ok", true}};
+    } catch (const OpError& e) {
+        // Compose the error string the SAME way ops_emit.dry_run does:
+        //   reason = env["message"]; if detail.all_errors: reason + " | " + "; ".join(all_errors[:5])
+        std::string reason = e.what();
+        if (e.detail.is_object() && e.detail.contains("all_errors") &&
+            e.detail["all_errors"].is_array() && !e.detail["all_errors"].empty()) {
+            std::string joined;
+            const json& all = e.detail["all_errors"];
+            for (std::size_t i = 0; i < all.size() && i < 5; ++i) {
+                if (i) joined += "; ";
+                joined += all[i].get<std::string>();
+            }
+            reason = reason + " | " + joined;
+        }
+        return json{{"ok", false}, {"error", reason}};
+    } catch (const std::exception& e) {
+        // Python's generic branch: f"{type(e).__name__}: {e}". The C++ exception type
+        // name is mangled/platform-specific, so we emit the message (the OpError path
+        // above is the one the agent gate exercises; this is a defensive fallback).
+        return json{{"ok", false}, {"error", std::string(e.what())}};
+    }
+}
+
 json doc_undo(const std::string& doc_id) {
     std::lock_guard<std::mutex> lk(g_mtx);
     Session& s = require_session(doc_id);

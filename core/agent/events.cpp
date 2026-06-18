@@ -31,6 +31,13 @@ RunEvents::RunEvents(const std::string& run_id) : run_id_(run_id) {
     // (best-effort; ignore failure to match Python's try/except pass)
 }
 
+RunEvents::RunEvents(const std::string& run_id, Callback cb)
+    : run_id_(run_id), cb_(std::move(cb)) {
+    dir_ = run_dir(run_id);
+    jsonl_ = dir_ / "events.jsonl";
+    std::ofstream fh(jsonl_, std::ios::binary | std::ios::trunc);
+}
+
 json RunEvents::emit(const std::string& kind, const json& data) {
     // ev = {"kind":kind, "run_id":run_id, **data}. Python dict preserves
     // insertion order; the gate compares PARSED objects so key order is moot.
@@ -39,9 +46,16 @@ json RunEvents::emit(const std::string& kind, const json& data) {
     ev["run_id"] = run_id_;
     if (data.is_object())
         for (auto it = data.begin(); it != data.end(); ++it) ev[it.key()] = it.value();
-    // Persist first (source of truth for replay).
+    // Persist first (source of truth for replay), then surface live (best-effort).
     std::ofstream fh(jsonl_, std::ios::binary | std::ios::app);
     if (fh) fh << ev.dump() << "\n";
+    if (cb_) {
+        try {
+            cb_(ev);
+        } catch (...) {
+            // match Python try/except pass — a sink failure never breaks the run.
+        }
+    }
     return ev;
 }
 

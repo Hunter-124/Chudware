@@ -100,36 +100,77 @@ void dump_string(const std::string& s, std::string& out) {
 std::string dump_double(double v) {
     if (std::isnan(v)) return "NaN";
     if (std::isinf(v)) return v < 0 ? "-Infinity" : "Infinity";
-    // Shortest precision (17 max) that round-trips, like Python's repr.
+    if (v == 0.0) return std::signbit(v) ? "-0.0" : "0.0";
+    // CPython float_repr: the SHORTEST decimal digit string that round-trips, then
+    // formatted by repr's fixed-vs-scientific rule. `%.*g`'s fixed/sci threshold is
+    // precision-dependent (so minimal-prec `%g` wrongly renders 10.0 as "1e+01"); we
+    // instead extract shortest (mantissa digits, decimal exponent) via `%.*e`, then
+    // apply Python's rule: scientific iff decexp < -4 or decexp >= 16, else fixed.
     char buf[64];
-    for (int prec = 1; prec <= 17; ++prec) {
-        std::snprintf(buf, sizeof(buf), "%.*g", prec, v);
-        double parsed = std::strtod(buf, nullptr);
-        if (parsed == v) break;
+    int digits10 = 17;
+    for (int prec = 0; prec <= 16; ++prec) {
+        std::snprintf(buf, sizeof(buf), "%.*e", prec, v);
+        if (std::strtod(buf, nullptr) == v) {
+            digits10 = prec + 1;
+            break;
+        }
     }
-    std::string s(buf);
-    // Python repr always shows a decimal point or exponent for floats.
-    bool has_dot_or_exp = s.find('.') != std::string::npos ||
-                          s.find('e') != std::string::npos ||
-                          s.find('E') != std::string::npos ||
-                          s.find("inf") != std::string::npos ||
-                          s.find("nan") != std::string::npos;
-    if (!has_dot_or_exp) s += ".0";
-    // Normalize exponent form to Python's: lowercase 'e', sign, >=2 digits.
-    size_t epos = s.find('e');
-    if (epos == std::string::npos) epos = s.find('E');
-    if (epos != std::string::npos) {
-        std::string mant = s.substr(0, epos);
-        std::string exp = s.substr(epos + 1);
-        char sign = '+';
-        size_t j = 0;
-        if (!exp.empty() && (exp[0] == '+' || exp[0] == '-')) { sign = exp[0]; j = 1; }
-        std::string digits = exp.substr(j);
-        while (digits.size() > 2 && digits[0] == '0') digits.erase(digits.begin());
-        while (digits.size() < 2) digits.insert(digits.begin(), '0');
-        s = mant + "e" + sign + digits;
+    // Re-render at the chosen significant-digit count in scientific form to read off
+    // the mantissa digits + decimal exponent unambiguously.
+    std::snprintf(buf, sizeof(buf), "%.*e", digits10 - 1, v);
+    std::string sci(buf);
+    bool neg = false;
+    size_t p = 0;
+    if (sci[p] == '-') { neg = true; ++p; }
+    // mantissa: D[.DDD]
+    std::string mant_digits;
+    mant_digits += sci[p++];          // leading digit
+    if (p < sci.size() && sci[p] == '.') {
+        ++p;
+        while (p < sci.size() && sci[p] != 'e' && sci[p] != 'E') mant_digits += sci[p++];
     }
-    return s;
+    // exponent
+    int decexp = 0;
+    {
+        size_t ep = sci.find_first_of("eE");
+        decexp = std::atoi(sci.c_str() + ep + 1);
+    }
+    // Strip trailing zeros from the mantissa digit string (keep >=1 digit).
+    while (mant_digits.size() > 1 && mant_digits.back() == '0') mant_digits.pop_back();
+    int ndig = static_cast<int>(mant_digits.size());
+
+    std::string out;
+    if (decexp < -4 || decexp >= 16) {
+        // Scientific: D[.DDD]e±NN (>=2 exponent digits, like Python). A single
+        // significant digit gets NO fractional part (Python: repr(1e16) == "1e+16").
+        out += mant_digits[0];
+        if (ndig > 1) out += "." + mant_digits.substr(1);
+        char esign = decexp < 0 ? '-' : '+';
+        int eabs = decexp < 0 ? -decexp : decexp;
+        std::string ed = std::to_string(eabs);
+        if (ed.size() < 2) ed = "0" + ed;
+        out += "e";
+        out += esign;
+        out += ed;
+    } else if (decexp >= 0) {
+        // Fixed, integer part spans decexp+1 digits.
+        int intlen = decexp + 1;
+        if (ndig <= intlen) {
+            out += mant_digits;
+            out.append(intlen - ndig, '0');
+            out += ".0";
+        } else {
+            out += mant_digits.substr(0, intlen);
+            out += ".";
+            out += mant_digits.substr(intlen);
+        }
+    } else {
+        // Fixed, value < 1: 0.00...DDD with (-decexp-1) leading zeros after the point.
+        out += "0.";
+        out.append(-decexp - 1, '0');
+        out += mant_digits;
+    }
+    return neg ? "-" + out : out;
 }
 
 // Recursively dump `j` with indent=0 + separators (",", ": "). `depth` only

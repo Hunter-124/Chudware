@@ -48,6 +48,14 @@ nlohmann::json doc_new(const std::string& kind, const std::string& name);
 nlohmann::json doc_apply_ops(const std::string& doc_id, long base_revision,
                              const nlohmann::json& ops, bool coalesce);
 
+// Stateless dry-run validation (engine.doc.ops dry_run, used by the agent modeler/
+// fixer path). Clones the live session's current doc into a scratch session and runs
+// the op batch against it WITHOUT mutating the live session or bumping its revision.
+// Returns {"ok": true} on success, or {"ok": false, "error": "<message>"} where the
+// error string is composed EXACTLY like ops_emit.dry_run: the OpError message, and if
+// detail.all_errors is present, message + " | " + "; ".join(all_errors[:5]).
+nlohmann::json doc_dry_run_ops(const std::string& doc_id, const nlohmann::json& ops);
+
 nlohmann::json doc_undo(const std::string& doc_id);     // bumps revision +1
 nlohmann::json doc_redo(const std::string& doc_id);     // bumps revision +1
 nlohmann::json doc_tree(const std::string& doc_id);     // no rebuild, no rev bump

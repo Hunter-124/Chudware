@@ -38,6 +38,7 @@
 #include "agent/ops_emit.h"
 #include "agent/providers.h"
 #include "agent/roles.h"
+#include "agent/run.h"
 #include "agent/state.h"
 #include "doc/document.h"
 #include "doc/export2d.h"
@@ -564,6 +565,22 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             result["events"] = captured;
             return emit(std::move(result), out_json, 0);
         }
+        if (m == "agent_run_design") {
+            // LIVE end-to-end run: {request, doc_id, provider:{...}, options?} ->
+            // {run_id, status, stop_reason, revision, doc_id, events:[...]}. The
+            // provider descriptor is the resolved {name,model,api_key,...} OR the
+            // role-scripted mock {name:"mock", replies:{by_role}} for the gate.
+            std::string request = params.value("request", std::string());
+            std::string doc_id = params.value("doc_id", std::string());
+            json provider = params.contains("provider") ? params["provider"] : json::object();
+            json options = params.contains("options") ? params["options"] : json::object();
+            // Capture every emitted event (like agent_run_machine returns `events`).
+            auto captured = std::make_shared<json>(json::array());
+            aicad::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
+            json result = aicad::agent::run_design(request, doc_id, provider, cb, options);
+            result["events"] = *captured;
+            return emit(std::move(result), out_json, 0);
+        }
         if (m == "sim_fea_static") {
             // Linear-static FEA (engine/sim/fea_static.py parity probe). Params carry an
             // ALREADY-RESOLVED problem: points[n*3], tets[m*4], E_mpa, nu, yield_mpa,
@@ -754,6 +771,11 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                     ? params["base_revision"].get<long>() : -1,
                                 params.contains("ops") ? params["ops"] : json::array(),
                                 params.value("coalesce", false)),
+                            out_json, 0);
+            if (m == "doc_dry_run_ops")
+                return emit(aicad::doc::doc_dry_run_ops(
+                                params.value("doc_id", std::string()),
+                                params.contains("ops") ? params["ops"] : json::array()),
                             out_json, 0);
             if (m == "doc_undo")
                 return emit(aicad::doc::doc_undo(params.value("doc_id", std::string())), out_json, 0);

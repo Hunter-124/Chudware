@@ -7,6 +7,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -28,8 +29,13 @@ std::filesystem::path run_dir(const std::string& run_id);
 // per line; write_sidecar() writes the uncapped raw output.
 class RunEvents {
 public:
+    using Callback = std::function<void(const json&)>;
     explicit RunEvents(const std::string& run_id);
-    // ev = {"kind":kind, "run_id":run_id, **data}; append json+"\n" to events.jsonl.
+    // run.py RunEvents(run_id, emit): a live callback invoked with each emitted
+    // event (after persistence). May be empty (no-op), matching emit=None.
+    RunEvents(const std::string& run_id, Callback cb);
+    // ev = {"kind":kind, "run_id":run_id, **data}; append json+"\n" to events.jsonl,
+    // then invoke the callback (if set) — mirrors events.py emit order.
     json emit(const std::string& kind, const json& data);
     std::string write_sidecar(const std::string& stage, int attempt, const std::string& raw);
     const std::filesystem::path& dir() const { return dir_; }
@@ -38,6 +44,7 @@ private:
     std::string run_id_;
     std::filesystem::path dir_;
     std::filesystem::path jsonl_;
+    Callback cb_;
 };
 
 }  // namespace agent

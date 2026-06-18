@@ -34,18 +34,14 @@ from tools.cpp_parity import CppCore  # noqa: E402
 # --------------------------------------------------------------------------- normalize
 def norm_tree(tree: dict) -> dict:
     """Canonicalize a document tree for cross-engine compare: pin the random doc
-    `id` to a constant (Python=uuid4, C++=session id) and strip each zone's
-    `filled_polys`. The copper-pour fill is produced by the COMPILE layer
-    (engine.ecad.zonefill, run inside session._compile) which is DEFERRED in this
-    C++ foundation wave — so Python stamps `filled_polys` onto a zone after an
-    add/edit while the C++ session does not. That is a compile-layer artifact, not
-    an ops divergence; everything the OPS write (id/net/layer/polygon/clearance/
-    fill/thermal) is compared as-is."""
+    `id` to a constant (Python=uuid4, C++=session id). The copper-pour
+    `filled_polys` ARE now compared (both engines run the zone fill inside the
+    board compile — engine.ecad.zonefill / core/ecad/zonefill.cpp), so they are NO
+    LONGER stripped: every byte the ops + compile write (id/net/layer/polygon/
+    clearance/fill/thermal AND the filled copper polygons) is compared as-is."""
     import copy
     t = copy.deepcopy(tree)
     t["id"] = "<id>"
-    for z in t.get("zones", []):
-        z.pop("filled_polys", None)
     return t
 
 
@@ -56,8 +52,7 @@ def cmp_compile(label, py, cpp):
     These are now computed in-process by the C++ core (core/ecad/netlist.cpp +
     erc.cpp) and must match the Python oracle (engine.ecad.netlist/erc) bit-for-bit
     — net naming, net ordering, ERC violation records + their order are all
-    load-bearing. `stats` (esp. the non-deterministic `ms` timing) and the still-
-    DEFERRED PCB artifacts (drc/ratsnest/filled_polys) are NOT compared here."""
+    load-bearing. `stats` (esp. the non-deterministic `ms` timing) is NOT compared."""
     pc = py.get("compile", {}) or {}
     cc = cpp.get("compile", {}) or {}
     diffs = []
@@ -70,6 +65,40 @@ def cmp_compile(label, py, cpp):
         diffs.append(f"erc differ (py={len(pc.get('erc') or [])} cpp={len(cc.get('erc') or [])})")
     ok = not diffs
     print(f"  {label:<40} {'MATCH' if ok else 'DIFF: ' + '; '.join(diffs)[:140]}")
+    return 0 if ok else 1
+
+
+def cmp_compile_pcb(label, py, cpp):
+    """Compare the BOARD compile sub-fields EXACTLY: compile.drc (the ordered DRC
+    violation list — rule/severity/locs/items/message + ORDER), compile.ratsnest
+    (the deterministic {net,p1,p2} airwires), and the per-zone filled_polys (the
+    copper-pour geometry — vertex-for-vertex). Computed in-process by the C++ core
+    (core/ecad/drc.cpp + zonefill.cpp) against the Python oracle (engine.ecad.drc /
+    zonefill). Only the non-deterministic `stats.ms` is ignored; everything else is
+    load-bearing and compared as-is."""
+    pc = py.get("compile", {}) or {}
+    cc = cpp.get("compile", {}) or {}
+    diffs = []
+    if pc.get("drc") != cc.get("drc"):
+        pd, cd = pc.get("drc") or [], cc.get("drc") or []
+        diffs.append(f"drc differ (py={len(pd)} cpp={len(cd)})")
+        for i, (a, b) in enumerate(zip(pd, cd)):
+            if a != b:
+                diffs.append(f"drc[{i}] {a.get('rule')}/{a.get('message','')[:30]}")
+                break
+    if pc.get("ratsnest") != cc.get("ratsnest"):
+        diffs.append(f"ratsnest differ (py={len(pc.get('ratsnest') or [])} "
+                     f"cpp={len(cc.get('ratsnest') or [])})")
+    # filled_polys live in the tree (the compile writes them back onto each zone).
+    pz = {z.get("id"): z.get("filled_polys", []) for z in py.get("tree", {}).get("zones", [])}
+    cz = {z.get("id"): z.get("filled_polys", []) for z in cpp.get("tree", {}).get("zones", [])}
+    for zid in sorted(set(pz) | set(cz)):
+        if pz.get(zid) != cz.get(zid):
+            pn = len(pz.get(zid) or [])
+            cn = len(cz.get(zid) or [])
+            diffs.append(f"zone {zid} filled_polys differ (py={pn}p cpp={cn}p)")
+    ok = not diffs
+    print(f"  {label:<40} {'MATCH' if ok else 'DIFF: ' + '; '.join(diffs)[:150]}")
     return 0 if ok else 1
 
 
@@ -533,6 +562,155 @@ def main() -> int:
         {"op": "sch_add_wire", "sheet": "$0", "pts": [[100.0, 0.0], [105.0, 0.0]]},
         {"op": "sch_add_label", "sheet": "sh1", "pos": [5.0, 0.0], "text": "DATA", "scope": "local"},
         {"op": "sch_add_label", "sheet": "$0", "pos": [105.0, 0.0], "text": "DATA", "scope": "local"},
+    ])
+
+    # ---- 17) BOARD COMPILE parity: DRC + ratsnest + zone fill ----
+    # Fixtures mirror engine/ecad/test_drc.py + test_zonefill.py. Built via ops so
+    # both engines hold an IDENTICAL tree; we then compare compile.drc +
+    # compile.ratsnest + each zone's filled_polys EXACTLY (only stats.ms ignored).
+    #
+    # NOTE on nets: there is no `pcb_add_net` op and validate_board rejects any pad/
+    # track/via/zone net not in the board net table (only "GND" by default). But a
+    # null pad net validates fine, and same_net(None, None) is False (an unassigned
+    # copper island still clears its neighbours), so DIFFERENT-net clearance is built
+    # from null-net pads; SAME-net suppression / ratsnest / zones use registered
+    # "GND". This exercises every DRC rule + every zonefill path (clearance carve,
+    # thermal relief, SMD solid flood, multi-component trace) within the op vocab.
+
+    def _pad(pid, pos, net, size=(0.5, 0.5), shape="circle", layer="F.Cu",
+             ptype="smd", drill=None):
+        p = {"id": pid, "number": "1", "pos": list(pos), "angle": 0.0, "shape": shape,
+             "size": list(size), "type": ptype, "layers": [layer], "drill": drill, "net": net}
+        if ptype in ("tht", "np_tht", "connector"):
+            p["layers"] = ["F.Cu", "B.Cu"]
+        return p
+
+    def _fpdef(pads, attr="smd"):
+        return {"fpid": "Test:FP", "value": "", "attr": attr, "pads": pads}
+
+    def _rect_outline(w, h, x0=0.0, y0=0.0):
+        x1, y1 = x0 + w, y0 + h
+        return [
+            {"type": "line", "p1": [x0, y0], "p2": [x1, y0]},
+            {"type": "line", "p1": [x1, y0], "p2": [x1, y1]},
+            {"type": "line", "p1": [x1, y1], "p2": [x0, y1]},
+            {"type": "line", "p1": [x0, y1], "p2": [x0, y0]},
+        ]
+
+    def run_compile_pcb(label, batch):
+        pp, cc = new("pcb", label)
+        pid, cid = pp["doc_id"], cc["doc_id"]
+        pr, cr = apply(pid, cid, 0, batch)
+        step(cmp_resp(f"{label} tree", pr, cr))
+        step(cmp_compile_pcb(f"{label} compile (drc+rats+fill)", pr, cr))
+
+    # 17a clearance net-aware: two different-net (null) round pads 0.6mm apart -> 1.
+    run_compile_pcb("drc_clearance", [
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [0.0, 0.0], "ref": "FP1",
+         "def": _fpdef([_pad("p1", (0.0, 0.0), None)])},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [0.6, 0.0], "ref": "FP2",
+         "def": _fpdef([_pad("p2", (0.0, 0.0), None)])},
+    ])
+
+    # 17b same-net pads close -> NO clearance (net-aware guarantee; both GND).
+    run_compile_pcb("drc_same_net", [
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [0.0, 0.0], "ref": "FP1",
+         "def": _fpdef([_pad("p1", (0.0, 0.0), "GND")])},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [0.6, 0.0], "ref": "FP2",
+         "def": _fpdef([_pad("p2", (0.0, 0.0), "GND")])},
+    ])
+
+    # 17c track_width below minimum (GND track, width 0.10 < 0.15).
+    run_compile_pcb("drc_track_width", [
+        {"op": "pcb_add_track", "net": "GND", "layer": "F.Cu", "p1": [0.0, 0.0],
+         "p2": [5.0, 0.0], "width": 0.10},
+    ])
+
+    # 17d via_size (drill 0.1 < 0.2) + annular ring on a via.
+    run_compile_pcb("drc_via", [
+        {"op": "pcb_add_via", "net": "GND", "at": [0.0, 0.0], "drill": 0.45, "diameter": 0.5},
+    ])
+    run_compile_pcb("drc_via_drill", [
+        {"op": "pcb_add_via", "net": "GND", "at": [0.0, 0.0], "drill": 0.1, "diameter": 0.8},
+    ])
+
+    # 17e annular ring on a tht pad (min dim 1.0, drill 0.9 -> ring 0.05 < 0.13).
+    run_compile_pcb("drc_pad_annular", [
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [0.0, 0.0], "ref": "FP1",
+         "def": _fpdef([_pad("p1", (0.0, 0.0), "GND", size=(1.0, 1.0), ptype="tht",
+                             drill={"diameter": 0.9, "shape": "round", "offset": [0, 0]})],
+                       attr="tht")},
+    ])
+
+    # 17f hole_to_hole: two tht pads, drills 0.5, centers 0.6 apart -> gap 0.1 < 0.25.
+    run_compile_pcb("drc_hole_to_hole", [
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [0.0, 0.0], "ref": "FP1",
+         "def": _fpdef([_pad("p1", (0.0, 0.0), None, size=(1.5, 1.5), ptype="tht",
+                             drill={"diameter": 0.5, "shape": "round", "offset": [0, 0]})],
+                       attr="tht")},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [0.6, 0.0], "ref": "FP2",
+         "def": _fpdef([_pad("p2", (0.0, 0.0), None, size=(1.5, 1.5), ptype="tht",
+                             drill={"diameter": 0.5, "shape": "round", "offset": [0, 0]})],
+                       attr="tht")},
+    ])
+
+    # 17g edge_clearance: pad copper touching the left board edge.
+    run_compile_pcb("drc_edge", [
+        {"op": "pcb_set_outline", "shapes": _rect_outline(20.0, 20.0), "closed": True},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [0.1, 10.0], "ref": "FP1",
+         "def": _fpdef([_pad("p1", (0.0, 0.0), None, size=(0.5, 0.5))])},
+    ])
+
+    # 17h ratsnest + unrouted: two unconnected same-net pads (rect shape -> box) far apart.
+    run_compile_pcb("drc_ratsnest", [
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [0.0, 0.0], "ref": "FP1",
+         "def": _fpdef([_pad("p1", (0.0, 0.0), "GND", size=(0.5, 0.5))])},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [10.0, 0.0], "ref": "FP2",
+         "def": _fpdef([_pad("p2", (0.0, 0.0), "GND", size=(0.5, 0.5))])},
+    ])
+
+    # 17i ratsnest MST over 3 pads -> 2 airwires (partial route via a GND track).
+    run_compile_pcb("drc_ratsnest_mst", [
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [0.0, 0.0], "ref": "FP1",
+         "def": _fpdef([_pad("p1", (0.0, 0.0), "GND", size=(0.5, 0.5))])},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [10.0, 0.0], "ref": "FP2",
+         "def": _fpdef([_pad("p2", (0.0, 0.0), "GND", size=(0.5, 0.5))])},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [20.0, 0.0], "ref": "FP3",
+         "def": _fpdef([_pad("p3", (0.0, 0.0), "GND", size=(0.5, 0.5))])},
+        {"op": "pcb_add_track", "net": "GND", "layer": "F.Cu", "p1": [0.0, 0.0],
+         "p2": [10.0, 0.0], "width": 0.25},
+    ])
+
+    # 17j ZONE FILL: a GND pour with a different-net (SIG) pad carving a clearance hole,
+    #     a same-net GND THT pad (thermal relief ring + spokes), and a same-net GND SMD
+    #     pad (solid flood). Mirrors test_zonefill._base_board (track replaced by a SIG
+    #     pad since a SIG track can't be registered through the op vocabulary).
+    run_compile_pcb("zonefill_base", [
+        {"op": "pcb_set_outline", "shapes": _rect_outline(30.0, 20.0), "closed": True},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [15.0, 10.0], "ref": "FP1",
+         "def": _fpdef([_pad("p1", (0.0, 0.0), None, size=(2.0, 2.0))])},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [6.0, 6.0], "ref": "FP2",
+         "def": _fpdef([_pad("p2", (0.0, 0.0), "GND", size=(2.0, 2.0), ptype="tht",
+                             drill={"diameter": 1.0, "shape": "round", "offset": [0, 0]})],
+                       attr="tht")},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [24.0, 6.0], "ref": "FP3",
+         "def": _fpdef([_pad("p3", (0.0, 0.0), "GND", size=(2.0, 2.0))])},
+        {"op": "pcb_add_zone", "net": "GND", "layer": "F.Cu",
+         "polygon": [[2, 2], [28, 2], [28, 18], [2, 18]], "clearance": 0.3,
+         "thermal": {"gap": 0.4, "spoke_width": 0.5}},
+    ])
+
+    # 17k ZONE FILL with a SIG-pad strip carving a tall corridor that isolates a thin
+    #     left region (a second pour topology — multiple traced components). min_width
+    #     is not settable via pcb_add_zone, so both engines keep the strip; this
+    #     exercises the multi-component trace + keyhole path for parity.
+    run_compile_pcb("zonefill_island", [
+        {"op": "pcb_set_outline", "shapes": _rect_outline(20.0, 20.0), "closed": True},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [3.0, 10.0], "ref": "FP1",
+         "def": _fpdef([_pad("p1", (0.0, 0.0), None, size=(0.5, 18.0), shape="rect")])},
+        {"op": "pcb_add_zone", "net": "GND", "layer": "F.Cu",
+         "polygon": [[1, 1], [19, 1], [19, 19], [1, 19]], "clearance": 0.3,
+         "thermal": {"gap": 0.4, "spoke_width": 0.5}},
     ])
 
     print(f"\n[ecad-parity] {total - mism}/{total} steps at full parity")

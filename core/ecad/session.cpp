@@ -10,9 +10,11 @@
 #include <mutex>
 #include <vector>
 
+#include "ecad/drc.h"
 #include "ecad/erc.h"
 #include "ecad/netlist.h"
 #include "ecad/schema.h"
+#include "ecad/zonefill.h"
 
 namespace aicad::ecad {
 
@@ -62,12 +64,40 @@ void push_undo(Session& s) {
     s.redo_stack.clear();
 }
 
-// The `compile` field (engine/ecad/session.py::_compile). For a SCHEMATIC the
-// netlist + ERC are now computed in-process (build_netlist + run_erc), matching
-// the Python oracle. For a BOARD the DRC/ratsnest path is still DEFERRED, so the
-// pcb branch keeps the skeleton (drc:[]/ratsnest:[]). The timing `stats.ms` is
-// omitted (non-deterministic); the harness compares compile.netlist + compile.erc.
-json compile_field(const json& doc) {
+// Interactive compile uses a COARSER zone-fill grid than the export path
+// (engine.ecad.zonefill.DEFAULT_RESOLUTION = 0.1mm) — mirrors
+// engine/ecad/session.py::_INTERACTIVE_FILL_RESOLUTION.
+constexpr double kInteractiveFillResolution = 0.25;
+
+// Recompute every copper zone's filled_polys IN PLACE on `doc`
+// (engine/ecad/session.py::_fill_zones_into). Returns the number of zones filled,
+// or -1 if there were no zones. fill_zones is pure (returns a filled copy); we
+// copy each zone's freshly-computed filled_polys back onto the working doc.
+int fill_zones_into(json& doc, double resolution) {
+    if (!doc.contains("zones") || !doc["zones"].is_array() || doc["zones"].empty()) return -1;
+    json filled = fill_zones(doc, resolution);
+    std::map<json, json> by_id;
+    if (filled.contains("zones") && filled["zones"].is_array()) {
+        for (const auto& z : filled["zones"])
+            by_id[z.contains("id") ? z["id"] : json(nullptr)] =
+                z.contains("filled_polys") ? z["filled_polys"] : json::array();
+    }
+    int n = 0;
+    for (auto& zone : doc["zones"]) {
+        json key = zone.contains("id") ? zone["id"] : json(nullptr);
+        auto it = by_id.find(key);
+        zone["filled_polys"] = (it != by_id.end()) ? it->second : json::array();
+        ++n;
+    }
+    return n;
+}
+
+// The `compile` field (engine/ecad/session.py::_compile). SCHEMATIC: netlist + ERC.
+// BOARD: refresh zone fills in place (so `tree` carries current filled_polys), then
+// DRC + ratsnest. `stats.ms` is omitted (non-deterministic); the harness compares
+// compile.netlist + compile.erc (sch) and compile.drc + compile.ratsnest +
+// zone.filled_polys (pcb).
+json compile_field(json& doc) {
     json out = {{"netlist", nullptr}, {"erc", json::array()}, {"drc", json::array()},
                 {"ratsnest", json::array()}, {"stats", json::object()}};
     if (schema::is_schematic(doc)) {
@@ -78,8 +108,12 @@ json compile_field(const json& doc) {
                                    ? netlist["nets"].size()
                                    : 0;
     } else if (schema::is_board(doc)) {
+        int zfilled = fill_zones_into(doc, kInteractiveFillResolution);
+        if (zfilled >= 0) out["stats"]["zones_filled"] = zfilled;
+        out["drc"] = run_drc(doc);
+        out["ratsnest"] = ratsnest(doc);
         out["stats"]["nets"] = doc.contains("nets") && doc["nets"].is_array() ? doc["nets"].size() : 0;
-        out["stats"]["unrouted"] = 0;
+        out["stats"]["unrouted"] = out["ratsnest"].size();
     }
     return out;
 }
@@ -111,11 +145,13 @@ json ecad_new(const std::string& kind, const std::string& name) {
     s.doc["id"] = s.doc_id;  // Python uses a uuid4; the session id is faithful here
     s.revision = 0;
     Session& stored = g_sessions[s.doc_id] = std::move(s);
-    // ecad_new -> rebuild() (no op application, no rev bump) + doc_id.
+    // ecad_new -> rebuild() (no op application, no rev bump) + doc_id. Compile FIRST
+    // (it may write filled_polys into the doc) so `tree` carries the current fills.
+    json cf = compile_field(stored.doc);
+    stored.last_compile = cf;
     json resp = {{"revision", stored.revision}, {"id_map", json::object()},
                  {"kind", schema::doc_kind(stored.doc)}, {"tree", stored.doc},
-                 {"compile", compile_field(stored.doc)}};
-    stored.last_compile = resp["compile"];
+                 {"compile", cf}};
     resp["doc_id"] = stored.doc_id;
     return resp;
 }

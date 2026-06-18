@@ -50,6 +50,9 @@ std::set<std::string> valid_layers(int copper_layers);
 // geometry: world endpoint of a symbol pin (the connection tip away from the body)
 std::pair<double, double> pin_world(const nlohmann::json& symbol, const nlohmann::json& pin);
 
+// geometry: world position of a footprint pad (bottom-side footprints mirror across x)
+std::pair<double, double> pad_world(const nlohmann::json& footprint, const nlohmann::json& pad);
+
 // validation — returns a list of locator-prefixed error strings (empty = valid).
 std::vector<std::string> validate_schematic(const nlohmann::json& doc);
 std::vector<std::string> validate_board(const nlohmann::json& doc);

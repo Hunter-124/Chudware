@@ -192,6 +192,16 @@ std::pair<double, double> pin_world(const json& symbol, const json& pin) {
     return local_to_world(tx, ty, symbol["pos"], sang, mir);
 }
 
+std::pair<double, double> pad_world(const json& footprint, const json& pad) {
+    std::string mirror =
+        (footprint.value("side", std::string()) == "bottom") ? "x" : "none";
+    double px = pad["pos"][0].get<double>(), py = pad["pos"][1].get<double>();
+    double angle = (footprint.contains("angle") && footprint["angle"].is_number())
+                       ? footprint["angle"].get<double>()
+                       : 0.0;
+    return local_to_world(px, py, footprint["pos"], angle, mirror);
+}
+
 // ----------------------------------------------------------------- validation
 namespace {
 bool is_xy(const json& v) {

@@ -120,6 +120,8 @@ add_library(aicad_ecad STATIC
   ecad/ops.cpp
   ecad/netlist.cpp
   ecad/erc.cpp
+  ecad/drc.cpp
+  ecad/zonefill.cpp
   ecad/session.cpp)
 target_include_directories(aicad_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_ecad PUBLIC nlohmann_json::nlohmann_json)

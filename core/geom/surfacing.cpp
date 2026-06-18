@@ -17,6 +17,7 @@
 #include <BRepFill.hxx>
 #include <BRepFill_Filling.hxx>
 #include <BRepGProp.hxx>
+#include <BRepGProp_Face.hxx>
 #include <BRepOffset_MakeOffset.hxx>
 #include <BRepOffset_Mode.hxx>
 #include <BRepOffsetAPI_MakeOffsetShape.hxx>
@@ -443,6 +444,84 @@ TopoDS_Shape surf_trim_surface(const TopoDS_Shape& surface, const TopoDS_Face& t
     for (const auto& f : kept_faces) sew.Add(f);
     sew.Perform();
     return tighten_surface(sew.SewedShape());
+}
+
+// --------------------------------------------------------------------------- non-planar split
+
+namespace {
+// Center of mass of a solid piece (GProp volume centroid), mirroring split.py's
+// _piece_centroid (build123d Solid.center()).
+Eigen::Vector3d solid_centroid(const TopoDS_Shape& s) {
+    GProp_GProps gp;
+    BRepGProp::VolumeProperties(s, gp);
+    gp_Pnt c = gp.CentreOfMass();
+    return Eigen::Vector3d(c.X(), c.Y(), c.Z());
+}
+}  // namespace
+
+std::vector<TopoDS_Shape> split_solid_by_surface(const TopoDS_Shape& target,
+                                                 const TopoDS_Face& tool_face,
+                                                 const std::string& keep) {
+    if (target.IsNull() || tool_face.IsNull()) return {};
+
+    // BOP general splitter: divide the solid by the (possibly curved) tool face.
+    TopTools_ListOfShape args, tools;
+    args.Append(target);
+    tools.Append(tool_face);
+    BRepAlgoAPI_Splitter splitter;
+    splitter.SetArguments(args);
+    splitter.SetTools(tools);
+    splitter.Build();
+    if (!splitter.IsDone()) return {};
+
+    std::vector<TopoDS_Shape> pieces;
+    for (TopExp_Explorer ex(splitter.Shape(), TopAbs_SOLID); ex.More(); ex.Next()) {
+        const TopoDS_Shape& sol = ex.Current();
+        GProp_GProps gp;
+        BRepGProp::VolumeProperties(sol, gp);
+        if (gp.Mass() > 1e-9) pieces.push_back(sol);
+    }
+    // A single resulting solid means the surface did not actually divide the body.
+    if (pieces.size() < 2) return {};
+
+    if (keep == "both") return pieces;
+
+    // Tool face local normal — the axis along which keep-side is measured (median split).
+    // MUST mirror the oracle's build123d Face.normal_at() (split.py _surface_split): it evaluates
+    // BRepGProp_Face::Normal at u=0.5, v=0.5 of the UV bounds, which is ORIENTATION-AWARE — it
+    // flips the geometric normal when the tool face is TopAbs_REVERSED. A raw Geom_Surface::D1
+    // cross product would ignore the face orientation and could pick the wrong above/below side.
+    Eigen::Vector3d ref_normal(0, 0, 1);
+    {
+        Standard_Real u0, u1, v0, v1;
+        BRepTools::UVBounds(tool_face, u0, u1, v0, v1);
+        double u_val = u0 + 0.5 * (u1 - u0);
+        double v_val = v0 + 0.5 * (v1 - v0);
+        gp_Pnt p;
+        gp_Vec nv;
+        BRepGProp_Face(tool_face).Normal(u_val, v_val, p, nv);
+        if (nv.Magnitude() > 1e-12) {
+            nv.Normalize();
+            ref_normal = Eigen::Vector3d(nv.X(), nv.Y(), nv.Z());
+        }
+    }
+
+    // Bucket by centroid projection onto ref_normal at the MEDIAN (split.py _bucket_pieces).
+    std::vector<double> projs;
+    projs.reserve(pieces.size());
+    for (const auto& p : pieces) projs.push_back(ref_normal.dot(solid_centroid(p)));
+    std::vector<double> sorted_projs = projs;
+    std::sort(sorted_projs.begin(), sorted_projs.end());
+    size_t n = sorted_projs.size();
+    double median = (n % 2) ? sorted_projs[n / 2]
+                            : (sorted_projs[n / 2 - 1] + sorted_projs[n / 2]) / 2.0;
+    std::vector<TopoDS_Shape> kept;
+    for (size_t i = 0; i < pieces.size(); ++i) {
+        bool take = (keep == "above") ? (projs[i] >= median) : (projs[i] < median);
+        if (take) kept.push_back(pieces[i]);
+    }
+    if (kept.empty()) return pieces;  // degenerate (all equal) — keep all rather than drop
+    return kept;
 }
 
 // --------------------------------------------------------------------------- surf_replace_face

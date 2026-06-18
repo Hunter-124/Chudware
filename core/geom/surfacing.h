@@ -90,6 +90,17 @@ TopoDS_Shape surf_delete_faces(const TopoDS_Shape& solid,
 TopoDS_Shape surf_trim_surface(const TopoDS_Shape& surface, const TopoDS_Face& tool_face,
                                const std::string& keep, int& out_split_count);
 
+// --- non-planar split: divide solid `target` along the (possibly curved) `tool_face`
+// using OCCT's general BOP splitter (BRepAlgoAPI_Splitter), returning the resulting
+// positive-volume solid pieces. Empty when the face does not actually divide the body
+// (a single piece comes back). C++ port of split.py::_split_by_surface. `keep` then
+// buckets the pieces along the tool face's local normal at the MEDIAN projection,
+// mirroring split.py::_bucket_pieces: "both" keeps all, "above" the +normal half,
+// "below" the -normal half. The returned vector is the kept subset (>=1 when divided).
+std::vector<TopoDS_Shape> split_solid_by_surface(const TopoDS_Shape& target,
+                                                 const TopoDS_Face& tool_face,
+                                                 const std::string& keep);
+
 // --- surf_replace_face: split `solid` by the replacement `surface`, keep the
 // piece(s) that do NOT carry any face at `target_centroids` (the retained side),
 // fuse them into one solid. `diag` is the solid's bbox diagonal (tolerance scale).

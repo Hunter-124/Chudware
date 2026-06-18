@@ -519,6 +519,40 @@ def fixtures():
     out["split_both"] = {"features": _split_base() + [_split("both")]}    # 2 bodies, 15000
     out["split_above"] = {"features": _split_base() + [_split("above")]}  # 1 body, 9000
 
+    # ---- split by a NON-PLANAR surface (split.py::_surface_split, BOP path) ---------
+    # A FACE selector resolving to a CURVED face takes the general BOP splitter path
+    # (BRepAlgoAPI_Splitter) instead of the planar half-space path. Target body A is a
+    # 40x40x30 box (V=48000); tool body B is a coaxial cylinder r=10, h=40 centred at
+    # (10,20) (taller than A so its lateral face spans A's full Z), built merge:false so
+    # both stay standalone. The split tool is B's LATERAL CYLINDRICAL face. Per the
+    # oracle the body that OWNS the tool face (B) passes through UNCHANGED; box A is
+    # divided by the curved face into the cylindrical plug it carves out + the
+    # remainder. The cylinder is OFFSET in X (cx=10) so the two pieces have distinct
+    # centroids -> the median bucket along the tool's local normal is non-degenerate
+    # (keep=above/below pick opposite single pieces). Gated the SAME way as the planar
+    # split: per-body + total volume + body count, version-independent (exact BRep vol).
+    #   keep=both  -> 3 bodies (A's 2 pieces + B), total V = 48000 + pi*100*40.
+    #   keep=above -> 2 bodies (one A piece + B); below -> the OTHER A piece + B.
+    SS_CX = 10.0
+    ss_box_e, ss_box_c = _rect(0, 0, 40, 40)
+    ss_cyl_e = [_circle("ec", SS_CX, 20, 10)]
+    ss_cyl_c = [_rel("cc1", "fix", ["ec.center"]), _dim("cc2", "radius", ["ec"], 10)]
+    # Tool: B's lateral cylindrical face (surf="cylinder", axis +Z, area=2*pi*r*h).
+    ss_tool = {"kind": "face", "surf": "cylinder",
+               "centroid": [SS_CX - 10.0, 20.0, 20.0], "axis": [0.0, 0.0, 1.0],
+               "area_or_len": 2.0 * 3.141592653589793 * 10.0 * 40.0,
+               "owner_feature": None, "hint_index": 0}
+    def _ss_base():
+        return [_sketch("sa", "plane.top", ss_box_e, ss_box_c),
+                _extrude("ba", "sa", 30.0, merge=False),
+                _sketch("sb", "plane.top", ss_cyl_e, ss_cyl_c),
+                _extrude("bb", "sb", 40.0, merge=False)]
+    def _ss_split(keep):
+        return {"id": "sp", "type": "split", "params": {"keep": keep}, "refs": {"tool": ss_tool}}
+    out["split_surface_both"] = {"features": _ss_base() + [_ss_split("both")]}    # 3 bodies
+    out["split_surface_above"] = {"features": _ss_base() + [_ss_split("above")]}  # 2 bodies
+    out["split_surface_below"] = {"features": _ss_base() + [_ss_split("below")]}  # 2 bodies
+
     # ---- datum point / coordinate (engine/doc/features/datum.py compile_point) ----
     def _point(fid, x, y, z):
         return {"id": fid, "type": "point",

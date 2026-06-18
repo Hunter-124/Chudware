@@ -1471,6 +1471,92 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     throw std::runtime_error("split: unknown keep '" + keep + "'");
                 if (!feat.contains("tool"))
                     throw std::runtime_error("split: refs.tool is required (a planar datum)");
+
+                // --- non-planar / surface split (split.py::_surface_split) ----------
+                // A FACE selector whose best match across the running bodies is a CURVED
+                // surface takes the general BOP splitter path (BRepAlgoAPI_Splitter);
+                // planar faces, datum planes, and reserved planes fall through to the
+                // half-space planar path below (behaviour for planar tools unchanged).
+                // Mirrors split.py::_tool_is_curved_face -> _surface_split exactly.
+                bool nonplanar_done = false;
+                {
+                    const json& tool = feat.at("tool");
+                    bool tool_is_face_sel = tool.is_object() &&
+                                            tool.value("kind", std::string()) == "face";
+                    TopoDS_Face tool_face;
+                    std::string owner_id;  // id of the body that OWNS the tool face
+                    bool tool_resolved = false;
+                    bool tool_is_curved = false;
+                    if (tool_is_face_sel) {
+                        // Resolve the face pick against every surviving solid body (the
+                        // oracle scans ctx.bodies and keeps the best-scoring match); take
+                        // the first body that resolves it, tracking the owner id so the
+                        // owning body is never split by its own face.
+                        for (const std::string& cand : solid_order) {
+                            if (consumed.count(cand)) continue;
+                            if (!std::holds_alternative<SolidResult>(results.at(cand))) continue;
+                            const TopoDS_Shape& cb = std::get<SolidResult>(results.at(cand)).shape;
+                            if (cb.IsNull()) continue;
+                            aicad::doc::FacePicks fp =
+                                aicad::doc::resolve_face_picks(cb, tool, "tool");
+                            if (!fp.faces.empty()) {
+                                tool_face = fp.faces.front();
+                                owner_id = cand;
+                                tool_resolved = true;
+                                BRepAdaptor_Surface ad(tool_face);
+                                tool_is_curved = (ad.GetType() != GeomAbs_Plane);
+                                break;
+                            }
+                        }
+                    }
+                    if (tool_resolved && tool_is_curved) {
+                        // Gather surviving solids the tool acts on (the running bodies).
+                        std::vector<std::string> targets;
+                        for (const std::string& sid : solid_order)
+                            if (!consumed.count(sid) &&
+                                std::holds_alternative<SolidResult>(results.at(sid)))
+                                targets.push_back(sid);
+                        if (targets.empty())
+                            throw std::runtime_error("split: no body to split");
+
+                        std::vector<std::pair<std::string, TopoDS_Shape>> new_pieces;
+                        int split_count = 0;
+                        for (const std::string& sid : targets) {
+                            // A body is never split by one of its OWN faces (degenerate:
+                            // BOP returns it whole) — pass the owner through unchanged.
+                            if (sid == owner_id) continue;
+                            const TopoDS_Shape& body =
+                                std::get<SolidResult>(results.at(sid)).shape;
+                            std::vector<TopoDS_Shape> kept =
+                                ::geom::split_solid_by_surface(body, tool_face, keep);
+                            if (kept.empty()) continue;  // surface missed/tangent
+                            ++split_count;
+                            consumed.insert(sid);
+                            for (const TopoDS_Shape& piece : kept)
+                                new_pieces.emplace_back(sid, piece);
+                        }
+                        if (split_count == 0)
+                            throw std::runtime_error(
+                                "split: the tool surface does not intersect/divide any body");
+
+                        // Register each kept piece as a new solid (id = "<fid>#k").
+                        int k = 0;
+                        for (auto& [src_id, shp] : new_pieces) {
+                            std::string pid =
+                                (k == 0 && new_pieces.size() == 1)
+                                    ? id
+                                    : id + "#" + std::to_string(k);
+                            results[pid] = SolidResult{shp};
+                            solid_order.push_back(pid);
+                            source_of[pid] = src_id;
+                            ++k;
+                        }
+                        st.ok = true;
+                        nonplanar_done = true;  // skip the planar half-space path
+                    }
+                }
+
+                if (!nonplanar_done) {
                 auto tp = resolve_plane_ref(feat.at("tool"));
                 if (!tp)
                     throw std::runtime_error(
@@ -1558,6 +1644,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     ++k;
                 }
                 st.ok = true;
+                }  // end planar half-space path (!nonplanar_done)
 
             } else if (type == "extrude") {
                 const std::string prof = req_str(feat, "profile");

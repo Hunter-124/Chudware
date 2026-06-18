@@ -45,6 +45,7 @@
 #include <GProp_GProps.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <TopAbs.hxx>
+#include <TopoDS.hxx>
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
@@ -52,6 +53,8 @@
 #include <gp_Dir.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Vec.hxx>
+#include <Geom_Surface.hxx>
 
 #include "doc/formats.h"  // import_bodies / detect_format (the import feature)
 #include "doc/picks.h"
@@ -65,6 +68,7 @@
 #include "geom/profile.h"
 #include "geom/sheetmetal.h"
 #include "geom/weldment.h"
+#include "geom/surfacing.h"
 #include "geom/tessellate.h"
 #include "geom/transform.h"
 #include "geom/aicm.h"
@@ -477,6 +481,11 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     // (1..N) and AICM body order are deterministic across rebuilds.
     std::vector<std::string> solid_order;
 
+    // Body KIND per feature id ("solid" default; "surface" for open sheet bodies the
+    // surf_* compilers produce). The surviving-bodies loop reads this to report AREA +
+    // face/edge counts (surfaces) vs VOLUME (solids), the surfacing parity-gate signal.
+    std::map<std::string, std::string> body_kinds;
+
     // The body each MODIFYING feature derived from (fillet/shell/boolean/... -> its
     // input solid id). Empty/absent for a CREATING feature (extrude boss/revolve/
     // sweep/loft/primitive build a fresh body). Drives the owner-map topology diff.
@@ -510,6 +519,49 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         if (feat.contains("body") && feat["body"].is_string())
             return feat["body"].get<std::string>();
         return current_solid_id();
+    };
+
+    // --- surfacing helpers (engine/doc/features/surf_*.py) -----------------------
+    // Resolve a `profile` ref (a sketch id, after normalize_feature) to its solved
+    // planar faces. Mirrors extrude._resolve_profile_faces for the simplified model.
+    auto surf_profile_faces = [&](const json& feat) -> std::vector<TopoDS_Face> {
+        const std::string prof = req_str(feat, "profile");
+        const SketchResult& src = require_sketch(results, prof, prof.c_str());
+        if (src.faces.empty())
+            throw std::runtime_error("surf: profile sketch has no closed face");
+        return src.faces;
+    };
+    // Resolve a sketch-id curve ref to its raw closed/open wire (for ruled rails /
+    // fill / boundary boundary curves). The ref is a region selector or a bare id.
+    auto surf_sketch_wire = [&](const json& ref, const char* slot) -> TopoDS_Wire {
+        const std::string sk = selector_owner_id(ref);
+        if (sk.empty())
+            throw std::runtime_error(std::string("surf: malformed ") + slot + " ref");
+        const SketchResult& src = require_sketch(results, sk, slot);
+        TopoDS_Wire w = aicad::geom::wire_from_solved_sketch(src.entities, src.plane);
+        if (w.IsNull())
+            throw std::runtime_error(std::string("surf: ") + slot + " sketch produced no wire");
+        return w;
+    };
+    // Planar-face normal (build123d face.normal_at() analogue): the geometric surface
+    // normal at the face's UV midpoint, used to set the surf_extrude sweep direction.
+    auto src_face_normal = [&](const TopoDS_Face& f) -> Eigen::Vector3d {
+        Standard_Real u0, u1, v0, v1;
+        BRepTools::UVBounds(f, u0, u1, v0, v1);
+        Handle(Geom_Surface) gs = BRep_Tool::Surface(f);
+        Eigen::Vector3d n(0, 0, 1);
+        if (!gs.IsNull()) {
+            gp_Pnt p;
+            gp_Vec du, dv;
+            gs->D1((u0 + u1) / 2.0, (v0 + v1) / 2.0, p, du, dv);
+            gp_Vec nv = du.Crossed(dv);
+            if (nv.Magnitude() > 1e-12) {
+                nv.Normalize();
+                n = Eigen::Vector3d(nv.X(), nv.Y(), nv.Z());
+            }
+        }
+        if (f.Orientation() == TopAbs_REVERSED) n = -n;
+        return n;
     };
 
     const json empty = json::array();
@@ -1983,6 +2035,383 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 solid_order.push_back(id);
                 st.ok = true;
 
+            } else if (type == "surf_planar") {
+                // The bounding sketch FACE is the surface body (no thickness).
+                std::vector<TopoDS_Face> faces = surf_profile_faces(feat);
+                results[id] = SolidResult{faces.front()};
+                solid_order.push_back(id);
+                body_kinds[id] = "surface";
+                st.ok = true;
+
+            } else if (type == "surf_extrude") {
+                std::vector<TopoDS_Face> faces = surf_profile_faces(feat);
+                const std::string end = feat.value("end", std::string("blind"));
+                const bool flip = feat.value("flip", false);
+                const double depth = feat.contains("depth")
+                    ? num_or_expr(feat.at("depth"), env) : 10.0;
+                // Direction = first profile face normal (flip negates). Sketch plane
+                // normal is the exact analogue of build123d face.normal_at() here.
+                Eigen::Vector3d normal = src_face_normal(faces.front());
+                if (flip) normal = -normal;
+                double amount = depth;
+                bool mid = (end == "mid_plane");
+                if (end == "through_all") {
+                    Bnd_Box bb;
+                    BRepBndLib::Add(faces.front(), bb);
+                    double x0, y0, z0, x1, y1, z1;
+                    bb.Get(x0, y0, z0, x1, y1, z1);
+                    double diag = std::sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0) +
+                                            (z1 - z0) * (z1 - z0));
+                    amount = 1.05 * std::max(diag, 1e-3) * 2.0;
+                }
+                if (!(amount > 0.0))
+                    throw std::runtime_error("surf_extrude: effective depth must be > 0");
+                TopoDS_Shape shell = ::geom::surf_extrude_walls(faces, normal, amount, mid);
+                if (shell.IsNull())
+                    throw std::runtime_error("surf_extrude: side-wall build failed");
+                results[id] = SolidResult{shell};
+                solid_order.push_back(id);
+                body_kinds[id] = "surface";
+                st.ok = true;
+
+            } else if (type == "surf_revolve") {
+                std::vector<TopoDS_Face> faces = surf_profile_faces(feat);
+                const Eigen::Vector3d axis_pt = req_vec3(feat, "axis_pt");
+                const Eigen::Vector3d axis_dir = req_vec3(feat, "axis_dir");
+                double angle_deg = feat.contains("angle")
+                    ? num_or_expr(feat.at("angle"), env) : 360.0;
+                if (std::abs(angle_deg) < 1e-6)
+                    throw std::runtime_error("surf_revolve: angle must be non-zero");
+                if (std::abs(angle_deg) > 360.0 + 1e-6)
+                    angle_deg = std::copysign(360.0, angle_deg);
+                TopoDS_Shape shell = ::geom::surf_revolve_walls(
+                    faces, axis_pt, axis_dir, radians(std::abs(angle_deg)));
+                if (shell.IsNull())
+                    throw std::runtime_error("surf_revolve: MakeRevol failed");
+                results[id] = SolidResult{shell};
+                solid_order.push_back(id);
+                body_kinds[id] = "surface";
+                st.ok = true;
+
+            } else if (type == "surf_sweep") {
+                std::vector<TopoDS_Face> faces = surf_profile_faces(feat);
+                auto pit = feat.find("path");
+                if (pit == feat.end())
+                    throw std::runtime_error("surf_sweep: a 'path' ref is required");
+                const std::string path_id = selector_owner_id(*pit);
+                const SketchResult& pathsk = require_sketch(results, path_id, "path");
+                TopoDS_Wire spine =
+                    aicad::geom::wire_from_solved_sketch(pathsk.entities, pathsk.plane);
+                if (spine.IsNull())
+                    throw std::runtime_error("surf_sweep: path produced no wire");
+                TopoDS_Shape shell = ::geom::surf_sweep_walls(faces, spine);
+                if (shell.IsNull())
+                    throw std::runtime_error("surf_sweep: build failed");
+                results[id] = SolidResult{shell};
+                solid_order.push_back(id);
+                body_kinds[id] = "surface";
+                st.ok = true;
+
+            } else if (type == "surf_loft") {
+                auto sit = feat.find("sections");
+                if (sit == feat.end() || !sit->is_array() || sit->size() < 2)
+                    throw std::runtime_error("surf_loft: needs >= 2 sections");
+                std::vector<TopoDS_Wire> wires;
+                for (const json& s : *sit) {
+                    const std::string sk = selector_owner_id(s);
+                    const SketchResult& src = require_sketch(results, sk, sk.c_str());
+                    if (src.faces.empty())
+                        throw std::runtime_error("surf_loft: section '" + sk + "' has no face");
+                    TopoDS_Wire w = BRepTools::OuterWire(src.faces.front());
+                    if (w.IsNull())
+                        throw std::runtime_error("surf_loft: section '" + sk + "' has no wire");
+                    wires.push_back(w);
+                }
+                const bool ruled = feat.value("ruled", false);
+                TopoDS_Shape shell = ::geom::surf_loft_shell(wires, ruled);
+                if (shell.IsNull())
+                    throw std::runtime_error("surf_loft: ThruSections failed");
+                results[id] = SolidResult{shell};
+                solid_order.push_back(id);
+                body_kinds[id] = "surface";
+                st.ok = true;
+
+            } else if (type == "surf_ruled") {
+                if (!feat.contains("edge_a") || !feat.contains("edge_b"))
+                    throw std::runtime_error("surf_ruled: edge_a and edge_b are required");
+                TopoDS_Wire wa = surf_sketch_wire(feat.at("edge_a"), "edge_a");
+                TopoDS_Wire wb = surf_sketch_wire(feat.at("edge_b"), "edge_b");
+                TopoDS_Shape surf = ::geom::surf_ruled_surface(wa, wb);
+                if (surf.IsNull())
+                    throw std::runtime_error("surf_ruled: build failed");
+                results[id] = SolidResult{surf};
+                solid_order.push_back(id);
+                body_kinds[id] = "surface";
+                st.ok = true;
+
+            } else if (type == "surf_offset") {
+                const std::string body_id = body_ref(feat);
+                if (body_id.empty())
+                    throw std::runtime_error("surf_offset: requires an existing body");
+                const TopoDS_Shape& body = require_solid(results, body_id, "body");
+                const double distance = feat.contains("distance")
+                    ? num_or_expr(feat.at("distance"), env) : 5.0;
+                if (std::abs(distance) < 1e-9)
+                    throw std::runtime_error("surf_offset: distance must be non-zero");
+                auto fit = feat.find("faces");
+                if (fit == feat.end())
+                    throw std::runtime_error("surf_offset: refs.faces is required");
+                aicad::doc::FacePicks picks =
+                    aicad::doc::resolve_face_picks(body, *fit, "faces");
+                if (!picks.dangling.empty())
+                    throw std::runtime_error("surf_offset: face selector(s) dangling");
+                if (picks.faces.empty())
+                    throw std::runtime_error("surf_offset: no faces resolved");
+                TopoDS_Shape surf = ::geom::surf_offset_surface(picks.faces, distance);
+                if (surf.IsNull())
+                    throw std::runtime_error("surf_offset: offset build failed");
+                results[id] = SolidResult{surf};
+                solid_order.push_back(id);
+                body_kinds[id] = "surface";
+                st.ok = true;
+
+            } else if (type == "surf_fill" || type == "surf_boundary") {
+                // Boundary edges come from sketch region curve(s). For surf_fill the
+                // ref slot is "edges"; for surf_boundary it is "dir1" (+ optional dir2).
+                std::vector<TopoDS_Edge> edges;
+                auto add_wire_edges = [&](const json& ref, const char* slot) {
+                    TopoDS_Wire w = surf_sketch_wire(ref, slot);
+                    for (TopExp_Explorer ex(w, TopAbs_EDGE); ex.More(); ex.Next())
+                        edges.push_back(TopoDS::Edge(ex.Current()));
+                };
+                if (type == "surf_fill") {
+                    auto eit = feat.find("edges");
+                    if (eit == feat.end() || !eit->is_array() || eit->empty())
+                        throw std::runtime_error("surf_fill: refs.edges is required");
+                    for (const json& s : *eit) add_wire_edges(s, "edges");
+                } else {
+                    auto d1 = feat.find("dir1");
+                    if (d1 == feat.end())
+                        throw std::runtime_error("surf_boundary: refs.dir1 is required");
+                    if (d1->is_array()) { for (const json& s : *d1) add_wire_edges(s, "dir1"); }
+                    else add_wire_edges(*d1, "dir1");
+                    auto d2 = feat.find("dir2");
+                    if (d2 != feat.end()) {
+                        if (d2->is_array()) { for (const json& s : *d2) add_wire_edges(s, "dir2"); }
+                        else add_wire_edges(*d2, "dir2");
+                    }
+                }
+                const int cont = (feat.value("continuity", std::string("g0")) == "g1") ? 1 : 0;
+                TopoDS_Shape patch = ::geom::surf_fill_patch(edges, cont);
+                if (patch.IsNull())
+                    throw std::runtime_error(type + ": BRepFill_Filling failed");
+                results[id] = SolidResult{patch};
+                solid_order.push_back(id);
+                body_kinds[id] = "surface";
+                st.ok = true;
+
+            } else if (type == "surf_knit") {
+                auto sit = feat.find("surfaces");
+                if (sit == feat.end() || !sit->is_array() || sit->size() < 2)
+                    throw std::runtime_error("surf_knit: needs >= 2 surface bodies");
+                std::vector<TopoDS_Shape> inputs;
+                std::vector<std::string> consumed_ids;
+                for (const json& s : *sit) {
+                    const std::string owner = selector_owner_id(s);
+                    if (owner.empty())
+                        throw std::runtime_error("surf_knit: malformed surface selector");
+                    inputs.push_back(require_solid(results, owner, "surfaces"));
+                    consumed_ids.push_back(owner);
+                }
+                // Sew tolerance: 1e-3 * combined bbox diagonal, clamped [1e-4, 0.1].
+                Bnd_Box bb;
+                for (const TopoDS_Shape& s : inputs) BRepBndLib::Add(s, bb);
+                double tol = 1e-3;
+                if (!bb.IsVoid()) {
+                    double x0, y0, z0, x1, y1, z1;
+                    bb.Get(x0, y0, z0, x1, y1, z1);
+                    double diag = std::sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0) +
+                                            (z1 - z0) * (z1 - z0));
+                    tol = std::max(1e-4, std::min(0.1, diag * 1e-3));
+                }
+                bool is_solid = false;
+                TopoDS_Shape knit = ::geom::surf_knit_bodies(inputs, tol, is_solid);
+                if (knit.IsNull())
+                    throw std::runtime_error("surf_knit: sewing failed");
+                for (const std::string& cid : consumed_ids) consumed.insert(cid);
+                results[id] = SolidResult{knit};
+                solid_order.push_back(id);
+                body_kinds[id] = is_solid ? "solid" : "surface";
+                st.ok = true;
+
+            } else if (type == "surf_delete_face") {
+                const std::string body_id = body_ref(feat);
+                if (body_id.empty())
+                    throw std::runtime_error("surf_delete_face: requires an existing body");
+                const TopoDS_Shape& body = require_solid(results, body_id, "body");
+                auto fit = feat.find("faces");
+                if (fit == feat.end())
+                    throw std::runtime_error("surf_delete_face: refs.faces is required");
+                aicad::doc::FacePicks picks =
+                    aicad::doc::resolve_face_picks(body, *fit, "faces");
+                if (!picks.dangling.empty())
+                    throw std::runtime_error("surf_delete_face: face selector(s) dangling");
+                if (picks.faces.empty())
+                    throw std::runtime_error("surf_delete_face: no faces resolved");
+                std::vector<Eigen::Vector3d> cents;
+                for (const TopoDS_Face& f : picks.faces)
+                    cents.push_back(::geom::face_centroid(f));
+                double tol = std::max(aicad::doc::bbox_diag(body), 1.0) * 1e-4;
+                TopoDS_Shape shell = ::geom::surf_delete_faces(body, cents, tol);
+                if (shell.IsNull())
+                    throw std::runtime_error("surf_delete_face: nothing left after delete");
+                // REPLACE the solid with the opened shell (same body, now a surface).
+                consumed.insert(body_id);
+                source_of[id] = body_id;
+                results[id] = SolidResult{shell};
+                solid_order.push_back(id);
+                body_kinds[id] = "surface";
+                st.ok = true;
+
+            } else if (type == "surf_trim") {
+                auto ssel = feat.find("surface");
+                if (ssel == feat.end())
+                    throw std::runtime_error("surf_trim: refs.surface is required");
+                const std::string surf_owner = selector_owner_id(*ssel);
+                const TopoDS_Shape& surface = require_solid(results, surf_owner, "surface");
+                auto tit = feat.find("tool");
+                if (tit == feat.end())
+                    throw std::runtime_error("surf_trim: refs.tool is required");
+                // The tool is a FACE selector (split._resolve_tool_face searches every
+                // running body), a sketch id whose face is the planar tool, or a body
+                // owner whose picked face is the tool. Try, in order: a named sketch
+                // face, then a face pick against every surviving solid body.
+                TopoDS_Face tool_face;
+                bool tool_ok = false;
+                const std::string tool_owner = selector_owner_id(*tit);
+                if (!tool_owner.empty() && results.count(tool_owner) &&
+                    std::holds_alternative<SketchResult>(results.at(tool_owner))) {
+                    const SketchResult& tsk = std::get<SketchResult>(results.at(tool_owner));
+                    if (!tsk.faces.empty()) { tool_face = tsk.faces.front(); tool_ok = true; }
+                }
+                if (!tool_ok && tit->is_object() &&
+                    tit->value("kind", std::string()) == "face") {
+                    // Resolve the face pick against every surviving solid body (the split
+                    // tool-face resolver scans all bodies); take the first that resolves.
+                    for (const std::string& cand : solid_order) {
+                        if (consumed.count(cand)) continue;
+                        if (!std::holds_alternative<SolidResult>(results.at(cand))) continue;
+                        const TopoDS_Shape& cb = std::get<SolidResult>(results.at(cand)).shape;
+                        if (cb.IsNull()) continue;
+                        aicad::doc::FacePicks tp =
+                            aicad::doc::resolve_face_picks(cb, *tit, "tool");
+                        if (!tp.faces.empty()) { tool_face = tp.faces.front(); tool_ok = true; break; }
+                    }
+                }
+                if (!tool_ok)
+                    throw std::runtime_error("surf_trim: tool face did not resolve");
+                const std::string keep = feat.value("keep", std::string("both"));
+                int split_count = 0;
+                TopoDS_Shape trimmed =
+                    ::geom::surf_trim_surface(surface, tool_face, keep, split_count);
+                if (trimmed.IsNull() || split_count == 0)
+                    throw std::runtime_error("surf_trim: tool did not divide the surface");
+                consumed.insert(surf_owner);
+                source_of[id] = surf_owner;
+                results[id] = SolidResult{trimmed};
+                solid_order.push_back(id);
+                body_kinds[id] = "surface";
+                st.ok = true;
+
+            } else if (type == "surf_replace_face") {
+                // The modification target is the last SOLID body (a surface body in the
+                // list is skipped — replace_face heals a solid, not a sheet).
+                std::string body_id;
+                if (feat.contains("body") && feat["body"].is_string()) {
+                    body_id = feat["body"].get<std::string>();
+                } else {
+                    for (auto it = solid_order.rbegin(); it != solid_order.rend(); ++it) {
+                        if (consumed.count(*it)) continue;
+                        auto kit = body_kinds.find(*it);
+                        if (kit != body_kinds.end() && kit->second == "surface") continue;
+                        body_id = *it;
+                        break;
+                    }
+                }
+                if (body_id.empty())
+                    throw std::runtime_error("surf_replace_face: requires an existing solid");
+                const TopoDS_Shape& solid = require_solid(results, body_id, "body");
+                auto fit = feat.find("faces");
+                if (fit == feat.end())
+                    throw std::runtime_error("surf_replace_face: refs.faces is required");
+                aicad::doc::FacePicks picks =
+                    aicad::doc::resolve_face_picks(solid, *fit, "faces");
+                if (picks.faces.empty())
+                    throw std::runtime_error("surf_replace_face: no target faces resolved");
+                auto ssel = feat.find("surface");
+                if (ssel == feat.end())
+                    throw std::runtime_error("surf_replace_face: refs.surface is required");
+                // The replacement surface is a BODY selector (a whole surface body) or a
+                // FACE selector (a single face on any running body). Resolve either.
+                TopoDS_Shape replacement;
+                const std::string surf_owner = selector_owner_id(*ssel);
+                if (!surf_owner.empty() && results.count(surf_owner) &&
+                    std::holds_alternative<SolidResult>(results.at(surf_owner)) &&
+                    surf_owner != body_id) {
+                    replacement = std::get<SolidResult>(results.at(surf_owner)).shape;
+                } else if (ssel->is_object() &&
+                           ssel->value("kind", std::string()) == "face") {
+                    for (const std::string& cand : solid_order) {
+                        if (cand == body_id || consumed.count(cand)) continue;
+                        if (!std::holds_alternative<SolidResult>(results.at(cand))) continue;
+                        const TopoDS_Shape& cb = std::get<SolidResult>(results.at(cand)).shape;
+                        if (cb.IsNull()) continue;
+                        aicad::doc::FacePicks rp =
+                            aicad::doc::resolve_face_picks(cb, *ssel, "surface");
+                        if (!rp.faces.empty()) { replacement = rp.faces.front(); break; }
+                    }
+                }
+                if (replacement.IsNull())
+                    throw std::runtime_error("surf_replace_face: replacement surface did not resolve");
+                std::vector<Eigen::Vector3d> cents;
+                for (const TopoDS_Face& f : picks.faces)
+                    cents.push_back(::geom::face_centroid(f));
+                TopoDS_Shape healed =
+                    ::geom::surf_replace_face_solid(solid, cents, replacement,
+                                                    aicad::doc::bbox_diag(solid));
+                if (healed.IsNull())
+                    throw std::runtime_error("surf_replace_face: could not heal a solid");
+                consumed.insert(body_id);
+                source_of[id] = body_id;
+                results[id] = SolidResult{healed};
+                solid_order.push_back(id);
+                body_kinds[id] = "solid";
+                st.ok = true;
+
+            } else if (type == "surf_thicken") {
+                auto ssel = feat.find("surface");
+                if (ssel == feat.end())
+                    throw std::runtime_error("surf_thicken: refs.surface is required");
+                const std::string surf_owner = selector_owner_id(*ssel);
+                const TopoDS_Shape& surface = require_solid(results, surf_owner, "surface");
+                const double thickness = feat.contains("thickness")
+                    ? num_or_expr(feat.at("thickness"), env) : 2.0;
+                if (!(thickness > 0.0))
+                    throw std::runtime_error("surf_thicken: thickness must be > 0");
+                const std::string side = feat.value("side", std::string("one"));
+                const bool flip = feat.value("flip", false);
+                TopoDS_Shape solid =
+                    ::geom::surf_thicken_solid(surface, thickness, side, flip);
+                if (solid.IsNull())
+                    throw std::runtime_error("surf_thicken: thickening failed");
+                // The solid REPLACES the consumed surface body.
+                consumed.insert(surf_owner);
+                source_of[id] = surf_owner;
+                results[id] = SolidResult{solid};
+                solid_order.push_back(id);
+                body_kinds[id] = "solid";
+                st.ok = true;
+
             } else {
                 // Forward-tolerant: an unknown feature type errors but the rebuild
                 // continues (mirrors the Python's "no compiler for type" path).
@@ -2013,10 +2442,28 @@ CompileResult compile_document(const json& doc, const json& env_json) {
             bodies.push_back(::geom::tessellate_body(shape, body_num, sid, color));
             result.shapes.push_back(shape);  // AICM order: shapes[i] <-> body ordinal i+1
             ++body_num;
-            // Accumulate the exact solid volume (geometry-level parity signal).
-            GProp_GProps gp;
-            BRepGProp::VolumeProperties(shape, gp);
-            result.volume += gp.Mass();
+            // Per-body stats: SURFACE bodies report meaningful AREA + face/edge counts
+            // (volume reported as 0, matching the oracle — VolumeProperties on an OPEN
+            // shell yields a meaningless signed value); SOLID bodies report VOLUME. The
+            // surfacing gate reads these (tools/cpp_surf_parity.py). Additive — existing
+            // solid fixtures are unaffected (default kind "solid" -> volume accumulates).
+            BodyInfo bi;
+            bi.name = sid;
+            auto kit = body_kinds.find(sid);
+            bi.kind = (kit != body_kinds.end()) ? kit->second : std::string("solid");
+            const bool is_surface = (bi.kind == "surface");
+            double vol = 0.0;
+            if (!is_surface) {
+                GProp_GProps gp;
+                BRepGProp::VolumeProperties(shape, gp);
+                vol = gp.Mass();
+            }
+            result.volume += vol;  // only solids contribute to the total volume signal
+            bi.volume = vol;
+            bi.area = ::geom::shape_area(shape);
+            bi.n_faces = ::geom::shape_face_count(shape);
+            bi.n_edges = ::geom::shape_edge_count(shape);
+            result.bodies_info.push_back(std::move(bi));
         } catch (...) {
             // A tessellation failure must not crash the rebuild; skip this body.
         }

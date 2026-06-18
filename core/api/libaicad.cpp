@@ -113,10 +113,25 @@ int handle_compile(const json& params, char** out_json) {
         aicm_path = std::filesystem::absolute(target).string();
     }
 
+    // Per-surviving-body stats (surfacing parity gate: area/face/edge counts for open
+    // shells, volume for solids). Additive — existing volume fixtures are unaffected.
+    json bodies = json::array();
+    for (const auto& b : res.bodies_info) {
+        bodies.push_back(json{
+            {"name", b.name},
+            {"kind", b.kind},
+            {"volume", b.volume},
+            {"area", b.area},
+            {"n_faces", b.n_faces},
+            {"n_edges", b.n_edges},
+        });
+    }
+
     return emit(json{
                     {"ok", res.ok},
                     {"body_count", res.body_count},
                     {"volume", res.volume},
+                    {"bodies", bodies},
                     {"statuses", statuses},
                     {"owner_map", res.owner_map.is_null() ? json::object() : res.owner_map},
                     {"aicm_path", aicm_path},

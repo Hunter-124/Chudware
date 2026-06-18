@@ -51,12 +51,25 @@ struct FeatureStatus {
     std::string error;  // empty when ok
 };
 
+// Per-surviving-body geometry stats (in AICM body order). Additive surfacing gate
+// signal: open SURFACE bodies report meaningful AREA + face/edge counts (volume ~= 0),
+// SOLID bodies report meaningful VOLUME. Mirrors the Python oracle's per-BodyOut props.
+struct BodyInfo {
+    std::string name;     // owning feature id (= AICM body name)
+    std::string kind;     // "solid" | "surface"
+    double volume = 0.0;  // enclosed volume (mm^3); ~0 for an open surface
+    double area = 0.0;    // surface area (mm^2)
+    int n_faces = 0;
+    int n_edges = 0;
+};
+
 // The result of compiling a whole document.
 struct CompileResult {
     std::vector<FeatureStatus> statuses;  // one per feature, in tree order
     std::vector<uint8_t> aicm;            // serialized SURVIVING solid bodies (write_aicm)
     int body_count = 0;                   // surviving solids after the whole tree
     double volume = 0.0;                  // total solid volume of surviving bodies (mm^3)
+    std::vector<BodyInfo> bodies_info;    // per-surviving-body stats (surfacing parity gate)
     // Per-creating-feature topology map (host picking): {fid: {bodies:[ordinal...],
     // faces:[[ordinal,topo_id]...], edges:[...]}} with 1-based AICM body ordinal +
     // 1-based TopExp topo index. Empty for an all-error compile. (Linear single-chain

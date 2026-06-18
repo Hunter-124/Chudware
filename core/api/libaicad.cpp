@@ -22,11 +22,17 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 
 #include <nlohmann/json.hpp>
 
+#include "agent/config.h"
+#include "agent/events.h"
+#include "agent/paths.h"
+#include "agent/ops_emit.h"
 #include "agent/providers.h"
+#include "agent/roles.h"
 #include "doc/document.h"
 #include "doc/export2d.h"
 #include "doc/session.h"
@@ -254,6 +260,120 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             std::string system = params.value("system", std::string());
             return emit(json{{"role", aicad::agent::RoleScriptedProvider::role_of(system)}},
                         out_json, 0);
+        }
+        // --- P52: agent SUPPORT layer diagnostics (paths/config/ops/events/roles) ---
+        // All PURE string/file-IO ports, gated byte-for-byte vs the Python oracle.
+        if (m == "agent_extract_ops") {
+            // {reply} -> {ops|null, error|null}.
+            std::string reply = params.value("reply", std::string());
+            aicad::agent::OpsResult r = aicad::agent::extract_ops(reply);
+            return emit(json{{"ops", r.ops ? *r.ops : json(nullptr)},
+                             {"error", r.error ? json(*r.error) : json(nullptr)}},
+                        out_json, 0);
+        }
+        if (m == "agent_extract_revert") {
+            std::string reply = params.value("reply", std::string());
+            return emit(json{{"revert", aicad::agent::extract_revert(reply)}}, out_json, 0);
+        }
+        if (m == "agent_extract_script") {
+            std::string reply = params.value("reply", std::string());
+            auto s = aicad::agent::extract_script(reply);
+            return emit(json{{"script", s ? json(*s) : json(nullptr)}}, out_json, 0);
+        }
+        if (m == "agent_first_balanced") {
+            // {text, open, close} -> {span|null}.
+            std::string text = params.value("text", std::string());
+            std::string open = params.value("open", std::string("["));
+            std::string close = params.value("close", std::string("]"));
+            auto s = aicad::agent::first_balanced(text, open.empty() ? '[' : open[0],
+                                                  close.empty() ? ']' : close[0]);
+            return emit(json{{"span", s ? json(*s) : json(nullptr)}}, out_json, 0);
+        }
+        if (m == "agent_script_escape_op") {
+            std::string code = params.value("code", std::string());
+            std::string name = params.value("name", std::string("Script"));
+            return emit(aicad::agent::script_escape_op(code, name), out_json, 0);
+        }
+        if (m == "agent_offline_safe") {
+            json provider = params.contains("provider") ? params["provider"] : json::object();
+            return emit(json{{"safe", aicad::agent::provider_offline_safe(provider)}},
+                        out_json, 0);
+        }
+        if (m == "agent_host_is_loopback") {
+            std::string base_url = params.value("base_url", std::string());
+            return emit(json{{"loopback", aicad::agent::host_is_loopback(base_url)}},
+                        out_json, 0);
+        }
+        if (m == "agent_resolve_provider") {
+            // {name?, cfg, env:{...}} -> resolved descriptor or {error}.
+            std::optional<std::string> name;
+            if (params.contains("name") && params["name"].is_string())
+                name = params["name"].get<std::string>();
+            json cfg = params.contains("cfg") ? params["cfg"] : json::object();
+            json env = params.contains("env") ? params["env"] : json::object();
+            return emit(aicad::agent::resolve_provider(name, cfg, env), out_json, 0);
+        }
+        if (m == "agent_cap_raw") {
+            std::string text = params.value("text", std::string());
+            return emit(json{{"capped", aicad::agent::cap_raw(text)}}, out_json, 0);
+        }
+        if (m == "agent_run_event") {
+            // {run_id, kind, data} -> the emitted event (also persisted to jsonl).
+            std::string run_id = params.value("run_id", std::string());
+            std::string kind = params.value("kind", std::string());
+            json data = params.contains("data") ? params["data"] : json::object();
+            aicad::agent::RunEvents ev(run_id);
+            // NOTE: a fresh RunEvents truncates events.jsonl on construct. The gate
+            // drives a multi-event run via agent_run_events_batch (below) instead.
+            return emit(ev.emit(kind, data), out_json, 0);
+        }
+        if (m == "agent_run_events_batch") {
+            // {run_id, events:[{kind, data}]} -> [emitted events]. One RunEvents
+            // (one truncate), then emit each — the realistic multi-event sequence.
+            std::string run_id = params.value("run_id", std::string());
+            aicad::agent::RunEvents ev(run_id);
+            json out = json::array();
+            if (params.contains("events") && params["events"].is_array())
+                for (const auto& e : params["events"]) {
+                    std::string kind = e.value("kind", std::string());
+                    json data = e.contains("data") ? e["data"] : json::object();
+                    out.push_back(ev.emit(kind, data));
+                }
+            return emit(std::move(out), out_json, 0);
+        }
+        if (m == "agent_run_events_read") {
+            // {run_id} -> [parsed events] read back from events.jsonl.
+            std::string run_id = params.value("run_id", std::string());
+            std::filesystem::path p =
+                aicad::agent::paths_cache() / "runs" / run_id / "events.jsonl";
+            json out = json::array();
+            std::ifstream fh(p, std::ios::binary);
+            std::string line;
+            while (std::getline(fh, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty()) continue;
+                out.push_back(json::parse(line));
+            }
+            return emit(std::move(out), out_json, 0);
+        }
+        if (m == "agent_load_prompt") {
+            std::string role = params.value("role", std::string());
+            std::string pd = params.value("prompts_dir", std::string());
+            auto pr = aicad::agent::load_prompt(role, pd);
+            return emit(json{{"text", pr.first}, {"source", pr.second}}, out_json, 0);
+        }
+        if (m == "agent_prompt_hash") {
+            std::string text = params.value("text", std::string());
+            return emit(json{{"hash", aicad::agent::prompt_hash(text)}}, out_json, 0);
+        }
+        if (m == "agent_get_prompts_v2") {
+            std::string pd = params.value("prompts_dir", std::string());
+            return emit(aicad::agent::get_prompts_v2(pd), out_json, 0);
+        }
+        if (m == "agent_load_cheatsheet") {
+            std::string ft = params.value("feature_type", std::string());
+            std::string pd = params.value("prompts_dir", std::string());
+            return emit(json{{"text", aicad::agent::load_cheatsheet(ft, pd)}}, out_json, 0);
         }
         if (m == "sim_fea_static") {
             // Linear-static FEA (engine/sim/fea_static.py parity probe). Params carry an

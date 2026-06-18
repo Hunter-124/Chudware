@@ -215,9 +215,14 @@ target_include_directories(aicad_aicm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # it builds in both configs. Dynamic CRT to match aicad_miniz / the DLL heap.
 add_library(aicad_agent STATIC
   agent/http.cpp
-  agent/providers.cpp)
+  agent/providers.cpp
+  agent/paths.cpp
+  agent/config.cpp
+  agent/ops_emit.cpp
+  agent/events.cpp
+  agent/roles.cpp)
 target_include_directories(aicad_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_agent PUBLIC nlohmann_json::nlohmann_json winhttp)
+target_link_libraries(aicad_agent PUBLIC nlohmann_json::nlohmann_json winhttp bcrypt)
 set_property(TARGET aicad_agent PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 

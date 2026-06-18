@@ -857,6 +857,95 @@ def main() -> int:
         vs = ", ".join(f"{r['value']:.0f}={float(r['op']['V(OUT)']):.4g}" for r in cr)
         print(f"  {'step R2 divider':<24} MATCH  ({vs})")
 
+    # ---- T (lossless transmission line). Both engines share the exact Branin transient companion
+    # (Z0 + delayed history voltage source, linear interpolation) and the exact lossless two-port AC
+    # stamp (coth/csch of j*omega*td), so the delayed waveform and the swept response match to FP.
+    #
+    # (a) AC quarter-wave impedance transformer: a TD line of electrical length 1/4 wave at f0 maps a
+    #     load RL to Zin = Z0^2/RL at f0. Plus a matched-line check (RL=Z0 -> flat |V(out)|). We sweep
+    #     V(out) magnitude+phase over a decade band straddling f0 and compare to the oracle.
+    z0_tl, f0_tl = 75.0, 1e9
+    td_tl = 0.25 / f0_tl  # quarter wave at f0
+    tl_ac = {
+        "nodes": ["0", "IN", "A", "B"],
+        "devices": [
+            {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0,
+             "params": {"ac": {"mag": 1.0, "phase": 0.0}}},
+            {"kind": "R", "name": "RS", "nodes": ["IN", "A"], "value": 50.0, "params": {}},
+            {"kind": "T", "name": "T1", "nodes": ["A", "0", "B", "0"], "value": None,
+             "params": {"z0": z0_tl, "td": td_tl}},
+            {"kind": "R", "name": "RL", "nodes": ["B", "0"], "value": 200.0, "params": {}}],
+        "models": {}, "params": {}}
+    tl_ac_study = {"analyses": [{"type": "ac", "sweep": "dec", "points": 12, "fstart": 1e8,
+                                 "fstop": 1e10}], "probes": ["V(A)", "V(B)"]}
+    checks += 1
+    ro = simulate(tl_ac, tl_ac_study)
+    rc, rcpp = core.call("sim_spice", {"circuit": tl_ac, "study": tl_ac_study})
+    diffs = []
+    if not (ro["convergence"].get("ac") and rcpp.get("convergence", {}).get("ac")):
+        diffs.append("ac did not converge")
+    fp = np.asarray(ro["ac"]["x_f"], dtype=np.float64)
+    fc = np.asarray(rcpp.get("ac", {}).get("x_f", []), dtype=np.float64)
+    if fp.shape != fc.shape:
+        diffs.append(f"freq grid {fp.shape}!={fc.shape}")
+    else:
+        for pr in tl_ac_study["probes"]:
+            for key in ("mag", "phase_deg"):
+                vp = np.asarray(ro["ac"][key][pr], dtype=np.float64)
+                vc = np.asarray(rcpp["ac"][key][pr], dtype=np.float64)
+                scale = max(float(np.max(np.abs(vp))), 1e-9)
+                dmax = float(np.max(np.abs(vp - vc)))
+                if dmax / scale > 1e-6:
+                    diffs.append(f"{pr}.{key} max|d|={dmax:.2e}")
+    if diffs:
+        print(f"  {'T ac quarter-wave':<24} DIFF: {'; '.join(diffs)[:100]}")
+        mism += 1
+    else:
+        print(f"  {'T ac quarter-wave':<24} MATCH  ({len(fc)} pts)")
+
+    # (b) Transient: a voltage step launched through a source resistor into a Z0 line terminated in
+    #     a matched load (RL=Z0 -> no reflection). With TD an exact integer multiple of tstep the
+    #     received step at B is a clean one-delay-shifted copy. Compare the full V(A)/V(B) traces.
+    z0_t, td_t = 50.0, 1e-8
+    tstep_t = td_t / 10.0  # td is an exact multiple of the timestep
+    tl_tr = {
+        "nodes": ["0", "IN", "A", "B"],
+        "devices": [
+            {"kind": "V", "name": "V1", "nodes": ["IN", "0"], "value": 0.0,
+             "params": {"waveform": _wf("PULSE", v1=0.0, v2=2.0, td=2e-8, tr=1e-10, tf=1e-10,
+                                        pw=1e-6, per=0.0)}},
+            {"kind": "R", "name": "RS", "nodes": ["IN", "A"], "value": z0_t, "params": {}},
+            {"kind": "T", "name": "T1", "nodes": ["A", "0", "B", "0"], "value": None,
+             "params": {"z0": z0_t, "td": td_t}},
+            {"kind": "R", "name": "RL", "nodes": ["B", "0"], "value": z0_t, "params": {}}],
+        "models": {}, "params": {}}
+    tl_tr_study = {"analyses": [{"type": "tran", "tstep": tstep_t, "tstop": 8e-8, "uic": False}],
+                   "probes": ["V(A)", "V(B)"]}
+    checks += 1
+    ro = simulate(tl_tr, tl_tr_study)
+    rc, rcpp = core.call("sim_spice", {"circuit": tl_tr, "study": tl_tr_study})
+    diffs = []
+    if not (ro["convergence"].get("tran") and rcpp.get("convergence", {}).get("tran")):
+        diffs.append("tran did not converge")
+    tp = np.asarray(ro["tran"]["x_t"], dtype=np.float64)
+    tc = np.asarray(rcpp.get("tran", {}).get("x_t", []), dtype=np.float64)
+    if tp.shape != tc.shape:
+        diffs.append(f"time grid len {tp.shape}!={tc.shape}")
+    else:
+        for pr in tl_tr_study["probes"]:
+            vp = np.asarray(ro["tran"]["traces"][pr], dtype=np.float64)
+            vc = np.asarray(rcpp["tran"]["traces"][pr], dtype=np.float64)
+            scale = max(float(np.max(np.abs(vp))), 1e-9)
+            dmax = float(np.max(np.abs(vp - vc)))
+            if dmax / scale > 1e-6:
+                diffs.append(f"{pr} max|d|={dmax:.2e} (rel {dmax/scale:.1e})")
+    if diffs:
+        print(f"  {'T tran matched line':<24} DIFF: {'; '.join(diffs)[:100]}")
+        mism += 1
+    else:
+        vb = float(np.max(np.abs(np.asarray(rcpp["tran"]["traces"]["V(B)"]))))
+        print(f"  {'T tran matched line':<24} MATCH  ({len(tc)} pts, |V(B)|max={vb:.4g})")
+
     print(f"\n[spice-parity] {checks - mism}/{checks} circuit cases at full parity")
     return mism
 

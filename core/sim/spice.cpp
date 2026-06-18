@@ -241,6 +241,50 @@ struct TranState {
     std::map<std::string, double> mdidt;     // M*di_other/dt per coupled neighbour
 };
 
+// Transmission-line (T) Branin history: per-port list of (t, v_port, i_port) samples, seeded with
+// the t=0 quiescent point. Mirrors TLine.update_state's per-port `st["a"]/st["b"]` lists.
+struct TLineHist {
+    std::vector<std::array<double, 3>> a{{{0.0, 0.0, 0.0}}};  // (t, v, i) into port A
+    std::vector<std::array<double, 3>> b{{{0.0, 0.0, 0.0}}};  // (t, v, i) into port B
+};
+
+// Incident wave from a port at the (fractional) delayed time — TLine._incident.
+// Branin: the wave launched at the far port at t-TD is v_far + Z0*i_far; linearly interpolate the
+// stored (t,v,i) samples. Before t=0 (or before the first sample) the line is quiescent -> 0.
+inline double tline_incident(const std::vector<std::array<double, 3>>& samples, double z0,
+                             double t_delayed) {
+    if (samples.empty() || t_delayed <= samples.front()[0]) return 0.0;
+    if (t_delayed >= samples.back()[0]) {
+        const auto& s = samples.back();
+        return s[1] + z0 * s[2];
+    }
+    std::size_t lo = 0, hi = samples.size() - 1;
+    while (hi - lo > 1) {
+        std::size_t mid = (lo + hi) / 2;
+        if (samples[mid][0] <= t_delayed) lo = mid; else hi = mid;
+    }
+    double t0 = samples[lo][0], v0 = samples[lo][1], i0 = samples[lo][2];
+    double t1 = samples[hi][0], v1 = samples[hi][1], i1 = samples[hi][2];
+    double frac = (t1 > t0) ? (t_delayed - t0) / (t1 - t0) : 0.0;
+    double v = v0 + (v1 - v0) * frac;
+    double i = i0 + (i1 - i0) * frac;
+    return v + z0 * i;
+}
+
+// Resolve a T device's (z0, td). Mirrors TLine._z0_td: z0 from z0/Z0 (default 50, clamped >0);
+// td from device-param td/TD if present, else nl/freq ({z0,freq,nl}, default nl=0.25), else 0.
+inline std::pair<double, double> tline_z0_td(const json& d, const json& models) {
+    double z0 = mp(d, models, "z0", mp(d, models, "Z0", 50.0));
+    if (z0 <= 0.0) z0 = 50.0;
+    const json& dp = params_of(d);
+    if (dp.contains("td") && dp["td"].is_number()) return {z0, std::max(dp["td"].get<double>(), 0.0)};
+    if (dp.contains("TD") && dp["TD"].is_number()) return {z0, std::max(dp["TD"].get<double>(), 0.0)};
+    double freq = mp(d, models, "freq", mp(d, models, "f", 0.0));
+    double nl = mp(d, models, "nl", mp(d, models, "NL", 0.25));
+    if (freq > 0.0) return {z0, nl / freq};
+    return {z0, 0.0};
+}
+
 // Shared circuit setup: node index, branch rows, device list.
 struct Setup {
     std::map<std::string, int> node_index;
@@ -911,6 +955,11 @@ json spice_simulate(const json& circuit, const json& study) {
             s.branch_of[d.value("name", std::string())] = dim++;
         else if (kind == "B" && b_src_type(d) == "V")  // behavioral voltage source owns a branch
             s.branch_of[d.value("name", std::string())] = dim++;
+        else if (kind == "T") {  // lossless line owns TWO branch currents (one per port)
+            const std::string nm = d.value("name", std::string());
+            s.branch_of[nm] = dim++;          // port-A branch row  (branch_rows[0])
+            s.branch_of[nm + "#1"] = dim++;    // port-B branch row  (branch_rows[1])
+        }
     }
     s.dim = dim;
 
@@ -1009,6 +1058,19 @@ json spice_simulate(const json& circuit, const json& study) {
             std::string kind = d.value("kind", std::string());
             if (kind == "C") continue;  // open at DC
             if (kind == "K") continue;  // relational coupling — stamps nothing itself
+            if (kind == "T") {          // lossless line: ideal DC pass-through — TLine.stamp_dc
+                std::string name = d.value("name", std::string());
+                int ap = N_of(d, 0), an = N_of(d, 1), bp = N_of(d, 2), bn = N_of(d, 3);
+                int bra = s.branch_of.at(name), brb = s.branch_of.at(name + "#1");
+                mna.G(ap, bra, 1.0); mna.G(an, bra, -1.0);
+                mna.G(bp, brb, 1.0); mna.G(bn, brb, -1.0);
+                // Row a: V(a) - V(b) = 0
+                mna.G(bra, ap, 1.0); mna.G(bra, an, -1.0);
+                mna.G(bra, bp, -1.0); mna.G(bra, bn, 1.0);
+                // Row b: i_a + i_b = 0
+                mna.G(brb, bra, 1.0); mna.G(brb, brb, 1.0);
+                continue;
+            }
             if (kind == "L") {          // ideal short
                 int a = N_of(d, 0), b = N_of(d, 1), br = s.branch_of.at(d.value("name", std::string()));
                 mna.G(a, br, 1.0); mna.G(b, br, -1.0); mna.G(br, a, 1.0); mna.G(br, b, -1.0);
@@ -1221,6 +1283,22 @@ json spice_simulate(const json& circuit, const json& study) {
                     if (ref >= 0) G(br, ref, -1.0);
                     G(br, ip, -Aw); G(br, inn, Aw);
                 }
+            } else if (kind == "T") {
+                // Exact lossless two-port — TLine.stamp_ac. The AC model is a pure node-admittance
+                // two-port; the DC/transient port-current branch rows are unused, so tie them off
+                // with a 1.0 diagonal (avoid singular zero rows in the complex MNA).
+                int ap = a0, an = b0, bp = N(d, 2), bn = N(d, 3);
+                int bra = s.branch_of.at(name), brb = s.branch_of.at(name + "#1");
+                G(bra, bra, cd(1.0, 0.0)); G(brb, brb, cd(1.0, 0.0));
+                auto [z0, td] = tline_z0_td(d, s.models);
+                cd gl(0.0, omega * td);  // gamma*l = j*omega*td (lossless)
+                if (std::abs(gl) < 1e-15) gl = cd(1e-15, 0.0);
+                cd y11 = cd(1.0, 0.0) / (cd(z0, 0.0) * std::tanh(gl));   // coth(gl)/Z0
+                cd y12 = cd(-1.0, 0.0) / (cd(z0, 0.0) * std::sinh(gl));  // -csch(gl)/Z0
+                G(ap, ap, y11); G(an, an, y11); G(ap, an, -y11); G(an, ap, -y11);
+                G(bp, bp, y11); G(bn, bn, y11); G(bp, bn, -y11); G(bn, bp, -y11);
+                G(ap, bp, y12); G(bp, ap, y12); G(an, bn, y12); G(bn, an, y12);
+                G(ap, bn, -y12); G(bn, ap, -y12); G(an, bp, -y12); G(bp, an, -y12);
             } else if (kind == "B") {
                 // Small-signal: keep the FD-Jacobian coupling about x_op, drop the DC offset.
                 auto it = b_expr.find(name);
@@ -1487,6 +1565,7 @@ json spice_simulate(const json& circuit, const json& study) {
             bool uic = a.value("uic", false);
 
             std::map<std::string, TranState> st;
+            std::map<std::string, TLineHist> tline_st;  // per-T Branin port history
             std::vector<double> x(dim, 0.0);
             if (uic) {
                 for (const json& d : devices) {
@@ -1557,6 +1636,30 @@ json spice_simulate(const json& circuit, const json& study) {
                             mna.G(br, obr, -reqm);
                         }
                         mna.I(br, veq);
+                    } else if (kind == "T") {
+                        // Lossless line — Branin method of characteristics (TLine.stamp_tran).
+                        int ap = N_of(d, 0), an = N_of(d, 1), bp = N_of(d, 2), bn = N_of(d, 3);
+                        int bra = s.branch_of.at(name), brb = s.branch_of.at(name + "#1");
+                        auto [z0, td] = tline_z0_td(d, s.models);
+                        if (td <= 0.0) {
+                            // Degenerate zero-delay line -> DC pass-through wire.
+                            mna.G(ap, bra, 1.0); mna.G(an, bra, -1.0);
+                            mna.G(bp, brb, 1.0); mna.G(bn, brb, -1.0);
+                            mna.G(bra, ap, 1.0); mna.G(bra, an, -1.0);
+                            mna.G(bra, bp, -1.0); mna.G(bra, bn, 1.0);
+                            mna.G(brb, bra, 1.0); mna.G(brb, brb, 1.0);
+                        } else {
+                            const TLineHist& th = tline_st[name];
+                            // Incident at each port now = wave that left the OTHER port at t-td.
+                            double ea = tline_incident(th.b, z0, t - td);  // from B into A
+                            double eb = tline_incident(th.a, z0, t - td);  // from A into B
+                            mna.G(ap, bra, 1.0); mna.G(an, bra, -1.0);
+                            mna.G(bp, brb, 1.0); mna.G(bn, brb, -1.0);
+                            mna.G(bra, ap, 1.0); mna.G(bra, an, -1.0);
+                            mna.G(bra, bra, -z0); mna.I(bra, ea);
+                            mna.G(brb, bp, 1.0); mna.G(brb, bn, -1.0);
+                            mna.G(brb, brb, -z0); mna.I(brb, eb);
+                        }
                     } else if (kind_is_nonlinear(kind)) {
                         stamp_nonlinear_dc(s, mna, d, xw, last_vd);
                         // Diode junction-cap companion (CJO) — Diode.stamp_tran.
@@ -1581,8 +1684,10 @@ json spice_simulate(const json& circuit, const json& study) {
                     }
                 }
             };
-            // Advance reactive history after a converged step.
-            auto update_state = [&](const std::vector<double>& xn, double dt, bool trap) {
+            // Advance reactive history after a converged step. `t_now` is hist["_t"] (0.0 for the
+            // non-uic op-point seed, tnew for a committed step) — used by the T-line history.
+            auto update_state = [&](const std::vector<double>& xn, double dt, bool trap,
+                                    double t_now) {
                 for (const json& d : devices) {
                     std::string kind = d.value("kind", std::string());
                     std::string name = d.value("name", std::string());
@@ -1620,6 +1725,22 @@ json spice_simulate(const json& circuit, const json& study) {
                                                 : CJO / dt * (v - h.vcap);
                             h.vcap = v; h.icap = i_new;
                         }
+                    } else if (kind == "T") {
+                        // Append the port (t,v,i) samples; overwrite the t=0 seed on first real
+                        // sample (t_now>0) — TLine.update_state.
+                        TLineHist& th = tline_st[name];
+                        int bra = s.branch_of.at(name), brb = s.branch_of.at(name + "#1");
+                        double va = xat(xn, N_of(d, 0)) - xat(xn, N_of(d, 1));
+                        double vb = xat(xn, N_of(d, 2)) - xat(xn, N_of(d, 3));
+                        double ia = xat(xn, bra), ib = xat(xn, brb);
+                        auto push = [&](std::vector<std::array<double, 3>>& lst, double v, double i) {
+                            if (lst.size() == 1 && lst[0][0] == 0.0 && t_now > 0.0)
+                                lst[0] = {t_now, v, i};
+                            else
+                                lst.push_back({t_now, v, i});
+                        };
+                        push(th.a, va, ia);
+                        push(th.b, vb, ib);
                     }
                 }
             };
@@ -1646,8 +1767,8 @@ json spice_simulate(const json& circuit, const json& study) {
                 return true;  // accept last iterate (Python returns it with a non-conv note)
             };
 
-            // Non-uic: seed reactive history from the op point.
-            if (!uic) update_state(x, tstep, true);
+            // Non-uic: seed reactive history from the op point (hist["_t"] is still 0.0 here).
+            if (!uic) update_state(x, tstep, true, 0.0);
 
             std::vector<double> times{0.0};
             std::map<std::string, std::vector<double>> traces;
@@ -1682,7 +1803,7 @@ json spice_simulate(const json& circuit, const json& study) {
                     converged = false;
                     break;
                 }
-                update_state(xn, dt, trap);
+                update_state(xn, dt, trap, tnew);
                 x = xn;
                 t = tnew;
                 times.push_back(t);

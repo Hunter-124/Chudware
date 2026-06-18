@@ -10,6 +10,8 @@
 #include <mutex>
 #include <vector>
 
+#include "ecad/erc.h"
+#include "ecad/netlist.h"
 #include "ecad/schema.h"
 
 namespace aicad::ecad {
@@ -60,16 +62,21 @@ void push_undo(Session& s) {
     s.redo_stack.clear();
 }
 
-// The `compile` field. The netlist/ERC/DRC sub-modules are DEFERRED, so this
-// returns the same skeleton the Python session produces when those lazy imports
-// fail (ImportError branch): netlist null, empty erc/drc/ratsnest, stats with the
-// counts the Python code always sets. (Timing `ms` is omitted — the harness does
-// not compare the compile field.)
+// The `compile` field (engine/ecad/session.py::_compile). For a SCHEMATIC the
+// netlist + ERC are now computed in-process (build_netlist + run_erc), matching
+// the Python oracle. For a BOARD the DRC/ratsnest path is still DEFERRED, so the
+// pcb branch keeps the skeleton (drc:[]/ratsnest:[]). The timing `stats.ms` is
+// omitted (non-deterministic); the harness compares compile.netlist + compile.erc.
 json compile_field(const json& doc) {
     json out = {{"netlist", nullptr}, {"erc", json::array()}, {"drc", json::array()},
                 {"ratsnest", json::array()}, {"stats", json::object()}};
     if (schema::is_schematic(doc)) {
-        out["stats"]["nets"] = 0;
+        json netlist = build_netlist(doc);
+        out["netlist"] = netlist;
+        out["erc"] = run_erc(doc, netlist);
+        out["stats"]["nets"] = netlist.contains("nets") && netlist["nets"].is_object()
+                                   ? netlist["nets"].size()
+                                   : 0;
     } else if (schema::is_board(doc)) {
         out["stats"]["nets"] = doc.contains("nets") && doc["nets"].is_array() ? doc["nets"].size() : 0;
         out["stats"]["unrouted"] = 0;
@@ -190,18 +197,28 @@ json ecad_describe(const std::string& doc_id) {
     if (compile_info.is_object() && compile_info.contains("stats") &&
         compile_info["stats"].contains("nets"))
         nets = compile_info["stats"]["nets"].get<int>();
+    int erc_violations = 0;
+    if (compile_info.is_object() && compile_info.contains("erc") && compile_info["erc"].is_array())
+        erc_violations = (int)compile_info["erc"].size();
+    int drc_violations = 0;
+    if (compile_info.is_object() && compile_info.contains("drc") && compile_info["drc"].is_array())
+        drc_violations = (int)compile_info["drc"].size();
+    int unrouted = 0;
+    if (compile_info.is_object() && compile_info.contains("stats") &&
+        compile_info["stats"].contains("unrouted"))
+        unrouted = compile_info["stats"]["unrouted"].get<int>();
     auto len = [&](const char* k) -> int {
         return doc.contains(k) && doc[k].is_array() ? (int)doc[k].size() : 0;
     };
     if (schema::is_schematic(doc)) {
         return json{{"kind", "sch"}, {"name", doc.value("name", std::string())},
                     {"revision", s.revision}, {"symbols", len("symbols")}, {"wires", len("wires")},
-                    {"nets", nets}, {"erc_violations", 0}};
+                    {"nets", nets}, {"erc_violations", erc_violations}};
     }
     return json{{"kind", "pcb"}, {"name", doc.value("name", std::string())},
                 {"revision", s.revision}, {"footprints", len("footprints")},
                 {"tracks", len("tracks")}, {"vias", len("vias")}, {"nets", nets},
-                {"unrouted", 0}, {"drc_violations", 0}};
+                {"unrouted", unrouted}, {"drc_violations", drc_violations}};
 }
 
 json ecad_schema(const std::string& kind) {

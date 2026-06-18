@@ -49,6 +49,30 @@ def norm_tree(tree: dict) -> dict:
     return t
 
 
+def cmp_compile(label, py, cpp):
+    """Compare the SCHEMATIC compile sub-fields EXACTLY: compile.netlist (nets /
+    by_pin / components / warnings) + compile.erc (the ordered violation list).
+
+    These are now computed in-process by the C++ core (core/ecad/netlist.cpp +
+    erc.cpp) and must match the Python oracle (engine.ecad.netlist/erc) bit-for-bit
+    — net naming, net ordering, ERC violation records + their order are all
+    load-bearing. `stats` (esp. the non-deterministic `ms` timing) and the still-
+    DEFERRED PCB artifacts (drc/ratsnest/filled_polys) are NOT compared here."""
+    pc = py.get("compile", {}) or {}
+    cc = cpp.get("compile", {}) or {}
+    diffs = []
+    if pc.get("netlist") != cc.get("netlist"):
+        pn, cn = pc.get("netlist") or {}, cc.get("netlist") or {}
+        for k in sorted(set(pn) | set(cn)):
+            if pn.get(k) != cn.get(k):
+                diffs.append(f"netlist.{k} differ")
+    if pc.get("erc") != cc.get("erc"):
+        diffs.append(f"erc differ (py={len(pc.get('erc') or [])} cpp={len(cc.get('erc') or [])})")
+    ok = not diffs
+    print(f"  {label:<40} {'MATCH' if ok else 'DIFF: ' + '; '.join(diffs)[:140]}")
+    return 0 if ok else 1
+
+
 def cmp_resp(label, py, cpp, *, check_warn=False):
     diffs = []
     if py.get("revision") != cpp.get("revision"):
@@ -364,6 +388,152 @@ def main() -> int:
         ok = pc == cc == want
         print(f"  {('err pcb ' + label):<34} {'MATCH' if ok else f'DIFF py={pc} cpp={cc} want={want}'}")
         step(0 if ok else 1)
+
+    # ---- 15) SCHEMATIC COMPILE parity: netlist + ERC (engine.ecad.netlist/erc) ----
+    # Fixtures mirror engine/ecad/test_netlist.py + test_hierarchy.py. The docs are
+    # built via ops (so both engines hold an IDENTICAL tree — proven by the steps
+    # above) and we then compare compile.netlist + compile.erc EXACTLY. Pin defs use
+    # length-0 pins so the world tip == symbol.pos + pin.pos (easy hand-placement),
+    # matching the oracle's test library.
+    def _pin(number, name, pos, angle, ptype):
+        return {"number": number, "name": name, "pos": list(pos), "angle": angle,
+                "length": 0.0, "type": ptype, "unit": 1}
+
+    R_DEF = {"libid": "Device:R", "name": "R", "description": "Resistor",
+             "reference_prefix": "R", "value": "R", "power": False,
+             "pins": [_pin("1", "~", [0.0, 2.54], 90.0, "passive"),
+                      _pin("2", "~", [0.0, -2.54], -90.0, "passive")]}
+    V_DEF = {"libid": "Sim:V", "name": "V", "description": "Voltage source",
+             "reference_prefix": "V", "value": "V", "power": False,
+             "pins": [_pin("1", "+", [0.0, 2.54], 90.0, "power_out"),
+                      _pin("2", "-", [0.0, -2.54], -90.0, "power_out")]}
+    GND_DEF = {"libid": "power:GND", "name": "GND", "description": "Ground",
+               "reference_prefix": "#PWR", "value": "GND", "power": True,
+               "pins": [_pin("1", "GND", [0.0, 0.0], -90.0, "power_in")]}
+    OUT_DEF = {"libid": "Logic:OUT", "name": "U", "description": "Output buffer",
+               "reference_prefix": "U", "value": "U", "power": False,
+               "pins": [_pin("1", "Y", [0.0, 0.0], 0.0, "output")]}
+
+    def addsym(libid, pos, defn, ref=None, sheet=None):
+        op = {"op": "sch_add_symbol", "libid": libid, "pos": list(pos), "def": defn}
+        if ref is not None:
+            op["ref"] = ref
+        if sheet is not None:
+            op["sheet"] = sheet
+        return op
+
+    def run_compile(label, batch):
+        pp, cc = new("sch", label)
+        pid, cid = pp["doc_id"], cc["doc_id"]
+        pr, cr = apply(pid, cid, 0, batch)
+        # also confirm the tree itself matched (input parity), then compare compile.
+        step(cmp_resp(f"{label} tree", pr, cr))
+        step(cmp_compile(f"{label} compile (netlist+erc)", pr, cr))
+
+    # 15a voltage divider (auto N$ nets, three distinct nets, byte-stable naming)
+    run_compile("divider", [
+        addsym("Sim:V", (0.0, 12.54), V_DEF, ref="V1"),
+        addsym("Device:R", (0.0, 7.46), R_DEF, ref="R1"),
+        addsym("Device:R", (0.0, 2.38), R_DEF, ref="R2"),
+        addsym("power:GND", (0.0, -0.16), GND_DEF, ref="#PWR01"),
+        {"op": "sch_add_wire", "pts": [[0.0, 15.08], [0.0, -0.16]]},
+    ])
+
+    # 15b crossing without junction does NOT merge (two distinct N$ nets)
+    run_compile("crossing", [
+        addsym("Device:R", (-5.0, -2.54), R_DEF, ref="R1"),
+        addsym("Device:R", (0.0, -7.54), R_DEF, ref="R2"),
+        {"op": "sch_add_wire", "pts": [[-5.0, 0.0], [5.0, 0.0]]},
+        {"op": "sch_add_wire", "pts": [[0.0, -5.0], [0.0, 5.0]]},
+    ])
+
+    # 15c junction at crossing DOES merge the two wires
+    run_compile("junction", [
+        addsym("Device:R", (-5.0, -2.54), R_DEF, ref="R1"),
+        addsym("Device:R", (0.0, -7.54), R_DEF, ref="R2"),
+        {"op": "sch_add_wire", "pts": [[-5.0, 0.0], [5.0, 0.0]]},
+        {"op": "sch_add_wire", "pts": [[0.0, -5.0], [0.0, 5.0]]},
+        {"op": "sch_add_junction", "pos": [0.0, 0.0]},
+    ])
+
+    # 15d global label merges two disjoint wires; net named CLK
+    run_compile("global_label", [
+        addsym("Device:R", (0.0, -2.54), R_DEF, ref="R1"),
+        addsym("Device:R", (60.0, -2.54), R_DEF, ref="R2"),
+        {"op": "sch_add_wire", "pts": [[0.0, 0.0], [10.0, 0.0]]},
+        {"op": "sch_add_wire", "pts": [[50.0, 0.0], [60.0, 0.0]]},
+        {"op": "sch_add_label", "pos": [10.0, 0.0], "text": "CLK", "scope": "global"},
+        {"op": "sch_add_label", "pos": [50.0, 0.0], "text": "CLK", "scope": "global"},
+    ])
+
+    # 15e power port priority over a local label (net=VCC wins)
+    run_compile("power_priority", [
+        addsym("Device:R", (0.0, -2.54), R_DEF, ref="R1"),
+        {"op": "sch_add_wire", "pts": [[0.0, 0.0], [10.0, 0.0]]},
+        {"op": "sch_add_power", "pos": [5.0, 0.0], "net": "VCC"},
+        {"op": "sch_add_label", "pos": [10.0, 0.0], "text": "MY_RAIL", "scope": "local"},
+    ])
+
+    # 15f ERC seeded faults: pin_not_connected, conflicting_drivers, power_not_driven,
+    #     missing_footprint (full violation list + ordering). NOTE: duplicate_ref is
+    #     NOT exercisable here — the ops layer rejects a duplicate non-'?' ref at apply
+    #     time (schema validation), so a doc with two same-ref symbols can't be built
+    #     through sch_add_symbol; the duplicate_ref RULE is ported but covered only by
+    #     the hand-built Python oracle test (test_netlist.py::test_erc_seeded_faults).
+    run_compile("erc_faults", [
+        addsym("Device:R", (0.0, 0.0), R_DEF, ref="R1"),
+        addsym("Logic:OUT", (20.0, 0.0), OUT_DEF, ref="U1"),
+        addsym("Logic:OUT", (20.0, 0.0), OUT_DEF, ref="U2"),
+        addsym("power:GND", (60.0, 0.0), GND_DEF, ref="#PWR02"),
+        addsym("power:GND", (60.0, 0.0), GND_DEF, ref="#PWR03"),
+    ])
+
+    # 15g no_connect suppresses pin_not_connected on the covered pin
+    run_compile("no_connect", [
+        addsym("Device:R", (0.0, 0.0), R_DEF, ref="R1"),
+        {"op": "sch_add_no_connect", "pos": [0.0, 2.54]},
+    ])
+
+    # ---- 16) HIERARCHY compile parity: cross-sheet bridge + hier ERC ----
+    def run_compile_hier(label, batch, base_to=None):
+        pp, cc = new("sch", label)
+        pid, cid = pp["doc_id"], cc["doc_id"]
+        pr, cr = apply(pid, cid, 0, batch)
+        step(cmp_resp(f"{label} tree", pr, cr))
+        step(cmp_compile(f"{label} compile (netlist+erc)", pr, cr))
+
+    # 16a cross-sheet bridge: sheet pin CLK <-> child hier label CLK -> one net CLK
+    run_compile_hier("hier_bridge", [
+        {"op": "sch_add_sheet", "name": "child", "parent": "sh1"},
+        addsym("Device:R", (0.0, -2.54), R_DEF, ref="R1", sheet="sh1"),
+        {"op": "sch_add_wire", "sheet": "sh1", "pts": [[0.0, 0.0], [10.0, 0.0]]},
+        {"op": "sch_add_sheet_symbol", "sheet": "sh1", "child": "$0", "pos": [10.0, 0.0],
+         "pins": [{"name": "CLK", "pos": [10.0, 0.0], "shape": "input"}]},
+        addsym("Device:R", (0.0, -2.54), R_DEF, ref="R2", sheet="$0"),
+        {"op": "sch_add_wire", "sheet": "$0", "pts": [[0.0, 0.0], [20.0, 0.0]]},
+        {"op": "sch_add_label", "sheet": "$0", "pos": [20.0, 0.0], "text": "CLK", "scope": "hier"},
+    ])
+
+    # 16b hier mismatch ERC: sheet pin CLK with no child label + child label RST not exposed
+    run_compile_hier("hier_mismatch", [
+        {"op": "sch_add_sheet", "name": "child", "parent": "sh1"},
+        addsym("Device:R", (0.0, -2.54), R_DEF, ref="R2", sheet="$0"),
+        {"op": "sch_add_wire", "sheet": "$0", "pts": [[0.0, 0.0], [20.0, 0.0]]},
+        {"op": "sch_add_label", "sheet": "$0", "pos": [20.0, 0.0], "text": "RST", "scope": "hier"},
+        {"op": "sch_add_sheet_symbol", "sheet": "sh1", "child": "$0", "pos": [10.0, 0.0],
+         "pins": [{"name": "CLK", "pos": [10.0, 0.0], "shape": "input"}]},
+    ])
+
+    # 16c local label does NOT span sheets (two distinct classes + collision warning)
+    run_compile_hier("local_label_no_span", [
+        {"op": "sch_add_sheet", "name": "child", "parent": "sh1"},
+        addsym("Device:R", (0.0, -2.54), R_DEF, ref="R1", sheet="sh1"),
+        addsym("Device:R", (100.0, -2.54), R_DEF, ref="R2", sheet="$0"),
+        {"op": "sch_add_wire", "sheet": "sh1", "pts": [[0.0, 0.0], [5.0, 0.0]]},
+        {"op": "sch_add_wire", "sheet": "$0", "pts": [[100.0, 0.0], [105.0, 0.0]]},
+        {"op": "sch_add_label", "sheet": "sh1", "pos": [5.0, 0.0], "text": "DATA", "scope": "local"},
+        {"op": "sch_add_label", "sheet": "$0", "pos": [105.0, 0.0], "text": "DATA", "scope": "local"},
+    ])
 
     print(f"\n[ecad-parity] {total - mism}/{total} steps at full parity")
     return mism

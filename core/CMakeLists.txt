@@ -118,6 +118,8 @@ target_link_libraries(aicad_sim PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_jso
 add_library(aicad_ecad STATIC
   ecad/schema.cpp
   ecad/ops.cpp
+  ecad/netlist.cpp
+  ecad/erc.cpp
   ecad/session.cpp)
 target_include_directories(aicad_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_ecad PUBLIC nlohmann_json::nlohmann_json)

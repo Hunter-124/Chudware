@@ -445,6 +445,15 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             if (m == "ecad_schema")
                 return emit(aicad::ecad::ecad_schema(params.value("kind", std::string("sch"))),
                             out_json, 0);
+            if (m == "ecad_dfm") {
+                json rules = params.contains("rules") ? params["rules"] : json(nullptr);
+                if (params.contains("board") && params["board"].is_object())
+                    return emit(aicad::ecad::ecad_dfm_board(params["board"], rules), out_json, 0);
+                return emit(aicad::ecad::ecad_dfm(params.value("doc_id", std::string()), rules),
+                            out_json, 0);
+            }
+            if (m == "ecad_impedance")
+                return emit(aicad::ecad::ecad_impedance(params), out_json, 0);
         } catch (const aicad::ecad::OpError& oe) {
             return emit(oe.envelope(), out_json, 3);
         }

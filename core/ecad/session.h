@@ -39,4 +39,17 @@ nlohmann::json ecad_describe(const std::string& doc_id);
 // ecad_schema {kind?} -> the empty document for the given kind (cheap diagnostic).
 nlohmann::json ecad_schema(const std::string& kind);
 
+// ecad_dfm {doc_id, rules?} -> {violations, summary} over the session's board doc.
+// Throws OpError("invalid_op") if the document is not a pcb.
+nlohmann::json ecad_dfm(const std::string& doc_id, const nlohmann::json& rules);
+
+// Stateless variant: run DFM over an inline board doc (parity harness path).
+nlohmann::json ecad_dfm_board(const nlohmann::json& board, const nlohmann::json& rules);
+
+// ecad_impedance {mode, ...geom} -> the impedance.cpp calculator result.
+// mode: "microstrip" | "stripline" | "coplanar" | "diff_pair" | "track".
+// For "track", params carry {doc_id, track_or_net}. The other modes carry
+// {w, s?, h, t, er, kind?}. Stateless except for "track" (session lookup).
+nlohmann::json ecad_impedance(const nlohmann::json& params);
+
 }  // namespace aicad::ecad

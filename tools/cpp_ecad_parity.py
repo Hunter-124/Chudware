@@ -713,8 +713,296 @@ def main() -> int:
          "thermal": {"gap": 0.4, "spoke_width": 0.5}},
     ])
 
+    # ---- 18) DFM parity: engine.ecad.dfm.run_dfm vs core/ecad/dfm.cpp ----
+    # Fixtures mirror engine/ecad/test_dfm.py (every rule: a seeded violation +
+    # the cleared case). The board doc is built directly (the test boards set
+    # graphics/footprints/vias as plain dicts) and passed VERBATIM to both engines:
+    # Python -> dfm.run_dfm + the same {violations,summary} grouping rpc.py builds;
+    # C++ -> ecad_dfm {board} (stateless inline path). The FULL response
+    # (violations list — rule/severity/locs/items/message + ORDER — and the grouped
+    # summary) is compared byte-for-byte.
+    from engine.ecad import schema as _eschema  # noqa: E402
+    from engine.ecad import dfm as _edfm  # noqa: E402
+
+    def _dfm_summary(violations):
+        """Replicate engine/ecad/rpc.py::_ecad_dfm summary grouping exactly."""
+        errors = [v for v in violations if v.get("severity") == "error"]
+        warnings_list = [v for v in violations if v.get("severity") != "error"]
+        by_rule = {}
+        for v in violations:
+            rule = v.get("rule", "?")
+            slot = by_rule.setdefault(rule, {"rule": rule, "severity": v.get("severity"),
+                                             "count": 0, "messages": []})
+            slot["count"] += 1
+            if v.get("severity") == "error":
+                slot["severity"] = "error"
+            if len(slot["messages"]) < 3:
+                slot["messages"].append(v.get("message", ""))
+        return {"errors": len(errors), "warnings": len(warnings_list),
+                "by_rule": sorted(by_rule.values(),
+                                  key=lambda g: (g["severity"] != "error", g["rule"]))}
+
+    def _py_dfm(board, rules=None):
+        v = _edfm.run_dfm(board, rules=rules)
+        return {"violations": v, "summary": _dfm_summary(v)}
+
+    def cmp_dfm(label, board, rules=None):
+        py_resp = _py_dfm(board, rules)
+        p = {"board": board}
+        if rules is not None:
+            p["rules"] = rules
+        cpp_resp = cpp.call("ecad_dfm", p)
+        diffs = []
+        if py_resp["violations"] != cpp_resp.get("violations"):
+            pv, cv = py_resp["violations"], cpp_resp.get("violations") or []
+            diffs.append(f"violations differ (py={len(pv)} cpp={len(cv)})")
+            for i, (a, b) in enumerate(zip(pv, cv)):
+                if a != b:
+                    diffs.append(f"v[{i}] {a.get('rule')}/{a.get('message','')[:40]} "
+                                 f"!= {b.get('rule')}/{b.get('message','')[:40]}")
+                    break
+        if py_resp["summary"] != cpp_resp.get("summary"):
+            diffs.append("summary differ")
+        ok = not diffs
+        print(f"  {('dfm ' + label):<40} {'MATCH' if ok else 'DIFF: ' + '; '.join(diffs)[:160]}")
+        return step(0 if ok else 1)
+
+    # fixture helpers (mirror test_dfm.py)
+    def _dfm_board():
+        return _eschema.new_board("dfm-test")
+
+    def _dfm_fp(fid, pos, pads=None, graphics=None, side="top"):
+        return {"id": fid, "fpid": "Test:FP", "ref": fid.upper(), "value": "",
+                "pos": list(pos), "angle": 0.0, "side": side,
+                "pads": pads or [], "graphics": graphics or [],
+                "model_3d": None, "attr": "smd", "linked_symbol": None}
+
+    def _dfm_smd_pad(pid, pos, net, size=(1.0, 1.0), shape="rect", layers=None):
+        if layers is None:
+            layers = ["F.Cu", "F.Mask", "F.Paste"]
+        return {"id": pid, "number": "1", "pos": list(pos), "angle": 0.0, "shape": shape,
+                "size": list(size), "type": "smd", "layers": layers, "drill": None,
+                "net": net, "pin": "1"}
+
+    def _dfm_via(vid, at, net, drill=0.4, diameter=0.8):
+        return {"id": vid, "net": net, "at": list(at), "drill": drill, "diameter": diameter,
+                "layers": ["F.Cu", "B.Cu"], "type": "through"}
+
+    def _dfm_silk_line(gid, p1, p2, width=0.15, layer="F.SilkS"):
+        return {"id": gid, "type": "line", "layer": layer, "p1": list(p1), "p2": list(p2),
+                "width": width}
+
+    def _dfm_silk_text(gid, pos, height=1.0, layer="F.SilkS"):
+        return {"id": gid, "type": "text", "layer": layer, "pos": list(pos), "text": "TEST",
+                "size": [height, height], "width": 0.15}
+
+    def _dfm_crtyd_line(gid, p1, p2, layer="F.CrtYd"):
+        return {"id": gid, "type": "line", "layer": layer, "p1": list(p1), "p2": list(p2),
+                "width": 0.05}
+
+    def _dfm_track(tid, p1, p2, net, width=0.25, layer="F.Cu"):
+        return {"id": tid, "net": net, "layer": layer, "width": width, "kind": "segment",
+                "p1": list(p1), "p2": list(p2)}
+
+    import math as _math
+
+    # 18a silk_over_pad: silk line crossing a pad (fires) + moved off (clean)
+    b = _dfm_board()
+    b["nets"] = [{"name": "NA", "class": "default"}]
+    b["footprints"] = [_dfm_fp("fp1", (5.0, 5.0),
+                               pads=[_dfm_smd_pad("p1", (0.0, 0.0), "NA", size=(2.0, 2.0))])]
+    b["graphics"] = [_dfm_silk_line("g1", (3.0, 5.0), (7.0, 5.0), width=0.15)]
+    cmp_dfm("silk_over_pad fire", b)
+    b2 = json_copy(b); b2["graphics"] = [_dfm_silk_line("g1", (3.0, 10.0), (7.0, 10.0), width=0.15)]
+    cmp_dfm("silk_over_pad clean", b2)
+
+    # 18b silk_min_width
+    b = _dfm_board(); b["graphics"] = [_dfm_silk_line("g1", (0.0, 0.0), (5.0, 0.0), width=0.08)]
+    cmp_dfm("silk_min_width fire", b)
+    b2 = json_copy(b); b2["graphics"][0]["width"] = 0.2
+    cmp_dfm("silk_min_width clean", b2)
+
+    # 18c silk_min_text
+    b = _dfm_board(); b["graphics"] = [_dfm_silk_text("g1", (5.0, 5.0), height=0.5)]
+    cmp_dfm("silk_min_text fire", b)
+    b2 = json_copy(b); b2["graphics"][0]["size"] = [1.0, 1.0]
+    cmp_dfm("silk_min_text clean", b2)
+
+    # 18d mask_sliver
+    b = _dfm_board()
+    b["nets"] = [{"name": "NA", "class": "default"}, {"name": "NB", "class": "default"}]
+    b["footprints"] = [
+        _dfm_fp("fp1", (0.0, 0.0), pads=[_dfm_smd_pad("p1", (0.0, 0.0), "NA", size=(1.0, 1.0))]),
+        _dfm_fp("fp2", (1.05, 0.0), pads=[_dfm_smd_pad("p2", (0.0, 0.0), "NB", size=(1.0, 1.0))]),
+    ]
+    cmp_dfm("mask_sliver fire", b)
+    b2 = json_copy(b); b2["footprints"][1]["pos"] = [2.0, 0.0]
+    cmp_dfm("mask_sliver clean", b2)
+
+    # 18e acid_trap: 30deg fires, 91deg clean, different-net clean
+    b = _dfm_board(); b["nets"] = [{"name": "NA", "class": "default"}]
+    end_b = (10.0 * _math.cos(_math.radians(30)), 10.0 * _math.sin(_math.radians(30)))
+    b["tracks"] = [_dfm_track("t1", (0.0, 0.0), (10.0, 0.0), "NA"),
+                   _dfm_track("t2", (0.0, 0.0), end_b, "NA")]
+    cmp_dfm("acid_trap 30deg fire", b)
+    end_c = (10.0 * _math.cos(_math.radians(91)), 10.0 * _math.sin(_math.radians(91)))
+    b2 = json_copy(b); b2["tracks"][1] = _dfm_track("t2", (0.0, 0.0), end_c, "NA")
+    cmp_dfm("acid_trap 91deg clean", b2)
+    b3 = json_copy(b)
+    b3["nets"].append({"name": "NB", "class": "default"})
+    b3["tracks"][1] = _dfm_track("t2", (0.0, 0.0), end_b, "NB")
+    cmp_dfm("acid_trap diff-net clean", b3)
+
+    # 18f courtyard_overlap (error severity) + separated clean
+    cy_a = [_dfm_crtyd_line("g1", (-2.0, -2.0), (2.0, -2.0)),
+            _dfm_crtyd_line("g2", (2.0, -2.0), (2.0, 2.0)),
+            _dfm_crtyd_line("g3", (2.0, 2.0), (-2.0, 2.0)),
+            _dfm_crtyd_line("g4", (-2.0, 2.0), (-2.0, -2.0))]
+    cy_b = [_dfm_crtyd_line("g5", (-2.0, -2.0), (2.0, -2.0)),
+            _dfm_crtyd_line("g6", (2.0, -2.0), (2.0, 2.0)),
+            _dfm_crtyd_line("g7", (2.0, 2.0), (-2.0, 2.0)),
+            _dfm_crtyd_line("g8", (-2.0, 2.0), (-2.0, -2.0))]
+    b = _dfm_board()
+    b["footprints"] = [_dfm_fp("fp1", (0.0, 0.0), graphics=cy_a),
+                       _dfm_fp("fp2", (3.0, 0.0), graphics=cy_b)]
+    cmp_dfm("courtyard_overlap fire", b)
+    b2 = json_copy(b); b2["footprints"][1]["pos"] = [10.0, 0.0]
+    cmp_dfm("courtyard_overlap clean", b2)
+
+    # 18g drill_min: 0.1 warning, 0.05 error, 0.2 clean
+    b = _dfm_board(); b["nets"] = [{"name": "NA", "class": "default"}]
+    b["vias"] = [_dfm_via("v1", (5.0, 5.0), "NA", drill=0.1, diameter=0.5)]
+    cmp_dfm("drill_min 0.1 warn", b)
+    b2 = json_copy(b); b2["vias"][0]["drill"] = 0.05
+    cmp_dfm("drill_min 0.05 error", b2)
+    b3 = json_copy(b); b3["vias"][0]["drill"] = 0.2
+    cmp_dfm("drill_min 0.2 clean", b3)
+
+    # 18h annular_min: ring 0.1 fires, healthy ring clean
+    b = _dfm_board(); b["nets"] = [{"name": "NA", "class": "default"}]
+    b["vias"] = [_dfm_via("v1", (5.0, 5.0), "NA", drill=0.3, diameter=0.5)]
+    cmp_dfm("annular_min fire", b)
+    b2 = json_copy(b); b2["vias"][0]["diameter"] = 0.8; b2["vias"][0]["drill"] = 0.4
+    cmp_dfm("annular_min clean", b2)
+
+    # 18i combined board (multiple rules at once) + non-board input
+    b = _dfm_board()
+    b["nets"] = [{"name": "NA", "class": "default"}, {"name": "NB", "class": "default"}]
+    b["footprints"] = [
+        _dfm_fp("fp1", (0.0, 0.0), pads=[_dfm_smd_pad("p1", (0.0, 0.0), "NA", size=(1.0, 1.0))]),
+        _dfm_fp("fp2", (1.05, 0.0), pads=[_dfm_smd_pad("p2", (0.0, 0.0), "NB", size=(1.0, 1.0))]),
+    ]
+    b["vias"] = [_dfm_via("v1", (10.0, 10.0), "NA", drill=0.1, diameter=0.5)]
+    b["graphics"] = [_dfm_silk_line("g1", (3.0, 0.0), (7.0, 0.0), width=0.08)]
+    cmp_dfm("combined multi-rule", b)
+    # rules override: tighten silk_min_width so 0.15 line now fires
+    b = _dfm_board(); b["graphics"] = [_dfm_silk_line("g1", (0.0, 0.0), (5.0, 0.0), width=0.15)]
+    cmp_dfm("rules override silk", b, rules={"silk_min_width": 0.2})
+
+    # ---- 19) IMPEDANCE parity: engine.ecad.impedance vs core/ecad/impedance.cpp ----
+    # Fixtures mirror engine/ecad/test_impedance.py (microstrip/stripline/CPWG/diff
+    # pair + track_impedance). Python functions are called DIRECTLY (there is no
+    # ecad_impedance rpc in the oracle — impedance.py is a pure calculator module);
+    # C++ exposes ecad_impedance {mode,...}. Every numeric field is compared to a
+    # tight relative tolerance (1e-9) and string fields (model/kind) exactly.
+    from engine.ecad import impedance as _eimp  # noqa: E402
+
+    def cmp_imp(label, py_dict, cpp_resp, keys):
+        diffs = []
+        for k in keys:
+            pv = py_dict[k]
+            cv = cpp_resp.get(k)
+            if isinstance(pv, str):
+                if pv != cv:
+                    diffs.append(f"{k} {pv!r}!={cv!r}")
+            elif pv is None:
+                if cv is not None:
+                    diffs.append(f"{k} None!={cv}")
+            else:
+                if cv is None:
+                    diffs.append(f"{k} missing")
+                else:
+                    denom = abs(pv) if pv != 0 else 1.0
+                    if abs(pv - cv) / denom > 1e-9:
+                        diffs.append(f"{k} {pv!r}!={cv!r} (rel {abs(pv-cv)/denom:.2e})")
+        ok = not diffs
+        print(f"  {('imp ' + label):<40} {'MATCH' if ok else 'DIFF: ' + '; '.join(diffs)[:160]}")
+        return step(0 if ok else 1)
+
+    _ZK = ["z0", "eeff", "delay_ps_per_mm", "model"]
+
+    # 19a microstrip (50-ohm-class FR-4)
+    cmp_imp("microstrip", _eimp.microstrip_z0(0.3, 0.2, 0.035, 4.3),
+            cpp.call("ecad_impedance", {"mode": "microstrip", "w": 0.3, "h": 0.2, "t": 0.035, "er": 4.3}),
+            _ZK)
+    # 19b microstrip w/h < 1 (exercises the 0.04*(1-u)^2 + thin-trace branch)
+    cmp_imp("microstrip narrow", _eimp.microstrip_z0(0.15, 0.3, 0.035, 4.3),
+            cpp.call("ecad_impedance", {"mode": "microstrip", "w": 0.15, "h": 0.3, "t": 0.035, "er": 4.3}),
+            _ZK)
+    # 19c stripline
+    cmp_imp("stripline", _eimp.stripline_z0(0.3, 0.2, 0.035, 4.3),
+            cpp.call("ecad_impedance", {"mode": "stripline", "w": 0.3, "h": 0.2, "t": 0.035, "er": 4.3}),
+            _ZK)
+    # 19d CPWG (elliptic-integral path) + wider gap
+    cmp_imp("coplanar", _eimp.coplanar_z0(0.3, 0.2, 0.2, 0.035, 4.3),
+            cpp.call("ecad_impedance", {"mode": "coplanar", "w": 0.3, "s": 0.2, "h": 0.2, "t": 0.035, "er": 4.3}),
+            _ZK)
+    cmp_imp("coplanar wide", _eimp.coplanar_z0(0.3, 0.6, 0.2, 0.035, 4.3),
+            cpp.call("ecad_impedance", {"mode": "coplanar", "w": 0.3, "s": 0.6, "h": 0.2, "t": 0.035, "er": 4.3}),
+            _ZK)
+    # 19e diff pair (microstrip + stripline + tighter spacing)
+    _DK = ["z0_se", "z0_diff", "z0_odd", "eeff", "delay_ps_per_mm", "kind", "model"]
+    cmp_imp("diff_pair ms", _eimp.diff_pair_z0(0.2, 0.2, 0.2, 0.035, 4.3, kind="microstrip"),
+            cpp.call("ecad_impedance", {"mode": "diff_pair", "w": 0.2, "s": 0.2, "h": 0.2, "t": 0.035,
+                                        "er": 4.3, "kind": "microstrip"}), _DK)
+    cmp_imp("diff_pair ms tight", _eimp.diff_pair_z0(0.2, 0.05, 0.2, 0.035, 4.3, kind="microstrip"),
+            cpp.call("ecad_impedance", {"mode": "diff_pair", "w": 0.2, "s": 0.05, "h": 0.2, "t": 0.035,
+                                        "er": 4.3, "kind": "microstrip"}), _DK)
+    cmp_imp("diff_pair strip", _eimp.diff_pair_z0(0.2, 0.2, 0.2, 0.035, 4.3, kind="stripline"),
+            cpp.call("ecad_impedance", {"mode": "diff_pair", "w": 0.2, "s": 0.2, "h": 0.2, "t": 0.035,
+                                        "er": 4.3, "kind": "stripline"}), _DK)
+
+    # 19f track_impedance over a 4-layer board stackup (outer=microstrip, inner=stripline)
+    def _board_4layer():
+        bb = _eschema.new_board("si")
+        bb["stackup"] = {"copper_layers": 4, "thickness": 1.6, "layers": [
+            {"id": "F.Cu", "type": "copper", "thickness": 0.035},
+            {"id": "d1", "type": "prepreg", "thickness": 0.2, "er": 4.3},
+            {"id": "In1.Cu", "type": "copper", "thickness": 0.035},
+            {"id": "d2", "type": "core", "thickness": 0.4, "er": 4.5},
+            {"id": "In2.Cu", "type": "copper", "thickness": 0.035},
+            {"id": "d3", "type": "prepreg", "thickness": 0.2, "er": 4.3},
+            {"id": "B.Cu", "type": "copper", "thickness": 0.035}]}
+        return bb
+
+    bsi = _board_4layer()
+    bsi["tracks"].append({"id": "t1", "net": "SIG", "layer": "F.Cu", "width": 0.3,
+                          "kind": "segment", "p1": [0.0, 0.0], "p2": [10.0, 0.0]})
+    bsi["nets"].append({"name": "SIG", "class": "default"})
+    bsi["tracks"].append({"id": "t2", "net": "SIG2", "layer": "In1.Cu", "width": 0.3,
+                          "kind": "segment", "p1": [0.0, 1.0], "p2": [5.0, 1.0]})
+    bsi["nets"].append({"name": "SIG2", "class": "default"})
+
+    # The C++ ecad_impedance "track" mode needs the board in a session. Open it via
+    # ecad_new then swap the doc in by applying nothing is not possible (ops vocab),
+    # so we pass the board inline through a dedicated stateless path: the libaicad
+    # "track" mode reads params["board"] when present (else session doc_id).
+    _TK = ["z0", "eeff", "delay_ps_per_mm", "kind", "model", "width", "h", "er", "t",
+           "layer", "net", "length_mm", "delay_ps"]
+    cmp_imp("track F.Cu (microstrip)", _eimp.track_impedance(bsi, "t1"),
+            cpp.call("ecad_impedance", {"mode": "track", "board": bsi, "track_or_net": "t1"}), _TK)
+    cmp_imp("track In1.Cu (stripline)", _eimp.track_impedance(bsi, "t2"),
+            cpp.call("ecad_impedance", {"mode": "track", "board": bsi, "track_or_net": "t2"}), _TK)
+    cmp_imp("track by net name", _eimp.track_impedance(bsi, "SIG"),
+            cpp.call("ecad_impedance", {"mode": "track", "board": bsi, "track_or_net": "SIG"}), _TK)
+
     print(f"\n[ecad-parity] {total - mism}/{total} steps at full parity")
     return mism
+
+
+def json_copy(obj):
+    import copy
+    return copy.deepcopy(obj)
 
 
 if __name__ == "__main__":

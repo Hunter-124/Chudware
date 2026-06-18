@@ -121,6 +121,8 @@ add_library(aicad_ecad STATIC
   ecad/netlist.cpp
   ecad/erc.cpp
   ecad/drc.cpp
+  ecad/dfm.cpp
+  ecad/impedance.cpp
   ecad/zonefill.cpp
   ecad/session.cpp)
 target_include_directories(aicad_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

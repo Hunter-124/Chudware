@@ -4,14 +4,18 @@
 
 #include "ecad/session.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <map>
 #include <mutex>
+#include <string>
 #include <vector>
 
+#include "ecad/dfm.h"
 #include "ecad/drc.h"
 #include "ecad/erc.h"
+#include "ecad/impedance.h"
 #include "ecad/netlist.h"
 #include "ecad/schema.h"
 #include "ecad/zonefill.h"
@@ -260,6 +264,94 @@ json ecad_describe(const std::string& doc_id) {
 json ecad_schema(const std::string& kind) {
     if (kind == "pcb") return schema::new_board("Board");
     return schema::new_schematic("Schematic");
+}
+
+// Internal: build the {violations, summary} response from a board doc + rules.
+static json dfm_response(const json& board, const json& rules) {
+    json violations = run_dfm(board, rules.is_null() ? json(nullptr) : rules);
+
+    // Group violations by rule (same shape as the Python rpc summary).
+    int errors = 0, warnings = 0;
+    for (const auto& v : violations) {
+        if (v.value("severity", std::string()) == "error")
+            ++errors;
+        else
+            ++warnings;
+    }
+    // by_rule keyed by rule, preserving first-seen order then re-sorted at the end.
+    std::vector<std::string> rule_order;
+    std::map<std::string, json> by_rule;
+    for (const auto& v : violations) {
+        std::string rule = v.value("rule", std::string("?"));
+        std::string sev = v.value("severity", std::string());
+        if (!by_rule.count(rule)) {
+            rule_order.push_back(rule);
+            by_rule[rule] = json{{"rule", rule}, {"severity", sev}, {"count", 0},
+                                 {"messages", json::array()}};
+        }
+        json& slot = by_rule[rule];
+        slot["count"] = slot["count"].get<int>() + 1;
+        if (sev == "error") slot["severity"] = "error";
+        if (slot["messages"].size() < 3) slot["messages"].push_back(v.value("message", std::string()));
+    }
+    std::vector<json> groups;
+    for (const auto& r : rule_order) groups.push_back(by_rule[r]);
+    std::stable_sort(groups.begin(), groups.end(), [](const json& a, const json& b) {
+        bool ae = a["severity"].get<std::string>() != "error";
+        bool be = b["severity"].get<std::string>() != "error";
+        if (ae != be) return !ae;  // errors (false) sort first
+        return a["rule"].get<std::string>() < b["rule"].get<std::string>();
+    });
+    json by_rule_arr = json::array();
+    for (const auto& g : groups) by_rule_arr.push_back(g);
+
+    json summary = {{"errors", errors}, {"warnings", warnings}, {"by_rule", by_rule_arr}};
+    return json{{"violations", violations}, {"summary", summary}};
+}
+
+json ecad_dfm(const std::string& doc_id, const json& rules) {
+    // Inline-board fast path (parity harness passes the board verbatim via rules
+    // wrapper is not used; the libaicad dispatch passes a board when doc_id empty).
+    // Standard path: look up the open session by doc_id.
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    if (!schema::is_board(s.doc))
+        throw OpError("invalid_op", "ecad_dfm requires a pcb document",
+                      {{"reason", "wrong doc kind"}, {"doc_id", doc_id}});
+    return dfm_response(s.doc, rules);
+}
+
+// Stateless inline-board variant used by the parity harness (no session needed).
+json ecad_dfm_board(const json& board, const json& rules) {
+    if (!schema::is_board(board))
+        throw OpError("invalid_op", "ecad_dfm requires a pcb document",
+                      {{"reason", "wrong doc kind"}});
+    return dfm_response(board, rules);
+}
+
+json ecad_impedance(const json& params) {
+    auto getd = [&](const char* k, double dflt) -> double {
+        return params.contains(k) && params[k].is_number() ? params[k].get<double>() : dflt;
+    };
+    std::string mode = params.value("mode", std::string("microstrip"));
+    if (mode == "microstrip")
+        return microstrip_z0(getd("w", 0), getd("h", 0), getd("t", 0), getd("er", 0));
+    if (mode == "stripline")
+        return stripline_z0(getd("w", 0), getd("h", 0), getd("t", 0), getd("er", 0));
+    if (mode == "coplanar")
+        return coplanar_z0(getd("w", 0), getd("s", 0), getd("h", 0), getd("t", 0), getd("er", 0));
+    if (mode == "diff_pair")
+        return diff_pair_z0(getd("w", 0), getd("s", 0), getd("h", 0), getd("t", 0), getd("er", 0),
+                            params.value("kind", std::string("microstrip")));
+    if (mode == "track") {
+        json ton = params.contains("track_or_net") ? params["track_or_net"] : json(nullptr);
+        if (params.contains("board") && params["board"].is_object())
+            return track_impedance(params["board"], ton);  // stateless inline path
+        std::lock_guard<std::mutex> lk(g_mtx);
+        Session& s = require_session(params.value("doc_id", std::string()));
+        return track_impedance(s.doc, ton);
+    }
+    throw OpError("invalid_op", "ecad_impedance: unknown mode '" + mode + "'", {{"mode", mode}});
 }
 
 }  // namespace aicad::ecad

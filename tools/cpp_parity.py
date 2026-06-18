@@ -541,6 +541,124 @@ def fixtures():
          "params": {"mode": "boss", "angle": {"value": 360.0, "expr": None}},
          "refs": {"profile": [{"kind": "region", "sketch": "s1"}], "axis": _datum("ax")}}]}
 
+    # ====================================================================
+    # SELECTOR-DRIVEN datums (P55l): datums defined by TOPOLOGY SELECTORS that
+    # resolve against the running body, not by coordinate/datum refs. The C++
+    # datum compilers route the face/edge/vertex selector through the SAME
+    # resolve_face_picks/resolve_edge_picks/describe_vertices machinery the
+    # dress/hole compilers use, then construct the datum from the resolved
+    # topology, matching engine/doc/features/datum.py. Each fixture seeds a
+    # known box (so the selectors resolve to fixed centroids/axes on BOTH
+    # engines via the identical scored matcher) and CONSUMES the datum with a
+    # boss/revolve, so the resulting solid's volume + body count is the gate
+    # (the established datum-parity bar — see datum_plane_angle above).
+    # ====================================================================
+
+    # A 40x30x20 base box (V=24000), x[0,40] y[0,30] z[0,20], built merge:false so
+    # the datum-driven boss stays a SEPARATE operand (2 bodies, sum gated).
+    sd_e, sd_c = _rect(0, 0, 40, 30)
+    def _sel_datum_base():
+        return [_sketch("sb", "plane.top", sd_e, sd_c),
+                _extrude("bx", "sb", 20.0, merge=False)]
+
+    # ---- datum plane via TWO PICKED FACES: midplane between the top (+Z, z=20) and
+    # bottom (-Z, z=0) faces -> the z=10 mid-plane. A 20x20 boss extruded 5 on it
+    # (V=2000) gates the resolved planar-face plane. 2 bodies, total 26000.
+    sd_top = {"kind": "face", "surf": "plane", "centroid": [20.0, 15.0, 20.0],
+              "axis": [0.0, 0.0, 1.0], "area_or_len": 1200.0,
+              "owner_feature": None, "hint_index": 0}
+    sd_bot = {"kind": "face", "surf": "plane", "centroid": [20.0, 15.0, 0.0],
+              "axis": [0.0, 0.0, 1.0], "area_or_len": 1200.0,
+              "owner_feature": None, "hint_index": 1}
+    out["datum_plane_midplane_faces"] = {"features": _sel_datum_base() + [
+        {"id": "pl", "type": "plane", "params": {"method": "midplane"},
+         "refs": {"base": sd_top, "second": sd_bot}},
+        _sketch("s1", "pl", dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]}
+
+    # ---- datum plane via a PICKED EDGE HINGE: rotate plane.top 30 degrees about a
+    # picked bottom edge (the +X-aligned edge at y=0,z=0, midpoint [20,0,0]). The
+    # 20x20 boss on the tilted plane (V=2000) is invariant to the tilt; the SAME
+    # edge-hinge rotation on both engines is the gate. 2 bodies, total 26000.
+    sd_edge = {"kind": "edge", "surf": "line", "centroid": [20.0, 0.0, 0.0],
+               "axis": [1.0, 0.0, 0.0], "area_or_len": 40.0,
+               "owner_feature": None, "hint_index": 0}
+    out["datum_plane_angle_edge"] = {"features": _sel_datum_base() + [
+        {"id": "pl", "type": "plane",
+         "params": {"method": "angle", "angle": {"value": 30.0, "expr": None}},
+         "refs": {"base": "plane.top", "second": sd_edge}},
+        _sketch("s1", "pl", dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]}
+
+    # ---- datum plane via THREE PICKED VERTICES: three corners of the base box
+    # define a plane; a 20x20 boss on it (V=2000) gates the vertex picks + plane
+    # construction (origin/normal). Corners: (0,0,0), (40,0,0), (0,30,0) -> the z=0
+    # plane. 2 bodies, total 26000.
+    sd_v0 = {"kind": "vertex", "surf": None, "centroid": [0.0, 0.0, 0.0],
+             "axis": None, "area_or_len": None, "owner_feature": None, "hint_index": 0}
+    sd_v1 = {"kind": "vertex", "surf": None, "centroid": [40.0, 0.0, 0.0],
+             "axis": None, "area_or_len": None, "owner_feature": None, "hint_index": 1}
+    sd_v2 = {"kind": "vertex", "surf": None, "centroid": [0.0, 30.0, 0.0],
+             "axis": None, "area_or_len": None, "owner_feature": None, "hint_index": 2}
+    out["datum_plane_three_point_vertices"] = {"features": _sel_datum_base() + [
+        {"id": "pl", "type": "plane", "params": {"method": "three_point"},
+         "refs": {"points": [sd_v0, sd_v1, sd_v2]}},
+        _sketch("s1", "pl", dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]}
+
+    # The axis/point datum FEATURE compilers are gated through the clean plane->boss
+    # consumer (the proven datum-parity path above), NOT a revolve: the C++ revolve
+    # mode=boss does not yet fuse into the running body the way the oracle does
+    # (a pre-existing revolve-merge gap, orthogonal to datum wiring), so a revolve
+    # consumer would diff on body COUNT even when the datum geometry is identical.
+    # Routing through an `angle` plane (whose hinge is the datum axis) / a
+    # `three_point` plane (whose points are the datum points) gates the resolved
+    # axis direction + point positions via the boss's body count + volume the SAME
+    # way datum_plane_angle does.
+
+    # ---- datum AXIS via a PICKED EDGE, consumed as the hinge of an angle plane:
+    # pick the bottom +X edge (y=0,z=0) -> an axis datum along +X at the origin; tilt
+    # plane.top 30 degrees about it; build a 20x20 boss (V=2000) on the tilted plane.
+    # The boss's body count + volume gate the picked-edge axis (direction + location).
+    # 2 bodies (box 24000 + boss 2000 = 26000).
+    out["datum_axis_edge_plane"] = {"features": _sel_datum_base() + [
+        {"id": "ax", "type": "axis", "params": {"method": "edge"}, "refs": {"a": sd_edge}},
+        {"id": "pl", "type": "plane",
+         "params": {"method": "angle", "angle": {"value": 30.0, "expr": None}},
+         "refs": {"base": "plane.top", "second": _datum("ax")}},
+        _sketch("s1", "pl", dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]}
+
+    # ---- datum AXIS via a PICKED CYLINDRICAL FACE, consumed as an angle-plane hinge:
+    # a thin coaxial cylinder (r=4, h=2) on plane.top establishes a pickable lateral
+    # cylindrical face -> an axis datum along Z through the centre. Tilt plane.front
+    # 45 degrees about that Z axis; build a 20x20 boss (V=2000) on the tilted plane.
+    # The boss gates the cylinder face's axis (direction + location). 2 bodies.
+    cyl_pe = [_circle("e1", 0, 0, 4)]
+    cyl_pc = [_rel("c1", "fix", ["e1.center"]), _dim("c2", "radius", ["e1"], 4)]
+    sd_cyl = {"kind": "face", "surf": "cylinder", "centroid": [0.0, 0.0, 1.0],
+              "axis": [0.0, 0.0, 1.0], "area_or_len": 2.0 * 3.141592653589793 * 4.0 * 2.0,
+              "owner_feature": None, "hint_index": 0}
+    out["datum_axis_cylinder_plane"] = {"features": [
+        _sketch("sc", "plane.top", cyl_pe, cyl_pc),
+        _extrude("bx", "sc", 2.0, merge=False),
+        {"id": "ax", "type": "axis", "params": {"method": "cylinder"}, "refs": {"a": sd_cyl}},
+        {"id": "pl", "type": "plane",
+         "params": {"method": "angle", "angle": {"value": 45.0, "expr": None}},
+         "refs": {"base": "plane.front", "second": _datum("ax")}},
+        _sketch("s1", "pl", dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]}
+
+    # ---- datum POINT via PICKED VERTICES, consumed as the points of a three_point
+    # plane: three point datums each built from a PICKED CORNER of the base box, then
+    # a plane through the three points + a 20x20 boss (V=2000) on it. This gates the
+    # vertex-pick -> point FEATURE compiler (each `point` resolves a picked vertex,
+    # then the plane is built from the three). Corners (0,0,0),(40,0,0),(0,30,0) ->
+    # the z=0 plane. 2 bodies, total 26000.
+    def _point_vertex(fid, vsel):
+        return {"id": fid, "type": "point", "params": {"method": "vertex"},
+                "refs": {"target": vsel}}
+    out["datum_point_vertex_plane"] = {"features": _sel_datum_base() + [
+        _point_vertex("pa", sd_v0), _point_vertex("pb", sd_v1), _point_vertex("pc", sd_v2),
+        {"id": "pl", "type": "plane", "params": {"method": "three_point"},
+         "refs": {"points": [_datum("pa"), _datum("pb"), _datum("pc")]}},
+        _sketch("s1", "pl", dp_e, dp_c), _extrude("x1", "s1", 5.0, merge=False)]}
+
     # ---- curve: constant-pitch helix consumed as a sweep path ----------------------
     # A circle (r=2) on plane.top swept along a helix (pitch 5, height 20, radius 10)
     # -> a coiled tube. The C++ helix replicates build123d Edge.make_helix exactly

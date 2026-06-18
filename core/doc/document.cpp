@@ -33,6 +33,7 @@
 
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
+#include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
@@ -46,6 +47,7 @@
 #include <TopoDS_Vertex.hxx>
 #include <Bnd_Box.hxx>
 #include <GProp_GProps.hxx>
+#include <GeomAbs_CurveType.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <TopAbs.hxx>
 #include <TopoDS.hxx>
@@ -655,6 +657,140 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         return std::nullopt;
     };
 
+    // --- selector-driven datum helpers (engine/doc/features/datum.py) -------------
+    // The oracle distinguishes a DATUM ref (a reserved/feature-id string, or a
+    // {"kind":"datum",...} selector) from a geometry TOPOLOGY selector
+    // ({"kind":"face|edge|vertex",...}); the latter resolves against the last body via
+    // the selectors/picks machinery. Port of datum.py::_is_datum_ref.
+    auto is_datum_ref = [](const json& ref) -> bool {
+        return ref.is_string() ||
+               (ref.is_object() && ref.value("kind", std::string()) == "datum");
+    };
+    // The running body a geometry selector resolves against (datum.py::_last_body =
+    // ctx.bodies[-1]). Throws (-> contained error status) when no solid exists yet.
+    auto last_body_shape = [&](const char* what) -> const TopoDS_Shape& {
+        const std::string bid = current_solid_id();
+        if (bid.empty())
+            throw std::runtime_error(std::string(what) +
+                                     ": no body to resolve a geometry selector against");
+        return require_solid(results, bid, what);
+    };
+    // Resolve a FACE selector against the running body -> the unique TopoDS_Face, via
+    // the SAME resolve_face_picks path the dress/hole compilers use. Throws with the
+    // dangling reason on a non-resolving selector (datum.py::_resolve_sel "face").
+    auto resolve_face_sel = [&](const json& sel, const char* slot) -> TopoDS_Face {
+        const TopoDS_Shape& body = last_body_shape(slot);
+        aicad::doc::FacePicks fp = aicad::doc::resolve_face_picks(body, sel, slot);
+        if (fp.faces.empty()) {
+            std::string reason = fp.dangling.empty() ? std::string("unresolved")
+                                                     : fp.dangling.front();
+            throw std::runtime_error(std::string(slot) + ": face selector dangling — " + reason);
+        }
+        return fp.faces.front();
+    };
+    // Resolve an EDGE selector against the running body -> the unique TopoDS_Edge.
+    auto resolve_edge_sel = [&](const json& sel, const char* slot) -> TopoDS_Edge {
+        const TopoDS_Shape& body = last_body_shape(slot);
+        aicad::doc::EdgePicks ep = aicad::doc::resolve_edge_picks(body, sel);
+        if (ep.edges.empty()) {
+            std::string reason = ep.dangling.empty() ? std::string("unresolved")
+                                                     : ep.dangling.front();
+            throw std::runtime_error(std::string(slot) + ": edge selector dangling — " + reason);
+        }
+        return ep.edges.front();
+    };
+    // (point, unit direction) of a straight model edge — datum.py::_edge_line_dir
+    // (endpoint chord). Throws on a degenerate edge.
+    auto edge_line_dir =
+        [](const TopoDS_Edge& edge, const char* slot)
+        -> std::pair<Eigen::Vector3d, Eigen::Vector3d> {
+        BRepAdaptor_Curve ad(edge);
+        gp_Pnt p0 = ad.Value(ad.FirstParameter());
+        gp_Pnt p1 = ad.Value(ad.LastParameter());
+        Eigen::Vector3d a(p0.X(), p0.Y(), p0.Z());
+        Eigen::Vector3d b(p1.X(), p1.Y(), p1.Z());
+        Eigen::Vector3d d = b - a;
+        if (d.norm() < 1e-9)
+            throw std::runtime_error(std::string(slot) + ": degenerate (zero-length) edge");
+        return {a, d};
+    };
+    // Axis (location, unit direction) of a cylindrical/conical face — datum.py::_face_axis.
+    auto face_axis =
+        [](const TopoDS_Face& face, const char* slot)
+        -> std::pair<Eigen::Vector3d, Eigen::Vector3d> {
+        BRepAdaptor_Surface ad(face);
+        GeomAbs_SurfaceType st = ad.GetType();
+        gp_Ax1 ax;
+        if (st == GeomAbs_Cylinder) ax = ad.Cylinder().Axis();
+        else if (st == GeomAbs_Cone) ax = ad.Cone().Axis();
+        else throw std::runtime_error(std::string(slot) +
+                 ": face is not cylindrical/conical (axis undefined)");
+        gp_Pnt loc = ax.Location();
+        gp_Dir dr = ax.Direction();
+        return {Eigen::Vector3d(loc.X(), loc.Y(), loc.Z()),
+                Eigen::Vector3d(dr.X(), dr.Y(), dr.Z())};
+    };
+    // A planar face -> (origin, outward normal), respecting the face orientation, so a
+    // datum plane can be built on it. Mirrors datum.py::_plane_of's Plane(face) path:
+    // build123d uses the face centroid as the plane origin + the orientation-aware
+    // surface normal as z_dir. Throws on a non-planar face.
+    auto face_plane = [&](const TopoDS_Face& face, const char* slot)
+        -> aicad::geom::SketchPlane {
+        BRepAdaptor_Surface ad(face);
+        if (ad.GetType() != GeomAbs_Plane)
+            throw std::runtime_error(std::string(slot) + ": face is not planar");
+        Eigen::Vector3d n = src_face_normal(face);  // orientation-aware unit normal
+        GProp_GProps props;
+        BRepGProp::SurfaceProperties(face, props);
+        gp_Pnt cm = props.CentreOfMass();
+        return aicad::geom::SketchPlane::from(Eigen::Vector3d(cm.X(), cm.Y(), cm.Z()), n);
+    };
+    // Resolve a "planar datum OR planar face selector" ref to a SketchPlane
+    // (datum.py::_plane_of). A datum ref goes through resolve_plane_ref; a face
+    // selector resolves against the last body.
+    auto plane_of = [&](const json& ref, const char* slot) -> aicad::geom::SketchPlane {
+        if (is_datum_ref(ref)) {
+            auto p = resolve_plane_ref(ref);
+            if (!p)
+                throw std::runtime_error(std::string(slot) +
+                                         ": datum is not a planar datum");
+            return *p;
+        }
+        return face_plane(resolve_face_sel(ref, slot), slot);
+    };
+    // A 3-D point from a vertex selector OR a point/vertex datum ref
+    // (datum.py::_vertex_point). A datum ref goes through resolve_point; a vertex
+    // selector resolves against the last body (describe_vertices + resolve).
+    auto vertex_point = [&](const json& ref, const char* slot) -> Eigen::Vector3d {
+        if (is_datum_ref(ref)) return resolve_point(ref, slot);
+        const TopoDS_Shape& body = last_body_shape(slot);
+        std::vector<aicad::doc::TopoInfo> infos = aicad::doc::describe_vertices(body);
+        const double diag = aicad::doc::bbox_diag(body);
+        std::optional<int> idx = aicad::doc::resolve_with_hint_fallback(ref, infos, diag);
+        if (!idx) {
+            aicad::doc::ResolveResult rr = aicad::doc::resolve(ref, infos, diag);
+            throw std::runtime_error(std::string(slot) + ": vertex selector dangling — " +
+                                     rr.dangling_reason.value_or(std::string("unresolved")));
+        }
+        // describe_vertices enumerates one descriptor per VERTEX occurrence (a box has
+        // 48 for 8 corners); map the resolved descriptor's centroid to the nearest
+        // unique vertex of the body, the same de-dup the edge/face pick path uses.
+        const Eigen::Vector3d& target = infos[*idx].centroid;
+        TopTools_IndexedMapOfShape uniq;
+        TopExp::MapShapes(body, TopAbs_VERTEX, uniq);
+        Eigen::Vector3d best(0, 0, 0);
+        double best_d2 = std::numeric_limits<double>::infinity();
+        for (int i = 1; i <= uniq.Extent(); ++i) {
+            gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(uniq(i)));
+            Eigen::Vector3d v(p.X(), p.Y(), p.Z());
+            double d2 = (v - target).squaredNorm();
+            if (d2 < best_d2) { best_d2 = d2; best = v; }
+        }
+        if (!std::isfinite(best_d2))
+            throw std::runtime_error(std::string(slot) + ": body has no vertices");
+        return best;
+    };
+
     const json empty = json::array();
     const json& base_features = doc.contains("features") ? doc.at("features") : empty;
 
@@ -717,16 +853,19 @@ CompileResult compile_document(const json& doc, const json& env_json) {
 
             } else if (type == "plane") {
                 // Datum plane (engine/doc/features/datum.py compile_plane). Ported
-                // methods: offset (from a base plane normal), midplane (between two
-                // datum planes), angle (rotate a base plane about a datum-axis hinge),
-                // three_point (through three point datums), parallel_point (base
-                // orientation through a point datum). Selector-driven sub-cases
-                // (face/edge/vertex pick hinges, on_surface, normal_to_curve) are
-                // deferred — they need the topology selector matcher. Stores a
-                // SketchPlane keyed by id; a downstream sketch+extrude gates it.
+                // methods: offset (datum-only, from a base plane normal), midplane
+                // (between two planar datums OR picked planar faces), angle (rotate a
+                // base plane — datum or face — about a datum-axis OR picked-edge hinge),
+                // three_point (through three point datums OR picked vertices),
+                // parallel_point (base datum/face orientation through a point datum or
+                // picked vertex). on_surface / normal_to_curve remain deferred (they need
+                // surface-projection / curve-tangent evaluation). Stores a SketchPlane
+                // keyed by id; a downstream sketch+extrude gates it.
                 const std::string method = feat.value("method", std::string("offset"));
 
                 if (method == "offset") {
+                    // OFFSET is datum-only in the oracle (ctx.datum requires a planar
+                    // datum — a face selector would raise), so keep it datum-only here.
                     const json bref = feat.contains("base") ? feat.at("base") : json("plane.top");
                     auto bp = resolve_plane_ref(bref);
                     if (!bp) throw std::runtime_error("plane offset: base is not a planar datum");
@@ -737,27 +876,32 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     results[id] = PlaneResult{p};
 
                 } else if (method == "midplane") {
+                    // base/second are planar datums OR picked planar faces (datum.py
+                    // _plane_of). mid origin = (a.origin + b.origin)/2 ; orientation = a's frame.
                     const json aref = feat.contains("base") ? feat.at("base") : json("plane.top");
                     const json bref = feat.contains("second") ? feat.at("second") : json("plane.top");
-                    auto a = resolve_plane_ref(aref);
-                    auto b = resolve_plane_ref(bref);
-                    if (!a || !b)
-                        throw std::runtime_error("plane midplane: base/second must be planar datums");
-                    // mid origin = (a.origin + b.origin)/2 ; orientation = a's frame.
-                    aicad::geom::SketchPlane p = *a;
-                    p.origin = (a->origin + b->origin) * 0.5;
+                    aicad::geom::SketchPlane a = plane_of(aref, "base");
+                    aicad::geom::SketchPlane b = plane_of(bref, "second");
+                    aicad::geom::SketchPlane p = a;
+                    p.origin = (a.origin + b.origin) * 0.5;
                     results[id] = PlaneResult{p};
 
                 } else if (method == "angle") {
                     const json bref = feat.contains("base") ? feat.at("base") : json("plane.top");
-                    auto base = resolve_plane_ref(bref);
-                    if (!base) throw std::runtime_error("plane angle: base is not a planar datum");
+                    aicad::geom::SketchPlane base = plane_of(bref, "base");
                     if (!feat.contains("second"))
-                        throw std::runtime_error("plane angle: refs.second (a hinge axis) is required");
-                    auto hinge = resolve_axis_ref(feat.at("second"));
-                    if (!hinge)
-                        throw std::runtime_error("plane angle: hinge must be a datum axis "
-                                                 "(edge-selector hinges not yet ported here)");
+                        throw std::runtime_error("plane angle: refs.second (a hinge edge) is required");
+                    // The hinge is a datum axis OR a picked model edge (datum.py: edge
+                    // endpoints give the hinge point + direction).
+                    std::optional<std::pair<Eigen::Vector3d, Eigen::Vector3d>> hinge;
+                    const json& href = feat.at("second");
+                    if (is_datum_ref(href)) {
+                        hinge = resolve_axis_ref(href);
+                        if (!hinge)
+                            throw std::runtime_error("plane angle: datum hinge must be an axis");
+                    } else {
+                        hinge = edge_line_dir(resolve_edge_sel(href, "second"), "second");
+                    }
                     double ang = feat.contains("angle") ? num_or_expr(feat.at("angle"), env) : 45.0;
                     if (feat.value("flip", false)) ang = -ang;
                     // Rotate the base plane's origin + axes about the hinge (point, dir).
@@ -774,9 +918,9 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         gp_Vec q(v.x(), v.y(), v.z()); q.Transform(trsf);
                         return Eigen::Vector3d(q.X(), q.Y(), q.Z());
                     };
-                    Eigen::Vector3d o = xf_pt(base->origin);
-                    Eigen::Vector3d nrm = xf_dir(base->normal);
-                    Eigen::Vector3d uref = xf_dir(base->uAxis);
+                    Eigen::Vector3d o = xf_pt(base.origin);
+                    Eigen::Vector3d nrm = xf_dir(base.normal);
+                    Eigen::Vector3d uref = xf_dir(base.uAxis);
                     results[id] = PlaneResult{aicad::geom::SketchPlane::from(o, nrm, uref)};
 
                 } else if (method == "three_point") {
@@ -784,9 +928,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     if (pit == feat.end() || !pit->is_array() || pit->size() < 3)
                         throw std::runtime_error(
                             "plane three_point: refs.points must be three point datums");
-                    Eigen::Vector3d p0 = resolve_point((*pit)[0], "points[0]");
-                    Eigen::Vector3d p1 = resolve_point((*pit)[1], "points[1]");
-                    Eigen::Vector3d p2 = resolve_point((*pit)[2], "points[2]");
+                    // Each point is a point datum OR a picked vertex (datum.py _vertex_point).
+                    Eigen::Vector3d p0 = vertex_point((*pit)[0], "points[0]");
+                    Eigen::Vector3d p1 = vertex_point((*pit)[1], "points[1]");
+                    Eigen::Vector3d p2 = vertex_point((*pit)[2], "points[2]");
                     Eigen::Vector3d v1 = p1 - p0, v2 = p2 - p0;
                     Eigen::Vector3d n = v1.cross(v2);
                     if (n.norm() < 1e-9 || v1.norm() < 1e-9 || v2.norm() < 1e-9)
@@ -795,15 +940,16 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     results[id] = PlaneResult{aicad::geom::SketchPlane::from(p0, n, v1)};
 
                 } else if (method == "parallel_point") {
+                    // base is a planar datum OR a picked planar face; the through-point is
+                    // a point datum OR a picked vertex (datum.py parallel_point).
                     const json bref = feat.contains("base") ? feat.at("base") : json("plane.top");
-                    auto base = resolve_plane_ref(bref);
-                    if (!base) throw std::runtime_error("plane parallel_point: base is not a planar datum");
+                    aicad::geom::SketchPlane base = plane_of(bref, "base");
                     auto pit = feat.find("points");
                     if (pit == feat.end() || !pit->is_array() || pit->empty())
                         throw std::runtime_error(
                             "plane parallel_point: refs.points[0] (a through-point) is required");
-                    Eigen::Vector3d thru = resolve_point((*pit)[0], "points[0]");
-                    aicad::geom::SketchPlane p = *base;
+                    Eigen::Vector3d thru = vertex_point((*pit)[0], "points[0]");
+                    aicad::geom::SketchPlane p = base;
                     p.origin = thru;
                     results[id] = PlaneResult{p};
 
@@ -814,20 +960,61 @@ CompileResult compile_document(const json& doc, const json& env_json) {
 
             } else if (type == "axis") {
                 // Datum axis (engine/doc/features/datum.py compile_axis). Ported:
-                // two_points (line through two point datums) + a reserved/axis-datum
-                // pass-through. Selector-driven (cylinder face / edge / plane_intersect
-                // / on_surface) are deferred. Stores an AxisResult; a downstream revolve
-                // about this axis gates it (the swept solid's volume + position).
+                // two_points (line through two point datums OR picked vertices), cylinder
+                // (a picked cylindrical/conical face's revolve axis OR a datum-axis pass-
+                // through), edge (a picked straight model edge OR a datum-axis pass-
+                // through), plane_intersect (the line shared by two planar datums/faces).
+                // Stores an AxisResult; a downstream revolve about this axis gates it.
                 const std::string method = feat.value("method", std::string("two_points"));
                 if (method == "two_points") {
-                    Eigen::Vector3d a = resolve_point(feat.at("a"), "a");
-                    Eigen::Vector3d b = resolve_point(feat.at("b"), "b");
+                    Eigen::Vector3d a = vertex_point(feat.at("a"), "a");
+                    Eigen::Vector3d b = vertex_point(feat.at("b"), "b");
                     Eigen::Vector3d d = b - a;
                     if (d.norm() < 1e-9)
                         throw std::runtime_error("axis two_points: coincident points");
                     results[id] = AxisResult{a, d.normalized()};
+                } else if (method == "cylinder") {
+                    const json& aref = feat.at("a");
+                    if (is_datum_ref(aref)) {
+                        auto ax = resolve_axis_ref(aref);
+                        if (!ax)
+                            throw std::runtime_error("axis cylinder: datum ref.a must be an axis");
+                        results[id] = AxisResult{ax->first, ax->second};
+                    } else {
+                        auto [loc, dir] = face_axis(resolve_face_sel(aref, "a"), "a");
+                        if (dir.norm() < 1e-9)
+                            throw std::runtime_error("axis cylinder: degenerate face axis");
+                        results[id] = AxisResult{loc, dir.normalized()};
+                    }
+                } else if (method == "edge") {
+                    const json& aref = feat.at("a");
+                    if (is_datum_ref(aref)) {
+                        auto ax = resolve_axis_ref(aref);
+                        if (!ax)
+                            throw std::runtime_error("axis edge: datum ref.a must be an axis");
+                        results[id] = AxisResult{ax->first, ax->second};
+                    } else {
+                        auto [pt, dir] = edge_line_dir(resolve_edge_sel(aref, "a"), "a");
+                        results[id] = AxisResult{pt, dir.normalized()};
+                    }
+                } else if (method == "plane_intersect") {
+                    // Line shared by two planes (datum or picked planar face). direction =
+                    // na × nb; a point on the line solves [na; nb; dir]·x = [na·oa; nb·ob; 0].
+                    aicad::geom::SketchPlane pa = plane_of(feat.at("a"), "a");
+                    aicad::geom::SketchPlane pb = plane_of(feat.at("b"), "b");
+                    Eigen::Vector3d na = pa.normal, nb = pb.normal;
+                    Eigen::Vector3d dir = na.cross(nb);
+                    if (dir.norm() < 1e-9)
+                        throw std::runtime_error(
+                            "axis plane_intersect: planes are parallel (no intersection line)");
+                    Eigen::Matrix3d A;
+                    A.row(0) = na; A.row(1) = nb; A.row(2) = dir;
+                    Eigen::Vector3d rhs(na.dot(pa.origin), nb.dot(pb.origin), 0.0);
+                    Eigen::Vector3d pt = A.fullPivLu().solve(rhs);
+                    results[id] = AxisResult{pt, dir.normalized()};
                 } else {
-                    // cylinder / edge: accept a datum-axis pass-through (refs.a a datum).
+                    // accept a datum-axis pass-through for any other method (e.g. on_surface
+                    // with a datum), else flag a clear unsupported-method error.
                     auto ax = feat.contains("a") ? resolve_axis_ref(feat.at("a"))
                                                  : std::nullopt;
                     if (ax) {
@@ -841,10 +1028,15 @@ CompileResult compile_document(const json& doc, const json& env_json) {
 
             } else if (type == "point") {
                 // Datum point (engine/doc/features/datum.py compile_point). Ported:
-                // coordinate (explicit XYZ) + a point-datum target pass-through. Other
-                // methods (vertex/center/on_face/on_curve/intersection/centroid) need
-                // the topology selector matcher and are deferred. Stores a PointResult.
+                // coordinate (explicit XYZ), a point/vertex-datum target pass-through,
+                // and the selector-driven methods vertex (a picked vertex), center (a
+                // picked circular edge's arc centre or a picked face's centre), and
+                // centroid (the whole-body volume centroid, or a picked face's area
+                // centroid). Stores a PointResult.
                 const std::string method = feat.value("method", std::string("vertex"));
+                auto tit = feat.find("target");
+                const bool target_is_datum =
+                    tit != feat.end() && is_datum_ref(*tit);
                 if (method == "coordinate") {
                     Eigen::Vector3d p(0, 0, 0);
                     auto cit = feat.find("coordinate");
@@ -858,8 +1050,57 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                             feat.contains("z") ? num_or_expr(feat.at("z"), env) : 0.0);
                     }
                     results[id] = PointResult{p};
-                } else if (feat.contains("target")) {
-                    results[id] = PointResult{resolve_point(feat.at("target"), "target")};
+                } else if (method == "centroid" &&
+                           (feat.value("body", false) ||
+                            (tit != feat.end() && tit->is_object() &&
+                             tit->value("kind", std::string()) == "body"))) {
+                    // Whole-body volume centre of mass (datum.py _body_centroid). Needs no
+                    // target — the running solid.
+                    const TopoDS_Shape& body = last_body_shape("point centroid");
+                    GProp_GProps props;
+                    BRepGProp::VolumeProperties(body, props);
+                    gp_Pnt cm = props.CentreOfMass();
+                    results[id] = PointResult{Eigen::Vector3d(cm.X(), cm.Y(), cm.Z())};
+                } else if (target_is_datum) {
+                    // A point/vertex datum target resolves directly regardless of method.
+                    results[id] = PointResult{resolve_point(*tit, "target")};
+                } else if (tit == feat.end()) {
+                    throw std::runtime_error("point: refs.target is required");
+                } else if (method == "vertex") {
+                    results[id] = PointResult{vertex_point(*tit, "target")};
+                } else if (method == "center") {
+                    const std::string kind = tit->is_object()
+                        ? tit->value("kind", std::string()) : std::string();
+                    if (kind == "edge") {
+                        // Centre of a circular edge (datum.py: edge.arc_center).
+                        TopoDS_Edge e = resolve_edge_sel(*tit, "target");
+                        BRepAdaptor_Curve ad(e);
+                        if (ad.GetType() != GeomAbs_Circle)
+                            throw std::runtime_error("point center: edge is not circular");
+                        gp_Pnt c = ad.Circle().Location();
+                        results[id] = PointResult{Eigen::Vector3d(c.X(), c.Y(), c.Z())};
+                    } else if (kind == "face") {
+                        // Centre of a face (datum.py: face.center() — area centroid).
+                        TopoDS_Face f = resolve_face_sel(*tit, "target");
+                        GProp_GProps props;
+                        BRepGProp::SurfaceProperties(f, props);
+                        gp_Pnt cm = props.CentreOfMass();
+                        results[id] = PointResult{Eigen::Vector3d(cm.X(), cm.Y(), cm.Z())};
+                    } else {
+                        throw std::runtime_error(
+                            "point center: target must be a circular edge or a face");
+                    }
+                } else if (method == "centroid") {
+                    // Area centre of mass of a picked face (the body centroid is handled
+                    // earlier). datum.py _face_centroid.
+                    if (!tit->is_object() || tit->value("kind", std::string()) != "face")
+                        throw std::runtime_error(
+                            "point centroid: target must be a face, or pass params.body");
+                    TopoDS_Face f = resolve_face_sel(*tit, "target");
+                    GProp_GProps props;
+                    BRepGProp::SurfaceProperties(f, props);
+                    gp_Pnt cm = props.CentreOfMass();
+                    results[id] = PointResult{Eigen::Vector3d(cm.X(), cm.Y(), cm.Z())};
                 } else {
                     throw std::runtime_error(
                         "point: method '" + method + "' needs a geometry selector (not yet ported)");
@@ -868,18 +1109,29 @@ CompileResult compile_document(const json& doc, const json& env_json) {
 
             } else if (type == "csys") {
                 // Datum coordinate system (engine/doc/features/datum.py compile_csys).
-                // Geometrically a Plane: origin from a point datum (default "origin"),
-                // optional x_dir/y_dir from datum axes (Gram-Schmidt orthonormal frame).
-                // Edge-selector directions are deferred. Stored as a csys PlaneResult so
-                // a sketch can be built on it (gates the origin + frame via the solid).
+                // Geometrically a Plane: origin from a point/vertex datum or a picked
+                // vertex (default "origin"); optional x_dir/y_dir from datum axes OR picked
+                // model edges (Gram-Schmidt orthonormal frame). Stored as a csys
+                // PlaneResult so a sketch can be built on it (gates origin + frame).
                 const json oref = feat.contains("origin") ? feat.at("origin") : json("origin");
-                Eigen::Vector3d o = resolve_point(oref, "origin");
-                auto xax = feat.contains("x_dir") ? resolve_axis_ref(feat.at("x_dir")) : std::nullopt;
-                if (feat.contains("x_dir") && !xax)
-                    throw std::runtime_error("csys x_dir: must be a datum axis (edge selectors not ported)");
-                auto yax = feat.contains("y_dir") ? resolve_axis_ref(feat.at("y_dir")) : std::nullopt;
-                if (feat.contains("y_dir") && !yax)
-                    throw std::runtime_error("csys y_dir: must be a datum axis (edge selectors not ported)");
+                Eigen::Vector3d o = vertex_point(oref, "origin");
+                // A direction from a datum axis OR a picked model edge (datum.py _dir_from).
+                auto dir_from = [&](const char* slot) -> std::optional<Eigen::Vector3d> {
+                    if (!feat.contains(slot)) return std::nullopt;
+                    const json& ref = feat.at(slot);
+                    if (is_datum_ref(ref)) {
+                        auto ax = resolve_axis_ref(ref);
+                        if (!ax) throw std::runtime_error(
+                            std::string("csys ") + slot + ": datum must be an axis");
+                        return ax->second;
+                    }
+                    auto [pt, d] = edge_line_dir(resolve_edge_sel(ref, slot), slot);
+                    return d;
+                };
+                std::optional<std::pair<Eigen::Vector3d, Eigen::Vector3d>> xax;
+                if (auto xd = dir_from("x_dir")) xax = std::make_pair(o, *xd);
+                std::optional<std::pair<Eigen::Vector3d, Eigen::Vector3d>> yax;
+                if (auto yd = dir_from("y_dir")) yax = std::make_pair(o, *yd);
                 aicad::geom::SketchPlane p;
                 if (!xax) {
                     p = aicad::geom::SketchPlane::top();

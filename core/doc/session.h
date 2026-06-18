@@ -128,6 +128,40 @@ nlohmann::json doc_face_points(const std::string& doc_id, const nlohmann::json& 
 // {is_surface, area_mm2, ...} report. Throws OpError on no bodies / a bad body_id.
 nlohmann::json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3);
 
+// Evaluate — geometry-validity report of the active body (port of evaluate.py::check via
+// worker.py::_eval_check). Runs BRepCheck_Analyzer + free-edge / tiny-edge / sliver-face
+// census. Returns {"issues":[{kind,severity,text}]} (empty issues == valid). body_id is
+// 1-based; <= 0 selects the LAST body. Throws OpError on no bodies / a bad body_id.
+nlohmann::json doc_eval_check(const std::string& doc_id, int body_id);
+
+// Evaluate — cross-section properties of the LAST body at `plane` (port of
+// evaluate.py::section_props via worker.py::_eval_section_props). `plane` is a reserved
+// planar datum id ("plane.top/front/right") or a {"kind":"datum","feature":<id>} selector.
+// Returns {area_mm2, centroid[3], Ixx, Iyy, Ixy}. Matches the oracle's degenerate path
+// (area/moments == 0; only the section-wire centroid is meaningful). Throws OpError on no
+// bodies / a non-reserved-planar plane.
+nlohmann::json doc_eval_section_props(const std::string& doc_id, const nlohmann::json& plane_ref);
+
+// Evaluate — mirror-symmetry of the active body about `plane` (port of evaluate.py::
+// symmetry via worker.py::_eval_symmetry). Returns {symmetric, deviation_mm3} where
+// deviation is the symmetric-difference volume. body_id 1-based, <= 0 = LAST. `plane` as
+// for section_props. Throws OpError on no bodies / a bad body_id / a bad plane.
+nlohmann::json doc_eval_symmetry(const std::string& doc_id, int body_id,
+                                 const nlohmann::json& plane_ref);
+
+// Evaluate — pairwise interference + clearance across ALL surviving bodies (port of
+// evaluate.py::interference via worker.py::_eval_interference, part-doc branch). Returns
+// {ok, summary, parts:[{name,volume,bbox}], interferences:[{a,b,volume}], clearances:
+// [{a,b,distance}]}. Body names are "b1".."bN" in AICM order (matching the oracle's
+// body_id). A single-body part yields an empty interference/clearance report.
+nlohmann::json doc_eval_interference(const std::string& doc_id);
+
+// Evaluate — measure 1-2 resolved refs against the LAST body (port of evaluate.py::measure
+// via worker.py::_eval_measure). Each ref is a face/edge/vertex selector. 1 ref ->
+// single-entity measure (length/radius/area/point/volume); 2 refs -> pair measure
+// (distance + optional angle). Throws OpError on no bodies / a dangling ref / a bad count.
+nlohmann::json doc_eval_measure(const std::string& doc_id, const nlohmann::json& refs);
+
 // Export the document's surviving solid bodies to `path` in `fmt` (step/iges/brep/stl)
 // via OCCT. Returns {"path": <abs>}. Throws OpError("export_failed") on no bodies / an
 // unsupported format / a writer failure (engine.doc.formats export_file).

@@ -1359,6 +1359,33 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 params.contains("density_g_cm3") && params["density_g_cm3"].is_number()
                                     ? params["density_g_cm3"].get<double>() : 7.85),
                             out_json, 0);
+            if (m == "eval_check")
+                return emit(aicad::doc::doc_eval_check(
+                                params.value("doc_id", std::string()),
+                                params.contains("body") && params["body"].is_number()
+                                    ? params["body"].get<int>() : 0),
+                            out_json, 0);
+            if (m == "eval_section_props")
+                return emit(aicad::doc::doc_eval_section_props(
+                                params.value("doc_id", std::string()),
+                                params.contains("plane") ? params["plane"] : json(nullptr)),
+                            out_json, 0);
+            if (m == "eval_symmetry")
+                return emit(aicad::doc::doc_eval_symmetry(
+                                params.value("doc_id", std::string()),
+                                params.contains("body") && params["body"].is_number()
+                                    ? params["body"].get<int>() : 0,
+                                params.contains("plane") ? params["plane"] : json(nullptr)),
+                            out_json, 0);
+            if (m == "eval_interference")
+                return emit(aicad::doc::doc_eval_interference(
+                                params.value("doc_id", std::string())),
+                            out_json, 0);
+            if (m == "eval_measure")
+                return emit(aicad::doc::doc_eval_measure(
+                                params.value("doc_id", std::string()),
+                                params.contains("refs") ? params["refs"] : json::array()),
+                            out_json, 0);
             if (m == "export_file")
                 return emit(aicad::doc::doc_export_file(params.value("doc_id", std::string()),
                                                         params.value("path", std::string()),

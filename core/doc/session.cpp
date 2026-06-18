@@ -38,12 +38,35 @@
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Pln.hxx>
+#include <gp_Dir.hxx>
+#include <gp_Ax2.hxx>
+#include <gp_Ax3.hxx>
+#include <gp_Vec.hxx>
 #include <gp_Trsf.hxx>
 #include <gp_Mat.hxx>
 #include <GProp_GProps.hxx>
 #include <BRepGProp.hxx>
 #include <TopExp.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
+#include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
+#include <BRepCheck_Analyzer.hxx>
+#include <BRepCheck_Result.hxx>
+#include <BRepCheck_ListOfStatus.hxx>
+#include <BRepCheck_Status.hxx>
+#include <BRepAlgoAPI_Section.hxx>
+#include <BRepAlgoAPI_Common.hxx>
+#include <BRepBuilderAPI_Transform.hxx>
+#include <BRepExtrema_DistShapeShape.hxx>
+#include <BRepAdaptor_Surface.hxx>
+#include <BRepAdaptor_Curve.hxx>
+#include <BRepLProp_SLProps.hxx>
+#include <GCPnts_AbscissaPoint.hxx>
+#include <GeomAbs_SurfaceType.hxx>
+#include <GeomAbs_CurveType.hxx>
+#include <gp_Circ.hxx>
+#include <TopoDS_Edge.hxx>
+#include <TopoDS_Vertex.hxx>
 
 #include <Eigen/Eigenvalues>
 
@@ -53,6 +76,7 @@
 #include "doc/sketch_geom.h"
 #include "doc/stepplus.h"
 #include "doc/validate.h"
+#include "geom/plane.h"
 #include "util/expr.h"
 
 namespace aicad::doc {
@@ -1784,6 +1808,546 @@ json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3)
         {"principal_axes", principal_axes},
         {"material", {{"density_g_cm3", density_g_cm3}}},
     };
+}
+
+// ----------------------------------------------------------------- Evaluate suite
+// Ports of engine/doc/evaluate.py {check, section_props, symmetry, interference,
+// measure} via the engine/worker.py _eval_* handlers. The active body is the LAST
+// compiled body by default (body_id 1-based; <=0 = last), EXCEPT interference (all
+// bodies) and measure (refs resolved against the LAST body).
+
+namespace {
+
+// Pick the active (or selected) surviving solid from a fresh compile. body_id is
+// 1-based; <=0 selects the LAST body. Mirrors worker.py::_eval_active_shape.
+const TopoDS_Shape& eval_active_shape(const CompileResult& r, const std::string& doc_id,
+                                      int body_id) {
+    if (r.shapes.empty())
+        throw OpError("invalid_op", "document has no bodies to evaluate", {{"doc_id", doc_id}});
+    if (body_id >= 1) {
+        if (body_id > static_cast<int>(r.shapes.size()))
+            throw OpError("invalid_op", "body_id " + std::to_string(body_id) + " out of range",
+                          {{"reason", "bad body_id"}});
+        return r.shapes[static_cast<std::size_t>(body_id - 1)];
+    }
+    return r.shapes.back();
+}
+
+// Resolve a plane ref (datum id string "plane.top/front/right", or {"kind":"datum",
+// "feature":<id>}) to a gp_Pln whose origin/normal/X-axis match the build123d Plane the
+// Python oracle produces (reserved_datums + worker.py::_resolve_eval_plane). The X-axis
+// (uAxis) parity matters for section_props' Ixx/Iyy/Ixy (the face MatrixOfInertia is
+// expressed in the plane frame). Throws OpError on a non-reserved/non-planar ref.
+gp_Pln eval_resolve_plane(const json& plane_ref) {
+    std::string name;
+    if (plane_ref.is_string()) {
+        name = plane_ref.get<std::string>();
+    } else if (plane_ref.is_object() && plane_ref.value("kind", std::string()) == "datum" &&
+               plane_ref.contains("feature") && plane_ref["feature"].is_string()) {
+        name = plane_ref["feature"].get<std::string>();
+    } else {
+        throw OpError("invalid_op", "plane must be a datum id or datum selector",
+                      {{"reason", "bad plane"}});
+    }
+    std::string bare = name;
+    if (bare.rfind("plane.", 0) == 0) bare = bare.substr(6);
+    if (bare != "top" && bare != "front" && bare != "right")
+        throw OpError("invalid_op", "plane '" + name + "' is not a reserved planar datum",
+                      {{"reason", "bad plane"}});
+    // SketchPlane factory: top u=+X n=+Z; front u=+X n=-Y; right u=+Y n=+X — these
+    // are exactly build123d's Plane.XY / .XZ / .YZ (origin, x_dir, z_dir).
+    aicad::geom::SketchPlane sp = (bare == "front") ? aicad::geom::SketchPlane::front()
+                                  : (bare == "right") ? aicad::geom::SketchPlane::right()
+                                                      : aicad::geom::SketchPlane::top();
+    gp_Pnt origin(sp.origin.x(), sp.origin.y(), sp.origin.z());
+    gp_Dir normal(sp.normal.x(), sp.normal.y(), sp.normal.z());
+    gp_Dir xdir(sp.uAxis.x(), sp.uAxis.y(), sp.uAxis.z());
+    return gp_Pln(gp_Ax3(origin, normal, xdir));
+}
+
+// engine/doc/evaluate.py::_edge_length — arc length via GCPnts_AbscissaPoint; 0 on error.
+double eval_edge_length(const TopoDS_Edge& edge) {
+    try {
+        BRepAdaptor_Curve ca(edge);
+        return GCPnts_AbscissaPoint::Length(ca, ca.FirstParameter(), ca.LastParameter(), 1e-4);
+    } catch (const Standard_Failure&) {
+        return 0.0;
+    }
+}
+
+// engine/doc/evaluate.py::_vol_or_zero — VolumeProperties mass clamped at >= 0; 0 on error.
+double eval_vol_or_zero(const TopoDS_Shape& shape) {
+    try {
+        GProp_GProps gp;
+        BRepGProp::VolumeProperties(shape, gp);
+        return std::max(0.0, gp.Mass());
+    } catch (const Standard_Failure&) {
+        return 0.0;
+    }
+}
+
+// engine/doc/evaluate.py::_face_normal_at_center — surface normal at the face's UV midpoint
+// (returns false when undefined). Mirrors BRepLProp_SLProps(.., 1, 1e-7).IsNormalDefined.
+bool eval_face_normal_at_center(const TopoDS_Face& face, gp_Dir& out) {
+    try {
+        BRepAdaptor_Surface sa(face);
+        double u = (sa.FirstUParameter() + sa.LastUParameter()) / 2.0;
+        double v = (sa.FirstVParameter() + sa.LastVParameter()) / 2.0;
+        BRepLProp_SLProps sl(sa, u, v, 1, 1e-7);
+        if (sl.IsNormalDefined()) {
+            out = sl.Normal();
+            return true;
+        }
+    } catch (const Standard_Failure&) {
+    }
+    return false;
+}
+
+// engine/doc/evaluate.py::_edge_tangent_at_mid — D1 tangent at the edge mid-parameter.
+bool eval_edge_tangent_at_mid(const TopoDS_Edge& edge, gp_Dir& out) {
+    try {
+        BRepAdaptor_Curve ca(edge);
+        double t = (ca.FirstParameter() + ca.LastParameter()) / 2.0;
+        gp_Pnt p;
+        gp_Vec tang;
+        ca.D1(t, p, tang);
+        if (tang.Magnitude() > 1e-12) {
+            out = gp_Dir(tang);
+            return true;
+        }
+    } catch (const Standard_Failure&) {
+    }
+    return false;
+}
+
+// engine/doc/evaluate.py::_try_angle — degrees between two faces (normals) or two edges
+// (tangents); returns false when not applicable. abs(dot) so the answer is in [0,90].
+bool eval_try_angle(const TopoDS_Shape& a, const TopoDS_Shape& b, double& out) {
+    try {
+        if (a.ShapeType() == TopAbs_FACE && b.ShapeType() == TopAbs_FACE) {
+            gp_Dir n1, n2;
+            if (eval_face_normal_at_center(TopoDS::Face(a), n1) &&
+                eval_face_normal_at_center(TopoDS::Face(b), n2)) {
+                double dot = std::max(-1.0, std::min(1.0, n1.Dot(n2)));
+                out = std::acos(std::fabs(dot)) * (180.0 / 3.14159265358979323846);
+                return true;
+            }
+        } else if (a.ShapeType() == TopAbs_EDGE && b.ShapeType() == TopAbs_EDGE) {
+            gp_Dir d1, d2;
+            if (eval_edge_tangent_at_mid(TopoDS::Edge(a), d1) &&
+                eval_edge_tangent_at_mid(TopoDS::Edge(b), d2)) {
+                double dot = std::max(-1.0, std::min(1.0, d1.Dot(d2)));
+                out = std::acos(std::fabs(dot)) * (180.0 / 3.14159265358979323846);
+                return true;
+            }
+        }
+    } catch (const Standard_Failure&) {
+    }
+    return false;
+}
+
+// engine/doc/evaluate.py::_measure_single — 1 ref. EDGE -> radius (circle) or length;
+// FACE -> area; VERTEX -> point; else volume.
+json eval_measure_single(const TopoDS_Shape& raw) {
+    const TopAbs_ShapeEnum st = raw.ShapeType();
+    if (st == TopAbs_EDGE) {
+        TopoDS_Edge edge = TopoDS::Edge(raw);
+        try {
+            BRepAdaptor_Curve ca(edge);
+            if (ca.GetType() == GeomAbs_Circle)
+                return json{{"kind", "radius"}, {"radius", ca.Circle().Radius()}};
+        } catch (const Standard_Failure&) {
+        }
+        return json{{"kind", "length"}, {"length", eval_edge_length(edge)}};
+    }
+    if (st == TopAbs_FACE) {
+        GProp_GProps gp;
+        BRepGProp::SurfaceProperties(raw, gp);
+        return json{{"kind", "area"}, {"area", gp.Mass()}};
+    }
+    if (st == TopAbs_VERTEX) {
+        gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(raw));
+        return json{{"kind", "point"}, {"points", json::array({json::array({p.X(), p.Y(), p.Z()})})}};
+    }
+    GProp_GProps gp;
+    BRepGProp::VolumeProperties(raw, gp);
+    return json{{"kind", "volume"}, {"volume", gp.Mass()}};
+}
+
+// engine/doc/evaluate.py::_measure_pair — distance (BRepExtrema) + optional angle.
+json eval_measure_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
+    json result = json::object();
+    try {
+        BRepExtrema_DistShapeShape dss(a, b);
+        if (dss.IsDone()) {
+            result["distance"] = dss.Value();
+            result["kind"] = "distance";
+            if (dss.NbSolution() > 0) {
+                gp_Pnt p1 = dss.PointOnShape1(1);
+                gp_Pnt p2 = dss.PointOnShape2(1);
+                result["points"] = json::array({json::array({p1.X(), p1.Y(), p1.Z()}),
+                                                 json::array({p2.X(), p2.Y(), p2.Z()})});
+            }
+        }
+    } catch (const Standard_Failure&) {
+    }
+    double angle = 0.0;
+    if (eval_try_angle(a, b, angle)) {
+        result["angle"] = angle;
+        if (!result.contains("kind")) result["kind"] = "angle";
+    }
+    if (result.empty()) result["kind"] = "unknown";
+    return result;
+}
+
+// Resolve a measure ref (face/edge/vertex selector) against `shape` to an OCCT sub-shape,
+// re-walking TopExp in the SAME order describe_* enumerates (mirrors worker.py::
+// _resolve_eval_ref + doc_face_points' index re-walk). bbox_diag floor 1e-3.
+TopoDS_Shape eval_resolve_ref(const json& ref, const TopoDS_Shape& shape, double diag) {
+    const std::string kind = ref.value("kind", std::string());
+    std::vector<TopoInfo> infos;
+    TopAbs_ShapeEnum tt;
+    if (kind == "face") {
+        infos = describe_faces(shape);
+        tt = TopAbs_FACE;
+    } else if (kind == "edge") {
+        infos = describe_edges(shape);
+        tt = TopAbs_EDGE;
+    } else if (kind == "vertex") {
+        infos = describe_vertices(shape);
+        tt = TopAbs_VERTEX;
+    } else {
+        throw OpError("invalid_op", "measure ref kind '" + kind + "' unsupported",
+                      {{"reason", "bad kind"}});
+    }
+    ResolveResult rr = resolve(ref, infos, diag);
+    if (!rr.index.has_value())
+        throw OpError("invalid_op",
+                      "measure ref dangling: " + rr.dangling_reason.value_or(std::string("unresolved")),
+                      {{"reason", rr.dangling_reason.value_or(std::string("dangling"))}});
+    int idx = 0;
+    for (TopExp_Explorer exp(shape, tt); exp.More(); exp.Next(), ++idx) {
+        if (idx == *rr.index) return exp.Current();
+    }
+    throw OpError("invalid_op", "measure ref dangling: index out of range",
+                  {{"reason", "index out of range"}});
+}
+
+}  // namespace
+
+// engine/doc/evaluate.py::check via worker.py::_eval_check. BRepCheck_Analyzer +
+// free-edge / tiny-edge / sliver-face census. Returns {"issues":[{kind,severity,text}]}.
+json doc_eval_check(const std::string& doc_id, int body_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    const TopoDS_Shape& shape = eval_active_shape(r, doc_id, body_id);
+
+    json issues = json::array();
+
+    // BRepCheck: walk the analyzer result tree, emit one "brep_check" error per non-OK
+    // sub-result status (mirrors _collect_brep_issues).
+    BRepCheck_Analyzer analyzer(shape);
+    if (!analyzer.IsValid()) {
+        try {
+            const Handle(BRepCheck_Result)& res = analyzer.Result(shape);
+            if (!res.IsNull()) {
+                for (res->InitContextIterator(); res->MoreShapeInContext();
+                     res->NextShapeInContext()) {
+                    const TopoDS_Shape& sub = res->ContextualShape();
+                    try {
+                        const Handle(BRepCheck_Result)& res2 = analyzer.Result(sub);
+                        if (!res2.IsNull()) {
+                            const BRepCheck_ListOfStatus& sts =
+                                res2->IsStatusOnShape(sub) ? res2->StatusOnShape(sub) : res2->Status();
+                            for (BRepCheck_ListOfStatus::Iterator it(sts); it.More(); it.Next()) {
+                                if (it.Value() != BRepCheck_NoError) {
+                                    issues.push_back(json{
+                                        {"kind", "brep_check"},
+                                        {"severity", "error"},
+                                        {"text", "BRepCheck status " +
+                                                     std::to_string(static_cast<int>(it.Value()))}});
+                                }
+                            }
+                        }
+                    } catch (const Standard_Failure&) {
+                    }
+                }
+            }
+        } catch (const Standard_Failure&) {
+        }
+    }
+
+    // Free-edge census: edges with fewer than 2 adjacent faces.
+    TopTools_IndexedDataMapOfShapeListOfShape anc_map;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, anc_map);
+    TopTools_IndexedMapOfShape edge_map;
+    TopExp::MapShapes(shape, TopAbs_EDGE, edge_map);
+
+    int free_edges = 0;
+    for (int ei = 1; ei <= edge_map.Extent(); ++ei) {
+        const TopoDS_Shape& edge = edge_map.FindKey(ei);
+        int n_faces = anc_map.Contains(edge) ? anc_map.FindFromKey(edge).Extent() : 0;
+        if (n_faces < 2) ++free_edges;
+    }
+    if (free_edges > 0)
+        issues.push_back(json{{"kind", "free_edges"},
+                              {"severity", "warning"},
+                              {"text", std::to_string(free_edges) +
+                                           " free edge(s) detected (open shell)"}});
+
+    // Tiny-edge census (< 0.01 mm).
+    constexpr double TINY_EDGE_MM = 0.01;
+    int tiny_edges = 0;
+    for (int ei = 1; ei <= edge_map.Extent(); ++ei) {
+        if (eval_edge_length(TopoDS::Edge(edge_map.FindKey(ei))) < TINY_EDGE_MM) ++tiny_edges;
+    }
+    if (tiny_edges > 0) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "%d tiny edge(s) shorter than %g mm", tiny_edges,
+                      TINY_EDGE_MM);
+        issues.push_back(json{{"kind", "tiny_edges"}, {"severity", "warning"}, {"text", buf}});
+    }
+
+    // Sliver-face census (< 0.01 mm^2).
+    constexpr double SLIVER_AREA_MM2 = 0.01;
+    TopTools_IndexedMapOfShape face_map;
+    TopExp::MapShapes(shape, TopAbs_FACE, face_map);
+    int sliver_faces = 0;
+    for (int fi = 1; fi <= face_map.Extent(); ++fi) {
+        GProp_GProps gp;
+        BRepGProp::SurfaceProperties(face_map.FindKey(fi), gp);
+        if (gp.Mass() < SLIVER_AREA_MM2) ++sliver_faces;
+    }
+    if (sliver_faces > 0) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "%d sliver face(s) smaller than %g mm\xc2\xb2",
+                      sliver_faces, SLIVER_AREA_MM2);
+        issues.push_back(json{{"kind", "sliver_faces"}, {"severity", "warning"}, {"text", buf}});
+    }
+
+    return json{{"issues", issues}};
+}
+
+// engine/doc/evaluate.py::section_props via worker.py::_eval_section_props. Because the
+// Python passes a build123d Plane (whose .wrapped is a gp_Pln), the oracle's
+// isinstance(plane, gp_Pln) check is FALSE and cutting_pln resolves to None — so it never
+// builds the section face and returns area/moments == 0 with only the section-wire
+// (LinearProperties) centroid. We reproduce that exact (degenerate) behavior faithfully.
+json doc_eval_section_props(const std::string& doc_id, const json& plane_ref) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    if (r.shapes.empty())
+        throw OpError("invalid_op", "document has no bodies to evaluate", {{"doc_id", doc_id}});
+    const TopoDS_Shape& shape = r.shapes.back();  // worker: bodies[-1]
+    gp_Pln pln = eval_resolve_plane(plane_ref);
+
+    double cx = 0.0, cy = 0.0, cz = 0.0;
+    try {
+        BRepAlgoAPI_Section section(shape, pln, Standard_False);
+        section.Build();
+        if (section.IsDone()) {
+            GProp_GProps lin;
+            BRepGProp::LinearProperties(section.Shape(), lin);
+            gp_Pnt com = lin.CentreOfMass();
+            cx = com.X();
+            cy = com.Y();
+            cz = com.Z();
+        }
+    } catch (const Standard_Failure&) {
+        // matches the oracle's broad except -> zero everything
+    }
+
+    return json{
+        {"area_mm2", 0.0},
+        {"centroid", {cx, cy, cz}},
+        {"Ixx", 0.0},
+        {"Iyy", 0.0},
+        {"Ixy", 0.0},
+    };
+}
+
+// engine/doc/evaluate.py::symmetry via worker.py::_eval_symmetry. Mirror the active body
+// across the plane and measure the symmetric-difference volume. symmetric iff deviation
+// <= 1e-3 * max(vol, 1.0). Returns {"symmetric", "deviation_mm3"}.
+json doc_eval_symmetry(const std::string& doc_id, int body_id, const json& plane_ref) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    const TopoDS_Shape& shape = eval_active_shape(r, doc_id, body_id);
+    gp_Pln pln = eval_resolve_plane(plane_ref);
+
+    try {
+        // Mirror about the plane: SetMirror(gp_Ax2) is planar symmetry. gp_Pln.Position()
+        // is a gp_Ax3; build the gp_Ax2 from its location + Z + X (matches _to_gp_plane ->
+        // gp_Ax2(location, direction, xdirection)).
+        const gp_Ax3& pos = pln.Position();
+        gp_Ax2 ax2(pos.Location(), pos.Direction(), pos.XDirection());
+        gp_Trsf mirror;
+        mirror.SetMirror(ax2);
+        BRepBuilderAPI_Transform xf(shape, mirror, Standard_True);
+        TopoDS_Shape mirrored = xf.Shape();
+
+        double vol_a = eval_vol_or_zero(shape);
+        double vol_mirror = eval_vol_or_zero(mirrored);
+        double vol_common = 0.0;
+        BRepAlgoAPI_Common common(shape, mirrored);
+        common.Build();
+        if (common.IsDone()) vol_common = eval_vol_or_zero(common.Shape());
+
+        double deviation = (vol_a - vol_common) + (vol_mirror - vol_common);
+        deviation = std::max(0.0, deviation);
+        double threshold = 1e-3 * std::max(vol_a, 1.0);
+        return json{{"symmetric", deviation <= threshold}, {"deviation_mm3", deviation}};
+    } catch (const Standard_Failure& ex) {
+        return json{{"symmetric", false}, {"deviation_mm3", -1.0}, {"error", ex.GetMessageString()}};
+    }
+}
+
+// engine/doc/evaluate.py::interference via worker.py::_eval_interference (part doc branch:
+// members = every surviving body). Pairwise overlap (BRepAlgoAPI_Common volume) +
+// clearance (BRepExtrema min distance), per-part bbox. ok iff nothing interferes.
+// Body names mirror the Python oracle's body_id "b1".."bN" (first-produced = AICM order).
+json doc_eval_interference(const std::string& doc_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+
+    const std::size_t n = r.shapes.size();
+    std::vector<std::string> names(n);
+    for (std::size_t i = 0; i < n; ++i) names[i] = "b" + std::to_string(i + 1);
+
+    constexpr double INTERFERENCE_EPS = 1e-3;
+
+    // Per-part bbox + volume (kernel.py::_bbox_dict uses build123d bounding_box() ->
+    // BRepBndLib::AddOptimal, the precise box, after BRepTools::Clean).
+    json parts = json::array();
+    for (std::size_t i = 0; i < n; ++i) {
+        const TopoDS_Shape& shp = r.shapes[i];
+        json part = {{"name", names[i]}, {"volume", eval_vol_or_zero(shp)}};
+        try {
+            BRepTools::Clean(shp);
+            Bnd_Box box;
+            BRepBndLib::AddOptimal(shp, box);
+            if (!box.IsVoid()) {
+                double xmn, ymn, zmn, xmx, ymx, zmx;
+                box.Get(xmn, ymn, zmn, xmx, ymx, zmx);
+                part["bbox"] = json{{"min", {xmn, ymn, zmn}},
+                                    {"max", {xmx, ymx, zmx}},
+                                    {"size", {xmx - xmn, ymx - ymn, zmx - zmn}}};
+            } else {
+                part["bbox"] = nullptr;
+            }
+        } catch (const Standard_Failure&) {
+            part["bbox"] = nullptr;
+        }
+        parts.push_back(std::move(part));
+    }
+
+    json interferences = json::array();
+    json clearances = json::array();
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = i + 1; j < n; ++j) {
+            // overlap volume (None on boolean failure -> Python warns + continue).
+            bool ov_ok = false;
+            double ov = 0.0;
+            try {
+                BRepAlgoAPI_Common common(r.shapes[i], r.shapes[j]);
+                common.Build();
+                if (common.IsDone()) {
+                    ov = eval_vol_or_zero(common.Shape());
+                    ov_ok = true;
+                }
+            } catch (const Standard_Failure&) {
+            }
+            if (!ov_ok) continue;  // matches the warnings-sink "interference check failed" path
+            if (ov > INTERFERENCE_EPS) {
+                interferences.push_back(json{{"a", names[i]}, {"b", names[j]}, {"volume", ov}});
+            } else {
+                try {
+                    BRepExtrema_DistShapeShape dss(r.shapes[i], r.shapes[j]);
+                    if (dss.IsDone())
+                        clearances.push_back(
+                            json{{"a", names[i]}, {"b", names[j]}, {"distance", dss.Value()}});
+                } catch (const Standard_Failure&) {
+                }
+            }
+        }
+    }
+
+    std::string summary;
+    if (!interferences.empty()) {
+        std::size_t big = 0;
+        for (std::size_t k = 1; k < interferences.size(); ++k)
+            if (interferences[k]["volume"].get<double>() > interferences[big]["volume"].get<double>())
+                big = k;
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "%zu interfering pair(s); largest %s<->%s = %.1f mm^3",
+                      interferences.size(), interferences[big]["a"].get<std::string>().c_str(),
+                      interferences[big]["b"].get<std::string>().c_str(),
+                      interferences[big]["volume"].get<double>());
+        summary = buf;
+    } else if (!clearances.empty()) {
+        std::size_t tight = 0;
+        for (std::size_t k = 1; k < clearances.size(); ++k)
+            if (clearances[k]["distance"].get<double>() < clearances[tight]["distance"].get<double>())
+                tight = k;
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "No interference. Tightest gap %s<->%s = %.2f mm",
+                      clearances[tight]["a"].get<std::string>().c_str(),
+                      clearances[tight]["b"].get<std::string>().c_str(),
+                      clearances[tight]["distance"].get<double>());
+        summary = buf;
+    } else {
+        summary = "No interference detected.";
+    }
+
+    return json{
+        {"ok", interferences.empty()},
+        {"summary", summary},
+        {"parts", parts},
+        {"interferences", interferences},
+        {"clearances", clearances},
+    };
+}
+
+// engine/doc/evaluate.py::measure via worker.py::_eval_measure. Resolve 1-2 refs against
+// the LAST body, then single-entity or pair measure. Refs resolve in the SAME enumeration
+// describe_* + body.faces()/edges()/vertices() use (a TopExp re-walk).
+json doc_eval_measure(const std::string& doc_id, const json& refs) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    if (r.shapes.empty())
+        throw OpError("invalid_op", "no bodies for measure", {{"reason", "no bodies"}});
+    const TopoDS_Shape& shape = r.shapes.back();  // worker: bodies[-1]
+
+    // bbox diag (build123d bounding_box() = BRepBndLib::AddOptimal), floor 1e-3, 100 on fail.
+    double diag = 100.0;
+    try {
+        BRepTools::Clean(shape);
+        Bnd_Box box;
+        BRepBndLib::AddOptimal(shape, box);
+        if (!box.IsVoid()) {
+            double xmn, ymn, zmn, xmx, ymx, zmx;
+            box.Get(xmn, ymn, zmn, xmx, ymx, zmx);
+            double dx = xmx - xmn, dy = ymx - ymn, dz = zmx - zmn;
+            diag = std::max(std::sqrt(dx * dx + dy * dy + dz * dz), 1e-3);
+        }
+    } catch (const Standard_Failure&) {
+    }
+
+    if (!refs.is_array() || refs.empty() || refs.size() > 2)
+        throw OpError("invalid_op",
+                      "measure() takes 1 or 2 refs, got " +
+                          std::to_string(refs.is_array() ? refs.size() : 0));
+
+    std::vector<TopoDS_Shape> shapes;
+    for (const auto& ref : refs) shapes.push_back(eval_resolve_ref(ref, shape, diag));
+
+    if (shapes.size() == 1) return eval_measure_single(shapes[0]);
+    return eval_measure_pair(shapes[0], shapes[1]);
 }
 
 json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double distance,

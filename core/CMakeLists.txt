@@ -134,7 +134,10 @@ add_library(aicad_ecad STATIC
 target_include_directories(aicad_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # aicad_miniz is the ZIP read/write lib (shared with the .step+ container) — the
 # .ecad+ container (container.cpp) writes/reads its archive through it.
-target_link_libraries(aicad_ecad PUBLIC nlohmann_json::nlohmann_json aicad_miniz)
+# aicad_sim provides the SPICE circuit builder + MNA simulator that ecad_simulate
+# (session.cpp) drives (schematic netlist -> SPICE circuit -> run). aicad_sim is
+# pure-JSON and does NOT depend on aicad_ecad, so this introduces no cycle.
+target_link_libraries(aicad_ecad PUBLIC nlohmann_json::nlohmann_json aicad_miniz aicad_sim)
 
 add_executable(test_sim tests/test_sim.cpp)
 target_include_directories(test_sim PRIVATE ${doctest_SOURCE_DIR})

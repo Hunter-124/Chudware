@@ -46,4 +46,18 @@ namespace aicad::ecad {
 // BoardGeometryError — here it becomes the structured OpError the worker expects).
 nlohmann::json board_to_3d(const nlohmann::json& board, const nlohmann::json& opts);
 
+// Doc-id session form of ecad_to_3d: build the SAME 3D model as board_to_3d, write
+// it to `out_path` as a STEP assembly (substrate + drilled holes + component box
+// proxies), and return the oracle's board_to_step shape:
+//
+//   { "step_path": <abs out_path>, "summary": {...same as board_to_3d.summary...},
+//     "body_count", "substrate_volume", "total_volume" }
+//
+// Mirrors engine/ecad/threed.py::board_to_step (which writes a STEP and returns
+// {step_path, summary}); the extra volume fields are carried for the parity gate.
+// Throws OpError("invalid_op") for a bad outline / thickness, OpError("io_error")
+// if the STEP write fails.
+nlohmann::json board_to_3d_step(const nlohmann::json& board, const nlohmann::json& opts,
+                                const std::string& out_path);
+
 }  // namespace aicad::ecad

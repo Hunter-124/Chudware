@@ -88,4 +88,46 @@ nlohmann::json ecad_export(const nlohmann::json& params);
 // {w, s?, h, t, er, kind?}. Stateless except for "track" (session lookup).
 nlohmann::json ecad_impedance(const nlohmann::json& params);
 
+// ecad_autoroute {doc_id, opts?, base_revision?} -> board ops-response + "report"
+// + "doc_id". Runs the grid autorouter on the open board session, applies the
+// routed tracks/vias as pcb_add_track / pcb_add_via ops (one batch, one revision
+// bump, undo snapshot, recompile), and attaches the router report (+ a failed-net
+// warning). Mirrors engine/ecad/rpc.py::_ecad_autoroute exactly.
+nlohmann::json ecad_autoroute(const std::string& doc_id, const nlohmann::json& opts,
+                              long base_revision);
+
+// ecad_route_diff_pair {doc_id, net_p, net_n, opts?, base_revision?} -> board
+// ops-response + "report" + "doc_id". Same flow as ecad_autoroute but for one
+// coupled differential pair (autoroute.route_diff_pair). NOTE: the Python worker
+// has no ecad_route_diff_pair RPC handler (the oracle exposes only the autoroute
+// compute); the C++ session adds the doc-id form the host's routeEcadToCpp expects,
+// applying the routed geometry exactly like ecad_autoroute.
+nlohmann::json ecad_route_diff_pair(const std::string& doc_id, const std::string& net_p,
+                                    const std::string& net_n, const nlohmann::json& opts,
+                                    long base_revision);
+
+// ecad_fill_zones {doc_id, resolution?, base_revision?} -> board ops-response +
+// "fill_summary" + "doc_id". Runs the FULL-resolution copper-pour fill (zonefill),
+// swaps the filled board into the session (one revision bump, undo snapshot,
+// recompile), and attaches {zones, zones_filled, polygons, copper_area_mm2}.
+// Mirrors engine/ecad/rpc.py::_ecad_fill_zones exactly.
+nlohmann::json ecad_fill_zones(const std::string& doc_id, const nlohmann::json& resolution,
+                               long base_revision);
+
+// ecad_simulate {doc_id, study?, sim_params?} -> the solver envelope
+// {ok, converged, results, warnings, log, convergence, ms}. Builds the schematic
+// netlist, maps it to a SPICE circuit (netlist_to_spice_circuit) and runs the
+// requested study (spice_simulate). Mirrors engine/ecad/rpc.py::_ecad_simulate.
+// PARITY SCOPE: a non-empty circuit requires each component to carry an inline
+// "sim" mapping (the starter SYMBOL library sim fallback is not ported to C++ —
+// see core/sim/netlist.h). A schematic whose components rely on the library
+// fallback yields {ok:false, "no simulatable devices ..."} here.
+nlohmann::json ecad_simulate(const std::string& doc_id, const nlohmann::json& study,
+                             const nlohmann::json& sim_params);
+
+// Return a deep COPY of an open session's document (for cross-target callers like
+// libaicad's OCCT-linked ecad_to_3d doc-id form, which lives outside aicad_ecad).
+// Throws OpError("unknown_doc") if no such session is open.
+nlohmann::json ecad_session_doc(const std::string& doc_id);
+
 }  // namespace aicad::ecad

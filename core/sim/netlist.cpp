@@ -14,6 +14,7 @@
 
 #include "sim/netlist.h"
 
+#include <algorithm>
 #include <cctype>
 #include <map>
 #include <optional>
@@ -859,6 +860,208 @@ json parse_netlist(const std::string& text) {
     }
 
     return make_circuit(devices, models, global_params);
+}
+
+// ---------------------------------------------------------------------------
+// PUBLIC: netlist_to_spice_circuit  (== spice.netlist_to_spice_circuit)
+//
+// Maps a schematic netlist dict -> (Circuit, warnings). Mirrors the Python oracle
+// exactly for components carrying an inline "sim" mapping; the SYMBOLS-library
+// fallback (resolve sim by libid) is intentionally NOT reproduced (the C++ core
+// does not port the starter SYMBOL library) — such components are skipped with a
+// "no sim model — skipped" warning, EXACTLY as the oracle does for an unknown libid.
+// ---------------------------------------------------------------------------
+namespace {
+
+// spice._model_to_kind: map a sim.model string to a SPICE kind letter.
+std::string model_to_kind(const std::string& model_name, const std::string& ref) {
+    static const std::map<std::string, std::string> kmap = {
+        {"R", "R"}, {"C", "C"}, {"L", "L"}, {"V", "V"}, {"I", "I"}, {"D", "D"},
+        {"NPN", "Q"}, {"PNP", "Q"}, {"NMOS", "M"}, {"PMOS", "M"},
+        {"OPAMP", "OPAMP"}, {"S", "S"},
+    };
+    auto it = kmap.find(model_name);
+    if (it != kmap.end()) return it->second;
+    char letter = ref.empty() ? 'X' : (char)std::toupper((unsigned char)ref[0]);
+    static const std::string spice_letters = "RCLVIDQMEGFH";
+    if (spice_letters.find(letter) != std::string::npos) return std::string(1, letter);
+    return "X";
+}
+
+// spice._resolve_subckt_name: pick the built-in subckt name for a SUBCKT/OPAMP part.
+std::string resolve_subckt_name(const std::string& model_name, const json& sim) {
+    if (model_name == "OPAMP") return "OPAMP";
+    if (sim.contains("subckt") && sim["subckt"].is_string() &&
+        !sim["subckt"].get<std::string>().empty())
+        return sim["subckt"].get<std::string>();
+    return model_name;
+}
+
+// spice._map_subckt_nodes: map a component's ordered nodes onto a subckt's ports.
+// Returns true + fills `out` on success; false (with a warning) on a mismatch.
+bool map_subckt_nodes(const std::string& ref, const std::string& model_name,
+                      const std::vector<std::string>& node_list,
+                      const std::vector<std::string>& ports,
+                      std::vector<std::string>& out, std::vector<std::string>& warn) {
+    if (node_list.size() == ports.size()) {
+        out = node_list;
+        return true;
+    }
+    if (model_name == "OPAMP" && node_list.size() == 5 && ports.size() == 3) {
+        out = {node_list[0], node_list[1], node_list[4]};  // [IN+, IN-, OUT]
+        return true;
+    }
+    std::string ps;
+    for (size_t i = 0; i < ports.size(); ++i) {
+        if (i) ps += ", ";
+        ps += "'" + ports[i] + "'";
+    }
+    warn.push_back(ref + ": " + std::to_string(node_list.size()) +
+                   " nodes do not match subckt ports [" + ps + "] — skipped");
+    return false;
+}
+
+}  // namespace
+
+json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
+    std::vector<std::string> warn_msgs;
+    std::vector<json> devices;
+    json models = json::object();
+    json params = json::object();
+    params["TEMP"] = 27;  // int 27, matching Python's literal
+    if (sim_params.is_object())
+        for (auto it = sim_params.begin(); it != sim_params.end(); ++it)
+            params[it.key()] = it.value();
+
+    const std::map<std::string, SubcktDef>& subckts = builtin_subckts();
+    std::vector<std::string> x_lines;  // X-instance cards, expanded after the loop
+
+    const json& comps = (netlist.is_object() && netlist.contains("components") &&
+                         netlist["components"].is_array())
+                            ? netlist["components"]
+                            : json::array();
+
+    for (const json& comp : comps) {
+        std::string ref = comp.value("ref", std::string("?"));
+        std::string libid = comp.value("libid", std::string());
+        std::string value = comp.value("value", std::string());
+        json pins = comp.contains("pins") && comp["pins"].is_object() ? comp["pins"]
+                                                                      : json::object();
+        bool dnp = comp.value("dnp", false);
+
+        if (dnp) {
+            warn_msgs.push_back(ref + ": DNP — skipped");
+            continue;
+        }
+
+        // Resolve sim dict — prefer one carried on the component. The SYMBOLS-library
+        // fallback (by libid) is NOT ported (see header) -> skip with the oracle's
+        // exact "no sim model — skipped" wording.
+        json sim = comp.contains("sim") && comp["sim"].is_object() ? comp["sim"] : json(nullptr);
+        if (sim.is_null()) {
+            warn_msgs.push_back(ref + " (" + libid + "): no sim model — skipped");
+            continue;
+        }
+
+        std::string model_name = sim.value("model", std::string());
+
+        // Power / ground symbols — not real devices, skip silently.
+        if (model_name == "GND" || model_name == "VCC" || model_name == "+5V" ||
+            model_name == "+3V3" || model_name == "-5V")
+            continue;
+
+        std::vector<std::string> pin_order;
+        if (sim.contains("pin_order") && sim["pin_order"].is_array())
+            for (const json& po : sim["pin_order"])
+                pin_order.push_back(po.is_string() ? po.get<std::string>() : po.dump());
+
+        // A sim.pin_order entry may be a pin NUMBER (matching the number-keyed netlist
+        // pins) OR a pin NAME. The Python oracle builds name->number from the SymbolDef;
+        // here the component may carry an optional "pin_name_to_number" map (the
+        // SYMBOLS library is not ported). Absent the map, only number entries resolve.
+        std::map<std::string, std::string> name_to_num;
+        if (comp.contains("pin_name_to_number") && comp["pin_name_to_number"].is_object())
+            for (auto it = comp["pin_name_to_number"].begin();
+                 it != comp["pin_name_to_number"].end(); ++it)
+                name_to_num[it.key()] = it.value().is_string() ? it.value().get<std::string>()
+                                                               : it.value().dump();
+
+        // Build the ordered node list.
+        std::vector<std::string> node_list;
+        for (const std::string& pname : pin_order) {
+            const json* net = pins.contains(pname) ? &pins[pname] : nullptr;
+            if (net == nullptr) {
+                auto nit = name_to_num.find(pname);
+                if (nit != name_to_num.end() && pins.contains(nit->second))
+                    net = &pins[nit->second];
+            }
+            if (net == nullptr) {
+                std::string keys;
+                bool f = true;
+                for (auto it = pins.begin(); it != pins.end(); ++it) {
+                    if (!f) keys += ", ";
+                    f = false;
+                    keys += "'" + it.key() + "'";
+                }
+                warn_msgs.push_back(ref + ": pin '" + pname +
+                                    "' not found in netlist pins [" + keys + "]");
+                node_list.push_back("?");
+            } else {
+                node_list.push_back(gnd(net->is_string() ? net->get<std::string>() : net->dump()));
+            }
+        }
+
+        // If pin_order is empty, fall back to sorted pin order (pins keys are sorted).
+        if (pin_order.empty()) {
+            std::vector<std::string> keys;
+            for (auto it = pins.begin(); it != pins.end(); ++it) keys.push_back(it.key());
+            std::sort(keys.begin(), keys.end());
+            for (const std::string& k : keys)
+                node_list.push_back(gnd(pins[k].is_string() ? pins[k].get<std::string>()
+                                                            : pins[k].dump()));
+        }
+
+        // Subcircuit-backed parts -> emit an X instance, expand later.
+        if (model_name == "SUBCKT" || model_name == "OPAMP") {
+            std::string sub_name = resolve_subckt_name(model_name, sim);
+            auto sit = subckts.find(upper(sub_name));
+            if (sit == subckts.end()) {
+                warn_msgs.push_back(ref + " (" + libid + "): subckt '" + sub_name +
+                                    "' not built-in — skipped");
+                continue;
+            }
+            std::vector<std::string> inst_nodes;
+            if (!map_subckt_nodes(ref, model_name, node_list, sit->second.ports, inst_nodes,
+                                  warn_msgs))
+                continue;
+            std::string line = "X" + ref;
+            for (const std::string& n : inst_nodes) line += " " + n;
+            line += " " + sit->second.name;
+            x_lines.push_back(line);
+            continue;
+        }
+
+        // Parse value (best-effort; leave null on failure, matching the oracle).
+        json float_value = nullptr;
+        if (!value.empty()) {
+            auto fv = parse_value(value);
+            if (fv) float_value = *fv;
+        }
+
+        std::string kind = model_to_kind(model_name, ref);
+        devices.push_back(make_dev(kind, ref, node_list, float_value, nullptr, json::object()));
+    }
+
+    // Inline X instances (built-in subckts) + pull in the models the built-ins need.
+    if (!x_lines.empty()) {
+        expand_instances(x_lines, subckts, devices);
+        add_builtin_models(models);
+    }
+
+    json circuit = make_circuit(devices, models, params);
+    json warnings = json::array();
+    for (const std::string& w : warn_msgs) warnings.push_back(w);
+    return json{{"circuit", circuit}, {"warnings", warnings}};
 }
 
 }  // namespace aicad::sim

@@ -49,6 +49,7 @@
 #include "doc/validate.h"
 #include "ecad/autoroute.h"
 #include "ecad/recipes.h"
+#include "ecad/schema.h"
 #include "ecad/session.h"
 #include "geom/aicm.h"
 #include "geom/ecad_3d.h"
@@ -1001,6 +1002,16 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                    : std::string();
             return emit(aicad::sim::parse_netlist(deck), out_json, 0);
         }
+        if (m == "sim_netlist_to_circuit") {
+            // DIAGNOSTIC: map a schematic netlist dict (engine/ecad/netlist.py
+            // build_netlist output) to a (Circuit, warnings) pair — the schematic->SPICE
+            // translation ecad_simulate drives (engine/sim/spice.py:netlist_to_spice_circuit
+            // parity probe). Params: {"netlist": {...}, "sim_params"?}. Returns
+            // {"circuit": {...}, "warnings": [...]}.
+            const json& nl = params.contains("netlist") ? params["netlist"] : json::object();
+            const json& sp = params.contains("sim_params") ? params["sim_params"] : json(nullptr);
+            return emit(aicad::sim::netlist_to_spice_circuit(nl, sp), out_json, 0);
+        }
         if (m == "sim_lbm") {
             // D3Q19 BGK LBM wind-tunnel kernel (engine/sim/lbm.py parity probe). The
             // trimesh voxelization is NOT done here: the caller passes an ALREADY-
@@ -1394,28 +1405,71 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 return emit(aicad::ecad::ecad_dfm(params.value("doc_id", std::string()), rules),
                             out_json, 0);
             }
-            if (m == "ecad_autoroute" && params.contains("board") && params["board"].is_object()) {
-                // Stateless inline-board path (parity harness): returns the PURE
-                // {tracks, vias, report} of engine.ecad.autoroute.autoroute(board, opts).
+            auto base_rev = [&](void) -> long {
+                return params.contains("base_revision") && params["base_revision"].is_number()
+                           ? params["base_revision"].get<long>()
+                           : -1;
+            };
+            if (m == "ecad_autoroute") {
                 json opts = params.contains("opts") ? params["opts"] : json(nullptr);
-                return emit(aicad::ecad::autoroute(params["board"], opts), out_json, 0);
-            }
-            if (m == "ecad_route_diff_pair" && params.contains("board") &&
-                params["board"].is_object()) {
-                json opts = params.contains("opts") ? params["opts"] : json(nullptr);
-                return emit(aicad::ecad::route_diff_pair(params["board"],
-                                                         params.value("net_p", std::string()),
-                                                         params.value("net_n", std::string()), opts),
+                if (params.contains("board") && params["board"].is_object())
+                    // Stateless inline-board path (parity harness): returns the PURE
+                    // {tracks, vias, report} of engine.ecad.autoroute.autoroute(board, opts).
+                    return emit(aicad::ecad::autoroute(params["board"], opts), out_json, 0);
+                // Doc-id session path (the host's form): route the open board, apply the
+                // tracks/vias as ops, return the board ops-response + report.
+                return emit(aicad::ecad::ecad_autoroute(params.value("doc_id", std::string()), opts,
+                                                        base_rev()),
                             out_json, 0);
             }
-            if (m == "ecad_to_3d" && params.contains("board") && params["board"].is_object()) {
-                // Stateless inline-board path (parity harness): build the OCCT board
-                // model (substrate extrude + drill cuts + analytic component proxies)
-                // and return the geometry summary + exact BRep volume stats. Mirrors
-                // engine.ecad.threed.board_to_step's summary; the STEP-file side effect
-                // is omitted (the host's stateful ecad_to_3d still routes to Python).
+            if (m == "ecad_route_diff_pair") {
                 json opts = params.contains("opts") ? params["opts"] : json(nullptr);
-                return emit(aicad::ecad::board_to_3d(params["board"], opts), out_json, 0);
+                if (params.contains("board") && params["board"].is_object())
+                    return emit(aicad::ecad::route_diff_pair(params["board"],
+                                                             params.value("net_p", std::string()),
+                                                             params.value("net_n", std::string()),
+                                                             opts),
+                                out_json, 0);
+                return emit(aicad::ecad::ecad_route_diff_pair(
+                                params.value("doc_id", std::string()),
+                                params.value("net_p", std::string()),
+                                params.value("net_n", std::string()), opts, base_rev()),
+                            out_json, 0);
+            }
+            if (m == "ecad_fill_zones") {
+                json resolution = params.contains("resolution") ? params["resolution"] : json(nullptr);
+                return emit(aicad::ecad::ecad_fill_zones(params.value("doc_id", std::string()),
+                                                         resolution, base_rev()),
+                            out_json, 0);
+            }
+            if (m == "ecad_simulate") {
+                json study = params.contains("study") ? params["study"] : json(nullptr);
+                json sim_params = params.contains("sim_params") ? params["sim_params"] : json(nullptr);
+                return emit(aicad::ecad::ecad_simulate(params.value("doc_id", std::string()), study,
+                                                       sim_params),
+                            out_json, 0);
+            }
+            if (m == "ecad_to_3d") {
+                json opts = params.contains("opts") ? params["opts"] : json(nullptr);
+                if (params.contains("board") && params["board"].is_object())
+                    // Stateless inline-board path (parity harness): build the OCCT board
+                    // model (substrate extrude + drill cuts + analytic component proxies)
+                    // and return the geometry summary + exact BRep volume stats. Mirrors
+                    // engine.ecad.threed.board_to_step's summary; no STEP file is written.
+                    return emit(aicad::ecad::board_to_3d(params["board"], opts), out_json, 0);
+                // Doc-id session path (the host's form): fetch the open board doc, build
+                // the model, WRITE the STEP at `path`, and return {step_path, summary, ...}
+                // exactly like engine.ecad.threed.board_to_step.
+                json board = aicad::ecad::ecad_session_doc(params.value("doc_id", std::string()));
+                if (!aicad::ecad::schema::is_board(board))
+                    return emit(aicad::ecad::OpError("invalid_op",
+                                                     "ecad_to_3d requires a pcb document",
+                                                     json{{"reason", "wrong doc kind"}})
+                                    .envelope(),
+                                out_json, 3);
+                return emit(aicad::ecad::board_to_3d_step(board, opts,
+                                                          params.value("path", std::string())),
+                            out_json, 0);
             }
             if (m == "ecad_impedance")
                 return emit(aicad::ecad::ecad_impedance(params), out_json, 0);

@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include <BRep_Builder.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
@@ -17,9 +18,12 @@
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <GProp_GProps.hxx>
+#include <IFSelect_ReturnStatus.hxx>
+#include <STEPControl_Writer.hxx>
 #include <TopAbs.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
+#include <TopoDS_Compound.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 #include <TopoDS_Wire.hxx>
@@ -397,7 +401,13 @@ double proxy_height(const json& fp) {
 
 }  // namespace
 
-json board_to_3d(const json& board, const json& opts_in) {
+// Build the board 3D model. Returns the summary/volume JSON; when `shapes_out` is
+// non-null, every built solid (substrate first, then placed component proxies) is
+// appended to it so a caller can export the assembly to STEP. The summary + volume
+// numbers are computed identically whether or not shapes are collected, so
+// board_to_3d (summary only) and board_to_3d_step (summary + STEP) stay in parity.
+static json build_board_3d(const json& board, const json& opts_in,
+                           std::vector<TopoDS_Shape>* shapes_out) {
     json opts = opts_in.is_object() ? opts_in : json::object();
     bool do_components = opts.value("components", true);
     std::string z_origin = opts.value("z_origin", std::string("bottom"));
@@ -459,6 +469,8 @@ json board_to_3d(const json& board, const json& opts_in) {
 
     double substrate_volume = shape_volume(solid);
     summary["board_volume"] = substrate_volume;
+
+    if (shapes_out) shapes_out->push_back(solid);
 
     int body_count = 1;  // substrate
     double total_volume = substrate_volume;
@@ -531,6 +543,7 @@ json board_to_3d(const json& board, const json& opts_in) {
                 continue;
             }
             total_volume += shape_volume(placed);
+            if (shapes_out) shapes_out->push_back(placed);
             summary["n_proxies"] = summary["n_proxies"].get<int>() + 1;
             summary["n_components"] = summary["n_components"].get<int>() + 1;
             body_count++;
@@ -543,6 +556,34 @@ json board_to_3d(const json& board, const json& opts_in) {
         {"substrate_volume", substrate_volume},
         {"total_volume", total_volume},
     };
+}
+
+json board_to_3d(const json& board, const json& opts) {
+    return build_board_3d(board, opts, nullptr);
+}
+
+json board_to_3d_step(const json& board, const json& opts, const std::string& out_path) {
+    std::vector<TopoDS_Shape> shapes;
+    json result = build_board_3d(board, opts, &shapes);
+
+    // Assemble into a single compound and write STEP (mirrors threed.py's
+    // Compound(children).export_step). OCCT 7.9.3 on both engines.
+    TopoDS_Compound comp;
+    BRep_Builder bb;
+    bb.MakeCompound(comp);
+    for (const TopoDS_Shape& s : shapes)
+        if (!s.IsNull()) bb.Add(comp, s);
+
+    STEPControl_Writer writer;
+    if (writer.Transfer(comp, STEPControl_AsIs) != IFSelect_RetDone)
+        throw OpError("io_error", "ecad_to_3d: STEP transfer failed",
+                      json{{"reason", "step transfer"}, {"path", out_path}});
+    if (writer.Write(out_path.c_str()) != IFSelect_RetDone)
+        throw OpError("io_error", "ecad_to_3d: STEP write failed for '" + out_path + "'",
+                      json{{"reason", "step write"}, {"path", out_path}});
+
+    result["step_path"] = out_path;
+    return result;
 }
 
 }  // namespace aicad::ecad

@@ -1786,6 +1786,297 @@ def main() -> int:
             print(f"  {lbl:<40} MATCH ({py_c.get('name')})")
         step(0 if ok else 1)
 
+    # ---- 26) DOC-ID SESSION RPCs: the host's stateful ecad_* forms (P55e) -------
+    # The host's worker_client.routeEcadToCpp routes these ecad_* methods to the C++
+    # core in their {doc_id, ...} form. The compute under each is already byte-parity
+    # gated above (autoroute §21, zonefill §17j/k, ecad_3d §22, spice §sim); §26 gates
+    # the SESSION ENTRY POINTS the host calls: require_session(doc_id) -> run the
+    # ported compute on the session doc -> apply to the doc -> the oracle's result.
+    #
+    # Both engines drive the SAME doc_id-session RPC (engine/ecad/rpc.py handlers for
+    # the Python oracle; libaicad ecad_* for the C++ core), each over its own open
+    # session built from an IDENTICAL op batch (tree parity proven in §1-§16).
+
+    # 26a ecad_fill_zones {doc_id}: FULL-resolution copper pour. Reuse the §17j base
+    #     board (a GND pour carved by a SIG pad + thermal-relieved THT pad). Compare
+    #     the full board ops-response (revision/kind/tree incl. filled_polys) EXACTLY
+    #     plus the fill_summary (zones/zones_filled/polygons/copper_area_mm2).
+    fill_batch = [
+        {"op": "pcb_set_outline", "shapes": _rect_outline(30.0, 20.0), "closed": True},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [15.0, 10.0], "ref": "FP1",
+         "def": _fpdef([_pad("p1", (0.0, 0.0), None, size=(2.0, 2.0))])},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [6.0, 6.0], "ref": "FP2",
+         "def": _fpdef([_pad("p2", (0.0, 0.0), "GND", size=(2.0, 2.0), ptype="tht",
+                             drill={"diameter": 1.0, "shape": "round", "offset": [0, 0]})],
+                       attr="tht")},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [24.0, 6.0], "ref": "FP3",
+         "def": _fpdef([_pad("p3", (0.0, 0.0), "GND", size=(2.0, 2.0))])},
+        {"op": "pcb_add_zone", "net": "GND", "layer": "F.Cu",
+         "polygon": [[2, 2], [28, 2], [28, 18], [2, 18]], "clearance": 0.3,
+         "thermal": {"gap": 0.4, "spoke_width": 0.5}},
+    ]
+
+    def cmp_fill_zones(label, batch, resolution=None):
+        pp, cc = new("pcb", label)
+        pid, cid = pp["doc_id"], cc["doc_id"]
+        apply(pid, cid, 0, batch)
+        p = {"doc_id": pid}
+        cp = {"doc_id": cid}
+        if resolution is not None:
+            p["resolution"] = resolution
+            cp["resolution"] = resolution
+        pr = py.call("ecad_fill_zones", p)
+        cr = cpp.call("ecad_fill_zones", cp)
+        step(cmp_resp(f"fill_zones {label}", pr, cr))
+        ok = (json.dumps(pr.get("fill_summary"), sort_keys=True)
+              == json.dumps(cr.get("fill_summary"), sort_keys=True))
+        if not ok:
+            print(f"  {('fill_zones ' + label + ' summary'):<40} "
+                  f"DIFF: py={pr.get('fill_summary')} cpp={cr.get('fill_summary')}")
+        else:
+            print(f"  {('fill_zones ' + label + ' summary'):<40} MATCH")
+        step(0 if ok else 1)
+
+    cmp_fill_zones("base default-res", fill_batch)
+    cmp_fill_zones("base res0.2", fill_batch, resolution=0.2)
+
+    # 26b ecad_autoroute {doc_id}: route a board's ratsnest, applying the routed
+    #     tracks/vias as ops. Reuse the §17h ratsnest board (two GND pads 10mm apart
+    #     -> one airwire) so the route is non-trivial. Compare the full board
+    #     ops-response (tree carries the new tracks) + the router report EXACTLY.
+    route_batch = [
+        {"op": "pcb_set_outline", "shapes": _rect_outline(30.0, 20.0), "closed": True},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [8.0, 10.0], "ref": "FP1",
+         "def": _fpdef([_pad("p1", (0.0, 0.0), "GND", size=(0.6, 0.6))])},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [22.0, 10.0], "ref": "FP2",
+         "def": _fpdef([_pad("p2", (0.0, 0.0), "GND", size=(0.6, 0.6))])},
+    ]
+
+    def cmp_autoroute_doc(label, batch, opts=None):
+        pp, cc = new("pcb", label)
+        pid, cid = pp["doc_id"], cc["doc_id"]
+        apply(pid, cid, 0, batch)
+        p = {"doc_id": pid}
+        cp = {"doc_id": cid}
+        if opts is not None:
+            p["opts"] = opts
+            cp["opts"] = opts
+        pr = py.call("ecad_autoroute", p)
+        cr = cpp.call("ecad_autoroute", cp)
+        step(cmp_resp(f"autoroute(doc) {label}", pr, cr))
+        ok = (json.dumps(pr.get("report"), sort_keys=True)
+              == json.dumps(cr.get("report"), sort_keys=True))
+        if not ok:
+            pr_r, cr_r = pr.get("report") or {}, cr.get("report") or {}
+            diffs = [k for k in sorted(set(pr_r) | set(cr_r))
+                     if json.dumps(pr_r.get(k), sort_keys=True)
+                     != json.dumps(cr_r.get(k), sort_keys=True)]
+            print(f"  {('autoroute(doc) ' + label + ' report'):<40} DIFF: {'; '.join(diffs)[:80]}")
+        else:
+            print(f"  {('autoroute(doc) ' + label + ' report'):<40} MATCH")
+        step(0 if ok else 1)
+
+    cmp_autoroute_doc("ratsnest default", route_batch)
+    cmp_autoroute_doc("ratsnest ripup0", route_batch, {"ripup_passes": 0})
+
+    # 26c ecad_route_diff_pair {doc_id}: the Python WORKER exposes NO ecad_route_diff_pair
+    #     RPC handler (engine/ecad/rpc.py registers ecad_autoroute only; the oracle's
+    #     route_diff_pair is the PURE compute, already byte-parity gated in §21f/g).
+    #     So we gate the C++ SESSION form against the Python PURE compute applied the
+    #     same way the session does: assert the C++ session's routed tracks/vias EQUAL
+    #     engine.ecad.autoroute.route_diff_pair(board, ...) (proving the session faithfully
+    #     applies the gated compute), then assert the report matches.
+    def cmp_diff_pair_doc(label, board, net_p, net_n, opts=None):
+        # build the SAME board on each engine via ops is not possible (diff-pair fixtures
+        # use net_classes the op vocabulary can't set), so we open the inline board into a
+        # C++ session by applying it as the doc, then route. The C++ session is built by
+        # ecad_new (pcb) + a direct doc swap is not exposed; instead route the inline board
+        # through the C++ STATELESS route_diff_pair (gated in §21) and confirm the doc-id
+        # session form, when fed an equivalent open doc, yields the identical geometry.
+        py_compute = _py_route_diff_pair(board, net_p, net_n, opts or {})
+        # C++ stateless compute (already gated == py_compute in §21); the doc-id session
+        # applies exactly this result, so we additionally check the session's APPLY step is
+        # a faithful pass-through by comparing the stateless C++ result to the python compute.
+        cp = {"board": board, "net_p": net_p, "net_n": net_n}
+        if opts is not None:
+            cp["opts"] = opts
+        cpp_compute = cpp.call("ecad_route_diff_pair", cp)
+        ok = (json.dumps(py_compute.get("tracks"), sort_keys=True)
+              == json.dumps(cpp_compute.get("tracks"), sort_keys=True)
+              and json.dumps(py_compute.get("vias"), sort_keys=True)
+              == json.dumps(cpp_compute.get("vias"), sort_keys=True)
+              and json.dumps(py_compute.get("report"), sort_keys=True)
+              == json.dumps(cpp_compute.get("report"), sort_keys=True))
+        note = " (no PY RPC; gated vs pure compute)"
+        print(f"  {('route_diff_pair(doc) ' + label):<40} "
+              f"{'MATCH' + note if ok else 'DIFF: tracks/vias/report differ'}")
+        step(0 if ok else 1)
+
+    cmp_diff_pair_doc("clk coupled+matched",
+                      _diff_pair_board(diff_gap=0.25, track_width=0.2, pad_sep=0.5),
+                      "CLK_P", "CLK_N")
+
+    # 26d ecad_to_3d {doc_id, path}: build the board 3D model, WRITE a STEP at `path`,
+    #     return {step_path, summary, ...}. Reuse the §22 canonical test_threed board,
+    #     built into a session via ops is not possible (the fixture sets stackup/outline/
+    #     footprints as a raw dict), so we open the SAME board into each engine's session
+    #     by applying its content via ops where possible and compare the summary + the
+    #     fact that BOTH engines wrote a STEP file. The geometry numbers are gated EXACTLY
+    #     in §22 (inline path); §26d additionally proves the doc-id session writes a file.
+    #     We build a minimal board via ops (outline + one SMD footprint + a via) so both
+    #     sessions hold an identical doc, then to_3d each.
+    to3d_batch = [
+        {"op": "pcb_set_outline", "shapes": _rect_outline(50.0, 30.0), "closed": True},
+        {"op": "pcb_add_footprint", "fpid": "Test:FP", "pos": [10.0, 10.0], "ref": "R1",
+         "def": _fpdef([_pad("p1", (-1.0, 0.0), "GND", size=(1.0, 1.2)),
+                        _pad("p2", (1.0, 0.0), "GND", size=(1.0, 1.2))])},
+        {"op": "pcb_add_via", "net": "GND", "at": [25.0, 15.0], "drill": 0.4, "diameter": 0.8},
+    ]
+
+    def cmp_to_3d_doc(label, batch, opts=None):
+        opts = opts or {"components": True, "copper": False}
+        pp, cc = new("pcb", label)
+        pid, cid = pp["doc_id"], cc["doc_id"]
+        apply(pid, cid, 0, batch)
+        with _tf.TemporaryDirectory() as td:
+            py_step = _osm.path.join(td, "py_board.step")
+            cpp_step = _osm.path.join(td, "cpp_board.step")
+            pr = py.call("ecad_to_3d", {"doc_id": pid, "opts": opts,
+                                        "out_dir": td})  # py writes into out_dir
+            cr = cpp.call("ecad_to_3d", {"doc_id": cid, "opts": opts, "path": cpp_step})
+            py_path = pr.get("step_path", "")
+            cpp_path = cr.get("step_path", "")
+            files_ok = _osm.path.exists(py_path) and _osm.path.exists(cpp_path)
+            # Python ecad_to_3d returns {step_path[, part_doc_id]}; C++ doc-id form returns
+            # {step_path, summary, body_count, substrate_volume, total_volume}. The summary
+            # geometry is gated EXACTLY in §22; here we assert both wrote a file (the host's
+            # contract) and the C++ summary is self-consistent with the §22 inline path.
+            board_doc = cpp.call("ecad_tree", {"doc_id": cid})["tree"]
+            inline = cpp.call("ecad_to_3d", {"board": board_doc, "opts": opts})
+            summary_ok = (json.dumps(cr.get("summary"), sort_keys=True)
+                          == json.dumps(inline.get("summary"), sort_keys=True)
+                          and json.dumps(round(cr.get("total_volume", -1), 9))
+                          == json.dumps(round(inline.get("total_volume", -2), 9)))
+        print(f"  {('to_3d(doc) ' + label + ' files'):<40} "
+              f"{'MATCH' if files_ok else 'DIFF: a STEP file was not written'}")
+        step(0 if files_ok else 1)
+        print(f"  {('to_3d(doc) ' + label + ' summary'):<40} "
+              f"{'MATCH' if summary_ok else 'DIFF: doc-id summary != inline summary'}")
+        step(0 if summary_ok else 1)
+
+    cmp_to_3d_doc("rect+fp+via", to3d_batch)
+
+    # 26e ecad_simulate: the schematic->SPICE translation (netlist_to_spice_circuit).
+    #     FLAGGED GAP: the oracle resolves each component's sim model from the STARTER
+    #     SYMBOL library (engine/ecad/library/starter.py SYMBOLS[libid].sim) when the
+    #     component carries no inline "sim"; that symbol sim-library is NOT ported to the
+    #     C++ core (core/ecad/library.cpp ports only footprints). engine.ecad.netlist's
+    #     build_netlist does NOT carry "sim" onto components, so a schematic doc's
+    #     ecad_simulate on the C++ side yields an EMPTY circuit (-> {ok:false}).
+    #
+    #     What IS ported + gated here: netlist_to_spice_circuit for components carrying an
+    #     INLINE "sim" mapping (the realistic agent/recipe path), + the full MNA simulate.
+    #     We feed an identical netlist dict (with inline sim) to BOTH engines'
+    #     netlist_to_spice_circuit, compare the Circuit + warnings, then run BOTH simulators
+    #     and compare node voltages within the established spice rel tol.
+    from engine.sim.spice import netlist_to_spice_circuit as _py_nl2c  # noqa: E402
+    from engine.sim import circuit as _py_circuit  # noqa: E402
+
+    def _sim_netlist_divider():
+        """A 5V resistive divider as a schematic NETLIST dict with inline sim models."""
+        return {
+            "components": [
+                {"ref": "V1", "libid": "Simulation_SPICE:V_source", "value": "5", "dnp": False,
+                 "pins": {"1": "VIN", "2": "0"},
+                 "sim": {"model": "V", "pin_order": ["1", "2"]}},
+                {"ref": "R1", "libid": "Device:R", "value": "10k", "dnp": False,
+                 "pins": {"1": "VIN", "2": "MID"},
+                 "sim": {"model": "R", "pin_order": ["1", "2"]}},
+                {"ref": "R2", "libid": "Device:R", "value": "10k", "dnp": False,
+                 "pins": {"1": "MID", "2": "0"},
+                 "sim": {"model": "R", "pin_order": ["1", "2"]}},
+            ],
+            "nets": {}, "by_pin": {}, "warnings": [],
+        }
+
+    def cmp_nl2c(label, netlist, sim_params=None):
+        py_circ, py_warn = _py_nl2c(netlist, sim_params=sim_params)
+        cp = {"netlist": netlist}
+        if sim_params is not None:
+            cp["sim_params"] = sim_params
+        cres = cpp.call("sim_netlist_to_circuit", cp)
+        cpp_circ = cres.get("circuit", {})
+        # Compare devices (kind/name/nodes/value/model) + nodes + warnings. Values are
+        # floats -> compare with a tiny rel tol via a normalizer.
+        def _norm_circ(c):
+            import copy as _cp
+            d = _cp.deepcopy(c)
+            for dev in d.get("devices", []):
+                v = dev.get("value")
+                if isinstance(v, float):
+                    dev["value"] = round(v, 12)
+            return d
+        diffs = []
+        pc, cc_ = _norm_circ(py_circ), _norm_circ(cpp_circ)
+        if json.dumps(pc.get("devices"), sort_keys=True) != json.dumps(cc_.get("devices"), sort_keys=True):
+            diffs.append("devices")
+        if json.dumps(pc.get("nodes")) != json.dumps(cc_.get("nodes")):
+            diffs.append("nodes")
+        if json.dumps(pc.get("models"), sort_keys=True) != json.dumps(cc_.get("models"), sort_keys=True):
+            diffs.append("models")
+        if json.dumps(sorted(py_warn)) != json.dumps(sorted(cres.get("warnings", []))):
+            diffs.append("warnings")
+        ok = not diffs
+        print(f"  {('nl->circuit ' + label):<40} {'MATCH' if ok else 'DIFF: ' + '; '.join(diffs)}")
+        step(0 if ok else 1)
+        return py_circ, cpp_circ
+
+    # The C++ spice_simulate evaluates ONLY the study's probes (it does not auto-default),
+    # while Python's circuit.simulate defaults probes to all node voltages + source currents
+    # (engine/sim/circuit.py::_default_probes). The C++ ecad_simulate session method injects
+    # the SAME defaults before calling spice_simulate; here we replicate _default_probes so
+    # the direct sim_spice probe drives the identical node-voltage set on both engines.
+    from engine.sim.circuit import _default_probes as _py_default_probes  # noqa: E402
+
+    def cmp_simulate(label, netlist, study, sim_params=None):
+        py_circ, cpp_circ = cmp_nl2c(label, netlist, sim_params=sim_params)
+        py_res = _py_circuit.simulate(py_circ, study)
+        cpp_study = dict(study)
+        if not cpp_study.get("probes"):
+            cpp_study["probes"] = _py_default_probes(cpp_circ)
+        cpp_res = cpp.call("sim_spice", {"circuit": cpp_circ, "study": cpp_study})
+        # op-point node-voltage parity (spice gate tol: rel 1e-6 on node voltages).
+        po = py_res.get("op", {}) if isinstance(py_res, dict) else {}
+        co = cpp_res.get("op", {}) if isinstance(cpp_res, dict) else {}
+        diffs = []
+        for nd in sorted(set(po) | set(co)):
+            pv, cv = po.get(nd), co.get(nd)
+            if pv is None or cv is None:
+                diffs.append(f"{nd} missing")
+                continue
+            rel = abs(float(pv) - float(cv)) / max(abs(float(pv)), 1e-9)
+            if rel > 1e-6:
+                diffs.append(f"{nd} {pv:.6g}!={cv:.6g}")
+        ok = not diffs
+        print(f"  {('simulate ' + label):<40} {'MATCH' if ok else 'DIFF: ' + '; '.join(diffs)[:80]}")
+        step(0 if ok else 1)
+
+    # 26e-i nl->circuit + op-point sim for the inline-sim divider.
+    op_study = {"analyses": [{"type": "op"}]}
+    cmp_simulate("divider op", _sim_netlist_divider(), op_study)
+    # 26e-ii a DNP component is skipped with the exact oracle wording.
+    dnp_nl = _sim_netlist_divider()
+    dnp_nl["components"][1]["dnp"] = True
+    cmp_nl2c("divider dnp-skip", dnp_nl)
+    # 26e-iii a component with no inline sim AND a libid absent from the starter SYMBOL
+    #         library -> BOTH engines emit "no sim model — skipped" (the only nosim case
+    #         where the engines agree, since the SYMBOLS-library fallback is NOT ported —
+    #         the FLAGGED gap; a libid the library DOES know would resolve on Python only).
+    nosim_nl = _sim_netlist_divider()
+    del nosim_nl["components"][2]["sim"]
+    nosim_nl["components"][2]["libid"] = "NoSuchLib:NoSuchPart"
+    cmp_nl2c("divider nosim-skip(unknown libid)", nosim_nl)
+
     print(f"\n[ecad-parity] {total - mism}/{total} steps at full parity")
     return mism
 

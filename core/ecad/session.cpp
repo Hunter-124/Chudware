@@ -6,12 +6,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <map>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include "ecad/autoroute.h"
 #include "ecad/container.h"
 #include "ecad/dfm.h"
 #include "ecad/drc.h"
@@ -22,6 +24,8 @@
 #include "ecad/schema.h"
 #include "ecad/sync.h"
 #include "ecad/zonefill.h"
+#include "sim/netlist.h"
+#include "sim/spice.h"
 
 namespace aicad::ecad {
 
@@ -537,6 +541,272 @@ json ecad_impedance(const json& params) {
         return track_impedance(s.doc, ton);
     }
     throw OpError("invalid_op", "ecad_impedance: unknown mode '" + mode + "'", {{"mode", mode}});
+}
+
+// ------------------------------------------------------------- autoroute / fill
+
+namespace {
+// Translate a router result's {tracks, vias} into pcb_add_track / pcb_add_via ops,
+// forwarding net/layer/width/kind verbatim (engine/ecad/rpc.py::_ecad_autoroute).
+json router_result_to_ops(const json& result) {
+    json ops = json::array();
+    if (result.contains("tracks") && result["tracks"].is_array()) {
+        for (const json& t : result["tracks"]) {
+            json op = {{"op", "pcb_add_track"}, {"net", t.value("net", json(nullptr))},
+                       {"layer", t.value("layer", json(nullptr))},
+                       {"p1", t.contains("p1") ? t["p1"] : json(nullptr)},
+                       {"p2", t.contains("p2") ? t["p2"] : json(nullptr)},
+                       {"width", t.contains("width") ? t["width"] : json(nullptr)},
+                       {"kind", t.value("kind", std::string("segment"))}};
+            if (op["kind"] == "arc") {
+                for (const char* k : {"center", "a0", "a1"})
+                    if (t.contains(k)) op[k] = t[k];
+            }
+            ops.push_back(op);
+        }
+    }
+    if (result.contains("vias") && result["vias"].is_array()) {
+        for (const json& v : result["vias"]) {
+            ops.push_back({{"op", "pcb_add_via"}, {"net", v.value("net", json(nullptr))},
+                           {"at", v.contains("at") ? v["at"] : json(nullptr)},
+                           {"drill", v.contains("drill") ? v["drill"] : json(nullptr)},
+                           {"diameter", v.contains("diameter") ? v["diameter"] : json(nullptr)},
+                           {"layers", v.contains("layers") ? v["layers"] : json(nullptr)},
+                           {"type", v.value("type", std::string("through"))}});
+        }
+    }
+    return ops;
+}
+
+// Apply a router result to the board session (one op batch -> one revision bump),
+// attaching the router report + a failed-net warning. Caller holds g_mtx. Mirrors
+// the tail of engine/ecad/rpc.py::_ecad_autoroute.
+json apply_route_result(Session& s, const json& result, long base_revision,
+                        const std::string& doc_id) {
+    json report = result.contains("report") ? result["report"] : json::object();
+    json ops = router_result_to_ops(result);
+
+    json warnings = json::array();
+    if (report.contains("failed") && report["failed"].is_array() && !report["failed"].empty()) {
+        std::string msg =
+            "nets the autorouter could not route (need manual routing or more space): ";
+        bool first = true;
+        for (const json& f : report["failed"]) {
+            if (!first) msg += ", ";
+            first = false;
+            msg += f.is_string() ? f.get<std::string>() : f.dump();
+        }
+        warnings.push_back(msg);
+    }
+
+    // apply_ops with the optimistic-concurrency guard (mirror ecad_apply_ops body).
+    if (base_revision >= 0 && base_revision != s.revision)
+        throw OpError("stale_revision",
+                      "base_revision " + std::to_string(base_revision) + " != current " +
+                          std::to_string(s.revision),
+                      {{"current_revision", s.revision}});
+    json res = apply_ops(s.doc, ops);
+    push_undo(s);
+    s.doc = res["doc"];
+    s.revision += 1;
+    s.dirty = true;
+    json resp = ops_response(s, res["id_map"],
+                             res.contains("warnings") ? res["warnings"] : json::array());
+    if (!warnings.empty()) {
+        json merged = resp.contains("warnings") && resp["warnings"].is_array() ? resp["warnings"]
+                                                                               : json::array();
+        for (const json& w : warnings) merged.push_back(w);
+        resp["warnings"] = merged;
+    }
+    resp["report"] = report;
+    resp["doc_id"] = doc_id;
+    return resp;
+}
+}  // namespace
+
+json ecad_autoroute(const std::string& doc_id, const json& opts, long base_revision) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    if (!schema::is_board(s.doc))
+        throw OpError("invalid_op", "ecad_autoroute requires a pcb document",
+                      {{"reason", "wrong doc kind"}, {"doc_id", doc_id}});
+    json result = autoroute(s.doc, opts.is_null() ? json::object() : opts);
+    return apply_route_result(s, result, base_revision, doc_id);
+}
+
+json ecad_route_diff_pair(const std::string& doc_id, const std::string& net_p,
+                          const std::string& net_n, const json& opts, long base_revision) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    if (!schema::is_board(s.doc))
+        throw OpError("invalid_op", "ecad_route_diff_pair requires a pcb document",
+                      {{"reason", "wrong doc kind"}, {"doc_id", doc_id}});
+    json result = route_diff_pair(s.doc, net_p, net_n, opts.is_null() ? json::object() : opts);
+    return apply_route_result(s, result, base_revision, doc_id);
+}
+
+json ecad_fill_zones(const std::string& doc_id, const json& resolution, long base_revision) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    if (!schema::is_board(s.doc))
+        throw OpError("invalid_op", "ecad_fill_zones requires a pcb document",
+                      {{"reason", "wrong doc kind"}, {"doc_id", doc_id}});
+
+    json filled_board = (resolution.is_number())
+                            ? fill_zones(s.doc, resolution.get<double>())
+                            : fill_zones(s.doc);
+
+    // fill_summary (engine/ecad/rpc.py::_zone_fill_summary): zones, zones_filled,
+    // polygons, copper_area_mm2 (abs shoelace, rounded to 4dp).
+    auto poly_area = [](const json& poly) -> double {
+        if (!poly.is_array() || poly.size() < 3) return 0.0;
+        double a = 0.0;
+        std::size_t n = poly.size();
+        for (std::size_t i = 0; i < n; ++i) {
+            const json& p = poly[i];
+            const json& q = poly[(i + 1) % n];
+            double x1 = p[0].get<double>(), y1 = p[1].get<double>();
+            double x2 = q[0].get<double>(), y2 = q[1].get<double>();
+            a += x1 * y2 - x2 * y1;
+        }
+        return std::fabs(a) / 2.0;
+    };
+    int zones = 0, filled = 0, polys = 0;
+    double area = 0.0;
+    if (filled_board.contains("zones") && filled_board["zones"].is_array()) {
+        zones = (int)filled_board["zones"].size();
+        for (const json& z : filled_board["zones"]) {
+            const json& fp = z.contains("filled_polys") && z["filled_polys"].is_array()
+                                 ? z["filled_polys"]
+                                 : json::array();
+            if (!fp.empty()) ++filled;
+            polys += (int)fp.size();
+            for (const json& poly : fp) area += poly_area(poly);
+        }
+    }
+    // round(area, 4) — match Python's round-half-to-even at 4 dp via the JSON repr.
+    double rounded = std::round(area * 1e4) / 1e4;
+    json summary = {{"zones", zones}, {"zones_filled", filled}, {"polygons", polys},
+                    {"copper_area_mm2", rounded}};
+
+    json resp = swap_doc_locked(s, filled_board, base_revision, json::array());
+    resp["fill_summary"] = summary;
+    resp["doc_id"] = doc_id;
+    return resp;
+}
+
+json ecad_simulate(const std::string& doc_id, const json& study_in, const json& sim_params) {
+    json nl, doc;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        Session& s = require_session(doc_id);
+        if (!schema::is_schematic(s.doc))
+            throw OpError("invalid_op", "ecad_simulate requires a sch document",
+                          {{"reason", "wrong doc kind"}, {"doc_id", doc_id}});
+        doc = s.doc;
+    }
+    nl = build_netlist(doc);
+
+    json conv = aicad::sim::netlist_to_spice_circuit(nl, sim_params);
+    json circuit = conv["circuit"];
+    json warns = conv["warnings"];
+
+    if (!circuit.contains("devices") || !circuit["devices"].is_array() ||
+        circuit["devices"].empty()) {
+        return json{{"ok", false},
+                    {"error", "no simulatable devices in the schematic"},
+                    {"warnings", warns}};
+    }
+
+    json study = study_in.is_object()
+                     ? study_in
+                     : json{{"analyses", json::array({json{{"type", "tran"},
+                                                            {"tstep", 5e-5},
+                                                            {"tstop", 5e-3}}})}};
+
+    // Default-all-nodes output (engine/sim/circuit.py::simulate + _default_probes): when
+    // the study requests no probes, emit V(node) for every non-ground node + I(Vname) for
+    // every independent V source, so a probe-less call still gets a useful result. The C++
+    // spice_simulate evaluates ONLY the study's probes, so we must inject the defaults here.
+    bool has_probes = study.contains("probes") && study["probes"].is_array() &&
+                      !study["probes"].empty();
+    if (!has_probes) {
+        json probes = json::array();
+        std::vector<std::string> seen;
+        auto have = [&](const std::string& x) {
+            for (const auto& s : seen)
+                if (s == x) return true;
+            return false;
+        };
+        std::vector<std::string> nodes;
+        if (circuit.contains("nodes") && circuit["nodes"].is_array())
+            for (const json& n : circuit["nodes"])
+                nodes.push_back(n.is_string() ? n.get<std::string>() : n.dump());
+        for (const json& d : circuit["devices"])
+            if (d.contains("nodes") && d["nodes"].is_array())
+                for (const json& n : d["nodes"]) {
+                    std::string nm = n.is_string() ? n.get<std::string>() : n.dump();
+                    if (std::find(nodes.begin(), nodes.end(), nm) == nodes.end()) nodes.push_back(nm);
+                }
+        for (const std::string& nm : nodes) {
+            if (nm == "0" || nm == "gnd" || nm == "GND" || have(nm)) continue;
+            seen.push_back(nm);
+            probes.push_back("V(" + nm + ")");
+        }
+        for (const json& d : circuit["devices"])
+            if (d.value("kind", std::string()) == "V")
+                probes.push_back("I(" + d.value("name", std::string()) + ")");
+        if (!probes.empty()) study["probes"] = probes;
+    }
+
+    // AC convenience: drive the first independent V source with a unit AC source if
+    // an AC analysis is requested and no source carries an AC stimulus
+    // (engine/ecad/rpc.py::_ecad_simulate).
+    bool wants_ac = false;
+    if (study.contains("analyses") && study["analyses"].is_array())
+        for (const json& a : study["analyses"])
+            if (a.is_object() && a.value("type", std::string()) == "ac") wants_ac = true;
+    if (wants_ac && circuit.contains("devices")) {
+        bool has_ac = false;
+        for (const json& d : circuit["devices"])
+            if (d.contains("params") && d["params"].is_object() && d["params"].contains("ac"))
+                has_ac = true;
+        if (!has_ac) {
+            for (json& d : circuit["devices"]) {
+                if (d.value("kind", std::string()) == "V") {
+                    if (!d.contains("params") || !d["params"].is_object()) d["params"] = json::object();
+                    d["params"]["ac"] = json{{"mag", 1.0}, {"phase", 0.0}};
+                    break;
+                }
+            }
+        }
+    }
+
+    json results = aicad::sim::spice_simulate(circuit, study);
+    json conv_field = results.is_object() && results.contains("convergence")
+                          ? results["convergence"]
+                          : json::object();
+    bool converged = conv_field.is_object() && !conv_field.empty();
+    if (converged)
+        for (auto it = conv_field.begin(); it != conv_field.end(); ++it)
+            if (!(it.value().is_boolean() ? it.value().get<bool>() : (bool)it.value()))
+                converged = false;
+
+    return json{
+        {"ok", true},
+        {"converged", converged},
+        {"results", results},
+        {"warnings", warns},
+        {"log", results.is_object() && results.contains("log") ? results["log"] : json::array()},
+        {"convergence", conv_field.is_object() ? conv_field : json::object()},
+        {"ms", results.is_object() && results.contains("ms") ? results["ms"] : json(nullptr)},
+    };
+}
+
+json ecad_session_doc(const std::string& doc_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    return s.doc;  // value semantics -> deep copy
 }
 
 }  // namespace aicad::ecad

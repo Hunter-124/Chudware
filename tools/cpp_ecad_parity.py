@@ -1347,6 +1347,112 @@ def main() -> int:
     b["footprints"] = [_ar_fp("fp1", (5.0, 5.0), [_ar_pad("p1", (0.0, 0.0), "X")])]
     cmp_autoroute("single_pad", b)
 
+    # ---- 22) ECAD -> 3D bridge parity: engine.ecad.threed vs core/geom/ecad_3d.cpp ----
+    # The Python oracle board_to_step() extrudes the Edge.Cuts outline by stackup
+    # thickness, subtracts drill cylinders (tht/np_tht pads + vias) and places one
+    # box proxy per on_board footprint. The C++ ecad_to_3d {board, opts} inline path
+    # builds the SAME OCCT solids and returns the geometry summary + exact BRep volume.
+    #
+    # GATE: EXACT. Both engines use OCCT 7.9.3, so the substrate BRep volume (after
+    # drill subtraction) and the analytic-proxy total volume match to full double
+    # precision. We compare: outline_area, thickness, the summary counts (n_holes /
+    # n_components / n_proxies / n_models / n_skipped), the substrate board_volume
+    # (json.dumps repr, so bit-exact), and the substrate+proxy total volume.
+    #
+    # DEFERRED: imported model_3d STEP component bodies (their volume depends on an
+    # external file, not the board doc). The fixtures use model_3d=None (box proxy),
+    # exactly like engine/ecad/test_threed.py, so every compared volume is exact.
+    import tempfile as _tf, os as _osm
+    from engine.ecad.threed import (board_to_step as _py_b2s,
+                                     _footprint_extent as _py_fpext,
+                                     _proxy_height as _py_fph,
+                                     _is_on_board as _py_onboard)
+
+    def _py_proxy_total(board, opts):
+        """Analytic substrate+proxy volume the oracle assembles (w*h*ht per box)."""
+        if not (opts or {}).get("components", True):
+            return 0.0
+        tot = 0.0
+        for fp in board.get("footprints", []):
+            if not _py_onboard(fp):
+                continue
+            if not fp.get("pads"):
+                continue
+            if fp.get("model_3d"):  # would import a STEP — not in our fixtures
+                continue
+            w, h = _py_fpext(fp)
+            tot += w * h * _py_fph(fp)
+        return tot
+
+    def cmp_to_3d(label, board, opts=None):
+        opts = opts or {"components": True, "copper": False}
+        with _tf.TemporaryDirectory() as td:
+            py = _py_b2s(board, _osm.path.join(td, "b.step"), dict(opts))
+        psum = py["summary"]
+        py_total = round(psum["board_volume"] + _py_proxy_total(board, opts), 9)
+        cres = cpp.call("ecad_to_3d", {"board": board, "opts": opts})
+        csum = cres.get("summary", {})
+        diffs = []
+        for k in ("outline_area", "thickness", "n_holes", "n_components",
+                  "n_proxies", "n_models", "n_skipped"):
+            if json.dumps(psum.get(k)) != json.dumps(csum.get(k)):
+                diffs.append(f"{k} {psum.get(k)}!={csum.get(k)}")
+        # board_volume (substrate) bit-exact via repr
+        if json.dumps(psum["board_volume"]) != json.dumps(csum.get("board_volume")):
+            diffs.append(f"board_volume {psum['board_volume']}!={csum.get('board_volume')}")
+        if json.dumps(round(cres.get("total_volume", -1), 9)) != json.dumps(py_total):
+            diffs.append(f"total_volume {cres.get('total_volume')}!={py_total}")
+        ok = not diffs
+        print(f"  {label:<40} {'MATCH' if ok else 'DIFF: ' + '; '.join(diffs)[:140]}")
+        return step(0 if ok else 1)
+
+    # 22a the canonical test_threed board: 50x30 rect, two 0805 SMD proxies (one
+    #     rotated 90deg), one via drill -> exact substrate + proxy volume.
+    from engine.ecad.test_threed import _make_board as _py_make_3d_board
+    cmp_to_3d("threed rect+2proxy+via", _py_make_3d_board())
+
+    # 22b same board, components OFF -> bare substrate (proxies excluded).
+    cmp_to_3d("threed substrate only", _py_make_3d_board(),
+              {"components": False, "copper": False})
+
+    # 22c bottom-side footprint + a no-pad (skipped) footprint + an off-board fp:
+    #     exercises the side='bottom' flip transform, n_skipped, and on_board=False.
+    def _mixed_3d_board():
+        b = _py_make_3d_board()
+        bot = json_copy(b["footprints"][0])
+        bot["id"] = "fp3"; bot["ref"] = "R3"; bot["pos"] = [40.0, 8.0]
+        bot["side"] = "bottom"; bot["angle"] = 45.0
+        b["footprints"].append(bot)
+        b["footprints"].append({  # no pads -> skipped
+            "id": "fp4", "fpid": "x:y", "ref": "X1", "value": "", "pos": [5.0, 5.0],
+            "angle": 0.0, "side": "top", "attr": "virtual", "pads": [],
+            "graphics": [], "model_3d": None, "linked_symbol": None})
+        off = json_copy(b["footprints"][1])
+        off["id"] = "fp5"; off["ref"] = "R5"; off["pos"] = [20.0, 25.0]
+        off["on_board"] = False
+        b["footprints"].append(off)
+        return b
+    cmp_to_3d("threed mixed (bottom/skip/off)", _mixed_3d_board())
+
+    # 22d empty-outline board -> structured error on BOTH engines. The oracle raises
+    #     BoardGeometryError; the C++ raises OpError("invalid_op"). We assert both refuse.
+    nb = _py_make_3d_board(); nb["outline"] = {"shapes": [], "closed": False}
+    from engine.ecad.threed import BoardGeometryError as _BGE
+    try:
+        with _tf.TemporaryDirectory() as td:
+            _py_b2s(nb, _osm.path.join(td, "b.step"), {"components": True})
+        _py_ref = False
+    except _BGE:
+        _py_ref = True
+    try:
+        cpp.call("ecad_to_3d", {"board": nb, "opts": {"components": True}})
+        _cpp_ref = False
+    except Exception:
+        _cpp_ref = True
+    _ref = _py_ref and _cpp_ref
+    print(f"  {'threed empty-outline refused':<40} {'MATCH' if _ref else 'DIFF: not refused'}")
+    step(0 if _ref else 1)
+
     print(f"\n[ecad-parity] {total - mism}/{total} steps at full parity")
     return mism
 

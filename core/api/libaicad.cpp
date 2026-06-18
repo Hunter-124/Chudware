@@ -31,6 +31,7 @@
 #include "doc/validate.h"
 #include "ecad/autoroute.h"
 #include "ecad/session.h"
+#include "geom/ecad_3d.h"
 #include "sim/fea_modal.h"
 #include "sim/fea_static.h"
 #include "sim/lbm.h"
@@ -466,6 +467,15 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                                          params.value("net_p", std::string()),
                                                          params.value("net_n", std::string()), opts),
                             out_json, 0);
+            }
+            if (m == "ecad_to_3d" && params.contains("board") && params["board"].is_object()) {
+                // Stateless inline-board path (parity harness): build the OCCT board
+                // model (substrate extrude + drill cuts + analytic component proxies)
+                // and return the geometry summary + exact BRep volume stats. Mirrors
+                // engine.ecad.threed.board_to_step's summary; the STEP-file side effect
+                // is omitted (the host's stateful ecad_to_3d still routes to Python).
+                json opts = params.contains("opts") ? params["opts"] : json(nullptr);
+                return emit(aicad::ecad::board_to_3d(params["board"], opts), out_json, 0);
             }
             if (m == "ecad_impedance")
                 return emit(aicad::ecad::ecad_impedance(params), out_json, 0);

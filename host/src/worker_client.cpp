@@ -137,6 +137,58 @@ bool routeSimToCpp(const std::string& method, const json& /*params*/) {
     }
     return true;
 }
+// --- C++ ECAD routing (opt-in, default OFF) ---------------------------------
+// Route the host's ECAD RPCs (ecad_*) to the pure-C++ core (libaicad) instead of
+// the Python worker. MIRRORS the doc_* seam exactly, but is DEFAULT OFF: unless
+// AI_CAD_CPP_ECAD is set (and != "0") every ecad_* call goes to the Python worker
+// exactly as today. An ECAD doc CREATED in the C++ core mints an "ecadcpp..." id
+// (core/ecad/session.cpp new_doc_id()), so every subsequent ecad_* call carrying
+// that doc_id routes to the C++ core too — the id prefix IS the commit-at-mint
+// marker, an all-or-nothing-per-document cutover (the ECAD analogue of "doc-cpp").
+//
+// Coverage gaps to be aware of when the flag is ON (these stay Python via the
+// "unknown method" -> nonzero-without-{code} hard-fail or, for ecad_design, by
+// minting a Python doc id): the C++ core handles the STATEFUL doc-id ecad methods
+// in libaicad.cpp (ecad_new/open/apply_ops/undo/redo/tree/rebuild/close/describe/
+// schema/dfm/impedance/export/save/update_from_sch/recipe*), but ecad_autoroute /
+// ecad_to_3d / ecad_route_diff_pair are only ported for the STATELESS inline-board
+// form, NOT the host's doc-id form; and ecad_fill_zones / ecad_simulate /
+// ecad_design / ecad_import_kicad* are not in the C++ core at all (KiCad import
+// stays Python). A call bound to an ecadcpp doc that hits one of these fails loud
+// (no Python doc to fall back to) — exactly the doc-cpp seam's behavior.
+bool cppEcadFlag() {
+    const char* f = std::getenv("AI_CAD_CPP_ECAD");
+    return f && f[0] && f[0] != '0';  // explicit opt-in only (default OFF)
+}
+
+bool routeEcadToCpp(const std::string& method, const json& params) {
+    if (method.rfind("ecad_", 0) != 0) return false;  // only ecad_* methods
+    // A C++-backed ECAD doc carries an "ecadcpp" doc_id -> EVERY ecad_* call
+    // operating on it routes to the C++ core for that doc's whole lifetime (even if
+    // the flag was since toggled off). An unported method then fails loud in the
+    // core (no Python doc to fall back to), surfacing the gap rather than misrouting.
+    if (params.is_object()) {
+        // doc_id (most ecad_*) or board_doc_id (ecad_update_from_sch) carrying an
+        // ecadcpp prefix binds the call to the C++-backed ECAD document.
+        for (const char* key : {"doc_id", "board_doc_id", "sch_doc_id"}) {
+            auto it = params.find(key);
+            if (it != params.end() && it->is_string() &&
+                it->get<std::string>().rfind("ecadcpp", 0) == 0)
+                return true;
+        }
+    }
+    // ecad_new / ecad_open MINT a fresh ECAD doc -> route to C++ when the flag is on
+    // and the core DLL is loadable. The core mints an "ecadcpp" doc; if it declines
+    // (structured "unsupported") or the DLL is unavailable, the host falls back to
+    // the Python worker so document creation never hard-breaks.
+    if (!cppEcadFlag()) return false;
+    if (method != "ecad_new" && method != "ecad_open") return false;  // minting only
+    if (!core::cpp_core().available()) {
+        std::string lerr;
+        if (!core::cpp_core().ensureLoaded(lerr)) return false;  // can't load -> Python
+    }
+    return true;
+}
 std::wstring widen(const std::string& s) {
     if (s.empty()) return L"";
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
@@ -375,6 +427,40 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
         }
         // Hard failure (DLL throw / load race after the available() check): do NOT hard-break
         // sim — fall through to the Python sim worker path below so analysis keeps working.
+    }
+    // C++ ECAD routing (opt-in via AI_CAD_CPP_ECAD, default OFF). MIRRORS the doc_* seam
+    // below: an ecad_new/ecad_open mints an "ecadcpp" doc and binds the whole doc lifetime
+    // to C++; any later ecad_* carrying that ecadcpp doc_id routes here. Default OFF =>
+    // routeEcadToCpp() returns false (and no ecadcpp doc exists) so this block is skipped
+    // entirely — byte-for-byte today's Python ECAD path. No params translation: the host's
+    // ecad_* send-shape IS the libaicad contract (kind/name, doc_id, base_revision, ops...).
+    if (routeEcadToCpp(method, params)) {
+        // ecad_new / ecad_open MINT a new ECAD doc; everything else operates on an
+        // existing ecadcpp doc (no Python doc to fall back to => fail loud on hard error).
+        const bool minting = (method == "ecad_new" || method == "ecad_open");
+        std::string cerr;
+        if (core::cpp_core().call(method, params, result, cerr))
+            return true;  // handled (rc==0); `result` holds {doc_id, revision, tree, ...}
+        // Nonzero rc: a structured OpError carries {code,message,detail} in `result`.
+        if (result.is_object() && result.contains("code")) {
+            // A MINTING call the core declined as "unsupported" created no C++ doc — fall
+            // back to the Python worker instead of surfacing the error (no engine switch).
+            if (!(minting && result.value("code", std::string()) == "unsupported")) {
+                err = result.value("message", std::string("cpp-ecad error"));
+                return true;  // structured error reported (round-trip OK)
+            }
+            // else: fall through to the Python worker path below
+        } else if (!minting) {
+            // Hard failure (DLL throw, or an unported ecad_* like ecad_fill_zones /
+            // ecad_simulate / doc-id ecad_autoroute) on a call bound to an EXISTING
+            // ecadcpp doc — there is no Python doc to fall back to, so fail loudly.
+            err = "cpp-ecad (" + method + "): " + cerr;
+            if (errorSink_) errorSink_(method, err);
+            return false;
+        }
+        // Minting-call fallback: the core could not mint this doc (unsupported kind / the
+        // DLL is unavailable) — continue to the Python worker so ECAD creation never
+        // hard-breaks (it mints a Python doc id, which keeps the doc on Python).
     }
     // P16: route C++-backed documents to the in-process core (libaicad) instead of the
     // Python worker. All-or-nothing per document (NO mid-doc Python fallback — Python

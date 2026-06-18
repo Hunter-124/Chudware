@@ -338,6 +338,96 @@ def fixtures():
         _sketch("s1", "plane.top", sm_e, sm_c), _base_flange("b1", "s1"),
         sm_edge_flange, sm_flat]}
 
+    # ---- weldments (engine/doc/features/weldment.py + engine/doc/weld_profiles.py) ----
+    # A weld_member sweeps a structural profile perpendicular to each sketch segment,
+    # one SEPARATE member body per segment (an assembly). The C++ port does NOT trim
+    # shared corners (miter/butt/cope), so fixtures use members that do NOT share a
+    # vertex — each member's volume is then the exact swept prism area*length, the
+    # robust geometry gate. Profiles are built identically in both engines (hollow
+    # tubes subtract the bore), so the cross-section area — hence volume — matches.
+
+    def _weld_member(fid, sketch_fid, profile, dims, segments=None, justify="center",
+                     angle=None, trim_corners=False):
+        # Profile dimension keys (size/thickness/w/...) are read RAW by the oracle's
+        # ProfileSpec.resolve (float(supplied[k])) — they are NOT compiler-core dim
+        # objects, so pass them as bare numbers (the C++ jnum reads both shapes).
+        params = {"profile": profile, "justify": justify, "trim_corners": trim_corners}
+        params.update(dims)
+        if angle is not None:
+            params["angle"] = {"value": angle, "expr": None}
+        refs = {"sketch": sketch_fid}
+        if segments is not None:
+            refs["segments"] = segments
+        return {"id": fid, "type": "weld_member", "params": params, "refs": refs}
+
+    # single square-tube member along ONE horizontal line of length 100 on plane.top.
+    # square_tube size=20 t=2 -> area = 20^2 - 16^2 = 144 ; V = 144*100 = 14400.
+    wm1_e = [_line("e1", 0, 0, 100, 0)]
+    wm1_c = [_rel("f1", "fix", ["e1.p1"]), _rel("f2", "fix", ["e1.p2"])]
+    out["weld_member_single"] = {"features": [
+        _sketch("s1", "plane.top", wm1_e, wm1_c),
+        _weld_member("m1", "s1", "square_tube", {"size": 20.0, "thickness": 2.0})]}
+
+    # member GROUP: three PARALLEL non-touching flat-bar members (no shared vertex ->
+    # no trim). flat_bar w=40 t=6 -> area=240 ; three lines of length 80 -> 3 bodies,
+    # V = 3*240*80 = 57600.
+    wm2_e = [_line("e1", 0, 0, 80, 0), _line("e2", 0, 20, 80, 20), _line("e3", 0, 40, 80, 40)]
+    wm2_c = [_rel("f1", "fix", ["e1.p1"]), _rel("f2", "fix", ["e1.p2"]),
+             _rel("f3", "fix", ["e2.p1"]), _rel("f4", "fix", ["e2.p2"]),
+             _rel("f5", "fix", ["e3.p1"]), _rel("f6", "fix", ["e3.p2"])]
+    out["weld_member_group"] = {"features": [
+        _sketch("s1", "plane.top", wm2_e, wm2_c),
+        _weld_member("m1", "s1", "flat_bar", {"w": 40.0, "thickness": 6.0})]}
+
+    # round-tube member (exercises the circular profile + bore). od=30 t=3 ->
+    # area = pi*(15^2-12^2) = pi*81 ; line length 120 -> V = pi*81*120 = 9720*pi.
+    wm3_e = [_line("e1", 0, 0, 120, 0)]
+    wm3_c = [_rel("f1", "fix", ["e1.p1"]), _rel("f2", "fix", ["e1.p2"])]
+    out["weld_member_round"] = {"features": [
+        _sketch("s1", "plane.top", wm3_e, wm3_c),
+        _weld_member("m1", "s1", "round_tube", {"od": 30.0, "thickness": 3.0})]}
+
+    # ---- end cap: a plate covering the open end of a single square-tube member ----
+    # The end face is at the member's far end (x=100); its outward normal is +X.
+    # 'outer' cap covers the whole 20x20 end -> plate V = 400*thickness = 400*5 = 2000.
+    # The member volume (144*100=14400) is unchanged; total = 16400, 2 bodies.
+    cap_face = {"kind": "face", "surf": "plane", "centroid": [100.0, 0.0, 0.0],
+                "axis": [1.0, 0.0, 0.0], "area_or_len": 144.0,
+                "owner_feature": None, "hint_index": 0}
+    out["weld_end_cap"] = {"features": [
+        _sketch("s1", "plane.top", wm1_e, wm1_c),
+        _weld_member("m1", "s1", "square_tube", {"size": 20.0, "thickness": 2.0}),
+        {"id": "c1", "type": "weld_end_cap",
+         "params": {"type": "outer", "thickness": {"value": 5.0, "expr": None}},
+         "refs": {"face": cap_face}}]}
+
+    # ---- gusset: a triangular plate in the L-corner of two perpendicular members ----
+    # Two flat-bar members sharing a corner at the origin: one along +X, one along +Y.
+    # We pick the TOP face (+Z) of each member; the gusset is built in the +Z plane.
+    # d1=d2=30 -> right-triangle legs 30 -> tri area 450 ; V = 450*thickness = 450*4 = 1800.
+    gus_e = [_line("e1", 0, 0, 100, 0), _line("e2", 0, 0, 0, 100)]
+    gus_c = [_rel("f1", "fix", ["e1.p1"]), _rel("f2", "fix", ["e1.p2"]),
+             _rel("f3", "fix", ["e2.p2"])]
+    # The two members' coplanar +Z "top" faces (normal +Z), the faces facing up out
+    # of the L-corner. flat_bar w=40 t=6 swept along the segment orients the 40-wide
+    # profile dimension along Z, so each member's +Z face spans z=+20, area 600
+    # (length 100 x half-width 6): the +X member's at centroid (50,0,20), the +Y
+    # member's at (0,50,20). Their longest edge (along the member axis, length 100)
+    # gives the axis the gusset apex/legs are built from.
+    gtop1 = {"kind": "face", "surf": "plane", "centroid": [50.0, 0.0, 20.0],
+             "axis": [0.0, 0.0, 1.0], "area_or_len": 600.0,
+             "owner_feature": None, "hint_index": 0}
+    gtop2 = {"kind": "face", "surf": "plane", "centroid": [0.0, 50.0, 20.0],
+             "axis": [0.0, 0.0, 1.0], "area_or_len": 600.0,
+             "owner_feature": None, "hint_index": 0}
+    out["weld_gusset"] = {"features": [
+        _sketch("s1", "plane.top", gus_e, gus_c),
+        _weld_member("m1", "s1", "flat_bar", {"w": 40.0, "thickness": 6.0}),
+        {"id": "g1", "type": "weld_gusset",
+         "params": {"type": "triangular", "thickness": {"value": 4.0, "expr": None},
+                    "d1": {"value": 30.0, "expr": None}, "d2": {"value": 30.0, "expr": None}},
+         "refs": {"faces": [gtop1, gtop2]}}]}
+
     return out
 
 

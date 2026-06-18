@@ -18,7 +18,9 @@
 
 #include "doc/document.h"
 
+#include <array>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -31,6 +33,7 @@
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepAdaptor_Surface.hxx>
+#include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
 #include <BRepTools.hxx>
@@ -61,6 +64,7 @@
 #include "geom/plane.h"
 #include "geom/profile.h"
 #include "geom/sheetmetal.h"
+#include "geom/weldment.h"
 #include "geom/tessellate.h"
 #include "geom/transform.h"
 #include "geom/aicm.h"
@@ -1685,6 +1689,297 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 consumed.insert(body_id);
                 source_of[id] = body_id;
                 results[id] = SolidResult{flat};
+                solid_order.push_back(id);
+                st.ok = true;
+
+            } else if (type == "weld_member") {
+                // Structural weldment members: sweep a library profile perpendicular
+                // to each selected sketch segment (BRepOffsetAPI_MakePipe), one
+                // SEPARATE body per segment (an assembly of members). Port of
+                // engine/doc/features/weldment.py::compile_weld_member.
+                //
+                // PARITY NOTE: corner trimming (miter/butt/cope) is NOT ported — the
+                // C++ fixtures use members that do not share a vertex (or a single
+                // member), so trim_corners is a no-op and each member's volume is the
+                // exact swept prism area*length. A trimmed-corner fixture would need
+                // the boolean half-space / cope ops ported; flagged out-of-scope here.
+                const std::string profile = feat.value("profile", std::string("square_tube"));
+                if (!::geom::weld_profile_known(profile))
+                    throw std::runtime_error("weld_member: unknown profile '" + profile + "'");
+                const std::string justify = feat.value("justify", std::string("center"));
+                if (justify != "center" && justify != "corner")
+                    throw std::runtime_error("weld_member: unknown justify '" + justify + "'");
+                const double angle = feat.contains("angle") && !feat.at("angle").is_null()
+                    ? num_or_expr(feat.at("angle"), env) : 0.0;
+
+                // The source sketch (its raw segments become the member paths).
+                const std::string sid = req_str(feat, "sketch");
+                const SketchResult& src = require_sketch(results, sid, sid.c_str());
+                // Optional segment filter: a list of entity ids (default = all).
+                std::set<std::string> wanted;
+                bool have_filter = false;
+                auto seg_it = feat.find("segments");
+                if (seg_it != feat.end() && seg_it->is_array()) {
+                    have_filter = true;
+                    for (const json& s : *seg_it)
+                        if (s.is_string()) wanted.insert(s.get<std::string>());
+                }
+
+                // Build the profile face once (local frame); reused per segment.
+                double area = 0.0;
+                std::string perr;
+                TopoDS_Face face_local = ::geom::weld_profile_face(
+                    profile, feat, justify, angle, area, perr);
+                if (face_local.IsNull())
+                    throw std::runtime_error("weld_member: " + perr);
+
+                // Resolve (entity_id, world-space line edge) pairs to sweep along.
+                // Only straight LINE segments are swept (the ported subset); a closed
+                // or construction entity is skipped, exactly like the oracle.
+                struct Seg { std::string eid; TopoDS_Edge edge; Eigen::Vector3d start, tangent; };
+                std::vector<Seg> segs;
+                const json& ents = src.entities;
+                if (ents.is_object()) {
+                    for (auto eit = ents.begin(); eit != ents.end(); ++eit) {
+                        const json& ent = eit.value();
+                        if (!ent.is_object()) continue;
+                        if (ent.value("construction", false)) continue;
+                        const std::string eid = ent.value("id", eit.key());
+                        if (have_filter && !wanted.count(eid)) continue;
+                        if (ent.value("type", std::string()) != "line") continue;  // lines only
+                        if (!ent.contains("p1") || !ent.contains("p2")) continue;
+                        Eigen::Vector2d a(ent["p1"][0].get<double>(), ent["p1"][1].get<double>());
+                        Eigen::Vector2d b(ent["p2"][0].get<double>(), ent["p2"][1].get<double>());
+                        if ((a - b).norm() < 1e-9) continue;
+                        Eigen::Vector3d wa = src.plane.lift(a), wb = src.plane.lift(b);
+                        BRepBuilderAPI_MakeEdge me(gp_Pnt(wa.x(), wa.y(), wa.z()),
+                                                   gp_Pnt(wb.x(), wb.y(), wb.z()));
+                        if (!me.IsDone()) continue;
+                        Seg sg;
+                        sg.eid = eid;
+                        sg.edge = me.Edge();
+                        sg.start = wa;
+                        sg.tangent = (wb - wa).normalized();
+                        segs.push_back(std::move(sg));
+                    }
+                }
+                if (segs.empty())
+                    throw std::runtime_error("weld_member: sketch has no usable segments to sweep along");
+
+                // One SEPARATE surviving body per member. Store each under a synthetic
+                // id (feature_id#k) so the surviving-body set + count + total volume
+                // match the oracle (which appends each member to ctx.bodies).
+                int k = 0;
+                for (const Seg& sg : segs) {
+                    TopoDS_Shape member =
+                        ::geom::weld_sweep_member(face_local, sg.edge, sg.start, sg.tangent);
+                    if (member.IsNull())
+                        throw std::runtime_error("weld_member: sweep failed for segment '" + sg.eid + "'");
+                    GProp_GProps gm;
+                    BRepGProp::VolumeProperties(member, gm);
+                    if (gm.Mass() <= 1e-9)
+                        throw std::runtime_error("weld_member: produced an empty member solid");
+                    std::string mid = id + "#" + std::to_string(k++);
+                    results[mid] = SolidResult{member};
+                    solid_order.push_back(mid);
+                }
+                st.ok = true;
+
+            } else if (type == "weld_end_cap" || type == "weld_gusset") {
+                // Dress weldment features: a plate resolved from picked planar face(s)
+                // on the EXISTING member bodies. Both are SEPARATE new bodies appended
+                // to the rolling list (the members are NOT consumed). Ports of
+                // compile_weld_end_cap / compile_weld_gusset.
+                //
+                // Face picks resolve against ALL current surviving bodies (members are
+                // kept separate), keeping the candidate with the smallest centroid
+                // distance — the C++ analogue of weldment.py::_resolve_face_any_body.
+                std::vector<std::string> live;
+                for (const std::string& s : solid_order)
+                    if (!consumed.count(s)) live.push_back(s);
+                if (live.empty())
+                    throw std::runtime_error(type + ": no member bodies — add weld_member first");
+
+                // Resolve ONE face selector against every live body, returning the
+                // best (smallest selector-centroid distance) face.
+                auto resolve_face_any = [&](const json& sel, const char* slot) -> TopoDS_Face {
+                    if (!sel.is_object() || sel.value("kind", std::string()) != "face")
+                        throw std::runtime_error(std::string(slot) + ": a planar face selector is required");
+                    std::array<double, 3> want{0, 0, 0};
+                    bool have_want = false;
+                    auto cit = sel.find("centroid");
+                    if (cit != sel.end() && cit->is_array() && cit->size() == 3) {
+                        want = {(*cit)[0].get<double>(), (*cit)[1].get<double>(), (*cit)[2].get<double>()};
+                        have_want = true;
+                    }
+                    TopoDS_Face best;
+                    double best_d = std::numeric_limits<double>::max();
+                    for (const std::string& bid : live) {
+                        const TopoDS_Shape& body = std::get<SolidResult>(results.at(bid)).shape;
+                        aicad::doc::FacePicks fp = aicad::doc::resolve_face_picks(body, sel, slot);
+                        for (const TopoDS_Face& fc : fp.faces) {
+                            double d = 0.0;
+                            if (have_want) {
+                                GProp_GProps gp;
+                                BRepGProp::SurfaceProperties(fc, gp);
+                                gp_Pnt c = gp.CentreOfMass();
+                                d = std::sqrt((c.X() - want[0]) * (c.X() - want[0]) +
+                                              (c.Y() - want[1]) * (c.Y() - want[1]) +
+                                              (c.Z() - want[2]) * (c.Z() - want[2]));
+                            }
+                            if (d < best_d) { best_d = d; best = fc; }
+                        }
+                    }
+                    if (best.IsNull())
+                        throw std::runtime_error(std::string(slot) + ": face selector did not resolve on any member body");
+                    return best;
+                };
+
+                // Planar face normal (build123d normal_at: geometric normal, flipped
+                // when the face is REVERSED) — matches the oracle's _require_planar.
+                auto face_normal = [&](const TopoDS_Face& fc, const char* what) -> Eigen::Vector3d {
+                    BRepAdaptor_Surface surf(fc);
+                    if (surf.GetType() != GeomAbs_Plane)
+                        throw std::runtime_error(std::string(what) + ": the picked face is not planar");
+                    gp_Dir d = surf.Plane().Axis().Direction();
+                    Eigen::Vector3d n(d.X(), d.Y(), d.Z());
+                    if (fc.Orientation() == TopAbs_REVERSED) n = -n;
+                    if (n.norm() < 1e-9)
+                        throw std::runtime_error(std::string(what) + ": degenerate face normal");
+                    return n.normalized();
+                };
+                auto face_center = [&](const TopoDS_Face& fc) -> Eigen::Vector3d {
+                    GProp_GProps gp;
+                    BRepGProp::SurfaceProperties(fc, gp);
+                    gp_Pnt c = gp.CentreOfMass();
+                    return Eigen::Vector3d(c.X(), c.Y(), c.Z());
+                };
+
+                TopoDS_Shape plate;
+                if (type == "weld_end_cap") {
+                    const double thickness = feat.contains("thickness")
+                        ? num_or_expr(feat.at("thickness"), env) : 5.0;
+                    const std::string cap_type = feat.value("hem_type", feat.value("type", std::string("outer")));
+                    const double offset = feat.contains("offset") && !feat.at("offset").is_null()
+                        ? num_or_expr(feat.at("offset"), env) : 0.0;
+                    const double overhang = feat.contains("overhang") && !feat.at("overhang").is_null()
+                        ? num_or_expr(feat.at("overhang"), env) : 0.0;
+                    if (!(thickness > 0.0))
+                        throw std::runtime_error("weld_end_cap: thickness must be > 0");
+                    if (cap_type != "outer" && cap_type != "inner")
+                        throw std::runtime_error("weld_end_cap: type must be 'outer' or 'inner'");
+                    if (overhang < 0.0)
+                        throw std::runtime_error("weld_end_cap: overhang must be >= 0");
+
+                    auto fsit = feat.find("face");
+                    if (fsit == feat.end())
+                        throw std::runtime_error("weld_end_cap: refs.face is required (a planar member END face)");
+                    json fsel = *fsit;
+                    if (fsel.is_array()) {
+                        if (fsel.size() != 1)
+                            throw std::runtime_error("weld_end_cap: refs.face takes exactly one face selector");
+                        fsel = fsel.front();
+                    }
+                    TopoDS_Face end_face = resolve_face_any(fsel, "face");
+                    Eigen::Vector3d n = face_normal(end_face, "weld_end_cap");
+                    std::string cerr;
+                    plate = ::geom::weld_end_cap_plate(end_face, n, cap_type, thickness,
+                                                       offset, overhang, cerr);
+                    if (plate.IsNull())
+                        throw std::runtime_error("weld_end_cap: " + cerr);
+
+                } else {  // weld_gusset
+                    const double thickness = feat.contains("thickness")
+                        ? num_or_expr(feat.at("thickness"), env) : 5.0;
+                    const double d1 = feat.contains("d1") ? num_or_expr(feat.at("d1"), env) : 30.0;
+                    const double d2 = feat.contains("d2") ? num_or_expr(feat.at("d2"), env) : 30.0;
+                    const std::string gtype = feat.value("hem_type", feat.value("type", std::string("triangular")));
+                    const std::string location = feat.value("location", std::string("centered"));
+                    const double offset = feat.contains("offset") && !feat.at("offset").is_null()
+                        ? num_or_expr(feat.at("offset"), env) : 0.0;
+                    if (!(thickness > 0.0))
+                        throw std::runtime_error("weld_gusset: thickness must be > 0");
+                    if (!(d1 > 0.0 && d2 > 0.0))
+                        throw std::runtime_error("weld_gusset: legs d1 and d2 must be > 0");
+                    if (gtype != "triangular" && gtype != "polygonal")
+                        throw std::runtime_error("weld_gusset: type must be 'triangular' or 'polygonal'");
+                    if (location != "centered" && location != "inner" && location != "outer")
+                        throw std::runtime_error("weld_gusset: location must be 'centered', 'inner' or 'outer'");
+
+                    auto fsit = feat.find("faces");
+                    if (fsit == feat.end() || !fsit->is_array() || fsit->size() != 2)
+                        throw std::runtime_error("weld_gusset: refs.faces must be exactly two planar face selectors");
+                    TopoDS_Face f1 = resolve_face_any((*fsit)[0], "faces[0]");
+                    TopoDS_Face f2 = resolve_face_any((*fsit)[1], "faces[1]");
+                    Eigen::Vector3d n1 = face_normal(f1, "weld_gusset");
+                    Eigen::Vector3d n2 = face_normal(f2, "weld_gusset");
+                    Eigen::Vector3d c1 = face_center(f1), c2 = face_center(f2);
+                    double len1 = 0.0, len2 = 0.0;
+                    Eigen::Vector3d axis1 = ::geom::weld_longest_edge_dir(f1, len1);
+                    Eigen::Vector3d axis2 = ::geom::weld_longest_edge_dir(f2, len2);
+                    if (len1 < 1e-6 || len2 < 1e-6)
+                        throw std::runtime_error("weld_gusset: could not recover a member axis from a picked face");
+                    if (std::abs(axis1.dot(axis2)) > 0.999)
+                        throw std::runtime_error("weld_gusset: the two picked faces are parallel/collinear members");
+
+                    Eigen::Vector3d apex =
+                        ::geom::weld_closest_point_between_lines(c1, axis1, c2, axis2);
+
+                    // Gusset plane normal: average of the two face normals when they
+                    // share a plane; else axis1 x axis2 (oracle).
+                    Eigen::Vector3d gn;
+                    if (std::abs(n1.dot(n2)) > 0.5) {
+                        gn = n1 + (n1.dot(n2) > 0 ? n2 : -n2);
+                        if (gn.norm() < 1e-9) gn = axis1.cross(axis2);
+                    } else {
+                        gn = axis1.cross(axis2);
+                    }
+                    if (gn.norm() < 1e-9)
+                        throw std::runtime_error("weld_gusset: could not determine the gusset plane normal");
+                    gn.normalize();
+
+                    auto toward = [](const Eigen::Vector3d& apex, const Eigen::Vector3d& target,
+                                     const Eigen::Vector3d& axis) -> Eigen::Vector3d {
+                        Eigen::Vector3d v = target - apex;
+                        return axis.dot(v) >= 0 ? axis : -axis;
+                    };
+                    auto in_plane = [](const Eigen::Vector3d& v, const Eigen::Vector3d& nn) -> Eigen::Vector3d {
+                        return v - nn * v.dot(nn);
+                    };
+                    Eigen::Vector3d leg1 = in_plane(toward(apex, c1, axis1), gn);
+                    Eigen::Vector3d leg2 = in_plane(toward(apex, c2, axis2), gn);
+                    if (leg1.norm() < 1e-9 || leg2.norm() < 1e-9)
+                        throw std::runtime_error("weld_gusset: degenerate leg direction at the corner");
+                    leg1.normalize();
+                    leg2.normalize();
+
+                    Eigen::Vector3d p_a = apex;
+                    Eigen::Vector3d p_b = apex + leg1 * d1;
+                    Eigen::Vector3d p_c = apex + leg2 * d2;
+                    std::vector<Eigen::Vector3d> corners;
+                    if (gtype == "triangular") {
+                        corners = {p_a, p_b, p_c};
+                    } else {
+                        Eigen::Vector3d pb2 = apex + leg1 * (d1 * 0.7);
+                        Eigen::Vector3d pc2 = apex + leg2 * (d2 * 0.7);
+                        corners = {p_a, p_b, pb2, pc2, p_c};
+                    }
+
+                    double loc_off = offset;
+                    if (location == "inner") loc_off -= thickness / 2.0;
+                    else if (location == "outer") loc_off += thickness / 2.0;
+
+                    plate = ::geom::weld_make_solid_plate(corners, gn, thickness, loc_off);
+                    if (plate.IsNull())
+                        throw std::runtime_error("weld_gusset: plate build failed");
+                }
+
+                GProp_GProps gp;
+                BRepGProp::VolumeProperties(plate, gp);
+                if (gp.Mass() <= 1e-9)
+                    throw std::runtime_error(type + ": produced an empty/degenerate plate");
+                // The plate is a SEPARATE new body (members survive untouched).
+                results[id] = SolidResult{plate};
                 solid_order.push_back(id);
                 st.ok = true;
 

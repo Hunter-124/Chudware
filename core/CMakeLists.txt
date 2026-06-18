@@ -234,6 +234,7 @@ if(AICAD_WITH_OCCT)
     geom/transform.cpp
     geom/hole.cpp
     geom/sheetmetal.cpp
+    geom/weldment.cpp
     geom/aicm.cpp)
   target_include_directories(aicad_geom_occt PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

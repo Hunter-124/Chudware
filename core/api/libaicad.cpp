@@ -31,6 +31,7 @@
 #include "doc/validate.h"
 #include "sim/fea_modal.h"
 #include "sim/fea_static.h"
+#include "sim/netlist.h"
 #include "sim/spice.h"
 
 using nlohmann::json;
@@ -220,6 +221,16 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             const json& circ = params.contains("circuit") ? params["circuit"] : json::object();
             const json& study = params.contains("study") ? params["study"] : json::object();
             return emit(aicad::sim::spice_simulate(circ, study), out_json, 0);
+        }
+        if (m == "sim_netlist_parse") {
+            // DIAGNOSTIC: parse a SPICE netlist deck text into the Circuit dict
+            // (engine/sim/spice.py:parse_spice + subckt.py parity probe). Params:
+            // {"netlist": "<deck text>"}. Returns the frozen Circuit dict (sim.md §1)
+            // so the host's .cir flow can run on the C++ core (it then feeds sim_spice).
+            std::string deck = params.contains("netlist") && params["netlist"].is_string()
+                                   ? params["netlist"].get<std::string>()
+                                   : std::string();
+            return emit(aicad::sim::parse_netlist(deck), out_json, 0);
         }
         if (m == "doc_validate") {
             // DIAGNOSTIC: structural-validate a document tree (schema.validate_document

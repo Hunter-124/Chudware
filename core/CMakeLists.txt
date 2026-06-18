@@ -220,7 +220,9 @@ add_library(aicad_agent STATIC
   agent/config.cpp
   agent/ops_emit.cpp
   agent/events.cpp
-  agent/roles.cpp)
+  agent/roles.cpp
+  agent/state.cpp
+  agent/machine.cpp)
 target_include_directories(aicad_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_agent PUBLIC nlohmann_json::nlohmann_json winhttp bcrypt)
 set_property(TARGET aicad_agent PROPERTY

@@ -17,22 +17,28 @@
 #include "api/libaicad.h"
 
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "agent/config.h"
 #include "agent/events.h"
+#include "agent/machine.h"
 #include "agent/paths.h"
 #include "agent/ops_emit.h"
 #include "agent/providers.h"
 #include "agent/roles.h"
+#include "agent/state.h"
 #include "doc/document.h"
 #include "doc/export2d.h"
 #include "doc/session.h"
@@ -374,6 +380,189 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             std::string ft = params.value("feature_type", std::string());
             std::string pd = params.value("prompts_dir", std::string());
             return emit(json{{"text", aicad::agent::load_cheatsheet(ft, pd)}}, out_json, 0);
+        }
+        // --- P53a: orchestrator state machine + state/context (agent/orchestrator) ---
+        if (m == "agent_est_tokens") {
+            std::string text = params.value("text", std::string());
+            return emit(json{{"n", aicad::agent::est_tokens(text)}}, out_json, 0);
+        }
+        if (m == "agent_err_sig") {
+            std::string err = params.value("err", std::string());
+            return emit(json{{"sig", aicad::agent::err_sig(err)}}, out_json, 0);
+        }
+        if (m == "agent_digest_tree") {
+            // Re-parse from the RAW request text as ordered_json so object key
+            // iteration preserves insertion order (matching Python dict order).
+            using ojson = nlohmann::ordered_json;
+            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
+            ojson tree = op.contains("tree") ? op["tree"] : ojson::object();
+            return emit(json{{"digest", aicad::agent::digest_tree(tree)}}, out_json, 0);
+        }
+        if (m == "agent_digest_params") {
+            using ojson = nlohmann::ordered_json;
+            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
+            ojson p = op.contains("params") ? op["params"] : ojson::object();
+            return emit(json{{"s", aicad::agent::digest_params(p)}}, out_json, 0);
+        }
+        if (m == "agent_looks_like_edit") {
+            std::string req = params.value("request", std::string());
+            return emit(json{{"edit", aicad::agent::looks_like_edit(req)}}, out_json, 0);
+        }
+        if (m == "agent_feature_status_errors") {
+            using ojson = nlohmann::ordered_json;
+            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
+            ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
+            return emit(json{{"errors", aicad::agent::feature_status_errors(fs)}}, out_json, 0);
+        }
+        if (m == "agent_build_context") {
+            // {state:{...}, role, prompts_dir?} -> {system, body, context_chars,
+            // context_tokens_est}. Re-parse as ordered_json for spec/plan/memory.
+            using ojson = nlohmann::ordered_json;
+            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
+            ojson st = op.contains("state") ? op["state"] : ojson::object();
+            std::string role = op.value("role", std::string());
+            std::string pd = op.value("prompts_dir", std::string());
+            aicad::agent::DesignState ds;
+            ds.request = st.value("request", std::string());
+            ds.doc_id = st.value("doc_id", std::string());
+            ds.revision = st.value("revision", 0);
+            ds.spec = st.contains("spec") ? st["spec"] : ojson(nullptr);
+            ds.plan = st.contains("plan") ? st["plan"] : ojson(nullptr);
+            ds.tree_digest = st.value("tree_digest", std::string());
+            if (st.contains("last_errors") && st["last_errors"].is_array())
+                for (const auto& e : st["last_errors"]) ds.last_errors.push_back(e.get<std::string>());
+            if (st.contains("last_issues") && st["last_issues"].is_array())
+                for (const auto& e : st["last_issues"]) ds.last_issues.push_back(e.get<std::string>());
+            ds.memory = (st.contains("memory") && st["memory"].is_object()) ? st["memory"]
+                                                                            : ojson::object();
+            ds.current_step = st.value("current_step", std::string());
+            aicad::agent::BuiltContext bc = aicad::agent::build_context(ds, role, pd);
+            return emit(json{{"system", bc.system},
+                             {"body", bc.body},
+                             {"context_chars", bc.context_chars},
+                             {"context_tokens_est", bc.context_tokens_est}},
+                        out_json, 0);
+        }
+        if (m == "agent_run_machine") {
+            // SCRIPTED machine drive: {script:{intake:[...],...}, plan_steps:[...],
+            // budgets?:{}, cancel_after?:int} -> {status, stop_reason, events:[...]}.
+            json script = params.contains("script") ? params["script"] : json::object();
+            json plan_steps_j = params.contains("plan_steps") ? params["plan_steps"] : json::array();
+            json budgets = params.contains("budgets") ? params["budgets"] : json::object();
+            bool has_cancel = params.contains("cancel_after") &&
+                              params["cancel_after"].is_number_integer();
+            int cancel_after = has_cancel ? params["cancel_after"].get<int>() : -1;
+
+            // Per-stage queues of scripted outcomes (popped in call order).
+            auto build_queue = [&](const char* stage) {
+                std::vector<aicad::agent::StageOutcome> q;
+                if (script.contains(stage) && script[stage].is_array())
+                    for (const auto& o : script[stage]) {
+                        aicad::agent::StageOutcome so;
+                        so.verdict = o.value("verdict", std::string("pass"));
+                        so.reason = o.value("reason", std::string());
+                        if (o.contains("error") && !o["error"].is_null()) {
+                            so.has_error = true;
+                            so.error = o["error"].get<std::string>();
+                        }
+                        so.done = o.value("done", false);
+                        so.raw = o.value("raw", std::string());
+                        so.parsed_ok = o.value("parsed_ok", true);
+                        if (o.contains("parse_error") && !o["parse_error"].is_null()) {
+                            so.has_parse_error = true;
+                            so.parse_error = o["parse_error"].get<std::string>();
+                        }
+                        if (o.contains("ops_count") && !o["ops_count"].is_null()) {
+                            so.has_ops_count = true;
+                            so.ops_count = o["ops_count"].get<int>();
+                        }
+                        so.duration_ms = o.value("duration_ms", 0);
+                        so.no_progress = o.value("no_progress", false);
+                        q.push_back(so);
+                    }
+                return q;
+            };
+
+            auto intake_q = std::make_shared<std::vector<aicad::agent::StageOutcome>>(
+                build_queue("intake"));
+            auto plan_q =
+                std::make_shared<std::vector<aicad::agent::StageOutcome>>(build_queue("plan"));
+            auto model_q =
+                std::make_shared<std::vector<aicad::agent::StageOutcome>>(build_queue("model"));
+            auto review_q =
+                std::make_shared<std::vector<aicad::agent::StageOutcome>>(build_queue("review"));
+            auto fix_q =
+                std::make_shared<std::vector<aicad::agent::StageOutcome>>(build_queue("fix"));
+            auto memory_q =
+                std::make_shared<std::vector<aicad::agent::StageOutcome>>(build_queue("memory"));
+
+            // Invocation counter for cancel_after (counts action calls = agent calls).
+            auto invoked = std::make_shared<int>(0);
+
+            auto make_action = [&](std::shared_ptr<std::vector<aicad::agent::StageOutcome>> q) {
+                auto cursor = std::make_shared<size_t>(0);
+                return [q, cursor, invoked](aicad::agent::DesignState& s,
+                                            int) -> aicad::agent::StageOutcome {
+                    (*invoked)++;
+                    aicad::agent::StageOutcome o;
+                    if (*cursor < q->size()) {
+                        o = (*q)[*cursor];
+                        (*cursor)++;
+                    } else if (!q->empty()) {
+                        o = q->back();  // repeat last (defensive; scripts should supply enough)
+                    } else {
+                        o.verdict = "pass";
+                    }
+                    s.last_no_progress = o.no_progress;
+                    return o;
+                };
+            };
+
+            aicad::agent::StageActions actions;
+            actions.intake = make_action(intake_q);
+            actions.plan = make_action(plan_q);
+            actions.model = make_action(model_q);
+            actions.review = make_action(review_q);
+            actions.fix = make_action(fix_q);
+            actions.memory = make_action(memory_q);
+            std::vector<std::string> steps;
+            if (plan_steps_j.is_array())
+                for (const auto& s : plan_steps_j) steps.push_back(s.get<std::string>());
+            actions.plan_steps = [steps](aicad::agent::DesignState&) { return steps; };
+
+            aicad::agent::RunControl control;
+            if (has_cancel) {
+                control.cancelled = [invoked, cancel_after] {
+                    return *invoked >= cancel_after;
+                };
+            }
+
+            // RunEvents to a temp run dir AND capture every emitted event.
+            std::string run_id = "gate-" + std::to_string(std::time(nullptr)) + "-" +
+                                 std::to_string(reinterpret_cast<uintptr_t>(&actions));
+            // Capture wrapper: subclass-free — we read back the jsonl after the run,
+            // but to capture WITHOUT volatile run_id we just collect emitted events.
+            aicad::agent::RunEvents events(run_id);
+            // Drive the machine, then read the persisted events back (the source of
+            // truth; identical to what emit() returned).
+            aicad::agent::DesignState ds;
+            ds.request = params.value("request", std::string("test request"));
+            json result = aicad::agent::run_machine(ds, actions, events, budgets, control);
+
+            // Read back captured events from the jsonl.
+            json captured = json::array();
+            {
+                std::filesystem::path p = events.dir() / "events.jsonl";
+                std::ifstream fh(p, std::ios::binary);
+                std::string line;
+                while (std::getline(fh, line)) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    if (line.empty()) continue;
+                    captured.push_back(json::parse(line));
+                }
+            }
+            result["events"] = captured;
+            return emit(std::move(result), out_json, 0);
         }
         if (m == "sim_fea_static") {
             // Linear-static FEA (engine/sim/fea_static.py parity probe). Params carry an

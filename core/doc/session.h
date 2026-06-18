@@ -121,6 +121,13 @@ nlohmann::json doc_export_step(const std::string& doc_id, const std::string& pat
 nlohmann::json doc_face_points(const std::string& doc_id, const nlohmann::json& selector,
                                int max_n = 400);
 
+// Evaluate — mass properties of the active body (port of engine/doc/evaluate.py::mass_props
+// via engine/worker.py::_eval_mass). body_id is 1-based; <= 0 selects the LAST body. Returns
+// {volume_mm3, mass_g, com[3], inertia[9] (row-major, kg·mm² scaled by density), principal_
+// moments[3], principal_axes[3][3], material{density_g_cm3}}. A surface body returns the
+// {is_surface, area_mm2, ...} report. Throws OpError on no bodies / a bad body_id.
+nlohmann::json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3);
+
 // Export the document's surviving solid bodies to `path` in `fmt` (step/iges/brep/stl)
 // via OCCT. Returns {"path": <abs>}. Throws OpError("export_failed") on no bodies / an
 // unsupported format / a writer failure (engine.doc.formats export_file).

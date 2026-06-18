@@ -1351,6 +1351,14 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 params.contains("max_n") && params["max_n"].is_number()
                                     ? params["max_n"].get<int>() : 400),
                             out_json, 0);
+            if (m == "eval_mass")
+                return emit(aicad::doc::doc_eval_mass(
+                                params.value("doc_id", std::string()),
+                                params.contains("body") && params["body"].is_number()
+                                    ? params["body"].get<int>() : 0,
+                                params.contains("density_g_cm3") && params["density_g_cm3"].is_number()
+                                    ? params["density_g_cm3"].get<double>() : 7.85),
+                            out_json, 0);
             if (m == "export_file")
                 return emit(aicad::doc::doc_export_file(params.value("doc_id", std::string()),
                                                         params.value("path", std::string()),

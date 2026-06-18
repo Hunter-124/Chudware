@@ -39,6 +39,13 @@
 #include <TopoDS_Shape.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
+#include <gp_Mat.hxx>
+#include <GProp_GProps.hxx>
+#include <BRepGProp.hxx>
+#include <TopExp.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
+
+#include <Eigen/Eigenvalues>
 
 #include "doc/document.h"
 #include "doc/formats.h"
@@ -1579,6 +1586,48 @@ std::vector<std::array<double, 3>> sample_face_nodes(const TopoDS_Face& face) {
     return out;
 }
 
+// engine/doc/evaluate.py::_is_surface_shape — true when `shape` has no enclosed volume:
+// an open SHELL / lone FACE / WIRE, or a SOLID/COMPSOLID whose VolumeProperties mass is
+// ≈0 while its SurfaceProperties area is positive (a degenerate sheet). A COMPOUND that
+// wraps any SOLID is NOT a surface. Defaults to the solid path (false) on OCCT errors.
+bool eval_is_surface_shape(const TopoDS_Shape& shape) {
+    try {
+        const TopAbs_ShapeEnum st = shape.ShapeType();
+        if (st == TopAbs_SOLID || st == TopAbs_COMPSOLID) {
+            GProp_GProps vp;
+            BRepGProp::VolumeProperties(shape, vp);
+            GProp_GProps sp;
+            BRepGProp::SurfaceProperties(shape, sp);
+            return std::fabs(vp.Mass()) < 1e-9 && sp.Mass() > 1e-9;
+        }
+        if (st == TopAbs_COMPOUND) {
+            TopTools_IndexedMapOfShape solids;
+            TopExp::MapShapes(shape, TopAbs_SOLID, solids);
+            if (solids.Extent() > 0) return false;
+        }
+        return true;  // FACE / SHELL / WIRE / solid-free compound -> surface report
+    } catch (const Standard_Failure&) {
+        return false;
+    }
+}
+
+// engine/doc/evaluate.py::_surface_props — area report for a surface body (zero
+// volume/mass/inertia; "mass" of a unit-density surface == its area in mm²).
+json eval_surface_props(const TopoDS_Shape& shape, double density_g_cm3) {
+    GProp_GProps sp;
+    BRepGProp::SurfaceProperties(shape, sp);
+    gp_Pnt com = sp.CentreOfMass();
+    return json{
+        {"is_surface", true},
+        {"area_mm2", sp.Mass()},
+        {"volume_mm3", 0.0},
+        {"mass_g", 0.0},
+        {"com", {com.X(), com.Y(), com.Z()}},
+        {"inertia", {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}},
+        {"material", {{"density_g_cm3", density_g_cm3}}},
+    };
+}
+
 }  // namespace
 
 json doc_export_step(const std::string& doc_id, const std::string& path) {
@@ -1667,6 +1716,74 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
     for (const auto& p : pts) points.push_back({p[0], p[1], p[2]});
     const double tol_mm = std::max(0.5, diag * 0.02);
     return json{{"points", points}, {"tol_mm", tol_mm}};
+}
+
+// Port of engine/doc/evaluate.py::mass_props (via engine/worker.py::_eval_mass). Computes
+// volume/mass/centre-of-mass/inertia of the active body, plus principal moments+axes. A
+// surface body (open shell / degenerate solid) returns the _surface_props area report.
+// body_id is 1-based; <= 0 selects the LAST body (the _eval_active_shape default).
+json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    if (r.shapes.empty())
+        throw OpError("invalid_op", "document has no bodies to evaluate", {{"doc_id", doc_id}});
+
+    const TopoDS_Shape* shape = nullptr;
+    if (body_id >= 1) {
+        if (body_id > static_cast<int>(r.shapes.size()))
+            throw OpError("invalid_op", "body_id " + std::to_string(body_id) + " out of range",
+                          {{"reason", "bad body_id"}});
+        shape = &r.shapes[static_cast<std::size_t>(body_id - 1)];
+    } else {
+        shape = &r.shapes.back();
+    }
+
+    const double density_g_mm3 = density_g_cm3 * 1e-3;  // 1 g/cm³ = 1e-3 g/mm³
+
+    if (eval_is_surface_shape(*shape)) return eval_surface_props(*shape, density_g_cm3);
+
+    GProp_GProps props;
+    BRepGProp::VolumeProperties(*shape, props);  // unit density -> Mass() is volume in mm³
+    const double volume_mm3 = props.Mass();
+    const double mass_g = volume_mm3 * density_g_mm3;
+    gp_Pnt com = props.CentreOfMass();
+    const gp_Mat im = props.MatrixOfInertia();  // gp_Mat is 1-based, row-major access
+
+    std::array<double, 9> inertia{};
+    for (int row = 1; row <= 3; ++row)
+        for (int col = 1; col <= 3; ++col)
+            inertia[static_cast<std::size_t>((row - 1) * 3 + (col - 1))] =
+                im.Value(row, col) * density_g_mm3;
+
+    // Principal moments + axes: eigendecomposition of the (symmetric) inertia tensor. Eigen's
+    // SelfAdjointEigenSolver yields ascending eigenvalues + orthonormal eigenvectors as COLUMNS
+    // — matching numpy.linalg.eigh. Symmetrise first to kill fp asymmetry. NOTE: eigenvector
+    // SIGN is library-arbitrary, so principal_axes match the oracle only up to a ± per axis.
+    Eigen::Matrix3d M;
+    for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b) M(a, b) = inertia[static_cast<std::size_t>(a * 3 + b)];
+    M = 0.5 * (M + M.transpose());
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(M);
+    const Eigen::Vector3d evals = es.eigenvalues();
+    const Eigen::Matrix3d evecs = es.eigenvectors();
+
+    json principal_moments = json::array();
+    for (int i = 0; i < 3; ++i) principal_moments.push_back(evals(i));
+    json principal_axes = json::array();  // principal_axes[i] = eigenvector column i
+    for (int i = 0; i < 3; ++i)
+        principal_axes.push_back({evecs(0, i), evecs(1, i), evecs(2, i)});
+
+    return json{
+        {"volume_mm3", volume_mm3},
+        {"mass_g", mass_g},
+        {"com", {com.X(), com.Y(), com.Z()}},
+        {"inertia", {inertia[0], inertia[1], inertia[2], inertia[3], inertia[4], inertia[5],
+                     inertia[6], inertia[7], inertia[8]}},
+        {"principal_moments", principal_moments},
+        {"principal_axes", principal_axes},
+        {"material", {{"density_g_cm3", density_g_cm3}}},
+    };
 }
 
 json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double distance,

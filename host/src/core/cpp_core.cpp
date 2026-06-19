@@ -1,4 +1,5 @@
 // CppCore implementation — see cpp_core.h.
+#include <cstdio>
 #include "cpp_core.h"
 
 #include <cstdlib>
@@ -58,15 +59,34 @@ bool CppCore::ensureLoaded(std::string& err) {
     candidates.push_back(L"libaicad.dll");  // last resort: default search order
 
     HMODULE h = nullptr;
+    std::string loadDiag;
     for (const std::wstring& path : candidates) {
-        // LOAD_WITH_ALTERED_SEARCH_PATH: when given an absolute path, the DLL's own
-        // directory joins the search so its OCCT sibling DLLs (TK*, jemalloc, tbb12)
-        // resolve without staging them next to the host exe.
+        // Resolve the DLL's directory and add it to the PROCESS search path. This is the
+        // crucial bit: LOAD_WITH_ALTERED_SEARCH_PATH adds that directory only for
+        // libaicad's DIRECT imports — it does NOT cover TRANSITIVE deps (a dep loaded by
+        // an OCCT TK*.dll or gmsh-4.15.dll). Those transitive loads use the normal process
+        // search, so an OCCT-internal sibling that lives only in the build dir came back
+        // ERROR_MOD_NOT_FOUND (126) inside the host, even though libaicad itself was found.
+        // SetDllDirectoryW puts the build dir on the process search path, which DOES apply
+        // to the whole dependency chain.
+        size_t slash = path.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) SetDllDirectoryW(path.substr(0, slash).c_str());
         h = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         if (h) break;
+        DWORD gle = GetLastError();
+        // narrow the wide path for the diagnostic
+        std::string p(path.begin(), path.end());
+        loadDiag += "[" + p + " -> Win32 " + std::to_string(gle) + "] ";
     }
+    SetDllDirectoryW(nullptr);  // restore the default search path
     if (!h) {
-        err = "could not load libaicad.dll (set AI_CAD_LIBAICAD or stage it next to the exe)";
+        err = "could not load libaicad.dll: " + loadDiag;
+        if (const char* lp = std::getenv("AI_CAD_LOG_FILE"); lp && lp[0]) {
+            if (FILE* f = std::fopen(lp, "a")) {
+                std::fprintf(f, "[diag] cpp_core load FAILED: %s\n", loadDiag.c_str());
+                std::fclose(f);
+            }
+        }
         return false;
     }
 

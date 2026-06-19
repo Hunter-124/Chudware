@@ -1,0 +1,20 @@
+{
+  "name": "chain3_coincident",
+  "components": [
+    {"id": "k1", "transform": [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1], "fixed": true,  "suppressed": false, "name": "base"},
+    {"id": "k2", "transform": [1,0,0,30, 0,1,0,0, 0,0,1,0, 0,0,0,1], "fixed": false, "suppressed": false, "name": "mid"},
+    {"id": "k3", "transform": [1,0,0,60, 0,1,0,0, 0,0,1,0, 0,0,0,1], "fixed": false, "suppressed": false, "name": "end"}
+  ],
+  "mates": [
+    {"id": "m1", "type": "coincident", "align": "aligned", "suppressed": false,
+     "refs": [{"component": "k1"}, {"component": "k2"}], "value": {"value": 0.0, "expr": null}},
+    {"id": "m2", "type": "coincident", "align": "aligned", "suppressed": false,
+     "refs": [{"component": "k2"}, {"component": "k3"}], "value": {"value": 0.0, "expr": null}}
+  ],
+  "resolved_geometry": [
+    {"mate_id": "m1", "ref_index": 0, "geom": {"kind": "plane", "point": [20,10,10], "normal": [1,0,0],  "direction": [1,0,0], "radius": 0.0}},
+    {"mate_id": "m1", "ref_index": 1, "geom": {"kind": "plane", "point": [0,10,10],  "normal": [-1,0,0], "direction": [1,0,0], "radius": 0.0}},
+    {"mate_id": "m2", "ref_index": 0, "geom": {"kind": "plane", "point": [20,10,10], "normal": [1,0,0],  "direction": [1,0,0], "radius": 0.0}},
+    {"mate_id": "m2", "ref_index": 1, "geom": {"kind": "plane", "point": [0,10,10],  "normal": [-1,0,0], "direction": [1,0,0], "radius": 0.0}}
+  ]
+}

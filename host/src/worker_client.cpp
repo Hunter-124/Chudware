@@ -71,17 +71,16 @@ bool routeDocToCpp(const std::string& method, const json& params) {
         }
     }
     // doc_new / doc_open / import_file (no `into`) MINT a fresh doc -> route to C++ when
-    // the flag is on. C++ PART docs route; ASSEMBLY docs stay on Python for now: the C++
-    // assembly compile (P57b) is parity-clean on the cpp_asm_parity fixtures BUT the asm
-    // scenario (concentric + coincident-anti seating a peg) places it at z=18 vs Python's
-    // z=15 — an un-isolated discrepancy (not the align key/normal — likely component
-    // local-frame loading or the coincident plane-point). Keep assemblies Python until
-    // that is fixed + gated, then re-enable here.  TODO(asm-seat): re-add "assembly".
+    // the flag is on. C++ now handles PART and ASSEMBLY documents (P57b compile + P57d
+    // resolve_pick assembly branch + P57e primitive cut/merge — the asm scenario now seats
+    // its peg at z=15, matching Python; cpp_asm_parity 10/10 incl. the host pick->mate->seat
+    // path). A doc_open of a non-part/asm container is detected by the core (code
+    // "unsupported") and falls back below.
     if (!cppDocsFlag()) return false;
     if (method == "doc_new") {
         const std::string kind = params.is_object() ? params.value("kind", std::string("part"))
                                                      : std::string("part");
-        return kind.empty() || kind == "part";
+        return kind.empty() || kind == "part" || kind == "assembly";
     }
     if (method == "doc_open") return true;  // core rejects non-parts -> host falls back
     if (isMintingMethod(method, params)) return true;  // import_file minting a new doc

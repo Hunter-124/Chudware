@@ -49,6 +49,12 @@ bool isMintingMethod(const std::string& method, const json& params) {
 }
 bool routeDocToCpp(const std::string& method, const json& params) {
     if (method == "doc_compile_cpp" || method == "doc_validate") return false;  // diagnostics
+    // Agent RPCs are owned by the AGENT seam (routeAgentToCpp), which translates the host
+    // names (agent_run_v2 -> agent_run, get_prompts_v2 -> agent_get_prompts_v2). They also
+    // carry the active doc's doc_id, so without this guard the doc seam below would greedily
+    // claim them by the doc-cpp prefix and call the C++ core with the UNtranslated name ->
+    // "unknown method: agent_run_v2". Never route agent_* / get_prompts_v2 here.
+    if (method.rfind("agent_", 0) == 0 || method == "get_prompts_v2") return false;
     // A C++-backed doc carries a doc-cpp id -> EVERY call operating on it routes to the
     // C++ core for that doc's whole lifetime (even if the flag was since toggled off).
     // This is NOT limited to doc_* — config_* / weld_* / export_* / etc. all carry the
@@ -90,11 +96,14 @@ bool routeDocToCpp(const std::string& method, const json& params) {
 bool cppAgentFlag() {
     const char* f = std::getenv("AI_CAD_CPP_AGENT");
     if (f && f[0]) return f[0] != '0';  // explicit override (1=on, 0=force Python)
-    // DEFAULT OFF (2026-06-18): the C++ agent drives a C++-backed (doc-cpp) doc session, but
-    // documents default to the Python engine now (see cppDocsFlag — C++ doc engine lacks sketch
-    // mode + evaluate). The agent must run on the SAME engine as the doc it edits, so it stays
-    // Python until the doc engine is the C++ default again. Only routes to C++ for doc-cpp docs.
-    return false;
+    // DEFAULT = FOLLOW THE DOC ENGINE. The agent drives the SAME doc session it edits, so it
+    // MUST run on the same engine as the doc (C++ agent <-> doc-cpp; Python agent <-> Python
+    // doc). Coupling the default to cppDocsFlag() makes the two impossible to mismatch: with
+    // AI_CAD_CPP_DOCS=1 the agent also routes to C++ (so agent_run_v2 on a doc-cpp doc is
+    // caught+translated by the agent seam, not mis-claimed by the doc seam); with docs on
+    // Python (the current default) the agent stays Python. An explicit AI_CAD_CPP_AGENT still
+    // overrides. (routeAgentToCpp additionally gates on the active doc actually being doc-cpp.)
+    return cppDocsFlag();
 }
 
 // Is the active document a C++-backed ("doc-cpp") session? For agent_run_v2 /

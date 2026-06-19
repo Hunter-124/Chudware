@@ -223,13 +223,15 @@ def two_fixed_floating_middle():
 
 def build_all():
     out = []
-    for n in (3, 4, 5, 6):
+    # long coincident chains stress the solve_pos lstsq robustness fix hardest:
+    # more coupling => more ill-conditioned normal matrix near convergence.
+    for n in (3, 4, 5, 6, 8, 10):
         out.append(chain_coincident(n))
     for n in (3, 4, 5):
         out.append(chain_distance(n))
     for n in (3, 4, 5):
         out.append(star_coincident(n))
-    for n in (3, 4):
+    for n in (3, 4, 6):  # concentric chains carry a free rotational DOF per pair
         out.append(concentric_chain(n))
     out.append(loop_coincident_3())
     out.append(mixed_chain())

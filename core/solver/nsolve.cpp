@@ -33,19 +33,53 @@ double max_abs(const Eigen::VectorXd& v) {
     return v.size() ? v.cwiseAbs().maxCoeff() : 0.0;
 }
 
-// Minimum-norm least-squares solve of A x = b (the scipy lstsq fallback).
+// Minimum-norm least-squares solve of A x = b (the numpy.linalg.lstsq fallback the
+// oracle uses). numpy's lstsq with rcond=None uses an SVD with a singular-value cutoff
+// of eps * max(M, N) * sigma_max and drops the null-space (minimum-norm) solution; we
+// mirror that exactly with a JacobiSVD so the C++ fallback step matches the oracle's.
 Eigen::VectorXd lstsq(const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
-    return A.completeOrthogonalDecomposition().solve(b);
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd(A, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    const Eigen::VectorXd& s = svd.singularValues();
+    double smax = s.size() ? s(0) : 0.0;
+    double cutoff = 2.220446049250313e-16 *
+                    static_cast<double>(std::max(A.rows(), A.cols())) * smax;
+    Eigen::VectorXd utb = svd.matrixU().transpose() * b;
+    Eigen::VectorXd z(s.size());
+    for (Eigen::Index i = 0; i < s.size(); ++i)
+        z(i) = (s(i) > cutoff) ? (utb(i) / s(i)) : 0.0;
+    return svd.matrixV() * z;
 }
 
-// Solve A x = b assuming A is (near) SPD; fall back to least squares if the
-// Cholesky factor is not usable or yields a non-finite result. Mirrors scipy's
-// solve(assume_a="pos") -> lstsq fallback.
+// Solve A x = b assuming A is (near) SPD; fall back to a minimum-norm least-squares
+// step if the Cholesky factor is not usable, yields a non-finite result, OR the matrix
+// is ill-conditioned. This mirrors scipy's solve(assume_a="pos"), which raises a
+// LinAlgWarning when the LAPACK reciprocal condition number rcond < machine epsilon;
+// the Python oracle catches that warning and takes np.linalg.lstsq (minimum-norm)
+// instead. Without the rcond gate the C++ LLT silently returns a numerically-valid but
+// poor step on rank-deficient normal matrices (e.g. a coupled rotational mate chain),
+// driving the solve to a different — non-converged — minimum than the oracle.
 Eigen::VectorXd solve_pos(const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
+    constexpr double kEps = 2.220446049250313e-16;  // np.finfo(float64).eps
     Eigen::LLT<Eigen::MatrixXd> llt(A);
     if (llt.info() == Eigen::Success) {
-        Eigen::VectorXd x = llt.solve(b);
-        if (x.allFinite()) return x;
+        // Reciprocal condition estimate from the Cholesky factor's diagonal: for A = L Lᵀ
+        // the 2-norm condition number is bounded below by (max d / min d)² where d are the
+        // diagonal entries of L, so rcond ≈ (min d / max d)². Eigen's own LLT::rcond() is a
+        // 1-norm estimate that overestimates for these rank-deficient mate normal matrices,
+        // so this diagonal ratio is the reliable gate. (scipy's POSV path raises a
+        // LinAlgWarning — caught → lstsq — when its LAPACK rcond < eps.)
+        const auto& L = llt.matrixLLT();
+        double dmin = std::numeric_limits<double>::infinity(), dmax = 0.0;
+        for (Eigen::Index i = 0; i < L.rows(); ++i) {
+            double d = std::abs(L(i, i));
+            dmin = std::min(dmin, d);
+            dmax = std::max(dmax, d);
+        }
+        double rcond = (dmax > 0.0) ? (dmin / dmax) * (dmin / dmax) : 0.0;
+        if (rcond >= kEps) {
+            Eigen::VectorXd x = llt.solve(b);
+            if (x.allFinite()) return x;
+        }
     }
     return lstsq(A, b);
 }

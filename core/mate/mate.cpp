@@ -3,10 +3,13 @@
 // for the coverage scope. OCCT-free: only solver/Eigen/json.
 #include "mate/mate.h"
 
+#include "sim/numpy_rng.h"
 #include "solver/nsolve.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <random>
@@ -1346,8 +1349,13 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         bool any_free = false;
         for (auto& kv : frames) if (!kv.second.fixed) any_free = true;
         if (!res_converged && !drag_opt && !time_budget_ms && any_free) {
-            std::mt19937_64 rng(12345);
-            std::normal_distribution<double> nd(0.0, 0.6);
+            // Antipodal-start escape (port of mate_solver.py): perturb the rotational DOF and
+            // re-solve. The oracle draws perturbations from numpy's default_rng(12345).normal(
+            // scale=0.6); to land on the SAME random restarts (and so the SAME basin) we must
+            // reproduce that stream bit-for-bit — std::mt19937_64 is a DIFFERENT generator and
+            // probes different points, so a coupled rotational chain that the oracle rescues
+            // here would otherwise stall. aicad::sim::NumpyGenerator is the validated clone.
+            aicad::sim::NumpyGenerator rng(12345);
             VectorXd x0_base = system.init_vector();
             std::vector<int> w_indices;
             for (auto& cid : frame_order) {
@@ -1358,7 +1366,8 @@ MateSolveResult solve_mates(const json& components, const json& mates,
             auto best = res;
             for (int iter = 0; iter < 6; ++iter) {
                 VectorXd x0 = x0_base;
-                for (int wi : w_indices) x0(wi) += nd(rng);
+                // numpy rng.normal(scale=0.6, size=N) = standard_normal() * 0.6, filled in order.
+                for (int wi : w_indices) x0(wi) += 0.6 * rng.standard_normal();
                 auto r2 = system.solve(x0, tol, max_iter);
                 if (r2.max_residual < best.max_residual) best = r2;
                 if (best.converged) break;

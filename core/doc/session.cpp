@@ -3180,27 +3180,20 @@ json doc_eval_symmetry(const std::string& doc_id, int body_id, const json& plane
     }
 }
 
-// engine/doc/evaluate.py::interference via worker.py::_eval_interference (part doc branch:
-// members = every surviving body). Pairwise overlap (BRepAlgoAPI_Common volume) +
-// clearance (BRepExtrema min distance), per-part bbox. ok iff nothing interferes.
-// Body names mirror the Python oracle's body_id "b1".."bN" (first-produced = AICM order).
-json doc_eval_interference(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
-    Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
-
-    const std::size_t n = r.shapes.size();
-    std::vector<std::string> names(n);
-    for (std::size_t i = 0; i < n; ++i) names[i] = "b" + std::to_string(i + 1);
-
+// Pairwise interference report over a list of named (name, shape) members — the shared core
+// of engine/doc/evaluate.py::interference (kernel.py::_fit_report). Pairwise overlap
+// (BRepAlgoAPI_Common volume) + clearance (BRepExtrema min distance), per-part bbox.
+// ok iff nothing interferes.
+json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>& members) {
+    const std::size_t n = members.size();
     constexpr double INTERFERENCE_EPS = 1e-3;
 
     // Per-part bbox + volume (kernel.py::_bbox_dict uses build123d bounding_box() ->
     // BRepBndLib::AddOptimal, the precise box, after BRepTools::Clean).
     json parts = json::array();
     for (std::size_t i = 0; i < n; ++i) {
-        const TopoDS_Shape& shp = r.shapes[i];
-        json part = {{"name", names[i]}, {"volume", eval_vol_or_zero(shp)}};
+        const TopoDS_Shape& shp = members[i].second;
+        json part = {{"name", members[i].first}, {"volume", eval_vol_or_zero(shp)}};
         try {
             BRepTools::Clean(shp);
             Bnd_Box box;
@@ -3223,12 +3216,14 @@ json doc_eval_interference(const std::string& doc_id) {
     json interferences = json::array();
     json clearances = json::array();
     for (std::size_t i = 0; i < n; ++i) {
+        const std::string& name_i = members[i].first;
         for (std::size_t j = i + 1; j < n; ++j) {
+            const std::string& name_j = members[j].first;
             // overlap volume (None on boolean failure -> Python warns + continue).
             bool ov_ok = false;
             double ov = 0.0;
             try {
-                BRepAlgoAPI_Common common(r.shapes[i], r.shapes[j]);
+                BRepAlgoAPI_Common common(members[i].second, members[j].second);
                 common.Build();
                 if (common.IsDone()) {
                     ov = eval_vol_or_zero(common.Shape());
@@ -3238,13 +3233,13 @@ json doc_eval_interference(const std::string& doc_id) {
             }
             if (!ov_ok) continue;  // matches the warnings-sink "interference check failed" path
             if (ov > INTERFERENCE_EPS) {
-                interferences.push_back(json{{"a", names[i]}, {"b", names[j]}, {"volume", ov}});
+                interferences.push_back(json{{"a", name_i}, {"b", name_j}, {"volume", ov}});
             } else {
                 try {
-                    BRepExtrema_DistShapeShape dss(r.shapes[i], r.shapes[j]);
+                    BRepExtrema_DistShapeShape dss(members[i].second, members[j].second);
                     if (dss.IsDone())
                         clearances.push_back(
-                            json{{"a", names[i]}, {"b", names[j]}, {"distance", dss.Value()}});
+                            json{{"a", name_i}, {"b", name_j}, {"distance", dss.Value()}});
                 } catch (const Standard_Failure&) {
                 }
             }
@@ -3285,6 +3280,34 @@ json doc_eval_interference(const std::string& doc_id) {
         {"interferences", interferences},
         {"clearances", clearances},
     };
+}
+
+// engine/doc/evaluate.py::interference via worker.py::_eval_interference.
+//   part doc      -> members = every surviving body, names "b1".."bN" (AICM order).
+//   assembly doc  -> members = WORLD-placed component bodies, names = component names (port of
+//                    session.py::asm_world_bodies, explode=False). This mirrors the oracle's
+//                    s.is_assembly branch — without it an assembly always reported "no interference"
+//                    because compile_document(asm).shapes is empty.
+json doc_eval_interference(const std::string& doc_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+
+    std::vector<std::pair<std::string, TopoDS_Shape>> members;
+    if (s.is_assembly()) {
+        if (!s.asm_result) rebuild_assembly(s);
+        const AssemblyResult* ares = s.asm_result.get();
+        if (ares)
+            for (const AsmBodyOut& body : ares->bodies) {
+                // interference measures the REAL assembly: no explode offset (explode=False).
+                TopoDS_Shape world = placed_world_shape(body, std::nullopt);
+                members.emplace_back(body.name, world);
+            }
+    } else {
+        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        for (std::size_t i = 0; i < r.shapes.size(); ++i)
+            members.emplace_back("b" + std::to_string(i + 1), r.shapes[i]);
+    }
+    return interference_report(members);
 }
 
 // engine/doc/evaluate.py::measure via worker.py::_eval_measure. Resolve 1-2 refs against

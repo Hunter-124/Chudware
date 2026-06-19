@@ -674,7 +674,12 @@ endif()
 # Standalone, OCCT-free: rigid-component placement over the shared solver core
 # (aicad_solver) + Eigen + json. Mirrors the sketch lib/cli/diff-harness shape.
 add_library(aicad_mate STATIC
-  mate/mate.cpp)
+  mate/mate.cpp
+  # numpy_rng.cpp is a standalone (stdlib-only) bit-exact clone of numpy's
+  # default_rng().standard_normal(); the antipodal-escape restart in mate.cpp draws from it
+  # so the C++ random restarts land on the SAME points as the Python oracle. Compiled in
+  # directly (not via aicad_sim) to keep aicad_mate OCCT-/sim-free.
+  sim/numpy_rng.cpp)
 target_include_directories(aicad_mate PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_mate PUBLIC aicad_solver Eigen3::Eigen nlohmann_json::nlohmann_json)
 

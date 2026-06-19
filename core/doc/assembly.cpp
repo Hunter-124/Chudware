@@ -7,7 +7,9 @@
 
 #include "doc/assembly.h"
 
+#define _USE_MATH_DEFINES
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <filesystem>
 #include <map>
@@ -327,6 +329,176 @@ gp_Trsf trsf_from_xform16(const std::vector<double>& m) {
     return t;
 }
 
+// ---------------------------------------------------------------- component patterns
+//
+// Assembly component patterns (asm_linear_pattern / asm_circular_pattern) replicate one or more
+// SEED components (already placed by the mate solve) along a direction (linear) or about an axis
+// (circular), in the assembly WORLD frame. Each instance is a clone of the seed's local shape with
+// an extra world-frame placement PRE-multiplied onto the seed's solved transform. (Port of
+// assembly.py::_compile_component_patterns.)
+//
+// Instances are NOT components: no entry in doc["components"], no part in the mate solve, excluded
+// from interference / BOM. They carry synthetic body_id / component_id values that cannot collide
+// with real component ordinals (body_id >= kPatternBodyBase; component_id = "<seed>#<k>").
+
+constexpr int kPatternBodyBase = 1000000;
+
+// Read a feature param that is a {value, expr} dim or a bare number; fall back to default.
+double feat_dim(const json& params, const std::string& key, double def) {
+    if (!params.is_object() || !params.contains(key)) return def;
+    const json& v = params[key];
+    if (v.is_object()) {
+        if (v.contains("value") && v["value"].is_number()) return v["value"].get<double>();
+        return def;
+    }
+    if (v.is_number()) return v.get<double>();
+    return def;
+}
+
+// Resolve a direction/axis ref to a unit WORLD vector (datum/world-axis strings, v1).
+// Returns false on an unsupported / degenerate ref.
+bool world_axis_from_ref(const json& ref, Eigen::Vector3d& out) {
+    Eigen::Vector3d v(0, 0, 0);
+    if (ref.is_array() && ref.size() == 3 && ref[0].is_number() && ref[1].is_number() &&
+        ref[2].is_number()) {
+        v = Eigen::Vector3d(ref[0].get<double>(), ref[1].get<double>(), ref[2].get<double>());
+    } else if (ref.is_string()) {
+        std::string s = lower(ref.get<std::string>());
+        // trim
+        while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+        while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+        if (s == "axis.x" || s == "x") v = Eigen::Vector3d(1, 0, 0);
+        else if (s == "axis.y" || s == "y") v = Eigen::Vector3d(0, 1, 0);
+        else if (s == "axis.z" || s == "z") v = Eigen::Vector3d(0, 0, 1);
+        // Datum-plane normals (Z-up: front=XZ→+Y, top=XY→+Z, right=YZ→+X).
+        else if (s == "plane.front" || s == "front") v = Eigen::Vector3d(0, 1, 0);
+        else if (s == "plane.top" || s == "top") v = Eigen::Vector3d(0, 0, 1);
+        else if (s == "plane.right" || s == "right") v = Eigen::Vector3d(1, 0, 0);
+        else return false;
+    } else {
+        return false;
+    }
+    double n = v.norm();
+    if (n < 1e-9) return false;
+    out = v / n;
+    return true;
+}
+
+// 4x4 (row-major) <-> Eigen::Matrix4d helpers.
+Eigen::Matrix4d mat_from_xform16(const std::vector<double>& m) {
+    Eigen::Matrix4d M = Eigen::Matrix4d::Identity();
+    if (m.size() == 16)
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j) M(i, j) = m[i * 4 + j];
+    return M;
+}
+
+std::vector<double> xform16_from_mat(const Eigen::Matrix4d& M) {
+    std::vector<double> out(16);
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) out[i * 4 + j] = M(i, j);
+    return out;
+}
+
+Eigen::Matrix4d translate16(const Eigen::Vector3d& vec) {
+    Eigen::Matrix4d M = Eigen::Matrix4d::Identity();
+    M(0, 3) = vec[0];
+    M(1, 3) = vec[1];
+    M(2, 3) = vec[2];
+    return M;
+}
+
+// 4x4 matrix rotating by angle_deg about the WORLD line (axis_pt, axis_dir) — Rodrigues.
+Eigen::Matrix4d rotation16_about_axis(const Eigen::Vector3d& axis_pt,
+                                      const Eigen::Vector3d& axis_dir, double angle_deg) {
+    double an = axis_dir.norm();
+    Eigen::Vector3d a = an > 1e-12 ? (axis_dir / an) : Eigen::Vector3d(0, 0, 1);
+    double th = angle_deg * 3.14159265358979323846 / 180.0;
+    double c = std::cos(th), s = std::sin(th);
+    double x = a[0], y = a[1], z = a[2];
+    Eigen::Matrix3d Rm;
+    Rm << c + x * x * (1 - c),     x * y * (1 - c) - z * s, x * z * (1 - c) + y * s,
+          y * x * (1 - c) + z * s, c + y * y * (1 - c),     y * z * (1 - c) - x * s,
+          z * x * (1 - c) - y * s, z * y * (1 - c) + x * s, c + z * z * (1 - c);
+    Eigen::Matrix4d M = Eigen::Matrix4d::Identity();
+    M.block<3, 3>(0, 0) = Rm;
+    M.block<3, 1>(0, 3) = axis_pt - Rm * axis_pt;
+    return M;
+}
+
+// Expand asm_linear_pattern / asm_circular_pattern features into synthetic instance bodies.
+// `placed` is the solved component bodies; returns ONLY the new instance bodies. Patterns with a
+// dangling direction/axis or unknown seeds are silently skipped (matches the oracle).
+std::vector<AsmBodyOut> compile_component_patterns(const json& doc,
+                                                   const std::vector<AsmBodyOut>& placed) {
+    std::map<std::string, const AsmBodyOut*> by_cid;
+    for (const AsmBodyOut& b : placed) by_cid[b.component_id] = &b;
+
+    std::vector<AsmBodyOut> instances;
+    if (!doc.contains("features") || !doc["features"].is_array()) return instances;
+    int body_id = kPatternBodyBase;
+
+    for (const json& feat : doc["features"]) {
+        if (!feat.is_object() || feat.value("suppressed", false)) continue;
+        const std::string ftype = feat.value("type", std::string());
+        if (ftype != "asm_linear_pattern" && ftype != "asm_circular_pattern") continue;
+        const json refs = feat.contains("refs") && feat["refs"].is_object() ? feat["refs"]
+                                                                            : json::object();
+        const json params = feat.contains("params") && feat["params"].is_object() ? feat["params"]
+                                                                                  : json::object();
+        std::vector<std::string> seed_cids;
+        if (refs.contains("components") && refs["components"].is_array())
+            for (const json& c : refs["components"]) {
+                if (!c.is_string()) continue;
+                const std::string cid = c.get<std::string>();
+                if (by_cid.count(cid)) seed_cids.push_back(cid);
+            }
+        if (seed_cids.empty()) continue;
+
+        // Build the additional instance transforms (k = 1..count-1; instance 0 = the seed).
+        std::vector<Eigen::Matrix4d> offsets;
+        if (ftype == "asm_linear_pattern") {
+            int count1 = std::max(1, static_cast<int>(std::lround(feat_dim(params, "count1", 2))));
+            double spacing1 = feat_dim(params, "spacing1", 10.0);
+            Eigen::Vector3d d1;
+            if (!world_axis_from_ref(refs.contains("dir1") ? refs["dir1"] : json(nullptr), d1) ||
+                count1 < 2)
+                continue;
+            for (int k = 1; k < count1; ++k) offsets.push_back(translate16(d1 * (spacing1 * k)));
+        } else {  // asm_circular_pattern
+            int count = std::max(1, static_cast<int>(std::lround(feat_dim(params, "count", 4))));
+            double angle_total = feat_dim(params, "angle", 360.0);
+            bool equal = params.value("equal_spacing", true);
+            Eigen::Vector3d ax;
+            if (!world_axis_from_ref(refs.contains("axis") ? refs["axis"] : json(nullptr), ax) ||
+                count < 2)
+                continue;
+            double step = equal ? (angle_total / count) : angle_total;
+            for (int k = 1; k < count; ++k)
+                offsets.push_back(rotation16_about_axis(Eigen::Vector3d::Zero(), ax, step * k));
+        }
+
+        for (const std::string& seed_cid : seed_cids) {
+            const AsmBodyOut* seed = by_cid[seed_cid];
+            Eigen::Matrix4d seed_mat = mat_from_xform16(seed->transform);
+            int k = 0;
+            for (const Eigen::Matrix4d& off : offsets) {
+                ++k;
+                Eigen::Matrix4d inst_mat = off * seed_mat;
+                AsmBodyOut inst;
+                inst.body_id = body_id++;
+                inst.component_id = seed_cid + "#" + std::to_string(k);
+                inst.name = seed->name + "#" + std::to_string(k);
+                inst.shape_local = seed->shape_local;
+                inst.transform = xform16_from_mat(inst_mat);
+                inst.color = seed->color;
+                instances.push_back(std::move(inst));
+            }
+        }
+    }
+    return instances;
+}
+
 }  // namespace
 
 void clear_component_cache() {
@@ -437,6 +609,16 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
         body.transform = xform;
         body.color = component_color(ordinal - 1);
         res.bodies.push_back(std::move(body));
+    }
+
+    // --- component patterns ---------------------------------------------
+    // Expand asm_linear_pattern / asm_circular_pattern into synthetic instance bodies (NOT
+    // components: excluded from the mate solve + interference/BOM). A bad pattern must never
+    // sink the whole assembly rebuild.
+    try {
+        std::vector<AsmBodyOut> instances = compile_component_patterns(doc, res.bodies);
+        for (AsmBodyOut& inst : instances) res.bodies.push_back(std::move(inst));
+    } catch (...) {
     }
 
     // mate status (merge dangling)

@@ -10,8 +10,8 @@ Rules:
 - Order matters: base shape first, then cuts/holes, then dress (fillet/chamfer), then patterns.
 - Put concrete numbers in params (length/width/height/radius/depth/spacing). Honor every number the user gave.
 - A simple centered block is ONE step (box). A round part centered on the Z axis is ONE step (cylinder). Do not over-split.
-- PLACEMENT RULE: box and cylinder are ALWAYS centered on the origin and cannot be moved or counted. Anything that is off-center, has a custom profile (L/T/U shape), or repeats at several positions (a bolt pattern) MUST be a `sketch` step (entities at their [x,y]) followed by an `extrude` step (mode "boss" to add, "cut" to remove). Sketch entities are circle/line/arc only - a rectangle is 4 lines, a round hole is a circle.
-- HOLES: a hole/bore on the Z axis (a central or concentric round hole) = ONE `cylinder` step with `"mode":"cut"`, made longer than the part so it passes through. Off-center or multiple holes = `sketch` circles + `extrude` cut (the PLACEMENT RULE). There is no `hole` step type - never emit one.
+- PLACEMENT RULE: box and cylinder are centered on the origin UNLESS you give them an `at`:[x,y,z] param (the center point - a plain editable value). Use `at` to put a boss/step/hole off to one side. A custom profile (L/T/U shape) or a dense grid of holes is still cleaner as a `sketch` step (entities at their [x,y]) + an `extrude` step (mode "boss"/"cut"); sketch entities are circle/line/arc only (a rectangle is 4 lines).
+- HOLES: a central/concentric bore = ONE `cylinder` step, "mode":"cut", height > the part. An OFF-CENTER hole = a `cylinder` cut with `at`:[x,y,0] at the hole center. A FEW holes = one cylinder-cut step per hole (each gets its own `at`). MANY/grid holes = `sketch` circles + `extrude` cut. There is no `hole` step type.
 
 Example - "60x40x10 plate, fillet the 4 vertical edges r=5, four M3 holes near the corners":
 ```json

@@ -1726,8 +1726,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
 
             } else if (type == "box" || type == "cylinder" || type == "sphere" ||
                        type == "cone" || type == "torus") {
-                // Base primitives, centered on the origin (the SolidWorks/Python
-                // default; the `at` placement datum is deferred). Port of
+                // Base primitives, centered on the origin by default. An optional `at`
+                // [x,y,z] param MOVES the primitive so a boss/cut/hole can sit off-origin
+                // (e.g. a cylinder cut at a corner = an off-center hole) — see the
+                // placement block after the solid is built. Port of
                 // engine/doc/features/primitives.py.
                 TopoDS_Shape solid;
                 if (type == "box") {
@@ -1749,6 +1751,43 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 }
                 if (solid.IsNull())
                     throw std::runtime_error(type + " produced an empty solid");
+
+                // PLACEMENT: an `at` [x,y,z] point translates the centered primitive so a
+                // boss/cut/hole can sit off-origin. It stays a NORMAL, auditable feature —
+                // `at` and `centered` are plain editable params (shown in the tree,
+                // patchable via edit_feature); there is no hidden/baked transform. With
+                // `centered:false` the primitive's natural base/corner sits at `at`
+                // (SolidWorks convention): box corner, cylinder/cone base center; sphere/
+                // torus have no corner so they stay centered on `at`.
+                {
+                    Eigen::Vector3d at(0, 0, 0);
+                    bool placed = false;
+                    auto at_it = feat.find("at");
+                    if (at_it != feat.end() && at_it->is_array() && at_it->size() >= 3 &&
+                        (*at_it)[0].is_number()) {
+                        at = Eigen::Vector3d((*at_it)[0].get<double>(),
+                                             (*at_it)[1].get<double>(),
+                                             (*at_it)[2].get<double>());
+                        placed = true;
+                    }
+                    if (!feat.value("centered", true)) {
+                        Bnd_Box bb;
+                        BRepBndLib::Add(solid, bb);
+                        if (!bb.IsVoid()) {
+                            double xmn, ymn, zmn, xmx, ymx, zmx;
+                            bb.Get(xmn, ymn, zmn, xmx, ymx, zmx);
+                            if (type == "box") {
+                                at.x() += (xmx - xmn) / 2.0;
+                                at.y() += (ymx - ymn) / 2.0;
+                                at.z() += (zmx - zmn) / 2.0;
+                            } else if (type == "cylinder" || type == "cone") {
+                                at.z() += (zmx - zmn) / 2.0;
+                            }
+                            placed = true;
+                        }
+                    }
+                    if (placed) solid = ::geom::translate_copy(solid, at);
+                }
 
                 // Apply boss/cut/merge against the running body, matching
                 // engine/doc/features/primitives.py::_apply_boolean: a FIRST primitive (no

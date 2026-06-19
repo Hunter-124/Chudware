@@ -1302,6 +1302,10 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 return emit(aicad::doc::doc_revert(params.value("doc_id", std::string()),
                                                    params.value("checkpoint", std::string())),
                             out_json, 0);
+            if (m == "doc_refresh_derived")
+                return emit(aicad::doc::doc_refresh_derived(params.value("doc_id", std::string()),
+                                                            params.value("id", std::string())),
+                            out_json, 0);
             if (m == "config_list")
                 return emit(aicad::doc::doc_config_list(params.value("doc_id", std::string())),
                             out_json, 0);

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <cmath>
+#include <functional>
 #include <iomanip>
 #include <optional>
 #include <sstream>
@@ -1221,6 +1222,676 @@ void op_asm_set_explode(json& doc, const json& op, std::size_t idx) {
     doc["explode"] = op["steps"];
 }
 
+// =========================================================================== copy/paste + derived
+// C++ port of the copy/paste-as-derived subsystem (engine/doc/ops.py Wave 4A/4C +
+// engine/doc/session.py refresh_derived). copy_feature packages a feature (+ its full
+// reference closure) into a portable "aicad.feature_bundle/1" bundle (read-only, via the
+// id_map side-channel). paste_feature re-ids the bundle and appends it (refs re-linked to
+// the target doc). paste_feature_as_derived additionally stamps a derived_from link on each
+// pasted feature so a later doc_refresh_derived can re-pull the live source definition.
+// Everything here mirrors the oracle byte-for-byte so the differential parity harness matches.
+
+std::atomic<unsigned long long> g_group_seq{1};
+std::string new_group_id() {
+    unsigned long long n = g_group_seq.fetch_add(1);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "dg-%010llx", n);
+    return std::string(buf);
+}
+
+bool is_reserved_datum(const std::string& s) {
+    static const std::set<std::string> R = {
+        "origin", "plane.front", "plane.top", "plane.right", "axis.x", "axis.y", "axis.z"};
+    return R.count(s) > 0;
+}
+bool is_feature_id_token(const std::string& s) {
+    static const std::regex re("^f[0-9]+$");
+    return std::regex_match(s, re);
+}
+
+// const feature finder (build_feature_bundle / closure read a const source doc).
+const json* find_feature_c(const json& doc, const std::string& id) {
+    if (doc.contains("features") && doc["features"].is_array())
+        for (const json& f : doc["features"])
+            if (f.is_object() && f.value("id", std::string()) == id) return &f;
+    return nullptr;
+}
+
+// ops.py::_walk_selector_owners — collect every owner_feature / datum.feature / region.sketch.
+void walk_selector_owners(const json& obj, std::set<std::string>& out) {
+    if (obj.is_object()) {
+        const std::string kind = obj.value("kind", std::string());
+        if (kind == "face" || kind == "edge" || kind == "vertex" || kind == "body") {
+            if (obj.contains("owner_feature") && obj["owner_feature"].is_string())
+                out.insert(obj["owner_feature"].get<std::string>());
+        } else if (kind == "datum") {
+            if (obj.contains("feature") && obj["feature"].is_string())
+                out.insert(obj["feature"].get<std::string>());
+        } else if (kind == "region") {
+            if (obj.contains("sketch") && obj["sketch"].is_string())
+                out.insert(obj["sketch"].get<std::string>());
+        }
+        for (auto it = obj.begin(); it != obj.end(); ++it) walk_selector_owners(it.value(), out);
+    } else if (obj.is_array()) {
+        for (const json& v : obj) walk_selector_owners(v, out);
+    }
+}
+
+// ops.py::_feature_refs_closure — dependency-first order of the transitive ref closure.
+std::pair<std::vector<std::string>, std::set<std::string>>
+feature_refs_closure(const json& doc, const std::string& root_fid) {
+    std::set<std::string> in_closure;
+    std::function<std::set<std::string>(const std::string&)> direct_refs =
+        [&](const std::string& fid) -> std::set<std::string> {
+        std::set<std::string> out;
+        const json* feat = find_feature_c(doc, fid);
+        if (!feat) return out;
+        const json refs = feat->contains("refs") ? (*feat)["refs"] : json::object();
+        walk_selector_owners(refs, out);
+        if (refs.is_object())
+            for (auto it = refs.begin(); it != refs.end(); ++it) {
+                const json& v = it.value();
+                if (v.is_array()) {
+                    for (const json& x : v)
+                        if (x.is_string()) out.insert(x.get<std::string>());
+                } else if (v.is_string()) {
+                    out.insert(v.get<std::string>());
+                }
+            }
+        std::set<std::string> filtered;
+        for (const std::string& r : out)
+            if (!is_reserved_datum(r) && find_feature_c(doc, r) != nullptr) filtered.insert(r);
+        return filtered;
+    };
+    std::function<void(const std::string&)> visit = [&](const std::string& fid) {
+        if (in_closure.count(fid)) return;
+        in_closure.insert(fid);
+        for (const std::string& dep : direct_refs(fid)) visit(dep);
+    };
+    visit(root_fid);
+    std::vector<std::string> order;
+    if (doc.contains("features") && doc["features"].is_array())
+        for (const json& f : doc["features"]) {
+            const std::string id = f.value("id", std::string());
+            if (in_closure.count(id)) order.push_back(id);
+        }
+    return {order, in_closure};
+}
+
+// ops.py::_remap_handle — rewrite the base of a sketch handle through eid_map.
+json remap_handle(const json& handle, const std::map<std::string, std::string>& eid_map) {
+    if (handle.is_string()) {
+        const std::string h = handle.get<std::string>();
+        const auto dot = h.find('.');
+        const std::string base = (dot == std::string::npos) ? h : h.substr(0, dot);
+        auto it = eid_map.find(base);
+        if (it != eid_map.end())
+            return json(it->second + (dot == std::string::npos ? std::string() : h.substr(dot)));
+    }
+    return handle;
+}
+
+// ops.py::_stamp_bundle_refs — in-closure ids -> placeholders; out-of-closure feature ids
+// recorded in external_refs (left raw).
+json stamp_bundle_refs(const json& refs, const std::map<std::string, std::string>& fid_to_ph,
+                       std::set<std::string>& external_refs) {
+    auto remap_fid = [&](const std::string& fid) -> std::string {
+        auto it = fid_to_ph.find(fid);
+        if (it != fid_to_ph.end()) return it->second;
+        if (!is_reserved_datum(fid) && is_feature_id_token(fid)) external_refs.insert(fid);
+        return fid;
+    };
+    std::function<json(const json&)> walk = [&](const json& obj) -> json {
+        if (obj.is_object()) {
+            json out = json::object();
+            const std::string kind = obj.value("kind", std::string());
+            for (auto it = obj.begin(); it != obj.end(); ++it) {
+                const std::string& k = it.key();
+                const json& v = it.value();
+                if ((kind == "face" || kind == "edge" || kind == "vertex" || kind == "body") &&
+                    k == "owner_feature" && v.is_string())
+                    out[k] = remap_fid(v.get<std::string>());
+                else if (kind == "datum" && k == "feature" && v.is_string())
+                    out[k] = remap_fid(v.get<std::string>());
+                else if (kind == "region" && k == "sketch" && v.is_string())
+                    out[k] = remap_fid(v.get<std::string>());
+                else
+                    out[k] = walk(v);
+            }
+            return out;
+        }
+        if (obj.is_array()) {
+            json a = json::array();
+            for (const json& v : obj) a.push_back(walk(v));
+            return a;
+        }
+        if (obj.is_string()) {
+            const std::string s = obj.get<std::string>();
+            if (is_reserved_datum(s)) return obj;
+            if (is_feature_id_token(s)) return json(remap_fid(s));
+        }
+        return obj;
+    };
+    return walk(refs.is_null() ? json::object() : refs);
+}
+
+// ops.py::_stamp_bundle_feature — portable copy: id removed, refs placeholdered, sketch
+// entity/constraint ids -> ~e<n>/~c<n> with handles re-pointed.
+json stamp_bundle_feature(const json& feat, const std::map<std::string, std::string>& fid_to_ph,
+                          std::set<std::string>& external_refs) {
+    json out = feat;
+    out.erase("id");
+    out["refs"] = stamp_bundle_refs(out.contains("refs") ? out["refs"] : json::object(),
+                                    fid_to_ph, external_refs);
+    if (out.value("type", std::string()) == "sketch") {
+        if (!out.contains("params") || !out["params"].is_object()) out["params"] = json::object();
+        json& params = out["params"];
+        if (!params.contains("entities") || !params["entities"].is_array())
+            params["entities"] = json::array();
+        if (!params.contains("constraints") || !params["constraints"].is_array())
+            params["constraints"] = json::array();
+        json& ents = params["entities"];
+        json& cons = params["constraints"];
+        std::map<std::string, std::string> eid_map;
+        for (std::size_t i = 0; i < ents.size(); ++i)
+            if (ents[i].is_object() && ents[i].contains("id") && ents[i]["id"].is_string())
+                eid_map[ents[i]["id"].get<std::string>()] = "~e" + std::to_string(i);
+        for (std::size_t i = 0; i < ents.size(); ++i)
+            if (ents[i].is_object()) ents[i]["id"] = "~e" + std::to_string(i);
+        for (std::size_t i = 0; i < cons.size(); ++i)
+            if (cons[i].is_object()) {
+                cons[i]["id"] = "~c" + std::to_string(i);
+                json nr = json::array();
+                if (cons[i].contains("refs") && cons[i]["refs"].is_array())
+                    for (const json& h : cons[i]["refs"]) nr.push_back(remap_handle(h, eid_map));
+                cons[i]["refs"] = nr;
+            }
+    }
+    return out;
+}
+
+// ops.py::build_feature_bundle — package feature `fid` (+ closure) into a portable bundle.
+json build_feature_bundle(const json& doc, const std::string& fid, bool include_dependencies) {
+    const json* feat = find_feature_c(doc, fid);
+    if (!feat)
+        throw OpError("invalid_op", "feature '" + fid + "' not found",
+                      {{"reason", "unknown feature " + fid}});
+    std::vector<std::string> order;
+    if (include_dependencies)
+        order = feature_refs_closure(doc, fid).first;
+    else
+        order = {fid};
+
+    std::map<std::string, std::string> fid_to_ph;
+    for (std::size_t i = 0; i < order.size(); ++i) fid_to_ph[order[i]] = "$" + std::to_string(i);
+
+    std::set<std::string> external_refs;
+    json features = json::object();
+    for (const std::string& src_fid : order) {
+        const json* f = find_feature_c(doc, src_fid);
+        features[fid_to_ph[src_fid]] = stamp_bundle_feature(*f, fid_to_ph, external_refs);
+    }
+
+    json external_datums = json::object();
+    for (const std::string& ext : external_refs) {
+        const json* ef = find_feature_c(doc, ext);
+        if (!ef) continue;
+        const std::string t = ef->value("type", std::string());
+        if (t == "plane" || t == "axis" || t == "point" || t == "csys") {
+            const std::string nm = ef->value("name", std::string());
+            external_datums[ext] = nm.empty() ? ext : nm;
+        }
+    }
+
+    json feature_order = json::array();
+    for (const std::string& src : order) feature_order.push_back(fid_to_ph[src]);
+    json source_ids = json::object();
+    for (const std::string& src : order) source_ids[fid_to_ph[src]] = src;
+    json ext_sorted = json::array();
+    for (const std::string& e : external_refs) ext_sorted.push_back(e);  // std::set is sorted
+
+    return json{
+        {"kind", "aicad.feature_bundle/1"},
+        {"source_doc_id", doc.contains("id") ? doc["id"] : json(nullptr)},
+        {"source_doc_name", doc.contains("name") ? doc["name"] : json(nullptr)},
+        {"root", fid_to_ph[fid]},
+        {"feature_order", feature_order},
+        {"features", features},
+        {"external_refs", ext_sorted},
+        {"external_datums", external_datums},
+        {"source_ids", source_ids},
+    };
+}
+
+// ops.py::_new_feature_envelope — normalize a bundled feature into a full envelope.
+json new_feature_envelope(const json& feature, const std::string& fid) {
+    json out = feature;
+    out["id"] = fid;
+    if (!out.contains("name")) out["name"] = fid;
+    if (!out.contains("suppressed")) out["suppressed"] = false;
+    if (!out.contains("params")) out["params"] = json::object();
+    if (!out.contains("refs")) out["refs"] = json::object();
+    return out;
+}
+
+// ops.py::_target_datum_by_name — same-named target datum (plane/axis/point/csys) or reserved id.
+std::optional<std::string> target_datum_by_name(const json& doc, const std::string& name) {
+    if (is_reserved_datum(name)) return name;
+    if (doc.contains("features") && doc["features"].is_array())
+        for (const json& f : doc["features"]) {
+            const std::string t = f.value("type", std::string());
+            if ((t == "plane" || t == "axis" || t == "point" || t == "csys") &&
+                f.value("name", std::string()) == name)
+                return f.value("id", std::string());
+        }
+    return std::nullopt;
+}
+
+// ops.py::_resolve_datum — out-of-closure datum: same-named reuse, else schema-valid fallback.
+json resolve_datum(const std::string& src_id, const json& external_datums, const json& doc,
+                   const json& src_doc_id, const json& src_doc_name) {
+    if (external_datums.contains(src_id) && external_datums[src_id].is_string()) {
+        const std::string name = external_datums[src_id].get<std::string>();
+        auto match = target_datum_by_name(doc, name);
+        if (match) {
+            if (is_reserved_datum(*match)) return json(*match);
+            return json{{"kind", "datum"}, {"feature", *match}};
+        }
+    }
+    return json{{"kind", "datum"}, {"feature", "plane.front"},
+                {"external", {{"doc_id", src_doc_id}, {"doc_name", src_doc_name},
+                              {"owner_feature", src_id}, {"unresolved", true}}}};
+}
+
+// ops.py::_resolve_paste_refs — re-link a pasted feature's refs against the TARGET doc.
+json resolve_paste_refs(const json& refs, const std::map<std::string, std::string>& ph_to_fid,
+                        const json& bundle, const json& doc) {
+    const json src_doc_id = bundle.contains("source_doc_id") ? bundle["source_doc_id"] : json(nullptr);
+    const json src_doc_name = bundle.contains("source_doc_name") ? bundle["source_doc_name"] : json(nullptr);
+    const json external_datums = bundle.contains("external_datums") ? bundle["external_datums"] : json::object();
+    auto ext_marker = [&](const json& owner) -> json {
+        return json{{"doc_id", src_doc_id}, {"doc_name", src_doc_name}, {"owner_feature", owner}};
+    };
+    std::function<json(const json&)> walk = [&](const json& obj) -> json {
+        if (obj.is_object()) {
+            const std::string kind = obj.value("kind", std::string());
+            if (kind == "face" || kind == "edge" || kind == "vertex" || kind == "body") {
+                json out = obj;
+                if (obj.contains("owner_feature") && obj["owner_feature"].is_string()) {
+                    const std::string ow = obj["owner_feature"].get<std::string>();
+                    auto it = ph_to_fid.find(ow);
+                    if (it != ph_to_fid.end())
+                        out["owner_feature"] = it->second;
+                    else {
+                        out["owner_feature"] = nullptr;
+                        out["external"] = ext_marker(ow);
+                    }
+                }
+                return out;
+            }
+            if (kind == "datum") {
+                json out = obj;
+                if (obj.contains("feature") && obj["feature"].is_string()) {
+                    const std::string fe = obj["feature"].get<std::string>();
+                    auto it = ph_to_fid.find(fe);
+                    if (it != ph_to_fid.end()) {
+                        out["feature"] = it->second;
+                        return out;
+                    }
+                    return resolve_datum(fe, external_datums, doc, src_doc_id, src_doc_name);
+                }
+                return out;
+            }
+            if (kind == "region") {
+                json out = obj;
+                if (obj.contains("sketch") && obj["sketch"].is_string()) {
+                    const std::string sk = obj["sketch"].get<std::string>();
+                    auto it = ph_to_fid.find(sk);
+                    if (it != ph_to_fid.end())
+                        out["sketch"] = it->second;
+                    else
+                        out["external"] = ext_marker(sk);
+                }
+                return out;
+            }
+            json out = json::object();
+            for (auto it = obj.begin(); it != obj.end(); ++it) out[it.key()] = walk(it.value());
+            return out;
+        }
+        if (obj.is_array()) {
+            bool all_str = !obj.empty();
+            for (const json& v : obj)
+                if (!v.is_string()) { all_str = false; break; }
+            if (all_str) {
+                json kept = json::array();
+                for (const json& v : obj) {
+                    auto it = ph_to_fid.find(v.get<std::string>());
+                    if (it != ph_to_fid.end()) kept.push_back(it->second);
+                }
+                if (kept != obj) return kept;  // a feature-id list with external members dropped
+            }
+            json resolved = json::array();
+            for (const json& v : obj) resolved.push_back(walk(v));
+            return resolved;
+        }
+        if (obj.is_string()) {
+            const std::string s = obj.get<std::string>();
+            auto it = ph_to_fid.find(s);
+            if (it != ph_to_fid.end()) return json(it->second);
+            if (is_reserved_datum(s)) return obj;
+            if (is_feature_id_token(s)) return resolve_datum(s, external_datums, doc, src_doc_id, src_doc_name);
+        }
+        return obj;
+    };
+    return walk(refs.is_null() ? json::object() : refs);
+}
+
+// ops.py::_reid_pasted_sketch — fresh e<N>/c<N> ids for a pasted sketch (handles re-pointed).
+void reid_pasted_sketch(json& feat, IdGen& gen) {
+    if (!feat.contains("params") || !feat["params"].is_object()) feat["params"] = json::object();
+    json& params = feat["params"];
+    std::map<std::string, std::string> eid_map;
+    if (params.contains("entities") && params["entities"].is_array())
+        for (json& ent : params["entities"])
+            if (ent.is_object()) {
+                const std::string neid = gen.next("e");
+                if (ent.contains("id") && ent["id"].is_string())
+                    eid_map[ent["id"].get<std::string>()] = neid;
+                ent["id"] = neid;
+            }
+    if (params.contains("constraints") && params["constraints"].is_array())
+        for (json& con : params["constraints"])
+            if (con.is_object()) {
+                con["id"] = gen.next("c");
+                json nr = json::array();
+                if (con.contains("refs") && con["refs"].is_array())
+                    for (const json& h : con["refs"]) nr.push_back(remap_handle(h, eid_map));
+                con["refs"] = nr;
+            }
+}
+
+// ops.py::_append_feature — append honoring the rollback bar.
+void append_feature(json& doc, const json& feat) {
+    if (!doc.contains("features") || !doc["features"].is_array()) doc["features"] = json::array();
+    json& feats = doc["features"];
+    const std::string rb = doc.value("rollback_after", std::string());
+    if (!rb.empty()) {
+        int bar_pos = -1;
+        for (std::size_t i = 0; i < feats.size(); ++i)
+            if (feats[i].value("id", std::string()) == rb) { bar_pos = static_cast<int>(i); break; }
+        if (bar_pos >= 0 && bar_pos < static_cast<int>(feats.size()) - 1) {
+            feats.insert(feats.begin() + bar_pos + 1, feat);
+            doc["rollback_after"] = feat["id"];
+            return;
+        }
+    }
+    feats.push_back(feat);
+}
+
+// ops.py::_paste_features — re-id every bundled feature, resolve refs, append. Returns
+// (ph_to_fid, new_ids in dependency-first order). When `derived`, stamp derived_from.
+std::pair<std::map<std::string, std::string>, std::vector<std::string>>
+paste_features(json& doc, const json& bundle, IdGen& gen, bool derived,
+               const std::string& group, const json& stamp_extra) {
+    const json& order = bundle["feature_order"];
+    const json& feats = bundle["features"];
+    const json source_ids = bundle.contains("source_ids") ? bundle["source_ids"] : json::object();
+    const std::string grp = group.empty() ? new_group_id() : group;
+
+    std::map<std::string, std::string> ph_to_fid;
+    for (const json& ph : order) ph_to_fid[ph.get<std::string>()] = gen.next("f");
+
+    std::vector<std::string> new_ids;
+    for (const json& phj : order) {
+        const std::string ph = phj.get<std::string>();
+        const json& src = feats[ph];
+        const std::string new_fid = ph_to_fid[ph];
+        json feat = new_feature_envelope(src, new_fid);
+        feat["refs"] = resolve_paste_refs(src.contains("refs") ? src["refs"] : json::object(),
+                                          ph_to_fid, bundle, doc);
+        if (feat.value("type", std::string()) == "sketch") reid_pasted_sketch(feat, gen);
+        if (derived) {
+            json stamp = {
+                {"doc_id", bundle.contains("source_doc_id") ? bundle["source_doc_id"] : json(nullptr)},
+                {"doc_name", bundle.contains("source_doc_name") ? bundle["source_doc_name"] : json(nullptr)},
+                {"feature", ph},
+                {"source_feature", source_ids.contains(ph) ? source_ids[ph] : json(nullptr)},
+                {"group", grp},
+            };
+            if (stamp_extra.is_object()) stamp.update(stamp_extra);
+            feat["derived_from"] = stamp;
+        }
+        append_feature(doc, feat);
+        new_ids.push_back(new_fid);
+    }
+    return {ph_to_fid, new_ids};
+}
+
+// ops.py::_bundle_or_invalid — validate the inbound bundle shape.
+json bundle_or_invalid(const json& op, std::size_t index) {
+    if (!op.contains("bundle") || !op["bundle"].is_object())
+        throw OpError("invalid_op", "paste requires a 'bundle' object", {{"index", index}});
+    const json& b = op["bundle"];
+    if (b.value("kind", std::string()) != "aicad.feature_bundle/1")
+        throw OpError("invalid_op", "bundle.kind must be 'aicad.feature_bundle/1'", {{"index", index}});
+    if (!b.contains("feature_order") || !b["feature_order"].is_array() || b["feature_order"].empty())
+        throw OpError("invalid_op", "bundle.feature_order must be a non-empty list", {{"index", index}});
+    if (!b.contains("features") || !b["features"].is_object())
+        throw OpError("invalid_op", "bundle.features must be an object", {{"index", index}});
+    for (const json& ph : b["feature_order"]) {
+        const std::string p = ph.get<std::string>();
+        if (!b["features"].contains(p) || !b["features"][p].is_object())
+            throw OpError("invalid_op", "bundle.features is missing feature for '" + p + "'",
+                          {{"index", index}});
+    }
+    if (!b.contains("root") ||
+        std::find(b["feature_order"].begin(), b["feature_order"].end(), b["root"]) ==
+            b["feature_order"].end())
+        throw OpError("invalid_op", "bundle.root must appear in feature_order", {{"index", index}});
+    return b;
+}
+
+void op_copy_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+    (void)gen;
+    const std::string fid = op.value("id", std::string());
+    bool inc = true;
+    if (op.contains("include_dependencies")) {
+        if (!op["include_dependencies"].is_boolean())
+            throw OpError("invalid_op", "copy_feature.include_dependencies must be a bool",
+                          {{"index", idx}});
+        inc = op["include_dependencies"].get<bool>();
+    }
+    if (find_feature_c(doc, fid) == nullptr)
+        throw OpError("invalid_op", "copy_feature: '" + fid + "' not found", {{"index", idx}});
+    json bundle = build_feature_bundle(doc, fid, inc);
+    id_map["$bundle"] = bundle;
+    id_map["$bundle:" + std::to_string(idx)] = bundle;
+}
+
+void op_paste_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+    const json bundle = bundle_or_invalid(op, idx);
+    auto pr = paste_features(doc, bundle, gen, /*derived=*/false, "", json(nullptr));
+    id_map["$" + std::to_string(idx)] = pr.first[bundle["root"].get<std::string>()];
+    for (std::size_t k = 0; k < pr.second.size(); ++k)
+        id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = pr.second[k];
+}
+
+void op_paste_feature_as_derived(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+    json bundle = bundle_or_invalid(op, idx);
+    if (op.contains("source_doc_id") && !op["source_doc_id"].is_null() &&
+        (!bundle.contains("source_doc_id") || bundle["source_doc_id"].is_null()))
+        bundle["source_doc_id"] = op["source_doc_id"];
+    auto pr = paste_features(doc, bundle, gen, /*derived=*/true, "", json(nullptr));
+    id_map["$" + std::to_string(idx)] = pr.first[bundle["root"].get<std::string>()];
+    for (std::size_t k = 0; k < pr.second.size(); ++k)
+        id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = pr.second[k];
+}
+
+// ops.py::refresh_derived_group — splice a FRESH source bundle over an existing derived
+// group IN PLACE (ids + tree positions preserved). Returns {refreshed, added, stale}.
+json refresh_derived_group(json& doc, const std::string& group, const json& bundle, IdGen& gen) {
+    const json& order = bundle["feature_order"];
+    const json& feats = bundle["features"];
+    const json source_ids = bundle.contains("source_ids") ? bundle["source_ids"] : json::object();
+    const json grp_doc_id = bundle.contains("source_doc_id") ? bundle["source_doc_id"] : json(nullptr);
+    const json grp_doc_name = bundle.contains("source_doc_name") ? bundle["source_doc_name"] : json(nullptr);
+
+    std::vector<std::string> member_ids;
+    std::map<std::string, std::string> by_source;  // source_feature -> existing target id
+    if (doc.contains("features") && doc["features"].is_array())
+        for (const json& f : doc["features"]) {
+            if (!f.is_object()) continue;
+            if (!f.contains("derived_from") || !f["derived_from"].is_object()) continue;
+            const json& df = f["derived_from"];
+            if (df.value("group", std::string()) != group) continue;
+            const std::string fid = f.value("id", std::string());
+            member_ids.push_back(fid);
+            if (df.contains("source_feature") && df["source_feature"].is_string()) {
+                const std::string sf = df["source_feature"].get<std::string>();
+                if (!by_source.count(sf)) by_source[sf] = fid;
+            }
+        }
+
+    std::map<std::string, std::string> ph_to_fid;
+    std::map<std::string, bool> ph_is_new;
+    for (const json& phj : order) {
+        const std::string ph = phj.get<std::string>();
+        const std::string src_fid =
+            (source_ids.contains(ph) && source_ids[ph].is_string()) ? source_ids[ph].get<std::string>() : "";
+        auto it = (!src_fid.empty()) ? by_source.find(src_fid) : by_source.end();
+        if (it != by_source.end()) {
+            ph_to_fid[ph] = it->second;
+            ph_is_new[ph] = false;
+        } else {
+            ph_to_fid[ph] = gen.next("f");
+            ph_is_new[ph] = true;
+        }
+    }
+
+    json refreshed = json::array(), added = json::array();
+    for (const json& phj : order) {
+        const std::string ph = phj.get<std::string>();
+        const json& src = feats[ph];
+        const std::string target_fid = ph_to_fid[ph];
+        json stamp = {
+            {"doc_id", grp_doc_id}, {"doc_name", grp_doc_name}, {"feature", ph},
+            {"source_feature", source_ids.contains(ph) ? source_ids[ph] : json(nullptr)},
+            {"group", group},
+        };
+        if (ph_is_new[ph]) {
+            json feat = new_feature_envelope(src, target_fid);
+            feat["refs"] = resolve_paste_refs(src.contains("refs") ? src["refs"] : json::object(),
+                                              ph_to_fid, bundle, doc);
+            if (feat.value("type", std::string()) == "sketch") reid_pasted_sketch(feat, gen);
+            feat["derived_from"] = stamp;
+            append_feature(doc, feat);
+            added.push_back(target_fid);
+        } else {
+            json* existing = find_feature(doc, target_fid);
+            json rebuilt = new_feature_envelope(src, target_fid);
+            rebuilt["refs"] = resolve_paste_refs(src.contains("refs") ? src["refs"] : json::object(),
+                                                 ph_to_fid, bundle, doc);
+            if (rebuilt.value("type", std::string()) == "sketch") reid_pasted_sketch(rebuilt, gen);
+            rebuilt["name"] = existing->value("name", rebuilt.value("name", std::string()));
+            *existing = rebuilt;
+            (*existing)["derived_from"] = stamp;
+            existing->erase("derived_stale");
+            refreshed.push_back(target_fid);
+        }
+    }
+
+    std::set<std::string> fresh_sources;
+    for (const json& phj : order) {
+        const std::string ph = phj.get<std::string>();
+        if (source_ids.contains(ph) && source_ids[ph].is_string())
+            fresh_sources.insert(source_ids[ph].get<std::string>());
+    }
+    std::set<std::string> refreshed_set;
+    for (const json& r : refreshed) refreshed_set.insert(r.get<std::string>());
+    json stale = json::array();
+    for (const std::string& mid : member_ids) {
+        if (refreshed_set.count(mid)) continue;
+        json* f = find_feature(doc, mid);
+        if (!f) continue;
+        std::string sf;
+        if (f->contains("derived_from") && (*f)["derived_from"].is_object() &&
+            (*f)["derived_from"].contains("source_feature") &&
+            (*f)["derived_from"]["source_feature"].is_string())
+            sf = (*f)["derived_from"]["source_feature"].get<std::string>();
+        if (!fresh_sources.count(sf)) {
+            (*f)["derived_stale"] = {{"reason", "source_feature_deleted"},
+                                     {"source_feature", sf.empty() ? json(nullptr) : json(sf)},
+                                     {"doc_id", grp_doc_id}, {"doc_name", grp_doc_name}};
+            stale.push_back(mid);
+        }
+    }
+    return json{{"refreshed", refreshed}, {"added", added}, {"stale", stale}};
+}
+
+// session.py::_resolve_source_session — find the live source session for a derived link's
+// source_doc_id, matching BOTH the registry key (session.doc_id) and the doc's internal id.
+// Caller holds g_mtx. Returns nullptr if the source doc is closed/absent.
+Session* resolve_source_session(const json& src_doc_id) {
+    if (src_doc_id.is_null()) return nullptr;
+    if (src_doc_id.is_string()) {
+        auto it = g_sessions.find(src_doc_id.get<std::string>());
+        if (it != g_sessions.end()) return &it->second;
+    }
+    for (auto& kv : g_sessions)
+        if (kv.second.doc.is_object() &&
+            (kv.second.doc.contains("id") ? kv.second.doc["id"] : json(nullptr)) == src_doc_id)
+            return &kv.second;
+    return nullptr;
+}
+
+// session.py::_group_root_source — the source feature to re-bundle a group from: the member
+// whose closure (transitively) covers the most of the group's source features.
+std::string group_root_source(const json& rec, const json& source_doc) {
+    std::vector<std::string> src_ids;
+    for (const json& m : rec["members"])
+        if (m.contains("source_feature") && m["source_feature"].is_string())
+            src_ids.push_back(m["source_feature"].get<std::string>());
+    if (src_ids.empty()) return "";
+    std::set<std::string> src_set(src_ids.begin(), src_ids.end());
+    std::string best;
+    std::pair<int, int> best_key{-1, -1};
+    for (const std::string& cand : src_ids) {
+        if (find_feature_c(source_doc, cand) == nullptr) continue;
+        std::set<std::string> closure;
+        try {
+            closure = feature_refs_closure(source_doc, cand).second;
+        } catch (...) {
+            continue;
+        }
+        int inter = 0;
+        for (const std::string& x : src_set)
+            if (closure.count(x)) ++inter;
+        std::pair<int, int> key{inter, static_cast<int>(closure.size())};
+        if (key > best_key) {
+            best_key = key;
+            best = cand;
+        }
+    }
+    return best;
+}
+
+// session.py::_mark_group_stale — stamp derived_stale on every member of `group`.
+json mark_group_stale(Session& s, const std::string& group, const std::string& reason,
+                      const json& detail) {
+    json marked = json::array();
+    if (!s.doc.contains("features") || !s.doc["features"].is_array()) return marked;
+    for (json& f : s.doc["features"]) {
+        if (!f.is_object()) continue;
+        if (!f.contains("derived_from") || !f["derived_from"].is_object()) continue;
+        if (f["derived_from"].value("group", std::string()) != group) continue;
+        json st = {{"reason", reason}};
+        if (detail.is_object()) st.update(detail);
+        f["derived_stale"] = st;
+        marked.push_back(f.contains("id") ? f["id"] : json(nullptr));
+    }
+    return marked;
+}
+
 void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     if (!op.is_object() || !op.contains("op") || !op["op"].is_string())
         throw OpError("unsupported", "op[" + std::to_string(idx) + "]: missing 'op'",
@@ -1282,6 +1953,9 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
     else if (k == "asm_edit_mate")              op_asm_edit_mate(doc, op, idx);
     else if (k == "asm_delete_mate")            op_asm_delete_mate(doc, op, idx);
     else if (k == "asm_set_explode")            op_asm_set_explode(doc, op, idx);
+    else if (k == "copy_feature")               op_copy_feature(doc, op, idx, gen, id_map);
+    else if (k == "paste_feature")              op_paste_feature(doc, op, idx, gen, id_map);
+    else if (k == "paste_feature_as_derived")   op_paste_feature_as_derived(doc, op, idx, gen, id_map);
     else
         throw OpError("unsupported", "op[" + std::to_string(idx) + "]: unknown op '" + k + "'",
                       {{"index", idx}, {"reason", "not ported"}});
@@ -1540,6 +2214,16 @@ json config_commit(Session& s, json&& working) {
     return ops_response(s, r, json::object(), /*with_tess=*/true);
 }
 
+// ops.py::is_readonly_batch — true iff `ops` is non-empty and EVERY op is read-only (only
+// copy_feature today). Such a batch surfaces its result only via the id_map side-channel, so
+// the session skips the undo snapshot, the revision bump, and the dirty flag (session.py).
+bool is_readonly_batch(const json& ops) {
+    if (!ops.is_array() || ops.empty()) return false;
+    for (const json& op : ops)
+        if (!op.is_object() || op.value("op", std::string()) != "copy_feature") return false;
+    return true;
+}
+
 // Apply an op batch to a session that the caller already holds g_mtx for (the shared
 // transactional core of doc_apply_ops; doc_import_file reuses it).
 json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coalesce) {
@@ -1565,6 +2249,18 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
         }
         throw OpError("invalid_op", "resulting document failed validation: " + joined,
                       {{"index", -1}, {"reason", errs.front()}, {"all_errors", errs}});
+    }
+
+    // Read-only fast-path: a batch of only read-only ops (copy_feature) makes no document
+    // change — it only returns its result through id_map ($bundle). Skip the undo snapshot,
+    // the revision bump, and the dirty flag; the live doc is left untouched (session.py).
+    if (is_readonly_batch(ops)) {
+        if (s.is_assembly()) {
+            rebuild_assembly(s);
+            return ops_response_assembly(s, id_map);
+        }
+        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        return ops_response(s, r, id_map, /*with_tess=*/true);
     }
 
     if (!coalesce) push_undo(s);
@@ -2108,6 +2804,138 @@ json doc_revert(const std::string& doc_id, const std::string& checkpoint_id) {
     s.dirty = true;
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     return ops_response(s, r, json::object(), /*with_tess=*/true);
+}
+
+// Live derived re-pull — C++ port of engine.doc.session.refresh_derived (Wave 4C).
+// Re-bundles each derived group's source feature (+ closure) from the LIVE source session
+// and splices it back over the existing derived copies in place (ids + positions preserved).
+// `id` empty == refresh every derived group; otherwise narrow to the group that feature `id`
+// belongs to (a non-derived id is a clean invalid_op). Mutating: one undo snapshot + revision
+// bump on any change. A closed source / deleted source feature leaves the group at last-good
+// and stamps derived_stale (never crashes). Returns the ops-response + a `derived` summary.
+json doc_refresh_derived(const std::string& doc_id, const std::string& id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+
+    // _derived_groups: group -> {source_doc_id, source_doc_name, members:[...]}, first-seen order.
+    std::vector<std::string> group_order;
+    std::map<std::string, json> groups;
+    if (s.doc.contains("features") && s.doc["features"].is_array())
+        for (const json& f : s.doc["features"]) {
+            if (!f.is_object()) continue;
+            if (!f.contains("derived_from") || !f["derived_from"].is_object()) continue;
+            const json& df = f["derived_from"];
+            if (!df.contains("group") || !df["group"].is_string()) continue;
+            const std::string grp = df["group"].get<std::string>();
+            if (!groups.count(grp)) {
+                group_order.push_back(grp);
+                groups[grp] = {{"group", grp},
+                               {"source_doc_id", df.contains("doc_id") ? df["doc_id"] : json(nullptr)},
+                               {"source_doc_name", df.contains("doc_name") ? df["doc_name"] : json(nullptr)},
+                               {"members", json::array()}};
+            }
+            groups[grp]["members"].push_back(
+                {{"id", f.contains("id") ? f["id"] : json(nullptr)},
+                 {"source_feature", df.contains("source_feature") ? df["source_feature"] : json(nullptr)},
+                 {"is_root", df.value("is_root", false)}});
+        }
+
+    if (!id.empty()) {
+        const json* target = find_feature_c(s.doc, id);
+        const json* df = (target && target->contains("derived_from") && (*target)["derived_from"].is_object())
+                             ? &(*target)["derived_from"] : nullptr;
+        std::string grp = (df && df->contains("group") && (*df)["group"].is_string())
+                              ? (*df)["group"].get<std::string>() : "";
+        if (grp.empty() || !groups.count(grp))
+            throw OpError("invalid_op", "refresh_derived: feature '" + id + "' is not a derived feature",
+                          {{"reason", "not derived"}, {"id", id}});
+        std::vector<std::string> only{grp};
+        std::map<std::string, json> narrowed{{grp, groups[grp]}};
+        group_order = only;
+        groups = narrowed;
+    }
+
+    if (groups.empty()) {
+        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        json resp = ops_response(s, r, json::object(), /*with_tess=*/true);
+        resp["derived"] = {{"groups", json::array()}, {"note", "no derived features in document"}};
+        return resp;
+    }
+
+    // Snapshot once up front so the whole multi-group refresh is a SINGLE undo step.
+    push_undo(s);
+    IdGen gen(s.doc);
+    json summaries = json::array();
+    bool any_change = false;
+
+    for (const std::string& grp : group_order) {
+        const json& rec = groups[grp];
+        const json src_doc_id = rec["source_doc_id"];
+        Session* src = resolve_source_session(src_doc_id);
+        if (src == nullptr) {
+            json marked = mark_group_stale(s, grp, "source_doc_closed",
+                                           {{"doc_id", src_doc_id}, {"doc_name", rec["source_doc_name"]}});
+            any_change = any_change || !marked.empty();
+            summaries.push_back({{"group", grp}, {"status", "source_doc_closed"},
+                                 {"source_doc_id", src_doc_id}, {"stale", marked}});
+            continue;
+        }
+        const std::string root_src = group_root_source(rec, src->doc);
+        if (root_src.empty() || find_feature_c(src->doc, root_src) == nullptr) {
+            json marked = mark_group_stale(s, grp, "source_feature_deleted",
+                                           {{"doc_id", src_doc_id}, {"doc_name", rec["source_doc_name"]}});
+            any_change = any_change || !marked.empty();
+            summaries.push_back({{"group", grp}, {"status", "source_feature_deleted"},
+                                 {"source_doc_id", src_doc_id}, {"stale", marked}});
+            continue;
+        }
+        try {
+            json bundle = build_feature_bundle(src->doc, root_src, /*include_dependencies=*/true);
+            json res = refresh_derived_group(s.doc, grp, bundle, gen);
+            any_change = true;
+            json summ = {{"group", grp}, {"status", "refreshed"}, {"source_doc_id", src_doc_id}};
+            summ.update(res);
+            summaries.push_back(summ);
+        } catch (const OpError& exc) {
+            json marked = mark_group_stale(s, grp, "refresh_failed",
+                                           {{"doc_id", src_doc_id}, {"error", exc.what()}});
+            any_change = any_change || !marked.empty();
+            summaries.push_back({{"group", grp}, {"status", "refresh_failed"},
+                                 {"source_doc_id", src_doc_id}, {"error", exc.what()}, {"stale", marked}});
+        }
+    }
+
+    // Validate the spliced doc; on failure ROLL BACK (pop our snapshot, restore) and raise.
+    std::vector<std::string> errs = validate_document(s.doc);
+    if (!errs.empty()) {
+        std::string prior = s.undo_stack.back();
+        s.undo_stack.pop_back();
+        s.doc = json::parse(prior);
+        std::string joined;
+        for (std::size_t i = 0; i < errs.size() && i < 5; ++i) {
+            if (i) joined += "; ";
+            joined += errs[i];
+        }
+        throw OpError("invalid_op", "refresh_derived produced an invalid document: " + joined,
+                      {{"reason", errs.front()}, {"all_errors", errs}});
+    }
+
+    if (!any_change) {
+        // Pure no-op: drop the snapshot we pushed and do NOT bump the revision.
+        s.undo_stack.pop_back();
+        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        json resp = ops_response(s, r, json::object(), /*with_tess=*/true);
+        resp["derived"] = {{"groups", summaries}};
+        return resp;
+    }
+
+    if (s.active_sketch) s.active_sketch->solve_state.reset();
+    s.revision += 1;
+    s.dirty = true;
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    json resp = ops_response(s, r, json::object(), /*with_tess=*/true);
+    resp["derived"] = {{"groups", summaries}};
+    return resp;
 }
 
 json doc_config_list(const std::string& doc_id) {

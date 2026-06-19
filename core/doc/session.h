@@ -88,6 +88,17 @@ nlohmann::json doc_list();
 nlohmann::json doc_checkpoint(const std::string& doc_id);
 nlohmann::json doc_revert(const std::string& doc_id, const std::string& checkpoint_id);
 
+// Copy/paste-as-derived live re-pull (engine.doc.session.refresh_derived). Re-bundles each
+// derived group's source feature (+ closure) from the LIVE source session and splices it back
+// over the existing derived copies in place. `id` empty == refresh ALL derived groups; else
+// narrow to the group feature `id` belongs to (a non-derived id throws OpError("invalid_op")).
+// Mutating on any change (one undo step + revision bump). A closed source / deleted source
+// feature leaves the group at last-good and stamps derived_stale (never crashes). Returns the
+// ops-response with an extra `derived`:{groups:[{group,status,...}]} summary. The copy/paste
+// ops themselves (copy_feature / paste_feature / paste_feature_as_derived) run through
+// doc_apply_ops; copy_feature is a read-only batch (no revision bump).
+nlohmann::json doc_refresh_derived(const std::string& doc_id, const std::string& id);
+
 // Named configurations (engine.doc.session config_*). config_list is read-only
 // ({configurations, active, detail}); the mutators edit the doc's configurations
 // list, validate the result, push one undo step, bump the revision, recompile the

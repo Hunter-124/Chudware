@@ -36,6 +36,7 @@ struct HoleDims {
     double cbore_depth = 0.0;     // counterbore depth at the mouth (Cbore)
     double csink_d = 0.0;         // countersink mouth diameter (Csink)
     double csink_angle_deg = 90.0;// countersink included angle in degrees (Csink)
+    double csink_lift = 0.0;      // over-drive added to the cone height (face-clearance lift)
 };
 
 // Build one hole cutting tool at `origin`, drilling along unit `drill_dir` (INTO the

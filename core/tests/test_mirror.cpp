@@ -270,7 +270,11 @@ TEST_CASE("mirror face-selector merge: reflection about a picked +X face") {
             << " bbox=" << (hi[0]-lo[0]) << "x" << (hi[1]-lo[1]) << "x" << (hi[2]-lo[2])
             << " volume=" << vol << " (expected 1500)");
 
-    CHECK(count_surf(b, 0) == 10);  // 5+5 (x=15 cap removed; coplanar sides NOT unified)
+    // Mirroring about the body's own +X face shares that exact face, so the fuse welds
+    // the two halves into one solid; build123d's mirror-merge runs UnifySameDomain, which
+    // collapses the now-coplanar side faces across the seam into one each -> a clean 6-face
+    // box (matches the Python oracle; tools/cpp_audit_parity.py "mirror feature" = 6 faces).
+    CHECK(count_surf(b, 0) == 6);   // unified box: 6 planar faces
     CHECK(count_surf(b, 1) == 0);   // no curved faces
     CHECK((hi[0] - lo[0]) == doctest::Approx(30.0).epsilon(1e-4));  // x in [0,30]
     CHECK((hi[1] - lo[1]) == doctest::Approx(10.0).epsilon(1e-4));

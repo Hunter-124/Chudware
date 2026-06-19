@@ -6,6 +6,7 @@
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
+#include <BRepOffsetAPI_MakeOffset.hxx>
 #include <BRepOffsetAPI_MakePipe.hxx>
 #include <BRepOffsetAPI_ThruSections.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
@@ -15,6 +16,12 @@
 #include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRepPrimAPI_MakeSphere.hxx>
 #include <BRepPrimAPI_MakeTorus.hxx>
+#include <BRepBuilderAPI_FindPlane.hxx>
+#include <BRepTools.hxx>
+#include <BRepTools_WireExplorer.hxx>
+#include <GeomAbs_JoinType.hxx>
+#include <GProp_GProps.hxx>
+#include <BRepGProp.hxx>
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
@@ -145,6 +152,100 @@ TopoDS_Shape make_rib_slab(const TopoDS_Wire& contour, const Eigen::Vector3d& no
         if (slab.IsNull()) return TopoDS_Shape();
     }
     return slab;
+}
+
+namespace {
+// Offset a CLOSED planar wire concentrically by `off` (outward for +, inward for -),
+// with GeomAbs_Intersection (sharp polygon corners — matches build123d Kind.INTERSECTION).
+// Returns the original wire for ~0 offset; a null wire on failure.
+TopoDS_Wire offset_wire(const TopoDS_Wire& wire, double off) {
+    if (std::abs(off) < 1e-12) return wire;
+    BRepOffsetAPI_MakeOffset mk(wire, GeomAbs_Intersection);
+    mk.Perform(off);
+    if (!mk.IsDone()) return TopoDS_Wire();
+    TopoDS_Shape r = mk.Shape();
+    if (r.IsNull()) return TopoDS_Wire();
+    if (r.ShapeType() == TopAbs_WIRE) return TopoDS::Wire(r);
+    // The offset of a wire may come back wrapped in a compound — take the first wire.
+    for (TopExp_Explorer ex(r, TopAbs_WIRE); ex.More(); ex.Next())
+        return TopoDS::Wire(ex.Current());
+    return TopoDS_Wire();
+}
+}  // namespace
+
+TopoDS_Face thin_ring_face(const TopoDS_Face& face, double outer_off, double inner_off) {
+    if (face.IsNull()) return TopoDS_Face();
+    TopoDS_Wire perim = BRepTools::OuterWire(face);
+    if (perim.IsNull()) return TopoDS_Face();
+
+    TopoDS_Wire outer_w = offset_wire(perim, outer_off);
+    TopoDS_Wire inner_w = offset_wire(perim, inner_off);
+    if (outer_w.IsNull() || inner_w.IsNull()) return TopoDS_Face();
+
+    // Build the ring face = outer wire with the inner wire as a (reversed) hole. The
+    // offset wires are co-planar with the original face; MakeFace(outer) then Add(inner
+    // reversed) carves the bore, mirroring Face(outer, inner_wires=[inner]) in Python.
+    BRepBuilderAPI_MakeFace mf(outer_w, /*OnlyPlane=*/true);
+    if (!mf.IsDone()) return TopoDS_Face();
+    mf.Add(TopoDS::Wire(inner_w.Reversed()));
+    if (!mf.IsDone()) return TopoDS_Face();
+    TopoDS_Face ring = mf.Face();
+
+    GProp_GProps gp;
+    BRepGProp::SurfaceProperties(ring, gp);
+    if (!(std::abs(gp.Mass()) > 1e-9)) return TopoDS_Face();  // empty wall
+    return ring;
+}
+
+namespace {
+// Loft a tapered solid between a base wire (at the profile plane) and a top wire (the
+// base wire offset by `off` and translated by `shift`). Used by extrude_face_tapered.
+TopoDS_Shape tapered_lump(const TopoDS_Wire& base, double off, const gp_Vec& shift) {
+    TopoDS_Wire top = offset_wire(base, off);
+    if (top.IsNull()) return TopoDS_Shape();
+    gp_Trsf tr;
+    tr.SetTranslation(shift);
+    top = TopoDS::Wire(BRepBuilderAPI_Transform(top, tr, true).Shape());
+    BRepOffsetAPI_ThruSections mk(Standard_True, Standard_False, 1.0e-6);
+    mk.AddWire(base);
+    mk.AddWire(top);
+    mk.Build();
+    if (!mk.IsDone()) return TopoDS_Shape();
+    return mk.Shape();
+}
+}  // namespace
+
+TopoDS_Shape extrude_face_tapered(const TopoDS_Face& face, const Eigen::Vector3d& dir,
+                                  double depth, double taper_deg, bool mid_plane) {
+    if (face.IsNull() || !(depth > 0.0)) return TopoDS_Shape();
+    const double t = std::tan(taper_deg * 3.14159265358979323846 / 180.0);
+    TopoDS_Wire outer = BRepTools::OuterWire(face);
+    if (outer.IsNull()) return TopoDS_Shape();
+
+    auto build = [&](double seg_depth, const Eigen::Vector3d& d) -> TopoDS_Shape {
+        // Positive taper narrows toward the extrude direction: offset the top INWARD.
+        const double off = -seg_depth * t;
+        const gp_Vec shift(d.x() * seg_depth, d.y() * seg_depth, d.z() * seg_depth);
+        TopoDS_Shape lump = tapered_lump(outer, off, shift);
+        if (lump.IsNull()) return lump;
+        // Carve each inner (hole) wire as its own tapered lump and subtract it, so a
+        // washer profile drafts both boundaries (matches build123d's tapered hole).
+        for (TopExp_Explorer ex(face, TopAbs_WIRE); ex.More(); ex.Next()) {
+            TopoDS_Wire w = TopoDS::Wire(ex.Current());
+            if (w.IsSame(outer)) continue;
+            TopoDS_Shape hole = tapered_lump(w, off, shift);
+            if (!hole.IsNull()) lump = cut(lump, hole);
+        }
+        return lump;
+    };
+
+    if (mid_plane) {
+        TopoDS_Shape fwd = build(depth / 2.0, dir);
+        TopoDS_Shape rev = build(depth / 2.0, -dir);
+        if (fwd.IsNull() || rev.IsNull()) return TopoDS_Shape();
+        return fuse(fwd, rev);
+    }
+    return build(depth, dir);
 }
 
 TopoDS_Shape sweep_face(const TopoDS_Face& profile, const TopoDS_Wire& spine) {

@@ -1993,28 +1993,138 @@ CompileResult compile_document(const json& doc, const json& env_json) {
 
                 // For a cut / through_all we size against the current body.
                 const std::string tgt_id = is_cut ? current_solid_id() : std::string();
+
+                // --- thin feature: replace each filled profile face with its thin-wall
+                // ring (port of extrude.py::_thin_profile_face). thin_side: one (inside,
+                // default) | two/mid (1/2 each side) | outside.
+                std::vector<TopoDS_Face> faces = src.faces;
+                const bool thin = feat.value("thin", false);
+                if (thin) {
+                    const double thin_thk = feat.contains("thin_thickness")
+                        ? num_or_expr(feat.at("thin_thickness"), env) : 1.0;
+                    if (!(thin_thk > 0.0))
+                        throw std::runtime_error("extrude: thin thickness must be > 0");
+                    std::string side = feat.value("thin_side", std::string("one"));
+                    double outer_off, inner_off;
+                    if (side == "two" || side == "both" || side == "mid") {
+                        outer_off = thin_thk / 2.0; inner_off = -thin_thk / 2.0;
+                    } else if (side == "outside" || side == "outer") {
+                        outer_off = thin_thk; inner_off = 0.0;
+                    } else {  // one / inside (default)
+                        outer_off = 0.0; inner_off = -thin_thk;
+                    }
+                    std::vector<TopoDS_Face> rings;
+                    for (const TopoDS_Face& f : faces) {
+                        TopoDS_Face ring = ::geom::thin_ring_face(f, outer_off, inner_off);
+                        if (ring.IsNull())
+                            throw std::runtime_error("extrude: thin wall offset failed "
+                                                     "(thickness too large for the profile)");
+                        rings.push_back(ring);
+                    }
+                    faces = std::move(rings);
+                }
+
+                // --- draft taper (degrees). SW "draft inward" (default) = positive taper
+                // (narrows toward the direction); draft_outward flips the sign. Applies to
+                // blind / mid_plane only — greyed out for through_all / up_to_* ends.
+                double taper_deg = feat.contains("draft")
+                    ? num_or_expr(feat.at("draft"), env) : 0.0;
+                if (feat.value("draft_outward", false)) taper_deg = -taper_deg;
+                const bool draftable = (end == "blind" || end == "mid_plane");
+                if (!draftable) taper_deg = 0.0;
+
+                // --- direction-1 linear amount + the dir-2 slab. The geometry-driven ends
+                // (through_all / up_to_vertex) reduce to a blind amount here; up_to_vertex
+                // reads the stamped vertex centroid from the `up_to` selector and projects
+                // it onto the direction (extrude.py::_up_to_vertex_amount).
+                auto bbox_diag_of_face = [](const TopoDS_Face& f) -> double {
+                    Bnd_Box bb; BRepBndLib::Add(f, bb);
+                    if (bb.IsVoid()) return 100.0;
+                    double xmn, ymn, zmn, xmx, ymx, zmx;
+                    bb.Get(xmn, ymn, zmn, xmx, ymx, zmx);
+                    Eigen::Vector3d d(xmx - xmn, ymx - ymn, zmx - zmn);
+                    return std::max(d.norm(), 1e-3);
+                };
+                auto face_center = [](const TopoDS_Face& f) -> Eigen::Vector3d {
+                    GProp_GProps g; BRepGProp::SurfaceProperties(f, g);
+                    gp_Pnt c = g.CentreOfMass();
+                    return Eigen::Vector3d(c.X(), c.Y(), c.Z());
+                };
+
                 double depth;
                 if (end == "through_all") {
-                    if (tgt_id.empty())
-                        throw std::runtime_error("extrude through_all requires an existing body");
-                    const TopoDS_Shape& tb = require_solid(results, tgt_id, "target");
-                    const double diag = aicad::doc::bbox_diag(tb);
-                    if (!(diag > 0.0))
-                        throw std::runtime_error("extrude through_all: body has no extent");
-                    depth = diag * 2.2;   // span the whole body...
-                    mid_plane = true;     // ...both directions from the sketch plane
+                    if (!tgt_id.empty()) {
+                        const TopoDS_Shape& tb = require_solid(results, tgt_id, "target");
+                        const double diag = aicad::doc::bbox_diag(tb);
+                        if (!(diag > 0.0))
+                            throw std::runtime_error("extrude through_all: body has no extent");
+                        depth = diag * 2.2;   // span the whole body...
+                        mid_plane = true;     // ...both directions from the sketch plane
+                    } else {
+                        // No prior body: bbox fallback (extrude.py through_all branch) —
+                        // blind extrude of 1.05 * (2 * profile bbox diag), one direction.
+                        depth = 1.05 * (bbox_diag_of_face(faces[0]) * 2.0);
+                        mid_plane = false;
+                    }
+                } else if (end == "up_to_vertex") {
+                    auto up_it = feat.find("up_to");
+                    if (up_it == feat.end() || !up_it->is_object())
+                        throw std::runtime_error("extrude: up_to_vertex needs an `up_to` vertex selector");
+                    auto cit = up_it->find("centroid");
+                    if (cit == up_it->end() || !cit->is_array() || cit->size() != 3)
+                        throw std::runtime_error("extrude: up_to_vertex selector has no centroid");
+                    Eigen::Vector3d vp((*cit)[0].get<double>(), (*cit)[1].get<double>(),
+                                       (*cit)[2].get<double>());
+                    Eigen::Vector3d pc = face_center(faces[0]);
+                    depth = dir.dot(vp - pc);
+                    if (!(depth > 1e-9))
+                        throw std::runtime_error("extrude: up_to_vertex is behind the profile");
+                    mid_plane = false;
                 } else {
                     depth = num_or_expr(feat.at("depth"), env);
                     if (!(depth > 0.0))
                         throw std::runtime_error("extrude depth must be > 0");
                 }
 
-                // Extrude each region face; fuse multiple regions into one solid.
+                // --- second direction (end2 != "none"): a blind slab of depth2 along the
+                // NEGATED direction, unioned into the tool (extrude.py Dir2, blind subset).
+                const std::string end2 = feat.value("end2", std::string("none"));
+                double depth2 = 0.0;
+                if (end2 != "none") {
+                    if (end2 == "blind") {
+                        depth2 = feat.contains("depth2")
+                            ? num_or_expr(feat.at("depth2"), env) : 10.0;
+                    } else if (end2 == "through_all") {
+                        depth2 = !tgt_id.empty()
+                            ? aicad::doc::bbox_diag(require_solid(results, tgt_id, "target")) * 2.2
+                            : 1.05 * (bbox_diag_of_face(faces[0]) * 2.0);
+                    } else {
+                        throw std::runtime_error("extrude: end2 '" + end2 + "' not supported");
+                    }
+                    if (!(depth2 > 0.0))
+                        throw std::runtime_error("extrude: effective depth2 must be > 0");
+                }
+
+                // Extrude each region face; fuse multiple regions into one solid. Draft
+                // routes through the tapered loft; otherwise the straight prism. Dir2 adds
+                // a second straight slab along -dir.
                 TopoDS_Shape solid;
-                for (const TopoDS_Face& f : src.faces) {
-                    TopoDS_Shape prism = ::geom::extrude_face(f, dir, depth, mid_plane);
+                for (const TopoDS_Face& f : faces) {
+                    TopoDS_Shape prism = (std::abs(taper_deg) > 1e-9)
+                        ? ::geom::extrude_face_tapered(f, dir, depth, taper_deg, mid_plane)
+                        : ::geom::extrude_face(f, dir, depth, mid_plane);
                     if (prism.IsNull())
                         throw std::runtime_error("extrude produced an empty solid");
+                    if (end2 != "none") {
+                        TopoDS_Shape slab2 = ::geom::extrude_face(f, -dir, depth2, false);
+                        if (slab2.IsNull())
+                            throw std::runtime_error("extrude: dir2 slab build failed");
+                        // build123d's piece + piece2 runs .clean() (UnifySameDomain), so the
+                        // sketch-plane seam between the two direction slabs collapses to one face.
+                        prism = ::geom::unify_same_domain(::geom::fuse(prism, slab2));
+                        if (prism.IsNull())
+                            throw std::runtime_error("extrude: dir2 fuse failed");
+                    }
                     solid = solid.IsNull() ? prism : ::geom::fuse(solid, prism);
                     if (solid.IsNull())
                         throw std::runtime_error("extrude region fuse failed");
@@ -2038,7 +2148,26 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     source_of[id] = tgt_id;  // owner-map: cut derives from the target body
                     results[id] = SolidResult{out};
                 } else {
-                    results[id] = SolidResult{solid};
+                    // Boss: with a running body AND merge (default true), FUSE into it
+                    // (SolidWorks "Merge result"); the merged solid replaces the body
+                    // (extrude.py: target + tool_solid). merge:false -> NEW body. The
+                    // SIMPLIFIED flat shape's mode "new" (the C++ default) is an explicit
+                    // standalone boss, so it never merges; only a canonical "boss"/"add"
+                    // mode honours the running-body merge (matches the audit's params.mode).
+                    const bool merge = feat.value("merge", true) &&
+                                       (mode == "boss" || mode == "add");
+                    const std::string mtgt = merge ? current_solid_id() : std::string();
+                    if (!mtgt.empty()) {
+                        const TopoDS_Shape& tgt = require_solid(results, mtgt, "target");
+                        TopoDS_Shape out = ::geom::unify_same_domain(::geom::fuse(tgt, solid));
+                        if (out.IsNull())
+                            throw std::runtime_error("extrude boss fuse produced an empty shape");
+                        consumed.insert(mtgt);
+                        source_of[id] = mtgt;  // owner-map: merged boss derives from the body
+                        results[id] = SolidResult{out};
+                    } else {
+                        results[id] = SolidResult{solid};
+                    }
                 }
                 solid_order.push_back(id);
                 st.ok = true;
@@ -2082,6 +2211,50 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 }
                 if (tool.IsNull())
                     throw std::runtime_error("revolve produced no solid");
+
+                // --- thin feature (revolve.py): subtract a revolve of each profile face
+                // offset toward the axis by thin_thickness, leaving a thin wall. side
+                // inside (default) | outside | both (1/2 each side, halved here).
+                if (feat.value("thin", false)) {
+                    const double thin_thk = feat.contains("thin_thickness")
+                        ? num_or_expr(feat.at("thin_thickness"), env) : 0.0;
+                    if (!(thin_thk > 0.0))
+                        throw std::runtime_error("revolve: thin requires a positive thin_thickness");
+                    const std::string side = feat.value("thin_side", std::string("inside"));
+                    const double per_t = (side == "both") ? thin_thk / 2.0 : thin_thk;
+                    TopoDS_Shape inner;
+                    for (const TopoDS_Face& f : src.faces) {
+                        // Radial direction = (face centroid - axis) projected perpendicular
+                        // to the axis; shift the face TOWARD the axis by per_t (matches
+                        // _offset_face_toward_axis, which uses -thickness for every side).
+                        GProp_GProps g; BRepGProp::SurfaceProperties(f, g);
+                        gp_Pnt cm = g.CentreOfMass();
+                        Eigen::Vector3d c(cm.X(), cm.Y(), cm.Z());
+                        Eigen::Vector3d ad = axis_dir.normalized();
+                        Eigen::Vector3d diff = c - axis_pt;
+                        Eigen::Vector3d radial = diff - ad * diff.dot(ad);
+                        if (!(radial.norm() > 1e-9)) continue;
+                        radial.normalize();
+                        Eigen::Vector3d shift = radial * (-per_t);
+                        gp_Trsf tr; tr.SetTranslation(gp_Vec(shift.x(), shift.y(), shift.z()));
+                        TopoDS_Face inf = TopoDS::Face(
+                            BRepBuilderAPI_Transform(f, tr, true).Shape());
+                        TopoDS_Shape inrev = ::geom::revolve_face(inf, axis_pt, axis_dir, angle);
+                        if (inrev.IsNull()) continue;
+                        inner = inner.IsNull() ? inrev : ::geom::fuse(inner, inrev);
+                    }
+                    if (!inner.IsNull()) {
+                        TopoDS_Shape hollow = ::geom::cut(tool, inner);
+                        if (!hollow.IsNull()) {
+                            GProp_GProps gh, gt;
+                            BRepGProp::VolumeProperties(hollow, gh);
+                            BRepGProp::VolumeProperties(tool, gt);
+                            // Accept only if material was actually removed (a wall remains).
+                            if (gh.Mass() > 1e-9 && gh.Mass() < gt.Mass() - 1e-9)
+                                tool = hollow;
+                        }
+                    }
+                }
 
                 // Apply to the running body, matching engine/doc/features/revolve.py:
                 //   mode default "boss"; merge default True. With no existing body OR
@@ -2255,6 +2428,24 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (out.IsNull())
                     throw std::runtime_error("boolean '" + op + "' produced an empty shape");
 
+                if (op == "fuse") {
+                    // combine: build123d's `+` runs .clean() (ShapeUpgrade_UnifySameDomain),
+                    // so flush coplanar faces from the two welded blocks merge into one. Match it.
+                    out = ::geom::unify_same_domain(out);
+                } else {
+                    // subtract / intersect: the oracle (boolean.py) calls getattr(result,
+                    // "volume", 0.0) <= 1e-9 -> FAIL. build123d's `volume` attribute is
+                    // None/0 on a multi-solid ShapeList, so a cut/intersect that yields >1
+                    // DISJOINT solid is treated by the oracle as an empty result. Reproduce
+                    // exactly: a disjoint subtract/intersect fails (leaving the inputs).
+                    int nsolids = 0;
+                    for (TopExp_Explorer sx(out, TopAbs_SOLID); sx.More(); sx.Next()) ++nsolids;
+                    if (nsolids != 1)
+                        throw std::runtime_error(
+                            std::string("boolean: ") + (op == "cut" ? "subtract" : "intersect") +
+                            " produced an empty body");
+                }
+
                 // a and b were merged/subtracted — they no longer survive standalone.
                 consumed.insert(a_id);
                 consumed.insert(b_id);
@@ -2307,14 +2498,34 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     const double radius = num_or_expr(feat.at("radius"), env);
                     if (!(radius > 0.0))
                         throw std::runtime_error("fillet radius must be > 0");
-                    out = picked ? ::geom::fillet_edges(body, radius, *picked)
-                                 : ::geom::fillet_edges(body, radius, dir);
+                    // Variable-radius fillet (dress.py): a linear law r1->r2 along the edge,
+                    // active when radius2 > 0 and differs from radius. Requires picked edges
+                    // (the variable law is per-edge; the dir-filter path stays uniform).
+                    double radius2 = feat.contains("radius2")
+                        ? num_or_expr(feat.at("radius2"), env) : 0.0;
+                    const bool variable = picked && radius2 > 0.0 &&
+                                          std::abs(radius2 - radius) > 1e-9;
+                    if (variable)
+                        out = ::geom::fillet_edges_variable(body, radius, radius2, *picked);
+                    else
+                        out = picked ? ::geom::fillet_edges(body, radius, *picked)
+                                     : ::geom::fillet_edges(body, radius, dir);
                 } else {
                     const double distance = num_or_expr(feat.at("distance"), env);
                     if (!(distance > 0.0))
                         throw std::runtime_error("chamfer distance must be > 0");
-                    out = picked ? ::geom::chamfer_edges(body, distance, *picked)
-                                 : ::geom::chamfer_edges(body, distance, dir);
+                    // Two-distance (asymmetric) chamfer (dress.py): leg d1 on one face, d2
+                    // on the other, active when length2 > 0 and differs from length. Needs
+                    // picked edges (the asymmetric Add references a specific incident face).
+                    double length2 = feat.contains("length2")
+                        ? num_or_expr(feat.at("length2"), env) : 0.0;
+                    const bool asym = picked && length2 > 0.0 &&
+                                      std::abs(length2 - distance) > 1e-9;
+                    if (asym)
+                        out = ::geom::chamfer_edges_two_distance(body, distance, length2, *picked);
+                    else
+                        out = picked ? ::geom::chamfer_edges(body, distance, *picked)
+                                     : ::geom::chamfer_edges(body, distance, dir);
                 }
                 if (out.IsNull())
                     throw std::runtime_error(type + " produced an empty shape");
@@ -2495,8 +2706,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 const bool merge = feat.value("merge", true);
                 if (merge) {
                     // Union the reflection into the body; the body is consumed (the
-                    // merged solid is its new current state in the tree).
-                    TopoDS_Shape out = ::geom::fuse(body, reflected);
+                    // merged solid is its new current state in the tree). build123d's
+                    // mirror merge runs .clean() (UnifySameDomain), so the seam where the
+                    // two flush halves meet collapses — apply it to match the face count.
+                    TopoDS_Shape out = ::geom::unify_same_domain(::geom::fuse(body, reflected));
                     if (out.IsNull())
                         throw std::runtime_error("mirror union (fuse) produced an empty shape");
                     consumed.insert(body_id);
@@ -2576,28 +2789,37 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     uv.emplace_back(0.0, 0.0);  // back-compat single hole at face centre
                 }
 
-                // --- style ---
+                // --- style. "tap" is a TAPPED hole: the oracle (hole.py) drills a plain
+                // bore (the cosmetic thread is metadata, not cut geometry) — so tap maps to
+                // the Simple bore. cbore/csink add the mouth pocket/cone.
                 const std::string style_s = feat.value("style", std::string("simple"));
                 ::geom::HoleStyle style;
-                if (style_s == "simple")      style = ::geom::HoleStyle::Simple;
+                if (style_s == "simple" || style_s == "tap") style = ::geom::HoleStyle::Simple;
                 else if (style_s == "cbore")  style = ::geom::HoleStyle::Cbore;
                 else if (style_s == "csink")  style = ::geom::HoleStyle::Csink;
                 else throw std::runtime_error("hole: unknown style '" + style_s + "'");
 
-                // --- dims ---
+                // --- dims. Mirrors hole.py::_resolve_dims for standard=="custom": the bore
+                // diameter is params.diameter; cbore/csink defaults derive from it (cbore_d =
+                // diameter*1.8, csink_d = diameter*2.0) when not explicitly provided. The
+                // canonical cbore_d/csink_d keys are read if present; the audit's *_dia keys
+                // are NOT (the oracle ignores them too), so both engines use the defaults.
                 ::geom::HoleDims dims;
                 dims.diameter = num_or_expr(feat.at("diameter"), env);
                 if (!(dims.diameter > 0.0))
                     throw std::runtime_error("hole: diameter must be > 0");
                 if (style == ::geom::HoleStyle::Cbore) {
-                    dims.cbore_d = num_or_expr(feat.at("cbore_d"), env);
-                    dims.cbore_depth = num_or_expr(feat.at("cbore_depth"), env);
+                    dims.cbore_d = feat.contains("cbore_d")
+                        ? num_or_expr(feat.at("cbore_d"), env) : dims.diameter * 1.8;
+                    dims.cbore_depth = feat.contains("cbore_depth")
+                        ? num_or_expr(feat.at("cbore_depth"), env) : dims.diameter;
                     if (!(dims.cbore_d > dims.diameter))
                         throw std::runtime_error("hole: cbore_d must be larger than diameter");
                     if (!(dims.cbore_depth > 0.0))
                         throw std::runtime_error("hole: cbore_depth must be > 0");
                 } else if (style == ::geom::HoleStyle::Csink) {
-                    dims.csink_d = num_or_expr(feat.at("csink_d"), env);
+                    dims.csink_d = feat.contains("csink_d")
+                        ? num_or_expr(feat.at("csink_d"), env) : dims.diameter * 2.0;
                     dims.csink_angle_deg = feat.contains("csink_angle")
                         ? num_or_expr(feat.at("csink_angle"), env) : 90.0;
                     if (!(dims.csink_d > dims.diameter))
@@ -2625,6 +2847,11 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 const double lift = 0.05;  // tool mouth sits just above the face
                 ::geom::HoleDims tool_dims = dims;
                 tool_dims.depth = depth + lift;
+                // Match hole.py: the cbore pocket / csink cone are over-driven by `lift`
+                // too (cb_h = cbore_depth + lift; cone_h gets +lift inside make_hole_tool
+                // via cbore_depth/csink_lift), so the mouth pieces clear the face cleanly.
+                if (style == ::geom::HoleStyle::Cbore) tool_dims.cbore_depth = dims.cbore_depth + lift;
+                tool_dims.csink_lift = lift;
 
                 TopoDS_Shape tool_union;
                 for (const auto& p : uv) {

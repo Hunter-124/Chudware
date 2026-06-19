@@ -60,6 +60,18 @@ TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
 TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
                            const std::vector<TopoDS_Edge>& edges);
 
+// Variable-radius fillet: a LINEAR radius law per edge from `r1` at the edge start to
+// `r2` at the edge end (BRepFilletAPI_MakeFillet::Add(r1, r2, edge)). Port of
+// dress.py::_variable_fillet. Empty shape on kernel failure / empty `edges`.
+TopoDS_Shape fillet_edges_variable(const TopoDS_Shape& shape, double r1, double r2,
+                                   const std::vector<TopoDS_Edge>& edges);
+
+// Two-distance (asymmetric) chamfer: leg `d1` on the first incident face, `d2` on the
+// other (BRepFilletAPI_MakeChamfer::Add(d1, d2, edge, face)). Matches build123d
+// chamfer(length=d1, length2=d2). Empty shape on kernel failure / empty `edges`.
+TopoDS_Shape chamfer_edges_two_distance(const TopoDS_Shape& shape, double d1, double d2,
+                                        const std::vector<TopoDS_Edge>& edges);
+
 // --- shell (hollow to a wall) + draft (taper faces) — port of dress.py/draft.py ---
 
 // Hollow `body` to a wall of thickness `t`. `remove` faces become the open mouths of

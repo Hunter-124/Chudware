@@ -38,4 +38,10 @@ TopoDS_Shape cut(const TopoDS_Shape& a, const TopoDS_Shape& b);
 // shape on kernel failure OR when the two solids do not overlap.
 TopoDS_Shape common(const TopoDS_Shape& a, const TopoDS_Shape& b);
 
+// Merge co-planar/co-cylindrical adjacent faces sharing a domain into single faces
+// (ShapeUpgrade_UnifySameDomain). build123d runs this in its `.clean()` after every
+// boolean, so a combine/mirror that welds two flush blocks reports ONE merged face
+// instead of two with a seam edge. Returns `s` unchanged on failure (best-effort).
+TopoDS_Shape unify_same_domain(const TopoDS_Shape& s);
+
 }  // namespace geom

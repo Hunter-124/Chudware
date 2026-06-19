@@ -52,7 +52,7 @@ TopoDS_Shape make_hole_tool(const Eigen::Vector3d& origin,
         const double cs_r = dims.csink_d / 2.0;
         const double half = radians(dims.csink_angle_deg / 2.0);
         const double t = std::tan(half);
-        const double cone_h = cs_r / (t > 1e-9 ? t : 1e-9);
+        const double cone_h = cs_r / (t > 1e-9 ? t : 1e-9) + dims.csink_lift;
         TopoDS_Shape cone = BRepPrimAPI_MakeCone(ax, cs_r, 0.0, cone_h).Shape();
         if (cone.IsNull()) return TopoDS_Shape();
         tool = fuse(tool, cone);

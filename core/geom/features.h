@@ -55,6 +55,23 @@ TopoDS_Shape make_rib_slab(const TopoDS_Wire& contour, const Eigen::Vector3d& no
 // clipping). Empty on non-positive size.
 TopoDS_Shape make_box_at(double x, double y, double z, double dx, double dy, double dz);
 
+// Convert a filled planar profile `face` into a thin-WALL ring face. `outer_off` /
+// `inner_off` are signed offsets (mm) applied to the face's outer wire to form the
+// ring's outer + inner boundaries (positive = outward, negative = inward); the result
+// is Face(outer, inner-as-hole). Port of
+// engine/doc/features/extrude.py::_thin_profile_face (Kind.INTERSECTION sharp-corner
+// 2D wire offset). Null face on failure (e.g. thickness too large for the profile).
+TopoDS_Face thin_ring_face(const TopoDS_Face& face, double outer_off, double inner_off);
+
+// Extrude planar `face` along unit `dir` by `depth` with a DRAFT taper of `taper_deg`
+// degrees. Positive taper narrows the profile toward the extrude direction (SolidWorks
+// "draft inward"); negative grows it. Built as a loft between the base profile and a
+// top profile offset by depth*tan(taper) (inward for +), so it matches build123d
+// extrude(..., taper=). Null shape on failure. If `face` has inner (hole) wires they
+// are tapered too. `mid_plane` centers the taper symmetrically about the sketch plane.
+TopoDS_Shape extrude_face_tapered(const TopoDS_Face& face, const Eigen::Vector3d& dir,
+                                  double depth, double taper_deg, bool mid_plane = false);
+
 // Sweep a planar profile face along a spine wire (BRepOffsetAPI_MakePipe). The
 // profile should sit at the spine start, roughly perpendicular to its tangent.
 // Empty shape on kernel failure. Port of engine/doc/features/sweep.py's MakePipe

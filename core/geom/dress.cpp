@@ -13,6 +13,7 @@
 #include <GeomAbs_Shape.hxx>
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
+#include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <TopoDS.hxx>
@@ -114,6 +115,37 @@ TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
     BRepFilletAPI_MakeChamfer mk(shape);
     // Symmetric chamfer: the single-distance Add(d, edge) sets both legs to d.
     for (const TopoDS_Edge& edge : edges) mk.Add(d, edge);
+    mk.Build();
+    if (!mk.IsDone()) return TopoDS_Shape();
+    return mk.Shape();
+}
+
+TopoDS_Shape fillet_edges_variable(const TopoDS_Shape& shape, double r1, double r2,
+                                   const std::vector<TopoDS_Edge>& edges) {
+    if (edges.empty()) return TopoDS_Shape();
+    BRepFilletAPI_MakeFillet mk(shape);
+    // Linear radius law r1 (edge start) -> r2 (edge end), matching dress.py::_variable_fillet.
+    for (const TopoDS_Edge& edge : edges) mk.Add(r1, r2, edge);
+    mk.Build();
+    if (!mk.IsDone()) return TopoDS_Shape();
+    return mk.Shape();
+}
+
+TopoDS_Shape chamfer_edges_two_distance(const TopoDS_Shape& shape, double d1, double d2,
+                                        const std::vector<TopoDS_Edge>& edges) {
+    if (edges.empty()) return TopoDS_Shape();
+    // The asymmetric Add needs the reference FACE the d1 leg is measured on (build123d
+    // chamfer(length,length2) picks the first incident face). Build an edge->faces map.
+    TopTools_IndexedDataMapOfShapeListOfShape ef;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, ef);
+    BRepFilletAPI_MakeChamfer mk(shape);
+    for (const TopoDS_Edge& edge : edges) {
+        if (!ef.Contains(edge)) return TopoDS_Shape();
+        const TopTools_ListOfShape& faces = ef.FindFromKey(edge);
+        if (faces.IsEmpty()) return TopoDS_Shape();
+        TopoDS_Face f = TopoDS::Face(faces.First());
+        mk.Add(d1, d2, edge, f);
+    }
     mk.Build();
     if (!mk.IsDone()) return TopoDS_Shape();
     return mk.Shape();

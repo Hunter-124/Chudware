@@ -3,6 +3,7 @@
 #include <BRepAlgoAPI_Common.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
+#include <ShapeUpgrade_UnifySameDomain.hxx>
 
 namespace geom {
 
@@ -37,6 +38,20 @@ TopoDS_Shape common(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     op.Build();
     if (!op.IsDone()) return TopoDS_Shape();
     return op.Shape();
+}
+
+TopoDS_Shape unify_same_domain(const TopoDS_Shape& s) {
+    if (s.IsNull()) return s;
+    try {
+        // Unify faces AND edges sharing a domain (concatBSplines=false): the seam between
+        // two flush coplanar faces collapses to one face, matching build123d's clean().
+        ShapeUpgrade_UnifySameDomain up(s, Standard_True, Standard_True, Standard_False);
+        up.Build();
+        TopoDS_Shape r = up.Shape();
+        return r.IsNull() ? s : r;
+    } catch (...) {
+        return s;  // best-effort: keep the un-unified shape on any kernel hiccup
+    }
 }
 
 }  // namespace geom

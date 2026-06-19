@@ -19,19 +19,18 @@ namespace {
 // all-or-nothing-per-document cutover with no separate routing state. Flag OFF (default)
 // is byte-for-byte today's behavior: every call goes to the Python worker.
 //
-// DEFAULT OFF (2026-06-18): the C++ doc engine handles the ops-build pipeline (doc_apply_ops:
-// extrude/fillet/pattern/...), but does NOT yet implement the interactive doc surface —
-// SKETCH MODE (sketch_enter/solve/probe/drag/exit, doc_sketch_overview/regions,
-// sketch_project_ref) or the EVALUATE suite (eval_mass/measure/section_props/interference/
-// check/symmetry/draft/thickness/curvature), plus doc_refresh_derived / doc_solve_mates /
-// doc_set_explode_state. On a doc-cpp doc those fail loud ("unknown method"). Until they are
-// ported, documents stay on the mature Python engine. Set AI_CAD_CPP_DOCS=1 to opt a session
-// into the C++ doc engine (parts that only use the ops pipeline). FLIP BACK TO DEFAULT-ON once
-// the sketch + evaluate surface is ported (and re-delete the v2 agent Python — see git log).
+// DEFAULT ON (2026-06-19): the C++ doc engine is parity-complete for parts / sketch mode /
+// the full Evaluate suite / weldments / assemblies / copy-paste-as-derived, verified by the
+// aggregate differential gate (tools/run_parity_suite.py — 24/24 vs the Python oracle: session
+// 65, eval 40, sketch 22, weld 26, asm 10, derived 37, audit/audit2/audit3, + agent orchestration
+// via the mock provider). Documents now default to the pure-C++ core. AI_CAD_CPP_DOCS=0 still
+// forces the legacy Python worker (escape hatch / fallback while the Python oracle stays in-tree).
+// The coupled cppAgentFlag() follows this, so the agent also defaults to C++ (it drives the same
+// doc-cpp session it edits).
 bool cppDocsFlag() {
     const char* f = std::getenv("AI_CAD_CPP_DOCS");
-    if (f && f[0]) return f[0] != '0';  // explicit override (1=on, 0=off)
-    return false;                       // default: mature Python doc engine (C++ doc gaps, above)
+    if (f && f[0]) return f[0] != '0';  // explicit override (1=on, 0=force Python fallback)
+    return true;                        // default: pure-C++ doc engine (parity-complete)
 }
 
 // Methods that MINT a new document (vs. operate on an existing one). For these the C++

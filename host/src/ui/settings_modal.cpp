@@ -221,7 +221,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         ImGui::SameLine();
                         dimText(("(" + std::string(env) + ")").c_str());
                     };
-                    const bool docsOn = flagOn("AI_CAD_CPP_DOCS", false);
+                    const bool docsOn = flagOn("AI_CAD_CPP_DOCS", true);
                     routeRow("Documents",  docsOn,                            "AI_CAD_CPP_DOCS");
                     routeRow("Simulation", flagOn("AI_CAD_CPP_SIM",   true),  "AI_CAD_CPP_SIM");
                     // AI agent FOLLOWS the doc engine by default (must run on the same engine

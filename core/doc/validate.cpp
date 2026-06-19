@@ -1515,6 +1515,198 @@ vector<string> validate_part(const json& doc) {
     return errs;
 }
 
+// --- assembly schema (port of engine/doc/schema.py::validate_assembly) -----------
+const std::set<string> MATE_TYPES = {
+    "coincident", "parallel", "perpendicular", "tangent",
+    "concentric", "distance", "angle", "lock",
+    "width", "symmetric", "distance_limit", "angle_limit", "profile_center",
+    "gear", "rack_pinion", "screw", "hinge", "slot", "cam_follower"};
+const std::set<string> MATE_VALUE_TYPES = {"distance", "angle"};
+// mtype -> (min, max) ref counts; default (2,2).
+std::pair<int, int> mate_ref_counts(const string& t) {
+    if (t == "width") return {3, 4};
+    if (t == "symmetric") return {3, 3};
+    if (t == "hinge") return {2, 4};
+    return {2, 2};
+}
+// mtype -> (required numeric keys, optional numeric keys) for coupling/limit mates.
+bool mate_coupling_spec(const string& t, vector<string>& req, vector<string>& opt) {
+    req.clear(); opt.clear();
+    if (t == "distance_limit" || t == "angle_limit") { req = {"min", "max"}; opt = {"value"}; return true; }
+    if (t == "gear") { req = {"ratio"}; return true; }
+    if (t == "screw") { req = {"pitch"}; return true; }
+    if (t == "rack_pinion") { opt = {"pitch_radius"}; return true; }
+    if (t == "hinge") { opt = {"min", "max"}; return true; }
+    return false;
+}
+
+vector<string> validate_assembly(const json& doc) {
+    if (!doc.is_object()) {
+        return {"document must be a JSON object"};
+    }
+    vector<string> errs = validate_common(doc, "aicad.asm/1");
+    auto eqres = validate_equations(doc, "");
+    errs.insert(errs.end(), eqres.first.begin(), eqres.first.end());
+    const std::set<string>& globals_names = eqres.second;
+
+    const json& comps = get(doc, "components");
+    std::set<string> comp_ids;
+    if (!comps.is_array()) {
+        errs.push_back("components: must be a list");
+    } else {
+        for (size_t i = 0; i < comps.size(); ++i) {
+            const json& k = comps[i];
+            string loc = "components[" + std::to_string(i) + "]";
+            if (!k.is_object()) { errs.push_back(loc + ": must be an object"); continue; }
+            const json& kidj = get(k, "id");
+            string kid = kidj.is_string() ? kidj.get<string>() : "";
+            if (!kidj.is_string() || !std::regex_match(kid, std::regex("^k[0-9]+$")))
+                errs.push_back(loc + ".id: must match k<N>");
+            else if (comp_ids.count(kid))
+                errs.push_back(loc + ".id: duplicate '" + kid + "'");
+            else
+                comp_ids.insert(kid);
+            if (!is_nonempty_string(get(k, "name"))) errs.push_back(loc + ".name: required");
+            const json& src = get(k, "source");
+            bool src_ok = src.is_object() &&
+                          ((get(src, "path").is_string()) || (get(src, "embedded").is_string()));
+            if (!src_ok) errs.push_back(loc + ".source: must be {path} or {embedded}");
+            if (!is_vec(get(k, "transform"), 16))
+                errs.push_back(loc + ".transform: must be 16 floats (row-major)");
+            for (const char* flag : {"fixed", "suppressed"})
+                if (!get(k, flag).is_boolean()) errs.push_back(loc + "." + flag + ": required bool");
+        }
+    }
+
+    const json& mates = get(doc, "mates");
+    std::set<string> seen_m;
+    if (!mates.is_array()) {
+        errs.push_back("mates: must be a list");
+    } else {
+        for (size_t i = 0; i < mates.size(); ++i) {
+            const json& m = mates[i];
+            string loc = "mates[" + std::to_string(i) + "]";
+            if (!m.is_object()) { errs.push_back(loc + ": must be an object"); continue; }
+            const json& midj = get(m, "id");
+            string mid = midj.is_string() ? midj.get<string>() : "";
+            if (!midj.is_string() || !std::regex_match(mid, std::regex("^m[0-9]+$")))
+                errs.push_back(loc + ".id: must match m<N>");
+            else if (seen_m.count(mid))
+                errs.push_back(loc + ".id: duplicate '" + mid + "'");
+            else
+                seen_m.insert(mid);
+            const json& mtj = get(m, "type");
+            string mtype = mtj.is_string() ? mtj.get<string>() : "";
+            if (!mtj.is_string() || !MATE_TYPES.count(mtype))
+                errs.push_back(loc + ".type: '" + (mtj.is_string() ? mtype : mtj.dump()) +
+                               "' not a mate type");
+            const json& alj = get(m, "align");
+            if (!(alj.is_string() && (alj.get<string>() == "aligned" || alj.get<string>() == "anti")))
+                errs.push_back(loc + ".align: must be 'aligned' or 'anti'");
+            if (!get(m, "suppressed").is_boolean())
+                errs.push_back(loc + ".suppressed: required bool");
+            const json& refsj = get(m, "refs");
+            auto [lo_r, hi_r] = mate_ref_counts(mtype);
+            json refs = json::array();
+            if (!refsj.is_array() ||
+                !((int)refsj.size() >= lo_r && (int)refsj.size() <= hi_r)) {
+                string want = lo_r == hi_r ? std::to_string(lo_r)
+                                           : std::to_string(lo_r) + ".." + std::to_string(hi_r);
+                errs.push_back(loc + ".refs: " + mtype + " takes " + want + " entries");
+            } else {
+                refs = refsj;
+            }
+            for (size_t j = 0; j < refs.size(); ++j) {
+                const json& r = refs[j];
+                string rloc = loc + ".refs[" + std::to_string(j) + "]";
+                if (!r.is_object()) { errs.push_back(rloc + ": must be {component, selector}"); continue; }
+                const json& cj = get(r, "component");
+                if (!(cj.is_string() && comp_ids.count(cj.get<string>())))
+                    errs.push_back(rloc + ".component: unknown '" +
+                                   (cj.is_string() ? cj.get<string>() : cj.dump()) + "'");
+                auto se = validate_selector(get(r, "selector"), rloc + ".selector");
+                errs.insert(errs.end(), se.begin(), se.end());
+            }
+            const json& valj = get(m, "value");
+            vector<string> req, opt;
+            if (MATE_VALUE_TYPES.count(mtype)) {
+                if (valj.is_null()) errs.push_back(loc + ".value: required for " + mtype);
+                else {
+                    auto de = validate_dim(valj, loc + ".value", globals_names);
+                    errs.insert(errs.end(), de.begin(), de.end());
+                }
+            } else if (mate_coupling_spec(mtype, req, opt)) {
+                if (!valj.is_object()) {
+                    if (!req.empty()) {
+                        string rs;
+                        for (size_t z = 0; z < req.size(); ++z) { if (z) rs += ", "; rs += req[z]; }
+                        errs.push_back(loc + ".value: " + mtype + " needs an object with [" + rs + "]");
+                    }
+                } else {
+                    for (const string& key : req)
+                        if (!is_num(get(valj, key)))
+                            errs.push_back(loc + ".value." + key + ": required number for " + mtype);
+                    for (const string& key : opt)
+                        if (!get(valj, key).is_null() && !is_num(get(valj, key)))
+                            errs.push_back(loc + ".value." + key + ": must be a number");
+                    if (get(valj, "value").is_number()) {
+                        auto de = validate_dim(valj, loc + ".value", globals_names);
+                        errs.insert(errs.end(), de.begin(), de.end());
+                    }
+                }
+            } else if (!valj.is_null()) {
+                errs.push_back(loc + ".value: " + mtype + " must not carry a value");
+            }
+        }
+    }
+
+    const json& feats = get(doc, "features");
+    std::set<string> earlier(RESERVED_DATUMS);
+    std::set<string> asm_feat_ids;
+    std::map<string, json> asm_feats_by_id;
+    if (feats.is_array()) {
+        for (size_t i = 0; i < feats.size(); ++i) {
+            const json& f = feats[i];
+            string fid = (f.is_object() && get(f, "id").is_string()) ? get(f, "id").get<string>() : "";
+            string fid_disp = fid.empty() ? "None" : fid;
+            auto fe = validate_feature(f, "features[" + std::to_string(i) + "](" + fid_disp + ")",
+                                       earlier, globals_names, comp_ids);
+            errs.insert(errs.end(), fe.begin(), fe.end());
+            if (!fid.empty()) {
+                earlier.insert(fid);
+                asm_feat_ids.insert(fid);
+                if (f.is_object()) asm_feats_by_id[fid] = f;
+            }
+        }
+    } else {
+        errs.push_back("features: must be a list");
+    }
+    auto re = validate_rollback(doc, asm_feat_ids);
+    errs.insert(errs.end(), re.begin(), re.end());
+    auto ce = validate_configurations(doc, asm_feats_by_id);
+    errs.insert(errs.end(), ce.begin(), ce.end());
+
+    const json& explode = get(doc, "explode");
+    if (!explode.is_null()) {
+        if (!explode.is_array()) {
+            errs.push_back("explode: must be a list");
+        } else {
+            for (size_t i = 0; i < explode.size(); ++i) {
+                const json& st = explode[i];
+                string loc = "explode[" + std::to_string(i) + "]";
+                if (!st.is_object()) { errs.push_back(loc + ": must be an object"); continue; }
+                const json& cj = get(st, "component");
+                if (!(cj.is_string() && comp_ids.count(cj.get<string>())))
+                    errs.push_back(loc + ".component: unknown '" +
+                                   (cj.is_string() ? cj.get<string>() : cj.dump()) + "'");
+                if (!is_vec(get(st, "vector"), 3)) errs.push_back(loc + ".vector: must be [x,y,z]");
+                if (!is_num(get(st, "distance"))) errs.push_back(loc + ".distance: must be a number");
+            }
+        }
+    }
+    return errs;
+}
+
 }  // namespace
 
 // --------------------------------------------------------------------------- public
@@ -1527,6 +1719,9 @@ std::vector<std::string> validate_document(const nlohmann::json& doc) {
     string schema = schj.is_string() ? schj.get<string>() : "";
     if (schj.is_string() && schema == "aicad.part/1") {
         return validate_part(doc);
+    }
+    if (schj.is_string() && schema == "aicad.asm/1") {
+        return validate_assembly(doc);
     }
     string got = schj.is_string() ? schj.get<string>() : (schj.is_null() ? "None" : schj.dump());
     return {"schema: unknown '" + got + "'"};

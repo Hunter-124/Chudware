@@ -1,0 +1,101 @@
+// Assembly compile + mate-solve + tessellation — C++ port of engine/doc/assembly.py.
+//
+// An assembly document (``aicad.asm/1``) is rebuilt very differently from a part:
+//
+//   1. Component loading — each non-suppressed component's ``source.path`` is opened
+//      (cached per path+mtime). ``.step+`` containers are parsed + compiled to bodies;
+//      bare ``.step``/``.iges``/``.brep``/mesh files import via doc/formats.cpp. The
+//      result is a list of local-frame TopoDS solids + a topology description for
+//      mate-ref resolution. (The Python oracle's compile path is PATH-only — the
+//      schema permits ``source.embedded`` but no loader consumes it — so this port
+//      matches: embedded-only components fail to load exactly as the oracle would.)
+//
+//   2. Mate-ref resolution — every mate ref {component, selector} resolves the selector
+//      against that component's LOCAL geometry (doc/selectors.{h,cpp}) into a
+//      aicad::mate::MateGeom (plane/axis/point/sphere) in the component's local frame.
+//
+//   3. Mate solve — aicad::mate::solve_mates over the shared numeric core places every
+//      floating component (fixed components pinned). Solved transforms + a per-mate
+//      status list + the DOF summary are reported.
+//
+//   4. Tessellation — each component contributes ONE AICM body (body_id = ordinal,
+//      name = component name, a distinct colour per ordinal), world-placed by the solved
+//      transform (+ an optional explode offset).
+//
+// Canonical units: mm / degrees / grams.
+#pragma once
+
+#include <map>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include <Eigen/Dense>
+#include <nlohmann/json.hpp>
+#include <TopoDS_Shape.hxx>
+
+#include "mate/mate.h"
+
+namespace aicad::doc {
+
+// One placed component body in the assembly result.
+struct AsmBodyOut {
+    int body_id = 0;
+    std::string component_id;
+    std::string name;
+    TopoDS_Shape shape_local;            // local-frame compound of the component's bodies
+    std::vector<double> transform;       // solved 16-float row-major (world placement, no explode)
+    std::array<float, 3> color{0.7f, 0.7f, 0.7f};  // rgb [0..1]
+};
+
+// Per-component build status.
+struct AsmComponentStatus {
+    std::string id;
+    bool ok = false;
+    double ms = 0.0;
+    std::optional<std::string> error;        // nullopt == ok
+    std::vector<std::string> dangling_refs;  // refs[i] strings (none here; mate-level)
+};
+
+// Per-mate status (id, type, status, dangling_refs).
+struct AsmMateStatus {
+    std::string id;
+    std::string type;
+    std::string status;                      // ok|redundant|conflicting|suppressed|unresolved
+    std::vector<std::string> dangling_refs;
+};
+
+// The result of compiling an assembly (mirror of assembly.py::AssemblyResult).
+struct AssemblyResult {
+    std::vector<AsmBodyOut> bodies;
+    std::vector<AsmComponentStatus> component_status;
+    std::vector<AsmMateStatus> mate_status;
+    int dof = 0;
+    bool over_defined = false;
+    bool converged = true;
+    std::string dof_summary;
+    std::map<std::string, std::vector<double>> transforms;  // component_id -> 16f (solved)
+    aicad::mate::WarmMap warm;                               // component_id -> (t,w)
+};
+
+// Compile an assembly doc: load components, resolve mate refs, solve mates, place bodies.
+// `base_dir` resolves relative source paths; `warm` (optional) speeds + stabilises the
+// solve across re-solves. `drag` (optional) threads a soft-target through the solver.
+AssemblyResult compile_assembly(const nlohmann::json& doc,
+                                const std::string& base_dir = std::string(),
+                                const std::optional<aicad::mate::WarmMap>& warm = std::nullopt,
+                                const std::optional<aicad::mate::Drag>& drag = std::nullopt);
+
+// Per-component explode offset vector (mm) from the doc's ``explode`` steps, scaled by
+// factor (port of assembly.py::explode_offsets).
+std::map<std::string, Eigen::Vector3d> explode_offsets(const nlohmann::json& doc, double factor);
+
+// World-place a component body: apply the solved 16-float transform (+ optional explode
+// offset) to its local shape. Port of assembly.py::placed_world_shape.
+TopoDS_Shape placed_world_shape(const AsmBodyOut& body,
+                                const std::optional<Eigen::Vector3d>& explode_offset = std::nullopt);
+
+// Clear the per-path component load cache (used by tests / re-solves over edited files).
+void clear_component_cache();
+
+}  // namespace aicad::doc

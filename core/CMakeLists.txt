@@ -451,6 +451,7 @@ if(AICAD_WITH_OCCT)
     doc/selectors.cpp
     doc/picks.cpp
     doc/session.cpp
+    doc/assembly.cpp
     doc/sketch_geom.cpp
     doc/stepplus.cpp
     doc/validate.cpp
@@ -476,6 +477,7 @@ if(AICAD_WITH_OCCT)
   target_compile_definitions(aicad_doc PRIVATE AICAD_WITH_OPENNURBS UNICODE _UNICODE)
   target_link_libraries(aicad_doc PUBLIC
     aicad_geom_occt aicad_sketch aicad_geom aicad_util
+    aicad_mate
     aicad_miniz
     opennurbsStatic
     nlohmann_json::nlohmann_json)

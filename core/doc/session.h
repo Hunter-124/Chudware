@@ -63,6 +63,19 @@ nlohmann::json doc_tree(const std::string& doc_id);     // no rebuild, no rev bu
 nlohmann::json doc_rebuild(const std::string& doc_id);  // forced rebuild, no rev bump
 bool doc_close(const std::string& doc_id);
 
+// C20 assembly RPCs (port of engine/doc/session.py solve_mates / set_explode_state /
+// asm_world_bodies). doc_solve_mates re-solves the mates (optional drag {component,
+// target[3]} soft-target), persists the solved transforms, bumps the revision, and
+// returns the ops-response carrying doc_status (dof/over_defined/mate_status). Throws
+// OpError("invalid_op") on a non-assembly doc.
+nlohmann::json doc_solve_mates(const std::string& doc_id,
+                               const nlohmann::json& drag = nlohmann::json(nullptr));
+// Toggle the exploded-view state and re-tessellate (no revision bump — view-only).
+nlohmann::json doc_set_explode_state(const std::string& doc_id, bool active, double factor);
+// World-placed component bodies (name + component + world bbox) for interference / BOM /
+// drawings (`explode` applies the explode offset when the explode view is active).
+nlohmann::json doc_asm_world_bodies(const std::string& doc_id, bool explode = false);
+
 // Enumerate the open C++ sessions: {"docs":[{doc_id,name,kind,path,revision,dirty}]}.
 // Mirrors engine.doc.session.list_sessions (metadata only — no compile).
 nlohmann::json doc_list();

@@ -1274,6 +1274,23 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 return emit(aicad::doc::doc_tree(params.value("doc_id", std::string())), out_json, 0);
             if (m == "doc_rebuild")
                 return emit(aicad::doc::doc_rebuild(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "doc_solve_mates")
+                return emit(aicad::doc::doc_solve_mates(
+                                params.value("doc_id", std::string()),
+                                params.contains("drag") ? params["drag"] : json(nullptr)),
+                            out_json, 0);
+            if (m == "doc_set_explode_state")
+                return emit(aicad::doc::doc_set_explode_state(
+                                params.value("doc_id", std::string()),
+                                params.value("active", false),
+                                params.contains("factor") && params["factor"].is_number()
+                                    ? params["factor"].get<double>() : 1.0),
+                            out_json, 0);
+            if (m == "asm_world_bodies")
+                return emit(aicad::doc::doc_asm_world_bodies(
+                                params.value("doc_id", std::string()),
+                                params.value("explode", false)),
+                            out_json, 0);
             if (m == "doc_close")
                 return emit(json{{"closed", aicad::doc::doc_close(params.value("doc_id", std::string()))}},
                             out_json, 0);
@@ -1403,6 +1420,10 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string()),
                                 params.contains("ref") ? params["ref"] : json(nullptr)),
+                            out_json, 0);
+            if (m == "weld_cut_list")
+                return emit(aicad::doc::doc_weld_cut_list(
+                                params.value("doc_id", std::string())),
                             out_json, 0);
             if (m == "eval_mass")
                 return emit(aicad::doc::doc_eval_mass(

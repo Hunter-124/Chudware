@@ -80,6 +80,9 @@
 
 #include <Eigen/Eigenvalues>
 
+#include <memory>
+
+#include "doc/assembly.h"
 #include "doc/document.h"
 #include "doc/formats.h"
 #include "doc/selectors.h"
@@ -90,6 +93,7 @@
 #include "geom/plane.h"
 #include "geom/profile.h"
 #include "geom/tessellate.h"
+#include "mate/mate.h"
 #include "sketch/sketch.h"
 #include "util/expr.h"
 
@@ -125,6 +129,17 @@ struct Session {
     std::map<std::string, std::string> extra_entries;  // unknown .step+ entries (verbatim)
     std::map<std::string, std::string> checkpoints;    // PM-cancel snapshots: id -> doc JSON
     std::optional<SketchState> active_sketch;          // C18 sketch-edit lifecycle
+
+    // C20 — assembly state. asm_result is the last assembly compile; asm_warm seeds the
+    // next mate solve; explode_active/explode_factor drive tessellation-time offsets.
+    std::shared_ptr<AssemblyResult> asm_result;        // nullptr until first assembly rebuild
+    aicad::mate::WarmMap asm_warm;
+    bool explode_active = false;
+    double explode_factor = 1.0;
+
+    bool is_assembly() const {
+        return doc.is_object() && doc.value("schema", std::string()) == "aicad.asm/1";
+    }
 };
 
 constexpr std::size_t kUndoLimit = 100;
@@ -166,6 +181,20 @@ json blank_part(const std::string& doc_id, const std::string& name) {
         {"material", nullptr},
         {"equations", {{"globals", json::array()}}},
         {"features", json::array()},
+    };
+}
+
+json blank_assembly(const std::string& doc_id, const std::string& name) {
+    return json{
+        {"schema", "aicad.asm/1"},
+        {"id", doc_id},
+        {"name", name.empty() ? std::string("Assembly1") : name},
+        {"units", {{"system", "MMGS"}}},
+        {"equations", {{"globals", json::array()}}},
+        {"components", json::array()},
+        {"mates", json::array()},
+        {"features", json::array()},
+        {"explode", json::array()},
     };
 }
 
@@ -1039,6 +1068,150 @@ void op_sketch_move(json& doc, const json& op, std::size_t idx, IdGen& gen, json
 }
 
 // Dispatch one op against the working doc.
+// ----------------------------------------------------------------- assembly ops
+// Port of engine/doc/ops.py::_op_asm_* (component + mate vocabulary). IdGen mints
+// k<N> components and m<N> mates; the existing IdGen.note() already records k/m highs
+// from a loaded doc (any prefix letters + digits) so counters never reuse a freed id.
+
+const std::array<double, 16> kIdent16{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+void op_asm_insert_component(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+    const json& source = op.contains("source") ? op["source"] : json(nullptr);
+    bool ok_src = source.is_object() &&
+                  ((source.contains("path") && source["path"].is_string()) ||
+                   (source.contains("embedded") && source["embedded"].is_string()));
+    if (!ok_src)
+        throw OpError("invalid_op", "asm_insert_component requires source.{path|embedded}",
+                      {{"index", idx}});
+    const std::string kid = gen.next("k");
+    if (!doc.contains("components") || !doc["components"].is_array()) doc["components"] = json::array();
+    json& comps = doc["components"];
+    bool first = comps.empty();
+    // Default name = source file stem (SolidWorks names components from the file).
+    std::string default_name = kid;
+    if (source.contains("path") && source["path"].is_string()) {
+        std::string stem = source["path"].get<std::string>();
+        for (char& c : stem) if (c == '\\') c = '/';
+        auto slash = stem.rfind('/');
+        if (slash != std::string::npos) stem = stem.substr(slash + 1);
+        static const char* exts[] = {".step+", ".step", ".stp", ".stl", ".brep", ".iges", ".igs"};
+        std::string low = stem;
+        std::transform(low.begin(), low.end(), low.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        for (const char* e : exts) {
+            std::string es(e);
+            if (low.size() >= es.size() && low.compare(low.size() - es.size(), es.size(), es) == 0) {
+                stem = stem.substr(0, stem.size() - es.size());
+                break;
+            }
+        }
+        default_name = stem.empty() ? kid : stem;
+    }
+    json comp;
+    comp["id"] = kid;
+    comp["name"] = (op.contains("name") && op["name"].is_string() && !op["name"].get<std::string>().empty())
+                       ? op["name"] : json(default_name);
+    comp["source"] = source;
+    comp["transform"] = (op.contains("transform") && op["transform"].is_array())
+                            ? op["transform"] : json(kIdent16);
+    comp["fixed"] = op.contains("fixed") ? json(op.value("fixed", first)) : json(first);
+    comp["suppressed"] = false;
+    comps.push_back(std::move(comp));
+    id_map["$" + std::to_string(idx)] = kid;
+}
+
+void op_asm_edit_component(json& doc, const json& op, std::size_t idx) {
+    const std::string kid = op.value("id", std::string());
+    if (doc.contains("components") && doc["components"].is_array())
+        for (json& c : doc["components"])
+            if (c.value("id", std::string()) == kid) {
+                for (const char* k : {"transform", "name", "suppressed", "fixed"})
+                    if (op.contains(k) && !op[k].is_null()) c[k] = op[k];
+                return;
+            }
+    throw OpError("invalid_op", "asm_edit_component: '" + kid + "' not found", {{"index", idx}});
+}
+
+void op_asm_delete_component(json& doc, const json& op, std::size_t idx) {
+    const std::string kid = op.value("id", std::string());
+    json comps = (doc.contains("components") && doc["components"].is_array()) ? doc["components"]
+                                                                             : json::array();
+    bool found = false;
+    for (const json& c : comps)
+        if (c.value("id", std::string()) == kid) { found = true; break; }
+    if (!found)
+        throw OpError("invalid_op", "asm_delete_component: '" + kid + "' not found", {{"index", idx}});
+    json mates = (doc.contains("mates") && doc["mates"].is_array()) ? doc["mates"] : json::array();
+    std::vector<std::string> referencing;
+    for (const json& m : mates) {
+        bool refs_kid = false;
+        if (m.contains("refs") && m["refs"].is_array())
+            for (const json& r : m["refs"])
+                if (r.is_object() && r.value("component", std::string()) == kid) refs_kid = true;
+        if (refs_kid) referencing.push_back(m.value("id", std::string()));
+    }
+    if (!referencing.empty() && !op.value("cascade", false))
+        throw OpError("dependency_exists",
+                      "component '" + kid + "' used by mates", {{"dependents", referencing}});
+    json kept_comps = json::array();
+    for (const json& c : comps)
+        if (c.value("id", std::string()) != kid) kept_comps.push_back(c);
+    doc["components"] = kept_comps;
+    json kept_mates = json::array();
+    for (const json& m : mates) {
+        bool refs_kid = false;
+        if (m.contains("refs") && m["refs"].is_array())
+            for (const json& r : m["refs"])
+                if (r.is_object() && r.value("component", std::string()) == kid) refs_kid = true;
+        if (!refs_kid) kept_mates.push_back(m);
+    }
+    doc["mates"] = kept_mates;
+}
+
+void op_asm_add_mate(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+    if (!op.contains("mate") || !op["mate"].is_object())
+        throw OpError("invalid_op", "asm_add_mate requires a 'mate' object", {{"index", idx}});
+    json m = op["mate"];  // deep copy
+    m["id"] = gen.next("m");
+    if (!m.contains("suppressed")) m["suppressed"] = false;
+    if (!m.contains("align")) m["align"] = "aligned";
+    if (!doc.contains("mates") || !doc["mates"].is_array()) doc["mates"] = json::array();
+    doc["mates"].push_back(m);
+    id_map["$" + std::to_string(idx)] = m["id"];
+}
+
+void op_asm_edit_mate(json& doc, const json& op, std::size_t idx) {
+    const std::string mid = op.value("id", std::string());
+    if (doc.contains("mates") && doc["mates"].is_array())
+        for (json& m : doc["mates"])
+            if (m.value("id", std::string()) == mid) {
+                for (const char* k : {"value", "align", "suppressed"})
+                    if (op.contains(k) && !op[k].is_null()) m[k] = op[k];
+                return;
+            }
+    throw OpError("invalid_op", "asm_edit_mate: '" + mid + "' not found", {{"index", idx}});
+}
+
+void op_asm_delete_mate(json& doc, const json& op, std::size_t idx) {
+    const std::string mid = op.value("id", std::string());
+    json mates = (doc.contains("mates") && doc["mates"].is_array()) ? doc["mates"] : json::array();
+    bool found = false;
+    for (const json& m : mates)
+        if (m.value("id", std::string()) == mid) { found = true; break; }
+    if (!found)
+        throw OpError("invalid_op", "asm_delete_mate: '" + mid + "' not found", {{"index", idx}});
+    json kept = json::array();
+    for (const json& m : mates)
+        if (m.value("id", std::string()) != mid) kept.push_back(m);
+    doc["mates"] = kept;
+}
+
+void op_asm_set_explode(json& doc, const json& op, std::size_t idx) {
+    if (!op.contains("steps") || !op["steps"].is_array())
+        throw OpError("invalid_op", "asm_set_explode requires a 'steps' list", {{"index", idx}});
+    doc["explode"] = op["steps"];
+}
+
 void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     if (!op.is_object() || !op.contains("op") || !op["op"].is_string())
         throw OpError("unsupported", "op[" + std::to_string(idx) + "]: missing 'op'",
@@ -1093,6 +1266,13 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
     else if (k == "sketch_mirror_entities")     op_sketch_mirror_entities(doc, op, idx, gen, id_map);
     else if (k == "sketch_pattern_entities")    op_sketch_pattern_entities(doc, op, idx, gen, id_map);
     else if (k == "sketch_move")                op_sketch_move(doc, op, idx, gen, id_map);
+    else if (k == "asm_insert_component")       op_asm_insert_component(doc, op, idx, gen, id_map);
+    else if (k == "asm_edit_component")         op_asm_edit_component(doc, op, idx);
+    else if (k == "asm_delete_component")       op_asm_delete_component(doc, op, idx);
+    else if (k == "asm_add_mate")               op_asm_add_mate(doc, op, idx, gen, id_map);
+    else if (k == "asm_edit_mate")              op_asm_edit_mate(doc, op, idx);
+    else if (k == "asm_delete_mate")            op_asm_delete_mate(doc, op, idx);
+    else if (k == "asm_set_explode")            op_asm_set_explode(doc, op, idx);
     else
         throw OpError("unsupported", "op[" + std::to_string(idx) + "]: unknown op '" + k + "'",
                       {{"index", idx}, {"reason", "not ported"}});
@@ -1179,6 +1359,108 @@ void push_undo(Session& s) {
     if (s.undo_stack.size() > kUndoLimit)
         s.undo_stack.erase(s.undo_stack.begin());
     s.redo_stack.clear();
+}
+
+std::string config_active_name(const json& doc);  // defined below (configurations section)
+
+// ----------------------------------------------------------------- assembly rebuild
+// Solve the assembly's mates, write the solved transforms back into the doc (so a save
+// captures the mated pose), and cache the AssemblyResult on the session (port of
+// session.py::_rebuild_assembly). base_dir resolves relative component source paths.
+void rebuild_assembly(Session& s) {
+    std::string base_dir;
+    if (!s.path.empty()) base_dir = std::filesystem::path(s.path).parent_path().string();
+    std::optional<aicad::mate::WarmMap> warm;
+    if (!s.asm_warm.empty()) warm = s.asm_warm;
+    AssemblyResult ares = compile_assembly(s.doc, base_dir, warm);
+    // Persist solved transforms back into the document (matched by component id).
+    if (s.doc.contains("components") && s.doc["components"].is_array())
+        for (json& comp : s.doc["components"]) {
+            const std::string cid = comp.value("id", std::string());
+            auto it = ares.transforms.find(cid);
+            if (it != ares.transforms.end()) comp["transform"] = it->second;
+        }
+    s.asm_warm = ares.warm;
+    s.asm_result = std::make_shared<AssemblyResult>(std::move(ares));
+}
+
+// Tessellate each component (world-placed + optional explode offset) as one AICM body
+// and write the AICM (port of session.py::_write_aicm_assembly). Returns (path, bodies-meta).
+std::pair<std::string, json> write_aicm_assembly(Session& s) {
+    json bodies_meta = json::array();
+    std::vector<aicm::AicmBody> tesses;
+    std::map<std::string, Eigen::Vector3d> offsets;
+    if (s.explode_active) offsets = explode_offsets(s.doc, s.explode_factor);
+    const AssemblyResult* ares = s.asm_result.get();
+    if (ares) {
+        for (const AsmBodyOut& body : ares->bodies) {
+            std::optional<Eigen::Vector3d> off;
+            auto oit = offsets.find(body.component_id);
+            if (oit != offsets.end()) off = oit->second;
+            TopoDS_Shape world = placed_world_shape(body, off);
+            float color[3] = {body.color[0], body.color[1], body.color[2]};
+            aicm::AicmBody bt = ::geom::tessellate_body(world, static_cast<uint32_t>(body.body_id),
+                                                        body.name, color);
+            tesses.push_back(std::move(bt));
+            bodies_meta.push_back({{"body_id", body.body_id}, {"name", body.name},
+                                   {"color", {body.color[0], body.color[1], body.color[2]}},
+                                   {"component", body.component_id},
+                                   {"owner_key", body.component_id},
+                                   {"metallic", 0.0}, {"roughness", 0.5}});
+        }
+    }
+    std::filesystem::path target = aicm_file(s.doc_id, s.revision);
+    aicm::write_aicm_file(target.string(), tesses);
+    return {std::filesystem::absolute(target).string(), bodies_meta};
+}
+
+// The assembly ops-response (port of the assembly branch of session.py::_ops_response).
+json ops_response_assembly(Session& s, const json& id_map) {
+    auto [aicm_path, bodies_meta] = write_aicm_assembly(s);
+    const AssemblyResult* ares = s.asm_result.get();
+
+    json feature_status = json::array();
+    json components = json::array();
+    json mates = json::array();
+    int dof = 0;
+    bool over_defined = false;
+    std::string dof_summary;
+    if (ares) {
+        for (const AsmComponentStatus& cs : ares->component_status) {
+            json row = {{"id", cs.id}, {"ok", cs.ok}, {"ms", cs.ms},
+                        {"error", cs.error ? json(*cs.error) : json(nullptr)},
+                        {"dangling_refs", cs.dangling_refs}};
+            feature_status.push_back(row);
+            components.push_back(row);
+        }
+        for (const AsmMateStatus& ms : ares->mate_status)
+            mates.push_back({{"id", ms.id}, {"type", ms.type}, {"status", ms.status},
+                             {"dangling_refs", ms.dangling_refs}});
+        dof = ares->dof;
+        over_defined = ares->over_defined;
+        dof_summary = ares->dof_summary;
+    }
+
+    json active_sketch_status = nullptr;  // assemblies have no active sketch
+    json rebuild = {
+        {"feature_status", feature_status},
+        {"doc_status", {{"active_sketch", active_sketch_status},
+                        {"mates", over_defined ? "over" : "ok"},
+                        {"active_configuration", config_active_name(s.doc)}}},
+        {"components", components},
+        {"mates", mates},
+        {"dof", dof},
+        {"over_defined", over_defined},
+        {"dof_summary", dof_summary},
+    };
+    return json{
+        {"revision", s.revision},
+        {"id_map", id_map},
+        {"tree", s.doc},
+        {"rebuild", rebuild},
+        {"tess", {{"aicm_path", aicm_path}, {"bodies", bodies_meta}}},
+        {"owner_map", json::object()},
+    };
 }
 
 // ----------------------------------------------------------------- configurations
@@ -1280,6 +1562,10 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
     s.doc = std::move(working);
     s.revision += 1;
     s.dirty = true;
+    if (s.is_assembly()) {
+        rebuild_assembly(s);
+        return ops_response_assembly(s, id_map);
+    }
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     return ops_response(s, r, id_map, /*with_tess=*/true);
 }
@@ -1537,10 +1823,22 @@ json sketch_result(const json& feat, const SolveActive& packed,
 
 // ----------------------------------------------------------------- public API
 json doc_new(const std::string& kind, const std::string& name) {
-    if (!kind.empty() && kind != "part")
-        throw OpError("unsupported", "doc_new: only 'part' documents are supported in the C++ core",
-                      {{"kind", kind}});
+    const std::string k = kind.empty() ? std::string("part") : kind;
+    if (k != "part" && k != "assembly")
+        throw OpError("invalid_op", "doc kind must be part|assembly, got '" + k + "'",
+                      {{"kind", kind}, {"reason", "bad kind"}});
     std::lock_guard<std::mutex> lk(g_mtx);
+    if (k == "assembly") {
+        Session s;
+        s.doc_id = new_doc_id();
+        s.doc = blank_assembly(s.doc_id, name);
+        s.revision = 0;
+        Session& stored = g_sessions[s.doc_id] = std::move(s);
+        rebuild_assembly(stored);
+        json resp = ops_response_assembly(stored, json::object());
+        resp["doc_id"] = stored.doc_id;
+        return resp;
+    }
     Session& stored = new_part_session_locked(name);
     CompileResult r = compile_document(stored.doc, env_from_doc(stored.doc));
     json resp = ops_response(stored, r, json::object(), /*with_tess=*/true);
@@ -1604,6 +1902,11 @@ json doc_undo(const std::string& doc_id) {
     // C50: drop warm sketch state so the next solve COLD-solves the restored seeds
     // (session.py: active_sketch.solve_state = None on undo/redo).
     if (s.active_sketch) s.active_sketch->solve_state.reset();
+    if (s.is_assembly()) {
+        s.asm_warm.clear();  // re-seed mate solve from the restored doc transforms
+        rebuild_assembly(s);
+        return ops_response_assembly(s, json::object());
+    }
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     return ops_response(s, r, json::object(), /*with_tess=*/true);
 }
@@ -1620,6 +1923,11 @@ json doc_redo(const std::string& doc_id) {
     s.revision += 1;
     s.dirty = true;
     if (s.active_sketch) s.active_sketch->solve_state.reset();  // C50 (see doc_undo)
+    if (s.is_assembly()) {
+        s.asm_warm.clear();  // re-seed mate solve from the restored doc transforms
+        rebuild_assembly(s);
+        return ops_response_assembly(s, json::object());
+    }
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     return ops_response(s, r, json::object(), /*with_tess=*/true);
 }
@@ -1627,6 +1935,13 @@ json doc_redo(const std::string& doc_id) {
 json doc_tree(const std::string& doc_id) {
     std::lock_guard<std::mutex> lk(g_mtx);
     Session& s = require_session(doc_id);
+    if (s.is_assembly()) {
+        json resp;
+        resp["revision"] = s.revision;
+        resp["tree"] = s.doc;
+        resp["owner_map"] = json::object();
+        return resp;
+    }
     // No revision bump / no tess, but DO carry the owner_map (host picking) — recompute.
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     json resp;
@@ -1639,8 +1954,102 @@ json doc_tree(const std::string& doc_id) {
 json doc_rebuild(const std::string& doc_id) {
     std::lock_guard<std::mutex> lk(g_mtx);
     Session& s = require_session(doc_id);
+    if (s.is_assembly()) {
+        rebuild_assembly(s);
+        return ops_response_assembly(s, json::object());
+    }
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     return ops_response(s, r, json::object(), /*with_tess=*/true);
+}
+
+// ============================================================ C20 assembly RPCs
+// doc_solve_mates: re-solve the assembly mates (optionally with a drag soft-target),
+// persist the solved transforms, bump the revision (one undoable step), and return the
+// ops-response (port of session.py::solve_mates). doc_set_explode_state toggles the
+// explode view and re-tessellates without a revision bump.
+
+json doc_solve_mates(const std::string& doc_id, const json& drag) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    if (!s.is_assembly())
+        throw OpError("invalid_op", "doc_solve_mates: document is not an assembly",
+                      {{"reason", "not an assembly"}});
+    std::string base_dir;
+    if (!s.path.empty()) base_dir = std::filesystem::path(s.path).parent_path().string();
+    push_undo(s);
+
+    std::optional<aicad::mate::WarmMap> warm;
+    if (!s.asm_warm.empty()) warm = s.asm_warm;
+    std::optional<aicad::mate::Drag> drag_opt;
+    if (drag.is_object() && drag.contains("component") && drag["component"].is_string()) {
+        // session.py::_compile_assembly_drag: first a plain compile to warm + load, then
+        // a second solve with the drag target seeded from that warm result. compile_assembly
+        // accepts a drag arg directly here, threading it to the solver in one pass.
+        aicad::mate::Drag d;
+        d.component = drag["component"].get<std::string>();
+        if (drag.contains("target") && drag["target"].is_array() && drag["target"].size() == 3)
+            d.target = Eigen::Vector3d(drag["target"][0].get<double>(),
+                                       drag["target"][1].get<double>(),
+                                       drag["target"][2].get<double>());
+        drag_opt = d;
+    }
+    AssemblyResult ares = compile_assembly(s.doc, base_dir, warm, drag_opt);
+    if (s.doc.contains("components") && s.doc["components"].is_array())
+        for (json& comp : s.doc["components"]) {
+            auto it = ares.transforms.find(comp.value("id", std::string()));
+            if (it != ares.transforms.end()) comp["transform"] = it->second;
+        }
+    s.asm_warm = ares.warm;
+    s.asm_result = std::make_shared<AssemblyResult>(std::move(ares));
+    s.revision += 1;
+    s.dirty = true;
+    return ops_response_assembly(s, json::object());
+}
+
+json doc_set_explode_state(const std::string& doc_id, bool active, double factor) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    if (!s.is_assembly())
+        throw OpError("invalid_op", "doc_set_explode_state: document is not an assembly",
+                      {{"reason", "not an assembly"}});
+    s.explode_active = active;
+    s.explode_factor = std::max(0.0, std::min(1.0, factor));
+    if (!s.asm_result) rebuild_assembly(s);
+    return ops_response_assembly(s, json::object());  // view-only: no revision bump
+}
+
+// World-placed component bodies for interference / BOM (port of session.py::
+// asm_world_bodies / asm_component_bodies). Returned as JSON metadata + a temp STEP
+// export per body is overkill; instead we surface per-body world bbox + name, which is
+// what the parity harness compares and what eval_interference's assembly branch consumes.
+json doc_asm_world_bodies(const std::string& doc_id, bool explode) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    if (!s.is_assembly())
+        throw OpError("invalid_op", "doc_asm_world_bodies: document is not an assembly",
+                      {{"reason", "not an assembly"}});
+    if (!s.asm_result) rebuild_assembly(s);
+    std::map<std::string, Eigen::Vector3d> offsets;
+    if (explode && s.explode_active) offsets = explode_offsets(s.doc, s.explode_factor);
+    json out = json::array();
+    if (s.asm_result)
+        for (const AsmBodyOut& body : s.asm_result->bodies) {
+            std::optional<Eigen::Vector3d> off;
+            auto oit = offsets.find(body.component_id);
+            if (oit != offsets.end()) off = oit->second;
+            TopoDS_Shape world = placed_world_shape(body, off);
+            Bnd_Box box;
+            BRepBndLib::Add(world, box);
+            json bb = nullptr;
+            if (!box.IsVoid()) {
+                double xa, ya, za, xb, yb, zb;
+                box.Get(xa, ya, za, xb, yb, zb);
+                bb = {{"min", {xa, ya, za}}, {"max", {xb, yb, zb}},
+                      {"size", {xb - xa, yb - ya, zb - za}}};
+            }
+            out.push_back({{"name", body.name}, {"component", body.component_id}, {"bbox", bb}});
+        }
+    return json{{"bodies", out}};
 }
 
 bool doc_close(const std::string& doc_id) {

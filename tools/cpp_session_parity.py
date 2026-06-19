@@ -281,6 +281,86 @@ def main() -> int:
     else:
         print(f"  {'resolve_pick (faces strict)':<28} MATCH{pick_notes}")
 
+    # 4c2) PRIMITIVE boss/cut/merge (P57e/P58): a centered box(40x40x10) then a centered
+    # `cylinder` feature with mode:"cut" (r=4, h=12) must bore a real through-hole, NOT leave
+    # the tool cylinder as a 2nd body. Regression: document.cpp's primitive branch ignored
+    # mode/merge and added the cylinder standalone -> 6+3=9 faces with bogus caps at z=+/-6
+    # (which made the host assembly seat a peg at z=16 instead of 15). The fixed body is a
+    # plate-with-through-hole: 7 faces = 4 side planes + top annulus (z=5) + bottom annulus
+    # (z=-5) + 1 cylindrical hole face. Enumerate the body's faces via doc_resolve_pick on
+    # both engines and assert the face set matches AND the SolidWorks-shaped invariants hold.
+    def _box_cut_cyl_ops():
+        return [
+            {"op": "add_feature", "feature": {"type": "box", "name": "Plate",
+                "params": {"length": 40.0, "width": 40.0, "height": 10.0, "centered": True},
+                "refs": {}}},
+            {"op": "add_feature", "feature": {"type": "cylinder", "name": "Hole",
+                "params": {"radius": 4.0, "height": 12.0, "centered": True, "mode": "cut"},
+                "refs": {}}},
+        ]
+
+    def _face_set_py(sess):
+        # resolve_pick raises OpError("topo_id out of range") past the last face — that is the
+        # face-count boundary, so catch it to terminate the enumeration.
+        from engine.doc.ops import OpError as _OpError
+        out = []
+        for tid in range(1, 64):
+            try:
+                sel = _sess.resolve_pick(sess.s, None, 1, "face", tid).get("selector")
+            except _OpError:
+                break
+            if not sel:
+                break
+            out.append(sel)
+        return out
+
+    def _face_set_cpp(cs):
+        out = []
+        for tid in range(1, 64):
+            rc, r = core.call("doc_resolve_pick",
+                              {"doc_id": cs.doc_id, "body_id": 1, "kind": "face", "topo_id": tid})
+            sel = r.get("selector") if isinstance(r, dict) else None
+            if rc != 0 or not sel:
+                break
+            out.append(sel)
+        return out
+
+    def _fkey(sel):
+        # surf + rounded centroid + rounded area-or-len: a geometry fingerprint that is
+        # order-independent across the OCCT-direct (C++) vs build123d (Python) face enums.
+        c = sel.get("centroid") or []
+        return (sel.get("surf"),
+                tuple(round(x, 3) for x in c),
+                round(sel["area_or_len"], 3) if sel.get("area_or_len") is not None else None)
+
+    py4 = py_session(); cpp4 = CppS(core)
+    py4.apply(0, _box_cut_cyl_ops()); cpp4.apply(0, _box_cut_cyl_ops())
+    pf, cf = _face_set_py(py4), _face_set_cpp(cpp4)
+    cut_diffs = []
+    # (a) the cut must have happened (one body, 7 faces) on BOTH engines.
+    if len(pf) != 7:
+        cut_diffs.append(f"py {len(pf)} faces (want 7)")
+    if len(cf) != 7:
+        cut_diffs.append(f"cpp {len(cf)} faces (want 7 — cut left tool as 2nd body?)")
+    # (b) geometry fingerprints match (the plate-with-hole topology is identical).
+    if sorted(map(_fkey, pf)) != sorted(map(_fkey, cf)):
+        cut_diffs.append("face-set mismatch")
+    # (c) SolidWorks invariants on the C++ body: exactly one cylindrical hole face, and the
+    # top planar face at z=+5 (the host max-z plane scan must land here, not on a bogus cap).
+    cyls = [s for s in cf if s.get("surf") == "cylinder"]
+    planes = [s for s in cf if s.get("surf") == "plane"]
+    if len(cyls) != 1:
+        cut_diffs.append(f"cpp {len(cyls)} cylinder faces (want 1 hole)")
+    if planes:
+        top_z = max(s["centroid"][2] for s in planes)
+        if abs(top_z - 5.0) > 1e-3:
+            cut_diffs.append(f"cpp max-z plane z={top_z:.3f} (want 5)")
+    if cut_diffs:
+        print(f"  {'primitive cut face-set':<28} DIFF: {'; '.join(cut_diffs)}")
+        mism += 1
+    else:
+        print(f"  {'primitive cut face-set':<28} MATCH")
+
     # 4d-adv) Advanced sketch ops (P13): trim / extend / offset / fillet / chamfer /
     # mirror_entities / pattern_entities / move. Drive the SAME op batch through both
     # engines and compare the resulting sketch entities + constraints (canonical, float-
@@ -805,7 +885,9 @@ def main() -> int:
     print(f"  {'stale_revision guard':<28} {'MATCH' if ok else 'DIFF: ' + str(cr)}")
     mism += 0 if ok else 1
 
-    total = 12 + adv_total + cfg_total + pp_total + fmt_total
+    # base 13 = the discrete top-level checks (compare() steps + resolve_pick faces +
+    # primitive-cut face-set + checkpoint/revert/undo + stale_revision guard).
+    total = 13 + adv_total + cfg_total + pp_total + fmt_total
     print(f"\n[session-parity] {total - mism}/{total} steps at full parity")
     return mism
 

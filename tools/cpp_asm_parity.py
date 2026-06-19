@@ -561,11 +561,11 @@ def main() -> int:
     # This case gates the doc_resolve_pick ASSEMBLY branch (the z=18 root cause): the C++ pick
     # path must resolve assembly bodies (return {selector, component}) so the host can add the
     # mates and the peg leaves its seed z=18. We assert BOTH engines resolve 2 mates and seat the
-    # peg OFF the seed. (The exact seat z is gated TIGHTLY by case 8 'peg seated z==15', which
-    # uses a real-boolean .step base. Here the C++ part-compiler leaves the centered cut-cylinder
-    # as a SECOND body with protruding caps at z=+/-6 — a separate document.cpp primitive-`mode`
-    # bug, OUT OF assembly scope — so the C++ max-z plane scan lands on z=6 -> peg z=16. We FLAG
-    # that residual but do not let a non-assembly bug fail the assembly gate.)
+    # peg at EXACTLY z=15. (Was: tolerated cz=16, because the C++ part-compiler left the centered
+    # cut-cylinder as a SECOND body with protruding caps at z=+/-6, so the max-z plane scan landed
+    # on z=6 -> peg z=16. P57e/P58 ported the primitive boss/cut/merge semantics to document.cpp,
+    # so the cut now bores a real through-hole, the plate top is the only max-z plane at z=5, and
+    # the peg seats at z=15 — same as the Python oracle and the real-boolean .step base in case 8.)
     total += 1
     try:
         py = py_session(); cpp = CppS(core)
@@ -578,15 +578,12 @@ def main() -> int:
             hdiffs.append(f"cpp added {cn} mates (want 2 — assembly picks must resolve)")
         if pz is None or abs(pz - 15.0) > 1e-3:
             hdiffs.append(f"py peg z={pz} != 15")
-        # MY scope: the C++ pick fix must move the peg off its seed z=18 (was: stayed at 18).
-        if cz is None or abs(cz - 18.0) < 1e-3:
-            hdiffs.append(f"cpp peg STUCK at seed z={cz} (assembly pick did not resolve)")
-        note = ""
-        if cz is not None and abs(cz - 15.0) > 1e-3 and abs(cz - 18.0) >= 1e-3:
-            note = (f"  [note: cpp peg z={cz:.3f} (not 15) — document.cpp centered-cut primitive "
-                    f"leaves z=+/-6 caps; OUT OF assembly scope]")
+        # The C++ pick fix (off seed z=18) AND the primitive-cut fix (real through-hole, max-z
+        # plane at z=5) must together seat the peg at exactly z=15, matching Python.
+        if cz is None or abs(cz - 15.0) > 1e-3:
+            hdiffs.append(f"cpp peg z={cz} != 15 (assembly pick + primitive-cut must seat at 15)")
         print(f"  {'host-path assembly pick->mate->seat':<34} "
-              f"{'MATCH' if not hdiffs else 'DIFF: ' + '; '.join(hdiffs)}{note}")
+              f"{'MATCH' if not hdiffs else 'DIFF: ' + '; '.join(hdiffs)}")
         mism += 0 if not hdiffs else 1
     except Exception as exc:  # noqa: BLE001
         print(f"  {'host-path assembly pick->mate->seat':<34} DIFF: raised {type(exc).__name__}: {exc}")

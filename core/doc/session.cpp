@@ -232,6 +232,15 @@ struct IdGen {
                 }
             }
         }
+        // Assembly id families (mirrors ops.py::_scan_max): components mint k<N>, mates m<N>.
+        // Without seeding these, a fresh apply_ops batch restarts the counter at 0 and a
+        // second asm_insert_component re-mints 'k1' -> "duplicate 'k1'" validation failure.
+        for (const char* fam : {"components", "mates"}) {
+            if (doc.contains(fam) && doc[fam].is_array())
+                for (const json& it : doc[fam])
+                    if (it.is_object() && it.contains("id") && it["id"].is_string())
+                        note(it["id"].get<std::string>());
+        }
     }
     std::string next(const std::string& prefix) {
         int n = ++hi[prefix];

@@ -392,6 +392,33 @@ def main() -> int:
     run("unmated 2 fixed boxes", ops_unmated,
         {"k1", "k2"}, {"k1": (20, 20, 20), "k2": (10, 10, 10)}, fully_constrained={"k1", "k2"})
 
+    # ---- 7. STAGED inserts in SEPARATE op-batches: the component-id counter (k<N>) must
+    # carry across apply_ops calls (regression: a fresh batch re-minted 'k1' -> duplicate id
+    # validation failure, because the C++ IdGen seeded only features, not components/mates). ----
+    total += 1
+    try:
+        py = py_session(); cpp = CppS(core)
+        py_ids, cpp_ids = [], []
+        for i, src in enumerate((box20, box10, box20)):
+            pr = py.apply(i, [_insert(src, None, fixed=(i == 0))])
+            cr = cpp.apply(i, [_insert(src, None, fixed=(i == 0))])
+            py_ids.append(pr["id_map"]["$0"]); cpp_ids.append(cr["id_map"]["$0"])
+        # then a mate referencing the staged ids, in its own batch
+        py.apply(3, [_mate("coincident", [{"component": "k1", "selector": _face_selector([20, 10, 10], [1, 0, 0], 400)},
+                                          {"component": "k2", "selector": _face_selector([0, 10, 10], [-1, 0, 0], 400)}])])
+        cpp.apply(3, [_mate("coincident", [{"component": "k1", "selector": _face_selector([20, 10, 10], [1, 0, 0], 400)},
+                                           {"component": "k2", "selector": _face_selector([0, 10, 10], [-1, 0, 0], 400)}])])
+        sdiffs = []
+        if py_ids != ["k1", "k2", "k3"]:
+            sdiffs.append(f"py ids {py_ids}")
+        if cpp_ids != py_ids:
+            sdiffs.append(f"cpp ids {cpp_ids} != py {py_ids}")
+        print(f"  {'staged separate-batch inserts':<34} {'MATCH' if not sdiffs else 'DIFF: ' + '; '.join(sdiffs)}")
+        mism += 0 if not sdiffs else 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"  {'staged separate-batch inserts':<34} DIFF: raised {type(exc).__name__}: {exc}")
+        mism += 1
+
     print(f"\n[asm-parity] {total - mism}/{total} checks at full parity")
     return mism
 

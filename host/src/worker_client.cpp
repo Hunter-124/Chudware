@@ -71,10 +71,12 @@ bool routeDocToCpp(const std::string& method, const json& params) {
         }
     }
     // doc_new / doc_open / import_file (no `into`) MINT a fresh doc -> route to C++ when
-    // the flag is on. The C++ core handles only PART documents, so a doc_new that names
-    // an assembly stays on Python; a doc_open of a non-part container is detected by the
-    // core (code "unsupported") and falls back below. import_file with `into` is handled
-    // by the prefix check above (it appends to whichever engine owns that doc).
+    // the flag is on. C++ PART docs route; ASSEMBLY docs stay on Python for now: the C++
+    // assembly compile (P57b) is parity-clean on the cpp_asm_parity fixtures BUT the asm
+    // scenario (concentric + coincident-anti seating a peg) places it at z=18 vs Python's
+    // z=15 — an un-isolated discrepancy (not the align key/normal — likely component
+    // local-frame loading or the coincident plane-point). Keep assemblies Python until
+    // that is fixed + gated, then re-enable here.  TODO(asm-seat): re-add "assembly".
     if (!cppDocsFlag()) return false;
     if (method == "doc_new") {
         const std::string kind = params.is_object() ? params.value("kind", std::string("part"))

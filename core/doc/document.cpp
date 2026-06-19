@@ -1719,7 +1719,38 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 }
                 if (solid.IsNull())
                     throw std::runtime_error(type + " produced an empty solid");
-                results[id] = SolidResult{solid};
+
+                // Apply boss/cut/merge against the running body, matching
+                // engine/doc/features/primitives.py::_apply_boolean: a FIRST primitive (no
+                // body) or merge:false starts a NEW body; otherwise mode "cut" subtracts and
+                // "boss" fuses into the current top body (which is consumed). Previously the
+                // primitive was ALWAYS added as a new body, so e.g. a cylinder with mode:"cut"
+                // left the tool as a 2nd body instead of boring a hole.
+                const std::string pmode = feat.value("mode", std::string("boss"));
+                const bool pmerge = feat.value("merge", true);
+                const std::string ptgt = pmerge ? current_solid_id() : std::string();
+                if (ptgt.empty()) {
+                    if (pmode == "cut")
+                        throw std::runtime_error(type + ": cut mode requires an existing body");
+                    results[id] = SolidResult{solid};
+                } else {
+                    const TopoDS_Shape& target = require_solid(results, ptgt, "target");
+                    TopoDS_Shape out = (pmode == "cut") ? ::geom::cut(target, solid)
+                                                        : ::geom::fuse(target, solid);
+                    if (out.IsNull())
+                        throw std::runtime_error("primitive boolean " + pmode +
+                                                 " produced an empty shape");
+                    if (pmode == "cut") {
+                        GProp_GProps gb, ga;
+                        BRepGProp::VolumeProperties(target, gb);
+                        BRepGProp::VolumeProperties(out, ga);
+                        if (std::abs(ga.Mass() - gb.Mass()) < 1e-9)
+                            throw std::runtime_error("primitive cut removed no material");
+                    }
+                    consumed.insert(ptgt);
+                    source_of[id] = ptgt;  // owner-map: result derives from the target body
+                    results[id] = SolidResult{out};
+                }
                 solid_order.push_back(id);
                 st.ok = true;
 

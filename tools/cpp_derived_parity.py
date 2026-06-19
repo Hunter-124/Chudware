@@ -398,6 +398,148 @@ def main() -> int:
           == crc["derived"]["groups"][0]["status"],
           {"py": prc["derived"]["groups"], "cpp": crc["derived"]["groups"]})
 
+    # 9) paste_feature (NON-derived) round-trip into the SAME doc: a second body of equal
+    #    volume, fresh non-colliding ids, and INDEPENDENCE (editing the original sketch must
+    #    NOT move the pasted copy). Validates op_paste_feature + the in-closure ref re-link.
+    ps9 = py.new("RT")
+    cs9 = cpp.new("RT")
+    py.apply(ps9, _source_ops(10.0))
+    cpp.apply(cs9, _source_ops(10.0))
+    pb9 = py.copy(ps9, "f2")["id_map"]["$bundle"]
+    cb9 = cpp.copy(cs9, "f2")["id_map"]["$bundle"]
+    ppr = py.apply(ps9, [{"op": "paste_feature", "bundle": pb9}])
+    cpr = cpp.apply(cs9, [{"op": "paste_feature", "bundle": cb9}])
+    check("paste_feature feat_ids", feat_ids(ppr["tree"]) == feat_ids(cpr["tree"]),
+          f"{feat_ids(ppr['tree'])} != {feat_ids(cpr['tree'])}")
+    check("paste_feature two-body volume",
+          abs(py.vol(ppr) - cpp.vol(cpr)) / max(abs(py.vol(ppr)), 1.0) < 1e-3,
+          f"{py.vol(ppr):.1f} != {cpp.vol(cpr):.1f}")
+    # The pasted (non-derived) features carry NO derived_from link.
+    check("paste_feature no derived stamp",
+          derived_features(ppr["tree"]) == [] == derived_features(cpr["tree"]),
+          {"py": len(derived_features(ppr["tree"])), "cpp": len(derived_features(cpr["tree"]))})
+    p_psk = ppr["id_map"]["$0#0"]   # pasted sketch (dependency-first: sketch then extrude)
+    c_psk = cpr["id_map"]["$0#0"]
+
+    def _e1_p2(tree, fid):
+        for f in tree.get("features", []):
+            if f.get("id") == fid:
+                ents = f.get("params", {}).get("entities", [])
+                return ents[0].get("p2") if ents else None
+        return None
+
+    # Edit the ORIGINAL sketch's first line; the pasted copy must be untouched (independent).
+    ppe = py.apply(ps9, [{"op": "sketch_edit_entity", "sketch": "f1", "id": "e1",
+                          "params": {"p2": [50.0, 0.0]}}])
+    cpe = cpp.apply(cs9, [{"op": "sketch_edit_entity", "sketch": "f1", "id": "e1",
+                           "params": {"p2": [50.0, 0.0]}}])
+    check("paste_feature independence",
+          _e1_p2(ppe["tree"], p_psk) == [20.0, 0.0] and _e1_p2(cpe["tree"], c_psk) == [20.0, 0.0]
+          and _e1_p2(ppe["tree"], "f1") == [50.0, 0.0] == _e1_p2(cpe["tree"], "f1"),
+          f"py pasted={_e1_p2(ppe['tree'], p_psk)} orig={_e1_p2(ppe['tree'], 'f1')} "
+          f"cpp pasted={_e1_p2(cpe['tree'], c_psk)} orig={_e1_p2(cpe['tree'], 'f1')}")
+
+    # 10) A garbage bundle is a clean invalid_op (atomic rejection) on both engines.
+    pg = py.new("Bad")
+    cg = cpp.new("Bad")
+    py.apply(pg, [_box_op()])
+    cpp.apply(cg, [_box_op()])
+    bad_bundles = [{"kind": "nope"},
+                   {"kind": "aicad.feature_bundle/1"},                       # missing order/features
+                   {"kind": "aicad.feature_bundle/1", "feature_order": [], "features": {}}]
+    for i, bad in enumerate(bad_bundles):
+        try:
+            py.apply(pg, [{"op": "paste_feature", "bundle": bad}])
+            py_ok = False
+        except py.P.OpError as exc:
+            py_ok = exc.code == "invalid_op"
+        rc, cre = cpp.core.call("doc_apply_ops", {"doc_id": cg["doc_id"],
+                                                  "ops": [{"op": "paste_feature", "bundle": bad}]})
+        cpp_ok = rc != 0 and isinstance(cre, dict) and cre.get("code") == "invalid_op"
+        check(f"garbage bundle #{i} -> invalid_op", py_ok and cpp_ok, f"py={py_ok} cpp={cpp_ok} {cre}")
+    # The box doc must be UNCHANGED after the rejected pastes (atomic).
+    pgt = py.P.tree(pg)["tree"]
+    rc, cgt = cpp.core.call("doc_tree", {"doc_id": cg["doc_id"]})
+    check("garbage bundle atomic (doc unchanged)",
+          feat_ids(pgt) == ["f1"] == feat_ids(cgt["tree"]),
+          f"py {feat_ids(pgt)} cpp {feat_ids(cgt.get('tree', {}))}")
+
+    # 11) Cross-document EXTERNAL ref: copy the extrude WITHOUT its closure (include_dependencies
+    #     =False) so its profile region points at the out-of-closure sketch f1; paste into an EMPTY
+    #     target and require the dangling region to be flagged identically (external marker, doc id
+    #     normalized). Validates the out-of-closure branch of resolve_paste_refs / build_feature_bundle.
+    psx = py.new("X")
+    csx = cpp.new("X")
+    py.apply(psx, _source_ops(10.0))
+    cpp.apply(csx, _source_ops(10.0))
+    pcx = py.apply(psx, [{"op": "copy_feature", "id": "f2", "include_dependencies": False}])
+    ccx = cpp.apply(csx, [{"op": "copy_feature", "id": "f2", "include_dependencies": False}])
+    pbx = pcx["id_map"]["$bundle"]
+    cbx = ccx["id_map"]["$bundle"]
+    check("no-deps bundle external_refs",
+          pbx.get("external_refs") == ["f1"] == cbx.get("external_refs")
+          and pbx.get("feature_order") == ["$0"] == cbx.get("feature_order"),
+          {"py": pbx.get("external_refs"), "cpp": cbx.get("external_refs")})
+
+    def _norm_doc(obj):
+        """Recursively normalize engine-specific doc ids (and the bundle's group) for comparison."""
+        if isinstance(obj, dict):
+            return {k: ("<DOC>" if k == "doc_id" else _norm_doc(v)) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_norm_doc(v) for v in obj]
+        return obj
+
+    ptx = py.new("XT")
+    ctx = cpp.new("XT")
+    try:
+        ppx = py.apply(ptx, [{"op": "paste_feature", "bundle": pbx}])
+        py_paste_err = None
+    except py.P.OpError as exc:
+        ppx, py_paste_err = None, exc.code
+    rc, cpx = cpp.core.call("doc_apply_ops", {"doc_id": ctx["doc_id"],
+                                              "ops": [{"op": "paste_feature", "bundle": cbx}]})
+    cpp_paste_err = None if rc == 0 else (cpx.get("code") if isinstance(cpx, dict) else "error")
+    if py_paste_err or cpp_paste_err:
+        # Both engines must AGREE on rejecting (or accepting) the dangling-region paste.
+        check("cross-doc paste agree (reject)", py_paste_err == cpp_paste_err,
+              f"py={py_paste_err} cpp={cpp_paste_err}")
+    else:
+        def _region(tree):
+            for f in tree.get("features", []):
+                if f.get("type") == "extrude":
+                    prof = f.get("refs", {}).get("profile", [])
+                    return _norm_doc(prof[0]) if prof else None
+            return None
+        check("cross-doc external region marker",
+              _region(ppx["tree"]) == _region(cpx["tree"]),
+              {"py": _region(ppx["tree"]), "cpp": _region(cpx["tree"])})
+
+    # 12) refresh BY ID targets only that group (and propagates the source dimension).
+    psr = py.new("SrcR")
+    csr = cpp.new("SrcR")
+    py.apply(psr, _source_ops(10.0))
+    cpp.apply(csr, _source_ops(10.0))
+    pbr = py.copy(psr, "f2")["id_map"]["$bundle"]
+    cbr = cpp.copy(csr, "f2")["id_map"]["$bundle"]
+    ptr = py.new("TgtR")
+    ctr = cpp.new("TgtR")
+    ppr2 = py.paste_derived(ptr, pbr, psr.doc_id)
+    cpr2 = cpp.paste_derived(ctr, cbr, csr["doc_id"])
+    p_de = next(f["id"] for f in ppr2["tree"]["features"]
+                if f.get("derived_from") and f["type"] == "extrude")
+    c_de = next(f["id"] for f in cpr2["tree"]["features"]
+                if f.get("derived_from") and f["type"] == "extrude")
+    py.apply(psr, [{"op": "edit_feature", "id": "f2", "params": {"depth": _dim(30.0)}}])
+    cpp.apply(csr, [{"op": "edit_feature", "id": "f2", "params": {"depth": _dim(30.0)}}])
+    prr2 = py.refresh(ptr, fid=p_de)
+    crr2 = cpp.refresh(ctr, fid=c_de)
+    check("refresh-by-id propagates depth 30",
+          depth_of(prr2["tree"], p_de) == 30.0 == depth_of(crr2["tree"], c_de),
+          f"py {depth_of(prr2['tree'], p_de)} cpp {depth_of(crr2['tree'], c_de)}")
+    check("refresh-by-id one group in summary",
+          len(prr2["derived"]["groups"]) == 1 == len(crr2["derived"]["groups"]),
+          f"py {len(prr2['derived']['groups'])} cpp {len(crr2['derived']['groups'])}")
+
     print(f"\n[derived-parity] {total - mism}/{total} steps at full parity")
     return mism
 

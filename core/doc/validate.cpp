@@ -689,6 +689,21 @@ string sorted_set_str(const std::set<string>& s) {
     return out;
 }
 
+// A semantic geometry QUERY object ({"of":"edge"|"face", ...}) is accepted anywhere a
+// pick selector / selector-list is — it is the agent's way of naming geometry it cannot
+// click (doc/picks::resolve_geom_query expands it at compile time).
+bool is_query_obj(const json& v) {
+    return v.is_object() && (get(v, "kind") == json("query") || v.contains("of"));
+}
+
+vector<string> validate_geom_query(const json& q, const string& where) {
+    const json& ofj = get(q, "of");
+    string of = ofj.is_string() ? ofj.get<string>() : "";
+    if (of != "edge" && of != "face")
+        return {where + ".of: geometry query must be \"edge\" or \"face\""};
+    return {};
+}
+
 vector<string> validate_selector(const json& sel, const string& where) {
     vector<string> errs;
     if (!sel.is_object()) {
@@ -1171,6 +1186,12 @@ vector<string> validate_feature(const json& f, const string& where,
         }
         const json& v = refs[name];
         string loc = where + ".refs." + name;
+        // A geometry query is valid in any selector slot (edges/remove/face/profile/...).
+        if (is_query_obj(v)) {
+            auto e = validate_geom_query(v, loc);
+            errs.insert(errs.end(), e.begin(), e.end());
+            continue;
+        }
         switch (slot.form) {
             case RefForm::Sel: {
                 auto e = validate_selector(v, loc);

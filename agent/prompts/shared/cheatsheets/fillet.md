@@ -1,24 +1,28 @@
-FILLET - round off edges with a radius. Reference each edge by a selector.
+FILLET - round off edges with a radius. params: `radius` (dim object). refs.edges names the edges.
 
-Op shape: one `add_feature` of type `fillet`. params: `radius` (dim object). refs.edges = [edge selector, ...].
+BEST WAY (works on ANY part, including ones you did not build) - a geometry QUERY under refs.edges. You NAME the edges instead of computing selectors:
+- {"of":"edge"}                  every edge of the body (round the whole part)
+- {"of":"edge","parallel":[0,0,1]} the vertical edges only (e.g. the 4 corners of a block)
+- {"of":"edge","side":"+z"}      the TOP edges / top rim   ("-z" = bottom; "+x"/"-x"/"+y"/"-y" too)
+- {"of":"edge","surf":"circle"}  the round edges (a cylinder's rims)
+- {"of":"edge","near":[20,0,5],"count":1}  the single edge nearest a point
 
-An edge selector names ONE edge by midpoint + direction + length + owner: {"kind":"edge","surf":"line","centroid":[x,y,z],"axis":[ux,uy,uz],"area_or_len":<len>,"owner_feature":"<feature id>","hint_index":0}. Solids are origin-centered: a 40x30x10 box's +X top edge midpoint is [20,0,5], running along Y (axis [0,1,0]), length 30.
-
-Example A - 3mm fillet on the +X top edge of box f1 (40x30x10):
+Example A - round ALL edges of the current body r=2:
 [
- {"op":"add_feature","feature":{"type":"fillet","name":"Fillet1","params":{"radius":{"value":3,"expr":null}},"refs":{"edges":[{"kind":"edge","surf":"line","centroid":[20,0,5],"axis":[0,1,0],"area_or_len":30,"owner_feature":"f1","hint_index":0}]}}}
+ {"op":"add_feature","feature":{"type":"fillet","name":"Fillet1","params":{"radius":{"value":2,"expr":null}},"refs":{"edges":{"of":"edge"}}}}
 ]
 
-Example B - fillet the 4 vertical edges (along Z) of a 40x30x10 box r=5:
+Example B - round just the 4 vertical edges of a block r=5:
 [
- {"op":"add_feature","feature":{"type":"fillet","name":"Round","params":{"radius":{"value":5,"expr":null}},"refs":{"edges":[
-  {"kind":"edge","surf":"line","centroid":[20,15,0],"axis":[0,0,1],"area_or_len":10,"owner_feature":"f1","hint_index":0},
-  {"kind":"edge","surf":"line","centroid":[-20,15,0],"axis":[0,0,1],"area_or_len":10,"owner_feature":"f1","hint_index":1},
-  {"kind":"edge","surf":"line","centroid":[20,-15,0],"axis":[0,0,1],"area_or_len":10,"owner_feature":"f1","hint_index":2},
-  {"kind":"edge","surf":"line","centroid":[-20,-15,0],"axis":[0,0,1],"area_or_len":10,"owner_feature":"f1","hint_index":3}]}}}
+ {"op":"add_feature","feature":{"type":"fillet","name":"Round","params":{"radius":{"value":5,"expr":null}},"refs":{"edges":{"of":"edge","parallel":[0,0,1]}}}}
+]
+
+Example C - round the top rim of a round flange r=1:
+[
+ {"op":"add_feature","feature":{"type":"fillet","name":"Rim","params":{"radius":{"value":1,"expr":null}},"refs":{"edges":{"of":"edge","side":"+z"}}}}
 ]
 
 3 common mistakes:
-1. `owner_feature` must be the id of the feature whose edges you fillet (the box/cylinder before it), or the edge won't resolve.
-2. Radius must be SMALLER than the thinnest wall it touches, or the build fails (auto-clamp may shrink it).
-3. Give ALL selector fields (centroid, axis, area_or_len) - a partial selector resolves to the wrong edge or none.
+1. The query goes under refs.edges (an OBJECT with "of"), not at the feature top level.
+2. Radius must be SMALLER than the thinnest wall it touches or the build fails (auto-clamp may shrink it).
+3. To discover what edges exist on a part you did not build, call the `doc_query` tool with {"of":"edge",...} first - it returns each edge's surf/centroid/axis.

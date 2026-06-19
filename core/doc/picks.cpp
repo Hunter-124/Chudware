@@ -13,6 +13,7 @@
 #include "doc/picks.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -21,14 +22,20 @@
 
 #include <Bnd_Box.hxx>
 #include <BRepBndLib.hxx>
+#include <BRepAdaptor_Curve.hxx>
+#include <BRepAdaptor_Surface.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
+#include <GeomAbs_CurveType.hxx>
+#include <GeomAbs_SurfaceType.hxx>
+#include <Standard_Failure.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopExp.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
+#include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
 
 namespace aicad::doc {
@@ -256,6 +263,194 @@ FacePicks resolve_face_picks(const TopoDS_Shape& shape, const nlohmann::json& se
         out.faces.push_back(TopoDS::Face(near));
     }
 
+    return out;
+}
+
+// --------------------------------------------------------------------------- geom query
+
+namespace {
+
+std::string q_curve_type(GeomAbs_CurveType t) {
+    switch (t) {
+        case GeomAbs_Line:         return "line";
+        case GeomAbs_Circle:       return "circle";
+        case GeomAbs_Ellipse:      return "ellipse";
+        case GeomAbs_BSplineCurve: return "bspline";
+        default:                   return "other";
+    }
+}
+std::string q_surf_type(GeomAbs_SurfaceType t) {
+    switch (t) {
+        case GeomAbs_Plane:          return "plane";
+        case GeomAbs_Cylinder:       return "cylinder";
+        case GeomAbs_Cone:           return "cone";
+        case GeomAbs_Sphere:         return "sphere";
+        case GeomAbs_Torus:          return "torus";
+        case GeomAbs_BSplineSurface: return "bspline";
+        default:                     return "other";
+    }
+}
+
+// One unique sub-shape's geometric fingerprint (the same fields the describers compute).
+struct QCand {
+    TopoDS_Shape shp;
+    Eigen::Vector3d centroid{0, 0, 0};
+    std::optional<Eigen::Vector3d> axis;
+    std::string surf;
+    double measure = 0.0;
+};
+
+// Parse a signed-axis token ("+z","-x",...) into a unit direction; nullopt if invalid.
+std::optional<Eigen::Vector3d> parse_side(const std::string& s) {
+    if (s.size() < 2) return std::nullopt;
+    double sign = (s[0] == '+') ? 1.0 : (s[0] == '-') ? -1.0 : 0.0;
+    if (sign == 0.0) return std::nullopt;
+    char ax = static_cast<char>(std::tolower(static_cast<unsigned char>(s[1])));
+    Eigen::Vector3d v(0, 0, 0);
+    if (ax == 'x') v.x() = sign;
+    else if (ax == 'y') v.y() = sign;
+    else if (ax == 'z') v.z() = sign;
+    else return std::nullopt;
+    return v;
+}
+
+std::optional<Eigen::Vector3d> json_vec3(const nlohmann::json& j) {
+    if (!j.is_array() || j.size() < 3) return std::nullopt;
+    return Eigen::Vector3d(j[0].get<double>(), j[1].get<double>(), j[2].get<double>());
+}
+
+}  // namespace
+
+bool is_geom_query(const nlohmann::json& v) {
+    return v.is_object() && (v.value("kind", std::string()) == "query" || v.contains("of"));
+}
+
+QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q) {
+    QueryPicks out;
+    const std::string of = q.value("of", std::string());
+    const bool want_face = (of == "face");
+    if (of != "edge" && of != "face") {
+        out.error = "geom query: 'of' must be \"edge\" or \"face\" (got '" + of + "')";
+        return out;
+    }
+    const TopAbs_ShapeEnum kind = want_face ? TopAbs_FACE : TopAbs_EDGE;
+    const double diag = bbox_diag(shape);
+    const double tol = std::max(diag * 1e-3, 1e-6);
+
+    // 1) enumerate UNIQUE sub-shapes + fingerprint each.
+    TopTools_IndexedMapOfShape uniq;
+    TopExp::MapShapes(shape, kind, uniq);
+    std::vector<QCand> cands;
+    for (int i = 1; i <= uniq.Extent(); ++i) {
+        QCand c;
+        c.shp = uniq(i);
+        GProp_GProps props;
+        if (want_face) {
+            TopoDS_Face f = TopoDS::Face(c.shp);
+            BRepGProp::SurfaceProperties(f, props);
+            BRepAdaptor_Surface ad(f);
+            GeomAbs_SurfaceType st = ad.GetType();
+            c.surf = q_surf_type(st);
+            try {
+                if (st == GeomAbs_Plane) c.axis = Eigen::Vector3d(ad.Plane().Axis().Direction().X(),
+                    ad.Plane().Axis().Direction().Y(), ad.Plane().Axis().Direction().Z());
+                else if (st == GeomAbs_Cylinder) c.axis = Eigen::Vector3d(ad.Cylinder().Axis().Direction().X(),
+                    ad.Cylinder().Axis().Direction().Y(), ad.Cylinder().Axis().Direction().Z());
+                else if (st == GeomAbs_Cone) c.axis = Eigen::Vector3d(ad.Cone().Axis().Direction().X(),
+                    ad.Cone().Axis().Direction().Y(), ad.Cone().Axis().Direction().Z());
+            } catch (const Standard_Failure&) { c.axis = std::nullopt; }
+        } else {
+            TopoDS_Edge e = TopoDS::Edge(c.shp);
+            BRepGProp::LinearProperties(e, props);
+            BRepAdaptor_Curve ad(e);
+            GeomAbs_CurveType ct = ad.GetType();
+            c.surf = q_curve_type(ct);
+            try {
+                if (ct == GeomAbs_Line) c.axis = Eigen::Vector3d(ad.Line().Direction().X(),
+                    ad.Line().Direction().Y(), ad.Line().Direction().Z());
+                else if (ct == GeomAbs_Circle) c.axis = Eigen::Vector3d(ad.Circle().Axis().Direction().X(),
+                    ad.Circle().Axis().Direction().Y(), ad.Circle().Axis().Direction().Z());
+            } catch (const Standard_Failure&) { c.axis = std::nullopt; }
+        }
+        c.measure = props.Mass();
+        gp_Pnt cm = props.CentreOfMass();
+        c.centroid = Eigen::Vector3d(cm.X(), cm.Y(), cm.Z());
+        cands.push_back(std::move(c));
+    }
+
+    // 2) boolean filters: surf, parallel, perpendicular.
+    std::vector<const QCand*> keep;
+    keep.reserve(cands.size());
+    const std::string surf_f = q.value("surf", std::string());
+    std::optional<Eigen::Vector3d> par = q.contains("parallel") ? json_vec3(q["parallel"]) : std::nullopt;
+    std::optional<Eigen::Vector3d> per = q.contains("perpendicular") ? json_vec3(q["perpendicular"]) : std::nullopt;
+    if (par) par->normalize();
+    if (per) per->normalize();
+    for (const QCand& c : cands) {
+        if (!surf_f.empty() && c.surf != surf_f) continue;
+        if (par) {
+            if (!c.axis) continue;
+            if (std::abs(std::abs(c.axis->dot(*par)) - 1.0) > 1e-6) continue;
+        }
+        if (per) {
+            if (!c.axis) continue;
+            if (std::abs(c.axis->dot(*per)) > 1e-6) continue;
+        }
+        keep.push_back(&c);
+    }
+
+    // 3) side: keep only the extreme-centroid set along the signed axis.
+    if (q.contains("side") && q["side"].is_string()) {
+        std::optional<Eigen::Vector3d> dir = parse_side(q["side"].get<std::string>());
+        if (!dir) { out.error = "geom query: bad 'side' (use +x/-x/+y/-y/+z/-z)"; return out; }
+        double best = -std::numeric_limits<double>::infinity();
+        for (const QCand* c : keep) best = std::max(best, c->centroid.dot(*dir));
+        std::vector<const QCand*> ext;
+        for (const QCand* c : keep)
+            if (c->centroid.dot(*dir) >= best - tol) ext.push_back(c);
+        keep.swap(ext);
+    }
+
+    // 4) near: sort by centroid distance, keep nearest `count` (default 1).
+    if (q.contains("near")) {
+        std::optional<Eigen::Vector3d> pt = json_vec3(q["near"]);
+        if (!pt) { out.error = "geom query: 'near' must be [x,y,z]"; return out; }
+        std::sort(keep.begin(), keep.end(), [&](const QCand* a, const QCand* b) {
+            return (a->centroid - *pt).squaredNorm() < (b->centroid - *pt).squaredNorm();
+        });
+        int n = q.value("count", 1);
+        if (n >= 0 && static_cast<int>(keep.size()) > n) keep.resize(n);
+    }
+
+    // 5) index: keep the listed ordinals of the filtered set.
+    if (q.contains("index") && q["index"].is_array()) {
+        std::vector<const QCand*> pick;
+        for (const auto& iv : q["index"]) {
+            int i = iv.get<int>();
+            if (i >= 0 && i < static_cast<int>(keep.size())) pick.push_back(keep[i]);
+        }
+        keep.swap(pick);
+    } else if (!q.contains("near") && q.contains("count")) {
+        // 6) count cap (when not already applied via `near`).
+        int n = q.value("count", static_cast<int>(keep.size()));
+        if (n >= 0 && static_cast<int>(keep.size()) > n) keep.resize(n);
+    }
+
+    // 7) materialise: kernel sub-shapes + introspection selectors.
+    int ordinal = 0;
+    for (const QCand* c : keep) {
+        if (want_face) out.faces.push_back(TopoDS::Face(c->shp));
+        else out.edges.push_back(TopoDS::Edge(c->shp));
+        TopoInfo ti;
+        ti.kind = of;
+        ti.surf = c->surf;
+        ti.centroid = c->centroid;
+        ti.axis = c->axis;
+        ti.measure = c->measure;
+        ti.owner = std::nullopt;
+        ti.hint_index = ordinal++;
+        out.selectors.push_back(make_selector(ti));
+    }
     return out;
 }
 

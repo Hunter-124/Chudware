@@ -83,4 +83,39 @@ struct FacePicks {
 FacePicks resolve_face_picks(const TopoDS_Shape& shape, const nlohmann::json& selectors,
                              const std::string& slot = "faces");
 
+// --------------------------------------------------------------------------- geom query
+// Semantic geometry query — how an AGENT (which cannot click a viewport) names geometry
+// on an EXISTING body, so it can fillet/chamfer/shell/probe human-made parts the same
+// way a human picks. Resolves a query object into concrete UNIQUE sub-shapes.
+//
+// Schema (all predicates AND-combine; absent/empty => ALL sub-shapes of `of`):
+//   of            "edge" | "face"                       (required)
+//   surf          "line"|"circle"|"plane"|"cylinder"|"cone"|"sphere"|... type filter
+//   parallel      [x,y,z]   edge direction / face normal parallel to this axis (|dot|~1)
+//   perpendicular [x,y,z]   |dot|~0
+//   side          "+x"|"-x"|"+y"|"-y"|"+z"|"-z"  keep only the sub-shapes at the EXTREME
+//                 centroid along that signed axis (e.g. "+z" = the top set: top face, or
+//                 the top rim edges)
+//   near          [x,y,z]   keep the nearest `count` (default 1) by centroid distance
+//   count         int       cap the result size
+//   index         [i,...]   keep these ordinals of the filtered set
+//
+// Examples:  {"of":"edge"}                           -> every edge (fillet/chamfer all)
+//            {"of":"edge","parallel":[0,0,1]}        -> the vertical edges
+//            {"of":"edge","side":"+z"}               -> the top edges / top rim
+//            {"of":"face","side":"+z"}               -> the top face
+//            {"of":"face","surf":"cylinder"}         -> the bore wall(s)
+//            {"of":"edge","near":[20,0,5],"count":1} -> the edge nearest a point
+struct QueryPicks {
+    std::vector<TopoDS_Edge> edges;
+    std::vector<TopoDS_Face> faces;
+    nlohmann::json selectors = nlohmann::json::array();  // make_selector per match (introspection)
+    std::string error;  // non-empty => malformed query; no geometry touched
+};
+QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& query);
+
+// True if `v` is a geometry-query object (a json object carrying "of", or kind=="query").
+// Feature compilers use this to branch a query payload vs an explicit pick selector.
+bool is_geom_query(const nlohmann::json& v);
+
 }  // namespace aicad::doc

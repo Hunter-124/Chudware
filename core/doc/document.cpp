@@ -2517,7 +2517,17 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                      (edges_it->is_array() && !edges_it->empty()));
 
                 std::optional<std::vector<TopoDS_Edge>> picked;
-                if (has_edge_sel) {
+                // A semantic geometry QUERY ({"of":"edge",...}) lets the agent name edges
+                // it cannot click — "all edges", "the vertical edges", "the top rim". It
+                // expands against the LIVE body to concrete unique edges (doc/picks).
+                if (has_edge_sel && aicad::doc::is_geom_query(*edges_it)) {
+                    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, *edges_it);
+                    if (!qp.error.empty())
+                        throw std::runtime_error(type + ": " + qp.error);
+                    if (qp.edges.empty())
+                        throw std::runtime_error(type + ": edge query matched no edges");
+                    picked = std::move(qp.edges);
+                } else if (has_edge_sel) {
                     aicad::doc::EdgePicks picks =
                         aicad::doc::resolve_edge_picks(body, *edges_it);
                     if (!picks.dangling.empty()) {
@@ -3013,7 +3023,15 @@ CompileResult compile_document(const json& doc, const json& env_json) {
 
                 std::vector<TopoDS_Face> remove;
                 auto rm = feat.find("remove");
-                if (rm != feat.end() &&
+                if (rm != feat.end() && aicad::doc::is_geom_query(*rm)) {
+                    // Query the open face(s) by name: {"of":"face","side":"+z"} = open top.
+                    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, *rm);
+                    if (!qp.error.empty())
+                        throw std::runtime_error("shell: " + qp.error);
+                    if (qp.faces.empty())
+                        throw std::runtime_error("shell: remove face query matched no faces");
+                    remove = std::move(qp.faces);
+                } else if (rm != feat.end() &&
                     (rm->is_object() || (rm->is_array() && !rm->empty()))) {
                     aicad::doc::FacePicks fp =
                         aicad::doc::resolve_face_picks(body, *rm, "remove");

@@ -146,6 +146,13 @@ nlohmann::json doc_export_step(const std::string& doc_id, const std::string& pat
 nlohmann::json doc_face_points(const std::string& doc_id, const nlohmann::json& selector,
                                int max_n = 400);
 
+// doc_query: run a semantic geometry query (doc/picks::resolve_geom_query) against the
+// LAST body so an agent can introspect a part it did not build before editing it —
+// "what faces/edges are here?". `query` is the {"of":"edge"|"face",...predicates} object.
+// Returns {"count": n, "matches": [<selector>, ...]} where each selector carries the
+// sub-shape's surf/centroid/axis/area_or_len (ready to paste into a fillet/hole/etc.).
+nlohmann::json doc_query(const std::string& doc_id, const nlohmann::json& query);
+
 // Weldment cut list — group every weld_member structural member into a SolidWorks
 // "Weldment Cut List" (port of engine/doc/cutlist.py::cut_list_for_session). Forces a
 // FRESH compile so the weld_member compiler repopulates the CompileResult.weld_members

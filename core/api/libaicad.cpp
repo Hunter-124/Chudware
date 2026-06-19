@@ -1373,6 +1373,11 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 params.contains("max_n") && params["max_n"].is_number()
                                     ? params["max_n"].get<int>() : 400),
                             out_json, 0);
+            if (m == "doc_query")
+                return emit(aicad::doc::doc_query(
+                                params.value("doc_id", std::string()),
+                                params.contains("query") ? params["query"] : params),
+                            out_json, 0);
             // --- C18 interactive sketch mode (engine/doc/session.py sketch_*) ---
             // The worker passes the sketch feature id under "sketch".
             if (m == "sketch_enter")

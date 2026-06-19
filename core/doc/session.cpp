@@ -86,6 +86,7 @@
 #include "doc/assembly.h"
 #include "doc/document.h"
 #include "doc/formats.h"
+#include "doc/picks.h"
 #include "doc/selectors.h"
 #include "doc/sketch_geom.h"
 #include "doc/stepplus.h"
@@ -3320,6 +3321,20 @@ json doc_export_step(const std::string& doc_id, const std::string& path) {
     const std::string fmt = (suffix == ".stl") ? "stl" : "step";
     std::string out = export_bodies(r.shapes, path, fmt);
     return json{{"path", out}};
+}
+
+json doc_query(const std::string& doc_id, const json& query) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    if (r.shapes.empty())
+        throw OpError("invalid_op", "document has no bodies to query", {{"doc_id", doc_id}});
+    // Query the LAST body (bridge.py policy: bodies[-1]).
+    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(r.shapes.back(), query);
+    if (!qp.error.empty())
+        throw OpError("invalid_op", qp.error);
+    int count = qp.selectors.is_array() ? static_cast<int>(qp.selectors.size()) : 0;
+    return json{{"count", count}, {"matches", qp.selectors}};
 }
 
 json doc_face_points(const std::string& doc_id, const json& selector, int max_n) {

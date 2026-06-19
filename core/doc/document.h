@@ -78,6 +78,12 @@ struct CompileResult {
     // The surviving solid shapes in AICM body order (shapes[i] <-> body ordinal i+1).
     // Lets a caller describe a picked body's topology (doc_resolve_pick).
     std::vector<TopoDS_Shape> shapes;
+    // Per-weld_member-feature cut-list side-channel: {fid: {profile, dims,
+    // members:[{segment_id, profile, length, start[3], end[3], area, volume}]}}.
+    // Surfaced from the weld_member compiler so the weldment cut list groups its
+    // members without re-deriving geometry (port of compiler.py's _weld_members ->
+    // CompileResult.weld_members). Empty when the doc has no weld_member feature.
+    nlohmann::json weld_members = nlohmann::json::object();
     bool ok = false;                      // true iff every feature compiled ok
     // The active configuration whose overrides/suppressions this compile reflects
     // ("Default" for a config-less doc). Surfaced in the ops-response doc_status so

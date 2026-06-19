@@ -210,6 +210,55 @@ bool weld_profile_known(const std::string& name) {
            name == "i_beam" || name == "t_section";
 }
 
+namespace {
+
+// Per-profile (key, default) dimension table, in the SAME key order as the oracle's
+// weld_profiles.PROFILES[name].params dict. weld_profile_dims walks this so the
+// resolved dims object matches ProfileSpec.resolve key-for-key.
+const std::vector<std::pair<const char*, double>>* profile_defaults(const std::string& name) {
+    static const std::vector<std::pair<const char*, double>> sq = {{"size", 20.0}, {"thickness", 2.0}};
+    static const std::vector<std::pair<const char*, double>> rect = {{"w", 40.0}, {"h", 20.0}, {"thickness", 2.0}};
+    static const std::vector<std::pair<const char*, double>> rnd = {{"od", 20.0}, {"thickness", 2.0}};
+    static const std::vector<std::pair<const char*, double>> ang = {{"leg", 30.0}, {"thickness", 3.0}};
+    static const std::vector<std::pair<const char*, double>> flat = {{"w", 40.0}, {"thickness", 6.0}};
+    static const std::vector<std::pair<const char*, double>> cch = {{"h", 50.0}, {"w", 25.0}, {"thickness", 3.0}};
+    static const std::vector<std::pair<const char*, double>> ibeam = {{"h", 100.0}, {"w", 50.0}, {"tw", 5.0}, {"tf", 7.0}};
+    static const std::vector<std::pair<const char*, double>> tsec = {{"h", 60.0}, {"w", 60.0}, {"tw", 6.0}, {"tf", 6.0}};
+    if (name == "square_tube") return &sq;
+    if (name == "rect_tube")   return &rect;
+    if (name == "round_tube")  return &rnd;
+    if (name == "angle_L")     return &ang;
+    if (name == "flat_bar")    return &flat;
+    if (name == "c_channel")   return &cch;
+    if (name == "i_beam")      return &ibeam;
+    if (name == "t_section")   return &tsec;
+    return nullptr;
+}
+
+}  // namespace
+
+nlohmann::json weld_profile_dims(const std::string& profile, const nlohmann::json& params) {
+    nlohmann::json out = nlohmann::json::object();
+    const auto* defs = profile_defaults(profile);
+    if (!defs) return out;
+    for (const auto& kv : *defs) {
+        double v = kv.second;  // start from the default
+        // ProfileSpec.resolve: override only when supplied[k] is present AND non-null,
+        // cast to float. A dim object {value,...} is unwrapped (jnum), matching the
+        // float() the oracle applies to the already-resolved profile param.
+        auto it = params.find(kv.first);
+        if (it != params.end() && !it->is_null()) {
+            if (it->is_number()) v = it->get<double>();
+            else if (it->is_object()) {
+                auto vv = it->find("value");
+                if (vv != it->end() && vv->is_number()) v = vv->get<double>();
+            }
+        }
+        out[kv.first] = v;
+    }
+    return out;
+}
+
 TopoDS_Face weld_profile_face(const std::string& profile, const nlohmann::json& params,
                               const std::string& justify, double angle,
                               double& area_out, std::string& error,

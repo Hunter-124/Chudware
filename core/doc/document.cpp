@@ -3095,6 +3095,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // `members` dicts before _mitre_trim / _butt_cope_trim).
                 std::vector<::geom::WeldMember> members;
                 members.reserve(segs.size());
+                // Parallel cut-list metadata per member (the oracle's member dict keys
+                // not carried on WeldMember): the source segment id + the section area.
+                std::vector<std::string> member_eids;
+                member_eids.reserve(segs.size());
                 double max_len = 1.0;
                 for (const Seg& sg : segs) {
                     TopoDS_Shape member =
@@ -3118,6 +3122,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     wm.env_h = env_h;
                     max_len = std::max(max_len, wm.length);
                     members.push_back(std::move(wm));
+                    member_eids.push_back(sg.eid);
                 }
 
                 // Trim shared corners / joints (best-effort; never fails the feature).
@@ -3130,15 +3135,39 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     }
                 }
 
+                // Resolved profile dims (= the oracle's build_profile_face dims): the
+                // key the cut list groups + describes members by.
+                json wm_dims = ::geom::weld_profile_dims(profile, feat);
+
                 // One SEPARATE surviving body per member. Store each under a synthetic
                 // id (feature_id#k) so the surviving-body set + count + total volume
-                // match the oracle (which appends each member to ctx.bodies).
+                // match the oracle (which appends each member to ctx.bodies). At the
+                // same time build the cut-list side-channel record per member, mirroring
+                // weldment.py's member_records (start/end/area/volume captured POST-trim,
+                // exactly like the oracle reads m["solid"].volume after the trim pass).
+                json wm_member_records = json::array();
                 int k = 0;
                 for (::geom::WeldMember& wm : members) {
-                    std::string mid = id + "#" + std::to_string(k++);
+                    std::string mid = id + "#" + std::to_string(k);
                     results[mid] = SolidResult{wm.solid};
                     solid_order.push_back(mid);
+                    GProp_GProps gv;
+                    BRepGProp::VolumeProperties(wm.solid, gv);
+                    wm_member_records.push_back(json{
+                        {"segment_id", member_eids[static_cast<std::size_t>(k)]},
+                        {"profile", profile},
+                        {"length", wm.length},
+                        {"start", {wm.start.x(), wm.start.y(), wm.start.z()}},
+                        {"end", {wm.end.x(), wm.end.y(), wm.end.z()}},
+                        {"area", area},
+                        {"volume", gv.Mass()},
+                    });
+                    ++k;
                 }
+                result.weld_members[id] = json{
+                    {"profile", profile}, {"dims", wm_dims},
+                    {"members", std::move(wm_member_records)},
+                };
                 st.ok = true;
 
             } else if (type == "weld_end_cap" || type == "weld_gusset") {

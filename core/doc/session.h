@@ -122,6 +122,16 @@ nlohmann::json doc_export_step(const std::string& doc_id, const std::string& pat
 nlohmann::json doc_face_points(const std::string& doc_id, const nlohmann::json& selector,
                                int max_n = 400);
 
+// Weldment cut list — group every weld_member structural member into a SolidWorks
+// "Weldment Cut List" (port of engine/doc/cutlist.py::cut_list_for_session). Forces a
+// FRESH compile so the weld_member compiler repopulates the CompileResult.weld_members
+// side-channel, then groups pooled members by (profile, resolved dims, length@0.1mm).
+// Returns {rows:[{item, profile, description, length_mm, quantity, total_length_mm}],
+// total_members, total_length_mm, profiles:[...]}. Rows sort by profile asc then length
+// desc; item is 1-based post-sort. An assembly / a part with no weld_member feature
+// yields empty rows + zero totals (NOT an error).
+nlohmann::json doc_weld_cut_list(const std::string& doc_id);
+
 // Evaluate — mass properties of the active body (port of engine/doc/evaluate.py::mass_props
 // via engine/worker.py::_eval_mass). body_id is 1-based; <= 0 selects the LAST body. Returns
 // {volume_mm3, mass_g, com[3], inertia[9] (row-major, kg·mm² scaled by density), principal_

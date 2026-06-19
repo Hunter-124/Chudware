@@ -43,6 +43,15 @@ TopoDS_Face weld_profile_face(const std::string& profile, const nlohmann::json& 
 // True if `name` is a known library profile.
 bool weld_profile_known(const std::string& name);
 
+// Resolve a profile's dimension dict the way the oracle's ProfileSpec.resolve does:
+// start from the per-profile defaults (mm), then override each KNOWN key with the
+// supplied value (cast to a double) when present and non-null. Unknown keys in
+// `params` are ignored. Returns a JSON object {key: number} in the profile's
+// declared key order (matching weld_profiles.PROFILES[name].params). An unknown
+// profile yields an empty object. This is the `dims` the cut list groups + describes
+// members by, so it must match the oracle's resolved dims EXACTLY.
+nlohmann::json weld_profile_dims(const std::string& profile, const nlohmann::json& params);
+
 // ---- member sweep (weldment.py _sweep_member) ------------------------------
 // Orient `face_local` (drawn in its own XY plane) perpendicular to the path at
 // `start` with the path tangent as the section normal, then sweep it along

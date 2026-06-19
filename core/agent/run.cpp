@@ -205,7 +205,7 @@ AgentCall agent_call(const ProviderFn& provider, const DesignState& state, const
     json messages = json::array({user_message(json::array({text_part(bc.body)}))});
 
     auto t0 = std::chrono::steady_clock::now();
-    ProvReply rep = provider(system, messages, 2048);
+    ProvReply rep = provider(system, messages, 4096);  // reasoning-model headroom (gemma reasons before answering)
     auto t1 = std::chrono::steady_clock::now();
     ac.duration_ms =
         static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
@@ -482,7 +482,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         // system. The RoleScriptedProvider sniffs "you are the reviewer" from the prompt's
         // first line, so routing is correct without the marker (matching Python byte-for-byte).
         auto t0 = std::chrono::steady_clock::now();
-        ProvReply rep = provider(bc.system, messages, 1024);
+        ProvReply rep = provider(bc.system, messages, 4096);  // reasoning-model headroom (see agent_call)
         auto t1 = std::chrono::steady_clock::now();
         o.duration_ms = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());

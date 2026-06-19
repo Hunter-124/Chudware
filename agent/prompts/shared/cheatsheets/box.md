@@ -14,5 +14,5 @@ Example B - a thin 80x80x3 plate:
 
 3 common mistakes:
 1. Each dimension is a dim OBJECT {"value":n,"expr":null}, never a bare number.
-2. The box is CENTERED on the origin - its top face is at z=+height/2, not z=height. Derive feature positions from the half-dimensions.
-3. Use `box` for a rectangular block; do not sketch+extrude unless the request needs a custom profile.
+2. The box is ALWAYS CENTERED on the origin and CANNOT be offset - its top face is at z=+height/2. Do NOT use two boxes to make an L or T shape (both center on the origin and you get a plus/cross). An L/T/U or any offset profile = ONE sketch of `line` entities (the profile outline) + extrude.
+3. Use `box` for a single centered rectangular block. Custom or off-center profiles need sketch+extrude.

@@ -1,0 +1,118 @@
+{
+  "name": "slot_on_centerline",
+  "components": [
+    {
+      "id": "k1",
+      "transform": [
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0
+      ],
+      "fixed": true,
+      "suppressed": false,
+      "name": "plate"
+    },
+    {
+      "id": "k2",
+      "transform": [
+        1.0,
+        0.0,
+        0.0,
+        6.0,
+        0.0,
+        1.0,
+        0.0,
+        9.0,
+        0.0,
+        0.0,
+        1.0,
+        -4.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "fixed": false,
+      "suppressed": false,
+      "name": "pin"
+    }
+  ],
+  "mates": [
+    {
+      "id": "m1",
+      "type": "slot",
+      "align": "aligned",
+      "suppressed": false,
+      "refs": [
+        {
+          "component": "k2"
+        },
+        {
+          "component": "k1"
+        }
+      ],
+      "value": null
+    }
+  ],
+  "resolved_geometry": [
+    {
+      "mate_id": "m1",
+      "ref_index": 0,
+      "geom": {
+        "kind": "point",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          0,
+          0,
+          1
+        ],
+        "direction": [
+          0,
+          0,
+          1
+        ],
+        "radius": 0.0
+      }
+    },
+    {
+      "mate_id": "m1",
+      "ref_index": 1,
+      "geom": {
+        "kind": "axis",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          0,
+          0,
+          1
+        ],
+        "direction": [
+          1,
+          0,
+          0
+        ],
+        "radius": 0.0
+      }
+    }
+  ]
+}

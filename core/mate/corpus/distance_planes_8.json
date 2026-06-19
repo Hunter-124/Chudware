@@ -1,0 +1,120 @@
+{
+  "name": "distance_planes_8",
+  "components": [
+    {
+      "id": "k1",
+      "transform": [
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0
+      ],
+      "fixed": true,
+      "suppressed": false
+    },
+    {
+      "id": "k2",
+      "transform": [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        22.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "fixed": false,
+      "suppressed": false,
+      "name": "top"
+    }
+  ],
+  "mates": [
+    {
+      "id": "m1",
+      "type": "distance",
+      "align": "anti",
+      "suppressed": false,
+      "refs": [
+        {
+          "component": "k1"
+        },
+        {
+          "component": "k2"
+        }
+      ],
+      "value": {
+        "value": 8.0,
+        "expr": null
+      }
+    }
+  ],
+  "resolved_geometry": [
+    {
+      "mate_id": "m1",
+      "ref_index": 0,
+      "geom": {
+        "kind": "plane",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          0,
+          0,
+          1
+        ],
+        "direction": [
+          0,
+          0,
+          1
+        ],
+        "radius": 0.0
+      }
+    },
+    {
+      "mate_id": "m1",
+      "ref_index": 1,
+      "geom": {
+        "kind": "plane",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          0,
+          0,
+          -1
+        ],
+        "direction": [
+          0,
+          0,
+          1
+        ],
+        "radius": 0.0
+      }
+    }
+  ]
+}

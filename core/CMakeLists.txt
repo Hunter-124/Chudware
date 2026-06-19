@@ -667,3 +667,32 @@ if(AICAD_WITH_OCCT)
   # Same OCCT DLL PATH prepend as the other OCCT tests, as a backup to the staged DLLs.
   set_tests_properties(probe PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 endif()
+
+# === 3D assembly mate solver (C++ port of engine/doc/mate_solver.py) ==========
+# Standalone, OCCT-free: rigid-component placement over the shared solver core
+# (aicad_solver) + Eigen + json. Mirrors the sketch lib/cli/diff-harness shape.
+add_library(aicad_mate STATIC
+  mate/mate.cpp)
+target_include_directories(aicad_mate PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_mate PUBLIC aicad_solver Eigen3::Eigen nlohmann_json::nlohmann_json)
+
+# mate_cli (differential-harness driver; see tools/mate_diff.py). Reads the
+# {components, mates, resolved_geometry, warm?, drag?} fixture from argv[1] (or
+# stdin if "-") and prints the solve_mates result as one JSON line.
+add_executable(mate_cli
+  mate/mate_cli.cpp)
+target_link_libraries(mate_cli PRIVATE aicad_mate)
+set_target_properties(mate_cli PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# Optional doctest smoke for the mate solver (rotation round-trips + the peg-in-hole
+# scenario). Only built when doctest is available.
+if(TARGET test_nsolve)
+  add_executable(test_mate
+    tests/test_mate.cpp)
+  target_include_directories(test_mate PRIVATE ${doctest_SOURCE_DIR})
+  target_link_libraries(test_mate PRIVATE aicad_mate)
+  set_target_properties(test_mate PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME mate COMMAND test_mate)
+endif()

@@ -1,0 +1,121 @@
+{
+  "name": "angle_limit_clamp45",
+  "components": [
+    {
+      "id": "k1",
+      "transform": [
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0
+      ],
+      "fixed": true,
+      "suppressed": false,
+      "name": "base"
+    },
+    {
+      "id": "k2",
+      "transform": [
+        0.17364817766693041,
+        -0.9848077530122079,
+        0.0,
+        0.0,
+        0.9848077530122079,
+        0.17364817766693041,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "fixed": false,
+      "suppressed": false,
+      "name": "arm"
+    }
+  ],
+  "mates": [
+    {
+      "id": "m1",
+      "type": "angle_limit",
+      "align": "aligned",
+      "suppressed": false,
+      "refs": [
+        {
+          "component": "k1"
+        },
+        {
+          "component": "k2"
+        }
+      ],
+      "value": {
+        "min": 0.0,
+        "max": 45.0
+      }
+    }
+  ],
+  "resolved_geometry": [
+    {
+      "mate_id": "m1",
+      "ref_index": 0,
+      "geom": {
+        "kind": "axis",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          0,
+          0,
+          1
+        ],
+        "direction": [
+          1,
+          0,
+          0
+        ],
+        "radius": 0.0
+      }
+    },
+    {
+      "mate_id": "m1",
+      "ref_index": 1,
+      "geom": {
+        "kind": "axis",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          0,
+          0,
+          1
+        ],
+        "direction": [
+          1,
+          0,
+          0
+        ],
+        "radius": 0.0
+      }
+    }
+  ]
+}

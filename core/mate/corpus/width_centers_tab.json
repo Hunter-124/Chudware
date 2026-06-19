@@ -1,0 +1,144 @@
+{
+  "name": "width_centers_tab",
+  "components": [
+    {
+      "id": "k1",
+      "transform": [
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0
+      ],
+      "fixed": true,
+      "suppressed": false,
+      "name": "base"
+    },
+    {
+      "id": "k2",
+      "transform": [
+        1.0,
+        0.0,
+        0.0,
+        37.0,
+        0.0,
+        1.0,
+        0.0,
+        4.0,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "fixed": false,
+      "suppressed": false,
+      "name": "block"
+    }
+  ],
+  "mates": [
+    {
+      "id": "m1",
+      "type": "width",
+      "align": "aligned",
+      "suppressed": false,
+      "refs": [
+        {
+          "component": "k2"
+        },
+        {
+          "component": "k1"
+        },
+        {
+          "component": "k1"
+        }
+      ],
+      "value": null
+    }
+  ],
+  "resolved_geometry": [
+    {
+      "mate_id": "m1",
+      "ref_index": 0,
+      "geom": {
+        "kind": "point",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          0,
+          0,
+          1
+        ],
+        "direction": [
+          0,
+          0,
+          1
+        ],
+        "radius": 0.0
+      }
+    },
+    {
+      "mate_id": "m1",
+      "ref_index": 1,
+      "geom": {
+        "kind": "plane",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          1,
+          0,
+          0
+        ],
+        "direction": [
+          0,
+          0,
+          1
+        ],
+        "radius": 0.0
+      }
+    },
+    {
+      "mate_id": "m1",
+      "ref_index": 2,
+      "geom": {
+        "kind": "plane",
+        "point": [
+          20,
+          0,
+          0
+        ],
+        "normal": [
+          1,
+          0,
+          0
+        ],
+        "direction": [
+          0,
+          0,
+          1
+        ],
+        "radius": 0.0
+      }
+    }
+  ]
+}

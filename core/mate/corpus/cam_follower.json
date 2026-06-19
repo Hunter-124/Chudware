@@ -1,0 +1,118 @@
+{
+  "name": "cam_follower",
+  "components": [
+    {
+      "id": "k1",
+      "transform": [
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0
+      ],
+      "fixed": true,
+      "suppressed": false,
+      "name": "cam"
+    },
+    {
+      "id": "k2",
+      "transform": [
+        1.0,
+        0.0,
+        0.0,
+        20.0,
+        0.0,
+        1.0,
+        0.0,
+        5.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "fixed": false,
+      "suppressed": false,
+      "name": "follower"
+    }
+  ],
+  "mates": [
+    {
+      "id": "m1",
+      "type": "cam_follower",
+      "align": "aligned",
+      "suppressed": false,
+      "refs": [
+        {
+          "component": "k2"
+        },
+        {
+          "component": "k1"
+        }
+      ],
+      "value": null
+    }
+  ],
+  "resolved_geometry": [
+    {
+      "mate_id": "m1",
+      "ref_index": 0,
+      "geom": {
+        "kind": "sphere",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          0,
+          0,
+          1
+        ],
+        "direction": [
+          0,
+          0,
+          1
+        ],
+        "radius": 2.0
+      }
+    },
+    {
+      "mate_id": "m1",
+      "ref_index": 1,
+      "geom": {
+        "kind": "axis",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          0,
+          0,
+          1
+        ],
+        "direction": [
+          0,
+          0,
+          1
+        ],
+        "radius": 10.0
+      }
+    }
+  ]
+}

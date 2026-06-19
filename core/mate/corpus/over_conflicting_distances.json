@@ -1,0 +1,246 @@
+{
+  "name": "over_conflicting_distances",
+  "components": [
+    {
+      "id": "k1",
+      "transform": [
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0,
+        0,
+        0,
+        0,
+        0,
+        1.0
+      ],
+      "fixed": true,
+      "suppressed": false,
+      "name": "base"
+    },
+    {
+      "id": "k2",
+      "transform": [
+        0.8595338985586632,
+        -0.497991537002922,
+        -0.11491695393636675,
+        30.0,
+        0.43986763295823095,
+        0.8353156052067086,
+        -0.3297943376922551,
+        -10.0,
+        0.26022671404809444,
+        0.23292116428443663,
+        0.937032437284918,
+        25.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "fixed": false,
+      "suppressed": false,
+      "name": "peg"
+    }
+  ],
+  "mates": [
+    {
+      "id": "m1",
+      "type": "concentric",
+      "align": "aligned",
+      "suppressed": false,
+      "refs": [
+        {
+          "component": "k1"
+        },
+        {
+          "component": "k2"
+        }
+      ],
+      "value": null
+    },
+    {
+      "id": "m2",
+      "type": "distance",
+      "align": "aligned",
+      "suppressed": false,
+      "refs": [
+        {
+          "component": "k1"
+        },
+        {
+          "component": "k2"
+        }
+      ],
+      "value": {
+        "value": 5.0,
+        "expr": null
+      }
+    },
+    {
+      "id": "m3",
+      "type": "distance",
+      "align": "aligned",
+      "suppressed": false,
+      "refs": [
+        {
+          "component": "k1"
+        },
+        {
+          "component": "k2"
+        }
+      ],
+      "value": {
+        "value": 12.0,
+        "expr": null
+      }
+    }
+  ],
+  "resolved_geometry": [
+    {
+      "mate_id": "m1",
+      "ref_index": 0,
+      "geom": {
+        "kind": "axis",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          0,
+          0,
+          1
+        ],
+        "direction": [
+          0,
+          0,
+          1
+        ],
+        "radius": 4.0
+      }
+    },
+    {
+      "mate_id": "m1",
+      "ref_index": 1,
+      "geom": {
+        "kind": "axis",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          0,
+          0,
+          1
+        ],
+        "direction": [
+          0,
+          0,
+          1
+        ],
+        "radius": 3.9
+      }
+    },
+    {
+      "mate_id": "m2",
+      "ref_index": 0,
+      "geom": {
+        "kind": "plane",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          0,
+          0,
+          1
+        ],
+        "direction": [
+          0,
+          0,
+          1
+        ],
+        "radius": 0.0
+      }
+    },
+    {
+      "mate_id": "m2",
+      "ref_index": 1,
+      "geom": {
+        "kind": "plane",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          0,
+          0,
+          -1
+        ],
+        "direction": [
+          0,
+          0,
+          1
+        ],
+        "radius": 0.0
+      }
+    },
+    {
+      "mate_id": "m3",
+      "ref_index": 0,
+      "geom": {
+        "kind": "plane",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          0,
+          0,
+          1
+        ],
+        "direction": [
+          0,
+          0,
+          1
+        ],
+        "radius": 0.0
+      }
+    },
+    {
+      "mate_id": "m3",
+      "ref_index": 1,
+      "geom": {
+        "kind": "plane",
+        "point": [
+          0,
+          0,
+          0
+        ],
+        "normal": [
+          0,
+          0,
+          -1
+        ],
+        "direction": [
+          0,
+          0,
+          1
+        ],
+        "radius": 0.0
+      }
+    }
+  ]
+}

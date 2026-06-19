@@ -540,6 +540,59 @@ def main() -> int:
           len(prr2["derived"]["groups"]) == 1 == len(crr2["derived"]["groups"]),
           f"py {len(prr2['derived']['groups'])} cpp {len(crr2['derived']['groups'])}")
 
+    # 13) sketch_paste_entities (Wave 4B): offset a pasted entity selection, keep the INTERNAL
+    #     constraint (handles re-pointed), DROP the one reaching outside the pasted set. Both
+    #     engines seed their id allocator from the existing 'e9', so the fresh ids match exactly.
+    def _round(x, nd=6):
+        if isinstance(x, bool):
+            return x
+        if isinstance(x, float):
+            return round(x, nd)
+        if isinstance(x, dict):
+            return {k: _round(v, nd) for k, v in x.items()}
+        if isinstance(x, list):
+            return [_round(v, nd) for v in x]
+        return x
+
+    sketch_e9 = {"type": "sketch", "name": "SP", "refs": {"plane": "plane.top"},
+                 "params": {"entities": [{"id": "e9", "type": "line", "construction": False,
+                                          "p1": [0, 0], "p2": [5, 0]}], "constraints": []}}
+    eb = {"entities": [{"id": "s1", "type": "line", "construction": False, "p1": [0, 0], "p2": [10, 0]},
+                       {"id": "s2", "type": "line", "construction": False, "p1": [10, 0], "p2": [10, 10]}],
+          "constraints": [{"id": "k1", "type": "coincident", "refs": ["s1.p2", "s2.p1"]},   # internal
+                          {"id": "k2", "type": "coincident", "refs": ["s1.p1", "sOUT.p1"]}]}  # external
+    paste_ent = {"op": "sketch_paste_entities", "sketch": "f1", "entities_bundle": eb,
+                 "offset_x": 100.0, "offset_y": 50.0}
+    psp = py.new("SPp")
+    csp = cpp.new("SPp")
+    py.apply(psp, [{"op": "add_feature", "feature": sketch_e9}])
+    cpp.apply(csp, [{"op": "add_feature", "feature": sketch_e9}])
+    pspr = py.apply(psp, [paste_ent])
+    cspr = cpp.apply(csp, [paste_ent])
+
+    def _sk_params(tree):
+        for f in tree.get("features", []):
+            if f.get("type") == "sketch":
+                p = f.get("params", {})
+                return {"entities": _round(p.get("entities", [])),
+                        "constraints": _round(p.get("constraints", []))}
+        return {}
+
+    check("sketch_paste id_map parity", pspr.get("id_map") == cspr.get("id_map"),
+          {"py": pspr.get("id_map"), "cpp": cspr.get("id_map")})
+    check("sketch_paste entities+constraints", _sk_params(pspr["tree"]) == _sk_params(cspr["tree"]),
+          {"py": _sk_params(pspr["tree"]), "cpp": _sk_params(cspr["tree"])})
+    # Invariants both must satisfy: 3 entities (e9 + 2 pasted), exactly 1 surviving constraint,
+    # the pasted geometry shifted by (100, 50).
+    cparams = _sk_params(cspr["tree"])
+    by_id = {e["id"]: e for e in cparams["entities"]}
+    cpp_ok = (len(cparams["entities"]) == 3 and len(cparams["constraints"]) == 1
+              and "e9" in by_id and by_id.get("e10", {}).get("p1") == [100.0, 50.0]
+              and by_id.get("e10", {}).get("p2") == [110.0, 50.0]
+              and by_id.get("e11", {}).get("p2") == [110.0, 60.0]
+              and {h.split(".")[0] for h in cparams["constraints"][0]["refs"]} == {"e10", "e11"})
+    check("sketch_paste invariants (shift+keep-internal)", cpp_ok, cparams)
+
     print(f"\n[derived-parity] {total - mism}/{total} steps at full parity")
     return mism
 

@@ -1727,6 +1727,94 @@ void op_paste_feature_as_derived(json& doc, const json& op, std::size_t idx, IdG
         id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = pr.second[k];
 }
 
+// ops.py::_shift_entity_any — deep-copy a sketch entity of ANY type shifted by (dx, dy)
+// (id/construction stripped — the caller restamps them). Translates every point-shaped field.
+json shift_entity_any(const json& src, double dx, double dy) {
+    auto shift_pt = [&](const json& p) -> json {
+        if (p.is_array() && p.size() == 2 && p[0].is_number() && p[1].is_number())
+            return json::array({p[0].get<double>() + dx, p[1].get<double>() + dy});
+        return p;
+    };
+    json out = json::object();
+    for (auto it = src.begin(); it != src.end(); ++it)
+        if (it.key() != "id" && it.key() != "construction") out[it.key()] = it.value();
+    for (const char* key : {"p", "p1", "p2", "center", "vertex", "focus", "apex", "p0"})
+        if (out.contains(key)) out[key] = shift_pt(out[key]);
+    if (out.contains("points") && out["points"].is_array()) {
+        json pts = json::array();
+        for (const json& p : out["points"]) pts.push_back(shift_pt(p));
+        out["points"] = pts;
+    }
+    return out;
+}
+
+// ops.py::_op_sketch_paste_entities (Wave 4B) — paste a bundle of sketch entities (+ their
+// constraints) into `sketch`, shifted by (offset_x, offset_y), with FRESH ids. Constraints
+// internal to the pasted set are kept (handles re-pointed); constraints reaching OUTSIDE the
+// set are DROPPED. Records the first new entity id under $<index> and the rest under $<index>#k.
+void op_sketch_paste_entities(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+    json& sk = require_sketch_feature(doc, op, id_map);
+    if (!op.contains("entities_bundle") || !op["entities_bundle"].is_object())
+        throw OpError("invalid_op", "sketch_paste_entities requires an 'entities_bundle' object",
+                      {{"index", idx}});
+    const json& eb = op["entities_bundle"];
+    if (!eb.contains("entities") || !eb["entities"].is_array() || eb["entities"].empty())
+        throw OpError("invalid_op", "entities_bundle.entities must be a non-empty list",
+                      {{"index", idx}});
+    const json src_cons = eb.contains("constraints") ? eb["constraints"] : json::array();
+    if (!src_cons.is_array())
+        throw OpError("invalid_op", "entities_bundle.constraints must be a list", {{"index", idx}});
+    if (!op.contains("offset_x") || !op["offset_x"].is_number())
+        throw OpError("invalid_op", "sketch_paste_entities requires a numeric 'offset_x'",
+                      {{"index", idx}});
+    if (!op.contains("offset_y") || !op["offset_y"].is_number())
+        throw OpError("invalid_op", "sketch_paste_entities requires a numeric 'offset_y'",
+                      {{"index", idx}});
+    const double dx = op["offset_x"].get<double>(), dy = op["offset_y"].get<double>();
+
+    std::map<std::string, std::string> eid_map;
+    std::vector<json> new_entities;
+    for (const json& src : eb["entities"]) {
+        if (!src.is_object() || !src.contains("id") || !src["id"].is_string())
+            throw OpError("invalid_op", "entities_bundle.entities: each entity needs an 'id'",
+                          {{"index", idx}});
+        const std::string neid = gen.next("e");
+        eid_map[src["id"].get<std::string>()] = neid;
+        json geom = shift_entity_any(src, dx, dy);
+        geom["id"] = neid;
+        geom["construction"] = src.value("construction", false);
+        new_entities.push_back(geom);
+    }
+    for (const json& ne : new_entities) sk["params"]["entities"].push_back(ne);
+
+    // Keep only constraints whose handles ALL land inside the pasted set (drop external/origin).
+    json& cons = sk["params"]["constraints"];
+    for (const json& con : src_cons) {
+        if (!con.is_object()) continue;
+        const json handles = con.contains("refs") ? con["refs"] : json::array();
+        bool all_in = handles.is_array() && !handles.empty();
+        if (all_in)
+            for (const json& h : handles)
+                if (!(h.is_string() && eid_map.count(handle_base(h.get<std::string>())))) {
+                    all_in = false;
+                    break;
+                }
+        if (!all_in) continue;
+        json nc = con;
+        nc["id"] = gen.next("c");
+        json nr = json::array();
+        for (const json& h : handles) nr.push_back(remap_handle(h, eid_map));
+        nc["refs"] = nr;
+        cons.push_back(nc);
+    }
+
+    std::vector<std::string> new_ids;
+    for (const json& ne : new_entities) new_ids.push_back(ne["id"].get<std::string>());
+    id_map["$" + std::to_string(idx)] = new_ids.empty() ? json("") : json(new_ids[0]);
+    for (std::size_t k = 1; k < new_ids.size(); ++k)
+        id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = new_ids[k];
+}
+
 // ops.py::refresh_derived_group — splice a FRESH source bundle over an existing derived
 // group IN PLACE (ids + tree positions preserved). Returns {refreshed, added, stale}.
 json refresh_derived_group(json& doc, const std::string& group, const json& bundle, IdGen& gen) {
@@ -1956,6 +2044,7 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
     else if (k == "copy_feature")               op_copy_feature(doc, op, idx, gen, id_map);
     else if (k == "paste_feature")              op_paste_feature(doc, op, idx, gen, id_map);
     else if (k == "paste_feature_as_derived")   op_paste_feature_as_derived(doc, op, idx, gen, id_map);
+    else if (k == "sketch_paste_entities")       op_sketch_paste_entities(doc, op, idx, gen, id_map);
     else
         throw OpError("unsupported", "op[" + std::to_string(idx) + "]: unknown op '" + k + "'",
                       {{"index", idx}, {"reason", "not ported"}});

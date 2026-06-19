@@ -531,6 +531,17 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     // sweep/loft/primitive build a fresh body). Drives the owner-map topology diff.
     std::map<std::string, std::string> source_of;
 
+    // The TOOL BODY + boolean OP each patternable feature contributed (the C++
+    // analogue of the oracle's ctx.tool_bodies / feature_ops — engine/doc/compiler.py).
+    // A pattern/mirror REPLICATES the SEED feature's tool body re-applying its op, so a
+    // patterned CUT subtracts N times (N holes) and a patterned boss fuses N times —
+    // exactly like SolidWorks, and matching engine/doc/features/pattern.py. Without this
+    // a pattern that fused copies of the post-cut SOLID would give a totally wrong body.
+    // tool body is stored at its instance-0 pose (the cut tool / boss prism / drilled
+    // tool union); a pattern/mirror records its WHOLE result (op "add") so nesting works.
+    std::map<std::string, TopoDS_Shape> tool_body_of;
+    std::map<std::string, std::string> feature_op_of;  // "add" | "cut"
+
     // --- sheet-metal part state (the C++ analogue of the oracle's ctx.datums
     // _sheet_metal / _sheet_metal_bends). A base flange establishes the part as
     // sheet metal (thickness / k-factor / default bend radius); later edge flanges /
@@ -559,6 +570,23 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         if (feat.contains("body") && feat["body"].is_string())
             return feat["body"].get<std::string>();
         return current_solid_id();
+    };
+    // Resolve a pattern/mirror SEED feature to its (tool body, op). Mirrors the oracle's
+    // pattern._gather_seeds: a seed must be an earlier feature that contributed
+    // patternable geometry (boss/cut/hole/revolve, or another pattern/mirror). Raises a
+    // dangling-style error otherwise, so the per-feature try/catch fails the pattern the
+    // SAME way the oracle does (e.g. when the seed id points at a sketch).
+    auto seed_tool_op = [&](const json& feat, const char* what)
+        -> std::pair<TopoDS_Shape, std::string> {
+        const std::string seed_id = req_str(feat, "seed");
+        auto it = tool_body_of.find(seed_id);
+        if (it == tool_body_of.end() || it->second.IsNull())
+            throw std::runtime_error(
+                std::string(what) + ": feature '" + seed_id + "' has no patternable "
+                "geometry (must be an earlier boss/cut/hole, and listed before this feature)");
+        const std::string op =
+            feature_op_of.count(seed_id) ? feature_op_of[seed_id] : std::string("add");
+        return {it->second, op};
     };
 
     // --- surfacing helpers (engine/doc/features/surf_*.py) -----------------------
@@ -2149,6 +2177,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     consumed.insert(tgt_id);
                     source_of[id] = tgt_id;  // owner-map: cut derives from the target body
                     results[id] = SolidResult{out};
+                    // Patternable tool: the cut PRISM at its instance-0 pose, op "cut" —
+                    // so a later pattern/mirror re-subtracts it per instance (N holes).
+                    tool_body_of[id] = solid;
+                    feature_op_of[id] = "cut";
                 } else {
                     // Boss: with a running body AND merge (default true), FUSE into it
                     // (SolidWorks "Merge result"); the merged solid replaces the body
@@ -2170,6 +2202,11 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     } else {
                         results[id] = SolidResult{solid};
                     }
+                    // Patternable tool: the boss PRISM (instance-0 pose), op "add" — a
+                    // later pattern/mirror replicates just this prism, NOT the whole
+                    // running body (matches the oracle's tool_body for a merged boss).
+                    tool_body_of[id] = solid;
+                    feature_op_of[id] = "add";
                 }
                 solid_order.push_back(id);
                 st.ok = true;
@@ -2294,6 +2331,9 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     source_of[id] = rtgt;  // owner-map: result derives from the target body
                     results[id] = SolidResult{out};
                 }
+                // Patternable tool: the revolved solid (instance-0 pose); op follows mode.
+                tool_body_of[id] = tool;
+                feature_op_of[id] = (rmode == "cut") ? "cut" : "add";
                 solid_order.push_back(id);
                 st.ok = true;
 
@@ -2545,13 +2585,22 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 st.ok = true;
 
             } else if (type == "linear_pattern") {
-                // Replicate a seed solid on a 1-D row (or 2-D grid) and fuse the copies
-                // into one body. Instance (0,0) IS the seed already present, so we only
-                // place the additional cells and union each onto the running result —
-                // the geometry-pattern strategy of pattern.py, in the simplified id-ref
-                // model (no CompileContext / tool_bodies / skip / vary / bidirectional).
-                const std::string seed_id = req_str(feat, "seed");
-                const TopoDS_Shape& seed = require_solid(results, seed_id, "seed");
+                // Replicate the SEED feature's TOOL BODY on a 1-D row (or 2-D grid),
+                // re-applying its boolean to the running body — so a patterned boss fuses
+                // N times and a patterned cut/hole subtracts N times (N holes), exactly
+                // like SolidWorks. Instance (0,0) IS the seed already baked into the
+                // running body, so we only place the additional cells. Port of
+                // engine/doc/features/pattern.py's geometry strategy in the id-ref model
+                // (no skip / vary / bidirectional).
+                std::pair<TopoDS_Shape, std::string> so =
+                    seed_tool_op(feat, "linear pattern");
+                const TopoDS_Shape seed_tool = so.first;
+                const std::string seed_op = so.second;
+                // The running body that already contains instance (0,0) (= bodies[-1]).
+                const std::string tgt_id = current_solid_id();
+                if (tgt_id.empty())
+                    throw std::runtime_error("linear pattern: no body to pattern");
+                TopoDS_Shape res = require_solid(results, tgt_id, "target");
 
                 const int count1 =
                     static_cast<int>(std::lround(num_or_expr(feat.at("count1"), env)));
@@ -2585,39 +2634,58 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (count1 * count2 < 2)
                     throw std::runtime_error("linear pattern needs at least 2 instances");
 
-                // Lay copies at i*spacing1*dir1 (+ j*spacing2*dir2). Instance (0,0) is
-                // the seed, already in `result`. The result body keyed under THIS pattern
-                // feature id is the owner the roadmap's "pattern copies inherit the
-                // pattern feature's owner id" refers to in this simplified model.
-                TopoDS_Shape res = seed;
+                // Lay copies of the seed TOOL at i*spacing1*dir1 (+ j*spacing2*dir2),
+                // re-applying the seed's boolean. Instance (0,0) is the seed, already in
+                // the running body.
                 for (int i = 0; i < count1; ++i) {
                     for (int j = 0; j < count2; ++j) {
                         if (i == 0 && j == 0) continue;  // the seed instance
                         Eigen::Vector3d offset = dir1 * (i * spacing1);
                         if (has_dir2) offset += dir2 * (j * spacing2);
-                        TopoDS_Shape copy = ::geom::translate_copy(seed, offset);
-                        res = ::geom::fuse(res, copy);
+                        TopoDS_Shape copy = ::geom::translate_copy(seed_tool, offset);
+                        res = (seed_op == "cut") ? ::geom::cut(res, copy)
+                                                 : ::geom::fuse(res, copy);
                         if (res.IsNull())
-                            throw std::runtime_error("linear pattern instance fuse failed");
+                            throw std::runtime_error("linear pattern instance "
+                                                     + std::string(seed_op == "cut" ? "cut" : "fuse")
+                                                     + " failed");
                     }
                 }
 
-                // The seed is absorbed into the pattern result (a SW pattern owns its
-                // instances), so it no longer survives as a standalone body.
-                consumed.insert(seed_id);
-                source_of[id] = seed_id;  // owner-map: pattern derives from the seed body
+                // build123d's `+` runs .clean() (UnifySameDomain), so abutting instances
+                // that fuse flush merge their coplanar seam faces — match it on the
+                // additive path so the face count agrees (the cut path leaves seams, like
+                // build123d's `-`). A disjoint compound has no shared domain -> a no-op.
+                if (seed_op != "cut") {
+                    TopoDS_Shape u = ::geom::unify_same_domain(res);
+                    if (!u.IsNull()) res = u;
+                }
+
+                // The running body is consumed; the pattern result is its new state. The
+                // pattern's OWN tool body is its whole result (op "add") so a pattern of
+                // THIS pattern replicates the full result (matches the oracle).
+                consumed.insert(tgt_id);
+                source_of[id] = tgt_id;  // owner-map: pattern derives from the running body
+                tool_body_of[id] = res;
+                feature_op_of[id] = "add";
 
                 results[id] = SolidResult{res};
                 solid_order.push_back(id);
                 st.ok = true;
 
             } else if (type == "circular_pattern") {
-                // Replicate a seed solid around an axis and fuse the copies into one
-                // body. k=0 is the seed (already present); copies k=1..count-1 are
-                // rotated by step_deg*k about the axis. Mirrors pattern.py's geometry
-                // strategy in the simplified id-ref model.
-                const std::string seed_id = req_str(feat, "seed");
-                const TopoDS_Shape& seed = require_solid(results, seed_id, "seed");
+                // Replicate the SEED feature's TOOL BODY around an axis, re-applying its
+                // boolean. k=0 is the seed (already in the running body); copies
+                // k=1..count-1 are rotated by step_deg*k. A patterned cut/hole bores N
+                // radial holes; a patterned boss fuses N copies. Mirrors pattern.py.
+                std::pair<TopoDS_Shape, std::string> so =
+                    seed_tool_op(feat, "circular pattern");
+                const TopoDS_Shape seed_tool = so.first;
+                const std::string seed_op = so.second;
+                const std::string tgt_id = current_solid_id();
+                if (tgt_id.empty())
+                    throw std::runtime_error("circular pattern: no body to pattern");
+                TopoDS_Shape res = require_solid(results, tgt_id, "target");
 
                 const int count =
                     static_cast<int>(std::lround(num_or_expr(feat.at("count"), env)));
@@ -2636,19 +2704,29 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 const Eigen::Vector3d axis_pt = req_vec3(feat, "axis_pt");
                 const Eigen::Vector3d axis_dir = req_vec3(feat, "axis_dir");
 
-                TopoDS_Shape res = seed;
                 for (int k = 1; k < count; ++k) {
                     TopoDS_Shape copy = ::geom::rotate_copy(
-                        seed, axis_pt, axis_dir, radians(step_deg * k));
-                    res = ::geom::fuse(res, copy);
+                        seed_tool, axis_pt, axis_dir, radians(step_deg * k));
+                    res = (seed_op == "cut") ? ::geom::cut(res, copy)
+                                             : ::geom::fuse(res, copy);
                     if (res.IsNull())
-                        throw std::runtime_error("circular pattern instance fuse failed");
+                        throw std::runtime_error("circular pattern instance "
+                                                 + std::string(seed_op == "cut" ? "cut" : "fuse")
+                                                 + " failed");
                 }
 
-                // The seed is absorbed into the pattern result (a SW pattern owns its
-                // instances), so it no longer survives standalone.
-                consumed.insert(seed_id);
-                source_of[id] = seed_id;  // owner-map: pattern derives from the seed body
+                // Match build123d's `+` .clean() on the additive path (merge coplanar
+                // seams from abutting instances); the cut path leaves seams (like `-`).
+                if (seed_op != "cut") {
+                    TopoDS_Shape u = ::geom::unify_same_domain(res);
+                    if (!u.IsNull()) res = u;
+                }
+
+                // The running body is consumed; the pattern result is its new state.
+                consumed.insert(tgt_id);
+                source_of[id] = tgt_id;  // owner-map: pattern derives from the running body
+                tool_body_of[id] = res;
+                feature_op_of[id] = "add";
 
                 results[id] = SolidResult{res};
                 solid_order.push_back(id);
@@ -2701,28 +2779,56 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     normal.normalize();
                 }
 
-                TopoDS_Shape reflected = ::geom::mirror_copy(body, point, normal);
-                if (reflected.IsNull())
-                    throw std::runtime_error("mirror produced an empty reflection");
-
-                const bool merge = feat.value("merge", true);
-                if (merge) {
-                    // Union the reflection into the body; the body is consumed (the
-                    // merged solid is its new current state in the tree). build123d's
-                    // mirror merge runs .clean() (UnifySameDomain), so the seam where the
-                    // two flush halves meet collapses — apply it to match the face count.
-                    TopoDS_Shape out = ::geom::unify_same_domain(::geom::fuse(body, reflected));
+                if (feat.contains("seed")) {
+                    // FEATURE MIRROR (SolidWorks "Features to Mirror", the oracle's
+                    // refs.features path): reflect the SEED feature's TOOL body across the
+                    // plane and re-apply its boolean to the running body — a mirrored cut
+                    // bores the reflected hole, a mirrored boss fuses the reflected boss.
+                    // (A whole-body reflect+fuse would be wrong for a subtractive seed.)
+                    std::pair<TopoDS_Shape, std::string> so = seed_tool_op(feat, "mirror");
+                    TopoDS_Shape rtool = ::geom::mirror_copy(so.first, point, normal);
+                    if (rtool.IsNull())
+                        throw std::runtime_error("mirror: reflecting the seed feature produced "
+                                                 "an empty shape");
+                    TopoDS_Shape out = (so.second == "cut")
+                        ? ::geom::cut(body, rtool)
+                        : ::geom::unify_same_domain(::geom::fuse(body, rtool));
                     if (out.IsNull())
-                        throw std::runtime_error("mirror union (fuse) produced an empty shape");
+                        throw std::runtime_error("mirror: feature mirror "
+                            + std::string(so.second == "cut" ? "cut" : "fuse")
+                            + " produced an empty shape");
                     consumed.insert(body_id);
+                    source_of[id] = body_id;
+                    tool_body_of[id] = out;
+                    feature_op_of[id] = "add";
                     results[id] = SolidResult{out};
+                    solid_order.push_back(id);
+                    st.ok = true;
                 } else {
-                    // The reflection is a NEW standalone body; the original body is NOT
-                    // consumed, so BOTH survive.
-                    results[id] = SolidResult{reflected};
+                    TopoDS_Shape reflected = ::geom::mirror_copy(body, point, normal);
+                    if (reflected.IsNull())
+                        throw std::runtime_error("mirror produced an empty reflection");
+
+                    const bool merge = feat.value("merge", true);
+                    if (merge) {
+                        // Union the reflection into the body; the body is consumed (the
+                        // merged solid is its new current state in the tree). build123d's
+                        // mirror merge runs .clean() (UnifySameDomain), so the seam where
+                        // the two flush halves meet collapses — match the face count.
+                        TopoDS_Shape out =
+                            ::geom::unify_same_domain(::geom::fuse(body, reflected));
+                        if (out.IsNull())
+                            throw std::runtime_error("mirror union (fuse) produced an empty shape");
+                        consumed.insert(body_id);
+                        results[id] = SolidResult{out};
+                    } else {
+                        // The reflection is a NEW standalone body; the original body is
+                        // NOT consumed, so BOTH survive.
+                        results[id] = SolidResult{reflected};
+                    }
+                    solid_order.push_back(id);
+                    st.ok = true;
                 }
-                solid_order.push_back(id);
-                st.ok = true;
 
             } else if (type == "hole") {
                 // Drill simple / cbore / csink hole(s) into a referenced solid at
@@ -2887,6 +2993,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 consumed.insert(body_id);
                 source_of[id] = body_id;  // owner-map: derives from the input body
                 results[id] = SolidResult{out};
+                // Patternable tool: the union of drilled hole tools (instance-0 pose),
+                // op "cut" — a later pattern/mirror re-drills it per instance.
+                tool_body_of[id] = tool_union;
+                feature_op_of[id] = "cut";
                 solid_order.push_back(id);
                 st.ok = true;
 

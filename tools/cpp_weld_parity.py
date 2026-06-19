@@ -7,19 +7,21 @@ structural-member line segments + a weld_member feature), then the cut list is b
 each and the full grouped table is compared.
 
 Cut-list comparison rationale:
-  * The member `length` is the swept-axis length = the exact segment length, a deterministic
-    geometric value identical on both engines (no kernel-version drift — it is read off the
-    sketch line endpoints, not measured on the B-rep). So length_mm / total_length_mm match
-    to 1e-6.
+  * The member `length` is the swept-axis length: the exact segment length for a straight
+    member (read off the sketch line endpoints), and the true ARC LENGTH for an arc member
+    (the oracle's edge.length / the C++ port's BRepGProp::LinearProperties — the same GProp
+    measure, so identical to kernel precision). So length_mm / total_length_mm match to 1e-6.
   * rows are grouped by (profile, resolved-dims, length@0.1mm) then sorted (profile asc,
     length desc) with 1-based item numbers. The grouping/sort/description logic is the ported
     pure function, so item / profile / description / quantity / structure must match EXACTLY.
   * profiles + total_members are exact.
 
-Only LINE segments are weldment paths in the C++ port today (arcs are swept by the oracle but
-not yet by the C++ compiler); every case here uses straight members + trim_corners=False so
-each stored length equals its exact segment length (matching the oracle test corpus in
-engine/doc/test_weld_cutlist.py).
+Both LINE and ARC segments are weldment paths (a closed circle is skipped, like the oracle's
+_segment_edges). Every case uses trim_corners=False so each stored length equals its exact
+swept-axis length (matching the oracle corpus in engine/doc/test_weld_cutlist.py). Arc cases
+keep ccw=True (the default): the C++ solver round-trips an arc's center/radius/start/end but
+not its `ccw` flag, while the oracle reads the raw entity — so only the shared default is
+exercised, which is all the cut list needs (length is direction-independent regardless).
 
 Run under the venv:
   & "$env:APPDATA\\AI-CAD\\runtime\\venv\\Scripts\\python.exe" \\
@@ -52,6 +54,14 @@ def _line(sketch, x1, y1, x2, y2):
             "entity": {"type": "line", "construction": False, "p1": [x1, y1], "p2": [x2, y2]}}
 
 
+def _arc(sketch, cx, cy, r, start, end, ccw=True):
+    """An OPEN arc segment (degrees for start/end), a valid weld member path. ccw stays
+    True so both engines build the same arc (the C++ solver does not round-trip ccw)."""
+    return {"op": "sketch_add_entity", "sketch": sketch,
+            "entity": {"type": "arc", "construction": False, "center": [cx, cy],
+                       "radius": r, "start": start, "end": end, "ccw": ccw}}
+
+
 def _weld(sketch, profile, dims, segments=None, trim=False):
     params = {"profile": profile, "trim_corners": trim}
     params.update(dims)
@@ -68,6 +78,23 @@ def weldment(segments_xy, profile, dims, sketch_ph="$0", trim=False, seg_filter=
     ops = [_sketch()]
     for (a, b) in segments_xy:
         ops.append(_line(sketch_ph, a[0], a[1], b[0], b[1]))
+    ops.append(_weld(sketch_ph, profile, dims, segments=seg_filter, trim=trim))
+    return ops
+
+
+def weldment_arcs(arcs, profile, dims, lines=None, sketch_ph="$0", trim=False, seg_filter=None):
+    """One sketch with ARC (and optional LINE) segments + one weld_member feature.
+
+    `arcs` is a list of (cx, cy, r, start_deg, end_deg[, ccw]); `lines` (optional, added
+    FIRST so they take the lower entity ids e1..) is a list of ((x1,y1),(x2,y2)). An arc's
+    swept length is r * span_radians, so the oracle and the C++ port (both GProp linear
+    length) agree to kernel precision."""
+    ops = [_sketch()]
+    for ln in (lines or []):
+        ops.append(_line(sketch_ph, ln[0][0], ln[0][1], ln[1][0], ln[1][1]))
+    for a in arcs:
+        ccw = a[5] if len(a) > 5 else True
+        ops.append(_arc(sketch_ph, a[0], a[1], a[2], a[3], a[4], ccw))
     ops.append(_weld(sketch_ph, profile, dims, segments=seg_filter, trim=trim))
     return ops
 
@@ -197,6 +224,37 @@ def main() -> int:
         ("segment filter",
          weldment([((0, 0), (100, 0)), ((100, 0), (100, 50)), ((100, 50), (0, 50))],
                   "square_tube", SQ, seg_filter=["e1", "e3"])),
+        # ---- ARC members (the new path) -------------------------------------
+        # Single quarter arc r=100 (0..90deg): length = 100*pi/2 ~= 157.08mm -> one row.
+        ("single arc member",
+         weldment_arcs([(0, 0, 100, 0, 90)], "square_tube", SQ)),
+        # Two IDENTICAL quarter arcs -> one grouped row, quantity 2 (length-grouping of
+        # arc lengths, not chords — a chord would be ~141.4, the arc is ~157.08).
+        ("two identical arcs (qty 2)",
+         weldment_arcs([(0, 0, 100, 0, 90), (300, 0, 100, 0, 90)], "square_tube", SQ)),
+        # Distinct arc lengths (r=100 vs r=60 over 90deg) -> two rows, length desc.
+        ("distinct arc lengths (2 rows)",
+         weldment_arcs([(0, 0, 100, 0, 90), (400, 0, 60, 0, 90)], "square_tube", SQ)),
+        # Non-zero start angle (45..135deg, span still 90) — length depends on the SPAN,
+        # not the absolute angles, so it equals the 0..90 case for the same radius.
+        ("arc nonzero start angle",
+         weldment_arcs([(50, 50, 120, 45, 135)], "square_tube", SQ)),
+        # Semicircle r=50 (0..180deg): length = 50*pi ~= 157.08mm -> single row.
+        ("semicircle arc member",
+         weldment_arcs([(0, 0, 50, 0, 180)], "square_tube", SQ)),
+        # Mixed: one straight 120mm line + one quarter arc r=100 in ONE feature -> two
+        # rows (the line=120.0, the arc=157.08) — exercises line+arc pooling.
+        ("mixed line + arc (2 rows)",
+         weldment_arcs([(0, 0, 100, 0, 90)], "square_tube", SQ,
+                       lines=[((0, -300), (120, -300))])),
+        # round_tube arc (r=80, 0..90deg => ~125.66mm) — arc length with a non-square
+        # profile's library description.
+        ("round_tube arc description",
+         weldment_arcs([(0, 0, 80, 0, 90)], "round_tube", {"od": 20.0, "thickness": 2.0})),
+        # Arc segment filter: two arcs added (e1,e2), keep only e1 -> one member.
+        ("arc segment filter",
+         weldment_arcs([(0, 0, 100, 0, 90), (300, 0, 100, 0, 90)],
+                       "square_tube", SQ, seg_filter=["e1"])),
     ]
     for label, ops in cases:
         total += 1

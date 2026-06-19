@@ -58,6 +58,7 @@
 #include <TopoDS_Shape.hxx>
 #include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
+#include <gp_Circ.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Trsf.hxx>
@@ -65,6 +66,7 @@
 #include <gp_Vec.hxx>
 #include <Geom_Surface.hxx>
 #include <Geom_Curve.hxx>
+#include <GC_MakeArcOfCircle.hxx>
 #include <GeomAPI_ProjectPointOnSurf.hxx>
 #include <GeomAPI_ProjectPointOnCurve.hxx>
 #include <GeomLProp_SLProps.hxx>
@@ -3314,10 +3316,19 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (face_local.IsNull())
                     throw std::runtime_error("weld_member: " + perr);
 
-                // Resolve (entity_id, world-space line edge) pairs to sweep along.
-                // Only straight LINE segments are swept (the ported subset); a closed
-                // or construction entity is skipped, exactly like the oracle.
-                struct Seg { std::string eid; TopoDS_Edge edge; Eigen::Vector3d start, end, tangent; };
+                // Resolve (entity_id, world-space edge) pairs to sweep along. Straight
+                // LINE segments AND ARC segments are swept (a closed circle or a
+                // construction entity is skipped, exactly like the oracle's
+                // _segment_edges which keeps any OPEN line/arc edge). `t_start`/`t_end`
+                // are the path tangents at the ends (parallel for a line), `length` is
+                // the swept-axis length — the CHORD for a line but the true ARC LENGTH
+                // for an arc (oracle reads edge.length), and `straight` flags a line
+                // member (only straight members are corner-trimmed).
+                struct Seg {
+                    std::string eid; TopoDS_Edge edge;
+                    Eigen::Vector3d start, end, t_start, t_end;
+                    double length = 0.0; bool straight = true;
+                };
                 std::vector<Seg> segs;
                 const json& ents = src.entities;
                 if (ents.is_object()) {
@@ -3327,22 +3338,81 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         if (ent.value("construction", false)) continue;
                         const std::string eid = ent.value("id", eit.key());
                         if (have_filter && !wanted.count(eid)) continue;
-                        if (ent.value("type", std::string()) != "line") continue;  // lines only
-                        if (!ent.contains("p1") || !ent.contains("p2")) continue;
-                        Eigen::Vector2d a(ent["p1"][0].get<double>(), ent["p1"][1].get<double>());
-                        Eigen::Vector2d b(ent["p2"][0].get<double>(), ent["p2"][1].get<double>());
-                        if ((a - b).norm() < 1e-9) continue;
-                        Eigen::Vector3d wa = src.plane.lift(a), wb = src.plane.lift(b);
-                        BRepBuilderAPI_MakeEdge me(gp_Pnt(wa.x(), wa.y(), wa.z()),
-                                                   gp_Pnt(wb.x(), wb.y(), wb.z()));
-                        if (!me.IsDone()) continue;
-                        Seg sg;
-                        sg.eid = eid;
-                        sg.edge = me.Edge();
-                        sg.start = wa;
-                        sg.end = wb;
-                        sg.tangent = (wb - wa).normalized();
-                        segs.push_back(std::move(sg));
+                        const std::string etype = ent.value("type", std::string());
+                        if (etype == "line") {
+                            if (!ent.contains("p1") || !ent.contains("p2")) continue;
+                            Eigen::Vector2d a(ent["p1"][0].get<double>(), ent["p1"][1].get<double>());
+                            Eigen::Vector2d b(ent["p2"][0].get<double>(), ent["p2"][1].get<double>());
+                            if ((a - b).norm() < 1e-9) continue;
+                            Eigen::Vector3d wa = src.plane.lift(a), wb = src.plane.lift(b);
+                            BRepBuilderAPI_MakeEdge me(gp_Pnt(wa.x(), wa.y(), wa.z()),
+                                                       gp_Pnt(wb.x(), wb.y(), wb.z()));
+                            if (!me.IsDone()) continue;
+                            Seg sg;
+                            sg.eid = eid;
+                            sg.edge = me.Edge();
+                            sg.start = wa;
+                            sg.end = wb;
+                            sg.t_start = (wb - wa).normalized();
+                            sg.t_end = sg.t_start;  // a line: start/end tangents parallel
+                            sg.length = (wb - wa).norm();
+                            sg.straight = true;
+                            segs.push_back(std::move(sg));
+                        } else if (etype == "arc") {
+                            // Build the arc identically to build123d's Edge.make_circle
+                            // (oracle _entity_to_edges): a CCW arc of the circle in the
+                            // sketch frame; if ccw=false the start/end angles swap.
+                            // The angles are DEGREES (matching the entity store + the
+                            // build123d API). Lifted into the sketch plane's world frame
+                            // (circle axis = plane normal, x-ref = plane uAxis), so the
+                            // swept geometry + arc length match the oracle.
+                            if (!ent.contains("center") || !ent.contains("radius")) continue;
+                            Eigen::Vector2d c(ent["center"][0].get<double>(),
+                                              ent["center"][1].get<double>());
+                            double r = ent.value("radius", 0.0);
+                            if (r <= 1e-9) continue;
+                            double sa = ent.value("start", 0.0);  // degrees
+                            double ea = ent.value("end", 0.0);
+                            bool ccw = ent.value("ccw", true);
+                            if (std::abs(ea - sa) < 1e-9) continue;  // degenerate (no span)
+                            double a1 = (ccw ? sa : ea) * PI / 180.0;
+                            double a2 = (ccw ? ea : sa) * PI / 180.0;
+                            Eigen::Vector3d cw = src.plane.lift(c);
+                            gp_Ax2 ax(gp_Pnt(cw.x(), cw.y(), cw.z()),
+                                      gp_Dir(src.plane.normal.x(), src.plane.normal.y(),
+                                             src.plane.normal.z()),
+                                      gp_Dir(src.plane.uAxis.x(), src.plane.uAxis.y(),
+                                             src.plane.uAxis.z()));
+                            gp_Circ circ(ax, r);
+                            GC_MakeArcOfCircle mkarc(circ, a1, a2, Standard_True);  // CCW
+                            if (!mkarc.IsDone()) continue;
+                            BRepBuilderAPI_MakeEdge me(mkarc.Value());
+                            if (!me.IsDone()) continue;
+                            Seg sg;
+                            sg.eid = eid;
+                            sg.edge = me.Edge();
+                            // Endpoints + end tangents from the curve (D1 = forward
+                            // derivative); length = the true arc length (LinearProperties,
+                            // the same measure as build123d's edge.length).
+                            BRepAdaptor_Curve curve(sg.edge);
+                            gp_Pnt p0, p1; gp_Vec d0, d1;
+                            curve.D1(curve.FirstParameter(), p0, d0);
+                            curve.D1(curve.LastParameter(), p1, d1);
+                            sg.start = Eigen::Vector3d(p0.X(), p0.Y(), p0.Z());
+                            sg.end = Eigen::Vector3d(p1.X(), p1.Y(), p1.Z());
+                            sg.t_start = Eigen::Vector3d(d0.X(), d0.Y(), d0.Z());
+                            if (sg.t_start.norm() > 1e-12) sg.t_start.normalize();
+                            sg.t_end = Eigen::Vector3d(d1.X(), d1.Y(), d1.Z());
+                            if (sg.t_end.norm() > 1e-12) sg.t_end.normalize();
+                            GProp_GProps lp;
+                            BRepGProp::LinearProperties(sg.edge, lp);
+                            sg.length = lp.Mass();
+                            sg.straight = false;  // an arc is not corner-trimmed
+                            if (sg.length < 1e-9) continue;
+                            segs.push_back(std::move(sg));
+                        } else {
+                            continue;  // circle/other closed or unsupported path: skipped
+                        }
                     }
                 }
                 if (segs.empty())
@@ -3359,8 +3429,12 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 member_eids.reserve(segs.size());
                 double max_len = 1.0;
                 for (const Seg& sg : segs) {
+                    // Orient the section perpendicular to the path at the START using the
+                    // start tangent (oracle _sweep_member sweeps along the edge from its
+                    // start tangent) — for a line this is the segment direction, for an
+                    // arc the curve tangent at the first endpoint.
                     TopoDS_Shape member =
-                        ::geom::weld_sweep_member(face_local, sg.edge, sg.start, sg.tangent);
+                        ::geom::weld_sweep_member(face_local, sg.edge, sg.start, sg.t_start);
                     if (member.IsNull())
                         throw std::runtime_error("weld_member: sweep failed for segment '" + sg.eid + "'");
                     GProp_GProps gm;
@@ -3371,11 +3445,12 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     wm.solid = member;
                     wm.start = sg.start;
                     wm.end = sg.end;
-                    // A line member: start/end tangents are the segment direction.
-                    wm.t_start = sg.tangent;
-                    wm.t_end = sg.tangent;
-                    wm.length = (sg.end - sg.start).norm();
-                    wm.straight = true;  // only line segments are swept here
+                    wm.t_start = sg.t_start;
+                    wm.t_end = sg.t_end;
+                    // Swept-axis length: the chord for a line, the true arc length for an
+                    // arc (the oracle stores edge.length on each member record).
+                    wm.length = sg.length;
+                    wm.straight = sg.straight;  // arcs are flagged non-straight (not trimmed)
                     wm.env_w = env_w;
                     wm.env_h = env_h;
                     max_len = std::max(max_len, wm.length);

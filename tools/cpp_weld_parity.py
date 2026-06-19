@@ -82,14 +82,17 @@ def weldment(segments_xy, profile, dims, sketch_ph="$0", trim=False, seg_filter=
     return ops
 
 
-def weldment_arcs(arcs, profile, dims, lines=None, sketch_ph="$0", trim=False, seg_filter=None):
+def weldment_arcs(arcs, profile, dims, lines=None, sketch_ph="$0", trim=False, seg_filter=None,
+                  plane="plane.top"):
     """One sketch with ARC (and optional LINE) segments + one weld_member feature.
 
     `arcs` is a list of (cx, cy, r, start_deg, end_deg[, ccw]); `lines` (optional, added
     FIRST so they take the lower entity ids e1..) is a list of ((x1,y1),(x2,y2)). An arc's
     swept length is r * span_radians, so the oracle and the C++ port (both GProp linear
-    length) agree to kernel precision."""
-    ops = [_sketch()]
+    length) agree to kernel precision. `plane` selects the sketch datum (top/front/right);
+    a non-top plane exercises the world-frame lift of the arc (axis = plane normal,
+    x-ref = plane uAxis), which must match the oracle's plane.location * edge."""
+    ops = [_sketch(plane)]
     for ln in (lines or []):
         ops.append(_line(sketch_ph, ln[0][0], ln[0][1], ln[1][0], ln[1][1]))
     for a in arcs:
@@ -255,6 +258,25 @@ def main() -> int:
         ("arc segment filter",
          weldment_arcs([(0, 0, 100, 0, 90), (300, 0, 100, 0, 90)],
                        "square_tube", SQ, seg_filter=["e1"])),
+        # Arc on the FRONT plane (XZ, normal -Y): the arc is built in the sketch plane's
+        # world frame (axis = plane normal, x-ref = uAxis), so the swept-axis length must
+        # still equal r*span regardless of the plane the sketch lives on.
+        ("arc on front plane",
+         weldment_arcs([(0, 0, 100, 0, 90)], "square_tube", SQ, plane="plane.front")),
+        # Arc on the RIGHT plane (YZ, normal +X) — second non-XY frame check.
+        ("arc on right plane",
+         weldment_arcs([(0, 0, 60, 0, 90)], "square_tube", SQ, plane="plane.right")),
+        # Two arcs (different radii) on front plane -> two rows, both lengths frame-correct.
+        ("two arcs on front plane (2 rows)",
+         weldment_arcs([(0, 0, 100, 0, 90), (300, 0, 60, 0, 90)],
+                       "square_tube", SQ, plane="plane.front")),
+        # trim_corners=TRUE with a mixed line+arc: the line pair would be trimmed but the
+        # arc is non-straight (never trimmed), and trimming mutates only the solid, never
+        # the stored member length — so the cut list is identical with trim on. Two L-legs
+        # share the vertex (100,0) and an arc sits apart; all three lengths must match.
+        ("mixed line+arc trim_corners=True",
+         weldment_arcs([(0, -400, 80, 0, 90)], "square_tube", SQ,
+                       lines=[((0, 0), (100, 0)), ((100, 0), (100, 70))], trim=True)),
     ]
     for label, ops in cases:
         total += 1

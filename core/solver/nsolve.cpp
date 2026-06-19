@@ -59,28 +59,18 @@ Eigen::VectorXd lstsq(const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
 // poor step on rank-deficient normal matrices (e.g. a coupled rotational mate chain),
 // driving the solve to a different — non-converged — minimum than the oracle.
 Eigen::VectorXd solve_pos(const Eigen::MatrixXd& A, const Eigen::VectorXd& b) {
-    constexpr double kEps = 2.220446049250313e-16;  // np.finfo(float64).eps
-    Eigen::LLT<Eigen::MatrixXd> llt(A);
-    if (llt.info() == Eigen::Success) {
-        // Reciprocal condition estimate from the Cholesky factor's diagonal: for A = L Lᵀ
-        // the 2-norm condition number is bounded below by (max d / min d)² where d are the
-        // diagonal entries of L, so rcond ≈ (min d / max d)². Eigen's own LLT::rcond() is a
-        // 1-norm estimate that overestimates for these rank-deficient mate normal matrices,
-        // so this diagonal ratio is the reliable gate. (scipy's POSV path raises a
-        // LinAlgWarning — caught → lstsq — when its LAPACK rcond < eps.)
-        const auto& L = llt.matrixLLT();
-        double dmin = std::numeric_limits<double>::infinity(), dmax = 0.0;
-        for (Eigen::Index i = 0; i < L.rows(); ++i) {
-            double d = std::abs(L(i, i));
-            dmin = std::min(dmin, d);
-            dmax = std::max(dmax, d);
-        }
-        double rcond = (dmax > 0.0) ? (dmin / dmax) * (dmin / dmax) : 0.0;
-        if (rcond >= kEps) {
-            Eigen::VectorXd x = llt.solve(b);
-            if (x.allFinite()) return x;
-        }
-    }
+    // Mirror scipy.linalg.solve(assume_a="pos") AND its caught-LinAlgWarning lstsq fallback
+    // as a SINGLE SVD minimum-norm path (numpy's np.linalg.lstsq cutoff). Rationale:
+    //  * well-conditioned A — no singular values fall below the cutoff, so the min-norm
+    //    solution is numerically identical to the exact Cholesky solve scipy would take;
+    //  * ill-conditioned / rank-deficient A — the tiny-singular-value directions are dropped,
+    //    exactly as the oracle's np.linalg.lstsq does after scipy raises LinAlgWarning.
+    // Using one path removes the rcond-estimate mismatch that previously diverged the two
+    // engines: the Cholesky-diagonal ratio (dmin/dmax)² UNDERestimates rcond, so the C++
+    // branch fell back to lstsq more eagerly than LAPACK's pocon and, on longer coupled mate
+    // chains (k1..kN coincident), took direction-dropping Gauss-Newton steps that wandered a
+    // residual plateau and never converged — while the oracle's posv/pocon path descended to
+    // ~1e-11. SVD per step is negligible for the small normal matrices here (n <~ 100).
     return lstsq(A, b);
 }
 

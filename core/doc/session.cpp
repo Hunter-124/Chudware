@@ -2240,10 +2240,48 @@ json doc_config_set_suppression(const std::string& doc_id, const std::string& na
     return config_commit(s, std::move(working));
 }
 
+// Resolve a pick in an ASSEMBLY: body_id = component ordinal, topo_id indexes that
+// component's LOCAL topology (TopExp order is transform-invariant, so the world AICM ids
+// match local ids). Returns {selector, component} so the host can build a mate ref
+// {component, selector}. Port of session.py::_resolve_pick_assembly.
+json resolve_pick_assembly(Session& s, int body_id, const std::string& kind, int topo_id) {
+    if (!s.asm_result) rebuild_assembly(s);
+    const AssemblyResult* ares = s.asm_result.get();
+    if (!ares || body_id < 1 || body_id > static_cast<int>(ares->bodies.size()))
+        throw OpError("invalid_op",
+                      "body_id " + std::to_string(body_id) + " out of range for assembly",
+                      {{"reason", "bad body_id"}});
+    const AsmBodyOut& abody = ares->bodies[body_id - 1];
+    const TopoDS_Shape& shape_local = abody.shape_local;
+
+    if (kind == "body") {
+        return json{{"selector", {{"kind", "body"}, {"owner_feature", ""}}},
+                    {"component", abody.component_id}};
+    }
+
+    std::vector<TopoInfo> infos;
+    if (kind == "face") infos = describe_faces(shape_local);
+    else if (kind == "edge") infos = describe_edges(shape_local);
+    else if (kind == "vertex") infos = describe_vertices(shape_local);
+    else
+        throw OpError("invalid_op", "kind '" + kind + "' must be face|edge|vertex|body",
+                      {{"reason", "bad kind"}});
+    if (topo_id < 1 || topo_id > static_cast<int>(infos.size()))
+        throw OpError("invalid_op",
+                      "topo_id " + std::to_string(topo_id) + " out of range (1.." +
+                          std::to_string(infos.size()) + ") for " + kind,
+                      {{"reason", "bad topo_id"}});
+    TopoInfo info = infos[topo_id - 1];
+    info.hint_index = topo_id - 1;
+    return json{{"selector", make_selector(info)}, {"component", abody.component_id}};
+}
+
 json doc_resolve_pick(const std::string& doc_id, int body_id, const std::string& kind,
                       int topo_id) {
     std::lock_guard<std::mutex> lk(g_mtx);
     Session& s = require_session(doc_id);
+    if (s.is_assembly())
+        return resolve_pick_assembly(s, body_id, kind, topo_id);
     json sel = resolve_pick(s.doc, env_from_doc(s.doc), body_id, kind, topo_id);
     return json{{"selector", sel}};
 }

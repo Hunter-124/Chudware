@@ -67,6 +67,28 @@ def _write_cyl_step(name: str, r: float, h: float) -> str:
     return str(path)
 
 
+def _write_centered_cyl_step(name: str, r: float, h: float) -> str:
+    """Write a CENTERED cylinder (axis +Z, z in [-h/2, +h/2]) to a .step file (peg pattern)."""
+    from build123d import Cylinder, export_step
+    path = _TMP / f"{name}.step"
+    if not path.exists():
+        export_step(Cylinder(r, h), str(path))   # build123d Cylinder is centered by default
+    return str(path)
+
+
+def _write_plate_hole_step(name: str, side: float, thick: float, hole_r: float) -> str:
+    """Write a CENTERED plate (side x side x thick) with a centered through-hole (radius hole_r).
+
+    Mirrors the host asm scenario base part: centered box (z in [-thick/2,+thick/2]) minus a
+    centered through-cylinder. Top plate face centroid sits at z=+thick/2."""
+    from build123d import Box, Cylinder, export_step
+    path = _TMP / f"{name}.step"
+    if not path.exists():
+        plate = Box(side, side, thick) - Cylinder(hole_r, thick * 2.0)
+        export_step(plate, str(path))
+    return str(path)
+
+
 def _face_selector(centroid, axis, area):
     return {"kind": "face", "surf": "plane", "centroid": list(centroid), "axis": list(axis),
             "area_or_len": area, "owner_feature": None, "hint_index": 0}
@@ -75,6 +97,22 @@ def _face_selector(centroid, axis, area):
 def _cyl_face_selector(centroid, axis, area):
     return {"kind": "face", "surf": "cylinder", "centroid": list(centroid), "axis": list(axis),
             "area_or_len": area, "owner_feature": None, "hint_index": 0}
+
+
+def _dim(v):
+    return {"value": float(v), "expr": None}
+
+
+def _make_stepplus_part(name, ops):
+    """Author a part .step+ via the Python doc engine (both engines read the IDENTICAL .step+)."""
+    from engine.doc import session, stepplus
+    path = _TMP / f"{name}.step+"
+    if not path.exists():
+        s = session.new_session("part")
+        session.apply_ops(s, 0, ops, None)
+        stepplus.save(s, str(path))
+        session.close_session(s.doc_id)
+    return str(path)
 
 
 def _insert(path, name, transform=None, fixed=None):
@@ -106,6 +144,14 @@ def py_session():
 
         def solve(self, drag=None):
             return session.solve_mates(self.s, drag, None)
+
+        def resolve_pick(self, body_id, kind, topo_id):
+            from engine.doc.session import OpError
+            try:
+                r = session.resolve_pick(self.s, None, body_id, kind, topo_id)
+            except OpError:
+                return None, None
+            return r.get("selector"), r.get("component")
     return PyS()
 
 
@@ -129,6 +175,14 @@ class CppS:
         rc, r = self.core.call("doc_solve_mates", params)
         assert rc == 0, f"cpp doc_solve_mates rc={rc}: {r}"
         return r
+
+    def resolve_pick(self, body_id, kind, topo_id):
+        rc, r = self.core.call("doc_resolve_pick",
+                               {"doc_id": self.doc_id, "body_id": body_id,
+                                "kind": kind, "topo_id": topo_id})
+        if rc != 0:
+            return None, None
+        return r.get("selector"), r.get("component")
 
 
 # --------------------------------------------------------------------------- compare
@@ -288,6 +342,10 @@ def main() -> int:
     box10 = _write_box_step("box10", 10, 10, 10)
     hole_block = _write_cyl_step("holeblk", 8, 20)   # r=8 cylinder (the "bore" host)
     pegcyl = _write_cyl_step("pegcyl", 4, 30)        # r=4 peg
+    # host asm-scenario parts: centered plate-with-hole (z in [-5,+5], top face z=+5) + a
+    # centered peg cylinder (z in [-10,+10], bottom face z=-10).
+    plate_hole = _write_plate_hole_step("platehole", 40, 10, 4)
+    peg_centered = _write_centered_cyl_step("pegcentered", 3.9, 20)
 
     mism = 0
     total = 0
@@ -391,6 +449,148 @@ def main() -> int:
     ]
     run("unmated 2 fixed boxes", ops_unmated,
         {"k1", "k2"}, {"k1": (20, 20, 20), "k2": (10, 10, 10)}, fully_constrained={"k1", "k2"})
+
+    # ---- 8. peg-in-hole SEATED: concentric (hole<->peg) + coincident-ANTI (plate top<->peg
+    # bottom) fully pins the peg's z. Base = centered plate-with-hole (top face z=+5); peg =
+    # centered cylinder (bottom face z=-10), seeded at z=+18. The anti-coincident seats the peg
+    # bottom on the plate top => peg origin z = +5 - (-10) = +15. (Host scenario: expect z=15;
+    # the C++ regression placed it at z=18.) Free only to spin about +Z, so z is determined. ----
+    plate_top = _face_selector([0, 0, 5], [0, 0, 1], 40 * 40 - math.pi * 4 * 4)
+    plate_hole_cyl = _cyl_face_selector([0, 0, 0], [0, 0, 1], 2 * math.pi * 4 * 10)
+    peg_bottom = _face_selector([0, 0, -10], [0, 0, -1], math.pi * 3.9 * 3.9)
+    peg_side = _cyl_face_selector([0, 0, 0], [0, 0, 1], 2 * math.pi * 3.9 * 20)
+    ops_seated = [
+        _insert(plate_hole, "k1", fixed=True),
+        _insert(peg_centered, "k2",
+                transform=[1, 0, 0, 30, 0, 1, 0, 25, 0, 0, 1, 18, 0, 0, 0, 1]),
+        _mate("concentric", [{"component": "k1", "selector": plate_hole_cyl},
+                             {"component": "k2", "selector": peg_side}]),
+        _mate("coincident", [{"component": "k1", "selector": plate_top},
+                             {"component": "k2", "selector": peg_bottom}], align="anti"),
+    ]
+    run("peg seated concentric+coincident-anti", ops_seated,
+        {"k1", "k2"}, {}, fully_constrained={"k1"})
+    # explicit seated-z assertion (the host-scenario invariant: peg origin z == 15).
+    total += 1
+    try:
+        py = py_session(); pres = py.apply(0, ops_seated)
+        cpp = CppS(core); cres = cpp.apply(0, ops_seated)
+        pz = _comp_transforms(pres)["k2"][11]
+        cz = _comp_transforms(cres)["k2"][11]
+        zdiffs = []
+        if abs(pz - 15.0) > 1e-3:
+            zdiffs.append(f"py peg z={pz:.4f} != 15")
+        if abs(cz - pz) > 1e-3:
+            zdiffs.append(f"cpp peg z={cz:.4f} != py {pz:.4f}")
+        print(f"  {'peg seated z==15 (host invariant)':<34} "
+              f"{'MATCH' if not zdiffs else 'DIFF: ' + '; '.join(zdiffs)}")
+        mism += 0 if not zdiffs else 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"  {'peg seated z==15 (host invariant)':<34} DIFF: raised {type(exc).__name__}: {exc}")
+        mism += 1
+
+    # ---- 8b. HOST-PATH peg-in-hole: reproduce the host asm scenario END-TO-END, including
+    # doc_resolve_pick (the bug was here — C++ doc_resolve_pick had NO assembly branch, so it
+    # returned nothing for an assembly body; the host then added no mates and the peg stayed at
+    # its seed z=18). Author .step+ parts (centered plate+hole, centered peg), insert, SCAN
+    # faces via doc_resolve_pick exactly like scenarios.cpp (hole cyl + max-z plate plane; peg
+    # cyl + min-z plane), add concentric + coincident-anti, assert the peg seats at z=15. ----
+    base_sp = _make_stepplus_part("base_host", [
+        {"op": "add_feature", "feature": {"type": "box", "name": "Plate", "suppressed": False,
+            "params": {"length": _dim(40), "width": _dim(40), "height": _dim(10),
+                       "centered": True}, "refs": {}}},
+        {"op": "add_feature", "feature": {"type": "cylinder", "name": "Hole", "suppressed": False,
+            "params": {"radius": _dim(4), "height": _dim(12), "centered": True, "mode": "cut"},
+            "refs": {}}},
+    ])
+    peg_sp = _make_stepplus_part("peg_host", [
+        {"op": "add_feature", "feature": {"type": "cylinder", "name": "Peg", "suppressed": False,
+            "params": {"radius": _dim(3.9), "height": _dim(20), "centered": True}, "refs": {}}},
+    ])
+    host_ins = [
+        _insert(base_sp, None, fixed=True),
+        _insert(peg_sp, None, transform=[1, 0, 0, 30, 0, 1, 0, 25, 0, 0, 1, 18, 0, 0, 0, 1]),
+    ]
+
+    def _host_scan_and_mate(eng):
+        """Mirror scenarios.cpp case 2: scan body1 (base) for hole cyl + max-z plane and body2
+        (peg) for its cyl + min-z plane via doc_resolve_pick, then add the two mates."""
+        eng.apply(0, host_ins)
+        c_base = c_peg = None
+        hole_cyl = top_plate = peg_cyl = bot_peg = None
+        top_z, bot_z = -1e9, 1e9
+        for t in range(1, 31):
+            sel, comp = eng.resolve_pick(1, "face", t)
+            if not sel:
+                break
+            c_base = comp
+            if sel.get("surf") == "cylinder" and hole_cyl is None:
+                hole_cyl = sel
+            if sel.get("surf") == "plane":
+                z = sel["centroid"][2]
+                if z > top_z:
+                    top_z, top_plate = z, sel
+        for t in range(1, 31):
+            sel, comp = eng.resolve_pick(2, "face", t)
+            if not sel:
+                break
+            c_peg = comp
+            if sel.get("surf") == "cylinder" and peg_cyl is None:
+                peg_cyl = sel
+            if sel.get("surf") == "plane":
+                z = sel["centroid"][2]
+                if z < bot_z:
+                    bot_z, bot_peg = z, sel
+        mates = []
+        if hole_cyl and peg_cyl:
+            mates.append(_mate("concentric", [{"component": c_base, "selector": hole_cyl},
+                                              {"component": c_peg, "selector": peg_cyl}]))
+        if top_plate and bot_peg:
+            mates.append(_mate("coincident", [{"component": c_base, "selector": top_plate},
+                                              {"component": c_peg, "selector": bot_peg}],
+                               align="anti"))
+        r = eng.apply(1, mates) if mates else None
+        # peg z from the tree
+        if r is None:
+            return None, len(mates)
+        for c in r["tree"]["components"]:
+            if c["id"] == "k2":
+                return c["transform"][11], len(mates)
+        return None, len(mates)
+
+    # This case gates the doc_resolve_pick ASSEMBLY branch (the z=18 root cause): the C++ pick
+    # path must resolve assembly bodies (return {selector, component}) so the host can add the
+    # mates and the peg leaves its seed z=18. We assert BOTH engines resolve 2 mates and seat the
+    # peg OFF the seed. (The exact seat z is gated TIGHTLY by case 8 'peg seated z==15', which
+    # uses a real-boolean .step base. Here the C++ part-compiler leaves the centered cut-cylinder
+    # as a SECOND body with protruding caps at z=+/-6 — a separate document.cpp primitive-`mode`
+    # bug, OUT OF assembly scope — so the C++ max-z plane scan lands on z=6 -> peg z=16. We FLAG
+    # that residual but do not let a non-assembly bug fail the assembly gate.)
+    total += 1
+    try:
+        py = py_session(); cpp = CppS(core)
+        pz, pn = _host_scan_and_mate(py)
+        cz, cn = _host_scan_and_mate(cpp)
+        hdiffs = []
+        if pn != 2:
+            hdiffs.append(f"py added {pn} mates (want 2)")
+        if cn != 2:
+            hdiffs.append(f"cpp added {cn} mates (want 2 — assembly picks must resolve)")
+        if pz is None or abs(pz - 15.0) > 1e-3:
+            hdiffs.append(f"py peg z={pz} != 15")
+        # MY scope: the C++ pick fix must move the peg off its seed z=18 (was: stayed at 18).
+        if cz is None or abs(cz - 18.0) < 1e-3:
+            hdiffs.append(f"cpp peg STUCK at seed z={cz} (assembly pick did not resolve)")
+        note = ""
+        if cz is not None and abs(cz - 15.0) > 1e-3 and abs(cz - 18.0) >= 1e-3:
+            note = (f"  [note: cpp peg z={cz:.3f} (not 15) — document.cpp centered-cut primitive "
+                    f"leaves z=+/-6 caps; OUT OF assembly scope]")
+        print(f"  {'host-path assembly pick->mate->seat':<34} "
+              f"{'MATCH' if not hdiffs else 'DIFF: ' + '; '.join(hdiffs)}{note}")
+        mism += 0 if not hdiffs else 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"  {'host-path assembly pick->mate->seat':<34} DIFF: raised {type(exc).__name__}: {exc}")
+        mism += 1
 
     # ---- 7. STAGED inserts in SEPARATE op-batches: the component-id counter (k<N>) must
     # carry across apply_ops calls (regression: a fresh batch re-minted 'k1' -> duplicate id

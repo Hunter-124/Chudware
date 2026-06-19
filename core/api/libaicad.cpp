@@ -265,6 +265,28 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
         return emit_error(std::string("invalid params JSON: ") + e.what(), out_json);
     }
 
+    // Host-version-robust aliases: accept the host's in-app agent RPC names (agent_run_v2
+    // / agent_ask_v2 / get_prompts_v2 / agent_pm_assist_v1) directly. The host normally
+    // pre-translates these in worker_client, but a stale host binary (or any direct
+    // caller) would otherwise hit "unknown method: agent_run_v2". We mirror that
+    // translation here so the core is self-sufficient. Param shapes already match the
+    // target handlers (request/doc_id, question/doc_id) except pm_assist, which wraps.
+    if (m == "agent_run_v2") {
+        m = "agent_run";
+    } else if (m == "agent_ask_v2") {
+        m = "agent_answer_question";
+    } else if (m == "get_prompts_v2") {
+        m = "agent_get_prompts_v2";
+    } else if (m == "agent_pm_assist_v1") {
+        if (params.is_object() && !params.contains("params")) {
+            json wrapped = json::object();
+            wrapped["params"] = params;
+            wrapped["doc_id"] = params.value("doc_id", std::string());
+            params = std::move(wrapped);
+        }
+        m = "agent_pm_assist";
+    }
+
     try {
         if (m == "ping") {
             return emit(json{{"ok", true}, {"abi", aicad_abi_version()}, {"echo", params}},

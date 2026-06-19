@@ -34,11 +34,13 @@ const char* kDecomposeEditBias =
     "— do NOT emit a step that rebuilds it from scratch.";
 
 const char* kExecEditBias =
-    "EDIT BIAS: the CURRENT DOC above already has features (ids + current params shown). If this "
-    "step modifies one of them, emit `edit_feature` on that feature's id (e.g. "
-    "[{\"op\":\"edit_feature\",\"id\":\"f1\",\"params\":{\"width\":{\"value\":60,\"expr\":null}}}]) "
-    "— "
-    "NOT a new add_feature duplicate.";
+    "EDIT BIAS: the CURRENT DOC above already has features (ids + current params shown). Act on the "
+    "EXISTING feature by id, do NOT rebuild it:\n"
+    "- change a dimension -> edit_feature: [{\"op\":\"edit_feature\",\"id\":\"f1\",\"params\":"
+    "{\"width\":{\"value\":60,\"expr\":null}}}]\n"
+    "- remove a feature   -> delete_feature: [{\"op\":\"delete_feature\",\"id\":\"f2\",\"cascade\":true}]\n"
+    "- turn one off/on    -> set_suppressed: [{\"op\":\"set_suppressed\",\"id\":\"f2\",\"value\":true}]\n"
+    "Never emit a duplicate add_feature for a feature that already exists.";
 
 const char* kExecWorkflowReminder =
     "LOCAL WORKFLOW: emit one JSON doc-op array for only this step. Use existing ids from "

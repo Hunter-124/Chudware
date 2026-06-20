@@ -441,6 +441,21 @@ if(AICAD_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(ops PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- Sweep robustness: geom::sweep_profile (MakePipeShell) + helix paths ----
+  # Pure-geom analytic suite: cylinder / hollow tube / 3-turn helix coil / L-elbow
+  # swept-volume checks proving the kernel caps into valid solids on curved spines.
+  add_executable(test_sweep
+    tests/test_sweep.cpp)
+  target_include_directories(test_sweep PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_sweep PRIVATE
+    aicad_geom_occt aicad_geom)
+  set_target_properties(test_sweep PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME sweep COMMAND test_sweep)
+  set_tests_properties(sweep PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- Wave 2 milestone: the document model — a rebuildable feature tree ------
   # core/doc/document.cpp orchestrates solve_sketch -> faces_from_solved_sketch ->
   # extrude/revolve -> fuse/cut/common -> fillet/chamfer into a part, keyed by

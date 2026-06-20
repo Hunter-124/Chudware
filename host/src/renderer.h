@@ -147,12 +147,16 @@ public:
     // (doc_mirror::refDatums); the host draws these as reference overlays after the model, the way
     // SolidWorks shows a created Axis/Plane/Point. setRefDatums replaces the whole set each rebuild.
     struct RefDatum {
-        enum class Kind { Axis, Plane, Point, Csys };
+        enum class Kind { Axis, Plane, Point, Csys, Curve };
         Kind kind = Kind::Axis;
         Vec3 origin{0, 0, 0};   // axis: a point on the line; plane/csys: origin; point: the point
         Vec3 dir{0, 0, 1};      // axis: unit direction; plane/csys: unit normal; (point: unused)
         Vec3 xdir{1, 0, 0};     // plane/csys: in-plane +U  (unused for axis / point)
         Vec3 ydir{0, 1, 0};     // plane/csys: in-plane +V  (unused for axis / point)
+        // curve (helix / spiral / spline path): the sampled world-space polyline.
+        // A curve feature builds no body — this is what the host draws AND hit-tests
+        // so the user can pick the helix as a sweep path.
+        std::vector<Vec3> points;
         std::string id;
         std::string name;
     };

@@ -356,3 +356,181 @@ TEST_CASE("error handling: missing ref errors one feature, rebuild survives") {
     CHECK((hi[0] - lo[0]) == doctest::Approx(W).epsilon(1e-4));
     CHECK((hi[2] - lo[2]) == doctest::Approx(D).epsilon(1e-4));
 }
+
+// 6. SWEEP with a SKETCH path: a circle profile on Top (XY, normal +Z) chased along
+//    an OPEN line sketch on Front (a vertical segment up +Z) must build the exact
+//    cylinder pi r^2 H. Proves the document resolves a sketch as the sweep path
+//    (the user-reported gap) and the MakePipeShell kernel caps it into a solid.
+TEST_CASE("sweep along a sketch path -> exact cylinder") {
+    const double R = 4.0, Hh = 20.0;
+    // Profile: a fully-constrained circle of radius R at the origin on Top.
+    json prof;
+    prof["id"] = "prof"; prof["type"] = "sketch"; prof["plane"] = "top";
+    prof["entities"] = json::array({circle("e1", 0, 0, R)});
+    prof["constraints"] = json::array({
+        rel("c1", "fix", {"e1.center"}),
+        dim("c2", "radius", {"e1"}, R),
+    });
+    // Path: a single vertical line on Front, sketch-coords (0,0)->(0,Hh) -> world
+    // (0,0,0)->(0,0,Hh), i.e. up +Z, perpendicular to the profile's +Z normal.
+    json path;
+    path["id"] = "path"; path["type"] = "sketch"; path["plane"] = "front";
+    path["entities"] = json::array({line("e1", 0, 0, 0, Hh)});
+    path["constraints"] = json::array({
+        rel("c1", "fix", {"e1.p1"}),
+        rel("c2", "vertical", {"e1"}),
+        dim("c3", "distance", {"e1.p1", "e1.p2"}, Hh),
+    });
+
+    json doc;
+    doc["features"] = json::array({
+        prof, path,
+        json{{"id", "sw"}, {"type", "sweep"}, {"profile", "prof"}, {"path", "path"}},
+    });
+
+    CompileResult r = compile_document(doc, json::object());
+    REQUIRE(r.ok);
+    REQUIRE(r.body_count == 1);
+    render::DocMesh dm = parse(r);
+    REQUIRE(dm.bodies.size() == 1);
+    const render::BodyMesh& b = dm.bodies[0];
+    check_common(b);
+    double lo[3], hi[3];
+    bbox(b, lo, hi);
+    MESSAGE("sweep-sketch: faces=" << b.faces.size() << " bbox=" << (hi[0]-lo[0])
+            << "x" << (hi[1]-lo[1]) << "x" << (hi[2]-lo[2]));
+    // Cylinder: diameter across X/Y, height along Z.
+    CHECK((hi[0] - lo[0]) == doctest::Approx(2 * R).epsilon(2e-2));
+    CHECK((hi[1] - lo[1]) == doctest::Approx(2 * R).epsilon(2e-2));
+    CHECK((hi[2] - lo[2]) == doctest::Approx(Hh).epsilon(2e-2));
+    CHECK(count_surf(b, /*cylinder*/ 1) >= 1);  // a cylindrical wall exists
+}
+
+// 7. HELIX curve emission: a helix feature builds no body, so the document ships it
+//    out-of-band as a {kind:"curve"} datum carrying a sampled world polyline — what
+//    lets the host DRAW and PICK the helix as a sweep path. Verify the datum exists,
+//    is a curve, and traces a real 3D path (not a degenerate point).
+TEST_CASE("helix feature emits a sampled curve datum for display/picking") {
+    json doc;
+    doc["features"] = json::array({
+        json{{"id", "hx"}, {"type", "helix"}, {"base", "plane.top"},
+             {"radius", 10.0}, {"pitch", 4.0}, {"height", 12.0}},
+    });
+    CompileResult r = compile_document(doc, json::object());
+    REQUIRE(r.ok);
+
+    const json* curve = nullptr;
+    for (const auto& d : r.datums)
+        if (d.is_object() && d.value("kind", std::string()) == "curve" &&
+            d.value("id", std::string()) == "hx") { curve = &d; break; }
+    REQUIRE_MESSAGE(curve != nullptr, "no curve datum emitted for the helix");
+    REQUIRE(curve->contains("points"));
+    const json& pts = (*curve)["points"];
+    REQUIRE(pts.is_array());
+    CHECK(pts.size() > 20);  // a 3-turn helix samples to many points
+
+    // The polyline must span ~the full height in Z and ~the diameter in X/Y.
+    double zlo = 1e9, zhi = -1e9, xlo = 1e9, xhi = -1e9;
+    for (const auto& p : pts) {
+        double x = p[0].get<double>(), z = p[2].get<double>();
+        zlo = std::min(zlo, z); zhi = std::max(zhi, z);
+        xlo = std::min(xlo, x); xhi = std::max(xhi, x);
+    }
+    CHECK((zhi - zlo) == doctest::Approx(12.0).epsilon(0.05));   // height
+    CHECK((xhi - xlo) == doctest::Approx(20.0).epsilon(0.05));   // 2 * radius
+}
+
+// 8. THE THREAD PATH, END TO END: a helix feature -> a sweep that references it as
+//    its PATH. This is the full chain that makes threads/springs possible: the
+//    document resolves a CURVE feature (not a sketch) as the spine, lifts it, and
+//    MakePipeShell closes a coil solid. Profile is a small circle on Front placed at
+//    the helix start (radius, 0), ~perpendicular to the start tangent.
+TEST_CASE("sweep along a helix feature -> closed coil solid (thread path)") {
+    const double HR = 8.0, pitch = 4.0, height = 12.0, a = 1.0;
+    json prof;
+    prof["id"] = "prof"; prof["type"] = "sketch"; prof["plane"] = "front";
+    prof["entities"] = json::array({circle("e1", HR, 0, a)});  // centered at the helix start
+    prof["constraints"] = json::array({
+        rel("c1", "fix", {"e1.center"}),
+        dim("c2", "radius", {"e1"}, a),
+    });
+    json doc;
+    doc["features"] = json::array({
+        prof,
+        json{{"id", "hx"}, {"type", "helix"}, {"base", "plane.top"},
+             {"radius", HR}, {"pitch", pitch}, {"height", height}},
+        json{{"id", "sw"}, {"type", "sweep"}, {"profile", "prof"}, {"path", "hx"}},
+    });
+
+    CompileResult r = compile_document(doc, json::object());
+    for (const auto& s : r.statuses)
+        if (!s.ok) MESSAGE("feature " << s.id << " error: " << s.error);
+    REQUIRE(r.ok);
+    REQUIRE(r.body_count == 1);   // exactly one coil solid survives
+
+    render::DocMesh dm = parse(r);
+    REQUIRE(dm.bodies.size() == 1);
+    const render::BodyMesh& b = dm.bodies[0];
+    check_common(b);
+    double lo[3], hi[3];
+    bbox(b, lo, hi);
+    MESSAGE("sweep-helix: faces=" << b.faces.size() << " bbox=" << (hi[0]-lo[0])
+            << "x" << (hi[1]-lo[1]) << "x" << (hi[2]-lo[2]));
+    // The coil wraps a radius-8 cylinder, so it spans ~ +/-(HR+a) in X and Y, and
+    // ~the helix height (plus the profile thickness) in Z.
+    CHECK((hi[0] - lo[0]) == doctest::Approx(2 * (HR + a)).epsilon(0.15));
+    CHECK((hi[2] - lo[2]) >= height - 1.0);
+}
+
+// 9. THE USER'S REAL CASE (Documents/sweep-test.step+): an OPEN 3-segment polyline on
+//    Top is the PATH; a circle on Right (perpendicular, at the path start) is the
+//    PROFILE. Sweeping the circle along the elbowed polyline must build one solid rod.
+//    This is the exact geometry that was failing — it proves the engine handles a
+//    cross-plane profile/path + an open multi-segment spine with sharp corners.
+TEST_CASE("sweep circle (Right) along an open polyline (Top) -> solid rod [user case]") {
+    // f1 — the PATH: open polyline on Top, starting at the origin going -X then up.
+    json path;
+    path["id"] = "f1"; path["type"] = "sketch"; path["plane"] = "top";
+    path["entities"] = json::array({
+        line("e1", 0.0, 0.0, -61.382561, 0.0),
+        line("e2", -61.382561, 0.0, -109.119049, 36.553005),
+        line("e3", -109.119049, 36.553005, 0.0, 36.553005),
+    });
+    path["constraints"] = json::array({
+        rel("c1", "horizontal", {"e1"}),
+        rel("c2", "coincident", {"origin", "e1.p1"}),
+        rel("c3", "coincident", {"e1.p2", "e2.p1"}),
+        rel("c4", "horizontal", {"e3"}),
+        rel("c5", "coincident", {"e2.p2", "e3.p1"}),
+    });
+    // f2 — the PROFILE: circle on Right (YZ, normal +X), centered at the origin so it
+    // sits at the path start, perpendicular to its first (-X) segment.
+    json prof;
+    prof["id"] = "f2"; prof["type"] = "sketch"; prof["plane"] = "right";
+    prof["entities"] = json::array({circle("e4", 0.0, 0.0, 6.338714)});
+    prof["constraints"] = json::array({rel("c7", "coincident", {"origin", "e4.center"})});
+
+    json doc;
+    doc["features"] = json::array({
+        path, prof,
+        json{{"id", "f3"}, {"type", "sweep"}, {"profile", "f2"}, {"path", "f1"}},
+    });
+
+    CompileResult r = compile_document(doc, json::object());
+    for (const auto& s : r.statuses)
+        if (!s.ok) MESSAGE("feature " << s.id << " error: " << s.error);
+    REQUIRE(r.ok);
+    REQUIRE(r.body_count == 1);   // one swept rod
+
+    render::DocMesh dm = parse(r);
+    REQUIRE(dm.bodies.size() == 1);
+    const render::BodyMesh& b = dm.bodies[0];
+    check_common(b);
+    double lo[3], hi[3];
+    bbox(b, lo, hi);
+    MESSAGE("sweep-user: faces=" << b.faces.size() << " bbox=" << (hi[0]-lo[0])
+            << "x" << (hi[1]-lo[1]) << "x" << (hi[2]-lo[2]));
+    // The rod follows a polyline ~109 wide in X and ~36 tall in Y, tube radius ~6.3.
+    CHECK((hi[0] - lo[0]) > 100.0);
+    CHECK((hi[1] - lo[1]) > 30.0);
+}

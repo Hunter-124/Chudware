@@ -1237,16 +1237,25 @@ bool PropertyManager::activeWellWantsPathFeature() const {
     return false;
 }
 
-bool PropertyManager::routePathFeature(const std::string& fid, const std::string& name) {
+bool PropertyManager::routePathFeature(const std::string& fid, const std::string& name,
+                                      bool isCurve) {
     PMField* well = activeWell();
     if (!well || fid.empty()) return false;
     if (std::strcmp(well->def->key, "path") != 0 &&
         std::strcmp(well->def->key, "centerline") != 0) return false;
+    // Schema-valid selector: a sketch path is a region (its wire = spine); a curve/helix
+    // path is a datum-feature ref. Both resolve to `fid` via selector_owner_id.
+    nlohmann::json sel = isCurve ? nlohmann::json{{"kind", "datum"}, {"feature", fid}}
+                                 : nlohmann::json{{"kind", "region"}, {"sketch", fid}};
+    auto owner = [](const nlohmann::json& s) -> std::string {
+        if (!s.is_object()) return std::string();
+        if (s.contains("feature") && s["feature"].is_string()) return s["feature"];
+        if (s.contains("sketch") && s["sketch"].is_string()) return s["sketch"];
+        return std::string();
+    };
     // Toggle off if this exact feature already fills the path (SolidWorks re-pick).
     for (size_t i = 0; i < well->picks.size(); ++i) {
-        const auto& sel = well->picks[i].selector;
-        if (sel.is_object() && sel.value("kind", std::string()) == "path" &&
-            sel.value("feature", std::string()) == fid) {
+        if (owner(well->picks[i].selector) == fid) {
             well->picks.erase(well->picks.begin() + i);
             dirty_ = true; lastEditTime_ = ImGui::GetTime();
             return true;
@@ -1254,13 +1263,32 @@ bool PropertyManager::routePathFeature(const std::string& fid, const std::string
     }
     well->picks.clear();   // path / centerline are single-ref
     PMSelEntry e;
-    e.selector = {{"kind", "path"}, {"feature", fid}};
+    e.selector = std::move(sel);
     e.label = name.empty() ? fid : name;
     well->picks.push_back(std::move(e));
     well->wellDangling = false;
     dirty_ = true; lastEditTime_ = ImGui::GetTime();
     advanceWellAfterFill(well);
     return true;
+}
+
+std::vector<std::string> PropertyManager::pathHighlightFeatureIds() const {
+    std::vector<std::string> out;
+    if (!active_) return out;
+    for (const auto& f : fields_) {
+        if (f.def->kind != PMFieldKind::SelectorWell) continue;
+        const bool isPath = std::strcmp(f.def->key, "path") == 0 ||
+                            std::strcmp(f.def->key, "centerline") == 0 ||
+                            std::strcmp(f.def->key, "guides") == 0;
+        if (!isPath) continue;
+        for (const auto& p : f.picks) {
+            const auto& s = p.selector;
+            if (!s.is_object()) continue;
+            if (s.contains("feature") && s["feature"].is_string()) out.push_back(s["feature"]);
+            else if (s.contains("sketch") && s["sketch"].is_string()) out.push_back(s["sketch"]);
+        }
+    }
+    return out;
 }
 
 bool PropertyManager::wantsRegionPicker() const {
@@ -1389,9 +1417,14 @@ void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
             }
             case PMFieldKind::SelectorWell: {
                 if (f.def->selMulti) {
-                    nlohmann::json arr = nlohmann::json::array();
-                    for (const auto& p : f.picks) arr.push_back(p.selector);
-                    refs[key] = arr;
+                    // OMIT an empty multi-well — an optional SelList ref (e.g. sweep/loft
+                    // guides) validates as "must be a non-empty list" if present-but-[],
+                    // so an empty well must drop the ref entirely, not emit [].
+                    if (!f.picks.empty()) {
+                        nlohmann::json arr = nlohmann::json::array();
+                        for (const auto& p : f.picks) arr.push_back(p.selector);
+                        refs[key] = arr;
+                    }
                 } else if (!f.picks.empty()) {
                     refs[key] = f.picks.front().selector;
                 }

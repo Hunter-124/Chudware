@@ -2031,7 +2031,8 @@ void drawFeatureTreeBody(AppState& st,
                         if (rr.clicked && st.propertyManager && st.propertyManager->active() &&
                             st.propertyManager->activeWellWantsPathFeature() &&
                             (ftype == "sketch" || ftype == "helix" || ftype == "curve")) {
-                            st.propertyManager->routePathFeature(fid, fname);
+                            const bool isCurve = (ftype == "helix" || ftype == "curve");
+                            st.propertyManager->routePathFeature(fid, fname, isCurve);
                             selectedFeatureId = fid;
                             s_multiSel.clear();
                             selectFeatureInViewport(st, fid);

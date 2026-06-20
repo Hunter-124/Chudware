@@ -1383,6 +1383,23 @@ void Renderer::drawRefDatums(const Mat4& mvp) {
                 upload(az, 6); setCol(0.30f, 0.45f, 0.95f, 0.95f); glDrawArrays(GL_LINES, 0, 2);
                 break;
             }
+            case RefDatum::Kind::Curve: {
+                // A helix / spiral / spline path: draw the sampled polyline as a solid
+                // cyan curve (brighter + thicker when selected), one GL_LINES segment
+                // per sample pair so the small plane VBO is never overflowed.
+                if (d.points.size() < 2) break;
+                glLineWidth(selected ? 3.5f : 2.25f);
+                if (selected) setCol(0.35f, 0.95f, 1.0f, 1.0f);
+                else          setCol(0.20f, 0.75f, 0.92f, 0.95f);
+                for (size_t i = 1; i < d.points.size(); ++i) {
+                    const Vec3& p0 = d.points[i - 1];
+                    const Vec3& p1 = d.points[i];
+                    float seg[6] = {p0.x, p0.y, p0.z, p1.x, p1.y, p1.z};
+                    upload(seg, 6);
+                    glDrawArrays(GL_LINES, 0, 2);
+                }
+                break;
+            }
         }
     }
 

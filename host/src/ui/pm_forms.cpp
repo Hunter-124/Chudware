@@ -233,10 +233,11 @@ static const std::vector<PMFormDef>& forms() {
                     "inside|outside|both", "Inside|Outside|Both", "thin", "true"),
             Check  ("merge",    "Merge result",   "Options",     true),
         }},
-        // --- sweep ---  mode/merge ; profile[] (region) + path (sketch chain or model edge)
-        //   Engine (sweep.py): profile resolves like extrude (whole-sketch/index/centroid region or
-        //   model face); path = a sketch region selector (its edge chain becomes the spine) or a
-        //   model edge. The viewport region picker fills profile; path is seeded/clicked.
+        // --- sweep ---  mode/merge ; profile[] (region) + path (a SKETCH or a CURVE/helix feature)
+        //   Engine: profile resolves like extrude (whole-sketch/index/centroid region or model face);
+        //   path = a whole sketch OR a curve feature (helix/spiral) whose wire becomes the spine. The
+        //   viewport region picker fills profile; the path well is filled by clicking a sketch/helix in
+        //   the FeatureManager tree, or by clicking a drawn helix in the viewport (drawCurvePathPicker).
         { "sweep", "Sweep", "sweep", {
             Well      ("profile", "Profile",      "Profile and Path", K_FACE, true),
             Well      ("path",    "Path",         "Profile and Path", K_EDGE, false),

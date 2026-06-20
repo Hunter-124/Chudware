@@ -72,11 +72,16 @@ TopoDS_Face thin_ring_face(const TopoDS_Face& face, double outer_off, double inn
 TopoDS_Shape extrude_face_tapered(const TopoDS_Face& face, const Eigen::Vector3d& dir,
                                   double depth, double taper_deg, bool mid_plane = false);
 
-// Sweep a planar profile face along a spine wire (BRepOffsetAPI_MakePipe). The
-// profile should sit at the spine start, roughly perpendicular to its tangent.
-// Empty shape on kernel failure. Port of engine/doc/features/sweep.py's MakePipe
-// fast path (guides/twist/orientation/thin deferred).
-TopoDS_Shape sweep_face(const TopoDS_Face& profile, const TopoDS_Wire& spine);
+// Sweep a planar profile face (outer boundary + hole wires) along a spine wire
+// using BRepOffsetAPI_MakePipeShell — the general, robust sweeper that handles
+// curved/helical spines, caps the ends into a solid, and carves swept holes so a
+// washer profile yields a hollow tube (threads/pipes). `orientation` selects the
+// frame law: 0=follow_path (CorrectedFrenet, default), 1=frenet, 2=keep_normal.
+// Falls back to BRepOffsetAPI_MakePipe on shell failure. The profile should sit at
+// the spine start, roughly perpendicular to its tangent (SolidWorks pierce rule).
+// Empty shape only when every strategy fails.
+TopoDS_Shape sweep_profile(const TopoDS_Face& profile, const TopoDS_Wire& spine,
+                           int orientation = 0);
 
 // Loft a solid through an ordered list of section wires (BRepOffsetAPI_ThruSections,
 // isSolid=true). `ruled` makes straight transitions between sections; otherwise a

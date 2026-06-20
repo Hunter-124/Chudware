@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <set>
 
 #include "../core/app_state.h"
 #include "../renderer.h"
@@ -3467,6 +3468,91 @@ void SketchMode::drawGhosts(AppState& st, const ImVec2& imgMin, const ImVec2& im
             // conic-family ghosts: not yet sampled (rare as standalone profiles).
         }
     }
+
+    // --- persistent selected-path highlight (sweep / loft) ----------------------
+    // Keep the chosen Path + Guides geometry boldly highlighted while the form is open,
+    // even when the live preview is failing — so the user always sees what's selected.
+    if (auto* pm = st.propertyManager; pm && pm->active()) {
+        std::set<std::string> hi;
+        for (const auto& id : pm->pathHighlightFeatureIds()) hi.insert(id);
+        if (!hi.empty()) {
+            const ImU32 hc = col(pal.accent, 1.0f);
+            const float D2R = 3.14159265f / 180.0f;
+            // (a) sketch paths/guides: redraw the matching ghost sketches bold.
+            for (const auto& g : ghosts_) {
+                if (!g.loaded || !hi.count(g.fid)) continue;
+                auto uv2s = [&](float u, float v, ImVec2& o) -> bool {
+                    float wx = g.frame[0] * u + g.frame[1] * v + g.frame[3];
+                    float wy = g.frame[4] * u + g.frame[5] * v + g.frame[7];
+                    float wz = g.frame[8] * u + g.frame[9] * v + g.frame[11];
+                    return worldToScreen(cam, imgMin, vw, vh, wx, wy, wz, o);
+                };
+                auto poly = [&](auto pointAt, int seg) {
+                    ImVec2 prev; bool have = false;
+                    for (int i = 0; i <= seg; ++i) {
+                        float u, v; pointAt(i / (float)seg, u, v);
+                        ImVec2 p;
+                        if (!uv2s(u, v, p)) { have = false; continue; }
+                        if (have) dl->AddLine(prev, p, hc, 2.75f);
+                        prev = p; have = true;
+                    }
+                };
+                for (const auto& e : g.ents) {
+                    if (e.construction) continue;
+                    if (e.type == "line" || e.type == "slot" || e.type == "arc_slot") {
+                        poly([&](float t, float& u, float& v) {
+                            u = e.p1[0] + (e.p2[0] - e.p1[0]) * t;
+                            v = e.p1[1] + (e.p2[1] - e.p1[1]) * t; }, 1);
+                    } else if (e.type == "circle") {
+                        poly([&](float t, float& u, float& v) {
+                            float a = t * 6.2831853f;
+                            u = e.center[0] + e.radius * std::cos(a);
+                            v = e.center[1] + e.radius * std::sin(a); }, 48);
+                    } else if (e.type == "arc") {
+                        float a0 = e.start, a1 = e.end;
+                        if (!e.ccw) { float t = a0; a0 = a1; a1 = t; }
+                        if (a1 < a0) a1 += 360.0f;
+                        poly([&](float t, float& u, float& v) {
+                            float a = (a0 + (a1 - a0) * t) * D2R;
+                            u = e.center[0] + e.radius * std::cos(a);
+                            v = e.center[1] + e.radius * std::sin(a); }, 40);
+                    } else if (e.type == "ellipse") {
+                        float ca = std::cos(e.rot * D2R), sa = std::sin(e.rot * D2R);
+                        poly([&](float t, float& u, float& v) {
+                            float a = t * 6.2831853f;
+                            float lx = e.rx * std::cos(a), ly = e.ry * std::sin(a);
+                            u = e.center[0] + lx * ca - ly * sa;
+                            v = e.center[1] + lx * sa + ly * ca; }, 48);
+                    } else if ((e.type == "spline" || e.type == "style_spline") && e.pts.size() >= 2) {
+                        for (size_t i = 1; i < e.pts.size(); ++i) {
+                            ImVec2 a, b;
+                            if (uv2s(e.pts[i - 1].x, e.pts[i - 1].y, a) && uv2s(e.pts[i].x, e.pts[i].y, b))
+                                dl->AddLine(a, b, hc, 2.75f);
+                        }
+                    }
+                }
+            }
+            // (b) curve paths (helix/spiral): draw the matching curve datum bold.
+            const nlohmann::json& datums = st.docMirror.refDatums();
+            if (datums.is_array()) {
+                for (const auto& d : datums) {
+                    if (!d.is_object() || d.value("kind", std::string()) != "curve") continue;
+                    if (!hi.count(d.value("id", std::string()))) continue;
+                    const auto& pts = d.contains("points") ? d["points"] : nlohmann::json();
+                    if (!pts.is_array()) continue;
+                    ImVec2 prev; bool have = false;
+                    for (const auto& p : pts) {
+                        ImVec2 s; bool ok = p.is_array() && p.size() >= 3 &&
+                            worldToScreen(cam, imgMin, vw, vh, (float)p[0].get<double>(),
+                                          (float)p[1].get<double>(), (float)p[2].get<double>(), s);
+                        if (!ok) { have = false; continue; }
+                        if (have) dl->AddLine(prev, s, hc, 2.75f);
+                        prev = s; have = true;
+                    }
+                }
+            }
+        }
+    }
     dl->PopClipRect();
 }
 
@@ -3915,6 +4001,161 @@ bool SketchMode::drawAxisPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
 
     st.requestCursor(ui::CursorKind::Hand);
     if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) pm->routeDatumAxis(fid, name);
+    return true;
+}
+
+bool SketchMode::drawCurvePathPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
+                                     const ImVec2& imgMax, int vw, int vh, bool imgHovered) {
+    if (active_) return false;                  // editing a sketch: that overlay owns the canvas
+    auto* pm = st.propertyManager;
+    if (!st.renderer || !st.workerStarted || !pm || !pm->active() ||
+        !pm->activeWellWantsPathFeature() || !imgHovered)
+        return false;
+    const auto& cam = st.renderer->camera();
+    const ImVec2 mouse = io.MousePos;
+
+    auto distToSeg = [](ImVec2 p, ImVec2 a, ImVec2 b) -> float {
+        float vx = b.x - a.x, vy = b.y - a.y, wx = p.x - a.x, wy = p.y - a.y;
+        float len2 = vx * vx + vy * vy;
+        float t = len2 > 1e-6f ? (wx * vx + wy * vy) / len2 : 0.0f;
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        float dx = a.x + t * vx - p.x, dy = a.y + t * vy - p.y;
+        return std::sqrt(dx * dx + dy * dy);
+    };
+    float best = 9.0f * ui::uiScale;   // pixel grab radius
+    bool found = false, bestIsCurve = false;
+    std::string bestFid, bestName;
+    std::vector<std::pair<ImVec2, ImVec2>> bestSegs;   // screen segments to highlight
+
+    // --- 1) curve datums (helix / spiral / spline) -------------------------------
+    const nlohmann::json& datums = st.docMirror.refDatums();
+    if (datums.is_array()) {
+        for (const auto& d : datums) {
+            if (!d.is_object() || d.value("kind", std::string()) != "curve") continue;
+            const auto& pts = d.contains("points") ? d["points"] : nlohmann::json();
+            if (!pts.is_array() || pts.size() < 2) continue;
+            std::vector<std::pair<ImVec2, ImVec2>> segs;
+            float dlocal = 1e9f;
+            ImVec2 prev; bool have = false;
+            for (const auto& p : pts) {
+                ImVec2 s; bool ok = p.is_array() && p.size() >= 3 &&
+                    worldToScreen(cam, imgMin, vw, vh, (float)p[0].get<double>(),
+                                  (float)p[1].get<double>(), (float)p[2].get<double>(), s);
+                if (!ok) { have = false; continue; }
+                if (have) { segs.push_back({prev, s}); dlocal = std::min(dlocal, distToSeg(mouse, prev, s)); }
+                prev = s; have = true;
+            }
+            if (dlocal < best) {
+                best = dlocal; found = true; bestIsCurve = true;
+                bestFid = d.value("id", std::string());
+                bestName = d.value("name", bestFid);
+                bestSegs = std::move(segs);
+            }
+        }
+    }
+
+    // --- 2) ghost sketches (a whole SKETCH used as the path) ---------------------
+    // The sketch the user drew for the path is rendered as a ghost (drawGhosts); hit-test
+    // its projected entities so a viewport click on the sketch fills the path well. Skip the
+    // sketch already consumed as the Profile so the user can't accidentally self-sweep.
+    std::set<std::string> profileSketches;
+    for (const auto& sel : pm->profilePicks())
+        if (sel.is_object() && sel.contains("sketch") && sel["sketch"].is_string())
+            profileSketches.insert(sel["sketch"].get<std::string>());
+    auto ghostName = [&](const std::string& fid) -> std::string {
+        const nlohmann::json& tree = st.docMirror.tree();
+        if (tree.is_object() && tree.contains("features") && tree["features"].is_array())
+            for (const auto& tf : tree["features"])
+                if (tf.is_object() && tf.value("id", std::string()) == fid)
+                    return tf.value("name", fid);
+        return fid;
+    };
+    const float D2R = 3.14159265f / 180.0f;
+    for (const auto& g : ghosts_) {
+        if (!g.loaded || profileSketches.count(g.fid)) continue;
+        auto uv2s = [&](float u, float v, ImVec2& o) -> bool {
+            float wx = g.frame[0] * u + g.frame[1] * v + g.frame[3];
+            float wy = g.frame[4] * u + g.frame[5] * v + g.frame[7];
+            float wz = g.frame[8] * u + g.frame[9] * v + g.frame[11];
+            return worldToScreen(cam, imgMin, vw, vh, wx, wy, wz, o);
+        };
+        std::vector<std::pair<ImVec2, ImVec2>> segs;
+        float dlocal = 1e9f;
+        auto samplePoly = [&](auto pointAt, int seg) {
+            ImVec2 prev; bool have = false;
+            for (int i = 0; i <= seg; ++i) {
+                float u, v; pointAt(i / (float)seg, u, v);
+                ImVec2 p;
+                if (!uv2s(u, v, p)) { have = false; continue; }
+                if (have) { segs.push_back({prev, p}); dlocal = std::min(dlocal, distToSeg(mouse, prev, p)); }
+                prev = p; have = true;
+            }
+        };
+        for (const auto& e : g.ents) {
+            if (e.construction) continue;
+            if (e.type == "line" || e.type == "slot" || e.type == "arc_slot") {
+                samplePoly([&](float t, float& u, float& v) {
+                    u = e.p1[0] + (e.p2[0] - e.p1[0]) * t;
+                    v = e.p1[1] + (e.p2[1] - e.p1[1]) * t;
+                }, 1);
+            } else if (e.type == "circle") {
+                samplePoly([&](float t, float& u, float& v) {
+                    float a = t * 6.2831853f;
+                    u = e.center[0] + e.radius * std::cos(a);
+                    v = e.center[1] + e.radius * std::sin(a);
+                }, 48);
+            } else if (e.type == "arc") {
+                float a0 = e.start, a1 = e.end;
+                if (!e.ccw) { float t = a0; a0 = a1; a1 = t; }
+                if (a1 < a0) a1 += 360.0f;
+                samplePoly([&](float t, float& u, float& v) {
+                    float a = (a0 + (a1 - a0) * t) * D2R;
+                    u = e.center[0] + e.radius * std::cos(a);
+                    v = e.center[1] + e.radius * std::sin(a);
+                }, 40);
+            } else if (e.type == "ellipse") {
+                float ca = std::cos(e.rot * D2R), sa = std::sin(e.rot * D2R);
+                samplePoly([&](float t, float& u, float& v) {
+                    float a = t * 6.2831853f;
+                    float lx = e.rx * std::cos(a), ly = e.ry * std::sin(a);
+                    u = e.center[0] + lx * ca - ly * sa;
+                    v = e.center[1] + lx * sa + ly * ca;
+                }, 48);
+            } else if ((e.type == "spline" || e.type == "style_spline") && e.pts.size() >= 2) {
+                for (size_t i = 1; i < e.pts.size(); ++i) {
+                    ImVec2 a, b;
+                    if (uv2s(e.pts[i - 1].x, e.pts[i - 1].y, a) && uv2s(e.pts[i].x, e.pts[i].y, b)) {
+                        segs.push_back({a, b}); dlocal = std::min(dlocal, distToSeg(mouse, a, b));
+                    }
+                }
+            }
+        }
+        if (dlocal < best) {
+            best = dlocal; found = true; bestIsCurve = false;
+            bestFid = g.fid; bestName = ghostName(g.fid);
+            bestSegs = std::move(segs);
+        }
+    }
+    if (!found) return false;
+
+    const auto& pal = ui::palette;
+    ImDrawList* wdl = ImGui::GetWindowDrawList();
+    wdl->PushClipRect(imgMin, imgMax, true);
+    for (const auto& s : bestSegs)
+        wdl->AddLine(s.first, s.second, col(pal.accent, 0.95f), 4.0f);
+    const char* banner = "Click to set this as the sweep path";
+    ImVec2 bts = ImGui::CalcTextSize(banner);
+    float bcx = (imgMin.x + imgMax.x) * 0.5f;
+    ImVec2 b0(bcx - bts.x * 0.5f - 14, imgMin.y + 52.0f * ui::uiScale);
+    ImVec2 b1(bcx + bts.x * 0.5f + 14, b0.y + bts.y + 12);
+    wdl->AddRectFilled(b0, b1, col(pal.overlayBg), 6.0f);
+    wdl->AddRect(b0, b1, col(pal.overlayBorder), 6.0f);
+    wdl->AddText(ImVec2(b0.x + 14, b0.y + 6), col(pal.overlayText), banner);
+    wdl->PopClipRect();
+
+    st.requestCursor(ui::CursorKind::Hand);
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        pm->routePathFeature(bestFid, bestName, bestIsCurve);
     return true;
 }
 

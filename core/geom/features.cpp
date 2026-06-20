@@ -3,11 +3,14 @@
 #include "geom/booleans.h"
 
 #include <BRep_Tool.hxx>
+#include <BRepBuilderAPI_TransitionMode.hxx>
+#include <Standard_Failure.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepOffsetAPI_MakeOffset.hxx>
 #include <BRepOffsetAPI_MakePipe.hxx>
+#include <BRepOffsetAPI_MakePipeShell.hxx>
 #include <BRepOffsetAPI_ThruSections.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCone.hxx>
@@ -260,12 +263,71 @@ TopoDS_Shape extrude_face_tapered(const TopoDS_Face& face, const Eigen::Vector3d
     return build(depth, dir);
 }
 
-TopoDS_Shape sweep_face(const TopoDS_Face& profile, const TopoDS_Wire& spine) {
+// Sweep a single CLOSED profile wire along the spine into a capped solid via
+// BRepOffsetAPI_MakePipeShell (the general sweeper — far more robust on curved /
+// helical spines than MakePipe, and the only one that supports orientation laws
+// + solid capping). orientation: 0=follow_path (CorrectedFrenet, the SolidWorks
+// default and the most stable for helices), 1=frenet (true Frenet frame, can flip
+// at inflections), 2=keep_normal (fixed +Z binormal — a profile that never twists).
+// Null shape on kernel failure so the caller can fall back / error cleanly.
+static TopoDS_Shape sweep_wire_solid(const TopoDS_Wire& profile, const TopoDS_Wire& spine,
+                                     int orientation) {
     if (profile.IsNull() || spine.IsNull()) return TopoDS_Shape();
-    BRepOffsetAPI_MakePipe mk(spine, profile);
-    mk.Build();
-    if (!mk.IsDone()) return TopoDS_Shape();
-    return mk.Shape();
+    try {
+        BRepOffsetAPI_MakePipeShell mk(spine);
+        if (orientation == 2)      mk.SetMode(gp_Dir(0, 0, 1));   // fixed binormal
+        else if (orientation == 1) mk.SetMode(Standard_True);     // Frenet
+        else                       mk.SetMode(Standard_False);    // CorrectedFrenet
+        // Transition handling matters on a polyline spine with sharp corners
+        // (e.g. an L-shaped path): round the joints so the shell stays valid.
+        mk.SetTransitionMode(BRepBuilderAPI_RoundCorner);
+        // withContact=false keeps the profile where the user drew it (SolidWorks
+        // pierces the path through the profile); withCorrection=false leaves the
+        // chosen orientation law in charge.
+        mk.Add(profile, Standard_False, Standard_False);
+        if (!mk.IsReady()) return TopoDS_Shape();
+        mk.Build();
+        if (!mk.IsDone()) return TopoDS_Shape();
+        if (!mk.MakeSolid()) return TopoDS_Shape();
+        return mk.Shape();
+    } catch (const Standard_Failure&) {
+        return TopoDS_Shape();
+    }
+}
+
+// Sweep a planar profile FACE (outer boundary + any hole wires) along a spine.
+// The outer wire sweeps to a solid; each hole wire sweeps to a solid that is cut
+// out, so a washer cross-section becomes a hollow tube (essential for threads /
+// pipes). Falls back to the simple BRepOffsetAPI_MakePipe over the face when the
+// shell sweeper can't close the outer solid. Empty shape only if everything fails.
+TopoDS_Shape sweep_profile(const TopoDS_Face& profile, const TopoDS_Wire& spine,
+                           int orientation) {
+    if (profile.IsNull() || spine.IsNull()) return TopoDS_Shape();
+    TopoDS_Wire outer = BRepTools::OuterWire(profile);
+    if (outer.IsNull()) return TopoDS_Shape();
+
+    TopoDS_Shape solid = sweep_wire_solid(outer, spine, orientation);
+    if (solid.IsNull()) {
+        // Fallback: the classic pipe over the whole face. Less robust but covers
+        // simple straight/gently-curved spines where MakePipeShell is fussy.
+        try {
+            BRepOffsetAPI_MakePipe mk(spine, profile);
+            mk.Build();
+            if (mk.IsDone()) return mk.Shape();
+        } catch (const Standard_Failure&) {}
+        return TopoDS_Shape();
+    }
+    // Subtract swept holes so washer / annular profiles yield hollow solids.
+    for (TopExp_Explorer ex(profile, TopAbs_WIRE); ex.More(); ex.Next()) {
+        TopoDS_Wire w = TopoDS::Wire(ex.Current());
+        if (w.IsSame(outer)) continue;
+        TopoDS_Shape hole = sweep_wire_solid(w, spine, orientation);
+        if (!hole.IsNull()) {
+            TopoDS_Shape cutres = cut(solid, hole);
+            if (!cutres.IsNull()) solid = cutres;
+        }
+    }
+    return solid;
 }
 
 TopoDS_Shape loft_sections(const std::vector<TopoDS_Wire>& sections, bool ruled) {

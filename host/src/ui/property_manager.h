@@ -300,11 +300,18 @@ public:
     // FeatureManager-tree click), not by topology. True while the active well is the
     // "path"/"centerline" well so those pickers arm.
     bool activeWellWantsPathFeature() const;
-    // Route a sketch / curve feature into the active path well as a
-    // {"kind":"path","feature":fid} selector (the engine's selector_owner_id resolves
-    // it to the owning feature, which a sweep follows as its spine). Re-picking the
-    // same feature toggles it off. Returns true if a path well consumed it.
-    bool routePathFeature(const std::string& fid, const std::string& name);
+    // Route a sketch / curve feature into the active path well. The selector uses a
+    // schema-valid kind: a SKETCH path emits {"kind":"region","sketch":fid} (its wire
+    // becomes the spine); a CURVE/helix path (isCurve=true) emits {"kind":"datum",
+    // "feature":fid}. selector_owner_id resolves either to the owning feature, which a
+    // sweep follows as its spine. Re-picking the same feature toggles it off. Returns
+    // true if a path well consumed it.
+    bool routePathFeature(const std::string& fid, const std::string& name, bool isCurve);
+
+    // Feature ids currently held by the path/centerline/guides wells, so the viewport can
+    // keep the selected sweep path + guides HIGHLIGHTED while the form is open (even when
+    // the preview is failing). Extracts the owning feature from each selector.
+    std::vector<std::string> pathHighlightFeatureIds() const;
 
     // ---- C51: sketched-feature region picking ----------------------------------------------
     // The viewport region picker (SketchMode::drawRegionPicker) drives these to render region

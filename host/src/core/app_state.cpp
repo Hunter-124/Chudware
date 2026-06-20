@@ -706,6 +706,48 @@ void AppState::clearViewportForNewDoc() {
     zoomToBBoxRequested = false;
 }
 
+// Multi-document: park the LEAVING tab's live per-doc value state into its DocSession (move out, so
+// AppState's fields are left empty — the entering doc's state is then restored over them). The owned
+// PM / SketchMode / EvaluateDialogs are not touched here; they live on the session and are repointed
+// by reseatActiveSubsystems. KEEP THE FIELD LIST IN SYNC WITH restoreDocState + clearViewportForNewDoc.
+void AppState::captureDocState(DocSession& s) {
+    // Selection items: swap the vector out of the live Selection WITHOUT disturbing its observer
+    // (the observer is wired once on AppState::selection and must survive every switch).
+    s.selItems.clear();
+    std::swap(s.selItems, selection.mutableItems());
+    s.hover        = hover;
+    s.pickStatus   = std::move(pickStatus);
+    s.bodyVisible  = std::move(bodyVisible);
+    s.docBodyIds   = std::move(docBodyIds);
+    s.modelInfo    = std::move(modelInfo);
+    s.asmParts     = std::move(asmParts);
+    s.asmFit       = std::move(asmFit);
+    s.asmStl       = std::move(asmStl);
+    s.selectedPart = selectedPart;
+    s.selectedFeatureId     = std::move(selectedFeatureId);
+    s.treeScrollToSelection = treeScrollToSelection;
+    s.featureHighlightFaces = std::move(featureHighlightFaces);
+    s.sketchPlanePickActive = sketchPlanePickActive;
+}
+
+// Multi-document: restore the ENTERING tab's parked MODEL-side state (hidden-body mask BEFORE the
+// mesh load so loadDocMesh preserves it, plus the readouts / tree highlight). The viewport SELECTION
+// (selItems / hover / pickStatus) is intentionally left on `s` and restored by switchToTab AFTER
+// loadDocMesh — loadDocMesh clears the live selection, so restoring it earlier would be wiped.
+void AppState::restoreDocState(DocSession& s) {
+    bodyVisible  = std::move(s.bodyVisible);
+    docBodyIds   = std::move(s.docBodyIds);
+    modelInfo    = std::move(s.modelInfo);
+    asmParts     = std::move(s.asmParts);
+    asmFit       = std::move(s.asmFit);
+    asmStl       = std::move(s.asmStl);
+    selectedPart = s.selectedPart;
+    selectedFeatureId     = std::move(s.selectedFeatureId);
+    treeScrollToSelection = s.treeScrollToSelection;
+    featureHighlightFaces = std::move(s.featureHighlightFaces);
+    sketchPlanePickActive = s.sketchPlanePickActive;
+}
+
 // Solid Bodies hide/show: push the host-side visibility mask to the renderer (per-slot draw
 // skip) and to the id pass (hidden-body pick skip), keeping both perfectly in sync. Safe to call
 // with no doc loaded (both sinks tolerate empty state).

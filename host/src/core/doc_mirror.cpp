@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>  // activateCached: verify the cached AICM mesh file still exists
 #include <map>
 #include <string>
 
@@ -503,6 +504,45 @@ bool DocMirror::activate(WorkerClient& w, const std::string& docId, std::string&
     // Strangler diagnostic (no-op unless $AI_CAD_CPP_PARITY): compile the same tree
     // through the C++ core and log per-feature parity vs Python.
     cppParityProbe("rebuild", docId_, revision_, tree_, featureStatus_);
+    notify();
+    return true;
+}
+
+bool DocMirror::activateCached(WorkerClient& w, const std::string& docId, int cachedRevision,
+                               const std::string& cachedAicm, std::string& aicmPath,
+                               bool& usedCache, std::string& err) {
+    usedCache = false;
+    aicmPath.clear();
+    if (docId.empty()) { err = "empty doc id"; return false; }
+    // No usable cache (never loaded, or the worker's mesh file is gone) -> full rebuild.
+    if (cachedRevision < 0 || cachedAicm.empty() ||
+        !std::filesystem::exists(std::filesystem::u8path(cachedAicm)))
+        return activate(w, docId, aicmPath, err);
+    // Cheap repoint: doc_tree carries tree/revision/feature_status/owner_map WITHOUT a re-tessellate.
+    nlohmann::json res;
+    if (!w.call("doc_tree", {{"doc_id", docId}}, res, err)) return false;
+    if (res.contains("code")) { err = jstr(res, "message"); return false; }
+    if (jint(res, "revision") != cachedRevision)
+        return activate(w, docId, aicmPath, err);   // changed while parked -> fresh rebuild + mesh
+    // Unchanged since we left it — adopt the doc_tree result + reuse the cached mesh (no rebuild).
+    docId_ = docId;
+    revision_ = cachedRevision;
+    tree_ = (res.contains("tree") && res["tree"].is_object()) ? res["tree"] : nlohmann::json{};
+    featureStatus_ = {};
+    if (res.contains("rebuild") && res["rebuild"].is_object()) {
+        const auto& rb = res["rebuild"];
+        if (rb.contains("feature_status") && rb["feature_status"].is_array())
+            featureStatus_ = rb["feature_status"];
+    }
+    if (res.contains("owner_map") && res["owner_map"].is_object())
+        storeOwnerMap(res["owner_map"]);
+    else if (res.contains("rebuild") && res["rebuild"].is_object() &&
+             res["rebuild"].contains("owner_map") && res["rebuild"]["owner_map"].is_object())
+        storeOwnerMap(res["rebuild"]["owner_map"]);
+    else
+        storeOwnerMap(nlohmann::json());
+    aicmPath = cachedAicm;
+    usedCache = true;
     notify();
     return true;
 }

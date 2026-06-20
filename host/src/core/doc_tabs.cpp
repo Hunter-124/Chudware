@@ -16,10 +16,48 @@
 #include "app_state.h"
 
 #include "../worker_client.h"
-#include "../ui/sketch_mode.h"        // exit a mid-edit sketch before switching
-#include "../ui/property_manager.h"   // cancel a mid-edit PM form before switching
+#include "../ui/sketch_mode.h"        // per-document SketchMode owned by each DocSession
+#include "../ui/property_manager.h"   // per-document PropertyManager owned by each DocSession
+#include "../ui/evaluate_dialogs.h"   // per-document EvaluateDialogs (Measure/Mass/Section) owned by DocSession
+#include "../ui/feature_tree.h"       // featureTreeResetTransient — clear tree statics on a tab switch
 #include "../ui/ecad/ecad_panel.h"    // Wave 2: point the ECAD editor at the active Schematic/PCB tab
 #include "../ui/ecad/ecad_mirror.h"   // Wave 2: complete EcadMirror type for setDocId on switch
+
+// ---- DocSession (multi-document per-tab editing/display state) -------------------------------
+// Defined here (not in app_state.h) so the unique_ptr members see the COMPLETE PropertyManager /
+// SketchMode / EvaluateDialogs types pulled in above — app_state.h only forward-declares them.
+DocSession::DocSession()
+    : pm(std::make_unique<ui::PropertyManager>()),
+      sketch(std::make_unique<ui::SketchMode>()),
+      evaluate(std::make_unique<ui::EvaluateDialogs>()) {}
+DocSession::~DocSession() = default;
+
+DocSession* AppState::activeSession() {
+    if (activeTab < 0 || activeTab >= (int)docTabs.size()) return nullptr;
+    DocTab& t = docTabs[activeTab];
+    if (t.kind != DocTab::TabKind::Part && t.kind != DocTab::TabKind::Assembly) return nullptr;
+    return t.session.get();
+}
+
+void AppState::ensureTabSession(DocTab& t) {
+    if (t.kind != DocTab::TabKind::Part && t.kind != DocTab::TabKind::Assembly) return;
+    if (!t.session) t.session = std::make_shared<DocSession>();
+}
+
+void AppState::reseatActiveSubsystems(DocSession* s) {
+    propertyManager = s ? s->pm.get()       : fallbackPropertyManager;
+    sketchMode      = s ? s->sketch.get()   : fallbackSketchMode;
+    evaluateDialogs = s ? s->evaluate.get() : fallbackEvaluate;
+}
+
+// Release closed-tab sessions once nothing they own can still be touched by a pending async result.
+// A DocSession's PM / sketch / evaluate capture `this` in their st.rpc completion lambdas; those run
+// on the GL thread in rpc.drain(). While rpc.busy() is true a queued/undrained result may still fire
+// against a retired session, so we keep it alive until the queue is fully drained. Called once per
+// frame from run_gui (after the rpc drain).
+void AppState::sweepRetiredSessions() {
+    if (!retiredSessions.empty() && !rpc.busy()) retiredSessions.clear();
+}
 
 // Safe JSON string accessor (local; avoids pulling the app_state.h jstr overloads here).
 static std::string jtab(const nlohmann::json& o, const char* k) {
@@ -57,6 +95,17 @@ int AppState::tabIndexForActiveDoc() const {
 
 void AppState::addDocTab(bool isAssembly) {
     if (!docMirror.hasDoc()) return;
+    // Multi-document: park the currently-active CAD tab's edit/display state before this new doc
+    // becomes active, so switching BACK to it later restores its selection/mask/readouts (its PM /
+    // sketch / measure already live on its own DocSession and survive regardless). Save its camera
+    // too (mirrors the switchToTab leaving-camera capture).
+    if (DocSession* prev = activeSession()) {
+        DocTab& cur = docTabs[activeTab];
+        cur.yaw = yaw; cur.pitch = pitch; cur.zoom = zoom;
+        cur.pan[0] = pan[0]; cur.pan[1] = pan[1]; cur.pan[2] = pan[2];
+        cur.camValid = true;
+        captureDocState(*prev);
+    }
     DocTab t;
     t.kind = isAssembly ? DocTab::TabKind::Assembly : DocTab::TabKind::Part;
     t.docId = docMirror.docId();
@@ -67,25 +116,30 @@ void AppState::addDocTab(bool isAssembly) {
     // switches away (camValid stays false until then, so the default iso view is used on return).
     docTabs.push_back(std::move(t));
     activeTab = (int)docTabs.size() - 1;
+    // Give the new tab its own editing/display session and point the active-subsystem borrows at it.
+    ensureTabSession(docTabs[activeTab]);
+    reseatActiveSubsystems(docTabs[activeTab].session.get());
 }
 
-// Cleanly leave whatever the user is editing so no state straddles a document switch/close.
-static void exitActiveEdits(AppState& st) {
-    if (st.sketchMode && st.sketchMode->active())
-        st.sketchMode->exitSketch(st, /*keep=*/true);
-    if (st.propertyManager && st.propertyManager->active())
-        st.propertyManager->cancelEdits(st);
+// Multi-document: park the active CAD tab's per-doc VALUE state into its DocSession before a switch.
+// This REPLACES the old "cancel the in-progress edit" behavior — a switch now PRESERVES the open PM
+// form / active sketch / measurement (those live on the session's own PropertyManager / SketchMode /
+// EvaluateDialogs and survive untouched; only the AppState value fields are parked here). No-op on a
+// non-CAD tab (Drawing / Schematic / PCB have no DocSession).
+static void parkActiveCadSession(AppState& st) {
+    if (DocSession* s = st.activeSession()) st.captureDocState(*s);
 }
 
 // Wave 2 (GUI rework): open an already-created worker ECAD doc as a new Schematic/PCB tab + make it
 // active. The caller (the New-Document chooser / ribbon New Schematic|PCB) has already run ecad_new
 // and adopted the result into the editor mirror (st.ecadDocId/ecadRevision are set). This appends a
 // matching tab carrying that ecad id/revision and points the editor at it. The Drawing-tab discipline
-// applies: no DocMirror touch. exitActiveEdits first so no half-edited CAD state straddles the switch.
+// applies: no DocMirror touch. The leaving CAD tab's edit/display state is PARKED (not cancelled) so
+// the part behind the ECAD canvas keeps its in-progress PM form / sketch / measure.
 void AppState::addEcadTab(const std::string& kind, const std::string& ecadDocId_,
                           int ecadRevision_, const std::string& title) {
     if (ecadDocId_.empty()) return;
-    exitActiveEdits(*this);
+    parkActiveCadSession(*this);
     // Save the leaving 3D tab's camera (mirrors switchToTab step 2; skipped for drawing/ECAD tabs).
     if (activeTab >= 0 && activeTab < (int)docTabs.size() &&
         docTabs[activeTab].kind != DocTab::TabKind::Drawing &&
@@ -112,6 +166,9 @@ void AppState::addEcadTab(const std::string& kind, const std::string& ecadDocId_
     showRibbon = true;
     ribbonTab = RT_PCB;
     wantFocusEcad = 6;
+    // An ECAD tab does not use the CAD subsystems — point st.propertyManager / sketchMode /
+    // evaluateDialogs back at the fallback singletons so nothing acts on the parked part behind it.
+    reseatActiveSubsystems(nullptr);
     addLog("[tabs] new ECAD " + kind + " tab '" + t.title + "' (" + ecadDocId_ + ")");
 }
 
@@ -126,8 +183,9 @@ void AppState::switchToTab(int idx) {
         if (docMirror.docId() == docTabs[idx].docId) return;
     }
 
-    // 1) Leave any in-progress sketch / PM form (no zombie edit state across docs).
-    exitActiveEdits(*this);
+    // 1) Park the LEAVING CAD tab's per-doc value state into its session (its PM form / sketch /
+    //    measure live on the session and are preserved — switching no longer cancels them).
+    parkActiveCadSession(*this);
 
     // 2) Save the LEAVING tab's camera so it keeps its own view (only meaningful for a 3D part/asm
     //    tab — a Drawing tab's "camera" is its sheet pan/zoom, and an ECAD tab's is its 2D canvas
@@ -150,6 +208,7 @@ void AppState::switchToTab(int idx) {
     if (dst0.kind == DocTab::TabKind::Drawing) {
         activeTab = idx;
         animActive = false;
+        reseatActiveSubsystems(nullptr);   // drawing tab: CAD subsystems fall back to the singletons
         // A drawing has no Assembly/PCB context; otherwise it keeps whatever ribbon was forward.
         if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB) ribbonTab = RT_Features;
         refreshDrawingTab(idx);
@@ -166,6 +225,7 @@ void AppState::switchToTab(int idx) {
     if (dst0.kind == DocTab::TabKind::Schematic || dst0.kind == DocTab::TabKind::PCB) {
         activeTab = idx;
         animActive = false;
+        reseatActiveSubsystems(nullptr);  // ECAD tab: CAD subsystems fall back to the singletons
         ecadDocId   = dst0.ecadDocId;     // mirror the active ECAD doc onto AppState (app.cpp helpers)
         ecadRevision = dst0.ecadRevision;
         if (!ecadDocId.empty()) {
@@ -190,40 +250,72 @@ void AppState::switchToTab(int idx) {
     }
 
     DocTab& dst = docTabs[idx];
+    ensureTabSession(dst);   // a never-activated tab gets its session on first switch-in
 
     // 3) Re-point DocMirror at the destination doc (doc_rebuild → tree + revision + owner map +
     //    fresh AICM mesh path). The worker still holds the doc, so this is a fast no-op-bump call.
     //    activate() fires the mirror listener; suppress the tab-dirty marker around it (a switch is
-    //    not an edit and must not light the destination's unsaved marker).
+    //    not an edit and must not light the destination's unsaved marker). The leaving doc's value
+    //    state is already parked on its session (step 1); the destination's is restored below — NO
+    //    clearViewportForNewDoc, so the destination keeps its selection / hidden bodies / readouts.
     suppressTabDirty = true;
     std::string aicmPath, err;
-    bool ok = docMirror.activate(worker, dst.docId, aicmPath, err);
+    bool usedCache = false;
+    // Scale: prefer the fast path — reuse the doc's cached mesh (cheap doc_tree, no re-tessellate)
+    // when its worker revision is unchanged since we last left it; activateCached falls back to the
+    // full rebuild otherwise. This keeps switching among many open parts O(doc_tree), not O(rebuild).
+    bool ok = docMirror.activateCached(worker, dst.docId, dst.session->cachedRevision,
+                                       dst.session->cachedAicmPath, aicmPath, usedCache, err);
     suppressTabDirty = false;
-
-    // 4) Reset every per-doc host cache / selection / tree transient BEFORE loading the new mesh
-    //    (clears the previous doc's bodies, hidden set, selection, rename buffer, pending ops...).
-    clearViewportForNewDoc();
 
     if (!ok) {
         addLog("[tabs] switch failed: " + err);
         toast(ui::ToastLevel::Error, "Couldn't switch document: " + err);
         // The mirror may now be in an inconsistent half-state; leave activeTab as-is on the strip
-        // but the doc id has likely changed — re-sync the active index to whatever the mirror holds.
+        // but the doc id has likely changed — re-sync the active index to whatever the mirror holds
+        // and re-point the active subsystems at whatever session that resolves to.
         activeTab = tabIndexForActiveDoc();
+        reseatActiveSubsystems(activeSession());
         return;
     }
 
     activeTab = idx;
+    // Re-seat the active PM / sketch / evaluate borrows at THIS document's session, then restore its
+    // parked MODEL state (hidden-body mask + readouts + tree highlight) BEFORE loadDocMesh so the
+    // mask is preserved across the rebuild. The viewport selection is restored AFTER the mesh load
+    // (loadDocMesh clears the live selection).
+    reseatActiveSubsystems(dst.session.get());
+    restoreDocState(*dst.session);
+    // Feature-tree file-static transients (in-progress inline rename, multi-select, the panel's
+    // current save path) are NOT yet per-document; clear them on every switch exactly as the old
+    // clearViewportForNewDoc path did, so doc A's rename buffer / save path can't bleed onto doc B.
+    // The one-shot zoom-to-bbox request is likewise dropped (it is transient, not per-doc state).
+    ui::featureTreeResetTransient();
+    zoomToBBoxRequested = false;
+
     dst.isAssembly = docMirror.tree().is_object() &&
                      (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
     dst.title = docTitle(docMirror.tree(), dst.isAssembly);
 
-    // 5) Load the destination doc's mesh (empty path / empty doc → datum-plane fallback).
+    // 5) Load the destination doc's mesh (empty path / empty doc → datum-plane fallback). With the
+    //    hidden-body mask already restored, loadDocMesh preserves it (body-id list unchanged).
     if (!aicmPath.empty()) {
         std::string lerr;
         if (!loadDocMesh(aicmPath, lerr) && !lerr.empty())
             addLog("[tabs] loadDocMesh on switch: " + lerr);
     }
+    // Refresh this session's fast-switch cache to the just-loaded mesh + revision, so the NEXT
+    // switch-in can skip the rebuild while the doc stays unedited (activateCached above).
+    dst.session->cachedAicmPath = aicmPath;
+    dst.session->cachedRevision = docMirror.revision();
+
+    // 5b) Restore the viewport selection now that the mesh is loaded (loadDocMesh cleared it). Assign
+    //     items directly so the resolved selectors survive and the observer isn't re-fired (the picks
+    //     were already resolved when first made on this doc).
+    selection.mutableItems() = std::move(dst.session->selItems);
+    dst.session->selItems.clear();
+    hover = dst.session->hover;
+    pickStatus = std::move(dst.session->pickStatus);
 
     // 6) Restore the destination tab's camera (or keep the fresh iso default if never saved).
     animActive = false;  // cancel any in-flight tween from the leaving doc
@@ -245,6 +337,11 @@ void AppState::switchToTab(int idx) {
 void AppState::closeDocTab(int idx) {
     if (idx < 0 || idx >= (int)docTabs.size()) return;
     DocTab closing = docTabs[idx];
+    // Multi-document: keep the closing tab's session alive past this erase until any async RPC its
+    // PM / sketch / evaluate has in flight has drained (their completion lambdas capture `this`).
+    // sweepRetiredSessions() releases it once rpc is idle. Harmless for a session with no pending
+    // call (cleared next frame).
+    if (closing.session) retiredSessions.push_back(closing.session);
 
     // Tell the worker to drop the document from its registry. (Best-effort: a failure still removes
     // the host tab so the UI never wedges on a doc the user asked to close.) A Drawing tab lives in
@@ -278,9 +375,11 @@ void AppState::closeDocTab(int idx) {
     docTabs.erase(docTabs.begin() + idx);
 
     if (docTabs.empty()) {
-        // Last tab closed → return to the empty/start state the app shows on launch.
-        exitActiveEdits(*this);
+        // Last tab closed → return to the empty/start state the app shows on launch. The closing
+        // doc's session (still ref-held by `closing`) destructs on return; nothing to cancel since
+        // its worker doc was already closed above. Point the active subsystems back at the fallbacks.
         activeTab = -1;
+        reseatActiveSubsystems(nullptr);
         docMirror.reset();
         clearViewportForNewDoc();
         addLog("[tabs] closed last document — empty start state");
@@ -294,8 +393,12 @@ void AppState::closeDocTab(int idx) {
         activeTab = -1;            // force switchToTab to do a real switch (don't early-out)
         switchToTab(neighbor);
     } else {
-        // A background tab closed: the active doc is unchanged; just fix up the active index.
+        // A background tab closed: the active doc is unchanged; just fix up the active index. The
+        // active session lives on the heap (shared_ptr), so erasing a different tab from the vector
+        // does not invalidate the st.propertyManager/sketchMode/evaluate borrows — but re-seat
+        // defensively in case the index shift moved which session activeTab resolves to.
         if (idx < activeTab) --activeTab;
+        reseatActiveSubsystems(activeSession());
     }
     addLog("[tabs] closed '" + closing.title + "'");
 }
@@ -342,8 +445,11 @@ void AppState::ensureActiveTab() {
     if (idx >= 0) {
         // The mirror's doc already has a tab. Make sure it's the active one (a doc-creating path
         // may have re-pointed the mirror without going through switchToTab) and keep its title in
-        // step with the live tree (renames, agent-built names).
+        // step with the live tree (renames, agent-built names). Ensure the tab has a session and the
+        // active-subsystem borrows resolve to it (idempotent when the active tab didn't change).
         activeTab = idx;
+        ensureTabSession(docTabs[idx]);
+        reseatActiveSubsystems(docTabs[idx].session.get());
         syncActiveTabTitle();
         return;
     }
@@ -457,8 +563,12 @@ void AppState::makeDrawing() {
     t.sourceDocId = sourceId;
     t.drawingDoc = std::move(drawingDoc);
     t.drawNeedFit = true;
+    // Park the source part's edit/display state before the drawing tab takes focus (it stays loaded
+    // behind the sheet), then push the drawing tab and fall the CAD subsystems back to the singletons.
+    parkActiveCadSession(*this);
     docTabs.push_back(std::move(t));
     activeTab = (int)docTabs.size() - 1;
+    reseatActiveSubsystems(nullptr);
     if (ribbonTab == RT_Assembly) ribbonTab = RT_Features;
     addLog("[draw] created drawing '" + drawingName + "' (" + drawingId + ", " +
            std::to_string(added) + " views) from " + sourceId);

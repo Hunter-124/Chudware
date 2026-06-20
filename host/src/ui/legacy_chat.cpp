@@ -861,14 +861,23 @@ static void submitTurn(AppState& st, const std::string& text) {
             }
         st.addLog("[..] clarify: " + text);
         st.status = "Thinking...";  st.statusKind = 0;
-        nlohmann::json params = {
-            {"request", text},
-            {"doc_id", st.docMirror.hasDoc() ? st.docMirror.docId() : std::string()}};
-        st.rpc.call("agent_clarify_v1", params, [&st, text](const core::RpcResult& r) {
+        const std::string clarifyDocId = st.docMirror.hasDoc() ? st.docMirror.docId() : std::string();
+        nlohmann::json params = {{"request", text}, {"doc_id", clarifyDocId}};
+        st.rpc.call("agent_clarify_v1", params, [&st, text, clarifyDocId](const core::RpcResult& r) {
             ChatMsg* msg = nullptr;
             for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
                 if (!it->fromUser && it->clarify.awaiting) { msg = &*it; break; }
             if (!msg) return;  // turn was cleared (New part) — nothing to do
+            // Multi-document: the user switched to a different document while clarify was in flight.
+            // launchDesignRun below would build against the NOW-active doc — the wrong one. Stop the
+            // turn's spinner and let the user re-issue from the doc they meant, rather than corrupt it.
+            if (st.docMirror.docId() != clarifyDocId) {
+                msg->clarify.awaiting = false;
+                msg->running = false;
+                msg->liveStatus.clear();
+                st.addLog("[..] clarify result for " + clarifyDocId + " dropped — active doc changed");
+                return;
+            }
             msg->clarify.awaiting = false;
             // Parse questions; on ANY error/empty -> build straight away (never block).
             bool ready = true;

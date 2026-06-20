@@ -657,13 +657,7 @@ static void ensureStarterDoc(AppState& st, bool shot) {
     if (shot || st.starterTried) return;
     if (!st.workerStarted || st.docMirror.hasDoc() || !st.docTabs.empty() || st.designStarted) return;
     st.starterTried = true;
-    std::string err;
-    st.suppressTabDirty = true;                 // a fresh doc is not an edit — start the tab clean
-    bool ok = st.docMirror.newPart(st.worker, err);
-    st.suppressTabDirty = false;
-    if (!ok) { st.addLog("[startup] default new part failed: " + err); return; }
-    st.clearViewportForNewDoc();
-    st.addDocTab(/*isAssembly=*/false);
+    ui::createNewDoc(st, 0);   // New Part — same path as the chooser (incl. per-doc session setup)
     if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
         st.docTabs[st.activeTab].isStarter = true;
     st.wantFocusViewport = 6;
@@ -788,20 +782,30 @@ int run_gui(const char* screenshotPath) {
     glfwSetWindowUserPointer(win, &st);
     g_prevDropCallback = glfwSetDropCallback(win, onFileDrop);
 
-    // C17: PropertyManager — owned here, borrowed via st.propertyManager (opaque void*).
+    // Multi-document FALLBACK singletons. PropertyManager / SketchMode / EvaluateDialogs are now
+    // owned PER-DOCUMENT on each DocSession; st.propertyManager / sketchMode / evaluateDialogs are
+    // re-seated at the active document's instances on every tab switch (reseatActiveSubsystems).
+    // These run_gui-owned objects are the FALLBACK used at the empty start state and on a Drawing /
+    // ECAD tab (no CAD document active). st.* default to them so every borrow site is valid before
+    // the first document opens. NOTE: the dispatcher + frame loop below go through st.propertyManager
+    // / st.sketchMode / st.evaluateDialogs (NOT these locals) so they act on the ACTIVE document.
     ui::PropertyManager propertyManager;
     st.propertyManager = &propertyManager;
+    st.fallbackPropertyManager = &propertyManager;
 
     // C19: SimClient (worker #2) + Simulation panel + Evaluate dialogs — owned here.
     core::SimClient simClient;
     st.simClient = &simClient;
     ui::SimPanel simPanel;
     st.simPanel = &simPanel;
-    ui::EvaluateDialogs evaluateDialogs;
+    ui::EvaluateDialogs evaluateDialogs;        // fallback Measure/Mass/Section dialogs (per-doc otherwise)
+    st.evaluateDialogs = &evaluateDialogs;
+    st.fallbackEvaluate = &evaluateDialogs;
 
     // C18: SketchMode — owned here, borrowed via st.sketchMode (opaque void*).
     ui::SketchMode sketchMode;
     st.sketchMode = &sketchMode;
+    st.fallbackSketchMode = &sketchMode;
 
     // Configurations panel (SolidWorks ConfigurationManager) — owned here. The Configurations
     // left-pane tab renders it (ConfigPanel::drawEmbedded) via st.configPanel; there is no
@@ -831,8 +835,13 @@ int run_gui(const char* screenshotPath) {
     //   - sketch-tab commands (sketch_new / sk_* / smart_dim / sketch_exit) go to SketchMode first
     //     so the sketch experience takes priority over any PM form for those ids;
     //   - commands without a form log a stub line so they stay observable until later cards wire them.
-    auto dispatchCmd = [&st, &propertyManager, &sketchMode, &simPanel,
-                        &evaluateDialogs, &asmPanels](const char* cmd_id) {
+    auto dispatchCmd = [&st, &simPanel, &asmPanels](const char* cmd_id) {
+        // Multi-document: resolve the PropertyManager / SketchMode / EvaluateDialogs of the ACTIVE
+        // document (st.* are re-seated on every tab switch). Shadowing the names keeps the dispatch
+        // body below byte-identical to the single-document version.
+        ui::PropertyManager& propertyManager = *st.propertyManager;
+        ui::SketchMode&      sketchMode      = *st.sketchMode;
+        ui::EvaluateDialogs& evaluateDialogs = *st.evaluateDialogs;
         // C43: starting a sketch while a PM form is open cancels the form first (revert
         // preview + close). Without this, plane-pick and the PM coexisted: the PM hid the
         // FeatureManager, both fought over the viewport mouse, and Esc couldn't untangle it.
@@ -1107,6 +1116,16 @@ int run_gui(const char* screenshotPath) {
                 } else if (k == "point") {
                     rd.kind = Renderer::RefDatum::Kind::Point;
                     rd.origin = v3(d.value("point", nlohmann::json()), Vec3(0, 0, 0));
+                } else if (k == "curve") {
+                    // A helix / spiral / spline path: a sampled world polyline that the
+                    // renderer draws and the path picker hit-tests as a sweep path.
+                    rd.kind = Renderer::RefDatum::Kind::Curve;
+                    if (d.contains("points") && d["points"].is_array()) {
+                        rd.points.reserve(d["points"].size());
+                        for (const auto& p : d["points"])
+                            rd.points.push_back(v3(p, Vec3(0, 0, 0)));
+                    }
+                    if (rd.points.size() < 2) continue;  // nothing to draw / pick
                 } else {
                     continue;
                 }
@@ -1179,6 +1198,10 @@ int run_gui(const char* screenshotPath) {
     st.wantEquations = shot && shotMode && std::strcmp(shotMode, "equations") == 0;
     if (st.wantEquations) { st.showFeatureTree = true; }  // keep the FeatureManager (Equations node) visible
     st.wantM1 = shot && shotMode && std::strcmp(shotMode, "m1") == 0;  // C17 integration scenario
+    // Multi-document mid-edit scenario: open a PM form on Part A, switch to Part B and measure,
+    // switch back — assert A's form/selection/hidden-body survive and B is independent (DocSession).
+    st.wantMultidoc = shot && shotMode && std::strcmp(shotMode, "multidoc") == 0;
+    if (st.wantMultidoc) { st.showRibbon = true; st.showFeatureTree = true; }
     st.wantEcad = shot && shotMode && std::strcmp(shotMode, "ecad") == 0;  // Wave N: ECAD GUI shot
     if (st.wantEcad) { st.showPcbTools = true; st.showRibbon = true; st.ribbonTab = AppState::RT_PCB; }  // PCB tab forward
     st.wantSketch = shot && shotMode && std::strcmp(shotMode, "sketch") == 0;  // C18 sketch flow
@@ -1230,7 +1253,7 @@ int run_gui(const char* screenshotPath) {
         st.showRibbon = true;
         st.showFeatureTree = true;  // ensure the left pane (which hosts the PM tab) is visible
         if (const char* cmd = std::getenv("AI_CAD_PMCMD"))
-            if (*cmd && !propertyManager.openForCommand(st, cmd))
+            if (*cmd && !st.propertyManager->openForCommand(st, cmd))
                 std::fprintf(stderr, "pmform: no form for command '%s'\n", cmd);
         // AI_CAD_PMSET="key=value;key2=value2" presets fields so type-gated rows render
         // (e.g. "type=face" to show a fillet's face-set wells, "end=up_to_surface", "thin=true").
@@ -1242,7 +1265,7 @@ int run_gui(const char* screenshotPath) {
                 std::string tok = spec.substr(pos, semi - pos);
                 size_t eq = tok.find('=');
                 if (eq != std::string::npos)
-                    propertyManager.presetFieldForShot(tok.substr(0, eq), tok.substr(eq + 1));
+                    st.propertyManager->presetFieldForShot(tok.substr(0, eq), tok.substr(eq + 1));
                 if (semi == std::string::npos) break;
                 pos = semi + 1;
             }
@@ -1398,7 +1421,7 @@ int run_gui(const char* screenshotPath) {
     // six step machines + their per-step backbuffer captures, extracted to ui::ScenarioRunner
     // (ui/scenarios.cpp). tick() advances the active scenario before each frame; endFrame()
     // handles the captures and the scenario-driven swap+continue / swap+break at loop bottom.
-    ui::ScenarioRunner scenarios(propertyManager, simPanel, evaluateDialogs, activityPanel);
+    ui::ScenarioRunner scenarios(simPanel, activityPanel);
 
     auto desiredThemeForFrame = [&st]() {
         if (const char* envTheme = std::getenv("AI_CAD_THEME")) {
@@ -1448,6 +1471,9 @@ int run_gui(const char* screenshotPath) {
         // C39: deliver finished async worker calls — their callbacks run HERE, on the GL
         // thread, before this frame's panels draw, so results land like any other state.
         st.rpc.drain();
+        // Multi-document: release closed-tab sessions whose async work (PM preview / sketch / eval
+        // callbacks that captured `this`) has now fully drained — safe to destroy once rpc is idle.
+        st.sweepRetiredSessions();
 
         // C48: click telemetry for interaction debugging — only when AI_CAD_DEBUG_INPUT is
         // set (pairs with AI_CAD_LOG_FILE). Logs what ImGui thinks is under every click.
@@ -1549,9 +1575,20 @@ int run_gui(const char* screenshotPath) {
                     // call froze the window right after the agent finished. Queue it async;
                     // the callback (a later frame's drain, GL thread) resyncs and reloads.
                     st.livePhase = "Refreshing model...";
-                    st.rpc.call("doc_rebuild", {{"doc_id", st.docMirror.docId()}},
-                        [&st](const core::RpcResult& r) {
+                    // Multi-document: capture the doc this rebuild targets. If the user switches to
+                    // another tab before the async result drains, the callback must NOT resync /
+                    // reload the FOREGROUND doc with this (background) doc's result — the foreground
+                    // mirror + mesh would be corrupted. The backgrounded doc picks up the fresh tree
+                    // + mesh when its tab is reactivated (switchToTab re-activates + reloads).
+                    const std::string rebuildDocId = st.docMirror.docId();
+                    st.rpc.call("doc_rebuild", {{"doc_id", rebuildDocId}},
+                        [&st, rebuildDocId](const core::RpcResult& r) {
                             st.livePhase.clear();
+                            if (st.docMirror.docId() != rebuildDocId) {
+                                st.addLog("[v2] doc_rebuild result for " + rebuildDocId +
+                                          " ignored — active doc changed");
+                                return;
+                            }
                             if (r.ok) {
                                 // W1-B (item 6): STALENESS FIX. Reloading the mesh alone left the
                                 // FeatureManager showing PRE-run features. Resync (doc_tree — a
@@ -2040,7 +2077,7 @@ int run_gui(const char* screenshotPath) {
         {
             const bool canDoc = st.workerStarted && !st.job.running.load() && !st.agentV2Running;
             const bool textFocus = io.WantTextInput;
-            const bool inSketchNow = sketchMode.active();
+            const bool inSketchNow = st.sketchMode->active();
             bool ecadFocused = false;
             if (ImGuiContext* g = ImGui::GetCurrentContext()) {
                 for (ImGuiWindow* w = g->NavWindow; w; w = w->ParentWindow)
@@ -2249,15 +2286,19 @@ int run_gui(const char* screenshotPath) {
         // while sketching.
         {
             static bool s_wasInSketch = false;
-            const bool nowInSketch = sketchMode.active();
+            const bool nowInSketch = st.sketchMode->active();
             if (nowInSketch && !s_wasInSketch)      st.ribbonTab = AppState::RT_Sketch;
             else if (!nowInSketch && s_wasInSketch) st.ribbonTab = AppState::RT_Features;
             s_wasInSketch = nowInSketch;
         }
         // C40: accent-highlight the armed sketch tool's ribbon button.
-        ui::setRibbonActiveCmd(sketchMode.activeToolCmd());
+        ui::setRibbonActiveCmd(st.sketchMode->activeToolCmd());
         float ribbonH = ui::drawRibbon(st.ribbonTab, st.showRibbon,
                                        st.showSimulationTools, st.showPcbTools, barH);
+
+        // ---------- default starter document ----------
+        // Open straight into a fresh part on launch (non-shot) so the app is immediately usable.
+        ensureStarterDoc(st, shot);
 
         // ---------- active document reconciliation ----------
         // The browser/SolidWorks-style document tabs are rendered INSIDE the central dock node's
@@ -2310,13 +2351,16 @@ int run_gui(const char* screenshotPath) {
         // so the debounced live preview fires; the container draws the PM form body when active.
         // A live PropertyManager forces the left pane open so its form is visible, but the preview
         // tick is independent of that pane state to avoid invisible active commands.
-        if (propertyManager.active()) {
-            propertyManager.tick(st);
+        // Multi-document: the ACTIVE document's PropertyManager (st.propertyManager is re-seated on
+        // every tab switch). A backgrounded doc's PM is NOT ticked here, so its debounced preview
+        // pauses while parked and resumes when its tab is reactivated.
+        if (st.propertyManager->active()) {
+            st.propertyManager->tick(st);
             st.showFeatureTree = true;
         }
         if (st.showFeatureTree) {
-            ui::drawLeftPane(st, [&st, &propertyManager](const std::string& fid) {
-                propertyManager.openForEdit(st, fid);
+            ui::drawLeftPane(st, [&st](const std::string& fid) {
+                st.propertyManager->openForEdit(st, fid);
             });
         }
         // W3-H: unified AI Copilot pane (input-at-top + conversation; embeds the run tree
@@ -2345,10 +2389,15 @@ int run_gui(const char* screenshotPath) {
         // ---------- C19: simulation panel + evaluate dialogs ----------
         simPanel.tick(st);          // drain SimClient progress + completion (loads overlays)
         simPanel.draw(st);
-        evaluateDialogs.draw(st);
+        st.evaluateDialogs->draw(st);   // active doc's Measure/Mass/Section windows (per-doc; re-seated)
 
         // ---------- C20b: assembly panels (Insert / Mate / Explode / Interference / BOM) ----------
         asmPanels.draw(st);
+
+        // ---------- "Create New" document chooser (tiled previews + Open existing) ----------
+        // Hosted here at app scope (not inside the Viewport window) so the doc-strip "+" / Ctrl+N
+        // raise it regardless of which central document — part, drawing, or ECAD — is forward.
+        ui::drawNewDocChooser(st);
 
         // ---------- Equations / Global Variables editor (modeless; gated by st.showEquations) ----------
         // Opened from the FeatureManager "Equations" node (double-click) or View > Equations. Lists

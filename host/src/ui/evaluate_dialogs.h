@@ -24,6 +24,11 @@ public:
     // Draw the currently-open result window (no-op when none is open).
     void draw(AppState& st);
 
+    // Which result window is currently open ("mass","measure","section",...; empty = none). Used by
+    // the AI_CAD_SHOT=multidoc scenario to assert that a measurement opened on one document does not
+    // bleed into another's (per-document EvaluateDialogs).
+    const std::string& openWindowKind() const { return openWindow_; }
+
 private:
     void runEval(AppState& st, const std::string& method, const nlohmann::json& extra);
     void runFieldEval(AppState& st, const std::string& method, const nlohmann::json& extra,

@@ -186,6 +186,11 @@ public:
     // The feature id under live edit/preview (empty until the first preview lands or on edit).
     const std::string& targetId() const { return targetId_; }
 
+    // Feature type of the active form ("fillet"/"chamfer"/…), or "" when no form is open. Cheap
+    // read of the open form's PMFormDef::type — lets scripted flows assert WHICH form survived a
+    // document switch (e.g. multidoc proving doc A keeps its fillet form while doc C has chamfer).
+    std::string activeFormType() const { return (active_ && form_) ? form_->type : std::string(); }
+
     // Open a fresh form for a ribbon command (defaults populated). No-op if the command has no
     // form (returns false so the caller can fall back to a log line).
     bool openForCommand(AppState& st, const std::string& cmdId);
@@ -288,6 +293,18 @@ public:
     // when no selector well is active. Used to toast feedback when a pick is rejected for the
     // wrong kind (SolidWorks tells you what a field wants).
     std::string activeWellKindHint() const;
+
+    // ---- sweep/loft PATH selection (a whole SKETCH or a CURVE/helix feature) ----
+    // A sweep path / loft centerline is a SKETCH or a CURVE (helix/spiral) feature,
+    // not a model edge — so it's picked by feature (viewport curve picker or a
+    // FeatureManager-tree click), not by topology. True while the active well is the
+    // "path"/"centerline" well so those pickers arm.
+    bool activeWellWantsPathFeature() const;
+    // Route a sketch / curve feature into the active path well as a
+    // {"kind":"path","feature":fid} selector (the engine's selector_owner_id resolves
+    // it to the owning feature, which a sweep follows as its spine). Re-picking the
+    // same feature toggles it off. Returns true if a path well consumed it.
+    bool routePathFeature(const std::string& fid, const std::string& name);
 
     // ---- C51: sketched-feature region picking ----------------------------------------------
     // The viewport region picker (SketchMode::drawRegionPicker) drives these to render region

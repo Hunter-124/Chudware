@@ -1,7 +1,7 @@
 // Scripted screenshot/test scenarios (extracted from app.cpp's run_gui frame loop).
 //
-// ScenarioRunner hosts the six frame-driven state machines keyed on AI_CAD_SHOT
-// (m1 / sketch / asm / fea / evalmass / activity). tick() runs once per frame before
+// ScenarioRunner hosts the frame-driven state machines keyed on AI_CAD_SHOT
+// (m1 / sketch / asm / fea / evalmass / activity / multidoc). tick() runs once per frame before
 // ImGui::NewFrame() and advances whichever scenario is active; endFrame() runs after
 // ImGui_ImplOpenGL3_RenderDrawData and handles the per-step backbuffer captures plus the
 // scenario-driven frame-loop control (swap+continue / swap+break). Behavior-preserving
@@ -32,11 +32,11 @@ public:
     };
 
     // The runner borrows the run_gui-owned panels the scenarios drive (same references the
-    // ribbon dispatcher captures); AppState carries everything else.
-    ScenarioRunner(PropertyManager& propertyManager, SimPanel& simPanel,
-                   EvaluateDialogs& evaluateDialogs, ActivityPanel& activityPanel)
-        : propertyManager(propertyManager), simPanel(simPanel),
-          evaluateDialogs(evaluateDialogs), activityPanel(activityPanel) {}
+    // ribbon dispatcher captures); AppState carries everything else. The PropertyManager and
+    // EvaluateDialogs are now PER-DOCUMENT — the scenarios resolve them from st.propertyManager /
+    // st.evaluateDialogs (re-seated on the doc they create), so they are no longer passed here.
+    ScenarioRunner(SimPanel& simPanel, ActivityPanel& activityPanel)
+        : simPanel(simPanel), activityPanel(activityPanel) {}
 
     // Advance the active scenario's step machine (no-op when no AI_CAD_SHOT scenario mode
     // is active). Call once per frame, before ImGui::NewFrame().
@@ -48,9 +48,7 @@ public:
     FrameAction endFrame(AppState& st, int dw, int dh, const char* screenshotPath);
 
 private:
-    PropertyManager& propertyManager;
     SimPanel& simPanel;
-    EvaluateDialogs& evaluateDialogs;
     ActivityPanel& activityPanel;
 
     // ---------- C17 M1 integration scenario (AI_CAD_SHOT=m1) ----------
@@ -90,6 +88,28 @@ private:
     std::string actCapture;
     std::string actSavePath;
     bool actDirReady = false;
+
+    // ---------- multi-document scenario (AI_CAD_SHOT=multidoc) ----------
+    // Verifies the per-document DocSession refactor: open a feature-edit PM form mid-edit on Part A
+    // (with a viewport selection + a hidden body), switch to Part B and measure, switch back to A —
+    // A's PM form / selection / hidden-body mask are intact and B is independent. Same step-machine /
+    // kSettle / per-step backbuffer-capture shape as m1; runMultidoc(st) drives it from tick().
+    void runMultidoc(AppState& st);
+    int mdStep = 0, mdSettle = 0;
+    std::string mdSavePath;
+    bool mdDirReady = false;
+    int mdIdxA = -1, mdIdxB = -1;        // tab indices of Part A / Part B
+    std::string mdDocA, mdDocB;          // worker doc ids of Part A / Part B
+    bool mdPassPm = false, mdPassDoc = false, mdPassMask = false, mdPassSel = false;
+    bool mdPassBIndep = false, mdPassBMeasure = false, mdPassBFresh = false;
+    std::string mdCapture;               // same per-step capture mechanism, separate path slot
+    // N-document scaling: a THIRD doc C with a DIFFERENT mid-edit (chamfer form + its own selection)
+    // proves the DocSession handles "parts C etc" and survives A<->C round-trips. Mirror the A/B
+    // slots above. mdPassChop[k] holds the per-hop verdict for the A<->C round-trip (4 hops).
+    int mdIdxC = -1;                     // tab index of Part C
+    std::string mdDocC;                  // worker doc id of Part C
+    bool mdPassCFresh = false;           // C's PM was fresh (inactive) before we opened its form
+    bool mdPassChop[4] = {false, false, false, false};  // A<->C hop verdicts (A,C,A,C)
 };
 
 }  // namespace ui

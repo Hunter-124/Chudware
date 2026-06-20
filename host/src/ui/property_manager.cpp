@@ -1225,6 +1225,44 @@ const PMField* PropertyManager::profileWell() const {
     return nullptr;
 }
 
+bool PropertyManager::activeWellWantsPathFeature() const {
+    if (!active_) return false;
+    // activeWell() is non-const; inline the same lookup here.
+    for (const auto& f : fields_) {
+        if (f.def->kind != PMFieldKind::SelectorWell || !f.wellActive ||
+            !fieldVisible(*f.def, fields_)) continue;
+        return std::strcmp(f.def->key, "path") == 0 ||
+               std::strcmp(f.def->key, "centerline") == 0;
+    }
+    return false;
+}
+
+bool PropertyManager::routePathFeature(const std::string& fid, const std::string& name) {
+    PMField* well = activeWell();
+    if (!well || fid.empty()) return false;
+    if (std::strcmp(well->def->key, "path") != 0 &&
+        std::strcmp(well->def->key, "centerline") != 0) return false;
+    // Toggle off if this exact feature already fills the path (SolidWorks re-pick).
+    for (size_t i = 0; i < well->picks.size(); ++i) {
+        const auto& sel = well->picks[i].selector;
+        if (sel.is_object() && sel.value("kind", std::string()) == "path" &&
+            sel.value("feature", std::string()) == fid) {
+            well->picks.erase(well->picks.begin() + i);
+            dirty_ = true; lastEditTime_ = ImGui::GetTime();
+            return true;
+        }
+    }
+    well->picks.clear();   // path / centerline are single-ref
+    PMSelEntry e;
+    e.selector = {{"kind", "path"}, {"feature", fid}};
+    e.label = name.empty() ? fid : name;
+    well->picks.push_back(std::move(e));
+    well->wellDangling = false;
+    dirty_ = true; lastEditTime_ = ImGui::GetTime();
+    advanceWellAfterFill(well);
+    return true;
+}
+
 bool PropertyManager::wantsRegionPicker() const {
     return active_ && profileWell() != nullptr;
 }
@@ -1476,8 +1514,13 @@ void PropertyManager::requestAiAssist(AppState& st) {
     aiHighlights_.clear();
     const int seq = ++aiRequestSeq_;
     nlohmann::json params = buildAiAssistPayload(st);
-    st.rpc.call("agent_pm_assist_v1", params, [this, &st, seq](const core::RpcResult& r) {
+    // Multi-document: this PropertyManager is now owned by its document's DocSession, but its result
+    // patches fields via st (the ACTIVE doc). Bind the request to its doc so a tab switch before the
+    // result drains can't apply this (backgrounded) form's AI suggestions against the foreground doc.
+    const std::string assistDocId = st.docMirror.docId();
+    st.rpc.call("agent_pm_assist_v1", params, [this, &st, seq, assistDocId](const core::RpcResult& r) {
         if (!active_ || seq != aiRequestSeq_) return;
+        if (st.docMirror.docId() != assistDocId) { aiBusy_ = false; return; }  // active doc changed
         aiBusy_ = false;
         if (!r.ok) {
             aiMessage_ = "AI assist failed: " + r.err;

@@ -74,12 +74,17 @@ void EvaluateDialogs::runFieldEval(AppState& st, const std::string& method,
     for (auto it = extra.begin(); it != extra.end(); ++it) params[it.key()] = it.value();
     pending_ = true;
     const int gen = ++gen_;
+    // Multi-document: this overlay loads its mesh into the SHARED renderer (st.loadDocMesh + the
+    // colormap). Bind it to the doc it was computed on so a tab switch before the async result
+    // drains can't paint this field overlay onto a different document's geometry.
+    const std::string fieldDocId = st.docMirror.docId();
     // Field results are shown in-viewport; while computing, a small wait window gives the
     // user feedback (the old sync call "gave feedback" by freezing the app instead).
     openWindow_ = "field_wait";
     st.rpc.call(method, params,
-        [this, &st, gen, method, legendTitle, units](const core::RpcResult& r) {
+        [this, &st, gen, method, legendTitle, units, fieldDocId](const core::RpcResult& r) {
             if (gen != gen_) return;
+            if (st.docMirror.docId() != fieldDocId) { pending_ = false; return; }  // active doc changed
             pending_ = false;
             if (!r.ok) {
                 errorText_ = r.err.empty() ? ("worker call failed: " + method) : r.err;

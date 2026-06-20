@@ -204,6 +204,18 @@ public:
     bool activate(WorkerClient& w, const std::string& docId, std::string& aicmPath,
                   std::string& err);
 
+    // Multi-document FAST tab re-activation (scales tab switching to big assemblies). A backgrounded
+    // doc cannot be edited, so its revision is stable while parked. This first does a CHEAP doc_tree
+    // (tree/revision/owner_map, NO re-tessellate); if the worker's current revision still equals
+    // `cachedRevision` AND the `cachedAicm` mesh file still exists, it re-points the mirror from that
+    // doc_tree result and hands back `cachedAicm` — skipping the forced doc_rebuild that activate()
+    // would run (the per-switch re-tessellation that does NOT scale). Otherwise (doc changed while
+    // parked / no cache / mesh file gone) it transparently falls back to activate()'s full rebuild.
+    // `*usedCache` reports which path ran. Identical post-conditions to activate() either way.
+    bool activateCached(WorkerClient& w, const std::string& docId, int cachedRevision,
+                        const std::string& cachedAicm, std::string& aicmPath,
+                        bool& usedCache, std::string& err);
+
     // List open docs (returns array or empty on error).
     nlohmann::json list(WorkerClient& w, std::string& err);
 

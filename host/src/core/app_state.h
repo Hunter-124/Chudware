@@ -170,6 +170,13 @@ struct DocSession {
     std::vector<uint64_t>      featureHighlightFaces;
     bool                       sketchPlanePickActive = false;
 
+    // Fast-switch mesh cache (scales tab switching to big assemblies). Set on every switch-in to the
+    // doc's last-loaded AICM path + the revision it was at; on the NEXT switch-in DocMirror::
+    // activateCached reuses them (skipping the forced re-tessellating doc_rebuild) when the worker's
+    // revision is unchanged — a backgrounded doc can't be edited, so it usually is. -1 = no cache yet.
+    std::string                cachedAicmPath;
+    int                        cachedRevision = -1;
+
     DocSession();
     ~DocSession();
     DocSession(const DocSession&) = delete;
@@ -481,6 +488,15 @@ struct AppState {
     };
     std::vector<DocTab> docTabs;
     int activeTab = -1;             // index into docTabs; -1 = no document open (start state)
+    // Multi-document: sessions of CLOSED tabs that may still have an async RPC in flight. A
+    // DocSession's PropertyManager / SketchMode / EvaluateDialogs capture `this` in their st.rpc
+    // completion lambdas (live preview, AI assist, sketch overview/regions, evaluate). Destroying the
+    // session while such a call is queued would make the later GL-thread drain deref a freed object,
+    // so closeDocTab parks the closing session here instead of letting it die; sweepRetiredSessions()
+    // releases them once the async queue is fully drained (rpc not busy). Bounded: the common
+    // no-pending-call case clears it the very next frame.
+    std::vector<std::shared_ptr<DocSession>> retiredSessions;
+    void sweepRetiredSessions();
     // While true, the DocMirror listener does NOT mark the active tab dirty. Set around a tab
     // switch / resync / fresh-doc activation (those fire the mirror's listener via doc_rebuild but
     // are not user edits, so they must not light the unsaved-changes marker).
@@ -661,6 +677,7 @@ struct AppState {
     int statusKind = 0;  // 0 = ok (teal), 1 = build issue (amber), 2 = system error (red)
     bool autoSetupTried = false;    // guard so startup auto-heal runs once, not in a loop
     bool importRepairTried = false; // guard so per-job ModuleNotFoundError repair runs once
+    bool starterTried = false;      // guard so the launch default-part creation runs once
 
     // ---- job + chat model ----
     JobState job;
@@ -832,6 +849,8 @@ struct AppState {
     bool pickPrinted = false;  // guard so the "pick:" stdout line prints exactly once
     bool wantM1 = false;       // C17: AI_CAD_SHOT=m1 scripted integration scenario
     bool m1ShotDone = false;   // guard so the m1 scenario runs exactly once per shot
+    bool wantMultidoc = false;     // AI_CAD_SHOT=multidoc scripted multi-document mid-edit scenario
+    bool multidocShotDone = false; // guard so the multidoc scenario runs exactly once per shot
     bool wantActivity = false;  // C22b: AI_CAD_SHOT=activity scripted orchestrator run + activity panel
     bool activityShotDone = false; // guard so the activity scenario runs exactly once
 
@@ -894,6 +913,7 @@ struct AppState {
     // requestSaveAll; the pump iterates docTabs and saves each saveable doc.
     std::string requestExportFormat;  // File > Export <fmt> (export the active doc next pump)
     bool requestSaveAll = false;      // File > Save All (save every saveable doc next pump)
+    bool wantNewDocChooser = false;   // doc-strip "+" / Ctrl+N → open the tiled "Create New" chooser
     // De-dup + cap (most-recent-first) + persist a path into recentFiles. Defined in app_state.cpp.
     void pushRecentFile(const std::string& path);
 

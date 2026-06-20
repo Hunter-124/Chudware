@@ -23,6 +23,7 @@
 #include "file_dialog.h"   // C41: native Win32 Save/Open dialogs
 #include "icons.h"
 #include "sketch_mode.h"   // C18 (Edit Sketch context entry)
+#include "property_manager.h"  // sweep/loft PATH pick from the tree (routePathFeature)
 #include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
 #include "cursors.h"        // C37-E: ResizeV cursor over the rollback bar
 
@@ -1234,8 +1235,15 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
         }
     }
     std::string base = pathBaseName(path);
-    st.rpc.call("doc_rebuild", {{"doc_id", st.docMirror.docId()}},
-        [&st, base](const core::RpcResult& r) {
+    // Multi-document: bind this open-refresh to the doc it targets so a tab switch before the async
+    // result drains can't load THIS doc's mesh / tree into whatever doc is foreground by then.
+    const std::string openDocId = st.docMirror.docId();
+    st.rpc.call("doc_rebuild", {{"doc_id", openDocId}},
+        [&st, base, openDocId](const core::RpcResult& r) {
+            if (st.docMirror.docId() != openDocId) {
+                st.addLog("[open] mesh refresh for " + openDocId + " ignored — active doc changed");
+                return;
+            }
             if (!r.ok || r.result.contains("code")) {
                 std::string msg = !r.ok ? r.err : jfld(r.result, "message");
                 st.addLog("[err] open mesh refresh: " + msg);
@@ -2016,7 +2024,18 @@ void drawFeatureTreeBody(AppState& st,
                         }
 
                         // ---- selection / interaction handling ----
-                        if (rr.doubleClick) {
+                        // Sweep/loft PATH pick: when the Path/Centerline well is armed, a
+                        // single click on a SKETCH or CURVE (helix) feature FILLS that well
+                        // (the user-reported "can't select the sketch path" gap) instead of
+                        // just re-selecting the tree row.
+                        if (rr.clicked && st.propertyManager && st.propertyManager->active() &&
+                            st.propertyManager->activeWellWantsPathFeature() &&
+                            (ftype == "sketch" || ftype == "helix" || ftype == "curve")) {
+                            st.propertyManager->routePathFeature(fid, fname);
+                            selectedFeatureId = fid;
+                            s_multiSel.clear();
+                            selectFeatureInViewport(st, fid);
+                        } else if (rr.doubleClick) {
                             selectedFeatureId = fid;
                             s_multiSel.clear();
                             selectFeatureInViewport(st, fid);

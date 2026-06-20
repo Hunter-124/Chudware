@@ -228,13 +228,13 @@ void ScenarioRunner::tick(AppState& st) {
                                 m1FilletMsBeforeEdit, filletAfter,
                                 (filletAfter != m1FilletMsBeforeEdit ? "yes" : "no"));
                     // Open the PM on the fillet so the screenshot shows the populated edit form.
-                    propertyManager.openForEdit(st, m1FilletId);
+                    st.propertyManager->openForEdit(st, m1FilletId);
                     std::fflush(stdout);
                     m1Capture = m1SavePath + "\\m1_05_edit.png"; m1Settle = kSettle;
                     break;
                 }
                 case 5: {  // Save .step+ then reopen; assert tree intact (3 features)
-                    propertyManager.closeIfActive();  // tree returns for the reopen screenshot
+                    st.propertyManager->closeIfActive();  // tree returns for the reopen screenshot
                     std::string sp = m1SavePath + "\\part.step";
                     std::string serr;
                     bool saved = st.docMirror.save(st.worker, sp, serr);
@@ -692,7 +692,7 @@ void ScenarioRunner::tick(AppState& st) {
                 evalSettle = 3; ++evalStep; break;
             }
             case 1: {
-                evaluateDialogs.handleCommand(st, "eval_mass_props");
+                st.evaluateDialogs->handleCommand(st, "eval_mass_props");
                 std::printf("evalmass: mass properties window opened\n"); std::fflush(stdout);
                 ++evalStep; break;
             }
@@ -770,6 +770,289 @@ void ScenarioRunner::tick(AppState& st) {
         }
     }
     // --- end C22b activity scenario ---
+
+    // ---------- multi-document scenario (AI_CAD_SHOT=multidoc) ----------
+    runMultidoc(st);
+}
+
+// Multi-document mid-edit verification (AI_CAD_SHOT=multidoc). Same frame-driven step machine +
+// kSettle settling + per-step backbuffer capture (mdCapture) as m1. The flow:
+//   A: new Part A -> box + fillet (m1's ops) -> record A's tab index + doc id.
+//   B (mid-edit on A): seed a viewport selection + hide a body, then open a feature-edit PM form
+//      (openForCommand "fillet") WITHOUT committing. Capture multidoc_01_A_editing.png.
+//   C: new Part B (parks A's session, re-seats subsystems to B) -> assert B's PM is FRESH (inactive)
+//      -> box on B -> measure on B (eval_measure). Capture multidoc_02_B.png. Record B's index/id.
+//   D: switch back to A -> assert A's PM form active, mirror re-pointed to A, hidden-body mask +
+//      selection preserved. Capture multidoc_03_A_restored.png.
+//   E: switch to B -> assert B's PM inactive AND B's measure window is B's (independent). Capture
+//      multidoc_04_B_independent.png. Finish (endFrame Break).
+void ScenarioRunner::runMultidoc(AppState& st) {
+    if (!(st.wantMultidoc && st.workerStarted && !st.multidocShotDone)) return;
+    if (!mdDirReady) {
+        mdDirReady = true;
+        const char* repo = std::getenv("AI_CAD_REPO");
+        std::string base = repo ? std::string(repo) : std::string(".");
+        mdSavePath = base + "\\scratch\\multidoc_shots";
+        std::error_code ec; std::filesystem::create_directories(mdSavePath, ec);
+    }
+    auto loadMesh = [&](const core::OpsResponse& r) {
+        if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    };
+    // Build the box + fillet ops verbatim from m1 (so we reuse the engine contract, not invent one).
+    auto buildBox = [&]() -> core::OpsResponse {
+        nlohmann::json ops = nlohmann::json::array();
+        ops.push_back({{"op","add_feature"},{"feature",{
+            {"type","box"},{"name","Box1"},{"params",{
+                {"length",{{"value",60.0},{"expr",nullptr}}},
+                {"width", {{"value",40.0},{"expr",nullptr}}},
+                {"height",{{"value",10.0},{"expr",nullptr}}},
+                {"centered",true}}}}}});
+        auto r = st.docMirror.applyOps(st.worker, ops); loadMesh(r);
+        return r;
+    };
+    // Find vertical edges (axis ~ +Z) for the fillet — copied from m1's verticalEdges helper.
+    auto verticalEdges = [&](int wantN) {
+        std::vector<nlohmann::json> out;
+        for (int tid = 1; tid <= 12 && (int)out.size() < wantN; ++tid) {
+            std::string serr;
+            std::string s = st.docMirror.resolvePick(st.worker, 1, "edge", tid, serr);
+            if (s.empty()) continue;
+            try {
+                nlohmann::json o = nlohmann::json::parse(s);
+                if (o.contains("axis") && o["axis"].is_array() && o["axis"].size() == 3 &&
+                    std::fabs(o["axis"][2].get<double>()) > 0.9)
+                    out.push_back(o);
+            } catch (...) {}
+        }
+        return out;
+    };
+    auto buildFillet = [&]() -> core::OpsResponse {
+        auto edges = verticalEdges(2);
+        nlohmann::json arr = nlohmann::json::array();
+        for (auto& e : edges) arr.push_back(e);
+        nlohmann::json ops = nlohmann::json::array();
+        ops.push_back({{"op","add_feature"},{"feature",{
+            {"type","fillet"},{"name","Fillet1"},
+            {"params",{{"radius",{{"value",4.0},{"expr",nullptr}}}}},
+            {"refs",{{"edges",arr}}}}}});
+        auto r = st.docMirror.applyOps(st.worker, ops); loadMesh(r);
+        return r;
+    };
+    const int kSettle = 4;
+    if (mdSettle > 0) { --mdSettle; return; }
+    if (!mdCapture.empty()) return;  // only advance when no capture is pending
+    std::string err;
+    switch (mdStep) {
+        case 0: {  // Part A: new part + box + fillet
+            if (!st.docMirror.newPart(st.worker, err)) {
+                std::printf("multidoc: new_part A FAILED: %s\n", err.c_str()); std::fflush(stdout);
+                st.multidocShotDone = true; break;
+            }
+            st.addDocTab(false);
+            buildBox();
+            buildFillet();
+            mdIdxA = st.activeTab;
+            mdDocA = st.docMirror.docId();
+            st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
+            std::printf("multidoc: Part A built doc=%s tab=%d\n", mdDocA.c_str(), mdIdxA);
+            std::fflush(stdout);
+            ++mdStep; mdSettle = kSettle; break;
+        }
+        case 1: {  // Put A mid-edit: seed selection + hide a body, then open a PM form (no commit)
+            // Seed a viewport selection (face 1 of body 1) so the restore can be asserted later.
+            render::PickHit hit;
+            hit.body_id = 1; hit.kind = render::PickKind::Face; hit.topo_id = 1;
+            st.selection.selectOne(hit);
+            // Hide body slot 0 (the box body) — the hidden-body mask is parked/restored by the
+            // DocSession swap, so it doubles as a model-state preservation probe.
+            if (!st.bodyVisible.empty()) { st.bodyVisible[0] = 0; st.applyBodyVisibility(); }
+            // Open a feature-edit PM form WITHOUT committing (leave active_ true).
+            st.propertyManager->openForCommand(st, "fillet");
+            std::printf("multidoc: A mid-edit pm_active=%d sel=%zu body0_hidden=%d\n",
+                        (int)st.propertyManager->active(), st.selection.size(),
+                        (int)(!st.bodyVisible.empty() && st.bodyVisible[0] == 0));
+            std::fflush(stdout);
+            mdCapture = mdSavePath + "\\multidoc_01_A_editing.png"; ++mdStep; mdSettle = kSettle;
+            break;
+        }
+        case 2: {  // Part B: new part (parks A's session) -> assert B's PM is fresh -> box -> measure
+            if (!st.docMirror.newPart(st.worker, err)) {
+                std::printf("multidoc: new_part B FAILED: %s\n", err.c_str()); std::fflush(stdout);
+                st.multidocShotDone = true; break;
+            }
+            st.addDocTab(false);   // parks A's session, re-seats subsystems at B's fresh instances
+            // B's PropertyManager is a fresh per-document instance — it must NOT be active.
+            mdPassBFresh = !st.propertyManager->active();
+            std::printf("multidoc: B fresh PM active=%d -> %s\n",
+                        (int)st.propertyManager->active(), mdPassBFresh ? "PASS" : "FAIL");
+            std::fflush(stdout);
+            buildBox();
+            mdIdxB = st.activeTab;
+            mdDocB = st.docMirror.docId();
+            // Measure on B (eval_measure with no selection still opens the Measure window on B's
+            // per-document EvaluateDialogs — that's what we assert is independent of A later).
+            st.evaluateDialogs->handleCommand(st, "eval_measure");
+            mdPassBMeasure = (st.evaluateDialogs->openWindowKind() == "measure");
+            std::printf("multidoc: B built doc=%s tab=%d measure_window='%s'\n",
+                        mdDocB.c_str(), mdIdxB, st.evaluateDialogs->openWindowKind().c_str());
+            std::fflush(stdout);
+            mdCapture = mdSavePath + "\\multidoc_02_B.png"; ++mdStep; mdSettle = kSettle;
+            break;
+        }
+        case 3: {  // Switch back to A -> assert PM form + selection + hidden-body mask all preserved
+            st.switchToTab(mdIdxA);
+            mdPassPm   = st.propertyManager->active();           // A's PM form survived
+            mdPassDoc  = (st.docMirror.docId() == mdDocA);       // mirror re-pointed at A
+            mdPassMask = (!st.bodyVisible.empty() && st.bodyVisible[0] == 0);  // hidden body restored
+            mdPassSel  = (st.selection.size() == 1);             // viewport selection restored
+            std::printf("multidoc: back-to-A pm_active=%d -> %s\n",
+                        (int)mdPassPm, mdPassPm ? "PASS" : "FAIL");
+            std::printf("multidoc: back-to-A mirror_doc=%s expect=%s -> %s\n",
+                        st.docMirror.docId().c_str(), mdDocA.c_str(),
+                        mdPassDoc ? "PASS" : "FAIL");
+            std::printf("multidoc: back-to-A body0_hidden=%d -> %s\n",
+                        (int)mdPassMask, mdPassMask ? "PASS" : "FAIL");
+            std::printf("multidoc: back-to-A selection=%zu -> %s\n",
+                        st.selection.size(), mdPassSel ? "PASS" : "FAIL");
+            std::fflush(stdout);
+            mdCapture = mdSavePath + "\\multidoc_03_A_restored.png"; ++mdStep; mdSettle = kSettle;
+            break;
+        }
+        case 4: {  // Switch to B -> assert B's PM independent (inactive) + B's measure window intact
+            st.switchToTab(mdIdxB);
+            mdPassBIndep = !st.propertyManager->active();        // B never had a form -> still none
+            bool bMeasureNow = (st.evaluateDialogs->openWindowKind() == "measure");
+            // B keeps ITS measure window; A's evaluate dialogs are a different instance (so the
+            // measure window is genuinely B's, not leaked from A which never measured).
+            std::printf("multidoc: at-B pm_active=%d -> %s\n",
+                        (int)st.propertyManager->active(), mdPassBIndep ? "PASS" : "FAIL");
+            std::printf("multidoc: at-B measure_window='%s' -> %s\n",
+                        st.evaluateDialogs->openWindowKind().c_str(),
+                        bMeasureNow ? "PASS" : "FAIL");
+            std::fflush(stdout);
+            mdPassBMeasure = mdPassBMeasure && bMeasureNow;
+            mdCapture = mdSavePath + "\\multidoc_04_B_independent.png"; ++mdStep; mdSettle = kSettle;
+            break;
+        }
+        case 5: {  // Part C: new part (scales the DocSession to a third doc) + box + a DIFFERENT mid-edit
+            if (!st.docMirror.newPart(st.worker, err)) {
+                std::printf("multidoc: new_part C FAILED: %s\n", err.c_str()); std::fflush(stdout);
+                st.multidocShotDone = true; break;
+            }
+            st.addDocTab(false);   // parks B's session, re-seats subsystems at C's fresh instances
+            // C's PropertyManager is a fresh per-document instance — it must NOT be active.
+            mdPassCFresh = !st.propertyManager->active();
+            std::printf("multidoc: C fresh PM active=%d -> %s\n",
+                        (int)st.propertyManager->active(), mdPassCFresh ? "PASS" : "FAIL");
+            std::fflush(stdout);
+            buildBox();
+            mdIdxC = st.activeTab;
+            mdDocC = st.docMirror.docId();
+            // Give C a mid-edit that is DISTINGUISHABLE from A's (A = fillet form, 1 selection, body0
+            // hidden). C opens a CHAMFER form and seeds NO viewport selection + hides NOTHING, so the
+            // form type AND the selection/mask differ from A. This is what proves a switch restores the
+            // RIGHT doc's edit state rather than leaking A's.
+            st.selection.clear();
+            st.propertyManager->openForCommand(st, "chamfer");
+            std::printf("multidoc: C built doc=%s tab=%d pm_active=%d form='%s' sel=%zu\n",
+                        mdDocC.c_str(), mdIdxC, (int)st.propertyManager->active(),
+                        st.propertyManager->activeFormType().c_str(), st.selection.size());
+            std::fflush(stdout);
+            mdCapture = mdSavePath + "\\multidoc_05_C_editing.png"; ++mdStep; mdSettle = kSettle;
+            break;
+        }
+        case 6: {  // A<->C hop 1: switch to A — A's FILLET form + selection + hidden mask still intact
+            st.switchToTab(mdIdxA);
+            bool pm   = st.propertyManager->active();
+            bool doc  = (st.docMirror.docId() == mdDocA);
+            bool form = (st.propertyManager->activeFormType() == "fillet");  // A's form, not C's chamfer
+            bool mask = (!st.bodyVisible.empty() && st.bodyVisible[0] == 0);
+            bool sel  = (st.selection.size() == 1);
+            mdPassChop[0] = pm && doc && form && mask && sel;
+            std::printf("multidoc: A<->C hop 1 pm=%d doc=%s form='%s' mask=%d sel=%zu rev=%d -> %s\n",
+                        (int)pm, st.docMirror.docId().c_str(),
+                        st.propertyManager->activeFormType().c_str(),
+                        (int)mask, st.selection.size(), st.docMirror.revision(),
+                        mdPassChop[0] ? "PASS" : "FAIL");
+            std::fflush(stdout);
+            mdCapture = mdSavePath + "\\multidoc_07_A_after_C.png"; ++mdStep; mdSettle = kSettle;
+            break;
+        }
+        case 7: {  // A<->C hop 2: switch to C — C's CHAMFER form + C's empty selection (distinct from A)
+            st.switchToTab(mdIdxC);
+            bool pm   = st.propertyManager->active();
+            bool doc  = (st.docMirror.docId() == mdDocC);
+            bool form = (st.propertyManager->activeFormType() == "chamfer");  // C's form, not A's fillet
+            bool sel  = (st.selection.size() == 0);  // C seeded no selection; A had 1 -> distinct
+            mdPassChop[1] = pm && doc && form && sel;
+            std::printf("multidoc: A<->C hop 2 pm=%d doc=%s form='%s' sel=%zu rev=%d -> %s\n",
+                        (int)pm, st.docMirror.docId().c_str(),
+                        st.propertyManager->activeFormType().c_str(),
+                        st.selection.size(), st.docMirror.revision(),
+                        mdPassChop[1] ? "PASS" : "FAIL");
+            std::fflush(stdout);
+            mdCapture = mdSavePath + "\\multidoc_06_C_restored.png"; ++mdStep; mdSettle = kSettle;
+            break;
+        }
+        case 8: {  // A<->C hop 3: switch back to A — fillet/selection/mask still intact (cached path)
+            st.switchToTab(mdIdxA);
+            bool pm   = st.propertyManager->active();
+            bool doc  = (st.docMirror.docId() == mdDocA);
+            bool form = (st.propertyManager->activeFormType() == "fillet");
+            bool mask = (!st.bodyVisible.empty() && st.bodyVisible[0] == 0);
+            bool sel  = (st.selection.size() == 1);
+            mdPassChop[2] = pm && doc && form && mask && sel;
+            std::printf("multidoc: A<->C hop 3 pm=%d doc=%s form='%s' mask=%d sel=%zu rev=%d -> %s\n",
+                        (int)pm, st.docMirror.docId().c_str(),
+                        st.propertyManager->activeFormType().c_str(),
+                        (int)mask, st.selection.size(), st.docMirror.revision(),
+                        mdPassChop[2] ? "PASS" : "FAIL");
+            std::fflush(stdout);
+            ++mdStep; mdSettle = kSettle;
+            break;
+        }
+        case 9: {  // A<->C hop 4: switch to C — chamfer/empty-selection still intact (independence holds)
+            st.switchToTab(mdIdxC);
+            bool pm   = st.propertyManager->active();
+            bool doc  = (st.docMirror.docId() == mdDocC);
+            bool form = (st.propertyManager->activeFormType() == "chamfer");
+            bool sel  = (st.selection.size() == 0);
+            mdPassChop[3] = pm && doc && form && sel;
+            std::printf("multidoc: A<->C hop 4 pm=%d doc=%s form='%s' sel=%zu rev=%d -> %s\n",
+                        (int)pm, st.docMirror.docId().c_str(),
+                        st.propertyManager->activeFormType().c_str(),
+                        st.selection.size(), st.docMirror.revision(),
+                        mdPassChop[3] ? "PASS" : "FAIL");
+            std::fflush(stdout);
+            ++mdStep; mdSettle = kSettle;
+            break;
+        }
+        default: {
+            bool allChop = mdPassChop[0] && mdPassChop[1] && mdPassChop[2] && mdPassChop[3];
+            bool allPass = mdPassPm && mdPassDoc && mdPassMask && mdPassSel &&
+                           mdPassBFresh && mdPassBIndep && mdPassBMeasure &&
+                           mdPassCFresh && allChop;
+            if (allPass) {
+                std::printf("multidoc: ALL PASS\n");
+            } else {
+                std::printf("multidoc: FAIL");
+                if (!mdPassPm)       std::printf(" A-pm-preserved");
+                if (!mdPassDoc)      std::printf(" A-mirror-repointed");
+                if (!mdPassMask)     std::printf(" A-hidden-mask");
+                if (!mdPassSel)      std::printf(" A-selection");
+                if (!mdPassBFresh)   std::printf(" B-pm-fresh");
+                if (!mdPassBIndep)   std::printf(" B-pm-independent");
+                if (!mdPassBMeasure) std::printf(" B-measure-independent");
+                if (!mdPassCFresh)   std::printf(" C-pm-fresh");
+                for (int k = 0; k < 4; ++k)
+                    if (!mdPassChop[k]) std::printf(" A<->C-hop%d", k + 1);
+                std::printf("\n");
+            }
+            std::fflush(stdout);
+            st.multidocShotDone = true;
+            break;
+        }
+    }
 }
 
 ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int dh,
@@ -878,6 +1161,25 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         return st.activityShotDone ? FrameAction::Break : FrameAction::Continue;
     }
     // --- end C22b activity shot capture ---
+
+    // multidoc scenario: identical per-step capture mechanism. Wait for any async worker call
+    // (eval_measure on B) to drain so the captured frame shows the settled state.
+    if (st.wantMultidoc) {
+        ++st.frame;
+        if (!mdCapture.empty() && !st.rpc.busy()) {
+            // Mirror the LAST per-step capture to the caller's --ui-screenshot target. The final
+            // capture chronologically is multidoc_06_C_restored.png (step 7, the C end of the
+            // round-trip); steps 8/9 assert without capturing.
+            const char* mirror = mdCapture.find("multidoc_06_C_restored") != std::string::npos
+                               ? screenshotPath : nullptr;
+            writeBackbufferPng(mdCapture.c_str(), dw, dh, mirror);
+            std::printf("multidoc screenshot -> %s (%dx%d)\n", mdCapture.c_str(), dw, dh);
+            std::fflush(stdout);
+            mdCapture.clear();
+        }
+        glfwSwapBuffers(st.win);
+        return st.multidocShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
 
     return FrameAction::None;
 }

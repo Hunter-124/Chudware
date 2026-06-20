@@ -287,16 +287,23 @@ bool pmParseDim(const std::string& raw, double& outMm, std::string& err, bool an
     {
         std::vector<DimTok> probe;
         int unitCount = 0; bool endsWithUnit = false; std::string perr;
-        if (dimTokenize(s, angle, probe, unitCount, endsWithUnit, perr) &&
-            unitCount == 1 && endsWithUnit) {
-            for (const auto& u : kDimUnits) {
-                size_t n = std::strlen(u.name);
-                if (u.angle == angle && s.size() > n &&
-                    s.compare(s.size() - n, n, u.name) == 0) {
-                    wholeScale = u.factor;
-                    s.erase(s.size() - n);
-                    break;
+        if (dimTokenize(s, angle, probe, unitCount, endsWithUnit, perr)) {
+            if (unitCount == 1 && endsWithUnit) {
+                for (const auto& u : kDimUnits) {
+                    size_t n = std::strlen(u.name);
+                    if (u.angle == angle && s.size() > n &&
+                        s.compare(s.size() - n, n, u.name) == 0) {
+                        wholeScale = u.factor;
+                        s.erase(s.size() - n);
+                        break;
+                    }
                 }
+            } else if (unitCount == 0 && !angle && bareLengthScale != 1.0) {
+                // No explicit units anywhere: the WHOLE expression is a length in the document
+                // unit, so scale the final RESULT — not each literal. Per-literal scaling only
+                // distributes over +/- ; across '*' it double-counts (".75*0.5" -> x25.4^2) and
+                // across '/' it cancels (".75/2" -> x1), which is the IPS dim-math bug.
+                wholeScale = bareLengthScale;
             }
         }
     }
@@ -606,6 +613,13 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
         initField(fields_[i], form->fields[i], ips_);
 
     loadFromTree(st, *target);
+
+    // A fillet/chamfer is shown LIVE and APPLIED while editing — the session already has it applied,
+    // so the rounded result is on screen the moment the PM opens. The original edges in the feature
+    // are drawn as dashed 3D overlay lines (viewport_panel + collectActiveWellEdgeSegments), built
+    // from each selector's geometry, so the user can see and click-to-deselect edges that have been
+    // rounded away. No suppressed-base preview is needed.
+
     st.addLog("[pm] edit " + featureId + " (" + type + ")");
     return true;
 }
@@ -782,6 +796,9 @@ void PropertyManager::loadFromTree(AppState& st, const nlohmann::json& feature) 
 // AppState topo-id centroid caches keyed by (body_id<<32 | topo_id) when absent.
 static bool anchorFromSel(AppState& st, const PMSelEntry& e, bool wantEdge, float out[3]) {
     const nlohmann::json& s = e.selector;
+    // Datum-plane / feature-id picks store a bare string selector — no centroid/hint to anchor on
+    // (and .value() below would throw on a non-object). They carry no in-viewport callout anchor.
+    if (!s.is_object()) return false;
     auto c = s.find("centroid");
     if (c != s.end() && c->is_array() && c->size() == 3 &&
         (*c)[0].is_number() && (*c)[1].is_number() && (*c)[2].is_number()) {
@@ -872,6 +889,8 @@ void PropertyManager::close() {
     focusedOnOpen_ = false;   // C37-F
     wantFocusFirstField_ = false; // C37-F
     previewError_.clear();    // C37-F
+    previewWarning_.clear();
+    committing_ = false;
     aiBusy_ = false;
     aiMessage_.clear();
     aiHighlights_.clear();
@@ -887,7 +906,31 @@ PMField* PropertyManager::activeWell() {
     return nullptr;
 }
 
-bool PropertyManager::routePick(const nlohmann::json& selector, int pickKind) {
+void PropertyManager::advanceWellAfterFill(PMField* filled) {
+    // Only single-ref wells advance; a multi-pick well stays active to gather more refs.
+    if (!filled || filled->def->selMulti || filled->picks.empty()) return;
+    // Find the next EMPTY visible selector well after `filled` (in field order); if none follows,
+    // wrap to the first empty one (so a 2-well form fills the other well no matter the click order).
+    bool seenFilled = false;
+    PMField* next = nullptr;
+    PMField* firstEmpty = nullptr;
+    for (auto& f : fields_) {
+        if (f.def->kind != PMFieldKind::SelectorWell || !fieldVisible(*f.def, fields_)) continue;
+        const bool empty = f.picks.empty();
+        if (&f == filled) { seenFilled = true; continue; }
+        if (empty && !firstEmpty) firstEmpty = &f;
+        if (empty && seenFilled && !next) next = &f;
+    }
+    PMField* target = next ? next : firstEmpty;
+    if (!target) return;                    // no empty well left — keep focus where it is
+    for (auto& o : fields_)
+        if (o.def->kind == PMFieldKind::SelectorWell || o.def->kind == PMFieldKind::FeatureWell)
+            o.wellActive = false;
+    target->wellActive = true;
+}
+
+bool PropertyManager::routePick(const nlohmann::json& selector, int pickKind,
+                                uint32_t pickBody, uint32_t pickTopo) {
     PMField* well = activeWell();
     if (!well || !selector.is_object()) return false;
     // Filter by allowed kinds.
@@ -903,6 +946,9 @@ bool PropertyManager::routePick(const nlohmann::json& selector, int pickKind) {
 
     // De-dup by hint_index + centroid (same element picked twice toggles off — SolidWorks).
     auto same = [&](const nlohmann::json& a, const nlohmann::json& b) {
+        // A topology pick (object) never equals a datum-plane pick (bare string), and .value()
+        // would throw on the string — so a mixed well just replaces (single) / appends (multi).
+        if (!a.is_object() || !b.is_object()) return false;
         // hint_index uses the SAME absent-sentinel on both sides — with asymmetric defaults
         // (-1 vs -2) two picks that both lack a hint_index never compared equal, so a re-pick of a
         // hint-less selector couldn't toggle off. The centroid term still distinguishes distinct
@@ -922,10 +968,110 @@ bool PropertyManager::routePick(const nlohmann::json& selector, int pickKind) {
     PMSelEntry e; e.selector = selector;
     std::string kind = selector.value("kind", std::string("ref"));
     e.label = kind.empty() ? "Ref" : std::string(1, (char)std::toupper((unsigned char)kind[0])) + kind.substr(1);
+    e.pickBody = pickBody; e.pickTopo = pickTopo; e.pickKind = pickKind;  // for viewport highlight
     well->picks.push_back(e);
     well->wellDangling = false;
     dirty_ = true; lastEditTime_ = ImGui::GetTime();
+    advanceWellAfterFill(well);
     return true;
+}
+
+void PropertyManager::collectActiveWellHighlights(std::vector<std::array<uint32_t, 3>>& out) const {
+    for (const auto& f : fields_) {
+        if (f.def->kind != PMFieldKind::SelectorWell || !f.wellActive ||
+            !fieldVisible(*f.def, fields_))
+            continue;
+        // Only edge/face/vertex topology wells carry highlightable picks (skip body/datum wells).
+        if (!(f.def->selKinds.edge || f.def->selKinds.face || f.def->selKinds.vertex)) return;
+        for (const auto& p : f.picks)
+            if (p.pickKind >= 0)
+                out.push_back({p.pickBody, p.pickTopo, (uint32_t)p.pickKind});
+        return;  // a single well is active at a time
+    }
+}
+
+void PropertyManager::collectActiveWellEdgeSegments(std::vector<EdgeSeg>& out) const {
+    if (!active_ || !form_) return;
+    const std::string ftype = form_->type ? form_->type : "";
+    if (ftype != "fillet" && ftype != "chamfer") return;  // dashed old-edge overlay is blend-only
+    for (const auto& f : fields_) {
+        if (f.def->kind != PMFieldKind::SelectorWell || !f.wellActive ||
+            !fieldVisible(*f.def, fields_) || !f.def->selKinds.edge)
+            continue;
+        for (int i = 0; i < (int)f.picks.size(); ++i) {
+            const nlohmann::json& sel = f.picks[i].selector;
+            if (!sel.is_object() || !sel.contains("centroid") || !sel["centroid"].is_array() ||
+                sel["centroid"].size() < 3)
+                continue;
+            EdgeSeg seg;
+            seg.pickIndex = i;
+            const auto& c = sel["centroid"];
+            float cx = c[0].get<float>(), cy = c[1].get<float>(), cz = c[2].get<float>();
+            const std::string surf = sel.value("surf", std::string());
+            const bool hasAxis = sel.contains("axis") && sel["axis"].is_array() &&
+                                 sel["axis"].size() == 3;
+            const bool hasLen = !sel.value("area_or_len", nlohmann::json()).is_null();
+            if (surf == "line" && hasAxis && hasLen) {
+                // Straight edge: reconstruct the segment from centroid ± half-length along its axis.
+                float ax = sel["axis"][0].get<float>(), ay = sel["axis"][1].get<float>(),
+                      az = sel["axis"][2].get<float>();
+                float half = 0.5f * sel["area_or_len"].get<float>();
+                seg.pts.push_back({cx - ax * half, cy - ay * half, cz - az * half});
+                seg.pts.push_back({cx + ax * half, cy + ay * half, cz + az * half});
+                seg.closed = false;
+            } else if (surf == "circle" && hasAxis && hasLen) {
+                // Circular edge (the revolve case): centroid is the center, area_or_len is the
+                // circumference (=2πr), axis is the circle normal. Sample a closed loop in the plane
+                // perpendicular to the axis so the dashed overlay traces the real edge.
+                float nx = sel["axis"][0].get<float>(), ny = sel["axis"][1].get<float>(),
+                      nz = sel["axis"][2].get<float>();
+                float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
+                float r = sel["area_or_len"].get<float>() / (2.0f * 3.14159265358979f);
+                if (nl > 1e-6f && r > 1e-6f) {
+                    nx /= nl; ny /= nl; nz /= nl;
+                    // Two basis vectors spanning the circle plane (u ⟂ n, v = n × u).
+                    float rx = (std::fabs(nx) < 0.9f) ? 1.0f : 0.0f;
+                    float ry = (std::fabs(nx) < 0.9f) ? 0.0f : 1.0f;
+                    float ux = ny * 0.0f - nz * ry, uy = nz * rx - nx * 0.0f, uz = nx * ry - ny * rx;
+                    float ul = std::sqrt(ux * ux + uy * uy + uz * uz);
+                    if (ul > 1e-6f) {
+                        ux /= ul; uy /= ul; uz /= ul;
+                        float vx = ny * uz - nz * uy, vy = nz * ux - nx * uz, vz = nx * uy - ny * ux;
+                        const int N = 48;
+                        seg.pts.reserve(N);
+                        for (int k = 0; k < N; ++k) {
+                            float t = (float)k / (float)N * 2.0f * 3.14159265358979f;
+                            float ct = std::cos(t) * r, stt = std::sin(t) * r;
+                            seg.pts.push_back({cx + ux * ct + vx * stt, cy + uy * ct + vy * stt,
+                                               cz + uz * ct + vz * stt});
+                        }
+                        seg.closed = true;
+                    }
+                }
+                if (seg.pts.empty()) { seg.pts.push_back({cx, cy, cz}); seg.closed = false; }
+            } else {
+                // Arc/spline/ellipse we can't reconstruct from the selector: mark the centroid so the
+                // viewport still draws a small ring there as a deselect target.
+                seg.pts.push_back({cx, cy, cz});
+                seg.closed = false;
+            }
+            out.push_back(seg);
+        }
+        return;  // a single well is active at a time
+    }
+}
+
+bool PropertyManager::removeActiveWellPick(int pickIndex) {
+    for (auto& f : fields_) {
+        if (f.def->kind != PMFieldKind::SelectorWell || !f.wellActive ||
+            !fieldVisible(*f.def, fields_) || !f.def->selKinds.edge)
+            continue;
+        if (pickIndex < 0 || pickIndex >= (int)f.picks.size()) return false;
+        f.picks.erase(f.picks.begin() + pickIndex);
+        dirty_ = true; lastEditTime_ = ImGui::GetTime();
+        return true;
+    }
+    return false;
 }
 
 bool PropertyManager::activeWellWantsBody() const {
@@ -934,6 +1080,97 @@ bool PropertyManager::activeWellWantsBody() const {
             fieldVisible(*f.def, fields_))
             return f.def->selKinds.body;
     return false;
+}
+
+bool PropertyManager::activeWellWantsPlane() const {
+    for (const auto& f : fields_)
+        if (f.def->kind == PMFieldKind::SelectorWell && f.wellActive &&
+            fieldVisible(*f.def, fields_))
+            return f.def->selKinds.plane;
+    return false;
+}
+
+bool PropertyManager::activeWellWantsAxis() const {
+    for (const auto& f : fields_)
+        if (f.def->kind == PMFieldKind::SelectorWell && f.wellActive &&
+            fieldVisible(*f.def, fields_))
+            return f.def->selKinds.axis;
+    return false;
+}
+
+bool PropertyManager::activeWellPrefersEdge() const {
+    for (const auto& f : fields_)
+        if (f.def->kind == PMFieldKind::SelectorWell && f.wellActive &&
+            fieldVisible(*f.def, fields_))
+            // Pure edge well (edge, not face) -> snap to nearby edges. A face-or-edge well stays on
+            // the exact-pixel pick so face selection isn't hijacked by a nearby edge.
+            return f.def->selKinds.edge && !f.def->selKinds.face;
+    return false;
+}
+
+bool PropertyManager::activeWellExpandsFaceToEdges() const {
+    // SolidWorks "fillet a whole face": clicking a FACE while a fillet/chamfer edge well is active
+    // adds ALL of that face's edges. Only for blend edge wells (edge-only, not face/body wells).
+    if (!form_) return false;
+    const std::string t = form_->type ? form_->type : "";
+    if (t != "fillet" && t != "chamfer") return false;
+    for (const auto& f : fields_)
+        if (f.def->kind == PMFieldKind::SelectorWell && f.wellActive &&
+            fieldVisible(*f.def, fields_))
+            return f.def->selKinds.edge && !f.def->selKinds.face;
+    return false;
+}
+
+bool PropertyManager::routeDatumAxis(const std::string& fid, const std::string& label) {
+    PMField* well = activeWell();
+    if (!well || !well->def->selKinds.axis || fid.empty()) return false;
+    // Toggle off if this exact datum axis is already in the well (SolidWorks re-pick).
+    for (size_t i = 0; i < well->picks.size(); ++i) {
+        const auto& sel = well->picks[i].selector;
+        if (sel.is_object() && sel.value("kind", std::string()) == "datum" &&
+            sel.value("feature", std::string()) == fid) {
+            well->picks.erase(well->picks.begin() + i);
+            dirty_ = true; lastEditTime_ = ImGui::GetTime();
+            return true;
+        }
+    }
+    if (!well->def->selMulti) well->picks.clear();   // single-ref wells hold one pick
+    PMSelEntry e;
+    e.selector = {{"kind", "datum"}, {"feature", fid}};  // resolve_axis_ref accepts this
+    e.label = label.empty() ? fid : label;
+    well->picks.push_back(e);
+    well->wellDangling = false;
+    dirty_ = true; lastEditTime_ = ImGui::GetTime();
+    advanceWellAfterFill(well);
+    return true;
+}
+
+bool PropertyManager::routeDatumPlane(const std::string& datumId) {
+    PMField* well = activeWell();
+    if (!well || !well->def->selKinds.plane || datumId.empty()) return false;
+    // Toggle off if this exact datum plane is already in the well (SolidWorks re-pick).
+    for (size_t i = 0; i < well->picks.size(); ++i) {
+        const auto& sel = well->picks[i].selector;
+        if (sel.is_string() && sel.get<std::string>() == datumId) {
+            well->picks.erase(well->picks.begin() + i);
+            dirty_ = true; lastEditTime_ = ImGui::GetTime();
+            return true;
+        }
+    }
+    if (!well->def->selMulti) well->picks.clear();   // single-ref wells hold one pick
+    // A short friendly chip label: "plane.front" -> "Front".
+    std::string label = datumId;
+    auto dot = label.rfind('.');
+    if (dot != std::string::npos) label = label.substr(dot + 1);
+    if (!label.empty()) label[0] = (char)std::toupper((unsigned char)label[0]);
+    PMSelEntry e;
+    e.selector = datumId;   // bare reserved-datum string; _SEL_OR_DATUM slots accept it
+    e.label = label;
+    well->picks.push_back(e);
+    well->wellDangling = false;
+    dirty_ = true; lastEditTime_ = ImGui::GetTime();
+    advanceWellAfterFill(well);
+    return true;
 }
 
 std::string PropertyManager::activeWellKindHint() const {
@@ -946,6 +1183,8 @@ std::string PropertyManager::activeWellKindHint() const {
         if (k.edge)   parts.push_back("edges");
         if (k.vertex) parts.push_back("vertices");
         if (k.body)   parts.push_back("bodies");
+        if (k.plane)  parts.push_back("planes");
+        if (k.axis)   parts.push_back("axes");
         std::string s;
         for (size_t i = 0; i < parts.size(); ++i) {
             if (i) s += (i + 1 == parts.size()) ? " or " : ", ";
@@ -1170,6 +1409,7 @@ nlohmann::json PropertyManager::buildAiAssistPayload(AppState& st) const {
             sf["accepts"] = {
                 {"face", f.def->selKinds.face}, {"edge", f.def->selKinds.edge},
                 {"vertex", f.def->selKinds.vertex}, {"body", f.def->selKinds.body},
+                {"plane", f.def->selKinds.plane},
             };
         }
         schema["fields"].push_back(sf);
@@ -1522,9 +1762,17 @@ bool PropertyManager::applyPreview(AppState& st) {
     nlohmann::json feature;
     buildOpFeature(feature);
 
+    // Fillet/chamfer preview is LIVE and APPLIED (SolidWorks style): the feature stays un-suppressed
+    // so the viewport shows the actual rounded result as the user edits. The original (pre-round)
+    // edges are drawn as dashed 3D lines (see viewport_panel + collectActiveWellEdgeSegments) so the
+    // user can still see and deselect them even after they're rounded away. Picking a NEW (un-rounded)
+    // edge on the live body resolves correctly now that make_pick_selector enumerates edges in the
+    // tessellator's unique order (the earlier "couldn't be located" / 3-way-corner-drop bug).
+    const std::string ftype = feature.value("type", std::string());
+    const bool blend = (ftype == "fillet" || ftype == "chamfer");
+
     nlohmann::json ops = nlohmann::json::array();
     if (!firstPreviewDone_ && targetId_.empty()) {
-        // First preview: add the feature.
         ops.push_back({{"op", "add_feature"}, {"feature", feature}, {"before", nullptr}});
     } else {
         // Subsequent previews / edit-path: edit the existing feature in place.
@@ -1537,6 +1785,10 @@ bool PropertyManager::applyPreview(AppState& st) {
                        {"params", feature.value("params", nlohmann::json::object())},
                        {"refs",   feature.value("refs",   nlohmann::json::object())}});
     }
+    if (blend)
+        st.addLog("[pm] blend preview: edges=" + std::to_string(
+                      feature.value("refs", nlohmann::json::object())
+                          .value("edges", nlohmann::json::array()).size()));
 
     auto resp = st.docMirror.applyOps(st.worker, ops, previewUndoGroupStarted_);
     if (!resp.ok) {
@@ -1563,13 +1815,28 @@ bool PropertyManager::applyPreview(AppState& st) {
 
     if (!resp.aicm_path.empty()) {
         std::string lerr;
-        st.loadDocMesh(resp.aicm_path, lerr);
+        st.loadDocMesh(resp.aicm_path, lerr);   // live rounded body -> id-pass + overlays + render
         if (!lerr.empty()) st.addLog("[pm] mesh: " + lerr);
     }
-    // Reflect any dangling ref back into the wells (red tint).
+
+    // Read the session compile's verdict for this feature (the host's applyOps already ran the real
+    // compile — there is no separate stateless compile; the old doc_compile_cpp call was an unknown
+    // method in-app and failed silently). For a blend the warning — "rounded N of M edge(s); K
+    // couldn't be located" — is the "selection saved but an edge didn't apply" signal; we log it so a
+    // dropped edge is visible, surface it in the PM body, and tint any dangling well red.
+    previewWarning_.clear();
     if (!targetId_.empty() && resp.feature_status.is_array()) {
         for (const auto& s : resp.feature_status) {
             if (!s.is_object() || s.value("id", std::string()) != targetId_) continue;
+            auto wt = s.find("warning");
+            if (wt != s.end() && wt->is_string()) previewWarning_ = wt->get<std::string>();
+            const bool sok = s.value("ok", true);
+            if (!sok) previewError_ = s.value("error", std::string());
+            if (blend)
+                st.addLog("[pm] feature status " + targetId_ +
+                          ": ok=" + std::string(sok ? "1" : "0") +
+                          " warn=\"" + (wt != s.end() && wt->is_string() ? wt->get<std::string>() : "") + "\"" +
+                          (sok ? "" : " err=\"" + s.value("error", std::string()) + "\""));
             auto dr = s.find("dangling_refs");
             std::vector<std::string> dangling;
             if (dr != s.end() && dr->is_array())
@@ -1602,6 +1869,8 @@ void PropertyManager::commit(AppState& st) {
         st.addLog("[pm] OK blocked: form is not ready");
         return;
     }
+    // The fillet/chamfer is already applied live in the session, so commit just flushes any pending
+    // edit and closes — no un-suppress step is needed anymore.
     if (dirty_ || !firstPreviewDone_) {
         if (!applyPreview(st)) {
             st.addLog("[pm] OK blocked: preview/apply failed");
@@ -1735,6 +2004,39 @@ void PropertyManager::draw(AppState& st) {
 void PropertyManager::drawBody(AppState& st) {
     if (!active_) return;
 
+    // Keep a VISIBLE selector well active at all times. A method combo can HIDE the currently-
+    // active well (ref_axis/ref_plane use duplicate-key, method-gated wells: switching
+    // "Cylindrical Face" -> "Two Planes" hides the face well and reveals two plane wells). The
+    // active flag would stay stranded on the now-hidden well, leaving NO visible active well — so
+    // the datum-plane/axis picker goes dark and the references don't show until the user clicks the
+    // new well. Re-home the active flag onto the first visible selector well (preferring an empty
+    // one) so the relevant references are pickable the instant a form opens OR its method changes —
+    // SolidWorks selection-first behaviour, for every tool. Only fires when nothing visible is
+    // active, so it never steals a well the user is actively filling. (Lives in drawBody, not
+    // draw(), because the tabbed left pane calls drawBody() directly — see layout.cpp.)
+    {
+        bool haveVisibleActive = false;
+        for (const auto& f : fields_)
+            if (f.def->kind == PMFieldKind::SelectorWell && f.wellActive &&
+                fieldVisible(*f.def, fields_)) { haveVisibleActive = true; break; }
+        if (!haveVisibleActive) {
+            PMField* target = nullptr;
+            for (auto& f : fields_) {
+                if (f.def->kind != PMFieldKind::SelectorWell || !fieldVisible(*f.def, fields_))
+                    continue;
+                if (!target) target = &f;                       // fallback: first visible well
+                if (f.picks.empty()) { target = &f; break; }    // prefer the first empty well
+            }
+            if (target) {
+                for (auto& o : fields_)
+                    if (o.def->kind == PMFieldKind::SelectorWell ||
+                        o.def->kind == PMFieldKind::FeatureWell)
+                        o.wellActive = false;
+                target->wellActive = true;
+            }
+        }
+    }
+
     // Live unit-system toggle: if the document units changed while this form is open (e.g. the
     // user clicked the status-bar MMGS/IPS cluster), reformat every open Dim field's DISPLAY from
     // its canonical mm value. The stored value is unchanged — purely a display reformat.
@@ -1863,7 +2165,14 @@ void PropertyManager::drawBody(AppState& st) {
 
         // C37-F: Enter commits ONLY when the PM window is focused/hovered or a PM widget was
         // active this frame. This prevents Enter-in-chat from accidentally committing the form.
-        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) &&
+        //
+        // BUT: while a text field (a Dim/Int/Text input) is being edited, Enter means "apply the
+        // value I just typed to the preview" — NOT "OK the whole feature". io.WantTextInput is true
+        // on the frame Enter is pressed (the InputText is still the active item; it deactivates
+        // later this same frame), so gating on it lets the field's own EnterReturnsTrue handler take
+        // the Enter (parse + schedule preview) instead of the form committing out from under the
+        // user. With focus then released, a second Enter (no field active) commits as before.
+        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) && !io.WantTextInput &&
             (pmWindowFocused || pmWindowHovered || pmWidgetWasActive)) {
             ok = true;
         }
@@ -2003,6 +2312,12 @@ void PropertyManager::drawBody(AppState& st) {
                 }
 
                 if (enabled && (changed || deact)) {
+                    // `changed` is true ONLY when Enter is pressed (EnterReturnsTrue) — an explicit
+                    // "apply now" gesture, so we backdate lastEditTime_ past the debounce window to
+                    // fire the preview this frame. A plain blur (`deact` without `changed`) keeps the
+                    // normal debounce.
+                    const double applyTime = changed ? (ImGui::GetTime() - kDebounceSec)
+                                                     : ImGui::GetTime();
                     std::string txt = f.dimBuf.data();
                     // trim
                     while (!txt.empty() && std::isspace((unsigned char)txt.front())) txt.erase(txt.begin());
@@ -2010,7 +2325,7 @@ void PropertyManager::drawBody(AppState& st) {
                     if (!txt.empty() && txt[0] == '=') {
                         f.dimExpr = txt.substr(1);
                         f.dimError.clear();
-                        dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                        dirty_ = true; lastEditTime_ = applyTime;
                     } else {
                         double mm;
                         std::string err;
@@ -2024,7 +2339,7 @@ void PropertyManager::drawBody(AppState& st) {
                         const double bareScale = (useIps && !unscaled) ? 25.4 : 1.0;
                         if (pmParseDim(txt, mm, err, /*angle=*/isAngle, bareScale)) {
                             f.dimValue = mm; f.dimExpr.clear(); f.dimError.clear();
-                            dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                            dirty_ = true; lastEditTime_ = applyTime;
                         } else {
                             f.dimError = err;
                         }
@@ -2295,6 +2610,18 @@ void PropertyManager::drawBody(AppState& st) {
         float wrapW = ImGui::GetContentRegionAvail().x;
         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
         ImGui::Text(u8"! Preview error: %s", previewError_.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    } else if (!previewWarning_.empty()) {
+        // Non-fatal note (amber): the preview succeeded but the engine couldn't fully apply (e.g. a
+        // fillet rounded only some of the selected edges because the radius was too large for the
+        // rest). The selected edges stay highlighted in the viewport so the user can see which set
+        // they picked while they lower the size.
+        ImGui::Separator();
+        pushTextColor(pal.statusWarn);
+        float wrapW = ImGui::GetContentRegionAvail().x;
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
+        ImGui::Text(u8"! %s", previewWarning_.c_str());
         ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
     }

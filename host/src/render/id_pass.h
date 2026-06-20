@@ -65,6 +65,14 @@ public:
     // for out-of-range / background pixels.
     PickHit pickFinal(int px, int py, int finalW, int finalH);
 
+    // Like pickFinal, but if the exact pixel is a Face (or background) it searches outward up to
+    // radiusPx (final-viewport pixels) for the nearest EDGE/VERTEX pixel and returns that instead.
+    // For tools that target model edges (Convert Entities): a 1-px-wide edge sitting on a large
+    // coplanar face — the common case when sketching normal-to a face — is otherwise nearly
+    // unclickable because the face wins the single center pixel. A center hit that is already an
+    // edge/vertex is returned unchanged.
+    PickHit pickFinalPreferEdge(int px, int py, int finalW, int finalH, int radiusPx);
+
     bool usesRgba8() const { return rgba8_; }
 
     // Solid Bodies hide/show: bodies in this set are skipped by render(), so hidden geometry is

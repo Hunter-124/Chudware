@@ -61,7 +61,7 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
 
     ImGui::PushID(idx);
 
-    std::string label = t.title.empty() ? std::string("Untitled") : t.title;
+    std::string label = t.displayTitle();   // filename-first (real file name, not internal "Part1")
     if (t.dirty) label += " *";
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -76,8 +76,11 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
     ImVec2 p0(x, y0);
     ImVec2 p1(p0.x + tabW, p0.y + tabH);
 
-    // Whole-pill click target (switch). The × button sits on top and consumes its own clicks.
+    // Whole-pill click target (switch). The × button sits on top and consumes its own clicks — but
+    // ImGui occludes a later item by an earlier overlapping one unless the underlying item opts in,
+    // so allow the pill to be overlapped or the × (submitted below) never receives its clicks.
     ImGui::SetCursorScreenPos(p0);
+    ImGui::SetNextItemAllowOverlap();
     bool switchClicked = ImGui::InvisibleButton("##tab", ImVec2(tabW, tabH));
     bool hovered = ImGui::IsItemHovered();
     bool middleClose = hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Middle);
@@ -143,7 +146,18 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
     return tabW;
 }
 
-float drawDocTabs(AppState& st, float topY) {
+float docTabStripHeight(const AppState& st) {
+    return st.docTabs.empty() ? 0.0f : 26.0f * ui::uiScale;
+}
+
+// Drawn INLINE at the top of the central dock window's content (the Viewport 3D view, the drawing
+// sheet, or the ECAD editor — whichever owns the central node this frame), NOT as a separate
+// overlay window. An overlay floated behind the focused central window and got covered by its
+// opaque background; drawing into the SAME window's draw list keeps the tabs on top with no z-order
+// fight. `availW` is the content width to span. The strip reserves its own height via a trailing
+// Dummy so the 3D image / sheet flows below it (picking is unaffected — the image rect is read from
+// the image item itself). Returns the strip height (0 when no document is open).
+float drawDocTabs(AppState& st, float availW) {
     // Nothing to show in the empty start state (no document open).
     if (st.docTabs.empty()) return 0.0f;
 
@@ -152,34 +166,30 @@ float drawDocTabs(AppState& st, float topY) {
     float barH = 26.0f * s;
 
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + topY));
-    ImGui::SetNextWindowSize(ImVec2(vp->Size.x, barH));
-    ImGui::SetNextWindowViewport(vp->ID);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * s, 0));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg,
-        ImVec4(pal.windowBg[0], pal.windowBg[1], pal.windowBg[2], 1));
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
-        ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings |
-        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus |
-        ImGuiWindowFlags_NoFocusOnAppearing;
-    ImGui::Begin("##DocTabs", nullptr, flags);
 
     s_switchTo = -1;
     s_closeIdx = -1;
     s_newDoc = NewDocKind::None;
 
-    // Explicit x-cursor placement (no SameLine/Dummy bookkeeping): each tab is drawn at the running
-    // x and returns its width. The strip never wraps; very many tabs just clip at the window edge.
+    // Background band spanning the content width so the row reads as a cohesive tab bar over the
+    // dark 3D view. Tabs/“+” paint on top of it via the host window's draw list.
     ImVec2 origin = ImGui::GetCursorScreenPos();
-    float x = origin.x;
+    {
+        ImDrawList* bdl = ImGui::GetWindowDrawList();
+        bdl->AddRectFilled(origin, ImVec2(origin.x + availW, origin.y + barH),
+                           ui::Palette::toU32(pal.windowBg));
+        bdl->AddLine(ImVec2(origin.x, origin.y + barH - 0.5f),
+                     ImVec2(origin.x + availW, origin.y + barH - 0.5f),
+                     ui::Palette::toU32(pal.border), 1.0f);
+    }
+
+    // Explicit x-cursor placement (no SameLine/Dummy bookkeeping): each tab is drawn at the running
+    // x and returns its width. The strip never wraps; very many tabs just clip at the content edge.
+    float runX = origin.x;
     float y0 = origin.y;
     float gap = 2.0f * s;
     for (int i = 0; i < (int)st.docTabs.size(); ++i) {
-        x += drawOneTab(st, i, x, y0, barH) + gap;
+        runX += drawOneTab(st, i, runX, y0, barH) + gap;
     }
 
     // "+" New-Document button at the end of the strip — opens a chooser popup (Wave 2). Clicking it
@@ -187,7 +197,7 @@ float drawDocTabs(AppState& st, float topY) {
     // NewDocKind applied after the strip is drawn (so docTabs isn't mutated mid-iteration).
     {
         float btn = barH;
-        ImVec2 p0(x, y0);
+        ImVec2 p0(runX, y0);
         ImGui::SetCursorScreenPos(p0);
         bool clicked = ImGui::InvisibleButton("##newtab", ImVec2(btn, btn));
         bool hov = ImGui::IsItemHovered();
@@ -241,7 +251,7 @@ float drawDocTabs(AppState& st, float topY) {
                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
         int idx = s_confirmCloseIdx;
         std::string name = (idx >= 0 && idx < (int)st.docTabs.size())
-                               ? st.docTabs[idx].title : std::string("this document");
+                               ? st.docTabs[idx].displayTitle() : std::string("this document");
         ImGui::Text("\"%s\" has unsaved changes.", name.c_str());
         ImGui::TextUnformatted("Close it anyway? Your edits will be lost.");
         ImGui::Spacing();
@@ -259,9 +269,10 @@ float drawDocTabs(AppState& st, float topY) {
     }
     if (!open) s_confirmCloseIdx = -1;   // modal dismissed via the title-bar X
 
-    ImGui::End();
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar(4);
+    // Reserve the strip's height in the host window's layout so the 3D image / sheet flows BELOW it
+    // (the tabs above were placed absolutely; this is what actually advances the content cursor).
+    ImGui::SetCursorScreenPos(origin);
+    ImGui::Dummy(ImVec2(availW, barH));
 
     // ---- apply deferred actions (after all tabs were drawn) ----
     // A close that targets the active tab leaves the mirror on a neighbor, so handle close before

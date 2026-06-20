@@ -18,21 +18,15 @@ static const RibbonCmd kCmds[] = {
     // --- Group: Sketch (entry point for the features workflow) ---
     { "sketch_new",        "New Sketch",     "sketch",          "Features", "Sketch",          true,  nullptr,          false },
 
-    // --- Group: Extrude (boss + cut share a split button) ---
-    { "extrude_boss",      "Extrude",        "extrude_boss",    "Features", "Extrude",         true,  nullptr,          false },
-    { "extrude_cut",       "Extrude Cut",    "extrude_cut",     "Features", "Extrude",         false, "extrude_boss",   false },
-
-    // --- Group: Revolve ---
-    { "revolve_boss",      "Revolve",        "revolve_boss",    "Features", "Revolve",         true,  nullptr,          false },
-    { "revolve_cut",       "Revolve Cut",    "revolve_cut",     "Features", "Revolve",         false, "revolve_boss",   false },
-
-    // --- Group: Sweep ---
-    { "sweep_boss",        "Sweep",          "sweep",           "Features", "Sweep",           true,  nullptr,          false },
-    { "sweep_cut",         "Sweep Cut",      "sweep_cut",       "Features", "Sweep",           false, "sweep_boss",     false },
-
-    // --- Group: Loft ---
-    { "loft_boss",         "Loft",           "loft",            "Features", "Loft",            true,  nullptr,          false },
-    { "loft_cut",          "Loft Cut",       "loft_cut",        "Features", "Loft",            false, "loft_boss",      false },
+    // --- Group: 3D Body ---
+    { "extrude_boss",      "Extrude",        "extrude_boss",    "Features", "3D Body",         true,  nullptr,          false },
+    { "extrude_cut",       "Extrude Cut",    "extrude_cut",     "Features", "3D Body",         true,  nullptr,          false },
+    { "revolve_boss",      "Revolve",        "revolve_boss",    "Features", "3D Body",         true,  nullptr,          false },
+    { "revolve_cut",       "Revolve Cut",    "revolve_cut",     "Features", "3D Body",         false, "revolve_boss",   false },
+    { "sweep_boss",        "Sweep",          "sweep",           "Features", "3D Body",         true,  nullptr,          false },
+    { "sweep_cut",         "Sweep Cut",      "sweep_cut",       "Features", "3D Body",         false, "sweep_boss",     false },
+    { "loft_boss",         "Loft",           "loft",            "Features", "3D Body",         true,  nullptr,          false },
+    { "loft_cut",          "Loft Cut",       "loft_cut",        "Features", "3D Body",         false, "loft_boss",      false },
 
     // --- Group: Dress-up ---
     { "fillet",            "Fillet",         "fillet",          "Features", "Dress-up",        true,  nullptr,          false },

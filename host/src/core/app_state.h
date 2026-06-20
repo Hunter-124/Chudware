@@ -45,6 +45,7 @@ class SketchMode;
 class SimPanel;
 class AsmPanels;
 class ActivityPanel;
+class EvaluateDialogs;  // Measure / Mass Properties / Section dialogs — owned per-document (DocSession)
 // Wave 2 (GUI rework): the per-document ECAD editor state (mirror + canvas + selection + edit
 // buffers) lives on each Schematic/PCB DocTab. Its full definition stays in ecad_panel.cpp (it
 // owns EcadMirror/EcadCanvas); AppState only needs an opaque pointer so app_state.h stays light.
@@ -124,6 +125,55 @@ struct FitReport {
     bool ok = true;  // true = no interference
     std::string summary;
     std::vector<FitPair> interferences, clearances;
+};
+
+// ---------------- per-document host session (multi-document mid-edit preservation) ----------------
+// Each open CAD Part/Assembly tab owns one DocSession holding the editing/display state that must
+// survive a tab switch: its OWN PropertyManager (the active feature-edit form + its live-preview
+// batches), SketchMode (the active sketch), EvaluateDialogs (Measure / Mass / Section windows), plus
+// a parked snapshot of the AppState per-doc VALUE fields (viewport selection, hidden-body mask, model
+// readout, assembly readout, tree highlight). On a tab switch AppState swaps its live per-doc fields
+// with the leaving/entering session (AppState::captureDocState / restoreDocState) and re-seats
+// st.propertyManager / sketchMode / evaluateDialogs at the active session's instances — so switching
+// neither cancels the PM form nor exits the sketch. The worker keeps every doc alive in its registry,
+// so a backgrounded doc's parked edit state (PM checkpoint id / preview batches against its worker
+// doc) stays valid and resumes exactly when its tab is reactivated.
+//
+// The DocMirror deliberately stays SINGLE on AppState (not per-session): it is already re-pointed at
+// the target worker doc via DocMirror::activate() on every switch, and is only ever mutated on behalf
+// of the active document — so one re-pointed mirror is correct, and its (single) listener always
+// drives the active doc's tree/mesh repaint. This mirrors the per-document precedent already set by
+// ECAD tabs (DocTab::ecadState, a shared_ptr to per-document editor state).
+struct DocSession {
+    // Owned per-document UI subsystems. The full types live in their ui/*.h headers; this struct is
+    // declared with only forward declarations, so its constructor + destructor are out-of-lined in
+    // core/doc_tabs.cpp (which includes those headers) where the unique_ptrs see complete types.
+    std::unique_ptr<ui::PropertyManager> pm;        // active feature-edit form (+ live preview)
+    std::unique_ptr<ui::SketchMode>      sketch;    // active sketch (entities/constraints/tools)
+    std::unique_ptr<ui::EvaluateDialogs> evaluate;  // Measure / Mass / Section result windows
+
+    // Parked copy of AppState's per-doc VALUE fields, moved in/out on switch (empty for a fresh
+    // session — equivalent to a cleared viewport). KEEP THIS LIST IN SYNC WITH
+    // AppState::captureDocState / restoreDocState and AppState::clearViewportForNewDoc.
+    std::vector<core::SelItem> selItems;            // viewport topology selection (st.selection items)
+    render::PickHit            hover;
+    std::string                pickStatus;
+    std::vector<uint8_t>       bodyVisible;         // Solid Bodies hide/show mask (per renderer slot)
+    std::vector<uint32_t>      docBodyIds;          // AICM body id per slot (keys the mask)
+    std::string                modelInfo;
+    std::vector<PartInfo>      asmParts;
+    FitReport                  asmFit;
+    std::string                asmStl;
+    int                        selectedPart = -1;
+    std::string                selectedFeatureId;   // FeatureManager primary selection
+    bool                       treeScrollToSelection = false;
+    std::vector<uint64_t>      featureHighlightFaces;
+    bool                       sketchPlanePickActive = false;
+
+    DocSession();
+    ~DocSession();
+    DocSession(const DocSession&) = delete;
+    DocSession& operator=(const DocSession&) = delete;
 };
 
 // ---------------- worker job ----------------
@@ -216,6 +266,22 @@ struct AgentStep {
 
 enum ErrKind { ERR_NONE = 0, ERR_CAD = 1, ERR_SYSTEM = 2 };
 
+// ---------------- pre-flight clarify gate ----------------
+// Before a Design run, agent_clarify_v1 returns the build-critical questions (or ready=true).
+// One ClarifyQ per question; `answer` is the editable buffer shown in the inline clarify card,
+// seeded with `suggested` so the user can accept a default with one click.
+struct ClarifyQ {
+    std::string key, ask, unit, suggested;
+    std::vector<char> answer{std::vector<char>(256, 0)};
+};
+struct ClarifyState {
+    bool awaiting = false;   // clarify RPC in flight — the turn shows "working out what I need..."
+    bool active = false;     // questions are shown; waiting for the user to fill them + Build
+    std::string request;     // the original user request, launched once answered/skipped
+    std::vector<ClarifyQ> questions;
+    std::vector<std::string> assumptions;
+};
+
 struct ChatMsg {
     bool fromUser = false;
     std::string text;              // user prompt, or the assistant's final summary
@@ -225,6 +291,7 @@ struct ChatMsg {
     std::string liveStatus;        // transient "Iteration N: building..." while running
     PlanInfo plan;                 // the build plan drafted before the code (plan mode)
     std::vector<AgentStep> steps;  // assistant turn: the iteration trace
+    ClarifyState clarify;          // pre-flight clarify gate (Design mode) — see ClarifyState
 };
 
 // A progress event streamed from the worker (parsed off the worker thread, applied on the
@@ -335,10 +402,32 @@ struct AppState {
         std::string title;          // display name (doc "name", "Part1"/"Assembly1")
         bool        isAssembly = false;
         bool        dirty = false;  // edits since last save (asterisk on the tab)
+        // The blank "example" document the app offers on launch (the Welcome chooser's New Part /
+        // New Assembly). It is disposable: opening a real file silently discards it (see
+        // dropBlankStarterTabs) UNLESS the user touched it (then `dirty` is set and it is kept). A
+        // doc from a DELIBERATE mid-session New Part/Assembly is NOT a starter, so it always survives.
+        bool        isStarter = false;
         std::string path;           // last saved file path ("" = never saved)
+
+        // Display label for the tab strip + viewport title. Prefers the on-disk file name (the
+        // thing the user actually opened/saved) over the internal tree "name" — an opened .step+
+        // keeps its tree name "Part1" but should read as "bracket" on the tab. Falls back to the
+        // tree-derived `title` for never-saved docs (and for Drawing/ECAD tabs, whose `path` is
+        // empty). The leading directory and a single trailing extension (incl. ".step+") are
+        // stripped. Defined in core/doc_tabs.cpp.
+        std::string displayTitle() const;
+
         // Saved camera so each tab keeps its own view across switches.
         float yaw = 35, pitch = 28, zoom = 1.0f, pan[3] = {0, 0, 0};
         bool  camValid = false;     // false until the first switch-away captures the live camera
+
+        // ---- Part / Assembly tabs only — per-document editing/display session ----
+        // Holds this document's PropertyManager + SketchMode + EvaluateDialogs and a parked snapshot
+        // of the per-doc value state, so switching away preserves the in-progress edit instead of
+        // cancelling it (see DocSession). Lazily created by ensureTabSession() on first activation;
+        // null for Drawing / Schematic / PCB tabs (which don't drive the DocMirror). shared_ptr so a
+        // DocTab stays copyable (closeDocTab takes a by-value copy), mirroring ecadState.
+        std::shared_ptr<DocSession> session;
 
         // ---- Drawing tabs only (kind == Drawing) ----
         std::string drawingDocId;       // drawing registry id (from drawing_new) — NOT a doc_* id
@@ -409,6 +498,11 @@ struct AppState {
     // Close docTabs[idx] (with the worker doc_close). If it was active, activates a neighbor; if it
     // was the last tab, returns to the empty start state. Does NOT prompt — the caller decides.
     void closeDocTab(int idx);
+    // Discard any disposable blank "starter" tab(s) — the launch example doc the user never touched
+    // (isStarter && !dirty && no saved path) — EXCEPT the tab at keepIdx. Called when a real file is
+    // opened so the blank example doesn't linger beside it. A starter the user edited (dirty) or
+    // saved (has a path) is kept. No-op when there is no such tab.
+    void dropBlankStarterTabs(int keepIdx);
     // Mark the active tab dirty (on any mutation) / clear it (on save). Safe with no active tab.
     void markActiveTabDirty();
     void clearActiveTabDirty();
@@ -416,6 +510,25 @@ struct AppState {
     void syncActiveTabTitle();
     // Index of the tab whose docId matches the mirror's current doc, or -1.
     int  tabIndexForActiveDoc() const;
+
+    // ---- multi-document per-session state (core/doc_tabs.cpp + app_state.cpp) ----
+    // The active CAD tab's DocSession (null at the empty start state or on a Drawing/ECAD tab).
+    DocSession* activeSession();
+    // Lazily allocate t.session for a Part/Assembly tab (no-op if already present or non-CAD tab).
+    void ensureTabSession(DocTab& t);
+    // Point st.propertyManager / sketchMode / evaluateDialogs at `s` (the active session), or at the
+    // run_gui fallback singletons when s == nullptr (empty start / non-CAD tab). Called on every
+    // switch + on session creation/teardown so every borrow site resolves the right document.
+    void reseatActiveSubsystems(DocSession* s);
+    // Move AppState's live per-doc VALUE fields (selection items, hover, hidden-body mask, model +
+    // assembly readout, tree highlight, sketchPlanePickActive) INTO `s` — called for the LEAVING tab
+    // before a switch. captureDocState moves out (leaves AppState's fields empty/default);
+    // restoreDocState moves the ENTERING tab's parked fields back. Selection items are restored
+    // AFTER loadDocMesh (which clears the selection), so restoreDocState handles only the model-side
+    // fields and the caller restores selection/hover/pickStatus from `s` post-mesh. The owned PM /
+    // sketch / evaluate are NOT touched here (they live on `s`; reseatActiveSubsystems repoints them).
+    void captureDocState(DocSession& s);
+    void restoreDocState(DocSession& s);
     // Reconcile the tab strip with the mirror once per frame: if the mirror holds a document that
     // has no tab yet (created by a path that doesn't open one itself — sketch auto-create, chat
     // "new part", an agent v2 run, the assembly panel), append a tab for it and make it active.
@@ -650,7 +763,17 @@ struct AppState {
     // ---- PropertyManager (C17) — occupies the tree dock slot while a command is active ----
     // W1-B: typed pointer (forward-declared above) so app_state.h stays free of the heavy
     // ui/property_manager.h include while every borrow site drops its static_cast.
-    ui::PropertyManager* propertyManager = nullptr;   // owned by run_gui
+    // Multi-document: these three point at the ACTIVE document's per-session instances (re-seated on
+    // every tab switch by reseatActiveSubsystems). They fall back to the run_gui-owned singletons
+    // (fallback* below) only at the empty start state / on a non-CAD tab. Every access site keeps
+    // using st.propertyManager / sketchMode / evaluateDialogs byte-identically; only the pointee
+    // changes per active document.
+    ui::PropertyManager* propertyManager = nullptr;   // active doc's feature-edit form (per DocSession)
+    // Fallback singletons owned by run_gui, used when no CAD document is active (empty start state /
+    // Drawing / ECAD tab). Set once in run_gui; never null after startup.
+    ui::PropertyManager* fallbackPropertyManager = nullptr;
+    ui::SketchMode*      fallbackSketchMode      = nullptr;
+    ui::EvaluateDialogs* fallbackEvaluate        = nullptr;
     // Configurations left-pane tab (SolidWorks ConfigurationManager). The live ConfigPanel is owned
     // by run_gui and borrowed here so ui::drawLeftPane's Configurations case can render it
     // (ConfigPanel::drawEmbedded). Null until run_gui wires it.
@@ -673,9 +796,14 @@ struct AppState {
     bool evalMassShotDone = false;
 
     // ---- SketchMode (C18) — in-sketch tools/overlay; typed like the PropertyManager (W1-B) ----
-    ui::SketchMode* sketchMode = nullptr;  // owned by run_gui
+    ui::SketchMode* sketchMode = nullptr;  // active doc's sketch (per DocSession; re-seated on switch)
     bool wantSketch = false;           // AI_CAD_SHOT=sketch scripted flow
     bool sketchShotDone = false;       // guard so the sketch scenario runs once per shot
+
+    // ---- EvaluateDialogs (C19) — Measure / Mass / Section windows; per-document like the PM ----
+    // Re-seated on tab switch so a measurement window/log on one part is independent of another's —
+    // "measure one part while a feature-edit form is open on another" (the multi-document headline).
+    ui::EvaluateDialogs* evaluateDialogs = nullptr;  // active doc's evaluate dialogs (per DocSession)
 
     // ---- AsmPanels (C20b) — assembly windows/forms; typed like the PropertyManager (W1-B) ----
     ui::AsmPanels* asmPanels = nullptr;  // owned by run_gui
@@ -792,7 +920,12 @@ struct AppState {
     // Requires a current GL context and st.idPass/st.overlays to be set. Returns false on
     // parse/GL failure (err set); on success sets hasDocMesh. (C15; the worker that produces
     // these per-rebuild files is wired in C16.)
-    bool loadDocMesh(const std::string& aicmPath, std::string& err);
+    //
+    // renderOnly: update ONLY the shaded renderer (setMeshes), leaving the id-pass / overlays /
+    // pick caches untouched. Used by the blend (fillet/chamfer) live preview to DISPLAY the rounded
+    // result while picking + highlighting still resolve against the un-rounded base body that the
+    // session holds (suppressed). So the user sees the round form but every edge pick is exact.
+    bool loadDocMesh(const std::string& aicmPath, std::string& err, bool renderOnly = false);
 
     // C34: reset the viewport to the fresh-document state — drops the legacy/demo mesh and any
     // previous doc's parts so the empty-doc datum-planes view shows. Called by every path that

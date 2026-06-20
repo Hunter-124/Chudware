@@ -22,6 +22,7 @@
 
 struct AppState;
 class Renderer;
+struct Vec3;   // ../math.h — only used by-reference in signatures here (full def in the .cpp)
 
 namespace ui {
 
@@ -141,6 +142,42 @@ public:
     bool drawRegionPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin, const ImVec2& imgMax,
                           int vw, int vh, bool imgHovered);
 
+    // Datum-plane picker for feature PropertyManager wells (reference axis "Two Planes", reference
+    // plane "Mid Plane", …). While a feature PM is open with an active plane-accepting well
+    // (PropertyManager::activeWellWantsPlane), the three origin datum planes are hit-tested with the
+    // same frontmost-barycentric logic as the new-sketch plane pick: hovering highlights one, a
+    // left-click routes its reserved datum ref ("plane.front"/…) into the well. Returns true while
+    // the cursor sits over an origin plane so model picking doesn't also fire (the well still
+    // accepts planar FACE picks through the normal id-buffer path when not over an origin plane).
+    bool drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin, const ImVec2& imgMax,
+                         int vw, int vh, bool imgHovered);
+
+    // Datum-axis picker for feature PropertyManager wells (revolve "Axis", circular-pattern axis).
+    // While a feature PM is open with an active axis-accepting well (activeWellWantsAxis), the
+    // displayed datum-axis lines (docMirror::refDatums kind=="axis") are hit-tested in screen space;
+    // hovering highlights one and a left-click routes its datum ref into the well. Returns true while
+    // the cursor is over a datum axis so model picking doesn't also fire (a click off any axis still
+    // falls through to the id-buffer, so the well's model-edge pick still works).
+    bool drawAxisPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin, const ImVec2& imgMax,
+                        int vw, int vh, bool imgHovered);
+
+    // GENERAL datum selection (outside any PM picker): hover-highlight a displayed datum axis and,
+    // on left-click, SELECT that datum feature (tree highlight + renderer emphasis). Returns true
+    // while the cursor is over a datum axis so the model-pick click is suppressed. No-op while a PM
+    // picker (axis/plane well) owns datum picks. Called from the viewport's normal selection path.
+    bool drawDatumSelect(AppState& st, ImGuiIO& io, const ImVec2& imgMin, const ImVec2& imgMax,
+                         int vw, int vh, bool imgHovered);
+
+    // World-space centre of the active sketch's geometry (bbox centre of its entities, or the sketch
+    // plane origin when empty), for the orbit-centre override so the view orbits/frames around the
+    // sketch (not the body bbox / origin). Returns false when not editing a sketch.
+    bool sketchOrbitCenter(Vec3& world) const;
+
+    // Origin-plane index (0/1/2, -1 none) hovered by the PM plane picker last frame — fed to
+    // Renderer::setPlanes as the emphasis so the hovered datum plane brightens (mirrors planeHover
+    // for the new-sketch flow).
+    int pmPlaneHover() const { return pmPlaneHover_; }
+
     // Short status line for the status bar ("Under Defined   DOF: 4"). Empty when inactive.
     std::string statusLine() const;
 
@@ -194,6 +231,19 @@ private:
     void commitDrag(AppState& st);              // sketch_drag_commit -> rebuild mesh
     void addEntity(AppState& st, const nlohmann::json& entity, const nlohmann::json& constraints);
     void addConstraint(AppState& st, const nlohmann::json& constraint);
+    // Translate a stored snap handle (toolSnaps_ encoding) into the geometric constraint it
+    // implies and append it to `cs`. `pt` is a "$self.<sub>" point handle on the new entity
+    // (e.g. "$self.center"/"$self.start"). Plain handle -> coincident; "mid:" -> midpoint;
+    // "rim:"/"tan:" -> point_on. Snaps onto an entity (no sub-handle) are no-ops. Shared by every
+    // drawing tool so a snap captured at placement persists as a real relation (was Line-only).
+    void pushSnapConstraint(const std::string& snap, const std::string& pt,
+                            nlohmann::json& cs) const;
+    // Lightweight single-entity / single-constraint emit used by the center-construction builders
+    // (Polygon inscribed circle, Center Rectangle diagonal + center point). Always coalesces into
+    // the in-progress undo step, so the whole shape stays ONE undo. Returns "" on failure.
+    std::string emitConstructionEntity(AppState& st, const nlohmann::json& entity,
+                                       const nlohmann::json& constraints);
+    void emitConstructionConstraint(AppState& st, const nlohmann::json& constraint);
     // C37-D: store the constraints array carried on every sketch response.
     void applyConstraints(const nlohmann::json& res);
 
@@ -259,6 +309,7 @@ private:
     struct SnapInfer {
         bool alignU = false, alignV = false;   // cursor u / v pulled to a source point's u / v
         ImVec2 srcU{0, 0}, srcV{0, 0};         // (u,v) of the alignment source point(s)
+        std::string srcUHandle, srcVHandle;    // handle of each source point ("origin"/"e3.p1"/…)
     };
     // Snap a free (u,v) to nearby sketch geometry. *snapHandle encodes what fired:
     //   "e3.p2" / "e4.center" / "e5.p"  point snap -> coincident candidate (existing behavior)
@@ -378,6 +429,9 @@ private:
     // st.sketchPlanePickActive; -1 = no origin-plane hovered, else 0/1/2 = front/top/right.
     bool planePicking_ = false;
     int  planeHover_ = -1;
+    // PM datum-plane picker hover (drawPlanePicker) — separate from the new-sketch planeHover_ so
+    // the two flows don't cross-talk. -1 = none, else 0/1/2 = front/top/right.
+    int  pmPlaneHover_ = -1;
 
     // per-frame projection basis
     ImVec2 originS_{0, 0};
@@ -391,6 +445,13 @@ private:
     // coincident snap stays (pre-C49 behavior); h/v force, alignment lines, midpoint, rim and
     // tangent inference all stand down and no auto h/v relation is emitted.
     bool inferenceOn_ = true;
+
+    // When set, the vertical/horizontal ALIGNMENT inference (the dashed guide pulling a new point
+    // onto another point's u or v) is also written as a real vertical/horizontal relation between
+    // the two points — so an aligned placement stays aligned instead of being positional-only.
+    // SolidWorks "automatic relations". Default ON; toggled from the in-sketch right-click menu.
+    // Gated by inferenceOn_ (alignment only fires while inference is on).
+    bool autoAlignRelations_ = true;
 
     // Sketch grid visibility — OFF by default (SolidWorks-style); toggled from the in-sketch
     // right-click context menu. The origin marker draws regardless.
@@ -408,10 +469,17 @@ private:
     // Emit the 4 lines of a quad (corners A,B,C,D in order) as one chained loop with the given
     // relation kinds (mirrors the corner-rect op pattern; relations[i] applies to edge i->i+1,
     // "" = none). Used by the 3pt/center/parallelogram rectangle variants.
-    void addQuadLoop(AppState& st, const ImVec2 corners[4], const char* relations[4]);
+    // cornerSnaps (optional, length 4) carries the toolSnaps_ record for each corner pick so a
+    // corner dropped on a vertex/origin keeps its coincident; "" / nullptr = unconstrained corner.
+    // Returns the 4 created line ids (in corner order), so a caller can attach center construction
+    // geometry (e.g. Center Rectangle's diagonal + center point). Empty entries on failure.
+    std::vector<std::string> addQuadLoop(AppState& st, const ImVec2 corners[4],
+                     const char* relations[4], const std::string* cornerSnaps = nullptr);
     // C42: emit N lines as a closed coincident-chained loop (generalized addQuadLoop, no per-edge
     // h/v). equalEdges adds "equal" relations between consecutive edges (Polygon regularity).
-    void addPolyLoop(AppState& st, const std::vector<ImVec2>& corners, bool equalEdges);
+    // Returns the N created line ids (corner order) for attaching the inscribed construction circle.
+    std::vector<std::string> addPolyLoop(AppState& st, const std::vector<ImVec2>& corners,
+                                         bool equalEdges);
     // C51: emit a straight slot as REAL geometry — 2 side lines + 2 cap arcs + 1 construction
     // centerline — joined by coincident endpoints (closure), the centerline ends coincident with
     // the arc centers, equal cap radii, and each side tangent to both caps. SolidWorks-style:
@@ -421,7 +489,10 @@ private:
     // because our solver reports an endpoint-coincident tangent as redundant and the session then
     // flagged a false over-define; that is fixed (a redundant geometric relation no longer
     // over-defines — see engine/doc/session.py), so they are restored. p1/p2 = spine endpoints.
-    void addDecomposedSlot(AppState& st, const ImVec2& p1, const ImVec2& p2, float width);
+    // snap1/snap2 (optional, toolSnaps_ encoding) constrain the two spine endpoints — the cap-arc
+    // centers — so a slot end dropped on a vertex/origin keeps its coincident/alignment.
+    void addDecomposedSlot(AppState& st, const ImVec2& p1, const ImVec2& p2, float width,
+                           const std::string& snap1 = "", const std::string& snap2 = "");
     // C42: Polygon tool side count (set with number keys 3-9 while the tool is armed).
     int polySides_ = 6;
 

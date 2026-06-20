@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cctype>
 #include <string>
+#include <unordered_map>
 
 #include "imgui.h"
 
@@ -63,6 +64,90 @@ bool toggleChip(const char* label, bool active) {
     bool clicked = ImGui::SmallButton(label);
     if (active) ImGui::PopStyleColor();
     return clicked;
+}
+
+// ---- auto-growing, wrapping chat input -------------------------------------------------------
+// ImGui's InputTextMultiline does NOT word-wrap (it renders with wrap_width=0, so long lines
+// extend past the box and get clipped — "run off the screen"). So we maintain the wrapping
+// ourselves: rewrapInPlace toggles spaces<->newlines so every visual line fits within wrapW.
+// It is SAME-LENGTH (only swaps ' ' <-> '\n'), so cursor indices in the active widget stay
+// valid. The box then grows by counting the newlines. Enter submits; Shift+Enter inserts a
+// soft break that the next rewrap reflows (a prompt rarely needs hard line breaks).
+static bool rewrapInPlace(char* buf, int len, float wrapW) {
+    if (len <= 0 || wrapW <= 1.0f) return false;
+    bool changed = false;
+    // 1) flatten every existing newline back to a space — an idempotent source to re-wrap from
+    //    (so widening the box reflows the text instead of leaving stale breaks).
+    for (int i = 0; i < len; ++i)
+        if (buf[i] == '\n') { buf[i] = ' '; changed = true; }
+    // 2) greedy word-wrap: break at the last space that keeps the running line within wrapW.
+    int lineStart = 0, lastSpace = -1;
+    float lineW = 0.0f;
+    for (int i = 0; i < len; ++i) {
+        float cw = ImGui::CalcTextSize(buf + i, buf + i + 1).x;
+        if (lineW + cw > wrapW && lastSpace >= lineStart) {
+            buf[lastSpace] = '\n';
+            changed = true;
+            lineStart = lastSpace + 1;
+            lineW = ImGui::CalcTextSize(buf + lineStart, buf + i).x;
+            lastSpace = -1;
+        }
+        lineW += cw;
+        if (buf[i] == ' ') lastSpace = i;
+    }
+    return changed;
+}
+namespace {
+struct ChatInputCb { float wrapW = 0.0f; };
+int chatInputEditCallback(ImGuiInputTextCallbackData* data) {
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackEdit) {
+        auto* cb = static_cast<ChatInputCb*>(data->UserData);
+        if (rewrapInPlace(data->Buf, data->BufTextLen, cb->wrapW))
+            data->BufDirty = true;   // same length, so BufTextLen/CursorPos are unchanged
+    }
+    return 0;
+}
+}  // namespace
+static bool drawChatInput(const char* id, std::vector<char>& buf, const char* placeholder,
+                          int maxLines) {
+    if (buf.empty()) return false;
+    const auto& pal = ui::palette;
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float lineH = ImGui::GetTextLineHeight();
+    float wrapW = ImGui::GetContentRegionAvail().x - style.FramePadding.x * 2.0f -
+                  style.ScrollbarSize;
+    if (wrapW < 1.0f) wrapW = 1.0f;
+
+    // When the widget is NOT active it is safe to rewrap the backing buffer directly — this
+    // covers programmatically-filled text (example chips) and panel resize. While active, the
+    // edit callback rewraps ImGui's internal copy instead (external edits would be ignored).
+    // We can't read ImGui's active id (internal API), so track per-id active state across frames.
+    static std::unordered_map<ImGuiID, bool> s_activeLast;
+    ImGuiID wid = ImGui::GetID(id);
+    if (!s_activeLast[wid])
+        rewrapInPlace(buf.data(), (int)std::strlen(buf.data()), wrapW);
+
+    int rows = 1;
+    for (const char* p = buf.data(); *p; ++p) if (*p == '\n') ++rows;
+    if (rows > maxLines) rows = maxLines;
+    const float h = lineH * (float)rows + style.FramePadding.y * 2.0f;
+
+    ChatInputCb cb;
+    cb.wrapW = wrapW;
+    ImGui::InputTextMultiline(id, buf.data(), buf.size(), ImVec2(-1, h),
+        ImGuiInputTextFlags_CallbackEdit, chatInputEditCallback, &cb);
+    s_activeLast[wid] = ImGui::IsItemActive();
+    // Enter sends, Shift+Enter does not. Detect the KEY (not a trailing '\n') so a newline the
+    // rewrap just inserted can never be mistaken for a submit.
+    bool submit = ImGui::IsItemFocused() && !ImGui::GetIO().KeyShift &&
+                  ImGui::IsKeyPressed(ImGuiKey_Enter, false);
+    if (buf[0] == 0 && placeholder && placeholder[0]) {
+        ImVec2 mn = ImGui::GetItemRectMin();
+        ImGui::GetWindowDrawList()->AddText(
+            ImVec2(mn.x + style.FramePadding.x * 2.0f, mn.y + style.FramePadding.y),
+            ui::Palette::toU32(pal.textDisabled), placeholder);
+    }
+    return submit;
 }
 
 // Read-only, copyable monospace code view; height fits the content up to maxH.
@@ -278,7 +363,8 @@ static void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     if (!s.contactSheet.empty()) {
         if (!s.triedThumb) { s.thumb = loadTexture(s.contactSheet); s.triedThumb = true; }
         if (s.thumb.id) {
-            float tw = logW < 220.0f ? logW : 220.0f;
+            float maxTw = ui::metrics::copilotThumbW();
+            float tw = logW < maxTw ? logW : maxTw;
             float th = tw * (float)s.thumb.h / (float)s.thumb.w;
             ImGui::Image((ImTextureID)(intptr_t)s.thumb.id, ImVec2(tw, th));
         }
@@ -316,10 +402,14 @@ static void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
         if (toggleChip("Error details", s.showError)) s.showError = !s.showError;
         first = false;
     }
-    if (s.showThinking && !s.thinking.empty()) drawProseBox("##think", s.thinking, 150.0f);
-    if (s.showCode && !s.code.empty()) drawCodeBox("##code_v", s.code, fonts.mono, 260.0f);
-    if (s.showDiff && !s.diff.empty()) drawDiffBox("##diff_v", s.diff, fonts.mono, 220.0f);
-    if (s.showError && !s.error.empty()) drawCodeBox("##err_v", s.error, fonts.mono, 200.0f);
+    if (s.showThinking && !s.thinking.empty())
+        drawProseBox("##think", s.thinking, ui::metrics::copilotProseMaxH());
+    if (s.showCode && !s.code.empty())
+        drawCodeBox("##code_v", s.code, fonts.mono, ui::metrics::px(260.0f));
+    if (s.showDiff && !s.diff.empty())
+        drawDiffBox("##diff_v", s.diff, fonts.mono, ui::metrics::copilotDiffMaxH());
+    if (s.showError && !s.error.empty())
+        drawCodeBox("##err_v", s.error, fonts.mono, ui::metrics::px(200.0f));
     ImGui::EndChild();
     ImGui::PopStyleColor();
 }
@@ -347,6 +437,105 @@ static std::string stripMdMarks(const std::string& in) {
     return out;
 }
 
+// Create a fresh part document if needed and launch the v2 orchestrator for `request`. The
+// current doc is replaced only when it already has features (so an empty new part is reused).
+// Centralized so both the direct Design path and the post-clarify "Build it" path share it.
+static void launchDesignRun(AppState& st, const std::string& request) {
+    std::string err;
+    bool docOk = st.docMirror.hasDoc();
+    if (docOk) {
+        const nlohmann::json& tree = st.docMirror.tree();
+        bool hasFeatures = tree.is_object() && tree.contains("features") &&
+                           tree["features"].is_array() && !tree["features"].empty();
+        if (hasFeatures) docOk = st.docMirror.newPart(st.worker, err);
+    } else {
+        docOk = st.docMirror.newPart(st.worker, err);
+    }
+    if (!docOk) {
+        st.addLog("[err] design: could not create a part document: " + err);
+        st.status = "Worker not ready";  st.statusKind = 2;
+        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+            if (!it->fromUser && (it->running || it->clarify.active)) {
+                it->running = false;
+                it->clarify = ClarifyState{};
+                it->errKind = ERR_SYSTEM;
+                it->text = "I couldn't open a new part document (worker not ready). "
+                           "Check the Console and try again.";
+                break;
+            }
+        return;
+    }
+    st.clearViewportForNewDoc();
+    st.addLog("[..] designing (v2): " + request);
+    st.status = "Designing...";  st.statusKind = 0;
+    st.agentV2Running = true;
+    st.agentV2 = true;
+    if (st.activityPanel)
+        st.activityPanel->clearLive();
+    launchAgentRunV2(st.worker, st.job, request, st.docMirror.docId());
+}
+
+// The inline clarify card: the build-critical questions the model asked, each with an editable
+// value field seeded with its suggested default. "Build it" folds the answers into the request
+// and launches the run; "Skip" uses the suggested defaults. Shown inside an assistant turn.
+static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
+    const auto& pal = ui::palette;
+    const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
+    ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImVec4(pal.stepCardBg[0], pal.stepCardBg[1], pal.stepCardBg[2], pal.stepCardBg[3]));
+    ImGui::BeginChild("##clarify", ImVec2(0, 0),
+                      ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(accentCol, "A few details to get this right");
+    ImGui::PopFont();
+    dimText("Accept the suggested values or change them, then build. Skip uses the defaults.");
+    for (size_t i = 0; i < m.clarify.questions.size(); ++i) {
+        ClarifyQ& q = m.clarify.questions[i];
+        ImGui::PushID((int)i);
+        std::string lbl = q.ask;
+        if (!q.unit.empty()) lbl += "  (" + q.unit + ")";
+        ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+        ImGui::TextWrapped("%s", lbl.c_str());
+        drawChatInput("##cq", q.answer, q.suggested.empty() ? "value" : q.suggested.c_str(), 2);
+        ImGui::PopID();
+    }
+    if (!m.clarify.assumptions.empty()) {
+        ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::TextUnformatted("Assuming:");
+        ImGui::PopStyleColor();
+        for (const auto& a : m.clarify.assumptions) {
+            ImGui::Bullet();
+            ImGui::SameLine();
+            dimText(a.c_str());
+        }
+    }
+    ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
+    bool build = primaryButton("Build it", ImVec2(-1, ui::metrics::copilotBtnH()));
+    bool skip = ImGui::Button("Skip - use defaults", ImVec2(-1, 0));
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    if (build || skip) {
+        // Fold each answer (or its suggested default on Skip) into the request so the
+        // orchestrator builds with concrete numbers.
+        std::string aug = m.clarify.request + "\n\nClarified dimensions:";
+        for (auto& q : m.clarify.questions) {
+            std::string val = skip ? q.suggested : std::string(q.answer.data());
+            if (val.empty()) val = q.suggested;
+            std::string nm = q.key.empty() ? q.ask : q.key;
+            aug += "\n- " + nm + ": " + val + (q.unit.empty() ? "" : " " + q.unit);
+        }
+        for (const auto& a : m.clarify.assumptions) aug += "\n- (assumed) " + a;
+        m.clarify.active = false;
+        m.clarify.questions.clear();
+        m.clarify.assumptions.clear();
+        m.running = true;
+        m.liveStatus = "Building...";
+        launchDesignRun(st, aug);
+    }
+}
+
 static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW) {
     const auto& pal = ui::palette;
     const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
@@ -366,6 +555,9 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
         if (m.errKind != ERR_NONE) ImGui::PopStyleColor();
     }
+
+    // pre-flight clarify gate: the model's build-critical questions, awaiting the user.
+    if (m.clarify.active) drawClarifyCard(st, m, fonts);
 
     // iteration trace — one expandable card per pass of the agent loop
     for (size_t si = 0; si < m.steps.size(); ++si) {
@@ -472,35 +664,23 @@ static void drawModeRow(AppState& st) {
     if (st.aiInteraction == 1 && !hasDoc) st.aiInteraction = 0;   // fall back when no doc
     st.agentV2 = (st.aiInteraction == 1);                         // Edit == orchestrator v2
 
-    // Model/provider label — clicking jumps to the Settings tab in this same task pane.
+    // Model / provider / mode label — clicking jumps to the Settings tab, where the model,
+    // provider, and the supervised-vs-autopilot toggle ("Plan before building") all live. The
+    // mode is shown read-only here (no duplicate toggle — that was the redundant control).
     const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp"};
     const char* prov = provNames[(st.settings.provider >= 0 && st.settings.provider < 4)
                                      ? st.settings.provider : 2];
-    char label[160];
-    std::snprintf(label, sizeof(label), "%s / %s", prov,
-                  st.settings.model[0] ? st.settings.model : "default");
+    char label[220];
+    std::snprintf(label, sizeof(label), "%s / %s  [%s]", prov,
+                  st.settings.model[0] ? st.settings.model : "default",
+                  st.settings.planMode ? "Supervised" : "Autopilot");
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, compactPad);
     ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-    bool supervised = st.settings.planMode;
-    const char* toggleLbl = supervised ? "Supervised" : "Autopilot";
-    float toggleW = ImGui::CalcTextSize(toggleLbl).x + compactPad.x * 2.0f;
-    float modelW = ImGui::GetContentRegionAvail().x;
-    bool sameLineToggle = modelW > toggleW + style.ItemSpacing.x + 96.0f * sc;
-    if (sameLineToggle) modelW -= toggleW + style.ItemSpacing.x;
-    if (ImGui::Button(label, ImVec2(modelW, 0))) st.focusSettingsTab = true;
+    if (ImGui::Button(label, ImVec2(-1, 0))) st.focusSettingsTab = true;
     ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Model & provider - click to open the Settings tab.\n%s", label);
-    if (sameLineToggle) ImGui::SameLine();
-    if (supervised) ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.accentMid));
-    if (ImGui::Button(toggleLbl, ImVec2(sameLineToggle ? toggleW : -1.0f, 0)))
-        st.settings.planMode = !st.settings.planMode;
-    if (supervised) ImGui::PopStyleColor();
     ImGui::PopStyleVar();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", supervised
-            ? "Supervised: the AI plans first and shows the plan before building. Click for Autopilot."
-            : "Autopilot: the AI builds without stopping to confirm. Click for Supervised.");
+        ImGui::SetTooltip("Model, provider & mode - click to open Settings.\n%s", label);
 }
 
 static void drawInlineSettingsTab(AppState& st, bool busy) {
@@ -579,7 +759,7 @@ static void drawInlineSettingsTab(AppState& st, bool busy) {
     }
 
     if (busy) ImGui::BeginDisabled();
-    if (primaryButton("Save settings", ImVec2(-1, 32.0f * S))) {
+    if (primaryButton("Save settings", ImVec2(-1, ui::metrics::copilotBtnH()))) {
         settings.systemPrompt = st.spBuf.data();
         saveSettings(settings);
         st.settings.recentFiles = st.recentFiles;
@@ -666,47 +846,71 @@ static void submitTurn(AppState& st, const std::string& text) {
             }
         }, 300000);
     } else {
-        // Design new -> C40: the v2 orchestrator on a FRESH part document, so "Design with AI"
-        // produces a real parametric feature tree. (The legacy build123d loop rendered a dead
-        // mesh disconnected from the document — you couldn't edit, dimension, or save what the
-        // AI built.) The current doc is replaced only when it already has features.
-        std::string err;
-        bool docOk = st.docMirror.hasDoc();
-        if (docOk) {
-            const nlohmann::json& tree = st.docMirror.tree();
-            bool hasFeatures = tree.is_object() && tree.contains("features") &&
-                               tree["features"].is_array() && !tree["features"].empty();
-            if (hasFeatures) docOk = st.docMirror.newPart(st.worker, err);
-        } else {
-            docOk = st.docMirror.newPart(st.worker, err);
-        }
-        if (!docOk) {
-            st.addLog("[err] design: could not create a part document: " + err);
-            st.status = "Worker not ready";  st.statusKind = 2;
-            if (!st.chat.empty() && st.chat.back().running) {
-                st.chat.back().running = false;
-                st.chat.back().errKind = 2;
-                st.chat.back().text = "I couldn't open a new part document (worker not ready). "
-                                      "Check the Console and try again.";
+        // Design new -> pre-flight CLARIFY gate, THEN the v2 orchestrator on a FRESH part
+        // document. The clarify call (agent_clarify_v1) runs async via AsyncRpc; its callback
+        // (GL thread) either launches the run directly (request already specific) or shows the
+        // inline clarify card with the build-critical questions. Any failure falls straight
+        // through to the build — clarify never blocks. See launchDesignRun / drawClarifyCard.
+        st.designStarted = true;
+        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+            if (!it->fromUser && it->running) {
+                it->clarify.awaiting = true;
+                it->clarify.request = text;
+                it->liveStatus = "Working out what I need to build this...";
+                break;
             }
-            return;
-        }
-        st.clearViewportForNewDoc();
-        st.addLog("[..] designing (v2): " + text);
-        st.status = "Designing...";  st.statusKind = 0;
-        st.agentV2Running = true;
-        st.agentV2 = true;
-        if (st.activityPanel)
-            st.activityPanel->clearLive();
-        launchAgentRunV2(st.worker, st.job, text, st.docMirror.docId());
+        st.addLog("[..] clarify: " + text);
+        st.status = "Thinking...";  st.statusKind = 0;
+        nlohmann::json params = {
+            {"request", text},
+            {"doc_id", st.docMirror.hasDoc() ? st.docMirror.docId() : std::string()}};
+        st.rpc.call("agent_clarify_v1", params, [&st, text](const core::RpcResult& r) {
+            ChatMsg* msg = nullptr;
+            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+                if (!it->fromUser && it->clarify.awaiting) { msg = &*it; break; }
+            if (!msg) return;  // turn was cleared (New part) — nothing to do
+            msg->clarify.awaiting = false;
+            // Parse questions; on ANY error/empty -> build straight away (never block).
+            bool ready = true;
+            std::vector<ClarifyQ> qs;
+            std::vector<std::string> assumptions;
+            if (r.ok && r.result.is_object() && !r.result.contains("code")) {
+                ready = r.result.value("ready", true);
+                if (r.result.contains("questions") && r.result["questions"].is_array()) {
+                    for (const auto& q : r.result["questions"]) {
+                        if (!q.is_object()) continue;
+                        ClarifyQ cq;
+                        cq.key = q.value("key", std::string());
+                        cq.ask = q.value("ask", std::string());
+                        cq.unit = q.value("unit", std::string());
+                        cq.suggested = q.value("suggested", std::string());
+                        if (cq.ask.empty()) continue;
+                        std::strncpy(cq.answer.data(), cq.suggested.c_str(),
+                                     cq.answer.size() - 1);
+                        qs.push_back(std::move(cq));
+                    }
+                }
+                if (r.result.contains("assumptions") && r.result["assumptions"].is_array())
+                    for (const auto& a : r.result["assumptions"])
+                        if (a.is_string()) assumptions.push_back(a.get<std::string>());
+            }
+            if (ready || qs.empty()) {
+                msg->liveStatus.clear();
+                launchDesignRun(st, text);   // keeps msg->running -> the run streams into it
+                return;
+            }
+            // Hold for the user: show the clarify card (msg stops "running" until Build it).
+            msg->running = false;
+            msg->liveStatus.clear();
+            msg->clarify.active = true;
+            msg->clarify.request = text;
+            msg->clarify.questions = std::move(qs);
+            msg->clarify.assumptions = std::move(assumptions);
+            st.status = "Waiting on a few details...";  st.statusKind = 0;
+            st.addLog("[..] clarify: " + std::to_string(msg->clarify.questions.size()) +
+                      " question(s)");
+        }, 120000);
     }
-}
-
-static bool hasNonSpace(const char* text) {
-    if (!text) return false;
-    for (const unsigned char* p = (const unsigned char*)text; *p; ++p)
-        if (!std::isspace(*p)) return true;
-    return false;
 }
 
 static void copyToBuffer(std::vector<char>& buf, const char* text) {
@@ -715,70 +919,19 @@ static void copyToBuffer(std::vector<char>& buf, const char* text) {
     if (text) std::strncpy(buf.data(), text, buf.size() - 1);
 }
 
-static std::string rpcErrorText(const core::RpcResult& r) {
-    if (!r.ok) return r.err.empty() ? "worker call failed" : r.err;
-    if (r.result.is_object() && r.result.contains("code"))
-        return r.result.value("message", std::string("worker error"));
-    return std::string();
-}
-
-static void submitHelpQuestion(AppState& st, const std::string& question) {
-    if (!hasNonSpace(question.c_str())) return;
-    if (!st.workerStarted) {
-        st.helpError = "Runtime is not ready yet.";
-        st.helpStatus = "Runtime not ready.";
-        return;
-    }
-    if (st.helpBusy) return;
-    st.helpBusy = true;
-    st.helpLastQuestion = question;
-    st.helpAnswer.clear();
-    st.helpError.clear();
-    st.helpStatus = "Asking...";
-    st.addLog("[..] help: " + question);
-    nlohmann::json params = {
-        {"doc_id", st.docMirror.hasDoc() ? st.docMirror.docId() : std::string()},
-        {"question", question}};
-    st.rpc.call("agent_ask_v2", params, [&st](const core::RpcResult& r) {
-        st.helpBusy = false;
-        std::string err = rpcErrorText(r);
-        if (!err.empty()) {
-            st.helpError = err;
-            st.helpAnswer.clear();
-            st.helpStatus = "Ask failed.";
-            st.status = "Help failed.";
-            st.statusKind = 2;
-            st.addLog("[err] help: " + err);
-            return;
-        }
-        st.helpAnswer = r.result.value("answer", std::string());
-        if (st.helpAnswer.empty()) st.helpAnswer = "(no answer)";
-        st.helpError.clear();
-        st.helpStatus = "Ready.";
-        st.status = "Ready.";
-        st.statusKind = 0;
-    }, 300000);
-}
-
-static void drawHelpTab(AppState& st, bool canRun) {
-    const auto& pal = ui::palette;
+// Ask-mode helpers shown under the prompt: example questions + a chip to ask about the
+// currently selected feature. They seed the shared prompt buffer (st.prompt), so the unified
+// input + Send path handles them — no separate Help tab needed. (Folded in from the removed
+// Help tab, which duplicated Ask mode: both just call agent_ask_v2.)
+static void drawAskHelpers(AppState& st) {
     const float sc = ui::uiScale;
-    bool workerReady = st.workerStarted && canRun && !st.agentV2Running;
-
-    ImGui::Dummy(ImVec2(0, 2 * sc));
-    ImGui::PushFont(st.fonts.medium);
-    ImGui::TextUnformatted("AI Help");
-    ImGui::PopFont();
-    dimText("Ask about the current part, feature tree, dimensions, or CAD workflow. Help mode is read-only.");
-
-    ImGui::Dummy(ImVec2(0, 4 * sc));
-    const char* examples[] = {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    static const char* examples[] = {
         "What features are in this part?",
         "Why is my sketch under defined?",
-        "How should I change this without breaking downstream features?",
+        "How do I change this without breaking downstream features?",
     };
     float avail = ImGui::GetContentRegionAvail().x;
-    const ImGuiStyle& style = ImGui::GetStyle();
     float rowW = 0.0f;
     for (int i = 0; i < 3; ++i) {
         float w = ImGui::CalcTextSize(examples[i]).x + style.FramePadding.x * 2.0f;
@@ -791,71 +944,19 @@ static void drawHelpTab(AppState& st, bool canRun) {
             }
         }
         rowW += w;
-        if (ImGui::SmallButton(examples[i])) copyToBuffer(st.helpQuestion, examples[i]);
+        if (ImGui::SmallButton(examples[i])) copyToBuffer(st.prompt, examples[i]);
     }
-
     if (!st.selectedFeatureId.empty()) {
-        ImGui::Dummy(ImVec2(0, 3 * sc));
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-        ImGui::Text("Selected feature: %s", st.selectedFeatureId.c_str());
+        ImGui::Dummy(ImVec2(0, 2 * sc));
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+        ImGui::Text("Selected: %s", st.selectedFeatureId.c_str());
         ImGui::PopStyleColor();
         ImGui::SameLine();
         if (ImGui::SmallButton("Ask about selection")) {
             std::string q = "Explain feature " + st.selectedFeatureId +
                             " and suggest safe edits I can make to it.";
-            copyToBuffer(st.helpQuestion, q.c_str());
+            copyToBuffer(st.prompt, q.c_str());
         }
-    }
-
-    ImGui::Dummy(ImVec2(0, 6 * sc));
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputTextMultiline("##help_question", st.helpQuestion.data(), st.helpQuestion.size(),
-                              ImVec2(-1, ImGui::GetTextLineHeight() * 3.0f),
-                              ImGuiInputTextFlags_NoHorizontalScroll);
-    if (st.helpQuestion[0] == 0) {
-        ImVec2 mn = ImGui::GetItemRectMin();
-        ImGui::GetWindowDrawList()->AddText(
-            ImVec2(mn.x + ImGui::GetStyle().FramePadding.x * 2,
-                   mn.y + ImGui::GetStyle().FramePadding.y),
-            ui::Palette::toU32(pal.textDisabled), "Ask for help with this model...");
-    }
-    bool ctrlEnter = ImGui::IsItemFocused() && ImGui::GetIO().KeyCtrl &&
-                     ImGui::IsKeyPressed(ImGuiKey_Enter, false);
-    bool hasQuestion = hasNonSpace(st.helpQuestion.data());
-    bool canAsk = workerReady && hasQuestion && !st.helpBusy;
-    if (!canAsk) ImGui::BeginDisabled();
-    bool ask = primaryButton(st.helpBusy ? "Asking..." : "Ask Help", ImVec2(-1, 32.0f * sc));
-    if (!canAsk) ImGui::EndDisabled();
-    if ((ask || ctrlEnter) && canAsk) submitHelpQuestion(st, std::string(st.helpQuestion.data()));
-    if (ImGui::IsItemHovered() && !workerReady)
-        ImGui::SetTooltip("Runtime/worker must be ready and no design/edit run can be active.");
-
-    ImGui::Dummy(ImVec2(0, 8 * sc));
-    if (st.helpBusy) {
-        static const char* kSpin[] = {"|", "/", "-", "\\"};
-        int sp = (int)(ImGui::GetTime() * 8.0) & 3;
-        ImGui::TextColored(ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1),
-                           "%s Asking the AI helper...", kSpin[sp]);
-    } else if (!st.helpStatus.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-        ImGui::TextUnformatted(st.helpStatus.c_str());
-        ImGui::PopStyleColor();
-    }
-
-    if (!st.helpError.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(pal.errSystem[0], pal.errSystem[1], pal.errSystem[2], 1));
-        ImGui::TextWrapped("I couldn't answer that: %s", st.helpError.c_str());
-        ImGui::PopStyleColor();
-    }
-    if (!st.helpLastQuestion.empty() || !st.helpAnswer.empty()) {
-        ImGui::SeparatorText("Answer");
-        if (!st.helpLastQuestion.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-            ImGui::TextWrapped("Q: %s", st.helpLastQuestion.c_str());
-            ImGui::PopStyleColor();
-        }
-        if (!st.helpAnswer.empty()) drawProseBox("##help_answer", st.helpAnswer, 260.0f * sc);
     }
 }
 
@@ -898,32 +999,24 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
                                                        : ImGuiTabItemFlags_None;
     if (ImGui::BeginTabItem("Design", nullptr, designFlags)) {
 
-    // ---- INPUT AT TOP — always visible, multiline; Ctrl+Enter sends, Enter = newline ----
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputTextMultiline("##aiprompt", st.prompt.data(), st.prompt.size(),
-                              ImVec2(-1, ImGui::GetTextLineHeight() * 2.4f),
-                              ImGuiInputTextFlags_NoHorizontalScroll);
-    // Ctrl+Enter sends (only while the input is focused); plain Enter inserts a newline.
-    bool ctrlEnter = ImGui::IsItemFocused() && ImGui::GetIO().KeyCtrl &&
-                     ImGui::IsKeyPressed(ImGuiKey_Enter, false);
-    // Placeholder hint when empty (InputTextMultiline has no hint variant).
-    if (st.prompt[0] == 0) {
-        ImVec2 mn = ImGui::GetItemRectMin();
-        ImGui::GetWindowDrawList()->AddText(
-            ImVec2(mn.x + ImGui::GetStyle().FramePadding.x * 2,
-                   mn.y + ImGui::GetStyle().FramePadding.y),
-            ui::Palette::toU32(pal.textDisabled), "Describe a part or a change\xE2\x80\xA6");
-    }
+    // ---- INPUT AT TOP — auto-growing + wrapping; Enter sends, Shift+Enter = new line ----
+    const char* placeholder = st.aiInteraction == 2
+        ? "Ask about this part\xE2\x80\xA6  (Enter to send)"
+        : "Describe a part or a change\xE2\x80\xA6  (Enter to send)";
+    bool submitInput = drawChatInput("##aiprompt", st.prompt, placeholder,
+                                     ui::metrics::copilotInputMaxLines());
     // mode pills + model label (wrapping row)
     drawModeRow(st);
+    // Ask-mode helpers (example questions + ask-about-selection) seed the same prompt buffer.
+    if (st.aiInteraction == 2) drawAskHelpers(st);
     // send button
     bool canStart = canRun && st.prompt[0];
     if (!canStart) ImGui::BeginDisabled();
     const char* sendLabel = st.aiInteraction == 0 ? "Design with AI"
                           : st.aiInteraction == 1 ? "Edit with AI" : "Send";
-    bool goSend = primaryButton(sendLabel, ImVec2(-1, 32 * ui::uiScale));
+    bool goSend = primaryButton(sendLabel, ImVec2(-1, ui::metrics::copilotBtnH()));
     if (!canStart) ImGui::EndDisabled();
-    if ((goSend || ctrlEnter) && canStart) {
+    if ((goSend || submitInput) && canStart) {
         submitTurn(st, std::string(st.prompt.data()));
         st.prompt[0] = 0;
     }
@@ -937,7 +1030,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // "Empty" = no user turn yet (the startup welcome assistant message may be present).
     bool conversationEmpty = true;
     for (const ChatMsg& m : st.chat) if (m.fromUser) { conversationEmpty = false; break; }
-    if (conversationEmpty) {
+    if (conversationEmpty && st.aiInteraction != 2) {   // Ask mode has its own helper chips
         ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
         dimText("Try:");
         static const char* kExamples[] = {
@@ -957,11 +1050,11 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // C40: reserve space for OPEN footers too (one-frame-lagged open state) — before, an
     // opened Console/code section landed entirely below the window with no scroll path.
     static bool s_codeOpen = false, s_consoleOpen = false;
-    float footerReserve = ImGui::GetFrameHeightWithSpacing() * 2.0f + 8.0f;
-    if (s_codeOpen)    footerReserve += (140.0f + 30.0f) * ui::uiScale + 24.0f;
-    if (s_consoleOpen) footerReserve += 160.0f * ui::uiScale + 12.0f;
+    float footerReserve = ImGui::GetFrameHeightWithSpacing() * 2.0f + ui::metrics::U(2);
+    if (s_codeOpen)    footerReserve += ui::metrics::copilotCodeH() + ui::metrics::px(30.0f) + ui::metrics::U(6);
+    if (s_consoleOpen) footerReserve += ui::metrics::copilotConsoleH() + ui::metrics::U(3);
     float chatH = ImGui::GetContentRegionAvail().y - footerReserve;
-    if (chatH < 120.0f) chatH = 120.0f;
+    if (chatH < ui::metrics::px(120.0f)) chatH = ui::metrics::px(120.0f);
     ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_Border);
     const float logW = ImGui::GetContentRegionAvail().x;
     for (size_t mi = 0; mi < st.chat.size(); ++mi) {
@@ -1019,10 +1112,10 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     if (s_codeOpen) {
         ImGui::PushFont(fonts.mono);
         ImGui::InputTextMultiline("##code", st.code.data(), st.code.size(),
-                                  ImVec2(-1, 140 * ui::uiScale));
+                                  ImVec2(-1, ui::metrics::copilotCodeH()));
         ImGui::PopFont();
         if (!canRun) ImGui::BeginDisabled();
-        if (ImGui::Button("Build code", ImVec2(-1, 30 * ui::uiScale))) {
+        if (ImGui::Button("Build code", ImVec2(-1, ui::metrics::px(30.0f)))) {
             st.addLog("[..] building code");
             st.status = "Building...";  st.statusKind = 0;
             st.buildErrSummary.clear();
@@ -1038,24 +1131,21 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             if (toggleChip(st.showBuildErr ? "Hide details" : "Details", st.showBuildErr))
                 st.showBuildErr = !st.showBuildErr;
             if (st.showBuildErr && !st.buildErrFull.empty())
-                drawCodeBox("##builderr", st.buildErrFull, fonts.mono, 180.0f);
+                drawCodeBox("##builderr", st.buildErrFull, fonts.mono, ui::metrics::px(180.0f));
         }
     }
     s_consoleOpen = ImGui::CollapsingHeader("Console");
     if (s_consoleOpen) {
-        ImGui::BeginChild("##consolebody", ImVec2(0, 160 * ui::uiScale), ImGuiChildFlags_Border);
+        ImGui::BeginChild("##consolebody", ImVec2(0, ui::metrics::copilotConsoleH()),
+                          ImGuiChildFlags_Border);
         drawConsoleBody(st);
         ImGui::EndChild();
     }
 
     ImGui::EndTabItem();
     }
-    ImGuiTabItemFlags helpFlags = st.focusHelpTab ? ImGuiTabItemFlags_SetSelected
-                                                   : ImGuiTabItemFlags_None;
-    if (ImGui::BeginTabItem("Help", nullptr, helpFlags)) {
-        drawHelpTab(st, canRun);
-        ImGui::EndTabItem();
-    }
+    // (The old "Help" tab was removed — it duplicated Ask mode; Ask now lives in the unified
+    //  conversation with its own helper chips. See drawAskHelpers.)
     ImGuiTabItemFlags settingsFlags = st.focusSettingsTab ? ImGuiTabItemFlags_SetSelected
                                                            : ImGuiTabItemFlags_None;
     if (ImGui::BeginTabItem("Settings", nullptr, settingsFlags)) {
@@ -1063,7 +1153,6 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         ImGui::EndTabItem();
     }
     st.focusDesignTab = false;
-    st.focusHelpTab = false;
     st.focusSettingsTab = false;
     ImGui::EndTabBar();
     }

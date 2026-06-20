@@ -142,6 +142,31 @@ public:
     // SAME geometry the user sees. Returns false if the plane index is out of range.
     bool planeQuad(int plane, Vec3 out[4]) const;
 
+    // ---- feature reference geometry (datum axes / planes / points / coordinate systems) ----
+    // A datum feature builds NO body, so the engine ships its resolved geometry out-of-band
+    // (doc_mirror::refDatums); the host draws these as reference overlays after the model, the way
+    // SolidWorks shows a created Axis/Plane/Point. setRefDatums replaces the whole set each rebuild.
+    struct RefDatum {
+        enum class Kind { Axis, Plane, Point, Csys };
+        Kind kind = Kind::Axis;
+        Vec3 origin{0, 0, 0};   // axis: a point on the line; plane/csys: origin; point: the point
+        Vec3 dir{0, 0, 1};      // axis: unit direction; plane/csys: unit normal; (point: unused)
+        Vec3 xdir{1, 0, 0};     // plane/csys: in-plane +U  (unused for axis / point)
+        Vec3 ydir{0, 1, 0};     // plane/csys: in-plane +V  (unused for axis / point)
+        std::string id;
+        std::string name;
+    };
+    void setRefDatums(std::vector<RefDatum> datums) { refDatums_ = std::move(datums); }
+    // The feature id of the currently SELECTED datum (drawn emphasized — brighter + thicker), or
+    // "" for none. Set each frame from AppState::selectedFeatureId so clicking a datum highlights it.
+    void setSelectedDatumId(const std::string& id) { selectedDatumId_ = id; }
+
+    // Orbit-center override: while a sketch is open the model bbox (center_) doesn't include the
+    // sketch geometry, so an offset sketch would orbit/frame around the origin. The sketch mode sets
+    // this to the sketch's geometric center so the view orbits/centres there instead. Cleared (on
+    // == false) outside sketch, where center_ (the model bbox centre) is already correct.
+    void setOrbitCenterOverride(bool on, const Vec3& c) { orbitOverride_ = on; orbitCenter_ = c; }
+
     // ---- C28-C: SolidWorks-style Section View — up to 3 simultaneous clip planes ----
     // A fragment is visible only when it is inside ALL active half-spaces: dot(p,Ni) <= Oi.
     // When showCap is set, each active plane gets a stencil-masked filled cap, also clipped by
@@ -223,6 +248,7 @@ private:
     void drawCurrent(float yawDeg, float pitchDeg, float zoom);
     void drawGroundShadow(const Mat4& mvp, const Vec3& eye, const Vec3& up);  // soft contact blob
     void drawReferencePlanes(const Mat4& mvp);   // translucent datum planes (after the opaque pass)
+    void drawRefDatums(const Mat4& mvp);         // feature datum axes/planes/points (reference geom)
     void drawSectionCap(const Mat4& mvp, int planeIdx);  // C28-C: cap for one plane, clipped by others
     void planeCorners(int plane, float e, Vec3 out[4]) const;  // 4 world corners of plane quad
     void freeSubs();
@@ -252,6 +278,10 @@ private:
     unsigned int bgProg_ = 0, bgVao_ = 0;
     unsigned int shadowProg_ = 0;  // ground contact-shadow quad
     unsigned int planeProg_ = 0, planeVao_ = 0, planeVbo_ = 0;
+    std::vector<RefDatum> refDatums_;   // feature datum geometry to draw (reference overlays)
+    std::string selectedDatumId_;       // id of the emphasized (selected) datum, "" = none
+    bool  orbitOverride_ = false;       // use orbitCenter_ instead of center_ as the look-at target
+    Vec3  orbitCenter_{0, 0, 0};        // sketch-geometry centre (valid when orbitOverride_)
     unsigned int capProg_ = 0, capVao_ = 0, capVbo_ = 0;  // W3-I: section cap (flat-lit quad)
     bool  showPlane_[3] = {false, false, false};
     int   planeEmphasis_ = -1;

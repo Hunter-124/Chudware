@@ -34,6 +34,19 @@ static std::string docTitle(const nlohmann::json& tree, bool isAssembly) {
     return isAssembly ? "Assembly1" : "Part1";
 }
 
+// See app_state.h: filename-first label for a tab. Strip directory + one trailing extension so an
+// opened "C:\parts\bracket.step+" reads as "bracket"; fall back to the tree-derived title otherwise.
+std::string AppState::DocTab::displayTitle() const {
+    if (!path.empty()) {
+        std::size_t slash = path.find_last_of("/\\");
+        std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
+        std::size_t dot = base.find_last_of('.');
+        if (dot != std::string::npos && dot > 0) base = base.substr(0, dot);
+        if (!base.empty()) return base;
+    }
+    return title.empty() ? std::string("Untitled") : title;
+}
+
 int AppState::tabIndexForActiveDoc() const {
     if (!docMirror.hasDoc()) return -1;
     const std::string& id = docMirror.docId();
@@ -285,6 +298,20 @@ void AppState::closeDocTab(int idx) {
         if (idx < activeTab) --activeTab;
     }
     addLog("[tabs] closed '" + closing.title + "'");
+}
+
+void AppState::dropBlankStarterTabs(int keepIdx) {
+    // Identify the keep tab by docId so the index stays valid across the erase below.
+    const std::string keepId = (keepIdx >= 0 && keepIdx < (int)docTabs.size())
+                                   ? docTabs[keepIdx].docId : std::string();
+    for (int i = (int)docTabs.size() - 1; i >= 0; --i) {
+        const DocTab& t = docTabs[i];
+        if (t.docId == keepId) continue;                       // never drop the just-opened doc
+        if (t.isStarter && !t.dirty && t.path.empty()) {       // untouched launch example → discard
+            addLog("[tabs] discarding blank starter '" + t.displayTitle() + "' (real file opened)");
+            closeDocTab(i);
+        }
+    }
 }
 
 void AppState::markActiveTabDirty() {

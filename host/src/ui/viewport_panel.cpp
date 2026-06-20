@@ -177,26 +177,21 @@ static bool newDocTile(const char* id, const char* title, const char* desc,
 
 static void drawNewDocumentPopup(AppState& st);
 
-// The "New file" affordance lives in the central dock node's TAB BAR, to the RIGHT of the "Viewport"
-// tab (browser / SolidWorks "+ new" convention) rather than as a full-width band below the tab.
-// Amends the docked tab bar with a trailing "+ New file" button; this must be called AFTER the host
-// window's End() because DockNodeBeginAmendTabBar re-enters the host window + tab-bar scope. The click
-// only flags s_newDocLauncherOpen — the create-new modal is hosted inside the Viewport window by
-// drawNewDocumentPopup (which opens the popup when it sees the flag), keeping OpenPopup/BeginPopup in
-// the same ID scope. Safe no-op when the window is floating (node == nullptr / no tab bar).
-static void drawViewportNewFileTab(AppState& st, ImGuiDockNode* node) {
-    (void)st;
-    if (!node) return;
-    if (!ImGui::DockNodeBeginAmendTabBar(node)) return;
-    ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(ui::palette.accent));
-    if (ImGui::TabItemButton("+ New file##vp_new_file_tab",
-                             ImGuiTabItemFlags_Trailing | ImGuiTabItemFlags_NoTooltip)) {
-        s_newDocLauncherOpen = true;
-        s_newDocStage = NewDocStage::Root;
-    }
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Create a new document");
-    ImGui::DockNodeEndAmendTabBar();
+// The open documents live as browser/SolidWorks tabs in the central dock node's tab-bar ROW (where
+// the "<doc> - Viewport" dock tab used to sit), NOT as a separate full-width band. We can't make
+// ImGui's docking tab bar host our per-document tabs (one window == one tab), so instead each
+// central panel that owns this node (Viewport 3D, Viewport-as-drawing-sheet, ECAD) hides the node's
+// own window tab (NoTabBar — so "Viewport"/"ECAD" don't show a redundant tab) and paints the doc
+// tabs INLINE as the first thing in its content. Inline (vs a floating overlay) keeps the tabs on
+// top of the dark 3D view — an overlay floated behind the focused window and was covered by its
+// background. Picking is unaffected: the 3D image rect is read from the image item itself, so the
+// strip reserving height at the top simply shifts the image down with it. Call right after Begin.
+static void vpDockStripDraw(AppState& st) {
+    ImGuiDockNode* node = ImGui::GetWindowDockNode();
+    // Always hide the node's own window tab — the redundant "Viewport"/"ECAD" label should never
+    // show (the document tabs carry identity; before any file is open the row is simply empty).
+    if (node) node->LocalFlags |= ImGuiDockNodeFlags_NoTabBar;
+    if (ui::docTabStripHeight(st) > 0.0f) ui::drawDocTabs(st, ImGui::GetContentRegionAvail().x);
 }
 
 static void closeNewDocPopup() {
@@ -320,6 +315,12 @@ static bool  s_zoomAreaArmed = false;
 static bool  s_zoomAreaDragging = false;
 static ImVec2 s_zoomAreaP0 = {0, 0};  // drag start (screen)
 static ImVec2 s_zoomAreaP1 = {0, 0};  // drag current (screen)
+
+// SolidWorks-style "rotate while sketching": once the user MMB-orbits inside a sketch, stop forcing
+// the normal-to-plane lock so they can view the sketch from any angle (reset on sketch exit / on
+// re-entry, which goes through the !inSketch reset below). The sketch overlay projects live each
+// frame, so a rotated view stays correct.
+static bool   s_sketchRotated  = false;
 
 // C37-C: LMB drag-threshold state — suppress orbit micro-movement on click-selects.
 static bool   s_lmbDragActive  = false;  // true once the 4px threshold has been crossed
@@ -901,6 +902,104 @@ static bool ppProject(const Renderer& renderer, const ImVec2& vr0, const ImVec2&
     return true;
 }
 
+// Stroke a dashed screen-space segment a..b (dash/gap in px). A degenerate segment (a curved edge
+// we can't reconstruct) draws a small ring at `a` instead so it's still a visible deselect target.
+static void ppDashedLine(ImDrawList* dl, const ImVec2& a, const ImVec2& b, ImU32 col, float thick,
+                         float dash, float gap) {
+    float dx = b.x - a.x, dy = b.y - a.y;
+    float len = std::sqrt(dx * dx + dy * dy);
+    if (len < 1e-3f) { dl->AddCircle(a, 4.0f, col, 12, thick); return; }
+    float ux = dx / len, uy = dy / len;
+    for (float t = 0.0f; t < len; t += dash + gap) {
+        float e = std::min(t + dash, len);
+        dl->AddLine(ImVec2(a.x + ux * t, a.y + uy * t),
+                    ImVec2(a.x + ux * e, a.y + uy * e), col, thick);
+    }
+}
+
+// SolidWorks-style fillet/chamfer edit overlay: the live body shows the ROUND, while each selected
+// (original) edge is drawn as a dashed 3D line at its old location so the user can see and click to
+// DESELECT edges the round has eaten away. Returns true while the cursor is over a dashed edge (the
+// caller suppresses the model pick); a left click over one removes that edge from the active well.
+static bool drawBlendEdgeOverlay(AppState& st, const Renderer& renderer, ImGuiIO& io,
+                                 const ImVec2& vr0, const ImVec2& vr1, int vw, int vh,
+                                 bool imgHovered) {
+    if (!st.propertyManager || !st.propertyManager->active()) return false;
+    std::vector<PropertyManager::EdgeSeg> segs;
+    st.propertyManager->collectActiveWellEdgeSegments(segs);
+    if (segs.empty()) return false;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float S = ui::uiScale;
+    const ImU32 colSel = IM_COL32(255, 178, 44, 230);   // amber dashed = selected original edge
+    const ImU32 colHot = IM_COL32(255, 232, 130, 255);  // brighter = hovered deselect target
+    const float tol = 8.0f * S;
+
+    // Project each edge polyline to screen. A point fails to project when it's behind the camera; we
+    // keep per-point validity so partly-clipped loops still draw their visible spans.
+    struct Proj { std::vector<ImVec2> pts; std::vector<char> ok; bool closed; int pick; };
+    std::vector<Proj> projs; projs.reserve(segs.size());
+    for (const auto& sg : segs) {
+        Proj pr; pr.closed = sg.closed; pr.pick = sg.pickIndex;
+        pr.pts.reserve(sg.pts.size()); pr.ok.reserve(sg.pts.size());
+        for (const auto& w : sg.pts) {
+            ImVec2 sp; bool ok = ppProject(renderer, vr0, vr1, vw, vh, w.data(), sp);
+            pr.pts.push_back(sp); pr.ok.push_back(ok ? 1 : 0);
+        }
+        projs.push_back(std::move(pr));
+    }
+
+    // Distance from the cursor to a polyline (only segments whose BOTH ends projected).
+    auto distToProj = [&](const Proj& pr, ImVec2 mp) -> float {
+        float best = 1e30f;
+        int n = (int)pr.pts.size();
+        if (n == 1) { float dx = mp.x - pr.pts[0].x, dy = mp.y - pr.pts[0].y;
+                      return pr.ok[0] ? std::sqrt(dx * dx + dy * dy) : 1e30f; }
+        int last = pr.closed ? n : n - 1;
+        for (int s = 0; s < last; ++s) {
+            int j = (s + 1) % n;
+            if (!pr.ok[s] || !pr.ok[j]) continue;
+            ImVec2 a = pr.pts[s], b = pr.pts[j];
+            ImVec2 ab(b.x - a.x, b.y - a.y), ap(mp.x - a.x, mp.y - a.y);
+            float ab2 = ab.x * ab.x + ab.y * ab.y;
+            float t = ab2 > 1e-6f ? (ap.x * ab.x + ap.y * ab.y) / ab2 : 0.0f;
+            t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+            float cx = a.x + ab.x * t, cy = a.y + ab.y * t;
+            float dx = mp.x - cx, dy = mp.y - cy, d2 = dx * dx + dy * dy;
+            if (d2 < best) best = d2;
+        }
+        return std::sqrt(best);
+    };
+
+    int hotIdx = -1; float hotD = tol;
+    if (imgHovered) {
+        for (const auto& pr : projs) {
+            float d = distToProj(pr, io.MousePos);
+            if (d < hotD) { hotD = d; hotIdx = pr.pick; }
+        }
+    }
+
+    for (const auto& pr : projs) {
+        bool hot = (pr.pick == hotIdx);
+        ImU32 col = hot ? colHot : colSel;
+        float thick = (hot ? 2.6f : 1.7f) * S;
+        int n = (int)pr.pts.size();
+        if (n == 1) { if (pr.ok[0]) dl->AddCircle(pr.pts[0], 4.0f * S, col, 12, thick); continue; }
+        int last = pr.closed ? n : n - 1;
+        for (int s = 0; s < last; ++s) {
+            int j = (s + 1) % n;
+            if (!pr.ok[s] || !pr.ok[j]) continue;
+            ppDashedLine(dl, pr.pts[s], pr.pts[j], col, thick, 7.0f * S, 5.0f * S);
+        }
+    }
+
+    if (hotIdx >= 0 && imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        st.propertyManager->removeActiveWellPick(hotIdx);
+        return true;  // swallow the click (deselect, not a new pick)
+    }
+    return hotIdx >= 0;
+}
+
 // The push-pull handle for the single selected face: returns false when there is no single face
 // selected or the face has no cached normal/centroid. On success fills the centroid screen pos,
 // the two arrow tips (+normal and −normal) in screen space, the unit screen-space normal
@@ -1157,7 +1256,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     auto viewportTitle = [&]() {
         if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
             const auto& tab = st.docTabs[st.activeTab];
-            std::string label = tab.title.empty() ? std::string("Untitled") : tab.title;
+            std::string label = tab.displayTitle();   // real file name (matches the doc-tab strip)
             if (tab.dirty) label += "*";
             return label + " - Viewport###Viewport";
         }
@@ -1170,6 +1269,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     if (st.showViewport && st.activeTabIsDrawing()) {
         const std::string title = viewportTitle();
         if (ImGui::Begin(title.c_str())) {
+            vpDockStripDraw(st);   // hide window tab + paint the doc tabs above the sheet
             ui::drawDrawingSheet(st);
         }
         ImGui::End();
@@ -1184,12 +1284,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     // ---------- Viewport ----------
     if (st.showViewport) {
     const std::string title = viewportTitle();
-    ImGuiDockNode* vpDockNode = nullptr;   // captured inside Begin, used to amend the tab bar post-End
     if (ImGui::Begin(title.c_str()))
     {
-        vpDockNode = ImGui::GetWindowDockNode();
-        drawNewDocumentPopup(st);   // host the create-new modal; the "+ New file" trigger lives in
-                                    // the dock tab bar (drawViewportNewFileTab, after End()).
+        vpDockStripDraw(st);        // hide window tab + paint the doc tabs above the 3D view
+        drawNewDocumentPopup(st);   // host the create-new modal (opened by the tile chooser, if used)
 
         // ---- assembly fit readout + parts list (multi-part builds only) ----
         if (!st.asmParts.empty()) {
@@ -1233,8 +1331,20 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         int vw = (int)avail.x > 64 ? (int)avail.x : 64;
         int vh = (int)avail.y > 64 ? (int)avail.y : 64;
         renderer.resize(vw, vh);
-        // C18: hard-lock the camera normal to the sketch plane while editing a sketch.
-        if (inSketch) { float ly, lp; if (sketch->cameraLock(ly, lp)) { st.yaw = ly; st.pitch = lp; } }
+        // C18: lock the camera normal to the sketch plane while editing a sketch — UNTIL the user
+        // middle-drags to rotate (SolidWorks lets you orbit a sketch). s_sketchRotated latches that
+        // and is cleared whenever we leave sketch mode (below), so re-entry starts normal-to again.
+        if (!inSketch) s_sketchRotated = false;
+        // Latch the moment an MMB orbit begins so the very first drag frame isn't snapped back to
+        // normal-to before the handler (below) gets to add its delta — that first-frame fight made
+        // the orbit feel dead. Once dragging, the lock yields immediately; s_sketchRotated keeps it
+        // yielded for the rest of the sketch session.
+        if (inSketch && !s_sketchRotated && ImGui::IsMouseDragging(ImGuiMouseButton_Middle) &&
+            !ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyShift)
+            s_sketchRotated = true;
+        if (inSketch && !s_sketchRotated) {
+            float ly, lp; if (sketch->cameraLock(ly, lp)) { st.yaw = ly; st.pitch = lp; }
+        }
         // Freeze the bbox-derived camera framing while editing a sketch: real-time rebuilds of a
         // downstream feature (e.g. the extrude that consumes this sketch) must not re-frame the
         // view on every added entity. Geometry still updates live; the view stays normal-to-plane
@@ -1312,17 +1422,38 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         bool effPlane[3] = {st.showPlane[0], st.showPlane[1], st.showPlane[2]};
         if (!st.hasDocMesh && st.docMirror.hasDoc())
             effPlane[0] = effPlane[1] = effPlane[2] = true;
+        // A feature PM with an active plane-accepting well (ref-axis "Two Planes", ref-plane "Mid
+        // Plane", …): force-show the origin planes so the user can click one, same as the new-sketch
+        // plane pick. The plane picker (drawPlanePicker) hit-tests them and feeds pmPlaneHover() back.
+        bool pmWantsPlane = !inSketch && st.propertyManager && st.propertyManager->active() &&
+                            st.propertyManager->activeWellWantsPlane();
         // C37-C item 5: while sketchPlanePickActive, force-show all three origin planes (the sketcher
         // needs them visible so the user can pick one). This uses the same effPlane mechanism as
         // the empty-doc state (viewport_panel.cpp:290-294 convention).
-        if (st.sketchPlanePickActive)
+        if (st.sketchPlanePickActive || pmWantsPlane)
             effPlane[0] = effPlane[1] = effPlane[2] = true;
         if (inSketch) { bool none[3] = {false,false,false}; renderer.setPlanes(none, -1); }
         else if (st.sketchPlanePickActive && sketch != nullptr)
             // Plane-pick: the hovered plane (from last frame's overlay hit-test) gets the
             // emphasis brightening; the other two dim. One-frame lag is invisible.
             renderer.setPlanes(effPlane, sketch->planeHover());
+        else if (pmWantsPlane && sketch != nullptr)
+            // Same one-frame-lagged emphasis, driven by the PM plane picker's hover.
+            renderer.setPlanes(effPlane, sketch->pmPlaneHover());
         else          renderer.setPlanes(effPlane, st.planeEmphasis);
+
+        // Orbit-centre override: while sketching, orbit/frame around the SKETCH geometry centre (the
+        // body bbox doesn't include sketch entities, so an offset sketch would otherwise spin about
+        // the origin). Off elsewhere — center_ (the model bbox centre) is already correct.
+        {
+            Vec3 sc;
+            if (inSketch && sketch != nullptr && sketch->sketchOrbitCenter(sc))
+                renderer.setOrbitCenterOverride(true, sc);
+            else
+                renderer.setOrbitCenterOverride(false, Vec3{0, 0, 0});
+        }
+        // Emphasize the currently-selected datum (reference axis/plane/point) in the viewport.
+        renderer.setSelectedDatumId(st.selectedFeatureId);
         // C25 W2-D: advance any in-flight camera tween (presets / Normal-To / zoom-to-fit) before
         // rendering. Sketch mode hard-locks the camera, so cancel/skip the tween while sketching.
         if (inSketch) cancelCameraAnimation();
@@ -1372,6 +1503,19 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             std::vector<render::PickHit> selHits;
             selHits.reserve(st.selection.size());
             for (const auto& it : st.selection.items()) selHits.push_back(it.hit);
+            // Highlight EVERY pick in the active edge/face well (a fillet's whole edge set), not just
+            // the last-clicked one in st.selection — so the user can always see what's selected,
+            // including when the round preview breaks (radius too large / a stale pick). Stale ids
+            // after a successful rebuild just fail findEdge() and skip silently.
+            if (st.propertyManager && st.propertyManager->active()) {
+                std::vector<std::array<uint32_t, 3>> wellHl;
+                st.propertyManager->collectActiveWellHighlights(wellHl);
+                for (const auto& h : wellHl) {
+                    render::PickHit ph;
+                    ph.body_id = h[0]; ph.topo_id = h[1]; ph.kind = (render::PickKind)h[2];
+                    selHits.push_back(ph);
+                }
+            }
             st.overlays->draw(renderer.camera(), st.hover, selHits);
             renderer.endOverlay();
         }
@@ -1847,7 +1991,40 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
             }
         } else if (imgHovered && inSketch) {
-            // Sketch mode: wheel still zooms (camera orientation stays plane-locked, no pan).
+            // SolidWorks-style view navigation WHILE sketching: middle-drag orbits (unlatches the
+            // normal-to lock so the view sticks), Ctrl+MMB pans, Shift+MMB zooms, wheel zooms.
+            // Left-click stays for drawing entities. The sketch overlay reprojects from the live
+            // camera each frame, so a rotated view stays correct (entity picking included).
+            const bool ctrl = io.KeyCtrl, shift = io.KeyShift;
+            if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) &&
+                (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
+                cancelCameraAnimation();
+                if (ctrl) {
+                    // World-space pan (mirrors the !inSketch applyPan basis math).
+                    const float deg = 3.14159265f / 180.0f;
+                    const float fov = Renderer::kFovDeg * deg;
+                    float zc = st.zoom < 0.05f ? 0.05f : st.zoom;
+                    float dist = renderer.modelRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
+                    float worldPerPx = 2.0f * dist * std::tan(fov * 0.5f) / (float)(vh > 1 ? vh : 1);
+                    float yr = st.yaw * deg, pr = st.pitch * deg;
+                    Vec3 vdir(std::cos(pr) * std::sin(yr), -std::cos(pr) * std::cos(yr), std::sin(pr));
+                    Vec3 worldUp = (std::fabs(pr) > 89.0f * deg) ? Vec3(0, 1, 0) : Vec3(0, 0, 1);
+                    Vec3 V = normalize(vdir);
+                    Vec3 R = normalize(cross(worldUp, V));
+                    Vec3 U = normalize(cross(V, R));
+                    st.pan[0] += (-R.x * io.MouseDelta.x + U.x * io.MouseDelta.y) * worldPerPx;
+                    st.pan[1] += (-R.y * io.MouseDelta.x + U.y * io.MouseDelta.y) * worldPerPx;
+                    st.pan[2] += (-R.z * io.MouseDelta.x + U.z * io.MouseDelta.y) * worldPerPx;
+                } else if (shift) {
+                    st.zoom *= std::exp(-io.MouseDelta.y * 0.005f);
+                    st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10 ? 10 : st.zoom);
+                } else {
+                    st.yaw += io.MouseDelta.x * 0.4f;
+                    st.pitch += io.MouseDelta.y * 0.4f;
+                    st.pitch = st.pitch > 89 ? 89 : (st.pitch < -89 ? -89 : st.pitch);
+                    s_sketchRotated = true;   // stop forcing normal-to so the rotation sticks
+                }
+            }
             if (io.MouseWheel != 0) {
                 st.zoom *= (1.0f + io.MouseWheel * 0.1f);
                 st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10 ? 10 : st.zoom);
@@ -1914,16 +2091,57 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         if (sketch != nullptr && !inSketch && !st.sketchPlanePickActive)
             regionPickerHot = sketch->drawRegionPicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
+        // ---- datum-plane picker (ref-axis "Two Planes", ref-plane "Mid Plane", …) ----
+        // Runs when a feature PM with an active plane-accepting well is open. Returns true while the
+        // cursor is over an origin datum plane, so the model-pick click below is suppressed (the
+        // plane click routes a datum ref into the well instead). A click that is NOT over an origin
+        // plane still falls through to model picking, so the same well can also take a planar face.
+        bool planePickerHot = false;
+        if (sketch != nullptr && !inSketch && !st.sketchPlanePickActive)
+            planePickerHot = sketch->drawPlanePicker(st, io, vr0, vr1, vw, vh, imgHovered);
+
+        // ---- datum-axis picker (revolve "Axis", circular-pattern axis) ----
+        // Runs when a feature PM with an active axis-accepting well is open. Returns true while the
+        // cursor is over a displayed datum-axis line, so the model-pick click is suppressed (the
+        // axis click routes a datum ref into the well). A click off any axis still falls through to
+        // the id-buffer, so the same well can still take a straight model edge.
+        bool axisPickerHot = false;
+        if (sketch != nullptr && !inSketch && !st.sketchPlanePickActive && !planePickerHot)
+            axisPickerHot = sketch->drawAxisPicker(st, io, vr0, vr1, vw, vh, imgHovered);
+
+        // ---- general datum selection: click a displayed reference axis to select it ----
+        // Runs in the normal (non-sketch, no-PM-picker) flow so a datum axis is clickable like any
+        // other geometry. Returns true while the cursor is over a datum axis, suppressing the model
+        // pick below (a click off the axis still falls through to the id-buffer).
+        bool datumSelectHot = false;
+        if (sketch != nullptr && !inSketch && !st.sketchPlanePickActive &&
+            !planePickerHot && !axisPickerHot)
+            datumSelectHot = sketch->drawDatumSelect(st, io, vr0, vr1, vw, vh, imgHovered);
+
+        // ---- fillet/chamfer dashed old-edge overlay (deselect targets over the live round) ----
+        bool blendDeselectHot = false;
+        if (!inSketch && !st.sketchPlanePickActive && !planePickerHot && !axisPickerHot &&
+            !datumSelectHot)
+            blendDeselectHot = drawBlendEdgeOverlay(st, renderer, io, vr0, vr1, vw, vh, imgHovered);
+
         // ---- hover + click selection (once per frame; only while a doc mesh is loaded) ----
         // C25 W2-E: suppressed while the glass-box View Selector is up (it owns the click).
         // C37-C item 5: also suppressed while sketchPlanePickActive (the overlay owns the mouse).
         if (picking && !inSketch && !s_viewSelector.active() && !st.sketchPlanePickActive) {
             // Instant3D: while a push-pull OR dimension drag owns the mouse, freeze hover and swallow
             // the click so the press that grabbed the handle doesn't also re-select / clear.
-            if (imgHovered && !s_lmbDragActive && !regionPickerHot && !s_pp.active && !s_dim.active) {
+            if (imgHovered && !s_lmbDragActive && !regionPickerHot && !planePickerHot &&
+                !axisPickerHot && !datumSelectHot && !blendDeselectHot && !s_pp.active && !s_dim.active) {
                 int px = (int)(io.MousePos.x - vr0.x);
                 int py = (int)(io.MousePos.y - vr0.y);
-                st.hover = st.idPass->pickFinal(px, py, vw, vh);
+                // Fillet/chamfer "Edges" wells: snap to the nearest edge within a grab radius so the
+                // 1-px curved rims of a revolved/round body are clickable (they'd otherwise lose the
+                // centre pixel to the face behind). Same edge-priority trick the Convert tool uses.
+                const bool preferEdge = st.propertyManager && st.propertyManager->active() &&
+                                        st.propertyManager->activeWellPrefersEdge();
+                st.hover = preferEdge
+                    ? st.idPass->pickFinalPreferEdge(px, py, vw, vh, (int)(14.0f * ui::uiScale))
+                    : st.idPass->pickFinal(px, py, vw, vh);
             } else {
                 st.hover = render::PickHit{};
             }
@@ -1933,7 +2151,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // C51: a click consumed by the region picker never falls through to model selection.
             // Instant3D: a click that started a push-pull / dimension drag is NOT a selection.
             if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-                !s_lmbDragActive && !regionPickerHot && !s_pp.active && !s_dim.active) {
+                !s_lmbDragActive && !regionPickerHot && !planePickerHot && !axisPickerHot &&
+                !datumSelectHot && !blendDeselectHot && !s_pp.active && !s_dim.active) {
                 if (io.KeyCtrl) {
                     if (st.hover.valid()) st.selection.toggle(st.hover);
                 } else {
@@ -2785,9 +3004,6 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         }  // end overlay colors scope
     }
     ImGui::End();
-    // "+ New file" button to the RIGHT of the Viewport tab — amends the central dock node's tab bar,
-    // so it must run after the window's End() (it re-enters the host window/tab-bar scope).
-    drawViewportNewFileTab(st, vpDockNode);
     }
 }
 

@@ -95,6 +95,12 @@ OpsResponse DocMirror::parseOpsResponse(const nlohmann::json& result) {
         r.id_map = result["id_map"];   // C17: add-feature flows find their new id here
     if (result.contains("owner_map") && result["owner_map"].is_object())
         r.owner_map = result["owner_map"];  // W1-B (item 6): feature -> owned topology (optional)
+    // Datum reference geometry to draw (axes/planes/points/csys). Stored on the mirror here — the
+    // single chokepoint every ops-response flows through — so all mutation paths (apply/undo/redo/
+    // revert/push-pull/config) refresh it without each re-implementing the store. Absent (e.g.
+    // assembly responses / older engine) leaves the last value; reset() / doc switch clears it.
+    if (result.contains("datums") && result["datums"].is_array())
+        refDatums_ = result["datums"];
     r.ok = true;
     return r;
 }
@@ -383,6 +389,24 @@ std::string DocMirror::resolvePick(WorkerClient& w, uint32_t body_id,
     // selector is returned as a JSON object; serialize to string for storage in SelItem
     if (res.contains("selector")) return res["selector"].dump();
     return {};
+}
+
+std::vector<uint32_t> DocMirror::faceEdges(WorkerClient& w, uint32_t body_id, uint32_t face_topo_id) {
+    std::vector<uint32_t> out;
+    if (docId_.empty()) return out;
+    nlohmann::json res; std::string err;
+    nlohmann::json params = {
+        {"doc_id", docId_}, {"revision", revision_},
+        {"body_id", body_id}, {"topo_id", (int)face_topo_id}
+    };
+    if (!w.call("doc_face_edges", params, res, err)) return out;
+    if (res.contains("code")) {
+        if (jstr(res, "code") == "stale_revision") resyncTree(w);
+        return out;
+    }
+    if (res.contains("edges") && res["edges"].is_array())
+        for (const auto& e : res["edges"]) if (e.is_number_integer()) out.push_back(e.get<uint32_t>());
+    return out;
 }
 
 // C37-F: Checkpoint / revert helpers -----------------------------------------

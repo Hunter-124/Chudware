@@ -735,8 +735,10 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     Vec3 dir(std::cos(pitch) * std::sin(yaw), -std::cos(pitch) * std::cos(yaw), std::sin(pitch));
     float fov = kFovDeg * deg;
     float dist = sceneR / std::sin(fov * 0.5f) * 1.05f / std::max(0.05f, zoom);
-    // W2-D: pan shifts the orbit target (and therefore the eye) in world space.
-    Vec3 target = center_ + pan_;
+    // W2-D: pan shifts the orbit target (and therefore the eye) in world space. While a sketch is
+    // open, orbitOverride_ replaces the model-bbox centre with the sketch's geometric centre so the
+    // view orbits/frames around the sketch (which is not part of the body bbox), not the origin.
+    Vec3 target = (orbitOverride_ ? orbitCenter_ : center_) + pan_;
     Vec3 eye = target + dir * dist;
     Vec3 up(0, 0, 1);
     if (std::fabs(pitch) > 89.0f * deg) up = Vec3(0, 1, 0);  // avoid gimbal at top view
@@ -938,6 +940,8 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
 
     // ---- translucent reference planes (after the opaque pass so they test against geometry) ----
     drawReferencePlanes(mvp);
+    // Feature datum geometry (created axes / planes / points / csys) — same blended overlay pass.
+    drawRefDatums(mvp);
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     const auto renderT1 = std::chrono::steady_clock::now();
@@ -1275,6 +1279,114 @@ void Renderer::drawReferencePlanes(const Mat4& mvp) {
         glDrawArrays(GL_LINE_LOOP, 0, 4);
     }
 
+    glBindVertexArray(0);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+}
+
+// Feature reference geometry: datum axes (lines), planes (quads), points (markers), and coordinate
+// systems (3 axes). These build no body, so the engine ships their geometry out-of-band (setRefDatums
+// from doc_mirror::refDatums). Reuses the flat uMVP+uColor plane shader. Datums read against the depth
+// buffer but don't occlude (depthMask off), the same as the origin planes, so they sit visibly over
+// the model without z-fighting it away. Amber/green keeps them distinct from the blue origin planes.
+void Renderer::drawRefDatums(const Mat4& mvp) {
+    if (refDatums_.empty() || planeProg_ == 0) return;
+    const float e = (radius_ > 0.0f) ? radius_ : kEmptySceneRadius;
+
+    glUseProgram(planeProg_);
+    glUniformMatrix4fv(glGetUniformLocation(planeProg_, "uMVP"), 1, GL_FALSE, mvp.m);
+    GLint colLoc = glGetUniformLocation(planeProg_, "uColor");
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
+    glBindVertexArray(planeVao_);
+
+    auto upload = [&](const float* data, int floats) {
+        glBindBuffer(GL_ARRAY_BUFFER, planeVbo_);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(floats * sizeof(float)), data);
+    };
+    auto setCol = [&](float r, float g, float b, float a) { glUniform4f(colLoc, r, g, b, a); };
+
+    // Amber datum line (axis), green-ish datum plane, white point marker, RGB csys triad.
+    const float L = e * 1.6f;     // half-length of an axis line
+    const float ps = e * 0.55f;   // half-extent of a datum-plane quad (smaller than origin planes)
+    const float ms = e * 0.04f;   // half-size of a point marker cross
+    const float cs = e * 0.35f;   // csys axis length
+
+    for (const auto& d : refDatums_) {
+        const bool selected = !selectedDatumId_.empty() && d.id == selectedDatumId_;
+        switch (d.kind) {
+            case RefDatum::Kind::Axis: {
+                // Thick DASHED amber line (brighter + thicker when selected). The dashes are split on
+                // the CPU into cells and every other cell drawn, since core-profile GL has no line
+                // stipple. Endpoints match the axis picker's hit-test (L = radius*1.6).
+                Vec3 A = d.origin - d.dir * L, B = d.origin + d.dir * L;
+                Vec3 AB = B - A;
+                const int cells = 40;   // 20 visible dashes
+                glLineWidth(selected ? 4.5f : 3.0f);
+                if (selected) setCol(1.0f, 0.72f, 0.20f, 1.0f);
+                else          setCol(0.88f, 0.56f, 0.14f, 0.95f);
+                for (int i = 0; i < cells; i += 2) {
+                    float t0 = (float)i / cells, t1 = (float)(i + 1) / cells;
+                    Vec3 p0 = A + AB * t0, p1 = A + AB * t1;
+                    float seg[6] = {p0.x, p0.y, p0.z, p1.x, p1.y, p1.z};
+                    upload(seg, 6);
+                    glDrawArrays(GL_LINES, 0, 2);
+                }
+                break;
+            }
+            case RefDatum::Kind::Plane: {
+                static const float uv[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
+                Vec3 c[4];
+                for (int i = 0; i < 4; ++i)
+                    c[i] = d.origin + d.xdir * (uv[i][0] * ps) + d.ydir * (uv[i][1] * ps);
+                float tri[18] = {
+                    c[0].x,c[0].y,c[0].z, c[1].x,c[1].y,c[1].z, c[2].x,c[2].y,c[2].z,
+                    c[0].x,c[0].y,c[0].z, c[2].x,c[2].y,c[2].z, c[3].x,c[3].y,c[3].z};
+                upload(tri, 18);
+                setCol(0.36f, 0.74f, 0.42f, 0.16f);
+                glDrawArrays(GL_TRIANGLES, 0, 6);
+                float loop[12] = {c[0].x,c[0].y,c[0].z, c[1].x,c[1].y,c[1].z,
+                                  c[2].x,c[2].y,c[2].z, c[3].x,c[3].y,c[3].z};
+                upload(loop, 12);
+                if (selected) setCol(0.40f, 0.90f, 0.50f, 1.0f);
+                else          setCol(0.30f, 0.62f, 0.34f, 0.85f);
+                glLineWidth(selected ? 2.5f : 1.5f);
+                glDrawArrays(GL_LINE_LOOP, 0, 4);
+                break;
+            }
+            case RefDatum::Kind::Point: {
+                // A 3-axis cross marker centered on the point.
+                Vec3 o = d.origin;
+                float cross[18] = {
+                    o.x - ms,o.y,o.z, o.x + ms,o.y,o.z,
+                    o.x,o.y - ms,o.z, o.x,o.y + ms,o.z,
+                    o.x,o.y,o.z - ms, o.x,o.y,o.z + ms};
+                upload(cross, 18);
+                if (selected) setCol(1.0f, 0.95f, 0.45f, 1.0f);
+                else          setCol(0.95f, 0.85f, 0.30f, 0.95f);
+                glLineWidth(selected ? 3.0f : 2.0f);
+                glDrawArrays(GL_LINES, 0, 6);
+                break;
+            }
+            case RefDatum::Kind::Csys: {
+                // Three axes from the origin: X=xdir (red), Y=ydir (green), Z=normal (blue).
+                Vec3 o = d.origin, x = o + d.xdir * cs, y = o + d.ydir * cs, z = o + d.dir * cs;
+                glLineWidth(2.0f);
+                float ax[6] = {o.x,o.y,o.z, x.x,x.y,x.z};
+                upload(ax, 6); setCol(0.90f, 0.25f, 0.25f, 0.95f); glDrawArrays(GL_LINES, 0, 2);
+                float ay[6] = {o.x,o.y,o.z, y.x,y.y,y.z};
+                upload(ay, 6); setCol(0.25f, 0.80f, 0.30f, 0.95f); glDrawArrays(GL_LINES, 0, 2);
+                float az[6] = {o.x,o.y,o.z, z.x,z.y,z.z};
+                upload(az, 6); setCol(0.30f, 0.45f, 0.95f, 0.95f); glDrawArrays(GL_LINES, 0, 2);
+                break;
+            }
+        }
+    }
+
+    glLineWidth(1.0f);
     glBindVertexArray(0);
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);

@@ -89,7 +89,7 @@ static void setBodyShown(AppState& st, int slot, bool shown) {
 // "paused" marker, never the red "!". Pass rolledBack=true for those rows.
 static void featureBadge(bool ok, bool hasError, const std::string& errText,
                          const std::vector<std::string>& danglingRefs,
-                         bool rolledBack = false) {
+                         bool rolledBack = false, const std::string& warnText = "") {
     if (rolledBack) {
         // Muted hollow ring — "not currently built" (distinct from ok/error/dangling).
         ImGui::SameLine();
@@ -102,7 +102,16 @@ static void featureBadge(bool ok, bool hasError, const std::string& errText,
             ImGui::SetTooltip("Rolled back (after the rollback bar — not built)");
         return;
     }
-    if (ok && danglingRefs.empty()) {
+    if (ok && danglingRefs.empty() && !warnText.empty()) {
+        // Built, but with a non-fatal note (e.g. fillet rounded a subset of edges) — amber "!".
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1],
+                   ui::palette.statusWarn[2], ui::palette.statusWarn[3]));
+        ImGui::TextUnformatted("!");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", warnText.c_str());
+    } else if (ok && danglingRefs.empty()) {
         // Green check (just a color dot for compactness)
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text,
@@ -441,6 +450,7 @@ void featureTreeResetTransient() {
 struct FStatus {
     bool ok = true;
     std::string error;
+    std::string warning;         // non-fatal note on an ok feature (e.g. fillet rounded a subset)
     std::vector<std::string> dangling;
     bool   rolledBack = false;   // C37-E: feature sits after the rollback bar (not built, not error)
     double ms = -1.0;            // C37-E: last compile time (ms); <0 = unknown
@@ -453,6 +463,8 @@ static FStatus parseStatusRow(const nlohmann::json& s) {
     fs.ms = jftnum(s, "ms", -1.0);
     auto it = s.find("error");
     if (it != s.end() && it->is_string()) fs.error = it->get<std::string>();
+    auto wt = s.find("warning");
+    if (wt != s.end() && wt->is_string()) fs.warning = wt->get<std::string>();
     auto dr = s.find("dangling_refs");
     if (dr != s.end() && dr->is_array())
         for (const auto& d : *dr)
@@ -875,12 +887,27 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
 // C24: every type maps to an atlas name that actually exists (see host/assets/icons/atlas.json),
 // so the FeatureManager shows a per-type glyph and the old 'datum_plane'/'feature' unknown-icon
 // warnings are gone.
-static const char* featureIcon(const std::string& type) {
+static bool featureModeIsCut(const nlohmann::json* feature) {
+    if (!feature || !feature->is_object()) return false;
+    auto pIt = feature->find("params");
+    if (pIt == feature->end() || !pIt->is_object()) return false;
+    auto mIt = pIt->find("mode");
+    if (mIt != pIt->end() && mIt->is_string())
+        return mIt->get<std::string>() == "cut";
+    auto opIt = pIt->find("operation");
+    if (opIt != pIt->end() && opIt->is_string()) {
+        std::string op = opIt->get<std::string>();
+        return op == "cut" || op == "subtract";
+    }
+    return false;
+}
+
+static const char* featureIcon(const std::string& type, const nlohmann::json* feature = nullptr) {
     if (type == "sketch")           return "sketch_node";
-    if (type == "extrude")          return "extrude_boss";
-    if (type == "revolve")          return "revolve_boss";
-    if (type == "sweep")            return "sweep";
-    if (type == "loft")             return "loft";
+    if (type == "extrude")          return featureModeIsCut(feature) ? "extrude_cut" : "extrude_boss";
+    if (type == "revolve")          return featureModeIsCut(feature) ? "revolve_cut" : "revolve_boss";
+    if (type == "sweep")            return featureModeIsCut(feature) ? "sweep_cut" : "sweep";
+    if (type == "loft")             return featureModeIsCut(feature) ? "loft_cut" : "loft";
     if (type == "fillet")           return "fillet";
     if (type == "chamfer")          return "chamfer";
     if (type == "shell")            return "shell";
@@ -890,15 +917,17 @@ static const char* featureIcon(const std::string& type) {
     if (type == "linear_pattern")   return "linear_pattern";
     if (type == "circular_pattern") return "circular_pattern";
     if (type == "mirror")           return "mirror";
-    if (type == "plane" || type == "datum_plane") return "plane";
-    if (type == "axis")             return "axis";
-    if (type == "point")            return "point";
+    if (type == "plane" || type == "datum_plane") return "ref_plane";
+    if (type == "axis")             return "ref_axis";
+    if (type == "point")            return "ref_point";
     if (type == "import")           return "open";
     if (type == "script")           return "history";
     // Primitives (box/cylinder/sphere/cone/torus) and anything else: the generic part glyph.
-    if (type == "box" || type == "cylinder" || type == "sphere" ||
-        type == "cone" || type == "torus")
-        return "part";
+    if (type == "box")              return "box_feature";
+    if (type == "cylinder")         return "cylinder_feature";
+    if (type == "sphere")           return "sphere_feature";
+    if (type == "cone")             return "cone_feature";
+    if (type == "torus")            return "torus_feature";
     return "part";
 }
 static const char* featureFallback(const std::string& type) {
@@ -971,7 +1000,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             ImGuiTreeNodeFlags lf = ImGuiTreeNodeFlags_Leaf |
                 ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanFullWidth;
             ImGui::TreeNodeEx((label + "##comp_" + cid).c_str(), lf);
-            featureBadge(fs.ok, !fs.error.empty(), fs.error, fs.dangling);
+            featureBadge(fs.ok, !fs.error.empty(), fs.error, fs.dangling, false, fs.warning);
             ++ci;
         }
     }
@@ -1184,6 +1213,9 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
             st.docTabs[st.activeTab].path = path;
             st.docTabs[st.activeTab].dirty = false;
         }
+        // A real file is now open — discard the blank launch "starter" example if it's still
+        // pristine (the user opened instead of modeling in it). Keeps the just-opened tab.
+        st.dropBlankStarterTabs(st.activeTab);
     }
     st.addLog("[doc] opened: " + path + "  rev=" + std::to_string(st.docMirror.revision()));
     st.toast(ui::ToastLevel::Info, "Opened " + pathBaseName(path));
@@ -1940,7 +1972,7 @@ void drawFeatureTreeBody(AppState& st,
 
                         RowCtx ctx;
                         ctx.fid = fid; ctx.name = fname; ctx.type = ftype;
-                        ctx.iconName = featureIcon(ftype);
+                        ctx.iconName = featureIcon(ftype, &f);
                         ctx.iconFallback = featureFallback(ftype);
                         ctx.suppressed = suppressed; ctx.selected = sel;
                         ctx.rolledBack = rolledBack; ctx.fs = fs;

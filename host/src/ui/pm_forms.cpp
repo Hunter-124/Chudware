@@ -125,6 +125,16 @@ static const PMSelKinds K_FEV    {true,  true,  true };   // face/edge/vertex (d
 static const PMSelKinds K_FACEEDGE {true, true,  false};  // face or edge (datum plane hinge / midplane #2)
 static const PMSelKinds K_FACEVERT {true, false, true};   // face or vertex (datum axis b)
 static const PMSelKinds K_BODY   {false, false, false, true};  // solid body (boolean targets/tools)
+// Planar reference: an origin datum plane (clicked in the viewport via the plane picker) OR a
+// planar model face (id-buffer pick). face=true routes a planar face through the normal pick path;
+// plane=true arms SketchMode::drawPlanePicker so the 3 origin planes become clickable. Used for the
+// datum-axis "Two Planes" refs and the datum-plane "Mid Plane" second reference.
+static const PMSelKinds K_PLANE  {true, false, false, false, true};
+// Axis reference: a straight model edge (id-buffer pick) OR a created datum AXIS (clicked in the
+// viewport via the axis picker, routed as a {kind:datum,feature} ref). edge=true keeps model-edge
+// picking; axis=true arms SketchMode::drawAxisPicker. Used for revolve / circular-pattern axes.
+static const PMSelKinds K_EDGEAXIS     {false, true, false, false, false, true};  // edge or datum axis
+static const PMSelKinds K_FACEEDGEAXIS {true,  true, false, false, false, true};  // face/edge or datum axis
 
 // ----------------------------------------------------------------------------
 // The forms. Field order == feature_params.md order == PM tab order.
@@ -205,7 +215,7 @@ static const std::vector<PMFormDef>& forms() {
         //   force dir2 on); Thin Feature (thin/thin_thickness/thin_side inside|outside|both).
         { "revolve", "Revolve", "revolve_boss", {
             Well   ("profile",  "Profile",        "From",        K_FACE, true),
-            Well   ("axis",     "Axis",           "From",        K_EDGE, false),
+            Well   ("axis",     "Axis",           "From",        K_EDGEAXIS, false),
             ComboL ("mode",     "Type",           "Direction 1", "boss|cut", "Boss|Cut"),
             ComboL ("end",      "End Condition",  "Direction 1",
                     "one_direction|mid_plane|up_to_surface",
@@ -383,7 +393,7 @@ static const std::vector<PMFormDef>& forms() {
         { "circular_pattern", "Circular Pattern", "circular_pattern", {
             DatumRef ("axis",     "Pattern Axis", "Parameters",
                       "axis.z|axis.x|axis.y", "Z axis|X axis|Y axis"),
-            Well     ("axis",     "…or pick edge/cyl face", "Parameters", K_FACEEDGE, false),
+            Well     ("axis",     "…or pick edge/cyl face/datum axis", "Parameters", K_FACEEDGEAXIS, false),
             Int      ("count",    "Instances",    "Parameters", 4),
             Angle    ("angle",    "Angle",        "Parameters", 360.0),
             Check    ("equal_spacing", "Equal spacing", "Parameters", true),
@@ -432,21 +442,33 @@ static const std::vector<PMFormDef>& forms() {
                       "plane.top|plane.front|plane.right", "Top plane|Front plane|Right plane"),
             DimIf    ("offset", "Offset Distance", "Parameters", 10.0, "method", "offset"),
             AngleIf  ("angle",  "Angle",           "Parameters", 45.0, "method", "angle"),
-            WellIf   ("second", "Hinge / 2nd Plane","Second Reference", K_FACEEDGE, false,
-                      "method", "angle|midplane"),
+            WellIf   ("second", "Hinge (edge/axis)","Second Reference", K_FACEEDGE, false,
+                      "method", "angle"),
+            WellIf   ("second", "Second Plane",     "Second Reference", K_PLANE, false,
+                      "method", "midplane"),
             WellIf   ("points", "Three Vertices",  "Points", K_VERTEX, true,
                       "method", "three_point"),
             Check    ("flip",   "Flip",            "Parameters", false),
         }},
         // --- ref_axis (datum) --- engine datum.py compile_axis. a = the primary reference (cyl
         //   face / edge / vertex); b = the second vertex (two_points) or plane (plane_intersect).
+        // ref_axis wells are method-gated (duplicate keys; buildOpFeature emits only the visible
+        //   one): cylinder/edge/two_points resolve a face/edge/vertex selector; plane_intersect
+        //   takes two PLANAR references (origin datum planes — clickable via the plane picker — or
+        //   planar faces). The engine's compile_axis plane_intersect already accepts a datum-plane
+        //   ref string for refs.a / refs.b (datum.py _plane_of).
         { "axis", "Axis", "ref_axis", {
             ComboL ("method", "Type",        "Reference",
                     "cylinder|two_points|edge|plane_intersect",
                     "Cylindrical Face|Two Points|Edge|Two Planes"),
-            Well   ("a",      "Reference 1", "Reference", K_FEV, false),
+            WellIf ("a",      "Reference 1", "Reference", K_FEV,   false,
+                    "method", "cylinder|two_points|edge"),
+            WellIf ("a",      "Plane 1",     "Reference", K_PLANE, false,
+                    "method", "plane_intersect"),
             WellIf ("b",      "Reference 2", "Reference", K_FACEVERT, false,
-                    "method", "two_points|plane_intersect"),
+                    "method", "two_points"),
+            WellIf ("b",      "Plane 2",     "Reference", K_PLANE, false,
+                    "method", "plane_intersect"),
         }},
         // --- ref_point (datum) --- engine datum.py compile_point. vertex/arc-center/on-face.
         { "point", "Point", "ref_point", {

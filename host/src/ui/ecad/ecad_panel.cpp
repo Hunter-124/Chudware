@@ -1,7 +1,9 @@
 // AI-ECAD UI scaffold (Wave D) — NOT yet build-verified; see docs/ECAD_UI_INTEGRATION.md
 #include "imgui.h"
+#include "imgui_internal.h"   // GetWindowDockNode + NoTabBar for the shared central-node doc tabs
 
 #include "ecad_panel.h"
+#include "../doc_tabs.h"      // document tabs share the central node with the Viewport (see below)
 
 #include <algorithm>
 #include <cmath>
@@ -17,6 +19,16 @@
 #include "ecad_mirror.h"
 
 namespace ui {
+
+// The document tab strip is shared across every window docked in the central node (Viewport 3D /
+// drawing sheet / this ECAD editor). When ECAD is the forward window the Viewport's Begin returns
+// false, so the ECAD editor hides the node's own tab bar and paints the doc tabs inline itself —
+// exactly like the Viewport panel does (see viewport_panel.cpp's vpDockStripDraw).
+static void ecadDockStripDraw(AppState& st) {
+    ImGuiDockNode* node = ImGui::GetWindowDockNode();
+    if (node) node->LocalFlags |= ImGuiDockNodeFlags_NoTabBar;   // never show the redundant window tab
+    if (ui::docTabStripHeight(st) > 0.0f) ui::drawDocTabs(st, ImGui::GetContentRegionAvail().x);
+}
 
 // Per-document ECAD editor state. Wave 2 (GUI rework) promoted this OFF the file-static singleton:
 // the per-document fields (mirror, canvas, selection, edit buffers) now live on each Schematic/PCB
@@ -856,6 +868,7 @@ void drawEcadEditor(AppState& st) {
     prevHadDoc = hasDocNow;
 
     if (!ImGui::Begin("ECAD")) { ImGui::End(); return; }
+    ecadDockStripDraw(st);   // hide window tab + paint the doc tabs above the ECAD canvas
 
     if (!es.mirror.hasDoc()) {
         // Launchpad: describe a circuit -> the AI designs a verified schematic. (Blank docs come

@@ -84,7 +84,7 @@ static void ribbon_seedDefaults() {
 
 // Ribbon geometry constants (logical pixels at 1x — always multiply by ui::uiScale)
 static constexpr float kTabH        = 28.0f;
-static constexpr float kBigIconSz   = 32.0f;
+static constexpr float kBigIconSz   = 36.0f;
 static constexpr float kSmIconSz    = 20.0f;
 static constexpr float kBigBtnW     = 52.0f;
 static constexpr float kBigBtnMaxW  = 96.0f;
@@ -95,6 +95,12 @@ static constexpr float kCaptionH    = 22.0f;
 static constexpr float kSmRowH      = 22.0f;
 static constexpr float kArrowW      = 12.0f;
 static constexpr float kDropArrowW  = 14.0f;
+
+static const char* ribbon_displayLabel(const char* cmd_id, const char* label) {
+    // The Features-tab sketch entry is intentionally icon-only; the tooltip keeps the full name.
+    if (cmd_id && std::strcmp(cmd_id, "sketch_new") == 0) return "";
+    return label ? label : "";
+}
 
 // C25-W3G: collapse levels for priority degradation
 enum CollapseLevel {
@@ -128,11 +134,12 @@ static float ribbon_wrapLabel(const char* label, std::string& l1, std::string& l
 // §2.1: ribbon_wrapLabel returns a CalcTextSize result (already screen-px / DPI-scaled), so the
 // label width is computed entirely in screen px (kBigLblPad scaled once) and clamped against the
 // screen-px min/max bounds. Mixing the screen-px text with *s once would double-scale the label.
-static float ribbon_bigBtnW(const char* label, bool hasDrop) {
+static float ribbon_bigBtnW(const char* cmd_id, const char* label, bool hasDrop) {
     float s = ui::uiScale;
     std::string l1, l2;
-    float lblWScreen = ribbon_wrapLabel(label, l1, l2) + kBigLblPad * 2.0f * s;
-    float base = kBigBtnW * s;
+    const char* visibleLabel = ribbon_displayLabel(cmd_id, label);
+    float lblWScreen = ribbon_wrapLabel(visibleLabel, l1, l2) + kBigLblPad * 2.0f * s;
+    float base = (visibleLabel[0] == '\0' ? 46.0f : kBigBtnW) * s;
     if (lblWScreen > base) base = lblWScreen;
     if (base > kBigBtnMaxW * s) base = kBigBtnMaxW * s;
     return base + (hasDrop ? kDropArrowW * s : 0.0f);
@@ -264,7 +271,7 @@ static float ribbon_groupNaturalW(const RibbonGroup& grp, CollapseLevel level) {
         float bigColW = 0.0f;
         for (const auto* cmd : grp.bigCmds) {
             bool drop = ribbon_hasSubs(grp, cmd);
-            bigColW += ribbon_bigBtnW(cmd->label, drop) + 2.0f * s;
+            bigColW += ribbon_bigBtnW(cmd->cmd_id, cmd->label, drop) + 2.0f * s;
         }
         float smW = ribbon_smZoneW(grp, {});
         content = kGroupPadX * s + bigColW
@@ -412,7 +419,7 @@ static void ribbon_tooltip(const char* title, const char* cmd_id, bool enabled) 
 static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
                            const char* label, bool enabled, bool hasDrop) {
     float s   = ui::uiScale;
-    float bw  = ribbon_bigBtnW(label, hasDrop);
+    float bw  = ribbon_bigBtnW(cmd_id, label, hasDrop);
     float bh  = (kBodyH - kCaptionH) * s;
 
     ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -455,12 +462,6 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
                               ui::metrics::ribbonBtnRound());
         }
         {
-            float lx = p0.x + mainW;
-            float inset = ui::metrics::ribbonSplitInset();
-            dl->AddLine(ImVec2(lx, p0.y + inset), ImVec2(lx, p0.y + bh - inset),
-                        ui::Palette::toU32(ui::palette.border), ui::metrics::stroke(1.0f));
-        }
-        {
             float ax = p0.x + mainW + kArrowW * s * 0.5f;
             float ay = p0.y + bh - 10.0f * s;
             ImU32 aCol = enabled ? ui::Palette::toU32(ui::palette.text)
@@ -489,7 +490,10 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         ImDrawList* dl = ImGui::GetWindowDrawList();
         float iconSz = snap(kBigIconSz * s);
         float cx     = snap(p0.x + mainW * 0.5f);
+        const char* visibleLabel = ribbon_displayLabel(cmd_id, label);
         float iy     = snap(p0.y + 4.0f * s);
+        if (visibleLabel[0] == '\0')
+            iy = snap(p0.y + (bh - iconSz) * 0.5f - 1.0f * s);
 
         ui::IconUV ic = ui::getIcon(iconName, 32);
         ImU32 tint = enabled ? IM_COL32(255,255,255,255) : IM_COL32(128,128,128,160);
@@ -499,13 +503,13 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
                      ic.uv0, ic.uv1, tint);
 
         std::string l1, l2;
-        ribbon_wrapLabel(label, l1, l2);
+        ribbon_wrapLabel(visibleLabel, l1, l2);
         ImU32 tCol = enabled ? ui::Palette::toU32(ui::palette.text)
                              : ui::Palette::toU32(ui::palette.textDisabled);
         float lineH = ImGui::GetTextLineHeight();
         float ty    = iy + iconSz + 2.0f * s;
         dl->PushClipRect(ImVec2(p0.x, p0.y), ImVec2(p0.x + mainW, p0.y + bh), true);
-        {
+        if (visibleLabel[0] != '\0') {
             ImVec2 t1 = ImGui::CalcTextSize(l1.c_str());
             dl->AddText(nullptr, 0.0f, ImVec2(cx - t1.x * 0.5f, ty), tCol, l1.c_str());
             if (!l2.empty()) {
@@ -592,12 +596,6 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
             dl->AddRectFilled(p0, ImVec2(p0.x + totalW, p0.y + rowH),
                               ui::Palette::toU32(ui::palette.buttonHovered),
                               ui::metrics::ribbonBtnRound());
-        {
-            float lx = p0.x + mainW;
-            float inset = ui::metrics::ribbonSmSplitInset();
-            dl->AddLine(ImVec2(lx, p0.y + inset), ImVec2(lx, p0.y + rowH - inset),
-                        ui::Palette::toU32(ui::palette.border), ui::metrics::stroke(1.0f));
-        }
         {
             float ax = p0.x + mainW + kDropArrowW * s * 0.5f;
             float ay = p0.y + rowH * 0.5f;
@@ -1095,7 +1093,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 resolveFace(cmd, drop, showIcon, showLabel);
                 ribbon_bigBtn(cmd->cmd_id, showIcon, showLabel, !cmd->stretch, drop);
                 if (drop) runFlyout(cmd);
-                bx += ribbon_bigBtnW(cmd->label, drop) + 2.0f * s;
+                bx += ribbon_bigBtnW(cmd->cmd_id, cmd->label, drop) + 2.0f * s;
             }
 
             // small zone: pack into independently-measured columns (defect 1)
@@ -1156,11 +1154,17 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         {
             ImVec2 cwinPos = ImGui::GetWindowPos();
             float  sepX    = snap(cwinPos.x + curX + grpW - kGroupPadX * s * 0.5f);
-            ImU32  sepCol  = Palette::toU32(palette.border);
+            ImVec4 sepMain(palette.border[0], palette.border[1], palette.border[2], 0.92f);
+            ImVec4 sepHi(palette.accent[0], palette.accent[1], palette.accent[2], 0.24f);
+            ImU32  sepCol  = ImGui::ColorConvertFloat4ToU32(sepMain);
+            ImU32  sepHiCol = ImGui::ColorConvertFloat4ToU32(sepHi);
             float  sepInset = ui::metrics::ribbonSplitInset();
+            dl->AddLine(ImVec2(sepX + ui::metrics::px(1.0f), cwinPos.y + sepInset + ui::metrics::px(4.0f)),
+                        ImVec2(sepX + ui::metrics::px(1.0f), cwinPos.y + bodyH2 - sepInset - ui::metrics::px(4.0f)),
+                        sepHiCol, ui::metrics::stroke(1.0f));
             dl->AddLine(ImVec2(sepX, cwinPos.y + sepInset),
                         ImVec2(sepX, cwinPos.y + bodyH2 - sepInset), sepCol,
-                        ui::metrics::stroke(1.0f));
+                        ui::metrics::stroke(1.25f));
 
             // Defect 2: centered caption. grpW already includes a caption-width floor, so labels
             // such as "Dimension" never truncate at COL_BIG/COL_SMALL. The clip rect is a safety

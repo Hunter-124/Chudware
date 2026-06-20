@@ -256,7 +256,7 @@ void AppState::addLog(const std::string& s) {
     // when diagnosing interaction bugs (and stdout is lost for a windowed exe).
     static FILE* tee = [] {
         const char* p = std::getenv("AI_CAD_LOG_FILE");
-        return p && *p ? std::fopen(p, "a") : nullptr;
+        return (p && *p) ? std::fopen(p, "a") : nullptr;
     }();
     if (tee) { std::fputs(s.c_str(), tee); std::fputc('\n', tee); std::fflush(tee); }
 }
@@ -457,10 +457,30 @@ static Mesh meshFromBody(const render::BodyMesh& b) {
     return m;
 }
 
-bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err) {
+bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool renderOnly) {
     if (!renderer || !idPass || !overlays) { err = "render objects not initialized"; return false; }
     render::DocMesh doc;
     if (!render::loadAicmFile(aicmPath, doc, err)) return false;
+    if (renderOnly) {
+        // Render-only (blend live preview): replace ONLY the shaded meshes; leave the id-pass,
+        // overlays, pick caches, selection and hasDocMesh as the base-body load left them, so picks
+        // and highlights keep resolving against the un-rounded base while the user sees the round.
+        std::vector<Renderer::PartMesh> rpms;
+        for (const auto& b : doc.bodies) {
+            if (b.pos.empty()) continue;
+            Renderer::PartMesh pm;
+            pm.mesh = meshFromBody(b);
+            pm.color[0] = b.color[0]; pm.color[1] = b.color[1]; pm.color[2] = b.color[2];
+            pm.metallic = b.metallic; pm.roughness = b.roughness;
+            pm.body_id = b.body_id;
+            pm.faces.reserve(b.faces.size());
+            for (const auto& fr : b.faces)
+                pm.faces.push_back({fr.face_id, fr.first_tri, fr.tri_count});
+            rpms.push_back(std::move(pm));
+        }
+        renderer->setMeshes(rpms);
+        return true;
+    }
     if (doc.bodies.empty()) {
         // C48: a rebuild can legitimately produce ZERO bodies — every solid feature rolled
         // back (rollback bar), suppressed, or deleted, or a sketch-only document. That is an

@@ -2,6 +2,7 @@
 
 #include <glad/gl.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -325,6 +326,58 @@ PickHit IdPass::pickFinal(int px, int py, int finalW, int finalH) {
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     return decodeId(id);
+}
+
+PickHit IdPass::pickFinalPreferEdge(int px, int py, int finalW, int finalH, int radiusPx) {
+    PickHit center = pickFinal(px, py, finalW, finalH);
+    // A vertex/edge already under the cursor wins outright (it's exactly what was asked for).
+    if (center.kind == PickKind::Edge || center.kind == PickKind::Vertex) return center;
+    if (!built_ || finalW <= 0 || finalH <= 0 || radiusPx <= 0) return center;
+    if (px < 0 || py < 0 || px >= finalW || py >= finalH) return center;
+
+    // Map the cursor + search radius into supersampled (GL bottom-left) space and read one block.
+    float sx = (px + 0.5f) * (float)w_ / (float)finalW;
+    float sy = (py + 0.5f) * (float)h_ / (float)finalH;
+    int cx = (int)sx;
+    int cy = h_ - 1 - (int)sy;  // GL origin
+    int rss = (int)std::ceil((float)radiusPx * (float)w_ / (float)finalW);
+    if (rss < 1) rss = 1;
+    int x0 = cx - rss, y0 = cy - rss;
+    int x1 = cx + rss, y1 = cy + rss;
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 >= w_) x1 = w_ - 1; if (y1 >= h_) y1 = h_ - 1;
+    int bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+    if (bw <= 0 || bh <= 0) return center;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    std::vector<uint32_t> block((size_t)bw * bh, 0u);
+    if (rgba8_) {
+        std::vector<unsigned char> rgba((size_t)bw * bh * 4, 0);
+        glReadPixels(x0, y0, bw, bh, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        for (size_t i = 0; i < block.size(); ++i)
+            block[i] = (uint32_t)rgba[i * 4] | ((uint32_t)rgba[i * 4 + 1] << 8) |
+                       ((uint32_t)rgba[i * 4 + 2] << 16) | ((uint32_t)rgba[i * 4 + 3] << 24);
+    } else {
+        glReadPixels(x0, y0, bw, bh, GL_RED_INTEGER, GL_UNSIGNED_INT, block.data());
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // Nearest EDGE/VERTEX pixel to the cursor, within the (circular) radius, skipping hidden bodies.
+    long bestD2 = (long)rss * rss + 1;
+    PickHit best;
+    for (int j = 0; j < bh; ++j) {
+        for (int i = 0; i < bw; ++i) {
+            uint32_t v = block[(size_t)j * bw + i];
+            if (v == 0 || bodyHidden(v)) continue;
+            PickKind k = PickKind((v >> 22) & 0x3u);
+            if (k != PickKind::Edge && k != PickKind::Vertex) continue;
+            long dx = (long)(x0 + i) - cx, dy = (long)(y0 + j) - cy;
+            long d2 = dx * dx + dy * dy;
+            if (d2 < bestD2) { bestD2 = d2; best = decodeId(v); }
+        }
+    }
+    return best.valid() ? best : center;
 }
 
 }  // namespace render

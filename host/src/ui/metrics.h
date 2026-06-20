@@ -84,6 +84,17 @@ inline float ribbonBtnRound()    { return rounding(3.0f); }  // button + tab fil
 inline float ribbonSplitInset()  { return px(4.0f); }        // big-button split divider inset
 inline float ribbonSmSplitInset(){ return px(2.0f); }        // small-button + tab underline inset
 
+// ---- AI Copilot pane (legacy_chat.cpp) --------------------------------------------------------
+inline float copilotBtnH()        { return px(32.0f); }   // primary send / build button height
+inline int   copilotInputMaxLines(){ return 6; }          // prompt box grows to N lines, then scrolls
+inline float copilotChipPadX()    { return px(8.0f); }    // mode-pill / chip horizontal padding
+inline float copilotChipPadY()    { return px(4.0f); }    // mode-pill / chip vertical padding
+inline float copilotThumbW()      { return px(220.0f); }  // iteration contact-sheet thumbnail width
+inline float copilotCodeH()       { return px(140.0f); }  // build123d code editor height
+inline float copilotConsoleH()    { return px(160.0f); }  // folded Console body height
+inline float copilotProseMaxH()   { return px(150.0f); }  // thoughts / prose scroll cap
+inline float copilotDiffMaxH()    { return px(220.0f); }  // diff / code view scroll cap
+
 // ---- sketch canvas glyphs (sketch_mode.cpp, screen-px draw-list art) --------------------------
 inline float sketchHandleR()    { return px(3.0f); }    // entity endpoint / handle dot radius
 inline float sketchHoverRingR() { return px(6.0f); }    // hover highlight ring radius

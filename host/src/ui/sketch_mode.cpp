@@ -605,6 +605,52 @@ void SketchMode::addEntity(AppState& st, const nlohmann::json& entity,
     resolve(st);
 }
 
+// Shared snap->constraint translation (see header). The Line tool keeps its own inline variant
+// because it also threads tangent emission through a per-segment flag; every other tool routes its
+// center/endpoint snaps through here so a snapped placement leaves a real relation behind.
+void SketchMode::pushSnapConstraint(const std::string& snap, const std::string& pt,
+                                    nlohmann::json& cs) const {
+    if (snap.empty()) return;
+    if (snapHasPrefix(snap, "align:")) {
+        // "align:<uHandle>|<vHandle>" — vertical (same u/x) to uHandle, horizontal (same v/y) to
+        // vHandle; either side may be empty. Two-point form: refs = {source, this point}.
+        std::string body = snap.substr(6);
+        auto bar = body.find('|');
+        std::string uH = bar == std::string::npos ? body : body.substr(0, bar);
+        std::string vH = bar == std::string::npos ? std::string() : body.substr(bar + 1);
+        if (!uH.empty()) cs.push_back({{"type", "vertical"},   {"refs", {uH, pt}}});
+        if (!vH.empty()) cs.push_back({{"type", "horizontal"}, {"refs", {vH, pt}}});
+        return;
+    }
+    if (snapHasPrefix(snap, "mid:")) {
+        cs.push_back({{"type", "midpoint"}, {"refs", {pt, snap.substr(4)}}});
+    } else if (snapHasPrefix(snap, "rim:") || snapHasPrefix(snap, "tan:")) {
+        // The new entity's point `pt` lands on the snapped circle/arc rim.
+        cs.push_back({{"type", "point_on"}, {"refs", {pt, snap.substr(4)}}});
+    } else {
+        // Plain endpoint/center/origin handle -> coincident.
+        cs.push_back({{"type", "coincident"}, {"refs", {snap, pt}}});
+    }
+}
+
+std::string SketchMode::emitConstructionEntity(AppState& st, const nlohmann::json& entity,
+                                               const nlohmann::json& constraints) {
+    nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_}, {"entity", entity}};
+    if (constraints.is_array() && !constraints.empty()) op["constraints"] = constraints;
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/true);
+    if (!r.ok) { st.addLog("[sketch] construction entity failed: " + r.error_message); return {}; }
+    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    return (r.id_map.is_object() && r.id_map.contains("$0"))
+         ? r.id_map["$0"].get<std::string>() : std::string();
+}
+
+void SketchMode::emitConstructionConstraint(AppState& st, const nlohmann::json& constraint) {
+    nlohmann::json op = {{"op", "sketch_add_constraint"}, {"sketch", fid_}, {"constraint", constraint}};
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/true);
+    if (!r.ok) { st.addLog("[sketch] construction constraint failed: " + r.error_message); return; }
+    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+}
+
 void SketchMode::addConstraint(AppState& st, const nlohmann::json& constraint) {
     nlohmann::json ops = nlohmann::json::array({
         {{"op", "sketch_add_constraint"}, {"sketch", fid_}, {"constraint", constraint}}});
@@ -712,7 +758,8 @@ void SketchMode::addPlaneDimRef(AppState& st, int planeIdx) {
 // of "horizontal"/"vertical"/"parallel"/"perpendicular"/"equal"/"", referencing $self, or for the
 // two-ref relations referencing the opposite edge's id via the {prefix}). Mirrors the corner-rect
 // op pattern (successive applyOps so coincidents reference real ids).
-void SketchMode::addQuadLoop(AppState& st, const ImVec2 corners[4], const char* relations[4]) {
+std::vector<std::string> SketchMode::addQuadLoop(AppState& st, const ImVec2 corners[4],
+                             const char* relations[4], const std::string* cornerSnaps) {
     std::string ids[4];
     std::string prevId, firstId;
     for (int i = 0; i < 4; ++i) {
@@ -725,6 +772,8 @@ void SketchMode::addQuadLoop(AppState& st, const ImVec2 corners[4], const char* 
             cs.push_back({{"type", rel}, {"refs", {"$self"}}});
         if (!prevId.empty())
             cs.push_back({{"type", "coincident"}, {"refs", {prevId + ".p2", "$self.p1"}}});
+        // Corner pick snapped onto a vertex/origin -> keep that coincident on this edge's p1.
+        if (cornerSnaps) pushSnapConstraint(cornerSnaps[i], "$self.p1", cs);
         nlohmann::json ent = {{"type", "line"},
             {"p1", nlohmann::json::array({corners[i].x, corners[i].y})},
             {"p2", nlohmann::json::array({corners[j].x, corners[j].y})}};
@@ -764,14 +813,16 @@ void SketchMode::addQuadLoop(AppState& st, const ImVec2 corners[4], const char* 
         if (tok.find("perpendicular") != std::string::npos) pair("perpendicular", ids[i], ids[i + 1]);
     }
     resolve(st);
+    return {ids[0], ids[1], ids[2], ids[3]};
 }
 
 // C42: N-line closed loop (generalized addQuadLoop without the per-edge h/v relations). Each edge
 // gets a chained coincident to its predecessor's p2 (+ loop-closing coincident); equalEdges adds
 // "equal" between consecutive edges so a Polygon stays regular-ish under drag.
-void SketchMode::addPolyLoop(AppState& st, const std::vector<ImVec2>& corners, bool equalEdges) {
+std::vector<std::string> SketchMode::addPolyLoop(AppState& st, const std::vector<ImVec2>& corners,
+                                                 bool equalEdges) {
     const size_t n = corners.size();
-    if (n < 3) return;
+    if (n < 3) return {};
     std::vector<std::string> ids(n);
     std::string prevId, firstId;
     for (size_t i = 0; i < n; ++i) {
@@ -808,6 +859,7 @@ void SketchMode::addPolyLoop(AppState& st, const std::vector<ImVec2>& corners, b
         }
     }
     resolve(st);
+    return ids;
 }
 
 // C51: straight slot as real geometry (see header). Builds the capsule from the spine endpoints
@@ -815,7 +867,8 @@ void SketchMode::addPolyLoop(AppState& st, const std::vector<ImVec2>& corners, b
 // arcs (the outer semicircles), and a construction centerline. Endpoints are chained by coincident
 // closure; the centerline ends pin to the arc centers; the cap radii are equal. All five batches
 // coalesce into ONE undo step.
-void SketchMode::addDecomposedSlot(AppState& st, const ImVec2& p1, const ImVec2& p2, float width) {
+void SketchMode::addDecomposedSlot(AppState& st, const ImVec2& p1, const ImVec2& p2, float width,
+                                   const std::string& snap1, const std::string& snap2) {
     const float R2D = 57.29577951f, D2R = 1.0f / 57.29577951f;
     float hw = width * 0.5f;
     float axisDeg = std::atan2(p2.y - p1.y, p2.x - p1.x) * R2D;
@@ -867,6 +920,11 @@ void SketchMode::addDecomposedSlot(AppState& st, const ImVec2& p1, const ImVec2&
     con({{"type", "tangent"}, {"refs", {l1, c2}}});
     con({{"type", "tangent"}, {"refs", {l2, c1}}});
     con({{"type", "tangent"}, {"refs", {l2, c2}}});
+    // Placement snaps on the two spine endpoints -> constraints on the cap-arc centers.
+    nlohmann::json endCs = nlohmann::json::array();
+    pushSnapConstraint(snap1, c1 + ".center", endCs);
+    pushSnapConstraint(snap2, c2 + ".center", endCs);
+    for (const auto& c : endCs) con(c);
     resolve(st);
 }
 
@@ -894,6 +952,10 @@ bool SketchMode::enterForFeature(AppState& st, const std::string& sketchFid) {
     prevYaw_ = st.yaw; prevPitch_ = st.pitch; prevZoom_ = st.zoom;
     prevPan_[0] = st.pan[0]; prevPan_[1] = st.pan[1]; prevPan_[2] = st.pan[2];
     havePrevCam_ = true;
+    // Recentre on the sketch: zero the pan so the orbit-centre override (the sketch geometry centre,
+    // set each frame by the viewport) sits at screen centre — the sketch, not the origin, is framed.
+    // prevPan_ is restored on exit, so the 3D view returns to where it was.
+    st.pan[0] = st.pan[1] = st.pan[2] = 0.0f;
     // Lock the camera looking down the plane normal (frame_ column 2 = z_dir in world).
     float nz0 = frame_[2], nz1 = frame_[6], nz2 = frame_[10];
     // The renderer's orbit convention (viewport_panel/renderer drawCurrent) is
@@ -1654,14 +1716,16 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfe
         const float pxPerU = std::hypot(uAxisS_.x, uAxisS_.y);
         const float pxPerV = std::hypot(vAxisS_.x, vAxisS_.y);
         float bestU = kSnapPx, bestV = kSnapPx;   // screen-px distance along each axis
-        forEachPoint([&](const std::string&, float eu, float ev) {
+        forEachPoint([&](const std::string& handle, float eu, float ev) {
             ImVec2 s = uvToScreen(eu, ev);
             float d2 = (s.x - cur.x) * (s.x - cur.x) + (s.y - cur.y) * (s.y - cur.y);
             if (d2 < (2.0f * kSnapPx) * (2.0f * kSnapPx)) return;  // too close to the point itself
             float dU = std::fabs(eu - u) * pxPerU;
             float dV = std::fabs(ev - v) * pxPerV;
-            if (dU < bestU) { bestU = dU; infer->alignU = true; infer->srcU = ImVec2(eu, ev); }
-            if (dV < bestV) { bestV = dV; infer->alignV = true; infer->srcV = ImVec2(eu, ev); }
+            if (dU < bestU) { bestU = dU; infer->alignU = true; infer->srcU = ImVec2(eu, ev);
+                              infer->srcUHandle = handle; }
+            if (dV < bestV) { bestV = dV; infer->alignV = true; infer->srcV = ImVec2(eu, ev);
+                              infer->srcVHandle = handle; }
         });
         if (infer->alignU) u = infer->srcU.x;
         if (infer->alignV) v = infer->srcV.y;
@@ -3683,6 +3747,230 @@ bool SketchMode::drawRegionPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMi
 }
 
 // ---------------------------------------------------------------------------
+// datum-plane picker for feature PM wells (reference axis / plane reference geometry)
+// ---------------------------------------------------------------------------
+
+bool SketchMode::drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
+                                 const ImVec2& imgMax, int vw, int vh, bool imgHovered) {
+    pmPlaneHover_ = -1;
+    if (active_) return false;                  // editing a sketch: that overlay owns the canvas
+    auto* pm = st.propertyManager;
+    if (!st.renderer || !st.workerStarted || !st.docMirror.hasDoc() ||
+        !pm || !pm->active() || !pm->activeWellWantsPlane())
+        return false;
+
+    const Renderer& r = *st.renderer;
+    const auto& cam = r.camera();
+    ImDrawList* wdl = ImGui::GetWindowDrawList();
+    wdl->PushClipRect(imgMin, imgMax, true);
+    const auto& pal = ui::palette;
+
+    // Project + hit-test the three origin-plane quads exactly as the new-sketch plane pick does
+    // (Renderer::planeQuad geometry, frontmost barycentric depth test) so the highlighted plane and
+    // the drawn plane always coincide and the overlapping origin planes resolve to the one nearest
+    // the camera under the cursor (SolidWorks behavior). See drawOverlay's plane-pick step.
+    const char* planeSel[3] = {"plane.front", "plane.top", "plane.right"};
+    int hovered = -1;
+    float hoveredDepth = 1e30f;
+    ImVec2 quadS[3][4];
+    bool quadVis[3] = {false, false, false};
+    Vec3 quadW[3][4];
+    for (int p = 0; p < 3; ++p) {
+        Vec3 c4[4];
+        if (!r.planeQuad(p, c4)) continue;
+        for (int i = 0; i < 4; ++i) quadW[p][i] = c4[i];
+        bool ok = true;
+        for (int i = 0; i < 4; ++i)
+            if (!worldToScreen(cam, imgMin, vw, vh, c4[i].x, c4[i].y, c4[i].z, quadS[p][i])) { ok = false; break; }
+        quadVis[p] = ok;
+        if (!ok || !imgHovered) continue;
+        auto hitDepth = [&](ImVec2 P, int a, int b, int cc, float& depthOut) -> bool {
+            ImVec2 sa = quadS[p][a], sb = quadS[p][b], sc = quadS[p][cc];
+            auto edge = [](ImVec2 pp, ImVec2 qq, ImVec2 rr) {
+                return (pp.x - rr.x) * (qq.y - rr.y) - (qq.x - rr.x) * (pp.y - rr.y);
+            };
+            float area = edge(sa, sb, sc);
+            if (area == 0.0f) return false;
+            float w0 = edge(P, sb, sc) / area;
+            float w1 = edge(P, sc, sa) / area;
+            float w2 = edge(P, sa, sb) / area;
+            if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) return false;
+            Vec3 Wa = quadW[p][a], Wb = quadW[p][b], Wc = quadW[p][cc];
+            Vec3 wp(w0 * Wa.x + w1 * Wb.x + w2 * Wc.x,
+                    w0 * Wa.y + w1 * Wb.y + w2 * Wc.y,
+                    w0 * Wa.z + w1 * Wb.z + w2 * Wc.z);
+            float dx = wp.x - cam.eye.x, dy = wp.y - cam.eye.y, dz = wp.z - cam.eye.z;
+            depthOut = dx * dx + dy * dy + dz * dz;
+            return true;
+        };
+        float d;
+        if ((hitDepth(io.MousePos, 0, 1, 2, d) || hitDepth(io.MousePos, 0, 2, 3, d)) &&
+            d < hoveredDepth) {
+            hoveredDepth = d;
+            hovered = p;
+        }
+    }
+    pmPlaneHover_ = hovered;
+    // Hover tint on the one plane under the cursor (the renderer already draws the three planes +
+    // emphasis brightening; viewport_panel feeds pmPlaneHover() as the emphasis index).
+    if (hovered >= 0 && quadVis[hovered]) {
+        wdl->AddQuadFilled(quadS[hovered][0], quadS[hovered][1], quadS[hovered][2],
+                           quadS[hovered][3], col(pal.accent, 0.16f));
+        wdl->AddQuad(quadS[hovered][0], quadS[hovered][1], quadS[hovered][2],
+                     quadS[hovered][3], col(pal.accent, 0.90f), 2.0f);
+    }
+    // Compact hint pill (below the heads-up view toolbar, same slot as the new-sketch banner).
+    const char* banner = "Click a reference plane \xE2\x80\x94 or pick a planar face";
+    ImVec2 bts = ImGui::CalcTextSize(banner);
+    float bcx = (imgMin.x + imgMax.x) * 0.5f;
+    ImVec2 b0(bcx - bts.x * 0.5f - 14, imgMin.y + 52.0f * ui::uiScale);
+    ImVec2 b1(bcx + bts.x * 0.5f + 14, b0.y + bts.y + 12);
+    wdl->AddRectFilled(b0, b1, col(pal.overlayBg), 6.0f);
+    wdl->AddRect(b0, b1, col(pal.overlayBorder), 6.0f);
+    wdl->AddText(ImVec2(b0.x + 14, b0.y + 6), col(pal.overlayText), banner);
+    wdl->PopClipRect();
+
+    // Click an origin plane -> route its datum ref into the active well. Returning true tells the
+    // viewport this frame's click landed on a plane, so model picking doesn't also fire.
+    if (hovered >= 0 && imgHovered) {
+        st.requestCursor(ui::CursorKind::Hand);
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            pm->routeDatumPlane(planeSel[hovered]);
+    }
+    return hovered >= 0;
+}
+
+// ---------------------------------------------------------------------------
+// datum-axis picker for feature PM wells (revolve / circular-pattern axis)
+// ---------------------------------------------------------------------------
+
+// Hit-test the displayed datum-axis lines (docMirror::refDatums kind=="axis") in screen space.
+// Returns true + the hovered axis's screen endpoints + feature id/name when the cursor is within the
+// pick radius. Shared by the PM axis picker (route into a well) and general datum selection. The
+// endpoints use L = radius*1.6 so the clickable segment coincides with the drawn dashed amber line.
+static bool hitTestDatumAxis(AppState& st, ImVec2 mouse, const ImVec2& imgMin, int vw, int vh,
+                             ImVec2& outA, ImVec2& outB, std::string& outFid, std::string& outName) {
+    if (!st.renderer || !st.docMirror.hasDoc()) return false;
+    const nlohmann::json& datums = st.docMirror.refDatums();
+    if (!datums.is_array() || datums.empty()) return false;
+    const Renderer& r = *st.renderer;
+    const auto& cam = r.camera();
+    // Match the DRAWN axis length exactly: drawRefDatums uses e=(radius_>0?radius_:kEmptySceneRadius)
+    // and L=e*1.6. cam.radius is published as that same sceneR (renderer.cpp drawCurrent), so use it
+    // directly — modelRadius() is 0 with no solid body (e.g. during Revolve: sketch + axis, no body),
+    // which shrank the pickable segment to ~1.6mm while the visible line spanned ~56mm. See handoff.
+    const float L = cam.radius * 1.6f;
+    auto distToSeg = [](ImVec2 p, ImVec2 a, ImVec2 b) -> float {
+        float vx = b.x - a.x, vy = b.y - a.y, wx = p.x - a.x, wy = p.y - a.y;
+        float len2 = vx * vx + vy * vy;
+        float t = len2 > 1e-6f ? (wx * vx + wy * vy) / len2 : 0.0f;
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        float dx = a.x + t * vx - p.x, dy = a.y + t * vy - p.y;
+        return std::sqrt(dx * dx + dy * dy);
+    };
+    float best = 9.0f * ui::uiScale;   // pixel pick radius around the line
+    bool found = false;
+    for (const auto& d : datums) {
+        if (!d.is_object() || d.value("kind", std::string()) != "axis") continue;
+        const auto& pj = d.contains("point") ? d["point"] : nlohmann::json();
+        const auto& dj = d.contains("dir") ? d["dir"] : nlohmann::json();
+        if (!pj.is_array() || pj.size() < 3 || !dj.is_array() || dj.size() < 3) continue;
+        Vec3 P((float)pj[0].get<double>(), (float)pj[1].get<double>(), (float)pj[2].get<double>());
+        Vec3 D((float)dj[0].get<double>(), (float)dj[1].get<double>(), (float)dj[2].get<double>());
+        ImVec2 sa, sb;
+        if (!worldToScreen(cam, imgMin, vw, vh, P.x - D.x * L, P.y - D.y * L, P.z - D.z * L, sa)) continue;
+        if (!worldToScreen(cam, imgMin, vw, vh, P.x + D.x * L, P.y + D.y * L, P.z + D.z * L, sb)) continue;
+        float dist = distToSeg(mouse, sa, sb);
+        if (dist < best) {
+            best = dist; found = true; outA = sa; outB = sb;
+            outFid = d.value("id", std::string());
+            outName = d.value("name", outFid);
+        }
+    }
+    return found;
+}
+
+bool SketchMode::drawAxisPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
+                                const ImVec2& imgMax, int vw, int vh, bool imgHovered) {
+    if (active_) return false;                  // editing a sketch: that overlay owns the canvas
+    auto* pm = st.propertyManager;
+    if (!st.workerStarted || !pm || !pm->active() || !pm->activeWellWantsAxis() || !imgHovered)
+        return false;
+    ImVec2 a, b; std::string fid, name;
+    if (!hitTestDatumAxis(st, io.MousePos, imgMin, vw, vh, a, b, fid, name)) return false;
+
+    const auto& pal = ui::palette;
+    ImDrawList* wdl = ImGui::GetWindowDrawList();
+    wdl->PushClipRect(imgMin, imgMax, true);
+    wdl->AddLine(a, b, col(pal.accent, 0.95f), 4.0f);
+    const char* banner = "Click the reference axis";
+    ImVec2 bts = ImGui::CalcTextSize(banner);
+    float bcx = (imgMin.x + imgMax.x) * 0.5f;
+    ImVec2 b0(bcx - bts.x * 0.5f - 14, imgMin.y + 52.0f * ui::uiScale);
+    ImVec2 b1(bcx + bts.x * 0.5f + 14, b0.y + bts.y + 12);
+    wdl->AddRectFilled(b0, b1, col(pal.overlayBg), 6.0f);
+    wdl->AddRect(b0, b1, col(pal.overlayBorder), 6.0f);
+    wdl->AddText(ImVec2(b0.x + 14, b0.y + 6), col(pal.overlayText), banner);
+    wdl->PopClipRect();
+
+    st.requestCursor(ui::CursorKind::Hand);
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) pm->routeDatumAxis(fid, name);
+    return true;
+}
+
+bool SketchMode::drawDatumSelect(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
+                                 const ImVec2& imgMax, int vw, int vh, bool imgHovered) {
+    if (active_ || !imgHovered) return false;
+    auto* pm = st.propertyManager;
+    // A PM picker (axis/plane well) owns datum picks while open — don't also general-select.
+    if (pm && pm->active() && (pm->activeWellWantsAxis() || pm->activeWellWantsPlane())) return false;
+    ImVec2 a, b; std::string fid, name;
+    if (!hitTestDatumAxis(st, io.MousePos, imgMin, vw, vh, a, b, fid, name)) return false;
+
+    ImDrawList* wdl = ImGui::GetWindowDrawList();
+    wdl->PushClipRect(imgMin, imgMax, true);
+    wdl->AddLine(a, b, col(ui::palette.accent, 0.90f), 4.0f);
+    wdl->PopClipRect();
+
+    st.requestCursor(ui::CursorKind::Hand);
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (!io.KeyCtrl) st.selection.clear();   // plain click = single-select the datum
+        st.selectedFeatureId = fid;              // tree row highlights; renderer emphasizes the datum
+        st.treeScrollToSelection = true;
+    }
+    return true;
+}
+
+bool SketchMode::sketchOrbitCenter(Vec3& world) const {
+    if (!active_) return false;
+    // 2D bbox over the sketch entities (plane u,v); empty sketch -> plane origin (u=v=0).
+    float mnu = 1e30f, mnv = 1e30f, mxu = -1e30f, mxv = -1e30f;
+    bool any = false;
+    auto inc = [&](float u, float v) {
+        if (u < mnu) mnu = u; if (v < mnv) mnv = v;
+        if (u > mxu) mxu = u; if (v > mxv) mxv = v; any = true;
+    };
+    for (const auto& e : ents_) {
+        inc(e.p1[0], e.p1[1]);
+        if (e.type == "line" || e.type == "slot" || e.type == "arc_slot") inc(e.p2[0], e.p2[1]);
+        if (e.type == "circle" || e.type == "arc" || e.type == "ellipse" || e.type == "arc_slot") {
+            float rr = e.radius > 0 ? e.radius : std::fmax(e.rx, e.ry);
+            inc(e.center[0] - rr, e.center[1] - rr);
+            inc(e.center[0] + rr, e.center[1] + rr);
+        }
+        for (const auto& p : e.pts) inc(p.x, p.y);
+    }
+    float cu = any ? (mnu + mxu) * 0.5f : 0.0f;
+    float cv = any ? (mnv + mxv) * 0.5f : 0.0f;
+    // Lift (cu,cv,0) to world via frame_ (row-major, sketch(u,v,0)->world) — same pattern as buildBasis.
+    const float* fr = frame_;
+    world.x = fr[0] * cu + fr[1] * cv + fr[3];
+    world.y = fr[4] * cu + fr[5] * cv + fr[7];
+    world.z = fr[8] * cu + fr[9] * cv + fr[11];
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // overlay draw + interaction
 // ---------------------------------------------------------------------------
 
@@ -4643,6 +4931,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         if (ImGui::MenuItem("Select")) resetTool();
         if (ImGui::MenuItem("Smart Dimension")) { resetTool(); tool_ = SketchTool::SmartDim; }
         if (ImGui::MenuItem("Grid", nullptr, showGrid_)) showGrid_ = !showGrid_;
+        if (ImGui::MenuItem("Automatic Relations", nullptr, autoAlignRelations_)) {
+            autoAlignRelations_ = !autoAlignRelations_;
+            st.toast(ui::ToastLevel::Info, autoAlignRelations_
+                     ? "Automatic relations: On (snapped alignments add vertical/horizontal relations)"
+                     : "Automatic relations: Off (alignment guides stay positional)");
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Exit Sketch")) { ImGui::CloseCurrentPopup(); ImGui::EndPopup();
                                               exitSketch(st, /*keep=*/true); dl->PopClipRect(); return; }
@@ -5091,7 +5385,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         render::PickHit extHit{};
         if (imgHovered && st.hasDocMesh && st.idPass) {
             int px = (int)(io.MousePos.x - imgMin.x), py = (int)(io.MousePos.y - imgMin.y);
-            render::PickHit h = st.idPass->pickFinal(px, py, vw, vh);
+            // Edge-priority pick: a model edge on a coplanar face (normal-to a sketched face) is
+            // 1 px wide and otherwise loses the center pixel to the face. ~7 px grab radius (scaled).
+            int grab = (int)std::lround(7.0f * ui::uiScale);
+            render::PickHit h = st.idPass->pickFinalPreferEdge(px, py, vw, vh, grab);
             if (h.valid() && (h.kind == render::PickKind::Edge || h.kind == render::PickKind::Face))
                 extHit = h;
         }
@@ -5650,8 +5947,19 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // suppress further captures while that popup is open.
         if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
             tool_ != SketchTool::EqCurve && !(tool_ == SketchTool::Text && textPopupOpen_)) {
+            // When no point snap fired but the click landed on a v/h alignment guide, record the
+            // alignment so the commit can write it as a real vertical/horizontal relation (the new
+            // point's handle is filled in per-tool via pushSnapConstraint). Positional-only if the
+            // toggle is off — then this stays "" and only the pulled coordinate persists.
+            std::string clickSnap = snapH;
+            if (clickSnap.empty() && autoAlignRelations_ && inferenceOn_ &&
+                (infer.alignU || infer.alignV)) {
+                std::string uH = infer.alignU ? infer.srcUHandle : std::string();
+                std::string vH = infer.alignV ? infer.srcVHandle : std::string();
+                if (!uH.empty() || !vH.empty()) clickSnap = "align:" + uH + "|" + vH;
+            }
             toolUV_.push_back(ImVec2(su, sv));
-            toolSnaps_.push_back(snapH);
+            toolSnaps_.push_back(clickSnap);
             // Sketch Text — the single click captures the lower-left anchor; open the popup that
             // collects the string + cap height. The entity is emitted from the popup's OK.
             if (tool_ == SketchTool::Text && toolUV_.size() == 1) {
@@ -5724,6 +6032,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 bool tangentEmitted = false;
                 auto snapCons = [&](const std::string& snap, const char* pt) {
                     if (snap.empty()) return;
+                    if (snapHasPrefix(snap, "align:")) { pushSnapConstraint(snap, pt, cs); return; }
                     if (snapHasPrefix(snap, "mid:")) {
                         cs.push_back({{"type", "midpoint"}, {"refs", {pt, snap.substr(4)}}});
                     } else if (snapHasPrefix(snap, "rim:") || snapHasPrefix(snap, "tan:")) {
@@ -5775,14 +6084,25 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 // (was an inline loop with 4 separate undo steps -> "vanishes one corner at a time").
                 ImVec2 quad[4] = {{a.x, a.y}, {b.x, a.y}, {b.x, b.y}, {a.x, b.y}};
                 const char* rel[4] = {"horizontal", "vertical", "horizontal", "vertical"};
-                addQuadLoop(st, quad, rel);
+                // The two clicked corners are quad[0] (first pick) and quad[2] (opposite); keep their
+                // placement snaps so a corner dropped on the origin/a vertex stays coincident.
+                std::string cornerSnaps[4] = {toolSnaps_[0], "", toolSnaps_[1], ""};
+                addQuadLoop(st, quad, rel, cornerSnaps);
                 resetTool();
             } else if (tool_ == SketchTool::Circle && toolUV_.size() == 2) {
                 ImVec2 c = toolUV_[0], rim = toolUV_[1];
                 float rad = std::hypot(rim.x - c.x, rim.y - c.y);
                 nlohmann::json ent = {{"type", "circle"},
                     {"center", nlohmann::json::array({c.x, c.y})}, {"radius", rad}};
-                addEntity(st, ent, nlohmann::json::array());
+                // Persist the placement snaps: center -> $self.center; the rim click's snapped
+                // point (a plain vertex) lies ON the circle (point_on). A rim snap onto another
+                // curve at the radius pick is left positional (ambiguous curve-curve relation).
+                nlohmann::json cs = nlohmann::json::array();
+                pushSnapConstraint(toolSnaps_[0], "$self.center", cs);
+                if (!toolSnaps_[1].empty() && !snapHasPrefix(toolSnaps_[1], "mid:") &&
+                    !snapHasPrefix(toolSnaps_[1], "rim:") && !snapHasPrefix(toolSnaps_[1], "tan:"))
+                    cs.push_back({{"type", "point_on"}, {"refs", {toolSnaps_[1], "$self"}}});
+                addEntity(st, ent, cs);
                 resetTool();
             } else if (tool_ == SketchTool::ArcCenter && toolUV_.size() == 3) {
                 ImVec2 c = toolUV_[0], p1 = toolUV_[1], p2 = toolUV_[2];
@@ -5792,7 +6112,13 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 nlohmann::json ent = {{"type", "arc"},
                     {"center", nlohmann::json::array({c.x, c.y})}, {"radius", rad},
                     {"start", a0}, {"end", a1}, {"ccw", true}};
-                addEntity(st, ent, nlohmann::json::array());
+                // Persist placement snaps: center pick -> $self.center, the two rim picks ->
+                // $self.start / $self.end (p1 defines the radius, p2 the end angle; both stay CCW).
+                nlohmann::json cs = nlohmann::json::array();
+                pushSnapConstraint(toolSnaps_[0], "$self.center", cs);
+                pushSnapConstraint(toolSnaps_[1], "$self.start", cs);
+                pushSnapConstraint(toolSnaps_[2], "$self.end", cs);
+                addEntity(st, ent, cs);
                 resetTool();
             } else if (tool_ == SketchTool::Slot && toolUV_.size() == 3) {
                 ImVec2 p1 = toolUV_[0], p2 = toolUV_[1], wpt = toolUV_[2];
@@ -5802,8 +6128,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 float w = L > 1e-6f ? std::fabs((wpt.x - p1.x) * (-dy) + (wpt.y - p1.y) * dx) / L : 5.0f;
                 if (w < 1e-3f) w = 5.0f;
                 // C51: emit a decomposed slot (2 lines + 2 arcs + construction centerline) so every
-                // piece is individually selectable / dimensionable.
-                addDecomposedSlot(st, p1, p2, w * 2.0f);
+                // piece is individually selectable / dimensionable. The two spine endpoints carry
+                // their placement snaps (toolSnaps_[0]/[1]); the width pick (toolSnaps_[2]) doesn't.
+                addDecomposedSlot(st, p1, p2, w * 2.0f, toolSnaps_[0], toolSnaps_[1]);
                 resetTool();
 
             // ---- C28-B variants ----
@@ -5862,8 +6189,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 float dx = e1.x - e2.x, dy = e1.y - e2.y; float L = std::hypot(dx, dy);
                 float w = L > 1e-6f ? std::fabs((wpk.x - e2.x) * (-dy) + (wpk.y - e2.y) * dx) / L : 5.0f;
                 if (w < 1e-3f) w = 5.0f;
-                // C51: decomposed slot (real lines + arcs + construction centerline).
-                addDecomposedSlot(st, e1, e2, w * 2.0f);
+                // C51: decomposed slot (real lines + arcs + construction centerline). e1 is the
+                // clicked end (carries toolSnaps_[1]); e2 is its mirror about the center (no pick).
+                addDecomposedSlot(st, e1, e2, w * 2.0f, toolSnaps_[1], "");
                 resetTool();
             } else if (tool_ == SketchTool::SlotArcCtr && toolUV_.size() == 4) {
                 // center, spine start (radius+a0), spine end dir (a1), width.
@@ -6019,7 +6347,28 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         float a = a0 + 6.2831853f * i / (float)polySides_;
                         corners.push_back(ImVec2(ctr.x + R * std::cos(a), ctr.y + R * std::sin(a)));
                     }
-                    addPolyLoop(st, corners, /*equalEdges=*/true);
+                    auto ids = addPolyLoop(st, corners, /*equalEdges=*/true);
+                    // SolidWorks-style inscribed CONSTRUCTION circle: anchors the polygon's center
+                    // (the center pick's snap lands on the circle center) and holds every vertex on
+                    // it, so a polygon dropped on the origin stays centered + dimensionable.
+                    nlohmann::json ccs = nlohmann::json::array();
+                    pushSnapConstraint(toolSnaps_[0], "$self.center", ccs);
+                    std::string cid = emitConstructionEntity(st,
+                        {{"type", "circle"}, {"construction", true},
+                         {"center", nlohmann::json::array({ctr.x, ctr.y})}, {"radius", R}}, ccs);
+                    if (!cid.empty()) {
+                        for (const auto& lid : ids)
+                            if (!lid.empty())
+                                emitConstructionConstraint(st, {{"type", "point_on"},
+                                    {"refs", {lid + ".p1", cid}}});
+                        // The picked vertex (corners[0] == ids[0].p1) keeps its own snap too.
+                        if (!ids.empty() && !ids[0].empty()) {
+                            nlohmann::json vcs = nlohmann::json::array();
+                            pushSnapConstraint(toolSnaps_[1], ids[0] + ".p1", vcs);
+                            for (const auto& c : vcs) emitConstructionConstraint(st, c);
+                        }
+                    }
+                    resolve(st);
                     resetTool();
                 }
             } else if (tool_ == SketchTool::RectCenter && toolUV_.size() == 2) {
@@ -6033,7 +6382,31 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     ImVec2 quad[4] = {ImVec2(ctr.x - dx, ctr.y - dy), ImVec2(ctr.x + dx, ctr.y - dy),
                                       ImVec2(ctr.x + dx, ctr.y + dy), ImVec2(ctr.x - dx, ctr.y + dy)};
                     const char* rel[4] = {"horizontal", "vertical", "horizontal", "vertical"};
-                    addQuadLoop(st, quad, rel);
+                    auto ids = addQuadLoop(st, quad, rel);
+                    // SolidWorks-style center rectangle: a construction diagonal (corner 0 -> corner
+                    // 2) plus a center CONSTRUCTION point pinned to the diagonal's midpoint. The
+                    // center pick's snap lands on that point, so the rect stays centered on it.
+                    if (ids.size() == 4 && !ids[0].empty() && !ids[2].empty()) {
+                        nlohmann::json pcs = nlohmann::json::array();
+                        pushSnapConstraint(toolSnaps_[0], "$self.p", pcs);
+                        std::string pc = emitConstructionEntity(st,
+                            {{"type", "point"}, {"construction", true},
+                             {"p", nlohmann::json::array({ctr.x, ctr.y})}}, pcs);
+                        std::string diag = emitConstructionEntity(st,
+                            {{"type", "line"}, {"construction", true},
+                             {"p1", nlohmann::json::array({quad[0].x, quad[0].y})},
+                             {"p2", nlohmann::json::array({quad[2].x, quad[2].y})}},
+                            nlohmann::json::array());
+                        if (!pc.empty() && !diag.empty()) {
+                            emitConstructionConstraint(st, {{"type", "coincident"},
+                                {"refs", {diag + ".p1", ids[0] + ".p1"}}});
+                            emitConstructionConstraint(st, {{"type", "coincident"},
+                                {"refs", {diag + ".p2", ids[2] + ".p1"}}});
+                            emitConstructionConstraint(st, {{"type", "midpoint"},
+                                {"refs", {pc + ".p", diag}}});
+                        }
+                        resolve(st);
+                    }
                     resetTool();
                 }
             } else if (tool_ == SketchTool::Point && toolUV_.size() == 1) {
@@ -6065,7 +6438,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     nlohmann::json ent = {{"type", "ellipse"},
                         {"center", nlohmann::json::array({ctr.x, ctr.y})},
                         {"rx", rx}, {"ry", ry}, {"rot", rot * kR2D}};   // rot in degrees (schema)
-                    addEntity(st, ent, nlohmann::json::array());
+                    // Persist the center pick's snap (coincident / alignment) onto $self.center.
+                    nlohmann::json cs = nlohmann::json::array();
+                    pushSnapConstraint(toolSnaps_[0], "$self.center", cs);
+                    addEntity(st, ent, cs);
                     resetTool();
                 }
             }
@@ -6104,7 +6480,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 for (const auto& q : toolUV_) pts.push_back(nlohmann::json::array({q.x, q.y}));
                 const char* entType = (tool_ == SketchTool::StyleSpline) ? "style_spline" : "spline";
                 nlohmann::json ent = {{"type", entType}, {"points", pts}};
-                addEntity(st, ent, nlohmann::json::array());
+                // Persist each through-point/pole pick's snap onto $self.p<i> (endpoints landing on
+                // a vertex are the usual case; alignment guides on any point carry too).
+                nlohmann::json cs = nlohmann::json::array();
+                for (size_t i = 0; i < toolSnaps_.size() && i < toolUV_.size(); ++i)
+                    pushSnapConstraint(toolSnaps_[i], "$self.p" + std::to_string(i), cs);
+                addEntity(st, ent, cs);
                 resetTool();
             }
         }

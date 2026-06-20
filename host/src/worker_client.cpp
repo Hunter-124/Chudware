@@ -111,6 +111,10 @@ bool cppAgentFlag() {
 // carries it too. get_prompts_v2 has no doc and is always safe to route (read-only).
 bool agentDocIsCpp(const std::string& method, const json& params) {
     if (method == "get_prompts_v2") return true;  // doc-independent (prompt catalog)
+    // The pre-flight clarify gate fires on a Design-new submit BEFORE any part doc exists,
+    // so it is doc-independent like get_prompts_v2: always safe to route to C++ (it only
+    // reads the request + optional live-session context). This also loads the DLL lazily.
+    if (method == "agent_clarify_v1") return true;
     if (!params.is_object()) return false;
     auto it = params.find("doc_id");
     if (it == params.end() || !it->is_string()) return false;
@@ -120,7 +124,8 @@ bool agentDocIsCpp(const std::string& method, const json& params) {
 bool routeAgentToCpp(const std::string& method, const json& params) {
     if (!cppAgentFlag()) return false;
     if (!(method == "agent_run_v2" || method == "agent_ask_v2" ||
-          method == "agent_pm_assist_v1" || method == "get_prompts_v2"))
+          method == "agent_clarify_v1" || method == "agent_pm_assist_v1" ||
+          method == "get_prompts_v2"))
         return false;  // agent_design (legacy) + everything else stays Python
     if (!agentDocIsCpp(method, params)) return false;  // only C++-backed docs (or doc-indep)
     // Ensure the core DLL is loadable before committing to the C++ path. ensureLoaded is
@@ -400,6 +405,12 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
             json p = {{"question", params.value("question", std::string())},
                       {"doc_id", params.value("doc_id", std::string())}};
             ok = core::cpp_core().call("agent_answer_question", p, cppResult, cerr);
+        } else if (method == "agent_clarify_v1") {
+            // {request, doc_id, ...} -> agent_clarify {request, doc_id}. Returns
+            // {ready, questions:[{key,ask,unit,suggested}], assumptions:[...]}.
+            json p = {{"request", params.value("request", std::string())},
+                      {"doc_id", params.value("doc_id", std::string())}};
+            ok = core::cpp_core().call("agent_clarify", p, cppResult, cerr);
         } else if (method == "agent_pm_assist_v1") {
             // The host's PM payload (doc_id, intent, form_schema, current, selected_refs)
             // IS the params object the C++ assist expects under "params".

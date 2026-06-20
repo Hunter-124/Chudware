@@ -647,6 +647,29 @@ static void onFileDrop(GLFWwindow* win, int count, const char** paths) {
                  " (dropped " + std::to_string(known) + " files; opening the first)");
 }
 
+// Default to a fresh part on launch — on a non-shot run, once the worker is ready and nothing is
+// open, auto-create a disposable STARTER part (DocTab::isStarter) so the app opens straight into a
+// usable document instead of an empty shell. If the user then opens an existing file, the untouched
+// starter is silently discarded (AppState::dropBlankStarterTabs, called from the open path); if they
+// edit it, it sticks. Fires at most once (st.starterTried). No-op in shot/scenario mode (scenarios
+// create their own docs) and once a doc/design already exists.
+static void ensureStarterDoc(AppState& st, bool shot) {
+    if (shot || st.starterTried) return;
+    if (!st.workerStarted || st.docMirror.hasDoc() || !st.docTabs.empty() || st.designStarted) return;
+    st.starterTried = true;
+    std::string err;
+    st.suppressTabDirty = true;                 // a fresh doc is not an edit — start the tab clean
+    bool ok = st.docMirror.newPart(st.worker, err);
+    st.suppressTabDirty = false;
+    if (!ok) { st.addLog("[startup] default new part failed: " + err); return; }
+    st.clearViewportForNewDoc();
+    st.addDocTab(/*isAssembly=*/false);
+    if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
+        st.docTabs[st.activeTab].isStarter = true;
+    st.wantFocusViewport = 6;
+    st.addLog("[startup] opened default starter part");
+}
+
 int run_gui(const char* screenshotPath) {
     const bool shot = screenshotPath != nullptr;
     if (!glfwInit()) return 1;
@@ -948,6 +971,32 @@ int run_gui(const char* screenshotPath) {
                     continue;  // handled — skip the part-doc resolve path
                 }
             }
+            // SolidWorks "fillet a whole face": a FACE pick into an active fillet/chamfer edge well
+            // expands into ALL of that face's edges. Resolve each edge to a selector and route it,
+            // then we're done with this pick (skip the normal single-element resolve below).
+            if (item.hit.kind == render::PickKind::Face && st.propertyManager &&
+                st.propertyManager->active() &&
+                st.propertyManager->activeWellExpandsFaceToEdges()) {
+                auto* pm = st.propertyManager;
+                std::vector<uint32_t> eids =
+                    st.docMirror.faceEdges(st.worker, item.hit.body_id, item.hit.topo_id);
+                int added = 0;
+                for (uint32_t eid : eids) {
+                    std::string eerr;
+                    std::string esel = st.docMirror.resolvePick(
+                        st.worker, item.hit.body_id, "edge", eid, eerr);
+                    if (esel.empty()) continue;
+                    try {
+                        nlohmann::json eobj = nlohmann::json::parse(esel);
+                        if (pm->routePick(eobj, (int)render::PickKind::Edge, item.hit.body_id, eid))
+                            ++added;
+                    } catch (...) {}
+                }
+                st.addLog("[pm] face fillet: expanded face " + std::to_string(item.hit.topo_id) +
+                          " -> " + std::to_string(added) + " edge(s)");
+                item.pending_resolve = false;
+                continue;
+            }
             // Body wells (boolean targets/tools): resolve the clicked element's OWNING body
             // (doc_resolve_pick kind="body" -> {kind:"body", owner_feature:...}) instead of the
             // face/edge/vertex it landed on, so picking anywhere on a body selects that body.
@@ -990,7 +1039,17 @@ int run_gui(const char* screenshotPath) {
                             nlohmann::json selObj = nlohmann::json::parse(sel);
                             // Feedback when a pick is rejected for the wrong topology (the active
                             // well wants a different kind) — otherwise the click is silently lost.
-                            if (!pm->routePick(selObj, (int)item.hit.kind)) {
+                            const char* kn = item.hit.kind == render::PickKind::Edge ? "edge" :
+                                             item.hit.kind == render::PickKind::Face ? "face" :
+                                             item.hit.kind == render::PickKind::Vertex ? "vertex" : "?";
+                            bool routed = pm->routePick(selObj, (int)item.hit.kind,
+                                                        item.hit.body_id, item.hit.topo_id);
+                            st.addLog(std::string("[pm] click kind=") + kn +
+                                      " body=" + std::to_string(item.hit.body_id) +
+                                      " topo=" + std::to_string(item.hit.topo_id) +
+                                      " routed=" + (routed ? "1" : "0") +
+                                      " sel=" + sel.substr(0, 120));
+                            if (!routed) {
                                 std::string hint = pm->activeWellKindHint();
                                 if (!hint.empty())
                                     st.toast(ui::ToastLevel::Info,
@@ -1018,6 +1077,45 @@ int run_gui(const char* screenshotPath) {
         // go stale after a topology rebuild retags them. (docUndo/docRedo also refresh explicitly,
         // which is redundant-but-harmless; this listener covers the ops/resync paths.)
         ui::refreshFeatureHighlight(st);
+        // Push feature datum geometry (axes/planes/points/csys) to the renderer so CREATED reference
+        // geometry is visible — datums build no body, so the engine ships them out-of-band in the
+        // ops-response. Tolerant of missing fields / an engine that doesn't send "datums" (the array
+        // is then empty and nothing is drawn).
+        if (st.renderer) {
+            auto v3 = [](const nlohmann::json& a, Vec3 dflt) -> Vec3 {
+                if (a.is_array() && a.size() == 3 && a[0].is_number())
+                    return Vec3((float)a[0].get<double>(), (float)a[1].get<double>(),
+                                (float)a[2].get<double>());
+                return dflt;
+            };
+            std::vector<Renderer::RefDatum> rds;
+            for (const auto& d : st.docMirror.refDatums()) {
+                if (!d.is_object()) continue;
+                Renderer::RefDatum rd;
+                const std::string k = d.value("kind", std::string());
+                if (k == "axis") {
+                    rd.kind = Renderer::RefDatum::Kind::Axis;
+                    rd.origin = v3(d.value("point", nlohmann::json()), Vec3(0, 0, 0));
+                    rd.dir    = v3(d.value("dir", nlohmann::json()), Vec3(0, 0, 1));
+                } else if (k == "plane" || k == "csys") {
+                    rd.kind = (k == "csys") ? Renderer::RefDatum::Kind::Csys
+                                            : Renderer::RefDatum::Kind::Plane;
+                    rd.origin = v3(d.value("origin", nlohmann::json()), Vec3(0, 0, 0));
+                    rd.dir    = v3(d.value("normal", nlohmann::json()), Vec3(0, 0, 1));
+                    rd.xdir   = v3(d.value("x_dir", nlohmann::json()), Vec3(1, 0, 0));
+                    rd.ydir   = v3(d.value("y_dir", nlohmann::json()), Vec3(0, 1, 0));
+                } else if (k == "point") {
+                    rd.kind = Renderer::RefDatum::Kind::Point;
+                    rd.origin = v3(d.value("point", nlohmann::json()), Vec3(0, 0, 0));
+                } else {
+                    continue;
+                }
+                rd.id = d.value("id", std::string());
+                rd.name = d.value("name", std::string());
+                rds.push_back(rd);
+            }
+            st.renderer->setRefDatums(std::move(rds));
+        }
         // Document tabs: a real edit (applyOps/undo/redo/pushPull/revert) lights the active tab's
         // unsaved-changes marker. Tab switches / fresh-doc activation / resyncs set suppressTabDirty
         // so they don't falsely dirty a tab. Keep the cached title in step with renames, too.
@@ -2162,9 +2260,10 @@ int run_gui(const char* screenshotPath) {
                                        st.showSimulationTools, st.showPcbTools, barH);
 
         // ---------- active document reconciliation ----------
-        // The old browser-style document strip used to live under the ribbon. That wasted a full
-        // horizontal band, so document identity now lives in the central Viewport dock tab; keep the
-        // reconciliation step, but give the reclaimed height back to the dockspace.
+        // The browser/SolidWorks-style document tabs are rendered INSIDE the central dock node's
+        // tab-bar row (see ui::drawDocTabs, invoked from the Viewport/ECAD panels which own that
+        // node's geometry) rather than as a separate full-width band here — so they sit exactly
+        // where the "<doc> - Viewport" dock tab used to, and span only the central column.
         st.ensureActiveTab();
         float docTabsH = 0.0f;
 

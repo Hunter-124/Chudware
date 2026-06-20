@@ -21,6 +21,8 @@
 // C37-F additions: checkpoint/revert cancel, keyboard policy, form polish, defensive fixes.
 #pragma once
 
+#include <array>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -42,8 +44,12 @@ namespace ui {
 enum class PMFieldKind { Dim, SelectorWell, Combo, Check, Int, DatumRef, FeatureWell, Text };
 
 // Which topology kinds a SelectorWell accepts (mirrors feature_params sel(kinds…)).
+// `plane` is special: it does not come from the id-buffer (the origin datum planes aren't
+// tessellated topology). A plane well is pickable in the viewport via SketchMode::drawPlanePicker,
+// which routes a reserved datum-plane ref ("plane.front"/"plane.top"/"plane.right") into the well
+// — the SolidWorks "click a reference plane" interaction reused outside the new-sketch flow.
 struct PMSelKinds {
-    bool face = false, edge = false, vertex = false, body = false;
+    bool face = false, edge = false, vertex = false, body = false, plane = false, axis = false;
 };
 
 // One row of a feature form (data-driven; one per param/ref in feature_params order).
@@ -105,6 +111,12 @@ const PMFormDef* pmFormForCommand(const std::string& cmdId, std::string& mode);
 struct PMSelEntry {
     nlohmann::json selector;   // resolved selector object (kind/surf/centroid/…)
     std::string label;         // short chip text ("Edge")
+    // Id-pass identity of the pick AT pick time (body + topo id + render::PickKind as int), so the
+    // viewport can highlight every selected edge — not just the last one in st.selection — including
+    // when a preview breaks. -1 kind = no viewport identity (datum/loaded pick); not highlightable.
+    uint32_t pickBody = 0;
+    uint32_t pickTopo = 0;
+    int      pickKind = -1;
 };
 
 struct PMField {
@@ -204,13 +216,73 @@ public:
     void drawBody(AppState& st);
 
     // Feed a resolved viewport pick into the active selector well (called from the selection
-    // observer). Returns true if the pick was consumed (an active well accepted it).
-    bool routePick(const nlohmann::json& selector, int pickKind /*render::PickKind*/);
+    // observer). Returns true if the pick was consumed (an active well accepted it). pickBody/
+    // pickTopo are the id-pass identity of the clicked element (0/0 if unknown), stored so the
+    // viewport can highlight every well pick — see collectActiveWellHighlights().
+    bool routePick(const nlohmann::json& selector, int pickKind /*render::PickKind*/,
+                   uint32_t pickBody = 0, uint32_t pickTopo = 0);
+
+    // Append (body_id, topo_id, render::PickKind) for every pick in the ACTIVE edge-accepting well
+    // that carries a viewport identity. The viewport feeds these into the overlay highlight set so
+    // all selected edges glow (not just the last-clicked one), including when the preview breaks.
+    void collectActiveWellHighlights(std::vector<std::array<uint32_t, 3>>& out) const;
+
+    // A selected fillet/chamfer edge reconstructed in WORLD space from its selector, for the dashed
+    // 3D overlay that lets the user see + deselect edges that the live round has already eaten away.
+    // Stored as a world polyline so it covers every curve type the same way: a straight edge is two
+    // points; a circular edge (revolve!) is a sampled loop (`closed`); anything we can't reconstruct
+    // is a single centroid point (drawn as a small ring). `pickIndex` is the entry's position in the
+    // active well (passed back to removeActiveWellPick).
+    struct EdgeSeg {
+        std::vector<std::array<float, 3>> pts;  // world polyline (>=1 pt)
+        bool closed = false;                    // connect last->first (full circle)
+        int  pickIndex = -1;                    // index into the active well's pick list
+    };
+    // Reconstruct the original (pre-round) edges of the active fillet/chamfer well from their stored
+    // selectors (line: centroid ± ½·len·axis; circle: radius=len/2π loop in the axis plane). Empty
+    // unless a blend PM is active. The viewport draws these dashed and hit-tests them so a click near
+    // one deselects that edge.
+    void collectActiveWellEdgeSegments(std::vector<EdgeSeg>& out) const;
+
+    // Remove the pick at `pickIndex` from the active edge well (the dashed-line deselect path) and
+    // schedule a live preview. Returns true if a pick was removed.
+    bool removeActiveWellPick(int pickIndex);
 
     // True when the active selector well wants BODY selectors (e.g. boolean targets/tools). The
     // selection observer uses this to resolve the picked element's owning body (resolvePick
     // kind="body") instead of the face/edge/vertex it clicked.
     bool activeWellWantsBody() const;
+
+    // True when the active selector well accepts origin datum-plane picks (PMSelKinds.plane). The
+    // viewport plane picker (SketchMode::drawPlanePicker) only arms while this is true.
+    bool activeWellWantsPlane() const;
+
+    // True when the active well is a fillet/chamfer edge well: a FACE pick should expand into ALL of
+    // that face's edges (SolidWorks "fillet a whole face"). The selection observer handles the
+    // expansion (doc_face_edges -> per-edge resolvePick -> routePick).
+    bool activeWellExpandsFaceToEdges() const;
+
+    // Route an origin datum-plane ref ("plane.front"/"plane.top"/"plane.right") into the active
+    // plane-accepting well (called by the viewport plane picker). Stores the reserved datum string
+    // as the well's selector — the engine's _SEL_OR_DATUM slots accept it directly. Re-picking the
+    // same plane toggles it off (SolidWorks). Returns true if a well consumed the pick.
+    bool routeDatumPlane(const std::string& datumId);
+
+    // True when the active selector well accepts datum-axis picks (PMSelKinds.axis). The viewport
+    // axis picker (SketchMode::drawAxisPicker) only arms while this is true.
+    bool activeWellWantsAxis() const;
+
+    // True when the active well wants EDGES but not faces (e.g. fillet/chamfer "Edges"). The viewport
+    // then uses an edge-PREFERRING pick (snap to the nearest edge within a grab radius) so 1-px-wide
+    // curved rims on a revolved/round body are clickable instead of losing the centre pixel to the
+    // face behind them — the "fillet can't find edges on a revolve" fix.
+    bool activeWellPrefersEdge() const;
+
+    // Route a datum-AXIS feature reference into the active axis-accepting well (called by the
+    // viewport axis picker). `fid` is the datum-axis feature id; `label` is the chip text (the
+    // datum's name). Stores a {"kind":"datum","feature":fid} selector — the engine's revolve /
+    // pattern axis slots resolve it via resolve_axis_ref. Re-picking the same axis toggles it off.
+    bool routeDatumAxis(const std::string& fid, const std::string& label);
 
     // Human phrase for the active well's accepted topology ("edges", "faces or edges", …), or ""
     // when no selector well is active. Used to toast feedback when a pick is rejected for the
@@ -267,6 +339,10 @@ private:
     void applyAiAssistResult(AppState& st, const nlohmann::json& result, int requestSeq);
     void loadFromTree(AppState& st, const nlohmann::json& feature);  // edit-path populate
     PMField* activeWell();
+    // After a single-ref well gets a pick, hand focus to the next empty visible selector well
+    // (SolidWorks "pick A then B" flow) so multi-reference tools don't make the user click each
+    // well first. No-op for multi-pick wells (they keep focus to gather more).
+    void advanceWellAfterFill(PMField* filled);
     // C51: the profile/sections well (first SelectorWell keyed "profile" or "sections").
     PMField* profileWell();
     const PMField* profileWell() const;
@@ -300,6 +376,15 @@ private:
 
     // C37-F: inline preview-error message shown in the PM body (cleared on next successful preview).
     std::string previewError_;
+    // Non-fatal note from the last successful preview (e.g. fillet rounded a subset of the selected
+    // edges) — surfaced in the PM body in amber so the user can lower the size before committing.
+    std::string previewWarning_;
+
+    // True only during the final commit apply. Blend features (fillet/chamfer) preview with the
+    // feature SUPPRESSED so the viewport shows + picks the UN-rounded base body — edge picks are then
+    // captured against stable base topology (no fillet blend/trim edges to corrupt them), making
+    // select/unselect reliable. On commit the feature is un-suppressed so the rounds actually apply.
+    bool committing_ = false;
 
     // C37-F: true when we need to set keyboard focus on the first editable field next frame.
     bool wantFocusFirstField_ = false;

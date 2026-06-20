@@ -330,8 +330,10 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         };
         auto drawHelpMenu = [&]() {
             if (ImGui::MenuItem("AI Help")) {
+                // Help folded into Ask mode in the unified Copilot conversation.
                 st.showAIPanel = true;
-                st.focusHelpTab = true;
+                st.focusDesignTab = true;
+                st.aiInteraction = 2;  // Ask
             }
             if (ImGui::MenuItem("About AI-CAD")) st.showAbout = true;
             // Documentation / Keyboard Shortcuts have no backing yet — greyed placeholders.

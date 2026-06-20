@@ -89,6 +89,12 @@ public:
     // Last rebuild feature_status array from the worker response.
     const nlohmann::json& featureStatus() const { return featureStatus_; }
 
+    // Displayable reference geometry (datum axes/planes/points/csys) from the latest response, as a
+    // raw JSON array (see core/doc/session.cpp ops_response "datums" for the per-entry shape). The
+    // renderer draws these as overlays — a datum produces no body, so without this it is invisible.
+    // Empty for docs with no datum features (or an engine that doesn't ship the field).
+    const nlohmann::json& refDatums() const { return refDatums_; }
+
     // W12+ — drawings restored by the most recent doc_open: an array of {doc_id, name,
     // source_doc_id}, one per embedded drawing the engine re-registered (their `source` already
     // re-pointed to THIS reopened doc). Empty for a file with no drawings. The open caller
@@ -178,6 +184,10 @@ public:
                             const std::string& kind, uint32_t topo_id,
                             std::string& err);
 
+    // The unique edge topo_ids bordering a face — for "fillet a whole face" (a face pick expands
+    // into the face's edges). Empty on error / no doc.
+    std::vector<uint32_t> faceEdges(WorkerClient& w, uint32_t body_id, uint32_t face_topo_id);
+
     // Save / open (.step+ path). On open: updates docId/revision/tree.
     // asSolid (optional): when true the doc_open request carries {"as_solid": true} so a mesh-format
     // source (.stl/.obj/.ply/.3mf/.gltf/.glb/.3dm) is sewn into a real B-rep solid by the engine
@@ -254,7 +264,8 @@ public:
     bool resync(WorkerClient& w);
 
     // Reset local state (e.g. on worker restart).
-    void reset() { docId_.clear(); revision_ = -1; tree_ = {}; featureStatus_ = {}; }
+    void reset() { docId_.clear(); revision_ = -1; tree_ = {}; featureStatus_ = {};
+                   refDatums_ = nlohmann::json::array(); }
 
     // Owned topology for each feature (raw, as last parsed). Exposed for completeness / debugging.
     const std::unordered_map<std::string, Owned>& ownerMap() const { return ownerMap_; }
@@ -273,6 +284,7 @@ private:
     int            revision_ = -1;
     nlohmann::json tree_;
     nlohmann::json featureStatus_;
+    nlohmann::json refDatums_ = nlohmann::json::array();           // datum reference geometry to draw
     nlohmann::json lastOpenedDrawings_ = nlohmann::json::array();  // W12+ doc_open "drawings"
     Listener       listener_;
     StaleCb        staleResyncCb_;  // W1-B: fired on stale_revision auto-resync

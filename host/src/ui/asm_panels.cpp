@@ -269,7 +269,10 @@ bool AsmPanels::addMate(AppState& st, const std::string& type, const std::string
     auto parseField = [&](std::vector<char>& buf, const char* label, bool angle,
                           double& out) -> bool {
         std::string txt(buf.data()); std::string perr;
-        if (!pmParseDim(txt, out, perr, angle)) { mateError_ = std::string(label) + ": " + perr; return false; }
+        // Bare length literals follow the active document unit (IPS -> inch, MMGS -> mm);
+        // angles are always degrees.
+        const double bareScale = (!angle && st.ips()) ? 25.4 : 1.0;
+        if (!pmParseDim(txt, out, perr, angle, bareScale)) { mateError_ = std::string(label) + ": " + perr; return false; }
         return true;
     };
     if (type == "distance" || type == "angle") {
@@ -601,7 +604,8 @@ bool AsmPanels::addPattern(AppState& st, std::string& aicmOut, std::string& erro
         double count = 0, spacing = 0; std::string perr;
         std::string ctxt(patternCountBuf_.data()), stxt(patternSpacingBuf_.data());
         if (!pmParseDim(ctxt, count, perr, /*isAngle=*/false)) { errorOut = "count: " + perr; return false; }
-        if (!pmParseDim(stxt, spacing, perr, /*isAngle=*/false)) { errorOut = "spacing: " + perr; return false; }
+        // spacing is a length -> bare literals follow the active doc unit (IPS inch / MMGS mm).
+        if (!pmParseDim(stxt, spacing, perr, /*isAngle=*/false, st.ips() ? 25.4 : 1.0)) { errorOut = "spacing: " + perr; return false; }
         feature = {
             {"type", "asm_linear_pattern"}, {"name", "Component Pattern"}, {"suppressed", false},
             {"params", {{"count1", {{"value", count}, {"expr", nullptr}}},

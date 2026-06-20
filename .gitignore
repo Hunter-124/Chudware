@@ -12,7 +12,7 @@ core/build/
 # Test caches
 .pytest_cache/
 
-# Generated PNG raster renders (binary; regenerate with tools/render_sketches.py).
+# Generated PNG raster renders (binary).
 # The text SVGs in corpus_render/ are kept for diffable visual reference.
 corpus_render/png/
 
@@ -39,3 +39,11 @@ _shot_*.png
 
 # Auto-provisioned OCCT (Open CASCADE) prebuilt binaries — fetched by CMake, never committed
 third_party/
+OCCT/
+
+# Loose build/debug artifacts that land in the repo root (never committed)
+/libtest*.obj
+/aicad_*.log
+/chain_dbg.json
+/session-continuation-prompt-*.txt
+core/build-occt/

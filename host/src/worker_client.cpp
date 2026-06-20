@@ -61,13 +61,23 @@ bool routeDocToCpp(const std::string& method, const json& params) {
     // core (no Python doc to fall back to), surfacing the gap rather than misrouting.
     if (params.is_object()) {
         // doc_id (most doc_* / config_* / export_*) or `into` (import_file appends to a
-        // doc) carrying a doc-cpp prefix binds the call to the C++-backed document.
+        // doc) binds the call to a C++-backed document. A part/assembly carries a "doc-cpp"
+        // id; a 2D DRAWING session (drawing_new / drawing_add_* / drawing_get / drawing_bom /
+        // export_drawing) carries a "dwg-cpp" id — both route to the C++ core.
         for (const char* key : {"doc_id", "into"}) {
             auto it = params.find(key);
-            if (it != params.end() && it->is_string() &&
-                it->get<std::string>().rfind("doc-cpp", 0) == 0)
-                return true;
+            if (it != params.end() && it->is_string()) {
+                const std::string v = it->get<std::string>();
+                if (v.rfind("doc-cpp", 0) == 0 || v.rfind("dwg-cpp", 0) == 0) return true;
+            }
         }
+        // drawing_new carries the SOURCE part by id (source_doc_id), not a doc_id of its
+        // own yet — route it to C++ when the source part is C++-backed so the new drawing
+        // is minted in (and stays bound to) the C++ core.
+        auto sit = params.find("source_doc_id");
+        if (sit != params.end() && sit->is_string() &&
+            sit->get<std::string>().rfind("doc-cpp", 0) == 0)
+            return true;
     }
     // doc_new / doc_open / import_file (no `into`) MINT a fresh doc -> route to C++ when
     // the flag is on. C++ now handles PART and ASSEMBLY documents (P57b compile + P57d

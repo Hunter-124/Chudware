@@ -362,15 +362,6 @@ def test_seam_edges_not_drawn() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 8: verify existing schema fixture suite still passes (regression)
-# ---------------------------------------------------------------------------
-def test_schema_fixtures() -> None:
-    """Smoke: engine.doc.test_schema_fixtures.main() still runs cleanly."""
-    import engine.doc.test_schema_fixtures as tsf
-    tsf.main()
-    print("test_schema_fixtures regression: PASS")
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -384,7 +375,6 @@ def main() -> None:
     test_write_file()
     test_unknown_chunk_skip()
     test_seam_edges_not_drawn()
-    test_schema_fixtures()
     print("\nAll tests passed.")
 
 

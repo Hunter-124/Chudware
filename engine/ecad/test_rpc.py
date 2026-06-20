@@ -5,7 +5,7 @@ Covers:
   - ecad_undo / ecad_redo
   - ecad_new pcb: set outline + add footprint + ecad_export bom
   - ecad_to_3d: returns either step_path OR a clean not_available error
-  - worker registry regression: import engine.worker; assert doc_new + ecad_* both present
+  - worker registry regression: import engine.worker; assert ecad_* present + doc_* moved to C++
 """
 from __future__ import annotations
 
@@ -512,12 +512,15 @@ def test_ecad_dfm_rpc() -> None:
 
 
 def test_worker_registry_regression() -> None:
-    """Importing engine.worker must succeed and both doc_* and ecad_* must be present."""
+    """Importing engine.worker must succeed and ecad_* must be present.
+
+    The Python doc engine was rewritten into the C++ core, so doc_*/sketch_*/eval_* are no longer
+    in the Python worker registry — assert doc_new is ABSENT (it routes to libaicad now)."""
     import importlib
     # Fresh import (may already be cached -- that's fine)
     import engine.worker as w
 
-    assert "doc_new" in w._METHODS, "doc_new missing from worker registry"
+    assert "doc_new" not in w._METHODS, "doc_new should have moved to the C++ core"
     ecad_methods = [m for m in w._METHODS if m.startswith("ecad_")]
     assert len(ecad_methods) > 0, "no ecad_* methods registered in worker"
 

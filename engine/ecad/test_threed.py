@@ -147,9 +147,12 @@ def test_proxy_placement() -> None:
 
 
 def test_part_doc_compiles() -> None:
-    """board_to_part_doc validates AND compiles to a non-empty / non-zero-volume body."""
-    from engine.doc.schema import validate_document
-    from engine.doc.compiler import CompileCache, compile_document
+    """board_to_part_doc produces a re-importable STEP + a well-formed aicad.part/1 envelope.
+
+    The Python doc compiler/schema were rewritten into the C++ core (libaicad) and deleted; the
+    actual compile + schema validation of this part doc now happen there when the host opens it.
+    This test keeps the closure-free half: the ECAD->STEP geometry round-trips, and the part-doc
+    envelope is structurally correct (one `import` feature referencing the STEP)."""
     from engine.doc.formats import import_path, _IMPORT_CACHE
 
     board = _make_board()
@@ -165,22 +168,15 @@ def test_part_doc_compiles() -> None:
             "STEP re-import produced no OCCT solids"
         print(f"[threed] STEP re-import: {len(imported)} body(ies)")
 
-        # (b) part doc validates against the CAD part schema.
+        # (b) part-doc envelope is well-formed (compiled/validated in the C++ core now).
         doc = board_to_part_doc(board, step_path)
-        errs = validate_document(doc)
-        assert errs == [], f"part doc failed validation: {errs}"
-        print("[threed] part doc validates (aicad.part/1)")
-
-        # (c) part doc compiles via the CAD pipeline to non-empty bodies with positive volume.
-        _IMPORT_CACHE.clear()
-        result = compile_document(doc, CompileCache())
-        st = next((s for s in result.feature_status if s["id"] == "f1"), None)
-        assert st is not None and st["ok"], f"import feature failed to compile: {st}"
-        assert result.bodies, "compiled part doc produced no bodies"
-        total_vol = sum(float(b.shape.volume) for b in result.bodies)
-        assert total_vol > 0.0, f"compiled part doc has zero volume ({total_vol})"
-        print(f"[threed] part doc compiles -> {len(result.bodies)} body(ies), "
-              f"total volume {total_vol:.1f} mm^3")
+        assert doc.get("schema") == "aicad.part/1", f"bad schema: {doc.get('schema')}"
+        feats = doc.get("features")
+        assert isinstance(feats, list) and len(feats) >= 1, "part doc has no features"
+        f1 = feats[0]
+        assert f1.get("type") == "import", f"expected an import feature, got {f1.get('type')}"
+        assert f1.get("params", {}).get("source_path"), "import feature missing source_path"
+        print(f"[threed] part doc envelope OK ({len(feats)} feature(s), import->STEP)")
 
 
 # --------------------------------------------------------------------------- 4. robustness

@@ -492,26 +492,18 @@ def test_threed(board: dict, tmpdir: str) -> None:
     print(f"  board_volume={board_volume:.2f} mm^3  step_path={step_path}")
     print(f"  summary: {summary}")
 
-    # board_to_part_doc -> validate_document
-    from engine.doc.schema import validate_document
+    # board_to_part_doc -> well-formed aicad.part/1 envelope. The Python doc schema/compiler were
+    # rewritten into the C++ core (libaicad) and deleted; the host validates + compiles this doc
+    # there when it opens it. Verify the envelope shape here (closure-free).
     part_doc = board_to_part_doc(board, step_path)
-    val_errs = validate_document(part_doc)
-    _assert(len(val_errs) == 0,
-            f"board_to_part_doc validates (got {len(val_errs)} errors: {val_errs[:3]})")
-
-    # compile_document -> non-empty body list (or graceful skip if OCP not available)
-    try:
-        from engine.doc.compiler import compile_document
-        cr = compile_document(part_doc)
-        # The import feature should produce >=1 body when OCP/build123d can load the STEP.
-        # It is also acceptable for the compiler to succeed with 0 bodies if the STEP cannot
-        # be round-tripped (the doc validates and compiles without raising regardless).
-        _assert(cr is not None, "compile_document returned a CompileResult")
-        print(f"  compile_document: features={len(part_doc['features'])}, "
-              f"bodies_len={len(getattr(cr, 'bodies', []))}")
-    except Exception as e:
-        # compiler may be unavailable in CI; that is not a FAILure for this test.
-        print(f"  compile_document skipped ({type(e).__name__}: {e})")
+    _assert(part_doc.get("schema") == "aicad.part/1",
+            f"board_to_part_doc schema = {part_doc.get('schema')} (expected aicad.part/1)")
+    feats = part_doc.get("features")
+    _assert(isinstance(feats, list) and len(feats) >= 1,
+            f"board_to_part_doc features malformed: {feats}")
+    _assert(feats[0].get("type") == "import" and feats[0].get("params", {}).get("source_path"),
+            "board_to_part_doc first feature is not a STEP `import`")
+    print(f"  board_to_part_doc envelope OK: features={len(feats)}, import->STEP")
 
 
 # ==============================================================================

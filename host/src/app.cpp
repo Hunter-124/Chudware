@@ -67,7 +67,7 @@
 #include "ui/cursors.h"       // W1-B: cursor manager
 // --- C19: simulation + flow + evaluate UI ---
 #include "core/sim_client.h"
-#include "ui/sim_panel.h"
+#include "ui/sim_manager.h"
 #include "ui/evaluate_dialogs.h"
 // --- end C19 ---
 // --- C22b: Activity panel + prompt editor ---
@@ -135,6 +135,7 @@ void ecadDocRpc(AppState& st, const char* method, const char* okMsg) {
     nlohmann::json res;
     if (!ecadCall(st, method, {{"doc_id", st.ecadDocId}}, res)) return;
     ecadAdopt(st, res);
+    st.markEcadTabDirty(st.ecadDocId);   // rebuild / autoroute / fill_zones mutate the board
     if (okMsg) st.toast(ui::ToastLevel::Info, okMsg);
 }
 
@@ -160,6 +161,7 @@ bool ecadApplyOps(AppState& st, const nlohmann::json& ops) {
         return false;
     }
     ecadAdopt(st, res);
+    st.markEcadTabDirty(st.ecadDocId);   // canvas place/route/move/delete/edit → unsaved
     return true;
 }
 
@@ -178,6 +180,7 @@ void ecadUndo(AppState& st) {
         return;
     }
     ecadAdopt(st, res);
+    st.markEcadTabDirty(st.ecadDocId);
     st.toast(ui::ToastLevel::Info, "Undo");
 }
 
@@ -193,6 +196,7 @@ void ecadRedo(AppState& st) {
         return;
     }
     ecadAdopt(st, res);
+    st.markEcadTabDirty(st.ecadDocId);
     st.toast(ui::ToastLevel::Info, "Redo");
 }
 
@@ -212,6 +216,17 @@ void ecadExport(AppState& st, const char* kind) {
 // ecad_save writes through engine.ecad.formats. Reuses the doc's current name as the suggested file.
 void ecadSaveDoc(AppState& st) {
     if (st.ecadDocId.empty()) { st.toast(ui::ToastLevel::Warn, "Design or open an ECAD document to save"); return; }
+    // Prefer the unified per-tab saver when this ECAD doc has a tab — it re-saves silently to the
+    // tab's known path (Save-As only on first save) and clears the tab's unsaved marker.
+    for (int i = 0; i < (int)st.docTabs.size(); ++i) {
+        const auto& t = st.docTabs[i];
+        if ((t.kind == AppState::DocTab::TabKind::Schematic ||
+             t.kind == AppState::DocTab::TabKind::PCB) && t.ecadDocId == st.ecadDocId) {
+            ui::saveDocTab(st, i, /*forceDialog=*/false);
+            return;
+        }
+    }
+    // Fallback: a tab-less ECAD doc (e.g. an AI-designed schematic that never got a tab).
     const std::string name = ui::ecadEditorMirror().name();
     const std::string path = ui::saveFileDialog(
         "AI-ECAD design (*.ecad+)\0*.ecad+\0All files (*.*)\0*.*\0", "ecad+",
@@ -664,6 +679,24 @@ static void ensureStarterDoc(AppState& st, bool shot) {
     st.addLog("[startup] opened default starter part");
 }
 
+// Save every dirty tab for the exit flow ("Save All & Quit"), dispatching by kind via the unified
+// saver (CAD .step+, ECAD .ecad+, Drawing → its source part). Titled docs re-save silently; untitled
+// ones raise a Save-As dialog. Restores the originally-active tab afterward (CAD/Drawing saves
+// re-point the mirror). Returns true only if every dirty doc is now clean — a cancelled Save-As or a
+// save failure returns false → abort the quit so nothing is lost.
+static bool saveAllDirtyForQuit(AppState& st) {
+    const int origActive = st.activeTab;
+    bool allSaved = true;
+    for (int i = 0; i < (int)st.docTabs.size(); ++i) {
+        if (!st.docTabs[i].dirty) continue;
+        ui::TabSaveResult r = ui::saveDocTab(st, i, /*forceDialog=*/false);
+        if (r == ui::TabSaveResult::Cancelled || r == ui::TabSaveResult::Failed) allSaved = false;
+    }
+    if (origActive >= 0 && origActive < (int)st.docTabs.size())
+        st.switchToTab(origActive);   // restore the originally-active document
+    return allSaved;
+}
+
 int run_gui(const char* screenshotPath) {
     const bool shot = screenshotPath != nullptr;
     if (!glfwInit()) return 1;
@@ -793,11 +826,14 @@ int run_gui(const char* screenshotPath) {
     st.propertyManager = &propertyManager;
     st.fallbackPropertyManager = &propertyManager;
 
-    // C19: SimClient (worker #2) + Simulation panel + Evaluate dialogs — owned here.
+    // C19: SimClient (worker #2, single shared solver) + Evaluate dialogs — owned here. The
+    // per-document SimManagers live on each DocSession; the fallback below covers the empty start
+    // state / non-CAD tabs.
     core::SimClient simClient;
     st.simClient = &simClient;
-    ui::SimPanel simPanel;
-    st.simPanel = &simPanel;
+    ui::SimManager fallbackSimManager;
+    st.fallbackSimManager = &fallbackSimManager;
+    st.simManager = &fallbackSimManager;
     ui::EvaluateDialogs evaluateDialogs;        // fallback Measure/Mass/Section dialogs (per-doc otherwise)
     st.evaluateDialogs = &evaluateDialogs;
     st.fallbackEvaluate = &evaluateDialogs;
@@ -835,7 +871,7 @@ int run_gui(const char* screenshotPath) {
     //   - sketch-tab commands (sketch_new / sk_* / smart_dim / sketch_exit) go to SketchMode first
     //     so the sketch experience takes priority over any PM form for those ids;
     //   - commands without a form log a stub line so they stay observable until later cards wire them.
-    auto dispatchCmd = [&st, &simPanel, &asmPanels](const char* cmd_id) {
+    auto dispatchCmd = [&st, &asmPanels](const char* cmd_id) {
         // Multi-document: resolve the PropertyManager / SketchMode / EvaluateDialogs of the ACTIVE
         // document (st.* are re-seated on every tab switch). Shadowing the names keeps the dispatch
         // body below byte-identical to the single-document version.
@@ -907,7 +943,7 @@ int run_gui(const char* screenshotPath) {
         if (cmd == "sm_export_flat_dxf") { exportFlatDxf(st); return; }  // W14: flat-pattern DXF
         if (cmd.rfind("sim_", 0) == 0) {
             st.showSimulationTools = true;
-            if (simPanel.handleCommand(st, cmd)) return;
+            if (st.simManager && st.simManager->handleCommand(st, cmd)) return;
         }
         if (cmd.rfind("eval_", 0) == 0 && evaluateDialogs.handleCommand(st, cmd)) return;
         std::printf("[ribbon] %s (no PM form)\n", cmd_id);
@@ -1067,6 +1103,16 @@ int run_gui(const char* screenshotPath) {
                         } catch (...) {}
                     }
                 }
+                // Simulation studies: route a FACE pick into the armed fixture/load well of the
+                // active study (only when the Simulation tab is up and no PM form owns picks — the
+                // mutual-exclusion guard lives in SimManager::wantsViewportFacePick).
+                if (st.simManager && st.simManager->wantsViewportFacePick(st) &&
+                    item.hit.kind == render::PickKind::Face) {
+                    try {
+                        nlohmann::json selObj = nlohmann::json::parse(sel);
+                        st.simManager->routeFacePick(st, selObj, item.hit.body_id, item.hit.topo_id);
+                    } catch (...) {}
+                }
             } else if (!err.empty()) {
                 // Log once (avoid flooding; resolvePick logs stale_revision internally).
             }
@@ -1212,7 +1258,7 @@ int run_gui(const char* screenshotPath) {
         st.showSimulationTools = true;
         st.showRibbon = true;
         st.ribbonTab = AppState::RT_Simulation;
-        st.showSimPanel = true;
+        st.leftPaneTab = AppState::LP_Simulation;
     }
     // C22b: activity shot — new part doc -> agent_run_v2 -> Activity panel -> Settings Agents tab
     st.wantActivity = shot && shotMode && std::strcmp(shotMode, "activity") == 0;
@@ -1421,7 +1467,7 @@ int run_gui(const char* screenshotPath) {
     // six step machines + their per-step backbuffer captures, extracted to ui::ScenarioRunner
     // (ui/scenarios.cpp). tick() advances the active scenario before each frame; endFrame()
     // handles the captures and the scenario-driven swap+continue / swap+break at loop bottom.
-    ui::ScenarioRunner scenarios(simPanel, activityPanel);
+    ui::ScenarioRunner scenarios(activityPanel);
 
     auto desiredThemeForFrame = [&st]() {
         if (const char* envTheme = std::getenv("AI_CAD_THEME")) {
@@ -1449,6 +1495,20 @@ int run_gui(const char* screenshotPath) {
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
+
+        // Unsaved-changes guard on exit. A close request (title-bar X / Alt+F4 / File > Quit all set
+        // glfwSetWindowShouldClose) is intercepted here: if any document has unsaved edits and the
+        // user hasn't already confirmed, cancel the close and raise the exit confirmation modal. A
+        // clean session (or an already-confirmed quit) falls straight through and the loop exits.
+        if (!shot && glfwWindowShouldClose(win) && !st.quitConfirmed) {
+            bool anyDirty = false;
+            for (const auto& t : st.docTabs)
+                if (t.dirty) { anyDirty = true; break; }
+            if (anyDirty) {
+                glfwSetWindowShouldClose(win, GLFW_FALSE);
+                st.wantQuitConfirm = true;
+            }
+        }
 
         if (st.setupDone.exchange(false)) {
             bool ok;
@@ -2173,50 +2233,36 @@ int run_gui(const char* screenshotPath) {
                     st.pushRecentFile(path);
                 }
             }
-            if (st.requestSave) {
-                st.requestSave = false;
-                std::string saved = ui::featureTreeSaveDoc(st, /*saveAs=*/false);
-                if (!saved.empty()) st.pushRecentFile(saved);
+            // Save / Save As route through the unified per-tab saver so the active tab saves by its
+            // kind (CAD .step+, ECAD .ecad+, or a Drawing via its source part). saveDocTab records
+            // Recent + clears the unsaved marker itself. Saving a Drawing switches the mirror to its
+            // source part, so restore the active tab afterward (a no-op for CAD/ECAD saves).
+            if (st.requestSave || st.requestSaveAs) {
+                const bool asSave = st.requestSaveAs;
+                st.requestSave = st.requestSaveAs = false;
+                const int origActive = st.activeTab;
+                ui::saveDocTab(st, origActive, /*forceDialog=*/asSave);
+                if (origActive >= 0 && origActive < (int)st.docTabs.size() &&
+                    st.activeTab != origActive)
+                    st.switchToTab(origActive);
             }
-            if (st.requestSaveAs) {
-                st.requestSaveAs = false;
-                std::string saved = ui::featureTreeSaveDoc(st, /*saveAs=*/true);
-                if (!saved.empty()) st.pushRecentFile(saved);
-            }
-            // Wave-5-fill: Save All — save every part/assembly tab. Tabs with a known path re-save
-            // silently to it (DocMirror::save needs the mirror pointed at the doc, so we switch to
-            // each first); the never-saved ACTIVE doc falls back to a Save-As prompt (a batch must
-            // not pop one dialog per untitled doc). Drawing/ECAD tabs are skipped (not DocMirror
-            // docs — they have their own save). The original active tab is restored afterward.
+            // Wave-5-fill: Save All — save every part/assembly + ECAD tab via the unified saver.
+            // Titled docs re-save silently; the never-saved ACTIVE doc falls back to a Save-As prompt
+            // (a batch must not pop one dialog per untitled doc, so untitled BACKGROUND tabs are left
+            // for an explicit per-doc Save). Drawing tabs are skipped — they persist when their source
+            // part is saved (which this loop does, clearing their markers). The original active tab is
+            // restored afterward (CAD saves re-point the mirror as a side effect).
             if (st.requestSaveAll) {
                 st.requestSaveAll = false;
                 const int origActive = st.activeTab;
                 int savedCount = 0, failCount = 0;
                 for (int i = 0; i < (int)st.docTabs.size(); ++i) {
-                    AppState::DocTab& tab = st.docTabs[i];
-                    if (tab.kind == AppState::DocTab::TabKind::Drawing ||
-                        tab.kind == AppState::DocTab::TabKind::Schematic ||
-                        tab.kind == AppState::DocTab::TabKind::PCB)
-                        continue;  // not a DocMirror-backed doc
-                    if (!tab.path.empty()) {
-                        st.switchToTab(i);   // re-point the mirror at this doc (no-op if already active)
-                        std::string err;
-                        if (st.docMirror.save(st.worker, tab.path, err)) {
-                            tab.dirty = false;
-                            st.pushRecentFile(tab.path);
-                            ++savedCount;
-                        } else {
-                            st.addLog("[doc] save-all failed for " + tab.path + ": " + err);
-                            ++failCount;
-                        }
-                    } else if (i == origActive) {
-                        // Untitled active doc: a Save-As prompt (sets tab.path + s_docPath on success).
-                        // Re-point the mirror at it first (a prior iteration may have switched away).
-                        st.switchToTab(i);
-                        std::string saved = ui::featureTreeSaveDoc(st, /*saveAs=*/false);
-                        if (!saved.empty()) { st.pushRecentFile(saved); ++savedCount; }
-                    }
-                    // Other untitled tabs are left for an explicit per-doc Save (no batch dialogs).
+                    const AppState::DocTab& tab = st.docTabs[i];
+                    if (tab.kind == AppState::DocTab::TabKind::Drawing) continue;  // via source part
+                    if (tab.path.empty() && i != origActive) continue;            // untitled background
+                    ui::TabSaveResult r = ui::saveDocTab(st, i, /*forceDialog=*/false);
+                    if (r == ui::TabSaveResult::Saved) ++savedCount;
+                    else if (r == ui::TabSaveResult::Failed) ++failCount;
                 }
                 if (origActive >= 0 && origActive < (int)st.docTabs.size())
                     st.switchToTab(origActive);   // restore the originally-active document
@@ -2386,9 +2432,10 @@ int run_gui(const char* screenshotPath) {
         if (st.ecadUndoGo) { st.ecadUndoGo = false; ecadUndo(st); }  // ECAD history undo
         if (st.ecadRedoGo) { st.ecadRedoGo = false; ecadRedo(st); }  // ECAD history redo
 
-        // ---------- C19: simulation panel + evaluate dialogs ----------
-        simPanel.tick(st);          // drain SimClient progress + completion (loads overlays)
-        simPanel.draw(st);
+        // ---------- C19: simulation (active doc) + evaluate dialogs ----------
+        // The active document's SimManager drains its own SimClient job (owner-gated) and loads result
+        // overlays. Its tree + setup forms render in the left pane's Simulation tab (drawLeftPane).
+        if (st.simManager) st.simManager->tick(st);
         st.evaluateDialogs->draw(st);   // active doc's Measure/Mass/Section windows (per-doc; re-seated)
 
         // ---------- C20b: assembly panels (Insert / Mate / Explode / Interference / BOM) ----------
@@ -2398,6 +2445,58 @@ int run_gui(const char* screenshotPath) {
         // Hosted here at app scope (not inside the Viewport window) so the doc-strip "+" / Ctrl+N
         // raise it regardless of which central document — part, drawing, or ECAD — is forward.
         ui::drawNewDocChooser(st);
+
+        // ---------- unsaved-changes confirmation on app exit ----------
+        // Raised from the main-loop close guard (st.wantQuitConfirm) when the user tries to quit with
+        // dirty documents. Save All & Quit saves every dirty doc then exits (cancelled Save-As keeps
+        // the app open); Quit Without Saving discards; Cancel returns. quitConfirmed latches the
+        // approved choices so the re-issued close request falls through the guard to the real exit.
+        {
+            static bool s_quitModalOpen = false;
+            if (st.wantQuitConfirm) { st.wantQuitConfirm = false; s_quitModalOpen = true; }
+            if (s_quitModalOpen) ImGui::OpenPopup("Quit AI-CAD?##appquit");
+            ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f,
+                                           vp->Pos.y + vp->Size.y * 0.5f),
+                                    ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            bool open = true;
+            if (ImGui::BeginPopupModal("Quit AI-CAD?##appquit", &open,
+                                       ImGuiWindowFlags_AlwaysAutoResize |
+                                           ImGuiWindowFlags_NoSavedSettings)) {
+                int n = 0;
+                for (const auto& t : st.docTabs) if (t.dirty) ++n;
+                ImGui::Text("%d document%s with unsaved changes:", n, n == 1 ? "" : "s");
+                ImGui::Spacing();
+                for (const auto& t : st.docTabs)
+                    if (t.dirty) ImGui::BulletText("%s", t.displayTitle().c_str());
+                ImGui::Spacing();
+                ImGui::TextUnformatted("Save before quitting?");
+                ImGui::Spacing();
+                const float bw = 150.0f * scale;
+                if (ImGui::Button("Save All & Quit", ImVec2(bw, 0))) {
+                    if (saveAllDirtyForQuit(st)) {
+                        st.quitConfirmed = true;
+                        glfwSetWindowShouldClose(win, GLFW_TRUE);
+                        s_quitModalOpen = false;
+                        ImGui::CloseCurrentPopup();
+                    }
+                    // else: a Save-As was cancelled — keep the modal up so nothing is lost.
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Quit Without Saving", ImVec2(bw + 30.0f * scale, 0))) {
+                    st.quitConfirmed = true;
+                    glfwSetWindowShouldClose(win, GLFW_TRUE);
+                    s_quitModalOpen = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel", ImVec2(90.0f * scale, 0))) {
+                    s_quitModalOpen = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+            if (!open) s_quitModalOpen = false;   // dismissed via the title-bar X = Cancel
+        }
 
         // ---------- Equations / Global Variables editor (modeless; gated by st.showEquations) ----------
         // Opened from the FeatureManager "Equations" node (double-click) or View > Equations. Lists

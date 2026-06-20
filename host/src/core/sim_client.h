@@ -38,6 +38,7 @@ struct SimJobResult {
     std::atomic<bool> ready{false};       // a result is waiting to be consumed on the main thread
     std::mutex mtx;
     std::string method;                   // the sim_* method that ran
+    std::string ownerDocId;               // doc id that launched this job (so the right tab consumes it)
     bool ok = false;
     nlohmann::json result;
     std::string error;
@@ -63,7 +64,10 @@ public:
     // (e.g. {"study": {...}} or {"stl_path":..., "direction":..., ...}). The job streams
     // sim_progress into job().events and latches job().ready when done. No-op (returns false)
     // if a job is already running or the worker can't be started.
-    bool launch(const std::string& method, nlohmann::json params, std::string& consoleNote);
+    // `ownerDocId` tags the job so the originating document's SimManager (and only it) consumes the
+    // completion, even if the user switched tabs mid-run.
+    bool launch(const std::string& method, nlohmann::json params, std::string& consoleNote,
+                const std::string& ownerDocId = "");
 
     // Best-effort cancel of the in-flight job (sends sim_cancel on a detached thread).
     void cancel();

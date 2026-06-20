@@ -42,7 +42,7 @@ namespace ui {
 class PropertyManager;
 class ConfigPanel;
 class SketchMode;
-class SimPanel;
+class SimManager;
 class AsmPanels;
 class ActivityPanel;
 class EvaluateDialogs;  // Measure / Mass Properties / Section dialogs — owned per-document (DocSession)
@@ -151,6 +151,7 @@ struct DocSession {
     std::unique_ptr<ui::PropertyManager> pm;        // active feature-edit form (+ live preview)
     std::unique_ptr<ui::SketchMode>      sketch;    // active sketch (entities/constraints/tools)
     std::unique_ptr<ui::EvaluateDialogs> evaluate;  // Measure / Mass / Section result windows
+    std::unique_ptr<ui::SimManager>      sim;       // simulation studies (FEA/CFD) linked to this part
 
     // Parked copy of AppState's per-doc VALUE fields, moved in/out on switch (empty for a fresh
     // session — equivalent to a cleared viewport). KEEP THIS LIST IN SYNC WITH
@@ -522,6 +523,17 @@ struct AppState {
     // Mark the active tab dirty (on any mutation) / clear it (on save). Safe with no active tab.
     void markActiveTabDirty();
     void clearActiveTabDirty();
+    // Mark the ECAD (Schematic/PCB) tab carrying `ecadDocId` dirty. ECAD tabs aren't DocMirror-backed
+    // (their docId is empty), so they're matched by their ecad id, not the mirror. Honors
+    // suppressTabDirty. No-op if no such tab.
+    void markEcadTabDirty(const std::string& ecadDocId);
+    // Mark a Drawing tab dirty. A drawing is embedded in its source part's .step+, so its unsaved
+    // state is persisted by saving that part; the tab still carries its own marker so closing it
+    // warns. Honors suppressTabDirty. No-op if idx isn't a Drawing tab.
+    void markDrawingTabDirty(int idx);
+    // Clear the dirty marker on every Drawing tab embedded in source part `sourceDocId` — call after
+    // that part is saved (doc_save embeds all of its open drawings). No-op if none match.
+    void clearDrawingDirtyForSource(const std::string& sourceDocId);
     // Refresh the active tab's cached title from the current doc tree (after a rename, etc.).
     void syncActiveTabTitle();
     // Index of the tab whose docId matches the mirror's current doc, or -1.
@@ -774,7 +786,8 @@ struct AppState {
     // Wave 1D: SW-faithful tabbed LEFT pane — Explorer / FeatureManager / PropertyManager /
     // Configurations as switchable tabs in one dock window. The PropertyManager auto-selects its
     // tab while a command form is active; closing the form returns to the FeatureManager tab.
-    enum LeftPaneTab { LP_Explorer = 0, LP_FeatureManager = 1, LP_PropertyManager = 2, LP_Configurations = 3 };
+    enum LeftPaneTab { LP_Explorer = 0, LP_FeatureManager = 1, LP_PropertyManager = 2,
+                       LP_Configurations = 3, LP_Simulation = 4 };
     int leftPaneTab = LP_FeatureManager;
 
     // ---- PropertyManager (C17) — occupies the tree dock slot while a command is active ----
@@ -797,9 +810,12 @@ struct AppState {
     ui::ConfigPanel* configPanel = nullptr;           // owned by run_gui
 
     // ---- C19: simulation + result-overlay UI state ----
-    core::SimClient* simClient = nullptr;  // owned by run_gui
-    ui::SimPanel*    simPanel   = nullptr;  // owned by run_gui
-    bool showSimPanel = false;         // Simulation dock visibility
+    core::SimClient* simClient = nullptr;  // owned by run_gui (single solve worker, shared)
+    // The active document's SimManager (per DocSession, re-seated on switch), or the run_gui fallback
+    // singleton at the empty start state / a non-CAD tab. Studies live in the document and persist in
+    // the .step+; the tree + setup forms render in the left pane's Simulation tab.
+    ui::SimManager*  simManager = nullptr;
+    ui::SimManager*  fallbackSimManager = nullptr;  // owned by run_gui; used when no CAD doc is active
     bool colormapOn = false;           // result colormap toggle (mirrors renderer state)
     bool docMeshHasScalar = false;     // the loaded overlay carries a per-vertex scalar
     bool docMeshHasDisp = false;       // the loaded overlay carries a displacement field
@@ -914,6 +930,12 @@ struct AppState {
     std::string requestExportFormat;  // File > Export <fmt> (export the active doc next pump)
     bool requestSaveAll = false;      // File > Save All (save every saveable doc next pump)
     bool wantNewDocChooser = false;   // doc-strip "+" / Ctrl+N → open the tiled "Create New" chooser
+    // Unsaved-changes guard on app exit. The window-close (title-bar X / Alt+F4 / File > Quit) is
+    // intercepted in run_gui: if any tab is dirty, the close is cancelled and wantQuitConfirm raises
+    // the exit confirmation modal. quitConfirmed latches true once the user picks Save & Quit or
+    // Quit-without-saving so the next close request falls straight through to the real exit.
+    bool wantQuitConfirm = false;     // raise the "unsaved changes on exit" modal next frame
+    bool quitConfirmed   = false;     // user approved the quit (after saving or discarding)
     // De-dup + cap (most-recent-first) + persist a path into recentFiles. Defined in app_state.cpp.
     void pushRecentFile(const std::string& path);
 

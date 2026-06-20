@@ -100,7 +100,7 @@ add_executable(AI-CAD
   # --- end Cut List ---
   # --- C19: simulation + flow + evaluate UI ---
   src/core/sim_client.cpp
-  src/ui/sim_panel.cpp
+  src/ui/sim_manager.cpp
   src/ui/legend.cpp
   src/ui/evaluate_dialogs.cpp
   # --- end C19 ---

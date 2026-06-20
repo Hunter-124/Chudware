@@ -35,7 +35,7 @@ void SimClient::cancel() {
 }
 
 bool SimClient::launch(const std::string& method, nlohmann::json params,
-                       std::string& consoleNote) {
+                       std::string& consoleNote, const std::string& ownerDocId) {
     if (job_.running.exchange(true)) {
         consoleNote = "[sim] a study is already running";
         return false;
@@ -49,6 +49,7 @@ bool SimClient::launch(const std::string& method, nlohmann::json params,
     {
         std::lock_guard<std::mutex> lk(job_.mtx);
         job_.method = method;
+        job_.ownerDocId = ownerDocId;
         job_.ok = false;
         job_.result = nlohmann::json::object();
         job_.error.clear();

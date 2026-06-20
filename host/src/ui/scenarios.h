@@ -17,7 +17,6 @@ struct AppState;
 namespace ui {
 
 class PropertyManager;
-class SimPanel;
 class EvaluateDialogs;
 class ActivityPanel;
 
@@ -34,9 +33,10 @@ public:
     // The runner borrows the run_gui-owned panels the scenarios drive (same references the
     // ribbon dispatcher captures); AppState carries everything else. The PropertyManager and
     // EvaluateDialogs are now PER-DOCUMENT — the scenarios resolve them from st.propertyManager /
-    // st.evaluateDialogs (re-seated on the doc they create), so they are no longer passed here.
-    ScenarioRunner(SimPanel& simPanel, ActivityPanel& activityPanel)
-        : simPanel(simPanel), activityPanel(activityPanel) {}
+    // st.evaluateDialogs (re-seated on the doc they create), so they are no longer passed here. The
+    // SimManager is likewise per-document (st.simManager), so the FEA scenario resolves it too.
+    explicit ScenarioRunner(ActivityPanel& activityPanel)
+        : activityPanel(activityPanel) {}
 
     // Advance the active scenario's step machine (no-op when no AI_CAD_SHOT scenario mode
     // is active). Call once per frame, before ImGui::NewFrame().
@@ -48,7 +48,6 @@ public:
     FrameAction endFrame(AppState& st, int dw, int dh, const char* screenshotPath);
 
 private:
-    SimPanel& simPanel;
     ActivityPanel& activityPanel;
 
     // ---------- C17 M1 integration scenario (AI_CAD_SHOT=m1) ----------

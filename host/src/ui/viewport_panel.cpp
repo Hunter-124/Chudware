@@ -30,6 +30,7 @@
 #include "sketch_mode.h"   // C18
 #include "dragdrop.h"      // kFileDragPayload (Explorer drag source -> viewport drop target)
 #include "property_manager.h"  // C27-A: in-viewport parameter callouts
+#include "sim_manager.h"        // simulation fixture/load previews in the viewport
 #include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
 #include "drawing_panel.h"  // DRAWINGS: 2D sheet renderer for a Drawing tab
 #include "doc_tabs.h"
@@ -144,6 +145,20 @@ static void drawNewDocPreview(ImDrawList* dl, ImVec2 p0, ImVec2 p1, int kind) {
                             ImVec2(c.x - 2.0f * S, c.y - 4.0f * S),
                             ImVec2(c.x + 8.0f * S, c.y + h * 0.22f)};
         dl->AddPolyline(boltPts, 4, IM_COL32(245, 190, 66, 230), 0, 2.0f * S);
+    } else if (kind == 8) { // open existing — an open folder with a file lifting out
+        ImVec2 f0(c.x - w * 0.32f, c.y - h * 0.10f), f1(c.x + w * 0.32f, c.y + h * 0.26f);
+        dl->AddRectFilled(ImVec2(f0.x, f0.y - h * 0.10f), ImVec2(f0.x + w * 0.26f, f0.y + 2.0f * S),
+                          withAlpha(pal.accent, 0.30f), 2.0f * S);   // folder tab
+        dl->AddRectFilled(f0, f1, withAlpha(pal.accent, 0.20f), 3.0f * S);
+        dl->AddRect(f0, f1, accent, 3.0f * S, 0, 1.3f * S);
+        // a document sheet emerging upward out of the folder
+        ImVec2 d0(c.x - w * 0.12f, c.y - h * 0.30f), d1(c.x + w * 0.12f, c.y + h * 0.06f);
+        dl->AddRectFilled(d0, d1, withAlpha(pal.text, 0.16f), 2.0f * S);
+        dl->AddRect(d0, d1, border, 2.0f * S, 0, 1.1f * S);
+        for (int i = 0; i < 3; ++i) {
+            float y = d0.y + (i + 1) * (d1.y - d0.y) / 4.5f;
+            dl->AddLine(ImVec2(d0.x + 4.0f * S, y), ImVec2(d1.x - 4.0f * S, y), textDim, 1.0f * S);
+        }
     }
 }
 
@@ -175,7 +190,7 @@ static bool newDocTile(const char* id, const char* title, const char* desc,
     return clicked;
 }
 
-static void drawNewDocumentPopup(AppState& st);
+// drawNewDocChooser is declared in viewport_panel.h (public — hosted at app scope).
 
 // The open documents live as browser/SolidWorks tabs in the central dock node's tab-bar ROW (where
 // the "<doc> - Viewport" dock tab used to sit), NOT as a separate full-width band. We can't make
@@ -204,14 +219,24 @@ static void runSimulationChoice(AppState& st, const char* cmd) {
     st.showSimulationTools = true;
     st.showRibbon = true;
     st.ribbonTab = AppState::RT_Simulation;
-    st.showSimPanel = true;
+    st.leftPaneTab = AppState::LP_Simulation;
     if (st.ribbonDispatch) st.ribbonDispatch(cmd);
 }
 
-static void drawNewDocumentPopup(AppState& st) {
+void drawNewDocChooser(AppState& st) {
     const auto& pal = ui::palette;
     const float S = ui::uiScale;
+    // The doc-strip "+" / Ctrl+N raise this one-shot request; consume it into the launcher state.
+    if (st.wantNewDocChooser) {
+        st.wantNewDocChooser = false;
+        s_newDocLauncherOpen = true;
+        s_newDocStage = NewDocStage::Root;
+    }
     if (s_newDocLauncherOpen) ImGui::OpenPopup("Create New##viewport_new_doc");
+    // Center in the main viewport (hosted at app scope now, so position it explicitly).
+    ImGuiViewport* mv = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(mv->Pos.x + mv->Size.x * 0.5f, mv->Pos.y + mv->Size.y * 0.5f),
+                            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(690.0f * S, 430.0f * S), ImGuiCond_Appearing);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f * S, 14.0f * S));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f * S, 10.0f * S));
@@ -259,6 +284,11 @@ static void drawNewDocumentPopup(AppState& st) {
             if (newDocTile("##new_pcb", "PCB", "Board layout workspace", 4, ImVec2(tileW, tileH))) {
                 st.showPcbTools = true; st.showRibbon = true; st.ribbonTab = AppState::RT_PCB;
                 ui::createNewDoc(st, 4); finish();
+            } next();
+            // Open an existing document instead of creating one — routes through the normal deferred
+            // open pump (native dialog + recent), and the untouched starter part is auto-discarded.
+            if (newDocTile("##open_existing", "Open existing", "Browse for a saved file", 8, ImVec2(tileW, tileH))) {
+                st.requestOpenDialog = true; finish();
             }
         } else if (s_newDocStage == NewDocStage::Drawing) {
             if (newDocTile("##drawing_active", "From active model", "Use current part/assembly", 2, ImVec2(tileW, tileH))) {
@@ -1287,7 +1317,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     if (ImGui::Begin(title.c_str()))
     {
         vpDockStripDraw(st);        // hide window tab + paint the doc tabs above the 3D view
-        drawNewDocumentPopup(st);   // host the create-new modal (opened by the tile chooser, if used)
+        // (The "Create New" chooser modal is hosted at app scope — ui::drawNewDocChooser — so it
+        //  works regardless of which central document is forward.)
 
         // ---- assembly fit readout + parts list (multi-part builds only) ----
         if (!st.asmParts.empty()) {
@@ -1454,6 +1485,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         }
         // Emphasize the currently-selected datum (reference axis/plane/point) in the viewport.
         renderer.setSelectedDatumId(st.selectedFeatureId);
+        // The datum plane open in the PM draws its normal arrow; cleared once nothing is being edited
+        // so committed planes carry no persistent normal handle.
+        renderer.setEditingDatumId(
+            (st.propertyManager && st.propertyManager->active()) ? st.propertyManager->targetId()
+                                                                 : std::string());
         // C25 W2-D: advance any in-flight camera tween (presets / Normal-To / zoom-to-fit) before
         // rendering. Sketch mode hard-locks the camera, so cancel/skip the tween while sketching.
         if (inSketch) cancelCameraAnimation();
@@ -1500,6 +1536,18 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // the ghost would read muddy.
             if (!st.featureHighlightFaces.empty() && !pmPreviewing)
                 st.overlays->drawFeatureHighlight(renderer.camera(), st.featureHighlightFaces);
+            // Simulation pre-run previews: paint the selected study's fixture faces green and its
+            // load faces red so the setup reads at a glance before solving (gated off while a result
+            // colormap is showing so the tints don't muddy the stress plot).
+            if (st.simManager && st.simManager->previewActive(st)) {
+                std::vector<uint64_t> fix, load;
+                st.simManager->collectFixtureFaces(fix);
+                st.simManager->collectLoadFaces(load);
+                static const float kFixCol[4]  = {0.18f, 0.80f, 0.36f, 0.45f};  // green
+                static const float kLoadCol[4] = {0.95f, 0.27f, 0.20f, 0.45f};  // red
+                if (!fix.empty())  st.overlays->drawFaceWash(renderer.camera(), fix, kFixCol);
+                if (!load.empty()) st.overlays->drawFaceWash(renderer.camera(), load, kLoadCol);
+            }
             std::vector<render::PickHit> selHits;
             selHits.reserve(st.selection.size());
             for (const auto& it : st.selection.items()) selHits.push_back(it.hit);

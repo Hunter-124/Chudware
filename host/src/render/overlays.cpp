@@ -220,6 +220,12 @@ void Overlays::drawHit(const Renderer::CameraXform& cam, const PickHit& h, const
 // C37-C: draw a set of faces with the feature-highlight tint.
 void Overlays::drawFeatureHighlight(const Renderer::CameraXform& cam,
                                     const std::vector<uint64_t>& faceKeys) {
+    drawFaceWash(cam, faceKeys, featHlCol_);
+}
+
+// Draw a set of faces filled with an explicit RGBA wash (simulation fixture/load previews).
+void Overlays::drawFaceWash(const Renderer::CameraXform& cam,
+                            const std::vector<uint64_t>& faceKeys, const float rgba[4]) {
     if (faceKeys.empty() || !prog_) return;
     glUseProgram(prog_);
     glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, cam.mvp.m);
@@ -235,7 +241,7 @@ void Overlays::drawFeatureHighlight(const Renderer::CameraXform& cam,
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(-1.0f, -1.0f);
     int colLoc = glGetUniformLocation(prog_, "uColor");
-    glUniform4fv(colLoc, 1, featHlCol_);
+    glUniform4fv(colLoc, 1, rgba);
     for (uint64_t key : faceKeys) {
         uint32_t body_id  = (uint32_t)(key >> 32);
         uint32_t face_id  = (uint32_t)(key & 0xFFFFFFFFu);

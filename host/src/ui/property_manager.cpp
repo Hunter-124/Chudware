@@ -562,6 +562,40 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
         }
     }
 
+    // Plane pre-select (SolidWorks "select a plane, then run the command"): if a plane is selected —
+    // a default origin plane ("plane.front/top/right") or a created datum-plane feature — seed the
+    // form's first empty plane-accepting well with it (ref-plane base, mirror plane, draft neutral,
+    // helix base, …). Routed as a BARE string, matching routeDatumPlane / the engine's datum resolve.
+    {
+        const std::string& sfid = st.selectedFeatureId;
+        std::string label;
+        bool isPlane = false;
+        if (sfid == "plane.front" || sfid == "plane.top" || sfid == "plane.right") {
+            isPlane = true;
+            label = sfid.substr(sfid.rfind('.') + 1);
+            if (!label.empty()) label[0] = (char)std::toupper((unsigned char)label[0]);
+        } else if (!sfid.empty()) {
+            const nlohmann::json& tree = st.docMirror.tree();
+            if (tree.is_object() && tree.contains("features") && tree["features"].is_array())
+                for (const auto& tf : tree["features"])
+                    if (tf.is_object() && tf.value("id", std::string()) == sfid &&
+                        tf.value("type", std::string()) == "plane") {
+                        isPlane = true; label = tf.value("name", sfid); break;
+                    }
+        }
+        if (isPlane)
+            for (auto& fld : fields_)
+                if (fld.def->kind == PMFieldKind::SelectorWell && fld.def->selKinds.plane &&
+                    fld.picks.empty() && fieldVisible(*fld.def, fields_)) {
+                    PMSelEntry e; e.selector = sfid; e.label = label;
+                    fld.picks.push_back(std::move(e));
+                    fld.wellDangling = false;
+                    dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                    st.addLog("[pm] plane well seeded from preselected " + sfid);
+                    break;
+                }
+    }
+
     st.addLog("[pm] open " + std::string(form_->type) +
               (mode_.empty() ? "" : " (" + mode_ + ")"));
     return true;
@@ -1145,7 +1179,7 @@ bool PropertyManager::routeDatumAxis(const std::string& fid, const std::string& 
     return true;
 }
 
-bool PropertyManager::routeDatumPlane(const std::string& datumId) {
+bool PropertyManager::routeDatumPlane(const std::string& datumId, const std::string& labelIn) {
     PMField* well = activeWell();
     if (!well || !well->def->selKinds.plane || datumId.empty()) return false;
     // Toggle off if this exact datum plane is already in the well (SolidWorks re-pick).
@@ -1158,11 +1192,15 @@ bool PropertyManager::routeDatumPlane(const std::string& datumId) {
         }
     }
     if (!well->def->selMulti) well->picks.clear();   // single-ref wells hold one pick
-    // A short friendly chip label: "plane.front" -> "Front".
-    std::string label = datumId;
-    auto dot = label.rfind('.');
-    if (dot != std::string::npos) label = label.substr(dot + 1);
-    if (!label.empty()) label[0] = (char)std::toupper((unsigned char)label[0]);
+    // Chip label: the datum's own name when given (created plane "Plane1"); else a short label
+    // derived from the reserved id ("plane.front" -> "Front").
+    std::string label = labelIn;
+    if (label.empty()) {
+        label = datumId;
+        auto dot = label.rfind('.');
+        if (dot != std::string::npos) label = label.substr(dot + 1);
+        if (!label.empty()) label[0] = (char)std::toupper((unsigned char)label[0]);
+    }
     PMSelEntry e;
     e.selector = datumId;   // bare reserved-datum string; _SEL_OR_DATUM slots accept it
     e.label = label;

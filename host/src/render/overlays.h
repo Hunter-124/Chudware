@@ -41,6 +41,10 @@ public:
     // skipped. Zero-cost when the vector is empty.
     void drawFeatureHighlight(const Renderer::CameraXform& cam,
                               const std::vector<uint64_t>& faceKeys);
+    // Same, but with an explicit RGBA wash colour — used by the simulation previews to paint fixture
+    // faces (green) and load faces (red) at once. `rgba` is a 4-float pointer.
+    void drawFaceWash(const Renderer::CameraXform& cam,
+                      const std::vector<uint64_t>& faceKeys, const float rgba[4]);
 
 private:
     void destroy();

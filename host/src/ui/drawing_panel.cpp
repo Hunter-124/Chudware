@@ -226,6 +226,7 @@ static void commitDimension(AppState& st, AppState::DocTab& tab, const std::stri
             tab.drawingDoc = res["drawing"];      // engine returned the full re-projected drawing
         else
             st.refreshDrawingTab(st.activeTab);
+        st.markDrawingTabDirty(st.activeTab);     // unsaved until the source part is saved
         st.addLog("[draw] added " + tab.dimType + " on " + viewId);
     } else {
         std::string msg = res.is_object() && res.contains("message") ? djstr(res, "message") : err;
@@ -243,6 +244,7 @@ static void deleteAnnotation(AppState& st, AppState::DocTab& tab, const std::str
     if (st.worker.call("drawing_remove_annotation", params, res, err) && res.is_object() &&
         !res.contains("code")) {
         st.refreshDrawingTab(st.activeTab);
+        st.markDrawingTabDirty(st.activeTab);
         st.addLog("[draw] removed annotation " + annId);
     } else {
         st.addLog("[draw] drawing_remove_annotation failed: " + err);
@@ -265,6 +267,7 @@ static void commitSection(AppState& st, AppState::DocTab& tab, const std::string
     if (st.worker.call("drawing_add_section", params, res, err) && res.is_object() &&
         !res.contains("code")) {
         st.refreshDrawingTab(st.activeTab);
+        st.markDrawingTabDirty(st.activeTab);
         st.addLog("[draw] added section on " + parentViewId);
         tab.drawNeedFit = true;   // frame the new section view
     } else {
@@ -288,6 +291,7 @@ static void commitDetail(AppState& st, AppState::DocTab& tab, const std::string&
     if (st.worker.call("drawing_add_detail", params, res, err) && res.is_object() &&
         !res.contains("code")) {
         st.refreshDrawingTab(st.activeTab);
+        st.markDrawingTabDirty(st.activeTab);
         st.addLog("[draw] added detail on " + parentViewId);
         tab.drawNeedFit = true;
     } else {

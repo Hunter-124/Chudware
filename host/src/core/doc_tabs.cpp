@@ -19,6 +19,7 @@
 #include "../ui/sketch_mode.h"        // per-document SketchMode owned by each DocSession
 #include "../ui/property_manager.h"   // per-document PropertyManager owned by each DocSession
 #include "../ui/evaluate_dialogs.h"   // per-document EvaluateDialogs (Measure/Mass/Section) owned by DocSession
+#include "../ui/sim_manager.h"        // per-document SimManager (simulation studies) owned by DocSession
 #include "../ui/feature_tree.h"       // featureTreeResetTransient — clear tree statics on a tab switch
 #include "../ui/ecad/ecad_panel.h"    // Wave 2: point the ECAD editor at the active Schematic/PCB tab
 #include "../ui/ecad/ecad_mirror.h"   // Wave 2: complete EcadMirror type for setDocId on switch
@@ -29,7 +30,8 @@
 DocSession::DocSession()
     : pm(std::make_unique<ui::PropertyManager>()),
       sketch(std::make_unique<ui::SketchMode>()),
-      evaluate(std::make_unique<ui::EvaluateDialogs>()) {}
+      evaluate(std::make_unique<ui::EvaluateDialogs>()),
+      sim(std::make_unique<ui::SimManager>()) {}
 DocSession::~DocSession() = default;
 
 DocSession* AppState::activeSession() {
@@ -48,6 +50,7 @@ void AppState::reseatActiveSubsystems(DocSession* s) {
     propertyManager = s ? s->pm.get()       : fallbackPropertyManager;
     sketchMode      = s ? s->sketch.get()   : fallbackSketchMode;
     evaluateDialogs = s ? s->evaluate.get() : fallbackEvaluate;
+    simManager      = s ? s->sim.get()      : fallbackSimManager;
 }
 
 // Release closed-tab sessions once nothing they own can still be touched by a pending async result.
@@ -285,6 +288,10 @@ void AppState::switchToTab(int idx) {
     // mask is preserved across the rebuild. The viewport selection is restored AFTER the mesh load
     // (loadDocMesh clears the live selection).
     reseatActiveSubsystems(dst.session.get());
+    // Result colormap/legend is GLOBAL viewport state — tear it down so the leaving doc's stress
+    // overlay never paints the entering doc's mesh. FEA results are transient (re-run to see them),
+    // so nothing persisted is lost. The entering doc's SimManager re-pulls its studies on first draw.
+    if (simManager) simManager->clearResultOverlay(*this);
     restoreDocState(*dst.session);
     // Feature-tree file-static transients (in-progress inline rename, multi-select, the panel's
     // current save path) are NOT yet per-document; clear them on every switch exactly as the old
@@ -429,6 +436,29 @@ void AppState::markActiveTabDirty() {
 void AppState::clearActiveTabDirty() {
     if (activeTab >= 0 && activeTab < (int)docTabs.size())
         docTabs[activeTab].dirty = false;
+}
+
+void AppState::markEcadTabDirty(const std::string& ecadDocId) {
+    if (suppressTabDirty || ecadDocId.empty()) return;
+    for (auto& t : docTabs)
+        if ((t.kind == DocTab::TabKind::Schematic || t.kind == DocTab::TabKind::PCB) &&
+            t.ecadDocId == ecadDocId) {
+            t.dirty = true;
+            return;
+        }
+}
+
+void AppState::markDrawingTabDirty(int idx) {
+    if (suppressTabDirty) return;
+    if (idx >= 0 && idx < (int)docTabs.size() && docTabs[idx].kind == DocTab::TabKind::Drawing)
+        docTabs[idx].dirty = true;
+}
+
+void AppState::clearDrawingDirtyForSource(const std::string& sourceDocId) {
+    if (sourceDocId.empty()) return;
+    for (auto& t : docTabs)
+        if (t.kind == DocTab::TabKind::Drawing && t.sourceDocId == sourceDocId)
+            t.dirty = false;
 }
 
 void AppState::ensureActiveTab() {

@@ -33,6 +33,7 @@ enum {
     kLeftPaneFeatureManager  = 1,
     kLeftPanePropertyManager = 2,
     kLeftPaneConfigurations  = 3,
+    kLeftPaneSimulation      = 4,
 };
 
 // Draw the tabbed SolidWorks left task pane into the "LeftPane" dock window. Owns the vertical

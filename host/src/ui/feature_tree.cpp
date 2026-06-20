@@ -1184,6 +1184,9 @@ static void doSaveDoc(AppState& st, bool forceDialog) {
         st.clearActiveTabDirty();
         if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
             st.docTabs[st.activeTab].path = path;
+        // doc_save embeds this part's open drawings into the .step+, so any Drawing tabs sourced from
+        // it are now persisted too — clear their unsaved markers.
+        st.clearDrawingDirtyForSource(st.docMirror.docId());
         st.addLog("[doc] saved: " + path);
         st.toast(ui::ToastLevel::Info, "Saved " + pathBaseName(path));
     } else {
@@ -1718,8 +1721,21 @@ void drawFeatureTreeBody(AppState& st,
                         // datum plane (projected into the sketch) instead of toggling visibility.
                         st.sketchMode->addPlaneDimRef(st, pi);
                     } else {
-                        st.showPlane[pi] = !st.showPlane[pi];
-                        st.planeEmphasis = st.showPlane[pi] ? pi : -1;
+                        // Plain click selects the plane (SolidWorks: select a plane, then Sketch /
+                        // run a plane-well feature) and shows it. Re-clicking the already-selected
+                        // plane hides + deselects it, preserving the old show/hide toggle.
+                        static const char* kPlaneSelId[] = {"plane.front", "plane.top", "plane.right"};
+                        bool wasSel = (st.selectedFeatureId == kPlaneSelId[pi]);
+                        if (wasSel && st.showPlane[pi]) {
+                            st.showPlane[pi] = false;
+                            st.planeEmphasis = -1;
+                            st.selectedFeatureId.clear();
+                        } else {
+                            st.showPlane[pi] = true;
+                            st.planeEmphasis = pi;
+                            st.selection.clear();
+                            st.selectedFeatureId = kPlaneSelId[pi];
+                        }
                     }
                 }
                 if (ImGui::IsItemHovered())
@@ -2024,11 +2040,24 @@ void drawFeatureTreeBody(AppState& st,
                         }
 
                         // ---- selection / interaction handling ----
-                        // Sweep/loft PATH pick: when the Path/Centerline well is armed, a
-                        // single click on a SKETCH or CURVE (helix) feature FILLS that well
-                        // (the user-reported "can't select the sketch path" gap) instead of
-                        // just re-selecting the tree row.
-                        if (rr.clicked && st.propertyManager && st.propertyManager->active() &&
+                        // User-defined datum PLANE clicked in the tree: targets it like the origin
+                        // planes do — start a new sketch on it during plane-pick, or fill an armed
+                        // plane well (SolidWorks lets you pick a reference plane from the tree). The
+                        // sketch plane is the bare feature-id string; a plane well takes id + name.
+                        if (rr.clicked && ftype == "plane" && st.sketchPlanePickActive && st.sketchMode) {
+                            st.sketchPlanePickActive = false;
+                            st.sketchMode->createSketchOnPlane(st, nlohmann::json(fid));
+                            selectedFeatureId = fid;
+                            s_multiSel.clear();
+                            selectFeatureInViewport(st, fid);
+                        } else if (rr.clicked && ftype == "plane" && st.propertyManager &&
+                                   st.propertyManager->active() &&
+                                   st.propertyManager->activeWellWantsPlane()) {
+                            st.propertyManager->routeDatumPlane(fid, fname);
+                            selectedFeatureId = fid;
+                            s_multiSel.clear();
+                            selectFeatureInViewport(st, fid);
+                        } else if (rr.clicked && st.propertyManager && st.propertyManager->active() &&
                             st.propertyManager->activeWellWantsPathFeature() &&
                             (ftype == "sketch" || ftype == "helix" || ftype == "curve")) {
                             const bool isCurve = (ftype == "helix" || ftype == "curve");

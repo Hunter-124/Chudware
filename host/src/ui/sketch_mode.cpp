@@ -57,6 +57,57 @@ bool worldToScreen(const Renderer::CameraXform& cam, const ImVec2& imgMin, int v
     return true;
 }
 
+// Inverse of a column-major 4x4 (OpenGL convention) — the classic cofactor invert. Returns false
+// for a singular matrix. Used to unproject the cursor into a world-space ray.
+bool invert4x4(const float* m, float* inv) {
+    inv[0]  =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+    inv[4]  = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+    inv[8]  =  m[4]*m[9]*m[15]  - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14]  + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+    inv[1]  = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+    inv[5]  =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+    inv[9]  = -m[0]*m[9]*m[15]  + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+    inv[13] =  m[0]*m[9]*m[14]  - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+    inv[2]  =  m[1]*m[6]*m[15]  - m[1]*m[7]*m[14]  - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7]  - m[13]*m[3]*m[6];
+    inv[6]  = -m[0]*m[6]*m[15]  + m[0]*m[7]*m[14]  + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7]  + m[12]*m[3]*m[6];
+    inv[10] =  m[0]*m[5]*m[15]  - m[0]*m[7]*m[13]  - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7]  - m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14]  + m[0]*m[6]*m[13]  + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6]  + m[12]*m[2]*m[5];
+    inv[3]  = -m[1]*m[6]*m[11]  + m[1]*m[7]*m[10]  + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7]   + m[9]*m[3]*m[6];
+    inv[7]  =  m[0]*m[6]*m[11]  - m[0]*m[7]*m[10]  - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7]   - m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11]  + m[0]*m[7]*m[9]   + m[4]*m[1]*m[11] - m[4]*m[3]*m[9]  - m[8]*m[1]*m[7]   + m[8]*m[3]*m[5];
+    inv[15] =  m[0]*m[5]*m[10]  - m[0]*m[6]*m[9]   - m[4]*m[1]*m[10] + m[4]*m[2]*m[9]  + m[8]*m[1]*m[6]   - m[8]*m[2]*m[5];
+    float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+    if (std::fabs(det) < 1e-20f) return false;
+    det = 1.0f / det;
+    for (int i = 0; i < 16; ++i) inv[i] *= det;
+    return true;
+}
+
+// Unproject the cursor to a world-space ray (origin on the near plane, normalized direction). Robust
+// where screen-space corner projection fails — a large plane can have corners behind the camera.
+bool screenRay(const Renderer::CameraXform& cam, const ImVec2& imgMin, int vw, int vh,
+               ImVec2 mouse, Vec3& outOrig, Vec3& outDir) {
+    float inv[16];
+    if (!invert4x4(cam.mvp.m, inv)) return false;
+    float ndcX = ((mouse.x - imgMin.x) / (float)vw) * 2.0f - 1.0f;
+    float ndcY = 1.0f - ((mouse.y - imgMin.y) / (float)vh) * 2.0f;
+    auto unproj = [&](float ndcZ, Vec3& o) -> bool {
+        float cl[4] = {ndcX, ndcY, ndcZ, 1.0f}, w[4];
+        for (int r = 0; r < 4; ++r)
+            w[r] = inv[0*4+r]*cl[0] + inv[1*4+r]*cl[1] + inv[2*4+r]*cl[2] + inv[3*4+r]*cl[3];
+        if (std::fabs(w[3]) < 1e-12f) return false;
+        o = Vec3(w[0]/w[3], w[1]/w[3], w[2]/w[3]);
+        return true;
+    };
+    Vec3 pNear, pFar;
+    if (!unproj(-1.0f, pNear) || !unproj(1.0f, pFar)) return false;
+    Vec3 d = pFar - pNear;
+    if (length(d) < 1e-12f) return false;
+    outOrig = pNear;
+    outDir  = normalize(d);
+    return true;
+}
+
 ImU32 col(const float role[4], float a = 1.0f) {
     float c[4] = {role[0], role[1], role[2], role[3] * a};
     return ui::Palette::toU32(c);
@@ -1022,6 +1073,22 @@ bool SketchMode::enterNewOnSelection(AppState& st) {
                 if (k == "face" || k == "datum") { planeRef = sel; haveRef = true; break; }
             } catch (...) {}
         }
+    }
+    // Pre-selected plane (SolidWorks "select a plane, then Sketch"): a plane held in
+    // st.selectedFeatureId — either a default origin plane ("plane.front/top/right") or a created
+    // datum-plane feature — starts the sketch directly on it. Routed as a BARE string so the engine
+    // resolves it as a plane name / feature id (same form createSketchOnPlane gets from a tree click).
+    if (!haveRef && !st.selectedFeatureId.empty()) {
+        const std::string& sfid = st.selectedFeatureId;
+        bool isPlane = (sfid == "plane.front" || sfid == "plane.top" || sfid == "plane.right");
+        if (!isPlane) {
+            const nlohmann::json& tree = st.docMirror.tree();
+            if (tree.is_object() && tree.contains("features") && tree["features"].is_array())
+                for (const auto& tf : tree["features"])
+                    if (tf.is_object() && tf.value("id", std::string()) == sfid &&
+                        tf.value("type", std::string()) == "plane") { isPlane = true; break; }
+        }
+        if (isPlane) { planeRef = sfid; haveRef = true; }
     }
     if (haveRef) return !createSketchOnPlane(st, planeRef).empty();
     // No usable selection: enter the interactive plane-pick (front/top/right or a planar face).
@@ -3836,6 +3903,122 @@ bool SketchMode::drawRegionPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMi
 // datum-plane picker for feature PM wells (reference axis / plane reference geometry)
 // ---------------------------------------------------------------------------
 
+// Shared hit-test: user-defined datum PLANES (docMirror refDatums kind=="plane") under the cursor.
+// Builds each datum plane's quad EXACTLY as Renderer::drawRefDatums does (origin ± xdir/ydir*ps,
+// ps = cam.radius*0.55) and barycentric depth-tests it, so the clickable area coincides with the
+// drawn quad. Returns the FRONTMOST hit's feature id + name + camera-distance² (so callers can
+// compare it against the three origin-plane depths and pick the single frontmost target), plus the
+// winning quad's screen corners for a hover tint. This is what lets the user sketch on / reference
+// their OWN datum planes, not just front/top/right.
+static bool hitTestDatumPlane(AppState& st, ImVec2 mouse, const ImVec2& imgMin, int vw, int vh,
+                              std::string& outFid, std::string& outName, float& outDepth,
+                              ImVec2 outQuad[4]) {
+    outDepth = 1e30f;
+    if (!st.renderer || !st.docMirror.hasDoc()) return false;
+    const nlohmann::json& datums = st.docMirror.refDatums();
+    if (!datums.is_array() || datums.empty()) return false;
+    const Renderer& r = *st.renderer;
+    const auto& cam = r.camera();
+    const float ps = cam.radius * 0.55f;   // matches drawRefDatums datum-plane half-extent
+    auto v3 = [](const nlohmann::json& a, Vec3 dflt) -> Vec3 {
+        if (a.is_array() && a.size() == 3 && a[0].is_number())
+            return Vec3((float)a[0].get<double>(), (float)a[1].get<double>(), (float)a[2].get<double>());
+        return dflt;
+    };
+    auto edge = [](ImVec2 p, ImVec2 q, ImVec2 rr) {
+        return (p.x - rr.x) * (q.y - rr.y) - (q.x - rr.x) * (p.y - rr.y);
+    };
+    static const float uv[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
+    bool found = false;
+    for (const auto& d : datums) {
+        if (!d.is_object() || d.value("kind", std::string()) != "plane") continue;
+        Vec3 o  = v3(d.value("origin", nlohmann::json()), Vec3(0, 0, 0));
+        Vec3 xd = v3(d.value("x_dir",  nlohmann::json()), Vec3(1, 0, 0));
+        Vec3 yd = v3(d.value("y_dir",  nlohmann::json()), Vec3(0, 1, 0));
+        Vec3 c4[4]; ImVec2 s4[4]; bool ok = true;
+        for (int i = 0; i < 4; ++i) {
+            c4[i] = o + xd * (uv[i][0] * ps) + yd * (uv[i][1] * ps);
+            if (!worldToScreen(cam, imgMin, vw, vh, c4[i].x, c4[i].y, c4[i].z, s4[i])) { ok = false; break; }
+        }
+        if (!ok) continue;
+        auto hit = [&](int a, int b, int cc, float& dp) -> bool {
+            float area = edge(s4[a], s4[b], s4[cc]);
+            if (area == 0.0f) return false;
+            float w0 = edge(mouse, s4[b], s4[cc]) / area;
+            float w1 = edge(mouse, s4[cc], s4[a]) / area;
+            float w2 = edge(mouse, s4[a], s4[b]) / area;
+            if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) return false;
+            Vec3 wp(w0 * c4[a].x + w1 * c4[b].x + w2 * c4[cc].x,
+                    w0 * c4[a].y + w1 * c4[b].y + w2 * c4[cc].y,
+                    w0 * c4[a].z + w1 * c4[b].z + w2 * c4[cc].z);
+            float dx = wp.x - cam.eye.x, dy = wp.y - cam.eye.y, dz = wp.z - cam.eye.z;
+            dp = dx * dx + dy * dy + dz * dz;
+            return true;
+        };
+        float dp;
+        if ((hit(0, 1, 2, dp) || hit(0, 2, 3, dp)) && dp < outDepth) {
+            outDepth = dp;
+            outFid  = d.value("id", std::string());
+            outName = d.value("name", std::string());
+            for (int i = 0; i < 4; ++i) outQuad[i] = s4[i];
+            found = true;
+        }
+    }
+    return found;
+}
+
+// Hit-test the three default origin planes (front=0/top=1/right=2) that are currently SHOWN, the
+// same quads Renderer::planeQuad draws. Returns the frontmost-under-cursor plane's index (+ its
+// reserved selector "plane.front/top/right", display name, camera-depth, and screen quad). Lets the
+// general viewport selection treat an origin plane like any other pickable so it can be preselected
+// for a sketch/feature. Only SHOWN planes are tested, so hidden origin planes never shadow model
+// picks during normal modeling.
+static bool hitTestOriginPlane(AppState& st, ImVec2 mouse, const ImVec2& imgMin, int vw, int vh,
+                               std::string& outSel, std::string& outName, float& outDepth,
+                               Vec3 outCorners[4]) {
+    outDepth = 1e30f;
+    if (!st.renderer) return false;
+    const Renderer& r = *st.renderer;
+    const auto& cam = r.camera();
+    Vec3 ro, rd;
+    if (!screenRay(cam, imgMin, vw, vh, mouse, ro, rd)) return false;
+    static const char* kSel[3]  = {"plane.front", "plane.top", "plane.right"};
+    static const char* kName[3] = {"Front Plane", "Top Plane", "Right Plane"};
+    bool found = false;
+    for (int p = 0; p < 3; ++p) {
+        if (!st.showPlane[p]) continue;   // only a visible plane is clickable in the graphics area
+        Vec3 c4[4];
+        if (!r.planeQuad(p, c4)) continue;
+        // Ray vs. the plane of the quad, then a bounds check in the quad's own (u,v) frame. World-
+        // space so a quad with corners behind the camera (large origin planes) is still hittable.
+        Vec3 uE = c4[1] - c4[0], vE = c4[3] - c4[0];
+        Vec3 n  = cross(uE, vE);
+        float denom = dot(n, rd);
+        if (std::fabs(denom) < 1e-9f) continue;       // ray parallel to plane
+        float t = dot(n, c4[0] - ro) / denom;
+        if (t <= 0.0f) continue;                       // behind the camera
+        Vec3 hit = ro + rd * t;
+        Vec3 d = hit - c4[0];
+        float uLen = length(uE), vLen = length(vE);
+        if (uLen < 1e-9f || vLen < 1e-9f) continue;
+        float u = dot(d, uE) / (uLen * uLen);          // normalized 0..1 across the quad
+        float v = dot(d, vE) / (vLen * vLen);
+        if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) continue;
+        // Squared distance from the camera eye — same metric hitTestDatumPlane returns, so the
+        // caller can pick the frontmost across created + origin planes.
+        Vec3 he = hit - cam.eye;
+        float dp = dot(he, he);
+        if (dp < outDepth) {
+            outDepth = dp;
+            outSel  = kSel[p];
+            outName = kName[p];
+            for (int i = 0; i < 4; ++i) outCorners[i] = c4[i];
+            found = true;
+        }
+    }
+    return found;
+}
+
 bool SketchMode::drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
                                  const ImVec2& imgMax, int vw, int vh, bool imgHovered) {
     pmPlaneHover_ = -1;
@@ -3896,17 +4079,27 @@ bool SketchMode::drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin
             hovered = p;
         }
     }
+    // Also hit-test the user's OWN datum planes; the frontmost target (origin OR datum plane) wins,
+    // so a created plane in front occludes an origin plane behind it, SolidWorks-style.
+    std::string datumFid, datumName; float datumDepth = 1e30f; ImVec2 datumQuad[4];
+    bool datumHit = imgHovered && hitTestDatumPlane(st, io.MousePos, imgMin, vw, vh,
+                                                    datumFid, datumName, datumDepth, datumQuad);
+    bool datumWins = datumHit && datumDepth < hoveredDepth;
+    if (datumWins) hovered = -1;   // a datum plane is in front; drop the origin-plane emphasis
     pmPlaneHover_ = hovered;
     // Hover tint on the one plane under the cursor (the renderer already draws the three planes +
     // emphasis brightening; viewport_panel feeds pmPlaneHover() as the emphasis index).
-    if (hovered >= 0 && quadVis[hovered]) {
+    if (datumWins) {
+        wdl->AddQuadFilled(datumQuad[0], datumQuad[1], datumQuad[2], datumQuad[3], col(pal.accent, 0.16f));
+        wdl->AddQuad(datumQuad[0], datumQuad[1], datumQuad[2], datumQuad[3], col(pal.accent, 0.90f), 2.0f);
+    } else if (hovered >= 0 && quadVis[hovered]) {
         wdl->AddQuadFilled(quadS[hovered][0], quadS[hovered][1], quadS[hovered][2],
                            quadS[hovered][3], col(pal.accent, 0.16f));
         wdl->AddQuad(quadS[hovered][0], quadS[hovered][1], quadS[hovered][2],
                      quadS[hovered][3], col(pal.accent, 0.90f), 2.0f);
     }
     // Compact hint pill (below the heads-up view toolbar, same slot as the new-sketch banner).
-    const char* banner = "Click a reference plane \xE2\x80\x94 or pick a planar face";
+    const char* banner = "Click a reference plane (incl. your datum planes) \xE2\x80\x94 or a planar face";
     ImVec2 bts = ImGui::CalcTextSize(banner);
     float bcx = (imgMin.x + imgMax.x) * 0.5f;
     ImVec2 b0(bcx - bts.x * 0.5f - 14, imgMin.y + 52.0f * ui::uiScale);
@@ -3916,14 +4109,17 @@ bool SketchMode::drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin
     wdl->AddText(ImVec2(b0.x + 14, b0.y + 6), col(pal.overlayText), banner);
     wdl->PopClipRect();
 
-    // Click an origin plane -> route its datum ref into the active well. Returning true tells the
-    // viewport this frame's click landed on a plane, so model picking doesn't also fire.
-    if (hovered >= 0 && imgHovered) {
+    // Click a plane -> route its datum ref into the active well (a created datum plane routes its
+    // feature id + name; an origin plane its reserved string). Returning true tells the viewport
+    // this frame's click landed on a plane, so model picking doesn't also fire.
+    if ((datumWins || hovered >= 0) && imgHovered) {
         st.requestCursor(ui::CursorKind::Hand);
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-            pm->routeDatumPlane(planeSel[hovered]);
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (datumWins) pm->routeDatumPlane(datumFid, datumName);
+            else           pm->routeDatumPlane(planeSel[hovered]);
+        }
     }
-    return hovered >= 0;
+    return hovered >= 0 || datumWins;
 }
 
 // ---------------------------------------------------------------------------
@@ -4165,18 +4361,61 @@ bool SketchMode::drawDatumSelect(AppState& st, ImGuiIO& io, const ImVec2& imgMin
     auto* pm = st.propertyManager;
     // A PM picker (axis/plane well) owns datum picks while open — don't also general-select.
     if (pm && pm->active() && (pm->activeWellWantsAxis() || pm->activeWellWantsPlane())) return false;
-    ImVec2 a, b; std::string fid, name;
-    if (!hitTestDatumAxis(st, io.MousePos, imgMin, vw, vh, a, b, fid, name)) return false;
 
     ImDrawList* wdl = ImGui::GetWindowDrawList();
-    wdl->PushClipRect(imgMin, imgMax, true);
-    wdl->AddLine(a, b, col(ui::palette.accent, 0.90f), 4.0f);
-    wdl->PopClipRect();
+    std::string fid, name;
+
+    // A datum AXIS is a thin target, so it wins when the cursor is on the line (a big datum plane
+    // behind it would otherwise swallow the click). Fall back to a created datum PLANE so a plane
+    // can be selected in the viewport and then preselected for a sketch/feature (SolidWorks pick).
+    ImVec2 a, b;
+    bool axisHit = hitTestDatumAxis(st, io.MousePos, imgMin, vw, vh, a, b, fid, name);
+    if (axisHit) {
+        wdl->PushClipRect(imgMin, imgMax, true);
+        wdl->AddLine(a, b, col(ui::palette.accent, 0.90f), 4.0f);
+        wdl->PopClipRect();
+    } else {
+        // Pick the frontmost plane under the cursor across BOTH created datum planes and the (shown)
+        // default origin planes, so either can be selected in the graphics area and preselected for a
+        // sketch/feature. selectedFeatureId is the created plane's feature id or a reserved
+        // "plane.front/top/right" token — both resolve as a sketch/feature plane.
+        float cDepth = 1e30f, oDepth = 1e30f;
+        ImVec2 cQuad[4]; Vec3 oCorners[4];
+        std::string cFid, cName, oSel, oName;
+        bool cHit = hitTestDatumPlane(st, io.MousePos, imgMin, vw, vh, cFid, cName, cDepth, cQuad) &&
+                    !cFid.empty();
+        bool oHit = hitTestOriginPlane(st, io.MousePos, imgMin, vw, vh, oSel, oName, oDepth, oCorners);
+        if (!cHit && !oHit) return false;
+        const bool originWins = oHit && (!cHit || oDepth < cDepth);
+        fid  = originWins ? oSel  : cFid;
+        name = originWins ? oName : cName;
+        wdl->PushClipRect(imgMin, imgMax, true);
+        if (originWins) {
+            // Project the origin-plane corners for the outline; skip any edge with an endpoint
+            // behind the camera (large quads can wrap) so we never draw a stray line.
+            const auto& cam = st.renderer->camera();
+            ImVec2 s[4]; bool ok[4];
+            for (int i = 0; i < 4; ++i)
+                ok[i] = worldToScreen(cam, imgMin, vw, vh, oCorners[i].x, oCorners[i].y,
+                                      oCorners[i].z, s[i]);
+            for (int i = 0; i < 4; ++i) {
+                int j = (i + 1) & 3;
+                if (ok[i] && ok[j]) wdl->AddLine(s[i], s[j], col(ui::palette.accent, 0.90f), 2.5f);
+            }
+        } else {
+            for (int i = 0; i < 4; ++i)
+                wdl->AddLine(cQuad[i], cQuad[(i + 1) & 3], col(ui::palette.accent, 0.90f), 2.5f);
+        }
+        wdl->PopClipRect();
+    }
 
     st.requestCursor(ui::CursorKind::Hand);
     if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        if (!io.KeyCtrl) st.selection.clear();   // plain click = single-select the datum
+        if (!io.KeyCtrl) st.selection.clear();   // plain click = single-select the datum/plane
         st.selectedFeatureId = fid;              // tree row highlights; renderer emphasizes the datum
+        // Keep the origin-plane tree emphasis in step when a default plane was picked in the viewport.
+        st.planeEmphasis = (fid == "plane.front") ? 0 : (fid == "plane.top") ? 1
+                          : (fid == "plane.right") ? 2 : st.planeEmphasis;
         st.treeScrollToSelection = true;
     }
     return true;
@@ -4288,21 +4527,36 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 hovered = p;
             }
         }
+        // Also hit-test the user's OWN datum planes so a sketch can be started on one (not just the
+        // three origin planes). The frontmost target (origin OR datum plane) wins.
+        std::string sDatumFid, sDatumName; float sDatumDepth = 1e30f; ImVec2 sDatumQuad[4];
+        bool sDatumHit = imgHovered && hitTestDatumPlane(st, io.MousePos, imgMin, vw, vh,
+                                                         sDatumFid, sDatumName, sDatumDepth, sDatumQuad);
+        bool sDatumWins = sDatumHit && sDatumDepth < hoveredDepth;
+        if (sDatumWins) hovered = -1;   // a datum plane is in front; drop origin-plane emphasis
         planeHover_ = hovered;
         // The renderer already draws all three datum planes (fill + outline, with emphasis
         // brightening the hovered one — viewport_panel passes planeHover() as the emphasis).
         // Painting a second translucent fill per plane on top made the overlap muddy and
         // unreadable (user bug report), so the overlay adds ONLY a hover tint on the one
         // plane under the cursor.
-        if (hovered >= 0 && quadVis[hovered]) {
+        if (sDatumWins) {
+            wdl->AddQuadFilled(sDatumQuad[0], sDatumQuad[1], sDatumQuad[2], sDatumQuad[3], col(pal.accent, 0.16f));
+            wdl->AddQuad(sDatumQuad[0], sDatumQuad[1], sDatumQuad[2], sDatumQuad[3], col(pal.accent, 0.90f), 2.0f);
+        } else if (hovered >= 0 && quadVis[hovered]) {
             wdl->AddQuadFilled(quadS[hovered][0], quadS[hovered][1], quadS[hovered][2],
                                quadS[hovered][3], col(pal.accent, 0.16f));
             wdl->AddQuad(quadS[hovered][0], quadS[hovered][1], quadS[hovered][2],
                          quadS[hovered][3], col(pal.accent, 0.90f), 2.0f);
         }
-        // Click: an origin plane wins if hovered; else attempt the hovered planar face.
+        // Click: a datum plane wins if frontmost; else an origin plane; else the hovered planar face.
         if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            if (hovered >= 0) {
+            if (sDatumWins) {
+                // A created datum plane: refs.plane = the bare feature-id STRING (the engine's sketch
+                // compiler looks it up in the results map as a PlaneResult — see document.cpp).
+                planePicking_ = false; st.sketchPlanePickActive = false;
+                createSketchOnPlane(st, nlohmann::json(sDatumFid));
+            } else if (hovered >= 0) {
                 planePicking_ = false; st.sketchPlanePickActive = false;
                 createSketchOnPlane(st, planeSel[hovered]);
             } else if (st.hover.valid() && st.hover.kind == render::PickKind::Face) {

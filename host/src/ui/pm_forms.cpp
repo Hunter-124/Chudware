@@ -362,6 +362,12 @@ static const std::vector<PMFormDef>& forms() {
             DatumRef ("plane",    "Mirror Face/Plane", "Mirror Plane",
                       "plane.right|plane.front|plane.top",
                       "Right plane|Front plane|Top plane"),
+            // Override well (shares the "plane" ref key, last-wins in buildOpFeature): click an
+            // origin plane (routed as a datum string) or a planar model face — same dropdown+pick
+            // pattern as linear/circular pattern. K_PLANE arms drawPlanePicker; the engine's
+            // mirror branch already resolves both (normalize_feature: datum->plane_point/normal,
+            // face selector passes through).
+            Well     ("plane",    "…or click a face/plane", "Mirror Plane", K_PLANE, false),
             FeatWell ("features", "Features to Mirror", "Features to Mirror"),
             Well     ("bodies",   "Bodies to Mirror",   "Bodies to Mirror", K_BODY, true),
             Check    ("merge",    "Merge result",       "Options", true),
@@ -415,6 +421,10 @@ static const std::vector<PMFormDef>& forms() {
             DatumRef ("neutral", "Neutral Plane", "Draft",
                       "plane.top|plane.front|plane.right",
                       "Top plane|Front plane|Right plane"),
+            // Override well (shares "neutral", last-wins): click an origin plane or a planar face
+            // for the neutral plane — the common SolidWorks draft workflow. Engine accepts both
+            // (normalize_feature neutral slot: datum->plane_point/normal, face passes through).
+            Well     ("neutral", "…or click a face/plane", "Draft", K_PLANE, false),
             Well     ("faces",   "Faces to Draft", "Draft", K_FACE, true),
             WellIf   ("parting", "Parting Line (edges)", "Draft", K_EDGE, true,
                       "mode", "parting_line|step"),
@@ -425,6 +435,10 @@ static const std::vector<PMFormDef>& forms() {
         { "helix", "Helix / Spiral", "curve_helix", {
             DatumRef ("base",   "Axis Plane",       "Helix",
                       "plane.top|plane.front|plane.right", "Top plane|Front plane|Right plane"),
+            // Override well (shares "base", last-wins): click an origin plane or a planar face as
+            // the helix axis-plane. Engine helix base now resolves via plane_of (datum/csys OR a
+            // planar face), same as the ref-plane offset base.
+            Well     ("base",   "…or click a face/plane", "Helix", K_PLANE, false),
             Dim      ("radius", "Radius",           "Helix", 10.0),
             Dim      ("pitch",  "Pitch",            "Helix", 5.0),
             Dim      ("height", "Height",           "Helix", 20.0),
@@ -434,13 +448,16 @@ static const std::vector<PMFormDef>& forms() {
         }},
         // --- ref_plane (datum) --- engine datum.py compile_plane. method gates which refs apply:
         //   offset/angle use base (+ second hinge for angle); three_point uses 3 vertices; midplane
-        //   uses base + second. base is a DatumRef (the 3 origin planes); second/points are picks.
+        //   uses base + second. base is a K_PLANE well: SolidWorks-style, the user CLICKS an origin
+        //   datum plane (routed as "plane.top"/… via the plane picker) or a planar model face in the
+        //   viewport — not a dropdown. Arming the well force-shows the three origin planes so the
+        //   pick target is visible. base is hidden for three_point (which is defined by 3 vertices).
         { "plane", "Plane", "ref_plane", {
             ComboL   ("method", "Type",            "First Reference",
                       "offset|angle|three_point|midplane",
                       "Offset|At Angle|Three Points|Mid Plane"),
-            DatumRef ("base",   "Reference",       "First Reference",
-                      "plane.top|plane.front|plane.right", "Top plane|Front plane|Right plane"),
+            WellIf   ("base",   "Reference",       "First Reference", K_PLANE, false,
+                      "method", "offset|angle|midplane"),
             DimIf    ("offset", "Offset Distance", "Parameters", 10.0, "method", "offset"),
             AngleIf  ("angle",  "Angle",           "Parameters", 45.0, "method", "angle"),
             WellIf   ("second", "Hinge (edge/axis)","Second Reference", K_FACEEDGE, false,
@@ -478,11 +495,13 @@ static const std::vector<PMFormDef>& forms() {
             Well   ("target", "Reference", "Reference", K_FEV, false),
         }},
         // --- ref_csys (datum) --- engine datum.py compile_csys. origin + optional X/Y direction
-        //   edges (orthonormalized engine-side).
+        //   refs (orthonormalized engine-side). x_dir/y_dir take a model edge OR a datum AXIS — the
+        //   engine's _dir_from (document.cpp) already resolves resolve_axis_ref, so the wells are
+        //   K_EDGEAXIS (arm the datum-axis picker too) for parity with revolve / circular-pattern.
         { "csys", "Coordinate System", "ref_csys", {
-            Well ("origin", "Origin",        "Coordinate System", K_VERTEX, false),
-            Well ("x_dir",  "X Axis (edge)", "Coordinate System", K_EDGE, false),
-            Well ("y_dir",  "Y Axis (edge)", "Coordinate System", K_EDGE, false),
+            Well ("origin", "Origin",            "Coordinate System", K_VERTEX,   false),
+            Well ("x_dir",  "X Axis (edge/axis)", "Coordinate System", K_EDGEAXIS, false),
+            Well ("y_dir",  "Y Axis (edge/axis)", "Coordinate System", K_EDGEAXIS, false),
         }},
         // --- boolean (Multi-body) --- engine features/boolean.py. op is preset from the ribbon
         //   command (Combine/Subtract/Intersect), like extrude boss/cut. Body wells (K_BODY): a

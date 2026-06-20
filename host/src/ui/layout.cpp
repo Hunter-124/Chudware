@@ -17,6 +17,7 @@
 #include "file_explorer.h"      // Wave 3: drawFileExplorerBody (Explorer tab)
 #include "property_manager.h"   // PropertyManager::drawBody
 #include "config_panel.h"       // ConfigPanel::drawEmbedded (live Configurations tab)
+#include "sim_manager.h"        // SimManager::drawTreeBody (live Simulation tab)
 #include "icons.h"              // getIcon / IconUV
 
 #include <algorithm>
@@ -83,7 +84,9 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     // Command dialogs dock into the lower-right slot so they surface as tabs instead of floating
     // behind the central node. They share one node (only one is typically open at a time).
     const char* dialogs[] = {
-        "Simulation", "Insert Component", "Mate##asm", "Exploded View",
+        // ("Simulation" used to dock here as a floating window; it now lives in the left-pane
+        // Simulation tab, so it is intentionally no longer pre-docked.)
+        "Insert Component", "Mate##asm", "Exploded View",
         "Interference Detection", "Bill of Materials",
         // Evaluate dialogs (titles set in evaluate_dialogs.cpp) — pre-registered so they land in
         // the task pane the first time they open (DockBuilderDockWindow matches by name).
@@ -236,6 +239,7 @@ void drawLeftPane(AppState& st,
         { kLeftPaneFeatureManager,  "history",     "F", "Feature Manager" },
         { kLeftPanePropertyManager, "material",    "P", "Property Manager" },
         { kLeftPaneConfigurations,  "settings",    "C", "Configurations" },
+        { kLeftPaneSimulation,      "performance", "S", "Simulation studies" },
     };
 
     const float btn = 36.0f * S;
@@ -288,6 +292,9 @@ void drawLeftPane(AppState& st,
     } else if (st.leftPaneTab == kLeftPaneConfigurations) {
         title = "Configurations";
         titleIcon = "settings";
+    } else if (st.leftPaneTab == kLeftPaneSimulation) {
+        title = "Simulation";
+        titleIcon = "performance";
     }
 
     // Equal left/right margins via symmetric WindowPadding + a slim scrollbar. When the form
@@ -343,6 +350,13 @@ void drawLeftPane(AppState& st,
             // without a Begin/End. Fall back to the at-rest single-config body if it's unset.
             if (st.configPanel) st.configPanel->drawEmbedded(st);
             else                drawConfigurationsBody(st);
+            break;
+
+        case kLeftPaneSimulation:
+            // Simulation studies for the active part: a SolidWorks-style study tree + inline setup
+            // forms. SimManager is per-document (re-seated on tab switch); studies live in the doc and
+            // persist in the .step+. Falls back to the run_gui singleton at the empty start state.
+            if (st.simManager) st.simManager->drawTreeBody(st);
             break;
 
         case kLeftPaneFeatureManager:

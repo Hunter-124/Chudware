@@ -9,6 +9,8 @@
 #include "imgui.h"
 
 #include "doc_tabs.h"
+#include "feature_tree.h"   // featureTreeSaveDoc — save-then-close from the unsaved-changes prompt
+#include "file_dialog.h"    // saveFileDialog — ECAD Save-As from the unsaved-changes prompt
 #include "icons.h"
 #include "metrics.h"
 
@@ -30,6 +32,9 @@ enum class NewDocKind { None = -1, Part = 0, Assembly, Drawing, Schematic, PCB }
 static NewDocKind s_newDoc = NewDocKind::None;
 // Unsaved-changes prompt: the tab the user asked to close while it had unsaved edits.
 static int  s_confirmCloseIdx = -1;
+// Save-then-close: the tab to save and then close (the "Save" choice on the unsaved-changes prompt).
+// Applied after the strip is drawn (like s_closeIdx), so it never mutates docTabs mid-iteration.
+static int  s_saveCloseIdx = -1;
 // Wave 2: set true to request the New-Document chooser popup open this frame (the "+" button click,
 // or a Ctrl+N hook from app.cpp via openNewDocChooser()). Consumed inside drawDocTabs.
 static bool s_openChooser = false;
@@ -147,7 +152,98 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
 }
 
 float docTabStripHeight(const AppState& st) {
-    return st.docTabs.empty() ? 0.0f : 26.0f * ui::uiScale;
+    // The strip persists even with no document open (empty start state / all tabs closed) so its
+    // "+" New-Document button stays reachable — closing the last tab must not strand the user with
+    // no way to start a new file. Only suppressed before the worker is up (nothing to host yet).
+    if (!st.docTabs.empty()) return 26.0f * ui::uiScale;
+    return st.workerStarted ? 26.0f * ui::uiScale : 0.0f;
+}
+
+// Index of the Part/Assembly tab that owns worker doc `docId`, or -1. Used to resolve a Drawing's
+// source part (a drawing is persisted by saving that part's .step+).
+static int partTabIndexForDoc(AppState& st, const std::string& docId) {
+    using K = AppState::DocTab::TabKind;
+    if (docId.empty()) return -1;
+    for (int i = 0; i < (int)st.docTabs.size(); ++i)
+        if ((st.docTabs[i].kind == K::Part || st.docTabs[i].kind == K::Assembly) &&
+            st.docTabs[i].docId == docId)
+            return i;
+    return -1;
+}
+
+// See doc_tabs.h. One place to save any tab kind so the close / quit / Save / Save-All flows behave
+// identically across the whole suite (CAD parts, ECAD boards, drawings).
+TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog) {
+    if (idx < 0 || idx >= (int)st.docTabs.size()) return TabSaveResult::Nothing;
+    using K = AppState::DocTab::TabKind;
+    AppState::DocTab& t = st.docTabs[idx];
+
+    // ---- Part / Assembly → DocMirror .step+ ----
+    if (t.kind == K::Part || t.kind == K::Assembly) {
+        st.switchToTab(idx);   // DocMirror::save writes whatever doc the mirror points at
+        if (!forceDialog && !t.path.empty()) {
+            std::string err;
+            if (st.docMirror.save(st.worker, t.path, err)) {
+                t.dirty = false;
+                st.clearDrawingDirtyForSource(t.docId);   // the save embedded this part's drawings
+                st.pushRecentFile(t.path);
+                return TabSaveResult::Saved;
+            }
+            st.addLog("[tabs] save failed for " + t.path + ": " + err);
+            st.toast(ui::ToastLevel::Error, "Save failed: " + err);
+            return TabSaveResult::Failed;
+        }
+        // Never saved (or forced) → Save-As (featureTreeSaveDoc records path + clears active dirty +
+        // doSaveDoc clears this part's drawing siblings).
+        std::string saved = ui::featureTreeSaveDoc(st, /*saveAs=*/forceDialog);
+        if (!saved.empty()) { st.pushRecentFile(saved); return TabSaveResult::Saved; }
+        return TabSaveResult::Cancelled;
+    }
+
+    // ---- Schematic / PCB → ecad_save .ecad+ ----
+    if (t.kind == K::Schematic || t.kind == K::PCB) {
+        if (t.ecadDocId.empty()) return TabSaveResult::Nothing;
+        std::string path = t.path;
+        if (forceDialog || path.empty()) {
+            std::string suggest = t.displayTitle();
+            path = ui::saveFileDialog(
+                "AI-ECAD design (*.ecad+)\0*.ecad+\0All files (*.*)\0*.*\0", "ecad+",
+                suggest.empty() ? "design" : suggest.c_str());
+            if (path.empty()) return TabSaveResult::Cancelled;
+        }
+        nlohmann::json res;
+        std::string err;
+        if (!st.worker.call("ecad_save", {{"doc_id", t.ecadDocId}, {"path", path}}, res, err) ||
+            (res.is_object() && res.contains("code"))) {
+            const std::string msg = err.empty() && res.is_object()
+                                        ? res.value("message", std::string("engine error")) : err;
+            st.addLog("[tabs] ecad_save failed for " + t.ecadDocId + ": " + msg);
+            st.toast(ui::ToastLevel::Error, "Save failed: " + msg);
+            return TabSaveResult::Failed;
+        }
+        const std::string saved = res.is_object() ? res.value("path", path) : path;
+        t.path = saved;
+        t.dirty = false;
+        st.pushRecentFile(saved);
+        st.addLog("[tabs] ecad saved -> " + saved);
+        st.toast(ui::ToastLevel::Info, "Saved " + t.displayTitle());
+        return TabSaveResult::Saved;
+    }
+
+    // ---- Drawing → save its SOURCE part (the drawing embeds in that part's .step+) ----
+    if (t.kind == K::Drawing) {
+        const int src = partTabIndexForDoc(st, t.sourceDocId);
+        if (src < 0) {
+            // Source part is no longer open — it can't be embed-saved. Don't block the close.
+            st.addLog("[tabs] drawing '" + t.displayTitle() +
+                      "' has no open source part — cannot persist independently");
+            return TabSaveResult::Nothing;
+        }
+        TabSaveResult r = saveDocTab(st, src, forceDialog);   // saving the part clears this drawing
+        return r;
+    }
+
+    return TabSaveResult::Nothing;
 }
 
 // Drawn INLINE at the top of the central dock window's content (the Viewport 3D view, the drawing
@@ -158,8 +254,10 @@ float docTabStripHeight(const AppState& st) {
 // Dummy so the 3D image / sheet flows below it (picking is unaffected — the image rect is read from
 // the image item itself). Returns the strip height (0 when no document is open).
 float drawDocTabs(AppState& st, float availW) {
-    // Nothing to show in the empty start state (no document open).
-    if (st.docTabs.empty()) return 0.0f;
+    // The strip still draws with zero tabs (empty start state / all tabs closed) — just the band and
+    // the "+" New-Document button, so the user can always start a new file. Suppressed only before
+    // the worker is up (mirrors docTabStripHeight).
+    if (st.docTabs.empty() && !st.workerStarted) return 0.0f;
 
     const auto& pal = ui::palette;
     float s = ui::uiScale;
@@ -169,6 +267,7 @@ float drawDocTabs(AppState& st, float availW) {
 
     s_switchTo = -1;
     s_closeIdx = -1;
+    s_saveCloseIdx = -1;
     s_newDoc = NewDocKind::None;
 
     // Background band spanning the content width so the row reads as a cohesive tab bar over the
@@ -221,22 +320,10 @@ float drawDocTabs(AppState& st, float availW) {
             dl->AddLine(ImVec2(c.x, c.y - g), ImVec2(c.x, c.y + g), col, 1.6f * s);
         }
         if (hov) ImGui::SetTooltip("New document");
-        if (clicked || s_openChooser) { ImGui::OpenPopup("##newdocmenu"); s_openChooser = false; }
-        // Anchor the popup just under the "+" button.
-        ImGui::SetNextWindowPos(ImVec2(p0.x, p0.y + btn));
-        if (ImGui::BeginPopup("##newdocmenu")) {
-            if (ImGui::MenuItem("New Part"))      s_newDoc = NewDocKind::Part;
-            if (ImGui::MenuItem("New Assembly"))  s_newDoc = NewDocKind::Assembly;
-            // Make Drawing needs an active PART/ASM tab to project from; gray it out otherwise.
-            const bool canDraw = st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
-                                 (st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Part ||
-                                  st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly);
-            if (ImGui::MenuItem("New Drawing", nullptr, false, canDraw)) s_newDoc = NewDocKind::Drawing;
-            ImGui::Separator();
-            if (ImGui::MenuItem("New Schematic")) s_newDoc = NewDocKind::Schematic;
-            if (ImGui::MenuItem("New PCB"))       s_newDoc = NewDocKind::PCB;
-            ImGui::EndPopup();
-        }
+        // Open the tiled "Create New" chooser (Part / Assembly / Drawing / Simulation / PCB / Open
+        // existing — with previews), hosted at app scope (ui::drawNewDocChooser). Ctrl+N raises it
+        // the same way via openNewDocChooser().
+        if (clicked || s_openChooser) { st.wantNewDocChooser = true; s_openChooser = false; }
     }
 
     // ---- unsaved-changes confirmation prompt ----
@@ -253,9 +340,15 @@ float drawDocTabs(AppState& st, float availW) {
         std::string name = (idx >= 0 && idx < (int)st.docTabs.size())
                                ? st.docTabs[idx].displayTitle() : std::string("this document");
         ImGui::Text("\"%s\" has unsaved changes.", name.c_str());
-        ImGui::TextUnformatted("Close it anyway? Your edits will be lost.");
+        ImGui::TextUnformatted("Save your edits before closing?");
         ImGui::Spacing();
-        if (ImGui::Button("Close without saving", ImVec2(ui::metrics::px(180), 0))) {
+        if (ImGui::Button("Save", ImVec2(ui::metrics::px(120), 0))) {
+            s_saveCloseIdx = s_confirmCloseIdx;
+            s_confirmCloseIdx = -1;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Don't Save", ImVec2(ui::metrics::px(120), 0))) {
             s_closeIdx = s_confirmCloseIdx;
             s_confirmCloseIdx = -1;
             ImGui::CloseCurrentPopup();
@@ -277,7 +370,14 @@ float drawDocTabs(AppState& st, float availW) {
     // ---- apply deferred actions (after all tabs were drawn) ----
     // A close that targets the active tab leaves the mirror on a neighbor, so handle close before
     // switch; only one of these fires per frame in practice.
-    if (s_closeIdx >= 0) {
+    if (s_saveCloseIdx >= 0) {
+        // Save the tab, then close it — unless the user cancels the Save-As or it fails (keep it open
+        // so nothing is lost). Saved/Nothing both proceed to close.
+        const int idx = s_saveCloseIdx;
+        s_saveCloseIdx = -1;
+        TabSaveResult r = saveDocTab(st, idx, /*forceDialog=*/false);
+        if (r != TabSaveResult::Cancelled && r != TabSaveResult::Failed) st.closeDocTab(idx);
+    } else if (s_closeIdx >= 0) {
         st.closeDocTab(s_closeIdx);
         s_closeIdx = -1;
     } else if (s_switchTo >= 0) {

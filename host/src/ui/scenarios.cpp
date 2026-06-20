@@ -24,7 +24,7 @@
 #include "asm_panels.h"
 #include "evaluate_dialogs.h"
 #include "property_manager.h"
-#include "sim_panel.h"
+#include "sim_manager.h"
 #include "sketch_mode.h"
 
 namespace {
@@ -587,7 +587,7 @@ void ScenarioRunner::tick(AppState& st) {
     // steel (index 0), density 0.4 -> wait for completion (cap ~90 s) -> von Mises colormap.
     if (st.wantFea && st.workerStarted && !st.feaShotDone) {
         auto* sim = st.simClient;
-        simPanel.tick(st);  // pump the panel so completion lands while we wait
+        if (st.simManager) st.simManager->tick(st);  // pump so completion lands while we wait
         if (feaSettle > 0) { --feaSettle; }
         else switch (feaStep) {
             case 0: {  // New part + box
@@ -608,10 +608,9 @@ void ScenarioRunner::tick(AppState& st) {
                 feaSettle = 3; ++feaStep; break;
             }
             case 1: {  // Static study + resolved fixture/load faces (-X end / +X end)
-                simPanel.handleCommand(st, "sim_new_static");
-                {
-                    int steelIdx = simPanel.materialIndexByKey("steel_1018");
-                    simPanel.configureActive(0.4f, steelIdx >= 0 ? steelIdx : 0);
+                if (st.simManager) {
+                    st.simManager->handleCommand(st, "sim_new_static");
+                    st.simManager->configureActive(st, 0.4f, "steel_1018");
                 }
                 auto faceAtExtremeX = [&](bool wantMax) -> nlohmann::json {
                     nlohmann::json best; double bestC = wantMax ? -1e30 : 1e30;
@@ -634,11 +633,11 @@ void ScenarioRunner::tick(AppState& st) {
                 st.selection.clear();
                 { core::SelItem it; it.selector = fixFace.dump(); it.pending_resolve = false;
                   st.selection.mutableItems().push_back(it); }
-                simPanel.handleCommand(st, "sim_fixture");
+                if (st.simManager) st.simManager->handleCommand(st, "sim_fixture");
                 st.selection.clear();
                 { core::SelItem it; it.selector = loadFace.dump(); it.pending_resolve = false;
                   st.selection.mutableItems().push_back(it); }
-                simPanel.handleCommand(st, "sim_load_force");
+                if (st.simManager) st.simManager->handleCommand(st, "sim_load_force");
                 st.selection.clear();
                 std::printf("fea: faces fixCx=%.1f loadCx=%.1f\n",
                             fixFace.contains("centroid") ? fixFace["centroid"][0].get<double>() : 0.0,
@@ -647,7 +646,7 @@ void ScenarioRunner::tick(AppState& st) {
                 feaSettle = 2; ++feaStep; break;
             }
             case 2: {  // Run
-                simPanel.handleCommand(st, "sim_run");
+                if (st.simManager) st.simManager->handleCommand(st, "sim_run");
                 std::printf("fea: study launched (density 0.4, steel, 100 N)\n");
                 std::fflush(stdout);
                 feaWaitFrames = 0; ++feaStep; break;

@@ -170,6 +170,10 @@ public:
     // The feature id of the currently SELECTED datum (drawn emphasized — brighter + thicker), or
     // "" for none. Set each frame from AppState::selectedFeatureId so clicking a datum highlights it.
     void setSelectedDatumId(const std::string& id) { selectedDatumId_ = id; }
+    // The feature id of the datum plane currently OPEN in the PropertyManager (being created/edited).
+    // Its normal arrow is drawn only while it's the active edit target — once committed the arrow is
+    // dropped so created planes don't carry a persistent normal handle. "" = none.
+    void setEditingDatumId(const std::string& id) { editingDatumId_ = id; }
 
     // Orbit-center override: while a sketch is open the model bbox (center_) doesn't include the
     // sketch geometry, so an offset sketch would orbit/frame around the origin. The sketch mode sets
@@ -290,6 +294,7 @@ private:
     unsigned int planeProg_ = 0, planeVao_ = 0, planeVbo_ = 0;
     std::vector<RefDatum> refDatums_;   // feature datum geometry to draw (reference overlays)
     std::string selectedDatumId_;       // id of the emphasized (selected) datum, "" = none
+    std::string editingDatumId_;        // id of the datum plane open in the PM (draws normal arrow)
     bool  orbitOverride_ = false;       // use orbitCenter_ instead of center_ as the look-at target
     Vec3  orbitCenter_{0, 0, 0};        // sketch-geometry centre (valid when orbitOverride_)
     unsigned int capProg_ = 0, capVao_ = 0, capVbo_ = 0;  // W3-I: section cap (flat-lit quad)

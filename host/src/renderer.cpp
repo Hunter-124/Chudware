@@ -1210,11 +1210,16 @@ int Renderer::sectionClip(float normals[3][3], float offsets[3]) const {
 // "it highlights a vertical plane but sketches on Top" bug). Geometry now matches the engine.
 void Renderer::planeCorners(int plane, float e, Vec3 out[4]) const {
     static const float uv[4][2] = {{-1,-1}, {1,-1}, {1,1}, {-1,1}};
+    // The default datum planes pass through the WORLD ORIGIN (engine SketchPlane::top/front/right
+    // origin = (0,0,0)); the quad is only CENTERED on the model in its two in-plane axes so it stays
+    // near the part for visibility. The out-of-plane axis is pinned to 0 — using center_ there made
+    // the Top plane float to the model's mid-height (the "Plane1 base displays halfway" bug) and
+    // disagreed with where a sketch on that plane actually lands.
     for (int i = 0; i < 4; ++i) {
         float u = uv[i][0] * e, v = uv[i][1] * e;
-        if (plane == 0)      out[i] = Vec3(center_.x + u, center_.y,     center_.z + v);   // XZ  Front
-        else if (plane == 1) out[i] = Vec3(center_.x + u, center_.y + v, center_.z);       // XY  Top
-        else                 out[i] = Vec3(center_.x,     center_.y + u, center_.z + v);   // YZ  Right
+        if (plane == 0)      out[i] = Vec3(center_.x + u, 0.0f,          center_.z + v);   // XZ  Front (y=0)
+        else if (plane == 1) out[i] = Vec3(center_.x + u, center_.y + v, 0.0f);            // XY  Top   (z=0)
+        else                 out[i] = Vec3(0.0f,          center_.y + u, center_.z + v);   // YZ  Right (x=0)
     }
 }
 
@@ -1365,6 +1370,32 @@ void Renderer::drawRefDatums(const Mat4& mvp) {
                 else          setCol(0.30f, 0.62f, 0.34f, 0.85f);
                 glLineWidth(selected ? 2.5f : 1.5f);
                 glDrawArrays(GL_LINE_LOOP, 0, 4);
+
+                // Normal arrow (SolidWorks plane-normal handle): a shaft from the plane centre along
+                // +normal plus a 4-line arrowhead in the in-plane (xdir/ydir) frame, so the user sees
+                // which way the new plane faces. Drawn ONLY while this plane is the one open in the
+                // PropertyManager (being created/edited) — once committed the arrow disappears so
+                // finished planes don't carry a persistent normal handle.
+                if (!editingDatumId_.empty() && d.id == editingDatumId_) {
+                    const float aLen = ps * 0.95f;   // shaft length ~ the quad half-extent
+                    const float hh   = ps * 0.22f;   // arrowhead back-set along -normal
+                    const float hw   = ps * 0.11f;   // arrowhead half-width
+                    Vec3 tip  = d.origin + d.dir * aLen;
+                    Vec3 base = tip - d.dir * hh;
+                    if (selected) setCol(0.45f, 0.95f, 0.55f, 1.0f);
+                    else          setCol(0.33f, 0.68f, 0.38f, 0.95f);
+                    glLineWidth(selected ? 2.5f : 1.8f);
+                    float shaft[6] = {d.origin.x,d.origin.y,d.origin.z, tip.x,tip.y,tip.z};
+                    upload(shaft, 6);
+                    glDrawArrays(GL_LINES, 0, 2);
+                    Vec3 head[4] = {base + d.xdir * hw, base - d.xdir * hw,
+                                    base + d.ydir * hw, base - d.ydir * hw};
+                    for (int i = 0; i < 4; ++i) {
+                        float seg[6] = {tip.x,tip.y,tip.z, head[i].x,head[i].y,head[i].z};
+                        upload(seg, 6);
+                        glDrawArrays(GL_LINES, 0, 2);
+                    }
+                }
                 break;
             }
             case RefDatum::Kind::Point: {

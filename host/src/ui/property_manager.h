@@ -267,11 +267,13 @@ public:
     // expansion (doc_face_edges -> per-edge resolvePick -> routePick).
     bool activeWellExpandsFaceToEdges() const;
 
-    // Route an origin datum-plane ref ("plane.front"/"plane.top"/"plane.right") into the active
-    // plane-accepting well (called by the viewport plane picker). Stores the reserved datum string
-    // as the well's selector — the engine's _SEL_OR_DATUM slots accept it directly. Re-picking the
-    // same plane toggles it off (SolidWorks). Returns true if a well consumed the pick.
-    bool routeDatumPlane(const std::string& datumId);
+    // Route a datum-plane ref into the active plane-accepting well (called by the viewport plane
+    // picker). datumId is either a reserved origin plane ("plane.front"/"plane.top"/"plane.right")
+    // OR a created datum-plane FEATURE ID (e.g. "F7") — both resolve as a bare-string ref in the
+    // engine (_SEL_OR_DATUM / resolve_plane_ref). label overrides the chip text (the datum's name,
+    // e.g. "Plane1"); empty => derive a short label from datumId. Re-picking the same plane toggles
+    // it off (SolidWorks). Returns true if a well consumed the pick.
+    bool routeDatumPlane(const std::string& datumId, const std::string& label = "");
 
     // True when the active selector well accepts datum-axis picks (PMSelKinds.axis). The viewport
     // axis picker (SketchMode::drawAxisPicker) only arms while this is true.

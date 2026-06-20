@@ -32,6 +32,21 @@
 #include "lib3mf_dynamic.hpp"
 #endif
 
+// SolidWorks COM import (sw_export_step). Confined to this TU; Windows-only. Pulls full
+// <windows.h> + the OLE Automation surface (IDispatch/VARIANT) and link-imports the COM
+// runtime via #pragma so no CMakeLists change is needed. NOMINMAX keeps the PLY reader's
+// std::max happy. Off Windows, sw_export_step throws the actionable "Save As STEP" error.
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <objbase.h>
+#include <oleauto.h>
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#endif
+
 // openNURBS (Rhino .3dm read/write) — CONFINED to this TU, guarded by
 // AICAD_WITH_OPENNURBS. opennurbs.h is the single umbrella header; it pulls in
 // <windows.h> itself on Win32. NOMINMAX (so its includes don't redefine
@@ -442,6 +457,162 @@ std::string detect_format(const std::string& path) {
     throw OpError("invalid_op", "cannot detect format from extension '" + ext + "'",
                   {{"reason", "unknown extension"}, {"path", path}});
 }
+
+// --------------------------------------------------------------- SolidWorks COM → STEP
+// Port of engine/doc/formats_solidworks.py (sw_com_export_step + solidworks_available) to
+// native Win32 IDispatch late-binding (no SolidWorks type library on the link line). The
+// automation sequence MIRRORS the proven Python path exactly:
+//   Dispatch("SldWorks.Application") -> .Visible=false -> OpenDoc6(file,type,1,"",0,0)
+//   -> model.SaveAs3(step,0,0) -> CloseDoc(file). Result verified by STEP file presence.
+#ifdef _WIN32
+namespace {
+
+std::wstring widen_utf8(const std::string& s) {
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), w.data(), n);
+    return w;
+}
+
+// Minimal IDispatch late-binding call. `args` are in REVERSE order (DISPPARAMS rgvarg[0]
+// is the LAST parameter). PROPERTYPUT names the value arg. Returns the HRESULT.
+HRESULT sw_invoke(IDispatch* disp, WORD flags, const wchar_t* name, VARIANT* result, int argc,
+                  VARIANT* args) {
+    if (!disp) return E_POINTER;
+    DISPID dispid;
+    LPOLESTR nm = const_cast<LPOLESTR>(name);
+    HRESULT hr = disp->GetIDsOfNames(IID_NULL, &nm, 1, LOCALE_USER_DEFAULT, &dispid);
+    if (FAILED(hr)) return hr;
+    DISPPARAMS dp{args, nullptr, (UINT)argc, 0};
+    DISPID putid = DISPID_PROPERTYPUT;
+    if (flags & DISPATCH_PROPERTYPUT) {
+        dp.cNamedArgs = 1;
+        dp.rgdispidNamedArgs = &putid;
+    }
+    return disp->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT, flags, &dp, result, nullptr, nullptr);
+}
+
+VARIANT v_bstr(const std::wstring& s) {
+    VARIANT v; VariantInit(&v); v.vt = VT_BSTR; v.bstrVal = SysAllocString(s.c_str()); return v;
+}
+VARIANT v_i4(LONG n) { VARIANT v; VariantInit(&v); v.vt = VT_I4; v.lVal = n; return v; }
+VARIANT v_bool(bool b) {
+    VARIANT v; VariantInit(&v); v.vt = VT_BOOL; v.boolVal = b ? VARIANT_TRUE : VARIANT_FALSE; return v;
+}
+
+}  // namespace
+
+bool solidworks_available() {
+    CLSID clsid;
+    // CLSIDFromProgID hits the registry's SldWorks.Application registration without
+    // launching SolidWorks (matches the Python winreg probe).
+    return SUCCEEDED(CLSIDFromProgID(L"SldWorks.Application", &clsid));
+}
+
+std::string sw_export_step(const std::string& src_path) {
+    std::string ext = lower(std::filesystem::path(src_path).extension().string());
+    // swDocumentTypes_e: PART=1, ASSEMBLY=2. Parasolid (.x_t/.x_b) opens as a PART.
+    const LONG doctype = (ext == ".sldasm") ? 2 : 1;
+    const std::string stem = std::filesystem::path(src_path).stem().string();
+    std::error_code ec;
+    std::filesystem::path outdir =
+        std::filesystem::temp_directory_path() / ("sw_" + std::to_string(GetTickCount64()));
+    std::filesystem::create_directories(outdir, ec);
+    const std::string out_step = (outdir / (stem + ".step")).string();
+
+    const std::string actionable =
+        ". Open the part in SolidWorks and 'Save As' STEP (.step), then import that.";
+
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool didInit = SUCCEEDED(hrInit);
+    IDispatch* swApp = nullptr;
+    IDispatch* model = nullptr;
+    auto cleanup = [&]() {
+        if (model) { model->Release(); model = nullptr; }
+        if (swApp) { swApp->Release(); swApp = nullptr; }
+        if (didInit) CoUninitialize();
+    };
+    auto fail = [&](const std::string& why) -> std::string {
+        cleanup();
+        throw OpError("import_failed", "SolidWorks COM import: " + why + actionable,
+                      {{"path", src_path}});
+    };
+
+    CLSID clsid;
+    if (FAILED(CLSIDFromProgID(L"SldWorks.Application", &clsid)))
+        return fail("SolidWorks is not installed / COM-registered on this machine");
+    if (FAILED(CoCreateInstance(clsid, nullptr, CLSCTX_LOCAL_SERVER | CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&swApp))) ||
+        !swApp)
+        return fail("could not start SolidWorks");
+
+    {  // swApp.Visible = false
+        VARIANT a = v_bool(false);
+        sw_invoke(swApp, DISPATCH_PROPERTYPUT, L"Visible", nullptr, 1, &a);
+        VariantClear(&a);
+    }
+    {  // model = swApp.OpenDoc6(file, type, options=1[Silent], config="", &errors, &warnings).
+       // Errors/Warnings are [in,out] ByRef LONG — pass VT_I4|VT_BYREF or OpenDoc6 fails.
+        LONG errCode = 0, warnCode = 0;
+        VARIANT vWarn; VariantInit(&vWarn); vWarn.vt = VT_I4 | VT_BYREF; vWarn.plVal = &warnCode;
+        VARIANT vErr;  VariantInit(&vErr);  vErr.vt = VT_I4 | VT_BYREF;  vErr.plVal = &errCode;
+        VARIANT cfg = v_bstr(L""), opt = v_i4(1), typ = v_i4(doctype),
+                fn = v_bstr(widen_utf8(src_path));
+        VARIANT args[6] = {vWarn, vErr, cfg, opt, typ, fn};  // reverse order
+        VARIANT res; VariantInit(&res);
+        HRESULT hr = sw_invoke(swApp, DISPATCH_METHOD, L"OpenDoc6", &res, 6, args);
+        // Don't VariantClear the byref VT_I4 wrappers (they alias stack LONGs); clear the rest.
+        VariantClear(&cfg); VariantClear(&opt); VariantClear(&typ); VariantClear(&fn);
+        if (SUCCEEDED(hr) && res.vt == VT_DISPATCH && res.pdispVal) {
+            model = res.pdispVal;  // owns the ref
+        } else {
+            VariantClear(&res);
+            // Fallback to the simpler OpenDoc(file, type) (older SW / odd marshalling).
+            VARIANT a2[2] = {v_i4(doctype), v_bstr(widen_utf8(src_path))};
+            VARIANT r2; VariantInit(&r2);
+            HRESULT hr2 = sw_invoke(swApp, DISPATCH_METHOD, L"OpenDoc", &r2, 2, a2);
+            for (VARIANT& a : a2) VariantClear(&a);
+            if (SUCCEEDED(hr2) && r2.vt == VT_DISPATCH && r2.pdispVal)
+                model = r2.pdispVal;
+            else {
+                VariantClear(&r2);
+                return fail("could not open '" + src_path + "' (OpenDoc6 hr=0x" +
+                            [&] { char b[16]; std::snprintf(b, sizeof b, "%08lx", (unsigned long)hr);
+                                  return std::string(b); }() +
+                            ", err=" + std::to_string(errCode) + ")");
+            }
+        }
+    }
+    {  // model.SaveAs3(step, version=0, options=0). Success verified by file presence below.
+        VARIANT args[3] = {v_i4(0), v_i4(0), v_bstr(widen_utf8(out_step))};
+        VARIANT res; VariantInit(&res);
+        sw_invoke(model, DISPATCH_METHOD, L"SaveAs3", &res, 3, args);
+        for (VARIANT& a : args) VariantClear(&a);
+        VariantClear(&res);
+    }
+    {  // swApp.CloseDoc(file)
+        VARIANT a = v_bstr(widen_utf8(src_path));
+        sw_invoke(swApp, DISPATCH_METHOD, L"CloseDoc", nullptr, 1, &a);
+        VariantClear(&a);
+    }
+    cleanup();
+    if (!std::filesystem::exists(out_step) || std::filesystem::file_size(out_step, ec) == 0)
+        throw OpError("import_failed",
+                      "SolidWorks produced no STEP output (SaveAs failed)" + actionable,
+                      {{"path", src_path}});
+    return out_step;
+}
+
+#else   // non-Windows: SolidWorks/Parasolid import is unavailable.
+bool solidworks_available() { return false; }
+std::string sw_export_step(const std::string& src_path) {
+    throw OpError("import_failed",
+                  "SolidWorks/Parasolid import needs Windows + SolidWorks. Export STEP (.step) "
+                  "from SolidWorks and import that.",
+                  {{"path", src_path}});
+}
+#endif
 
 // --------------------------------------------------------------------------- mesh soup
 

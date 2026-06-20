@@ -151,6 +151,7 @@ std::mutex g_mtx;
 std::map<std::string, Session> g_sessions;
 std::atomic<unsigned long long> g_doc_seq{1};
 std::atomic<unsigned long long> g_ckpt_seq{1};
+std::atomic<unsigned long long> g_study_seq{1};
 
 std::string new_checkpoint_id() {
     // Opaque, unique-per-process id (Python uses a uuid4 prefix; the value is only
@@ -165,6 +166,15 @@ std::string new_doc_id() {
     unsigned long long n = g_doc_seq.fetch_add(1);
     char buf[32];
     std::snprintf(buf, sizeof(buf), "doc-cpp%08llx", n);
+    return std::string(buf);
+}
+
+std::string new_study_id() {
+    // Opaque, unique-per-process id for a simulation study. Only assigned by the core
+    // (the host fills every other study field; the core treats them as opaque JSON).
+    unsigned long long n = g_study_seq.fetch_add(1);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "study-%08llx", n);
     return std::string(buf);
 }
 
@@ -2859,6 +2869,99 @@ json doc_set_explode_state(const std::string& doc_id, bool active, double factor
     return ops_response_assembly(s, json::object());  // view-only: no revision bump
 }
 
+// ============================================================ simulation studies
+// FEA/CFD study setups live as a top-level `studies` array in the document JSON so
+// they persist inside the .step+ container automatically (stepplus_save dumps the
+// whole doc). The core treats each study as OPAQUE JSON — only the `id` is core-
+// assigned — and NEVER rebuilds geometry, so these RPCs are cheap and work for both
+// part and assembly docs. The host fills/interprets every other field.
+
+json doc_sim_study_list(const std::string& doc_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json resp;
+    resp["studies"] = s.doc.value("studies", json::array());
+    resp["revision"] = s.revision;
+    return resp;  // read-only: no revision bump
+}
+
+json doc_sim_study_add(const std::string& doc_id, const json& study) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    json entry = study.is_object() ? study : json::object();
+    std::string id = entry.value("id", std::string());
+    if (id.empty()) {
+        id = new_study_id();
+        entry["id"] = id;
+    }
+    if (!s.doc.contains("studies") || !s.doc["studies"].is_array())
+        s.doc["studies"] = json::array();
+    s.doc["studies"].push_back(entry);
+    push_undo(s);
+    s.revision += 1;
+    s.dirty = true;
+    json resp;
+    resp["studies"] = s.doc["studies"];
+    resp["revision"] = s.revision;
+    resp["study_id"] = id;
+    return resp;
+}
+
+json doc_sim_study_edit(const std::string& doc_id, const std::string& study_id,
+                        const json& study) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    bool found = false;
+    if (s.doc.contains("studies") && s.doc["studies"].is_array()) {
+        for (json& el : s.doc["studies"]) {
+            if (el.is_object() && el.value("id", std::string()) == study_id) {
+                json replacement = study.is_object() ? study : json::object();
+                replacement["id"] = study_id;  // id can't be lost or changed
+                el = std::move(replacement);
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found)
+        throw OpError("invalid_op", "no such study: " + study_id,
+                      {{"reason", "unknown study"}, {"study_id", study_id}});
+    push_undo(s);
+    s.revision += 1;
+    s.dirty = true;
+    json resp;
+    resp["studies"] = s.doc["studies"];
+    resp["revision"] = s.revision;
+    return resp;
+}
+
+json doc_sim_study_delete(const std::string& doc_id, const std::string& study_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    bool found = false;
+    if (s.doc.contains("studies") && s.doc["studies"].is_array()) {
+        json kept = json::array();
+        for (const json& el : s.doc["studies"]) {
+            if (el.is_object() && el.value("id", std::string()) == study_id) {
+                found = true;
+                continue;
+            }
+            kept.push_back(el);
+        }
+        if (found) s.doc["studies"] = std::move(kept);
+    }
+    if (!found)
+        throw OpError("invalid_op", "no such study: " + study_id,
+                      {{"reason", "unknown study"}, {"study_id", study_id}});
+    push_undo(s);
+    s.revision += 1;
+    s.dirty = true;
+    json resp;
+    resp["studies"] = s.doc["studies"];
+    resp["revision"] = s.revision;
+    return resp;
+}
+
 // World-placed component bodies for interference / BOM (port of session.py::
 // asm_world_bodies / asm_component_bodies). Returned as JSON metadata + a temp STEP
 // export per body is overkill; instead we surface per-body world bbox + name, which is
@@ -4803,10 +4906,19 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
     if (path.empty())
         throw OpError("invalid_op", "import_file: 'path' is required", {{"reason", "missing path"}});
     // Resolve the format up front so a bad extension errors before we touch a session.
-    const std::string f = fmt.empty() ? detect_format(path) : fmt;
+    std::string f = fmt.empty() ? detect_format(path) : fmt;
     const std::string stem = std::filesystem::path(path).stem().string();
 
-    json params = {{"source_path", path}, {"format", f}, {"original_name", stem}};
+    // SolidWorks / Parasolid have no free B-rep reader: drive SolidWorks via COM to export a
+    // neutral STEP, then import THAT through the normal B-rep lane (the part keeps the source
+    // file's stem as its name). Throws an actionable error if SolidWorks/COM is unavailable.
+    std::string import_path_ = path;
+    if (f == "sldprt" || f == "sldasm" || f == "x_t" || f == "x_b") {
+        import_path_ = sw_export_step(path);
+        f = "step";
+    }
+
+    json params = {{"source_path", import_path_}, {"format", f}, {"original_name", stem}};
     if (as_solid) params["as_solid"] = true;
     json ops = json::array({json{
         {"op", "add_feature"},

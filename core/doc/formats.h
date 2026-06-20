@@ -33,6 +33,17 @@ namespace aicad::doc {
 // Throws OpError("invalid_op") on an unknown extension.
 std::string detect_format(const std::string& path);
 
+// True iff this machine can COM-automate SolidWorks (SldWorks.Application registered).
+// Cheap registry probe; never launches SolidWorks. Always false off Windows.
+bool solidworks_available();
+
+// SolidWorks/Parasolid → STEP via SolidWorks COM (port of engine/doc/formats_solidworks.py
+// sw_com_export_step). Opens `src_path` (.sldprt/.sldasm/.x_t/.x_b — SolidWorks reads
+// Parasolid) invisibly, Save-As STEP to a temp file, closes the doc, and returns the STEP
+// path for the normal B-rep import lane. Throws OpError("import_failed") with an actionable
+// "Save As STEP" message when SolidWorks/COM is unavailable or the automation fails.
+std::string sw_export_step(const std::string& src_path);
+
 // A raw triangle-soup mesh (the C++ analogue of engine/doc/mesh_body.py::MeshBody used
 // only internally by the mesh readers/writers — the public body model stays TopoDS).
 // `verts` is N*3 doubles (x,y,z row-major); `tris` is M*3 0-based vertex indices.

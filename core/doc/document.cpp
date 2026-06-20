@@ -47,6 +47,8 @@
 #include <TopTools_IndexedMapOfShape.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <Bnd_Box.hxx>
+#include <GCPnts_TangentialDeflection.hxx>
+#include <Standard_Failure.hxx>
 #include <GProp_GProps.hxx>
 #include <GeomAbs_CurveType.hxx>
 #include <GeomAbs_SurfaceType.hxx>
@@ -307,6 +309,10 @@ std::string selector_owner_id(const json& sel) {
             return sel["owner_feature"].get<std::string>();
         if (sel.contains("sketch") && sel["sketch"].is_string())
             return sel["sketch"].get<std::string>();
+        // A {kind:"path",feature:fid} ref (sweep/loft path picked from the tree or
+        // the viewport curve picker) names the owning sketch / curve feature.
+        if (sel.contains("feature") && sel["feature"].is_string())
+            return sel["feature"].get<std::string>();
     }
     return std::string();
 }
@@ -2413,11 +2419,21 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (spine.IsNull())
                     throw std::runtime_error("sweep: path sketch produced no wire");
 
+                // Profile orientation law along the path (see geom::sweep_profile).
+                int orient = 0;  // follow_path (CorrectedFrenet) — SolidWorks default
+                if (feat.contains("orientation") && feat.at("orientation").is_string()) {
+                    const std::string o = feat.at("orientation").get<std::string>();
+                    if (o == "frenet") orient = 1;
+                    else if (o == "keep_normal") orient = 2;
+                }
+
                 TopoDS_Shape solid;
                 for (const TopoDS_Face& f : src.faces) {
-                    TopoDS_Shape pipe = ::geom::sweep_face(f, spine);
+                    TopoDS_Shape pipe = ::geom::sweep_profile(f, spine, orient);
                     if (pipe.IsNull())
-                        throw std::runtime_error("sweep produced an empty solid");
+                        throw std::runtime_error("sweep produced an empty solid "
+                            "(check the profile sits on/near the path start, roughly "
+                            "perpendicular to it)");
                     solid = solid.IsNull() ? pipe : ::geom::fuse(solid, pipe);
                     if (solid.IsNull())
                         throw std::runtime_error("sweep region fuse failed");
@@ -3466,14 +3482,30 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (bend_records.empty())
                     throw std::runtime_error("sm_flat_pattern: the part has no bends to unfold");
 
-                TopoDS_Shape flat = ::geom::sm_flat_pattern_solid(
-                    body, sheet_ctx.thickness, bend_records);
+                ::geom::FlatPattern fpat =
+                    ::geom::sm_flat_pattern(body, sheet_ctx.thickness, bend_records);
+                const TopoDS_Shape& flat = fpat.solid;
                 if (flat.IsNull())
                     throw std::runtime_error("sm_flat_pattern: produced an empty flat body");
                 GProp_GProps gf;
                 BRepGProp::VolumeProperties(flat, gf);
                 if (gf.Mass() <= 1e-9)
                     throw std::runtime_error("sm_flat_pattern: produced an empty flat body");
+
+                // Surface the flat-blank metadata export_flat_dxf needs (base normal +
+                // FLAT-SPACE bend seam lines); the 2D outline + holes are read back off the
+                // flat solid's broad face. Parity: CompileResult.sheet_metal_flat.
+                {
+                    json bls = json::array();
+                    for (const auto& seg : fpat.bend_lines)
+                        bls.push_back(json::array(
+                            {json::array({seg[0].x(), seg[0].y(), seg[0].z()}),
+                             json::array({seg[1].x(), seg[1].y(), seg[1].z()})}));
+                    result.sheet_metal_flat[id] =
+                        json{{"n_base", json::array({fpat.n_base.x(), fpat.n_base.y(),
+                                                     fpat.n_base.z()})},
+                             {"bend_lines", bls}};
+                }
 
                 consumed.insert(body_id);
                 source_of[id] = body_id;
@@ -4447,8 +4479,34 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         } else if (std::holds_alternative<PointResult>(rit->second)) {
             const PointResult& pt = std::get<PointResult>(rit->second);
             d = {{"kind", "point"}, {"point", {pt.pt.x(), pt.pt.y(), pt.pt.z()}}};
+        } else if (std::holds_alternative<CurveResult>(rit->second)) {
+            // A curve feature (helix / spiral / spline) builds no body, so ship it
+            // out-of-band like a datum: lift its local wire into world space and
+            // sample it into a polyline the host can draw AND pick as a sweep path.
+            const CurveResult& cr = std::get<CurveResult>(rit->second);
+            if (cr.wire.IsNull()) continue;
+            const aicad::geom::SketchPlane& b = cr.base;
+            gp_Trsf lift;
+            lift.SetValues(
+                b.uAxis.x(), b.vAxis.x(), b.normal.x(), b.origin.x(),
+                b.uAxis.y(), b.vAxis.y(), b.normal.y(), b.origin.y(),
+                b.uAxis.z(), b.vAxis.z(), b.normal.z(), b.origin.z());
+            TopoDS_Shape lifted = BRepBuilderAPI_Transform(cr.wire, lift, true).Shape();
+            json pts = json::array();
+            for (TopExp_Explorer ex(lifted, TopAbs_EDGE); ex.More(); ex.Next()) {
+                try {
+                    BRepAdaptor_Curve crv(TopoDS::Edge(ex.Current()));
+                    GCPnts_TangentialDeflection disc(crv, 0.05, 0.05);
+                    for (int ni = 1; ni <= disc.NbPoints(); ++ni) {
+                        gp_Pnt p = disc.Value(ni);
+                        pts.push_back({p.X(), p.Y(), p.Z()});
+                    }
+                } catch (const Standard_Failure&) {}
+            }
+            if (pts.empty()) continue;
+            d = {{"kind", "curve"}, {"points", std::move(pts)}};
         } else {
-            continue;  // sketch / solid / curve results are not reference datums
+            continue;  // sketch / solid results are not reference datums
         }
         d["id"] = id;
         d["name"] = raw.value("name", id);

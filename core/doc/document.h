@@ -85,6 +85,13 @@ struct CompileResult {
     // members without re-deriving geometry (port of compiler.py's _weld_members ->
     // CompileResult.weld_members). Empty when the doc has no weld_member feature.
     nlohmann::json weld_members = nlohmann::json::object();
+    // Per-sm_flat_pattern-feature flat-blank side-channel: {fid: {n_base:[3],
+    // bend_lines:[[[x,y,z],[x,y,z]],...]}}. The flat SOLID is the surviving body; what
+    // cannot be recovered from it is the base-plane normal + the FLAT-SPACE bend seam
+    // lines, so the flatten compiler surfaces them here for export_flat_dxf (the 2D
+    // outline + holes are read back off the solid's broad face). Empty when the doc has
+    // no flat pattern. Parity basis: engine/doc/compiler.py CompileResult.sheet_metal_flat.
+    nlohmann::json sheet_metal_flat = nlohmann::json::object();
     // Displayable reference geometry: datum axis/plane/point/csys features produce no body, so they
     // never reach the AICM. Each entry surfaces the resolved geometry so the host can DRAW them as
     // reference overlays (the host had no way to show a created datum before). Shapes:

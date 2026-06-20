@@ -19,6 +19,7 @@
 // p_start (a vertex of the picked bend edge) and prismed along e_dir by edge_length.
 #pragma once
 
+#include <array>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -109,5 +110,17 @@ struct BendRecord {
 // strip (BA + wall) per bend record, all unioned. Empty shape on failure.
 TopoDS_Shape sm_flat_pattern_solid(const TopoDS_Shape& body, double thickness,
                                    const std::vector<BendRecord>& bends);
+
+// The flat blank PLUS the metadata a 2D flat-pattern export (export_flat_dxf) needs:
+// the base-plane normal and the FLAT-SPACE bend seam lines (where each developed strip
+// meets the base, i.e. the fold lines in the unfolded blank — NOT the folded-body bend
+// positions). `solid` is null on failure. Port basis for engine/doc/export2d.py flat layers.
+struct FlatPattern {
+    TopoDS_Shape solid;
+    Eigen::Vector3d n_base{0.0, 0.0, 1.0};
+    std::vector<std::array<Eigen::Vector3d, 2>> bend_lines;  // {p0, p1} per bend, flat space
+};
+FlatPattern sm_flat_pattern(const TopoDS_Shape& body, double thickness,
+                            const std::vector<BendRecord>& bends);
 
 }  // namespace geom

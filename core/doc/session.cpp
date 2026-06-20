@@ -2892,6 +2892,44 @@ json doc_asm_world_bodies(const std::string& doc_id, bool explode) {
     return json{{"bodies", out}};
 }
 
+json doc_asm_bom_components(const std::string& doc_id) {
+    // Non-throwing: a missing / part / closed source returns an empty array so drawing_bom
+    // degrades to an empty BOM rather than crashing (mirrors the oracle's try/except).
+    std::lock_guard<std::mutex> lk(g_mtx);
+    auto it = g_sessions.find(doc_id);
+    if (it == g_sessions.end()) return json::array();
+    Session& s = it->second;
+    if (!s.is_assembly()) return json::array();
+    if (!s.asm_result) rebuild_assembly(s);
+    if (!s.asm_result) return json::array();
+    // Count component-pattern instances seeded from each real component ("<seed>#<k>").
+    std::map<std::string, int> instance_counts;
+    for (const AsmBodyOut& b : s.asm_result->bodies) {
+        auto h = b.component_id.find('#');
+        if (h != std::string::npos) instance_counts[b.component_id.substr(0, h)] += 1;
+    }
+    // Source path per real component id from doc["components"].
+    std::map<std::string, std::string> src_by_id;
+    if (s.doc.contains("components") && s.doc["components"].is_array())
+        for (const json& c : s.doc["components"]) {
+            std::string path = (c.contains("source") && c["source"].is_object())
+                                   ? c["source"].value("path", std::string())
+                                   : std::string();
+            src_by_id[c.value("id", std::string())] = path;
+        }
+    json out = json::array();
+    for (const AsmBodyOut& b : s.asm_result->bodies) {
+        if (b.component_id.find('#') != std::string::npos) continue;  // pattern instance
+        auto ic = instance_counts.find(b.component_id);
+        auto sp = src_by_id.find(b.component_id);
+        out.push_back({{"component", b.component_id},
+                       {"name", b.name},
+                       {"source", sp == src_by_id.end() ? std::string() : sp->second},
+                       {"quantity", 1 + (ic == instance_counts.end() ? 0 : ic->second)}});
+    }
+    return out;
+}
+
 bool doc_close(const std::string& doc_id) {
     std::lock_guard<std::mutex> lk(g_mtx);
     return g_sessions.erase(doc_id) > 0;

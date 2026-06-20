@@ -47,8 +47,9 @@ std::array<double, 2> sheet_dims(const std::string& size) {
 // ----------------------------------------------------------------- session store
 struct DrawingSession {
     std::string doc_id;
+    std::string source_ref_id;  // LIVE source DocSession id ("doc-cpp...") — empty = inline
     json doc;             // the aicad.drawing/1 document
-    json source_doc;      // the source part document tree it projects
+    json source_doc;      // the source part tree (initial snapshot / inline fallback)
     json source_env;      // equation env for the source compile
     long revision = 0;
     long source_revision = 0;
@@ -84,12 +85,23 @@ json blank_drawing(const std::string& name, const std::string& source_doc_id) {
 }
 
 // ----------------------------------------------------------------- source geometry
-// Compile the stored source tree into its surviving solid bodies (drawing.py
-// _source_shapes — here over the inline tree rather than an open DocSession). The
-// per-fetch recompile keeps the drawing associative.
+// Compile the source tree into its surviving solid bodies (drawing.py _source_shapes).
+// When the drawing references a LIVE source session (source_ref_id), re-pull that
+// session's CURRENT tree on every fetch so the drawing stays associative to the part
+// the user is editing — exactly like the Python oracle pulling the open source session.
+// If that session is gone (closed), fall back to the last good inline snapshot. With no
+// ref id, recompile the fixed inline tree (the stateless probe / parity path).
 std::vector<TopoDS_Shape> source_shapes(const DrawingSession& s) {
-    CompileResult res =
-        compile_document(s.source_doc, s.source_env.is_null() ? json::object() : s.source_env);
+    json tree = s.source_doc;
+    json env = s.source_env;
+    if (!s.source_ref_id.empty()) {
+        json live = doc_live_source(s.source_ref_id);
+        if (live.is_object() && live.contains("tree")) {
+            tree = live["tree"];
+            env = live.value("env", json::object());
+        }
+    }
+    CompileResult res = compile_document(tree, env.is_null() ? json::object() : env);
     return res.shapes;
 }
 
@@ -477,7 +489,8 @@ json drawing_get_locked_unsafe(const std::string& doc_id) {
                                       {"views", views_out}});
         }
     return json{
-        {"doc_id", doc_id}, {"revision", s.revision}, {"source_doc_id", s.doc_id},
+        {"doc_id", doc_id}, {"revision", s.revision},
+        {"source_doc_id", s.source_ref_id.empty() ? s.doc_id : s.source_ref_id},
         {"source_revision", s.source_revision}, {"tree", s.doc}, {"sheets", sheets_out},
         {"total_hlr_ms", round6(total_ms)},
     };
@@ -487,21 +500,38 @@ json drawing_get_locked_unsafe(const std::string& doc_id) {
 
 // ----------------------------------------------------------------- public API
 
-json drawing_new(const json& source_doc, const json& env, const std::string& name) {
+json drawing_new(const json& source_doc, const json& env, const std::string& name,
+                 const std::string& source_doc_id) {
     std::lock_guard<std::mutex> lk(g_mtx);
+    // LIVE source: snapshot the open session's current tree+env now (for the name + a
+    // fallback if it later closes) and remember the id for the associative re-pull.
+    json src = source_doc;
+    json src_env = env.is_null() ? json::object() : env;
+    long src_rev = 0;
+    if (!source_doc_id.empty()) {
+        json live = doc_live_source(source_doc_id);
+        if (live.is_object() && live.contains("tree")) {
+            src = live["tree"];
+            src_env = live.value("env", json::object());
+            src_rev = live.value("revision", 0L);
+        }
+    }
     std::string src_name;
-    if (source_doc.is_object() && source_doc.contains("name") && source_doc["name"].is_string())
-        src_name = source_doc["name"].get<std::string>();
+    if (src.is_object() && src.contains("name") && src["name"].is_string())
+        src_name = src["name"].get<std::string>();
     if (src_name.empty()) src_name = "Part";
     std::string nm = name.empty() ? (src_name + " - Drawing") : name;
     std::string doc_id = new_drawing_id();
     DrawingSession s;
     s.doc_id = doc_id;
-    s.source_doc = source_doc;
-    s.source_env = env.is_null() ? json::object() : env;
-    s.doc = blank_drawing(nm, doc_id);  // source ref = the drawing's own session id
+    s.source_ref_id = source_doc_id;
+    s.source_doc = src;
+    s.source_env = src_env;
+    // The drawing's "source" field records the part it projects (the live ref id when
+    // present, else its own id for the inline probe — matches drawing.py's source ref).
+    s.doc = blank_drawing(nm, source_doc_id.empty() ? doc_id : source_doc_id);
     s.revision = 0;
-    s.source_revision = 0;
+    s.source_revision = src_rev;
     g_drawings[doc_id] = std::move(s);
     DrawingSession& cur = g_drawings[doc_id];
     return json{{"doc_id", cur.doc_id}, {"drawing", cur.doc}};
@@ -510,6 +540,8 @@ json drawing_new(const json& source_doc, const json& env, const std::string& nam
 json drawing_set_source(const std::string& doc_id, const json& source_doc, const json& env) {
     std::lock_guard<std::mutex> lk(g_mtx);
     DrawingSession& s = require_session(doc_id);
+    // An explicit inline source replaces any live ref (the caller now owns the tree).
+    s.source_ref_id.clear();
     s.source_doc = source_doc;
     s.source_env = env.is_null() ? json::object() : env;
     s.source_revision += 1;
@@ -842,6 +874,44 @@ json drawing_remove_annotation(const std::string& doc_id, const std::string& vie
 json drawing_get(const std::string& doc_id) {
     std::lock_guard<std::mutex> lk(g_mtx);
     return drawing_get_locked_unsafe(doc_id);
+}
+
+json drawing_bom(const std::string& doc_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingSession& s = require_session(doc_id);
+    const std::string src_id = s.source_ref_id;
+    // No live source (inline probe) -> no BOM. Else ask the source session for its real
+    // components (empty array when the source is a part or has since closed).
+    json comps = src_id.empty() ? json::array() : doc_asm_bom_components(src_id);
+    if (!comps.is_array() || comps.empty())
+        return json{{"rows", json::array()}, {"is_assembly", false},
+                    {"source_doc_id", src_id.empty() ? doc_id : src_id},
+                    {"note", src_id.empty() ? "inline-source drawing has no BOM"
+                                            : "part drawings have no BOM"}};
+    // Group identical parts: same source path (or name when there is no path). Each
+    // component contributes its own quantity (pattern instances already rolled in).
+    std::vector<std::string> order;
+    std::map<std::string, json> groups;
+    for (const json& c : comps) {
+        std::string name = c.value("name", std::string());
+        if (name.empty()) name = c.value("component", std::string("Part"));
+        std::string source = c.value("source", std::string());
+        std::string key = !source.empty() ? source : ("name:" + name);
+        auto g = groups.find(key);
+        if (g == groups.end()) {
+            groups[key] = json{{"name", name}, {"source", source}, {"quantity", 0}};
+            order.push_back(key);
+        }
+        groups[key]["quantity"] = groups[key]["quantity"].get<int>() + c.value("quantity", 1);
+    }
+    json rows = json::array();
+    int item = 1;
+    for (const std::string& key : order) {
+        const json& g = groups[key];
+        rows.push_back({{"item", item++}, {"name", g["name"]},
+                        {"quantity", g["quantity"]}, {"source", g["source"]}});
+    }
+    return json{{"rows", rows}, {"is_assembly", true}, {"source_doc_id", src_id}};
 }
 
 bool drawing_close(const std::string& doc_id) {

@@ -27,6 +27,7 @@ GATES = [
     ("doc",    "cpp_eval_parity",         "dll"),
     ("doc",    "cpp_export_parity",       "dll"),
     ("doc",    "cpp_drawing_parity",      "dll"),
+    ("doc",    "cpp_export2d_parity",     "dll"),
     ("doc",    "cpp_sketch_parity",       "dll"),
     ("doc",    "cpp_weld_parity",         "dll"),
     ("doc",    "cpp_simbridge_parity",    "dll"),

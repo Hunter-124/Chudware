@@ -474,19 +474,21 @@ TopoDS_Shape flat_base_block(const TopoDS_Shape& body, const Eigen::Vector3d& n_
 
 }  // namespace
 
-TopoDS_Shape sm_flat_pattern_solid(const TopoDS_Shape& body, double thickness,
-                                   const std::vector<BendRecord>& bends) {
-    if (bends.empty()) return TopoDS_Shape();
+FlatPattern sm_flat_pattern(const TopoDS_Shape& body, double thickness,
+                            const std::vector<BendRecord>& bends) {
+    FlatPattern fp;
+    if (bends.empty()) return fp;
 
     // Base-plane frame from the first bend.
     Eigen::Vector3d e0 = bends[0].e_dir.normalized();
     Eigen::Vector3d l0 = bends[0].length_dir.normalized();
     Eigen::Vector3d n_base = e0.cross(l0);
     n_base.normalize();
+    fp.n_base = n_base;
 
     Eigen::Vector3d into_dir, face_pt;
     TopoDS_Shape flat = flat_base_block(body, n_base, thickness, into_dir, face_pt);
-    if (flat.IsNull()) return TopoDS_Shape();
+    if (flat.IsNull()) return fp;
 
     auto to_face_plane = [&](const Eigen::Vector3d& pt) -> Eigen::Vector3d {
         return pt - n_base * ((pt - face_pt).dot(n_base));
@@ -510,14 +512,28 @@ TopoDS_Shape sm_flat_pattern_solid(const TopoDS_Shape& body, double thickness,
         Eigen::Vector3d c2 = c1 + e_dir * edge_len;
         Eigen::Vector3d c3 = c0 + e_dir * edge_len;
 
+        // The two fold lines bounding the bend-allowance zone in the FLAT blank (oracle
+        // line_start + line_end): the base tangent (where the bend leaves the base) and
+        // the wall tangent (BA further along, where the straight wall begins).
+        Eigen::Vector3d w0 = tangent_start + length_dir * ba;  // wall-tangent start
+        Eigen::Vector3d w1 = w0 + e_dir * edge_len;
+        fp.bend_lines.push_back({c0, c3});  // base tangent
+        fp.bend_lines.push_back({w0, w1});  // wall tangent
+
         std::vector<Eigen::Vector3d> quad{c0, c1, c2, c3};
         TopoDS_Shape strip = prism_face(make_face_from_pts(quad), into_dir * T);
-        if (strip.IsNull()) return TopoDS_Shape();
+        if (strip.IsNull()) return FlatPattern{};
         TopoDS_Shape fused = fuse(flat, strip);
-        if (fused.IsNull()) return TopoDS_Shape();
+        if (fused.IsNull()) return FlatPattern{};
         flat = fused;
     }
-    return flat;
+    fp.solid = flat;
+    return fp;
+}
+
+TopoDS_Shape sm_flat_pattern_solid(const TopoDS_Shape& body, double thickness,
+                                   const std::vector<BendRecord>& bends) {
+    return sm_flat_pattern(body, thickness, bends).solid;
 }
 
 }  // namespace geom

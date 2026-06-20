@@ -83,6 +83,13 @@ nlohmann::json doc_set_explode_state(const std::string& doc_id, bool active, dou
 // drawings (`explode` applies the explode offset when the explode view is active).
 nlohmann::json doc_asm_world_bodies(const std::string& doc_id, bool explode = false);
 
+// Per-real-component BOM listing of an assembly: [{component, name, source, quantity}]
+// with component-pattern instances ("<seed>#<k>") folded into their seed's quantity and
+// the source path pulled from doc["components"][i].source.path. Returns an EMPTY array
+// when `doc_id` is not an open assembly (so a part/closed source yields an empty BOM, not
+// an error). Port of engine/doc/session.py::asm_component_bodies (BOM fields, no shape).
+nlohmann::json doc_asm_bom_components(const std::string& doc_id);
+
 // Enumerate the open C++ sessions: {"docs":[{doc_id,name,kind,path,revision,dirty}]}.
 // Mirrors engine.doc.session.list_sessions (metadata only — no compile).
 nlohmann::json doc_list();

@@ -18,6 +18,7 @@
 
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1571,6 +1572,22 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                                         params.value("path", std::string()),
                                                         params.value("format", std::string())),
                             out_json, 0);
+            // 2D exports (engine/doc/export2d.py). Format = explicit param else the path's
+            // .dxf/.pdf extension (mirrors export2d.py::_resolve_format).
+            if (m == "export_drawing" || m == "export_flat_dxf") {
+                const std::string path = params.value("path", std::string());
+                std::string fmt = params.value("format", std::string());
+                if (fmt.empty()) {
+                    auto dot = path.find_last_of('.');
+                    std::string ext = dot == std::string::npos ? "" : path.substr(dot + 1);
+                    for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+                    if (ext == "dxf" || ext == "pdf") fmt = ext;
+                }
+                const std::string doc_id = params.value("doc_id", std::string());
+                if (m == "export_drawing")
+                    return emit(aicad::doc::export_drawing(doc_id, path, fmt), out_json, 0);
+                return emit(aicad::doc::export_flat_dxf(doc_id, path, fmt), out_json, 0);
+            }
             if (m == "import_file")
                 return emit(aicad::doc::doc_import_file(params.value("path", std::string()),
                                                         params.value("into", std::string()),
@@ -1615,14 +1632,21 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 return params.contains(k) ? params[k] : json(nullptr);
             };
             if (m == "drawing_new") {
+                // LIVE source: the host sends source_doc_id (an open doc-cpp part) and the
+                // drawing re-projects it associatively. INLINE source: source_doc/doc/features
+                // carry the tree (the stateless probe / parity path).
+                std::string src_id = params.value("source_doc_id", std::string());
                 json src;
                 if (params.contains("source_doc")) src = params["source_doc"];
                 else if (params.contains("doc")) src = params["doc"];
                 else if (params.contains("features")) src = params;
-                else throw aicad::doc::OpError("invalid_op",
-                                               "drawing_new: params need a 'source_doc' (or 'doc')");
+                else if (src_id.empty())
+                    throw aicad::doc::OpError(
+                        "invalid_op", "drawing_new: params need a 'source_doc' (or 'doc') or "
+                                      "a 'source_doc_id'");
                 json env = params.contains("env") ? params["env"] : json::object();
-                return emit(aicad::doc::drawing_new(src, env, params.value("name", std::string())),
+                return emit(aicad::doc::drawing_new(src, env, params.value("name", std::string()),
+                                                    src_id),
                             out_json, 0);
             }
             if (m == "drawing_set_source") {
@@ -1688,6 +1712,9 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                             out_json, 0);
             if (m == "drawing_get")
                 return emit(aicad::doc::drawing_get(params.value("doc_id", std::string())),
+                            out_json, 0);
+            if (m == "drawing_bom")
+                return emit(aicad::doc::drawing_bom(params.value("doc_id", std::string())),
                             out_json, 0);
             if (m == "drawing_close")
                 return emit(json{{"closed", aicad::doc::drawing_close(

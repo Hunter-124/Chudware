@@ -33,4 +33,20 @@ nlohmann::json export2d_drawing(const nlohmann::json& doc, const nlohmann::json&
                                 const nlohmann::json& views, const std::string& path,
                                 const std::string& fmt);
 
+// export_drawing: STATEFUL — pool every sheet/view of an OPEN drawing session (`doc_id`
+// is a dwg-cpp id) into layers {VISIBLE, HIDDEN} and write `fmt` ("dxf"|"pdf"). The view
+// geometry is already absolute sheet-mm (positioned by the session), so this just pools
+// + writes. Returns {path, format, visible, hidden, entities}. Port of
+// engine/doc/export2d.py::export_drawing. Throws OpError on no geometry / bad drawing.
+nlohmann::json export_drawing(const std::string& doc_id, const std::string& path,
+                              const std::string& fmt);
+
+// export_flat_dxf: STATEFUL — the active sheet-metal PART's flat pattern (`doc_id` is a
+// doc-cpp part id) written with the blank OUTLINE, BEND lines, and CUTS holes on SEPARATE
+// layers (the key sheet-metal requirement). Derives the 2D blank from the compiled flat
+// solid. Returns {path, format, bend_lines, outline_points, flat_area, entities}. Port of
+// engine/doc/export2d.py::export_flat_dxf. Throws OpError when the part has no flat pattern.
+nlohmann::json export_flat_dxf(const std::string& doc_id, const std::string& path,
+                               const std::string& fmt);
+
 }  // namespace aicad::doc

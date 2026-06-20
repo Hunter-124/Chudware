@@ -28,10 +28,17 @@
 
 namespace aicad::doc {
 
-// drawing_new: create a drawing referencing a source part `doc` (the tree, + `env`).
+// drawing_new: create a drawing referencing a source part. Two source models:
+//   - LIVE (host path): pass `source_doc_id` = an OPEN C++ DocSession id ("doc-cpp...").
+//     The drawing re-pulls that session's CURRENT tree on every fetch (associative,
+//     matching engine/doc/drawing.py which references the open source session). The
+//     inline `source_doc`/`env` then act only as the initial name + a fallback snapshot
+//     if the source is later closed.
+//   - INLINE (stateless probe / parity): leave `source_doc_id` empty and pass the source
+//     part tree in `source_doc` (+ `env`); the drawing recompiles that fixed tree.
 // `name` defaults to "<source name> - Drawing". Returns {doc_id, drawing:<tree>}.
 nlohmann::json drawing_new(const nlohmann::json& source_doc, const nlohmann::json& env,
-                           const std::string& name);
+                           const std::string& name, const std::string& source_doc_id = "");
 
 // drawing_set_source: replace the stored source tree (+env) and bump the source
 // revision so all views re-project against the new bodies (mirrors an edit to the
@@ -83,6 +90,13 @@ nlohmann::json drawing_remove_annotation(const std::string& doc_id, const std::s
 // drawing_get: the full drawing doc + every view's projected geometry (re-projected
 // against the source's current bodies). Mirrors get_drawing_full.
 nlohmann::json drawing_get(const std::string& doc_id);
+
+// drawing_bom: a bill of materials for the drawing's source document. For an ASSEMBLY
+// source: one row per DISTINCT part (grouped by source path, else name), with a rolled-up
+// quantity, 1-based item, name, and source file. For a PART (or closed) source: empty rows
+// (clean, not an error). Returns {rows:[{item,name,quantity,source}], is_assembly,
+// source_doc_id}. Port of engine/doc/drawing.py::drawing_bom.
+nlohmann::json drawing_bom(const std::string& doc_id);
 
 // drawing_close: drop the session. Returns true if it existed.
 bool drawing_close(const std::string& doc_id);

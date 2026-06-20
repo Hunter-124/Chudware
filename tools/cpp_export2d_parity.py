@@ -138,6 +138,32 @@ def main():
                        f"py={pyr.get('bend_lines')}/{pyr.get('outline_points')}/"
                        f"{pyr.get('entities')}/{float(pyr.get('flat_area', 0)):.3f}")
 
+    # ---- drawing persistence: save a part+drawing, reopen, drawing is restored ---------
+    rc, r = core.call("doc_new", {"kind": "part"}); sdid = r["doc_id"]
+    core.call("doc_apply_ops", {"doc_id": sdid, "base_revision": 0, "ops": box_ops()})
+    rc, r = core.call("drawing_new", {"source_doc_id": sdid, "name": "Persist - Drawing"})
+    sdwg = r["doc_id"]
+    for t, o, p in VIEWS:
+        core.call("drawing_add_view", {"doc_id": sdwg, "type": t, "orientation": o, "position": p})
+    core.call("drawing_add_dim", {"doc_id": sdwg, "view_id": "v1", "type": "linear_dim",
+                                  "a": [100, 100], "b": [140, 100], "pos": [120, 90]})
+    spath = str(tmp / "persist.step")
+    core.call("doc_save", {"doc_id": sdid, "path": spath})
+    core.call("drawing_close", {"doc_id": sdwg}); core.call("doc_close", {"doc_id": sdid})
+    rc, r = core.call("doc_open", {"path": spath})
+    restored = r.get("drawings", [])
+    ok = len(restored) == 1 and restored[0].get("name") == "Persist - Drawing"
+    if ok:
+        rc, g = core.call("drawing_get", {"doc_id": restored[0]["doc_id"]})
+        views = (g.get("sheets", [{}])[0] or {}).get("views", [])
+        anns = sum(len(v.get("annotations", [])) for v in views)
+        ok = len(views) == len(VIEWS) and anns == 1
+        fails += check("drawing persistence (save/reopen)", ok,
+                       f"restored={len(restored)} views={len(views)} annotations={anns}")
+    else:
+        fails += check("drawing persistence (save/reopen)", False,
+                       f"restored={len(restored)}")
+
     print(f"\n[export2d-parity] {'ALL PASS' if fails == 0 else str(fails) + ' FAILED'}")
     return fails
 

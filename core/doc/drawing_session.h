@@ -22,11 +22,26 @@
 // valid exactly as in the oracle.
 #pragma once
 
+#include <map>
 #include <string>
 
 #include <nlohmann/json.hpp>
 
 namespace aicad::doc {
+
+// --- persistence (W12+ drawing embedding in the .step+ container) --------------
+// drawings_for_source: serialize every OPEN drawing whose live source is `source_doc_id`
+// to {"drawings/<drawing_id>.json": <drawing doc JSON string>} for .step+ embedding on
+// save (port of engine/doc/stepplus.py::_collect_drawing_entries). Empty when none.
+std::map<std::string, std::string> drawings_for_source(const std::string& source_doc_id);
+
+// register_restored_drawing: re-register a saved drawing (its serialized aicad.drawing/1
+// doc) as a FRESH session whose live source is re-pointed to `source_doc_id` (the just-
+// reopened part), so it re-projects against the reopened bodies. Returns
+// {doc_id, name, source_doc_id}. Throws OpError on a non-drawing doc. Port of
+// engine/doc/drawing.py::register_restored_drawing.
+nlohmann::json register_restored_drawing(const nlohmann::json& drawing_doc,
+                                         const std::string& source_doc_id);
 
 // drawing_new: create a drawing referencing a source part. Two source models:
 //   - LIVE (host path): pass `source_doc_id` = an OPEN C++ DocSession id ("doc-cpp...").

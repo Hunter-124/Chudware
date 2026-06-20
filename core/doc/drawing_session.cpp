@@ -914,6 +914,39 @@ json drawing_bom(const std::string& doc_id) {
     return json{{"rows", rows}, {"is_assembly", true}, {"source_doc_id", src_id}};
 }
 
+std::map<std::string, std::string> drawings_for_source(const std::string& source_doc_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    std::map<std::string, std::string> out;
+    for (const auto& [id, s] : g_drawings)
+        if (s.source_ref_id == source_doc_id)
+            out["drawings/" + id + ".json"] = s.doc.dump();
+    return out;
+}
+
+json register_restored_drawing(const json& drawing_doc, const std::string& source_doc_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (!drawing_doc.is_object() ||
+        drawing_doc.value("schema", std::string()) != kSchemaDrawing)
+        throw OpError("invalid_op",
+                      std::string("register_restored_drawing: not a ") + kSchemaDrawing +
+                          " document",
+                      {{"reason", "bad schema"}});
+    const std::string doc_id = new_drawing_id();
+    DrawingSession s;
+    s.doc_id = doc_id;
+    s.source_ref_id = source_doc_id;  // re-point the live source to the reopened part
+    s.doc = drawing_doc;
+    s.doc["source"] = source_doc_id;  // keep the doc's own source ref in sync
+    s.source_doc = json::object();    // no inline snapshot — re-pull live from the source
+    s.source_env = json::object();
+    s.revision = 0;
+    s.source_revision = 0;
+    g_drawings[doc_id] = std::move(s);
+    return json{{"doc_id", doc_id},
+                {"name", g_drawings[doc_id].doc.value("name", std::string("Drawing"))},
+                {"source_doc_id", source_doc_id}};
+}
+
 bool drawing_close(const std::string& doc_id) {
     std::lock_guard<std::mutex> lk(g_mtx);
     return g_drawings.erase(doc_id) > 0;

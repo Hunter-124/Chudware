@@ -89,6 +89,7 @@
 #include "doc/picks.h"
 #include "doc/selectors.h"
 #include "doc/sketch_geom.h"
+#include "doc/drawing_session.h"  // W12+ drawing embed/restore on save/open
 #include "doc/stepplus.h"
 #include "doc/validate.h"
 #include "geom/aicm.h"
@@ -4841,6 +4842,13 @@ json mesh_read_raw(const std::string& path, const std::string& fmt) {
 }
 
 json doc_save(const std::string& doc_id, const std::string& path) {
+    // W12+: embed every open drawing whose live source is this doc as a drawings/<id>.json
+    // entry. Gather them BEFORE taking the session lock — drawings_for_source takes the
+    // (separate) drawing lock, and a drawing projection takes drawing->session, so doing it
+    // under the session lock would invert the lock order. drawings_for_source touches no
+    // session state, so it is safe to call lock-free here.
+    std::map<std::string, std::string> drawing_entries = drawings_for_source(doc_id);
+
     std::lock_guard<std::mutex> lk(g_mtx);
     Session& s = require_session(doc_id);
     const std::string target = !path.empty() ? path : s.path;
@@ -4848,6 +4856,14 @@ json doc_save(const std::string& doc_id, const std::string& path) {
         throw OpError("io_error",
                       "doc_save: no path given and document has no current path",
                       {{"reason", "missing path"}});
+    // Re-write the live drawing set: drop any stale drawings/*.json carried over from a
+    // previous open, then add the current ones (mirrors stepplus.py::save).
+    for (auto it = s.extra_entries.begin(); it != s.extra_entries.end();) {
+        if (it->first.rfind("drawings/", 0) == 0) it = s.extra_entries.erase(it);
+        else ++it;
+    }
+    for (auto& [name, data] : drawing_entries) s.extra_entries[name] = data;
+
     std::string out = stepplus_save(s.doc, target, s.extra_entries);
     s.path = out;
     s.dirty = false;
@@ -4855,6 +4871,10 @@ json doc_save(const std::string& doc_id, const std::string& path) {
 }
 
 json doc_open(const std::string& path) {
+    std::string opened_doc_id;
+    std::map<std::string, std::string> drawing_entries;  // restored after the session lock
+    json resp;
+    {
     std::lock_guard<std::mutex> lk(g_mtx);
     StepPlusDoc loaded = stepplus_open(path);  // throws OpError on a bad file
 
@@ -4881,8 +4901,13 @@ json doc_open(const std::string& path) {
     Session& stored = g_sessions[s.doc_id] = std::move(s);
 
     CompileResult r = compile_document(stored.doc, env_from_doc(stored.doc));
-    json resp = ops_response(stored, r, json::object(), /*with_tess=*/true);
+    resp = ops_response(stored, r, json::object(), /*with_tess=*/true);
     resp["doc_id"] = stored.doc_id;
+    opened_doc_id = stored.doc_id;
+    // Capture embedded drawings to restore AFTER releasing the session lock (registering
+    // a drawing takes the drawing lock; doing it here would invert the lock order).
+    for (const auto& [name, data] : stored.extra_entries)
+        if (name.rfind("drawings/", 0) == 0) drawing_entries[name] = data;
 
     // Warnings: container load notes + per-feature rebuild failures (the non-total-
     // failure branch of the Python oracle; frozen-geometry fallback is deferred).
@@ -4901,6 +4926,22 @@ json doc_open(const std::string& path) {
         warnings.push_back(msg);
     }
     resp["warnings"] = warnings;
+    }  // release the session lock before restoring drawings (lock-order safety)
+
+    // W12+ — restore any embedded drawings as FRESH drawing sessions re-pointed at this
+    // reopened part, so they project against the reopened bodies. Fully contained: a
+    // malformed / non-drawing entry is skipped, never breaking the part open. The host
+    // reads resp["drawings"] to re-create the Drawing tabs (doc_mirror lastOpenedDrawings).
+    json drawings = json::array();
+    for (const auto& [name, data] : drawing_entries) {
+        try {
+            json ddoc = json::parse(data);
+            drawings.push_back(register_restored_drawing(ddoc, opened_doc_id));
+        } catch (const std::exception&) {
+            // skip a malformed drawing entry (mirrors stepplus.restore_drawings)
+        }
+    }
+    resp["drawings"] = drawings;
     return resp;
 }
 

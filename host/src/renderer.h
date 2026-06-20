@@ -124,8 +124,14 @@ public:
     // W2-D: bounding radius of the loaded model (1 if none). The viewport input code uses it to
     // convert a screen-space pan drag (px) into a world-space offset (matches drawCurrent's FOV/dist).
     float modelRadius() const { return radius_; }
+    // Effective scene radius for camera math: the real bbox radius, or — when the part is empty
+    // (no bodies, radius_==0) — the same fallback the camera uses to frame an empty scene. Pan/zoom
+    // screen->world math MUST use this, not modelRadius(), or a drag on an empty part scales by 0
+    // (worldPerPx == 0) and the view never moves until the first body exists.
+    float effectiveSceneRadius() const { return radius_ > 0.0f ? radius_ : kEmptySceneRadius; }
     Vec3 modelCenter() const { return center_; }
     static constexpr float kFovDeg = 35.0f;  // shared with drawCurrent's projection
+    static constexpr float kEmptySceneRadius = 35.0f;  // scene radius used to frame an empty part
 
     // ---- reference planes (Front=XY, Top=XZ, Right=YZ) ----
     // Translucent datum planes drawn over the model. `show[3]` toggles each; `emphasized` (0..2,

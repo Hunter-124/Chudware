@@ -244,9 +244,12 @@ void ViewSelector::update(AppState& st, Renderer& renderer, bool imgHovered, boo
     ImGuiIO& io = ImGui::GetIO();
 
     if (!m_active) {
-        // Activate on Space while the viewport is hovered, not typing, not sketching. Opening also
-        // frames the glass box (zoom-to-fit + recenter) so it never opens spilled off-screen.
-        if (imgHovered && !inSketch && !io.WantTextInput &&
+        // Activate on Space while the viewport is hovered and not typing. Works in ANY edit/feature
+        // state (sketch, property-manager, plane-pick) — the caller latches the sketch normal-to
+        // lock when we drive the camera so a picked view sticks. Opening also frames the glass box
+        // (zoom-to-fit + recenter) so it never opens spilled off-screen.
+        (void)inSketch;
+        if (imgHovered && !io.WantTextInput &&
             ImGui::IsKeyPressed(ImGuiKey_Space) && !cameraAnimating()) {
             openFramed(st);
         }

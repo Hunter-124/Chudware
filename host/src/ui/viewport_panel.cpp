@@ -1546,14 +1546,19 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             const float deg = 3.14159265f / 180.0f;
             const float fov = Renderer::kFovDeg * deg;
             float zc = st.zoom < 0.05f ? 0.05f : st.zoom;
-            float dist = renderer.modelRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
+            // effectiveSceneRadius (not modelRadius): on an empty part radius_==0 would make
+            // worldPerPx 0, so middle-drag pan moved nothing until the first body existed.
+            float dist = renderer.effectiveSceneRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
             float worldPerPx = 2.0f * dist * std::tan(fov * 0.5f) / (float)(vh > 1 ? vh : 1);
 
             // Camera basis for screen-space pan: right (R) and up (U) in world space. Mirrors
             // drawCurrent: dir = view direction (target->eye), up = +Z (or +Y near a pole).
             float yr = st.yaw * deg, pr = st.pitch * deg;
             Vec3 dir(std::cos(pr) * std::sin(yr), -std::cos(pr) * std::cos(yr), std::sin(pr));
-            Vec3 worldUp = (std::fabs(pr) > 89.0f * deg) ? Vec3(0, 1, 0) : Vec3(0, 0, 1);
+            // Continuous turntable up (matches Renderer's camera up): well-defined past the poles
+            // so pan / zoom-to-cursor stay correct when the free orbit has rolled over the top.
+            Vec3 worldUp = normalize(Vec3(-std::sin(pr) * std::sin(yr),
+                                           std::sin(pr) * std::cos(yr), std::cos(pr)));
             Vec3 V = normalize(dir);
             Vec3 R = normalize(cross(worldUp, V));   // screen-right in world space
             Vec3 U = normalize(cross(V, R));         // screen-up in world space
@@ -1585,10 +1590,6 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 st.pan[2] += (-R.z * ddx + U.z * ddy) * worldPerPx;
                 clampPan();
             };
-            auto clampPitch = [&]() {
-                st.pitch = st.pitch > 89 ? 89 : (st.pitch < -89 ? -89 : st.pitch);
-            };
-
             const bool ctrl = io.KeyCtrl, shift = io.KeyShift;
 
             // C25 W3-J: apply display style from AppState each frame (cheap no-op when unchanged).
@@ -1934,8 +1935,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     applyPan(io.MouseDelta.x, io.MouseDelta.y);
                 } else {
                     st.yaw += io.MouseDelta.x * 0.4f;
-                    st.pitch += io.MouseDelta.y * 0.4f;
-                    clampPitch();
+                    st.pitch += io.MouseDelta.y * 0.4f;   // free orbit: no pitch clamp
                 }
             }
             // W1-B (item 3): in pan-drag mode, show the Hand cursor over the viewport so the user
@@ -1945,8 +1945,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 st.requestCursor(ui::CursorKind::Hand);
 
             // Middle-button navigation (SolidWorks bindings):
-            //   MMB        = orbit (same rate as left-drag)
-            //   Ctrl+MMB   = pan
+            //   MMB        = orbit / "spin the part around" (free 360, no pitch clamp)
+            //   Ctrl+MMB   = pan  / slide the view (translate)
             //   Shift+MMB  = zoom (vertical, smooth exponential)
             if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) &&
                 (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
@@ -1959,8 +1959,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10 ? 10 : st.zoom);
                 } else {
                     st.yaw += io.MouseDelta.x * 0.4f;
-                    st.pitch += io.MouseDelta.y * 0.4f;
-                    clampPitch();
+                    st.pitch += io.MouseDelta.y * 0.4f;   // free orbit: no pitch clamp
                 }
             }
 
@@ -1991,10 +1990,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
             }
         } else if (imgHovered && inSketch) {
-            // SolidWorks-style view navigation WHILE sketching: middle-drag orbits (unlatches the
-            // normal-to lock so the view sticks), Ctrl+MMB pans, Shift+MMB zooms, wheel zooms.
-            // Left-click stays for drawing entities. The sketch overlay reprojects from the live
-            // camera each frame, so a rotated view stays correct (entity picking included).
+            // View navigation WHILE sketching (left-click stays for drawing entities):
+            //   middle-drag        = orbit / "spin the part" (unlatches the normal-to lock; free 360)
+            //   Ctrl + middle-drag = pan / slide the view (translate)
+            //   Shift + middle-drag= zoom ; wheel = zoom
+            // The sketch overlay reprojects from the live camera each frame, so a rotated view stays
+            // correct (entity picking included).
             const bool ctrl = io.KeyCtrl, shift = io.KeyShift;
             if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) &&
                 (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
@@ -2004,11 +2005,13 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     const float deg = 3.14159265f / 180.0f;
                     const float fov = Renderer::kFovDeg * deg;
                     float zc = st.zoom < 0.05f ? 0.05f : st.zoom;
-                    float dist = renderer.modelRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
+                    // effectiveSceneRadius: empty-sketch (no body yet) pan would otherwise be 0.
+                    float dist = renderer.effectiveSceneRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
                     float worldPerPx = 2.0f * dist * std::tan(fov * 0.5f) / (float)(vh > 1 ? vh : 1);
                     float yr = st.yaw * deg, pr = st.pitch * deg;
                     Vec3 vdir(std::cos(pr) * std::sin(yr), -std::cos(pr) * std::cos(yr), std::sin(pr));
-                    Vec3 worldUp = (std::fabs(pr) > 89.0f * deg) ? Vec3(0, 1, 0) : Vec3(0, 0, 1);
+                    Vec3 worldUp = normalize(Vec3(-std::sin(pr) * std::sin(yr),
+                                                   std::sin(pr) * std::cos(yr), std::cos(pr)));
                     Vec3 V = normalize(vdir);
                     Vec3 R = normalize(cross(worldUp, V));
                     Vec3 U = normalize(cross(V, R));
@@ -2020,8 +2023,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10 ? 10 : st.zoom);
                 } else {
                     st.yaw += io.MouseDelta.x * 0.4f;
-                    st.pitch += io.MouseDelta.y * 0.4f;
-                    st.pitch = st.pitch > 89 ? 89 : (st.pitch < -89 ? -89 : st.pitch);
+                    st.pitch += io.MouseDelta.y * 0.4f;   // free orbit: no pitch clamp
                     s_sketchRotated = true;   // stop forcing normal-to so the rotation sticks
                 }
             }
@@ -2565,7 +2567,14 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // ---- C25 W2-E: glass-box View Selector (Space). Drawn after the heads-up toolbar so its
         // orientation popup sits just below it; uses the same window draw list. While active it
         // suppresses normal click-picking (guard added on the picking click above).
+        // The selector now opens in any edit/feature state (sketch, PM, plane-pick). When it drives
+        // the camera while a sketch is open, latch s_sketchRotated so the normal-to lock yields and
+        // the picked orientation sticks (matches a manual orbit). Check active() both before and
+        // after update() so the frame the user CLICKS a face — which closes the selector inside
+        // update() — still latches.
+        bool selActiveBefore = s_viewSelector.active();
         s_viewSelector.update(st, renderer, imgHovered, inSketch, vr0, vr1);
+        if (inSketch && (selActiveBefore || s_viewSelector.active())) s_sketchRotated = true;
         s_viewSelector.draw(st, ImGui::GetWindowDrawList(), vr0, vr1);
 
         // ---- C25 W3-I: Section View tool. Pushes the clip plane to the renderer each frame and

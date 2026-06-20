@@ -704,8 +704,10 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
 
 // C25: world radius used when the document has no geometry yet (a fresh "new part") —
 // keeps the camera, datum planes, and label anchors at a sensible scale. ~35mm reads like
-// SolidWorks's default plane size.
-static constexpr float kEmptySceneRadius = 35.0f;
+// SolidWorks's default plane size. Single source of truth lives in renderer.h (camera math in
+// viewport_panel shares it via effectiveSceneRadius()); this file-scope alias keeps existing
+// in-file references terse.
+static constexpr float kEmptySceneRadius = Renderer::kEmptySceneRadius;
 
 void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     const auto renderT0 = std::chrono::steady_clock::now();
@@ -740,8 +742,14 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     // view orbits/frames around the sketch (which is not part of the body bbox), not the origin.
     Vec3 target = (orbitOverride_ ? orbitCenter_ : center_) + pan_;
     Vec3 eye = target + dir * dist;
-    Vec3 up(0, 0, 1);
-    if (std::fabs(pitch) > 89.0f * deg) up = Vec3(0, 1, 0);  // avoid gimbal at top view
+    // Continuous turntable up-vector: the direction of increasing pitch (d(dir)/d(pitch)). For
+    // pitch in (-90,90) this is exactly the world +Z component projected onto the view plane, so
+    // existing views are pixel-identical; but it stays well-defined AT and BEYOND the poles, which
+    // lets the camera orbit freely over the top/bottom with no gimbal flip (the old (0,1,0) hack
+    // discontinuously snapped the roll there). Required now that the pitch clamp is gone.
+    Vec3 up = normalize(Vec3(-std::sin(pitch) * std::sin(yaw),
+                              std::sin(pitch) * std::cos(yaw),
+                              std::cos(pitch)));
 
     Mat4 proj = perspective(fov, (float)sw_ / (float)sh_, dist * 0.01f, dist * 10.0f);
     Mat4 view = lookAt(eye, target, up);
@@ -1021,8 +1029,10 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px) {
     float dist = sceneR / std::sin(fov * 0.5f) * 1.05f;  // zoom=1 fit, no pan
     Vec3 target = center_;
     Vec3 eye = target + dir * dist;
-    Vec3 up(0, 0, 1);
-    if (std::fabs(pitch) > 89.0f * deg) up = Vec3(0, 1, 0);  // avoid gimbal at top/bottom
+    // Same continuous up-vector as drawCurrent (see note there) so thumbnails match the live view.
+    Vec3 up = normalize(Vec3(-std::sin(pitch) * std::sin(yaw),
+                              std::sin(pitch) * std::cos(yaw),
+                              std::cos(pitch)));
 
     Mat4 proj = perspective(fov, 1.0f, dist * 0.01f, dist * 10.0f);  // square aspect
     Mat4 view = lookAt(eye, target, up);

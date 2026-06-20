@@ -252,6 +252,26 @@ bool runtimeReady() {
     return installedVenvFresh();
 }
 
-bool ensureRuntime(std::string& log) { return provisionRuntime(false, log); }
+// Point the C++ core (libaicad) at the app's bundled agent prompts. The core reads
+// AI_CAD_PROMPTS_DIR for its role prompts + cheatsheets; if it is unset the core falls
+// back to "agent/prompts" RELATIVE TO THE PROCESS CWD. When the app is launched from its
+// install dir (not the source tree) that relative path does not exist, so agent_run throws
+// "role prompt unreadable/empty: agent\prompts\decomposer.md" and the host silently falls
+// back to the Python worker -> the in-app AI fails with "unknown method: agent_run_v2".
+// appDir() already resolves the dev-repo vs shipped-payload layouts, so its agent/prompts is
+// the right, CWD-independent location. Set it via BOTH _putenv_s (host CRT) and the process
+// block (so libaicad's own CRT, initialised when the DLL loads later, also sees it).
+void ensurePromptsDir() {
+    if (!env_or("AI_CAD_PROMPTS_DIR", "").empty()) return;  // respect an explicit override
+    std::string p = appDir() + "\\agent\\prompts";
+    if (!dirExists(p)) return;
+    _putenv_s("AI_CAD_PROMPTS_DIR", p.c_str());
+    SetEnvironmentVariableA("AI_CAD_PROMPTS_DIR", p.c_str());
+}
+
+bool ensureRuntime(std::string& log) {
+    ensurePromptsDir();
+    return provisionRuntime(false, log);
+}
 
 bool repairRuntime(std::string& log) { return provisionRuntime(true, log); }

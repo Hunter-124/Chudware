@@ -17,3 +17,8 @@ std::string appDir();
 bool runtimeReady();                     // python file exists at runtimePython()
 bool ensureRuntime(std::string& log);    // provision if absent; true once ready
 bool repairRuntime(std::string& log);    // force a clean re-provision (broken/partial venv)
+
+// Default AI_CAD_PROMPTS_DIR (if unset) to the app's bundled agent/prompts so the C++ core
+// finds its role prompts regardless of the process CWD. MUST be called unconditionally at
+// startup (ensureRuntime is skipped when the runtime is already provisioned).
+void ensurePromptsDir();

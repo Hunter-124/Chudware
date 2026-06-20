@@ -178,6 +178,9 @@ int buildAndRender(const std::string& src, const std::string& out, bool isDesign
 }
 
 int main(int argc, char** argv) {
+    // Point the C++ core at its prompts on EVERY launch path (run_gui only calls
+    // ensureRuntime when provisioning is needed, so it can't be relied on for this).
+    ensurePromptsDir();
     if (argc >= 4 && std::strcmp(argv[1], "--render") == 0)
         return renderSingle(argv[2], argv[3], argc >= 5 ? argv[4] : "iso");
     if (argc >= 4 && std::strcmp(argv[1], "--contact") == 0)

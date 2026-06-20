@@ -214,6 +214,14 @@ static void ribbon_fire(const char* cmd_id) {
 
 // C40: the currently ACTIVE tool command (accent-filled button). See ribbon.h.
 static std::string s_activeCmd;
+
+// True while a sketch is being edited (set per-frame via setRibbonSketchActive). When false the
+// Sketch tab's "Exit Sketch" state button is replaced by this "New Sketch" button — the very same
+// entry point the Features tab carries — so a sketch can be started directly from the Sketch tab.
+// Same group label ("Sketch") so it occupies the Exit-Sketch slot.
+static bool s_sketchActive = false;
+static const ui::RibbonCmd kSketchNewOnSketchTab =
+    { "sketch_new", "New Sketch", "sketch", "Sketch", "Sketch", true, nullptr, false };
 static bool ribbon_isActive(const char* cmd_id) {
     return !s_activeCmd.empty() && cmd_id && s_activeCmd == cmd_id;
 }
@@ -876,6 +884,10 @@ void setRibbonActiveCmd(const char* cmd_id) {
     s_activeCmd = (cmd_id && *cmd_id) ? cmd_id : "";
 }
 
+void setRibbonSketchActive(bool active) {
+    s_sketchActive = active;
+}
+
 float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool showPcbTools,
                  float titleBarH) {
     if (!visible) return 0.0f;
@@ -997,10 +1009,16 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     for (int i = 0; i < cmdCount; ++i) {
         const RibbonCmd& c = cmds[i];
         if (std::strcmp(c.tab, actTabName) != 0) continue;
-        RibbonGroup& grp = ribbon_findOrAddGroup(groups, c.group);
-        if (c.sub_of)  grp.subCmds.push_back(&c);
-        else if (c.big) grp.bigCmds.push_back(&c);
-        else if (!smallIsHidden(c)) grp.smCmds.push_back(&c);
+        // Sketch tab, no sketch being edited: present "New Sketch" in the "Exit Sketch" slot so the
+        // user can start a sketch from this tab (matches the Features-tab entry point). Once a sketch
+        // is open, s_sketchActive is true and the real "Exit Sketch" button shows.
+        const RibbonCmd* cp = &c;
+        if (!s_sketchActive && std::strcmp(c.cmd_id, "sketch_exit") == 0)
+            cp = &kSketchNewOnSketchTab;
+        RibbonGroup& grp = ribbon_findOrAddGroup(groups, cp->group);
+        if (cp->sub_of)  grp.subCmds.push_back(cp);
+        else if (cp->big) grp.bigCmds.push_back(cp);
+        else if (!smallIsHidden(*cp)) grp.smCmds.push_back(cp);
     }
 
     // --- C25-W3G: priority collapse assignment ---

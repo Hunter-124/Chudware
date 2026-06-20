@@ -167,6 +167,11 @@ public:
         std::string name;
     };
     void setRefDatums(std::vector<RefDatum> datums) { refDatums_ = std::move(datums); }
+    // Datum feature ids hidden via the FeatureManager eye toggle. drawRefDatums skips any datum whose
+    // id is in this set, so a hide takes effect immediately (no document rebuild). Applied from
+    // AppState::applyDatumVisibility() on toggle / tab-switch / rebuild. Harmless to pass a superset
+    // (e.g. AppState::hiddenFeatures verbatim) — only datum ids are ever matched here.
+    void setHiddenDatums(std::unordered_set<std::string> ids) { hiddenDatums_ = std::move(ids); }
     // The feature id of the currently SELECTED datum (drawn emphasized — brighter + thicker), or
     // "" for none. Set each frame from AppState::selectedFeatureId so clicking a datum highlights it.
     void setSelectedDatumId(const std::string& id) { selectedDatumId_ = id; }
@@ -293,6 +298,7 @@ private:
     unsigned int shadowProg_ = 0;  // ground contact-shadow quad
     unsigned int planeProg_ = 0, planeVao_ = 0, planeVbo_ = 0;
     std::vector<RefDatum> refDatums_;   // feature datum geometry to draw (reference overlays)
+    std::unordered_set<std::string> hiddenDatums_;  // datum ids hidden via the FeatureManager eye
     std::string selectedDatumId_;       // id of the emphasized (selected) datum, "" = none
     std::string editingDatumId_;        // id of the datum plane open in the PM (draws normal arrow)
     bool  orbitOverride_ = false;       // use orbitCenter_ instead of center_ as the look-at target

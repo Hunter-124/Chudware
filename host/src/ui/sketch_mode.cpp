@@ -1056,6 +1056,51 @@ std::string SketchMode::createSketchOnPlane(AppState& st, const nlohmann::json& 
     return newFid;
 }
 
+void SketchMode::beginPlaneEdit(AppState& st, const std::string& sketchFid) {
+    if (sketchFid.empty()) return;
+    // The plane-pick overlay can't share the screen with an open sketcher — leave any active sketch
+    // first (keep its entities), then arm the reparent pick.
+    if (active_) exitSketch(st, /*keep=*/true);
+    planeEditFid_ = sketchFid;
+    planePicking_ = true;
+    planeHover_ = -1;
+    st.sketchPlanePickActive = true;
+    st.requestCursor(ui::CursorKind::Crosshair);
+    st.toast(ui::ToastLevel::Info, "Pick the new sketch plane (or a planar face)");
+}
+
+std::string SketchMode::consumePlanePick(AppState& st, const nlohmann::json& planeRef) {
+    // New-sketch path: defer to createSketchOnPlane and let the CALLER own the pick-flag lifecycle
+    // (so a non-planar face leaves the user still in pick mode, as before).
+    if (planeEditFid_.empty()) return createSketchOnPlane(st, planeRef);
+
+    // Re-parent path: there's no sketch to enter afterwards, so clear the pick-arm flags here or the
+    // overlay would stay up. Then patch refs.plane on the existing sketch and rebuild the document.
+    // edit_feature merges refs, so the sketch (and every feature consuming it) recompiles on the new
+    // plane.
+    planePicking_ = false;
+    st.sketchPlanePickActive = false;
+    std::string fid = planeEditFid_;
+    planeEditFid_.clear();
+    nlohmann::json ops = nlohmann::json::array({
+        {{"op", "edit_feature"}, {"id", fid}, {"refs", {{"plane", planeRef}}}}});
+    auto r = st.docMirror.applyOps(st.worker, ops);
+    if (!r.ok) {
+        st.addLog("[sketch] reparent plane failed: " + r.error_message);
+        st.toast(ui::ToastLevel::Warn, "Couldn't move the sketch to that plane");
+        return {};
+    }
+    if (!r.aicm_path.empty()) {
+        std::string le;
+        st.loadDocMesh(r.aicm_path, le);
+        if (!le.empty()) st.addLog("[err] loadDocMesh (reparent): " + le);
+    }
+    resyncMirror(st);
+    st.selectedFeatureId = fid;
+    st.toast(ui::ToastLevel::Info, "Sketch plane updated");
+    return fid;
+}
+
 bool SketchMode::enterNewOnSelection(AppState& st) {
     // C38 (S2): a double-fire of the ribbon "New Sketch" (sketch_new) while a sketch is already
     // entered would start a plane-pick over the live sketch and leave a zombie state. Refuse to
@@ -3426,6 +3471,7 @@ void SketchMode::drawGhosts(AppState& st, const ImVec2& imgMin, const ImVec2& im
     for (const auto& g : ghosts_) {
         if (!g.loaded) continue;
         if (active_ && g.fid == fid_) continue;   // the live overlay owns the active sketch
+        if (st.hiddenFeatures.count(g.fid)) continue;   // FeatureManager eye toggled this sketch off
         // Project sketch (u,v) through this ghost's own plane frame (no shared basis).
         auto uv2s = [&](float u, float v, ImVec2& o) -> bool {
             float wx = g.frame[0] * u + g.frame[1] * v + g.frame[3];
@@ -3932,6 +3978,7 @@ static bool hitTestDatumPlane(AppState& st, ImVec2 mouse, const ImVec2& imgMin, 
     bool found = false;
     for (const auto& d : datums) {
         if (!d.is_object() || d.value("kind", std::string()) != "plane") continue;
+        if (st.hiddenFeatures.count(d.value("id", std::string()))) continue;  // hidden datum: not pickable
         Vec3 o  = v3(d.value("origin", nlohmann::json()), Vec3(0, 0, 0));
         Vec3 xd = v3(d.value("x_dir",  nlohmann::json()), Vec3(1, 0, 0));
         Vec3 yd = v3(d.value("y_dir",  nlohmann::json()), Vec3(0, 1, 0));
@@ -4154,6 +4201,7 @@ static bool hitTestDatumAxis(AppState& st, ImVec2 mouse, const ImVec2& imgMin, i
     bool found = false;
     for (const auto& d : datums) {
         if (!d.is_object() || d.value("kind", std::string()) != "axis") continue;
+        if (st.hiddenFeatures.count(d.value("id", std::string()))) continue;  // hidden datum: not pickable
         const auto& pj = d.contains("point") ? d["point"] : nlohmann::json();
         const auto& dj = d.contains("dir") ? d["dir"] : nlohmann::json();
         if (!pj.is_array() || pj.size() < 3 || !dj.is_array() || dj.size() < 3) continue;
@@ -4555,10 +4603,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 // A created datum plane: refs.plane = the bare feature-id STRING (the engine's sketch
                 // compiler looks it up in the results map as a PlaneResult — see document.cpp).
                 planePicking_ = false; st.sketchPlanePickActive = false;
-                createSketchOnPlane(st, nlohmann::json(sDatumFid));
+                consumePlanePick(st, nlohmann::json(sDatumFid));
             } else if (hovered >= 0) {
                 planePicking_ = false; st.sketchPlanePickActive = false;
-                createSketchOnPlane(st, planeSel[hovered]);
+                consumePlanePick(st, planeSel[hovered]);
             } else if (st.hover.valid() && st.hover.kind == render::PickKind::Face) {
                 // Planar-face pick: resolve via the same path enterNewOnSelection uses. We try the
                 // hovered face's selector; the engine rejects non-planar faces (toast + stay).
@@ -4569,7 +4617,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     nlohmann::json js;
                     try { js = nlohmann::json::parse(sel); } catch (...) {}
                     if (js.is_object()) {
-                        std::string newFid = createSketchOnPlane(st, js);
+                        std::string newFid = consumePlanePick(st, js);
                         if (newFid.empty())
                             st.toast(ui::ToastLevel::Warn, "That face can't host a sketch — pick a planar face or plane");
                         else { planePicking_ = false; st.sketchPlanePickActive = false; }
@@ -4578,7 +4626,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             }
         }
         // Top-center banner.
-        const char* banner = "Select a plane or a planar face for the sketch \xE2\x80\x94 Esc to cancel";
+        const char* banner = planeEditFid_.empty()
+            ? "Select a plane or a planar face for the sketch \xE2\x80\x94 Esc to cancel"
+            : "Select the new sketch plane or a planar face \xE2\x80\x94 Esc to cancel";
         ImVec2 bts = ImGui::CalcTextSize(banner);
         float bcx = (imgMin.x + imgMax.x) * 0.5f;
         // Sit BELOW the heads-up view toolbar (centered pill at imgMin.y+8, ~34px tall) so the
@@ -4589,10 +4639,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         wdl->AddRect(b0, b1, col(pal.overlayBorder), 6.0f);
         wdl->AddText(ImVec2(b0.x + 14, b0.y + 6), col(pal.overlayText), banner);
         wdl->PopClipRect();
-        // Esc cancels the whole thing.
+        // Esc cancels the whole thing (new-sketch pick OR an Edit-Sketch-Plane reparent).
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
             planePicking_ = false; st.sketchPlanePickActive = false;
-            st.toast(ui::ToastLevel::Info, "Sketch cancelled");
+            bool wasReparent = !planeEditFid_.empty();
+            planeEditFid_.clear();
+            st.toast(ui::ToastLevel::Info, wasReparent ? "Edit plane cancelled" : "Sketch cancelled");
         }
         return;
     }

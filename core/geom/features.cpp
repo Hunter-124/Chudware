@@ -2,7 +2,12 @@
 
 #include "geom/booleans.h"
 
+#include <algorithm>
+#include <cmath>
+
 #include <BRep_Tool.hxx>
+#include <BRepAdaptor_Curve.hxx>
+#include <Geom_Surface.hxx>
 #include <BRepBuilderAPI_TransitionMode.hxx>
 #include <Standard_Failure.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
@@ -82,11 +87,97 @@ TopoDS_Shape extrude_face(const TopoDS_Face& face, const Eigen::Vector3d& dir,
     return unify_same_domain(prism);
 }
 
+namespace {
+// Planar face normal at its UV midpoint (build123d-parity normal probe).
+Eigen::Vector3d face_plane_normal(const TopoDS_Face& face) {
+    Standard_Real u0, u1, v0, v1;
+    BRepTools::UVBounds(face, u0, u1, v0, v1);
+    Handle(Geom_Surface) gs = BRep_Tool::Surface(face);
+    if (gs.IsNull()) return Eigen::Vector3d::Zero();
+    gp_Pnt p; gp_Vec du, dv;
+    gs->D1((u0 + u1) / 2.0, (v0 + v1) / 2.0, p, du, dv);
+    gp_Vec nv = du.Crossed(dv);
+    if (nv.Magnitude() < 1e-12) return Eigen::Vector3d::Zero();
+    nv.Normalize();
+    return Eigen::Vector3d(nv.X(), nv.Y(), nv.Z());
+}
+
+// Min/max of (point - axis_pt)·v over the face's outer wire, sampling each edge so a
+// circular/spline edge (whose extent is NOT captured by its vertices) is measured too.
+void face_v_extent(const TopoDS_Face& face, const Eigen::Vector3d& axis_pt,
+                   const Eigen::Vector3d& v, double& vmin, double& vmax) {
+    vmin = 1e300; vmax = -1e300;
+    for (TopExp_Explorer ex(face, TopAbs_EDGE); ex.More(); ex.Next()) {
+        BRepAdaptor_Curve ac(TopoDS::Edge(ex.Current()));
+        const double t0 = ac.FirstParameter(), t1 = ac.LastParameter();
+        const int N = 24;
+        for (int i = 0; i <= N; ++i) {
+            gp_Pnt p = ac.Value(t0 + (t1 - t0) * (double(i) / N));
+            const double d = (Eigen::Vector3d(p.X(), p.Y(), p.Z()) - axis_pt).dot(v);
+            vmin = std::min(vmin, d);
+            vmax = std::max(vmax, d);
+        }
+    }
+}
+}  // namespace
+
 TopoDS_Shape revolve_face(const TopoDS_Face& face, const Eigen::Vector3d& axis_pt,
                           const Eigen::Vector3d& axis_dir, double angle_rad) {
     gp_Ax1 axis(gp_Pnt(axis_pt.x(), axis_pt.y(), axis_pt.z()),
                 gp_Dir(axis_dir.x(), axis_dir.y(), axis_dir.z()));
-    TopoDS_Shape solid = BRepPrimAPI_MakeRevol(face, axis, angle_rad).Shape();
+
+    // When the profile STRADDLES the axis (e.g. a full circle centered on the axis, the
+    // sphere case), revolving it sweeps each half through the other → a self-intersecting,
+    // degenerate solid. The kernel-correct CAD behavior (SolidWorks parity) is to revolve a
+    // profile that lies on ONE side of the axis. So if the face crosses the axis line, clip
+    // it to its larger half-plane first: a half-disk revolved 360° is a clean sphere.
+    TopoDS_Face prof = face;
+    const Eigen::Vector3d N = face_plane_normal(face);
+    if (N.squaredNorm() > 0.5) {
+        // In-plane basis: u along the axis (projected into the face plane), v perpendicular
+        // to the axis within the plane. v is the direction the profile is split across.
+        Eigen::Vector3d u = axis_dir - N * axis_dir.dot(N);
+        if (u.norm() > 1e-9) {
+            u.normalize();
+            Eigen::Vector3d v = N.cross(u);
+            if (v.norm() > 1e-9) {
+                v.normalize();
+                double vmin, vmax;
+                face_v_extent(face, axis_pt, v, vmin, vmax);
+                const double tol = 1e-7 * std::max(1.0, std::abs(vmax) + std::abs(vmin));
+                if (vmin < -tol && vmax > tol) {
+                    // Straddles the axis — keep the larger side (b>=0 vs b<=0). Build a big
+                    // coplanar half-plane rectangle on that side and intersect the profile.
+                    const bool keep_pos = (vmax >= -vmin);
+                    const double big = (std::abs(vmax) + std::abs(vmin)) * 4.0 + 1.0;
+                    const double b0 = keep_pos ? 0.0 : -big;
+                    const double b1 = keep_pos ? big : 0.0;
+                    auto P = [&](double a, double b) {
+                        Eigen::Vector3d q = axis_pt + u * a + v * b;
+                        return gp_Pnt(q.x(), q.y(), q.z());
+                    };
+                    BRepBuilderAPI_MakePolygon poly;
+                    poly.Add(P(-big, b0));
+                    poly.Add(P(big, b0));
+                    poly.Add(P(big, b1));
+                    poly.Add(P(-big, b1));
+                    poly.Close();
+                    TopoDS_Shape half = BRepBuilderAPI_MakeFace(poly.Wire()).Shape();
+                    TopoDS_Shape clipped = common(face, half);
+                    // Take the resulting (largest) face; fall back to the raw face if the
+                    // intersection failed so a non-degenerate profile is never lost.
+                    double best = 0.0;
+                    for (TopExp_Explorer fx(clipped, TopAbs_FACE); fx.More(); fx.Next()) {
+                        TopoDS_Face cf = TopoDS::Face(fx.Current());
+                        GProp_GProps g; BRepGProp::SurfaceProperties(cf, g);
+                        if (g.Mass() > best) { best = g.Mass(); prof = cf; }
+                    }
+                }
+            }
+        }
+    }
+
+    TopoDS_Shape solid = BRepPrimAPI_MakeRevol(prof, axis, angle_rad).Shape();
     // Same collinear-segment cleanup as extrude_face: collinear profile runs revolve into
     // separate cocylindrical/coplanar faces split by a phantom edge — merge them so the
     // revolved body has one face per real wall and no spurious edges to confuse fillet.

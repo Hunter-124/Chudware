@@ -1331,6 +1331,7 @@ void Renderer::drawRefDatums(const Mat4& mvp) {
     const float cs = e * 0.35f;   // csys axis length
 
     for (const auto& d : refDatums_) {
+        if (!d.id.empty() && hiddenDatums_.count(d.id)) continue;  // FeatureManager eye hid this datum
         const bool selected = !selectedDatumId_.empty() && d.id == selectedDatumId_;
         switch (d.kind) {
             case RefDatum::Kind::Axis: {

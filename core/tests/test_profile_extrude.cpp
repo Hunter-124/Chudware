@@ -310,3 +310,50 @@ TEST_CASE("rectangle revolved 360 about Z -> annular tube of exact volume") {
     CHECK((hi[0] - lo[0]) == doctest::Approx(2 * R1).epsilon(1e-2));
     CHECK((hi[1] - lo[1]) == doctest::Approx(2 * R1).epsilon(1e-2));
 }
+
+// 5. Sphere by revolution: a FULL circle centered ON the axis (the axis passes
+//    through the profile's center) revolved 360 deg. This is the regression case
+//    for the axis-straddle clip — a naive MakeRevol sweeps each half-disk through
+//    the other and yields a self-intersecting, degenerate solid. revolve_face must
+//    clip the profile to one half-plane first so the result is a CLEAN sphere of
+//    exact volume 4/3 pi r^3 with one spherical face. Circle on the FRONT plane
+//    (XZ) centered at origin, axis = world Z (lies in-plane, through the center).
+TEST_CASE("full circle on the axis revolved 360 -> clean sphere of exact volume") {
+    const double R = 25.4;
+    json s;
+    s["entities"] = json::array({circle("e1", 0, 0, R)});
+    s["constraints"] = json::array({
+        rel("c1", "fix", {"e1.center"}),
+        dim("c2", "radius", {"e1"}, R),
+    });
+    auto sol = solve_sketch(s, json::object());
+    REQUIRE(sol.converged);
+
+    auto faces = faces_from_solved_sketch(sol.entities, SketchPlane::front());
+    REQUIRE(faces.size() == 1);
+
+    TopoDS_Shape solid = geom::revolve_face(
+        faces[0], Eigen::Vector3d(0, 0, 0), Eigen::Vector3d(0, 0, 1), 2.0 * PI);
+
+    const float color[3] = {0.6f, 0.62f, 0.66f};
+    Loaded ld = roundtrip(solid, "Sphere", color);
+    REQUIRE(ld.doc.bodies.size() == 1);
+    const render::BodyMesh& b = ld.doc.bodies[0];
+    check_common(b);
+
+    double expected_vol = 4.0 / 3.0 * PI * R * R * R;
+    double vol = solid_volume(solid);
+    double lo[3], hi[3];
+    bbox(b, lo, hi);
+    MESSAGE("sphere: faces=" << b.faces.size()
+            << " sphere=" << count_surf(b, 4) << " planar=" << count_surf(b, 0)
+            << " bbox=" << (hi[0]-lo[0]) << "x" << (hi[1]-lo[1]) << "x" << (hi[2]-lo[2])
+            << " volume=" << vol << " (expected " << expected_vol << ")");
+
+    // Exact sphere volume (proves no double-coverage / self-intersection) and a
+    // 2R cube bounding box on every axis.
+    CHECK(vol == doctest::Approx(expected_vol).epsilon(1e-3));
+    CHECK((hi[0] - lo[0]) == doctest::Approx(2 * R).epsilon(1e-2));
+    CHECK((hi[1] - lo[1]) == doctest::Approx(2 * R).epsilon(1e-2));
+    CHECK((hi[2] - lo[2]) == doctest::Approx(2 * R).epsilon(1e-2));
+}

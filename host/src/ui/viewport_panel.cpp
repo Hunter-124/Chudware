@@ -1451,7 +1451,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // C25: a fresh part with no geometry auto-shows its datum planes (SolidWorks "pick a
         // plane to start" state); once geometry exists, visibility is the user's toggle.
         bool effPlane[3] = {st.showPlane[0], st.showPlane[1], st.showPlane[2]};
-        if (!st.hasDocMesh && st.docMirror.hasDoc())
+        // Auto-show all three on a body-less part (SolidWorks "pick a plane to start") — but ONLY
+        // until the user takes control of plane visibility, so an explicit hide actually sticks.
+        if (!st.hasDocMesh && st.docMirror.hasDoc() && !st.planesUserToggled)
             effPlane[0] = effPlane[1] = effPlane[2] = true;
         // A feature PM with an active plane-accepting well (ref-axis "Two Planes", ref-plane "Mid
         // Plane", …): force-show the origin planes so the user can click one, same as the new-sketch
@@ -2982,20 +2984,34 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 if (y0 + ts.y + 6 > vr1.y) y0 = vr1.y - ts.y - 6;
                 if (y0 < vr0.y + 2) y0 = vr0.y + 2;
                 ImVec2 q0(x0, y0), q1(x0 + ts.x + 12, y0 + ts.y + 6);
-                // C43: during plane-pick the label chips are CLICK TARGETS too (the quads
-                // overlap heavily near the origin; the labels are unambiguous).
-                bool chipHovered = st.sketchPlanePickActive &&
-                                   ImGui::IsMouseHoveringRect(q0, q1);
+                // C43: during plane-pick the label chips are CLICK TARGETS (the quads overlap
+                // heavily near the origin; the labels are unambiguous). Outside a pick — and outside
+                // a PM form that owns plane picking — the chip is still clickable to PRE-SELECT the
+                // plane in the graphics area (SolidWorks "select a plane, then Sketch"): the click
+                // sets it as the FeatureManager selection so the ribbon "New Sketch" starts on it.
+                bool pmOwnsPlanes = st.propertyManager && st.propertyManager->active();
+                bool chipClickable = st.sketchPlanePickActive || !pmOwnsPlanes;
+                bool chipHovered = chipClickable && ImGui::IsMouseHoveringRect(q0, q1);
+                static const char* kPlaneSel[3] = {"plane.front", "plane.top", "plane.right"};
+                bool chipSelected = !st.sketchPlanePickActive &&
+                                    st.selectedFeatureId == kPlaneSel[p];
                 vdl->AddRectFilled(q0, q1, overlayBg, 4.0f * ui::uiScale);
-                vdl->AddRect(q0, q1, chipHovered ? ui::Palette::toU32(vpal.accent)
-                                                 : planeChipBord, 4.0f * ui::uiScale, 0,
-                             chipHovered ? 2.0f : 1.0f);
+                vdl->AddRect(q0, q1, (chipHovered || chipSelected)
+                                         ? ui::Palette::toU32(vpal.accent)
+                                         : planeChipBord, 4.0f * ui::uiScale, 0,
+                             (chipHovered || chipSelected) ? 2.0f : 1.0f);
                 vdl->AddText(ImVec2(x0 + 6 * ui::uiScale, y0 + 3 * ui::uiScale), overlayTxt, nm);
-                if (chipHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-                    st.sketchMode) {
-                    static const char* kPlaneSel[3] = {"plane.front", "plane.top", "plane.right"};
-                    st.sketchPlanePickActive = false;
-                    st.sketchMode->createSketchOnPlane(st, kPlaneSel[p]);
+                if (chipHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    if (st.sketchPlanePickActive && st.sketchMode) {
+                        st.sketchPlanePickActive = false;
+                        st.sketchMode->consumePlanePick(st, kPlaneSel[p]);
+                    } else {
+                        // Pre-select the plane (graphics-area). enterNewOnSelection consumes
+                        // st.selectedFeatureId, so the next "New Sketch" starts on this plane.
+                        st.selection.clear();
+                        st.selectedFeatureId = kPlaneSel[p];
+                        st.planeEmphasis = p;
+                    }
                 }
             }
         }

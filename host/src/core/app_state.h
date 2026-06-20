@@ -13,6 +13,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -161,7 +162,8 @@ struct DocSession {
     std::string                pickStatus;
     std::vector<uint8_t>       bodyVisible;         // Solid Bodies hide/show mask (per renderer slot)
     std::vector<uint32_t>      docBodyIds;          // AICM body id per slot (keys the mask)
-    std::string                modelInfo;
+    std::unordered_set<std::string> hiddenFeatures; // FeatureManager eye-toggle: fids hidden (non-body)
+    std::string                modelInfo;            // (DocSession parked copy — see AppState field)
     std::vector<PartInfo>      asmParts;
     FitReport                  asmFit;
     std::string                asmStl;
@@ -644,9 +646,18 @@ struct AppState {
     // by-ordinal hides would land on the wrong body). clearViewportForNewDoc clears both.
     std::vector<uint8_t>  bodyVisible;
     std::vector<uint32_t> docBodyIds;
+    // FeatureManager per-feature eye toggle (the hide/show eye on every tree row). Holds the fids of
+    // features hidden via the eye that DON'T own bodies (sketches, datums) — body-owning features
+    // route their eye straight to bodyVisible instead. Consulted by the sketch-ghost renderer; per-doc
+    // (parked in DocSession, cleared by clearViewportForNewDoc).
+    std::unordered_set<std::string> hiddenFeatures;
     // Push bodyVisible to the renderer (per-slot draw skip) and the id pass (pick skip). Call
     // after any toggle; loadDocMesh calls it after every setMeshes/setDoc.
     void applyBodyVisibility();
+    // Push hiddenFeatures to the renderer so hidden DATUM features (ref axis/plane/point/csys) drop
+    // out of the reference-overlay draw immediately. Call after an eye toggle, a tab switch, and
+    // every datum rebuild (the datum geometry is otherwise re-pushed only on a document mutation).
+    void applyDatumVisibility();
 
     // ---- Wave-2 shared UI state (cross-panel contracts; each field has one writer + one reader) ----
     // True while SketchMode runs the SolidWorks-style "pick a plane to start the sketch" step.
@@ -731,6 +742,11 @@ struct AppState {
     // W4-K: hidden by default (SolidWorks behavior). Toggle a plane on via the FeatureManager row
     // or it is forced visible during sketch-plane picking. Sketch mode hides them (grid owns view).
     bool showPlane[3] = {false, false, false};
+    // True once the user has explicitly toggled origin-plane visibility (eye / FeatureManager row).
+    // Until then, an empty part (no solid body) auto-shows all three planes (SolidWorks "pick a plane
+    // to start"); after the user takes control, showPlane is authoritative so a hide actually sticks
+    // even with no body yet. Per-doc (parked in DocSession); reset on a fresh doc.
+    bool planesUserToggled = false;
     int  planeEmphasis = -1;
     // C25 W3-J: viewport display/visibility state.
     int  displayStyle  = 1;          // mirrors DisplayStyle enum; 0=Shaded 1=ShadedEdges(default) 2=HLR 3=HLV 4=Wire

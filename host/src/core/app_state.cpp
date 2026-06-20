@@ -684,7 +684,9 @@ void AppState::clearViewportForNewDoc() {
     // must never leak into the next document).
     bodyVisible.clear();
     docBodyIds.clear();
+    hiddenFeatures.clear();
     applyBodyVisibility();
+    applyDatumVisibility();
     asmParts.clear();
     selectedPart = -1;
     selection.clear();
@@ -704,6 +706,8 @@ void AppState::clearViewportForNewDoc() {
     sketchPlanePickActive = false;
     featureHighlightFaces.clear();
     zoomToBBoxRequested = false;
+    // A fresh part re-enters the auto-show "pick a plane to start" state until the user toggles.
+    planesUserToggled = false;
 }
 
 // Multi-document: park the LEAVING tab's live per-doc value state into its DocSession (move out, so
@@ -719,6 +723,7 @@ void AppState::captureDocState(DocSession& s) {
     s.pickStatus   = std::move(pickStatus);
     s.bodyVisible  = std::move(bodyVisible);
     s.docBodyIds   = std::move(docBodyIds);
+    s.hiddenFeatures = std::move(hiddenFeatures);
     s.modelInfo    = std::move(modelInfo);
     s.asmParts     = std::move(asmParts);
     s.asmFit       = std::move(asmFit);
@@ -737,6 +742,8 @@ void AppState::captureDocState(DocSession& s) {
 void AppState::restoreDocState(DocSession& s) {
     bodyVisible  = std::move(s.bodyVisible);
     docBodyIds   = std::move(s.docBodyIds);
+    hiddenFeatures = std::move(s.hiddenFeatures);
+    applyDatumVisibility();   // reflect this tab's datum hides in the renderer
     modelInfo    = std::move(s.modelInfo);
     asmParts     = std::move(s.asmParts);
     asmFit       = std::move(s.asmFit);
@@ -763,6 +770,10 @@ void AppState::applyBodyVisibility() {
             if (!bodyVisible[i]) hidden.insert(docBodyIds[i]);
         idPass->setHiddenBodies(hidden);
     }
+}
+
+void AppState::applyDatumVisibility() {
+    if (renderer) renderer->setHiddenDatums(hiddenFeatures);
 }
 
 std::string AppState::pickLabel(const render::PickHit& h) const {

@@ -18,6 +18,11 @@ void setRibbonCallback(std::function<void(const char* cmd_id)> cb);
 // Set once per frame before drawRibbon (app.cpp mirrors SketchMode's active tool).
 void setRibbonActiveCmd(const char* cmd_id);
 
+// True while a sketch is being EDITED. When false, the Sketch tab swaps its "Exit Sketch" state
+// button for the Features-tab "New Sketch" button so the user can start a sketch from this tab
+// (SolidWorks shows the same entry point). Set once per frame before drawRibbon.
+void setRibbonSketchActive(bool active);
+
 // --- Ribbon layout helpers --------------------------------------------------
 
 // Begin the ribbon bar: reserves a full-width child window of height ribbonH.

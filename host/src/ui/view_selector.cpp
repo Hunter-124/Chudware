@@ -130,7 +130,11 @@ namespace {
 
 bool buildZones(Renderer& renderer, ImVec2 vr0, ImVec2 vr1,
                 std::vector<Zone>& zones) {
-    if (!renderer.hasMesh()) return false;
+    // The view selector must work on an EMPTY part (SolidWorks orients the view before any body
+    // exists). drawCurrent already publishes cam.radius = kEmptySceneRadius and cam.mvp/center for
+    // an empty document, so we no longer bail on !hasMesh() — the box frames the empty scene at the
+    // same ~35mm scale the camera and datum planes use. The h<=0 guard below still covers a stale
+    // pre-first-frame camera.
     const Renderer::CameraXform& cam = renderer.camera();
     const float h = cam.radius * kBoxScale;
     if (h <= 1e-5f) return false;

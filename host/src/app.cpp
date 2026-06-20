@@ -1180,6 +1180,7 @@ int run_gui(const char* screenshotPath) {
                 rds.push_back(rd);
             }
             st.renderer->setRefDatums(std::move(rds));
+            st.applyDatumVisibility();   // re-apply the FeatureManager eye hides to the fresh datums
         }
         // Document tabs: a real edit (applyOps/undo/redo/pushPull/revert) lights the active tab's
         // unsaved-changes marker. Tab switches / fresh-doc activation / resyncs set suppressTabDirty
@@ -2339,6 +2340,8 @@ int run_gui(const char* screenshotPath) {
         }
         // C40: accent-highlight the armed sketch tool's ribbon button.
         ui::setRibbonActiveCmd(st.sketchMode->activeToolCmd());
+        // Sketch tab swaps Exit Sketch <-> New Sketch depending on whether a sketch is being edited.
+        ui::setRibbonSketchActive(st.sketchMode->active());
         float ribbonH = ui::drawRibbon(st.ribbonTab, st.showRibbon,
                                        st.showSimulationTools, st.showPcbTools, barH);
 

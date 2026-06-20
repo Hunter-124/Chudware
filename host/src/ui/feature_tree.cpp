@@ -85,6 +85,49 @@ static void setBodyShown(AppState& st, int slot, bool shown) {
     st.applyBodyVisibility();
 }
 
+// ---- per-feature eye (FeatureManager hide/show on every tree row) ----
+// Renderer slot index for an AICM body id (or -1 if that body isn't currently loaded).
+static int slotForBodyId(AppState& st, uint32_t bid) {
+    for (int i = 0; i < (int)st.docBodyIds.size(); ++i)
+        if (st.docBodyIds[i] == bid) return i;
+    return -1;
+}
+// Is a feature currently shown? Features that OWN bodies derive it from those bodies' visibility
+// (any owned body hidden => the feature reads as hidden); everything else from the hiddenFeatures
+// set. This keeps the eye and the "Solid Bodies" folder in sync for solids while still giving
+// sketches/datums a hide toggle.
+static bool featureEyeShown(AppState& st, const std::string& fid,
+                            const std::vector<uint32_t>& ownedBodies) {
+    if (!ownedBodies.empty()) {
+        for (uint32_t bid : ownedBodies) {
+            int slot = slotForBodyId(st, bid);
+            if (slot >= 0 && slot < (int)st.bodyVisible.size() && !st.bodyVisible[slot])
+                return false;
+        }
+        return true;
+    }
+    return st.hiddenFeatures.find(fid) == st.hiddenFeatures.end();
+}
+// Flip a feature's visibility. Body-owning => toggle every owned body (reuses setBodyShown so the
+// Solid Bodies folder agrees); other features => flip hiddenFeatures membership (the sketch-ghost
+// renderer honors it).
+static void toggleFeatureEye(AppState& st, const std::string& fid,
+                             const std::vector<uint32_t>& ownedBodies, bool currentlyShown) {
+    if (!ownedBodies.empty()) {
+        for (uint32_t bid : ownedBodies) {
+            int slot = slotForBodyId(st, bid);
+            if (slot >= 0) setBodyShown(st, slot, !currentlyShown);
+        }
+    } else {
+        if (currentlyShown) st.hiddenFeatures.insert(fid);
+        else st.hiddenFeatures.erase(fid);
+        // Datum features (ref axis/plane/point/csys) are reference overlays, not bodies — push the
+        // hidden set to the renderer so the toggle hides/shows them immediately (sketches read
+        // st.hiddenFeatures live in drawGhosts, so they need no extra push).
+        st.applyDatumVisibility();
+    }
+}
+
 // ---- status badge (ok/warn/error/rolled-back) ----
 // C37-E: a rolled-back feature (after the rollback bar) is NOT an error — it gets a distinct muted
 // "paused" marker, never the red "!". Pass rolledBack=true for those rows.
@@ -590,6 +633,7 @@ struct RowCtx {
     bool rolledBack = false;        // after the rollback bar → greyed/italic, NOT error styling
     FStatus fs;                     // ok / error / dangling / ms
     int  ownerBodyCount = 0;        // for the tooltip
+    std::vector<uint32_t> ownedBodies;  // AICM body ids this feature owns (per-row eye toggle)
     bool nested = false;            // a sketch child node (indented under its consumer)
     bool canDoc = true;            // gates every mutating menu item + drag-reorder
     bool barAtEnd = true;          // hides "Roll to End" when already at the end
@@ -688,10 +732,22 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
 
     if (dim) ImGui::PopStyleColor();
 
+    // ---- per-feature eye hit-box (right edge of the row) ----
+    // Computed from the SpanFullWidth node rect now; drawn + handled at the end of the row. A click
+    // landing on the eye must NOT also select/double-click the row, so the classification below skips
+    // when the cursor is over the eye.
+    ImVec2 nodeMin = ImGui::GetItemRectMin();
+    ImVec2 nodeMax = ImGui::GetItemRectMax();
+    float  eyeSz   = 14.0f * ui::uiScale;
+    float  eyePad  = 6.0f  * ui::uiScale;
+    ImVec2 eyeMin(nodeMax.x - eyeSz - eyePad, nodeMin.y + (nodeMax.y - nodeMin.y - eyeSz) * 0.5f);
+    ImVec2 eyeMax(eyeMin.x + eyeSz, eyeMin.y + eyeSz);
+    bool   overEye = ImGui::IsMouseHoveringRect(eyeMin, eyeMax);
+
     // ---- click classification (defer the actual selection change to the caller) ----
     bool itemHovered = ImGui::IsItemHovered();
     res.hovered = itemHovered;
-    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !overEye) {
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) res.doubleClick = true;
         else if (ImGui::GetIO().KeyCtrl)                        res.ctrlClicked = true;
         else                                                    res.clicked = true;
@@ -739,12 +795,17 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         if (!c.canDoc) ImGui::BeginDisabled();   // gate every mutating item while an agent run is busy
 
         if (isSketch) {
+            // A sketch gets "Edit Sketch" (enter the sketcher) + "Edit Sketch Plane" (re-pick the
+            // plane it sits on) — NOT the generic "Edit" form, which doesn't apply to a sketch.
             if (ImGui::MenuItem("Edit Sketch")) {
                 auto* sk = st.sketchMode;
                 if (sk) sk->enterForFeature(st, fid);
             }
-        }
-        if (c.editCallback && *c.editCallback) {
+            if (ImGui::MenuItem("Edit Sketch Plane")) {
+                auto* sk = st.sketchMode;
+                if (sk) sk->beginPlaneEdit(st, fid);
+            }
+        } else if (c.editCallback && *c.editCallback) {
             if (ImGui::MenuItem("Edit")) (*c.editCallback)(fid);
         } else {
             ImGui::BeginDisabled(); ImGui::MenuItem("Edit"); ImGui::EndDisabled();
@@ -873,6 +934,33 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         }
         if (!c.canDoc) ImGui::EndDisabled();
         ImGui::EndPopup();
+    }
+
+    // ---- per-feature eye toggle (every row, right edge) ----
+    // Hidden body-owning features hide their bodies; hidden sketches/datums drop out of the ghost
+    // overlay. The glyph dims when hidden, with a slash (the atlas carries one eye icon, not a pair).
+    {
+        bool shown = featureEyeShown(st, fid, c.ownedBodies);
+        ImDrawList* eyeDl = ImGui::GetWindowDrawList();
+        IconUV iv = getIcon("hide_show_eye", 20);
+        float a = shown ? (overEye ? 1.0f : 0.70f) : (overEye ? 0.55f : 0.28f);
+        ImU32 tint = IM_COL32(255, 255, 255, (int)(a * 255.0f + 0.5f));
+        if (iv.valid) {
+            eyeDl->AddImage(iv.texId, eyeMin, eyeMax, iv.uv0, iv.uv1, tint);
+            if (!shown)
+                eyeDl->AddLine(ImVec2(eyeMin.x, eyeMax.y), ImVec2(eyeMax.x, eyeMin.y),
+                               ImGui::ColorConvertFloat4ToU32(
+                                   ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                                          ui::palette.textDim[2], 0.9f)),
+                               std::max(1.0f, 1.5f * ui::uiScale));
+        } else {
+            eyeDl->AddText(eyeMin, tint, shown ? "o" : "-");
+        }
+        if (overEye) {
+            ImGui::SetTooltip(shown ? "Hide" : "Show");
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                toggleFeatureEye(st, fid, c.ownedBodies, shown);
+        }
     }
 
     featureBadge(c.fs.ok, !c.fs.error.empty(), c.fs.error, c.fs.dangling, c.rolledBack);
@@ -1696,12 +1784,24 @@ void drawFeatureTreeBody(AppState& st,
             // Reference planes — click to show/hide in the viewport; the clicked plane is
             // emphasized (brighter) and the others dim (focus-follows-selection).
             static const char* kPlanes[] = {"Front Plane", "Top Plane", "Right Plane"};
+            // A body-less part auto-shows all three planes until the user takes control of plane
+            // visibility (eye / row click). Taking control bakes that auto-shown state into showPlane
+            // so hiding ONE plane doesn't blank the other two. The eye/glyph track EFFECTIVE
+            // visibility (what the viewport shows), not raw showPlane.
+            bool planesAutoShow = !st.hasDocMesh && st.docMirror.hasDoc() && !st.planesUserToggled;
+            auto takePlaneControl = [&st, planesAutoShow]() {
+                if (st.planesUserToggled) return;
+                if (planesAutoShow)
+                    st.showPlane[0] = st.showPlane[1] = st.showPlane[2] = true;
+                st.planesUserToggled = true;
+            };
             for (int pi = 0; pi < 3; ++pi) {
                 ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_Leaf |
                                        ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                        ImGuiTreeNodeFlags_SpanFullWidth;
                 if (st.planeEmphasis == pi) f |= ImGuiTreeNodeFlags_Selected;
-                bool hidden = !st.showPlane[pi];
+                bool planeShownEff = st.showPlane[pi] || planesAutoShow;
+                bool hidden = !planeShownEff;
                 treeIcon("plane", "[P]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                 if (hidden)
@@ -1709,13 +1809,52 @@ void drawFeatureTreeBody(AppState& st,
                         ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.55f));
                 ImGui::TreeNodeEx((std::string(kPlanes[pi]) + "##plane" + std::to_string(pi)).c_str(), f);
                 if (hidden) ImGui::PopStyleColor();
-                if (ImGui::IsItemClicked()) {
+                // Per-row eye (show/hide this origin plane), matching the feature rows. A click on the
+                // eye toggles visibility WITHOUT changing the selection; the rest of the row keeps its
+                // select / plane-pick behavior.
+                ImVec2 pNodeMin = ImGui::GetItemRectMin();
+                ImVec2 pNodeMax = ImGui::GetItemRectMax();
+                float  pEyeSz = 14.0f * ui::uiScale, pEyePad = 6.0f * ui::uiScale;
+                ImVec2 pEyeMin(pNodeMax.x - pEyeSz - pEyePad,
+                               pNodeMin.y + (pNodeMax.y - pNodeMin.y - pEyeSz) * 0.5f);
+                ImVec2 pEyeMax(pEyeMin.x + pEyeSz, pEyeMin.y + pEyeSz);
+                bool   pOverEye = ImGui::IsMouseHoveringRect(pEyeMin, pEyeMax);
+                {
+                    ImDrawList* pdl = ImGui::GetWindowDrawList();
+                    IconUV iv = getIcon("hide_show_eye", 20);
+                    float a = !hidden ? (pOverEye ? 1.0f : 0.70f) : (pOverEye ? 0.55f : 0.28f);
+                    ImU32 tint = IM_COL32(255, 255, 255, (int)(a * 255.0f + 0.5f));
+                    if (iv.valid) {
+                        pdl->AddImage(iv.texId, pEyeMin, pEyeMax, iv.uv0, iv.uv1, tint);
+                        if (hidden)
+                            pdl->AddLine(ImVec2(pEyeMin.x, pEyeMax.y), ImVec2(pEyeMax.x, pEyeMin.y),
+                                         ImGui::ColorConvertFloat4ToU32(ImVec4(pal.textDim[0],
+                                             pal.textDim[1], pal.textDim[2], 0.9f)),
+                                         std::max(1.0f, 1.5f * ui::uiScale));
+                    } else {
+                        pdl->AddText(pEyeMin, tint, hidden ? "-" : "o");
+                    }
+                    if (pOverEye) {
+                        ImGui::SetTooltip(hidden ? "Show %s" : "Hide %s", kPlanes[pi]);
+                        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                            static const char* kPlaneEyeId[] = {"plane.front","plane.top","plane.right"};
+                            takePlaneControl();          // bake auto-shown state, then toggle this one
+                            st.showPlane[pi] = hidden;   // was hidden -> turn on; was shown -> turn off
+                            if (!st.showPlane[pi]) {
+                                if (st.planeEmphasis == pi) st.planeEmphasis = -1;
+                                if (st.selectedFeatureId == kPlaneEyeId[pi]) st.selectedFeatureId.clear();
+                            }
+                        }
+                    }
+                }
+                if (!pOverEye && ImGui::IsItemClicked()) {
                     if (st.sketchPlanePickActive && st.sketchMode) {
-                        // Plane-pick in progress: clicking a plane in the tree picks it for the
-                        // new sketch (SolidWorks behavior), instead of toggling visibility.
+                        // Plane-pick in progress: clicking a plane in the tree picks it (SolidWorks
+                        // behavior) instead of toggling visibility. consumePlanePick routes to a NEW
+                        // sketch or an Edit-Sketch-Plane reparent depending on the armed mode.
                         static const char* kPlaneSel[] = {"plane.front", "plane.top", "plane.right"};
                         st.sketchPlanePickActive = false;
-                        st.sketchMode->createSketchOnPlane(st, kPlaneSel[pi]);
+                        st.sketchMode->consumePlanePick(st, kPlaneSel[pi]);
                     } else if (st.sketchMode && st.sketchMode->smartDimPicking()) {
                         // Smart Dimension armed in a sketch: a tree plane click references that
                         // datum plane (projected into the sketch) instead of toggling visibility.
@@ -1725,8 +1864,9 @@ void drawFeatureTreeBody(AppState& st,
                         // run a plane-well feature) and shows it. Re-clicking the already-selected
                         // plane hides + deselects it, preserving the old show/hide toggle.
                         static const char* kPlaneSelId[] = {"plane.front", "plane.top", "plane.right"};
+                        takePlaneControl();
                         bool wasSel = (st.selectedFeatureId == kPlaneSelId[pi]);
-                        if (wasSel && st.showPlane[pi]) {
+                        if (wasSel && planeShownEff) {
                             st.showPlane[pi] = false;
                             st.planeEmphasis = -1;
                             st.selectedFeatureId.clear();
@@ -1738,7 +1878,7 @@ void drawFeatureTreeBody(AppState& st,
                         }
                     }
                 }
-                if (ImGui::IsItemHovered())
+                if (ImGui::IsItemHovered() && !pOverEye)
                     ImGui::SetTooltip(st.sketchPlanePickActive ? "Sketch on %s"
                                       : ((st.sketchMode && st.sketchMode->smartDimPicking())
                                              ? "Dimension to %s"
@@ -1783,7 +1923,14 @@ void drawFeatureTreeBody(AppState& st,
                     // viewport highlight if the primary is gone.
                     {
                         std::unordered_set<std::string> live(order.begin(), order.end());
-                        if (!selectedFeatureId.empty() && !live.count(selectedFeatureId)) {
+                        // The three reserved ORIGIN-plane ids are valid selections (SolidWorks
+                        // "select a plane, then Sketch") but are NOT features, so they must be exempt
+                        // from this live-feature prune or a plane selection would be wiped next frame.
+                        bool isOriginPlane = selectedFeatureId == "plane.front" ||
+                                             selectedFeatureId == "plane.top"   ||
+                                             selectedFeatureId == "plane.right";
+                        if (!selectedFeatureId.empty() && !live.count(selectedFeatureId) &&
+                            !isOriginPlane) {
                             selectedFeatureId.clear();
                             clearFeatureHighlight(st);
                         }
@@ -1907,6 +2054,10 @@ void drawFeatureTreeBody(AppState& st,
                         auto it = ownerMap.find(fid);
                         return it == ownerMap.end() ? 0 : (int)it->second.bodies.size();
                     };
+                    auto ownedBodies = [&](const std::string& fid) -> std::vector<uint32_t> {
+                        auto it = ownerMap.find(fid);
+                        return it == ownerMap.end() ? std::vector<uint32_t>{} : it->second.bodies;
+                    };
 
                     // ---- render one feature row (shared by flat + nested-sketch paths) ----
                     int rowIdx = 0;   // visual stripe index (stable across nesting)
@@ -2001,6 +2152,7 @@ void drawFeatureTreeBody(AppState& st,
                         ctx.suppressed = suppressed; ctx.selected = sel;
                         ctx.rolledBack = rolledBack; ctx.fs = fs;
                         ctx.ownerBodyCount = bodyCount(fid);
+                        ctx.ownedBodies = ownedBodies(fid);
                         ctx.nested = nested;
                         ctx.canDoc = canDocTree;
                         ctx.barAtEnd = barAtEnd;

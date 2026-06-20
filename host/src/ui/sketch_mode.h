@@ -115,6 +115,16 @@ public:
     std::string createSketchOnPlane(AppState& st, const nlohmann::json& planeRef);
     void exitSketch(AppState& st, bool keep = true);   // keep=false also deletes an empty new sketch
 
+    // Tree "Edit Sketch Plane": arm a plane pick that RE-PARENTS an existing sketch onto the picked
+    // plane/face (rebuilds the sketch and every feature downstream). Exits the active sketch first if
+    // it is the one being moved. planeEditActive() is true while the reparent pick is armed.
+    void beginPlaneEdit(AppState& st, const std::string& sketchFid);
+    bool planeEditActive() const { return !planeEditFid_.empty(); }
+    // Consume a picked plane ref: re-parents the armed sketch when planeEditActive(), otherwise
+    // creates+enters a new sketch (createSketchOnPlane). All plane-pick consumption sites (the
+    // SketchMode overlay, the tree plane rows, the viewport plane chips) route through this.
+    std::string consumePlanePick(AppState& st, const nlohmann::json& planeRef);
+
     // Ribbon Sketch-tab command dispatch (sk_line / sk_rect_corner / sk_circle / sk_arc_center /
     // sk_slot / smart_dim / sketch_exit / sketch_new). Returns true if handled.
     bool onRibbonCommand(AppState& st, const std::string& cmdId);
@@ -437,6 +447,10 @@ private:
     // st.sketchPlanePickActive; -1 = no origin-plane hovered, else 0/1/2 = front/top/right.
     bool planePicking_ = false;
     int  planeHover_ = -1;
+    // Tree "Edit Sketch Plane": when set, the next plane pick RE-PARENTS this existing sketch
+    // (edit_feature refs.plane) instead of creating a new sketch. Empty = normal new-sketch pick.
+    // consumePlanePick() reads this; every pick consumption site routes through that helper.
+    std::string planeEditFid_;
     // PM datum-plane picker hover (drawPlanePicker) — separate from the new-sketch planeHover_ so
     // the two flows don't cross-talk. -1 = none, else 0/1/2 = front/top/right.
     int  pmPlaneHover_ = -1;

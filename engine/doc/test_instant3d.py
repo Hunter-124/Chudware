@@ -237,6 +237,36 @@ def test_hole_bore_changes_diameter():
     assert r["old_value"] == 6.0 and r["new_value"] == 8.0
 
 
+def test_body_swallowing_drag_rolls_back_not_poison():
+    """Dragging a bore past the stock removes ALL material (empty compound, not a FeatureError).
+
+    That must be rejected like any degenerate rebuild: the doc rolls back to the last valid size and
+    a subsequent drag/press tick must NOT raise "body_id/topo_id out of range (1..0)" — the bug this
+    guards. (A plate is 40x40; a Ø(6+2*50)=106 bore centred on it swallows the whole plate.)"""
+    s = _new_plate_hole(diameter=6.0)
+    bo0, infos = _faces(s)
+    bore = _face_idx(infos, "cylinder")
+    vol0 = float(bo0.shape.volume)
+    n_bodies0 = len(s.last_result.bodies)
+
+    # Commit a swallowing drag — radial +50 -> diameter 106, larger than the 40x40 plate.
+    r = i3d.push_pull(s, 1, bore, 50.0, commit=True)
+    assert r["ok"] and r["draggable"] is False, r
+    assert "material" in r["reason"] or "vanish" in r["reason"], r["reason"]
+
+    # The body survives unchanged (rolled back), and the session is NOT poisoned.
+    assert len(s.last_result.bodies) == n_bodies0, "body count changed after a rejected drag"
+    assert abs(float(s.last_result.bodies[0].shape.volume) - vol0) < 1e-6, "geometry not restored"
+
+    # The next tick (a press probe / drag sample) must resolve cleanly, no out-of-range OpError.
+    probe = i3d.push_pull(s, 1, bore, 0.0, commit=False)
+    assert probe["ok"], probe
+
+    # A normal valid drag still works after the rejection (6 -> 6 + 2*2 = 10).
+    ok = i3d.push_pull(s, 1, bore, 2.0, commit=True)
+    assert ok["draggable"] and ok["param"] == "diameter" and ok["new_value"] == 10.0, ok
+
+
 # --------------------------------------------------------------------------- not-draggable faces
 
 

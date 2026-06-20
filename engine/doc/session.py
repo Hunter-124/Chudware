@@ -432,6 +432,10 @@ def _ops_response(session: DocSession, result: CompileResult,
         "rebuild": rebuild,
         "tess": {"aicm_path": aicm_path, "bodies": bodies_meta},
         "owner_map": _owner_map(session, result),
+        # Displayable reference geometry (datum axes/planes/points/csys) so the host can draw a
+        # created datum — it builds no body and never reaches the AICM. Empty for the assembly
+        # branch above and for docs with no datum features.
+        "datums": getattr(result, "display_datums", []),
     }
 
 

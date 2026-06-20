@@ -665,6 +665,110 @@ def test_distance_cond_circle_circle() -> None:
     print(f"[dist_cond:circle-circle] gap={gap:.4f}, measured={m:.4f}")
 
 
+def test_distance_cond_concentric_wall() -> None:
+    """Concentric circles (centers coincide): a [max,min] rim distance is the wall
+    thickness r_outer - r_inner. Regression for the point-point distance Jacobian, which
+    early-returned an all-zero row when |center0-center1| ~ 0 and so DROPPED the radius
+    partials — the dimension then removed no DOF and the inner radius never moved (the
+    hollow-cylinder bug)."""
+    from engine.doc.sketch_solver import measure_constraint
+    sketch = {
+        "entities": [
+            {"id": "e1", "type": "circle", "construction": False,
+             "center": [0.0, 0.0], "radius": 20.0},
+            {"id": "e2", "type": "circle", "construction": False,
+             "center": [0.0, 0.0], "radius": 12.0},
+        ],
+        "constraints": [
+            {"id": "c1", "type": "coincident", "refs": ["e1.center", "origin"]},
+            {"id": "c2", "type": "concentric", "refs": ["e1", "e2"]},
+            {"id": "c3", "type": "diameter", "refs": ["e1"],
+             "value": {"value": 40.0, "expr": None}},
+            # wall thickness = outer-rim(max) - inner-rim(min) = 5 -> inner r = 15
+            {"id": "c4", "type": "distance", "refs": ["e1", "e2"],
+             "value": {"value": 5.0, "expr": None}, "cond": ["max", "min"]},
+        ],
+    }
+    sol = solve_sketch(sketch, {}, warm=None)
+    assert sol.converged, "concentric wall: did not converge"
+    r_out = sol.entities["e1"]["radius"]
+    r_in = sol.entities["e2"]["radius"]
+    assert abs(r_out - 20.0) < 1e-5, f"outer radius should stay 20, got {r_out}"
+    assert abs(r_in - 15.0) < 1e-5, f"inner radius should solve to 15 (wall 5), got {r_in}"
+    # the wall-thickness dimension must actually consume the last DOF (it was zero-Jacobian before)
+    assert sol.dof == 0, f"fully-dimensioned concentric annulus should be dof=0, got {sol.dof}"
+    m = measure_constraint(sketch["constraints"][3], sol.entities)
+    assert abs(m - 5.0) < 1e-5, f"measured wall should be 5, got {m}"
+    print(f"[dist_cond:concentric-wall] r_out={r_out:.3f} r_in={r_in:.3f} wall={m:.4f} dof={sol.dof}")
+
+
+def test_distance_cond_hv_tangent_lines() -> None:
+    """Directional (h/v) rim distance is the gap between two TANGENT LINES, each at
+    centre[comp] + s*r (s = -1 min / +1 max), NOT |Δcoord| - rA - rB. Regression for the
+    "circles fly apart" bug: a horizontal [min,min] dim between overlapping/concentric circles
+    must measure the wall/tangent gap in place, instead of shoving the centres rA+rB+d apart."""
+    from engine.doc.sketch_solver import measure_constraint
+
+    def _sketch(cx2, axis, conds, value):
+        return {
+            "entities": [
+                {"id": "e1", "type": "circle", "construction": False,
+                 "center": [0.0, 0.0], "radius": 20.0},
+                {"id": "e2", "type": "circle", "construction": False,
+                 "center": [cx2, 0.0], "radius": 12.0},
+            ],
+            "constraints": [
+                {"id": "c1", "type": "coincident", "refs": ["e1.center", "origin"]},
+                {"id": "c2", "type": "concentric", "refs": ["e1", "e2"]},
+                {"id": "c3", "type": "diameter", "refs": ["e1"],
+                 "value": {"value": 40.0, "expr": None}},
+                {"id": "c4", "type": "distance", "refs": ["e1", "e2"], "axis": axis,
+                 "cond": conds, "value": {"value": value, "expr": None}},
+            ],
+        }
+
+    # Concentric hollow cylinder, horizontal [min,min]: both left tangent lines -> wall = r_out-r_in.
+    sol = solve_sketch(_sketch(0.0, "h", ["min", "min"], 5.0), {}, warm=None)
+    assert sol.converged, "h [min,min] concentric: did not converge"
+    c1, c2 = sol.entities["e1"]["center"], sol.entities["e2"]["center"]
+    # the centres must STAY concentric at the origin (the bug pushed e2 to cx = d+rA+rB)
+    assert abs(c1[0]) < 1e-6 and abs(c2[0]) < 1e-6, \
+        f"centres must stay put, not fly apart, got e1={c1} e2={c2}"
+    assert abs(sol.entities["e2"]["radius"] - 15.0) < 1e-5, \
+        f"inner radius should solve to 15 (wall 5), got {sol.entities['e2']['radius']}"
+    m = measure_constraint(_sketch(0.0, "h", ["min", "min"], 5.0)["constraints"][3], sol.entities)
+    assert abs(m - 5.0) < 1e-5, f"measured h-wall should be 5, got {m}"
+
+    # vertical works the same way.
+    solv = solve_sketch(_sketch(0.0, "v", ["min", "min"], 3.0), {}, warm=None)
+    assert solv.converged and abs(solv.entities["e2"]["radius"] - 17.0) < 1e-5, \
+        f"v [min,min] wall=3 should give inner r=17, got {solv.entities['e2']['radius']}"
+
+    # Non-concentric horizontal: tangent lines at fixed coords -> |(cx1-r1) - (cx2-r2)| measure.
+    # e1 fixed at origin r=20; pin e2 centre at cx=6 (no concentric), r=12 -> left tangents at
+    # -20 and -6 -> gap 14.
+    sk = {
+        "entities": [
+            {"id": "e1", "type": "circle", "construction": False,
+             "center": [0.0, 0.0], "radius": 20.0},
+            {"id": "e2", "type": "circle", "construction": False,
+             "center": [6.0, 0.0], "radius": 12.0},
+        ],
+        "constraints": [
+            {"id": "f1", "type": "fix", "refs": ["e1"]},
+            {"id": "f2", "type": "fix", "refs": ["e2"]},
+            {"id": "d", "type": "distance", "refs": ["e1", "e2"], "axis": "h",
+             "cond": ["min", "min"], "value": {"value": 14.0, "expr": None}},
+        ],
+    }
+    sk_driven = copy.deepcopy(sk)
+    sk_driven["constraints"][2]["driven"] = True
+    sold = solve_sketch(sk_driven, {}, warm=None)
+    md = measure_constraint(sk_driven["constraints"][2], sold.entities)
+    assert abs(md - 14.0) < 1e-5, f"non-concentric h [min,min] tangent gap should be 14, got {md}"
+    print("[dist_cond:hv-tangent] concentric wall in-place + non-concentric tangent gap OK")
+
+
 # ---------------------------------------------------------------------------
 # Test 16: "origin" virtual handle (C50)
 # ---------------------------------------------------------------------------
@@ -1836,6 +1940,8 @@ def main() -> None:
     test_distance_cond_point_circle()
     test_distance_cond_line_circle()
     test_distance_cond_circle_circle()
+    test_distance_cond_concentric_wall()
+    test_distance_cond_hv_tangent_lines()
     test_origin_refs()
     test_fix_whole_entity()
     test_collinear()

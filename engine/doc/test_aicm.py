@@ -325,6 +325,43 @@ def test_unknown_chunk_skip() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 7b: seam / degenerate edges are NOT drawn (a cylinder has no vertical line)
+# ---------------------------------------------------------------------------
+def test_seam_edges_not_drawn() -> None:
+    """Periodic-surface seam edges and degenerate edges must carry zero polyline points.
+
+    A cylinder (extruded circle) has 3 B-rep edges: 2 circular rims + 1 seam (the vertical line
+    where the cylindrical face's u-parametrization wraps). The seam is real topology but NOT a
+    visible model edge, so it must be recorded with pt_count==0 (index stays stable, nothing draws).
+    A cone adds a degenerate apex edge that must likewise be hidden. A box keeps all 12 edges."""
+    import build123d as bd
+
+    # Cylinder: edge records preserved (index stability) but the seam draws nothing.
+    cyl = bd.Cylinder(radius=10, height=20)
+    btc = tessellate_body(cyl, 1, "Cyl", (0.7, 0.7, 0.8))
+    drawn = [e for e in btc.edges if e.pt_count > 0]
+    assert len(btc.edges) == 3, f"cylinder edge records = {len(btc.edges)} (expected 3)"
+    assert len(drawn) == 2, f"cylinder DREW {len(drawn)} edges (expected 2 rims, seam hidden)"
+    # The two drawn edges are the circular rims (curve_type 1 == circle).
+    assert all(e.curve_type == 1 for e in drawn), "drawn cylinder edges must be the circular rims"
+
+    # Cone: base circle drawn; seam + degenerate apex hidden.
+    cone = bd.Cone(bottom_radius=10, top_radius=0, height=20)
+    btk = tessellate_body(cone, 1, "Cone", (0.7, 0.7, 0.8))
+    drawn_k = [e for e in btk.edges if e.pt_count > 0]
+    assert len(drawn_k) == 1, f"cone DREW {len(drawn_k)} edges (expected 1 base circle)"
+
+    # Box: a non-periodic solid keeps every edge — the filter must not touch real model edges.
+    box = bd.Box(10, 20, 30)
+    btb = tessellate_body(box, 1, "Box", (0.7, 0.7, 0.8))
+    drawn_b = [e for e in btb.edges if e.pt_count > 0]
+    assert len(drawn_b) == 12, f"box DREW {len(drawn_b)} edges (expected all 12)"
+
+    print(f"test_seam_edges_not_drawn: PASS  (cyl {len(drawn)}/3, cone {len(drawn_k)}/3, "
+          f"box {len(drawn_b)}/12 drawn)")
+
+
+# ---------------------------------------------------------------------------
 # Test 8: verify existing schema fixture suite still passes (regression)
 # ---------------------------------------------------------------------------
 def test_schema_fixtures() -> None:
@@ -346,6 +383,7 @@ def main() -> None:
     test_overlay_chunks()
     test_write_file()
     test_unknown_chunk_skip()
+    test_seam_edges_not_drawn()
     test_schema_fixtures()
     print("\nAll tests passed.")
 

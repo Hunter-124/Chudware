@@ -104,6 +104,13 @@ class CompileResult:
     # not repopulate the side-channel, so callers that need this should compile with a fresh cache
     # (see engine.doc.export2d.flat_pattern_for_session).
     sheet_metal_flat: dict[str, Any] = field(default_factory=dict)
+    # Displayable reference geometry: datum axis/plane/point/csys features produce no body, so they
+    # never reach the AICM. Each entry surfaces the resolved geometry so the host can DRAW the
+    # created datum as a reference overlay (C++ parity: document.cpp CompileResult.datums). Shapes:
+    #   axis  -> {id,name,kind:"axis",  point:[3], dir:[3]}
+    #   plane -> {id,name,kind:"plane", origin:[3], x_dir:[3], y_dir:[3], normal:[3]}  (csys: kind="csys")
+    #   point -> {id,name,kind:"point", point:[3]}
+    display_datums: list[dict] = field(default_factory=list)
     # CONFIG version bump — the configuration this rebuild compiled (the active config's name, or
     # "Default" when the document carries no configurations). Pure echo; absent-config docs report
     # "Default" and are otherwise unchanged.
@@ -154,6 +161,30 @@ class CompileCache:
 
 def _canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _serialize_datum_geo(d: Any) -> dict | None:
+    """Resolve a :class:`Datum`'s build123d carrier into a plain geometry dict for the host to draw.
+
+    axis -> {point, dir}; plane/csys -> {origin, x_dir, y_dir, normal}; point -> {point}. Returns
+    None for a missing datum or any extraction failure (the datum is then simply not drawn).
+    """
+    if d is None:
+        return None
+    try:
+        kind, obj = d.kind, d.obj
+        if kind == "axis":
+            p, dr = obj.position, obj.direction
+            return {"kind": "axis", "point": [p.X, p.Y, p.Z], "dir": [dr.X, dr.Y, dr.Z]}
+        if kind in ("plane", "csys"):
+            o, x, y, z = obj.origin, obj.x_dir, obj.y_dir, obj.z_dir
+            return {"kind": kind, "origin": [o.X, o.Y, o.Z], "x_dir": [x.X, x.Y, x.Z],
+                    "y_dir": [y.X, y.Y, y.Z], "normal": [z.X, z.Y, z.Z]}
+        if kind == "point":
+            return {"kind": "point", "point": [obj.X, obj.Y, obj.Z]}
+    except Exception:  # noqa: BLE001 — never let a display extraction break the rebuild
+        return None
+    return None
 
 
 def _feature_env_subset(feat: dict, env: dict[str, float]) -> dict[str, float]:
@@ -666,5 +697,18 @@ def compile_document(doc: dict, cache: CompileCache | None = None) -> CompileRes
     smf = datums.get("_sheet_metal_flat")
     if smf is not None and isinstance(getattr(smf, "obj", None), dict):
         result.sheet_metal_flat = smf.obj
+
+    # --- displayable reference geometry (datum axis/plane/point/csys) ---------
+    # Datums build no body, so they never reach the AICM. Surface each resolved datum's geometry so
+    # the host can draw it as a reference overlay. A feature that errored has no entry in `datums`.
+    for feat in features:
+        if feat.get("type") not in ("axis", "plane", "point", "csys"):
+            continue
+        geo = _serialize_datum_geo(datums.get(feat.get("id")))
+        if geo is None:
+            continue
+        geo["id"] = feat.get("id")
+        geo["name"] = feat.get("name", feat.get("id"))
+        result.display_datums.append(geo)
 
     return result

@@ -330,6 +330,54 @@ def _resolve_face_owner(session: "docsess.DocSession", body_id: int, topo_id: in
     return bo, info, owner
 
 
+def _result_is_degenerate(result) -> bool:
+    """True if a rebuilt *result* carries no real geometry to keep.
+
+    A push-pull value can drive the geometry to nothing without raising — e.g. a hole/cut whose
+    bore grows past the stock so the boolean removes ALL material. The cut "succeeds" but yields an
+    empty COMPOUND (zero faces, zero solids) rather than a FeatureError, and committing that poisons
+    the session: the next face/body resolve sees ``(1..0)`` and the user gets "body_id out of range".
+    We treat "no body has any face" as degenerate so the caller can roll back instead of committing
+    it. (A multi-body edit that collapses only one body still has faces elsewhere, so it is kept.)
+    """
+    bodies = list(getattr(result, "bodies", []) or [])
+    if not bodies:
+        return True
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopExp import TopExp
+    from OCP.TopTools import TopTools_IndexedMapOfShape
+    for b in bodies:
+        try:
+            shp = b.shape.wrapped if hasattr(b.shape, "wrapped") else b.shape
+            if shp is None or shp.IsNull():
+                continue
+            fmap = TopTools_IndexedMapOfShape()
+            TopExp.MapShapes_s(shp, TopAbs_FACE, fmap)
+            if fmap.Size() > 0:
+                return False
+        except Exception:  # noqa: BLE001 — a body we can't inspect counts as no geometry
+            continue
+    return True
+
+
+def _rollback_edit(session: "docsess.DocSession", pre_doc_snapshot: str, commit: bool,
+                   emit, owner_fid: str, ftype: str, reason: str) -> dict:
+    """Restore the pre-edit doc + rebuild, returning the ``draggable:false`` response.
+
+    Shared by both failure paths (a rebuild that raises, and one that silently collapses the body):
+    every push-pull failure must leave the document EXACTLY as it was before the drag tick."""
+    session.doc = json.loads(pre_doc_snapshot)
+    session.revision += 1
+    if commit and session.undo_stack and session.undo_stack[-1] == pre_doc_snapshot:
+        session.undo_stack.pop()
+    session.last_result = None
+    rb = docsess.rebuild(session, emit=emit)
+    out = {"ok": True, "draggable": False, "reason": reason,
+           "feature_id": owner_fid, "feature_type": ftype}
+    out.update(rb)
+    return out
+
+
 def push_pull(session: "docsess.DocSession", body_id: int, topo_id: int,
               distance: float, commit: bool = False,
               emit=None) -> dict:
@@ -398,17 +446,17 @@ def push_pull(session: "docsess.DocSession", body_id: int, topo_id: int,
         result = docsess._rebuild(session, emit)
     except Exception as exc:  # noqa: BLE001 — never corrupt the doc on a degenerate rebuild
         # Roll the document fully back (and undo the snapshot/revision side effects).
-        session.doc = json.loads(pre_doc_snapshot)
-        session.revision += 1
-        if commit and session.undo_stack and session.undo_stack[-1] == pre_doc_snapshot:
-            session.undo_stack.pop()
-        session.last_result = None
-        rb = docsess.rebuild(session, emit=emit)
-        out = {"ok": True, "draggable": False,
-               "reason": f"rebuild failed for the new value: {exc}",
-               "feature_id": owner_fid, "feature_type": ftype}
-        out.update(rb)
-        return out
+        return _rollback_edit(session, pre_doc_snapshot, commit, emit, owner_fid, ftype,
+                              f"rebuild failed for the new value: {exc}")
+
+    # A rebuild can SUCCEED yet leave nothing to keep — e.g. dragging a bore past the stock so the
+    # cut removes all material, yielding an empty compound (zero faces) the compiler reports as ok.
+    # Committing that poisons the session (the next resolve sees "body_id 1 out of range (1..0)"),
+    # so roll back exactly like a raising rebuild: the body stays at its last valid size.
+    if _result_is_degenerate(result):
+        return _rollback_edit(session, pre_doc_snapshot, commit, emit, owner_fid, ftype,
+                              "the new value removes all material (the body would vanish) — "
+                              "drag limited to the last valid size")
 
     # A feature that errors out (e.g. cut removes no material at the new value) leaves the body
     # unchanged but is still a *contained* error — surface it but treat as a successful edit so the

@@ -25,6 +25,8 @@ GATES = [
     # ---- doc engine: curated parity corpora -------------------------------
     ("doc",    "cpp_session_parity",      "noarg"),
     ("doc",    "cpp_eval_parity",         "dll"),
+    ("doc",    "cpp_export_parity",       "dll"),
+    ("doc",    "cpp_drawing_parity",      "dll"),
     ("doc",    "cpp_sketch_parity",       "dll"),
     ("doc",    "cpp_weld_parity",         "dll"),
     ("doc",    "cpp_simbridge_parity",    "dll"),

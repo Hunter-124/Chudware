@@ -108,12 +108,25 @@ def make_wordmark(height=200, cad_color=WHITE):
     return img.resize((target_w, target_h), Image.LANCZOS)
 
 
+def make_ico(path):
+    """Windows .ico embedded in the exe (File Explorer / taskbar icon).
+
+    Each size is rendered natively rather than downsampled from one bitmap so the
+    small entries (16/24/32) keep crisp rounded-corner + cube edges.
+    """
+    sizes = [256, 128, 64, 48, 32, 24, 16]
+    imgs = [make_tile(s, with_spark=(s >= 32)) for s in sizes]
+    imgs[0].save(path, format="ICO", sizes=[(s, s) for s in sizes],
+                 append_images=imgs[1:])
+
+
 def main():
     make_tile(256).save(HERE / "logo_icon.png")
     make_tile(48).save(HERE / "logo_window.png")
     make_wordmark(200).save(HERE / "logo_wordmark.png")              # dark theme (white "-CAD")
     make_wordmark(200, cad_color=SLATE).save(HERE / "logo_wordmark_dark.png")  # light theme (slate "-CAD")
-    print("wrote logo_icon.png, logo_window.png, logo_wordmark.png, logo_wordmark_dark.png to", HERE)
+    make_ico(HERE / "app.ico")
+    print("wrote logo_icon.png, logo_window.png, logo_wordmark.png, logo_wordmark_dark.png, app.ico to", HERE)
 
 
 if __name__ == "__main__":

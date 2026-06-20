@@ -24,6 +24,8 @@ CONTRACT_NAMES: list[str] = [
     "csys", "origin", "equations", "material", "mates_folder", "body_folder",
     "history", "rollback", "error_badge", "warning_badge", "ok_badge",
     "suppressed",
+    "box_feature", "cylinder_feature", "sphere_feature", "cone_feature",
+    "torus_feature",
     # Features tab
     "extrude_boss", "extrude_cut", "revolve_boss", "revolve_cut", "sweep",
     "sweep_cut", "loft", "loft_cut", "boundary", "fillet", "chamfer",
@@ -190,6 +192,68 @@ def diagonal_box(d, x0, y0, x1, y1, stroke, lw):
     d.line([(x0, y0), (x1, y1)], fill=stroke, width=lw)
     d.line([(x1, y0), (x0, y1)], fill=stroke, width=lw)
 
+
+def _rgba(c, a):
+    return (c[0], c[1], c[2], a)
+
+
+def shaded_prism(d, s, x, y, w, h, dx, dy, p, accent=False, cut=False):
+    """Small isometric solid with distinct top/front/side faces."""
+    lw = max(1, int(1.6 * SS))
+    base = p.accent if accent else p.stroke
+    err = p.err if cut else base
+    top = [(x, y), (x + dx, y - dy), (x + w + dx, y - dy), (x + w, y)]
+    side = [(x + w, y), (x + w + dx, y - dy), (x + w + dx, y + h - dy), (x + w, y + h)]
+    front = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+    d.polygon(front, fill=_rgba(base, 36 if not cut else 18))
+    d.polygon(top, fill=_rgba(p.accent, 72 if not cut else 26))
+    d.polygon(side, fill=_rgba(base, 54 if not cut else 22))
+    for pts, col in [(front, err), (top, err if cut else p.accent), (side, err)]:
+        d.line(pts + [pts[0]], fill=col, width=lw)
+    d.line([(x + dx, y - dy), (x + dx, y + h - dy)], fill=_rgba(base, 105), width=max(1, lw // 2))
+
+
+def shaded_cylinder(d, s, cx, cy, w, h, p, accent=False):
+    lw = max(1, int(1.6 * SS))
+    col = p.accent if accent else p.stroke
+    fill = _rgba(col, 46)
+    top = [cx - w / 2, cy - h / 2, cx + w / 2, cy - h / 2 + w * 0.34]
+    bot = [cx - w / 2, cy + h / 2 - w * 0.34, cx + w / 2, cy + h / 2]
+    d.rectangle([cx - w / 2, cy - h / 2 + w * 0.17, cx + w / 2, cy + h / 2 - w * 0.17],
+                fill=fill)
+    d.ellipse(top, fill=_rgba(p.accent, 60), outline=col, width=lw)
+    d.line([(cx - w / 2, cy - h / 2 + w * 0.17), (cx - w / 2, cy + h / 2 - w * 0.17)],
+           fill=col, width=lw)
+    d.line([(cx + w / 2, cy - h / 2 + w * 0.17), (cx + w / 2, cy + h / 2 - w * 0.17)],
+           fill=col, width=lw)
+    d.arc(bot, start=0, end=180, fill=_rgba(col, 150), width=lw)
+    d.arc(bot, start=180, end=360, fill=col, width=lw)
+
+
+def draw_pencil(d, s, p, x0, y0, x1, y1, width):
+    """Detailed diagonal pencil with wood tip and eraser."""
+    lw = max(1, int(1.4 * SS))
+    dx, dy = x1 - x0, y1 - y0
+    ang = math.atan2(dy, dx)
+    nx, ny = -math.sin(ang), math.cos(ang)
+    tip_len = width * 2.3
+    er_len = width * 1.35
+    bx0, by0 = x0 + math.cos(ang) * er_len, y0 + math.sin(ang) * er_len
+    tx0, ty0 = x1 - math.cos(ang) * tip_len, y1 - math.sin(ang) * tip_len
+    body = [(bx0 + nx*width, by0 + ny*width), (tx0 + nx*width, ty0 + ny*width),
+            (tx0 - nx*width, ty0 - ny*width), (bx0 - nx*width, by0 - ny*width)]
+    eraser = [(x0 + nx*width, y0 + ny*width), (bx0 + nx*width, by0 + ny*width),
+              (bx0 - nx*width, by0 - ny*width), (x0 - nx*width, y0 - ny*width)]
+    tip = [(tx0 + nx*width, ty0 + ny*width), (x1, y1), (tx0 - nx*width, ty0 - ny*width)]
+    d.polygon(body, fill=_rgba(p.accent, 95))
+    d.line(body + [body[0]], fill=p.accent, width=lw)
+    d.line([(bx0, by0), (tx0, ty0)], fill=_rgba(p.stroke, 155), width=max(1, lw // 2))
+    d.polygon(eraser, fill=_rgba(p.warn, 150))
+    d.line(eraser + [eraser[0]], fill=p.stroke, width=lw)
+    d.polygon(tip, fill=_rgba(p.stroke, 50))
+    d.line(tip + [tip[0]], fill=p.stroke, width=lw)
+    filled_circle(d, x1, y1, max(1, lw // 2), p.stroke)
+
 # ---------------------------------------------------------------------------
 # Draw functions — one per icon name.
 # Each receives: d (ImageDraw on SS*cell canvas), cell (target px), palette
@@ -224,16 +288,11 @@ def draw_app(d, cell, p):
 
 @icon("part")
 def draw_part(d, cell, p):
-    """Solid extrusion outline: rounded rect with depth lines."""
+    """Shaded generic solid body."""
     s = cell * SS
-    lw = stroke_width(cell)
-    m = s * 0.15
-    d.rounded_rectangle([m, m*1.5, s-m, s-m], radius=int(s*0.08),
-                         outline=p.stroke, width=lw)
-    # depth tab top-right
-    offset = s * 0.12
-    d.line([(s-m, m*1.5), (s-m+offset, m*1.2)], fill=p.accent, width=lw)
-    d.line([(s-m+offset, m*1.2), (s-m+offset, s-m-offset)], fill=p.accent, width=lw)
+    shaded_prism(d, s, s*0.20, s*0.34, s*0.47, s*0.37, s*0.15, s*0.11, p, accent=True)
+    d.line([(s*0.25, s*0.50), (s*0.62, s*0.50)], fill=_rgba(p.stroke, 120),
+           width=max(1, stroke_width(cell)//2))
 
 @icon("assembly")
 def draw_assembly(d, cell, p):
@@ -252,13 +311,17 @@ def draw_assembly(d, cell, p):
 
 @icon("sketch_node")
 def draw_sketch_node(d, cell, p):
-    """Pencil on a grid square."""
+    """Professional pencil on a sketch plane."""
     s = cell * SS
     lw = stroke_width(cell)
-    m = s * 0.14
-    d.rectangle([m, m, s-m, s-m], outline=p.stroke, width=lw)
-    # pencil line diagonal
-    d.line([(m*1.5, s-m*1.5), (s-m*1.5, m*1.5)], fill=p.accent, width=lw*2)
+    pts = [(s*0.14, s*0.65), (s*0.42, s*0.28), (s*0.88, s*0.38), (s*0.60, s*0.76)]
+    d.polygon(pts, fill=_rgba(p.stroke, 20))
+    d.line(pts + [pts[0]], fill=p.stroke, width=lw)
+    for t in [0.34, 0.50, 0.66]:
+        d.line([(s*(0.14 + (0.88-0.14)*t), s*(0.65 + (0.38-0.65)*t)),
+                (s*(0.42 + (0.60-0.42)*t), s*(0.28 + (0.76-0.28)*t))],
+               fill=_rgba(p.stroke, 75), width=max(1, lw//2))
+    draw_pencil(d, s, p, s*0.20, s*0.78, s*0.82, s*0.18, s*0.045)
 
 @icon("plane")
 def draw_plane(d, cell, p):
@@ -421,187 +484,311 @@ def draw_suppressed(d, cell, p):
     # diagonal strikethrough
     d.line([(s*0.15, s*0.25), (s*0.85, s*0.75)], fill=p.warn, width=lw)
 
+@icon("box_feature")
+def draw_box_feature(d, cell, p):
+    s = cell * SS
+    shaded_prism(d, s, s*0.19, s*0.36, s*0.48, s*0.36, s*0.17, s*0.13, p, accent=True)
+
+@icon("cylinder_feature")
+def draw_cylinder_feature(d, cell, p):
+    s = cell * SS
+    shaded_cylinder(d, s, s*0.50, s*0.54, s*0.48, s*0.58, p, accent=True)
+
+@icon("sphere_feature")
+def draw_sphere_feature(d, cell, p):
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx, cy, r = s*0.50, s*0.52, s*0.31
+    d.ellipse([cx-r, cy-r, cx+r, cy+r], fill=_rgba(p.accent, 54), outline=p.stroke, width=lw)
+    d.arc([cx-r*0.70, cy-r, cx+r*0.70, cy+r], start=90, end=270, fill=_rgba(p.stroke, 130), width=lw)
+    d.arc([cx-r*0.70, cy-r, cx+r*0.70, cy+r], start=270, end=90, fill=p.accent, width=lw)
+    d.arc([cx-r, cy-r*0.42, cx+r, cy+r*0.42], start=0, end=360, fill=_rgba(p.stroke, 120), width=lw)
+    filled_circle(d, cx-r*0.35, cy-r*0.35, lw, _rgba((255, 255, 255), 155))
+
+@icon("cone_feature")
+def draw_cone_feature(d, cell, p):
+    s = cell * SS
+    lw = stroke_width(cell)
+    apex = (s*0.50, s*0.16)
+    left = (s*0.26, s*0.72)
+    right = (s*0.74, s*0.72)
+    d.polygon([apex, right, left], fill=_rgba(p.accent, 45))
+    d.line([apex, right], fill=p.stroke, width=lw)
+    d.line([apex, left], fill=p.stroke, width=lw)
+    d.ellipse([s*0.26, s*0.62, s*0.74, s*0.82], fill=_rgba(p.stroke, 28), outline=p.accent, width=lw)
+
+@icon("torus_feature")
+def draw_torus_feature(d, cell, p):
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.ellipse([s*0.15, s*0.28, s*0.85, s*0.72], fill=_rgba(p.accent, 45), outline=p.stroke, width=lw*2)
+    d.ellipse([s*0.34, s*0.39, s*0.66, s*0.61], fill=(0, 0, 0, 0), outline=p.accent, width=lw*2)
+    d.arc([s*0.18, s*0.30, s*0.82, s*0.70], start=15, end=165, fill=_rgba((255,255,255), 130), width=lw)
+
 # ---- Features tab ----
 
 @icon("extrude_boss")
 def draw_extrude_boss(d, cell, p):
-    """Profile square with up-arrow (add material)."""
+    """Mini preview: sketched profile pulled into a solid boss."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.rectangle([s*0.2, s*0.55, s*0.8, s*0.82], outline=p.stroke, width=lw)
-    arrow(d, s/2, s*0.55, s/2, s*0.12, p.accent, lw)
+    shaded_prism(d, s, s*0.24, s*0.40, s*0.42, s*0.33, s*0.16, s*0.13, p, accent=True)
+    d.rounded_rectangle([s*0.20, s*0.70, s*0.62, s*0.84], radius=int(s*0.035),
+                         outline=p.stroke, width=lw)
+    arrow(d, s*0.43, s*0.67, s*0.43, s*0.18, p.accent, lw)
+    plus_sign(d, s*0.74, s*0.26, s*0.08, p.accent, lw)
 
 @icon("extrude_cut")
 def draw_extrude_cut(d, cell, p):
-    """Profile square with down-arrow (remove material)."""
+    """Mini preview: red cut profile passing through a solid block."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.rectangle([s*0.2, s*0.18, s*0.8, s*0.48], outline=p.stroke, width=lw)
-    arrow(d, s/2, s*0.48, s/2, s*0.85, p.err, lw)
+    shaded_prism(d, s, s*0.18, s*0.38, s*0.50, s*0.36, s*0.16, s*0.12, p)
+    d.rounded_rectangle([s*0.42, s*0.30, s*0.62, s*0.62], radius=int(s*0.04),
+                         outline=p.err, width=lw)
+    d.line([(s*0.52, s*0.18), (s*0.52, s*0.78)], fill=p.err, width=lw)
+    arrow(d, s*0.52, s*0.20, s*0.52, s*0.78, p.err, lw)
+    x_sign(d, s*0.77, s*0.28, s*0.07, p.err, lw)
 
 @icon("revolve_boss")
 def draw_revolve_boss(d, cell, p):
-    """Half profile + revolution arc."""
+    """Lathe-style revolved boss preview."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.line([(s*0.5, s*0.15), (s*0.5, s*0.85)], fill=p.accent, width=lw)  # axis
-    d.rectangle([s*0.52, s*0.3, s*0.80, s*0.70], outline=p.stroke, width=lw)
-    arc_segment(d, s*0.5, s*0.5, s*0.35, 270, 90, p.stroke, lw)
+    shaded_cylinder(d, s, s*0.55, s*0.54, s*0.42, s*0.55, p, accent=True)
+    d.line([(s*0.27, s*0.14), (s*0.27, s*0.86)], fill=p.accent, width=lw)
+    polyline(d, [(s*0.31, s*0.34), (s*0.46, s*0.34), (s*0.46, s*0.70), (s*0.31, s*0.70)],
+             p.stroke, lw)
+    arc_segment(d, s*0.27, s*0.52, s*0.32, 275, 85, p.accent, lw)
 
 @icon("revolve_cut")
 def draw_revolve_cut(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
-    d.line([(s*0.5, s*0.15), (s*0.5, s*0.85)], fill=p.accent, width=lw)
-    d.rectangle([s*0.52, s*0.3, s*0.80, s*0.70], outline=p.err, width=lw)
-    arc_segment(d, s*0.5, s*0.5, s*0.35, 270, 90, p.err, lw)
+    shaded_cylinder(d, s, s*0.54, s*0.54, s*0.43, s*0.55, p)
+    d.line([(s*0.28, s*0.14), (s*0.28, s*0.86)], fill=p.accent, width=lw)
+    d.polygon([(s*0.36, s*0.35), (s*0.54, s*0.44), (s*0.54, s*0.64), (s*0.36, s*0.73)],
+              fill=_rgba(p.err, 28))
+    d.line([(s*0.36, s*0.35), (s*0.54, s*0.44), (s*0.54, s*0.64), (s*0.36, s*0.73),
+            (s*0.36, s*0.35)], fill=p.err, width=lw)
+    arc_segment(d, s*0.28, s*0.52, s*0.32, 275, 85, p.err, lw)
 
 @icon("sweep")
 def draw_sweep(d, cell, p):
-    """Profile following a curved path."""
+    """Shaded tube swept along a curved path."""
     s = cell * SS
     lw = stroke_width(cell)
-    # path curve
-    d.arc([s*0.1, s*0.1, s*0.9, s*0.9], start=200, end=340, fill=p.accent, width=lw)
-    # profile rect at start
-    d.rectangle([s*0.12, s*0.42, s*0.32, s*0.62], outline=p.stroke, width=lw)
+    pts = []
+    p0, p1, p2, p3 = (s*0.17, s*0.66), (s*0.30, s*0.18), (s*0.73, s*0.18), (s*0.83, s*0.58)
+    for i in range(28):
+        t = i / 27.0
+        mt = 1.0 - t
+        x = mt**3*p0[0] + 3*mt*mt*t*p1[0] + 3*mt*t*t*p2[0] + t**3*p3[0]
+        y = mt**3*p0[1] + 3*mt*mt*t*p1[1] + 3*mt*t*t*p2[1] + t**3*p3[1]
+        pts.append((x, y))
+    polyline(d, pts, _rgba(p.stroke, 88), lw*6)
+    polyline(d, pts, _rgba(p.accent, 120), lw*5)
+    polyline(d, pts, p.accent, lw*3)
+    polyline(d, [(x, y - s*0.055) for x, y in pts[5:22]], _rgba((255,255,255), 105), max(1, lw))
+    d.ellipse([s*0.08, s*0.55, s*0.31, s*0.77], fill=_rgba(p.stroke, 46),
+              outline=p.stroke, width=lw)
+    d.ellipse([s*0.70, s*0.47, s*0.93, s*0.69], fill=_rgba(p.accent, 54),
+              outline=p.accent, width=lw)
+    circle(d, s*0.195, s*0.66, s*0.048, fill=p.stroke)
+    circle(d, s*0.815, s*0.58, s*0.048, fill=p.accent)
 
 @icon("sweep_cut")
 def draw_sweep_cut(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
-    d.arc([s*0.1, s*0.1, s*0.9, s*0.9], start=200, end=340, fill=p.err, width=lw)
-    d.rectangle([s*0.12, s*0.42, s*0.32, s*0.62], outline=p.err, width=lw)
+    shaded_prism(d, s, s*0.18, s*0.42, s*0.47, s*0.30, s*0.15, s*0.10, p)
+    pts = []
+    p0, p1, p2, p3 = (s*0.15, s*0.30), (s*0.31, s*0.13), (s*0.68, s*0.17), (s*0.82, s*0.42)
+    for i in range(24):
+        t = i / 23.0
+        mt = 1.0 - t
+        x = mt**3*p0[0] + 3*mt*mt*t*p1[0] + 3*mt*t*t*p2[0] + t**3*p3[0]
+        y = mt**3*p0[1] + 3*mt*mt*t*p1[1] + 3*mt*t*t*p2[1] + t**3*p3[1]
+        pts.append((x, y))
+    polyline(d, pts, _rgba(p.err, 78), lw*5)
+    polyline(d, pts, p.err, lw*3)
+    d.ellipse([s*0.07, s*0.22, s*0.27, s*0.39], fill=_rgba(p.err, 28),
+              outline=p.err, width=lw)
+    d.ellipse([s*0.72, s*0.34, s*0.92, s*0.51], fill=_rgba(p.err, 28),
+              outline=p.err, width=lw)
+    x_sign(d, s*0.79, s*0.25, s*0.065, p.err, lw)
 
 @icon("loft")
 def draw_loft(d, cell, p):
-    """Two profiles connected with transition lines."""
+    """Shaded lofted body between a round and rectangular profile."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.rectangle([s*0.55, s*0.55, s*0.85, s*0.80], outline=p.stroke, width=lw)
-    circle(d, s*0.3, s*0.32, s*0.14, outline=p.stroke, lw=lw)
-    d.line([(s*0.44, s*0.32), (s*0.55, s*0.55)], fill=p.accent, width=lw)
-    d.line([(s*0.44, s*0.35), (s*0.55, s*0.80)], fill=p.accent, width=lw)
+    front = [s*0.10, s*0.38, s*0.43, s*0.75]
+    rear = [s*0.55, s*0.22, s*0.92, s*0.70]
+    # silhouette and shaded loft faces
+    d.polygon([(front[0]+s*0.14, front[1]), (rear[0], rear[1]),
+               (rear[2], rear[1]+s*0.05), (front[2], front[1]+s*0.09),
+               (front[2], front[3]-s*0.08), (rear[2], rear[3]-s*0.04),
+               (rear[0], rear[3]), (front[0]+s*0.12, front[3])],
+              fill=_rgba(p.stroke, 44))
+    d.polygon([(front[0]+s*0.14, front[1]), (rear[0], rear[1]),
+               (rear[2], rear[1]+s*0.05), (front[2], front[1]+s*0.09)],
+              fill=_rgba(p.accent, 72))
+    d.polygon([(front[2], front[1]+s*0.09), (rear[2], rear[1]+s*0.05),
+               (rear[2], rear[3]-s*0.04), (front[2], front[3]-s*0.08)],
+              fill=_rgba(p.accent, 44))
+    d.polygon([(front[0]+s*0.12, front[3]), (rear[0], rear[3]),
+               (rear[2], rear[3]-s*0.04), (front[2], front[3]-s*0.08)],
+              fill=_rgba(p.stroke, 58))
+    # profile rims
+    d.rounded_rectangle(rear, radius=int(s*0.035), outline=p.accent, width=lw)
+    d.ellipse(front, fill=_rgba(p.stroke, 24), outline=p.stroke, width=lw)
+    d.arc(front, start=286, end=74, fill=p.accent, width=lw)
+    # guide edges stay sparse so the icon reads at 20 px too
+    d.line([(front[0]+s*0.14, front[1]), (rear[0], rear[1])], fill=p.accent, width=lw)
+    d.line([(front[2], front[1]+s*0.09), (rear[2], rear[1]+s*0.05)], fill=p.accent, width=lw)
+    d.line([(front[2], front[3]-s*0.08), (rear[2], rear[3]-s*0.04)], fill=p.stroke, width=lw)
+    d.line([(front[0]+s*0.12, front[3]), (rear[0], rear[3])], fill=p.stroke, width=lw)
 
 @icon("loft_cut")
 def draw_loft_cut(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
-    d.rectangle([s*0.55, s*0.55, s*0.85, s*0.80], outline=p.err, width=lw)
-    circle(d, s*0.3, s*0.32, s*0.14, outline=p.err, lw=lw)
-    d.line([(s*0.44, s*0.32), (s*0.55, s*0.55)], fill=p.err, width=lw)
-    d.line([(s*0.44, s*0.35), (s*0.55, s*0.80)], fill=p.err, width=lw)
+    shaded_prism(d, s, s*0.16, s*0.42, s*0.50, s*0.31, s*0.15, s*0.10, p)
+    front = [s*0.21, s*0.28, s*0.49, s*0.58]
+    rear = [s*0.54, s*0.47, s*0.84, s*0.73]
+    d.polygon([(front[0]+s*0.11, front[1]), (rear[0], rear[1]),
+               (rear[2], rear[1]+s*0.03), (front[2], front[1]+s*0.08),
+               (front[2], front[3]-s*0.06), (rear[2], rear[3]-s*0.03),
+               (rear[0], rear[3]), (front[0]+s*0.09, front[3])],
+              fill=_rgba(p.err, 42))
+    d.rounded_rectangle(rear, radius=int(s*0.025), outline=p.err, width=lw)
+    d.ellipse(front, outline=p.err, width=lw)
+    d.line([(front[0]+s*0.11, front[1]), (rear[0], rear[1])], fill=p.err, width=lw)
+    d.line([(front[2], front[1]+s*0.08), (rear[2], rear[1]+s*0.03)], fill=p.err, width=lw)
+    d.line([(front[0]+s*0.09, front[3]), (rear[0], rear[3])], fill=p.err, width=lw)
+    x_sign(d, s*0.78, s*0.27, s*0.07, p.err, lw)
 
 @icon("boundary")
 def draw_boundary(d, cell, p):
-    """Grid of boundary lines forming a patch."""
+    """Boundary surface patch with U/V guide curves."""
     s = cell * SS
     lw = stroke_width(cell)
-    for frac in [0.3, 0.5, 0.7]:
-        d.line([(s*0.15, s*frac), (s*0.85, s*frac)], fill=p.stroke, width=lw)
-        d.line([(s*frac, s*0.15), (s*frac, s*0.85)], fill=p.accent, width=lw)
+    patch = [(s*0.15, s*0.68), (s*0.36, s*0.25), (s*0.82, s*0.32), (s*0.68, s*0.78)]
+    d.polygon(patch, fill=_rgba(p.accent, 34))
+    d.line(patch + [patch[0]], fill=p.stroke, width=lw)
+    for t in [0.33, 0.56, 0.76]:
+        d.line([(s*(0.15 + (0.36-0.15)*t), s*(0.68 + (0.25-0.68)*t)),
+                (s*(0.68 + (0.82-0.68)*t), s*(0.78 + (0.32-0.78)*t))],
+               fill=_rgba(p.accent, 145), width=lw)
+        d.line([(s*(0.15 + (0.68-0.15)*t), s*(0.68 + (0.78-0.68)*t)),
+                (s*(0.36 + (0.82-0.36)*t), s*(0.25 + (0.32-0.25)*t))],
+               fill=_rgba(p.stroke, 135), width=max(1, lw//2))
 
 @icon("fillet")
 def draw_fillet(d, cell, p):
-    """Right-angle corner with rounded inner arc."""
+    """Part corner with highlighted rounded edge."""
     s = cell * SS
-    lw = stroke_width(cell) * 2
-    # two sides of corner
-    d.line([(s*0.2, s*0.8), (s*0.2, s*0.3)], fill=p.stroke, width=lw)
-    d.line([(s*0.2, s*0.8), (s*0.75, s*0.8)], fill=p.stroke, width=lw)
-    # fillet arc
-    r = s * 0.28
-    d.arc([s*0.2, s*0.8 - 2*r, s*0.2 + 2*r, s*0.8], start=180, end=270, fill=p.accent, width=lw)
+    lw = stroke_width(cell)
+    shaded_prism(d, s, s*0.20, s*0.38, s*0.48, s*0.34, s*0.15, s*0.11, p)
+    d.arc([s*0.45, s*0.31, s*0.78, s*0.63], start=265, end=360, fill=p.accent, width=lw*2)
+    d.line([(s*0.68, s*0.40), (s*0.83, s*0.29)], fill=p.accent, width=lw)
 
 @icon("chamfer")
 def draw_chamfer(d, cell, p):
-    """Right-angle corner with cut diagonal."""
+    """Part corner with highlighted beveled face."""
     s = cell * SS
-    lw = stroke_width(cell) * 2
-    d.line([(s*0.2, s*0.8), (s*0.2, s*0.45)], fill=p.stroke, width=lw)
-    d.line([(s*0.55, s*0.8), (s*0.8, s*0.8)], fill=p.stroke, width=lw)
-    d.line([(s*0.2, s*0.45), (s*0.55, s*0.80)], fill=p.accent, width=lw)
+    lw = stroke_width(cell)
+    shaded_prism(d, s, s*0.19, s*0.38, s*0.48, s*0.34, s*0.15, s*0.11, p)
+    face = [(s*0.54, s*0.31), (s*0.80, s*0.37), (s*0.66, s*0.52), (s*0.45, s*0.46)]
+    d.polygon(face, fill=_rgba(p.accent, 90))
+    d.line(face + [face[0]], fill=p.accent, width=lw)
 
 @icon("shell")
 def draw_shell(d, cell, p):
-    """Box with thin wall (hollow rectangle in rectangle)."""
+    """Hollow box with wall thickness."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.rounded_rectangle([s*0.15, s*0.15, s*0.85, s*0.85], radius=int(s*0.06),
-                         outline=p.stroke, width=lw)
-    d.rounded_rectangle([s*0.30, s*0.30, s*0.70, s*0.70], radius=int(s*0.04),
-                         outline=p.accent, width=lw)
+    shaded_prism(d, s, s*0.18, s*0.37, s*0.50, s*0.36, s*0.15, s*0.11, p)
+    d.rounded_rectangle([s*0.32, s*0.43, s*0.58, s*0.64], radius=int(s*0.035),
+                         fill=(0, 0, 0, 0), outline=p.accent, width=lw*2)
+    d.line([(s*0.58, s*0.43), (s*0.72, s*0.33)], fill=p.accent, width=lw)
+    d.line([(s*0.58, s*0.64), (s*0.72, s*0.54)], fill=p.accent, width=lw)
 
 @icon("draft")
 def draw_draft(d, cell, p):
-    """Tapered shape (trapezoid) indicating draft angle."""
+    """Shaded draft preview with tapered side face."""
     s = cell * SS
     lw = stroke_width(cell)
-    pts = [(s*0.2, s*0.75), (s*0.8, s*0.75), (s*0.65, s*0.25), (s*0.35, s*0.25)]
-    d.polygon(pts, fill=None, outline=p.stroke)
-    d.line([pts[0], pts[1], pts[2], pts[3], pts[0]], fill=p.stroke, width=lw)
-    # angle line
-    d.line([(s*0.2, s*0.75), (s*0.35, s*0.25)], fill=p.accent, width=lw)
+    base = [(s*0.25, s*0.76), (s*0.78, s*0.70), (s*0.66, s*0.29), (s*0.38, s*0.22)]
+    d.polygon(base, fill=_rgba(p.stroke, 30))
+    d.line(base + [base[0]], fill=p.stroke, width=lw)
+    face = [(s*0.38, s*0.22), (s*0.66, s*0.29), (s*0.78, s*0.70), (s*0.54, s*0.62)]
+    d.polygon(face, fill=_rgba(p.accent, 70))
+    d.line(face + [face[0]], fill=p.accent, width=lw)
+    arc_segment(d, s*0.30, s*0.75, s*0.23, 285, 340, p.warn, lw)
+    d.line([(s*0.30, s*0.75), (s*0.54, s*0.62)], fill=p.warn, width=lw)
 
 @icon("rib")
 def draw_rib(d, cell, p):
-    """T-shaped rib profile."""
+    """Support rib grown from a base plate."""
     s = cell * SS
     lw = stroke_width(cell)
-    # base
-    d.line([(s*0.1, s*0.75), (s*0.9, s*0.75)], fill=p.stroke, width=lw*2)
-    # rib stem
-    d.line([(s*0.5, s*0.75), (s*0.5, s*0.25)], fill=p.accent, width=lw*2)
+    shaded_prism(d, s, s*0.16, s*0.62, s*0.56, s*0.13, s*0.13, s*0.08, p)
+    rib = [(s*0.36, s*0.62), (s*0.58, s*0.62), (s*0.47, s*0.23)]
+    d.polygon(rib, fill=_rgba(p.accent, 78))
+    d.line(rib + [rib[0]], fill=p.accent, width=lw)
+    d.line([(s*0.47, s*0.23), (s*0.58, s*0.62)], fill=p.stroke, width=max(1, lw//2))
 
 @icon("hole_wizard")
 def draw_hole_wizard(d, cell, p):
-    """Circle with depth lines — a drilled hole."""
+    """Solid plate with a drilled counterbore."""
     s = cell * SS
     lw = stroke_width(cell)
-    cx, cy = s/2, s*0.42
-    r = s * 0.28
-    circle(d, cx, cy, r, outline=p.stroke, lw=lw)
-    d.line([(cx - r*0.6, cy + r*0.8), (cx + r*0.6, cy + r*0.8)], fill=p.stroke, width=lw)
-    arrow(d, cx, cy + r, cx, cy + r + s*0.22, p.accent, lw)  # depth arrow
+    shaded_prism(d, s, s*0.18, s*0.43, s*0.52, s*0.28, s*0.15, s*0.10, p)
+    d.ellipse([s*0.36, s*0.33, s*0.58, s*0.47], fill=(0, 0, 0, 0), outline=p.accent, width=lw*2)
+    d.ellipse([s*0.42, s*0.37, s*0.52, s*0.43], fill=_rgba(p.stroke, 90), outline=p.stroke, width=lw)
+    arrow(d, s*0.47, s*0.18, s*0.47, s*0.34, p.accent, lw)
 
 @icon("linear_pattern")
 def draw_linear_pattern(d, cell, p):
-    """Row of three squares."""
+    """Three patterned mini bodies along a direction arrow."""
     s = cell * SS
     lw = stroke_width(cell)
-    sz = s * 0.20
     for i in range(3):
-        x = s*(0.15 + i*0.28)
-        d.rectangle([x, s*0.40, x+sz, s*0.60], outline=p.stroke if i > 0 else p.accent, width=lw)
-    arrow(d, s*0.2, s*0.72, s*0.8, s*0.72, p.accent, lw)
+        x = s*(0.14 + i*0.25)
+        shaded_prism(d, s, x, s*0.45, s*0.13, s*0.12, s*0.05, s*0.04, p, accent=(i == 0))
+    arrow(d, s*0.18, s*0.78, s*0.82, s*0.78, p.accent, lw)
+    d.line([(s*0.14, s*0.34), (s*0.76, s*0.34)], fill=_rgba(p.stroke, 105), width=max(1, lw//2))
 
 @icon("circular_pattern")
 def draw_circular_pattern(d, cell, p):
-    """Five dots around a ring."""
+    """Bodies repeated around an axis."""
     s = cell * SS
     lw = stroke_width(cell)
     cx, cy = s/2, s/2
     ring_r = s * 0.30
-    dot_r  = s * 0.07
-    for i in range(5):
-        angle = math.radians(-90 + i * 72)
+    circle(d, cx, cy, ring_r, outline=_rgba(p.stroke, 130), lw=lw)
+    for i in range(6):
+        angle = math.radians(-90 + i * 60)
         dx = cx + ring_r * math.cos(angle)
         dy = cy + ring_r * math.sin(angle)
-        col = p.accent if i == 0 else p.stroke
-        filled_circle(d, dx, dy, dot_r, col)
-    circle(d, cx, cy, ring_r, outline=p.stroke, lw=lw)
+        d.rounded_rectangle([dx-s*0.045, dy-s*0.045, dx+s*0.045, dy+s*0.045],
+                             radius=int(s*0.015), fill=_rgba(p.accent if i == 0 else p.stroke, 70),
+                             outline=p.accent if i == 0 else p.stroke, width=lw)
+    arrow(d, cx + ring_r*0.55, cy - ring_r*0.78, cx + ring_r*0.82, cy - ring_r*0.28, p.accent, lw)
 
 @icon("mirror")
 def draw_mirror(d, cell, p):
-    """Two mirrored L-shapes."""
+    """Mirrored solid feature across a reference plane."""
     s = cell * SS
     lw = stroke_width(cell)
-    # mirror line
-    d.line([(s*0.5, s*0.1), (s*0.5, s*0.9)], fill=p.accent, width=lw)
-    # left shape
-    polyline(d, [(s*0.2, s*0.3), (s*0.4, s*0.3), (s*0.4, s*0.7)], p.stroke, lw)
-    # right mirrored
-    polyline(d, [(s*0.8, s*0.3), (s*0.6, s*0.3), (s*0.6, s*0.7)], p.stroke, lw)
+    plane = [(s*0.48, s*0.12), (s*0.54, s*0.16), (s*0.54, s*0.88), (s*0.48, s*0.84)]
+    d.polygon(plane, fill=_rgba(p.accent, 45))
+    d.line(plane + [plane[0]], fill=p.accent, width=lw)
+    shaded_prism(d, s, s*0.17, s*0.42, s*0.17, s*0.20, s*0.06, s*0.05, p)
+    shaded_prism(d, s, s*0.63, s*0.42, s*0.17, s*0.20, s*0.06, s*0.05, p, accent=True)
+    d.line([(s*0.39, s*0.52), (s*0.61, s*0.52)], fill=_rgba(p.stroke, 120), width=max(1, lw//2))
 
 @icon("ref_plane")
 def draw_ref_plane(d, cell, p):
@@ -614,187 +801,209 @@ def draw_ref_plane(d, cell, p):
 
 @icon("ref_axis")
 def draw_ref_axis(d, cell, p):
-    """Dashed reference axis."""
+    """Reference axis through two circular handles."""
     s = cell * SS
     lw = stroke_width(cell)
-    # dashed line (alternate segments)
-    segs = 5
-    for i in range(segs):
-        t0 = i / segs
-        t1 = (i + 0.6) / segs
-        y0 = s*0.1 + (s*0.8) * t0
-        y1 = s*0.1 + (s*0.8) * t1
-        col = p.accent if i % 2 == 0 else (p.accent[0], p.accent[1], p.accent[2], 80)
-        d.line([(s*0.5, y0), (s*0.5, y1)], fill=col, width=lw)
+    x0, y0 = s*0.25, s*0.78
+    x1, y1 = s*0.76, s*0.20
+    for i in range(6):
+        t0 = i / 6.0
+        t1 = min(1.0, t0 + 0.10)
+        d.line([(x0 + (x1-x0)*t0, y0 + (y1-y0)*t0),
+                (x0 + (x1-x0)*t1, y0 + (y1-y0)*t1)],
+               fill=p.accent, width=lw)
+    circle(d, x0, y0, s*0.10, outline=p.stroke, lw=lw)
+    circle(d, x1, y1, s*0.10, outline=p.stroke, lw=lw)
+    arrow(d, s*0.38, s*0.64, s*0.61, s*0.38, p.accent, lw)
 
 @icon("ref_point")
 def draw_ref_point(d, cell, p):
-    """Small diamond (reference point)."""
+    """Reference point with target crosshair."""
     s = cell * SS
     lw = stroke_width(cell)
     cx, cy = s/2, s/2
-    r = s * 0.22
+    r = s * 0.18
     pts = [(cx, cy-r), (cx+r, cy), (cx, cy+r), (cx-r, cy)]
-    d.polygon(pts, fill=None, outline=p.accent)
+    d.polygon(pts, fill=_rgba(p.accent, 58), outline=p.accent)
     d.line([pts[0], pts[1], pts[2], pts[3], pts[0]], fill=p.accent, width=lw)
+    d.line([(cx-s*0.34, cy), (cx-s*0.23, cy)], fill=p.stroke, width=lw)
+    d.line([(cx+s*0.23, cy), (cx+s*0.34, cy)], fill=p.stroke, width=lw)
+    d.line([(cx, cy-s*0.34), (cx, cy-s*0.23)], fill=p.stroke, width=lw)
+    d.line([(cx, cy+s*0.23), (cx, cy+s*0.34)], fill=p.stroke, width=lw)
 
 @icon("ref_csys")
 def draw_ref_csys(d, cell, p):
-    """Smaller XYZ triad with dashed lines — reference CSYS."""
+    """Coordinate-system triad with origin plate."""
     s = cell * SS
     lw = stroke_width(cell)
-    ox, oy = s*0.38, s*0.62
-    for color, ex, ey in [(p.err, s*0.75, s*0.62), (p.ok, s*0.38, s*0.25),
-                           (p.accent, s*0.18, s*0.82)]:
-        d.line([(ox, oy), (ex, ey)], fill=color, width=lw)
-    circle(d, ox, oy, lw*0.8, fill=p.stroke)
+    ox, oy = s*0.34, s*0.68
+    d.ellipse([ox-s*0.10, oy-s*0.05, ox+s*0.10, oy+s*0.05], fill=_rgba(p.stroke, 35),
+              outline=p.stroke, width=lw)
+    arrow(d, ox, oy, s*0.82, oy, p.err, lw)
+    arrow(d, ox, oy, ox, s*0.18, p.ok, lw)
+    arrow(d, ox, oy, s*0.18, s*0.84, p.accent, lw)
+    filled_circle(d, ox, oy, lw, p.stroke)
 
 @icon("curve_helix")
 def draw_curve_helix(d, cell, p):
-    """Spring/helix: stacked arcs."""
+    """Helix curve around a ghost cylinder."""
     s = cell * SS
     lw = stroke_width(cell)
     cx = s / 2
-    r = s * 0.30
-    for i, (y_off, a0, a1) in enumerate([
-        (s*0.22, 0, 180), (s*0.40, 180, 360), (s*0.58, 0, 180)
-    ]):
-        d.arc([cx-r, y_off-r*0.4, cx+r, y_off+r*0.4], start=a0, end=a1,
-              fill=p.accent if i % 2 else p.stroke, width=lw)
+    d.ellipse([s*0.28, s*0.14, s*0.72, s*0.30], outline=_rgba(p.stroke, 95), width=lw)
+    d.line([(s*0.28, s*0.22), (s*0.28, s*0.78)], fill=_rgba(p.stroke, 70), width=max(1, lw//2))
+    d.line([(s*0.72, s*0.22), (s*0.72, s*0.78)], fill=_rgba(p.stroke, 70), width=max(1, lw//2))
+    d.ellipse([s*0.28, s*0.70, s*0.72, s*0.86], outline=_rgba(p.stroke, 95), width=lw)
+    for y in [0.22, 0.36, 0.50, 0.64]:
+        d.arc([s*0.25, s*(y-0.08), s*0.75, s*(y+0.10)], start=0, end=180,
+              fill=p.accent, width=lw)
+        d.arc([s*0.25, s*(y+0.02), s*0.75, s*(y+0.20)], start=180, end=360,
+              fill=p.accent, width=lw)
 
 @icon("combine")
 def draw_combine(d, cell, p):
-    """Two overlapping circles with union-fill."""
+    """Two bodies joined into one."""
     s = cell * SS
     lw = stroke_width(cell)
-    r = s * 0.27
-    circle(d, s*0.38, s*0.5, r, outline=p.stroke, lw=lw)
-    circle(d, s*0.62, s*0.5, r, outline=p.accent, lw=lw)
-    plus_sign(d, s*0.5, s*0.5, lw*1.5, p.accent, lw)
+    shaded_prism(d, s, s*0.14, s*0.44, s*0.30, s*0.22, s*0.09, s*0.07, p)
+    shaded_cylinder(d, s, s*0.65, s*0.56, s*0.27, s*0.34, p, accent=True)
+    plus_sign(d, s*0.50, s*0.52, s*0.08, p.accent, lw)
 
 @icon("intersect")
 def draw_intersect(d, cell, p):
-    """Two circles, intersection region highlighted."""
+    """Two bodies with highlighted overlap."""
     s = cell * SS
     lw = stroke_width(cell)
-    r = s * 0.27
-    circle(d, s*0.38, s*0.5, r, outline=p.stroke, lw=lw)
-    circle(d, s*0.62, s*0.5, r, outline=p.accent, lw=lw)
-    # intersection lens
-    d.arc([s*0.62-r, s*0.5-r, s*0.62+r, s*0.5+r], start=130, end=230, fill=p.accent, width=lw*2)
-    d.arc([s*0.38-r, s*0.5-r, s*0.38+r, s*0.5+r], start=310, end=50,  fill=p.accent, width=lw*2)
+    d.rounded_rectangle([s*0.18, s*0.34, s*0.61, s*0.70], radius=int(s*0.04),
+                         fill=_rgba(p.stroke, 25), outline=p.stroke, width=lw)
+    d.ellipse([s*0.40, s*0.25, s*0.83, s*0.75], fill=_rgba(p.accent, 25),
+              outline=p.accent, width=lw)
+    d.rounded_rectangle([s*0.40, s*0.34, s*0.61, s*0.70], radius=int(s*0.03),
+                         fill=_rgba(p.accent, 90), outline=p.accent, width=lw)
 
 @icon("subtract")
 def draw_subtract(d, cell, p):
-    """Large circle minus small circle."""
+    """Body subtraction with red cutter."""
     s = cell * SS
     lw = stroke_width(cell)
-    r = s * 0.27
-    circle(d, s*0.42, s*0.5, r, outline=p.stroke, lw=lw)
-    circle(d, s*0.64, s*0.5, r*0.65, outline=p.err, lw=lw)
-    # minus sign
-    d.line([(s*0.56, s*0.5), (s*0.72, s*0.5)], fill=p.err, width=lw)
+    shaded_prism(d, s, s*0.15, s*0.42, s*0.45, s*0.28, s*0.12, s*0.09, p)
+    d.ellipse([s*0.48, s*0.34, s*0.82, s*0.66], fill=_rgba(p.err, 26), outline=p.err, width=lw)
+    d.line([(s*0.55, s*0.50), (s*0.75, s*0.50)], fill=p.err, width=lw*2)
 
 @icon("split")
 def draw_split(d, cell, p):
-    """Rectangle split by a vertical cutting line."""
+    """Solid body split by a cutting plane."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.rectangle([s*0.15, s*0.25, s*0.85, s*0.75], outline=p.stroke, width=lw)
-    d.line([(s*0.5, s*0.18), (s*0.5, s*0.82)], fill=p.err, width=lw*2)
+    shaded_prism(d, s, s*0.18, s*0.40, s*0.50, s*0.31, s*0.14, s*0.10, p)
+    plane = [(s*0.49, s*0.23), (s*0.58, s*0.28), (s*0.58, s*0.82), (s*0.49, s*0.77)]
+    d.polygon(plane, fill=_rgba(p.err, 58))
+    d.line(plane + [plane[0]], fill=p.err, width=lw)
 
 @icon("wrap")
 def draw_wrap(d, cell, p):
-    """Flat rectangle wrapping around a cylinder."""
+    """Sketch contour wrapped onto a cylinder."""
     s = cell * SS
     lw = stroke_width(cell)
-    # cylinder ellipse
-    d.ellipse([s*0.22, s*0.15, s*0.78, s*0.45], outline=p.stroke, width=lw)
-    d.line([(s*0.22, s*0.30), (s*0.22, s*0.72)], fill=p.stroke, width=lw)
-    d.line([(s*0.78, s*0.30), (s*0.78, s*0.72)], fill=p.stroke, width=lw)
-    d.ellipse([s*0.22, s*0.55, s*0.78, s*0.85], outline=p.accent, width=lw)
-    # wrap line on surface
-    d.arc([s*0.22, s*0.30, s*0.78, s*0.60], start=0, end=180, fill=p.accent, width=lw)
+    shaded_cylinder(d, s, s*0.55, s*0.54, s*0.42, s*0.58, p)
+    d.arc([s*0.32, s*0.30, s*0.78, s*0.58], start=8, end=180, fill=p.accent, width=lw*2)
+    d.arc([s*0.32, s*0.43, s*0.78, s*0.71], start=180, end=352, fill=p.accent, width=lw*2)
+    d.rounded_rectangle([s*0.10, s*0.30, s*0.36, s*0.50], radius=int(s*0.025),
+                         fill=_rgba(p.stroke, 15), outline=p.stroke, width=lw)
+    arrow(d, s*0.34, s*0.40, s*0.48, s*0.42, p.accent, lw)
 
 # ---- Sketch tab ----
 
 @icon("sketch")
 def draw_sketch(d, cell, p):
-    """Pencil over a square plane."""
+    """Pencil over a lightly gridded sketch plane."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.rectangle([s*0.15, s*0.15, s*0.75, s*0.75], outline=p.stroke, width=lw)
-    # pencil diagonal
-    pencil_pts = [(s*0.62, s*0.22), (s*0.82, s*0.42), (s*0.72, s*0.60), (s*0.52, s*0.40)]
-    d.polygon(pencil_pts, fill=None, outline=p.accent)
-    d.line([pencil_pts[0], pencil_pts[1], pencil_pts[2], pencil_pts[3], pencil_pts[0]],
-           fill=p.accent, width=lw)
+    plane = [(s*0.13, s*0.67), (s*0.40, s*0.30), (s*0.86, s*0.40), (s*0.59, s*0.78)]
+    d.polygon(plane, fill=_rgba(p.stroke, 18))
+    d.line(plane + [plane[0]], fill=p.stroke, width=lw)
+    for a, b in [((0.23,0.60),(0.50,0.24)), ((0.36,0.69),(0.63,0.33)),
+                 ((0.27,0.44),(0.73,0.54)), ((0.19,0.56),(0.65,0.66))]:
+        d.line([(s*a[0], s*a[1]), (s*b[0], s*b[1])], fill=_rgba(p.stroke, 65),
+               width=max(1, lw//2))
+    draw_pencil(d, s, p, s*0.21, s*0.79, s*0.82, s*0.19, s*0.050)
 
 @icon("smart_dim")
 def draw_smart_dim(d, cell, p):
-    """Dimension line with arrows and value bar."""
+    """Professional dimension annotation over a sketch edge."""
     s = cell * SS
     lw = stroke_width(cell)
-    y = s * 0.6
-    arrow(d, s*0.15, y, s*0.85, y, p.accent, lw)
-    d.line([(s*0.15, y - s*0.1), (s*0.15, y + s*0.1)], fill=p.stroke, width=lw)
-    d.line([(s*0.85, y - s*0.1), (s*0.85, y + s*0.1)], fill=p.stroke, width=lw)
-    d.line([(s*0.25, s*0.22), (s*0.25, y)], fill=p.stroke, width=lw)  # entity
+    d.line([(s*0.22, s*0.68), (s*0.78, s*0.68)], fill=p.stroke, width=lw*2)
+    for x in [0.22, 0.78]:
+        d.line([(s*x, s*0.28), (s*x, s*0.78)], fill=_rgba(p.stroke, 130), width=lw)
+    y = s*0.34
+    arrow(d, s*0.22, y, s*0.78, y, p.accent, lw)
+    d.rounded_rectangle([s*0.38, s*0.18, s*0.62, s*0.31], radius=int(s*0.025),
+                         fill=_rgba(p.accent, 44), outline=p.accent, width=lw)
 
 @icon("line")
 def draw_line(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell) * 2
-    d.line([(s*0.15, s*0.75), (s*0.85, s*0.25)], fill=p.stroke, width=lw)
-    filled_circle(d, s*0.15, s*0.75, lw*0.8, p.accent)
-    filled_circle(d, s*0.85, s*0.25, lw*0.8, p.accent)
+    d.line([(s*0.16, s*0.74), (s*0.84, s*0.26)], fill=p.stroke, width=lw)
+    for x, y in [(s*0.16, s*0.74), (s*0.84, s*0.26)]:
+        filled_circle(d, x, y, lw*1.05, p.accent)
+        circle(d, x, y, lw*1.65, outline=p.stroke, lw=max(1, lw//2))
 
 @icon("rect_corner")
 def draw_rect_corner(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
-    d.rectangle([s*0.15, s*0.25, s*0.85, s*0.75], outline=p.stroke, width=lw)
-    filled_circle(d, s*0.15, s*0.25, lw, p.accent)
+    d.rounded_rectangle([s*0.16, s*0.26, s*0.84, s*0.74], radius=int(s*0.035),
+                         fill=_rgba(p.stroke, 14), outline=p.stroke, width=lw)
+    filled_circle(d, s*0.16, s*0.26, lw*1.1, p.accent)
+    d.line([(s*0.16, s*0.26), (s*0.84, s*0.74)], fill=_rgba(p.accent, 90), width=max(1, lw//2))
 
 @icon("rect_center")
 def draw_rect_center(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
-    d.rectangle([s*0.15, s*0.25, s*0.85, s*0.75], outline=p.stroke, width=lw)
-    filled_circle(d, s*0.5, s*0.5, lw, p.accent)
-    d.line([(s*0.15, s*0.5), (s*0.85, s*0.5)], fill=p.accent, width=lw)
-    d.line([(s*0.5, s*0.25), (s*0.5, s*0.75)], fill=p.accent, width=lw)
+    d.rounded_rectangle([s*0.16, s*0.26, s*0.84, s*0.74], radius=int(s*0.035),
+                         fill=_rgba(p.stroke, 14), outline=p.stroke, width=lw)
+    filled_circle(d, s*0.5, s*0.5, lw*1.1, p.accent)
+    d.line([(s*0.16, s*0.5), (s*0.84, s*0.5)], fill=_rgba(p.accent, 140), width=lw)
+    d.line([(s*0.5, s*0.26), (s*0.5, s*0.74)], fill=_rgba(p.accent, 140), width=lw)
 
 @icon("circle")
 def draw_circle(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell) * 2
-    circle(d, s/2, s/2, s*0.32, outline=p.stroke, lw=lw)
+    circle(d, s/2, s/2, s*0.32, fill=_rgba(p.stroke, 10), outline=p.stroke, lw=lw)
     filled_circle(d, s/2, s/2, lw*0.7, p.accent)
+    d.line([(s*0.5, s*0.5), (s*0.76, s*0.32)], fill=p.accent, width=max(1, lw//2))
 
 @icon("arc_3pt")
 def draw_arc_3pt(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell) * 2
-    arc_segment(d, s/2, s*0.65, s*0.38, 210, 330, p.stroke, lw)
-    for x, y in [(s*0.2, s*0.82), (s*0.5, s*0.28), (s*0.8, s*0.82)]:
-        filled_circle(d, x, y, lw, p.accent)
+    arc_segment(d, s/2, s*0.67, s*0.40, 210, 330, p.stroke, lw)
+    for i, (x, y) in enumerate([(s*0.19, s*0.83), (s*0.5, s*0.27), (s*0.81, s*0.83)]):
+        filled_circle(d, x, y, lw, p.accent if i == 1 else p.stroke)
+        circle(d, x, y, lw*1.45, outline=p.accent, lw=max(1, lw//2))
 
 @icon("arc_center")
 def draw_arc_center(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell) * 2
     cx, cy = s*0.5, s*0.65
-    arc_segment(d, cx, cy, s*0.35, 210, 330, p.stroke, lw)
-    filled_circle(d, cx, cy, lw, p.accent)  # center point
+    arc_segment(d, cx, cy, s*0.36, 210, 330, p.stroke, lw)
+    d.line([(cx, cy), (s*0.22, s*0.82)], fill=_rgba(p.accent, 120), width=max(1, lw//2))
+    d.line([(cx, cy), (s*0.78, s*0.82)], fill=_rgba(p.accent, 120), width=max(1, lw//2))
+    filled_circle(d, cx, cy, lw, p.accent)
 
 @icon("arc_tangent")
 def draw_arc_tangent(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell) * 2
-    # line first, then tangent arc
-    d.line([(s*0.15, s*0.65), (s*0.5, s*0.65)], fill=p.stroke, width=lw)
-    arc_segment(d, s*0.5, s*0.65, s*0.3, 270, 0, p.accent, lw)
+    d.line([(s*0.13, s*0.67), (s*0.48, s*0.67)], fill=p.stroke, width=lw)
+    arc_segment(d, s*0.48, s*0.67, s*0.32, 270, 5, p.accent, lw)
+    filled_circle(d, s*0.48, s*0.67, lw, p.accent)
+    d.line([(s*0.34, s*0.58), (s*0.49, s*0.73)], fill=_rgba(p.stroke, 130), width=max(1, lw//2))
 
 @icon("polygon")
 def draw_polygon(d, cell, p):
@@ -803,51 +1012,65 @@ def draw_polygon(d, cell, p):
     cx, cy, r, n = s/2, s/2, s*0.35, 6
     pts = [(cx + r*math.cos(math.radians(-90 + i*360/n)),
             cy + r*math.sin(math.radians(-90 + i*360/n))) for i in range(n)]
-    d.polygon(pts, fill=None, outline=p.stroke)
+    d.polygon(pts, fill=_rgba(p.stroke, 16), outline=p.stroke)
     d.line(pts + [pts[0]], fill=p.stroke, width=lw)
+    d.line([(cx, cy), pts[0]], fill=p.accent, width=lw)
+    filled_circle(d, cx, cy, lw, p.accent)
 
 @icon("slot")
 def draw_slot(d, cell, p):
-    """Oblong slot shape."""
+    """Oblong slot with centerline and end centers."""
     s = cell * SS
     lw = stroke_width(cell)
     d.rounded_rectangle([s*0.15, s*0.35, s*0.85, s*0.65], radius=int(s*0.15),
-                         outline=p.stroke, width=lw)
+                         fill=_rgba(p.stroke, 14), outline=p.stroke, width=lw)
+    d.line([(s*0.27, s*0.50), (s*0.73, s*0.50)], fill=p.accent, width=lw)
+    filled_circle(d, s*0.27, s*0.50, lw, p.accent)
+    filled_circle(d, s*0.73, s*0.50, lw, p.accent)
 
 @icon("spline")
 def draw_spline(d, cell, p):
-    """Smooth S-curve."""
+    """Spline with control points."""
     s = cell * SS
     lw = stroke_width(cell) * 2
-    # approximate S-curve with arcs
     d.arc([s*0.15, s*0.1, s*0.65, s*0.6], start=200, end=360, fill=p.stroke, width=lw)
     d.arc([s*0.35, s*0.4, s*0.85, s*0.9], start=20, end=180, fill=p.stroke, width=lw)
+    for x, y in [(0.18,0.55),(0.38,0.24),(0.62,0.76),(0.82,0.45)]:
+        filled_circle(d, s*x, s*y, lw*0.65, p.accent)
+    d.line([(s*0.18,s*0.55),(s*0.38,s*0.24),(s*0.62,s*0.76),(s*0.82,s*0.45)],
+           fill=_rgba(p.accent, 90), width=max(1, lw//3))
 
 @icon("ellipse")
 def draw_ellipse(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell) * 2
-    d.ellipse([s*0.12, s*0.28, s*0.88, s*0.72], outline=p.stroke, width=lw)
-    # axes
+    d.ellipse([s*0.12, s*0.28, s*0.88, s*0.72], fill=_rgba(p.stroke, 12), outline=p.stroke, width=lw)
     d.line([(s*0.12, s*0.5), (s*0.88, s*0.5)], fill=p.accent, width=lw//2)
     d.line([(s*0.5, s*0.28), (s*0.5, s*0.72)], fill=p.accent, width=lw//2)
+    for x, y in [(0.12,0.5),(0.88,0.5),(0.5,0.28),(0.5,0.72)]:
+        filled_circle(d, s*x, s*y, max(1, lw//2), p.accent)
 
 @icon("point_ent")
 def draw_point_ent(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
     cx, cy = s/2, s/2
-    filled_circle(d, cx, cy, lw*1.5, p.accent)
-    d.line([(cx - s*0.2, cy), (cx + s*0.2, cy)], fill=p.stroke, width=lw)
-    d.line([(cx, cy - s*0.2), (cx, cy + s*0.2)], fill=p.stroke, width=lw)
+    circle(d, cx, cy, s*0.18, outline=p.stroke, lw=lw)
+    filled_circle(d, cx, cy, lw*1.55, p.accent)
+    d.line([(cx - s*0.30, cy), (cx - s*0.22, cy)], fill=p.stroke, width=lw)
+    d.line([(cx + s*0.22, cy), (cx + s*0.30, cy)], fill=p.stroke, width=lw)
+    d.line([(cx, cy - s*0.30), (cx, cy - s*0.22)], fill=p.stroke, width=lw)
+    d.line([(cx, cy + s*0.22), (cx, cy + s*0.30)], fill=p.stroke, width=lw)
 
 @icon("text_ent")
 def draw_text_ent(d, cell, p):
-    """'T' glyph."""
+    """Sketch text on a baseline."""
     s = cell * SS
     lw = stroke_width(cell) * 2
-    d.line([(s*0.2, s*0.22), (s*0.8, s*0.22)], fill=p.stroke, width=lw)
-    d.line([(s*0.5, s*0.22), (s*0.5, s*0.80)], fill=p.stroke, width=lw)
+    d.line([(s*0.16, s*0.78), (s*0.84, s*0.78)], fill=_rgba(p.accent, 160), width=max(1, lw//2))
+    d.line([(s*0.22, s*0.24), (s*0.78, s*0.24)], fill=p.stroke, width=lw)
+    d.line([(s*0.50, s*0.24), (s*0.50, s*0.76)], fill=p.stroke, width=lw)
+    d.line([(s*0.34, s*0.76), (s*0.66, s*0.76)], fill=p.stroke, width=lw)
 
 @icon("trim")
 def draw_trim(d, cell, p):
@@ -892,66 +1115,67 @@ def draw_extend(d, cell, p):
 def draw_offset_ent(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
-    d.rounded_rectangle([s*0.15, s*0.25, s*0.75, s*0.75], radius=int(s*0.08),
-                         outline=p.stroke, width=lw)
-    d.rounded_rectangle([s*0.25, s*0.35, s*0.85, s*0.85], radius=int(s*0.08),
-                         outline=p.accent, width=lw)
+    d.rounded_rectangle([s*0.14, s*0.22, s*0.68, s*0.68], radius=int(s*0.08),
+                         fill=_rgba(p.stroke, 12), outline=p.stroke, width=lw)
+    d.rounded_rectangle([s*0.30, s*0.36, s*0.86, s*0.82], radius=int(s*0.08),
+                         fill=_rgba(p.accent, 18), outline=p.accent, width=lw)
+    arrow(d, s*0.64, s*0.34, s*0.77, s*0.47, p.accent, lw)
 
 @icon("convert_ent")
 def draw_convert_ent(d, cell, p):
-    """Two stacked rects (model face -> sketch entity) with an arrow showing the conversion."""
+    """Model edge converted to sketch geometry."""
     s = cell * SS
     lw = stroke_width(cell)
-    # source (model edge/face) — upper-left, solid stroke
-    d.rectangle([s*0.12, s*0.14, s*0.50, s*0.46], outline=p.stroke, width=lw)
-    # converted result — lower-right, accent (the new sketch entity)
-    d.rectangle([s*0.50, s*0.54, s*0.88, s*0.86], outline=p.accent, width=lw)
-    # arrow from source to result
+    shaded_prism(d, s, s*0.12, s*0.26, s*0.28, s*0.20, s*0.08, s*0.06, p)
+    d.rounded_rectangle([s*0.50, s*0.54, s*0.88, s*0.82], radius=int(s*0.035),
+                         fill=_rgba(p.accent, 18), outline=p.accent, width=lw)
     arrow(d, s*0.40, s*0.42, s*0.60, s*0.58, p.accent, lw)
 
 @icon("mirror_ent")
 def draw_mirror_ent(d, cell, p):
-    """Sketch mirror — two lines either side of centerline."""
+    """Sketch mirror with dashed centerline."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.line([(s*0.5, s*0.1), (s*0.5, s*0.9)], fill=p.accent, width=lw)
-    polyline(d, [(s*0.2, s*0.3), (s*0.38, s*0.5), (s*0.2, s*0.7)], p.stroke, lw)
-    polyline(d, [(s*0.8, s*0.3), (s*0.62, s*0.5), (s*0.8, s*0.7)], p.stroke, lw)
+    for y in [0.12,0.28,0.44,0.60,0.76]:
+        d.line([(s*0.5, s*y), (s*0.5, s*(y+0.08))], fill=p.accent, width=lw)
+    polyline(d, [(s*0.22, s*0.30), (s*0.38, s*0.50), (s*0.22, s*0.70)], p.stroke, lw)
+    polyline(d, [(s*0.78, s*0.30), (s*0.62, s*0.50), (s*0.78, s*0.70)], p.stroke, lw)
+    filled_circle(d, s*0.38, s*0.50, lw, p.accent)
+    filled_circle(d, s*0.62, s*0.50, lw, p.accent)
 
 @icon("pattern_lin_ent")
 def draw_pattern_lin_ent(d, cell, p):
-    """Three dots in a row."""
+    """Sketch entities in a linear pattern."""
     s = cell * SS
     lw = stroke_width(cell)
-    r = s * 0.09
-    for x in [0.25, 0.50, 0.75]:
-        col = p.accent if x == 0.25 else p.stroke
-        circle(d, s*x, s*0.5, r, outline=col, lw=lw)
-    arrow(d, s*0.2, s*0.72, s*0.8, s*0.72, p.accent, lw)
+    for i, x in enumerate([0.23, 0.50, 0.77]):
+        d.rounded_rectangle([s*x-s*0.07, s*0.40, s*x+s*0.07, s*0.56],
+                             radius=int(s*0.02), outline=p.accent if i == 0 else p.stroke,
+                             width=lw)
+    arrow(d, s*0.20, s*0.74, s*0.82, s*0.74, p.accent, lw)
 
 @icon("pattern_circ_ent")
 def draw_pattern_circ_ent(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
     cx, cy = s/2, s/2
-    ring_r = s * 0.28
-    dot_r  = s * 0.07
-    circle(d, cx, cy, ring_r, outline=p.stroke, lw=lw)
-    for i in range(4):
-        angle = math.radians(i * 90)
+    ring_r = s * 0.30
+    circle(d, cx, cy, ring_r, outline=_rgba(p.stroke, 125), lw=lw)
+    for i in range(5):
+        angle = math.radians(-90 + i * 72)
         dx = cx + ring_r * math.cos(angle)
         dy = cy + ring_r * math.sin(angle)
-        col = p.accent if i == 0 else p.stroke
-        filled_circle(d, dx, dy, dot_r, col)
+        circle(d, dx, dy, s*0.055, outline=p.accent if i == 0 else p.stroke, lw=lw)
+    arrow(d, s*0.72, s*0.28, s*0.82, s*0.42, p.accent, lw)
 
 @icon("move_ent")
 def draw_move_ent(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
     cx, cy = s/2, s/2
-    r = s * 0.16
+    r = s * 0.14
     d.rounded_rectangle([cx-r, cy-r, cx+r, cy+r], radius=int(r*0.3),
-                         outline=p.stroke, width=lw)
+                         fill=_rgba(p.stroke, 14), outline=p.stroke, width=lw)
     m = s * 0.32
     for ax, ay, bx, by in [(cx, cy-m, cx, cy-r-2), (cx, cy+m, cx, cy+r+2),
                              (cx-m, cy, cx-r-2, cy), (cx+m, cy, cx+r+2, cy)]:
@@ -959,7 +1183,7 @@ def draw_move_ent(d, cell, p):
 
 @icon("construction")
 def draw_construction(d, cell, p):
-    """Dashed line (construction geometry)."""
+    """Construction geometry dashed line with center glyph."""
     s = cell * SS
     lw = stroke_width(cell) * 2
     segs = 4
@@ -969,30 +1193,31 @@ def draw_construction(d, cell, p):
         d.line([(s*0.15 + (s*0.7)*t0, s*0.75 - (s*0.5)*t0),
                 (s*0.15 + (s*0.7)*t1, s*0.75 - (s*0.5)*t1)],
                fill=p.accent, width=lw)
+    circle(d, s*0.50, s*0.50, s*0.09, outline=p.stroke, lw=max(1, lw//2))
 
 @icon("relations")
 def draw_relations(d, cell, p):
-    """Two point dots with constraint symbol (=)."""
+    """Constraint relation link with equal mark."""
     s = cell * SS
     lw = stroke_width(cell)
-    filled_circle(d, s*0.25, s*0.5, lw, p.stroke)
-    filled_circle(d, s*0.75, s*0.5, lw, p.stroke)
+    filled_circle(d, s*0.25, s*0.5, lw*1.1, p.stroke)
+    filled_circle(d, s*0.75, s*0.5, lw*1.1, p.stroke)
     d.line([(s*0.25, s*0.5), (s*0.75, s*0.5)], fill=p.stroke, width=lw)
-    # = symbol mid
-    d.line([(s*0.42, s*0.43), (s*0.58, s*0.43)], fill=p.accent, width=lw)
-    d.line([(s*0.42, s*0.57), (s*0.58, s*0.57)], fill=p.accent, width=lw)
+    d.rounded_rectangle([s*0.39, s*0.36, s*0.61, s*0.64], radius=int(s*0.035),
+                         fill=_rgba(p.accent, 34), outline=p.accent, width=max(1, lw//2))
+    d.line([(s*0.44, s*0.45), (s*0.56, s*0.45)], fill=p.accent, width=lw)
+    d.line([(s*0.44, s*0.55), (s*0.56, s*0.55)], fill=p.accent, width=lw)
 
 @icon("fix")
 def draw_fix(d, cell, p):
-    """Lock/anchor symbol."""
+    """Fixed relation lock anchored to a sketch point."""
     s = cell * SS
     lw = stroke_width(cell)
-    # shackle
     arc_segment(d, s*0.5, s*0.42, s*0.2, 180, 360, p.stroke, lw)
-    # body
     d.rounded_rectangle([s*0.3, s*0.48, s*0.7, s*0.80], radius=int(s*0.05),
-                         outline=p.stroke, width=lw)
+                         fill=_rgba(p.stroke, 18), outline=p.stroke, width=lw)
     filled_circle(d, s*0.5, s*0.64, lw, p.accent)
+    d.line([(s*0.25, s*0.86), (s*0.75, s*0.86)], fill=p.accent, width=lw)
 
 # ---- Assembly tab ----
 
@@ -1000,222 +1225,230 @@ def draw_fix(d, cell, p):
 def draw_insert_component(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
-    # box with down-arrow (drop in)
-    d.rounded_rectangle([s*0.2, s*0.45, s*0.75, s*0.82], radius=int(s*0.05),
-                         outline=p.stroke, width=lw)
-    arrow(d, s*0.5, s*0.12, s*0.5, s*0.45, p.accent, lw)
+    shaded_prism(d, s, s*0.22, s*0.48, s*0.38, s*0.25, s*0.12, s*0.08, p)
+    arrow(d, s*0.50, s*0.12, s*0.50, s*0.42, p.accent, lw)
+    plus_sign(d, s*0.76, s*0.30, s*0.08, p.accent, lw)
 
 @icon("mate")
 def draw_mate(d, cell, p):
-    """Two faces touching — paperclip-like."""
+    """Two assembly parts constrained face-to-face."""
     s = cell * SS
     lw = stroke_width(cell)
-    # two half-circles opening toward each other
-    arc_segment(d, s*0.38, s*0.5, s*0.22, 90, 270, p.stroke, lw)
-    arc_segment(d, s*0.62, s*0.5, s*0.22, 270, 90, p.accent, lw)
-    d.line([(s*0.38, s*0.28), (s*0.62, s*0.28)], fill=p.stroke, width=lw)
-    d.line([(s*0.38, s*0.72), (s*0.62, s*0.72)], fill=p.stroke, width=lw)
+    shaded_prism(d, s, s*0.13, s*0.44, s*0.27, s*0.20, s*0.08, s*0.06, p)
+    shaded_prism(d, s, s*0.58, s*0.44, s*0.27, s*0.20, s*0.08, s*0.06, p, accent=True)
+    d.line([(s*0.42, s*0.52), (s*0.58, s*0.52)], fill=p.accent, width=lw*2)
+    d.line([(s*0.46, s*0.43), (s*0.54, s*0.43)], fill=p.stroke, width=lw)
+    d.line([(s*0.46, s*0.61), (s*0.54, s*0.61)], fill=p.stroke, width=lw)
 
 @icon("move_component")
 def draw_move_component(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
     cx, cy = s/2, s/2
-    d.rounded_rectangle([cx - s*0.2, cy - s*0.2, cx + s*0.2, cy + s*0.2],
-                         radius=int(s*0.04), outline=p.stroke, width=lw)
-    m = s * 0.35
+    shaded_prism(d, s, cx - s*0.18, cy - s*0.08, s*0.28, s*0.20, s*0.08, s*0.06, p)
+    m = s * 0.34
     arrow(d, cx, cy, cx + m, cy, p.accent, lw)
     arrow(d, cx, cy, cx, cy - m, p.accent, lw)
+    arrow(d, cx, cy, cx - m*0.55, cy + m*0.45, p.accent, lw)
 
 @icon("rotate_component")
 def draw_rotate_component(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
     cx, cy = s/2, s/2
-    d.rounded_rectangle([cx - s*0.18, cy - s*0.18, cx + s*0.18, cy + s*0.18],
-                         radius=int(s*0.04), outline=p.stroke, width=lw)
+    shaded_prism(d, s, cx - s*0.18, cy - s*0.05, s*0.27, s*0.20, s*0.08, s*0.06, p)
     r = s*0.36
-    arc_segment(d, cx, cy, r, 270, 180, p.accent, lw)
+    arc_segment(d, cx, cy, r, 205, 510, p.accent, lw)
     arrow(d, cx - r, cy, cx - r - s*0.1, cy - s*0.12, p.accent, lw)
 
 @icon("pattern_component")
 def draw_pattern_component(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
-    sz = s * 0.20
     for xi in range(2):
         for yi in range(2):
             x = s*(0.18 + xi*0.35)
             y = s*(0.25 + yi*0.35)
-            col = p.accent if (xi == 0 and yi == 0) else p.stroke
-            d.rounded_rectangle([x, y, x+sz, y+sz], radius=int(sz*0.15),
-                                 outline=col, width=lw)
+            shaded_prism(d, s, x, y, s*0.14, s*0.12, s*0.05, s*0.04,
+                         p, accent=(xi == 0 and yi == 0))
+    d.line([(s*0.28, s*0.33), (s*0.63, s*0.33)], fill=_rgba(p.accent, 120), width=max(1, lw//2))
+    d.line([(s*0.28, s*0.33), (s*0.28, s*0.68)], fill=_rgba(p.accent, 120), width=max(1, lw//2))
 
 @icon("smart_fasteners")
 def draw_smart_fasteners(d, cell, p):
-    """Bolt/nut cross-section."""
+    """Bolt and washer fastener stack."""
     s = cell * SS
     lw = stroke_width(cell)
     cx, cy = s/2, s*0.42
     r = s * 0.20
-    # hex
     pts = [(cx + r*math.cos(math.radians(-90 + i*60)),
             cy + r*math.sin(math.radians(-90 + i*60))) for i in range(6)]
-    d.polygon(pts, fill=None, outline=p.stroke)
+    d.polygon(pts, fill=_rgba(p.stroke, 25), outline=p.stroke)
     d.line(pts + [pts[0]], fill=p.stroke, width=lw)
-    # thread shank
-    d.rectangle([cx-lw*1.5, cy+r, cx+lw*1.5, cy+r+s*0.3], fill=p.accent)
+    d.rectangle([cx-lw*1.5, cy+r, cx+lw*1.5, cy+r+s*0.30], fill=p.accent)
+    for y in [0.64,0.70,0.76]:
+        d.line([(cx-s*0.10, s*y), (cx+s*0.10, s*(y+0.04))], fill=p.stroke, width=max(1, lw//2))
+    d.ellipse([cx-s*0.19, s*0.77, cx+s*0.19, s*0.88], outline=p.accent, width=lw)
 
 @icon("exploded_view")
 def draw_exploded_view(d, cell, p):
-    """Three pieces flying outward from a center."""
+    """Assembly pieces exploded outward from a center."""
     s = cell * SS
     lw = stroke_width(cell)
     cx, cy = s/2, s/2
-    for angle, r_inner, r_outer in [(315, 0.12, 0.38), (180, 0.12, 0.38), (90, 0.12, 0.38)]:
+    for angle, r_inner, r_outer in [(320, 0.12, 0.37), (185, 0.12, 0.38), (85, 0.12, 0.36)]:
         a = math.radians(angle)
         x0 = cx + r_inner*s*math.cos(a)
         y0 = cy + r_inner*s*math.sin(a)
         x1 = cx + r_outer*s*math.cos(a)
         y1 = cy + r_outer*s*math.sin(a)
         d.line([(x0, y0), (x1, y1)], fill=p.accent, width=lw)
-        sz = s * 0.10
-        d.rectangle([x1 - sz, y1 - sz, x1 + sz, y1 + sz], outline=p.stroke, width=lw)
+        shaded_prism(d, s, x1 - s*0.07, y1 - s*0.03, s*0.12, s*0.10, s*0.04, s*0.03, p)
+    filled_circle(d, cx, cy, lw, p.accent)
 
 @icon("bom")
 def draw_bom(d, cell, p):
-    """Table rows (bill of materials)."""
+    """Bill of materials table with part callout."""
     s = cell * SS
     lw = stroke_width(cell)
-    # header
-    d.rectangle([s*0.12, s*0.20, s*0.88, s*0.36], outline=p.accent, width=lw)
-    # rows
+    d.rounded_rectangle([s*0.12, s*0.18, s*0.88, s*0.82], radius=int(s*0.035),
+                         fill=_rgba(p.stroke, 12), outline=p.stroke, width=lw)
+    d.rectangle([s*0.12, s*0.18, s*0.88, s*0.34], fill=_rgba(p.accent, 50), outline=p.accent, width=lw)
     for i in range(3):
-        y = s*(0.38 + i*0.16)
-        d.rectangle([s*0.12, y, s*0.88, y + s*0.14], outline=p.stroke, width=lw)
+        y = s*(0.38 + i*0.14)
+        d.line([(s*0.16, y), (s*0.84, y)], fill=_rgba(p.stroke, 120), width=max(1, lw//2))
         d.line([(s*0.35, y), (s*0.35, y + s*0.14)], fill=p.stroke, width=lw)
-        d.line([(s*0.65, y), (s*0.65, y + s*0.14)], fill=p.stroke, width=lw)
+        filled_circle(d, s*0.23, y+s*0.07, max(1, lw//2), p.accent if i == 0 else p.stroke)
 
 @icon("interference")
 def draw_interference(d, cell, p):
-    """Two overlapping solid rects, overlap in red."""
+    """Interfering assembly solids with red collision volume."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.rectangle([s*0.15, s*0.3, s*0.62, s*0.75], outline=p.stroke, width=lw)
-    d.rectangle([s*0.38, s*0.25, s*0.85, s*0.70], outline=p.stroke, width=lw)
-    # overlap zone
-    d.rectangle([s*0.38, s*0.30, s*0.62, s*0.70], outline=p.err, width=lw*2)
+    shaded_prism(d, s, s*0.14, s*0.42, s*0.35, s*0.26, s*0.10, s*0.07, p)
+    shaded_prism(d, s, s*0.43, s*0.35, s*0.35, s*0.26, s*0.10, s*0.07, p, accent=True)
+    d.rounded_rectangle([s*0.42, s*0.43, s*0.56, s*0.67], radius=int(s*0.02),
+                         fill=_rgba(p.err, 92), outline=p.err, width=lw)
 
 # ---- Evaluate tab ----
 
 @icon("measure")
 def draw_measure(d, cell, p):
-    """Ruler diagonal with tick marks."""
+    """Caliper-style measurement tool."""
     s = cell * SS
-    lw = stroke_width(cell) * 2
-    d.line([(s*0.15, s*0.85), (s*0.85, s*0.15)], fill=p.stroke, width=lw)
+    lw = stroke_width(cell)
+    d.line([(s*0.18, s*0.70), (s*0.78, s*0.22)], fill=p.stroke, width=lw*2)
+    d.line([(s*0.18, s*0.70), (s*0.30, s*0.84)], fill=p.accent, width=lw*2)
+    d.line([(s*0.78, s*0.22), (s*0.88, s*0.36)], fill=p.accent, width=lw*2)
     for i in range(4):
         t = (i + 1) / 5
-        px = s*0.15 + (s*0.7)*t
-        py = s*0.85 - (s*0.7)*t
-        perp_dx, perp_dy = 0.07*s, 0.07*s
-        d.line([(px - perp_dy, py - perp_dx), (px + perp_dy, py + perp_dx)],
-               fill=p.accent, width=lw//2)
+        px = s*0.18 + (s*0.60)*t
+        py = s*0.70 - (s*0.48)*t
+        d.line([(px-s*0.035, py-s*0.045), (px+s*0.035, py+s*0.045)], fill=p.accent, width=lw)
 
 @icon("mass_props")
 def draw_mass_props(d, cell, p):
-    """Scale/balance icon."""
+    """Mass properties scale with shaded body."""
     s = cell * SS
     lw = stroke_width(cell)
     cx = s/2
-    # pivot
-    d.line([(cx, s*0.25), (cx, s*0.65)], fill=p.stroke, width=lw)
-    # beam
-    d.line([(s*0.18, s*0.38), (s*0.82, s*0.38)], fill=p.stroke, width=lw)
-    # pans
+    shaded_prism(d, s, s*0.40, s*0.18, s*0.20, s*0.12, s*0.06, s*0.04, p, accent=True)
+    d.line([(cx, s*0.30), (cx, s*0.66)], fill=p.stroke, width=lw)
+    d.line([(s*0.18, s*0.42), (s*0.82, s*0.42)], fill=p.stroke, width=lw)
     for x in [s*0.22, s*0.78]:
-        d.line([(x, s*0.38), (x, s*0.62)], fill=p.stroke, width=lw)
-        d.ellipse([x - s*0.12, s*0.62, x + s*0.12, s*0.72], outline=p.accent, width=lw)
+        d.line([(x, s*0.42), (x, s*0.62)], fill=p.stroke, width=lw)
+        d.ellipse([x - s*0.13, s*0.60, x + s*0.13, s*0.73], fill=_rgba(p.accent, 24),
+                  outline=p.accent, width=lw)
 
 @icon("section_props")
 def draw_section_props(d, cell, p):
-    """I-beam cross-section."""
+    """Section properties with centroid axes."""
     s = cell * SS
     lw = stroke_width(cell)
-    # flanges
-    d.line([(s*0.2, s*0.22), (s*0.8, s*0.22)], fill=p.stroke, width=lw*2)
-    d.line([(s*0.2, s*0.78), (s*0.8, s*0.78)], fill=p.stroke, width=lw*2)
-    # web
-    d.line([(s*0.5, s*0.22), (s*0.5, s*0.78)], fill=p.accent, width=lw*2)
+    d.polygon([(s*0.22,s*0.22),(s*0.78,s*0.22),(s*0.78,s*0.36),(s*0.57,s*0.36),
+               (s*0.57,s*0.64),(s*0.78,s*0.64),(s*0.78,s*0.78),(s*0.22,s*0.78),
+               (s*0.22,s*0.64),(s*0.43,s*0.64),(s*0.43,s*0.36),(s*0.22,s*0.36)],
+              fill=_rgba(p.stroke, 22))
+    pts = [(s*0.22,s*0.22),(s*0.78,s*0.22),(s*0.78,s*0.36),(s*0.57,s*0.36),
+           (s*0.57,s*0.64),(s*0.78,s*0.64),(s*0.78,s*0.78),(s*0.22,s*0.78),
+           (s*0.22,s*0.64),(s*0.43,s*0.64),(s*0.43,s*0.36),(s*0.22,s*0.36)]
+    d.line(pts + [pts[0]], fill=p.stroke, width=lw)
+    d.line([(s*0.50,s*0.15),(s*0.50,s*0.85)], fill=p.accent, width=max(1,lw//2))
+    d.line([(s*0.15,s*0.50),(s*0.85,s*0.50)], fill=p.accent, width=max(1,lw//2))
+    filled_circle(d, s*0.50, s*0.50, lw, p.accent)
 
 @icon("interference_eval")
 def draw_interference_eval(d, cell, p):
-    """Overlap rects + warning badge."""
+    """Geometry interference analysis with warning badge."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.rectangle([s*0.15, s*0.35, s*0.58, s*0.72], outline=p.stroke, width=lw)
-    d.rectangle([s*0.42, s*0.30, s*0.82, s*0.68], outline=p.stroke, width=lw)
-    d.rectangle([s*0.42, s*0.35, s*0.58, s*0.68], outline=p.err, width=lw*2)
-    filled_circle(d, s*0.78, s*0.72, s*0.1, p.warn)
+    shaded_prism(d, s, s*0.14, s*0.42, s*0.36, s*0.24, s*0.09, s*0.07, p)
+    d.ellipse([s*0.40, s*0.32, s*0.80, s*0.72], fill=_rgba(p.accent, 18), outline=p.accent, width=lw)
+    d.rounded_rectangle([s*0.40, s*0.43, s*0.56, s*0.66], radius=int(s*0.02),
+                         fill=_rgba(p.err, 90), outline=p.err, width=lw)
+    filled_circle(d, s*0.78, s*0.73, s*0.09, p.warn)
+    d.line([(s*0.78,s*0.68),(s*0.78,s*0.74)], fill=(255,255,255), width=max(1,lw//2))
 
 @icon("draft_analysis")
 def draw_draft_analysis(d, cell, p):
-    """Shaded trapezoid (color map for draft)."""
+    """Draft analysis color bands on a tapered face."""
     s = cell * SS
     lw = stroke_width(cell)
     pts = [(s*0.2, s*0.75), (s*0.8, s*0.75), (s*0.65, s*0.25), (s*0.35, s*0.25)]
-    d.polygon(pts, fill=(*p.accent[:3], 60))
+    d.polygon(pts, fill=_rgba(p.accent, 44))
     d.line([pts[0], pts[1], pts[2], pts[3], pts[0]], fill=p.stroke, width=lw)
-    # gradient bars right side
     for i, col in enumerate([p.ok, p.accent, p.warn, p.err]):
         y = s*(0.28 + i*0.12)
         d.rectangle([s*0.82, y, s*0.90, y + s*0.10], fill=col)
+        d.line([(s*0.35, y+s*0.02), (s*0.67, y+s*0.04)], fill=col, width=max(1,lw//2))
 
 @icon("thickness")
 def draw_thickness(d, cell, p):
-    """Two parallel lines with arrow between them."""
+    """Wall thickness probe through a shell."""
     s = cell * SS
-    lw = stroke_width(cell) * 2
-    d.line([(s*0.15, s*0.30), (s*0.85, s*0.30)], fill=p.stroke, width=lw)
-    d.line([(s*0.15, s*0.70), (s*0.85, s*0.70)], fill=p.stroke, width=lw)
-    arrow(d, s*0.5, s*0.30, s*0.5, s*0.70, p.accent, lw)
+    lw = stroke_width(cell)
+    d.rounded_rectangle([s*0.18, s*0.26, s*0.82, s*0.74], radius=int(s*0.04),
+                         outline=p.stroke, width=lw*2)
+    d.rounded_rectangle([s*0.32, s*0.40, s*0.68, s*0.60], radius=int(s*0.03),
+                         outline=p.accent, width=lw*2)
+    arrow(d, s*0.50, s*0.26, s*0.50, s*0.40, p.accent, lw)
+    arrow(d, s*0.50, s*0.74, s*0.50, s*0.60, p.accent, lw)
 
 @icon("curvature")
 def draw_curvature(d, cell, p):
-    """Curve with comb-like curvature spines."""
+    """Surface curvature comb."""
     s = cell * SS
     lw = stroke_width(cell)
-    # base curve (arc)
     arc_segment(d, s*0.5, s*1.0, s*0.65, 210, 330, p.stroke, lw*2)
-    # combs
     for angle in range(215, 330, 25):
         a = math.radians(angle)
         cx = s*0.5 + s*0.65*math.cos(a)
         cy = s*1.0 + s*0.65*math.sin(a)
-        ex = cx + s*0.18*math.cos(a)
-        ey = cy + s*0.18*math.sin(a)
+        ex = cx + s*(0.10 + 0.08*math.sin(a*3))*math.cos(a)
+        ey = cy + s*(0.10 + 0.08*math.sin(a*3))*math.sin(a)
         d.line([(cx, cy), (ex, ey)], fill=p.accent, width=lw)
+        filled_circle(d, ex, ey, max(1,lw//2), p.accent)
 
 @icon("zebra")
 def draw_zebra(d, cell, p):
-    """Alternating stripes on a surface."""
+    """Zebra reflection stripes on a curved surface."""
     s = cell * SS
     lw = stroke_width(cell)
     r = s * 0.35
     cx, cy = s/2, s/2
-    circle(d, cx, cy, r, outline=p.stroke, lw=lw)
-    # zebra stripes (horizontal, clipped by circle implicitly)
-    for i in range(4):
-        y = cy - r + (2*r) * (i + 0.25) / 4
+    d.ellipse([cx-r, cy-r, cx+r, cy+r], fill=_rgba(p.stroke, 18), outline=p.stroke, width=lw)
+    for i in range(5):
+        y = cy - r + (2*r) * (i + 0.20) / 5
         half = math.sqrt(max(0, r*r - (y-cy)**2))
         col = p.stroke if i % 2 == 0 else p.accent
-        d.line([(cx - half, y), (cx + half, y)], fill=col, width=lw*2)
+        d.arc([cx-half, y-s*0.07, cx+half, y+s*0.07], start=0, end=180, fill=col, width=lw*2)
 
 @icon("symmetry_check")
 def draw_symmetry_check(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
-    d.line([(s*0.5, s*0.1), (s*0.5, s*0.9)], fill=p.accent, width=lw)
+    for y in [0.12,0.28,0.44,0.60,0.76]:
+        d.line([(s*0.5, s*y), (s*0.5, s*(y+0.08))], fill=p.accent, width=lw)
     d.rounded_rectangle([s*0.55, s*0.3, s*0.82, s*0.7], radius=int(s*0.05),
                          outline=p.stroke, width=lw)
     d.rounded_rectangle([s*0.18, s*0.3, s*0.45, s*0.7], radius=int(s*0.05),
@@ -1226,18 +1459,19 @@ def draw_symmetry_check(d, cell, p):
 def draw_check(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
-    circle(d, s/2, s/2, s*0.35, outline=p.stroke, lw=lw)
-    check_mark(d, s/2, s/2, s*0.22, p.ok, lw*2)
+    shaded_prism(d, s, s*0.20, s*0.42, s*0.43, s*0.26, s*0.12, s*0.08, p)
+    filled_circle(d, s*0.72, s*0.30, s*0.14, p.ok)
+    check_mark(d, s*0.72, s*0.30, s*0.09, (255,255,255), lw)
 
 @icon("geometry_analysis")
 def draw_geometry_analysis(d, cell, p):
-    """Solid shape with dimension/analysis arrows."""
+    """General geometry analysis scanner."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.rounded_rectangle([s*0.2, s*0.2, s*0.72, s*0.72], radius=int(s*0.08),
-                         outline=p.stroke, width=lw)
-    arrow(d, s*0.72, s*0.46, s*0.85, s*0.46, p.accent, lw)
-    arrow(d, s*0.46, s*0.72, s*0.46, s*0.85, p.accent, lw)
+    shaded_prism(d, s, s*0.18, s*0.40, s*0.44, s*0.28, s*0.12, s*0.08, p)
+    d.arc([s*0.50, s*0.16, s*0.90, s*0.56], start=95, end=350, fill=p.accent, width=lw)
+    arrow(d, s*0.82, s*0.40, s*0.88, s*0.52, p.accent, lw)
+    filled_circle(d, s*0.38, s*0.52, max(1,lw//2), p.warn)
 
 @icon("performance")
 def draw_performance(d, cell, p):
@@ -1614,42 +1848,52 @@ def draw_settings(d, cell, p):
 
 @icon("save")
 def draw_save(d, cell, p):
-    """Floppy disk."""
+    """Modern save card with inset label and corner notch."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.rounded_rectangle([s*0.15, s*0.15, s*0.85, s*0.85], radius=int(s*0.04),
-                         outline=p.stroke, width=lw)
-    # label area
-    d.rectangle([s*0.28, s*0.55, s*0.72, s*0.82], outline=p.accent, width=lw)
-    # notch top-right
-    d.polygon([(s*0.68, s*0.15), (s*0.85, s*0.15), (s*0.85, s*0.32)],
-              fill=None, outline=p.stroke)
-    d.line([(s*0.68, s*0.15), (s*0.85, s*0.32)], fill=p.stroke, width=lw)
+    d.rounded_rectangle([s*0.15, s*0.13, s*0.85, s*0.87], radius=int(s*0.06),
+                         fill=_rgba(p.stroke, 24), outline=p.stroke, width=lw)
+    d.polygon([(s*0.63, s*0.13), (s*0.85, s*0.13), (s*0.85, s*0.35)],
+              fill=_rgba(p.accent, 54))
+    d.line([(s*0.63, s*0.13), (s*0.85, s*0.35)], fill=p.stroke, width=lw)
+    d.rounded_rectangle([s*0.27, s*0.54, s*0.73, s*0.80], radius=int(s*0.035),
+                         fill=_rgba(p.accent, 34), outline=p.accent, width=lw)
+    d.line([(s*0.33, s*0.32), (s*0.61, s*0.32)], fill=p.stroke, width=lw)
+    d.line([(s*0.33, s*0.42), (s*0.69, s*0.42)], fill=_rgba(p.stroke, 130), width=max(1, lw//2))
 
 @icon("open")
 def draw_open(d, cell, p):
-    """Folder with up-arrow."""
+    """Open folder with import arrow."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.rounded_rectangle([s*0.12, s*0.32, s*0.88, s*0.80], radius=int(s*0.05),
-                         outline=p.stroke, width=lw)
-    d.rectangle([s*0.12, s*0.26, s*0.45, s*0.36], outline=p.stroke, width=lw)
-    arrow(d, s*0.5, s*0.62, s*0.5, s*0.42, p.accent, lw)
+    d.rounded_rectangle([s*0.10, s*0.34, s*0.90, s*0.80], radius=int(s*0.06),
+                         fill=_rgba(p.stroke, 24), outline=p.stroke, width=lw)
+    d.rounded_rectangle([s*0.12, s*0.24, s*0.48, s*0.40], radius=int(s*0.035),
+                         fill=_rgba(p.accent, 45), outline=p.stroke, width=lw)
+    d.polygon([(s*0.15, s*0.43), (s*0.87, s*0.43), (s*0.76, s*0.82), (s*0.08, s*0.82)],
+              fill=_rgba(p.accent, 35))
+    d.line([(s*0.15, s*0.43), (s*0.87, s*0.43), (s*0.76, s*0.82), (s*0.08, s*0.82),
+            (s*0.15, s*0.43)], fill=p.stroke, width=lw)
+    arrow(d, s*0.53, s*0.67, s*0.53, s*0.47, p.accent, lw)
 
 @icon("new_doc")
 def draw_new_doc(d, cell, p):
-    """Page with dog-ear + plus."""
+    """New document page with folded corner and plus."""
     s = cell * SS
     lw = stroke_width(cell)
     fold = s * 0.22
     pts = [(s*0.22, s*0.12), (s*0.78 - fold, s*0.12),
            (s*0.78, s*0.12 + fold), (s*0.78, s*0.88),
            (s*0.22, s*0.88)]
-    d.polygon(pts, fill=None, outline=p.stroke)
+    d.polygon(pts, fill=_rgba(p.stroke, 22), outline=p.stroke)
     d.line(pts + [pts[0]], fill=p.stroke, width=lw)
+    d.polygon([(s*0.78 - fold, s*0.12), (s*0.78 - fold, s*0.12 + fold),
+               (s*0.78, s*0.12 + fold)], fill=_rgba(p.accent, 48))
     d.line([(s*0.78 - fold, s*0.12), (s*0.78 - fold, s*0.12 + fold),
             (s*0.78, s*0.12 + fold)], fill=p.stroke, width=lw)
-    plus_sign(d, s*0.5, s*0.56, s*0.16, p.accent, lw)
+    d.rounded_rectangle([s*0.34, s*0.46, s*0.66, s*0.78], radius=int(s*0.04),
+                         fill=_rgba(p.accent, 34), outline=p.accent, width=lw)
+    plus_sign(d, s*0.5, s*0.62, s*0.12, p.accent, lw)
 
 @icon("undo")
 def draw_undo(d, cell, p):
@@ -1657,9 +1901,10 @@ def draw_undo(d, cell, p):
     lw = stroke_width(cell)
     cx, cy = s*0.52, s*0.52
     r = s*0.30
-    arc_segment(d, cx, cy, r, 180, 360, p.stroke, lw)
-    arc_segment(d, cx, cy, r, 0, 90, p.stroke, lw)
-    arrow(d, cx - r, cy, cx - r - s*0.1, cy - s*0.14, p.stroke, lw)
+    arc_segment(d, cx, cy, r, 182, 360, p.stroke, lw*2)
+    arc_segment(d, cx, cy, r, 0, 92, _rgba(p.accent, 190), lw*2)
+    arrow(d, cx - r, cy, cx - r - s*0.11, cy - s*0.14, p.stroke, lw*2)
+    filled_circle(d, cx + r*0.62, cy - r*0.52, max(1, lw//2), p.accent)
 
 @icon("redo")
 def draw_redo(d, cell, p):
@@ -1667,9 +1912,10 @@ def draw_redo(d, cell, p):
     lw = stroke_width(cell)
     cx, cy = s*0.48, s*0.52
     r = s*0.30
-    arc_segment(d, cx, cy, r, 180, 360, p.stroke, lw)
-    arc_segment(d, cx, cy, r, 90, 180, p.stroke, lw)
-    arrow(d, cx + r, cy, cx + r + s*0.1, cy - s*0.14, p.stroke, lw)
+    arc_segment(d, cx, cy, r, 180, 358, p.stroke, lw*2)
+    arc_segment(d, cx, cy, r, 88, 180, _rgba(p.accent, 190), lw*2)
+    arrow(d, cx + r, cy, cx + r + s*0.11, cy - s*0.14, p.stroke, lw*2)
+    filled_circle(d, cx - r*0.62, cy - r*0.52, max(1, lw//2), p.accent)
 
 @icon("theme_toggle")
 def draw_theme_toggle(d, cell, p):
@@ -1792,60 +2038,60 @@ def draw_refresh(d, cell, p):
 
 @icon("rect_3pt_corner")
 def draw_rect_3pt_corner(d, cell, p):
-    """Rectangle with 3-point annotation dots on two corners + midpoint."""
+    """Three-point corner rectangle with numbered construction points."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.rectangle([s*0.15, s*0.25, s*0.85, s*0.75], outline=p.stroke, width=lw)
+    d.rounded_rectangle([s*0.15, s*0.25, s*0.85, s*0.75], radius=int(s*0.025),
+                         fill=_rgba(p.stroke, 12), outline=p.stroke, width=lw)
     for x, y in [(s*0.15, s*0.25), (s*0.85, s*0.25), (s*0.85, s*0.75)]:
-        filled_circle(d, x, y, lw, p.accent)
-    # small 3 label hint (three dots in triangle)
-    for ox, oy in [(-0.06, -0.11), (0, -0.11), (0.06, -0.11)]:
-        filled_circle(d, s*0.5 + ox*s, s*0.13 + oy*s, lw*0.6, p.accent)
+        filled_circle(d, x, y, lw*1.05, p.accent)
+        circle(d, x, y, lw*1.65, outline=p.stroke, lw=max(1, lw//2))
+    d.line([(s*0.15, s*0.25), (s*0.85, s*0.75)], fill=_rgba(p.accent, 95), width=max(1,lw//2))
 
 @icon("rect_3pt_center")
 def draw_rect_3pt_center(d, cell, p):
-    """Rectangle with center + 3 control points."""
+    """Three-point center rectangle."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.rectangle([s*0.15, s*0.25, s*0.85, s*0.75], outline=p.stroke, width=lw)
-    filled_circle(d, s*0.5, s*0.5, lw, p.accent)
+    d.rounded_rectangle([s*0.15, s*0.25, s*0.85, s*0.75], radius=int(s*0.025),
+                         fill=_rgba(p.stroke, 12), outline=p.stroke, width=lw)
+    filled_circle(d, s*0.5, s*0.5, lw*1.05, p.accent)
     d.line([(s*0.15, s*0.5), (s*0.85, s*0.5)], fill=p.accent, width=lw)
     d.line([(s*0.5, s*0.25), (s*0.5, s*0.75)], fill=p.accent, width=lw)
-    for ox, oy in [(-0.06, -0.11), (0, -0.11), (0.06, -0.11)]:
-        filled_circle(d, s*0.5 + ox*s, s*0.13 + oy*s, lw*0.6, p.accent)
+    for x, y in [(s*0.15,s*0.25),(s*0.85,s*0.25),(s*0.85,s*0.75)]:
+        circle(d, x, y, lw*1.25, outline=p.accent, lw=max(1,lw//2))
 
 @icon("parallelogram")
 def draw_parallelogram(d, cell, p):
-    """Parallelogram shape."""
+    """Parallelogram with three pick handles."""
     s = cell * SS
     lw = stroke_width(cell)
     pts = [(s*0.30, s*0.25), (s*0.85, s*0.25), (s*0.70, s*0.75), (s*0.15, s*0.75)]
-    d.polygon(pts, fill=None, outline=p.stroke)
+    d.polygon(pts, fill=_rgba(p.stroke, 14), outline=p.stroke)
     d.line([pts[0], pts[1], pts[2], pts[3], pts[0]], fill=p.stroke, width=lw)
-    filled_circle(d, pts[0][0], pts[0][1], lw, p.accent)
+    for pt in [pts[0], pts[1], pts[3]]:
+        filled_circle(d, pt[0], pt[1], lw, p.accent)
 
 @icon("circle_perimeter")
 def draw_circle_perimeter(d, cell, p):
-    """Circle with perimeter point instead of center point."""
+    """Circle by three perimeter points."""
     s = cell * SS
     lw = stroke_width(cell) * 2
     cx, cy = s/2, s/2
     r = s * 0.32
-    circle(d, cx, cy, r, outline=p.stroke, lw=lw)
-    # accent dot on perimeter (top)
-    filled_circle(d, cx, cy - r, lw, p.accent)
-    # two additional perimeter dots
-    filled_circle(d, cx + r*0.87, cy + r*0.5, lw*0.7, p.accent)
-    filled_circle(d, cx - r*0.87, cy + r*0.5, lw*0.7, p.accent)
+    circle(d, cx, cy, r, fill=_rgba(p.stroke, 10), outline=p.stroke, lw=lw)
+    for x, y in [(cx, cy-r), (cx + r*0.87, cy + r*0.5), (cx - r*0.87, cy + r*0.5)]:
+        filled_circle(d, x, y, lw*0.75, p.accent)
+        circle(d, x, y, lw*1.25, outline=p.stroke, lw=max(1,lw//3))
 
 @icon("slot_ctr_str")
 def draw_slot_ctr_str(d, cell, p):
-    """Centerpoint straight slot — oblong with center dot."""
+    """Centerpoint straight slot with centerline."""
     s = cell * SS
     lw = stroke_width(cell)
     d.rounded_rectangle([s*0.15, s*0.35, s*0.85, s*0.65], radius=int(s*0.15),
-                         outline=p.stroke, width=lw)
-    filled_circle(d, s*0.5, s*0.5, lw, p.accent)
+                         fill=_rgba(p.stroke, 14), outline=p.stroke, width=lw)
+    filled_circle(d, s*0.5, s*0.5, lw*1.1, p.accent)
     d.line([(s*0.15, s*0.5), (s*0.85, s*0.5)], fill=p.accent, width=lw)
 
 @icon("slot_arc_3pt")
@@ -1853,10 +2099,8 @@ def draw_slot_arc_3pt(d, cell, p):
     """3-point arc slot — slot following a curved arc."""
     s = cell * SS
     lw = stroke_width(cell)
-    # curved arc path
     arc_segment(d, s*0.5, s*0.75, s*0.38, 210, 330, p.stroke, lw)
     arc_segment(d, s*0.5, s*0.75, s*0.52, 210, 330, p.stroke, lw)
-    # end caps
     for angle in [210, 330]:
         a = math.radians(angle)
         cx1 = s*0.5 + s*0.38*math.cos(a)
@@ -1864,12 +2108,12 @@ def draw_slot_arc_3pt(d, cell, p):
         cx2 = s*0.5 + s*0.52*math.cos(a)
         cy2 = s*0.75 + s*0.52*math.sin(a)
         d.line([(cx1, cy1), (cx2, cy2)], fill=p.stroke, width=lw)
-    # 3-pt dots
     for angle in [210, 270, 330]:
         a = math.radians(angle)
         cx = s*0.5 + s*0.45*math.cos(a)
         cy = s*0.75 + s*0.45*math.sin(a)
-        filled_circle(d, cx, cy, lw*0.7, p.accent)
+        filled_circle(d, cx, cy, lw*0.9, p.accent)
+    arc_segment(d, s*0.5, s*0.75, s*0.45, 214, 326, _rgba(p.accent, 145), max(1,lw//2))
 
 @icon("slot_arc_ctr")
 def draw_slot_arc_ctr(d, cell, p):
@@ -1885,8 +2129,8 @@ def draw_slot_arc_ctr(d, cell, p):
         cx2 = s*0.5 + s*0.52*math.cos(a)
         cy2 = s*0.75 + s*0.52*math.sin(a)
         d.line([(cx1, cy1), (cx2, cy2)], fill=p.stroke, width=lw)
-    # center dot
-    filled_circle(d, s*0.5, s*0.75, lw, p.accent)
+    d.line([(s*0.5, s*0.75), (s*0.5, s*0.30)], fill=_rgba(p.accent, 130), width=max(1,lw//2))
+    filled_circle(d, s*0.5, s*0.75, lw*1.1, p.accent)
 
 @icon("spline_style")
 def draw_spline_style(d, cell, p):
@@ -1895,12 +2139,12 @@ def draw_spline_style(d, cell, p):
     lw = stroke_width(cell) * 2
     d.arc([s*0.15, s*0.1, s*0.65, s*0.6], start=200, end=360, fill=p.stroke, width=lw)
     d.arc([s*0.35, s*0.4, s*0.85, s*0.9], start=20, end=180, fill=p.stroke, width=lw)
-    # control polygon (dashed-style in accent)
     ctrl_pts = [(s*0.18, s*0.55), (s*0.38, s*0.22), (s*0.62, s*0.78), (s*0.82, s*0.45)]
     for i in range(len(ctrl_pts) - 1):
-        d.line([ctrl_pts[i], ctrl_pts[i+1]], fill=p.accent, width=lw//2)
+        d.line([ctrl_pts[i], ctrl_pts[i+1]], fill=_rgba(p.accent, 110), width=max(1,lw//3))
     for pt in ctrl_pts:
-        filled_circle(d, pt[0], pt[1], lw*0.6, p.accent)
+        d.rounded_rectangle([pt[0]-lw*0.7, pt[1]-lw*0.7, pt[0]+lw*0.7, pt[1]+lw*0.7],
+                             radius=int(lw*0.25), fill=p.accent)
 
 @icon("spline_surface")
 def draw_spline_surface(d, cell, p):
@@ -1908,7 +2152,7 @@ def draw_spline_surface(d, cell, p):
     s = cell * SS
     lw = stroke_width(cell)
     pts = [(s*0.1, s*0.65), (s*0.45, s*0.28), (s*0.9, s*0.38), (s*0.55, s*0.75)]
-    d.polygon(pts, fill=(*p.stroke[:3], 30))
+    d.polygon(pts, fill=_rgba(p.stroke, 30))
     d.line([pts[0], pts[1], pts[2], pts[3], pts[0]], fill=p.stroke, width=lw)
     # spline over it
     d.arc([s*0.20, s*0.18, s*0.65, s*0.62], start=200, end=360, fill=p.accent, width=lw*2)
@@ -1921,23 +2165,23 @@ def draw_spline_equation(d, cell, p):
     lw = stroke_width(cell) * 2
     d.arc([s*0.15, s*0.1, s*0.65, s*0.6], start=200, end=360, fill=p.stroke, width=lw)
     d.arc([s*0.35, s*0.4, s*0.85, s*0.9], start=20, end=180, fill=p.stroke, width=lw)
-    # '=' sign top-right
-    d.line([(s*0.70, s*0.18), (s*0.88, s*0.18)], fill=p.accent, width=lw//2)
-    d.line([(s*0.70, s*0.28), (s*0.88, s*0.28)], fill=p.accent, width=lw//2)
+    d.rounded_rectangle([s*0.66, s*0.13, s*0.90, s*0.34], radius=int(s*0.025),
+                         fill=_rgba(p.accent, 35), outline=p.accent, width=max(1,lw//3))
+    d.line([(s*0.71, s*0.20), (s*0.85, s*0.20)], fill=p.accent, width=max(1,lw//2))
+    d.line([(s*0.71, s*0.27), (s*0.85, s*0.27)], fill=p.accent, width=max(1,lw//2))
 
 @icon("ellipse_partial")
 def draw_ellipse_partial(d, cell, p):
     """Partial ellipse arc."""
     s = cell * SS
     lw = stroke_width(cell) * 2
-    # draw only part of the ellipse
     d.arc([s*0.12, s*0.28, s*0.88, s*0.72], start=30, end=250, fill=p.stroke, width=lw)
-    # endpoints
     for angle in [30, 250]:
         a = math.radians(angle)
         cx = s*0.5 + s*0.38*math.cos(a)
         cy = s*0.5 + s*0.22*math.sin(a)
-        filled_circle(d, cx, cy, lw*0.7, p.accent)
+        filled_circle(d, cx, cy, lw*0.85, p.accent)
+    d.line([(s*0.5, s*0.50), (s*0.82, s*0.61)], fill=_rgba(p.accent, 100), width=max(1,lw//3))
 
 @icon("parabola")
 def draw_parabola(d, cell, p):
@@ -1953,21 +2197,22 @@ def draw_parabola(d, cell, p):
         pts.append((x, y))
     for i in range(len(pts) - 1):
         d.line([pts[i], pts[i+1]], fill=p.stroke, width=lw)
-    # focal point
-    filled_circle(d, s*0.5, s*0.50, lw*0.7, p.accent)
-    # axis
-    d.line([(s*0.5, s*0.15), (s*0.5, s*0.78)], fill=p.accent, width=lw//2)
+    filled_circle(d, s*0.5, s*0.50, lw*0.75, p.accent)
+    d.line([(s*0.5, s*0.15), (s*0.5, s*0.78)], fill=_rgba(p.accent, 130), width=max(1,lw//2))
+    d.line([(s*0.22, s*0.35), (s*0.78, s*0.35)], fill=_rgba(p.stroke, 85), width=max(1,lw//3))
 
 @icon("conic")
 def draw_conic(d, cell, p):
-    """Conic section — ellipse with rho value indicator."""
+    """Conic curve with control handle."""
     s = cell * SS
     lw = stroke_width(cell) * 2
-    # slightly asymmetric ellipse to suggest conic
-    d.ellipse([s*0.15, s*0.25, s*0.85, s*0.75], outline=p.stroke, width=lw)
-    # diagonal cutting plane line (suggesting conic section)
-    d.line([(s*0.15, s*0.22), (s*0.85, s*0.78)], fill=p.accent, width=lw//2)
-    filled_circle(d, s*0.5, s*0.5, lw*0.7, p.accent)
+    d.arc([s*0.14, s*0.22, s*0.86, s*0.80], start=210, end=20, fill=p.stroke, width=lw)
+    handles = [(s*0.18,s*0.66),(s*0.36,s*0.20),(s*0.70,s*0.34),(s*0.84,s*0.70)]
+    d.line(handles, fill=_rgba(p.accent, 105), width=max(1,lw//3))
+    for pt in handles:
+        filled_circle(d, pt[0], pt[1], max(1,lw//2), p.accent)
+    d.rounded_rectangle([s*0.60, s*0.16, s*0.86, s*0.30], radius=int(s*0.02),
+                         fill=_rgba(p.accent, 28), outline=p.accent, width=max(1,lw//3))
 
 @icon("hide_show_eye")
 def draw_hide_show_eye(d, cell, p):

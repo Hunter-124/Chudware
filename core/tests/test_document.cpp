@@ -534,3 +534,75 @@ TEST_CASE("sweep circle (Right) along an open polyline (Top) -> solid rod [user 
     CHECK((hi[0] - lo[0]) > 100.0);
     CHECK((hi[1] - lo[1]) > 30.0);
 }
+
+// 10. EXTRUDE "UP TO" A REFERENCE PLANE. rect 30x20 on top (z=0) -> datum plane
+//     offset +15 from top -> extrude end=up_to_surface targeting that plane. The end
+//     cap must land ON the plane: bbox height == 15 (NOT a blind depth). Verifies the
+//     user-reported gap — "extrude up to the plane" now actually trims to the plane.
+TEST_CASE("extrude up to a reference plane -> end cap conforms to the plane") {
+    const double W = 30.0, H = 20.0, OFF = 15.0;
+    json doc;
+    doc["features"] = json::array({
+        sketch_feature("s1", "top", rect_entities(0, 0, W, H)),
+        json{{"id", "p1"}, {"type", "plane"}, {"method", "offset"},
+             {"base", "plane.top"}, {"offset", OFF}},
+        json{{"id", "x1"}, {"type", "extrude"}, {"profile", "s1"},
+             {"end", "up_to_surface"},
+             {"up_to", json{{"kind", "datum"}, {"feature", "p1"}}}},
+    });
+
+    CompileResult r = compile_document(doc, json::object());
+    for (const auto& s : r.statuses)
+        if (!s.ok) MESSAGE("feature " << s.id << " error: " << s.error);
+    REQUIRE(r.ok);
+    REQUIRE(r.body_count == 1);
+
+    render::DocMesh dm = parse(r);
+    REQUIRE(dm.bodies.size() == 1);
+    const render::BodyMesh& b = dm.bodies[0];
+    check_common(b);
+    double lo[3], hi[3];
+    bbox(b, lo, hi);
+    MESSAGE("up-to-plane: faces=" << b.faces.size() << " bbox=" << (hi[0]-lo[0])
+            << "x" << (hi[1]-lo[1]) << "x" << (hi[2]-lo[2]));
+    CHECK(b.faces.size() == 6);                                  // clean box, end on the plane
+    CHECK((hi[0] - lo[0]) == doctest::Approx(W).epsilon(1e-4));
+    CHECK((hi[1] - lo[1]) == doctest::Approx(H).epsilon(1e-4));
+    CHECK((hi[2] - lo[2]) == doctest::Approx(OFF).epsilon(1e-4));   // trimmed to the plane
+    CHECK(lo[2] == doctest::Approx(0.0).epsilon(1e-4));
+    CHECK(hi[2] == doctest::Approx(OFF).epsilon(1e-4));
+}
+
+// 11. EXTRUDE "FROM" A REFERENCE PLANE. rect on top (z=0) -> datum plane offset +5 ->
+//     extrude start=from_reference (start at that plane) + blind depth 10. The solid
+//     must start at z=5 and end at z=15 — the "From = reference plane" the user wanted.
+TEST_CASE("extrude from a reference plane -> profile starts at the plane") {
+    const double W = 30.0, H = 20.0, START = 5.0, D = 10.0;
+    json doc;
+    doc["features"] = json::array({
+        sketch_feature("s1", "top", rect_entities(0, 0, W, H)),
+        json{{"id", "p1"}, {"type", "plane"}, {"method", "offset"},
+             {"base", "plane.top"}, {"offset", START}},
+        json{{"id", "x1"}, {"type", "extrude"}, {"profile", "s1"},
+             {"start", "from_reference"},
+             {"start_ref", json{{"kind", "datum"}, {"feature", "p1"}}},
+             {"end", "blind"}, {"depth", D}},
+    });
+
+    CompileResult r = compile_document(doc, json::object());
+    for (const auto& s : r.statuses)
+        if (!s.ok) MESSAGE("feature " << s.id << " error: " << s.error);
+    REQUIRE(r.ok);
+    REQUIRE(r.body_count == 1);
+
+    render::DocMesh dm = parse(r);
+    REQUIRE(dm.bodies.size() == 1);
+    const render::BodyMesh& b = dm.bodies[0];
+    check_common(b);
+    double lo[3], hi[3];
+    bbox(b, lo, hi);
+    MESSAGE("from-plane: bbox z=[" << lo[2] << "," << hi[2] << "]");
+    CHECK((hi[2] - lo[2]) == doctest::Approx(D).epsilon(1e-4));
+    CHECK(lo[2] == doctest::Approx(START).epsilon(1e-4));        // starts AT the plane
+    CHECK(hi[2] == doctest::Approx(START + D).epsilon(1e-4));
+}

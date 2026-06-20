@@ -2125,6 +2125,42 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     gp_Pnt c = g.CentreOfMass();
                     return Eigen::Vector3d(c.X(), c.Y(), c.Z());
                 };
+                // --- start condition (SW "From"): shift the profile along `dir` so the
+                // extrude can begin at an offset, at a reference plane, or plane+offset
+                // (default sketch_plane = no shift). A reference is a datum plane OR a
+                // planar model face — resolved by plane_of (datum.py::_plane_of), which
+                // is what lets the user pick a reference PLANE, not just a model face.
+                {
+                    const std::string start =
+                        feat.value("start", std::string("sketch_plane"));
+                    const double soff = feat.contains("start_offset")
+                        ? num_or_expr(feat.at("start_offset"), env) : 0.0;
+                    double start_shift = 0.0;
+                    if (start == "offset") {
+                        start_shift = soff;
+                    } else if (start == "from_reference" ||
+                               start == "offset_from_reference") {
+                        if (!feat.contains("start_ref"))
+                            throw std::runtime_error("extrude: " + start +
+                                " needs a `start_ref` plane/surface reference");
+                        aicad::geom::SketchPlane sp =
+                            plane_of(feat.at("start_ref"), "start_ref");
+                        start_shift = dir.dot(sp.origin - face_center(faces[0]));
+                        if (start == "offset_from_reference") start_shift += soff;
+                    }
+                    if (std::abs(start_shift) > 1e-12) {
+                        Eigen::Vector3d sv = dir * start_shift;
+                        for (TopoDS_Face& f : faces)
+                            f = TopoDS::Face(::geom::translate_copy(f, sv));
+                    }
+                }
+
+                // Up-to-plane end state: when set, the prism is built with an overshoot
+                // depth and then trimmed to `trim_plane` (+ optional offset) after the
+                // build, so the end cap conforms to the reference plane/planar surface.
+                bool trim_to_plane = false;
+                aicad::geom::SketchPlane trim_plane;
+                double end_offset_val = 0.0;
 
                 double depth;
                 if (end == "through_all") {
@@ -2154,6 +2190,34 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     depth = dir.dot(vp - pc);
                     if (!(depth > 1e-9))
                         throw std::runtime_error("extrude: up_to_vertex is behind the profile");
+                    mid_plane = false;
+                } else if (end == "up_to_surface" || end == "offset_from_surface" ||
+                           end == "up_to_reference" || end == "offset_from_reference") {
+                    // Up to a reference PLANE or planar surface (+ optional offset). The
+                    // surface/plane forms read the `up_to` well; the *_reference forms
+                    // read `end_ref`. Both resolve a datum plane or a planar face.
+                    const char* slot =
+                        (end == "up_to_reference" || end == "offset_from_reference")
+                            ? "end_ref" : "up_to";
+                    if (!feat.contains(slot))
+                        throw std::runtime_error(std::string("extrude: ") + end +
+                            " needs an `" + slot + "` plane/surface reference");
+                    trim_plane = plane_of(feat.at(slot), slot);
+                    trim_to_plane = true;
+                    if (end == "offset_from_surface")
+                        end_offset_val = feat.contains("offset")
+                            ? num_or_expr(feat.at("offset"), env) : 0.0;
+                    else if (end == "offset_from_reference")
+                        end_offset_val = feat.contains("end_offset")
+                            ? num_or_expr(feat.at("end_offset"), env) : 0.0;
+                    // Orient `dir` toward the plane, then overshoot far enough to fully
+                    // cross it; the post-build half-space trim conforms the end cap to
+                    // the plane (handles parallel AND angled references).
+                    Eigen::Vector3d pc = face_center(faces[0]);
+                    double along = dir.dot(trim_plane.origin - pc);
+                    if (along < 0) { dir = -dir; along = -along; }
+                    depth = along + bbox_diag_of_face(faces[0]) * 2.0 +
+                            std::abs(end_offset_val) + 10.0;
                     mid_plane = false;
                 } else {
                     depth = num_or_expr(feat.at("depth"), env);
@@ -2206,6 +2270,41 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 }
                 if (solid.IsNull())
                     throw std::runtime_error("extrude produced no solid");
+
+                // --- up-to-plane trim: cut away the overshoot beyond the reference
+                // plane (+ offset) so the end cap lands exactly on the plane. The
+                // half-space box's near face IS the cut plane; it fills the beyond-plane
+                // (overshoot) side, so subtracting it keeps profile -> plane.
+                if (trim_to_plane) {
+                    Eigen::Vector3d pc = face_center(faces[0]);
+                    Eigen::Vector3d n = trim_plane.normal.normalized();
+                    Eigen::Vector3d q = trim_plane.origin;
+                    // removalN points from the plane toward the overshoot (away from the
+                    // profile); a positive offset extends material that far past the plane.
+                    Eigen::Vector3d removalN = ((pc - q).dot(n) >= 0) ? -n : n;
+                    Eigen::Vector3d cutPoint = q + removalN * end_offset_val;
+                    double reach = aicad::doc::bbox_diag(solid) * 2.0 + 50.0;
+                    aicad::geom::SketchPlane cut =
+                        aicad::geom::SketchPlane::from(cutPoint, removalN);
+                    Eigen::Vector3d corner =
+                        cut.origin - cut.uAxis * reach - cut.vAxis * reach;
+                    gp_Ax2 box_frame(gp_Pnt(corner.x(), corner.y(), corner.z()),
+                                     gp_Dir(cut.normal.x(), cut.normal.y(), cut.normal.z()),
+                                     gp_Dir(cut.uAxis.x(), cut.uAxis.y(), cut.uAxis.z()));
+                    TopoDS_Shape hs =
+                        BRepPrimAPI_MakeBox(box_frame, 2 * reach, 2 * reach, 2 * reach).Shape();
+                    if (hs.IsNull())
+                        throw std::runtime_error("extrude up-to: failed to build the trim half-space");
+                    TopoDS_Shape trimmed = ::geom::cut(solid, hs);
+                    if (trimmed.IsNull())
+                        throw std::runtime_error("extrude up-to: trim to the reference plane failed");
+                    GProp_GProps gtrim; BRepGProp::VolumeProperties(trimmed, gtrim);
+                    if (!(gtrim.Mass() > 1e-9))
+                        throw std::runtime_error(
+                            "extrude up-to: the reference plane/surface does not intersect the extrusion");
+                    TopoDS_Shape unified = ::geom::unify_same_domain(trimmed);
+                    solid = unified.IsNull() ? trimmed : unified;
+                }
 
                 if (is_cut) {
                     if (tgt_id.empty())

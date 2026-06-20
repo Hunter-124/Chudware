@@ -2582,7 +2582,31 @@ void PropertyManager::drawBody(AppState& st) {
                     for (int n = 0; n < (int)labels.size(); ++n) {
                         bool sel = (f.comboIndex == n);
                         if (ImGui::Selectable(labels[n].c_str(), sel)) {
-                            if (enabled) { f.comboIndex = n; dirty_ = true; lastEditTime_ = ImGui::GetTime(); }
+                            if (enabled) {
+                                f.comboIndex = n; dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                                // SolidWorks: choosing an end/start condition that reveals a
+                                // reference selection box auto-activates that box, so the next
+                                // viewport click picks the plane/face/vertex (without this the
+                                // active well stays on `profile` and the plane picker never arms).
+                                // Re-home the active well onto the first now-visible, empty
+                                // selector well gated by THIS combo.
+                                const char* ckey = f.def->key;
+                                PMField* reveal = nullptr;
+                                for (auto& w : fields_) {
+                                    if (w.def->kind != PMFieldKind::SelectorWell) continue;
+                                    if (!w.def->enableKey ||
+                                        std::strcmp(w.def->enableKey, ckey) != 0) continue;
+                                    if (!w.picks.empty() || !fieldVisible(*w.def, fields_)) continue;
+                                    reveal = &w; break;
+                                }
+                                if (reveal) {
+                                    for (auto& o : fields_)
+                                        if (o.def->kind == PMFieldKind::SelectorWell ||
+                                            o.def->kind == PMFieldKind::FeatureWell)
+                                            o.wellActive = false;
+                                    reveal->wellActive = true;
+                                }
+                            }
                         }
                         if (sel) ImGui::SetItemDefaultFocus();
                     }

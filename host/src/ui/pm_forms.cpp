@@ -130,6 +130,14 @@ static const PMSelKinds K_BODY   {false, false, false, true};  // solid body (bo
 // plane=true arms SketchMode::drawPlanePicker so the 3 origin planes become clickable. Used for the
 // datum-axis "Two Planes" refs and the datum-plane "Mid Plane" second reference.
 static const PMSelKinds K_PLANE  {true, false, false, false, true};
+// Planar reference target: a planar model FACE (id-buffer pick) OR a datum PLANE
+// (plane picker). Same flags as K_PLANE but named for the extrude "Up To" / "From"
+// references so a reference PLANE (origin or created datum) is a valid pick, not just
+// a model face. The engine resolves either form (resolve_plane_ref / planar face).
+static const PMSelKinds K_FACEPLANE     {true, false, false, false, true};
+// Face, vertex, OR datum plane — the extrude "Up To" target (up_to_surface picks a
+// plane/planar face; up_to_vertex picks a vertex). plane=true arms the plane picker.
+static const PMSelKinds K_FACEVERTPLANE {true, false, true,  false, true};
 // Axis reference: a straight model edge (id-buffer pick) OR a created datum AXIS (clicked in the
 // viewport via the axis picker, routed as a {kind:datum,feature} ref). edge=true keeps model-edge
 // picking; axis=true arms SketchMode::drawAxisPicker. Used for revolve / circular-pattern axes.
@@ -164,7 +172,7 @@ static const std::vector<PMFormDef>& forms() {
             ComboL    ("start",    "Start Condition", "From",
                        "sketch_plane|offset|from_reference|offset_from_reference",
                        "Sketch Plane|Offset|From Ref.|Offset Ref."),
-            WellIf    ("start_ref","Start Reference", "From",        K_FACE, false,
+            WellIf    ("start_ref","Start Reference", "From",        K_FACEPLANE, false,
                        "start", "from_reference|offset_from_reference"),
             DimIf     ("start_offset", "Start Offset","From",        0.0,
                        "start", "offset|offset_from_reference", true),
@@ -172,14 +180,14 @@ static const std::vector<PMFormDef>& forms() {
                                                                      "Boss|Cut"),
             ComboL    ("end",      "End Condition",   "Direction 1",
                        "blind|mid_plane|through_all|up_to_next|up_to_surface|offset_from_surface|up_to_body|up_to_vertex|up_to_reference|offset_from_reference",
-                       "Blind|Mid Plane|Through All|Up To Next|Up To Surface|Offset Surface|Up To Body|Up To Vertex|Up To Ref.|Offset Ref."),
+                       "Blind|Mid Plane|Through All|Up To Next|Up To Plane/Surface|Offset Plane/Surf.|Up To Body|Up To Vertex|Up To Ref.|Offset Ref."),
             DimIf     ("depth",    "Depth",           "Direction 1", 10.0,
                        "end", "blind|mid_plane", true),
-            WellIf    ("up_to",    "Up To Reference", "Direction 1", K_FACEVERT, false,
+            WellIf    ("up_to",    "Up To Reference", "Direction 1", K_FACEVERTPLANE, false,
                        "end", "up_to_surface|offset_from_surface|up_to_body|up_to_vertex"),
             DimIf     ("offset",   "Offset",          "Direction 1", 0.0,
                        "end", "offset_from_surface", true),
-            WellIf    ("end_ref",  "End Reference",   "Direction 1", K_FACE, false,
+            WellIf    ("end_ref",  "End Reference",   "Direction 1", K_FACEPLANE, false,
                        "end", "up_to_reference|offset_from_reference"),
             DimIf     ("end_offset","End Offset",      "Direction 1", 0.0,
                        "end", "offset_from_reference", true),
@@ -190,12 +198,12 @@ static const std::vector<PMFormDef>& forms() {
                        "end", "blind|mid_plane"),
             ComboL    ("end2",     "End Condition",   "Direction 2",
                        "none|blind|through_all|up_to_next|up_to_surface|offset_from_surface|up_to_body|up_to_vertex|up_to_reference|offset_from_reference",
-                       "None|Blind|Through All|Up To Next|Up To Surface|Offset Surface|Up To Body|Up To Vertex|Up To Ref.|Offset Ref."),
-            WellIf    ("up_to2",   "Up To Reference", "Direction 2", K_FACEVERT, false,
+                       "None|Blind|Through All|Up To Next|Up To Plane/Surface|Offset Plane/Surf.|Up To Body|Up To Vertex|Up To Ref.|Offset Ref."),
+            WellIf    ("up_to2",   "Up To Reference", "Direction 2", K_FACEVERTPLANE, false,
                        "end2", "up_to_surface|offset_from_surface|up_to_body|up_to_vertex"),
             DimIf     ("offset2",  "Offset",          "Direction 2", 0.0,
                        "end2", "offset_from_surface", true),
-            WellIf    ("end2_ref", "End Reference",   "Direction 2", K_FACE, false,
+            WellIf    ("end2_ref", "End Reference",   "Direction 2", K_FACEPLANE, false,
                        "end2", "up_to_reference|offset_from_reference"),
             DimIf     ("end2_offset","End Offset",     "Direction 2", 0.0,
                        "end2", "offset_from_reference", true),

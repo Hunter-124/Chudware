@@ -470,13 +470,15 @@ def _ecad_to_3d(params: dict, _emit: EmitFn) -> dict:
         actual_step = step_result.get("path", step_path) if isinstance(step_result, dict) else step_path
         result: dict = {"step_path": actual_step}
 
-        # Optionally import the STEP into an existing CAD doc session.
+        # Optionally build the importable part-doc for an existing CAD doc. board_to_part_doc
+        # returns a self-contained aicad.part/1 dict (one `import` feature referencing the STEP);
+        # the host opens/imports it through the C++ core (doc_open / import_file), so this no
+        # longer touches the Python doc engine.
         if into_doc_id:
             try:
-                from engine.doc import session as docsess
-                cad_s = docsess.get_session(into_doc_id)
                 part_result = _threed_mod.board_to_part_doc(s.doc, actual_step)
-                result["part_doc_id"] = part_result.get("doc_id") if isinstance(part_result, dict) \
+                result["part_doc"] = part_result
+                result["part_doc_id"] = part_result.get("id") if isinstance(part_result, dict) \
                     else str(part_result)
             except Exception as exc:  # noqa: BLE001
                 result["part_doc_id_warning"] = f"board_to_part_doc failed: {exc}"

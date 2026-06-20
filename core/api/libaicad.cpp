@@ -1617,6 +1617,14 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 return emit(aicad::doc::mesh_read_raw(params.value("path", std::string()),
                                                       params.value("format", std::string())),
                             out_json, 0);
+            if (m == "vendor_part_insert")
+                return emit(aicad::doc::doc_vendor_part_insert(
+                                params.contains("into") ? params.value("into", std::string())
+                                                        : params.value("doc_id", std::string()),
+                                params.value("supplier", std::string()),
+                                params.value("part_number", std::string()),
+                                params.value("name", std::string())),
+                            out_json, 0);
             // --- 2D DRAWING projection + export (engine/doc/drawing.py + export2d.py) ---
             // STATELESS diagnostic form (the strangler parity probe): compile a part
             // tree + project its views via OCCT HLR, or pool the views to DXF/PDF.

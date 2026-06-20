@@ -269,6 +269,13 @@ nlohmann::json doc_export_file(const std::string& doc_id, const std::string& pat
 nlohmann::json doc_import_file(const std::string& path, const std::string& into,
                                bool as_solid, const std::string& fmt);
 
+// Insert a registered supplier/vendor CAD part as an `import` feature. Reads the Python-written
+// vendor registry index (%APPDATA%/AI-CAD/vendor_parts/index.json), resolves the cached CAD path +
+// metadata for slug(supplier)::slug(part_number), and applies an import op carrying the vendor_*
+// params. `into` empty -> mint a new part doc. Port of engine/vendor_parts.py::_vendor_part_insert.
+nlohmann::json doc_vendor_part_insert(const std::string& into, const std::string& supplier,
+                                      const std::string& part_number, const std::string& name);
+
 // STATELESS diagnostic: read a mesh file into its RAW per-object meshes (no sewing) and
 // return {"objects": [{"name", "verts":[x,y,z,...], "tris":[i,j,k,...]}, ...]}. Used by
 // the 3MF bit-parity gate to compare the C++ lib3mf extraction against the Python oracle

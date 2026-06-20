@@ -600,20 +600,16 @@ def step10_threed(board, tmpdir):
             _info(f"Warnings: {summary['warnings']}")
 
         part_doc = board_to_part_doc(board, step_path)
-        from engine.doc.schema import validate_document
-        val_errs = validate_document(part_doc)
-        status = "OK (0 errors)" if not val_errs else f"FAILED: {val_errs[:3]}"
-        _info(f"board_to_part_doc validation: {status}")
+        # Structural self-check (the doc compiles/validates in the C++ core now; the Python
+        # doc engine is gone, so verify the envelope shape here instead).
+        ok = (isinstance(part_doc, dict)
+              and part_doc.get("schema") == "aicad.part/1"
+              and isinstance(part_doc.get("features"), list)
+              and len(part_doc["features"]) >= 1)
+        _info(f"board_to_part_doc envelope: {'OK' if ok else 'MALFORMED'}")
         _info(f"part_doc features: {[f['type'] for f in part_doc['features']]}")
 
-        try:
-            from engine.doc.compiler import compile_document
-            cr = compile_document(part_doc)
-            _info(f"compile_document: bodies={len(getattr(cr, 'bodies', []))}")
-        except Exception as ce:
-            _info(f"compile_document: {type(ce).__name__}: {ce}")
-
-        _pass("3D STEP exported and part_doc validated")
+        _pass("3D STEP exported and part_doc built")
     except ImportError as e:
         _skip(f"OCP/build123d not available: {e}")
     except Exception as e:

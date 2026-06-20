@@ -2448,10 +2448,11 @@ json sketch_params(const json& feat) {
 
 // session.py::_resolve_sketch_plane — resolve refs.plane to a SketchPlane. Reserved
 // datums ("plane.top/front/right" or bare "top/front/right") map to the factory
-// frames; a plane-FEATURE id (offset/midplane/etc.) is resolved by recompiling the
-// doc and reading that feature's plane — but compile_document does not surface the
-// per-feature plane, so for now non-reserved refs fall back to the reserved name
-// match (the interactive fixtures sketch on reserved planes). Throws on no plane ref.
+// frames; a plane-FEATURE id (offset/midplane/angle/etc.) is resolved by recompiling
+// the doc and reading that feature's resolved plane out of CompileResult.datums (which
+// now surfaces per-feature plane geometry — origin + x_dir/y_dir/normal). Only the
+// reserved factory frames are tried first; an unknown ref falls back to TOP. Throws on
+// no plane ref.
 aicad::geom::SketchPlane resolve_sketch_plane(Session& s, const json& feat) {
     json plane_ref;
     if (feat.contains("refs") && feat["refs"].is_object() && feat["refs"].contains("plane"))
@@ -2467,8 +2468,36 @@ aicad::geom::SketchPlane resolve_sketch_plane(Session& s, const json& feat) {
         name = plane_ref["feature"].get<std::string>();
     std::string bare = name;
     if (bare.rfind("plane.", 0) == 0) bare = bare.substr(6);
+    if (bare == "top")   return aicad::geom::SketchPlane::top();
     if (bare == "front") return aicad::geom::SketchPlane::front();
     if (bare == "right") return aicad::geom::SketchPlane::right();
+
+    // Non-reserved ref: a created datum-plane feature (offset/midplane/angle/three_point/
+    // …). Recompile and read its resolved frame from the datums side-channel so the sketch
+    // lands ON that plane (origin + offset) instead of silently falling back to TOP — which
+    // was the long-standing "offset plane sketches on the base plane" bug.
+    if (!name.empty()) {
+        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        if (r.datums.is_array()) {
+            auto v3 = [](const json& a, const Eigen::Vector3d& dflt) -> Eigen::Vector3d {
+                if (a.is_array() && a.size() == 3 && a[0].is_number())
+                    return Eigen::Vector3d(a[0].get<double>(), a[1].get<double>(),
+                                           a[2].get<double>());
+                return dflt;
+            };
+            for (const json& d : r.datums) {
+                if (!d.is_object() || d.value("id", std::string()) != name) continue;
+                const std::string k = d.value("kind", std::string());
+                if (k != "plane" && k != "csys") break;  // axis/point/curve aren't sketchable
+                aicad::geom::SketchPlane p;
+                p.origin = v3(d.value("origin", json()), Eigen::Vector3d(0, 0, 0));
+                p.uAxis  = v3(d.value("x_dir",  json()), Eigen::Vector3d(1, 0, 0));
+                p.vAxis  = v3(d.value("y_dir",  json()), Eigen::Vector3d(0, 1, 0));
+                p.normal = v3(d.value("normal", json()), Eigen::Vector3d(0, 0, 1));
+                return p;
+            }
+        }
+    }
     return aicad::geom::SketchPlane::top();
 }
 
@@ -4932,6 +4961,110 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
 
     json resp = apply_ops_locked(*s, -1, ops, /*coalesce=*/false);
     resp["doc_id"] = s->doc_id;
+    return resp;
+}
+
+// Slug a string the SAME way engine/vendor_parts.py::slug does: trim whitespace, collapse every
+// run of chars outside [A-Za-z0-9_.-] to a single '-', strip leading/trailing '-', lowercase;
+// empty -> "part". Used to rebuild the vendor index key `slug(supplier)::slug(part_number)`.
+static std::string vendor_slug(const std::string& v) {
+    size_t b = v.find_first_not_of(" \t\r\n");
+    size_t e = v.find_last_not_of(" \t\r\n");
+    std::string s = (b == std::string::npos) ? std::string() : v.substr(b, e - b + 1);
+    std::string t;
+    bool prev_dash = false;
+    for (char c : s) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
+        if (ok) { t += c; prev_dash = false; }
+        else if (!prev_dash) { t += '-'; prev_dash = true; }
+    }
+    size_t lb = t.find_first_not_of('-');
+    size_t le = t.find_last_not_of('-');
+    t = (lb == std::string::npos) ? std::string() : t.substr(lb, le - lb + 1);
+    for (char& c : t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return t.empty() ? std::string("part") : t;
+}
+
+// Insert a registered supplier/vendor CAD part as an `import` feature (port of
+// engine/vendor_parts.py::_vendor_part_insert, which is now removed from the Python worker — the
+// doc mutation lives here). The vendor REGISTRY stays in Python (register/list/context write
+// %APPDATA%/AI-CAD/vendor_parts/index.json); this reads that SAME index, resolves the cached CAD
+// path + metadata, and applies an import op carrying the vendor_* params verbatim. `into` empty ->
+// mint a new part doc. Throws OpError on a missing index / unknown part / missing CAD file.
+json doc_vendor_part_insert(const std::string& into, const std::string& supplier,
+                            const std::string& part_number, const std::string& name) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    // %APPDATA%/AI-CAD/vendor_parts/index.json (mirror of engine/paths.py::appdata_root()).
+    const char* appdata = std::getenv("APPDATA");
+    std::filesystem::path root;
+    if (appdata && appdata[0]) {
+        root = std::filesystem::path(appdata);
+    } else {
+        const char* home = std::getenv("USERPROFILE");
+        root = std::filesystem::path(home && home[0] ? home : ".") / "AppData" / "Roaming";
+    }
+    const std::filesystem::path index = root / "AI-CAD" / "vendor_parts" / "index.json";
+    if (!std::filesystem::exists(index))
+        throw OpError("invalid_op", "vendor_part_insert: no vendor parts registered",
+                      {{"reason", "no vendor index"}, {"index", index.string()}});
+
+    json idx;
+    try {
+        std::ifstream in(index);
+        in >> idx;
+    } catch (const std::exception& ex) {
+        throw OpError("invalid_op",
+                      std::string("vendor_part_insert: cannot read index: ") + ex.what(),
+                      {{"reason", "bad index"}});
+    }
+    const std::string key = vendor_slug(supplier) + "::" + vendor_slug(part_number);
+    if (!idx.is_object() || !idx.contains(key))
+        throw OpError("invalid_op", "vendor part not registered: " + supplier + " " + part_number,
+                      {{"reason", "unknown part"}, {"supplier", supplier},
+                       {"part_number", part_number}});
+    const json& rec = idx[key];
+    std::string cad_path = rec.value("cad_path", std::string());
+    if (cad_path.empty() || !std::filesystem::exists(cad_path))
+        throw OpError("invalid_op",
+                      "registered CAD file is missing for " + supplier + " " + part_number,
+                      {{"reason", "missing cad file"}, {"cad_path", cad_path}});
+
+    std::string feat_name = !name.empty()
+                                ? name
+                                : (rec.value("supplier", std::string()) + " " +
+                                   rec.value("part_number", std::string()));
+    std::string fmt = rec.value("cad_format", std::string());
+    // SolidWorks / Parasolid have no free B-rep reader: route through COM -> STEP first, exactly
+    // like doc_import_file.
+    std::string import_path_ = cad_path;
+    if (fmt == "sldprt" || fmt == "sldasm" || fmt == "x_t" || fmt == "x_b") {
+        import_path_ = sw_export_step(cad_path);
+        fmt = "step";
+    }
+    const std::string original = rec.value("description", std::string()).empty()
+                                     ? feat_name
+                                     : rec.value("description", std::string());
+    json params = {{"source_path", import_path_},
+                   {"format", fmt.empty() ? detect_format(cad_path) : fmt},
+                   {"original_name", original},
+                   {"vendor_supplier", rec.value("supplier", std::string())},
+                   {"vendor_part_number", rec.value("part_number", std::string())},
+                   {"vendor_product_url", rec.value("product_url", std::string())}};
+    json ops = json::array({json{
+        {"op", "add_feature"},
+        {"feature",
+         {{"type", "import"}, {"name", feat_name}, {"params", params}, {"refs", json::object()}}}}});
+
+    Session* s = nullptr;
+    if (!into.empty())
+        s = &require_session(into);
+    else
+        s = &new_part_session_locked(feat_name.empty() ? std::string("Vendor Part") : feat_name);
+
+    json resp = apply_ops_locked(*s, -1, ops, /*coalesce=*/false);
+    resp["doc_id"] = s->doc_id;
+    resp["vendor_part"] = rec;
     return resp;
 }
 

@@ -199,27 +199,12 @@ def _vendor_part_context(params: dict, _emit: EmitFn) -> dict:
     return context_card(limit=int(params.get("limit") or 12), query=params.get("query"))
 
 
-def _vendor_part_insert(params: dict, emit: EmitFn) -> dict:
-    from engine.doc import session as docsess
-
-    supplier = str(params.get("supplier") or "")
-    part_number = str(params.get("part_number") or "")
-    into = params.get("doc_id") or params.get("into")
-    if into:
-        sess = docsess.get_session(str(into))
-    else:
-        sess = docsess.new_session("part", name=f"{supplier} {part_number}".strip() or "Vendor Part")
-    ops = import_ops_for_part(supplier, part_number, name=params.get("name"))
-    resp = docsess.apply_ops(sess, params.get("base_revision"), ops, emit,
-                             coalesce=bool(params.get("coalesce", False)))
-    resp["doc_id"] = sess.doc_id
-    resp["vendor_part"] = get_part(supplier, part_number)
-    return resp
-
-
+# vendor_part_insert moved to the C++ core (doc_vendor_part_insert): it mutates a doc by applying
+# an `import` feature, which now lives in libaicad. The registry above (register/list/context +
+# import_ops_for_part, get_part) is pure metadata and stays in Python — the C++ insert reads the
+# SAME index.json this module writes. import_ops_for_part is retained as the op-shape contract.
 WORKER_METHODS = {
     "vendor_part_register_local_cad": _vendor_part_register_local_cad,
     "vendor_part_list": _vendor_part_list,
     "vendor_part_context": _vendor_part_context,
-    "vendor_part_insert": _vendor_part_insert,
 }

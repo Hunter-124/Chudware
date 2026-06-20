@@ -697,105 +697,10 @@ def _cached_import(path: str, format: str | None) -> list[tuple[str, Any]]:  # n
 EmitFn = Callable[[dict], None]
 
 
-def _handler_import_file(params: dict, emit: EmitFn) -> dict:
-    """Worker handler for ``import_file`` (worker_rpc.md §Formats).
-
-    Imports the geometry at ``params["path"]``, creates one ``import`` feature per body, and
-    applies them to the target session (``params.get("into")`` = existing doc_id, or a new
-    part session when absent).  Returns an ops-response dict.
-    """
-    from engine.doc.session import new_session, get_session, apply_ops as sess_apply_ops
-    from engine.doc.ops import OpError
-
-    path = params.get("path")
-    if not path:
-        raise OpError("invalid_op", "import_file: 'path' is required", {"reason": "missing path"})
-
-    into_id: str | None = params.get("into")
-
-    try:
-        bodies = import_path(path)
-    except Exception as exc:  # noqa: BLE001
-        raise OpError("import_failed", f"import_file: {exc}", {"path": path}) from exc
-
-    if not bodies:
-        raise OpError("import_failed", f"import_file: no bodies found in '{path}'", {"path": path})
-
-    # Target session
-    if into_id:
-        session = get_session(into_id)
-    else:
-        session = new_session("part", name=Path(path).stem)
-
-    # ONE import feature per file — the import compiler appends *every* body found in the source
-    # (compile_import → _cached_import returns all of them). Emitting one feature per body would
-    # re-append the whole file once per body (N×N bodies for an N-body STEP / multi-mesh 3MF).
-    fmt = _detect_format(path) if not params.get("format") else params["format"]
-    feat_name = Path(path).name if len(bodies) > 1 else (bodies[0][0] or Path(path).stem)
-    feat_params = {
-        "source_path": str(path),
-        "format": fmt,
-        "original_name": feat_name,
-    }
-    # Import-time "convert to solid" option (host passes as_solid for mesh files).
-    if params.get("as_solid"):
-        feat_params["as_solid"] = True
-    ops = [{
-        "op": "add_feature",
-        "feature": {
-            "type": "import",
-            "name": feat_name,
-            "params": feat_params,
-            "refs": {},
-        },
-    }]
-
-    response = sess_apply_ops(session, None, ops, emit)
-    response["doc_id"] = session.doc_id
-    return response
-
-
-def _handler_export_file(params: dict, emit: EmitFn) -> dict:  # noqa: ARG001
-    """Worker handler for ``export_file`` (worker_rpc.md §Formats).
-
-    Exports the compiled bodies of the document identified by ``params["doc_id"]`` to
-    ``params["path"]`` in ``params["format"]``.  Returns ``{path}``.
-    """
-    from engine.doc.session import get_session
-    from engine.doc.ops import OpError
-
-    doc_id = params.get("doc_id")
-    path = params.get("path")
-    fmt = params.get("format")
-
-    if not doc_id:
-        raise OpError("invalid_op", "export_file: 'doc_id' is required", {"reason": "missing doc_id"})
-    if not path:
-        raise OpError("invalid_op", "export_file: 'path' is required", {"reason": "missing path"})
-    if not fmt:
-        raise OpError("invalid_op", "export_file: 'format' is required", {"reason": "missing format"})
-
-    session = get_session(doc_id)
-    from engine.doc.session import _rebuild, _solid_bodies
-
-    result = session.last_result
-    if result is None:
-        result = _rebuild(session)
-
-    bodies = _solid_bodies(result)
-    if not bodies:
-        raise OpError("export_failed", "export_file: document has no bodies to export",
-                      {"doc_id": doc_id})
-
-    session_bodies = [(bo.name or f"Body{i}", bo.shape) for i, bo in enumerate(bodies, start=1)]
-
-    try:
-        out_path = export_document(session_bodies, path, fmt)
-    except Exception as exc:  # noqa: BLE001
-        raise OpError("export_failed", f"export_file: {exc}",
-                      {"doc_id": doc_id, "path": path, "format": fmt}) from exc
-
-    return {"path": out_path}
+# NOTE: import_file / export_file handlers were removed — they applied import/export ops through
+# the Python doc closure (session/compiler), which is gone. Both RPCs now run in the C++ core
+# (host routes them by the doc-cpp / minting rule). The pure helpers above — import_path() and
+# export_document() — survive and stay closure-free (engine.ecad.threed imports import_path).
 
 
 def _handler_doc_formats(params: dict, emit: EmitFn) -> dict:  # noqa: ARG001
@@ -807,8 +712,9 @@ def _handler_doc_formats(params: dict, emit: EmitFn) -> dict:  # noqa: ARG001
 
 
 # The orchestrator wires these via: _METHODS.update(formats.WORKER_METHODS)
+# import_file / export_file now run in the C++ core (routed by doc-cpp / minting); only the
+# closure-free format-matrix probe stays in Python. The pure helpers above (import_path /
+# export_document) survive — engine.ecad.threed imports import_path.
 WORKER_METHODS: dict[str, Callable] = {
-    "import_file": _handler_import_file,
-    "export_file": _handler_export_file,
     "doc_formats": _handler_doc_formats,
 }

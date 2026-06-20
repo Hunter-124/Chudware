@@ -93,6 +93,10 @@ bool routeDocToCpp(const std::string& method, const json& params) {
     }
     if (method == "doc_open") return true;  // core rejects non-parts -> host falls back
     if (isMintingMethod(method, params)) return true;  // import_file minting a new doc
+    // vendor_part_insert mutates/mints a doc by applying an `import` feature; it now lives only in
+    // the C++ core (the Python doc engine is gone). Route it there whenever it carries no doc-cpp
+    // id yet (the prefix check above already catches the into/doc_id case).
+    if (method == "vendor_part_insert") return true;
     return false;
 }
 // --- C++ AGENT routing (opt-in, default OFF) --------------------------------

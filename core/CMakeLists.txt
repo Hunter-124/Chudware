@@ -518,6 +518,24 @@ if(AICAD_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(document PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- Simulation-study persistence + mutate RPCs (doc_sim_study_*) -----------
+  # Exercises the full study lifecycle (add/edit/list/save+open/delete) on a blank
+  # part. doc_new/doc_open compile the empty document through OCCT, so this is gated
+  # under AICAD_WITH_OCCT and links aicad_doc (which carries the OCCT toolkits via
+  # aicad_geom_occt). No AICM loader needed — it asserts on the studies JSON directly.
+  add_executable(test_studies
+    tests/test_studies.cpp)
+  target_include_directories(test_studies PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_studies PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  set_target_properties(test_studies PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME studies COMMAND test_studies)
+  # Same OCCT DLL PATH prepend so the test can load TKernel et al.
+  set_tests_properties(studies PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- A3: pattern feature compilers — linear_pattern / circular_pattern ------
   # core/doc/document.cpp's pattern branches REPLICATE a referenced seed solid with
   # rigid transforms (geom/transform.cpp: translate_copy / rotate_copy) and FUSE the

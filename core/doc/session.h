@@ -129,6 +129,20 @@ nlohmann::json doc_config_set_override(const std::string& doc_id, const std::str
 nlohmann::json doc_config_set_suppression(const std::string& doc_id, const std::string& name,
                                           const std::string& feature_id, bool suppressed);
 
+// Simulation studies (FEA/CFD setups). Stored as a top-level `studies` array in the
+// document JSON so they persist inside the .step+ container automatically. The core
+// treats each study as OPAQUE JSON — only the `id` is core-assigned — and NEVER
+// rebuilds geometry, so these are cheap and work for both part and assembly docs.
+// list is read-only ({studies, revision}); add/edit/delete push one undo step, bump
+// the revision, mark the doc dirty, and return {studies, revision} (add also
+// study_id). A bad doc_id throws OpError("unknown_doc"); a missing study on
+// edit/delete throws OpError("invalid_op").
+nlohmann::json doc_sim_study_list(const std::string& doc_id);
+nlohmann::json doc_sim_study_add(const std::string& doc_id, const nlohmann::json& study);
+nlohmann::json doc_sim_study_edit(const std::string& doc_id, const std::string& study_id,
+                                  const nlohmann::json& study);
+nlohmann::json doc_sim_study_delete(const std::string& doc_id, const std::string& study_id);
+
 // Resolve a viewport pick (1-based body ordinal + kind + 1-based MapShapes topo id)
 // into a selector json {selector: {...}}. Throws OpError("unknown_doc"/...).
 nlohmann::json doc_resolve_pick(const std::string& doc_id, int body_id,

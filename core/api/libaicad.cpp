@@ -1403,6 +1403,25 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 params.value("feature_id", std::string()),
                                 params.value("suppressed", false)),
                             out_json, 0);
+            if (m == "sim_study_list")
+                return emit(aicad::doc::doc_sim_study_list(params.value("doc_id", std::string())),
+                            out_json, 0);
+            if (m == "sim_study_add")
+                return emit(aicad::doc::doc_sim_study_add(
+                                params.value("doc_id", std::string()),
+                                params.contains("study") ? params["study"] : json(nullptr)),
+                            out_json, 0);
+            if (m == "sim_study_edit")
+                return emit(aicad::doc::doc_sim_study_edit(
+                                params.value("doc_id", std::string()),
+                                params.value("study_id", std::string()),
+                                params.contains("study") ? params["study"] : json(nullptr)),
+                            out_json, 0);
+            if (m == "sim_study_delete")
+                return emit(aicad::doc::doc_sim_study_delete(
+                                params.value("doc_id", std::string()),
+                                params.value("study_id", std::string())),
+                            out_json, 0);
             if (m == "doc_save")
                 return emit(aicad::doc::doc_save(params.value("doc_id", std::string()),
                                                  params.value("path", std::string())),

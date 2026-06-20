@@ -1485,6 +1485,30 @@ vector<string> validate_common(const json& doc, const string& schema) {
     return errs;
 }
 
+// Optional doc-level `studies` list (simulation/FEA/CFD setups; sim_study_* RPCs).
+// ABSENT `studies` => no constraint. The core stores study payloads verbatim and does
+// NOT interpret their fields, so this is a LIGHT structural check only: studies must be
+// a list of objects, each carrying a non-empty string `id` and `type`. Port of
+// engine/doc/schema.py::_validate_studies.
+vector<string> validate_studies(const json& doc) {
+    const json& studies = get(doc, "studies");
+    if (studies.is_null()) return {};
+    if (!studies.is_array()) return {"studies: must be a list"};
+    vector<string> errs;
+    for (size_t i = 0; i < studies.size(); ++i) {
+        string loc = "studies[" + std::to_string(i) + "]";
+        const json& st = studies[i];
+        if (!st.is_object()) { errs.push_back(loc + ": must be an object"); continue; }
+        const json& idj = get(st, "id");
+        if (!(idj.is_string() && !idj.get<string>().empty()))
+            errs.push_back(loc + ".id: required non-empty string");
+        const json& tj = get(st, "type");
+        if (!(tj.is_string() && !tj.get<string>().empty()))
+            errs.push_back(loc + ".type: required non-empty string");
+    }
+    return errs;
+}
+
 vector<string> validate_part(const json& doc) {
     if (!doc.is_object()) {
         return {"document must be a JSON object"};
@@ -1533,6 +1557,8 @@ vector<string> validate_part(const json& doc) {
     errs.insert(errs.end(), re.begin(), re.end());
     auto ce = validate_configurations(doc, feats_by_id);
     errs.insert(errs.end(), ce.begin(), ce.end());
+    auto se = validate_studies(doc);
+    errs.insert(errs.end(), se.begin(), se.end());
     return errs;
 }
 
@@ -1725,6 +1751,8 @@ vector<string> validate_assembly(const json& doc) {
             }
         }
     }
+    auto se = validate_studies(doc);
+    errs.insert(errs.end(), se.begin(), se.end());
     return errs;
 }
 

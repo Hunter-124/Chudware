@@ -1003,15 +1003,19 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 const std::string method = feat.value("method", std::string("offset"));
 
                 if (method == "offset") {
-                    // OFFSET is datum-only in the oracle (ctx.datum requires a planar
-                    // datum — a face selector would raise), so keep it datum-only here.
+                    // base is a planar datum (origin plane / upstream datum) OR a picked
+                    // planar model face — SolidWorks offsets a new plane from either. The
+                    // host's ref-plane "Reference" well (K_PLANE) routes an origin-plane
+                    // click as a datum string and a planar-face click as a face selector;
+                    // plane_of resolves both. (The Python oracle keeps offset datum-only;
+                    // accepting a face here is a deliberate SW-parity superset that does not
+                    // affect datum-offset parity.)
                     const json bref = feat.contains("base") ? feat.at("base") : json("plane.top");
-                    auto bp = resolve_plane_ref(bref);
-                    if (!bp) throw std::runtime_error("plane offset: base is not a planar datum");
+                    aicad::geom::SketchPlane bp = plane_of(bref, "base");
                     const double off =
                         feat.contains("offset") ? num_or_expr(feat.at("offset"), env) : 0.0;
-                    aicad::geom::SketchPlane p = *bp;
-                    p.origin = bp->origin + bp->normal * off;
+                    aicad::geom::SketchPlane p = bp;
+                    p.origin = bp.origin + bp.normal * off;
                     results[id] = PlaneResult{p};
 
                 } else if (method == "midplane") {
@@ -1498,15 +1502,11 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // spiral / variable-pitch wire in the base local frame. Ported:
                 // constant-pitch helix (incl. taper + start_angle + handedness), the
                 // flat Archimedean spiral, and variable-pitch (pitch_table).
-                // refs.base = a datum plane / csys (origin + axis); standalone helices
-                // fall back to the `radius` param. Stores a CurveResult a sweep consumes.
+                // refs.base = a datum plane / csys (origin + axis) OR a picked planar model
+                // face (plane_of, same as the ref-plane offset base); standalone helices fall
+                // back to the `radius` param. Stores a CurveResult a sweep consumes.
                 const json bref = feat.contains("base") ? feat.at("base") : json("plane.top");
-                auto bp = resolve_plane_ref(bref);
-                if (!bp)
-                    throw std::runtime_error(
-                        "helix: base must be a datum plane/csys (geometry circle/cylinder "
-                        "picks not yet ported here)");
-                aicad::geom::SketchPlane base = *bp;
+                aicad::geom::SketchPlane base = plane_of(bref, "base");
 
                 const double start_angle =
                     feat.contains("start_angle") ? num_or_expr(feat.at("start_angle"), env) : 0.0;

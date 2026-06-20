@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <tuple>
 #include <utility>
@@ -102,6 +103,47 @@ TopoDS_Shape nearest_unique_subshape(const TopoDS_Shape& shape, TopAbs_ShapeEnum
     return best;
 }
 
+// GeomAbs_CurveType -> the edge surf contract string (line|circle|ellipse|bspline|other).
+std::string edge_curve_string(GeomAbs_CurveType t) {
+    switch (t) {
+        case GeomAbs_Line:        return "line";
+        case GeomAbs_Circle:      return "circle";
+        case GeomAbs_Ellipse:     return "ellipse";
+        case GeomAbs_BezierCurve: return "bspline";
+        case GeomAbs_BSplineCurve:return "bspline";
+        default:                  return "other";
+    }
+}
+
+// Build a scoring descriptor for ONE unique edge (centroid, direction, length, curve type). `idx`
+// is the edge's position in the unique-edge map (used as the hint_index for tie-breaking).
+TopoInfo unique_edge_info(const TopoDS_Edge& e, int idx) {
+    TopoInfo info;
+    info.kind = "edge";
+    info.index = idx;
+    info.hint_index = idx;
+    BRepAdaptor_Curve ac(e);
+    GeomAbs_CurveType ct = ac.GetType();
+    info.surf = edge_curve_string(ct);
+    GProp_GProps props;
+    BRepGProp::LinearProperties(e, props);
+    info.measure = props.Mass();
+    gp_Pnt cm = props.CentreOfMass();
+    info.centroid = Eigen::Vector3d(cm.X(), cm.Y(), cm.Z());
+    try {
+        if (ct == GeomAbs_Line) {
+            gp_Dir d = ac.Line().Direction();
+            info.axis = Eigen::Vector3d(d.X(), d.Y(), d.Z());
+        } else if (ct == GeomAbs_Circle) {
+            gp_Dir d = ac.Circle().Axis().Direction();
+            info.axis = Eigen::Vector3d(d.X(), d.Y(), d.Z());
+        }
+    } catch (const Standard_Failure&) {
+        info.axis = std::nullopt;
+    }
+    return info;
+}
+
 // Normalise the `selectors` payload to a vector of selector objects (a single object or
 // a json array), mirroring dress.py's `sel if isinstance(sel, list) else [sel]`.
 std::vector<nlohmann::json> as_selector_list(const nlohmann::json& selectors) {
@@ -137,12 +179,17 @@ std::optional<int> resolve_with_hint_fallback(const nlohmann::json& sel,
     ResolveResult rr = resolve(sel, infos, diag);
     if (rr.index.has_value()) return rr.index;
 
-    // Apply hint_index fallback: only when a MARGIN failure and best score < 0.01. At
-    // that point only IDENTICAL duplicates co-rank, so the reference is clearly correct
-    // and just geometrically ambiguous (e.g. a box's two identical edge occurrences).
+    // Apply hint_index fallback on a MARGIN failure. describe_edges emits ONE descriptor per
+    // incident face, so EVERY edge pick co-ranks its own two occurrences (margin ~0) — the
+    // "symmetric ambiguity" is almost always just this self-duplicate, not two distinct edges.
+    // The gate is resolve()'s own acceptance bound (best score < 0.35), NOT a near-exact 0.01:
+    // a selector captured against a live fillet/draft PREVIEW carries a trimmed centroid+length
+    // (an adjacent in-progress round shortens the edge), which pushes the score just over 0.01
+    // and used to hard-fail the whole feature. hint_index + owner + nearest-unique mapping below
+    // still disambiguate truly distinct symmetric edges, so widening the gate is safe.
     bool margin_fail = rr.dangling_reason.has_value() &&
                        rr.dangling_reason->find("margin") != std::string::npos;
-    if (!margin_fail || !(rr.score < 0.01)) return std::nullopt;
+    if (!margin_fail || !(rr.score < 0.35)) return std::nullopt;
 
     const std::string kind = sel.value("kind", std::string());
     std::optional<std::string> s_owner;
@@ -176,7 +223,7 @@ std::optional<int> resolve_with_hint_fallback(const nlohmann::json& sel,
                          std::tie(b.first, b.second->hint_index);
               });
 
-    if (scored.empty() || !(scored[0].first < 0.01)) return std::nullopt;
+    if (scored.empty() || !(scored[0].first < 0.35)) return std::nullopt;
 
     // If hint_index is unspecified or matches the best after sort, take the best;
     // otherwise prefer the candidate whose hint_index matches; else the overall best.
@@ -193,36 +240,85 @@ std::optional<int> resolve_with_hint_fallback(const nlohmann::json& sel,
 EdgePicks resolve_edge_picks(const TopoDS_Shape& shape, const nlohmann::json& selectors) {
     EdgePicks out;
     const std::vector<nlohmann::json> sel_list = as_selector_list(selectors);
+    const std::size_t M = sel_list.size();
 
-    // describe_edges enumerates one descriptor per incident face (the wider 24-edge
-    // space for a box); we map each resolved descriptor back to the nearest unique edge.
-    const std::vector<TopoInfo> infos = describe_edges(shape);
+    // Enumerate UNIQUE edges (one descriptor each — NOT the per-incident-face 24-space, which made
+    // every pick self-co-rank). Resolution is then a 1-TO-1 ASSIGNMENT: each selector claims its
+    // best UNUSED edge. This is the fix for "N selectors mapped to the same edge" — when a fillet
+    // trims/renumbers edges so two picks would otherwise both grab one base edge, the second now
+    // falls through to its correct neighbour instead of silently duplicating (and inflating the
+    // "rounded" count). Most-confident selectors are assigned first so a stale pick can't steal a
+    // confident one's edge.
+    TopTools_IndexedMapOfShape uniq;
+    TopExp::MapShapes(shape, TopAbs_EDGE, uniq);
+    const int N = uniq.Extent();
+    std::vector<TopoInfo> infos;
+    infos.reserve(N);
+    for (int i = 1; i <= N; ++i)
+        infos.push_back(unique_edge_info(TopoDS::Edge(uniq(i)), i - 1));
     const double diag = bbox_diag(shape);
-    const double tol = std::max(diag, 1.0) * kResolveMapTolFrac;
+    constexpr double kAccept = 0.35;  // matches resolve()'s acceptance bound
 
-    for (std::size_t i = 0; i < sel_list.size(); ++i) {
-        const nlohmann::json& sel = sel_list[i];
-        std::optional<int> idx = resolve_with_hint_fallback(sel, infos, diag);
-        if (!idx.has_value()) {
-            ResolveResult rr = resolve(sel, infos, diag);
-            std::string reason = rr.dangling_reason.value_or(std::string("unresolved"));
-            out.dangling.push_back("edges[" + std::to_string(i) + "]: " + reason);
+    auto valid_edge_sel = [](const nlohmann::json& s) -> bool {
+        if (!s.is_object() || !s.contains("centroid") || !s.at("centroid").is_array()) return false;
+        if (s.contains("kind") && !s.at("kind").is_null() &&
+            s.at("kind").get<std::string>() != "edge")
+            return false;
+        return true;
+    };
+
+    // Pass 1 — per-selector confidence = its best score against ANY edge. Sort ascending so the
+    // surest matches assign first.
+    std::vector<std::pair<double, std::size_t>> order;
+    order.reserve(M);
+    for (std::size_t s = 0; s < M; ++s) {
+        if (!valid_edge_sel(sel_list[s])) { order.emplace_back(1e30, s); continue; }
+        double bs = 1e30;
+        for (int i = 0; i < N; ++i) bs = std::min(bs, score_candidate(sel_list[s], infos[i], diag));
+        order.emplace_back(bs, s);
+    }
+    std::sort(order.begin(), order.end(),
+              [](const std::pair<double, std::size_t>& a, const std::pair<double, std::size_t>& b) {
+                  return a.first < b.first;
+              });
+
+    // Pass 2 — greedy assignment in confidence order.
+    std::vector<char> used(N, 0);
+    std::vector<TopoDS_Edge> resolved(M);
+    std::vector<char> ok(M, 0);
+    std::vector<std::string> reason(M);
+    for (const auto& pr : order) {
+        const std::size_t s = pr.second;
+        const nlohmann::json& sel = sel_list[s];
+        if (!valid_edge_sel(sel)) { reason[s] = "not an edge selector"; continue; }
+        std::optional<int> s_hint;
+        if (sel.contains("hint_index") && !sel.at("hint_index").is_null())
+            s_hint = sel.at("hint_index").get<int>();
+        int best = -1; double best_score = 1e30; bool best_hint = false;
+        for (int i = 0; i < N; ++i) {
+            if (used[i]) continue;
+            double sc = score_candidate(sel, infos[i], diag);
+            bool hint = s_hint.has_value() && infos[i].hint_index == *s_hint;
+            if (sc < best_score - 1e-9 ||
+                (std::abs(sc - best_score) <= 1e-9 && hint && !best_hint)) {
+                best = i; best_score = sc; best_hint = hint;
+            }
+        }
+        if (best < 0) { reason[s] = "no unused edge remains"; continue; }
+        if (best_score >= kAccept) {
+            reason[s] = "best score " + fmt4g(best_score) + " >= 0.35 (no close edge)";
             continue;
         }
-        // The resolved descriptor's centroid (edge midpoint) -> nearest unique edge.
-        const Eigen::Vector3d& target = infos[*idx].centroid;
-        double dist = std::numeric_limits<double>::infinity();
-        TopoDS_Shape near = nearest_unique_subshape(shape, TopAbs_EDGE, target, tol, dist);
-        if (near.IsNull()) {
-            out.dangling.push_back(
-                "edges[" + std::to_string(i) + "]: no unique edge within " +
-                fmt4g(tol) + " mm of the resolved descriptor (nearest " +
-                fmt4g(dist) + " mm)");
-            continue;
-        }
-        out.edges.push_back(TopoDS::Edge(near));
+        used[best] = 1;
+        resolved[s] = TopoDS::Edge(uniq(best + 1));
+        ok[s] = 1;
     }
 
+    // Assemble in ORIGINAL selector order.
+    for (std::size_t s = 0; s < M; ++s) {
+        if (ok[s]) out.edges.push_back(resolved[s]);
+        else out.dangling.push_back("edges[" + std::to_string(s) + "]: " + reason[s]);
+    }
     return out;
 }
 

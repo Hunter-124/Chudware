@@ -132,48 +132,52 @@ std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
 
 // --------------------------------------------------------------------------- describe_edges
 
+// Build the geometric descriptor for ONE edge (centroid/axis/surf/measure). Shared by
+// describe_edges (per-incident-face enumeration) and make_pick_selector (unique-edge
+// enumeration) so a pick and a compile-time describe agree on an edge's geometry.
+TopoInfo edge_info(const TopoDS_Edge& edge, int idx) {
+    BRepAdaptor_Curve adaptor(edge);
+    GeomAbs_CurveType ct = adaptor.GetType();
+
+    // Centroid (midpoint) + length via linear mass properties.
+    GProp_GProps props;
+    BRepGProp::LinearProperties(edge, props);
+    double length = props.Mass();
+    gp_Pnt cm = props.CentreOfMass();
+    Eigen::Vector3d centroid(cm.X(), cm.Y(), cm.Z());
+
+    // Axis — line direction, circle axis only (matches the Python oracle; an
+    // ellipse edge carries surf=="ellipse" but no axis).
+    std::optional<Eigen::Vector3d> axis;
+    try {
+        if (ct == GeomAbs_Line) {
+            axis = unit_axis(adaptor.Line().Direction());
+        } else if (ct == GeomAbs_Circle) {
+            axis = unit_axis(adaptor.Circle().Axis().Direction());
+        }
+    } catch (const Standard_Failure&) {
+        axis = std::nullopt;
+    }
+
+    TopoInfo info;
+    info.kind = "edge";
+    info.index = idx;
+    info.surf = curve_type_string(ct);
+    info.centroid = centroid;
+    info.axis = axis;
+    info.measure = length;
+    info.hint_index = idx;
+    return info;
+}
+
 std::vector<TopoInfo> describe_edges(const TopoDS_Shape& shape,
                                      const std::map<int, std::string>& owners) {
     std::vector<TopoInfo> result;
     int idx = 0;
     for (TopExp_Explorer exp(shape, TopAbs_EDGE); exp.More(); exp.Next(), ++idx) {
-        TopoDS_Edge edge = TopoDS::Edge(exp.Current());
-        BRepAdaptor_Curve adaptor(edge);
-        GeomAbs_CurveType ct = adaptor.GetType();
-
-        // Centroid (midpoint) + length via linear mass properties.
-        GProp_GProps props;
-        BRepGProp::LinearProperties(edge, props);
-        double length = props.Mass();
-        gp_Pnt cm = props.CentreOfMass();
-        Eigen::Vector3d centroid(cm.X(), cm.Y(), cm.Z());
-
-        // Axis — line direction, circle axis only (matches the Python oracle; an
-        // ellipse edge carries surf=="ellipse" but no axis).
-        std::optional<Eigen::Vector3d> axis;
-        try {
-            if (ct == GeomAbs_Line) {
-                axis = unit_axis(adaptor.Line().Direction());
-            } else if (ct == GeomAbs_Circle) {
-                axis = unit_axis(adaptor.Circle().Axis().Direction());
-            }
-        } catch (const Standard_Failure&) {
-            axis = std::nullopt;
-        }
-
-        std::optional<std::string> owner;
+        TopoInfo info = edge_info(TopoDS::Edge(exp.Current()), idx);
         auto it = owners.find(idx);
-        if (it != owners.end()) owner = it->second;
-
-        TopoInfo info;
-        info.kind = "edge";
-        info.index = idx;
-        info.surf = curve_type_string(ct);
-        info.centroid = centroid;
-        info.axis = axis;
-        info.measure = length;
-        info.owner = owner;
-        info.hint_index = idx;
+        if (it != owners.end()) info.owner = it->second;
         result.push_back(std::move(info));
     }
     return result;
@@ -233,18 +237,38 @@ nlohmann::json make_selector(const TopoInfo& info) {
 nlohmann::json make_pick_selector(const TopoDS_Shape& shape, const std::string& kind,
                                   int topo_id, std::optional<std::string> owner) {
     if (shape.IsNull()) return nlohmann::json(nullptr);
-    // EXACT port of engine/doc/session.py::resolve_pick: describe the body's sub-shapes
-    // (the same TopExp_Explorer enumeration the host's pick topo_id indexes) and take
-    // entry topo_id-1, stamping the owner from the compiler's owner map + hint_index.
-    std::vector<TopoInfo> infos;
-    if (kind == "face") infos = describe_faces(shape);
-    else if (kind == "edge") infos = describe_edges(shape);
-    else if (kind == "vertex") infos = describe_vertices(shape);
-    else return nlohmann::json(nullptr);
-    if (topo_id < 1 || topo_id > static_cast<int>(infos.size()))
+    // The host's pick topo_id is the tessellator's edge/vertex id = the 1-based index into
+    // TopExp::MapShapes (the UNIQUE sub-shape map). describe_edges/_vertices enumerate via
+    // TopExp_Explorer, which visits a SHARED edge/vertex once PER incident face — a box yields
+    // 24 edge-visits for 12 unique edges, in a DIFFERENT order. Indexing that 24-space by the
+    // 12-space topo_id mapped DISTINCT picked edges onto the SAME descriptor (two picks, one
+    // centroid), so the 1-to-1 resolver dropped the colliding one: the "N selectors couldn't be
+    // located" / "3-way corner only rounds 2/3" / "added edge not applied" bug. Build the
+    // descriptor from the unique sub-shape at the SAME MapShapes index the tessellator used.
+    // Faces are NOT shared (Explorer order == MapShapes order), so they keep describe_faces.
+    TopoInfo info;
+    if (kind == "edge") {
+        TopTools_IndexedMapOfShape m;
+        TopExp::MapShapes(shape, TopAbs_EDGE, m);
+        if (topo_id < 1 || topo_id > m.Extent()) return nlohmann::json(nullptr);
+        info = edge_info(TopoDS::Edge(m.FindKey(topo_id)), topo_id - 1);
+    } else if (kind == "vertex") {
+        TopTools_IndexedMapOfShape m;
+        TopExp::MapShapes(shape, TopAbs_VERTEX, m);
+        if (topo_id < 1 || topo_id > m.Extent()) return nlohmann::json(nullptr);
+        gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(m.FindKey(topo_id)));
+        info.kind = "vertex";
+        info.index = topo_id - 1;
+        info.centroid = Eigen::Vector3d(p.X(), p.Y(), p.Z());
+        info.hint_index = topo_id - 1;
+    } else if (kind == "face") {
+        std::vector<TopoInfo> infos = describe_faces(shape);
+        if (topo_id < 1 || topo_id > static_cast<int>(infos.size()))
+            return nlohmann::json(nullptr);
+        info = infos[topo_id - 1];
+    } else {
         return nlohmann::json(nullptr);
-
-    TopoInfo info = infos[topo_id - 1];
+    }
     if (owner) info.owner = owner;
     info.hint_index = topo_id - 1;
     return make_selector(info);
@@ -257,11 +281,16 @@ nlohmann::json make_pick_selector(const TopoDS_Shape& shape, const std::string& 
 // selectors.h) so doc/picks.cpp can re-score same-kind candidates for the hint
 // fallback; resolve() below still calls it unqualified (same namespace).
 double score_candidate(const nlohmann::json& sel, const TopoInfo& c, double bbox_diag) {
-    // Centroid distance term (always present).
     const auto& sc = sel.at("centroid");
     Eigen::Vector3d s_centroid(sc.at(0).get<double>(), sc.at(1).get<double>(),
                                sc.at(2).get<double>());
-    double dc = (c.centroid - s_centroid).norm() / std::max(bbox_diag, 1e-12);
+
+    // Surface/curve type. The selector's surf may be null (vertices); compare optionals the same
+    // way the Python compares c.surf == sel.get("surf").
+    std::optional<std::string> sel_surf;
+    if (sel.contains("surf") && !sel.at("surf").is_null())
+        sel_surf = sel.at("surf").get<std::string>();
+    double tm = (c.surf == sel_surf) ? 0.0 : 1.0;
 
     // Axis term — only when BOTH selector and candidate have an axis.
     bool sel_has_axis = sel.contains("axis") && !sel.at("axis").is_null();
@@ -274,21 +303,34 @@ double score_candidate(const nlohmann::json& sel, const TopoInfo& c, double bbox
         ax = 1.0 - std::abs(s_ax.dot(*c.axis));
     }
 
-    // Area/length term — only when both measures exist.
+    // Position term. For a straight edge picked against a LIVE preview (a fillet trims the edge an
+    // adjacent round eats into), the stored MIDPOINT and LENGTH drift, but the edge stays on the
+    // SAME infinite line. So for line-vs-line we score the PERPENDICULAR distance from the selector's
+    // point to the candidate's supporting line — trimming-invariant, yet still distinguishing parallel
+    // edges on different lines. Everything else keeps the plain centroid distance.
+    const bool line_match = sel_surf && *sel_surf == "line" && c.surf && *c.surf == "line" &&
+                            c.axis.has_value();
+    double dc;
+    if (line_match) {
+        Eigen::Vector3d dir = *c.axis;
+        double n = dir.norm();
+        Eigen::Vector3d v = s_centroid - c.centroid;
+        Eigen::Vector3d perp = (n > 1e-12) ? (v - dir * (v.dot(dir) / (n * n))) : v;
+        dc = perp.norm() / std::max(bbox_diag, 1e-12);
+    } else {
+        dc = (c.centroid - s_centroid).norm() / std::max(bbox_diag, 1e-12);
+    }
+
+    // Area/length term — only when both measures exist. SKIPPED for line-vs-line: a trimmed edge's
+    // length is unreliable and would penalise the correct base edge (position+direction already pin
+    // it down; post-unify there are no distinct collinear edges to separate by length).
     double ar = 0.0;
     bool sel_has_measure = sel.contains("area_or_len") && !sel.at("area_or_len").is_null();
-    if (sel_has_measure && c.measure.has_value()) {
+    if (!line_match && sel_has_measure && c.measure.has_value()) {
         double s_measure = sel.at("area_or_len").get<double>();
         double denom = std::max({std::abs(s_measure), std::abs(*c.measure), 1e-12});
         ar = std::abs(*c.measure - s_measure) / denom;
     }
-
-    // Surface/curve type match term. The selector's surf may be null (vertices);
-    // compare optionals the same way the Python compares c.surf == sel.get("surf").
-    std::optional<std::string> sel_surf;
-    if (sel.contains("surf") && !sel.at("surf").is_null())
-        sel_surf = sel.at("surf").get<std::string>();
-    double tm = (c.surf == sel_surf) ? 0.0 : 1.0;
 
     if (has_axis) {
         return 0.4 * dc + 0.3 * ax + 0.2 * ar + 0.1 * tm;

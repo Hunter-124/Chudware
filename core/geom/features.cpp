@@ -60,22 +60,34 @@ TopoDS_Shape extrude_rect(double w, double h, double depth) {
 TopoDS_Shape extrude_face(const TopoDS_Face& face, const Eigen::Vector3d& dir,
                           double depth, bool mid_plane) {
     const gp_Vec full(dir.x() * depth, dir.y() * depth, dir.z() * depth);
+    TopoDS_Shape prism;
     if (mid_plane) {
         // Center the solid on the face: shift the face back by half the depth,
         // then prism the full depth so it straddles the sketch plane symmetrically.
         gp_Trsf trsf;
         trsf.SetTranslation(gp_Vec(-0.5 * full.X(), -0.5 * full.Y(), -0.5 * full.Z()));
         TopoDS_Shape shifted = BRepBuilderAPI_Transform(face, trsf, true).Shape();
-        return BRepPrimAPI_MakePrism(shifted, full).Shape();
+        prism = BRepPrimAPI_MakePrism(shifted, full).Shape();
+    } else {
+        prism = BRepPrimAPI_MakePrism(face, full).Shape();
     }
-    return BRepPrimAPI_MakePrism(face, full).Shape();
+    // Collinear adjacent segments in the profile (one straight edge drawn as 2+ segments)
+    // would each sweep into a SEPARATE coplanar side face joined by a phantom edge. Unify
+    // same-domain faces/edges (build123d .clean() parity) so the wall is one face and the
+    // phantom edge is gone — it reads, selects, and fillets like SolidWorks. No-op when the
+    // profile has no collinear runs.
+    return unify_same_domain(prism);
 }
 
 TopoDS_Shape revolve_face(const TopoDS_Face& face, const Eigen::Vector3d& axis_pt,
                           const Eigen::Vector3d& axis_dir, double angle_rad) {
     gp_Ax1 axis(gp_Pnt(axis_pt.x(), axis_pt.y(), axis_pt.z()),
                 gp_Dir(axis_dir.x(), axis_dir.y(), axis_dir.z()));
-    return BRepPrimAPI_MakeRevol(face, axis, angle_rad).Shape();
+    TopoDS_Shape solid = BRepPrimAPI_MakeRevol(face, axis, angle_rad).Shape();
+    // Same collinear-segment cleanup as extrude_face: collinear profile runs revolve into
+    // separate cocylindrical/coplanar faces split by a phantom edge — merge them so the
+    // revolved body has one face per real wall and no spurious edges to confuse fillet.
+    return unify_same_domain(solid);
 }
 
 TopoDS_Shape make_box_centered(double l, double w, double h) {

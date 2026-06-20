@@ -53,24 +53,30 @@ TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
 
 // --- explicit-edge overloads (the doc model's edge-selector path) ---
 // Round/bevel EXACTLY the given `edges` (already resolved against the body's topology
-// by doc/picks::resolve_edge_picks). Each edge is Add()ed to the builder once; gates on
-// IsDone(). Empty shape on kernel failure OR when `edges` is empty (nothing to do).
+// by doc/picks::resolve_edge_picks). Rounds every edge that CAN be rounded at this radius;
+// if some can't (radius exceeds the local geometry, a corner combo OCCT can't resolve), they
+// are dropped and `*n_dropped` (when given) reports how many — the caller surfaces that as a
+// non-fatal warning rather than failing the whole feature. Empty shape only when NOTHING could
+// be rounded OR `edges` is empty.
 TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
-                          const std::vector<TopoDS_Edge>& edges);
+                          const std::vector<TopoDS_Edge>& edges, int* n_dropped = nullptr);
 TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
-                           const std::vector<TopoDS_Edge>& edges);
+                           const std::vector<TopoDS_Edge>& edges, int* n_dropped = nullptr);
 
 // Variable-radius fillet: a LINEAR radius law per edge from `r1` at the edge start to
 // `r2` at the edge end (BRepFilletAPI_MakeFillet::Add(r1, r2, edge)). Port of
-// dress.py::_variable_fillet. Empty shape on kernel failure / empty `edges`.
+// dress.py::_variable_fillet. Same drop-and-report behaviour as fillet_edges.
 TopoDS_Shape fillet_edges_variable(const TopoDS_Shape& shape, double r1, double r2,
-                                   const std::vector<TopoDS_Edge>& edges);
+                                   const std::vector<TopoDS_Edge>& edges, int* n_dropped = nullptr);
 
 // Two-distance (asymmetric) chamfer: leg `d1` on the first incident face, `d2` on the
 // other (BRepFilletAPI_MakeChamfer::Add(d1, d2, edge, face)). Matches build123d
-// chamfer(length=d1, length2=d2). Empty shape on kernel failure / empty `edges`.
+// chamfer(length=d1, length2=d2). Same drop-and-report behaviour as fillet_edges: edges the
+// kernel can't bevel at this size are dropped (counted in `n_dropped`) instead of failing the
+// whole feature. Empty shape on total failure / empty `edges`.
 TopoDS_Shape chamfer_edges_two_distance(const TopoDS_Shape& shape, double d1, double d2,
-                                        const std::vector<TopoDS_Edge>& edges);
+                                        const std::vector<TopoDS_Edge>& edges,
+                                        int* n_dropped = nullptr);
 
 // --- shell (hollow to a wall) + draft (taper faces) — port of dress.py/draft.py ---
 

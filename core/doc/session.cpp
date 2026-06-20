@@ -505,10 +505,40 @@ void op_sketch_set_dim(json& doc, const json& op, const json& id_map) {
     const std::string cid = op.value("id", std::string());
     for (json& c : sk["params"]["constraints"]) {
         if (c.value("id", std::string()) == cid) {
-            if (op.contains("value")) c["value"] = op["value"];
-            if (op.contains("expr")) c["expr"] = op["expr"];
-            if (op.contains("placement")) c["placement"] = op["placement"];
-            if (op.contains("driven")) c["driven"] = op["driven"];
+            // A constraint's `value` is a dim object {value, expr} (see validate_dim).
+            // Any subset of {value|expr, placement, driven} may be supplied; expr wins
+            // over value when both are present (mirrors the Python oracle).
+            bool touched = false;
+            if (op.contains("expr") && !op["expr"].is_null()) {
+                double cur = (c.contains("value") && c["value"].is_object())
+                                 ? c["value"].value("value", 0.0)
+                                 : 0.0;
+                c["value"] = json{{"value", cur}, {"expr", op["expr"]}};
+                touched = true;
+            } else if (op.contains("value") && !op["value"].is_null()) {
+                c["value"] = json{{"value", op["value"].get<double>()}, {"expr", nullptr}};
+                touched = true;
+            }
+            if (op.contains("placement")) {
+                if (op["placement"].is_null()) {
+                    c.erase("placement");
+                } else if (op["placement"].is_array() && op["placement"].size() == 2) {
+                    c["placement"] = json{op["placement"][0].get<double>(),
+                                          op["placement"][1].get<double>()};
+                } else {
+                    throw OpError("invalid_op", "sketch_set_dim.placement must be [u, v] or null");
+                }
+                touched = true;
+            }
+            if (op.contains("driven") && !op["driven"].is_null()) {
+                if (!op["driven"].is_boolean())
+                    throw OpError("invalid_op", "sketch_set_dim.driven must be a bool");
+                c["driven"] = op["driven"];
+                touched = true;
+            }
+            if (!touched)
+                throw OpError("invalid_op",
+                              "sketch_set_dim requires 'value', 'expr', 'placement', or 'driven'");
             return;
         }
     }
@@ -2087,6 +2117,7 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
                       {"ok", st.ok},
                       {"ms", 0.0},
                       {"error", st.ok ? json(nullptr) : json(st.error)},
+                      {"warning", st.warning.empty() ? json(nullptr) : json(st.warning)},
                       {"dangling_refs", json::array()},
                       {"rolled_back", false}});
     }
@@ -2095,6 +2126,9 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
     resp["id_map"] = id_map;
     resp["tree"] = s.doc;
     resp["owner_map"] = r.owner_map.is_null() ? json::object() : r.owner_map;
+    // Displayable reference geometry (datum axes/planes/points/csys) — empty for docs with no
+    // datum features. The host draws these as overlays; without it a created datum is invisible.
+    resp["datums"] = r.datums;
     if (with_tess) {
         json active_sketch_status = nullptr;
         if (s.active_sketch && !s.active_sketch->last_overall_status.empty())
@@ -2746,6 +2780,17 @@ json doc_tree(const std::string& doc_id) {
     return resp;
 }
 
+json doc_live_source(const std::string& doc_id) {
+    // Non-throwing peek at an open session's current tree + env (the associative source
+    // for drawings / derived re-pulls). A missing doc returns null so the caller keeps
+    // its last good snapshot rather than crashing when the source was closed.
+    std::lock_guard<std::mutex> lk(g_mtx);
+    auto it = g_sessions.find(doc_id);
+    if (it == g_sessions.end()) return json(nullptr);
+    Session& s = it->second;
+    return json{{"tree", s.doc}, {"env", env_from_doc(s.doc)}, {"revision", s.revision}};
+}
+
 json doc_rebuild(const std::string& doc_id) {
     std::lock_guard<std::mutex> lk(g_mtx);
     Session& s = require_session(doc_id);
@@ -3202,6 +3247,16 @@ json doc_resolve_pick(const std::string& doc_id, int body_id, const std::string&
         return resolve_pick_assembly(s, body_id, kind, topo_id);
     json sel = resolve_pick(s.doc, env_from_doc(s.doc), body_id, kind, topo_id);
     return json{{"selector", sel}};
+}
+
+// SolidWorks "fillet a whole face": the host expands a face pick into the face's edge ids, then
+// resolves each to an edge selector. Returns {"edges": [topo_id, ...]} in the host's edge id space.
+json doc_face_edges(const std::string& doc_id, int body_id, int face_topo_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    if (s.is_assembly()) return json{{"edges", json::array()}};  // not supported for assemblies
+    std::vector<int> e = face_edges(s.doc, env_from_doc(s.doc), body_id, face_topo_id);
+    return json{{"edges", e}};
 }
 
 // ----------------------------------------------------------------- C19 sim bridge

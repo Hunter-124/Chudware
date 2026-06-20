@@ -4,6 +4,7 @@
 #include <vector>
 
 #include <BRepAdaptor_Curve.hxx>
+#include <BRep_Tool.hxx>
 #include <BRepFilletAPI_MakeChamfer.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepOffsetAPI_DraftAngle.hxx>
@@ -15,9 +16,12 @@
 #include <TopExp_Explorer.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
+#include <TopTools_ListIteratorOfListOfShape.hxx>
 #include <TopTools_ListOfShape.hxx>
+#include <Standard_Failure.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
+#include <TopoDS_Face.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
@@ -45,6 +49,65 @@ bool edge_parallel_to(const TopoDS_Edge& edge, const Eigen::Vector3d& dir) {
     return std::abs(std::abs(dot) - 1.0) < 1e-6;
 }
 
+// A seam edge (closed on its face — e.g. the 0°/360° closure of a full revolve) or a
+// degenerate edge (a cone apex / sphere pole) is real B-rep topology but NOT a roundable
+// model edge. Handing one to BRepFilletAPI makes Build() fail and nukes the whole feature,
+// which is exactly the "fillet won't work on my revolved part" symptom. The tessellator
+// hides these same edges (so the user never sees or picks one); skip them here too so an
+// "all edges" / direction-filtered round on a revolved body can't trip over the seam.
+bool is_blendable_edge(const TopoDS_Edge& edge,
+                       const TopTools_IndexedDataMapOfShapeListOfShape& edge_faces) {
+    if (BRep_Tool::Degenerated(edge)) return false;
+    if (edge_faces.Contains(edge)) {
+        const TopTools_ListOfShape& faces = edge_faces.FindFromKey(edge);
+        for (TopTools_ListIteratorOfListOfShape it(faces); it.More(); it.Next()) {
+            if (BRep_Tool::IsClosed(edge, TopoDS::Face(it.Value()))) return false;
+        }
+    }
+    return true;
+}
+
+// Build a fillet/chamfer over `good`, dropping any edge that breaks the build instead of failing
+// the whole feature. Fast path adds them all at once (the common, correct case); on failure it
+// re-adds one at a time and keeps only the edges that still produce a valid solid. This is what
+// the user expects when most edges are fine and one section is too tight for the radius (a rim near
+// the axis, a corner OCCT can't resolve, radius > local half-width) — "round what you can" beats
+// a hard error. `Builder` is BRepFilletAPI_MakeFillet/_MakeChamfer; `add(mk, edge)` applies the leg.
+template <class Builder, class AddFn>
+TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
+                                const std::vector<TopoDS_Edge>& good, AddFn add,
+                                int* n_dropped) {
+    if (n_dropped) *n_dropped = 0;
+    if (good.empty()) return TopoDS_Shape();
+    try {
+        Builder mk(shape);
+        for (const TopoDS_Edge& e : good) add(mk, e);
+        mk.Build();
+        if (mk.IsDone()) return mk.Shape();
+    } catch (const Standard_Failure&) { /* fall through to incremental */ }
+
+    std::vector<TopoDS_Edge> accepted;
+    accepted.reserve(good.size());
+    for (const TopoDS_Edge& e : good) {
+        try {
+            Builder mk(shape);
+            for (const TopoDS_Edge& a : accepted) add(mk, a);
+            add(mk, e);
+            mk.Build();
+            if (mk.IsDone()) accepted.push_back(e);
+        } catch (const Standard_Failure&) { /* skip this edge */ }
+    }
+    if (n_dropped) *n_dropped = (int)(good.size() - accepted.size());
+    if (accepted.empty()) return TopoDS_Shape();
+    try {
+        Builder mk(shape);
+        for (const TopoDS_Edge& e : accepted) add(mk, e);
+        mk.Build();
+        if (mk.IsDone()) return mk.Shape();
+    } catch (const Standard_Failure&) {}
+    return TopoDS_Shape();
+}
+
 }  // namespace
 
 TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
@@ -56,10 +119,13 @@ TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
     // edge is Add()ed to the builder exactly once.
     TopTools_IndexedMapOfShape edges;
     TopExp::MapShapes(shape, TopAbs_EDGE, edges);
+    TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
 
     int added = 0;
     for (int i = 1; i <= edges.Extent(); ++i) {
         const TopoDS_Edge edge = TopoDS::Edge(edges(i));
+        if (!is_blendable_edge(edge, edge_faces)) continue;  // skip seams/degenerates
         if (dir.has_value() && !edge_parallel_to(edge, *dir)) continue;
         mk.Add(r, edge);
         ++added;
@@ -78,10 +144,13 @@ TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
     // Same unique-edge enumeration as fillet_edges (see note there).
     TopTools_IndexedMapOfShape edges;
     TopExp::MapShapes(shape, TopAbs_EDGE, edges);
+    TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
 
     int added = 0;
     for (int i = 1; i <= edges.Extent(); ++i) {
         const TopoDS_Edge edge = TopoDS::Edge(edges(i));
+        if (!is_blendable_edge(edge, edge_faces)) continue;  // skip seams/degenerates
         if (dir.has_value() && !edge_parallel_to(edge, *dir)) continue;
         // Symmetric chamfer: the single-distance Add(d, edge) sets both legs to d.
         mk.Add(d, edge);
@@ -99,56 +168,61 @@ TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
 // resolved by doc/picks::resolve_edge_picks, so we just Add() each to the builder (no
 // re-enumeration, no dir filter). Empty `edges` -> empty shape (nothing to do).
 
+// Filter a pick list to the blendable edges (drop seams/degenerates that slipped in).
+static std::vector<TopoDS_Edge> blendable_only(const TopoDS_Shape& shape,
+                                               const std::vector<TopoDS_Edge>& edges) {
+    TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
+    std::vector<TopoDS_Edge> good;
+    good.reserve(edges.size());
+    for (const TopoDS_Edge& e : edges)
+        if (is_blendable_edge(e, edge_faces)) good.push_back(e);
+    return good;
+}
+
 TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
-                          const std::vector<TopoDS_Edge>& edges) {
+                          const std::vector<TopoDS_Edge>& edges, int* n_dropped) {
     if (edges.empty()) return TopoDS_Shape();
-    BRepFilletAPI_MakeFillet mk(shape);
-    for (const TopoDS_Edge& edge : edges) mk.Add(r, edge);
-    mk.Build();
-    if (!mk.IsDone()) return TopoDS_Shape();
-    return mk.Shape();
+    return blend_drop_failing<BRepFilletAPI_MakeFillet>(
+        shape, blendable_only(shape, edges),
+        [r](BRepFilletAPI_MakeFillet& mk, const TopoDS_Edge& e) { mk.Add(r, e); }, n_dropped);
 }
 
 TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
-                           const std::vector<TopoDS_Edge>& edges) {
+                           const std::vector<TopoDS_Edge>& edges, int* n_dropped) {
     if (edges.empty()) return TopoDS_Shape();
-    BRepFilletAPI_MakeChamfer mk(shape);
     // Symmetric chamfer: the single-distance Add(d, edge) sets both legs to d.
-    for (const TopoDS_Edge& edge : edges) mk.Add(d, edge);
-    mk.Build();
-    if (!mk.IsDone()) return TopoDS_Shape();
-    return mk.Shape();
+    return blend_drop_failing<BRepFilletAPI_MakeChamfer>(
+        shape, blendable_only(shape, edges),
+        [d](BRepFilletAPI_MakeChamfer& mk, const TopoDS_Edge& e) { mk.Add(d, e); }, n_dropped);
 }
 
 TopoDS_Shape fillet_edges_variable(const TopoDS_Shape& shape, double r1, double r2,
-                                   const std::vector<TopoDS_Edge>& edges) {
+                                   const std::vector<TopoDS_Edge>& edges, int* n_dropped) {
     if (edges.empty()) return TopoDS_Shape();
-    BRepFilletAPI_MakeFillet mk(shape);
     // Linear radius law r1 (edge start) -> r2 (edge end), matching dress.py::_variable_fillet.
-    for (const TopoDS_Edge& edge : edges) mk.Add(r1, r2, edge);
-    mk.Build();
-    if (!mk.IsDone()) return TopoDS_Shape();
-    return mk.Shape();
+    return blend_drop_failing<BRepFilletAPI_MakeFillet>(
+        shape, blendable_only(shape, edges),
+        [r1, r2](BRepFilletAPI_MakeFillet& mk, const TopoDS_Edge& e) { mk.Add(r1, r2, e); },
+        n_dropped);
 }
 
 TopoDS_Shape chamfer_edges_two_distance(const TopoDS_Shape& shape, double d1, double d2,
-                                        const std::vector<TopoDS_Edge>& edges) {
+                                        const std::vector<TopoDS_Edge>& edges, int* n_dropped) {
     if (edges.empty()) return TopoDS_Shape();
     // The asymmetric Add needs the reference FACE the d1 leg is measured on (build123d
-    // chamfer(length,length2) picks the first incident face). Build an edge->faces map.
+    // chamfer(length,length2) picks the first incident face). Build an edge->faces map, then route
+    // through the SAME drop-failing builder as fillet/symmetric-chamfer so a too-tight edge is
+    // dropped (and reported) instead of nuking the whole feature.
     TopTools_IndexedDataMapOfShapeListOfShape ef;
     TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, ef);
-    BRepFilletAPI_MakeChamfer mk(shape);
-    for (const TopoDS_Edge& edge : edges) {
-        if (!ef.Contains(edge)) return TopoDS_Shape();
-        const TopTools_ListOfShape& faces = ef.FindFromKey(edge);
-        if (faces.IsEmpty()) return TopoDS_Shape();
-        TopoDS_Face f = TopoDS::Face(faces.First());
-        mk.Add(d1, d2, edge, f);
-    }
-    mk.Build();
-    if (!mk.IsDone()) return TopoDS_Shape();
-    return mk.Shape();
+    return blend_drop_failing<BRepFilletAPI_MakeChamfer>(
+        shape, blendable_only(shape, edges),
+        [d1, d2, &ef](BRepFilletAPI_MakeChamfer& mk, const TopoDS_Edge& e) {
+            if (ef.Contains(e) && !ef.FindFromKey(e).IsEmpty())
+                mk.Add(d1, d2, e, TopoDS::Face(ef.FindFromKey(e).First()));
+        },
+        n_dropped);
 }
 
 // --- shell ----------------------------------------------------------------------

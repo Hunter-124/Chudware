@@ -230,6 +230,7 @@ add_library(aicad_agent STATIC
   agent/run.cpp
   agent/micro.cpp
   agent/ask.cpp
+  agent/clarify.cpp
   agent/pm_assist.cpp)
 target_include_directories(aicad_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_agent PUBLIC nlohmann_json::nlohmann_json winhttp bcrypt)

@@ -63,6 +63,13 @@ nlohmann::json doc_tree(const std::string& doc_id);     // no rebuild, no rev bu
 nlohmann::json doc_rebuild(const std::string& doc_id);  // forced rebuild, no rev bump
 bool doc_close(const std::string& doc_id);
 
+// Live source tree + equation env for an associative re-pull by a drawing / derived
+// consumer (mirrors engine/doc/drawing.py pulling an OPEN source DocSession's current
+// bodies on every fetch). Returns {"tree":<doc json>, "env":<equation env>,
+// "revision":<long>}; returns a null json when `doc_id` is not an open session, so the
+// caller can fall back to its last good snapshot instead of crashing.
+nlohmann::json doc_live_source(const std::string& doc_id);
+
 // C20 assembly RPCs (port of engine/doc/session.py solve_mates / set_explode_state /
 // asm_world_bodies). doc_solve_mates re-solves the mates (optional drag {component,
 // target[3]} soft-target), persists the solved transforms, bumps the revision, and
@@ -119,6 +126,9 @@ nlohmann::json doc_config_set_suppression(const std::string& doc_id, const std::
 // into a selector json {selector: {...}}. Throws OpError("unknown_doc"/...).
 nlohmann::json doc_resolve_pick(const std::string& doc_id, int body_id,
                                 const std::string& kind, int topo_id);
+
+// The edge topo_ids bordering a face (for "fillet a whole face"). Returns {edges:[...]}.
+nlohmann::json doc_face_edges(const std::string& doc_id, int body_id, int face_topo_id);
 
 // Instant3D push-pull: drag face (1-based body_id, 1-based topo_id) by `distance` mm
 // along its outward normal. Plans the drivable feature param (plan_push_pull), and on

@@ -339,3 +339,68 @@ TEST_CASE("composed: block + through-hole + filleted outer edges -> real part") 
     CHECK((hi[1] - lo[1]) == doctest::Approx(H).epsilon(1e-4));
     CHECK((hi[2] - lo[2]) == doctest::Approx(D).epsilon(1e-4));
 }
+
+// Regression (3-way corner): three box edges meeting at ONE vertex, all filleted at the same
+// radius, must all round (n_dropped==0) — the "corner approached from all 3 edges" case. Also
+// exercises the full 12-edge round (every vertex is a 3-way corner) and chamfer parity. Pure
+// geometry (explicit edges) isolates the OCCT blend from selector resolution.
+#include <TopExp.hxx>
+#include <TopoDS.hxx>
+#include <TopoDS_Edge.hxx>
+#include <TopoDS_Vertex.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
+#include <BRep_Tool.hxx>
+TEST_CASE("fillet: 3-way corner (3 edges at one vertex) all round") {
+    const double W = 40.0, H = 30.0, D = 20.0, R = 4.0;  // R well under every half-extent
+    TopoDS_Shape box = geom::make_box(W, H, D);
+    const gp_Pnt corner(W, H, D);
+
+    // The 3 unique edges touching the (W,H,D) corner vertex.
+    TopTools_IndexedMapOfShape emap;
+    TopExp::MapShapes(box, TopAbs_EDGE, emap);
+    std::vector<TopoDS_Edge> corner_edges;
+    for (int i = 1; i <= emap.Extent(); ++i) {
+        TopoDS_Edge e = TopoDS::Edge(emap(i));
+        TopoDS_Vertex v1, v2;
+        TopExp::Vertices(e, v1, v2);
+        gp_Pnt p1 = BRep_Tool::Pnt(v1), p2 = BRep_Tool::Pnt(v2);
+        if (p1.Distance(corner) < 1e-6 || p2.Distance(corner) < 1e-6)
+            corner_edges.push_back(e);
+    }
+    REQUIRE(corner_edges.size() == 3);
+
+    int dropped = -1;
+    TopoDS_Shape part = geom::fillet_edges(box, R, corner_edges, &dropped);
+    const double vol = part.IsNull() ? -1.0 : solid_volume(part);
+    MESSAGE("3-way corner: dropped=" << dropped << " null=" << part.IsNull()
+            << " volume=" << vol);
+    CHECK(dropped == 0);
+    REQUIRE_FALSE(part.IsNull());
+
+    // Full 12-edge round: every one of the 8 vertices is a 3-way corner.
+    std::vector<TopoDS_Edge> all_edges;
+    for (int i = 1; i <= emap.Extent(); ++i) all_edges.push_back(TopoDS::Edge(emap(i)));
+    REQUIRE(all_edges.size() == 12);
+    int dropped12 = -1;
+    TopoDS_Shape full = geom::fillet_edges(box, R, all_edges, &dropped12);
+    MESSAGE("full 12-edge round: dropped=" << dropped12 << " null=" << full.IsNull()
+            << " volume=" << (full.IsNull() ? -1.0 : solid_volume(full)));
+    CHECK(dropped12 == 0);
+
+    // Parity: CHAMFER must drop nothing on the same 3-way corner and full-edge sets.
+    int cdrop = -1;
+    TopoDS_Shape cpart = geom::chamfer_edges(box, R, corner_edges, &cdrop);
+    MESSAGE("chamfer 3-way corner: dropped=" << cdrop << " null=" << cpart.IsNull());
+    CHECK(cdrop == 0);
+    REQUIRE_FALSE(cpart.IsNull());
+    int cdrop12 = -1;
+    TopoDS_Shape cfull = geom::chamfer_edges(box, R, all_edges, &cdrop12);
+    MESSAGE("chamfer full 12-edge: dropped=" << cdrop12 << " null=" << cfull.IsNull());
+    CHECK(cdrop12 == 0);
+    // Two-distance (asymmetric) chamfer now drop-failing too.
+    int cdrop2 = -1;
+    TopoDS_Shape ctwo = geom::chamfer_edges_two_distance(box, R, R * 0.5, corner_edges, &cdrop2);
+    MESSAGE("two-distance chamfer 3-way: dropped=" << cdrop2 << " null=" << ctwo.IsNull());
+    CHECK(cdrop2 == 0);
+    REQUIRE_FALSE(ctwo.IsNull());
+}

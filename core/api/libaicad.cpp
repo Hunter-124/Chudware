@@ -33,6 +33,7 @@
 #include <nlohmann/json.hpp>
 
 #include "agent/ask.h"
+#include "agent/clarify.h"
 #include "agent/config.h"
 #include "agent/events.h"
 #include "agent/machine.h"
@@ -154,6 +155,7 @@ int handle_compile(const json& params, char** out_json) {
             {"type", s.type},
             {"ok", s.ok},
             {"error", s.error},
+            {"warning", s.warning},
         });
     }
 
@@ -275,6 +277,8 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
         m = "agent_run";
     } else if (m == "agent_ask_v2") {
         m = "agent_answer_question";
+    } else if (m == "agent_clarify_v1") {
+        m = "agent_clarify";
     } else if (m == "get_prompts_v2") {
         m = "agent_get_prompts_v2";
     } else if (m == "agent_pm_assist_v1") {
@@ -872,6 +876,43 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 });
             return emit(json{{"answer", answer}}, out_json, 0);
         }
+        if (m == "agent_clarify") {
+            // Pre-flight clarify gate: one provider call returns the build-critical
+            // questions (or ready=true) for the host's Design/Edit submit path. Mirrors
+            // agent_answer_question's provider/context resolution exactly.
+            using ojson = nlohmann::ordered_json;
+            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
+            // Accept both {request} (Design submit) and {question} (defensive alias).
+            std::string request = op.value("request", std::string());
+            if (request.empty()) request = op.value("question", std::string());
+            std::string doc_id = op.value("doc_id", std::string("?"));
+            // Hydrate doc/revision/feature_status from the live C++ session when present
+            // (Edit mode); for Design-new no doc exists yet and `doc` stays null.
+            hydrate_assist_from_session(op, doc_id);
+            ojson doc = op.contains("doc") ? op["doc"] : ojson(nullptr);
+            long rev = op.contains("revision") && op["revision"].is_number()
+                           ? op["revision"].get<long>()
+                           : 0;
+            ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
+            // Provider: explicit descriptor (gate mock) OR resolved from config.json. On an
+            // offline/unavailable refusal, return ready=true so the build proceeds (the host
+            // also treats any clarify failure as "skip clarify").
+            json prov = resolve_assist_provider(params);
+            if (prov.is_object() && prov.contains("error")) {
+                return emit(json{{"ready", true},
+                                 {"questions", json::array()},
+                                 {"assumptions", json::array()}},
+                            out_json, 0);
+            }
+            auto provider = aicad::agent::make_assist_provider(prov);
+            aicad::agent::ojson result = aicad::agent::clarify(
+                request, doc, doc_id, rev, fs,
+                [&](const std::string& sys, const std::string& body) {
+                    std::string err;
+                    return provider(sys, body, &err);  // clarify treats an error as empty reply
+                });
+            return emit(json::parse(result.dump()), out_json, 0);
+        }
         if (m == "agent_pm_extract_json") {
             std::string reply = params.value("reply", std::string());
             aicad::agent::ojson plan = aicad::agent::pm_extract_json(reply);
@@ -1372,6 +1413,12 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 params.value("doc_id", std::string()),
                                 params.value("body_id", 0),
                                 params.value("kind", std::string()),
+                                params.value("topo_id", 0)),
+                            out_json, 0);
+            if (m == "doc_face_edges")
+                return emit(aicad::doc::doc_face_edges(
+                                params.value("doc_id", std::string()),
+                                params.value("body_id", 0),
                                 params.value("topo_id", 0)),
                             out_json, 0);
             if (m == "doc_push_pull")

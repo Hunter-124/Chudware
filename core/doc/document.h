@@ -48,7 +48,8 @@ struct FeatureStatus {
     std::string id;
     std::string type;
     bool ok = false;
-    std::string error;  // empty when ok
+    std::string error;    // empty when ok
+    std::string warning;  // non-fatal note on an ok feature (e.g. fillet rounded a subset of edges)
 };
 
 // Per-surviving-body geometry stats (in AICM body order). Additive surfacing gate
@@ -84,6 +85,15 @@ struct CompileResult {
     // members without re-deriving geometry (port of compiler.py's _weld_members ->
     // CompileResult.weld_members). Empty when the doc has no weld_member feature.
     nlohmann::json weld_members = nlohmann::json::object();
+    // Displayable reference geometry: datum axis/plane/point/csys features produce no body, so they
+    // never reach the AICM. Each entry surfaces the resolved geometry so the host can DRAW them as
+    // reference overlays (the host had no way to show a created datum before). Shapes:
+    //   axis  -> {id,name,kind:"axis",  point:[3], dir:[3]}
+    //   plane -> {id,name,kind:"plane", origin:[3], x_dir:[3], y_dir:[3], normal:[3]}
+    //   csys  -> same as plane with kind:"csys"
+    //   point -> {id,name,kind:"point", point:[3]}
+    // Empty for a doc with no datum features. (Parity: engine/doc/session.py display_datums.)
+    nlohmann::json datums = nlohmann::json::array();
     bool ok = false;                      // true iff every feature compiled ok
     // The active configuration whose overrides/suppressions this compile reflects
     // ("Default" for a config-less doc). Surfaced in the ops-response doc_status so
@@ -131,5 +141,10 @@ PushPullPlan plan_push_pull(const nlohmann::json& doc, const nlohmann::json& env
 // Port of engine/doc/session.py::resolve_pick.
 nlohmann::json resolve_pick(const nlohmann::json& doc, const nlohmann::json& env,
                             int body_id, const std::string& kind, int topo_id);
+
+// The unique edge topo_ids bordering a face — for "fillet a whole face" (host expands a face pick
+// into its edges). Empty on a bad id.
+std::vector<int> face_edges(const nlohmann::json& doc, const nlohmann::json& env,
+                            int body_id, int face_topo_id);
 
 }  // namespace aicad::doc

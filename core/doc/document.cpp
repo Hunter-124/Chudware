@@ -2556,6 +2556,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                      (edges_it->is_array() && !edges_it->empty()));
 
                 std::optional<std::vector<TopoDS_Edge>> picked;
+                int n_dangling = 0;   // picks that couldn't be located on the body (skipped + warned)
                 // A semantic geometry QUERY ({"of":"edge",...}) lets the agent name edges
                 // it cannot click — "all edges", "the vertical edges", "the top rim". It
                 // expands against the LIVE body to concrete unique edges (doc/picks).
@@ -2569,26 +2570,29 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 } else if (has_edge_sel) {
                     aicad::doc::EdgePicks picks =
                         aicad::doc::resolve_edge_picks(body, *edges_it);
-                    if (!picks.dangling.empty()) {
-                        std::string msg = type + ": " +
-                            std::to_string(picks.dangling.size()) +
-                            " edge selector(s) dangling: ";
-                        for (std::size_t k = 0; k < picks.dangling.size(); ++k) {
-                            if (k) msg += "; ";
-                            msg += picks.dangling[k];
-                        }
+                    n_dangling = (int)picks.dangling.size();
+                    // Don't fail the WHOLE feature when one freshly-picked selector is stale (a very
+                    // common case while editing a fillet to add edges — the pick is captured against
+                    // the live preview, which the round has trimmed). Round the edges that DID
+                    // resolve and report the rest as a non-fatal warning. Only a total miss errors.
+                    if (picks.edges.empty()) {
+                        std::string msg = type + ": none of the selected edges could be located on "
+                            "the body";
+                        if (n_dangling)
+                            msg += " (" + std::to_string(n_dangling) + " selector(s) dangling)";
                         throw std::runtime_error(msg);
                     }
-                    if (picks.edges.empty())
-                        throw std::runtime_error(type + ": no edges resolved");
                     picked = std::move(picks.edges);
                 }
 
                 TopoDS_Shape out;
+                int n_dropped = 0;      // explicit picks that couldn't be blended at this size
+                double blend_size = 0.0;  // radius / distance, for the warning text
                 if (type == "fillet") {
                     const double radius = num_or_expr(feat.at("radius"), env);
                     if (!(radius > 0.0))
                         throw std::runtime_error("fillet radius must be > 0");
+                    blend_size = radius;
                     // Variable-radius fillet (dress.py): a linear law r1->r2 along the edge,
                     // active when radius2 > 0 and differs from radius. Requires picked edges
                     // (the variable law is per-edge; the dir-filter path stays uniform).
@@ -2597,14 +2601,15 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     const bool variable = picked && radius2 > 0.0 &&
                                           std::abs(radius2 - radius) > 1e-9;
                     if (variable)
-                        out = ::geom::fillet_edges_variable(body, radius, radius2, *picked);
+                        out = ::geom::fillet_edges_variable(body, radius, radius2, *picked, &n_dropped);
                     else
-                        out = picked ? ::geom::fillet_edges(body, radius, *picked)
+                        out = picked ? ::geom::fillet_edges(body, radius, *picked, &n_dropped)
                                      : ::geom::fillet_edges(body, radius, dir);
                 } else {
                     const double distance = num_or_expr(feat.at("distance"), env);
                     if (!(distance > 0.0))
                         throw std::runtime_error("chamfer distance must be > 0");
+                    blend_size = distance;
                     // Two-distance (asymmetric) chamfer (dress.py): leg d1 on one face, d2
                     // on the other, active when length2 > 0 and differs from length. Needs
                     // picked edges (the asymmetric Add references a specific incident face).
@@ -2613,13 +2618,51 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     const bool asym = picked && length2 > 0.0 &&
                                       std::abs(length2 - distance) > 1e-9;
                     if (asym)
-                        out = ::geom::chamfer_edges_two_distance(body, distance, length2, *picked);
+                        out = ::geom::chamfer_edges_two_distance(body, distance, length2, *picked,
+                                                                 &n_dropped);
                     else
-                        out = picked ? ::geom::chamfer_edges(body, distance, *picked)
+                        out = picked ? ::geom::chamfer_edges(body, distance, *picked, &n_dropped)
                                      : ::geom::chamfer_edges(body, distance, dir);
                 }
-                if (out.IsNull())
+                if (out.IsNull()) {
+                    // Nothing could be rounded/beveled — almost always the size exceeds the local
+                    // geometry. Give the actionable message instead of the bare "empty shape".
+                    if (picked && !picked->empty()) {
+                        char buf[160];
+                        std::snprintf(buf, sizeof(buf),
+                            "%s: %.4g mm is too large for the selected edge(s) - reduce the %s",
+                            type.c_str(), blend_size,
+                            type == "fillet" ? "radius" : "distance");
+                        throw std::runtime_error(buf);
+                    }
                     throw std::runtime_error(type + " produced an empty shape");
+                }
+                // Partial success: some selected edges were too tight for the size, and/or some
+                // selectors couldn't be located on the body (stale preview pick). The feature still
+                // applies to the edges that worked — surface the rest as a non-fatal warning so the
+                // user knows to lower the size or re-pick, rather than silently leaving them sharp.
+                if (picked && (n_dropped > 0 || n_dangling > 0)) {
+                    const int requested = (int)picked->size() + n_dangling;
+                    const int rounded = (int)picked->size() - n_dropped;
+                    char buf[240];
+                    const char* sz = type == "fillet" ? "radius" : "distance";
+                    if (n_dangling > 0 && n_dropped > 0)
+                        std::snprintf(buf, sizeof(buf),
+                            "rounded %d of %d edge(s) at %.4g mm; %d too tight, %d couldn't be "
+                            "located - lower the %s or re-pick those edge(s)",
+                            rounded, requested, blend_size, n_dropped, n_dangling, sz);
+                    else if (n_dropped > 0)
+                        std::snprintf(buf, sizeof(buf),
+                            "rounded %d of %d edge(s) at %.4g mm; %d too tight - lower the %s or "
+                            "deselect those edge(s)",
+                            rounded, requested, blend_size, n_dropped, sz);
+                    else
+                        std::snprintf(buf, sizeof(buf),
+                            "rounded %d of %d edge(s); %d selector(s) couldn't be located - re-pick "
+                            "those edge(s)",
+                            rounded, requested, n_dangling);
+                    st.warning = buf;
+                }
 
                 // Dress-up REPLACES the source body (SolidWorks-style): the rounded /
                 // beveled solid is the current state of that body in the tree. Recording
@@ -4377,6 +4420,41 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         result.owner_map = std::move(om);
     }
 
+    // --- displayable reference geometry (datum axis/plane/point/csys) -----------
+    // Datums build no body, so they never reach the AICM. Surface each resolved datum's geometry
+    // (keyed by feature, in tree order) so the host can draw it as a reference overlay. A feature
+    // that errored has no entry in `results`, so it is simply skipped (no datum drawn).
+    for (const json& raw : features.is_array() ? features : empty) {
+        if (!raw.is_object()) continue;
+        const std::string id = raw.value("id", std::string());
+        if (id.empty()) continue;
+        auto rit = results.find(id);
+        if (rit == results.end()) continue;
+        json d;
+        if (std::holds_alternative<AxisResult>(rit->second)) {
+            const AxisResult& a = std::get<AxisResult>(rit->second);
+            d = {{"kind", "axis"},
+                 {"point", {a.point.x(), a.point.y(), a.point.z()}},
+                 {"dir",   {a.dir.x(),   a.dir.y(),   a.dir.z()}}};
+        } else if (std::holds_alternative<PlaneResult>(rit->second)) {
+            const PlaneResult& p = std::get<PlaneResult>(rit->second);
+            const aicad::geom::SketchPlane& pl = p.plane;
+            d = {{"kind", p.is_csys ? "csys" : "plane"},
+                 {"origin", {pl.origin.x(), pl.origin.y(), pl.origin.z()}},
+                 {"x_dir",  {pl.uAxis.x(),  pl.uAxis.y(),  pl.uAxis.z()}},
+                 {"y_dir",  {pl.vAxis.x(),  pl.vAxis.y(),  pl.vAxis.z()}},
+                 {"normal", {pl.normal.x(), pl.normal.y(), pl.normal.z()}}};
+        } else if (std::holds_alternative<PointResult>(rit->second)) {
+            const PointResult& pt = std::get<PointResult>(rit->second);
+            d = {{"kind", "point"}, {"point", {pt.pt.x(), pt.pt.y(), pt.pt.z()}}};
+        } else {
+            continue;  // sketch / solid / curve results are not reference datums
+        }
+        d["id"] = id;
+        d["name"] = raw.value("name", id);
+        result.datums.push_back(std::move(d));
+    }
+
     // ok iff every feature compiled cleanly.
     result.ok = true;
     for (const FeatureStatus& s : result.statuses)
@@ -4409,6 +4487,28 @@ nlohmann::json resolve_pick(const json& doc, const json& env, int body_id,
         }
     }
     return aicad::doc::make_pick_selector(shape, kind, topo_id, owner);
+}
+
+// All UNIQUE edge topo_ids (tessellator/host edge ids) bordering face `face_topo_id` of body
+// `body_id`. Powers SolidWorks "select a face to fillet all its edges": the host expands a face
+// pick into individual edge selectors. Empty on a bad body/face id.
+std::vector<int> face_edges(const json& doc, const json& env, int body_id, int face_topo_id) {
+    std::vector<int> out;
+    CompileResult r = compile_document(doc, env);
+    if (body_id < 1 || body_id > static_cast<int>(r.shapes.size())) return out;
+    const TopoDS_Shape& shape = r.shapes[body_id - 1];
+    TopTools_IndexedMapOfShape face_map, edge_map;
+    TopExp::MapShapes(shape, TopAbs_FACE, face_map);
+    TopExp::MapShapes(shape, TopAbs_EDGE, edge_map);   // same unique order as the tessellator
+    if (face_topo_id < 1 || face_topo_id > face_map.Extent()) return out;
+    TopoDS_Face face = TopoDS::Face(face_map.FindKey(face_topo_id));
+    TopTools_IndexedMapOfShape fe;
+    TopExp::MapShapes(face, TopAbs_EDGE, fe);
+    for (int i = 1; i <= fe.Extent(); ++i) {
+        int idx = edge_map.FindIndex(fe.FindKey(i));   // -> the host's edge topo_id
+        if (idx >= 1) out.push_back(idx);
+    }
+    return out;
 }
 
 // --------------------------------------------------------------- push-pull (Instant3D)

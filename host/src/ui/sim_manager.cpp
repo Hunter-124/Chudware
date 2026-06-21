@@ -231,6 +231,14 @@ const ResultField kFlowFields[] = {
 };
 const int kNFlowFields = (int)(sizeof(kFlowFields) / sizeof(kFlowFields[0]));
 
+// True if a flow result actually carries `chunk` (from the worker's scalar_fields). An empty
+// list means a legacy result with unknown fields — show everything rather than hide all.
+static bool flowFieldPresent(const std::vector<std::string>& fields, const char* chunk) {
+    if (fields.empty()) return true;
+    for (const auto& f : fields) if (f == chunk) return true;
+    return false;
+}
+
 // Fluid presets: {label, density kg/m^3, kinematic viscosity m^2/s}. The last entry (Custom) is a
 // sentinel — its density/viscosity come from the study's editable fields instead.
 struct FluidPreset { const char* label; float density; float visc; };
@@ -270,6 +278,7 @@ void fieldMeta(const AppState& st, const std::string& chunk, std::string& label,
                double& fromSI) {
     SimManager::UnitSys u = SimManager::unitSys(st);
     if (chunk == "mode_amplitude") { label = "Mode amplitude"; unit = ""; fromSI = 1.0; return; }
+    if (chunk == "temperature")    { label = "Temperature"; unit = "degC"; fromSI = 1.0; return; }
     auto scan = [&](const ResultField* arr, int n) -> bool {
         for (int i = 0; i < n; ++i)
             if (chunk == arr[i].chunk) {
@@ -2704,12 +2713,20 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
         const int n = (s.type == StudyType::Static)  ? kNStaticFields
                     : (s.type == StudyType::Fatigue) ? kNFatigueFields : kNFlowFields;
         ImGui::TextUnformatted("Plot");
+        // For flow, only offer fields the result actually carries (aero -> pressure_cp/velocity;
+        // thermal/CHT -> temperature/velocity). FEA studies always expose their full field set.
+        auto avail = [&](int i) {
+            return s.type != StudyType::Flow || flowFieldPresent(s.flowFields, arr[i].chunk);
+        };
         int curIdx = 0;
         for (int i = 0; i < n; ++i)
             if (st.activeScalarField == arr[i].chunk) curIdx = i;
+        if (!avail(curIdx))
+            for (int i = 0; i < n; ++i) if (avail(i)) { curIdx = i; break; }
         ImGui::SetNextItemWidth(-FLT_MIN);
         if (ImGui::BeginCombo("##field", arr[curIdx].label)) {
-            for (int i = 0; i < n; ++i)
+            for (int i = 0; i < n; ++i) {
+                if (!avail(i)) continue;
                 if (ImGui::Selectable(arr[i].label, i == curIdx)) {
                     st.activeScalarField = arr[i].chunk;
                     applyResultField(st, s);
@@ -2727,6 +2744,7 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
                         rebuildFlowLines(st, s);
                     }
                 }
+            }
             ImGui::EndCombo();
         }
         simTip("Which result field colors the model. Switching is instant — the same result is "
@@ -2757,6 +2775,15 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
                 row(("Mode " + std::to_string(i + 1)).c_str(), b);
             }
             if (s.freqs.empty()) row("Frequencies", "(none)");
+        } else if (s.type == StudyType::Flow && flowFieldPresent(s.flowFields, "temperature")) {
+            // Thermal / CHT result: temperatures (degC), not forces. cpMin/cpMax carry the
+            // surface (or solid) temperature range; the banner adds inlet + total heat flow.
+            std::snprintf(b, sizeof(b), "%.1f degC", s.flowInletTempC);   row("Inlet / ambient", b);
+            const char* lbl = (s.flowThermalType == 1) ? "Part temp (min)" : "Surface temp (min)";
+            std::snprintf(b, sizeof(b), "%.1f degC", s.cpMin);            row(lbl, b);
+            std::snprintf(b, sizeof(b), "%.1f degC", s.cpMax);
+            row((s.flowThermalType == 1) ? "Part temp (max)" : "Surface temp (max)", b);
+            std::snprintf(b, sizeof(b), "%.0f", s.reynolds);              row("Reynolds number", b);
         } else if (s.type == StudyType::Flow) {
             std::snprintf(b, sizeof(b), "%.4g N", s.dragN);          row("Drag", b);
             std::snprintf(b, sizeof(b), "%.4g N", s.liftN);          row("Lift", b);

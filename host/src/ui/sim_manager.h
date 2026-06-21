@@ -105,6 +105,7 @@ struct Study {
     int flowRoughness = 0;          // surface-roughness preset index (last = custom)
     float flowRoughnessUm = 0.0f;   // equivalent sand-grain roughness Ks (micrometres) — when custom
     float flowRefAreaMm2 = 0.0f;    // reference area for Cd/Cl (mm^2); 0 = auto (projected frontal)
+    int flowSolver = 0;             // CFD engine: 0 LBM (fast), 1 OpenFOAM RANS (accurate, needs provision)
 
     // Result state (transient — regenerated on Run; never persisted).
     bool hasResult = false;

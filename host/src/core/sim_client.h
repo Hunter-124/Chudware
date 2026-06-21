@@ -72,6 +72,12 @@ public:
     // Best-effort cancel of the in-flight job (sends sim_cancel on a detached thread).
     void cancel();
 
+    // Which simulation engines are available, e.g. {lbm:true, openfoam:true,
+    // openfoam_kind:"wsl", openfoam_version:"..."}. Queried once (lazily, only when idle) and
+    // cached; returns {} until the first successful probe. Used to gate the Flow solver
+    // selector so OpenFOAM is offered only when it's actually provisioned.
+    nlohmann::json caps();
+
     SimJobResult& job() { return job_; }
 
 private:
@@ -79,6 +85,10 @@ private:
     SimJobResult job_;
     std::string curJobId_;
     std::mutex startMtx_;
+
+    std::mutex capsMtx_;
+    nlohmann::json capsCache_;
+    std::atomic<bool> capsQueried_{false};
 };
 
 }  // namespace core

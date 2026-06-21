@@ -34,6 +34,25 @@ void SimClient::cancel() {
     }).detach();
 }
 
+nlohmann::json SimClient::caps() {
+    if (capsQueried_.load()) {
+        std::lock_guard<std::mutex> lk(capsMtx_);
+        return capsCache_;
+    }
+    // Don't poke the worker mid-job (the WorkerClient serializes calls; a long solve would block
+    // the UI thread). Leave capsQueried_ false so a later idle frame retries.
+    if (job_.running.load()) return nlohmann::json::object();
+    std::string note;
+    if (!ensureStarted(note)) return nlohmann::json::object();
+    nlohmann::json r;
+    std::string e;
+    bool ok = worker_.call("sim_caps", nlohmann::json::object(), r, e, 15000);
+    std::lock_guard<std::mutex> lk(capsMtx_);
+    if (ok && r.is_object() && !r.contains("code")) capsCache_ = r;
+    capsQueried_ = true;
+    return capsCache_;
+}
+
 bool SimClient::launch(const std::string& method, nlohmann::json params,
                        std::string& consoleNote, const std::string& ownerDocId) {
     if (job_.running.exchange(true)) {

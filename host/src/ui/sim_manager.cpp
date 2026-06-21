@@ -387,7 +387,7 @@ nlohmann::json SimManager::studyToJson(const Study& s) {
                   {"fluid", s.flowFluid}, {"density", s.flowDensity}, {"viscosity", s.flowViscosity},
                   {"aoa", s.flowAoA}, {"sideslip", s.flowSideslip},
                   {"roughness", s.flowRoughness}, {"roughness_um", s.flowRoughnessUm},
-                  {"ref_area_mm2", s.flowRefAreaMm2}}},
+                  {"ref_area_mm2", s.flowRefAreaMm2}, {"solver", s.flowSolver}}},
         {"fatigue", {{"method", s.fatigueMethod}, {"load_type", s.fatigueLoadType},
                      {"ratio", s.fatigueRatio}, {"lmin", s.fatigueLmin}, {"lmax", s.fatigueLmax},
                      {"se_mpa", s.fatigueSe}, {"sut_mpa", s.fatigueSut},
@@ -440,6 +440,7 @@ Study SimManager::studyFromJson(const nlohmann::json& j) {
         s.flowRoughness = fl.value("roughness", 0);
         s.flowRoughnessUm = fl.value("roughness_um", 0.0);
         s.flowRefAreaMm2 = fl.value("ref_area_mm2", 0.0);
+        s.flowSolver = fl.value("solver", 0);
     }
     if (j.contains("fatigue") && j["fatigue"].is_object()) {
         const auto& fa = j["fatigue"];
@@ -1389,6 +1390,7 @@ void SimManager::runFlow(AppState& st, Study& s) {
         {"fluid", {{"name", fluidName}, {"density_kgm3", density}, {"kinematic_visc_m2s", visc}}},
         {"roughness_um", flowRoughnessUm(s)},
         {"ref_area_mm2", s.flowRefAreaMm2},
+        {"solver", s.flowSolver == 1 ? "openfoam" : "lbm"},
     };
     std::string note;
     if (sim->launch("sim_run_flow", params, note, st.docMirror.docId())) {
@@ -2509,6 +2511,41 @@ void SimManager::drawFlowForm(AppState& st, Study& s) {
         ImGui::EndCombo();
     }
     simTip("Voxel resolution / run time. Thin walls need a finer preset or they leak flow.");
+
+    // ---- CFD engine: LBM (fast) vs OpenFOAM RANS (accurate, only if provisioned) ----
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Solver");
+    bool ofAvail = false; std::string ofVer;
+    if (st.simClient) {
+        nlohmann::json caps = st.simClient->caps();
+        ofAvail = caps.value("openfoam", false);
+        ofVer = caps.value("openfoam_version", std::string());
+    }
+    // Fall back to LBM if OpenFOAM was selected but is no longer available.
+    if (!ofAvail && s.flowSolver == 1) { s.flowSolver = 0; persist(st, s); }
+    static const char* kSolverLabels[2] = {"LBM (fast)", "OpenFOAM RANS (accurate)"};
+    int svi = (s.flowSolver == 1 && ofAvail) ? 1 : 0;
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##solver", kSolverLabels[svi])) {
+        if (ImGui::Selectable(kSolverLabels[0], svi == 0)) { s.flowSolver = 0; persist(st, s); }
+        if (ofAvail) {
+            if (ImGui::Selectable(kSolverLabels[1], svi == 1)) { s.flowSolver = 1; persist(st, s); }
+        } else {
+            ImGui::BeginDisabled();
+            ImGui::Selectable("OpenFOAM RANS (not provisioned)", false);
+            ImGui::EndDisabled();
+        }
+        ImGui::EndCombo();
+    }
+    if (ofAvail) {
+        std::string tip = "LBM: fast lattice-Boltzmann for quick comparisons. OpenFOAM: steady RANS "
+                          "(k-omega SST) with boundary-layer meshing — slower but trustworthy Cd/Cl for "
+                          "engineering decisions. Detected: " + ofVer + ".";
+        simTip(tip.c_str());
+    } else {
+        simTip("LBM lattice-Boltzmann solver. OpenFOAM RANS is unavailable on this machine — provision "
+               "it with `python -m tools.provision_openfoam --install` to unlock accurate drag/lift.");
+    }
 
     // ---- live setup readout: resolved stream vector + Reynolds estimate ----
     ImGui::Spacing();

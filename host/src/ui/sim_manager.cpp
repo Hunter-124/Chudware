@@ -226,6 +226,7 @@ const int kNFatigueFields = (int)(sizeof(kFatigueFields) / sizeof(kFatigueFields
 // Fields a FLOW study's overlay carries. kind 3 = velocity (m/s, unit-agnostic); kind 2 = dimensionless.
 const ResultField kFlowFields[] = {
     {"pressure_cp", "Pressure coefficient (Cp)", 2},
+    {"temperature", "Temperature (degC)",        3},   // OpenFOAM thermal studies
     {"velocity",    "Velocity (slices)",         3},
 };
 const int kNFlowFields = (int)(sizeof(kFlowFields) / sizeof(kFlowFields[0]));
@@ -387,7 +388,10 @@ nlohmann::json SimManager::studyToJson(const Study& s) {
                   {"fluid", s.flowFluid}, {"density", s.flowDensity}, {"viscosity", s.flowViscosity},
                   {"aoa", s.flowAoA}, {"sideslip", s.flowSideslip},
                   {"roughness", s.flowRoughness}, {"roughness_um", s.flowRoughnessUm},
-                  {"ref_area_mm2", s.flowRefAreaMm2}, {"solver", s.flowSolver}}},
+                  {"ref_area_mm2", s.flowRefAreaMm2}, {"solver", s.flowSolver},
+                  {"thermal", s.flowThermal}, {"inlet_temp_c", s.flowInletTempC},
+                  {"wall_mode", s.flowWallMode}, {"wall_temp_c", s.flowWallTempC},
+                  {"wall_flux_wm2", s.flowWallFluxWm2}, {"wall_power_w", s.flowWallPowerW}}},
         {"fatigue", {{"method", s.fatigueMethod}, {"load_type", s.fatigueLoadType},
                      {"ratio", s.fatigueRatio}, {"lmin", s.fatigueLmin}, {"lmax", s.fatigueLmax},
                      {"se_mpa", s.fatigueSe}, {"sut_mpa", s.fatigueSut},
@@ -441,6 +445,12 @@ Study SimManager::studyFromJson(const nlohmann::json& j) {
         s.flowRoughnessUm = fl.value("roughness_um", 0.0);
         s.flowRefAreaMm2 = fl.value("ref_area_mm2", 0.0);
         s.flowSolver = fl.value("solver", 0);
+        s.flowThermal = fl.value("thermal", false);
+        s.flowInletTempC = fl.value("inlet_temp_c", 20.0);
+        s.flowWallMode = fl.value("wall_mode", 2);
+        s.flowWallTempC = fl.value("wall_temp_c", 80.0);
+        s.flowWallFluxWm2 = fl.value("wall_flux_wm2", 0.0);
+        s.flowWallPowerW = fl.value("wall_power_w", 10.0);
     }
     if (j.contains("fatigue") && j["fatigue"].is_object()) {
         const auto& fa = j["fatigue"];
@@ -1392,6 +1402,16 @@ void SimManager::runFlow(AppState& st, Study& s) {
         {"ref_area_mm2", s.flowRefAreaMm2},
         {"solver", s.flowSolver == 1 ? "openfoam" : "lbm"},
     };
+    // Thermal (heat-transfer) study — OpenFOAM only; applied to the whole part wall.
+    if (s.flowSolver == 1 && s.flowThermal) {
+        const char* wallMode = (s.flowWallMode == 0) ? "temp"
+                             : (s.flowWallMode == 1) ? "flux" : "power";
+        params["thermal"] = {
+            {"enabled", true}, {"inlet_temp_c", s.flowInletTempC}, {"wall_mode", wallMode},
+            {"wall_temp_c", s.flowWallTempC}, {"wall_flux_w_m2", s.flowWallFluxWm2},
+            {"wall_power_w", s.flowWallPowerW},
+        };
+    }
     std::string note;
     if (sim->launch("sim_run_flow", params, note, st.docMirror.docId())) {
         clearTransientResult(s);
@@ -1534,16 +1554,23 @@ void SimManager::tick(AppState& st) {
             if (res.contains("scalar_fields") && res["scalar_fields"].is_array())
                 for (const auto& f : res["scalar_fields"])
                     if (f.is_string()) s.flowFields.push_back(f.get<std::string>());
+            // Thermal studies don't report drag; show the temperature/heat headline from the banner.
+            bool isThermal = false;
+            for (const auto& f : s.flowFields) if (f == "temperature") isThermal = true;
             char buf[256];
-            std::snprintf(buf, sizeof(buf), "Drag %.3g N | Lift %.3g N | Cd %.3f | Cl %.3f",
-                          s.dragN, s.liftN, s.cd, s.cl);
+            if (isThermal)
+                std::snprintf(buf, sizeof(buf), "Surface %.0f-%.0f degC | inlet %.0f degC",
+                              s.cpMin, s.cpMax, s.flowInletTempC);
+            else
+                std::snprintf(buf, sizeof(buf), "Drag %.3g N | Lift %.3g N | Cd %.3f | Cl %.3f",
+                              s.dragN, s.liftN, s.cd, s.cl);
             s.summary = buf;
             s.banner = res.value("reynolds_note", std::string());
             // The overlay carries the MODEL (Cp-coloured) + streamline/slice lines, so the part stays
             // visible — flow now rides the same overlay/colormap path as FEA instead of replacing the
             // model with a body-less streamline file.
             s.overlayPath = res.value("overlay_aicm", res.value("lines_aicm", std::string()));
-            st.activeScalarField = "pressure_cp";
+            st.activeScalarField = isThermal ? "temperature" : "pressure_cp";
             applyResultField(st, s);
             resultShown_ = true; shownStudyId_ = s.id;
             rebuildFlowLines(st, s);
@@ -2545,6 +2572,50 @@ void SimManager::drawFlowForm(AppState& st, Study& s) {
     } else {
         simTip("LBM lattice-Boltzmann solver. OpenFOAM RANS is unavailable on this machine — provision "
                "it with `python -m tools.provision_openfoam --install` to unlock accurate drag/lift.");
+    }
+
+    // ---- thermal / heat transfer (OpenFOAM only) ----
+    if (s.flowSolver == 1 && ofAvail) {
+        ImGui::Spacing();
+        if (ImGui::Checkbox("Heat transfer (thermal)", &s.flowThermal)) persist(st, s);
+        simTip("Solve the energy equation (buoyantSimpleFoam) for a heated part: surface temperature, "
+               "the thermal plume, and total wall heat flow. Applied to the whole part surface.");
+        if (s.flowThermal) {
+            ImGui::Indent(10.0f * S);
+            ImGui::TextUnformatted("Inlet/ambient temp (degC)");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::InputFloat("##inletT", &s.flowInletTempC, 0, 0, "%.1f")) {}
+            if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+
+            ImGui::TextUnformatted("Wall condition");
+            static const char* kWallModes[3] = {"Fixed temperature", "Heat flux (W/m2)", "Total power (W)"};
+            int wm = (s.flowWallMode < 0 || s.flowWallMode > 2) ? 2 : s.flowWallMode;
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::BeginCombo("##wallmode", kWallModes[wm])) {
+                for (int i = 0; i < 3; ++i)
+                    if (ImGui::Selectable(kWallModes[i], wm == i)) { s.flowWallMode = i; persist(st, s); }
+                ImGui::EndCombo();
+            }
+            simTip("How the part heats the fluid: hold the wall at a fixed temperature, drive a uniform "
+                   "heat flux, or dissipate a fixed total power across the whole surface.");
+            if (wm == 0) {
+                ImGui::TextUnformatted("Wall temperature (degC)");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::InputFloat("##wallT", &s.flowWallTempC, 0, 0, "%.1f")) {}
+                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+            } else if (wm == 1) {
+                ImGui::TextUnformatted("Heat flux (W/m2)");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::InputFloat("##wallQ", &s.flowWallFluxWm2, 0, 0, "%.1f")) {}
+                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+            } else {
+                ImGui::TextUnformatted("Total power (W)");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::InputFloat("##wallP", &s.flowWallPowerW, 0, 0, "%.2f")) {}
+                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+            }
+            ImGui::Unindent(10.0f * S);
+        }
     }
 
     // ---- live setup readout: resolved stream vector + Reynolds estimate ----

@@ -66,6 +66,12 @@ class CaseInfo:
     iters: int
     n_proc: int
     part_patch: str = "part"
+    # Thermal (buoyantSimpleFoam) extras — defaults describe a pure-aero (simpleFoam) case.
+    app: str = "simpleFoam"
+    thermal: bool = False
+    inlet_temp_k: float = 293.15
+    wall_temp_k: float = 0.0           # >0 when the part wall is a fixed-temperature BC
+    g_case: Tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     def world_mm_to_case_m(self, pts_mm: np.ndarray) -> np.ndarray:
         """Map world-space mm points into the OpenFOAM case (aligned, metres)."""
@@ -103,8 +109,15 @@ def build_case(case_dir: str, stl_path: str,
                direction=(1.0, 0.0, 0.0), speed_mps: float = 10.0,
                preset: str = "coarse", aoa_deg: float = 0.0, sideslip_deg: float = 0.0,
                fluid: Optional[dict] = None, ref_area_mm2: float = 0.0,
-               n_proc: int = 1) -> CaseInfo:
-    """Write a full OpenFOAM case under ``case_dir``; return its :class:`CaseInfo`."""
+               n_proc: int = 1, thermal: Optional[dict] = None) -> CaseInfo:
+    """Write a full OpenFOAM case under ``case_dir``; return its :class:`CaseInfo`.
+
+    ``thermal`` (optional) switches the case to steady buoyant heat transfer (buoyantSimpleFoam):
+        {enabled: bool, inlet_temp_c: float, wall_mode: "temp"|"flux"|"power",
+         wall_temp_c: float, wall_flux_w_m2: float, wall_power_w: float}
+    The part wall carries the chosen thermal BC; everything else (mesh, domain, turbulence)
+    matches the aero case so results are comparable.
+    """
     pre = _PRESETS.get(preset, _PRESETS["coarse"])
     case = Path(case_dir)
 
@@ -170,25 +183,52 @@ def build_case(case_dir: str, stl_path: str,
            0.5 * (box_min_m[2] + box_max_m[2]))
 
     iters = pre["iters"]
+    th = thermal if (thermal and thermal.get("enabled")) else None
 
-    # ---- write everything ----
+    # ---- mesh dicts (identical for aero and thermal) ----
     _write_blockmesh(case, box_min_m, box_max_m, nx, ny, nz)
     _write_snappy(case, pre["refine"], pre["layers"], loc)
     _write_surface_features(case)
     _write_mesh_quality(case)
-    _write_transport(case, nu)
     _write_turbulence(case)
-    _write_control_dict(case, iters, rho, u, aref_m2, char_len_m)
-    _write_fv_schemes(case)
-    _write_fv_solution(case)
     _write_decompose(case, n_proc)
-    _write_fields(case, u, k0, omega0, nut0)
+
+    if th is None:
+        # ---- aero (incompressible simpleFoam) ----
+        _write_transport(case, nu)
+        _write_control_dict(case, iters, rho, u, aref_m2, char_len_m)
+        _write_fv_schemes(case)
+        _write_fv_solution(case)
+        _write_fields(case, u, k0, omega0, nut0)
+        return CaseInfo(
+            case_dir=str(case), R=R, scale_m=1e-3, speed_mps=u, rho_kgm3=rho, nu_m2s=nu,
+            reynolds=reynolds, char_len_m=char_len_m, frontal_area_mm2=frontal_mm2,
+            ref_area_mm2=ref_mm2, drag_dir=(1.0, 0.0, 0.0), lift_dir=(0.0, 0.0, 1.0),
+            side_dir=(0.0, 1.0, 0.0), iters=iters, n_proc=n_proc,
+        )
+
+    # ---- thermal (compressible buoyant buoyantSimpleFoam) ----
+    inlet_t = float(th.get("inlet_temp_c", 20.0)) + 273.15
+    wall_mode = str(th.get("wall_mode", "temp"))
+    wall_t = float(th.get("wall_temp_c", 80.0)) + 273.15
+    # Gravity in case space: world is Z-up, the part was rotated world->case by R.
+    g_case = tuple((R @ np.array([0.0, 0.0, -9.81])).tolist())
+
+    _write_thermo(case, nu, rho)
+    _write_g(case, g_case)
+    _write_control_dict_thermal(case, iters, u, aref_m2, char_len_m)
+    _write_fv_schemes_thermal(case)
+    _write_fv_solution_thermal(case)
+    _write_fields_thermal(case, u, k0, omega0, nut0, inlet_t, wall_mode, wall_t,
+                          float(th.get("wall_flux_w_m2", 0.0)), float(th.get("wall_power_w", 0.0)))
 
     return CaseInfo(
         case_dir=str(case), R=R, scale_m=1e-3, speed_mps=u, rho_kgm3=rho, nu_m2s=nu,
         reynolds=reynolds, char_len_m=char_len_m, frontal_area_mm2=frontal_mm2,
         ref_area_mm2=ref_mm2, drag_dir=(1.0, 0.0, 0.0), lift_dir=(0.0, 0.0, 1.0),
         side_dir=(0.0, 1.0, 0.0), iters=iters, n_proc=n_proc,
+        app="buoyantSimpleFoam", thermal=True, inlet_temp_k=inlet_t,
+        wall_temp_k=(wall_t if wall_mode == "temp" else 0.0), g_case=g_case,
     )
 
 
@@ -451,3 +491,164 @@ def _write_turbulence(case: Path) -> None:
         "    turbulence      on;\n    printCoeffs     on;\n}\n"
     )
     _w(case / "constant" / "turbulenceProperties", body)
+
+
+# --------------------------------------------------------------------------- thermal (buoyantSimpleFoam)
+
+def _write_thermo(case: Path, nu: float, rho: float) -> None:
+    """Perfect-gas air thermophysics; mu derived from the requested kinematic viscosity."""
+    mu = nu * rho                       # dynamic viscosity (Pa.s) consistent with the aero nu
+    body = _header("dictionary", "thermophysicalProperties", "constant")
+    body += (
+        "thermoType\n{\n    type            heRhoThermo;\n    mixture         pureMixture;\n"
+        "    transport       const;\n    thermo          hConst;\n"
+        "    equationOfState perfectGas;\n    specie          specie;\n"
+        "    energy          sensibleEnthalpy;\n}\n\n"
+        "mixture\n{\n    specie       { molWeight 28.96; }\n"
+        "    thermodynamics { Cp 1004.4; Hf 0; }\n"
+        f"    transport      {{ mu {mu:.6g}; Pr 0.705; }}\n}}\n"
+    )
+    _w(case / "constant" / "thermophysicalProperties", body)
+
+
+def _write_g(case: Path, g) -> None:
+    body = _header("uniformDimensionedVectorField", "g", "constant")
+    body += f"dimensions      [0 1 -2 0 0 0 0];\nvalue           ({g[0]:.6g} {g[1]:.6g} {g[2]:.6g});\n"
+    _w(case / "constant" / "g", body)
+
+
+def _write_control_dict_thermal(case: Path, iters, u, aref_m2=0.0, lref_m=0.0) -> None:
+    body = _header("dictionary", "controlDict", "system")
+    body += (
+        "application     buoyantSimpleFoam;\nstartFrom       startTime;\nstartTime       0;\n"
+        f"stopAt          endTime;\nendTime         {iters};\ndeltaT          1;\n"
+        f"writeControl    timeStep;\nwriteInterval   {iters};\npurgeWrite      2;\n"
+        "writeFormat     ascii;\nwritePrecision  7;\nwriteCompression off;\n"
+        "timeFormat      general;\ntimePrecision   6;\nrunTimeModifiable true;\n\n"
+        # Thermal study headline is heat transfer, not drag — a compressible forceCoeffs needs
+        # careful pRef handling, so it's omitted here (use an aero study for trustworthy Cd/Cl).
+        "functions\n{\n"
+        "    wallHeatFlux\n    {\n        type            wallHeatFlux;\n"
+        "        libs            (\"libfieldFunctionObjects.so\");\n"
+        "        writeControl    writeTime;\n        patches         (part);\n    }\n"
+        "}\n"
+    )
+    _w(case / "system" / "controlDict", body)
+
+
+def _write_fv_schemes_thermal(case: Path) -> None:
+    body = _header("dictionary", "fvSchemes", "system")
+    body += (
+        "ddtSchemes      { default steadyState; }\n"
+        "gradSchemes     { default Gauss linear; }\n"
+        "divSchemes\n{\n    default none;\n"
+        "    div(phi,U)      bounded Gauss linearUpwindV grad(U);\n"
+        "    div(phi,K)      bounded Gauss linear;\n"
+        "    div(phi,h)      bounded Gauss linearUpwind grad(h);\n"
+        "    div(phi,k)      bounded Gauss upwind;\n"
+        "    div(phi,omega)  bounded Gauss upwind;\n"
+        "    div(phi,Ekp)    bounded Gauss linear;\n"
+        "    div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;\n}\n"
+        "laplacianSchemes { default Gauss linear corrected; }\n"
+        "interpolationSchemes { default linear; }\n"
+        "snGradSchemes   { default corrected; }\n"
+        "wallDist        { method meshWave; }\n"
+    )
+    _w(case / "system" / "fvSchemes", body)
+
+
+def _write_fv_solution_thermal(case: Path) -> None:
+    body = _header("dictionary", "fvSolution", "system")
+    body += (
+        "solvers\n{\n"
+        "    p_rgh\n    {\n        solver GAMG;\n        smoother GaussSeidel;\n"
+        "        tolerance 1e-7;\n        relTol 0.01;\n    }\n"
+        "    \"(U|h|k|omega)\"\n    {\n        solver smoothSolver;\n"
+        "        smoother symGaussSeidel;\n        tolerance 1e-7;\n        relTol 0.1;\n    }\n}\n\n"
+        "SIMPLE\n{\n    momentumPredictor no;\n    nNonOrthogonalCorrectors 0;\n"
+        "    pRefCell 0;\n    pRefValue 0;\n"
+        "    residualControl\n    {\n        p_rgh 1e-4;\n        U 1e-4;\n        h 1e-4;\n"
+        "        \"(k|omega)\" 1e-3;\n    }\n}\n\n"
+        "relaxationFactors\n{\n    fields\n    {\n        rho 1.0;\n        p_rgh 0.7;\n    }\n"
+        "    equations\n    {\n        U 0.3;\n        h 0.3;\n        \"(k|omega)\" 0.7;\n    }\n}\n"
+    )
+    _w(case / "system" / "fvSolution", body)
+
+
+def _write_fields_thermal(case: Path, u, k0, omega0, nut0, inlet_t, wall_mode,
+                          wall_t, wall_flux, wall_power) -> None:
+    z = case / "0"
+    P0 = 1.0e5  # absolute reference pressure (Pa) for the perfect-gas equation of state
+    # U
+    _w(z / "U", _header("volVectorField", "U", "0") +
+       "dimensions      [0 1 -1 0 0 0 0];\n"
+       f"internalField   uniform ({u:.6g} 0 0);\n\n"
+       "boundaryField\n{\n"
+       f"    inlet   {{ type fixedValue; value uniform ({u:.6g} 0 0); }}\n"
+       "    outlet  { type inletOutlet; inletValue uniform (0 0 0); value uniform (0 0 0); }\n"
+       "    sides   { type slip; }\n"
+       "    part    { type noSlip; }\n}\n")
+    # p_rgh (solved)
+    _w(z / "p_rgh", _header("volScalarField", "p_rgh", "0") +
+       f"dimensions      [1 -1 -2 0 0 0 0];\ninternalField   uniform {P0:.6g};\n\n"
+       "boundaryField\n{\n"
+       f"    inlet   {{ type fixedFluxPressure; value uniform {P0:.6g}; }}\n"
+       f"    outlet  {{ type prghPressure; p uniform {P0:.6g}; value uniform {P0:.6g}; }}\n"
+       f"    sides   {{ type fixedFluxPressure; value uniform {P0:.6g}; }}\n"
+       f"    part    {{ type fixedFluxPressure; value uniform {P0:.6g}; }}\n}}\n")
+    # p (calculated)
+    _w(z / "p", _header("volScalarField", "p", "0") +
+       f"dimensions      [1 -1 -2 0 0 0 0];\ninternalField   uniform {P0:.6g};\n\n"
+       "boundaryField\n{\n"
+       f"    inlet   {{ type calculated; value uniform {P0:.6g}; }}\n"
+       f"    outlet  {{ type calculated; value uniform {P0:.6g}; }}\n"
+       f"    sides   {{ type calculated; value uniform {P0:.6g}; }}\n"
+       f"    part    {{ type calculated; value uniform {P0:.6g}; }}\n}}\n")
+    # T
+    if wall_mode == "flux":
+        part_t = (f"    part    {{ type externalWallHeatFluxTemperature; mode flux; "
+                  f"q uniform {wall_flux:.6g}; kappaMethod fluidThermo; value uniform {inlet_t:.6g}; }}\n")
+    elif wall_mode == "power":
+        part_t = (f"    part    {{ type externalWallHeatFluxTemperature; mode power; "
+                  f"Q {wall_power:.6g}; kappaMethod fluidThermo; value uniform {inlet_t:.6g}; }}\n")
+    else:  # fixed temperature
+        part_t = f"    part    {{ type fixedValue; value uniform {wall_t:.6g}; }}\n"
+    _w(z / "T", _header("volScalarField", "T", "0") +
+       f"dimensions      [0 0 0 1 0 0 0];\ninternalField   uniform {inlet_t:.6g};\n\n"
+       "boundaryField\n{\n"
+       f"    inlet   {{ type fixedValue; value uniform {inlet_t:.6g}; }}\n"
+       f"    outlet  {{ type inletOutlet; inletValue uniform {inlet_t:.6g}; value uniform {inlet_t:.6g}; }}\n"
+       "    sides   { type zeroGradient; }\n"
+       f"{part_t}}}\n")
+    # alphat
+    _w(z / "alphat", _header("volScalarField", "alphat", "0") +
+       "dimensions      [1 -1 -1 0 0 0 0];\ninternalField   uniform 0;\n\n"
+       "boundaryField\n{\n"
+       "    inlet   { type calculated; value uniform 0; }\n"
+       "    outlet  { type calculated; value uniform 0; }\n"
+       "    sides   { type calculated; value uniform 0; }\n"
+       "    part    { type compressible::alphatWallFunction; Prt 0.85; value uniform 0; }\n}\n")
+    # k
+    _w(z / "k", _header("volScalarField", "k", "0") +
+       f"dimensions      [0 2 -2 0 0 0 0];\ninternalField   uniform {k0:.6g};\n\n"
+       "boundaryField\n{\n"
+       f"    inlet   {{ type fixedValue; value uniform {k0:.6g}; }}\n"
+       f"    outlet  {{ type inletOutlet; inletValue uniform {k0:.6g}; value uniform {k0:.6g}; }}\n"
+       "    sides   { type slip; }\n"
+       f"    part    {{ type kqRWallFunction; value uniform {k0:.6g}; }}\n}}\n")
+    # omega
+    _w(z / "omega", _header("volScalarField", "omega", "0") +
+       f"dimensions      [0 0 -1 0 0 0 0];\ninternalField   uniform {omega0:.6g};\n\n"
+       "boundaryField\n{\n"
+       f"    inlet   {{ type fixedValue; value uniform {omega0:.6g}; }}\n"
+       f"    outlet  {{ type inletOutlet; inletValue uniform {omega0:.6g}; value uniform {omega0:.6g}; }}\n"
+       "    sides   { type slip; }\n"
+       f"    part    {{ type omegaWallFunction; value uniform {omega0:.6g}; }}\n}}\n")
+    # nut
+    _w(z / "nut", _header("volScalarField", "nut", "0") +
+       "dimensions      [0 2 -1 0 0 0 0];\ninternalField   uniform 0;\n\n"
+       "boundaryField\n{\n"
+       "    inlet   { type calculated; value uniform 0; }\n"
+       "    outlet  { type calculated; value uniform 0; }\n"
+       "    sides   { type calculated; value uniform 0; }\n"
+       "    part    { type nutkWallFunction; value uniform 0; }\n}\n")

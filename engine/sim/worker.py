@@ -126,6 +126,7 @@ def _sim_run_flow(params: dict, emit: EmitFn) -> dict:
     fluid = params.get("fluid") or None
     roughness_um = float(params.get("roughness_um", 0.0) or 0.0)
     ref_area_mm2 = float(params.get("ref_area_mm2", 0.0) or 0.0)
+    thermal = params.get("thermal") or None  # OpenFOAM-only: heat-transfer config (ignored by LBM)
 
     def on_progress(info: dict) -> None:
         if _cancel_flag:
@@ -141,7 +142,7 @@ def _sim_run_flow(params: dict, emit: EmitFn) -> dict:
             data["trace_point"] = info["trace_point"]
         emit(data)
 
-    result = run_tunnel(
+    tunnel_kwargs = dict(
         stl_path=stl_path,
         direction=direction,
         speed_mps=speed_mps,
@@ -153,6 +154,9 @@ def _sim_run_flow(params: dict, emit: EmitFn) -> dict:
         roughness_um=roughness_um,
         ref_area_mm2=ref_area_mm2,
     )
+    if solver == "openfoam":
+        tunnel_kwargs["thermal"] = thermal   # LBM has no thermal param; only pass to OpenFOAM
+    result = run_tunnel(**tunnel_kwargs)
 
     out = {
         "drag_n": float(result.drag_n),
@@ -186,12 +190,15 @@ def _sim_run_flow(params: dict, emit: EmitFn) -> dict:
         prebuilt = getattr(result, "overlay_path", None)
         if prebuilt:
             out["overlay_aicm"] = prebuilt
+            # The OpenFOAM bridge reports exactly which fields its overlay carries
+            # (pressure_cp+velocity for aero, temperature+velocity for thermal).
+            out["scalar_fields"] = list(getattr(result, "scalar_fields", None) or ["pressure_cp"])
         else:
             out["overlay_aicm"] = overlay.flow_overlay(stl_path, result)
-        sf = ["pressure_cp"]
-        if result.streamline_points:
-            sf.append("velocity")
-        out["scalar_fields"] = sf
+            sf = ["pressure_cp"]
+            if result.streamline_points:
+                sf.append("velocity")
+            out["scalar_fields"] = sf
 
         # Back-compat: lines-only AICM + slice PNGs.
         sl_chunk = overlay.streamlines_chunk(result.streamline_points, result.streamline_speeds)

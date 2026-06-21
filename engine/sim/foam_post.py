@@ -77,17 +77,44 @@ def _read_case(case_dir: str):
     return internal, patches
 
 
-def _cp_on_surface(world_verts_mm: np.ndarray, info: CaseInfo, part_poly, q_kin: float) -> np.ndarray:
-    """Per-world-vertex Cp by nearest-neighbour from the part-patch pressure (case-m space)."""
+def _sample_on_surface(world_verts_mm: np.ndarray, info: CaseInfo, part_poly,
+                       values: np.ndarray) -> np.ndarray:
+    """Map a part-patch point field onto world-space surface vertices (nearest neighbour)."""
     from scipy.spatial import cKDTree
 
     pts_m = np.asarray(part_poly.points, dtype=np.float64)
-    p_kin = np.asarray(part_poly.point_data["p"], dtype=np.float64)   # kinematic p (m^2/s^2)
     tree = cKDTree(pts_m)
     q = info.world_mm_to_case_m(world_verts_mm)
     _, idx = tree.query(q, k=1)
-    cp = p_kin[idx] / max(q_kin, 1e-9)
-    return cp.astype(np.float32)
+    return np.asarray(values, dtype=np.float64)[idx]
+
+
+def _cp_on_surface(world_verts_mm: np.ndarray, info: CaseInfo, part_poly, q_kin: float) -> np.ndarray:
+    """Per-world-vertex Cp by nearest-neighbour from the part-patch pressure (case-m space)."""
+    p_kin = np.asarray(part_poly.point_data["p"], dtype=np.float64)   # kinematic p (m^2/s^2)
+    return (_sample_on_surface(world_verts_mm, info, part_poly, p_kin) / max(q_kin, 1e-9)).astype(np.float32)
+
+
+def parse_wall_heat_flux(case_dir: str):
+    """Total wall heat flow (W) from the wallHeatFlux function object, or None."""
+    pp = Path(case_dir) / "postProcessing"
+    dats = list(pp.glob("wallHeatFlux*/**/wallHeatFlux.dat"))
+    if not dats:
+        return None
+    last = None
+    for line in dats[0].read_text(errors="ignore").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        last = s
+    if not last:
+        return None
+    # columns: Time patch min max integral  (integral = total heat flow in W)
+    cols = last.split()
+    try:
+        return float(cols[-1])
+    except (IndexError, ValueError):
+        return None
 
 
 def _streamlines(internal, info: CaseInfo, n_seeds: int = 60
@@ -137,8 +164,13 @@ def _streamlines(internal, info: CaseInfo, n_seeds: int = 60
 # --------------------------------------------------------------------------- overlay
 
 def build_overlay(stl_path: str, info: CaseInfo, internal, patches,
-                  cp_min: float, cp_max: float) -> Tuple[str, List[str], List[np.ndarray], List[np.ndarray]]:
-    """Write the flow overlay AICM; return (path, scalar_fields, streamline_pts, streamline_speeds)."""
+                  cp_min: float, cp_max: float, temp_range=None
+                  ) -> Tuple[str, List[str], List[np.ndarray], List[np.ndarray]]:
+    """Write the flow overlay AICM; return (path, scalar_fields, streamline_pts, streamline_speeds).
+
+    Aero case: a ``pressure_cp`` SCLR. Thermal case: a ``temperature`` SCLR (degC). Both add a
+    ``velocity`` LINS of streamlines.
+    """
     from engine.sim import overlay as ov
     from engine.doc import tessellate as tess
 
@@ -146,17 +178,28 @@ def build_overlay(stl_path: str, info: CaseInfo, internal, patches,
     surf = ov._surface_verts(bt)
     chunks: list = []
     scalar_fields: List[str] = []
-
-    q_kin = 0.5 * info.speed_mps * info.speed_mps
     part = patches.get(info.part_patch)
-    if part is not None and "p" in part.point_data:
-        try:
-            cp = _cp_on_surface(surf, info, part, q_kin)
-            cp = np.clip(cp, cp_min, cp_max)
-            chunks.append(tess.scalar_chunk(1, "pressure_cp", cp, vmin=cp_min, vmax=cp_max))
-            scalar_fields.append("pressure_cp")
-        except Exception:
-            pass
+
+    if info.thermal:
+        if part is not None and "T" in part.point_data:
+            try:
+                t_c = _sample_on_surface(surf, info, part,
+                                         np.asarray(part.point_data["T"], dtype=np.float64) - 273.15)
+                lo, hi = (temp_range or (float(t_c.min()), float(t_c.max())))
+                chunks.append(tess.scalar_chunk(1, "temperature", t_c.astype(np.float32),
+                                                vmin=lo, vmax=hi))
+                scalar_fields.append("temperature")
+            except Exception:
+                pass
+    else:
+        q_kin = 0.5 * info.speed_mps * info.speed_mps
+        if part is not None and "p" in part.point_data:
+            try:
+                cp = np.clip(_cp_on_surface(surf, info, part, q_kin), cp_min, cp_max)
+                chunks.append(tess.scalar_chunk(1, "pressure_cp", cp, vmin=cp_min, vmax=cp_max))
+                scalar_fields.append("pressure_cp")
+            except Exception:
+                pass
 
     sl_pts, sl_spd, _ = _streamlines(internal, info)
     if sl_pts:
@@ -178,6 +221,38 @@ def postprocess(case_dir: str, stl_path: str, info: CaseInfo, converged: bool,
     """Assemble a FlowResult from a finished OpenFOAM run."""
     from engine.sim.lbm import FlowResult
 
+    internal, patches = _read_case(case_dir)
+    part = patches.get(info.part_patch)
+    U = np.asarray(internal.point_data.get("U", np.zeros((1, 3))), dtype=np.float64)
+    vmax = float(np.linalg.norm(U, axis=1).max()) if U.size else info.speed_mps
+    notes = list(solver_notes or [])
+    conv = "converged" if converged else "did not fully converge"
+
+    if info.thermal:
+        # Temperature legend (degC) from the part wall.
+        t_lo, t_hi = info.inlet_temp_k - 273.15, info.inlet_temp_k - 273.15 + 1.0
+        if part is not None and "T" in part.point_data:
+            t_c = np.asarray(part.point_data["T"], dtype=np.float64) - 273.15
+            if t_c.size:
+                t_lo, t_hi = float(t_c.min()), float(t_c.max())
+        heat_w = parse_wall_heat_flux(case_dir)
+        overlay_path, scalar_fields, sl_pts, sl_spd = build_overlay(
+            stl_path, info, internal, patches, -1.0, 1.0, temp_range=(t_lo, t_hi))
+        heat_txt = f", wall heat flow {heat_w:.1f} W" if heat_w is not None else ""
+        re_note = (f"OpenFOAM buoyant RANS - Re {info.reynolds:,.0f}; inlet "
+                   f"{info.inlet_temp_k - 273.15:.0f} C; surface T {t_lo:.0f}-{t_hi:.0f} C{heat_txt}.")
+        notes.append(f"OpenFOAM {info.iters}-iter buoyant RANS (k-omega SST, heat transfer); {conv}.")
+        return FlowResult(
+            drag_n=0.0, lift_n=0.0, cd=0.0, frontal_area_mm2=info.frontal_area_mm2,
+            reynolds_note=re_note, trace=[], slices=[], slice_transforms=[],
+            streamline_points=sl_pts, streamline_speeds=sl_spd,
+            diverged=not converged, steps_run=info.iters,
+            side_n=0.0, cl=0.0, ld=0.0, reynolds=info.reynolds, ref_area_mm2=info.ref_area_mm2,
+            cp_min=t_lo, cp_max=t_hi, vmax_mps=vmax, solver_notes=notes,
+            overlay_path=overlay_path, scalar_fields=scalar_fields,
+        )
+
+    # ---- aero ----
     cd, cl = parse_coefficients(case_dir)
     q = 0.5 * info.rho_kgm3 * info.speed_mps ** 2
     aref_m2 = max(info.ref_area_mm2 * 1e-6, 1e-9)
@@ -185,11 +260,7 @@ def postprocess(case_dir: str, stl_path: str, info: CaseInfo, converged: bool,
     lift_n = cl * q * aref_m2
     ld = (cl / cd) if abs(cd) > 1e-9 else 0.0
 
-    internal, patches = _read_case(case_dir)
-
-    # Cp legend range from the actual part-patch pressure.
     cp_min, cp_max = -1.0, 1.0
-    part = patches.get(info.part_patch)
     if part is not None and "p" in part.point_data:
         q_kin = max(0.5 * info.speed_mps ** 2, 1e-9)
         cp_all = np.asarray(part.point_data["p"], dtype=np.float64) / q_kin
@@ -200,15 +271,9 @@ def postprocess(case_dir: str, stl_path: str, info: CaseInfo, converged: bool,
     overlay_path, scalar_fields, sl_pts, sl_spd = build_overlay(
         stl_path, info, internal, patches, cp_min, cp_max)
 
-    U = np.asarray(internal.point_data.get("U", np.zeros((1, 3))), dtype=np.float64)
-    vmax = float(np.linalg.norm(U, axis=1).max()) if U.size else info.speed_mps
-
-    notes = list(solver_notes or [])
-    notes.append(f"OpenFOAM {info.iters}-iter RANS (k-omega SST); "
-                 f"{'converged' if converged else 'did not fully converge'}.")
+    notes.append(f"OpenFOAM {info.iters}-iter RANS (k-omega SST); {conv}.")
     re_note = (f"OpenFOAM RANS - Re {info.reynolds:,.0f}; "
                f"Cd {cd:.3f}, Cl {cl:.3f} on Aref {info.ref_area_mm2:.0f} mm2.")
-
     return FlowResult(
         drag_n=drag_n, lift_n=lift_n, cd=cd, frontal_area_mm2=info.frontal_area_mm2,
         reynolds_note=re_note, trace=[], slices=[], slice_transforms=[],
@@ -216,5 +281,5 @@ def postprocess(case_dir: str, stl_path: str, info: CaseInfo, converged: bool,
         diverged=not converged, steps_run=info.iters,
         side_n=0.0, cl=cl, ld=ld, reynolds=info.reynolds, ref_area_mm2=info.ref_area_mm2,
         cp_min=cp_min, cp_max=cp_max, vmax_mps=vmax, solver_notes=notes,
-        overlay_path=overlay_path,
+        overlay_path=overlay_path, scalar_fields=scalar_fields,
     )

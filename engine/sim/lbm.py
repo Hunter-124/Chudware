@@ -192,6 +192,9 @@ class FlowResult:
     # packages an overlay from the lattice carriers above; the OpenFOAM bridge (which has no
     # lattice) instead writes its own overlay and sets this so the worker uses it directly.
     overlay_path:       Optional[str] = None
+    # Scalar fields available in `overlay_path` (e.g. ["pressure_cp","velocity"] for aero or
+    # ["temperature","velocity"] for thermal).  Empty -> the worker derives the LBM defaults.
+    scalar_fields:      List[str] = dataclasses.field(default_factory=list)
 
     def save_npz(self, path: str) -> None:
         """Save all arrays + scalars to a compressed .npz file."""

@@ -44,8 +44,13 @@ def run_openfoam_tunnel(
     fluid: Optional[dict] = None,
     roughness_um: float = 0.0,
     ref_area_mm2: float = 0.0,
+    thermal: Optional[dict] = None,
 ):
-    """Run an OpenFOAM RANS wind tunnel.  Signature mirrors lbm.run_wind_tunnel."""
+    """Run an OpenFOAM RANS wind tunnel.  Signature mirrors lbm.run_wind_tunnel.
+
+    ``thermal`` (optional) switches to steady buoyant heat transfer (buoyantSimpleFoam) with a
+    wall thermal BC — see engine.sim.foam_case.build_case.
+    """
     runner = get_runner()
     if runner is None or not runner.available():
         raise RuntimeError(
@@ -64,10 +69,11 @@ def run_openfoam_tunnel(
 
     case_dir = tempfile.mkdtemp(prefix="aicad_foam_")
     try:
-        prog("mesh", 2, f"Building OpenFOAM case ({preset})...")
+        kind = "thermal" if (thermal and thermal.get("enabled")) else "aero"
+        prog("mesh", 2, f"Building OpenFOAM {kind} case ({preset})...")
         info = build_case(case_dir, stl_path, direction=direction, speed_mps=speed_mps,
                           preset=preset, aoa_deg=aoa_deg, sideslip_deg=sideslip_deg,
-                          fluid=fluid, ref_area_mm2=ref_area_mm2, n_proc=1)
+                          fluid=fluid, ref_area_mm2=ref_area_mm2, n_proc=1, thermal=thermal)
 
         # ---- mesh ----
         prog("mesh", 6, "blockMesh (background domain)...")
@@ -84,8 +90,8 @@ def run_openfoam_tunnel(
         q = 0.5 * info.rho_kgm3 * info.speed_mps ** 2
         aref_m2 = max(info.ref_area_mm2 * 1e-6, 1e-9)
         state = {"converged": False}
-        prog("solve", 18, f"simpleFoam (RANS, {info.iters} iters)...")
-        runner.run(case_dir, "simpleFoam",
+        prog("solve", 18, f"{info.app} ({'buoyant RANS' if info.thermal else 'RANS'}, {info.iters} iters)...")
+        runner.run(case_dir, info.app,
                    on_line=_solve_line(prog, info.iters, q * aref_m2, state),
                    timeout=3300)
 

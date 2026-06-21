@@ -73,19 +73,6 @@ EcadPt EcadMirror::localToWorld(const EcadPt& p, const EcadPt& pos, float angleD
     return EcadPt{rx + pos.x, ry + pos.y};
 }
 
-void EcadMirror::reset() {
-    kind_ = Kind::None;
-    revision_ = -1;
-    name_.clear();
-    symbols_.clear(); wires_.clear(); junctions_.clear(); labels_.clear(); powers_.clear();
-    footprints_.clear(); tracks_.clear(); vias_.clear(); zones_.clear(); outline_.clear();
-    layers_.clear();
-    ratsnest_.clear(); erc_.clear(); drc_.clear(); nets_.clear();
-    // NOTE: layerVis_ and docId_ are intentionally preserved across reset() so the user's per-layer
-    // toggles and the open doc id survive a rebuild. reset() is for hard close — callers that want a
-    // full wipe clear those explicitly.
-}
-
 void EcadMirror::loadFromTree(const nlohmann::json& resp) {
     // Clear parsed geometry but keep layerVis_/docId_ across rebuilds (see reset() note).
     revision_ = -1;

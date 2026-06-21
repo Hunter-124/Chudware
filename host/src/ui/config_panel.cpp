@@ -101,13 +101,6 @@ bool ConfigPanel::runConfigOp(AppState& st, const std::string& method,
     return true;
 }
 
-void ConfigPanel::draw(AppState& st) {
-    if (!st.showConfigPanel) return;
-    if (!ImGui::Begin("Configurations", &st.showConfigPanel)) { ImGui::End(); return; }
-    drawBody(st);
-    ImGui::End();
-}
-
 void ConfigPanel::drawEmbedded(AppState& st) {
     drawBody(st);
 }

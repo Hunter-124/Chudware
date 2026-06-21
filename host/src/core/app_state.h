@@ -758,7 +758,7 @@ struct AppState {
     // One-shot flag: set by mouse_gestures right-click-without-drag hook; consumed by viewport_panel.
     bool wantContextMenu = false;
     bool layoutInit = false, resetLayout = false, openSettings = false;
-    bool showDesign = true, showViewport = true, showConsole = true;
+    bool showViewport = true;
     // C24: the right task pane (Design + Agent Activity tabs, SolidWorks-style). View > Task Pane.
     bool showTaskPane = true;
     bool focusDesignTab = false;  // one-shot: focus the Design tab after a (re)layout
@@ -766,9 +766,6 @@ struct AppState {
     bool focusSettingsTab = false; // one-shot: focus the AI pane's Settings tab
     // Consolidated AI panel (Design / Activity / Console as internal tabs). One dock window "AI".
     bool showAIPanel = true;
-    // Configurations panel (SolidWorks ConfigurationManager). Dockable "Configurations" window in
-    // the right task pane; View > Configurations toggles it. Only meaningful for part/asm docs.
-    bool showConfigPanel = false;
     // Design Table panel (SolidWorks Design Table). Dockable "Design Table" window in the right
     // task pane; View > Design Table toggles it. An editable grid (rows=configs, columns=driven
     // params + per-feature suppression) over the same config_* RPCs the Configurations panel reads.

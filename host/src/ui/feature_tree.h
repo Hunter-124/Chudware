@@ -12,16 +12,10 @@ struct AppState;
 
 namespace ui {
 
-// Draw the FeatureManager tree panel. Call every frame from the main loop.
-// editCallback is invoked when "Edit" is chosen from a feature's context menu;
-// it receives the feature id. Pass {} until C17 wires it.
-// Thin compatibility wrapper: Begin("FeatureManager") -> drawFeatureTreeBody -> End().
-void drawFeatureTree(AppState& st,
-                     const std::function<void(const std::string& featureId)>& editCallback = {});
-
-// Wave 1D: the tree's inner content WITHOUT its own Begin/End. The Wave 1D tabbed left pane
-// (ui::drawLeftPane) calls this inside its own "LeftPane" container child so the FeatureManager and
-// PropertyManager tabs share one dock window. drawFeatureTree() is the standalone wrapper around it.
+// The tree's inner content WITHOUT its own Begin/End. The tabbed left pane (ui::drawLeftPane) calls
+// this inside its own "LeftPane" container child so the FeatureManager and PropertyManager tabs share
+// one dock window. editCallback is invoked when "Edit" is chosen from a feature's context menu; it
+// receives the feature id.
 void drawFeatureTreeBody(AppState& st,
                          const std::function<void(const std::string& featureId)>& editCallback = {});
 

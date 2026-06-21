@@ -61,15 +61,7 @@ public:
         float radius = 1.0f;
         int ssWidth = 0, ssHeight = 0;  // supersampled framebuffer size (matches colorTexture)
     };
-    struct Timing {
-        unsigned int frame = 0;
-        double renderMs = 0.0;
-        double resolveMs = 0.0;
-        int width = 0, height = 0;
-        int ssWidth = 0, ssHeight = 0;
-    };
     const CameraXform& camera() const { return cam_; }
-    const Timing& timing() const { return timing_; }
     int supersample() const { return SS; }
 
     // Bind the studio color framebuffer + supersampled viewport so the C15 overlays can draw
@@ -87,7 +79,6 @@ public:
     // not re-frame the camera. Used to stop the view "bouncing" during sketch editing — the view
     // stays normal-to-plane at a stable zoom while geometry updates live underneath.
     void setFramingFrozen(bool f) { framingFrozen_ = f; }
-    bool framingFrozen() const { return framingFrozen_; }
     void setBackground(float tr, float tg, float tb, float br, float bg, float bb);
     // 3-stop vertical background gradient (top / mid-band ~55% / bottom floor glow).
     void setBackground3(const float top[3], const float mid[3], const float bot[3]);
@@ -104,7 +95,6 @@ public:
     // pattern takes precedence over the scalar LUT and RealView. `freq` is the band density along
     // the reflected-direction coordinate (typical 4..60). Default OFF.
     void setZebra(bool on, float freq) { zebra_ = on; if (freq > 0.0f) zebraFreq_ = freq; }
-    bool zebraOn() const { return zebra_; }
     void setDisplayStyle(DisplayStyle s) { displayStyle_ = s; }
     DisplayStyle displayStyle() const { return displayStyle_; }
     // SolidWorks-style per-feature edit preview: while a feature's PropertyManager is open, ONLY the
@@ -196,13 +186,11 @@ public:
     // Backward-compat single-plane setter (existing callers unchanged).
     void setSectionPlane(const float normal[3], float offset, bool enabled,
                          const float capRgb[3], bool showCap);
-    bool sectionEnabled() const { return section_.count > 0; }
     int sectionClip(float normals[3][3], float offsets[3]) const;
 
     // ---- C19 result colormap + deformation ----
     // When colormap mode is on, bodies that carry a per-vertex scalar render through the LUT.
     void setColormapMode(bool on) { colormap_ = on; }
-    bool colormapMode() const { return colormap_; }
     // Deformation multiplier applied to the per-vertex DISP field (0 = undeformed). Setting it
     // re-uploads the displaced positions on the CPU, so call sparingly (on slider change).
     void setDeformScale(float s);
@@ -222,10 +210,8 @@ public:
     unsigned int renderThumbnail(float yawDeg, float pitchDeg, int px);
 
     std::vector<unsigned char> readRGBA() const;         // final w*h*4, top-left origin
-    // Final-size box-resolved texture. This is the intended on-screen presentation target; the raw
-    // supersampled colorTexture() remains available for internal passes that draw into the SS FBO.
+    // Final-size box-resolved texture. This is the intended on-screen presentation target.
     unsigned int resolvedColorTexture() const;
-    unsigned int colorTexture() const { return colorTex_; }
     int width() const { return w_; }
     int height() const { return h_; }
     bool hasMesh() const { return !subs_.empty(); }
@@ -282,7 +268,6 @@ private:
     mutable unsigned int resolveFbo_ = 0, resolvedTex_ = 0;
     unsigned int resolveProg_ = 0;
     mutable bool resolvedDirty_ = true;
-    mutable Timing timing_;
     // C27-D: dedicated small offscreen target for the View Selector preview thumbnail. Lazily
     // allocated on the first renderThumbnail() call; reallocated only when the requested px changes.
     unsigned int thumbFbo_ = 0, thumbTex_ = 0, thumbDepth_ = 0;

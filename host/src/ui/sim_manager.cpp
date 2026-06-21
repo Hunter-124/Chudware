@@ -762,43 +762,6 @@ void SimManager::collectLoadFaces(std::vector<uint64_t>& keys) const {
                 keys.push_back(((uint64_t)p.pickBody << 32) | (uint64_t)p.pickTopo);
 }
 
-void SimManager::collectLoadArrows(AppState& st, std::vector<LoadArrow>& arrows) const {
-    if (sel_ < 0 || sel_ >= (int)studies_.size()) return;
-    (void)st;
-    for (const auto& ld : studies_[sel_].loads) {
-        // Anchor at the average of the load faces' selector centroids.
-        float c[3] = {0, 0, 0}; int n = 0;
-        for (const auto& p : ld.faces.picks) {
-            if (!p.selector.is_object()) continue;
-            auto it = p.selector.find("centroid");
-            if (it != p.selector.end() && it->is_array() && it->size() == 3) {
-                for (int k = 0; k < 3; ++k) c[k] += (*it)[k].get<float>();
-                ++n;
-            }
-        }
-        if (!n) continue;
-        LoadArrow a;
-        for (int k = 0; k < 3; ++k) a.at[k] = c[k] / n;
-        a.pressure = ld.pressure;
-        char buf[48];
-        if (ld.pressure) {
-            // Pressure: arrow points into the face (use the selector normal if present, else -Z).
-            float nrm[3] = {0, 0, -1};
-            if (!ld.faces.picks.empty() && ld.faces.picks[0].selector.is_object()) {
-                auto it = ld.faces.picks[0].selector.find("normal");
-                if (it != ld.faces.picks[0].selector.end() && it->is_array() && it->size() == 3)
-                    for (int k = 0; k < 3; ++k) nrm[k] = -(*it)[k].get<float>();
-            }
-            for (int k = 0; k < 3; ++k) a.dir[k] = nrm[k];
-            std::snprintf(buf, sizeof(buf), "%.3g MPa", ld.pressureMpa);
-        } else {
-            for (int k = 0; k < 3; ++k) a.dir[k] = ld.vec[k];
-            std::snprintf(buf, sizeof(buf), "%.0f,%.0f,%.0f N", ld.vec[0], ld.vec[1], ld.vec[2]);
-        }
-        a.mag = buf;
-        arrows.push_back(std::move(a));
-    }
-}
 
 // ---------------------------------------------------------------- result field reload / mesh preview
 

@@ -5,10 +5,8 @@ struct AppState;
 
 namespace ui {
 
-// Draw the Console dockable window if state.showConsole. Renders state.log with per-tag colors.
-void drawConsolePanel(AppState& state);
-
-// Body only (no Begin/End) — for hosting the console inside the consolidated AI panel's tab.
+// Body only (no Begin/End) — renders state.log inside the consolidated AI panel's Console tab,
+// color-coded per [tag].
 void drawConsoleBody(AppState& state);
 
 }  // namespace ui

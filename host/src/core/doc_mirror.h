@@ -122,10 +122,6 @@ public:
         auto it = bodyOwners_.find(body_id);
         return it == bodyOwners_.end() ? std::vector<std::string>() : it->second;
     }
-    // True when the worker has supplied an owner map at least once (lets callers fall back gracefully
-    // before the engine lands the feature).
-    bool hasOwnerMap() const { return !faceOwner_.empty() || !bodyOwners_.empty(); }
-
     // ---- mutations (synchronous, blocking the calling thread) ----
 
     // Create a new empty part doc. Returns true + fills docId / revision on success.

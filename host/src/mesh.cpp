@@ -134,7 +134,6 @@ bool loadBinarySTL(const std::string& path, Mesh& out, std::string& err) {
 
     // Find triangles adjacent across each welded edge and union the non-crease pairs.
     {
-        struct EdgeAdj { uint32_t tri; };
         std::unordered_map<uint64_t, uint32_t> firstTriOnEdge;  // edge -> tri index (+1, 0=empty)
         firstTriOnEdge.reserve(nFaceTris * 3);
         auto ekey = [](uint32_t a, uint32_t b) -> uint64_t {

@@ -62,14 +62,12 @@ public:
     bool patternFormActive() const { return patternOpen_; }
 
     // --- scripted scenario helpers (AI_CAD_SHOT=asm) ---
-    void openInsert()       { insertOpen_ = true; insertFocus_ = true; }
     void openMateForm()     { beginMateForm(); }
     // Preselect a mate type for a headless shot (AI_CAD_MATETYPE=gear), so the type-aware
     // parameter block renders. Mirrors PropertyManager::presetFieldForShot. No-op if the type
     // is unknown; the mate form must already be open.
     void presetMateTypeForShot(const std::string& type);
     void openInterference(AppState& st) { handleCommand(st, "asm_interference"); }
-    void openBom(AppState& st)          { handleCommand(st, "asm_bom"); }
     // Insert a component by path directly (scenario / programmatic). Returns the new aicm path.
     bool insertComponent(AppState& st, const std::string& path,
                          const nlohmann::json& transform, std::string& aicmOut);

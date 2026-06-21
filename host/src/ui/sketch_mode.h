@@ -122,10 +122,9 @@ public:
 
     // Tree "Edit Sketch Plane": arm a plane pick that RE-PARENTS an existing sketch onto the picked
     // plane/face (rebuilds the sketch and every feature downstream). Exits the active sketch first if
-    // it is the one being moved. planeEditActive() is true while the reparent pick is armed.
+    // it is the one being moved.
     void beginPlaneEdit(AppState& st, const std::string& sketchFid);
-    bool planeEditActive() const { return !planeEditFid_.empty(); }
-    // Consume a picked plane ref: re-parents the armed sketch when planeEditActive(), otherwise
+    // Consume a picked plane ref: re-parents the armed sketch when a plane edit is active, otherwise
     // creates+enters a new sketch (createSketchOnPlane). All plane-pick consumption sites (the
     // SketchMode overlay, the tree plane rows, the viewport plane chips) route through this.
     std::string consumePlanePick(AppState& st, const nlohmann::json& planeRef);
@@ -234,7 +233,6 @@ public:
     bool sketchHasSelection() const;          // at least one entity selected (Ctrl+C is meaningful)
     bool sketchCopySelection(AppState& st);   // selection -> st.clipboard (entities bundle)
     bool sketchPasteBegin(AppState& st);      // arm paste-placement from a SketchEntities clipboard
-    bool pastePlacing() const { return pastePlacing_; }   // true while placing pasted entities
     // Datum plane (0=front 1=top 2=right) clicked in the tree while Smart Dimension is armed:
     // project its intersection line with the sketch plane and add it as a dimension pick.
     void addPlaneDimRef(AppState& st, int planeIdx);
@@ -253,7 +251,6 @@ private:
     void resolve(AppState& st);                 // sketch_solve -> refresh entities/statuses
     void commitDrag(AppState& st);              // sketch_drag_commit -> rebuild mesh
     void addEntity(AppState& st, const nlohmann::json& entity, const nlohmann::json& constraints);
-    void addConstraint(AppState& st, const nlohmann::json& constraint);
     // Translate a stored snap handle (toolSnaps_ encoding) into the geometric constraint it
     // implies and append it to `cs`. `pt` is a "$self.<sub>" point handle on the new entity
     // (e.g. "$self.center"/"$self.start"). Plain handle -> coincident; "mid:" -> midpoint;
@@ -290,8 +287,6 @@ private:
                      std::string cond; };   // circle/arc entity picks: "center"|"min"|"max" anchor
     int entIndexById(const std::string& id) const;   // C38 (S1): id -> current ents_ index, or -1
     bool dimHitTest(const ImVec2& s, DimPick& out) const;       // point-priority then entity
-    // C50: (u,v) midpoint of the line under the cursor (Smart Dim hover marker), or false.
-    bool hoveredLineMidpoint(const ImVec2& s, float& mu, float& mv) const;
     // picks -> dimPending_ (+axis). keepAxis=true preserves the current dimAxis_ instead of
     // re-deriving it from the cursor zone (used when re-running after an arc-condition change in
     // the Modify box, where the dimension is already placed and its axis must not flip).
@@ -314,8 +309,6 @@ private:
                        bool hovered, float pu, float pv, DimHit* hitOut = nullptr) const;
     // Compute a sensible default placement (u,v) for a constraint that has none yet.
     bool defaultPlacement(const SketchConstraint& c, float& pu, float& pv) const;
-    // Screen location of a dimension's text (for hover / drag / double-click hit-testing).
-    bool dimTextAnchor(const SketchConstraint& c, ImVec2& out) const;
     const SketchEntity* entById(const std::string& id) const;
 
     // ---- projection (camera locked fronto-parallel to the plane) ----

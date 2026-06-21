@@ -178,11 +178,6 @@ struct Palette {
 // Must be called after ImGui::CreateContext() and whenever the theme is toggled.
 void applyTheme(Theme t, float scale = 1.0f);
 
-// Convenience overload: apply dark theme (matches old call sites in app.cpp).
-inline void applyTheme(float scale = 1.0f) {
-    applyTheme(Theme::Dark, scale);
-}
-
 Fonts loadFonts(const std::string& assetsDir, float pxScale = 1.0f);
 
 // The active palette — read-only from panels.

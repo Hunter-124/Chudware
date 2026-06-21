@@ -2489,15 +2489,6 @@ void drawFeatureTreeBody(AppState& st,
     flushPendingClipboard(st);
 }
 
-// Thin compatibility wrapper (Wave 1D): the standalone FeatureManager dock window. The Wave 1D
-// tabbed left pane bypasses this and calls drawFeatureTreeBody() directly inside its container.
-void drawFeatureTree(AppState& st,
-                     const std::function<void(const std::string&)>& editCallback) {
-    if (!ImGui::Begin("FeatureManager")) { ImGui::End(); return; }
-    drawFeatureTreeBody(st, editCallback);
-    ImGui::End();
-}
-
 // ---- Wave 3: public Save/Open wrappers (the File menu + File Explorer reuse these) ----
 // The actual RPC/dialog/mesh-refresh logic lives in the file-local doSaveDoc / doOpenDoc /
 // applyOpenedDoc above; these thin wrappers expose it without duplicating any of it, and keep

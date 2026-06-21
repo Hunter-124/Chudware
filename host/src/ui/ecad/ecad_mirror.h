@@ -202,9 +202,6 @@ public:
     // successful mutation.
     void loadFromTree(const nlohmann::json& resp);
 
-    // Wipe everything (worker restart / doc close).
-    void reset();
-
     // ---- top-level state ----
     Kind        kind()     const { return kind_; }
     bool        isSch()    const { return kind_ == Kind::Sch; }

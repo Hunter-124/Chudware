@@ -111,13 +111,6 @@ static PMFieldDef FeatWell(const char* key, const char* label, const char* group
 static PMFieldDef FeatWell1(const char* key, const char* label, const char* group) {
     PMFieldDef f = FeatWell(key, label, group); f.selMulti = false; return f;
 }
-// Check/Dim that is disabled and shows "(coming soon)" — discoverability only, never serialised.
-static PMFieldDef CheckSoon(const char* key, const char* label, const char* group) {
-    PMFieldDef f = Check(key, label, group, false); f.comingSoon = true; return f;
-}
-static PMFieldDef DimSoon(const char* key, const char* label, const char* group, double def) {
-    PMFieldDef f = Dim(key, label, group, def); f.comingSoon = true; return f;
-}
 static const PMSelKinds K_FACE   {true,  false, false};
 static const PMSelKinds K_EDGE   {false, true,  false};
 static const PMSelKinds K_VERTEX {false, false, true};

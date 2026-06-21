@@ -73,8 +73,6 @@ public:
     // edge/vertex is returned unchanged.
     PickHit pickFinalPreferEdge(int px, int py, int finalW, int finalH, int radiusPx);
 
-    bool usesRgba8() const { return rgba8_; }
-
     // Solid Bodies hide/show: bodies in this set are skipped by render(), so hidden geometry is
     // unpickable (a click goes through to whatever is behind it — never an invisible hit).
     // Persists across setDoc(); AppState::applyBodyVisibility() re-syncs it after every reload

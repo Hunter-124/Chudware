@@ -7,8 +7,7 @@
 
 namespace ui {
 
-// Body only (no Begin/End) — used both by the standalone Console window and the consolidated
-// AI panel's Console tab.
+// Body only (no Begin/End) — rendered inside the consolidated AI panel's Console tab.
 void drawConsoleBody(AppState& st) {
         const auto& pal = ui::palette;
         ImGui::PushFont(st.fonts.mono);
@@ -32,12 +31,6 @@ void drawConsoleBody(AppState& st) {
         ImGui::EndChild();
         ImGui::PopStyleColor();
         ImGui::PopFont();
-}
-
-void drawConsolePanel(AppState& st) {
-    if (!st.showConsole) return;
-    if (ImGui::Begin("Console")) drawConsoleBody(st);
-    ImGui::End();
 }
 
 }  // namespace ui

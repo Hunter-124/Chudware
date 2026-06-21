@@ -705,15 +705,6 @@ void SketchMode::emitConstructionConstraint(AppState& st, const nlohmann::json& 
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
 }
 
-void SketchMode::addConstraint(AppState& st, const nlohmann::json& constraint) {
-    nlohmann::json ops = nlohmann::json::array({
-        {{"op", "sketch_add_constraint"}, {"sketch", fid_}, {"constraint", constraint}}});
-    auto r = st.docMirror.applyOps(st.worker, ops);
-    if (!r.ok) { st.addLog("[sketch] add_constraint failed: " + r.error_message); return; }
-    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
-    resolve(st);
-}
-
 void SketchMode::applyRelationOps(AppState& st, const nlohmann::json& ops,
                                   const std::string& label) {
     auto r = st.docMirror.applyOps(st.worker, ops);
@@ -2807,17 +2798,6 @@ bool SketchMode::defaultPlacement(const SketchConstraint& c, float& pu, float& p
     return true;
 }
 
-// Where a constraint's text sits on screen (for hover/drag/double-click hit-testing).
-bool SketchMode::dimTextAnchor(const SketchConstraint& c, ImVec2& out) const {
-    float pu, pv;
-    auto it = autoPlace_.find(c.id);
-    if (c.hasPlacement) { pu = c.placement[0]; pv = c.placement[1]; }
-    else if (it != autoPlace_.end()) { pu = it->second.x; pv = it->second.y; }
-    else if (!defaultPlacement(c, pu, pv)) return false;
-    out = uvToScreen(pu, pv);
-    return true;
-}
-
 // Render one dimension annotation. (pu,pv) is the placement in (u,v).
 void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 lineCol,
                                ImU32 textCol, bool hovered, float pu, float pv, DimHit* hitOut) const {
@@ -3092,17 +3072,6 @@ bool SketchMode::dimHitTest(const ImVec2& s, DimPick& out) const {
         return true;
     }
     return false;
-}
-
-// C50: the midpoint of the line currently hovered in Smart Dimension, in (u,v), or false. Used by
-// the hover overlay to draw the SolidWorks midpoint marker whenever a line is hovered (so the user
-// knows the target is available before moving onto it).
-bool SketchMode::hoveredLineMidpoint(const ImVec2& s, float& mu, float& mv) const {
-    int ei = hitTestEntity(s, 12.0f);
-    if (ei < 0 || ents_[ei].type != "line") return false;
-    const SketchEntity& e = ents_[ei];
-    mu = (e.p1[0] + e.p2[0]) * 0.5f; mv = (e.p1[1] + e.p2[1]) * 0.5f;
-    return true;
 }
 
 // Build the pending dimension from the current pick buffer + the live cursor. Returns true when the

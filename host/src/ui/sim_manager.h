@@ -181,10 +181,6 @@ public:
     bool previewActive(AppState& st) const;      // Sim tab active + a study selected + no colormap
     void collectFixtureFaces(std::vector<uint64_t>& keys) const;  // (body<<32)|topo
     void collectLoadFaces(std::vector<uint64_t>& keys) const;
-    // Load arrows: world anchor (face-pick centroid) + direction for each force/pressure load of the
-    // selected study. dirOut points the force vector (or -normal for pressure, approximated by vec).
-    struct LoadArrow { float at[3]; float dir[3]; bool pressure; std::string mag; };
-    void collectLoadArrows(AppState& st, std::vector<LoadArrow>& arrows) const;
 
     // Build world-space indicator geometry for the selected study's setup, sized to the model: red
     // arrows for force/pressure loads (force along the vector, pressure into the face) and green
@@ -222,7 +218,6 @@ public:
     int  studyCount() const { return (int)studies_.size(); }
 
     // ---- scripted-shot helpers (AI_CAD_SHOT=fea), preserved from the old SimPanel ----
-    int  activeStudy() const { return sel_; }
     void configureActive(AppState& st, float density, const std::string& materialKey);
     // Scripted-shot helper (AI_CAD_SHOT=flow): set the active flow study's fluid / angles / resolution.
     void configureActiveFlow(AppState& st, int fluid, float aoaDeg, float sideslipDeg, int preset);

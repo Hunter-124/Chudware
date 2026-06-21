@@ -25,10 +25,6 @@ public:
     // drawing tabs / no document; a "no weldment members" hint for parts without weld_member).
     void draw(AppState& st);
 
-    // Force a re-pull of weld_cut_list on the next draw. The panel ALSO auto-invalidates when the
-    // mirror's doc id or revision differs from the cached snapshot, so explicit calls are rare.
-    void invalidate() { cacheValid_ = false; }
-
 private:
     // (Re)pull weld_cut_list into the cache for the active doc. Guarded; logs + leaves the old cache
     // on failure. Records the doc id + revision the cache reflects so staleness is auto-detected.

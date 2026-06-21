@@ -21,17 +21,9 @@ namespace ui {
 
 class ConfigPanel {
 public:
-    // Draw the "Configurations" window (no-op unless st.showConfigPanel). Call every frame from the
-    // main loop. Pulls config_list lazily and caches it; gated to part/asm documents (shows a
-    // "no part" hint for drawing tabs / no document).
-    void draw(AppState& st);
-    // Draw only the ConfigurationManager contents into the current window/child.
+    // Draw the ConfigurationManager contents into the current window/child. Pulls config_list
+    // lazily and caches it; gated to part/asm documents (shows a "no part" hint otherwise).
     void drawEmbedded(AppState& st);
-
-    // Force a re-pull of config_list on the next draw (e.g. after an external doc change). The panel
-    // ALSO auto-invalidates when the mirror's doc id or revision differs from the cached snapshot,
-    // so explicit calls are rarely needed.
-    void invalidate() { cacheValid_ = false; }
 
 private:
     // (Re)pull config_list into the cache for the active doc. Guarded; toasts + leaves the old cache

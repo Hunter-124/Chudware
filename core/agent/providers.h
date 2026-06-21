@@ -29,7 +29,6 @@ using nlohmann::json;
 json text_part(const std::string& text);
 json image_part(const std::string& path);
 json user_message(const json& parts);       // base.user(parts)
-json assistant_message(const json& parts);  // base.assistant(parts)
 
 // --- helpers ----------------------------------------------------------------
 // base64.standard_b64encode(...).decode() — standard alphabet, "=" padding.

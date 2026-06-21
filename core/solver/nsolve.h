@@ -64,7 +64,6 @@ struct Analysis {
 class System {
 public:
     int n_vars() const { return static_cast<int>(init_.size()); }
-    int n_residuals();
 
     // The registered initial-guess vector (the `sys._init` the Python warm-start
     // path copies as its cold base before overlaying per-entity warm values).

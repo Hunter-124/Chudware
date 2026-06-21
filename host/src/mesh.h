@@ -15,7 +15,6 @@ struct Mesh {
     float radius = 1.0f;           // bounding-sphere radius about center
 
     size_t triangleCount() const { return indices.size() / 3; }
-    size_t edgeCount() const { return edgeLines.size() / 6; }
     bool empty() const { return indices.empty(); }
 };
 

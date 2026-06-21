@@ -29,10 +29,8 @@
 
 namespace geom {
 
-// ---- bend math (engine/doc/features/sheetmetal.py bend_allowance/bend_deduction) ----
+// ---- bend math (engine/doc/features/sheetmetal.py bend_allowance) ----
 double sm_bend_allowance(double angle_deg, double inner_radius, double thickness,
-                         double k_factor);
-double sm_bend_deduction(double angle_deg, double inner_radius, double thickness,
                          double k_factor);
 
 // ---- bend-edge frame -------------------------------------------------------
@@ -104,12 +102,6 @@ struct BendRecord {
     Eigen::Vector3d e_dir;
     Eigen::Vector3d length_dir;
 };
-
-// Develop the folded `body` into its flat blank (oracle compile_sm_flat_pattern):
-// rebuild the flat base block from the largest broad face, then add one developed
-// strip (BA + wall) per bend record, all unioned. Empty shape on failure.
-TopoDS_Shape sm_flat_pattern_solid(const TopoDS_Shape& body, double thickness,
-                                   const std::vector<BendRecord>& bends);
 
 // The flat blank PLUS the metadata a 2D flat-pattern export (export_flat_dxf) needs:
 // the base-plane normal and the FLAT-SPACE bend seam lines (where each developed strip

@@ -32,10 +32,6 @@ public:
     // hint for drawing tabs / no document).
     void draw(AppState& st);
 
-    // Force a re-pull of config_list on the next draw. The panel ALSO auto-invalidates when the
-    // mirror's doc id or revision differs from the cached snapshot, so explicit calls are rare.
-    void invalidate() { cacheValid_ = false; }
-
 private:
     // One grid column. Two kinds: a driven param (feature_id.param, numeric, possibly an angle) or a
     // per-feature suppression checkbox. label_ is the human header ("Extrude1.depth" / "Suppress:

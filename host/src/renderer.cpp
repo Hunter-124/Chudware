@@ -710,7 +710,6 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
 static constexpr float kEmptySceneRadius = Renderer::kEmptySceneRadius;
 
 void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
-    const auto renderT0 = std::chrono::steady_clock::now();
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
     glViewport(0, 0, sw_, sh_);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -952,14 +951,6 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     drawRefDatums(mvp);
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    const auto renderT1 = std::chrono::steady_clock::now();
-    timing_.frame += 1;
-    timing_.renderMs = std::chrono::duration<double, std::milli>(renderT1 - renderT0).count();
-    timing_.resolveMs = 0.0;
-    timing_.width = w_;
-    timing_.height = h_;
-    timing_.ssWidth = sw_;
-    timing_.ssHeight = sh_;
     resolvedDirty_ = true;
 }
 
@@ -1558,8 +1549,6 @@ void Renderer::renderOrbit(float yawDeg, float pitchDeg, float zoom, const float
 void Renderer::resolveColorTexture() const {
     if (!resolvedDirty_ || !resolveFbo_ || !resolvedTex_ || !colorTex_ || !resolveProg_) return;
 
-    const auto resolveT0 = std::chrono::steady_clock::now();
-
     GLint prevFbo = 0, prevViewport[4] = {0, 0, 0, 0}, prevProgram = 0;
     GLint prevActiveTex = 0, prevTex0 = 0;
     GLboolean prevDepthTest = glIsEnabled(GL_DEPTH_TEST);
@@ -1593,9 +1582,6 @@ void Renderer::resolveColorTexture() const {
     if (prevDepthTest) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
     if (prevBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
 
-    const auto resolveT1 = std::chrono::steady_clock::now();
-    timing_.resolveMs =
-        std::chrono::duration<double, std::milli>(resolveT1 - resolveT0).count();
     resolvedDirty_ = false;
 }
 

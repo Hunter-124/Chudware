@@ -61,6 +61,22 @@ def _ping(_params: dict, _emit: EmitFn) -> dict:
     return {"pong": True, "protocol": 2, "sim": True}
 
 
+def _sim_caps(_params: dict, _emit: EmitFn) -> dict:
+    """Report available simulation engines so the host can gate the solver selector.
+
+    -> {lbm: true, openfoam: bool, openfoam_kind: "native"|"wsl"|null, openfoam_version: str}
+    LBM is always present (pure Python).  OpenFOAM availability is probed via
+    engine.sim.foam_runner (native Windows build preferred, WSL fallback).
+    """
+    caps = {"lbm": True, "openfoam": False, "openfoam_kind": None, "openfoam_version": ""}
+    try:
+        from engine.sim.foam_runner import capabilities
+        caps.update(capabilities())
+    except Exception as e:  # noqa: BLE001 — never let probing crash the worker
+        log.warning("openfoam capability probe failed: %s", e)
+    return caps
+
+
 # FEA (sim_mesh / sim_run_static / sim_run_modal) MIGRATED TO THE C++ CORE (libaicad), which
 # the host routes to by default (AI_CAD_CPP_SIM on). The Python gmsh mesher + FEA solvers
 # (engine/sim/{mesher,fea_static,fea_modal}.py) and their result-overlay packaging were deleted
@@ -192,6 +208,7 @@ def _sim_cancel(params: dict, _emit: EmitFn) -> dict:
 
 _METHODS: dict[str, Callable] = {
     "ping": _ping,
+    "sim_caps": _sim_caps,  # which engines are available (LBM always; OpenFOAM if provisioned)
     # sim_mesh / sim_run_static / sim_run_modal migrated to the C++ core (libaicad).
     "sim_run_flow": _sim_run_flow,  # LBM wind-tunnel — stays Python (trimesh voxelization)
     "sim_cancel": _sim_cancel,

@@ -23,7 +23,7 @@ namespace core { class SimClient; }
 
 namespace ui {
 
-enum class StudyType { Static, Modal, Flow, Fatigue };
+enum class StudyType { Static, Modal, Flow, Fatigue, Thermal };
 
 // Static failure theory used for the headline factor of safety + the FoS plot field.
 enum class FailureCriterion { VonMises = 0, Tresca = 1, MaxNormal = 2 };

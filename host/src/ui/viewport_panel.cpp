@@ -311,6 +311,9 @@ void drawNewDocChooser(AppState& st) {
             if (newDocTile("##sim_fluids", "Fluids", "Flow field study", 6, ImVec2(tileW, tileH))) {
                 runSimulationChoice(st, "sim_new_flow"); finish();
             } next();
+            if (newDocTile("##sim_thermal", "Thermal", "Heat transfer / cooling study", 6, ImVec2(tileW, tileH))) {
+                runSimulationChoice(st, "sim_new_thermal"); finish();
+            } next();
             if (newDocTile("##sim_electrical", "Electrical", "Circuit simulation", 7, ImVec2(tileW, tileH))) {
                 st.showPcbTools = true; st.showRibbon = true; st.ribbonTab = AppState::RT_PCB;
                 ui::createNewDoc(st, 3);

@@ -39,11 +39,16 @@ static void simTip(const char* tip) {
 // by both the setup form readout and the viewport setup preview).
 static void flowIncomingDir(const Study& s, float out[3]);
 
+// Thermal is a flow-family study (it runs the same OpenFOAM convection/CHT pipeline as Flow,
+// just always with heat transfer on) — these share STL export, the run path, and result rendering.
+static bool isFlowFamily(StudyType t) { return t == StudyType::Flow || t == StudyType::Thermal; }
+
 static const char* studyTypeKey(StudyType t) {
     switch (t) {
         case StudyType::Modal:   return "modal";
         case StudyType::Flow:    return "flow";
         case StudyType::Fatigue: return "fatigue";
+        case StudyType::Thermal: return "thermal";
         default:                 return "static";
     }
 }
@@ -51,6 +56,7 @@ static StudyType studyTypeFromKey(const std::string& k) {
     if (k == "modal")   return StudyType::Modal;
     if (k == "flow")    return StudyType::Flow;
     if (k == "fatigue") return StudyType::Fatigue;
+    if (k == "thermal") return StudyType::Thermal;
     return StudyType::Static;
 }
 static const char* studyTypeLabel(StudyType t) {
@@ -58,6 +64,7 @@ static const char* studyTypeLabel(StudyType t) {
         case StudyType::Modal:   return "Frequency";
         case StudyType::Flow:    return "Flow";
         case StudyType::Fatigue: return "Fatigue";
+        case StudyType::Thermal: return "Thermal";
         default:                 return "Static";
     }
 }
@@ -553,6 +560,9 @@ void SimManager::newStudy(AppState& st, StudyType t) {
     s.type = t;
     s.name = std::string(studyTypeLabel(t)) + " " + std::to_string((int)studies_.size() + 1);
     if (!materials().empty()) s.materialKey = materials()[0].key;
+    // A Thermal study IS the OpenFOAM heat-transfer pipeline — force the solver + thermal on so
+    // the form opens straight into the thermal setup (no LBM, no aero-only fallback).
+    if (t == StudyType::Thermal) { s.flowSolver = 1; s.flowThermal = true; }
     nlohmann::json res; std::string err;
     nlohmann::json params = {{"doc_id", st.docMirror.docId()}, {"study", studyToJson(s)}};
     if (!st.worker.call("sim_study_add", params, res, err, 15000) || res.contains("code")) {
@@ -594,6 +604,7 @@ bool SimManager::handleCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sim_new_static")  { newStudy(st, StudyType::Static);  return true; }
     if (cmdId == "sim_new_modal")   { newStudy(st, StudyType::Modal);   return true; }
     if (cmdId == "sim_new_flow")    { newStudy(st, StudyType::Flow);    return true; }
+    if (cmdId == "sim_new_thermal") { newStudy(st, StudyType::Thermal); return true; }
     if (cmdId == "sim_new_fatigue") { newStudy(st, StudyType::Fatigue); return true; }
     refresh(st);
     const bool haveStudy = sel_ >= 0 && sel_ < (int)studies_.size();
@@ -1071,7 +1082,7 @@ bool SimManager::flowSetupActive(AppState& st) const {
     if (st.colormapOn) return false;       // a result colormap is up — the setup overlay would muddy it
     if (node_ == SimNode::Results) return false;  // never stack the setup tunnel over a result view
     if (sel_ < 0 || sel_ >= (int)studies_.size()) return false;
-    return studies_[sel_].type == StudyType::Flow;
+    return isFlowFamily(studies_[sel_].type);
 }
 
 void SimManager::collectFlowSetup(AppState& st, std::vector<float>& arrowSegs,
@@ -1135,7 +1146,7 @@ bool SimManager::flowResultLinesActive(AppState& st) const {
     if (st.leftPaneTab != AppState::LP_Simulation) return false;
     if (sel_ < 0 || sel_ >= (int)studies_.size()) return false;
     const Study& s = studies_[sel_];
-    return s.type == StudyType::Flow && node_ == SimNode::Results && s.hasResult;
+    return isFlowFamily(s.type) && node_ == SimNode::Results && s.hasResult;
 }
 
 void SimManager::rebuildFlowLines(AppState& st, Study& s) {
@@ -1210,7 +1221,7 @@ nlohmann::json SimManager::facePointsFor(AppState& st, const nlohmann::json& sel
 }
 
 void SimManager::run(AppState& st, Study& s) {
-    if (s.type == StudyType::Flow) runFlow(st, s);
+    if (isFlowFamily(s.type)) runFlow(st, s);
     else if (s.type == StudyType::Fatigue) runFatigue(st, s);
     else runStaticOrModal(st, s);
 }
@@ -1560,7 +1571,7 @@ void SimManager::tick(AppState& st) {
         if (res.contains("solver_notes") && res["solver_notes"].is_array())
             for (const auto& n : res["solver_notes"])
                 if (n.is_string()) s.solverNotes.push_back(n.get<std::string>());
-        if (s.type == StudyType::Flow) {
+        if (isFlowFamily(s.type)) {
             s.dragN = res.value("drag_n", 0.0);
             s.liftN = res.value("lift_n", 0.0);
             s.sideN = res.value("side_n", 0.0);
@@ -1702,6 +1713,10 @@ void SimManager::drawTreeBody(AppState& st) {
     ImGui::SameLine();
     if (ImGui::Button("Flow##new", ImVec2(bw, 0))) newStudy(st, StudyType::Flow);
     simTip("External flow (wind tunnel): estimate drag/lift and streamlines for a flow direction.");
+    if (ImGui::Button("Thermal##new", ImVec2(bw, 0))) newStudy(st, StudyType::Thermal);
+    simTip("Heat transfer (OpenFOAM): a heated part cooled by airflow. Fluid mode gives surface "
+           "temperature + heat flow; Conjugate (CHT) conducts heat through the solid part itself — "
+           "the right model for electronics / heat-sink cooling.");
 
     ImGui::Spacing();
 
@@ -1781,7 +1796,7 @@ void SimManager::drawStudyRow(AppState& st, int i) {
         child("material", "Material: " + matName, SimNode::Material, !s.materialKey.empty(),
               s.materialKey.empty() ? "No material assigned — pick one before running." : "");
 
-        if (s.type != StudyType::Flow) {
+        if (!isFlowFamily(s.type)) {
             bool hasFix = !s.fixtures.empty();
             child("fixture", "Fixtures (" + s.fixtures.label() + ")", SimNode::Fixtures, hasFix,
                   hasFix ? "" : (s.type == StudyType::Modal
@@ -2562,48 +2577,69 @@ void SimManager::drawFlowForm(AppState& st, Study& s) {
     }
     simTip("Voxel resolution / run time. Thin walls need a finer preset or they leak flow.");
 
-    // ---- CFD engine: LBM (fast) vs OpenFOAM RANS (accurate, only if provisioned) ----
-    ImGui::Spacing();
-    ImGui::TextUnformatted("Solver");
+    // A dedicated Thermal study IS the OpenFOAM heat-transfer pipeline — it always runs OpenFOAM
+    // with thermal on, so it skips the LBM/OpenFOAM selector and the heat-transfer toggle.
+    const bool thermalStudy = (s.type == StudyType::Thermal);
+
     bool ofAvail = false; std::string ofVer;
     if (st.simClient) {
         nlohmann::json caps = st.simClient->caps();
         ofAvail = caps.value("openfoam", false);
         ofVer = caps.value("openfoam_version", std::string());
     }
-    // Fall back to LBM if OpenFOAM was selected but is no longer available.
-    if (!ofAvail && s.flowSolver == 1) { s.flowSolver = 0; persist(st, s); }
-    static const char* kSolverLabels[2] = {"LBM (fast)", "OpenFOAM RANS (accurate)"};
-    int svi = (s.flowSolver == 1 && ofAvail) ? 1 : 0;
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::BeginCombo("##solver", kSolverLabels[svi])) {
-        if (ImGui::Selectable(kSolverLabels[0], svi == 0)) { s.flowSolver = 0; persist(st, s); }
-        if (ofAvail) {
-            if (ImGui::Selectable(kSolverLabels[1], svi == 1)) { s.flowSolver = 1; persist(st, s); }
-        } else {
-            ImGui::BeginDisabled();
-            ImGui::Selectable("OpenFOAM RANS (not provisioned)", false);
-            ImGui::EndDisabled();
+
+    if (!thermalStudy) {
+        // ---- CFD engine: LBM (fast) vs OpenFOAM RANS (accurate, only if provisioned) ----
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Solver");
+        // Fall back to LBM if OpenFOAM was selected but is no longer available.
+        if (!ofAvail && s.flowSolver == 1) { s.flowSolver = 0; persist(st, s); }
+        static const char* kSolverLabels[2] = {"LBM (fast)", "OpenFOAM RANS (accurate)"};
+        int svi = (s.flowSolver == 1 && ofAvail) ? 1 : 0;
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo("##solver", kSolverLabels[svi])) {
+            if (ImGui::Selectable(kSolverLabels[0], svi == 0)) { s.flowSolver = 0; persist(st, s); }
+            if (ofAvail) {
+                if (ImGui::Selectable(kSolverLabels[1], svi == 1)) { s.flowSolver = 1; persist(st, s); }
+            } else {
+                ImGui::BeginDisabled();
+                ImGui::Selectable("OpenFOAM RANS (not provisioned)", false);
+                ImGui::EndDisabled();
+            }
+            ImGui::EndCombo();
         }
-        ImGui::EndCombo();
-    }
-    if (ofAvail) {
-        std::string tip = "LBM: fast lattice-Boltzmann for quick comparisons. OpenFOAM: steady RANS "
-                          "(k-omega SST) with boundary-layer meshing — slower but trustworthy Cd/Cl for "
-                          "engineering decisions. Detected: " + ofVer + ".";
-        simTip(tip.c_str());
+        if (ofAvail) {
+            std::string tip = "LBM: fast lattice-Boltzmann for quick comparisons. OpenFOAM: steady RANS "
+                              "(k-omega SST) with boundary-layer meshing — slower but trustworthy Cd/Cl "
+                              "for engineering decisions. Detected: " + ofVer + ".";
+            simTip(tip.c_str());
+        } else {
+            simTip("LBM lattice-Boltzmann solver. OpenFOAM RANS is unavailable on this machine — "
+                   "provision it with `python -m tools.provision_openfoam --install`.");
+        }
     } else {
-        simTip("LBM lattice-Boltzmann solver. OpenFOAM RANS is unavailable on this machine — provision "
-               "it with `python -m tools.provision_openfoam --install` to unlock accurate drag/lift.");
+        // Thermal study: force the OpenFOAM thermal pipeline; warn if it isn't provisioned.
+        s.flowSolver = 1; s.flowThermal = true;
+        if (!ofAvail) {
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.55f, 0.25f, 1));
+            ImGui::TextWrapped("Thermal studies need OpenFOAM, which isn't detected. Provision it with "
+                               "`python -m tools.provision_openfoam --install`.");
+            ImGui::PopStyleColor();
+        }
     }
 
-    // ---- thermal / heat transfer (OpenFOAM only) ----
-    if (s.flowSolver == 1 && ofAvail) {
+    // ---- thermal / heat transfer ----
+    // Flow study: an opt-in "Heat transfer" toggle (OpenFOAM only). Thermal study: always on.
+    bool showThermal = thermalStudy ? ofAvail : (s.flowSolver == 1 && ofAvail);
+    if (!thermalStudy && s.flowSolver == 1 && ofAvail) {
         ImGui::Spacing();
         if (ImGui::Checkbox("Heat transfer (thermal)", &s.flowThermal)) persist(st, s);
         simTip("Solve the energy equation (buoyantSimpleFoam) for a heated part: surface temperature, "
                "the thermal plume, and total wall heat flow. Applied to the whole part surface.");
-        if (s.flowThermal) {
+    }
+    if (showThermal && (thermalStudy || s.flowThermal)) {
+        {
             ImGui::Indent(10.0f * S);
             ImGui::TextUnformatted("Thermal model");
             static const char* kThermTypes[2] = {"Fluid (surface heat)", "Conjugate (solid + fluid)"};
@@ -2707,16 +2743,16 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
     ImGui::Spacing();
 
     // --- result-field selector (static + fatigue + flow expose multiple fields; switching is instant) ---
-    if (s.type == StudyType::Static || s.type == StudyType::Fatigue || s.type == StudyType::Flow) {
+    if (s.type == StudyType::Static || s.type == StudyType::Fatigue || isFlowFamily(s.type)) {
         const ResultField* arr = (s.type == StudyType::Static)  ? kStaticFields
                                : (s.type == StudyType::Fatigue) ? kFatigueFields : kFlowFields;
         const int n = (s.type == StudyType::Static)  ? kNStaticFields
                     : (s.type == StudyType::Fatigue) ? kNFatigueFields : kNFlowFields;
         ImGui::TextUnformatted("Plot");
-        // For flow, only offer fields the result actually carries (aero -> pressure_cp/velocity;
-        // thermal/CHT -> temperature/velocity). FEA studies always expose their full field set.
+        // For flow/thermal, only offer fields the result actually carries (aero -> pressure_cp/
+        // velocity; thermal/CHT -> temperature/velocity). FEA studies expose their full field set.
         auto avail = [&](int i) {
-            return s.type != StudyType::Flow || flowFieldPresent(s.flowFields, arr[i].chunk);
+            return !isFlowFamily(s.type) || flowFieldPresent(s.flowFields, arr[i].chunk);
         };
         int curIdx = 0;
         for (int i = 0; i < n; ++i)
@@ -2733,7 +2769,7 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
                     // Velocity reads on the slice planes; pressure reads on the body. The body carries
                     // only the Cp scalar, so for the velocity view drop the body colormap (it would
                     // otherwise fall back to Cp) and let the speed-colored slices carry the field.
-                    if (s.type == StudyType::Flow) {
+                    if (isFlowFamily(s.type)) {
                         if (st.activeScalarField == "velocity") {
                             flowShowSlices_ = true;
                             st.colormapOn = false; st.legendOn = false;
@@ -2775,7 +2811,7 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
                 row(("Mode " + std::to_string(i + 1)).c_str(), b);
             }
             if (s.freqs.empty()) row("Frequencies", "(none)");
-        } else if (s.type == StudyType::Flow && flowFieldPresent(s.flowFields, "temperature")) {
+        } else if (isFlowFamily(s.type) && flowFieldPresent(s.flowFields, "temperature")) {
             // Thermal / CHT result: temperatures (degC), not forces. cpMin/cpMax carry the
             // surface (or solid) temperature range; the banner adds inlet + total heat flow.
             std::snprintf(b, sizeof(b), "%.1f degC", s.flowInletTempC);   row("Inlet / ambient", b);
@@ -2784,7 +2820,7 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
             std::snprintf(b, sizeof(b), "%.1f degC", s.cpMax);
             row((s.flowThermalType == 1) ? "Part temp (max)" : "Surface temp (max)", b);
             std::snprintf(b, sizeof(b), "%.0f", s.reynolds);              row("Reynolds number", b);
-        } else if (s.type == StudyType::Flow) {
+        } else if (isFlowFamily(s.type)) {
             std::snprintf(b, sizeof(b), "%.4g N", s.dragN);          row("Drag", b);
             std::snprintf(b, sizeof(b), "%.4g N", s.liftN);          row("Lift", b);
             if (std::fabs(s.sideN) > 1e-9) {
@@ -2834,7 +2870,7 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
         ImGui::TextWrapped("Qualitative result: %s", s.banner.c_str());
         ImGui::PopStyleColor();
     }
-    if (s.type == StudyType::Flow && !s.dragTrace.empty())
+    if (isFlowFamily(s.type) && !s.dragTrace.empty())
         ImGui::PlotLines("##drag", s.dragTrace.data(), (int)s.dragTrace.size(), 0, "Drag trace",
                          FLT_MAX, FLT_MAX, ImVec2(-FLT_MIN, 50.0f * ui::uiScale));
 
@@ -2851,14 +2887,14 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
     }
 
     // --- flow visualization controls: colormap + streamline / slice line overlays ---
-    if (s.type == StudyType::Flow) {
+    if (isFlowFamily(s.type)) {
         ImGui::Spacing();
         ImGui::Separator();
         if (ImGui::Checkbox("Show colormap", &st.colormapOn)) {
             if (st.renderer) st.renderer->setColormapMode(st.colormapOn);
             st.legendOn = st.colormapOn && st.docMeshHasScalar;
         }
-        simTip("Color the model by the selected plot field (pressure Cp, or velocity on the slices).");
+        simTip("Color the model by the selected plot field (Cp / temperature, or velocity on the slices).");
         if (ImGui::Checkbox("Show streamlines", &flowShowStreamlines_)) rebuildFlowLines(st, s);
         simTip("Trace the flow as speed-colored streamlines over the model.");
         ImGui::SameLine();
@@ -2867,7 +2903,7 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
     }
 
     // --- visualization controls (stacked so nothing clips in the narrow pane) ---
-    if (s.type != StudyType::Flow) {
+    if (!isFlowFamily(s.type)) {
         ImGui::Spacing();
         ImGui::Separator();
         if (ImGui::Checkbox("Show colormap", &st.colormapOn)) {
@@ -2959,7 +2995,7 @@ void SimManager::drawForm(AppState& st, Study& s) {
         case SimNode::Study:
         default:
             // Study overview: material + (type-specific) key controls + Run.
-            if (s.type == StudyType::Flow) {
+            if (isFlowFamily(s.type)) {
                 drawFlowForm(st, s);
             } else {
                 ImGui::TextUnformatted("Material"); drawMaterialCombo(st, s);

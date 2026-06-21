@@ -25,9 +25,127 @@
 #include "renderer.h"
 #include "worker_client.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <dbghelp.h>
+#include <ctime>
+#endif
+
 int run_gui(const char* screenshotPath);  // gui_app.cpp
 
 namespace {
+
+#ifdef _WIN32
+// ---- crash diagnostics ---------------------------------------------------------------------
+// On any unhandled SEH fault (access violation, etc.) write a symbolized call stack + a minidump
+// next to the exe (and append the stack to $AI_CAD_LOG_FILE when set) so an "instant hard crash"
+// reported in the field gives us the exact faulting frame instead of a silent window-close.
+LONG WINAPI aicadCrashFilter(EXCEPTION_POINTERS* ep) {
+    char dir[MAX_PATH] = {0};
+    GetModuleFileNameA(nullptr, dir, MAX_PATH);
+    std::string base(dir);
+    size_t slash = base.find_last_of("\\/");
+    base = (slash == std::string::npos) ? std::string(".") : base.substr(0, slash);
+
+    char stamp[32];
+    std::time_t now = std::time(nullptr);
+    std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", std::localtime(&now));
+    std::string stackPath = base + "\\AI-CAD_crash_" + stamp + ".txt";
+    std::string dmpPath   = base + "\\AI-CAD_crash_" + stamp + ".dmp";
+
+    std::ofstream out(stackPath, std::ios::binary);
+    auto emit = [&](const std::string& line) {
+        if (out) out << line << "\n";
+        std::fprintf(stderr, "%s\n", line.c_str());
+    };
+    char hdr[128];
+    std::snprintf(hdr, sizeof(hdr), "AI-CAD CRASH  code=0x%08lX  addr=%p",
+                  ep->ExceptionRecord->ExceptionCode,
+                  ep->ExceptionRecord->ExceptionAddress);
+    emit(hdr);
+
+    HANDLE proc = GetCurrentProcess();
+    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+    SymInitialize(proc, nullptr, TRUE);
+
+    CONTEXT ctx = *ep->ContextRecord;
+    STACKFRAME64 frame = {};
+    DWORD machine;
+#if defined(_M_X64)
+    machine = IMAGE_FILE_MACHINE_AMD64;
+    frame.AddrPC.Offset = ctx.Rip;     frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Offset = ctx.Rbp;  frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Offset = ctx.Rsp;  frame.AddrStack.Mode = AddrModeFlat;
+#else
+    machine = IMAGE_FILE_MACHINE_I386;
+    frame.AddrPC.Offset = ctx.Eip;     frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Offset = ctx.Ebp;  frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Offset = ctx.Esp;  frame.AddrStack.Mode = AddrModeFlat;
+#endif
+    for (int i = 0; i < 64; ++i) {
+        if (!StackWalk64(machine, proc, GetCurrentThread(), &frame, &ctx, nullptr,
+                         SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
+            break;
+        if (frame.AddrPC.Offset == 0) break;
+
+        DWORD64 modBase = SymGetModuleBase64(proc, frame.AddrPC.Offset);
+        char modName[MAX_PATH] = "?";
+        if (modBase) {
+            char path[MAX_PATH];
+            if (GetModuleFileNameA((HMODULE)modBase, path, MAX_PATH)) {
+                const char* s = std::strrchr(path, '\\');
+                std::snprintf(modName, sizeof(modName), "%s", s ? s + 1 : path);
+            }
+        }
+        char symBuf[sizeof(SYMBOL_INFO) + 512] = {0};
+        auto* sym = reinterpret_cast<SYMBOL_INFO*>(symBuf);
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 511;
+        DWORD64 disp = 0;
+        char line[700];
+        if (SymFromAddr(proc, frame.AddrPC.Offset, &disp, sym)) {
+            IMAGEHLP_LINE64 il = {sizeof(IMAGEHLP_LINE64)};
+            DWORD ld = 0;
+            if (SymGetLineFromAddr64(proc, frame.AddrPC.Offset, &ld, &il))
+                std::snprintf(line, sizeof(line), "  #%02d %s!%s+0x%llX  (%s:%lu)", i, modName,
+                              sym->Name, (unsigned long long)disp, il.FileName, il.LineNumber);
+            else
+                std::snprintf(line, sizeof(line), "  #%02d %s!%s+0x%llX", i, modName, sym->Name,
+                              (unsigned long long)disp);
+        } else {
+            std::snprintf(line, sizeof(line), "  #%02d %s!0x%llX", i, modName,
+                          (unsigned long long)frame.AddrPC.Offset);
+        }
+        emit(line);
+    }
+    out.close();
+
+    // Full minidump for offline analysis (cdb/WinDbg).
+    HANDLE fh = CreateFileA(dmpPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (fh != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei = {GetCurrentThreadId(), ep, FALSE};
+        MiniDumpWriteDump(proc, GetCurrentProcessId(), fh,
+                          (MINIDUMP_TYPE)(MiniDumpWithIndirectlyReferencedMemory |
+                                          MiniDumpWithDataSegs),
+                          &mei, nullptr, nullptr);
+        CloseHandle(fh);
+    }
+
+    // Mirror the stack into the running log file if one is configured.
+    if (const char* lf = std::getenv("AI_CAD_LOG_FILE")) {
+        std::ifstream in(stackPath, std::ios::binary);
+        std::ofstream log(lf, std::ios::app | std::ios::binary);
+        if (in && log) log << "\n" << in.rdbuf() << "(minidump: " << dmpPath << ")\n";
+    }
+    SymCleanup(proc);
+    return EXCEPTION_EXECUTE_HANDLER;  // let the process die after we've recorded the fault
+}
+
+void installCrashHandler() { SetUnhandledExceptionFilter(aicadCrashFilter); }
+#else
+void installCrashHandler() {}
+#endif
 
 GLFWwindow* makeContext(int w, int h, bool visible) {
     if (!glfwInit()) {
@@ -178,6 +296,7 @@ int buildAndRender(const std::string& src, const std::string& out, bool isDesign
 }
 
 int main(int argc, char** argv) {
+    installCrashHandler();  // symbolized stack + minidump on any unhandled fault
     // Point the C++ core at its prompts on EVERY launch path (run_gui only calls
     // ensureRuntime when provisioning is needed, so it can't be relied on for this).
     ensurePromptsDir();

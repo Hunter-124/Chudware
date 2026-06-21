@@ -12,6 +12,7 @@
 // mesh. No GL headers here (kept dock-light, like PropertyManager).
 #pragma once
 
+#include <array>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -54,7 +55,11 @@ enum class SketchTool {
     Text, EqCurve,
     // Style Spline (entity type "style_spline"): click-collect CONTROL POLES (a control polygon);
     // the smooth curve is built by-poles in the engine. Same collect/finish UX as Spline.
-    StyleSpline
+    StyleSpline,
+    // Airfoil calculator (no viewport pick; origin-relative like EqCurve): a popup collects a
+    // NACA 4-/5-digit code or a .dat file + chord/angle-of-attack, then emits the upper/lower
+    // surfaces as two through-point splines (chained into a closed, extrudable loop).
+    Airfoil
 };
 
 // C37-D: One constraint record from a sketch_enter/solve/drag response (worker_rpc.md §"constraints").
@@ -741,6 +746,26 @@ private:
     float  eqT2_ = 6.2831853f;
     bool   eqFocus_ = false;           // request keyboard focus on the x(t) field next frame
     void   drawEqCurvePopup(AppState& st, bool& escHandled);
+
+    // ---- Airfoil calculator (SketchTool::Airfoil; entities = two through-point splines) ----
+    // The ribbon command opens this popup immediately (origin-relative, like Eq-Driven Curve).
+    // It generates a NACA 4-/5-digit section or loads a Selig/Lednicer .dat file, scaled to
+    // `chord` and rotated by the angle of attack. OK emits the upper+lower surfaces as splines
+    // (plus a trailing-edge line when the TE is open) chained into one closed loop via addAirfoil.
+    bool   afPopupOpen_ = false;
+    ImVec2 afPopupPos_{0, 0};
+    int    afSeries_ = 0;              // 0 = NACA 4-digit, 1 = NACA 5-digit, 2 = .dat file
+    char   afCode_[16] = "2412";      // NACA code (4 or 5 digits depending on series)
+    float  afChord_ = 100.0f;         // chord length (mm)
+    float  afAoA_ = 0.0f;             // angle of attack (deg; +nose up)
+    int    afPoints_ = 80;            // sample points per surface (cosine-spaced)
+    bool   afClosedTE_ = true;        // closed (sharp) vs open trailing edge
+    std::string afDatPath_;           // chosen .dat file (series 2)
+    bool   afFocus_ = false;          // request keyboard focus on the code field next frame
+    void   drawAirfoilPopup(AppState& st, bool& escHandled);
+    // Emit a generated profile (upper/lower surface point arrays, mm) as chained splines.
+    void   addAirfoil(AppState& st, const std::vector<std::array<double, 2>>& upper,
+                      const std::vector<std::array<double, 2>>& lower, bool sharpTE);
 
     // ---- C37-D Smart Dimension state machine ----
     // Pick buffer (separate from toolUV_): points/entities collected for the next dimension.

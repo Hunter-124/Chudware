@@ -92,10 +92,19 @@ struct Study {
     float fatigueTempC = 20.0f;     // kd: operating temperature (C)
     float fatigueReliability = 50.0f;  // design reliability % (confidence) for the headline + band
 
-    // Flow
-    int flowDir = 0;                // 0..5 = +X,-X,+Y,-Y,+Z,-Z
-    float flowSpeed = 10.0f;        // m/s
-    int flowPreset = 0;             // 0 coarse,1 medium,2 fine,3 xfine
+    // Flow (external wind/water tunnel). The base axis + AoA/sideslip compose the incoming flow
+    // direction; fluid + roughness set the physics; ref area normalises the coefficients.
+    int flowDir = 0;                // base flow axis: 0..5 = +X,-X,+Y,-Y,+Z,-Z
+    float flowSpeed = 10.0f;        // free-stream speed, m/s
+    int flowPreset = 0;             // grid resolution: 0 coarse,1 medium,2 fine,3 xfine
+    int flowFluid = 0;              // 0 air, 1 water, 2 custom
+    float flowDensity = 1.225f;     // fluid density (kg/m^3) — used when flowFluid==custom
+    float flowViscosity = 1.5e-5f;  // kinematic viscosity (m^2/s) — used when flowFluid==custom
+    float flowAoA = 0.0f;           // angle of attack (deg, pitch about the side axis)
+    float flowSideslip = 0.0f;      // sideslip (deg, yaw about the up axis)
+    int flowRoughness = 0;          // surface-roughness preset index (last = custom)
+    float flowRoughnessUm = 0.0f;   // equivalent sand-grain roughness Ks (micrometres) — when custom
+    float flowRefAreaMm2 = 0.0f;    // reference area for Cd/Cl (mm^2); 0 = auto (projected frontal)
 
     // Result state (transient — regenerated on Run; never persisted).
     bool hasResult = false;
@@ -110,6 +119,10 @@ struct Study {
     int nNodes = 0, nElems = 0, nDof = 0;  // mesh / system size from the last run
     std::vector<float> freqs;       // modal natural frequencies (Hz)
     double dragN = 0, cd = 0, frontalMm2 = 0;  // parsed CFD numbers for the metric table
+    // Extended flow results: full force/coefficient set + legend ranges (transient).
+    double liftN = 0, sideN = 0, cl = 0, ld = 0, reynolds = 0, refAreaMm2 = 0;
+    double cpMin = 0, cpMax = 0, vmaxMps = 0;  // legend ranges for the Cp / velocity plots
+    std::vector<std::string> flowFields;       // scalar_fields available to plot (pressure_cp, velocity)
     std::vector<std::string> solverNotes;      // solver_notes echoed verbatim (pressure area, fallbacks…)
 };
 
@@ -171,6 +184,25 @@ public:
     bool hasMeshPreview(AppState& st) const;
     const std::vector<float>& meshPreviewSegments() const { return meshPreviewSegs_; }
 
+    // ---- flow-study setup preview (drawn while a Flow study is selected, before/without a result) ----
+    // True when the selected study is a Flow study and no result colormap is up (so the wind-tunnel
+    // setup overlay reads without muddying a result). Drawn from the viewport block.
+    bool flowSetupActive(AppState& st) const;
+    // Build the wind-tunnel setup overlay sized to the model: the incoming-flow arrow (oriented by the
+    // base axis + AoA + sideslip), the flow-domain box, and the inlet plane. Flat GL_LINES batches.
+    void collectFlowSetup(AppState& st, std::vector<float>& arrowSegs, std::vector<float>& domainSegs,
+                          std::vector<float>& inletSegs) const;
+
+    // ---- flow-result streamline / slice lines (drawn over the model while the Results node is up) ----
+    // One speed-banded line batch: a pointer to the (manager-owned) flat GL_LINES xyz for that band +
+    // its RGBA colour. The pointer stays valid until the next rebuildFlowLines.
+    struct FlowLineBatch { const std::vector<float>* segs; float color[4]; };
+    // True when a Flow study's Results node is active and a result with line overlays is loaded.
+    bool flowResultLinesActive(AppState& st) const;
+    // The speed-banded streamline + slice batches for the selected flow result (world coords). Honors
+    // the show-streamlines / show-slices toggles. Rebuilt lazily from the cached overlay AICM.
+    void collectFlowResultLines(AppState& st, std::vector<FlowLineBatch>& out);
+
     // Number of studies the active document carries (mirror count after the last refresh). Used by
     // the tab-switch hook to auto-reveal the Simulation workspace when a part has studies.
     int  studyCount() const { return (int)studies_.size(); }
@@ -178,6 +210,8 @@ public:
     // ---- scripted-shot helpers (AI_CAD_SHOT=fea), preserved from the old SimPanel ----
     int  activeStudy() const { return sel_; }
     void configureActive(AppState& st, float density, const std::string& materialKey);
+    // Scripted-shot helper (AI_CAD_SHOT=flow): set the active flow study's fluid / angles / resolution.
+    void configureActiveFlow(AppState& st, int fluid, float aoaDeg, float sideslipDeg, int preset);
 
     // Material lookup (singleton: built-in engine/sim/materials.json + user custom_materials.json).
     struct Material {
@@ -213,6 +247,7 @@ private:
     void drawLoadsForm(AppState& st, Study& s);
     void drawMaterialCombo(AppState& st, Study& s);
     void drawMeshForm(AppState& st, Study& s);
+    void drawFlowForm(AppState& st, Study& s);     // wind-tunnel setup: fluid, AoA, roughness, ref area
     void drawResultControls(AppState& st, Study& s);
     void drawWellRow(AppState& st, const char* label, SimWell& well, int armId, const char* tip);
     void drawCustomMaterialPopup(AppState& st, Study& s);
@@ -272,6 +307,18 @@ private:
     // Mesh-preview state (built by previewMesh from sim_mesh; drawn in the viewport while setting up).
     std::vector<float> meshPreviewSegs_;   // flat GL_LINES xyz pairs (surface element edges)
     std::string meshPreviewStudyId_;       // study the preview belongs to ("" = none)
+
+    // Flow-result line overlays (streamlines + velocity slices) parsed from the cached overlay AICM
+    // and split into speed bands so drawSegments (flat-colour) can fake a speed colormap. Rebuilt when
+    // the shown study / toggles change. Drawn over the (visible) model while the Results node is up.
+    static constexpr int kFlowBands = 8;
+    std::vector<float> flowStreamSegs_[kFlowBands];  // streamlines per speed band
+    std::vector<float> flowSliceSegs_[kFlowBands];   // slice gridlines per speed band
+    std::string flowLinesBuiltFor_;        // study id the line bands were built for ("" = none)
+    bool flowShowStreamlines_ = true;      // result-panel toggles
+    bool flowShowSlices_ = false;
+    double flowLinesVmax_ = 1.0;           // speed range the bands were built against
+    void rebuildFlowLines(AppState& st, Study& s);  // (re)parse the overlay AICM into the band arrays
 
     // Custom-material editor scratch (filled by the "+ New material…" popup).
     char cmName_[64] = "";

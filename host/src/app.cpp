@@ -1295,8 +1295,9 @@ int run_gui(const char* screenshotPath) {
     st.wantSketch = shot && shotMode && std::strcmp(shotMode, "sketch") == 0;  // C18 sketch flow
     if (st.wantSketch) { st.showRibbon = true; st.ribbonTab = AppState::RT_Sketch; }  // Sketch tab forward
     st.wantFea = shot && shotMode && std::strcmp(shotMode, "fea") == 0;       // C19 static study
+    st.wantFlow = shot && shotMode && std::strcmp(shotMode, "flow") == 0;     // external-flow study
     st.wantEvalMass = shot && shotMode && std::strcmp(shotMode, "evalmass") == 0;  // C19 mass props
-    if (st.wantFea) {
+    if (st.wantFea || st.wantFlow) {
         st.showSimulationTools = true;
         st.showRibbon = true;
         st.ribbonTab = AppState::RT_Simulation;

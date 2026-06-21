@@ -670,6 +670,64 @@ void ScenarioRunner::tick(AppState& st) {
         (void)sim;
     }
 
+    // ---------- external-flow scenario (AI_CAD_SHOT=flow) ----------
+    // new part -> fuselage-ish bar 80x20x20 -> Flow study (water, 10 deg AoA, coarse) -> run ->
+    // wait for the result colormap (Cp on the model + streamlines over it) -> capture.
+    if (st.wantFlow && st.workerStarted && !st.flowShotDone) {
+        if (st.simManager) st.simManager->tick(st);  // pump so completion lands while we wait
+        if (flowSettle > 0) { --flowSettle; }
+        else switch (flowStep) {
+            case 0: {  // New part + a slender bar (stand-in fuselage/hull)
+                std::string err;
+                st.docMirror.newPart(st.worker, err);
+                nlohmann::json ops = nlohmann::json::array();
+                ops.push_back({{"op","add_feature"},{"feature",{
+                    {"type","box"},{"name","Hull"},{"params",{
+                        {"length",{{"value",80.0},{"expr",nullptr}}},
+                        {"width", {{"value",20.0},{"expr",nullptr}}},
+                        {"height",{{"value",20.0},{"expr",nullptr}}}},
+                    },{"centered",true}}}});
+                auto r = st.docMirror.applyOps(st.worker, ops);
+                if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+                std::printf("flow: bar ok=%d rev=%d\n", (int)r.ok, r.revision);
+                std::fflush(stdout);
+                st.yaw = 40; st.pitch = 22; st.zoom = 1.0f;
+                flowSettle = 3; ++flowStep; break;
+            }
+            case 1: {  // Flow study: water, 10 deg AoA, coarse preset
+                if (st.simManager) {
+                    st.simManager->handleCommand(st, "sim_new_flow");
+                    st.simManager->configureActiveFlow(st, /*fluid=water*/1, /*aoa*/10.0f,
+                                                       /*sideslip*/0.0f, /*preset=coarse*/0);
+                }
+                std::printf("flow: study configured (water, AoA 10, coarse)\n");
+                std::fflush(stdout);
+                flowSettle = 2; ++flowStep; break;
+            }
+            case 2: {  // Run
+                if (st.simManager) st.simManager->handleCommand(st, "sim_run");
+                std::printf("flow: study launched\n");
+                std::fflush(stdout);
+                flowWaitFrames = 0; ++flowStep; break;
+            }
+            case 3: {  // Wait for completion (cap ~180 s — coarse LBM)
+                ++flowWaitFrames;
+                if (st.colormapOn || flowWaitFrames > 10800) {
+                    std::printf("flow: result ready colormap=%d legend=%d (%d frames)\n",
+                                (int)st.colormapOn, (int)st.legendOn, flowWaitFrames);
+                    std::fflush(stdout);
+                    ++flowStep;
+                }
+                break;
+            }
+            default:
+                st.flowShotDone = true;
+                std::printf("flow: scenario complete\n");
+                std::fflush(stdout);
+                break;
+        }
+    }
+
     // ---------- C19 evalmass scenario (AI_CAD_SHOT=evalmass) ----------
     if (st.wantEvalMass && st.workerStarted && !st.evalMassShotDone) {
         if (evalSettle > 0) { --evalSettle; }
@@ -1115,6 +1173,19 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         if (st.feaShotDone) {
             writeBackbufferPng(screenshotPath, dw, dh);
             std::printf("fea screenshot -> %s (%dx%d)\n",
+                        screenshotPath ? screenshotPath : "(none)", dw, dh);
+            std::fflush(stdout);
+            glfwSwapBuffers(st.win);
+            return FrameAction::Break;
+        }
+        glfwSwapBuffers(st.win);
+        return FrameAction::Continue;
+    }
+    if (st.wantFlow) {
+        ++st.frame;
+        if (st.flowShotDone) {
+            writeBackbufferPng(screenshotPath, dw, dh);
+            std::printf("flow screenshot -> %s (%dx%d)\n",
                         screenshotPath ? screenshotPath : "(none)", dw, dh);
             std::fflush(stdout);
             glfwSwapBuffers(st.win);

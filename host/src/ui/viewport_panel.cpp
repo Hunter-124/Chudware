@@ -1565,6 +1565,28 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                                               st.simManager->meshPreviewSegments(), kMeshCol, 1.0f);
                 }
             }
+            // Flow-study setup preview: incoming-flow arrows + the wind-tunnel domain box + inlet plane,
+            // sized to the model and oriented by the base axis / AoA / sideslip, so the user sees how the
+            // analysis is framed before committing minutes to a solve.
+            if (st.simManager && st.simManager->flowSetupActive(st)) {
+                std::vector<float> arrowSegs, domainSegs, inletSegs;
+                st.simManager->collectFlowSetup(st, arrowSegs, domainSegs, inletSegs);
+                static const float kFlowArrow[4]  = {0.28f, 0.70f, 0.98f, 1.0f};  // bright blue stream
+                static const float kFlowDomain[4] = {0.45f, 0.55f, 0.68f, 0.55f}; // grey tunnel box
+                static const float kFlowInlet[4]  = {0.30f, 0.80f, 0.85f, 0.75f}; // teal inlet
+                if (!domainSegs.empty()) st.overlays->drawSegments(renderer.camera(), domainSegs, kFlowDomain, 1.2f);
+                if (!inletSegs.empty())  st.overlays->drawSegments(renderer.camera(), inletSegs, kFlowInlet, 1.5f);
+                if (!arrowSegs.empty())  st.overlays->drawSegments(renderer.camera(), arrowSegs, kFlowArrow, 2.5f);
+            }
+            // Flow-study result: speed-colored streamlines + velocity slices drawn OVER the (still
+            // visible, Cp-colored) model. Each batch is one speed band drawn in its ramp colour.
+            if (st.simManager && st.simManager->flowResultLinesActive(st)) {
+                std::vector<ui::SimManager::FlowLineBatch> batches;
+                st.simManager->collectFlowResultLines(st, batches);
+                for (const auto& fb : batches)
+                    if (fb.segs && !fb.segs->empty())
+                        st.overlays->drawSegments(renderer.camera(), *fb.segs, fb.color, 2.0f, true);
+            }
             std::vector<render::PickHit> selHits;
             selHits.reserve(st.selection.size());
             for (const auto& it : st.selection.items()) selHits.push_back(it.hit);

@@ -15,6 +15,8 @@
 #include "../worker_client.h"
 #include "../ui_theme.h"
 #include "property_manager.h"   // pmParseDim (Smart Dimension value parsing)
+#include "airfoil.h"            // NACA 4-/5-digit + .dat profile generator (SketchTool::Airfoil)
+#include "file_dialog.h"        // openFileDialog (.dat import)
 
 namespace ui {
 
@@ -1299,6 +1301,10 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sk_spline_equation") { resetTool(); tool_ = SketchTool::EqCurve;
                                          eqPopupOpen_ = true; eqPopupPos_ = ImGui::GetMousePos();
                                          eqFocus_ = true;                                  return true; }
+    // Airfoil calculator — no viewport pick; open the NACA/.dat parameter popup right away.
+    if (cmdId == "sk_airfoil")         { resetTool(); tool_ = SketchTool::Airfoil;
+                                         afPopupOpen_ = true; afPopupPos_ = ImGui::GetMousePos();
+                                         afFocus_ = true;                                  return true; }
     // C42: Construction — immediate toggle on the current selection (engine op
     // sketch_toggle_construction). Not a tool: the selection survives (entity ids persist).
     if (cmdId == "sk_construction") {
@@ -1392,6 +1398,7 @@ const char* SketchMode::activeToolCmd() const {
         case SketchTool::StyleSpline:     return "sk_spline_style";
         case SketchTool::Text:            return "sk_text";
         case SketchTool::EqCurve:         return "sk_spline_equation";
+        case SketchTool::Airfoil:         return "sk_airfoil";
         default:                          return "";
     }
 }
@@ -1421,6 +1428,7 @@ void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSn
                                relOverDefOpen_ = false; relOverDefOps_ = nullptr; relOverDefLabel_.clear();   // C50g
                                textPopupOpen_ = false; textFocus_ = false;          // Sketch Text popup
                                eqPopupOpen_ = false; eqFocus_ = false;              // Eq-Driven Curve popup
+                               afPopupOpen_ = false; afFocus_ = false;              // Airfoil calculator popup
                                pastePlacing_ = false; pasteBundle_ = nlohmann::json(); }  // Wave 4C paste-placement
 void SketchMode::cancelTool() { resetTool(); }
 
@@ -1541,6 +1549,187 @@ void SketchMode::drawEqCurvePopup(AppState& st, bool& escHandled) {
         }
     }
     ImGui::End();
+}
+
+// Airfoil calculator: generate a NACA 4-/5-digit section (or load a .dat file), scaled to the
+// chord and rotated by the angle of attack, with a live preview. OK emits the profile as chained
+// splines via addAirfoil. Origin-relative (the leading edge sits at the sketch origin), so there
+// is no viewport pick — the popup opens straight from the ribbon command, like Eq-Driven Curve.
+void SketchMode::drawAirfoilPopup(AppState& st, bool& escHandled) {
+    if (!afPopupOpen_) return;
+    const auto& pal = ui::palette;
+    ImGui::SetNextWindowPos(afPopupPos_, ImGuiCond_Appearing);
+    ImGui::SetNextWindowBgAlpha(0.98f);
+    if (ImGui::Begin("##SketchAirfoil", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1));
+        ImGui::TextUnformatted("Airfoil Calculator");
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+
+        const char* kSeries[] = {"NACA 4-digit", "NACA 5-digit", "Load .dat file"};
+        ImGui::SetNextItemWidth(220);
+        ImGui::Combo("Series", &afSeries_, kSeries, IM_ARRAYSIZE(kSeries));
+
+        if (afSeries_ == 2) {
+            // .dat import: a Browse button + the chosen file name.
+            if (ImGui::Button("Browse .dat\xE2\x80\xA6")) {
+                std::string pick = ui::openFileDialog(
+                    "Airfoil coordinates (*.dat)\0*.dat\0All files (*.*)\0*.*\0");
+                if (!pick.empty()) afDatPath_ = pick;
+            }
+            ImGui::SameLine();
+            if (afDatPath_.empty()) ImGui::TextDisabled("no file chosen");
+            else {
+                size_t slash = afDatPath_.find_last_of("/\\");
+                ImGui::TextUnformatted(slash == std::string::npos ? afDatPath_.c_str()
+                                                                  : afDatPath_.c_str() + slash + 1);
+            }
+        } else {
+            // NACA code (presets help the user remember the layout).
+            ImGui::SetNextItemWidth(120);
+            if (afFocus_) { ImGui::SetKeyboardFocusHere(); afFocus_ = false; }
+            ImGui::InputText(afSeries_ == 0 ? "Code (MPTT)" : "Code (LPQTT)",
+                             afCode_, sizeof(afCode_), ImGuiInputTextFlags_CharsDecimal);
+            if (afSeries_ == 0) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("2412")) std::snprintf(afCode_, sizeof(afCode_), "2412");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("0012")) std::snprintf(afCode_, sizeof(afCode_), "0012");
+            } else {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("23012")) std::snprintf(afCode_, sizeof(afCode_), "23012");
+            }
+            ImGui::SetNextItemWidth(120);
+            ImGui::SliderInt("Points/surface", &afPoints_, 20, 200);
+            ImGui::Checkbox("Closed (sharp) trailing edge", &afClosedTE_);
+        }
+
+        ImGui::SetNextItemWidth(120);
+        ImGui::InputFloat("Chord (mm)", &afChord_, 1.0f, 10.0f, "%.2f");
+        if (afChord_ < 0.001f) afChord_ = 0.001f;
+        ImGui::SetNextItemWidth(120);
+        ImGui::InputFloat("Angle of attack", &afAoA_, 0.5f, 5.0f, "%.2f\xC2\xB0");
+
+        // Generate the profile from the current parameters (cheap; recomputed each frame so the
+        // preview tracks edits live).
+        airfoil::Profile prof;
+        if (afSeries_ == 0)      prof = airfoil::naca4(afCode_, afChord_, afAoA_, afPoints_, afClosedTE_);
+        else if (afSeries_ == 1) prof = airfoil::naca5(afCode_, afChord_, afAoA_, afPoints_, afClosedTE_);
+        else if (afDatPath_.empty()) prof.error = "choose a .dat file";
+        else                     prof = airfoil::fromDatFile(afDatPath_, afChord_, afAoA_);
+
+        // ---- live preview ----
+        ImGui::Separator();
+        const float pw = 240.0f, ph = 90.0f;
+        ImVec2 org = ImGui::GetCursorScreenPos();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(org, ImVec2(org.x + pw, org.y + ph), col(pal.overlayBg), 4.0f);
+        dl->AddRect(org, ImVec2(org.x + pw, org.y + ph), col(pal.overlayBorder), 4.0f);
+        if (prof.ok()) {
+            // Fit the profile bbox into the preview rect (uniform scale, Y up).
+            double xmn = 1e30, xmx = -1e30, ymn = 1e30, ymx = -1e30;
+            auto bound = [&](const std::vector<std::array<double, 2>>& s) {
+                for (const auto& q : s) { xmn = std::min(xmn, q[0]); xmx = std::max(xmx, q[0]);
+                                          ymn = std::min(ymn, q[1]); ymx = std::max(ymx, q[1]); }
+            };
+            bound(prof.upper); bound(prof.lower);
+            double sx = (xmx - xmn) > 1e-9 ? (pw - 16) / (xmx - xmn) : 1.0;
+            double sy = (ymx - ymn) > 1e-9 ? (ph - 16) / (ymx - ymn) : 1.0;
+            double s = std::min(sx, sy);
+            double cx = 0.5 * (xmn + xmx), cy = 0.5 * (ymn + ymx);
+            auto map = [&](const std::array<double, 2>& q) -> ImVec2 {
+                return ImVec2(float(org.x + pw * 0.5 + (q[0] - cx) * s),
+                              float(org.y + ph * 0.5 - (q[1] - cy) * s));   // flip Y
+            };
+            auto stroke = [&](const std::vector<std::array<double, 2>>& sv) {
+                for (size_t i = 1; i < sv.size(); ++i)
+                    dl->AddLine(map(sv[i - 1]), map(sv[i]), col(pal.accent), 1.5f);
+            };
+            stroke(prof.upper); stroke(prof.lower);
+            // close the TE visually
+            dl->AddLine(map(prof.upper.back()), map(prof.lower.back()), col(pal.accent), 1.5f);
+        } else {
+            dl->AddText(ImVec2(org.x + 8, org.y + ph * 0.5f - 7), col(pal.statusErr),
+                        prof.error.c_str());
+        }
+        ImGui::Dummy(ImVec2(pw, ph));
+        if (prof.ok())
+            ImGui::TextDisabled("%s  \xC2\xB7  %d pts  \xC2\xB7  %s TE", prof.name.c_str(),
+                                int(prof.upper.size() + prof.lower.size()),
+                                prof.sharpTE ? "sharp" : "open");
+
+        ImGui::Separator();
+        ImGui::BeginDisabled(!prof.ok());
+        bool ok = ImGui::Button("OK");
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        bool escPressed = ImGui::IsKeyPressed(ImGuiKey_Escape);
+        bool cancel = ImGui::Button("Cancel") || escPressed;
+        if (escPressed) escHandled = true;   // suppress the catch-all Esc (it would also resetTool)
+        if (ok && prof.ok()) {
+            addAirfoil(st, prof.upper, prof.lower, prof.sharpTE);
+            st.toast(ui::ToastLevel::Info, prof.name + " airfoil added");
+            afPopupOpen_ = false;
+            resetTool();   // one profile per invocation
+        } else if (cancel) {
+            afPopupOpen_ = false;
+            resetTool();
+        }
+    }
+    ImGui::End();
+}
+
+// Emit a generated airfoil as real sketch geometry: the upper and lower surfaces become two
+// through-point splines (LE->TE each), chained into one closed loop. A short trailing-edge line
+// closes an open TE; a sharp TE shares the endpoint directly. Coincident relations tie the
+// surfaces at the leading and trailing edges. All batches coalesce into ONE undo step, mirroring
+// addDecomposedSlot. The C++ core profile builder now lifts the closed spline loop into a face,
+// so the result extrudes/revolves/lofts like any other closed profile.
+void SketchMode::addAirfoil(AppState& st, const std::vector<std::array<double, 2>>& upper,
+                            const std::vector<std::array<double, 2>>& lower, bool sharpTE) {
+    if (upper.size() < 2 || lower.size() < 2) return;
+    bool first = true;
+    auto add = [&](const nlohmann::json& entity) -> std::string {
+        nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_}, {"entity", entity}};
+        auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/!first);
+        first = false;
+        if (!r.ok) { st.addLog("[sketch] airfoil part failed: " + r.error_message); return std::string(); }
+        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        return (r.id_map.is_object() && r.id_map.contains("$0"))
+             ? r.id_map["$0"].get<std::string>() : std::string();
+    };
+    auto ptsJson = [](const std::vector<std::array<double, 2>>& s) {
+        nlohmann::json a = nlohmann::json::array();
+        for (const auto& q : s) a.push_back(nlohmann::json::array({q[0], q[1]}));
+        return a;
+    };
+    std::string up = add({{"type", "spline"}, {"points", ptsJson(upper)}});
+    std::string lo = add({{"type", "spline"}, {"points", ptsJson(lower)}});
+    std::string te;   // optional trailing-edge closing line (open TE only)
+    if (!sharpTE)
+        te = add({{"type", "line"},
+                  {"p1", {upper.back()[0], upper.back()[1]}},
+                  {"p2", {lower.back()[0], lower.back()[1]}}});
+    if (up.empty() || lo.empty() || (!sharpTE && te.empty())) { resolve(st); return; }
+
+    auto con = [&](const nlohmann::json& c) {
+        nlohmann::json op = {{"op", "sketch_add_constraint"}, {"sketch", fid_}, {"constraint", c}};
+        st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/true);
+    };
+    const std::string uLE = up + ".p0";
+    const std::string uTE = up + ".p" + std::to_string(upper.size() - 1);
+    const std::string lLE = lo + ".p0";
+    const std::string lTE = lo + ".p" + std::to_string(lower.size() - 1);
+    con({{"type", "coincident"}, {"refs", {uLE, lLE}}});           // shared leading edge
+    if (sharpTE) {
+        con({{"type", "coincident"}, {"refs", {uTE, lTE}}});       // shared sharp trailing edge
+    } else {
+        con({{"type", "coincident"}, {"refs", {te + ".p1", uTE}}});
+        con({{"type", "coincident"}, {"refs", {te + ".p2", lTE}}});
+    }
+    resolve(st);
 }
 
 // C52: apply one sketch_fillet / sketch_chamfer op for the held corner (e1=corner1Id_, e2=line2).
@@ -6493,7 +6682,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // ribbon command). Text takes exactly one placement click and then defers to its popup, so
         // suppress further captures while that popup is open.
         if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-            tool_ != SketchTool::EqCurve && !(tool_ == SketchTool::Text && textPopupOpen_)) {
+            tool_ != SketchTool::EqCurve && tool_ != SketchTool::Airfoil &&
+            !(tool_ == SketchTool::Text && textPopupOpen_)) {
             // When no point snap fired but the click landed on a v/h alignment guide, record the
             // alignment so the commit can write it as a real vertical/horizontal relation (the new
             // point's handle is filled in per-tool via pushSnapConstraint). Positional-only if the
@@ -7426,6 +7616,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                                       : "click to place the text"; break;
             case SketchTool::EqCurve:
                 step = "enter x(t) / y(t) and the t range, then OK"; break;
+            case SketchTool::Airfoil:
+                step = "set the NACA code / .dat + chord, then OK"; break;
             default: break;
         }
         std::string hint = std::string(tn) + (step ? std::string(" \xE2\x80\x94 ") + step : std::string());
@@ -7695,6 +7887,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // ---- Sketch Text + Equation-Driven Curve parameter popups (engine entities text / eq_curve) ----
     drawTextPopup(st, escHandled);
     drawEqCurvePopup(st, escHandled);
+    drawAirfoilPopup(st, escHandled);
 
     // ---- C50: Add Relation popup over an N-element selection (entities and/or point handles) ----
     // Classifies the snapshotted selection and offers the SolidWorks relations valid for it:

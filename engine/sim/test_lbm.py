@@ -273,6 +273,75 @@ def test_save_npz(result: FlowResult) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 7: Aero upgrade — AoA + water fluid + roughness, new keys + overlay
+# ---------------------------------------------------------------------------
+
+def test_aero_upgrade() -> None:
+    print("\n[test_aero_upgrade] sphere, AoA=10, water, roughness=50um, coarse, 120 steps...")
+    stl = _make_sphere_stl(radius_mm=20.0)
+    try:
+        t0 = time.monotonic()
+        result = run_wind_tunnel(
+            stl_path=stl,
+            direction=(1.0, 0.0, 0.0),
+            speed_mps=5.0,
+            preset="coarse",
+            max_steps=120,
+            aoa_deg=10.0,
+            sideslip_deg=5.0,
+            fluid={"name": "water", "density_kgm3": 998.0, "kinematic_visc_m2s": 1.0e-6},
+            roughness_um=50.0,
+            ref_area_mm2=0.0,  # auto-frontal
+        )
+        elapsed = time.monotonic() - t0
+
+        # All new scalar outputs present and finite.
+        for attr in ("drag_n", "lift_n", "side_n", "cd", "cl", "ld",
+                     "reynolds", "ref_area_mm2", "cp_min", "cp_max", "vmax_mps"):
+            v = getattr(result, attr)
+            assert np.isfinite(v), f"FAIL: {attr}={v} not finite"
+
+        assert not result.diverged, "FAIL: diverged"
+        assert result.reynolds > 0.0, "FAIL: reynolds not positive"
+        assert result.ref_area_mm2 > 0.0, "FAIL: ref_area not positive (auto-frontal)"
+        assert "water" in result.reynolds_note.lower(), "FAIL: fluid name missing from note"
+        assert isinstance(result.solver_notes, list) and len(result.solver_notes) >= 2, \
+            "FAIL: solver_notes missing"
+        assert any("roughness" in n.lower() for n in result.solver_notes), \
+            "FAIL: roughness note missing"
+        # ld consistency
+        if abs(result.drag_n) > 1e-9:
+            assert abs(result.ld - result.lift_n / result.drag_n) < 1e-4, "FAIL: ld mismatch"
+
+        # Streamlines/slices converted to world coords.
+        assert len(result.slice_world_polys) > 0, "FAIL: no world slice polylines"
+        assert len(result.slice_world_polys) == len(result.slice_world_speeds), \
+            "FAIL: slice poly/speed length mismatch"
+
+        # Build + re-parse the model-bearing overlay.
+        from engine.sim import overlay
+        from engine.doc import tessellate as tess
+        ov_path = overlay.flow_overlay(stl, result)
+        assert os.path.getsize(ov_path) > 0, "FAIL: empty overlay"
+        parsed = tess.read_aicm(open(ov_path, "rb").read())
+        assert len(parsed["bodies"]) == 1, "FAIL: overlay has no model body"
+        names = {s["name"] for s in parsed["scalars"]}
+        assert "pressure_cp" in names, "FAIL: pressure_cp SCLR missing"
+        line_names = {l["name"] for l in parsed["lines"]}
+        assert "slices" in line_names, "FAIL: slices LINS missing"
+        os.unlink(ov_path)
+
+        print(f"  drag={result.drag_n:.4f} N lift={result.lift_n:.4f} N side={result.side_n:.4f} N "
+              f"Cd={result.cd:.3f} Cl={result.cl:.3f} L/D={result.ld:.3f} "
+              f"Re={result.reynolds:.0f} elapsed={elapsed:.1f}s")
+        print(f"  overlay bodies={len(parsed['bodies'])} scalars={sorted(names)} "
+              f"lines={sorted(line_names)}")
+        print("  PASS")
+    finally:
+        os.unlink(stl)
+
+
+# ---------------------------------------------------------------------------
 # Test 6: Memory guard
 # ---------------------------------------------------------------------------
 
@@ -360,6 +429,13 @@ def main() -> None:
         except Exception as e:
             failures.append(("test_save_npz", e))
             traceback.print_exc()
+
+    # Test 7: aero upgrade (AoA + water + roughness + overlay)
+    try:
+        test_aero_upgrade()
+    except Exception as e:
+        failures.append(("test_aero_upgrade", e))
+        traceback.print_exc()
 
     # Test 6: memory guard (informational, won't fail suite)
     try:

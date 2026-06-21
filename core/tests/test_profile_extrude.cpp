@@ -11,6 +11,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -45,6 +46,11 @@ json line(const char* id, double x1, double y1, double x2, double y2) {
 json circle(const char* id, double cx, double cy, double r) {
     return json{{"id", id}, {"type", "circle"}, {"construction", false},
                 {"center", json::array({cx, cy})}, {"radius", r}};
+}
+json spline(const char* id, const std::vector<std::array<double, 2>>& pts) {
+    json p = json::array();
+    for (const auto& q : pts) p.push_back(json::array({q[0], q[1]}));
+    return json{{"id", id}, {"type", "spline"}, {"construction", false}, {"points", p}};
 }
 json rel(const char* id, const char* type, std::vector<const char*> refs) {
     json r = json::array();
@@ -356,4 +362,64 @@ TEST_CASE("full circle on the axis revolved 360 -> clean sphere of exact volume"
     CHECK((hi[0] - lo[0]) == doctest::Approx(2 * R).epsilon(1e-2));
     CHECK((hi[1] - lo[1]) == doctest::Approx(2 * R).epsilon(1e-2));
     CHECK((hi[2] - lo[2]) == doctest::Approx(2 * R).epsilon(1e-2));
+}
+
+// 6. Self-closing through-point spline -> extrudable face. A spline whose first and last
+//    points coincide is a single closed loop (like a circle): build_edge must interpolate it
+//    PERIODICALLY and detect_loops must treat it as a one-edge loop using the spline's own
+//    sample ring for the area polygon. Sampling a circle of radius R at 24 stations and closing
+//    it gives a near-circular profile; extruded +Z by D the volume is ~pi R^2 D (the cubic
+//    interpolation bulges very slightly outward between samples, so allow 3%). This is the
+//    regression for "closed splines / eq-curves were silently non-extrudable in the C++ core".
+TEST_CASE("self-closing through-point spline solves + extrudes to a closed prism") {
+    const double R = 12.0, D = 5.0;
+    std::vector<std::array<double, 2>> pts;
+    const int N = 24;
+    for (int i = 0; i <= N; ++i) {          // i==N repeats i==0 -> closes the ring
+        double th = 2.0 * PI * i / N;
+        pts.push_back({R * std::cos(th), R * std::sin(th)});
+    }
+    json s;
+    s["entities"] = json::array({spline("e1", pts)});
+    s["constraints"] = json::array();
+    auto sol = solve_sketch(s, json::object());
+    REQUIRE(sol.converged);
+
+    auto faces = faces_from_solved_sketch(sol.entities, SketchPlane::top());
+    REQUIRE(faces.size() == 1);
+
+    TopoDS_Shape solid = geom::extrude_face(faces[0], Eigen::Vector3d(0, 0, 1), D, false);
+    double vol = solid_volume(solid);
+    MESSAGE("closed spline: faces=" << faces.size() << " volume=" << vol
+            << " (~" << PI * R * R * D << ")");
+    CHECK(vol == doctest::Approx(PI * R * R * D).epsilon(0.03));
+}
+
+// 7. Airfoil topology: two open through-point splines that SHARE their leading- and trailing-
+//    edge endpoints chain into ONE closed loop (exactly how SketchMode::addAirfoil emits a
+//    NACA section with a sharp/closed trailing edge). faces_from_solved_sketch must chain the
+//    two curved edges by endpoint proximity, splice each spline's interior samples into the
+//    area polygon, and return a single positive-area face that extrudes to a finite prism.
+TEST_CASE("two endpoint-sharing splines -> closed airfoil-style loop -> prism") {
+    const double c = 30.0, h = 4.0, D = 6.0;
+    std::vector<std::array<double, 2>> up = {
+        {0, 0}, {c * 0.25, h * 0.9}, {c * 0.5, h}, {c * 0.75, h * 0.6}, {c, 0}};
+    std::vector<std::array<double, 2>> lo = {
+        {0, 0}, {c * 0.25, -h * 0.9}, {c * 0.5, -h}, {c * 0.75, -h * 0.6}, {c, 0}};
+    json s;
+    s["entities"] = json::array({spline("eu", up), spline("el", lo)});
+    s["constraints"] = json::array();
+    auto sol = solve_sketch(s, json::object());
+    REQUIRE(sol.converged);
+
+    auto faces = faces_from_solved_sketch(sol.entities, SketchPlane::top());
+    REQUIRE(faces.size() == 1);
+
+    TopoDS_Shape solid = geom::extrude_face(faces[0], Eigen::Vector3d(0, 0, 1), D, false);
+    double vol = solid_volume(solid);
+    const double bboxVol = c * (2 * h) * D;   // loose envelope: profile fits inside c x 2h
+    MESSAGE("airfoil loop: faces=" << faces.size() << " volume=" << vol
+            << " (envelope " << bboxVol << ")");
+    CHECK(vol > 0.2 * bboxVol);   // a real lens, not a sliver
+    CHECK(vol < bboxVol);         // strictly inside its bounding box
 }

@@ -87,6 +87,7 @@ add_executable(AI-CAD
   # --- end C17 ---
   # --- C18: sketch mode UI ---
   src/ui/sketch_mode.cpp
+  src/ui/airfoil.cpp   # NACA 4-/5-digit + .dat airfoil profile generator (SketchTool::Airfoil)
   # --- end C18 ---
   # --- Configurations panel (SolidWorks ConfigurationManager) ---
   src/ui/config_panel.cpp
@@ -156,7 +157,12 @@ target_include_directories(AI-CAD PRIVATE
   ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(AI-CAD PRIVATE glfw nlohmann_json::nlohmann_json)
 if(WIN32)
-  target_link_libraries(AI-CAD PRIVATE dwmapi comdlg32)  # comdlg32: C41 file dialogs
+  target_link_libraries(AI-CAD PRIVATE dwmapi comdlg32 dbghelp)  # comdlg32: C41 file dialogs; dbghelp: crash stack/minidump
+  # Emit debug info even in Release so crash stacks symbolize (PDB next to the exe).
+  if(MSVC)
+    target_compile_options(AI-CAD PRIVATE $<$<CONFIG:Release>:/Zi>)
+    target_link_options(AI-CAD PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
+  endif()
 endif()
 
 set_target_properties(AI-CAD PROPERTIES

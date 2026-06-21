@@ -201,6 +201,9 @@ static const RibbonCmd kCmds[] = {
     { "sk_spline_style",     "Style Spline",    "spline_style",     "Sketch", "Draw", false, "sk_spline",      false },
     { "sk_spline_surface",   "Spline on Surf.", "spline_surface",   "Sketch", "Draw", false, "sk_spline",      true  },
     { "sk_spline_equation",  "Eq. Driven Crv.", "spline_equation",  "Sketch", "Draw", false, "sk_spline",      false },
+    // Airfoil calculator — generates a NACA/.dat section as chained splines (reuses the
+    // equation-curve glyph; both are parametric-curve generators).
+    { "sk_airfoil",          "Airfoil",         "spline_equation",  "Sketch", "Draw", false, "sk_spline",      false },
 
     // --- Ellipse flyout (new big-button parent; original sk_ellipse small-btn kept for compat) ---
     // sk_ellipse_big is the split-button parent with sub-variants. W4-K: enabled (stretch=false) so

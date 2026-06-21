@@ -848,6 +848,8 @@ struct AppState {
     int simUnits = 0;
     bool wantFea = false;       // C19: AI_CAD_SHOT=fea scripted static-study scenario
     bool feaShotDone = false;   // guard so the fea scenario runs exactly once
+    bool wantFlow = false;      // AI_CAD_SHOT=flow scripted external-flow (wind-tunnel) study scenario
+    bool flowShotDone = false;  // guard so the flow scenario runs exactly once
     bool wantEvalMass = false;  // C19: AI_CAD_SHOT=evalmass mass-properties window
     bool evalMassShotDone = false;
 

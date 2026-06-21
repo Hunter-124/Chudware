@@ -79,6 +79,9 @@ private:
     // ---------- C19 FEA scenario (AI_CAD_SHOT=fea) ----------
     int feaStep = 0, feaSettle = 0, feaWaitFrames = 0;
 
+    // ---------- external-flow scenario (AI_CAD_SHOT=flow) ----------
+    int flowStep = 0, flowSettle = 0, flowWaitFrames = 0;
+
     // ---------- C19 evalmass scenario (AI_CAD_SHOT=evalmass) ----------
     int evalStep = 0, evalSettle = 0;
 

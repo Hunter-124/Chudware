@@ -119,9 +119,16 @@ _PRESETS = {
     "xfine":   {"cells": 128, "steps": 10000},
 }
 
-# Air properties
+# Air properties (defaults — overridable via the `fluid` param)
 _RHO_AIR_KGM3 = 1.225  # kg/m^3
 _NU_AIR_M2S   = 1.5e-5  # kinematic viscosity m^2/s
+
+# Reference water properties (for callers/host that pass fluid="water")
+_RHO_WATER_KGM3 = 998.0   # kg/m^3
+_NU_WATER_M2S   = 1.0e-6  # kinematic viscosity m^2/s
+
+_DEFAULT_FLUID = {"name": "air", "density_kgm3": _RHO_AIR_KGM3,
+                  "kinematic_visc_m2s": _NU_AIR_M2S}
 
 # Smagorinsky constant
 _CS_SMAG = 0.17
@@ -152,10 +159,34 @@ class FlowResult:
     trace:              List[Tuple[int, float]]    # (step, drag_n)
     slices:             List[np.ndarray]           # [x_mid, y_mid, z_mid] 2D vmag arrays
     slice_transforms:   List[np.ndarray]           # 3 × (4,4) float64 world→lattice transforms
-    streamline_points:  List[np.ndarray]           # list of (N,3) float32 mm coords
+    streamline_points:  List[np.ndarray]           # list of (N,3) float32 WORLD mm coords
     streamline_speeds:  List[np.ndarray]           # list of (N,) float32 m/s
     diverged:           bool
     steps_run:          int
+
+    # ── New aerodynamic outputs (serialised by worker.py) ──
+    side_n:             float = 0.0   # side force (N), world side_dir
+    cl:                 float = 0.0   # lift coefficient
+    ld:                 float = 0.0   # lift/drag ratio (0 if |drag|<1e-9)
+    reynolds:           float = 0.0   # physical Reynolds number U*L/nu
+    ref_area_mm2:       float = 0.0   # area actually used for coefficients
+    cp_min:             float = 0.0
+    cp_max:             float = 0.0
+    vmax_mps:           float = 0.0
+    solver_notes:       List[str] = dataclasses.field(default_factory=list)
+
+    # ── In-process overlay-packaging carriers (NOT serialised) ──
+    # The forward transform maps world->domain:  p_domain = R @ p_world + offset  (mm).
+    transform_R:        Optional[np.ndarray] = None   # (3,3) float64
+    transform_offset:   Optional[np.ndarray] = None   # (3,)  float64 (mm)
+    voxel_mm:           float = 0.0
+    rho_grid:           Optional[np.ndarray] = None    # (Nx,Ny,Nz) float32 lattice density
+    vmag_grid_mps:      Optional[np.ndarray] = None    # (Nx,Ny,Nz) float32 speed (m/s)
+    solid_mask:         Optional[np.ndarray] = None    # (Nx,Ny,Nz) bool
+    u_lat:              float = 0.0                     # lattice inlet speed
+    # Slice geometry already converted to WORLD coords, as grid polylines.
+    slice_world_polys:  List[np.ndarray] = dataclasses.field(default_factory=list)  # (N,3) mm
+    slice_world_speeds: List[np.ndarray] = dataclasses.field(default_factory=list)  # (N,) m/s
 
     def save_npz(self, path: str) -> None:
         """Save all arrays + scalars to a compressed .npz file."""
@@ -249,25 +280,55 @@ def run_wind_tunnel(
     preset: str = "coarse",
     on_progress: Optional[Callable[[dict], None]] = None,
     max_steps: Optional[int] = None,
+    aoa_deg: float = 0.0,
+    sideslip_deg: float = 0.0,
+    fluid: Optional[dict] = None,
+    roughness_um: float = 0.0,
+    ref_area_mm2: float = 0.0,
 ) -> FlowResult:
-    """Run a D3Q19 LBM wind-tunnel simulation.
+    """Run a D3Q19 LBM wind/water-tunnel simulation.
 
     Parameters
     ----------
-    stl_path:   Path to the STL file of the part (in mm).
-    direction:  Unit vector of incoming flow in world space (default +X).
+    stl_path:   Path to the STL file of the part (in mm, world space).
+    direction:  BASE flow axis unit vector in world space (default +X).  AoA/sideslip rotate it.
     speed_mps:  Free-stream velocity in m/s (default 10 m/s).
     preset:     Grid preset: "coarse" (48) / "medium" (64) / "fine" (96) / "xfine" (128).
     on_progress: Callable receiving sim_progress dicts:
                  {job_id, stage, pct, text, trace_point?:{step, drag}}
     max_steps:  Override step cap (None = use preset default).
+    aoa_deg:    Angle of attack (deg, pitch about the side axis); default 0.
+    sideslip_deg: Sideslip / yaw (deg, about world up); default 0.
+    fluid:      {"name","density_kgm3","kinematic_visc_m2s"}; default air (1.225 / 1.5e-5).
+    roughness_um: Equivalent sand-grain roughness Ks in micrometres (0 = smooth); default 0.
+    ref_area_mm2: Reference area for coefficients (0 = auto, use frontal area); default 0.
 
     Returns
     -------
-    FlowResult with all physical outputs and numpy arrays ready for C19.
+    FlowResult with all physical outputs, world-space streamlines/slices, and the in-process
+    overlay-packaging carriers (transform_R, rho_grid, ...).
     """
     if preset not in _PRESETS:
         raise ValueError(f"Unknown preset {preset!r}; choose from {list(_PRESETS)}")
+
+    # Resolve fluid properties (back-compat: None -> air).
+    _fluid = dict(_DEFAULT_FLUID)
+    if fluid:
+        _fluid.update({k: v for k, v in fluid.items() if v is not None})
+    fluid_name = str(_fluid.get("name", "air"))
+    rho_fluid = float(_fluid.get("density_kgm3", _RHO_AIR_KGM3))
+    nu_fluid = float(_fluid.get("kinematic_visc_m2s", _NU_AIR_M2S))
+    if rho_fluid <= 0.0:
+        rho_fluid = _RHO_AIR_KGM3
+    if nu_fluid <= 0.0:
+        nu_fluid = _NU_AIR_M2S
+
+    solver_notes: List[str] = []
+
+    # Compose the true incoming flow direction (base axis + AoA + sideslip), world space.
+    base_axis = np.asarray(direction, dtype=np.float64)
+    base_axis /= (np.linalg.norm(base_axis) + 1e-12)
+    flow_dir = _compose_flow_dir(base_axis, aoa_deg, sideslip_deg)
 
     def _progress(stage: str, pct: int, text: str, trace_point: Optional[dict] = None) -> None:
         if on_progress is None:
@@ -285,10 +346,10 @@ def run_wind_tunnel(
     if not isinstance(mesh, trimesh.Trimesh):
         raise ValueError("STL did not produce a single trimesh.Trimesh")
 
-    # Align mesh so flow direction == +X
-    dir_vec = np.array(direction, dtype=np.float64)
-    dir_vec /= np.linalg.norm(dir_vec)
-    mesh = _align_to_x(mesh, dir_vec)
+    # Align mesh so the (AoA/sideslip-rotated) flow direction == +X.
+    mesh, R = _align_to_x(mesh, flow_dir)
+    # R rotates world->aligned. The full world->domain transform also includes the `offset`
+    # translation applied below (p_domain = R @ p_world + offset_total).
 
     bbox_min = mesh.bounds[0]    # mm
     bbox_max = mesh.bounds[1]    # mm
@@ -331,7 +392,9 @@ def run_wind_tunnel(
 
     _progress("voxelize", 5, f"Domain {Nx}×{Ny}×{Nz}, voxel {voxel_mm:.2f} mm, ~{mem_gb*1024:.0f} MB")
 
-    # Offset mesh so it sits inside the domain with correct padding
+    # Offset mesh so it sits inside the domain with correct padding.
+    # Full forward transform world->domain (mm):  p_domain = R @ p_world + offset
+    # (bbox_min is already in the rotated frame, so `offset` is applied post-rotation.)
     offset = np.array([up_pad_mm, lat_pad_mm, lat_pad_mm]) - bbox_min
     mesh.apply_translation(offset)
 
@@ -371,9 +434,10 @@ def run_wind_tunnel(
     # Physical time step
     dt_s = u_lat * dx_m / speed_mps  # u_lat = speed_mps * dt/dx  → dt = u_lat*dx/speed
 
-    # Lattice kinematic viscosity from Reynolds proxy
+    # Lattice kinematic viscosity from the PHYSICAL Reynolds number (fluid-dependent).
     L_char_m = longest_axis * 1e-3
-    Re_target = speed_mps * L_char_m / _NU_AIR_M2S
+    reynolds = speed_mps * L_char_m / nu_fluid if nu_fluid > 0 else 0.0
+    Re_target = reynolds
     nu_lat = u_lat * L_char_m / dx_m / Re_target if Re_target > 0 else _CS2 * 0.5
     # Clamp for stability
     nu_lat = max(nu_lat, _CS2 * 0.01)
@@ -381,21 +445,42 @@ def run_wind_tunnel(
     tau0 = max(tau0, 0.51)
     tau0 = min(tau0, 1.99)  # very high tau → over-damped but stable
 
-    # Conversion factor lattice force → Newtons
+    # Conversion factor lattice force → Newtons (uses the FLUID density).
     # Standard LBM momentum exchange (Aidun & Clausen 2010):
     #   drag_n [N] = drag_lat * rho_phys * dx^3 / dt
     #             = drag_lat * rho_phys * dx^2 * (dx/dt)
     # where drag_lat is dimensionless (rho_lat=1 normalised populations summed over boundary links)
     # Note: NOT dx^4/dt^2 — that would be off by c=dx/dt.
-    force_factor = float(_RHO_AIR_KGM3 * dx_m**3 / dt_s)
+    force_factor = float(rho_fluid * dx_m**3 / dt_s)
+
+    # ── Roughness skin-friction multiplier (qualitative) ──
+    # Ks (sand-grain) in metres; L_char in metres (consistent units for L/Ks).
+    roughness_factor = 1.0
+    friction_frac = 0.5  # assumed friction fraction of total drag for a streamlined body
+    if roughness_um and roughness_um > 0.0 and L_char_m > 0.0:
+        ks_m = float(roughness_um) * 1e-6
+        re_clamp = min(max(reynolds, 1e3), 1e9)
+        cf_smooth = 0.074 * re_clamp ** -0.2
+        l_over_ks = max(L_char_m / ks_m, 1.0 + 1e-6)
+        cf_rough = (1.89 + 1.62 * np.log10(l_over_ks)) ** -2.5
+        roughness_factor = max(1.0, cf_rough / cf_smooth) if cf_smooth > 0 else 1.0
+        solver_notes.append(
+            f"Roughness Ks={roughness_um:.1f} um, Re={reynolds:.0f}: "
+            f"Cf_smooth={cf_smooth:.4f}, Cf_rough={cf_rough:.4f}, "
+            f"drag x{1 + friction_frac*(roughness_factor-1):.3f} on the friction fraction "
+            f"(~{friction_frac:.0%}) - QUALITATIVE."
+        )
+    else:
+        solver_notes.append("Roughness: smooth wall (Ks=0).")
 
     reynolds_note = (
-        f"Lattice Re ~{Re_target:.0f} (u_lat={u_lat:.3f}, tau={tau0:.3f}, "
-        f"Nu_lat={nu_lat:.4f}, dx={dx_m*1e3:.2f} mm, dt={dt_s*1e6:.3f} us) - "
-        f"QUALITATIVE result; use CFD solver for engineering decisions."
+        f"{fluid_name} Re ~{reynolds:.0f} (u_lat={u_lat:.3f}, tau={tau0:.3f}, "
+        f"Nu_lat={nu_lat:.4f}, dx={dx_m*1e3:.2f} mm, dt={dt_s*1e6:.3f} us, "
+        f"rho={rho_fluid:.1f} kg/m^3, nu={nu_fluid:.2e} m^2/s) - "
+        f"QUALITATIVE result; use a full CFD solver for engineering decisions."
     )
 
-    _progress("assemble", 20, f"Re~{Re_target:.0f}, tau={tau0:.3f}, u_lat={u_lat:.3f}")
+    _progress("assemble", 20, f"{fluid_name} Re~{reynolds:.0f}, tau={tau0:.3f}, u_lat={u_lat:.3f}")
 
     # ------------------------------------------------------------------
     # 3. Initialise distributions
@@ -492,7 +577,7 @@ def run_wind_tunnel(
 
         # --- Drag calculation (momentum exchange) ---
         if step % 10 == 0 or step == step_cap:
-            drag_lat, lift_lat = _momentum_exchange(f, bound_links)
+            drag_lat, lift_lat, _span_lat = _momentum_exchange(f, bound_links)
             drag_n_raw = drag_lat * force_factor
             lift_n_raw = lift_lat * force_factor
             trace.append((step, float(drag_n_raw)))
@@ -526,21 +611,57 @@ def run_wind_tunnel(
 
     # Convert lattice velocity to physical (m/s)
     vel_scale = speed_mps / float(u_lat)
+    vmag_phys = vmag * vel_scale   # m/s physical
 
-    # Final drag/lift
-    drag_lat_f, lift_lat_f = _momentum_exchange(f, bound_links)
-    drag_n = float(drag_lat_f * force_factor)
-    lift_n = float(lift_lat_f * force_factor)
+    # ── Force decomposition in WORLD coords ──
+    # Lattice force (aligned frame, +X = flow). Rotate back to world via R^T.
+    fx_lat, fy_lat, fz_lat = _momentum_exchange(f, bound_links)
+    F_aligned = np.array([fx_lat, fy_lat, fz_lat], dtype=np.float64) * force_factor
+    F_world = R.T @ F_aligned
 
-    frontal_area_m2 = frontal_area_mm2 * 1e-6
-    dyn_pressure = 0.5 * _RHO_AIR_KGM3 * speed_mps**2
-    if frontal_area_m2 > 0.0 and dyn_pressure > 0.0:
-        cd = drag_n / (dyn_pressure * frontal_area_m2)
+    # World decomposition axes.
+    z_up = np.array([0.0, 0.0, 1.0])
+    drag_dir = flow_dir
+    side_raw = np.cross(z_up, flow_dir)
+    if np.linalg.norm(side_raw) < 1e-9:
+        # Vertical flow degenerate case: use +X as the up reference.
+        side_raw = np.cross(np.array([1.0, 0.0, 0.0]), flow_dir)
+    side_dir = side_raw / (np.linalg.norm(side_raw) + 1e-12)
+    lift_dir = np.cross(drag_dir, side_dir)
+    lift_dir = lift_dir / (np.linalg.norm(lift_dir) + 1e-12)
+
+    drag_n = float(np.dot(F_world, drag_dir))
+    lift_n = float(np.dot(F_world, lift_dir))
+    side_n = float(np.dot(F_world, side_dir))
+
+    # ── Roughness: multiply the friction fraction of total drag ──
+    if roughness_factor > 1.0:
+        drag_n *= (1.0 + friction_frac * (roughness_factor - 1.0))
+
+    # ── Coefficients ──
+    ref_area_used_mm2 = float(ref_area_mm2) if ref_area_mm2 and ref_area_mm2 > 0.0 else frontal_area_mm2
+    ref_area_src = "user" if (ref_area_mm2 and ref_area_mm2 > 0.0) else "auto-frontal"
+    ref_area_m2 = ref_area_used_mm2 * 1e-6
+    dyn_pressure = 0.5 * rho_fluid * speed_mps**2  # q
+    if ref_area_m2 > 0.0 and dyn_pressure > 0.0:
+        cd = drag_n / (dyn_pressure * ref_area_m2)
+        cl = lift_n / (dyn_pressure * ref_area_m2)
     else:
         cd = 0.0
+        cl = 0.0
+    ld = (lift_n / drag_n) if abs(drag_n) > 1e-9 else 0.0
 
-    # --- Velocity slices (mid-planes) ---
-    vmag_phys = vmag * vel_scale   # m/s physical
+    vmax_mps = float(np.max(vmag_phys)) if vmag_phys.size else 0.0
+
+    # ── Domain->world helper for streamlines & slices ──
+    # p_world = R^T @ (p_domain_mm - offset)
+    Rt = R.T
+
+    def _domain_to_world(pts_mm: np.ndarray) -> np.ndarray:
+        p = np.asarray(pts_mm, dtype=np.float64).reshape(-1, 3)
+        return (Rt @ (p - offset).T).T.astype(np.float32)
+
+    # --- Velocity slices (mid-planes) → world-space grid polylines ---
     mid_x = Nx // 2
     mid_y = Ny // 2
     mid_z = Nz // 2
@@ -549,8 +670,6 @@ def run_wind_tunnel(
     slice_y = vmag_phys[:, mid_y, :]  # XZ plane at y_mid
     slice_z = vmag_phys[:, :, mid_z]  # XY plane at z_mid
 
-    # World transforms (mm): position each slice in world space
-    # Transform is 4×4 scaling by voxel_mm, translated to mid-plane
     def _slice_transform(axis: int, mid: int) -> np.ndarray:
         T = np.eye(4, dtype=np.float64)
         T[0, 0] = voxel_mm
@@ -571,16 +690,37 @@ def run_wind_tunnel(
         _slice_transform(2, mid_z),
     ]
 
-    # --- Streamlines (RK2 from inlet seed grid, ~40 lines) ---
+    # Grid polylines (world coords) for each mid-plane slice, scalar = local speed (m/s).
+    slice_world_polys, slice_world_speeds = _slice_grid_world(
+        vmag_phys, (mid_x, mid_y, mid_z), (Nx, Ny, Nz),
+        voxel_mm, _domain_to_world, n_lines=12,
+    )
+
+    # --- Streamlines (RK2 from inlet seed grid) → converted to WORLD coords ---
     _progress("stream", 90, "Tracing streamlines...")
     ux_phys = ux_f * vel_scale
     uy_phys = uy_f * vel_scale
     uz_phys = uz_f * vel_scale
-    streamline_points, streamline_speeds = _trace_streamlines(
+    sl_pts_dom, streamline_speeds = _trace_streamlines(
         ux_phys, uy_phys, uz_phys, solid_mask, voxel_mm, n_lines=40
     )
+    streamline_points = [_domain_to_world(p) for p in sl_pts_dom]
 
-    _progress("stream", 98, f"Done. Cd={cd:.3f}, drag={drag_n:.4f} N, lift={lift_n:.4f} N")
+    # ── Cp range from near-wall density (for legend / clamp consistency) ──
+    cp_min, cp_max = -3.0, 1.5
+
+    solver_notes.insert(0,
+        f"Domain {Nx}x{Ny}x{Nz}, voxel {voxel_mm:.2f} mm; fluid {fluid_name} "
+        f"(rho={rho_fluid:.1f} kg/m^3, nu={nu_fluid:.2e} m^2/s); Re={reynolds:.0f}; "
+        f"u_lat={float(u_lat):.3f}, tau={tau0:.3f}; AoA={aoa_deg:.1f} deg, "
+        f"sideslip={sideslip_deg:.1f} deg; ref area={ref_area_used_mm2:.1f} mm^2 ({ref_area_src})."
+    )
+    solver_notes.append(
+        "QUALITATIVE LBM (Smagorinsky LES, half-way bounce-back) - not a validated CFD result."
+    )
+
+    _progress("stream", 98,
+              f"Done. Cd={cd:.3f}, Cl={cl:.3f}, drag={drag_n:.4f} N, lift={lift_n:.4f} N")
 
     return FlowResult(
         drag_n=drag_n,
@@ -595,6 +735,24 @@ def run_wind_tunnel(
         streamline_speeds=streamline_speeds,
         diverged=diverged,
         steps_run=step,
+        side_n=side_n,
+        cl=cl,
+        ld=ld,
+        reynolds=float(reynolds),
+        ref_area_mm2=float(ref_area_used_mm2),
+        cp_min=float(cp_min),
+        cp_max=float(cp_max),
+        vmax_mps=float(vmax_mps),
+        solver_notes=solver_notes,
+        transform_R=R.astype(np.float64),
+        transform_offset=np.asarray(offset, dtype=np.float64),
+        voxel_mm=float(voxel_mm),
+        rho_grid=rho_f.astype(np.float32),
+        vmag_grid_mps=vmag_phys.astype(np.float32),
+        solid_mask=solid_mask,
+        u_lat=float(u_lat),
+        slice_world_polys=slice_world_polys,
+        slice_world_speeds=slice_world_speeds,
     )
 
 
@@ -602,23 +760,56 @@ def run_wind_tunnel(
 # Helper functions
 # ---------------------------------------------------------------------------
 
-def _align_to_x(mesh: trimesh.Trimesh, dir_vec: np.ndarray) -> trimesh.Trimesh:
-    """Rotate mesh so that dir_vec aligns with +X axis."""
+def _rotation_align_to_x(dir_vec: np.ndarray) -> np.ndarray:
+    """Return a 3x3 rotation R such that R @ dir_vec == +X (dir_vec assumed unit)."""
     x_axis = np.array([1.0, 0.0, 0.0])
     axis = np.cross(dir_vec, x_axis)
     norm = np.linalg.norm(axis)
     if norm < 1e-10:
         if np.dot(dir_vec, x_axis) > 0:
-            return mesh  # already aligned
-        # Anti-parallel: rotate 180 around Y
-        mesh = mesh.copy()
-        mesh.apply_transform(trimesh.transformations.rotation_matrix(np.pi, [0, 1, 0]))
-        return mesh
+            return np.eye(3)
+        # Anti-parallel: 180 deg about Y
+        return trimesh.transformations.rotation_matrix(np.pi, [0, 1, 0])[:3, :3]
     axis /= norm
     angle = np.arccos(np.clip(np.dot(dir_vec, x_axis), -1.0, 1.0))
+    return trimesh.transformations.rotation_matrix(angle, axis)[:3, :3]
+
+
+def _align_to_x(mesh: trimesh.Trimesh, dir_vec: np.ndarray) -> Tuple[trimesh.Trimesh, np.ndarray]:
+    """Rotate mesh so that dir_vec aligns with +X axis.
+
+    Returns (rotated_mesh, R) where R is the 3x3 rotation applied (R @ dir_vec == +X).
+    """
+    R = _rotation_align_to_x(np.asarray(dir_vec, dtype=np.float64))
     mesh = mesh.copy()
-    mesh.apply_transform(trimesh.transformations.rotation_matrix(angle, axis))
-    return mesh
+    T = np.eye(4)
+    T[:3, :3] = R
+    mesh.apply_transform(T)
+    return mesh, R
+
+
+def _compose_flow_dir(base: np.ndarray, aoa_deg: float, sideslip_deg: float) -> np.ndarray:
+    """Compose the incoming flow unit vector from a base axis + AoA + sideslip.
+
+    World is Z-up.  side0 = normalize(cross(+Z, base)) (fallback +Y if base ~ Z).
+    up0 = normalize(cross(base, side0)).  alpha (AoA) rotates base in the (base, up0) plane;
+    beta (sideslip) rotates in the (base, side0) plane.  Returns a unit vector.
+    """
+    f0 = np.asarray(base, dtype=np.float64)
+    f0 = f0 / (np.linalg.norm(f0) + 1e-12)
+    z = np.array([0.0, 0.0, 1.0])
+    side0 = np.cross(z, f0)
+    if np.linalg.norm(side0) < 1e-9:
+        side0 = np.array([0.0, 1.0, 0.0])
+    side0 = side0 / np.linalg.norm(side0)
+    up0 = np.cross(f0, side0)
+    up0 = up0 / (np.linalg.norm(up0) + 1e-12)
+
+    a = np.radians(float(aoa_deg))
+    b = np.radians(float(sideslip_deg))
+    # AoA: tilt toward up0; sideslip: yaw toward side0.
+    flow = (np.cos(a) * np.cos(b)) * f0 + np.sin(a) * up0 + np.cos(a) * np.sin(b) * side0
+    return flow / (np.linalg.norm(flow) + 1e-12)
 
 
 def _macros(f: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -707,13 +898,15 @@ def _build_boundary_links(
 def _momentum_exchange(
     f: np.ndarray,
     bound_links: List[Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]],
-) -> Tuple[float, float]:
-    """Compute drag and lift via momentum exchange method.
+) -> Tuple[float, float, float]:
+    """Compute the full lattice force vector via momentum exchange.
 
-    Returns (drag_lat, lift_lat) in dimensionless lattice units.
+    Returns (fx_lat, fy_lat, fz_lat) in dimensionless lattice units.  Lattice +X is the
+    aligned flow direction; the caller rotates this back to world via R^T.
     """
     drag_lat = np.float64(0.0)
     lift_lat = np.float64(0.0)
+    span_lat = np.float64(0.0)
     for ix_f, iy_f, iz_f, q, q_opp in bound_links:
         # Half-way bounce-back momentum exchange (Ladd 1994 / Aidun 2010):
         # f[fluid, q] streams toward solid; the solid returns f[fluid, q_opp]
@@ -729,7 +922,68 @@ def _momentum_exchange(
         contrib = float(np.sum(f_q)) * 2.0   # factor 2 for momentum reversal
         drag_lat += contrib * float(_EQ[q, 0])
         lift_lat += contrib * float(_EQ[q, 1])
-    return float(drag_lat), float(lift_lat)
+        span_lat += contrib * float(_EQ[q, 2])
+    return float(drag_lat), float(lift_lat), float(span_lat)
+
+
+def _slice_grid_world(
+    vmag_phys: np.ndarray,
+    mids: Tuple[int, int, int],
+    dims: Tuple[int, int, int],
+    voxel_mm: float,
+    domain_to_world: Callable[[np.ndarray], np.ndarray],
+    n_lines: int = 12,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """Build world-space grid polylines for the 3 mid-plane velocity slices.
+
+    For each mid-plane we emit ~``n_lines`` polylines in each of the 2 in-plane directions
+    (a wire grid), per-point scalar = local speed magnitude (m/s) sampled from the slice.
+    Domain coords (index*voxel_mm) are mapped to world via ``domain_to_world``.
+    Returns (polys_world [list of (P,3) float32], speeds [list of (P,) float32]).
+    """
+    Nx, Ny, Nz = dims
+    mid_x, mid_y, mid_z = mids
+    polys: List[np.ndarray] = []
+    speeds: List[np.ndarray] = []
+
+    def _sample(field2d: np.ndarray, a_idx: np.ndarray, b_idx: np.ndarray) -> np.ndarray:
+        ai = np.clip(np.round(a_idx).astype(int), 0, field2d.shape[0] - 1)
+        bi = np.clip(np.round(b_idx).astype(int), 0, field2d.shape[1] - 1)
+        return field2d[ai, bi].astype(np.float32)
+
+    # plane definitions: (fixed_axis, fixed_index, axisA, lenA, axisB, lenB, field2d)
+    planes = [
+        (0, mid_x, 1, Ny, 2, Nz, vmag_phys[mid_x, :, :]),  # YZ plane
+        (1, mid_y, 0, Nx, 2, Nz, vmag_phys[:, mid_y, :]),  # XZ plane
+        (2, mid_z, 0, Nx, 1, Ny, vmag_phys[:, :, mid_z]),  # XY plane
+    ]
+
+    for fixed_ax, fixed_i, axA, lenA, axB, lenB, field2d in planes:
+        a_vals = np.linspace(0, lenA - 1, max(2, min(n_lines, lenA)))
+        b_vals = np.linspace(0, lenB - 1, max(2, min(n_lines, lenB)))
+        b_dense = np.linspace(0, lenB - 1, max(2, lenB))
+        a_dense = np.linspace(0, lenA - 1, max(2, lenA))
+
+        # lines that run along axB (one per a_val)
+        for a in a_vals:
+            dom = np.zeros((len(b_dense), 3), dtype=np.float64)
+            dom[:, fixed_ax] = fixed_i * voxel_mm
+            dom[:, axA] = a * voxel_mm
+            dom[:, axB] = b_dense * voxel_mm
+            spd = _sample(field2d, np.full(len(b_dense), a), b_dense)
+            polys.append(domain_to_world(dom))
+            speeds.append(spd)
+        # lines that run along axA (one per b_val)
+        for b in b_vals:
+            dom = np.zeros((len(a_dense), 3), dtype=np.float64)
+            dom[:, fixed_ax] = fixed_i * voxel_mm
+            dom[:, axB] = b * voxel_mm
+            dom[:, axA] = a_dense * voxel_mm
+            spd = _sample(field2d, a_dense, np.full(len(a_dense), b))
+            polys.append(domain_to_world(dom))
+            speeds.append(spd)
+
+    return polys, speeds
 
 
 def _trace_streamlines(

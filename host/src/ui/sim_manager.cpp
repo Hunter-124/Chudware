@@ -22,6 +22,7 @@
 #include "../core/sim_client.h"
 #include "../bootstrap.h"
 #include "../renderer.h"
+#include "../render/aicm_loader.h"   // parse the flow overlay's streamline / slice LINS chunks
 #include "../ui_theme.h"
 
 namespace ui {
@@ -33,6 +34,10 @@ static void simTip(const char* tip) {
     if (tip && *tip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("%s", tip);
 }
+
+// Compose the incoming-flow unit vector from a study's base axis + AoA + sideslip (defined below; used
+// by both the setup form readout and the viewport setup preview).
+static void flowIncomingDir(const Study& s, float out[3]);
 
 static const char* studyTypeKey(StudyType t) {
     switch (t) {
@@ -218,6 +223,47 @@ const ResultField kFatigueFields[] = {
 };
 const int kNFatigueFields = (int)(sizeof(kFatigueFields) / sizeof(kFatigueFields[0]));
 
+// Fields a FLOW study's overlay carries. kind 3 = velocity (m/s, unit-agnostic); kind 2 = dimensionless.
+const ResultField kFlowFields[] = {
+    {"pressure_cp", "Pressure coefficient (Cp)", 2},
+    {"velocity",    "Velocity (slices)",         3},
+};
+const int kNFlowFields = (int)(sizeof(kFlowFields) / sizeof(kFlowFields[0]));
+
+// Fluid presets: {label, density kg/m^3, kinematic viscosity m^2/s}. The last entry (Custom) is a
+// sentinel — its density/viscosity come from the study's editable fields instead.
+struct FluidPreset { const char* label; float density; float visc; };
+static const FluidPreset kFluids[3] = {
+    {"Air (sea level, 15 C)", 1.225f,  1.5e-5f},
+    {"Water (fresh, 20 C)",   998.0f,  1.0e-6f},
+    {"Custom",                1.225f,  1.5e-5f},
+};
+static const int kNFluids = 3;
+
+// Surface-roughness presets: equivalent sand-grain roughness Ks in micrometres. Last entry = Custom.
+struct RoughPreset { const char* label; float ks_um; };
+static const RoughPreset kRoughness[6] = {
+    {"Smooth / polished",            0.0f},
+    {"Smooth paint / gelcoat",       6.0f},
+    {"Bare aluminium / sheet metal", 30.0f},
+    {"Galvanised / rough paint",     150.0f},
+    {"Cast / rough composite",       500.0f},
+    {"Custom (um)",                  0.0f},
+};
+static const int kNRoughness = 6;
+
+// Resolve a study's fluid choice to concrete density + kinematic viscosity (SI).
+static void flowFluidProps(const ui::Study& s, float& density, float& visc) {
+    int fi = (s.flowFluid < 0 || s.flowFluid >= kNFluids) ? 0 : s.flowFluid;
+    if (fi == kNFluids - 1) { density = s.flowDensity; visc = s.flowViscosity; }  // Custom
+    else                    { density = kFluids[fi].density; visc = kFluids[fi].visc; }
+}
+// Resolve a study's roughness choice to an equivalent sand-grain Ks in micrometres.
+static float flowRoughnessUm(const ui::Study& s) {
+    int ri = (s.flowRoughness < 0 || s.flowRoughness >= kNRoughness) ? 0 : s.flowRoughness;
+    return (ri == kNRoughness - 1) ? s.flowRoughnessUm : kRoughness[ri].ks_um;
+}
+
 // Display label + unit string + SI->display factor for a named field, honoring the active unit system.
 void fieldMeta(const AppState& st, const std::string& chunk, std::string& label, std::string& unit,
                double& fromSI) {
@@ -229,6 +275,7 @@ void fieldMeta(const AppState& st, const std::string& chunk, std::string& label,
                 label = arr[i].label;
                 if (arr[i].kind == 0)      { unit = u.stress; fromSI = u.stressFromMpa; }
                 else if (arr[i].kind == 1) { unit = u.len;    fromSI = u.lenFromMm; }
+                else if (arr[i].kind == 3) { unit = "m/s";    fromSI = 1.0; }  // velocity (always SI)
                 else                       { unit = "";       fromSI = 1.0; }
                 return true;
             }
@@ -236,6 +283,7 @@ void fieldMeta(const AppState& st, const std::string& chunk, std::string& label,
     };
     if (scan(kStaticFields, kNStaticFields)) return;
     if (scan(kFatigueFields, kNFatigueFields)) return;
+    if (scan(kFlowFields, kNFlowFields)) return;
     label = chunk; unit = ""; fromSI = 1.0;
 }
 
@@ -335,7 +383,11 @@ nlohmann::json SimManager::studyToJson(const Study& s) {
         {"mesh_optimize", s.meshOptimize},
         {"n_modes", s.nModes},
         {"criterion", (int)s.criterion},
-        {"flow", {{"dir", s.flowDir}, {"speed", s.flowSpeed}, {"preset", s.flowPreset}}},
+        {"flow", {{"dir", s.flowDir}, {"speed", s.flowSpeed}, {"preset", s.flowPreset},
+                  {"fluid", s.flowFluid}, {"density", s.flowDensity}, {"viscosity", s.flowViscosity},
+                  {"aoa", s.flowAoA}, {"sideslip", s.flowSideslip},
+                  {"roughness", s.flowRoughness}, {"roughness_um", s.flowRoughnessUm},
+                  {"ref_area_mm2", s.flowRefAreaMm2}}},
         {"fatigue", {{"method", s.fatigueMethod}, {"load_type", s.fatigueLoadType},
                      {"ratio", s.fatigueRatio}, {"lmin", s.fatigueLmin}, {"lmax", s.fatigueLmax},
                      {"se_mpa", s.fatigueSe}, {"sut_mpa", s.fatigueSut},
@@ -380,6 +432,14 @@ Study SimManager::studyFromJson(const nlohmann::json& j) {
         s.flowDir = fl.value("dir", 0);
         s.flowSpeed = fl.value("speed", 10.0);
         s.flowPreset = fl.value("preset", 0);
+        s.flowFluid = fl.value("fluid", 0);
+        s.flowDensity = fl.value("density", 1.225);
+        s.flowViscosity = fl.value("viscosity", 1.5e-5);
+        s.flowAoA = fl.value("aoa", 0.0);
+        s.flowSideslip = fl.value("sideslip", 0.0);
+        s.flowRoughness = fl.value("roughness", 0);
+        s.flowRoughnessUm = fl.value("roughness_um", 0.0);
+        s.flowRefAreaMm2 = fl.value("ref_area_mm2", 0.0);
     }
     if (j.contains("fatigue") && j["fatigue"].is_object()) {
         const auto& fa = j["fatigue"];
@@ -567,6 +627,18 @@ void SimManager::configureActive(AppState& st, float density, const std::string&
     studies_[sel_].meshDensity = density;
     if (!materialKey.empty()) studies_[sel_].materialKey = materialKey;
     persist(st, studies_[sel_]);
+}
+
+void SimManager::configureActiveFlow(AppState& st, int fluid, float aoaDeg, float sideslipDeg,
+                                     int preset) {
+    if (sel_ < 0 || sel_ >= (int)studies_.size()) return;
+    Study& s = studies_[sel_];
+    s.flowFluid = fluid;
+    if (fluid >= 0 && fluid < kNFluids - 1) { s.flowDensity = kFluids[fluid].density; s.flowViscosity = kFluids[fluid].visc; }
+    s.flowAoA = aoaDeg;
+    s.flowSideslip = sideslipDeg;
+    s.flowPreset = preset;
+    persist(st, s);
 }
 
 // ---------------------------------------------------------------- pick capture
@@ -935,6 +1007,170 @@ void SimManager::collectIndicatorSegments(AppState& st, std::vector<float>& load
         }
 }
 
+// ---------------------------------------------------------------- flow setup preview + result lines
+
+namespace {
+// 8-stop turbo-ish ramp (slow -> fast) for speed-banded flow lines.
+static const float kFlowBandCol[8][4] = {
+    {0.20f, 0.10f, 0.55f, 0.85f},  // indigo (near-stagnant)
+    {0.13f, 0.32f, 0.78f, 0.85f},  // blue
+    {0.10f, 0.58f, 0.85f, 0.88f},  // cyan
+    {0.13f, 0.76f, 0.62f, 0.90f},  // teal
+    {0.46f, 0.84f, 0.27f, 0.92f},  // green
+    {0.88f, 0.85f, 0.18f, 0.95f},  // yellow
+    {0.97f, 0.56f, 0.13f, 0.97f},  // orange
+    {0.92f, 0.23f, 0.14f, 1.00f},  // red (fastest)
+};
+// Push the 12 edges of an oriented box (centre c, orthonormal axes u/v/w, half-extents hu/hv/hw).
+void pushBox(std::vector<float>& s, const float c[3], const float u[3], const float v[3],
+             const float w[3], float hu, float hv, float hw) {
+    float cor[8][3];
+    int n = 0;
+    for (int su = -1; su <= 1; su += 2)
+        for (int sv = -1; sv <= 1; sv += 2)
+            for (int sw = -1; sw <= 1; sw += 2) {
+                cor[n][0] = c[0] + su*hu*u[0] + sv*hv*v[0] + sw*hw*w[0];
+                cor[n][1] = c[1] + su*hu*u[1] + sv*hv*v[1] + sw*hw*w[1];
+                cor[n][2] = c[2] + su*hu*u[2] + sv*hv*v[2] + sw*hw*w[2];
+                ++n;
+            }
+    // bit pattern: bit0=w, bit1=v, bit2=u. Connect corners differing in exactly one bit.
+    static const int edges[12][2] = {{0,1},{2,3},{4,5},{6,7}, {0,2},{1,3},{4,6},{5,7},
+                                     {0,4},{1,5},{2,6},{3,7}};
+    for (auto& e : edges) pushSeg3(s, cor[e[0]], cor[e[1]]);
+}
+}  // namespace
+
+bool SimManager::flowSetupActive(AppState& st) const {
+    if (st.leftPaneTab != AppState::LP_Simulation) return false;
+    if (st.colormapOn) return false;       // a result colormap is up — the setup overlay would muddy it
+    if (node_ == SimNode::Results) return false;  // never stack the setup tunnel over a result view
+    if (sel_ < 0 || sel_ >= (int)studies_.size()) return false;
+    return studies_[sel_].type == StudyType::Flow;
+}
+
+void SimManager::collectFlowSetup(AppState& st, std::vector<float>& arrowSegs,
+                                  std::vector<float>& domainSegs, std::vector<float>& inletSegs) const {
+    if (sel_ < 0 || sel_ >= (int)studies_.size()) return;
+    const Study& s = studies_[sel_];
+    // Model bbox / centre / scale from the face-centroid cache (same source as the FEA indicators).
+    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f}; bool any = false;
+    for (const auto& kv : st.faceNormalCache) {
+        for (int k = 0; k < 3; ++k) { lo[k] = std::min(lo[k], kv.second[3+k]); hi[k] = std::max(hi[k], kv.second[3+k]); }
+        any = true;
+    }
+    if (!any) { lo[0]=lo[1]=lo[2]=-50; hi[0]=hi[1]=hi[2]=50; }
+    float ctr[3] = {0.5f*(lo[0]+hi[0]), 0.5f*(lo[1]+hi[1]), 0.5f*(lo[2]+hi[2])};
+    float diag = std::sqrt((hi[0]-lo[0])*(hi[0]-lo[0]) + (hi[1]-lo[1])*(hi[1]-lo[1]) +
+                           (hi[2]-lo[2])*(hi[2]-lo[2]));
+    if (diag < 1e-3f) diag = 100.0f;
+    const float r = 0.5f * diag;  // model "radius"
+
+    // Flow frame: f = incoming dir, right = up x f (fallback +Y), up = f x right.
+    float f[3]; flowIncomingDir(s, f); vecNorm3(f);
+    float up[3] = {0, 0, 1};
+    float rgt[3] = {up[1]*f[2]-up[2]*f[1], up[2]*f[0]-up[0]*f[2], up[0]*f[1]-up[1]*f[0]};
+    if (std::sqrt(rgt[0]*rgt[0]+rgt[1]*rgt[1]+rgt[2]*rgt[2]) < 1e-4f) { rgt[0]=0; rgt[1]=1; rgt[2]=0; }
+    vecNorm3(rgt);
+    float upv[3] = {f[1]*rgt[2]-f[2]*rgt[1], f[2]*rgt[0]-f[0]*rgt[2], f[0]*rgt[1]-f[1]*rgt[0]};
+    vecNorm3(upv);
+
+    // Wind-tunnel domain (matches the solver's 1x up / 3x down / 1x lateral padding, roughly): a box
+    // 6r long along the flow, 3r square in cross-section, with the model ~1/4 in from the inlet.
+    const float halfLen = 3.0f * r, halfCross = 1.6f * r;
+    const float shift = 1.0f * r;  // push the box centre downstream so the inlet sits ahead of the part
+    float boxC[3] = {ctr[0] + f[0]*shift, ctr[1] + f[1]*shift, ctr[2] + f[2]*shift};
+    pushBox(domainSegs, boxC, f, rgt, upv, halfLen, halfCross, halfCross);
+
+    // Inlet plane: the upstream face rectangle + a cross, at the box's leading face.
+    float inC[3] = {boxC[0] - f[0]*halfLen, boxC[1] - f[1]*halfLen, boxC[2] - f[2]*halfLen};
+    float a1[3], a2[3], a3[3], a4[3];
+    for (int k = 0; k < 3; ++k) {
+        a1[k] = inC[k] + rgt[k]*halfCross + upv[k]*halfCross;
+        a2[k] = inC[k] - rgt[k]*halfCross + upv[k]*halfCross;
+        a3[k] = inC[k] - rgt[k]*halfCross - upv[k]*halfCross;
+        a4[k] = inC[k] + rgt[k]*halfCross - upv[k]*halfCross;
+    }
+    pushSeg3(inletSegs, a1, a2); pushSeg3(inletSegs, a2, a3);
+    pushSeg3(inletSegs, a3, a4); pushSeg3(inletSegs, a4, a1);
+    pushSeg3(inletSegs, a1, a3); pushSeg3(inletSegs, a2, a4);
+
+    // Flow arrows: a 3x3 grid across the inlet, each pointing downstream along f, length ~1.2r.
+    const float aLen = 1.2f * r;
+    for (int iu = -1; iu <= 1; ++iu)
+        for (int iv = -1; iv <= 1; ++iv) {
+            float tail[3];
+            for (int k = 0; k < 3; ++k)
+                tail[k] = inC[k] + rgt[k]*(0.7f*halfCross*iu) + upv[k]*(0.7f*halfCross*iv);
+            pushArrow3(arrowSegs, tail, f, aLen);
+        }
+}
+
+bool SimManager::flowResultLinesActive(AppState& st) const {
+    if (st.leftPaneTab != AppState::LP_Simulation) return false;
+    if (sel_ < 0 || sel_ >= (int)studies_.size()) return false;
+    const Study& s = studies_[sel_];
+    return s.type == StudyType::Flow && node_ == SimNode::Results && s.hasResult;
+}
+
+void SimManager::rebuildFlowLines(AppState& st, Study& s) {
+    for (int b = 0; b < kFlowBands; ++b) { flowStreamSegs_[b].clear(); flowSliceSegs_[b].clear(); }
+    flowLinesBuiltFor_.clear();
+    (void)st;
+    if (s.overlayPath.empty()) return;
+    std::error_code ec;
+    if (!std::filesystem::exists(s.overlayPath, ec)) return;
+    render::DocMesh doc; std::string err;
+    if (!render::loadAicmFile(s.overlayPath, doc, err)) return;
+    double vmax = (s.vmaxMps > 1e-6) ? s.vmaxMps : ((s.flowSpeed * 1.5 > 1e-6) ? s.flowSpeed * 1.5 : 1.0);
+    flowLinesVmax_ = vmax;
+    auto bandOf = [&](float spd) -> int {
+        int bi = (int)((spd / (float)vmax) * kFlowBands);
+        return bi < 0 ? 0 : (bi >= kFlowBands ? kFlowBands - 1 : bi);
+    };
+    for (const auto& ls : doc.lines) {
+        const bool isSlice = (ls.name == "slices");
+        const bool isStream = (ls.name == "streamlines");
+        if (!isSlice && !isStream) continue;
+        std::vector<float>* dst = isSlice ? flowSliceSegs_ : flowStreamSegs_;
+        size_t p = 0;
+        for (uint32_t li = 0; li < ls.pts_per_line.size(); ++li) {
+            uint32_t cnt = ls.pts_per_line[li];
+            for (uint32_t i = 0; i + 1 < cnt; ++i) {
+                size_t a = p + i, c = p + i + 1;
+                if ((c * 3 + 2) >= ls.pts.size()) break;
+                float spd = 0.0f;
+                if (ls.has_scalar && c < ls.scalar.size()) spd = 0.5f * (ls.scalar[a] + ls.scalar[c]);
+                int bi = bandOf(spd);
+                const float* pa = &ls.pts[a * 3];
+                const float* pc = &ls.pts[c * 3];
+                dst[bi].insert(dst[bi].end(), {pa[0], pa[1], pa[2], pc[0], pc[1], pc[2]});
+            }
+            p += cnt;
+        }
+    }
+    flowLinesBuiltFor_ = s.id;
+}
+
+void SimManager::collectFlowResultLines(AppState& st, std::vector<FlowLineBatch>& out) {
+    if (sel_ < 0 || sel_ >= (int)studies_.size()) return;
+    Study& s = studies_[sel_];
+    if (flowLinesBuiltFor_ != s.id) rebuildFlowLines(st, s);
+    for (int b = 0; b < kFlowBands; ++b) {
+        if (flowShowStreamlines_ && !flowStreamSegs_[b].empty()) {
+            FlowLineBatch fb; fb.segs = &flowStreamSegs_[b];
+            for (int k = 0; k < 4; ++k) fb.color[k] = kFlowBandCol[b][k];
+            out.push_back(fb);
+        }
+        if (flowShowSlices_ && !flowSliceSegs_[b].empty()) {
+            FlowLineBatch fb; fb.segs = &flowSliceSegs_[b];
+            for (int k = 0; k < 4; ++k) fb.color[k] = kFlowBandCol[b][k];
+            fb.color[3] *= 0.55f;  // slices a touch fainter than streamlines
+            out.push_back(fb);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- run (ported from SimPanel)
 
 nlohmann::json SimManager::facePointsFor(AppState& st, const nlohmann::json& selector, std::string& err) {
@@ -1141,10 +1377,18 @@ void SimManager::runFlow(AppState& st, Study& s) {
     lastStepPath_ = r.value("path", stlPath);
     static const int dirs[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
     static const char* presets[4] = {"coarse", "medium", "fine", "xfine"};
+    int di = (s.flowDir < 0 || s.flowDir > 5) ? 0 : s.flowDir;
+    int pi = (s.flowPreset < 0 || s.flowPreset > 3) ? 0 : s.flowPreset;
+    float density, visc; flowFluidProps(s, density, visc);
+    const char* fluidName = (s.flowFluid == 1) ? "water" : (s.flowFluid == 2) ? "custom" : "air";
     nlohmann::json params = {
         {"stl_path", lastStepPath_},
-        {"direction", {dirs[s.flowDir][0], dirs[s.flowDir][1], dirs[s.flowDir][2]}},
-        {"speed_mps", s.flowSpeed}, {"preset", presets[s.flowPreset]},
+        {"direction", {dirs[di][0], dirs[di][1], dirs[di][2]}},
+        {"speed_mps", s.flowSpeed}, {"preset", presets[pi]},
+        {"aoa_deg", s.flowAoA}, {"sideslip_deg", s.flowSideslip},
+        {"fluid", {{"name", fluidName}, {"density_kgm3", density}, {"kinematic_visc_m2s", visc}}},
+        {"roughness_um", flowRoughnessUm(s)},
+        {"ref_area_mm2", s.flowRefAreaMm2},
     };
     std::string note;
     if (sim->launch("sim_run_flow", params, note, st.docMirror.docId())) {
@@ -1273,15 +1517,34 @@ void SimManager::tick(AppState& st) {
                 if (n.is_string()) s.solverNotes.push_back(n.get<std::string>());
         if (s.type == StudyType::Flow) {
             s.dragN = res.value("drag_n", 0.0);
+            s.liftN = res.value("lift_n", 0.0);
+            s.sideN = res.value("side_n", 0.0);
             s.cd = res.value("cd", 0.0);
+            s.cl = res.value("cl", 0.0);
+            s.ld = res.value("ld", 0.0);
+            s.reynolds = res.value("reynolds", 0.0);
             s.frontalMm2 = res.value("frontal_area_mm2", 0.0);
+            s.refAreaMm2 = res.value("ref_area_mm2", s.frontalMm2);
+            s.cpMin = res.value("cp_min", -1.0);
+            s.cpMax = res.value("cp_max", 1.0);
+            s.vmaxMps = res.value("vmax_mps", s.flowSpeed * 1.5);
+            s.flowFields.clear();
+            if (res.contains("scalar_fields") && res["scalar_fields"].is_array())
+                for (const auto& f : res["scalar_fields"])
+                    if (f.is_string()) s.flowFields.push_back(f.get<std::string>());
             char buf[256];
-            std::snprintf(buf, sizeof(buf), "Drag %.3f N | Cd %.3f | frontal %.0f mm2",
-                          s.dragN, s.cd, s.frontalMm2);
+            std::snprintf(buf, sizeof(buf), "Drag %.3g N | Lift %.3g N | Cd %.3f | Cl %.3f",
+                          s.dragN, s.liftN, s.cd, s.cl);
             s.summary = buf;
             s.banner = res.value("reynolds_note", std::string());
-            std::string lines = res.value("lines_aicm", std::string());
-            if (!lines.empty()) { std::string le; st.loadDocMesh(lines, le); }
+            // The overlay carries the MODEL (Cp-coloured) + streamline/slice lines, so the part stays
+            // visible — flow now rides the same overlay/colormap path as FEA instead of replacing the
+            // model with a body-less streamline file.
+            s.overlayPath = res.value("overlay_aicm", res.value("lines_aicm", std::string()));
+            st.activeScalarField = "pressure_cp";
+            applyResultField(st, s);
+            resultShown_ = true; shownStudyId_ = s.id;
+            rebuildFlowLines(st, s);
             st.addLog("[sim] flow done: " + s.summary);
         } else {
             // Mesh / system size for the Results metric table + solver transparency.
@@ -2127,6 +2390,148 @@ void SimManager::drawFatigueGraphs(AppState& st, Study& s) {
         ImGui::TextDisabled("%s life at %.1f%%: %.3g cycles.", kTheoryNames[m], s.fatigueReliability, lifeH);
 }
 
+// Compose the incoming-flow unit vector from a base axis + AoA + sideslip (Z-up world). Mirrors the
+// solver's construction so the setup preview arrow and the readout match what gets solved.
+static void flowIncomingDir(const Study& s, float out[3]) {
+    static const float kAxis[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+    int di = (s.flowDir < 0 || s.flowDir > 5) ? 0 : s.flowDir;
+    float f0[3] = {kAxis[di][0], kAxis[di][1], kAxis[di][2]};
+    // side0 = up x f0 (up = +Z); fall back to +Y if f0 is (anti)parallel to up.
+    float up[3] = {0, 0, 1};
+    float side0[3] = {up[1]*f0[2] - up[2]*f0[1], up[2]*f0[0] - up[0]*f0[2], up[0]*f0[1] - up[1]*f0[0]};
+    float sl = std::sqrt(side0[0]*side0[0] + side0[1]*side0[1] + side0[2]*side0[2]);
+    if (sl < 1e-5f) { side0[0] = 0; side0[1] = 1; side0[2] = 0; }
+    else { for (int k = 0; k < 3; ++k) side0[k] /= sl; }
+    // up0 = f0 x side0
+    float up0[3] = {f0[1]*side0[2] - f0[2]*side0[1], f0[2]*side0[0] - f0[0]*side0[2],
+                    f0[0]*side0[1] - f0[1]*side0[0]};
+    const float a = s.flowAoA * 3.14159265f / 180.0f;     // pitch toward up0
+    const float b = s.flowSideslip * 3.14159265f / 180.0f; // yaw toward side0
+    float ca = std::cos(a), saa = std::sin(a), cb = std::cos(b), sb = std::sin(b);
+    for (int k = 0; k < 3; ++k)
+        out[k] = ca * cb * f0[k] + ca * sb * side0[k] + saa * up0[k];
+    float l = std::sqrt(out[0]*out[0] + out[1]*out[1] + out[2]*out[2]);
+    if (l > 1e-9f) for (int k = 0; k < 3; ++k) out[k] /= l;
+}
+
+void SimManager::drawFlowForm(AppState& st, Study& s) {
+    const float S = ui::uiScale;
+    // ---- incoming flow: base axis + angle of attack + sideslip ----
+    ImGui::TextUnformatted("Flow direction (base axis)");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##dir", kDirLabels[(s.flowDir < 0 || s.flowDir > 5) ? 0 : s.flowDir])) {
+        for (int i = 0; i < 6; ++i)
+            if (ImGui::Selectable(kDirLabels[i], s.flowDir == i)) { s.flowDir = i; persist(st, s); }
+        ImGui::EndCombo();
+    }
+    simTip("World axis the fluid flows toward. Angle of attack and sideslip tilt the stream off this "
+           "axis, so you can sweep a fuselage or hull without re-orienting the part.");
+
+    ImGui::TextUnformatted("Angle of attack");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::SliderFloat("##aoa", &s.flowAoA, -30.0f, 30.0f, "%.1f deg")) {}
+    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+    simTip("Pitch of the incoming stream relative to the base axis (about the side axis). Positive "
+           "tilts the flow toward world +Z.");
+    ImGui::TextUnformatted("Sideslip");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::SliderFloat("##beta", &s.flowSideslip, -30.0f, 30.0f, "%.1f deg")) {}
+    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+    simTip("Yaw of the incoming stream relative to the base axis (about the up axis).");
+
+    ImGui::Spacing();
+    // ---- free-stream speed ----
+    ImGui::TextUnformatted("Speed");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::InputFloat("##speed", &s.flowSpeed, 0, 0, "%.2f m/s")) {}
+    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+    simTip("Free-stream speed in metres per second.");
+
+    // ---- fluid medium ----
+    ImGui::TextUnformatted("Fluid");
+    int fi = (s.flowFluid < 0 || s.flowFluid >= kNFluids) ? 0 : s.flowFluid;
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##fluid", kFluids[fi].label)) {
+        for (int i = 0; i < kNFluids; ++i)
+            if (ImGui::Selectable(kFluids[i].label, fi == i)) {
+                s.flowFluid = i;
+                if (i != kNFluids - 1) { s.flowDensity = kFluids[i].density; s.flowViscosity = kFluids[i].visc; }
+                persist(st, s);
+            }
+        ImGui::EndCombo();
+    }
+    simTip("Working fluid. Water has ~815x the density and ~15x the Reynolds number of air at the same "
+           "speed/size — pick it for hull / hydrodynamic studies.");
+    if (s.flowFluid == kNFluids - 1) {  // Custom
+        ImGui::TextUnformatted("Density (kg/m3)");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputFloat("##rho", &s.flowDensity, 0, 0, "%.3f")) {}
+        if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+        ImGui::TextUnformatted("Kinematic viscosity (m2/s)");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputFloat("##nu", &s.flowViscosity, 0, 0, "%.2e")) {}
+        if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+    }
+
+    // ---- surface roughness ----
+    ImGui::TextUnformatted("Surface roughness");
+    int ri = (s.flowRoughness < 0 || s.flowRoughness >= kNRoughness) ? 0 : s.flowRoughness;
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##rough", kRoughness[ri].label)) {
+        for (int i = 0; i < kNRoughness; ++i)
+            if (ImGui::Selectable(kRoughness[i].label, ri == i)) { s.flowRoughness = i; persist(st, s); }
+        ImGui::EndCombo();
+    }
+    simTip("Equivalent sand-grain roughness of the wetted surface. Rougher skin raises the friction "
+           "drag — significant for hulls and large surfaces (qualitative correction).");
+    if (s.flowRoughness == kNRoughness - 1) {  // Custom
+        ImGui::TextUnformatted("Roughness Ks (um)");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputFloat("##ks", &s.flowRoughnessUm, 0, 0, "%.1f")) {}
+        if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+    }
+
+    // ---- reference area for the coefficients ----
+    ImGui::TextUnformatted("Reference area (mm2, 0 = auto frontal)");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::InputFloat("##refarea", &s.flowRefAreaMm2, 0, 0, "%.0f")) {}
+    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+    simTip("Area used to non-dimensionalise Cd and Cl. Leave 0 to use the projected frontal area; set "
+           "the planform (wing) or wetted area to match a published coefficient convention.");
+
+    ImGui::Spacing();
+    // ---- resolution / runtime ----
+    ImGui::TextUnformatted("Resolution");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##preset", kPresetLabels[(s.flowPreset < 0 || s.flowPreset > 3) ? 0 : s.flowPreset])) {
+        for (int i = 0; i < 4; ++i)
+            if (ImGui::Selectable(kPresetLabels[i], s.flowPreset == i)) { s.flowPreset = i; persist(st, s); }
+        ImGui::EndCombo();
+    }
+    simTip("Voxel resolution / run time. Thin walls need a finer preset or they leak flow.");
+
+    // ---- live setup readout: resolved stream vector + Reynolds estimate ----
+    ImGui::Spacing();
+    float dir[3]; flowIncomingDir(s, dir);
+    float density, visc; flowFluidProps(s, density, visc);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
+                                                ui::palette.textDim[2], 1));
+    ImGui::Text("Incoming flow: (%.2f, %.2f, %.2f)", dir[0], dir[1], dir[2]);
+    // Reynolds estimate off the model's bounding diagonal (a stand-in for the characteristic length).
+    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f}; bool any = false;
+    for (const auto& kv : st.faceNormalCache) {
+        for (int k = 0; k < 3; ++k) { lo[k] = std::min(lo[k], kv.second[3+k]); hi[k] = std::max(hi[k], kv.second[3+k]); }
+        any = true;
+    }
+    if (any && visc > 0) {
+        float Lc = std::max({hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]}) * 1e-3f;  // mm -> m
+        double Re = (double)s.flowSpeed * Lc / visc;
+        ImGui::Text("Re ~ %.0f  |  rho %.3g kg/m3", Re, density);
+    }
+    ImGui::PopStyleColor();
+    (void)S;
+}
+
 void SimManager::drawResultControls(AppState& st, Study& s) {
     if (!s.hasResult) {
         ImGui::TextWrapped("No results yet. Set up the study and press Run.");
@@ -2143,10 +2548,12 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
     ImGui::PopFont();
     ImGui::Spacing();
 
-    // --- result-field selector (static + fatigue expose many fields; switching is instant) ---
-    if (s.type == StudyType::Static || s.type == StudyType::Fatigue) {
-        const ResultField* arr = (s.type == StudyType::Static) ? kStaticFields : kFatigueFields;
-        const int n = (s.type == StudyType::Static) ? kNStaticFields : kNFatigueFields;
+    // --- result-field selector (static + fatigue + flow expose multiple fields; switching is instant) ---
+    if (s.type == StudyType::Static || s.type == StudyType::Fatigue || s.type == StudyType::Flow) {
+        const ResultField* arr = (s.type == StudyType::Static)  ? kStaticFields
+                               : (s.type == StudyType::Fatigue) ? kFatigueFields : kFlowFields;
+        const int n = (s.type == StudyType::Static)  ? kNStaticFields
+                    : (s.type == StudyType::Fatigue) ? kNFatigueFields : kNFlowFields;
         ImGui::TextUnformatted("Plot");
         int curIdx = 0;
         for (int i = 0; i < n; ++i)
@@ -2157,6 +2564,19 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
                 if (ImGui::Selectable(arr[i].label, i == curIdx)) {
                     st.activeScalarField = arr[i].chunk;
                     applyResultField(st, s);
+                    // Velocity reads on the slice planes; pressure reads on the body. The body carries
+                    // only the Cp scalar, so for the velocity view drop the body colormap (it would
+                    // otherwise fall back to Cp) and let the speed-colored slices carry the field.
+                    if (s.type == StudyType::Flow) {
+                        if (st.activeScalarField == "velocity") {
+                            flowShowSlices_ = true;
+                            st.colormapOn = false; st.legendOn = false;
+                            if (st.renderer) st.renderer->setColormapMode(false);
+                        } else {
+                            flowShowSlices_ = false;
+                        }
+                        rebuildFlowLines(st, s);
+                    }
                 }
             ImGui::EndCombo();
         }
@@ -2190,8 +2610,16 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
             if (s.freqs.empty()) row("Frequencies", "(none)");
         } else if (s.type == StudyType::Flow) {
             std::snprintf(b, sizeof(b), "%.4g N", s.dragN);          row("Drag", b);
-            std::snprintf(b, sizeof(b), "%.4g", s.cd);               row("Drag coefficient Cd", b);
-            std::snprintf(b, sizeof(b), "%.0f mm^2", s.frontalMm2);  row("Frontal area", b);
+            std::snprintf(b, sizeof(b), "%.4g N", s.liftN);          row("Lift", b);
+            if (std::fabs(s.sideN) > 1e-9) {
+                std::snprintf(b, sizeof(b), "%.4g N", s.sideN);      row("Side force", b);
+            }
+            std::snprintf(b, sizeof(b), "%.4f", s.cd);               row("Drag coefficient Cd", b);
+            std::snprintf(b, sizeof(b), "%.4f", s.cl);               row("Lift coefficient Cl", b);
+            std::snprintf(b, sizeof(b), "%.2f", s.ld);               row("Lift / drag (L/D)", b);
+            std::snprintf(b, sizeof(b), "%.0f", s.reynolds);         row("Reynolds number", b);
+            std::snprintf(b, sizeof(b), "%.0f mm^2", s.refAreaMm2 > 0 ? s.refAreaMm2 : s.frontalMm2);
+            row(s.flowRefAreaMm2 > 0 ? "Reference area" : "Frontal area", b);
         } else {
             const auto& sm = s.resultSummary;
             row("Max von Mises", stressV("max_von_mises_mpa"));
@@ -2244,6 +2672,22 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
             for (const auto& n : s.solverNotes) ImGui::BulletText("%s", n.c_str());
             ImGui::TreePop();
         }
+    }
+
+    // --- flow visualization controls: colormap + streamline / slice line overlays ---
+    if (s.type == StudyType::Flow) {
+        ImGui::Spacing();
+        ImGui::Separator();
+        if (ImGui::Checkbox("Show colormap", &st.colormapOn)) {
+            if (st.renderer) st.renderer->setColormapMode(st.colormapOn);
+            st.legendOn = st.colormapOn && st.docMeshHasScalar;
+        }
+        simTip("Color the model by the selected plot field (pressure Cp, or velocity on the slices).");
+        if (ImGui::Checkbox("Show streamlines", &flowShowStreamlines_)) rebuildFlowLines(st, s);
+        simTip("Trace the flow as speed-colored streamlines over the model.");
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Show slices", &flowShowSlices_)) rebuildFlowLines(st, s);
+        simTip("Velocity cross-section planes (mid-X / mid-Y / mid-Z) drawn as a speed-colored grid.");
     }
 
     // --- visualization controls (stacked so nothing clips in the narrow pane) ---
@@ -2340,27 +2784,7 @@ void SimManager::drawForm(AppState& st, Study& s) {
         default:
             // Study overview: material + (type-specific) key controls + Run.
             if (s.type == StudyType::Flow) {
-                ImGui::TextUnformatted("Flow direction");
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                if (ImGui::BeginCombo("##dir", kDirLabels[s.flowDir])) {
-                    for (int i = 0; i < 6; ++i)
-                        if (ImGui::Selectable(kDirLabels[i], s.flowDir == i)) { s.flowDir = i; persist(st, s); }
-                    ImGui::EndCombo();
-                }
-                simTip("World-axis direction the air flows toward.");
-                ImGui::TextUnformatted("Speed");
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                if (ImGui::InputFloat("##speed", &s.flowSpeed, 0, 0, "%.1f m/s")) {}
-                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
-                simTip("Free-stream air speed in metres per second.");
-                ImGui::TextUnformatted("Resolution");
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                if (ImGui::BeginCombo("##preset", kPresetLabels[s.flowPreset])) {
-                    for (int i = 0; i < 4; ++i)
-                        if (ImGui::Selectable(kPresetLabels[i], s.flowPreset == i)) { s.flowPreset = i; persist(st, s); }
-                    ImGui::EndCombo();
-                }
-                simTip("Voxel resolution / run time. Thin walls need a finer preset or they leak flow.");
+                drawFlowForm(st, s);
             } else {
                 ImGui::TextUnformatted("Material"); drawMaterialCombo(st, s);
                 ImGui::Spacing();

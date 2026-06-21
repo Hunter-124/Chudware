@@ -12,6 +12,9 @@
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <GC_MakeArcOfCircle.hxx>
+#include <Geom_BSplineCurve.hxx>
+#include <GeomAPI_Interpolate.hxx>
+#include <TColgp_HArray1OfPnt.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Wire.hxx>
@@ -35,7 +38,16 @@ struct SketchEdge {
     TopoDS_Edge edge;
     Eigen::Vector2d p_start;  // 2D sketch-space start
     Eigen::Vector2d p_end;    // 2D sketch-space end
-    bool closed = false;      // single-edge closed loop (circle)
+    bool closed = false;      // single-edge closed loop (circle / self-closing spline)
+    // 2D sample points to splice into the loop polygon AFTER p_start when this edge
+    // is traversed start->end. Empty for straight/analytic edges (line/circle/arc) so
+    // their loop polygons stay byte-identical to the pre-spline behavior; populated for
+    // curved through-point edges (splines) so the shoelace area / containment tests see
+    // the real curve shape instead of just the two endpoints. For an OPEN spline these
+    // are the strictly-interior points (the end vertex is supplied by the next edge's
+    // start); for a self-closing spline (closed==true) these are every unique ring point
+    // after the start (the start closes the ring via the shoelace wrap).
+    std::vector<Eigen::Vector2d> interior;
 };
 
 bool near2(const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
@@ -112,10 +124,53 @@ bool build_edge(const nlohmann::json& ent, const SketchPlane& plane,
             out.closed = false;
             return true;
         }
+        if (t == "spline") {
+            // Through-point cubic spline. Build the OCCT edge by INTERPOLATION (the same
+            // GeomAPI_Interpolate path as curves.cpp::make_spline_wire / build123d
+            // Edge.make_spline), so a closed spline profile extrudes/revolves with the same
+            // geometry the rest of the kernel produces. The loop polygon uses the entity's
+            // own through-points (interpolation passes through every one), which is sampling-
+            // method independent and keeps area/orientation correct.
+            if (!ent.contains("points") || !ent["points"].is_array()) return false;
+            std::vector<Eigen::Vector2d> pts2d;
+            for (const auto& q : ent["points"]) {
+                if (!q.is_array() || q.size() < 2) continue;
+                Eigen::Vector2d p(q[0].get<double>(), q[1].get<double>());
+                // Drop a point coincident with the previous one — GeomAPI_Interpolate
+                // rejects duplicate consecutive knots (and zero-length segments are noise).
+                if (!pts2d.empty() && near2(pts2d.back(), p)) continue;
+                pts2d.push_back(p);
+            }
+            if (pts2d.size() < 2) return false;
+            // A self-closing spline (first ~ last): drop the duplicate closing point and
+            // interpolate PERIODICALLY so the single edge is genuinely closed (one-edge loop,
+            // like a circle). Otherwise interpolate an open curve start->end.
+            const bool selfClosed = pts2d.size() >= 4 && near2(pts2d.front(), pts2d.back());
+            if (selfClosed) pts2d.pop_back();
+            const int np = static_cast<int>(pts2d.size());
+            Handle(TColgp_HArray1OfPnt) arr = new TColgp_HArray1OfPnt(1, np);
+            for (int i = 0; i < np; ++i)
+                arr->SetValue(i + 1, lift_pnt(plane, pts2d[i]));
+            GeomAPI_Interpolate interp(arr, selfClosed ? Standard_True : Standard_False, 1.0e-6);
+            interp.Perform();
+            if (!interp.IsDone()) return false;
+            Handle(Geom_BSplineCurve) curve = interp.Curve();
+            if (curve.IsNull()) return false;
+            BRepBuilderAPI_MakeEdge mk(curve);
+            if (!mk.IsDone()) return false;
+            out.edge = mk.Edge();
+            out.p_start = pts2d.front();
+            out.p_end   = selfClosed ? pts2d.front() : pts2d.back();
+            out.closed  = selfClosed;
+            // Polygon contribution after the start vertex (see SketchEdge::interior).
+            out.interior.assign(pts2d.begin() + 1,
+                                selfClosed ? pts2d.end() : pts2d.end() - 1);
+            return true;
+        }
     } catch (...) {
         return false;  // malformed param dict / OCCT throw — skip this entity
     }
-    return false;  // unsupported entity type (point/spline/ellipse/...) — skip
+    return false;  // unsupported entity type (point/style_spline/ellipse/...) — skip
 }
 
 // One detected closed loop: the edges in head-to-tail order (reversed where the
@@ -142,18 +197,23 @@ std::vector<Loop> detect_loops(const std::vector<SketchEdge>& edges) {
         used[i] = true;
         Loop lp;
         lp.edges.push_back(edges[i].edge);
-        // Reconstruct an approximating polygon from the start point and center.
-        const Eigen::Vector2d& c = edges[i].p_start;  // center (start==end==center)
-        // We do not know r here directly; recover it as the larger of |start-end|
-        // — but start==end for a circle. Sample using a stored radius instead:
-        // approximate via the edge's parametric points is overkill; a centroid-
-        // only polyline (degenerate) still works because containment uses the
-        // OTHER loop's polygon. To keep area sane we emit a tiny CCW square at c.
-        const double e = kEps;
-        lp.poly = {{c.x() - e, c.y() - e},
-                   {c.x() + e, c.y() - e},
-                   {c.x() + e, c.y() + e},
-                   {c.x() - e, c.y() + e}};
+        if (!edges[i].interior.empty()) {
+            // Self-closing spline: it carries its own ring of sample points, so the loop
+            // polygon is the real curve (start + every unique ring point). This is what
+            // gives the shoelace area its correct sign for CCW normalisation.
+            lp.poly.push_back(edges[i].p_start);
+            for (const auto& q : edges[i].interior) lp.poly.push_back(q);
+        } else {
+            // Circle: start==end==center, radius not stored here. A centroid-only polyline
+            // (degenerate) still works because containment uses the OTHER loop's polygon;
+            // to keep the area sane we emit a tiny CCW square at the center.
+            const Eigen::Vector2d& c = edges[i].p_start;
+            const double e = kEps;
+            lp.poly = {{c.x() - e, c.y() - e},
+                       {c.x() + e, c.y() - e},
+                       {c.x() + e, c.y() + e},
+                       {c.x() - e, c.y() + e}};
+        }
         loops.push_back(std::move(lp));
     }
 
@@ -187,11 +247,22 @@ std::vector<Loop> detect_loops(const std::vector<SketchEdge>& edges) {
 
         Loop lp;
         for (const Step& s : chain) {
-            TopoDS_Edge e = edges[s.idx].edge;
+            const SketchEdge& se = edges[s.idx];
+            TopoDS_Edge e = se.edge;
             if (s.rev) e = TopoDS::Edge(e.Reversed());
             lp.edges.push_back(e);
-            // Loop polyline: the START point of each edge in head-to-tail order.
-            lp.poly.push_back(s.rev ? edges[s.idx].p_end : edges[s.idx].p_start);
+            // Loop polyline: the START point of each edge in head-to-tail order, then any
+            // curved-edge interior samples (in walk order) so a spline edge contributes its
+            // real shape — not just a chord — to the area/containment polygon. Straight and
+            // analytic edges have empty interior, so line/arc loops stay byte-identical.
+            lp.poly.push_back(s.rev ? se.p_end : se.p_start);
+            if (!se.interior.empty()) {
+                if (s.rev)
+                    for (auto it = se.interior.rbegin(); it != se.interior.rend(); ++it)
+                        lp.poly.push_back(*it);
+                else
+                    for (const auto& q : se.interior) lp.poly.push_back(q);
+            }
         }
         loops.push_back(std::move(lp));
     }

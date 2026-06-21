@@ -11,9 +11,13 @@ Supported methods:
   sim_mesh       {step_path, density}  -> {mesh_path, nodes, elems, char_len_mm}
   sim_run_static {study}              -> {results_npz, summary}
   sim_run_modal  {study, n_modes}     -> {freqs_hz, results_npz}
-  sim_run_flow   {stl_path, direction, speed_mps, preset}
-                                      -> delegated to engine.sim.lbm.run_wind_tunnel
-                                         (C07 card; skipped if module absent)
+  sim_run_flow   {stl_path, direction, speed_mps, preset, aoa_deg?, sideslip_deg?,
+                  fluid?{name,density_kgm3,kinematic_visc_m2s}, roughness_um?, ref_area_mm2?}
+                                      -> {drag_n, lift_n, side_n, cd, cl, ld, reynolds,
+                                          frontal_area_mm2, ref_area_mm2, reynolds_note, diverged,
+                                          trace, overlay_aicm, scalar_fields, cp_min, cp_max,
+                                          vmax_mps, solver_notes, lines_aicm?, slice_pngs?}
+                                         (engine.sim.lbm.run_wind_tunnel; skipped if module absent)
   sim_cancel     {job_id}             -> {cancelled: bool}
   shutdown
 
@@ -65,20 +69,28 @@ def _ping(_params: dict, _emit: EmitFn) -> dict:
 
 
 def _sim_run_flow(params: dict, emit: EmitFn) -> dict:
-    """Delegate to engine.sim.lbm.run_wind_tunnel (C07 card).
+    """Delegate to engine.sim.lbm.run_wind_tunnel.
 
-    Signature per C07 card:
-      run_wind_tunnel(stl_path, direction=(1,0,0), speed_mps=10.0,
-                      preset="coarse", on_progress=None, max_steps=None)
-      -> FlowResult with .drag_n, .lift_n, .cd, .frontal_area_mm2,
-                        .reynolds_note, .trace, .diverged
+    INPUT params:
+      stl_path (str), direction [bx,by,bz] (base flow axis), speed_mps (float),
+      preset ("coarse"|"medium"|"fine"|"xfine"),
+      aoa_deg (float, default 0), sideslip_deg (float, default 0),
+      fluid {name, density_kgm3, kinematic_visc_m2s} (default air 1.225 / 1.5e-5),
+      roughness_um (float Ks, default 0 = smooth),
+      ref_area_mm2 (float, 0 = auto frontal area).
+
+    OUTPUT (worker -> host):
+      drag_n, lift_n, side_n, cd, cl, ld, reynolds,
+      frontal_area_mm2, ref_area_mm2, reynolds_note, diverged,
+      trace [{step,drag}], overlay_aicm (model-bearing AICM path),
+      scalar_fields [str], cp_min, cp_max, vmax_mps, solver_notes [str],
+      lines_aicm (back-compat), slice_pngs (back-compat).
     """
     try:
         from engine.sim.lbm import run_wind_tunnel  # type: ignore[import]
     except ImportError:
         raise RuntimeError(
-            "engine.sim.lbm is not available (C07 card not yet built). "
-            "sim_run_flow is unavailable in this build."
+            "engine.sim.lbm is not available. sim_run_flow is unavailable in this build."
         )
 
     stl_path = params["stl_path"]
@@ -86,6 +98,11 @@ def _sim_run_flow(params: dict, emit: EmitFn) -> dict:
     speed_mps = float(params.get("speed_mps", 10.0))
     preset = params.get("preset", "coarse")
     job_id = params.get("job_id", "flow")
+    aoa_deg = float(params.get("aoa_deg", 0.0) or 0.0)
+    sideslip_deg = float(params.get("sideslip_deg", 0.0) or 0.0)
+    fluid = params.get("fluid") or None
+    roughness_um = float(params.get("roughness_um", 0.0) or 0.0)
+    ref_area_mm2 = float(params.get("ref_area_mm2", 0.0) or 0.0)
 
     def on_progress(info: dict) -> None:
         if _cancel_flag:
@@ -107,40 +124,54 @@ def _sim_run_flow(params: dict, emit: EmitFn) -> dict:
         speed_mps=speed_mps,
         preset=preset,
         on_progress=on_progress,
+        aoa_deg=aoa_deg,
+        sideslip_deg=sideslip_deg,
+        fluid=fluid,
+        roughness_um=roughness_um,
+        ref_area_mm2=ref_area_mm2,
     )
-
-    # Build serialisable return dict (FlowResult may have numpy arrays in slices/streamlines)
-    import numpy as np
-
-    def _maybe_tolist(v):
-        if isinstance(v, np.ndarray):
-            return v.tolist()
-        if isinstance(v, list):
-            return [_maybe_tolist(i) for i in v]
-        return v
 
     out = {
         "drag_n": float(result.drag_n),
         "lift_n": float(result.lift_n),
+        "side_n": float(result.side_n),
         "cd": float(result.cd),
+        "cl": float(result.cl),
+        "ld": float(result.ld),
+        "reynolds": float(result.reynolds),
         "frontal_area_mm2": float(result.frontal_area_mm2),
+        "ref_area_mm2": float(result.ref_area_mm2),
         "reynolds_note": str(result.reynolds_note),
         "diverged": bool(result.diverged),
         "trace": [{"step": s, "drag": d} for s, d in result.trace],
+        "cp_min": float(result.cp_min),
+        "cp_max": float(result.cp_max),
+        "vmax_mps": float(result.vmax_mps),
+        "solver_notes": [str(n) for n in result.solver_notes],
+        "scalar_fields": [],
     }
 
-    # ── C19: result overlays — streamline LINS + colormap slice PNGs ──
+    # ── Result overlays: model-bearing AICM + back-compat lines/PNGs ──
     emit({"kind": "sim_progress", "job_id": job_id,
           "stage": "post", "pct": 95, "text": "Packing flow overlays"})
     try:
         from engine.sim import overlay
         from engine.doc import tessellate as tess
+
+        # Model-bearing overlay (body + pressure_cp SCLR + streamlines/slices LINS).
+        overlay_path = overlay.flow_overlay(stl_path, result)
+        out["overlay_aicm"] = overlay_path
+        sf = ["pressure_cp"]
+        if result.streamline_points:
+            sf.append("velocity")
+        out["scalar_fields"] = sf
+
+        # Back-compat: lines-only AICM + slice PNGs.
         sl_chunk = overlay.streamlines_chunk(result.streamline_points, result.streamline_speeds)
         if sl_chunk is not None:
             import tempfile
             with tempfile.NamedTemporaryFile(suffix=".aicm", delete=False) as tf:
                 lines_path = tf.name
-            # LINS-only AICM (no body): write_aicm tolerates a body-less file via extra_chunks.
             tess.write_aicm_file(lines_path, [], extra_chunks=[sl_chunk])
             out["lines_aicm"] = lines_path
         out["slice_pngs"] = overlay.slice_pngs(

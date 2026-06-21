@@ -188,6 +188,11 @@ class FlowResult:
     slice_world_polys:  List[np.ndarray] = dataclasses.field(default_factory=list)  # (N,3) mm
     slice_world_speeds: List[np.ndarray] = dataclasses.field(default_factory=list)  # (N,) m/s
 
+    # Optional pre-packaged overlay AICM path.  The LBM solver leaves this None and the worker
+    # packages an overlay from the lattice carriers above; the OpenFOAM bridge (which has no
+    # lattice) instead writes its own overlay and sets this so the worker uses it directly.
+    overlay_path:       Optional[str] = None
+
     def save_npz(self, path: str) -> None:
         """Save all arrays + scalars to a compressed .npz file."""
         sl_pts  = {f"sl_pts_{i}":  a for i, a in enumerate(self.streamline_points)}

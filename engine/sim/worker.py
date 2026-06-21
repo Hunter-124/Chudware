@@ -102,12 +102,19 @@ def _sim_run_flow(params: dict, emit: EmitFn) -> dict:
       scalar_fields [str], cp_min, cp_max, vmax_mps, solver_notes [str],
       lines_aicm (back-compat), slice_pngs (back-compat).
     """
-    try:
-        from engine.sim.lbm import run_wind_tunnel  # type: ignore[import]
-    except ImportError:
-        raise RuntimeError(
-            "engine.sim.lbm is not available. sim_run_flow is unavailable in this build."
-        )
+    solver = str(params.get("solver", "lbm") or "lbm").lower()
+    if solver == "openfoam":
+        try:
+            from engine.sim.openfoam import run_openfoam_tunnel as run_tunnel  # type: ignore[import]
+        except ImportError as e:
+            raise RuntimeError(f"OpenFOAM bridge unavailable: {e}")
+    else:
+        try:
+            from engine.sim.lbm import run_wind_tunnel as run_tunnel  # type: ignore[import]
+        except ImportError:
+            raise RuntimeError(
+                "engine.sim.lbm is not available. sim_run_flow is unavailable in this build."
+            )
 
     stl_path = params["stl_path"]
     direction = tuple(params.get("direction", [1, 0, 0]))
@@ -134,7 +141,7 @@ def _sim_run_flow(params: dict, emit: EmitFn) -> dict:
             data["trace_point"] = info["trace_point"]
         emit(data)
 
-    result = run_wind_tunnel(
+    result = run_tunnel(
         stl_path=stl_path,
         direction=direction,
         speed_mps=speed_mps,
@@ -174,9 +181,13 @@ def _sim_run_flow(params: dict, emit: EmitFn) -> dict:
         from engine.sim import overlay
         from engine.doc import tessellate as tess
 
-        # Model-bearing overlay (body + pressure_cp SCLR + streamlines/slices LINS).
-        overlay_path = overlay.flow_overlay(stl_path, result)
-        out["overlay_aicm"] = overlay_path
+        # The OpenFOAM bridge pre-packages its own overlay (no lattice carriers to rebuild from);
+        # the LBM solver leaves overlay_path None so we build the overlay here from its lattice.
+        prebuilt = getattr(result, "overlay_path", None)
+        if prebuilt:
+            out["overlay_aicm"] = prebuilt
+        else:
+            out["overlay_aicm"] = overlay.flow_overlay(stl_path, result)
         sf = ["pressure_cp"]
         if result.streamline_points:
             sf.append("velocity")

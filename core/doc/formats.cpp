@@ -754,16 +754,6 @@ void write_ply(const MeshData& mesh, const std::string& path) {
 // are deferred (raise import_failed) — trimesh never emits them for our meshes.
 namespace ply {
 
-int type_size(const std::string& t) {
-    if (t == "char" || t == "uchar" || t == "int8" || t == "uint8") return 1;
-    if (t == "short" || t == "ushort" || t == "int16" || t == "uint16") return 2;
-    if (t == "int" || t == "uint" || t == "int32" || t == "uint32" || t == "float" ||
-        t == "float32")
-        return 4;
-    if (t == "double" || t == "float64" || t == "int64" || t == "uint64") return 8;
-    return 0;  // unknown
-}
-
 struct Prop {
     std::string name;
     std::string type;      // scalar type (or list-value type for a list prop)

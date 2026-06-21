@@ -501,11 +501,6 @@ std::vector<AsmBodyOut> compile_component_patterns(const json& doc,
 
 }  // namespace
 
-void clear_component_cache() {
-    std::lock_guard<std::mutex> lk(g_cache_mtx);
-    g_load_cache.clear();
-}
-
 AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
                                 const std::optional<aicad::mate::WarmMap>& warm,
                                 const std::optional<aicad::mate::Drag>& drag) {

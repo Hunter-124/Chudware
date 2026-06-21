@@ -219,13 +219,6 @@ double sm_bend_allowance(double angle_deg, double inner_radius, double thickness
     return radians(angle_deg) * (inner_radius + k_factor * thickness);
 }
 
-double sm_bend_deduction(double angle_deg, double inner_radius, double thickness,
-                         double k_factor) {
-    double ba = sm_bend_allowance(angle_deg, inner_radius, thickness, k_factor);
-    double ossb = (inner_radius + thickness) * std::tan(radians(angle_deg) / 2.0);
-    return 2.0 * ossb - ba;
-}
-
 // --------------------------------------------------------------------------- bend frame
 
 BendFrame sm_bend_frame(const TopoDS_Shape& body, const TopoDS_Edge& edge,
@@ -529,11 +522,6 @@ FlatPattern sm_flat_pattern(const TopoDS_Shape& body, double thickness,
     }
     fp.solid = flat;
     return fp;
-}
-
-TopoDS_Shape sm_flat_pattern_solid(const TopoDS_Shape& body, double thickness,
-                                   const std::vector<BendRecord>& bends) {
-    return sm_flat_pattern(body, thickness, bends).solid;
 }
 
 }  // namespace geom

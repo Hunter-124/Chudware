@@ -22,8 +22,6 @@ json image_part(const std::string& path) { return json{{"type", "image"}, {"path
 
 json user_message(const json& parts) { return json{{"role", "user"}, {"content", parts}}; }
 
-json assistant_message(const json& parts) { return json{{"role", "assistant"}, {"content", parts}}; }
-
 // --------------------------------------------------------------------------- helpers
 std::string read_file_bytes(const std::string& path) {
     std::ifstream f(path, std::ios::binary);

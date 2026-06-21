@@ -95,7 +95,4 @@ std::map<std::string, Eigen::Vector3d> explode_offsets(const nlohmann::json& doc
 TopoDS_Shape placed_world_shape(const AsmBodyOut& body,
                                 const std::optional<Eigen::Vector3d>& explode_offset = std::nullopt);
 
-// Clear the per-path component load cache (used by tests / re-solves over edited files).
-void clear_component_cache();
-
 }  // namespace aicad::doc

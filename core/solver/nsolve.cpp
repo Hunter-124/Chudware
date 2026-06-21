@@ -127,11 +127,6 @@ std::vector<int> dependent_rows(const Eigen::MatrixXd& J, int rank, double tol) 
 
 // -- construction -------------------------------------------------------------
 
-int System::n_residuals() {
-    if (dirty_) finalize_rows();
-    return n_rows_;
-}
-
 std::vector<int> System::add_vars(int n, const std::vector<double>& init) {
     if (n < 0) throw std::invalid_argument("add_vars: n must be >= 0");
     const int start = static_cast<int>(init_.size());

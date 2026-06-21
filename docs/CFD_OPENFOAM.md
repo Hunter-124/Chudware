@@ -11,15 +11,32 @@ Flow form:
 The OpenFOAM option appears only when a working OpenFOAM is detected; otherwise it is greyed out
 with a hint to provision one.
 
+### Heat transfer
+
+When the OpenFOAM solver is selected, a **Heat transfer (thermal)** section offers two models:
+
+| Thermal model | Solver | Use it for |
+|---------------|--------|-----------|
+| **Fluid (surface heat)** | `buoyantSimpleFoam` (steady, compressible buoyant) | A heated/cooled part surface warming the air: surface temperature, the thermal plume, and total wall heat flow. Wall BC = fixed temperature, heat flux (W/m²), or total power (W). |
+| **Conjugate (solid + fluid)** | `chtMultiRegionFoam` (CHT) | The part *itself* conducts heat from an internal dissipation while the airflow cools it — electronics / heat-sink cooling. Inputs: solid thermal conductivity (W/mK) and dissipated power (W). Meshes a solid region + fluid region from the one part STL; takes a few minutes. |
+
+CHT note: the part STL must be watertight (a closed solid). The steady solid temperature is
+independent of the solid's thermal *mass*, so the bridge runs the transient solver with a low
+artificial rho·Cp to reach the same steady answer in a few fluid flow-through times rather than
+the solid's real (hours-long) thermal time constant.
+
 ## Architecture
 
 ```
 host Flow study (Solver = OpenFOAM)
   -> sim_run_flow {solver:"openfoam", ...}            (engine/sim/worker.py)
        -> engine/sim/openfoam.py  run_openfoam_tunnel  (same signature/return as the LBM tunnel)
-            ├─ foam_case.py    build the case (blockMesh + snappyHexMesh + simpleFoam dicts)
+            ├─ foam_case.py    aero + fluid-thermal case (blockMesh + snappyHexMesh + simpleFoam
+            │                  / buoyantSimpleFoam dicts)
+            ├─ foam_cht.py     conjugate case (multi-region snappy + splitMeshRegions +
+            │                  chtMultiRegionFoam)
             ├─ foam_runner.py  launch utilities (NativeRunner | WslRunner)
-            └─ foam_post.py    coefficient.dat -> Cd/Cl; pyvista -> Cp + streamlines overlay
+            └─ foam_post.py    coefficient.dat -> Cd/Cl; pyvista -> Cp / temperature + streamlines
 ```
 
 `run_openfoam_tunnel` returns the **same `FlowResult`** as the LBM solver, so the host, the

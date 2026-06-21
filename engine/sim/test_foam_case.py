@@ -74,3 +74,31 @@ def test_parse_coefficients(tmp_path=None):
 def test_parse_coefficients_missing():
     cd, cl = foam_post.parse_coefficients(tempfile.mkdtemp())
     assert (cd, cl) == (0.0, 0.0)
+
+
+def test_build_thermal_case():
+    stl, _ = _sphere_stl(50.0)
+    case = tempfile.mkdtemp()
+    info = foam_case.build_case(case, stl, speed_mps=5.0, preset="coarse",
+                                thermal={"enabled": True, "inlet_temp_c": 20.0,
+                                         "wall_mode": "power", "wall_power_w": 50.0})
+    assert info.thermal and info.app == "buoyantSimpleFoam"
+    for f in ["constant/thermophysicalProperties", "constant/g", "0/T", "0/p_rgh", "0/alphat"]:
+        assert (Path(case) / f).exists(), f"missing {f}"
+
+
+def test_build_cht_case():
+    from engine.sim import foam_cht
+    stl, _ = _sphere_stl(50.0)
+    case = tempfile.mkdtemp()
+    info = foam_cht.build_cht_case(case, stl, speed_mps=5.0, preset="coarse",
+                                   solid_kappa=200.0, power_w=20.0)
+    assert info.conjugate and info.app == "chtMultiRegionFoam"
+    assert info.end_time > 0
+    for f in ["constant/regionProperties", "constant/fluid/thermophysicalProperties",
+              "constant/part/thermophysicalProperties", "system/fvSchemes",
+              "system/fluid/fvSolution", "system/part/fvOptions",
+              "0/fluid/T", "0/part/T", "system/snappyHexMeshDict"]:
+        assert (Path(case) / f).exists(), f"missing {f}"
+    # heat source power present in the solid fvOptions
+    assert "20" in (Path(case) / "system" / "part" / "fvOptions").read_text()

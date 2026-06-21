@@ -107,13 +107,18 @@ struct Study {
     float flowRefAreaMm2 = 0.0f;    // reference area for Cd/Cl (mm^2); 0 = auto (projected frontal)
     int flowSolver = 0;             // CFD engine: 0 LBM (fast), 1 OpenFOAM RANS (accurate, needs provision)
 
-    // Thermal / heat transfer (OpenFOAM buoyantSimpleFoam only). Applied to the whole part wall.
+    // Thermal / heat transfer (OpenFOAM only).
     bool flowThermal = false;       // enable heat-transfer solve
+    int flowThermalType = 0;        // 0 fluid (buoyantSimpleFoam, wall BC), 1 conjugate (CHT, solid+fluid)
     float flowInletTempC = 20.0f;   // free-stream / inlet air temperature (degC)
+    // Fluid-thermal (type 0): wall BC applied to the whole part surface.
     int flowWallMode = 2;           // wall thermal BC: 0 fixed temp, 1 heat flux, 2 total power
     float flowWallTempC = 80.0f;    // mode 0: wall fixed temperature (degC)
     float flowWallFluxWm2 = 0.0f;   // mode 1: wall heat flux (W/m^2)
     float flowWallPowerW = 10.0f;   // mode 2: total dissipated power (W)
+    // Conjugate (type 1): the solid part conducts heat from an internal dissipation.
+    float flowSolidKappa = 200.0f;  // solid thermal conductivity (W/mK); 200 ~ aluminium
+    float flowPowerW = 20.0f;       // power dissipated inside the solid (W)
 
     // Result state (transient — regenerated on Run; never persisted).
     bool hasResult = false;

@@ -389,9 +389,11 @@ nlohmann::json SimManager::studyToJson(const Study& s) {
                   {"aoa", s.flowAoA}, {"sideslip", s.flowSideslip},
                   {"roughness", s.flowRoughness}, {"roughness_um", s.flowRoughnessUm},
                   {"ref_area_mm2", s.flowRefAreaMm2}, {"solver", s.flowSolver},
-                  {"thermal", s.flowThermal}, {"inlet_temp_c", s.flowInletTempC},
+                  {"thermal", s.flowThermal}, {"thermal_type", s.flowThermalType},
+                  {"inlet_temp_c", s.flowInletTempC},
                   {"wall_mode", s.flowWallMode}, {"wall_temp_c", s.flowWallTempC},
-                  {"wall_flux_wm2", s.flowWallFluxWm2}, {"wall_power_w", s.flowWallPowerW}}},
+                  {"wall_flux_wm2", s.flowWallFluxWm2}, {"wall_power_w", s.flowWallPowerW},
+                  {"solid_kappa", s.flowSolidKappa}, {"power_w", s.flowPowerW}}},
         {"fatigue", {{"method", s.fatigueMethod}, {"load_type", s.fatigueLoadType},
                      {"ratio", s.fatigueRatio}, {"lmin", s.fatigueLmin}, {"lmax", s.fatigueLmax},
                      {"se_mpa", s.fatigueSe}, {"sut_mpa", s.fatigueSut},
@@ -446,11 +448,14 @@ Study SimManager::studyFromJson(const nlohmann::json& j) {
         s.flowRefAreaMm2 = fl.value("ref_area_mm2", 0.0);
         s.flowSolver = fl.value("solver", 0);
         s.flowThermal = fl.value("thermal", false);
+        s.flowThermalType = fl.value("thermal_type", 0);
         s.flowInletTempC = fl.value("inlet_temp_c", 20.0);
         s.flowWallMode = fl.value("wall_mode", 2);
         s.flowWallTempC = fl.value("wall_temp_c", 80.0);
         s.flowWallFluxWm2 = fl.value("wall_flux_wm2", 0.0);
         s.flowWallPowerW = fl.value("wall_power_w", 10.0);
+        s.flowSolidKappa = fl.value("solid_kappa", 200.0);
+        s.flowPowerW = fl.value("power_w", 20.0);
     }
     if (j.contains("fatigue") && j["fatigue"].is_object()) {
         const auto& fa = j["fatigue"];
@@ -1402,15 +1407,24 @@ void SimManager::runFlow(AppState& st, Study& s) {
         {"ref_area_mm2", s.flowRefAreaMm2},
         {"solver", s.flowSolver == 1 ? "openfoam" : "lbm"},
     };
-    // Thermal (heat-transfer) study — OpenFOAM only; applied to the whole part wall.
+    // Thermal (heat-transfer) study — OpenFOAM only.
     if (s.flowSolver == 1 && s.flowThermal) {
-        const char* wallMode = (s.flowWallMode == 0) ? "temp"
-                             : (s.flowWallMode == 1) ? "flux" : "power";
-        params["thermal"] = {
-            {"enabled", true}, {"inlet_temp_c", s.flowInletTempC}, {"wall_mode", wallMode},
-            {"wall_temp_c", s.flowWallTempC}, {"wall_flux_w_m2", s.flowWallFluxWm2},
-            {"wall_power_w", s.flowWallPowerW},
-        };
+        if (s.flowThermalType == 1) {
+            // Conjugate heat transfer: solid part conducts an internal power dissipation.
+            params["thermal"] = {
+                {"enabled", true}, {"mode", "conjugate"}, {"inlet_temp_c", s.flowInletTempC},
+                {"solid_kappa", s.flowSolidKappa}, {"power_w", s.flowPowerW},
+            };
+        } else {
+            // Fluid heat transfer: wall thermal BC on the whole part surface.
+            const char* wallMode = (s.flowWallMode == 0) ? "temp"
+                                 : (s.flowWallMode == 1) ? "flux" : "power";
+            params["thermal"] = {
+                {"enabled", true}, {"mode", "fluid"}, {"inlet_temp_c", s.flowInletTempC},
+                {"wall_mode", wallMode}, {"wall_temp_c", s.flowWallTempC},
+                {"wall_flux_w_m2", s.flowWallFluxWm2}, {"wall_power_w", s.flowWallPowerW},
+            };
+        }
     }
     std::string note;
     if (sim->launch("sim_run_flow", params, note, st.docMirror.docId())) {
@@ -2582,37 +2596,64 @@ void SimManager::drawFlowForm(AppState& st, Study& s) {
                "the thermal plume, and total wall heat flow. Applied to the whole part surface.");
         if (s.flowThermal) {
             ImGui::Indent(10.0f * S);
+            ImGui::TextUnformatted("Thermal model");
+            static const char* kThermTypes[2] = {"Fluid (surface heat)", "Conjugate (solid + fluid)"};
+            int tt = (s.flowThermalType == 1) ? 1 : 0;
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::BeginCombo("##thermtype", kThermTypes[tt])) {
+                for (int i = 0; i < 2; ++i)
+                    if (ImGui::Selectable(kThermTypes[i], tt == i)) { s.flowThermalType = i; persist(st, s); }
+                ImGui::EndCombo();
+            }
+            simTip("Fluid: a thermal boundary condition on the part surface heats the air. "
+                   "Conjugate (CHT): the solid part conducts heat from an internal power dissipation "
+                   "and the air cools it — the right model for electronics / heat-sink cooling. "
+                   "CHT meshes a solid region and takes a few minutes.");
+
             ImGui::TextUnformatted("Inlet/ambient temp (degC)");
             ImGui::SetNextItemWidth(-FLT_MIN);
             if (ImGui::InputFloat("##inletT", &s.flowInletTempC, 0, 0, "%.1f")) {}
             if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
 
-            ImGui::TextUnformatted("Wall condition");
-            static const char* kWallModes[3] = {"Fixed temperature", "Heat flux (W/m2)", "Total power (W)"};
-            int wm = (s.flowWallMode < 0 || s.flowWallMode > 2) ? 2 : s.flowWallMode;
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ImGui::BeginCombo("##wallmode", kWallModes[wm])) {
-                for (int i = 0; i < 3; ++i)
-                    if (ImGui::Selectable(kWallModes[i], wm == i)) { s.flowWallMode = i; persist(st, s); }
-                ImGui::EndCombo();
-            }
-            simTip("How the part heats the fluid: hold the wall at a fixed temperature, drive a uniform "
-                   "heat flux, or dissipate a fixed total power across the whole surface.");
-            if (wm == 0) {
-                ImGui::TextUnformatted("Wall temperature (degC)");
+            if (s.flowThermalType == 1) {
+                ImGui::TextUnformatted("Solid conductivity (W/mK)");
                 ImGui::SetNextItemWidth(-FLT_MIN);
-                if (ImGui::InputFloat("##wallT", &s.flowWallTempC, 0, 0, "%.1f")) {}
+                if (ImGui::InputFloat("##kappa", &s.flowSolidKappa, 0, 0, "%.1f")) {}
                 if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
-            } else if (wm == 1) {
-                ImGui::TextUnformatted("Heat flux (W/m2)");
+                simTip("Thermal conductivity of the part material. ~200 aluminium, ~50 steel, ~0.2 plastic.");
+                ImGui::TextUnformatted("Dissipated power (W)");
                 ImGui::SetNextItemWidth(-FLT_MIN);
-                if (ImGui::InputFloat("##wallQ", &s.flowWallFluxWm2, 0, 0, "%.1f")) {}
+                if (ImGui::InputFloat("##chtP", &s.flowPowerW, 0, 0, "%.2f")) {}
                 if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                simTip("Total heat generated inside the solid part (e.g. a component's power draw).");
             } else {
-                ImGui::TextUnformatted("Total power (W)");
+                ImGui::TextUnformatted("Wall condition");
+                static const char* kWallModes[3] = {"Fixed temperature", "Heat flux (W/m2)", "Total power (W)"};
+                int wm = (s.flowWallMode < 0 || s.flowWallMode > 2) ? 2 : s.flowWallMode;
                 ImGui::SetNextItemWidth(-FLT_MIN);
-                if (ImGui::InputFloat("##wallP", &s.flowWallPowerW, 0, 0, "%.2f")) {}
-                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                if (ImGui::BeginCombo("##wallmode", kWallModes[wm])) {
+                    for (int i = 0; i < 3; ++i)
+                        if (ImGui::Selectable(kWallModes[i], wm == i)) { s.flowWallMode = i; persist(st, s); }
+                    ImGui::EndCombo();
+                }
+                simTip("How the part heats the fluid: hold the wall at a fixed temperature, drive a uniform "
+                       "heat flux, or dissipate a fixed total power across the whole surface.");
+                if (wm == 0) {
+                    ImGui::TextUnformatted("Wall temperature (degC)");
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::InputFloat("##wallT", &s.flowWallTempC, 0, 0, "%.1f")) {}
+                    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                } else if (wm == 1) {
+                    ImGui::TextUnformatted("Heat flux (W/m2)");
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::InputFloat("##wallQ", &s.flowWallFluxWm2, 0, 0, "%.1f")) {}
+                    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                } else {
+                    ImGui::TextUnformatted("Total power (W)");
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::InputFloat("##wallP", &s.flowWallPowerW, 0, 0, "%.2f")) {}
+                    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                }
             }
             ImGui::Unindent(10.0f * S);
         }

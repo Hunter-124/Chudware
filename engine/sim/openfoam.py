@@ -59,6 +59,11 @@ def run_openfoam_tunnel(
             "natively and set %AICAD_OPENFOAM%."
         )
 
+    # Conjugate heat transfer (solid + fluid) is a different solver/mesh path.
+    if thermal and thermal.get("enabled") and thermal.get("mode") == "conjugate":
+        return run_openfoam_cht(stl_path, direction, speed_mps, preset, on_progress,
+                                aoa_deg, sideslip_deg, fluid, thermal, runner)
+
     def prog(stage: str, pct: int, text: str, trace_point: Optional[dict] = None) -> None:
         if on_progress is None:
             return
@@ -105,6 +110,78 @@ def run_openfoam_tunnel(
         import os
         if not os.environ.get("AICAD_FOAM_KEEP"):
             shutil.rmtree(case_dir, ignore_errors=True)
+
+
+def run_openfoam_cht(stl_path, direction, speed_mps, preset, on_progress,
+                     aoa_deg, sideslip_deg, fluid, thermal, runner):
+    """Conjugate heat transfer: mesh solid+fluid regions and run chtMultiRegionFoam."""
+    from engine.sim.foam_cht import build_cht_case
+
+    def prog(stage, pct, text, trace_point=None):
+        if on_progress is None:
+            return
+        d = {"job_id": "openfoam-cht", "stage": stage, "pct": int(pct), "text": text}
+        if trace_point is not None:
+            d["trace_point"] = trace_point
+        on_progress(d)
+
+    case_dir = tempfile.mkdtemp(prefix="aicad_cht_")
+    try:
+        prog("mesh", 2, f"Building CHT case ({preset})...")
+        info = build_cht_case(
+            case_dir, stl_path, direction=direction, speed_mps=speed_mps, preset=preset,
+            aoa_deg=aoa_deg, sideslip_deg=sideslip_deg, fluid=fluid,
+            inlet_temp_c=float(thermal.get("inlet_temp_c", 20.0)),
+            solid_kappa=float(thermal.get("solid_kappa", 200.0)),
+            power_w=float(thermal.get("power_w", 20.0)))
+
+        prog("mesh", 6, "blockMesh...")
+        runner.run(case_dir, "blockMesh")
+        prog("mesh", 9, "surfaceFeatureExtract...")
+        try:
+            runner.run(case_dir, "surfaceFeatureExtract")
+        except FoamError:
+            pass
+        prog("mesh", 12, "snappyHexMesh (solid + fluid zones)...")
+        runner.run(case_dir, "snappyHexMesh", ["-overwrite"])
+        prog("mesh", 16, "splitMeshRegions (solid/fluid)...")
+        runner.run(case_dir, "splitMeshRegions", ["-cellZones", "-overwrite"])
+
+        state = {"converged": True}  # transient-to-steady: completes when it reaches endTime
+        prog("solve", 20, f"chtMultiRegionFoam (coupled, ~{info.end_time:.2g}s sim)...")
+        runner.run(case_dir, "chtMultiRegionFoam",
+                   on_line=_cht_line(prog, info.end_time), timeout=3300)
+
+        prog("post", 90, "Exporting solid temperature...")
+        # Export all fields (avoids shell-quoting the `-fields (T)` list across runners).
+        try:
+            runner.run(case_dir, "foamToVTK", ["-region", "part", "-latestTime"])
+        except FoamError:
+            pass
+
+        prog("post", 95, "Post-processing (solid temperature overlay)...")
+        from engine.sim.foam_post import postprocess_cht
+        result = postprocess_cht(case_dir, stl_path, info)
+        prog("post", 100, f"Done: {result.reynolds_note}")
+        return result
+    finally:
+        import os
+        if not os.environ.get("AICAD_FOAM_KEEP"):
+            shutil.rmtree(case_dir, ignore_errors=True)
+
+
+def _cht_line(prog, end_time: float) -> Callable[[str], None]:
+    def on_line(line: str) -> None:
+        line = line.strip()
+        m = _TIME_RE.match(line)
+        if m:
+            try:
+                t = float(m.group(1))
+                pct = 20 + int(min(68, 68 * t / max(end_time, 1e-9)))
+                prog("solve", pct, f"chtMultiRegionFoam t={t:.3g}/{end_time:.2g}s")
+            except ValueError:
+                pass
+    return on_line
 
 
 def _mesh_line(prog) -> Callable[[str], None]:

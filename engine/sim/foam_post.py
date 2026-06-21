@@ -216,6 +216,104 @@ def build_overlay(stl_path: str, info: CaseInfo, internal, patches,
 
 # --------------------------------------------------------------------------- top level
 
+def _read_vtm_combined(pattern_dir: Path, exclude=("boundary",)):
+    """Read the first non-excluded .vtm under a foamToVTK region dir; return a merged dataset."""
+    import pyvista as pv
+    vtms = [p for p in pattern_dir.glob("*.vtm")
+            if not any(x in p.stem for x in exclude)]
+    if not vtms:
+        return None
+    mb = pv.read(str(sorted(vtms)[-1]))
+    try:
+        return mb.combine() if hasattr(mb, "combine") else mb
+    except Exception:
+        return mb
+
+
+def _xyz_and_T(ds):
+    """(points, T) from a dataset, handling foamToVTK cell-data OR point-data layouts."""
+    if ds is None or ds.n_points == 0:
+        return None, None
+    if "T" in ds.point_data:
+        return np.asarray(ds.points, dtype=np.float64), np.asarray(ds.point_data["T"], dtype=np.float64)
+    if "T" in ds.cell_data:
+        try:
+            cc = ds.cell_centers()
+            return np.asarray(cc.points, dtype=np.float64), np.asarray(ds.cell_data["T"], dtype=np.float64)
+        except Exception:
+            return None, None
+    return None, None
+
+
+def postprocess_cht(case_dir: str, stl_path: str, info):
+    """Assemble a FlowResult from a finished chtMultiRegionFoam (CHT) run.
+
+    Reads the solid region temperature (foamToVTK export), reports the part's hot/mean
+    temperature + dissipated power, and colours the part surface by temperature.
+    """
+    from engine.sim.lbm import FlowResult
+    from engine.sim import overlay as ov
+    from engine.doc import tessellate as tess
+
+    cd = Path(case_dir)
+    Tin_c = info.inlet_temp_k - 273.15
+    t_min = t_max = t_mean = Tin_c
+
+    solid = _read_vtm_combined(cd / "VTK" / "part")
+    _, Tsolid = _xyz_and_T(solid)
+    if Tsolid is not None and Tsolid.size:
+        Tc = Tsolid - 273.15
+        t_min, t_max, t_mean = float(Tc.min()), float(Tc.max()), float(Tc.mean())
+
+    # Surface temperature overlay: map the part's outer-surface (boundary patch) T onto the
+    # world STL vertices.  Prefer the boundary patch; fall back to the solid cell field.
+    bt = ov._tessellate_stl_world(stl_path)
+    surf = ov._surface_verts(bt)
+    chunks: list = []
+    scalar_fields: List[str] = []
+    bnd = None
+    bvtms = list((cd / "VTK" / "part").rglob("*boundary*.vtm"))  # foamToVTK nests boundary/
+    if bvtms:
+        import pyvista as pv
+        try:
+            bmb = pv.read(str(bvtms[-1]))
+            bnd = bmb.combine() if hasattr(bmb, "combine") else bmb
+        except Exception:
+            bnd = None
+    src_xyz, src_T = _xyz_and_T(bnd)
+    if src_xyz is None:                      # fall back to the solid volume field
+        src_xyz, src_T = _xyz_and_T(solid)
+    try:
+        if src_xyz is not None and src_T.size:
+            from scipy.spatial import cKDTree
+            Tc_b = src_T - 273.15
+            tree = cKDTree(src_xyz)
+            _, idx = tree.query(info.world_mm_to_case_m(surf), k=1)
+            t_surf = Tc_b[idx].astype(np.float32)
+            lo, hi = float(min(Tin_c, t_surf.min())), float(max(t_surf.max(), Tin_c + 1.0))
+            chunks.append(tess.scalar_chunk(1, "temperature", t_surf, vmin=lo, vmax=hi))
+            scalar_fields.append("temperature")
+    except Exception:
+        pass
+
+    with tempfile.NamedTemporaryFile(suffix=".aicm", delete=False) as tf:
+        overlay_path = tf.name
+    tess.write_aicm_file(overlay_path, [bt], extra_chunks=chunks)
+
+    re_note = (f"OpenFOAM CHT (conjugate) - Re {info.reynolds:,.0f}; {info.power_w:.1f} W in solid "
+               f"(k={info.solid_kappa:.0f} W/mK), inlet {Tin_c:.0f} C -> part {t_mean:.0f} C "
+               f"(peak {t_max:.0f} C).")
+    notes = [f"chtMultiRegionFoam coupled solid+fluid; part temperature {t_min:.0f}-{t_max:.0f} C."]
+    return FlowResult(
+        drag_n=0.0, lift_n=0.0, cd=0.0, frontal_area_mm2=info.frontal_area_mm2,
+        reynolds_note=re_note, trace=[], slices=[], slice_transforms=[],
+        streamline_points=[], streamline_speeds=[],
+        diverged=False, steps_run=0, side_n=0.0, cl=0.0, ld=0.0, reynolds=info.reynolds,
+        ref_area_mm2=info.frontal_area_mm2, cp_min=t_min, cp_max=t_max, vmax_mps=info.speed_mps,
+        solver_notes=notes, overlay_path=overlay_path, scalar_fields=scalar_fields,
+    )
+
+
 def postprocess(case_dir: str, stl_path: str, info: CaseInfo, converged: bool,
                 solver_notes: Optional[List[str]] = None):
     """Assemble a FlowResult from a finished OpenFOAM run."""

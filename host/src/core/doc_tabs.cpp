@@ -337,6 +337,19 @@ void AppState::switchToTab(int idx) {
     if (dst.isAssembly) { showRibbon = true; ribbonTab = RT_Assembly; }
     else if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB) ribbonTab = RT_Features;
 
+    // Reveal the Simulation workspace when the entering part already carries studies, so a part with
+    // a saved simulation opens with the Simulation toolbar + study tree in view (the user shouldn't
+    // have to hunt for the gated tab). Cheap sim_study_list pull; no solve is triggered. We don't
+    // force it for assemblies (they default to the Assembly ribbon above).
+    if (!dst.isAssembly && simManager) {
+        simManager->refresh(*this);
+        if (simManager->studyCount() > 0) {
+            showSimulationTools = true;
+            ribbonTab = RT_Simulation;
+            leftPaneTab = LP_Simulation;
+        }
+    }
+
     addLog("[tabs] switched to '" + dst.title + "' (doc " + dst.docId +
            ", rev " + std::to_string(docMirror.revision()) + ")");
 }

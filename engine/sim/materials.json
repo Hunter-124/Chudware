@@ -4,48 +4,233 @@
     "E_mpa": 200000,
     "nu": 0.29,
     "density_g_cm3": 7.87,
-    "yield_mpa": 370
+    "yield_mpa": 370,
+    "ultimate_mpa": 440,
+    "endurance_mpa": 220
   },
   "alu_6061": {
     "name": "Aluminum 6061-T6",
     "E_mpa": 68900,
     "nu": 0.33,
     "density_g_cm3": 2.70,
-    "yield_mpa": 276
+    "yield_mpa": 276,
+    "ultimate_mpa": 310,
+    "endurance_mpa": 96
   },
   "abs": {
     "name": "ABS",
     "E_mpa": 2300,
     "nu": 0.35,
     "density_g_cm3": 1.05,
-    "yield_mpa": 40
+    "yield_mpa": 40,
+    "ultimate_mpa": 44,
+    "endurance_mpa": 13
   },
   "pla": {
     "name": "PLA",
     "E_mpa": 3500,
     "nu": 0.36,
     "density_g_cm3": 1.24,
-    "yield_mpa": 55
+    "yield_mpa": 55,
+    "ultimate_mpa": 60,
+    "endurance_mpa": 18
   },
   "petg": {
     "name": "PETG",
     "E_mpa": 2100,
     "nu": 0.37,
     "density_g_cm3": 1.27,
-    "yield_mpa": 50
+    "yield_mpa": 50,
+    "ultimate_mpa": 53,
+    "endurance_mpa": 16
   },
   "nylon_pa12": {
     "name": "Nylon PA-12",
     "E_mpa": 1600,
     "nu": 0.39,
     "density_g_cm3": 1.01,
-    "yield_mpa": 45
+    "yield_mpa": 45,
+    "ultimate_mpa": 48,
+    "endurance_mpa": 15
   },
   "ti_6al4v": {
     "name": "Titanium Ti-6Al-4V",
     "E_mpa": 113800,
     "nu": 0.342,
     "density_g_cm3": 4.43,
-    "yield_mpa": 880
+    "yield_mpa": 880,
+    "ultimate_mpa": 950,
+    "endurance_mpa": 510
+  },
+  "steel_304_stainless": {
+    "name": "Steel AISI 304 Stainless",
+    "E_mpa": 193000,
+    "nu": 0.29,
+    "density_g_cm3": 8.00,
+    "yield_mpa": 215,
+    "ultimate_mpa": 505,
+    "endurance_mpa": 240
+  },
+  "steel_1045": {
+    "name": "Steel AISI 1045",
+    "E_mpa": 200000,
+    "nu": 0.29,
+    "density_g_cm3": 7.85,
+    "yield_mpa": 450,
+    "ultimate_mpa": 585,
+    "endurance_mpa": 290
+  },
+  "cast_iron_gray": {
+    "name": "Cast Iron (Gray)",
+    "E_mpa": 110000,
+    "nu": 0.26,
+    "density_g_cm3": 7.20,
+    "yield_mpa": 130,
+    "ultimate_mpa": 240,
+    "endurance_mpa": 100
+  },
+  "alu_7075_t6": {
+    "name": "Aluminum 7075-T6",
+    "E_mpa": 71700,
+    "nu": 0.33,
+    "density_g_cm3": 2.81,
+    "yield_mpa": 503,
+    "ultimate_mpa": 572,
+    "endurance_mpa": 159
+  },
+  "alu_2024_t3": {
+    "name": "Aluminum 2024-T3",
+    "E_mpa": 73100,
+    "nu": 0.33,
+    "density_g_cm3": 2.78,
+    "yield_mpa": 345,
+    "ultimate_mpa": 483,
+    "endurance_mpa": 138
+  },
+  "brass_c360": {
+    "name": "Brass C360",
+    "E_mpa": 97000,
+    "nu": 0.31,
+    "density_g_cm3": 8.50,
+    "yield_mpa": 310,
+    "ultimate_mpa": 400,
+    "endurance_mpa": 130
+  },
+  "copper_c110": {
+    "name": "Copper C110",
+    "E_mpa": 117000,
+    "nu": 0.34,
+    "density_g_cm3": 8.94,
+    "yield_mpa": 70,
+    "ultimate_mpa": 220,
+    "endurance_mpa": 76
+  },
+  "magnesium_az31b": {
+    "name": "Magnesium AZ31B",
+    "E_mpa": 45000,
+    "nu": 0.35,
+    "density_g_cm3": 1.77,
+    "yield_mpa": 200,
+    "ultimate_mpa": 260,
+    "endurance_mpa": 90
+  },
+  "ti_grade_2": {
+    "name": "Titanium Grade 2 (CP)",
+    "E_mpa": 105000,
+    "nu": 0.37,
+    "density_g_cm3": 4.51,
+    "yield_mpa": 275,
+    "ultimate_mpa": 345,
+    "endurance_mpa": 190
+  },
+  "polycarbonate": {
+    "name": "Polycarbonate",
+    "E_mpa": 2300,
+    "nu": 0.37,
+    "density_g_cm3": 1.20,
+    "yield_mpa": 62,
+    "ultimate_mpa": 66,
+    "endurance_mpa": 20
+  },
+  "nylon_66": {
+    "name": "Nylon 6/6",
+    "E_mpa": 2900,
+    "nu": 0.39,
+    "density_g_cm3": 1.14,
+    "yield_mpa": 82,
+    "ultimate_mpa": 85,
+    "endurance_mpa": 26
+  },
+  "peek": {
+    "name": "PEEK",
+    "E_mpa": 3600,
+    "nu": 0.38,
+    "density_g_cm3": 1.32,
+    "yield_mpa": 97,
+    "ultimate_mpa": 100,
+    "endurance_mpa": 32
+  },
+  "acrylic_pmma": {
+    "name": "Acrylic (PMMA)",
+    "E_mpa": 3200,
+    "nu": 0.37,
+    "density_g_cm3": 1.18,
+    "yield_mpa": 70,
+    "ultimate_mpa": 72,
+    "endurance_mpa": 22
+  },
+  "carbon_fiber_ud": {
+    "name": "Carbon Fiber (UD, iso-equivalent)",
+    "E_mpa": 135000,
+    "nu": 0.30,
+    "density_g_cm3": 1.60,
+    "yield_mpa": 1500,
+    "ultimate_mpa": 1600,
+    "endurance_mpa": 640
+  },
+  "concrete": {
+    "name": "Concrete",
+    "E_mpa": 30000,
+    "nu": 0.20,
+    "density_g_cm3": 2.40,
+    "yield_mpa": 30,
+    "ultimate_mpa": 40,
+    "endurance_mpa": 18
+  },
+  "glass_soda_lime": {
+    "name": "Glass (Soda-Lime)",
+    "E_mpa": 70000,
+    "nu": 0.22,
+    "density_g_cm3": 2.52,
+    "yield_mpa": 50,
+    "ultimate_mpa": 50,
+    "endurance_mpa": 22
+  },
+  "tungsten": {
+    "name": "Tungsten",
+    "E_mpa": 411000,
+    "nu": 0.28,
+    "density_g_cm3": 19.25,
+    "yield_mpa": 750,
+    "ultimate_mpa": 980,
+    "endurance_mpa": 430
+  },
+  "inconel_718": {
+    "name": "Inconel 718",
+    "E_mpa": 200000,
+    "nu": 0.29,
+    "density_g_cm3": 8.19,
+    "yield_mpa": 1100,
+    "ultimate_mpa": 1375,
+    "endurance_mpa": 620
+  },
+  "lead": {
+    "name": "Lead",
+    "E_mpa": 16000,
+    "nu": 0.44,
+    "density_g_cm3": 11.34,
+    "yield_mpa": 12,
+    "ultimate_mpa": 18,
+    "endurance_mpa": 5
   }
 }

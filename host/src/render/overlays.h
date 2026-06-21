@@ -46,6 +46,12 @@ public:
     void drawFaceWash(const Renderer::CameraXform& cam,
                       const std::vector<uint64_t>& faceKeys, const float rgba[4]);
 
+    // Draw a flat batch of world-space line segments (flat [x0,y0,z0, x1,y1,z1, …] — every 2 verts is
+    // one GL_LINES segment), biased slightly over the shaded surface. Used by the simulation module to
+    // draw the mesh-preview wireframe and the fixture/load/pressure indicator arrows. No-op when empty.
+    void drawSegments(const Renderer::CameraXform& cam, const std::vector<float>& xyz,
+                      const float rgba[4], float lineWidth = 2.0f, bool overSurface = true);
+
 private:
     void destroy();
 
@@ -65,6 +71,7 @@ private:
 
     unsigned int prog_ = 0;     // flat color (faces wash + edges)
     unsigned int vao_ = 0, vbo_ = 0;  // scratch buffer for single-vertex point draws
+    unsigned int segVao_ = 0, segVbo_ = 0;  // dynamic buffer for drawSegments line batches
 
     std::vector<std::pair<Key, FaceBuf>> faces_;
     std::vector<std::pair<Key, EdgeBuf>> edges_;

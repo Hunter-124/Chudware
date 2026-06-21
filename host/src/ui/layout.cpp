@@ -269,8 +269,15 @@ void drawLeftPane(AppState& st,
         char idBuf[16];
         std::snprintf(idBuf, sizeof(idBuf), "%d", t.id);
         ImGui::SetCursorPosX(btnX);
-        if (drawManagerTabButton(idBuf, t.icon, t.fallback, t.tip, selected, attention, btn, glyph))
+        if (drawManagerTabButton(idBuf, t.icon, t.fallback, t.tip, selected, attention, btn, glyph)) {
             st.leftPaneTab = t.id;
+            // Opening the Simulation manager reveals + fronts the Simulation ribbon toolbar so the
+            // study tools are at hand the moment the user is in the simulation workspace.
+            if (t.id == kLeftPaneSimulation) {
+                st.showSimulationTools = true;
+                st.ribbonTab = AppState::RT_Simulation;
+            }
+        }
         ImGui::Dummy(ImVec2(0, gap));
     }
     ImGui::EndChild();

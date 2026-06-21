@@ -1549,6 +1549,21 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 static const float kLoadCol[4] = {0.95f, 0.27f, 0.20f, 0.45f};  // red
                 if (!fix.empty())  st.overlays->drawFaceWash(renderer.camera(), fix, kFixCol);
                 if (!load.empty()) st.overlays->drawFaceWash(renderer.camera(), load, kLoadCol);
+                // 3D indicators on top of the washes: red arrows for loads (force along the vector,
+                // pressure into the face) and green ground glyphs at fixtures — so direction + which
+                // faces are constrained/loaded read at a glance, not just a flat tint.
+                std::vector<float> loadSegs, fixSegs;
+                st.simManager->collectIndicatorSegments(st, loadSegs, fixSegs);
+                static const float kArrowCol[4] = {0.95f, 0.27f, 0.20f, 1.0f};
+                static const float kGlyphCol[4] = {0.10f, 0.66f, 0.30f, 1.0f};
+                if (!loadSegs.empty()) st.overlays->drawSegments(renderer.camera(), loadSegs, kArrowCol, 2.5f);
+                if (!fixSegs.empty())  st.overlays->drawSegments(renderer.camera(), fixSegs,  kGlyphCol, 2.5f);
+                // Mesh-preview wireframe (surface element edges) while setting the study up.
+                if (st.simManager->hasMeshPreview(st)) {
+                    static const float kMeshCol[4] = {0.55f, 0.74f, 0.95f, 0.55f};
+                    st.overlays->drawSegments(renderer.camera(),
+                                              st.simManager->meshPreviewSegments(), kMeshCol, 1.0f);
+                }
             }
             std::vector<render::PickHit> selHits;
             selHits.reserve(st.selection.size());
@@ -1795,8 +1810,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // press lands on the normal-axis handle of the single selected face. Owns the mouse for
             // its whole lifetime (orbit/pan/pick all skip while s_pp.active).
             if (st.hasDocMesh && !st.sketchPlanePickActive && !ppPmOpen && !s_zoomAreaArmed &&
-                !s_asmDrag.active) {
-                // Press: hit-test the handle arrow. We use the handle geometry computed for THIS
+                !s_asmDrag.active && !st.inSimulation()) {
+                // Simulation lockout: no Instant3D push-pull while a study is open (the model is frozen
+                // so fixtures/loads/results stay valid). Press: hit-test the handle arrow. We use the
+                // handle geometry computed for THIS
                 // frame's camera; the centroid screen pos + the two tips define a thick segment.
                 if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s_pp.active) {
                     ImVec2 cSp, tipP, tipN; float nsx, nsy, wpp; uint32_t bId, tId;

@@ -839,6 +839,13 @@ struct AppState {
     std::string legendTitle, legendUnits;  // legend widget labels for the active scalar
     bool legendOn = false;             // draw the viewport legend overlay
     float legendMin = 0.0f, legendMax = 1.0f;
+    // Sim result rework: which named scalar chunk the overlay colormaps (von_mises / p1 / p3 /
+    // max_shear / displacement_mag / disp_x|y|z / fos). loadDocMesh prefers this field by name so the
+    // user can switch result fields with NO re-solve (just a renderOnly re-load of the cached overlay).
+    std::string activeScalarField = "von_mises";
+    // Sim display-unit mode: 0 = follow the document units (st.ips()), 1 = force SI (MPa·N·mm),
+    // 2 = force US customary (psi·lbf·in). Engine stays canonical SI; this only affects display/input.
+    int simUnits = 0;
     bool wantFea = false;       // C19: AI_CAD_SHOT=fea scripted static-study scenario
     bool feaShotDone = false;   // guard so the fea scenario runs exactly once
     bool wantEvalMass = false;  // C19: AI_CAD_SHOT=evalmass mass-properties window
@@ -973,6 +980,11 @@ struct AppState {
     // the default-unit so "1.5" means 1.5 in in IPS and 1.5 mm in MMGS. Angles stay in degrees.
     bool ips() const { return settings.units == Units::IPS; }
     void toggleUnits() { settings.units = ips() ? Units::MMGS : Units::IPS; }
+
+    // True while the Simulation left-pane tab is the active workspace. Modeling tools (ribbon
+    // commands + Instant3D push-pull/drag) lock out in this state so the model can't change shape
+    // out from under a study's fixtures/loads/results — SolidWorks behaves the same in a study.
+    bool inSimulation() const { return leftPaneTab == LP_Simulation; }
 
     // Load an AICM tessellation file into the id pass + overlays (and clear the selection).
     // Requires a current GL context and st.idPass/st.overlays to be set. Returns false on

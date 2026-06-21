@@ -21,6 +21,8 @@
 #include <cmath>
 #include <cstddef>
 #include <filesystem>
+#include <mutex>
+#include <limits>
 #include <unordered_map>
 
 // gmshc.h is a pure-C header with NO `extern "C"` guard of its own — wrap it so the
@@ -42,13 +44,85 @@ struct GmshGuard {
     }
 };
 
+// gmsh keeps PROCESS-GLOBAL state (one model registry) and is NOT thread-safe: two
+// concurrent gmshInitialize/generate sessions corrupt that state and crash. The host can
+// trigger overlapping meshes — e.g. a background study solve (SimClient thread) while the
+// user hits "Preview mesh" (main thread), or rapid re-runs across a study-type switch. This
+// mutex serializes the entire session so those paths queue instead of racing.
+std::mutex& gmsh_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+double tet_volume6(const std::vector<double>& p, int a, int b, int c, int d) {
+    const double* A = &p[static_cast<size_t>(a) * 3];
+    const double* B = &p[static_cast<size_t>(b) * 3];
+    const double* C = &p[static_cast<size_t>(c) * 3];
+    const double* D = &p[static_cast<size_t>(d) * 3];
+    const double ux = B[0] - A[0], uy = B[1] - A[1], uz = B[2] - A[2];
+    const double vx = C[0] - A[0], vy = C[1] - A[1], vz = C[2] - A[2];
+    const double wx = D[0] - A[0], wy = D[1] - A[1], wz = D[2] - A[2];
+    return ux * (vy * wz - vz * wy) - uy * (vx * wz - vz * wx) +
+           uz * (vx * wy - vy * wx);
+}
+
+double edge_len(const std::vector<double>& p, int a, int b) {
+    const double* A = &p[static_cast<size_t>(a) * 3];
+    const double* B = &p[static_cast<size_t>(b) * 3];
+    const double dx = A[0] - B[0], dy = A[1] - B[1], dz = A[2] - B[2];
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+void fill_quality(MeshOut& out) {
+    const int stride = out.nodes_per_elem == 10 ? 10 : 4;
+    const size_t n = out.tets.size() / static_cast<size_t>(stride);
+    if (n == 0) return;
+    double min_vol = std::numeric_limits<double>::infinity();
+    double max_ratio = 0.0;
+    static const int ED[6][2] = {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}};
+    for (size_t e = 0; e < n; ++e) {
+        const int* t = &out.tets[e * static_cast<size_t>(stride)];
+        const double vol = std::abs(tet_volume6(out.points, t[0], t[1], t[2], t[3])) / 6.0;
+        if (vol > 0.0 && vol < min_vol) min_vol = vol;
+        double lo = std::numeric_limits<double>::infinity(), hi = 0.0;
+        for (const auto& ed : ED) {
+            const double L = edge_len(out.points, t[ed[0]], t[ed[1]]);
+            if (L > 0.0) {
+                lo = std::min(lo, L);
+                hi = std::max(hi, L);
+            }
+        }
+        if (std::isfinite(lo) && lo > 0.0) max_ratio = std::max(max_ratio, hi / lo);
+    }
+    out.min_tet_volume_mm3 = std::isfinite(min_vol) ? min_vol : 0.0;
+    out.max_tet_edge_ratio = max_ratio;
+}
+
 }  // namespace
 
-MeshOut mesh_step(const std::string& step_path, double density) {
+MeshOut mesh_step(const std::string& step_path, double density, int order) {
+    MeshOptions options;
+    options.density = density;
+    options.order = order;
+    return mesh_step(step_path, options);
+}
+
+MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
+    std::lock_guard<std::mutex> gmsh_lock(gmsh_mutex());  // serialize: gmsh is not thread-safe
     MeshOut out;
 
+    // Second-order (tet10) selection. order==1 keeps the prior tet4 path
+    // BYTE-IDENTICAL (same gmsh option sequence, MSH element type 4). order==2 sets
+    // Mesh.ElementOrder=2 and extracts MSH type 11 (10-node tets). Any other value
+    // is treated as order 1 (defensive).
+    const bool order2 = (options.order == 2);
+    const int elem_order = order2 ? 2 : 1;
+    const int want_etype = order2 ? 11 : 4;   // MSH_TET_10 vs MSH_TET_4
+    const int npe = order2 ? 10 : 4;
+    out.nodes_per_elem = npe;
+
     // Clip density to [0, 1] (float(np.clip(density, 0.0, 1.0))).
-    density = std::min(1.0, std::max(0.0, density));
+    double density = std::min(1.0, std::max(0.0, options.density));
 
     // Derive a .msh output path next to the step file (Path.with_suffix(".msh")).
     std::filesystem::path mesh_path_fs = std::filesystem::path(step_path);
@@ -108,19 +182,35 @@ MeshOut mesh_step(const std::string& step_path, double density) {
     if (!have_min) return fail("degenerate bounding box (no side dimension > 1e-6)");
 
     // lerp: density=0 -> 0.25*min_dim, density=1 -> 0.05*min_dim.
-    const double char_len = min_dim * (0.25 - 0.20 * density);
+    const double char_len =
+        (std::isfinite(options.target_size_mm) && options.target_size_mm > 0.0)
+            ? options.target_size_mm
+            : min_dim * (0.25 - 0.20 * density);
+    double min_len =
+        (std::isfinite(options.min_size_mm) && options.min_size_mm > 0.0)
+            ? options.min_size_mm
+            : char_len * 0.1;
+    double max_len =
+        (std::isfinite(options.max_size_mm) && options.max_size_mm > 0.0)
+            ? options.max_size_mm
+            : char_len;
+    if (max_len < min_len) std::swap(max_len, min_len);
 
-    gmshOptionSetNumber("Mesh.CharacteristicLengthMin", char_len * 0.1, &ierr);
+    gmshOptionSetNumber("Mesh.CharacteristicLengthMin", min_len, &ierr);
     if (ierr != 0) return fail("setNumber(CharacteristicLengthMin)");
-    gmshOptionSetNumber("Mesh.CharacteristicLengthMax", char_len, &ierr);
+    gmshOptionSetNumber("Mesh.CharacteristicLengthMax", max_len, &ierr);
     if (ierr != 0) return fail("setNumber(CharacteristicLengthMax)");
-    gmshOptionSetNumber("Mesh.ElementOrder", 1, &ierr);
+    gmshOptionSetNumber("Mesh.ElementOrder", elem_order, &ierr);
     if (ierr != 0) return fail("setNumber(ElementOrder)");
-    gmshOptionSetNumber("Mesh.Algorithm3D", 1, &ierr);  // Delaunay 3D
+    gmshOptionSetNumber("Mesh.Algorithm3D", options.algorithm3d > 0 ? options.algorithm3d : 1, &ierr);
     if (ierr != 0) return fail("setNumber(Algorithm3D)");
 
     gmshModelMeshGenerate(3, &ierr);
     if (ierr != 0) return fail("mesh.generate(3)");
+    if (options.optimize) {
+        gmshModelMeshOptimize("", 0, 10, nullptr, 0, &ierr);
+        if (ierr != 0) return fail("mesh.optimize");
+    }
     gmshWrite(mesh_path.c_str(), &ierr);
     if (ierr != 0) return fail("write(.msh)");
 
@@ -167,7 +257,7 @@ MeshOut mesh_step(const std::string& step_path, double density) {
     bool any_tet = false;
     if (ierr == 0) {
         for (std::size_t b = 0; b < elem_types_n; ++b) {
-            if (elem_types[b] != 4) continue;  // tet4 only
+            if (elem_types[b] != want_etype) continue;  // tet4 (4) or tet10 (11) only
             any_tet = true;
             const std::size_t* entags = elem_node_tags[b];
             const std::size_t cnt = elem_node_tags_n[b];
@@ -197,14 +287,16 @@ MeshOut mesh_step(const std::string& step_path, double density) {
 
     if (!any_tet) {
         out.ok = false;
-        out.error = "gmsh produced no tet4 elements for '" + step_path +
+        out.error = std::string("gmsh produced no ") + (order2 ? "tet10" : "tet4") +
+                    " elements for '" + step_path +
                     "'. Check that the geometry is a valid closed solid.";
         return out;
     }
 
     out.char_len_mm = char_len;
     out.n_nodes = static_cast<int>(out.points.size() / 3);
-    out.n_elems = static_cast<int>(out.tets.size() / 4);
+    out.n_elems = static_cast<int>(out.tets.size() / npe);
+    fill_quality(out);
     out.ok = true;
     return out;
 }

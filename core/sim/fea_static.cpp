@@ -13,6 +13,7 @@
 #include <set>
 
 #include <Eigen/Dense>
+#include <Eigen/SparseCholesky>
 #include <Eigen/SparseCore>
 #include <Eigen/SparseLU>
 
@@ -66,12 +67,87 @@ bool tet4_B(const std::array<Eigen::Vector3d, 4>& ep, Eigen::Matrix<double, 6, 1
     return true;
 }
 
+// ── Quadratic (10-node) isoparametric tet ─────────────────────────────────────
+//
+// Natural coords (r,s,t); volume coords L0=1-r-s-t, L1=r, L2=s, L3=t. Node ordering
+// matches the gmsh MSH_TET_10 layout (mesher.cpp): corners 0..3, then mid-edge nodes
+// on edges {0,1},{1,2},{2,0},{3,0},{3,2},{3,1} -> nodes 4..9.
+
+// Shape-function derivatives dN/d{r,s,t} (10x3) at natural coords (r,s,t).
+// dL0/dr=dL0/ds=dL0/dt=-1; dL1/dr=1; dL2/ds=1; dL3/dt=1 (others 0).
+Eigen::Matrix<double, 10, 3> tet10_dN(double r, double s, double t) {
+    const double L0 = 1.0 - r - s - t, L1 = r, L2 = s, L3 = t;
+    // Per-volume-coord gradients in (r,s,t).
+    const Eigen::Vector3d g0(-1.0, -1.0, -1.0), g1(1.0, 0.0, 0.0),
+        g2(0.0, 1.0, 0.0), g3(0.0, 0.0, 1.0);
+    Eigen::Matrix<double, 10, 3> dN;
+    // Corner: N = L(2L-1) -> dN = (4L-1) dL.
+    dN.row(0) = (4.0 * L0 - 1.0) * g0.transpose();
+    dN.row(1) = (4.0 * L1 - 1.0) * g1.transpose();
+    dN.row(2) = (4.0 * L2 - 1.0) * g2.transpose();
+    dN.row(3) = (4.0 * L3 - 1.0) * g3.transpose();
+    // Mid-edge: N = 4 La Lb -> dN = 4 (La dLb + Lb dLa).
+    dN.row(4) = (4.0 * (L0 * g1 + L1 * g0)).transpose();  // edge {0,1}
+    dN.row(5) = (4.0 * (L1 * g2 + L2 * g1)).transpose();  // edge {1,2}
+    dN.row(6) = (4.0 * (L2 * g0 + L0 * g2)).transpose();  // edge {2,0}
+    dN.row(7) = (4.0 * (L3 * g0 + L0 * g3)).transpose();  // edge {3,0}
+    dN.row(8) = (4.0 * (L3 * g2 + L2 * g3)).transpose();  // edge {3,2}
+    dN.row(9) = (4.0 * (L3 * g1 + L1 * g3)).transpose();  // edge {3,1}
+    return dN;
+}
+
+// 4-point Gauss rule for a tet (degree-2 exact). Points in (r,s,t); each weight 1/24
+// so the weights sum to 1/6 (the reference-tet volume in natural coords).
+struct TetGauss4 {
+    double pt[4][3];
+    double w[4];
+    TetGauss4() {
+        const double a = 0.5854101966249685, b = 0.1381966011250105;
+        const double P[4][3] = {{a, b, b}, {b, a, b}, {b, b, a}, {b, b, b}};
+        for (int g = 0; g < 4; ++g) {
+            for (int k = 0; k < 3; ++k) pt[g][k] = P[g][k];
+            w[g] = 1.0 / 24.0;
+        }
+    }
+};
+
+// Build B (6x30) at one Gauss point for a tet10 with corner+mid-edge node coords `ep`
+// (10 entries). Returns false if the Jacobian is degenerate; on success sets detJ and
+// the spatial shape-function gradients dNxyz (10x3, dNi/d{x,y,z}).
+bool tet10_B_at(const std::array<Eigen::Vector3d, 10>& ep, double r, double s, double t,
+                Eigen::Matrix<double, 6, 30>& B, double& detJ,
+                Eigen::Matrix<double, 10, 3>& dNxyz) {
+    const Eigen::Matrix<double, 10, 3> dNrst = tet10_dN(r, s, t);
+    // Jacobian J(3x3): J(i,j) = d x_i / d xi_j = sum_n ep[n](i) * dNrst(n,j).
+    Eigen::Matrix3d J = Eigen::Matrix3d::Zero();
+    for (int n = 0; n < 10; ++n) J += ep[n] * dNrst.row(n);
+    detJ = J.determinant();
+    if (!(std::abs(detJ) > 0.0)) return false;
+    Eigen::Matrix3d Jinv = J.inverse();
+    if (!Jinv.allFinite()) return false;
+    // dN/d{x,y,z} = dN/d{r,s,t} * Jinv  (row n: grad in natural * Jinv = grad in space).
+    dNxyz = dNrst * Jinv;
+    B.setZero();
+    for (int n = 0; n < 10; ++n) {
+        const int col = n * 3;
+        const double dx = dNxyz(n, 0), dy = dNxyz(n, 1), dz = dNxyz(n, 2);
+        B(0, col + 0) = dx;
+        B(1, col + 1) = dy;
+        B(2, col + 2) = dz;
+        B(3, col + 0) = dy; B(3, col + 1) = dx;
+        B(4, col + 1) = dz; B(4, col + 2) = dy;
+        B(5, col + 0) = dz; B(5, col + 2) = dx;
+    }
+    return true;
+}
+
 }  // namespace
 
 FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::vector<int>& tets,
                                  double E_mpa, double nu, double yield_mpa,
                                  const std::vector<int>& fixed_nodes,
-                                 const std::vector<double>& nodal_forces) {
+                                 const std::vector<double>& nodal_forces,
+                                 int nodes_per_elem) {
     FeaStaticResult res;
     const int n_nodes = static_cast<int>(points.size() / 3);
     const int n_dof = n_nodes * 3;
@@ -80,9 +156,46 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
         res.error = "fea_static: empty mesh";
         return res;
     }
+    if (points.size() % 3 != 0) {
+        res.error = "fea_static: points length must be divisible by 3";
+        return res;
+    }
     if (static_cast<int>(nodal_forces.size()) != n_dof) {
         res.error = "fea_static: nodal_forces length must be n_nodes*3";
         return res;
+    }
+    if (nodes_per_elem != 4 && nodes_per_elem != 10) {
+        res.error = "fea_static: nodes_per_elem must be 4 (tet4) or 10 (tet10)";
+        return res;
+    }
+    if (tets.size() % static_cast<size_t>(nodes_per_elem) != 0) {
+        res.error = "fea_static: tets length must be divisible by nodes_per_elem";
+        return res;
+    }
+    if (!std::isfinite(E_mpa) || E_mpa <= 0.0 || !std::isfinite(nu) || nu <= -1.0 ||
+        nu >= 0.5) {
+        res.error = "fea_static: material requires E>0 and -1<nu<0.5";
+        return res;
+    }
+    for (double x : points) {
+        if (!std::isfinite(x)) {
+            res.error = "fea_static: mesh coordinates must be finite";
+            return res;
+        }
+    }
+    for (double x : nodal_forces) {
+        if (!std::isfinite(x)) {
+            res.error = "fea_static: nodal forces must be finite";
+            return res;
+        }
+    }
+    const bool tet10 = (nodes_per_elem == 10);
+    const int stride = nodes_per_elem;
+    for (int nid : tets) {
+        if (nid < 0 || nid >= n_nodes) {
+            res.error = "fea_static: tet node index out of range";
+            return res;
+        }
     }
 
     double lam, mu;
@@ -92,7 +205,8 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
     auto node_pt = [&](int nid) {
         return Eigen::Vector3d(points[nid * 3], points[nid * 3 + 1], points[nid * 3 + 2]);
     };
-    const int n_tets = static_cast<int>(tets.size() / 4);
+    const int n_tets = static_cast<int>(tets.size() / stride);
+    const TetGauss4 gauss;
 
     // Fixed-DOF mask + reduced (free) DOF numbering: dof -> reduced index, or -1 if fixed.
     std::vector<char> fixed(n_dof, 0);
@@ -110,25 +224,65 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
 
     // Assemble the reduced free-free stiffness directly (skip rows/cols of fixed DOFs).
     std::vector<Eigen::Triplet<double>> trips;
-    trips.reserve(static_cast<std::size_t>(n_tets) * 144);
-    for (int e = 0; e < n_tets; ++e) {
-        std::array<Eigen::Vector3d, 4> ep;
-        std::array<int, 4> tn;
-        for (int j = 0; j < 4; ++j) { tn[j] = tets[e * 4 + j]; ep[j] = node_pt(tn[j]); }
-        Eigen::Matrix<double, 6, 12> B;
-        double vol;
-        if (!tet4_B(ep, B, vol)) continue;
-        Eigen::Matrix<double, 12, 12> Ke = B.transpose() * C * B * vol;
-        int dof_map[12];
-        for (int j = 0; j < 4; ++j)
-            for (int k = 0; k < 3; ++k) dof_map[j * 3 + k] = tn[j] * 3 + k;
-        for (int a = 0; a < 12; ++a) {
-            int ra = reduced[dof_map[a]];
-            if (ra < 0) continue;
-            for (int b = 0; b < 12; ++b) {
-                int rb = reduced[dof_map[b]];
-                if (rb < 0) continue;
-                trips.emplace_back(ra, rb, Ke(a, b));
+    const int edof = stride * 3;  // element DOFs (12 for tet4, 30 for tet10)
+    trips.reserve(static_cast<std::size_t>(n_tets) * static_cast<std::size_t>(edof) * edof);
+    if (!tet10) {
+        // ── tet4 path (UNCHANGED — parity-critical) ──────────────────────────
+        for (int e = 0; e < n_tets; ++e) {
+            std::array<Eigen::Vector3d, 4> ep;
+            std::array<int, 4> tn;
+            for (int j = 0; j < 4; ++j) { tn[j] = tets[e * 4 + j]; ep[j] = node_pt(tn[j]); }
+            Eigen::Matrix<double, 6, 12> B;
+            double vol;
+            if (!tet4_B(ep, B, vol)) continue;
+            Eigen::Matrix<double, 12, 12> Ke = B.transpose() * C * B * vol;
+            int dof_map[12];
+            for (int j = 0; j < 4; ++j)
+                for (int k = 0; k < 3; ++k) dof_map[j * 3 + k] = tn[j] * 3 + k;
+            for (int a = 0; a < 12; ++a) {
+                int ra = reduced[dof_map[a]];
+                if (ra < 0) continue;
+                for (int b = 0; b < 12; ++b) {
+                    int rb = reduced[dof_map[b]];
+                    if (rb < 0) continue;
+                    trips.emplace_back(ra, rb, Ke(a, b));
+                }
+            }
+        }
+    } else {
+        // ── tet10 path (quadratic isoparametric, 4-point Gauss) ──────────────
+        for (int e = 0; e < n_tets; ++e) {
+            std::array<Eigen::Vector3d, 10> ep;
+            std::array<int, 10> tn;
+            for (int j = 0; j < 10; ++j) {
+                tn[j] = tets[e * 10 + j];
+                ep[j] = node_pt(tn[j]);
+            }
+            Eigen::Matrix<double, 30, 30> Ke = Eigen::Matrix<double, 30, 30>::Zero();
+            bool ok_elem = true;
+            for (int g = 0; g < 4; ++g) {
+                Eigen::Matrix<double, 6, 30> B;
+                double detJ;
+                Eigen::Matrix<double, 10, 3> dNxyz;
+                if (!tet10_B_at(ep, gauss.pt[g][0], gauss.pt[g][1], gauss.pt[g][2], B, detJ,
+                                dNxyz)) {
+                    ok_elem = false;
+                    break;
+                }
+                Ke += B.transpose() * C * B * (std::abs(detJ) * gauss.w[g]);
+            }
+            if (!ok_elem) continue;
+            int dof_map[30];
+            for (int j = 0; j < 10; ++j)
+                for (int k = 0; k < 3; ++k) dof_map[j * 3 + k] = tn[j] * 3 + k;
+            for (int a = 0; a < 30; ++a) {
+                int ra = reduced[dof_map[a]];
+                if (ra < 0) continue;
+                for (int b = 0; b < 30; ++b) {
+                    int rb = reduced[dof_map[b]];
+                    if (rb < 0) continue;
+                    trips.emplace_back(ra, rb, Ke(a, b));
+                }
             }
         }
     }
@@ -136,28 +290,54 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
     Eigen::SparseMatrix<double> Kff(n_free, n_free);
     Kff.setFromTriplets(trips.begin(), trips.end());
     Kff.makeCompressed();
+    if (Kff.nonZeros() == 0) {
+        res.error = "fea_static: no valid elements contributed stiffness";
+        return res;
+    }
 
     Eigen::VectorXd ff(n_free);
     for (int d = 0; d < n_dof; ++d)
         if (reduced[d] >= 0) ff(reduced[d]) = nodal_forces[d];
 
-    Eigen::SparseLU<Eigen::SparseMatrix<double>> lu;
-    lu.analyzePattern(Kff);
-    lu.factorize(Kff);
-    if (lu.info() != Eigen::Success) {
-        res.error = "fea_static: sparse factorization failed (singular system)";
-        return res;
+    // The reduced stiffness is symmetric positive-definite. For tet10 (large systems, no Python
+    // parity oracle) use a Cholesky factorization (SimplicialLDLT) — markedly faster + lower memory
+    // than SparseLU on SPD systems — and fall back to SparseLU only if it reports failure. tet4 keeps
+    // SparseLU verbatim so its results stay byte-identical to the Python oracle (parity harness).
+    Eigen::VectorXd uf;
+    bool solved = false;
+    if (tet10) {
+        Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
+        ldlt.compute(Kff);
+        if (ldlt.info() == Eigen::Success) {
+            uf = ldlt.solve(ff);
+            if (ldlt.info() == Eigen::Success) solved = true;
+        }
     }
-    Eigen::VectorXd uf = lu.solve(ff);
-    if (lu.info() != Eigen::Success) {
-        res.error = "fea_static: sparse solve failed";
-        return res;
+    if (!solved) {
+        Eigen::SparseLU<Eigen::SparseMatrix<double>> lu;
+        lu.analyzePattern(Kff);
+        lu.factorize(Kff);
+        if (lu.info() != Eigen::Success) {
+            res.error = "fea_static: sparse factorization failed (singular system)";
+            return res;
+        }
+        uf = lu.solve(ff);
+        if (lu.info() != Eigen::Success) {
+            res.error = "fea_static: sparse solve failed";
+            return res;
+        }
     }
 
     // Scatter back to the full DOF vector (fixed DOFs stay zero).
     std::vector<double> u_full(n_dof, 0.0);
     for (int d = 0; d < n_dof; ++d)
         if (reduced[d] >= 0) u_full[d] = uf(reduced[d]);
+    for (double x : u_full) {
+        if (!std::isfinite(x)) {
+            res.error = "fea_static: sparse solve produced non-finite displacement";
+            return res;
+        }
+    }
 
     // Displacement + magnitude.
     res.displacement = u_full;
@@ -168,30 +348,120 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
     }
 
     // Per-element von Mises -> node-averaged (mean of neighbouring elements).
+    // Additive (parity-safe): in the SAME loop, accumulate the full symmetric stress
+    // tensor (sx,sy,sz,txy,tyz,txz) per node with the SAME vm_count divisor, so the
+    // von Mises accumulation below is byte-for-byte unchanged.
     std::vector<double> vm_accum(n_nodes, 0.0);
     std::vector<int> vm_count(n_nodes, 0);
-    for (int e = 0; e < n_tets; ++e) {
-        std::array<Eigen::Vector3d, 4> ep;
-        std::array<int, 4> tn;
-        for (int j = 0; j < 4; ++j) { tn[j] = tets[e * 4 + j]; ep[j] = node_pt(tn[j]); }
-        Eigen::Matrix<double, 6, 12> B;
-        double vol;
-        if (!tet4_B(ep, B, vol)) continue;
-        Eigen::Matrix<double, 12, 1> ue;
-        for (int j = 0; j < 4; ++j)
-            for (int k = 0; k < 3; ++k) ue(j * 3 + k) = u_full[tn[j] * 3 + k];
-        Eigen::Matrix<double, 6, 1> strain = B * ue;
-        Eigen::Matrix<double, 6, 1> stress = C * strain;
-        double sx = stress(0), sy = stress(1), sz = stress(2);
-        double txy = stress(3), tyz = stress(4), txz = stress(5);
-        double vm = std::sqrt(0.5 * ((sx - sy) * (sx - sy) + (sy - sz) * (sy - sz) +
-                                     (sz - sx) * (sz - sx) +
-                                     6.0 * (txy * txy + tyz * tyz + txz * txz)));
-        for (int j = 0; j < 4; ++j) { vm_accum[tn[j]] += vm; vm_count[tn[j]] += 1; }
+    std::vector<double> sx_accum(n_nodes, 0.0), sy_accum(n_nodes, 0.0), sz_accum(n_nodes, 0.0);
+    std::vector<double> txy_accum(n_nodes, 0.0), tyz_accum(n_nodes, 0.0), txz_accum(n_nodes, 0.0);
+    if (!tet10) {
+        // ── tet4 stress recovery (UNCHANGED — parity-critical) ───────────────
+        for (int e = 0; e < n_tets; ++e) {
+            std::array<Eigen::Vector3d, 4> ep;
+            std::array<int, 4> tn;
+            for (int j = 0; j < 4; ++j) { tn[j] = tets[e * 4 + j]; ep[j] = node_pt(tn[j]); }
+            Eigen::Matrix<double, 6, 12> B;
+            double vol;
+            if (!tet4_B(ep, B, vol)) continue;
+            Eigen::Matrix<double, 12, 1> ue;
+            for (int j = 0; j < 4; ++j)
+                for (int k = 0; k < 3; ++k) ue(j * 3 + k) = u_full[tn[j] * 3 + k];
+            Eigen::Matrix<double, 6, 1> strain = B * ue;
+            Eigen::Matrix<double, 6, 1> stress = C * strain;
+            double sx = stress(0), sy = stress(1), sz = stress(2);
+            double txy = stress(3), tyz = stress(4), txz = stress(5);
+            double vm = std::sqrt(0.5 * ((sx - sy) * (sx - sy) + (sy - sz) * (sy - sz) +
+                                         (sz - sx) * (sz - sx) +
+                                         6.0 * (txy * txy + tyz * tyz + txz * txz)));
+            for (int j = 0; j < 4; ++j) {
+                vm_accum[tn[j]] += vm; vm_count[tn[j]] += 1;
+                sx_accum[tn[j]] += sx;  sy_accum[tn[j]] += sy;  sz_accum[tn[j]] += sz;
+                txy_accum[tn[j]] += txy; tyz_accum[tn[j]] += tyz; txz_accum[tn[j]] += txz;
+            }
+        }
+    } else {
+        // ── tet10 stress recovery: evaluate at the 4 Gauss points, average to a
+        // single element stress, then scatter that element stress onto ALL 10
+        // nodes (same node-averaging scheme as tet4). This reuses the per-node
+        // vm/principal/shear recovery below unchanged.
+        for (int e = 0; e < n_tets; ++e) {
+            std::array<Eigen::Vector3d, 10> ep;
+            std::array<int, 10> tn;
+            for (int j = 0; j < 10; ++j) {
+                tn[j] = tets[e * 10 + j];
+                ep[j] = node_pt(tn[j]);
+            }
+            Eigen::Matrix<double, 30, 1> ue;
+            for (int j = 0; j < 10; ++j)
+                for (int k = 0; k < 3; ++k) ue(j * 3 + k) = u_full[tn[j] * 3 + k];
+            Eigen::Matrix<double, 6, 1> stress_avg = Eigen::Matrix<double, 6, 1>::Zero();
+            int ngp = 0;
+            for (int g = 0; g < 4; ++g) {
+                Eigen::Matrix<double, 6, 30> B;
+                double detJ;
+                Eigen::Matrix<double, 10, 3> dNxyz;
+                if (!tet10_B_at(ep, gauss.pt[g][0], gauss.pt[g][1], gauss.pt[g][2], B, detJ,
+                                dNxyz))
+                    continue;
+                Eigen::Matrix<double, 6, 1> strain = B * ue;
+                stress_avg += C * strain;
+                ++ngp;
+            }
+            if (ngp == 0) continue;
+            stress_avg /= static_cast<double>(ngp);
+            double sx = stress_avg(0), sy = stress_avg(1), sz = stress_avg(2);
+            double txy = stress_avg(3), tyz = stress_avg(4), txz = stress_avg(5);
+            double vm = std::sqrt(0.5 * ((sx - sy) * (sx - sy) + (sy - sz) * (sy - sz) +
+                                         (sz - sx) * (sz - sx) +
+                                         6.0 * (txy * txy + tyz * tyz + txz * txz)));
+            for (int j = 0; j < 10; ++j) {
+                vm_accum[tn[j]] += vm; vm_count[tn[j]] += 1;
+                sx_accum[tn[j]] += sx;  sy_accum[tn[j]] += sy;  sz_accum[tn[j]] += sz;
+                txy_accum[tn[j]] += txy; tyz_accum[tn[j]] += tyz; txz_accum[tn[j]] += txz;
+            }
+        }
     }
     res.von_mises.assign(n_nodes, 0.0);
     for (int i = 0; i < n_nodes; ++i)
         if (vm_count[i] > 0) res.von_mises[i] = vm_accum[i] / vm_count[i];
+
+    // ── Additive principal/shear/normal-component recovery ───────────────────
+    // Average each tensor component (same divisor), build the 3x3 symmetric stress
+    // tensor per node, and take its eigenvalues (ascending: p3=eig[0], p1=eig[2]).
+    res.principal1.assign(n_nodes, 0.0);
+    res.principal3.assign(n_nodes, 0.0);
+    res.max_shear.assign(n_nodes, 0.0);
+    res.stress_xx.assign(n_nodes, 0.0);
+    res.stress_yy.assign(n_nodes, 0.0);
+    res.stress_zz.assign(n_nodes, 0.0);
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_solver;
+    for (int i = 0; i < n_nodes; ++i) {
+        if (vm_count[i] <= 0) continue;  // no incident elements -> leave zeros
+        const double inv = 1.0 / static_cast<double>(vm_count[i]);
+        const double sx = sx_accum[i] * inv;
+        const double sy = sy_accum[i] * inv;
+        const double sz = sz_accum[i] * inv;
+        const double txy = txy_accum[i] * inv;
+        const double tyz = tyz_accum[i] * inv;
+        const double txz = txz_accum[i] * inv;
+        res.stress_xx[i] = sx;
+        res.stress_yy[i] = sy;
+        res.stress_zz[i] = sz;
+        Eigen::Matrix3d T;
+        T << sx, txy, txz,
+             txy, sy, tyz,
+             txz, tyz, sz;
+        if (!T.allFinite()) continue;  // guard NaN/inf -> leave zeros
+        eig_solver.computeDirect(T);
+        if (eig_solver.info() != Eigen::Success) continue;
+        const Eigen::Vector3d ev = eig_solver.eigenvalues();  // ascending
+        const double p3 = ev(0), p1 = ev(2);
+        if (!std::isfinite(p1) || !std::isfinite(p3)) continue;
+        res.principal1[i] = p1;
+        res.principal3[i] = p3;
+        res.max_shear[i] = (p1 - p3) * 0.5;
+    }
 
     // Summary (max von Mises, max disp, min factor of safety clipped to [0,15]).
     double max_vm = 0.0, max_disp = 0.0;
@@ -211,6 +481,22 @@ FeaStaticResult fea_static_solve(const std::vector<double>& points, const std::v
     res.max_von_mises_mpa = max_vm;
     res.max_disp_mm = max_disp;
     res.min_fos = min_fos;
+
+    // Additive summary extrema over the per-node principal/shear arrays.
+    double max_p1 = 0.0, min_p3 = 0.0, max_sh = 0.0;
+    bool first_p1 = true, first_p3 = true;
+    for (int i = 0; i < n_nodes; ++i) {
+        if (vm_count[i] <= 0) continue;
+        const double p1 = res.principal1[i], p3 = res.principal3[i], sh = res.max_shear[i];
+        if (first_p1 || p1 > max_p1) { max_p1 = p1; first_p1 = false; }
+        if (first_p3 || p3 < min_p3) { min_p3 = p3; first_p3 = false; }
+        if (sh > max_sh) max_sh = sh;
+    }
+    res.max_principal_mpa = first_p1 ? 0.0 : max_p1;
+    res.min_principal_mpa = first_p3 ? 0.0 : min_p3;
+    res.max_shear_mpa = max_sh;
+    res.n_nodes = n_nodes;
+    res.n_elems = n_tets;
     res.ok = true;
     return res;
 }

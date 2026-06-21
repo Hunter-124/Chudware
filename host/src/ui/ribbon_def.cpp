@@ -136,6 +136,7 @@ static const RibbonCmd kCmds[] = {
     { "sim_new_static",    "Static Study",   "study_static",    "Simulation","Study",          true,  nullptr,          false },
     { "sim_new_modal",     "Modal Study",    "study_modal",     "Simulation","Study",          true,  nullptr,          false },
     { "sim_new_flow",      "Flow Study",     "study_flow",      "Simulation","Study",          true,  nullptr,          false },
+    { "sim_new_fatigue",   "Fatigue Study",  "results",         "Simulation","Study",          true,  nullptr,          false },
 
     // --- Group: Materials ---
     { "sim_material",      "Material",       "material",        "Simulation","Materials",      true,  nullptr,          false },

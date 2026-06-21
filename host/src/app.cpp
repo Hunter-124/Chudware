@@ -878,6 +878,33 @@ int run_gui(const char* screenshotPath) {
         ui::PropertyManager& propertyManager = *st.propertyManager;
         ui::SketchMode&      sketchMode      = *st.sketchMode;
         ui::EvaluateDialogs& evaluateDialogs = *st.evaluateDialogs;
+        // Simulation lockout: while the Simulation workspace is active the model is frozen — a study's
+        // fixtures/loads/results are tied to the current geometry, so changing the part's shape from
+        // under them is disallowed (SolidWorks freezes the model inside a study the same way). We block
+        // the feature/sketch/assembly/edit verbs but leave simulation (sim_*), inspection (eval_*) and
+        // view/camera commands free so the user can still measure, orient and set up the study. The
+        // toast tells them the one move that unlocks editing: leave the Simulation tab.
+        if (st.inSimulation()) {
+            std::string c(cmd_id);
+            auto pre = [&](const char* p) { return c.rfind(p, 0) == 0; };
+            const bool allowed =
+                pre("sim_") || pre("eval_") || pre("view_") || pre("zoom") || pre("cam_") ||
+                pre("display_") || pre("section") || pre("rollback") || pre("config_") ||
+                c == "toggle_units" || c == "make_drawing";
+            const bool modeling =
+                pre("sketch") || pre("sk_") || pre("smart_dim") || pre("extrude") || pre("revolve") ||
+                pre("fillet") || pre("chamfer") || pre("shell") || pre("draft") || pre("hole") ||
+                pre("sweep") || pre("loft") || pre("boss") || pre("cut") || pre("pattern") ||
+                pre("mirror") || pre("rib") || pre("dome") || pre("wrap") || pre("split") ||
+                pre("combine") || pre("scale") || pre("move") || pre("boolean") || pre("helix") ||
+                pre("ref_") || pre("datum") || pre("plane") || pre("axis") || pre("weld") ||
+                pre("sm_") || pre("asm_") || pre("edit_") || c == "new_assembly";
+            if (modeling && !allowed) {
+                st.toast(ui::ToastLevel::Info,
+                         "Model is locked in Simulation — leave the Simulation tab to edit it");
+                return;
+            }
+        }
         // C43: starting a sketch while a PM form is open cancels the form first (revert
         // preview + close). Without this, plane-pick and the PM coexisted: the PM hid the
         // FeatureManager, both fought over the viewport mouse, and Esc couldn't untangle it.
@@ -981,6 +1008,7 @@ int run_gui(const char* screenshotPath) {
     // Called on the GL thread (selection changes happen there); worker call is synchronous.
     st.selection.setObserver([&st]() {
         if (!st.docMirror.hasDoc() || !st.workerStarted) return;
+        bool simPickConsumed = false;  // a sim face pick was routed into a fixture/load well this pass
         for (auto& item : st.selection.mutableItems()) {
             if (!item.pending_resolve || !item.hit.valid()) continue;
             const char* kindStr =
@@ -1106,17 +1134,30 @@ int run_gui(const char* screenshotPath) {
                 // Simulation studies: route a FACE pick into the armed fixture/load well of the
                 // active study (only when the Simulation tab is up and no PM form owns picks — the
                 // mutual-exclusion guard lives in SimManager::wantsViewportFacePick).
-                if (st.simManager && st.simManager->wantsViewportFacePick(st) &&
-                    item.hit.kind == render::PickKind::Face) {
-                    try {
-                        nlohmann::json selObj = nlohmann::json::parse(sel);
-                        st.simManager->routeFacePick(st, selObj, item.hit.body_id, item.hit.topo_id);
-                    } catch (...) {}
+                if (st.simManager && st.simManager->wantsViewportFacePick(st)) {
+                    if (item.hit.kind == render::PickKind::Face) {
+                        try {
+                            nlohmann::json selObj = nlohmann::json::parse(sel);
+                            if (st.simManager->routeFacePick(st, selObj, item.hit.body_id,
+                                                             item.hit.topo_id))
+                                simPickConsumed = true;
+                        } catch (...) {}
+                    } else {
+                        // The click resolved to an edge/vertex while a fixture/load well is armed —
+                        // tell the user instead of silently dropping it.
+                        st.toast(ui::ToastLevel::Info,
+                                 "Fixtures and loads take faces — click a model face");
+                    }
                 }
             } else if (!err.empty()) {
                 // Log once (avoid flooding; resolvePick logs stale_revision internally).
             }
         }
+        // A routed sim face pick belongs to the fixture/load WELL (shown as the green/red face wash),
+        // not the global selection. Clear st.selection so sim picks never ACCUMULATE here and get
+        // scooped into the next well's capture (the fixture→force carryover). Safe here: we're past
+        // the iteration, and clear()'s re-entrant notify just re-runs this observer over an empty list.
+        if (simPickConsumed) st.selection.clear();
     });
 
     // C16: Doc mirror listener — re-draws the tree whenever a mutation lands.

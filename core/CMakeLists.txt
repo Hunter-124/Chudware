@@ -147,6 +147,16 @@ set_target_properties(test_sim PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME sim COMMAND test_sim)
 
+# Second-order (tet10) quadratic-tet FEA gate: node-ordering sanity + axial accuracy
+# + cantilever bending (tet10 relieves tet4 shear-locking). OCCT-/gmsh-free (inline
+# structured box meshes), so it links only aicad_sim like test_sim.
+add_executable(test_tet10 tests/test_tet10.cpp)
+target_include_directories(test_tet10 PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_tet10 PRIVATE aicad_sim)
+set_target_properties(test_tet10 PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME tet10 COMMAND test_tet10)
+
 # --- libaicad sketch (parameterization + constraints over the solver core) ---
 add_library(aicad_sketch STATIC
   sketch/sketch.cpp)
@@ -292,7 +302,7 @@ if(AICAD_WITH_OCCT)
   # target — it is the only sim source that needs the mesher, and adding it here
   # keeps the gmsh confinement intact (fea_run.h itself is gmsh-free). aicad_mesh
   # gains a PUBLIC dep on aicad_sim so fea_run.cpp can call the FEA solvers.
-  add_library(aicad_mesh STATIC sim/mesher.cpp sim/fea_run.cpp)
+  add_library(aicad_mesh STATIC sim/mesher.cpp sim/fea_run.cpp sim/fea_fatigue.cpp)
   target_include_directories(aicad_mesh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_include_directories(aicad_mesh PRIVATE ${GMSH_INCLUDE_DIR})
   # GMSH_DLL makes gmsh.h's GMSH_API decorate the prototypes __declspec(dllimport)
@@ -378,6 +388,48 @@ if(AICAD_WITH_OCCT)
     # toolkit DLLs are already staged by aicad_occt_copy_dlls (copy_directory of the
     # whole OCCT bin dir).
     TKRWMesh TKDEOBJ TKDEGLTF TKXCAF TKLCAF TKCDF TKBin TKBinL TKBinXCAF)
+
+  # sim/fea_fatigue.cpp (in aicad_mesh, defined above) calls fatigue_overlay from
+  # sim/overlay.cpp (in aicad_geom_occt). Wire that dep here — AFTER aicad_geom_occt
+  # exists — so the fatigue solver can package its display overlay. PRIVATE: only
+  # fea_fatigue.cpp's TU needs it; consumers of aicad_mesh link aicad_geom_occt on
+  # their own (the final aicad DLL already does).
+  target_link_libraries(aicad_mesh PRIVATE aicad_geom_occt)
+
+  # Fatigue solver smoke test: inline 6-tet cube under tension -> fea_run_fatigue.
+  # No STEP path -> no overlay, so it needs no OCCT DLL PATH munging, but it still
+  # links the OCCT-gated targets (this whole block is AICAD_WITH_OCCT-only).
+  add_executable(test_fatigue tests/test_fatigue.cpp)
+  target_include_directories(test_fatigue PRIVATE ${doctest_SOURCE_DIR})
+  target_link_libraries(test_fatigue PRIVATE aicad_mesh aicad_geom_occt)
+  set_target_properties(test_fatigue PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME fatigue COMMAND test_fatigue)
+  # gmsh + OCCT DLLs must be on PATH for the static solve (fea_run_static meshes only
+  # when a STEP path is present — the inline-mesh test does not — but aicad_mesh pulls
+  # the gmsh import lib, and aicad_geom_occt pulls OCCT, so stage both dirs to be safe).
+  set(_fatigue_envmod "PATH=path_list_prepend:${OCCT_DLL_DIR}")
+  foreach(_b ${OCCT_3RDPARTY_BINS})
+    list(APPEND _fatigue_envmod "PATH=path_list_prepend:${_b}")
+  endforeach()
+  if(GMSH_DLL)
+    get_filename_component(_gmsh_dll_dir "${GMSH_DLL}" DIRECTORY)
+    list(APPEND _fatigue_envmod "PATH=path_list_prepend:${_gmsh_dll_dir}")
+  endif()
+  set_tests_properties(fatigue PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
+
+  # FEA boundary-surface extractor: fea_surface_body (the result-plot display surface,
+  # so a bent beam renders curved). No STEP/mesher — builds structured tet meshes in
+  # code — but fea_surface_body lives in aicad_geom_occt, so it links + needs OCCT DLLs.
+  add_executable(test_overlay_surface tests/test_overlay_surface.cpp)
+  target_include_directories(test_overlay_surface PRIVATE
+    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_overlay_surface PRIVATE aicad_geom_occt)
+  set_target_properties(test_overlay_surface PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME overlay_surface COMMAND test_overlay_surface)
+  set_tests_properties(overlay_surface PROPERTIES
+    ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # Verification: tessellate -> write_aicm -> HOST render::parseAicm round-trip.
   add_executable(test_geom_aicm

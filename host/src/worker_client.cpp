@@ -169,7 +169,8 @@ bool cppSimFlag() {
 
 bool routeSimToCpp(const std::string& method, const json& /*params*/) {
     if (!cppSimFlag()) return false;
-    if (!(method == "sim_mesh" || method == "sim_run_static" || method == "sim_run_modal"))
+    if (!(method == "sim_mesh" || method == "sim_run_static" || method == "sim_run_modal" ||
+          method == "sim_run_fatigue"))
         return false;  // sim_run_flow (LBM) + sim_cancel + everything else stays Python
     if (!core::cpp_core().available()) {
         // Lazily try to load the core DLL; if it can't load, fall through to Python so

@@ -66,8 +66,12 @@ std::vector<double> faceset_sample(const json& points_node) {
 
 // Resolve the mesh: inline points/tets if present, else mesh the STEP file.
 // Returns true on success (fills points/tets), false with `err` set otherwise.
+// nodes_per_elem is set to 4 (tet4) or 10 (tet10): for an inline mesh it is taken
+// from study["nodes_per_elem"] (default 4); for a STEP mesh it follows the chosen
+// mesh_order (study["mesh_order"], default 1).
 bool resolve_mesh(const json& study, std::vector<double>& points, std::vector<int>& tets,
-                  std::string& err) {
+                  int& nodes_per_elem, std::string& err) {
+    nodes_per_elem = 4;
     if (study.contains("points") && study["points"].is_array() && study.contains("tets") &&
         study["tets"].is_array()) {
         points = json_doubles(study["points"]);
@@ -76,18 +80,27 @@ bool resolve_mesh(const json& study, std::vector<double>& points, std::vector<in
             err = "inline mesh has empty points/tets";
             return false;
         }
+        nodes_per_elem = study.value("nodes_per_elem", 4);
         return true;
     }
     if (study.contains("step_path") && study["step_path"].is_string()) {
         std::string step_path = study["step_path"].get<std::string>();
-        double density = study.value("density", 0.5);
-        MeshOut m = mesh_step(step_path, density);
+        MeshOptions opts;
+        opts.density = study.value("density", 0.5);
+        opts.order = study.value("mesh_order", study.value("order", 1));
+        opts.target_size_mm = study.value("target_size_mm", 0.0);
+        opts.min_size_mm = study.value("min_size_mm", 0.0);
+        opts.max_size_mm = study.value("max_size_mm", 0.0);
+        opts.optimize = study.value("optimize", false);
+        opts.algorithm3d = study.value("algorithm3d", 1);
+        MeshOut m = mesh_step(step_path, opts);
         if (!m.ok) {
             err = "mesh failed: " + m.error;
             return false;
         }
         points = m.points;
         tets = m.tets;
+        nodes_per_elem = m.nodes_per_elem;
         return true;
     }
     err = "study must have inline points/tets or a step_path";
@@ -130,8 +143,10 @@ std::vector<int> nodes_in_faceset(const std::vector<double>& points,
 nlohmann::json fea_run_static(const nlohmann::json& study) {
     std::vector<double> points;
     std::vector<int> tets;
+    int nodes_per_elem = 4;
     std::string err;
-    if (!resolve_mesh(study, points, tets, err)) return json{{"ok", false}, {"error", err}};
+    if (!resolve_mesh(study, points, tets, nodes_per_elem, err))
+        return json{{"ok", false}, {"error", err}};
 
     const int n_nodes = static_cast<int>(points.size() / 3);
     const int n_dof = n_nodes * 3;
@@ -181,9 +196,12 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
                 std::vector<double> node_force(static_cast<size_t>(n_nodes) * 3, 0.0);
                 double total_area = 0.0;
                 int face_count = 0;
-                const size_t m = tets.size() / 4;
+                // For tet10 the 4 CORNER nodes are still tet[0..3]; iterate with the
+                // element stride and read corners only for the surface-face combos.
+                const size_t stride = static_cast<size_t>(nodes_per_elem);
+                const size_t m = tets.size() / stride;
                 for (size_t e = 0; e < m; ++e) {
-                    const int* tet = &tets[e * 4];
+                    const int* tet = &tets[e * stride];
                     for (const auto& fc : face_combos) {
                         const int n0 = tet[fc[0]], n1 = tet[fc[1]], n2 = tet[fc[2]];
                         if (node_set.count(n0) && node_set.count(n1) && node_set.count(n2)) {
@@ -260,26 +278,80 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     std::sort(fixed_nodes.begin(), fixed_nodes.end());
 
     FeaStaticResult r = fea_static_solve(points, tets, E_mpa, nu, yield_mpa, fixed_nodes,
-                                         nodal_forces);
+                                         nodal_forces, nodes_per_elem);
     if (!r.ok) return json{{"ok", false}, {"error", r.error}};
+    if (nodes_per_elem == 10) notes.push_back("second-order (tet10) elements");
+
+    // ── Additive failure-criterion summary (Tresca / Rankine) ────────────────
+    // Computed from the per-node principal stresses the solver already produced;
+    // does NOT touch the existing summary keys.
+    //   tresca_i        = p1_i - p3_i           (max-shear-stress equivalent)
+    //   abs_principal_i = max(|p1_i|, |p3_i|)   (max-normal-stress / Rankine)
+    double max_tresca = 0.0, max_abs_principal = 0.0;
+    {
+        const size_t nn = std::min(r.principal1.size(), r.principal3.size());
+        for (size_t i = 0; i < nn; ++i) {
+            const double tr = r.principal1[i] - r.principal3[i];
+            const double ap =
+                std::max(std::abs(r.principal1[i]), std::abs(r.principal3[i]));
+            if (tr > max_tresca) max_tresca = tr;
+            if (ap > max_abs_principal) max_abs_principal = ap;
+        }
+    }
+    auto clamp_fos = [](double yld, double denom) -> double {
+        if (yld <= 0.0) return 15.0;  // no yield strength -> leave at max FoS
+        double f = yld / std::max(denom, 1e-9);
+        if (f < 0.0) f = 0.0;
+        if (f > 15.0) f = 15.0;
+        return f;
+    };
+    const double min_fos_tresca = clamp_fos(yield_mpa, max_tresca);
+    const double min_fos_rankine = clamp_fos(yield_mpa, max_abs_principal);
 
     return json{{"ok", true},
                 {"displacement", r.displacement},
                 {"disp_magnitude", r.disp_magnitude},
                 {"von_mises", r.von_mises},
+                // Additive stress fields (do not affect existing keys / parity).
+                {"principal1", r.principal1},
+                {"principal3", r.principal3},
+                {"max_shear", r.max_shear},
+                {"stress_xx", r.stress_xx},
+                {"stress_yy", r.stress_yy},
+                {"stress_zz", r.stress_zz},
                 {"n_dof", r.n_dof},
+                {"n_nodes", r.n_nodes},
+                {"n_elems", r.n_elems},
                 {"summary",
                  {{"max_von_mises_mpa", round_nd(r.max_von_mises_mpa, 4)},
                   {"max_disp_mm", round_nd(r.max_disp_mm, 6)},
-                  {"min_fos", round_nd(r.min_fos, 4)}}},
+                  {"min_fos", round_nd(r.min_fos, 4)},
+                  {"max_principal_mpa", round_nd(r.max_principal_mpa, 4)},
+                  {"min_principal_mpa", round_nd(r.min_principal_mpa, 4)},
+                  {"max_shear_mpa", round_nd(r.max_shear_mpa, 4)},
+                  // Additive failure-criterion summary (does not alter existing keys).
+                  {"min_fos_tresca", round_nd(min_fos_tresca, 4)},
+                  {"min_fos_rankine", round_nd(min_fos_rankine, 4)},
+                  {"max_tresca_mpa", round_nd(max_tresca, 4)},
+                  {"max_abs_principal_mpa", round_nd(max_abs_principal, 4)}}},
                 {"solver_notes", notes}};
 }
 
 nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     std::vector<double> points;
     std::vector<int> tets;
+    int nodes_per_elem = 4;
     std::string err;
-    if (!resolve_mesh(study, points, tets, err)) return json{{"ok", false}, {"error", err}};
+    std::vector<std::string> notes;
+    // Modal stays on 1st-order elements (the quadratic mass matrix is not implemented
+    // yet). Force order 1 regardless of mesh_order so the eigen-solve gets tet4.
+    json modal_study = study;
+    if (study.value("mesh_order", 1) == 2)
+        notes.push_back("modal uses 1st-order elements (mesh_order=2 ignored)");
+    modal_study["mesh_order"] = 1;
+    if (study.contains("nodes_per_elem")) modal_study["nodes_per_elem"] = 4;
+    if (!resolve_mesh(modal_study, points, tets, nodes_per_elem, err))
+        return json{{"ok", false}, {"error", err}};
 
     const json material = study.value("material", json::object());
     const double E_mpa = material.value("E_mpa", 0.0);
@@ -309,7 +381,8 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
                 {"mode_shapes", r.mode_shapes},
                 {"n_modes", r.n_modes},
                 {"n_nodes", r.n_nodes},
-                {"n_dof", r.n_dof}};
+                {"n_dof", r.n_dof},
+                {"solver_notes", notes}};
 }
 
 }  // namespace aicad::sim

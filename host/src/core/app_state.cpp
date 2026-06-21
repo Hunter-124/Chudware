@@ -522,14 +522,20 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool r
         pm.faces.reserve(b.faces.size());
         for (const auto& fr : b.faces)
             pm.faces.push_back({fr.face_id, fr.first_tri, fr.tri_count});
-        // First scalar field for this body (von Mises / |u| / thickness / …).
+        // Scalar field for this body. Prefer the user-selected result field by name
+        // (activeScalarField — von Mises / principal / shear / disp component / FoS …) so switching
+        // result fields is a cheap renderOnly re-load of the same overlay with no re-solve; fall back
+        // to the first scalar present when the named field isn't in this overlay.
+        const render::ScalarField* chosen = nullptr;
         for (const auto& sc : doc.scalars) {
-            if (sc.body_id == b.body_id && sc.values.size() == b.n_verts) {
-                pm.scalar = sc.values;
-                pm.scalarMin = sc.vmin;
-                pm.scalarMax = sc.vmax;
-                break;
-            }
+            if (sc.body_id != b.body_id || sc.values.size() != b.n_verts) continue;
+            if (sc.name == activeScalarField) { chosen = &sc; break; }
+            if (!chosen) chosen = &sc;
+        }
+        if (chosen) {
+            pm.scalar = chosen->values;
+            pm.scalarMin = chosen->vmin;
+            pm.scalarMax = chosen->vmax;
         }
         // First displacement field for this body (FEA deformed shape).
         for (const auto& df : doc.displacements) {

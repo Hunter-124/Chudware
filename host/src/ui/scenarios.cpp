@@ -610,7 +610,7 @@ void ScenarioRunner::tick(AppState& st) {
             case 1: {  // Static study + resolved fixture/load faces (-X end / +X end)
                 if (st.simManager) {
                     st.simManager->handleCommand(st, "sim_new_static");
-                    st.simManager->configureActive(st, 0.4f, "steel_1018");
+                    st.simManager->configureActive(st, 0.2f, "steel_1018");
                 }
                 auto faceAtExtremeX = [&](bool wantMax) -> nlohmann::json {
                     nlohmann::json best; double bestC = wantMax ? -1e30 : 1e30;

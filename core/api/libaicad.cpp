@@ -57,6 +57,7 @@
 #include "ecad/session.h"
 #include "geom/aicm.h"
 #include "geom/ecad_3d.h"
+#include "sim/fea_fatigue.h"
 #include "sim/fea_modal.h"
 #include "sim/fea_run.h"
 #include "sim/fea_static.h"
@@ -101,6 +102,21 @@ std::vector<double> flat_doubles(const json& j) {
             for (const auto& c : x) v.push_back(c.get<double>());
         } else {
             v.push_back(x.get<double>());
+        }
+    }
+    return v;
+}
+
+// Flatten a JSON int array (flat or nested) to a vector<int> — the tet-connectivity
+// shape the boundary-surface overlay needs (mirrors flat_doubles for ints).
+std::vector<int> flat_ints(const json& j) {
+    std::vector<int> v;
+    if (!j.is_array()) return v;
+    for (const auto& x : j) {
+        if (x.is_array()) {
+            for (const auto& c : x) v.push_back(c.get<int>());
+        } else {
+            v.push_back(x.get<int>());
         }
     }
     return v;
@@ -1010,7 +1026,8 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             aicad::sim::FeaStaticResult r = aicad::sim::fea_static_solve(
                 getd("points"), geti("tets"), params.value("E_mpa", 0.0),
                 params.value("nu", 0.0), params.value("yield_mpa", 250.0),
-                geti("fixed_nodes"), getd("nodal_forces"));
+                geti("fixed_nodes"), getd("nodal_forces"),
+                params.value("nodes_per_elem", 4));
             if (!r.ok) return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
             return emit(json{{"ok", true},
                              {"displacement", r.displacement},
@@ -1149,15 +1166,25 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                         : std::string();
             if (step_path.empty())
                 return emit_error("sim_mesh: 'step_path' (string) is required", out_json);
-            double density = params.value("density", 0.5);
-            aicad::sim::MeshOut r = aicad::sim::mesh_step(step_path, density);
+            aicad::sim::MeshOptions opts;
+            opts.density = params.value("density", 0.5);
+            opts.order = params.value("order", params.value("mesh_order", 1));
+            opts.target_size_mm = params.value("target_size_mm", 0.0);
+            opts.min_size_mm = params.value("min_size_mm", 0.0);
+            opts.max_size_mm = params.value("max_size_mm", 0.0);
+            opts.optimize = params.value("optimize", false);
+            opts.algorithm3d = params.value("algorithm3d", 1);
+            aicad::sim::MeshOut r = aicad::sim::mesh_step(step_path, opts);
             if (!r.ok) return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
             return emit(json{{"ok", true},
                              {"points", r.points},
                              {"tets", r.tets},
                              {"char_len_mm", r.char_len_mm},
                              {"n_nodes", r.n_nodes},
-                             {"n_elems", r.n_elems}},
+                             {"n_elems", r.n_elems},
+                             {"nodes_per_elem", r.nodes_per_elem},
+                             {"min_tet_volume_mm3", r.min_tet_volume_mm3},
+                             {"max_tet_edge_ratio", r.max_tet_edge_ratio}},
                         out_json, 0);
         }
         if (m == "sim_run_static") {
@@ -1177,26 +1204,58 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 const std::string step_path = study["step_path"].get<std::string>();
                 if (std::filesystem::exists(step_path) && res.contains("von_mises")) {
                     std::vector<double> vol = flat_doubles(study.value("points", json::array()));
+                    std::vector<int> tets;
+                    int npe = 4;
                     if (vol.empty()) {
                         // Inline points absent: re-mesh to recover the volume node coords
-                        // (the solve already meshed; this just re-derives the cloud — the
-                        // mesh is deterministic so node coords match the solved result).
-                        double density = study.value("density", 0.5);
-                        aicad::sim::MeshOut mo = aicad::sim::mesh_step(step_path, density);
-                        if (mo.ok) vol = mo.points;
+                        // AND the tet connectivity (the boundary-surface overlay needs the
+                        // tets). The mesh is deterministic so node coords + tets match the
+                        // solved result.
+                        aicad::sim::MeshOptions opts;
+                        opts.density = study.value("density", 0.5);
+                        opts.order = study.value("mesh_order", study.value("order", 1));
+                        opts.target_size_mm = study.value("target_size_mm", 0.0);
+                        opts.min_size_mm = study.value("min_size_mm", 0.0);
+                        opts.max_size_mm = study.value("max_size_mm", 0.0);
+                        opts.optimize = study.value("optimize", false);
+                        opts.algorithm3d = study.value("algorithm3d", 1);
+                        aicad::sim::MeshOut mo = aicad::sim::mesh_step(step_path, opts);
+                        if (mo.ok) {
+                            vol = mo.points;
+                            tets = mo.tets;
+                            npe = mo.nodes_per_elem;
+                        }
+                    } else {
+                        // Inline mesh: read the connectivity + element order off the study.
+                        tets = flat_ints(study.value("tets", json::array()));
+                        npe = study.value("nodes_per_elem",
+                                          study.value("mesh_order", 1) == 2 ? 10 : 4);
                     }
                     std::vector<double> vm = flat_doubles(res.value("von_mises", json::array()));
                     std::vector<double> dm = flat_doubles(res.value("disp_magnitude", json::array()));
                     std::vector<double> dv = flat_doubles(res.value("displacement", json::array()));
+                    std::vector<double> p1 = flat_doubles(res.value("principal1", json::array()));
+                    std::vector<double> p3 = flat_doubles(res.value("principal3", json::array()));
+                    std::vector<double> ms = flat_doubles(res.value("max_shear", json::array()));
                     double yield_mpa = 250.0;
                     if (study.contains("material") && study["material"].is_object())
                         yield_mpa = study["material"].value("yield_mpa", 250.0);
                     json summary = res.contains("summary") ? res["summary"] : json::object();
                     std::string ov =
-                        aicad::sim::static_overlay(step_path, vol, vm, dm, dv, yield_mpa, summary);
+                        aicad::sim::static_overlay(step_path, vol, tets, npe, vm, dm, dv,
+                                                   p1, p3, ms, yield_mpa, summary);
                     if (!ov.empty()) res["overlay_aicm"] = ov;
                 }
             }
+            return emit(std::move(res), out_json, 0);
+        }
+        if (m == "sim_run_fatigue") {
+            // High-cycle fatigue study (Goodman/Gerber/Soderberg + S-N life). Reuses
+            // the static stress field; reads study["fatigue"] for the method/load
+            // case + strength overrides. The overlay (when a STEP path is present) is
+            // packaged inside fea_run_fatigue and returned as "overlay_aicm".
+            const json& study = params.contains("study") ? params["study"] : json::object();
+            json res = aicad::sim::fea_run_fatigue(study);
             return emit(std::move(res), out_json, 0);
         }
         if (m == "sim_run_modal") {
@@ -1217,15 +1276,32 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                     res.contains("freqs_hz") && res["freqs_hz"].is_array() &&
                     !res["freqs_hz"].empty()) {
                     std::vector<double> vol = flat_doubles(study.value("points", json::array()));
+                    std::vector<int> tets;
+                    int npe = 4;  // modal is always order 1 (tet4)
                     if (vol.empty() && study.contains("step_path")) {
-                        // Inline points absent: re-mesh to get the volume node coords.
-                        double density = study.value("density", 0.5);
-                        aicad::sim::MeshOut mo = aicad::sim::mesh_step(step_path, density);
-                        if (mo.ok) vol = mo.points;
+                        // Inline points absent: re-mesh to get the volume node coords AND
+                        // the tet connectivity (the boundary-surface overlay needs them).
+                        aicad::sim::MeshOptions opts;
+                        opts.density = study.value("density", 0.5);
+                        opts.order = 1;
+                        opts.target_size_mm = study.value("target_size_mm", 0.0);
+                        opts.min_size_mm = study.value("min_size_mm", 0.0);
+                        opts.max_size_mm = study.value("max_size_mm", 0.0);
+                        opts.optimize = study.value("optimize", false);
+                        opts.algorithm3d = study.value("algorithm3d", 1);
+                        aicad::sim::MeshOut mo = aicad::sim::mesh_step(step_path, opts);
+                        if (mo.ok) {
+                            vol = mo.points;
+                            tets = mo.tets;
+                            npe = mo.nodes_per_elem;
+                        }
+                    } else {
+                        tets = flat_ints(study.value("tets", json::array()));
                     }
                     std::vector<double> mode0 = flat_doubles(res["mode_shapes"][0]);
                     double freq = res["freqs_hz"][0].get<double>();
-                    std::string ov = aicad::sim::modal_overlay(step_path, vol, mode0, freq);
+                    std::string ov =
+                        aicad::sim::modal_overlay(step_path, vol, tets, npe, mode0, freq);
                     if (!ov.empty()) res["overlay_aicm"] = ov;
                 }
             }
@@ -1277,13 +1353,19 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             //  displacement[n*3], yield_mpa?, summary?} -> {overlay_aicm}.
             const std::string step_path = params.value("step_path", std::string());
             std::vector<double> pts = flat_doubles(params.value("points", json::array()));
+            std::vector<int> tets = flat_ints(params.value("tets", json::array()));
+            int npe = params.value("nodes_per_elem", 4);
             std::vector<double> vm = flat_doubles(params.value("von_mises", json::array()));
             std::vector<double> dm = flat_doubles(params.value("disp_magnitude", json::array()));
             std::vector<double> dv = flat_doubles(params.value("displacement", json::array()));
+            std::vector<double> p1 = flat_doubles(params.value("principal1", json::array()));
+            std::vector<double> p3 = flat_doubles(params.value("principal3", json::array()));
+            std::vector<double> ms = flat_doubles(params.value("max_shear", json::array()));
             double yield_mpa = params.value("yield_mpa", 250.0);
             json summary = params.contains("summary") ? params["summary"] : json::object();
             std::string ov =
-                aicad::sim::static_overlay(step_path, pts, vm, dm, dv, yield_mpa, summary);
+                aicad::sim::static_overlay(step_path, pts, tets, npe, vm, dm, dv, p1, p3,
+                                           ms, yield_mpa, summary);
             if (ov.empty()) return emit_error("sim_static_overlay: overlay packaging failed", out_json);
             return emit(json{{"overlay_aicm", ov}}, out_json, 0);
         }
@@ -1292,9 +1374,12 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             // {step_path, points[n*3], mode_shape[n*3], freq_hz?} -> {overlay_aicm}.
             const std::string step_path = params.value("step_path", std::string());
             std::vector<double> pts = flat_doubles(params.value("points", json::array()));
+            std::vector<int> tets = flat_ints(params.value("tets", json::array()));
+            int npe = params.value("nodes_per_elem", 4);
             std::vector<double> shp = flat_doubles(params.value("mode_shape", json::array()));
             double freq_hz = params.value("freq_hz", 0.0);
-            std::string ov = aicad::sim::modal_overlay(step_path, pts, shp, freq_hz);
+            std::string ov =
+                aicad::sim::modal_overlay(step_path, pts, tets, npe, shp, freq_hz);
             if (ov.empty()) return emit_error("sim_modal_overlay: overlay packaging failed", out_json);
             return emit(json{{"overlay_aicm", ov}}, out_json, 0);
         }

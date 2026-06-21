@@ -255,6 +255,32 @@ void Overlays::drawFaceWash(const Renderer::CameraXform& cam,
     glBindVertexArray(0);
 }
 
+void Overlays::drawSegments(const Renderer::CameraXform& cam, const std::vector<float>& xyz,
+                            const float rgba[4], float lineWidth, bool overSurface) {
+    if (xyz.size() < 6 || !prog_) return;
+    if (!segVao_) { glGenVertexArrays(1, &segVao_); glGenBuffers(1, &segVbo_); }
+    glUseProgram(prog_);
+    glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, cam.mvp.m);
+    glUniform1i(glGetUniformLocation(prog_, "uClipCount"), clipCount_);
+    if (clipCount_ > 0) {
+        glUniform3fv(glGetUniformLocation(prog_, "uClipN"), clipCount_, clipNormals_[0]);
+        glUniform1fv(glGetUniformLocation(prog_, "uClipOff"), clipCount_, clipOffsets_);
+    }
+    glUniform4fv(glGetUniformLocation(prog_, "uColor"), 1, rgba);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    if (overSurface) glDepthRange(0.0, 0.999);  // bias over the shaded surface like edge highlights
+    glBindVertexArray(segVao_);
+    glBindBuffer(GL_ARRAY_BUFFER, segVbo_);
+    glBufferData(GL_ARRAY_BUFFER, xyz.size() * sizeof(float), xyz.data(), GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glLineWidth(lineWidth);
+    glDrawArrays(GL_LINES, 0, (int)(xyz.size() / 3));
+    if (overSurface) glDepthRange(0.0, 1.0);
+    glBindVertexArray(0);
+}
+
 void Overlays::draw(const Renderer::CameraXform& cam, const PickHit& hover,
                     const std::vector<PickHit>& sel) {
     if (!prog_) return;

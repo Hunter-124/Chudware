@@ -1161,6 +1161,50 @@ static void submitTurn(AppState& st, const std::string& text) {
 
     bool editMode = (st.aiInteraction == 1);
     bool askMode  = (st.aiInteraction == 2);
+
+    // CFD/sim intent: a flow-sim request on an open part routes to the simulation tool in ANY mode
+    // (the AI runs a wind-tunnel CFD and reports drag/lift). Mirrors Ask — async, fills the chat,
+    // never mutates geometry. Works fully offline (the core parses the flow condition itself).
+    auto looksLikeSim = [&]() -> bool {
+        if (!st.docMirror.hasDoc() || st.agentV2Running) return false;
+        std::string lo = text;
+        std::transform(lo.begin(), lo.end(), lo.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        auto has = [&](const char* k) { return lo.find(k) != std::string::npos; };
+        if (has("cfd") || has("wind tunnel") || has("windtunnel") || has("aerodynam") ||
+            has("drag") || has("downforce"))
+            return true;
+        return (has("simulate") || has("simulation") || has("flow") || has("lift")) &&
+               (has("air") || has("m/s") || has("mph") || has("km/h") || has("speed") ||
+                has("velocity") || has("wind"));
+    };
+    if (looksLikeSim()) {
+        st.addLog("[..] cfd: " + text);
+        st.status = "Running CFD...";  st.statusKind = 0;
+        nlohmann::json params = {{"doc_id", st.docMirror.docId()}, {"request", text}};
+        st.rpc.call("agent_simulate_v1", params, [&st](const core::RpcResult& r) {
+            ChatMsg* msg = nullptr;
+            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+                if (!it->fromUser && it->running) { msg = &*it; break; }
+            std::string err;
+            if (!r.ok) err = r.err.empty() ? "worker call failed" : r.err;
+            else if (r.result.is_object() && r.result.contains("code"))
+                err = r.result.value("message", std::string("worker error"));
+            if (msg) {
+                msg->running = false;
+                msg->liveStatus.clear();
+                if (!err.empty()) { msg->errKind = ERR_SYSTEM; msg->text = "The CFD sim failed: " + err; }
+                else {
+                    msg->text = r.result.value("answer", std::string());
+                    if (msg->text.empty()) msg->text = "(no result)";
+                }
+            }
+            st.status = err.empty() ? "Ready." : "CFD failed.";
+            st.statusKind = err.empty() ? 0 : 2;
+        }, 600000);
+        return;
+    }
+
     if (editMode && st.docMirror.hasDoc()) {
         // Edit part -> orchestrator v2 (validated document ops).
         st.addLog("[..] editing: " + text);

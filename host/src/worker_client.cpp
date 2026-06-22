@@ -146,7 +146,7 @@ bool routeAgentToCpp(const std::string& method, const json& params) {
     if (!cppAgentFlag()) return false;
     if (!(method == "agent_run_v2" || method == "agent_ask_v2" ||
           method == "agent_clarify_v1" || method == "agent_pm_assist_v1" ||
-          method == "get_prompts_v2"))
+          method == "agent_simulate_v1" || method == "get_prompts_v2"))
         return false;  // agent_design (legacy) + everything else stays Python
     if (!agentDocIsCpp(method, params)) return false;  // only C++-backed docs (or doc-indep)
     // Ensure the core DLL is loadable before committing to the C++ path. ensureLoaded is
@@ -449,6 +449,10 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
         } else if (method == "agent_list_models") {
             // {provider, base_url?, api_key?} -> {ok, models:[...]} (pass-through probe).
             ok = core::cpp_core().call("agent_list_models", params, cppResult, cerr);
+        } else if (method == "agent_simulate_v1") {
+            // {doc_id, request} -> {ok, answer, drag_n, lift_n, ...}: run a wind-tunnel CFD on the
+            // current geometry (pass-through; the core parses the flow condition + runs LBM).
+            ok = core::cpp_core().call("agent_simulate_v1", params, cppResult, cerr);
         }
         if (ok) {
             result = std::move(cppResult);

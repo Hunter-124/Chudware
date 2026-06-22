@@ -37,7 +37,22 @@ drag/lift/Cd. APPROACH (built): there was NO sim_run_flow + no voxelizer; added 
       running (bst9198ug).
   TODO host hookup (a Simulate action / chat-intent routing to agent_simulate_v1) — note for later.
 
-## WS3 — True assembly + part interfaces  [STATUS: not started]
+## WS3 — True assembly + part interfaces  [STATUS: CORE DONE — commit b9c3707b; host hooks remain]
+DONE: `run_assembly_design` (run.cpp) — plans, builds each part in its own child doc (run_design),
+doc_saves each to a .step+, creates an ASSEMBLY doc, inserts positioned fixed components
+(asm_insert_component, transform=placement). agent_run routes design path through it. VERIFIED:
+deterministic 2-part plumbing + full mock-driven flow (Base@[0,0,0] + Lid@[0,0,40] as components).
+REMAINING (host GUI — needs the running app + an open question to resolve):
+- [ ] 3c. Host opens the returned assembly doc as a tab. result carries {created_doc, assembly,
+      doc_id}. Wire jobs.cpp/app.cpp to store the new doc_id + open it (addDocTab(true) + DocMirror).
+      ⚠ OPEN QUESTION: the C++ core currently REJECTS opening assembly docs ("unsupported",
+      session.cpp ~5354) and the host routes assembly-open to the Python worker — so a C++-created
+      assembly (doc-cpp id) may not display without either (a) teaching the C++ core to open/rebuild
+      assemblies, or (b) routing the open through Python. Investigate before wiring.
+- [ ] 3d. Expose the CFD tool in the UI too: route chat requests mentioning cfd/wind-tunnel/drag to
+      agent_simulate_v1 (mirror Ask mode), or add a Simulate action. (host, low risk)
+- Control-surface interfaces: deferred (positioned components cover separable parts; hinged mates
+  would need asm_add_mate + a hinge-axis from the planner).
 Heaviest. Done when a multi-part request yields separate part docs assembled into an assembly doc
 with positioned components, opened in the app.
 - [ ] 3a. Map: doc_save (.step+ path), doc_new("assembly"), asm_insert_component via doc_apply_ops,

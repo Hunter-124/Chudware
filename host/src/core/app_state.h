@@ -226,6 +226,12 @@ struct JobState {
     // assembly .step+ rather than mutating the active doc. createdDocPath is that file (absolute);
     // the drain opens it as a NEW tab via the requestOpenPath pump (assembly opens route to Python).
     std::string createdDocPath;       // non-empty => open this file as a new tab on success
+    // W17: the agent answered a "make a drawing of this part" request by building a 2D drawing
+    // (a dwg-cpp registry id, NOT a doc_* doc). The drain opens it as a Drawing tab via
+    // adoptDrawingTab — the active part doc was NOT mutated (so the doc_rebuild is skipped).
+    std::string drawingDocId;         // non-empty => adopt this drawing as a new tab on success
+    std::string drawingName;          // display name for the drawing tab
+    std::string drawingSourceId;      // the source part doc the drawing projects from
     std::mutex evMtx;
     std::vector<AgentEvent> events;  // streamed agent progress, drained on the main thread
 };

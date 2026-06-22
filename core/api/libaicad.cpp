@@ -784,6 +784,56 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             std::string doc_id = params.value("doc_id", std::string());
             json options = params.contains("options") ? params["options"] : json::object();
 
+            // ---- W17 drawing-intent fast-path ----
+            // "make a drawing / blueprint of this part" doesn't need the modeler: build the 2D
+            // sheet directly from the current part (deterministic standard views + auto-dims +
+            // hole callouts + title block). No provider call -> works offline + shines on small
+            // local models. Only fires when the active doc already has geometry to project;
+            // otherwise we fall through to normal modeling (e.g. "draw a bracket" on an empty doc).
+            {
+                std::string lc;
+                lc.reserve(request.size());
+                for (char c : request) lc += (char)std::tolower((unsigned char)c);
+                bool wants_drawing = lc.find("blueprint") != std::string::npos ||
+                                     lc.find("drafting") != std::string::npos ||
+                                     lc.find("drawing") != std::string::npos;
+                if (wants_drawing && !doc_id.empty()) {
+                    json t = aicad::doc::doc_tree(doc_id);
+                    bool has_geom = t.is_object() && t.contains("tree") && t["tree"].is_object() &&
+                                    t["tree"].contains("features") && t["tree"]["features"].is_array() &&
+                                    !t["tree"]["features"].empty();
+                    if (has_geom) {
+                        std::string part_name = t["tree"].value("name", std::string());
+                        json spec = {{"views", json::array({"front", "top", "right", "iso"})},
+                                     {"model_items", true}, {"hole_callouts", true}};
+                        if (!part_name.empty()) spec["title"] = json{{"title", part_name}};
+                        json dr;
+                        try {
+                            dr = aicad::doc::drawing_make(doc_id, spec);
+                        } catch (const aicad::doc::OpError& oe) {
+                            return emit(json{{"ok", false}, {"error", oe.what()}}, out_json, 0);
+                        }
+                        json events = json::array();
+                        events.push_back(json{{"kind", "run_started"}, {"request", request},
+                                              {"doc_id", doc_id}});
+                        events.push_back(json{{"kind", "run_finished"}, {"status", "done"},
+                                              {"stop_reason", "drawing"}});
+                        return emit(json{
+                                        {"status", "done"}, {"stop_reason", "drawing"},
+                                        {"run_id", options.value("run_id", std::string("drawing"))},
+                                        {"revision", t.value("revision", 0)}, {"doc_id", doc_id},
+                                        {"created_drawing", true},
+                                        {"drawing_doc_id", dr.value("doc_id", std::string())},
+                                        {"drawing_name", part_name.empty()
+                                                             ? std::string("Drawing")
+                                                             : part_name + " - Drawing"},
+                                        {"source_doc_id", doc_id}, {"events", events},
+                                        {"engaged", "drawing"}},
+                                    out_json, 0);
+                    }
+                }
+            }
+
             // ---- provider resolution ----
             json provider;
             const bool explicit_provider = params.contains("provider") &&

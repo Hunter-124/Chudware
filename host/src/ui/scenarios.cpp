@@ -1265,6 +1265,21 @@ void ScenarioRunner::runDrawing(AppState& st) {
                 }
                 std::fflush(stdout);
             }
+            // In-app copilot trigger: a chat "make an engineering drawing of this part" is
+            // intercepted by the agent fast-path (no provider needed) and builds a drawing.
+            {
+                nlohmann::json r6;
+                bool ok6 = st.worker.call(
+                    "agent_run_v2",
+                    {{"request", "make an engineering drawing of this part"},
+                     {"doc_id", tab.sourceDocId}},
+                    r6, err);
+                bool made = ok6 && r6.is_object() && r6.value("created_drawing", false);
+                std::printf("drawing: agent fast-path created_drawing=%d doc=%s %s\n", (int)made,
+                            made ? r6.value("drawing_doc_id", std::string()).c_str() : "-",
+                            made ? "PASS" : "CHECK");
+                std::fflush(stdout);
+            }
             dwgCapture = dwgSavePath + "\\drawing_01_detailed.png"; dwgSettle = kSettle; ++dwgStep;
             break;
         }

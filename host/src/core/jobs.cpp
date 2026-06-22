@@ -173,6 +173,13 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
             // drain opens it as a new tab (via requestOpenPath). Only on a clean assembly.
             if (result.value("created_doc", false) && result.value("status", "") == "done")
                 job.createdDocPath = result.value("asm_path", std::string());
+            // W17: the run answered a drawing request by building a 2D drawing (its own dwg-cpp
+            // id). The drain adopts it as a Drawing tab; the active part doc was untouched.
+            if (result.value("created_drawing", false) && result.value("status", "") == "done") {
+                job.drawingDocId = result.value("drawing_doc_id", std::string());
+                job.drawingName = result.value("drawing_name", std::string());
+                job.drawingSourceId = result.value("source_doc_id", std::string());
+            }
         }
         job.ready = true;
         job.running = false;

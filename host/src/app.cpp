@@ -1689,9 +1689,17 @@ int run_gui(const char* screenshotPath) {
                 st.requestOpenPath = st.job.createdDocPath;
                 st.addLog("[v2] assembly built -> opening as new tab: " + st.job.createdDocPath);
             }
+            // W17: the run built a 2D drawing — adopt it as a Drawing tab (the active part was
+            // NOT mutated, so we skip the doc_rebuild below).
+            const bool madeDrawing = wasV2 && !st.job.drawingDocId.empty() && st.job.error.empty();
+            if (madeDrawing) {
+                st.adoptDrawingTab(st.job.drawingDocId, st.job.drawingName, st.job.drawingSourceId);
+                st.addLog("[v2] drawing built -> opened drawing tab " + st.job.drawingDocId);
+                st.job.drawingDocId.clear();
+            }
             if (st.agentV2Running) {
                 st.agentV2Running = false;
-                if (!openedNewDoc && st.docMirror.hasDoc() && st.job.error.empty()) {
+                if (!openedNewDoc && !madeDrawing && st.docMirror.hasDoc() && st.job.error.empty()) {
                     // C39: doc_rebuild can take tens of seconds on a heavy doc — the old sync
                     // call froze the window right after the agent finished. Queue it async;
                     // the callback (a later frame's drain, GL thread) resyncs and reloads.

@@ -10,7 +10,10 @@ Work out three things (plus, for multi-part designs, an assembly LAYOUT):
    in the shared assembly space so the parts FIT TOGETHER and DO NOT overlap or stack at the origin
    (e.g. wings out along +Y/-Y from the fuselage, tail at the rear -X). Set top-level "assembly":true
    when the parts are genuinely separate components; false for a single body or a welded/multibody
-   whole. A single-part design omits placement.
+   whole. A single-part design omits placement. `rot` (Euler degrees, applied X then Y then Z)
+   ORIENTS a part in place — use it to deflect a control surface about its hinge axis (e.g. an
+   aileron rot:[0,0,-15] for 15° down) so the assembled model shows the real configuration a CFD
+   run will see, or to angle a tail/winglet.
 2. DIMENSIONS - commit to CONCRETE values for every key dimension. Honor every number in the spec;
    derive the rest from function and proportion, preferring round, manufacturable values. Anchors:
    M2/M3/M4 clearance holes r=1.1/1.7/2.2; wall thickness 2-3 for small enclosures (1.5 min);

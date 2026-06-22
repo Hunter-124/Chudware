@@ -2,6 +2,7 @@
 #include "agent/run.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <optional>
@@ -765,7 +766,7 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                                     {"part_count", static_cast<int>(parts.size())}});
 
     // 2) Build each part in its OWN child doc (full run_design), then save it to a .step+ file.
-    struct SavedPart { std::string path, name; double pos[3]; };
+    struct SavedPart { std::string path, name; double pos[3]; double rot[3]; };
     std::vector<SavedPart> saved;
     int idx = 0;
     for (const auto& p : parts) {
@@ -785,12 +786,21 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                 if (!feats.empty()) feats += "; ";
                 feats += py_scalar_str(f);
             }
+        // Placement: position (mm) + rotation (Euler degrees about X, then Y, then Z). Rotation
+        // lets a control surface be assembled DEFLECTED (e.g. an aileron rotated about its hinge
+        // axis) so a downstream CFD run sees the deflected configuration — the planner emits
+        // placement.rot per part. A missing rot is no rotation (identity), the common case.
         double pos[3] = {0, 0, 0};
-        if (p.contains("placement") && p["placement"].is_object() &&
-            p["placement"].contains("pos") && p["placement"]["pos"].is_array() &&
-            p["placement"]["pos"].size() >= 3)
-            for (int k = 0; k < 3; ++k)
-                if (p["placement"]["pos"][k].is_number()) pos[k] = p["placement"]["pos"][k].get<double>();
+        double rot[3] = {0, 0, 0};
+        if (p.contains("placement") && p["placement"].is_object()) {
+            const json& pl = p["placement"];
+            if (pl.contains("pos") && pl["pos"].is_array() && pl["pos"].size() >= 3)
+                for (int k = 0; k < 3; ++k)
+                    if (pl["pos"][k].is_number()) pos[k] = pl["pos"][k].get<double>();
+            if (pl.contains("rot") && pl["rot"].is_array() && pl["rot"].size() >= 3)
+                for (int k = 0; k < 3; ++k)
+                    if (pl["rot"][k].is_number()) rot[k] = pl["rot"][k].get<double>();
+        }
 
         events.emit("part_started", json{{"index", idx},
                                          {"total", static_cast<int>(parts.size())},
@@ -819,6 +829,7 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
             sp.path = std::filesystem::absolute(path).string();
             sp.name = name;
             sp.pos[0] = pos[0]; sp.pos[1] = pos[1]; sp.pos[2] = pos[2];
+            sp.rot[0] = rot[0]; sp.rot[1] = rot[1]; sp.rot[2] = rot[2];
             saved.push_back(sp);
         } catch (...) {
         }
@@ -847,12 +858,26 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
         return json{{"run_id", run_id}, {"status", "failed"}, {"stop_reason", "assembly_doc_failed"},
                     {"revision", 0}, {"doc_id", doc_id}};
     }
+    // 4x4 row-major component transform = R(rot)·... + translation. Rotation is Euler degrees
+    // applied X then Y then Z (R = Rz·Ry·Rx), matching the placement.rot the planner emits.
+    auto placement_transform = [](const double pos[3], const double rot[3]) {
+        const double d2r = 3.14159265358979323846 / 180.0;
+        double cx = std::cos(rot[0] * d2r), sx = std::sin(rot[0] * d2r);
+        double cy = std::cos(rot[1] * d2r), sy = std::sin(rot[1] * d2r);
+        double cz = std::cos(rot[2] * d2r), sz = std::sin(rot[2] * d2r);
+        // R = Rz * Ry * Rx (row-major 3x3).
+        double r00 = cz * cy, r01 = cz * sy * sx - sz * cx, r02 = cz * sy * cx + sz * sx;
+        double r10 = sz * cy, r11 = sz * sy * sx + cz * cx, r12 = sz * sy * cx - cz * sx;
+        double r20 = -sy,     r21 = cy * sx,                r22 = cy * cx;
+        return json{r00, r01, r02, pos[0],
+                    r10, r11, r12, pos[1],
+                    r20, r21, r22, pos[2],
+                    0,   0,   0,   1};
+    };
     json comp_ops = json::array();
     for (size_t k = 0; k < saved.size(); ++k) {
         const SavedPart& sp = saved[k];
-        // 4x4 row-major transform = identity + translation (placement).
-        json transform = {1, 0, 0, sp.pos[0], 0, 1, 0, sp.pos[1],
-                          0, 0, 1, sp.pos[2], 0, 0, 0, 1};
+        json transform = placement_transform(sp.pos, sp.rot);
         comp_ops.push_back(json{{"op", "asm_insert_component"},
                                 {"source", {{"path", sp.path}}},
                                 {"name", sp.name},

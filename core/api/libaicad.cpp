@@ -819,7 +819,9 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 result = aicad::agent::run_micro_design(request, doc_id, provider, cb, options);
             } else {
                 aicad::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
-                result = aicad::agent::run_design(request, doc_id, provider, cb, options);
+                // run_assembly_design plans first: a true multi-part assembly builds each part in
+                // its own doc + assembles; a single part delegates to run_design unchanged.
+                result = aicad::agent::run_assembly_design(request, doc_id, provider, cb, options);
             }
             result["events"] = *captured;
             result["engaged"] = micro ? "micro" : "design";  // diagnostic: which profile ran

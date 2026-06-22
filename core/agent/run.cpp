@@ -726,5 +726,162 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
                 {"doc_id", state.doc_id}};
 }
 
+json run_assembly_design(const std::string& request, const std::string& doc_id,
+                         const json& provider_cfg, EmitFn emit, const json& options) {
+    std::string prompts_dir = options.value("prompts_dir", std::string());
+    std::string run_id = options.value("run_id", std::string());
+    if (run_id.empty())
+        run_id = "asm-" + std::to_string(static_cast<unsigned long long>(
+                              std::chrono::steady_clock::now().time_since_epoch().count()));
+
+    // 1) Plan the request to learn the parts + whether it's an assembly. One intake + one planner
+    //    call (cheap relative to a full build); the per-part run_design re-plans its own part.
+    ProviderFn provider = make_provider(provider_cfg);
+    const int budget = call_budget_for(provider_cfg);
+    DesignState pstate;
+    pstate.request = request;
+    pstate.doc_id = doc_id;
+    {
+        AgentCall ia = agent_call(provider, pstate, "intake", prompts_dir, budget, false);
+        ojson spec = extract_json_obj(ia.reply);
+        if (!spec.is_null()) pstate.spec = spec;
+    }
+    AgentCall pa = agent_call(provider, pstate, "planner", prompts_dir, budget, false);
+    ojson plan = extract_json_obj(pa.reply);
+    bool want_asm = !plan.is_null() && plan.is_object() && truthy_json(plan.value("assembly", ojson(false)));
+    ojson parts = (!plan.is_null() && plan.is_object() && plan.contains("parts") &&
+                   plan["parts"].is_array())
+                      ? plan["parts"]
+                      : ojson::array();
+
+    // Not an assembly (or <2 parts): the existing single-doc multibody path is correct.
+    if (!want_asm || parts.size() < 2)
+        return run_design(request, doc_id, provider_cfg, emit, options);
+
+    RunEvents events(run_id, emit);
+    events.emit("run_started", json{{"request", request},
+                                    {"doc_id", doc_id},
+                                    {"assembly", true},
+                                    {"part_count", static_cast<int>(parts.size())}});
+
+    // 2) Build each part in its OWN child doc (full run_design), then save it to a .step+ file.
+    struct SavedPart { std::string path, name; double pos[3]; };
+    std::vector<SavedPart> saved;
+    int idx = 0;
+    for (const auto& p : parts) {
+        std::string name = (p.contains("name") && p["name"].is_string())
+                               ? p["name"].get<std::string>() : ("part" + std::to_string(idx + 1));
+        std::string purpose = (p.contains("purpose") && p["purpose"].is_string())
+                                  ? p["purpose"].get<std::string>() : "";
+        std::string dim_s;
+        if (p.contains("dimensions") && p["dimensions"].is_object())
+            for (auto it = p["dimensions"].begin(); it != p["dimensions"].end(); ++it) {
+                if (!dim_s.empty()) dim_s += ", ";
+                dim_s += it.key() + "=" + py_scalar_str(it.value());
+            }
+        std::string feats;
+        if (p.contains("features") && p["features"].is_array())
+            for (const auto& f : p["features"]) {
+                if (!feats.empty()) feats += "; ";
+                feats += py_scalar_str(f);
+            }
+        double pos[3] = {0, 0, 0};
+        if (p.contains("placement") && p["placement"].is_object() &&
+            p["placement"].contains("pos") && p["placement"]["pos"].is_array() &&
+            p["placement"]["pos"].size() >= 3)
+            for (int k = 0; k < 3; ++k)
+                if (p["placement"]["pos"][k].is_number()) pos[k] = p["placement"]["pos"][k].get<double>();
+
+        events.emit("part_started", json{{"index", idx},
+                                         {"total", static_cast<int>(parts.size())},
+                                         {"name", name}});
+
+        std::string part_req = "Build ONLY this single standalone part, centered at the origin (it "
+                               "will be positioned in an assembly afterward). Part: '" + name +
+                               "' — " + purpose + ". Dimensions: " + dim_s +
+                               ". Features: " + feats;
+        std::string child;
+        try {
+            json nd = doc::doc_new("part", name);
+            child = nd.value("doc_id", std::string());
+        } catch (...) {
+        }
+        if (child.empty()) { ++idx; continue; }
+
+        json sub_opts = options;
+        sub_opts["run_id"] = run_id + "-p" + std::to_string(idx);
+        run_design(part_req, child, provider_cfg, emit, sub_opts);
+
+        std::filesystem::path path = run_dir(run_id) / ("part_" + std::to_string(idx) + ".step+");
+        try {
+            doc::doc_save(child, path.string());
+            SavedPart sp;
+            sp.path = std::filesystem::absolute(path).string();
+            sp.name = name;
+            sp.pos[0] = pos[0]; sp.pos[1] = pos[1]; sp.pos[2] = pos[2];
+            saved.push_back(sp);
+        } catch (...) {
+        }
+        ++idx;
+    }
+
+    if (saved.empty()) {
+        events.emit("run_finished", json{{"status", "failed"},
+                                         {"stop_reason", "no_parts_built"}, {"revision", 0}});
+        return json{{"run_id", run_id}, {"status", "failed"}, {"stop_reason", "no_parts_built"},
+                    {"revision", 0}, {"doc_id", doc_id}};
+    }
+
+    // 3) Create the assembly doc and insert each saved part as a positioned, fixed component.
+    std::string asm_name = (!plan.is_null() && plan.contains("name") && plan["name"].is_string())
+                               ? plan["name"].get<std::string>() : "Assembly";
+    std::string asm_id;
+    try {
+        json nd = doc::doc_new("assembly", asm_name);
+        asm_id = nd.value("doc_id", std::string());
+    } catch (...) {
+    }
+    if (asm_id.empty()) {
+        events.emit("run_finished", json{{"status", "failed"},
+                                         {"stop_reason", "assembly_doc_failed"}, {"revision", 0}});
+        return json{{"run_id", run_id}, {"status", "failed"}, {"stop_reason", "assembly_doc_failed"},
+                    {"revision", 0}, {"doc_id", doc_id}};
+    }
+    json comp_ops = json::array();
+    for (size_t k = 0; k < saved.size(); ++k) {
+        const SavedPart& sp = saved[k];
+        // 4x4 row-major transform = identity + translation (placement).
+        json transform = {1, 0, 0, sp.pos[0], 0, 1, 0, sp.pos[1],
+                          0, 0, 1, sp.pos[2], 0, 0, 0, 1};
+        comp_ops.push_back(json{{"op", "asm_insert_component"},
+                                {"source", {{"path", sp.path}}},
+                                {"name", sp.name},
+                                {"transform", transform},
+                                {"fixed", k == 0}});
+    }
+    int asm_rev = 0;
+    try {
+        json before = doc::doc_tree(asm_id);
+        json resp = doc::doc_apply_ops(asm_id, before.value("revision", 0), comp_ops, false);
+        asm_rev = resp.value("revision", 0);
+        doc::doc_save(asm_id, (run_dir(run_id) / (asm_name + ".step+")).string());
+    } catch (const std::exception& e) {
+        events.emit("run_finished", json{{"status", "failed"},
+                                         {"stop_reason", std::string("assemble_failed: ") + e.what()},
+                                         {"revision", 0}});
+        return json{{"run_id", run_id}, {"status", "failed"},
+                    {"stop_reason", "assemble_failed"}, {"revision", 0}, {"doc_id", asm_id},
+                    {"created_doc", true}, {"assembly", true}};
+    }
+
+    events.emit("run_finished", json{{"status", "done"},
+                                     {"stop_reason", "assembled"},
+                                     {"revision", asm_rev},
+                                     {"components", static_cast<int>(saved.size())}});
+    return json{{"run_id", run_id}, {"status", "done"}, {"stop_reason", "assembled"},
+                {"revision", asm_rev}, {"doc_id", asm_id}, {"created_doc", true},
+                {"assembly", true}, {"components", static_cast<int>(saved.size())}};
+}
+
 }  // namespace agent
 }  // namespace aicad

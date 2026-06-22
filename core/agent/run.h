@@ -52,5 +52,15 @@ using EmitFn = std::function<void(const json&)>;
 json run_design(const std::string& request, const std::string& doc_id, const json& provider_cfg,
                 EmitFn emit = nullptr, const json& options = json::object());
 
+// run_assembly_design — multi-part TRUE assembly. Plans the request; if the plan is a single part
+// (or assembly:false) it delegates to run_design on `doc_id` (unchanged behavior). Otherwise it
+// builds each part in its OWN child doc (run_design per part), saves each to a .step+ file under
+// run_dir, creates an ASSEMBLY doc, and inserts each part as a positioned component (transform from
+// the planner's placement; no constraint mates). Returns the run result for the ASSEMBLY doc with
+// {created_doc:true, assembly:true, doc_id:<asm>} so the host can open it as a new tab.
+json run_assembly_design(const std::string& request, const std::string& doc_id,
+                         const json& provider_cfg, EmitFn emit = nullptr,
+                         const json& options = json::object());
+
 }  // namespace agent
 }  // namespace aicad

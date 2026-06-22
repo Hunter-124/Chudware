@@ -168,6 +168,11 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
             // the GL thread calls docMirror.open() or resync (C22b: see app.cpp drain).
             job.converged = (result.value("status", "") == "done");
             job.stopReason = result.value("stop_reason", "");
+            // WS3 true-assembly: the run created a SEPARATE assembly document saved to its own
+            // .step+ (it did not mutate the active doc). Carry the absolute path so the GL-thread
+            // drain opens it as a new tab (via requestOpenPath). Only on a clean assembly.
+            if (result.value("created_doc", false) && result.value("status", "") == "done")
+                job.createdDocPath = result.value("asm_path", std::string());
         }
         job.ready = true;
         job.running = false;

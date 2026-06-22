@@ -1679,9 +1679,19 @@ int run_gui(const char* screenshotPath) {
             // The worker already rebuilt the doc; call doc_rebuild to refresh the tree and
             // get the latest aicm_path, then load it into the viewport.
             const bool wasV2 = st.agentV2Running;
+            // WS3: a true-assembly run produced a NEW assembly document (its own .step+) rather
+            // than mutating the active doc. Open that file as a fresh tab via the GL-thread open
+            // pump — featureTreeOpenPath detects the aicad.asm schema and routes the open to the
+            // Python worker (the C++ core rejects opening assemblies by design). The active part
+            // doc was untouched, so we skip the doc_rebuild-on-current-doc below for this case.
+            const bool openedNewDoc = wasV2 && !st.job.createdDocPath.empty() && st.job.error.empty();
+            if (openedNewDoc) {
+                st.requestOpenPath = st.job.createdDocPath;
+                st.addLog("[v2] assembly built -> opening as new tab: " + st.job.createdDocPath);
+            }
             if (st.agentV2Running) {
                 st.agentV2Running = false;
-                if (st.docMirror.hasDoc() && st.job.error.empty()) {
+                if (!openedNewDoc && st.docMirror.hasDoc() && st.job.error.empty()) {
                     // C39: doc_rebuild can take tens of seconds on a heavy doc — the old sync
                     // call froze the window right after the agent finished. Queue it async;
                     // the callback (a later frame's drain, GL thread) resyncs and reloads.
@@ -1824,9 +1834,15 @@ int run_gui(const char* screenshotPath) {
                 if (st.job.converged) {
                     st.status = "Done";
                     st.statusKind = 0;
-                    assistant = "Done - I built this as parametric features; see the FeatureManager "
-                                "tree and the viewport. Switch to \"Edit part\" to ask for changes, "
-                                "or edit any feature directly (double-click / right-click it).";
+                    if (openedNewDoc)
+                        assistant = "Done - I built each part as its own editable document and "
+                                    "assembled them with positioned components. The assembly is "
+                                    "opening in a new tab; each component is a separate part you "
+                                    "can edit. Ask for a tweak and I'll revise.";
+                    else
+                        assistant = "Done - I built this as parametric features; see the FeatureManager "
+                                    "tree and the viewport. Switch to \"Edit part\" to ask for changes, "
+                                    "or edit any feature directly (double-click / right-click it).";
                 } else {
                     st.status = "Stopped early";
                     st.statusKind = 1;

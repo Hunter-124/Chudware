@@ -37,7 +37,18 @@ drag/lift/Cd. APPROACH (built): there was NO sim_run_flow + no voxelizer; added 
       running (bst9198ug).
   TODO host hookup (a Simulate action / chat-intent routing to agent_simulate_v1) — note for later.
 
-## WS3 — True assembly + part interfaces  [STATUS: CORE DONE — commit b9c3707b; host hooks remain]
+## WS3 — True assembly + part interfaces  [STATUS: DONE — core b9c3707b + host display wired]
+HOST DISPLAY NOW WIRED: run_assembly_design returns the saved assembly's absolute `asm_path`;
+launchAgentRunV2 (jobs.cpp) captures it into job.createdDocPath; the app.cpp v2-drain sets
+st.requestOpenPath so the existing GL-thread open pump (featureTreeOpenPath -> docMirror.open ->
+worker) opens it as a NEW tab — and since the C++ core rejects assembly opens with code
+"unsupported", the worker routes that open to Python (the proven File>Open/asm-scenario path),
+so the C++-created assembly displays. The active part doc is left untouched (drain skips its
+rebuild for this case). VERIFIED headlessly (tools/asm_open_verify.py): the saved file is a valid
+aicad.asm/1 with 2 components referencing the part .step+ files, AND C++ doc_open returns
+"unsupported" (the route-to-Python trigger). The only un-headless-testable bit is the ImGui tab
+itself rendering — it rides the existing File>Open path.
+
 DONE: `run_assembly_design` (run.cpp) — plans, builds each part in its own child doc (run_design),
 doc_saves each to a .step+, creates an ASSEMBLY doc, inserts positioned fixed components
 (asm_insert_component, transform=placement). agent_run routes design path through it. VERIFIED:

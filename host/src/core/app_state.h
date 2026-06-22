@@ -222,6 +222,10 @@ struct JobState {
     FitReport fit;                    // final fit report (assemblies)
     bool converged = true;            // design loop ended by matching the request (not the cap)
     std::string stopReason;           // confirmed | stabilized | failed | no_code | max_iters
+    // WS3: a true-assembly design run builds the parts in their own docs and saves a fresh
+    // assembly .step+ rather than mutating the active doc. createdDocPath is that file (absolute);
+    // the drain opens it as a NEW tab via the requestOpenPath pump (assembly opens route to Python).
+    std::string createdDocPath;       // non-empty => open this file as a new tab on success
     std::mutex evMtx;
     std::vector<AgentEvent> events;  // streamed agent progress, drained on the main thread
 };

@@ -860,11 +860,18 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                                 {"fixed", k == 0}});
     }
     int asm_rev = 0;
+    // Absolute path the host opens to display the assembly. The C++ core REJECTS opening
+    // assembly docs (doc_open "unsupported" by schema), so the host routes this file open to
+    // the Python worker — exactly the File>Open / Explorer-double-click path. Components are
+    // referenced by absolute .step+ paths (saved above under the same run_dir), so the loaded
+    // assembly resolves its parts regardless of the host's cwd.
+    std::string asm_path =
+        std::filesystem::absolute(run_dir(run_id) / (asm_name + ".step+")).string();
     try {
         json before = doc::doc_tree(asm_id);
         json resp = doc::doc_apply_ops(asm_id, before.value("revision", 0), comp_ops, false);
         asm_rev = resp.value("revision", 0);
-        doc::doc_save(asm_id, (run_dir(run_id) / (asm_name + ".step+")).string());
+        doc::doc_save(asm_id, asm_path);
     } catch (const std::exception& e) {
         events.emit("run_finished", json{{"status", "failed"},
                                          {"stop_reason", std::string("assemble_failed: ") + e.what()},
@@ -880,7 +887,8 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                                      {"components", static_cast<int>(saved.size())}});
     return json{{"run_id", run_id}, {"status", "done"}, {"stop_reason", "assembled"},
                 {"revision", asm_rev}, {"doc_id", asm_id}, {"created_doc", true},
-                {"assembly", true}, {"components", static_cast<int>(saved.size())}};
+                {"assembly", true}, {"asm_path", asm_path},
+                {"components", static_cast<int>(saved.size())}};
 }
 
 }  // namespace agent

@@ -41,15 +41,27 @@ static void loadPrompts(AppState& st) {
         st.addLog("[err] get_prompts_v2: " + err);
         return;
     }
-    auto& recs = result.value("prompts", nlohmann::json::array());
+    // get_prompts_v2 returns a BARE JSON array of prompt records; tolerate a legacy
+    // {"prompts":[...]} envelope too. Calling value("prompts",...) on a bare array would
+    // throw type_error.306, and a present-but-null string field would throw 302 — either
+    // crashes the Settings > Agents tab. Read every field defensively.
+    auto str = [](const nlohmann::json& j, const char* k) -> std::string {
+        auto it = j.find(k);
+        return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string();
+    };
+    const nlohmann::json* recs = &result;
+    if (result.is_object() && result.contains("prompts") && result["prompts"].is_array())
+        recs = &result["prompts"];
     s_promptRecs.clear();
-    for (auto& r : recs) {
+    if (!recs->is_array()) { s_promptsLoaded = true; return; }
+    for (auto& r : *recs) {
+        if (!r.is_object()) continue;
         PromptRecord pr;
-        pr.role         = r.value("role", "");
-        pr.builtinPath  = r.value("path", "");
-        pr.overridePath = r.value("override_path", "");
+        pr.role         = str(r, "role");
+        pr.builtinPath  = str(r, "path");
+        pr.overridePath = str(r, "override_path");
         pr.overridden   = r.value("overridden", false);
-        std::string text = r.value("text", "");
+        std::string text = str(r, "text");
         pr.builtinLen = (int)text.size();
         // fill buf with the resolved text (override or built-in)
         std::fill(pr.buf.begin(), pr.buf.end(), 0);

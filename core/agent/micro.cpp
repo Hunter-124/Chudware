@@ -438,7 +438,12 @@ bool should_engage(const json& provider_cfg, const json& cfg) {
     if (name == "mock" || name == "mock-roles") {
         is_local = true;
     } else if (name == "openai" || name == "llamacpp") {
-        std::string base_url = provider_cfg.value("base_url", std::string());
+        // base_url may be present-but-NULL (openai with no override) — value() would throw
+        // type_error.302 on a null, so read it null-safely.
+        std::string base_url = provider_cfg.contains("base_url") &&
+                                       provider_cfg["base_url"].is_string()
+                                   ? provider_cfg["base_url"].get<std::string>()
+                                   : std::string();
         is_local = host_is_loopback(base_url);
     }
     if (!is_local) return false;

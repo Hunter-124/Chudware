@@ -464,8 +464,19 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
             err = cppResult.value("message", std::string("cpp-agent error"));
             return true;
         }
-        // Hard failure (DLL throw / load race): do NOT hard-break the agent — fall through
-        // to the Python worker path below so the in-app AI keeps working.
+        // Hard failure (a C++ throw, not a structured {code} envelope). The v2 agent RPCs
+        // (agent_run_v2 / ask / clarify / pm_assist / simulate) are C++-ONLY — the Python
+        // worker deleted them (engine/worker.py: "MIGRATED TO THE C++ CORE"), so falling
+        // through to it would ALWAYS return the misleading "unknown method: agent_run_v2"
+        // and bury the real cause (e.g. a provider/config error). Surface the actual C++
+        // error instead. (agent_list_models is the one exception: it has a host-side static
+        // catalog fallback, so we let it fall through and degrade gracefully.)
+        if (method != "agent_list_models") {
+            err = cerr.empty() ? ("cpp-agent (" + method + ") failed") : cerr;
+            if (errorSink_) errorSink_(method, err);
+            return false;
+        }
+        // else: fall through to the Python worker path below (list_models tolerates failure).
     }
     // C++ SIM (FEA) routing (opt-in via AI_CAD_CPP_SIM, default OFF). Run the FEA mesh /
     // static / modal RPCs in-process against libaicad. The host already sends the C++

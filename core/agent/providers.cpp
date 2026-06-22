@@ -25,6 +25,17 @@ json image_part(const std::string& path) { return json{{"type", "image"}, {"path
 json user_message(const json& parts) { return json{{"role", "user"}, {"content", parts}}; }
 
 // --------------------------------------------------------------------------- helpers
+// Read a string field tolerating a present-but-NULL value. nlohmann's value(key,default)
+// throws type_error.302 when the key EXISTS but is null (it only returns the default when
+// the key is ABSENT). The resolved provider descriptor sets api_key/base_url to null on
+// purpose (e.g. gemini has base_url:null; llamacpp/local has api_key:null), so value() here
+// would throw -> the run aborts and the host masks it as "unknown method: agent_run_v2".
+std::string str_or(const json& cfg, const char* key, const std::string& dflt = std::string()) {
+    auto it = cfg.find(key);
+    if (it == cfg.end() || !it->is_string()) return dflt;
+    return it->get<std::string>();
+}
+
 std::string read_file_bytes(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot open file: " + path);
@@ -403,11 +414,11 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         return res;
     }
 
-    std::string api_key = cfg.value("api_key", std::string());
-    std::string base_url = cfg.value("base_url", std::string());
+    std::string api_key = str_or(cfg, "api_key");
+    std::string base_url = str_or(cfg, "base_url");
 
     if (provider == "anthropic") {
-        std::string model = cfg.value("model", std::string(kAnthropicDefaultModel));
+        std::string model = str_or(cfg, "model", std::string(kAnthropicDefaultModel));
         BuiltRequest req = anthropic_build_request(model, system, messages, max_tokens);
         for (auto& h : req.headers)
             if (h.first == "x-api-key") h.second = api_key;
@@ -429,7 +440,7 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
     if (provider == "openai" || provider == "llamacpp") {
         std::string def = (provider == "llamacpp") ? std::string("local-gguf")
                                                     : std::string(kOpenAIDefaultModel);
-        std::string model = cfg.value("model", def);
+        std::string model = str_or(cfg, "model", def);
         BuiltRequest req = openai_build_request(model, system, messages, max_tokens, base_url);
         for (auto& h : req.headers)
             if (h.first == "Authorization")
@@ -458,8 +469,8 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
     }
 
     if (provider == "gemini") {
-        std::string model = cfg.value("model", std::string(kGeminiDefaultModel));
-        std::string effort = cfg.value("reasoning_effort", std::string());
+        std::string model = str_or(cfg, "model", std::string(kGeminiDefaultModel));
+        std::string effort = str_or(cfg, "reasoning_effort");
         BuiltRequest req = gemini_build_request(model, system, messages, max_tokens, effort);
         for (auto& h : req.headers)
             if (h.first == "x-goog-api-key") h.second = api_key;

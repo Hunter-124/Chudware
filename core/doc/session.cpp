@@ -436,6 +436,15 @@ void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen
     json& sk = require_sketch_feature(doc, op, id_map);
     json ent = op.at("entity");
 
+    // Leniency for weak local models: a spline's points sometimes arrive DOUBLE-WRAPPED as
+    // [[[x,y],[x,y],...]] (one extra array level). Unwrap that single wrapping so the curve
+    // builds instead of failing validation. Only fires on the exact double-wrap shape.
+    if (ent.value("type", std::string()) == "spline" && ent.contains("points") &&
+        ent["points"].is_array() && ent["points"].size() == 1 && ent["points"][0].is_array() &&
+        !ent["points"][0].empty() && ent["points"][0][0].is_array()) {
+        ent["points"] = ent["points"][0];
+    }
+
     // AIRFOIL convenience entity: {type:"airfoil", naca:"2412"|dat:"<path>", chord, aoa,
     // points, closedTE} expands to the upper-spline + lower-spline (+ a trailing-edge line for
     // an open TE) — one closed aerofoil loop the agent can extrude/loft. Standard splines from

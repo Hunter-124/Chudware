@@ -953,9 +953,16 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
     }
 
     // ---- finish ----
-    std::string status = applied_ok > 0 ? "done" : "failed";
-    std::string stop_reason = status == "done" ? "completed" : "all_steps_failed";
+    // Honest status: "done" requires that real geometry actually exists. A step that returned an
+    // empty ops array counts toward applied_ok but builds nothing, so applied_ok>0 alone is not
+    // enough — a weak local model can "pass" empty steps and leave an empty doc. Require a solid.
     int revision = rev_now();
+    LiveDoc final_doc = read_live(doc_id);
+    bool has_solid = final_doc.body_count > 0;
+    std::string status = (applied_ok > 0 && has_solid) ? "done" : "failed";
+    std::string stop_reason = (status == "done")
+                                  ? "completed"
+                                  : (has_solid ? "all_steps_failed" : "no_geometry_built");
     events.emit("run_finished", json{{"status", status}, {"stop_reason", stop_reason},
                                      {"revision", revision}, {"steps_applied", applied_ok},
                                      {"steps_total", n}});

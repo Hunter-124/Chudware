@@ -62,8 +62,17 @@ REMAINING (host GUI — needs the running app + an open question to resolve):
       assemblies, or (b) routing the open through Python. Investigate before wiring.
 - [ ] 3d. Expose the CFD tool in the UI too: route chat requests mentioning cfd/wind-tunnel/drag to
       agent_simulate_v1 (mirror Ask mode), or add a Simulate action. (host, low risk)
-- Control-surface interfaces: deferred (positioned components cover separable parts; hinged mates
-  would need asm_add_mate + a hinge-axis from the planner).
+- Control-surface DEFLECTION now works (commit f6a7c03d): run_assembly_design honors the planner's
+  placement.rot (Euler deg, R=Rz*Ry*Rx) so an aileron/elevator/rudder is assembled at its real
+  deflection angle — exactly the configuration a downstream CFD run sees. Verified headlessly
+  (tools/asm_rotation_verify.py: a 90 deg yaw swaps a bar's world X/Y extents). This covers the
+  "flight control surfaces" goal for the design->assemble->CFD workflow.
+- LIVE draggable hinge MATES still deferred (interactive articulation only; NOT needed for the CFD
+  workflow): the hinge mate type + solver exist and pass tests (core/tests/test_mate.cpp peg-in-hole
+  = 1 DOF), but mate refs resolve only from geometric picks (cylindrical face / circular edge — see
+  assembly.cpp selector_to_mategeom; no datum-axis kind), so the parts would need matching hinge
+  geometry (pin+bore) AND the planner would need to emit hinge metadata. A capable-model + interactive
+  task, not safe to auto-emit (risks dangling mate refs).
 Heaviest. Done when a multi-part request yields separate part docs assembled into an assembly doc
 with positioned components, opened in the app.
 - [ ] 3a. Map: doc_save (.step+ path), doc_new("assembly"), asm_insert_component via doc_apply_ops,

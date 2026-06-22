@@ -830,6 +830,9 @@ void ScenarioRunner::tick(AppState& st) {
 
     // ---------- multi-document scenario (AI_CAD_SHOT=multidoc) ----------
     runMultidoc(st);
+
+    // ---------- W17 engineering-drawing scenario (AI_CAD_SHOT=drawing) ----------
+    runDrawing(st);
 }
 
 // Multi-document mid-edit verification (AI_CAD_SHOT=multidoc). Same frame-driven step machine +
@@ -1112,6 +1115,166 @@ void ScenarioRunner::runMultidoc(AppState& st) {
     }
 }
 
+// W17 engineering-drawing scenario (AI_CAD_SHOT=drawing). Build a plate with a through hole, Make
+// Drawing (standard views), then exercise the new detailing engine: Model Items auto-dimensioning,
+// a smart hole callout, a critical ±toleranced dimension, and the title block — with the contextual
+// View Layout / Annotation ribbon visible. One capture (drawing_01_detailed.png).
+void ScenarioRunner::runDrawing(AppState& st) {
+    if (!(st.wantDrawing && st.workerStarted && !st.drawingShotDone && st.frame >= 5)) return;
+    if (!dwgDirReady) {
+        dwgDirReady = true;
+        const char* repo = std::getenv("AI_CAD_REPO");
+        std::string base = repo ? std::string(repo) : std::string(".");
+        dwgSavePath = base + "\\scratch\\drawing_shots";
+        std::error_code ec; std::filesystem::create_directories(dwgSavePath, ec);
+    }
+    auto vid_of = [](const nlohmann::json& v) -> std::string {
+        std::string id = v.value("view_id", std::string());
+        return id.empty() ? v.value("id", std::string()) : id;
+    };
+    const int kSettle = 5;
+    if (dwgSettle > 0) { --dwgSettle; return; }
+    if (!dwgCapture.empty()) return;
+    std::string err;
+    switch (dwgStep) {
+        case 0: {  // new part + plate (80x50x12) with a central through hole (-> a circle in top view)
+            if (!st.docMirror.newPart(st.worker, err)) {
+                std::printf("drawing: new_part FAILED: %s\n", err.c_str()); std::fflush(stdout);
+                st.drawingShotDone = true; break;
+            }
+            st.addDocTab(false);
+            nlohmann::json ops = nlohmann::json::array();
+            ops.push_back({{"op","add_feature"},{"feature",{
+                {"type","box"},{"name","Plate"},{"params",{
+                    {"length",{{"value",80.0},{"expr",nullptr}}},
+                    {"width", {{"value",50.0},{"expr",nullptr}}},
+                    {"height",{{"value",12.0},{"expr",nullptr}}},
+                    {"centered",true}}}}}});
+            ops.push_back({{"op","add_feature"},{"feature",{
+                {"type","cylinder"},{"name","Hole"},{"params",{
+                    {"radius",{{"value",6.0},{"expr",nullptr}}},
+                    {"height",{{"value",16.0},{"expr",nullptr}}},
+                    {"centered",true},{"mode","cut"}}}}}});
+            auto r = st.docMirror.applyOps(st.worker, ops);
+            if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+            std::printf("drawing: plate+hole ok=%d rev=%d\n", (int)r.ok, r.revision);
+            std::fflush(stdout);
+            dwgSettle = kSettle; ++dwgStep; break;
+        }
+        case 1: {  // Make Drawing -> standard views; ribbon swaps to the drawing tabs
+            st.makeDrawing();
+            std::printf("drawing: makeDrawing activeTab=%d isDrawing=%d\n",
+                        st.activeTab, (int)st.activeTabIsDrawing());
+            std::fflush(stdout);
+            dwgSettle = kSettle; ++dwgStep; break;
+        }
+        case 2: {  // Detailing: model items + hole callout + critical toleranced dim + title block
+            if (!st.activeTabIsDrawing()) {
+                std::printf("drawing: NO drawing tab after makeDrawing\n"); std::fflush(stdout);
+                st.drawingShotDone = true; break;
+            }
+            AppState::DocTab& tab = st.docTabs[st.activeTab];
+            // Find a view with a closed projected circle (the hole in the top view).
+            std::string circVid; double cx = 0, cy = 0; bool haveCirc = false;
+            if (tab.drawingDoc.contains("sheets") && tab.drawingDoc["sheets"].is_array() &&
+                !tab.drawingDoc["sheets"].empty()) {
+                for (const auto& v : tab.drawingDoc["sheets"][0].value("views",
+                                                                       nlohmann::json::array())) {
+                    for (const auto& a : v.value("arcs", nlohmann::json::array()))
+                        if (a.value("closed", false) && a.contains("center") &&
+                            a["center"].is_array() && a["center"].size() == 2) {
+                            circVid = vid_of(v);
+                            cx = a["center"][0].get<double>(); cy = a["center"][1].get<double>();
+                            haveCirc = true; break;
+                        }
+                    if (haveCirc) break;
+                }
+            }
+            std::string mvid = circVid;
+            if (mvid.empty() && tab.drawingDoc.contains("sheets")) {
+                const auto& vs = tab.drawingDoc["sheets"][0].value("views", nlohmann::json::array());
+                if (vs.is_array() && !vs.empty()) mvid = vid_of(vs[0]);
+            }
+            nlohmann::json res;
+            if (!mvid.empty())
+                st.worker.call("drawing_model_items",
+                               {{"doc_id", tab.drawingDocId}, {"view_id", mvid}}, res, err);
+            if (haveCirc) {
+                nlohmann::json r2;
+                st.worker.call("drawing_add_callout",
+                               {{"doc_id", tab.drawingDocId}, {"view_id", circVid}, {"kind", "hole"},
+                                {"a", nlohmann::json::array({cx, cy})}}, r2, err);
+            }
+            nlohmann::json r3;
+            st.worker.call("drawing_set_titleblock",
+                           {{"doc_id", tab.drawingDocId}, {"sheet_id", "s1"},
+                            {"fields", {{"title", "PLATE"}, {"drawn_by", "AI-CAD"},
+                                        {"material", "AL 6061"}, {"scale", "1:1"}, {"rev", "A"}}}},
+                           r3, err);
+            st.refreshDrawingTab(st.activeTab);
+            // Make the first linear dim a critical +/-0.1 tolerance.
+            std::string tvid, tann;
+            if (tab.drawingDoc.contains("sheets"))
+                for (const auto& v : tab.drawingDoc["sheets"][0].value("views",
+                                                                       nlohmann::json::array())) {
+                    for (const auto& a : v.value("annotations", nlohmann::json::array()))
+                        if (a.value("type", std::string()) == "linear_dim") {
+                            tvid = vid_of(v); tann = a.value("id", std::string()); break;
+                        }
+                    if (!tann.empty()) break;
+                }
+            if (!tann.empty()) {
+                nlohmann::json r4;
+                st.worker.call("drawing_set_annotation",
+                               {{"doc_id", tab.drawingDocId}, {"view_id", tvid}, {"ann_id", tann},
+                                {"tol_type", "symmetric"}, {"tol_upper", 0.1}, {"precision", 2},
+                                {"critical", true}}, r4, err);
+            }
+            st.refreshDrawingTab(st.activeTab);
+            tab.drawNeedFit = true;
+            int nann = 0;
+            if (tab.drawingDoc.contains("sheets"))
+                for (const auto& v : tab.drawingDoc["sheets"][0].value("views",
+                                                                       nlohmann::json::array()))
+                    nann += (int)v.value("annotations", nlohmann::json::array()).size();
+            std::printf("drawing: detail done circle=%d critical_dim=%s annotations=%d\n",
+                        (int)haveCirc, tann.empty() ? "none" : tann.c_str(), nann);
+            std::fflush(stdout);
+            // Copilot one-shot path: agent_make_drawing builds a complete drawing (views +
+            // auto-dims + hole callouts + title block) from the source part in a single call.
+            {
+                nlohmann::json r5;
+                nlohmann::json spec = {
+                    {"views", nlohmann::json::array({"front", "top", "right", "iso"})},
+                    {"model_items", true}, {"hole_callouts", true},
+                    {"title", {{"title", "COPILOT"}, {"material", "STEEL"}, {"rev", "A"}}}};
+                if (st.worker.call("drawing_make",
+                                   {{"source_doc_id", tab.sourceDocId}, {"spec", spec}}, r5, err) &&
+                    r5.is_object() && !r5.contains("code")) {
+                    int v5 = 0, a5 = 0;
+                    if (r5.contains("drawing") && r5["drawing"].contains("sheets") &&
+                        r5["drawing"]["sheets"].is_array() && !r5["drawing"]["sheets"].empty())
+                        for (const auto& v : r5["drawing"]["sheets"][0].value("views",
+                                                                        nlohmann::json::array())) {
+                            ++v5; a5 += (int)v.value("annotations", nlohmann::json::array()).size();
+                        }
+                    std::printf("drawing: drawing_make one-shot views=%d annotations=%d %s\n",
+                                v5, a5, (v5 >= 3 && a5 > 0) ? "PASS" : "CHECK");
+                } else {
+                    std::printf("drawing: drawing_make FAILED: %s\n", err.c_str());
+                }
+                std::fflush(stdout);
+            }
+            dwgCapture = dwgSavePath + "\\drawing_01_detailed.png"; dwgSettle = kSettle; ++dwgStep;
+            break;
+        }
+        default:
+            st.drawingShotDone = true;
+            std::printf("drawing: scenario complete\n"); std::fflush(stdout);
+            break;
+    }
+}
+
 ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int dh,
                                                      const char* screenshotPath) {
     // C17 M1 scenario: per-step captures. When the step machine set m1Capture, write the
@@ -1193,6 +1356,20 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         }
         glfwSwapBuffers(st.win);
         return FrameAction::Continue;
+    }
+
+    // W17 drawing scenario: per-step capture (one shot), wait for the sync RPCs to settle.
+    if (st.wantDrawing) {
+        ++st.frame;
+        if (!dwgCapture.empty() && !st.rpc.busy()) {
+            std::error_code ec; std::filesystem::create_directories(dwgSavePath, ec);
+            writeBackbufferPng(dwgCapture.c_str(), dw, dh, screenshotPath);
+            std::printf("drawing screenshot -> %s (%dx%d)\n", dwgCapture.c_str(), dw, dh);
+            std::fflush(stdout);
+            dwgCapture.clear();
+        }
+        glfwSwapBuffers(st.win);
+        return st.drawingShotDone ? FrameAction::Break : FrameAction::Continue;
     }
     if (st.wantEvalMass) {
         ++st.frame;

@@ -508,6 +508,23 @@ struct AppState {
         std::string detailViewId;               // parent view the detail circle is anchored to
         float       detailCx = 0, detailCy = 0; // detail circle center (sheet mm)
 
+        // ---- W17: detailing tools (drawing tabs) — all mutually exclusive with the above ----
+        // One-shot / single-click tools the new Annotation ribbon arms. modelItems auto-dimensions
+        // the clicked view; holeCallout/centerMark snap to a circle; balloon drops an item bubble;
+        // note places a text note; centerLine is a 2-click construction line. drawingHandleCommand()
+        // arms them; the 2D panel consumes the clicks (mirrors the dim/section/detail tool stages).
+        bool        modelItemsActive = false;   // armed: click a view -> auto-dimension it
+        bool        holeCalloutActive = false;  // armed: click a circle -> "n× ⌀d" callout
+        bool        centerMarkActive = false;   // armed: click a circle -> center mark
+        bool        noteActive = false;         // armed: click -> place a note
+        bool        balloonActive = false;      // armed: click -> item-number balloon
+        int         balloonNext = 1;            // next balloon item number (auto-increments)
+        bool        centerLineActive = false;   // armed: 2 clicks -> center line
+        int         centerLineStage = 0;        // 0=pick a, 1=pick b
+        float       centerLineAx = 0, centerLineAy = 0;  // center-line start (sheet mm)
+        // Title-block / sheet-properties editor popup (opened from the ribbon).
+        bool        titleBlockOpen = false;     // request to open the title-block editor this frame
+
         // ---- Schematic / PCB tabs only (kind == Schematic || PCB) ----
         // An ECAD tab is backed by a SEPARATE worker registry (ecad_* RPCs), not the DocMirror.
         // ecadDocId is the worker ecad doc id; ecadRevision is the optimistic-concurrency base.
@@ -828,6 +845,9 @@ struct AppState {
         RT_Features   = 0, RT_Sketch     = 1, RT_Evaluate   = 2, RT_Simulation = 3,
         RT_Assembly   = 4, RT_SheetMetal = 5, RT_Weldments  = 6, RT_PCB        = 7,
         RT_Surfaces   = 8,
+        // W17 drawing overhaul: contextual tabs shown ONLY while a Drawing doc is active
+        // (they replace the mechanical tabs, SolidWorks-style). See ribbon_tabVisible().
+        RT_ViewLayout = 9, RT_Annotation = 10,
     };
     bool showRibbon = true;        // View > Ribbon visibility toggle
     int  ribbonTab  = RT_Features; // active ribbon tab (one of RibbonTab); contextual on the doc
@@ -885,6 +905,8 @@ struct AppState {
     bool feaShotDone = false;   // guard so the fea scenario runs exactly once
     bool wantFlow = false;      // AI_CAD_SHOT=flow scripted external-flow (wind-tunnel) study scenario
     bool flowShotDone = false;  // guard so the flow scenario runs exactly once
+    bool wantDrawing = false;   // W17: AI_CAD_SHOT=drawing scripted engineering-drawing scenario
+    bool drawingShotDone = false;  // guard so the drawing scenario runs exactly once
     bool wantEvalMass = false;  // C19: AI_CAD_SHOT=evalmass mass-properties window
     bool evalMassShotDone = false;
 

@@ -39,10 +39,17 @@ static std::unordered_map<std::string, std::string> s_LastUsed;
 static std::string s_flyoutOpenReq;
 
 static const char* kRibbonTabs[] = {"Features", "Sketch", "Evaluate", "Simulation", "Assembly",
-                                    "Sheet Metal", "Weldments", "PCB", "Surfaces"};
-static constexpr int kRibbonTabCount = 9;  // mechanical tabs + Wave N "PCB" + "Surfaces" (surfacing features)
+                                    "Sheet Metal", "Weldments", "PCB", "Surfaces",
+                                    "View Layout", "Annotation"};
+static constexpr int kRibbonTabCount = 11;  // + W17 contextual "View Layout"/"Annotation" (drawings)
 
-static bool ribbon_tabVisible(int tab, bool showSimulationTools, bool showPcbTools) {
+// W17: in a Drawing doc the ribbon swaps to the two contextual drawing tabs ONLY (the
+// mechanical/sim/pcb tabs are 3D-doc context and would do nothing on a sheet). Outside a
+// drawing the two drawing tabs stay hidden.
+static bool ribbon_tabVisible(int tab, bool showSimulationTools, bool showPcbTools,
+                              bool showDrawingTools) {
+    if (showDrawingTools) return tab == 9 || tab == 10;  // View Layout, Annotation
+    if (tab == 9 || tab == 10) return false;
     if (tab == 3) return showSimulationTools;
     if (tab == 7) return showPcbTools;
     return true;
@@ -889,12 +896,20 @@ void setRibbonSketchActive(bool active) {
 }
 
 float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool showPcbTools,
-                 float titleBarH) {
+                 float titleBarH, bool showDrawingTools) {
     if (!visible) return 0.0f;
     ribbon_seedDefaults();
     if (activeTab < 0 || activeTab >= kRibbonTabCount ||
-        !ribbon_tabVisible(activeTab, showSimulationTools, showPcbTools))
+        !ribbon_tabVisible(activeTab, showSimulationTools, showPcbTools, showDrawingTools)) {
+        // Land on the first visible tab — in drawing mode tab 0 is hidden, so pick the
+        // first drawing tab; on a 3D doc fall back to Features.
         activeTab = 0;
+        for (int i = 0; i < kRibbonTabCount; ++i)
+            if (ribbon_tabVisible(i, showSimulationTools, showPcbTools, showDrawingTools)) {
+                activeTab = i;
+                break;
+            }
+    }
 
     float s      = ui::uiScale;
     float tabH   = kTabH  * s;
@@ -939,7 +954,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     float tabY = wPos.y + tabTopPad;
 
     for (int i = 0; i < kRibbonTabCount; ++i) {
-        if (!ribbon_tabVisible(i, showSimulationTools, showPcbTools)) continue;
+        if (!ribbon_tabVisible(i, showSimulationTools, showPcbTools, showDrawingTools)) continue;
         const char* tabLabel = kRibbonTabs[i];
         ImVec2 tsize  = ImGui::CalcTextSize(tabLabel);
         float  tw     = tsize.x + 22.0f * s;

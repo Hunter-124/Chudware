@@ -32,8 +32,10 @@ void setRibbonSketchActive(bool active);
 // directly under it. Pass <0 to fall back to ImGui::GetFrameHeight() — but note that fallback uses
 // the default frame padding, which underestimates the title bar (it is drawn with a taller padding)
 // and would tuck the ribbon up under the menu bar, clipping the tab strip into the top edge.
+// showDrawingTools (W17): true while the active doc is a Drawing — swaps the ribbon to the
+// contextual "View Layout" + "Annotation" tabs and hides the mechanical/sim/pcb tabs.
 float drawRibbon(int& activeTab, bool visible, bool showSimulationTools = true,
-                 bool showPcbTools = true, float titleBarH = -1.0f);
+                 bool showPcbTools = true, float titleBarH = -1.0f, bool showDrawingTools = false);
 
 // Returns the ribbon height in pixels for layout math.
 float ribbonHeight();

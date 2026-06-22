@@ -323,6 +323,40 @@ static const RibbonCmd kCmds[] = {
     { "surf_delete_face",   "Delete Face",    "subtract",        "Surfaces", "Edit",   false, nullptr, false },
     { "surf_replace_face",  "Replace Face",   "wrap",            "Surfaces", "Edit",   false, nullptr, false },
 
+    // =========================================================================
+    // W17 DRAWING OVERHAUL — two contextual tabs shown ONLY in a Drawing doc
+    // (ribbon_tabVisible swaps to these when activeTabIsDrawing()). cmd_ids are
+    // dispatched in app.cpp -> ui::drawingHandleCommand(). Icons reuse existing
+    // atlas glyphs (gui_lint --rule icons must stay clean).
+    // =========================================================================
+
+    // --- Tab: View Layout ---------------------------------------------------
+    { "dwg_view_model",   "Model View",    "part",          "View Layout", "Views", true,  nullptr, false },
+    { "dwg_view_proj",    "Projected",     "orientation",   "View Layout", "Views", true,  nullptr, false },
+    { "dwg_view_std3",    "Standard 3",    "view_cube",     "View Layout", "Views", true,  nullptr, false },
+    { "dwg_view_section", "Section",       "section_view",  "View Layout", "Views", true,  nullptr, false },
+    { "dwg_view_detail",  "Detail",        "zoom_area",     "View Layout", "Views", true,  nullptr, false },
+    // --- Group: Sheet --- sheet-level + output actions (were inline buttons).
+    { "dwg_sheet_props",  "Sheet Props",   "settings",      "View Layout", "Sheet", true,  nullptr, false },
+    { "dwg_rebuild",      "Rebuild",       "refresh",       "View Layout", "Sheet", false, nullptr, false },
+    { "dwg_fit",          "Fit",           "zoom_fit",      "View Layout", "Sheet", false, nullptr, false },
+    { "dwg_export_dxf",   "Export DXF",    "section_props", "View Layout", "Sheet", false, nullptr, false },
+    { "dwg_export_pdf",   "Export PDF",    "save",          "View Layout", "Sheet", false, nullptr, false },
+
+    // --- Tab: Annotation ----------------------------------------------------
+    { "dwg_smart_dim",    "Smart Dim",     "smart_dim",     "Annotation", "Dimensions", true,  nullptr, false },
+    { "dwg_model_items",  "Model Items",   "relations",     "Annotation", "Dimensions", true,  nullptr, false },
+    { "dwg_hole_callout", "Hole Callout",  "hole_wizard",   "Annotation", "Dimensions", true,  nullptr, false },
+    // --- Group: Annotations --- marks, lines, notes, balloons.
+    { "dwg_center_mark",  "Center Mark",   "point",         "Annotation", "Annotations", true,  nullptr, false },
+    { "dwg_center_line",  "Center Line",   "construction",  "Annotation", "Annotations", true,  nullptr, false },
+    { "dwg_note",         "Note",          "text_ent",      "Annotation", "Annotations", true,  nullptr, false },
+    { "dwg_balloon",      "Balloon",       "circle",        "Annotation", "Annotations", false, nullptr, false },
+    { "dwg_auto_balloon", "Auto Balloon",  "circular_pattern", "Annotation", "Annotations", false, nullptr, false },
+    // --- Group: Tables --- title block + BOM.
+    { "dwg_title_block",  "Title Block",   "new_doc",       "Annotation", "Tables", true,  nullptr, false },
+    { "dwg_bom_table",    "Bill of Mat.",  "bom",           "Annotation", "Tables", true,  nullptr, false },
+
 };
 // clang-format on
 

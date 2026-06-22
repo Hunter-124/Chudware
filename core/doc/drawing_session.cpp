@@ -417,6 +417,66 @@ std::string format_dim_value(double value, const std::string& units, const std::
     return body;
 }
 
+// Format a length (model mm) in the drawing's display units, no unit word. `prec` < 0
+// uses %.4g (significant-figures, the default look); >= 0 uses fixed decimals.
+std::string fmt_len(double mm, bool ips, int prec) {
+    double v = ips ? mm / 25.4 : mm;
+    char buf[64];
+    if (prec >= 0) std::snprintf(buf, sizeof(buf), "%.*f", prec, v);
+    else std::snprintf(buf, sizeof(buf), "%.4g", v);
+    return std::string(buf);
+}
+
+// Compose the on-sheet display string for a dimension annotation from its canonical
+// model `value` + optional detailing fields (count / prefix / suffix / precision /
+// tolerance). A drawing is a fixed-unit deliverable, so units follow the drawing's own
+// units.system. Non-dimension kinds (notes / center marks / center lines) never reach
+// here. Tolerance styles: symmetric "x ±t", deviation "x +tu / -tl", limit "hi / lo",
+// basic "[x]".
+std::string compose_disp(const json& ann, const std::string& units) {
+    std::string kind = ann.value("kind", std::string());
+    if (kind.empty()) kind = ann.value("type", std::string());
+    bool ips = (units == "IPS");
+    bool angular = (kind == "angular_dim");
+    double value = ann.value("value", 0.0);
+    int prec = -1;
+    if (ann.contains("precision") && ann["precision"].is_number_integer())
+        prec = ann["precision"].get<int>();
+    int tprec = prec >= 0 ? prec : 2;
+    std::string pre = ann.value("prefix", std::string());
+    std::string suf = ann.value("suffix", std::string());
+    int count = ann.value("count", 0);
+    std::string tt = ann.value("tol_type", std::string("none"));
+    double tu = ann.value("tol_upper", 0.0), tl = ann.value("tol_lower", 0.0);
+
+    std::string sym;  // leading symbol
+    if (kind == "radial_dim") sym = "R";
+    else if (kind == "diameter_dim" || kind == "hole_callout") sym = "\xE2\x8C\x80";  // U+2300
+
+    std::string core;
+    if (angular) {
+        char buf[64];
+        if (prec >= 0) std::snprintf(buf, sizeof(buf), "%.*f", prec, value);
+        else std::snprintf(buf, sizeof(buf), "%.4g", value);
+        core = std::string(buf) + "\xC2\xB0";  // U+00B0
+    } else if (tt == "limit") {
+        core = fmt_len(value + tu, ips, tprec) + " / " + fmt_len(value - tl, ips, tprec);
+    } else {
+        core = fmt_len(value, ips, prec);
+        if (tt == "symmetric")
+            core += " \xC2\xB1" + fmt_len(tu, ips, tprec);  // U+00B1 plus-minus
+        else if (tt == "deviation")
+            core += " +" + fmt_len(tu, ips, tprec) + " / -" + fmt_len(tl, ips, tprec);
+    }
+
+    std::string body = sym + core;
+    if (ips && !angular) body += " in";
+    body = pre + body + suf;
+    if (count > 1) body = std::to_string(count) + "\xC3\x97 " + body;  // U+00D7 multiply
+    if (tt == "basic" && !angular) body = "[" + body + "]";
+    return body;
+}
+
 double round6(double v) { return std::round(v * 1e6) / 1e6; }
 
 // The arc in geom["arcs"] whose ring lies nearest `point` (drawing.py::_nearest_arc).
@@ -486,6 +546,7 @@ json drawing_get_locked_unsafe(const std::string& doc_id) {
             sheets_out.push_back(json{{"id", sh.value("id", json(nullptr))},
                                       {"size", sh.value("size", json(nullptr))},
                                       {"size_mm", json::array({sz[0], sz[1]})},
+                                      {"title_block", sh.value("title_block", json::object())},
                                       {"views", views_out}});
         }
     return json{
@@ -945,6 +1006,329 @@ json register_restored_drawing(const json& drawing_doc, const std::string& sourc
     return json{{"doc_id", doc_id},
                 {"name", g_drawings[doc_id].doc.value("name", std::string("Drawing"))},
                 {"source_doc_id", source_doc_id}};
+}
+
+// ----------------------------------------------------------- detailing (W17 overhaul)
+// The numeric dimension kinds whose on-sheet text is composed from value + detailing
+// fields (vs. notes / center marks / center lines, whose text is literal).
+static bool is_numeric_dim(const std::string& type, const std::string& kind) {
+    const std::string& dk = kind.empty() ? type : kind;
+    return dk == "linear_dim" || dk == "aligned_dim" || dk == "radial_dim" ||
+           dk == "diameter_dim" || dk == "angular_dim" || dk == "hole_callout";
+}
+
+json drawing_set_annotation(const std::string& doc_id, const std::string& view_id,
+                            const std::string& ann_id, const json& patch) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingSession& s = require_session(doc_id);
+    json* view = find_view(s.doc, view_id);
+    if (!view)
+        throw OpError("invalid_op", "no view '" + view_id + "'", {{"reason", "unknown view"}});
+    json* ann = nullptr;
+    if (view->contains("annotations") && (*view)["annotations"].is_array())
+        for (json& a : (*view)["annotations"])
+            if (a.value("id", std::string()) == ann_id) { ann = &a; break; }
+    if (!ann)
+        throw OpError("invalid_op", "no annotation '" + ann_id + "' on view '" + view_id + "'",
+                      {{"reason", "unknown annotation"}});
+
+    if (patch.is_object())
+        for (auto it = patch.begin(); it != patch.end(); ++it) {
+            const std::string& k = it.key();
+            const json& v = it.value();
+            if (k == "tol_type" && v.is_string()) (*ann)["tol_type"] = v;
+            else if (k == "prefix" && v.is_string()) (*ann)["prefix"] = v;
+            else if (k == "suffix" && v.is_string()) (*ann)["suffix"] = v;
+            else if (k == "critical" && v.is_boolean()) (*ann)["critical"] = v;
+            else if ((k == "tol_upper" || k == "tol_lower" || k == "value") && v.is_number())
+                (*ann)[k] = v.get<double>();
+            else if (k == "precision" && v.is_number_integer()) (*ann)["precision"] = v.get<int>();
+            else if (k == "count" && v.is_number_integer()) (*ann)["count"] = v.get<int>();
+            else if (k == "pos" && is_xy(v))
+                (*ann)["pos"] = json::array({v[0].get<double>(), v[1].get<double>()});
+            else if (k == "text") (*ann)["text_override"] = v.is_string() ? v : json("");
+        }
+
+    std::string units = doc_units(s.doc);
+    std::string ov = ann->value("text_override", std::string());
+    std::string type = ann->value("type", std::string());
+    std::string kind = ann->value("kind", std::string());
+    if (is_numeric_dim(type, kind))
+        (*ann)["text"] = ov.empty() ? compose_disp(*ann, units) : ov;
+    else if (!ov.empty())
+        (*ann)["text"] = ov;
+    s.revision += 1;
+    return json{{"annotation", *ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
+}
+
+json drawing_add_callout(const std::string& doc_id, const std::string& view_id,
+                         const std::string& kind, const json& a, const json& opts) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingSession& s = require_session(doc_id);
+    json* view = find_view(s.doc, view_id);
+    if (!view)
+        throw OpError("invalid_op", "no view '" + view_id + "'", {{"reason", "unknown view"}});
+    std::string units = doc_units(s.doc);
+    double scale = view->value("scale", 1.0);
+    if (scale == 0.0) scale = 1.0;
+    const json& o = opts.is_object() ? opts : json::object();
+
+    if (kind == "hole") {
+        if (!is_xy(a))
+            throw OpError("invalid_op", "hole callout needs a pick point a [x,y]",
+                          {{"reason", "bad point"}});
+        auto shapes = source_shapes(s);
+        json geom = project_one(s, *view, shapes);
+        const json* arc = nearest_arc(geom, a, 1);  // closed circle only
+        if (!arc)
+            throw OpError("invalid_op", "hole callout: no projected circle near pick in this view",
+                          {{"reason", "no circle"}});
+        double cx = (*arc)["center"][0].get<double>(), cy = (*arc)["center"][1].get<double>();
+        double r_sheet = arc->value("radius", 0.0);
+        double r_model = r_sheet / scale;
+        // Count same-diameter holes in this view -> "n× ⌀d" (SW hole-callout convention).
+        // Dedupe by center so a through hole (whose top + bottom rims project to the SAME
+        // circle) counts once, while a real pattern of N holes counts N.
+        std::vector<std::array<double, 2>> hole_centers;
+        if (geom.contains("arcs") && geom["arcs"].is_array())
+            for (const json& ar : geom["arcs"]) {
+                if (!ar.value("closed", false)) continue;
+                if (std::fabs(ar.value("radius", 0.0) - r_sheet) >= 1e-4) continue;
+                double hx = ar["center"][0].get<double>(), hy = ar["center"][1].get<double>();
+                bool dup = false;
+                for (auto& c : hole_centers)
+                    if (std::hypot(c[0] - hx, c[1] - hy) < 1e-3) { dup = true; break; }
+                if (!dup) hole_centers.push_back({hx, hy});
+            }
+        int count = (int)hole_centers.size();
+        json pos = is_xy(o.value("pos", json(nullptr)))
+                       ? json::array({o["pos"][0].get<double>(), o["pos"][1].get<double>()})
+                       : json::array({cx + r_sheet + 14.0, cy + r_sheet + 14.0});
+        json ann = {
+            {"id", next_ann_id(*view)}, {"type", "note"}, {"kind", "hole_callout"},
+            {"a", json::array({a[0].get<double>(), a[1].get<double>()})},
+            {"b", json::array({cx, cy})}, {"center", json::array({cx, cy})},
+            {"radius", round6(r_sheet)}, {"model_radius", round6(r_model)}, {"closed", true},
+            {"value", round6(2.0 * r_model)}, {"count", count > 1 ? count : 0}, {"pos", pos},
+        };
+        if (o.contains("suffix") && o["suffix"].is_string()) ann["suffix"] = o["suffix"];
+        ann["text"] = compose_disp(ann, units);
+        (*view)["annotations"].push_back(ann);
+        s.revision += 1;
+        return json{{"annotation", ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
+    }
+
+    if (kind == "balloon") {
+        int item = o.value("item", 0);
+        json anchor = is_xy(a) ? json::array({a[0].get<double>(), a[1].get<double>()}) : json(nullptr);
+        json pos = is_xy(o.value("pos", json(nullptr)))
+                       ? json::array({o["pos"][0].get<double>(), o["pos"][1].get<double>()})
+                       : (is_xy(a) ? json::array({a[0].get<double>() + 14.0, a[1].get<double>() + 14.0})
+                                   : json::array({0.0, 0.0}));
+        std::string txt = o.contains("text") && o["text"].is_string() && !o["text"].get<std::string>().empty()
+                              ? o["text"].get<std::string>()
+                              : (item > 0 ? std::to_string(item) : "");
+        json ann = {
+            {"id", next_ann_id(*view)}, {"type", "note"}, {"kind", "balloon"},
+            {"a", anchor.is_null() ? pos : anchor}, {"pos", pos},
+            {"value", (double)item}, {"item", item}, {"text", txt},
+        };
+        (*view)["annotations"].push_back(ann);
+        s.revision += 1;
+        return json{{"annotation", ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
+    }
+
+    throw OpError("invalid_op", "callout kind must be hole|balloon", {{"reason", "bad kind"}});
+}
+
+json drawing_model_items(const std::string& doc_id, const std::string& view_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingSession& s = require_session(doc_id);
+    json* view = find_view(s.doc, view_id);
+    if (!view)
+        throw OpError("invalid_op", "no view '" + view_id + "'", {{"reason", "unknown view"}});
+    std::string units = doc_units(s.doc);
+    double scale = view->value("scale", 1.0);
+    if (scale == 0.0) scale = 1.0;
+    auto shapes = source_shapes(s);
+    json geom = project_one(s, *view, shapes);
+    if (!(*view).contains("annotations") || !(*view)["annotations"].is_array())
+        (*view)["annotations"] = json::array();
+    json& anns = (*view)["annotations"];
+    int added = 0;
+
+    // Overall envelope: width below + height to the left (SW "auto-dimension" baseline).
+    if (geom.contains("bbox") && geom["bbox"].is_array() && geom["bbox"].size() == 4 &&
+        geom["bbox"][0].is_number()) {
+        double minx = geom["bbox"][0].get<double>(), miny = geom["bbox"][1].get<double>();
+        double maxx = geom["bbox"][2].get<double>(), maxy = geom["bbox"][3].get<double>();
+        double w = maxx - minx, h = maxy - miny;
+        if (w > 1e-6) {
+            json ann = {{"id", next_ann_id(*view)}, {"type", "linear_dim"}, {"auto", true},
+                        {"a", json::array({minx, miny})}, {"b", json::array({maxx, miny})},
+                        {"pos", json::array({(minx + maxx) / 2.0, miny - 12.0})},
+                        {"value", round6(w / scale)}};
+            ann["text"] = compose_disp(ann, units);
+            anns.push_back(ann);
+            ++added;
+        }
+        if (h > 1e-6) {
+            json ann = {{"id", next_ann_id(*view)}, {"type", "linear_dim"}, {"auto", true},
+                        {"a", json::array({minx, miny})}, {"b", json::array({minx, maxy})},
+                        {"pos", json::array({minx - 12.0, (miny + maxy) / 2.0})},
+                        {"value", round6(h / scale)}};
+            ann["text"] = compose_disp(ann, units);
+            anns.push_back(ann);
+            ++added;
+        }
+    }
+
+    // One diameter callout per DISTINCT closed circle (dedupe coincident inner/outer edges).
+    std::vector<std::array<double, 3>> seen;
+    if (geom.contains("arcs") && geom["arcs"].is_array())
+        for (const json& ar : geom["arcs"]) {
+            if (!ar.value("closed", false)) continue;
+            double cx = ar["center"][0].get<double>(), cy = ar["center"][1].get<double>();
+            double r = ar.value("radius", 0.0);
+            bool dup = false;
+            for (auto& sd : seen)
+                if (std::hypot(sd[0] - cx, sd[1] - cy) < 1e-4 && std::fabs(sd[2] - r) < 1e-4) {
+                    dup = true;
+                    break;
+                }
+            if (dup) continue;
+            seen.push_back({cx, cy, r});
+            json ann = {{"id", next_ann_id(*view)}, {"type", "note"}, {"kind", "diameter_dim"},
+                        {"auto", true}, {"a", json::array({cx, cy})}, {"b", json::array({cx, cy})},
+                        {"center", json::array({cx, cy})}, {"radius", round6(r)},
+                        {"model_radius", round6(r / scale)}, {"closed", true},
+                        {"value", round6(2.0 * r / scale)},
+                        {"pos", json::array({cx + r + 10.0, cy + r + 10.0})}};
+            ann["text"] = compose_disp(ann, units);
+            anns.push_back(ann);
+            ++added;
+        }
+
+    s.revision += 1;
+    json out = drawing_get_locked_unsafe(doc_id);
+    out["added"] = added;
+    out["view_id"] = view_id;
+    return out;
+}
+
+json drawing_set_titleblock(const std::string& doc_id, const std::string& sheet_id,
+                            const json& fields) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingSession& s = require_session(doc_id);
+    json& sheet = find_sheet(s.doc, sheet_id);
+    json tb = sheet.contains("title_block") && sheet["title_block"].is_object()
+                  ? sheet["title_block"]
+                  : json::object();
+    if (fields.is_object())
+        for (auto it = fields.begin(); it != fields.end(); ++it)
+            if (it->is_string() || it->is_number() || it->is_boolean()) tb[it.key()] = it.value();
+    sheet["title_block"] = tb;
+    s.revision += 1;
+    return json{{"doc_id", doc_id}, {"sheet_id", sheet.value("id", json(nullptr))},
+                {"title_block", tb}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
+}
+
+json drawing_set_sheet(const std::string& doc_id, const std::string& sheet_id,
+                       const std::string& size) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingSession& s = require_session(doc_id);
+    json& sheet = find_sheet(s.doc, sheet_id);
+    if (sheet_dims(size)[0] <= 0.0)
+        throw OpError("invalid_op", "unknown sheet size '" + size + "'", {{"reason", "bad size"}});
+    sheet["size"] = size;
+    s.revision += 1;
+    return json{{"doc_id", doc_id}, {"sheet_id", sheet.value("id", json(nullptr))},
+                {"size", size}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
+}
+
+json drawing_make(const std::string& source_doc_id, const json& spec) {
+    // Orchestrates the public single-step RPCs (each takes g_mtx itself) — so we must NOT hold
+    // the lock here. This is the copilot's high-level entry: one compact spec -> a full drawing.
+    const json& s = spec.is_object() ? spec : json::object();
+    std::string name = s.value("name", std::string());
+    json created = drawing_new(json::object(), json::object(), name, source_doc_id);
+    std::string doc_id = created.value("doc_id", std::string());
+    if (doc_id.empty())
+        throw OpError("invalid_op", "drawing_make: could not create drawing",
+                      {{"reason", "no doc_id"}});
+
+    if (s.contains("sheet") && s["sheet"].is_string())
+        try { drawing_set_sheet(doc_id, "s1", s["sheet"].get<std::string>()); }
+        catch (const OpError&) { /* bad size -> keep default A3 */ }
+
+    // Requested views (default the SolidWorks standard set). Lay them out in a tidy grid so a
+    // fresh drawing reads well before the user/agent nudges anything.
+    std::vector<std::string> views;
+    if (s.contains("views") && s["views"].is_array())
+        for (const auto& v : s["views"])
+            if (v.is_string()) views.push_back(v.get<std::string>());
+    if (views.empty()) views = {"front", "top", "right", "iso"};
+
+    struct Slot { const char* name; const char* type; double x, y; };
+    static const Slot kSlots[] = {
+        {"front", "base", 130, 175},  {"top", "projected", 130, 90},
+        {"right", "projected", 300, 175}, {"bottom", "projected", 130, 250},
+        {"left", "projected", 300, 90}, {"back", "projected", 300, 250},
+        {"iso", "iso", 320, 90},
+    };
+    std::vector<std::string> ortho_view_ids;  // for model items / hole callouts (not the iso)
+    bool used_base = false;
+    for (const std::string& vn : views) {
+        const Slot* slot = nullptr;
+        for (const auto& k : kSlots)
+            if (vn == k.name) { slot = &k; break; }
+        if (!slot) continue;  // unknown view name -> skip (never throw)
+        std::string type = slot->type;
+        // The first orthographic view is the drawing's base; the rest project off it.
+        if (type == "base") { if (used_base) type = "projected"; else used_base = true; }
+        try {
+            json added = drawing_add_view(doc_id, type, vn, "s1", 1.0,
+                                          json::array({slot->x, slot->y}), json(nullptr));
+            std::string vid = added.value("view_id", std::string());
+            if (!vid.empty() && vn != "iso") ortho_view_ids.push_back(vid);
+        } catch (const OpError&) { /* skip a view that fails to project */ }
+    }
+
+    bool model_items = s.value("model_items", true);
+    bool hole_callouts = s.value("hole_callouts", false);
+    if (model_items)
+        for (const std::string& vid : ortho_view_ids)
+            try { drawing_model_items(doc_id, vid); } catch (const OpError&) {}
+
+    if (hole_callouts) {
+        // Re-fetch geometry, then drop a ⌀ callout on each DISTINCT projected circle per view.
+        json full = drawing_get(doc_id);
+        if (full.contains("sheets") && full["sheets"].is_array())
+            for (const auto& sh : full["sheets"])
+                for (const auto& v : sh.value("views", json::array())) {
+                    std::string vid = v.value("view_id", v.value("id", std::string()));
+                    if (vid.empty() || v.value("type", std::string()) == "iso") continue;
+                    std::vector<std::array<double, 2>> seen;
+                    for (const auto& ar : v.value("arcs", json::array())) {
+                        if (!ar.value("closed", false)) continue;
+                        double cx = ar["center"][0].get<double>(), cy = ar["center"][1].get<double>();
+                        bool dup = false;
+                        for (auto& c : seen)
+                            if (std::hypot(c[0] - cx, c[1] - cy) < 1e-3) { dup = true; break; }
+                        if (dup) continue;
+                        seen.push_back({cx, cy});
+                        try {
+                            drawing_add_callout(doc_id, vid, "hole",
+                                                json::array({cx, cy}), json::object());
+                        } catch (const OpError&) {}
+                    }
+                }
+    }
+
+    if (s.contains("title") && s["title"].is_object())
+        try { drawing_set_titleblock(doc_id, "s1", s["title"]); } catch (const OpError&) {}
+
+    return json{{"doc_id", doc_id}, {"drawing", drawing_get(doc_id)}};
 }
 
 bool drawing_close(const std::string& doc_id) {

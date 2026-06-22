@@ -2058,6 +2058,21 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 params.value("sheet_id", std::string()),
                                 params.value("size", std::string("A3"))),
                             out_json, 0);
+            if (m == "drawing_make") {
+                // One-shot copilot drawing authoring. Source is a live part session id
+                // (source_doc_id|doc_id); the compact spec rides as "spec" (or flat keys).
+                // NOTE: named drawing_* (NOT agent_*) so worker_client routes it to the C++
+                // core by its doc-cpp source_doc_id (agent_* is pinned to the agent seam).
+                std::string src = params.value("source_doc_id", std::string());
+                if (src.empty()) src = params.value("doc_id", std::string());
+                json spec = params.contains("spec") && params["spec"].is_object()
+                                ? params["spec"]
+                                : json::object();
+                for (const char* k : {"name", "sheet", "views", "model_items", "hole_callouts",
+                                      "title"})
+                    if (params.contains(k)) spec[k] = params[k];
+                return emit(aicad::doc::drawing_make(src, spec), out_json, 0);
+            }
             if (m == "drawing_get")
                 return emit(aicad::doc::drawing_get(params.value("doc_id", std::string())),
                             out_json, 0);

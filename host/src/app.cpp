@@ -51,6 +51,7 @@
 #include "ui/status_bar.h"
 #include "ui/title_bar.h"
 #include "ui/viewport_panel.h"
+#include "ui/drawing_panel.h"     // W17: drawing ribbon command dispatch (drawingHandleCommand)
 #include "ui/ecad/ecad_panel.h"   // Wave N: AI-ECAD 2D editor
 #include "ui/ecad/ecad_mirror.h"  // Wave N: complete type for EcadMirror::setDocId
 #include "ui/file_dialog.h"       // Wave Y: native Save As / Open dialogs for .ecad+
@@ -949,6 +950,9 @@ int run_gui(const char* screenshotPath) {
         // DRAWINGS: "Make Drawing" creates a drawing + standard views from the active part and
         // opens it as a Drawing tab (guarded; toasts if no part is open).
         if (std::strcmp(cmd_id, "make_drawing") == 0) { st.makeDrawing(); return; }
+        // W17 drawing overhaul: View Layout / Annotation ribbon commands route to the 2D panel.
+        if (std::strncmp(cmd_id, "dwg_", 4) == 0 && ui::drawingHandleCommand(st, std::string(cmd_id)))
+            return;
         // C20b: Assembly tab + New Assembly route to the assembly panels first.
         {
             std::string cmd(cmd_id);
@@ -1296,6 +1300,10 @@ int run_gui(const char* screenshotPath) {
     if (st.wantSketch) { st.showRibbon = true; st.ribbonTab = AppState::RT_Sketch; }  // Sketch tab forward
     st.wantFea = shot && shotMode && std::strcmp(shotMode, "fea") == 0;       // C19 static study
     st.wantFlow = shot && shotMode && std::strcmp(shotMode, "flow") == 0;     // external-flow study
+    // W17: engineering-drawing scenario — part w/ a hole -> Make Drawing -> Model Items + hole
+    // callout + a critical toleranced dim + title block, with the contextual drawing ribbon shown.
+    st.wantDrawing = shot && shotMode && std::strcmp(shotMode, "drawing") == 0;
+    if (st.wantDrawing) { st.showRibbon = true; st.showFeatureTree = true; }
     st.wantEvalMass = shot && shotMode && std::strcmp(shotMode, "evalmass") == 0;  // C19 mass props
     if (st.wantFea || st.wantFlow) {
         st.showSimulationTools = true;
@@ -2385,7 +2393,8 @@ int run_gui(const char* screenshotPath) {
         // Sketch tab swaps Exit Sketch <-> New Sketch depending on whether a sketch is being edited.
         ui::setRibbonSketchActive(st.sketchMode->active());
         float ribbonH = ui::drawRibbon(st.ribbonTab, st.showRibbon,
-                                       st.showSimulationTools, st.showPcbTools, barH);
+                                       st.showSimulationTools, st.showPcbTools, barH,
+                                       st.activeTabIsDrawing());
 
         // ---------- default starter document ----------
         // Open straight into a fresh part on launch (non-shot) so the app is immediately usable.

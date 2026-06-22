@@ -358,6 +358,173 @@ static void fetchBom(AppState& st, AppState::DocTab& tab) {
     tab.bomFetched = true;
 }
 
+// --- W17 detailing: shared RPC plumbing + tool commits ---------------------------------------
+
+// Update the cached drawing from an RPC result (a {drawing:...} envelope, a full {sheets:...} doc,
+// or neither -> re-fetch), and mark the tab unsaved.
+static void absorbDrawingResult(AppState& st, AppState::DocTab& tab, const nlohmann::json& res) {
+    if (res.is_object() && res.contains("drawing") && res["drawing"].is_object())
+        tab.drawingDoc = res["drawing"];
+    else if (res.is_object() && res.contains("sheets") && res["sheets"].is_array())
+        tab.drawingDoc = res;
+    else
+        st.refreshDrawingTab(st.activeTab);
+    st.markDrawingTabDirty(st.activeTab);
+}
+
+// Call a drawing RPC; on failure log + toast and return false. `label` is the user-facing verb.
+static bool drawCall(AppState& st, const char* method, const nlohmann::json& params,
+                     nlohmann::json& res, const char* label) {
+    std::string err;
+    if (st.worker.call(method, params, res, err) && res.is_object() && !res.contains("code"))
+        return true;
+    std::string msg = res.is_object() && res.contains("message") ? djstr(res, "message") : err;
+    st.addLog(std::string("[draw] ") + method + " failed: " + msg);
+    st.toast(ui::ToastLevel::Error,
+             std::string(label) + " failed: " + (msg.empty() ? "engine error" : msg));
+    return false;
+}
+
+// Clear every modal drawing tool + its in-progress stage (called when arming a new tool).
+static void disarmDrawTools(AppState::DocTab& tab) {
+    tab.dimToolActive = false; tab.dimStage = 0; tab.dimViewId.clear();
+    tab.sectionToolActive = false; tab.sectionStage = 0; tab.sectionViewId.clear();
+    tab.detailToolActive = false; tab.detailStage = 0; tab.detailViewId.clear();
+    tab.modelItemsActive = false; tab.holeCalloutActive = false;
+    tab.centerMarkActive = false; tab.noteActive = false; tab.balloonActive = false;
+    tab.centerLineActive = false; tab.centerLineStage = 0;
+    tab.selAnnViewId.clear(); tab.selAnnId.clear();
+}
+
+// True while ANY modal drawing tool is armed (used to gate plain selection / drag).
+static bool anyDrawToolActive(const AppState::DocTab& tab) {
+    return tab.dimToolActive || tab.sectionToolActive || tab.detailToolActive ||
+           tab.modelItemsActive || tab.holeCalloutActive || tab.centerMarkActive ||
+           tab.noteActive || tab.balloonActive || tab.centerLineActive;
+}
+
+static void addStdView(AppState& st, AppState::DocTab& tab, const char* type, const char* orient,
+                       double px, double py) {
+    nlohmann::json res;
+    nlohmann::json params = {{"doc_id", tab.drawingDocId}, {"type", type}, {"orientation", orient},
+                             {"position", nlohmann::json::array({px, py})}};
+    if (drawCall(st, "drawing_add_view", params, res, "Add view")) {
+        st.refreshDrawingTab(st.activeTab);
+        st.markDrawingTabDirty(st.activeTab);
+        tab.drawNeedFit = true;
+        st.addLog(std::string("[draw] added ") + type + " " + orient + " view");
+    }
+}
+
+// Auto-dimension the clicked view (overall envelope + per-circle diameter callouts).
+static void commitModelItems(AppState& st, AppState::DocTab& tab, const std::string& viewId) {
+    nlohmann::json res;
+    if (drawCall(st, "drawing_model_items",
+                 {{"doc_id", tab.drawingDocId}, {"view_id", viewId}}, res, "Model Items")) {
+        absorbDrawingResult(st, tab, res);
+        int added = res.is_object() ? (int)djnum(res, "added", 0) : 0;
+        st.addLog("[draw] model items added " + std::to_string(added) + " dims on " + viewId);
+        st.toast(ui::ToastLevel::Info, "Auto-dimensioned (" + std::to_string(added) + ")");
+    }
+}
+
+// Smart hole callout: snaps the nearest circle near (ax,ay) -> "n× ⌀d".
+static void commitHoleCallout(AppState& st, AppState::DocTab& tab, const std::string& viewId,
+                              float ax, float ay) {
+    nlohmann::json res;
+    nlohmann::json params = {{"doc_id", tab.drawingDocId}, {"view_id", viewId}, {"kind", "hole"},
+                             {"a", nlohmann::json::array({ax, ay})}};
+    if (drawCall(st, "drawing_add_callout", params, res, "Hole callout")) {
+        absorbDrawingResult(st, tab, res);
+        st.addLog("[draw] hole callout on " + viewId);
+    }
+}
+
+// Item-number balloon at the click point (auto-incrementing).
+static void commitBalloon(AppState& st, AppState::DocTab& tab, const std::string& viewId,
+                          float ax, float ay) {
+    nlohmann::json res;
+    nlohmann::json params = {{"doc_id", tab.drawingDocId}, {"view_id", viewId}, {"kind", "balloon"},
+                             {"a", nlohmann::json::array({ax, ay})}, {"item", tab.balloonNext}};
+    if (drawCall(st, "drawing_add_callout", params, res, "Balloon")) {
+        absorbDrawingResult(st, tab, res);
+        ++tab.balloonNext;
+        st.addLog("[draw] balloon on " + viewId);
+    }
+}
+
+// Center mark / center line / note via drawing_add_dim (type carries the kind).
+static void commitExtDim(AppState& st, AppState::DocTab& tab, const std::string& viewId,
+                         const char* type, const nlohmann::json& a, const nlohmann::json& b,
+                         const std::string& text) {
+    nlohmann::json res;
+    nlohmann::json params = {{"doc_id", tab.drawingDocId}, {"view_id", viewId}, {"type", type},
+                             {"a", a}};
+    if (b.is_array()) params["b"] = b;
+    if (!text.empty()) params["text"] = text;
+    if (drawCall(st, "drawing_add_dim", params, res, type)) {
+        absorbDrawingResult(st, tab, res);
+        st.addLog(std::string("[draw] added ") + type + " on " + viewId);
+    }
+}
+
+// Patch detailing fields on an existing annotation (tolerance / critical / prefix / pos / ...).
+static void applyAnnPatch(AppState& st, AppState::DocTab& tab, const std::string& viewId,
+                          const std::string& annId, const nlohmann::json& patch) {
+    nlohmann::json res;
+    nlohmann::json params = patch;
+    params["doc_id"] = tab.drawingDocId;
+    params["view_id"] = viewId;
+    params["ann_id"] = annId;
+    if (drawCall(st, "drawing_set_annotation", params, res, "Edit dimension")) {
+        absorbDrawingResult(st, tab, res);
+        st.addLog("[draw] edited annotation " + annId);
+    }
+}
+
+bool drawingHandleCommand(AppState& st, const std::string& cmd) {
+    if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return true;
+    AppState::DocTab& tab = st.docTabs[st.activeTab];
+    if (tab.kind != AppState::DocTab::TabKind::Drawing || tab.drawingDocId.empty()) {
+        st.toast(ui::ToastLevel::Warn, "Open a drawing first");
+        return true;
+    }
+
+    // --- View Layout tab ---
+    if (cmd == "dwg_rebuild")     { disarmDrawTools(tab); st.refreshDrawingTab(st.activeTab); return true; }
+    if (cmd == "dwg_fit")         { tab.drawNeedFit = true; return true; }
+    if (cmd == "dwg_export_dxf")  { exportActiveDrawing(st, "dxf"); return true; }
+    if (cmd == "dwg_export_pdf")  { exportActiveDrawing(st, "pdf"); return true; }
+    if (cmd == "dwg_view_model")  { disarmDrawTools(tab); addStdView(st, tab, "base", "front", 150, 180); return true; }
+    if (cmd == "dwg_view_proj")   { disarmDrawTools(tab); addStdView(st, tab, "projected", "top", 150, 80); return true; }
+    if (cmd == "dwg_view_std3") {
+        disarmDrawTools(tab);
+        addStdView(st, tab, "base", "front", 150, 180);
+        addStdView(st, tab, "projected", "top", 150, 80);
+        addStdView(st, tab, "projected", "right", 320, 180);
+        tab.drawNeedFit = true;
+        return true;
+    }
+    if (cmd == "dwg_view_section") { disarmDrawTools(tab); tab.sectionToolActive = true; tab.sectionStage = 0; return true; }
+    if (cmd == "dwg_view_detail")  { disarmDrawTools(tab); tab.detailToolActive = true; tab.detailStage = 0; return true; }
+    if (cmd == "dwg_sheet_props" || cmd == "dwg_title_block") { tab.titleBlockOpen = true; return true; }
+
+    // --- Annotation tab ---
+    if (cmd == "dwg_smart_dim")    { disarmDrawTools(tab); tab.dimToolActive = true; tab.dimStage = 0; return true; }
+    if (cmd == "dwg_model_items")  { disarmDrawTools(tab); tab.modelItemsActive = true; return true; }
+    if (cmd == "dwg_hole_callout") { disarmDrawTools(tab); tab.holeCalloutActive = true; return true; }
+    if (cmd == "dwg_center_mark")  { disarmDrawTools(tab); tab.centerMarkActive = true; return true; }
+    if (cmd == "dwg_center_line")  { disarmDrawTools(tab); tab.centerLineActive = true; tab.centerLineStage = 0; return true; }
+    if (cmd == "dwg_note")         { disarmDrawTools(tab); tab.noteActive = true; return true; }
+    if (cmd == "dwg_balloon" || cmd == "dwg_auto_balloon") { disarmDrawTools(tab); tab.balloonActive = true; return true; }
+    if (cmd == "dwg_bom_table") {
+        tab.bomVisible = !tab.bomVisible;
+        if (tab.bomVisible && !tab.bomFetched) fetchBom(st, tab);
+        return true;
+    }
+    return false;
+}
+
 // Render one stored dimension annotation: extension lines from a & b, a dimension line through the
 // text position, simple arrowheads, and the value text. `toScreen` maps sheet-mm to screen px.
 static void renderDimension(ImDrawList* dl, const nlohmann::json& ann, bool ips,
@@ -370,19 +537,107 @@ static void renderDimension(ImDrawList* dl, const nlohmann::json& ann, bool ips,
         x = (*it)[0].get<double>(); y = (*it)[1].get<double>(); return true;
     };
     const std::string atype = djstr(ann, "type");
+    const std::string kind = djstr(ann, "kind");
+    const bool critical = ann.is_object() && ann.value("critical", false);
     double ax, ay, bx, by, px, py;
     bool haveA = rdvec("a", ax, ay), haveB = rdvec("b", bx, by), haveP = rdvec("pos", px, py);
 
-    const ImU32 dimCol = selected ? IM_COL32(220, 120, 30, 255) : IM_COL32(40, 90, 180, 255);
-    const float thick = std::max(1.0f, 1.0f * s);
+    // Critical dims pop red + heavier; selected = orange; otherwise drawing-blue ink.
+    const ImU32 dimCol = critical ? IM_COL32(200, 40, 40, 255)
+                       : selected  ? IM_COL32(220, 120, 30, 255)
+                                   : IM_COL32(40, 90, 180, 255);
+    const float thick = std::max(1.0f, (critical ? 1.6f : 1.0f) * s);
+
+    std::string txt = djstr(ann, "text");
+    auto drawLabel = [&](ImVec2 tp, const std::string& t) {
+        if (t.empty()) return;
+        ImVec2 ts = ImGui::CalcTextSize(t.c_str());
+        dl->AddRectFilled(ImVec2(tp.x - 2, tp.y - 1), ImVec2(tp.x + ts.x + 2, tp.y + ts.y + 1),
+                          IM_COL32(255, 255, 255, 220), 2.0f);
+        dl->AddText(tp, dimCol, t.c_str());
+    };
+    auto criticalFlag = [&](ImVec2 at) {
+        if (critical) dl->AddText(ImVec2(at.x - 10 * s, at.y - 1), IM_COL32(200, 40, 40, 255), "!");
+    };
+
+    // --- center mark: a small cross at the circle center ---
+    if (kind == "center_mark") {
+        double cx = ax, cy = ay, t1, t2;
+        if (rdvec("center", t1, t2)) { cx = t1; cy = t2; }
+        ImVec2 c = toScreen(cx, cy);
+        float r = 6.0f * s;
+        dl->AddLine(ImVec2(c.x - r, c.y), ImVec2(c.x + r, c.y), dimCol, thick);
+        dl->AddLine(ImVec2(c.x, c.y - r), ImVec2(c.x, c.y + r), dimCol, thick);
+        return;
+    }
+    // --- center line: dashed construction line a->b (with a small overrun each end) ---
+    if (kind == "center_line") {
+        if (haveA && haveB) {
+            ImVec2 A = toScreen(ax, ay), B = toScreen(bx, by);
+            ImVec2 d(B.x - A.x, B.y - A.y);
+            float l = std::sqrt(d.x * d.x + d.y * d.y);
+            if (l > 1e-3f) {
+                d.x /= l; d.y /= l;
+                float e = 6.0f * s;
+                A = ImVec2(A.x - d.x * e, A.y - d.y * e);
+                B = ImVec2(B.x + d.x * e, B.y + d.y * e);
+            }
+            addDashedPolyline(dl, {A, B}, dimCol, thick, 9.0f * s, 4.0f * s);
+        }
+        return;
+    }
+    // --- balloon: leader from anchor a to a numbered bubble at pos ---
+    if (kind == "balloon") {
+        if (haveP) {
+            ImVec2 P = toScreen(px, py);
+            float r = 11.0f * s;
+            if (haveA) {
+                ImVec2 A = toScreen(ax, ay);
+                dl->AddLine(A, P, dimCol, thick);
+                dl->AddCircleFilled(A, 2.0f * s, dimCol);
+            }
+            dl->AddCircleFilled(P, r, IM_COL32(255, 255, 255, 235));
+            dl->AddCircle(P, r, dimCol, 24, thick);
+            if (txt.empty()) {
+                int it = (int)djnum(ann, "item", 0);
+                if (it > 0) txt = std::to_string(it);
+            }
+            if (!txt.empty()) {
+                ImVec2 ts = ImGui::CalcTextSize(txt.c_str());
+                dl->AddText(ImVec2(P.x - ts.x * 0.5f, P.y - ts.y * 0.5f), dimCol, txt.c_str());
+            }
+        }
+        return;
+    }
+    // --- hole callout / radial / diameter: leader from the circle center to text at pos ---
+    if (kind == "hole_callout" || kind == "radial_dim" || kind == "diameter_dim") {
+        if (txt.empty()) {
+            double val = djnum(ann, "value", 0.0);
+            txt = pmFormatDim(val, ips);
+            if (kind == "diameter_dim" || kind == "hole_callout") txt = "\xE2\x8C\x80" + txt;
+            else if (kind == "radial_dim") txt = "R" + txt;
+        }
+        double cx = ax, cy = ay, t1, t2;
+        if (rdvec("center", t1, t2)) { cx = t1; cy = t2; }
+        ImVec2 C = toScreen(cx, cy);
+        ImVec2 P = haveP ? toScreen(px, py) : ImVec2(C.x + 22 * s, C.y - 22 * s);
+        dl->AddLine(C, P, dimCol, thick);
+        dl->AddCircleFilled(C, 2.0f * s, dimCol);
+        drawLabel(ImVec2(P.x + 3 * s, P.y - ImGui::GetTextLineHeight() * 0.5f), txt);
+        criticalFlag(P);
+        return;
+    }
+    // --- angular dim: value text at pos (witness geometry omitted for the MVP) ---
+    if (kind == "angular_dim") {
+        if (haveP) drawLabel(toScreen(px, py), txt.empty() ? "?" : txt);
+        return;
+    }
 
     // Note: just text at pos.
     if (atype == "note" || !haveA || !haveB) {
         if (haveP) {
-            std::string txt = djstr(ann, "text");
             if (txt.empty()) txt = "note";
-            ImVec2 tp = toScreen(px, py);
-            dl->AddText(ImVec2(tp.x, tp.y), dimCol, txt.c_str());
+            drawLabel(toScreen(px, py), txt);
         }
         return;
     }
@@ -432,8 +687,8 @@ static void renderDimension(ImDrawList* dl, const nlohmann::json& ann, bool ips,
     arrow(A2, B2);
     arrow(B2, A2);
 
-    // Value text at P (centered above the dimension line).
-    std::string txt = djstr(ann, "text");
+    // Value text at P (centered above the dimension line). `txt` is the engine-composed display
+    // string (prefix / tolerance baked in); fall back to formatting the canonical mm value.
     if (txt.empty()) {
         double val = djnum(ann, "value", 0.0);
         txt = pmFormatDim(val, ips);   // engine value is canonical mm; pmFormatDim handles IPS
@@ -444,6 +699,252 @@ static void renderDimension(ImDrawList* dl, const nlohmann::json& ann, bool ips,
     dl->AddRectFilled(ImVec2(tp.x - 2, tp.y - 1), ImVec2(tp.x + ts.x + 2, tp.y + ts.y + 1),
                       IM_COL32(255, 255, 255, 220), 2.0f);
     dl->AddText(tp, dimCol, txt.c_str());
+    criticalFlag(ImVec2(tp.x, tp.y));
+}
+
+// --- W17: editor / drag interaction state (only the active Drawing tab interacts) -------------
+static bool s_annEditOpen = false;     // request to open the dimension editor popup this frame
+static bool s_annEditLoaded = false;   // editor scratch has been loaded from the selected ann
+static bool s_annDragActive = false;   // a text-drag is in progress
+
+// Locate the selected annotation in the cached sheet (read-only).
+static const nlohmann::json* findSelAnn(const nlohmann::json& sheet, const std::string& viewId,
+                                        const std::string& annId) {
+    if (annId.empty() || !(sheet.contains("views") && sheet["views"].is_array())) return nullptr;
+    for (const auto& v : sheet["views"]) {
+        if (!v.is_object() || !v.contains("annotations") || !v["annotations"].is_array()) continue;
+        const std::string vid = djstr(v, "view_id").empty() ? djstr(v, "id") : djstr(v, "view_id");
+        if (vid != viewId) continue;
+        for (const auto& a : v["annotations"])
+            if (a.is_object() && djstr(a, "id") == annId) return &a;
+    }
+    return nullptr;
+}
+
+// Draw a standard SolidWorks-style title block in the bottom-right of the sheet (always drawn so
+// the sheet reads as a real drawing; fields come from sheet["title_block"], else sensible blanks).
+static void renderTitleBlock(ImDrawList* dl, const nlohmann::json& sheet,
+                             const std::function<ImVec2(double, double)>& toScreen,
+                             double paperW, double /*paperH*/, float s) {
+    const nlohmann::json* tb =
+        (sheet.contains("title_block") && sheet["title_block"].is_object()) ? &sheet["title_block"]
+                                                                            : nullptr;
+    auto field = [&](const char* key, const std::string& fb) -> std::string {
+        if (tb) {
+            auto it = tb->find(key);
+            if (it != tb->end()) {
+                if (it->is_string()) return it->get<std::string>();
+                if (it->is_number()) { char b[32]; std::snprintf(b, sizeof(b), "%g",
+                                       it->get<double>()); return b; }
+            }
+        }
+        return fb;
+    };
+    const double margin = 8.0, bw = 176.0, bh = 48.0;
+    const double rx = paperW - margin, by = margin;     // bottom-right corner, inside the trim
+    const double lx = rx - bw, ty = by + bh;
+    ImVec2 tl = toScreen(lx, ty), br = toScreen(rx, by);
+    const ImU32 ink = IM_COL32(40, 44, 52, 255), line = IM_COL32(60, 64, 74, 255);
+    dl->AddRectFilled(tl, br, IM_COL32(255, 255, 255, 235));
+    dl->AddRect(tl, br, line, 0.0f, 0, 1.4f * s);
+    // Two horizontal dividers -> 3 rows: title, drawn/date, scale/rev/sheet + material.
+    float h = br.y - tl.y, w = br.x - tl.x;
+    float r1 = tl.y + h * 0.42f, r2 = tl.y + h * 0.72f;
+    dl->AddLine(ImVec2(tl.x, r1), ImVec2(br.x, r1), line, 1.0f * s);
+    dl->AddLine(ImVec2(tl.x, r2), ImVec2(br.x, r2), line, 1.0f * s);
+    auto label = [&](float x, float y, const char* k, const std::string& val) {
+        dl->AddText(ImVec2(x + 3 * s, y + 1 * s), IM_COL32(120, 126, 138, 255), k);
+        dl->AddText(ImVec2(x + 3 * s, y + ImGui::GetTextLineHeight() * 0.6f + 2 * s), ink,
+                    val.c_str());
+    };
+    std::string title = field("title", "TITLE");
+    ImVec2 tts = ImGui::CalcTextSize(title.c_str());
+    dl->AddText(ImVec2(tl.x + (w - tts.x) * 0.5f, tl.y + (r1 - tl.y - tts.y) * 0.5f), ink,
+                title.c_str());
+    label(tl.x, r1, "DRAWN", field("drawn_by", ""));
+    label(tl.x + w * 0.5f, r1, "DATE", field("date", ""));
+    label(tl.x, r2, "MATL", field("material", ""));
+    label(tl.x + w * 0.34f, r2, "SCALE", field("scale", "1:1"));
+    label(tl.x + w * 0.62f, r2, "REV", field("rev", "A"));
+    label(tl.x + w * 0.80f, r2, "SHEET", field("sheet", "1/1"));
+}
+
+// The dimension/annotation editor popup: double-click a dim to open it. Edits tolerance, prefix/
+// suffix, precision, "Critical", and a verbatim text override -> drawing_set_annotation.
+static void renderDimEditorPopup(AppState& st, AppState::DocTab& tab, const nlohmann::json& sheet) {
+    static int  etTol = 0;              // 0 none,1 symmetric,2 deviation,3 limit,4 basic
+    static double etUp = 0.0, etLo = 0.0;
+    static int  etPrec = 2;
+    static bool etCrit = false;
+    static char etPrefix[32] = {0}, etSuffix[32] = {0}, etText[96] = {0};
+
+    const nlohmann::json* ann = findSelAnn(sheet, tab.selAnnViewId, tab.selAnnId);
+    if (s_annEditOpen) {
+        if (!ann) { s_annEditOpen = false; }
+        else {
+            ImGui::OpenPopup("Edit Dimension##dimedit");
+            s_annEditOpen = false;
+            s_annEditLoaded = false;
+        }
+    }
+    if (ann && !s_annEditLoaded) {
+        std::string tt = djstr(*ann, "tol_type");
+        etTol = tt == "symmetric" ? 1 : tt == "deviation" ? 2 : tt == "limit" ? 3
+                                                                : tt == "basic" ? 4 : 0;
+        etUp = djnum(*ann, "tol_upper", 0.0);
+        etLo = djnum(*ann, "tol_lower", 0.0);
+        etPrec = ann->contains("precision") && (*ann)["precision"].is_number_integer()
+                     ? (*ann)["precision"].get<int>() : 2;
+        etCrit = ann->is_object() && ann->value("critical", false);
+        std::snprintf(etPrefix, sizeof(etPrefix), "%s", djstr(*ann, "prefix").c_str());
+        std::snprintf(etSuffix, sizeof(etSuffix), "%s", djstr(*ann, "suffix").c_str());
+        std::snprintf(etText, sizeof(etText), "%s", djstr(*ann, "text_override").c_str());
+        s_annEditLoaded = true;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(320 * ui::uiScale, 0), ImGuiCond_Appearing);
+    if (ImGui::BeginPopup("Edit Dimension##dimedit")) {
+        std::string kind = ann ? djstr(*ann, "kind") : std::string();
+        std::string type = ann ? djstr(*ann, "type") : std::string();
+        bool numeric = kind == "linear_dim" || kind == "aligned_dim" || kind == "radial_dim" ||
+                       kind == "diameter_dim" || kind == "angular_dim" || kind == "hole_callout" ||
+                       type == "linear_dim" || type == "aligned_dim";
+        if (ann) {
+            double val = djnum(*ann, "value", 0.0);
+            ImGui::TextDisabled("%s  (value %.4g mm)", kind.empty() ? type.c_str() : kind.c_str(),
+                                val);
+        }
+        ImGui::Separator();
+        if (numeric) {
+            const char* tols[] = {"None", "Symmetric  \xC2\xB1", "Deviation  +/-", "Limit",
+                                  "Basic  [ ]"};
+            ImGui::SetNextItemWidth(-1);
+            ImGui::Combo("##tol", &etTol, tols, IM_ARRAYSIZE(tols));
+            if (etTol == 1) {
+                ImGui::InputDouble("Tolerance \xC2\xB1", &etUp, 0.0, 0.0, "%.4f");
+            } else if (etTol == 2 || etTol == 3) {
+                ImGui::InputDouble("Upper", &etUp, 0.0, 0.0, "%.4f");
+                ImGui::InputDouble("Lower", &etLo, 0.0, 0.0, "%.4f");
+            }
+            ImGui::SliderInt("Precision", &etPrec, 0, 4);
+            ImGui::InputText("Prefix", etPrefix, sizeof(etPrefix));
+            ImGui::InputText("Suffix", etSuffix, sizeof(etSuffix));
+            ImGui::Checkbox("Critical dimension", &etCrit);
+        }
+        ImGui::InputText(numeric ? "Override text" : "Note text", etText, sizeof(etText));
+        ImGui::Separator();
+        if (ImGui::Button("Apply", ImVec2(120 * ui::uiScale, 0))) {
+            nlohmann::json patch;
+            if (numeric) {
+                const char* tname[] = {"none", "symmetric", "deviation", "limit", "basic"};
+                patch["tol_type"] = tname[etTol];
+                patch["tol_upper"] = etUp;
+                patch["tol_lower"] = etLo;
+                patch["precision"] = etPrec;
+                patch["prefix"] = std::string(etPrefix);
+                patch["suffix"] = std::string(etSuffix);
+                patch["critical"] = etCrit;
+            }
+            patch["text"] = std::string(etText);
+            applyAnnPatch(st, tab, tab.selAnnViewId, tab.selAnnId, patch);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Delete", ImVec2(90 * ui::uiScale, 0))) {
+            deleteAnnotation(st, tab, tab.selAnnViewId, tab.selAnnId);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(90 * ui::uiScale, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    } else {
+        s_annEditLoaded = false;
+    }
+}
+
+// The title-block / sheet-properties editor popup (opened from the View Layout ribbon).
+static void renderTitleBlockPopup(AppState& st, AppState::DocTab& tab, const nlohmann::json& sheet) {
+    static char tbTitle[96] = {0}, tbDrawn[48] = {0}, tbDate[32] = {0}, tbMatl[48] = {0},
+                tbFinish[48] = {0}, tbRev[16] = {0}, tbScale[16] = {0}, tbSheetNo[16] = {0},
+                tbCompany[64] = {0};
+    static int  tbSizeIdx = 1;          // A3 default
+    static bool tbLoaded = false;
+    static const char* kSizes[] = {"A4", "A3", "A2", "A1", "A0", "A", "B", "C", "D", "E"};
+
+    if (tab.titleBlockOpen) {
+        ImGui::OpenPopup("Sheet Properties##sheetprops");
+        tab.titleBlockOpen = false;
+        tbLoaded = false;
+    }
+    if (!tbLoaded) {
+        const nlohmann::json* tb =
+            (sheet.contains("title_block") && sheet["title_block"].is_object())
+                ? &sheet["title_block"] : nullptr;
+        auto load = [&](const char* k, char* buf, size_t n, const char* fb) {
+            std::string v = tb ? djstr(*tb, k) : std::string();
+            std::snprintf(buf, n, "%s", v.empty() ? fb : v.c_str());
+        };
+        load("title", tbTitle, sizeof(tbTitle), "");
+        load("drawn_by", tbDrawn, sizeof(tbDrawn), "");
+        load("date", tbDate, sizeof(tbDate), "");
+        load("material", tbMatl, sizeof(tbMatl), "");
+        load("finish", tbFinish, sizeof(tbFinish), "");
+        load("rev", tbRev, sizeof(tbRev), "A");
+        load("scale", tbScale, sizeof(tbScale), "1:1");
+        load("sheet", tbSheetNo, sizeof(tbSheetNo), "1/1");
+        load("company", tbCompany, sizeof(tbCompany), "");
+        std::string sz = djstr(sheet, "size");
+        tbSizeIdx = 1;
+        for (int i = 0; i < IM_ARRAYSIZE(kSizes); ++i)
+            if (sz == kSizes[i]) { tbSizeIdx = i; break; }
+        tbLoaded = true;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(360 * ui::uiScale, 0), ImGuiCond_Appearing);
+    if (ImGui::BeginPopup("Sheet Properties##sheetprops")) {
+        ImGui::SetNextItemWidth(120 * ui::uiScale);
+        ImGui::Combo("Sheet size", &tbSizeIdx, kSizes, IM_ARRAYSIZE(kSizes));
+        ImGui::Separator();
+        ImGui::InputText("Title", tbTitle, sizeof(tbTitle));
+        ImGui::InputText("Drawn by", tbDrawn, sizeof(tbDrawn));
+        ImGui::InputText("Date", tbDate, sizeof(tbDate));
+        ImGui::InputText("Material", tbMatl, sizeof(tbMatl));
+        ImGui::InputText("Finish", tbFinish, sizeof(tbFinish));
+        ImGui::InputText("Scale", tbScale, sizeof(tbScale));
+        ImGui::InputText("Rev", tbRev, sizeof(tbRev));
+        ImGui::InputText("Sheet", tbSheetNo, sizeof(tbSheetNo));
+        ImGui::InputText("Company", tbCompany, sizeof(tbCompany));
+        ImGui::Separator();
+        if (ImGui::Button("Apply", ImVec2(120 * ui::uiScale, 0))) {
+            std::string sheetId = djstr(sheet, "id");
+            // Sheet size (only if it changed) then the title-block fields.
+            std::string curSize = djstr(sheet, "size");
+            if (curSize != kSizes[tbSizeIdx]) {
+                nlohmann::json res;
+                drawCall(st, "drawing_set_sheet",
+                         {{"doc_id", tab.drawingDocId}, {"sheet_id", sheetId},
+                          {"size", kSizes[tbSizeIdx]}}, res, "Sheet size");
+                absorbDrawingResult(st, tab, res);
+                tab.drawNeedFit = true;
+            }
+            nlohmann::json fields = {
+                {"title", tbTitle}, {"drawn_by", tbDrawn}, {"date", tbDate}, {"material", tbMatl},
+                {"finish", tbFinish}, {"scale", tbScale}, {"rev", tbRev}, {"sheet", tbSheetNo},
+                {"company", tbCompany}};
+            nlohmann::json res;
+            if (drawCall(st, "drawing_set_titleblock",
+                         {{"doc_id", tab.drawingDocId}, {"sheet_id", sheetId}, {"fields", fields}},
+                         res, "Title block")) {
+                absorbDrawingResult(st, tab, res);
+            }
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(90 * ui::uiScale, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    } else {
+        tbLoaded = false;
+    }
 }
 
 void drawDrawingSheet(AppState& st) {
@@ -453,123 +954,48 @@ void drawDrawingSheet(AppState& st) {
     if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return;
     AppState::DocTab& tab = st.docTabs[st.activeTab];
 
-    // ---- header strip: title + Rebuild + Fit ----
+    // ---- compact status strip (the tools now live on the View Layout / Annotation ribbon tabs) ----
+    // SolidWorks-style contextual ribbon owns Rebuild/Fit/Export/Views/Dimensions/Callouts; this
+    // strip just echoes the active tool's current click-stage + the canvas hotkeys.
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
     ImGui::TextUnformatted("Drawing");
     ImGui::PopStyleColor();
     ImGui::SameLine();
-    if (ImGui::SmallButton("Rebuild")) {
-        // Re-fetch from the engine (it reprojects from the live source part).
-        st.refreshDrawingTab(st.activeTab);
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Re-project from the source part (picks up edits)");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Fit")) tab.drawNeedFit = true;
-    // ---- 2D export: DXF (manufacturing) + PDF ----
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Export DXF")) exportActiveDrawing(st, "dxf");
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Write this drawing's views to a DXF (layers VISIBLE + HIDDEN)");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Export PDF")) exportActiveDrawing(st, "pdf");
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Write this drawing's views to a vector PDF (1:1 mm)");
-
-    // ---- W13: Dimension tool (arm/disarm) + type, and BOM toggle ----
-    ImGui::SameLine();
     {
-        bool armed = tab.dimToolActive;
-        if (armed) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.62f, 0.18f, 1.0f));
-        if (ImGui::SmallButton(armed ? "Dimension*" : "Dimension")) {
-            tab.dimToolActive = !tab.dimToolActive;
-            tab.dimStage = 0;
-            tab.dimViewId.clear();
-            if (tab.dimToolActive) { tab.selAnnViewId.clear(); tab.selAnnId.clear(); }
-        }
-        if (armed) ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Place a linear dimension: click two polyline vertices, then a 3rd "
-                              "click sets the text position. Esc cancels.");
-    }
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(86 * s);
-    {
-        const char* kinds[] = {"linear", "aligned"};
-        int cur = (tab.dimType == "aligned_dim") ? 1 : 0;
-        if (ImGui::Combo("##dimtype", &cur, kinds, 2))
-            tab.dimType = (cur == 1) ? "aligned_dim" : "linear_dim";
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("linear = horizontal/vertical span; aligned = true point-to-point distance");
-
-    // ---- W15: Section View tool ----
-    ImGui::SameLine();
-    {
-        bool armed = tab.sectionToolActive;
-        if (armed) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.62f, 0.18f, 1.0f));
-        if (ImGui::SmallButton(armed ? "Section*" : "Section")) {
-            bool now = !tab.sectionToolActive;
-            // Disarm the other modal tools (mutually exclusive).
-            tab.dimToolActive = false; tab.detailToolActive = false;
-            tab.sectionToolActive = now;
-            tab.sectionStage = 0; tab.sectionViewId.clear();
-            if (now) { tab.selAnnViewId.clear(); tab.selAnnId.clear(); }
-        }
-        if (armed) ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Section View: click two points across a view to drop a cutting line; "
-                              "the cut model is projected with the cut faces hatched. Esc cancels.");
-    }
-    // ---- W15: Detail View tool ----
-    ImGui::SameLine();
-    {
-        bool armed = tab.detailToolActive;
-        if (armed) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.62f, 0.18f, 1.0f));
-        if (ImGui::SmallButton(armed ? "Detail*" : "Detail")) {
-            bool now = !tab.detailToolActive;
-            tab.dimToolActive = false; tab.sectionToolActive = false;
-            tab.detailToolActive = now;
-            tab.detailStage = 0; tab.detailViewId.clear();
-            if (now) { tab.selAnnViewId.clear(); tab.selAnnId.clear(); }
-        }
-        if (armed) ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Detail View: click a center on a view, then drag to set the circle "
-                              "radius; a magnified crop is created. Esc cancels.");
-    }
-
-    // BOM toggle — only meaningful for assembly source drawings; we fetch lazily and disable for
-    // part drawings (the engine returns is_assembly=false + empty rows).
-    ImGui::SameLine();
-    if (ImGui::SmallButton(tab.bomVisible ? "BOM*" : "BOM")) {
-        tab.bomVisible = !tab.bomVisible;
-        if (tab.bomVisible && !tab.bomFetched) fetchBom(st, tab);
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Toggle the Bill of Materials table (assembly drawings list components)");
-
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
-    if (tab.dimToolActive || tab.sectionToolActive || tab.detailToolActive) {
-        const char* stageMsg;
+        const char* stageMsg = nullptr;
         if (tab.dimToolActive)
-            stageMsg = tab.dimStage == 0 ? "  click vertex A"
-                     : tab.dimStage == 1 ? "  click vertex B"
-                                         : "  click to place text";
+            stageMsg = tab.dimStage == 0 ? "Smart Dimension: click vertex A"
+                     : tab.dimStage == 1 ? "Smart Dimension: click vertex B"
+                                         : "Smart Dimension: click to place text";
         else if (tab.sectionToolActive)
-            stageMsg = tab.sectionStage == 0 ? "  click the cutting-line start across a view"
-                                             : "  click the cutting-line end";
-        else
-            stageMsg = tab.detailStage == 0 ? "  click the detail-circle center on a view"
-                                            : "  move to set the radius, click to finish";
-        ImGui::PopStyleColor();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.62f, 0.18f, 1.0f));
-        ImGui::TextUnformatted(stageMsg);
-    } else {
-        ImGui::Text("  wheel: zoom   MMB / Space+drag: pan   Del: delete dim");
+            stageMsg = tab.sectionStage == 0 ? "Section: click the cutting-line start across a view"
+                                             : "Section: click the cutting-line end";
+        else if (tab.detailToolActive)
+            stageMsg = tab.detailStage == 0 ? "Detail: click the circle center on a view"
+                                            : "Detail: move to set the radius, click to finish";
+        else if (tab.modelItemsActive)  stageMsg = "Model Items: click a view to auto-dimension it";
+        else if (tab.holeCalloutActive) stageMsg = "Hole Callout: click a circle";
+        else if (tab.centerMarkActive)  stageMsg = "Center Mark: click a circle";
+        else if (tab.centerLineActive)
+            stageMsg = tab.centerLineStage == 0 ? "Center Line: click the first point"
+                                                : "Center Line: click the second point";
+        else if (tab.noteActive)        stageMsg = "Note: click to place a note";
+        else if (tab.balloonActive)     stageMsg = "Balloon: click to drop an item bubble";
+
+        if (stageMsg) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.62f, 0.18f, 1.0f));
+            ImGui::TextUnformatted(stageMsg);
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Done")) disarmDrawTools(tab);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
+            ImGui::TextUnformatted("double-click a dim to edit  |  drag to reposition  |  "
+                                   "wheel zoom  |  MMB / Space+drag pan  |  Del removes");
+            ImGui::PopStyleColor();
+        }
     }
-    ImGui::PopStyleColor();
 
     // ---- canvas child ----
     ImVec2 canvasMin = ImGui::GetCursorScreenPos();
@@ -871,6 +1297,9 @@ void drawDrawingSheet(AppState& st) {
         }
     }
 
+    // ---- W17: standard title block in the sheet's bottom-right corner ----
+    renderTitleBlock(dl, *sheet, toScreen, paperW, paperH, s);
+
     // ---- W13: render stored dimensions/notes (over the geometry) ----
     if (sheet->contains("views") && (*sheet)["views"].is_array()) {
         for (const auto& v : (*sheet)["views"]) {
@@ -888,11 +1317,9 @@ void drawDrawingSheet(AppState& st) {
 
     // ---- W13: dimension tool interaction (snap + place) + annotation select/delete ----
     {
-        // Esc cancels the in-progress dimension/section/detail (or disarms a fresh tool).
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-            if (tab.dimToolActive) { tab.dimStage = 0; tab.dimViewId.clear(); }
-            if (tab.sectionToolActive) { tab.sectionStage = 0; tab.sectionViewId.clear(); }
-            if (tab.detailToolActive) { tab.detailStage = 0; tab.detailViewId.clear(); }
+        // Esc cancels the in-progress action and disarms whatever tool is armed.
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape) && anyDrawToolActive(tab)) {
+            disarmDrawTools(tab);
         }
         ImVec2 mouse = ImGui::GetIO().MousePos;
         bool overCanvas = canvasHovered;
@@ -988,13 +1415,99 @@ void drawDrawingSheet(AppState& st) {
                     tab.dimViewId.clear();
                 }
             }
-        } else if (!tab.dimToolActive && !tab.sectionToolActive && !tab.detailToolActive &&
-                   overCanvas && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown &&
-                   !panning) {
-            // Selection: pick the nearest stored dimension's text position to the click.
-            std::string hitView, hitAnn; double bestD2 = (14.0 / std::max(z, 1e-4f)) *
-                                                          (14.0 / std::max(z, 1e-4f));
-            if (sheet->contains("views") && (*sheet)["views"].is_array()) {
+        }
+        // ---- W17: Model Items — click a view to auto-dimension it ----
+        else if (tab.modelItemsActive && overCanvas) {
+            std::string overView = viewAtPoint(*sheet, curMx, curMy, 8.0);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
+                if (!overView.empty()) { commitModelItems(st, tab, overView); tab.modelItemsActive = false; }
+                else st.toast(ui::ToastLevel::Warn, "Click a view to auto-dimension");
+            }
+        }
+        // ---- W17: Hole Callout / Center Mark — snap a circle, drop the callout ----
+        else if ((tab.holeCalloutActive || tab.centerMarkActive) && overCanvas) {
+            double sx, sy; std::string svid;
+            bool snapped = snapToVertex(*sheet, curMx, curMy, snapRadiusMm * 2.0, sx, sy, svid);
+            if (snapped) {
+                ImVec2 sp = toScreen(sx, sy);
+                dl->AddCircle(sp, 5.0f * s, IM_COL32(220, 120, 30, 255), 12, 1.6f * s);
+            }
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
+                std::string overView = !svid.empty() ? svid : viewAtPoint(*sheet, curMx, curMy, 8.0);
+                if (overView.empty()) {
+                    st.toast(ui::ToastLevel::Warn, "Click on a circle in a view");
+                } else if (tab.holeCalloutActive) {
+                    commitHoleCallout(st, tab, overView, (float)curMx, (float)curMy);
+                    tab.holeCalloutActive = false;
+                } else {
+                    commitExtDim(st, tab, overView, "center_mark",
+                                 nlohmann::json::array({curMx, curMy}), nlohmann::json(), "");
+                    tab.centerMarkActive = false;
+                }
+            }
+        }
+        // ---- W17: Center Line — two clicks ----
+        else if (tab.centerLineActive && overCanvas) {
+            double sx, sy; std::string svid;
+            bool snapped = snapToVertex(*sheet, curMx, curMy, snapRadiusMm, sx, sy, svid);
+            if (snapped) {
+                ImVec2 sp = toScreen(sx, sy);
+                dl->AddCircle(sp, 5.0f * s, IM_COL32(220, 120, 30, 255), 12, 1.6f * s);
+            }
+            if (tab.centerLineStage == 1) {
+                ImVec2 a = toScreen(tab.centerLineAx, tab.centerLineAy);
+                ImVec2 b = snapped ? toScreen(sx, sy) : mouse;
+                addDashedPolyline(dl, {a, b}, IM_COL32(220, 120, 30, 160), 1.2f * s, 9.0f * s, 4.0f * s);
+            }
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
+                double mx = snapped ? sx : curMx, my = snapped ? sy : curMy;
+                if (tab.centerLineStage == 0) {
+                    tab.centerLineAx = (float)mx; tab.centerLineAy = (float)my;
+                    tab.dimViewId = !svid.empty() ? svid : viewAtPoint(*sheet, curMx, curMy, 8.0);
+                    tab.centerLineStage = 1;
+                } else {
+                    std::string overView = tab.dimViewId.empty()
+                                               ? viewAtPoint(*sheet, curMx, curMy, 8.0)
+                                               : tab.dimViewId;
+                    if (!overView.empty())
+                        commitExtDim(st, tab, overView, "center_line",
+                                     nlohmann::json::array({tab.centerLineAx, tab.centerLineAy}),
+                                     nlohmann::json::array({mx, my}), "");
+                    tab.centerLineStage = 0; tab.dimViewId.clear();
+                }
+            }
+        }
+        // ---- W17: Note / Balloon — single click drops the annotation ----
+        else if ((tab.noteActive || tab.balloonActive) && overCanvas) {
+            double sx, sy; std::string svid;
+            bool snapped = tab.balloonActive &&
+                           snapToVertex(*sheet, curMx, curMy, snapRadiusMm, sx, sy, svid);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
+                std::string overView = !svid.empty() ? svid : viewAtPoint(*sheet, curMx, curMy, 24.0);
+                if (overView.empty() && sheet->contains("views") && (*sheet)["views"].is_array() &&
+                    !(*sheet)["views"].empty()) {
+                    const auto& v0 = (*sheet)["views"][0];
+                    overView = djstr(v0, "view_id").empty() ? djstr(v0, "id") : djstr(v0, "view_id");
+                }
+                if (!overView.empty()) {
+                    if (tab.noteActive)
+                        commitExtDim(st, tab, overView, "note",
+                                     nlohmann::json::array({curMx, curMy}),
+                                     nlohmann::json::array({curMx, curMy}), "NOTE");
+                    else
+                        commitBalloon(st, tab, overView, snapped ? (float)sx : (float)curMx,
+                                      snapped ? (float)sy : (float)curMy);
+                }
+                tab.noteActive = false; tab.balloonActive = false;
+            }
+        }
+        // ---- selection + double-click-to-edit + drag-to-reposition (no tool armed) ----
+        else if (!anyDrawToolActive(tab) && overCanvas) {
+            // Nearest stored annotation's text position to the cursor (sheet-mm pick radius).
+            auto pickAnn = [&](double qx, double qy, std::string& hv, std::string& ha,
+                               double& hx, double& hy) {
+                double bestD2 = (14.0 / std::max(z, 1e-4f)) * (14.0 / std::max(z, 1e-4f));
+                if (!(sheet->contains("views") && (*sheet)["views"].is_array())) return;
                 for (const auto& v : (*sheet)["views"]) {
                     if (!v.is_object() || !v.contains("annotations") ||
                         !v["annotations"].is_array()) continue;
@@ -1005,17 +1518,70 @@ void drawDrawingSheet(AppState& st) {
                         auto it = ann.find("pos");
                         if (it == ann.end() || !it->is_array() || it->size() != 2) continue;
                         double ppx = (*it)[0].get<double>(), ppy = (*it)[1].get<double>();
-                        double d2 = (ppx - curMx) * (ppx - curMx) + (ppy - curMy) * (ppy - curMy);
-                        if (d2 < bestD2) { bestD2 = d2; hitView = vid; hitAnn = djstr(ann, "id"); }
+                        double d2 = (ppx - qx) * (ppx - qx) + (ppy - qy) * (ppy - qy);
+                        if (d2 < bestD2) { bestD2 = d2; hv = vid; ha = djstr(ann, "id");
+                                           hx = ppx; hy = ppy; }
                     }
                 }
+            };
+            // Double-click opens the dimension editor for the annotation under the cursor.
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !spaceDown) {
+                std::string hv, ha; double hx = 0, hy = 0;
+                pickAnn(curMx, curMy, hv, ha, hx, hy);
+                if (!ha.empty()) {
+                    tab.selAnnViewId = hv; tab.selAnnId = ha;
+                    s_annEditOpen = true; s_annEditLoaded = false;
+                }
+            } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown && !panning) {
+                std::string hv, ha; double hx = 0, hy = 0;
+                pickAnn(curMx, curMy, hv, ha, hx, hy);
+                tab.selAnnViewId = hv; tab.selAnnId = ha;   // empty clears the selection
             }
-            tab.selAnnViewId = hitView;   // empty clears the selection
-            tab.selAnnId = hitAnn;
+            // Drag the selected annotation's text to reposition it (commit on release).
+            if (!tab.selAnnId.empty() && !spaceDown) {
+                // current pos of the selected annotation
+                double selx = 0, sely = 0; bool haveSel = false;
+                for (const auto& v : (*sheet)["views"]) {
+                    if (!v.is_object() || !v.contains("annotations") ||
+                        !v["annotations"].is_array()) continue;
+                    const std::string vid = djstr(v, "view_id").empty() ? djstr(v, "id")
+                                                                        : djstr(v, "view_id");
+                    if (vid != tab.selAnnViewId) continue;
+                    for (const auto& ann : v["annotations"])
+                        if (ann.is_object() && djstr(ann, "id") == tab.selAnnId) {
+                            auto it = ann.find("pos");
+                            if (it != ann.end() && it->is_array() && it->size() == 2) {
+                                selx = (*it)[0].get<double>(); sely = (*it)[1].get<double>();
+                                haveSel = true;
+                            }
+                        }
+                }
+                if (haveSel && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                    if (!s_annDragActive) {
+                        // arm only if the drag began near the selected annotation
+                        ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+                        ImVec2 press(mouse.x - dd.x, mouse.y - dd.y);
+                        ImVec2 selS = toScreen(selx, sely);
+                        float pr = 16.0f * s;
+                        if (std::fabs(press.x - selS.x) < pr && std::fabs(press.y - selS.y) < pr)
+                            s_annDragActive = true;
+                    }
+                    if (s_annDragActive) {
+                        ImVec2 selS = toScreen(selx, sely);
+                        dl->AddLine(selS, mouse, IM_COL32(220, 120, 30, 200), 1.2f * s);
+                        dl->AddCircleFilled(mouse, 3.0f * s, IM_COL32(220, 120, 30, 220));
+                    }
+                }
+                if (s_annDragActive && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                    applyAnnPatch(st, tab, tab.selAnnViewId, tab.selAnnId,
+                                  {{"pos", nlohmann::json::array({curMx, curMy})}});
+                    s_annDragActive = false;
+                }
+            }
         }
 
-        // Delete the selected dimension.
-        if (!tab.dimToolActive && !tab.selAnnId.empty() &&
+        // Delete the selected annotation.
+        if (!anyDrawToolActive(tab) && !tab.selAnnId.empty() &&
             (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
             deleteAnnotation(st, tab, tab.selAnnViewId, tab.selAnnId);
         }
@@ -1091,6 +1657,10 @@ void drawDrawingSheet(AppState& st) {
     }
 
     dl->PopClipRect();
+
+    // ---- W17: editor popups (rendered last; they are separate ImGui windows) ----
+    renderDimEditorPopup(st, tab, *sheet);
+    renderTitleBlockPopup(st, tab, *sheet);
 }
 
 }  // namespace ui

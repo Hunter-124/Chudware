@@ -82,6 +82,12 @@ private:
     // ---------- external-flow scenario (AI_CAD_SHOT=flow) ----------
     int flowStep = 0, flowSettle = 0, flowWaitFrames = 0;
 
+    // ---------- W17 engineering-drawing scenario (AI_CAD_SHOT=drawing) ----------
+    void runDrawing(AppState& st);
+    int dwgStep = 0, dwgSettle = 0;
+    bool dwgDirReady = false;
+    std::string dwgSavePath, dwgCapture;
+
     // ---------- C19 evalmass scenario (AI_CAD_SHOT=evalmass) ----------
     int evalStep = 0, evalSettle = 0;
 

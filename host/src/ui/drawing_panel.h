@@ -11,6 +11,8 @@
 // scale / annotation editing is a later wave — this pass is create + render + pan/zoom only.
 #pragma once
 
+#include <string>
+
 struct AppState;
 
 namespace ui {
@@ -19,5 +21,11 @@ namespace ui {
 // from drawViewportPanel after it has Begun the central "Viewport" dock window and confirmed the
 // active tab is a Drawing. Reads + mutates only the active DocTab's drawing cache + sheet pan/zoom.
 void drawDrawingSheet(AppState& state);
+
+// W17: dispatch a "dwg_*" ribbon command (View Layout / Annotation tabs) against the active
+// Drawing tab — adds views, arms annotation tools, opens the title-block editor, exports, etc.
+// Returns true if the command was recognized + handled (false otherwise, so app.cpp can fall
+// through). No-op + returns true with a toast when the active tab is not a Drawing.
+bool drawingHandleCommand(AppState& state, const std::string& cmd);
 
 }  // namespace ui

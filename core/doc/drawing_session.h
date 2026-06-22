@@ -102,6 +102,54 @@ nlohmann::json drawing_add_dim(const std::string& doc_id, const std::string& vie
 nlohmann::json drawing_remove_annotation(const std::string& doc_id, const std::string& view_id,
                                          const std::string& ann_id);
 
+// drawing_set_annotation: patch detailing fields on an existing annotation without
+// recreating it (the "double-click to edit" / agent set_dim path). `patch` is an object
+// holding any of: tol_type ("none|symmetric|deviation|limit|basic"), tol_upper, tol_lower,
+// prefix, suffix, precision (int), critical (bool), count (int), pos ([x,y]), value (model
+// override), text (verbatim display override; "" clears it). The on-sheet display text is
+// recomposed from value + fields for numeric dims. Returns {annotation, drawing}.
+nlohmann::json drawing_set_annotation(const std::string& doc_id, const std::string& view_id,
+                                      const std::string& ann_id, const nlohmann::json& patch);
+
+// drawing_add_callout: SolidWorks-style smart callouts attached to a view.
+//   kind "hole"   -> snaps the nearest projected circle to `a`, emits "n× ⌀d" (count is
+//                    the number of same-diameter holes in the view). opts: pos, suffix.
+//   kind "balloon"-> item-number bubble (opts: item, pos, text); `a` is the leader anchor.
+// Returns {annotation, drawing}.
+nlohmann::json drawing_add_callout(const std::string& doc_id, const std::string& view_id,
+                                   const std::string& kind, const nlohmann::json& a,
+                                   const nlohmann::json& opts);
+
+// drawing_model_items: auto-dimension a view — overall width/height from the bbox plus a
+// diameter callout per distinct projected circle. Annotations are tagged "auto":true.
+// Returns the full drawing plus {added, view_id}.
+nlohmann::json drawing_model_items(const std::string& doc_id, const std::string& view_id);
+
+// drawing_set_titleblock: merge title-block fields (title, drawn_by, date, scale, sheet,
+// rev, material, finish, ...) onto a sheet. Returns {title_block, drawing}.
+nlohmann::json drawing_set_titleblock(const std::string& doc_id, const std::string& sheet_id,
+                                      const nlohmann::json& fields);
+
+// drawing_set_sheet: change a sheet's paper size (one of the ISO/ANSI keys A4..A0 / A..E).
+// Returns {size, drawing}.
+nlohmann::json drawing_set_sheet(const std::string& doc_id, const std::string& sheet_id,
+                                 const std::string& size);
+
+// drawing_make: ONE-SHOT drawing authoring for the copilot. From a live source part
+// (source_doc_id) build a complete drawing in a single call and return {doc_id, drawing}. The
+// spec is intentionally tiny so even small local models can emit it:
+//   {
+//     "name":   "<drawing name>",                  // optional
+//     "sheet":  "A3",                               // optional ISO/ANSI size
+//     "views":  ["front","top","right","iso"],      // default: front/top/right/iso
+//     "model_items":   true,                        // auto-dimension each ortho view (default true)
+//     "hole_callouts": false,                       // add ⌀ callouts to each distinct hole
+//     "title":  {"title":"...","drawn_by":"...","material":"...","scale":"1:1","rev":"A", ...}
+//   }
+// Every step reuses the same associative engine path as the interactive tools, so the result is
+// a fully editable drawing. Unknown view names are skipped (never throws on a bad view).
+nlohmann::json drawing_make(const std::string& source_doc_id, const nlohmann::json& spec);
+
 // drawing_get: the full drawing doc + every view's projected geometry (re-projected
 // against the source's current bodies). Mirrors get_drawing_full.
 nlohmann::json drawing_get(const std::string& doc_id);

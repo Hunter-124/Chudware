@@ -3756,23 +3756,38 @@ bool render_iso_png(const std::vector<aicm::AicmBody>& bodies, const std::string
 
 }  // namespace
 
+// Tessellate the surviving solids of `s` into AICM bodies (no lock — callers hold g_mtx).
+static std::vector<aicm::AicmBody> tessellate_session_bodies(Session& s) {
+    std::vector<aicm::AicmBody> bodies;
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    uint32_t id = 1;
+    const float color[3] = {0.62f, 0.70f, 0.82f};
+    for (const auto& shp : r.shapes) {
+        try {
+            bodies.push_back(::geom::tessellate_body(shp, id, "b" + std::to_string(id), color));
+            ++id;
+        } catch (...) {
+        }
+    }
+    return bodies;
+}
+
+std::vector<aicm::AicmBody> doc_tessellate_bodies(const std::string& doc_id) {
+    try {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        Session& s = require_session(doc_id);
+        return tessellate_session_bodies(s);
+    } catch (...) {
+        return {};
+    }
+}
+
 json doc_render_png(const std::string& doc_id, const std::string& out_path) {
     try {
         std::lock_guard<std::mutex> lk(g_mtx);
         Session& s = require_session(doc_id);
-        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
-        if (r.shapes.empty()) return json{{"ok", false}, {"reason", "no bodies"}};
-        std::vector<aicm::AicmBody> bodies;
-        uint32_t id = 1;
-        const float color[3] = {0.62f, 0.70f, 0.82f};
-        for (const auto& shp : r.shapes) {
-            try {
-                bodies.push_back(::geom::tessellate_body(shp, id, "b" + std::to_string(id), color));
-                ++id;
-            } catch (...) {
-            }
-        }
-        if (bodies.empty()) return json{{"ok", false}, {"reason", "tessellation failed"}};
+        std::vector<aicm::AicmBody> bodies = tessellate_session_bodies(s);
+        if (bodies.empty()) return json{{"ok", false}, {"reason", "no bodies"}};
         bool ok = render_iso_png(bodies, out_path);
         return json{{"ok", ok}, {"path", ok ? out_path : std::string()}};
     } catch (...) {

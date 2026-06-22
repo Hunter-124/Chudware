@@ -21,8 +21,11 @@
 #include <array>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
+
+#include "geom/aicm.h"  // aicm::AicmBody (doc_tessellate_bodies)
 
 namespace aicad::doc {
 
@@ -168,6 +171,11 @@ nlohmann::json doc_push_pull(const std::string& doc_id, int body_id, int topo_id
 // exports as-is; multiple bodies combine into a compound. Returns {"path": <abs>}.
 // Throws OpError("export_failed", "document has no solid bodies to export") on empty.
 nlohmann::json doc_export_step(const std::string& doc_id, const std::string& path);
+
+// doc_tessellate_bodies: tessellate the document's surviving solids and return them as AICM
+// bodies (flat pos/idx in WORLD mm). Used by the agent CFD path (voxelize -> wind tunnel) and the
+// preview renderer. Returns an empty vector on no bodies / failure (never throws).
+std::vector<aicm::AicmBody> doc_tessellate_bodies(const std::string& doc_id);
 
 // doc_render_png: render the document's surviving solids to a small isometric shaded PNG at
 // `out_path` (a lightweight software rasterizer — no GL). Used by the agent's vision review so

@@ -16,14 +16,17 @@
 
 #include "api/libaicad.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <exception>
+#include <regex>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -45,6 +48,7 @@
 #include "agent/providers.h"
 #include "agent/http.h"
 #include "agent/roles.h"
+#include "sim/flow_run.h"
 #include "agent/run.h"
 #include "agent/state.h"
 #include "doc/document.h"
@@ -1620,6 +1624,109 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 params.value("doc_id", std::string()),
                                 params.value("out_path", std::string())),
                             out_json, 0);
+            if (m == "sim_run_flow") {
+                // {doc_id, velocity, aoa?, fluid?, cells?, n_steps?} -> wind-tunnel LBM forces.
+                std::string doc_id = params.value("doc_id", std::string());
+                std::vector<aicm::AicmBody> bodies = aicad::doc::doc_tessellate_bodies(doc_id);
+                if (bodies.empty())
+                    return emit(json{{"ok", false}, {"error", "no solid geometry to simulate"}},
+                                out_json, 0);
+                std::vector<std::vector<float>> bp;
+                std::vector<std::vector<uint32_t>> bi;
+                for (auto& b : bodies) { bp.push_back(b.pos); bi.push_back(b.idx); }
+                aicad::sim::FlowParams fp;
+                fp.velocity_ms = params.value("velocity", 10.0);
+                fp.aoa_deg = params.value("aoa", 0.0);
+                std::string fluid = params.value("fluid", std::string("air"));
+                if (fluid == "water") { fp.nu_fluid = 1.0e-6; fp.rho_fluid = 1000.0; }
+                fp.cells = params.value("cells", 96);
+                fp.n_steps = params.value("n_steps", 2000);
+                double re = 0.0;
+                aicad::sim::LbmResult r = aicad::sim::run_wind_tunnel(bp, bi, fp, &re);
+                if (!r.ok)
+                    return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
+                return emit(json{{"ok", true},
+                                 {"drag_n", r.drag_n},
+                                 {"lift_n", r.lift_n},
+                                 {"cd", r.cd},
+                                 {"frontal_area_mm2", r.frontal_area_mm2},
+                                 {"reynolds", re},
+                                 {"velocity_ms", fp.velocity_ms},
+                                 {"aoa_deg", fp.aoa_deg},
+                                 {"fluid", fluid},
+                                 {"steps_run", r.steps_run},
+                                 {"diverged", r.diverged},
+                                 {"grid", {r.nx, r.ny, r.nz}}},
+                            out_json, 0);
+            }
+            if (m == "agent_simulate_v1") {
+                // "AI runs CFD": {doc_id, request} (+ optional explicit velocity/aoa/fluid) ->
+                // parse a flow condition from natural language, run the wind tunnel, return forces
+                // + a human summary. No LLM needed (regex parse), so it works fully offline.
+                std::string doc_id = params.value("doc_id", std::string());
+                std::string req = params.value("request", std::string());
+                std::string lo = req;
+                std::transform(lo.begin(), lo.end(), lo.begin(),
+                               [](unsigned char c) { return (char)std::tolower(c); });
+                aicad::sim::FlowParams fp;
+                // velocity: explicit param wins; else parse "<n> m/s|mps|mph|km/h|kph|knots".
+                if (params.contains("velocity")) {
+                    fp.velocity_ms = params.value("velocity", 10.0);
+                } else {
+                    std::smatch mm;
+                    std::regex rv(R"((\d+(?:\.\d+)?)\s*(m/s|mps|mph|km/?h|kph|knots?|kt))");
+                    if (std::regex_search(lo, mm, rv)) {
+                        double v = std::stod(mm[1].str());
+                        std::string u = mm[2].str();
+                        if (u == "mph") v *= 0.44704;
+                        else if (u.rfind("km", 0) == 0 || u == "kph") v *= 0.27778;
+                        else if (u.rfind("kn", 0) == 0 || u == "kt") v *= 0.514444;
+                        fp.velocity_ms = v;
+                    }
+                }
+                // aoa: explicit param wins; else parse "<n> deg" (optionally near 'attack'/'aoa').
+                if (params.contains("aoa")) {
+                    fp.aoa_deg = params.value("aoa", 0.0);
+                } else {
+                    std::smatch ma;
+                    std::regex raoa(R"((-?\d+(?:\.\d+)?)\s*(?:deg|degree|degrees|\xc2\xb0))");
+                    if (std::regex_search(lo, ma, raoa)) fp.aoa_deg = std::stod(ma[1].str());
+                }
+                std::string fluid = params.value("fluid", std::string());
+                if (fluid.empty()) fluid = (lo.find("water") != std::string::npos) ? "water" : "air";
+                if (fluid == "water") { fp.nu_fluid = 1.0e-6; fp.rho_fluid = 1000.0; }
+                fp.cells = params.value("cells", 96);
+                fp.n_steps = params.value("n_steps", 2000);
+
+                std::vector<aicm::AicmBody> bodies = aicad::doc::doc_tessellate_bodies(doc_id);
+                if (bodies.empty())
+                    return emit(json{{"ok", false},
+                                     {"answer", "There's no solid geometry to simulate yet — model "
+                                                "the part first, then ask me to run the flow sim."}},
+                                out_json, 0);
+                std::vector<std::vector<float>> bp;
+                std::vector<std::vector<uint32_t>> bi;
+                for (auto& b : bodies) { bp.push_back(b.pos); bi.push_back(b.idx); }
+                double re = 0.0;
+                aicad::sim::LbmResult r = aicad::sim::run_wind_tunnel(bp, bi, fp, &re);
+                if (!r.ok)
+                    return emit(json{{"ok", false}, {"answer", "The flow sim could not run: " + r.error}},
+                                out_json, 0);
+                char buf[512];
+                std::snprintf(buf, sizeof(buf),
+                              "Wind-tunnel CFD at %.1f m/s%s, %.1f deg AoA (Re %.0f): drag %.3f N, "
+                              "lift %.3f N, Cd %.3f, frontal area %.0f mm^2. (Coarse LBM grid "
+                              "%dx%dx%d, %d steps — directional estimate.)",
+                              fp.velocity_ms, fluid == "water" ? " in water" : "", fp.aoa_deg, re,
+                              r.drag_n, r.lift_n, r.cd, r.frontal_area_mm2, r.nx, r.ny, r.nz,
+                              r.steps_run);
+                return emit(json{{"ok", true},
+                                 {"answer", std::string(buf)},
+                                 {"drag_n", r.drag_n}, {"lift_n", r.lift_n}, {"cd", r.cd},
+                                 {"frontal_area_mm2", r.frontal_area_mm2}, {"reynolds", re},
+                                 {"velocity_ms", fp.velocity_ms}, {"aoa_deg", fp.aoa_deg}},
+                            out_json, 0);
+            }
             if (m == "doc_face_points")
                 return emit(aicad::doc::doc_face_points(
                                 params.value("doc_id", std::string()),
@@ -1901,6 +2008,53 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 params.value("doc_id", std::string()),
                                 params.value("view_id", std::string()),
                                 params.value("ann_id", std::string())),
+                            out_json, 0);
+            if (m == "drawing_set_annotation") {
+                // Detailing patch: any of tol_type/tol_upper/tol_lower/prefix/suffix/
+                // precision/critical/count/pos/value/text may ride either as a nested
+                // "patch" object or flat alongside the ids.
+                json patch = params.contains("patch") && params["patch"].is_object()
+                                 ? params["patch"]
+                                 : json::object();
+                for (const char* k : {"tol_type", "tol_upper", "tol_lower", "prefix", "suffix",
+                                      "precision", "critical", "count", "pos", "value", "text"})
+                    if (params.contains(k)) patch[k] = params[k];
+                return emit(aicad::doc::drawing_set_annotation(
+                                params.value("doc_id", std::string()),
+                                params.value("view_id", std::string()),
+                                params.value("ann_id", std::string()), patch),
+                            out_json, 0);
+            }
+            if (m == "drawing_add_callout") {
+                json o = params.contains("opts") && params["opts"].is_object() ? params["opts"]
+                                                                               : json::object();
+                for (const char* k : {"pos", "item", "text", "suffix"})
+                    if (params.contains(k)) o[k] = params[k];
+                return emit(aicad::doc::drawing_add_callout(
+                                params.value("doc_id", std::string()),
+                                params.value("view_id", std::string()),
+                                params.value("kind", std::string("hole")), opt("a"), o),
+                            out_json, 0);
+            }
+            if (m == "drawing_model_items")
+                return emit(aicad::doc::drawing_model_items(
+                                params.value("doc_id", std::string()),
+                                params.value("view_id", std::string())),
+                            out_json, 0);
+            if (m == "drawing_set_titleblock") {
+                json fields = params.contains("fields") && params["fields"].is_object()
+                                  ? params["fields"]
+                                  : json::object();
+                return emit(aicad::doc::drawing_set_titleblock(
+                                params.value("doc_id", std::string()),
+                                params.value("sheet_id", std::string()), fields),
+                            out_json, 0);
+            }
+            if (m == "drawing_set_sheet")
+                return emit(aicad::doc::drawing_set_sheet(
+                                params.value("doc_id", std::string()),
+                                params.value("sheet_id", std::string()),
+                                params.value("size", std::string("A3"))),
                             out_json, 0);
             if (m == "drawing_get")
                 return emit(aicad::doc::drawing_get(params.value("doc_id", std::string())),

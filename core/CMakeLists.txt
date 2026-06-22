@@ -107,7 +107,8 @@ add_library(aicad_sim STATIC
   sim/spice.cpp
   sim/numpy_rng.cpp
   sim/netlist.cpp
-  sim/lbm.cpp)
+  sim/lbm.cpp
+  sim/flow_run.cpp)
 target_include_directories(aicad_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(aicad_sim PRIVATE ${spectra_SOURCE_DIR}/include)
 target_link_libraries(aicad_sim PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_json)

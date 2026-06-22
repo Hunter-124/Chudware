@@ -43,6 +43,7 @@
 #include "agent/paths.h"
 #include "agent/ops_emit.h"
 #include "agent/providers.h"
+#include "agent/http.h"
 #include "agent/roles.h"
 #include "agent/run.h"
 #include "agent/state.h"
@@ -338,6 +339,11 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 std::string base_url = params.value("base_url", std::string());
                 req = aicad::agent::openai_build_request(model, system, messages, max_tokens,
                                                          base_url);
+            } else if (provider == "gemini") {
+                std::string model = params.value("model",
+                                                 std::string(aicad::agent::kGeminiDefaultModel));
+                std::string effort = params.value("reasoning_effort", std::string());
+                req = aicad::agent::gemini_build_request(model, system, messages, max_tokens, effort);
             } else {
                 return emit_error("agent_build_request: unknown provider: " + provider, out_json);
             }
@@ -357,6 +363,10 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             if (provider == "openai" || provider == "llamacpp") {
                 aicad::agent::ParsedReply pr = aicad::agent::openai_parse_response(resp);
                 return emit(json{{"text", pr.text}}, out_json, 0);
+            }
+            if (provider == "gemini") {
+                aicad::agent::ParsedReply pr = aicad::agent::gemini_parse_response(resp);
+                return emit(json{{"text", pr.text}, {"thinking", pr.thinking}}, out_json, 0);
             }
             return emit_error("agent_parse_response: unknown provider: " + provider, out_json);
         }
@@ -444,6 +454,71 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             json cfg = params.contains("cfg") ? params["cfg"] : json::object();
             json env = params.contains("env") ? params["env"] : json::object();
             return emit(aicad::agent::resolve_provider(name, cfg, env), out_json, 0);
+        }
+        if (m == "agent_list_models") {
+            // {provider, base_url?, api_key?} -> {ok, models:[id...], error?}. Probes the
+            // backend so the host model picker can hide unreachable / unkeyed providers.
+            std::string provider = params.value("provider", std::string());
+            std::string base_url = params.value("base_url", std::string());
+            std::string api_key = params.value("api_key", std::string());
+            json models = json::array();
+            if (provider == "openai" || provider == "llamacpp") {
+                std::string root = aicad::agent::openai_normalize_base_url(base_url);
+                if (root.empty()) root = "https://api.openai.com/v1";
+                std::vector<std::pair<std::string, std::string>> hdrs;
+                if (!api_key.empty()) hdrs.push_back({"Authorization", "Bearer " + api_key});
+                aicad::agent::HttpResponse hr = aicad::agent::http_get(root + "/models", hdrs);
+                if (!hr.error.empty())
+                    return emit(json{{"ok", false}, {"models", models}, {"error", hr.error}},
+                                out_json, 0);
+                if (hr.status < 200 || hr.status >= 300)
+                    return emit(json{{"ok", false}, {"models", models},
+                                     {"error", "HTTP " + std::to_string(hr.status)}}, out_json, 0);
+                json parsed = json::parse(hr.body, nullptr, false);
+                if (parsed.is_object() && parsed.contains("data") && parsed["data"].is_array())
+                    for (const auto& d : parsed["data"])
+                        if (d.contains("id") && d["id"].is_string())
+                            models.push_back(d["id"].get<std::string>());
+                return emit(json{{"ok", true}, {"models", models}}, out_json, 0);
+            }
+            if (provider == "gemini") {
+                if (api_key.empty())
+                    return emit(json{{"ok", false}, {"models", models}, {"error", "no api key"}},
+                                out_json, 0);
+                std::vector<std::pair<std::string, std::string>> hdrs = {{"x-goog-api-key", api_key}};
+                aicad::agent::HttpResponse hr = aicad::agent::http_get(
+                    "https://generativelanguage.googleapis.com/v1beta/models", hdrs);
+                if (!hr.error.empty())
+                    return emit(json{{"ok", false}, {"models", models}, {"error", hr.error}},
+                                out_json, 0);
+                if (hr.status < 200 || hr.status >= 300)
+                    return emit(json{{"ok", false}, {"models", models},
+                                     {"error", "HTTP " + std::to_string(hr.status)}}, out_json, 0);
+                json parsed = json::parse(hr.body, nullptr, false);
+                if (parsed.is_object() && parsed.contains("models") && parsed["models"].is_array())
+                    for (const auto& md : parsed["models"]) {
+                        bool gen = false;
+                        if (md.contains("supportedGenerationMethods") &&
+                            md["supportedGenerationMethods"].is_array())
+                            for (const auto& meth : md["supportedGenerationMethods"])
+                                if (meth.is_string() && meth.get<std::string>() == "generateContent")
+                                    gen = true;
+                        if (gen && md.contains("name") && md["name"].is_string()) {
+                            std::string nm = md["name"].get<std::string>();
+                            if (nm.rfind("models/", 0) == 0) nm = nm.substr(7);
+                            models.push_back(nm);
+                        }
+                    }
+                return emit(json{{"ok", true}, {"models", models}}, out_json, 0);
+            }
+            if (provider == "anthropic") {
+                // No keyless list endpoint; report availability by key presence + a static set.
+                bool ok = !api_key.empty();
+                if (ok) models.push_back("claude-opus-4-8");
+                return emit(json{{"ok", ok}, {"models", models}}, out_json, 0);
+            }
+            return emit(json{{"ok", false}, {"models", models}, {"error", "unknown provider"}},
+                        out_json, 0);
         }
         if (m == "agent_cap_raw") {
             std::string text = params.value("text", std::string());
@@ -1539,6 +1614,11 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 return emit(aicad::doc::doc_export_step(
                                 params.value("doc_id", std::string()),
                                 params.value("path", std::string())),
+                            out_json, 0);
+            if (m == "doc_render_png")
+                return emit(aicad::doc::doc_render_png(
+                                params.value("doc_id", std::string()),
+                                params.value("out_path", std::string())),
                             out_json, 0);
             if (m == "doc_face_points")
                 return emit(aicad::doc::doc_face_points(

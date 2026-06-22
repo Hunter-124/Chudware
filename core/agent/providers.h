@@ -70,6 +70,16 @@ BuiltRequest openai_build_request(const std::string& model, const std::string& s
                                   const std::string& base_url);
 ParsedReply openai_parse_response(const json& resp);
 
+// --- gemini (Google generativelanguage REST) --------------------------------
+extern const char* kGeminiDefaultModel;  // "gemini-2.5-pro"
+// _part(part): text -> {text}; image -> {inline_data:{mime_type,data}}.
+json gemini_part(const json& part);
+// reasoning_effort: ""/"off"/"low"/"medium"/"high" -> thinkingConfig (omitted when unknown/empty).
+BuiltRequest gemini_build_request(const std::string& model, const std::string& system,
+                                  const json& messages, int max_tokens,
+                                  const std::string& reasoning_effort);
+ParsedReply gemini_parse_response(const json& resp);
+
 // --- mock_provider.py -------------------------------------------------------
 // MockProvider: scripted replies in order; the last repeats once exhausted.
 class MockProvider {

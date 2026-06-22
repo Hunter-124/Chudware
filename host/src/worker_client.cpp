@@ -136,6 +136,13 @@ bool agentDocIsCpp(const std::string& method, const json& params) {
 }
 
 bool routeAgentToCpp(const std::string& method, const json& params) {
+    // Model-availability probe is doc-independent and provider-diagnostic; route it to the
+    // C++ core whenever the DLL loads, regardless of the agent flag (the host picker falls
+    // back to a static catalog if the core is unavailable).
+    if (method == "agent_list_models") {
+        std::string lerr;
+        return core::cpp_core().ensureLoaded(lerr);
+    }
     if (!cppAgentFlag()) return false;
     if (!(method == "agent_run_v2" || method == "agent_ask_v2" ||
           method == "agent_clarify_v1" || method == "agent_pm_assist_v1" ||
@@ -439,6 +446,9 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
         } else if (method == "get_prompts_v2") {
             // -> agent_get_prompts_v2 {} (C++ default/env resolves the prompts dir).
             ok = core::cpp_core().call("agent_get_prompts_v2", json::object(), cppResult, cerr);
+        } else if (method == "agent_list_models") {
+            // {provider, base_url?, api_key?} -> {ok, models:[...]} (pass-through probe).
+            ok = core::cpp_core().call("agent_list_models", params, cppResult, cerr);
         }
         if (ok) {
             result = std::move(cppResult);

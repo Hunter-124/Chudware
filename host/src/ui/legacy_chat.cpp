@@ -4,16 +4,22 @@
 // the code/diff/prose/fit/plan/parts draw helpers) declared in core/app_state.h — they live here
 // because the Design panel is their primary user, and are shared with the other panels via the
 // header.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cctype>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <unordered_map>
+
+#include <nlohmann/json.hpp>
 
 #include "imgui.h"
 
 #include "legacy_chat.h"
+#include "model_registry.h"  // ui::ModelInfo / capability flags / provider mapping
 #include "metrics.h"          // ui::metrics::px/U/asmHeaderIconGap
 #include "activity_panel.h"  // C22b: for casting st.activityPanel
 #include "console_panel.h"   // drawConsoleBody for the consolidated AI panel's Console tab
@@ -667,12 +673,16 @@ static void drawModeRow(AppState& st) {
     // Model / provider / mode label — clicking jumps to the Settings tab, where the model,
     // provider, and the supervised-vs-autopilot toggle ("Plan before building") all live. The
     // mode is shown read-only here (no duplicate toggle — that was the redundant control).
-    const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp"};
-    const char* prov = provNames[(st.settings.provider >= 0 && st.settings.provider < 4)
-                                     ? st.settings.provider : 2];
-    char label[220];
-    std::snprintf(label, sizeof(label), "%s / %s  [%s]", prov,
+    const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini"};
+    const char* prov = provNames[(st.settings.provider >= 0 &&
+                                  st.settings.provider < ui::PROV_COUNT)
+                                     ? st.settings.provider : ui::PROV_GEMINI];
+    char label[260];
+    bool showEffort = ui::modelSupportsReasoning(st.settings.provider, st.settings.model) &&
+                      st.settings.reasoningEffort[0];
+    std::snprintf(label, sizeof(label), "%s / %s%s%s  [%s]", prov,
                   st.settings.model[0] ? st.settings.model : "default",
+                  showEffort ? " · " : "", showEffort ? st.settings.reasoningEffort : "",
                   st.settings.planMode ? "Supervised" : "Autopilot");
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, compactPad);
     ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
@@ -683,12 +693,400 @@ static void drawModeRow(AppState& st) {
         ImGui::SetTooltip("Model, provider & mode - click to open Settings.\n%s", label);
 }
 
+// ============================ conversation tabs + persistence ============================
+// Each conversation is its own tab. The ACTIVE conversation's messages live in st.chat; the
+// rest park in st.conversations[i].msgs. Persisted per document to chat_history.json.
+
+static std::string chatHistoryPath() { return appdataDir() + "\\AI-CAD\\chat_history.json"; }
+
+// A stable key for the active document: the saved file path if any (survives restarts), else
+// the live doc id, else "scratch" (an unsaved, never-touched session).
+static std::string convDocKey(AppState& st) {
+    if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+        const auto& t = st.docTabs[st.activeTab];
+        if (!t.path.empty()) return "file:" + t.path;
+        if (!t.docId.empty()) return "doc:" + t.docId;
+    }
+    std::string d = st.docMirror.hasDoc() ? st.docMirror.docId() : std::string();
+    return d.empty() ? std::string("scratch") : ("doc:" + d);
+}
+
+static std::string newConvId(AppState& st) { return "c" + std::to_string(++st.convCounter); }
+
+// Guarantee at least one (active) conversation exists, adopting whatever is already in st.chat.
+static void ensureConversations(AppState& st) {
+    if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size()) return;
+    st.conversations.clear();
+    Conversation c;
+    c.id = newConvId(st);
+    c.title = "Chat 1";
+    st.conversations.push_back(std::move(c));
+    st.activeConv = 0;  // st.chat remains the active buffer
+}
+
+void persistChatHistory(AppState& st) {
+    if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return;
+    if (st.chatDocKey.empty()) return;
+    nlohmann::json root = nlohmann::json::object();
+    {
+        std::ifstream in(chatHistoryPath());
+        if (in) { try { in >> root; } catch (...) { root = nlohmann::json::object(); } }
+        if (!root.is_object()) root = nlohmann::json::object();
+    }
+    nlohmann::json convs = nlohmann::json::array();
+    for (int i = 0; i < (int)st.conversations.size(); ++i) {
+        const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : st.conversations[i].msgs;
+        nlohmann::json jm = nlohmann::json::array();
+        for (const auto& m : msgs) {
+            if (m.text.empty()) continue;  // skip running/placeholder turns with no content yet
+            jm.push_back({{"u", m.fromUser}, {"t", m.text}, {"e", m.errKind}});
+        }
+        convs.push_back({{"id", st.conversations[i].id},
+                         {"title", st.conversations[i].title},
+                         {"msgs", jm}});
+    }
+    root[st.chatDocKey] = {{"active", st.activeConv}, {"conversations", convs}};
+    try {
+        std::filesystem::create_directories(appdataDir() + "\\AI-CAD");
+        std::ofstream out(chatHistoryPath());
+        if (out) out << root.dump(1);
+    } catch (...) {
+    }
+}
+
+// Replace conversations/chat with the saved set for `key` (or a fresh empty chat if none).
+static void loadChatHistoryForKey(AppState& st, const std::string& key) {
+    nlohmann::json root = nlohmann::json::object();
+    {
+        std::ifstream in(chatHistoryPath());
+        if (in) { try { in >> root; } catch (...) {} }
+    }
+    bool found = root.is_object() && root.contains(key) && root[key].is_object();
+    if (found) {
+        freeChatTextures(st.chat);
+        st.chat.clear();
+        st.conversations.clear();
+        const nlohmann::json& e = root[key];
+        for (const auto& jc : e.value("conversations", nlohmann::json::array())) {
+            Conversation c;
+            c.id = jc.value("id", newConvId(st));
+            c.title = jc.value("title", std::string("Chat"));
+            for (const auto& m : jc.value("msgs", nlohmann::json::array())) {
+                ChatMsg cm;
+                cm.fromUser = m.value("u", false);
+                cm.text = m.value("t", std::string());
+                cm.errKind = m.value("e", 0);
+                cm.running = false;
+                c.msgs.push_back(std::move(cm));
+            }
+            st.conversations.push_back(std::move(c));
+        }
+        if (st.conversations.empty()) { st.activeConv = -1; ensureConversations(st); return; }
+        int act = e.value("active", 0);
+        if (act < 0 || act >= (int)st.conversations.size()) act = 0;
+        st.activeConv = act;
+        st.chat = std::move(st.conversations[act].msgs);
+        st.conversations[act].msgs.clear();
+    } else if (st.conversations.empty() && st.activeConv < 0) {
+        ensureConversations(st);  // first init: adopt current st.chat (welcome) as conversation 1
+    } else {
+        freeChatTextures(st.chat);  // switching to a different doc with no history: fresh chat
+        st.chat.clear();
+        st.conversations.clear();
+        st.activeConv = -1;
+        ensureConversations(st);
+    }
+}
+
+// Detect a document change and swap the chat history accordingly (called each frame).
+static void syncChatToDoc(AppState& st) {
+    std::string key = convDocKey(st);
+    if (key == st.chatDocKey) { ensureConversations(st); return; }
+    if (!st.chatDocKey.empty()) persistChatHistory(st);  // save the outgoing doc's conversations
+    loadChatHistoryForKey(st, key);
+    st.chatDocKey = key;
+}
+
+static void newConversation(AppState& st) {
+    ensureConversations(st);
+    st.conversations[st.activeConv].msgs = std::move(st.chat);
+    st.chat.clear();
+    Conversation c;
+    c.id = newConvId(st);
+    c.title = "Chat " + std::to_string((int)st.conversations.size() + 1);
+    st.conversations.push_back(std::move(c));
+    st.activeConv = (int)st.conversations.size() - 1;
+    persistChatHistory(st);
+}
+
+static void switchConversation(AppState& st, int idx) {
+    if (idx == st.activeConv || idx < 0 || idx >= (int)st.conversations.size()) return;
+    st.conversations[st.activeConv].msgs = std::move(st.chat);
+    st.chat = std::move(st.conversations[idx].msgs);
+    st.conversations[idx].msgs.clear();
+    st.activeConv = idx;
+}
+
+static void closeConversation(AppState& st, int idx) {
+    if (idx < 0 || idx >= (int)st.conversations.size()) return;
+    bool closingActive = (idx == st.activeConv);
+    if (closingActive) { freeChatTextures(st.chat); st.chat.clear(); }
+    else { freeChatTextures(st.conversations[idx].msgs); }
+    st.conversations.erase(st.conversations.begin() + idx);
+    if (st.conversations.empty()) { st.activeConv = -1; ensureConversations(st); persistChatHistory(st); return; }
+    if (closingActive) {
+        int na = std::min(idx, (int)st.conversations.size() - 1);
+        st.chat = std::move(st.conversations[na].msgs);
+        st.conversations[na].msgs.clear();
+        st.activeConv = na;
+    } else if (idx < st.activeConv) {
+        st.activeConv--;
+    }
+    persistChatHistory(st);
+}
+
+// A compact horizontal strip of conversation tabs: click to switch, middle-click to close,
+// "+" to start a new conversation. Mirrors the document-tab UX.
+static void drawConversationTabs(AppState& st, bool busy) {
+    ensureConversations(st);
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * sc, 3.0f * sc));
+    const ImGuiStyle& style = ImGui::GetStyle();
+    float avail = ImGui::GetContentRegionAvail().x;
+    float x = 0.0f;
+    for (int i = 0; i < (int)st.conversations.size(); ++i) {
+        ImGui::PushID(i);
+        bool active = (i == st.activeConv);
+        std::string title = st.conversations[i].title.empty()
+                                ? ("Chat " + std::to_string(i + 1)) : st.conversations[i].title;
+        std::string shown = title.size() > 18 ? (title.substr(0, 17) + "...") : title;
+        float w = ImGui::CalcTextSize(shown.c_str()).x + 18.0f * sc;
+        if (i > 0) {
+            if (x + style.ItemSpacing.x + w <= avail) { ImGui::SameLine(); x += style.ItemSpacing.x; }
+            else { x = 0.0f; }
+        }
+        x += w;
+        if (active) ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.accent));
+        if (ImGui::Button(shown.c_str()) && !active && !busy) switchConversation(st, i);
+        if (active) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s  (middle-click to close)", title.c_str());
+            if (ImGui::IsMouseClicked(2) && !busy) { closeConversation(st, i); ImGui::PopID(); break; }
+        }
+        ImGui::PopID();
+    }
+    if (x + style.ItemSpacing.x + 26.0f * sc <= avail) ImGui::SameLine();
+    if (ImGui::Button("+##newconv") && !busy) newConversation(st);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("New conversation");
+    ImGui::PopStyleVar();
+}
+
+// Probe the local OpenAI-compatible endpoint for its loaded models + reachability, so the
+// picker can hide local models that are down. Throttled to ~5s; force bypasses the throttle.
+void refreshModelAvailability(AppState& st, bool force) {
+    static double lastProbe = -1e9;
+    double now = ImGui::GetTime();
+    if (!force && (st.modelProbeInFlight.load() || (now - lastProbe) < 5.0)) return;
+    lastProbe = now;
+    st.modelProbeInFlight.store(true);
+    nlohmann::json p = {{"provider", "openai"},
+                        {"base_url", st.settings.baseUrl},
+                        {"api_key", st.settings.apiKey}};
+    st.rpc.call("agent_list_models", p, [&st](const core::RpcResult& r) {
+        ProviderModels pm;
+        pm.checked = true;
+        if (r.ok && r.result.is_object()) {
+            pm.ok = r.result.value("ok", false);
+            pm.error = r.result.value("error", std::string());
+            if (r.result.contains("models") && r.result["models"].is_array())
+                for (const auto& m : r.result["models"])
+                    if (m.is_string()) pm.models.push_back(m.get<std::string>());
+        } else {
+            pm.error = r.err.empty() ? "core unavailable" : r.err;
+        }
+        st.providerModels[ui::PROV_LOCAL] = pm;
+        st.providerModels[ui::PROV_LLAMACPP] = pm;  // same local endpoint family
+        st.modelProbeInFlight.store(false);
+    }, 12000);
+}
+
+// The active provider's API-key buffer (cloud providers keep separate keys; local reuses the
+// optional apiKey buffer).
+static char* providerKeyBuf(Settings& s, int provider) {
+    switch (provider) {
+        case ui::PROV_GEMINI: return s.geminiKey;
+        case ui::PROV_ANTHROPIC: return s.anthropicKey;
+        case ui::PROV_OPENAI: return s.openaiKey;
+        default: return s.apiKey;  // local OpenAI-compatible optional key
+    }
+}
+
+// Shared provider + model picker. Returns true if a setting changed this frame.
+bool drawProviderModelPicker(AppState& st, bool busy) {
+    (void)busy;
+    Settings& s = st.settings;
+    const float S = ui::uiScale;
+    bool changed = false;
+    refreshModelAvailability(st, false);
+
+    // ---- provider ----
+    ImGui::TextUnformatted("Provider");
+    ImGui::SetNextItemWidth(-1);
+    const char* provs[ui::PROV_COUNT];
+    for (int i = 0; i < ui::PROV_COUNT; ++i) provs[i] = ui::providerLabel(i);
+    int prevProvider = s.provider;
+    if (ImGui::Combo("##provider", &s.provider, provs, ui::PROV_COUNT) &&
+        s.provider != prevProvider) {
+        changed = true;
+        // Set sensible per-provider defaults on switch.
+        if (s.provider == ui::PROV_GEMINI && (!s.model[0] || std::strstr(s.model, "gpt") ||
+                                              std::strstr(s.model, "claude")))
+            std::strncpy(s.model, "gemini-2.5-pro", sizeof(s.model) - 1);
+        else if (s.provider == ui::PROV_ANTHROPIC)
+            std::strncpy(s.model, "claude-opus-4-8", sizeof(s.model) - 1);
+        else if (s.provider == ui::PROV_OPENAI)
+            std::strncpy(s.model, "gpt-4o", sizeof(s.model) - 1);
+        else if (s.provider == ui::PROV_LOCAL) {
+            std::strncpy(s.baseUrl, "http://localhost:1234/v1", sizeof(s.baseUrl) - 1);
+            if (std::strstr(s.model, ".gguf") || std::strstr(s.model, "gemini") ||
+                std::strstr(s.model, "claude"))
+                std::strncpy(s.model, "gemma-4-e4b", sizeof(s.model) - 1);
+            s.vision = true;
+        } else if (s.provider == ui::PROV_LLAMACPP) {
+            std::strncpy(s.baseUrl, "http://127.0.0.1:1234/v1", sizeof(s.baseUrl) - 1);
+            if (!std::strstr(s.model, ".gguf"))
+                std::strncpy(s.model, "%APPDATA%\\AI-CAD\\models\\model.gguf",
+                             sizeof(s.model) - 1);
+            s.vision = false;
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    const bool cloud = ui::providerIsCloud(s.provider);
+
+    // ---- model ----
+    if (cloud) {
+        // Known-good model list for this provider, plus the current value if it's custom.
+        std::vector<const char*> ids, labels;
+        for (const auto& m : ui::builtinModels())
+            if (m.provider == s.provider) { ids.push_back(m.id.c_str()); labels.push_back(m.label.c_str()); }
+        int cur = -1;
+        for (size_t i = 0; i < ids.size(); ++i)
+            if (s.model[0] && std::strcmp(ids[i], s.model) == 0) cur = (int)i;
+        std::string customLabel;
+        if (cur < 0) {  // present whatever is configured as a trailing custom entry
+            customLabel = std::string(s.model[0] ? s.model : "(choose a model)") + "  (custom)";
+            labels.push_back(customLabel.c_str());
+            cur = (int)labels.size() - 1;
+        }
+        ImGui::TextUnformatted("Model");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##modelpick", &cur, labels.data(), (int)labels.size())) {
+            if (cur >= 0 && cur < (int)ids.size()) {
+                std::strncpy(s.model, ids[cur], sizeof(s.model) - 1);
+                changed = true;
+            }
+        }
+    } else {
+        // Local: list discovered models when the endpoint is up; else a free-text field.
+        const ProviderModels& pm = st.providerModels[s.provider == ui::PROV_LLAMACPP
+                                                          ? ui::PROV_LLAMACPP : ui::PROV_LOCAL];
+        bool useGguf = (s.provider == ui::PROV_LLAMACPP);
+        ImGui::TextUnformatted(useGguf ? "GGUF model path" : "Model");
+        if (!useGguf && pm.ok && !pm.models.empty()) {
+            std::vector<const char*> ids;
+            for (const auto& id : pm.models) ids.push_back(id.c_str());
+            int cur = -1;
+            for (size_t i = 0; i < ids.size(); ++i)
+                if (s.model[0] && std::strcmp(ids[i], s.model) == 0) cur = (int)i;
+            std::string customLabel;
+            if (cur < 0) { customLabel = std::string(s.model[0] ? s.model : "(select)") + "  (custom)";
+                           ids.push_back(customLabel.c_str()); cur = (int)ids.size() - 1; }
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("##localmodel", &cur, ids.data(), (int)ids.size())) {
+                if (cur >= 0 && (size_t)cur < pm.models.size()) {
+                    std::strncpy(s.model, pm.models[cur].c_str(), sizeof(s.model) - 1);
+                    changed = true;
+                }
+            }
+        } else {
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputText("##localmodeltext", s.model, sizeof(s.model))) changed = true;
+        }
+    }
+
+    // ---- reasoning effort (only for reasoning-capable models) ----
+    if (ui::modelSupportsReasoning(s.provider, s.model)) {
+        ImGui::Dummy(ImVec2(0, 4 * S));
+        ImGui::TextUnformatted("Reasoning effort");
+        int nEff = 0; auto effVals = ui::reasoningEffortValues(&nEff);
+        auto effLabels = ui::reasoningEffortLabels(nullptr);
+        int eff = ui::reasoningEffortToIndex(s.reasoningEffort);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##effort", &eff, effLabels, nEff)) {
+            std::strncpy(s.reasoningEffort, effVals[eff], sizeof(s.reasoningEffort) - 1);
+            changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("How much hidden reasoning the model spends before answering.\n"
+                              "Higher = better planning on hard parts, slower + more tokens.");
+    }
+
+    // ---- credentials / connection ----
+    ImGui::Dummy(ImVec2(0, 6 * S));
+    if (cloud) {
+        ImGui::TextUnformatted("API key");
+        char* key = providerKeyBuf(s, s.provider);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##provkey", key, 256, ImGuiInputTextFlags_Password)) changed = true;
+        bool haveKey = key[0] != '\0';
+        ImGui::PushStyleColor(ImGuiCol_Text, haveKey ? IM_COL32(120, 200, 120, 255)
+                                                     : IM_COL32(220, 170, 90, 255));
+        ImGui::TextUnformatted(haveKey ? "key set — model available"
+                                       : "no API key — add one to use this provider");
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::TextUnformatted("Base URL");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##baseurl", s.baseUrl, sizeof(s.baseUrl))) {
+            changed = true;
+            refreshModelAvailability(st, true);  // re-probe the new endpoint
+        }
+        if (s.provider == ui::PROV_LOCAL) {
+            ImGui::TextUnformatted("API key (optional)");
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputText("##localkey", s.apiKey, sizeof(s.apiKey),
+                                 ImGuiInputTextFlags_Password)) changed = true;
+        }
+        if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
+        // Local availability status.
+        const ProviderModels& pm = st.providerModels[s.provider == ui::PROV_LLAMACPP
+                                                          ? ui::PROV_LLAMACPP : ui::PROV_LOCAL];
+        const char* msg; ImU32 col;
+        if (!pm.checked) { msg = "checking endpoint…"; col = IM_COL32(180, 180, 180, 255); }
+        else if (pm.ok) { msg = "endpoint reachable"; col = IM_COL32(120, 200, 120, 255); }
+        else { msg = "endpoint unreachable — start your local model server"; col = IM_COL32(220, 120, 110, 255); }
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImGui::TextUnformatted(msg);
+        ImGui::PopStyleColor();
+    }
+
+    // ---- privacy / offline ----
+    ImGui::Dummy(ImVec2(0, 6 * S));
+    ImGui::SeparatorText("Privacy");
+    if (ImGui::Checkbox("Offline mode (local models only — no network egress)", &s.offlineMode))
+        changed = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Refuses any cloud provider (Gemini, Anthropic, OpenAI). Only a local "
+                          "loopback endpoint is allowed. Enforced before every run.");
+    return changed;
+}
+
 static void drawInlineSettingsTab(AppState& st, bool busy) {
     Settings& settings = st.settings;
     const auto& pal = ui::palette;
     const float S = ui::uiScale;
-    const char* provs[] = {"Anthropic (Claude)", "OpenAI",
-                           "Local (OpenAI-compatible)", "llama.cpp (managed local)"};
 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * S, 8.0f * S));
     ImGui::PushStyleColor(ImGuiCol_ChildBg,
@@ -701,46 +1099,12 @@ static void drawInlineSettingsTab(AppState& st, bool busy) {
     dimText("Provider, model, privacy, and common run behavior.");
     ImGui::Separator();
 
-    ImGui::TextUnformatted("Provider");
-    ImGui::SetNextItemWidth(-1);
-    int prevProvider = settings.provider;
-    if (ImGui::Combo("##provider", &settings.provider, provs, 4) &&
-        settings.provider != prevProvider) {
-        if (settings.provider == 2) {
-            std::strncpy(settings.baseUrl, "http://localhost:1234/v1",
-                         sizeof(settings.baseUrl) - 1);
-            if (std::strstr(settings.model, ".gguf"))
-                std::strncpy(settings.model, "gemma-4-e4b", sizeof(settings.model) - 1);
-            settings.vision = true;
-        } else if (settings.provider == 3) {
-            std::strncpy(settings.baseUrl, "http://127.0.0.1:1234/v1",
-                         sizeof(settings.baseUrl) - 1);
-            if (!std::strstr(settings.model, ".gguf"))
-                std::strncpy(settings.model, "%APPDATA%\\AI-CAD\\models\\model.gguf",
-                             sizeof(settings.model) - 1);
-            settings.vision = false;
-        }
-    }
-
-    ImGui::TextUnformatted(settings.provider == 3 ? "GGUF model path" : "Model");
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputText("##model_quick", settings.model, sizeof(settings.model));
-
-    if (settings.provider == 0 || settings.provider == 1) {
-        ImGui::TextUnformatted("API key");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputText("##api_quick", settings.apiKey, sizeof(settings.apiKey),
-                         ImGuiInputTextFlags_Password);
-    } else {
-        ImGui::TextUnformatted("Base URL");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputText("##base_quick", settings.baseUrl, sizeof(settings.baseUrl));
-        ImGui::Checkbox("Model supports vision", &settings.vision);
-    }
+    // Shared provider + availability-filtered model picker + reasoning effort (Settings modal
+    // uses the same widget, so the two never diverge).
+    ui::drawProviderModelPicker(st, busy);
 
     ImGui::SeparatorText("Behavior");
     ImGui::Checkbox("Plan before building", &settings.planMode);
-    ImGui::Checkbox("Offline mode (local models only)", &settings.offlineMode);
     int units = st.ips() ? 1 : 0;
     if (ImGui::RadioButton("MMGS", &units, 0)) settings.units = Units::MMGS;
     ImGui::SameLine();
@@ -786,6 +1150,14 @@ static void submitTurn(AppState& st, const std::string& text) {
     { ChatMsg u; u.fromUser = true; u.text = text; st.chat.push_back(u); }
     { ChatMsg a; a.running = true; st.chat.push_back(a); }
     st.designStarted = true;   // conversation is now active (kept for shot scenarios)
+
+    // Name the conversation tab after its first prompt; persist so the turn survives a restart.
+    if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size()) {
+        std::string& title = st.conversations[st.activeConv].title;
+        bool isDefault = title.empty() || (title.rfind("Chat ", 0) == 0);
+        if (isDefault) title = text.size() > 28 ? (text.substr(0, 27) + "...") : text;
+    }
+    ui::persistChatHistory(st);
 
     bool editMode = (st.aiInteraction == 1);
     bool askMode  = (st.aiInteraction == 2);
@@ -1003,6 +1375,9 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     ImGui::Separator();
     drawRuntimeBanner(st);
 
+    // Keep the conversation set bound to the active document (swaps history on doc change).
+    syncChatToDoc(st);
+
     if (ImGui::BeginTabBar("##ai_tabs")) {
     ImGuiTabItemFlags designFlags = st.focusDesignTab ? ImGuiTabItemFlags_SetSelected
                                                        : ImGuiTabItemFlags_None;
@@ -1034,6 +1409,9 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
 
     ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
     ImGui::Separator();
+
+    // ---- conversation tabs (one tab per chat, like Copilot/Cursor) ----
+    drawConversationTabs(st, busy);
 
     // ---- CONVERSATION — newest at bottom, auto-scroll. Empty-state suggestion chips. ----
     // "Empty" = no user turn yet (the startup welcome assistant message may be present).
@@ -1096,22 +1474,21 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 6) ImGui::SetScrollHereY(1.0f);
     ImGui::EndChild();
 
-    // ---- footer: New part + collapsing Code / Console (kept reachable) ----
+    // ---- footer: New chat + collapsing Code / Console (kept reachable) ----
     if (busy) ImGui::BeginDisabled();
-    if (ImGui::SmallButton("+ New part")) {
-        freeChatTextures(st.chat);
-        st.chat.clear();
+    if (ImGui::SmallButton("+ New chat")) {
+        // Start a fresh conversation tab (the previous one is preserved, not wiped).
+        newConversation(st);
         st.designStarted = false;
         st.modelInfo.clear();
         st.livePhase.clear();
-        st.asmParts.clear();
-        st.asmFit = FitReport{};
-        st.asmStl.clear();
-        st.selectedPart = -1;
         st.prompt[0] = 0;
         st.status = st.workerStarted ? "Ready." : st.status;
         st.statusKind = 0;
     }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Start a new conversation. Past conversations stay as tabs above and "
+                          "are saved per document.");
     if (busy) ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::SmallButton("Activity panel")) st.showActivityPanel = true;

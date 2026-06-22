@@ -24,8 +24,24 @@ namespace {
 
 using ojson = nlohmann::ordered_json;
 
-// How many parse/validate failures before the modeler escape hatch fires.
-constexpr int kEscapeAfter = 2;
+// How many parse/validate failures before the modeler escape hatch (raw build123d script)
+// fires. Kept deliberately high so the agent keeps trying REAL parametric ops — each retry is
+// re-prompted with the concrete validation error (state.last_errors flows into build_context),
+// which is how it self-corrects. The script escape is a genuine last resort, not a 2-strike
+// default (the old value of 2 made the agent bail to a canned script on anything non-trivial).
+constexpr int kEscapeAfter = 4;
+
+// Per-call output-token budget by provider + reasoning effort. The hardcoded 4096 throttled
+// capable cloud models (a complex part is one modeler call → truncation → parse fail → escape
+// hatch). Capable cloud backends get real headroom; local models stay modest.
+int call_budget_for(const json& provider_cfg) {
+    std::string name = provider_cfg.value("name", std::string());
+    std::string effort = provider_cfg.value("reasoning_effort", std::string());
+    int base = 4096;  // local / unknown
+    if (name == "anthropic" || name == "gemini" || name == "openai") base = 8192;
+    if (effort == "high" || effort == "max") base += 4096;  // reasoning headroom before content
+    return base;
+}
 
 // Python truthiness of a JSON value (bool(x)): None/false/0/0.0/""/[]/{} -> false.
 bool truthy_json(const ojson& v) {
@@ -191,7 +207,7 @@ ProviderFn make_provider(const json& provider_cfg) {
 // _agent_call(provider, state, role): build a FRESH bounded context, prepend the
 // "ROLE: <role>" marker line, call the provider, capture meta. max_tokens = 2048.
 AgentCall agent_call(const ProviderFn& provider, const DesignState& state, const std::string& role,
-                     const std::string& prompts_dir) {
+                     const std::string& prompts_dir, int max_tokens, bool vision) {
     BuiltContext bc = build_context(state, role, prompts_dir);
     std::string system = "ROLE: " + role + "\n" + bc.system;
     auto pr = load_prompt(role, prompts_dir);
@@ -202,10 +218,15 @@ AgentCall agent_call(const ProviderFn& provider, const DesignState& state, const
     ac.context_tokens_est = bc.context_tokens_est;
     ac.inputs_digest = inputs_digest(state);
 
-    json messages = json::array({user_message(json::array({text_part(bc.body)}))});
+    // Vision: when the provider supports images and a render of the current model exists,
+    // attach it so the model can SEE the geometry (reviewer/fixer self-correction).
+    json parts = json::array({text_part(bc.body)});
+    if (vision && state.last_render.is_string() && !state.last_render.get<std::string>().empty())
+        parts.push_back(image_part(state.last_render.get<std::string>()));
+    json messages = json::array({user_message(parts)});
 
     auto t0 = std::chrono::steady_clock::now();
-    ProvReply rep = provider(system, messages, 4096);  // reasoning-model headroom (gemma reasons before answering)
+    ProvReply rep = provider(system, messages, max_tokens);  // provider/effort-scaled budget
     auto t1 = std::chrono::steady_clock::now();
     ac.duration_ms =
         static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
@@ -268,6 +289,10 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // ONE provider instance for the whole run (per-role scripted queues must persist).
     ProviderFn provider = make_provider(provider_cfg);
+    // Output-token budget per call, scaled to the provider + reasoning effort.
+    const int call_budget = call_budget_for(provider_cfg);
+    // Whether the provider can receive screenshots (drives vision review/fix).
+    const bool vision = provider_cfg.value("supports_vision", false);
 
     // Seed the DesignState from the live session: doc_tree(doc_id) gives {revision, tree}.
     json tree0 = doc::doc_tree(doc_id);
@@ -309,7 +334,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // ---- INTAKE ----
     actions.intake = [&](DesignState& st, int) -> StageOutcome {
-        AgentCall ac = agent_call(provider, st, "intake", prompts_dir);
+        AgentCall ac = agent_call(provider, st, "intake", prompts_dir, call_budget, vision);
         ojson spec = extract_json_obj(ac.reply);
         StageOutcome o;
         fill_meta(o, ac);
@@ -333,7 +358,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // ---- PLAN ----
     actions.plan = [&](DesignState& st, int) -> StageOutcome {
-        AgentCall ac = agent_call(provider, st, "planner", prompts_dir);
+        AgentCall ac = agent_call(provider, st, "planner", prompts_dir, call_budget, vision);
         ojson p = extract_json_obj(ac.reply);
         StageOutcome o;
         fill_meta(o, ac);
@@ -370,7 +395,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             appended = (a == std::string::npos) ? "" : appended.substr(a, b - a + 1);
         }
         st.current_step = appended;
-        AgentCall ac = agent_call(provider, st, "modeler", prompts_dir);
+        AgentCall ac = agent_call(provider, st, "modeler", prompts_dir, call_budget, vision);
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;
@@ -415,7 +440,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     actions.model = [&](DesignState& st, int attempt) -> StageOutcome {
         st.last_no_progress = false;
         if (attempt > kEscapeAfter) return model_escape(st);
-        AgentCall ac = agent_call(provider, st, "modeler", prompts_dir);
+        AgentCall ac = agent_call(provider, st, "modeler", prompts_dir, call_budget, vision);
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;
@@ -466,8 +491,15 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // ---- REVIEW (stats-only; vision rendering DEFERRED to host P55) ----
     actions.review = [&](DesignState& st, int) -> StageOutcome {
-        // render_path = "" (no _render_review; no image attached). Documented out-of-scope.
+        // Vision review: rasterize the current revision so a vision-capable model can SEE its
+        // model and self-correct (fail-soft — text-only review if the render is unavailable).
         st.last_render = nullptr;
+        if (vision) {
+            std::filesystem::path png =
+                run_dir(run_id) / ("review_r" + std::to_string(st.revision) + ".png");
+            json rr = doc::doc_render_png(doc_id, png.string());
+            if (rr.value("ok", false)) st.last_render = png.string();
+        }
         BuiltContext bc = build_context(st, "reviewer", prompts_dir);
         auto pr = load_prompt("reviewer", prompts_dir);
         StageOutcome o;
@@ -477,12 +509,15 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         o.context_chars = bc.context_chars;
         o.context_tokens_est = bc.context_tokens_est;
         o.inputs_digest = inputs_digest(st);
-        json messages = json::array({user_message(json::array({text_part(bc.body)}))});
+        json review_parts = json::array({text_part(bc.body)});
+        if (vision && st.last_render.is_string() && !st.last_render.get<std::string>().empty())
+            review_parts.push_back(image_part(st.last_render.get<std::string>()));
+        json messages = json::array({user_message(review_parts)});
         // run.py review() does NOT prepend "ROLE:" — it passes the bare build_context
         // system. The RoleScriptedProvider sniffs "you are the reviewer" from the prompt's
         // first line, so routing is correct without the marker (matching Python byte-for-byte).
         auto t0 = std::chrono::steady_clock::now();
-        ProvReply rep = provider(bc.system, messages, 4096);  // reasoning-model headroom (see agent_call)
+        ProvReply rep = provider(bc.system, messages, call_budget);  // provider/effort-scaled budget
         auto t1 = std::chrono::steady_clock::now();
         o.duration_ms = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
@@ -520,7 +555,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // ---- FIX ----
     actions.fix = [&](DesignState& st, int) -> StageOutcome {
-        AgentCall ac = agent_call(provider, st, "fixer", prompts_dir);
+        AgentCall ac = agent_call(provider, st, "fixer", prompts_dir, call_budget, vision);
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;
@@ -587,7 +622,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // ---- MEMORY ----
     actions.memory = [&](DesignState& st, int) -> StageOutcome {
-        AgentCall ac = agent_call(provider, st, "memory", prompts_dir);
+        AgentCall ac = agent_call(provider, st, "memory", prompts_dir, call_budget, vision);
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;
@@ -616,6 +651,15 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             steps.push_back(default_step(st));
             return steps;
         }
+        // Decompose each part into an ORDERED task list: a base-solid step, then one step per
+        // feature. Smaller modeler calls model far more reliably than one giant "build everything"
+        // call (less truncation, and each step's failure is isolated + re-promptable), and the
+        // step list is exactly the long-horizon task checklist the UI surfaces. The modeler is
+        // told to emit ONLY ops for the current step and not re-emit existing features.
+        auto rstrip = [](std::string s) {
+            size_t b = s.find_last_not_of(" \t\r\n\f\v");
+            return (b == std::string::npos) ? std::string() : s.substr(0, b + 1);
+        };
         for (const auto& p : st.plan["parts"]) {
             std::string name = (p.contains("name") && p["name"].is_string())
                                    ? p["name"].get<std::string>()
@@ -634,21 +678,32 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             } else if (p.contains("dimensions")) {
                 dim_s = py_scalar_str(p["dimensions"]);
             }
-            std::string feat_s;
-            if (p.contains("features") && p["features"].is_array()) {
-                bool first = true;
-                for (const auto& f : p["features"]) {
-                    if (!first) feat_s += "; ";
-                    first = false;
-                    feat_s += py_scalar_str(f);
-                }
+            // Placement: position this part in the shared assembly space so multiple parts fit
+            // together instead of stacking at the origin. The modeler places primitives with `at`,
+            // and sketched bodies by building the sketch at those coordinates / on an offset plane.
+            std::string place_s;
+            if (p.contains("placement") && p["placement"].is_object() &&
+                p["placement"].contains("pos") && p["placement"]["pos"].is_array() &&
+                p["placement"]["pos"].size() >= 3) {
+                const auto& pos = p["placement"]["pos"];
+                auto num = [&](const ojson& v) {
+                    return v.is_number() ? py_scalar_str(v) : std::string("0");
+                };
+                std::string xyz = num(pos[0]) + "," + num(pos[1]) + "," + num(pos[2]);
+                if (xyz != "0,0,0")
+                    place_s = " Position this part's origin at [" + xyz +
+                              "] in the shared assembly space (primitives: use \"at\":[" + xyz +
+                              "]; sketched bodies: build the sketch at those coordinates or on an "
+                              "offset plane) so it does not overlap the other parts.";
             }
-            std::string step = "Build part '" + name + "' (" + purpose + "). Dimensions: " + dim_s +
-                               ". Features: " + feat_s;
-            // .rstrip()
-            size_t b = step.find_last_not_of(" \t\r\n\f\v");
-            step = (b == std::string::npos) ? "" : step.substr(0, b + 1);
-            steps.push_back(step);
+            steps.push_back(rstrip("Build the base solid of part '" + name + "' (" + purpose +
+                                   "). Dimensions: " + dim_s + "." + place_s));
+            if (p.contains("features") && p["features"].is_array())
+                for (const auto& f : p["features"]) {
+                    std::string fs = py_scalar_str(f);
+                    if (rstrip(fs).empty()) continue;
+                    steps.push_back(rstrip("Refine part '" + name + "': " + fs));
+                }
         }
         return steps;
     };

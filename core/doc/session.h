@@ -169,6 +169,13 @@ nlohmann::json doc_push_pull(const std::string& doc_id, int body_id, int topo_id
 // Throws OpError("export_failed", "document has no solid bodies to export") on empty.
 nlohmann::json doc_export_step(const std::string& doc_id, const std::string& path);
 
+// doc_render_png: render the document's surviving solids to a small isometric shaded PNG at
+// `out_path` (a lightweight software rasterizer — no GL). Used by the agent's vision review so
+// the model can SEE its current model and self-correct. Returns {"ok": bool, "path": <out>}.
+// Fail-soft: {"ok": false} on no bodies / tessellation or render failure (caller falls back to
+// text-only review). Never throws.
+nlohmann::json doc_render_png(const std::string& doc_id, const std::string& out_path);
+
 // doc_face_points: resolve the face `selector` (kind=="face") against the LAST body's
 // faces and sample that face's triangulation nodes in WORLD space, down-sampled to at
 // most `max_n` points (uniform stride). Returns {"points": [[x,y,z],...], "tol_mm":

@@ -147,6 +147,7 @@ bool provider_offline_safe(const json& provider) {
         name = provider["name"].get<std::string>();
     if (name == "mock" || name == "mock-roles" || name == "base") return true;
     if (name == "anthropic") return false;
+    if (name == "gemini") return false;  // always cloud (generativelanguage API)
     std::optional<std::string> base_url;
     if (provider.contains("base_url") && provider["base_url"].is_string())
         base_url = provider["base_url"].get<std::string>();
@@ -178,6 +179,11 @@ json resolve_provider(const std::optional<std::string>& name_arg, const json& cf
     };
 
     // Offline refusals BEFORE constructing anything (security-critical path).
+    if (offline && name == "gemini")
+        return refusal(
+            std::string("offline mode is enabled (config '") + kOfflineSetting +
+            "': true): the Google Gemini cloud provider is refused. Use a local "
+            "(loopback) model server instead.");
     if (offline && (name == "anthropic" || name == "openai") && !name.empty()) {
         if (name == "anthropic")
             return refusal(
@@ -263,6 +269,19 @@ json resolve_provider(const std::optional<std::string>& name_arg, const json& cf
         };
         if (desc["api_key"].is_string() && desc["api_key"].get<std::string>().empty())
             desc["api_key"] = nullptr;  // key may be None when unset (mirrors Python).
+    } else if (name == "gemini") {
+        // Google Gemini (cloud). Key from cfg.api_key or GEMINI_API_KEY / GOOGLE_API_KEY env.
+        std::string key = py_or(cfg_str(cfg, "api_key"), env_get(env, "GEMINI_API_KEY").value_or(""));
+        if (key.empty()) key = env_get(env, "GOOGLE_API_KEY").value_or("");
+        desc = json{
+            {"name", "gemini"},
+            {"model", py_or(cfg_str(cfg, "model"), "gemini-2.5-flash")},
+            {"base_url", nullptr},
+            {"supports_vision", true},
+            {"api_key", key},
+        };
+        if (desc["api_key"].is_string() && desc["api_key"].get<std::string>().empty())
+            desc["api_key"] = nullptr;
     } else if (name == "openai") {
         std::optional<std::string> base = oai_cfg("base_url");
         desc = json{
@@ -302,6 +321,11 @@ json resolve_provider(const std::optional<std::string>& name_arg, const json& cf
             " is NOT local-only, so the run is refused. Switch to a local "
             "(loopback) model server or disable offline mode in Settings.");
     }
+    // Reasoning effort (Off/Low/Medium/High) flows to the provider as a hint; the
+    // provider layer maps it per-backend (gemini thinkingConfig, anthropic effort).
+    if (auto eff = cfg_str(cfg, "reasoning_effort"); eff && !eff->empty())
+        desc["reasoning_effort"] = *eff;
+
     desc["offline_safe"] = provider_offline_safe(desc);
     return desc;
 }

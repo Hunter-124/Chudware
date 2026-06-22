@@ -33,6 +33,9 @@ std::string cheatsheet_name(const std::string& feature_type) {
     if (t == "sketch") return "sketch";
     if (t == "extrude") return "extrude";
     if (t == "revolve") return "revolve";
+    if (t == "loft") return "loft";
+    if (t == "sweep") return "sweep";
+    if (t == "mirror") return "mirror";
     if (t == "fillet") return "fillet";
     if (t == "chamfer") return "chamfer";
     if (t == "shell") return "shell";

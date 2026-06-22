@@ -16,6 +16,7 @@
 #include "../core/app_state.h"
 #include "../core/cpp_core.h"
 #include "../renderer.h"
+#include "legacy_chat.h"  // ui::drawProviderModelPicker (shared with the inline AI tab)
 
 // ---- C22b prompt editor state ----
 // Per-role editor buffer and metadata, lazily loaded from get_prompts_v2.
@@ -92,12 +93,6 @@ static void helpMarker(const char* desc) {
         ImGui::PopTextWrapPos();
         ImGui::EndTooltip();
     }
-}
-
-static void copySettingText(char* dst, size_t dstSize, const char* src) {
-    if (!dst || dstSize == 0) return;
-    std::fill(dst, dst + dstSize, 0);
-    std::strncpy(dst, src ? src : "", dstSize - 1);
 }
 
 // Apply a dark/light theme immediately (settings.theme persists on Save) and sync the viewport
@@ -248,83 +243,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                 dimText("Used by Design, Edit, and Help. Stored in "
                         "%APPDATA%\\AI-CAD\\config.json.");
                 ImGui::Dummy(ImVec2(0, 4 * sc));
-                const char* provs[] = {"Anthropic (Claude)", "OpenAI",
-                                       "Local (OpenAI-compatible)", "llama.cpp (managed local)"};
-                ImGui::SetNextItemWidth(-1);
-                int prevProvider = settings.provider;
-                if (ImGui::Combo("##prov", &settings.provider, provs, 4) &&
-                    settings.provider != prevProvider) {
-                    if (settings.provider == 2) {
-                        copySettingText(settings.baseUrl, sizeof(settings.baseUrl),
-                                        "http://localhost:1234/v1");
-                        if (std::strstr(settings.model, ".gguf"))
-                            copySettingText(settings.model, sizeof(settings.model), "gemma-4-e4b");
-                        settings.vision = true;
-                    } else if (settings.provider == 3) {
-                        copySettingText(settings.baseUrl, sizeof(settings.baseUrl),
-                                        "http://127.0.0.1:1234/v1");
-                        if (!std::strstr(settings.model, ".gguf")) {
-                            copySettingText(settings.model, sizeof(settings.model),
-                                            "%APPDATA%\\AI-CAD\\models\\model.gguf");
-                        }
-                        settings.vision = false;
-                    }
-                }
-                ImGui::Dummy(ImVec2(0, 4 * sc));
-                ImGui::TextUnformatted(settings.provider == 3 ? "GGUF model path" : "Model");
-                ImGui::SetNextItemWidth(-1);
-                ImGui::InputText("##model", settings.model, sizeof(settings.model));
-                if (settings.provider == 0 || settings.provider == 1) {
-                    ImGui::Dummy(ImVec2(0, 8 * sc));
-                    ImGui::SeparatorText("Credentials");
-                    ImGui::TextUnformatted("API key");
-                    ImGui::SetNextItemWidth(-1);
-                    ImGui::InputText("##key", settings.apiKey, sizeof(settings.apiKey),
-                                     ImGuiInputTextFlags_Password);
-                } else if (settings.provider == 2) {
-                    ImGui::Dummy(ImVec2(0, 8 * sc));
-                    ImGui::SeparatorText("Connection");
-                    ImGui::TextUnformatted("Base URL");
-                    ImGui::SetNextItemWidth(-1);
-                    ImGui::InputText("##base", settings.baseUrl, sizeof(settings.baseUrl));
-                    ImGui::Dummy(ImVec2(0, 4));
-                    ImGui::SeparatorText("Credentials");
-                    ImGui::TextUnformatted("API key (optional)");
-                    ImGui::SetNextItemWidth(-1);
-                    ImGui::InputText("##lkey", settings.apiKey, sizeof(settings.apiKey),
-                                     ImGuiInputTextFlags_Password);
-                    ImGui::Dummy(ImVec2(0, 8));
-                    ImGui::SeparatorText("Capabilities");
-                    ImGui::Checkbox("Model supports vision (send screenshots)",
-                                    &settings.vision);
-                    helpMarker("Let the agent SEE its own renders: each iteration's contact-sheet "
-                               "screenshot is sent back to the model so it can visually check the "
-                               "part and self-correct. Only enable for multimodal local models — "
-                               "a text-only model will error on image input.");
-                } else {
-                    ImGui::TextUnformatted("Base URL");
-                    ImGui::SetNextItemWidth(-1);
-                    ImGui::InputText("##llamabase", settings.baseUrl, sizeof(settings.baseUrl));
-                    ImGui::Checkbox("Model supports vision (send screenshots)",
-                                    &settings.vision);
-                    helpMarker("Managed llama.cpp launches a bundled or AppData-installed "
-                               "llama-server.exe on demand and talks to its local /v1 chat API. "
-                               "Put llama-server.exe under %APPDATA%\\AI-CAD\\llamacpp and a GGUF "
-                               "model under %APPDATA%\\AI-CAD\\models, or package those folders "
-                               "with the installer.");
-                }
-                // --- C35: local-only / offline mode (ITAR compliance) --- begin marked block ---
-                ImGui::Dummy(ImVec2(0, 8 * sc));
-                ImGui::SeparatorText("Privacy");
-                ImGui::Checkbox("Offline mode (local models only — no network egress)",
-                                &settings.offlineMode);
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip(
-                        "When enabled, the AI refuses any provider whose endpoint is not the "
-                        "local machine (localhost / 127.0.0.1 / ::1). Cloud providers (Anthropic, "
-                        "OpenAI) are blocked outright, so no technical data ever leaves this "
-                        "computer. Enforced in the agent before every run.");
-                // --- end C35 marked block ---
+                // Shared provider + availability-filtered model picker + reasoning effort +
+                // privacy/offline. The inline AI Settings tab renders the SAME widget.
+                ui::drawProviderModelPicker(st, busy);
                 ImGui::EndTabItem();
             }
             // --- C22b: Agents tab (role prompt editor) --- begin marked block ---

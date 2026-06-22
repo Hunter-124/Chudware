@@ -691,6 +691,7 @@ VerifyResult verify_step(const Step& step, const ojson& tree, const ojson& featu
         bool in_adds_set =
             (step.type == "box" || step.type == "cylinder" || step.type == "sphere" ||
              step.type == "cone" || step.type == "extrude" || step.type == "revolve" ||
+             step.type == "loft" || step.type == "sweep" ||
              step.type == "linear_pattern" || step.type == "circular_pattern");
         bool adds = in_adds_set && !removes;
         double delta = *vol_after - *vol_before;
@@ -794,11 +795,11 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
 
     events.emit("agent_call", json{{"stage", "decompose"}, {"role", "decomposer"}, {"attempt", 1},
                                    {"context_tokens_est", est_tokens(dsys) + est_tokens(dbody)}});
-    // 4096 (not 1024): reasoning models (gemma-4-e4b et al.) spend 600-900 tokens on hidden
-    // reasoning_content BEFORE emitting any answer; a 1024 cap left the step-list json empty or
-    // truncated (finish=length) -> "no parseable step list". A larger cap costs nothing on short
-    // replies (the model stops early) and only lets reasoning+output both fit.
-    CallResult dcall = provider_call(provider, dsys, user_body(dbody), 4096);
+    // 8192 (not 1024/4096): reasoning models (gemma et al.) spend a LOT of tokens on hidden
+    // reasoning_content BEFORE emitting any answer — bigger local models (26B) can burn 4096 on
+    // reasoning alone and emit EMPTY content (finish=length) -> "no parseable step list". A larger
+    // cap costs nothing on short replies (the model stops early) and lets reasoning+output both fit.
+    CallResult dcall = provider_call(provider, dsys, user_body(dbody), 8192);
     std::string dsidecar = events.write_sidecar("decompose", 1, dcall.reply);
     std::vector<Step> steps = normalize_steps(extract_json_array(dcall.reply));
 
@@ -865,7 +866,7 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
                         json{{"stage", "execute"}, {"role", "executor"}, {"attempt", attempt},
                              {"step_index", i},
                              {"context_tokens_est", est_tokens(system) + est_tokens(ep.body)}});
-            CallResult ecall = provider_call(provider, system, user_body(ep.body), 4096);  // reasoning headroom (see decompose)
+            CallResult ecall = provider_call(provider, system, user_body(ep.body), 8192);  // reasoning headroom (see decompose)
             std::string sc = events.write_sidecar("execute_" + std::to_string(i), attempt,
                                                   ecall.reply);
             OpsResult ores = extract_ops(ecall.reply);

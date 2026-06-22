@@ -96,6 +96,9 @@
 #include "geom/plane.h"
 #include "geom/profile.h"
 #include "geom/tessellate.h"
+#include "geom/airfoil.h"  // "airfoil" sketch-entity expansion (agent aerofoil support)
+
+#include <miniz.h>  // PNG/deflate for the agent vision-review rasterizer (doc_render_png)
 #include "mate/mate.h"
 #include "sketch/sketch.h"
 #include "util/expr.h"
@@ -432,6 +435,54 @@ void op_reorder_feature(json& doc, const json& op) {
 void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
     json ent = op.at("entity");
+
+    // AIRFOIL convenience entity: {type:"airfoil", naca:"2412"|dat:"<path>", chord, aoa,
+    // points, closedTE} expands to the upper-spline + lower-spline (+ a trailing-edge line for
+    // an open TE) — one closed aerofoil loop the agent can extrude/loft. Standard splines from
+    // here on, so downstream (solver, region detect, profile.cpp) needs no airfoil awareness.
+    if (ent.value("type", std::string()) == "airfoil") {
+        const std::string naca = ent.value("naca", std::string());
+        const std::string dat = ent.value("dat", std::string());
+        const double chord = ent.value("chord", 100.0);
+        const double aoa = ent.value("aoa", 0.0);
+        const int pts = ent.value("points", 60);
+        const bool closedTE = ent.value("closedTE", true);
+        aicad::geom::AirfoilProfile prof =
+            aicad::geom::airfoil_profile(naca, dat, chord, aoa, pts, closedTE);
+        if (!prof.error.empty()) throw OpError("invalid_op", "airfoil: " + prof.error);
+        if (prof.upper.size() < 2 || prof.lower.size() < 2)
+            throw OpError("invalid_op", "airfoil: profile produced too few points");
+        const bool constr = ent.value("construction", false);
+        std::vector<std::string> ids;
+        auto push_spline = [&](const std::vector<std::array<double, 2>>& pl) {
+            json s;
+            s["type"] = "spline";
+            json arr = json::array();
+            for (const auto& q : pl) arr.push_back(json::array({q[0], q[1]}));
+            s["points"] = arr;
+            s["id"] = gen.next("e");
+            s["construction"] = constr;
+            ids.push_back(s["id"].get<std::string>());
+            sk["params"]["entities"].push_back(std::move(s));
+        };
+        push_spline(prof.upper);  // LE -> TE (shares the LE point with `lower`)
+        push_spline(prof.lower);  // LE -> TE
+        if (!prof.sharpTE) {      // close the open trailing edge with a short line TE_u -> TE_l
+            json ln;
+            ln["type"] = "line";
+            ln["p1"] = json::array({prof.upper.back()[0], prof.upper.back()[1]});
+            ln["p2"] = json::array({prof.lower.back()[0], prof.lower.back()[1]});
+            ln["id"] = gen.next("e");
+            ln["construction"] = constr;
+            ids.push_back(ln["id"].get<std::string>());
+            sk["params"]["entities"].push_back(std::move(ln));
+        }
+        id_map["$" + std::to_string(idx)] = ids.empty() ? std::string() : ids[0];
+        for (std::size_t k = 1; k < ids.size(); ++k)
+            id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = ids[k];
+        return;
+    }
+
     const std::string eid = gen.next("e");
     ent["id"] = eid;
     if (!ent.contains("construction")) ent["construction"] = false;
@@ -3547,6 +3598,177 @@ json doc_export_step(const std::string& doc_id, const std::string& path) {
     const std::string fmt = (suffix == ".stl") ? "stl" : "step";
     std::string out = export_bodies(r.shapes, path, fmt);
     return json{{"path", out}};
+}
+
+// ----------------------------------------------------------------- preview render (vision)
+// A tiny OCCT-free software rasterizer: project the tessellated solids isometrically, z-buffer
+// + Lambert shade, and PNG-encode. Good enough for the agent to SEE its own model and catch
+// gross mistakes (missing features, wrong proportions). Not a pretty renderer.
+namespace {
+
+void png_put_u32_be(std::string& out, uint32_t v) {
+    out.push_back((char)((v >> 24) & 0xFF));
+    out.push_back((char)((v >> 16) & 0xFF));
+    out.push_back((char)((v >> 8) & 0xFF));
+    out.push_back((char)(v & 0xFF));
+}
+void png_chunk_rgb(std::string& out, const char tag[4], const std::string& data) {
+    png_put_u32_be(out, (uint32_t)data.size());
+    std::string body(tag, 4);
+    body += data;
+    out.append(body);
+    mz_ulong crc = mz_crc32(MZ_CRC32_INIT, (const unsigned char*)body.data(), body.size());
+    png_put_u32_be(out, (uint32_t)crc);
+}
+std::string encode_png_rgb(int w, int h, const std::vector<unsigned char>& rgb) {
+    std::string out;
+    out.append("\x89PNG\r\n\x1a\n", 8);
+    std::string ihdr;
+    png_put_u32_be(ihdr, (uint32_t)w);
+    png_put_u32_be(ihdr, (uint32_t)h);
+    ihdr.push_back(8); ihdr.push_back(2); ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0);
+    png_chunk_rgb(out, "IHDR", ihdr);
+    std::string raw;
+    raw.reserve((size_t)h * (1 + (size_t)w * 3));
+    for (int y = 0; y < h; ++y) {
+        raw.push_back(0);  // filter: none
+        raw.append((const char*)&rgb[(size_t)y * w * 3], (size_t)w * 3);
+    }
+    mz_ulong bound = mz_compressBound((mz_ulong)raw.size());
+    std::vector<unsigned char> comp(bound);
+    mz_ulong clen = bound;
+    if (mz_compress2(comp.data(), &clen, (const unsigned char*)raw.data(),
+                     (mz_ulong)raw.size(), 9) != MZ_OK)
+        clen = 0;
+    png_chunk_rgb(out, "IDAT", std::string((char*)comp.data(), clen));
+    png_chunk_rgb(out, "IEND", std::string());
+    return out;
+}
+
+struct RV3 { double x, y, z; };
+inline RV3 rsub(const RV3& a, const RV3& b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+inline RV3 rcross(const RV3& a, const RV3& b) {
+    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+inline double rdot(const RV3& a, const RV3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+inline RV3 rnorm(const RV3& a) {
+    double l = std::sqrt(rdot(a, a));
+    return l < 1e-12 ? RV3{0, 0, 0} : RV3{a.x / l, a.y / l, a.z / l};
+}
+
+bool render_iso_png(const std::vector<aicm::AicmBody>& bodies, const std::string& out_path,
+                    int W = 512, int H = 400) {
+    RV3 lo{1e30, 1e30, 1e30}, hi{-1e30, -1e30, -1e30};
+    bool any = false;
+    for (const auto& b : bodies)
+        for (size_t i = 0; i + 2 < b.pos.size(); i += 3) {
+            lo.x = std::min(lo.x, (double)b.pos[i]);     hi.x = std::max(hi.x, (double)b.pos[i]);
+            lo.y = std::min(lo.y, (double)b.pos[i + 1]); hi.y = std::max(hi.y, (double)b.pos[i + 1]);
+            lo.z = std::min(lo.z, (double)b.pos[i + 2]); hi.z = std::max(hi.z, (double)b.pos[i + 2]);
+            any = true;
+        }
+    if (!any) return false;
+    RV3 c{(lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2};
+    RV3 d = rnorm({1.0, 1.0, 0.8});           // view dir (scene -> camera), iso-ish
+    RV3 r = rnorm(rcross({0, 0, 1}, d));
+    RV3 u = rcross(d, r);
+    RV3 light = rnorm({0.4, 0.5, 1.0});
+    auto proj = [&](double x, double y, double z, double& pu, double& pv, double& pd) {
+        RV3 p = rsub({x, y, z}, c);
+        pu = rdot(p, r); pv = rdot(p, u); pd = rdot(p, d);
+    };
+    double minu = 1e30, maxu = -1e30, minv = 1e30, maxv = -1e30;
+    for (const auto& b : bodies)
+        for (size_t i = 0; i + 2 < b.pos.size(); i += 3) {
+            double pu, pv, pd; proj(b.pos[i], b.pos[i + 1], b.pos[i + 2], pu, pv, pd);
+            minu = std::min(minu, pu); maxu = std::max(maxu, pu);
+            minv = std::min(minv, pv); maxv = std::max(maxv, pv);
+        }
+    double scale = 0.85 * std::min(W / std::max(maxu - minu, 1e-6), H / std::max(maxv - minv, 1e-6));
+    double cu = (minu + maxu) / 2, cv = (minv + maxv) / 2;
+    auto toScreen = [&](double pu, double pv, double& sx, double& sy) {
+        sx = (pu - cu) * scale + W / 2.0;
+        sy = H / 2.0 - (pv - cv) * scale;
+    };
+    std::vector<unsigned char> img((size_t)W * H * 3, 245);  // light-grey background
+    std::vector<double> zbuf((size_t)W * H, -1e30);
+    long painted = 0;
+    for (const auto& b : bodies) {
+        double br = b.color[0], bg = b.color[1], bb = b.color[2];
+        for (size_t t = 0; t + 2 < b.idx.size(); t += 3) {
+            uint32_t i0 = b.idx[t], i1 = b.idx[t + 1], i2 = b.idx[t + 2];
+            if (3u * i0 + 2 >= b.pos.size() || 3u * i1 + 2 >= b.pos.size() ||
+                3u * i2 + 2 >= b.pos.size())
+                continue;
+            RV3 w0{b.pos[3 * i0], b.pos[3 * i0 + 1], b.pos[3 * i0 + 2]};
+            RV3 w1{b.pos[3 * i1], b.pos[3 * i1 + 1], b.pos[3 * i1 + 2]};
+            RV3 w2{b.pos[3 * i2], b.pos[3 * i2 + 1], b.pos[3 * i2 + 2]};
+            RV3 fn = rnorm(rcross(rsub(w1, w0), rsub(w2, w0)));
+            double lam = 0.35 + 0.65 * std::max(0.0, std::abs(rdot(fn, light)));
+            unsigned char R = (unsigned char)std::min(255.0, br * 255 * lam);
+            unsigned char G = (unsigned char)std::min(255.0, bg * 255 * lam);
+            unsigned char B = (unsigned char)std::min(255.0, bb * 255 * lam);
+            double su0, sv0, su1, sv1, su2, sv2, d0, d1, d2, pu, pv;
+            proj(w0.x, w0.y, w0.z, pu, pv, d0); toScreen(pu, pv, su0, sv0);
+            proj(w1.x, w1.y, w1.z, pu, pv, d1); toScreen(pu, pv, su1, sv1);
+            proj(w2.x, w2.y, w2.z, pu, pv, d2); toScreen(pu, pv, su2, sv2);
+            int minx = (int)std::floor(std::min({su0, su1, su2}));
+            int maxx = (int)std::ceil(std::max({su0, su1, su2}));
+            int miny = (int)std::floor(std::min({sv0, sv1, sv2}));
+            int maxy = (int)std::ceil(std::max({sv0, sv1, sv2}));
+            minx = std::max(minx, 0); miny = std::max(miny, 0);
+            maxx = std::min(maxx, W - 1); maxy = std::min(maxy, H - 1);
+            double area = (su1 - su0) * (sv2 - sv0) - (su2 - su0) * (sv1 - sv0);
+            if (std::abs(area) < 1e-9) continue;
+            for (int py = miny; py <= maxy; ++py)
+                for (int px = minx; px <= maxx; ++px) {
+                    double fx = px + 0.5, fy = py + 0.5;
+                    double a0 = ((su1 - fx) * (sv2 - fy) - (su2 - fx) * (sv1 - fy)) / area;
+                    double a1 = ((su2 - fx) * (sv0 - fy) - (su0 - fx) * (sv2 - fy)) / area;
+                    double a2 = 1.0 - a0 - a1;
+                    if (a0 < 0 || a1 < 0 || a2 < 0) continue;
+                    double depth = a0 * d0 + a1 * d1 + a2 * d2;
+                    size_t pi = (size_t)py * W + px;
+                    if (depth > zbuf[pi]) {
+                        zbuf[pi] = depth;
+                        img[pi * 3] = R; img[pi * 3 + 1] = G; img[pi * 3 + 2] = B;
+                        ++painted;
+                    }
+                }
+        }
+    }
+    if (painted < (long)(W * H) / 400) return false;  // ~nothing drawn — treat as failed render
+    std::string png = encode_png_rgb(W, H, img);
+    std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    f.write(png.data(), (std::streamsize)png.size());
+    return (bool)f;
+}
+
+}  // namespace
+
+json doc_render_png(const std::string& doc_id, const std::string& out_path) {
+    try {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        Session& s = require_session(doc_id);
+        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        if (r.shapes.empty()) return json{{"ok", false}, {"reason", "no bodies"}};
+        std::vector<aicm::AicmBody> bodies;
+        uint32_t id = 1;
+        const float color[3] = {0.62f, 0.70f, 0.82f};
+        for (const auto& shp : r.shapes) {
+            try {
+                bodies.push_back(::geom::tessellate_body(shp, id, "b" + std::to_string(id), color));
+                ++id;
+            } catch (...) {
+            }
+        }
+        if (bodies.empty()) return json{{"ok", false}, {"reason", "tessellation failed"}};
+        bool ok = render_iso_png(bodies, out_path);
+        return json{{"ok", ok}, {"path", ok ? out_path : std::string()}};
+    } catch (...) {
+        return json{{"ok", false}, {"reason", "render exception"}};
+    }
 }
 
 json doc_query(const std::string& doc_id, const json& query) {

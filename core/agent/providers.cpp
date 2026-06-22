@@ -1,10 +1,12 @@
 // core/agent/providers.cpp — C++ port of agent/providers/*.py (see providers.h).
 #include "agent/providers.h"
 
+#include <chrono>
 #include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "agent/http.h"
@@ -241,6 +243,84 @@ ParsedReply openai_parse_response(const json& resp) {
     return out;
 }
 
+// --------------------------------------------------------------------------- gemini
+// Google Gemini (generativelanguage REST: models/{model}:generateContent).
+const char* kGeminiDefaultModel = "gemini-2.5-flash";
+
+// One content part -> a Gemini part: text -> {text}; image -> {inline_data:{mime_type,data}}.
+json gemini_part(const json& part) {
+    if (pstr(part, "type") == "text") {
+        return json{{"text", part.value("text", std::string())}};
+    }
+    std::string data = base64_encode(read_file_bytes(pstr(part, "path")));
+    return json{{"inline_data", {{"mime_type", "image/png"}, {"data", data}}}};
+}
+
+// effort -> thinkingConfig.thinkingBudget. Empty/"off" -> omit (model default).
+// 2.5-pro cannot disable thinking (budget 0 is rejected), so we never send 0 by default.
+static bool gemini_thinking_budget(const std::string& effort, int* out) {
+    std::string e;
+    for (char c : effort) e.push_back(static_cast<char>(std::tolower((unsigned char)c)));
+    if (e == "low") { *out = 1024; return true; }
+    if (e == "medium" || e == "med") { *out = 8192; return true; }
+    if (e == "high" || e == "max") { *out = 24576; return true; }
+    if (e == "off" || e == "none") { *out = 0; return true; }
+    return false;  // unknown/empty -> let the model decide (dynamic)
+}
+
+BuiltRequest gemini_build_request(const std::string& model, const std::string& system,
+                                  const json& messages, int max_tokens,
+                                  const std::string& reasoning_effort) {
+    // contents: one entry per message. role "user" stays "user"; anything else -> "model".
+    json contents = json::array();
+    for (const auto& m : messages) {
+        json parts = json::array();
+        for (const auto& p : m.at("content")) parts.push_back(gemini_part(p));
+        std::string role = m.value("role", std::string("user"));
+        if (role != "user" && role != "model") role = (role == "assistant") ? "model" : "user";
+        contents.push_back(json{{"role", role}, {"parts", parts}});
+    }
+    json gen = json{{"maxOutputTokens", max_tokens}};
+    int budget = 0;
+    if (gemini_thinking_budget(reasoning_effort, &budget)) {
+        gen["thinkingConfig"] = json{{"thinkingBudget", budget}};
+    }
+    json body = {{"contents", contents}, {"generationConfig", gen}};
+    if (!system.empty()) {
+        body["system_instruction"] = json{{"parts", json::array({json{{"text", system}}})}};
+    }
+    BuiltRequest r;
+    r.url = "https://generativelanguage.googleapis.com/v1beta/models/" + model +
+            ":generateContent";
+    r.headers = {
+        {"x-goog-api-key", ""},  // filled by complete()
+        {"content-type", "application/json"},
+    };
+    r.body_json = body;
+    r.body = body.dump();
+    return r;
+}
+
+ParsedReply gemini_parse_response(const json& resp) {
+    ParsedReply out;
+    auto cit = resp.find("candidates");
+    if (cit == resp.end() || !cit->is_array() || cit->empty()) return out;
+    const json& cand = (*cit)[0];
+    const json content = cand.value("content", json::object());
+    auto pit = content.find("parts");
+    if (pit == content.end() || !pit->is_array()) return out;
+    for (const auto& p : *pit) {
+        if (p.contains("text") && p["text"].is_string()) {
+            // A "thought" part is reasoning, not the answer; keep it out of the reply text.
+            if (p.value("thought", false))
+                out.thinking += p["text"].get<std::string>();
+            else
+                out.text += p["text"].get<std::string>();
+        }
+    }
+    return out;
+}
+
 // --------------------------------------------------------------------------- mock
 std::string MockProvider::complete() {
     if (replies_.empty()) return std::string();
@@ -290,6 +370,25 @@ std::string RoleScriptedProvider::complete(const std::string& system) {
     return queue.front().get<std::string>();
 }
 
+// POST with transparent retry on rate-limit / transient overload (HTTP 429/503). Cloud free
+// tiers (esp. Gemini flash) rate-limit, and an agent run fires ~10 calls — without this a single
+// 429 mid-run fails the whole build. Exponential backoff: 1s, 2s, 4s, 8s (4 retries).
+namespace {
+HttpResponse http_post_retry(const std::string& url,
+                             const std::vector<std::pair<std::string, std::string>>& headers,
+                             const std::string& body) {
+    HttpResponse hr = http_post(url, headers, body);
+    int delay_ms = 1000;
+    for (int attempt = 0; attempt < 4 && hr.error.empty() &&
+                          (hr.status == 429 || hr.status == 503); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        delay_ms *= 2;
+        hr = http_post(url, headers, body);
+    }
+    return hr;
+}
+}  // namespace
+
 // --------------------------------------------------------------------------- complete
 CompleteResult complete(const std::string& provider, const json& cfg, const std::string& system,
                         const json& messages, int max_tokens) {
@@ -312,7 +411,7 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         BuiltRequest req = anthropic_build_request(model, system, messages, max_tokens);
         for (auto& h : req.headers)
             if (h.first == "x-api-key") h.second = api_key;
-        HttpResponse hr = http_post(req.url, req.headers, req.body, max_tokens > 0 ? 120000 : 120000);
+        HttpResponse hr = http_post_retry(req.url, req.headers, req.body);
         if (!hr.error.empty()) {
             res.error = hr.error;
             return res;
@@ -335,7 +434,7 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
         for (auto& h : req.headers)
             if (h.first == "Authorization")
                 h.second = "Bearer " + (api_key.empty() ? std::string("not-needed") : api_key);
-        HttpResponse hr = http_post(req.url, req.headers, req.body);
+        HttpResponse hr = http_post_retry(req.url, req.headers, req.body);
         if (!hr.error.empty()) {
             res.error = hr.error;
             return res;
@@ -355,6 +454,43 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             }
         }
         res.text = pr.text;
+        return res;
+    }
+
+    if (provider == "gemini") {
+        std::string model = cfg.value("model", std::string(kGeminiDefaultModel));
+        std::string effort = cfg.value("reasoning_effort", std::string());
+        BuiltRequest req = gemini_build_request(model, system, messages, max_tokens, effort);
+        for (auto& h : req.headers)
+            if (h.first == "x-goog-api-key") h.second = api_key;
+        HttpResponse hr = http_post_retry(req.url, req.headers, req.body);
+        if (!hr.error.empty()) {
+            res.error = hr.error;
+            return res;
+        }
+        if (hr.status < 200 || hr.status >= 300) {
+            res.error = "gemini HTTP " + std::to_string(hr.status) + ": " + hr.body;
+            return res;
+        }
+        json parsed = json::parse(hr.body, nullptr, false);
+        if (parsed.is_discarded()) {
+            res.error = "gemini: unparseable response body";
+            return res;
+        }
+        ParsedReply pr = gemini_parse_response(parsed);
+        if (pr.text.empty()) {
+            // Surface a blocked/empty completion so the caller can retry/report.
+            if (!parsed.contains("candidates") || !parsed["candidates"].is_array() ||
+                parsed["candidates"].empty()) {
+                std::string why;
+                if (parsed.contains("promptFeedback")) why = parsed["promptFeedback"].dump();
+                res.error = "gemini endpoint returned no completion" +
+                            (why.empty() ? std::string() : (": " + why));
+                return res;
+            }
+        }
+        res.text = pr.text;
+        res.thinking = pr.thinking;
         return res;
     }
 

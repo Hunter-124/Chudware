@@ -246,11 +246,23 @@ json run_machine(DesignState& state, const StageActions& actions, RunEvents& eve
     // ---- MODEL (loop per plan step) ----
     std::vector<std::string> steps = actions.plan_steps(state);
     if (steps.empty()) steps.push_back("");
+    // Surface the ordered task list so the UI can show a live build checklist (long-horizon
+    // planning). Unknown event kinds are ignored by consumers, so this is forward-compatible.
+    {
+        json task_arr = json::array();
+        for (const std::string& s : steps) task_arr.push_back(s);
+        events.emit("plan_steps", json{{"steps", task_arr}, {"total", (int)steps.size()}});
+    }
     int stagnant = 0;
+    int step_index = 0;
     for (const std::string& step : steps) {
         if (cancelled()) return cancel_result();
         if (over_global_cap()) return json{{"status", "failed"}, {"stop_reason", "max_iters"}};
         state.current_step = step;
+        events.emit("model_step", json{{"index", step_index},
+                                       {"total", (int)steps.size()},
+                                       {"step", step}});
+        ++step_index;
         std::string v = run_stage("model", actions.model, "modeler");
         if (v == "cancelled") return cancel_result();
         if (v == "fail") return json{{"status", "failed"}, {"stop_reason", "model_failed"}};

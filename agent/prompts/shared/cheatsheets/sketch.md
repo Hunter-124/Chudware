@@ -4,7 +4,9 @@ Op shape (a JSON ARRAY): first an `add_feature` of type `sketch` (refs.plane = "
 
 The reserved plane names are EXACTLY "plane.top" (the XY plane, +Z up), "plane.front" (XZ), "plane.right" (YZ). Do NOT write "XY"/"XZ"/"YZ" - they are rejected.
 
-Entity `type` is one of: `circle` (center, radius), `line` (p1, p2), `arc` (center, radius, start, end, ccw), `point` (p). There is NO "rect" entity - build a rectangle from 4 `line` entities.
+Entity `type` is one of: `circle` (center, radius), `line` (p1, p2), `arc` (center, radius, start, end, ccw), `point` (p), `spline` (points: [[x,y],...] - a smooth curve THROUGH the points, for organic / profile / cam outlines), `airfoil` (naca:"2412", chord, aoa - a NACA aerofoil section as one closed loop, for wings). There is NO "rect" entity - build a rectangle from 4 `line` entities.
+
+A spline closes a profile when its ends meet the other edges (e.g. a revolve half-profile = a spline outer wall + a line back down the axis). An `airfoil` entity is self-contained (it expands to the upper/lower splines + trailing-edge line) - just extrude it.
 
 Example A - circle r=8 at the origin on the top plane:
 [
@@ -21,7 +23,13 @@ Example B - four 3mm-radius circles at the corners of a 60x60 plate (the right w
  {"op":"sketch_add_entity","sketch":"$0","entity":{"type":"circle","center":[-24,-24],"radius":3}}
 ]
 
+Example C - a NACA 2412 wing section (then EXTRUDE it for a wing):
+[
+ {"op":"add_feature","feature":{"type":"sketch","name":"WingSec","params":{"entities":[],"constraints":[]},"refs":{"plane":"plane.front"}}},
+ {"op":"sketch_add_entity","sketch":"$0","entity":{"type":"airfoil","naca":"2412","chord":120,"aoa":2}}
+]
+
 3 common mistakes:
-1. A sketch ALONE makes no solid - it must be extruded/cut in the NEXT step. Do not expect volume yet.
+1. A sketch ALONE makes no solid - it must be extruded/cut/revolved/lofted in a LATER step. Do not expect volume yet.
 2. Plane MUST be "plane.top"/"plane.front"/"plane.right" (a string), never "XY" or an object. Entity coords are 2D ([x,y]), never 3D.
-3. No "rect" entity - a rectangle is 4 `line` entities; a round hole/post is a `circle`.
+3. No "rect" entity - a rectangle is 4 `line` entities; a round hole/post is a `circle`; a curved profile is a `spline`.

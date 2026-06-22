@@ -84,7 +84,8 @@ target_link_libraries(aicad_solver PUBLIC Eigen3::Eigen)
 
 # --- libaicad geom (sketch-plane 2D<->3D lift + polar helpers) ---------------
 add_library(aicad_geom STATIC
-  geom/plane.cpp)
+  geom/plane.cpp
+  geom/airfoil.cpp)
 target_include_directories(aicad_geom PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_geom PUBLIC Eigen3::Eigen)
 

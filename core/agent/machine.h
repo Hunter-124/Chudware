@@ -23,7 +23,9 @@ namespace agent {
 using nlohmann::json;
 
 extern const std::map<std::string, int> kDefaultBudgets;
-constexpr int kGlobalIterCap = 40;
+// Global provider-call cap across the whole run. Raised from 40 to absorb per-feature step
+// decomposition (a part with several features now spans several modeler steps).
+constexpr int kGlobalIterCap = 60;
 constexpr int kSameSigLimit = 3;
 constexpr int kStagnationLimit = 3;
 

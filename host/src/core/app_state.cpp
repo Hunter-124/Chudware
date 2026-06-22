@@ -45,25 +45,55 @@ std::string appdataDir() {
 std::string configPath() { return appdataDir() + "\\AI-CAD\\config.json"; }
 const char* kDefaultLlamaModelPath = "%APPDATA%\\AI-CAD\\models\\model.gguf";
 
+// User-provided Gemini key, seeded as the out-of-box default so the copilot works on first
+// launch. Replaceable in Settings → AI. (Stored plaintext in %APPDATA%/AI-CAD/config.json,
+// same as every other provider key.)
+const char* kSeededGeminiKey = "AQ.Ab8RN6KgQVaemw7y3lReGzhLlD4VpUnyCYCxgT7ABxbNe1QKbA";
+
+static void copyStr(char* dst, size_t cap, const std::string& v) {
+    std::strncpy(dst, v.c_str(), cap - 1);
+    dst[cap - 1] = '\0';
+}
+
 void loadSettings(Settings& s) {
+    // Seed the shipped Gemini key by default; an on-disk config overrides it below. Done
+    // before the file check so a fresh install (no config.json yet) still has a working key.
+    if (!s.geminiKey[0]) copyStr(s.geminiKey, sizeof(s.geminiKey), kSeededGeminiKey);
     std::ifstream f(configPath());
     if (!f) return;
     try {
         nlohmann::json j;
         f >> j;
-        std::string prov = j.value("provider", "anthropic");
+        std::string prov = j.value("provider", "gemini");
         auto oai = j.value("openai", nlohmann::json::object());
         auto llama = j.value("llamacpp", nlohmann::json::object());
         std::string base = oai.value("base_url", "");
         bool hasBase = !base.empty();
-        if (prov == "anthropic") s.provider = 0;
+        if (prov == "gemini") s.provider = 4;
+        else if (prov == "anthropic") s.provider = 0;
         else if (prov == "llamacpp" || prov == "llama.cpp" || prov == "llama-cpp") s.provider = 3;
         else s.provider = hasBase ? 2 : 1;
         std::string model = j.value("model", "");
         if (s.provider == 3) model = llama.value("model_path", model);
         if (s.provider == 3 && model.empty()) model = kDefaultLlamaModelPath;
-        std::strncpy(s.model, model.c_str(), sizeof(s.model) - 1);
-        std::strncpy(s.apiKey, j.value("api_key", "").c_str(), sizeof(s.apiKey) - 1);
+        copyStr(s.model, sizeof(s.model), model);
+        std::string activeKey = j.value("api_key", "");
+        copyStr(s.apiKey, sizeof(s.apiKey), activeKey);
+
+        // Per-provider keys (config.json "keys"), so the picker can hide unkeyed providers.
+        auto keys = j.value("keys", nlohmann::json::object());
+        copyStr(s.geminiKey, sizeof(s.geminiKey), keys.value("gemini", std::string()));
+        copyStr(s.anthropicKey, sizeof(s.anthropicKey), keys.value("anthropic", std::string()));
+        copyStr(s.openaiKey, sizeof(s.openaiKey), keys.value("openai", std::string()));
+        // Back-compat: fold the active provider's top-level api_key into its per-provider slot.
+        if (!activeKey.empty()) {
+            if (prov == "gemini" && !s.geminiKey[0]) copyStr(s.geminiKey, sizeof(s.geminiKey), activeKey);
+            else if (prov == "anthropic" && !s.anthropicKey[0]) copyStr(s.anthropicKey, sizeof(s.anthropicKey), activeKey);
+            else if ((prov == "openai") && !hasBase && !s.openaiKey[0]) copyStr(s.openaiKey, sizeof(s.openaiKey), activeKey);
+        }
+        // Seed the shipped Gemini key on first run so the copilot works out of the box.
+        if (!s.geminiKey[0]) copyStr(s.geminiKey, sizeof(s.geminiKey), kSeededGeminiKey);
+        copyStr(s.reasoningEffort, sizeof(s.reasoningEffort), j.value("reasoning_effort", std::string("high")));
         if (s.provider == 3) {
             std::string lbase = llama.value("base_url", "http://127.0.0.1:1234/v1");
             std::strncpy(s.baseUrl, lbase.c_str(), sizeof(s.baseUrl) - 1);
@@ -90,14 +120,18 @@ void loadSettings(Settings& s) {
 
 void saveSettings(const Settings& s) {
     nlohmann::json j;
-    if (s.provider == 0) {
+    if (s.provider == 4) {
+        j["provider"] = "gemini";
+        j["model"] = s.model[0] ? s.model : "gemini-2.5-flash";
+        j["api_key"] = s.geminiKey;
+    } else if (s.provider == 0) {
         j["provider"] = "anthropic";
         j["model"] = s.model[0] ? s.model : "claude-opus-4-8";
-        j["api_key"] = s.apiKey;
+        j["api_key"] = s.anthropicKey;
     } else if (s.provider == 1) {
         j["provider"] = "openai";
         j["model"] = s.model[0] ? s.model : "gpt-4o";
-        j["api_key"] = s.apiKey;
+        j["api_key"] = s.openaiKey;
     } else if (s.provider == 2) {
         j["provider"] = "openai";
         j["model"] = s.model;
@@ -113,6 +147,13 @@ void saveSettings(const Settings& s) {
             {"vision", s.vision}
         };
     }
+    // Persist every provider's key so switching providers never loses one, and the picker
+    // can tell which providers are usable. The active provider's key is also the top-level
+    // api_key above (what resolve_provider reads).
+    j["keys"] = {{"gemini", s.geminiKey}, {"anthropic", s.anthropicKey}, {"openai", s.openaiKey}};
+    // Reasoning effort applies only to reasoning-capable models; resolve_provider passes it
+    // through to the provider (gemini thinkingConfig / anthropic effort).
+    if (s.reasoningEffort[0]) j["reasoning_effort"] = s.reasoningEffort;
     j["offline_mode"] = s.offlineMode;
     j["plan_mode"] = s.planMode;
     if (s.maxIters > 0) j["max_iters"] = s.maxIters;

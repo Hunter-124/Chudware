@@ -68,10 +68,16 @@ enum class Units { MMGS = 0, IPS = 1 };
 
 // ---------------- settings (AI provider) -> %APPDATA%/AI-CAD/config.json ----------------
 struct Settings {
-    int provider = 2;  // 0 = Anthropic, 1 = OpenAI, 2 = Local OpenAI-compatible, 3 = managed llama.cpp.
-                       // Default to a local LM Studio so the app is testable out of the box.
-    char model[512] = "gemma-4-e4b";
-    char apiKey[256] = "";
+    int provider = 4;  // 0=Anthropic 1=OpenAI 2=Local OpenAI-compat 3=managed llama.cpp 4=Gemini.
+                       // Default to Google Gemini (see kSeededGeminiKey) for out-of-box copilot.
+    char model[512] = "gemini-2.5-flash";  // flash: reliable free-tier quota for multi-call runs
+    char apiKey[256] = "";        // active-provider key (local OpenAI-compat optional key)
+    // Per-provider keys so the picker can hide providers with no key while keeping each key
+    // around when another provider is active. Serialized under config.json "keys".
+    char geminiKey[256] = "";
+    char anthropicKey[256] = "";
+    char openaiKey[256] = "";
+    char reasoningEffort[16] = "high";  // off|low|medium|high — only used by reasoning models
     char baseUrl[256] = "http://localhost:1234/v1";
     bool vision = true;
     bool offlineMode = false;    // C35: local-only mode — refuse any non-loopback provider (ITAR)
@@ -91,6 +97,20 @@ std::string appdataDir();
 std::string configPath();
 void loadSettings(Settings& s);
 void saveSettings(const Settings& s);
+
+// The Gemini API key shipped as the out-of-box default (user-provided). Seeded into
+// config.json on first run when no Gemini key is configured, so the copilot works
+// immediately. Users can replace it in Settings → AI.
+extern const char* kSeededGeminiKey;
+
+// One provider's live availability, filled by the agent_list_models probe. Lets the model
+// picker hide providers that are down / unkeyed and list the local endpoint's loaded models.
+struct ProviderModels {
+    bool checked = false;             // probe returned at least once
+    bool ok = false;                  // reachable + (cloud) keyed
+    std::vector<std::string> models;  // live ids (local) or confirmed cloud ids
+    std::string error;
+};
 
 // ---------------- textures ----------------
 struct Tex {
@@ -302,6 +322,16 @@ struct ChatMsg {
     PlanInfo plan;                 // the build plan drafted before the code (plan mode)
     std::vector<AgentStep> steps;  // assistant turn: the iteration trace
     ClarifyState clarify;          // pre-flight clarify gate (Design mode) — see ClarifyState
+};
+
+// One copilot conversation = its own tab. The ACTIVE conversation's live messages stay in
+// AppState::chat (so every existing st.chat user keeps working unchanged); an INACTIVE
+// conversation parks its messages here. Switching tabs swaps chat <-> msgs. Persisted per
+// document to %APPDATA%/AI-CAD/chat_history.json so conversations survive restarts.
+struct Conversation {
+    std::string id;
+    std::string title;             // shown on the tab; defaults to "Chat N", renamed to 1st prompt
+    std::vector<ChatMsg> msgs;      // populated only while INACTIVE (active lives in AppState::chat)
 };
 
 // A progress event streamed from the worker (parsed off the worker thread, applied on the
@@ -706,7 +736,11 @@ struct AppState {
     JobState job;
     std::vector<char> code{std::vector<char>(64 * 1024, 0)};
     std::vector<char> prompt{std::vector<char>(2048, 0)};
-    std::vector<ChatMsg> chat;
+    std::vector<ChatMsg> chat;                 // the ACTIVE conversation's live messages
+    std::vector<Conversation> conversations;   // all conversation tabs (active's msgs live in `chat`)
+    int activeConv = -1;                       // index into conversations; -1 = uninitialized
+    std::string chatDocKey;                    // doc key that conversations/chat currently belong to
+    int convCounter = 0;                       // monotonic id source (no Date/random needed)
     std::vector<char> helpQuestion{std::vector<char>(2048, 0)};
     std::string helpLastQuestion;
     std::string helpAnswer;
@@ -719,6 +753,10 @@ struct AppState {
     FitReport asmFit;
     std::string asmStl;               // combined assembly STL (shown when selectedPart == -1)
     int selectedPart = -1;            // -1 = whole assembly; >=0 = index into asmParts
+
+    // ---- model picker availability (filled by the agent_list_models probe) ----
+    ProviderModels providerModels[5];        // indexed by ui::ProviderIndex
+    std::atomic<bool> modelProbeInFlight{false};
 
     std::vector<char> chatInput{std::vector<char>(2048, 0)};
     std::string modelInfo;

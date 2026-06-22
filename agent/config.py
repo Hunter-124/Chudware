@@ -79,7 +79,7 @@ def provider_offline_safe(provider: Provider) -> bool:
     name = getattr(provider, "name", "")
     if name in ("mock", "mock-roles", "base"):
         return True
-    if name == "anthropic":
+    if name in ("anthropic", "gemini"):
         return False  # always cloud
     base_url = getattr(provider, "base_url", None)
     if name == "openai":
@@ -125,6 +125,10 @@ def _resolve_provider(name: str | None, cfg: dict) -> Provider:
 
     # Offline mode: refuse cloud providers OUTRIGHT before constructing them (no client, no key
     # lookup). A local OpenAI-compatible endpoint is checked against its base_url below.
+    if offline and name == "gemini":
+        raise OfflineModeError(
+            f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the Google Gemini "
+            f"cloud provider is refused. Use a local (loopback) model server instead.")
     if offline and name in ("anthropic", "openai") and name != "":
         if name == "anthropic":
             raise OfflineModeError(
@@ -186,6 +190,14 @@ def _resolve_provider(name: str | None, cfg: dict) -> Provider:
 
         key = cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY")
         return AnthropicProvider(api_key=key, model=cfg.get("model", DEFAULT_MODEL))
+
+    if name == "gemini":
+        from .providers.gemini_provider import GeminiProvider, DEFAULT_MODEL
+
+        key = cfg.get("api_key") or os.environ.get("GEMINI_API_KEY") or os.environ.get(
+            "GOOGLE_API_KEY")
+        return GeminiProvider(api_key=key, model=cfg.get("model", DEFAULT_MODEL),
+                              reasoning_effort=cfg.get("reasoning_effort"))
 
     if name == "openai":
         from .providers.openai_provider import OpenAIProvider, DEFAULT_MODEL

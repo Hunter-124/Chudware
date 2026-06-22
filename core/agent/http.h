@@ -33,5 +33,11 @@ HttpResponse http_post(const std::string& url,
                        const std::string& body,
                        int timeout_ms = 120000);
 
+// Blocking HTTPS (or HTTP) GET. Same semantics as http_post without a request body
+// (used for availability probes like the OpenAI-compatible /v1/models endpoint).
+HttpResponse http_get(const std::string& url,
+                      const std::vector<std::pair<std::string, std::string>>& headers,
+                      int timeout_ms = 8000);
+
 }  // namespace agent
 }  // namespace aicad

@@ -2642,6 +2642,7 @@ int run_gui(const char* screenshotPath) {
         glfwSwapBuffers(win);
     }
 
+    ui::persistChatHistory(st);  // save the active conversation transcript before teardown
     freeChatTextures(st.chat);  // release iteration thumbnails while the GL context is still live
     ui::freeIcons();            // C14: release atlas textures while GL context is still live
     ui::destroyCursors();       // W1-B: free the GLFW standard cursors

@@ -1,8 +1,10 @@
 {
-  "_comment": "Copy to %APPDATA%/AI-CAD/config.json and fill in. Providers: anthropic, openai, llamacpp.",
-  "provider": "llamacpp",
-  "model": "local-gguf",
-  "api_key": "sk-ant-...",
+  "_comment": "Copy to %APPDATA%/AI-CAD/config.json and fill in. Providers: gemini, anthropic, openai, llamacpp.",
+  "provider": "gemini",
+  "model": "gemini-2.5-flash",
+  "api_key": "AIza... (Gemini) or sk-ant-... (Anthropic)",
+  "reasoning_effort": "high",
+  "_reasoning_effort_note": "off | low | medium | high — applies only to reasoning-capable models (Gemini 2.5, Claude).",
   "openai": {
     "base_url": null
   },

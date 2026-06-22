@@ -1,14 +1,19 @@
-// AI-CAD legacy Design panel: brand header, prompt / conversation takeover, iteration cards,
-// plan card, and the always-visible build123d code section.
+// AI-CAD Copilot pane: slim header (logo + status + chat menu), conversation log with a per-turn
+// transparent activity timeline (what the AI is doing / thinking, expandable), and a bottom
+// composer (rounded input + inline model/settings/send toolbar + provider/mode/autopilot chips).
 #pragma once
 
 struct AppState;
 
 namespace ui {
 
-// Draw the consolidated AI panel (Design / Activity / Console tabs + workflow control strip).
-// `busy` whether a job is running, `canRun` whether new jobs can be launched.
+// Draw the AI Copilot pane (header + conversation + bottom composer). `busy` whether a job is
+// running, `canRun` whether new jobs can be launched.
 void drawAIPanel(AppState& state, bool busy, bool canRun);
+
+// Draw the "Settings" dock tab that sits next to the "AI" window (same dock node). Call right
+// after drawAIPanel each frame.
+void drawAISettingsTab(AppState& state, bool busy);
 
 // Shared provider + model picker (provider combo, availability-filtered model picker, per-
 // provider API key, reasoning-effort knob, local base URL/vision, offline toggle). Rendered

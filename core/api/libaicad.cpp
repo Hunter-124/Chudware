@@ -483,6 +483,32 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                     for (const auto& d : parsed["data"])
                         if (d.contains("id") && d["id"].is_string())
                             models.push_back(d["id"].get<std::string>());
+                // The OpenAI-compatible /v1/models lists every DOWNLOADED model — including ones
+                // not currently loaded into memory, which can't actually serve a request. LM
+                // Studio's native REST endpoint (/api/v0/models) reports a per-model "state", so
+                // when it's reachable we use it to report which ids are actually loaded. Other
+                // OpenAI-compatible servers (vLLM, llama.cpp) only serve loaded models, so the
+                // absence of this endpoint just means "treat all listed as available".
+                if (!base_url.empty()) {
+                    std::string origin = root;
+                    if (origin.size() >= 3 && origin.compare(origin.size() - 3, 3, "/v1") == 0)
+                        origin.erase(origin.size() - 3);
+                    aicad::agent::HttpResponse lr =
+                        aicad::agent::http_get(origin + "/api/v0/models", hdrs);
+                    if (lr.error.empty() && lr.status >= 200 && lr.status < 300) {
+                        json lp = json::parse(lr.body, nullptr, false);
+                        if (lp.is_object() && lp.contains("data") && lp["data"].is_array()) {
+                            json loaded = json::array();
+                            for (const auto& d : lp["data"])
+                                if (d.value("state", std::string()) == "loaded" &&
+                                    d.contains("id") && d["id"].is_string())
+                                    loaded.push_back(d["id"].get<std::string>());
+                            return emit(json{{"ok", true}, {"models", models},
+                                             {"loaded", loaded}, {"loaded_known", true}},
+                                        out_json, 0);
+                        }
+                    }
+                }
                 return emit(json{{"ok", true}, {"models", models}}, out_json, 0);
             }
             if (provider == "gemini") {

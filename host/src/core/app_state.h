@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -81,7 +82,10 @@ struct Settings {
     char baseUrl[256] = "http://localhost:1234/v1";
     bool vision = true;
     bool offlineMode = false;    // C35: local-only mode — refuse any non-loopback provider (ITAR)
-    bool planMode = true;        // draft a build plan (parts/dimensions/features) first
+    // Run mode (composer chip): planMode=true is "Supervised" (draft a build plan + ask the
+    // build-critical clarify questions before modeling); planMode=false is "Autopilot" (model
+    // straight from the prompt, no plan/clarify). Persisted as "plan_mode".
+    bool planMode = true;
     int maxIters = 0;            // refine-pass cap per turn; 0 = automatic
     std::string systemPrompt;    // system prompt override; empty = built-in
     std::string theme = "dark";  // "dark" | "light" — persisted to config.json
@@ -91,6 +95,10 @@ struct Settings {
     // copy the UI reads, Settings is what saveSettings serializes.
     std::string workspaceDir;                  // "" = use the Documents/AI-CAD default
     std::vector<std::string> recentFiles;      // most-recent-first, capped at AppState::kRecentFilesMax
+    // Chat model-picker visibility: ids the user has explicitly hidden (VS-Code-Copilot-style
+    // "Manage models" toggle in Settings → AI). Default-empty = every available model shows;
+    // hiding is opt-out so the picker works out of the box. Serialized as "hidden_models".
+    std::set<std::string> hiddenModels;
 };
 
 std::string appdataDir();
@@ -108,7 +116,13 @@ extern const char* kSeededGeminiKey;
 struct ProviderModels {
     bool checked = false;             // probe returned at least once
     bool ok = false;                  // reachable + (cloud) keyed
-    std::vector<std::string> models;  // live ids (local) or confirmed cloud ids
+    std::vector<std::string> models;  // all discovered ids (local: every downloaded model)
+    // LM Studio's native endpoint reports which models are actually loaded (vs merely
+    // downloaded). When loadedKnown is true, only ids in `loaded` can serve a request and the
+    // picker hides the rest; when false (non-LM-Studio server) every listed model is assumed
+    // available. See agent_list_models in libaicad.cpp.
+    std::vector<std::string> loaded;
+    bool loadedKnown = false;
     std::string error;
 };
 
@@ -322,6 +336,22 @@ struct ClarifyState {
     std::vector<std::string> assumptions;
 };
 
+// ---------------- transparent activity timeline ----------------
+// One row in an assistant turn's activity timeline — a plain-language summary of one thing the
+// model did (an orchestrator stage / tool action), expandable to reveal the raw thoughts/output
+// behind it. Built live from orchestrator events (feedTurnActivity) so the user can watch what
+// the AI is doing and thinking, coherently, inline in the conversation (this replaces the old
+// separate "Agent Activity" panel).
+struct ActivityItem {
+    std::string stage;     // raw stage key (intake/plan/model/edit/review/fix/memory) — for matching
+    std::string title;     // friendly heading ("Planning the build")
+    std::string detail;    // the model's raw output / reasoning for this step (collapsible body)
+    std::string reason;    // verdict reason (one short line shown under the title)
+    std::string status;    // "running" | "pass" | "retry" | "fail" | "done" | ""
+    int durationMs = 0, tokensIn = 0, tokensOut = 0, opsCount = 0;
+    bool expanded = false; // user toggled this row open to read the detail
+};
+
 struct ChatMsg {
     bool fromUser = false;
     std::string text;              // user prompt, or the assistant's final summary
@@ -330,9 +360,15 @@ struct ChatMsg {
                                    // ERR_SYSTEM = app/runtime/provider failure (red)
     std::string liveStatus;        // transient "Iteration N: building..." while running
     PlanInfo plan;                 // the build plan drafted before the code (plan mode)
+    std::vector<ActivityItem> activity;  // transparent "what the AI is doing" timeline (orchestrator)
     std::vector<AgentStep> steps;  // assistant turn: the iteration trace
     ClarifyState clarify;          // pre-flight clarify gate (Design mode) — see ClarifyState
 };
+
+// Fold one streamed orchestrator event (kind = stage_started / agent_output / stage_result /
+// run_finished; data = the event's "data" object) into a turn's activity timeline. Called on the
+// GL thread from the event-drain loop. No-op for events it doesn't recognize.
+void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json& data);
 
 // One copilot conversation = its own tab. The ACTIVE conversation's live messages stay in
 // AppState::chat (so every existing st.chat user keeps working unchanged); an INACTIVE
@@ -831,6 +867,8 @@ struct AppState {
     bool focusSettingsTab = false; // one-shot: focus the AI pane's Settings tab
     // Consolidated AI panel (Design / Activity / Console as internal tabs). One dock window "AI".
     bool showAIPanel = true;
+    unsigned int aiDockId = 0;   // dock node the "AI" window lives in — so the sibling "Settings"
+                                 // tab can dock next to it even on a saved layout (ImGuiID).
     // Design Table panel (SolidWorks Design Table). Dockable "Design Table" window in the right
     // task pane; View > Design Table toggles it. An editable grid (rows=configs, columns=driven
     // params + per-feature suppression) over the same config_* RPCs the Configurations panel reads.
@@ -944,6 +982,15 @@ struct AppState {
     std::string agentV2Status;              // e.g. "PLAN > planner attempt 1..."
     bool agentV2Running = false;            // a v2 run is in flight (blocks concurrent runs)
     // --- end C22b ---
+
+    // ---- Stop + message queue (modern agentic composer) ----
+    // stopRequested: the user hit Stop on an in-flight JOB run. The worker can't be interrupted
+    // mid-RPC, so the background thread finishes, but the GL-thread drain (app.cpp) DISCARDS the
+    // result instead of applying it (no chat/doc/tab updates). Cleared by the drain.
+    bool stopRequested = false;
+    // queuedPrompts: messages the user sent WHILE a turn was active (Claude-Code-style queue).
+    // Drained one-at-a-time by the composer once the assistant is free again.
+    std::vector<std::string> queuedPrompts;
 
     // ---- C25: ribbon dispatch hook (set in app.cpp after the ribbon callback is wired) ----
     // Allows UI widgets (shortcut bar, gesture wheel) to fire ribbon commands without

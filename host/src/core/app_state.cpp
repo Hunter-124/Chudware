@@ -114,6 +114,11 @@ void loadSettings(Settings& s) {
         if (auto it = j.find("recent_files"); it != j.end() && it->is_array())
             for (const auto& e : *it)
                 if (e.is_string()) s.recentFiles.push_back(e.get<std::string>());
+        // Chat-picker model visibility (opt-out hidden set).
+        s.hiddenModels.clear();
+        if (auto it = j.find("hidden_models"); it != j.end() && it->is_array())
+            for (const auto& e : *it)
+                if (e.is_string()) s.hiddenModels.insert(e.get<std::string>());
     } catch (...) {
     }
 }
@@ -163,6 +168,8 @@ void saveSettings(const Settings& s) {
     // Wave 3: File Explorer workspace + Recent files.
     if (!s.workspaceDir.empty()) j["workspace_dir"] = s.workspaceDir;
     j["recent_files"] = s.recentFiles;
+    if (!s.hiddenModels.empty())
+        j["hidden_models"] = std::vector<std::string>(s.hiddenModels.begin(), s.hiddenModels.end());
     try {
         std::filesystem::create_directories(appdataDir() + "\\AI-CAD");
         std::ofstream(configPath()) << j.dump(2);

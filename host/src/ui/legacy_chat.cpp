@@ -1,16 +1,23 @@
-// AI-CAD legacy Design panel (extracted from gui_app.cpp).
+// AI-CAD Copilot pane.
+//
+// One clean vertical pane: a slim header (logo + status + chat menu), the conversation log with a
+// per-turn transparent activity timeline (what the AI is doing / thinking, expandable), and a
+// bottom composer (rounded input + inline model/settings/send toolbar + provider/mode/autopilot
+// chips). Settings live in a popup off the composer; there is no separate Activity panel anymore.
 //
 // Also home to the shared small-UI helpers (primaryButton/sectionHeader/dimText/toggleChip and
 // the code/diff/prose/fit/plan/parts draw helpers) declared in core/app_state.h — they live here
-// because the Design panel is their primary user, and are shared with the other panels via the
+// because the Copilot pane is their primary user, and are shared with the other panels via the
 // header.
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <string>
 #include <unordered_map>
 
@@ -21,8 +28,9 @@
 #include "legacy_chat.h"
 #include "model_registry.h"  // ui::ModelInfo / capability flags / provider mapping
 #include "metrics.h"          // ui::metrics::px/U/asmHeaderIconGap
-#include "activity_panel.h"  // C22b: for casting st.activityPanel
-#include "console_panel.h"   // drawConsoleBody for the consolidated AI panel's Console tab
+#include "activity_panel.h"  // C22b: ActivityPanel still fed for the AI_CAD_SHOT=activity scenario
+#include "console_panel.h"   // drawConsoleBody (shared console helper)
+#include "icons.h"           // getIcon / IconUV — composer settings glyph
 
 #include "../core/app_state.h"
 #include "../core/jobs.h"
@@ -322,7 +330,72 @@ void drawPartsLine(const std::vector<PartInfo>& parts) {
     }
 }
 
+// ============================ transparent activity timeline ============================
+// Map a raw orchestrator stage key to a plain-language heading the user can follow.
+static std::string friendlyStageTitle(const std::string& stage) {
+    if (stage == "intake")  return "Understanding the request";
+    if (stage == "plan")    return "Planning the build";
+    if (stage == "model")   return "Building the model";
+    if (stage == "edit")    return "Editing the model";
+    if (stage == "review")  return "Reviewing the result";
+    if (stage == "fix")     return "Fixing issues";
+    if (stage == "memory")  return "Saving notes";
+    std::string t = stage;            // Title-case fallback for any unknown stage
+    if (!t.empty()) t[0] = (char)std::toupper((unsigned char)t[0]);
+    return t.empty() ? std::string("Working") : t;
+}
+
+void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json& data) {
+    auto findStage = [&](const std::string& s) -> ActivityItem* {
+        for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
+            if (it->stage == s) return &*it;
+        return nullptr;
+    };
+    if (kind == "stage_started") {
+        std::string s = jstr(data, "stage");
+        ActivityItem* a = findStage(s);
+        if (!a) {
+            ActivityItem ni;
+            ni.stage = s;
+            ni.title = friendlyStageTitle(s);
+            m.activity.push_back(std::move(ni));
+            a = &m.activity.back();
+        }
+        a->status = "running";
+    } else if (kind == "agent_output") {
+        ActivityItem* a = findStage(jstr(data, "stage"));
+        if (a) {
+            std::string raw = jstr(data, "raw");
+            if (!raw.empty()) a->detail = raw;     // keep the latest attempt's thoughts/output
+            a->durationMs = jint(data, "duration_ms");
+            a->opsCount   = jint(data, "ops_count");
+            if (data.contains("tokens") && data["tokens"].is_object()) {
+                a->tokensIn  = jint(data["tokens"], "in");
+                a->tokensOut = jint(data["tokens"], "out");
+            }
+        }
+    } else if (kind == "stage_result") {
+        ActivityItem* a = findStage(jstr(data, "stage"));
+        if (a) {
+            std::string v = jstr(data, "verdict");
+            a->status = v.empty() ? "done" : v;
+            a->reason = jstr(data, "reason");
+        }
+    } else if (kind == "run_finished") {
+        for (auto& a : m.activity)
+            if (a.status == "running" || a.status.empty()) a.status = "done";
+    }
+}
+
 namespace ui {
+
+// Forward decls for the conversation helpers (defined further down) so the header/composer can
+// drive them.
+static void ensureConversations(AppState& st);
+static void newConversation(AppState& st);
+static void switchConversation(AppState& st, int idx);
+static void closeConversation(AppState& st, int idx);
+static void submitTurn(AppState& st, const std::string& text);
 
 // ============================ W3-H: unified AI Copilot pane ============================
 // One pane, top-down: header -> input -> mode pills -> conversation (with inline live run
@@ -542,6 +615,108 @@ static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     }
 }
 
+// The transparent activity timeline: one expandable row per thing the AI did/thought, with a
+// status glyph (drawn with the draw list — check/arrow glyphs are not in the body font), the
+// plain-language heading, optional verdict reason, and a click-to-expand body that reveals the
+// raw reasoning/output behind the step. This is the primary "what the AI is doing" surface and
+// replaces the old separate Activity panel + cramped embedded run tree.
+static void drawActivityTimeline(ChatMsg& m, const ui::Fonts& fonts) {
+    if (m.activity.empty()) return;
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    for (size_t i = 0; i < m.activity.size(); ++i) {
+        ActivityItem& a = m.activity[i];
+        ImGui::PushID((int)i);
+        const float lh = ImGui::GetTextLineHeight();
+        const float gw = lh;                       // status-glyph box width
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        const ImVec2 c(p0.x + gw * 0.5f, p0.y + lh * 0.5f);
+        const float r = lh * 0.30f;
+        const bool running = a.status == "running";
+        const bool pass    = a.status == "pass" || a.status == "done";
+        const bool retry   = a.status == "retry";
+        const bool fail    = a.status == "fail";
+        ImU32 col = ui::Palette::toU32(running || pass ? pal.accent
+                                       : retry ? pal.statusWarn
+                                       : fail  ? pal.statusErr : pal.textDim);
+        const float th = ui::metrics::stroke(1.6f);
+        if (running) {                              // spinning comet arc
+            float t = (float)ImGui::GetTime();
+            const int seg = 14;
+            for (int s = 0; s < seg; ++s) {
+                float f = (float)s / seg, aa = t * 6.0f + f * 6.2831853f;
+                float al = 0.12f + 0.88f * f;
+                ImU32 cc = (col & 0x00FFFFFFu) | ((ImU32)(al * 255) << 24);
+                dl->AddCircleFilled(ImVec2(c.x + std::cos(aa) * r, c.y + std::sin(aa) * r), th, cc);
+            }
+        } else if (pass) {                          // check mark
+            dl->AddLine(ImVec2(c.x - r * 0.55f, c.y + r * 0.05f),
+                        ImVec2(c.x - r * 0.10f, c.y + r * 0.50f), col, th);
+            dl->AddLine(ImVec2(c.x - r * 0.10f, c.y + r * 0.50f),
+                        ImVec2(c.x + r * 0.60f, c.y - r * 0.50f), col, th);
+        } else if (fail) {                          // cross
+            dl->AddLine(ImVec2(c.x - r * 0.5f, c.y - r * 0.5f),
+                        ImVec2(c.x + r * 0.5f, c.y + r * 0.5f), col, th);
+            dl->AddLine(ImVec2(c.x - r * 0.5f, c.y + r * 0.5f),
+                        ImVec2(c.x + r * 0.5f, c.y - r * 0.5f), col, th);
+        } else if (retry) {
+            dl->AddCircle(c, r, col, 12, th);
+        } else {
+            dl->AddCircle(c, r * 0.8f, col, 12, th);  // pending hollow dot
+        }
+        ImGui::Dummy(ImVec2(gw, lh));
+        ImGui::SameLine(0, 6 * sc);
+
+        const bool hasDetail = !a.detail.empty();
+        ImVec4 titleCol = running ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)
+                        : fail    ? ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1)
+                        : pass    ? ImVec4(pal.text[0], pal.text[1], pal.text[2], 1)
+                                  : ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1);
+        ImGui::PushFont(fonts.medium);
+        ImGui::TextColored(titleCol, "%s", a.title.c_str());
+        ImGui::PopFont();
+        if (hasDetail) {
+            if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
+            ImGui::SameLine(0, 6 * sc);
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+            ImGui::TextUnformatted(a.expanded ? "(hide)" : "(details)");
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
+        }
+        if (a.durationMs > 0 || a.opsCount > 0) {
+            ImGui::SameLine(0, 8 * sc);
+            char meta[96];
+            if (a.opsCount > 0 && a.durationMs > 0)
+                std::snprintf(meta, sizeof(meta), "%d ops \xc2\xb7 %.1fs", a.opsCount, a.durationMs / 1000.0);
+            else if (a.durationMs > 0)
+                std::snprintf(meta, sizeof(meta), "%.1fs", a.durationMs / 1000.0);
+            else
+                std::snprintf(meta, sizeof(meta), "%d ops", a.opsCount);
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+            ImGui::TextUnformatted(meta);
+            ImGui::PopStyleColor();
+        }
+        if (!a.reason.empty()) {
+            ImGui::Indent(gw + 6 * sc);
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+            ImGui::TextWrapped("%s", a.reason.c_str());
+            ImGui::PopStyleColor();
+            ImGui::Unindent(gw + 6 * sc);
+        }
+        if (a.expanded && hasDetail) {
+            ImGui::Indent(gw + 6 * sc);
+            drawProseBox("##actdetail", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
+            ImGui::Unindent(gw + 6 * sc);
+        }
+        ImGui::Dummy(ImVec2(0, 3 * sc));
+        ImGui::PopID();
+    }
+}
+
 static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW) {
     const auto& pal = ui::palette;
     const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
@@ -551,6 +726,10 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
                              pal.assistantName[2], 1), "Assistant");
     ImGui::PopFont();
     if (m.plan.present) drawPlanCard(m.plan, fonts);
+
+    // Transparent activity timeline — what the AI is doing / thinking, inline + expandable.
+    drawActivityTimeline(m, fonts);
+
     if (!m.text.empty()) {
         if (m.errKind == ERR_SYSTEM)
             ImGui::PushStyleColor(ImGuiCol_Text,
@@ -574,7 +753,8 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 
     if (m.running) {
         // Inline live status: a simple braille spinner + the current phase, then a thin
-        // accent progress bar so the pane reads as "working" at a glance.
+        // accent progress bar so the pane reads as "working" at a glance. The transparent
+        // activity timeline above already shows the per-stage detail.
         ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
         static const char* kSpin[] = {"|", "/", "-", "\\"};
         int sp = (int)(ImGui::GetTime() * 8.0) & 3;
@@ -590,26 +770,17 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         float frac = 0.15f + 0.35f * (float)(0.5 + 0.5 * std::sin(ImGui::GetTime() * 2.2));
         ImGui::ProgressBar(frac, ImVec2(-1, 3.0f * ui::uiScale), "");
         ImGui::PopStyleColor(2);
-
-        // For an orchestrator (v2) run, embed the Activity tree inline (collapsed by default).
-        // There is no per-run filter API on ActivityPanel, so we host its full body (which
-        // already shows the live run first) inside a bounded scroll region, plus a link to the
-        // standalone Activity panel for the full view.
-        if (st.agentV2Running && st.activityPanel) {
-            if (ImGui::CollapsingHeader("Activity")) {
-                ImGui::BeginChild("##inlineact", ImVec2(0, 220.0f * ui::uiScale),
-                                  ImGuiChildFlags_Border);
-                st.activityPanel->drawBody(st);
-                ImGui::EndChild();
-                if (ImGui::SmallButton("Open Activity panel")) st.showActivityPanel = true;
-            }
-        }
     }
 }
 
-// ---- header: small logo glyph + "AI-CAD Copilot" + status dot (idle/running/error) ----
+// ---- header: logo + "AI-CAD Copilot" + right cluster ([New chat] [Chats ▾] + status dot) ----
 static void drawCopilotHeader(AppState& st, bool busy) {
     const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    // NOTE: do NOT ensureConversations() here — drawAIPanel calls syncChatToDoc() first, which
+    // adopts the seeded/persisted chat. Forcing a conversation earlier flips that load into its
+    // "fresh chat" branch and wipes the active turn.
+
     if (st.logoIcon.id) {
         float h = ImGui::GetTextLineHeight();
         ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(h, h));
@@ -618,79 +789,87 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     ImGui::PushFont(st.fonts.h2);
     ImGui::TextUnformatted("AI-CAD Copilot");
     ImGui::PopFont();
-    // status dot: error (red) > running (accent) > idle (dim accent)
-    const float* dot = pal.statusOk;
-    const char* tip = "Idle";
+
+    // ---- right cluster ----
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float lh = ImGui::GetTextLineHeight();
+    float newW   = ImGui::CalcTextSize("New chat").x + style.FramePadding.x * 2.0f;
+    float chatsW = ImGui::CalcTextSize("Chats").x + style.FramePadding.x * 2.0f;
+    float cluster = newW + style.ItemSpacing.x + chatsW + style.ItemSpacing.x + lh;
+    ImGui::SameLine();
+    float xRight = ImGui::GetContentRegionMax().x - cluster;
+    if (xRight > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(xRight);
+
+    if (busy) ImGui::BeginDisabled();
+    if (ImGui::SmallButton("New chat")) { newConversation(st); st.prompt[0] = 0; }
+    if (busy) ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a new conversation (past chats are kept).");
+
+    ImGui::SameLine();
+    bool openChats = ImGui::SmallButton("Chats");
+    // The "Chats" button sits near the panel's right edge, so a popup anchored there grows off the
+    // right of the window (hiding the trashcan column). Capture the button's bottom-right and pin
+    // the popup's top-RIGHT corner to it so it opens leftward, fully on-screen.
+    ImVec2 chatsAnchor = ImGui::GetItemRectMax();
+    if (openChats) ImGui::OpenPopup("##chatspopup");
+
+    // Render one chat row: a width-bounded Selectable (so long titles clip instead of overflowing)
+    // plus a right-aligned trashcan delete button. Returns true if the chat was deleted, in which
+    // case the caller must stop iterating (st.conversations changed).
+    auto chatRow = [&](int i) -> bool {
+        std::string title = st.conversations[i].title.empty()
+                                ? ("Chat " + std::to_string(i + 1)) : st.conversations[i].title;
+        ImGui::PushID(i);
+        float trashW = ImGui::GetFrameHeight();
+        float rowW = ImGui::GetContentRegionAvail().x;
+        if (ImGui::Selectable(title.c_str(), i == st.activeConv,
+                              ImGuiSelectableFlags_DontClosePopups,
+                              ImVec2(rowW - trashW - 4 * sc, 0)) &&
+            !busy)
+            switchConversation(st, i);
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - trashW);
+        IconUV trash = ui::getIcon("delete", 20);
+        bool del;
+        if (trash.valid) {
+            ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(0, 0, 0, 0));  // frameless icon
+            del = ImGui::ImageButton("##delconv", trash.texId,
+                                     ImVec2(trashW - 8 * sc, trashW - 8 * sc),
+                                     trash.uv0, trash.uv1);
+            ImGui::PopStyleColor();
+        } else {
+            del = ImGui::SmallButton("x");
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete this chat");
+        bool deleted = del && !busy;
+        if (deleted) closeConversation(st, i);
+        ImGui::PopID();
+        return deleted;
+    };
+
+    // Pin the popup width. BeginPopup forces ImGuiWindowFlags_AlwaysAutoResize, which IGNORES
+    // SetNextWindowSize — so the popup would auto-size to its "fill available" content and balloon
+    // to viewport width. SizeConstraints ARE honored under auto-resize: clamp the width (height
+    // auto). Anchoring the top-RIGHT to the button then keeps it on-screen, growing leftward.
+    ImGui::SetNextWindowPos(chatsAnchor, ImGuiCond_Appearing, ImVec2(1.0f, 0.0f));  // grow left
+    ImGui::SetNextWindowSizeConstraints(ImVec2(248 * sc, 0), ImVec2(248 * sc, FLT_MAX));
+    if (ImGui::BeginPopup("##chatspopup")) {
+        for (int i = 0; i < (int)st.conversations.size(); ++i) if (chatRow(i)) break;
+        ImGui::Separator();
+        if (ImGui::Selectable("+ New chat") && !busy) newConversation(st);
+        ImGui::EndPopup();
+    }
+
+    // status dot (drawn — the ● glyph is not in the body font), accent=running / red=error / dim=idle
+    ImGui::SameLine();
+    const float* dot = pal.accentMid;  const char* tip = "Idle";
     if (st.statusKind == 2) { dot = pal.statusErr; tip = "Error"; }
     else if (busy || st.agentV2Running) { dot = pal.accent; tip = "Running"; }
-    else { dot = pal.accentMid; tip = "Idle"; }
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - ImGui::GetTextLineHeight());
-    ImGui::TextColored(ImVec4(dot[0], dot[1], dot[2], dot[3]), "%s",
-                       "\xe2\x97\x8f" /* ● */);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 cp = ImGui::GetCursorScreenPos();
+    dl->AddCircleFilled(ImVec2(cp.x + lh * 0.5f, cp.y + lh * 0.5f), lh * 0.30f,
+                        ImGui::ColorConvertFloat4ToU32(ImVec4(dot[0], dot[1], dot[2], dot[3])));
+    ImGui::Dummy(ImVec2(lh, lh));
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
-}
-
-// ---- mode pill row: [Design new] [Edit part] [Ask] + model/provider label. Wraps to a
-//      second row when the pane is too narrow to fit on one line. ----
-static void drawModeRow(AppState& st) {
-    const auto& pal = ui::palette;
-    bool hasDoc = st.docMirror.hasDoc();
-    const float sc = ui::uiScale;
-    const char* kModes[] = {"Design new", "Edit part", "Ask"};
-    const char* kModeTips[] = {
-        "Design new — describe a new part and the AI models it from scratch.",
-        "Edit part — the orchestrator (v2) edits the open part via validated document ops.",
-        "Ask — ask questions about the current part; nothing is modified.",
-    };
-    float avail = ImGui::GetContentRegionAvail().x;
-    const ImGuiStyle& style = ImGui::GetStyle();
-    const ImVec2 compactPad(8.0f * sc, 4.0f * sc);
-
-    // Lay out the three pills; wrap onto the next line when the running width would overflow.
-    float x = 0.0f;
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, compactPad);
-    for (int i = 0; i < 3; ++i) {
-        bool active = (st.aiInteraction == i);
-        bool disabled = (i == 1 && !hasDoc);   // Edit requires a doc
-        float w = ImGui::CalcTextSize(kModes[i]).x + compactPad.x * 2.0f;
-        if (i > 0) {
-            if (x + style.ItemSpacing.x + w <= avail) { ImGui::SameLine(); x += style.ItemSpacing.x; }
-            else { x = 0.0f; }  // wrap
-        }
-        x += w;
-        if (disabled) ImGui::BeginDisabled();
-        if (active) ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.accent));
-        if (ImGui::Button(kModes[i])) st.aiInteraction = i;
-        if (active) ImGui::PopStyleColor();
-        if (disabled) ImGui::EndDisabled();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kModeTips[i]);
-    }
-    ImGui::PopStyleVar();
-    if (st.aiInteraction == 1 && !hasDoc) st.aiInteraction = 0;   // fall back when no doc
-    st.agentV2 = (st.aiInteraction == 1);                         // Edit == orchestrator v2
-
-    // Model / provider / mode label — clicking jumps to the Settings tab, where the model,
-    // provider, and the supervised-vs-autopilot toggle ("Plan before building") all live. The
-    // mode is shown read-only here (no duplicate toggle — that was the redundant control).
-    const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini"};
-    const char* prov = provNames[(st.settings.provider >= 0 &&
-                                  st.settings.provider < ui::PROV_COUNT)
-                                     ? st.settings.provider : ui::PROV_GEMINI];
-    char label[260];
-    bool showEffort = ui::modelSupportsReasoning(st.settings.provider, st.settings.model) &&
-                      st.settings.reasoningEffort[0];
-    std::snprintf(label, sizeof(label), "%s / %s%s%s  [%s]", prov,
-                  st.settings.model[0] ? st.settings.model : "default",
-                  showEffort ? " · " : "", showEffort ? st.settings.reasoningEffort : "",
-                  st.settings.planMode ? "Supervised" : "Autopilot");
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, compactPad);
-    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-    if (ImGui::Button(label, ImVec2(-1, 0))) st.focusSettingsTab = true;
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Model, provider & mode - click to open Settings.\n%s", label);
 }
 
 // ============================ conversation tabs + persistence ============================
@@ -845,42 +1024,8 @@ static void closeConversation(AppState& st, int idx) {
     persistChatHistory(st);
 }
 
-// A compact horizontal strip of conversation tabs: click to switch, middle-click to close,
-// "+" to start a new conversation. Mirrors the document-tab UX.
-static void drawConversationTabs(AppState& st, bool busy) {
-    ensureConversations(st);
-    const auto& pal = ui::palette;
-    const float sc = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * sc, 3.0f * sc));
-    const ImGuiStyle& style = ImGui::GetStyle();
-    float avail = ImGui::GetContentRegionAvail().x;
-    float x = 0.0f;
-    for (int i = 0; i < (int)st.conversations.size(); ++i) {
-        ImGui::PushID(i);
-        bool active = (i == st.activeConv);
-        std::string title = st.conversations[i].title.empty()
-                                ? ("Chat " + std::to_string(i + 1)) : st.conversations[i].title;
-        std::string shown = title.size() > 18 ? (title.substr(0, 17) + "...") : title;
-        float w = ImGui::CalcTextSize(shown.c_str()).x + 18.0f * sc;
-        if (i > 0) {
-            if (x + style.ItemSpacing.x + w <= avail) { ImGui::SameLine(); x += style.ItemSpacing.x; }
-            else { x = 0.0f; }
-        }
-        x += w;
-        if (active) ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.accent));
-        if (ImGui::Button(shown.c_str()) && !active && !busy) switchConversation(st, i);
-        if (active) ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("%s  (middle-click to close)", title.c_str());
-            if (ImGui::IsMouseClicked(2) && !busy) { closeConversation(st, i); ImGui::PopID(); break; }
-        }
-        ImGui::PopID();
-    }
-    if (x + style.ItemSpacing.x + 26.0f * sc <= avail) ImGui::SameLine();
-    if (ImGui::Button("+##newconv") && !busy) newConversation(st);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("New conversation");
-    ImGui::PopStyleVar();
-}
+// (The horizontal conversation-tab strip was removed in the copilot overhaul — conversations are
+//  now switched from the header's "Chats" dropdown; New chat lives in the header + composer.)
 
 // Probe the local OpenAI-compatible endpoint for its loaded models + reachability, so the
 // picker can hide local models that are down. Throttled to ~5s; force bypasses the throttle.
@@ -902,6 +1047,12 @@ void refreshModelAvailability(AppState& st, bool force) {
             if (r.result.contains("models") && r.result["models"].is_array())
                 for (const auto& m : r.result["models"])
                     if (m.is_string()) pm.models.push_back(m.get<std::string>());
+            // LM Studio reports which models are actually loaded (vs merely downloaded); when
+            // present, the picker shows only those. Absent => every listed model is available.
+            pm.loadedKnown = r.result.value("loaded_known", false);
+            if (r.result.contains("loaded") && r.result["loaded"].is_array())
+                for (const auto& m : r.result["loaded"])
+                    if (m.is_string()) pm.loaded.push_back(m.get<std::string>());
         } else {
             pm.error = r.err.empty() ? "core unavailable" : r.err;
         }
@@ -921,6 +1072,11 @@ static char* providerKeyBuf(Settings& s, int provider) {
         default: return s.apiKey;  // local OpenAI-compatible optional key
     }
 }
+
+// Availability helpers (defined with the model-dropdown section below; forward-declared so the
+// "Manage models" panel inside drawProviderModelPicker can call them).
+static bool providerUsable(AppState& st, int provider);
+static bool localModelLoaded(const ProviderModels& pm, const std::string& id);
 
 // Shared provider + model picker. Returns true if a setting changed this frame.
 bool drawProviderModelPicker(AppState& st, bool busy) {
@@ -1072,6 +1228,66 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
         ImGui::PopStyleColor();
     }
 
+    // ---- manage which models appear in the chat picker (VS-Code-Copilot "Manage models") ----
+    ImGui::Dummy(ImVec2(0, 6 * S));
+    if (ImGui::CollapsingHeader("Manage models (chat picker)")) {
+        dimText("Uncheck a model to hide it from the composer's model dropdown. Only available "
+                "models (keyed cloud / loaded local) appear there; this just trims that list.");
+        ImGui::Dummy(ImVec2(0, 2 * S));
+        const auto& pal2 = ui::palette;
+        int rowuid = 0;
+        // One toggle row: [x] Label .................... status
+        auto visRow = [&](const std::string& id, const std::string& label,
+                          const char* status, ImU32 statusCol) {
+            ImGui::PushID(rowuid++);
+            bool show = (s.hiddenModels.count(id) == 0);
+            if (ImGui::Checkbox("##vis", &show)) {
+                if (show) s.hiddenModels.erase(id);
+                else      s.hiddenModels.insert(id);
+                changed = true;
+            }
+            ImGui::SameLine();
+            ImGui::TextUnformatted(label.c_str());
+            if (status && status[0]) {
+                float tw = ImGui::CalcTextSize(status).x;
+                ImGui::SameLine(ImGui::GetContentRegionMax().x - tw);
+                ImGui::PushStyleColor(ImGuiCol_Text, statusCol);
+                ImGui::TextUnformatted(status);
+                ImGui::PopStyleColor();
+            }
+            ImGui::PopID();
+        };
+        const ImU32 okCol = IM_COL32(120, 200, 120, 255);
+        const ImU32 dimCol = ui::Palette::toU32(pal2.textDim);
+        const ImU32 warnCol = IM_COL32(220, 170, 90, 255);
+
+        // Built-in cloud models, grouped by provider.
+        for (int pv : {ui::PROV_GEMINI, ui::PROV_ANTHROPIC, ui::PROV_OPENAI}) {
+            bool header = false;
+            for (const auto& m : ui::builtinModels()) {
+                if (m.provider != pv) continue;
+                if (!header) { ImGui::SeparatorText(ui::providerLabel(pv)); header = true; }
+                bool keyed = providerUsable(st, pv);
+                visRow(m.id, m.label, keyed ? "available" : "needs key", keyed ? okCol : warnCol);
+            }
+        }
+        // Discovered local models (deduped across the local provider pair).
+        const ProviderModels& lpm = st.providerModels[ui::PROV_LOCAL];
+        if (!lpm.models.empty()) {
+            ImGui::SeparatorText("Local endpoint");
+            std::set<std::string> seen;
+            for (const auto& id : lpm.models) {
+                if (!seen.insert(id).second) continue;
+                bool loaded = localModelLoaded(lpm, id);
+                visRow(id, id, lpm.loadedKnown ? (loaded ? "loaded" : "not loaded") : "available",
+                       loaded ? okCol : dimCol);
+            }
+        } else {
+            ImGui::SeparatorText("Local endpoint");
+            dimText("No local models discovered — start your local model server.");
+        }
+    }
+
     // ---- privacy / offline ----
     ImGui::Dummy(ImVec2(0, 6 * S));
     ImGui::SeparatorText("Privacy");
@@ -1083,20 +1299,16 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
     return changed;
 }
 
-static void drawInlineSettingsTab(AppState& st, bool busy) {
+// The AI settings popover body (opened from the composer's settings glyph): the shared
+// provider/model/reasoning picker plus the common run-behavior toggles. No outer child — the
+// popup window provides the frame.
+static void drawAISettingsBody(AppState& st, bool busy) {
     Settings& settings = st.settings;
-    const auto& pal = ui::palette;
-    const float S = ui::uiScale;
-
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * S, 8.0f * S));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(pal.panelBg[0], pal.panelBg[1], pal.panelBg[2], 1));
-    ImGui::BeginChild("##settings_quick", ImVec2(0, 0), ImGuiChildFlags_Border);
 
     ImGui::PushFont(st.fonts.medium);
     ImGui::TextUnformatted("AI Settings");
     ImGui::PopFont();
-    dimText("Provider, model, privacy, and common run behavior.");
+    dimText("Provider, model, privacy, and run behavior.");
     ImGui::Separator();
 
     // Shared provider + availability-filtered model picker + reasoning effort (Settings modal
@@ -1104,7 +1316,14 @@ static void drawInlineSettingsTab(AppState& st, bool busy) {
     ui::drawProviderModelPicker(st, busy);
 
     ImGui::SeparatorText("Behavior");
-    ImGui::Checkbox("Plan before building", &settings.planMode);
+    {
+        const char* rmItems[] = {"Supervised (plan + clarify before modeling)",
+                                 "Autopilot (model straight from the prompt)"};
+        int rm = settings.planMode ? 0 : 1;
+        ImGui::TextUnformatted("Run mode");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##runmodecombo", &rm, rmItems, 2)) settings.planMode = (rm == 0);
+    }
     int units = st.ips() ? 1 : 0;
     if (ImGui::RadioButton("MMGS", &units, 0)) settings.units = Units::MMGS;
     ImGui::SameLine();
@@ -1136,10 +1355,233 @@ static void drawInlineSettingsTab(AppState& st, bool busy) {
         !st.setupRunning.load() && !st.job.running.load()) {
         st.startSetup(true);
     }
+}
 
+// The Settings dock tab — a sibling of the "AI" window (docked next to it). Hosts the same AI
+// settings body. SetNextWindowDockID pins it beside "AI" even on a saved layout; focusSettingsTab
+// (set by the composer gear / model-dropdown gear) brings it forward.
+void drawAISettingsTab(AppState& st, bool busy) {
+    if (!st.showAIPanel) return;
+    if (st.aiDockId) ImGui::SetNextWindowDockID((ImGuiID)st.aiDockId, ImGuiCond_FirstUseEver);
+    if (st.focusSettingsTab) { ImGui::SetNextWindowFocus(); st.focusSettingsTab = false; }
+    if (!ImGui::Begin("Settings###AISettings")) { ImGui::End(); return; }
+    const auto& pal = ui::palette;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImVec4(pal.panelBg[0], pal.panelBg[1], pal.panelBg[2], 1));
+    ImGui::BeginChild("##aisetbody", ImVec2(0, 0), ImGuiChildFlags_None);
+    drawAISettingsBody(st, busy);
     ImGui::EndChild();
     ImGui::PopStyleColor();
-    ImGui::PopStyleVar();
+    ImGui::End();
+}
+
+// ============================ searchable model dropdown ============================
+// A short provider tag shown as the dim sublabel next to each model (like the reference's
+// "Copilot").
+static const char* providerShort(int provider) {
+    switch (provider) {
+        case ui::PROV_ANTHROPIC: return "Claude";
+        case ui::PROV_OPENAI:    return "OpenAI";
+        case ui::PROV_LOCAL:     return "Local";
+        case ui::PROV_LLAMACPP:  return "llama.cpp";
+        case ui::PROV_GEMINI:    return "Gemini";
+    }
+    return "";
+}
+
+// A discovered local model is selectable only when the endpoint can actually serve it: when LM
+// Studio reports loaded state we require the model to be loaded; otherwise (servers without that
+// endpoint, e.g. vLLM/llama.cpp, which only list what they serve) every listed id is available.
+static bool localModelLoaded(const ProviderModels& pm, const std::string& id) {
+    if (!pm.loadedKnown) return true;
+    return std::find(pm.loaded.begin(), pm.loaded.end(), id) != pm.loaded.end();
+}
+
+// Has the user hidden this model from the chat picker (Settings → AI → Manage models)?
+static bool modelHidden(AppState& st, const std::string& id) {
+    return st.settings.hiddenModels.count(id) != 0;
+}
+
+// Does this provider have credentials / a reachable endpoint, so its models can be selected?
+static bool providerUsable(AppState& st, int provider) {
+    switch (provider) {
+        case ui::PROV_GEMINI:    return st.settings.geminiKey[0] != 0;
+        case ui::PROV_ANTHROPIC: return st.settings.anthropicKey[0] != 0;
+        case ui::PROV_OPENAI:    return st.settings.openaiKey[0] != 0;
+        case ui::PROV_LOCAL:     return st.providerModels[ui::PROV_LOCAL].ok;
+        case ui::PROV_LLAMACPP:  return st.providerModels[ui::PROV_LLAMACPP].ok;
+    }
+    return false;
+}
+
+// One model row: checkmark gutter (drawn — no check glyph in the font) + label + dim provider
+// sublabel; an accent "Add key" when the provider isn't usable. Returns true when picked.
+// `uid` makes the ImGui id unique per row — model ids can repeat across providers/endpoints
+// (the same local endpoint backs both PROV_LOCAL and PROV_LLAMACPP), and two rows sharing an
+// id string would trip ImGui's "conflicting ID" assert.
+static bool modelRow(AppState& st, int provider, const std::string& id, const std::string& label,
+                     bool usable, int uid) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const float rowH = ImGui::GetFrameHeight();
+    const float fh = ImGui::GetFontSize();
+    const float gut = fh + 8 * sc;
+    bool current = (st.settings.provider == provider &&
+                    std::strcmp(st.settings.model, id.c_str()) == 0);
+    ImGui::PushID(uid);
+    bool clicked = ImGui::Selectable("##mrow", current,
+                                     usable ? 0 : ImGuiSelectableFlags_Disabled, ImVec2(0, rowH));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+    float midY = (mn.y + mx.y) * 0.5f;
+    if (current) {
+        float r = fh * 0.30f; ImVec2 c(mn.x + 5 * sc + r, midY);
+        ImU32 col = ui::Palette::toU32(pal.accent); float th = ui::metrics::stroke(1.6f);
+        dl->AddLine(ImVec2(c.x - r * 0.55f, c.y + r * 0.05f),
+                    ImVec2(c.x - r * 0.10f, c.y + r * 0.50f), col, th);
+        dl->AddLine(ImVec2(c.x - r * 0.10f, c.y + r * 0.50f),
+                    ImVec2(c.x + r * 0.60f, c.y - r * 0.50f), col, th);
+    }
+    dl->AddText(ImVec2(mn.x + gut, midY - fh * 0.5f),
+                usable ? ui::Palette::toU32(pal.text) : ui::Palette::toU32(pal.textDisabled),
+                label.c_str());
+    float lw = ImGui::CalcTextSize(label.c_str()).x;
+    dl->AddText(ImVec2(mn.x + gut + lw + 8 * sc, midY - fh * 0.5f),
+                ui::Palette::toU32(pal.textDim), providerShort(provider));
+    if (!usable) {
+        const char* hint = "Add key";
+        float hw = ImGui::CalcTextSize(hint).x;
+        dl->AddText(ImVec2(mx.x - hw - 8 * sc, midY - fh * 0.5f),
+                    ui::Palette::toU32(pal.accent), hint);
+    }
+    ImGui::PopID();
+    return clicked && usable;
+}
+
+// The model dropdown body (hosted in a popup): a search box, the usable models with a checkmark
+// on the current one, an "Other Models" group for unkeyed providers, and a gear that opens the
+// Settings tab. Picking a model sets provider+model and closes the popup.
+static void drawModelDropdown(AppState& st, bool busy) {
+    (void)busy;
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    static char s_modelSearch[64] = "";
+    refreshModelAvailability(st, false);
+
+    if (ImGui::IsWindowAppearing()) { s_modelSearch[0] = 0; ImGui::SetKeyboardFocusHere(); }
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputTextWithHint("##modelsearch", "Search models", s_modelSearch, sizeof(s_modelSearch));
+    ImGui::Separator();
+
+    auto lc = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return s;
+    };
+    std::string q = lc(s_modelSearch);
+    auto matchq = [&](const std::string& a, const std::string& b) {
+        return q.empty() || lc(a).find(q) != std::string::npos || lc(b).find(q) != std::string::npos;
+    };
+
+    bool picked = false;
+    int uid = 0;       // monotonic per-row id seed — keeps ImGui ids unique across sections
+    int shown = 0;     // visible rows after availability + search filtering
+    ImGui::BeginChild("##modellist", ImVec2(0, 240 * sc), ImGuiChildFlags_None);
+
+    // Usable built-in cloud models (provider has a key), minus any the user hid.
+    for (const auto& m : ui::builtinModels()) {
+        if (!providerUsable(st, m.provider) || !matchq(m.label, providerShort(m.provider))) continue;
+        if (modelHidden(st, m.id)) continue;
+        ++shown;
+        if (modelRow(st, m.provider, m.id, m.label, true, uid++)) {
+            st.settings.provider = m.provider;
+            std::strncpy(st.settings.model, m.id.c_str(), sizeof(st.settings.model) - 1);
+            picked = true;
+        }
+    }
+    // Live-discovered local models (when a local endpoint is up). The probe assigns the same
+    // model list to PROV_LOCAL and PROV_LLAMACPP (one endpoint family), so dedup by id to avoid
+    // listing each model twice. Skip models that are downloaded but not loaded, and any the user
+    // hid.
+    std::set<std::string> seenLocal;
+    for (int lp : {ui::PROV_LOCAL, ui::PROV_LLAMACPP}) {
+        const ProviderModels& pm = st.providerModels[lp];
+        if (!pm.ok) continue;
+        for (const auto& id : pm.models) {
+            if (!seenLocal.insert(id).second) continue;     // already shown for the sibling provider
+            if (!localModelLoaded(pm, id)) continue;        // downloaded but not loaded into memory
+            if (modelHidden(st, id)) continue;
+            if (!matchq(id, providerShort(lp))) continue;
+            ++shown;
+            if (modelRow(st, lp, id, id, true, uid++)) {
+                st.settings.provider = lp;
+                std::strncpy(st.settings.model, id.c_str(), sizeof(st.settings.model) - 1);
+                picked = true;
+            }
+        }
+    }
+    if (shown == 0) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDisabled));
+        ImGui::TextWrapped(q.empty() ? "No models available — add a provider key or start a local "
+                                       "model server (gear below)."
+                                     : "No models match your search.");
+        ImGui::PopStyleColor();
+    }
+    ImGui::EndChild();
+
+    // Unavailable models (no key / endpoint down) are hidden from the list above; surface a
+    // single muted hint pointing at Settings so they're still discoverable.
+    bool anyUnavailable = false;
+    for (const auto& m : ui::builtinModels())
+        if (!providerUsable(st, m.provider)) { anyUnavailable = true; break; }
+    if (anyUnavailable) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::TextUnformatted("Other providers need an API key \xE2\x80\x94 add one in Settings.");
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Separator();
+    IconUV gear = ui::getIcon("settings", 20);
+    float gsz = ImGui::GetFrameHeight();
+    ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - gsz);
+    bool openSet = gear.valid
+        ? ImGui::ImageButton("##mdlgear", gear.texId, ImVec2(gsz - 8 * sc, gsz - 8 * sc),
+                             gear.uv0, gear.uv1)
+        : ImGui::SmallButton("settings");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI settings");
+    if (openSet) { st.focusSettingsTab = true; ImGui::CloseCurrentPopup(); }
+    if (picked) ImGui::CloseCurrentPopup();
+}
+
+// ============================ run-mode dropdown ============================
+// Our real run modes (driven by Settings::planMode): Supervised drafts a plan + asks the
+// build-critical clarify questions before modeling; Autopilot models straight from the prompt.
+static void drawRunModeMenu(AppState& st) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    struct Row { bool plan; const char* title; const char* desc; };
+    static const Row rows[] = {
+        {true,  "Supervised", "Drafts a plan and asks for key dimensions before modeling"},
+        {false, "Autopilot",  "Models straight from your prompt \xE2\x80\x94 no plan or questions"},
+    };
+    const float lh = ImGui::GetTextLineHeight();
+    for (const auto& r : rows) {
+        bool cur = st.settings.planMode == r.plan;
+        float h = lh * 2 + 8 * sc;
+        ImGui::PushID(r.title);
+        bool clicked = ImGui::Selectable("##rmrow", cur, 0, ImVec2(300 * sc, h));
+        ImVec2 mn = ImGui::GetItemRectMin();
+        float tx = mn.x + 8 * sc;
+        if (st.fonts.medium)
+            dl->AddText(st.fonts.medium, st.fonts.medium->FontSize, ImVec2(tx, mn.y + 4 * sc),
+                        ui::Palette::toU32(pal.text), r.title);
+        else
+            dl->AddText(ImVec2(tx, mn.y + 4 * sc), ui::Palette::toU32(pal.text), r.title);
+        dl->AddText(ImVec2(tx, mn.y + 4 * sc + lh), ui::Palette::toU32(pal.textDim), r.desc);
+        ImGui::PopID();
+        if (clicked) { st.settings.planMode = r.plan; saveSettings(st.settings); }
+    }
 }
 
 // Launch the active turn for `text` according to the current mode (Design/Edit/Ask). Pushes
@@ -1268,6 +1710,13 @@ static void submitTurn(AppState& st, const std::string& text) {
         // inline clarify card with the build-critical questions. Any failure falls straight
         // through to the build — clarify never blocks. See launchDesignRun / drawClarifyCard.
         st.designStarted = true;
+        // Autopilot (planMode off) skips the clarify gate and builds straight away.
+        if (!st.settings.planMode) {
+            for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+                if (!it->fromUser && it->running) { it->liveStatus = "Building..."; break; }
+            launchDesignRun(st, text);
+            return;
+        }
         for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
             if (!it->fromUser && it->running) {
                 it->clarify.awaiting = true;
@@ -1338,53 +1787,6 @@ static void submitTurn(AppState& st, const std::string& text) {
     }
 }
 
-static void copyToBuffer(std::vector<char>& buf, const char* text) {
-    if (buf.empty()) return;
-    std::memset(buf.data(), 0, buf.size());
-    if (text) std::strncpy(buf.data(), text, buf.size() - 1);
-}
-
-// Ask-mode helpers shown under the prompt: example questions + a chip to ask about the
-// currently selected feature. They seed the shared prompt buffer (st.prompt), so the unified
-// input + Send path handles them — no separate Help tab needed. (Folded in from the removed
-// Help tab, which duplicated Ask mode: both just call agent_ask_v2.)
-static void drawAskHelpers(AppState& st) {
-    const float sc = ui::uiScale;
-    const ImGuiStyle& style = ImGui::GetStyle();
-    static const char* examples[] = {
-        "What features are in this part?",
-        "Why is my sketch under defined?",
-        "How do I change this without breaking downstream features?",
-    };
-    float avail = ImGui::GetContentRegionAvail().x;
-    float rowW = 0.0f;
-    for (int i = 0; i < 3; ++i) {
-        float w = ImGui::CalcTextSize(examples[i]).x + style.FramePadding.x * 2.0f;
-        if (i > 0) {
-            if (rowW + style.ItemSpacing.x + w <= avail) {
-                ImGui::SameLine();
-                rowW += style.ItemSpacing.x;
-            } else {
-                rowW = 0.0f;
-            }
-        }
-        rowW += w;
-        if (ImGui::SmallButton(examples[i])) copyToBuffer(st.prompt, examples[i]);
-    }
-    if (!st.selectedFeatureId.empty()) {
-        ImGui::Dummy(ImVec2(0, 2 * sc));
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
-        ImGui::Text("Selected: %s", st.selectedFeatureId.c_str());
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Ask about selection")) {
-            std::string q = "Explain feature " + st.selectedFeatureId +
-                            " and suggest safe edits I can make to it.";
-            copyToBuffer(st.prompt, q.c_str());
-        }
-    }
-}
-
 // ---- runtime-not-ready banner (kept from the old Design body) ----
 static void drawRuntimeBanner(AppState& st) {
     if (st.workerStarted) return;
@@ -1395,7 +1797,7 @@ static void drawRuntimeBanner(AppState& st) {
     if (st.setupRunning.load()) {
         ImGui::TextColored(ImVec4(pal.statusWarn[0], pal.statusWarn[1], pal.statusWarn[2], 1),
                            "Setting up runtime...");
-        dimText("First run installs an isolated Python + build123d (~once).");
+        dimText("First run installs the local CAD engine runtime (~once).");
     } else {
         ImGui::TextColored(ImVec4(pal.statusWarn[0], pal.statusWarn[1], pal.statusWarn[2], 1),
                            "Runtime not ready");
@@ -1407,7 +1809,278 @@ static void drawRuntimeBanner(AppState& st) {
     ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
 }
 
-// ---- unified AI Copilot pane ----
+// Build a compact "Provider · model" label for the composer's model chip.
+static void composerModelLabel(const Settings& s, char* out, size_t n) {
+    const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini"};
+    const char* prov = provNames[(s.provider >= 0 && s.provider < ui::PROV_COUNT)
+                                     ? s.provider : ui::PROV_GEMINI];
+    std::snprintf(out, n, "%s \xc2\xb7 %s", prov, s.model[0] ? s.model : "default");
+}
+
+// ---- footer chips under the composer: provider · mode · autopilot (SolidWorks-clean pills) ----
+static void drawComposerChips(AppState& st, bool busy) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const bool hasDoc = st.docMirror.hasDoc();
+    ImGui::Dummy(ImVec2(0, 3 * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 3 * sc));
+    ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.button));
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+
+    // provider / connection chip — opens the model picker
+    const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini"};
+    int pv = (st.settings.provider >= 0 && st.settings.provider < ui::PROV_COUNT)
+                 ? st.settings.provider : ui::PROV_GEMINI;
+    bool isLocal = (pv == ui::PROV_LOCAL || pv == ui::PROV_LLAMACPP);
+    if (ImGui::SmallButton(isLocal ? "Local" : provNames[pv])) ImGui::OpenPopup("##chipmodel");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(isLocal ? "Running on a local model — click to search/switch models."
+                                  : "Cloud provider — click to search/switch models.");
+    ImGui::SetNextWindowSizeConstraints(ImVec2(300 * sc, 0), ImVec2(300 * sc, FLT_MAX));
+    if (ImGui::BeginPopup("##chipmodel")) { drawModelDropdown(st, busy); ImGui::EndPopup(); }
+
+    // mode chip — Design / Edit / Ask
+    ImGui::SameLine();
+    const char* modes[] = {"Design", "Edit", "Ask"};
+    int mode = (st.aiInteraction >= 0 && st.aiInteraction <= 2) ? st.aiInteraction : 0;
+    if (ImGui::SmallButton(modes[mode])) ImGui::OpenPopup("##chipmode");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("What the AI does with your message.");
+    if (ImGui::BeginPopup("##chipmode")) {
+        if (ImGui::Selectable("Design  — model a new part from a description", mode == 0))
+            st.aiInteraction = 0;
+        if (!hasDoc) ImGui::BeginDisabled();
+        if (ImGui::Selectable("Edit  — change the open part", mode == 1)) st.aiInteraction = 1;
+        if (!hasDoc) ImGui::EndDisabled();
+        if (!hasDoc) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDisabled));
+            ImGui::TextUnformatted("   (open a part to edit)");
+            ImGui::PopStyleColor();
+        }
+        if (ImGui::Selectable("Ask  — questions about the part, no changes", mode == 2))
+            st.aiInteraction = 2;
+        ImGui::EndPopup();
+    }
+
+    // run-mode chip — Supervised / Autopilot (our real plan/clarify behavior)
+    ImGui::SameLine();
+    if (ImGui::SmallButton(st.settings.planMode ? "Supervised" : "Autopilot"))
+        ImGui::OpenPopup("##runmode");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Whether the AI plans and asks before modeling.");
+    if (ImGui::BeginPopup("##runmode")) { drawRunModeMenu(st); ImGui::EndPopup(); }
+
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar();
+}
+
+// Is the assistant currently working a turn? Covers every run path: job-based design/edit, the
+// async ask/sim calls (which set the back message running without a job), and any streaming
+// message. Drives the composer's send<->stop swap and the message queue.
+static bool aiTurnActive(AppState& st) {
+    if (st.job.running.load() || st.agentV2Running) return true;
+    if (!st.chat.empty()) {
+        const ChatMsg& b = st.chat.back();
+        if (!b.fromUser && b.running) return true;
+    }
+    return false;
+}
+
+// Stop the in-flight run. The worker RPC can't be interrupted mid-flight (one blocking call per
+// WorkerClient, serialized), so this is a SOFT stop: finalize the active message as stopped and,
+// for a job-based run, flag the drain to discard the result when the background thread lands. The
+// model may finish its current step in the background; we just stop listening.
+static void requestStopRun(AppState& st) {
+    // Only a job-based run produces a result the drain must discard. Async ask/sim runs land via
+    // their own callbacks, which look for a *running* message — clearing it below makes them no-op.
+    if (st.job.running.load() || st.job.ready.load()) st.stopRequested = true;
+    st.agentV2Running = false;
+    st.livePhase.clear();
+    st.agentV2Status.clear();
+    for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+        if (!it->fromUser && it->running) {
+            it->running = false;
+            it->liveStatus.clear();
+            it->errKind = ERR_CAD;  // a user stop is not an app error
+            if (it->text.empty())
+                it->text = "Stopped. The model may finish its current step in the background.";
+            else
+                it->text += "\n\n(Stopped by you.)";
+            break;
+        }
+    st.status = st.job.running.load() ? "Stopping..." : "Stopped.";
+    st.statusKind = 1;
+    st.addLog("[..] stop requested by user");
+}
+
+// ---- the composer: a rounded input box + inline toolbar (+, model chip, settings, send) ----
+// Submits on Enter or the send button. Returns nothing; runs the turn directly.
+static void drawComposer(AppState& st, bool busy, bool canRun) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const bool hasDoc = st.docMirror.hasDoc();
+
+    // Keep the orchestrator flag synced to the mode (Edit == validated document ops on the doc).
+    if (st.aiInteraction == 1 && !hasDoc) st.aiInteraction = 0;
+    st.agentV2 = (st.aiInteraction == 1);
+
+    // Drain the message queue: once the assistant is free, auto-send the next queued message
+    // (Claude-Code-style). Done before computing `active` so the new turn shows as running now.
+    if (!aiTurnActive(st) && !st.queuedPrompts.empty() && canRun) {
+        std::string next = st.queuedPrompts.front();
+        st.queuedPrompts.erase(st.queuedPrompts.begin());
+        submitTurn(st, next);
+    }
+
+    const bool active = aiTurnActive(st);
+    bool canStart = canRun && st.prompt[0] && !active;  // start now only when idle
+    bool submit   = false;   // send / queue requested this frame
+    bool stopReq  = false;   // stop requested this frame
+
+    // ---- queued messages (shown above the composer, each removable) ----
+    if (!st.queuedPrompts.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        for (size_t qi = 0; qi < st.queuedPrompts.size(); ++qi) {
+            ImGui::PushID((int)qi + 9000);
+            float xBtn = ImGui::GetFrameHeight();
+            std::string& q = st.queuedPrompts[qi];
+            std::string label = "Queued: " + (q.size() > 48 ? q.substr(0, 47) + "\xE2\x80\xA6" : q);
+            ImGui::TextUnformatted(label.c_str());
+            ImGui::SameLine(ImGui::GetContentRegionMax().x - xBtn);
+            if (ImGui::SmallButton("x")) {
+                st.queuedPrompts.erase(st.queuedPrompts.begin() + qi);
+                ImGui::PopID();
+                break;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove from queue");
+            ImGui::PopID();
+        }
+        ImGui::PopStyleColor();
+    }
+
+    // ---- rounded composer box ----
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::Palette::toU32(pal.frameBg));
+    ImGui::PushStyleColor(ImGuiCol_Border, ui::Palette::toU32(pal.border));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui::metrics::rounding(10.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, ui::metrics::stroke(1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 8 * sc));
+    ImGui::BeginChild("##composer", ImVec2(0, 0),
+                      ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
+
+    // input (transparent frame so it blends into the rounded box)
+    const char* placeholder = st.aiInteraction == 2 ? "Ask about this part\xE2\x80\xA6"
+                            : st.aiInteraction == 1 ? "Describe a change to this part\xE2\x80\xA6"
+                                                    : "Describe what to build\xE2\x80\xA6";
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
+    bool submitInput = drawChatInput("##aiprompt", st.prompt, placeholder,
+                                     ui::metrics::copilotInputMaxLines());
+    ImGui::PopStyleColor();
+
+    // ---- inline toolbar row ----
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * sc, 3 * sc));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));   // ghost buttons
+
+    // + new chat
+    if (ImGui::SmallButton("+")) { newConversation(st); st.prompt[0] = 0; }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("New chat");
+
+    // model chip
+    ImGui::SameLine();
+    char modelLabel[160];
+    composerModelLabel(st.settings, modelLabel, sizeof(modelLabel));
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+    if (ImGui::SmallButton(modelLabel)) ImGui::OpenPopup("##modeldropdown");
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Model — click to search and switch.");
+
+    // right cluster: [settings] [send]
+    const float sendSz = ImGui::GetFrameHeight();
+    const float gearSz = ImGui::GetFrameHeight();
+    ImGui::SameLine();
+    float rightX = ImGui::GetContentRegionMax().x - sendSz - 6 * sc - gearSz;
+    if (rightX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rightX);
+
+    // settings (gear glyph from the icon atlas; text fallback)
+    IconUV gear = ui::getIcon("settings", 20);
+    bool openSettings = false;
+    if (gear.valid)
+        openSettings = ImGui::ImageButton("##aigear", gear.texId,
+                                          ImVec2(gearSz - 8 * sc, gearSz - 8 * sc),
+                                          gear.uv0, gear.uv1);
+    else
+        openSettings = ImGui::SmallButton("set");
+    if (openSettings) st.focusSettingsTab = true;   // bring the Settings dock tab forward
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI settings");
+
+    // right action: STOP while a turn is active (red square), else SEND (accent up-arrow).
+    // Arrow/square glyphs aren't in the body font, so both are drawn on the draw list.
+    ImGui::SameLine(0, 6 * sc);
+    if (active) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.statusErr));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(220, 100, 92, 255));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(190, 80, 74, 255));
+        if (ImGui::Button("##stop", ImVec2(sendSz, sendSz))) stopReq = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(st.stopRequested ? "Stopping\xE2\x80\xA6 (finishing current step)"
+                                               : "Stop the current run");
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+        ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
+        float h = sendSz * 0.18f;
+        dl->AddRectFilled(ImVec2(c.x - h, c.y - h), ImVec2(c.x + h, c.y + h),
+                          IM_COL32(255, 255, 255, 235), 1.5f * sc);
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            canStart ? ui::Palette::toU32(pal.accent) : ui::Palette::toU32(pal.button));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+            canStart ? ui::Palette::toU32(pal.accentDim) : ui::Palette::toU32(pal.buttonHovered));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ui::Palette::toU32(pal.accentDim));
+        if (ImGui::Button("##send", ImVec2(sendSz, sendSz)) && canStart) submit = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(canStart ? "Send  (Enter)"
+                              : !canRun ? "Runtime/worker not ready yet." : "Type a message first.");
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+        ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
+        float t = sendSz * 0.22f;
+        ImU32 ac = canStart ? IM_COL32(8, 26, 26, 255) : ui::Palette::toU32(pal.textDim);
+        dl->AddTriangleFilled(ImVec2(c.x, c.y - t), ImVec2(c.x - t, c.y + t * 0.55f),
+                              ImVec2(c.x + t, c.y + t * 0.55f), ac);
+        dl->AddRectFilled(ImVec2(c.x - t * 0.30f, c.y - t * 0.1f),
+                          ImVec2(c.x + t * 0.30f, c.y + t * 0.9f), ac);
+    }
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleColor();   // ghost button base
+    ImGui::PopStyleVar();     // toolbar frame padding
+
+    // model dropdown popup (search + checkmarked list + gear)
+    ImGui::SetNextWindowSizeConstraints(ImVec2(300 * sc, 0), ImVec2(300 * sc, FLT_MAX));
+    if (ImGui::BeginPopup("##modeldropdown")) { drawModelDropdown(st, busy); ImGui::EndPopup(); }
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar(3);   // child rounding / border / window padding
+    ImGui::PopStyleColor(2); // child bg / border
+
+    // ---- footer chips ----
+    drawComposerChips(st, busy);
+
+    // ---- stop / submit / queue ----
+    if (stopReq) requestStopRun(st);
+    if (submit || submitInput) {
+        if (active) {
+            // A turn is running — queue the message instead of starting concurrently. It auto-
+            // sends when the assistant frees up (drain at the top of drawComposer).
+            if (st.prompt[0]) {
+                st.queuedPrompts.emplace_back(st.prompt.data());
+                st.prompt[0] = 0;
+            }
+        } else if (canStart) {
+            submitTurn(st, std::string(st.prompt.data()));
+            st.prompt[0] = 0;
+        }
+    }
+}
+
+// ---- unified AI Copilot pane: header -> conversation -> bottom composer ----
 void drawAIPanel(AppState& st, bool busy, bool canRun) {
     if (!st.showAIPanel) return;
     if (!ImGui::Begin("AI")) { ImGui::End(); return; }
@@ -1415,79 +2088,30 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     const auto& pal = ui::palette;
     const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
 
+    // Remember which dock node we live in so the sibling "Settings" tab can dock next to us.
+    st.aiDockId = (unsigned int)ImGui::GetWindowDockID();
+
+    // Keep the conversation set bound to the active document (swaps history on doc change). Must
+    // run BEFORE the header/composer touch st.conversations, so the seeded/persisted chat is
+    // adopted rather than cleared.
+    syncChatToDoc(st);
+
     drawCopilotHeader(st, busy);
     ImGui::Separator();
     drawRuntimeBanner(st);
 
-    // Keep the conversation set bound to the active document (swaps history on doc change).
-    syncChatToDoc(st);
-
-    if (ImGui::BeginTabBar("##ai_tabs")) {
-    ImGuiTabItemFlags designFlags = st.focusDesignTab ? ImGuiTabItemFlags_SetSelected
-                                                       : ImGuiTabItemFlags_None;
-    if (ImGui::BeginTabItem("Design", nullptr, designFlags)) {
-
-    // ---- INPUT AT TOP — auto-growing + wrapping; Enter sends, Shift+Enter = new line ----
-    const char* placeholder = st.aiInteraction == 2
-        ? "Ask about this part\xE2\x80\xA6  (Enter to send)"
-        : "Describe a part or a change\xE2\x80\xA6  (Enter to send)";
-    bool submitInput = drawChatInput("##aiprompt", st.prompt, placeholder,
-                                     ui::metrics::copilotInputMaxLines());
-    // mode pills + model label (wrapping row)
-    drawModeRow(st);
-    // Ask-mode helpers (example questions + ask-about-selection) seed the same prompt buffer.
-    if (st.aiInteraction == 2) drawAskHelpers(st);
-    // send button
-    bool canStart = canRun && st.prompt[0];
-    if (!canStart) ImGui::BeginDisabled();
-    const char* sendLabel = st.aiInteraction == 0 ? "Design with AI"
-                          : st.aiInteraction == 1 ? "Edit with AI" : "Send";
-    bool goSend = primaryButton(sendLabel, ImVec2(-1, ui::metrics::copilotBtnH()));
-    if (!canStart) ImGui::EndDisabled();
-    if ((goSend || submitInput) && canStart) {
-        submitTurn(st, std::string(st.prompt.data()));
-        st.prompt[0] = 0;
-    }
-    if (ImGui::IsItemHovered() && !canStart && !canRun)
-        ImGui::SetTooltip("Runtime/worker not ready yet.");
-
-    ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
-    ImGui::Separator();
-
-    // ---- conversation tabs (one tab per chat, like Copilot/Cursor) ----
-    drawConversationTabs(st, busy);
-
-    // ---- CONVERSATION — newest at bottom, auto-scroll. Empty-state suggestion chips. ----
-    // "Empty" = no user turn yet (the startup welcome assistant message may be present).
-    bool conversationEmpty = true;
-    for (const ChatMsg& m : st.chat) if (m.fromUser) { conversationEmpty = false; break; }
-    if (conversationEmpty && st.aiInteraction != 2) {   // Ask mode has its own helper chips
-        ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
-        dimText("Try:");
-        static const char* kExamples[] = {
-            "GoPro tripod adapter",
-            "Raspberry Pi 5 vented case",
-            "an M3 hex standoff, 25mm tall",
-        };
-        for (int ei = 0; ei < 3; ++ei) {
-            ImGui::PushID(ei);
-            if (ImGui::Button(kExamples[ei], ImVec2(-1, 0)))
-                std::strncpy(st.prompt.data(), kExamples[ei], st.prompt.size() - 1);
-            ImGui::PopID();
-        }
-    }
-
-    // conversation log fills the remaining height above the collapsing footers.
-    // C40: reserve space for OPEN footers too (one-frame-lagged open state) — before, an
-    // opened Console/code section landed entirely below the window with no scroll path.
-    static bool s_codeOpen = false, s_consoleOpen = false;
-    float footerReserve = ImGui::GetFrameHeightWithSpacing() * 2.0f + ui::metrics::U(2);
-    if (s_codeOpen)    footerReserve += ui::metrics::copilotCodeH() + ui::metrics::px(30.0f) + ui::metrics::U(6);
-    if (s_consoleOpen) footerReserve += ui::metrics::copilotConsoleH() + ui::metrics::U(3);
-    float chatH = ImGui::GetContentRegionAvail().y - footerReserve;
+    // Reserve the composer's height (measured last frame) so the conversation log fills the rest.
+    static float s_composerH = 0.0f;
+    float reserve = (s_composerH > 0 ? s_composerH
+                                     : ImGui::GetFrameHeightWithSpacing() * 4.0f) + ui::metrics::U(2);
+    float chatH = ImGui::GetContentRegionAvail().y - reserve;
     if (chatH < ui::metrics::px(120.0f)) chatH = ui::metrics::px(120.0f);
-    ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_Border);
+
+    // ---- conversation log (transparent — the cards carry their own backgrounds) ----
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+    ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_None);
     const float logW = ImGui::GetContentRegionAvail().x;
+
     for (size_t mi = 0; mi < st.chat.size(); ++mi) {
         ChatMsg& m = st.chat[mi];
         ImGui::PushID((int)mi);
@@ -1517,75 +2141,14 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     }
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 6) ImGui::SetScrollHereY(1.0f);
     ImGui::EndChild();
+    ImGui::PopStyleColor();
 
-    // ---- footer: New chat + collapsing Code / Console (kept reachable) ----
-    if (busy) ImGui::BeginDisabled();
-    if (ImGui::SmallButton("+ New chat")) {
-        // Start a fresh conversation tab (the previous one is preserved, not wiped).
-        newConversation(st);
-        st.designStarted = false;
-        st.modelInfo.clear();
-        st.livePhase.clear();
-        st.prompt[0] = 0;
-        st.status = st.workerStarted ? "Ready." : st.status;
-        st.statusKind = 0;
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Start a new conversation. Past conversations stay as tabs above and "
-                          "are saved per document.");
-    if (busy) ImGui::EndDisabled();
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Activity panel")) st.showActivityPanel = true;
-
-    // build123d code editor — folded away by default (was always-visible before).
-    s_codeOpen = ImGui::CollapsingHeader("build123d code");
-    if (s_codeOpen) {
-        ImGui::PushFont(fonts.mono);
-        ImGui::InputTextMultiline("##code", st.code.data(), st.code.size(),
-                                  ImVec2(-1, ui::metrics::copilotCodeH()));
-        ImGui::PopFont();
-        if (!canRun) ImGui::BeginDisabled();
-        if (ImGui::Button("Build code", ImVec2(-1, ui::metrics::px(30.0f)))) {
-            st.addLog("[..] building code");
-            st.status = "Building...";  st.statusKind = 0;
-            st.buildErrSummary.clear();
-            st.buildErrFull.clear();
-            launchJob(st.worker, st.job, JOB_BUILD, std::string(st.code.data()), false, false);
-        }
-        if (!canRun) ImGui::EndDisabled();
-        if (!st.buildErrSummary.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(pal.statusWarn[0], pal.statusWarn[1], pal.statusWarn[2], 1));
-            ImGui::TextWrapped("Build issue - %s", st.buildErrSummary.c_str());
-            ImGui::PopStyleColor();
-            if (toggleChip(st.showBuildErr ? "Hide details" : "Details", st.showBuildErr))
-                st.showBuildErr = !st.showBuildErr;
-            if (st.showBuildErr && !st.buildErrFull.empty())
-                drawCodeBox("##builderr", st.buildErrFull, fonts.mono, ui::metrics::px(180.0f));
-        }
-    }
-    s_consoleOpen = ImGui::CollapsingHeader("Console");
-    if (s_consoleOpen) {
-        ImGui::BeginChild("##consolebody", ImVec2(0, ui::metrics::copilotConsoleH()),
-                          ImGuiChildFlags_Border);
-        drawConsoleBody(st);
-        ImGui::EndChild();
-    }
-
-    ImGui::EndTabItem();
-    }
-    // (The old "Help" tab was removed — it duplicated Ask mode; Ask now lives in the unified
-    //  conversation with its own helper chips. See drawAskHelpers.)
-    ImGuiTabItemFlags settingsFlags = st.focusSettingsTab ? ImGuiTabItemFlags_SetSelected
-                                                           : ImGuiTabItemFlags_None;
-    if (ImGui::BeginTabItem("Settings", nullptr, settingsFlags)) {
-        drawInlineSettingsTab(st, busy);
-        ImGui::EndTabItem();
-    }
-    st.focusDesignTab = false;
-    st.focusSettingsTab = false;
-    ImGui::EndTabBar();
-    }
+    // ---- composer (measure its height for next frame's reserve) ----
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
+    ImGui::BeginGroup();
+    drawComposer(st, busy, canRun);
+    ImGui::EndGroup();
+    s_composerH = ImGui::GetItemRectSize().y + ui::metrics::U(1);
 
     ImGui::End();
 }

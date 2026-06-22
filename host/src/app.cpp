@@ -1269,7 +1269,7 @@ int run_gui(const char* screenshotPath) {
     std::strncpy(st.prompt.data(), "a knurled hex standoff, 22mm tall, M3 clearance bore", st.prompt.size() - 1);
     {
         ChatMsg w;
-        w.text = "Hi! Describe a part and I'll model it in build123d, render it, and check the "
+        w.text = "Hi! Describe a part and I'll model it, show my work as I go, and check the "
                  "result - then keep refining it with you. Set your AI provider in Settings first.";
         st.chat.push_back(w);
     }
@@ -1471,6 +1471,25 @@ int run_gui(const char* screenshotPath) {
         ChatMsg a;
         a.text = "Raised the standoff to 30mm and chamfered the top rim. Ask for another tweak "
                  "and I'll revise this same part.";
+        // Transparent activity timeline — what the AI did, expandable. Mirrors the live
+        // orchestrator stages so the screenshot exercises the new inline activity surface.
+        {
+            ActivityItem i0; i0.stage = "intake"; i0.title = "Understanding the request";
+            i0.status = "pass"; i0.reason = "Edit the open hex standoff: 30mm tall + chamfered top.";
+            i0.detail = "User wants the existing part taller with a chamfered top rim; this is an "
+                        "edit to the open document, not a new part.";
+            i0.durationMs = 900; a.activity.push_back(i0);
+            ActivityItem i1; i1.stage = "plan"; i1.title = "Planning the build";
+            i1.status = "pass"; i1.reason = "Change total_h 22->30, add 1mm chamfer on top edges.";
+            i1.durationMs = 1400; a.activity.push_back(i1);
+            ActivityItem i2; i2.stage = "edit"; i2.title = "Editing the model";
+            i2.status = "pass"; i2.opsCount = 3; i2.durationMs = 2600;
+            i2.detail = "Set height=30; selected top perimeter edges; applied chamfer length=1.0.";
+            a.activity.push_back(i2);
+            ActivityItem i3; i3.stage = "review"; i3.title = "Reviewing the result";
+            i3.status = "pass"; i3.reason = "Rebuilds clean; height and chamfer match.";
+            i3.durationMs = 1100; a.activity.push_back(i3);
+        }
         // The plan-mode card the agent drafts before writing code.
         a.plan.present = true;
         a.plan.name = "hex standoff";
@@ -1609,6 +1628,9 @@ int run_gui(const char* screenshotPath) {
                 std::lock_guard<std::mutex> lk(st.job.evMtx);
                 if (!st.job.events.empty()) evs.swap(st.job.events);
             }
+            // The user stopped this run — drop its streamed events so the (finalized) chat message
+            // and status line don't flicker with live progress while the worker winds down.
+            if (st.stopRequested) evs.clear();
             if (!evs.empty()) {
                 ChatMsg* active = nullptr;
                 for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
@@ -1623,6 +1645,9 @@ int run_gui(const char* screenshotPath) {
                                 auto* ap = st.activityPanel;
                                 ap->onEvent(orchKind, data);
                             }
+                            // Fold the event into the running turn's inline activity timeline so
+                            // the conversation transparently shows what the AI is doing/thinking.
+                            if (active) feedTurnActivity(*active, orchKind, data);
                         } catch (...) {}
                         // Also update the compact status line in the chat
                         if (!e.notes.empty()) {
@@ -1675,6 +1700,15 @@ int run_gui(const char* screenshotPath) {
             std::lock_guard<std::mutex> lk(st.job.mtx);
             st.livePhase.clear();
             st.agentV2Status.clear();
+          if (st.stopRequested) {
+            // The user stopped this run. The worker finished in the background, but discard the
+            // result: leave the chat message as the Stop handler finalized it, and skip the doc
+            // rebuild/resync and any new-tab adoption.
+            st.stopRequested = false;
+            st.agentV2Running = false;
+            st.status = "Stopped.";  st.statusKind = 1;
+            st.addLog("[..] run result discarded (stopped by user)");
+          } else {
             // --- C22b: if this was a v2 run, resync the DocMirror tree + reload mesh ---
             // The worker already rebuilt the doc; call doc_rebuild to refresh the tree and
             // get the latest aicm_path, then load it into the viewport.
@@ -1875,6 +1909,7 @@ int run_gui(const char* screenshotPath) {
                     st.chat.push_back(m);
                 }
             }
+          }  // end else (run not stopped by the user)
         }
 
         // C16 tree shot: run the doc smoke once the worker is ready (fires the first time
@@ -2490,6 +2525,8 @@ int run_gui(const char* screenshotPath) {
         // W3-H: unified AI Copilot pane (input-at-top + conversation; embeds the run tree
         // inline while a v2 run is active). st.activityPanel is still fed events via onEvent.
         ui::drawAIPanel(st, busy, canRun);
+        // Sibling "Settings" dock tab next to the AI pane.
+        ui::drawAISettingsTab(st, busy);
         // W3-H: standalone "Agent Activity" window (View > Activity / the pane's Activity
         // button / the activity shot). No-op unless st.showActivityPanel; was previously
         // unreachable because only the in-pane tab hosted drawBody.

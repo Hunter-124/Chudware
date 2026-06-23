@@ -161,6 +161,41 @@ TEST_CASE("apply_experimental: offline refuses a cloud review endpoint, falls ba
     CHECK_FALSE(out.contains("review_provider"));  // skipped -> review uses the safe main provider
 }
 
+TEST_CASE("cloud OpenAI-compatible (DashScope/DeepSeek): offline ITAR refuses, online resolves") {
+    // The cloud Qwen/DeepSeek slot serializes as provider "openai" + a non-loopback base_url.
+    auto cfg = [](bool offline) {
+        return json{{"provider", "openai"},
+                    {"model", "qwen-vl-max"},
+                    {"api_key", "sk-test"},
+                    {"offline_mode", offline},
+                    {"openai",
+                     {{"base_url", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
+                      {"vision", true}}}};
+    };
+    // Offline (ITAR) mode => refused before any network use.
+    json off = resolve_provider(std::string("openai"), cfg(true), json::object());
+    REQUIRE(off.is_object());
+    CHECK(off.contains("error"));
+    // Online => resolves to a cloud (NOT offline-safe) descriptor with vision on.
+    json on = resolve_provider(std::string("openai"), cfg(false), json::object());
+    REQUIRE(on.is_object());
+    CHECK_FALSE(on.contains("error"));
+    CHECK(on.value("model", std::string()) == "qwen-vl-max");
+    CHECK(on.value("supports_vision", false) == true);
+    CHECK(on.value("offline_safe", true) == false);  // cloud host => never offline-safe
+
+    // A LOCAL open-weight endpoint stays allowed under the SAME offline flag (the user's policy:
+    // local fine under ITAR, only the cloud Alibaba/DeepSeek APIs are blocked).
+    json local = resolve_provider(
+        std::string("openai"),
+        json{{"provider", "openai"}, {"model", "qwen2.5-vl-7b-instruct"}, {"offline_mode", true},
+             {"openai", {{"base_url", "http://localhost:1234/v1"}, {"vision", true}}}},
+        json::object());
+    REQUIRE(local.is_object());
+    CHECK_FALSE(local.contains("error"));
+    CHECK(local.value("offline_safe", false) == true);
+}
+
 TEST_CASE("apply_experimental: cad_sequence_mode flag flows through") {
     json cfg = json{{"experimental", {{"cad_sequence_mode", true}}}};
     json out = apply_experimental(json{{"name", "openai"}}, cfg, json::object());

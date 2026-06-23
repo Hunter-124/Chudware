@@ -82,7 +82,10 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
         }
     }
     const char* provName = st.settings.provider == 0 ? "Anthropic"
-                         : st.settings.provider == 1 ? "OpenAI" : "Local";
+                         : st.settings.provider == 1 ? "OpenAI"
+                         : st.settings.provider == 3 ? "llama.cpp"
+                         : st.settings.provider == 4 ? "Gemini"
+                         : st.settings.provider == 5 ? "Cloud API" : "Local";
     std::string ptxt = std::string(provName) + "  /  " +
                        (st.settings.model[0] ? st.settings.model : "default") +
                        (st.settings.planMode ? "   [plan mode]" : "");

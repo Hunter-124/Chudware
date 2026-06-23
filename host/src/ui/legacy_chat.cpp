@@ -1149,6 +1149,7 @@ static char* providerKeyBuf(Settings& s, int provider) {
         case ui::PROV_GEMINI: return s.geminiKey;
         case ui::PROV_ANTHROPIC: return s.anthropicKey;
         case ui::PROV_OPENAI: return s.openaiKey;
+        case ui::PROV_CLOUDCOMPAT: return s.cloudKey;  // DashScope / DeepSeek / OpenAI-compatible
         default: return s.apiKey;  // local OpenAI-compatible optional key
     }
 }
@@ -1195,6 +1196,14 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
                 std::strncpy(s.model, "%APPDATA%\\AI-CAD\\models\\model.gguf",
                              sizeof(s.model) - 1);
             s.vision = false;
+        } else if (s.provider == ui::PROV_CLOUDCOMPAT) {
+            // Default to Alibaba DashScope Qwen-Max; the preset dropdown can switch service+model.
+            const auto& cp = ui::cloudPresets();
+            if (!cp.empty()) {
+                std::strncpy(s.model, cp[0].id.c_str(), sizeof(s.model) - 1);
+                std::strncpy(s.baseUrl, cp[0].baseUrl.c_str(), sizeof(s.baseUrl) - 1);
+                s.vision = cp[0].vision;
+            }
         }
     }
 
@@ -1202,7 +1211,33 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
     const bool cloud = ui::providerIsCloud(s.provider);
 
     // ---- model ----
-    if (cloud) {
+    if (s.provider == ui::PROV_CLOUDCOMPAT) {
+        // Cloud OpenAI-compatible API: a preset bundles the service base URL + model id, plus a
+        // free-text model field. Credentials (base URL + key) are edited in the section below.
+        ImGui::TextUnformatted("Service / model preset");
+        dimText("Alibaba Cloud (DashScope) Qwen and the official DeepSeek API. These are CLOUD "
+                "providers — Offline (ITAR) mode refuses them; use the local presets for ITAR.");
+        const auto& cps = ui::cloudPresets();
+        std::vector<const char*> plabels;
+        plabels.push_back("(choose a preset…)");
+        for (const auto& p : cps) plabels.push_back(p.label.c_str());
+        int psel = 0;
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##cloudpreset", &psel, plabels.data(), (int)plabels.size()) &&
+            psel > 0 && psel - 1 < (int)cps.size()) {
+            const auto& p = cps[psel - 1];
+            std::strncpy(s.model, p.id.c_str(), sizeof(s.model) - 1);
+            std::strncpy(s.baseUrl, p.baseUrl.c_str(), sizeof(s.baseUrl) - 1);
+            s.vision = p.vision;
+            changed = true;
+        }
+        if (psel > 0 && psel - 1 < (int)cps.size() && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", cps[psel - 1].note.c_str());
+        ImGui::Dummy(ImVec2(0, 4 * S));
+        ImGui::TextUnformatted("Model id");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##cloudmodel", s.model, sizeof(s.model))) changed = true;
+    } else if (cloud) {
         // Known-good model list for this provider, plus the current value if it's custom.
         std::vector<const char*> ids, labels;
         for (const auto& m : ui::builtinModels())
@@ -1340,7 +1375,23 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
 
     // ---- credentials / connection ----
     ImGui::Dummy(ImVec2(0, 6 * S));
-    if (cloud) {
+    if (s.provider == ui::PROV_CLOUDCOMPAT) {
+        // Cloud OpenAI-compatible: needs BOTH an endpoint (set by the preset, editable) and a key.
+        ImGui::TextUnformatted("Endpoint (base URL)");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##cloudbase", s.baseUrl, sizeof(s.baseUrl))) changed = true;
+        ImGui::TextUnformatted("API key");
+        char* key = providerKeyBuf(s, s.provider);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##provkey", key, 256, ImGuiInputTextFlags_Password)) changed = true;
+        if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
+        bool haveKey = key[0] != '\0';
+        ImGui::PushStyleColor(ImGuiCol_Text, haveKey ? IM_COL32(120, 200, 120, 255)
+                                                     : IM_COL32(220, 170, 90, 255));
+        ImGui::TextUnformatted(haveKey ? "key set — cloud API available (blocked in Offline mode)"
+                                       : "no API key — add your DashScope / DeepSeek key");
+        ImGui::PopStyleColor();
+    } else if (cloud) {
         ImGui::TextUnformatted("API key");
         char* key = providerKeyBuf(s, s.provider);
         ImGui::SetNextItemWidth(-1);
@@ -1554,11 +1605,12 @@ static bool modelHidden(AppState& st, const std::string& id) {
 // Does this provider have credentials / a reachable endpoint, so its models can be selected?
 static bool providerUsable(AppState& st, int provider) {
     switch (provider) {
-        case ui::PROV_GEMINI:    return st.settings.geminiKey[0] != 0;
-        case ui::PROV_ANTHROPIC: return st.settings.anthropicKey[0] != 0;
-        case ui::PROV_OPENAI:    return st.settings.openaiKey[0] != 0;
-        case ui::PROV_LOCAL:     return st.providerModels[ui::PROV_LOCAL].ok;
-        case ui::PROV_LLAMACPP:  return st.providerModels[ui::PROV_LLAMACPP].ok;
+        case ui::PROV_GEMINI:      return st.settings.geminiKey[0] != 0;
+        case ui::PROV_ANTHROPIC:   return st.settings.anthropicKey[0] != 0;
+        case ui::PROV_OPENAI:      return st.settings.openaiKey[0] != 0;
+        case ui::PROV_CLOUDCOMPAT: return st.settings.cloudKey[0] != 0;
+        case ui::PROV_LOCAL:       return st.providerModels[ui::PROV_LOCAL].ok;
+        case ui::PROV_LLAMACPP:    return st.providerModels[ui::PROV_LLAMACPP].ok;
     }
     return false;
 }
@@ -1987,7 +2039,7 @@ static void drawRuntimeBanner(AppState& st) {
 
 // Build a compact "Provider · model" label for the composer's model chip.
 static void composerModelLabel(const Settings& s, char* out, size_t n) {
-    const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini"};
+    const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini", "Cloud API"};
     const char* prov = provNames[(s.provider >= 0 && s.provider < ui::PROV_COUNT)
                                      ? s.provider : ui::PROV_GEMINI];
     std::snprintf(out, n, "%s \xc2\xb7 %s", prov, s.model[0] ? s.model : "default");
@@ -2004,7 +2056,7 @@ static void drawComposerChips(AppState& st, bool busy) {
     ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
 
     // provider / connection chip — opens the model picker
-    const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini"};
+    const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini", "Cloud API"};
     int pv = (st.settings.provider >= 0 && st.settings.provider < ui::PROV_COUNT)
                  ? st.settings.provider : ui::PROV_GEMINI;
     bool isLocal = (pv == ui::PROV_LOCAL || pv == ui::PROV_LLAMACPP);

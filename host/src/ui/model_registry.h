@@ -20,7 +20,10 @@ enum ProviderIndex {
     PROV_LOCAL = 2,       // Local OpenAI-compatible endpoint (LM Studio etc.)
     PROV_LLAMACPP = 3,    // Managed llama.cpp
     PROV_GEMINI = 4,      // Google Gemini (generativelanguage)
-    PROV_COUNT = 5,
+    PROV_CLOUDCOMPAT = 5, // Cloud OpenAI-compatible API w/ custom base_url (Alibaba DashScope /
+                          // DeepSeek API / etc.). Resolves as provider "openai" + a cloud base_url,
+                          // so the offline (ITAR) guard REFUSES it while local stays allowed.
+    PROV_COUNT = 6,
 };
 
 struct ModelInfo {
@@ -40,6 +43,7 @@ inline const char* providerConfigName(int provider) {
         case PROV_LOCAL: return "openai";
         case PROV_LLAMACPP: return "llamacpp";
         case PROV_GEMINI: return "gemini";
+        case PROV_CLOUDCOMPAT: return "openai";  // cloud OpenAI-compatible via base_url
         default: return "openai";
     }
 }
@@ -51,13 +55,19 @@ inline const char* providerLabel(int provider) {
         case PROV_LOCAL: return "Local (OpenAI-compatible)";
         case PROV_LLAMACPP: return "llama.cpp (managed local)";
         case PROV_GEMINI: return "Google Gemini";
+        case PROV_CLOUDCOMPAT: return "Cloud API (Qwen / DeepSeek / OpenAI-compatible)";
         default: return "?";
     }
 }
 
 inline bool providerIsCloud(int provider) {
-    return provider == PROV_ANTHROPIC || provider == PROV_OPENAI || provider == PROV_GEMINI;
+    return provider == PROV_ANTHROPIC || provider == PROV_OPENAI || provider == PROV_GEMINI ||
+           provider == PROV_CLOUDCOMPAT;
 }
+
+// True for the cloud OpenAI-compatible API slot — the one cloud provider that also needs a
+// user-editable base URL (Alibaba DashScope, DeepSeek, etc.). Refused under offline (ITAR) mode.
+inline bool providerIsCloudCompat(int provider) { return provider == PROV_CLOUDCOMPAT; }
 
 // The built-in catalog of KNOWN cloud models. Local/llama.cpp models are discovered live
 // (a local endpoint can serve any GGUF), so they are NOT listed here — the probe fills them.
@@ -91,27 +101,53 @@ struct LocalPreset {
 
 inline const std::vector<LocalPreset>& localPresets() {
     static const std::vector<LocalPreset> kPresets = {
-        // Code / tool-calling backbones for structured CAD-op emission (Apache-2.0 sizes).
+        // Code / tool-calling backbones for structured CAD-op emission.
         {"qwen2.5-coder-7b-instruct", "Qwen2.5-Coder 7B (ops/code)", false,
-         "Apache-2.0 code model; reliable JSON + tool-calling for emitting CAD ops.",
+         "Code model; reliable JSON + tool-calling for emitting CAD ops.",
          "http://localhost:1234/v1"},
         {"qwen2.5-coder-32b-instruct", "Qwen2.5-Coder 32B (ops/code)", false,
-         "Larger Apache-2.0 coder; best structured-op quality if your GPU fits it.",
+         "Larger coder; best structured-op quality if your GPU fits it.",
          "http://localhost:1234/v1"},
         {"qwen2.5-14b-instruct", "Qwen2.5 14B (general)", false,
-         "Apache-2.0 general model; solid planner/intake without a vision head.",
+         "General model; solid planner/intake without a vision head.",
          "http://localhost:1234/v1"},
         // Vision judges for the review/fix loop (beat Gemini 1.5 Pro on grounding in the research).
         {"qwen2.5-vl-7b-instruct", "Qwen2.5-VL 7B (vision review)", true,
-         "Apache-2.0 vision model; strong grounding on rendered viewport PNGs.",
+         "Vision model; strong grounding on rendered viewport PNGs.",
          "http://localhost:1234/v1"},
         {"qwen2.5-vl-3b-instruct", "Qwen2.5-VL 3B (vision, light)", true,
-         "Smaller vision judge for modest GPUs (Qwen-Research license — verify before commercial use).",
+         "Smaller vision judge for modest GPUs.",
          "http://localhost:1234/v1"},
         // Reasoning model behind the Seek-CAD-style local self-refinement loop.
         {"deepseek-r1-distill-qwen-32b", "DeepSeek-R1 Distill 32B (reasoning)", false,
          "Reasoning model; the Seek-CAD local design loop runs a Q4 of this on a single 24GB GPU.",
          "http://localhost:1234/v1"},
+    };
+    return kPresets;
+}
+
+// Cloud OpenAI-compatible API presets (PROV_CLOUDCOMPAT). Each bundles the service base URL with a
+// model id, so picking one fills both. These are NETWORK providers: they are REFUSED when Offline
+// (ITAR) mode is on — only the local open-weight presets above run under ITAR. DashScope = Alibaba
+// Cloud's Qwen API; api.deepseek.com = the official DeepSeek API.
+inline const std::vector<LocalPreset>& cloudPresets() {
+    static const std::string kDashScope = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
+    static const std::string kDeepSeek = "https://api.deepseek.com/v1";
+    static const std::vector<LocalPreset> kPresets = {
+        // Alibaba Cloud (DashScope) — Qwen flagship + vision + coder.
+        {"qwen-max", "Alibaba Qwen-Max (flagship)", false,
+         "Alibaba Cloud DashScope. Strong general model; needs a DashScope API key.", kDashScope},
+        {"qwen-plus", "Alibaba Qwen-Plus (balanced)", false,
+         "Alibaba Cloud DashScope. Cheaper/faster than Max.", kDashScope},
+        {"qwen-vl-max", "Alibaba Qwen-VL-Max (vision)", true,
+         "Alibaba Cloud DashScope vision model — great as the review judge.", kDashScope},
+        {"qwen-coder-plus", "Alibaba Qwen-Coder-Plus (ops/code)", false,
+         "Alibaba Cloud DashScope code model for structured op emission.", kDashScope},
+        // DeepSeek official API.
+        {"deepseek-chat", "DeepSeek V3 (chat)", false,
+         "Official DeepSeek API. Strong general/coding model.", kDeepSeek},
+        {"deepseek-reasoner", "DeepSeek R1 (reasoner)", false,
+         "Official DeepSeek API reasoning model (R1).", kDeepSeek},
     };
     return kPresets;
 }

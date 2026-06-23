@@ -21,19 +21,30 @@ protocol.
 
 **Where:** Settings → AI → Provider = *Local (OpenAI-compatible)* → **Quick preset**.
 
-| Preset | Role | License | Notes |
-|---|---|---|---|
-| Qwen2.5-Coder 7B / 32B | main agent (op/code emission) | Apache-2.0 | Reliable JSON + tool-calling for CAD ops |
-| Qwen2.5 14B | planner / intake | Apache-2.0 | General reasoning, no vision head |
-| Qwen2.5-VL 7B | vision review judge | Apache-2.0 | Beat Gemini 1.5 Pro on grounding in the research |
-| Qwen2.5-VL 3B | vision (light) | Qwen-Research | Smaller GPUs; verify license before commercial use |
-| DeepSeek-R1 Distill 32B | reasoning loop | MIT-ish | Q4 fits a single 24 GB GPU |
+| Preset | Role | Notes |
+|---|---|---|
+| Qwen2.5-Coder 7B / 32B | main agent (op/code emission) | Reliable JSON + tool-calling for CAD ops |
+| Qwen2.5 14B | planner / intake | General reasoning, no vision head |
+| Qwen2.5-VL 7B | vision review judge | Beat Gemini 1.5 Pro on grounding in the research |
+| Qwen2.5-VL 3B | vision (light) | Smaller GPUs |
+| DeepSeek-R1 Distill 32B | reasoning loop | Q4 fits a single 24 GB GPU |
 
 A preset fills the model id, vision flag, and a default base URL. **You still need the weights loaded
-in your local server.**
+in your local server.** These run fully local, so they are allowed under **Offline (ITAR) mode**.
 
-> ⚠️ **Licensing is not uniform.** Qwen2.5 0.5B/1.5B/7B/14B/32B are Apache-2.0; the **3B and 72B are
-> proprietary** Qwen licenses. Verify the actual `LICENSE` of any checkpoint before commercial use.
+### Cloud APIs (Qwen / DeepSeek) — non-ITAR
+
+For when ITAR mode is **off**, there's also a **Cloud API (Qwen / DeepSeek / OpenAI-compatible)**
+provider (Settings → AI → Provider). It resolves as an `openai` provider with a cloud `base_url`, so:
+
+- **Alibaba Cloud (DashScope)** — `qwen-max`, `qwen-plus`, `qwen-vl-max`, `qwen-coder-plus`
+- **DeepSeek API** — `deepseek-chat`, `deepseek-reasoner`
+
+Pick a preset (it fills the service endpoint + model), paste your API key, and go. **These are network
+providers and are automatically refused when Offline (ITAR) mode is on** — the offline guard in
+`resolve_provider` rejects any non-loopback endpoint before a single byte leaves the machine, while the
+local presets above keep working. That's the whole policy: local open-weight = ITAR-OK, Alibaba/DeepSeek
+*cloud* = ITAR-blocked.
 
 ---
 

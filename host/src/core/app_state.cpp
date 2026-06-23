@@ -69,10 +69,21 @@ void loadSettings(Settings& s) {
         auto llama = j.value("llamacpp", nlohmann::json::object());
         std::string base = oai.value("base_url", "");
         bool hasBase = !base.empty();
+        // A base_url whose host is loopback => a LOCAL endpoint; any other host => a cloud
+        // OpenAI-compatible API (DashScope / DeepSeek / ...). This split is what lets the offline
+        // (ITAR) guard refuse the cloud slot while keeping local allowed.
+        auto isLoopbackUrl = [](const std::string& u) {
+            return u.find("localhost") != std::string::npos ||
+                   u.find("127.0.0.1") != std::string::npos ||
+                   u.find("0.0.0.0") != std::string::npos ||
+                   u.find("[::1]") != std::string::npos || u.find("://::1") != std::string::npos;
+        };
+        bool baseLoopback = hasBase && isLoopbackUrl(base);
         if (prov == "gemini") s.provider = 4;
         else if (prov == "anthropic") s.provider = 0;
         else if (prov == "llamacpp" || prov == "llama.cpp" || prov == "llama-cpp") s.provider = 3;
-        else s.provider = hasBase ? 2 : 1;
+        else if (hasBase) s.provider = baseLoopback ? 2 : 5;  // 2=Local, 5=Cloud OpenAI-compatible
+        else s.provider = 1;                                   // 1=OpenAI cloud (api.openai.com)
         std::string model = j.value("model", "");
         if (s.provider == 3) model = llama.value("model_path", model);
         if (s.provider == 3 && model.empty()) model = kDefaultLlamaModelPath;
@@ -85,11 +96,13 @@ void loadSettings(Settings& s) {
         copyStr(s.geminiKey, sizeof(s.geminiKey), keys.value("gemini", std::string()));
         copyStr(s.anthropicKey, sizeof(s.anthropicKey), keys.value("anthropic", std::string()));
         copyStr(s.openaiKey, sizeof(s.openaiKey), keys.value("openai", std::string()));
+        copyStr(s.cloudKey, sizeof(s.cloudKey), keys.value("cloud_compat", std::string()));
         // Back-compat: fold the active provider's top-level api_key into its per-provider slot.
         if (!activeKey.empty()) {
             if (prov == "gemini" && !s.geminiKey[0]) copyStr(s.geminiKey, sizeof(s.geminiKey), activeKey);
             else if (prov == "anthropic" && !s.anthropicKey[0]) copyStr(s.anthropicKey, sizeof(s.anthropicKey), activeKey);
-            else if ((prov == "openai") && !hasBase && !s.openaiKey[0]) copyStr(s.openaiKey, sizeof(s.openaiKey), activeKey);
+            else if (prov == "openai" && !hasBase && !s.openaiKey[0]) copyStr(s.openaiKey, sizeof(s.openaiKey), activeKey);
+            else if (prov == "openai" && hasBase && !baseLoopback && !s.cloudKey[0]) copyStr(s.cloudKey, sizeof(s.cloudKey), activeKey);
         }
         // Seed the shipped Gemini key on first run so the copilot works out of the box.
         if (!s.geminiKey[0]) copyStr(s.geminiKey, sizeof(s.geminiKey), kSeededGeminiKey);
@@ -157,6 +170,16 @@ void saveSettings(const Settings& s) {
         j["model"] = s.model;
         j["api_key"] = s.apiKey[0] ? s.apiKey : "lm-studio";
         j["openai"] = {{"base_url", s.baseUrl}, {"vision", s.vision}};
+    } else if (s.provider == 5) {
+        // Cloud OpenAI-compatible API (DashScope / DeepSeek / ...). Same wire shape as a local
+        // openai endpoint but with a CLOUD base_url, so resolve_provider's offline guard refuses it
+        // under ITAR mode while local stays allowed.
+        j["provider"] = "openai";
+        j["model"] = s.model[0] ? s.model : "qwen-max";
+        j["api_key"] = s.cloudKey;
+        j["openai"] = {{"base_url", s.baseUrl[0] ? s.baseUrl
+                                                 : "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
+                       {"vision", s.vision}};
     } else {
         j["provider"] = "llamacpp";
         j["model"] = "local-gguf";
@@ -170,7 +193,8 @@ void saveSettings(const Settings& s) {
     // Persist every provider's key so switching providers never loses one, and the picker
     // can tell which providers are usable. The active provider's key is also the top-level
     // api_key above (what resolve_provider reads).
-    j["keys"] = {{"gemini", s.geminiKey}, {"anthropic", s.anthropicKey}, {"openai", s.openaiKey}};
+    j["keys"] = {{"gemini", s.geminiKey}, {"anthropic", s.anthropicKey}, {"openai", s.openaiKey},
+                 {"cloud_compat", s.cloudKey}};
     // Reasoning effort applies only to reasoning-capable models; resolve_provider passes it
     // through to the provider (gemini thinkingConfig / anthropic effort).
     if (s.reasoningEffort[0]) j["reasoning_effort"] = s.reasoningEffort;

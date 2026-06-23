@@ -87,6 +87,12 @@ struct Settings {
     // straight from the prompt, no plan/clarify). Persisted as "plan_mode".
     bool planMode = true;
     int maxIters = 0;            // refine-pass cap per turn; 0 = automatic
+    int maxTokens = 0;           // max output tokens per model call; 0 = automatic (per-provider
+                                 // default). Raise this if a reasoning model returns "no JSON ops"
+                                 // / "budget exhausted" — it spent its output budget thinking.
+    int contextWindow = 0;       // model's total token context window; 0 = automatic (per-provider
+                                 // default: cloud large, local 8192). Input + output are fitted to
+                                 // this so a small LOCAL model never overruns it and breaks the chain.
     std::string systemPrompt;    // system prompt override; empty = built-in
     std::string theme = "dark";  // "dark" | "light" — persisted to config.json
     Units units = Units::MMGS;   // document display/input unit system — persisted to config.json
@@ -99,6 +105,21 @@ struct Settings {
     // "Manage models" toggle in Settings → AI). Default-empty = every available model shows;
     // hiding is opt-out so the picker works out of the box. Serialized as "hidden_models".
     std::set<std::string> hiddenModels;
+
+    // ---- Experimental AI features (Settings → Experimental) -> config.json "experimental" ----
+    // All default-off and additive: when off, the resolved provider + agent loop are byte-identical
+    // to the non-experimental path. See docs/EXPERIMENTAL_AI.md.
+    //
+    // Separate vision-review provider (the Seek-CAD split): a LOCAL OpenAI-compatible vision model
+    // (e.g. self-hosted Qwen2.5-VL) judges the rendered viewport in the review/fix stages while the
+    // main provider plans + emits ops. Lets you pair a strong/cloud planner with a local vision
+    // judge, or keep the whole loop local for ITAR. Serialized under "experimental.vision_review".
+    bool expVisionReview = false;
+    char expVisionModel[512] = "qwen2.5-vl-7b-instruct";
+    char expVisionBaseUrl[256] = "http://localhost:1234/v1";
+    // Modeler prompt augmentation toward an editable parametric feature SEQUENCE (DeepCAD /
+    // CAD-Coder-style design history) over a monolithic solid. Serialized "experimental.cad_sequence_mode".
+    bool expCadSequenceMode = false;
 };
 
 std::string appdataDir();
@@ -246,6 +267,11 @@ struct JobState {
     std::string drawingDocId;         // non-empty => adopt this drawing as a new tab on success
     std::string drawingName;          // display name for the drawing tab
     std::string drawingSourceId;      // the source part doc the drawing projects from
+    // Mission orchestrator: a multi-capability run (design -> CFD -> verdict). isMission marks the
+    // job so the drain uses missionVerdict (the report stage's prose) as the final chat bubble
+    // instead of the generic design summary; createdDocPath still carries any assembly tab to open.
+    bool isMission = false;
+    std::string missionVerdict;       // the report/verdict prose to show as the assistant reply
     std::mutex evMtx;
     std::vector<AgentEvent> events;  // streamed agent progress, drained on the main thread
 };
@@ -350,6 +376,8 @@ struct ActivityItem {
     std::string status;    // "running" | "pass" | "retry" | "fail" | "done" | ""
     int durationMs = 0, tokensIn = 0, tokensOut = 0, opsCount = 0;
     bool expanded = false; // user toggled this row open to read the detail
+    bool missionHeader = false;  // a top-level mission TASK row ("Wind-tunnel it"); its sub-run
+                                 // stages (intake/model/...) follow it, namespaced by task index
 };
 
 struct ChatMsg {
@@ -361,6 +389,8 @@ struct ChatMsg {
     std::string liveStatus;        // transient "Iteration N: building..." while running
     PlanInfo plan;                 // the build plan drafted before the code (plan mode)
     std::vector<ActivityItem> activity;  // transparent "what the AI is doing" timeline (orchestrator)
+    int curMissionTask = -1;       // index of the mission task currently running (-1 = not a mission);
+                                   // namespaces sub-run stage keys so per-task stages don't collide
     std::vector<AgentStep> steps;  // assistant turn: the iteration trace
     ClarifyState clarify;          // pre-flight clarify gate (Design mode) — see ClarifyState
 };

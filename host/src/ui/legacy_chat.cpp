@@ -346,24 +346,59 @@ static std::string friendlyStageTitle(const std::string& stage) {
 }
 
 void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json& data) {
+    // Inside a mission, sub-run stage keys (intake/model/...) repeat per task — namespace them by
+    // the current task index so task 2's "model" row doesn't reopen task 1's. Outside a mission
+    // (curMissionTask < 0) the key is the bare stage, preserving the single-run behavior exactly.
+    auto nsKey = [&](const std::string& s) {
+        return m.curMissionTask >= 0 ? (std::to_string(m.curMissionTask) + ":" + s) : s;
+    };
     auto findStage = [&](const std::string& s) -> ActivityItem* {
         for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
             if (it->stage == s) return &*it;
         return nullptr;
     };
-    if (kind == "stage_started") {
-        std::string s = jstr(data, "stage");
+    if (kind == "mission_started") {
+        m.curMissionTask = -1;  // task rows arrive via mission_task_started
+    } else if (kind == "mission_task_started") {
+        int idx = jint(data, "index");
+        m.curMissionTask = idx;
+        std::string key = "task" + std::to_string(idx);
+        ActivityItem* a = findStage(key);
+        if (!a) {
+            ActivityItem ni;
+            ni.stage = key;
+            ni.title = jstr(data, "title");
+            if (ni.title.empty()) ni.title = jstr(data, "capability");
+            ni.missionHeader = true;
+            m.activity.push_back(std::move(ni));
+            a = &m.activity.back();
+        }
+        a->status = "running";
+    } else if (kind == "mission_task_result") {
+        ActivityItem* a = findStage("task" + std::to_string(jint(data, "index")));
+        if (a) {
+            std::string s = jstr(data, "status");
+            a->status = (s == "done") ? "done" : (s.empty() ? "done" : s);
+            std::string summary = jstr(data, "summary");
+            if (!summary.empty()) a->reason = summary;
+        }
+    } else if (kind == "mission_finished") {
+        m.curMissionTask = -1;
+        for (auto& a : m.activity)
+            if (a.status == "running" || a.status.empty()) a.status = "done";
+    } else if (kind == "stage_started") {
+        std::string s = nsKey(jstr(data, "stage"));
         ActivityItem* a = findStage(s);
         if (!a) {
             ActivityItem ni;
             ni.stage = s;
-            ni.title = friendlyStageTitle(s);
+            ni.title = friendlyStageTitle(jstr(data, "stage"));
             m.activity.push_back(std::move(ni));
             a = &m.activity.back();
         }
         a->status = "running";
     } else if (kind == "agent_output") {
-        ActivityItem* a = findStage(jstr(data, "stage"));
+        ActivityItem* a = findStage(nsKey(jstr(data, "stage")));
         if (a) {
             std::string raw = jstr(data, "raw");
             if (!raw.empty()) a->detail = raw;     // keep the latest attempt's thoughts/output
@@ -375,15 +410,18 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             }
         }
     } else if (kind == "stage_result") {
-        ActivityItem* a = findStage(jstr(data, "stage"));
+        ActivityItem* a = findStage(nsKey(jstr(data, "stage")));
         if (a) {
             std::string v = jstr(data, "verdict");
             a->status = v.empty() ? "done" : v;
             a->reason = jstr(data, "reason");
         }
     } else if (kind == "run_finished") {
+        // A sub-run finished (one mission task) OR a single-run completed. Close only the rows
+        // for the CURRENT task; mission_finished does the final sweep. Outside a mission this
+        // closes everything, as before.
         for (auto& a : m.activity)
-            if (a.status == "running" || a.status.empty()) a.status = "done";
+            if ((a.status == "running" || a.status.empty()) && !a.missionHeader) a.status = "done";
     }
 }
 
@@ -552,6 +590,48 @@ static void launchDesignRun(AppState& st, const std::string& request) {
     if (st.activityPanel)
         st.activityPanel->clearLive();
     launchAgentRunV2(st.worker, st.job, request, st.docMirror.docId());
+}
+
+// Launch the MISSION orchestrator for a multi-capability request (e.g. "model X, then run CFD and
+// prove it's good"). Mirrors launchDesignRun's doc-prep + mutex + activity reset, but routes to
+// agent_mission_v1 so the run decomposes into a task chain (design/assembly -> sim -> verdict).
+// Shares the same fresh-part policy: a new build starts on a clean part doc; an existing model is
+// kept (a mission that only analyzes the open part should not wipe it).
+static void launchMissionRunChat(AppState& st, const std::string& request, bool needFreshDoc) {
+    std::string err;
+    bool docOk = st.docMirror.hasDoc();
+    if (needFreshDoc) {
+        if (docOk) {
+            const nlohmann::json& tree = st.docMirror.tree();
+            bool hasFeatures = tree.is_object() && tree.contains("features") &&
+                               tree["features"].is_array() && !tree["features"].empty();
+            if (hasFeatures) docOk = st.docMirror.newPart(st.worker, err);
+        } else {
+            docOk = st.docMirror.newPart(st.worker, err);
+        }
+    }
+    if (!docOk) {
+        st.addLog("[err] mission: could not create a part document: " + err);
+        st.status = "Worker not ready";  st.statusKind = 2;
+        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+            if (!it->fromUser && (it->running || it->clarify.active)) {
+                it->running = false;
+                it->clarify = ClarifyState{};
+                it->errKind = ERR_SYSTEM;
+                it->text = "I couldn't open a part document (worker not ready). "
+                           "Check the Console and try again.";
+                break;
+            }
+        return;
+    }
+    if (needFreshDoc) st.clearViewportForNewDoc();
+    st.addLog("[..] mission: " + request);
+    st.status = "Working on it...";  st.statusKind = 0;
+    st.agentV2Running = true;
+    st.agentV2 = true;
+    if (st.activityPanel)
+        st.activityPanel->clearLive();
+    launchMissionRun(st.worker, st.job, request, st.docMirror.docId());
 }
 
 // The inline clarify card: the build-critical questions the model asked, each with an editable
@@ -1149,6 +1229,34 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
         const ProviderModels& pm = st.providerModels[s.provider == ui::PROV_LLAMACPP
                                                           ? ui::PROV_LLAMACPP : ui::PROV_LOCAL];
         bool useGguf = (s.provider == ui::PROV_LLAMACPP);
+        // Experimental: one-click presets for the research-backed open-weight local models
+        // (Qwen2.5-Coder / Qwen2.5-VL / DeepSeek-R1). Fills the model id + vision flag + a default
+        // base URL; the weights must already be loaded in the local server.
+        if (!useGguf) {
+            ImGui::TextUnformatted("Quick preset");
+            dimText("Open-weight, self-hostable models recommended for the copilot (ITAR-safe). "
+                    "Fills the model id, vision flag, and a default base URL. The weights must "
+                    "already be loaded in your local server.");
+            const auto& presets = ui::localPresets();
+            std::vector<const char*> plabels;
+            plabels.push_back("(choose a preset…)");
+            for (const auto& p : presets) plabels.push_back(p.label.c_str());
+            int psel = 0;
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("##localpreset", &psel, plabels.data(), (int)plabels.size()) &&
+                psel > 0 && psel - 1 < (int)presets.size()) {
+                const auto& p = presets[psel - 1];
+                std::strncpy(s.model, p.id.c_str(), sizeof(s.model) - 1);
+                if (!p.baseUrl.empty())
+                    std::strncpy(s.baseUrl, p.baseUrl.c_str(), sizeof(s.baseUrl) - 1);
+                s.vision = p.vision;
+                changed = true;
+                refreshModelAvailability(st, true);  // re-probe for the (possibly new) endpoint
+            }
+            if (psel > 0 && psel - 1 < (int)presets.size() && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", presets[psel - 1].note.c_str());
+            ImGui::Dummy(ImVec2(0, 4 * S));
+        }
         ImGui::TextUnformatted(useGguf ? "GGUF model path" : "Model");
         if (!useGguf && pm.ok && !pm.models.empty()) {
             std::vector<const char*> ids;
@@ -1188,6 +1296,47 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
             ImGui::SetTooltip("How much hidden reasoning the model spends before answering.\n"
                               "Higher = better planning on hard parts, slower + more tokens.");
     }
+
+    // ---- max response tokens (per model call) ----
+    // The lever for "budget exhausted" / "no JSON ops in reply": a reasoning model can spend its
+    // whole output budget thinking and emit no/truncated JSON. 0 = automatic per-provider default
+    // (4096 local, 8192 cloud, +4096 at high effort). Raise it if builds keep failing to parse.
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    ImGui::TextUnformatted("Max response tokens");
+    ImGui::SetNextItemWidth(-1);
+    int mt = s.maxTokens;  // 0 = auto
+    if (ImGui::InputInt("##maxtokens", &mt, 1024, 4096)) {
+        if (mt < 0) mt = 0;
+        if (mt > 0 && mt < 512) mt = 512;
+        if (mt > 200000) mt = 200000;
+        s.maxTokens = mt;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Output token cap per model call. 0 = automatic.\n"
+                          "Raise this if the agent reports \"budget exhausted\" or \"no JSON ops\"\n"
+                          "— a reasoning model spent its budget thinking before emitting the build.");
+
+    // ---- model context window ----
+    // The model's TOTAL token window. The agent fits input (prompt) + output (above) inside it so
+    // a small LOCAL model never silently runs out of context mid-chain. 0 = automatic per-provider
+    // default (cloud large; local 8192). Set this to your local server's real window (e.g. 4096,
+    // 8192, 32768) so the prompt is trimmed to fit instead of being truncated blindly by the server.
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    ImGui::TextUnformatted("Model context window");
+    ImGui::SetNextItemWidth(-1);
+    int cw = s.contextWindow;  // 0 = auto
+    if (ImGui::InputInt("##ctxwindow", &cw, 1024, 8192)) {
+        if (cw < 0) cw = 0;
+        if (cw > 0 && cw < 2048) cw = 2048;
+        if (cw > 2000000) cw = 2000000;
+        s.contextWindow = cw;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("The model's total token context window. 0 = automatic\n"
+                          "(cloud large; local 8192). Set your LOCAL server's real window so the\n"
+                          "agent trims the prompt to fit instead of overrunning it and breaking the run.");
 
     // ---- credentials / connection ----
     ImGui::Dummy(ImVec2(0, 6 * S));
@@ -1604,15 +1753,42 @@ static void submitTurn(AppState& st, const std::string& text) {
     bool editMode = (st.aiInteraction == 1);
     bool askMode  = (st.aiInteraction == 2);
 
+    std::string lo = text;
+    std::transform(lo.begin(), lo.end(), lo.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    auto has = [&](const char* k) { return lo.find(k) != std::string::npos; };
+
+    // MISSION intent: a request that asks to BUILD something AND then analyze/validate it
+    // ("model an airplane, then run CFD and prove it's good"; "design a bracket and FEA it").
+    // The old routing was mutually exclusive — a "...run a CFD..." phrase greedily hijacked the
+    // whole message into the sim tool, which then refused on the empty doc. Route the combined
+    // case to the mission orchestrator, which decomposes it into design -> analyze -> verdict.
+    // Conservative on purpose: a miss just falls through to plain design (no regression).
+    auto looksLikeMission = [&]() -> bool {
+        if (editMode || askMode || st.agentV2Running) return false;
+        bool buildVerb = has("make ") || has("model ") || has("build ") || has("design ") ||
+                         has("create ") || has("generate ") || has("give me");
+        bool analyzeVerb = has("cfd") || has("wind tunnel") || has("windtunnel") ||
+                           has("aerodynam") || has("simulat") || has("flow sim") || has("fea") ||
+                           has("stress") || has("downforce") ||
+                           ((has("drag") || has("lift")) && (has("air") || has("speed") ||
+                            has("wind") || has("m/s") || has("mph"))) ||
+                           has("prove") || has("validate") || has("verify it") ||
+                           has("is it a good") || has("good design") || has("analyze");
+        return buildVerb && analyzeVerb;
+    };
+    if (looksLikeMission()) {
+        launchMissionRunChat(st, text, /*needFreshDoc=*/true);
+        return;
+    }
+
     // CFD/sim intent: a flow-sim request on an open part routes to the simulation tool in ANY mode
     // (the AI runs a wind-tunnel CFD and reports drag/lift). Mirrors Ask — async, fills the chat,
     // never mutates geometry. Works fully offline (the core parses the flow condition itself).
+    // This is the SIM-ONLY quick path (no build verb) — a combined build+analyze request was
+    // already handled by looksLikeMission above.
     auto looksLikeSim = [&]() -> bool {
         if (!st.docMirror.hasDoc() || st.agentV2Running) return false;
-        std::string lo = text;
-        std::transform(lo.begin(), lo.end(), lo.begin(),
-                       [](unsigned char c) { return (char)std::tolower(c); });
-        auto has = [&](const char* k) { return lo.find(k) != std::string::npos; };
         if (has("cfd") || has("wind tunnel") || has("windtunnel") || has("aerodynam") ||
             has("drag") || has("downforce"))
             return true;

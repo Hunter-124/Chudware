@@ -49,6 +49,7 @@
 #include "agent/http.h"
 #include "agent/roles.h"
 #include "sim/flow_run.h"
+#include "agent/mission.h"
 #include "agent/run.h"
 #include "agent/state.h"
 #include "doc/document.h"
@@ -56,6 +57,7 @@
 #include "doc/drawing_session.h"
 #include "doc/session.h"
 #include "doc/validate.h"
+#include "parts/parts.h"
 #include "ecad/autoroute.h"
 #include "ecad/recipes.h"
 #include "ecad/schema.h"
@@ -265,6 +267,75 @@ nlohmann::json resolve_assist_provider(const nlohmann::json& params) {
         return params["provider"];  // explicit (gate mock / host override)
     json cfg = aicad::agent::load_config();
     return aicad::agent::resolve_provider(std::nullopt, cfg, nlohmann::json::object());
+}
+
+// Wind-tunnel CFD on a live doc. Extracted from the agent_simulate_v1 handler so the
+// mission orchestrator (run_mission, a simulate_flow task) can call the SAME flow-sim
+// path the host's CFD quick-path uses. No LLM (the flow condition is regex-parsed from
+// `request`), so it works fully offline. `doc_id` may be a part OR an assembly doc —
+// doc_tessellate_bodies resolves world-placed component geometry for assemblies.
+// Returns {ok, answer, drag_n, lift_n, cd, frontal_area_mm2, reynolds, velocity_ms,
+// aoa_deg} on success, or {ok:false, answer} when there is no geometry / the sim fails.
+nlohmann::json run_flow_sim(const std::string& doc_id, const std::string& request,
+                            const nlohmann::json& params) {
+    std::string lo = request;
+    std::transform(lo.begin(), lo.end(), lo.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    aicad::sim::FlowParams fp;
+    // velocity: explicit param wins; else parse "<n> m/s|mps|mph|km/h|kph|knots".
+    if (params.contains("velocity")) {
+        fp.velocity_ms = params.value("velocity", 10.0);
+    } else {
+        std::smatch mm;
+        std::regex rv(R"((\d+(?:\.\d+)?)\s*(m/s|mps|mph|km/?h|kph|knots?|kt))");
+        if (std::regex_search(lo, mm, rv)) {
+            double v = std::stod(mm[1].str());
+            std::string u = mm[2].str();
+            if (u == "mph") v *= 0.44704;
+            else if (u.rfind("km", 0) == 0 || u == "kph") v *= 0.27778;
+            else if (u.rfind("kn", 0) == 0 || u == "kt") v *= 0.514444;
+            fp.velocity_ms = v;
+        }
+    }
+    // aoa: explicit param wins; else parse "<n> deg" (optionally near 'attack'/'aoa').
+    if (params.contains("aoa")) {
+        fp.aoa_deg = params.value("aoa", 0.0);
+    } else {
+        std::smatch ma;
+        std::regex raoa(R"((-?\d+(?:\.\d+)?)\s*(?:deg|degree|degrees|\xc2\xb0))");
+        if (std::regex_search(lo, ma, raoa)) fp.aoa_deg = std::stod(ma[1].str());
+    }
+    std::string fluid = params.value("fluid", std::string());
+    if (fluid.empty()) fluid = (lo.find("water") != std::string::npos) ? "water" : "air";
+    if (fluid == "water") { fp.nu_fluid = 1.0e-6; fp.rho_fluid = 1000.0; }
+    fp.cells = params.value("cells", 96);
+    fp.n_steps = params.value("n_steps", 2000);
+
+    std::vector<aicm::AicmBody> bodies = aicad::doc::doc_tessellate_bodies(doc_id);
+    if (bodies.empty())
+        return json{{"ok", false},
+                    {"answer", "There's no solid geometry to simulate yet — model "
+                               "the part first, then ask me to run the flow sim."}};
+    std::vector<std::vector<float>> bp;
+    std::vector<std::vector<uint32_t>> bi;
+    for (auto& b : bodies) { bp.push_back(b.pos); bi.push_back(b.idx); }
+    double re = 0.0;
+    aicad::sim::LbmResult r = aicad::sim::run_wind_tunnel(bp, bi, fp, &re);
+    if (!r.ok)
+        return json{{"ok", false}, {"answer", "The flow sim could not run: " + r.error}};
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "Wind-tunnel CFD at %.1f m/s%s, %.1f deg AoA (Re %.0f): drag %.3f N, "
+                  "lift %.3f N, Cd %.3f, frontal area %.0f mm^2. (Coarse LBM grid "
+                  "%dx%dx%d, %d steps — directional estimate.)",
+                  fp.velocity_ms, fluid == "water" ? " in water" : "", fp.aoa_deg, re,
+                  r.drag_n, r.lift_n, r.cd, r.frontal_area_mm2, r.nx, r.ny, r.nz,
+                  r.steps_run);
+    return json{{"ok", true},
+                {"answer", std::string(buf)},
+                {"drag_n", r.drag_n}, {"lift_n", r.lift_n}, {"cd", r.cd},
+                {"frontal_area_mm2", r.frontal_area_mm2}, {"reynolds", re},
+                {"velocity_ms", fp.velocity_ms}, {"aoa_deg", fp.aoa_deg}};
 }
 
 }  // namespace
@@ -877,7 +948,9 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                      {"error", resolved.value("error", std::string("provider resolution failed"))}},
                                 out_json, 0);
                 }
-                provider = resolved;
+                // Attach the experimental knobs (separate vision review provider + cad-sequence
+                // mode) from config.json "experimental". No-op when the block is absent.
+                provider = aicad::agent::apply_experimental(resolved, cfg, json::object());
             }
 
             // ---- micro vs design ----
@@ -901,6 +974,46 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             }
             result["events"] = *captured;
             result["engaged"] = micro ? "micro" : "design";  // diagnostic: which profile ran
+            return emit(std::move(result), out_json, 0);
+        }
+        if (m == "agent_mission_v1") {
+            // TOP-LEVEL orchestration: {request, doc_id, options?, provider?} -> decompose the
+            // request into an ordered task list (design/assembly/simulate_flow/report/...), run
+            // them threading the working doc forward, and return a verdict. This is the entry
+            // that lets ONE message express a whole workflow ("model X, then CFD it and prove
+            // it's good") instead of the old one-capability-per-message routing. Provider is
+            // resolved exactly like agent_run; the flow-sim capability is wired to run_flow_sim
+            // (the same path agent_simulate_v1 uses), so design->CFD chains in one run.
+            std::string request = params.value("request", std::string());
+            std::string doc_id = params.value("doc_id", std::string());
+            json options = params.contains("options") ? params["options"] : json::object();
+
+            json provider;
+            const bool explicit_provider = params.contains("provider") &&
+                                           params["provider"].is_object() &&
+                                           !params["provider"].empty();
+            json cfg = aicad::agent::load_config();
+            if (explicit_provider) {
+                provider = params["provider"];
+            } else {
+                json resolved = aicad::agent::resolve_provider(std::nullopt, cfg, json::object());
+                if (resolved.is_object() && resolved.contains("error"))
+                    return emit(json{{"ok", false},
+                                     {"error", resolved.value(
+                                                   "error", std::string("provider resolution failed"))}},
+                                out_json, 0);
+                provider = aicad::agent::apply_experimental(resolved, cfg, json::object());
+            }
+
+            auto captured = std::make_shared<json>(json::array());
+            aicad::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
+            aicad::agent::SimFn sim = [](const std::string& sim_doc, const std::string& sim_req,
+                                         const json& sim_params) -> json {
+                return run_flow_sim(sim_doc, sim_req, sim_params);
+            };
+            json result = aicad::agent::run_mission(request, doc_id, provider, cb, sim, options);
+            result["events"] = *captured;
+            result["engaged"] = "mission";
             return emit(std::move(result), out_json, 0);
         }
         if (m == "agent_run_design") {
@@ -1697,6 +1810,53 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 params.value("doc_id", std::string()),
                                 params.value("path", std::string())),
                             out_json, 0);
+            if (m == "parts_catalog_list")
+                // The parametric standard-parts catalog (families + sizes + lengths)
+                // for the GUI library browser and the agent context. No doc needed.
+                return emit(aicad::parts::catalog_json(), out_json, 0);
+            if (m == "parts_make") {
+                // {family, size, length_mm?, options?, name?, save_path?} -> build a
+                // NEW editable part doc from the catalog generator. With save_path,
+                // also export a .step so an assembly can asm_insert_component it.
+                try {
+                    const std::string family = params.value("family", std::string());
+                    const std::string size = params.value("size", std::string());
+                    double length = 0.0;
+                    if (params.contains("length_mm") && params["length_mm"].is_number())
+                        length = params["length_mm"].get<double>();
+                    else if (params.contains("length") && params["length"].is_number())
+                        length = params["length"].get<double>();
+                    const json opts = (params.contains("options") && params["options"].is_object())
+                                          ? params["options"]
+                                          : json::object();
+                    aicad::parts::PartBuild pb = aicad::parts::build(family, size, length, opts);
+                    const std::string nm = params.value("name", pb.name);
+                    json nresp = aicad::doc::doc_new("part", nm);
+                    const std::string doc_id = nresp.value("doc_id", std::string());
+                    if (doc_id.empty())
+                        return emit(json{{"ok", false}, {"error", "parts_make: doc_new failed"}},
+                                    out_json, 1);
+                    json aresp = aicad::doc::doc_apply_ops(doc_id, 0, pb.ops, false);
+                    json out;
+                    out["ok"] = true;
+                    out["doc_id"] = doc_id;
+                    out["name"] = nm;
+                    out["meta"] = pb.meta;
+                    if (aresp.contains("revision")) out["revision"] = aresp["revision"];
+                    if (aresp.contains("tess")) out["tess"] = aresp["tess"];
+                    if (aresp.contains("volume")) out["volume"] = aresp["volume"];
+                    if (aresp.contains("rebuild")) out["rebuild"] = aresp["rebuild"];
+                    const std::string sp = params.value("save_path", std::string());
+                    if (!sp.empty()) {
+                        json sresp = aicad::doc::doc_export_step(doc_id, sp);
+                        out["step_path"] = sp;
+                        out["step_ok"] = sresp.value("ok", true);
+                    }
+                    return emit(std::move(out), out_json, 0);
+                } catch (const std::exception& e) {
+                    return emit(json{{"ok", false}, {"error", e.what()}}, out_json, 1);
+                }
+            }
             if (m == "doc_render_png")
                 return emit(aicad::doc::doc_render_png(
                                 params.value("doc_id", std::string()),
@@ -1740,69 +1900,10 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             if (m == "agent_simulate_v1") {
                 // "AI runs CFD": {doc_id, request} (+ optional explicit velocity/aoa/fluid) ->
                 // parse a flow condition from natural language, run the wind tunnel, return forces
-                // + a human summary. No LLM needed (regex parse), so it works fully offline.
-                std::string doc_id = params.value("doc_id", std::string());
-                std::string req = params.value("request", std::string());
-                std::string lo = req;
-                std::transform(lo.begin(), lo.end(), lo.begin(),
-                               [](unsigned char c) { return (char)std::tolower(c); });
-                aicad::sim::FlowParams fp;
-                // velocity: explicit param wins; else parse "<n> m/s|mps|mph|km/h|kph|knots".
-                if (params.contains("velocity")) {
-                    fp.velocity_ms = params.value("velocity", 10.0);
-                } else {
-                    std::smatch mm;
-                    std::regex rv(R"((\d+(?:\.\d+)?)\s*(m/s|mps|mph|km/?h|kph|knots?|kt))");
-                    if (std::regex_search(lo, mm, rv)) {
-                        double v = std::stod(mm[1].str());
-                        std::string u = mm[2].str();
-                        if (u == "mph") v *= 0.44704;
-                        else if (u.rfind("km", 0) == 0 || u == "kph") v *= 0.27778;
-                        else if (u.rfind("kn", 0) == 0 || u == "kt") v *= 0.514444;
-                        fp.velocity_ms = v;
-                    }
-                }
-                // aoa: explicit param wins; else parse "<n> deg" (optionally near 'attack'/'aoa').
-                if (params.contains("aoa")) {
-                    fp.aoa_deg = params.value("aoa", 0.0);
-                } else {
-                    std::smatch ma;
-                    std::regex raoa(R"((-?\d+(?:\.\d+)?)\s*(?:deg|degree|degrees|\xc2\xb0))");
-                    if (std::regex_search(lo, ma, raoa)) fp.aoa_deg = std::stod(ma[1].str());
-                }
-                std::string fluid = params.value("fluid", std::string());
-                if (fluid.empty()) fluid = (lo.find("water") != std::string::npos) ? "water" : "air";
-                if (fluid == "water") { fp.nu_fluid = 1.0e-6; fp.rho_fluid = 1000.0; }
-                fp.cells = params.value("cells", 96);
-                fp.n_steps = params.value("n_steps", 2000);
-
-                std::vector<aicm::AicmBody> bodies = aicad::doc::doc_tessellate_bodies(doc_id);
-                if (bodies.empty())
-                    return emit(json{{"ok", false},
-                                     {"answer", "There's no solid geometry to simulate yet — model "
-                                                "the part first, then ask me to run the flow sim."}},
-                                out_json, 0);
-                std::vector<std::vector<float>> bp;
-                std::vector<std::vector<uint32_t>> bi;
-                for (auto& b : bodies) { bp.push_back(b.pos); bi.push_back(b.idx); }
-                double re = 0.0;
-                aicad::sim::LbmResult r = aicad::sim::run_wind_tunnel(bp, bi, fp, &re);
-                if (!r.ok)
-                    return emit(json{{"ok", false}, {"answer", "The flow sim could not run: " + r.error}},
-                                out_json, 0);
-                char buf[512];
-                std::snprintf(buf, sizeof(buf),
-                              "Wind-tunnel CFD at %.1f m/s%s, %.1f deg AoA (Re %.0f): drag %.3f N, "
-                              "lift %.3f N, Cd %.3f, frontal area %.0f mm^2. (Coarse LBM grid "
-                              "%dx%dx%d, %d steps — directional estimate.)",
-                              fp.velocity_ms, fluid == "water" ? " in water" : "", fp.aoa_deg, re,
-                              r.drag_n, r.lift_n, r.cd, r.frontal_area_mm2, r.nx, r.ny, r.nz,
-                              r.steps_run);
-                return emit(json{{"ok", true},
-                                 {"answer", std::string(buf)},
-                                 {"drag_n", r.drag_n}, {"lift_n", r.lift_n}, {"cd", r.cd},
-                                 {"frontal_area_mm2", r.frontal_area_mm2}, {"reynolds", re},
-                                 {"velocity_ms", fp.velocity_ms}, {"aoa_deg", fp.aoa_deg}},
+                // + a human summary. No LLM needed (regex parse), so it works fully offline. The
+                // body lives in run_flow_sim so the mission orchestrator shares the exact path.
+                return emit(run_flow_sim(params.value("doc_id", std::string()),
+                                         params.value("request", std::string()), params),
                             out_json, 0);
             }
             if (m == "doc_face_points")

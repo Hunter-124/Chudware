@@ -105,6 +105,8 @@ void loadSettings(Settings& s) {
         s.offlineMode = j.value("offline_mode", false);
         s.planMode = j.value("plan_mode", true);
         s.maxIters = j.value("max_iters", 0);
+        s.maxTokens = j.value("max_output_tokens", 0);
+        s.contextWindow = j.value("context_window", 0);
         s.systemPrompt = j.value("system_prompt", "");
         s.theme = j.value("theme", "dark");
         s.units = (j.value("units", std::string("mmgs")) == "ips") ? Units::IPS : Units::MMGS;
@@ -119,6 +121,19 @@ void loadSettings(Settings& s) {
         if (auto it = j.find("hidden_models"); it != j.end() && it->is_array())
             for (const auto& e : *it)
                 if (e.is_string()) s.hiddenModels.insert(e.get<std::string>());
+        // Experimental AI features ("experimental" block) — all default-off.
+        auto exp = j.value("experimental", nlohmann::json::object());
+        if (exp.is_object()) {
+            auto vr = exp.value("vision_review", nlohmann::json::object());
+            if (vr.is_object()) {
+                s.expVisionReview = vr.value("enabled", false);
+                copyStr(s.expVisionModel, sizeof(s.expVisionModel),
+                        vr.value("model", std::string("qwen2.5-vl-7b-instruct")));
+                copyStr(s.expVisionBaseUrl, sizeof(s.expVisionBaseUrl),
+                        vr.value("base_url", std::string("http://localhost:1234/v1")));
+            }
+            s.expCadSequenceMode = exp.value("cad_sequence_mode", false);
+        }
     } catch (...) {
     }
 }
@@ -162,6 +177,8 @@ void saveSettings(const Settings& s) {
     j["offline_mode"] = s.offlineMode;
     j["plan_mode"] = s.planMode;
     if (s.maxIters > 0) j["max_iters"] = s.maxIters;
+    if (s.maxTokens > 0) j["max_output_tokens"] = s.maxTokens;
+    if (s.contextWindow > 0) j["context_window"] = s.contextWindow;
     if (!s.systemPrompt.empty()) j["system_prompt"] = s.systemPrompt;
     j["theme"] = s.theme;
     j["units"] = (s.units == Units::IPS) ? "ips" : "mmgs";
@@ -170,6 +187,21 @@ void saveSettings(const Settings& s) {
     j["recent_files"] = s.recentFiles;
     if (!s.hiddenModels.empty())
         j["hidden_models"] = std::vector<std::string>(s.hiddenModels.begin(), s.hiddenModels.end());
+    // Experimental AI features. Only emit the block when something is enabled/customized, so a
+    // default config stays clean and the core's apply_experimental is a no-op.
+    if (s.expVisionReview || s.expCadSequenceMode) {
+        nlohmann::json exp = nlohmann::json::object();
+        if (s.expVisionReview) {
+            exp["vision_review"] = {
+                {"enabled", true},
+                {"model", s.expVisionModel[0] ? s.expVisionModel : "qwen2.5-vl-7b-instruct"},
+                {"base_url", s.expVisionBaseUrl[0] ? s.expVisionBaseUrl
+                                                   : "http://localhost:1234/v1"},
+            };
+        }
+        if (s.expCadSequenceMode) exp["cad_sequence_mode"] = true;
+        j["experimental"] = exp;
+    }
     try {
         std::filesystem::create_directories(appdataDir() + "\\AI-CAD");
         std::ofstream(configPath()) << j.dump(2);

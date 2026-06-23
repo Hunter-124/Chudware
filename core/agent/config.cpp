@@ -9,6 +9,7 @@
 #include <sstream>
 
 #include "agent/paths.h"
+#include "agent/state.h"  // kContextTokenCap (the lean input-cap ceiling for big windows)
 
 namespace aicad {
 namespace agent {
@@ -16,6 +17,18 @@ namespace agent {
 const char* kDefaultLocalModel = "gemma-4-e4b";
 const char* kDefaultLocalBaseUrl = "http://localhost:1234/v1";
 const char* kOfflineSetting = "offline_mode";
+
+namespace {
+// Per-provider default context window (total tokens) when the user has not set one. Cloud
+// models are large; a LOCAL/unknown server is assumed 8192 — a common LM Studio / Ollama
+// default — so input+output budgeting never overruns a small window by accident.
+int default_context_window(const std::string& name) {
+    if (name == "anthropic") return 200000;
+    if (name == "gemini") return 1048576;
+    if (name == "openai") return 128000;
+    return 8192;  // local / unknown — conservative
+}
+}  // namespace
 
 // load_config — mirror agent/config.py load_config(): read paths_config()
 // (%APPDATA%/AI-CAD/config.json) and parse it. Returns {} on a missing file or any
@@ -326,8 +339,103 @@ json resolve_provider(const std::optional<std::string>& name_arg, const json& cf
     if (auto eff = cfg_str(cfg, "reasoning_effort"); eff && !eff->empty())
         desc["reasoning_effort"] = *eff;
 
+    // Optional per-call output-token override (config "max_output_tokens"). 0/absent = the
+    // per-provider automatic default in call_budget_for. Raising it is the fix when a reasoning
+    // model burns its whole output budget thinking and returns no/truncated JSON ("no JSON ops").
+    if (cfg.contains("max_output_tokens") && cfg["max_output_tokens"].is_number_integer()) {
+        int mt = cfg["max_output_tokens"].get<int>();
+        if (mt > 0) desc["max_tokens"] = mt;
+    }
+
+    // Context window (config "context_window") — the model's total token window that input +
+    // output must fit within. 0/absent = the per-provider default (cloud large; local/unknown
+    // 8192). fit_call_budget() derives the input cap + output reservation from this so a small
+    // local window is never overrun (which would corrupt the prompt and break the chain).
+    {
+        int cw = 0;
+        if (cfg.contains("context_window") && cfg["context_window"].is_number_integer())
+            cw = cfg["context_window"].get<int>();
+        desc["context_window"] =
+            cw > 0 ? cw : default_context_window(desc.value("name", std::string()));
+    }
+
     desc["offline_safe"] = provider_offline_safe(desc);
     return desc;
+}
+
+json resolve_review_provider(const json& cfg, const json& env) {
+    if (!cfg.is_object() || !cfg.contains("experimental") || !cfg["experimental"].is_object())
+        return json(nullptr);
+    const json& ex = cfg["experimental"];
+    if (!ex.contains("vision_review") || !ex["vision_review"].is_object()) return json(nullptr);
+    const json& vr = ex["vision_review"];
+    bool enabled = vr.contains("enabled") && vr["enabled"].is_boolean() && vr["enabled"].get<bool>();
+    if (!enabled) return json(nullptr);
+
+    // The review judge is a LOCAL OpenAI-compatible vision endpoint (the Seek-CAD use case: a
+    // self-hosted Qwen2.5-VL). Synthesize the minimal cfg resolve_provider expects and reuse ALL of
+    // its offline-safety logic — so an offline run still refuses a non-loopback review endpoint.
+    std::string base_url = vr.contains("base_url") && vr["base_url"].is_string() &&
+                                   !vr["base_url"].get<std::string>().empty()
+                               ? vr["base_url"].get<std::string>()
+                               : std::string(kDefaultLocalBaseUrl);
+    std::string model = vr.contains("model") && vr["model"].is_string() &&
+                                !vr["model"].get<std::string>().empty()
+                            ? vr["model"].get<std::string>()
+                            : std::string("qwen2.5-vl-7b-instruct");
+    std::string api_key = vr.contains("api_key") && vr["api_key"].is_string() &&
+                                  !vr["api_key"].get<std::string>().empty()
+                              ? vr["api_key"].get<std::string>()
+                              : std::string("lm-studio");
+    json sub = json{
+        {"provider", "openai"},
+        {"model", model},
+        {"api_key", api_key},
+        {"offline_mode", offline_enabled(cfg)},  // inherit the ambient ITAR guard
+        {"openai", {{"base_url", base_url}, {"vision", true}}},
+    };
+    return resolve_provider(std::string("openai"), sub, env);
+}
+
+json apply_experimental(json resolved_main, const json& cfg, const json& env) {
+    if (!cfg.is_object() || !cfg.contains("experimental") || !cfg["experimental"].is_object())
+        return resolved_main;
+    const json& ex = cfg["experimental"];
+
+    // A separate vision review/fix judge. On an offline refusal (cloud endpoint while offline) we
+    // SKIP it silently: review then falls back to the main provider, which already passed the
+    // offline guard, so the run stays ITAR-safe rather than failing.
+    json rp = resolve_review_provider(cfg, env);
+    if (rp.is_object() && !rp.contains("error")) resolved_main["review_provider"] = rp;
+
+    if (ex.contains("cad_sequence_mode") && ex["cad_sequence_mode"].is_boolean() &&
+        ex["cad_sequence_mode"].get<bool>())
+        resolved_main["cad_sequence_mode"] = true;
+    return resolved_main;
+}
+
+int context_window_for(const json& provider_cfg) {
+    if (provider_cfg.contains("context_window") &&
+        provider_cfg["context_window"].is_number_integer()) {
+        int cw = provider_cfg["context_window"].get<int>();
+        if (cw > 0) return cw;
+    }
+    return default_context_window(provider_cfg.value("name", std::string()));
+}
+
+CallBudget fit_call_budget(const json& provider_cfg, int desired_output) {
+    const int window = context_window_for(provider_cfg);
+    const int margin = 768;      // role markers + JSON scaffolding + tokenizer slop
+    const int min_input = 1024;  // always leave room for the request + the current step
+    int out = desired_output > 0 ? desired_output : 4096;
+    // The output reservation must not swallow the whole window — keep min_input for the prompt.
+    int out_ceiling = window - min_input - margin;
+    if (out_ceiling < 1024) out_ceiling = 1024;  // pathologically tiny window: still attempt
+    if (out > out_ceiling) out = out_ceiling;
+    int input_cap = window - out - margin;
+    if (input_cap < min_input) input_cap = min_input;
+    if (input_cap > kContextTokenCap) input_cap = kContextTokenCap;  // big windows: keep prompts lean
+    return CallBudget{input_cap, out};
 }
 
 }  // namespace agent

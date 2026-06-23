@@ -76,6 +76,46 @@ inline const std::vector<ModelInfo>& builtinModels() {
     return kModels;
 }
 
+// ---- experimental local-model presets (research-backed, ITAR-safe self-hostable) ----
+// Local OpenAI-compatible servers (LM Studio / Ollama / vLLM) can serve ANY model, so these are
+// NOT live-discovered like the cloud catalog — they are one-click presets that fill the model id
+// (+ vision flag + a sensible default base URL) for the open-weight models the research flagged as
+// strong fits for the copilot. The user still needs the weights loaded in their local server.
+struct LocalPreset {
+    std::string id;        // wire model id to request (must match the server's loaded model)
+    std::string label;     // human label for the preset picker
+    bool vision = false;   // can receive viewport screenshots (drives vision review/fix)
+    std::string note;      // one-line "what it's good for" shown on hover
+    std::string baseUrl;   // default endpoint (LM Studio 1234; user can override)
+};
+
+inline const std::vector<LocalPreset>& localPresets() {
+    static const std::vector<LocalPreset> kPresets = {
+        // Code / tool-calling backbones for structured CAD-op emission (Apache-2.0 sizes).
+        {"qwen2.5-coder-7b-instruct", "Qwen2.5-Coder 7B (ops/code)", false,
+         "Apache-2.0 code model; reliable JSON + tool-calling for emitting CAD ops.",
+         "http://localhost:1234/v1"},
+        {"qwen2.5-coder-32b-instruct", "Qwen2.5-Coder 32B (ops/code)", false,
+         "Larger Apache-2.0 coder; best structured-op quality if your GPU fits it.",
+         "http://localhost:1234/v1"},
+        {"qwen2.5-14b-instruct", "Qwen2.5 14B (general)", false,
+         "Apache-2.0 general model; solid planner/intake without a vision head.",
+         "http://localhost:1234/v1"},
+        // Vision judges for the review/fix loop (beat Gemini 1.5 Pro on grounding in the research).
+        {"qwen2.5-vl-7b-instruct", "Qwen2.5-VL 7B (vision review)", true,
+         "Apache-2.0 vision model; strong grounding on rendered viewport PNGs.",
+         "http://localhost:1234/v1"},
+        {"qwen2.5-vl-3b-instruct", "Qwen2.5-VL 3B (vision, light)", true,
+         "Smaller vision judge for modest GPUs (Qwen-Research license — verify before commercial use).",
+         "http://localhost:1234/v1"},
+        // Reasoning model behind the Seek-CAD-style local self-refinement loop.
+        {"deepseek-r1-distill-qwen-32b", "DeepSeek-R1 Distill 32B (reasoning)", false,
+         "Reasoning model; the Seek-CAD local design loop runs a Q4 of this on a single 24GB GPU.",
+         "http://localhost:1234/v1"},
+    };
+    return kPresets;
+}
+
 // Does (provider, model id) expose a reasoning-effort knob? Falls back to the provider
 // default for unknown ids (local models route through gemma-style reasoning -> true).
 inline bool modelSupportsReasoning(int provider, const std::string& id) {

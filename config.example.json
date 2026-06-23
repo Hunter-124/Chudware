@@ -5,6 +5,10 @@
   "api_key": "AIza... (Gemini) or sk-ant-... (Anthropic)",
   "reasoning_effort": "high",
   "_reasoning_effort_note": "off | low | medium | high — applies only to reasoning-capable models (Gemini 2.5, Claude).",
+  "max_output_tokens": 0,
+  "_max_output_tokens_note": "0 = automatic (4096 local / 8192 cloud, +4096 at high effort). Raise it (e.g. 16384) if the agent reports 'budget exhausted' / 'no JSON ops in reply' — a reasoning model spent its output budget thinking. Also settable in AI Settings.",
+  "context_window": 0,
+  "_context_window_note": "0 = automatic (cloud large; local/unknown 8192). The model's TOTAL token window. The agent fits prompt + output inside it so a small LOCAL model never overruns its context mid-chain (which truncates the prompt and breaks the run). Set this to your local server's real window (e.g. 4096, 8192, 32768). Also settable in AI Settings.",
   "openai": {
     "base_url": null
   },
@@ -15,5 +19,16 @@
     "ctx_size": 8192,
     "gpu_layers": -1,
     "vision": false
+  },
+  "experimental": {
+    "_note": "Opt-in, default-off AI features. All run fully local (ITAR-safe) and are additive — omit this block for the standard copilot. Also settable in Settings → Experimental. See docs/EXPERIMENTAL_AI.md.",
+    "vision_review": {
+      "enabled": false,
+      "_note": "When enabled, a SEPARATE local OpenAI-compatible vision model (e.g. self-hosted Qwen2.5-VL) judges the rendered viewport in the review/fix stages while the main provider plans + emits ops (the Seek-CAD split). The endpoint must be loopback when offline_mode is true.",
+      "base_url": "http://localhost:1234/v1",
+      "model": "qwen2.5-vl-7b-instruct"
+    },
+    "cad_sequence_mode": false,
+    "_cad_sequence_mode_note": "Nudge the modeler to build an editable parametric feature SEQUENCE (DeepCAD / CAD-Coder-style design history) over a monolithic solid."
   }
 }

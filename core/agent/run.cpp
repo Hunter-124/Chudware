@@ -1,17 +1,20 @@
 // core/agent/run.cpp — see run.h. Mirrors agent/orchestrator/run.py (P53b).
 #include "agent/run.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <optional>
 #include <regex>
+#include <set>
 #include <sstream>
 
 #include "agent/config.h"
 #include "agent/events.h"
 #include "agent/machine.h"
+#include "agent/mission.h"
 #include "agent/ops_emit.h"
 #include "agent/providers.h"
 #include "agent/roles.h"
@@ -36,6 +39,14 @@ constexpr int kEscapeAfter = 4;
 // capable cloud models (a complex part is one modeler call → truncation → parse fail → escape
 // hatch). Capable cloud backends get real headroom; local models stay modest.
 int call_budget_for(const json& provider_cfg) {
+    // Explicit user override (config "max_output_tokens" -> provider.max_tokens) wins. This is the
+    // knob the AI settings expose: raise it when a reasoning model spends its output budget
+    // thinking and returns no/truncated JSON. Clamp to a sane floor so a tiny value can't starve
+    // every stage; no hard ceiling (the user opts into the cost).
+    if (provider_cfg.contains("max_tokens") && provider_cfg["max_tokens"].is_number_integer()) {
+        int mt = provider_cfg["max_tokens"].get<int>();
+        if (mt > 0) return mt < 512 ? 512 : mt;
+    }
     std::string name = provider_cfg.value("name", std::string());
     std::string effort = provider_cfg.value("reasoning_effort", std::string());
     int base = 4096;  // local / unknown
@@ -208,8 +219,10 @@ ProviderFn make_provider(const json& provider_cfg) {
 // _agent_call(provider, state, role): build a FRESH bounded context, prepend the
 // "ROLE: <role>" marker line, call the provider, capture meta. max_tokens = 2048.
 AgentCall agent_call(const ProviderFn& provider, const DesignState& state, const std::string& role,
-                     const std::string& prompts_dir, int max_tokens, bool vision) {
-    BuiltContext bc = build_context(state, role, prompts_dir);
+                     const std::string& prompts_dir, int max_tokens, bool vision,
+                     int context_cap = kContextTokenCap,
+                     const std::string& extra_directive = std::string()) {
+    BuiltContext bc = build_context(state, role, prompts_dir, context_cap);
     std::string system = "ROLE: " + role + "\n" + bc.system;
     auto pr = load_prompt(role, prompts_dir);
     AgentCall ac;
@@ -219,9 +232,14 @@ AgentCall agent_call(const ProviderFn& provider, const DesignState& state, const
     ac.context_tokens_est = bc.context_tokens_est;
     ac.inputs_digest = inputs_digest(state);
 
+    // Experimental: an optional run-scoped directive appended to the user body (empty by default,
+    // so the context + the parity gate are unchanged). Used by cad_sequence_mode to nudge the
+    // modeler toward an editable parametric feature sequence.
+    std::string body = extra_directive.empty() ? bc.body : (bc.body + "\n\n" + extra_directive);
+
     // Vision: when the provider supports images and a render of the current model exists,
     // attach it so the model can SEE the geometry (reviewer/fixer self-correction).
-    json parts = json::array({text_part(bc.body)});
+    json parts = json::array({text_part(body)});
     if (vision && state.last_render.is_string() && !state.last_render.get<std::string>().empty())
         parts.push_back(image_part(state.last_render.get<std::string>()));
     json messages = json::array({user_message(parts)});
@@ -290,10 +308,45 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // ONE provider instance for the whole run (per-role scripted queues must persist).
     ProviderFn provider = make_provider(provider_cfg);
-    // Output-token budget per call, scaled to the provider + reasoning effort.
-    const int call_budget = call_budget_for(provider_cfg);
+    // Output-token budget + INPUT context cap, jointly fitted to the model's context window so a
+    // small local window is never overrun (which would truncate the prompt and break the chain).
+    const CallBudget budget = fit_call_budget(provider_cfg, call_budget_for(provider_cfg));
+    const int call_budget = budget.output;
+    const int ctx_cap = budget.input_cap;
     // Whether the provider can receive screenshots (drives vision review/fix).
     const bool vision = provider_cfg.value("supports_vision", false);
+
+    // Experimental: a SEPARATE provider for the vision review + fix stages (Seek-CAD split — a
+    // strong/cloud planner emits ops while a local vision judge sees the render and self-corrects;
+    // also enables an all-local ITAR review loop). Absent -> identical to the main provider, so the
+    // behavior and the Python-parity gate are unchanged.
+    ProviderFn review_provider = provider;
+    bool review_vision = vision;
+    int review_budget = call_budget;
+    int review_ctx_cap = ctx_cap;
+    if (provider_cfg.contains("review_provider") && provider_cfg["review_provider"].is_object()) {
+        const json& rpc = provider_cfg["review_provider"];
+        review_provider = make_provider(rpc);
+        review_vision = rpc.value("supports_vision", false);
+        const CallBudget rb = fit_call_budget(rpc, call_budget_for(rpc));
+        review_budget = rb.output;
+        review_ctx_cap = rb.input_cap;
+        events.emit("run_note",
+                    json{{"note", "experimental: separate vision-review provider"},
+                         {"review_provider", rpc.value("name", std::string())},
+                         {"review_model", rpc.value("model", std::string())}});
+    }
+
+    // Experimental: modeler prompt augmentation toward an editable parametric feature SEQUENCE
+    // (DeepCAD/CAD-Coder-style design history) rather than a monolithic solid. Empty when off.
+    const std::string cad_seq_directive =
+        provider_cfg.value("cad_sequence_mode", false)
+            ? std::string(
+                  "[experimental: parametric sequence mode] Build the part as a minimal, ORDERED "
+                  "sequence of individually editable features (sketch -> extrude/revolve/loft/sweep, "
+                  "then fillet/chamfer/hole/pattern/mirror) that reconstructs a clean design history. "
+                  "Avoid a single fused/imported solid; each feature must stay separately editable.")
+            : std::string();
 
     // Seed the DesignState from the live session: doc_tree(doc_id) gives {revision, tree}.
     json tree0 = doc::doc_tree(doc_id);
@@ -335,11 +388,21 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // ---- INTAKE ----
     actions.intake = [&](DesignState& st, int) -> StageOutcome {
-        AgentCall ac = agent_call(provider, st, "intake", prompts_dir, call_budget, vision);
+        AgentCall ac = agent_call(provider, st, "intake", prompts_dir, call_budget, vision, ctx_cap);
         ojson spec = extract_json_obj(ac.reply);
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;
+        if (ac.has_call_error) {
+            o.verdict = "retry";
+            o.reason = "provider error: " + ac.call_error;
+            o.parsed_ok = false;
+            o.has_parse_error = true;
+            o.parse_error = ac.call_error;
+            o.has_error = true;
+            o.error = "intake: " + ac.call_error;
+            return o;
+        }
         if (!spec.is_null()) {
             st.spec = spec;
             o.verdict = "pass";
@@ -359,11 +422,21 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // ---- PLAN ----
     actions.plan = [&](DesignState& st, int) -> StageOutcome {
-        AgentCall ac = agent_call(provider, st, "planner", prompts_dir, call_budget, vision);
+        AgentCall ac = agent_call(provider, st, "planner", prompts_dir, call_budget, vision, ctx_cap);
         ojson p = extract_json_obj(ac.reply);
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;
+        if (ac.has_call_error) {
+            o.verdict = "retry";
+            o.reason = "provider error: " + ac.call_error;
+            o.parsed_ok = false;
+            o.has_parse_error = true;
+            o.parse_error = ac.call_error;
+            o.has_error = true;
+            o.error = "plan: " + ac.call_error;
+            return o;
+        }
         bool ok = !p.is_null() && p.contains("parts") && p["parts"].is_array() &&
                   !p["parts"].empty();
         if (ok) {
@@ -396,7 +469,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
             appended = (a == std::string::npos) ? "" : appended.substr(a, b - a + 1);
         }
         st.current_step = appended;
-        AgentCall ac = agent_call(provider, st, "modeler", prompts_dir, call_budget, vision);
+        AgentCall ac = agent_call(provider, st, "modeler", prompts_dir, call_budget, vision, ctx_cap);
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;
@@ -441,10 +514,20 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     actions.model = [&](DesignState& st, int attempt) -> StageOutcome {
         st.last_no_progress = false;
         if (attempt > kEscapeAfter) return model_escape(st);
-        AgentCall ac = agent_call(provider, st, "modeler", prompts_dir, call_budget, vision);
+        AgentCall ac = agent_call(provider, st, "modeler", prompts_dir, call_budget, vision, ctx_cap,
+                                  cad_seq_directive);
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;
+        if (ac.has_call_error) {
+            // The provider itself failed (HTTP error, empty/truncated completion). Report the
+            // real cause so the run doesn't masquerade it as a "no JSON ops" parse failure.
+            o.verdict = "retry";
+            o.reason = "provider error: " + ac.call_error;
+            o.has_error = true;
+            o.error = "model: " + ac.call_error;
+            return o;
+        }
         OpsResult ores = extract_ops(ac.reply);
         if (!ores.ops) {
             std::string perr = ores.error.value_or("");
@@ -495,13 +578,13 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         // Vision review: rasterize the current revision so a vision-capable model can SEE its
         // model and self-correct (fail-soft — text-only review if the render is unavailable).
         st.last_render = nullptr;
-        if (vision) {
+        if (review_vision) {
             std::filesystem::path png =
                 run_dir(run_id) / ("review_r" + std::to_string(st.revision) + ".png");
             json rr = doc::doc_render_png(doc_id, png.string());
             if (rr.value("ok", false)) st.last_render = png.string();
         }
-        BuiltContext bc = build_context(st, "reviewer", prompts_dir);
+        BuiltContext bc = build_context(st, "reviewer", prompts_dir, review_ctx_cap);
         auto pr = load_prompt("reviewer", prompts_dir);
         StageOutcome o;
         o.prompt_file = pr.second;
@@ -511,14 +594,14 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         o.context_tokens_est = bc.context_tokens_est;
         o.inputs_digest = inputs_digest(st);
         json review_parts = json::array({text_part(bc.body)});
-        if (vision && st.last_render.is_string() && !st.last_render.get<std::string>().empty())
+        if (review_vision && st.last_render.is_string() && !st.last_render.get<std::string>().empty())
             review_parts.push_back(image_part(st.last_render.get<std::string>()));
         json messages = json::array({user_message(review_parts)});
         // run.py review() does NOT prepend "ROLE:" — it passes the bare build_context
         // system. The RoleScriptedProvider sniffs "you are the reviewer" from the prompt's
         // first line, so routing is correct without the marker (matching Python byte-for-byte).
         auto t0 = std::chrono::steady_clock::now();
-        ProvReply rep = provider(bc.system, messages, call_budget);  // provider/effort-scaled budget
+        ProvReply rep = review_provider(bc.system, messages, review_budget);  // review-scaled budget
         auto t1 = std::chrono::steady_clock::now();
         o.duration_ms = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
@@ -556,7 +639,8 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // ---- FIX ----
     actions.fix = [&](DesignState& st, int) -> StageOutcome {
-        AgentCall ac = agent_call(provider, st, "fixer", prompts_dir, call_budget, vision);
+        AgentCall ac = agent_call(review_provider, st, "fixer", prompts_dir, review_budget,
+                                  review_vision, review_ctx_cap);
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;
@@ -623,7 +707,7 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // ---- MEMORY ----
     actions.memory = [&](DesignState& st, int) -> StageOutcome {
-        AgentCall ac = agent_call(provider, st, "memory", prompts_dir, call_budget, vision);
+        AgentCall ac = agent_call(provider, st, "memory", prompts_dir, call_budget, vision, ctx_cap);
         StageOutcome o;
         fill_meta(o, ac);
         o.raw = ac.reply;
@@ -738,16 +822,18 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
     // 1) Plan the request to learn the parts + whether it's an assembly. One intake + one planner
     //    call (cheap relative to a full build); the per-part run_design re-plans its own part.
     ProviderFn provider = make_provider(provider_cfg);
-    const int budget = call_budget_for(provider_cfg);
+    const CallBudget cb = fit_call_budget(provider_cfg, call_budget_for(provider_cfg));
+    const int budget = cb.output;
+    const int ctx_cap = cb.input_cap;
     DesignState pstate;
     pstate.request = request;
     pstate.doc_id = doc_id;
     {
-        AgentCall ia = agent_call(provider, pstate, "intake", prompts_dir, budget, false);
+        AgentCall ia = agent_call(provider, pstate, "intake", prompts_dir, budget, false, ctx_cap);
         ojson spec = extract_json_obj(ia.reply);
         if (!spec.is_null()) pstate.spec = spec;
     }
-    AgentCall pa = agent_call(provider, pstate, "planner", prompts_dir, budget, false);
+    AgentCall pa = agent_call(provider, pstate, "planner", prompts_dir, budget, false, ctx_cap);
     ojson plan = extract_json_obj(pa.reply);
     bool want_asm = !plan.is_null() && plan.is_object() && truthy_json(plan.value("assembly", ojson(false)));
     ojson parts = (!plan.is_null() && plan.is_object() && plan.contains("parts") &&
@@ -914,6 +1000,257 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
                 {"revision", asm_rev}, {"doc_id", asm_id}, {"created_doc", true},
                 {"assembly", true}, {"asm_path", asm_path},
                 {"components", static_cast<int>(saved.size())}};
+}
+
+// ============================================================================ mission
+// The closed set of capabilities the mission planner may emit. design/assembly both map
+// to run_assembly_design (it auto-detects assembly from its own planner); the rest map to
+// the noted backends. Anything outside this set is skipped (forward-compatible).
+namespace {
+
+// One human + deterministic line per flow result, plus a qualitative read. Kept honest:
+// the LBM grid is coarse (the result string itself says "directional estimate"), so the
+// verdict reports the L/D ratio and flags clearly-bad signs rather than over-claiming.
+std::string deterministic_verdict(const ojson& sim_results) {
+    if (!sim_results.is_array() || sim_results.empty())
+        return "No simulation was run, so there is nothing to judge yet.";
+    std::ostringstream os;
+    int n = 0;
+    for (const auto& sr : sim_results) {
+        if (!sr.is_object() || !truthy_json(sr.value("ok", ojson(false)))) {
+            os << "- A flow run did not produce usable forces"
+               << (sr.contains("answer") ? (": " + sr.value("answer", std::string())) : ".")
+               << "\n";
+            continue;
+        }
+        double drag = sr.value("drag_n", 0.0);
+        double lift = sr.value("lift_n", 0.0);
+        double cd = sr.value("cd", 0.0);
+        double v = sr.value("velocity_ms", 0.0);
+        double aoa = sr.value("aoa_deg", 0.0);
+        double ld = lift / std::max(std::fabs(drag), 1e-9);
+        std::ostringstream line;
+        line.precision(2);
+        line << std::fixed;
+        line << "- At " << v << " m/s, " << aoa << " deg AoA: lift " << lift << " N, drag "
+             << drag << " N (Cd " << cd << "), lift-to-drag ratio " << ld << ". ";
+        if (lift <= 0.0)
+            line << "Lift is non-positive — this orientation does not generate useful lift; "
+                    "check the angle of attack or the wing.";
+        else if (ld >= 10.0)
+            line << "That is an efficient L/D for a model aircraft — the design looks "
+                    "aerodynamically sound.";
+        else if (ld >= 4.0)
+            line << "That is a workable L/D — the design flies, with room to cut drag.";
+        else
+            line << "That L/D is low — the shape is draggy for the lift it makes; consider a "
+                    "cleaner profile or higher aspect ratio.";
+        os << line.str() << "\n";
+        ++n;
+    }
+    if (n == 0) os << "No flow run produced usable forces.\n";
+    os << "\n(LBM is a coarse, directional estimate — trust the trend and the L/D, not the "
+          "absolute drag to three digits.)";
+    return os.str();
+}
+
+// Build the verdict text: deterministic baseline always, then (best-effort) an LLM reporter
+// pass layered on top. Falls back to the deterministic text when offline or on any error.
+std::string build_verdict(const ProviderFn& provider, const std::string& prompts_dir, int budget,
+                          int ctx_cap, const std::string& mission_request,
+                          const std::string& design_summary, const ojson& sim_results) {
+    std::string deterministic = deterministic_verdict(sim_results);
+    // Compose the reporter's context into the request field (build_context surfaces request).
+    DesignState rstate;
+    rstate.request = "Mission: " + mission_request + "\n\nWhat was built:\n" +
+                     (design_summary.empty() ? "(model summary unavailable)" : design_summary) +
+                     "\n\nMeasured results:\n" + deterministic;
+    AgentCall ra = agent_call(provider, rstate, "reporter", prompts_dir, budget, false, ctx_cap);
+    if (ra.has_call_error || ra.reply.empty()) return deterministic;
+    // Trim whitespace.
+    size_t a = ra.reply.find_first_not_of(" \t\r\n");
+    size_t b = ra.reply.find_last_not_of(" \t\r\n");
+    if (a == std::string::npos) return deterministic;
+    return ra.reply.substr(a, b - a + 1);
+}
+
+// A compact digest of the doc's feature tree, for the reporter's "what was built" context.
+std::string doc_design_summary(const std::string& doc_id) {
+    try {
+        json t = doc::doc_tree(doc_id);
+        if (t.is_object() && t.contains("tree"))
+            return digest_tree(tree_to_ojson(t["tree"]), 20);
+    } catch (...) {
+    }
+    return "";
+}
+
+}  // namespace
+
+json run_mission(const std::string& request, const std::string& doc_id, const json& provider_cfg,
+                 EmitFn emit, SimFn sim, const json& options) {
+    std::string prompts_dir = options.value("prompts_dir", std::string());
+    std::string run_id = options.value("run_id", std::string());
+    if (run_id.empty())
+        run_id = "mission-" + std::to_string(static_cast<unsigned long long>(
+                                  std::chrono::steady_clock::now().time_since_epoch().count()));
+
+    ProviderFn provider = make_provider(provider_cfg);
+    const CallBudget cb = fit_call_budget(provider_cfg, call_budget_for(provider_cfg));
+    const int budget = cb.output;
+    const int ctx_cap = cb.input_cap;
+    RunEvents events(run_id, emit);
+
+    // 1) Decompose the request into an ordered task list (one mission_planner call). On any
+    //    parse failure / offline provider this degrades to a single design task, so a plain
+    //    "make a bracket" still builds exactly as before.
+    DesignState mstate;
+    mstate.request = request;
+    mstate.doc_id = doc_id;
+    AgentCall ma =
+        agent_call(provider, mstate, "mission_planner", prompts_dir, budget, false, ctx_cap);
+    ojson plan = extract_json_obj(ma.reply);
+
+    struct Task {
+        std::string capability, title, req, target;
+    };
+    static const std::set<std::string> kCaps = {"design",       "assembly", "simulate_flow",
+                                                "simulate_fea", "drawing",  "evaluate",
+                                                "report"};
+    std::vector<Task> tasks;
+    if (!plan.is_null() && plan.is_object() && plan.contains("tasks") && plan["tasks"].is_array()) {
+        for (const auto& t : plan["tasks"]) {
+            if (!t.is_object()) continue;
+            Task tk;
+            tk.capability = t.value("capability", std::string());
+            tk.title = t.value("title", std::string());
+            tk.req = t.value("request", std::string());
+            tk.target = t.value("target", std::string("previous"));
+            if (tk.capability.empty()) continue;
+            if (tk.req.empty()) tk.req = request;  // defensive: hand the modeler something
+            tasks.push_back(std::move(tk));
+            if (tasks.size() >= 8) break;  // hard cap (planner is asked for <=6)
+        }
+    }
+    if (tasks.empty())
+        tasks.push_back(Task{"design", "Build the model", request, "active"});
+
+    json task_list = json::array();
+    for (const auto& tk : tasks)
+        task_list.push_back(json{{"capability", tk.capability}, {"title", tk.title}});
+    events.emit("mission_started", json{{"request", request},
+                                        {"task_count", static_cast<int>(tasks.size())},
+                                        {"tasks", task_list}});
+
+    // 2) Execute tasks in order, threading the working document forward.
+    std::string current_doc = doc_id;  // "previous" target resolves to this
+    std::string final_doc = doc_id;
+    bool created_doc = false;
+    std::string asm_path;
+    int components = 0;
+    int revision = 0;
+    bool any_built = false;  // geometry was produced (drives stop_reason + tab-open)
+    bool any_ok = false;     // any task completed (drives the mission's done/failed status)
+    bool reported = false;
+    ojson sim_results = ojson::array();
+    std::string design_summary;
+    std::string verdict;
+    json task_results = json::array();
+
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        const Task& tk = tasks[i];
+        std::string target_doc = (tk.target == "active") ? doc_id : current_doc;
+        events.emit("mission_task_started",
+                    json{{"index", static_cast<int>(i)},
+                         {"total", static_cast<int>(tasks.size())},
+                         {"capability", tk.capability},
+                         {"title", tk.title},
+                         {"doc_id", target_doc}});
+
+        std::string status = "skipped";
+        std::string summary;
+
+        if (!kCaps.count(tk.capability)) {
+            summary = "unknown capability '" + tk.capability + "'";
+        } else if (tk.capability == "design" || tk.capability == "assembly") {
+            json sub_opts = options;
+            sub_opts["run_id"] = run_id + "-t" + std::to_string(i);
+            json rr = run_assembly_design(tk.req, target_doc, provider_cfg, emit, sub_opts);
+            status = rr.value("status", std::string("done"));
+            summary = rr.value("stop_reason", std::string());
+            if (truthy_json(ojson(rr.value("created_doc", false)))) {
+                current_doc = rr.value("doc_id", current_doc);
+                created_doc = true;
+                asm_path = rr.value("asm_path", asm_path);
+                components = rr.value("components", components);
+            } else {
+                current_doc = target_doc;  // design mutated the target doc in place
+            }
+            final_doc = current_doc;
+            revision = rr.value("revision", revision);
+            if (status == "done") {
+                any_built = true;
+                design_summary = doc_design_summary(current_doc);
+            }
+        } else if (tk.capability == "simulate_flow") {
+            if (sim) {
+                json sr = sim(current_doc, tk.req, json::object());
+                sim_results.push_back(tree_to_ojson(sr));
+                bool ok = sr.value("ok", false);
+                status = ok ? "done" : "failed";
+                summary = sr.value("answer", std::string());
+            } else {
+                summary = "no flow-sim backend wired";
+            }
+        } else if (tk.capability == "report") {
+            verdict = build_verdict(provider, prompts_dir, budget, ctx_cap, request, design_summary,
+                                    sim_results);
+            reported = true;
+            status = "done";
+            summary = verdict;
+        } else {
+            // simulate_fea / drawing / evaluate — recognized but not yet executed here.
+            summary = "capability '" + tk.capability + "' is not yet wired into missions";
+        }
+
+        if (status == "done") any_ok = true;
+        events.emit("mission_task_result", json{{"index", static_cast<int>(i)},
+                                                 {"capability", tk.capability},
+                                                 {"status", status},
+                                                 {"doc_id", current_doc},
+                                                 {"summary", summary}});
+        task_results.push_back(json{{"capability", tk.capability},
+                                    {"title", tk.title},
+                                    {"status", status},
+                                    {"doc_id", current_doc},
+                                    {"summary", summary}});
+    }
+
+    // If the mission ran a sim but the planner forgot an explicit report task, still produce a
+    // verdict — that is the whole point of "prove it's a good design".
+    if (!reported && sim_results.is_array() && !sim_results.empty())
+        verdict = build_verdict(provider, prompts_dir, budget, ctx_cap, request, design_summary,
+                                sim_results);
+
+    std::string stop_reason = any_built ? (created_doc ? "assembled" : "built")
+                                        : (any_ok ? "done" : "planned");
+    std::string status = any_ok ? "done" : "failed";
+    events.emit("mission_finished", json{{"status", status},
+                                          {"stop_reason", stop_reason},
+                                          {"doc_id", final_doc},
+                                          {"verdict", verdict}});
+
+    json result = json{{"run_id", run_id},     {"status", status},
+                       {"stop_reason", stop_reason}, {"doc_id", final_doc},
+                       {"revision", revision},  {"verdict", verdict},
+                       {"tasks", task_results}};
+    if (created_doc) {
+        result["created_doc"] = true;
+        result["assembly"] = true;
+        if (!asm_path.empty()) result["asm_path"] = asm_path;
+        result["components"] = components;
+    }
+    return result;
 }
 
 }  // namespace agent

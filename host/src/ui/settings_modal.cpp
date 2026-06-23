@@ -17,6 +17,7 @@
 #include "../core/cpp_core.h"
 #include "../renderer.h"
 #include "legacy_chat.h"  // ui::drawProviderModelPicker (shared with the inline AI tab)
+#include "model_registry.h"  // ui::localPresets (experimental vision-review model presets)
 
 // ---- C22b prompt editor state ----
 // Per-role editor buffer and metadata, lazily loaded from get_prompts_v2.
@@ -406,6 +407,75 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ImGui::SameLine();
                 if (ImGui::Button("Clear (use built-in)"))
                     std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
+                ImGui::EndTabItem();
+            }
+
+            // ---- Experimental tab: research-backed opt-in AI features ----
+            if (ImGui::BeginTabItem("Experimental")) {
+                ImGui::Dummy(ImVec2(0, 2 * sc));
+                dimText("Opt-in, default-off features from the model/provider research. All run "
+                        "fully local (ITAR-safe) and are additive — off = the standard copilot.");
+
+                // --- Separate vision-review provider (the Seek-CAD split) ---
+                ImGui::Dummy(ImVec2(0, 4 * sc));
+                ImGui::SeparatorText("Local vision review (Seek-CAD split)");
+                bool vrChanged = ImGui::Checkbox("Use a separate local model to review renders",
+                                                 &settings.expVisionReview);
+                helpMarker("When on, a LOCAL OpenAI-compatible vision model (e.g. a self-hosted "
+                           "Qwen2.5-VL) judges the rendered viewport during the review/fix stages, "
+                           "while your main provider plans and emits the CAD ops. This lets you pair "
+                           "a strong/cloud planner with a local vision judge — or keep the whole "
+                           "self-correction loop local for ITAR. The endpoint must be reachable and "
+                           "the model must support images.");
+                dimText("Main provider emits ops; this model sees the screenshot and drives fixes.");
+                if (settings.expVisionReview) {
+                    ImGui::Dummy(ImVec2(0, 2 * sc));
+                    ImGui::TextUnformatted("Vision model preset");
+                    // Only the vision-capable presets make sense as a review judge.
+                    std::vector<const char*> vlabels;
+                    std::vector<const std::string*> vids;
+                    vlabels.push_back("(custom / type below)");
+                    vids.push_back(nullptr);
+                    for (const auto& p : ui::localPresets())
+                        if (p.vision) { vlabels.push_back(p.label.c_str()); vids.push_back(&p.id); }
+                    int vsel = 0;
+                    for (int i = 1; i < (int)vids.size(); ++i)
+                        if (vids[i] && *vids[i] == settings.expVisionModel) vsel = i;
+                    ImGui::SetNextItemWidth(-1);
+                    if (ImGui::Combo("##expvispreset", &vsel, vlabels.data(), (int)vlabels.size()) &&
+                        vsel > 0 && vids[vsel]) {
+                        std::strncpy(settings.expVisionModel, vids[vsel]->c_str(),
+                                     sizeof(settings.expVisionModel) - 1);
+                    }
+                    ImGui::TextUnformatted("Model id");
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputText("##expvismodel", settings.expVisionModel,
+                                     sizeof(settings.expVisionModel));
+                    ImGui::TextUnformatted("Endpoint (base URL)");
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputText("##expvisbase", settings.expVisionBaseUrl,
+                                     sizeof(settings.expVisionBaseUrl));
+                    helpMarker("Your local OpenAI-compatible server (LM Studio / Ollama / vLLM). "
+                               "Must be a loopback address when Offline mode is on.");
+                }
+                (void)vrChanged;
+
+                // --- Parametric sequence mode (DeepCAD / CAD-Coder direction) ---
+                ImGui::Dummy(ImVec2(0, 8 * sc));
+                ImGui::SeparatorText("Parametric sequence mode (experimental)");
+                ImGui::Checkbox("Prefer an editable feature sequence over a monolithic solid",
+                                &settings.expCadSequenceMode);
+                helpMarker("Nudges the modeler to build the part as an ordered sequence of "
+                           "individually editable features (sketch → extrude/revolve/loft/sweep → "
+                           "fillet/chamfer/hole/pattern) that reconstructs a clean design history, "
+                           "rather than one fused solid — inspired by the DeepCAD / CAD-Coder "
+                           "command-sequence research. Prompt-level steering today; a dedicated "
+                           "sequence-generation model is future work (see docs/EXPERIMENTAL_AI.md).");
+                dimText("Keeps generated parts editable as a real feature tree, not a dead solid.");
+
+                ImGui::Dummy(ImVec2(0, 8 * sc));
+                dimText("Saved to %APPDATA%\\AI-CAD\\config.json under \"experimental\". "
+                        "Open-weight model presets for your main provider live under AI → Local.");
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();

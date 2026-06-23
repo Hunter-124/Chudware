@@ -162,6 +162,7 @@ static const RibbonCmd kCmds[] = {
 
     // --- Group: Components ---
     { "asm_insert",        "Insert Comp.",   "insert_component", "Assembly", "Components",      true,  nullptr,          false },
+    { "asm_parts_library", "Std. Parts",     "insert_component", "Assembly", "Components",      true,  nullptr,          false },
     { "asm_move",          "Move Comp.",     "move_component",   "Assembly", "Components",      true,  nullptr,          false },
     { "asm_pattern",       "Comp. Pattern",  "pattern_component","Assembly", "Components",      true,  nullptr,          false },
 

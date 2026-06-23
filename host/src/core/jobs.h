@@ -19,3 +19,11 @@ void launchJob(WorkerClient& w, JobState& job, int kind, std::string payload, bo
 // main-thread drain can route them to the ActivityPanel separately from legacy events.
 void launchAgentRunV2(WorkerClient& w, JobState& job,
                       const std::string& request, const std::string& docId);
+
+// --- Mission orchestrator launcher ---
+// Runs agent_mission_v1 on a background thread: the core decomposes the request into an ordered
+// capability chain (design/assembly -> CFD -> verdict), threads the working doc forward, and
+// returns {..., verdict, tasks, created_doc?, asm_path?}. Streams the same "orch_"-prefixed events
+// as launchAgentRunV2 (plus mission_* kinds) and stashes the verdict into job.missionVerdict.
+void launchMissionRun(WorkerClient& w, JobState& job,
+                      const std::string& request, const std::string& docId);

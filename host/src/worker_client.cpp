@@ -48,6 +48,10 @@ bool isMintingMethod(const std::string& method, const json& params) {
 }
 bool routeDocToCpp(const std::string& method, const json& params) {
     if (method == "doc_compile_cpp" || method == "doc_validate") return false;  // diagnostics
+    // The parametric standard-parts catalog lives ONLY in the C++ core: parts_catalog_list
+    // is doc-independent (family/size listing); parts_make mints a NEW doc-cpp part from the
+    // generator. There is no Python equivalent, so always route to the core.
+    if (method == "parts_catalog_list" || method == "parts_make") return true;
     // Agent RPCs are owned by the AGENT seam (routeAgentToCpp), which translates the host
     // names (agent_run_v2 -> agent_run, get_prompts_v2 -> agent_get_prompts_v2). They also
     // carry the active doc's doc_id, so without this guard the doc seam below would greedily
@@ -146,7 +150,8 @@ bool routeAgentToCpp(const std::string& method, const json& params) {
     if (!cppAgentFlag()) return false;
     if (!(method == "agent_run_v2" || method == "agent_ask_v2" ||
           method == "agent_clarify_v1" || method == "agent_pm_assist_v1" ||
-          method == "agent_simulate_v1" || method == "get_prompts_v2"))
+          method == "agent_simulate_v1" || method == "agent_mission_v1" ||
+          method == "get_prompts_v2"))
         return false;  // agent_design (legacy) + everything else stays Python
     if (!agentDocIsCpp(method, params)) return false;  // only C++-backed docs (or doc-indep)
     // Ensure the core DLL is loadable before committing to the C++ path. ensureLoaded is
@@ -418,6 +423,28 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
             ok = core::cpp_core().call("agent_run", p, cppResult, cerr);
             // Replay captured events through onEvent so the Copilot/Activity pane updates.
             // (Batched after the run for this opt-in v1 — live streaming is a later step.)
+            if (ok && onEvent && cppResult.is_object() && cppResult.contains("events") &&
+                cppResult["events"].is_array()) {
+                for (const auto& ev : cppResult["events"]) onEvent(ev);
+            }
+        } else if (method == "agent_mission_v1") {
+            // {request, doc_id, ...} -> agent_mission_v1 {request, doc_id, options}. The core
+            // decomposes the request into a task chain (design -> CFD -> verdict), threads the
+            // working doc forward, and returns {..., verdict, tasks, created_doc?, asm_path?}.
+            json p = {{"request", params.value("request", std::string())},
+                      {"doc_id", params.value("doc_id", std::string())}};
+            json options = json::object();
+            for (const char* k : {"options", "budgets", "run_id", "control"}) {
+                auto it = params.find(k);
+                if (it != params.end()) {
+                    if (std::string(k) == "options" && it->is_object()) options = *it;
+                    else options[k] = *it;
+                }
+            }
+            if (!options.empty()) p["options"] = options;
+            ok = core::cpp_core().call("agent_mission_v1", p, cppResult, cerr);
+            // Replay captured events (mission_* + sub-run stage events) — batched after the run
+            // for this opt-in v1, exactly like agent_run_v2.
             if (ok && onEvent && cppResult.is_object() && cppResult.contains("events") &&
                 cppResult["events"].is_array()) {
                 for (const auto& ev : cppResult["events"]) onEvent(ev);

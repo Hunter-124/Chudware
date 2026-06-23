@@ -26,6 +26,7 @@ void launchJob(WorkerClient& w, JobState& job, int kind, std::string payload, bo
         job.errorIsCad = false;
         job.isAssembly = false; job.parts.clear(); job.fit = FitReport{};
         job.converged = true; job.stopReason.clear();
+        job.isMission = false; job.missionVerdict.clear();
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
     std::thread([&w, &job, kind, payload, reset, plan]() {
@@ -124,6 +125,7 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
         job.error.clear(); job.stl.clear(); job.info.clear();
         job.errorIsCad = false;
         job.converged = true; job.stopReason.clear();
+        job.isMission = false; job.missionVerdict.clear();
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
 
@@ -180,6 +182,68 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
                 job.drawingName = result.value("drawing_name", std::string());
                 job.drawingSourceId = result.value("source_doc_id", std::string());
             }
+        }
+        job.ready = true;
+        job.running = false;
+    }).detach();
+}
+
+// --- Mission orchestrator launcher (see jobs.h) ---
+// A near-clone of launchAgentRunV2: same background thread + "orch_"-prefixed event streaming,
+// but calls agent_mission_v1 and captures the verdict + any assembly tab to open. The mission
+// emits mission_* events (in addition to each sub-run's stage events) — the drain renders them.
+void launchMissionRun(WorkerClient& w, JobState& job,
+                      const std::string& request, const std::string& docId) {
+    if (job.running.exchange(true)) return;
+    job.ready = false;
+    job.kind = JOB_DESIGN;
+    {
+        std::lock_guard<std::mutex> lk(job.mtx);
+        job.error.clear(); job.stl.clear(); job.info.clear();
+        job.errorIsCad = false;
+        job.converged = true; job.stopReason.clear();
+        job.createdDocPath.clear();
+        job.isMission = true; job.missionVerdict.clear();
+    }
+    { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
+
+    std::thread([&w, &job, request, docId]() {
+        nlohmann::json result;
+        std::string err;
+
+        WorkerClient::EventFn onEvent = [&job](const nlohmann::json& d) {
+            AgentEvent e;
+            std::string origKind = jstr(d, "kind");
+            e.kind = "orch_" + origKind;
+            e.text = d.dump();  // full event JSON for the panel/timeline to parse
+            std::string stage = jstr(d, "stage");
+            std::string role  = jstr(d, "role");
+            if (origKind == "stage_started")
+                e.notes = stage + " > " + role + " attempt " +
+                          std::to_string(jint(d, "attempt") + 1) + "...";
+            else if (origKind == "mission_task_started")
+                e.notes = jstr(d, "title");
+            else if (origKind == "run_finished" || origKind == "mission_finished")
+                e.notes = "run " + jstr(d, "status");
+            std::lock_guard<std::mutex> lk(job.evMtx);
+            job.events.push_back(std::move(e));
+        };
+
+        bool ok = w.call("agent_mission_v1",
+                         {{"request", request}, {"doc_id", docId}},
+                         result, err, 900000, onEvent);
+        std::lock_guard<std::mutex> lk(job.mtx);
+        if (!ok) {
+            job.error = err;
+            job.errorIsCad = false;
+        } else {
+            // agent_mission_v1 returns {status, stop_reason, doc_id, verdict, tasks, created_doc?,
+            // asm_path?}. The verdict is the assistant's final reply; createdDocPath opens a tab.
+            job.converged = (result.value("status", "") == "done");
+            job.stopReason = result.value("stop_reason", "");
+            job.missionVerdict = result.value("verdict", std::string());
+            if (result.value("created_doc", false))
+                job.createdDocPath = result.value("asm_path", std::string());
         }
         job.ready = true;
         job.running = false;

@@ -3759,6 +3759,26 @@ bool render_iso_png(const std::vector<aicm::AicmBody>& bodies, const std::string
 // Tessellate the surviving solids of `s` into AICM bodies (no lock — callers hold g_mtx).
 static std::vector<aicm::AicmBody> tessellate_session_bodies(Session& s) {
     std::vector<aicm::AicmBody> bodies;
+    // Assembly docs resolve their geometry through compile_assembly (loaded components +
+    // solved mate poses), NOT compile_document — so tessellate the world-placed component
+    // bodies off the cached AssemblyResult. Without this branch every assembly tessellates
+    // to nothing (compile_document sees no features), which broke CFD/render on assemblies.
+    // No explode offset here: consumers (CFD, iso render) want the assembled configuration.
+    if (s.is_assembly()) {
+        if (!s.asm_result) rebuild_assembly(s);
+        const AssemblyResult* ares = s.asm_result.get();
+        if (ares)
+            for (const AsmBodyOut& body : ares->bodies) {
+                try {
+                    TopoDS_Shape world = placed_world_shape(body, std::nullopt);
+                    float color[3] = {body.color[0], body.color[1], body.color[2]};
+                    bodies.push_back(::geom::tessellate_body(
+                        world, static_cast<uint32_t>(body.body_id), body.name, color));
+                } catch (...) {
+                }
+            }
+        return bodies;
+    }
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     uint32_t id = 1;
     const float color[3] = {0.62f, 0.70f, 0.82f};

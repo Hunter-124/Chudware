@@ -292,8 +292,9 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             if (ImGui::MenuItem("Hole Wizard", nullptr, false, hasDoc)) st.ribbonDispatch("hole_wizard");
             ImGui::Separator();
             if (ImGui::BeginMenu("Assembly")) {
-                if (ImGui::MenuItem("Insert Component")) st.ribbonDispatch("asm_insert");
-                if (ImGui::MenuItem("Mate"))             st.ribbonDispatch("asm_mate");
+                if (ImGui::MenuItem("Insert Component"))       st.ribbonDispatch("asm_insert");
+                if (ImGui::MenuItem("Standard Parts Library")) st.ribbonDispatch("asm_parts_library");
+                if (ImGui::MenuItem("Mate"))                   st.ribbonDispatch("asm_mate");
                 ImGui::EndMenu();
             }
         };

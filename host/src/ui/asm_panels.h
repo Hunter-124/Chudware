@@ -88,6 +88,11 @@ private:
     void beginMateForm();
     void beginPatternForm();
     void drawInsert(AppState& st);
+    void drawPartsLibrary(AppState& st);
+    // Generate a catalog part (parts_make) and insert it into the active assembly. Returns the
+    // solved aicm path in aicmOut. length_mm <= 0 means "use the family default".
+    bool insertCatalogPart(AppState& st, const std::string& family, const std::string& size,
+                           double length_mm, std::string& aicmOut);
     void drawMateForm(AppState& st);
     void drawPatternForm(AppState& st);
     void drawExplode(AppState& st);
@@ -107,6 +112,17 @@ private:
     // ---- Insert ----
     bool insertOpen_ = false, insertFocus_ = false;
     std::vector<char> insertPath_{std::vector<char>(512, 0)};
+
+    // ---- Standard Parts Library (parametric catalog browser) ----
+    bool partsLibOpen_ = false, partsLibFocus_ = false;
+    bool partsCatalogFetched_ = false;          // lazy parts_catalog_list fetch done
+    nlohmann::json partsCatalog_;               // {"families":[...]} from the core
+    std::string partsCatalogError_;             // non-empty if the fetch failed
+    int partsSelFamily_ = -1;                   // index into families (-1 = none)
+    int partsSelSize_ = 0;                       // index into the selected family's sizes
+    std::vector<char> partsLenBuf_{std::vector<char>(32, 0)};  // length (mm) when needs_length
+    std::vector<char> partsFilter_{std::vector<char>(64, 0)};  // family search filter
+    std::string partsNote_;                     // last insert status line
 
     // ---- Mate form (PM-style) ----
     bool mateOpen_ = false, mateFocus_ = false;

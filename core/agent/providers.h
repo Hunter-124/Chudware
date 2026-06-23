@@ -80,6 +80,11 @@ BuiltRequest gemini_build_request(const std::string& model, const std::string& s
                                   const std::string& reasoning_effort);
 ParsedReply gemini_parse_response(const json& resp);
 
+// Condense a provider HTTP-error body into one concise, actionable line for the run timeline
+// (which shows only the last line — a raw JSON body would surface as a useless "}"). A 429 is
+// classified as a hard daily/free-tier quota vs a transient rate-limit and given matching advice.
+std::string concise_http_error(const std::string& provider, int status, const std::string& body);
+
 // --- mock_provider.py -------------------------------------------------------
 // MockProvider: scripted replies in order; the last repeats once exhausted.
 class MockProvider {

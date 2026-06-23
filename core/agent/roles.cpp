@@ -18,11 +18,18 @@ namespace agent {
 
 const std::vector<std::string> kRoles = {
     "intake", "planner", "modeler", "reviewer", "fixer", "memory",
-    "decomposer", "executor"};
+    "decomposer", "executor", "mission_planner", "reporter"};
 
 namespace {
 
 const std::vector<std::string> kOpsRoles = {"modeler", "fixer"};
+
+// Roles that get the full standard-hardware catalog appended (shared/cheatsheets/hardware.md).
+// These are the deciding roles — they choose which off-the-shelf parts to use and what
+// pockets/clearance-holes/counterbores to cut, so they need real dimensions. The ops roles
+// (modeler/fixer) deliberately do NOT get it: they already carry the large ops_cheatsheet and
+// would blow the per-call context cap; they receive the concrete dims through the plan instead.
+const std::vector<std::string> kCatalogRoles = {"planner", "mission_planner"};
 
 // _CHEATSHEET_BY_TYPE map (roles.py).
 std::string cheatsheet_name(const std::string& feature_type) {
@@ -89,8 +96,18 @@ std::string read_cheatsheet_shared(const std::string& prompts_dir) {
     return read_text(builtin_dir(prompts_dir) / "shared" / "ops_cheatsheet.md");
 }
 
+std::string read_hardware_catalog(const std::string& prompts_dir) {
+    return py_strip(read_text(builtin_dir(prompts_dir) / "shared" / "cheatsheets" / "hardware.md"));
+}
+
 bool is_ops_role(const std::string& role) {
     for (const auto& r : kOpsRoles)
+        if (r == role) return true;
+    return false;
+}
+
+bool is_catalog_role(const std::string& role) {
+    for (const auto& r : kCatalogRoles)
         if (r == role) return true;
     return false;
 }
@@ -124,6 +141,12 @@ std::pair<std::string, std::string> load_prompt(const std::string& role,
     if (is_ops_role(role)) {
         std::string cs = read_cheatsheet_shared(prompts_dir);
         if (!cs.empty()) text = py_rstrip(text) + "\n\n---\n" + cs;
+    }
+    if (is_catalog_role(role)) {
+        std::string hw = read_hardware_catalog(prompts_dir);
+        if (!hw.empty())
+            text = py_rstrip(text) + "\n\n---\nSTANDARD HARDWARE CATALOG (use these real "
+                   "dimensions when the request names off-the-shelf parts):\n\n" + hw;
     }
     return {text, source};
 }

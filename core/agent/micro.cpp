@@ -605,7 +605,8 @@ std::string build_decompose_prompt(const std::string& prompts_dir) {
 
 ExecutorPrompt build_executor_prompt(const Step& step, const std::string& doc_summary_in,
                                      const std::string& request, const std::string& error_feedback,
-                                     const std::string& prompts_dir) {
+                                     const std::string& prompts_dir,
+                                     int input_cap = kExecPromptBudgetTokens) {
     auto pr = load_prompt("executor", prompts_dir);
     std::string base_system = pr.first;
     std::string cheat = load_cheatsheet(step.type, prompts_dir);
@@ -641,7 +642,7 @@ ExecutorPrompt build_executor_prompt(const Step& step, const std::string& doc_su
     std::string body = join2(build_parts());
     int sys_tok = est_tokens(system);
     // Budget remediation: truncate doc_summary FIRST until it fits.
-    while (sys_tok + est_tokens(body) > kExecPromptBudgetTokens && !doc_summary.empty()) {
+    while (sys_tok + est_tokens(body) > input_cap && !doc_summary.empty()) {
         // micro.py: doc_summary[:max(40, len(doc_summary)//2)] — len() is code points.
         int cp_len = utf8_len(doc_summary);
         int keep = std::max(40, cp_len / 2);
@@ -774,6 +775,22 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
 
     ProviderFn provider = make_provider(provider_cfg);
 
+    // Per-call output budget: the config "max_output_tokens" override (provider.max_tokens) wins,
+    // else 8192 (reasoning headroom — see the decompose note below). The AI settings expose this
+    // so a user can give a thinking-heavy local model more room when it returns empty content.
+    int desired_out = 8192;
+    if (provider_cfg.contains("max_tokens") && provider_cfg["max_tokens"].is_number_integer()) {
+        int mt = provider_cfg["max_tokens"].get<int>();
+        if (mt > 0) desired_out = mt < 512 ? 512 : mt;
+    }
+    // Fit output + input against the model's context window. On a small LOCAL window the 8192
+    // reasoning budget alone overruns it (8192 out + ~2400 in > 8k), so the server truncates the
+    // prompt and the model emits garbage. fit_call_budget shrinks BOTH so they fit; the executor
+    // prompt is then bounded by the tighter of its own lean cap and the window-derived input cap.
+    const CallBudget mcb = fit_call_budget(provider_cfg, desired_out);
+    int micro_budget = mcb.output;
+    int exec_input_cap = std::min(kExecPromptBudgetTokens, mcb.input_cap);
+
     auto rev_now = [&]() -> int { return doc::doc_tree(doc_id).value("revision", 0); };
 
     events.emit("run_started", json{{"request", request},
@@ -804,7 +821,7 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
     // reasoning_content BEFORE emitting any answer — bigger local models (26B) can burn 4096 on
     // reasoning alone and emit EMPTY content (finish=length) -> "no parseable step list". A larger
     // cap costs nothing on short replies (the model stops early) and lets reasoning+output both fit.
-    CallResult dcall = provider_call(provider, dsys, user_body(dbody), 8192);
+    CallResult dcall = provider_call(provider, dsys, user_body(dbody), micro_budget);
     std::string dsidecar = events.write_sidecar("decompose", 1, dcall.reply);
     std::vector<Step> steps = normalize_steps(extract_json_array(dcall.reply));
 
@@ -863,15 +880,15 @@ json run_micro_design(const std::string& request, const std::string& doc_id,
             LiveDoc cur = read_live(doc_id);
             std::optional<double> vol_cur = total_volume(cur.body_count, cur.volume);
             std::string doc_summary = summarize_doc(cur.tree, vol_cur);
-            ExecutorPrompt ep =
-                build_executor_prompt(step, doc_summary, request, error_feedback, prompts_dir);
+            ExecutorPrompt ep = build_executor_prompt(step, doc_summary, request, error_feedback,
+                                                      prompts_dir, exec_input_cap);
             std::string system = "ROLE: executor\n" + ep.system;
 
             events.emit("agent_call",
                         json{{"stage", "execute"}, {"role", "executor"}, {"attempt", attempt},
                              {"step_index", i},
                              {"context_tokens_est", est_tokens(system) + est_tokens(ep.body)}});
-            CallResult ecall = provider_call(provider, system, user_body(ep.body), 8192);  // reasoning headroom (see decompose)
+            CallResult ecall = provider_call(provider, system, user_body(ep.body), micro_budget);  // reasoning headroom (see decompose)
             std::string sc = events.write_sidecar("execute_" + std::to_string(i), attempt,
                                                   ecall.reply);
             OpsResult ores = extract_ops(ecall.reply);

@@ -295,6 +295,13 @@ BuiltRequest gemini_build_request(const std::string& model, const std::string& s
     int budget = 0;
     if (gemini_thinking_budget(reasoning_effort, &budget)) {
         gen["thinkingConfig"] = json{{"thinkingBudget", budget}};
+        // Gemini 2.5 counts thinking tokens against maxOutputTokens. If the thinking budget
+        // meets or exceeds the output cap, the model spends the whole cap thinking and returns
+        // EMPTY content (finishReason MAX_TOKENS) -> the caller sees "no JSON ops in reply" and
+        // every stage fails. At "medium" (8192) the budget equalled the cap and at "high" (24576)
+        // it dwarfed it. Give the actual answer room ON TOP of the thinking budget: max_tokens is
+        // the intended answer size, so the real cap is thinking + answer.
+        if (budget > 0) gen["maxOutputTokens"] = budget + max_tokens;
     }
     json body = {{"contents", contents}, {"generationConfig", gen}};
     if (!system.empty()) {
@@ -383,8 +390,18 @@ std::string RoleScriptedProvider::complete(const std::string& system) {
 
 // POST with transparent retry on rate-limit / transient overload (HTTP 429/503). Cloud free
 // tiers (esp. Gemini flash) rate-limit, and an agent run fires ~10 calls — without this a single
-// 429 mid-run fails the whole build. Exponential backoff: 1s, 2s, 4s, 8s (4 retries).
+// transient 429 mid-run fails the whole build. Exponential backoff: 1s, 2s, 4s, 8s (4 retries).
 namespace {
+// A HARD daily-quota 429 (vs a transient per-minute rate-limit) won't clear for hours — the quota
+// resets at midnight, not in seconds — so backing off 15s per call just wastes the user's time
+// across the ~10 calls of a run. Detect the per-day / free-tier quota markers and fail fast.
+bool is_daily_quota_exhausted(const HttpResponse& hr) {
+    if (hr.status != 429) return false;
+    const std::string& b = hr.body;
+    return b.find("PerDay") != std::string::npos ||
+           b.find("free_tier") != std::string::npos ||
+           b.find("FreeTier") != std::string::npos;
+}
 HttpResponse http_post_retry(const std::string& url,
                              const std::vector<std::pair<std::string, std::string>>& headers,
                              const std::string& body) {
@@ -392,6 +409,7 @@ HttpResponse http_post_retry(const std::string& url,
     int delay_ms = 1000;
     for (int attempt = 0; attempt < 4 && hr.error.empty() &&
                           (hr.status == 429 || hr.status == 503); ++attempt) {
+        if (is_daily_quota_exhausted(hr)) break;  // retrying won't help today — surface it now
         std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
         delay_ms *= 2;
         hr = http_post(url, headers, body);
@@ -399,6 +417,35 @@ HttpResponse http_post_retry(const std::string& url,
     return hr;
 }
 }  // namespace
+
+// Turn a verbose provider HTTP-error body into one concise, actionable line for the run timeline
+// (which only shows the LAST line — a raw JSON body shows up as a useless "}"). A 429 in particular
+// should tell the user WHAT to do (enable billing / switch to a local model / wait for reset).
+std::string concise_http_error(const std::string& provider, int status, const std::string& body) {
+    if (status == 429) {
+        std::string msg;
+        json j = json::parse(body, nullptr, false);  // best-effort: pull the human message out
+        if (!j.is_discarded() && j.is_object() && j.contains("error") && j["error"].is_object() &&
+            j["error"].contains("message") && j["error"]["message"].is_string())
+            msg = j["error"]["message"].get<std::string>();
+        bool daily = body.find("PerDay") != std::string::npos ||
+                     body.find("free_tier") != std::string::npos ||
+                     body.find("FreeTier") != std::string::npos;
+        std::string head = provider + (daily ? " daily quota exhausted (HTTP 429, free tier)"
+                                              : " rate limit hit (HTTP 429)");
+        std::string tail = daily ? " — enable billing on your API key, switch to a local model, or "
+                                   "try again after the daily quota resets."
+                                 : " — wait a moment and retry, or switch to a local model.";
+        if (!msg.empty()) {
+            // Keep only the first sentence of the provider message; drop the URLs/retry noise.
+            size_t dot = msg.find(". ");
+            if (dot != std::string::npos) msg = msg.substr(0, dot + 1);
+            return head + ": " + msg + tail;
+        }
+        return head + "." + tail;
+    }
+    return provider + " HTTP " + std::to_string(status) + ": " + body;
+}
 
 // --------------------------------------------------------------------------- complete
 CompleteResult complete(const std::string& provider, const json& cfg, const std::string& system,
@@ -428,7 +475,7 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             return res;
         }
         if (hr.status < 200 || hr.status >= 300) {
-            res.error = "anthropic HTTP " + std::to_string(hr.status) + ": " + hr.body;
+            res.error = concise_http_error("anthropic", hr.status, hr.body);
             return res;
         }
         ParsedReply pr = anthropic_parse_response(json::parse(hr.body, nullptr, false));
@@ -451,7 +498,7 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             return res;
         }
         if (hr.status < 200 || hr.status >= 300) {
-            res.error = "openai HTTP " + std::to_string(hr.status) + ": " + hr.body;
+            res.error = concise_http_error("openai", hr.status, hr.body);
             return res;
         }
         json parsed = json::parse(hr.body, nullptr, false);
@@ -480,7 +527,7 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             return res;
         }
         if (hr.status < 200 || hr.status >= 300) {
-            res.error = "gemini HTTP " + std::to_string(hr.status) + ": " + hr.body;
+            res.error = concise_http_error("gemini", hr.status, hr.body);
             return res;
         }
         json parsed = json::parse(hr.body, nullptr, false);
@@ -499,6 +546,17 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
                             (why.empty() ? std::string() : (": " + why));
                 return res;
             }
+            // Candidates exist but carry no answer text — almost always finishReason MAX_TOKENS
+            // with the whole output budget consumed by thinking. Report it as a real error so the
+            // run shows the cause instead of a silent "no JSON ops in reply".
+            std::string fr = parsed["candidates"][0].value("finishReason", std::string());
+            res.error = "gemini: empty completion (finishReason " +
+                        (fr.empty() ? std::string("unknown") : fr) + ")" +
+                        (fr == "MAX_TOKENS"
+                             ? " — thinking consumed the output budget; lower reasoning effort or"
+                               " raise max_output_tokens"
+                             : "");
+            return res;
         }
         res.text = pr.text;
         res.thinking = pr.thinking;

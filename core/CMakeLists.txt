@@ -272,6 +272,25 @@ set_target_properties(test_aicm PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME aicm COMMAND test_aicm)
 
+# --- libaicad parts (parametric standard-parts catalog) ----------------------
+# Generates EDITABLE geometry for off-the-shelf hardware (fasteners/nuts/washers/
+# standoffs/bearings/inserts/dowels) by EMITTING document ops — so it is OCCT-free
+# (only JSON; the doc engine compiles the geometry). The numbers mirror
+# agent/prompts/shared/cheatsheets/hardware.md. Linked into the libaicad DLL below
+# (parts_make / parts_catalog_list RPCs) and unit-tested in both configs.
+add_library(aicad_parts STATIC
+  parts/catalog.cpp
+  parts/generate.cpp)
+target_include_directories(aicad_parts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_parts PUBLIC nlohmann_json::nlohmann_json)
+
+add_executable(test_parts tests/test_parts.cpp)
+target_include_directories(test_parts PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_parts PRIVATE aicad_parts)
+set_target_properties(test_parts PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME parts COMMAND test_parts)
+
 # --- Wave 2: OCCT geometry kernel (opt-in) -----------------------------------
 if(AICAD_WITH_OCCT)
   include(ProvisionOCCT)
@@ -726,7 +745,7 @@ if(AICAD_WITH_OCCT)
     api/libaicad.cpp)
   target_include_directories(aicad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_definitions(aicad PRIVATE AICAD_BUILD_DLL)
-  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_mesh aicad_agent)
+  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_mesh aicad_agent aicad_parts)
   set_target_properties(aicad PROPERTIES
     OUTPUT_NAME libaicad   # -> libaicad.dll + libaicad.lib (the host loads by this name)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

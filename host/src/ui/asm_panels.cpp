@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <string>
 
@@ -73,6 +75,7 @@ bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
         return true;
     }
     if (cmdId == "asm_insert")  { insertOpen_ = true; insertFocus_ = true; return true; }
+    if (cmdId == "asm_parts_library") { partsLibOpen_ = true; partsLibFocus_ = true; return true; }
     if (cmdId == "asm_mate")    { beginMateForm(); return true; }
     if (cmdId == "asm_explode") { explodeOpen_ = true; explodeFocus_ = true; return true; }
     if (cmdId == "asm_interference") {
@@ -108,6 +111,7 @@ bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
 
 void AsmPanels::draw(AppState& st) {
     drawInsert(st);
+    drawPartsLibrary(st);
     drawMateForm(st);
     drawPatternForm(st);
     drawExplode(st);
@@ -171,6 +175,227 @@ void AsmPanels::drawInsert(AppState& st) {
     }
     ImGui::End();
     if (!open) insertOpen_ = false;
+}
+
+// ===========================================================================
+// Standard Parts Library — parametric catalog browser (parts_catalog_list / parts_make)
+// ===========================================================================
+
+namespace {
+// A stable cache path per part identity, so the same part dedupes to one .step and the
+// assembly's source.path stays valid across rebuilds. Sanitizes size designators
+// ("1/4-20" / "#6-32") into filename-safe tokens.
+std::string partsCacheDir() {
+    const char* a = std::getenv("APPDATA");
+    return std::string(a ? a : ".") + "\\AI-CAD\\cache\\parts_library";
+}
+std::string sanitizeToken(const std::string& s) {
+    std::string out;
+    for (char c : s) out += (c == '/' || c == '\\' || c == '#' || c == ' ' || c == '.') ? '_' : c;
+    return out;
+}
+}  // namespace
+
+bool AsmPanels::insertCatalogPart(AppState& st, const std::string& family,
+                                  const std::string& size, double length_mm,
+                                  std::string& aicmOut) {
+    aicmOut.clear();
+    if (!st.docMirror.hasDoc()) {
+        partsNote_ = "Open or create an assembly first.";
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(partsCacheDir(), ec);
+    std::string fname = family + "_" + sanitizeToken(size);
+    if (length_mm > 0.0) fname += "_" + std::to_string((int)length_mm);
+    const std::string stepPath = partsCacheDir() + "\\" + fname + ".step";
+
+    nlohmann::json params = {{"family", family}, {"size", size}, {"save_path", stepPath}};
+    if (length_mm > 0.0) params["length_mm"] = length_mm;
+    nlohmann::json res;
+    std::string err;
+    if (!st.worker.call("parts_make", params, res, err)) {
+        partsNote_ = "parts_make failed: " + err;
+        st.addLog("[err] parts_make: " + err);
+        return false;
+    }
+    if (!res.value("ok", false)) {
+        const std::string e = res.value("error", std::string("unknown error"));
+        partsNote_ = "parts_make: " + e;
+        st.addLog("[err] parts_make: " + e);
+        return false;
+    }
+    const std::string sp = res.value("step_path", stepPath);
+    if (!insertComponent(st, sp, nullptr, aicmOut)) return false;
+    partsNote_ = "Inserted " + res.value("name", fname) + ".";
+    st.addLog("[asm] inserted catalog part: " + res.value("name", fname));
+    return true;
+}
+
+void AsmPanels::drawPartsLibrary(AppState& st) {
+    if (!partsLibOpen_) return;
+    bool open = true;
+    ImGui::SetNextWindowSize(ImVec2(560 * ui::uiScale, 420 * ui::uiScale), ImGuiCond_Appearing);
+    if (partsLibFocus_) { ImGui::SetNextWindowFocus(); partsLibFocus_ = false; }
+    if (ImGui::Begin("Standard Parts Library", &open)) {
+        asmIcon("insert_component", "[+]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
+        ImGui::TextUnformatted("Insert standard hardware (generated to spec)");
+        ImGui::Spacing();
+
+        // Lazy fetch the catalog from the core (synchronous; tiny payload).
+        if (!partsCatalogFetched_) {
+            nlohmann::json res;
+            std::string err;
+            if (st.worker.call("parts_catalog_list", nlohmann::json::object(), res, err) &&
+                res.is_object() && res.contains("families")) {
+                partsCatalog_ = res;
+                partsCatalogError_.clear();
+            } else {
+                partsCatalogError_ = err.empty() ? "catalog unavailable" : err;
+            }
+            partsCatalogFetched_ = true;
+        }
+
+        if (!partsCatalogError_.empty()) {
+            pushText(ui::palette.statusWarn);
+            ImGui::TextWrapped("Could not load the parts catalog: %s", partsCatalogError_.c_str());
+            ImGui::PopStyleColor();
+            if (ImGui::Button("Retry")) partsCatalogFetched_ = false;
+            ImGui::End();
+            if (!open) partsLibOpen_ = false;
+            return;
+        }
+
+        const nlohmann::json& fams =
+            (partsCatalog_.is_object() && partsCatalog_["families"].is_array())
+                ? partsCatalog_["families"]
+                : nlohmann::json::array();
+
+        if (!st.docMirror.hasDoc()) {
+            pushText(ui::palette.statusWarn);
+            ImGui::TextWrapped("No assembly open — use File > New Assembly to insert parts.");
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+        }
+
+        // Search filter over family names/categories.
+        ImGui::SetNextItemWidth(220 * ui::uiScale);
+        ImGui::InputTextWithHint("##parts_filter", "filter (e.g. screw, bearing, M3)",
+                                 partsFilter_.data(), partsFilter_.size());
+        std::string filt = partsFilter_.data();
+        std::transform(filt.begin(), filt.end(), filt.begin(), ::tolower);
+
+        ImGui::Spacing();
+        ImGui::BeginChild("parts_list", ImVec2(220 * ui::uiScale, -1), true);
+        std::string lastCat;
+        for (int i = 0; i < (int)fams.size(); ++i) {
+            const nlohmann::json& f = fams[i];
+            const std::string name = f.value("name", std::string());
+            const std::string cat = f.value("category", std::string());
+            const std::string key = f.value("key", std::string());
+            if (!filt.empty()) {
+                std::string hay = name + " " + cat + " " + key;
+                std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
+                // also match any size token (e.g. "m3")
+                for (const auto& s : f.value("sizes", nlohmann::json::array())) {
+                    std::string sv = s.get<std::string>();
+                    std::transform(sv.begin(), sv.end(), sv.begin(), ::tolower);
+                    hay += " " + sv;
+                }
+                if (hay.find(filt) == std::string::npos) continue;
+            }
+            if (cat != lastCat) {
+                pushText(ui::palette.textDim);
+                ImGui::TextUnformatted(cat.c_str());
+                ImGui::PopStyleColor();
+                lastCat = cat;
+            }
+            if (ImGui::Selectable((name + "##fam" + std::to_string(i)).c_str(),
+                                  partsSelFamily_ == i)) {
+                partsSelFamily_ = i;
+                partsSelSize_ = 0;
+                partsLenBuf_[0] = 0;
+            }
+        }
+        ImGui::EndChild();
+
+        ImGui::SameLine();
+        ImGui::BeginChild("parts_detail", ImVec2(0, -1), false);
+        if (partsSelFamily_ >= 0 && partsSelFamily_ < (int)fams.size()) {
+            const nlohmann::json& f = fams[partsSelFamily_];
+            ImGui::TextUnformatted(f.value("name", std::string("?")).c_str());
+            pushText(ui::palette.textDim);
+            ImGui::TextWrapped("%s", f.value("description", std::string()).c_str());
+            ImGui::Text("Standard: %s", f.value("standard", std::string("-")).c_str());
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+
+            const nlohmann::json sizes = f.value("sizes", nlohmann::json::array());
+            if (partsSelSize_ >= (int)sizes.size()) partsSelSize_ = 0;
+            const std::string curSize =
+                sizes.empty() ? std::string() : sizes[partsSelSize_].get<std::string>();
+
+            ImGui::TextUnformatted("Size");
+            ImGui::SetNextItemWidth(160 * ui::uiScale);
+            if (ImGui::BeginCombo("##parts_size", curSize.c_str())) {
+                for (int s = 0; s < (int)sizes.size(); ++s) {
+                    const std::string sv = sizes[s].get<std::string>();
+                    if (ImGui::Selectable(sv.c_str(), partsSelSize_ == s)) partsSelSize_ = s;
+                }
+                ImGui::EndCombo();
+            }
+
+            const bool needsLen = f.value("needs_length", false);
+            double lenVal = 0.0;
+            if (needsLen) {
+                ImGui::TextUnformatted("Length (mm)");
+                ImGui::SetNextItemWidth(160 * ui::uiScale);
+                ImGui::InputText("##parts_len", partsLenBuf_.data(), partsLenBuf_.size(),
+                                 ImGuiInputTextFlags_CharsDecimal);
+                const nlohmann::json lens = f.value("lengths_mm", nlohmann::json::array());
+                if (!lens.empty()) {
+                    ImGui::SameLine();
+                    if (ImGui::BeginCombo("##parts_len_menu", "common", ImGuiComboFlags_NoPreview)) {
+                        for (const auto& L : lens) {
+                            const int lv = (int)L.get<double>();
+                            if (ImGui::Selectable((std::to_string(lv) + " mm").c_str()))
+                                std::snprintf(partsLenBuf_.data(), partsLenBuf_.size(), "%d", lv);
+                        }
+                        ImGui::EndCombo();
+                    }
+                }
+                lenVal = std::atof(partsLenBuf_.data());
+            }
+
+            ImGui::Spacing();
+            const bool canInsert = st.docMirror.hasDoc() && !curSize.empty() &&
+                                   (!needsLen || lenVal > 0.0);
+            if (!canInsert) ImGui::BeginDisabled();
+            if (ImGui::Button("Insert into Assembly", ImVec2(180 * ui::uiScale, 0))) {
+                std::string aicm;
+                insertCatalogPart(st, f.value("key", std::string()), curSize, lenVal, aicm);
+            }
+            if (!canInsert) ImGui::EndDisabled();
+            if (needsLen && lenVal <= 0.0) {
+                pushText(ui::palette.textDim);
+                ImGui::TextUnformatted("Enter or pick a length.");
+                ImGui::PopStyleColor();
+            }
+        } else {
+            pushText(ui::palette.textDim);
+            ImGui::TextWrapped("Select a part family on the left.");
+            ImGui::PopStyleColor();
+        }
+        if (!partsNote_.empty()) {
+            ImGui::Spacing();
+            pushText(ui::palette.textDim);
+            ImGui::TextWrapped("%s", partsNote_.c_str());
+            ImGui::PopStyleColor();
+        }
+        ImGui::EndChild();
+    }
+    ImGui::End();
+    if (!open) partsLibOpen_ = false;
 }
 
 // ===========================================================================

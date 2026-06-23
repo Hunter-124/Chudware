@@ -41,6 +41,9 @@ class VendorPart:
     specs: dict[str, Any] = field(default_factory=dict)
     source: str = "manual"
     added_ts: float = field(default_factory=time.time)
+    # Optional: mtime of the on-disk source file when last registered. Used by the watched
+    # parts-library scanner to skip unchanged files (idempotent re-scan). C++ core ignores it.
+    source_mtime: float = 0.0
 
     @property
     def key(self) -> str:
@@ -81,14 +84,16 @@ def _part_dir(part: VendorPart) -> Path:
 def register_local_cad(*, supplier: str, part_number: str, cad_path: str,
                        description: str = "", product_url: str = "",
                        specs: dict | None = None, source: str = "manual",
-                       copy_file: bool = True) -> dict:
+                       copy_file: bool = True, source_mtime: float | None = None) -> dict:
     if not part_number:
         raise ValueError("part_number is required")
     src = Path(os.path.expandvars(os.path.expanduser(cad_path))).resolve()
     if not src.exists():
         raise FileNotFoundError(f"CAD file not found: {src}")
     part = VendorPart(supplier=supplier, part_number=part_number, description=description,
-                      product_url=product_url, specs=specs or {}, source=source)
+                      product_url=product_url, specs=specs or {}, source=source,
+                      source_mtime=float(source_mtime if source_mtime is not None
+                                         else src.stat().st_mtime))
     part.cad_format = _detect_format(src)
     dest_dir = _part_dir(part)
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -199,6 +204,18 @@ def _vendor_part_context(params: dict, _emit: EmitFn) -> dict:
     return context_card(limit=int(params.get("limit") or 12), query=params.get("query"))
 
 
+def _vendor_part_scan_library(params: dict, emit: EmitFn) -> dict:
+    # Imported lazily: parts_library imports this module (vendor_parts is the registry owner).
+    from engine import parts_library
+    return parts_library._vendor_part_scan_library(params, emit)
+
+
+def _vendor_part_fetch(params: dict, emit: EmitFn) -> dict:
+    # Imported lazily to keep the provider/HTTP surface out of the registry import path.
+    from engine import parts_providers
+    return parts_providers._vendor_part_fetch(params, emit)
+
+
 # vendor_part_insert moved to the C++ core (doc_vendor_part_insert): it mutates a doc by applying
 # an `import` feature, which now lives in libaicad. The registry above (register/list/context +
 # import_ops_for_part, get_part) is pure metadata and stays in Python — the C++ insert reads the
@@ -207,4 +224,6 @@ WORKER_METHODS = {
     "vendor_part_register_local_cad": _vendor_part_register_local_cad,
     "vendor_part_list": _vendor_part_list,
     "vendor_part_context": _vendor_part_context,
+    "vendor_part_scan_library": _vendor_part_scan_library,
+    "vendor_part_fetch": _vendor_part_fetch,
 }

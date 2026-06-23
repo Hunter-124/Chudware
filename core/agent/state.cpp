@@ -647,17 +647,35 @@ std::string join_body(const std::vector<std::pair<std::string, std::string>>& bl
 }  // namespace
 
 BuiltContext build_context(const DesignState& state, const std::string& role,
-                           const std::string& prompts_dir) {
+                           const std::string& prompts_dir, int context_cap) {
+    if (context_cap < 256) context_cap = 256;  // a floor so the math below stays sane
     auto pr = load_prompt(role, prompts_dir);
     std::string system = pr.first;
+    bool trimmed = false;
+
+    // The system prompt (role instructions + appended ops cheatsheet / hardware catalog) is the
+    // largest fixed cost. On a SMALL model window it can alone exceed the cap, leaving no room for
+    // the request — which the server then truncates blindly. Shed the appended reference material
+    // (it sits at the TAIL, after the role instructions) so the model still receives its role +
+    // the request instead of a mangled prompt. Reserve a slice of the cap for the body.
+    int sys_tokens = est_tokens(system);
+    int sys_ceiling = context_cap - std::min(512, context_cap / 4);
+    if (sys_tokens > sys_ceiling) {
+        int keep_chars = std::max(400, sys_ceiling * kCharsPerToken);
+        if (static_cast<int>(system.size()) > keep_chars) {
+            system = system.substr(0, keep_chars) +
+                     "\n...[reference material trimmed to fit the model's context window]";
+            trimmed = true;
+            sys_tokens = est_tokens(system);
+        }
+    }
 
     auto blocks = role_blocks(state, role);
 
-    int sys_tokens = est_tokens(system);
     while (!blocks.empty()) {
         std::string body = join_body(blocks);
         int total = sys_tokens + est_tokens(body);
-        if (total <= kContextTokenCap) break;
+        if (total <= context_cap) break;
         // Drop the first opt: block, else hard-truncate the largest essential.
         int opt_idx = -1;
         for (size_t i = 0; i < blocks.size(); ++i)
@@ -666,13 +684,15 @@ BuiltContext build_context(const DesignState& state, const std::string& role,
             size_t largest = 0;
             for (size_t i = 1; i < blocks.size(); ++i)
                 if (blocks[i].second.size() > blocks[largest].second.size()) largest = i;
-            int keep = std::max(200, (kContextTokenCap - sys_tokens) * kCharsPerToken - 200);
+            int keep = std::max(200, (context_cap - sys_tokens) * kCharsPerToken - 200);
             std::string& t = blocks[largest].second;
             if (static_cast<int>(t.size()) > keep) t = t.substr(0, keep);
             t += "\n...[truncated]";
+            trimmed = true;
             break;
         }
         blocks.erase(blocks.begin() + opt_idx);
+        trimmed = true;
     }
 
     std::string body = join_body(blocks);
@@ -682,6 +702,7 @@ BuiltContext build_context(const DesignState& state, const std::string& role,
     // Python: len(system) + len(body) — Unicode code points, not bytes.
     out.context_chars = utf8_len(system) + utf8_len(body);
     out.context_tokens_est = est_tokens(system) + est_tokens(body);
+    out.trimmed = trimmed;
     return out;
 }
 

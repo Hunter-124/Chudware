@@ -107,12 +107,16 @@ struct BuiltContext {
     std::string body;  // the single user message's joined text
     int context_chars = 0;
     int context_tokens_est = 0;
+    bool trimmed = false;  // true if a block was dropped or hard-truncated to fit the cap
 };
 
-// Assemble the FRESH bounded context for *role*. prompts_dir overrides the env
-// builtin dir (so the gate can point C++ at the same prompt files Python reads).
+// Assemble the FRESH bounded context for *role*, keeping system + body within `context_cap`
+// estimated tokens. prompts_dir overrides the env builtin dir (so the gate can point C++ at the
+// same prompt files Python reads). `context_cap` defaults to kContextTokenCap; callers that know
+// the model's window pass a model-aware cap (fit_call_budget) so small local windows fit.
 BuiltContext build_context(const DesignState& state, const std::string& role,
-                           const std::string& prompts_dir = "");
+                           const std::string& prompts_dir = "",
+                           int context_cap = kContextTokenCap);
 
 }  // namespace agent
 }  // namespace aicad

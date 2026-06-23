@@ -25,6 +25,13 @@ config.json
 # Editor / app state
 imgui.ini
 
+# Per-machine MCP client configs (absolute paths) — regenerate with mcp_setup.bat.
+# The portable installer (mcp_setup.bat + installer/setup_mcp_clients.py) IS committed.
+/.mcp.json
+/opencode.json
+/.cursor/mcp.json
+/.vscode/mcp.json
+
 # Scratch + spike outputs
 scratch/
 
@@ -47,3 +54,11 @@ OCCT/
 /chain_dbg.json
 /session-continuation-prompt-*.txt
 core/build-occt/
+
+# FEA/CFD scratch debug output (logs, stderr/stdout dumps, verification screenshots)
+/fea_*.txt
+/fea_*.png
+
+# Exported CAD persistence (regenerate via export — never committed)
+*.step
+*.stp

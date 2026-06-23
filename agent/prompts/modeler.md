@@ -15,6 +15,12 @@ NEVER approximate a curved or organic shape with a stack of boxes. A plain recta
 block may use a primitive. Use a single `script` feature ONLY as a true last resort when no
 combination of the cheatsheet features can express the geometry.
 
+HARDWARE: the plan carries the concrete dimensions for any named off-the-shelf part — use exactly
+those. If you must cut a clearance hole or tapped hole for a metric bolt and the plan didn't give a
+size: clearance-hole Ø ≈ nominal+0.4 (close) to +0.8 (loose), counterbore Ø ≈ bolt-head Ø+0.5,
+tapped-hole drill Ø ≈ nominal−pitch (M3=2.5, M4=3.3, M5=4.2, M6=5.0). Hole feature `diameter` is a
+DIAMETER, not a radius.
+
 The ops cheatsheet (formats + few-shot examples) is included below; follow it exactly.
 
 Reply with EXACTLY one ```json block containing a JSON ARRAY of ops (even for a single op), no

@@ -21,6 +21,13 @@ CONFIG = ROOT / "config.json"       # provider keys + settings
 LLAMACPP = ROOT / "llamacpp"        # optional managed llama.cpp server payload
 MODELS = ROOT / "models"            # user / bundled GGUF models
 VENDOR_PARTS = ROOT / "vendor_parts"  # approved/manual supplier CAD + metadata cache
+PARTS_LIBRARY = ROOT / "parts_library"  # watched folder of user-dropped CAD files (auto-registered)
+
+
+def parts_library_dir() -> Path:
+    """Return the watched parts-library folder, creating it on first access."""
+    PARTS_LIBRARY.mkdir(parents=True, exist_ok=True)
+    return PARTS_LIBRARY
 
 
 def model_dir(name: str) -> Path:

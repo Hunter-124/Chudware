@@ -138,25 +138,28 @@ inline const std::vector<LocalPreset>& cloudPresets() {
         // OpenRouter — one key, many models (Qwen / DeepSeek / open-weight). ":free" tiers cost
         // nothing but are rate-limited upstream; paid slugs are cheap and reliable (needs credit /
         // a non-zero key spend limit). Listed first since it's the easiest working cloud path.
+        // Qwen = current Qwen3 generation only (chat / vision / coder; no image/video generation).
         {"qwen/qwen3-coder:free", "OpenRouter · Qwen3-Coder (free)", false,
          "OpenRouter free tier — Qwen3 coder for op emission. Rate-limited; retries help.", kOpenRouter},
-        {"qwen/qwen-2.5-coder-32b-instruct", "OpenRouter · Qwen2.5-Coder 32B (paid)", false,
-         "OpenRouter paid — reliable Qwen coder for structured ops (needs credit).", kOpenRouter},
-        {"qwen/qwen2.5-vl-72b-instruct", "OpenRouter · Qwen2.5-VL 72B (vision, paid)", true,
-         "OpenRouter paid — Qwen vision model, great as the review judge (needs credit).", kOpenRouter},
+        {"qwen/qwen3-coder", "OpenRouter · Qwen3-Coder (paid)", false,
+         "OpenRouter paid — reliable Qwen3 coder for structured ops (needs credit).", kOpenRouter},
+        {"qwen/qwen3-vl-32b-instruct", "OpenRouter · Qwen3-VL 32B (vision, paid)", true,
+         "OpenRouter paid — Qwen3 vision model, great as the review judge (needs credit).", kOpenRouter},
+        {"qwen/qwen3-max", "OpenRouter · Qwen3-Max (flagship, paid)", false,
+         "OpenRouter paid — Qwen3 flagship general model (needs credit).", kOpenRouter},
         {"deepseek/deepseek-chat", "OpenRouter · DeepSeek V3 (paid)", false,
          "OpenRouter paid — DeepSeek V3 general/coding (needs credit).", kOpenRouter},
         {"openai/gpt-oss-120b:free", "OpenRouter · GPT-OSS 120B (free)", false,
          "OpenRouter free tier — open-weight 120B, currently reliable.", kOpenRouter},
-        // Alibaba Cloud (DashScope) — Qwen flagship + vision + coder.
-        {"qwen-max", "Alibaba Qwen-Max (flagship)", false,
-         "Alibaba Cloud DashScope. Strong general model; needs a DashScope API key.", kDashScope},
-        {"qwen-plus", "Alibaba Qwen-Plus (balanced)", false,
-         "Alibaba Cloud DashScope. Cheaper/faster than Max.", kDashScope},
-        {"qwen-vl-max", "Alibaba Qwen-VL-Max (vision)", true,
-         "Alibaba Cloud DashScope vision model — great as the review judge.", kDashScope},
-        {"qwen-coder-plus", "Alibaba Qwen-Coder-Plus (ops/code)", false,
-         "Alibaba Cloud DashScope code model for structured op emission.", kDashScope},
+        // Alibaba Cloud (DashScope) — current Qwen3 generation (chat / vision / coder). Image/video
+        // generation (qwen-image-*, wan*, z-image) and audio (qwen3-tts/asr/omni) are intentionally
+        // excluded — they aren't text copilots.
+        {"qwen3-max", "Alibaba Qwen3-Max (flagship)", false,
+         "Alibaba Cloud DashScope. Current Qwen3 flagship; needs a DashScope API key.", kDashScope},
+        {"qwen3-vl-plus", "Alibaba Qwen3-VL-Plus (vision)", true,
+         "Alibaba Cloud DashScope Qwen3 vision model — great as the review judge.", kDashScope},
+        {"qwen3-coder-plus", "Alibaba Qwen3-Coder-Plus (ops/code)", false,
+         "Alibaba Cloud DashScope Qwen3 code model for structured op emission.", kDashScope},
         // DeepSeek official API.
         {"deepseek-chat", "DeepSeek V3 (chat)", false,
          "Official DeepSeek API. Strong general/coding model.", kDeepSeek},

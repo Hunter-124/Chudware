@@ -134,6 +134,10 @@ void loadSettings(Settings& s) {
         if (auto it = j.find("hidden_models"); it != j.end() && it->is_array())
             for (const auto& e : *it)
                 if (e.is_string()) s.hiddenModels.insert(e.get<std::string>());
+        s.disabledProviders.clear();
+        if (auto it = j.find("disabled_providers"); it != j.end() && it->is_array())
+            for (const auto& e : *it)
+                if (e.is_string()) s.disabledProviders.insert(e.get<std::string>());
         // Experimental AI features ("experimental" block) — all default-off.
         auto exp = j.value("experimental", nlohmann::json::object());
         if (exp.is_object()) {
@@ -211,6 +215,9 @@ void saveSettings(const Settings& s) {
     j["recent_files"] = s.recentFiles;
     if (!s.hiddenModels.empty())
         j["hidden_models"] = std::vector<std::string>(s.hiddenModels.begin(), s.hiddenModels.end());
+    if (!s.disabledProviders.empty())
+        j["disabled_providers"] =
+            std::vector<std::string>(s.disabledProviders.begin(), s.disabledProviders.end());
     // Experimental AI features. Only emit the block when something is enabled/customized, so a
     // default config stays clean and the core's apply_experimental is a no-op.
     if (s.expVisionReview || s.expCadSequenceMode) {

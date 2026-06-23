@@ -106,6 +106,11 @@ struct Settings {
     // "Manage models" toggle in Settings → AI). Default-empty = every available model shows;
     // hiding is opt-out so the picker works out of the box. Serialized as "hidden_models".
     std::set<std::string> hiddenModels;
+    // Bulk provider on/off: category keys the user has disabled wholesale ("gemini", "anthropic",
+    // "openai", "openrouter", "alibaba", "deepseek", "local"). A disabled category's models are
+    // hidden from the composer's chat picker and shown collapsed/greyed in Settings → Manage models.
+    // Serialized as "disabled_providers".
+    std::set<std::string> disabledProviders;
 
     // ---- Experimental AI features (Settings → Experimental) -> config.json "experimental" ----
     // All default-off and additive: when off, the resolved provider + agent loop are byte-identical

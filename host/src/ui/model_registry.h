@@ -69,6 +69,42 @@ inline bool providerIsCloud(int provider) {
 // user-editable base URL (Alibaba DashScope, DeepSeek, etc.). Refused under offline (ITAR) mode.
 inline bool providerIsCloudCompat(int provider) { return provider == PROV_CLOUDCOMPAT; }
 
+// ---- provider/service CATEGORY keys (for Manage-models categories + bulk on/off) ----
+// A stable string identity per provider category, used by Settings::disabledProviders and the
+// collapsible Manage-models groups. Cloud-compat is sub-categorized by base URL (a single cloud
+// slot serves OpenRouter / Alibaba / DeepSeek), so cloud rows use cloudServiceKey() instead.
+inline const char* providerCatKey(int provider) {
+    switch (provider) {
+        case PROV_GEMINI: return "gemini";
+        case PROV_ANTHROPIC: return "anthropic";
+        case PROV_OPENAI: return "openai";
+        case PROV_LOCAL:
+        case PROV_LLAMACPP: return "local";
+        case PROV_CLOUDCOMPAT: return "cloud";  // refine with cloudServiceKey(base_url)
+        default: return "other";
+    }
+}
+
+// Map a cloud base URL to its service category key (OpenRouter / Alibaba / DeepSeek / generic).
+inline const char* cloudServiceKey(const std::string& base_url) {
+    if (base_url.find("openrouter.ai") != std::string::npos) return "openrouter";
+    if (base_url.find("aliyuncs.com") != std::string::npos) return "alibaba";
+    if (base_url.find("deepseek.com") != std::string::npos) return "deepseek";
+    return "cloud";
+}
+
+// Human label for a category key (covers both builtin providers and cloud services).
+inline const char* categoryLabel(const std::string& key) {
+    if (key == "gemini") return "Google Gemini";
+    if (key == "anthropic") return "Anthropic (Claude)";
+    if (key == "openai") return "OpenAI";
+    if (key == "local") return "Local endpoint";
+    if (key == "openrouter") return "OpenRouter";
+    if (key == "alibaba") return "Alibaba Cloud (Qwen)";
+    if (key == "deepseek") return "DeepSeek";
+    return "Cloud API";
+}
+
 // The built-in catalog of KNOWN cloud models. Local/llama.cpp models are discovered live
 // (a local endpoint can serve any GGUF), so they are NOT listed here — the probe fills them.
 inline const std::vector<ModelInfo>& builtinModels() {

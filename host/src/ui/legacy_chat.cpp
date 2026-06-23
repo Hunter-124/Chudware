@@ -1460,31 +1460,94 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
         const ImU32 okCol = IM_COL32(120, 200, 120, 255);
         const ImU32 dimCol = ui::Palette::toU32(pal2.textDim);
         const ImU32 warnCol = IM_COL32(220, 170, 90, 255);
+        dimText("Each provider is a category: the checkbox bulk-toggles the whole provider on/off; "
+                "expand it to hide individual models. Off = hidden from the composer's model picker.");
+        ImGui::Dummy(ImVec2(0, 2 * S));
 
-        // Built-in cloud models, grouped by provider.
+        // One collapsible category header: [x] bulk-on/off checkbox + an expander showing the model
+        // count. Returns whether the body (the model rows) should be drawn.
+        auto catHeader = [&](const std::string& key, int n) -> bool {
+            bool enabled = st.settings.disabledProviders.count(key) == 0;
+            ImGui::PushID(("cat_" + key).c_str());
+            if (ImGui::Checkbox("##en", &enabled)) {
+                if (enabled) st.settings.disabledProviders.erase(key);
+                else         st.settings.disabledProviders.insert(key);
+                changed = true;
+            }
+            ImGui::PopID();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(enabled ? "Turn this whole provider OFF (hide all its models)"
+                                          : "Turn this provider back ON");
+            ImGui::SameLine();
+            char hdr[128];
+            std::snprintf(hdr, sizeof(hdr), "%s  (%d)%s###hdr_%s", ui::categoryLabel(key), n,
+                          enabled ? "" : "   - off", key.c_str());
+            return ImGui::CollapsingHeader(hdr);
+        };
+        auto catEnabled = [&](const std::string& key) {
+            return st.settings.disabledProviders.count(key) == 0;
+        };
+
+        // Built-in cloud providers (Gemini / Anthropic / OpenAI).
         for (int pv : {ui::PROV_GEMINI, ui::PROV_ANTHROPIC, ui::PROV_OPENAI}) {
-            bool header = false;
-            for (const auto& m : ui::builtinModels()) {
-                if (m.provider != pv) continue;
-                if (!header) { ImGui::SeparatorText(ui::providerLabel(pv)); header = true; }
+            std::string key = ui::providerCatKey(pv);
+            int n = 0;
+            for (const auto& m : ui::builtinModels()) if (m.provider == pv) ++n;
+            if (catHeader(key, n)) {
+                bool en = catEnabled(key);
+                if (!en) ImGui::BeginDisabled();
+                ImGui::Indent(14 * S);
                 bool keyed = providerUsable(st, pv);
-                visRow(m.id, m.label, keyed ? "available" : "needs key", keyed ? okCol : warnCol);
+                for (const auto& m : ui::builtinModels()) {
+                    if (m.provider != pv) continue;
+                    visRow(m.id, m.label, keyed ? "available" : "needs key", keyed ? okCol : warnCol);
+                }
+                ImGui::Unindent(14 * S);
+                if (!en) ImGui::EndDisabled();
             }
         }
-        // Discovered local models (deduped across the local provider pair).
-        const ProviderModels& lpm = st.providerModels[ui::PROV_LOCAL];
-        if (!lpm.models.empty()) {
-            ImGui::SeparatorText("Local endpoint");
-            std::set<std::string> seen;
-            for (const auto& id : lpm.models) {
-                if (!seen.insert(id).second) continue;
-                bool loaded = localModelLoaded(lpm, id);
-                visRow(id, id, lpm.loadedKnown ? (loaded ? "loaded" : "not loaded") : "available",
-                       loaded ? okCol : dimCol);
+        // Cloud OpenAI-compatible SERVICES as their own categories (OpenRouter / Alibaba / DeepSeek),
+        // built from the curated presets and grouped by base URL.
+        for (const char* svc : {"openrouter", "alibaba", "deepseek"}) {
+            int n = 0;
+            for (const auto& p : ui::cloudPresets())
+                if (std::strcmp(ui::cloudServiceKey(p.baseUrl), svc) == 0) ++n;
+            if (n == 0) continue;
+            if (catHeader(svc, n)) {
+                bool en = catEnabled(svc);
+                if (!en) ImGui::BeginDisabled();
+                ImGui::Indent(14 * S);
+                for (const auto& p : ui::cloudPresets()) {
+                    if (std::strcmp(ui::cloudServiceKey(p.baseUrl), svc) != 0) continue;
+                    visRow(p.id, p.label, p.vision ? "vision" : "chat", dimCol);
+                }
+                ImGui::Unindent(14 * S);
+                if (!en) ImGui::EndDisabled();
             }
-        } else {
-            ImGui::SeparatorText("Local endpoint");
-            dimText("No local models discovered — start your local model server.");
+        }
+        // Local discovered models (deduped across the local provider pair).
+        {
+            const ProviderModels& lpm = st.providerModels[ui::PROV_LOCAL];
+            std::vector<std::string> ids;
+            std::set<std::string> seen;
+            for (const auto& id : lpm.models) if (seen.insert(id).second) ids.push_back(id);
+            if (catHeader("local", (int)ids.size())) {
+                bool en = catEnabled("local");
+                if (!en) ImGui::BeginDisabled();
+                ImGui::Indent(14 * S);
+                if (ids.empty()) {
+                    dimText("No local models discovered - start your local model server.");
+                } else {
+                    for (const auto& id : ids) {
+                        bool loaded = localModelLoaded(lpm, id);
+                        visRow(id, id,
+                               lpm.loadedKnown ? (loaded ? "loaded" : "not loaded") : "available",
+                               loaded ? okCol : dimCol);
+                    }
+                }
+                ImGui::Unindent(14 * S);
+                if (!en) ImGui::EndDisabled();
+            }
         }
     }
 
@@ -1689,8 +1752,14 @@ static void drawModelDropdown(AppState& st, bool busy) {
     int shown = 0;     // visible rows after availability + search filtering
     ImGui::BeginChild("##modellist", ImVec2(0, 240 * sc), ImGuiChildFlags_None);
 
-    // Usable built-in cloud models (provider has a key), minus any the user hid.
+    auto catOff = [&](const std::string& key) {
+        return st.settings.disabledProviders.count(key) != 0;
+    };
+
+    // Usable built-in cloud models (provider has a key), minus any the user hid or whose provider
+    // category is bulk-disabled.
     for (const auto& m : ui::builtinModels()) {
+        if (catOff(ui::providerCatKey(m.provider))) continue;
         if (!providerUsable(st, m.provider) || !matchq(m.label, providerShort(m.provider))) continue;
         if (modelHidden(st, m.id)) continue;
         ++shown;
@@ -1700,12 +1769,31 @@ static void drawModelDropdown(AppState& st, bool busy) {
             picked = true;
         }
     }
+    // Cloud OpenAI-compatible service presets (OpenRouter / Alibaba / DeepSeek). Shown when a cloud
+    // key is configured and the service category isn't bulk-disabled. Picking one points the active
+    // Cloud API provider at that service's endpoint + model.
+    if (st.settings.cloudKey[0]) {
+        for (const auto& p : ui::cloudPresets()) {
+            std::string key = ui::cloudServiceKey(p.baseUrl);
+            if (catOff(key)) continue;
+            if (modelHidden(st, p.id) || !matchq(p.label, key)) continue;
+            ++shown;
+            if (modelRow(st, ui::PROV_CLOUDCOMPAT, p.id, p.label, true, uid++)) {
+                st.settings.provider = ui::PROV_CLOUDCOMPAT;
+                std::strncpy(st.settings.model, p.id.c_str(), sizeof(st.settings.model) - 1);
+                std::strncpy(st.settings.baseUrl, p.baseUrl.c_str(), sizeof(st.settings.baseUrl) - 1);
+                st.settings.vision = p.vision;
+                picked = true;
+            }
+        }
+    }
     // Live-discovered local models (when a local endpoint is up). The probe assigns the same
     // model list to PROV_LOCAL and PROV_LLAMACPP (one endpoint family), so dedup by id to avoid
     // listing each model twice. Skip models that are downloaded but not loaded, and any the user
     // hid.
     std::set<std::string> seenLocal;
     for (int lp : {ui::PROV_LOCAL, ui::PROV_LLAMACPP}) {
+        if (catOff("local")) break;
         const ProviderModels& pm = st.providerModels[lp];
         if (!pm.ok) continue;
         for (const auto& id : pm.models) {

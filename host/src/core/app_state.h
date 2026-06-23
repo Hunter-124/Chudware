@@ -150,6 +150,10 @@ struct ProviderModels {
     // available. See agent_list_models in libaicad.cpp.
     std::vector<std::string> loaded;
     bool loadedKnown = false;
+    // Ids the endpoint prices at $0 (OpenRouter ":free" tiers etc.) — surfaced by agent_list_models
+    // from each model's pricing. Lets the OpenRouter category list ALL currently-free models live,
+    // so the set stays current instead of going stale in a hardcoded list.
+    std::vector<std::string> free;
     std::string error;
 };
 

@@ -1110,6 +1110,23 @@ static void closeConversation(AppState& st, int idx) {
 // Probe the local OpenAI-compatible endpoint for its loaded models + reachability, so the
 // picker can hide local models that are down. Throttled to ~5s; force bypasses the throttle.
 void refreshModelAvailability(AppState& st, bool force) {
+    // The "Local endpoint" probe is only meaningful for a LOOPBACK base_url. When a cloud
+    // OpenAI-compatible service is active (OpenRouter / DashScope / ...), st.settings.baseUrl is a
+    // remote URL whose huge /models catalog must NOT be listed under "Local endpoint" — that cloud
+    // is discovered via its own category (refreshOpenRouterModels), not here.
+    auto isLoopback = [](const char* u) {
+        std::string s = u ? u : "";
+        return s.find("localhost") != std::string::npos ||
+               s.find("127.0.0.1") != std::string::npos ||
+               s.find("0.0.0.0") != std::string::npos || s.find("[::1]") != std::string::npos;
+    };
+    if (!isLoopback(st.settings.baseUrl)) {
+        ProviderModels empty;
+        empty.checked = true;  // probed: no local server in use right now
+        st.providerModels[ui::PROV_LOCAL] = empty;
+        st.providerModels[ui::PROV_LLAMACPP] = empty;
+        return;
+    }
     static double lastProbe = -1e9;
     double now = ImGui::GetTime();
     if (!force && (st.modelProbeInFlight.load() || (now - lastProbe) < 5.0)) return;
@@ -1140,6 +1157,63 @@ void refreshModelAvailability(AppState& st, bool force) {
         st.providerModels[ui::PROV_LLAMACPP] = pm;  // same local endpoint family
         st.modelProbeInFlight.store(false);
     }, 12000);
+}
+
+// A row in the OpenRouter model list (curated preset or live-discovered free model).
+struct OpenRouterModel {
+    std::string id;
+    std::string label;
+    bool vision = false;
+    bool free = false;
+};
+std::vector<OpenRouterModel> openRouterModels(AppState& st);  // fwd (defined just below)
+
+// Probe OpenRouter's public /models catalog and cache the list of currently-FREE model ids (the
+// endpoint exposes per-model pricing). Stored in providerModels[PROV_CLOUDCOMPAT] so the OpenRouter
+// category can list every free model live instead of from a stale hardcoded set. Listing needs no
+// key (the catalog is public); running a free model still needs the OpenRouter key. Throttled — the
+// catalog changes slowly.
+void refreshOpenRouterModels(AppState& st, bool force) {
+    static double last = -1e9;
+    double now = ImGui::GetTime();
+    if (!force && (now - last) < 60.0) return;
+    last = now;
+    nlohmann::json p = {{"provider", "openai"},
+                        {"base_url", "https://openrouter.ai/api/v1"},
+                        {"api_key", st.settings.cloudKey}};
+    st.rpc.call("agent_list_models", p, [&st](const core::RpcResult& r) {
+        ProviderModels pm;
+        pm.checked = true;
+        if (r.ok && r.result.is_object()) {
+            pm.ok = r.result.value("ok", false);
+            if (r.result.contains("models") && r.result["models"].is_array())
+                for (const auto& m : r.result["models"])
+                    if (m.is_string()) pm.models.push_back(m.get<std::string>());
+            if (r.result.contains("free") && r.result["free"].is_array())
+                for (const auto& m : r.result["free"])
+                    if (m.is_string()) pm.free.push_back(m.get<std::string>());
+        } else {
+            pm.error = r.err.empty() ? "core unavailable" : r.err;
+        }
+        st.providerModels[ui::PROV_CLOUDCOMPAT] = pm;
+    }, 12000);
+}
+
+// The OpenRouter model list shown in the picker/manage UI: the curated presets PLUS every live
+// free model the catalog probe found (deduped). `free`/`vision` flags drive the row status.
+std::vector<OpenRouterModel> openRouterModels(AppState& st) {
+    refreshOpenRouterModels(st, false);
+    std::vector<OpenRouterModel> out;
+    std::set<std::string> seen;
+    for (const auto& p : ui::cloudPresets()) {
+        if (std::strcmp(ui::cloudServiceKey(p.baseUrl), "openrouter") != 0) continue;
+        out.push_back({p.id, p.label, p.vision,
+                       p.id.find(":free") != std::string::npos});
+        seen.insert(p.id);
+    }
+    for (const auto& id : st.providerModels[ui::PROV_CLOUDCOMPAT].free)
+        if (seen.insert(id).second) out.push_back({id, id, false, true});
+    return out;
 }
 
 // The active provider's API-key buffer (cloud providers keep separate keys; local reuses the
@@ -1506,21 +1580,28 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
                 if (!en) ImGui::EndDisabled();
             }
         }
-        // Cloud OpenAI-compatible SERVICES as their own categories (OpenRouter / Alibaba / DeepSeek),
-        // built from the curated presets and grouped by base URL.
+        // Cloud services as their own categories. OpenRouter is discovered LIVE so its category
+        // lists every currently-free model (plus curated paid presets); Alibaba/DeepSeek use presets.
         for (const char* svc : {"openrouter", "alibaba", "deepseek"}) {
-            int n = 0;
-            for (const auto& p : ui::cloudPresets())
-                if (std::strcmp(ui::cloudServiceKey(p.baseUrl), svc) == 0) ++n;
-            if (n == 0) continue;
-            if (catHeader(svc, n)) {
+            std::vector<OpenRouterModel> rows;
+            if (std::strcmp(svc, "openrouter") == 0) {
+                rows = openRouterModels(st);
+            } else {
+                for (const auto& p : ui::cloudPresets())
+                    if (std::strcmp(ui::cloudServiceKey(p.baseUrl), svc) == 0)
+                        rows.push_back({p.id, p.label, p.vision, false});
+            }
+            if (rows.empty()) continue;
+            if (catHeader(svc, (int)rows.size())) {
                 bool en = catEnabled(svc);
                 if (!en) ImGui::BeginDisabled();
                 ImGui::Indent(14 * S);
-                for (const auto& p : ui::cloudPresets()) {
-                    if (std::strcmp(ui::cloudServiceKey(p.baseUrl), svc) != 0) continue;
-                    visRow(p.id, p.label, p.vision ? "vision" : "chat", dimCol);
-                }
+                if (std::strcmp(svc, "openrouter") == 0)
+                    dimText("Free models discovered live from OpenRouter (cost $0; still need a key "
+                            "to run). Paid presets are listed too.");
+                for (const auto& r : rows)
+                    visRow(r.id, r.label, r.free ? "free" : (r.vision ? "vision" : "paid"),
+                           r.free ? okCol : dimCol);
                 ImGui::Unindent(14 * S);
                 if (!en) ImGui::EndDisabled();
             }
@@ -1773,8 +1854,25 @@ static void drawModelDropdown(AppState& st, bool busy) {
     // key is configured and the service category isn't bulk-disabled. Picking one points the active
     // Cloud API provider at that service's endpoint + model.
     if (st.settings.cloudKey[0]) {
+        // OpenRouter: the live list (all free models + curated paid), minus any the user hid.
+        if (!catOff("openrouter")) {
+            for (const auto& r : openRouterModels(st)) {
+                if (modelHidden(st, r.id) || !matchq(r.label, "openrouter free")) continue;
+                ++shown;
+                if (modelRow(st, ui::PROV_CLOUDCOMPAT, r.id, r.label, true, uid++)) {
+                    st.settings.provider = ui::PROV_CLOUDCOMPAT;
+                    std::strncpy(st.settings.model, r.id.c_str(), sizeof(st.settings.model) - 1);
+                    std::strncpy(st.settings.baseUrl, "https://openrouter.ai/api/v1",
+                                 sizeof(st.settings.baseUrl) - 1);
+                    st.settings.vision = r.vision;
+                    picked = true;
+                }
+            }
+        }
+        // Alibaba / DeepSeek curated presets.
         for (const auto& p : ui::cloudPresets()) {
             std::string key = ui::cloudServiceKey(p.baseUrl);
+            if (key == "openrouter") continue;  // handled above (live)
             if (catOff(key)) continue;
             if (modelHidden(st, p.id) || !matchq(p.label, key)) continue;
             ++shown;

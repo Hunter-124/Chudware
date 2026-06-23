@@ -550,10 +550,50 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                     return emit(json{{"ok", false}, {"models", models},
                                      {"error", "HTTP " + std::to_string(hr.status)}}, out_json, 0);
                 json parsed = json::parse(hr.body, nullptr, false);
+                json free = json::array();  // ids priced at $0 prompt (OpenRouter ":free" tiers etc.)
                 if (parsed.is_object() && parsed.contains("data") && parsed["data"].is_array())
-                    for (const auto& d : parsed["data"])
-                        if (d.contains("id") && d["id"].is_string())
-                            models.push_back(d["id"].get<std::string>());
+                    for (const auto& d : parsed["data"]) {
+                        if (!d.contains("id") || !d["id"].is_string()) continue;
+                        std::string id = d["id"].get<std::string>();
+                        models.push_back(id);
+                        // OpenRouter (and some others) expose per-model pricing; prompt=="0" => free.
+                        if (d.contains("pricing") && d["pricing"].is_object()) {
+                            const auto& pr = d["pricing"];
+                            auto pp = pr.find("prompt");
+                            auto cp = pr.find("completion");
+                            bool pfree = pp != pr.end() && pp->is_string() && pp->get<std::string>() == "0";
+                            bool cfree = cp == pr.end() ||
+                                         (cp->is_string() && cp->get<std::string>() == "0");
+                            // Only TEXT-ONLY-output models (real chat LLMs) — exclude free image/
+                            // audio/video generators (e.g. lyria outputs ["text","audio"]) that price
+                            // at $0 but can't drive the agent. Rule: output has "text" and no media.
+                            bool textOut = true;
+                            auto isMedia = [](const std::string& s) {
+                                return s == "audio" || s == "image" || s == "video";
+                            };
+                            if (d.contains("architecture") && d["architecture"].is_object()) {
+                                const auto& a = d["architecture"];
+                                if (a.contains("output_modalities") && a["output_modalities"].is_array()) {
+                                    bool hasText = false, hasMedia = false;
+                                    for (const auto& om : a["output_modalities"])
+                                        if (om.is_string()) {
+                                            if (om.get<std::string>() == "text") hasText = true;
+                                            else if (isMedia(om.get<std::string>())) hasMedia = true;
+                                        }
+                                    textOut = hasText && !hasMedia;
+                                } else if (a.contains("modality") && a["modality"].is_string()) {
+                                    std::string mod = a["modality"];
+                                    size_t arrow = mod.find("->");
+                                    std::string outp = arrow == std::string::npos ? mod : mod.substr(arrow + 2);
+                                    textOut = outp.find("text") != std::string::npos &&
+                                              outp.find("audio") == std::string::npos &&
+                                              outp.find("image") == std::string::npos &&
+                                              outp.find("video") == std::string::npos;
+                                }
+                            }
+                            if (pfree && cfree && textOut) free.push_back(id);
+                        }
+                    }
                 // The OpenAI-compatible /v1/models lists every DOWNLOADED model — including ones
                 // not currently loaded into memory, which can't actually serve a request. LM
                 // Studio's native REST endpoint (/api/v0/models) reports a per-model "state", so
@@ -574,13 +614,13 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 if (d.value("state", std::string()) == "loaded" &&
                                     d.contains("id") && d["id"].is_string())
                                     loaded.push_back(d["id"].get<std::string>());
-                            return emit(json{{"ok", true}, {"models", models},
+                            return emit(json{{"ok", true}, {"models", models}, {"free", free},
                                              {"loaded", loaded}, {"loaded_known", true}},
                                         out_json, 0);
                         }
                     }
                 }
-                return emit(json{{"ok", true}, {"models", models}}, out_json, 0);
+                return emit(json{{"ok", true}, {"models", models}, {"free", free}}, out_json, 0);
             }
             if (provider == "gemini") {
                 if (api_key.empty())

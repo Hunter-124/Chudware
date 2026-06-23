@@ -133,7 +133,21 @@ inline const std::vector<LocalPreset>& localPresets() {
 inline const std::vector<LocalPreset>& cloudPresets() {
     static const std::string kDashScope = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
     static const std::string kDeepSeek = "https://api.deepseek.com/v1";
+    static const std::string kOpenRouter = "https://openrouter.ai/api/v1";
     static const std::vector<LocalPreset> kPresets = {
+        // OpenRouter — one key, many models (Qwen / DeepSeek / open-weight). ":free" tiers cost
+        // nothing but are rate-limited upstream; paid slugs are cheap and reliable (needs credit /
+        // a non-zero key spend limit). Listed first since it's the easiest working cloud path.
+        {"qwen/qwen3-coder:free", "OpenRouter · Qwen3-Coder (free)", false,
+         "OpenRouter free tier — Qwen3 coder for op emission. Rate-limited; retries help.", kOpenRouter},
+        {"qwen/qwen-2.5-coder-32b-instruct", "OpenRouter · Qwen2.5-Coder 32B (paid)", false,
+         "OpenRouter paid — reliable Qwen coder for structured ops (needs credit).", kOpenRouter},
+        {"qwen/qwen2.5-vl-72b-instruct", "OpenRouter · Qwen2.5-VL 72B (vision, paid)", true,
+         "OpenRouter paid — Qwen vision model, great as the review judge (needs credit).", kOpenRouter},
+        {"deepseek/deepseek-chat", "OpenRouter · DeepSeek V3 (paid)", false,
+         "OpenRouter paid — DeepSeek V3 general/coding (needs credit).", kOpenRouter},
+        {"openai/gpt-oss-120b:free", "OpenRouter · GPT-OSS 120B (free)", false,
+         "OpenRouter free tier — open-weight 120B, currently reliable.", kOpenRouter},
         // Alibaba Cloud (DashScope) — Qwen flagship + vision + coder.
         {"qwen-max", "Alibaba Qwen-Max (flagship)", false,
          "Alibaba Cloud DashScope. Strong general model; needs a DashScope API key.", kDashScope},

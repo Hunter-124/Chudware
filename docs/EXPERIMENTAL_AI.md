@@ -37,7 +37,14 @@ in your local server.** These run fully local, so they are allowed under **Offli
 For when ITAR mode is **off**, there's also a **Cloud API (Qwen / DeepSeek / OpenAI-compatible)**
 provider (Settings → AI → Provider). It resolves as an `openai` provider with a cloud `base_url`, so:
 
-- **Alibaba Cloud (DashScope)** — `qwen-max`, `qwen-plus`, `qwen-vl-max`, `qwen-coder-plus`
+- **OpenRouter** (`https://openrouter.ai/api/v1`) — one key, many models. `:free` slugs cost nothing
+  but are rate-limited upstream; paid slugs (`qwen/qwen-2.5-coder-32b-instruct`,
+  `qwen/qwen2.5-vl-72b-instruct`, `deepseek/deepseek-chat`) are cheap + reliable once the key has a
+  non-zero spend limit / credit. Easiest working cloud path.
+- **Alibaba Cloud (DashScope)** — `qwen-max`, `qwen-plus`, `qwen-vl-max`, `qwen-coder-plus`.
+  Workspace-scoped (`sk-ws-…`) keys use a per-workspace endpoint
+  (`https://<ws-id>.<region>.maas.aliyuncs.com/compatible-mode/v1`), not the generic DashScope URL,
+  and the account must have model access activated (else `AccessDenied.Unpurchased`).
 - **DeepSeek API** — `deepseek-chat`, `deepseek-reasoner`
 
 Pick a preset (it fills the service endpoint + model), paste your API key, and go. **These are network

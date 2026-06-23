@@ -9,10 +9,13 @@ agent (the built-in chat, or any external agent such as Claude Code).
 > **Status:** a working parametric modeler. Sketches + relations/dimensions solver, the full
 > common feature set (extrude/revolve/sweep/loft/rib/shell/draft/fillet/chamfer/hole/pattern/
 > mirror), assemblies + mates, sheet metal, surfacing, weldments, drawings, FEA (static/modal)
-> + LBM flow + SPICE simulation, an **ECAD** module (schematic / PCB / native sim / Gerber), and
-> multi-format import/export (STEP/IGES/BREP/STL/3MF/OBJ/PLY/glTF/3dm + SolidWorks COM +
-> Parasolid) plus the native **`.step+`** document. See [ARCHITECTURE.md](ARCHITECTURE.md) and
-> [docs/PLAN.md](docs/PLAN.md) for the full design.
+> + LBM flow + SPICE simulation, an **ECAD** module (schematic / PCB / native sim / Gerber), a
+> **standard-parts library** (vendor hardware catalog — see [docs/PARTS_LIBRARY.md](docs/PARTS_LIBRARY.md)),
+> and multi-format import/export (STEP/IGES/BREP/STL/3MF/OBJ/PLY/glTF/3dm + SolidWorks COM +
+> Parasolid) plus the native **`.step+`** document. The built-in **AI copilot** can run a whole
+> **mission** end-to-end (design → assemble → simulate → verdict) from one prompt, with selectable
+> local/cloud model routing (Gemini, plus OpenRouter / Alibaba / DeepSeek presets). See
+> [ARCHITECTURE.md](ARCHITECTURE.md) and [docs/PLAN.md](docs/PLAN.md) for the full design.
 >
 > **In progress — the C++/CUDA core rewrite ([docs/CPP_MIGRATION.md](docs/CPP_MIGRATION.md)):**
 > the Python engine is being replaced, subsystem by subsystem, with a pure-C++ core shipped as
@@ -52,10 +55,13 @@ engine/          Python CAD engine (runs in the managed runtime)
                    stepplus (.step+ I/O), 110+ test_*.py suites
   ecad/            KiCad-class EDA: schematic, PCB, netlist, native MNA circuit sim, fab out
   sim/             simulation: FEA (static/modal), LBM CFD, SPICE
+  parts_library.py standard-parts library + parts_providers.py (vendor hardware catalog)
   kernel.py        v1: run build123d code -> ModelResult (subprocess-isolated)
   worker.py        JSON-RPC worker the C++ host spawns; render.py headless PNGs
 core/            C++/CUDA core rewrite (the Python-replacement, in progress)
   geom/ doc/ sketch/ solver/   geometry kernel, document compiler, SW sketch solver
+  agent/           C++ agent loop: roles, providers, state, mission orchestrator (mission.h)
+  parts/           C++ standard-parts catalog + generators
   api/             libaicad.{h,cpp} flat C ABI (aicad_call) + DLL load probe
   tests/           doctest suites (ctest); built with Eigen + OCCT 7.9.3
 host/            native C++ desktop app (GLFW + Dear ImGui + OpenGL)
@@ -65,10 +71,13 @@ host/            native C++ desktop app (GLFW + Dear ImGui + OpenGL)
   src/render/      offscreen GL renderer, id-pass picking, overlays
   CMakeLists.txt   MSVC build (fetches GLFW/ImGui/json)
 mcp_server/      MCP server exposing the engine as tools (run_model, doc ops, screenshots)
-agent/           built-in agent loop: prompt -> ops/code -> render -> visual self-check
+agent/           built-in agent loop: prompt -> ops/code -> render -> visual self-check;
+                 prompts/ roles incl. mission_planner + reporter, shared cheatsheets (hardware)
 installer/       runtime provisioning + Claude MCP self-registration + release packaging
-docs/            PLAN.md, ARCHITECTURE, CPP_MIGRATION, ECAD_*, FORMATS_*, contracts/, sessions/
-tools/           dev/diagnostic scripts (cpp_parity.py, cpp_session_parity.py, ...)
+mcp_setup.bat    portable multi-client MCP installer (Claude Code / Cursor / VS Code / opencode /
+                 Antigravity) -> installer/setup_mcp_clients.py
+docs/            PLAN.md, ARCHITECTURE, CPP_MIGRATION, ECAD_*, FORMATS_*, PARTS_LIBRARY, contracts/
+tools/           dev/diagnostic scripts (cpp_parity.py, cpp_session_parity.py, mission_*_verify, ...)
 build.bat        one-shot host build + dist sync (see below)
 ```
 
@@ -130,6 +139,13 @@ Drive the built-in agent loop from a prompt (needs an API key, or use the mock p
 $env:ANTHROPIC_API_KEY = "sk-ant-..."   # or copy config.example.json to %APPDATA%\AI-CAD\config.json
 & $py -m agent.run_agent "a 60x40x12mm bracket with two M5 clearance holes and a filleted back edge"
 & $py -m agent.test_loop_mock           # verify the loop logic with no API key
+```
+
+## Wire the MCP server into external agents
+Register the AI-CAD MCP server with every supported client (Claude Code, Cursor, VS Code,
+opencode, Antigravity) in one shot — the installer writes each client's config in its own format:
+```powershell
+mcp_setup.bat            # portable wrapper around installer/setup_mcp_clients.py
 ```
 
 ## Model-author contract (v1 `script` features)

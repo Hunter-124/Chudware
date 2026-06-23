@@ -416,36 +416,61 @@ void drawSettingsModal(AppState& st, bool busy) {
                 dimText("Opt-in, default-off features from the model/provider research. All run "
                         "fully local (ITAR-safe) and are additive — off = the standard copilot.");
 
-                // --- Separate vision-review provider (the Seek-CAD split) ---
+                // --- Model routing: command model vs. vision/spatial model ---
                 ImGui::Dummy(ImVec2(0, 4 * sc));
-                ImGui::SeparatorText("Local vision review (Seek-CAD split)");
-                bool vrChanged = ImGui::Checkbox("Use a separate local model to review renders",
-                                                 &settings.expVisionReview);
-                helpMarker("When on, a LOCAL OpenAI-compatible vision model (e.g. a self-hosted "
-                           "Qwen2.5-VL) judges the rendered viewport during the review/fix stages, "
-                           "while your main provider plans and emits the CAD ops. This lets you pair "
-                           "a strong/cloud planner with a local vision judge — or keep the whole "
-                           "self-correction loop local for ITAR. The endpoint must be reachable and "
-                           "the model must support images.");
-                dimText("Main provider emits ops; this model sees the screenshot and drives fixes.");
+                ImGui::SeparatorText("Model routing");
+
+                // Command model = the active main provider/model (emits + parses the CAD ops). It's
+                // chosen in the AI tab / composer picker; shown here read-only for clarity.
+                ImGui::TextUnformatted("Command model (sends & parses CAD ops)");
+                helpMarker("The model that drives the agent loop: understands the request, plans, and "
+                           "emits/parses the CAD operations. Pick it in the AI tab or the composer's "
+                           "model chip. Shown here so you can see both routes side by side.");
+                {
+                    char cm[600];
+                    std::snprintf(cm, sizeof(cm), "   %s  \xc2\xb7  %s",
+                                  ui::providerLabel(settings.provider),
+                                  settings.model[0] ? settings.model : "(default)");
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.accent[0],
+                                          ui::palette.accent[1], ui::palette.accent[2], 1));
+                    ImGui::TextUnformatted(cm);
+                    ImGui::PopStyleColor();
+                }
+
+                ImGui::Dummy(ImVec2(0, 6 * sc));
+                ImGui::Checkbox("Route vision & spatial reasoning through a separate model",
+                                &settings.expVisionReview);
+                helpMarker("When on, a vision model judges the rendered viewport during the "
+                           "review/fix stages (spatial awareness), while the command model above "
+                           "plans and emits ops — the Seek-CAD split. It can be local (ITAR-safe) or "
+                           "a cloud vision model (e.g. Qwen-VL). When off, the command model handles "
+                           "vision too (if it supports images). Refused under Offline mode if cloud.");
+                dimText("Command model emits ops; this vision model sees the screenshot and drives fixes.");
                 if (settings.expVisionReview) {
                     ImGui::Dummy(ImVec2(0, 2 * sc));
-                    ImGui::TextUnformatted("Vision model preset");
-                    // Only the vision-capable presets make sense as a review judge.
+                    ImGui::TextUnformatted("Vision / spatial model");
+                    // Vision-capable presets: cloud (Qwen-VL via OpenRouter/DashScope) + local.
                     std::vector<const char*> vlabels;
-                    std::vector<const std::string*> vids;
+                    std::vector<const ui::LocalPreset*> vps;
                     vlabels.push_back("(custom / type below)");
-                    vids.push_back(nullptr);
-                    for (const auto& p : ui::localPresets())
-                        if (p.vision) { vlabels.push_back(p.label.c_str()); vids.push_back(&p.id); }
+                    vps.push_back(nullptr);
+                    for (const auto& p : ui::cloudPresets()) if (p.vision) { vlabels.push_back(p.label.c_str()); vps.push_back(&p); }
+                    for (const auto& p : ui::localPresets()) if (p.vision) { vlabels.push_back(p.label.c_str()); vps.push_back(&p); }
                     int vsel = 0;
-                    for (int i = 1; i < (int)vids.size(); ++i)
-                        if (vids[i] && *vids[i] == settings.expVisionModel) vsel = i;
+                    for (int i = 1; i < (int)vps.size(); ++i)
+                        if (vps[i] && vps[i]->id == settings.expVisionModel) vsel = i;
                     ImGui::SetNextItemWidth(-1);
                     if (ImGui::Combo("##expvispreset", &vsel, vlabels.data(), (int)vlabels.size()) &&
-                        vsel > 0 && vids[vsel]) {
-                        std::strncpy(settings.expVisionModel, vids[vsel]->c_str(),
-                                     sizeof(settings.expVisionModel) - 1);
+                        vsel > 0 && vps[vsel]) {
+                        const ui::LocalPreset* p = vps[vsel];
+                        std::strncpy(settings.expVisionModel, p->id.c_str(), sizeof(settings.expVisionModel) - 1);
+                        std::strncpy(settings.expVisionBaseUrl, p->baseUrl.c_str(), sizeof(settings.expVisionBaseUrl) - 1);
+                        // Cloud vision preset => prefill the cloud key; local => clear (optional key).
+                        bool isCloud = std::strcmp(ui::cloudServiceKey(p->baseUrl), "cloud") != 0 ||
+                                       p->baseUrl.rfind("http://localhost", 0) != 0;
+                        std::strncpy(settings.expVisionKey,
+                                     isCloud && settings.cloudKey[0] ? settings.cloudKey : "",
+                                     sizeof(settings.expVisionKey) - 1);
                     }
                     ImGui::TextUnformatted("Model id");
                     ImGui::SetNextItemWidth(-1);
@@ -455,10 +480,13 @@ void drawSettingsModal(AppState& st, bool busy) {
                     ImGui::SetNextItemWidth(-1);
                     ImGui::InputText("##expvisbase", settings.expVisionBaseUrl,
                                      sizeof(settings.expVisionBaseUrl));
-                    helpMarker("Your local OpenAI-compatible server (LM Studio / Ollama / vLLM). "
-                               "Must be a loopback address when Offline mode is on.");
+                    ImGui::TextUnformatted("API key (blank for a local endpoint)");
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputText("##expviskey", settings.expVisionKey, sizeof(settings.expVisionKey),
+                                     ImGuiInputTextFlags_Password);
+                    helpMarker("Local: LM Studio / Ollama / vLLM (loopback, no key needed). Cloud: a "
+                               "vision model endpoint + its API key (refused under Offline mode).");
                 }
-                (void)vrChanged;
 
                 // --- Parametric sequence mode (DeepCAD / CAD-Coder direction) ---
                 ImGui::Dummy(ImVec2(0, 8 * sc));

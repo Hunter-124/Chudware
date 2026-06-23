@@ -695,12 +695,48 @@ static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     }
 }
 
+// --- model-routing + context-meter helpers (transparency UI) -----------------------------------
+// "openai/gpt-oss-120b:free" -> "gpt-oss-120b" for compact display.
+static std::string shortModelName(const std::string& id) {
+    std::string s = id;
+    size_t slash = s.rfind('/'); if (slash != std::string::npos) s = s.substr(slash + 1);
+    size_t colon = s.find(':');  if (colon != std::string::npos) s = s.substr(0, colon);
+    return s;
+}
+static std::string fmtTokens(int n) {
+    char b[32];
+    if (n >= 1000000) std::snprintf(b, sizeof(b), "%.1fM", n / 1000000.0);
+    else if (n >= 1000) std::snprintf(b, sizeof(b), "%dk", (n + 500) / 1000);
+    else std::snprintf(b, sizeof(b), "%d", n);
+    return b;
+}
+// The active model's total context window (mirrors core default_context_window for the meter).
+static int effectiveContextWindow(const Settings& s) {
+    if (s.contextWindow > 0) return s.contextWindow;
+    switch (s.provider) {
+        case ui::PROV_GEMINI: return 1048576;
+        case ui::PROV_ANTHROPIC: return 200000;
+        case ui::PROV_OPENAI:
+        case ui::PROV_CLOUDCOMPAT: return 128000;
+        default: return 8192;  // local / unknown
+    }
+}
+// Which model handles a given stage, per the routing config: the vision/spatial model runs the
+// review+fix stages when enabled; the command model runs everything else.
+static std::string stageModel(const Settings& s, const std::string& stage) {
+    bool visionStage =
+        stage.find("review") != std::string::npos || stage.find("fix") != std::string::npos;
+    if (s.expVisionReview && visionStage && s.expVisionModel[0]) return s.expVisionModel;
+    return s.model;
+}
+
 // The transparent activity timeline: one expandable row per thing the AI did/thought, with a
 // status glyph (drawn with the draw list — check/arrow glyphs are not in the body font), the
 // plain-language heading, optional verdict reason, and a click-to-expand body that reveals the
 // raw reasoning/output behind the step. This is the primary "what the AI is doing" surface and
-// replaces the old separate Activity panel + cramped embedded run tree.
-static void drawActivityTimeline(ChatMsg& m, const ui::Fonts& fonts) {
+// replaces the old separate Activity panel + cramped embedded run tree. `cfg` drives the per-row
+// "which model ran this stage" label.
+static void drawActivityTimeline(ChatMsg& m, const ui::Fonts& fonts, const Settings& cfg) {
     if (m.activity.empty()) return;
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
@@ -780,6 +816,16 @@ static void drawActivityTimeline(ChatMsg& m, const ui::Fonts& fonts) {
             ImGui::TextUnformatted(meta);
             ImGui::PopStyleColor();
         }
+        // Which model ran (or is running) this stage — the transparency the user asked for.
+        if (!a.missionHeader) {
+            std::string mdl = shortModelName(stageModel(cfg, a.stage));
+            if (!mdl.empty()) {
+                ImGui::SameLine(0, 8 * sc);
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+                ImGui::Text("\xc2\xb7 %s", mdl.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
         if (!a.reason.empty()) {
             ImGui::Indent(gw + 6 * sc);
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
@@ -808,7 +854,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     if (m.plan.present) drawPlanCard(m.plan, fonts);
 
     // Transparent activity timeline — what the AI is doing / thinking, inline + expandable.
-    drawActivityTimeline(m, fonts);
+    drawActivityTimeline(m, fonts, st.settings);
 
     if (!m.text.empty()) {
         if (m.errKind == ERR_SYSTEM)
@@ -844,6 +890,15 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1));
         ImGui::TextWrapped("%s", m.liveStatus.empty() ? "working..." : m.liveStatus.c_str());
         ImGui::PopStyleColor();
+        // Which model(s) are driving this turn — transparency about what's actually running.
+        {
+            std::string line = "Command model: " + shortModelName(st.settings.model);
+            if (st.settings.expVisionReview && st.settings.expVisionModel[0])
+                line += "   \xc2\xb7   Vision: " + shortModelName(st.settings.expVisionModel);
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+            ImGui::TextWrapped("%s", line.c_str());
+            ImGui::PopStyleColor();
+        }
         // thin animated accent progress bar
         ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ui::Palette::toU32(pal.accent));
         ImGui::PushStyleColor(ImGuiCol_FrameBg, ui::Palette::toU32(pal.accentSoft));
@@ -2282,6 +2337,45 @@ static void drawComposerChips(AppState& st, bool busy) {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Whether the AI plans and asks before modeling.");
     if (ImGui::BeginPopup("##runmode")) { drawRunModeMenu(st); ImGui::EndPopup(); }
+
+    // ---- context meter (right-aligned) — like Claude Code / Codex / VS Code ----
+    // How full the model's context window was on the last call (input-token estimate), so the user
+    // can see headroom before a small local window overruns mid-chain.
+    {
+        int win = effectiveContextWindow(st.settings);
+        int used = st.lastContextTokens;
+        float frac = win > 0 ? std::min(1.0f, (float)used / (float)win) : 0.0f;
+        std::string txt = "ctx " + fmtTokens(used) + "/" + fmtTokens(win);
+        const float barW = 44 * sc, gap = 6 * sc;
+        float tw = ImGui::CalcTextSize(txt.c_str()).x;
+        float total = barW + gap + tw;
+        float x = ImGui::GetContentRegionMax().x - total;
+        if (x > ImGui::GetCursorPosX() + 8 * sc) {  // only if it fits on the row
+            ImGui::SameLine(x);
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            float h = ImGui::GetTextLineHeight();
+            float by0 = p.y + h * 0.32f, by1 = p.y + h * 0.68f;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImU32 fg = frac < 0.5f ? IM_COL32(120, 200, 120, 255)
+                     : frac < 0.85f ? IM_COL32(220, 170, 90, 255)
+                                    : IM_COL32(220, 110, 100, 255);
+            dl->AddRectFilled(ImVec2(p.x, by0), ImVec2(p.x + barW, by1),
+                              ui::Palette::toU32(pal.accentSoft), 2 * sc);
+            if (frac > 0)
+                dl->AddRectFilled(ImVec2(p.x, by0), ImVec2(p.x + barW * frac, by1), fg, 2 * sc);
+            dl->AddRect(ImVec2(p.x, by0), ImVec2(p.x + barW, by1),
+                        ui::Palette::toU32(pal.textDim), 2 * sc);
+            ImGui::Dummy(ImVec2(barW, h));
+            ImGui::SameLine(0, gap);
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+            ImGui::TextUnformatted(txt.c_str());
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Context window usage — the last model call's input tokens vs the "
+                                  "active model's window (%d / %d).\nSet the window in AI settings if "
+                                  "your local model differs.", used, win);
+        }
+    }
 
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar();

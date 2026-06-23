@@ -1648,6 +1648,14 @@ int run_gui(const char* screenshotPath) {
                             // Fold the event into the running turn's inline activity timeline so
                             // the conversation transparently shows what the AI is doing/thinking.
                             if (active) feedTurnActivity(*active, orchKind, data);
+                            // Context meter: reset at run start; track the latest call's input-token
+                            // estimate (how full the model's context is right now).
+                            if (orchKind == "run_started") st.lastContextTokens = 0;
+                            else if (orchKind == "agent_output" && data.contains("tokens") &&
+                                     data["tokens"].is_object()) {
+                                int in = data["tokens"].value("in", 0);
+                                if (in > 0) st.lastContextTokens = in;
+                            }
                         } catch (...) {}
                         // Also update the compact status line in the chat
                         if (!e.notes.empty()) {
@@ -1868,6 +1876,14 @@ int run_gui(const char* screenshotPath) {
                     assistant = "Built it, but couldn't load the mesh: " + e;
                     assistantErr = ERR_SYSTEM;
                 }
+            } else if (wasV2 && st.job.isMission && !st.job.missionVerdict.empty() &&
+                       st.job.error.empty()) {
+                // Mission run: the report/verdict prose IS the assistant's reply (it already
+                // narrates what was built + the analysis conclusion). The assembly tab / doc
+                // rebuild were handled above; we just surface the verdict as the bubble text.
+                st.status = "Done";
+                st.statusKind = 0;
+                assistant = st.job.missionVerdict;
             } else if (wasV2 && st.job.error.empty()) {
                 // C40: a v2 orchestrator run has no job.stl — the doc itself was built. Without
                 // this branch the assistant bubble finished EMPTY (the run looked dead even when

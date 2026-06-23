@@ -123,6 +123,7 @@ struct Settings {
     bool expVisionReview = false;
     char expVisionModel[512] = "qwen2.5-vl-7b-instruct";
     char expVisionBaseUrl[256] = "http://localhost:1234/v1";
+    char expVisionKey[256] = "";   // API key for the vision endpoint (cloud vision model; blank=local)
     // Modeler prompt augmentation toward an editable parametric feature SEQUENCE (DeepCAD /
     // CAD-Coder-style design history) over a monolithic solid. Serialized "experimental.cad_sequence_mode".
     bool expCadSequenceMode = false;
@@ -1021,6 +1022,10 @@ struct AppState {
     // Live status line for the v2 orchestrator run, shown in the chat area
     std::string agentV2Status;              // e.g. "PLAN > planner attempt 1..."
     bool agentV2Running = false;            // a v2 run is in flight (blocks concurrent runs)
+    // Live context-meter telemetry: the most recent agent call's INPUT token estimate (how full the
+    // model's context is right now) — fed from agent_output events, reset at run start. The composer
+    // shows it vs the active model's window like the Claude Code / Codex / VS Code context meters.
+    int lastContextTokens = 0;
     // --- end C22b ---
 
     // ---- Stop + message queue (modern agentic composer) ----

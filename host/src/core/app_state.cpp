@@ -148,6 +148,7 @@ void loadSettings(Settings& s) {
                         vr.value("model", std::string("qwen2.5-vl-7b-instruct")));
                 copyStr(s.expVisionBaseUrl, sizeof(s.expVisionBaseUrl),
                         vr.value("base_url", std::string("http://localhost:1234/v1")));
+                copyStr(s.expVisionKey, sizeof(s.expVisionKey), vr.value("api_key", std::string()));
             }
             s.expCadSequenceMode = exp.value("cad_sequence_mode", false);
         }
@@ -228,6 +229,7 @@ void saveSettings(const Settings& s) {
                 {"model", s.expVisionModel[0] ? s.expVisionModel : "qwen2.5-vl-7b-instruct"},
                 {"base_url", s.expVisionBaseUrl[0] ? s.expVisionBaseUrl
                                                    : "http://localhost:1234/v1"},
+                {"api_key", s.expVisionKey},
             };
         }
         if (s.expCadSequenceMode) exp["cad_sequence_mode"] = true;

@@ -127,7 +127,8 @@ float pairwise_sum_f32(const float* a, std::size_t n) {
 }  // namespace
 
 LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
-                  const LbmParams& p, int n_steps) {
+                  const LbmParams& p, int n_steps,
+                  const std::function<void(int, int)>& on_progress) {
     LbmResult R;
     R.nx = nx;
     R.ny = ny;
@@ -470,6 +471,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
             double d = 0.0, l = 0.0;
             momentum_exchange(f, d, l);
             drag_hist.push_back(d);
+            if (on_progress) on_progress(step, n_steps);  // live progress (read-only)
         }
     }
     step = n_steps;  // loop exits with step == n_steps+1; oracle's `step` is last value

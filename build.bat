@@ -76,7 +76,7 @@ if not exist "%DIST%" mkdir "%DIST%"
 
 if /i not "%MODE%"=="app" (
   copy /y "%EXE%" "%DIST%\AI-CAD.exe" >nul || goto :fail
-  robocopy "%ROOT%\host\assets" "%DIST%\assets" /MIR /XF Rubik-VF.ttf make_logo.py /XD __pycache__ /NFL /NDL /NJH /NJS /NP >nul
+  robocopy "%ROOT%\host\assets" "%DIST%\assets" /MIR /XF Rubik-VF.ttf make_logo.py /XD __pycache__ /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
   if errorlevel 8 goto :fail
   rem --- stage the C++ core (libaicad.dll + its OCCT/gmsh sibling DLLs) next to
   rem     the exe so the host loads the in-process C++ engine with NO env override
@@ -84,8 +84,15 @@ if /i not "%MODE%"=="app" (
   set "CORE_BIN=%ROOT%\core\build-occt\bin\Release"
   if exist "%ROOT%\core\build-occt\bin\Release\libaicad.dll" (
     echo [build] staging C++ core DLLs from core\build-occt\bin\Release ...
-    robocopy "%ROOT%\core\build-occt\bin\Release" "%DIST%" *.dll /NFL /NDL /NJH /NJS /NP >nul
-    if errorlevel 8 goto :fail
+    rem /R:2 /W:1 so a DLL locked by a RUNNING app/MCP fails fast (≈2s) instead of robocopy's
+    rem default million-retry (which hangs the build for ~30 min). If this fails, close the
+    rem desktop app AND any running MCP server (they hold libaicad.dll + the OCCT TK*.dll), then rerun.
+    robocopy "%ROOT%\core\build-occt\bin\Release" "%DIST%" *.dll /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+    if errorlevel 8 (
+      echo [build] ERROR: could not stage core DLLs -- a DLL is locked. Close AI-CAD.exe AND any
+      echo [build]        running AI-CAD MCP server ^(both load libaicad.dll / OCCT TK*.dll^), then rerun.
+      goto :fail
+    )
   ) else (
     echo [build] WARNING: core\build-occt\bin\Release\libaicad.dll not found -- C++ core NOT staged.
     echo [build]          The app will fall back to the Python worker. Build the core with:
@@ -94,12 +101,12 @@ if /i not "%MODE%"=="app" (
 )
 
 for %%P in (engine agent mcp_server installer) do (
-  robocopy "%ROOT%\%%P" "%DIST%\app\%%P" /MIR /XD __pycache__ build samples /XF *.pyc /NFL /NDL /NJH /NJS /NP >nul
+  robocopy "%ROOT%\%%P" "%DIST%\app\%%P" /MIR /XD __pycache__ build samples /XF *.pyc /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
   if errorlevel 8 goto :fail
 )
 for %%P in (llamacpp models) do (
   if exist "%ROOT%\%%P" (
-    robocopy "%ROOT%\%%P" "%DIST%\%%P" /MIR /XD __pycache__ /XF *.pyc /NFL /NDL /NJH /NJS /NP >nul
+    robocopy "%ROOT%\%%P" "%DIST%\%%P" /MIR /XD __pycache__ /XF *.pyc /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
     if errorlevel 8 goto :fail
   )
 )

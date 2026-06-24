@@ -184,6 +184,12 @@ std::vector<aicm::AicmBody> doc_tessellate_bodies(const std::string& doc_id);
 // text-only review). Never throws.
 nlohmann::json doc_render_png(const std::string& doc_id, const std::string& out_path);
 
+// drawing_render_png: rasterize a 2D DRAWING document (its projected views) to a PNG at
+// `out_path` so the AI can SEE and self-review a drawing the same way it does a 3D part
+// (Bug D-1). Visible edges black, hidden edges grey, on white paper, auto-fit. Returns
+// {"ok": bool, "path", "visible", "hidden"}. Fail-soft on a non-drawing doc / no views.
+nlohmann::json drawing_render_png(const std::string& doc_id, const std::string& out_path);
+
 // doc_face_points: resolve the face `selector` (kind=="face") against the LAST body's
 // faces and sample that face's triangulation nodes in WORLD space, down-sampled to at
 // most `max_n` points (uniform stride). Returns {"points": [[x,y,z],...], "tol_mm":
@@ -215,6 +221,10 @@ nlohmann::json doc_weld_cut_list(const std::string& doc_id);
 // moments[3], principal_axes[3][3], material{density_g_cm3}}. A surface body returns the
 // {is_surface, area_mm2, ...} report. Throws OpError on no bodies / a bad body_id.
 nlohmann::json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3);
+
+// doc_bbox: precise world AABB of the whole document. Returns {min[3], max[3], size[3],
+// center[3]} in mm. Throws OpError on no bodies / an empty box.
+nlohmann::json doc_bbox(const std::string& doc_id);
 
 // Evaluate — geometry-validity report of the active body (port of evaluate.py::check via
 // worker.py::_eval_check). Runs BRepCheck_Analyzer + free-edge / tiny-edge / sliver-face

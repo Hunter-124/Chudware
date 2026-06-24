@@ -23,6 +23,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -77,7 +78,10 @@ struct LbmResult {
 // Smagorinsky depending on tau0>0.55) -> stream -> inlet -> outlet -> lateral slip
 // -> bounce-back -> zero-solid, then momentum-exchange drag/Cd at the end. Never
 // throws; a bad mask/params returns ok=false with an error string.
+// `on_progress(step, n_steps)` (optional) is invoked at the ~50 convergence checkpoints so a
+// long run can report live progress; it must not touch the lattice (it is read-only timing).
 LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
-                  const LbmParams& p, int n_steps);
+                  const LbmParams& p, int n_steps,
+                  const std::function<void(int, int)>& on_progress = {});
 
 }  // namespace aicad::sim

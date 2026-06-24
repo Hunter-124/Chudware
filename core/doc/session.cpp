@@ -352,8 +352,13 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
     // type/name/suppressed/params/refs/folder are kept above, so a stray top-level option
     // would be SILENTLY DROPPED -> wrong geometry with no error (a cut cylinder fuses).
     // Relocate the known options into params so both conventions behave identically.
+    // `body` is the transform/fillet/chamfer/shell/hole/draft target — documented as a
+    // top-level field; without hoisting it here it was dropped on persistence, so
+    // transform body:"fN" silently moved the current/last body instead (the assembly
+    // mistargeting bug T-1). `copy` is transform's instancing flag, same hazard.
     if (env["params"].is_object()) {
-        for (const char* k : {"mode", "merge", "centered", "at", "at_offset", "offset"}) {
+        for (const char* k : {"mode", "merge", "centered", "at", "at_offset", "offset",
+                              "body", "copy"}) {
             if (feat.contains(k) && !env["params"].contains(k)) env["params"][k] = feat[k];
         }
     }
@@ -4044,6 +4049,89 @@ json doc_render_png(const std::string& doc_id, const std::string& out_path) {
     }
 }
 
+// Rasterize a 2D DRAWING document to a PNG so the AI can SEE and self-review the drawing
+// it just made — the same feedback loop it has for 3D parts (Bug D-1; previously
+// render_part threw an opaque "render exception" because a drawing has no 3D bodies and
+// lives in a separate session registry). Visible edges draw black, hidden edges light
+// grey, on white paper, auto-fit to the canvas. Returns {ok, path, visible, hidden}.
+json drawing_render_png(const std::string& doc_id, const std::string& out_path) {
+    try {
+        // drawing_get works on the drawing-session registry (its own locking); it throws
+        // unknown_doc if doc_id isn't an open drawing.
+        json full = aicad::doc::drawing_get(doc_id);
+
+        std::vector<std::vector<std::array<double, 2>>> visible, hidden;
+        auto pool = [](const json& jpls,
+                       std::vector<std::vector<std::array<double, 2>>>& out) {
+            if (!jpls.is_array()) return;
+            for (const auto& jpl : jpls) {
+                if (!jpl.is_array() || jpl.size() < 2) continue;
+                std::vector<std::array<double, 2>> pl;
+                for (const auto& jp : jpl)
+                    if (jp.is_array() && jp.size() >= 2)
+                        pl.push_back({jp[0].get<double>(), jp[1].get<double>()});
+                if (pl.size() >= 2) out.push_back(std::move(pl));
+            }
+        };
+        if (full.contains("sheets") && full["sheets"].is_array())
+            for (const auto& sheet : full["sheets"])
+                if (sheet.contains("views") && sheet["views"].is_array())
+                    for (const auto& view : sheet["views"]) {
+                        pool(view.value("visible", json::array()), visible);
+                        pool(view.value("hidden", json::array()), hidden);
+                    }
+        if (visible.empty() && hidden.empty())
+            return json{{"ok", false},
+                        {"reason", "drawing has no view geometry to render — add views, then Rebuild"}};
+
+        double minx = 1e30, miny = 1e30, maxx = -1e30, maxy = -1e30;
+        auto acc = [&](const std::vector<std::vector<std::array<double, 2>>>& src) {
+            for (const auto& pl : src)
+                for (const auto& p : pl) {
+                    minx = std::min(minx, p[0]); miny = std::min(miny, p[1]);
+                    maxx = std::max(maxx, p[0]); maxy = std::max(maxy, p[1]);
+                }
+        };
+        acc(visible); acc(hidden);
+        if (!(maxx > minx) || !(maxy > miny))
+            return json{{"ok", false}, {"reason", "degenerate drawing bounds"}};
+
+        const int W = 1100, H = 850, margin = 40;
+        std::vector<unsigned char> img(static_cast<std::size_t>(W) * H * 3, 255);  // white paper
+        const double sc = std::min(double(W - 2 * margin) / (maxx - minx),
+                                   double(H - 2 * margin) / (maxy - miny));
+        const double offx = margin + (W - 2 * margin - (maxx - minx) * sc) / 2.0;
+        const double offy = margin + (H - 2 * margin - (maxy - miny) * sc) / 2.0;
+        auto to_pix = [&](const std::array<double, 2>& p, int& ix, int& iy) {
+            ix = static_cast<int>(offx + (p[0] - minx) * sc);
+            iy = static_cast<int>(H - (offy + (p[1] - miny) * sc));  // flip Y: sheet-up = image-up
+        };
+        for (const auto& pl : hidden)
+            for (std::size_t i = 1; i < pl.size(); ++i) {
+                int x0, y0, x1, y1; to_pix(pl[i - 1], x0, y0); to_pix(pl[i], x1, y1);
+                draw_line(img, W, H, x0, y0, x1, y1, 150, 150, 150);
+            }
+        for (const auto& pl : visible)
+            for (std::size_t i = 1; i < pl.size(); ++i) {
+                int x0, y0, x1, y1; to_pix(pl[i - 1], x0, y0); to_pix(pl[i], x1, y1);
+                draw_line(img, W, H, x0, y0, x1, y1, 20, 20, 20);
+            }
+        std::string png = encode_png_rgb(W, H, img);
+        if (png.empty()) return json{{"ok", false}, {"reason", "png encode failed"}};
+        std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+        if (!f) return json{{"ok", false}, {"reason", "cannot open output path"}};
+        f.write(png.data(), static_cast<std::streamsize>(png.size()));
+        if (!f) return json{{"ok", false}, {"reason", "png write failed"}};
+        return json{{"ok", true}, {"path", out_path},
+                    {"visible", static_cast<int>(visible.size())},
+                    {"hidden", static_cast<int>(hidden.size())}};
+    } catch (const OpError&) {
+        return json{{"ok", false}, {"reason", "not a drawing document"}};
+    } catch (...) {
+        return json{{"ok", false}, {"reason", "drawing render exception"}};
+    }
+}
+
 json doc_query(const std::string& doc_id, const json& query) {
     std::lock_guard<std::mutex> lk(g_mtx);
     Session& s = require_session(doc_id);
@@ -4126,6 +4214,31 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
     for (const auto& p : pts) points.push_back({p[0], p[1], p[2]});
     const double tol_mm = std::max(0.5, diag * 0.02);
     return json{{"points", points}, {"tol_mm", tol_mm}};
+}
+
+// Precise world axis-aligned bounding box of the whole document (all bodies), via
+// BRepBndLib::AddOptimal (matches the sim/eval box). Returns {min,max,size,center} in mm.
+// Used to hand callers (e.g. make_standard_part) the extents + a placement datum so they
+// can position a part without a measure round-trip (Bug A-1).
+json doc_bbox(const std::string& doc_id) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    if (r.shapes.empty())
+        throw OpError("invalid_op", "document has no bodies to bound", {{"doc_id", doc_id}});
+    Bnd_Box box;
+    for (const TopoDS_Shape& shp : r.shapes)
+        if (!shp.IsNull()) BRepBndLib::AddOptimal(shp, box);
+    if (box.IsVoid())
+        throw OpError("invalid_op", "bounding box is empty", {{"doc_id", doc_id}});
+    Standard_Real xmin, ymin, zmin, xmax, ymax, zmax;
+    box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+    return json{
+        {"min", {xmin, ymin, zmin}},
+        {"max", {xmax, ymax, zmax}},
+        {"size", {xmax - xmin, ymax - ymin, zmax - zmin}},
+        {"center", {(xmin + xmax) / 2.0, (ymin + ymax) / 2.0, (zmin + zmax) / 2.0}},
+    };
 }
 
 // Port of engine/doc/evaluate.py::mass_props (via engine/worker.py::_eval_mass). Computes

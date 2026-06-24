@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -108,6 +109,15 @@ def _publish_current(doc_id: str) -> Optional[dict]:
         return None
 
 
+# A per-process session id stamped onto every autosave. Recovery is scoped to the
+# SINGLE most-recent PRIOR session (the one that crashed), not the whole autosave
+# history, so a restart doesn't drag in 19 unrelated old docs (Bug S-1).
+import uuid as _uuid_session  # noqa: E402
+_SESSION_ID = _uuid_session.uuid4().hex[:12]
+# Autosaves older than this are pruned at startup so the directory can't grow forever.
+_AUTOSAVE_MAX_AGE_DAYS = float(os.environ.get("AI_CAD_AUTOSAVE_MAX_AGE_DAYS", "7") or 7)
+
+
 def _autosave_dir() -> Path:
     base = os.environ.get("APPDATA") or tempfile.gettempdir()
     d = Path(base) / "AI-CAD" / "mcp_autosave"
@@ -115,31 +125,103 @@ def _autosave_dir() -> Path:
     return d
 
 
-def _autosave(doc_id: Optional[str]) -> None:
-    """Persist a doc to a recoverable .step+ so a server restart (e.g. after a client timeout)
-    can reload it instead of dropping every open document. Best-effort; never raises."""
+def _autosave(doc_id: Optional[str], name: Optional[str] = None) -> None:
+    """Persist a doc to a recoverable .step+ (plus a sidecar tagging the session) so a
+    server restart — e.g. after a client timeout killed it — can reload THIS session's
+    work instead of dropping every open document. Best-effort; never raises."""
     if not doc_id:
         return
     try:
-        cb.call("doc_save", {"doc_id": doc_id, "path": str(_autosave_dir() / f"{doc_id}.step+")})
+        path = _autosave_dir() / f"{doc_id}.step+"
+        cb.call("doc_save", {"doc_id": doc_id, "path": str(path)})
+        meta = {"session": _SESSION_ID, "doc_id": doc_id, "name": name or "",
+                "saved_at": time.time()}
+        (_autosave_dir() / f"{doc_id}.json").write_text(json.dumps(meta))
     except Exception:  # noqa: BLE001
         pass
 
 
-def recover_autosaved() -> list:
-    """Reopen every autosaved .step+ into the engine (called at server startup). A reopened doc
-    gets a FRESH doc_id; returns [{path, doc_id}] for the ones that loaded. Best-effort."""
+def _autosave_all_open() -> None:
+    """Autosave EVERY open document. Called before a heavy solve so a transport timeout
+    that kills the server can never lose an unrelated open part (Bug R-1)."""
+    try:
+        docs = (cb.call("doc_list", {}) or {}).get("docs", [])
+    except Exception:  # noqa: BLE001
+        return
+    for d in docs:
+        did = d.get("doc_id") if isinstance(d, dict) else None
+        if did:
+            _autosave(did, d.get("name") if isinstance(d, dict) else None)
+
+
+def _prune_autosaves(max_age_days: float = _AUTOSAVE_MAX_AGE_DAYS) -> int:
+    """Delete autosave .step+ / sidecars older than max_age_days (by mtime). Returns count."""
+    n = 0
+    cutoff = time.time() - max_age_days * 86400.0
+    try:
+        for p in _autosave_dir().glob("*.step+"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+                    p.with_suffix(".json").unlink(missing_ok=True)
+                    n += 1
+            except OSError:
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return n
+
+
+def _autosave_session_of(step_path: Path) -> tuple[Optional[str], float, str]:
+    """(session_id, saved_at, name) for an autosave from its sidecar, falling back to
+    file mtime when there's no sidecar (legacy autosaves)."""
+    side = step_path.with_suffix(".json")
+    try:
+        m = json.loads(side.read_text())
+        return m.get("session"), float(m.get("saved_at", step_path.stat().st_mtime)), m.get("name", "")
+    except Exception:  # noqa: BLE001
+        try:
+            return None, step_path.stat().st_mtime, ""
+        except OSError:
+            return None, 0.0, ""
+
+
+def recover_autosaved(scope: str = "recent") -> list:
+    """Reopen autosaved .step+ docs into the engine. A reopened doc gets a FRESH doc_id;
+    returns [{path, doc_id, name, original_doc_id}] for the ones that loaded.
+
+    scope="recent" (default): only the SINGLE most-recent prior session's docs — the
+    crash we're recovering from — never the whole history. scope="all": every autosave.
+    Prunes stale autosaves first. Called at server startup and by recover_parts."""
+    _prune_autosaves()
     out: list = []
     try:
         files = sorted(_autosave_dir().glob("*.step+"))
     except Exception:  # noqa: BLE001
         return out
-    for p in files:
+
+    info = [(p, *_autosave_session_of(p)) for p in files]  # (path, session, saved_at, name)
+    if scope != "all":
+        prior = [t for t in info if t[1] != _SESSION_ID]  # exclude our own (fresh) session
+        if prior:
+            # the most-recent prior session = the one whose newest autosave is latest.
+            latest_session = max(prior, key=lambda t: t[2])[1]
+            if latest_session is None:
+                # legacy autosaves with no session tag — take the newest few by mtime.
+                prior.sort(key=lambda t: t[2], reverse=True)
+                info = prior[:8]
+            else:
+                info = [t for t in prior if t[1] == latest_session]
+        else:
+            info = []
+
+    for p, _sess, _ts, name in info:
         try:
             r = cb.call("doc_open", {"path": str(p)})
             did = r.get("doc_id")
             if did:
-                out.append({"path": str(p), "doc_id": did})
+                out.append({"path": str(p), "doc_id": did, "name": name,
+                            "original_doc_id": p.stem})
                 _CUR["doc_id"] = did
         except Exception:  # noqa: BLE001
             continue
@@ -177,6 +259,38 @@ def _start_job(kind: str, fn, progress: Optional[dict] = None) -> str:
     # Daemon thread: a long OpenFOAM/FEA solve must never block server (or test) shutdown.
     _threading.Thread(target=_run, name=f"aicad-job-{kind}", daemon=True).start()
     return jid
+
+
+# How long a "synchronous" heavy solve may block the MCP call before we hand it off to
+# the background so the call returns BEFORE the transport timeout can kill the server
+# (Bug R-1). Stay safely under a typical 60s transport timeout.
+_SYNC_SOLVE_BUDGET_S = float(os.environ.get("AI_CAD_MCP_SYNC_BUDGET_S", "45") or 45)
+
+
+def _solve_sync_or_handoff(kind: str, fn, progress: Optional[dict] = None,
+                           budget_s: float = _SYNC_SOLVE_BUDGET_S) -> dict:
+    """Run a heavy solve so it can NEVER time out the transport and drop the session.
+
+    Always runs on a worker thread (via _start_job). For a synchronous request we poll
+    the job up to `budget_s`; if it finishes we return the result inline (small solves
+    behave exactly as before). If it overruns, we LEAVE it running and return the job_id
+    so the call returns in time — the agent polls get_job() instead of losing the session.
+    """
+    jid = _start_job(kind, fn, progress)
+    deadline = time.time() + max(1.0, budget_s)
+    while time.time() < deadline:
+        with _JOB_LOCK:
+            snap = dict(_JOBS.get(jid, {}))
+        st = snap.get("status")
+        if st == "done":
+            return snap.get("result") or {"ok": False, "error": "no result"}
+        if st == "error":
+            return {"ok": False, "error": snap.get("error", "solve failed")}
+        time.sleep(0.1)
+    return {"ok": True, "job_id": jid, "status": "running", "auto_backgrounded": True,
+            "note": (f"solve still running after {budget_s:.0f}s — continued in the BACKGROUND "
+                     f"to avoid a transport timeout (which would drop open documents). "
+                     f"Open parts were autosaved. Poll get_job('{jid}').")}
 
 
 # A small material library so FEA tools take a friendly name. Fields are exactly what the
@@ -506,7 +620,15 @@ def register_cad_tools(mcp: FastMCP) -> None:
         d = _doc(doc_id)
         png = _tmp(".png")
         r = cb.call("doc_render_png", {"doc_id": d, "out_path": png})
-        if not r.get("ok") or not os.path.exists(png):
+        if (not r.get("ok") or not os.path.exists(png)):
+            # A 2D DRAWING doc has no 3D bodies — rasterize its views instead so the AI
+            # can still self-review the drawing it just made (Bug D-1).
+            try:
+                rd = cb.call("drawing_render_png", {"doc_id": d, "out_path": png})
+            except Exception:  # noqa: BLE001
+                rd = {"ok": False}
+            if rd.get("ok") and os.path.exists(png):
+                return Image(path=png)
             raise ValueError(f"Render failed: {r.get('reason', 'no bodies to render')}")
         return Image(path=png)
 
@@ -759,11 +881,12 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 return {"ok": True, "doc_id": d, "material": mat.get("name", material),
                         "summary": res.get("summary", {}), "n_dof": res.get("n_dof")}
 
+            _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             if background:
                 jid = _start_job("fea_static", _solve)
                 return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
                                "note": "solving on a worker thread — poll get_job(job_id)"})
-            return _dumps(_solve())
+            return _dumps(_solve_sync_or_handoff("fea_static", _solve))
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -799,11 +922,12 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 return {"ok": True, "doc_id": d, "material": mat.get("name", material),
                         "freqs_hz": res.get("freqs_hz", []), "n_modes": res.get("n_modes")}
 
+            _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             if background:
                 jid = _start_job("fea_modal", _solve)
                 return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
                                "note": "solving on a worker thread — poll get_job(job_id)"})
-            return _dumps(_solve())
+            return _dumps(_solve_sync_or_handoff("fea_modal", _solve))
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -842,10 +966,15 @@ def register_cad_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
+            # Live-progress side-channel: the engine writes {pct,step,n_steps} to this file as the
+            # LBM iterates; get_job reads it so a background run reports progress like OpenFOAM.
+            prog_path = _tmp(".json")
+            prog: dict = {"pct": 0, "stage": "lbm_solve", "progress_file": prog_path}
 
             def _solve() -> dict:
                 res = cb.call("sim_run_flow", {"doc_id": d, "velocity": velocity, "aoa": aoa,
-                                               "fluid": fluid, "cells": cells, "n_steps": n_steps})
+                                               "fluid": fluid, "cells": cells, "n_steps": n_steps,
+                                               "progress_path": prog_path})
                 if not res.get("ok"):
                     return {"ok": False, "doc_id": d,
                             "error": res.get("error", "flow sim failed")}
@@ -858,11 +987,12 @@ def register_cad_tools(mcp: FastMCP) -> None:
                         out[k] = res[k]
                 return out
 
+            _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             if background:
-                jid = _start_job("cfd_flow", _solve)
+                jid = _start_job("cfd_flow", _solve, progress=prog)
                 return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
                                "note": "solving on a worker thread — poll get_job(job_id)"})
-            return _dumps(_solve())
+            return _dumps(_solve_sync_or_handoff("cfd_flow", _solve, progress=prog))
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -948,7 +1078,17 @@ def register_cad_tools(mcp: FastMCP) -> None:
             snap = dict(job)
         out = {"ok": True, "job_id": job_id, "status": snap["status"], "kind": snap["kind"]}
         if snap["status"] == "running" and snap.get("progress"):
-            out["progress"] = snap["progress"]  # live {pct, stage, text} for long OpenFOAM runs
+            progress = dict(snap["progress"])  # live {pct, stage, text} for long OpenFOAM runs
+            # LBM reports progress via a file the engine writes each checkpoint — fold it in so the
+            # built-in CFD path gets an ETA-style readout like OpenFOAM (report footnote).
+            pf = progress.pop("progress_file", None)
+            if pf:
+                try:
+                    with open(pf, encoding="utf-8") as fh:
+                        progress.update(json.load(fh))
+                except (OSError, ValueError):
+                    pass  # not written yet / mid-write — keep the seed
+            out["progress"] = progress
         if snap["status"] == "done":
             out["result"] = snap["result"]
         elif snap["status"] == "error":
@@ -957,16 +1097,23 @@ def register_cad_tools(mcp: FastMCP) -> None:
         return _dumps(out)
 
     @mcp.tool()
-    def recover_parts() -> str:
-        """Reopen any auto-saved parts after a server restart (recover a dropped session).
+    def recover_parts(all: bool = False) -> str:
+        """Reopen auto-saved parts after a server restart (recover a dropped session).
 
         Every successful add_features auto-persists the part to a recoverable .step+; if the
         server was restarted (e.g. a client timeout killed it) the in-memory docs are gone — call
         this to reload them (each gets a fresh doc_id). list_parts() then shows them.
+
+        By default this recovers ONLY the most-recent prior session's parts (the one that was
+        dropped) — not the entire autosave history, so you don't drag in unrelated old docs.
+        Pass all=True to reach every autosaved part. Each entry returns its fresh `doc_id` plus
+        the saved `name` and `original_doc_id` so you can re-map old handles. Stale autosaves
+        (older than AI_CAD_AUTOSAVE_MAX_AGE_DAYS, default 7) are pruned automatically.
         """
         try:
-            recovered = recover_autosaved()
-            return _dumps({"ok": True, "recovered": recovered, "count": len(recovered)})
+            recovered = recover_autosaved(scope="all" if all else "recent")
+            return _dumps({"ok": True, "recovered": recovered, "count": len(recovered),
+                           "scope": "all" if all else "recent"})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -987,7 +1134,34 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 spec["title"] = {"title": name}
             r = cb.call("drawing_make", {"source_doc_id": d, "spec": spec})
             return _dumps({"ok": True, "source_doc_id": d,
-                           "drawing_doc_id": r.get("doc_id"), "name": name})
+                           "drawing_doc_id": r.get("doc_id"), "name": name,
+                           "next_actions": [
+                               "render_part(drawing_doc_id)  # SEE the drawing",
+                               "export_drawing('pdf', drawing_doc_id)  # or 'dxf'"]})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def export_drawing(fmt: str = "pdf", doc_id: Optional[str] = None,
+                       path: Optional[str] = None) -> str:
+        """Export a 2D DRAWING document to a vector file so you can deliver it.
+
+        fmt    : "pdf" (a viewable sheet) or "dxf" (CAD interchange). Pass the drawing_doc_id from
+                 make_drawing as doc_id. To SEE a drawing inline use render_part(drawing_doc_id).
+        Returns the written path + entity counts. (export_part is for 3D B-rep/mesh only — a
+        drawing is 2D, so it has its own export here.)
+        """
+        try:
+            d = _doc(doc_id)
+            fmt = (fmt or "pdf").lower()
+            if fmt not in ("pdf", "dxf"):
+                return _dumps({"ok": False, "error": f"fmt must be 'pdf' or 'dxf', got {fmt!r}"})
+            out_path = path or _tmp("." + fmt)
+            r = cb.call("export_drawing", {"doc_id": d, "path": out_path, "fmt": fmt})
+            return _dumps({"ok": True, "doc_id": d, "format": fmt,
+                           "path": r.get("path", out_path),
+                           "visible": r.get("visible"), "hidden": r.get("hidden"),
+                           "entities": r.get("entities")})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -1008,7 +1182,10 @@ def register_cad_tools(mcp: FastMCP) -> None:
         family : a catalog key from list_standard_parts (e.g. "shcs", "hex_nut", "washer").
         size   : a size string for that family (e.g. "M5"). length_mm where the family needs it.
         Returns the new part's doc_id (and makes it current) so you can drop it into an assembly
-        or export it.
+        or export it — PLUS `bbox` (min/max/size/center, mm) and a `datum` (base_center + axis)
+        so you can position it with the `transform` feature WITHOUT a measure round-trip. Standard
+        parts seat their base at z=0 with the axis along +Z, so translate `datum.base_center` to
+        the seat point. (Tip: transform's `body` selector targets a named body — see cad_guide.)
         """
         try:
             params: dict = {"family": family, "size": size}
@@ -1023,8 +1200,11 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 return _dumps({"ok": False, "error": r.get("error", "parts_make failed")})
             _CUR["doc_id"] = r.get("doc_id")
             _publish_current(r.get("doc_id"))
-            _autosave(r.get("doc_id"))
+            _autosave(r.get("doc_id"), r.get("name"))
+            # bbox + datum let the caller position this part in an assembly without a
+            # measure round-trip (A-1): standard parts seat base at z=0, axis +Z.
             return _dumps({"ok": True, "doc_id": r.get("doc_id"), "name": r.get("name"),
-                           "meta": r.get("meta"), "volume": r.get("volume")})
+                           "meta": r.get("meta"), "volume": r.get("volume"),
+                           "bbox": r.get("bbox"), "datum": r.get("datum")})
         except Exception as e:  # noqa: BLE001
             return _err(e)

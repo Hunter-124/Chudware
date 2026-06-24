@@ -47,20 +47,28 @@ def _pin(number: str, name: str, pos: list, angle: float, ptype: str,
     }
 
 
+# Standard silkscreen stroke width (mm). Fab minimum is ~0.15; generated footprint
+# graphics MUST carry it, or DFM's silk_min_width flags every line as a 0mm stroke.
+_SILK_W = 0.15
+
+
 def _rect(x1: float, y1: float, x2: float, y2: float) -> dict:
-    return {"type": "rect", "p1": [x1, y1], "p2": [x2, y2]}
+    return {"type": "rect", "p1": [x1, y1], "p2": [x2, y2],
+            "layer": "F.SilkS", "width": _SILK_W}
 
 
 def _line(x1: float, y1: float, x2: float, y2: float) -> dict:
-    return {"type": "line", "p1": [x1, y1], "p2": [x2, y2]}
+    return {"type": "line", "p1": [x1, y1], "p2": [x2, y2],
+            "layer": "F.SilkS", "width": _SILK_W}
 
 
 def _circle(cx: float, cy: float, r: float) -> dict:
-    return {"type": "circle", "center": [cx, cy], "radius": r}
+    return {"type": "circle", "center": [cx, cy], "radius": r,
+            "layer": "F.SilkS", "width": _SILK_W}
 
 
 def _polyline(*pts) -> dict:
-    return {"type": "polyline", "pts": list(pts)}
+    return {"type": "polyline", "pts": list(pts), "layer": "F.SilkS", "width": _SILK_W}
 
 
 def _smd_pad(pid: str, number: str, x: float, y: float,
@@ -675,12 +683,12 @@ SYMBOLS: dict[str, dict] = _make_symbols()
 # ─── FOOTPRINTS ───────────────────────────────────────────────────────────────
 
 def _silk_box(x1: float, y1: float, x2: float, y2: float, layer: str = "F.SilkS") -> list:
-    """Four-line rectangle on silkscreen."""
+    """Four-line rectangle on silkscreen, with a fab-legal stroke width (DFM silk_min_width)."""
     return [
-        {"type": "line", "p1": [x1, y1], "p2": [x2, y1], "layer": layer},
-        {"type": "line", "p1": [x2, y1], "p2": [x2, y2], "layer": layer},
-        {"type": "line", "p1": [x2, y2], "p2": [x1, y2], "layer": layer},
-        {"type": "line", "p1": [x1, y2], "p2": [x1, y1], "layer": layer},
+        {"type": "line", "p1": [x1, y1], "p2": [x2, y1], "layer": layer, "width": _SILK_W},
+        {"type": "line", "p1": [x2, y1], "p2": [x2, y2], "layer": layer, "width": _SILK_W},
+        {"type": "line", "p1": [x2, y2], "p2": [x1, y2], "layer": layer, "width": _SILK_W},
+        {"type": "line", "p1": [x1, y2], "p2": [x1, y1], "layer": layer, "width": _SILK_W},
     ]
 
 

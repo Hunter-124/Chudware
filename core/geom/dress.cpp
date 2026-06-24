@@ -4,6 +4,7 @@
 #include <vector>
 
 #include <BRepAdaptor_Curve.hxx>
+#include <BRepAdaptor_Surface.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepFilletAPI_MakeChamfer.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
@@ -11,7 +12,9 @@
 #include <BRepOffsetAPI_MakeThickSolid.hxx>
 #include <BRepOffset_Mode.hxx>
 #include <GeomAbs_CurveType.hxx>
+#include <GeomAbs_JoinType.hxx>
 #include <GeomAbs_Shape.hxx>
+#include <GeomAbs_SurfaceType.hxx>
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
@@ -229,18 +232,55 @@ TopoDS_Shape chamfer_edges_two_distance(const TopoDS_Shape& shape, double d1, do
 TopoDS_Shape shell_solid(const TopoDS_Shape& body, double t, bool outward,
                          const std::vector<TopoDS_Face>& remove) {
     if (body.IsNull() || !(t > 0.0)) return TopoDS_Shape();
-    TopTools_ListOfShape faces_to_remove;
-    for (const TopoDS_Face& f : remove) faces_to_remove.Append(f);
     // SolidWorks default = inward wall (offset NEGATIVE, material kept inside the
-    // original surface); `outward` flips to +t. Join = GeomAbs_Arc (rounded corners),
-    // Mode = Skin (offset the skin), matching dress.py's build123d offset.
+    // original surface); `outward` flips to +t. Mode = Skin (offset the skin).
     const Standard_Real offset = outward ? t : -t;
-    BRepOffsetAPI_MakeThickSolid mk;
-    mk.MakeThickSolidByJoin(body, faces_to_remove, offset, 1.0e-6,
-                            BRepOffset_Skin, Standard_False, Standard_False, GeomAbs_Arc);
-    mk.Build();
-    if (!mk.IsDone()) return TopoDS_Shape();
-    return mk.Shape();
+    // Strategy table. The default (Arc join / no face-intersection / tight tolerance)
+    // matches dress.py's build123d offset and handles prismatic solids exactly like
+    // SolidWorks. Lofted / swept / revolved bodies carry B-spline faces whose offsets
+    // self-intersect at the rounded corners → the Arc join fails ("empty shape").
+    // Re-trying with an Intersection join + the face-intersection flag + a looser
+    // tolerance recovers many freeform bodies (OCCT's recommended path for offsetting
+    // curved skins). We return on the first strategy that yields a non-null solid.
+    struct Strat { GeomAbs_JoinType join; Standard_Boolean inter; Standard_Real tol; };
+    static const Strat strats[] = {
+        {GeomAbs_Arc,          Standard_False, 1.0e-6},
+        {GeomAbs_Intersection, Standard_True,  1.0e-6},
+        {GeomAbs_Intersection, Standard_True,  1.0e-3},
+        {GeomAbs_Arc,          Standard_True,  1.0e-3},
+    };
+    for (const Strat& s : strats) {
+        try {
+            TopTools_ListOfShape faces_to_remove;
+            for (const TopoDS_Face& f : remove) faces_to_remove.Append(f);
+            BRepOffsetAPI_MakeThickSolid mk;
+            mk.MakeThickSolidByJoin(body, faces_to_remove, offset, s.tol,
+                                    BRepOffset_Skin, s.inter, Standard_False, s.join);
+            mk.Build();
+            if (mk.IsDone()) {
+                TopoDS_Shape out = mk.Shape();
+                if (!out.IsNull()) return out;
+            }
+        } catch (const Standard_Failure&) {
+            // This strategy threw inside OCCT — fall through to the next one.
+        }
+    }
+    return TopoDS_Shape();
+}
+
+// True if any face of `shape` is a freeform / non-analytic surface (B-spline or
+// Bezier) — the surface types a loft/sweep/revolve produces and on which the OCCT
+// thick-solid offset routinely fails. Used to turn the shell "empty shape" failure
+// into an actionable "build the wall into the profile instead" message.
+bool has_freeform_faces(const TopoDS_Shape& shape) {
+    for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
+        BRepAdaptor_Surface as(TopoDS::Face(ex.Current()));
+        const GeomAbs_SurfaceType st = as.GetType();
+        if (st == GeomAbs_BSplineSurface || st == GeomAbs_BezierSurface ||
+            st == GeomAbs_SurfaceOfRevolution || st == GeomAbs_SurfaceOfExtrusion)
+            return true;
+    }
+    return false;
 }
 
 // --- draft ----------------------------------------------------------------------

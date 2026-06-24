@@ -22,6 +22,37 @@ namespace ui {
 
 namespace {
 
+// M-1: an interpolating "spline" entity passes THROUGH its points, so drawing straight
+// segments between them makes a smooth curve look sharp-cornered — and a smooth swept/
+// revolved path then doesn't match what the viewport showed. Densify the through-points
+// with a centripetal Catmull-Rom so the viewport shows the ACTUAL curve. (style_spline is
+// a by-poles curve whose points are control poles — keep showing its control polygon, the
+// SolidWorks convention.) Returns UV points (same space as the input through-points).
+inline std::vector<ImVec2> catmullRomUV(const std::vector<ImVec2>& p, int perSeg = 16) {
+    if (p.size() < 3) return p;  // 2 points = a straight line already
+    std::vector<ImVec2> out;
+    out.reserve((p.size() - 1) * perSeg + 1);
+    auto at = [&](int i) -> ImVec2 {
+        return p[(size_t)std::min(std::max(i, 0), (int)p.size() - 1)];
+    };
+    for (size_t i = 0; i + 1 < p.size(); ++i) {
+        ImVec2 p0 = at((int)i - 1), p1 = p[i], p2 = p[i + 1], p3 = at((int)i + 2);
+        for (int s = 0; s < perSeg; ++s) {
+            float t = s / (float)perSeg, t2 = t * t, t3 = t2 * t;
+            // Uniform Catmull-Rom basis (tension 0.5).
+            float bx = 0.5f * ((2 * p1.x) + (-p0.x + p2.x) * t +
+                               (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
+                               (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3);
+            float by = 0.5f * ((2 * p1.y) + (-p0.y + p2.y) * t +
+                               (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
+                               (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
+            out.push_back(ImVec2(bx, by));
+        }
+    }
+    out.push_back(p.back());
+    return out;
+}
+
 constexpr float kSnapPx = 6.0f;        // endpoint coincident snap radius (screen px)
 constexpr float kHandlePx = 8.0f;      // drag hit-test radius (screen px)
 constexpr float kHVDeg = 5.0f;         // horizontal/vertical auto-relation tolerance (deg)
@@ -3721,10 +3752,13 @@ void SketchMode::drawGhosts(AppState& st, const ImVec2& imgMin, const ImVec2& im
                     v = e.center[1] + lx * sa + ly * ca;
                 }, 48);
             } else if ((e.type == "spline" || e.type == "style_spline") && e.pts.size() >= 2) {
-                // C42: polyline through the solved through-points (style_spline: control polygon).
-                for (size_t i = 1; i < e.pts.size(); ++i) {
+                // C42/M-1: a "spline" ghosts its SMOOTH curve (Catmull-Rom through-points) so it
+                // doesn't read as sharp-cornered; a "style_spline" ghosts its control polygon.
+                const std::vector<ImVec2>& gp =
+                    (e.type == "spline") ? catmullRomUV(e.pts) : e.pts;
+                for (size_t i = 1; i < gp.size(); ++i) {
                     ImVec2 a, b;
-                    if (uv2s(e.pts[i - 1].x, e.pts[i - 1].y, a) && uv2s(e.pts[i].x, e.pts[i].y, b))
+                    if (uv2s(gp[i - 1].x, gp[i - 1].y, a) && uv2s(gp[i].x, gp[i].y, b))
                         dl->AddLine(a, b, col(pal.sketchInk, 0.55f), 1.5f);
                 }
             } else if (e.type == "point") {
@@ -5101,11 +5135,14 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             strokePoly(pts);
             dl->AddCircleFilled(uvToScreen(e.center[0], e.center[1]), 2.5f, cc);
         } else if (e.type == "spline" || e.type == "style_spline") {
-            // C42: polyline through the through-points + point markers. For style_spline this is the
-            // control polygon (the editable poles, exactly as SW shows a Style Spline); the smooth
-            // by-poles curve is realized by the engine at use/extrude time.
-            std::vector<ImVec2> pts; pts.reserve(e.pts.size());
-            for (const auto& q : e.pts) pts.push_back(uvToScreen(q.x, q.y));
+            // C42/M-1: an interpolating "spline" draws the SMOOTH curve through its points
+            // (Catmull-Rom), so the viewport matches the geometry the engine sweeps/revolves.
+            // A "style_spline" is a by-poles curve — keep showing its control polygon (the
+            // SolidWorks convention) plus its pole markers.
+            const std::vector<ImVec2>& src =
+                (e.type == "spline") ? catmullRomUV(e.pts) : e.pts;
+            std::vector<ImVec2> pts; pts.reserve(src.size());
+            for (const auto& q : src) pts.push_back(uvToScreen(q.x, q.y));
             strokePoly(pts);
             for (const auto& q : e.pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), 2.5f, cc);
         }

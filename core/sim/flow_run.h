@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "sim/lbm.h"
@@ -21,6 +22,10 @@ struct FlowParams {
     double rho_fluid = 1.225;   // density (air 1.225, water ~1000) kg/m^3
     int cells = 96;             // cells along the DOMAIN's longest axis (resolution)
     int n_steps = 2000;         // LBM time steps
+    // Optional progress side-channel: if set, the solver writes a small JSON file
+    // {"pct","step","n_steps","stage"} here every ~2% so a long background LBM run can be
+    // polled live (get_job) the way the OpenFOAM path reports progress. Empty = no progress.
+    std::string progress_path;
 };
 
 // Run a wind-tunnel LBM over the given bodies. Each body is a triangle soup: positions = flat

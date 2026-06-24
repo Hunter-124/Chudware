@@ -1931,6 +1931,22 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                     out["doc_id"] = doc_id;
                     out["name"] = nm;
                     out["meta"] = pb.meta;
+                    // Hand back the extents + a placement datum so an assembly can position
+                    // this part WITHOUT a measure round-trip (Bug A-1). Standard parts seat
+                    // their base at z=0 with the axis along +Z, so the mating datum is the
+                    // base-centre at the bbox min-z. Fail-soft: omit if the box can't compute.
+                    try {
+                        json bb = aicad::doc::doc_bbox(doc_id);
+                        out["bbox"] = bb;
+                        const auto& mn = bb["min"]; const auto& mx = bb["max"];
+                        out["datum"] = {
+                            {"base_center", {(mn[0].get<double>() + mx[0].get<double>()) / 2.0,
+                                             (mn[1].get<double>() + mx[1].get<double>()) / 2.0,
+                                             mn[2].get<double>()}},
+                            {"axis", {0, 0, 1}},
+                            {"note", "base seats at z=0, axis +Z; translate base_center to the seat point"}};
+                    } catch (...) {
+                    }
                     if (aresp.contains("revision")) out["revision"] = aresp["revision"];
                     if (aresp.contains("tess")) out["tess"] = aresp["tess"];
                     if (aresp.contains("volume")) out["volume"] = aresp["volume"];
@@ -1951,6 +1967,11 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 params.value("doc_id", std::string()),
                                 params.value("out_path", std::string())),
                             out_json, 0);
+            if (m == "drawing_render_png")
+                return emit(aicad::doc::drawing_render_png(
+                                params.value("doc_id", std::string()),
+                                params.value("out_path", std::string())),
+                            out_json, 0);
             if (m == "sim_run_flow") {
                 // {doc_id, velocity, aoa?, fluid?, cells?, n_steps?} -> wind-tunnel LBM forces.
                 std::string doc_id = params.value("doc_id", std::string());
@@ -1968,6 +1989,7 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 if (fluid == "water") { fp.nu_fluid = 1.0e-6; fp.rho_fluid = 1000.0; }
                 fp.cells = params.value("cells", 96);
                 fp.n_steps = params.value("n_steps", 2000);
+                fp.progress_path = params.value("progress_path", std::string());
                 double re = 0.0;
                 aicad::sim::LbmResult r = aicad::sim::run_wind_tunnel(bp, bi, fp, &re);
                 if (!r.ok)
@@ -2077,6 +2099,9 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                     ? params["body"].get<int>() : 0,
                                 params.contains("density_g_cm3") && params["density_g_cm3"].is_number()
                                     ? params["density_g_cm3"].get<double>() : 7.85),
+                            out_json, 0);
+            if (m == "doc_bbox")
+                return emit(aicad::doc::doc_bbox(params.value("doc_id", std::string())),
                             out_json, 0);
             if (m == "eval_check")
                 return emit(aicad::doc::doc_eval_check(

@@ -438,7 +438,7 @@ def build_netlist(sch: dict) -> dict:
     components: list[dict] = []
     for sym in sorted(sch.get("symbols", []), key=lambda s: (s.get("ref", "~"), s.get("id", ""))):
         sid = sym.get("id", "")
-        components.append({
+        comp = {
             "ref": sym.get("ref", ""),
             "libid": sym.get("libid", ""),
             "value": sym.get("value", ""),
@@ -447,7 +447,16 @@ def build_netlist(sch: dict) -> dict:
             "pins": dict(sorted(pins_by_sym.get(sid, {}).items())),
             "fields": dict(sorted((sym.get("fields", {}) or {}).items())),
             "dnp": bool(sym.get("dnp", False)),
-        })
+        }
+        # Surface a source's small-signal AC magnitude (carried in sim_params by
+        # build_design) so the SPICE netlister can give an AC sweep a stimulus
+        # (Bug E-1 — otherwise an AC source built from a schematic has no AC drive).
+        _sp = sym.get("sim_params") or {}
+        if _sp.get("ac_mag") is not None:
+            comp["ac_mag"] = _sp["ac_mag"]
+        if _sp.get("ac_phase") is not None:
+            comp["ac_phase"] = _sp["ac_phase"]
+        components.append(comp)
 
     by_pin_sorted = dict(sorted(by_pin.items()))
 

@@ -6,7 +6,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <fstream>
+#include <functional>
 #include <limits>
+#include <string>
 
 namespace aicad {
 namespace sim {
@@ -165,7 +169,26 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
     lp.dt_s = dt_s;
     lp.rho_air = fp.rho_fluid;
 
-    R = lbm_run(mask, Nx, Ny, Nz, lp, std::max(1, fp.n_steps));
+    // Optional live-progress side-channel: write a tiny JSON file at each LBM checkpoint so a
+    // background run can be polled (get_job) like the OpenFOAM path. Atomic (tmp + rename) so a
+    // reader never sees a half-written file. No-op when no progress_path was supplied.
+    std::function<void(int, int)> on_progress;
+    if (!fp.progress_path.empty()) {
+        const std::string path = fp.progress_path;
+        on_progress = [path](int step, int total) {
+            const int pct = (total > 0) ? (int)std::lround(100.0 * step / total) : 0;
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "{\"pct\":%d,\"step\":%d,\"n_steps\":%d,\"stage\":\"lbm_solve\"}",
+                          pct, step, total);
+            // Overwrite in place each checkpoint. (NOT tmp+rename: std::rename does not replace an
+            // existing file on Windows, which would freeze the file at the first write.) A torn
+            // read is harmless — the poller ignores an unparseable file and keeps the last value.
+            std::ofstream f(path, std::ios::binary | std::ios::trunc);
+            if (f) f << buf;
+        };
+    }
+    R = lbm_run(mask, Nx, Ny, Nz, lp, std::max(1, fp.n_steps), on_progress);
 
     // Resolution diagnostics. The grid pitch is set from the DOMAIN's longest span, so a thin
     // feature (a 4 mm wing/tail edge) can fall below one voxel and vanish — the real cause of

@@ -492,11 +492,22 @@ json normalize_feature(const json& raw) {
                     f["pull_dir"] = {ax->second.x(), ax->second.y(), ax->second.z()};
                 else
                     f["pull"] = val;
+            } else if (slot == "body") {
+                // transform/fillet/chamfer/shell/hole `body` target. A canonical
+                // selector is {"kind":"body","owner_feature":"fN"}; extract the
+                // owning feature id so body_ref() (which only accepts a STRING)
+                // targets the named body. Without this the selector object fell
+                // through unparsed and body_ref() silently defaulted to the
+                // current/last body — the assembly `transform body:"fN"`
+                // mistargeting bug (every batched per-body move landed on the
+                // last-imported body). A bare id string passes through unchanged.
+                std::string bid = selector_owner_id(val);
+                f["body"] = bid.empty() ? val : json(bid);
             } else if (slot == "face" || slot == "edges" || slot == "remove" ||
                        slot == "faces" || slot == "sections" || slot == "edge") {
                 f[slot] = val;  // selector(-list) refs pass through to their branch
             } else {
-                f[slot] = val;  // a/b/body/seed/... pass through
+                f[slot] = val;  // a/b/seed/... pass through
             }
         }
     }
@@ -639,12 +650,20 @@ CompileResult compile_document(const json& doc, const json& env_json) {
             if (!consumed.count(*it)) return *it;
         return std::string();
     };
-    // The body a dress/hole/mirror feature targets: an explicit "body" id (the
-    // simplified model) or, for canonical features that carry no body ref, the
-    // current top body. Empty when neither exists -> the branch raises a clear error.
+    // The body a dress/hole/mirror/transform feature targets: an explicit "body"
+    // ref or, for canonical features that carry no body ref, the current top body.
+    // The body ref may arrive as a bare id string ("f3") OR a canonical body
+    // selector object {"kind":"body","owner_feature":"f3"} — accept BOTH via
+    // selector_owner_id. Previously this only honored an is_string() body, so a
+    // selector OBJECT (top-level or via refs) silently fell through to the current
+    // body — the assembly `transform body:"fN"` mistargeting bug where every
+    // batched per-body move stacked onto the last-imported body instead. Empty
+    // when neither resolves -> the branch raises a clear error.
     auto body_ref = [&](const json& feat) -> std::string {
-        if (feat.contains("body") && feat["body"].is_string())
-            return feat["body"].get<std::string>();
+        if (feat.contains("body")) {
+            std::string bid = selector_owner_id(feat["body"]);
+            if (!bid.empty()) return bid;
+        }
         return current_solid_id();
     };
     // Resolve a pattern/mirror SEED feature to its (tool body, op). Mirrors the oracle's
@@ -3637,8 +3656,20 @@ CompileResult compile_document(const json& doc, const json& env_json) {
 
                 const bool outward = feat.value("outward", false);
                 TopoDS_Shape out = ::geom::shell_solid(body, t, outward, remove);
-                if (out.IsNull())
+                if (out.IsNull()) {
+                    // Distinguish a genuine kernel limitation (curved/B-spline skins)
+                    // from an ordinary failure so the caller gets an actionable fix
+                    // instead of an opaque "empty shape" (Bug L-1).
+                    if (::geom::has_freeform_faces(body))
+                        throw std::runtime_error(
+                            "shell is not supported on lofted / swept / revolved "
+                            "(B-spline / freeform) bodies — the offset self-intersects "
+                            "on curved skins. Build the wall thickness INTO the profile "
+                            "instead: sketch a thin closed wall cross-section (offset "
+                            "inner + outer curves) and loft/revolve THAT to get a hollow "
+                            "body directly, rather than shelling a solid one.");
                     throw std::runtime_error("shell produced an empty shape");
+                }
                 consumed.insert(body_id);
                 source_of[id] = body_id;  // owner-map: derives from the input body
                 results[id] = SolidResult{out};

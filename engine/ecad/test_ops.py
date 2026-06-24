@@ -350,6 +350,41 @@ def test_rename_and_set_field() -> None:
     print("[ecad-ops] shared: rename_doc + set_field(MPN) + nop")
 
 
+def test_ac_magnitude_propagates_to_source() -> None:
+    """E-1: a source carrying ac_mag yields a device with an AC stimulus (not a flat zero)."""
+    from engine.sim.spice import netlist_to_spice_circuit
+    nl = {"components": [
+        {"ref": "V1", "libid": "Simulation_SPICE:V_source", "value": "0", "ac_mag": 1.0,
+         "sim": {"model": "V", "pin_order": ["+", "-"]},
+         "pins": {"+": "IN", "-": "GND"}},
+    ], "nets": {}}
+    circ, _ = netlist_to_spice_circuit(nl)
+    vs = [d for d in circ["devices"] if d.get("kind") == "V"]
+    assert vs, "expected a V device"
+    ac = (vs[0].get("params") or {}).get("ac") or {}
+    assert ac.get("mag") == 1.0, f"AC magnitude not propagated: {vs[0]}"
+    print("[ecad-ops] E-1: source ac_mag -> device AC stimulus")
+
+
+def test_drc_warns_no_outline_then_clears() -> None:
+    """E-3: a board with no Edge.Cuts outline warns; setting one clears the warning."""
+    from engine.ecad import drc as drc_mod
+    s = new_session("pcb", "ob")
+    session_apply_ops(s, s.revision, [
+        {"op": "pcb_add_footprint", "fpid": "R_0805", "ref": "R1", "pos": [5, 5],
+         "pads": [{"pos": [-1, 0]}, {"pos": [1, 0]}]}])
+    v = drc_mod.run_drc(s.doc)
+    assert any(x["rule"] == "no_outline" for x in v), "expected a no_outline warning"
+    session_apply_ops(s, s.revision, [{"op": "pcb_set_outline", "closed": True, "shapes": [
+        {"type": "line", "p1": [0, 0], "p2": [20, 0]},
+        {"type": "line", "p1": [20, 0], "p2": [20, 20]},
+        {"type": "line", "p1": [20, 20], "p2": [0, 20]},
+        {"type": "line", "p1": [0, 20], "p2": [0, 0]}]}])
+    v2 = drc_mod.run_drc(s.doc)
+    assert not any(x["rule"] == "no_outline" for x in v2), "no_outline should clear once an outline is set"
+    print("[ecad-ops] E-3: no_outline DRC warning fires then clears")
+
+
 def main() -> None:
     test_placeholder_batch_symbol_and_wire()
     test_placeholder_forward_ref_rejected()
@@ -366,6 +401,8 @@ def main() -> None:
     test_pcb_track_bad_layer_and_net()
     test_pcb_add_tracks_polyline()
     test_rename_and_set_field()
+    test_ac_magnitude_propagates_to_source()
+    test_drc_warns_no_outline_then_clears()
     print("\nECAD OPS + SESSION TESTS PASSED")
 
 

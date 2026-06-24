@@ -797,6 +797,41 @@ def register_ecad_tools(mcp) -> None:
         if an["type"] in ("four", "mc", "temp", "noise"):
             return _simulate_advanced(session, circuit, an, probe_list, warns)
 
+        # AC needs a small-signal stimulus. The structured netlist carries only DC
+        # values, so unless a source already has an AC magnitude (an ecad_design
+        # filter now persists one) an AC sweep would read a flat zero at every
+        # frequency (Bug E-1). Honor an explicit ac_source/ac_mag in params; else
+        # auto-drive a source with AC=1 and SAY SO, so the agent never silently
+        # gets zero and has no idea why.
+        if an["type"] == "ac":
+            p = params or {}
+
+            def _ac_mag(d: dict) -> float:
+                try:
+                    return float(((d.get("params") or {}).get("ac") or {}).get("mag", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
+
+            vsrcs = [d for d in circuit["devices"] if d.get("kind") == "V"]
+            want_mag = float(p.get("ac_mag", 1.0) or 1.0)
+            want_src = p.get("ac_source") or p.get("source")
+            if not vsrcs:
+                warns.append("AC sweep has no voltage source to drive — add a V source "
+                             "and wire it to the input.")
+            elif want_src:
+                tgt = next((d for d in vsrcs if d.get("name") == want_src), None)
+                if tgt is None:
+                    warns.append(f"ac_source {want_src!r} not found among "
+                                 f"{[d['name'] for d in vsrcs]} — drove {vsrcs[0]['name']} instead.")
+                    tgt = vsrcs[0]
+                tgt.setdefault("params", {})["ac"] = {"mag": want_mag, "phase": 0.0}
+            elif not any(_ac_mag(d) > 0 for d in vsrcs):
+                tgt = vsrcs[0]
+                tgt.setdefault("params", {})["ac"] = {"mag": want_mag, "phase": 0.0}
+                warns.append(
+                    f"no source carried an AC magnitude — auto-drove {tgt['name']} with AC={want_mag} "
+                    f"so the sweep has a stimulus. Pass params={{'ac_source':'V1','ac_mag':1}} to set it explicitly.")
+
         study = {"analyses": [an], "probes": probe_list}
         result = sim_run(circuit, study)
         conv = result.get("convergence", {})
@@ -1972,6 +2007,26 @@ def register_ecad_tools(mcp) -> None:
             _step("autoroute", {"ok": False}, f"FAILED: {e.message}")
             routed = []; failed = []
 
+        # ---- 3.5 board outline (auto Edge.Cuts rectangle if none) ----
+        # The one-shot flow must leave a closed Edge.Cuts loop: ecad_to_3d needs it to
+        # build the substrate, and the GND pour wants the true board extents (Bug E-3).
+        outline_ok = False
+        try:
+            pcb_doc = pcb_sess.doc
+            if not (pcb_doc.get("outline", {}) or {}).get("shapes"):
+                shapes = _default_outline_shapes(pcb_doc)
+                _apply(pcb_sess, [{"op": "pcb_set_outline", "shapes": shapes, "closed": True}])
+                bb = _outline_bbox(pcb_sess.doc)
+                outline_ok = True
+                _step("set_outline", {"ok": True},
+                      "auto Edge.Cuts rectangle "
+                      + (f"{bb[2]-bb[0]:.1f} x {bb[3]-bb[1]:.1f} mm" if bb else "added"))
+            else:
+                outline_ok = True
+                _step("set_outline", {"ok": True}, "outline already present — kept")
+        except Exception as e:  # noqa: BLE001
+            _step("set_outline", {"ok": False}, f"FAILED: {type(e).__name__}: {e}")
+
         # ---- 4. fill zones (add GND zone automatically if board has none) ----
         fill_ok = False
         try:
@@ -2450,6 +2505,53 @@ def _outline_bbox(doc: dict) -> tuple[float, float, float, float] | None:
     if not xs or not ys:
         return None
     return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _parts_extents(doc: dict) -> tuple[float, float, float, float] | None:
+    """Bounding box of placed footprints (origins + pad offsets), or None if empty."""
+    xs: list[float] = []
+    ys: list[float] = []
+    for fp in doc.get("footprints", []) or []:
+        pos = fp.get("pos")
+        if not (isinstance(pos, (list, tuple)) and len(pos) == 2):
+            continue
+        fx, fy = float(pos[0]), float(pos[1])
+        pads = fp.get("pads", []) or []
+        added_pad = False
+        for pad in pads:
+            # pad offset relative to the footprint origin (field name varies: pos/at/offset)
+            off = pad.get("pos") or pad.get("at") or pad.get("offset")
+            if isinstance(off, (list, tuple)) and len(off) >= 2:
+                xs.append(fx + float(off[0])); ys.append(fy + float(off[1]))
+                added_pad = True
+        if not added_pad:
+            xs.append(fx); ys.append(fy)
+    if not xs or not ys:
+        return None
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _default_outline_shapes(doc: dict, margin: float = 5.0,
+                            min_side: float = 20.0) -> list[dict]:
+    """A closed rectangular Edge.Cuts outline enclosing the placed parts (+margin).
+
+    Falls back to a min_side square at the origin when nothing is placed yet, so the
+    one-shot board flow always produces a valid outline (Bug E-3 — ecad_to_3d needs
+    an Edge.Cuts loop, and the GND pour wants the real board extents).
+    """
+    ext = _parts_extents(doc)
+    if ext is None:
+        x0, y0, x1, y1 = 0.0, 0.0, min_side, min_side
+    else:
+        x0, y0, x1, y1 = ext
+        x0 -= margin; y0 -= margin; x1 += margin; y1 += margin
+        if x1 - x0 < min_side:
+            cx = (x0 + x1) / 2.0; x0, x1 = cx - min_side / 2.0, cx + min_side / 2.0
+        if y1 - y0 < min_side:
+            cy = (y0 + y1) / 2.0; y0, y1 = cy - min_side / 2.0, cy + min_side / 2.0
+    corners = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    return [{"type": "line", "p1": corners[i], "p2": corners[(i + 1) % 4], "layer": "Edge.Cuts"}
+            for i in range(4)]
 
 
 def _summarize_sweep_steps(runs: list, atype: str, probe: Optional[str]):

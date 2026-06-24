@@ -83,9 +83,16 @@ TopoDS_Shape chamfer_edges_two_distance(const TopoDS_Shape& shape, double d1, do
 // Hollow `body` to a wall of thickness `t`. `remove` faces become the open mouths of
 // the shell (empty -> a fully-closed hollow); `outward` thickens outward (+t) instead
 // of the SolidWorks default inward (-t). BRepOffsetAPI_MakeThickSolid (MakeThickSolidByJoin
-// with offset sign per `outward`). Empty shape on kernel failure.
+// with offset sign per `outward`). Tries an Arc join first, then falls back to an
+// Intersection join + looser tolerance for curved/B-spline skins. Empty shape on
+// kernel failure (after all strategies).
 TopoDS_Shape shell_solid(const TopoDS_Shape& body, double t, bool outward,
                          const std::vector<TopoDS_Face>& remove);
+
+// True if `shape` has any freeform (B-spline/Bezier/revolution/extrusion) face — the
+// surface types a loft/sweep/revolve makes, on which the thick-solid offset often
+// fails. Lets the shell feature emit an actionable error instead of "empty shape".
+bool has_freeform_faces(const TopoDS_Shape& shape);
 
 // Taper the given `faces` of `body` by `angle_rad` about the neutral plane
 // (`neutral_pt`, `neutral_n`), pulled along `pull` (BRepOffsetAPI_DraftAngle::Add per

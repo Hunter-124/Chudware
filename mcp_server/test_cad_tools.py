@@ -189,6 +189,55 @@ def test_transform_copy_makes_two_bodies():
     assert r2["ok"] and r2["body_count"] == 2, r2
 
 
+def test_transform_targets_named_non_last_body():
+    """transform with a body SELECTOR OBJECT moves THAT named body, not the current/last one (T-1).
+
+    Regression for the assembly bug: a canonical body selector object
+    {"kind":"body","owner_feature":"fN"} was not resolved by body_ref (it only honored a
+    bare string), so transform silently fell back to the last-imported body — every
+    batched per-body move stacked onto one body. Here we lift the FIRST (non-last) body
+    and confirm *it* moved while the later copy stayed put.
+    """
+    r, _ = _call("new_part", {"name": "tgt"})
+    doc = r["doc_id"]
+    r1, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B1", {"length": cb.dim(20), "width": cb.dim(20), "height": cb.dim(20)})]})
+    first_id = r1["features"][0]["id"]
+    # A moved copy off in +X becomes the current/last body (the wrong target if the bug bites).
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("transform", "Dup", {"translate": [100, 0, 0], "copy": True})]})
+    # Target the FIRST body by a canonical selector OBJECT (top-level body field) and lift it +1000 Z.
+    r3, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("transform", "LiftFirst", {"translate": [0, 0, 1000]},
+                body={"kind": "body", "owner_feature": first_id})]})
+    assert r3["ok"], r3
+    m, _ = _call("measure_part", {"doc_id": doc})
+    bodies = m["mass"]["bodies"]
+    assert len(bodies) == 2, m
+    near0 = next(b for b in bodies if abs(b["com"][0]) < 50)     # the original first body
+    near100 = next(b for b in bodies if b["com"][0] > 50)        # the moved copy
+    assert near0["com"][2] > 900, ("the named first body should have lifted", bodies)
+    assert near100["com"][2] < 100, ("the copy must NOT have moved", bodies)
+
+
+def test_transform_targets_named_body_string():
+    """Same T-1 guard via a plain top-level body id STRING (the documented cheatsheet form)."""
+    r, _ = _call("new_part", {"name": "tgt2"})
+    doc = r["doc_id"]
+    r1, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B1", {"length": cb.dim(20), "width": cb.dim(20), "height": cb.dim(20)})]})
+    first_id = r1["features"][0]["id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("transform", "Dup", {"translate": [100, 0, 0], "copy": True})]})
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("transform", "LiftFirst", {"translate": [0, 0, 1000]}, body=first_id)]})
+    m, _ = _call("measure_part", {"doc_id": doc})
+    bodies = m["mass"]["bodies"]
+    near0 = next(b for b in bodies if abs(b["com"][0]) < 50)
+    near100 = next(b for b in bodies if b["com"][0] > 50)
+    assert near0["com"][2] > 900 and near100["com"][2] < 100, bodies
+
+
 def test_measure_multibody_per_body_and_total():
     """A multi-body doc reports per-body breakdown + the combined total (not just one body)."""
     r, _ = _call("new_part", {"name": "asm"})

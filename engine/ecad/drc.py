@@ -583,6 +583,16 @@ def run_drc(board: dict) -> list[dict]:
 
     rules = board.get("rules", {})
 
+    # ── no_outline: the board has no Edge.Cuts loop ──
+    # Advisory warning (not an error) — many checks degrade silently without an
+    # outline and the 3D export can't build a substrate. Surfacing it here stops the
+    # board flow from "passing" with no shape at all (Bug E-3).
+    if not (board.get("outline", {}) or {}).get("shapes"):
+        out.append(_violation(
+            "no_outline", "warning", [], [],
+            "board has no Edge.Cuts outline — add one (pcb_set_outline) before fabrication "
+            "or 3D export; edge-clearance checks are skipped without it"))
+
     # ── clearance: copper-copper spacing between DIFFERENT nets, on a shared layer ──
     shapes = _copper_shapes(board)
     for i in range(len(shapes)):

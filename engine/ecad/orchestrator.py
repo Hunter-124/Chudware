@@ -381,6 +381,15 @@ def build_design(session: ecad_session.EcadSession, design: dict) -> dict:
         fp = c.get("footprint") or _DEFAULT_FOOTPRINTS.get(c["libid"])
         if fp:
             op["footprint"] = fp  # board-ready: update-from-sch can place a real footprint
+        # Persist a source's AC magnitude ONTO the schematic symbol so the netlist
+        # (and therefore any later ecad_simulate('ac'), not just this design's own
+        # self-check) has a real small-signal stimulus — otherwise an AC sweep of a
+        # filter built by ecad_design reads a flat zero (Bug E-1).
+        if c.get("ac_mag") is not None:
+            sp = {"ac_mag": c["ac_mag"]}
+            if c.get("ac_phase") is not None:
+                sp["ac_phase"] = c["ac_phase"]
+            op["sim_params"] = sp
         place_ops.append(op)
     resp = ecad_session.apply_ops(session, session.revision, place_ops)
     ops_applied = len(place_ops)

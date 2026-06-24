@@ -67,6 +67,7 @@ from __future__ import annotations
 import copy
 import heapq
 import math
+import os
 import re
 from typing import Any
 
@@ -468,26 +469,65 @@ def _path_to_geometry(grid: _Grid, path: list[tuple[int, int, int]], net: Any,
     return tracks, vias
 
 
+# Max 45-degree chamfer (mm) applied at an interior right-angle corner. The chamfer only
+# trims the INNER corner of an L the router already routed (clear space), and is capped at
+# half the shorter leg so adjacent chamfers never overlap — so it can't create a clearance
+# violation. Set AI_CAD_ROUTE_CHAMFER=0 to keep pure 90-degree corners.
+_CORNER_CHAMFER_MM = float(os.environ.get("AI_CAD_ROUTE_CHAMFER", "0.5") or 0.5)
+
+# Runtime gate. Length-MATCHED routing (diff pairs / meanders) measures exact track lengths
+# to equalize skew, so a chamfer there would corrupt the match — those paths disable it.
+_CHAMFER_ON = True
+
+
+def _corner_vertices(pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Reduce a run of grid points to its direction-change corner vertices (incl. endpoints)."""
+    if len(pts) < 2:
+        return list(pts)
+    out = [pts[0]]
+    cur_dir: tuple[int, int] | None = None
+    for i in range(1, len(pts)):
+        d = (_sign(pts[i][0] - pts[i - 1][0]), _sign(pts[i][1] - pts[i - 1][1]))
+        if d == (0, 0):
+            continue
+        if cur_dir is not None and d != cur_dir:
+            out.append(pts[i - 1])      # the corner is the previous point
+        cur_dir = d
+    out.append(pts[-1])
+    return out
+
+
 def _emit_run(pts: list[tuple[float, float]], layer: str, net: Any, width: float,
               tracks: list[dict], tcnt: _IdCounter) -> None:
-    """Emit merged colinear segment tracks for a run of grid points on one layer."""
-    if len(pts) < 2:
+    """Emit track segments for a run, chamfering interior right-angle corners to 45 degrees.
+
+    A 90-degree corner joint reads as an acid trap to DFM (etchant pools in the acute inner
+    angle); breaking each into two 135-degree corners with a short diagonal removes that.
+    """
+    corners = _corner_vertices(pts)
+    if len(corners) < 2:
         return
-    seg_start = pts[0]
-    prev = pts[0]
-    cur_dir: tuple[float, float] | None = None
-    for p in pts[1:]:
-        d = (_sign(p[0] - prev[0]), _sign(p[1] - prev[1]))
-        if cur_dir is None:
-            cur_dir = d
-        elif d != cur_dir:
-            # direction changed -> close the run at prev
-            tracks.append(_mk_track(tcnt.next(), seg_start, prev, net, width, layer))
-            seg_start = prev
-            cur_dir = d
-        prev = p
-    if seg_start != prev:
-        tracks.append(_mk_track(tcnt.next(), seg_start, prev, net, width, layer))
+    cham = _CORNER_CHAMFER_MM if _CHAMFER_ON else 0.0
+    # Build the output vertex list: each interior corner C becomes (C_in, C_out), trimmed
+    # back along each leg. The chamfer per corner is capped at half the shorter adjacent leg.
+    verts: list[tuple[float, float]] = [corners[0]]
+    for k in range(1, len(corners) - 1):
+        a, c, b = corners[k - 1], corners[k], corners[k + 1]
+        in_len = math.hypot(c[0] - a[0], c[1] - a[1])
+        out_len = math.hypot(b[0] - c[0], b[1] - c[1])
+        t = min(cham, in_len * 0.5, out_len * 0.5)
+        if t <= 1e-6:
+            verts.append(c)
+            continue
+        in_dir = (_sign(c[0] - a[0]), _sign(c[1] - a[1]))
+        out_dir = (_sign(b[0] - c[0]), _sign(b[1] - c[1]))
+        verts.append((c[0] - in_dir[0] * t, c[1] - in_dir[1] * t))   # C_in
+        verts.append((c[0] + out_dir[0] * t, c[1] + out_dir[1] * t))  # C_out
+    verts.append(corners[-1])
+    for i in range(1, len(verts)):
+        a, b = verts[i - 1], verts[i]
+        if a != b:
+            tracks.append(_mk_track(tcnt.next(), a, b, net, width, layer))
 
 
 def _sign(v: float) -> int:
@@ -1165,8 +1205,15 @@ def route_diff_pair(board: dict, net_p: str, net_n: str, opts: dict | None = Non
     tcnt = _IdCounter(board, "t", "tracks")
     vcnt = _IdCounter(board, "v", "vias")
     reg = _RoutedRegistry()
-    stats = _route_diff_pair_into(grid, board, net_p, net_n, reg,
-                                  tcnt, vcnt, via_cost, bend_cost, opts)
+    # Keep right angles here: skew matching needs exact, predictable track lengths, which a
+    # corner chamfer would shift (it shortens the path) and break the length match.
+    global _CHAMFER_ON
+    _prev_chamfer, _CHAMFER_ON = _CHAMFER_ON, False
+    try:
+        stats = _route_diff_pair_into(grid, board, net_p, net_n, reg,
+                                      tcnt, vcnt, via_cost, bend_cost, opts)
+    finally:
+        _CHAMFER_ON = _prev_chamfer
     out["tracks"] = reg.all_tracks()
     out["vias"] = reg.all_vias()
     out["report"] = stats

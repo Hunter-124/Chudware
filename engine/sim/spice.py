@@ -842,7 +842,29 @@ def netlist_to_spice_circuit(
         # Kind maps model_name → SPICE kind letter
         kind = _model_to_kind(model_name, ref)
 
-        dev = _dev(kind, ref, node_list, float_value, None, {})
+        dev_params: dict = {}
+        # Independent sources (V/I) may carry a small-signal AC magnitude so an AC
+        # sweep has a stimulus. The structured netlist path parses only the DC
+        # `value`, so without this an AC analysis sees 0 at every frequency (Bug
+        # E-1). Honor `ac_mag` carried on the component (set by build_design) or an
+        # `ac` mapping on the sim dict; a phase may ride along on `ac_phase`.
+        if kind in ("V", "I"):
+            ac_mag = comp.get("ac_mag")
+            ac_phase = comp.get("ac_phase", 0.0)
+            if ac_mag is None and isinstance(sim, dict):
+                _sa = sim.get("ac")
+                if isinstance(_sa, dict):
+                    ac_mag = _sa.get("mag")
+                    ac_phase = _sa.get("phase", ac_phase)
+                elif _sa is not None:
+                    ac_mag = _sa
+            if ac_mag is not None:
+                try:
+                    dev_params["ac"] = {"mag": float(ac_mag), "phase": float(ac_phase)}
+                except (TypeError, ValueError):
+                    pass
+
+        dev = _dev(kind, ref, node_list, float_value, None, dev_params)
         devices.append(dev)
 
     # Inline X instances (built-in subckts) + pull in the models the built-ins need.

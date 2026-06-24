@@ -82,7 +82,13 @@ need a face number or a coordinate.
             "inner"/"outer" to tell coaxial round geometry apart (tube inner vs outer
             wall, bore vs rim) — e.g. {"of":"face","surf":"round","pick":"outer"}.
     "near":[x,y,z] + "count": the N edges/faces nearest a point.  "index":[i,..]: pick by ordinal.
-  Use the doc_query tool FIRST if unsure what a part has — it returns each edge/face's shape+side.
+  On CURVED bodies: a REVOLVE/LOFT/SWEEP body is mostly ONE freeform (B-spline) face, so
+    surf:"flat" matches it 0 times — that is correct, there are no planar faces. A `side` query on
+    such a body returns the freeform wall (the only face facing that way), not a flat cap, because
+    there is no cap. If you need selectable FLAT end faces (e.g. the rim of a tube), build the body
+    so it HAS them: revolve a wall-profile ring (flat end faces) rather than a solid pole-to-pole
+    profile. Use the doc_query tool FIRST if unsure what faces a part has — it returns each
+    edge/face's shape (surf) + side so you can see what will resolve.
 
 INTENT FEATURES — one op that is a whole recipe. PREFER these over hand-built sketch+cut+pattern
 for the common machining features; they take a face in plain words and need no positions math.
@@ -116,12 +122,20 @@ components into one coordinate frame for assembly (e.g. move a tail to meet the 
   params: translate:[dx,dy,dz] (mm) and/or angle:<dim deg> with rotate:[ax,ay,az] (rotation axis),
           pivot:[x,y,z] (point the rotation turns about, default origin), and copy:true to KEEP the
           original and add a MOVED DUPLICATE as a new body (instancing; default false = move in place).
-  top-level: "body":"f3" targets that feature's body (default = the current running body).
+  top-level: "body":"f3" targets THAT feature's body (default = the current running body). The
+          named body is honored exactly — so in a multi-body assembly you can transform any named
+          component (not just the last one), and several per-body transforms in one batch each land
+          on their own body.
   Rotation is applied first (about pivot), then translation. e.g. move a wing +120 in X and up 8:
   {"type":"transform","name":"PlaceWing","params":{"translate":[120,0,8]},"body":"f4"}
   e.g. yaw a body 30° about Z through the origin:
   {"type":"transform","name":"Yaw","params":{"angle":{"value":30,"expr":null},"rotate":[0,0,1]}}
   e.g. two instances of a body 50 apart: a transform with params {"translate":[50,0,0],"copy":true}
+  ASSEMBLY: import_part / make_standard_part each add a body whose BASE seats at z=0, axis +Z
+          (make_standard_part also returns its bbox + datum). Position each with its own
+          transform body:"fN" — e.g. import a screw (f2), washer (f3), nut (f4), then transform
+          each by id to its seat. Build hollow CURVED bodies with a wall-profile revolve/loft, not
+          shell (shell is prismatic-only).
 
 PLANE / OFFSET CONVENTIONS (Z-up). plane.top = XY (normal +Z), plane.front = XZ (normal +Y),
 plane.right = YZ (normal +X). A sketch `offset`:<mm> shifts the sketch plane ALONG that normal

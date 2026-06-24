@@ -154,17 +154,16 @@ def recover_autosaved() -> list:
 # for simple use; pass background=True for the heavy runs.
 import threading as _threading  # noqa: E402
 import uuid as _uuid  # noqa: E402
-from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor  # noqa: E402
 
 _JOBS: dict = {}
 _JOB_LOCK = _threading.Lock()
-_JOB_EXEC = _ThreadPoolExecutor(max_workers=2)
 
 
-def _start_job(kind: str, fn) -> str:
+def _start_job(kind: str, fn, progress: Optional[dict] = None) -> str:
     jid = "job-" + _uuid.uuid4().hex[:12]
     with _JOB_LOCK:
-        _JOBS[jid] = {"status": "running", "kind": kind, "result": None, "error": None}
+        _JOBS[jid] = {"status": "running", "kind": kind, "result": None, "error": None,
+                      "progress": progress if progress is not None else {}}
 
     def _run() -> None:
         try:
@@ -175,7 +174,8 @@ def _start_job(kind: str, fn) -> str:
             with _JOB_LOCK:
                 _JOBS[jid].update(status="error", error=str(e))
 
-    _JOB_EXEC.submit(_run)
+    # Daemon thread: a long OpenFOAM/FEA solve must never block server (or test) shutdown.
+    _threading.Thread(target=_run, name=f"aicad-job-{kind}", daemon=True).start()
     return jid
 
 
@@ -295,10 +295,16 @@ run_cfd_flow(velocity, aoa, fluid) — LBM wind tunnel over the whole part/assem
   thin part alone) and `converged` / `residual` (a non-converged run is under-iterated, not
   physically zero). For heavy runs pass background=True and poll get_job(job_id).
 
-Heavy solves: run_cfd_flow / run_fea_* accept background=True → they return a job_id immediately
-and solve on a worker thread; poll get_job(job_id) for the result. This keeps a long solve from
-tripping the transport timeout (which would otherwise drop the session). After a restart,
-recover_parts() reloads auto-saved docs.
+run_cfd_accurate(velocity, aoa, fluid, preset) — HIGH-FIDELITY OpenFOAM RANS (k-omega SST + prism
+  layers). The TRUSTWORTHY absolute Cd/Cl path (validated ~10-15% of experiment) vs run_cfd_flow's
+  coarse LBM estimate. Requires OpenFOAM (WSL/native); runs for MINUTES, always background → poll
+  get_job(job_id) (live progress). preset coarse|medium|fine|xfine. Use run_cfd_flow first to scan
+  trends fast, then run_cfd_accurate to certify the chosen design.
+
+Heavy solves: run_cfd_flow / run_fea_* accept background=True (run_cfd_accurate is always
+background) → return a job_id immediately; poll get_job(job_id) for the result. This keeps a long
+solve from tripping the transport timeout (which would otherwise drop the session). After a
+restart, recover_parts() reloads auto-saved docs.
 """
 
 _OVERVIEW_HEADER = """\
@@ -830,9 +836,9 @@ def register_cad_tools(mcp: FastMCP) -> None:
         over-counts force (more so on curved/angled faces), so the magnitude of drag_n/cd can be
         off by an order of magnitude and is resolution-dependent. Use it to COMPARE configurations
         and read TRENDS (does +aoa add lift? does a fillet cut drag? A vs B?), which it now gets
-        right (drag scales as V^2, Cd is velocity-independent). For quantitative absolute Cd, use a
-        validated external solver (the desktop app's OpenFOAM bridge). Treat these numbers as a
-        directional estimate, not a certified coefficient.
+        right (drag scales as V^2, Cd is velocity-independent). For a TRUSTWORTHY absolute Cd/Cl,
+        use run_cfd_accurate() (OpenFOAM RANS — validated, but minutes per run). Treat these LBM
+        numbers as a fast directional estimate, not a certified coefficient.
         """
         try:
             d = _doc(doc_id)
@@ -861,6 +867,73 @@ def register_cad_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
+    def run_cfd_accurate(velocity: float = 10.0, aoa: float = 0.0, fluid: str = "air",
+                         preset: str = "coarse", doc_id: Optional[str] = None) -> str:
+        """HIGH-FIDELITY external-aero CFD via OpenFOAM (steady RANS, k-omega SST + prism layers).
+
+        Use this when you need a TRUSTWORTHY absolute Cd/Cl, not the coarse directional estimate
+        from run_cfd_flow (the built-in LBM). This is the validated path — sphere/cube land within
+        ~10-15% of experiment. It body-fits a snappyHexMesh with boundary layers and solves to
+        convergence, so it takes MINUTES and requires OpenFOAM installed (WSL openfoam2412 or native
+        blueCFD). It ALWAYS runs in the background: returns a job_id immediately; poll get_job(job_id)
+        (which reports live meshing/solve progress) for the result.
+
+        CONVENTIONS match run_cfd_flow (Z-up): freestream +X, lift +Z, +aoa pitches nose up.
+        velocity : m/s.   aoa : degrees.   fluid : "air" | "water".
+        preset   : "coarse" (fastest, ~600 iters) | "medium" | "fine" | "xfine" (finest/slowest).
+                   Start coarse to sanity-check, refine if you need the digits.
+
+        Result (via get_job): {cd, cl, ld (lift/drag), drag_n, lift_n, reynolds, ref_area_mm2,
+        vmax_mps, converged, iters, notes}. If `converged` is false, raise the preset / iterations.
+        """
+        try:
+            from engine.sim.foam_runner import capabilities
+            caps = capabilities()
+            if not caps.get("openfoam"):
+                return _dumps({"ok": False, "error":
+                               "OpenFOAM is not available on this machine. Provision it with "
+                               "`python -m tools.provision_openfoam --install` (WSL) or install "
+                               "blueCFD-Core natively. The coarse LBM run_cfd_flow still works."})
+            if preset not in ("coarse", "medium", "fine", "xfine"):
+                return _dumps({"ok": False, "error": f"unknown preset {preset!r} — use "
+                               "coarse|medium|fine|xfine"})
+            d = _doc(doc_id)
+            # OpenFOAM meshes a watertight STL surface (build_case handles mm -> m).
+            stl = _tmp(".stl")
+            cb.call("export_file", {"doc_id": d, "path": stl, "format": "stl"})
+            fluid_dict = ({"nu": 1.0e-6, "rho": 1000.0} if fluid == "water"
+                          else {"nu": 1.5e-5, "rho": 1.225})
+
+            prog: dict = {"pct": 0, "stage": "start", "text": "queued"}
+
+            def _on_progress(ev: dict) -> None:
+                prog.update(pct=ev.get("pct", 0), stage=ev.get("stage", ""),
+                            text=ev.get("text", ""))
+
+            def _solve() -> dict:
+                from engine.sim.openfoam import run_openfoam_tunnel
+                r = run_openfoam_tunnel(stl, direction=(1.0, 0.0, 0.0),
+                                        speed_mps=float(velocity), preset=preset,
+                                        aoa_deg=float(aoa), fluid=fluid_dict,
+                                        on_progress=_on_progress)
+                return {"ok": True, "doc_id": d,
+                        "solver": f"OpenFOAM RANS (k-omega SST, {caps.get('openfoam_kind')})",
+                        "preset": preset, "cd": r.cd, "cl": r.cl, "ld": r.ld,
+                        "drag_n": r.drag_n, "lift_n": r.lift_n, "side_n": r.side_n,
+                        "reynolds": r.reynolds, "ref_area_mm2": r.ref_area_mm2,
+                        "vmax_mps": r.vmax_mps, "converged": (not r.diverged),
+                        "iters": r.steps_run, "notes": r.solver_notes,
+                        "velocity_ms": float(velocity), "aoa_deg": float(aoa), "fluid": fluid}
+
+            jid = _start_job("cfd_openfoam", _solve, progress=prog)
+            return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
+                           "solver": caps.get("openfoam_version"), "preset": preset,
+                           "note": "OpenFOAM RANS runs for minutes — poll get_job(job_id); it "
+                                   "reports live meshing/solve progress."})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
     def get_job(job_id: str) -> str:
         """Poll a background job started by run_cfd_flow/run_fea_*(background=True).
 
@@ -874,6 +947,8 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 return _dumps({"ok": False, "error": f"unknown job_id {job_id!r}"})
             snap = dict(job)
         out = {"ok": True, "job_id": job_id, "status": snap["status"], "kind": snap["kind"]}
+        if snap["status"] == "running" and snap.get("progress"):
+            out["progress"] = snap["progress"]  # live {pct, stage, text} for long OpenFOAM runs
         if snap["status"] == "done":
             out["result"] = snap["result"]
         elif snap["status"] == "error":

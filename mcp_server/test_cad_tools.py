@@ -266,6 +266,21 @@ def test_background_job_and_get_job():
     assert g["status"] == "done" and g["result"]["ok"], g
 
 
+def test_run_cfd_accurate_dispatches():
+    """run_cfd_accurate either starts an OpenFOAM job (returns a job_id) or reports it's
+    unavailable — both are valid; we don't wait for the multi-minute solve here."""
+    r, _ = _call("new_part", {"name": "sph"})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [cb.feat("sphere", "S", {"radius": cb.dim(40)})]})
+    out, _ = _call("run_cfd_accurate", {"doc_id": doc, "velocity": 15.0, "preset": "coarse"})
+    if not out["ok"]:
+        assert "OpenFOAM" in out.get("error", ""), out  # graceful "not available"
+        return
+    assert out.get("job_id") and out["status"] == "running", out
+    g, _ = _call("get_job", {"job_id": out["job_id"]})
+    assert g["status"] in ("running", "done", "error"), g
+
+
 if __name__ == "__main__":
     import sys
 

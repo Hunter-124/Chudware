@@ -316,6 +316,28 @@ nlohmann::json run_flow_sim(const std::string& doc_id, const std::string& reques
         return json{{"ok", false},
                     {"answer", "There's no solid geometry to simulate yet — model "
                                "the part first, then ask me to run the flow sim."}};
+
+    // Accurate (OpenFOAM RANS) hand-off. OpenFOAM lives in the Python worker, which the HOST
+    // owns; the core can't run it. So on an explicit solver:"openfoam" (the host chat sets it
+    // when the user asks for an "accurate"/OpenFOAM run AND the worker reports OpenFOAM
+    // available), we export a watertight STL and return a hand-off the host fulfills via
+    // sim_run_flow(solver:openfoam). Missions pass empty params, so they always take the LBM
+    // path below (the core mission can't reach the worker). Falls back to LBM on export failure.
+    if (params.value("solver", std::string()) == "openfoam") {
+        try {
+            std::filesystem::path p = std::filesystem::temp_directory_path() /
+                ("aicad_cfd_" + doc_id + ".stl");
+            aicad::doc::doc_export_file(doc_id, p.string(), "stl", 0.0, 0.0, false, false);
+            return json{{"ok", true}, {"needs_openfoam", true}, {"stl_path", p.string()},
+                        {"velocity_ms", fp.velocity_ms}, {"aoa_deg", fp.aoa_deg},
+                        {"fluid", fluid},
+                        {"answer", "Running an accurate OpenFOAM RANS wind tunnel (a few "
+                                   "minutes)..."}};
+        } catch (const std::exception&) {
+            // fall through to the LBM estimate so the agent still answers
+        }
+    }
+
     std::vector<std::vector<float>> bp;
     std::vector<std::vector<uint32_t>> bi;
     for (auto& b : bodies) { bp.push_back(b.pos); bi.push_back(b.idx); }
@@ -323,18 +345,24 @@ nlohmann::json run_flow_sim(const std::string& doc_id, const std::string& reques
     aicad::sim::LbmResult r = aicad::sim::run_wind_tunnel(bp, bi, fp, &re);
     if (!r.ok)
         return json{{"ok", false}, {"answer", "The flow sim could not run: " + r.error}};
-    char buf[512];
+    std::string warn = r.warning.empty() ? std::string() : (" WARNING: " + r.warning);
+    char buf[900];
     std::snprintf(buf, sizeof(buf),
-                  "Wind-tunnel CFD at %.1f m/s%s, %.1f deg AoA (Re %.0f): drag %.3f N, "
-                  "lift %.3f N, Cd %.3f, frontal area %.0f mm^2. (Coarse LBM grid "
-                  "%dx%dx%d, %d steps — directional estimate.)",
+                  "Wind-tunnel CFD at %.1f m/s%s, %.1f deg AoA (Re %.0f, ref length %.0f mm): "
+                  "drag %.3f N, lift %.3f N, Cd %.3f, frontal area %.0f mm^2. Coarse LBM "
+                  "(%dx%dx%d, %d steps, %s) — a directional estimate; absolute Cd is uncalibrated "
+                  "(drag scales V^2, Cd velocity-independent). Ask for an \"accurate\" (OpenFOAM) "
+                  "run for a validated coefficient.%s",
                   fp.velocity_ms, fluid == "water" ? " in water" : "", fp.aoa_deg, re,
-                  r.drag_n, r.lift_n, r.cd, r.frontal_area_mm2, r.nx, r.ny, r.nz,
-                  r.steps_run);
+                  r.ref_length_mm, r.drag_n, r.lift_n, r.cd, r.frontal_area_mm2, r.nx, r.ny, r.nz,
+                  r.steps_run, r.converged ? "converged" : "not fully converged", warn.c_str());
     return json{{"ok", true},
                 {"answer", std::string(buf)},
                 {"drag_n", r.drag_n}, {"lift_n", r.lift_n}, {"cd", r.cd},
                 {"frontal_area_mm2", r.frontal_area_mm2}, {"reynolds", re},
+                {"ref_length_mm", r.ref_length_mm}, {"converged", r.converged},
+                {"residual", r.residual}, {"voxel_mm", r.voxel_mm},
+                {"min_feature_voxels", r.min_feature_voxels}, {"warning", r.warning},
                 {"velocity_ms", fp.velocity_ms}, {"aoa_deg", fp.aoa_deg}};
 }
 

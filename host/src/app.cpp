@@ -1620,6 +1620,10 @@ int run_gui(const char* screenshotPath) {
         // and no-ops the vast majority of frames (a single mtime stat).
         ui::pollAiCadHandoff(st);
 
+        // If a chat-triggered accurate (OpenFOAM) CFD finished on the SimClient channel, post its
+        // Cd/Cl onto the running chat bubble. No-op unless a chat OpenFOAM run is pending.
+        ui::pollChatOpenFoam(st);
+
         // C48: click telemetry for interaction debugging — only when AI_CAD_DEBUG_INPUT is
         // set (pairs with AI_CAD_LOG_FILE). Logs what ImGui thinks is under every click.
         {

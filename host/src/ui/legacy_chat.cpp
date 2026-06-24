@@ -33,6 +33,7 @@
 #include "icons.h"           // getIcon / IconUV — composer settings glyph
 
 #include "../core/app_state.h"
+#include "../core/sim_client.h"  // chat-triggered OpenFOAM CFD on the SimClient channel
 #include "../core/jobs.h"
 #include "../ui_theme.h"
 
@@ -1068,6 +1069,41 @@ void persistChatHistory(AppState& st) {
     }
 }
 
+void pollChatOpenFoam(AppState& st) {
+    if (!st.chatCfdPending || !st.simClient) return;
+    core::SimJobResult& job = st.simClient->job();
+    if (!job.ready.load()) return;                 // OpenFOAM still meshing/solving
+    if (job.ownerDocId != "__chat_cfd__") return;  // not the chat's job (a study's result)
+    st.chatCfdPending = false;
+    job.ready = false;                             // consume (SimManager ignored it — wrong owner)
+
+    ChatMsg* msg = nullptr;
+    for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+        if (!it->fromUser && it->running) { msg = &*it; break; }
+
+    std::string answer, err;
+    if (!job.ok) {
+        err = job.error.empty() ? "OpenFOAM run failed" : job.error;
+    } else {
+        const double cd = job.result.value("cd", 0.0), cl = job.result.value("cl", 0.0);
+        const double drag = job.result.value("drag_n", 0.0), lift = job.result.value("lift_n", 0.0);
+        const double re = job.result.value("reynolds", 0.0);
+        char b[512];
+        std::snprintf(b, sizeof(b),
+            "Accurate OpenFOAM RANS (k-omega SST) at %.1f m/s, %.1f deg AoA (Re %.0f): drag %.3f N, "
+            "lift %.3f N, Cd %.3f, Cl %.3f. Validated solver — trust these as absolute coefficients.",
+            st.chatCfdVel, st.chatCfdAoa, re, drag, lift, cd, cl);
+        answer = b;
+    }
+    if (msg) {
+        msg->running = false; msg->liveStatus.clear();
+        if (!err.empty()) { msg->errKind = ERR_SYSTEM; msg->text = "The CFD sim failed: " + err; }
+        else msg->text = answer;
+    }
+    st.status = err.empty() ? "Ready." : "CFD failed.";
+    st.statusKind = err.empty() ? 0 : 2;
+}
+
 // Replace conversations/chat with the saved set for `key` (or a fresh empty chat if none).
 static void loadChatHistoryForKey(AppState& st, const std::string& key) {
     nlohmann::json root = nlohmann::json::object();
@@ -2093,6 +2129,21 @@ static void submitTurn(AppState& st, const std::string& text) {
         st.addLog("[..] cfd: " + text);
         st.status = "Running CFD...";  st.statusKind = 0;
         nlohmann::json params = {{"doc_id", st.docMirror.docId()}, {"request", text}};
+        // Accurate (OpenFOAM RANS) opt-in: when the user asks for an accurate/validated run AND the
+        // worker reports OpenFOAM available, request solver=openfoam. The core exports an STL and
+        // hands back {needs_openfoam, stl_path, velocity_ms, aoa_deg, fluid}; the app loop fulfils
+        // it on the dedicated (non-blocking) SimClient channel — see pollChatOpenFoam in app.cpp.
+        // (sim_run_flow must NOT go through st.rpc: WorkerClient::call serialises on callMtx_, so a
+        // minutes-long solve there would freeze every other RPC.)
+        const bool wantAccurate = has("accurate") || has("openfoam") || has("open foam") ||
+                                  has("precise") || has("high-fidelity") || has("high fidelity") ||
+                                  has("rans") || has("validated");
+        bool ofAvail = false;
+        if (wantAccurate && st.simClient) ofAvail = st.simClient->caps().value("openfoam", false);
+        if (wantAccurate && ofAvail) params["solver"] = "openfoam";
+        if (wantAccurate && !ofAvail)
+            st.addLog("[cfd] accurate requested but OpenFOAM not provisioned — using LBM estimate");
+
         st.rpc.call("agent_simulate_v1", params, [&st](const core::RpcResult& r) {
             ChatMsg* msg = nullptr;
             for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
@@ -2101,6 +2152,36 @@ static void submitTurn(AppState& st, const std::string& text) {
             if (!r.ok) err = r.err.empty() ? "worker call failed" : r.err;
             else if (r.result.is_object() && r.result.contains("code"))
                 err = r.result.value("message", std::string("worker error"));
+
+            // Accurate hand-off: the core exported an STL; launch OpenFOAM on the SimClient channel
+            // (non-blocking) and let the app loop post the result when the study finishes.
+            if (err.empty() && r.result.value("needs_openfoam", false) && st.simClient) {
+                const bool water = (r.result.value("fluid", std::string("air")) == "water");
+                nlohmann::json fparams = {
+                    {"stl_path", r.result.value("stl_path", std::string())},
+                    {"direction", {1.0, 0.0, 0.0}},
+                    {"speed_mps", r.result.value("velocity_ms", 10.0)},
+                    {"aoa_deg", r.result.value("aoa_deg", 0.0)},
+                    {"sideslip_deg", 0.0}, {"preset", "coarse"}, {"ref_area_mm2", 0.0},
+                    {"fluid", {{"name", water ? "water" : "air"},
+                               {"density_kgm3", water ? 1000.0 : 1.225},
+                               {"kinematic_visc_m2s", water ? 1.0e-6 : 1.5e-5}}},
+                    {"solver", "openfoam"},
+                };
+                std::string note;
+                // Sentinel owner so SimManager::tick (which matches the real doc id) ignores this
+                // job — the chat's own poll consumes it instead. No study/overlay side effects.
+                if (st.simClient->launch("sim_run_flow", fparams, note, "__chat_cfd__")) {
+                    st.chatCfdVel = r.result.value("velocity_ms", 10.0);
+                    st.chatCfdAoa = r.result.value("aoa_deg", 0.0);
+                    st.chatCfdPending = true;   // app loop polls SimClient and posts the result
+                    if (msg) msg->liveStatus = "OpenFOAM RANS (a few minutes)...";
+                    st.status = "Running OpenFOAM...";  st.statusKind = 0;
+                    return;
+                }
+                err = note.empty() ? "could not launch OpenFOAM" : note;  // e.g. a study is running
+            }
+
             if (msg) {
                 msg->running = false;
                 msg->liveStatus.clear();

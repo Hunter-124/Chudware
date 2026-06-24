@@ -1033,6 +1033,12 @@ struct AppState {
     // Live status line for the v2 orchestrator run, shown in the chat area
     std::string agentV2Status;              // e.g. "PLAN > planner attempt 1..."
     bool agentV2Running = false;            // a v2 run is in flight (blocks concurrent runs)
+    // Chat-triggered accurate (OpenFOAM) CFD: launched on the SimClient channel (non-blocking) and
+    // fulfilled by ui::pollChatOpenFoam each frame (it can't use the serialised st.rpc for a
+    // minutes-long solve). chatCfdVel/Aoa carry the parsed condition for the result message.
+    bool chatCfdPending = false;
+    double chatCfdVel = 10.0;
+    double chatCfdAoa = 0.0;
     // Live context-meter telemetry: the most recent agent call's INPUT token estimate (how full the
     // model's context is right now) — fed from agent_output events, reset at run start. The composer
     // shows it vs the active model's window like the Claude Code / Codex / VS Code context meters.

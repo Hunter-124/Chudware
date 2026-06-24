@@ -29,4 +29,9 @@ void refreshModelAvailability(AppState& state, bool force);
 // %APPDATA%/AI-CAD/chat_history.json. Safe to call any time; no-op if nothing to save.
 void persistChatHistory(AppState& state);
 
+// Per-frame: if a chat-triggered accurate (OpenFOAM) CFD launched on the SimClient channel has
+// finished, post its Cd/Cl result onto the running chat bubble. No-op when nothing is pending.
+// Call once per frame from the main loop (alongside pollAiCadHandoff).
+void pollChatOpenFoam(AppState& state);
+
 }  // namespace ui

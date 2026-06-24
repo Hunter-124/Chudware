@@ -1605,6 +1605,11 @@ int run_gui(const char* screenshotPath) {
         // callbacks that captured `this`) has now fully drained — safe to destroy once rpc is idle.
         st.sweepRetiredSessions();
 
+        // Live MCP handoff: if the external AI-CAD MCP server (the engine Claude drives) published
+        // a new part, open/refresh it in the viewport so the user watches the AI build. Self-guards
+        // and no-ops the vast majority of frames (a single mtime stat).
+        ui::pollAiCadHandoff(st);
+
         // C48: click telemetry for interaction debugging — only when AI_CAD_DEBUG_INPUT is
         // set (pairs with AI_CAD_LOG_FILE). Logs what ImGui thinks is under every click.
         {

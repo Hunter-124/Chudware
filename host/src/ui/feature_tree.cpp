@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -2506,6 +2508,45 @@ bool featureTreeOpenPath(AppState& st, const std::string& path, bool asSolid) {
     st.addLog("[err] open: " + err);
     st.toast(ui::ToastLevel::Error, "Open failed: " + pathBaseName(path) + " — " + err);
     return false;
+}
+
+// Live MCP handoff poll — see the header. The external MCP server (the engine Claude drives)
+// publishes the part it's working on to %APPDATA%\AI-CAD\handoff\ as a NATIVE .step+ doc plus a
+// tiny live.json {rev, step}. We open/refresh a single tab from it so the user watches the AI
+// build in the viewport. Loading the native .step+ (not bare STEP) brings the whole feature tree.
+void pollAiCadHandoff(AppState& st) {
+    if (!st.workerStarted) return;   // worker not up — nothing can open yet
+    if (st.agentV2Running) return;   // an in-app agent run owns the doc; don't fight it
+    namespace fs = std::filesystem;
+    static const std::string ctrl = appdataDir() + "\\AI-CAD\\handoff\\live.json";
+    std::error_code ec;
+    if (!fs::exists(ctrl, ec)) return;
+    // Cheap most frames: only parse when the control file's modification time advances.
+    static fs::file_time_type lastMtime{};
+    fs::file_time_type mt = fs::last_write_time(ctrl, ec);
+    if (ec || mt == lastMtime) return;
+    lastMtime = mt;
+
+    nlohmann::json j;
+    {
+        std::ifstream f(ctrl, std::ios::binary);
+        if (!f) return;
+        try { f >> j; } catch (...) { return; }   // half-written: pick it up on the next change
+    }
+    const long long rev = j.value("rev", (long long)-1);
+    const std::string step = j.value("step", std::string());
+    static long long lastRev = -1;
+    if (rev < 0 || rev == lastRev) return;
+    if (step.empty() || !fs::exists(step, ec)) return;
+    lastRev = rev;
+
+    // Refresh in place: close any tab already showing the handoff file (matched by PATH so a user
+    // tab reorder/close can't make us close the wrong one), then open the freshly published doc.
+    for (int i = (int)st.docTabs.size() - 1; i >= 0; --i)
+        if (st.docTabs[i].path == step) st.closeDocTab(i);
+
+    if (featureTreeOpenPath(st, step))
+        st.toast(ui::ToastLevel::Info, "AI-CAD: showing the AI's live part");
 }
 
 // Native "Open..." dialog -> open. Returns the opened path (for Recent), or "" on cancel/failure.

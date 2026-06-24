@@ -1,238 +1,118 @@
 """AI-CAD MCP server.
 
-Exposes the modeling engine as MCP tools so any MCP-capable agent (Claude Code, etc.)
-can drive parametric CAD: write build123d code, render screenshots, read mass
-properties, and export STEP/STL. Runs over stdio; the desktop host registers it into the
-machine's Claude config so it "just works".
+Exposes the AI-CAD modeling engine — the SAME C++ core (`libaicad.dll`) the desktop app
+runs — as MCP tools, so an MCP client (Claude in cowork/chat or Claude Code) can drive
+real parametric CAD and simulation: build an editable feature tree with the plain-English
+geometry vocabulary, render an annotated image to self-review, run FEA (static/modal) and
+wind-tunnel CFD, make 2D drawings, pull standard hardware, and export STEP/STL/3MF/etc.
 
-Single-part tools:
-  run_model(code, name)   build a solid from build123d code; returns stats + paths
-  get_screenshot(view)    render the current model (contact sheet or a single view)
-  get_model_info()        mass properties + export paths for the current model
-  export_model(fmt)       ensure STEP/STL exists; returns the path
-  reset()                 clear the current model
+This is parity with the in-app AI agent — except YOU (the model calling these tools) are the
+brain, so call `cad_guide()` first to load the engine's op vocabulary, then model → render →
+iterate → simulate exactly like the app does.
 
-Multi-part / assembly tools:
-  run_assembly(code, name)      build several named parts placed together; returns per-part
-                                stats + a fit report (interference / clearance)
-  get_fit_report()              interference (overlap mm^3) + clearances (mm) for the assembly
-  get_assembly_screenshot()     color-coded contact sheet of the assembled parts
-  export_part(name, fmt)        STEP/STL path for one part (or the whole "assembly")
+Mechanical CAD + simulation tools live in `cad_tools` (driven through `core_bridge`, the
+ctypes bridge to the staged DLL). ECAD (schematic/PCB) tools live in `ecad_tools`.
+Runs over stdio; the desktop host registers it into the machine's MCP client configs.
 """
 from __future__ import annotations
 
-import json
-from pathlib import Path
-from typing import Optional
+import os
+import sys
+import tempfile
+import threading
 
-from mcp.server.fastmcp import FastMCP, Image
-
-from engine import paths, render
-from engine.kernel import AssemblyResult, ModelResult, run_code, run_code_multi
+from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP(
     "AI-CAD",
     instructions=(
-        "Parametric CAD via build123d. For a SINGLE part, call run_model(code) where `code` "
-        "assigns the final shape to `result`, then get_screenshot() to verify it from "
-        "iso/front/back/right/top/bottom. For a MULTI-PART assembly that must fit together, call "
-        "run_assembly(code) where `code` defines `parts = {\"base\": solid, ...}` (each "
-        "positioned with Pos/Rot); it returns per-part stats plus a FIT REPORT (pairwise "
-        "interference overlap + clearances). Use get_assembly_screenshot() to see the "
-        "color-coded fit and get_fit_report() for the numbers; verify no unintended "
-        "interference before finishing. The OpenCASCADE B-rep kernel gives precise solids; "
-        "prefer fillet/chamfer/holes/patterns over mesh hacks."
+        "Real parametric CAD + simulation on the AI-CAD C++ engine (same kernel as the "
+        "desktop app). You are the design brain.\n"
+        "START by calling cad_guide() — it returns the engine's modeling op vocabulary and "
+        "worked examples; cad_guide('simulation') and cad_guide('review') cover FEA/CFD and "
+        "how to read the annotated render.\n"
+        "TYPICAL LOOP: new_part(name) -> add_features([...ops...]) to build with standard "
+        "editable features (boxes/sketch+extrude/revolve/loft/sweep, fillet/chamfer/shell, "
+        "holes, bolt_circle, patterns/mirror) -> render_part() to SEE the colour-coded, "
+        "face-labelled result and self-review against the request -> iterate add_features to "
+        "fix anything -> measure_part()/query_geometry() to check -> run_fea_static()/"
+        "run_fea_modal()/run_cfd_flow() to prove it -> export_part() or make_drawing() to "
+        "deliver.\n"
+        "Address geometry in PLAIN WORDS — 'the top face', 'all edges', 'the vertical edges', "
+        "'the largest round face' — never face numbers or raw coordinates. Build with the "
+        "feature a person would use (sketch+revolve for round bodies, loft for blended shapes), "
+        "not stacks of boxes. The OpenCASCADE B-rep kernel gives precise solids.\n"
+        "ECAD (schematic/PCB) tools are also available (ecad_*)."
     ),
 )
 
-# === ECAD tools (Wave C3) ===
+# Mechanical CAD + simulation (C++ feature engine via libaicad.dll).
+from mcp_server.cad_tools import register_cad_tools
+register_cad_tools(mcp)
+
+# ECAD (schematic / PCB / native circuit sim).
 from mcp_server.ecad_tools import register_ecad_tools
 register_ecad_tools(mcp)
-# === end ECAD tools ===
-
-# in-memory "current model" — one active part per server session
-_STATE: dict = {"name": None, "result": None, "out_dir": None}
-# separate "current assembly" so the multi-part tools don't clobber the single-part state
-_ASM: dict = {"name": None, "result": None, "out_dir": None}
 
 
-def _summary(res: ModelResult) -> dict:
-    return {
-        "ok": res.ok,
-        "error": res.error,
-        "stdout": res.stdout,
-        "triangles": res.triangles,
-        "volume_mm3": res.volume,
-        "area_mm2": res.area,
-        "bbox": res.bbox,
-        "step_path": res.step_path,
-        "stl_path": res.stl_path,
-        "warnings": res.warnings,
-    }
+def _install_clean_stdout():
+    """Point the process's native stdout (fd 1) at a log file and return a private handle to
+    the REAL stdout pipe for the MCP transport.
 
-
-@mcp.tool()
-def run_model(code: str, name: str = "model") -> str:
-    """Build a solid from build123d `code` (assign the final shape to `result`).
-
-    Returns a JSON summary: ok/error, captured stdout, triangle count, volume (mm^3),
-    surface area (mm^2), bounding box, and STEP/STL paths. On error, `error` holds the
-    traceback — read it, fix the code, and call again.
+    Why: the C++ core (OCCT) prints statistics straight to fd 1 — which is the MCP JSON-RPC
+    channel. Those bytes corrupt the protocol, and on a slow-drained pipe a big native write
+    can even BLOCK and hang the call ("request timed out"). Redirecting fd 1 to a file once,
+    here at startup, makes that impossible without any per-call fd toggling (which would race
+    the transport's off-thread response writer). The transport is handed an explicit stream
+    bound to the preserved pipe. Returns an ``anyio`` async file, or None if the dup dance
+    isn't supported (then we fall back to the default transport).
     """
-    out_dir = paths.model_dir(name)
-    res = run_code(code, out_dir, name)
-    _STATE.update(name=name, result=res, out_dir=str(out_dir))
-    return json.dumps(_summary(res), indent=2)
+    try:
+        import anyio
+        from io import FileIO, TextIOWrapper
+
+        real_fd = os.dup(1)  # the genuine JSON-RPC pipe to the MCP client
+        log_path = os.path.join(tempfile.gettempdir(), "ai-cad-mcp-native.log")
+        log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        os.dup2(log_fd, 1)  # fd 1 -> log; sys.stdout follows, so stray prints are harmless too
+        os.close(log_fd)
+        real_stream = anyio.wrap_file(TextIOWrapper(FileIO(real_fd, mode="w"), encoding="utf-8"))
+        return real_stream
+    except Exception:
+        return None
 
 
-@mcp.tool()
-def get_screenshot(view: str = "all") -> Image:
-    """Render the current model to a PNG and return it for visual inspection.
-
-    view="all" -> a 2x3 contact sheet (iso/front/back/right/top/bottom). Otherwise one of
-    "iso" | "front" | "back" | "right" | "top" | "bottom".
-    """
-    res: Optional[ModelResult] = _STATE["result"]
-    if res is None or not res.ok or not res.stl_path:
-        raise ValueError("No valid current model. Call run_model first.")
-    out_dir = Path(_STATE["out_dir"])
-    name = _STATE["name"]
-    if view == "all":
-        png = render.render_grid(res.stl_path, out_dir / f"{name}_grid.png")
-    else:
-        pngs = render.render_views(res.stl_path, out_dir, prefix=name, views=(view,))
-        png = pngs[view]
-    return Image(path=png)
-
-
-@mcp.tool()
-def get_model_info() -> str:
-    """JSON mass properties + export paths for the current model."""
-    res: Optional[ModelResult] = _STATE["result"]
-    if res is None:
-        return json.dumps({"error": "No current model. Call run_model first."})
-    return json.dumps(_summary(res), indent=2)
-
-
-@mcp.tool()
-def export_model(fmt: str = "step") -> str:
-    """Return the path to the current model in `fmt` ("step" or "stl"). Built at run time."""
-    res: Optional[ModelResult] = _STATE["result"]
-    if res is None or not res.ok:
-        return json.dumps({"error": "No valid current model. Call run_model first."})
-    path = res.step_path if fmt.lower() == "step" else res.stl_path
-    if not path:
-        return json.dumps({"error": f"No {fmt} export available."})
-    return json.dumps({"format": fmt.lower(), "path": path})
-
-
-@mcp.tool()
-def reset() -> str:
-    """Clear the current model and assembly."""
-    _STATE.update(name=None, result=None, out_dir=None)
-    _ASM.update(name=None, result=None, out_dir=None)
-    return json.dumps({"ok": True})
-
-
-# ----------------------------- multi-part / assembly -----------------------------
-
-def _asm_summary(res: AssemblyResult) -> dict:
-    return {
-        "ok": res.ok,
-        "error": res.error,
-        "stdout": res.stdout,
-        "is_assembly": res.is_assembly,
-        "triangles": res.triangles,
-        "volume_mm3": res.volume,
-        "bbox": res.bbox,
-        "assembly_step_path": res.step_path,
-        "assembly_stl_path": res.stl_path,
-        "parts": [
-            {"name": p.get("name"), "volume_mm3": p.get("volume"), "bbox": p.get("bbox"),
-             "triangles": p.get("triangles"), "step_path": p.get("step_path"),
-             "stl_path": p.get("stl_path")}
-            for p in res.parts
-        ],
-        "fit": res.fit,
-        "warnings": res.warnings,
-    }
-
-
-@mcp.tool()
-def run_assembly(code: str, name: str = "assembly") -> str:
-    """Build a MULTI-PART assembly from build123d `code`.
-
-    Define `parts = {"base": solid_a, "lid": solid_b, ...}` where each value is a complete
-    solid positioned in the shared coordinate space with `Pos(x,y,z) *` / `Rot(rx,ry,rz) *`
-    (and/or an explicit `assembly = Compound(children=[...])`). Returns a JSON summary: each
-    part's volume/bbox/STEP+STL paths, a combined assembly STEP/STL, and a FIT REPORT —
-    pairwise interference (overlap mm^3 when bodies collide) and clearances (gap mm when they
-    don't). Then call get_assembly_screenshot() to see the color-coded fit and verify it
-    before finishing. A plain single-`result` script also works (one part, no fit report).
-    """
-    out_dir = paths.model_dir(name)
-    res = run_code_multi(code, out_dir, name)
-    _ASM.update(name=name, result=res, out_dir=str(out_dir))
-    return json.dumps(_asm_summary(res), indent=2)
-
-
-@mcp.tool()
-def get_fit_report() -> str:
-    """JSON fit report for the current assembly: interference (overlapping pairs + overlap
-    volume mm^3), clearances (non-touching pairs + gap mm), and per-part bounding boxes.
-    Call run_assembly first."""
-    res: Optional[AssemblyResult] = _ASM["result"]
-    if res is None or not res.ok:
-        return json.dumps({"error": "No valid current assembly. Call run_assembly first."})
-    if not res.is_assembly or res.fit is None:
-        return json.dumps({"is_assembly": False,
-                           "note": "The current build is a single part; there is no fit report."})
-    return json.dumps(res.fit, indent=2)
-
-
-@mcp.tool()
-def get_assembly_screenshot() -> Image:
-    """Render the current assembly to a color-coded 2x2 contact sheet (each part a distinct
-    color, with a legend) and return it for visual fit inspection. Call run_assembly first."""
-    res: Optional[AssemblyResult] = _ASM["result"]
-    if res is None or not res.ok or not res.stl_path:
-        raise ValueError("No valid current assembly. Call run_assembly first.")
-    out_dir = Path(_ASM["out_dir"])
-    name = _ASM["name"]
-    png = None
-    if res.is_assembly and res.parts:
-        png = render.render_assembly_grid(res.parts, out_dir / f"{name}_asm_grid.png")
-    if not png:
-        png = render.render_grid(res.stl_path, out_dir / f"{name}_grid.png")
-    if not png:
-        raise ValueError("Rendering unavailable (pyvista/vtk not installed).")
-    return Image(path=png)
-
-
-@mcp.tool()
-def export_part(name: str, fmt: str = "step") -> str:
-    """Path to one part of the current assembly in `fmt` ("step" or "stl"). `name` matches a
-    part name from run_assembly's summary; pass "assembly" for the combined model. Built at
-    run time. Call run_assembly first."""
-    res: Optional[AssemblyResult] = _ASM["result"]
-    if res is None or not res.ok:
-        return json.dumps({"error": "No valid current assembly. Call run_assembly first."})
-    fmt = fmt.lower()
-    if name.lower() in ("assembly", "all", ""):
-        path = res.step_path if fmt == "step" else res.stl_path
-        return json.dumps({"name": "assembly", "format": fmt, "path": path} if path
-                          else {"error": f"No {fmt} export for the assembly."})
-    for p in res.parts:
-        if p.get("name") == name:
-            path = p.get("step_path") if fmt == "step" else p.get("stl_path")
-            return json.dumps({"name": name, "format": fmt, "path": path} if path
-                              else {"error": f"No {fmt} export for part {name!r}."})
-    avail = [p.get("name") for p in res.parts]
-    return json.dumps({"error": f"No part named {name!r}. Available: {avail}"})
+def _warm_core() -> None:
+    """Load libaicad.dll up front (in the background) so the FIRST tool call doesn't eat the
+    cold load (DLL + OCCT/gmsh deps can take many seconds) inside the client's call timeout."""
+    try:
+        from mcp_server import core_bridge
+        core_bridge.available()
+    except Exception:
+        pass
 
 
 def main() -> None:
-    mcp.run()  # stdio transport
+    real_stream = _install_clean_stdout()
+    # Warm the core only AFTER fd 1 is redirected, so its load-time prints land in the log,
+    # never on the protocol pipe.
+    threading.Thread(target=_warm_core, name="aicad-warm", daemon=True).start()
+
+    if real_stream is None:
+        mcp.run()  # fallback (fd redirect unsupported) — stdio transport on sys.stdout
+        return
+
+    import anyio
+    from mcp.server.stdio import stdio_server
+
+    async def _serve() -> None:
+        async with stdio_server(stdout=real_stream) as (read_stream, write_stream):
+            await mcp._mcp_server.run(
+                read_stream, write_stream,
+                mcp._mcp_server.create_initialization_options(),
+            )
+
+    anyio.run(_serve)
 
 
 if __name__ == "__main__":

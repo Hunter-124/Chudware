@@ -2,7 +2,16 @@ HOLE - a standards-aware hole (simple/cbore/csink/tap) on a face at sketched poi
 
 Op shape: one `add_feature` of type `hole`. params: `style` ("simple"|"cbore"|"csink"|"tap"), `standard` ("M2".."M12"|"custom"), `diameter` (dim, custom only), `end` ("through_all"|"blind"), `depth` (dim, blind). refs.face = a planar face selector; refs.positions = a sketch of points (or positions_sketch = sketch feature id).
 
-A face selector: {"kind":"face","surf":"plane","centroid":[x,y,z],"axis":[nx,ny,nz],"area_or_len":<area>,"owner_feature":"<feature id>","hint_index":0}.
+refs.face is EASIEST as a plain-word geometry QUERY (no clicking, no coordinates): {"of":"face","side":"top"} = the top face ("bottom"/"left"/"right"/"front"/"back" too). A clicked face selector also works: {"kind":"face","surf":"plane","centroid":[x,y,z],"axis":[nx,ny,nz],"area_or_len":<area>,"owner_feature":"<feature id>","hint_index":0}.
+
+POSITIONS without a sketch: pass params `positions`:[[u,v],...] — mm in the face's own frame, origin = face CENTRE. Omit positions entirely = ONE hole at the face centre. Use `positions_sketch` only when the points come from a real sketch.
+
+Example 0 (simplest) - one ⌀5 through-hole in the centre of the top face:
+[
+ {"op":"add_feature","feature":{"type":"hole","name":"Bore","params":{"style":"simple","standard":"custom","diameter":{"value":5,"expr":null},"end":"through_all"},"refs":{"face":{"of":"face","side":"top"}}}}
+]
+
+For a RING of holes (bolt circle) use the `bolt_circle` feature, not many `hole` ops — see ops cheatsheet.
 
 Example A - M3 through-hole on box f1's top face, points from sketch f2:
 [
@@ -15,6 +24,6 @@ Example B - custom 5mm diameter blind hole 8mm deep:
 ]
 
 3 common mistakes:
-1. A hole needs a POINTS SKETCH on its face (positions_sketch) - create that sketch first, then the hole.
+1. You do NOT need a points sketch — pass params.positions:[[u,v],..] (or omit for a centre hole). Use positions_sketch only when the points already come from a real sketch.
 2. Standard "M3" sets the diameter automatically; only set `diameter` when standard is "custom".
 3. For a simple round bore without standards, a `cylinder` with mode "cut" is often simpler than `hole`.

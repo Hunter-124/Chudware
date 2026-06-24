@@ -1467,23 +1467,30 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                         out_json, 0);
         }
         if (m == "sim_mesh") {
-            // gmsh tet4 mesher (engine/sim/mesher.py parity probe). Wraps the SAME
-            // libgmsh 4.15.2 as the Python oracle, so the mesh is bit-identical.
-            // Params: {"step_path": "<path>", "density": <float, default 0.5>}.
-            // Returns points[n*3], tets[m*4] (0-based), char_len_mm, n_nodes, n_elems.
+            // Curvature-adaptive tet mesher (wraps gmsh 4.15.2). Params:
+            //   {"step_path", "fineness"(0..1)|"density"(legacy), "order"|"mesh_order",
+            //    "curvature"(bool), "curv_elems_per_circle", "target_size_mm",
+            //    "min_size_mm", "max_size_mm", "optimize"(bool), "algorithm3d"}.
+            // Returns points[n*3], tets[m*K] (0-based), counts, and quality metrics
+            // (aspect min/avg/max, jacobian_min, pct_poor, aspect_hist) for the GUI.
             std::string step_path = params.contains("step_path") && params["step_path"].is_string()
                                         ? params["step_path"].get<std::string>()
                                         : std::string();
             if (step_path.empty())
                 return emit_error("sim_mesh: 'step_path' (string) is required", out_json);
             aicad::sim::MeshOptions opts;
-            opts.density = params.value("density", 0.5);
+            opts.fineness = params.value("fineness", 0.5);
+            opts.density = params.value("density", -1.0);  // legacy alias
             opts.order = params.value("order", params.value("mesh_order", 1));
+            opts.curvature = params.value("curvature", true);
+            opts.curv_elems_per_circle = params.value("curv_elems_per_circle", 12.0);
             opts.target_size_mm = params.value("target_size_mm", 0.0);
             opts.min_size_mm = params.value("min_size_mm", 0.0);
             opts.max_size_mm = params.value("max_size_mm", 0.0);
-            opts.optimize = params.value("optimize", false);
+            opts.optimize = params.value("optimize", true);
             opts.algorithm3d = params.value("algorithm3d", 1);
+            opts.structured = params.value(
+                "structured", params.value("mesh_type", std::string()) == "hex");
             aicad::sim::MeshOut r = aicad::sim::mesh_step(step_path, opts);
             if (!r.ok) return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
             return emit(json{{"ok", true},
@@ -1494,7 +1501,13 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                              {"n_elems", r.n_elems},
                              {"nodes_per_elem", r.nodes_per_elem},
                              {"min_tet_volume_mm3", r.min_tet_volume_mm3},
-                             {"max_tet_edge_ratio", r.max_tet_edge_ratio}},
+                             {"max_tet_edge_ratio", r.max_tet_edge_ratio},
+                             {"aspect_min", r.aspect_min},
+                             {"aspect_avg", r.aspect_avg},
+                             {"aspect_max", r.aspect_max},
+                             {"jacobian_min", r.jacobian_min},
+                             {"pct_poor", r.pct_poor},
+                             {"aspect_hist", r.aspect_hist}},
                         out_json, 0);
         }
         if (m == "sim_run_static") {
@@ -1522,13 +1535,18 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                         // tets). The mesh is deterministic so node coords + tets match the
                         // solved result.
                         aicad::sim::MeshOptions opts;
-                        opts.density = study.value("density", 0.5);
+                        opts.fineness = study.value("fineness", 0.5);
+                        opts.density = study.value("density", -1.0);  // legacy alias
                         opts.order = study.value("mesh_order", study.value("order", 1));
+                        opts.curvature = study.value("curvature", true);
+                        opts.curv_elems_per_circle = study.value("curv_elems_per_circle", 12.0);
                         opts.target_size_mm = study.value("target_size_mm", 0.0);
                         opts.min_size_mm = study.value("min_size_mm", 0.0);
                         opts.max_size_mm = study.value("max_size_mm", 0.0);
-                        opts.optimize = study.value("optimize", false);
+                        opts.optimize = study.value("optimize", true);
                         opts.algorithm3d = study.value("algorithm3d", 1);
+                        opts.structured = study.value(
+                            "structured", study.value("mesh_type", std::string()) == "hex");
                         aicad::sim::MeshOut mo = aicad::sim::mesh_step(step_path, opts);
                         if (mo.ok) {
                             vol = mo.points;
@@ -1592,12 +1610,15 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                         // Inline points absent: re-mesh to get the volume node coords AND
                         // the tet connectivity (the boundary-surface overlay needs them).
                         aicad::sim::MeshOptions opts;
-                        opts.density = study.value("density", 0.5);
+                        opts.fineness = study.value("fineness", 0.5);
+                        opts.density = study.value("density", -1.0);  // legacy alias
                         opts.order = 1;
+                        opts.curvature = study.value("curvature", true);
+                        opts.curv_elems_per_circle = study.value("curv_elems_per_circle", 12.0);
                         opts.target_size_mm = study.value("target_size_mm", 0.0);
                         opts.min_size_mm = study.value("min_size_mm", 0.0);
                         opts.max_size_mm = study.value("max_size_mm", 0.0);
-                        opts.optimize = study.value("optimize", false);
+                        opts.optimize = study.value("optimize", true);
                         opts.algorithm3d = study.value("algorithm3d", 1);
                         aicad::sim::MeshOut mo = aicad::sim::mesh_step(step_path, opts);
                         if (mo.ok) {
@@ -1923,19 +1944,26 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                 aicad::sim::LbmResult r = aicad::sim::run_wind_tunnel(bp, bi, fp, &re);
                 if (!r.ok)
                     return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
-                return emit(json{{"ok", true},
-                                 {"drag_n", r.drag_n},
-                                 {"lift_n", r.lift_n},
-                                 {"cd", r.cd},
-                                 {"frontal_area_mm2", r.frontal_area_mm2},
-                                 {"reynolds", re},
-                                 {"velocity_ms", fp.velocity_ms},
-                                 {"aoa_deg", fp.aoa_deg},
-                                 {"fluid", fluid},
-                                 {"steps_run", r.steps_run},
-                                 {"diverged", r.diverged},
-                                 {"grid", {r.nx, r.ny, r.nz}}},
-                            out_json, 0);
+                json flow{{"ok", true},
+                          {"drag_n", r.drag_n},
+                          {"lift_n", r.lift_n},
+                          {"cd", r.cd},
+                          {"frontal_area_mm2", r.frontal_area_mm2},
+                          {"reynolds", re},
+                          {"ref_length_mm", r.ref_length_mm},
+                          {"velocity_ms", fp.velocity_ms},
+                          {"aoa_deg", fp.aoa_deg},
+                          {"fluid", fluid},
+                          {"steps_run", r.steps_run},
+                          {"diverged", r.diverged},
+                          {"converged", r.converged},
+                          {"residual", r.residual},
+                          {"voxel_mm", r.voxel_mm},
+                          {"min_feature_mm", r.min_feature_mm},
+                          {"min_feature_voxels", r.min_feature_voxels},
+                          {"grid", {r.nx, r.ny, r.nz}}};
+                if (!r.warning.empty()) flow["warning"] = r.warning;
+                return emit(std::move(flow), out_json, 0);
             }
             if (m == "agent_simulate_v1") {
                 // "AI runs CFD": {doc_id, request} (+ optional explicit velocity/aoa/fluid) ->
@@ -2078,9 +2106,22 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                     ? params["body"].get<int>() : 0),
                             out_json, 0);
             if (m == "export_file")
-                return emit(aicad::doc::doc_export_file(params.value("doc_id", std::string()),
-                                                        params.value("path", std::string()),
-                                                        params.value("format", std::string())),
+                return emit(aicad::doc::doc_export_file(
+                                params.value("doc_id", std::string()),
+                                params.value("path", std::string()),
+                                params.value("format", std::string()),
+                                params.value("lin_deflection", 0.05),
+                                params.value("ang_deflection", 0.35),
+                                params.value("relative", false), params.value("ascii", false)),
+                            out_json, 0);
+            // Live triangle/vertex estimate for the export dialog — tessellates in memory
+            // at the requested quality and returns counts without writing a file.
+            if (m == "export_tess_estimate")
+                return emit(aicad::doc::doc_export_estimate(
+                                params.value("doc_id", std::string()),
+                                params.value("lin_deflection", 0.05),
+                                params.value("ang_deflection", 0.35),
+                                params.value("relative", false)),
                             out_json, 0);
             // 2D exports (engine/doc/export2d.py). Format = explicit param else the path's
             // .dxf/.pdf extension (mirrors export2d.py::_resolve_format).

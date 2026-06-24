@@ -88,6 +88,13 @@ def _warm_core() -> None:
     try:
         from mcp_server import core_bridge
         core_bridge.available()
+        # Recover any docs auto-saved before a previous restart so a client-timeout kill doesn't
+        # permanently drop the user's open parts (they reload with fresh ids; list_parts shows them).
+        try:
+            from mcp_server.cad_tools import recover_autosaved
+            recover_autosaved()
+        except Exception:
+            pass
     except Exception:
         pass
 

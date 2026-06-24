@@ -169,6 +169,7 @@ const std::map<string, FeatureSpec> FEATURE_TYPES = {
                                  {"positions", RefForm::SelList, false},
                                  {"positions_sketch", RefForm::SelOrDatum, false},
                                  {"points", RefForm::UvList, false}}}},
+    {"bolt_circle", {{"diameter", "count", "pcd"}, {{"face", RefForm::SelOrDatum, false}}}},
     {"linear_pattern", {{"count1", "spacing1"}, {{"dir1", RefForm::SelOrDatum, true},
                                                  {"dir2", RefForm::SelOrDatum, false},
                                                  {"features", RefForm::FeatList, true}}}},
@@ -177,6 +178,9 @@ const std::map<string, FeatureSpec> FEATURE_TYPES = {
     {"mirror", {{}, {{"plane", RefForm::SelOrDatum, true},
                      {"features", RefForm::FeatList, false},
                      {"bodies", RefForm::SelList, false}}}},
+    // transform: move/rotate a body. No required params (translate and/or angle+rotate), no ref
+    // slots — the optional target `body` is a top-level feature id read by the compiler, not a ref.
+    {"transform", {{}, {}}},
     {"boolean", {{"op"}, {{"targets", RefForm::SelList, true},
                           {"tools", RefForm::SelList, false}}}},
     {"sm_base_flange", {{}, {{"profile", RefForm::SelList, true}}}},
@@ -696,6 +700,14 @@ bool is_query_obj(const json& v) {
     return v.is_object() && (get(v, "kind") == json("query") || v.contains("of"));
 }
 
+// An EXPLICIT axis/direction spec: an object carrying a 3-vector `axis` direction.
+// Small local models hand us a revolve/pattern axis as raw geometry under an invented
+// wrapper (kind:"axis", or an edge selector with a bogus surf) rather than the datum
+// ref. The compiler (normalize_feature::axis_from_explicit) accepts this, so validation
+// must too — but ONLY in direction slots, where a direction vector is meaningful.
+bool is_explicit_axis(const json& v) { return v.is_object() && is_vec(get(v, "axis"), 3); }
+const std::set<string> AXIS_DIR_SLOTS = {"axis", "dir1", "dir2", "pull"};
+
 vector<string> validate_geom_query(const json& q, const string& where) {
     const json& ofj = get(q, "of");
     string of = ofj.is_string() ? ofj.get<string>() : "";
@@ -1192,6 +1204,18 @@ vector<string> validate_feature(const json& f, const string& where,
             errs.insert(errs.end(), e.begin(), e.end());
             continue;
         }
+        // An explicit axis/direction vector is valid in a direction slot, whatever
+        // wrapper the model put around it (the compiler reads the `axis` vector).
+        if (AXIS_DIR_SLOTS.count(name) && is_explicit_axis(v)) continue;
+        // hole `positions` is a list of [u,v] face-local coordinate pairs — that is what
+        // the compiler reads and what the cheatsheet teaches. (The slot is typed SelList
+        // for a legacy vertex-selector form, which the compiler never actually consumes.)
+        // Accept a clean [u,v] list here; fall through to SelList for selector objects.
+        if (name == "positions" && v.is_array() && !v.empty()) {
+            bool all_uv = true;
+            for (const json& p : v) if (!is_vec(p, 2)) { all_uv = false; break; }
+            if (all_uv) continue;
+        }
         switch (slot.form) {
             case RefForm::Sel: {
                 auto e = validate_selector(v, loc);
@@ -1208,7 +1232,13 @@ vector<string> validate_feature(const json& f, const string& where,
                     errs.push_back(loc + ": must be a non-empty list");
                 } else {
                     for (size_t i = 0; i < v.size(); ++i) {
-                        auto e = validate_selector(v[i], loc + "[" + std::to_string(i) + "]");
+                        const string eloc = loc + "[" + std::to_string(i) + "]";
+                        // A list element may be a geometry QUERY ({"of":"edge",...}) just like
+                        // a single-value slot — e.g. "chamfer both ends" =
+                        // [{"of":"edge","side":"+z"},{"of":"edge","side":"-z"}]. Validate it as
+                        // a query, not a topology selector.
+                        auto e = is_query_obj(v[i]) ? validate_geom_query(v[i], eloc)
+                                                    : validate_selector(v[i], eloc);
                         errs.insert(errs.end(), e.begin(), e.end());
                     }
                 }

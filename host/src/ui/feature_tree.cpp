@@ -1312,7 +1312,8 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
         st.dropBlankStarterTabs(st.activeTab);
     }
     st.addLog("[doc] opened: " + path + "  rev=" + std::to_string(st.docMirror.revision()));
-    st.toast(ui::ToastLevel::Info, "Opened " + pathBaseName(path));
+    if (!st.handoffQuietOpen)   // silent on a live MCP-handoff refresh (would toast every build step)
+        st.toast(ui::ToastLevel::Info, "Opened " + pathBaseName(path));
     // W12+ — re-open any drawings the engine restored from this .step+ (their `source` already
     // re-pointed to the just-opened part). Each becomes a Drawing tab ALONGSIDE the part tab (the
     // part stays active). Tolerant: an empty/absent list is a no-op (a file with no drawings).
@@ -1323,8 +1324,9 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
                 if (!d.is_object()) continue;
                 st.adoptDrawingTab(jfld(d, "doc_id"), jfld(d, "name"), jfld(d, "source_doc_id"));
             }
-            st.toast(ui::ToastLevel::Info,
-                     "Restored " + std::to_string(drws.size()) + " drawing(s)");
+            if (!st.handoffQuietOpen)
+                st.toast(ui::ToastLevel::Info,
+                         "Restored " + std::to_string(drws.size()) + " drawing(s)");
         }
     }
     std::string base = pathBaseName(path);
@@ -2519,34 +2521,82 @@ void pollAiCadHandoff(AppState& st) {
     if (st.agentV2Running) return;   // an in-app agent run owns the doc; don't fight it
     namespace fs = std::filesystem;
     static const std::string ctrl = appdataDir() + "\\AI-CAD\\handoff\\live.json";
-    std::error_code ec;
-    if (!fs::exists(ctrl, ec)) return;
-    // Cheap most frames: only parse when the control file's modification time advances.
+
+    static long long shownRev   = -1;   // the rev currently drawn in the mirror tab
+    static long long pendingRev = -1;   // the latest rev the MCP published (may be deferred)
+    static std::string pendingStep;     // the .step+ that goes with pendingRev
     static fs::file_time_type lastMtime{};
-    fs::file_time_type mt = fs::last_write_time(ctrl, ec);
-    if (ec || mt == lastMtime) return;
-    lastMtime = mt;
 
-    nlohmann::json j;
-    {
-        std::ifstream f(ctrl, std::ios::binary);
-        if (!f) return;
-        try { f >> j; } catch (...) { return; }   // half-written: pick it up on the next change
+    // 1) Cheaply pick up a newer control file. Only parse when its mtime advances; a published rev
+    //    is remembered as "pending" until it is SAFE to show (we may defer it, see step 3).
+    std::error_code ec;
+    if (fs::exists(ctrl, ec)) {
+        fs::file_time_type mt = fs::last_write_time(ctrl, ec);
+        if (!ec && mt != lastMtime) {
+            lastMtime = mt;
+            nlohmann::json j;
+            std::ifstream f(ctrl, std::ios::binary);
+            if (f) { try { f >> j; } catch (...) { j = nlohmann::json{}; } }  // half-written: retry next change
+            const long long rev = j.value("rev", (long long)-1);
+            const std::string step = j.value("step", std::string());
+            if (rev > pendingRev && !step.empty() && fs::exists(step, ec)) {
+                pendingRev = rev;
+                pendingStep = step;
+            }
+        }
     }
-    const long long rev = j.value("rev", (long long)-1);
-    const std::string step = j.value("step", std::string());
-    static long long lastRev = -1;
-    if (rev < 0 || rev == lastRev) return;
-    if (step.empty() || !fs::exists(step, ec)) return;
-    lastRev = rev;
 
-    // Refresh in place: close any tab already showing the handoff file (matched by PATH so a user
-    // tab reorder/close can't make us close the wrong one), then open the freshly published doc.
+    // 2) Nothing new to reveal.
+    if (pendingRev < 0 || pendingRev == shownRev) return;
+
+    // 3) SAFETY GATES — defer rather than disrupt the user. The AI keeps building in its OWN engine
+    //    process; the on-screen mirror just catches up the moment it is safe, so user interaction
+    //    can never break the AI's work and the AI's refresh can never wreck the user's.
+    const bool userMidEdit =
+        (st.sketchMode && st.sketchMode->active()) ||           // an open sketch
+        (st.propertyManager && st.propertyManager->active());   // an open feature-edit (PM) form
+    int handoffIdx = -1;
+    for (int i = 0; i < (int)st.docTabs.size(); ++i)
+        if (st.docTabs[i].aiHandoff) { handoffIdx = i; break; }
+
+    const bool firstReveal = (handoffIdx < 0);
+    if (firstReveal) {
+        // No mirror tab yet — opening one makes it active (steals focus). Don't pop it over an
+        // in-progress edit; wait until the user finishes, then reveal.
+        if (userMidEdit) return;
+    } else {
+        // Mirror already exists — only refresh it while the user is actually looking at it and not
+        // mid-edit. If they switched to their own tab (or are editing), leave the update pending;
+        // it applies the next frame they return, so we never yank focus or cancel their edit.
+        if (handoffIdx != st.activeTab || userMidEdit) return;
+    }
+
+    // 4) Apply. Preserve the user's camera across the in-place refresh of the mirror tab so watching
+    //    the AI build doesn't reset their orbit/zoom each step.
+    const bool keepCam = (!firstReveal && handoffIdx == st.activeTab);
+    const float cy = st.yaw, cp = st.pitch, cz = st.zoom,
+                px = st.pan[0], py = st.pan[1], pz = st.pan[2];
+
+    // Close the prior mirror tab(s) (matched by the aiHandoff flag — robust to tab reorder/close),
+    // then open the freshly published .step+. Quiet: applyOpenedDoc must not toast every step.
     for (int i = (int)st.docTabs.size() - 1; i >= 0; --i)
-        if (st.docTabs[i].path == step) st.closeDocTab(i);
+        if (st.docTabs[i].aiHandoff) st.closeDocTab(i);
 
-    if (featureTreeOpenPath(st, step))
-        st.toast(ui::ToastLevel::Info, "AI-CAD: showing the AI's live part");
+    st.handoffQuietOpen = true;
+    const bool opened = featureTreeOpenPath(st, pendingStep);
+    st.handoffQuietOpen = false;
+
+    if (opened && st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+        st.docTabs[st.activeTab].aiHandoff = true;   // tag the just-opened tab as the mirror
+        if (keepCam) {
+            st.yaw = cy; st.pitch = cp; st.zoom = cz;
+            st.pan[0] = px; st.pan[1] = py; st.pan[2] = pz;
+            st.zoomToBBoxRequested = false;          // keep our restored view; cancel the fresh-open auto-fit
+        }
+        shownRev = pendingRev;
+        if (firstReveal)
+            st.toast(ui::ToastLevel::Info, "AI-CAD: live view of the AI's part — it updates as it builds");
+    }
 }
 
 // Native "Open..." dialog -> open. Returns the opened path (for Recent), or "" on cancel/failure.

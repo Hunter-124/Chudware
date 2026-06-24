@@ -323,7 +323,7 @@ if(AICAD_WITH_OCCT)
   # target — it is the only sim source that needs the mesher, and adding it here
   # keeps the gmsh confinement intact (fea_run.h itself is gmsh-free). aicad_mesh
   # gains a PUBLIC dep on aicad_sim so fea_run.cpp can call the FEA solvers.
-  add_library(aicad_mesh STATIC sim/mesher.cpp sim/fea_run.cpp sim/fea_fatigue.cpp)
+  add_library(aicad_mesh STATIC sim/mesher.cpp sim/hex_mesher.cpp sim/fea_run.cpp sim/fea_fatigue.cpp)
   target_include_directories(aicad_mesh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_include_directories(aicad_mesh PRIVATE ${GMSH_INCLUDE_DIR})
   # GMSH_DLL makes gmsh.h's GMSH_API decorate the prototypes __declspec(dllimport)

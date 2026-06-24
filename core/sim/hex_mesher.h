@@ -1,0 +1,26 @@
+// hex_mesher.h — structured hexahedral (hex8) meshing for prismatic parts.
+//
+// Unstructured tet meshing (mesher.cpp / gmsh) never produces a symmetric mesh on a box
+// — the Delaunay pattern is irregular by nature. For a box / rectangular prism we can
+// instead lay down a perfectly regular nx*ny*nz grid of 8-node hexahedra, which IS
+// symmetric and which the hex8 path in fea_static consumes (nodes_per_elem==8).
+//
+// This is OCCT-backed (reads the STEP, checks the solid is an axis-aligned box) and lives
+// in the aicad_mesh target, which already links aicad_geom_occt for OCCT access.
+#pragma once
+
+#include <string>
+
+#include "sim/mesher.h"  // MeshOut, MeshOptions
+
+namespace aicad::sim {
+
+// Mesh an axis-aligned box/rectangular-prism STEP into a regular grid of hex8 elements.
+// Sizing follows the same fineness model as the tet mesher (base from the bbox diagonal,
+// or an explicit target_size_mm). Returns MeshOut with nodes_per_elem==8 and the quality
+// metrics filled. If the solid is NOT a mappable axis-aligned box (volume != bbox volume,
+// not exactly 6 faces, rotated, curved, …), returns ok=false with an actionable error
+// telling the caller to use tetrahedral meshing instead. Never throws.
+MeshOut mesh_box_hex(const std::string& step_path, const MeshOptions& options);
+
+}  // namespace aicad::sim

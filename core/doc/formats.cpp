@@ -148,10 +148,14 @@ TopoDS_Shape as_compound(const std::vector<TopoDS_Shape>& bodies) {
     return comp;
 }
 
-// Tessellate a shape in place at the Python defaults (tessellate.py: 0.05mm linear,
-// 0.35rad angular) so a mesh writer has a triangulation to emit.
-void mesh_shape(const TopoDS_Shape& shape) {
-    BRepMesh_IncrementalMesh m(shape, 0.05, Standard_False, 0.35, Standard_True);
+// Tessellate a shape in place at the requested quality so a mesh writer has a
+// triangulation to emit. The prior triangulation is cleared first so the exact
+// requested deflection is honored even if the shape was already meshed at another
+// quality (e.g. a finer dialog "estimate" preceding a coarser export).
+void mesh_shape(const TopoDS_Shape& shape, const TessOptions& tess = TessOptions{}) {
+    BRepTools::Clean(shape);
+    BRepMesh_IncrementalMesh m(shape, tess.lin_deflection, tess.relative ? Standard_True : Standard_False,
+                               tess.ang_deflection, Standard_True);
     m.Perform();
 }
 
@@ -616,10 +620,10 @@ std::string sw_export_step(const std::string& src_path) {
 
 // --------------------------------------------------------------------------- mesh soup
 
-MeshData shape_to_mesh(const TopoDS_Shape& shape) {
+MeshData shape_to_mesh(const TopoDS_Shape& shape, const TessOptions& tess) {
     MeshData mesh;
     if (shape.IsNull()) return mesh;
-    mesh_shape(shape);
+    mesh_shape(shape, tess);
     // Walk every face's triangulation, baking the face location and concatenating into
     // one global vertex/triangle buffer (de-dup is not needed for the count/bbox/volume
     // invariant the gate checks; OBJ/PLY readers re-weld coincident verts identically on
@@ -940,12 +944,13 @@ Handle(TDocStd_Document) new_xcaf_doc() {
     return doc;
 }
 
-void write_gltf(const std::vector<TopoDS_Shape>& bodies, const std::string& path, bool binary) {
+void write_gltf(const std::vector<TopoDS_Shape>& bodies, const std::string& path, bool binary,
+                const TessOptions& tess = TessOptions{}) {
     Handle(TDocStd_Document) doc = new_xcaf_doc();
     Handle(XCAFDoc_ShapeTool) tool = XCAFDoc_DocumentTool::ShapeTool(doc->Main());
     for (const TopoDS_Shape& s : bodies) {
         if (s.IsNull()) continue;
-        mesh_shape(s);  // glTF writer needs precomputed triangulation
+        mesh_shape(s, tess);  // glTF writer needs precomputed triangulation
         tool->AddShape(s, /*makeAssembly=*/Standard_False);
     }
     TColStd_IndexedDataMapOfStringString file_info;
@@ -1123,7 +1128,7 @@ TopoDS_Shape mesh_to_shape(const MeshData& mesh) {
 // --------------------------------------------------------------------------- export
 
 std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::string& path,
-                          const std::string& fmt) {
+                          const std::string& fmt, const TessOptions& tess) {
     if (bodies.empty())
         throw OpError("export_failed", "export: no bodies to write", {{"format", fmt}});
     const std::string out = abs_path(path);
@@ -1157,26 +1162,27 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
             return out;
         }
         if (fmt == "stl") {
-            mesh_shape(shape);
+            mesh_shape(shape, tess);
             StlAPI_Writer w;
+            w.ASCIIMode() = tess.ascii ? Standard_True : Standard_False;
             if (!w.Write(shape, out.c_str()))
                 throw OpError("export_failed", "STL writer returned failure", {{"path", out}});
             return out;
         }
         if (fmt == "obj") {
-            write_obj(shape_to_mesh(shape), out);
+            write_obj(shape_to_mesh(shape, tess), out);
             return out;
         }
         if (fmt == "ply") {
-            write_ply(shape_to_mesh(shape), out);
+            write_ply(shape_to_mesh(shape, tess), out);
             return out;
         }
         if (fmt == "gltf") {
-            write_gltf(bodies, out, /*binary=*/false);
+            write_gltf(bodies, out, /*binary=*/false, tess);
             return out;
         }
         if (fmt == "glb") {
-            write_gltf(bodies, out, /*binary=*/true);
+            write_gltf(bodies, out, /*binary=*/true, tess);
             return out;
         }
         if (fmt == "3mf") {
@@ -1190,7 +1196,7 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
                 if (bodies[i].IsNull()) continue;
                 NamedMesh nm;
                 nm.name = "Body" + std::to_string(i + 1);
-                nm.mesh = shape_to_mesh(bodies[i]);
+                nm.mesh = shape_to_mesh(bodies[i], tess);
                 if (nm.mesh.triangle_count() > 0) meshes.push_back(std::move(nm));
             }
             write_3mf_meshes(meshes, out);
@@ -1213,7 +1219,7 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
                 if (bodies[i].IsNull()) continue;
                 OnNamedMesh nm;
                 nm.name = "Body" + std::to_string(i + 1);
-                nm.mesh = shape_to_mesh(bodies[i]);
+                nm.mesh = shape_to_mesh(bodies[i], tess);
                 if (nm.mesh.triangle_count() > 0) meshes.push_back(std::move(nm));
             }
             write_3dm_meshes(meshes, out);
@@ -1234,6 +1240,18 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
     throw OpError("export_failed",
                   "export format '" + fmt + "' is not supported by the C++ core",
                   {{"format", fmt}, {"reason", "unsupported format"}});
+}
+
+std::pair<std::size_t, std::size_t> estimate_tessellation(
+    const std::vector<TopoDS_Shape>& bodies, const TessOptions& tess) {
+    std::size_t tris = 0, verts = 0;
+    for (const TopoDS_Shape& s : bodies) {
+        if (s.IsNull()) continue;
+        const MeshData m = shape_to_mesh(s, tess);
+        tris += m.triangle_count();
+        verts += m.vertex_count();
+    }
+    return {tris, verts};
 }
 
 // --------------------------------------------------------------------------- import

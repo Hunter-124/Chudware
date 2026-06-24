@@ -596,8 +596,18 @@ static void exportFile3d(AppState& st, const std::string& fmt) {
         if (path.empty()) return;  // canceled
     }
 
+    // Mesh formats carry the dialog's tessellation choice; B-rep formats ignore it.
+    const bool meshFmt = (fmt == "stl" || fmt == "obj" || fmt == "ply" || fmt == "3mf" ||
+                          fmt == "gltf" || fmt == "glb");
+    const double linDef = meshFmt ? (double)st.exportTess.linDeflection : 0.05;
+    const double angDef = meshFmt ? (double)st.exportTess.angDeflectionDeg * 3.14159265358979 / 180.0
+                                  : 0.35;
+    const bool relDef = meshFmt && st.exportTess.relative;
+    const bool asciiStl = meshFmt && st.exportTess.ascii;
+
     std::string err;
-    std::string written = st.docMirror.exportFile(st.worker, st.docMirror.docId(), path, fmt, err);
+    std::string written = st.docMirror.exportFile(st.worker, st.docMirror.docId(), path, fmt, err,
+                                                  linDef, angDef, relDef, asciiStl);
     if (!written.empty()) {
         st.addLog("[export] " + fmt + ": " + written);
         st.toast(ui::ToastLevel::Info, "Exported " + written);
@@ -2632,6 +2642,108 @@ int run_gui(const char* screenshotPath) {
                 ImGui::EndPopup();
             }
             if (!open) s_quitModalOpen = false;   // dismissed via the title-bar X = Cancel
+        }
+
+        // ---------- mesh-export tessellation options ----------
+        // Raised by File > Export of a mesh format. Lets the user pick a quality preset or
+        // fine-tune the chord/normal deflection, shows a live triangle estimate, then sets
+        // requestExportFormat so the GL-thread pump runs the actual Save-As + export.
+        {
+            auto& d = st.exportTess;
+            // Preset -> (linear mm, angular deg). Custom keeps whatever is in the fields.
+            auto applyPreset = [&](int p) {
+                if (p == 0)      { d.linDeflection = 0.2f;  d.angDeflectionDeg = 30.0f; }
+                else if (p == 1) { d.linDeflection = 0.05f; d.angDeflectionDeg = 20.0f; }
+                else if (p == 2) { d.linDeflection = 0.01f; d.angDeflectionDeg = 12.0f; }
+                d.estimateDirty = true;
+            };
+            if (d.open) ImGui::OpenPopup("Export mesh options##exporttess");
+            ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f,
+                                           vp->Pos.y + vp->Size.y * 0.5f),
+                                    ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            ImGui::SetNextWindowSize(ImVec2(420.0f * scale, 0.0f), ImGuiCond_Appearing);
+            bool eopen = true;
+            if (ImGui::BeginPopupModal("Export mesh options##exporttess", &eopen,
+                                       ImGuiWindowFlags_AlwaysAutoResize |
+                                           ImGuiWindowFlags_NoSavedSettings)) {
+                std::string fmtUpper = d.fmt;
+                for (char& c : fmtUpper) c = (char)std::toupper((unsigned char)c);
+                ImGui::Text("Tessellation quality for %s", fmtUpper.c_str());
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                ImGui::TextUnformatted("Quality");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                static const char* kPreset[4] = {"Coarse (fast, small file)", "Standard",
+                                                 "Fine (smooth, large file)", "Custom"};
+                if (ImGui::BeginCombo("##tesspreset", kPreset[d.preset < 0 || d.preset > 3 ? 1 : d.preset])) {
+                    for (int i = 0; i < 4; ++i)
+                        if (ImGui::Selectable(kPreset[i], d.preset == i)) {
+                            d.preset = i;
+                            if (i != 3) applyPreset(i);
+                        }
+                    ImGui::EndCombo();
+                }
+
+                ImGui::Spacing();
+                if (ImGui::Checkbox("Advanced", &d.advanced)) {}
+                if (d.advanced) {
+                    ImGui::Indent();
+                    float lin = d.linDeflection, angDeg = d.angDeflectionDeg;
+                    ImGui::TextUnformatted("Linear deflection (max chord deviation)");
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::InputFloat("##lindef", &lin, 0.0f, 0.0f,
+                                          d.relative ? "%.4g (fraction)" : "%.4g mm")) {}
+                    if (ImGui::IsItemDeactivatedAfterEdit() && lin > 0.0f) {
+                        d.linDeflection = lin; d.preset = 3; d.estimateDirty = true;
+                    }
+                    ImGui::TextUnformatted("Angular deflection (max normal deviation)");
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    if (ImGui::SliderFloat("##angdef", &angDeg, 5.0f, 45.0f, "%.0f deg")) {}
+                    if (ImGui::IsItemDeactivatedAfterEdit()) {
+                        d.angDeflectionDeg = angDeg; d.preset = 3; d.estimateDirty = true;
+                    }
+                    if (ImGui::Checkbox("Relative deflection (scale with feature size)", &d.relative))
+                        d.estimateDirty = true;
+                    if (d.fmt == "stl")
+                        ImGui::Checkbox("ASCII STL (default binary)", &d.ascii);
+                    ImGui::Unindent();
+                }
+
+                // Live triangle/vertex estimate.
+                ImGui::Spacing();
+                if (d.estimateDirty) {
+                    d.estimateDirty = false;
+                    std::string eerr;
+                    long long tris = 0, verts = 0;
+                    const double angRad = (double)d.angDeflectionDeg * 3.14159265358979 / 180.0;
+                    d.estimateValid = st.docMirror.exportEstimate(
+                        st.worker, st.docMirror.docId(), (double)d.linDeflection, angRad,
+                        d.relative, tris, verts, eerr);
+                    d.estTris = tris; d.estVerts = verts;
+                }
+                if (d.estimateValid)
+                    ImGui::TextDisabled("Estimated: %lld triangles, %lld vertices", d.estTris,
+                                        d.estVerts);
+                else
+                    ImGui::TextDisabled("Estimate unavailable");
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                const float bw = 110.0f * scale;
+                if (ImGui::Button("Export...", ImVec2(bw, 0))) {
+                    d.open = false;
+                    st.requestExportFormat = d.fmt;   // GL pump runs Save-As + export with d.*
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel", ImVec2(bw, 0))) {
+                    d.open = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+            if (!eopen) d.open = false;  // dismissed via the title-bar X
         }
 
         // ---------- Equations / Global Variables editor (modeless; gated by st.showEquations) ----------

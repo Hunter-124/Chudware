@@ -454,12 +454,13 @@ def run_wind_tunnel(
     tau0 = min(tau0, 1.99)  # very high tau → over-damped but stable
 
     # Conversion factor lattice force → Newtons (uses the FLUID density).
-    # Standard LBM momentum exchange (Aidun & Clausen 2010):
-    #   drag_n [N] = drag_lat * rho_phys * dx^3 / dt
-    #             = drag_lat * rho_phys * dx^2 * (dx/dt)
-    # where drag_lat is dimensionless (rho_lat=1 normalised populations summed over boundary links)
-    # Note: NOT dx^4/dt^2 — that would be off by c=dx/dt.
-    force_factor = float(rho_fluid * dx_m**3 / dt_s)
+    # The momentum-exchange sum is a force in LATTICE units (momentum per lattice timestep,
+    # dt_lat=1), so the unit-conversion is the standard LBM force factor
+    #     C_F = rho * dx^4 / dt^2        (mass = rho*dx^3, accel = dx/dt^2).
+    # The previous rho*dx^3/dt was short by one factor of dx/dt = c (= speed/u_lat), which made the
+    # physical V^2 drag come out ∝ V^1 (and Cd ∝ 1/V). With dt = u_lat*dx/speed this now reproduces
+    # drag = Cd * 0.5 * rho * V^2 * A. (lbm.cpp force_factor matches this exactly.)
+    force_factor = float(rho_fluid * dx_m**4 / (dt_s * dt_s))
 
     # ── Roughness skin-friction multiplier (qualitative) ──
     # Ks (sand-grain) in metres; L_char in metres (consistent units for L/Ks).

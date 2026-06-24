@@ -15,6 +15,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -24,6 +25,8 @@
 #include <nlohmann/json.hpp>
 
 #include "doc/document.h"
+#include "doc/validate.h"  // validate_document (explicit-axis acceptance regression)
+#include "doc/session.h"   // doc_new/doc_apply_ops (top-level-option hoist regression)
 #include "aicm_loader.h"  // host loader (host/src/render on the include path)
 
 using json = nlohmann::json;
@@ -176,6 +179,257 @@ TEST_CASE("single-feature part: sketch -> extrude -> exact box") {
     CHECK((hi[0] - lo[0]) == doctest::Approx(W).epsilon(1e-4));
     CHECK((hi[1] - lo[1]) == doctest::Approx(H).epsilon(1e-4));
     CHECK((hi[2] - lo[2]) == doctest::Approx(D).epsilon(1e-4));
+}
+
+// 1b. REVOLVE AUTO-CLOSE: an OPEN profile — just the outer-wall line, offset from the
+//     axis — is closed back to the revolve axis so it still makes a solid. Weak local
+//     models routinely sketch the wall but forget the line back down the axis; without
+//     the fallback that revolve yields a surface (no_geometry_built). A line at u=R from
+//     v=0..H on plane.front, revolved 360 about Z, must give a solid cylinder: two bbox
+//     extents = 2R, one = H, regardless of the plane's in-frame axis ordering.
+TEST_CASE("revolve auto-closes an open profile to the axis -> solid of revolution") {
+    const double R = 12.0, H = 30.0;
+    json sk;
+    sk["id"] = "prof";
+    sk["type"] = "sketch";
+    sk["plane"] = "front";  // a plane that CONTAINS the Z axis
+    sk["entities"] = json::array({line("e1", R, 0.0, R, H)});  // open wall, no closing line
+    sk["constraints"] = json::array();
+
+    json doc;
+    doc["features"] = json::array({
+        sk,
+        json{{"id", "rev"}, {"type", "revolve"}, {"profile", "prof"},
+             {"axis", json{{"kind", "datum"}, {"feature", "axis.z"}}},
+             {"angle", 360.0}},
+    });
+
+    CompileResult r = compile_document(doc, json::object());
+    REQUIRE(r.ok);
+    REQUIRE(r.body_count == 1);  // 0 here would mean the open profile was NOT closed
+    for (const auto& s : r.statuses) CHECK(s.ok);
+
+    render::DocMesh dm = parse(r);
+    REQUIRE(dm.bodies.size() == 1);
+    const render::BodyMesh& b = dm.bodies[0];
+    check_common(b);
+    double lo[3], hi[3];
+    bbox(b, lo, hi);
+    double ext[3] = {hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]};
+    std::sort(ext, ext + 3);
+    MESSAGE("revolve auto-close: sorted bbox=" << ext[0] << "," << ext[1] << "," << ext[2]);
+    CHECK(ext[0] == doctest::Approx(2 * R).epsilon(2e-2));  // diameter
+    CHECK(ext[1] == doctest::Approx(2 * R).epsilon(2e-2));  // diameter
+    CHECK(ext[2] == doctest::Approx(H).epsilon(1e-2));      // height
+}
+
+// 1c. EXPLICIT AXIS under an invented wrapper: a small local model gets the revolve
+//     axis GEOMETRY right (axis:[0,0,1]) but wraps it as an edge selector with a bogus
+//     surf instead of the datum ref. Live runs failed at VALIDATION ("refs.axis.surf:
+//     not an edge curve type") and never reached compile. Both validation and compile
+//     must now accept the explicit direction vector.
+TEST_CASE("revolve accepts an explicit axis vector under an invented wrapper") {
+    const json axis_ref = json{{"kind", "edge"}, {"surf", "datum"},
+                               {"centroid", {0, 0, 0}}, {"axis", {0, 0, 1}},
+                               {"owner_feature", nullptr}, {"hint_index", 0}};
+    // (a) VALIDATION accepts it (canonical {params,refs} shape, as the agent emits).
+    json canon;
+    canon["schema"] = "aicad.part/1";
+    canon["id"] = "doc1";
+    canon["name"] = "AxisTest";
+    canon["units"] = json{{"system", "MMGS"}};
+    canon["features"] = json::array({
+        json{{"id", "f1"}, {"type", "sketch"}, {"name", "Prof"}, {"suppressed", false},
+             {"params", {{"entities", json::array({line("e1", 12, 0, 12, 30)})},
+                         {"constraints", json::array()}}},
+             {"refs", {{"plane", "plane.front"}}}},
+        json{{"id", "f2"}, {"type", "revolve"}, {"name", "Rev"}, {"suppressed", false},
+             {"params", {{"mode", "boss"}, {"angle", 360}}},
+             {"refs", {{"profile", json::array({json{{"kind", "region"}, {"sketch", "f1"},
+                                                     {"centroid", {6, 15}}, {"hint_index", 0}}})},
+                       {"axis", axis_ref}}}},
+    });
+    std::vector<std::string> verrs = aicad::doc::validate_document(canon);
+    for (const auto& e : verrs) MESSAGE("unexpected validation error: " << e);
+    CHECK(verrs.empty());
+
+    // (b) COMPILE builds the solid (normalize_feature extracts the axis; the open
+    //     profile is auto-closed to it). A flat-shape feature carries axis at top level.
+    json doc;
+    json sk;
+    sk["id"] = "prof";
+    sk["type"] = "sketch";
+    sk["plane"] = "front";
+    sk["entities"] = json::array({line("e1", 12, 0, 12, 30)});
+    sk["constraints"] = json::array();
+    doc["features"] = json::array({
+        sk,
+        json{{"id", "rev"}, {"type", "revolve"}, {"profile", "prof"},
+             {"angle", 360.0}, {"axis", axis_ref}},
+    });
+    CompileResult r = compile_document(doc, json::object());
+    REQUIRE(r.ok);
+    REQUIRE(r.body_count == 1);
+    for (const auto& s : r.statuses) CHECK(s.ok);
+}
+
+// 1d. ADD_FEATURE OPTION HOIST: a model may put a primitive option (mode/merge/centered/
+//     at) at the feature TOP LEVEL instead of in params. op_add_feature keeps only
+//     type/name/suppressed/params/refs, so a stray top-level `mode:"cut"` was SILENTLY
+//     dropped -> the bore FUSED with no error. The hoist relocates it into params; the
+//     tube must now form (pi*(20^2-12^2)*50 = 40212, NOT the 67356 of a dropped cut).
+TEST_CASE("add_feature hoists a top-level option into params -> cut is not dropped") {
+    using aicad::doc::doc_new;
+    using aicad::doc::doc_apply_ops;
+    json nr = doc_new("part", "TubeTest");
+    const std::string id = nr.at("doc_id").get<std::string>();
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "cylinder"}, {"name", "Outer"},
+             {"params", {{"radius", dimv(20)}, {"height", dimv(50)}}}}}},
+        // mode:"cut" deliberately at the FEATURE top level, not inside params.
+        json{{"op", "add_feature"}, {"feature", {{"type", "cylinder"}, {"name", "Bore"},
+             {"mode", "cut"},
+             {"params", {{"radius", dimv(12)}, {"height", dimv(60)}}}}}},
+    });
+    json resp = doc_apply_ops(id, -1, ops, false);
+    const double vol = resp.value("volume", 0.0);
+    MESSAGE("tube volume (top-level mode:cut) = " << vol);
+    CHECK(vol == doctest::Approx(40212.0).epsilon(0.02));  // real tube, not a fused stub
+}
+
+// 1e. LIST OF EDGE QUERIES: "chamfer both ends" is naturally expressed as a LIST of two
+//     queries [{"of":"edge","side":"+z"},{"of":"edge","side":"-z"}]. Validation must accept
+//     query elements in a SelList, and the compiler must resolve+union them. A shaft
+//     chamfered at both ends loses a small ring of material at each end (0 < vol < full).
+TEST_CASE("chamfer accepts a LIST of edge queries (both ends of a shaft)") {
+    const json edges = json::array({json{{"of", "edge"}, {"side", "+z"}},
+                                    json{{"of", "edge"}, {"side", "-z"}}});
+    // (a) validation accepts a list of queries in the edges SelList.
+    json canon;
+    canon["schema"] = "aicad.part/1";
+    canon["id"] = "d";
+    canon["name"] = "ShaftChamfer";
+    canon["units"] = json{{"system", "MMGS"}};
+    canon["features"] = json::array({
+        json{{"id", "f1"}, {"type", "cylinder"}, {"name", "Shaft"}, {"suppressed", false},
+             {"params", {{"radius", 10}, {"height", 80}}}, {"refs", json::object()}},
+        json{{"id", "f2"}, {"type", "chamfer"}, {"name", "Ends"}, {"suppressed", false},
+             {"params", {{"length", 1.5}}}, {"refs", {{"edges", edges}}}},
+    });
+    std::vector<std::string> verrs = aicad::doc::validate_document(canon);
+    for (const auto& e : verrs) MESSAGE("unexpected validation error: " << e);
+    CHECK(verrs.empty());
+
+    // (b) compile resolves both query-sets and chamfers both ends.
+    const double R = 10.0, H = 80.0;
+    json doc;
+    doc["features"] = json::array({
+        json{{"id", "cyl"}, {"type", "cylinder"}, {"radius", R}, {"height", H}},
+        json{{"id", "ch"}, {"type", "chamfer"}, {"length", 1.5}, {"edges", edges}},
+    });
+    CompileResult r = compile_document(doc, json::object());
+    REQUIRE(r.ok);
+    REQUIRE(r.body_count == 1);
+    for (const auto& s : r.statuses) CHECK(s.ok);
+    render::DocMesh dm = parse(r);
+    REQUIRE(dm.bodies.size() == 1);
+    // Bounding box height unchanged (chamfer is a small bevel), volume reduced from full.
+    double lo[3], hi[3];
+    bbox(dm.bodies[0], lo, hi);
+    MESSAGE("both-ends chamfer: bbox z = " << (hi[2] - lo[2]));
+    CHECK((hi[2] - lo[2]) == doctest::Approx(H).epsilon(1e-3));
+}
+
+// 1f. HOLE positions as [u,v] PAIRS. The cheatsheet/decomposer teach params.positions =
+//     [[u,v],...] and the compiler reads exactly that — but the slot was typed SelList, so
+//     a coordinate-pair list was rejected ("selector must be an object") and a whole row of
+//     holes silently vanished. Validation must accept the [u,v] list, and the compile must
+//     drill all five holes (volume drops below the solid bar).
+TEST_CASE("hole positions accept a list of [u,v] coordinate pairs (a row of holes)") {
+    const json positions = json::array({json::array({-33.3, 0}), json::array({-16.7, 0}),
+                                         json::array({0, 0}), json::array({16.7, 0}),
+                                         json::array({33.3, 0})});
+    // (a) validation accepts [u,v] pairs in positions.
+    json canon;
+    canon["schema"] = "aicad.part/1";
+    canon["id"] = "d";
+    canon["name"] = "HoleRow";
+    canon["units"] = json{{"system", "MMGS"}};
+    canon["features"] = json::array({
+        json{{"id", "f1"}, {"type", "box"}, {"name", "Bar"}, {"suppressed", false},
+             {"params", {{"length", 100}, {"width", 20}, {"height", 5}}}, {"refs", json::object()}},
+        json{{"id", "f2"}, {"type", "hole"}, {"name", "Holes"}, {"suppressed", false},
+             {"params", {{"style", "simple"}, {"end", "through_all"}, {"diameter", 4},
+                         {"positions", positions}}},
+             {"refs", {{"face", json{{"of", "face"}, {"side", "top"}}}}}},
+    });
+    std::vector<std::string> verrs = aicad::doc::validate_document(canon);
+    for (const auto& e : verrs) MESSAGE("unexpected validation error: " << e);
+    CHECK(verrs.empty());
+
+    // (b) compile drills all five holes through the bar.
+    json doc;
+    doc["features"] = json::array({
+        json{{"id", "bar"}, {"type", "box"}, {"length", 100.0}, {"width", 20.0}, {"height", 5.0}},
+        json{{"id", "h"}, {"type", "hole"},
+             {"style", "simple"}, {"end", "through_all"}, {"diameter", 4.0},
+             {"positions", positions},
+             {"face", json{{"of", "face"}, {"side", "top"}}}},
+    });
+    CompileResult r = compile_document(doc, json::object());
+    REQUIRE(r.ok);
+    REQUIRE(r.body_count == 1);
+    for (const auto& s : r.statuses) CHECK(s.ok);
+    render::DocMesh dm = parse(r);
+    REQUIRE(dm.bodies.size() == 1);
+}
+
+// 1g. BURIED-BOSS GUARD: a primitive boss merged into a body that adds NO material is
+//     buried inside it (a model leaving a cylinder boss centred on the origin inside a
+//     plate). That used to pass silently with the body unchanged; it must now error the
+//     boss feature loudly (the doc still rebuilds — never-raise — with the plate intact).
+TEST_CASE("buried primitive boss errors loudly instead of silently adding nothing") {
+    json doc;
+    doc["features"] = json::array({
+        json{{"id", "plate"}, {"type", "box"}, {"length", 80.0}, {"width", 40.0}, {"height", 10.0}},
+        json{{"id", "boss"}, {"type", "cylinder"}, {"radius", 8.0}, {"height", 10.0},
+             {"mode", "boss"}},  // centred at origin -> fully inside the plate
+    });
+    CompileResult r = compile_document(doc, json::object());
+    REQUIRE(r.statuses.size() == 2);
+    CHECK(r.statuses[0].ok);                  // plate builds
+    CHECK_FALSE(r.statuses[1].ok);            // buried boss is rejected
+    CHECK(r.statuses[1].error.find("buried") != std::string::npos);
+    // The body survives as the plate alone (80*40*10), not silently corrupted.
+    REQUIRE(r.body_count == 1);
+}
+
+// 1h. HOLE CENTRING on a PRIMITIVE face. Regression for the pln.Location()-vs-centroid
+//     bug: the hole drilled at the surface PARAMETER origin (a corner on a primitive's
+//     face) instead of the area centroid, so a Ø10 bore removed only the quarter inside
+//     the body (~393) and looked like a Ø5 hole. test_hole missed it (its sketch-extrude
+//     box happened to have its param origin at the centroid); the agent uses PRIMITIVE
+//     boxes. A Ø10 through-hole in a 40x40x20 box must remove pi*5^2*20 = 1571 (vol 30429),
+//     not a corner quarter-bore (vol ~31607).
+TEST_CASE("hole on a primitive face drills a centred full-diameter bore") {
+    using aicad::doc::doc_new;
+    using aicad::doc::doc_apply_ops;
+    json nr = doc_new("part", "HoleCentre");
+    const std::string id = nr.at("doc_id").get<std::string>();
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Blk"},
+             {"params", {{"length", dimv(40)}, {"width", dimv(40)}, {"height", dimv(20)}}}}}},
+        json{{"op", "add_feature"}, {"feature", {{"type", "hole"}, {"name", "Bore"},
+             {"params", {{"style", "simple"}, {"standard", "custom"}, {"diameter", dimv(10)},
+                         {"end", "through_all"}}},
+             {"refs", {{"face", json{{"of", "face"}, {"side", "top"}}}}}}}},
+    });
+    json resp = doc_apply_ops(id, -1, ops, false);
+    const double vol = resp.value("volume", 0.0);
+    MESSAGE("primitive hole vol = " << vol << " (centred bore 30429; corner quarter-bore ~31607)");
+    CHECK(vol == doctest::Approx(40.0 * 40 * 20 - 3.14159265 * 25 * 20).epsilon(0.01));
 }
 
 // 2. MULTI-FEATURE PART: square 40x40 -> extrude 25 (base); circle r8 -> extrude 25

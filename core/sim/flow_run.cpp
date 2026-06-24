@@ -166,6 +166,25 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
     lp.rho_air = fp.rho_fluid;
 
     R = lbm_run(mask, Nx, Ny, Nz, lp, std::max(1, fp.n_steps));
+
+    // Resolution diagnostics. The grid pitch is set from the DOMAIN's longest span, so a thin
+    // feature (a 4 mm wing/tail edge) can fall below one voxel and vanish — the real cause of
+    // "lift ~0" and the frontal-area collapse seen at low `cells`. Surface the pitch, the smallest
+    // part dimension, and how many voxels span it so the caller can warn rather than trust a
+    // silently-unresolved solve. (Note `part[]` here is in LBM axes: [0]=flow, [1]=lift, [2]=span.)
+    const double min_part = std::min({part[0], part[1], part[2]});
+    R.voxel_mm = voxel;
+    R.ref_length_mm = longest;
+    R.min_feature_mm = min_part;
+    R.min_feature_voxels = (voxel > 0.0) ? (int)std::floor(min_part / voxel) : 0;
+    if (R.ok && R.min_feature_voxels < 4) {
+        R.warning = "coarse grid: the smallest part dimension (" +
+                    std::to_string((int)std::round(min_part)) + " mm) spans only " +
+                    std::to_string(R.min_feature_voxels) + " voxel(s) at " +
+                    std::to_string((int)std::round(voxel)) + " mm pitch — thin features are "
+                    "under-resolved (lift/forces unreliable). Raise `cells` so the thinnest "
+                    "feature spans >= 8 voxels, or simulate the wing/section alone.";
+    }
     return R;
 }
 

@@ -49,6 +49,20 @@ struct LbmResult {
     double frontal_area_mm2 = 0.0;
     int steps_run = 0;
     bool diverged = false;
+    // Convergence indicator (filled by lbm_run): residual = coefficient of variation of the drag
+    // over the last fifth of the run. converged = residual < 1% (the force has settled). Lets a
+    // caller tell a physically-zero result from an under-converged one (no early exit — the full
+    // n_steps still run, so this is parity-safe with the oracle).
+    double residual = -1.0;
+    bool converged = false;
+    // Resolution diagnostics (filled by run_wind_tunnel) — the #1 reason lift reads ~0 and frontal
+    // area collapses is that a thin feature falls below the voxel pitch. Surfaced so the caller can
+    // warn instead of silently trusting an unresolved solve.
+    double voxel_mm = 0.0;          // grid pitch (mm)
+    double ref_length_mm = 0.0;     // characteristic length used for Reynolds (longest part span)
+    double min_feature_mm = 0.0;    // smallest part bbox dimension (mm)
+    int min_feature_voxels = 0;     // how many voxels span that smallest dimension
+    std::string warning;            // non-empty when the grid likely under-resolves the geometry
     bool ok = false;
     std::string error;  // non-empty when ok==false
 };

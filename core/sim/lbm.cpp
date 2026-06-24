@@ -314,6 +314,12 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     // (_CS_SMAG**2) * np.sqrt(np.float32(2.0)) constant-folds to this float32 value.
     const float SMAG_C = 0.04087077f;
 
+    // Convergence sampling: record the drag at ~50 checkpoints through the run so we can report a
+    // residual (how settled the force is) WITHOUT an early exit (the full n_steps still run, so the
+    // lattice walk stays bit-identical to the oracle for the parity gate).
+    std::vector<double> drag_hist;
+    const int sample_every = std::max(1, n_steps / 50);
+
     int step = 0;
     for (step = 1; step <= n_steps; ++step) {
         // --- Collision (BGK + Smagorinsky) ---
@@ -457,6 +463,14 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
                 for (int q = 0; q < NQ; ++q) f[base + q] = 0.0f;
             }
         }
+
+        // Sample the (lattice) drag at checkpoints for the convergence residual. Read-only — it
+        // gathers from f and never writes it, so the solve is unchanged.
+        if (step % sample_every == 0 || step == n_steps) {
+            double d = 0.0, l = 0.0;
+            momentum_exchange(f, d, l);
+            drag_hist.push_back(d);
+        }
     }
     step = n_steps;  // loop exits with step == n_steps+1; oracle's `step` is last value
 
@@ -469,8 +483,13 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
 
     double drag_lat = 0.0, lift_lat = 0.0;
     momentum_exchange(f, drag_lat, lift_lat);
-    // force_factor = rho_air * dx_m**3 / dt_s (double), same grouping as the oracle.
-    const double force_factor = p.rho_air * std::pow(p.dx_m, 3.0) / p.dt_s;
+    // Lattice force -> SI force. The momentum-exchange sum is a force in lattice units (momentum
+    // per lattice timestep, dt_lat=1), so the conversion is the LBM force factor
+    //   C_F = rho * dx^4 / dt^2     (mass=rho*dx^3, accel=dx/dt^2).
+    // The old code used rho*dx^3/dt, short by dx/dt = speed/u_lat — which turned the physical V^2
+    // drag into the observed V^1 (and Cd ~ 1/V). With dt=u_lat*dx/speed this now yields the
+    // correct drag = Cd*0.5*rho*V^2*A scaling. (lbm.py force_factor matches this.)
+    const double force_factor = p.rho_air * std::pow(p.dx_m, 4.0) / (p.dt_s * p.dt_s);
     R.drag_n = drag_lat * force_factor;
     R.lift_n = lift_lat * force_factor;
 
@@ -501,6 +520,29 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
 
     R.steps_run = step;
     R.diverged = false;
+
+    // Convergence residual: coefficient of variation of the drag over the last fifth of the
+    // sampled history. Small => the force has settled; large => still developing (treat the numbers
+    // as under-converged). NaN/Inf in the drag => diverged.
+    if (!std::isfinite(R.drag_n) || !std::isfinite(R.lift_n)) {
+        R.diverged = true;
+        R.residual = 1.0;
+        R.converged = false;
+    } else if (drag_hist.size() >= 4) {
+        const std::size_t tail = std::max<std::size_t>(3, drag_hist.size() / 5);
+        const std::size_t start = drag_hist.size() - tail;
+        double mean = 0.0;
+        for (std::size_t i = start; i < drag_hist.size(); ++i) mean += drag_hist[i];
+        mean /= static_cast<double>(tail);
+        double var = 0.0;
+        for (std::size_t i = start; i < drag_hist.size(); ++i)
+            var += (drag_hist[i] - mean) * (drag_hist[i] - mean);
+        var /= static_cast<double>(tail);
+        const double denom = std::abs(mean) > 1e-30 ? std::abs(mean) : 1e-30;
+        R.residual = std::sqrt(var) / denom;
+        R.converged = R.residual < 0.01;  // <1% variation over the tail
+    }
+
     R.ok = true;
     return R;
 }

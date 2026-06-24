@@ -54,9 +54,28 @@ struct MeshData {
     std::size_t triangle_count() const { return tris.size() / 3; }
 };
 
-// Tessellate a TopoDS_Shape (solid or shell) into a triangle soup at the Python
-// tessellation defaults (0.05mm linear / 0.35rad angular). Used by the mesh writers.
-MeshData shape_to_mesh(const TopoDS_Shape& shape);
+// Tessellation quality controls for mesh-format export (STL/OBJ/PLY/3MF/glTF/3DM).
+// Defaults reproduce the historical hardcoded behaviour (0.05mm linear / 0.35rad
+// angular, absolute deflection, binary STL) so callers that don't set them are
+// unchanged.
+struct TessOptions {
+    double lin_deflection = 0.05;  // max chord deviation; mm (absolute) or a fraction (relative)
+    double ang_deflection = 0.35;  // max normal deviation, radians
+    bool relative = false;         // scale linear deflection by each edge size (size-robust)
+    bool ascii = false;            // STL only: ASCII vs binary container
+};
+
+// Tessellate a TopoDS_Shape (solid or shell) into a triangle soup at the given
+// tessellation quality (defaults to 0.05mm linear / 0.35rad angular). Used by the mesh
+// writers. The existing triangulation is cleared first so the requested deflection is
+// honored exactly even if the shape was previously meshed at a different quality.
+MeshData shape_to_mesh(const TopoDS_Shape& shape, const TessOptions& tess = TessOptions{});
+
+// Count the triangles/vertices a mesh export would produce at the given quality, without
+// writing a file. Returns {triangles, vertices} summed over the bodies. Used by the GUI
+// export dialog's live estimate.
+std::pair<std::size_t, std::size_t> estimate_tessellation(
+    const std::vector<TopoDS_Shape>& bodies, const TessOptions& tess = TessOptions{});
 
 // Read a mesh file into a triangle soup (no sewing). Supported fmt: stl/obj/ply/gltf/
 // glb/3mf. Throws OpError("import_failed") on an unsupported format or a read failure.
@@ -81,7 +100,8 @@ TopoDS_Shape mesh_to_shape(const MeshData& mesh);
 // _shapes_to_export_list). Throws OpError("export_failed") on an unsupported format or
 // a writer failure. Returns the absolute path written.
 std::string export_bodies(const std::vector<TopoDS_Shape>& bodies,
-                          const std::string& path, const std::string& fmt);
+                          const std::string& path, const std::string& fmt,
+                          const TessOptions& tess = TessOptions{});
 
 // Read solid bodies from `path`. Supported: step (multi-solid), iges (sewn+healed),
 // brep, and the mesh formats stl/obj/ply/gltf/glb (sewn into a shell/solid). Returns

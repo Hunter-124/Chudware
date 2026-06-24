@@ -1,11 +1,14 @@
 FILLET - round off edges with a radius. params: `radius` (dim object). refs.edges names the edges.
 
-BEST WAY (works on ANY part, including ones you did not build) - a geometry QUERY under refs.edges. You NAME the edges instead of computing selectors:
-- {"of":"edge"}                  every edge of the body (round the whole part)
-- {"of":"edge","parallel":[0,0,1]} the vertical edges only (e.g. the 4 corners of a block)
-- {"of":"edge","side":"+z"}      the TOP edges / top rim   ("-z" = bottom; "+x"/"-x"/"+y"/"-y" too)
-- {"of":"edge","surf":"circle"}  the round edges (a cylinder's rims)
+BEST WAY (works on ANY part, including ones you did not build) - a geometry QUERY under refs.edges. You NAME the edges in PLAIN WORDS instead of computing selectors or face numbers:
+- {"of":"edge"}                       every edge of the body (round the whole part)
+- {"of":"edge","parallel":"z"}        the vertical edges only (the 4 corners of a block); "x"/"y" too
+- {"of":"edge","side":"top"}          the TOP edges / top rim   (bottom/left/right/front/back too)
+- {"of":"edge","surf":"round"}        the round edges (a cylinder's rims)
+- {"of":"edge","pick":"longest"}      the longest edge(s) ("shortest" too)
 - {"of":"edge","near":[20,0,5],"count":1}  the single edge nearest a point
+Direction words map to the standard views: top=+Z, bottom=-Z, right=+X, left=-X, front=-Y, back=+Y
+(the signed-axis forms "+z"/"-x"/.. still work if you prefer them).
 
 Example A - round ALL edges of the current body r=2:
 [
@@ -14,12 +17,12 @@ Example A - round ALL edges of the current body r=2:
 
 Example B - round just the 4 vertical edges of a block r=5:
 [
- {"op":"add_feature","feature":{"type":"fillet","name":"Round","params":{"radius":{"value":5,"expr":null}},"refs":{"edges":{"of":"edge","parallel":[0,0,1]}}}}
+ {"op":"add_feature","feature":{"type":"fillet","name":"Round","params":{"radius":{"value":5,"expr":null}},"refs":{"edges":{"of":"edge","parallel":"z"}}}}
 ]
 
 Example C - round the top rim of a round flange r=1:
 [
- {"op":"add_feature","feature":{"type":"fillet","name":"Rim","params":{"radius":{"value":1,"expr":null}},"refs":{"edges":{"of":"edge","side":"+z"}}}}
+ {"op":"add_feature","feature":{"type":"fillet","name":"Rim","params":{"radius":{"value":1,"expr":null}},"refs":{"edges":{"of":"edge","side":"top"}}}}
 ]
 
 3 common mistakes:

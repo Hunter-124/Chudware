@@ -272,11 +272,22 @@ nlohmann::json doc_eval_curvature(const std::string& doc_id, int body_id,
 // LAST. Parity is PHYSICAL (tolerance band), not bit-exact (oracle uses trimesh BVH).
 nlohmann::json doc_eval_thickness(const std::string& doc_id, int body_id);
 
-// Export the document's surviving solid bodies to `path` in `fmt` (step/iges/brep/stl)
-// via OCCT. Returns {"path": <abs>}. Throws OpError("export_failed") on no bodies / an
-// unsupported format / a writer failure (engine.doc.formats export_file).
+// Export the document's surviving solid bodies to `path` in `fmt` (step/iges/brep/stl/
+// obj/ply/3mf/gltf/glb) via OCCT. For mesh formats, the tessellation quality is
+// controlled by lin_deflection (mm, or a fraction when `relative`), ang_deflection
+// (radians), and `ascii` (STL container); the defaults reproduce the historical
+// behaviour. Returns {"path": <abs>}. Throws OpError("export_failed") on no bodies / an
+// unsupported format / a writer failure.
 nlohmann::json doc_export_file(const std::string& doc_id, const std::string& path,
-                               const std::string& fmt);
+                               const std::string& fmt, double lin_deflection = 0.05,
+                               double ang_deflection = 0.35, bool relative = false,
+                               bool ascii = false);
+
+// Count the triangles/vertices a mesh export of this document would produce at the given
+// tessellation quality, without writing a file. Returns {triangles, vertices, bodies}.
+// Used by the GUI export dialog's live estimate.
+nlohmann::json doc_export_estimate(const std::string& doc_id, double lin_deflection = 0.05,
+                                   double ang_deflection = 0.35, bool relative = false);
 
 // Import a neutral B-rep file (step/iges/brep) as a new `import` feature. With `into`
 // (a doc id) it appends to that session; otherwise it creates a new part session.

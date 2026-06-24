@@ -78,6 +78,10 @@ static std::string docTitle(const nlohmann::json& tree, bool isAssembly) {
 // See app_state.h: filename-first label for a tab. Strip directory + one trailing extension so an
 // opened "C:\parts\bracket.step+" reads as "bracket"; fall back to the tree-derived title otherwise.
 std::string AppState::DocTab::displayTitle() const {
+    // Live MCP-handoff mirror: never show its on-disk name ("live", from live.step+). Label it as
+    // the AI's part using the tree-derived title so the user reads "AI: bracket", not "live".
+    if (aiHandoff)
+        return "AI: " + (title.empty() ? std::string("part") : title);
     if (!path.empty()) {
         std::size_t slash = path.find_last_of("/\\");
         std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);

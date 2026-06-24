@@ -72,8 +72,13 @@ std::vector<double> faceset_sample(const json& points_node) {
 bool resolve_mesh(const json& study, std::vector<double>& points, std::vector<int>& tets,
                   int& nodes_per_elem, std::string& err) {
     nodes_per_elem = 4;
-    if (study.contains("points") && study["points"].is_array() && study.contains("tets") &&
-        study["tets"].is_array()) {
+    // A present step_path ALWAYS re-meshes with the current options. Inline points/tets
+    // are only used as a fallback when there is no step_path, so a cached/stale inline
+    // mesh can never silently override the GUI mesh controls.
+    const bool has_step = study.contains("step_path") && study["step_path"].is_string() &&
+                          !study["step_path"].get<std::string>().empty();
+    if (!has_step && study.contains("points") && study["points"].is_array() &&
+        study.contains("tets") && study["tets"].is_array()) {
         points = json_doubles(study["points"]);
         tets = json_ints(study["tets"]);
         if (points.empty() || tets.empty()) {
@@ -83,16 +88,22 @@ bool resolve_mesh(const json& study, std::vector<double>& points, std::vector<in
         nodes_per_elem = study.value("nodes_per_elem", 4);
         return true;
     }
-    if (study.contains("step_path") && study["step_path"].is_string()) {
+    if (has_step) {
         std::string step_path = study["step_path"].get<std::string>();
         MeshOptions opts;
-        opts.density = study.value("density", 0.5);
+        // fineness is the primary control; `density` is read as a legacy alias (the
+        // mesher maps a >=0 density onto fineness with the same higher=finer sense).
+        opts.fineness = study.value("fineness", 0.5);
+        opts.density = study.value("density", -1.0);
         opts.order = study.value("mesh_order", study.value("order", 1));
+        opts.curvature = study.value("curvature", true);
+        opts.curv_elems_per_circle = study.value("curv_elems_per_circle", 12.0);
         opts.target_size_mm = study.value("target_size_mm", 0.0);
         opts.min_size_mm = study.value("min_size_mm", 0.0);
         opts.max_size_mm = study.value("max_size_mm", 0.0);
-        opts.optimize = study.value("optimize", false);
+        opts.optimize = study.value("optimize", true);
         opts.algorithm3d = study.value("algorithm3d", 1);
+        opts.structured = study.value("structured", study.value("mesh_type", std::string()) == "hex");
         MeshOut m = mesh_step(step_path, opts);
         if (!m.ok) {
             err = "mesh failed: " + m.error;
@@ -190,50 +201,60 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
                         ? load["magnitude"].get<double>()
                         : 0.0;
                 std::unordered_set<int> node_set(node_ids.begin(), node_ids.end());
-                // tet face combos in the SAME order as the oracle.
-                static const int face_combos[4][3] = {
-                    {0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
+                // Element boundary faces: 4 triangular faces for a tet (corners 0..3,
+                // SAME order as the oracle — tet path stays byte-identical), or 6 quad
+                // faces for a hex8. The area-weighted polygon normal via a fan
+                // triangulation from the face's first corner handles tris (1 fan tri) and
+                // quads (2 fan tris) uniformly.
+                static const int tet_faces[4][4] = {
+                    {0, 1, 2, -1}, {0, 1, 3, -1}, {0, 2, 3, -1}, {1, 2, 3, -1}};
+                static const int hex_faces[6][4] = {{0, 1, 2, 3}, {4, 5, 6, 7}, {0, 1, 5, 4},
+                                                    {2, 3, 7, 6}, {0, 3, 7, 4}, {1, 2, 6, 5}};
+                const bool hexEl = (nodes_per_elem == 8);
+                const int n_faces = hexEl ? 6 : 4;
+                const int fk = hexEl ? 4 : 3;  // corners per face
                 std::vector<double> node_force(static_cast<size_t>(n_nodes) * 3, 0.0);
                 double total_area = 0.0;
                 int face_count = 0;
-                // For tet10 the 4 CORNER nodes are still tet[0..3]; iterate with the
-                // element stride and read corners only for the surface-face combos.
                 const size_t stride = static_cast<size_t>(nodes_per_elem);
                 const size_t m = tets.size() / stride;
                 for (size_t e = 0; e < m; ++e) {
-                    const int* tet = &tets[e * stride];
-                    for (const auto& fc : face_combos) {
-                        const int n0 = tet[fc[0]], n1 = tet[fc[1]], n2 = tet[fc[2]];
-                        if (node_set.count(n0) && node_set.count(n1) && node_set.count(n2)) {
-                            const double* v0 = &points[static_cast<size_t>(n0) * 3];
-                            const double* v1 = &points[static_cast<size_t>(n1) * 3];
-                            const double* v2 = &points[static_cast<size_t>(n2) * 3];
-                            const double e1x = v1[0] - v0[0], e1y = v1[1] - v0[1],
-                                         e1z = v1[2] - v0[2];
-                            const double e2x = v2[0] - v0[0], e2y = v2[1] - v0[1],
-                                         e2z = v2[2] - v0[2];
-                            // cross = (v1-v0) x (v2-v0)
-                            const double cx = e1y * e2z - e1z * e2y;
-                            const double cy = e1z * e2x - e1x * e2z;
-                            const double cz = e1x * e2y - e1y * e2x;
-                            const double cmag = std::sqrt(cx * cx + cy * cy + cz * cz);
-                            const double area = cmag / 2.0;
-                            if (area < 1e-12) continue;
-                            // normal = cross / (2*area) == cross / cmag (unit)
-                            const double inv2a = 1.0 / (2.0 * area);
-                            const double nx = cx * inv2a, ny = cy * inv2a, nz = cz * inv2a;
-                            // face_force = pressure * area * normal, split /3 per node.
-                            const double ffx = pressure * area * nx / 3.0;
-                            const double ffy = pressure * area * ny / 3.0;
-                            const double ffz = pressure * area * nz / 3.0;
-                            for (int nid : {n0, n1, n2}) {
-                                node_force[static_cast<size_t>(nid) * 3 + 0] += ffx;
-                                node_force[static_cast<size_t>(nid) * 3 + 1] += ffy;
-                                node_force[static_cast<size_t>(nid) * 3 + 2] += ffz;
-                            }
-                            total_area += area;
-                            face_count += 1;
+                    const int* el = &tets[e * stride];
+                    for (int f = 0; f < n_faces; ++f) {
+                        const int* fc = hexEl ? hex_faces[f] : tet_faces[f];
+                        int fn[4];
+                        bool all_in = true;
+                        for (int i = 0; i < fk; ++i) {
+                            fn[i] = el[fc[i]];
+                            if (!node_set.count(fn[i])) { all_in = false; break; }
                         }
+                        if (!all_in) continue;
+                        // Area-weighted normal = sum of fan-triangle (p0,pi,pi+1) cross/2.
+                        const double* p0 = &points[static_cast<size_t>(fn[0]) * 3];
+                        double nvx = 0.0, nvy = 0.0, nvz = 0.0;
+                        for (int i = 1; i < fk - 1; ++i) {
+                            const double* pa = &points[static_cast<size_t>(fn[i]) * 3];
+                            const double* pb = &points[static_cast<size_t>(fn[i + 1]) * 3];
+                            const double ax = pa[0] - p0[0], ay = pa[1] - p0[1], az = pa[2] - p0[2];
+                            const double bx = pb[0] - p0[0], by = pb[1] - p0[1], bz = pb[2] - p0[2];
+                            nvx += 0.5 * (ay * bz - az * by);
+                            nvy += 0.5 * (az * bx - ax * bz);
+                            nvz += 0.5 * (ax * by - ay * bx);
+                        }
+                        const double area = std::sqrt(nvx * nvx + nvy * nvy + nvz * nvz);
+                        if (area < 1e-12) continue;
+                        const double nx = nvx / area, ny = nvy / area, nz = nvz / area;
+                        // face_force = pressure * area * normal, split equally per corner.
+                        const double ffx = pressure * area * nx / fk;
+                        const double ffy = pressure * area * ny / fk;
+                        const double ffz = pressure * area * nz / fk;
+                        for (int i = 0; i < fk; ++i) {
+                            node_force[static_cast<size_t>(fn[i]) * 3 + 0] += ffx;
+                            node_force[static_cast<size_t>(fn[i]) * 3 + 1] += ffy;
+                            node_force[static_cast<size_t>(fn[i]) * 3 + 2] += ffz;
+                        }
+                        total_area += area;
+                        face_count += 1;
                     }
                 }
                 if (face_count == 0) {

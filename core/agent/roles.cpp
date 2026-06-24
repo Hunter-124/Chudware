@@ -46,7 +46,7 @@ std::string cheatsheet_name(const std::string& feature_type) {
     if (t == "fillet") return "fillet";
     if (t == "chamfer") return "chamfer";
     if (t == "shell") return "shell";
-    if (t == "hole") return "hole";
+    if (t == "hole" || t == "bolt_circle") return "hole";  // hole.md documents both
     if (t == "linear_pattern" || t == "circular_pattern" || t == "pattern") return "pattern";
     if (t == "drawing") return "drawing";  // W17: 2D engineering-drawing authoring cheatsheet
     return "";

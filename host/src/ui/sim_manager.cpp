@@ -69,13 +69,19 @@ static const char* studyTypeLabel(StudyType t) {
     }
 }
 
-static void addMeshParams(nlohmann::json& j, const Study& s, int meshOrder) {
-    j["density"] = s.meshDensity;
+// allowHex=false forces tetrahedral (e.g. modal studies have no hex8 mass matrix).
+static void addMeshParams(nlohmann::json& j, const Study& s, int meshOrder, bool allowHex = true) {
+    j["fineness"] = s.meshFineness;     // primary control (0=coarse..1=fine)
+    const bool hex = allowHex && s.meshHex;
+    j["structured"] = hex;
+    j["mesh_type"] = hex ? "hex" : "tet";
     j["mesh_order"] = meshOrder;
-    j["order"] = meshOrder;  // direct sim_mesh accepts both; keep the call self-describing.
+    j["order"] = meshOrder;             // direct sim_mesh accepts both; keep it self-describing.
+    j["curvature"] = s.meshCurvature;
+    j["curv_elems_per_circle"] = s.meshCurvPerCircle;
     if (s.meshTargetMm > 0.0f) j["target_size_mm"] = s.meshTargetMm;
     if (s.meshMinMm > 0.0f) j["min_size_mm"] = s.meshMinMm;
-    if (s.meshMaxMm > 0.0f) j["max_size_mm"] = s.meshMaxMm;
+    j["algorithm3d"] = s.meshAlgo;
     j["optimize"] = s.meshOptimize;
 }
 
@@ -392,11 +398,14 @@ nlohmann::json SimManager::studyToJson(const Study& s) {
         {"material", s.materialKey},
         {"fixtures", fixtures},
         {"loads", loads},
-        {"mesh_density", s.meshDensity},
+        {"mesh_fineness", s.meshFineness},
+        {"mesh_hex", s.meshHex},
+        {"mesh_curvature", s.meshCurvature},
+        {"mesh_curv_per_circle", s.meshCurvPerCircle},
         {"mesh_order", s.meshOrder},
         {"mesh_target_mm", s.meshTargetMm},
         {"mesh_min_mm", s.meshMinMm},
-        {"mesh_max_mm", s.meshMaxMm},
+        {"mesh_algo", s.meshAlgo},
         {"mesh_optimize", s.meshOptimize},
         {"n_modes", s.nModes},
         {"criterion", (int)s.criterion},
@@ -441,11 +450,15 @@ Study SimManager::studyFromJson(const nlohmann::json& j) {
     s.type = studyTypeFromKey(j.value("type", std::string("static")));
     s.name = j.value("name", std::string("Study"));
     s.materialKey = j.value("material", std::string());
-    s.meshDensity = j.value("mesh_density", 0.5);
+    // Back-compat: old studies persisted "mesh_density" (same higher=finer sense as fineness).
+    s.meshFineness = j.value("mesh_fineness", j.value("mesh_density", 0.5f));
+    s.meshHex = j.value("mesh_hex", false);
+    s.meshCurvature = j.value("mesh_curvature", true);
+    s.meshCurvPerCircle = j.value("mesh_curv_per_circle", 12.0f);
     s.meshOrder = j.value("mesh_order", 2);
     s.meshTargetMm = j.value("mesh_target_mm", 0.0f);
     s.meshMinMm = j.value("mesh_min_mm", 0.0f);
-    s.meshMaxMm = j.value("mesh_max_mm", 0.0f);
+    s.meshAlgo = j.value("mesh_algo", 1);
     s.meshOptimize = j.value("mesh_optimize", true);
     s.nModes = j.value("n_modes", 6);
     s.criterion = (FailureCriterion)j.value("criterion", 0);
@@ -660,7 +673,7 @@ bool SimManager::handleCommand(AppState& st, const std::string& cmdId) {
 
 void SimManager::configureActive(AppState& st, float density, const std::string& materialKey) {
     if (sel_ < 0 || sel_ >= (int)studies_.size()) return;
-    studies_[sel_].meshDensity = density;
+    studies_[sel_].meshFineness = density;  // density and fineness share the higher=finer sense
     if (!materialKey.empty()) studies_[sel_].materialKey = materialKey;
     persist(st, studies_[sel_]);
 }
@@ -819,16 +832,30 @@ void SimManager::previewMesh(AppState& st, Study& s) {
     nlohmann::json res, params = {{"step_path", stepPath}};
     addMeshParams(params, s, s.meshOrder);
     std::string err;
-    if (!st.worker.call("sim_mesh", params, res, err, 180000) || res.contains("code")) {
-        st.toast(ui::ToastLevel::Error, "Mesh preview: meshing failed");
-        st.addLog("[sim] sim_mesh failed: " +
-                  (res.contains("code") ? res.value("message", err) : err));
+    if (!st.worker.call("sim_mesh", params, res, err, 180000) || res.contains("code") ||
+        !res.value("ok", true)) {
+        // The mesher reports failure as {ok:false, error:...} (e.g. hex on a non-box part).
+        const std::string msg = res.contains("code") ? res.value("message", err)
+                                : res.contains("error") ? res.value("error", err)
+                                                        : err;
+        st.toast(ui::ToastLevel::Error, msg.empty() ? "Mesh preview: meshing failed" : msg);
+        st.addLog("[sim] sim_mesh failed: " + msg);
         return;
     }
     s.nNodes = res.value("n_nodes", 0);
     s.nElems = res.value("n_elems", 0);
     const double minVol = res.value("min_tet_volume_mm3", 0.0);
     const double edgeRatio = res.value("max_tet_edge_ratio", 0.0);
+    // Capture the professional quality metrics for the Mesh-form readout.
+    s.meshAspectMin = (float)res.value("aspect_min", 0.0);
+    s.meshAspectAvg = (float)res.value("aspect_avg", 0.0);
+    s.meshAspectMax = (float)res.value("aspect_max", 0.0);
+    s.meshJacobianMin = (float)res.value("jacobian_min", 0.0);
+    s.meshPctPoor = (float)res.value("pct_poor", 0.0);
+    s.meshAspectHist.clear();
+    if (res.contains("aspect_hist") && res["aspect_hist"].is_array())
+        for (const auto& b : res["aspect_hist"]) s.meshAspectHist.push_back((float)b.get<int>());
+    s.meshHasQuality = s.nElems > 0;
     clearMeshPreview();
     meshPreviewStudyId_ = s.id;
     if (!res.contains("points") || !res.contains("tets") ||
@@ -843,17 +870,7 @@ void SimManager::previewMesh(AppState& st, Study& s) {
     const int nT = (stride > 0) ? (int)(T.size() / (size_t)stride) : 0;
     // Cap the wireframe so a dense mesh can't tank the frame; the stats still surface regardless.
     if (nT > 0 && nT <= 250000) {
-        // Surface triangles = tet faces owned by exactly one tet; draw the unique edges of those.
-        static const int fv[4][3] = {{0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
-        std::map<std::array<int, 3>, int> faceCount;
-        auto tetNode = [&](int e, int k) { return T[(size_t)e * (size_t)stride + k].get<int>(); };
-        for (int e = 0; e < nT; ++e)
-            for (int f = 0; f < 4; ++f) {
-                std::array<int, 3> tri{tetNode(e, fv[f][0]), tetNode(e, fv[f][1]),
-                                       tetNode(e, fv[f][2])};
-                std::sort(tri.begin(), tri.end());
-                faceCount[tri]++;
-            }
+        auto elNode = [&](int e, int k) { return T[(size_t)e * (size_t)stride + k].get<int>(); };
         std::unordered_set<uint64_t> seenEdge;
         auto pt = [&](int i, float out[3]) {
             out[0] = (float)P[(size_t)i * 3 + 0].get<double>();
@@ -868,12 +885,43 @@ void SimManager::previewMesh(AppState& st, Study& s) {
             meshPreviewSegs_.insert(meshPreviewSegs_.end(),
                                     {pa[0], pa[1], pa[2], pb[0], pb[1], pb[2]});
         };
-        for (const auto& kv : faceCount)
-            if (kv.second == 1) {
-                edge(kv.first[0], kv.first[1]);
-                edge(kv.first[1], kv.first[2]);
-                edge(kv.first[0], kv.first[2]);
-            }
+        if (stride == 8) {
+            // hex8: 6 quad faces; a face owned by exactly one element is on the boundary.
+            static const int hexF[6][4] = {{0, 1, 2, 3}, {4, 5, 6, 7}, {0, 1, 5, 4},
+                                           {2, 3, 7, 6}, {0, 3, 7, 4}, {1, 2, 6, 5}};
+            std::map<std::array<int, 4>, int> faceCount;
+            for (int e = 0; e < nT; ++e)
+                for (int f = 0; f < 6; ++f) {
+                    std::array<int, 4> q{elNode(e, hexF[f][0]), elNode(e, hexF[f][1]),
+                                         elNode(e, hexF[f][2]), elNode(e, hexF[f][3])};
+                    std::sort(q.begin(), q.end());
+                    faceCount[q]++;
+                }
+            for (const auto& kv : faceCount)
+                if (kv.second == 1) {
+                    edge(kv.first[0], kv.first[1]);
+                    edge(kv.first[1], kv.first[2]);
+                    edge(kv.first[2], kv.first[3]);
+                    edge(kv.first[0], kv.first[3]);
+                }
+        } else {
+            // Surface triangles = tet faces owned by exactly one tet; draw their unique edges.
+            static const int fv[4][3] = {{0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
+            std::map<std::array<int, 3>, int> faceCount;
+            for (int e = 0; e < nT; ++e)
+                for (int f = 0; f < 4; ++f) {
+                    std::array<int, 3> tri{elNode(e, fv[f][0]), elNode(e, fv[f][1]),
+                                           elNode(e, fv[f][2])};
+                    std::sort(tri.begin(), tri.end());
+                    faceCount[tri]++;
+                }
+            for (const auto& kv : faceCount)
+                if (kv.second == 1) {
+                    edge(kv.first[0], kv.first[1]);
+                    edge(kv.first[1], kv.first[2]);
+                    edge(kv.first[0], kv.first[2]);
+                }
+        }
     }
     std::string msg = "Mesh: " + std::to_string(s.nNodes) + " nodes, " +
                       std::to_string(s.nElems) + " elements";
@@ -1322,7 +1370,9 @@ void SimManager::runStaticOrModal(AppState& st, Study& s) {
     };
     // 2nd-order (tet10) elements for static so bending is captured; modal stays 1st-order
     // (its mass matrix is linear-only) — the engine forces order 1 for modal regardless.
-    addMeshParams(study, s, s.type == StudyType::Static ? s.meshOrder : 1);
+    // Modal has no hex8 mass matrix → force tetrahedral (and 1st-order) for it.
+    addMeshParams(study, s, s.type == StudyType::Static ? s.meshOrder : 1,
+                  /*allowHex=*/s.type == StudyType::Static);
 
     std::string note;
     if (s.type == StudyType::Static) {
@@ -1984,46 +2034,68 @@ void SimManager::drawMeshForm(AppState& st, Study& s) {
     ImGui::PushFont(st.fonts.medium);
     ImGui::TextUnformatted("Mesh");
     ImGui::PopFont();
-    ImGui::TextWrapped("The tetrahedral mesh the solve runs on. Finer captures stress concentrations "
+    ImGui::TextWrapped("The mesh the solve runs on. Finer captures stress concentrations "
                        "better but takes longer.");
     ImGui::Spacing();
-    ImGui::TextUnformatted("Density (relative)");
+
+    // --- Mesh type: tetrahedral (general) vs structured hexahedral (prismatic) ------
+    const bool modal = (s.type == StudyType::Modal);
+    ImGui::TextUnformatted("Mesh type");
+    static const char* kType[2] = {"Tetrahedral (any shape)",
+                                   "Hexahedral (box / prismatic only)"};
+    if (modal) ImGui::BeginDisabled();  // modal has no hex8 mass matrix
+    int ti = (s.meshHex && !modal) ? 1 : 0;
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::SliderFloat("##density", &s.meshDensity, 0.1f, 1.0f, "%.2f")) {}
+    if (ImGui::BeginCombo("##meshtype", kType[ti])) {
+        for (int i = 0; i < 2; ++i)
+            if (ImGui::Selectable(kType[i], ti == i)) {
+                s.meshHex = (i == 1); persist(st, s); clearMeshPreview();
+            }
+        ImGui::EndCombo();
+    }
+    if (modal) ImGui::EndDisabled();
+    simTip("Tetrahedral fills any geometry but its element pattern is irregular (normal for "
+           "unstructured meshing). Hexahedral lays down a perfectly regular, symmetric grid — "
+           "but only works on a box / rectangular prism (other shapes fall back with a note). "
+           "Frequency studies are tetrahedral only.");
+    ImGui::Spacing();
+    const bool hexMesh = s.meshHex && !modal;
+
+    // --- Mesh fineness (primary control) -------------------------------------------
+    ImGui::TextUnformatted("Mesh fineness");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    // Show a Coarse..Fine word instead of a bare number so the control reads like SW.
+    const char* fineWord = s.meshFineness < 0.2f   ? "Coarse"
+                           : s.meshFineness < 0.4f ? "Coarse-medium"
+                           : s.meshFineness < 0.6f ? "Medium"
+                           : s.meshFineness < 0.8f ? "Fine-medium"
+                                                   : "Fine";
+    if (ImGui::SliderFloat("##fineness", &s.meshFineness, 0.0f, 1.0f, fineWord)) {}
     if (ImGui::IsItemDeactivatedAfterEdit()) { persist(st, s); clearMeshPreview(); }
-    simTip("Lower = coarser/faster; higher = finer/slower, more accurate.");
+    simTip("Base element size, derived from the part's overall size. Left = coarse/fast, "
+           "right = fine/slow & more accurate.");
     ImGui::Spacing();
-    if (ImGui::Checkbox("Optimize element quality", &s.meshOptimize)) {
+
+    if (hexMesh) {
+        // Structured hex: only fineness (grid density) applies; the tet-only controls
+        // (curvature/order/optimize/algorithm) are hidden.
+        ImGui::TextDisabled("Regular hex8 grid. Element size from fineness; the part must be a\n"
+                            "box / rectangular prism (otherwise switch to Tetrahedral).");
+        ImGui::Spacing();
+    } else {
+
+    // --- Curvature-adaptive refinement ---------------------------------------------
+    if (ImGui::Checkbox("Refine curved features (holes, fillets)", &s.meshCurvature)) {
         persist(st, s);
         clearMeshPreview();
     }
-    simTip("Run gmsh's mesh optimizer after generation to improve poor-quality tetrahedra.");
+    simTip("Automatically uses smaller elements around curvature so stress concentrations "
+           "at holes and fillets are resolved. Strongly recommended for accurate FEA.");
     ImGui::Spacing();
-    ImGui::TextUnformatted("Element size controls");
-    float target = s.meshTargetMm, minSize = s.meshMinMm, maxSize = s.meshMaxMm;
-    bool sizeEdited = false;
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::InputFloat("##target_size", &target, 0.0f, 0.0f, "%.4g mm")) {}
-    sizeEdited = sizeEdited || ImGui::IsItemDeactivatedAfterEdit();
-    simTip("Target element size in mm. Set 0 to derive it from density.");
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::InputFloat("##min_size", &minSize, 0.0f, 0.0f, "%.4g mm")) {}
-    sizeEdited = sizeEdited || ImGui::IsItemDeactivatedAfterEdit();
-    simTip("Minimum element size in mm. Set 0 for automatic sizing.");
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::InputFloat("##max_size", &maxSize, 0.0f, 0.0f, "%.4g mm")) {}
-    sizeEdited = sizeEdited || ImGui::IsItemDeactivatedAfterEdit();
-    simTip("Maximum element size in mm. Set 0 for automatic sizing. Use this with min size to keep the mesh more uniform.");
-    if (sizeEdited) {
-        s.meshTargetMm = std::max(0.0f, target);
-        s.meshMinMm = std::max(0.0f, minSize);
-        s.meshMaxMm = std::max(0.0f, maxSize);
-        persist(st, s);
-        clearMeshPreview();
-    }
-    ImGui::Spacing();
-    // Element order: linear (tet4) shear-locks and makes bending look straight; quadratic (tet10)
-    // captures it. Static defaults to High quality; modal always runs 1st-order (linear mass matrix).
+
+    // --- Element order -------------------------------------------------------------
+    // Linear (tet4) shear-locks and makes bending look straight; quadratic (tet10)
+    // captures it. Static defaults to High quality; modal always runs 1st-order.
     ImGui::TextUnformatted("Element order");
     static const char* kOrder[2] = {"Draft - linear (1st order, fast)",
                                     "High quality - quadratic (2nd order)"};
@@ -2036,23 +2108,105 @@ void SimManager::drawMeshForm(AppState& st, Study& s) {
             }
         ImGui::EndCombo();
     }
-    simTip("2nd-order (quadratic) elements capture bending and curved geometry far more accurately. "
-           "Linear elements are overly stiff (shear-locking) and make a bent part look almost straight. "
-           "Use High quality for structural accuracy; Draft for a fast first look. (Frequency studies "
-           "always use 1st-order.)");
+    simTip("2nd-order (quadratic) elements capture bending and curved geometry far more "
+           "accurately. Linear elements are overly stiff (shear-locking) and make a bent "
+           "part look almost straight. Use High quality for structural accuracy; Draft for a "
+           "fast first look. (Frequency studies always use 1st-order.)");
     ImGui::Spacing();
+
+    // --- Optimize ------------------------------------------------------------------
+    if (ImGui::Checkbox("Optimize element quality (Netgen)", &s.meshOptimize)) {
+        persist(st, s);
+        clearMeshPreview();
+    }
+    simTip("Run the gmsh + Netgen optimizers after generation to improve poorly-shaped "
+           "tetrahedra. Recommended; adds a little meshing time.");
+    ImGui::Spacing();
+
+    // --- Advanced (collapsed) ------------------------------------------------------
+    if (ImGui::CollapsingHeader("Advanced")) {
+        ImGui::Indent();
+        bool edited = false;
+        if (s.meshCurvature) {
+            ImGui::TextUnformatted("Curvature refinement (elements per circle)");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::SliderFloat("##curvper", &s.meshCurvPerCircle, 6.0f, 24.0f, "%.0f")) {}
+            edited = edited || ImGui::IsItemDeactivatedAfterEdit();
+            simTip("Target number of elements around a full circle of curvature. Higher = "
+                   "rounder holes/fillets but more elements.");
+            ImGui::Spacing();
+        }
+        ImGui::TextUnformatted("Element size override (mm, 0 = auto)");
+        float target = s.meshTargetMm, minSize = s.meshMinMm;
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputFloat("##target_size", &target, 0.0f, 0.0f, "%.4g")) {}
+        edited = edited || ImGui::IsItemDeactivatedAfterEdit();
+        simTip("Explicit target element size in mm. Overrides fineness when > 0.");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputFloat("##min_size", &minSize, 0.0f, 0.0f, "%.4g")) {}
+        edited = edited || ImGui::IsItemDeactivatedAfterEdit();
+        simTip("Minimum element size in mm (floor for curvature refinement). 0 = auto.");
+        if (edited) {
+            s.meshTargetMm = std::max(0.0f, target);
+            s.meshMinMm = std::max(0.0f, minSize);
+            persist(st, s);
+            clearMeshPreview();
+        }
+        ImGui::Spacing();
+        ImGui::TextUnformatted("3D algorithm");
+        static const char* kAlgo[2] = {"Delaunay (robust)", "HXT (fast, parallel)"};
+        int ai = (s.meshAlgo == 10) ? 1 : 0;
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo("##meshalgo", kAlgo[ai])) {
+            for (int i = 0; i < 2; ++i)
+                if (ImGui::Selectable(kAlgo[i], ai == i)) {
+                    s.meshAlgo = i ? 10 : 1; persist(st, s); clearMeshPreview();
+                }
+            ImGui::EndCombo();
+        }
+        simTip("Tetrahedral meshing algorithm. Delaunay is the robust default; HXT is faster "
+               "and multi-threaded for large parts.");
+        ImGui::Unindent();
+    }
+    ImGui::Spacing();
+    }  // end !hexMesh tet-only controls
+
     bool busy = st.simClient && st.simClient->busy();
     if (busy) ImGui::BeginDisabled();
     if (ImGui::Button("Preview mesh", ImVec2(-FLT_MIN, 28.0f * ui::uiScale))) previewMesh(st, s);
     if (busy) ImGui::EndDisabled();
-    simTip("Mesh the part now and show the element wireframe + node/element counts in the viewport, "
-           "without running the solve.");
+    simTip("Mesh the part now and show the element wireframe + node/element counts + quality "
+           "in the viewport, without running the solve.");
+
     if (s.nNodes > 0 || s.nElems > 0) {
         ImGui::Spacing();
         ImGui::Text("Nodes: %d", s.nNodes);
         ImGui::Text("Elements: %d", s.nElems);
         if (!meshPreviewSegs_.empty() && meshPreviewStudyId_ == s.id)
             ImGui::TextDisabled("Wireframe shown in the viewport.");
+    }
+
+    // --- Mesh quality readout ------------------------------------------------------
+    if (s.meshHasQuality) {
+        ImGui::Spacing();
+        ImGui::PushFont(st.fonts.medium);
+        ImGui::TextUnformatted("Mesh quality");
+        ImGui::PopFont();
+        ImGui::Text("Aspect ratio: %.2f avg, %.2f worst", s.meshAspectAvg, s.meshAspectMax);
+        simTip("Element aspect ratio (1.0 = ideal). Elements above 10 are flagged as poor; a "
+               "few are normal, many indicate the mesh needs refining where the geometry is thin.");
+        ImGui::Text("Min Jacobian: %.3f", s.meshJacobianMin);
+        simTip("Worst scaled Jacobian (1.0 = ideal, <= 0 = inverted/invalid element).");
+        // Color the poor-element percentage like SW: green clean, amber some, red many.
+        ImVec4 poorCol = s.meshPctPoor < 1.0f   ? ImVec4(0.45f, 0.80f, 0.45f, 1.0f)
+                         : s.meshPctPoor < 5.0f ? ImVec4(0.90f, 0.75f, 0.30f, 1.0f)
+                                                : ImVec4(0.90f, 0.40f, 0.40f, 1.0f);
+        ImGui::TextColored(poorCol, "Poor elements: %.1f%%", s.meshPctPoor);
+        if (s.meshAspectHist.size() == 10) {
+            ImGui::PlotHistogram("##aspecthist", s.meshAspectHist.data(), 10, 0, "aspect 1 -> 10",
+                                 0.0f, FLT_MAX, ImVec2(-FLT_MIN, 40.0f * ui::uiScale));
+            simTip("Distribution of element aspect ratios from best (left, ~1) to poor (right, >=10).");
+        }
     }
 }
 

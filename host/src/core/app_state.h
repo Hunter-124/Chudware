@@ -536,6 +536,13 @@ struct AppState {
         bool        isStarter = false;
         std::string path;           // last saved file path ("" = never saved)
 
+        // Live MCP handoff mirror: this tab shows the part the external AI-CAD MCP engine is
+        // building (pollAiCadHandoff opens it from %APPDATA%\AI-CAD\handoff\live.step+ and refreshes
+        // it in place as the AI works). It is a READ-ONLY view of another process's doc — the user's
+        // own tabs are never the handoff. Flagged so the refresh can find it without path-matching,
+        // label it clearly, and avoid stealing focus / yanking an in-progress edit.
+        bool        aiHandoff = false;
+
         // Display label for the tab strip + viewport title. Prefers the on-disk file name (the
         // thing the user actually opened/saved) over the internal tree "name" — an opened .step+
         // keeps its tree name "Part1" but should read as "bracket" on the tab. Falls back to the
@@ -638,6 +645,10 @@ struct AppState {
     // switch / resync / fresh-doc activation (those fire the mirror's listener via doc_rebuild but
     // are not user edits, so they must not light the unsaved-changes marker).
     bool suppressTabDirty = false;
+    // While true, applyOpenedDoc stays SILENT (no "Opened …" / "Restored drawings" toast). Set only
+    // around the live MCP-handoff refresh (pollAiCadHandoff reopens the mirror on every AI build
+    // step) so watching the AI build doesn't spam a toast per step. Cleared right after the open.
+    bool handoffQuietOpen = false;
 
     // ---- document-tab operations (implemented in core/doc_tabs.cpp via ui/doc_tabs) ----
     // Append a tab for an already-created/opened worker doc and make it active (does NOT touch the
@@ -1113,6 +1124,26 @@ struct AppState {
     // requestSaveAll; the pump iterates docTabs and saves each saveable doc.
     std::string requestExportFormat;  // File > Export <fmt> (export the active doc next pump)
     bool requestSaveAll = false;      // File > Save All (save every saveable doc next pump)
+
+    // Mesh-export tessellation dialog. File > Export of a MESH format (stl/obj/ply/3mf/
+    // gltf/glb) opens this modal first (instead of going straight to requestExportFormat)
+    // so the user picks a quality preset / fine-tunes deflection before the Save-As. On
+    // confirm, the chosen options are stashed here and requestExportFormat is set for the
+    // GL-thread pump to consume. B-rep formats (step/iges/brep) bypass the dialog.
+    struct ExportTessDialog {
+        bool open = false;            // modal visible this frame
+        std::string fmt;              // pending mesh format
+        int preset = 1;              // 0 Coarse, 1 Standard, 2 Fine, 3 Custom
+        bool advanced = false;        // reveal raw deflection / STL container controls
+        float linDeflection = 0.05f;  // mm (or fraction when relative)
+        float angDeflectionDeg = 20.0f;  // degrees (converted to radians on send)
+        bool relative = false;        // relative-to-size linear deflection
+        bool ascii = false;           // STL ASCII vs binary
+        // Live estimate state.
+        bool estimateDirty = true;    // recompute the triangle/vertex estimate next draw
+        bool estimateValid = false;
+        long long estTris = 0, estVerts = 0;
+    } exportTess;
     bool wantNewDocChooser = false;   // doc-strip "+" / Ctrl+N → open the tiled "Create New" chooser
     // Unsaved-changes guard on app exit. The window-close (title-bar X / Alt+F4 / File > Quit) is
     // intercepted in run_gui: if any tab is dirty, the close is cancelled and wantQuitConfirm raises

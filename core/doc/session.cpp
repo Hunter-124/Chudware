@@ -347,6 +347,16 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
     env["params"] = feat.contains("params") ? feat["params"] : json::object();
     env["refs"] = feat.contains("refs") ? feat["refs"] : json::object();
     if (feat.contains("folder")) env["folder"] = feat["folder"];
+    // A model may put primitive/feature OPTIONS at the feature TOP LEVEL instead of in
+    // params (their canonical home) — e.g. {"type":"cylinder","mode":"cut",...}. Only
+    // type/name/suppressed/params/refs/folder are kept above, so a stray top-level option
+    // would be SILENTLY DROPPED -> wrong geometry with no error (a cut cylinder fuses).
+    // Relocate the known options into params so both conventions behave identically.
+    if (env["params"].is_object()) {
+        for (const char* k : {"mode", "merge", "centered", "at", "at_offset", "offset"}) {
+            if (feat.contains(k) && !env["params"].contains(k)) env["params"][k] = feat[k];
+        }
+    }
     resolve_placeholders_deep(env["params"], id_map);
     resolve_placeholders_deep(env["refs"], id_map);
 
@@ -3665,7 +3675,137 @@ inline RV3 rnorm(const RV3& a) {
     return l < 1e-12 ? RV3{0, 0, 0} : RV3{a.x / l, a.y / l, a.z / l};
 }
 
+// ---- annotation overlay: a tiny bitmap font + 2D draw helpers so the agent vision-review
+// render is LABELLED (an orientation gizmo + named-face callouts) and COLOUR-CODED by face
+// orientation, instead of a bare grey blob the vision model has to guess at. -------------
+
+// Classic 5x7 glyphs, column-major: glyph[j] is column j, bit i (0=top) lights row i.
+// Covers space, + - . : 0-9 A-Z — enough for the gizmo letters, the TOP/FRONT/... callouts,
+// dimensions, and feature names (upper-cased before drawing).
+const unsigned char* glyph5x7(char ch) {
+    static const unsigned char F[][5] = {
+        {0x00,0x00,0x00,0x00,0x00},                  // ' '
+        {0x08,0x08,0x3E,0x08,0x08},                  // '+'
+        {0x08,0x08,0x08,0x08,0x08},                  // '-'
+        {0x00,0x60,0x60,0x00,0x00},                  // '.'
+        {0x00,0x36,0x36,0x00,0x00},                  // ':'
+        {0x3E,0x51,0x49,0x45,0x3E},{0x00,0x42,0x7F,0x40,0x00},  // 0 1
+        {0x42,0x61,0x51,0x49,0x46},{0x21,0x41,0x45,0x4B,0x31},  // 2 3
+        {0x18,0x14,0x12,0x7F,0x10},{0x27,0x45,0x45,0x45,0x39},  // 4 5
+        {0x3C,0x4A,0x49,0x49,0x30},{0x01,0x71,0x09,0x05,0x03},  // 6 7
+        {0x36,0x49,0x49,0x49,0x36},{0x06,0x49,0x49,0x29,0x1E},  // 8 9
+        {0x7E,0x11,0x11,0x11,0x7E},{0x7F,0x49,0x49,0x49,0x36},  // A B
+        {0x3E,0x41,0x41,0x41,0x22},{0x7F,0x41,0x41,0x22,0x1C},  // C D
+        {0x7F,0x49,0x49,0x49,0x41},{0x7F,0x09,0x09,0x09,0x01},  // E F
+        {0x3E,0x41,0x49,0x49,0x7A},{0x7F,0x08,0x08,0x08,0x7F},  // G H
+        {0x00,0x41,0x7F,0x41,0x00},{0x20,0x40,0x41,0x3F,0x01},  // I J
+        {0x7F,0x08,0x14,0x22,0x41},{0x7F,0x40,0x40,0x40,0x40},  // K L
+        {0x7F,0x02,0x0C,0x02,0x7F},{0x7F,0x04,0x08,0x10,0x7F},  // M N
+        {0x3E,0x41,0x41,0x41,0x3E},{0x7F,0x09,0x09,0x09,0x06},  // O P
+        {0x3E,0x41,0x51,0x21,0x5E},{0x7F,0x09,0x19,0x29,0x46},  // Q R
+        {0x46,0x49,0x49,0x49,0x31},{0x01,0x01,0x7F,0x01,0x01},  // S T
+        {0x3F,0x40,0x40,0x40,0x3F},{0x1F,0x20,0x40,0x20,0x1F},  // U V
+        {0x7F,0x20,0x18,0x20,0x7F},{0x63,0x14,0x08,0x14,0x63},  // W X
+        {0x07,0x08,0x70,0x08,0x07},{0x61,0x51,0x49,0x45,0x43},  // Y Z
+    };
+    if (ch == ' ') return F[0];
+    if (ch == '+') return F[1];
+    if (ch == '-') return F[2];
+    if (ch == '.') return F[3];
+    if (ch == ':') return F[4];
+    if (ch >= '0' && ch <= '9') return F[5 + (ch - '0')];
+    if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
+    if (ch >= 'A' && ch <= 'Z') return F[15 + (ch - 'A')];
+    return F[0];
+}
+
+inline void put_px(std::vector<unsigned char>& img, int W, int H, int x, int y,
+                   unsigned char r, unsigned char g, unsigned char b) {
+    if (x < 0 || y < 0 || x >= W || y >= H) return;
+    size_t p = (size_t)y * W + x;
+    img[p * 3] = r; img[p * 3 + 1] = g; img[p * 3 + 2] = b;
+}
+
+// Draw `text` at (x,y) top-left, each pixel scaled `sc`x, with a 1px dark halo so it stays
+// readable over any face colour. Returns the x just past the string.
+int blit_text(std::vector<unsigned char>& img, int W, int H, int x, int y,
+              const std::string& text, int sc, unsigned char r, unsigned char g, unsigned char b) {
+    int cx = x;
+    for (char ch : text) {
+        const unsigned char* gly = glyph5x7(ch);
+        for (int col = 0; col < 5; ++col)
+            for (int row = 0; row < 7; ++row)
+                if (gly[col] & (1u << row))
+                    for (int dy = 0; dy < sc; ++dy)
+                        for (int dx = 0; dx < sc; ++dx) {
+                            int px = cx + col * sc + dx, py = y + row * sc + dy;
+                            // halo first (8-neighbour dark), then the glyph colour on top
+                            for (int oy = -1; oy <= 1; ++oy)
+                                for (int ox = -1; ox <= 1; ++ox)
+                                    put_px(img, W, H, px + ox, py + oy, 20, 20, 20);
+                        }
+        // second pass: the bright glyph over the halo
+        for (int col = 0; col < 5; ++col)
+            for (int row = 0; row < 7; ++row)
+                if (gly[col] & (1u << row))
+                    for (int dy = 0; dy < sc; ++dy)
+                        for (int dx = 0; dx < sc; ++dx)
+                            put_px(img, W, H, cx + col * sc + dx, y + row * sc + dy, r, g, b);
+        cx += 6 * sc;  // 5px glyph + 1px space
+    }
+    return cx;
+}
+
+void draw_line(std::vector<unsigned char>& img, int W, int H, int x0, int y0, int x1, int y1,
+               unsigned char r, unsigned char g, unsigned char b, int thick = 1) {
+    int dx = std::abs(x1 - x0), dy = -std::abs(y1 - y0);
+    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx + dy;
+    while (true) {
+        for (int oy = 0; oy < thick; ++oy)
+            for (int ox = 0; ox < thick; ++ox) put_px(img, W, H, x0 + ox, y0 + oy, r, g, b);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+void fill_disc(std::vector<unsigned char>& img, int W, int H, int cx, int cy, int rad,
+               unsigned char r, unsigned char g, unsigned char b) {
+    for (int y = -rad; y <= rad; ++y)
+        for (int x = -rad; x <= rad; ++x)
+            if (x * x + y * y <= rad * rad) put_px(img, W, H, cx + x, cy + y, r, g, b);
+}
+
+// A face callout the renderer overlays: a world anchor (face centroid) + outward normal (for
+// back-face culling) + the label text + its colour.
+struct RenderLabel {
+    RV3 anchor;
+    RV3 normal;
+    std::string text;
+    unsigned char col[3];
+};
+
+// Tint a lit face colour toward its principal-orientation hue when its normal is strongly
+// axis-aligned (a flat principal face); curved / oblique faces are left neutral. Returns true
+// and writes the tint when aligned. Hues match the gizmo: X=red, Y=green, Z=blue, with the
+// negative side a distinct sibling (front=-Y yellow vs back=+Y green; left=-X orange vs right
+// =+X red; top=+Z blue vs bottom=-Z teal).
+bool orient_tint(double nx, double ny, double nz, unsigned char out[3]) {
+    double ax = std::abs(nx), ay = std::abs(ny), az = std::abs(nz);
+    double m = std::max({ax, ay, az});
+    if (m < 0.92) return false;  // not flat-on a principal axis -> leave neutral
+    if (az == m) { if (nz > 0) { out[0]=90; out[1]=140; out[2]=225; }   // top +Z blue
+                   else        { out[0]=70; out[1]=175; out[2]=185; } } // bottom -Z teal
+    else if (ay == m) { if (ny > 0) { out[0]=95; out[1]=185; out[2]=95; }   // back +Y green
+                        else        { out[0]=215; out[1]=200; out[2]=70; } } // front -Y yellow
+    else { if (nx > 0) { out[0]=220; out[1]=80; out[2]=80; }   // right +X red
+           else        { out[0]=225; out[1]=140; out[2]=70; } } // left -X orange
+    return true;
+}
+
 bool render_iso_png(const std::vector<aicm::AicmBody>& bodies, const std::string& out_path,
+                    const std::vector<RenderLabel>& labels = {},
                     int W = 512, int H = 400) {
     RV3 lo{1e30, 1e30, 1e30}, hi{-1e30, -1e30, -1e30};
     bool any = false;
@@ -3714,9 +3854,20 @@ bool render_iso_png(const std::vector<aicm::AicmBody>& bodies, const std::string
             RV3 w2{b.pos[3 * i2], b.pos[3 * i2 + 1], b.pos[3 * i2 + 2]};
             RV3 fn = rnorm(rcross(rsub(w1, w0), rsub(w2, w0)));
             double lam = 0.35 + 0.65 * std::max(0.0, std::abs(rdot(fn, light)));
-            unsigned char R = (unsigned char)std::min(255.0, br * 255 * lam);
-            unsigned char G = (unsigned char)std::min(255.0, bg * 255 * lam);
-            unsigned char B = (unsigned char)std::min(255.0, bb * 255 * lam);
+            // Orientation colour-coding: blend a flat principal face toward its direction hue
+            // (curved/oblique faces stay the neutral body colour) so the vision model can read
+            // which way each face points at a glance.
+            double cr = br, cg = bg, cb = bb;
+            unsigned char tint[3];
+            if (orient_tint(fn.x, fn.y, fn.z, tint)) {
+                const double mix = 0.55;
+                cr = (1 - mix) * br + mix * (tint[0] / 255.0);
+                cg = (1 - mix) * bg + mix * (tint[1] / 255.0);
+                cb = (1 - mix) * bb + mix * (tint[2] / 255.0);
+            }
+            unsigned char R = (unsigned char)std::min(255.0, cr * 255 * lam);
+            unsigned char G = (unsigned char)std::min(255.0, cg * 255 * lam);
+            unsigned char B = (unsigned char)std::min(255.0, cb * 255 * lam);
             double su0, sv0, su1, sv1, su2, sv2, d0, d1, d2, pu, pv;
             proj(w0.x, w0.y, w0.z, pu, pv, d0); toScreen(pu, pv, su0, sv0);
             proj(w1.x, w1.y, w1.z, pu, pv, d1); toScreen(pu, pv, su1, sv1);
@@ -3747,6 +3898,42 @@ bool render_iso_png(const std::vector<aicm::AicmBody>& bodies, const std::string
         }
     }
     if (painted < (long)(W * H) / 400) return false;  // ~nothing drawn — treat as failed render
+
+    // ---- annotation overlay (drawn ON TOP of the shaded mesh) ----------------------------
+    // (a) named-face CALLOUTS: a coloured dot + leader + text at each visible principal face's
+    //     screen position, using the SAME words the model addresses geometry with (TOP/FRONT
+    //     /RIGHT/...). Back-facing labels (normal pointing away from the camera) are culled.
+    for (const RenderLabel& lb : labels) {
+        if (rdot(lb.normal, d) < 0.15) continue;  // face points away from camera -> skip
+        double pu, pv, pd, sx, sy;
+        proj(lb.anchor.x, lb.anchor.y, lb.anchor.z, pu, pv, pd);
+        toScreen(pu, pv, sx, sy);
+        int ix = (int)std::lround(sx), iy = (int)std::lround(sy);
+        fill_disc(img, W, H, ix, iy, 4, 20, 20, 20);
+        fill_disc(img, W, H, ix, iy, 3, lb.col[0], lb.col[1], lb.col[2]);
+        // place the text just up-right of the dot, nudged inside the frame
+        int tx = std::min(ix + 7, W - (int)lb.text.size() * 12 - 2);
+        int ty = std::max(2, iy - 8);
+        blit_text(img, W, H, tx, ty, lb.text, 2, lb.col[0], lb.col[1], lb.col[2]);
+    }
+    // (b) ORIENTATION GIZMO bottom-left: the three world axes drawn through the SAME camera so
+    //     the model can read which way is +X/+Y/+Z (and thus right/back/top). Fixed screen
+    //     anchor; only the projected screen direction of each axis is used.
+    {
+        int ox = 40, oy = H - 36;
+        const int axlen = 26;
+        struct Ax { RV3 v; unsigned char c[3]; const char* n; };
+        Ax axes[3] = {{{1,0,0},{220,80,80},"X"}, {{0,1,0},{95,185,95},"Y"}, {{0,0,1},{90,140,225},"Z"}};
+        for (const Ax& a : axes) {
+            double su = rdot(a.v, r), sv = rdot(a.v, u);   // axis dir in screen space
+            int ex = ox + (int)std::lround(su * axlen);
+            int ey = oy - (int)std::lround(sv * axlen);
+            draw_line(img, W, H, ox, oy, ex, ey, a.c[0], a.c[1], a.c[2], 2);
+            blit_text(img, W, H, ex - 3, ey - 6, a.n, 2, a.c[0], a.c[1], a.c[2]);
+        }
+        fill_disc(img, W, H, ox, oy, 3, 30, 30, 30);
+    }
+
     std::string png = encode_png_rgb(W, H, img);
     std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
     if (!f) return false;
@@ -3808,7 +3995,49 @@ json doc_render_png(const std::string& doc_id, const std::string& out_path) {
         Session& s = require_session(doc_id);
         std::vector<aicm::AicmBody> bodies = tessellate_session_bodies(s);
         if (bodies.empty()) return json{{"ok", false}, {"reason", "no bodies"}};
-        bool ok = render_iso_png(bodies, out_path);
+        // Named-face CALLOUTS (part docs only): label each principal face with the SAME word
+        // the model queries geometry by, so the vision reviewer can SEE and reference faces
+        // concretely (TOP/FRONT/RIGHT/...) instead of guessing at a grey blob. Fail-soft.
+        std::vector<RenderLabel> labels;
+        if (!s.is_assembly()) {
+            try {
+                CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+                if (!r.shapes.empty()) {
+                    const TopoDS_Shape& shp = r.shapes.back();
+                    struct Dir { const char* side; const char* label;
+                                 RV3 nrm; unsigned char c[3]; };
+                    const Dir dirs[] = {
+                        {"top",    "TOP",    {0, 0, 1},  {90, 140, 225}},
+                        {"bottom", "BOTTOM", {0, 0, -1}, {70, 175, 185}},
+                        {"front",  "FRONT",  {0, -1, 0}, {215, 200, 70}},
+                        {"back",   "BACK",   {0, 1, 0},  {95, 185, 95}},
+                        {"right",  "RIGHT",  {1, 0, 0},  {220, 80, 80}},
+                        {"left",   "LEFT",   {-1, 0, 0}, {225, 140, 70}},
+                    };
+                    for (const Dir& dd : dirs) {
+                        aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(
+                            shp, json{{"of", "face"}, {"side", dd.side}});
+                        if (!qp.error.empty() || !qp.selectors.is_array() ||
+                            qp.selectors.empty())
+                            continue;
+                        const json& sel = qp.selectors.front();
+                        if (!sel.contains("centroid") || !sel.at("centroid").is_array() ||
+                            sel.at("centroid").size() < 3)
+                            continue;
+                        const json& ct = sel.at("centroid");
+                        RenderLabel L;
+                        L.anchor = {ct[0].get<double>(), ct[1].get<double>(),
+                                    ct[2].get<double>()};
+                        L.normal = dd.nrm;
+                        L.text = dd.label;
+                        L.col[0] = dd.c[0]; L.col[1] = dd.c[1]; L.col[2] = dd.c[2];
+                        labels.push_back(L);
+                    }
+                }
+            } catch (...) {
+            }
+        }
+        bool ok = render_iso_png(bodies, out_path, labels);
         return json{{"ok", ok}, {"path", ok ? out_path : std::string()}};
     } catch (...) {
         return json{{"ok", false}, {"reason", "render exception"}};
@@ -3910,61 +4139,100 @@ json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3)
     if (r.shapes.empty())
         throw OpError("invalid_op", "document has no bodies to evaluate", {{"doc_id", doc_id}});
 
-    const TopoDS_Shape* shape = nullptr;
-    if (body_id >= 1) {
-        if (body_id > static_cast<int>(r.shapes.size()))
-            throw OpError("invalid_op", "body_id " + std::to_string(body_id) + " out of range",
-                          {{"reason", "bad body_id"}});
-        shape = &r.shapes[static_cast<std::size_t>(body_id - 1)];
-    } else {
-        shape = &r.shapes.back();
-    }
-
     const double density_g_mm3 = density_g_cm3 * 1e-3;  // 1 g/cm³ = 1e-3 g/mm³
 
-    if (eval_is_surface_shape(*shape)) return eval_surface_props(*shape, density_g_cm3);
-
-    GProp_GProps props;
-    BRepGProp::VolumeProperties(*shape, props);  // unit density -> Mass() is volume in mm³
-    const double volume_mm3 = props.Mass();
-    const double mass_g = volume_mm3 * density_g_mm3;
-    gp_Pnt com = props.CentreOfMass();
-    const gp_Mat im = props.MatrixOfInertia();  // gp_Mat is 1-based, row-major access
-
-    std::array<double, 9> inertia{};
-    for (int row = 1; row <= 3; ++row)
-        for (int col = 1; col <= 3; ++col)
-            inertia[static_cast<std::size_t>((row - 1) * 3 + (col - 1))] =
-                im.Value(row, col) * density_g_mm3;
-
-    // Principal moments + axes: eigendecomposition of the (symmetric) inertia tensor. Eigen's
-    // SelfAdjointEigenSolver yields ascending eigenvalues + orthonormal eigenvectors as COLUMNS
-    // — matching numpy.linalg.eigh. Symmetrise first to kill fp asymmetry. NOTE: eigenvector
-    // SIGN is library-arbitrary, so principal_axes match the oracle only up to a ± per axis.
-    Eigen::Matrix3d M;
-    for (int a = 0; a < 3; ++a)
-        for (int b = 0; b < 3; ++b) M(a, b) = inertia[static_cast<std::size_t>(a * 3 + b)];
-    M = 0.5 * (M + M.transpose());
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(M);
-    const Eigen::Vector3d evals = es.eigenvalues();
-    const Eigen::Matrix3d evecs = es.eigenvectors();
-
-    json principal_moments = json::array();
-    for (int i = 0; i < 3; ++i) principal_moments.push_back(evals(i));
-    json principal_axes = json::array();  // principal_axes[i] = eigenvector column i
-    for (int i = 0; i < 3; ++i)
-        principal_axes.push_back({evecs(0, i), evecs(1, i), evecs(2, i)});
-
-    return json{
-        {"volume_mm3", volume_mm3},
-        {"mass_g", mass_g},
-        {"com", {com.X(), com.Y(), com.Z()}},
-        {"inertia", {inertia[0], inertia[1], inertia[2], inertia[3], inertia[4], inertia[5],
-                     inertia[6], inertia[7], inertia[8]}},
-        {"principal_moments", principal_moments},
-        {"principal_axes", principal_axes},
-        {"material", {{"density_g_cm3", density_g_cm3}}},
+    // Build the mass-props JSON block from a computed GProp_GProps (volume, mass, COM, the inertia
+    // tensor about the global origin, and its principal moments/axes). Shared by the single-body
+    // and the per-body assembly paths.
+    auto props_json = [&](const GProp_GProps& props) -> json {
+        const double volume_mm3 = props.Mass();
+        const double mass_g = volume_mm3 * density_g_mm3;
+        gp_Pnt com = props.CentreOfMass();
+        const gp_Mat im = props.MatrixOfInertia();  // gp_Mat is 1-based, row-major access
+        std::array<double, 9> inertia{};
+        for (int row = 1; row <= 3; ++row)
+            for (int col = 1; col <= 3; ++col)
+                inertia[static_cast<std::size_t>((row - 1) * 3 + (col - 1))] =
+                    im.Value(row, col) * density_g_mm3;
+        // Principal moments + axes: eigendecomposition of the (symmetric) inertia tensor. Eigen's
+        // SelfAdjointEigenSolver yields ascending eigenvalues + orthonormal eigenvectors as COLUMNS
+        // — matching numpy.linalg.eigh. Symmetrise first to kill fp asymmetry. NOTE: eigenvector
+        // SIGN is library-arbitrary, so principal_axes match the oracle only up to a ± per axis.
+        Eigen::Matrix3d M;
+        for (int a = 0; a < 3; ++a)
+            for (int b = 0; b < 3; ++b) M(a, b) = inertia[static_cast<std::size_t>(a * 3 + b)];
+        M = 0.5 * (M + M.transpose());
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(M);
+        const Eigen::Vector3d evals = es.eigenvalues();
+        const Eigen::Matrix3d evecs = es.eigenvectors();
+        json principal_moments = json::array();
+        for (int i = 0; i < 3; ++i) principal_moments.push_back(evals(i));
+        json principal_axes = json::array();  // principal_axes[i] = eigenvector column i
+        for (int i = 0; i < 3; ++i)
+            principal_axes.push_back({evecs(0, i), evecs(1, i), evecs(2, i)});
+        return json{
+            {"volume_mm3", volume_mm3},
+            {"mass_g", mass_g},
+            {"com", {com.X(), com.Y(), com.Z()}},
+            {"inertia", {inertia[0], inertia[1], inertia[2], inertia[3], inertia[4], inertia[5],
+                         inertia[6], inertia[7], inertia[8]}},
+            {"principal_moments", principal_moments},
+            {"principal_axes", principal_axes},
+        };
     };
+
+    // Single explicit body, OR a single-body document: report that one body (legacy shape).
+    if (body_id >= 1 || r.shapes.size() == 1) {
+        const TopoDS_Shape* shape = nullptr;
+        if (body_id >= 1) {
+            if (body_id > static_cast<int>(r.shapes.size()))
+                throw OpError("invalid_op", "body_id " + std::to_string(body_id) + " out of range",
+                              {{"reason", "bad body_id"}});
+            shape = &r.shapes[static_cast<std::size_t>(body_id - 1)];
+        } else {
+            shape = &r.shapes.front();
+        }
+        if (eval_is_surface_shape(*shape)) return eval_surface_props(*shape, density_g_cm3);
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(*shape, props);  // unit density -> Mass() is volume in mm³
+        json out = props_json(props);
+        out["body_count"] = 1;
+        out["material"] = {{"density_g_cm3", density_g_cm3}};
+        return out;
+    }
+
+    // MULTI-BODY (body_id <= 0): per-body breakdown PLUS the combined assembly total. Previously
+    // this returned only the LAST body, silently under-reporting a multi-body doc. The top-level
+    // fields now carry the TOTAL (so the in-app Mass Properties dialog shows the whole assembly);
+    // `bodies[]` lists each solid. GProp_GProps::Add combines correctly (same origin reference).
+    json bodies = json::array();
+    GProp_GProps total;
+    bool have_total = false;
+    for (std::size_t i = 0; i < r.shapes.size(); ++i) {
+        const TopoDS_Shape& shape = r.shapes[i];
+        json entry;
+        entry["body_id"] = static_cast<int>(i + 1);
+        if (eval_is_surface_shape(shape)) {
+            entry["surface"] = true;
+            json sp = eval_surface_props(shape, density_g_cm3);
+            for (auto it = sp.begin(); it != sp.end(); ++it) entry[it.key()] = it.value();
+        } else {
+            GProp_GProps props;
+            BRepGProp::VolumeProperties(shape, props);
+            json pj = props_json(props);
+            for (auto it = pj.begin(); it != pj.end(); ++it) entry[it.key()] = it.value();
+            total.Add(props);  // accumulate the assembly total (volume-weighted COM + inertia)
+            have_total = true;
+        }
+        bodies.push_back(std::move(entry));
+    }
+
+    json out = have_total ? props_json(total)
+                          : json{{"volume_mm3", 0.0}, {"mass_g", 0.0}};
+    out["body_count"] = static_cast<int>(r.shapes.size());
+    out["bodies"] = std::move(bodies);
+    out["material"] = {{"density_g_cm3", density_g_cm3}};
+    return out;
 }
 
 // ----------------------------------------------------------------- weldment cut list
@@ -5180,7 +5448,8 @@ json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double d
     return out;
 }
 
-json doc_export_file(const std::string& doc_id, const std::string& path, const std::string& fmt) {
+json doc_export_file(const std::string& doc_id, const std::string& path, const std::string& fmt,
+                     double lin_deflection, double ang_deflection, bool relative, bool ascii) {
     std::lock_guard<std::mutex> lk(g_mtx);
     Session& s = require_session(doc_id);
     if (path.empty())
@@ -5191,8 +5460,78 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
     if (r.shapes.empty())
         throw OpError("export_failed", "export_file: document has no bodies to export",
                       {{"doc_id", doc_id}});
-    std::string out = export_bodies(r.shapes, path, fmt);  // throws export_failed on a writer error
-    return json{{"path", out}};
+    TessOptions tess;
+    if (lin_deflection > 0.0) tess.lin_deflection = lin_deflection;
+    if (ang_deflection > 0.0) tess.ang_deflection = ang_deflection;
+    tess.relative = relative;
+    tess.ascii = ascii;
+    const std::size_t expected_solids = r.shapes.size();
+    std::string out = export_bodies(r.shapes, path, fmt, tess);  // throws on a writer error
+
+    // Real metadata + a flush check: never report success on a missing/empty (truncated) file.
+    std::error_code fec;
+    const std::uintmax_t bytes = std::filesystem::exists(out, fec)
+                                     ? std::filesystem::file_size(out, fec) : 0;
+    if (bytes == 0)
+        throw OpError("export_failed", "export_file: wrote 0 bytes (file missing or truncated)",
+                      {{"path", out}, {"format", fmt}});
+
+    json meta{{"path", out}, {"format", fmt}, {"bytes", static_cast<double>(bytes)},
+              {"expected_solids", static_cast<int>(expected_solids)}};
+
+    // Round-trip B-rep formats: re-read with the SAME kernel and confirm the solids survived and
+    // are topologically valid BEFORE returning success. This catches the "STEP/IGES won't open"
+    // class (truncated/garbled writes, dropped solids) loudly instead of a false ok:true. Mesh
+    // formats have no solids to recover, so we report bytes only.
+    const std::string f = fmt;
+    const bool is_brep_fmt = (f == "step" || f == "stp" || f == "iges" || f == "igs" ||
+                              f == "brep" || f == "step+" || f == "stepplus");
+    if (is_brep_fmt) {
+        try {
+            auto reread = import_bodies(out, (f == "stp") ? "step" : (f == "igs") ? "iges" : f);
+            std::size_t valid = 0;
+            for (const auto& nb : reread)
+                if (!nb.second.IsNull() && BRepCheck_Analyzer(nb.second).IsValid()) ++valid;
+            meta["solid_count"] = static_cast<int>(reread.size());
+            meta["valid_solids"] = static_cast<int>(valid);
+            // IGES is a face-soup format: solids may sew into fewer/zero TopAbs_SOLIDs, so we
+            // only HARD-fail step/brep on a solid-count mismatch; IGES just reports what it read.
+            const bool count_ok = (f == "iges" || f == "igs") ? (reread.size() > 0)
+                                                              : (reread.size() >= expected_solids);
+            meta["validated"] = (count_ok && valid == reread.size() && !reread.empty());
+            if (!meta["validated"].get<bool>())
+                throw OpError("export_failed",
+                              "export_file: wrote " + out + " but re-reading it recovered " +
+                                  std::to_string(reread.size()) + "/" +
+                                  std::to_string(expected_solids) + " solids (" +
+                                  std::to_string(valid) + " valid) — the file is incomplete or "
+                                  "malformed and would not open elsewhere",
+                              {{"path", out}, {"format", fmt}});
+        } catch (const OpError&) {
+            throw;
+        } catch (const std::exception& e) {
+            throw OpError("export_failed",
+                          std::string("export_file: ") + out +
+                              " failed round-trip validation (not re-openable): " + e.what(),
+                          {{"path", out}, {"format", fmt}});
+        }
+    } else {
+        meta["validated"] = true;  // mesh formats: bytes>0 is the only integrity signal we have
+    }
+    return meta;
+}
+
+json doc_export_estimate(const std::string& doc_id, double lin_deflection, double ang_deflection,
+                         bool relative) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    TessOptions tess;
+    if (lin_deflection > 0.0) tess.lin_deflection = lin_deflection;
+    if (ang_deflection > 0.0) tess.ang_deflection = ang_deflection;
+    tess.relative = relative;
+    auto [tris, verts] = estimate_tessellation(r.shapes, tess);
+    return json{{"triangles", tris}, {"vertices", verts}, {"bodies", r.shapes.size()}};
 }
 
 json doc_import_file(const std::string& path, const std::string& into, bool as_solid,

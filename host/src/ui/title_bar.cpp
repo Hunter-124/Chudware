@@ -154,18 +154,26 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             // the dialog never re-enters this menu walk. (Drawing export stays on the 2D panel's own
             // DXF/PDF button — exportDrawing needs the drawing registry id, not this part doc.)
             const bool canExport3d = hasDoc && !st.activeTabIsDrawing() && !st.activeTabIsEcad();
+            // Mesh formats open the tessellation-options dialog first (quality preset +
+            // fine-tune); B-rep formats go straight to the native Save-As.
+            auto openMeshExport = [&st](const char* fmt) {
+                st.exportTess.open = true;
+                st.exportTess.fmt = fmt;
+                st.exportTess.estimateDirty = true;
+                st.exportTess.estimateValid = false;
+            };
             if (ImGui::BeginMenu("Export", canExport3d)) {
                 if (ImGui::MenuItem("STEP (.step)...")) st.requestExportFormat = "step";
                 if (ImGui::MenuItem("IGES (.iges)...")) st.requestExportFormat = "iges";
                 if (ImGui::MenuItem("BREP (.brep)...")) st.requestExportFormat = "brep";
                 ImGui::Separator();
                 // F4: mesh-lane exports (engine export_file accepts these format strings too).
-                if (ImGui::MenuItem("STL (.stl)..."))   st.requestExportFormat = "stl";
-                if (ImGui::MenuItem("OBJ (.obj)..."))   st.requestExportFormat = "obj";
-                if (ImGui::MenuItem("PLY (.ply)..."))   st.requestExportFormat = "ply";
-                if (ImGui::MenuItem("3MF (.3mf)..."))   st.requestExportFormat = "3mf";
-                if (ImGui::MenuItem("glTF (.gltf)...")) st.requestExportFormat = "gltf";
-                if (ImGui::MenuItem("GLB (.glb)..."))   st.requestExportFormat = "glb";
+                if (ImGui::MenuItem("STL (.stl)..."))   openMeshExport("stl");
+                if (ImGui::MenuItem("OBJ (.obj)..."))   openMeshExport("obj");
+                if (ImGui::MenuItem("PLY (.ply)..."))   openMeshExport("ply");
+                if (ImGui::MenuItem("3MF (.3mf)..."))   openMeshExport("3mf");
+                if (ImGui::MenuItem("glTF (.gltf)...")) openMeshExport("gltf");
+                if (ImGui::MenuItem("GLB (.glb)..."))   openMeshExport("glb");
                 ImGui::EndMenu();
             }
             ImGui::Separator();

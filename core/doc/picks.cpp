@@ -392,16 +392,38 @@ struct QCand {
     TopoDS_Shape shp;
     Eigen::Vector3d centroid{0, 0, 0};
     std::optional<Eigen::Vector3d> axis;
+    std::optional<double> radius;  // cylinder face / circle edge radius (for inner/outer)
     std::string surf;
     double measure = 0.0;
 };
 
-// Parse a signed-axis token ("+z","-x",...) into a unit direction; nullopt if invalid.
-std::optional<Eigen::Vector3d> parse_side(const std::string& s) {
+// ASCII-lowercase a copy of `raw` (the query vocabulary is case-insensitive so a model
+// can write "Top"/"FRONT"/"Largest" and still hit).
+std::string lc(const std::string& raw) {
+    std::string s;
+    s.reserve(raw.size());
+    for (char c : raw) s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    return s;
+}
+
+// Parse a `side` token into a unit world direction. Accepts the canonical signed-axis
+// tokens (+x/-x/+y/-y/+z/-z) AND the plain direction WORDS a spatially-unaware model
+// reaches for first (top/bottom/up/down/left/right/front/back/rear). The word->axis
+// mapping matches the host's named-view convention (viewport_panel.cpp kAx): top=+Z,
+// bottom=-Z, right=+X, left=-X, front=-Y, back=+Y — so "the top face" and "side:+z"
+// resolve to the same set. nullopt for anything unrecognised.
+std::optional<Eigen::Vector3d> parse_side(const std::string& raw) {
+    const std::string s = lc(raw);
+    if (s == "top"    || s == "up")             return Eigen::Vector3d(0, 0, 1);
+    if (s == "bottom" || s == "down")           return Eigen::Vector3d(0, 0, -1);
+    if (s == "right")                           return Eigen::Vector3d(1, 0, 0);
+    if (s == "left")                            return Eigen::Vector3d(-1, 0, 0);
+    if (s == "front")                           return Eigen::Vector3d(0, -1, 0);
+    if (s == "back"   || s == "rear")           return Eigen::Vector3d(0, 1, 0);
     if (s.size() < 2) return std::nullopt;
     double sign = (s[0] == '+') ? 1.0 : (s[0] == '-') ? -1.0 : 0.0;
     if (sign == 0.0) return std::nullopt;
-    char ax = static_cast<char>(std::tolower(static_cast<unsigned char>(s[1])));
+    char ax = s[1];
     Eigen::Vector3d v(0, 0, 0);
     if (ax == 'x') v.x() = sign;
     else if (ax == 'y') v.y() = sign;
@@ -410,9 +432,44 @@ std::optional<Eigen::Vector3d> parse_side(const std::string& s) {
     return v;
 }
 
+// Canonicalise a `surf` token into a kernel surface/curve name. Accepts the everyday
+// words a model uses ("flat"/"round"/"straight") resolved against whether we're filtering
+// faces or edges, plus every canonical kernel token unchanged. Returns "" for an
+// unrecognised token (the caller turns that into a teaching error).
+std::string canon_surf(const std::string& raw, bool want_face) {
+    const std::string s = lc(raw);
+    if (want_face) {
+        if (s == "flat"  || s == "planar")               return "plane";
+        if (s == "round" || s == "cylindrical")          return "cylinder";
+    } else {
+        if (s == "straight")                             return "line";
+        if (s == "round" || s == "curved")               return "circle";
+    }
+    // Canonical kernel tokens pass through unchanged (preserves prior behaviour).
+    static const char* kKnown[] = {"line", "circle", "ellipse", "bspline", "plane",
+                                   "cylinder", "cone", "sphere", "torus", "other"};
+    for (const char* k : kKnown)
+        if (s == k) return s;
+    return "";
+}
+
 std::optional<Eigen::Vector3d> json_vec3(const nlohmann::json& j) {
     if (!j.is_array() || j.size() < 3) return std::nullopt;
     return Eigen::Vector3d(j[0].get<double>(), j[1].get<double>(), j[2].get<double>());
+}
+
+// Parse a `parallel`/`perpendicular` value: either an explicit [x,y,z] OR a string axis
+// word ("x"/"y"/"z", "+z", "vertical"). Sign is irrelevant downstream (the filter uses
+// |dot|), so we only need the axis. Lets a model write parallel:"z" for "vertical edges".
+std::optional<Eigen::Vector3d> parse_axis_vec(const nlohmann::json& j) {
+    if (j.is_array()) return json_vec3(j);
+    if (j.is_string()) {
+        const std::string s = lc(j.get<std::string>());
+        if (s == "x" || s == "+x" || s == "-x")                return Eigen::Vector3d(1, 0, 0);
+        if (s == "y" || s == "+y" || s == "-y")                return Eigen::Vector3d(0, 1, 0);
+        if (s == "z" || s == "+z" || s == "-z" || s == "vertical") return Eigen::Vector3d(0, 0, 1);
+    }
+    return std::nullopt;
 }
 
 }  // namespace
@@ -450,9 +507,11 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
             try {
                 if (st == GeomAbs_Plane) c.axis = Eigen::Vector3d(ad.Plane().Axis().Direction().X(),
                     ad.Plane().Axis().Direction().Y(), ad.Plane().Axis().Direction().Z());
-                else if (st == GeomAbs_Cylinder) c.axis = Eigen::Vector3d(ad.Cylinder().Axis().Direction().X(),
-                    ad.Cylinder().Axis().Direction().Y(), ad.Cylinder().Axis().Direction().Z());
-                else if (st == GeomAbs_Cone) c.axis = Eigen::Vector3d(ad.Cone().Axis().Direction().X(),
+                else if (st == GeomAbs_Cylinder) {
+                    c.axis = Eigen::Vector3d(ad.Cylinder().Axis().Direction().X(),
+                        ad.Cylinder().Axis().Direction().Y(), ad.Cylinder().Axis().Direction().Z());
+                    c.radius = ad.Cylinder().Radius();  // inner/outer discriminator
+                } else if (st == GeomAbs_Cone) c.axis = Eigen::Vector3d(ad.Cone().Axis().Direction().X(),
                     ad.Cone().Axis().Direction().Y(), ad.Cone().Axis().Direction().Z());
             } catch (const Standard_Failure&) { c.axis = std::nullopt; }
         } else {
@@ -464,8 +523,11 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
             try {
                 if (ct == GeomAbs_Line) c.axis = Eigen::Vector3d(ad.Line().Direction().X(),
                     ad.Line().Direction().Y(), ad.Line().Direction().Z());
-                else if (ct == GeomAbs_Circle) c.axis = Eigen::Vector3d(ad.Circle().Axis().Direction().X(),
-                    ad.Circle().Axis().Direction().Y(), ad.Circle().Axis().Direction().Z());
+                else if (ct == GeomAbs_Circle) {
+                    c.axis = Eigen::Vector3d(ad.Circle().Axis().Direction().X(),
+                        ad.Circle().Axis().Direction().Y(), ad.Circle().Axis().Direction().Z());
+                    c.radius = ad.Circle().Radius();  // inner/outer discriminator
+                }
             } catch (const Standard_Failure&) { c.axis = std::nullopt; }
         }
         c.measure = props.Mass();
@@ -477,9 +539,18 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
     // 2) boolean filters: surf, parallel, perpendicular.
     std::vector<const QCand*> keep;
     keep.reserve(cands.size());
-    const std::string surf_f = q.value("surf", std::string());
-    std::optional<Eigen::Vector3d> par = q.contains("parallel") ? json_vec3(q["parallel"]) : std::nullopt;
-    std::optional<Eigen::Vector3d> per = q.contains("perpendicular") ? json_vec3(q["perpendicular"]) : std::nullopt;
+    std::string surf_f;
+    if (q.contains("surf") && q["surf"].is_string()) {
+        surf_f = canon_surf(q["surf"].get<std::string>(), want_face);
+        if (surf_f.empty()) {
+            out.error = "geom query: unknown 'surf' '" + q["surf"].get<std::string>() +
+                        (want_face ? "' (faces: flat/round or plane/cylinder/cone/sphere/torus)"
+                                   : "' (edges: straight/round or line/circle/ellipse/bspline)");
+            return out;
+        }
+    }
+    std::optional<Eigen::Vector3d> par = q.contains("parallel") ? parse_axis_vec(q["parallel"]) : std::nullopt;
+    std::optional<Eigen::Vector3d> per = q.contains("perpendicular") ? parse_axis_vec(q["perpendicular"]) : std::nullopt;
     if (par) par->normalize();
     if (per) per->normalize();
     for (const QCand& c : cands) {
@@ -495,16 +566,71 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
         keep.push_back(&c);
     }
 
-    // 3) side: keep only the extreme-centroid set along the signed axis.
+    // 3) side: keep only the extreme-centroid set along the signed axis (or direction word).
     if (q.contains("side") && q["side"].is_string()) {
         std::optional<Eigen::Vector3d> dir = parse_side(q["side"].get<std::string>());
-        if (!dir) { out.error = "geom query: bad 'side' (use +x/-x/+y/-y/+z/-z)"; return out; }
+        if (!dir) {
+            out.error = "geom query: bad 'side' '" + q["side"].get<std::string>() +
+                        "' (use top/bottom/left/right/front/back or +x/-x/+y/-y/+z/-z)";
+            return out;
+        }
         double best = -std::numeric_limits<double>::infinity();
         for (const QCand* c : keep) best = std::max(best, c->centroid.dot(*dir));
         std::vector<const QCand*> ext;
         for (const QCand* c : keep)
             if (c->centroid.dot(*dir) >= best - tol) ext.push_back(c);
         keep.swap(ext);
+    }
+
+    // 3b) pick: keep the extreme set. largest/smallest face by area, longest/shortest
+    //     edge by length — a model with no spatial sense can say "the largest face"
+    //     instead of computing areas. inner/outer (also innermost/outermost/bore) rank by
+    //     RADIUS among round candidates, the plain-language way to tell coaxial geometry
+    //     apart: the inner vs outer wall of a tube, the bore vs the rim. Near-equal values
+    //     co-rank (a relative tolerance) so a symmetric body keeps the opposite pair;
+    //     combine with `side` or add count:1 to force a single result.
+    if (q.contains("pick") && q["pick"].is_string()) {
+        const std::string p = lc(q["pick"].get<std::string>());
+        const bool want_max = (p == "largest" || p == "biggest" || p == "longest");
+        const bool want_min = (p == "smallest" || p == "shortest");
+        const bool want_outer = (p == "outer" || p == "outermost" || p == "outside");
+        const bool want_inner = (p == "inner" || p == "innermost" || p == "inside" ||
+                                 p == "bore");
+        if (!want_max && !want_min && !want_outer && !want_inner) {
+            out.error = "geom query: unknown 'pick' '" + p +
+                        "' (use largest/smallest, longest/shortest, or inner/outer for "
+                        "coaxial round faces/edges)";
+            return out;
+        }
+        if (want_inner || want_outer) {
+            // Rank by radius; ignore candidates with no radius (planes/lines) entirely.
+            std::vector<const QCand*> round;
+            for (const QCand* c : keep) if (c->radius) round.push_back(c);
+            if (round.empty()) {
+                out.error = "geom query: pick '" + p +
+                            "' needs round faces/edges (cylinders or circles); none matched";
+                return out;
+            }
+            double ext = want_outer ? -std::numeric_limits<double>::infinity()
+                                    :  std::numeric_limits<double>::infinity();
+            for (const QCand* c : round)
+                ext = want_outer ? std::max(ext, *c->radius) : std::min(ext, *c->radius);
+            const double rtol = std::max(std::abs(ext) * 1e-3, 1e-9);
+            std::vector<const QCand*> sel;
+            for (const QCand* c : round)
+                if (std::abs(*c->radius - ext) <= rtol) sel.push_back(c);
+            keep.swap(sel);
+        } else if (!keep.empty()) {
+            double ext = want_max ? -std::numeric_limits<double>::infinity()
+                                  :  std::numeric_limits<double>::infinity();
+            for (const QCand* c : keep)
+                ext = want_max ? std::max(ext, c->measure) : std::min(ext, c->measure);
+            const double mtol = std::max(std::abs(ext) * 1e-3, 1e-9);
+            std::vector<const QCand*> sel;
+            for (const QCand* c : keep)
+                if (std::abs(c->measure - ext) <= mtol) sel.push_back(c);
+            keep.swap(sel);
+        }
     }
 
     // 4) near: sort by centroid distance, keep nearest `count` (default 1).

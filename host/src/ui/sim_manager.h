@@ -62,13 +62,23 @@ struct Study {
     std::string materialKey;        // material key (e.g. "steel_1018"); "" = none
     SimWell fixtures;
     std::vector<SimLoad> loads;
-    float meshDensity = 0.5f;
+    // Mesh controls. Fineness (0=coarse..1=fine) is the primary knob; the rest are
+    // advanced overrides. See core/sim/mesher.h MeshOptions.
+    float meshFineness = 0.5f;      // Coarse..Fine — base element size from bbox diagonal
+    bool  meshHex = false;          // structured hexahedral mesh (box/prismatic parts only)
+    bool  meshCurvature = true;     // curvature-adaptive refinement (holes/fillets)
+    float meshCurvPerCircle = 12.0f;// advanced: elements per full turn of curvature
     int meshOrder = 2;              // 1 = draft (linear tet4), 2 = high quality (quadratic tet10).
                                     // 2nd order captures bending accurately (linear tets shear-lock).
-    float meshTargetMm = 0.0f;      // 0 = auto from density
-    float meshMinMm = 0.0f;         // 0 = auto
-    float meshMaxMm = 0.0f;         // 0 = auto
-    bool meshOptimize = true;       // gmsh post-generation optimization pass
+    float meshTargetMm = 0.0f;      // advanced: explicit element size override (0 = auto)
+    float meshMinMm = 0.0f;         // advanced: min element size override (0 = auto)
+    int   meshAlgo = 1;             // advanced 3D algorithm: 1 = Delaunay, 10 = HXT
+    bool meshOptimize = true;       // gmsh + Netgen optimization pass
+    // Mesh quality readout from the last Preview (transient; not persisted).
+    bool  meshHasQuality = false;
+    float meshAspectMin = 0, meshAspectAvg = 0, meshAspectMax = 0;
+    float meshJacobianMin = 0, meshPctPoor = 0;
+    std::vector<float> meshAspectHist;  // 10 buckets
     int nModes = 6;                 // modal
 
     // Static: which failure theory drives the headline FoS + the FoS plot field.

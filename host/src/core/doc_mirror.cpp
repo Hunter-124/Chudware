@@ -637,14 +637,34 @@ std::string DocMirror::exportDrawing(WorkerClient& w, const std::string& drawing
 // A fresh compile + B-rep/mesh write can be slow, so it gets the same 60s headroom they use.
 std::string DocMirror::exportFile(WorkerClient& w, const std::string& docId,
                                   const std::string& path, const std::string& format,
-                                  std::string& err) {
+                                  std::string& err, double linDeflection, double angDeflection,
+                                  bool relative, bool ascii) {
     if (docId.empty()) { err = "no document open"; return {}; }
     nlohmann::json res;
     if (!w.call("export_file",
-                {{"doc_id", docId}, {"path", path}, {"format", format}}, res, err, 60000))
+                {{"doc_id", docId}, {"path", path}, {"format", format},
+                 {"lin_deflection", linDeflection}, {"ang_deflection", angDeflection},
+                 {"relative", relative}, {"ascii", ascii}},
+                res, err, 60000))
         return {};
     if (res.contains("code")) { err = jstr(res, "message"); return {}; }
     return jstr(res, "path");
+}
+
+bool DocMirror::exportEstimate(WorkerClient& w, const std::string& docId, double linDeflection,
+                               double angDeflection, bool relative, long long& tris,
+                               long long& verts, std::string& err) {
+    if (docId.empty()) { err = "no document open"; return false; }
+    nlohmann::json res;
+    if (!w.call("export_tess_estimate",
+                {{"doc_id", docId}, {"lin_deflection", linDeflection},
+                 {"ang_deflection", angDeflection}, {"relative", relative}},
+                res, err, 60000))
+        return false;
+    if (res.contains("code")) { err = jstr(res, "message"); return false; }
+    tris = res.value("triangles", 0LL);
+    verts = res.value("vertices", 0LL);
+    return true;
 }
 
 }  // namespace core

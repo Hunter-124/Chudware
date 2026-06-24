@@ -3,6 +3,11 @@ Dimension params are objects: {"value": <num>, "expr": null}. A later op refers 
 created earlier IN THE SAME ARRAY as "$<index>" (0-based op position); refer to existing tree
 features by their id (e.g. "f1").
 
+NATIVE FORMAT — AI-CAD's native, editable file is .step+. It stores the WHOLE parametric feature
+tree plus its simulation studies (and any 2D drawings) in one container the app reopens fully
+editable. Save deliverables as .step+ so the user keeps an editable part; a plain STEP/STL is a
+flattened export (geometry only — no feature history, no studies).
+
 PICK THE RIGHT FEATURE — model like a person would, with standard editable features. Do NOT
 approximate a curved or organic body with a stack of boxes.
   - Round/curved body that is the same all the way around an axis (bottle, vase, fuselage, nozzle,
@@ -25,10 +30,20 @@ PRIMITIVES — box/cylinder/sphere/cone/torus. Centered on the origin by default
 "boss"|"cut" and `merge` combine it with the running body (a cylinder mode:"cut" bores a hole).
   box {length,width,height}   cylinder {radius,height}   sphere {radius}
   cone {r1,r2,height}         torus {major_r,minor_r}     +optional {at:[x,y,z], centered:false}
+  RELATIONAL `at` — instead of coordinates, `at` can be a face/edge QUERY: the primitive
+  centres on that geometry. `at:{"of":"face","side":"top"}` = on the top face. Add
+  `at_offset:[dx,dy,dz]` to nudge in world axes (e.g. a boss raised 10mm: at_offset:[0,0,10]).
 
 SKETCH + a 2D-profile feature — this is how you make anything that is not a bare primitive.
   1) add_feature type "sketch", refs.plane = "plane.top" | "plane.front" | "plane.right"
      (NEVER "XY"/"XZ"/"YZ"). plane.top = XY (+Z up), plane.front = XZ, plane.right = YZ.
+     SKETCH ON AN EXISTING FACE: set refs.plane to a face QUERY — e.g. {"of":"face","side":
+     "top"} ("sketch on the top face"). Your 2D origin (0,0) is then the CENTRE of that face,
+     so draw relative to it — no need to know its world height. Optional `offset`:<mm> lifts
+     the sketch plane along the face/datum normal (a sketch N mm above a face).
+     ⚠ For a BOSS on top of an existing part, sketch on the FACE ({"of":"face","side":"top"}),
+     NOT "plane.top": primitives are CENTRED on the origin, so plane.top cuts through the
+     MIDDLE of a box — a boss sketched there extrudes INTO the part and adds nothing.
   2) sketch_add_entity ops (refer to the sketch as "$<its op index>"). Entity types:
         circle {center:[x,y], radius}      line {p1:[x,y], p2:[x,y]}
         arc {center:[x,y], radius, start:<deg>, end:<deg>, ccw:<bool>}      point {p:[x,y]}
@@ -49,13 +64,37 @@ SKETCH + a 2D-profile feature — this is how you make anything that is not a ba
      SWEEP    params {mode}, refs.profile = [region] (the cross-section),
               refs.path = a selector naming the PATH sketch (an open line/arc/spline, or a `helix`).
 
-DRESS / TRANSFORM an existing body — name edges/faces with a geometry QUERY (no clicking needed):
+DRESS / TRANSFORM an existing body — name edges/faces with a geometry QUERY (no clicking needed).
+You describe the geometry IN PLAIN WORDS; the engine finds the matching edges/faces. You never
+need a face number or a coordinate.
   fillet  {radius}  refs.edges = {"of":"edge", ...}      chamfer {length} refs.edges = {...}
-  shell   {thickness} refs.remove = {"of":"face","side":"+z"}   (omit remove = closed shell)
+  shell   {thickness} refs.remove = {"of":"face","side":"top"}   (omit remove = closed shell)
   draft   {angle}  refs.neutral = a planar face/datum (the parting plane), refs.faces = the faces
           to taper {"of":"face", ...}
-  Query predicates: {"of":"edge"|"face"} all; add "side":"+z"/"-z"/.. , "parallel":[x,y,z],
-  "surf":"circle"/"plane"/.. , "near":[x,y,z]+"count". Use the doc_query tool first if unsure.
+  Query predicates (combine freely; omit all = EVERY edge/face of `of`):
+    "side": which side it's on — "top"/"bottom"/"left"/"right"/"front"/"back" (top=+Z, front=-Y;
+            signed axes "+z"/"-x"/.. also work). Keeps the faces/edges furthest that way.
+    "surf": the shape — faces "flat"/"round"; edges "straight"/"round" (or exact: plane/cylinder/
+            cone/sphere/torus, line/circle).
+    "parallel": which way it runs — "z" (="vertical"), "x", "y", or [x,y,z]. parallel:"z" = the
+            vertical corner edges of a block.
+    "pick": the size — faces "largest"/"smallest", edges "longest"/"shortest"; or
+            "inner"/"outer" to tell coaxial round geometry apart (tube inner vs outer
+            wall, bore vs rim) — e.g. {"of":"face","surf":"round","pick":"outer"}.
+    "near":[x,y,z] + "count": the N edges/faces nearest a point.  "index":[i,..]: pick by ordinal.
+  Use the doc_query tool FIRST if unsure what a part has — it returns each edge/face's shape+side.
+
+INTENT FEATURES — one op that is a whole recipe. PREFER these over hand-built sketch+cut+pattern
+for the common machining features; they take a face in plain words and need no positions math.
+  hole  — drill into a planar face. params {style:"simple"|"cbore"|"csink"|"tap", end:"through_all"
+          |"blind", diameter, depth?(blind), cbore_d?/cbore_depth?, csink_d?/csink_angle?}.
+          refs.face = a face query e.g. {"of":"face","side":"top"}. Optional `positions`:[[u,v],..]
+          (mm in the face, origin = face centre) for several holes; omit = one at the centre.
+  bolt_circle — a RING of holes in one feature (no per-hole trig). params {diameter, count, pcd
+          (bolt-circle diameter), style?, end?, depth?(blind), start_angle?:<deg>}. refs.face = a
+          face query (defaults to the top face). e.g. 6×⌀5 on a 40mm circle:
+          {"type":"bolt_circle","params":{"diameter":5,"count":6,"pcd":40},"refs":{"face":{"of":"face","side":"top"}}}
+  rib    — a thin web from an open sketch profile. refs.profile = [region]. (See sheet if present.)
 
 REPEAT / SYMMETRY. The seed feature(s) in refs.features MUST be earlier sketch-based features
 that carry geometry to copy — an EXTRUDE boss/cut, a HOLE, a REVOLVE/SWEEP/LOFT. A bare primitive
@@ -68,6 +107,26 @@ that carry geometry to copy — an EXTRUDE boss/cut, a HOLE, a REVOLVE/SWEEP/LOF
   `count*` are plain INTEGERS; spacings/angles are dim objects.
   Reserved datums: planes "plane.top"/"plane.front"/"plane.right", axes "axis.x"/"axis.y"/"axis.z",
   point "origin" — referenced as {"kind":"datum","feature":"<name>"}.
+  WHAT'S PATTERNABLE/MIRRORABLE: sketch-based features (extrude/revolve/sweep/loft boss or cut,
+  hole) and transforms. Primitives (box/cylinder/...) are NOT — rebuild them as sketch+extrude.
+
+MOVE / PLACE A BODY (op "add_feature", type "transform"). Translate and/or rotate ANY body — a
+lofted fuselage, an extruded wing — not just a primitive's `at`. Use it to position separate
+components into one coordinate frame for assembly (e.g. move a tail to meet the fuselage).
+  params: translate:[dx,dy,dz] (mm) and/or angle:<dim deg> with rotate:[ax,ay,az] (rotation axis),
+          pivot:[x,y,z] (point the rotation turns about, default origin), and copy:true to KEEP the
+          original and add a MOVED DUPLICATE as a new body (instancing; default false = move in place).
+  top-level: "body":"f3" targets that feature's body (default = the current running body).
+  Rotation is applied first (about pivot), then translation. e.g. move a wing +120 in X and up 8:
+  {"type":"transform","name":"PlaceWing","params":{"translate":[120,0,8]},"body":"f4"}
+  e.g. yaw a body 30° about Z through the origin:
+  {"type":"transform","name":"Yaw","params":{"angle":{"value":30,"expr":null},"rotate":[0,0,1]}}
+  e.g. two instances of a body 50 apart: a transform with params {"translate":[50,0,0],"copy":true}
+
+PLANE / OFFSET CONVENTIONS (Z-up). plane.top = XY (normal +Z), plane.front = XZ (normal +Y),
+plane.right = YZ (normal +X). A sketch `offset`:<mm> shifts the sketch plane ALONG that normal
+(positive = +Z on top, +Y on front, +X on right); a negative offset goes the other way. When
+sketching ON a face, `offset` lifts along that face's outward normal.
 
 ----------------------------------------------------------------- EDIT an existing feature
   edit_feature   {"op":"edit_feature","id":"f1","params":{"length":{"value":80,"expr":null}}}

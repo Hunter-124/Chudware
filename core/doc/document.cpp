@@ -36,6 +36,8 @@
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
+#include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
@@ -72,6 +74,7 @@
 #include <GeomAPI_ProjectPointOnSurf.hxx>
 #include <GeomAPI_ProjectPointOnCurve.hxx>
 #include <GeomLProp_SLProps.hxx>
+#include <ShapeAnalysis.hxx>  // FindBounds: free ends of an open profile wire (revolve auto-close)
 
 #include "doc/formats.h"  // import_bodies / detect_format (the import feature)
 #include "doc/picks.h"
@@ -239,6 +242,47 @@ const SketchResult& require_sketch(const std::map<std::string, FeatureResult>& r
     return std::get<SketchResult>(it->second);
 }
 
+// Close an OPEN revolve profile back to its axis so a bare outer-wall curve can still
+// make a solid of revolution. Weak local models routinely sketch the profile curve but
+// forget the closing line down the axis; revolving an open wire yields a surface, not a
+// solid (status no_geometry_built). We take the open profile wire, project its two free
+// ends onto the axis line, and add the perpendicular + along-axis edges that close the
+// region, then build a planar face. Returns empty if it cannot be closed into a planar
+// face (the caller then errors exactly as before). This is ONLY consulted when the
+// sketch produced NO closed region, so it can never alter a model that already closed
+// its own profile — it only turns a guaranteed failure into a likely success.
+std::vector<TopoDS_Face> close_profile_to_axis(
+    const nlohmann::json& solved_entities, const aicad::geom::SketchPlane& plane,
+    const Eigen::Vector3d& axis_pt, const Eigen::Vector3d& axis_dir) {
+    std::vector<TopoDS_Face> out;
+    TopoDS_Wire open = aicad::geom::wire_from_solved_sketch(solved_entities, plane);
+    if (open.IsNull()) return out;
+    TopoDS_Vertex va, vb;
+    ShapeAnalysis::FindBounds(open, va, vb);          // free ends of the open wire
+    if (va.IsNull() || vb.IsNull() || va.IsSame(vb)) return out;  // already closed/degenerate
+    gp_Pnt pa = BRep_Tool::Pnt(va), pb = BRep_Tool::Pnt(vb);
+    Eigen::Vector3d ea(pa.X(), pa.Y(), pa.Z()), eb(pb.X(), pb.Y(), pb.Z());
+    const Eigen::Vector3d d = axis_dir.normalized();
+    auto proj = [&](const Eigen::Vector3d& p) { return axis_pt + d * (p - axis_pt).dot(d); };
+    const Eigen::Vector3d aa = proj(ea), ab = proj(eb);
+    const double tol = 1e-7;
+    auto mkedge = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) -> TopoDS_Edge {
+        if ((a - b).norm() < tol) return TopoDS_Edge();  // skip degenerate (end already on axis)
+        return BRepBuilderAPI_MakeEdge(gp_Pnt(a.x(), a.y(), a.z()),
+                                       gp_Pnt(b.x(), b.y(), b.z())).Edge();
+    };
+    // Close: end_b -> axis(end_b) -> axis(end_a) -> end_a. MakeWire stitches by proximity.
+    BRepBuilderAPI_MakeWire mw;
+    mw.Add(open);
+    for (const TopoDS_Edge& e : {mkedge(eb, ab), mkedge(ab, aa), mkedge(aa, ea)})
+        if (!e.IsNull()) mw.Add(e);
+    if (!mw.IsDone()) return out;
+    BRepBuilderAPI_MakeFace mf(mw.Wire(), /*OnlyPlane=*/true);
+    if (!mf.IsDone()) return out;
+    out.push_back(mf.Face());
+    return out;
+}
+
 // Read a string field, with a default for an absent key. Throws if present but not a
 // string (a malformed feature dict -> error status).
 std::string str_field(const json& feat, const char* key, const std::string& dflt) {
@@ -276,6 +320,24 @@ std::optional<std::pair<Eigen::Vector3d, Eigen::Vector3d>> axis_from_datum(const
     if (name == "axis.y") return std::make_pair(o, Eigen::Vector3d(0, 1, 0));
     if (name == "axis.z") return std::make_pair(o, Eigen::Vector3d(0, 0, 1));
     return std::nullopt;
+}
+
+// An EXPLICIT axis spec: an object that carries a direction vector under `axis:[x,y,z]`
+// (and an optional through-point under `centroid`/`point`/`origin`, default origin).
+// Small local models, asked for a revolve/pattern axis, routinely hand us the axis
+// geometry directly but wrap it in an invented `kind` (e.g. {"kind":"axis",...} or an
+// edge-selector with a bogus `surf`) instead of the documented datum ref. The geometry
+// is unambiguous, so we accept it -> (point, unit dir). nullopt if there is no usable
+// 3-vector direction. (A reserved datum is handled by axis_from_datum first.)
+std::optional<std::pair<Eigen::Vector3d, Eigen::Vector3d>> axis_from_explicit(const json& ref) {
+    if (!ref.is_object()) return std::nullopt;
+    auto dir = opt_vec3(ref, "axis");
+    if (!dir || !(dir->norm() > 1e-9)) return std::nullopt;
+    Eigen::Vector3d pt(0, 0, 0);
+    for (const char* k : {"centroid", "point", "origin"}) {
+        if (auto p = opt_vec3(ref, k)) { pt = *p; break; }
+    }
+    return std::make_pair(pt, dir->normalized());
 }
 
 // A reserved plane datum ("plane.top/front/right" or the bare "top"/"front"/"right",
@@ -374,16 +436,24 @@ json normalize_feature(const json& raw) {
             if (slot == "profile") {
                 f["profile"] = canonical_profile_to_id(val);
             } else if (slot == "axis") {
-                // revolve / circular_pattern axis: a reserved datum -> axis_pt/axis_dir.
-                if (auto ax = axis_from_datum(val)) {
+                // revolve / circular_pattern axis: a reserved datum, OR an explicit
+                // axis spec (a direction vector the model handed us under an invented
+                // wrapper) -> axis_pt/axis_dir. Both revolve and circular_pattern read
+                // axis_pt/axis_dir, so this one conversion serves both.
+                auto ax = axis_from_datum(val);
+                if (!ax) ax = axis_from_explicit(val);
+                if (ax) {
                     f["axis_pt"] = {ax->first.x(), ax->first.y(), ax->first.z()};
                     f["axis_dir"] = {ax->second.x(), ax->second.y(), ax->second.z()};
                 } else {
                     f["axis"] = val;  // leave for a clearer error / future selector port
                 }
             } else if (slot == "dir1" || slot == "dir2") {
-                // linear_pattern direction: a reserved axis datum -> a unit vec3.
-                if (auto ax = axis_from_datum(val))
+                // linear_pattern direction: a reserved axis datum OR an explicit axis
+                // vector -> a unit vec3 (the compiler reads dir1/dir2 via req_vec3).
+                auto ax = axis_from_datum(val);
+                if (!ax) ax = axis_from_explicit(val);
+                if (ax)
                     f[slot] = {ax->second.x(), ax->second.y(), ax->second.z()};
                 else
                     f[slot] = val;
@@ -662,7 +732,8 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     // axis-datum feature id, or a {"kind":"datum",...} selector. nullopt otherwise.
     auto resolve_axis_ref =
         [&](const json& ref) -> std::optional<std::pair<Eigen::Vector3d, Eigen::Vector3d>> {
-        if (auto ax = axis_from_datum(ref)) return ax;  // reserved axis.x/y/z
+        if (auto ax = axis_from_datum(ref)) return ax;     // reserved axis.x/y/z
+        if (auto ax = axis_from_explicit(ref)) return ax;  // explicit {axis:[..],point?}
         std::string fid;
         if (ref.is_string()) fid = ref.get<std::string>();
         else if (ref.is_object() && ref.value("kind", std::string()) == "datum" &&
@@ -721,6 +792,18 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     // dangling reason on a non-resolving selector (datum.py::_resolve_sel "face").
     auto resolve_face_sel = [&](const json& sel, const char* slot) -> TopoDS_Face {
         const TopoDS_Shape& body = last_body_shape(slot);
+        // A plain-language geometry QUERY ({"of":"face","side":"top",...}) resolves the same
+        // way a dressed feature's query does — so any face REF (sketch plane, hole target,
+        // draft neutral, mirror plane, datum base) can be named "the top face" in words
+        // instead of carrying a clicked centroid selector. (A real selector has no "of".)
+        if (aicad::doc::is_geom_query(sel)) {
+            aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, sel);
+            if (!qp.error.empty())
+                throw std::runtime_error(std::string(slot) + ": " + qp.error);
+            if (qp.faces.empty())
+                throw std::runtime_error(std::string(slot) + ": query matched no face");
+            return qp.faces.front();
+        }
         aicad::doc::FacePicks fp = aicad::doc::resolve_face_picks(body, sel, slot);
         if (fp.faces.empty()) {
             std::string reason = fp.dangling.empty() ? std::string("unresolved")
@@ -732,6 +815,14 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     // Resolve an EDGE selector against the running body -> the unique TopoDS_Edge.
     auto resolve_edge_sel = [&](const json& sel, const char* slot) -> TopoDS_Edge {
         const TopoDS_Shape& body = last_body_shape(slot);
+        if (aicad::doc::is_geom_query(sel)) {  // word-vocabulary query (see resolve_face_sel)
+            aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, sel);
+            if (!qp.error.empty())
+                throw std::runtime_error(std::string(slot) + ": " + qp.error);
+            if (qp.edges.empty())
+                throw std::runtime_error(std::string(slot) + ": query matched no edge");
+            return qp.edges.front();
+        }
         aicad::doc::EdgePicks ep = aicad::doc::resolve_edge_picks(body, sel);
         if (ep.edges.empty()) {
             std::string reason = ep.dangling.empty() ? std::string("unresolved")
@@ -971,16 +1062,20 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (!sol.converged)
                     throw std::runtime_error("sketch did not converge");
 
-                // The sketch plane is a reserved datum NAME ("top"/"front"/"right")
-                // OR a prior `plane` feature id (e.g. an offset datum plane).
-                const std::string pref = str_field(feat, "plane", "top");
-                aicad::geom::SketchPlane plane;
-                auto pit = results.find(pref);
-                if (pit != results.end() &&
-                    std::holds_alternative<PlaneResult>(pit->second))
-                    plane = std::get<PlaneResult>(pit->second).plane;
-                else
-                    plane = plane_from_name(pref);
+                // The sketch plane: a reserved datum NAME ("plane.top"/...), a prior
+                // datum-plane feature id, OR a geometry reference to an existing planar
+                // FACE ("sketch on the top face"). All three resolve through plane_of —
+                // the same helper datum planes use — so a face query/selector lifts the
+                // sketch onto that face's OWN frame (2D origin at the face centroid). A
+                // spatially-limited model can then draw in 2D on a face without tracking
+                // world Z. (plane_of's face path needs a body; base datums need none.)
+                const json pref = feat.contains("plane") && !feat.at("plane").is_null()
+                                      ? feat.at("plane") : json("plane.top");
+                aicad::geom::SketchPlane plane = plane_of(pref, "sketch plane");
+                // Optional `offset`: shift the resolved plane along its normal (a sketch N
+                // mm above a datum/face), matching the loft-on-offset cheatsheet usage.
+                if (feat.contains("offset") && !feat.at("offset").is_null())
+                    plane.origin += plane.normal * num_or_expr(feat.at("offset"), env);
                 std::vector<TopoDS_Face> faces =
                     aicad::geom::faces_from_solved_sketch(sol.entities, plane);
                 // NB: an open sketch (no closed loop) is NOT an error here — it is a
@@ -1725,6 +1820,19 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 TopoDS_Shape solid = ::geom::loft_sections(wires, ruled);
                 if (solid.IsNull())
                     throw std::runtime_error("loft produced an empty solid");
+                // Guard the silent-degenerate case: if every section sits on the SAME plane
+                // (a model forgot to offset the 2nd sketch), ThruSections yields a flat /
+                // zero-volume shape and we'd report success with vol=0. Fail loudly and tell
+                // the model how to fix it instead of emitting an invisible body.
+                {
+                    GProp_GProps lg;
+                    BRepGProp::VolumeProperties(solid, lg);
+                    if (!(lg.Mass() > 1e-6))
+                        throw std::runtime_error(
+                            "loft produced a zero-volume solid — the sections are coplanar; "
+                            "put each section on its own plane (offset the later sketch, e.g. "
+                            "params.offset, or use a different datum plane)");
+                }
 
                 results[id] = SolidResult{solid};
                 solid_order.push_back(id);
@@ -1769,7 +1877,23 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     Eigen::Vector3d at(0, 0, 0);
                     bool placed = false;
                     auto at_it = feat.find("at");
-                    if (at_it != feat.end() && at_it->is_array() && at_it->size() >= 3 &&
+                    // RELATIONAL placement: `at` may be a geometry QUERY ({"of":"face",
+                    // "side":"top"}) instead of a coordinate — place the primitive at the
+                    // centroid of the matched face/edge on the current body, so a model can
+                    // say "a boss on the top face" with no coordinates.
+                    if (at_it != feat.end() && at_it->is_object() &&
+                        aicad::doc::is_geom_query(*at_it)) {
+                        const TopoDS_Shape& abody = last_body_shape("at");
+                        aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(abody, *at_it);
+                        if (!qp.error.empty())
+                            throw std::runtime_error(std::string("at: ") + qp.error);
+                        if (qp.selectors.empty())
+                            throw std::runtime_error("at: query matched no geometry");
+                        const json& c = qp.selectors.front().at("centroid");
+                        at = Eigen::Vector3d(c[0].get<double>(), c[1].get<double>(),
+                                             c[2].get<double>());
+                        placed = true;
+                    } else if (at_it != feat.end() && at_it->is_array() && at_it->size() >= 3 &&
                         (*at_it)[0].is_number()) {
                         at = Eigen::Vector3d((*at_it)[0].get<double>(),
                                              (*at_it)[1].get<double>(),
@@ -1791,6 +1915,16 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                             }
                             placed = true;
                         }
+                    }
+                    // Optional `at_offset:[dx,dy,dz]` — a world-axis nudge on top of either
+                    // an absolute or a relational `at` (e.g. a boss centred on the top face
+                    // then raised: at={of:face,side:top}, at_offset:[0,0,10]).
+                    if (feat.contains("at_offset") && feat.at("at_offset").is_array() &&
+                        feat.at("at_offset").size() >= 3 && feat.at("at_offset")[0].is_number()) {
+                        const json& o = feat.at("at_offset");
+                        at += Eigen::Vector3d(o[0].get<double>(), o[1].get<double>(),
+                                              o[2].get<double>());
+                        placed = true;
                     }
                     if (placed) solid = ::geom::translate_copy(solid, at);
                 }
@@ -1821,6 +1955,19 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         BRepGProp::VolumeProperties(out, ga);
                         if (std::abs(ga.Mass() - gb.Mass()) < 1e-9)
                             throw std::runtime_error("primitive cut removed no material");
+                    } else {
+                        // Symmetric buried-boss guard: a primitive boss merged into a body that
+                        // adds NO volume is buried inside it (a centred-on-origin cylinder/box
+                        // boss inside a plate). Fail loudly + teach placement rather than leave
+                        // the body silently unchanged.
+                        GProp_GProps gb, ga;
+                        BRepGProp::VolumeProperties(target, gb);
+                        BRepGProp::VolumeProperties(out, ga);
+                        if (ga.Mass() <= gb.Mass() + 1e-9)
+                            throw std::runtime_error(
+                                type + " boss added no material (it is buried inside the body — "
+                                "place it on the surface, e.g. at:{\"of\":\"face\",\"side\":"
+                                "\"top\"}, or set centered:false)");
                     }
                     consumed.insert(ptgt);
                     source_of[id] = ptgt;  // owner-map: result derives from the target body
@@ -2340,6 +2487,19 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         TopoDS_Shape out = ::geom::unify_same_domain(::geom::fuse(tgt, solid));
                         if (out.IsNull())
                             throw std::runtime_error("extrude boss fuse produced an empty shape");
+                        // Guard the silent buried-boss: primitives are CENTRED on the origin,
+                        // so plane.top is a centred block's MID-plane — a boss sketched there
+                        // and extruded inward lands entirely inside the body and adds nothing,
+                        // yet would report success. Fail loudly and teach the fix.
+                        GProp_GProps gbb, gab;
+                        BRepGProp::VolumeProperties(tgt, gbb);
+                        BRepGProp::VolumeProperties(out, gab);
+                        if (gab.Mass() <= gbb.Mass() + 1e-9)
+                            throw std::runtime_error(
+                                "extrude boss added no material (it is buried inside the body — "
+                                "primitives are centred on the origin, so sketch the boss on the "
+                                "actual face, e.g. refs.plane {\"of\":\"face\",\"side\":\"top\"}, "
+                                "not plane.top)");
                         consumed.insert(mtgt);
                         source_of[id] = mtgt;  // owner-map: merged boss derives from the body
                         results[id] = SolidResult{out};
@@ -2382,9 +2542,21 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (!(std::abs(angle) > 0.0))
                     throw std::runtime_error("revolve angle must be non-zero");
 
+                // Profile faces: the sketch's closed regions, or — if the model left the
+                // profile OPEN (a common weak-model mistake) — a region synthesised by
+                // closing the outer curve back to the axis. The fallback only runs when
+                // there is no closed region, so a properly closed profile is untouched.
+                std::vector<TopoDS_Face> rev_faces = src.faces;
+                if (rev_faces.empty())
+                    rev_faces = close_profile_to_axis(src.entities, src.plane, axis_pt, axis_dir);
+                if (rev_faces.empty())
+                    throw std::runtime_error(
+                        "revolve: profile has no closed region (close the profile back to the "
+                        "axis with a line)");
+
                 // Build the revolve tool (union all profile region revolves).
                 TopoDS_Shape tool;
-                for (const TopoDS_Face& f : src.faces) {
+                for (const TopoDS_Face& f : rev_faces) {
                     TopoDS_Shape rev = ::geom::revolve_face(f, axis_pt, axis_dir, angle);
                     if (rev.IsNull())
                         throw std::runtime_error("revolve produced an empty solid");
@@ -2406,7 +2578,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     const std::string side = feat.value("thin_side", std::string("inside"));
                     const double per_t = (side == "both") ? thin_thk / 2.0 : thin_thk;
                     TopoDS_Shape inner;
-                    for (const TopoDS_Face& f : src.faces) {
+                    for (const TopoDS_Face& f : rev_faces) {
                         // Radial direction = (face centroid - axis) projected perpendicular
                         // to the axis; shift the face TOWARD the axis by per_t (matches
                         // _offset_face_toward_axis, which uses -thickness for every side).
@@ -2675,6 +2847,13 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // A semantic geometry QUERY ({"of":"edge",...}) lets the agent name edges
                 // it cannot click — "all edges", "the vertical edges", "the top rim". It
                 // expands against the LIVE body to concrete unique edges (doc/picks).
+                // A LIST may MIX queries and plain selectors — e.g. "chamfer both ends" =
+                // [{"of":"edge","side":"+z"},{"of":"edge","side":"-z"}]. Detect any query
+                // element and resolve each entry appropriately, unioning (deduped) the edges.
+                const bool list_has_query =
+                    has_edge_sel && edges_it->is_array() &&
+                    std::any_of(edges_it->begin(), edges_it->end(),
+                                [](const json& e) { return aicad::doc::is_geom_query(e); });
                 if (has_edge_sel && aicad::doc::is_geom_query(*edges_it)) {
                     aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, *edges_it);
                     if (!qp.error.empty())
@@ -2682,6 +2861,30 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     if (qp.edges.empty())
                         throw std::runtime_error(type + ": edge query matched no edges");
                     picked = std::move(qp.edges);
+                } else if (list_has_query) {
+                    std::vector<TopoDS_Edge> all;
+                    TopTools_IndexedMapOfShape seen;
+                    json plain = json::array();
+                    for (const json& el : *edges_it) {
+                        if (aicad::doc::is_geom_query(el)) {
+                            aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, el);
+                            if (!qp.error.empty())
+                                throw std::runtime_error(type + ": " + qp.error);
+                            for (TopoDS_Edge& e : qp.edges)
+                                if (seen.Add(e)) all.push_back(e);
+                        } else {
+                            plain.push_back(el);  // batch the concrete selectors below
+                        }
+                    }
+                    if (!plain.empty()) {
+                        aicad::doc::EdgePicks picks = aicad::doc::resolve_edge_picks(body, plain);
+                        n_dangling += (int)picks.dangling.size();
+                        for (TopoDS_Edge& e : picks.edges)
+                            if (seen.Add(e)) all.push_back(e);
+                    }
+                    if (all.empty())
+                        throw std::runtime_error(type + ": edge query/selectors matched no edges");
+                    picked = std::move(all);
                 } else if (has_edge_sel) {
                     aicad::doc::EdgePicks picks =
                         aicad::doc::resolve_edge_picks(body, *edges_it);
@@ -3037,6 +3240,59 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     st.ok = true;
                 }
 
+            } else if (type == "transform") {
+                // Move/rotate a body in space — translate + rotate (axis+angle about a pivot).
+                // Works on ANY solid (a lofted fuselage, an extruded wing), not just primitives'
+                // `at`, so separate components can be placed into a shared frame for assembly
+                // (fixes the "no way to position a non-primitive body" gap). `body` targets an
+                // earlier feature id; default is the current running body. `copy:true` keeps the
+                // original and adds a transformed DUPLICATE as a new body (assembly instancing);
+                // default moves the body in place (the source is consumed).
+                const std::string body_id = body_ref(feat);
+                if (body_id.empty())
+                    throw std::runtime_error(type + ": no body ref and no current body");
+                const TopoDS_Shape& body = require_solid(results, body_id, "body");
+
+                Eigen::Vector3d translate(0, 0, 0);
+                if (auto t = opt_vec3(feat, "translate")) translate = *t;
+
+                const double angle_deg =
+                    feat.contains("angle") ? num_or_expr(feat.at("angle"), env) : 0.0;
+                Eigen::Vector3d axis_dir(0, 0, 1);
+                if (auto a = opt_vec3(feat, "rotate")) axis_dir = *a;
+                else if (auto a2 = opt_vec3(feat, "axis")) axis_dir = *a2;
+                Eigen::Vector3d pivot(0, 0, 0);
+                if (auto pv = opt_vec3(feat, "pivot")) pivot = *pv;
+
+                if (!(translate.norm() > 1e-12) && std::abs(angle_deg) <= 1e-9)
+                    throw std::runtime_error(
+                        type + ": no motion — give a non-zero translate:[x,y,z] and/or "
+                        "angle:<deg> with rotate:[ax,ay,az]");
+
+                // Rotate first (about the pivot), then translate — the intuitive "orient then
+                // place" order. Each step copies (the kernel helpers leave the input untouched).
+                TopoDS_Shape out = body;
+                if (std::abs(angle_deg) > 1e-9) {
+                    if (!(axis_dir.norm() > 1e-12))
+                        throw std::runtime_error(type + ": rotate axis has zero length");
+                    out = ::geom::rotate_copy(out, pivot, axis_dir, radians(angle_deg));
+                    if (out.IsNull())
+                        throw std::runtime_error(type + ": rotation produced an empty shape");
+                }
+                if (translate.norm() > 1e-12) {
+                    out = ::geom::translate_copy(out, translate);
+                    if (out.IsNull())
+                        throw std::runtime_error(type + ": translation produced an empty shape");
+                }
+
+                const bool copy = feat.value("copy", false);
+                if (!copy) consumed.insert(body_id);   // move in place: source replaced
+                tool_body_of[id] = out;                // patternable/mirrorable downstream
+                feature_op_of[id] = "add";
+                results[id] = SolidResult{out};
+                solid_order.push_back(id);
+                st.ok = true;
+
             } else if (type == "hole") {
                 // Drill simple / cbore / csink hole(s) into a referenced solid at
                 // position(s) on a FACE-SELECTOR-resolved planar face. One tool per
@@ -3054,27 +3310,45 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (face_it == feat.end() || !face_it->is_object())
                     throw std::runtime_error(
                         "hole: 'face' selector is required (the planar face to drill into)");
-                aicad::doc::FacePicks fp =
-                    aicad::doc::resolve_face_picks(body, *face_it, "face");
-                if (!fp.dangling.empty()) {
-                    std::string msg = "hole: face selector dangling: ";
-                    for (std::size_t k = 0; k < fp.dangling.size(); ++k) {
-                        if (k) msg += "; ";
-                        msg += fp.dangling[k];
+                TopoDS_Face face;
+                if (aicad::doc::is_geom_query(*face_it)) {
+                    // word query: "drill the top face" -> {"of":"face","side":"top"}.
+                    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, *face_it);
+                    if (!qp.error.empty()) throw std::runtime_error("hole: " + qp.error);
+                    if (qp.faces.empty()) throw std::runtime_error("hole: query matched no face");
+                    face = qp.faces.front();
+                } else {
+                    aicad::doc::FacePicks fp =
+                        aicad::doc::resolve_face_picks(body, *face_it, "face");
+                    if (!fp.dangling.empty()) {
+                        std::string msg = "hole: face selector dangling: ";
+                        for (std::size_t k = 0; k < fp.dangling.size(); ++k) {
+                            if (k) msg += "; ";
+                            msg += fp.dangling[k];
+                        }
+                        throw std::runtime_error(msg);
                     }
-                    throw std::runtime_error(msg);
+                    if (fp.faces.empty())
+                        throw std::runtime_error("hole: target face not resolved");
+                    face = fp.faces.front();
                 }
-                if (fp.faces.empty())
-                    throw std::runtime_error("hole: target face not resolved");
-                const TopoDS_Face& face = fp.faces[0];
 
                 BRepAdaptor_Surface surf(face);
                 if (surf.GetType() != GeomAbs_Plane)
                     throw std::runtime_error("hole: target face is not planar");
                 gp_Pln pln = surf.Plane();
 
-                // --- face frame (origin + x/y in-plane + outward normal) ---
-                gp_Pnt o = pln.Location();
+                // --- face frame (origin at the TRUE area centroid + x/y in-plane + outward
+                // normal). Positions are "[u,v] mm from the face CENTRE" (the contract, and
+                // what bolt_circle uses), so the origin MUST be the area centroid — NOT
+                // pln.Location(), the surface PARAMETER origin, which for many faces (e.g. a
+                // centred primitive's top face) is a CORNER. A corner origin drills the bore
+                // off-centre — only the quarter inside the body gets removed, so a Ø10 hole
+                // came out looking like Ø5. (test_hole passed only because its sketch-extrude
+                // box happened to have its param origin at the centroid.)
+                GProp_GProps fcprops;
+                BRepGProp::SurfaceProperties(face, fcprops);
+                gp_Pnt o = fcprops.CentreOfMass();
                 gp_Dir xd = pln.XAxis().Direction();
                 gp_Dir yd = pln.YAxis().Direction();
                 gp_Dir nd = pln.Axis().Direction();
@@ -3202,6 +3476,124 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 results[id] = SolidResult{out};
                 // Patternable tool: the union of drilled hole tools (instance-0 pose),
                 // op "cut" — a later pattern/mirror re-drills it per instance.
+                tool_body_of[id] = tool_union;
+                feature_op_of[id] = "cut";
+                solid_order.push_back(id);
+                st.ok = true;
+
+            } else if (type == "bolt_circle") {
+                // INTENT MACRO: a ring of holes (bolt circle) in ONE feature. The model
+                // gives a face (default: the top face), the bolt-circle diameter `pcd`, and
+                // a `count`; we drill N evenly-spaced holes around the face CENTROID — no
+                // per-hole trig for the model to get wrong. Reuses the Hole-Wizard tool
+                // builder; style/dims mirror `hole` exactly.
+                const std::string body_id = body_ref(feat);
+                if (body_id.empty())
+                    throw std::runtime_error(type + ": no body ref and no current body");
+                const TopoDS_Shape& body = require_solid(results, body_id, "body");
+
+                // Target planar face (word query OR clicked selector); default = top face.
+                const json face_ref = (feat.contains("face") && !feat.at("face").is_null())
+                                          ? feat.at("face")
+                                          : json{{"of", "face"}, {"side", "top"}};
+                TopoDS_Face face;
+                if (aicad::doc::is_geom_query(face_ref)) {
+                    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, face_ref);
+                    if (!qp.error.empty()) throw std::runtime_error("bolt_circle: " + qp.error);
+                    if (qp.faces.empty())
+                        throw std::runtime_error("bolt_circle: query matched no face");
+                    face = qp.faces.front();
+                } else {
+                    aicad::doc::FacePicks fp =
+                        aicad::doc::resolve_face_picks(body, face_ref, "face");
+                    if (fp.faces.empty())
+                        throw std::runtime_error("bolt_circle: target face not resolved");
+                    face = fp.faces.front();
+                }
+                BRepAdaptor_Surface bc_surf(face);
+                if (bc_surf.GetType() != GeomAbs_Plane)
+                    throw std::runtime_error("bolt_circle: target face is not planar");
+
+                // Frame centred on the TRUE area centroid (not the surface param origin).
+                Eigen::Vector3d normal = src_face_normal(face);
+                GProp_GProps fprops;
+                BRepGProp::SurfaceProperties(face, fprops);
+                gp_Pnt fcm = fprops.CentreOfMass();
+                Eigen::Vector3d center(fcm.X(), fcm.Y(), fcm.Z());
+                aicad::geom::SketchPlane fr = aicad::geom::SketchPlane::from(center, normal);
+                const Eigen::Vector3d drill_dir = -normal;
+
+                // Ring geometry.
+                const int count = static_cast<int>(std::llround(num_or_expr(feat.at("count"), env)));
+                if (count < 1) throw std::runtime_error("bolt_circle: count must be >= 1");
+                double pcd;
+                if (feat.contains("pcd")) pcd = num_or_expr(feat.at("pcd"), env);
+                else if (feat.contains("bolt_circle_d")) pcd = num_or_expr(feat.at("bolt_circle_d"), env);
+                else throw std::runtime_error("bolt_circle: 'pcd' (bolt-circle diameter) is required");
+                if (!(pcd > 0.0)) throw std::runtime_error("bolt_circle: pcd must be > 0");
+                const double ring_r = pcd / 2.0;
+                const double PI = std::acos(-1.0);
+                const double a0 = feat.contains("start_angle")
+                                      ? num_or_expr(feat.at("start_angle"), env) * PI / 180.0 : 0.0;
+
+                // Hole style/dims (same contract as `hole`).
+                const std::string style_s = feat.value("style", std::string("simple"));
+                ::geom::HoleStyle style;
+                if (style_s == "simple" || style_s == "tap") style = ::geom::HoleStyle::Simple;
+                else if (style_s == "cbore") style = ::geom::HoleStyle::Cbore;
+                else if (style_s == "csink") style = ::geom::HoleStyle::Csink;
+                else throw std::runtime_error("bolt_circle: unknown style '" + style_s + "'");
+                ::geom::HoleDims dims;
+                dims.diameter = num_or_expr(feat.at("diameter"), env);
+                if (!(dims.diameter > 0.0)) throw std::runtime_error("bolt_circle: diameter must be > 0");
+                if (style == ::geom::HoleStyle::Cbore) {
+                    dims.cbore_d = feat.contains("cbore_d")
+                        ? num_or_expr(feat.at("cbore_d"), env) : dims.diameter * 1.8;
+                    dims.cbore_depth = feat.contains("cbore_depth")
+                        ? num_or_expr(feat.at("cbore_depth"), env) : dims.diameter;
+                } else if (style == ::geom::HoleStyle::Csink) {
+                    dims.csink_d = feat.contains("csink_d")
+                        ? num_or_expr(feat.at("csink_d"), env) : dims.diameter * 2.0;
+                    dims.csink_angle_deg = feat.contains("csink_angle")
+                        ? num_or_expr(feat.at("csink_angle"), env) : 90.0;
+                }
+                const std::string end = feat.value("end", std::string("through_all"));
+                double depth;
+                if (end == "through_all") depth = aicad::doc::bbox_diag(body) * 1.1;
+                else if (end == "blind") {
+                    depth = num_or_expr(feat.at("depth"), env);
+                    if (!(depth > 0.0)) throw std::runtime_error("bolt_circle: blind depth must be > 0");
+                } else throw std::runtime_error("bolt_circle: unknown end '" + end + "'");
+
+                const double lift = 0.05;  // tool mouth just above the face (matches hole)
+                ::geom::HoleDims tool_dims = dims;
+                tool_dims.depth = depth + lift;
+                if (style == ::geom::HoleStyle::Cbore) tool_dims.cbore_depth = dims.cbore_depth + lift;
+                tool_dims.csink_lift = lift;
+
+                TopoDS_Shape tool_union;
+                for (int k = 0; k < count; ++k) {
+                    const double ang = a0 + 2.0 * PI * static_cast<double>(k) / static_cast<double>(count);
+                    Eigen::Vector3d world = center + (ring_r * std::cos(ang)) * fr.uAxis +
+                                                     (ring_r * std::sin(ang)) * fr.vAxis;
+                    Eigen::Vector3d lifted = world + lift * normal;
+                    TopoDS_Shape t = ::geom::make_hole_tool(lifted, drill_dir, style, tool_dims);
+                    if (t.IsNull()) throw std::runtime_error("bolt_circle: failed to build a hole tool");
+                    tool_union = tool_union.IsNull() ? t : ::geom::fuse(tool_union, t);
+                    if (tool_union.IsNull()) throw std::runtime_error("bolt_circle: tool union (fuse) failed");
+                }
+                TopoDS_Shape out = ::geom::cut(body, tool_union);
+                if (out.IsNull())
+                    throw std::runtime_error("bolt_circle: boolean cut produced an empty shape");
+                GProp_GProps gp_before, gp_after;
+                BRepGProp::VolumeProperties(body, gp_before);
+                BRepGProp::VolumeProperties(out, gp_after);
+                if (std::abs(gp_after.Mass() - gp_before.Mass()) < 1e-9)
+                    throw std::runtime_error(
+                        "bolt_circle removed no material (the ring may fall outside the face)");
+                consumed.insert(body_id);
+                source_of[id] = body_id;
+                results[id] = SolidResult{out};
                 tool_body_of[id] = tool_union;
                 feature_op_of[id] = "cut";
                 solid_order.push_back(id);

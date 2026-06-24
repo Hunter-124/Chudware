@@ -47,20 +47,20 @@ struct FeaStaticResult {
     std::string error;  // non-empty when ok==false
 };
 
-// Solve a linear-static problem on a tet mesh (4-node OR 10-node elements).
+// Solve a linear-static problem on a tet OR hex mesh (4-, 10-, or 8-node elements).
 //   points         : n*3 flat node coordinates (mm)
 //   tets           : m*K flat node indices (0-based), K = nodes_per_elem
 //   E_mpa, nu      : isotropic material (Young's modulus MPa, Poisson ratio)
 //   yield_mpa      : yield strength for the factor-of-safety summary
 //   fixed_nodes    : node indices held at zero displacement (all 3 DOFs)
 //   nodal_forces   : n*3 flat applied nodal force vector (N); same length as points
-//   nodes_per_elem : 4 (linear tet4, the parity path) or 10 (quadratic tet10)
+//   nodes_per_elem : 4 (tet4, parity path), 10 (tet10), or 8 (hex8, structured grid)
 //
 // nodes_per_elem==4 uses the analytical tet4 strain-displacement operator UNCHANGED
-// (byte-for-byte parity with the prior solver / the Python oracle). nodes_per_elem==10
-// uses an isoparametric quadratic tet integrated with a 4-point Gauss rule — this is a
-// SEPARATE code path that captures bending without shear-locking. Default 4 keeps every
-// existing caller on the parity path.
+// (byte-for-byte parity with the prior solver / the Python oracle). ==10 uses an
+// isoparametric quadratic tet (4-point Gauss); ==8 uses an isoparametric trilinear
+// hexahedron (2x2x2 Gauss) for structured/symmetric meshes of prismatic parts. Each is a
+// SEPARATE code path; default 4 keeps every existing caller on the parity path.
 // Never throws: a degenerate/unsolvable model returns ok=false with an error string.
 FeaStaticResult fea_static_solve(const std::vector<double>& points,
                                  const std::vector<int>& tets, double E_mpa, double nu,

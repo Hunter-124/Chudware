@@ -102,7 +102,8 @@ FeaSurface fea_surface_body(const std::vector<double>& vol_points,
     fs.body.color[1] = 0.76f;
     fs.body.color[2] = 0.82f;
 
-    const int stride = (nodes_per_elem == 10) ? 10 : 4;
+    const bool hex = (nodes_per_elem == 8);
+    const int stride = (nodes_per_elem == 10) ? 10 : (hex ? 8 : 4);
     const size_t n_tets = (stride > 0) ? (tets.size() / static_cast<size_t>(stride)) : 0;
     const size_t n_nodes = vol_points.size() / 3;
     if (n_tets == 0 || n_nodes == 0) return fs;
@@ -127,15 +128,16 @@ FeaSurface fea_surface_body(const std::vector<double>& vol_points,
 
     // ── Pass 1: count occurrences of each tet-face key (sorted global corner ids). ──
     std::map<std::array<int, 3>, int> face_count;
-    for (size_t e = 0; e < n_tets; ++e) {
-        const int* t = &tets[e * static_cast<size_t>(stride)];
-        for (int f = 0; f < 4; ++f) {
-            std::array<int, 3> key = {t[FACE_LOCAL[f][0]], t[FACE_LOCAL[f][1]],
-                                      t[FACE_LOCAL[f][2]]};
-            std::sort(key.begin(), key.end());
-            ++face_count[key];
+    if (!hex)
+        for (size_t e = 0; e < n_tets; ++e) {
+            const int* t = &tets[e * static_cast<size_t>(stride)];
+            for (int f = 0; f < 4; ++f) {
+                std::array<int, 3> key = {t[FACE_LOCAL[f][0]], t[FACE_LOCAL[f][1]],
+                                          t[FACE_LOCAL[f][2]]};
+                std::sort(key.begin(), key.end());
+                ++face_count[key];
+            }
         }
-    }
 
     // ── Pass 2: for each boundary face, decide outward winding + emit triangles. ──
     // Global node id -> compacted surface vertex index (deduped, first-seen order).
@@ -165,7 +167,7 @@ FeaSurface fea_surface_body(const std::vector<double>& vol_points,
         }
     };
 
-    for (size_t e = 0; e < n_tets; ++e) {
+    for (size_t e = 0; !hex && e < n_tets; ++e) {
         const int* t = &tets[e * static_cast<size_t>(stride)];
         for (int f = 0; f < 4; ++f) {
             const int gA = t[FACE_LOCAL[f][0]];
@@ -203,6 +205,52 @@ FeaSurface fea_surface_body(const std::vector<double>& vol_points,
                 emit_tri(mAB, gB, mBC, flip);
                 emit_tri(mCA, mBC, gC, flip);
                 emit_tri(mAB, mBC, mCA, flip);
+            }
+        }
+    }
+
+    // ── hex8 boundary surface: 6 quad faces; a quad on exactly one element is on the
+    //    boundary; emit it as 2 triangles (winding from the element centroid). ──
+    if (hex) {
+        static const int HEX_FACE[6][4] = {{0, 1, 2, 3}, {4, 5, 6, 7}, {0, 1, 5, 4},
+                                           {2, 3, 7, 6}, {0, 3, 7, 4}, {1, 2, 6, 5}};
+        std::map<std::array<int, 4>, int> qcount;
+        for (size_t e = 0; e < n_tets; ++e) {
+            const int* t = &tets[e * static_cast<size_t>(stride)];
+            for (int f = 0; f < 6; ++f) {
+                std::array<int, 4> key = {t[HEX_FACE[f][0]], t[HEX_FACE[f][1]],
+                                          t[HEX_FACE[f][2]], t[HEX_FACE[f][3]]};
+                std::sort(key.begin(), key.end());
+                ++qcount[key];
+            }
+        }
+        for (size_t e = 0; e < n_tets; ++e) {
+            const int* t = &tets[e * static_cast<size_t>(stride)];
+            double cen[3] = {0, 0, 0};
+            for (int j = 0; j < 8; ++j) {
+                double p[3];
+                pt(t[j], p);
+                cen[0] += p[0] / 8.0; cen[1] += p[1] / 8.0; cen[2] += p[2] / 8.0;
+            }
+            for (int f = 0; f < 6; ++f) {
+                const int gA = t[HEX_FACE[f][0]], gB = t[HEX_FACE[f][1]];
+                const int gC = t[HEX_FACE[f][2]], gD = t[HEX_FACE[f][3]];
+                std::array<int, 4> key = {gA, gB, gC, gD};
+                std::sort(key.begin(), key.end());
+                if (qcount[key] != 1) continue;  // interior quad (shared) -> skip
+                double A[3], B[3], C[3];
+                pt(gA, A); pt(gB, B); pt(gC, C);
+                const double e1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]};
+                const double e2[3] = {C[0] - A[0], C[1] - A[1], C[2] - A[2]};
+                const double nx = e1[1] * e2[2] - e1[2] * e2[1];
+                const double ny = e1[2] * e2[0] - e1[0] * e2[2];
+                const double nz = e1[0] * e2[1] - e1[1] * e2[0];
+                // flip if the face normal points toward the element centroid (interior).
+                const double dot = nx * (cen[0] - A[0]) + ny * (cen[1] - A[1]) +
+                                   nz * (cen[2] - A[2]);
+                const bool flip = (dot > 0.0);
+                emit_tri(gA, gB, gC, flip);  // quad ABCD -> tris ABC + ACD
+                emit_tri(gA, gC, gD, flip);
             }
         }
     }

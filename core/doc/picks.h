@@ -88,23 +88,39 @@ FacePicks resolve_face_picks(const TopoDS_Shape& shape, const nlohmann::json& se
 // on an EXISTING body, so it can fillet/chamfer/shell/probe human-made parts the same
 // way a human picks. Resolves a query object into concrete UNIQUE sub-shapes.
 //
+// The vocabulary is built for a model with little spatial sense: every predicate accepts
+// the plain WORD a person would use as well as the precise form. Words are case-insensitive
+// and desugar to the primitive below, so full capability is preserved.
+//
 // Schema (all predicates AND-combine; absent/empty => ALL sub-shapes of `of`):
 //   of            "edge" | "face"                       (required)
-//   surf          "line"|"circle"|"plane"|"cylinder"|"cone"|"sphere"|... type filter
-//   parallel      [x,y,z]   edge direction / face normal parallel to this axis (|dot|~1)
-//   perpendicular [x,y,z]   |dot|~0
-//   side          "+x"|"-x"|"+y"|"-y"|"+z"|"-z"  keep only the sub-shapes at the EXTREME
-//                 centroid along that signed axis (e.g. "+z" = the top set: top face, or
-//                 the top rim edges)
+//   surf          type filter. faces: "flat"|"round" (= plane|cylinder) or the exact kernel
+//                 name (plane|cylinder|cone|sphere|torus). edges: "straight"|"round" (=
+//                 line|circle) or line|circle|ellipse|bspline.
+//   parallel      [x,y,z] OR axis word "x"|"y"|"z"|"vertical" — edge direction / face normal
+//                 parallel to this axis (|dot|~1). parallel:"z" = the vertical edges.
+//   perpendicular [x,y,z] OR axis word — |dot|~0
+//   side          direction WORD "top"|"bottom"|"left"|"right"|"front"|"back" (also up/down)
+//                 OR signed axis "+x"|"-x"|"+y"|"-y"|"+z"|"-z" — keep only the sub-shapes at
+//                 the EXTREME centroid along that direction. Word->axis matches the named
+//                 views: top=+z, bottom=-z, right=+x, left=-x, front=-y, back=+y.
+//   pick          "largest"|"smallest" (faces, by area) or "longest"|"shortest" (edges, by
+//                 length) — keep the extreme-measure set. OR "inner"|"outer" (also bore/
+//                 innermost/outermost) — keep the min/max-RADIUS round face(s)/edge(s), the
+//                 plain way to tell coaxial geometry apart (tube inner vs outer wall, bore vs
+//                 rim). Ties co-rank, so a symmetric body keeps the opposite pair; add
+//                 count:1 or a side to force one.
 //   near          [x,y,z]   keep the nearest `count` (default 1) by centroid distance
 //   count         int       cap the result size
 //   index         [i,...]   keep these ordinals of the filtered set
 //
 // Examples:  {"of":"edge"}                           -> every edge (fillet/chamfer all)
-//            {"of":"edge","parallel":[0,0,1]}        -> the vertical edges
-//            {"of":"edge","side":"+z"}               -> the top edges / top rim
-//            {"of":"face","side":"+z"}               -> the top face
-//            {"of":"face","surf":"cylinder"}         -> the bore wall(s)
+//            {"of":"edge","parallel":"z"}            -> the vertical edges (corner rounds)
+//            {"of":"edge","side":"top"}              -> the top edges / top rim
+//            {"of":"face","side":"top"}              -> the top face
+//            {"of":"face","surf":"round"}            -> the bore wall(s) / cylindrical faces
+//            {"of":"face","surf":"round","pick":"outer"} -> the OUTER wall of a tube
+//            {"of":"face","pick":"largest"}          -> the biggest face(s)
 //            {"of":"edge","near":[20,0,5],"count":1} -> the edge nearest a point
 struct QueryPicks {
     std::vector<TopoDS_Edge> edges;

@@ -108,6 +108,77 @@ def _publish_current(doc_id: str) -> Optional[dict]:
         return None
 
 
+def _autosave_dir() -> Path:
+    base = os.environ.get("APPDATA") or tempfile.gettempdir()
+    d = Path(base) / "AI-CAD" / "mcp_autosave"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _autosave(doc_id: Optional[str]) -> None:
+    """Persist a doc to a recoverable .step+ so a server restart (e.g. after a client timeout)
+    can reload it instead of dropping every open document. Best-effort; never raises."""
+    if not doc_id:
+        return
+    try:
+        cb.call("doc_save", {"doc_id": doc_id, "path": str(_autosave_dir() / f"{doc_id}.step+")})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def recover_autosaved() -> list:
+    """Reopen every autosaved .step+ into the engine (called at server startup). A reopened doc
+    gets a FRESH doc_id; returns [{path, doc_id}] for the ones that loaded. Best-effort."""
+    out: list = []
+    try:
+        files = sorted(_autosave_dir().glob("*.step+"))
+    except Exception:  # noqa: BLE001
+        return out
+    for p in files:
+        try:
+            r = cb.call("doc_open", {"path": str(p)})
+            did = r.get("doc_id")
+            if did:
+                out.append({"path": str(p), "doc_id": did})
+                _CUR["doc_id"] = did
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+# --- async jobs ------------------------------------------------------------------------
+# Heavy solves (CFD, FEA) can exceed the MCP transport's per-call timeout; when the client gives
+# up it may KILL the server and lose every open doc. So the sim tools can run in the BACKGROUND:
+# return a job_id immediately, run the engine call on a worker thread (the LBM/FEA solve itself
+# does not hold the engine lock), and let the caller poll get_job(job_id). Default stays synchronous
+# for simple use; pass background=True for the heavy runs.
+import threading as _threading  # noqa: E402
+import uuid as _uuid  # noqa: E402
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor  # noqa: E402
+
+_JOBS: dict = {}
+_JOB_LOCK = _threading.Lock()
+_JOB_EXEC = _ThreadPoolExecutor(max_workers=2)
+
+
+def _start_job(kind: str, fn) -> str:
+    jid = "job-" + _uuid.uuid4().hex[:12]
+    with _JOB_LOCK:
+        _JOBS[jid] = {"status": "running", "kind": kind, "result": None, "error": None}
+
+    def _run() -> None:
+        try:
+            res = fn()
+            with _JOB_LOCK:
+                _JOBS[jid].update(status="done", result=res)
+        except Exception as e:  # noqa: BLE001
+            with _JOB_LOCK:
+                _JOBS[jid].update(status="error", error=str(e))
+
+    _JOB_EXEC.submit(_run)
+    return jid
+
+
 # A small material library so FEA tools take a friendly name. Fields are exactly what the
 # host's study expects (host/src/ui/sim_manager.cpp): E in MPa, density g/cm^3, strengths MPa.
 _MATERIALS: dict = {
@@ -217,6 +288,17 @@ run_cfd_flow(velocity, aoa, fluid) — LBM wind tunnel over the whole part/assem
   velocity m/s, aoa degrees, fluid "air"|"water". Returns drag (N), lift (N), Cd, frontal
   area, and Reynolds number. Coarse grid by default — a directional estimate, raise `cells`
   for more resolution.
+  CONVENTIONS (Z-up): freestream +X, lift +Z, span Y; +aoa pitches nose up. `reynolds`/`cd`
+  use the part's LONGEST span as reference length (reported as `ref_length_mm`).
+  TRUST THE DIAGNOSTICS: the result reports `voxel_mm` / `min_feature_voxels` (thin features
+  under ~8 voxels are unresolved → lift reads ~0, a `warning` is set — raise `cells` or run the
+  thin part alone) and `converged` / `residual` (a non-converged run is under-iterated, not
+  physically zero). For heavy runs pass background=True and poll get_job(job_id).
+
+Heavy solves: run_cfd_flow / run_fea_* accept background=True → they return a job_id immediately
+and solve on a worker thread; poll get_job(job_id) for the result. This keeps a long solve from
+tripping the transport timeout (which would otherwise drop the session). After a restart,
+recover_parts() reloads auto-saved docs.
 """
 
 _OVERVIEW_HEADER = """\
@@ -232,7 +314,14 @@ WORKFLOW
                                             against the request; iterate add_features to fix.
   4. measure_part() / query_geometry(q)     check mass/bbox, or explore faces/edges.
   5. run_fea_static(...) / run_cfd_flow(...) prove it (see cad_guide("simulation")).
-  6. export_part(fmt) / make_drawing()      deliver STEP/STL/3MF or a dimensioned drawing.
+  6. save_part()                            save the NATIVE .step+ — the editable feature tree
+                                            PLUS its simulation studies + any drawings, in one
+                                            file the desktop app reopens fully editable. This is
+                                            AI-CAD's native format; save to it to hand the user a
+                                            part they can keep working on (not a flattened mesh).
+  7. export_part(fmt) / make_drawing()      hand off a NON-native interchange/mesh file
+                                            (STEP/IGES/BREP exact, STL/OBJ/3MF mesh) or a
+                                            dimensioned 2D drawing.
 
 Address geometry in PLAIN WORDS (no coordinates, no face numbers): "the top face", "all
 edges", "the vertical edges", "the largest round face". The engine resolves the words to
@@ -320,12 +409,42 @@ def register_cad_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
+            # Transactional batch: snapshot first so a partial failure rolls the WHOLE batch back
+            # (the engine otherwise leaves failed features in the tree). All-or-nothing.
+            ckpt = None
+            try:
+                ckpt = cb.call("doc_checkpoint", {"doc_id": d}).get("checkpoint")
+            except Exception:  # noqa: BLE001
+                ckpt = None
+
             r = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
             fs = (r.get("rebuild") or {}).get("feature_status", [])
             feats = [{"id": s.get("id"), "ok": s.get("ok"),
                       "error": s.get("error"), "warning": s.get("warning")} for s in fs]
             bodies = (r.get("tess") or {}).get("bodies", [])
             ok = all(s.get("ok") for s in fs) if fs else True
+
+            if not ok and ckpt:
+                # Roll the tree back to the pre-batch revision; report WHY each feature failed.
+                reverted = False
+                try:
+                    cb.call("doc_revert", {"doc_id": d, "checkpoint": ckpt})
+                    reverted = True
+                except Exception:  # noqa: BLE001
+                    reverted = False
+                fail = [{"id": s.get("id"), "error": s.get("error")} for s in fs
+                        if not s.get("ok")]
+                _publish_current(d)  # mirror the rolled-back (or current) state to the app
+                return _dumps({
+                    "ok": False,
+                    "doc_id": d,
+                    "rolled_back": reverted,
+                    "error": "batch rejected — no features were kept; fix and resend"
+                             if reverted else "batch failed and rollback failed",
+                    "failed_features": fail,
+                    "features": feats,
+                })
+
             out = {
                 "ok": ok,
                 "doc_id": d,
@@ -340,6 +459,7 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 pub = _publish_current(d)
                 if pub:
                     out["shown_in_app"] = True
+                _autosave(d)  # persist so a server restart can recover this doc
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -390,6 +510,11 @@ def register_cad_tools(mcp: FastMCP) -> None:
 
         density_g_cm3 sets the material density used for mass (default 7.85 = steel). Also runs a
         geometry sanity check (closed/valid solid).
+
+        Multi-body docs: the top-level volume/mass/com/inertia are the COMBINED total of ALL
+        bodies, and `mass.bodies[]` lists each body's own properties (with `mass.body_count`).
+        Pass body_id via a direct query if you need just one. (Previously this silently reported
+        only the last body of an assembly.)
         """
         try:
             d = _doc(doc_id)
@@ -463,22 +588,99 @@ def register_cad_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
+    def save_part(path: Optional[str] = None, doc_id: Optional[str] = None) -> str:
+        """Save the part as AI-CAD's NATIVE .step+ — the editable, reopenable format. PREFER THIS.
+
+        .step+ is the only format that round-trips the full PARAMETRIC feature tree (so the user
+        can keep editing parameters/features), its SIMULATION STUDIES (FEA/CFD setups + results),
+        and any associated 2D drawings — all in one file the desktop app opens fully editable. Use
+        this to deliver a part the user will keep working on. (export_part writes flat interchange
+        or mesh files: a plain STEP/STL has geometry only, no feature history or studies.)
+
+        path : where to write. If omitted, a temp .step+ is written. A ".step+" extension is added
+               if missing. Returns the written path and bytes so you can confirm a real save.
+        """
+        try:
+            d = _doc(doc_id)
+            out = path or _tmp(".step+")
+            if not out.lower().endswith(".step+"):
+                out += ".step+"
+            r = cb.call("doc_save", {"doc_id": d, "path": out})
+            written = r.get("path", out)
+            ok = os.path.exists(written)
+            return _dumps({"ok": ok, "format": "step+", "native": True, "doc_id": d,
+                           "path": written,
+                           "bytes": (os.path.getsize(written) if ok else 0)})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
     def export_part(fmt: str = "step", path: Optional[str] = None,
                     doc_id: Optional[str] = None) -> str:
-        """Export the current part to a CAD/mesh file; returns the written path.
+        """Export the current part to an interchange/mesh file; returns the written path.
 
-        fmt: "step" | "stl" | "3mf" | "iges" | "brep" | "obj" | "ply" | "gltf" | "glb" | "3dm".
-        If `path` is omitted, a temp file with the right extension is written. STEP/IGES/BREP are
-        exact B-rep; STL/OBJ/PLY/glTF are tessellated meshes.
+        fmt: "step+" (native) | "step" | "stl" | "3mf" | "iges" | "brep" | "obj" | "ply" |
+             "gltf" | "glb" | "3dm". If `path` is omitted, a temp file with the right extension is
+             written. STEP/IGES/BREP are exact B-rep; STL/OBJ/PLY/glTF are tessellated meshes.
+
+        NOTE: plain STEP/STL/etc. carry geometry only — NO editable feature tree or simulation
+        studies. To hand the user a part they can keep editing, use save_part() (native .step+).
+        fmt="step+" here is accepted as an alias and routed to the native saver.
         """
         try:
             d = _doc(doc_id)
             fmt = fmt.lower().lstrip(".")
+            # The native editable container is written by doc_save, not the interchange writer.
+            if fmt in ("step+", "stepplus", "stp+", "native"):
+                out = path or _tmp(".step+")
+                if not out.lower().endswith(".step+"):
+                    out += ".step+"
+                r = cb.call("doc_save", {"doc_id": d, "path": out})
+                written = r.get("path", out)
+                return _dumps({"ok": os.path.exists(written), "format": "step+",
+                               "native": True, "doc_id": d, "path": written,
+                               "exists": os.path.exists(written)})
             out = path or _tmp("." + fmt)
+            # The engine round-trips B-rep formats (re-reads + BRepCheck) and THROWS if the file is
+            # truncated/malformed, so a returned ok:True means it actually re-opens. It echoes real
+            # metadata (solid_count, valid_solids, bytes, validated) — surface it so the caller can
+            # trust the export instead of a bare exists flag.
             r = cb.call("export_file", {"doc_id": d, "path": out, "format": fmt})
             written = r.get("path", out)
-            return _dumps({"ok": True, "format": fmt, "path": written,
-                           "exists": os.path.exists(written)})
+            res = {"ok": True, "format": fmt, "doc_id": d, "path": written,
+                   "exists": os.path.exists(written)}
+            for k in ("bytes", "solid_count", "valid_solids", "expected_solids", "validated"):
+                if k in r:
+                    res[k] = r[k]
+            return _dumps(res)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def import_part(path: str, into: Optional[str] = None, as_solid: bool = False) -> str:
+        """Import a CAD/mesh file (STEP/IGES/BREP/STL/3MF/OBJ/STEP+/…) as a body.
+
+        Lets you assemble components built or exported separately, or recover geometry from a file
+        after a session reset. `into` = an existing doc_id to add the body to the CURRENT part
+        (for assembly); omit it to open the file as a NEW part (made current). `as_solid` sews a
+        mesh (STL/OBJ/…) into a solid on import; B-rep formats already import as solids.
+
+        TIP: pair with the `transform` feature (in add_features) to POSITION each imported body
+        into a shared coordinate frame — translate:[x,y,z] and/or angle:<deg> with rotate:[ax,ay,az].
+        """
+        try:
+            params: dict = {"path": path, "as_solid": bool(as_solid)}
+            if into:
+                params["into"] = into
+            r = cb.call("import_file", params)
+            new_id = r.get("doc_id") or into
+            if new_id and not into:
+                _CUR["doc_id"] = new_id
+            if new_id:
+                _publish_current(new_id)
+            return _dumps({"ok": True, "doc_id": new_id, "imported_from": path,
+                           "into": into, **{k: r[k] for k in ("revision", "name", "body_count")
+                                            if k in r}})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -486,7 +688,8 @@ def register_cad_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def run_fea_static(fixtures: list, loads: list, material: Union[str, dict] = "steel",
-                       mesh_fineness: float = 0.5, doc_id: Optional[str] = None) -> str:
+                       mesh_fineness: float = 0.5, doc_id: Optional[str] = None,
+                       background: bool = False) -> str:
         """Linear-static stress FEA on the current part. Returns max stress, displacement, and FoS.
 
         fixtures : list of face queries held fixed, e.g. ["bottom"] or
@@ -497,6 +700,8 @@ def register_cad_tools(mcp: FastMCP) -> None:
         material : a name ("steel","aluminum","titanium","stainless","brass","abs","pla") or an
                    explicit dict {E_mpa, nu, density_g_cm3, yield_mpa, ...}.
         mesh_fineness : 0..1 (default 0.5). Second-order (tet10) elements are used for accuracy.
+        background : if True, return a job_id immediately and solve on a worker thread — poll
+                     get_job(job_id). Use it for fine meshes that may exceed the call timeout.
 
         Returns {max_von_mises_mpa, max_disp_mm, min_fos}. min_fos = yield / max stress; > 1 holds.
         Tip: query_geometry(...) first to confirm your fixture/load faces resolve.
@@ -540,27 +745,32 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 "mesh_order": 2,        # tet10 captures bending
                 "fineness": mesh_fineness,
             }
-            res = cb.call("sim_run_static", {"study": study})
-            if not res.get("ok"):
-                return _dumps({"ok": False, "error": res.get("error", "solve failed")})
-            return _dumps({
-                "ok": True,
-                "doc_id": d,
-                "material": mat.get("name", material),
-                "summary": res.get("summary", {}),
-                "n_dof": res.get("n_dof"),
-            })
+
+            def _solve() -> dict:
+                res = cb.call("sim_run_static", {"study": study})
+                if not res.get("ok"):
+                    return {"ok": False, "doc_id": d, "error": res.get("error", "solve failed")}
+                return {"ok": True, "doc_id": d, "material": mat.get("name", material),
+                        "summary": res.get("summary", {}), "n_dof": res.get("n_dof")}
+
+            if background:
+                jid = _start_job("fea_static", _solve)
+                return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
+                               "note": "solving on a worker thread — poll get_job(job_id)"})
+            return _dumps(_solve())
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
     @mcp.tool()
     def run_fea_modal(fixtures: list, material: Union[str, dict] = "steel", n_modes: int = 6,
-                      mesh_fineness: float = 0.5, doc_id: Optional[str] = None) -> str:
+                      mesh_fineness: float = 0.5, doc_id: Optional[str] = None,
+                      background: bool = False) -> str:
         """Modal FEA — the natural frequencies (Hz) of the held part. Returns the first n_modes.
 
         fixtures : list of face queries held fixed (e.g. ["bottom"]). An unconstrained part has
                    rigid-body modes near 0 Hz, so fix it like it is mounted.
         material : name or explicit dict (density drives the mode frequencies).
+        background : if True, return a job_id and solve on a worker thread — poll get_job(job_id).
         """
         try:
             d = _doc(doc_id)
@@ -574,38 +784,114 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 return _dumps({"ok": False, "error": "no fixture faces resolved"})
             study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
                      "mesh_order": 1, "fineness": mesh_fineness}
-            res = cb.call("sim_run_modal", {"study": study, "n_modes": n_modes})
-            if not res.get("ok"):
-                return _dumps({"ok": False, "error": res.get("error", "modal solve failed")})
-            return _dumps({"ok": True, "doc_id": d, "material": mat.get("name", material),
-                           "freqs_hz": res.get("freqs_hz", []), "n_modes": res.get("n_modes")})
+
+            def _solve() -> dict:
+                res = cb.call("sim_run_modal", {"study": study, "n_modes": n_modes})
+                if not res.get("ok"):
+                    return {"ok": False, "doc_id": d,
+                            "error": res.get("error", "modal solve failed")}
+                return {"ok": True, "doc_id": d, "material": mat.get("name", material),
+                        "freqs_hz": res.get("freqs_hz", []), "n_modes": res.get("n_modes")}
+
+            if background:
+                jid = _start_job("fea_modal", _solve)
+                return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
+                               "note": "solving on a worker thread — poll get_job(job_id)"})
+            return _dumps(_solve())
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
     @mcp.tool()
     def run_cfd_flow(velocity: float = 10.0, aoa: float = 0.0, fluid: str = "air",
-                     cells: int = 96, n_steps: int = 2000, doc_id: Optional[str] = None) -> str:
+                     cells: int = 96, n_steps: int = 2000, doc_id: Optional[str] = None,
+                     background: bool = False) -> str:
         """Wind-tunnel CFD over the current part/assembly (LBM). Returns drag, lift, Cd, Reynolds.
 
+        CONVENTIONS (AI-CAD is Z-up): freestream is along +X; LIFT is the +Z (up) force; SPAN is Y.
+        +aoa pitches the nose up (rotation about Y), so a cambered wing makes +lift. `reynolds` and
+        `cd` use ref_length_mm = the part's LONGEST span (NOT chord) — for an airfoil, simulate the
+        wing alone or read `ref_length_mm` and renormalise to chord yourself.
+
         velocity : free-stream speed (m/s).   aoa : angle of attack (degrees).
-        fluid    : "air" or "water".          cells : grid resolution along the longest span
-                   (higher = finer + slower).  n_steps : LBM iterations.
-        The grid is coarse by default — treat the numbers as a directional estimate; raise
-        `cells` for a finer solution. Works on a single part or a multi-body assembly.
+        fluid    : "air" or "water".          cells : grid pitch = domain's longest span / cells
+                   (higher = finer + slower; practical 48-200).  n_steps : LBM iterations (~500-4000).
+        background : if True, return a job_id immediately and solve on a worker thread (recommended
+                     for cells>=120 or n_steps>=2500, which can exceed the call timeout) — then poll
+                     get_job(job_id).
+
+        RESOLUTION MATTERS: the result reports `voxel_mm`, `min_feature_mm`, and
+        `min_feature_voxels` (how many cells span the thinnest part dimension). If a thin wing/tail
+        edge spans < ~8 voxels it is UNDER-RESOLVED — lift especially reads near zero — and a
+        `warning` is returned; raise `cells` or simulate the thin part on its own. Also reported:
+        `converged` + `residual` (force settle over the last fifth of the run); a non-converged run
+        is under-iterated, not physically zero.
+
+        ⚠ ABSOLUTE Cd IS UNCALIBRATED. This is a coarse voxel LBM: the staircased surface
+        over-counts force (more so on curved/angled faces), so the magnitude of drag_n/cd can be
+        off by an order of magnitude and is resolution-dependent. Use it to COMPARE configurations
+        and read TRENDS (does +aoa add lift? does a fillet cut drag? A vs B?), which it now gets
+        right (drag scales as V^2, Cd is velocity-independent). For quantitative absolute Cd, use a
+        validated external solver (the desktop app's OpenFOAM bridge). Treat these numbers as a
+        directional estimate, not a certified coefficient.
         """
         try:
             d = _doc(doc_id)
-            res = cb.call("sim_run_flow", {"doc_id": d, "velocity": velocity, "aoa": aoa,
-                                           "fluid": fluid, "cells": cells, "n_steps": n_steps})
-            if not res.get("ok"):
-                return _dumps({"ok": False, "error": res.get("error", "flow sim failed")})
-            return _dumps({
-                "ok": True, "doc_id": d,
-                "drag_n": res.get("drag_n"), "lift_n": res.get("lift_n"), "cd": res.get("cd"),
-                "frontal_area_mm2": res.get("frontal_area_mm2"), "reynolds": res.get("reynolds"),
-                "velocity_ms": res.get("velocity_ms"), "aoa_deg": res.get("aoa_deg"),
-                "fluid": res.get("fluid"), "grid": res.get("grid"),
-            })
+
+            def _solve() -> dict:
+                res = cb.call("sim_run_flow", {"doc_id": d, "velocity": velocity, "aoa": aoa,
+                                               "fluid": fluid, "cells": cells, "n_steps": n_steps})
+                if not res.get("ok"):
+                    return {"ok": False, "doc_id": d,
+                            "error": res.get("error", "flow sim failed")}
+                out = {"ok": True, "doc_id": d}
+                for k in ("drag_n", "lift_n", "cd", "frontal_area_mm2", "reynolds",
+                          "ref_length_mm", "velocity_ms", "aoa_deg", "fluid", "grid",
+                          "converged", "residual", "voxel_mm", "min_feature_mm",
+                          "min_feature_voxels", "steps_run", "diverged", "warning"):
+                    if k in res:
+                        out[k] = res[k]
+                return out
+
+            if background:
+                jid = _start_job("cfd_flow", _solve)
+                return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
+                               "note": "solving on a worker thread — poll get_job(job_id)"})
+            return _dumps(_solve())
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def get_job(job_id: str) -> str:
+        """Poll a background job started by run_cfd_flow/run_fea_*(background=True).
+
+        Returns {status: "running"|"done"|"error"}; when done, the solve `result` is included.
+        Polling a long solve this way never trips the per-call transport timeout that would
+        otherwise drop the whole session.
+        """
+        with _JOB_LOCK:
+            job = _JOBS.get(job_id)
+            if job is None:
+                return _dumps({"ok": False, "error": f"unknown job_id {job_id!r}"})
+            snap = dict(job)
+        out = {"ok": True, "job_id": job_id, "status": snap["status"], "kind": snap["kind"]}
+        if snap["status"] == "done":
+            out["result"] = snap["result"]
+        elif snap["status"] == "error":
+            out["ok"] = False
+            out["error"] = snap["error"]
+        return _dumps(out)
+
+    @mcp.tool()
+    def recover_parts() -> str:
+        """Reopen any auto-saved parts after a server restart (recover a dropped session).
+
+        Every successful add_features auto-persists the part to a recoverable .step+; if the
+        server was restarted (e.g. a client timeout killed it) the in-memory docs are gone — call
+        this to reload them (each gets a fresh doc_id). list_parts() then shows them.
+        """
+        try:
+            recovered = recover_autosaved()
+            return _dumps({"ok": True, "recovered": recovered, "count": len(recovered)})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -662,6 +948,7 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 return _dumps({"ok": False, "error": r.get("error", "parts_make failed")})
             _CUR["doc_id"] = r.get("doc_id")
             _publish_current(r.get("doc_id"))
+            _autosave(r.get("doc_id"))
             return _dumps({"ok": True, "doc_id": r.get("doc_id"), "name": r.get("name"),
                            "meta": r.get("meta"), "volume": r.get("volume")})
         except Exception as e:  # noqa: BLE001

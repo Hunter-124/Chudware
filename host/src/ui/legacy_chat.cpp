@@ -2338,6 +2338,13 @@ static void drawComposerChips(AppState& st, bool busy) {
         ImGui::SetTooltip("Whether the AI plans and asks before modeling.");
     if (ImGui::BeginPopup("##runmode")) { drawRunModeMenu(st); ImGui::EndPopup(); }
 
+    // Right edge of the left-hand chips on this row, in window-local cursor coords. The run-mode
+    // chip wasn't followed by SameLine(), so the cursor has already wrapped to the next line —
+    // GetCursorPosX() would report the left margin, not the chip edge. The chip width also varies
+    // ("Supervised" is wider than "Autopilot"), so measure the actual item rect instead.
+    const float chipsEndX =
+        ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + ImGui::GetScrollX();
+
     // ---- context meter (right-aligned) — like Claude Code / Codex / VS Code ----
     // How full the model's context window was on the last call (input-token estimate), so the user
     // can see headroom before a small local window overruns mid-chain.
@@ -2350,7 +2357,9 @@ static void drawComposerChips(AppState& st, bool busy) {
         float tw = ImGui::CalcTextSize(txt.c_str()).x;
         float total = barW + gap + tw;
         float x = ImGui::GetContentRegionMax().x - total;
-        if (x > ImGui::GetCursorPosX() + 8 * sc) {  // only if it fits on the row
+        // Only draw when the meter clears the chips with a visible gap. Because `total` already
+        // accounts for the live text width, this stays correct as the token count grows wider.
+        if (x > chipsEndX + 10 * sc) {  // only if it fits on the row clear of the chips
             ImGui::SameLine(x);
             ImVec2 p = ImGui::GetCursorScreenPos();
             float h = ImGui::GetTextLineHeight();

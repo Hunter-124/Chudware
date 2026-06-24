@@ -333,7 +333,7 @@ bool is_cut(const Step& step) {
     if (step.params.is_object() && step.params.contains("mode"))
         mode = to_lower(py_scalar_str(step.params["mode"]));
     if (mode == "cut") return true;
-    if (step.type == "hole") return true;
+    if (step.type == "hole" || step.type == "bolt_circle") return true;
     return to_lower(step.desc).find("cut") != std::string::npos;
 }
 

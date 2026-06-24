@@ -261,8 +261,20 @@ public:
     // literal strings export_document accepts: "step" | "iges" | "stl" | "3mf" | "brep". Does NOT
     // touch the mirror. Returns the written absolute path (worker echoes {path}), or "" on error
     // (err filled). `docId` is passed explicitly so the caller controls which doc is exported.
+    // For mesh formats (stl/obj/ply/3mf/gltf/glb) the optional tessellation controls set
+    // the export resolution: linDeflection (mm, or a fraction when `relative`),
+    // angDeflection (radians), and `ascii` (STL container). The defaults reproduce the
+    // historical hardcoded behaviour; B-rep formats ignore them.
     std::string exportFile(WorkerClient& w, const std::string& docId,
-                           const std::string& path, const std::string& format, std::string& err);
+                           const std::string& path, const std::string& format, std::string& err,
+                           double linDeflection = 0.05, double angDeflection = 0.35,
+                           bool relative = false, bool ascii = false);
+
+    // Live triangle/vertex estimate for the export dialog (export_tess_estimate RPC).
+    // Returns true on success and fills tris/verts; false on error (err filled).
+    bool exportEstimate(WorkerClient& w, const std::string& docId, double linDeflection,
+                        double angDeflection, bool relative, long long& tris, long long& verts,
+                        std::string& err);
 
     // Re-pull the document tree + revision from the worker (doc_tree) and fire the listener.
     // C24: the public face of the formerly-private resyncTree — callers that mutated the doc

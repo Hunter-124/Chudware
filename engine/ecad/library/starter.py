@@ -31,6 +31,8 @@ Public API:
 
 from __future__ import annotations
 
+import math
+
 # ─── small helpers ────────────────────────────────────────────────────────────
 
 def _pin(number: str, name: str, pos: list, angle: float, ptype: str,
@@ -696,6 +698,98 @@ def _crtyd_box(x1: float, y1: float, x2: float, y2: float) -> list:
     return _silk_box(x1, y1, x2, y2, "F.CrtYd")
 
 
+# Silk-to-pad clearance (mm) kept when clipping silk lines off the pads. The real fab
+# wants silk to clear copper; this also keeps DFM's silk_over_pad (0 mm overlap) quiet.
+_SILK_PAD_CLEAR = 0.12
+
+
+def _pad_keepout(pad: dict) -> tuple[float, float, float] | None:
+    """A conservative circular keepout (cx, cy, r) around a pad's copper, expanded by the
+    silk-to-pad clearance. Round/oval -> max(w,h)/2; rect-ish -> half-diagonal (over-covers
+    the corners slightly, which only shortens silk a hair). Returns None for a sizeless pad."""
+    pos = pad.get("pos") or [0.0, 0.0]
+    size = pad.get("size") or [0.0, 0.0]
+    w = float(size[0]) if len(size) > 0 else 0.0
+    h = float(size[1]) if len(size) > 1 else w
+    if w <= 0.0 and h <= 0.0:
+        return None
+    shape = pad.get("shape", "rect")
+    if shape in ("circle", "oval"):
+        r = max(w, h) / 2.0
+    else:
+        r = 0.5 * math.hypot(w, h)
+    return (float(pos[0]), float(pos[1]), r + _SILK_PAD_CLEAR)
+
+
+def _clip_silk_line(p1: list, p2: list, keepouts: list) -> list[tuple]:
+    """Clip a silk line segment p1->p2 to the parts NOT inside any pad keepout circle.
+
+    Returns a list of (a, b) sub-segments (possibly empty). Parametric sampling along the
+    line keeps maximal runs whose midpoint clears every keepout, so it works for any
+    orientation (the chip end-lines vanish; the long edges keep their exposed middle)."""
+    ax, ay = float(p1[0]), float(p1[1])
+    bx, by = float(p2[0]), float(p2[1])
+    length = math.hypot(bx - ax, by - ay)
+    if length < 1e-9 or not keepouts:
+        return [((ax, ay), (bx, by))]
+
+    def _blocked(t: float) -> bool:
+        x = ax + (bx - ax) * t
+        y = ay + (by - ay) * t
+        for (cx, cy, r) in keepouts:
+            if (x - cx) ** 2 + (y - cy) ** 2 <= r * r:
+                return True
+        return False
+
+    n = max(48, int(length / 0.02))          # ~0.02 mm sampling, fine enough for chip silk
+    segs: list[tuple] = []
+    run_start: float | None = None
+    prev_blocked = True
+    for i in range(n + 1):
+        t = i / n
+        blk = _blocked(t)
+        if not blk and prev_blocked:
+            run_start = t
+        elif blk and not prev_blocked and run_start is not None:
+            segs.append((run_start, (i - 1) / n))
+            run_start = None
+        prev_blocked = blk
+    if run_start is not None:
+        segs.append((run_start, 1.0))
+
+    out: list[tuple] = []
+    for (t0, t1) in segs:
+        if (t1 - t0) * length < 0.15:          # drop slivers shorter than a fab-legal tick
+            continue
+        a = (ax + (bx - ax) * t0, ay + (by - ay) * t0)
+        b = (ax + (bx - ax) * t1, ay + (by - ay) * t1)
+        out.append((a, b))
+    return out
+
+
+def _clip_footprint_silk(fp: dict) -> None:
+    """In place: clip every F/B.SilkS LINE graphic off this footprint's pads.
+
+    Generic + future-proof: any footprint whose silk crosses a pad gets clean silk
+    automatically (no per-footprint hand-tuning), killing DFM silk_over_pad false
+    positives AND producing manufacturable silk. Non-line silk and non-silk graphics
+    are left untouched (text/courtyard/etc.)."""
+    keepouts = [k for k in (_pad_keepout(p) for p in fp.get("pads", [])) if k is not None]
+    if not keepouts:
+        return
+    new_graphics: list[dict] = []
+    for g in fp.get("graphics", []):
+        if g.get("layer") not in ("F.SilkS", "B.SilkS") or g.get("type") != "line":
+            new_graphics.append(g)
+            continue
+        for (a, b) in _clip_silk_line(g.get("p1", [0, 0]), g.get("p2", [0, 0]), keepouts):
+            ng = dict(g)
+            ng["p1"] = [a[0], a[1]]
+            ng["p2"] = [b[0], b[1]]
+            new_graphics.append(ng)
+    fp["graphics"] = new_graphics
+
+
 def _make_footprints() -> dict:
     fps: dict[str, dict] = {}
 
@@ -934,6 +1028,11 @@ def _make_footprints() -> dict:
         graphics=_silk_box(-4.0, -1.8, 4.0, 1.8) + _crtyd_box(-4.6, -2.3, 4.6, 2.3),
         description="Diode SMB",
     )
+
+    # Final pass: clip every footprint's silk off its pads so no generated footprint
+    # ships silk over copper (DFM silk_over_pad) — generic, covers all sizes + future parts.
+    for fp in fps.values():
+        _clip_footprint_silk(fp)
 
     return fps
 

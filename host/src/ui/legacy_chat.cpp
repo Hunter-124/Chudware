@@ -1201,31 +1201,33 @@ static void closeConversation(AppState& st, int idx) {
 // Probe the local OpenAI-compatible endpoint for its loaded models + reachability, so the
 // picker can hide local models that are down. Throttled to ~5s; force bypasses the throttle.
 void refreshModelAvailability(AppState& st, bool force) {
-    // The "Local endpoint" probe is only meaningful for a LOOPBACK base_url. When a cloud
-    // OpenAI-compatible service is active (OpenRouter / DashScope / ...), st.settings.baseUrl is a
-    // remote URL whose huge /models catalog must NOT be listed under "Local endpoint" — that cloud
-    // is discovered via its own category (refreshOpenRouterModels), not here.
+    // Discover models on the LOCAL endpoint regardless of which provider is currently active, so
+    // local models always show up in the picker WITHOUT the user first switching the Provider
+    // dropdown to "Local". Previously this early-returned whenever a cloud provider (OpenRouter /
+    // DashScope / ...) was active — st.settings.baseUrl is then a remote URL — which is exactly why
+    // local models were invisible until the user "poked around in settings" and selected Local.
     auto isLoopback = [](const char* u) {
         std::string s = u ? u : "";
         return s.find("localhost") != std::string::npos ||
                s.find("127.0.0.1") != std::string::npos ||
                s.find("0.0.0.0") != std::string::npos || s.find("[::1]") != std::string::npos;
     };
-    if (!isLoopback(st.settings.baseUrl)) {
-        ProviderModels empty;
-        empty.checked = true;  // probed: no local server in use right now
-        st.providerModels[ui::PROV_LOCAL] = empty;
-        st.providerModels[ui::PROV_LLAMACPP] = empty;
-        return;
-    }
+    // When the active base_url IS loopback, probe it (honors a custom local port). Otherwise a cloud
+    // provider is active, so its base_url isn't the local one — fall back to the default LM Studio
+    // endpoint so local discovery still happens. (A non-default local port is only auto-found while
+    // the Local provider is the active one; the default covers the common case.)
+    bool activeLoopback = isLoopback(st.settings.baseUrl);
+    std::string localUrl = activeLoopback ? std::string(st.settings.baseUrl)
+                                          : std::string("http://localhost:1234/v1");
+    std::string localKey = activeLoopback ? std::string(st.settings.apiKey) : std::string();
     static double lastProbe = -1e9;
     double now = ImGui::GetTime();
     if (!force && (st.modelProbeInFlight.load() || (now - lastProbe) < 5.0)) return;
     lastProbe = now;
     st.modelProbeInFlight.store(true);
     nlohmann::json p = {{"provider", "openai"},
-                        {"base_url", st.settings.baseUrl},
-                        {"api_key", st.settings.apiKey}};
+                        {"base_url", localUrl},
+                        {"api_key", localKey}};
     st.rpc.call("agent_list_models", p, [&st](const core::RpcResult& r) {
         ProviderModels pm;
         pm.checked = true;
@@ -1994,6 +1996,20 @@ static void drawModelDropdown(AppState& st, bool busy) {
             if (modelRow(st, lp, id, id, true, uid++)) {
                 st.settings.provider = lp;
                 std::strncpy(st.settings.model, id.c_str(), sizeof(st.settings.model) - 1);
+                // This pick may be switching AWAY from a cloud provider whose base_url is remote.
+                // Point base_url back at the local endpoint so the run hits LM Studio, not the cloud
+                // (a local model id sent to the cloud 403s). Preserve an already-loopback base_url so
+                // a custom local port survives.
+                std::string bu = st.settings.baseUrl ? st.settings.baseUrl : "";
+                bool loop = bu.find("localhost") != std::string::npos ||
+                            bu.find("127.0.0.1") != std::string::npos ||
+                            bu.find("0.0.0.0") != std::string::npos ||
+                            bu.find("[::1]") != std::string::npos;
+                if (!loop)
+                    std::strncpy(st.settings.baseUrl,
+                                 lp == ui::PROV_LLAMACPP ? "http://127.0.0.1:1234/v1"
+                                                         : "http://localhost:1234/v1",
+                                 sizeof(st.settings.baseUrl) - 1);
                 picked = true;
             }
         }
@@ -2028,7 +2044,15 @@ static void drawModelDropdown(AppState& st, bool busy) {
         : ImGui::SmallButton("settings");
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI settings");
     if (openSet) { st.focusSettingsTab = true; ImGui::CloseCurrentPopup(); }
-    if (picked) ImGui::CloseCurrentPopup();
+    if (picked) {
+        // CRITICAL: persist the pick to config.json NOW. The in-app run (agent_run_v2) resolves its
+        // provider from config.json in the C++ core — NOT from in-memory st.settings — so a pick that
+        // only updates st.settings would leave the run using the STALE persisted provider. That's the
+        // bug where selecting a local model (gemma) still routed to the previously-saved cloud
+        // endpoint and 403'd. Saving here keeps config.json == what the picker shows before any run.
+        saveSettings(st.settings);
+        ImGui::CloseCurrentPopup();
+    }
 }
 
 // ============================ run-mode dropdown ============================
@@ -2067,6 +2091,11 @@ static void drawRunModeMenu(AppState& st) {
 // and the per-turn follow-up input share one code path.
 static void submitTurn(AppState& st, const std::string& text) {
     if (text.empty()) return;
+    // Persist the active provider/model to config.json BEFORE launching any run. The C++ core
+    // resolves the provider from config.json (not in-memory st.settings), so this guarantees the
+    // run uses exactly what the picker shows — closing the window where a freshly-picked local
+    // model still ran against a stale, previously-saved cloud endpoint (the 403 "model_failed").
+    saveSettings(st.settings);
     { ChatMsg u; u.fromUser = true; u.text = text; st.chat.push_back(u); }
     { ChatMsg a; a.running = true; st.chat.push_back(a); }
     st.designStarted = true;   // conversation is now active (kept for shot scenarios)
@@ -2681,6 +2710,14 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
 // ---- unified AI Copilot pane: header -> conversation -> bottom composer ----
 void drawAIPanel(AppState& st, bool busy, bool canRun) {
     if (!st.showAIPanel) return;
+
+    // Keep the local-endpoint model list fresh whenever the copilot panel exists — BEFORE the
+    // visibility gate below, so discovery runs even when the AI tab is docked in the background
+    // (ImGui::Begin returns false for an inactive tab). Without this, a model loaded in LM Studio
+    // isn't discovered until the user opens the picker ("pokes around in settings"). The probe is
+    // throttled to ~5s and no-ops for a non-loopback (cloud) base_url, so this is cheap.
+    refreshModelAvailability(st, false);
+
     if (!ImGui::Begin("AI")) { ImGui::End(); return; }
     ui::Fonts& fonts = st.fonts;
     const auto& pal = ui::palette;

@@ -251,6 +251,20 @@ ParsedReply openai_parse_response(const json& resp) {
         out.text = msg["content"].get<std::string>();
     }
     // (content == null) -> "" (Python `... or ""`); covered by the default.
+    //
+    // Reasoning models served over the OpenAI-compatible API (LM Studio, llama.cpp, vLLM,
+    // DeepSeek-R1, Qwen-think, gemma-think, …) emit their chain-of-thought in a separate
+    // `reasoning_content` field (some use `reasoning`). Capture it as thinking; and when the
+    // model returned ONLY reasoning with an empty `content` — it spent its output budget
+    // thinking, or never split the two — fall back to it so extract_json_obj can still pull
+    // any ops JSON the model wrote inline, instead of the run dying with an empty reply.
+    for (const char* k : {"reasoning_content", "reasoning"}) {
+        if (msg.contains(k) && msg[k].is_string() && !msg[k].get<std::string>().empty()) {
+            out.thinking = msg[k].get<std::string>();
+            if (out.text.empty()) out.text = out.thinking;
+            break;
+        }
+    }
     return out;
 }
 
@@ -512,6 +526,7 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             }
         }
         res.text = pr.text;
+        res.thinking = pr.thinking;
         return res;
     }
 

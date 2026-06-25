@@ -32,12 +32,18 @@ class OpenAIProvider(Provider):
     name = "openai"
 
     def __init__(self, api_key: str | None = None, model: str = DEFAULT_MODEL,
-                 base_url: str | None = None, supports_vision: bool = True):
+                 base_url: str | None = None, supports_vision: bool = True,
+                 timeout: float = 120.0):
         from openai import OpenAI
 
         # Local OpenAI-compatible servers (LM Studio, etc.) often need any non-empty key.
         self.base_url = _normalize_base_url(base_url)
-        self.client = OpenAI(api_key=api_key or "not-needed", base_url=self.base_url)
+        # Bound every request: the OpenAI SDK default is 600 s, so a local server that is
+        # slow/loading a model would otherwise hang the caller (e.g. ecad_design) for ten
+        # minutes. A finite timeout makes a stuck endpoint fail fast so callers can degrade.
+        self.timeout = float(timeout) if timeout and timeout > 0 else 120.0
+        self.client = OpenAI(api_key=api_key or "not-needed", base_url=self.base_url,
+                             timeout=self.timeout)
         self.model = model
         self.supports_vision = supports_vision
 
@@ -56,7 +62,7 @@ class OpenAIProvider(Provider):
         return {"role": role, "content": [self._content(p) for p in parts]}
 
     def complete(self, system: str, messages: list[dict], max_tokens: int = 8000) -> str:
-        from openai import APIConnectionError
+        from openai import APIConnectionError, APITimeoutError
 
         msgs = [{"role": "system", "content": system}]
         for m in messages:
@@ -65,6 +71,13 @@ class OpenAIProvider(Provider):
             resp = self.client.chat.completions.create(
                 model=self.model, messages=msgs, max_tokens=max_tokens
             )
+        except APITimeoutError as e:
+            url = self.base_url or "https://api.openai.com/v1"
+            raise RuntimeError(
+                f"The model server at {url} did not respond within {self.timeout:.0f}s "
+                f"(model={self.model!r} may still be loading, or the request is too large). "
+                f"Try again once it is warm, lower the load, or switch provider. ({e})"
+            ) from e
         except APIConnectionError as e:
             # The single most common local-model failure: the server isn't there. Name the
             # endpoint so the user can tell "server down" apart from auth/model problems.
@@ -87,4 +100,18 @@ class OpenAIProvider(Provider):
                 f"Check that the model is loaded and the Base URL is correct in Settings, "
                 f"or switch provider to Anthropic. Endpoint detail: {detail}"
             )
-        return choices[0].message.content or ""
+        msg = choices[0].message
+        # Reasoning models served over the OpenAI-compatible API (LM Studio, llama.cpp,
+        # vLLM, DeepSeek-R1, Qwen-think, …) put their chain-of-thought in `reasoning_content`
+        # (some use `reasoning`). When the model returned ONLY reasoning with an empty
+        # `content` (spent its output budget thinking, or never split the two), fall back to
+        # it so the caller can still pull any ops JSON the model wrote inline.
+        content = getattr(msg, "content", None) or ""
+        if not content:
+            extra = getattr(msg, "model_extra", None) or {}
+            content = (getattr(msg, "reasoning_content", None)
+                       or getattr(msg, "reasoning", None)
+                       or extra.get("reasoning_content")
+                       or extra.get("reasoning")
+                       or "")
+        return content

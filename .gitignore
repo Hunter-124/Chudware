@@ -65,3 +65,9 @@ core/build-occt/
 # Exported CAD persistence (regenerate via export — never committed)
 *.step
 *.stp
+
+# MCP client-config backups (mcp_setup.bat writes these next to the regenerated configs)
+*.aicad-bak
+
+# Scratch render output from dev tools (leading-underscore convention, like _shot_*.png)
+tools/_*.png

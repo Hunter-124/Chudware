@@ -26,6 +26,7 @@
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepGProp.hxx>
+#include <BRepLProp_SLProps.hxx>
 #include <GProp_GProps.hxx>
 #include <GeomAbs_CurveType.hxx>
 #include <GeomAbs_SurfaceType.hxx>
@@ -36,8 +37,12 @@
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
+#include <gp_Ax1.hxx>
+#include <gp_Cone.hxx>
+#include <gp_Cylinder.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Vec.hxx>
 
 namespace aicad::doc {
 
@@ -112,6 +117,46 @@ std::string edge_curve_string(GeomAbs_CurveType t) {
         case GeomAbs_BezierCurve: return "bspline";
         case GeomAbs_BSplineCurve:return "bspline";
         default:                  return "other";
+    }
+}
+
+// GEOMETRIC concavity of a cylindrical face (C5). The raw face Orientation() flag is NOT
+// reliable for bore-vs-fillet classification after boolean+fillet operations: OCCT may store
+// either orientation depending on how the face was (re)built, so a convex corner fillet can
+// come back REVERSED and a bore FORWARD. Instead we decide concavity from real geometry:
+//   1. outward material normal n  = geometric surface normal, flipped when the face is REVERSED
+//      (so n points OUT of the solid, away from material — the build123d normal_at convention).
+//   2. radial-outward direction r = from the cylinder axis to a point on the surface.
+//   n·r < 0  ->  the outward normal points TOWARD the axis: the void is the central cylinder and
+//                material wraps its outside -> a BORE / hole -> concave.
+//   n·r > 0  ->  the outward normal points AWAY from the axis: material is the central cylinder
+//                (a boss / convex-corner fillet) -> convex.
+// Returns nullopt when the normal is undefined (degenerate) so the caller can fall back to
+// the radius heuristic instead of guessing.
+std::optional<bool> cylinder_face_concave(const TopoDS_Face& f) {
+    try {
+        BRepAdaptor_Surface sa(f);
+        if (sa.GetType() != GeomAbs_Cylinder) return std::nullopt;
+        const double u = (sa.FirstUParameter() + sa.LastUParameter()) / 2.0;
+        const double v = (sa.FirstVParameter() + sa.LastVParameter()) / 2.0;
+        BRepLProp_SLProps sl(sa, u, v, 1, 1e-7);
+        if (!sl.IsNormalDefined()) return std::nullopt;
+        gp_Dir gn = sl.Normal();  // geometric normal (orientation-independent)
+        gp_Vec n(gn);
+        if (f.Orientation() == TopAbs_REVERSED) n.Reverse();  // -> outward material normal
+
+        // Surface point + radial-outward direction (point projected onto the cylinder axis).
+        const gp_Pnt p = sl.Value();
+        const gp_Ax1 ax = sa.Cylinder().Axis();
+        const gp_Pnt a0 = ax.Location();
+        const gp_Vec ad(ax.Direction());
+        gp_Vec ap(a0, p);                       // axis-origin -> surface point
+        gp_Vec radial = ap - ad * ap.Dot(ad);   // remove the axial component
+        if (radial.Magnitude() < 1e-9) return std::nullopt;
+
+        return n.Dot(radial) < 0.0;  // outward normal points toward the axis -> concave bore
+    } catch (const Standard_Failure&) {
+        return std::nullopt;
     }
 }
 
@@ -387,14 +432,61 @@ std::string q_surf_type(GeomAbs_SurfaceType t) {
     }
 }
 
+// I3 — the body's axis-aligned bbox CENTER (the outward-direction origin for sphere/torus/
+// bspline faces, which carry no kernel axis). Computed once per query.
+Eigen::Vector3d query_bbox_center(const TopoDS_Shape& shape) {
+    Bnd_Box box;
+    BRepBndLib::Add(shape, box);
+    if (box.IsVoid()) return Eigen::Vector3d(0, 0, 0);
+    double xmin, ymin, zmin, xmax, ymax, zmax;
+    box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+    return Eigen::Vector3d((xmin + xmax) * 0.5, (ymin + ymax) * 0.5, (zmin + zmax) * 0.5);
+}
+
+// I3 — REPRESENTATIVE OUTWARD DIRECTION at a face centroid (mirrors selectors.cpp). plane:
+// the signed outward normal; cylinder/cone: radial-outward at the centroid (centroid minus
+// its projection onto the surface axis through `axis_loc`); sphere/torus/bspline (no
+// `surf_axis`): outward from the body bbox center. nullopt only if every fallback degenerates.
+std::optional<Eigen::Vector3d> query_rep_dir(
+    GeomAbs_SurfaceType st, const Eigen::Vector3d& centroid,
+    const std::optional<Eigen::Vector3d>& plane_axis,
+    const std::optional<Eigen::Vector3d>& surf_axis,
+    const std::optional<Eigen::Vector3d>& axis_loc,
+    const Eigen::Vector3d& body_center) {
+    auto unit = [](const Eigen::Vector3d& v) -> std::optional<Eigen::Vector3d> {
+        double n = v.norm();
+        if (n > 1e-12) return v / n;
+        return std::nullopt;
+    };
+    if (st == GeomAbs_Plane) return plane_axis;  // already the signed outward normal
+    if ((st == GeomAbs_Cylinder || st == GeomAbs_Cone) && surf_axis && axis_loc) {
+        const Eigen::Vector3d& d = *surf_axis;
+        Eigen::Vector3d ap = centroid - *axis_loc;
+        Eigen::Vector3d radial = ap - d * ap.dot(d);
+        if (auto r = unit(radial)) return r;
+        return surf_axis;  // centroid on the axis -> fall back to the axis
+    }
+    return unit(centroid - body_center);  // sphere/torus/bspline/other
+}
+
 // One unique sub-shape's geometric fingerprint (the same fields the describers compute).
 struct QCand {
     TopoDS_Shape shp;
     Eigen::Vector3d centroid{0, 0, 0};
     std::optional<Eigen::Vector3d> axis;
+    // I3 — representative OUTWARD direction at the face centroid, for EVERY face type
+    // (plane normal / cyl-cone radial / outward-from-bbox-center). Lets the side filter
+    // rank a curved face by which way it faces, not just by centroid height. nullopt for
+    // edges and degenerate faces.
+    std::optional<Eigen::Vector3d> rep_dir;
     std::optional<double> radius;  // cylinder face / circle edge radius (for inner/outer)
     std::string surf;
     double measure = 0.0;
+    // Concavity flag for cylindrical faces (B5/C5): set from face orientation.
+    // TopAbs_REVERSED means the outward solid normal points inward (into the hole) ->
+    // the face is concave = a bore. TopAbs_FORWARD = outward normal = convex = boss.
+    // nullopt when the geometry is not a cylinder face (edges, planar faces, etc.).
+    std::optional<bool> concave;  // true=bore/inner, false=boss/outer, nullopt=N/A
 };
 
 // ASCII-lowercase a copy of `raw` (the query vocabulary is case-insensitive so a model
@@ -432,18 +524,35 @@ std::optional<Eigen::Vector3d> parse_side(const std::string& raw) {
     return v;
 }
 
+// I1 CATEGORY sentinel: "round"/"curved" is NOT a single kernel type — it means "any
+// non-planar surface" (cylinder OR cone OR sphere OR torus OR bspline) for faces, and
+// "any non-line curve" (circle OR ellipse OR bspline) for edges. canon_surf returns this
+// sentinel so the surf filter can match a CATEGORY (q_surf_type != "plane") instead of a
+// single type string. A user asking to "fillet all the round faces" of a cone/sphere/bottle
+// now gets every curved face, not EMPTY (the previous round->cylinder-ONLY alias).
+constexpr const char* kSurfCurvedCategory = "@curved";
+
 // Canonicalise a `surf` token into a kernel surface/curve name. Accepts the everyday
-// words a model uses ("flat"/"round"/"straight") resolved against whether we're filtering
-// faces or edges, plus every canonical kernel token unchanged. Returns "" for an
-// unrecognised token (the caller turns that into a teaching error).
+// words a model uses ("flat"/"round"/"curved"/"straight") resolved against whether we're
+// filtering faces or edges, plus specific curved-type words (conical/spherical/toroidal/
+// cylindrical) and every canonical kernel token unchanged. Returns the kSurfCurvedCategory
+// sentinel for the "round"/"curved" CATEGORY, or "" for an unrecognised token (the caller
+// turns that into a teaching error).
 std::string canon_surf(const std::string& raw, bool want_face) {
     const std::string s = lc(raw);
     if (want_face) {
         if (s == "flat"  || s == "planar")               return "plane";
-        if (s == "round" || s == "cylindrical")          return "cylinder";
+        // "round"/"curved" => any non-planar face (category match — see filter below).
+        if (s == "round" || s == "curved")               return kSurfCurvedCategory;
+        // Specific curved-type words let a user pick ONE kernel surface type.
+        if (s == "cylindrical")                          return "cylinder";
+        if (s == "conical")                              return "cone";
+        if (s == "spherical")                            return "sphere";
+        if (s == "toroidal")                             return "torus";
     } else {
         if (s == "straight")                             return "line";
-        if (s == "round" || s == "curved")               return "circle";
+        // "round"/"curved" => any non-line edge (category match — circle/ellipse/bspline).
+        if (s == "round" || s == "curved")               return kSurfCurvedCategory;
     }
     // Canonical kernel tokens pass through unchanged (preserves prior behaviour).
     static const char* kKnown[] = {"line", "circle", "ellipse", "bspline", "plane",
@@ -451,6 +560,14 @@ std::string canon_surf(const std::string& raw, bool want_face) {
     for (const char* k : kKnown)
         if (s == k) return s;
     return "";
+}
+
+// I1 category test: does candidate surf `cs` belong to the "curved" category? For both
+// faces and edges the curved set is everything that is NOT the straight/flat primitive:
+// faces -> any surf != "plane"; edges -> any surf != "line". ("other" counts as curved —
+// an unusual surface is still non-planar; better to include than silently drop it.)
+bool surf_is_curved(const std::string& cs) {
+    return cs != "plane" && cs != "line";
 }
 
 std::optional<Eigen::Vector3d> json_vec3(const nlohmann::json& j) {
@@ -491,6 +608,9 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
     const double tol = std::max(diag * 1e-3, 1e-6);
 
     // 1) enumerate UNIQUE sub-shapes + fingerprint each.
+    // I3 — body bbox center, the outward-direction origin for sphere/torus/bspline faces.
+    const Eigen::Vector3d body_center = want_face ? query_bbox_center(shape)
+                                                  : Eigen::Vector3d(0, 0, 0);
     TopTools_IndexedMapOfShape uniq;
     TopExp::MapShapes(shape, kind, uniq);
     std::vector<QCand> cands;
@@ -498,21 +618,47 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
         QCand c;
         c.shp = uniq(i);
         GProp_GProps props;
+        // I3 — captured for the representative-direction computation (after centroid known).
+        GeomAbs_SurfaceType face_st = GeomAbs_OtherSurface;
+        std::optional<Eigen::Vector3d> plane_axis;  // signed outward plane normal
+        std::optional<Eigen::Vector3d> axis_loc;    // a point ON the cyl/cone axis
         if (want_face) {
             TopoDS_Face f = TopoDS::Face(c.shp);
             BRepGProp::SurfaceProperties(f, props);
             BRepAdaptor_Surface ad(f);
             GeomAbs_SurfaceType st = ad.GetType();
+            face_st = st;
             c.surf = q_surf_type(st);
             try {
-                if (st == GeomAbs_Plane) c.axis = Eigen::Vector3d(ad.Plane().Axis().Direction().X(),
-                    ad.Plane().Axis().Direction().Y(), ad.Plane().Axis().Direction().Z());
-                else if (st == GeomAbs_Cylinder) {
-                    c.axis = Eigen::Vector3d(ad.Cylinder().Axis().Direction().X(),
-                        ad.Cylinder().Axis().Direction().Y(), ad.Cylinder().Axis().Direction().Z());
+                if (st == GeomAbs_Plane) {
+                    gp_Dir pn = ad.Plane().Axis().Direction();
+                    // I3: signed outward normal (REVERSED faces face the opposite way), so
+                    // a flat cap's rep_dir distinguishes top from bottom — same convention
+                    // as describe_faces. The stored `axis` keeps the geometric (unsigned)
+                    // direction it always had, so the F5 score path is unchanged.
+                    c.axis = Eigen::Vector3d(pn.X(), pn.Y(), pn.Z());
+                    gp_Dir pn_signed = pn;
+                    if (f.Orientation() == TopAbs_REVERSED) pn_signed.Reverse();
+                    plane_axis = Eigen::Vector3d(pn_signed.X(), pn_signed.Y(), pn_signed.Z());
+                } else if (st == GeomAbs_Cylinder) {
+                    gp_Ax1 ax = ad.Cylinder().Axis();
+                    c.axis = Eigen::Vector3d(ax.Direction().X(), ax.Direction().Y(),
+                                             ax.Direction().Z());
+                    axis_loc = Eigen::Vector3d(ax.Location().X(), ax.Location().Y(),
+                                               ax.Location().Z());
                     c.radius = ad.Cylinder().Radius();  // inner/outer discriminator
-                } else if (st == GeomAbs_Cone) c.axis = Eigen::Vector3d(ad.Cone().Axis().Direction().X(),
-                    ad.Cone().Axis().Direction().Y(), ad.Cone().Axis().Direction().Z());
+                    // Concavity from REAL geometry (C5): compare the outward material normal to
+                    // the radial direction. The raw face Orientation() flag is unreliable after
+                    // boolean+fillet (a convex fillet can come back REVERSED), so we don't trust
+                    // it. nullopt (degenerate normal) -> fall back to the radius heuristic.
+                    c.concave = cylinder_face_concave(f);
+                } else if (st == GeomAbs_Cone) {
+                    gp_Ax1 ax = ad.Cone().Axis();
+                    c.axis = Eigen::Vector3d(ax.Direction().X(), ax.Direction().Y(),
+                                             ax.Direction().Z());
+                    axis_loc = Eigen::Vector3d(ax.Location().X(), ax.Location().Y(),
+                                               ax.Location().Z());
+                }
             } catch (const Standard_Failure&) { c.axis = std::nullopt; }
         } else {
             TopoDS_Edge e = TopoDS::Edge(c.shp);
@@ -533,6 +679,13 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
         c.measure = props.Mass();
         gp_Pnt cm = props.CentreOfMass();
         c.centroid = Eigen::Vector3d(cm.X(), cm.Y(), cm.Z());
+        // I3 — representative outward direction for EVERY face (computed after the centroid).
+        if (want_face) {
+            try {
+                c.rep_dir = query_rep_dir(face_st, c.centroid, plane_axis, c.axis, axis_loc,
+                                          body_center);
+            } catch (const Standard_Failure&) { c.rep_dir = std::nullopt; }
+        }
         cands.push_back(std::move(c));
     }
 
@@ -544,8 +697,9 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
         surf_f = canon_surf(q["surf"].get<std::string>(), want_face);
         if (surf_f.empty()) {
             out.error = "geom query: unknown 'surf' '" + q["surf"].get<std::string>() +
-                        (want_face ? "' (faces: flat/round or plane/cylinder/cone/sphere/torus)"
-                                   : "' (edges: straight/round or line/circle/ellipse/bspline)");
+                        (want_face ? "' (faces: flat/round/curved, cylindrical/conical/spherical/"
+                                     "toroidal, or plane/cylinder/cone/sphere/torus)"
+                                   : "' (edges: straight/round/curved or line/circle/ellipse/bspline)");
             return out;
         }
     }
@@ -554,7 +708,15 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
     if (par) par->normalize();
     if (per) per->normalize();
     for (const QCand& c : cands) {
-        if (!surf_f.empty() && c.surf != surf_f) continue;
+        if (!surf_f.empty()) {
+            // I1: the "round"/"curved" category matches ANY non-planar (face) / non-line
+            // (edge) surface; every other token is an exact kernel-type match as before.
+            if (surf_f == kSurfCurvedCategory) {
+                if (!surf_is_curved(c.surf)) continue;
+            } else if (c.surf != surf_f) {
+                continue;
+            }
+        }
         if (par) {
             if (!c.axis) continue;
             if (std::abs(std::abs(c.axis->dot(*par)) - 1.0) > 1e-6) continue;
@@ -566,7 +728,21 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
         keep.push_back(&c);
     }
 
-    // 3) side: keep only the extreme-centroid set along the signed axis (or direction word).
+    // 3) side: keep only the extreme set along the signed axis (or direction word).
+    //    I3 — rank by a SCORE that blends the centroid projection (primary, keeps the flat
+    //    cap winning top/bottom) with the representative-direction alignment (so a CURVED
+    //    face whose outward direction faces the requested side is selectable even when its
+    //    centroid sits on the body axis — a cone/sphere/torus patch that centroid projection
+    //    alone can't separate). The direction term is weighted by a fraction of the bbox
+    //    diagonal so it acts as a tie-breaker among centroid-equal faces (e.g. a sphere's
+    //    hemispheres, both centred on the body) and NEVER overrides a genuinely higher
+    //    centroid (a box's top face still beats its side faces). B5 largest-area tie-break
+    //    below still fires for genuine ties.
+    //    score(c) = centroid·dir + kDirWeight * diag * (rep_dir·dir)
+    //    kDirWeight = 0.25: for a unit-cube the side-face centroid sits 0.5*diag below the
+    //    top, while a side face's rep_dir·(+z)=0 vs the top's +1 contributes 0.25*diag — so
+    //    the top (0.5+0.25 ahead) still wins outright; planar ordering is unchanged. But two
+    //    faces at the SAME centroid height are separated purely by which way they face.
     if (q.contains("side") && q["side"].is_string()) {
         std::optional<Eigen::Vector3d> dir = parse_side(q["side"].get<std::string>());
         if (!dir) {
@@ -574,19 +750,68 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
                         "' (use top/bottom/left/right/front/back or +x/-x/+y/-y/+z/-z)";
             return out;
         }
+        constexpr double kDirWeight = 0.25;
+        const double dir_scale = kDirWeight * diag;
+        auto side_score = [&](const QCand* c) -> double {
+            double s = c->centroid.dot(*dir);
+            if (c->rep_dir) s += dir_scale * c->rep_dir->dot(*dir);
+            return s;
+        };
+        // CAP PREFERENCE (revolved-part fix): when this is a FACE query and the body has
+        // PLANAR faces whose normal is PARALLEL to the queried direction (|rep_dir·dir| ~ 1
+        // — axis-perpendicular CAPS like a flange top/bottom), restrict the set to those
+        // caps before taking the centroid-extreme. This stops a PERPENDICULAR curved face
+        // (a bore/side wall, rep_dir ⟂ dir) from out-scoring a planar cap that genuinely
+        // faces the queried side — seen on uncentred revolved tubes/flanges where the cap
+        // sits at one end and the bore centroid lies BETWEEN the ends (so the bore's
+        // centroid·dir beat the cap's, and the cap's small dir-term couldn't recover it).
+        // Cap identification uses |rep_dir·dir| (SIGN-INDEPENDENT, so a mis-signed revolved
+        // planar-face normal still counts as a cap); top-vs-bottom is then decided purely by
+        // the centroid projection below (reliable). Untouched for curved-only bodies
+        // (sphere/cone — no parallel planar cap) and slanted tops (|rep_dir·dir| < 0.9), which
+        // keep using the centroid+direction blend.
+        if (want_face) {
+            constexpr double kCapParallel = 0.9;
+            std::vector<const QCand*> caps;
+            for (const QCand* c : keep)
+                if (c->surf == "plane" && c->rep_dir &&
+                    std::abs(c->rep_dir->dot(*dir)) >= kCapParallel)
+                    caps.push_back(c);
+            if (!caps.empty()) keep.swap(caps);
+        }
         double best = -std::numeric_limits<double>::infinity();
-        for (const QCand* c : keep) best = std::max(best, c->centroid.dot(*dir));
+        for (const QCand* c : keep) best = std::max(best, side_score(c));
         std::vector<const QCand*> ext;
         for (const QCand* c : keep)
-            if (c->centroid.dot(*dir) >= best - tol) ext.push_back(c);
+            if (side_score(c) >= best - tol) ext.push_back(c);
+        // B5 face-only tie-break: when multiple FACES share the same extreme centroid (e.g. a
+        // linear_pattern that creates several co-planar top faces alongside the dominant plate
+        // top), keep only the largest-area ones (with relative tolerance). This is a
+        // deterministic tie-break so "the top face" always selects the dominant face, not an
+        // arbitrarily chosen small boss top. Applied only to face queries (not edges — edge
+        // tie-breaking at the same height is intentional, e.g. top-rim has 4 edges). Also
+        // skipped when an explicit `pick` key is present (pick has its own selection logic).
+        if (want_face && ext.size() > 1 && !q.contains("pick")) {
+            double max_m = 0.0;
+            for (const QCand* c : ext) max_m = std::max(max_m, c->measure);
+            const double mtol = std::max(std::abs(max_m) * 1e-3, 1e-9);
+            std::vector<const QCand*> dominant;
+            for (const QCand* c : ext)
+                if (c->measure >= max_m - mtol) dominant.push_back(c);
+            // Only apply the tie-break if it actually reduces the set (paranoia guard:
+            // if all faces have equal area, the set is unchanged and all are returned).
+            if (!dominant.empty()) ext.swap(dominant);
+        }
         keep.swap(ext);
     }
 
     // 3b) pick: keep the extreme set. largest/smallest face by area, longest/shortest
     //     edge by length — a model with no spatial sense can say "the largest face"
-    //     instead of computing areas. inner/outer (also innermost/outermost/bore) rank by
-    //     RADIUS among round candidates, the plain-language way to tell coaxial geometry
-    //     apart: the inner vs outer wall of a tube, the bore vs the rim. Near-equal values
+    //     instead of computing areas. inner/outer (also innermost/outermost/bore) classify
+    //     by CONCAVITY for cylindrical faces (C5 fix: bore = concave = TopAbs_REVERSED
+    //     orientation; boss/fillet = convex = TopAbs_FORWARD). When all candidates lack
+    //     orientation data (edges, or a body with only one cylinder), fall back to ranking
+    //     by radius so "inner" still means the smaller circle. Near-equal radius values
     //     co-rank (a relative tolerance) so a symmetric body keeps the opposite pair;
     //     combine with `side` or add count:1 to force a single result.
     if (q.contains("pick") && q["pick"].is_string()) {
@@ -603,23 +828,46 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
             return out;
         }
         if (want_inner || want_outer) {
-            // Rank by radius; ignore candidates with no radius (planes/lines) entirely.
+            // Collect round candidates only (those with a radius).
             std::vector<const QCand*> round;
             for (const QCand* c : keep) if (c->radius) round.push_back(c);
             if (round.empty()) {
-                out.error = "geom query: pick '" + p +
-                            "' needs round faces/edges (cylinders or circles); none matched";
-                return out;
+                // I2: no round faces/edges to rank — return an EMPTY result GRACEFULLY
+                // (0 matches, no error), consistent with every other no-match query (e.g.
+                // surf:round on a box). Previously this THREW a teaching error, which made
+                // an honest "this body has no bores" look like a query bug to the caller.
+                keep.clear();
+            } else {
+                // C5 fix: classify by CONCAVITY when orientation data is available.
+                // Concavity (c->concave) is set only for cylindrical faces (not edges).
+                // Count how many round candidates have orientation info.
+                int with_concavity = 0;
+                for (const QCand* c : round) if (c->concave.has_value()) ++with_concavity;
+                std::vector<const QCand*> sel;
+                if (with_concavity > 0) {
+                    // Primary: classify by concavity (bore=concave=inner; boss=convex=outer).
+                    // Any candidate lacking orientation data (e.g. edges in a mixed query)
+                    // is excluded from the concavity split and falls through to the radius
+                    // fallback below. If the concavity split yields a non-empty result, use it.
+                    for (const QCand* c : round) {
+                        if (!c->concave.has_value()) continue;
+                        const bool is_inner_by_shape = *c->concave;  // true=bore, false=boss
+                        if (want_inner == is_inner_by_shape) sel.push_back(c);
+                    }
+                }
+                if (sel.empty()) {
+                    // Fallback: rank by radius (smaller = inner, larger = outer). Used for
+                    // circular edges (which have no face orientation) and degenerate cases.
+                    double ext = want_outer ? -std::numeric_limits<double>::infinity()
+                                            :  std::numeric_limits<double>::infinity();
+                    for (const QCand* c : round)
+                        ext = want_outer ? std::max(ext, *c->radius) : std::min(ext, *c->radius);
+                    const double rtol = std::max(std::abs(ext) * 1e-3, 1e-9);
+                    for (const QCand* c : round)
+                        if (std::abs(*c->radius - ext) <= rtol) sel.push_back(c);
+                }
+                keep.swap(sel);
             }
-            double ext = want_outer ? -std::numeric_limits<double>::infinity()
-                                    :  std::numeric_limits<double>::infinity();
-            for (const QCand* c : round)
-                ext = want_outer ? std::max(ext, *c->radius) : std::min(ext, *c->radius);
-            const double rtol = std::max(std::abs(ext) * 1e-3, 1e-9);
-            std::vector<const QCand*> sel;
-            for (const QCand* c : round)
-                if (std::abs(*c->radius - ext) <= rtol) sel.push_back(c);
-            keep.swap(sel);
         } else if (!keep.empty()) {
             double ext = want_max ? -std::numeric_limits<double>::infinity()
                                   :  std::numeric_limits<double>::infinity();
@@ -630,6 +878,22 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
             for (const QCand* c : keep)
                 if (std::abs(c->measure - ext) <= mtol) sel.push_back(c);
             keep.swap(sel);
+        }
+    }
+
+    // K10/K11: validate `count` early — an invalid value (< 1) is a logic error that
+    // would silently return ALL matches (n >= 0 guard below would clamp to 0 and return
+    // nothing, or a negative skipped the resize). Both are confusing; reject loudly so
+    // the caller can fix the query rather than wondering why they got unexpected results.
+    if (q.contains("count")) {
+        if (!q["count"].is_number_integer() && !q["count"].is_number_unsigned()) {
+            out.error = "geom query: 'count' must be an integer >= 1";
+            return out;
+        }
+        const int count_val = q.value("count", 1);
+        if (count_val < 1) {
+            out.error = "geom query: count must be >= 1 (got " + std::to_string(count_val) + ")";
+            return out;
         }
     }
 

@@ -229,6 +229,93 @@ TEST_CASE("A6 no matching kind: dangling with the matching-kind reason") {
 // GROUP B — OCCT describers + end-to-end
 // ===========================================================================
 
+// A7. F5 SYMMETRIC-PLATE SIGNED-NORMAL TIE-BREAK. A 100×100×5 plate has a +Z top
+//   face and a -Z bottom face with IDENTICAL area (10000 mm²) and mirror-symmetric
+//   centroids. Their pure scores differ by only ~0.014 (well within the 0.05 ambiguous
+//   band), so the main margin gate would normally dangle. The selector is built for
+//   the BOTTOM face (axis -Z). The signed-normal tie-break must resolve to the bottom
+//   face (negative-Z axis) and NOT to the top face (positive-Z axis). The safety gate
+//   (best_align > 0.5 AND gap > 0.5) must hold: top/bottom gives aligns ~+1 vs ~-1,
+//   gap ~2 >> 0.5. A genuinely-ambiguous axis-less pair (two vertices equidistant)
+//   must still dangle (confirming the §5 vertex case is untouched).
+TEST_CASE("A7 F5 symmetric plate: signed-normal tie-break resolves bottom face, vertex tie still dangles") {
+    // Build plate-like face TopoInfos: top (+Z, index 0) and bottom (-Z, index 1).
+    // Area 10000, centroids ±2.5 on Z, selector centred exactly between them (z=0).
+    auto face_info = [](int idx, Eigen::Vector3d centroid, Eigen::Vector3d axis, double area) {
+        TopoInfo t;
+        t.kind = "face";
+        t.index = idx;
+        t.surf = std::string("plane");
+        t.centroid = centroid;
+        t.axis = axis;
+        t.measure = area;
+        t.owner = std::nullopt;
+        t.hint_index = idx;
+        return t;
+    };
+
+    // The selector represents a previously-picked "bottom" face (axis -Z, centroid z=0).
+    // In a stored selector the centroid is the ACTUAL centroid of the bottom face at pick
+    // time; here we place the selector centroid exactly at the bottom face's centroid so
+    // the bottom face has a marginally better score than the top — mirroring the real
+    // plate case where a slight centroid distance difference yields margin ~0.014.
+    const double AREA = 10000.0;
+    TopoInfo top    = face_info(0, {50, 50,  2.5}, { 0,  0,  1}, AREA);
+    TopoInfo bottom = face_info(1, {50, 50, -2.5}, { 0,  0, -1}, AREA);
+
+    // Selector: face, surf=plane, axis=-Z, centroid at bottom face's centroid (z=-2.5).
+    // This mirrors what make_selector would emit for the bottom face at pick time.
+    json sel_bottom;
+    sel_bottom["kind"]          = "face";
+    sel_bottom["surf"]          = "plane";
+    sel_bottom["centroid"]      = json::array({50.0, 50.0, -2.5});
+    sel_bottom["axis"]          = json::array({0.0, 0.0, -1.0});  // -Z = bottom normal
+    sel_bottom["area_or_len"]   = AREA;
+    sel_bottom["owner_feature"] = nullptr;
+    sel_bottom["hint_index"]    = 1;
+
+    // bbox_diag for a 100×100×5 plate ≈ 141.4.
+    double diag = std::sqrt(100.0*100.0 + 100.0*100.0 + 5.0*5.0);
+
+    std::vector<TopoInfo> plate_faces = {top, bottom};
+    ResolveResult r = resolve(sel_bottom, plate_faces, diag);
+
+    // Must resolve to the bottom face (index 1) not dangle.
+    REQUIRE(r.index.has_value());
+    CHECK(*r.index == 1);   // bottom face (-Z)
+    CHECK_FALSE(r.dangling_reason.has_value());
+    MESSAGE("A7 F5 plate-bottom: resolved index=" << *r.index
+            << " score=" << r.score << " second=" << r.second_score);
+
+    // Sanity: selector with axis +Z (top face) must resolve to the TOP face (index 0).
+    json sel_top;
+    sel_top["kind"]          = "face";
+    sel_top["surf"]          = "plane";
+    sel_top["centroid"]      = json::array({50.0, 50.0, 2.5});
+    sel_top["axis"]          = json::array({0.0, 0.0, 1.0});  // +Z = top normal
+    sel_top["area_or_len"]   = AREA;
+    sel_top["owner_feature"] = nullptr;
+    sel_top["hint_index"]    = 0;
+
+    ResolveResult r2 = resolve(sel_top, plate_faces, diag);
+    REQUIRE(r2.index.has_value());
+    CHECK(*r2.index == 0);  // top face (+Z)
+    CHECK_FALSE(r2.dangling_reason.has_value());
+    MESSAGE("A7 F5 plate-top: resolved index=" << *r2.index);
+
+    // §5 safety: two axis-LESS vertices equidistant from selector must still dangle.
+    // This confirms the signed-normal fix doesn't bleed into vertex resolution.
+    std::vector<TopoInfo> sym_verts = {
+        vtx(10,  10, 0, 0),
+        vtx(11, -10, 0, 0),
+    };
+    ResolveResult rv = resolve(vtx_selector(0, 0, 0), sym_verts, 100.0);
+    CHECK_FALSE(rv.index.has_value());
+    REQUIRE(rv.dangling_reason.has_value());
+    CHECK(rv.dangling_reason->find("margin") != std::string::npos);
+    MESSAGE("A7 F5 vertex-sym still dangles: " << *rv.dangling_reason);
+}
+
 // B7. describe_faces over a 20x10x6 box (min corner at origin): 6 planar faces,
 //   each with a unit axis, areas summing to the box surface area, and the +Z top
 //   face is identifiable (centroid z=6, axis ~ +/-Z, area=200).

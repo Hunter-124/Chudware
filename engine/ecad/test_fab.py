@@ -717,6 +717,44 @@ def test_placement(board: dict) -> None:
     print("  PASS: natural sort order C1, R1, R2, R10")
 
 
+# ── Test M5: rows count excludes CSV header ──────────────────────────────────
+
+def test_m5_bom_rows_excludes_header() -> None:
+    """M5: write_bom CSV text.count('\\n') includes the header line; the MCP tool subtracts 1.
+    Verify the raw CSV has exactly (data_rows + 1) newlines so the fix is correct."""
+    board = _make_test_board()
+    csv_text = write_bom(board, fmt="csv")
+    reader = csv.DictReader(io.StringIO(csv_text))
+    data_rows = list(reader)
+    n_data = len(data_rows)  # 4 for the test board (TP1/virtual excluded)
+    n_newlines = csv_text.count("\n")
+    # The CSV must have exactly one more newline than data rows (the header line).
+    assert n_newlines == n_data + 1, (
+        f"BOM CSV: {n_data} data rows but {n_newlines} newlines — "
+        f"expected {n_data + 1} (header + data); "
+        f"MCP rows fix (subtract 1) would report {n_newlines - 1} = {n_data} ✓")
+    # Verify the MCP subtraction yields the correct data-only count
+    mcp_rows = max(0, n_newlines - 1)
+    assert mcp_rows == n_data, f"MCP rows={mcp_rows} should equal data rows={n_data}"
+    print(f"  PASS: BOM CSV {n_newlines} newlines, {n_data} data rows; MCP rows={mcp_rows}")
+
+
+def test_m5_placement_rows_excludes_header() -> None:
+    """M5: same header-line fix applies to placement CSV."""
+    board = _make_test_board()
+    from engine.ecad.fab.placement import write_placement as _wp
+    cpl_text = _wp(board)
+    reader = csv.DictReader(io.StringIO(cpl_text))
+    data_rows = list(reader)
+    n_data = len(data_rows)
+    n_newlines = cpl_text.count("\n")
+    assert n_newlines == n_data + 1, (
+        f"Placement CSV: {n_data} data rows but {n_newlines} newlines; expected {n_data + 1}")
+    mcp_rows = max(0, n_newlines - 1)
+    assert mcp_rows == n_data
+    print(f"  PASS: Placement CSV {n_newlines} newlines, {n_data} data rows; MCP rows={mcp_rows}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -729,6 +767,10 @@ def main() -> None:
     test_bom(board)
     print()
     test_placement(board)
+    print()
+    test_m5_bom_rows_excludes_header()
+    print()
+    test_m5_placement_rows_excludes_header()
     print("\n=== ALL PASS ===")
 
 

@@ -18,6 +18,7 @@
 #include <map>
 #include <mutex>
 #include <regex>
+#include <thread>
 #include <set>
 #include <string>
 #include <vector>
@@ -60,6 +61,8 @@
 #include <TopExp.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
+#include <TopTools_ListOfShape.hxx>
+#include <TopTools_ListIteratorOfListOfShape.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepCheck_Result.hxx>
 #include <BRepCheck_ListOfStatus.hxx>
@@ -75,10 +78,13 @@
 #include <GeomAbs_SurfaceType.hxx>
 #include <GeomAbs_CurveType.hxx>
 #include <ShapeAnalysis_Surface.hxx>
+#include <ShapeAnalysis_FreeBounds.hxx>     // section_props: group multi-loop section edges into closed wires
+#include <TopTools_HSequenceOfShape.hxx>    // ConnectEdgesToWires in/out sequences
 #include <Geom_Surface.hxx>
 #include <gp_Circ.hxx>
 #include <gp_Pnt2d.hxx>
 #include <TopoDS_Edge.hxx>
+#include <TopoDS_Wire.hxx>  // section_props stores closed section loops by value
 #include <TopoDS_Vertex.hxx>
 
 #include <Eigen/Eigenvalues>
@@ -153,6 +159,35 @@ struct Session {
 constexpr std::size_t kUndoLimit = 100;
 
 std::mutex g_mtx;
+// Owner-tracking for crash recovery (see force_release_doc_lock / session.h). We
+// record which thread currently holds g_mtx so that, if a Windows structured
+// exception (an access violation) unwinds PAST a DocLock without running its C++
+// destructor under /EHsc, the dispatch boundary can detect the orphaned lock —
+// owned by this very thread — and drop it before serving the next call. A plain
+// std::mutex exposes no owner, so we maintain it ourselves. g_mtx_held is true
+// only while a DocLock is alive; g_mtx_owner is meaningful only when held.
+std::atomic<bool> g_mtx_held{false};
+std::thread::id g_mtx_owner;  // guarded by g_mtx (only read/written while held)
+
+// RAII lock for the process-global session store. Behaves exactly like
+// std::lock_guard<std::mutex> on g_mtx for the normal (success / C++-exception)
+// paths — the destructor releases on stack unwind — while additionally stamping
+// the owning thread so an SEH-orphaned lock is recoverable (force_release_doc_lock).
+class DocLock {
+public:
+    DocLock() {
+        g_mtx.lock();
+        g_mtx_owner = std::this_thread::get_id();
+        g_mtx_held.store(true, std::memory_order_release);
+    }
+    ~DocLock() {
+        g_mtx_held.store(false, std::memory_order_release);
+        g_mtx.unlock();
+    }
+    DocLock(const DocLock&) = delete;
+    DocLock& operator=(const DocLock&) = delete;
+};
+
 std::map<std::string, Session> g_sessions;
 std::atomic<unsigned long long> g_doc_seq{1};
 std::atomic<unsigned long long> g_ckpt_seq{1};
@@ -360,7 +395,15 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
     // mistargeting bug T-1). `copy` is transform's instancing flag, same hazard.
     if (env["params"].is_object()) {
         for (const char* k : {"mode", "merge", "centered", "at", "at_offset", "offset",
-                              "body", "copy"}) {
+                              "body", "copy",
+                              // W1: `positions` on hole/bolt_circle is documented as a top-level
+                              // field but was silently dropped because op_add_feature copies only
+                              // type/name/suppressed/params/refs/folder into the stored feature.
+                              // Without hoisting it here the feature built only ONE hole at the
+                              // face centre (the default when no positions are given). Hoist it
+                              // into params exactly like `body`/`copy` so both placements produce
+                              // the same N-hole result — consistent with the no-silent-drop rule.
+                              "positions"}) {
             if (feat.contains(k) && !env["params"].contains(k)) env["params"][k] = feat[k];
         }
     }
@@ -507,6 +550,74 @@ void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen
         for (std::size_t k = 1; k < ids.size(); ++k)
             id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = ids[k];
         return;
+    }
+
+    // REGULAR POLYGON convenience entity: {type:"polygon"|"regular_polygon"|"hexagon", center:[x,y],
+    // sides:N, and ONE size — across_flats (wrench/spanner size), circumradius/radius (centre->vertex),
+    // or inradius/apothem} expands to N closed line segments. A small local model can't reliably draw
+    // a closed hexagon as a spline (it emits an OPEN spline -> no region -> "extrude produced no
+    // solid"); this gives it a clean closed hex/nut/bolt-head profile in one entity. type:"hexagon"
+    // implies sides=6. Plain lines downstream, so the solver / region-detect / profile.cpp need no
+    // polygon awareness — same trick as the airfoil entity above.
+    {
+        const std::string et = ent.value("type", std::string());
+        if (et == "polygon" || et == "regular_polygon" || et == "ngon" || et == "hexagon") {
+            int n = et == "hexagon" ? 6 : 0;
+            for (const char* k : {"sides", "n", "num_sides", "count"})
+                if (ent.contains(k) && ent[k].is_number_integer()) { n = ent[k].get<int>(); break; }
+            if (n == 0 && et == "hexagon") n = 6;
+            if (n < 3) throw OpError("invalid_op",
+                                     "polygon: needs 'sides' >= 3 (e.g. {\"type\":\"polygon\","
+                                     "\"sides\":6,\"across_flats\":12})");
+            double cx = 0.0, cy = 0.0;
+            if (ent.contains("center") && ent["center"].is_array() && ent["center"].size() >= 2) {
+                cx = ent["center"][0].get<double>();
+                cy = ent["center"][1].get<double>();
+            }
+            auto getnum = [&](std::initializer_list<const char*> keys, double* out) -> bool {
+                for (const char* k : keys)
+                    if (ent.contains(k) && ent[k].is_number()) { *out = ent[k].get<double>(); return true; }
+                return false;
+            };
+            const double apo = std::cos(M_PI / n);  // inradius / circumradius
+            double v = 0.0, R = 0.0;
+            if (getnum({"circumradius", "radius", "r", "vertex_radius"}, &v)) R = v;
+            else if (getnum({"across_flats", "width_across_flats", "af", "wrench", "flats",
+                             "flat_to_flat", "width"}, &v)) R = (v * 0.5) / apo;
+            else if (getnum({"inradius", "apothem"}, &v)) R = v / apo;
+            else if (getnum({"diameter"}, &v)) R = v * 0.5;  // circum-diameter
+            if (!(R > 0.0))
+                throw OpError("invalid_op",
+                              "polygon: needs a size — 'across_flats' (wrench size), 'circumradius', "
+                              "or 'inradius' (mm)");
+            double rot = 0.0;
+            for (const char* k : {"rotation", "angle"})
+                if (ent.contains(k) && ent[k].is_number()) { rot = ent[k].get<double>(); break; }
+            rot *= M_PI / 180.0;
+            const bool constr = ent.value("construction", false);
+            std::vector<std::array<double, 2>> verts;
+            for (int i = 0; i < n; ++i) {
+                double a = rot + 2.0 * M_PI * i / n;
+                verts.push_back({cx + R * std::cos(a), cy + R * std::sin(a)});
+            }
+            std::vector<std::string> ids;
+            for (int i = 0; i < n; ++i) {
+                const auto& a = verts[i];
+                const auto& b = verts[(i + 1) % n];
+                json ln;
+                ln["type"] = "line";
+                ln["p1"] = json::array({a[0], a[1]});
+                ln["p2"] = json::array({b[0], b[1]});
+                ln["id"] = gen.next("e");
+                ln["construction"] = constr;
+                ids.push_back(ln["id"].get<std::string>());
+                sk["params"]["entities"].push_back(std::move(ln));
+            }
+            id_map["$" + std::to_string(idx)] = ids.empty() ? std::string() : ids[0];
+            for (std::size_t k = 1; k < ids.size(); ++k)
+                id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = ids[k];
+            return;
+        }
     }
 
     const std::string eid = gen.next("e");
@@ -2475,7 +2586,34 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
         return ops_response(s, r, id_map, /*with_tess=*/true);
     }
 
-    if (!coalesce) push_undo(s);
+    // Bugs C2/C3/C4 — failed-batch undo corruption. Below we optimistically commit the
+    // edit (push the undo snapshot, swap in `working`, bump the revision) BEFORE compiling.
+    // If the batch then fails to compile (a feature errored — fillet that can't apply, a
+    // boolean that produced nothing, etc., so r.ok==false), we MUST NOT leave that wreckage
+    // behind: a ghost revision on the undo stack + an errored feature in the live tree make
+    // later undo/redo step through phantom states and block a subsequent edit_feature.
+    // So we snapshot the EXACT pre-batch session state (doc, revision, both stacks, dirty)
+    // and, on a rejected compile, restore all of it verbatim — no ghost revision, no errored
+    // feature persisted, stacks untouched. We then RETURN the normal ops-response (with the
+    // per-feature failure surfaced in r.statuses), NOT throw: doc_apply_ops's contract is an
+    // in-band {ok:false} rejection at rc 0 (the original pre-C2/C3/C4 return path), so the
+    // Python add_features wrapper sees the failing feature_status, reverts, and reports
+    // rolled_back:true. The SUCCESSFUL path is byte-for-byte identical to before (push undo
+    // => clears redo, swap doc, bump revision, return the compiled response).
+    const json pre_doc = s.doc;  // deep copy of the live tree (cheap vs. a corrupted doc)
+    const long pre_revision = s.revision;
+    const std::vector<std::string> pre_undo = s.undo_stack;
+    const std::vector<std::string> pre_redo = s.redo_stack;
+    const bool pre_dirty = s.dirty;
+    auto restore_pre_batch = [&]() {
+        s.doc = pre_doc;
+        s.revision = pre_revision;
+        s.undo_stack = pre_undo;
+        s.redo_stack = pre_redo;
+        s.dirty = pre_dirty;
+    };
+
+    if (!coalesce) push_undo(s);  // NOTE: push_undo clears the redo stack
     s.doc = std::move(working);
     s.revision += 1;
     s.dirty = true;
@@ -2484,6 +2622,19 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
         return ops_response_assembly(s, id_map);
     }
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    if (!r.ok) {
+        // Rejected batch: restore the document AND the undo/redo stacks to exactly their
+        // pre-batch state — no ghost revision, no errored feature persisted, stacks untouched
+        // (the load-bearing C2/C3/C4 correctness fix). We do NOT throw: doc_apply_ops returns
+        // an in-band rejection at rc 0 (the original contract), so the caller reads the
+        // per-feature failure out of feature_status. `r` was compiled against the failing
+        // `working` tree, so r.statuses carries the offending feature (ok:false + error);
+        // ops_response surfaces it while reporting the restored (pre-batch) revision/tree —
+        // nothing from the batch was kept. The Python add_features wrapper then sees ok==false
+        // (some feature_status.ok is false), reverts its checkpoint, and reports rolled_back:true.
+        restore_pre_batch();
+        return ops_response(s, r, id_map, /*with_tess=*/true);
+    }
     return ops_response(s, r, id_map, /*with_tess=*/true);
 }
 
@@ -2767,13 +2918,35 @@ json sketch_result(const json& feat, const SolveActive& packed,
 
 }  // namespace
 
+// ----------------------------------------------------------------- crash recovery
+// Drop an orphaned g_mtx lock left held by THIS thread after a Windows structured
+// exception (an access violation) unwound past a DocLock without running its C++
+// destructor under /EHsc. Called from the libaicad C dispatch boundary's __except
+// filter after such a fault, so the worker thread doesn't EDEADLK on its next call.
+//
+// SAFETY: an SEH unwind returns control to this same thread with the OS mutex STILL
+// owned by it (the lock_guard destructor was skipped, so no unlock ran). Calling
+// unlock() from the owning thread is therefore valid and exactly undoes the orphaned
+// lock(). We gate on g_mtx_held && g_mtx_owner == this-thread so we NEVER unlock a
+// mutex this thread doesn't own (which would be UB) and NEVER touch a lock another
+// thread legitimately holds. Idempotent: a second call no-ops once the flag is clear.
+bool force_release_doc_lock() {
+    if (!g_mtx_held.load(std::memory_order_acquire)) return false;
+    // g_mtx_owner is only meaningful while held; it was last written under the lock by
+    // the DocLock that is now orphaned on THIS thread, so the read is consistent here.
+    if (g_mtx_owner != std::this_thread::get_id()) return false;
+    g_mtx_held.store(false, std::memory_order_release);
+    g_mtx.unlock();
+    return true;
+}
+
 // ----------------------------------------------------------------- public API
 json doc_new(const std::string& kind, const std::string& name) {
     const std::string k = kind.empty() ? std::string("part") : kind;
     if (k != "part" && k != "assembly")
         throw OpError("invalid_op", "doc kind must be part|assembly, got '" + k + "'",
                       {{"kind", kind}, {"reason", "bad kind"}});
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     if (k == "assembly") {
         Session s;
         s.doc_id = new_doc_id();
@@ -2793,13 +2966,13 @@ json doc_new(const std::string& kind, const std::string& name) {
 }
 
 json doc_apply_ops(const std::string& doc_id, long base_revision, const json& ops, bool coalesce) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     return apply_ops_locked(s, base_revision, ops, coalesce);
 }
 
 json doc_dry_run_ops(const std::string& doc_id, const json& ops) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& live = require_session(doc_id);
     // Clone the live doc into a scratch session; apply_ops_locked there so the live
     // session (and its revision/undo stacks) is never touched. base_revision = -1
@@ -2810,7 +2983,32 @@ json doc_dry_run_ops(const std::string& doc_id, const json& ops) {
     scratch.doc = live.doc;        // deep copy of the feature tree json.
     scratch.revision = live.revision;
     try {
-        apply_ops_locked(scratch, -1, ops, /*coalesce=*/true);
+        // apply_ops_locked THROWS on a structural/validation rejection (caught below) but
+        // RETURNS an in-band rejection on a compile failure (per the batch-atomicity contract:
+        // the doomed batch is restored, then its per-feature failure is surfaced in
+        // rebuild.feature_status). The dry-run gate must report {ok:false} for BOTH, so we
+        // inspect the returned feature_status for any ok:false and compose the same error
+        // string shape (the failing features' messages joined) the throw path produces.
+        json resp = apply_ops_locked(scratch, -1, ops, /*coalesce=*/true);
+        std::vector<std::string> feat_errs;
+        if (resp.contains("rebuild") && resp["rebuild"].is_object() &&
+            resp["rebuild"].contains("feature_status") &&
+            resp["rebuild"]["feature_status"].is_array())
+            for (const json& st : resp["rebuild"]["feature_status"])
+                if (st.is_object() && !st.value("ok", true)) {
+                    std::string emsg = st.contains("error") && st["error"].is_string()
+                                           ? st["error"].get<std::string>()
+                                           : std::string("feature compile failed");
+                    feat_errs.push_back(st.value("id", std::string()) + ": " + emsg);
+                }
+        if (!feat_errs.empty()) {
+            std::string joined;
+            for (std::size_t i = 0; i < feat_errs.size() && i < 5; ++i) {
+                if (i) joined += "; ";
+                joined += feat_errs[i];
+            }
+            return json{{"ok", false}, {"error", "op batch rejected: " + joined}};
+        }
         return json{{"ok", true}};
     } catch (const OpError& e) {
         // Compose the error string the SAME way ops_emit.dry_run does:
@@ -2836,7 +3034,7 @@ json doc_dry_run_ops(const std::string& doc_id, const json& ops) {
 }
 
 json doc_undo(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     if (s.undo_stack.empty())
         throw OpError("invalid_op", "nothing to undo", {{"reason", "empty undo stack"}});
@@ -2858,7 +3056,7 @@ json doc_undo(const std::string& doc_id) {
 }
 
 json doc_redo(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     if (s.redo_stack.empty())
         throw OpError("invalid_op", "nothing to redo", {{"reason", "empty redo stack"}});
@@ -2879,7 +3077,7 @@ json doc_redo(const std::string& doc_id) {
 }
 
 json doc_tree(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     if (s.is_assembly()) {
         json resp;
@@ -2901,7 +3099,7 @@ json doc_live_source(const std::string& doc_id) {
     // Non-throwing peek at an open session's current tree + env (the associative source
     // for drawings / derived re-pulls). A missing doc returns null so the caller keeps
     // its last good snapshot rather than crashing when the source was closed.
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     auto it = g_sessions.find(doc_id);
     if (it == g_sessions.end()) return json(nullptr);
     Session& s = it->second;
@@ -2909,7 +3107,7 @@ json doc_live_source(const std::string& doc_id) {
 }
 
 json doc_rebuild(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     if (s.is_assembly()) {
         rebuild_assembly(s);
@@ -2926,7 +3124,7 @@ json doc_rebuild(const std::string& doc_id) {
 // explode view and re-tessellates without a revision bump.
 
 json doc_solve_mates(const std::string& doc_id, const json& drag) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     if (!s.is_assembly())
         throw OpError("invalid_op", "doc_solve_mates: document is not an assembly",
@@ -2964,7 +3162,7 @@ json doc_solve_mates(const std::string& doc_id, const json& drag) {
 }
 
 json doc_set_explode_state(const std::string& doc_id, bool active, double factor) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     if (!s.is_assembly())
         throw OpError("invalid_op", "doc_set_explode_state: document is not an assembly",
@@ -2983,7 +3181,7 @@ json doc_set_explode_state(const std::string& doc_id, bool active, double factor
 // part and assembly docs. The host fills/interprets every other field.
 
 json doc_sim_study_list(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     json resp;
     resp["studies"] = s.doc.value("studies", json::array());
@@ -2992,7 +3190,7 @@ json doc_sim_study_list(const std::string& doc_id) {
 }
 
 json doc_sim_study_add(const std::string& doc_id, const json& study) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     json entry = study.is_object() ? study : json::object();
     std::string id = entry.value("id", std::string());
@@ -3015,7 +3213,7 @@ json doc_sim_study_add(const std::string& doc_id, const json& study) {
 
 json doc_sim_study_edit(const std::string& doc_id, const std::string& study_id,
                         const json& study) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     bool found = false;
     if (s.doc.contains("studies") && s.doc["studies"].is_array()) {
@@ -3042,7 +3240,7 @@ json doc_sim_study_edit(const std::string& doc_id, const std::string& study_id,
 }
 
 json doc_sim_study_delete(const std::string& doc_id, const std::string& study_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     bool found = false;
     if (s.doc.contains("studies") && s.doc["studies"].is_array()) {
@@ -3073,11 +3271,34 @@ json doc_sim_study_delete(const std::string& doc_id, const std::string& study_id
 // export per body is overkill; instead we surface per-body world bbox + name, which is
 // what the parity harness compares and what eval_interference's assembly branch consumes.
 json doc_asm_world_bodies(const std::string& doc_id, bool explode) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
-    if (!s.is_assembly())
-        throw OpError("invalid_op", "doc_asm_world_bodies: document is not an assembly",
-                      {{"reason", "not an assembly"}});
+    if (!s.is_assembly()) {
+        // Multi-body PART fallback (Issue 9). A part assembled via import_part (several
+        // imported + transform-placed bodies) is not a formal assembly doc, but the caller
+        // still wants to see where each body sits in the shared frame. Compile and report each
+        // surviving body's bbox — already in world coordinates (a part's transforms place
+        // bodies absolutely). explode is an assembly-only concept here, so it is ignored.
+        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        json out = json::array();
+        for (std::size_t i = 0; i < r.shapes.size(); ++i) {
+            const TopoDS_Shape& world = r.shapes[i];
+            if (world.IsNull()) continue;
+            Bnd_Box box;
+            BRepBndLib::Add(world, box);
+            json bb = nullptr;
+            if (!box.IsVoid()) {
+                double xa, ya, za, xb, yb, zb;
+                box.Get(xa, ya, za, xb, yb, zb);
+                bb = {{"min", {xa, ya, za}}, {"max", {xb, yb, zb}},
+                      {"size", {xb - xa, yb - ya, zb - za}}};
+            }
+            const std::string nm =
+                i < r.bodies_info.size() ? r.bodies_info[i].name : ("Body" + std::to_string(i + 1));
+            out.push_back({{"name", nm}, {"component", nm}, {"bbox", bb}});
+        }
+        return json{{"bodies", out}, {"multibody_part", true}};
+    }
     if (!s.asm_result) rebuild_assembly(s);
     std::map<std::string, Eigen::Vector3d> offsets;
     if (explode && s.explode_active) offsets = explode_offsets(s.doc, s.explode_factor);
@@ -3105,7 +3326,7 @@ json doc_asm_world_bodies(const std::string& doc_id, bool explode) {
 json doc_asm_bom_components(const std::string& doc_id) {
     // Non-throwing: a missing / part / closed source returns an empty array so drawing_bom
     // degrades to an empty BOM rather than crashing (mirrors the oracle's try/except).
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     auto it = g_sessions.find(doc_id);
     if (it == g_sessions.end()) return json::array();
     Session& s = it->second;
@@ -3141,12 +3362,12 @@ json doc_asm_bom_components(const std::string& doc_id) {
 }
 
 bool doc_close(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     return g_sessions.erase(doc_id) > 0;
 }
 
 json doc_list() {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     json docs = json::array();
     for (const auto& [id, s] : g_sessions) {
         const std::string schema = s.doc.is_object() ? s.doc.value("schema", std::string()) : std::string();
@@ -3163,7 +3384,7 @@ json doc_list() {
 }
 
 json doc_checkpoint(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     const std::string cid = new_checkpoint_id();
     s.checkpoints[cid] = s.doc.dump();
@@ -3171,7 +3392,7 @@ json doc_checkpoint(const std::string& doc_id) {
 }
 
 json doc_revert(const std::string& doc_id, const std::string& checkpoint_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     auto it = s.checkpoints.find(checkpoint_id);
     if (it == s.checkpoints.end())
@@ -3197,7 +3418,7 @@ json doc_revert(const std::string& doc_id, const std::string& checkpoint_id) {
 // bump on any change. A closed source / deleted source feature leaves the group at last-good
 // and stamps derived_stale (never crashes). Returns the ops-response + a `derived` summary.
 json doc_refresh_derived(const std::string& doc_id, const std::string& id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
 
     // _derived_groups: group -> {source_doc_id, source_doc_name, members:[...]}, first-seen order.
@@ -3322,7 +3543,7 @@ json doc_refresh_derived(const std::string& doc_id, const std::string& id) {
 }
 
 json doc_config_list(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     json names = json::array();
     std::string active;
@@ -3351,7 +3572,7 @@ json doc_config_list(const std::string& doc_id) {
 }
 
 json doc_config_add(const std::string& doc_id, const std::string& name, const json& copy_from) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     if (name.empty())
         throw OpError("invalid_op", "config_add: 'name' must be a non-empty string",
@@ -3377,7 +3598,7 @@ json doc_config_add(const std::string& doc_id, const std::string& name, const js
 }
 
 json doc_config_delete(const std::string& doc_id, const std::string& name) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     json working = s.doc;
     const bool have = working.contains("configurations") && working["configurations"].is_array() &&
@@ -3407,7 +3628,7 @@ json doc_config_delete(const std::string& doc_id, const std::string& name) {
 }
 
 json doc_config_activate(const std::string& doc_id, const std::string& name) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     json working = s.doc;
     ensure_configs(working);
@@ -3420,7 +3641,7 @@ json doc_config_activate(const std::string& doc_id, const std::string& name) {
 json doc_config_set_override(const std::string& doc_id, const std::string& name,
                              const std::string& feature_id, const std::string& param,
                              const json& value, bool clear) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     json working = s.doc;
     json& cfg = find_config(working, name);
@@ -3437,7 +3658,7 @@ json doc_config_set_override(const std::string& doc_id, const std::string& name,
 
 json doc_config_set_suppression(const std::string& doc_id, const std::string& name,
                                 const std::string& feature_id, bool suppressed) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     json working = s.doc;
     json& cfg = find_config(working, name);
@@ -3489,7 +3710,7 @@ json resolve_pick_assembly(Session& s, int body_id, const std::string& kind, int
 
 json doc_resolve_pick(const std::string& doc_id, int body_id, const std::string& kind,
                       int topo_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     if (s.is_assembly())
         return resolve_pick_assembly(s, body_id, kind, topo_id);
@@ -3500,7 +3721,7 @@ json doc_resolve_pick(const std::string& doc_id, int body_id, const std::string&
 // SolidWorks "fillet a whole face": the host expands a face pick into the face's edge ids, then
 // resolves each to an edge selector. Returns {"edges": [topo_id, ...]} in the host's edge id space.
 json doc_face_edges(const std::string& doc_id, int body_id, int face_topo_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     if (s.is_assembly()) return json{{"edges", json::array()}};  // not supported for assemblies
     std::vector<int> e = face_edges(s.doc, env_from_doc(s.doc), body_id, face_topo_id);
@@ -3606,10 +3827,46 @@ json eval_surface_props(const TopoDS_Shape& shape, double density_g_cm3) {
     };
 }
 
+// True only when `shape` is a watertight CLOSED solid (or compound/compsolid of such) —
+// i.e. VolumeProperties yields a TRUSTWORTHY CoM / inertia. Bug J4: an open shell that
+// slipped past eval_is_surface_shape (e.g. an unsewn import that OCCT still types SOLID, or
+// a solid with genuine free edges) makes BRepGProp::VolumeProperties return garbage (CoM at
+// z≈0 on a 20 mm-tall part, negative principal moments). We detect this via a SEAM-EXCLUDED
+// free-edge census: a closed solid has every edge shared by two faces (seam/degenerate edges
+// excepted — those legitimately bound one face). Any genuinely free edge means the volume is
+// not enclosed, so the mass props are unreliable. Pure shells/faces are already routed to the
+// surface report before this is called; this catches the SOLID-typed-but-not-closed case.
+bool eval_is_closed_solid(const TopoDS_Shape& shape) {
+    try {
+        TopTools_IndexedDataMapOfShapeListOfShape anc;
+        TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, anc);
+        TopTools_IndexedMapOfShape edges;
+        TopExp::MapShapes(shape, TopAbs_EDGE, edges);
+        if (edges.Extent() == 0) return false;  // no faces/edges -> not a solid
+        for (int ei = 1; ei <= edges.Extent(); ++ei) {
+            const TopoDS_Shape& es = edges.FindKey(ei);
+            int nf = anc.Contains(es) ? anc.FindFromKey(es).Extent() : 0;
+            if (nf >= 2) continue;
+            const TopoDS_Edge& e = TopoDS::Edge(es);
+            if (BRep_Tool::Degenerated(e)) continue;
+            bool seam = false;
+            if (anc.Contains(es)) {
+                const TopTools_ListOfShape& faces = anc.FindFromKey(es);
+                for (TopTools_ListIteratorOfListOfShape it(faces); it.More(); it.Next())
+                    if (BRep_Tool::IsClosed(e, TopoDS::Face(it.Value()))) { seam = true; break; }
+            }
+            if (!seam) return false;  // a real free edge -> open shell
+        }
+        return true;
+    } catch (const Standard_Failure&) {
+        return false;  // be conservative: an OCCT error means we can't vouch for closure
+    }
+}
+
 }  // namespace
 
 json doc_export_step(const std::string& doc_id, const std::string& path) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     if (r.shapes.empty())
@@ -3696,6 +3953,7 @@ const unsigned char* glyph5x7(char ch) {
         {0x08,0x08,0x08,0x08,0x08},                  // '-'
         {0x00,0x60,0x60,0x00,0x00},                  // '.'
         {0x00,0x36,0x36,0x00,0x00},                  // ':'
+        {0x02,0x01,0x51,0x09,0x06},                  // '?'
         {0x3E,0x51,0x49,0x45,0x3E},{0x00,0x42,0x7F,0x40,0x00},  // 0 1
         {0x42,0x61,0x51,0x49,0x46},{0x21,0x41,0x45,0x4B,0x31},  // 2 3
         {0x18,0x14,0x12,0x7F,0x10},{0x27,0x45,0x45,0x45,0x39},  // 4 5
@@ -3720,9 +3978,10 @@ const unsigned char* glyph5x7(char ch) {
     if (ch == '-') return F[2];
     if (ch == '.') return F[3];
     if (ch == ':') return F[4];
-    if (ch >= '0' && ch <= '9') return F[5 + (ch - '0')];
+    if (ch == '?') return F[5];
+    if (ch >= '0' && ch <= '9') return F[6 + (ch - '0')];
     if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
-    if (ch >= 'A' && ch <= 'Z') return F[15 + (ch - 'A')];
+    if (ch >= 'A' && ch <= 'Z') return F[16 + (ch - 'A')];
     return F[0];
 }
 
@@ -3807,11 +4066,17 @@ std::string sanitize_label(const std::string& in) {
             else if (d == 0xB1) out += "+-";        // ± plus-minus
             i += 2; continue;
         }
-        if (c == 0xE2 && i + 2 < in.size() &&
-            static_cast<unsigned char>(in[i + 1]) == 0x8C &&
-            static_cast<unsigned char>(in[i + 2]) == 0x80) {
-            out += "DIA ";                          // ⌀ diameter sign (U+2300)
-            i += 3; continue;
+        if (c == 0xE2 && i + 2 < in.size()) {
+            unsigned char d = static_cast<unsigned char>(in[i + 1]);
+            unsigned char e = static_cast<unsigned char>(in[i + 2]);
+            // The drafting symbols the engine emits in stacked hole callouts + dims, mapped to
+            // readable ASCII shorthand so they don't silently vanish from the PNG (the bitmap
+            // font has no glyphs for them). ⌀ diameter, ⌴ counterbore, ⌵ countersink, ↧ depth.
+            if (d == 0x8C && e == 0x80) { out += "DIA "; i += 3; continue; }   // ⌀ U+2300
+            if (d == 0x8C && e == 0xB4) { out += "CBORE "; i += 3; continue; } // ⌴ U+2334
+            if (d == 0x8C && e == 0xB5) { out += "CSK "; i += 3; continue; }   // ⌵ U+2335
+            if (d == 0x86 && e == 0xA7) { out += "DEPTH "; i += 3; continue; } // ↧ U+21A7
+            // fall through to the generic skip for any other 3-byte sequence
         }
         // Unknown multibyte lead: skip this byte and any continuation bytes.
         ++i;
@@ -4024,7 +4289,7 @@ static std::vector<aicm::AicmBody> tessellate_session_bodies(Session& s) {
 
 std::vector<aicm::AicmBody> doc_tessellate_bodies(const std::string& doc_id) {
     try {
-        std::lock_guard<std::mutex> lk(g_mtx);
+        DocLock lk;
         Session& s = require_session(doc_id);
         return tessellate_session_bodies(s);
     } catch (...) {
@@ -4034,7 +4299,7 @@ std::vector<aicm::AicmBody> doc_tessellate_bodies(const std::string& doc_id) {
 
 json doc_render_png(const std::string& doc_id, const std::string& out_path) {
     try {
-        std::lock_guard<std::mutex> lk(g_mtx);
+        DocLock lk;
         Session& s = require_session(doc_id);
         std::vector<aicm::AicmBody> bodies = tessellate_session_bodies(s);
         if (bodies.empty()) return json{{"ok", false}, {"reason", "no bodies"}};
@@ -4082,6 +4347,14 @@ json doc_render_png(const std::string& doc_id, const std::string& out_path) {
         }
         bool ok = render_iso_png(bodies, out_path, labels);
         return json{{"ok", ok}, {"path", ok ? out_path : std::string()}};
+    } catch (const OpError& e) {
+        // Bug K8 (P2): a CLOSED/missing doc made require_session throw unknown_doc, which the
+        // catch-all below flattened to an opaque "render exception" — so render_part read very
+        // differently from add_features/measure/undo, which all return the structured
+        // {ok:false, error, code:"unknown_doc"} envelope on a stale doc id. Surface the same
+        // shape here so a closed-doc render is diagnosable (and the orchestrator can route it)
+        // instead of looking like an internal renderer crash.
+        return json{{"ok", false}, {"error", e.what()}, {"code", e.code}};
     } catch (...) {
         return json{{"ok", false}, {"reason", "render exception"}};
     }
@@ -4118,7 +4391,9 @@ json drawing_render_png(const std::string& doc_id, const std::string& out_path) 
         std::vector<std::vector<std::array<double, 2>>> annSolid, annDash;  // sheet-mm strokes
         struct Txt { std::array<double, 2> pos{}; std::string text; double h = 3.5; };
         std::vector<Txt> texts;
-        std::vector<std::string> title_lines;
+        // Bug D-8 — title block as label/value cells (not one crammed "key: value" line),
+        // so all standard fields fit a two-column grid without truncating or overlapping.
+        std::vector<std::pair<std::string, std::string>> title_cells;  // (LABEL, value)
         auto poolDraw = [&](const json& d) {
             if (!d.is_object()) return;
             pool(d.value("segments", json::array()), annSolid);
@@ -4165,16 +4440,62 @@ json drawing_render_png(const std::string& doc_id, const std::string& out_path) 
                         pool(view.value("hatch", json::array()), annSolid);  // section hatch
                         for (const auto& an : view.value("annotations", json::array()))
                             if (an.is_object() && an.contains("draw")) poolDraw(an["draw"]);
+                        // R9 — cutting-plane line + "A-A" label on the PARENT view of a section.
+                        // attach_parent_markers puts {label,line} onto the parent view's
+                        // section_lines; draw each as a dashed cutting-plane line with the
+                        // section label at both endpoints (the SolidWorks "A ──┼── A" marker),
+                        // so the section view reads as derived from a real cut on the parent.
+                        for (const auto& sl : view.value("section_lines", json::array())) {
+                            if (!sl.is_object() || !sl.contains("line") || !sl["line"].is_array())
+                                continue;
+                            std::vector<std::array<double, 2>> ln;
+                            for (const auto& jp : sl["line"])
+                                if (jp.is_array() && jp.size() >= 2)
+                                    ln.push_back({jp[0].get<double>(), jp[1].get<double>()});
+                            if (ln.size() < 2) continue;
+                            annDash.push_back(ln);
+                            std::string lab = sl.value("label", std::string());
+                            if (lab.empty()) lab = "A";
+                            Txt t0; t0.pos = ln.front();   t0.text = sanitize_label(lab); t0.h = 4.5;
+                            Txt t1; t1.pos = ln.back();    t1.text = sanitize_label(lab); t1.h = 4.5;
+                            texts.push_back(std::move(t0));
+                            texts.push_back(std::move(t1));
+                        }
                     }
-                // Title block: gather its non-empty string fields into a few lines.
+                // Title block: gather every non-empty standard field as a (LABEL, value) cell.
+                // The full ASME set is 10 fields (set_titleblock): title, drawn_by, date,
+                // material, finish, scale, rev, sheet, part_number, company. `rev`/`revision`
+                // are accepted interchangeably. Values are rendered in their own column so a
+                // long value never eats the label and nothing truncates (Bug D-8).
                 const json& tb = sheet.value("title_block", json::object());
                 if (tb.is_object()) {
-                    for (const char* key : {"title", "drawn_by", "date", "scale", "material",
-                                            "part_number", "revision", "sheet"}) {
-                        auto it = tb.find(key);
-                        if (it != tb.end() && it->is_string() && !it->get<std::string>().empty())
-                            title_lines.push_back(sanitize_label(
-                                std::string(key) + ": " + it->get<std::string>()));
+                    // {json key(s), display label}; first present key wins.
+                    struct Field { const char* keys[2]; const char* label; };
+                    static const Field kFields[] = {
+                        {{"title", nullptr}, "TITLE"},
+                        {{"part_number", "part_no"}, "PART NO"},
+                        {{"drawn_by", "drawn"}, "DRAWN"},
+                        {{"date", nullptr}, "DATE"},
+                        {{"material", nullptr}, "MATERIAL"},
+                        {{"finish", nullptr}, "FINISH"},
+                        {{"scale", nullptr}, "SCALE"},
+                        {{"rev", "revision"}, "REV"},
+                        {{"sheet", nullptr}, "SHEET"},
+                        {{"company", nullptr}, "COMPANY"},
+                    };
+                    for (const Field& fld : kFields) {
+                        std::string val;
+                        for (const char* k : fld.keys) {
+                            if (!k) break;
+                            auto it = tb.find(k);
+                            if (it != tb.end() && it->is_string() && !it->get<std::string>().empty()) {
+                                val = it->get<std::string>();
+                                break;
+                            }
+                        }
+                        if (!val.empty())
+                            title_cells.emplace_back(std::string(fld.label),
+                                                     sanitize_label(val));
                     }
                 }
             }
@@ -4190,14 +4511,17 @@ json drawing_render_png(const std::string& doc_id, const std::string& out_path) 
                     maxx = std::max(maxx, p[0]); maxy = std::max(maxy, p[1]);
                 }
         };
+        // Bug D-1 — annotation rescale. The fit/content box MUST be computed from the
+        // projected GEOMETRY (the view polylines) ONLY. If we grew it to include annotation
+        // strokes or text positions, adding a single GD&T frame / datum / dimension placed
+        // just outside the part would re-scale and re-shift EVERY view into a corner of the
+        // sheet (the layout would chase the annotation). Annotations are drawn afterwards
+        // with the SAME sheet->pixel transform (to_pix) at their given sheet coords, so they
+        // land in the right place on top of a now-FIXED layout. Adding an annotation no
+        // longer changes view placement or scale. (A label far outside the geometry may run
+        // toward the paper margin, which is the correct, non-destructive behavior — the views
+        // stay put.) Do NOT acc(annSolid)/acc(annDash)/texts here.
         acc(visible); acc(hidden);
-        // Grow the fit box to include annotation strokes + text so GD&T frames / dims placed
-        // just outside the geometry don't get clipped off the sheet.
-        acc(annSolid); acc(annDash);
-        for (const auto& T : texts) {
-            minx = std::min(minx, T.pos[0]); miny = std::min(miny, T.pos[1]);
-            maxx = std::max(maxx, T.pos[0]); maxy = std::max(maxy, T.pos[1]);
-        }
         if (!(maxx > minx) || !(maxy > miny))
             return json{{"ok", false}, {"reason", "degenerate drawing bounds"}};
 
@@ -4240,23 +4564,59 @@ json drawing_render_png(const std::string& doc_id, const std::string& out_path) 
             int fs = std::max(1, (int)std::lround(T.h * sc / 7.0));  // 5x7 bitmap font scale
             blit_text(img, W, H, tx + 1, ty - fs * 7, T.text, fs, DR, DG, DB);
         }
-        // Title block: a fixed panel in the bottom-right corner (screen space, never clipped).
-        if (!title_lines.empty()) {
-            const int lineH = 16, pad = 6;
-            int boxW = 0;
-            for (const auto& s : title_lines) boxW = std::max(boxW, int(s.size()) * 12);
-            boxW = std::min(std::max(boxW + 2 * pad, 160), W - 2);
-            int boxH = int(title_lines.size()) * lineH + 2 * pad;
+        // Title block: a fixed two-column grid panel in the bottom-right corner (screen
+        // space, never clipped). One row per field; a LABEL column and a VALUE column with a
+        // divider between them, so a long value can never overrun a label and nothing
+        // truncates against another field (Bug D-8). Text is scale-1 (6px/char advance, 7px
+        // tall) so the full 10-field block fits; an over-long value is clipped to its cell
+        // with a trailing '.' so it degrades gracefully instead of bleeding past the frame.
+        if (!title_cells.empty()) {
+            const int ts = 1;            // bitmap-font scale
+            const int chW = 6 * ts;      // glyph advance
+            const int rowH = 7 * ts + 6; // text height + vertical padding
+            const int padX = 4;
+            // Label column: sized to the widest label (bounded so it can't dominate).
+            int labChars = 0;
+            for (const auto& c : title_cells) labChars = std::max(labChars, (int)c.first.size());
+            int labW = std::min(labChars * chW + 2 * padX, 90);
+            // Value column: sized to the widest value, but the whole panel is capped so it
+            // always fits the canvas; the value cell is clipped to whatever width remains.
+            int valChars = 0;
+            for (const auto& c : title_cells) valChars = std::max(valChars, (int)c.second.size());
+            int valW = valChars * chW + 2 * padX;
+            const int boxWmax = 360;     // panel width cap
+            int boxW = std::min(labW + valW, boxWmax);
+            boxW = std::min(boxW, W - 4);
+            boxW = std::max(boxW, 150);
+            valW = boxW - labW;          // value column gets the remainder
+            int boxH = (int)title_cells.size() * rowH;
+            // Keep the panel on-paper even if there are many rows.
+            boxH = std::min(boxH, H - 4);
             int bx0 = W - boxW - 2, by0 = H - boxH - 2;
-            // frame
+            int labX = bx0 + labW;       // label|value divider x
+            // Outer frame.
             draw_line(img, W, H, bx0, by0, bx0 + boxW, by0, 20, 20, 20);
             draw_line(img, W, H, bx0, by0 + boxH, bx0 + boxW, by0 + boxH, 20, 20, 20);
             draw_line(img, W, H, bx0, by0, bx0, by0 + boxH, 20, 20, 20);
             draw_line(img, W, H, bx0 + boxW, by0, bx0 + boxW, by0 + boxH, 20, 20, 20);
-            int ty = by0 + pad;
-            for (const auto& s : title_lines) {
-                blit_text(img, W, H, bx0 + pad, ty, s, 2, 20, 20, 20);
-                ty += lineH;
+            // Label|value divider, full height.
+            draw_line(img, W, H, labX, by0, labX, by0 + boxH, 20, 20, 20);
+            // Clip a string to a pixel width (cells are fixed): keep what fits, mark a cut.
+            auto clip_to = [&](const std::string& s, int wpx) -> std::string {
+                int maxChars = std::max(0, (wpx - 2 * padX) / chW);
+                if ((int)s.size() <= maxChars) return s;
+                if (maxChars <= 1) return s.substr(0, std::max(0, maxChars));
+                return s.substr(0, maxChars - 1) + ".";
+            };
+            int ry = by0;
+            for (const auto& c : title_cells) {
+                if (ry + rowH > by0 + boxH) break;  // ran out of panel height
+                if (ry > by0)  // row divider (skip above the first row)
+                    draw_line(img, W, H, bx0, ry, bx0 + boxW, ry, 90, 90, 90);
+                int ty = ry + 3;
+                blit_text(img, W, H, bx0 + padX, ty, clip_to(c.first, labW), ts, 20, 20, 20);
+                blit_text(img, W, H, labX + padX, ty, clip_to(c.second, valW), ts, 20, 20, 20);
+                ry += rowH;
             }
         }
         std::string png = encode_png_rgb(W, H, img);
@@ -4269,20 +4629,68 @@ json drawing_render_png(const std::string& doc_id, const std::string& out_path) 
                     {"visible", static_cast<int>(visible.size())},
                     {"hidden", static_cast<int>(hidden.size())},
                     {"annotations", n_anns_drawn},
-                    {"title_block", !title_lines.empty()}};
-    } catch (const OpError&) {
-        return json{{"ok", false}, {"reason", "not a drawing document"}};
+                    {"title_block", !title_cells.empty()}};
+    } catch (const OpError& e) {
+        // Bug D-3 — review after a detail/section view. drawing_get() re-projects EVERY view
+        // on each render; if a derived view (e.g. a detail whose parent is a section with a
+        // degenerate cut plane) throws an OpError during re-projection, the whole render
+        // aborts. The old catch flattened EVERY OpError to "not a drawing document", which is
+        // wrong and undiagnosable (unknown_doc is the only case that actually means that).
+        // Surface the real code+message so review_drawing reports WHY (and the orchestrator
+        // can route a genuine derived-view-creation bug to drawing_session.cpp). A true
+        // missing/closed drawing still reads clearly via the unknown_doc code.
+        if (e.code == "unknown_doc")
+            return json{{"ok", false}, {"reason", "not a drawing document"},
+                        {"code", e.code}};
+        return json{{"ok", false},
+                    {"reason", std::string("drawing render failed: ") + e.what()},
+                    {"code", e.code}};
     } catch (...) {
         return json{{"ok", false}, {"reason", "drawing render exception"}};
     }
 }
 
+// A document can compile to ZERO surviving bodies for two very different reasons: the
+// feature tree is genuinely empty, OR a feature FAILED to rebuild (e.g. an `import` whose
+// source file is gone and that carries no embedded geometry, a degenerate sweep/loft, a
+// boolean that consumed its only body). The latter used to surface as the generic
+// "document has no bodies …" — indistinguishable from an empty doc, and easy to misread as
+// a phantom "eval lost the body right after open" bug. Build a message that NAMES the
+// culprit feature(s) + their rebuild error so the failure is self-explaining. Returns ""
+// when nothing failed (genuinely empty document).
+static std::string rebuild_failure_detail(const CompileResult& r) {
+    std::string out;
+    int n = 0;
+    for (const FeatureStatus& st : r.statuses) {
+        if (st.ok) continue;
+        out += n++ ? "; " : "";
+        out += "feature '" + st.id + "'";
+        if (!st.type.empty()) out += " (" + st.type + ")";
+        out += " failed to rebuild";
+        if (!st.error.empty()) out += ": " + st.error;
+    }
+    return out;
+}
+
+// Throw the right "no bodies to <action>" OpError for an empty compile: a rebuild-failure-
+// aware message (naming the broken feature) when a feature errored, else the plain message.
+// Centralises the pattern shared by eval_mass / doc_query / doc_bbox / face_points / …
+[[noreturn]] static void throw_no_bodies(const std::string& doc_id, const CompileResult& r,
+                                         const char* action) {
+    const std::string detail = rebuild_failure_detail(r);
+    const std::string base = std::string("document has no bodies to ") + action;
+    if (!detail.empty())
+        throw OpError("invalid_op", base + " — " + detail,
+                      {{"doc_id", doc_id}, {"reason", "feature rebuild failed"}});
+    throw OpError("invalid_op", base, {{"doc_id", doc_id}});
+}
+
 json doc_query(const std::string& doc_id, const json& query) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     if (r.shapes.empty())
-        throw OpError("invalid_op", "document has no bodies to query", {{"doc_id", doc_id}});
+        throw_no_bodies(doc_id, r, "query");
     // Query the LAST body (bridge.py policy: bodies[-1]).
     aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(r.shapes.back(), query);
     if (!qp.error.empty())
@@ -4292,7 +4700,7 @@ json doc_query(const std::string& doc_id, const json& query) {
 }
 
 json doc_face_points(const std::string& doc_id, const json& selector, int max_n) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
 
     if (!selector.is_object() || selector.value("kind", std::string()) != "face")
@@ -4300,7 +4708,7 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
 
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     if (r.shapes.empty())
-        throw OpError("invalid_op", "document has no bodies", {{"doc_id", doc_id}});
+        throw_no_bodies(doc_id, r, "evaluate");
 
     // Resolve against the LAST body's faces (bridge.py policy: bodies[-1]).
     const TopoDS_Shape& shape = r.shapes.back();
@@ -4344,6 +4752,63 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
         }
     }
 
+    // Z1 FIX: For flat (planar) faces, OCCT's BRepMesh_IncrementalMesh only produces
+    // the 4 boundary corners as triangulation nodes (chord deviation on a plane is 0 for
+    // any interior point, so the mesher adds no interior nodes). When these 4 corners are
+    // the only sample points, the proximity search in nodes_in_faceset uses a tol based on
+    // the body diagonal (~2mm for a 101mm bar) — too small to reach the face center
+    // (7.07mm away for a 10×10mm face) — so most gmsh mesh nodes on the end face are
+    // EXCLUDED. With only 4 corner sample nodes picked, the work-consistent force
+    // distribution concentrates the full 10000N into 4 instead of ~300 nodes → ~21×
+    // stress spike (original bug), or with add_midside_face_nodes it still gives
+    // corner-biased BCs → wrong stress.
+    //
+    // FIX: For planar faces, export the face normal vector alongside the sample points.
+    // The solver (nodes_in_faceset_with_normal in fea_run.cpp) splits the proximity check
+    // into (a) normal-direction distance < perp_tol_mm (tight: 1.5mm — any gmsh node
+    // ON this face passes; a node on the OPPOSITE face of a 5mm plate is 5mm away →
+    // rejected) and (b) in-plane distance < tol_mm (large: half of face diagonal — covers
+    // the entire face surface). This is the ONLY correct fix for the thin-plate case
+    // (Z2): a 100×100mm face with 100/2 = 50mm in-plane tol but only 1.5mm normal tol
+    // correctly includes the 100×100 fixture face but excludes the top face 5mm away.
+    // The face normal vector is added as "face_normal": [nx, ny, nz] in the response and
+    // read by fea_run.cpp's resolve_faceset_samples(). Falls back to old Euclidean tol
+    // when no normal is present (backward compat — e.g. manually-constructed studies).
+    std::optional<std::array<double, 3>> face_normal;
+    double tol_mm = std::max(0.5, diag * 0.02);  // default: old formula for curved faces
+    {
+        BRepAdaptor_Surface ad_face(face);
+        if (ad_face.GetType() == GeomAbs_Plane && static_cast<int>(pts.size()) <= 8) {
+            // Planar face with few triangulation nodes (just the 4 boundary corners).
+            // Use a dense UV-parametric grid so the face is well-sampled in-plane.
+            double u0, u1, v0, v1;
+            BRepTools::UVBounds(face, u0, u1, v0, v1);
+            Handle(Geom_Surface) surf = BRep_Tool::Surface(face);
+            const int N = 7;  // 7×7 = 49 interior points for good in-plane coverage
+            const double du = (u1 - u0) / (N + 1);
+            const double dv = (v1 - v0) / (N + 1);
+            for (int ii = 1; ii <= N; ++ii) {
+                for (int jj = 1; jj <= N; ++jj) {
+                    gp_Pnt p = surf->Value(u0 + ii * du, v0 + jj * dv);
+                    pts.push_back({p.X(), p.Y(), p.Z()});
+                }
+            }
+            // The in-plane tol = half the face diagonal: covers the full face plane.
+            // For a 10×10 face: sqrt(10²+10²)/2 = 7.07mm — reaches any interior node.
+            // For a 100×100 face: sqrt(100²+100²)/2 = 70.7mm — covers full face.
+            // This is safe because the PERPENDICULAR check (via face_normal + perp_tol)
+            // in nodes_in_faceset rejects any node not on the face plane.
+            gp_Pnt p_corner0 = surf->Value(u0, v0);
+            gp_Pnt p_corner1 = surf->Value(u1, v1);
+            const double face_diag_2d = p_corner0.Distance(p_corner1);
+            tol_mm = std::max(0.5, face_diag_2d * 0.5);
+            // Outward face normal (signed: REVERSED → flip so normal points away from solid).
+            gp_Dir dir = ad_face.Plane().Axis().Direction();
+            if (face.Orientation() == TopAbs_REVERSED) dir.Reverse();
+            face_normal = {dir.X(), dir.Y(), dir.Z()};
+        }
+    }
+
     // Down-sample to <= max_n with a uniform stride: stride = (n + max_n - 1) // max_n;
     // pts = pts[::stride][:max_n].
     if (static_cast<int>(pts.size()) > max_n) {
@@ -4357,8 +4822,18 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
 
     json points = json::array();
     for (const auto& p : pts) points.push_back({p[0], p[1], p[2]});
-    const double tol_mm = std::max(0.5, diag * 0.02);
-    return json{{"points", points}, {"tol_mm", tol_mm}};
+    json result = json{{"points", points}, {"tol_mm", tol_mm}};
+    if (face_normal) {
+        result["face_normal"] = {(*face_normal)[0], (*face_normal)[1], (*face_normal)[2]};
+        // perp_tol: tight threshold in the face normal direction to exclude off-face nodes.
+        // 1.5mm handles gmsh mesh noise (nodes on a face are at exactly the CAD plane, but
+        // floating-point mesh positions may drift ≤ 0.1mm). The nearest off-face node for
+        // a 5mm-thick plate is 5mm away → safely excluded. Thinner plates (e.g. 2mm) would
+        // need perp_tol < 2mm — 1.5mm is conservative. For very thin (<2mm) plates the user
+        // should use a different meshing strategy.
+        result["perp_tol_mm"] = 1.5;
+    }
+    return result;
 }
 
 // Precise world axis-aligned bounding box of the whole document (all bodies), via
@@ -4366,11 +4841,11 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
 // Used to hand callers (e.g. make_standard_part) the extents + a placement datum so they
 // can position a part without a measure round-trip (Bug A-1).
 json doc_bbox(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     if (r.shapes.empty())
-        throw OpError("invalid_op", "document has no bodies to bound", {{"doc_id", doc_id}});
+        throw_no_bodies(doc_id, r, "bound");
     Bnd_Box box;
     for (const TopoDS_Shape& shp : r.shapes)
         if (!shp.IsNull()) BRepBndLib::AddOptimal(shp, box);
@@ -4391,11 +4866,30 @@ json doc_bbox(const std::string& doc_id) {
 // surface body (open shell / degenerate solid) returns the _surface_props area report.
 // body_id is 1-based; <= 0 selects the LAST body (the _eval_active_shape default).
 json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     if (r.shapes.empty())
-        throw OpError("invalid_op", "document has no bodies to evaluate", {{"doc_id", doc_id}});
+        throw_no_bodies(doc_id, r, "evaluate");
+
+    // Flatten the surviving bodies into their individual CONNECTED solids. An in-document
+    // boolean fuse / boss-merge of two DISJOINT solids (e.g. two cylinders placed far
+    // apart) yields a single TopoDS_Compound holding multiple TopAbs_SOLIDs — OCCT does
+    // NOT weld non-touching solids — which the compile pipeline tracks as ONE body. For
+    // mass properties we want the PHYSICAL body count, so explode each surviving shape
+    // into its sub-solids and report each separately (count + per-body breakdown). A
+    // surface / non-solid body (no SOLID inside) stays as a single entry. A shape that IS
+    // a single solid maps to exactly one entry, so single-solid docs are unchanged.
+    std::vector<TopoDS_Shape> solids;
+    for (const TopoDS_Shape& sh : r.shapes) {
+        TopTools_IndexedMapOfShape smap;
+        TopExp::MapShapes(sh, TopAbs_SOLID, smap);
+        if (smap.Extent() == 0) {
+            solids.push_back(sh);  // surface / degenerate body — counts as one
+        } else {
+            for (int i = 1; i <= smap.Extent(); ++i) solids.push_back(smap.FindKey(i));
+        }
+    }
 
     const double density_g_mm3 = density_g_cm3 * 1e-3;  // 1 g/cm³ = 1e-3 g/mm³
 
@@ -4439,16 +4933,18 @@ json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3)
         };
     };
 
-    // Single explicit body, OR a single-body document: report that one body (legacy shape).
-    if (body_id >= 1 || r.shapes.size() == 1) {
+    // Single explicit body, OR a genuinely single-solid document: report that one body
+    // (legacy shape). body_id and the per-body breakdown both index the EXPLODED solids,
+    // so a disjoint fuse reports its true N>1 physical bodies instead of one compound.
+    if (body_id >= 1 || solids.size() == 1) {
         const TopoDS_Shape* shape = nullptr;
         if (body_id >= 1) {
-            if (body_id > static_cast<int>(r.shapes.size()))
+            if (body_id > static_cast<int>(solids.size()))
                 throw OpError("invalid_op", "body_id " + std::to_string(body_id) + " out of range",
                               {{"reason", "bad body_id"}});
-            shape = &r.shapes[static_cast<std::size_t>(body_id - 1)];
+            shape = &solids[static_cast<std::size_t>(body_id - 1)];
         } else {
-            shape = &r.shapes.front();
+            shape = &solids.front();
         }
         if (eval_is_surface_shape(*shape)) return eval_surface_props(*shape, density_g_cm3);
         GProp_GProps props;
@@ -4456,6 +4952,13 @@ json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3)
         json out = props_json(props);
         out["body_count"] = 1;
         out["material"] = {{"density_g_cm3", density_g_cm3}};
+        // Bug J4: VolumeProperties on a non-closed solid returns a meaningless CoM/inertia
+        // (the integral over an unbounded volume). Don't report it as if trustworthy — flag it.
+        if (!eval_is_closed_solid(*shape)) {
+            out["closed_solid"] = false;
+            out["warning"] = "body is not a closed solid (free edges / open shell) — "
+                             "volume, mass, centre of mass and inertia may be unreliable";
+        }
         return out;
     }
 
@@ -4466,8 +4969,9 @@ json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3)
     json bodies = json::array();
     GProp_GProps total;
     bool have_total = false;
-    for (std::size_t i = 0; i < r.shapes.size(); ++i) {
-        const TopoDS_Shape& shape = r.shapes[i];
+    bool any_open = false;  // Bug J4: a non-closed solid taints its own + the assembly total
+    for (std::size_t i = 0; i < solids.size(); ++i) {
+        const TopoDS_Shape& shape = solids[i];
         json entry;
         entry["body_id"] = static_cast<int>(i + 1);
         if (eval_is_surface_shape(shape)) {
@@ -4479,6 +4983,12 @@ json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3)
             BRepGProp::VolumeProperties(shape, props);
             json pj = props_json(props);
             for (auto it = pj.begin(); it != pj.end(); ++it) entry[it.key()] = it.value();
+            if (!eval_is_closed_solid(shape)) {
+                entry["closed_solid"] = false;
+                entry["warning"] = "body is not a closed solid (free edges / open shell) — "
+                                   "its volume, mass, centre of mass and inertia may be unreliable";
+                any_open = true;
+            }
             total.Add(props);  // accumulate the assembly total (volume-weighted COM + inertia)
             have_total = true;
         }
@@ -4487,9 +4997,12 @@ json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3)
 
     json out = have_total ? props_json(total)
                           : json{{"volume_mm3", 0.0}, {"mass_g", 0.0}};
-    out["body_count"] = static_cast<int>(r.shapes.size());
+    out["body_count"] = static_cast<int>(solids.size());
     out["bodies"] = std::move(bodies);
     out["material"] = {{"density_g_cm3", density_g_cm3}};
+    if (any_open)
+        out["warning"] = "one or more bodies are not closed solids — the combined total "
+                         "mass / centre of mass / inertia may be unreliable";
     return out;
 }
 
@@ -4726,7 +5239,7 @@ json build_cut_list(const json& weld_members) {
 // the side-channel, then group. An assembly (no part weldment topology) reports an
 // empty cut list. A doc with no weld_member feature yields empty rows + zero totals.
 json doc_weld_cut_list(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     if (s.doc.value("kind", std::string()) == "assembly" ||
         s.doc.value("is_assembly", false))
@@ -4748,7 +5261,7 @@ namespace {
 const TopoDS_Shape& eval_active_shape(const CompileResult& r, const std::string& doc_id,
                                       int body_id) {
     if (r.shapes.empty())
-        throw OpError("invalid_op", "document has no bodies to evaluate", {{"doc_id", doc_id}});
+        throw_no_bodies(doc_id, r, "evaluate");
     if (body_id >= 1) {
         if (body_id > static_cast<int>(r.shapes.size()))
             throw OpError("invalid_op", "body_id " + std::to_string(body_id) + " out of range",
@@ -4925,10 +5438,71 @@ json eval_measure_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     return result;
 }
 
-// Resolve a measure ref (face/edge/vertex selector) against `shape` to an OCCT sub-shape,
-// re-walking TopExp in the SAME order describe_* enumerates (mirrors worker.py::
-// _resolve_eval_ref + doc_face_points' index re-walk). bbox_diag floor 1e-3.
+// Resolve a measure ref to a single OCCT sub-shape — the SAME predicate-aware path doc_query
+// uses (doc/picks::resolve_geom_query), so a measure ref honours pick/near/count/index exactly
+// as the rest of the app does.
+//
+// WHY this matters (the symmetric-ambiguity bug it fixes): the prior code re-resolved the ref
+// through the plain resolve() scorer. That scorer ranks a selector against describe_* candidates
+// and REFUSES to guess when several equivalent candidates co-rank (margin 0 "symmetric
+// ambiguity"). A cylinder's lone seam/round edge, or any one of a box's four identical vertical
+// edges, therefore dangled — even though the resolved selector carries a UNIQUE centroid that
+// pins down exactly one edge, and even though doc_query (resolve_geom_query) disambiguates the
+// very same geometry. We now route through resolve_geom_query:
+//   * a raw geom-query ref ({"of":"edge","pick":"longest"}) resolves with its predicate intact;
+//   * a RESOLVED selector ref (kind+centroid, what _resolve_one_selector hands us) is turned into
+//     {"of":kind,"near":<centroid>,"count":1} so its unique centroid singles out one sub-shape.
+// pick:"longest"/"shortest" (and friends) break ties deterministically by taking the first of the
+// stable MapShapes-ordered result; a genuinely UNQUALIFIED multi-match (no singling predicate)
+// still errors loudly so the caller adds a predicate. Vertices (no resolve_geom_query support)
+// keep the original describe_vertices + resolve() path.
 TopoDS_Shape eval_resolve_ref(const json& ref, const TopoDS_Shape& shape, double diag) {
+    // 1) build the predicate-aware query for an edge/face ref.
+    json query;
+    bool singling = false;  // does the query explicitly single out ONE sub-shape?
+    if (aicad::doc::is_geom_query(ref)) {
+        // A raw plain-words query — honour every predicate it carries. It is "singling" when it
+        // names a pick/near/index or a count cap (the predicates that intentionally narrow to a
+        // specific sub-shape and so license a deterministic tie-break on the survivors).
+        query = ref;
+        singling = ref.contains("pick") || ref.contains("near") || ref.contains("index") ||
+                   ref.contains("count") || ref.contains("side");
+    } else {
+        const std::string kind = ref.value("kind", std::string());
+        if (kind == "edge" || kind == "face") {
+            // A resolved make_selector dict: re-express it as a query keyed on its UNIQUE
+            // centroid so the symmetric describe_* duplicates can't co-rank it into a dangle.
+            const json& c = ref.contains("centroid") ? ref.at("centroid") : json();
+            if (c.is_array() && c.size() == 3 && c[0].is_number() && c[1].is_number() &&
+                c[2].is_number()) {
+                query = json{{"of", kind}, {"near", c}, {"count", 1}};
+                singling = true;
+            }
+        }
+        // vertices, or an edge/face selector with no centroid -> handled by the legacy path below.
+    }
+
+    if (!query.is_null()) {
+        aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(shape, query);
+        if (!qp.error.empty())
+            throw OpError("invalid_op", "measure ref: " + qp.error, {{"reason", "bad query"}});
+        const std::size_t n = qp.faces.size() + qp.edges.size();
+        if (n == 0)
+            throw OpError("invalid_op", "measure ref matched no geometry",
+                          {{"reason", "no match"}});
+        if (n > 1 && !singling)
+            throw OpError("invalid_op",
+                          "measure ref matched " + std::to_string(n) +
+                              " candidates, not one — narrow it with a predicate "
+                              "(pick/side/near/count)",
+                          {{"reason", "ambiguous"}});
+        // exactly one, OR a singling predicate that deterministically picks the first of the
+        // stable-ordered survivors (the longest/shortest tie-break the caller asked for).
+        if (!qp.faces.empty()) return qp.faces.front();
+        return qp.edges.front();
+    }
+
+    // 2) legacy describe_* + resolve() path (vertices, and selectors without a centroid).
     const std::string kind = ref.value("kind", std::string());
     std::vector<TopoInfo> infos;
     TopAbs_ShapeEnum tt;
@@ -4963,7 +5537,7 @@ TopoDS_Shape eval_resolve_ref(const json& ref, const TopoDS_Shape& shape, double
 // engine/doc/evaluate.py::check via worker.py::_eval_check. BRepCheck_Analyzer +
 // free-edge / tiny-edge / sliver-face census. Returns {"issues":[{kind,severity,text}]}.
 json doc_eval_check(const std::string& doc_id, int body_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     const TopoDS_Shape& shape = eval_active_shape(r, doc_id, body_id);
@@ -5003,7 +5577,16 @@ json doc_eval_check(const std::string& doc_id, int body_id) {
         }
     }
 
-    // Free-edge census: edges with fewer than 2 adjacent faces.
+    // Free-edge census: edges with fewer than 2 adjacent faces — BUT a SEAM edge of a
+    // periodic face (the 0°/360° closure of a cylinder/sphere/full-revolve) and a
+    // DEGENERATE edge (a cone apex / sphere pole) are real, watertight B-rep topology that
+    // legitimately bound just one face. MapShapesAndAncestors lists a seam's parent face a
+    // single time, so the naive "< 2 faces == free" census flagged every cylindrical bore /
+    // fillet / chamfer seam as a "free edge" and reported valid CLOSED solids as open shells
+    // (bugs H3/H4/H5/J4). Exclude seams (BRep_Tool::IsClosed(edge,face)) and degenerate edges
+    // so only the genuine boundary of an open shell (a lone face, an unsewn import) is
+    // counted. This is precise — a real free edge has NO seam/degenerate marker, so an
+    // honestly-open shell still reports its real free-edge count.
     TopTools_IndexedDataMapOfShapeListOfShape anc_map;
     TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, anc_map);
     TopTools_IndexedMapOfShape edge_map;
@@ -5011,9 +5594,24 @@ json doc_eval_check(const std::string& doc_id, int body_id) {
 
     int free_edges = 0;
     for (int ei = 1; ei <= edge_map.Extent(); ++ei) {
-        const TopoDS_Shape& edge = edge_map.FindKey(ei);
-        int n_faces = anc_map.Contains(edge) ? anc_map.FindFromKey(edge).Extent() : 0;
-        if (n_faces < 2) ++free_edges;
+        const TopoDS_Shape& edge_sh = edge_map.FindKey(ei);
+        int n_faces = anc_map.Contains(edge_sh) ? anc_map.FindFromKey(edge_sh).Extent() : 0;
+        if (n_faces >= 2) continue;  // shared by two faces -> interior, never free
+        const TopoDS_Edge& edge = TopoDS::Edge(edge_sh);
+        // A degenerate edge (cone apex / sphere pole) bounds one face but is not free.
+        if (BRep_Tool::Degenerated(edge)) continue;
+        // A seam edge is closed on its (single) parent face — periodic-surface closure, not
+        // a free boundary. The face appears once in the ancestor list yet the edge is glued
+        // to itself across the seam, so it is fully shared.
+        bool is_seam = false;
+        if (anc_map.Contains(edge_sh)) {
+            const TopTools_ListOfShape& faces = anc_map.FindFromKey(edge_sh);
+            for (TopTools_ListIteratorOfListOfShape it(faces); it.More(); it.Next()) {
+                if (BRep_Tool::IsClosed(edge, TopoDS::Face(it.Value()))) { is_seam = true; break; }
+            }
+        }
+        if (is_seam) continue;
+        ++free_edges;
     }
     if (free_edges > 0)
         issues.push_back(json{{"kind", "free_edges"},
@@ -5054,42 +5652,260 @@ json doc_eval_check(const std::string& doc_id, int body_id) {
     return json{{"issues", issues}};
 }
 
-// engine/doc/evaluate.py::section_props via worker.py::_eval_section_props. Because the
-// Python passes a build123d Plane (whose .wrapped is a gp_Pln), the oracle's
-// isinstance(plane, gp_Pln) check is FALSE and cutting_pln resolves to None — so it never
-// builds the section face and returns area/moments == 0 with only the section-wire
-// (LinearProperties) centroid. We reproduce that exact (degenerate) behavior faithfully.
+// engine/doc/evaluate.py::section_props via worker.py::_eval_section_props. Cut the body by
+// the cutting plane (BRepAlgoAPI_Section -> a compound of edges), GROUP those edges into the
+// closed loop(s) of the cross-section, build the planar face (outer loop bounded by inner
+// loops as HOLES), and read the REAL cross-section properties off the face: area =
+// |SurfaceProperties.Mass| (so a hollow/annular section = outer - holes), centroid = its CoM,
+// and the 2nd area moments Ixx/Iyy/Ixy about the CENTROID expressed in the CUTTING PLANE'S
+// local (u,v) frame. Falls back to the section-wire (LinearProperties) centroid with zero
+// area/moments only when no face can be built (open/degenerate section).
+//
+// Two bugs fixed here (vs the prior "force ALL edges into ONE wire / read GLOBAL-axis
+// MatrixOfInertia" code):
+//   * Multi-loop sections (a tube wall = outer loop + inner bore loop) made the single
+//     MakeWire fail -> area 0. Now ShapeAnalysis_FreeBounds::ConnectEdgesToWires groups the
+//     edges into separate closed wires and the largest-area wire becomes the face boundary
+//     with the rest added as holes, so an annulus reports the wall area.
+//   * Ixx/Iyy were read straight off MatrixOfInertia(1,1)/(2,2) which are GLOBAL-axis area
+//     moments — correct only for an XY (top) cut. For a front/right cut they mixed in the
+//     out-of-plane coordinate. We now express the face in the plane's LOCAL frame located at
+//     the section centroid (a gp_Trsf SetTransformation about the centroidal local Ax3) so the
+//     in-plane second moments fall straight out of the transformed face's MatrixOfInertia. For
+//     an XY cut of a centred body that transform is the identity, so the top-cut result is
+//     unchanged.
 json doc_eval_section_props(const std::string& doc_id, const json& plane_ref) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     if (r.shapes.empty())
-        throw OpError("invalid_op", "document has no bodies to evaluate", {{"doc_id", doc_id}});
+        throw_no_bodies(doc_id, r, "evaluate");
     const TopoDS_Shape& shape = r.shapes.back();  // worker: bodies[-1]
     gp_Pln pln = eval_resolve_plane(plane_ref);
 
-    double cx = 0.0, cy = 0.0, cz = 0.0;
+    double area = 0.0, cx = 0.0, cy = 0.0, cz = 0.0, Ixx = 0.0, Iyy = 0.0, Ixy = 0.0;
     try {
         BRepAlgoAPI_Section section(shape, pln, Standard_False);
         section.Build();
         if (section.IsDone()) {
-            GProp_GProps lin;
-            BRepGProp::LinearProperties(section.Shape(), lin);
-            gp_Pnt com = lin.CentreOfMass();
-            cx = com.X();
-            cy = com.Y();
-            cz = com.Z();
+            const TopoDS_Shape& sec_shape = section.Shape();
+
+            try {
+                TopTools_IndexedMapOfShape edge_map;
+                TopExp::MapShapes(sec_shape, TopAbs_EDGE, edge_map);
+                if (edge_map.Extent() > 0) {
+                    // Tolerance for joining edge ends into loops — relative to the body size so
+                    // section sliver gaps still connect on big and small parts alike.
+                    const double join_tol = std::max(sim_bbox_diag(shape) * 1e-4, 1e-6);
+
+                    // Group the section edges into closed loops. A solid box/cylinder yields ONE
+                    // loop; a hollow/annular section yields an outer loop + one inner loop per
+                    // bore. (The old single MakeWire could only ever hold one loop -> area 0 on
+                    // anything hollow.) shared=false joins by end-point proximity (join_tol),
+                    // robust to the section's free-edge vertices not being shared.
+                    Handle(TopTools_HSequenceOfShape) in_edges = new TopTools_HSequenceOfShape();
+                    for (int ei = 1; ei <= edge_map.Extent(); ++ei)
+                        in_edges->Append(edge_map.FindKey(ei));
+                    Handle(TopTools_HSequenceOfShape) wires;
+                    ShapeAnalysis_FreeBounds::ConnectEdgesToWires(in_edges, join_tol,
+                                                                  Standard_False, wires);
+
+                    // Build a face per closed wire; keep its area, wire and a 2D polygon (the
+                    // wire's vertices projected into the plane's (u,v) basis) so we can classify
+                    // loop NESTING. A solid box yields one loop; an annulus yields a big outer
+                    // loop + an inner bore loop (the bore is INSIDE the outer); a tube cut along
+                    // its length yields TWO DISJOINT solid loops (neither inside the other).
+                    const gp_Ax3& pos = pln.Position();
+                    const gp_Pnt o3 = pos.Location();
+                    const gp_Dir ud = pos.XDirection();
+                    const gp_Dir vd = pos.YDirection();
+                    auto to_uv = [&](const gp_Pnt& p) -> Eigen::Vector2d {
+                        gp_Vec d(o3, p);
+                        return Eigen::Vector2d(d.Dot(gp_Vec(ud)), d.Dot(gp_Vec(vd)));
+                    };
+                    // Sample a wire into a 2D polygon (plane u,v coords). We sample ALONG each
+                    // edge's curve — not just the vertices — so a CIRCULAR loop (which carries a
+                    // single seam vertex) still yields a real polygon for the point-in-loop test;
+                    // a vertex-only polygon would have <3 points and wrongly report "not inside",
+                    // breaking the annulus (bore-inside-outer) classification.
+                    auto wire_poly = [&](const TopoDS_Wire& w) -> std::vector<Eigen::Vector2d> {
+                        std::vector<Eigen::Vector2d> poly;
+                        for (TopExp_Explorer ee(w, TopAbs_EDGE); ee.More(); ee.Next()) {
+                            try {
+                                BRepAdaptor_Curve ca(TopoDS::Edge(ee.Current()));
+                                const double t0 = ca.FirstParameter(), t1 = ca.LastParameter();
+                                const int N = 16;  // straight edges collapse to their 2 ends
+                                for (int k = 0; k < N; ++k)
+                                    poly.push_back(to_uv(ca.Value(t0 + (t1 - t0) * k / N)));
+                            } catch (const Standard_Failure&) {
+                            }
+                        }
+                        return poly;
+                    };
+                    struct Loop { TopoDS_Wire wire; double area; std::vector<Eigen::Vector2d> poly;
+                                  Eigen::Vector2d cuv{0, 0}; };
+                    std::vector<Loop> loops;
+                    if (!wires.IsNull()) {
+                        for (int wi = 1; wi <= wires->Length(); ++wi) {
+                            const TopoDS_Shape& ws = wires->Value(wi);
+                            if (ws.ShapeType() != TopAbs_WIRE) continue;
+                            TopoDS_Wire w = TopoDS::Wire(ws);
+                            BRepBuilderAPI_MakeFace fm(pln, w);
+                            if (!fm.IsDone()) continue;
+                            GProp_GProps wp;
+                            BRepGProp::SurfaceProperties(fm.Face(), wp);
+                            Loop lp;
+                            lp.wire = w;
+                            lp.area = std::abs(wp.Mass());
+                            lp.poly = wire_poly(w);
+                            gp_Pnt c = wp.CentreOfMass();
+                            lp.cuv = to_uv(c);
+                            loops.push_back(std::move(lp));
+                        }
+                    }
+                    // Fallback for the single-loop path when grouping returned nothing usable
+                    // (e.g. one already-closed wire OCCT didn't re-emit): stitch every edge into
+                    // one wire, exactly as before, so the solid-section path stays correct.
+                    if (loops.empty()) {
+                        BRepBuilderAPI_MakeWire wb;
+                        for (int ei = 1; ei <= edge_map.Extent(); ++ei)
+                            wb.Add(TopoDS::Edge(edge_map.FindKey(ei)));
+                        if (wb.IsDone()) {
+                            BRepBuilderAPI_MakeFace fm(pln, wb.Wire());
+                            if (fm.IsDone()) {
+                                GProp_GProps wp;
+                                BRepGProp::SurfaceProperties(fm.Face(), wp);
+                                Loop lp;
+                                lp.wire = wb.Wire();
+                                lp.area = std::abs(wp.Mass());
+                                gp_Pnt c = wp.CentreOfMass();
+                                lp.cuv = to_uv(c);
+                                loops.push_back(std::move(lp));
+                            }
+                        }
+                    }
+
+                    if (!loops.empty()) {
+                        // EVEN-ODD nesting: a loop's depth = how many OTHER loops contain it
+                        // (its centroid inside their polygon). Depth 0/2/… = SOLID material;
+                        // depth 1/3/… = a HOLE in the solid that immediately encloses it. This
+                        // is correct for an annulus (outer depth 0, bore depth 1 -> a hole) AND
+                        // for two disjoint solids (both depth 0 -> two separate material faces),
+                        // unlike a naive "biggest loop is outer, rest are holes" rule which would
+                        // wrongly punch one disjoint solid out of the other.
+                        const std::size_t n = loops.size();
+                        std::vector<int> depth(n, 0);
+                        std::vector<int> parent(n, -1);  // immediate (smallest) enclosing loop
+                        auto poly_inside = [](const Eigen::Vector2d& pt,
+                                              const std::vector<Eigen::Vector2d>& poly) -> bool {
+                            const std::size_t m = poly.size();
+                            if (m < 3) return false;
+                            bool in = false;
+                            for (std::size_t i = 0, j = m - 1; i < m; j = i++) {
+                                double xi = poly[i].x(), yi = poly[i].y();
+                                double xj = poly[j].x(), yj = poly[j].y();
+                                if (((yi > pt.y()) != (yj > pt.y())) &&
+                                    (pt.x() < (xj - xi) * (pt.y() - yi) / (yj - yi + 1e-30) + xi))
+                                    in = !in;
+                            }
+                            return in;
+                        };
+                        for (std::size_t i = 0; i < n; ++i) {
+                            double parent_area = std::numeric_limits<double>::infinity();
+                            for (std::size_t j = 0; j < n; ++j) {
+                                if (i == j) continue;
+                                // i is inside j only if j is STRICTLY LARGER — without this guard
+                                // CONCENTRIC loops (a bore and its outer wall share a centroid)
+                                // each test "inside" the other and both collapse to holes (area 0).
+                                if (loops[j].area <= loops[i].area) continue;
+                                if (poly_inside(loops[i].cuv, loops[j].poly)) {
+                                    ++depth[i];
+                                    if (loops[j].area < parent_area) {  // smallest enclosing = parent
+                                        parent_area = loops[j].area;
+                                        parent[i] = static_cast<int>(j);
+                                    }
+                                }
+                            }
+                        }
+
+                        // One face per SOLID loop, with its direct HOLE children added. Collect
+                        // every solid face into a compound so disjoint material regions SUM.
+                        TopoDS_Compound sec_comp;
+                        BRep_Builder cb;
+                        cb.MakeCompound(sec_comp);
+                        bool any_face = false;
+                        for (std::size_t i = 0; i < n; ++i) {
+                            if (depth[i] % 2 != 0) continue;  // odd depth = a hole, not material
+                            BRepBuilderAPI_MakeFace fm(pln, loops[i].wire);
+                            for (std::size_t h = 0; h < n; ++h) {
+                                if (depth[h] % 2 == 0 || parent[h] != static_cast<int>(i)) continue;
+                                // A hole wire must run opposite to its outer wire; MakeFace::Add
+                                // treats the added wire as an inner boundary and subtracts it.
+                                TopoDS_Wire hole = loops[h].wire;
+                                hole.Reverse();
+                                fm.Add(hole);
+                            }
+                            if (fm.IsDone()) { cb.Add(sec_comp, fm.Face()); any_face = true; }
+                        }
+
+                        if (any_face) {
+                            GProp_GProps fp;
+                            BRepGProp::SurfaceProperties(sec_comp, fp);
+                            area = std::abs(fp.Mass());
+                            gp_Pnt com = fp.CentreOfMass();
+                            cx = com.X();
+                            cy = com.Y();
+                            cz = com.Z();
+
+                            // Ixx/Iyy/Ixy in the CUTTING PLANE's local frame, about the section
+                            // centroid. Re-express the section in a frame whose origin is the
+                            // centroid and whose X/Y axes are the plane's in-plane u/v: a
+                            // gp_Trsf::SetTransformation(localAx3) maps a point's GLOBAL coords
+                            // into that frame's LOCAL coords, so after the transform the section
+                            // lies in z=0 with its centroid at the origin. Its MatrixOfInertia is
+                            // then the centroidal planar tensor: (1,1)=∫v²dA=Ixx (about local u),
+                            // (2,2)=∫u²dA=Iyy (about local v), (1,2)=-∫uv dA=Ixy. (Reading the
+                            // GLOBAL-axis MatrixOfInertia directly only happens to be right for an
+                            // XY/top cut; a front/right cut mixed in the out-of-plane axis.)
+                            gp_Ax3 local(com, pos.Direction(), pos.XDirection());
+                            gp_Trsf to_local;
+                            to_local.SetTransformation(local);
+                            TopoDS_Shape lf =
+                                BRepBuilderAPI_Transform(sec_comp, to_local, true).Shape();
+                            GProp_GProps lp;
+                            BRepGProp::SurfaceProperties(lf, lp);
+                            const gp_Mat& mat = lp.MatrixOfInertia();  // 1-based, about origin
+                            Ixx = mat.Value(1, 1);
+                            Iyy = mat.Value(2, 2);
+                            Ixy = mat.Value(1, 2);
+                        }
+                    }
+                }
+            } catch (const Standard_Failure&) {
+                // face build failed -> fall through to the wire-centroid fallback below
+            }
+
+            // Fallback: a centroid from the section wire when no face could be built (open
+            // or degenerate section); leaves area/moments at 0.
+            if (area == 0.0 && cx == 0.0 && cy == 0.0 && cz == 0.0) {
+                GProp_GProps lin;
+                BRepGProp::LinearProperties(sec_shape, lin);
+                gp_Pnt com = lin.CentreOfMass();
+                cx = com.X();
+                cy = com.Y();
+                cz = com.Z();
+            }
         }
     } catch (const Standard_Failure&) {
         // matches the oracle's broad except -> zero everything
     }
 
     return json{
-        {"area_mm2", 0.0},
+        {"area_mm2", area},
         {"centroid", {cx, cy, cz}},
-        {"Ixx", 0.0},
-        {"Iyy", 0.0},
-        {"Ixy", 0.0},
+        {"Ixx", Ixx},
+        {"Iyy", Iyy},
+        {"Ixy", Ixy},
     };
 }
 
@@ -5097,7 +5913,7 @@ json doc_eval_section_props(const std::string& doc_id, const json& plane_ref) {
 // across the plane and measure the symmetric-difference volume. symmetric iff deviation
 // <= 1e-3 * max(vol, 1.0). Returns {"symmetric", "deviation_mm3"}.
 json doc_eval_symmetry(const std::string& doc_id, int body_id, const json& plane_ref) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     const TopoDS_Shape& shape = eval_active_shape(r, doc_id, body_id);
@@ -5239,7 +6055,7 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
 //                    s.is_assembly branch — without it an assembly always reported "no interference"
 //                    because compile_document(asm).shapes is empty.
 json doc_eval_interference(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
 
     std::vector<std::pair<std::string, TopoDS_Shape>> members;
@@ -5264,7 +6080,7 @@ json doc_eval_interference(const std::string& doc_id) {
 // the LAST body, then single-entity or pair measure. Refs resolve in the SAME enumeration
 // describe_* + body.faces()/edges()/vertices() use (a TopExp re-walk).
 json doc_eval_measure(const std::string& doc_id, const json& refs) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     if (r.shapes.empty())
@@ -5356,6 +6172,14 @@ inline void field_vertex_normal(const aicm::AicmBody& body, std::size_t vi, doub
 // engine/doc/evaluate.py::_moller_trumbore_all — for each ray, the smallest positive t
 // (distance along a UNIT direction) to a triangle of the mesh; inf if no hit. Ported 1:1
 // (same EPS=1e-10, u/v barycentric bounds, t>EPS guard). directions are unit vectors.
+//
+// TWO-SIDED (intentional, load-bearing for wall thickness): the determinant test below is
+// `std::abs(a) <= EPS` — it rejects ONLY rays parallel to a triangle, accepting BOTH front-
+// and back-facing triangles. This is what makes the thickness cast (doc_eval_thickness) find
+// the NEAREST opposite wall: the near inner-shell wall is wound toward the cavity (back-facing
+// to an inward ray), so a one-sided / back-face-culling cast would SKIP it and cross the whole
+// cavity to the far wall (reporting the cavity span, not the wall). Do NOT add a sign-of-`a`
+// cull here without giving doc_eval_thickness its own two-sided path.
 std::vector<double> field_moller_trumbore_all(const std::vector<float>& pos,
                                               const std::vector<uint32_t>& idx,
                                               const std::vector<std::array<double, 3>>& origins,
@@ -5421,10 +6245,13 @@ std::vector<double> field_moller_trumbore_all(const std::vector<float>& pos,
 }  // namespace
 
 // engine/doc/evaluate.py::draft_field. Per-vertex draft angle = degrees(arcsin(clip(n·pull,
-// -1,1))) for the normalized vertex normal n and normalized pull. chunk name "draft".
+// -1,1))) for the normalized vertex normal n and normalized pull. chunk name "draft". Beyond
+// the field, returns the moldability summary: min/max draft over the body, and (using
+// angle_deg as the minimum-draft threshold, default 3°) the count + list of FACES whose
+// worst-case |draft| is below it — the walls that would drag on the mold during ejection.
 json doc_eval_draft(const std::string& doc_id, int body_id, const std::array<double, 3>& pull_in,
-                    double /*angle_deg*/) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+                    double angle_deg) {
+    DocLock lk;
     Session& s = require_session(doc_id);
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     const TopoDS_Shape& shape = field_active_shape(r, doc_id, body_id);
@@ -5464,8 +6291,72 @@ json doc_eval_draft(const std::string& doc_id, int body_id, const std::array<dou
         vmax = 90.0f;
     }
 
+    // Per-FACE moldability classification. For each B-rep face, take its worst-case (minimum
+    // over the face's vertices) absolute draft, and its area + area-weighted centroid. A face
+    // is "below threshold" iff its worst |draft| < threshold (the shallowest point governs
+    // whether it drags on the mold). threshold = angle_deg when given, else the common 3°
+    // injection-molding minimum.
+    const double threshold = (angle_deg > 0.0) ? angle_deg : 3.0;
+    json below = json::array();
+    int n_below = 0;
+    for (const aicm::FaceRec& fr : body.faces) {
+        if (fr.tri_count == 0) continue;
+        std::size_t lo = static_cast<std::size_t>(fr.first_tri) * 3;
+        std::size_t hi = static_cast<std::size_t>(fr.first_tri + fr.tri_count) * 3;
+        if (hi > body.idx.size()) hi = body.idx.size();
+
+        double face_area = 0.0;
+        double cw[3] = {0.0, 0.0, 0.0};  // area-weighted centroid accumulator
+        double min_abs_draft = std::numeric_limits<double>::infinity();
+        bool have_draft = false;
+        for (std::size_t k = lo; k + 2 < hi; k += 3) {
+            uint32_t a = body.idx[k], b = body.idx[k + 1], c = body.idx[k + 2];
+            if (a >= n || b >= n || c >= n) continue;
+            const float* pa = &body.pos[3 * a];
+            const float* pb = &body.pos[3 * b];
+            const float* pc = &body.pos[3 * c];
+            double e1[3] = {pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]};
+            double e2[3] = {pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]};
+            double cx_ = e1[1] * e2[2] - e1[2] * e2[1];
+            double cy_ = e1[2] * e2[0] - e1[0] * e2[2];
+            double cz_ = e1[0] * e2[1] - e1[1] * e2[0];
+            double tri_area = 0.5 * std::sqrt(cx_ * cx_ + cy_ * cy_ + cz_ * cz_);
+            face_area += tri_area;
+            double tcx = (pa[0] + pb[0] + pc[0]) / 3.0;
+            double tcy = (pa[1] + pb[1] + pc[1]) / 3.0;
+            double tcz = (pa[2] + pb[2] + pc[2]) / 3.0;
+            cw[0] += tcx * tri_area;
+            cw[1] += tcy * tri_area;
+            cw[2] += tcz * tri_area;
+            for (uint32_t vi : {a, b, c}) {
+                double dr = std::abs(static_cast<double>(values[vi]));
+                if (std::isfinite(dr)) {
+                    min_abs_draft = std::min(min_abs_draft, dr);
+                    have_draft = true;
+                }
+            }
+        }
+        if (!have_draft || face_area <= 0.0) continue;
+        if (min_abs_draft < threshold) {
+            ++n_below;
+            below.push_back(json{
+                {"face_id", fr.face_id},
+                {"min_draft_deg", min_abs_draft},
+                {"area_mm2", face_area},
+                {"centroid", {cw[0] / face_area, cw[1] / face_area, cw[2] / face_area}},
+            });
+        }
+    }
+
     auto chunk = aicm::scalar_chunk(body.body_id, "draft", values, vmin, vmax);
-    return json{{"aicm_path", field_write_temp_aicm(body, chunk)}};
+    return json{
+        {"aicm_path", field_write_temp_aicm(body, chunk)},
+        {"min_draft_deg", any_finite ? json(static_cast<double>(vmin)) : json(nullptr)},
+        {"max_draft_deg", any_finite ? json(static_cast<double>(vmax)) : json(nullptr)},
+        {"threshold_deg", threshold},
+        {"n_faces_below_threshold", n_below},
+        {"faces_below_threshold", below},
+    };
 }
 
 // engine/doc/evaluate.py::curvature_field. Re-mesh (BRepMesh 0.1) to match the oracle's face
@@ -5473,7 +6364,7 @@ json doc_eval_draft(const std::string& doc_id, int body_id, const std::array<dou
 // (projected via ShapeAnalysis_Surface::ValueOfUV). kind: mean=(k1+k2)/2, gaussian=k1*k2,
 // max=max(|k1|,|k2|). chunk name "curvature_<kind>". Verts with no defined curvature stay NaN.
 json doc_eval_curvature(const std::string& doc_id, int body_id, const std::string& kind) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     const TopoDS_Shape& shape = field_active_shape(r, doc_id, body_id);
@@ -5555,16 +6446,26 @@ json doc_eval_curvature(const std::string& doc_id, int body_id, const std::strin
     }
 
     auto chunk = aicm::scalar_chunk(body.body_id, "curvature_" + kind, values, vmin, vmax);
-    return json{{"aicm_path", field_write_temp_aicm(body, chunk)}};
+    json out{{"aicm_path", field_write_temp_aicm(body, chunk)}};
+    out["min_curvature"] = any ? json(static_cast<double>(vmin)) : json(nullptr);
+    out["max_curvature"] = any ? json(static_cast<double>(vmax)) : json(nullptr);
+    out["kind"] = kind;
+    return out;
 }
 
 // engine/doc/evaluate.py::thickness_field. Per-vertex inward-raycast wall thickness: from each
-// vertex offset 1e-3 along -normal, cast -normal and take the first re-intersection distance
-// (minus the offset). The oracle's primary path is trimesh BVH; we port the deterministic
+// vertex offset 1e-3 along -normal (the inward direction, since field_vertex_normal returns the
+// OUTWARD surface normal), cast -normal and take the NEAREST re-intersection distance (minus the
+// offset). The cast is TWO-SIDED (field_moller_trumbore_all accepts triangles of either winding)
+// so it stops at the FIRST opposite wall — for a hollow shell that is the thin wall, not the far
+// side across the cavity. The oracle's primary path is trimesh BVH; we port the deterministic
 // Moller-Trumbore FALLBACK (_moller_trumbore_all). chunk name "thickness". NOTE: parity here is
 // PHYSICAL (a tolerance band), not bit-exact — the oracle's BVH runs on a divergent mesh.
+// CAVEAT: thickness is a property of the SOLID. A solid block reports its full span (a 40 mm
+// cube -> ~40 mm), which is correct; only a body with a genuine cavity (e.g. an open shell)
+// has a thin wall to report (~2 mm for a 2 mm shell).
 json doc_eval_thickness(const std::string& doc_id, int body_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     const TopoDS_Shape& shape = field_active_shape(r, doc_id, body_id);
@@ -5591,12 +6492,16 @@ json doc_eval_thickness(const std::string& doc_id, int body_id) {
     std::vector<double> hits = field_moller_trumbore_all(body.pos, body.idx, origins, dirs);
 
     float vmin = 0.0f, vmax = 0.0f;
+    double sum = 0.0;
+    std::size_t n_sampled = 0;  // vertices with a valid through-wall hit
     bool any = false;
     for (std::size_t i = 0; i < n; ++i) {
         double d = hits[i];
         if (std::isfinite(d) && d > OFFSET) {
             float t = static_cast<float>(d - OFFSET);
             values[i] = t;
+            sum += t;
+            ++n_sampled;
             if (!any) {
                 vmin = vmax = t;
                 any = true;
@@ -5608,12 +6513,25 @@ json doc_eval_thickness(const std::string& doc_id, int body_id) {
     }
 
     auto chunk = aicm::scalar_chunk(body.body_id, "thickness", values, vmin, vmax);
-    return json{{"aicm_path", field_write_temp_aicm(body, chunk)}};
+    json out{{"aicm_path", field_write_temp_aicm(body, chunk)}};
+    // Numeric summary over the sampled (valid-hit) vertices. min is the key value — the
+    // thinnest wall. null when no vertex got a through-wall hit (e.g. an open/sheet body).
+    if (n_sampled > 0) {
+        out["min_thickness_mm"] = static_cast<double>(vmin);
+        out["max_thickness_mm"] = static_cast<double>(vmax);
+        out["mean_thickness_mm"] = sum / static_cast<double>(n_sampled);
+    } else {
+        out["min_thickness_mm"] = nullptr;
+        out["max_thickness_mm"] = nullptr;
+        out["mean_thickness_mm"] = nullptr;
+    }
+    out["n_sampled"] = static_cast<int>(n_sampled);
+    return out;
 }
 
 json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double distance,
                    bool commit) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     // plan_push_pull compiles + resolves the face owner (throws OpError on a bad
     // body_id/topo_id), never mutating the doc.
@@ -5708,7 +6626,7 @@ json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double d
 
 json doc_export_file(const std::string& doc_id, const std::string& path, const std::string& fmt,
                      double lin_deflection, double ang_deflection, bool relative, bool ascii) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     if (path.empty())
         throw OpError("invalid_op", "export_file: 'path' is required", {{"reason", "missing path"}});
@@ -5723,7 +6641,20 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
     if (ang_deflection > 0.0) tess.ang_deflection = ang_deflection;
     tess.relative = relative;
     tess.ascii = ascii;
-    const std::size_t expected_solids = r.shapes.size();
+    // Count the ACTUAL solids handed to the writer (Issue 3). A single body can be a COMPOUND
+    // of disjoint lumps (a boolean result), so the body count understates how many solids a
+    // re-read recovers — which made the round-trip check report a misleading "3/1 solids" for
+    // a multi-body export and, on the steering body, reject a perfectly good file. Counting
+    // solids here matches what the (per-solid) STEP writer emits and what import_bodies reads
+    // back. A body with no solid (an open sheet/shell surface) counts as one unit.
+    std::size_t expected_solids = 0;
+    for (const TopoDS_Shape& b : r.shapes) {
+        if (b.IsNull()) continue;
+        std::size_t n = 0;
+        for (TopExp_Explorer ex(b, TopAbs_SOLID); ex.More(); ex.Next()) ++n;
+        expected_solids += (n > 0 ? n : 1);
+    }
+    if (expected_solids == 0) expected_solids = r.shapes.size();
     std::string out = export_bodies(r.shapes, path, fmt, tess);  // throws on a writer error
 
     // Real metadata + a flush check: never report success on a missing/empty (truncated) file.
@@ -5781,7 +6712,7 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
 
 json doc_export_estimate(const std::string& doc_id, double lin_deflection, double ang_deflection,
                          bool relative) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     TessOptions tess;
@@ -5800,15 +6731,77 @@ static bool is_stepplus_path(const std::string& path) {
     return ext == ".step+";
 }
 
+// Make `base` unique among the existing feature DISPLAY names in `s` by appending _2, _3, …
+// (Issue 10). Importing the same file repeatedly used to add several features all named e.g.
+// "HP_Rover_Wheel", which the compiler then flagged with a duplicate-name warning on every
+// import. Uniquifying at insert time keeps the tree readable and silences the noise. Caller
+// must hold the doc lock (reads s.doc). Empty base is returned as-is.
+static std::string unique_feature_name(const Session& s, const std::string& base) {
+    if (base.empty()) return base;
+    std::set<std::string> used;
+    if (s.doc.contains("features") && s.doc["features"].is_array())
+        for (const json& f : s.doc["features"])
+            if (f.is_object() && f.contains("name") && f["name"].is_string())
+                used.insert(f["name"].get<std::string>());
+    if (!used.count(base)) return base;
+    for (int i = 2;; ++i) {
+        std::string cand = base + "_" + std::to_string(i);
+        if (!used.count(cand)) return cand;
+    }
+}
+
 json doc_import_file(const std::string& path, const std::string& into, bool as_solid,
                      const std::string& fmt) {
     // A native .step+ is a DOCUMENT, not a neutral body file: reopen it as a part doc
     // instead of failing on the format sniffer (Bug N-4 — import_part rejected the very
     // extension save_part writes). Route BEFORE taking the lock (doc_open locks g_mtx).
-    if (fmt.empty() && into.empty() && is_stepplus_path(path))
-        return doc_open(path, as_solid);
+    if (fmt.empty() && is_stepplus_path(path)) {
+        if (into.empty())
+            return doc_open(path, as_solid);
+        // Import a native .step+ INTO an existing doc for assembly (Issue 2). Native is the
+        // recommended save format, yet it used to be the one format you couldn't assemble from
+        // (the caller had to re-export every part to plain STEP/BREP first). We open the
+        // container as a throwaway doc, bake its compiled solids into an embedded-BREP import
+        // feature on `into` (the same representation a STEP import uses — survives source
+        // deletion), then discard the temp doc. Routed before the lock: doc_open locks g_mtx.
+        json opened = doc_open(path, as_solid);
+        const std::string tmp_id = opened.value("doc_id", std::string());
+        if (tmp_id.empty())
+            throw OpError("import_failed", "import_file: could not open .step+ container",
+                          {{"path", path}});
+        const std::string stem = std::filesystem::path(path).stem().string();
+        std::string blob;
+        std::size_t n = 0;
+        {
+            DocLock lk;
+            Session& tmp = require_session(tmp_id);
+            CompileResult r = compile_document(tmp.doc, env_from_doc(tmp.doc));
+            TopoDS_Compound comp;
+            BRep_Builder bb;
+            bb.MakeCompound(comp);
+            for (const TopoDS_Shape& shp : r.shapes)
+                if (!shp.IsNull()) { bb.Add(comp, shp); ++n; }
+            if (n > 0) blob = shape_to_brep_b64(comp);
+        }
+        try { doc_close(tmp_id); } catch (...) { /* best-effort cleanup of the temp doc */ }
+        if (n == 0 || blob.empty())
+            throw OpError("import_failed", "import_file: .step+ contained no solids to import",
+                          {{"path", path}});
+        DocLock lk;
+        Session& s = require_session(into);
+        const std::string fname = unique_feature_name(s, stem);  // Issue 10
+        json params = {{"source_path", path}, {"format", "step+"}, {"original_name", stem},
+                       {"embedded_brep", blob}, {"embedded_bodies", n}};
+        json ops = json::array({json{
+            {"op", "add_feature"},
+            {"feature", {{"type", "import"}, {"name", fname}, {"params", params},
+                         {"refs", json::object()}}}}});
+        json resp = apply_ops_locked(s, -1, ops, /*coalesce=*/false);
+        resp["doc_id"] = s.doc_id;
+        return resp;
+    }
 
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     if (path.empty())
         throw OpError("invalid_op", "import_file: 'path' is required", {{"reason", "missing path"}});
     // Resolve the format up front so a bad extension errors before we touch a session.
@@ -5850,15 +6843,18 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
     } catch (...) {
         // leave path-only; compiler falls back to source_path
     }
-    json ops = json::array({json{
-        {"op", "add_feature"},
-        {"feature", {{"type", "import"}, {"name", stem}, {"params", params}, {"refs", json::object()}}}}});
-
     Session* s = nullptr;
     if (!into.empty())
         s = &require_session(into);  // append to an existing C++ session
     else
         s = &new_part_session_locked(stem.empty() ? std::string("Imported") : stem);
+
+    // Uniquify the feature name against the target doc (Issue 10) so repeated imports of the
+    // same file don't all share one name (and trip the duplicate-name warning every time).
+    const std::string fname = unique_feature_name(*s, stem.empty() ? std::string("Imported") : stem);
+    json ops = json::array({json{
+        {"op", "add_feature"},
+        {"feature", {{"type", "import"}, {"name", fname}, {"params", params}, {"refs", json::object()}}}}});
 
     json resp = apply_ops_locked(*s, -1, ops, /*coalesce=*/false);
     resp["doc_id"] = s->doc_id;
@@ -5895,7 +6891,7 @@ static std::string vendor_slug(const std::string& v) {
 // mint a new part doc. Throws OpError on a missing index / unknown part / missing CAD file.
 json doc_vendor_part_insert(const std::string& into, const std::string& supplier,
                             const std::string& part_number, const std::string& name) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     // %APPDATA%/AI-CAD/vendor_parts/index.json (mirror of engine/paths.py::appdata_root()).
     const char* appdata = std::getenv("APPDATA");
     std::filesystem::path root;
@@ -6043,7 +7039,7 @@ json doc_save(const std::string& doc_id, const std::string& path) {
     // session state, so it is safe to call lock-free here.
     std::map<std::string, std::string> drawing_entries = drawings_for_source(doc_id);
 
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     const std::string target = !path.empty() ? path : s.path;
     if (target.empty())
@@ -6080,7 +7076,7 @@ json doc_open(const std::string& path, bool as_solid) {
     std::map<std::string, std::string> drawing_entries;  // restored after the session lock
     json resp;
     {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     StepPlusDoc loaded = stepplus_open(path);  // throws OpError on a bad file
 
     // Only PART documents are handled by the C++ core. A non-part container (e.g. an
@@ -6157,7 +7153,7 @@ json doc_open(const std::string& path, bool as_solid) {
 // regions/probe/project_ref. doc_id-keyed; operate on the per-session active_sketch.
 
 json doc_sketch_enter(const std::string& doc_id, const std::string& sketch_fid) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     json& feat = find_sketch_feature(s, sketch_fid);
     aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
@@ -6178,7 +7174,7 @@ json doc_sketch_enter(const std::string& doc_id, const std::string& sketch_fid) 
 }
 
 json doc_sketch_solve(const std::string& doc_id, const std::string& sketch_fid) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     json& feat = find_sketch_feature(s, sketch_fid);
     std::optional<aicad::sketch::SolveState> warm;
@@ -6203,7 +7199,7 @@ json doc_sketch_solve(const std::string& doc_id, const std::string& sketch_fid) 
 }
 
 json doc_sketch_overview(const std::string& doc_id, const std::string& sketch_fid) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     json& feat = find_sketch_feature(s, sketch_fid);
     aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
@@ -6221,7 +7217,7 @@ json doc_sketch_overview(const std::string& doc_id, const std::string& sketch_fi
 
 json doc_sketch_drag(const std::string& doc_id, const std::string& sketch_fid,
                      const std::string& handle, const json& xy, const json& targets) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     json& feat = find_sketch_feature(s, sketch_fid);
     // Not entered (or stale / cold) — enter implicitly so drag is still serviceable.
@@ -6294,7 +7290,7 @@ json doc_sketch_drag(const std::string& doc_id, const std::string& sketch_fid,
 }
 
 json doc_sketch_drag_commit(const std::string& doc_id, const std::string& sketch_fid) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     json& feat = find_sketch_feature(s, sketch_fid);
 
@@ -6350,7 +7346,7 @@ json doc_sketch_drag_commit(const std::string& doc_id, const std::string& sketch
 }
 
 json doc_sketch_exit(const std::string& doc_id, const std::string& sketch_fid) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     json& feat = find_sketch_feature(s, sketch_fid);
 
@@ -6663,7 +7659,7 @@ json poly_to_json(const std::vector<Eigen::Vector2d>& p) {
 }  // namespace
 
 json doc_sketch_regions(const std::string& doc_id, const std::string& sketch_fid) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     json& feat = find_sketch_feature(s, sketch_fid);
     aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
@@ -6774,7 +7770,7 @@ json doc_sketch_regions(const std::string& doc_id, const std::string& sketch_fid
 
 json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
                       const json& action) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     // The probe operates on the ACTIVE sketch (same context sketch_solve uses).
     json* featp = nullptr;
@@ -6944,7 +7940,7 @@ std::pair<Eigen::Vector2d, Eigen::Vector2d> plane_plane_line_uv(
 // `ref` is {"datum":"front|top|right"} or {"kind":"face|edge","selector":{...}}.
 json doc_sketch_project_ref(const std::string& doc_id, const std::string& sketch_fid,
                             const json& ref) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DocLock lk;
     Session& s = require_session(doc_id);
     json& feat = find_sketch_feature(s, sketch_fid);
     aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);

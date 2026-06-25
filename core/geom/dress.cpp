@@ -1,16 +1,22 @@
 #include "geom/dress.h"
 
+#include <algorithm>
 #include <cmath>
+#include <string>
 #include <vector>
 
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRep_Tool.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
 #include <BRepFilletAPI_MakeChamfer.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepOffsetAPI_DraftAngle.hxx>
+#include <BRepOffsetAPI_MakeOffsetShape.hxx>
 #include <BRepOffsetAPI_MakeThickSolid.hxx>
 #include <BRepOffset_Mode.hxx>
+#include <BRepGProp.hxx>
+#include <GProp_GProps.hxx>
 #include <GeomAbs_CurveType.hxx>
 #include <GeomAbs_JoinType.hxx>
 #include <GeomAbs_Shape.hxx>
@@ -70,12 +76,53 @@ bool is_blendable_edge(const TopoDS_Edge& edge,
     return true;
 }
 
+// Seam-aware watertight-solid test (mirrors document.cpp::dress_is_closed_solid). Every edge
+// of a closed solid is shared by >= 2 faces; the only single-face exceptions are SEAMS (the
+// 0/2pi closure of a cylinder/sphere/revolution skin) and DEGENERATE edges (a cone apex /
+// sphere pole). Any OTHER edge with < 2 incident faces is a genuine FREE edge -> the shell is
+// open. A partial blend that drops a too-tight edge mid-chain can hand back a body with a
+// POSITIVE volume but an OPEN B-rep (BRepFilletAPI reports IsDone yet the surface didn't
+// reseal). Such a body later fails eval_check / STEP re-validation / FEA, so we must never
+// ACCEPT one — this is the acceptance gate that makes "round what you can" still yield a
+// watertight solid instead of being rejected wholesale downstream (the seats-fillet symptom).
+bool blend_is_watertight(const TopoDS_Shape& shape) {
+    if (shape.IsNull()) return false;
+    try {
+        TopTools_IndexedDataMapOfShapeListOfShape anc;
+        TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, anc);
+        TopTools_IndexedMapOfShape edges;
+        TopExp::MapShapes(shape, TopAbs_EDGE, edges);
+        if (edges.Extent() == 0) return false;
+        for (int ei = 1; ei <= edges.Extent(); ++ei) {
+            const TopoDS_Shape& es = edges.FindKey(ei);
+            const int nf = anc.Contains(es) ? anc.FindFromKey(es).Extent() : 0;
+            if (nf >= 2) continue;
+            const TopoDS_Edge& e = TopoDS::Edge(es);
+            if (BRep_Tool::Degenerated(e)) continue;
+            bool seam = false;
+            if (anc.Contains(es)) {
+                const TopTools_ListOfShape& faces = anc.FindFromKey(es);
+                for (TopTools_ListIteratorOfListOfShape it(faces); it.More(); it.Next())
+                    if (BRep_Tool::IsClosed(e, TopoDS::Face(it.Value()))) { seam = true; break; }
+            }
+            if (!seam) return false;
+        }
+        return true;
+    } catch (const Standard_Failure&) {
+        return false;
+    }
+}
+
 // Build a fillet/chamfer over `good`, dropping any edge that breaks the build instead of failing
 // the whole feature. Fast path adds them all at once (the common, correct case); on failure it
 // re-adds one at a time and keeps only the edges that still produce a valid solid. This is what
 // the user expects when most edges are fine and one section is too tight for the radius (a rim near
 // the axis, a corner OCCT can't resolve, radius > local half-width) — "round what you can" beats
 // a hard error. `Builder` is BRepFilletAPI_MakeFillet/_MakeChamfer; `add(mk, edge)` applies the leg.
+// An edge is ACCEPTED only when its build is IsDone AND the result is still a WATERTIGHT solid:
+// an edge whose drop (or whose own blend) opens the shell is rejected too, so the returned body
+// is always closed — otherwise the downstream open-shell guard would reject the whole feature
+// even though most edges rounded fine (the all-or-nothing "produced an open/invalid body" bug).
 template <class Builder, class AddFn>
 TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
                                 const std::vector<TopoDS_Edge>& good, AddFn add,
@@ -86,7 +133,10 @@ TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
         Builder mk(shape);
         for (const TopoDS_Edge& e : good) add(mk, e);
         mk.Build();
-        if (mk.IsDone()) return mk.Shape();
+        if (mk.IsDone()) {
+            TopoDS_Shape s = mk.Shape();
+            if (blend_is_watertight(s)) return s;  // common case: every edge rounded cleanly
+        }
     } catch (const Standard_Failure&) { /* fall through to incremental */ }
 
     std::vector<TopoDS_Edge> accepted;
@@ -97,7 +147,7 @@ TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
             for (const TopoDS_Edge& a : accepted) add(mk, a);
             add(mk, e);
             mk.Build();
-            if (mk.IsDone()) accepted.push_back(e);
+            if (mk.IsDone() && blend_is_watertight(mk.Shape())) accepted.push_back(e);
         } catch (const Standard_Failure&) { /* skip this edge */ }
     }
     if (n_dropped) *n_dropped = (int)(good.size() - accepted.size());
@@ -106,13 +156,22 @@ TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
         Builder mk(shape);
         for (const TopoDS_Edge& e : accepted) add(mk, e);
         mk.Build();
-        if (mk.IsDone()) return mk.Shape();
+        if (mk.IsDone()) {
+            TopoDS_Shape s = mk.Shape();
+            if (blend_is_watertight(s)) return s;
+        }
     } catch (const Standard_Failure&) {}
     return TopoDS_Shape();
 }
 
 }  // namespace
 
+// NOTE: the "round/bevel EVERY edge" (dir-filter) overloads below are intentionally
+// ALL-OR-NOTHING. An oversize radius on the whole-body round is a mistake the caller wants
+// flagged (a clear "too large" error leaving the body intact), NOT silently turned into a
+// partial round of whichever subset happens to fit. The drop-failing/best-effort behaviour is
+// reserved for the EXPLICIT-edge selector overloads (the doc model's `refs.edges` path — the
+// "round these specific edges, skip the few too tight" case the rover seats hit).
 TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
                           std::optional<Eigen::Vector3d> dir) {
     BRepFilletAPI_MakeFillet mk(shape);
@@ -229,9 +288,75 @@ TopoDS_Shape chamfer_edges_two_distance(const TopoDS_Shape& shape, double d1, do
 }
 
 // --- shell ----------------------------------------------------------------------
+
+namespace {
+
+// CLOSED-shell builder (no faces removed = a fully-sealed hollow part, e.g. a hollow
+// ball / a sealed enclosure). MakeThickSolidByJoin with an EMPTY ClosingFaces list
+// no-ops on a closed solid: with no mouth to open, the offset shell coincides with the
+// original skin and OCCT hands back the ORIGINAL solid (a 40^3 box shells to a 36^3
+// SOLID block, not a hollow wall). So the closed case takes a different, robust path:
+// build an offset *solid* (the whole body grown/shrunk by `t` via
+// BRepOffsetAPI_MakeOffsetShape::PerformByJoin on the solid) and BOOLEAN-CUT it against
+// the original to leave a closed wall of thickness `t`:
+//   inward  (SolidWorks default): inner = body offset by -t;  result = body - inner
+//   outward                     : outer = body offset by +t;  result = outer - body
+// For a 40^3 box at t=2: inner=36^3, result volume = 40^3 - 36^3 = 17344 (a sealed wall).
+// Returns a null shape on kernel failure so the caller's guards report it cleanly.
+TopoDS_Shape closed_shell_offset_cut(const TopoDS_Shape& body, double t, bool outward) {
+    const Standard_Real off = outward ? t : -t;
+    // Same join/intersection/tolerance ladder as the open path: Arc join + tight tol
+    // handles prismatic solids exactly; the Intersection join + looser tol recovers
+    // curved skins whose inward offset would otherwise self-intersect at rounded corners.
+    struct Strat { GeomAbs_JoinType join; Standard_Boolean inter; Standard_Real tol; };
+    static const Strat strats[] = {
+        {GeomAbs_Arc,          Standard_False, 1.0e-6},
+        {GeomAbs_Intersection, Standard_True,  1.0e-6},
+        {GeomAbs_Intersection, Standard_True,  1.0e-3},
+        {GeomAbs_Arc,          Standard_True,  1.0e-3},
+    };
+    for (const Strat& s : strats) {
+        try {
+            BRepOffsetAPI_MakeOffsetShape mk;
+            mk.PerformByJoin(body, off, s.tol, BRepOffset_Skin, s.inter,
+                             Standard_False, s.join);
+            mk.Build();
+            if (!mk.IsDone()) continue;
+            TopoDS_Shape offset_solid = mk.Shape();
+            if (offset_solid.IsNull()) continue;
+            // Wall = the larger solid minus the smaller. Inward: body - inner(smaller).
+            // Outward: outer(larger) - body. The cut yields the closed wall of thickness t.
+            const TopoDS_Shape& big   = outward ? offset_solid : body;
+            const TopoDS_Shape& small = outward ? body         : offset_solid;
+            BRepAlgoAPI_Cut cut(big, small);
+            cut.Build();
+            if (!cut.IsDone()) continue;
+            TopoDS_Shape wall = cut.Shape();
+            if (wall.IsNull()) continue;
+            // A genuine sealed wall has positive, REDUCED-from-`big` volume. Reject a
+            // degenerate cut (empty / coincident offset that left the whole big solid).
+            GProp_GProps gbig, gwall;
+            BRepGProp::VolumeProperties(big, gbig);
+            BRepGProp::VolumeProperties(wall, gwall);
+            const double vbig = gbig.Mass(), vwall = gwall.Mass();
+            const double eps = 1e-6 * std::max(1.0, std::abs(vbig));
+            if (vwall > eps && vwall < vbig - eps) return wall;
+        } catch (const Standard_Failure&) {
+            // This strategy threw inside OCCT — fall through to the next one.
+        }
+    }
+    return TopoDS_Shape();
+}
+
+}  // namespace
+
 TopoDS_Shape shell_solid(const TopoDS_Shape& body, double t, bool outward,
                          const std::vector<TopoDS_Face>& remove) {
     if (body.IsNull() || !(t > 0.0)) return TopoDS_Shape();
+    // CLOSED shell (no mouth opened): MakeThickSolidByJoin no-ops with an empty face
+    // list, so route to the offset-solid + boolean-cut path that builds a real sealed
+    // wall (a hollow ball / sealed box). The OPEN path below is unchanged.
+    if (remove.empty()) return closed_shell_offset_cut(body, t, outward);
     // SolidWorks default = inward wall (offset NEGATIVE, material kept inside the
     // original surface); `outward` flips to +t. Mode = Skin (offset the skin).
     const Standard_Real offset = outward ? t : -t;
@@ -286,16 +411,77 @@ bool has_freeform_faces(const TopoDS_Shape& shape) {
 // --- draft ----------------------------------------------------------------------
 TopoDS_Shape draft_faces(const TopoDS_Shape& body, const std::vector<TopoDS_Face>& faces,
                          const Eigen::Vector3d& neutral_pt, const Eigen::Vector3d& neutral_n,
-                         const Eigen::Vector3d& pull, double angle_rad) {
-    if (body.IsNull() || faces.empty()) return TopoDS_Shape();
-    if (!(neutral_n.norm() > 1e-12) || !(pull.norm() > 1e-12)) return TopoDS_Shape();
+                         const Eigen::Vector3d& pull, double angle_rad, std::string* diag) {
+    if (diag) diag->clear();
+    if (body.IsNull() || faces.empty()) {
+        if (diag) *diag = "no body or no faces to draft";
+        return TopoDS_Shape();
+    }
+    if (!(neutral_n.norm() > 1e-12) || !(pull.norm() > 1e-12)) {
+        if (diag) *diag = "degenerate neutral-plane normal or pull direction";
+        return TopoDS_Shape();
+    }
     const gp_Pln neutral(gp_Pnt(neutral_pt.x(), neutral_pt.y(), neutral_pt.z()),
                          gp_Dir(neutral_n.x(), neutral_n.y(), neutral_n.z()));
     const gp_Dir pull_dir(pull.x(), pull.y(), pull.z());
+    // PRE-FILTER the selection to the faces OCCT can actually taper about this neutral
+    // plane. A planar face that is roughly PARALLEL to the neutral plane — e.g. the
+    // top/bottom cap of a box about a horizontal plane — has no intersection line to
+    // pivot about and cannot be drafted; left in the builder it makes Build() THROW a
+    // Standard_Failure (which, not being a std::exception, surfaced as the opaque
+    // "unknown error during feature compile"). Dropping such caps UP FRONT (never adding
+    // them, so the builder state stays clean) lets a mixed selection like {"of":"face"}
+    // (all 6 box faces) still draft the 4 side walls — the SolidWorks behaviour.
+    const gp_Dir neutral_dir(neutral_n.x(), neutral_n.y(), neutral_n.z());
+    std::vector<TopoDS_Face> draftable;
+    int rejected = 0;
+    for (const TopoDS_Face& f : faces) {
+        bool ok = true;
+        try {
+            BRepAdaptor_Surface surf(f);
+            if (surf.GetType() == GeomAbs_Plane) {
+                // |n . neutral| ~ 1  =>  the face is parallel to the neutral plane.
+                const double d = std::abs(surf.Plane().Axis().Direction().Dot(neutral_dir));
+                if (d > 0.999) ok = false;
+            }
+        } catch (const Standard_Failure&) { ok = true; }  // unknown surface: let OCCT try
+        if (ok) draftable.push_back(f);
+        else ++rejected;
+    }
+    if (draftable.empty()) {
+        if (diag)
+            *diag = "none of the selected faces can be tapered about this neutral plane "
+                    "— a draftable face must be roughly PERPENDICULAR to the plane "
+                    "(you cannot draft a face that is parallel to it, e.g. the top/bottom "
+                    "of a box about a horizontal plane). Select the SIDE walls, or move "
+                    "the neutral plane so the faces meet it.";
+        return TopoDS_Shape();
+    }
+
     BRepOffsetAPI_DraftAngle mk(body);
-    for (const TopoDS_Face& f : faces) mk.Add(f, pull_dir, angle_rad, neutral);
-    mk.Build();
-    if (!mk.IsDone()) return TopoDS_Shape();
+    try {
+        for (const TopoDS_Face& f : draftable) mk.Add(f, pull_dir, angle_rad, neutral);
+        mk.Build();
+    } catch (const Standard_Failure& e) {
+        if (diag) {
+            const char* m = e.GetMessageString();
+            *diag = std::string("the kernel could not taper the selected face(s) about "
+                                "this neutral plane") +
+                    (m && *m ? std::string(" (") + m + ")" : std::string()) +
+                    " — check that the pull direction is roughly normal to the neutral "
+                    "plane and the faces meet it.";
+        }
+        return TopoDS_Shape();
+    }
+    if (!mk.IsDone()) {
+        if (diag)
+            *diag = "the draft did not complete — check that the neutral plane intersects "
+                    "the selected faces and the pull direction is roughly normal to it.";
+        return TopoDS_Shape();
+    }
+    if (diag && rejected > 0)
+        *diag = std::to_string(draftable.size()) + " face(s) drafted; " +
+                std::to_string(rejected) + " skipped (parallel to the neutral plane)";
     return mk.Shape();
 }
 

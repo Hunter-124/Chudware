@@ -25,6 +25,14 @@ Example C - round the top rim of a round flange r=1:
  {"op":"add_feature","feature":{"type":"fillet","name":"Rim","params":{"radius":{"value":1,"expr":null}},"refs":{"edges":{"of":"edge","side":"top"}}}}
 ]
 
+VARIABLE-RADIUS fillet: add `radius2` param — the fillet tapers linearly from `radius` at the
+start of each edge to `radius2` at the end. Requires explicit edge picks (not a plain direction
+query). Both radius and radius2 must be > 0.
+Example D - taper edge from 3mm to 1mm (variable):
+[
+ {"op":"add_feature","feature":{"type":"fillet","name":"TaperFillet","params":{"radius":{"value":3,"expr":null},"radius2":{"value":1,"expr":null}},"refs":{"edges":{"of":"edge","side":"top"}}}}
+]
+
 3 common mistakes:
 1. The query goes under refs.edges (an OBJECT with "of"), not at the feature top level.
 2. Radius must be SMALLER than the thinnest wall it touches or the build fails (auto-clamp may shrink it).

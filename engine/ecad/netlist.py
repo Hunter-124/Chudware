@@ -414,6 +414,14 @@ def build_netlist(sch: dict) -> dict:
     by_pin: dict[str, str] = {}
     # pins per component, keyed by sym id.
     pins_by_sym: dict[str, dict[str, str]] = {}
+    # pin NAME -> net for the *placed* unit, keyed by sym id, with the count of distinct pin
+    # numbers carrying that name (so an ambiguous name — shared by two pins of one placed unit —
+    # is NOT aliased). This feeds a number+name pins dict so subckt-backed parts (the op-amp, the
+    # 555) whose sim.pin_order is by NAME resolve their nodes (Bug E3). iter_placed_pins already
+    # filters to the placed unit, so the name->net map is unambiguous per unit (it never mixes the
+    # op-amp's unit-1 IN+/IN- with unit-2's identically-named pins).
+    pin_name_net_by_sym: dict[str, dict[str, str]] = {}
+    pin_name_count_by_sym: dict[str, dict[str, int]] = {}
 
     pin_records.sort(key=lambda r: (r["ref"] or "~", r["sym"], r["pin"], r["pt"]))
     for rec in pin_records:
@@ -422,6 +430,12 @@ def build_netlist(sch: dict) -> dict:
         net = name_of_root.get(root, "") if root is not None else ""
         by_pin[pinref] = net
         pins_by_sym.setdefault(rec["sym"], {})[rec["pin"]] = net
+        nm = rec.get("name") or ""
+        # don't alias a name that equals its own number (R "1"/"2") or "~" (unnamed KiCad pin)
+        if nm and nm != rec["pin"] and nm != "~":
+            pin_name_net_by_sym.setdefault(rec["sym"], {})[nm] = net
+            cnt = pin_name_count_by_sym.setdefault(rec["sym"], {})
+            cnt[nm] = cnt.get(nm, 0) + 1
         if net:
             nets.setdefault(net, []).append({
                 "sym": rec["sym"], "pin": rec["pin"], "ref": rec["ref"],
@@ -438,13 +452,23 @@ def build_netlist(sch: dict) -> dict:
     components: list[dict] = []
     for sym in sorted(sch.get("symbols", []), key=lambda s: (s.get("ref", "~"), s.get("id", ""))):
         sid = sym.get("id", "")
+        # Number-keyed pins, plus NAME-keyed aliases for the placed unit (so a subckt-backed part
+        # whose sim.pin_order is by name — e.g. the op-amp's IN+/IN-/OUT — resolves; Bug E3). Only
+        # an UNAMBIGUOUS name (exactly one pin of the placed unit carries it) is aliased, and a name
+        # never shadows an existing number key.
+        sym_pins = dict(sorted(pins_by_sym.get(sid, {}).items()))
+        name_nets = pin_name_net_by_sym.get(sid, {})
+        name_counts = pin_name_count_by_sym.get(sid, {})
+        for nm, net in name_nets.items():
+            if name_counts.get(nm, 0) == 1 and nm not in sym_pins:
+                sym_pins[nm] = net
         comp = {
             "ref": sym.get("ref", ""),
             "libid": sym.get("libid", ""),
             "value": sym.get("value", ""),
             "footprint": sym.get("footprint", ""),
             "sym": sid,
-            "pins": dict(sorted(pins_by_sym.get(sid, {}).items())),
+            "pins": sym_pins,
             "fields": dict(sorted((sym.get("fields", {}) or {}).items())),
             "dnp": bool(sym.get("dnp", False)),
         }

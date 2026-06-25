@@ -11,6 +11,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ecad/autoroute.h"
@@ -48,6 +49,27 @@ struct Session {
 };
 
 std::mutex g_mtx;
+// Owner-tracking for crash recovery (see force_release_ecad_lock / session.h).
+// Mirrors the identical pattern in core/doc/session.cpp (DocLock / force_release_doc_lock).
+std::atomic<bool> g_mtx_held{false};
+std::thread::id g_mtx_owner;  // guarded by g_mtx (only read/written while held)
+
+// RAII lock for the ECAD session store. Mirrors DocLock in doc/session.cpp exactly.
+class EcadLock {
+public:
+    EcadLock() {
+        g_mtx.lock();
+        g_mtx_owner = std::this_thread::get_id();
+        g_mtx_held.store(true, std::memory_order_release);
+    }
+    ~EcadLock() {
+        g_mtx_held.store(false, std::memory_order_release);
+        g_mtx.unlock();
+    }
+    EcadLock(const EcadLock&) = delete;
+    EcadLock& operator=(const EcadLock&) = delete;
+};
+
 std::map<std::string, Session> g_sessions;
 std::atomic<unsigned long long> g_seq{1};
 
@@ -142,7 +164,7 @@ json ops_response(Session& s, const json& id_map, const json& warnings) {
 }  // namespace
 
 json ecad_new(const std::string& kind, const std::string& name) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     json doc;
     if (kind == "sch")
         doc = schema::new_schematic(name.empty() ? "Schematic1" : name);
@@ -169,7 +191,7 @@ json ecad_new(const std::string& kind, const std::string& name) {
 }
 
 json ecad_apply_ops(const std::string& doc_id, long base_revision, const json& ops) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     Session& s = require_session(doc_id);
     if (base_revision >= 0 && base_revision != s.revision)
         throw OpError("stale_revision",
@@ -188,7 +210,7 @@ json ecad_apply_ops(const std::string& doc_id, long base_revision, const json& o
 }
 
 json ecad_undo(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     Session& s = require_session(doc_id);
     if (s.undo_stack.empty())
         throw OpError("invalid_op", "nothing to undo", {{"reason", "empty undo stack"}});
@@ -202,7 +224,7 @@ json ecad_undo(const std::string& doc_id) {
 }
 
 json ecad_redo(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     Session& s = require_session(doc_id);
     if (s.redo_stack.empty())
         throw OpError("invalid_op", "nothing to redo", {{"reason", "empty redo stack"}});
@@ -217,7 +239,7 @@ json ecad_redo(const std::string& doc_id) {
 }
 
 json ecad_tree(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     Session& s = require_session(doc_id);
     json cf = s.last_compile.is_null() ? compile_field(s.doc) : s.last_compile;
     s.last_compile = cf;
@@ -226,18 +248,18 @@ json ecad_tree(const std::string& doc_id) {
 }
 
 json ecad_rebuild(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     Session& s = require_session(doc_id);
     return ops_response(s, json::object(), json::array());
 }
 
 bool ecad_close(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     return g_sessions.erase(doc_id) > 0;
 }
 
 json ecad_describe(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     Session& s = require_session(doc_id);
     const json& doc = s.doc;
     json compile_info = s.last_compile.is_null() ? json::object() : s.last_compile;
@@ -321,7 +343,7 @@ json ecad_dfm(const std::string& doc_id, const json& rules) {
     // Inline-board fast path (parity harness passes the board verbatim via rules
     // wrapper is not used; the libaicad dispatch passes a board when doc_id empty).
     // Standard path: look up the open session by doc_id.
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     Session& s = require_session(doc_id);
     if (!schema::is_board(s.doc))
         throw OpError("invalid_op", "ecad_dfm requires a pcb document",
@@ -348,7 +370,7 @@ json ecad_export(const json& params) {
     if (params.contains("board") && params["board"].is_object()) {
         board = params["board"];
     } else {
-        std::lock_guard<std::mutex> lk(g_mtx);
+        EcadLock lk;
         Session& s = require_session(params.value("doc_id", std::string()));
         board = s.doc;
     }
@@ -387,7 +409,7 @@ json ecad_export(const json& params) {
 // ------------------------------------------------------------------- save / open
 
 json ecad_save(const std::string& doc_id, const std::string& path) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     Session& s = require_session(doc_id);
     const std::string target = !path.empty() ? path : s.path;
     if (target.empty())
@@ -401,7 +423,7 @@ json ecad_save(const std::string& doc_id, const std::string& path) {
 }
 
 json ecad_open(const std::string& path) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     EcadContainerDoc loaded = ecad_container_open(path);  // throws OpError on a bad file
 
     if (!(schema::is_schematic(loaded.doc) || schema::is_board(loaded.doc))) {
@@ -459,7 +481,7 @@ json swap_doc_locked(Session& s, const json& new_doc, long base_revision, const 
 
 json ecad_update_from_sch(const std::string& board_doc_id, const std::string& sch_doc_id, bool prune,
                           const json& place_origin, long base_revision) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     Session& board_s = require_session(board_doc_id);
     Session& sch_s = require_session(sch_doc_id);
 
@@ -536,7 +558,7 @@ json ecad_impedance(const json& params) {
         json ton = params.contains("track_or_net") ? params["track_or_net"] : json(nullptr);
         if (params.contains("board") && params["board"].is_object())
             return track_impedance(params["board"], ton);  // stateless inline path
-        std::lock_guard<std::mutex> lk(g_mtx);
+        EcadLock lk;
         Session& s = require_session(params.value("doc_id", std::string()));
         return track_impedance(s.doc, ton);
     }
@@ -625,7 +647,7 @@ json apply_route_result(Session& s, const json& result, long base_revision,
 }  // namespace
 
 json ecad_autoroute(const std::string& doc_id, const json& opts, long base_revision) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     Session& s = require_session(doc_id);
     if (!schema::is_board(s.doc))
         throw OpError("invalid_op", "ecad_autoroute requires a pcb document",
@@ -636,7 +658,7 @@ json ecad_autoroute(const std::string& doc_id, const json& opts, long base_revis
 
 json ecad_route_diff_pair(const std::string& doc_id, const std::string& net_p,
                           const std::string& net_n, const json& opts, long base_revision) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     Session& s = require_session(doc_id);
     if (!schema::is_board(s.doc))
         throw OpError("invalid_op", "ecad_route_diff_pair requires a pcb document",
@@ -646,7 +668,7 @@ json ecad_route_diff_pair(const std::string& doc_id, const std::string& net_p,
 }
 
 json ecad_fill_zones(const std::string& doc_id, const json& resolution, long base_revision) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     Session& s = require_session(doc_id);
     if (!schema::is_board(s.doc))
         throw OpError("invalid_op", "ecad_fill_zones requires a pcb document",
@@ -698,7 +720,7 @@ json ecad_fill_zones(const std::string& doc_id, const json& resolution, long bas
 json ecad_simulate(const std::string& doc_id, const json& study_in, const json& sim_params) {
     json nl, doc;
     {
-        std::lock_guard<std::mutex> lk(g_mtx);
+        EcadLock lk;
         Session& s = require_session(doc_id);
         if (!schema::is_schematic(s.doc))
             throw OpError("invalid_op", "ecad_simulate requires a sch document",
@@ -804,9 +826,25 @@ json ecad_simulate(const std::string& doc_id, const json& study_in, const json& 
 }
 
 json ecad_session_doc(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    EcadLock lk;
     Session& s = require_session(doc_id);
     return s.doc;  // value semantics -> deep copy
+}
+
+// ----------------------------------------------------------------- crash recovery
+// Drop an orphaned g_mtx lock left held by THIS thread after a Windows structured
+// exception (access violation) unwound past an EcadLock without running its C++
+// destructor under /EHsc. Mirrors force_release_doc_lock in core/doc/session.cpp —
+// same pattern, same safety contract, same idempotency guarantee.
+// Called from the libaicad C dispatch boundary's __except filter alongside
+// force_release_doc_lock and force_release_drawing_lock so ANY hardware fault releases
+// ALL orphaned registry locks.
+bool force_release_ecad_lock() {
+    if (!g_mtx_held.load(std::memory_order_acquire)) return false;
+    if (g_mtx_owner != std::this_thread::get_id()) return false;
+    g_mtx_held.store(false, std::memory_order_release);
+    g_mtx.unlock();
+    return true;
 }
 
 }  // namespace aicad::ecad

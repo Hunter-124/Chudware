@@ -15,10 +15,23 @@ approximate a curved or organic body with a stack of boxes.
   - Shape that blends between different cross-sections (boat hull, wing, blended duct, turbine
     blade, transition)      -> SKETCH each cross-section on its own plane + LOFT through them.
   - Constant cross-section that follows a path (pipe, handle, gasket, extruded rail, spring/thread)
-                            -> SKETCH the profile + a path + SWEEP (helix path for a thread/spring).
+                            -> SKETCH the profile + a path + SWEEP (for a spring/coil/thread: a
+                            HELIX feature as the path — no sketch needed for the coil path).
+  - Thin support web bridging two walls (gusset, rib, stiffener)
+                            -> open sketch contour (just the web outline) + RIB.
+  - Taper a wall for moulding/casting (draft angle, tapered extrusion wall)
+                            -> build the base shape first, then add a DRAFT feature on the wall faces.
+  - Combine or subtract two separately-built bodies
+                            -> BOOLEAN (fuse/cut/common) referencing the two feature ids.
   - Slab / boss / pocket with a flat 2D outline (bracket, plate, rib, gusset) -> SKETCH + EXTRUDE.
   - Repeated holes/bosses (bolt circle, vent grid)  -> make ONE, then LINEAR/CIRCULAR PATTERN it.
   - Symmetric feature                                -> make one side, then MIRROR it.
+  - Folded constant-thickness metal (bracket, enclosure, chassis, tray) -> SHEET METAL: sm_base_flange
+    then sm_edge_flange / sm_hem / sm_jog bends (see cheatsheets/sheetmetal).
+  - Welded frame from stock tube/angle/channel/beam (chassis, rack, railing) -> WELDMENTS: sketch the
+    member path, then weld_member with a profile (see cheatsheets/weldment).
+  - Freeform / blended thin-wall shell or cover a solid can't make cleanly -> SURFACING: loft/sweep a
+    surface, then surf_thicken it into a wall (see cheatsheets/surfacing).
   - Aerofoil / wing section                          -> AIRFOIL sketch entity (see cheatsheets/airfoil).
   - A plain rectangular/cylindrical block            -> a primitive (box/cylinder) is fine.
 Use a raw `script` feature ONLY when no combination of the features below can express the geometry.
@@ -67,15 +80,27 @@ SKETCH + a 2D-profile feature — this is how you make anything that is not a ba
 DRESS / TRANSFORM an existing body — name edges/faces with a geometry QUERY (no clicking needed).
 You describe the geometry IN PLAIN WORDS; the engine finds the matching edges/faces. You never
 need a face number or a coordinate.
-  fillet  {radius}  refs.edges = {"of":"edge", ...}      chamfer {length} refs.edges = {...}
+  fillet  params {radius} refs.edges = {"of":"edge", ...}
+          VARIABLE-RADIUS: add params.radius2 — a linear taper r→r2 along each edge (requires
+          explicit edge picks, not a direction filter). e.g. r=3, radius2=1 tapers each selected
+          edge from 3mm to 1mm.
+  chamfer params {length} refs.edges = {...}
+          ASYMMETRIC: add params.length2 — leg d1=length on one incident face, d2=length2 on the
+          other (requires explicit edge picks). e.g. length=2, length2=0.5.
   shell   {thickness} refs.remove = {"of":"face","side":"top"}   (omit remove = closed shell)
-  draft   {angle}  refs.neutral = a planar face/datum (the parting plane), refs.faces = the faces
-          to taper {"of":"face", ...}
+  draft   params {angle (deg)}, refs.neutral = a planar datum OR a face query (the parting/neutral
+          plane — the hinge about which faces tilt), refs.faces = the faces to taper {"of":"face",...}
+          Optional refs.pull = an axis datum (pull direction; defaults to neutral plane normal).
+          Positive angle = narrows in the pull direction (draft inward / SolidWorks default).
+          e.g. 3° draft on all side walls of a block, neutral = bottom face:
+          {"type":"draft","name":"Draft","params":{"angle":{"value":3,"expr":null}},
+           "refs":{"neutral":{"of":"face","side":"bottom"},"faces":{"of":"face","surf":"flat"}}}
   Query predicates (combine freely; omit all = EVERY edge/face of `of`):
     "side": which side it's on — "top"/"bottom"/"left"/"right"/"front"/"back" (top=+Z, front=-Y;
             signed axes "+z"/"-x"/.. also work). Keeps the faces/edges furthest that way.
-    "surf": the shape — faces "flat"/"round"; edges "straight"/"round" (or exact: plane/cylinder/
-            cone/sphere/torus, line/circle).
+    "surf": the shape — faces "flat"/"round" (round matches ANY curved face: cylinder/cone/sphere/
+            torus); also "cylindrical"/"conical"/"spherical"/"toroidal" for specific curved types.
+            Edges: "straight"/"round" (or exact: plane/cylinder/cone/sphere/torus, line/circle).
     "parallel": which way it runs — "z" (="vertical"), "x", "y", or [x,y,z]. parallel:"z" = the
             vertical corner edges of a block.
     "pick": the size — faces "largest"/"smallest", edges "longest"/"shortest"; or
@@ -90,10 +115,65 @@ need a face number or a coordinate.
     profile. Use the doc_query tool FIRST if unsure what faces a part has — it returns each
     edge/face's shape (surf) + side so you can see what will resolve.
 
+HELIX / COIL / SPRING PATH (type "helix"). A helix is a CURVE feature — it emits no body by
+itself; use it as refs.path of a SWEEP to make a spring, coil, or thread.
+  Required: refs.base = a datum plane ("plane.top" etc., the helix base), params.pitch (mm per
+  turn), params.height (total axial height). Optional params: radius (default 10), taper (deg,
+  narrows toward top; 0 = straight), turns (overrides height = turns*pitch), start_angle (deg),
+  shape:"spiral" (flat Archimedean spiral — set turns, not height; start_radius optional).
+  VARIABLE PITCH: instead of pitch+height, give pitch_table — an array of rows
+  {turn:<float>, pitch:<mm>, dia?:<mm>} (or bare [turn, pitch, dia?] arrays) — the radius
+  and pitch interpolate piecewise-linear between rows. Needs >= 2 rows.
+  e.g. simple 3-turn compression spring: profile circle r=1.5 on plane.front at (8,0),
+  helix base=plane.top radius=8 pitch=4 height=12, sweep profile over helix.
+  Full example (spring coil, profile + helix + sweep):
+  {"type":"helix","name":"SpringPath","params":{"pitch":{"value":4,"expr":null},
+   "height":{"value":12,"expr":null},"radius":{"value":8,"expr":null}},
+   "refs":{"base":"plane.top"}}
+
+RIB — thin support web grown from an open sketch contour (type "rib"). The sketch must contain
+  an OPEN line/arc/spline that bridges the body. The engine drops the contour inward toward the
+  body centroid, thickens it by `thickness`, trims it to the body bbox, and fuses it.
+  refs.profile = [region selector pointing at the open contour sketch]. Optional params.thickness
+  (default 3mm). The sketch plane is typically a side face or datum plane; the rib web grows
+  perpendicular to that plane.
+  e.g. a 2mm web sketch on plane.right, bridging a bracket:
+  {"type":"rib","name":"Gusset","params":{"thickness":{"value":2,"expr":null}},
+   "refs":{"profile":[{"kind":"region","sketch":"$2","centroid":[0,10],"hint_index":0}]}}
+
+SPLIT — cut a body into pieces along a planar tool (type "split"). Each piece becomes a
+  separate body. Optional params.keep: "both" (default), "above", or "below" (relative to the
+  tool plane normal). refs.tool = a datum plane or a face selector.
+  e.g. split a body at the midplane, keep both halves:
+  {"type":"split","name":"Halves","params":{},"refs":{"tool":"plane.right"}}
+  e.g. keep only the top half:
+  {"type":"split","name":"Top","params":{"keep":"above"},"refs":{"tool":"plane.top"}}
+
+BOOLEAN — explicit fuse/cut/intersect of two named bodies (type "boolean"). Use when you have
+  built two separate bodies and want to combine them without relying on the implicit
+  mode:"boss"/"cut" merging in extrude/revolve/sweep. params.op: "fuse" (union),
+  "cut" (subtract the tool from the target), "common" (intersection). Also accepts
+  "combine"/"subtract"/"intersect" as op aliases.
+  Canonical form: refs.targets = [{"kind":"body","owner_feature":"f1"}],
+                  refs.tools   = [{"kind":"body","owner_feature":"f3"}].
+  Shorthand: params.a = "f1" (target body feature id), params.b = "f3" (tool body feature id)
+  — the engine accepts either form. Both bodies are consumed; a single new body replaces them.
+  A fuse must produce ONE connected solid; a cut/common must also yield ONE solid piece
+  (disjoint results fail — position the bodies so they actually overlap before cutting).
+  e.g. subtract body f3 from body f1 (canonical):
+  {"type":"boolean","name":"CutResult","params":{"op":"cut"},
+   "refs":{"targets":[{"kind":"body","owner_feature":"f1"}],
+           "tools":[{"kind":"body","owner_feature":"f3"}]}}
+  e.g. union two bodies (shorthand):
+  {"type":"boolean","name":"Union","params":{"op":"fuse","a":"f1","b":"f2"}}
+
 INTENT FEATURES — one op that is a whole recipe. PREFER these over hand-built sketch+cut+pattern
 for the common machining features; they take a face in plain words and need no positions math.
   hole  — drill into a planar face. params {style:"simple"|"cbore"|"csink"|"tap", end:"through_all"
           |"blind", diameter, depth?(blind), cbore_d?/cbore_depth?, csink_d?/csink_angle?}.
+          Size the bore by `diameter` (mm) OR by fastener standard `"standard":"M3"` (the engine
+          resolves the clearance bore — M3->3.4mm; tap-drill when style:"tap"). For an "M3 clearance
+          bore" just give {"standard":"M3"}.
           refs.face = a face query e.g. {"of":"face","side":"top"}. Optional `positions`:[[u,v],..]
           (mm in the face, origin = face centre) for several holes; omit = one at the centre.
   bolt_circle — a RING of holes in one feature (no per-hole trig). params {diameter, count, pcd
@@ -101,6 +181,23 @@ for the common machining features; they take a face in plain words and need no p
           face query (defaults to the top face). e.g. 6×⌀5 on a 40mm circle:
           {"type":"bolt_circle","params":{"diameter":5,"count":6,"pcd":40},"refs":{"face":{"of":"face","side":"top"}}}
   rib    — a thin web from an open sketch profile. refs.profile = [region]. (See sheet if present.)
+
+ADVANCED FEATURE FAMILIES — three families the engine fully supports (watertight geometry). Each has
+its own detailed cheatsheet; the essentials to invoke them:
+  SHEET METAL (sm_*) — a folded constant-thickness part. sm_base_flange {thickness}, refs.profile =
+    [region], makes the flat base AND marks the part as sheet metal; then bend walls off its straight
+    top-rim edges with sm_edge_flange {length,angle} / sm_hem {hem_type} / sm_jog {offset,angle}, each
+    refs.edge = ONE straight edge on a thickness face — query_geometry({"of":"edge","surf":"line",
+    "near":[x,y,z],"count":1}) FIRST and pass the RESOLVED match back (this slot rejects a bare query);
+    sm_flat_pattern unfolds the developed blank. Detail: cheatsheets/sheetmetal.
+  WELDMENTS (weld_*) — a frame of stock members. Sketch the centerline PATH, then weld_member
+    {profile, +per-profile dims, joint:"miter"|"butt"|"cope"} -> ONE member body per path segment.
+    profiles: square_tube/rect_tube/round_tube/angle_L/flat_bar/c_channel/i_beam/t_section. ! refs.sketch
+    is a BARE STRING sketch id ("$0"), NOT a region selector. Detail: cheatsheets/weldment.
+  SURFACING (surf_*) — zero-thickness surfaces you thicken into solids. Build a surface (surf_planar/
+    surf_extrude/surf_revolve/surf_sweep/surf_loft/surf_ruled/surf_fill), then surf_thicken {thickness},
+    refs.surface = {"kind":"body","owner_feature":"$N"}, for a constant wall (or surf_knit panels
+    watertight). surf_revolve axis = {"kind":"datum","feature":"axis.z"}. Detail: cheatsheets/surfacing.
 
 REPEAT / SYMMETRY. The seed feature(s) in refs.features MUST be earlier sketch-based features
 that carry geometry to copy — an EXTRUDE boss/cut, a HOLE, a REVOLVE/SWEEP/LOFT. A bare primitive

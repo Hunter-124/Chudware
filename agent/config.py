@@ -162,6 +162,7 @@ def _resolve_provider(name: str | None, cfg: dict) -> Provider:
             model=cfg.get("model") or DEFAULT_LOCAL_MODEL,
             base_url=oai.get("base_url") or DEFAULT_LOCAL_BASE_URL,
             supports_vision=oai.get("vision", True),
+            timeout=float(oai.get("timeout", 120.0)),
         )
 
     if name == "mock":
@@ -206,7 +207,8 @@ def _resolve_provider(name: str | None, cfg: dict) -> Provider:
         oai = cfg.get("openai", {})
         return OpenAIProvider(api_key=key, model=cfg.get("model", DEFAULT_MODEL),
                               base_url=oai.get("base_url"),
-                              supports_vision=oai.get("vision", True))
+                              supports_vision=oai.get("vision", True),
+                              timeout=float(oai.get("timeout", 120.0)))
 
     if name in ("llamacpp", "llama.cpp", "llama-cpp"):
         from .providers.llamacpp_provider import LlamaCppProvider, DEFAULT_MODEL

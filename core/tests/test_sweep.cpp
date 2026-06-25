@@ -16,6 +16,7 @@
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
+#include <GProp_PrincipalProps.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
@@ -137,4 +138,27 @@ TEST_CASE("sweep with a null profile or null spine fails gracefully") {
     CHECK(geom::sweep_profile(TopoDS_Face(), spine, 0).IsNull());
     CHECK(geom::sweep_profile(circle_face(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1), 1.0),
                               TopoDS_Wire(), 0).IsNull());
+}
+
+// --- 6. INERTIA SANITY (Bug H1 symptom guard). The H1 bug left a sweep boss as a SECOND
+//        disjoint body fused with the running body only at the document layer; the broken
+//        path produced a degenerate solid whose principal MOMENT OF INERTIA went NEGATIVE
+//        (an impossible result that flagged the non-solid). A correct single swept solid
+//        must have STRICTLY POSITIVE principal moments of inertia about its centroid —
+//        assert that directly on the kernel solid the document layer fuses.
+TEST_CASE("swept solid has strictly positive principal moments of inertia") {
+    const double r = 2.0, L = 10.0;
+    TopoDS_Face prof = circle_face(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1), r);
+    TopoDS_Wire spine = line_spine(gp_Pnt(0, 0, 0), gp_Pnt(0, 0, L));
+    TopoDS_Shape solid = geom::sweep_profile(prof, spine, 0);
+    REQUIRE_FALSE(solid.IsNull());
+
+    GProp_GProps props;
+    BRepGProp::VolumeProperties(solid, props);
+    GProp_PrincipalProps pp = props.PrincipalProperties();
+    Standard_Real i1, i2, i3;
+    pp.Moments(i1, i2, i3);
+    CHECK(i1 > 0.0);
+    CHECK(i2 > 0.0);
+    CHECK(i3 > 0.0);
 }

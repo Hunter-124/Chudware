@@ -21,14 +21,18 @@
 #include <limits>
 #include <tuple>
 
+#include <Bnd_Box.hxx>
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Surface.hxx>
+#include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
 #include <BRep_Tool.hxx>
 #include <GProp_GProps.hxx>
 #include <GeomAbs_CurveType.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <TopAbs.hxx>
+#include <gp_Ax1.hxx>
+#include <gp_Vec.hxx>
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
@@ -78,6 +82,50 @@ std::optional<Eigen::Vector3d> unit_axis(const gp_Dir& d) {
     return std::nullopt;
 }
 
+// Normalise an Eigen vector, nullopt if degenerate.
+std::optional<Eigen::Vector3d> unit_vec(const Eigen::Vector3d& v) {
+    double n = v.norm();
+    if (n > 1e-12) return v / n;
+    return std::nullopt;
+}
+
+// I3 — the body's axis-aligned bbox CENTER (used as the outward-direction origin for
+// sphere/torus/bspline faces that have no kernel axis). Computed once per describe_faces.
+Eigen::Vector3d bbox_center(const TopoDS_Shape& shape) {
+    Bnd_Box box;
+    BRepBndLib::Add(shape, box);
+    if (box.IsVoid()) return Eigen::Vector3d(0, 0, 0);
+    double xmin, ymin, zmin, xmax, ymax, zmax;
+    box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+    return Eigen::Vector3d((xmin + xmax) * 0.5, (ymin + ymax) * 0.5, (zmin + zmax) * 0.5);
+}
+
+// I3 — REPRESENTATIVE OUTWARD DIRECTION at a face's centroid, for EVERY surface type:
+//   plane            : the signed outward normal `plane_axis` (already orientation-flipped).
+//   cylinder / cone  : radial-outward at the centroid = centroid minus its projection onto
+//                      the surface axis (the axis passes through `axis_loc`); falls back to
+//                      the surface axis if the centroid sits on the axis (degenerate).
+//   sphere/torus/bspline (no `surf_axis`): (centroid - body bbox center) — a coarse but
+//                      stable outward proxy for a convex-ish curved cap.
+// Returns nullopt only if every fallback is degenerate.
+std::optional<Eigen::Vector3d> representative_dir(
+    GeomAbs_SurfaceType st, const Eigen::Vector3d& centroid,
+    const std::optional<Eigen::Vector3d>& plane_axis,
+    const std::optional<Eigen::Vector3d>& surf_axis,
+    const std::optional<Eigen::Vector3d>& axis_loc,
+    const Eigen::Vector3d& body_center) {
+    if (st == GeomAbs_Plane) return plane_axis;  // already the signed outward normal
+    if ((st == GeomAbs_Cylinder || st == GeomAbs_Cone) && surf_axis && axis_loc) {
+        const Eigen::Vector3d& d = *surf_axis;       // unit axis direction
+        Eigen::Vector3d ap = centroid - *axis_loc;   // axis-origin -> centroid
+        Eigen::Vector3d radial = ap - d * ap.dot(d); // strip the axial component
+        if (auto r = unit_vec(radial)) return r;
+        return surf_axis;  // centroid on the axis (degenerate) -> fall back to the axis
+    }
+    // sphere / torus / bspline / other: outward from the body center.
+    return unit_vec(centroid - body_center);
+}
+
 }  // namespace
 
 // --------------------------------------------------------------------------- describe_faces
@@ -85,6 +133,8 @@ std::optional<Eigen::Vector3d> unit_axis(const gp_Dir& d) {
 std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
                                      const std::map<int, std::string>& owners) {
     std::vector<TopoInfo> result;
+    // I3 — outward-direction origin for sphere/torus/bspline faces (no kernel axis).
+    const Eigen::Vector3d body_center = bbox_center(shape);
     int idx = 0;
     for (TopExp_Explorer exp(shape, TopAbs_FACE); exp.More(); exp.Next(), ++idx) {
         TopoDS_Face face = TopoDS::Face(exp.Current());
@@ -99,17 +149,56 @@ std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
         Eigen::Vector3d centroid(cm.X(), cm.Y(), cm.Z());
 
         // Axis — plane normal, cylinder/cone axis only (matches the Python oracle).
+        // ORIENTATION FIX (Z2): OCCT's Plane().Axis().Direction() returns the plane's
+        // mathematical +Z direction (the surface's geometric normal) WITHOUT accounting
+        // for the face's topological orientation in the solid. A REVERSED face—like the
+        // bottom face of a box whose solid was built with outward-facing normals—has its
+        // outward material normal pointing OPPOSITE to the geometric plane normal. Without
+        // this flip, the top and bottom faces of a thin plate both store axis=[0,0,1] and
+        // the signed-normal tie-break in resolve() cannot distinguish them → "symmetric
+        // ambiguity" when trying to fixture the bottom face for FEA or query the bottom face.
+        // Flipping the stored axis so FORWARD=>geometry and REVERSED=>negated-geometry makes
+        // the axis a SIGNED outward normal: top=[0,0,+1] and bottom=[0,0,-1] for a Z-up plate.
+        // The resolution score uses |dot(sel_axis, cand_axis)| (sign-agnostic), so the
+        // flip does NOT change the score — it only arms the signed-dot tie-break that fires
+        // when two parallel faces otherwise score identically.
         std::optional<Eigen::Vector3d> axis;
+        std::optional<Eigen::Vector3d> plane_axis;  // I3: signed outward plane normal
+        std::optional<Eigen::Vector3d> axis_loc;    // I3: a point ON the cyl/cone axis
         try {
             if (st == GeomAbs_Plane) {
-                axis = unit_axis(adaptor.Plane().Axis().Direction());
+                gp_Dir plane_normal = adaptor.Plane().Axis().Direction();
+                // Reverse for REVERSED-orientation faces so the axis is the outward
+                // material normal (the direction the face "faces away from" the solid).
+                if (face.Orientation() == TopAbs_REVERSED) plane_normal.Reverse();
+                axis = unit_axis(plane_normal);
+                plane_axis = axis;
             } else if (st == GeomAbs_Cylinder) {
-                axis = unit_axis(adaptor.Cylinder().Axis().Direction());
+                gp_Ax1 ax = adaptor.Cylinder().Axis();
+                axis = unit_axis(ax.Direction());
+                axis_loc = Eigen::Vector3d(ax.Location().X(), ax.Location().Y(),
+                                           ax.Location().Z());
             } else if (st == GeomAbs_Cone) {
-                axis = unit_axis(adaptor.Cone().Axis().Direction());
+                gp_Ax1 ax = adaptor.Cone().Axis();
+                axis = unit_axis(ax.Direction());
+                axis_loc = Eigen::Vector3d(ax.Location().X(), ax.Location().Y(),
+                                           ax.Location().Z());
             }
         } catch (const Standard_Failure&) {
             axis = std::nullopt;
+            plane_axis = std::nullopt;
+            axis_loc = std::nullopt;
+        }
+
+        // I3 — representative outward direction for EVERY face (plane normal / cyl-cone
+        // radial / outward-from-bbox-center). Wrapped in its own try so a kernel quirk on
+        // an exotic surface can't drop the whole descriptor.
+        std::optional<Eigen::Vector3d> rep_dir;
+        try {
+            rep_dir = representative_dir(st, centroid, plane_axis, axis, axis_loc,
+                                         body_center);
+        } catch (const Standard_Failure&) {
+            rep_dir = std::nullopt;
         }
 
         std::optional<std::string> owner;
@@ -125,6 +214,7 @@ std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
         info.measure = area;
         info.owner = owner;
         info.hint_index = idx;
+        info.rep_dir = rep_dir;
         result.push_back(std::move(info));
     }
     return result;
@@ -396,6 +486,67 @@ ResolveResult resolve(const nlohmann::json& selector,
     double margin = second_score - best_score;
     if (best_score < 0.35 && margin > 0.05) {
         return ResolveResult{best_cand->index, best_score, second_score, std::nullopt};
+    }
+
+    // ── Signed-normal tie-break for opposite-facing parallel planes (Bug F5) ──────
+    // The score's axis term is |s_ax · c_ax| — SIGN-AGNOSTIC — so two parallel planar
+    // faces with OPPOSITE outward normals (a plate's top vs bottom, a tube's two ends)
+    // score identically, OR nearly so, and the margin rule dangles them as "symmetric".
+    // For a real 100×100×5 plate, top and bottom have identical areas so their scores
+    // differ by only ~0.014 — not an exact float tie, but still within the ambiguous band
+    // (margin <= 0.05). Their normals' SIGN is a genuine, stable distinction the selector
+    // already carries (a "bottom" pick stored axis -Z; the bottom face's outward normal
+    // is -Z, the top's +Z). When the margin <= 0.05 band fires and the selector has an
+    // axis, deterministically prefer the candidate in that band whose SIGNED axis best
+    // matches the selector's — recovering top/bottom choice without guessing on a true
+    // tie. This fires ONLY for axis-bearing candidates (planar/round faces, cylinders):
+    // the §5 vertex symmetric-ambiguity cases (no axis) are untouched, so the selector
+    // contract / torture suite is preserved. A FEA fixture on a symmetric plate's
+    // "bottom" now resolves instead of erroring.
+    bool sel_has_axis = selector.contains("axis") && !selector.at("axis").is_null();
+    if (best_score < 0.35 && sel_has_axis && scored.size() > 1) {
+        const auto& sa = selector.at("axis");
+        Eigen::Vector3d s_ax(sa.at(0).get<double>(), sa.at(1).get<double>(),
+                             sa.at(2).get<double>());
+        double sn = s_ax.norm();
+        if (sn > 1e-12) {
+            s_ax /= sn;
+            // Among ALL candidates in the ambiguous band (score within 0.05 of best),
+            // find the one whose SIGNED axis aligns best with the selector's axis, and
+            // the next-best alignment. The band is exactly the set the main gate rejects
+            // (margin <= 0.05), so we consider any candidate that could plausibly be the
+            // winner under pure-score comparison. A non-ambiguous winner (margin > 0.05)
+            // is already accepted above and never reaches here.
+            const TopoInfo* pick = nullptr;
+            double best_align = -std::numeric_limits<double>::infinity();
+            double second_align = -std::numeric_limits<double>::infinity();
+            int n_in_band = 0;
+            bool axis_less = false;
+            for (const auto& pr : scored) {
+                if (pr.first - best_score > 0.05) break;  // outside ambiguous band
+                if (!pr.second->axis.has_value()) { axis_less = true; break; }  // bail on axis-less member
+                ++n_in_band;
+                double align = s_ax.dot(*pr.second->axis);
+                if (align > best_align) {
+                    second_align = best_align;
+                    best_align = align;
+                    pick = pr.second;
+                } else if (align > second_align) {
+                    second_align = align;
+                }
+            }
+            // Only break the tie when there is a CLEAR signed-direction winner:
+            //   1. best_align > 0.5 — the winner genuinely faces the queried direction
+            //      (|dot| > 0.5 means within 60° of the selector's axis direction).
+            //   2. best_align - second_align > 0.5 — the winner clearly beats the runner-
+            //      up; a plate top/bottom gives ~+1 vs ~-1 → gap ~2; genuinely-ambiguous
+            //      co-directional faces give gap ~0 and correctly stay dangling.
+            // This inner safety gate ensures we never resolve a truly-ambiguous selector.
+            if (pick && !axis_less && n_in_band >= 2 && best_align > 0.5 &&
+                best_align - second_align > 0.5) {
+                return ResolveResult{pick->index, best_score, second_score, std::nullopt};
+            }
+        }
     }
 
     // Dangling — explain why (match the Python reason strings).

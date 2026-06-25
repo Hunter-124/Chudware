@@ -12,6 +12,7 @@
 #include <BRepAlgoAPI_Common.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepGProp.hxx>
+#include <BRepMesh_IncrementalMesh.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepTools.hxx>
 #include <GCPnts_TangentialDeflection.hxx>
@@ -21,6 +22,8 @@
 #include <HLRAlgo_Projector.hxx>
 #include <HLRBRep_Algo.hxx>
 #include <HLRBRep_HLRToShape.hxx>
+#include <HLRBRep_PolyAlgo.hxx>
+#include <HLRBRep_PolyHLRToShape.hxx>
 #include <Standard_Handle.hxx>
 #include <TopAbs.hxx>
 #include <TopExp.hxx>
@@ -208,6 +211,46 @@ json bbox_of(const std::vector<std::vector<std::array<double, 2>>>& a,
     return json::array({minx, miny, maxx, maxy});
 }
 
+// Expand `bbox` so it reaches the TRUE analytic extent of each CLOSED circle in `arcs`.
+// Curved edges are tessellated (GCPnts_TangentialDeflection) for the polylines, and the
+// tessellation chords fall slightly INSIDE the real curve, so a bbox taken from polyline
+// points alone undershoots a round face's extremes by up to the deflection (~0.05mm). That
+// loss reads back as e.g. an 80mm cylinder height auto-dimensioning to 79.90. The arcs[]
+// entities carry the exact center/radius, so for each full circle we widen the bbox to
+// cx±r / cy±r — giving clean, integer-accurate projected dimensions. (D6)
+void expand_bbox_with_arcs(json& bbox, const json& arcs) {
+    if (!arcs.is_array() || arcs.empty()) return;
+    bool any = bbox.is_array() && bbox.size() == 4;
+    double minx = any ? bbox[0].get<double>() : 0.0;
+    double miny = any ? bbox[1].get<double>() : 0.0;
+    double maxx = any ? bbox[2].get<double>() : 0.0;
+    double maxy = any ? bbox[3].get<double>() : 0.0;
+    auto hit = [&](double x, double y) {
+        if (!any) { minx = maxx = x; miny = maxy = y; any = true; return; }
+        minx = std::min(minx, x); miny = std::min(miny, y);
+        maxx = std::max(maxx, x); maxy = std::max(maxy, y);
+    };
+    // Only CLOSED circles get the analytic extent: a full circle reaches cx±r and cy±r on
+    // all four sides unconditionally (the cylinder-rim / hole case that drives D6). Partial
+    // arcs are left to their tessellation — their start/end parameters are in the circle's
+    // OWN local frame (not screen X), so we cannot reliably map a world-cardinal extreme to
+    // the curve span without re-deriving the local axes, and their tiny undershoot rarely
+    // sets the dimensioned extreme anyway. Conservative: never widen past the real geometry.
+    for (const auto& arc : arcs) {
+        if (!arc.is_object() || !arc.contains("center")) continue;
+        if (!arc.value("closed", false)) continue;
+        double cx = arc["center"][0].get<double>();
+        double cy = arc["center"][1].get<double>();
+        double r = arc.value("radius", 0.0);
+        if (r <= 0.0) continue;
+        hit(cx + r, cy);
+        hit(cx - r, cy);
+        hit(cx, cy + r);
+        hit(cx, cy - r);
+    }
+    if (any) bbox = json::array({minx, miny, maxx, maxy});
+}
+
 json polylines_to_json(const std::vector<std::vector<std::array<double, 2>>>& pls) {
     json arr = json::array();
     for (const auto& pl : pls) {
@@ -216,6 +259,54 @@ json polylines_to_json(const std::vector<std::vector<std::array<double, 2>>>& pl
         arr.push_back(std::move(j));
     }
     return arr;
+}
+
+// R4 — polygonal HLR fallback for purely-curved (revolved/lofted) solids. The exact
+// HLRBRep_Algo can return ZERO edges for a body whose visible outline is entirely a
+// surface silhouette (no sharp edges) — e.g. a sphere or a smooth solid of revolution —
+// because its outline computation on exact curved geometry is fragile and occasionally
+// yields an empty result. HLRBRep_PolyAlgo runs the same hidden-line removal on each
+// shape's TRIANGULATION, which robustly produces the silhouette outline as polyline
+// edges. We mesh each shape first (BRepMesh) then project. The outline comes back as line
+// edges (polyline-approximated silhouette), so `compound_arcs` finds no analytic circles
+// here — that is acceptable: the round silhouette still draws, and the common faceted
+// path keeps using the exact algo (sharper, analytic arcs). Appends into `visible`/
+// `hidden`; never throws (a failed poly pass just adds nothing).
+void poly_hlr_fallback(const std::vector<TopoDS_Shape>& shapes,
+                       const Vec3& view_dir, const Vec3& screen_x, double scale,
+                       std::array<double, 2> position, double lin_defl, double ang_defl,
+                       bool show_hidden,
+                       std::vector<std::vector<std::array<double, 2>>>& visible,
+                       std::vector<std::vector<std::array<double, 2>>>& hidden) {
+    try {
+        gp_Ax2 ax(gp_Pnt(0, 0, 0),
+                  gp_Dir(view_dir[0], view_dir[1], view_dir[2]),
+                  gp_Dir(screen_x[0], screen_x[1], screen_x[2]));
+        HLRAlgo_Projector projector(ax);
+        Handle(HLRBRep_PolyAlgo) algo = new HLRBRep_PolyAlgo();
+        bool any = false;
+        for (const auto& sh : shapes) {
+            if (sh.IsNull()) continue;
+            // A reasonably fine mesh so the silhouette reads smooth at common scales.
+            try {
+                BRepMesh_IncrementalMesh mesher(sh, 0.1, Standard_False, 0.35, Standard_True);
+                mesher.Perform();
+            } catch (...) { /* fall through — Load anyway, it may already be meshed */ }
+            algo->Load(sh);
+            any = true;
+        }
+        if (!any) return;
+        algo->Projector(projector);
+        algo->Update();
+        HLRBRep_PolyHLRToShape hlr;
+        hlr.Update(algo);
+        compound_polylines(hlr.VCompound(), scale, position, lin_defl, ang_defl, visible);
+        compound_polylines(hlr.OutLineVCompound(), scale, position, lin_defl, ang_defl, visible);
+        if (show_hidden) {
+            compound_polylines(hlr.HCompound(), scale, position, lin_defl, ang_defl, hidden);
+            compound_polylines(hlr.OutLineHCompound(), scale, position, lin_defl, ang_defl, hidden);
+        }
+    } catch (...) { /* poly fallback failed -> leave visible/hidden as the exact pass left them */ }
 }
 
 }  // namespace
@@ -268,10 +359,23 @@ json project_view(const std::vector<TopoDS_Shape>& shapes,
             compound_arcs(hlr.OutLineHCompound(), scale, position, "hidden", arcs);
         }
 
+        // R4 — a purely-curved solid (revolve/loft, e.g. a sphere or smooth body of
+        // revolution) can yield ZERO edges from the exact HLR (its outline is a surface
+        // silhouette the exact algo failed to emit). Retry on the triangulated mesh, which
+        // robustly produces the silhouette outline as polylines, so revolved parts project
+        // into proper views instead of an empty drawing.
+        if (visible.empty() && hidden.empty())
+            poly_hlr_fallback(shapes, view_dir, screen_x, scale, position, lin_defl, ang_defl,
+                              show_hidden, visible, hidden);
+
         base["visible"] = polylines_to_json(visible);
         base["hidden"] = polylines_to_json(hidden);
         base["arcs"] = arcs;
-        base["bbox"] = bbox_of(visible, hidden);
+        json bbox = bbox_of(visible, hidden);
+        // Use the exact arc extents (not the tessellated polyline points) so round-face
+        // dimensions come out clean — e.g. a cylinder height reads 80, not 79.90 (D6).
+        expand_bbox_with_arcs(bbox, arcs);
+        base["bbox"] = bbox;
     } catch (const std::exception& exc) {
         base["error"] = std::string("exception: ") + exc.what();
     } catch (...) {
@@ -468,14 +572,58 @@ json project_section(const std::vector<TopoDS_Shape>& shapes, const json& plane,
             compound_polylines(hlr.OutLineHCompound(), scale, position, lin_defl, ang_defl, hidden);
         }
 
-        base["visible"] = polylines_to_json(visible);
-        base["hidden"] = polylines_to_json(hidden);
-        base["section_faces"] = polylines_to_json(section_faces);
-        // bbox over visible + hidden + section_faces.
+        // R4 — section of a purely-curved solid: if the exact HLR produced no edges, retry
+        // the cut bodies through the polygonal (triangulated) HLR so a revolved part still
+        // shows its outline in the section view.
+        if (visible.empty() && hidden.empty())
+            poly_hlr_fallback(cut_shapes, look, sx, scale, position, lin_defl, ang_defl,
+                              show_hidden, visible, hidden);
+
+        // HALF section: draw the division boundary line where the sectioned half meets the
+        // unsectioned external half, so it no longer reads as a full section. The division
+        // plane has normal `half_axis` through `point`; projected into the (sx,sy) screen it
+        // is the line through the projected `point`, running PERPENDICULAR to the projected
+        // half_axis. We clip it to the geometry bbox so it reaches both edges of the part. (D11)
         std::vector<std::vector<std::array<double, 2>>> all = visible;
         all.insert(all.end(), hidden.begin(), hidden.end());
         all.insert(all.end(), section_faces.begin(), section_faces.end());
-        base["bbox"] = bbox_of(all, {});
+        json bbox = bbox_of(all, {});
+        if (mode == "half" && have_half && bbox.is_array() && bbox.size() == 4) {
+            // Projected division point + half_axis direction in sheet (scaled) coordinates.
+            double bdx = dot(half_axis, sx), bdy = dot(half_axis, sy);
+            double blen = std::sqrt(bdx * bdx + bdy * bdy);
+            double minx = bbox[0].get<double>(), miny = bbox[1].get<double>();
+            double maxx = bbox[2].get<double>(), maxy = bbox[3].get<double>();
+            if (blen > 1e-9 && maxx > minx && maxy > miny) {
+                // Boundary runs perpendicular to the projected half_axis through the cut point.
+                double dirx = -bdy / blen, diry = bdx / blen;
+                double cx = dot(point, sx) * scale + position[0];
+                double cy = dot(point, sy) * scale + position[1];
+                // Clip the infinite division line to the bbox rectangle (Liang–Barsky) so it
+                // spans the part without overshooting / re-inflating the view bounds.
+                double t0 = -1e30, t1 = 1e30;
+                const double pq[4][2] = {{-dirx, cx - minx}, {dirx, maxx - cx},
+                                         {-diry, cy - miny}, {diry, maxy - cy}};
+                bool ok = true;
+                for (auto& e : pq) {
+                    double p = e[0], q = e[1];
+                    if (std::fabs(p) < 1e-12) { if (q < 0) { ok = false; break; } continue; }
+                    double t = q / p;
+                    if (p < 0) t0 = std::max(t0, t); else t1 = std::min(t1, t);
+                }
+                if (ok && t1 > t0) {
+                    std::vector<std::array<double, 2>> boundary = {
+                        {cx + dirx * t0, cy + diry * t0},
+                        {cx + dirx * t1, cy + diry * t1}};
+                    visible.push_back(boundary);
+                }
+            }
+        }
+
+        base["visible"] = polylines_to_json(visible);
+        base["hidden"] = polylines_to_json(hidden);
+        base["section_faces"] = polylines_to_json(section_faces);
+        base["bbox"] = bbox;
         if (section_faces.empty()) base["error"] = "cut plane does not intersect the model";
     } catch (const std::exception& exc) {
         base["error"] = std::string("exception: ") + exc.what();

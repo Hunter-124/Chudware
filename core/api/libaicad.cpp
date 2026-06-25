@@ -30,11 +30,20 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
+
+#ifdef _WIN32
+// For the dispatch-boundary structured-exception (SEH) guard that converts a hardware
+// fault (access violation) into a clean JSON error + orphaned-lock recovery, instead of
+// leaving the session mutex held => "resource deadlock would occur" on the next call.
+#include <windows.h>
+#include <excpt.h>
+#endif
 
 #include "agent/ask.h"
 #include "agent/clarify.h"
@@ -58,6 +67,7 @@
 #include "doc/session.h"
 #include "doc/validate.h"
 #include "parts/parts.h"
+#include "prof/sampler.h"
 #include "ecad/autoroute.h"
 #include "ecad/recipes.h"
 #include "ecad/schema.h"
@@ -97,6 +107,74 @@ int emit(json&& j, char** out_json, int rc) {
 
 int emit_error(const std::string& msg, char** out_json) {
     return emit(json{{"error", msg}}, out_json, 1);
+}
+
+// --- sampling-profiler scoping ------------------------------------------------------
+// The profiler samples only the thread that is registered as the "work thread" (see
+// prof::set_target). To keep samples focused on MODELING — and to keep simulation/ECAD
+// out, per the request that spawned this — we register the calling thread only around the
+// RPCs that actually do geometry/document work. In "all" mode every call is registered.
+bool prof_is_modeling_method(const std::string& m) {
+    // The doc session RPCs are where the OCCT B-rep work (extrude/fillet/boolean/pattern/
+    // tessellate) and the sketch solver run. Renders re-tessellate, so include them.
+    static const std::array<const char*, 14> kModeling = {{
+        "doc_compile_cpp", "doc_apply_ops", "doc_dry_run_ops", "doc_rebuild",
+        "doc_solve_mates", "doc_tree", "doc_new", "doc_checkpoint", "doc_undo",
+        "doc_redo", "doc_render_png", "doc_export", "doc_import", "asm_world_bodies"}};
+    for (const char* k : kModeling)
+        if (m == k) return true;
+    return false;
+}
+
+// Default output directory for env-var auto-profile reports: %APPDATA%/AI-CAD/prof
+// (matches the handoff/cache convention used elsewhere), falling back to the temp dir.
+std::filesystem::path prof_default_out_dir() {
+    std::error_code ec;
+    const char* appdata = std::getenv("APPDATA");
+    std::filesystem::path base;
+    if (appdata && appdata[0]) {
+        base = std::filesystem::path(appdata) / "AI-CAD" / "prof";
+    } else {
+        base = std::filesystem::temp_directory_path(ec) / "AI-CAD-prof";
+    }
+    std::filesystem::create_directories(base, ec);
+    return base;
+}
+
+// One-time env-var auto-profile: AI_CAD_PROFILE=1 starts the sampler (modeling mode) for
+// the whole process; on exit a report (folded + speedscope + a flat .txt) is written under
+// AI_CAD_PROFILE_OUT (default %APPDATA%/AI-CAD/prof). AI_CAD_PROFILE_HZ tunes the rate.
+// Zero-touch: just launch the app/MCP with the var set, model normally, close it.
+std::once_flag g_prof_env_once;
+void prof_env_init_once() {
+    std::call_once(g_prof_env_once, []() {
+        const char* on = std::getenv("AI_CAD_PROFILE");
+        if (!on || on[0] == '\0' || on[0] == '0') return;
+        unsigned hz = 1000;
+        if (const char* h = std::getenv("AI_CAD_PROFILE_HZ")) {
+            int v = std::atoi(h);
+            if (v > 0) hz = static_cast<unsigned>(v);
+        }
+        unsigned interval_us = hz > 0 ? (1000000u / hz) : 1000u;
+        if (!aicad::prof::start(interval_us, "modeling")) return;
+        std::atexit([]() {
+            if (!aicad::prof::active()) return;
+            aicad::prof::stop();
+            std::filesystem::path dir;
+            if (const char* o = std::getenv("AI_CAD_PROFILE_OUT")) {
+                std::error_code ec;
+                dir = std::filesystem::path(o);
+                std::filesystem::create_directories(dir, ec);
+            } else {
+                dir = prof_default_out_dir();
+            }
+            json opts = {
+                {"top", 60},
+                {"write_folded", (dir / "modeling.folded").string()},
+                {"write_speedscope", (dir / "modeling.speedscope.json").string()}};
+            aicad::prof::report(opts);
+        });
+    });
 }
 
 // Flatten a JSON numeric array — accepts nested ([[x,y,z],...]) OR already-flat
@@ -374,7 +452,15 @@ AICAD_API const char* aicad_abi_version(void) { return "1"; }
 
 AICAD_API void aicad_free(char* s) { std::free(s); }
 
-AICAD_API int aicad_call(const char* method, const char* params_json, char** out_json) {
+// Real dispatch body. Extracted from aicad_call so the public entry can wrap it in a
+// Windows structured-exception (SEH) guard WITHOUT this function — which is full of
+// C++ objects that require stack unwinding — having to host the __try/__except itself
+// (MSVC C2712: a function that needs C++ object unwinding can't contain __try). This
+// function keeps its own top-level C++ try/catch, so a thrown OpError / std::exception
+// becomes a clean JSON error with every lock_guard/DocLock already released by unwind.
+// Only a hardware fault (access violation) escapes as an SEH; that's caught one frame
+// up in aicad_call.
+static int aicad_call_inner(const char* method, const char* params_json, char** out_json) {
     if (out_json) *out_json = nullptr;
     if (!method) return emit_error("null method", out_json);
 
@@ -412,9 +498,56 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
         m = "agent_pm_assist";
     }
 
+    // Env-var auto-profile (AI_CAD_PROFILE=1): start the sampler on the first call so the
+    // whole session is covered; a report is written on process exit. No-op when unset.
+    prof_env_init_once();
+    // Register this thread as the profiler's sample target for the duration of the call when
+    // the profiler is running AND this is a method we want sampled (modeling-only by default,
+    // every method in "all" mode). RAII: target is cleared on every return/throw below.
+    aicad::prof::TargetScope _prof_scope(
+        aicad::prof::active() &&
+        (aicad::prof::mode() == "all" || prof_is_modeling_method(m)));
+
     try {
         if (m == "ping") {
             return emit(json{{"ok", true}, {"abi", aicad_abi_version()}, {"echo", params}},
+                        out_json, 0);
+        }
+        // --- sampling profiler control (see core/prof/sampler.{h,cpp}) ----------
+        // prof_start {interval_us?|hz?, mode?:"modeling"|"all"} -> begin sampling.
+        if (m == "prof_start") {
+            unsigned iv = 0;
+            if (params.contains("interval_us") && params["interval_us"].is_number())
+                iv = params["interval_us"].get<unsigned>();
+            else if (params.contains("hz") && params["hz"].is_number()) {
+                int hz = params["hz"].get<int>();
+                if (hz > 0) iv = 1000000u / static_cast<unsigned>(hz);
+            }
+            std::string md = params.value("mode", std::string("modeling"));
+            bool started = aicad::prof::start(iv, md);
+            return emit(json{{"ok", true},
+                             {"started", started},
+                             {"already_running", !started},
+                             {"interval_us", aicad::prof::interval_us()},
+                             {"mode", aicad::prof::mode()}},
+                        out_json, 0);
+        }
+        // prof_stop {top?, write_folded?, write_speedscope?, min_samples?} -> stop +
+        // return the symbolized report (also writes the requested files).
+        if (m == "prof_stop") {
+            aicad::prof::stop();
+            return emit(aicad::prof::report(params), out_json, 0);
+        }
+        // prof_report {...} -> symbolize + return the report WITHOUT stopping.
+        if (m == "prof_report") {
+            return emit(aicad::prof::report(params), out_json, 0);
+        }
+        if (m == "prof_status") {
+            return emit(json{{"ok", true},
+                             {"active", aicad::prof::active()},
+                             {"samples", aicad::prof::sample_count()},
+                             {"interval_us", aicad::prof::interval_us()},
+                             {"mode", aicad::prof::mode()}},
                         out_json, 0);
         }
         if (m == "doc_compile_cpp") {
@@ -2589,5 +2722,71 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
         return emit_error("aicad_call(" + m + ") threw a non-std exception", out_json);
     }
 }
+
+#ifdef _WIN32
+// SEH filter for the dispatch boundary: only catch HARDWARE faults that would otherwise
+// escape as an unhandled structured exception and leave the session lock orphaned (the
+// P0 "resource deadlock would occur" bug). Access violation (the reported 0x60 null
+// deref), stack/array overrun, misalignment, page faults, illegal instruction. Real C++
+// exceptions are NOT routed here — they're already handled inside aicad_call_inner's
+// try/catch and unwind their locks normally — so we EXCEPTION_CONTINUE_SEARCH anything
+// that isn't a hardware fault (a C++ throw surfaces to MSVC as code 0xE06D7363).
+static int aicad_seh_filter(unsigned int code) {
+    switch (code) {
+        case EXCEPTION_ACCESS_VIOLATION:
+        case EXCEPTION_DATATYPE_MISALIGNMENT:
+        case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+        case EXCEPTION_STACK_OVERFLOW:
+        case EXCEPTION_IN_PAGE_ERROR:
+        case EXCEPTION_ILLEGAL_INSTRUCTION:
+        case EXCEPTION_PRIV_INSTRUCTION:
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:
+        case EXCEPTION_FLT_DIVIDE_BY_ZERO:
+            return EXCEPTION_EXECUTE_HANDLER;
+        default:
+            return EXCEPTION_CONTINUE_SEARCH;
+    }
+}
+
+// malloc a fixed C error string for the SEH path (no C++ objects: this lives in the
+// __except function, which must not require C++ object unwinding).
+static char* dup_seh_error(const char* msg) {
+    size_t n = std::strlen(msg);
+    char* p = static_cast<char*>(std::malloc(n + 1));
+    if (p) std::memcpy(p, msg, n + 1);
+    return p;
+}
+
+// Public entry. Thin SEH wrapper around aicad_call_inner. A hardware fault (e.g. an
+// access violation deep inside compile_document while the session mutex is held) is
+// caught HERE so that: (1) we drop the orphaned doc lock left by the skipped DocLock
+// destructor — without this, the SAME worker thread re-locks the still-held mutex on
+// its next call and gets std::system_error EDEADLK "resource deadlock would occur",
+// bricking every document; (2) we return a clean JSON error instead of crashing the
+// host or corrupting the JSON-RPC channel. This function deliberately holds NO C++
+// objects with destructors so MSVC permits __try/__except (C2712) even under /EHsc.
+AICAD_API int aicad_call(const char* method, const char* params_json, char** out_json) {
+    __try {
+        return aicad_call_inner(method, params_json, out_json);
+    } __except (aicad_seh_filter(GetExceptionCode())) {
+        // The structured-exception unwind skipped aicad_call_inner's C++ destructors,
+        // so any registry lock (doc / drawing / ecad) taken on this thread is still held
+        // by it. Drop all three now (each call is a no-op if that registry's lock is not
+        // held by this thread) so the next call on this worker thread doesn't deadlock.
+        aicad::doc::force_release_doc_lock();
+        aicad::doc::force_release_drawing_lock();
+        aicad::ecad::force_release_ecad_lock();
+        if (out_json) *out_json = dup_seh_error("{\"error\":\"internal error: access violation (the engine hit a hardware fault and recovered; the document is unchanged)\"}");
+        return 1;
+    }
+}
+#else
+// Non-Windows: no SEH. The C++ try/catch inside aicad_call_inner already releases locks
+// on any C++ exception; a hardware fault delivers a POSIX signal (SIGSEGV) which is a
+// separate, process-level concern, not a held-mutex deadlock.
+AICAD_API int aicad_call(const char* method, const char* params_json, char** out_json) {
+    return aicad_call_inner(method, params_json, out_json);
+}
+#endif
 
 }  // extern "C"

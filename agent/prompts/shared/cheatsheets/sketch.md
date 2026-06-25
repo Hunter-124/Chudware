@@ -4,7 +4,9 @@ Op shape (a JSON ARRAY): first an `add_feature` of type `sketch` (refs.plane = "
 
 The reserved plane names are EXACTLY "plane.top" (the XY plane, +Z up), "plane.front" (XZ), "plane.right" (YZ). Do NOT write "XY"/"XZ"/"YZ" - they are rejected.
 
-Entity `type` is one of: `circle` (center, radius), `line` (p1, p2), `arc` (center, radius, start, end, ccw), `point` (p), `spline` (points: [[x,y],...] - a smooth curve THROUGH the points, for organic / profile / cam outlines), `airfoil` (naca:"2412", chord, aoa - a NACA aerofoil section as one closed loop, for wings). There is NO "rect" entity - build a rectangle from 4 `line` entities.
+Entity `type` is one of: `circle` (center, radius), `line` (p1, p2), `arc` (center, radius, start, end, ccw), `point` (p), `spline` (points: [[x,y],...] - a smooth curve THROUGH the points, for organic / profile / cam outlines), `airfoil` (naca:"2412", chord, aoa - a NACA aerofoil section as one closed loop, for wings), `polygon` (a regular N-gon as ONE closed loop). There is NO "rect" entity - build a rectangle from 4 `line` entities.
+
+A `polygon` is the way to make a HEXAGON / hex standoff / nut / bolt-head / any regular N-sided profile - NEVER draw it as a spline (an open spline makes no closed region and the extrude builds nothing). Shape: `{"type":"polygon","center":[0,0],"sides":6,"across_flats":12}`. Give `sides` (>=3; or use `"type":"hexagon"` for 6) and EXACTLY ONE size: `across_flats` (the wrench/spanner size, flat-to-flat - the usual way to spec a hex), or `circumradius` (centre-to-vertex), or `inradius`. Optional `rotation` (degrees). The engine expands it into the N lines - do NOT also add the lines yourself; just extrude the sketch.
 
 A spline closes a profile when its ends meet the other edges (e.g. a revolve half-profile = a spline outer wall + a line back down the axis). An `airfoil` entity is self-contained (it expands to the upper/lower splines + trailing-edge line) - just extrude it.
 

@@ -94,9 +94,12 @@ FacePicks resolve_face_picks(const TopoDS_Shape& shape, const nlohmann::json& se
 //
 // Schema (all predicates AND-combine; absent/empty => ALL sub-shapes of `of`):
 //   of            "edge" | "face"                       (required)
-//   surf          type filter. faces: "flat"|"round" (= plane|cylinder) or the exact kernel
-//                 name (plane|cylinder|cone|sphere|torus). edges: "straight"|"round" (=
-//                 line|circle) or line|circle|ellipse|bspline.
+//   surf          type filter. faces: "flat" (= plane) | "round"/"curved" (= ANY non-planar
+//                 face: cylinder|cone|sphere|torus|bspline) | the everyday curved words
+//                 cylindrical/conical/spherical/toroidal | the exact kernel name
+//                 (plane|cylinder|cone|sphere|torus). edges: "straight" (= line) |
+//                 "round"/"curved" (= ANY non-line edge: circle|ellipse|bspline) |
+//                 line|circle|ellipse|bspline.
 //   parallel      [x,y,z] OR axis word "x"|"y"|"z"|"vertical" — edge direction / face normal
 //                 parallel to this axis (|dot|~1). parallel:"z" = the vertical edges.
 //   perpendicular [x,y,z] OR axis word — |dot|~0
@@ -109,7 +112,8 @@ FacePicks resolve_face_picks(const TopoDS_Shape& shape, const nlohmann::json& se
 //                 innermost/outermost) — keep the min/max-RADIUS round face(s)/edge(s), the
 //                 plain way to tell coaxial geometry apart (tube inner vs outer wall, bore vs
 //                 rim). Ties co-rank, so a symmetric body keeps the opposite pair; add
-//                 count:1 or a side to force one.
+//                 count:1 or a side to force one. When the body has NO round faces/edges,
+//                 inner/outer return an EMPTY result (0 matches) — not an error.
 //   near          [x,y,z]   keep the nearest `count` (default 1) by centroid distance
 //   count         int       cap the result size
 //   index         [i,...]   keep these ordinals of the filtered set
@@ -118,7 +122,7 @@ FacePicks resolve_face_picks(const TopoDS_Shape& shape, const nlohmann::json& se
 //            {"of":"edge","parallel":"z"}            -> the vertical edges (corner rounds)
 //            {"of":"edge","side":"top"}              -> the top edges / top rim
 //            {"of":"face","side":"top"}              -> the top face
-//            {"of":"face","surf":"round"}            -> the bore wall(s) / cylindrical faces
+//            {"of":"face","surf":"round"}            -> every non-planar face (cyl/cone/sphere/torus/bspline)
 //            {"of":"face","surf":"round","pick":"outer"} -> the OUTER wall of a tube
 //            {"of":"face","pick":"largest"}          -> the biggest face(s)
 //            {"of":"edge","near":[20,0,5],"count":1} -> the edge nearest a point

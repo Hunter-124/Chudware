@@ -179,6 +179,52 @@ def inverting_amp(gain: float = 10.0) -> dict:
     }
 
 
+def led_driver(vsupply: float = 3.3, vf: float = 1.8, current: float = 0.01) -> dict:
+    """A series current-limited LED driver: V1 (vsupply) -> R (limit) -> LED -> GND.
+
+    The current-limit resistor is the textbook ``R = (Vsupply - Vf) / I`` for the requested LED
+    forward voltage ``vf`` and target current ``current`` (default 10 mA). R is rounded to a sane
+    value so the BOM is real.
+
+    Simulation note: the starter LED uses the generic Shockley diode model (IS=1e-14), whose forward
+    drop is ~0.73 V at these currents — lower than a real LED's ~1.8 V — so the self-check expects
+    the MODEL forward voltage V(LED_A) (a stable, model-determined value), not the design ``vf``.
+    The DESIGNED resistor still uses the real ``vf`` so the schematic/BOM is correct for a physical
+    LED, while the op-point self-check honestly confirms the LED conducts.
+    """
+    vsupply = float(vsupply)
+    vf = max(min(float(vf), vsupply * 0.95), 0.0)
+    current = float(current) if current and float(current) > 0 else 0.01
+    r = (vsupply - vf) / current
+    # round to a tidy resistor value (no smaller than 10 ohm so the LED is always current-limited)
+    r = max(round(r / 10.0) * 10.0, 10.0)
+    return {
+        "name": "led_driver",
+        "request": f"a {_trim(vsupply)}V LED driver (series current-limit resistor)",
+        "components": [
+            {"ref": "V1", "libid": "Simulation_SPICE:V_source", "value": _trim(vsupply)},
+            {"ref": "R1", "libid": "Device:R", "value": _fmt_ohms(r)},
+            {"ref": "D1", "libid": "Device:LED", "value": "LED"},
+        ],
+        "nets": {
+            # V1+ -> VCC -> R1.1 ; R1.2 -> LED anode ; LED cathode -> GND ; V1- -> GND.
+            "VCC":   [{"ref": "V1", "pin": "+"}, {"ref": "R1", "pin": "1"}],
+            "LED_A": [{"ref": "R1", "pin": "2"}, {"ref": "D1", "pin": "A"}],
+            "GND":   [{"ref": "D1", "pin": "K"}, {"ref": "V1", "pin": "-"}],
+        },
+        "study": {
+            "analysis": "op",
+            "params": {},
+            # Expect the LED to conduct at its (model) forward voltage. Generous tol because the
+            # generic diode model's drop varies with current; this confirms the LED is forward-biased.
+            "expect": {"probe": "V(LED_A)", "value": 0.73, "tol": 0.25},
+        },
+        "notes": (f"R1={_fmt_ohms(r)} = (Vsupply-Vf)/I = ({_trim(vsupply)}-{_trim(vf)})/"
+                  f"{_trim(current)} ; LED current ~= {_trim(current*1000)} mA. "
+                  f"V1={_trim(vsupply)}V -> R1 -> LED -> GND."),
+    }
+
+
 def rc_555_astable(freq: float = 1.0) -> dict:
     """A 555 astable oscillator at ~freq Hz (standard Ra/Rb/C topology).
 
@@ -230,6 +276,9 @@ def rc_555_astable(freq: float = 1.0) -> dict:
 
 # (name, builder, list of trigger keywords) -- order matters for "closest" selection.
 RECIPES: list[tuple[str, "callable", tuple[str, ...]]] = [
+    ("led_driver", led_driver,
+     ("led", "led driver", "drive an led", "indicator", "current limit",
+      "current-limit", "current limiting")),
     ("inverting_amp", inverting_amp,
      ("inverting", "invert", "amplifier", "amp", "op-amp", "opamp", "gain")),
     ("rc_555_astable", rc_555_astable,
@@ -281,8 +330,12 @@ def closest_recipe(request: str) -> dict:
     yields ``voltage_divider(5, 2.5)``. Always returns a fully-built design (the safety net).
     """
     low = request.lower()
+    # Default to the resistive divider when NOTHING matches: best_score starts at 0 so a recipe must
+    # actually hit a keyword (score >= 1) to win — otherwise every unmatched request would fall to
+    # whichever recipe is listed first (Bug E2: "LED driver" silently became inverting_amp because
+    # all scores were 0 and inverting_amp led the list).
     best_name = "voltage_divider"
-    best_score = -1
+    best_score = 0
     for rname, _builder, keywords in RECIPES:
         score = sum(1 for kw in keywords if kw in low)
         if score > best_score:
@@ -297,6 +350,11 @@ def closest_recipe(request: str) -> dict:
         if len(vs) == 1:
             return voltage_divider(vin=vs[0], vout=vs[0] / 2.0)
         return voltage_divider()
+    if best_name == "led_driver":
+        import re
+        vs = [float(x) for x in re.findall(r"([0-9]*\.?[0-9]+)\s*v\b", low)]
+        kw = {"vsupply": vs[0]} if vs else {}
+        return led_driver(**kw)
     if best_name == "inverting_amp":
         return inverting_amp(gain=num) if num else inverting_amp()
     if best_name == "rc_lowpass":

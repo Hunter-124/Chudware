@@ -17,6 +17,14 @@ Example B - 2mm chamfer on every edge:
  {"op":"add_feature","feature":{"type":"chamfer","name":"Chamfer1","params":{"length":{"value":2,"expr":null}},"refs":{"edges":{"of":"edge"}}}}
 ]
 
+ASYMMETRIC chamfer: add `length2` param — leg d1=`length` on one incident face, d2=`length2` on
+the other. Requires explicit edge picks (not a plain direction query). Useful for a different bevel
+angle on each side of an edge.
+Example C - asymmetric 2mm / 0.5mm chamfer on the top rim:
+[
+ {"op":"add_feature","feature":{"type":"chamfer","name":"AsymChamfer","params":{"length":{"value":2,"expr":null},"length2":{"value":0.5,"expr":null}},"refs":{"edges":{"of":"edge","side":"+z"}}}}
+]
+
 3 common mistakes:
 1. Chamfer uses `length` (the setback), NOT `radius`. Using radius is rejected.
 2. The query goes under refs.edges (an OBJECT with "of"), not at the feature top level.

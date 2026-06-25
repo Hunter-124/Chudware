@@ -49,6 +49,13 @@ std::string cheatsheet_name(const std::string& feature_type) {
     if (t == "hole" || t == "bolt_circle") return "hole";  // hole.md documents both
     if (t == "linear_pattern" || t == "circular_pattern" || t == "pattern") return "pattern";
     if (t == "drawing") return "drawing";  // W17: 2D engineering-drawing authoring cheatsheet
+    if (t == "helix") return "helix";      // one-op coil/spring path (helix.md)
+    if (t == "thread") return "thread";    // one-op ISO thread cut (thread.md)
+    if (t == "text") return "text";        // one-op emboss/engrave on a planar face (text.md)
+    // Feature FAMILIES (prefix-matched): every sm_/weld_/surf_ type shares one cheatsheet.
+    if (t.rfind("sm_", 0) == 0) return "sheetmetal";    // sheet-metal flanges/hems/jogs/flat
+    if (t.rfind("weld_", 0) == 0) return "weldment";    // structural-member frames + gusset/cap
+    if (t.rfind("surf_", 0) == 0) return "surfacing";   // surface bodies + thicken/knit/trim
     return "";
 }
 

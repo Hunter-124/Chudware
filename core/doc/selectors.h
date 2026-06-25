@@ -48,6 +48,14 @@ struct TopoInfo {
     std::optional<double> measure;          // face area / edge length; nullopt for vertex
     std::optional<std::string> owner;       // owner feature id, or nullopt
     int hint_index = -1;                    // -1 => equals index (set in describers)
+    // I3 — REPRESENTATIVE OUTWARD DIRECTION at the face centroid, for EVERY face (unlike
+    // `axis`, which describe_faces sets only for plane/cylinder/cone). Used by the side
+    // filter so a directional query (top/front/...) can rank a curved face by which way it
+    // faces, not just by centroid height. plane = signed outward normal; cylinder/cone =
+    // radial-outward at the centroid; sphere/torus/bspline = (centroid - body bbox center).
+    // nullopt for edges/vertices and any degenerate face. NOT serialised by make_selector
+    // (it is a transient ranking aid, not part of the persisted selector fingerprint).
+    std::optional<Eigen::Vector3d> rep_dir;
 };
 
 struct ResolveResult {

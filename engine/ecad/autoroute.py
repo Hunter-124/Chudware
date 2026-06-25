@@ -277,12 +277,17 @@ class _Grid:
                 mask[self.idx(ix, iy)] = True
         return mask
 
-    def build_blocked(self, net: Any) -> list[list[bool]]:
-        """Per-layer blocked map for routing ``net``: other-net copper inflated by clearance +
-        half track width blocks cells; this net's own copper does NOT block (it is source/target);
-        outside-outline / edge cells block."""
-        clr = _clearance(self.board, net)
-        halo = clr + _track_width(self.board, net) / 2.0
+    def build_blocked(self, net: Any, halo: float | None = None) -> list[list[bool]]:
+        """Per-layer blocked map for routing ``net``: other-net copper inflated by ``halo`` blocks
+        cells; this net's own copper does NOT block (it is source/target); outside-outline / edge
+        cells block.
+
+        ``halo`` is the inflation radius. It defaults to the *track* halo (clearance + half track
+        width) — a track centre that far from copper keeps the track edge one clearance away. A via,
+        whose copper radius is much larger, needs ``clearance + via_radius`` instead; pass that as
+        ``halo`` to get the via-placement map (see :func:`_route_airwire`)."""
+        if halo is None:
+            halo = _clearance(self.board, net) + _track_width(self.board, net) / 2.0
         blocked: list[list[bool]] = []
         for ly in self.layers:
             row = [not m for m in self._outline_mask]  # start: outside-outline cells blocked
@@ -337,12 +342,18 @@ def _astar(grid: _Grid, blocked: list[list[bool]],
            starts: set[tuple[int, int, int]], goals: set[tuple[int, int, int]],
            goal_xy: tuple[float, float],
            via_cost: float = VIA_COST, bend_cost: float = BEND_COST,
+           via_blocked: list[list[bool]] | None = None,
            ) -> list[tuple[int, int, int]] | None:
     """A* from any start node to any goal node. Nodes are (layer_idx, ix, iy).
 
     Cost: 1 per orthogonal same-layer step + ``bend_cost`` on a turn + HV bias; ``via_cost`` per
     layer change. Heuristic: Manhattan distance (in cells) to the goal centroid -- admissible since
     each move advances at most one cell. Deterministic: ties broken by node tuple in the heap.
+
+    ``via_blocked`` (optional) is a second per-layer map inflated by the *via* halo (clearance +
+    via_radius). A layer change is only allowed at a cell that is clear in ``via_blocked`` on every
+    copper layer the through-via passes -- a via's copper is far wider than a track's, so the
+    track-halo ``blocked`` map alone would let A* drop a via that violates clearance.
     """
     gi = grid.nearest_cell(goal_xy)
 
@@ -391,11 +402,18 @@ def _astar(grid: _Grid, blocked: list[list[bool]],
                 gscore[nb] = ng
                 came[nb] = (node, (dx, dy))
                 heapq.heappush(heap, (ng + h(*nb), ng, nb, (dx, dy)))
-        # layer change (via) at this cell
+        # layer change (via) at this cell. A through-via occupies the SAME cell on every copper
+        # layer and its copper radius (via_dia/2) dwarfs a track's half-width, so the track-halo
+        # `blocked` map is not enough: the via must also clear other-net copper by the via halo on
+        # ALL layers (`via_blocked`), else it lands within `clearance` of a neighbouring pad/track.
+        via_ok_here = via_blocked is None or not any(
+            via_blocked[L][grid.idx(ix, iy)] for L in range(len(grid.layers)))
         for nl in range(len(grid.layers)):
             if nl == layer:
                 continue
             if blocked[nl][grid.idx(ix, iy)]:
+                continue
+            if not via_ok_here:
                 continue
             nb = (nl, ix, iy)
             ng = g + via_cost
@@ -598,12 +616,16 @@ class _RoutedRegistry:
 
 
 def _blocked_for(grid: _Grid, net: Any, reg: _RoutedRegistry,
-                 extra_shapes: list[drc._Shape] | None = None) -> list[list[bool]]:
+                 extra_shapes: list[drc._Shape] | None = None,
+                 halo: float | None = None) -> list[list[bool]]:
     """Per-layer blocked map for ``net``: static other-net copper (from the board) + the registry's
-    routed copper of other nets + any ``extra_shapes`` (e.g. a coupled diff partner to avoid)."""
-    blocked = grid.build_blocked(net)
-    clr = _clearance(grid.board, net)
-    halo = clr + _track_width(grid.board, net) / 2.0
+    routed copper of other nets + any ``extra_shapes`` (e.g. a coupled diff partner to avoid).
+
+    ``halo`` is the copper inflation radius (defaults to the track halo, clearance + half track
+    width). Pass the via halo (clearance + via_radius) to build the map that gates via placement."""
+    if halo is None:
+        halo = _clearance(grid.board, net) + _track_width(grid.board, net) / 2.0
+    blocked = grid.build_blocked(net, halo)
     obstacles = reg.shapes_for(net)
     if extra_shapes:
         obstacles = obstacles + [s for s in extra_shapes if not drc.same_net(s.net, net)]
@@ -626,15 +648,22 @@ def _route_airwire(grid: _Grid, board: dict, air: dict, reg: _RoutedRegistry,
     except for the intentional gap, and so coupled pairs avoid each other where required)."""
     net = air["net"]
     blocked = _blocked_for(grid, net, reg, extra_shapes)
-    starts = _terminal_cells(grid, blocked, air["p1"])
-    goals = _terminal_cells(grid, blocked, air["p2"])
+    starts = _terminal_cells(grid, blocked, air["p1"], net)
+    goals = _terminal_cells(grid, blocked, air["p2"], net)
     if not starts or not goals:
         return None
-    path = _astar(grid, blocked, starts, goals, tuple(air["p2"]), via_cost, bend_cost)
+    # A via needs a larger clearance halo than a track (its copper radius is via_dia/2, vs the
+    # track's width/2). Build a second, via-sized blocked map so A* only drops vias where the via
+    # copper truly clears other-net copper — otherwise the route is DRC-clean for tracks but the
+    # via violates clearance against a neighbouring pad/track.
+    via_dia, via_drill = _via_dims(board, net)
+    via_halo = _clearance(board, net) + via_dia / 2.0
+    via_blocked = _blocked_for(grid, net, reg, extra_shapes, halo=via_halo)
+    path = _astar(grid, blocked, starts, goals, tuple(air["p2"]), via_cost, bend_cost,
+                  via_blocked=via_blocked)
     if path is None:
         return None
     width = _track_width(board, net)
-    via_dia, via_drill = _via_dims(board, net)
     return _path_to_geometry(
         grid, path, net, width, tcnt, vcnt, via_dia, via_drill,
         (float(air["p1"][0]), float(air["p1"][1])),
@@ -1009,6 +1038,9 @@ def _resolve_diff_pairs(board: dict, airwires: list[dict], opts: dict) -> list[t
     seen: set[str] = set()
 
     explicit = opts.get("diff_pairs")
+    # M3: if diff_pairs is a string (e.g. 'auto'), treat it as auto-detect (no explicit pairs).
+    if isinstance(explicit, str):
+        explicit = None
     if explicit:
         for entry in explicit:
             if not entry or len(entry) < 2:
@@ -1443,13 +1475,39 @@ def _coupled_pct(poly_p: list[tuple[float, float]], poly_n: list[tuple[float, fl
     return 100.0 * coupled / total if total > 0 else 0.0
 
 
+def _terminal_layers(grid: _Grid, at: list[float], net: Any) -> set[int]:
+    """Layer indices on which same-net copper actually covers the point ``at`` — i.e. the copper
+    layers a route may legally start/end on at this terminal.
+
+    A track only connects to a pad on a layer where the pad HAS copper: an F.Cu-only SMD pad cannot
+    be reached by a B.Cu track (there is no copper there to touch, and no via). A tht pad / via spans
+    several layers and so allows them all. Returns an empty set if no same-net copper is found at
+    ``at`` (the caller then falls back to every layer — defensive; a real airwire endpoint is always
+    a pad/via centre)."""
+    pt = (float(at[0]), float(at[1]))
+    layers: set[int] = set()
+    for li, ly in enumerate(grid.layers):
+        for s in grid._shapes_by_layer.get(ly, []):
+            if drc.same_net(s.net, net) and _Grid._cell_clear_dist(s, pt) <= 1e-9:
+                layers.add(li)
+                break
+    return layers
+
+
 def _terminal_cells(grid: _Grid, blocked: list[list[bool]],
-                    at: list[float]) -> set[tuple[int, int, int]]:
-    """Routable cells representing a pad terminal: the nearest unblocked cell on each layer, plus
-    its immediate unblocked neighbours (so a pad sitting between grid lines still has an anchor)."""
+                    at: list[float], net: Any = None) -> set[tuple[int, int, int]]:
+    """Routable cells representing a pad terminal: the nearest unblocked cell on each *valid* layer,
+    plus its immediate unblocked neighbours (so a pad sitting between grid lines still has an anchor).
+
+    ``net`` restricts the terminal to the layers the pad/via actually occupies (see
+    :func:`_terminal_layers`) so the router never "reaches" a single-layer pad on the wrong layer.
+    When ``net`` is None (or no same-net copper is found) every layer is allowed (legacy behaviour)."""
     cx, cy = grid.nearest_cell((at[0], at[1]))
     out: set[tuple[int, int, int]] = set()
+    valid = _terminal_layers(grid, at, net) if net is not None else set()
     for li in range(len(grid.layers)):
+        if valid and li not in valid:
+            continue
         # search outward in rings for the closest unblocked cell on this layer
         found = None
         for r in range(0, 4):

@@ -262,6 +262,23 @@ TEST_CASE("openai parse") {
     CHECK(openai_parse_response(resp).text == "hi");
     json empty = {{"choices", json::array()}};
     CHECK(openai_parse_response(empty).text == "");
+
+    // Reasoning model with a real answer: content wins, reasoning is kept as thinking.
+    json reason = {{"choices", json::array({{{"message",
+                   {{"content", "answer"}, {"reasoning_content", "thought"}}}}})}};
+    ParsedReply pr = openai_parse_response(reason);
+    CHECK(pr.text == "answer");
+    CHECK(pr.thinking == "thought");
+
+    // Reasoning model that emitted ONLY reasoning (empty content) -> fall back to it so any
+    // inline ops JSON survives instead of the run seeing an empty reply.
+    json only_reason = {{"choices", json::array({{{"message",
+                        {{"content", ""}, {"reasoning_content", "{\"ops\":[]}"}}}}})}};
+    CHECK(openai_parse_response(only_reason).text == "{\"ops\":[]}");
+
+    // The `reasoning` spelling (some servers) is also honored.
+    json alt = {{"choices", json::array({{{"message", {{"reasoning", "r"}}}}})}};
+    CHECK(openai_parse_response(alt).text == "r");
 }
 
 TEST_CASE("mock provider repeats last") {

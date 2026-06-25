@@ -285,6 +285,60 @@ def test_transform_targets_named_body_string():
     assert near0["com"][2] > 900 and near100["com"][2] < 100, bodies
 
 
+def test_second_transform_composes_not_duplicates():
+    """Issue 4: a second copy:false transform that targets a body a PRIOR transform already moved
+    must compose on the placed body — not re-read the original and spawn a duplicate."""
+    r, _ = _call("new_part", {"name": "compose"})
+    doc = r["doc_id"]
+    r1, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(20), "width": cb.dim(20), "height": cb.dim(20)})]})
+    fid = r1["features"][0]["id"]
+    m0, _ = _call("measure_part", {"doc_id": doc})
+    vol0 = m0["mass"]["volume_mm3"]
+    # First in-place move (consumes fid, produces a placed body).
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("transform", "Place", {"translate": [100, 0, 0]}, body=fid)]})
+    # Second transform STILL targeting the ORIGINAL fid, copy:false -> must compose on the placed
+    # body. body_count stays 1, volume unchanged (no duplicate), and both moves accumulate.
+    r3, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("transform", "Nudge", {"translate": [0, 0, 50]}, body=fid)]})
+    assert r3["ok"] and r3["body_count"] == 1, r3
+    m1, _ = _call("measure_part", {"doc_id": doc})
+    assert abs(m1["mass"]["volume_mm3"] - vol0) < 1e-6, (m1["mass"]["volume_mm3"], vol0)
+    com = m1["mass"]["com"]
+    assert com[0] > 90 and com[2] > 40, com  # composed both translations onto one body
+
+
+def test_config_override_accepts_a_vector():
+    """Issue 5: set_config_override accepts a LIST value (a transform translate) so one file can
+    hold configs differing only in a placement vector."""
+    r, _ = _call("new_part", {"name": "cfgvec"})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(10), "width": cb.dim(10), "height": cb.dim(10)})]})
+    r2, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("transform", "Place", {"translate": [0, 0, 0]})]})
+    tid = r2["features"][-1]["id"]
+    _call("add_configuration", {"name": "Stowed", "doc_id": doc})
+    ov, _ = _call("set_config_override", {"config": "Stowed", "feature_id": tid,
+                                          "param": "translate", "value": [0, 0, 50], "doc_id": doc})
+    assert ov["ok"] and ov["value"] == [0.0, 0.0, 50.0], ov
+    act, _ = _call("activate_configuration", {"name": "Stowed", "doc_id": doc})
+    assert act["ok"], act
+    m, _ = _call("measure_part", {"doc_id": doc})
+    assert m["mass"]["com"][2] > 40, m  # the body lifted in the Stowed config
+
+
+def test_get_part_summary_is_lightweight():
+    """Issue 8: get_part(summary=True) lists feature id/name/type/params with no tessellation."""
+    doc = _new_plate_with_hole()
+    summ, _ = _call("get_part", {"doc_id": doc, "summary": True})
+    assert summ["ok"] and summ["summary"] is True, summ
+    assert summ["feature_count"] >= 1 and summ["features"], summ
+    f0 = summ["features"][0]
+    assert set(("id", "name", "type", "params")).issubset(f0), f0
+
+
 def test_measure_multibody_per_body_and_total():
     """A multi-body doc reports per-body breakdown + the combined total (not just one body)."""
     r, _ = _call("new_part", {"name": "asm"})
@@ -375,6 +429,341 @@ def test_run_cfd_accurate_dispatches():
     assert out.get("job_id") and out["status"] == "running", out
     g, _ = _call("get_job", {"job_id": out["job_id"]})
     assert g["status"] in ("running", "done", "error"), g
+
+
+def test_fea_static_material_scaling_f4():
+    """F4: aluminum must deflect ~2.86x MORE than steel under the same load (E_steel/E_Al ≈ 200/70).
+
+    Bug F4: non-steel materials were 3.6x too stiff — aluminum deflected LESS than steel because
+    the material name was not being correctly resolved to a properties dict before the solve.
+    Fix: _resolve_material always returns a fresh copy of the _MATERIALS dict and validates that
+    E_mpa > 0 so a bad entry is caught in Python rather than as a cryptic C++ error.
+
+    This test catches any regression where the wrong E (e.g. steel's 200 GPa) is used for
+    aluminum instead of the correct 69 GPa.  The cantilever is the same geometry and load for
+    both solves; the deflection ratio must equal E_steel / E_Al to within 15% (the tolerance
+    accommodates the coarse mesh and boundary-layer effects, but 3.6x too stiff collapses the
+    ratio to ~1 and would fail instantly).
+    """
+    r, _ = _call("new_part", {"name": "mat_scale"})
+    doc = r["doc_id"]
+    # A simple 80×20×10 mm cantilever beam.
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Beam",
+                {"length": cb.dim(80), "width": cb.dim(20), "height": cb.dim(10)})]})
+
+    common = {
+        "doc_id": doc,
+        "fixtures": [{"of": "face", "side": "left"}],
+        "loads": [{"face": {"of": "face", "side": "right"}, "force": [0, 0, -300]}],
+    }
+    rs, _ = _call("run_fea_static", {**common, "material": "steel"})
+    ra, _ = _call("run_fea_static", {**common, "material": "aluminum"})
+    assert rs["ok"], f"steel solve failed: {rs}"
+    assert ra["ok"], f"aluminum solve failed: {ra}"
+
+    delta_steel = rs["summary"]["max_disp_mm"]
+    delta_al = ra["summary"]["max_disp_mm"]
+    assert delta_steel > 0, f"steel deflection is zero: {rs}"
+    assert delta_al > 0, f"aluminum deflection is zero: {ra}"
+
+    # Aluminum (E≈69 GPa) must deflect MORE than steel (E≈200 GPa) — the bug caused it to
+    # deflect LESS (backwards), which maps to a ratio < 1.
+    assert delta_al > delta_steel, (
+        f"F4 regression: aluminum deflects LESS than steel (delta_al={delta_al:.4f} mm < "
+        f"delta_steel={delta_steel:.4f} mm). Material resolution is broken — check _MATERIALS "
+        f"and _resolve_material in cad_tools.py."
+    )
+
+    # The ratio must be close to E_steel / E_Al = 200000 / 69000 ≈ 2.90.
+    E_steel, E_al = 200000.0, 69000.0
+    expected_ratio = E_steel / E_al  # ≈ 2.90
+    actual_ratio = delta_al / delta_steel
+    assert abs(actual_ratio - expected_ratio) / expected_ratio < 0.15, (
+        f"F4: deflection ratio {actual_ratio:.3f} differs from expected {expected_ratio:.3f} "
+        f"by more than 15%  (delta_steel={delta_steel:.4f}, delta_al={delta_al:.4f}). "
+        f"A ratio ~1 means both materials are being solved with the SAME (steel) E."
+    )
+
+
+def test_fea_modal_free_free_f6():
+    """F6: run_fea_modal(fixtures=[]) must NOT return 'no fixture faces resolved' — it should
+    call the C++ solver with no constraints and return rigid-body + elastic modes.
+
+    Bug F6: the Python guard `if not fixture_sets: return error` fired for empty-fixture calls
+    even though the C++ fea_modal_solve handles unconstrained (free-free) problems correctly.
+    Fix: only reject when fixtures were PROVIDED but none resolved; skip the guard when
+    fixtures=[] (free-free is intentional).
+
+    Verified behavior from the live C++ solver on a 60×20×10 mm box:
+    - ok:True (not an error)
+    - Returns the requested n_modes frequencies
+    - At least the first few modes are near 0 Hz (rigid-body; the shift-invert solver may
+      collapse all 6 near-zero modes into fewer numerical zeros depending on spectral shift)
+    - All remaining (elastic) modes are strictly positive
+    """
+    r, _ = _call("new_part", {"name": "free_free"})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Block",
+                {"length": cb.dim(60), "width": cb.dim(20), "height": cb.dim(10)})]})
+
+    # Free-free: no fixture faces.  Before the F6 fix this returned {"ok":False,
+    # "error":"no fixture faces resolved"} without ever calling the C++ solver.
+    rf, _ = _call("run_fea_modal", {"doc_id": doc, "fixtures": [], "n_modes": 12,
+                                    "material": "steel"})
+    assert rf["ok"], (
+        f"F6 regression: free-free modal returned an error — the Python guard is still "
+        f"blocking unconstrained solves.  Error: {rf.get('error', rf)}"
+    )
+    freqs = rf.get("freqs_hz", [])
+    assert len(freqs) >= 6, (
+        f"expected at least 6 modes from a free-free solve, got {len(freqs)}: {freqs}"
+    )
+
+    # At least the first mode must be near 0 Hz (a rigid-body mode).  We use a generous
+    # 1 Hz threshold to accommodate numerical noise; the exact count of near-zero modes
+    # depends on the spectral shift the solver uses.
+    assert abs(freqs[0]) < 1.0, (
+        f"F6: mode 0 has frequency {freqs[0]:.4f} Hz — expected a rigid-body mode near 0 Hz. "
+        f"All modes: {freqs}"
+    )
+
+    # Count near-zero (rigid-body) modes and confirm the rest are positive elastic modes.
+    near_zero = [f for f in freqs if abs(f) < 1.0]
+    elastic = [f for f in freqs if abs(f) >= 1.0]
+    assert len(near_zero) >= 1, f"no near-zero rigid-body modes found: {freqs}"
+    for f in elastic:
+        assert f > 0, (
+            f"elastic mode has non-positive frequency {f} Hz — expected all elastic "
+            f"modes to be > 0. Rigid-body modes: {near_zero}, elastic: {elastic}"
+        )
+
+
+def test_measure_between_single_face_area():
+    """measure_between(one face query) returns that face's area."""
+    doc = _new_plate_with_hole()
+    r, _ = _call("measure_between", {"a_query": "top", "doc_id": doc})
+    assert r["ok"], r
+    assert r["kind"] == "area"
+    # The plate top is 60x40 minus an 8mm hole's footprint; area is just under 2400.
+    assert 2000 < r["area"] < 2400, r
+    assert "mm^2" in r["summary"], r
+
+
+def test_measure_between_two_faces_distance():
+    """measure_between(top, bottom) returns the through-thickness distance (= plate height 10)."""
+    doc = _new_plate_with_hole()
+    r, _ = _call("measure_between", {"a_query": "top", "b_query": "bottom", "doc_id": doc})
+    assert r["ok"], r
+    assert abs(r["distance"] - 10.0) < 1e-6, r
+    assert "distance" in r["summary"], r
+
+
+def test_measure_between_two_faces_angle():
+    """Adjacent orthogonal faces measure a 90-degree angle."""
+    doc = _new_plate_with_hole()
+    r, _ = _call("measure_between", {"a_query": "top", "b_query": "front", "doc_id": doc})
+    assert r["ok"], r
+    assert abs(r["angle"] - 90.0) < 1e-6, r
+
+
+def test_measure_between_ambiguous_query_is_rejected():
+    """A query matching several faces/edges is rejected with a helpful message (not a wrong number)."""
+    doc = _new_plate_with_hole()
+    # "all the vertical edges" matches 4 -> must not silently measure one.
+    r, _ = _call("measure_between", {"a_query": {"of": "edge", "parallel": "z"}, "doc_id": doc})
+    assert r["ok"] is False, r
+    assert "matched" in r["error"].lower() or "candidate" in r["error"].lower(), r
+
+
+def test_check_interference_single_part_clean():
+    """A single-body part trivially reports no interference."""
+    doc = _new_plate_with_hole()
+    r, _ = _call("check_interference", {"doc_id": doc})
+    assert r["ok"] is True, r
+    assert r["interferences"] == [], r
+    assert len(r["parts"]) == 1, r
+
+
+def test_check_interference_overlapping_bodies():
+    """Two overlapping copies of a body are flagged as an interference with an overlap volume."""
+    r, _ = _call("new_part", {"name": "clash"})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(40), "width": cb.dim(40), "height": cb.dim(40)})]})
+    # A copy shifted only 10mm in X overlaps the original.
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("transform", "Dup", {"translate": [10, 0, 0], "copy": True})]})
+    r2, _ = _call("check_interference", {"doc_id": doc})
+    assert r2["ok"] is False, r2  # they overlap -> not ok
+    assert len(r2["interferences"]) == 1, r2
+    assert r2["interferences"][0]["volume"] > 0, r2
+
+
+def test_check_symmetry_centered_box():
+    """A box centered on the origin is symmetric about all three principal planes."""
+    r, _ = _call("new_part", {"name": "sym"})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(40), "width": cb.dim(30), "height": cb.dim(20)})]})
+    for plane in ("top", "front", "right"):
+        rr, _ = _call("check_symmetry", {"plane": plane, "doc_id": doc})
+        assert rr["ok"] and rr["symmetric"] is True, (plane, rr)
+        assert rr["deviation_mm3"] < 1e-3, (plane, rr)
+
+
+def test_configurations_variant_changes_volume():
+    """A configuration with a parameter override + a suppression yields a different built variant."""
+    r, _ = _call("new_part", {"name": "variants"})
+    doc = r["doc_id"]
+    r1, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Block", {"length": cb.dim(40), "width": cb.dim(30), "height": cb.dim(20)})]})
+    fid = r1["features"][0]["id"]
+
+    base, _ = _call("measure_part", {"doc_id": doc})
+    base_vol = base["mass"]["volume_mm3"]
+    assert abs(base_vol - 24000) < 1e-3, base
+
+    # Default + a "Big" variant that doubles the length.
+    lst, _ = _call("list_configurations", {"doc_id": doc})
+    assert lst["configurations"] == ["Default"] and lst["active"] == "Default", lst
+
+    a, _ = _call("add_configuration", {"name": "Big", "doc_id": doc})
+    assert a["ok"] and "Big" in a["configurations"], a
+
+    o, _ = _call("set_config_override", {"config": "Big", "feature_id": fid,
+                                         "param": "length", "value": 80, "doc_id": doc})
+    assert o["ok"], o
+
+    act, _ = _call("activate_configuration", {"name": "Big", "doc_id": doc})
+    assert act["ok"] and act["active"] == "Big" and act["body_count"] == 1, act
+
+    big, _ = _call("measure_part", {"doc_id": doc})
+    assert abs(big["mass"]["volume_mm3"] - 48000) < 1e-3, big  # length doubled -> volume doubled
+
+    # Switch back to Default -> original volume restored.
+    _call("activate_configuration", {"name": "Default", "doc_id": doc})
+    back, _ = _call("measure_part", {"doc_id": doc})
+    assert abs(back["mass"]["volume_mm3"] - base_vol) < 1e-3, back
+
+
+def test_config_suppression_drops_a_feature():
+    """Suppressing the only feature in a config removes the body in that variant."""
+    r, _ = _call("new_part", {"name": "supp"})
+    doc = r["doc_id"]
+    r1, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Block", {"length": cb.dim(20), "width": cb.dim(20), "height": cb.dim(20)})]})
+    fid = r1["features"][0]["id"]
+    _call("add_configuration", {"name": "Empty", "doc_id": doc})
+    s, _ = _call("set_config_suppression", {"config": "Empty", "feature_id": fid,
+                                            "suppressed": True, "doc_id": doc})
+    assert s["ok"], s
+    act, _ = _call("activate_configuration", {"name": "Empty", "doc_id": doc})
+    assert act["ok"] and act["body_count"] == 0, act  # the box is suppressed -> no body
+
+
+def test_solve_mates_rejects_a_part_but_world_bodies_lists_it():
+    """solve_mates is assembly-only (clear error on a part); list_world_bodies now ALSO works on
+    a multi-body part (Issue 9) — it reports each body's world bbox so an import_part-assembled
+    part can be inspected without promoting it to a formal assembly doc."""
+    doc = _new_plate_with_hole()
+    sm, _ = _call("solve_mates", {"doc_id": doc})
+    assert sm["ok"] is False and "assembl" in sm["error"].lower(), sm
+    wb, _ = _call("list_world_bodies", {"doc_id": doc})
+    assert wb["ok"] is True and wb.get("multibody_part") is True, wb
+    assert wb["body_count"] >= 1 and wb["bodies"], wb
+    assert wb["bodies"][0].get("bbox"), wb  # each body carries a world bbox
+
+
+# ---------------------------------------------------------------- inspection suite
+# These exercise the three INSPECTION RPCs that were filled in C++ (section area+moments,
+# numeric wall thickness, moldability draft). They need the REBUILT DLL — the math was 0/empty
+# before. After `build.bat` rebuilds + stages libaicad.dll they pass.
+
+def test_inspect_section_real_area():
+    """inspect_section cuts the part and returns the REAL cross-section area (not 0).
+
+    A 60x40x20 box cut by the 'right' plane (YZ, through the origin -> mid-length) exposes a
+    40(width) x 20(height) rectangle = 800 mm^2. Before the C++ fix this was hard-coded to 0.
+    """
+    r, _ = _call("new_part", {"name": "sec"})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(20)})]})
+    s, _ = _call("inspect_section", {"plane": "right", "doc_id": doc})
+    assert s["ok"], s
+    # Right plane (YZ) slices the 40x20 face: 800 mm^2 (the box is centred on the origin).
+    assert abs(s["area_mm2"] - 800.0) < 1.0, s
+    assert "mm^2" in s["summary"], s
+    # Second moments of a 40(b) x 20(h) rect about its centroid in the plane frame are nonzero.
+    assert s["Ixx"] > 0 and s["Iyy"] > 0, s
+
+
+def test_wall_thickness_numeric_on_shell():
+    """wall_thickness returns a numeric min/mean/max — the thinnest wall of a shelled box.
+
+    A 40x40x40 box shelled to 2 mm walls should report a min wall thickness ~2 mm. The inward
+    ray-cast (Moller-Trumbore, two-sided) stops at the NEAREST opposite wall, so the thinnest
+    wall is found regardless of triangle winding. Before the C++ fix only an aicm_path came
+    back (no numbers).
+
+    NOTE: the body must actually HAVE walls — i.e. an open shell with a removed face. A
+    "closed" shell with NO removed face is, in the current engine, a solid shrunk block (the
+    shell op needs at least one open face to leave a cavity), and a solid block's "thickness"
+    is correctly its full span (~36 mm), not 2. So we remove the top face to make a real
+    2 mm-walled bucket and assert the algorithm finds the 2 mm wall."""
+    r, _ = _call("new_part", {"name": "wt"})
+    doc = r["doc_id"]
+    # Open hollow shell, 2 mm walls: remove the top face so there is a genuine cavity with
+    # real inner + outer walls. thickness+outward are the documented params (see
+    # cheatsheets/shell.md); outward:false hollows inward.
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(40), "width": cb.dim(40), "height": cb.dim(40)}),
+        cb.feat("shell", "Hollow", {"thickness": cb.dim(2), "outward": False},
+                {"remove": {"of": "face", "side": "top"}})]})
+    w, _ = _call("wall_thickness", {"doc_id": doc})
+    assert w["ok"], w
+    assert w["min_thickness_mm"] is not None, w
+    # The thinnest wall is the 2 mm shell (raycast on a coarse tessellation -> tolerance band).
+    assert 1.0 < w["min_thickness_mm"] < 3.5, w
+    assert w["mean_thickness_mm"] >= w["min_thickness_mm"], w
+    assert w["max_thickness_mm"] >= w["mean_thickness_mm"], w
+    assert "wall" in w["summary"].lower(), w
+
+
+def test_draft_analysis_flags_vertical_walls():
+    """draft_analysis flags the 4 vertical walls of a box pulled along +Z (0deg draft < 3deg).
+
+    A plain box's side walls are parallel to a +Z pull -> 0deg draft -> below the 3deg minimum.
+    The top/bottom faces are perpendicular (90deg) -> fine. So exactly the 4 sides are flagged.
+    """
+    r, _ = _call("new_part", {"name": "dr"})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(40), "width": cb.dim(30), "height": cb.dim(20)})]})
+    d, _ = _call("draft_analysis", {"pull_dir": [0, 0, 1], "min_draft_deg": 3.0, "doc_id": doc})
+    assert d["ok"], d
+    # The four vertical side walls have ~0deg draft -> below threshold; top+bottom are fine.
+    assert d["n_faces_below_threshold"] == 4, d
+    assert len(d["faces_below_threshold"]) == 4, d
+    for f in d["faces_below_threshold"]:
+        assert f["area_mm2"] > 0 and len(f["centroid"]) == 3, f
+        assert f["min_draft_deg"] < 3.0, f
+    assert "draft" in d["summary"].lower(), d
+
+
+def test_draft_analysis_sphere_is_moldable():
+    """A sphere has draft everywhere except a single silhouette ring; pulled along Z almost
+    all faces clear a small threshold. We just assert the summary + fields are well-formed and
+    that min/max draft span roughly -90..90 (a full range of surface orientations)."""
+    r, _ = _call("new_part", {"name": "sph"})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [cb.feat("sphere", "S", {"radius": cb.dim(20)})]})
+    d, _ = _call("draft_analysis", {"pull_dir": [0, 0, 1], "min_draft_deg": 1.0, "doc_id": doc})
+    assert d["ok"], d
+    assert d["min_draft_deg"] is not None and d["max_draft_deg"] is not None, d
+    assert d["min_draft_deg"] < -45.0 and d["max_draft_deg"] > 45.0, d  # full orientation span
 
 
 if __name__ == "__main__":

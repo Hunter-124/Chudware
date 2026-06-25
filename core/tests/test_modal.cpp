@@ -25,6 +25,34 @@ struct Mesh {
     std::vector<int> fixed;    // nodes at x≈0
 };
 
+// Rectangular-section variant: [0,L] x [0,ay] x [0,az], meshed nx x ny x nz Kuhn cells.
+Mesh beam_mesh_rect(double L, double ay, double az, int nx, int ny, int nz) {
+    Mesh m;
+    auto nid = [&](int i, int j, int k) { return (i * (ny + 1) + j) * (nz + 1) + k; };
+    for (int i = 0; i <= nx; ++i)
+        for (int j = 0; j <= ny; ++j)
+            for (int k = 0; k <= nz; ++k) {
+                m.pts.push_back(L * i / nx);
+                m.pts.push_back(ay * j / ny);
+                m.pts.push_back(az * k / nz);
+                if (i == 0) m.fixed.push_back(nid(i, j, k));
+            }
+    const int paths[6][4][3] = {
+        {{0,0,0},{1,0,0},{1,1,0},{1,1,1}}, {{0,0,0},{1,0,0},{1,0,1},{1,1,1}},
+        {{0,0,0},{0,1,0},{1,1,0},{1,1,1}}, {{0,0,0},{0,1,0},{0,1,1},{1,1,1}},
+        {{0,0,0},{0,0,1},{1,0,1},{1,1,1}}, {{0,0,0},{0,0,1},{0,1,1},{1,1,1}},
+    };
+    for (int ci = 0; ci < nx; ++ci)
+        for (int cj = 0; cj < ny; ++cj)
+            for (int ck = 0; ck < nz; ++ck)
+                for (int t = 0; t < 6; ++t)
+                    for (int v = 0; v < 4; ++v) {
+                        const int* d = paths[t][v];
+                        m.tets.push_back(nid(ci + d[0], cj + d[1], ck + d[2]));
+                    }
+    return m;
+}
+
 Mesh beam_mesh(double L, double a, int nx, int ny, int nz) {
     Mesh m;
     auto nid = [&](int i, int j, int k) { return (i * (ny + 1) + j) * (nz + 1) + k; };
@@ -150,4 +178,47 @@ TEST_CASE("modal: tet10 reads near Euler-Bernoulli with a tight bending pair (N-
                                           m4.fixed, /*n_modes*/ 4, /*nodes_per_elem*/ 4);
     REQUIRE(r4.ok);
     CHECK(r4.freqs_hz[0] >= f1);  // tet4 stiffer => not below the tet10 reading
+}
+
+// F3 — NON-SQUARE cantilever first bending near the analytic value. A 200(x) x 20(y) x
+// 10(z) steel cantilever bends most easily about the y-axis (the 10 mm dimension), giving
+// Euler-Bernoulli f1 = (1.875^2/2pi) sqrt(E I / (rho A L^4)) ~ 209 Hz with I = b h^3/12,
+// b=20, h=10. The consistent tet10 mass (M_ij = rho * mapped-volume * exact N_iN_j moments)
+// must read in that band — the old corner-tet-volume mass mis-stated the inertia on
+// distorted high-aspect elements and read several-fold high (Bug F3). On a STRAIGHT mesh the
+// Gauss-integrated mapped volume equals the corner volume exactly, so this also confirms the
+// fix did not perturb a regular mesh. f2 (bending about the 20 mm dimension) sits higher,
+// near ~418 Hz, and must be well above f1.
+TEST_CASE("modal: non-square cantilever f1 near Euler-Bernoulli (~209 Hz) (F3)") {
+    Mesh m4 = beam_mesh_rect(200.0, 20.0, 10.0, 24, 3, 2);
+    Mesh10 m = to_tet10(m4);
+    auto r = aicad::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
+                                         m.fixed, /*n_modes*/ 3, /*nodes_per_elem*/ 10);
+    REQUIRE(r.ok);
+    REQUIRE(r.freqs_hz.size() >= 2);
+    const double f1 = r.freqs_hz[0], f2 = r.freqs_hz[1];
+    MESSAGE("F3 non-square f1=", f1, " f2=", f2, " (analytic weak~209, strong~418)");
+    // f1 near the 209 Hz weak-axis Euler-Bernoulli value. The band is generous on the high
+    // side for the coarse straight mesh (slightly over-stiff), but its UPPER bound (300 Hz)
+    // categorically rejects the ~762 Hz the corner-volume mass produced — F3's 3.x-too-high
+    // signature. Lower bound guards against a collapse.
+    CHECK(f1 > 150.0);
+    CHECK(f1 < 300.0);
+    CHECK(f2 >= f1);               // ascending
+    CHECK(f2 > 1.25 * f1);         // strong-axis bending is distinctly higher (not degenerate)
+}
+
+// F6 — a FREE-FREE (no fixtures) non-square body is a VALID unconstrained solve: it must
+// return ~6 rigid-body modes near 0 Hz and then positive elastic modes, NOT an error. The
+// solver already supports fixtures=={} (the negative spectral shift keeps the singular K
+// factorable); this pins that contract for a rectangular section too.
+TEST_CASE("modal: free-free non-square body returns rigid-body modes, not an error (F6)") {
+    Mesh m = beam_mesh_rect(120.0, 20.0, 10.0, 12, 2, 1);
+    auto r = aicad::sim::fea_modal_solve(m.pts, m.tets, 210000.0, 0.30, 7.85,
+                                         /*fixed*/ {}, /*n_modes*/ 9);
+    REQUIRE(r.ok);                       // empty fixtures is NOT an error
+    REQUIRE(r.freqs_hz.size() >= 8);
+    for (int i = 0; i < 6; ++i) CHECK(r.freqs_hz[i] < 5.0);   // 6 rigid-body modes ~0 Hz
+    CHECK(r.freqs_hz[6] > 50.0);                              // first elastic mode is positive
+    CHECK(r.freqs_hz[7] >= r.freqs_hz[6]);                    // ascending
 }

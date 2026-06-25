@@ -23,6 +23,7 @@
 #include "sim/mesher.h"
 
 #include "sim/hex_mesher.h"  // mesh_box_hex (structured hex path)
+#include "geom/booleans.h"   // geom::unify_same_domain (mesh-time geometry healing)
 
 #include <algorithm>
 #include <cmath>
@@ -31,6 +32,16 @@
 #include <mutex>
 #include <limits>
 #include <unordered_map>
+
+// OCCT data-exchange + healing for the mesh-time defeaturing fallback (Issue 6): a STEP
+// read/write round-trip plus ShapeFix + same-domain face merge, used only when gmsh's
+// volume mesher rejects fused-primitive geometry (coincident coplanar faces / sliver edges).
+#include <IFSelect_ReturnStatus.hxx>
+#include <STEPControl_Reader.hxx>
+#include <STEPControl_Writer.hxx>
+#include <STEPControl_StepModelType.hxx>
+#include <ShapeFix_Shape.hxx>
+#include <TopoDS_Shape.hxx>
 
 // gmshc.h is a pure-C header with NO `extern "C"` guard of its own — wrap it so the
 // C++ compiler emits C linkage (the DLL exports plain C names: gmshInitialize, …).
@@ -197,10 +208,74 @@ MeshOut mesh_step(const std::string& step_path, double density, int order) {
     return mesh_step(step_path, options);
 }
 
+namespace {
+
+// Heal a STEP for meshing (Issue 6). Fused-primitive parts (many boxes booleaned with
+// boss/merge) meet at coincident coplanar faces with sliver edges at the box-box junctions;
+// gmsh's volume mesher (mesh.generate(3)) rejects that topology even though the body is a
+// valid solid. We read the STEP back into OCCT, run ShapeFix (sew gaps / fix small edges),
+// then ShapeUpgrade_UnifySameDomain (the same .clean() the booleans apply — collapses the
+// flush coplanar junction faces to one), and write a healed STEP. Returns the healed path,
+// or "" if anything failed (caller falls back to the original). Best-effort: never throws.
+std::string heal_step_for_mesh(const std::string& step_path) {
+    try {
+        STEPControl_Reader rd;
+        if (rd.ReadFile(step_path.c_str()) != IFSelect_RetDone) return std::string();
+        rd.TransferRoots();
+        TopoDS_Shape shape = rd.OneShape();
+        if (shape.IsNull()) return std::string();
+
+        Handle(ShapeFix_Shape) fixer = new ShapeFix_Shape(shape);
+        fixer->Perform();
+        TopoDS_Shape fixed = fixer->Shape();
+        if (fixed.IsNull()) fixed = shape;
+
+        TopoDS_Shape healed = ::geom::unify_same_domain(fixed);
+        if (healed.IsNull()) healed = fixed;
+
+        std::filesystem::path out_fs = std::filesystem::path(step_path);
+        out_fs.replace_extension(".healed.step");
+        const std::string out = out_fs.string();
+        STEPControl_Writer wr;
+        if (wr.Transfer(healed, STEPControl_AsIs) != IFSelect_RetDone) return std::string();
+        if (wr.Write(out.c_str()) != IFSelect_RetDone) return std::string();
+        return out;
+    } catch (...) {
+        return std::string();  // best-effort — the caller keeps the original STEP
+    }
+}
+
+}  // namespace
+
+// The gmsh meshing core (defined below); the public mesh_step wraps it with the heal-and-retry
+// fallback for fused-primitive geometry (Issue 6).
+MeshOut mesh_step_gmsh(const std::string& step_path, const MeshOptions& options);
+
 MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
     // Structured hexahedral request: delegate to the OCCT box-grid mesher (no gmsh).
     if (options.structured) return mesh_box_hex(step_path, options);
 
+    MeshOut out = mesh_step_gmsh(step_path, options);
+    if (out.ok) return out;
+
+    // Robust-fallback meshing (Issue 6): gmsh failed on the raw geometry — almost always a
+    // fused-primitive part whose coincident coplanar faces / sliver edges defeat tet
+    // generation. Heal the shape and retry ONCE on the healed STEP before reporting failure.
+    // The common (clean-geometry) path never pays this cost: it only runs after a real miss.
+    std::string healed = heal_step_for_mesh(step_path);
+    if (!healed.empty() && healed != step_path) {
+        MeshOut out2 = mesh_step_gmsh(healed, options);
+        std::error_code ec;
+        std::filesystem::remove(healed, ec);
+        std::filesystem::path msh = std::filesystem::path(healed);
+        msh.replace_extension(".msh");
+        std::filesystem::remove(msh, ec);
+        if (out2.ok) return out2;
+    }
+    return out;  // surface the original gmsh error
+}
+
+MeshOut mesh_step_gmsh(const std::string& step_path, const MeshOptions& options) {
     std::lock_guard<std::mutex> gmsh_lock(gmsh_mutex());  // serialize: gmsh is not thread-safe
     MeshOut out;
 
@@ -285,15 +360,29 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
     if (!explicit_size && std::isfinite(min_side) && min_side < 1e29)
         base = std::min(base, min_side);
 
+    // Auto size band. The lower bound used to be base*0.1 — a 10:1 spread. Combined with the
+    // curvature refinement that can drive the local size down to MeshSizeMin, that let the
+    // FINEST settings emit very small SLIVER tets next to much larger ones: a poorly graded,
+    // ill-conditioned mesh whose static solve drifted AWAY from the analytic answer (Bug F7:
+    // fineness 0.9 read 0.21 mm vs the 0.80 mm analytic, worse than the 0.5 setting). A
+    // tighter 2:1 band (base*0.5 .. base) gradates cleanly and keeps element quality high, so
+    // a finer mesh now converges TOWARD the reference instead of degrading. (Explicit
+    // min/max overrides are still honored verbatim.)
     double min_len =
         (std::isfinite(options.min_size_mm) && options.min_size_mm > 0.0)
             ? options.min_size_mm
-            : base * 0.1;
+            : base * 0.5;
     double max_len =
         (std::isfinite(options.max_size_mm) && options.max_size_mm > 0.0)
             ? options.max_size_mm
             : base;
     if (max_len < min_len) std::swap(max_len, min_len);
+    // Never let the floor collapse to a near-zero absolute size (a degenerate bbox or an
+    // aggressive curvature setting could otherwise push MeshSizeMin to a sliver scale that
+    // gmsh fills with near-zero-volume tets). Keep it a sane fraction of the diagonal.
+    const double abs_floor = diag * 1e-3;
+    if (min_len < abs_floor) min_len = abs_floor;
+    if (max_len < min_len) max_len = min_len;
 
     // Element size bounds (modern option names; the old CharacteristicLength* are
     // deprecated aliases of these).

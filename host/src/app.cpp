@@ -40,6 +40,7 @@
 #include "render/overlays.h"
 
 #include "core/app_state.h"
+#include "core/cpp_core.h"   // sampling-profiler RPCs (prof_start/prof_stop) via libaicad
 #include "core/jobs.h"
 #include "ui/console_panel.h"
 #include "ui/doc_tabs.h"
@@ -112,6 +113,65 @@ bool ecadCall(AppState& st, const char* method, const nlohmann::json& params, nl
         return false;
     }
     return true;
+}
+
+// Evaluate > Profiler: toggle the in-process sampling profiler in libaicad (prof_start /
+// prof_stop). Click once to start sampling, model normally, click again to stop — the
+// symbolized report (folded stacks + a speedscope profile) is written to
+// %APPDATA%\AI-CAD\prof and the top hotspots are toasted. Drives the C++ core directly
+// (cpp_core), since profiling is a global, non-document operation. See docs/PROFILER.md.
+void toggleProfiler(AppState& st) {
+    nlohmann::json res;
+    std::string err;
+    if (!st.profilerRunning) {
+        if (!core::cpp_core().call("prof_start",
+                                   {{"hz", 1000}, {"mode", "modeling"}}, res, err) ||
+            (res.is_object() && res.contains("error"))) {
+            const std::string why = !err.empty() ? err
+                : (res.is_object() ? res.value("error", std::string("unavailable"))
+                                   : std::string("unavailable"));
+            st.toast(ui::ToastLevel::Error,
+                     "Profiler couldn't start (" + why +
+                     "). Rebuild + restart so the engine exposes prof_*.");
+            return;
+        }
+        st.profilerRunning = true;
+        st.toast(ui::ToastLevel::Info,
+                 "Profiler ON — model now, then click Profiler again to stop & save.");
+        return;
+    }
+
+    // Stop + write the report.
+    st.profilerRunning = false;
+    const std::string dir = appdataDir() + "\\AI-CAD\\prof";
+    try { std::filesystem::create_directories(dir); } catch (...) {}
+    const std::string folded = dir + "\\modeling.folded";
+    const std::string scope  = dir + "\\modeling.speedscope.json";
+    if (!core::cpp_core().call("prof_stop",
+                               {{"top", 25}, {"write_folded", folded},
+                                {"write_speedscope", scope}}, res, err)) {
+        st.toast(ui::ToastLevel::Error, "Profiler stop failed: " + err);
+        return;
+    }
+    if (!res.value("ok", false)) {
+        st.toast(ui::ToastLevel::Warn,
+                 "Profiler: " + res.value("error", std::string("no samples captured")));
+        return;
+    }
+    const auto& summary = res["summary"];
+    long long samples = summary.value("samples", 0LL);
+    std::string hot;
+    if (res.contains("modules") && res["modules"].is_array() && !res["modules"].empty()) {
+        const auto& m0 = res["modules"][0];
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), " · hottest %s %.0f%%",
+                      m0.value("module", std::string("?")).c_str(), m0.value("pct", 0.0));
+        hot = buf;
+    }
+    st.toast(ui::ToastLevel::Info,
+             "Profiler: " + std::to_string(samples) + " samples" + hot +
+             " → " + dir + " (open modeling.speedscope.json at speedscope.app)");
+    st.addLog("[prof] report written to " + dir);
 }
 
 void ecadNewDoc(AppState& st, const char* kind) {
@@ -889,6 +949,9 @@ int run_gui(const char* screenshotPath) {
         ui::PropertyManager& propertyManager = *st.propertyManager;
         ui::SketchMode&      sketchMode      = *st.sketchMode;
         ui::EvaluateDialogs& evaluateDialogs = *st.evaluateDialogs;
+        // Evaluate > Profiler: global, document-independent — handle before any lockout so it can be
+        // toggled at any time (including mid-edit, which is exactly when you want to profile).
+        if (std::strcmp(cmd_id, "prof_toggle") == 0) { toggleProfiler(st); return; }
         // Simulation lockout: while the Simulation workspace is active the model is frozen — a study's
         // fixtures/loads/results are tied to the current geometry, so changing the part's shape from
         // under them is disallowed (SolidWorks freezes the model inside a study the same way). We block
@@ -2482,8 +2545,12 @@ int run_gui(const char* screenshotPath) {
             else if (!nowInSketch && s_wasInSketch) st.ribbonTab = AppState::RT_Features;
             s_wasInSketch = nowInSketch;
         }
-        // C40: accent-highlight the armed sketch tool's ribbon button.
-        ui::setRibbonActiveCmd(st.sketchMode->activeToolCmd());
+        // C40: accent-highlight the armed sketch tool's ribbon button. When the profiler is
+        // running (and no sketch tool is armed) highlight the Profiler button instead, so its
+        // ON state is visible at a glance.
+        const char* activeCmd = st.sketchMode->activeToolCmd();
+        if (st.profilerRunning && (!activeCmd || !*activeCmd)) activeCmd = "prof_toggle";
+        ui::setRibbonActiveCmd(activeCmd);
         // Sketch tab swaps Exit Sketch <-> New Sketch depending on whether a sketch is being edited.
         ui::setRibbonSketchActive(st.sketchMode->active());
         float ribbonH = ui::drawRibbon(st.ribbonTab, st.showRibbon,

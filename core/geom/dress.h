@@ -30,6 +30,7 @@
 #pragma once
 
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -81,11 +82,17 @@ TopoDS_Shape chamfer_edges_two_distance(const TopoDS_Shape& shape, double d1, do
 // --- shell (hollow to a wall) + draft (taper faces) — port of dress.py/draft.py ---
 
 // Hollow `body` to a wall of thickness `t`. `remove` faces become the open mouths of
-// the shell (empty -> a fully-closed hollow); `outward` thickens outward (+t) instead
-// of the SolidWorks default inward (-t). BRepOffsetAPI_MakeThickSolid (MakeThickSolidByJoin
-// with offset sign per `outward`). Tries an Arc join first, then falls back to an
-// Intersection join + looser tolerance for curved/B-spline skins. Empty shape on
-// kernel failure (after all strategies).
+// the shell; `outward` thickens outward (+t) instead of the SolidWorks default inward
+// (-t).
+//   OPEN shell (`remove` non-empty): BRepOffsetAPI_MakeThickSolid::MakeThickSolidByJoin
+//     opens the removed faces and offsets the remaining skin (Arc join first, then an
+//     Intersection join + looser tolerance for curved/B-spline skins).
+//   CLOSED shell (`remove` EMPTY = a fully-sealed hollow part, e.g. a hollow ball /
+//     sealed enclosure): MakeThickSolidByJoin no-ops with no faces to open (it hands
+//     back the original solid), so this case instead builds an offset solid
+//     (PerformByJoin by ±t) and BOOLEAN-CUTs it against the original to leave a closed
+//     wall of thickness `t` (a 40^3 box at t=2 -> 40^3-36^3 = 17344, sealed cavity).
+// Empty shape on kernel failure (after all strategies).
 TopoDS_Shape shell_solid(const TopoDS_Shape& body, double t, bool outward,
                          const std::vector<TopoDS_Face>& remove);
 
@@ -96,10 +103,14 @@ bool has_freeform_faces(const TopoDS_Shape& shape);
 
 // Taper the given `faces` of `body` by `angle_rad` about the neutral plane
 // (`neutral_pt`, `neutral_n`), pulled along `pull` (BRepOffsetAPI_DraftAngle::Add per
-// face). Each face tilts about the line where it meets the neutral plane. Empty shape
-// on kernel failure. (neutral_plane mode only; parting_line/step are deferred.)
+// face). Each face tilts about the line where it meets the neutral plane. Faces OCCT
+// cannot draft about this plane (e.g. caps parallel to it) are SKIPPED so a valid
+// subset still drafts; returns an empty shape only when NO face is draftable or the
+// kernel build fails, with the reason written to `*diag` (if non-null) for an
+// actionable error. (neutral_plane mode only; parting_line/step are deferred.)
 TopoDS_Shape draft_faces(const TopoDS_Shape& body, const std::vector<TopoDS_Face>& faces,
                          const Eigen::Vector3d& neutral_pt, const Eigen::Vector3d& neutral_n,
-                         const Eigen::Vector3d& pull, double angle_rad);
+                         const Eigen::Vector3d& pull, double angle_rad,
+                         std::string* diag = nullptr);
 
 }  // namespace geom

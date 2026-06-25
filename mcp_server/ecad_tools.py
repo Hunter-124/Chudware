@@ -34,7 +34,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from engine.ecad import netlist as netlist_mod
 from engine.ecad import schema
@@ -55,6 +55,18 @@ _ECAD: dict = {
     "current": None,       # doc_id of the MOST-RECENTLY active doc (either kind) — what status defaults to
     "out_dir": None,       # last export directory used
 }
+
+# Provider-plan serialization for ecad_design (Bug E4). The ENGINE state is fully per-doc (the
+# session registry is a doc_id-keyed dict; no global lock), so parallel ecad_design calls do not
+# block each other — UNLESS each fires a provider plan at the SAME single-threaded local model
+# server, where the second request queues behind the first and BOTH burn the full plan budget,
+# overrunning the MCP request deadline (-32001). This NON-BLOCKING flag lets a concurrent
+# ecad_design see the provider is busy and take the instant, deterministic recipe path instead of
+# stacking provider latency. A plain bool guarded by a Lock (no waiting) — the recipe path always
+# produces a verified schematic, so skipping the model here only costs the model's topology choice.
+import threading as _threading
+_PROVIDER_PLAN_LOCK = _threading.Lock()
+_PROVIDER_PLAN_BUSY = {"v": False}
 
 
 # --------------------------------------------------------------------------- small helpers
@@ -357,26 +369,46 @@ def register_ecad_tools(mcp) -> None:
     @mcp.tool()
     def ecad_place_symbol(libid: str, x: float = 0.0, y: float = 0.0,
                           ref: str = "", value: str = "",
-                          angle: float = 0.0, doc_id: str = "") -> str:
+                          angle: float = 0.0, footprint: str = "", doc_id: str = "") -> str:
         """Place a symbol on the active schematic and return its assigned REF plus its full PIN
         LIST (name/number/type/world-xy) and the count of pins still unconnected.
 
         The pin list is the context you need to wire: each pin's world ``xy`` is where a wire must
         reach, and ``net`` tells you what it already touches. ``value`` matters for simulation —
         a resistor needs e.g. '1k', a voltage source '5' — set it now or with ecad_set later.
-        ``ref`` auto-assigns (R1, R2, ...) if omitted.
+        ``ref`` auto-assigns (R1, R2, ...) if omitted. ``footprint`` (an fpid like
+        'Resistor_SMD:R_0603') makes the part board-ready for ecad_update_from_sch; omit it and a
+        sane default for the part's libid is used automatically when you sync to a board.
         """
         try:
             session = _get_sch(doc_id or None)
         except OpError as e:
             return _err(e.message, hint="Open a schematic first.",
                         next_actions=["ecad_new_schematic('mydesign')"])
+        # E7: Validate libid resolves BEFORE dispatching the op. An unresolvable libid would
+        # silently produce a 2-pin stub with ok:true, which then corrupts the netlist. Fail fast
+        # with a clear error and direct the user to ecad_find_part.
+        from engine.ecad import library as _lib
+        if _lib.resolve(libid) is None:
+            keyword = libid.split(":")[-1] if ":" in libid else libid
+            return _err(
+                f"unknown library part {libid!r} — use ecad_find_part to find a real libid",
+                hint=(f"'{libid}' is not in the component library. "
+                      f"Run ecad_find_part('{keyword}') to discover the correct libid."),
+                next_actions=[
+                    f"ecad_find_part('{keyword}')  # search for the correct libid",
+                    "ecad_find_part('resistor')  # browse common parts",
+                ],
+                libid=libid,
+            )
         op: dict = {"op": "sch_add_symbol", "libid": libid, "pos": [float(x), float(y)],
                     "angle": float(angle)}
         if ref:
             op["ref"] = ref
         if value:
             op["value"] = value
+        if footprint:
+            op["footprint"] = footprint
         try:
             resp = _apply(session, [op])
         except OpError as e:
@@ -1055,7 +1087,8 @@ def register_ecad_tools(mcp) -> None:
     # ---------------------------------------------------------------- autoroute
 
     @mcp.tool()
-    def ecad_autoroute(pitch: float = 0.0, diff_pairs: Optional[list] = None,
+    def ecad_autoroute(pitch: float = 0.0,
+                       diff_pairs: Optional[Union[list, str]] = None,
                        ripup_passes: int = 2, doc_id: str = "") -> str:
         """Auto-route the active board's ratsnest with a basic 2-layer grid (Lee/A*) router.
 
@@ -1085,8 +1118,11 @@ def register_ecad_tools(mcp) -> None:
         if pitch and pitch > 0:
             opts["pitch"] = float(pitch)
         opts["ripup_passes"] = max(0, int(ripup_passes))
-        # diff_pairs: None/'auto' -> let the router auto-detect; a list -> pass through
-        if diff_pairs is not None and diff_pairs != "auto":
+        # diff_pairs: None/'auto'/'' -> let the router auto-detect; a list -> pass through
+        # M3: diff_pairs may be the string 'auto' (documented alias for auto-detect);
+        # treat any non-list value as "auto" so callers that pass 'auto' don't get a
+        # Pydantic/iteration error trying to iterate over a string.
+        if diff_pairs is not None and not isinstance(diff_pairs, str):
             opts["diff_pairs"] = [[str(p), str(n)] for p, n in (
                 (entry[0], entry[1]) for entry in diff_pairs if len(entry) >= 2)]
         try:
@@ -1356,14 +1392,19 @@ def register_ecad_tools(mcp) -> None:
                 os.makedirs(os.path.dirname(fp) or ".", exist_ok=True)
                 with open(fp, "w", encoding="utf-8") as fh:
                     fh.write(text)
-                result = {"kind": "bom", "path": fp, "rows": text.count("\n")}
+                # M5: text.count("\n") includes the header line; subtract 1 to report
+                # only DATA rows (the meaningful count for a 5-component board = 5, not 6).
+                result = {"kind": "bom", "path": fp,
+                          "rows": max(0, text.count("\n") - 1)}
             elif kind == "placement":
                 text = fab.write_placement(doc)
                 fp = path or os.path.join(out_dir, "placement.csv")
                 os.makedirs(os.path.dirname(fp) or ".", exist_ok=True)
                 with open(fp, "w", encoding="utf-8") as fh:
                     fh.write(text)
-                result = {"kind": "placement", "path": fp, "rows": text.count("\n")}
+                # M5: same header-line subtraction for placement CSV
+                result = {"kind": "placement", "path": fp,
+                          "rows": max(0, text.count("\n") - 1)}
             else:
                 return _err(f"unknown export kind {kind!r}",
                             hint="Use 'gerber', 'drill', 'bom', or 'placement'.",
@@ -1481,12 +1522,57 @@ def register_ecad_tools(mcp) -> None:
         except Exception:  # noqa: BLE001 -- offline / unconfigured / module absent
             pass
 
-        try:
-            run = _orch.run_design(request, provider=provider)
-        except Exception as exc:  # noqa: BLE001
-            return _err(f"ecad_design failed: {type(exc).__name__}: {exc}",
-                        hint="Check that engine.ecad.orchestrator and its deps are available.",
-                        next_actions=["ecad_status()"])
+        # The model-planning stage can stall on a slow/loading local server (LM Studio,
+        # llama.cpp) well past the MCP request budget — and ecad_design must ALWAYS return a
+        # verified schematic. Run the provider-backed plan in a worker thread with a hard
+        # wall-clock deadline; if it overruns, fall back to the deterministic recipe path
+        # (provider=None) which is instant. The abandoned thread's finite provider timeout
+        # lets it die on its own rather than lingering.
+        import threading
+
+        _PLAN_BUDGET_S = 22.0
+        box: dict = {}
+
+        def _worker():
+            try:
+                box["run"] = _orch.run_design(request, provider=provider)
+            except Exception as exc:  # noqa: BLE001
+                box["err"] = exc
+
+        # Only ONE provider plan runs at a time (Bug E4): if another ecad_design already holds the
+        # provider, this call takes the instant recipe path rather than queueing behind it on a
+        # single-threaded local model server (which would overrun the MCP deadline). The flag is
+        # claimed without blocking and always released in finally.
+        provider_busy = False
+        if provider is not None:
+            with _PROVIDER_PLAN_LOCK:
+                if _PROVIDER_PLAN_BUSY["v"]:
+                    provider_busy = True
+                else:
+                    _PROVIDER_PLAN_BUSY["v"] = True
+
+        provider_timed_out = False
+        if provider is not None and not provider_busy:
+            th = threading.Thread(target=_worker, daemon=True)
+            th.start()
+            th.join(_PLAN_BUDGET_S)
+            if th.is_alive():
+                provider_timed_out = True
+            with _PROVIDER_PLAN_LOCK:
+                _PROVIDER_PLAN_BUSY["v"] = False
+        elif provider is None:
+            _worker()
+        # provider_busy: leave box empty -> recipe fallback below (instant).
+
+        run = box.get("run")
+        if run is None:
+            # Provider path overran or errored — use the deterministic recipe fallback.
+            try:
+                run = _orch.run_design(request, provider=None)
+            except Exception as exc:  # noqa: BLE001
+                return _err(f"ecad_design failed: {type(exc).__name__}: {exc}",
+                            hint="Check that engine.ecad.orchestrator and its deps are available.",
+                            next_actions=["ecad_status()"])
 
         doc_id: str | None = run.doc_id
 
@@ -1520,7 +1606,10 @@ def register_ecad_tools(mcp) -> None:
             elif sim.get("log"):
                 sim_line = sim["log"][-1] if sim["log"] else ""
 
-        hint = (f"Design '{request}' produced with stop_reason={stop!r}. "
+        hint = ((f"The configured model server did not plan within {_PLAN_BUDGET_S:.0f}s — used "
+                 "the built-in recipe instead (it is loading/slow; the schematic is still verified). "
+                 if provider_timed_out else "")
+                + f"Design '{request}' produced with stop_reason={stop!r}. "
                 + (f"Recipe fallback used: {recipe!r}. " if recipe else "")
                 + (f"ERC: {erc.get('errors', 0)} error(s), "
                    f"{erc.get('warnings', 0)} warning(s). " if erc else "")
@@ -1950,15 +2039,30 @@ def register_ecad_tools(mcp) -> None:
         Sets _ECAD['current_pcb'] to the produced board so ecad_status / ecad_run_drc /
         ecad_export work immediately after.
 
+        ``doc_id`` selects WHICH schematic to build the board from (defaults to the active
+        schematic). Pass it when you have several schematics open and want a board from a specific
+        one (Bug E5: this argument was previously ignored).
+
         Finishes with a hint: "call ecad_to_3d to bring the board into the CAD app for a housing".
         """
-        sch_id = _ECAD.get("current_sch")
+        sch_id = doc_id or _ECAD.get("current_sch")
         if sch_id is None:
             return _err("no active schematic -- build one first",
                         hint="Create a schematic (ecad_new_schematic + place + wire parts) before "
                              "calling ecad_make_board.",
                         next_actions=["ecad_new_schematic('mydesign')",
                                       "ecad_design('your circuit description')"])
+        # Validate the requested schematic resolves and IS a schematic (a clear error beats
+        # silently building an empty board from a bad/board doc_id).
+        try:
+            sch_sess = ecad_session.get_session(sch_id)
+            if sch_sess.kind != "sch":
+                return _err(f"doc '{sch_id}' is a {sch_sess.kind}, not a schematic",
+                            hint="Pass the doc_id of a SCHEMATIC to build the board from.",
+                            next_actions=["ecad_status()"])
+        except OpError as e:
+            return _err(e.message, hint="That schematic doc_id is not open.",
+                        next_actions=["ecad_new_schematic('mydesign')"])
 
         steps: list[dict] = []
 
@@ -2006,6 +2110,34 @@ def register_ecad_tools(mcp) -> None:
         except OpError as e:
             _step("autoroute", {"ok": False}, f"FAILED: {e.message}")
             routed = []; failed = []
+
+        # M4: compute the true routed-net count = multi-pad nets with NO remaining airwires.
+        # The autorouter's ``routed`` list only includes nets that HAD airwires and the
+        # router successfully connected them; single-pad stubs and zone-only nets are never
+        # in the list.  We count all board nets that are NOT in ``failed`` (unrouted) and
+        # have at least 2 pads (so single-pad stubs don't inflate the "routed" figure).
+        try:
+            _pcb_doc_now = pcb_sess.doc
+            _all_board_nets = {
+                n.get("name") for n in _pcb_doc_now.get("nets", [])
+                if isinstance(n, dict) and n.get("name")
+            }
+            # count pads per net
+            from collections import Counter as _Counter
+            _pad_net_counts: _Counter = _Counter()
+            for _fp in _pcb_doc_now.get("footprints", []):
+                for _pad in _fp.get("pads", []):
+                    _pn = _pad.get("net")
+                    if _pn:
+                        _pad_net_counts[_pn] += 1
+            # a net is "multi-pad" when it has >= 2 pads (i.e. needs a connection)
+            _multi_pad_nets = {n for n, c in _pad_net_counts.items() if c >= 2}
+            _failed_set = set(failed)
+            _nets_routed_count = len(_multi_pad_nets - _failed_set)
+            _nets_failed_count = len(_multi_pad_nets & _failed_set)
+        except Exception:  # noqa: BLE001
+            _nets_routed_count = len(routed)
+            _nets_failed_count = len(failed)
 
         # ---- 3.5 board outline (auto Edge.Cuts rectangle if none) ----
         # The one-shot flow must leave a closed Edge.Cuts loop: ecad_to_3d needs it to
@@ -2091,7 +2223,12 @@ def register_ecad_tools(mcp) -> None:
             "sch_doc_id": sch_id, "pcb_name": pcb_name,
             "steps": steps, "reading": reading,
             "footprints_placed": len(added),
-            "nets_routed": len(routed), "nets_failed": len(failed),
+            # M4: nets_routed = multi-pad nets with no remaining airwires (all connected).
+            # nets_autorouted = nets the router actively connected in this run (subset).
+            # nets_failed = multi-pad nets that still have unrouted airwires.
+            "nets_routed": _nets_routed_count,
+            "nets_autorouted": len(routed),
+            "nets_failed": _nets_failed_count,
             "drc_errors": drc_errors, "drc_warnings": drc_warnings,
             "drc_violations": drc_lines,
             "warnings": drc_lines[:3],
@@ -2158,7 +2295,10 @@ def _build_analysis(analysis: str, params: dict, circuit: dict) -> dict | None:
         inner_params = params.get("inner_params", {})
         inner_an = _build_analysis(inner_name, inner_params, circuit) or {"type": "op"}
         vals = params.get("values", [-40.0, 27.0, 85.0])
-        return {"type": "temp", "values": [float(v) for v in vals], "analysis": inner_an}
+        # Carry the requested probe so the temp-sweep trend reports the node the caller asked for,
+        # not just the first node in probe_list (Bug E8).
+        return {"type": "temp", "values": [float(v) for v in vals], "analysis": inner_an,
+                "probe": params.get("probe")}
     if a == "noise":
         return {"type": "noise",
                 "output": params.get("output", "V(OUT)"),
@@ -2273,14 +2413,20 @@ def _simulate_advanced(session, circuit: dict, an: dict, probe_list: list[str],
         })
 
     if atype == "temp":
-        study = {"analyses": [an], "probes": probe_list}
+        # Honor the caller's requested probe (Bug E8): build the simulated probe set so the
+        # requested probe is included, and report the trend for THAT probe (not just probe_list[0]).
+        req_probe = an.get("probe")
+        sim_probes = list(probe_list)
+        if req_probe and req_probe not in sim_probes:
+            sim_probes = [req_probe] + sim_probes
+        study = {"analyses": [an], "probes": sim_probes}
         result = sim_run(circuit, study)
         temp_res = result.get("temp", {})
         conv = bool(result.get("convergence", {}).get("temp", False))
         points_data = temp_res.get("points", [])
         temps = temp_res.get("values", [])
-        # Summarise the first probe across temperatures.
-        probe_used = probe_list[0] if probe_list else None
+        # Summarise the requested probe across temperatures (else the first probe).
+        probe_used = req_probe or (probe_list[0] if probe_list else None)
         trend_vals: list[tuple[float, float]] = []
         for pt in points_data:
             op = pt.get("op", {})
@@ -2350,9 +2496,11 @@ def _simulate_advanced(session, circuit: dict, an: dict, probe_list: list[str],
             "converged": conv,
             "device_count": len(circuit["devices"]),
             "output": output,
-            "total_noise_rms": _round(total_rms),
-            "peak_density_v_sqrthz": _round(peak_density),
-            "per_resistor_rms": {k: _round(v) for k, v in per_r.items()},
+            # Significant-figure rounding so micro/nano-scale noise figures don't collapse to 0.0
+            # (Bug E9: _round to 4 decimals zeroed a 9.1 uVrms total).
+            "total_noise_rms": _round_sig(total_rms),
+            "peak_density_v_sqrthz": _round_sig(peak_density),
+            "per_resistor_rms": {k: _round_sig(v) for k, v in per_r.items()},
             "dominant_source": dominant_r,
             "noise": {k: v for k, v in noise.items() if k not in ("onoise_spectrum", "onoise_psd")},
             "reading": reading,
@@ -2386,6 +2534,24 @@ def _round(v: Any, n: int = 4) -> Any:
         return round(f, n)
     except Exception:  # noqa: BLE001
         return v
+
+
+def _round_sig(v: Any, sig: int = 4) -> Any:
+    """Round to *sig* SIGNIFICANT figures (not decimal places) so very small magnitudes survive.
+
+    ``_round`` truncates to 4 decimals, which silently zeroes micro/nano-scale values (e.g. a
+    9.1 uVrms noise figure rounds to 0.0 — Bug E9). This keeps the leading significant digits for
+    any magnitude. Returns ``None`` for non-finite, passes non-numerics through."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return v
+    if not math.isfinite(f):
+        return None
+    if f == 0.0:
+        return 0.0
+    exp = math.floor(math.log10(abs(f)))
+    return round(f, max(0, sig - 1 - exp))
 
 
 def _eng(v: float) -> str:

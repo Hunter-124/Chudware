@@ -85,13 +85,18 @@
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_Sewing.hxx>
+#include <BRepCheck_Analyzer.hxx>
+#include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepTools.hxx>
+#include <GProp_GProps.hxx>
 #include <IFSelect_ReturnStatus.hxx>
+#include <IGESControl_Controller.hxx>
 #include <IGESControl_Reader.hxx>
 #include <IGESControl_Writer.hxx>
+#include <Interface_Static.hxx>
 #include <Message_ProgressRange.hxx>
 #include <Poly_Triangulation.hxx>
 #include <RWGltf_CafReader.hxx>
@@ -146,6 +151,94 @@ TopoDS_Shape as_compound(const std::vector<TopoDS_Shape>& bodies) {
     for (const TopoDS_Shape& s : bodies)
         if (!s.IsNull()) bb.Add(comp, s);
     return comp;
+}
+
+// Sew the export bodies into a watertight B-rep (shell promoted to SOLID when closed),
+// used by the IGES writer. IGESControl_Writer in BRep mode (write.iges.brep.mode=1) emits
+// a real manifold_solid_brep ONLY when it is handed a SOLID — a bare COMPOUND of loose
+// FACEs writes as disconnected trimmed surfaces that DON'T sew back into a closed solid on
+// re-import (the P2 bug: re-read came back as no body / an open shell of volume 0). Sewing
+// here guarantees the writer sees one closed solid per lump. as_compound is kept for the
+// face-mode/default callers; this is the BRep-mode preparation. A single already-solid body
+// is returned unchanged; a truly open surface body falls through as the sewn shell so
+// surfaces still export (just not as a closed solid).
+TopoDS_Shape as_sewn_solid(const std::vector<TopoDS_Shape>& bodies) {
+    // Collect the existing solids first — if every body is already a solid we hand them
+    // straight to the writer (no need to re-sew good geometry).
+    std::vector<TopoDS_Shape> solids;
+    bool any_non_solid = false;
+    for (const TopoDS_Shape& b : bodies) {
+        if (b.IsNull()) continue;
+        bool had_solid = false;
+        for (TopExp_Explorer ex(b, TopAbs_SOLID); ex.More(); ex.Next()) {
+            solids.push_back(ex.Current());
+            had_solid = true;
+        }
+        if (!had_solid) any_non_solid = true;
+    }
+    if (!any_non_solid && !solids.empty())
+        return as_compound(solids);  // already-solid bodies: write them as-is
+
+    // Otherwise sew every face of every body into shells, then promote closed shells to
+    // solids (the same as_solid path used by mesh_to_shape / IGES import). The tolerance
+    // matches the IGES import sewer (0.01) so a body we just wrote re-sews on re-read.
+    BRepBuilderAPI_Sewing sew(0.01);
+    int added = 0;
+    for (const TopoDS_Shape& b : bodies) {
+        if (b.IsNull()) continue;
+        sew.Add(b);
+        ++added;
+    }
+    if (added == 0) return as_compound(bodies);
+    sew.Perform();
+    TopoDS_Shape sewn = sew.SewedShape();
+    if (sewn.IsNull()) return as_compound(bodies);
+    TopoDS_Compound out;
+    BRep_Builder bb;
+    bb.MakeCompound(out);
+    int n_added = 0;
+    for (TopExp_Explorer ex(sewn, TopAbs_SHELL); ex.More(); ex.Next()) {
+        TopoDS_Shell shell = TopoDS::Shell(ex.Current());
+        TopoDS_Shape unit = shell;
+        if (BRep_Tool::IsClosed(shell)) {
+            try {
+                BRepBuilderAPI_MakeSolid ms(shell);
+                if (ms.IsDone()) {
+                    ShapeFix_Solid sfix;
+                    TopoDS_Shape solid = sfix.SolidFromShell(shell);
+                    unit = solid.IsNull() ? TopoDS_Shape(ms.Solid()) : solid;
+                }
+            } catch (const Standard_Failure&) {
+                unit = shell;  // leave a problematic shell as a shell
+            }
+        }
+        bb.Add(out, unit);
+        ++n_added;
+    }
+    if (n_added == 0) return sewn;             // no shells (free faces only) — write what we sewed
+    if (n_added == 1) {
+        // Unwrap the single unit out of the compound so the writer sees a bare SOLID.
+        for (TopExp_Explorer ex(out, TopAbs_SOLID); ex.More(); ex.Next()) return ex.Current();
+        for (TopExp_Explorer ex(out, TopAbs_SHELL); ex.More(); ex.Next()) return ex.Current();
+    }
+    return out;
+}
+
+// True iff a re-read IGES shape carries at least one topologically-valid SOLID with a
+// non-zero (closed) volume. This is the HONEST round-trip check for IGES: the writer can
+// claim success while emitting trimmed surfaces that re-import as an open shell of volume 0,
+// so we re-read the file and require a real closed solid before reporting validated.
+bool iges_reread_has_closed_solid(const TopoDS_Shape& shape) {
+    if (shape.IsNull()) return false;
+    bool any = false;
+    for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next()) {
+        const TopoDS_Shape solid = ex.Current();
+        if (!BRepCheck_Analyzer(solid).IsValid()) continue;
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(solid, props);
+        if (std::abs(props.Mass()) > 1e-9) { any = true; break; }
+    }
+    return any;
 }
 
 // Tessellate a shape in place at the requested quality so a mesh writer has a
@@ -1142,18 +1235,104 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
     try {
         if (fmt == "step") {
             STEPControl_Writer w;
-            if (w.Transfer(shape, STEPControl_AsIs) != IFSelect_RetDone)
-                throw OpError("export_failed", "STEP writer: transfer failed", {{"format", fmt}});
+            // Transfer one SOLID at a time, not the whole COMPOUND AsIs (Issue 3). A boolean
+            // result body can be a compound of DISJOINT LUMPS (e.g. a steering body: knuckles +
+            // tie rod + column + handlebar); transferring that compound AsIs can emit a single
+            // malformed manifold_solid_brep that re-reads as one INVALID solid, so the export
+            // self-validation rejects the file even though .brep/.step+ wrote it fine. Exploding
+            // to individual solids writes each lump as its own valid STEP solid (an implicit
+            // STEP assembly), and a re-read recovers them all. A body with NO solid (an open
+            // sheet/shell surface body) is transferred as-is so surfaces still export.
+            std::vector<TopoDS_Shape> units;
+            for (const TopoDS_Shape& b : bodies) {
+                if (b.IsNull()) continue;
+                bool any_solid = false;
+                for (TopExp_Explorer ex(b, TopAbs_SOLID); ex.More(); ex.Next()) {
+                    units.push_back(ex.Current());
+                    any_solid = true;
+                }
+                if (!any_solid) units.push_back(b);
+            }
+            if (units.empty()) units.push_back(shape);
+            for (const TopoDS_Shape& u : units)
+                if (w.Transfer(u, STEPControl_AsIs) != IFSelect_RetDone)
+                    throw OpError("export_failed", "STEP writer: transfer failed", {{"format", fmt}});
             if (w.Write(out.c_str()) != IFSelect_RetDone)
                 throw OpError("export_failed", "STEP writer: write failed", {{"path", out}});
             return out;
         }
         if (fmt == "iges") {
-            IGESControl_Writer w;
-            w.AddShape(shape);
+            // P2 fix — make IGES round-trip as a SOLID, not loose trimmed surfaces.
+            //
+            // The default IGESControl_Writer writes in FACE mode (write.iges.brep.mode=0):
+            // each face becomes an independent trimmed-surface entity (IGES type 144). On
+            // re-import those surfaces DON'T sew back into a closed solid, so a re-read came
+            // back as NO body (one part) or an OPEN shell of volume 0 with free edges
+            // (another) — while the writer still reported success. Two changes fix it:
+            //   (1) Switch the writer to BRep mode so it emits manifold_solid_brep entities
+            //       (IGES 186) that re-import AS solids. Init() registers the IGES static
+            //       parameters first (otherwise SetIVal has nothing to set), then we flip
+            //       write.iges.brep.mode=1 BEFORE constructing the writer (it snapshots the
+            //       mode at construction).
+            //   (2) Hand the writer a SEWN solid, not the bare compound: BRep mode only emits
+            //       a real solid when it is given a TopoDS_Solid, and a boolean-result body
+            //       can be a compound of loose faces. as_sewn_solid sews + promotes closed
+            //       shells to solids so the writer always sees watertight geometry.
+            IGESControl_Controller::Init();
+            Interface_Static::SetIVal("write.iges.brep.mode", 1);
+            const TopoDS_Shape iges_shape = as_sewn_solid(bodies);
+            IGESControl_Writer w("MM", /*modecr=*/1);  // unit mm, BRep write mode
+            w.AddShape(iges_shape);
             w.ComputeModel();
             if (!w.Write(out.c_str()))
                 throw OpError("export_failed", "IGES writer returned failure", {{"path", out}});
+
+            // Did the INPUT contain a closed solid? Only then do we DEMAND that a solid
+            // round-trips — a legitimate open surface/sheet body has no solid to recover, so
+            // writing its surfaces is the correct outcome (not an error). This keeps surface
+            // export working while making the solid case honest.
+            bool expected_solid = false;
+            for (const TopoDS_Shape& b : bodies) {
+                if (b.IsNull()) continue;
+                if (TopExp_Explorer(b, TopAbs_SOLID).More()) { expected_solid = true; break; }
+            }
+
+            // HONEST round-trip validation (independent of the brep.mode success above). Even
+            // in BRep mode a degenerate body could fail to recover, so we RE-READ the file we
+            // just wrote and, when a solid was expected, require a topologically-valid closed
+            // solid before returning. If it doesn't round-trip, throw export_failed here — the
+            // caller (doc_export_file) runs this BEFORE it sets meta["validated"], so a throw
+            // guarantees we never report a false validated:true for an IGES file that comes
+            // back as no body / an open shell of volume 0.
+            try {
+                auto reread = import_bodies(out, "iges");
+                if (reread.empty())
+                    throw OpError("export_failed",
+                                  "IGES export wrote " + out + " but re-reading it recovered no "
+                                  "bodies — the file is incomplete or malformed and would not "
+                                  "open elsewhere",
+                                  {{"path", out}, {"format", fmt}});
+                if (expected_solid) {
+                    bool ok = false;
+                    for (const auto& nb : reread)
+                        if (iges_reread_has_closed_solid(nb.second)) { ok = true; break; }
+                    if (!ok)
+                        throw OpError("export_failed",
+                                      "IGES export wrote " + out + " but re-reading it recovered no "
+                                      "valid closed solid (the file would re-import as no body or "
+                                      "an open shell of volume 0) — IGES is lossy for this "
+                                      "geometry; use STEP for a guaranteed solid round-trip",
+                                      {{"path", out}, {"format", fmt}});
+                }
+            } catch (const OpError&) {
+                throw;
+            } catch (const std::exception& e) {
+                throw OpError("export_failed",
+                              std::string("IGES export ") + out +
+                                  " failed round-trip validation (not re-openable as a solid): " +
+                                  e.what(),
+                              {{"path", out}, {"format", fmt}});
+            }
             return out;
         }
         if (fmt == "brep") {
@@ -1309,7 +1488,28 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
             ShapeFix_Shape fix(sewn);
             fix.Perform();
             TopoDS_Shape fixed = fix.Shape();
-            return name_bodies(split_solids(fixed.IsNull() ? raw : fixed));
+            if (fixed.IsNull()) fixed = raw;
+            // Promote any closed shells to solids (same pattern as mesh_to_shape).
+            // Without this step, IGES returns a surface shell with volume=0 even for
+            // geometrically-closed bodies, because split_solids only finds TopAbs_SOLID.
+            TopoDS_Shape promoted = fixed;
+            for (TopExp_Explorer ex(fixed, TopAbs_SHELL); ex.More(); ex.Next()) {
+                TopoDS_Shell shell = TopoDS::Shell(ex.Current());
+                if (BRep_Tool::IsClosed(shell)) {
+                    try {
+                        BRepBuilderAPI_MakeSolid ms(shell);
+                        if (ms.IsDone()) {
+                            ShapeFix_Solid sfix;
+                            TopoDS_Shape solid = sfix.SolidFromShell(shell);
+                            promoted = solid.IsNull() ? TopoDS_Shape(ms.Solid()) : solid;
+                        }
+                    } catch (const Standard_Failure&) {
+                        // leave as shell — truly open surfaces stay shells
+                    }
+                    break;  // single closed shell is the common IGES case
+                }
+            }
+            return name_bodies(split_solids(promoted));
         }
         if (fmt == "brep") {
             TopoDS_Shape shape;

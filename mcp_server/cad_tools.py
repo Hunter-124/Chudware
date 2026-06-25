@@ -40,14 +40,30 @@ from .core_bridge import CoreError
 # doc_id). Mirrors the old server's _STATE, but the doc lives in the C++ core, not here.
 _CUR: dict = {"doc_id": None}
 
+# doc_id STABILITY across an autosave-recovery (Issue 1). When a transport timeout kills the
+# server and it restarts, recovery reopens each autosaved .step+ — which the engine assigns a
+# FRESH doc_id (the per-process counter doesn't reset). Any doc_id the agent was holding would
+# then be dead. We map the ORIGINAL id (the autosave filename stem) -> the new live id here, so
+# an old handle the agent passes still resolves to the recovered document instead of erroring.
+_DOC_ALIASES: dict = {}
+
 
 # --------------------------------------------------------------------------- helpers
+
+def _resolve_alias(doc_id: str) -> str:
+    """Follow the recovery alias chain so a stale (pre-restart) doc_id resolves to the live one."""
+    seen: set = set()
+    while doc_id in _DOC_ALIASES and doc_id not in seen:
+        seen.add(doc_id)
+        doc_id = _DOC_ALIASES[doc_id]
+    return doc_id
+
 
 def _doc(doc_id: Optional[str]) -> str:
     d = doc_id or _CUR["doc_id"]
     if not d:
         raise ValueError("No current part. Call new_part(...) first (or pass doc_id=).")
-    return d
+    return _resolve_alias(d)
 
 
 def _dumps(obj: Any) -> str:
@@ -70,6 +86,24 @@ def _tmp(suffix: str) -> str:
     fd, path = tempfile.mkstemp(suffix=suffix, prefix="aicad_mcp_")
     os.close(fd)
     return path
+
+
+def _sanitize_output_path(path: str) -> str:
+    """K3: Normalize an output path so callers see (and the engine writes to) the real,
+    resolved absolute path.
+
+    We canonicalise via os.path.abspath (which resolves '..' components and symlinks so
+    path-traversal sequences like '../../etc/passwd' are fully collapsed).  We do NOT
+    impose an allowlist root here — the MCP server runs under the user's own account so
+    writing anywhere they have permission is intentional.  What we DO guarantee is that
+    the returned path is fully resolved (no '..' components remain) so the caller always
+    knows exactly where the file will land, and the engine can't be fooled by a crafted
+    relative sequence that navigates outside an expected directory.
+
+    Raises ValueError for obviously invalid inputs (empty string, non-string)."""
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("output path must be a non-empty string")
+    return os.path.abspath(path)
 
 
 # --- live viewport handoff -------------------------------------------------------------
@@ -232,9 +266,14 @@ def recover_autosaved(scope: str = "recent") -> list:
             if did:
                 # Prefer the sidecar name; fall back to the reopened doc's own name so an
                 # untagged/legacy autosave still recovers with a real name (Bug N-6).
+                original = p.stem
                 out.append({"path": str(p), "doc_id": did,
                             "name": name or r.get("name") or "",
-                            "original_doc_id": p.stem})
+                            "original_doc_id": original})
+                # Keep the agent's old handle alive (Issue 1): the original id now aliases the
+                # freshly-allocated one, so a doc_id captured before the restart still works.
+                if original and original != did:
+                    _DOC_ALIASES[original] = did
                 _CUR["doc_id"] = did
         except Exception:  # noqa: BLE001
             continue
@@ -253,21 +292,45 @@ import uuid as _uuid  # noqa: E402
 _JOBS: dict = {}
 _JOB_LOCK = _threading.Lock()
 
+# G2/G5: completed jobs must stay retrievable for a generous window so a poll after a
+# long OpenFOAM run (which may take minutes) never returns "unknown job_id".  We keep:
+#   - ALL running jobs (never evict while in-flight)
+#   - completed/errored jobs for at least this many seconds after completion
+_JOB_DONE_TTL_S: float = float(os.environ.get("AI_CAD_JOB_TTL_S", "600") or 600)  # 10 min
+
+
+def _evict_old_jobs() -> None:
+    """Evict ONLY completed/errored jobs whose completion time is older than _JOB_DONE_TTL_S.
+    Running jobs are NEVER evicted regardless of age. Called inside _start_job so the dict
+    can't grow without bound in a long-lived server, but the eviction window is generous
+    enough that a poll right after a multi-minute OpenFOAM run still succeeds."""
+    cutoff = time.time() - _JOB_DONE_TTL_S
+    to_del = []
+    for jid, job in _JOBS.items():
+        if job["status"] in ("done", "error"):
+            done_at = job.get("done_at", 0.0)
+            if done_at and done_at < cutoff:
+                to_del.append(jid)
+    for jid in to_del:
+        del _JOBS[jid]
+
 
 def _start_job(kind: str, fn, progress: Optional[dict] = None) -> str:
     jid = "job-" + _uuid.uuid4().hex[:12]
     with _JOB_LOCK:
+        _evict_old_jobs()  # prune stale completed jobs so dict stays bounded
         _JOBS[jid] = {"status": "running", "kind": kind, "result": None, "error": None,
-                      "progress": progress if progress is not None else {}}
+                      "progress": progress if progress is not None else {},
+                      "started_at": time.time(), "done_at": None}
 
     def _run() -> None:
         try:
             res = fn()
             with _JOB_LOCK:
-                _JOBS[jid].update(status="done", result=res)
+                _JOBS[jid].update(status="done", result=res, done_at=time.time())
         except Exception as e:  # noqa: BLE001
             with _JOB_LOCK:
-                _JOBS[jid].update(status="error", error=str(e))
+                _JOBS[jid].update(status="error", error=str(e), done_at=time.time())
 
     # Daemon thread: a long OpenFOAM/FEA solve must never block server (or test) shutdown.
     _threading.Thread(target=_run, name=f"aicad-job-{kind}", daemon=True).start()
@@ -291,6 +354,10 @@ def _solve_sync_or_handoff(kind: str, fn, progress: Optional[dict] = None,
     """
     jid = _start_job(kind, fn, progress)
     deadline = time.time() + max(1.0, budget_s)
+    # Adaptive poll: start fine (10 ms) so a fast op — the common modeling case now that
+    # add_features routes through here — returns almost immediately, then back off to 100 ms so a
+    # multi-second solve doesn't spin. Heavy-op handoff at `budget_s` is unaffected.
+    interval = 0.01
     while time.time() < deadline:
         with _JOB_LOCK:
             snap = dict(_JOBS.get(jid, {}))
@@ -299,7 +366,9 @@ def _solve_sync_or_handoff(kind: str, fn, progress: Optional[dict] = None,
             return snap.get("result") or {"ok": False, "error": "no result"}
         if st == "error":
             return {"ok": False, "error": snap.get("error", "solve failed")}
-        time.sleep(0.1)
+        time.sleep(interval)
+        if interval < 0.1:
+            interval = min(0.1, interval * 1.5)
     return {"ok": True, "job_id": jid, "status": "running", "auto_backgrounded": True,
             "note": (f"solve still running after {budget_s:.0f}s — continued in the BACKGROUND "
                      f"to avoid a transport timeout (which would drop open documents). "
@@ -333,16 +402,39 @@ _MATERIAL_ALIASES: dict = {
 
 
 def _resolve_material(material: Union[str, dict, None]) -> dict:
+    """Resolve a material name or explicit dict to a validated properties dict.
+
+    Always returns a FRESH copy so callers cannot mutate the shared _MATERIALS cache
+    between runs (which would silently corrupt subsequent solves with wrong E values).
+    The returned dict is validated: E_mpa and nu must be physically plausible so a bad
+    entry is caught here rather than inside the C++ solver.
+    """
     if isinstance(material, dict):
-        return material
-    key = (material or "steel").strip().lower()
-    key = _MATERIAL_ALIASES.get(key, key)
-    if key not in _MATERIALS:
+        mat = dict(material)  # copy: caller-supplied dicts are returned as a new copy too
+    else:
+        key = (material or "steel").strip().lower()
+        key = _MATERIAL_ALIASES.get(key, key)
+        if key not in _MATERIALS:
+            raise ValueError(
+                f"Unknown material {material!r}. Known: {sorted(_MATERIALS)} "
+                f"(or pass an explicit dict with E_mpa/nu/density_g_cm3/yield_mpa)."
+            )
+        mat = dict(_MATERIALS[key])  # F4: always return a COPY, never the shared dict
+    # F4: validate that the resolved dict has physically plausible mechanical properties.
+    # A zero or missing E_mpa means the C++ will reject the study with a cryptic error;
+    # catch it here with a useful message that names the offending material.
+    E = mat.get("E_mpa", 0.0)
+    nu = mat.get("nu", -999.0)
+    if not (isinstance(E, (int, float)) and E > 0):
         raise ValueError(
-            f"Unknown material {material!r}. Known: {sorted(_MATERIALS)} "
-            f"(or pass an explicit dict with E_mpa/nu/density_g_cm3/yield_mpa)."
+            f"Material {material!r}: E_mpa must be > 0 (got {E!r}). "
+            f"Check your material dict or the _MATERIALS table."
         )
-    return _MATERIALS[key]
+    if not (isinstance(nu, (int, float)) and -1.0 < nu < 0.5):
+        raise ValueError(
+            f"Material {material!r}: nu must be in (-1, 0.5) (got {nu!r})."
+        )
+    return mat
 
 
 def _as_face_query(q: Union[str, dict]) -> dict:
@@ -350,6 +442,81 @@ def _as_face_query(q: Union[str, dict]) -> dict:
     if isinstance(q, dict):
         return q
     return {"of": "face", "side": str(q)}
+
+
+def _resolve_drawing_view_id(doc_id: str, view_id: str) -> str:
+    """D7: Accept a numeric view-id (v1, v2, …) OR an orientation string ("front", "top", …).
+
+    When the caller passes an orientation string we call drawing_get and find the first
+    non-section/non-detail view whose 'orientation' field matches (case-insensitive).
+    This mirrors how add_section_view's `parent` resolver already works, so ALL drawing
+    annotation tools accept the same flexible identifier.
+
+    Returns the resolved view_id string, or raises ValueError if no match is found.
+    """
+    if not view_id:
+        raise ValueError("view_id must be a non-empty string")
+    # If it already looks like a numeric view id (starts with 'v' + digits, or is all digits)
+    # return it unchanged.
+    if view_id.lower().startswith("v") and view_id[1:].isdigit():
+        return view_id
+    if view_id.isdigit():
+        return view_id
+    # Try to resolve as an orientation string.
+    try:
+        full = cb.call("drawing_get", {"doc_id": doc_id})
+    except Exception:
+        # Can't query the drawing — pass through and let the engine reject it.
+        return view_id
+    target = view_id.lower().strip()
+    for sh in full.get("sheets", []):
+        for v in sh.get("views", []):
+            if v.get("type") in ("section", "detail"):
+                continue
+            if (v.get("orientation", "").lower() == target
+                    or v.get("view_id", "") == view_id
+                    or v.get("id", "") == view_id):
+                return v.get("view_id") or v.get("id") or view_id
+    # No match — return original so the engine surfaces a meaningful error.
+    return view_id
+
+
+def _resolve_one_selector(doc_id: str, query: Union[str, dict], kind: Optional[str] = None) -> dict:
+    """Resolve a plain-English face/edge query to a SINGLE unambiguous topology selector dict.
+
+    eval_measure (and friends) re-resolve their refs against the whole body, so they need a
+    selector that pins down exactly ONE face/edge — the RESOLVED match dict that doc_query
+    returns (it carries the centroid/axis/area_or_len the scorer keys on), not the raw
+    plain-English predicates ({"side":"top"}). This runs doc_query, then:
+      * 1 match  -> return it (unambiguous).
+      * >1 match -> raise, because passing one of several tied matches would dangle on
+                    re-resolution ("symmetric ambiguity"). The caller should add a predicate
+                    (e.g. {"of":"edge","parallel":"z","pick":"largest"}) to single one out.
+      * 0 match  -> raise.
+    kind, when given ("face"/"edge"), filters the matches to that topology kind first.
+    """
+    q = query if isinstance(query, dict) else _as_face_query(query)
+    res = cb.call("doc_query", {"doc_id": doc_id, "query": q})
+    matches = res.get("matches", [])
+    if kind:
+        matches = [m for m in matches if m.get("kind") == kind]
+    if not matches:
+        raise ValueError(f"No {kind or 'geometry'} matched query {query!r} "
+                         f"(use query_geometry to explore).")
+    if len(matches) > 1:
+        # The C++ eval_measure (eval_resolve_ref) is now predicate-aware and breaks ties
+        # deterministically. If the query carries a TIE-BREAKING predicate (pick/index/
+        # count/near), hand it the RAW query so eval_measure applies that predicate and
+        # singles one out — e.g. pick:"longest" on a box's four equal vertical edges, which
+        # doc_query leaves tied. Without such a predicate, keep the friendly "narrow it"
+        # guidance rather than silently measuring one of several tied candidates.
+        if isinstance(q, dict) and any(k in q for k in ("pick", "index", "count", "near")):
+            return q
+        raise ValueError(
+            f"Query {query!r} matched {len(matches)} candidates, not one — measuring needs a "
+            f"single face/edge. Narrow it with a predicate (e.g. add \"pick\":\"largest\", "
+            f"\"side\":\"top\", or \"parallel\":\"z\"). query_geometry({query!r}) lists them.")
+    return matches[0]
 
 
 def _resolve_face_points(doc_id: str, query: Union[str, dict]) -> list:
@@ -553,7 +720,7 @@ def register_cad_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def add_features(ops: list, doc_id: Optional[str] = None) -> str:
+    def add_features(ops: list, doc_id: Optional[str] = None, background: bool = False) -> str:
         """Apply a list of document ops to build/edit the part (the core modeling tool).
 
         `ops` is a JSON array of ops in the vocabulary from cad_guide() — e.g.
@@ -570,69 +737,130 @@ def register_cad_tools(mcp: FastMCP) -> None:
         so you can immediately tell a dropped cut, a failed reference, or a stray extra body.
         Then call render_part() to LOOK at the result. On a validation error the whole batch is
         rejected — read `error`, fix the ops, call again.
+
+        HEAVY OPS: a costly op (a global fillet/chamfer/shell/boolean on a many-edged body) is
+        run on a worker thread and AUTO-HANDED-OFF to the background if it overruns the call
+        budget, so it can never block past the MCP transport timeout (which would otherwise drop
+        the whole session). If that happens you get {job_id, status:"running"} — poll get_job().
+        All open docs are autosaved BEFORE the op, so nothing is lost even on a hard timeout.
+        Pass background=True to hand off immediately for an op you already know is heavy.
         """
         try:
             d = _doc(doc_id)
-            # Transactional batch: snapshot first so a partial failure rolls the WHOLE batch back
-            # (the engine otherwise leaves failed features in the tree). All-or-nothing.
-            ckpt = None
-            try:
-                ckpt = cb.call("doc_checkpoint", {"doc_id": d}).get("checkpoint")
-            except Exception:  # noqa: BLE001
+
+            def _apply() -> dict:
+                # Transactional batch: snapshot first so a partial failure rolls the WHOLE batch
+                # back (the engine otherwise leaves failed features in the tree). All-or-nothing.
                 ckpt = None
-
-            r = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
-            fs = (r.get("rebuild") or {}).get("feature_status", [])
-            feats = [{"id": s.get("id"), "ok": s.get("ok"),
-                      "error": s.get("error"), "warning": s.get("warning")} for s in fs]
-            bodies = (r.get("tess") or {}).get("bodies", [])
-            ok = all(s.get("ok") for s in fs) if fs else True
-
-            if not ok and ckpt:
-                # Roll the tree back to the pre-batch revision; report WHY each feature failed.
-                reverted = False
                 try:
-                    cb.call("doc_revert", {"doc_id": d, "checkpoint": ckpt})
-                    reverted = True
+                    ckpt = cb.call("doc_checkpoint", {"doc_id": d}).get("checkpoint")
                 except Exception:  # noqa: BLE001
-                    reverted = False
-                fail = [{"id": s.get("id"), "error": s.get("error")} for s in fs
-                        if not s.get("ok")]
-                _publish_current(d)  # mirror the rolled-back (or current) state to the app
-                return _dumps({
-                    "ok": False,
-                    "doc_id": d,
-                    "rolled_back": reverted,
-                    "error": "batch rejected — no features were kept; fix and resend"
-                             if reverted else "batch failed and rollback failed",
-                    "failed_features": fail,
-                    "features": feats,
-                })
+                    ckpt = None
 
-            out = {
-                "ok": ok,
-                "doc_id": d,
-                "revision": r.get("revision"),
-                "body_count": len(bodies),
-                "volume_mm3": r.get("volume"),
-                "features": feats,
-            }
-            # Push the updated part to the desktop app's viewport (if it's open) so the user
-            # watches it build. Best-effort; only when something actually got built.
-            if ok and bodies:
-                pub = _publish_current(d)
-                if pub:
-                    out["shown_in_app"] = True
-                _autosave(d)  # persist so a server restart can recover this doc
-            return _dumps(out)
+                r = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
+                fs = (r.get("rebuild") or {}).get("feature_status", [])
+                feats = [{"id": s.get("id"), "ok": s.get("ok"),
+                          "error": s.get("error"), "warning": s.get("warning")} for s in fs]
+                bodies = (r.get("tess") or {}).get("bodies", [])
+                ok = all(s.get("ok") for s in fs) if fs else True
+
+                if not ok and ckpt:
+                    # Roll the tree back to the pre-batch revision; report WHY each feature failed.
+                    reverted = False
+                    try:
+                        cb.call("doc_revert", {"doc_id": d, "checkpoint": ckpt})
+                        reverted = True
+                    except Exception:  # noqa: BLE001
+                        reverted = False
+                    fail = [{"id": s.get("id"), "error": s.get("error")} for s in fs
+                            if not s.get("ok")]
+                    _publish_current(d)  # mirror the rolled-back (or current) state to the app
+                    return {
+                        "ok": False,
+                        "doc_id": d,
+                        "rolled_back": reverted,
+                        "error": "batch rejected — no features were kept; fix and resend"
+                                 if reverted else "batch failed and rollback failed",
+                        "failed_features": fail,
+                        "features": feats,
+                    }
+
+                out = {
+                    "ok": ok,
+                    "doc_id": d,
+                    "revision": r.get("revision"),
+                    "body_count": len(bodies),
+                    "volume_mm3": r.get("volume"),
+                    "features": feats,
+                }
+                # Push the updated part to the desktop app's viewport (if it's open) so the user
+                # watches it build. Best-effort; only when something actually got built.
+                if ok and bodies:
+                    pub = _publish_current(d)
+                    if pub:
+                        out["shown_in_app"] = True
+                    _autosave(d)  # persist so a server restart can recover this doc
+                return out
+
+            if background:
+                jid = _start_job("add_features", _apply)
+                return _dumps({"ok": True, "doc_id": d, "job_id": jid, "status": "running",
+                               "note": f"applying {len(ops)} op(s) in the background — "
+                                       f"poll get_job('{jid}')."})
+            # Run on a worker thread with auto-handoff: a fast batch returns inline exactly as
+            # before; a heavy one that overruns the budget keeps running and returns a job_id so
+            # the transport call returns in time and the session survives.
+            return _dumps(_solve_sync_or_handoff("add_features", _apply))
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
     @mcp.tool()
-    def get_part(doc_id: Optional[str] = None) -> str:
-        """Return the current feature tree (features, parameters, ids) + revision for editing."""
+    def get_part(doc_id: Optional[str] = None, summary: bool = False) -> str:
+        """Return the feature tree (features, parameters, ids) + revision for editing.
+
+        summary=True returns a LIGHTWEIGHT tree — feature id/name/type/suppressed + parameters,
+        with heavy embedded geometry (the import features' base64 BREP blobs) and any oversized
+        string value ELIDED. Use it on big assemblies/imported parts where the full tree blows
+        the tool token limit (a 600k-char part lists in a few KB). The full (default) form
+        carries the complete params verbatim for round-trip editing.
+        """
         try:
-            return _dumps(cb.call("doc_tree", {"doc_id": _doc(doc_id)}))
+            d = _doc(doc_id)
+            r = cb.call("doc_tree", {"doc_id": d})
+            if not summary:
+                return _dumps(r)
+
+            def _trim(value: Any) -> Any:
+                # Elide base64 geometry blobs / very long strings that bloat the tree but carry
+                # no design intent the caller would read in a summary.
+                if isinstance(value, str) and len(value) > 200:
+                    return f"<{len(value)} chars elided>"
+                if isinstance(value, dict):
+                    return {k: ("<elided>" if k in ("embedded_brep",) else _trim(v))
+                            for k, v in value.items()}
+                if isinstance(value, list):
+                    return [_trim(v) for v in value] if len(value) <= 64 else \
+                        f"<list of {len(value)} elided>"
+                return value
+
+            tree = r.get("tree") or {}
+            feats = tree.get("features") or []
+            out_feats = []
+            for f in feats:
+                if not isinstance(f, dict):
+                    continue
+                params = {k: ("<elided>" if k == "embedded_brep" else _trim(v))
+                          for k, v in (f.get("params") or {}).items()}
+                out_feats.append({
+                    "id": f.get("id"),
+                    "name": f.get("name"),
+                    "type": f.get("type"),
+                    "suppressed": bool(f.get("suppressed", False)),
+                    "params": params,
+                })
+            return _dumps({"ok": True, "doc_id": d, "revision": r.get("revision"),
+                           "summary": True, "feature_count": len(out_feats),
+                           "features": out_feats})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -697,6 +925,212 @@ def register_cad_tools(mcp: FastMCP) -> None:
             except CoreError:
                 pass
             return _dumps(out)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    # ---------------------------------------------------------------- inspection
+
+    @mcp.tool()
+    def measure_between(a_query: Union[str, dict], b_query: Optional[Union[str, dict]] = None,
+                        doc_id: Optional[str] = None) -> str:
+        """Measure a face/edge — or the distance + angle BETWEEN two of them — in plain words.
+
+        This is the engineer's measure/probe tool. Address geometry the same way you do
+        everywhere else (a side word like "top", or a full query {"of":"face","side":"top"} /
+        {"of":"edge","parallel":"z","pick":"largest"}).
+
+        One query (b_query omitted) -> that single feature's intrinsic measure:
+          * a face   -> its area (mm^2)
+          * an edge  -> its length (mm), or radius (mm) for a circular edge
+          * a vertex -> its point coordinates
+        Two queries -> the minimum DISTANCE (mm) between them (with the two closest points) and,
+        when applicable (face↔face normals or edge↔edge tangents), the ANGLE (degrees, 0..90).
+
+        Each query must resolve to exactly ONE face/edge. If it matches several (e.g. "all the
+        vertical edges"), narrow it with a predicate ("pick":"largest"/"side":"top"/…) — call
+        query_geometry(query) first to see the candidates. Returns a readable `summary` line.
+        """
+        try:
+            d = _doc(doc_id)
+            ref_a = _resolve_one_selector(d, a_query)
+            refs = [ref_a]
+            if b_query is not None:
+                refs.append(_resolve_one_selector(d, b_query))
+            res = cb.call("eval_measure", {"doc_id": d, "refs": refs})
+            kind = res.get("kind")
+            out = {"ok": True, "doc_id": d, "a_query": a_query, **res}
+            if b_query is not None:
+                out["b_query"] = b_query
+                parts = []
+                if "distance" in res:
+                    parts.append(f"distance {res['distance']:.4g} mm")
+                if "angle" in res:
+                    parts.append(f"angle {res['angle']:.4g} deg")
+                out["summary"] = ("between the two selections: " + ", ".join(parts)) if parts \
+                    else "no distance/angle computed"
+            else:
+                if kind == "area":
+                    out["summary"] = f"area = {res.get('area'):.6g} mm^2"
+                elif kind == "length":
+                    out["summary"] = f"length = {res.get('length'):.6g} mm"
+                elif kind == "radius":
+                    out["summary"] = f"radius = {res.get('radius'):.6g} mm"
+                elif kind == "point":
+                    out["summary"] = f"point = {res.get('points')}"
+                elif kind == "volume":
+                    out["summary"] = f"volume = {res.get('volume'):.6g} mm^3"
+                else:
+                    out["summary"] = f"measured ({kind})"
+            return _dumps(out)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def check_interference(doc_id: Optional[str] = None) -> str:
+        """Clash/clearance check — do the bodies OVERLAP, and if not, how tight is the gap?
+
+        Runs a pairwise interference analysis over every body in the document (for an assembly
+        doc, over the world-placed component bodies). For each pair it reports either an
+        INTERFERENCE (overlap volume in mm^3 — a real collision the design must not have) or a
+        CLEARANCE (minimum gap in mm). Use it to validate that mating/instanced parts fit without
+        clashing, or to find the tightest gap in an assembly.
+
+        Returns {ok, summary, parts:[{name,bbox,volume}], interferences:[{a,b,volume}],
+        clearances:[{a,b,distance}]}. ok is True only when NOTHING interferes. A single-body part
+        trivially reports no interference (build a multi-body part with the `transform` copy
+        feature, or open an assembly, to get meaningful pairs).
+        """
+        try:
+            d = _doc(doc_id)
+            res = cb.call("eval_interference", {"doc_id": d})
+            return _dumps({"ok": res.get("ok", True), "doc_id": d, **res})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def check_symmetry(plane: str = "top", doc_id: Optional[str] = None) -> str:
+        """Is the part mirror-symmetric about a principal datum plane? Returns the deviation.
+
+        plane : "top" (XY, mirror across Z), "front" (XZ, mirror across Y), or "right" (YZ,
+                mirror across X) — the reserved AI-CAD datum planes (Z-up).
+        Mirrors the active body across the plane and measures the symmetric-difference volume.
+        Returns {symmetric: bool, deviation_mm3}: symmetric is True when the leftover volume is
+        within a tiny tolerance (1e-3 of the part volume). Handy to confirm a feature you meant
+        to place symmetrically really is, or to pick a sensible mirror plane.
+        """
+        try:
+            d = _doc(doc_id)
+            res = cb.call("eval_symmetry", {"doc_id": d, "plane": plane})
+            sym = res.get("symmetric")
+            dev = res.get("deviation_mm3")
+            summary = (f"symmetric about plane '{plane}' (deviation {dev:.4g} mm^3)" if sym
+                       else f"NOT symmetric about plane '{plane}' (deviation {dev:.4g} mm^3)")
+            return _dumps({"ok": True, "doc_id": d, "plane": plane, "summary": summary, **res})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def inspect_section(plane: str = "top", doc_id: Optional[str] = None) -> str:
+        """Cut the part with a datum plane and report the CROSS-SECTION area + section moments.
+
+        This is the "section the part to inspect its internals" probe. It slices the active
+        body with one of the reserved datum planes and computes the real properties of the
+        resulting cut face — the cross-section a draftsman would dimension.
+
+        plane : "top" (XY, normal +Z), "front" (XZ, normal -Y), or "right" (YZ, normal +X) —
+                the reserved AI-CAD datum planes (Z-up). The cut passes through the origin.
+
+        Returns {ok, area_mm2, centroid:[x,y,z], Ixx, Iyy, Ixy, summary}:
+          * area_mm2 — the cross-section area (mm^2), the headline number. For a solid this is
+            the filled region; for a thin/hollow wall it's the material the plane cuts through.
+          * centroid — the area centroid of the section, in world coordinates.
+          * Ixx/Iyy/Ixy — the section second moments of area (mm^4), expressed in the cutting
+            plane's frame (use for bending stiffness / section modulus reasoning).
+        Use it to verify a beam's cross-section, check a wall's cut area, or feed a hand
+        bending calc. A plane that misses the body (empty cut) returns area 0.
+        """
+        try:
+            d = _doc(doc_id)
+            res = cb.call("eval_section_props", {"doc_id": d, "plane": plane})
+            area = res.get("area_mm2", 0.0)
+            if area and area > 0:
+                summary = f"cross-section area at plane '{plane}' = {area:.6g} mm^2"
+            else:
+                summary = (f"plane '{plane}' produced no closed cross-section (the cut may miss "
+                           f"the body or only graze an edge) — area = 0")
+            return _dumps({"ok": True, "doc_id": d, "plane": plane, "summary": summary, **res})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def wall_thickness(doc_id: Optional[str] = None) -> str:
+        """How THIN is the thinnest wall? Inward ray-cast wall-thickness over the whole part.
+
+        From every surface sample it casts a ray straight into the material and measures the
+        distance to the far wall — the local wall thickness. The headline value is the MINIMUM
+        ("the thinnest wall is X mm"), the number that governs whether a part can be molded,
+        machined, or 3D-printed, and where it's likely to be weak or warp.
+
+        Returns {ok, min_thickness_mm, mean_thickness_mm, max_thickness_mm, n_sampled,
+        aicm_path, summary}:
+          * min_thickness_mm — the thinnest wall found (the key value). null if no sample got a
+            through-wall hit (e.g. an open sheet body with no opposite wall).
+          * mean/max — the average and thickest sampled wall.
+          * aicm_path — a temp field file for the in-app thickness colour-map viewer.
+        Compare min_thickness_mm against your process minimum (e.g. ~1 mm injection wall,
+        ~0.8 mm FDM) to flag thin spots before manufacturing.
+        """
+        try:
+            d = _doc(doc_id)
+            res = cb.call("eval_thickness", {"doc_id": d})
+            mn = res.get("min_thickness_mm")
+            if mn is not None:
+                mean = res.get("mean_thickness_mm")
+                summary = (f"thinnest wall = {mn:.4g} mm"
+                           + (f" (mean {mean:.4g} mm)" if mean is not None else ""))
+            else:
+                summary = ("no through-wall thickness could be measured (open/sheet body, or no "
+                           "opposite wall in line of sight)")
+            return _dumps({"ok": True, "doc_id": d, "summary": summary, **res})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def draft_analysis(pull_dir: Optional[list] = None, min_draft_deg: float = 3.0,
+                       doc_id: Optional[str] = None) -> str:
+        """Moldability check: which faces lack enough DRAFT to release from the mold?
+
+        For a given mold-pull (ejection) direction it measures each face's draft angle — how far
+        its surface tilts away from the pull axis. Faces whose worst-case draft is below
+        min_draft_deg would drag on the tool during ejection and need a draft feature added.
+
+        pull_dir : the mold-opening / ejection direction as [x,y,z] (defaults to +Z, [0,0,1]).
+        min_draft_deg : the minimum acceptable draft angle in degrees (default 3°, a common
+                        injection-molding minimum).
+
+        Returns {ok, min_draft_deg, max_draft_deg, threshold_deg, n_faces_below_threshold,
+        faces_below_threshold:[{face_id, min_draft_deg, area_mm2, centroid}], aicm_path,
+        summary}. n_faces_below_threshold == 0 means every face clears the threshold (good to
+        mold along that direction). The faces_below_threshold list (centroid + area) tells you
+        WHERE to add draft. aicm_path is the colour-map field for the in-app viewer.
+        """
+        try:
+            d = _doc(doc_id)
+            pull = pull_dir if (isinstance(pull_dir, (list, tuple)) and len(pull_dir) == 3) \
+                else [0.0, 0.0, 1.0]
+            res = cb.call("eval_draft",
+                          {"doc_id": d, "pull": [float(x) for x in pull],
+                           "angle_deg": float(min_draft_deg)})
+            n_bad = res.get("n_faces_below_threshold", 0)
+            thr = res.get("threshold_deg", min_draft_deg)
+            if n_bad == 0:
+                summary = (f"all faces have >= {thr:g}deg draft along pull {list(pull)} — "
+                           f"moldable in that direction")
+            else:
+                summary = (f"{n_bad} face(s) below the {thr:g}deg draft minimum along pull "
+                           f"{list(pull)} — add draft there before molding")
+            return _dumps({"ok": True, "doc_id": d, "pull_dir": list(pull),
+                           "summary": summary, **res})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -774,7 +1208,10 @@ def register_cad_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            out = path or _tmp(".step+")
+            # K3: canonicalise the caller-supplied path so any '..' traversal sequences are
+            # fully resolved before we pass them to the engine.  This means the caller sees
+            # exactly where the file will be written (no hidden navigation).
+            out = _sanitize_output_path(path) if path else _tmp(".step+")
             if not out.lower().endswith(".step+"):
                 out += ".step+"
             r = cb.call("doc_save", {"doc_id": d, "path": out})
@@ -804,7 +1241,8 @@ def register_cad_tools(mcp: FastMCP) -> None:
             fmt = fmt.lower().lstrip(".")
             # The native editable container is written by doc_save, not the interchange writer.
             if fmt in ("step+", "stepplus", "stp+", "native"):
-                out = path or _tmp(".step+")
+                # K3: canonicalise caller-supplied path before passing to the engine.
+                out = _sanitize_output_path(path) if path else _tmp(".step+")
                 if not out.lower().endswith(".step+"):
                     out += ".step+"
                 r = cb.call("doc_save", {"doc_id": d, "path": out})
@@ -812,7 +1250,8 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 return _dumps({"ok": os.path.exists(written), "format": "step+",
                                "native": True, "doc_id": d, "path": written,
                                "exists": os.path.exists(written)})
-            out = path or _tmp("." + fmt)
+            # K3: canonicalise caller-supplied path before passing to the engine.
+            out = _sanitize_output_path(path) if path else _tmp("." + fmt)
             # The engine round-trips B-rep formats (re-reads + BRepCheck) and THROWS if the file is
             # truncated/malformed, so a returned ok:True means it actually re-opens. It echoes real
             # metadata (solid_count, valid_solids, bytes, validated) — surface it so the caller can
@@ -841,6 +1280,26 @@ def register_cad_tools(mcp: FastMCP) -> None:
         into a shared coordinate frame — translate:[x,y,z] and/or angle:<deg> with rotate:[ax,ay,az].
         """
         try:
+            # K2: validate the path exists BEFORE calling the engine so we never open a
+            # zombie doc.  The engine's import_file does not distinguish "file missing" from
+            # "format unsupported" and may silently create an empty document.
+            if not os.path.isfile(path):
+                return _dumps({"ok": False, "error": f"file not found: {path}"})
+            # A3: .step+ is the engine's NATIVE format. With no `into`, route it through
+            # doc_open (the same path used by recover_parts and the host's own file-open) to
+            # open it as a fresh part. WITH `into`, the engine's import_file now extracts the
+            # container's solids and bakes them as an embedded-BREP import feature on the target
+            # doc (Issue 2 — native parts are assemblable without re-exporting to plain STEP).
+            if path.lower().endswith(".step+") and not into:
+                r = cb.call("doc_open", {"path": path})
+                new_id = r.get("doc_id")
+                if new_id:
+                    _CUR["doc_id"] = new_id
+                    _publish_current(new_id)
+                return _dumps({"ok": True, "doc_id": new_id, "imported_from": path,
+                               "format": "step+", "native": True,
+                               **{k: r[k] for k in ("revision", "name", "body_count")
+                                  if k in r}})
             params: dict = {"path": path, "as_solid": bool(as_solid)}
             if into:
                 params["into"] = into
@@ -888,16 +1347,31 @@ def register_cad_tools(mcp: FastMCP) -> None:
             for q in fixtures:
                 fixture_sets.extend(_resolve_face_points(d, q))
             if not fixture_sets:
-                return _dumps({"ok": False, "error": "no fixture faces resolved"})
+                return _dumps({"ok": False, "error":
+                               "no fixture faces resolved — the face queries you provided "
+                               "didn't match any surface points. Static FEA requires at least "
+                               "one fixed face. Use query_geometry() to confirm the face query."})
 
             load_specs: list = []
             for ld in loads:
                 if not isinstance(ld, dict) or "face" not in ld:
                     raise ValueError(f"each load needs a 'face' query: {ld!r}")
                 faces = _resolve_face_points(d, ld["face"])
-                merged = {"points": []}
+                # Merge multiple face-point sets for this load. Keep face_normal + perp_tol
+                # from the FIRST face set (they're geometry-based and won't differ between
+                # matches of the same query). Without these, nodes_in_faceset falls back to
+                # pure Euclidean tol and may bleed across thin-plate faces (Bug Z1/Z2).
+                merged: dict = {"points": []}
                 for f in faces:
                     merged["points"].extend(f.get("points", []))
+                if faces:
+                    first = faces[0]
+                    if "tol_mm" in first:
+                        merged["tol_mm"] = first["tol_mm"]
+                    if "face_normal" in first:
+                        merged["face_normal"] = first["face_normal"]
+                    if "perp_tol_mm" in first:
+                        merged["perp_tol_mm"] = first["perp_tol_mm"]
                 spec: dict = {"faces": merged}
                 if "pressure" in ld:
                     spec["type"] = "pressure"
@@ -966,8 +1440,16 @@ def register_cad_tools(mcp: FastMCP) -> None:
             fixture_sets: list = []
             for q in fixtures:
                 fixture_sets.extend(_resolve_face_points(d, q))
-            if not fixture_sets:
-                return _dumps({"ok": False, "error": "no fixture faces resolved"})
+            # F6 (free-free modal): when fixtures=[] the caller is requesting an unconstrained
+            # solve — the C++ fea_modal_solve handles empty fixed_nodes by computing the full
+            # 6 rigid-body modes near 0 Hz followed by the elastic modes. Only reject when the
+            # caller DID supply fixture queries but NONE of them resolved to real face points
+            # (which is almost certainly a geometry-query mistake, not intentional free-free).
+            if fixtures and not fixture_sets:
+                return _dumps({"ok": False, "error": "no fixture faces resolved — "
+                               "the face queries you provided didn't match any surface points. "
+                               "Use query_geometry() to find the right face query, or pass "
+                               "fixtures=[] for a free-free (unconstrained) solve."})
             # 2nd-order (tet10) elements: quadratic bending accuracy — no spurious split on
             # a square section and no low-frequency bias the way tet4 had (Bug N-1).
             study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
@@ -1197,6 +1679,177 @@ def register_cad_tools(mcp: FastMCP) -> None:
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
+    # ---------------------------------------------------------------- configurations
+
+    @mcp.tool()
+    def list_configurations(doc_id: Optional[str] = None) -> str:
+        """List the part's configurations (parametric variants) and which one is active.
+
+        A configuration is a named variant of the SAME feature tree with its own parameter
+        overrides and feature suppressions — e.g. "Long" / "Short" of one bracket, or a family of
+        sizes. Returns {configurations:[names], active, detail:[{name, param_overrides,
+        suppressions}]}. A fresh part has just the implicit "Default". Build variants with
+        add_configuration + set_config_override / set_config_suppression, switch with
+        activate_configuration; measure_part/render_part then reflect the active variant.
+        """
+        try:
+            return _dumps(cb.call("config_list", {"doc_id": _doc(doc_id)}))
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def add_configuration(name: str, copy_from: Optional[str] = None,
+                          doc_id: Optional[str] = None) -> str:
+        """Add a new configuration (a named parametric variant) to the current part.
+
+        name      : the new configuration's name (must be unique).
+        copy_from : an existing configuration name to seed its overrides/suppressions from
+                    (omit to start empty = identical to the base part). Then tailor it with
+                    set_config_override / set_config_suppression, and activate_configuration to
+                    make it current. The new config is created but NOT activated.
+        """
+        try:
+            d = _doc(doc_id)
+            r = cb.call("config_add", {"doc_id": d, "name": name, "copy_from": copy_from})
+            _publish_current(d)
+            return _dumps({"ok": True, "doc_id": d, "added": name,
+                           "active": (r.get("tree") or {}).get("active_configuration"),
+                           "configurations": [c.get("name") for c in
+                                              (r.get("tree") or {}).get("configurations", [])]})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def activate_configuration(name: str, doc_id: Optional[str] = None) -> str:
+        """Switch the active configuration. The part rebuilds to that variant's parameters.
+
+        After this, measure_part / render_part / export_part reflect the chosen variant. Returns
+        the new active configuration name and the rebuilt body count/volume so you can confirm the
+        switch took (e.g. a suppressed feature drops a body, an override changes the volume).
+        """
+        try:
+            d = _doc(doc_id)
+            r = cb.call("config_activate", {"doc_id": d, "name": name})
+            bodies = (r.get("tess") or {}).get("bodies", [])
+            _publish_current(d)
+            _autosave(d)
+            return _dumps({"ok": True, "doc_id": d, "active": name,
+                           "body_count": len(bodies),
+                           "revision": r.get("revision")})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def set_config_override(config: str, feature_id: str, param: str,
+                            value: Optional[Union[float, list]] = None, clear: bool = False,
+                            doc_id: Optional[str] = None) -> str:
+        """Override one feature parameter in a configuration (the parametric-variant edit).
+
+        config     : the configuration name to edit (see list_configurations).
+        feature_id : the feature's id from get_part (e.g. "f1").
+        param      : the parameter name on that feature (e.g. "length", "radius", "translate").
+        value      : the override value for this configuration only — a plain NUMBER for a scalar
+                     param (length/radius/angle…) OR a LIST for a vector param, e.g.
+                     translate:[x,y,z] on a `transform` feature (so one assembly file can hold a
+                     Default and a STOWED config that differ only in a placement vector).
+        clear      : pass True (and omit value) to REMOVE the override so the config falls back to
+                     the base value.
+        The base/Default config and other configurations are untouched. Activate the configuration
+        (or it may already be active) and measure_part to see the effect.
+        """
+        try:
+            d = _doc(doc_id)
+            params: dict = {"doc_id": d, "name": config, "feature_id": feature_id,
+                            "param": param}
+            if clear or value is None:
+                params["clear"] = True
+            elif isinstance(value, (list, tuple)):
+                # Vector/array param (e.g. transform.translate): the engine reads it as a raw
+                # array (opt_vec3), so the override must be the bare list — NOT wrapped in a
+                # {value, expr} scalar object. Coerce numeric components to float.
+                params["value"] = [float(x) if isinstance(x, (int, float)) else x for x in value]
+            else:
+                # Scalar params are {value, expr} objects in the engine; wrap a bare number.
+                params["value"] = {"value": float(value), "expr": None}
+            cb.call("config_set_override", params)
+            _publish_current(d)
+            _autosave(d)
+            echoed = None
+            if not (clear or value is None):
+                echoed = (params["value"] if isinstance(value, (list, tuple)) else float(value))
+            return _dumps({"ok": True, "doc_id": d, "config": config,
+                           "feature_id": feature_id, "param": param,
+                           "value": echoed,
+                           "cleared": bool(clear or value is None)})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def set_config_suppression(config: str, feature_id: str, suppressed: bool = True,
+                               doc_id: Optional[str] = None) -> str:
+        """Suppress (or un-suppress) a feature in a configuration — turn a feature ON/OFF per variant.
+
+        config     : the configuration name (see list_configurations).
+        feature_id : the feature id from get_part (e.g. "f3" — a fillet, a hole, a boss).
+        suppressed : True to remove that feature in this configuration; False to bring it back.
+        Lets one variant include a feature (a mounting boss, a chamfer) that another omits, without
+        forking the feature tree. Activate the configuration + render_part to confirm.
+        """
+        try:
+            d = _doc(doc_id)
+            cb.call("config_set_suppression", {"doc_id": d, "name": config,
+                                               "feature_id": feature_id,
+                                               "suppressed": bool(suppressed)})
+            _publish_current(d)
+            _autosave(d)
+            return _dumps({"ok": True, "doc_id": d, "config": config,
+                           "feature_id": feature_id, "suppressed": bool(suppressed)})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    # ---------------------------------------------------------------- assembly
+
+    @mcp.tool()
+    def solve_mates(doc_id: Optional[str] = None) -> str:
+        """Solve the mate constraints of an ASSEMBLY document (positions its components).
+
+        Only valid on an assembly doc (e.g. one opened from a .step+ assembly via import_part) —
+        on a single part it returns a clear "not an assembly" error. Solves the mate network and
+        returns the rebuilt assembly state. Follow with list_world_bodies to read where each
+        component landed.
+        """
+        try:
+            d = _doc(doc_id)
+            r = cb.call("doc_solve_mates", {"doc_id": d})
+            _publish_current(d)
+            return _dumps({"ok": True, "doc_id": d, "revision": r.get("revision"),
+                           "status": (r.get("rebuild") or {}).get("doc_status")})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def list_world_bodies(explode: bool = False, doc_id: Optional[str] = None) -> str:
+        """List a doc's bodies with their WORLD-placed bounding boxes.
+
+        Works on an ASSEMBLY doc (each placed component after mates are solved) AND on a
+        multi-body PART — e.g. one assembled via import_part + transform (where the bodies are
+        already placed absolutely). Returns each body {name, component, bbox:{min,max,size}};
+        use it to see where every part sits in the shared frame, or pair with check_interference
+        to validate fit. explode=True applies the exploded-view offsets on an assembly (ignored
+        on a plain multi-body part).
+        """
+        try:
+            d = _doc(doc_id)
+            r = cb.call("asm_world_bodies", {"doc_id": d, "explode": bool(explode)})
+            bodies = r.get("bodies", [])
+            if r.get("multibody_part"):
+                return _dumps({"ok": True, "doc_id": d, "multibody_part": True,
+                               "body_count": len(bodies), "bodies": bodies})
+            return _dumps({"ok": True, "doc_id": d, "body_count": len(bodies),
+                           "bodies": bodies})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
     # ---------------------------------------------------------------- drawings & parts
 
     @mcp.tool()
@@ -1225,7 +1878,22 @@ def register_cad_tools(mcp: FastMCP) -> None:
         try:
             d = _doc(doc_id)
             tree = cb.call("doc_tree", {"doc_id": d})
-            name = (tree.get("tree") or {}).get("name", "") if isinstance(tree.get("tree"), dict) else ""
+            tree_node = tree.get("tree") or {}
+            name = tree_node.get("name", "") if isinstance(tree_node, dict) else ""
+
+            # D2: reject make_drawing on a doc that has no geometry so we don't silently
+            # draw a stale "last-used" part.  We consider the doc empty when it has no
+            # features in the tree AND no tessellated bodies (body_count==0 or missing).
+            features = tree_node.get("features", []) if isinstance(tree_node, dict) else []
+            body_count = tree.get("body_count", tree_node.get("body_count", None))
+            if body_count is None:
+                # Some engine versions put body_count at the top level of doc_tree,
+                # others bury it inside the tree node.  If we can't read it, check features.
+                body_count = len(features)
+            if not features and not body_count:
+                return _dumps({"ok": False,
+                               "error": f"make_drawing: document {d!r} has no geometry to draw"})
+
             spec = {"views": views or ["front", "top", "right", "iso"],
                     "model_items": bool(model_items), "hole_callouts": bool(hole_callouts)}
             if sections:
@@ -1238,8 +1906,25 @@ def register_cad_tools(mcp: FastMCP) -> None:
             if tb:
                 spec["title"] = tb
             r = cb.call("drawing_make", {"source_doc_id": d, "spec": spec})
+            drawing_doc_id = r.get("doc_id")
+            # D7: include the view_id ↔ orientation map so callers can pass either a view_id
+            # or an orientation string to add_gdt / add_datum / add_dimension without having
+            # to call drawing_get first.
+            view_map: dict = {}
+            if drawing_doc_id:
+                try:
+                    full = cb.call("drawing_get", {"doc_id": drawing_doc_id})
+                    for sh in full.get("sheets", []):
+                        for v in sh.get("views", []):
+                            vid = v.get("view_id") or v.get("id")
+                            ori = v.get("orientation") or v.get("type", "")
+                            if vid:
+                                view_map[vid] = ori
+                except Exception:  # noqa: BLE001
+                    pass
             return _dumps({"ok": True, "source_doc_id": d,
-                           "drawing_doc_id": r.get("doc_id"), "name": name,
+                           "drawing_doc_id": drawing_doc_id, "name": name,
+                           "views": view_map or None,
                            "next_actions": [
                                "review_drawing(drawing_doc_id)  # SEE the drawing, then refine",
                                "add_gdt / add_dimension / set_view / set_titleblock  # refine",
@@ -1365,9 +2050,15 @@ def register_cad_tools(mcp: FastMCP) -> None:
         """Add a dimension to a view. doc_id = drawing_doc_id. a,b are sheet-mm points (snap to
         projected vertices you read from review_drawing). dtype: linear_dim|aligned_dim. pos is
         the optional text position. For auto-dimensioning a whole view use the drawing spec's
-        model_items instead."""
+        model_items instead.
+
+        view_id accepts a numeric id (v1, v2, …) OR an orientation string ("front", "top", …)
+        matching the view labels returned by review_drawing / make_drawing.
+        """
         try:
             d = _doc(doc_id)
+            # D7: resolve orientation strings ("front"/"top"/…) to numeric view ids.
+            view_id = _resolve_drawing_view_id(d, view_id)
             params = {"doc_id": d, "view_id": view_id, "type": dtype, "a": a, "b": b}
             if pos:
                 params["pos"] = pos
@@ -1390,9 +2081,13 @@ def register_cad_tools(mcp: FastMCP) -> None:
         datums   : a list of datum letters ["A","B","C"] (or dicts {"ref":"A","modifier":"mmc"}).
         a   : the feature point on the view the frame points at (sheet mm, from review_drawing).
         pos : where the frame sits on the sheet (sheet mm).
+
+        view_id accepts a numeric id (v1, v2, …) OR an orientation string ("front"/"top"/…).
         """
         try:
             d = _doc(doc_id)
+            # D7: resolve orientation strings ("front"/"top"/…) to numeric view ids.
+            view_id = _resolve_drawing_view_id(d, view_id)
             dl = []
             for it in (datums or []):
                 dl.append(it if isinstance(it, dict) else {"ref": str(it)})
@@ -1407,9 +2102,14 @@ def register_cad_tools(mcp: FastMCP) -> None:
     def add_datum(view_id: str, label: str, a: list, pos: list,
                   doc_id: Optional[str] = None) -> str:
         """Add a datum feature symbol (triangle + boxed letter). doc_id = drawing_doc_id.
-        label is the datum letter ("A"); a is the feature point, pos the label box (sheet mm)."""
+        label is the datum letter ("A"); a is the feature point, pos the label box (sheet mm).
+
+        view_id accepts a numeric id (v1, v2, …) OR an orientation string ("front"/"top"/…).
+        """
         try:
             d = _doc(doc_id)
+            # D7: resolve orientation strings ("front"/"top"/…) to numeric view ids.
+            view_id = _resolve_drawing_view_id(d, view_id)
             spec = {"label": label, "a": a, "pos": pos}
             r = cb.call("drawing_add_datum", {"doc_id": d, "view_id": view_id, "spec": spec})
             return _dumps({"ok": True, "annotation": (r.get("annotation") or {}).get("id")})

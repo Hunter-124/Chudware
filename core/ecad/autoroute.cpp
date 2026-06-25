@@ -438,9 +438,10 @@ struct Grid {
     }
 
     // per-layer blocked map for `net` (other-net copper inflated by clearance+half-width).
-    std::vector<std::vector<char>> build_blocked(const json& net) const {
-        double clr = clearance_of(board, net);
-        double halo = clr + track_width(board, net) / 2.0;
+    // ``halo`` is the copper inflation radius; pass < 0 to use the track halo (clearance + half
+    // track width). The via halo (clearance + via_radius) is passed in for the via-placement map.
+    std::vector<std::vector<char>> build_blocked(const json& net, double halo = -1.0) const {
+        if (halo < 0.0) halo = clearance_of(board, net) + track_width(board, net) / 2.0;
         std::vector<std::vector<char>> blocked;
         for (const auto& ly : layers) {
             std::vector<char> row(outline_mask.size());
@@ -578,7 +579,8 @@ std::vector<Node> reconstruct(const std::map<Node, Came>& came, Node node) {
 
 bool astar(const Grid& grid, const std::vector<std::vector<char>>& blocked,
            const std::set<Node>& starts, const std::set<Node>& goals, const Point& goal_xy,
-           double via_cost, double bend_cost, std::vector<Node>& out_path) {
+           double via_cost, double bend_cost, std::vector<Node>& out_path,
+           const std::vector<std::vector<char>>* via_blocked = nullptr) {
     auto [gix, giy] = grid.nearest_cell(goal_xy);
     auto h = [&](int /*layer*/, int ix, int iy) -> double {
         return std::abs(ix - gix) + std::abs(iy - giy);
@@ -658,10 +660,22 @@ bool astar(const Grid& grid, const std::vector<std::vector<char>>& blocked,
                 heap.push({ng + h(layer, nx_, ny_), ng, nb, true, dx, dy});
             }
         }
-        // layer change (via) at this cell
+        // layer change (via) at this cell. A through-via occupies the SAME cell on every copper
+        // layer and its copper radius (via_dia/2) dwarfs a track's half-width, so the track-halo
+        // `blocked` map is not enough: gate the via on the via-halo map (`via_blocked`) across ALL
+        // layers, else the placed via lands within `clearance` of other-net copper (a DRC violation).
+        bool via_ok_here = true;
+        if (via_blocked) {
+            for (int L = 0; L < n_layers; ++L)
+                if ((*via_blocked)[L][grid.idx(ix, iy)]) {
+                    via_ok_here = false;
+                    break;
+                }
+        }
         for (int nl = 0; nl < n_layers; ++nl) {
             if (nl == layer) continue;
             if (blocked[nl][grid.idx(ix, iy)]) continue;
+            if (!via_ok_here) continue;
             Node nb{nl, ix, iy};
             double ng = g + via_cost;
             auto nit = gscore.find(nb);
@@ -752,13 +766,35 @@ std::pair<std::vector<json>, std::vector<json>> path_to_geometry(
     return {tracks, vias};
 }
 
-// terminal cells for a pad (autoroute.py::_terminal_cells).
+// Layer indices on which same-net copper covers `at` — the copper layers a route may legally
+// start/end on at this terminal (autoroute.py::_terminal_layers). Empty -> caller falls back to all
+// layers. A track only connects to a pad on a layer where the pad HAS copper: an F.Cu-only SMD pad
+// cannot be reached by a B.Cu track; a tht pad / via spans several layers and allows them all.
+std::set<int> terminal_layers(const Grid& grid, const Point& at, const json& net) {
+    std::set<int> out;
+    for (int li = 0; li < (int)grid.layers.size(); ++li) {
+        auto it = grid.shapes_by_layer.find(grid.layers[li]);
+        if (it == grid.shapes_by_layer.end()) continue;
+        for (const auto& s : it->second) {
+            if (same_net(s.net, net) && cell_clear_dist(s, at) <= 1e-9) {
+                out.insert(li);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+// terminal cells for a pad (autoroute.py::_terminal_cells). ``net`` restricts the terminal to the
+// layers the pad/via actually occupies; null -> every layer (legacy behaviour).
 std::set<Node> terminal_cells(const Grid& grid, const std::vector<std::vector<char>>& blocked,
-                              const Point& at) {
+                              const Point& at, const json& net = json(nullptr)) {
     auto [cx, cy] = grid.nearest_cell(at);
     std::set<Node> out;
     int n_layers = (int)grid.layers.size();
+    std::set<int> valid = net.is_null() ? std::set<int>{} : terminal_layers(grid, at, net);
     for (int li = 0; li < n_layers; ++li) {
+        if (!valid.empty() && !valid.count(li)) continue;
         bool found = false;
         int fx = 0, fy = 0;
         for (int r = 0; r < 4 && !found; ++r) {
@@ -795,10 +831,10 @@ std::set<Node> terminal_cells(const Grid& grid, const std::vector<std::vector<ch
 // (autoroute.py::_blocked_for).
 std::vector<std::vector<char>> blocked_for(const Grid& grid, const json& net,
                                            const RoutedRegistry& reg,
-                                           const std::vector<Shape>* extra_shapes) {
-    auto blocked = grid.build_blocked(net);
-    double clr = clearance_of(grid.board, net);
-    double halo = clr + track_width(grid.board, net) / 2.0;
+                                           const std::vector<Shape>* extra_shapes,
+                                           double halo = -1.0) {
+    if (halo < 0.0) halo = clearance_of(grid.board, net) + track_width(grid.board, net) / 2.0;
+    auto blocked = grid.build_blocked(net, halo);
     std::vector<Shape> obstacles = reg.shapes_for(net.get<std::string>());
     if (extra_shapes) {
         for (const auto& s : *extra_shapes)
@@ -823,13 +859,19 @@ bool route_airwire(const Grid& grid, const json& board, const json& air, const R
     auto blocked = blocked_for(grid, net, reg, extra_shapes);
     Point p1{getf(air["p1"][0]), getf(air["p1"][1])};
     Point p2{getf(air["p2"][0]), getf(air["p2"][1])};
-    auto starts = terminal_cells(grid, blocked, p1);
-    auto goals = terminal_cells(grid, blocked, p2);
+    auto starts = terminal_cells(grid, blocked, p1, net);
+    auto goals = terminal_cells(grid, blocked, p2, net);
     if (starts.empty() || goals.empty()) return false;
-    std::vector<Node> path;
-    if (!astar(grid, blocked, starts, goals, p2, via_cost, bend_cost, path)) return false;
-    double width = track_width(board, net);
+    // A via needs a larger clearance halo than a track (copper radius via_dia/2 vs track width/2).
+    // Build the via-sized blocked map so A* only drops vias where the via copper truly clears
+    // other-net copper — otherwise the route is DRC-clean for tracks but the via violates clearance.
     auto [via_dia, via_drill] = via_dims(board, net);
+    double via_halo = clearance_of(board, net) + via_dia / 2.0;
+    auto via_blocked = blocked_for(grid, net, reg, extra_shapes, via_halo);
+    std::vector<Node> path;
+    if (!astar(grid, blocked, starts, goals, p2, via_cost, bend_cost, path, &via_blocked))
+        return false;
+    double width = track_width(board, net);
     geom = path_to_geometry(grid, path, net, width, tcnt, vcnt, via_dia, via_drill, p1, p2);
     return true;
 }

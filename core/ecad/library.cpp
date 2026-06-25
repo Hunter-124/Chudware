@@ -5,6 +5,8 @@
 
 #include "ecad/library.h"
 
+#include <algorithm>
+#include <cmath>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -51,13 +53,17 @@ json tht_pad(const std::string& pid, const std::string& number, double x, double
                 {"pin", number}};
 }
 
+// Standard silkscreen stroke width (mm) — mirrors starter.py::_SILK_W. Generated silk MUST
+// carry it or DFM's silk_min_width flags every line as a 0 mm stroke.
+constexpr double kSilkW = 0.15;
+
 // engine/ecad/library/starter.py::_silk_box (four-line rectangle on a layer)
 json silk_box(double x1, double y1, double x2, double y2, const std::string& layer = "F.SilkS") {
     return json::array({
-        json{{"type", "line"}, {"p1", json::array({x1, y1})}, {"p2", json::array({x2, y1})}, {"layer", layer}},
-        json{{"type", "line"}, {"p1", json::array({x2, y1})}, {"p2", json::array({x2, y2})}, {"layer", layer}},
-        json{{"type", "line"}, {"p1", json::array({x2, y2})}, {"p2", json::array({x1, y2})}, {"layer", layer}},
-        json{{"type", "line"}, {"p1", json::array({x1, y2})}, {"p2", json::array({x1, y1})}, {"layer", layer}},
+        json{{"type", "line"}, {"p1", json::array({x1, y1})}, {"p2", json::array({x2, y1})}, {"layer", layer}, {"width", kSilkW}},
+        json{{"type", "line"}, {"p1", json::array({x2, y1})}, {"p2", json::array({x2, y2})}, {"layer", layer}, {"width", kSilkW}},
+        json{{"type", "line"}, {"p1", json::array({x2, y2})}, {"p2", json::array({x1, y2})}, {"layer", layer}, {"width", kSilkW}},
+        json{{"type", "line"}, {"p1", json::array({x1, y2})}, {"p2", json::array({x1, y1})}, {"layer", layer}, {"width", kSilkW}},
     });
 }
 
@@ -81,6 +87,86 @@ json concat(json a, json b) {
         out.push_back(e);
     }
     return out;
+}
+
+// ── Silk-over-pad clip (mirrors starter.py::_clip_footprint_silk) ─────────────
+// Silk-to-pad clearance (mm) kept when clipping silk lines off pads.
+constexpr double kSilkPadClear = 0.12;
+
+// Conservative circular keepout (cx, cy, r) around a pad's copper, expanded by the
+// silk-to-pad clearance. Returns false for a sizeless pad.
+bool pad_keepout(const json& pad, double& cx, double& cy, double& r) {
+    json pos = pad.contains("pos") && pad["pos"].is_array() ? pad["pos"] : json::array({0.0, 0.0});
+    json size = pad.contains("size") && pad["size"].is_array() ? pad["size"] : json::array({0.0, 0.0});
+    double w = size.size() > 0 ? size[0].get<double>() : 0.0;
+    double h = size.size() > 1 ? size[1].get<double>() : w;
+    if (w <= 0.0 && h <= 0.0) return false;
+    std::string shape = pad.value("shape", std::string("rect"));
+    double rad = (shape == "circle" || shape == "oval") ? std::max(w, h) / 2.0
+                                                        : 0.5 * std::hypot(w, h);
+    cx = pos.size() > 0 ? pos[0].get<double>() : 0.0;
+    cy = pos.size() > 1 ? pos[1].get<double>() : 0.0;
+    r = rad + kSilkPadClear;
+    return true;
+}
+
+struct Keepout { double cx, cy, r; };
+
+// Clip a silk line p1->p2 to the parts NOT inside any keepout circle; append sub-segments.
+void clip_silk_line(const json& p1, const json& p2, const std::vector<Keepout>& kos,
+                    const json& templ, json& out_graphics) {
+    double ax = p1[0].get<double>(), ay = p1[1].get<double>();
+    double bx = p2[0].get<double>(), by = p2[1].get<double>();
+    double length = std::hypot(bx - ax, by - ay);
+    auto emit = [&](double t0, double t1) {
+        if ((t1 - t0) * length < 0.15) return;  // drop slivers shorter than a fab-legal tick
+        json g = templ;
+        g["p1"] = json::array({ax + (bx - ax) * t0, ay + (by - ay) * t0});
+        g["p2"] = json::array({ax + (bx - ax) * t1, ay + (by - ay) * t1});
+        out_graphics.push_back(g);
+    };
+    if (length < 1e-9 || kos.empty()) { emit(0.0, 1.0); return; }
+    auto blocked = [&](double t) {
+        double x = ax + (bx - ax) * t, y = ay + (by - ay) * t;
+        for (const auto& k : kos)
+            if ((x - k.cx) * (x - k.cx) + (y - k.cy) * (y - k.cy) <= k.r * k.r) return true;
+        return false;
+    };
+    int n = std::max(48, static_cast<int>(length / 0.02));
+    double run_start = -1.0;
+    bool prev_blocked = true;
+    for (int i = 0; i <= n; ++i) {
+        double t = static_cast<double>(i) / n;
+        bool blk = blocked(t);
+        if (!blk && prev_blocked) run_start = t;
+        else if (blk && !prev_blocked && run_start >= 0.0) {
+            emit(run_start, static_cast<double>(i - 1) / n);
+            run_start = -1.0;
+        }
+        prev_blocked = blk;
+    }
+    if (run_start >= 0.0) emit(run_start, 1.0);
+}
+
+// In place: clip every F/B.SilkS LINE graphic off this footprint's pads.
+void clip_footprint_silk(json& fp_doc) {
+    std::vector<Keepout> kos;
+    if (fp_doc.contains("pads") && fp_doc["pads"].is_array())
+        for (const auto& pad : fp_doc["pads"]) {
+            double cx, cy, r;
+            if (pad_keepout(pad, cx, cy, r)) kos.push_back({cx, cy, r});
+        }
+    if (kos.empty() || !fp_doc.contains("graphics") || !fp_doc["graphics"].is_array()) return;
+    json new_graphics = json::array();
+    for (const auto& g : fp_doc["graphics"]) {
+        std::string lyr = g.value("layer", std::string());
+        if ((lyr != "F.SilkS" && lyr != "B.SilkS") || g.value("type", std::string()) != "line") {
+            new_graphics.push_back(g);
+            continue;
+        }
+        clip_silk_line(g["p1"], g["p2"], kos, g, new_graphics);
+    }
+    fp_doc["graphics"] = std::move(new_graphics);
 }
 
 // engine/ecad/library/starter.py::_fp
@@ -289,6 +375,10 @@ std::map<std::string, json> make_footprints() {
                      smd_pad("p2", "A", 3.3, 0.0, 2.2, 2.8, 0.1)}),
         concat(silk_box(-4.0, -1.8, 4.0, 1.8), crtyd_box(-4.6, -2.3, 4.6, 2.3)),
         "smd", "Diode SMB");
+
+    // Final pass: clip every footprint's silk off its pads so no generated footprint
+    // ships silk over copper (DFM silk_over_pad) — mirrors starter.py::_clip_footprint_silk.
+    for (auto& kv : fps) clip_footprint_silk(kv.second);
 
     return fps;
 }

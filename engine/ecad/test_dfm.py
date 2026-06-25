@@ -221,9 +221,14 @@ def test_acid_trap():
     assert len(fired) >= 1, f"expected acid_trap at 30deg, got {_rules(viols)}"
     assert "30" in fired[0]["message"] or "30." in fired[0]["message"], fired[0]["message"]
 
-    # Replace track B with one going to (0, 10) (90 deg from A).
-    # Angle between vectors = 90 deg. Default threshold is <= 90 deg, so 90 deg DOES fire.
-    # Use 91 deg to be safely above the threshold.
+    # A 90 deg orthogonal L-bend (the bread-and-butter of any autoroute) must NOT fire:
+    # an acid trap is an ACUTE corner, not a right angle. Track B straight up to (0,10).
+    b["tracks"][1] = _track("t2", (0.0, 0.0), (0.0, 10.0), "NA")
+    viols_90 = run_dfm(b)
+    assert _by_rule(viols_90, "acid_trap") == [], \
+        f"a 90 deg L-bend must NOT fire acid_trap (false positive): {_rules(viols_90)}"
+
+    # Obtuse (91 deg) also must not fire.
     end_c = (10.0 * math.cos(math.radians(91)), 10.0 * math.sin(math.radians(91)))
     b["tracks"][1] = _track("t2", (0.0, 0.0), end_c, "NA")
     viols2 = run_dfm(b)
@@ -365,6 +370,37 @@ def test_non_mutation_and_determinism():
     print("  test_non_mutation_and_determinism OK")
 
 
+# ── Test 10: library footprints ship no silk over copper ──────────────────────
+
+def test_library_footprints_no_silk_over_pad():
+    """Every starter-library footprint, placed on a board, must produce ZERO silk_over_pad
+    and ZERO silk_min_width violations (silk is clipped off pads + carries a fab-legal width).
+    Guards the chip-footprint silk regression (full silk box crossed the chip pads)."""
+    from engine.ecad import session as ecad_session
+    from engine.ecad.library.starter import FOOTPRINTS
+
+    offenders = []
+    for fpid in sorted(FOOTPRINTS):
+        b = _board()
+        try:
+            ecad_session.apply_ops(
+                ecad_session.new_session("pcb", "lib"), 0,
+                [{"op": "pcb_add_footprint", "fpid": fpid, "pos": [0, 0], "ref": "X1"}])
+        except Exception:  # noqa: BLE001 — placement is exercised via a real session below
+            pass
+        sess = ecad_session.new_session("pcb", "lib")
+        ecad_session.apply_ops(sess, sess.revision,
+                               [{"op": "pcb_add_footprint", "fpid": fpid, "pos": [0, 0],
+                                 "ref": "X1"}])
+        viols = run_dfm(sess.doc)
+        sop = _by_rule(viols, "silk_over_pad")
+        smw = _by_rule(viols, "silk_min_width")
+        if sop or smw:
+            offenders.append((fpid, len(sop), len(smw)))
+    assert not offenders, f"footprints ship silk over pad / zero-width silk: {offenders}"
+    print("  test_library_footprints_no_silk_over_pad OK")
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -380,6 +416,7 @@ def main() -> None:
     test_drill_min()
     test_annular_min()
     test_non_mutation_and_determinism()
+    test_library_footprints_no_silk_over_pad()
     print("ALL DFM TESTS PASSED")
 
 

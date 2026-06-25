@@ -46,13 +46,16 @@ mask_sliver
     Default sliver minimum: 0.1 mm.
 
 acid_trap / acute_angle
-    Two copper track segments of the **same net** meeting at an acute angle
-    (angle between the outgoing directions < threshold) create a sharp inside
-    corner where etchant is trapped, under-etching the inner corner.
+    Two copper track segments of the **same net** meeting at an ACUTE angle
+    (angle between the outgoing directions strictly < 90 deg) create a sharp
+    inside corner where etchant is trapped, under-etching the inner corner.
     Measured as the angle between the two segments at their shared endpoint
-    (the smaller of the two angles at the vertex). Fires when angle < threshold.
+    (the smaller of the two angles at the vertex). Fires only when the angle is
+    meaningfully acute -- a 90 deg right-angle joint (the bread-and-butter of any
+    orthogonal autoroute) is NOT a trap and must never be flagged, so a 1 deg
+    guard band absorbs float noise around 90 deg before the rule fires.
     Arc tracks are skipped (documented).
-    Default threshold: 90 deg (right angle or sharper is a trap risk).
+    Default threshold: 90 deg, fired strictly-below minus the guard band.
 
 courtyard_overlap
     Two footprints' courtyard outlines (F.CrtYd / B.CrtYd graphics) overlap.
@@ -135,8 +138,12 @@ _DEFAULTS: dict[str, Any] = {
     "silk_min_text": 0.8,
     # mask_sliver: min soldermask web between adjacent pad openings (mm)
     "mask_sliver_min": 0.1,
-    # acid_trap: acute angle threshold (deg) -- angle <= this fires
+    # acid_trap: acute-angle threshold (deg). Only a track joint MORE acute than this
+    # (by at least the guard band below) is a trap; a 90 deg orthogonal joint is normal.
     "acid_trap_angle_max": 90.0,
+    # acid_trap: guard band (deg) subtracted from the threshold so float noise around a
+    # right angle (89.999..90.001 from an orthogonal router) never reads as acute.
+    "acid_trap_guard_deg": 1.0,
     # courtyard_overlap: any overlap fires (no numeric threshold, just presence)
     # annular_min: DFM-grade annular ring minimum (mm) -- tighter than DRC default 0.13
     "annular_min": 0.15,
@@ -544,17 +551,26 @@ def _check_mask_sliver(board: dict, rules: dict | None, out: list) -> None:
 
 
 def _pad_pair_gap(a: dict, b: dict) -> float:
-    """Edge-to-edge gap between two pad copper extents (circle or box)."""
+    """Signed edge-to-edge gap between two pad copper extents (circle or box).
+
+    Positive = clear space between the pad edges; zero = touching; negative =
+    pads overlap.  The mask_sliver rule uses the raw signed value so it reports
+    the true measurement (not a clamped 0mm when pads actually interpenetrate).
+    """
     if a["kind"] == "circle" and b["kind"] == "circle":
-        return max(_dist(a["center"], b["center"]) - float(a["margin"]) - float(b["margin"]), 0.0)
+        return _dist(a["center"], b["center"]) - float(a["margin"]) - float(b["margin"])
     if a["kind"] == "circle" and b["kind"] == "box":
         hx, hy = b["margin"]
         d = _point_box_dist(a["center"], b["center"][0], b["center"][1], hx, hy)
-        return max(d - float(a["margin"]), 0.0)
+        return d - float(a["margin"])
     if a["kind"] == "box" and b["kind"] == "circle":
         return _pad_pair_gap(b, a)
-    # box / box
-    return _box_box_dist(a["center"], a["margin"], b["center"], b["margin"])
+    # box / box — reconstruct signed gap (same logic as drc.edge_distance box/box)
+    dx = abs(a["center"][0] - b["center"][0]) - (a["margin"][0] + b["margin"][0])
+    dy = abs(a["center"][1] - b["center"][1]) - (a["margin"][1] + b["margin"][1])
+    if dx <= 0.0 and dy <= 0.0:
+        return max(dx, dy)   # overlap: shallowest penetration (most-positive negative)
+    return math.hypot(max(dx, 0.0), max(dy, 0.0))
 
 
 # ── Rule: acid_trap / acute_angle ─────────────────────────────────────────────
@@ -562,6 +578,10 @@ def _pad_pair_gap(a: dict, b: dict) -> float:
 def _check_acid_trap(board: dict, rules: dict | None, out: list) -> None:
     """Two same-net track segments meeting at an acute angle -> etchant trap."""
     angle_max = float(_cfg(rules, "acid_trap_angle_max"))
+    guard = float(_cfg(rules, "acid_trap_guard_deg"))
+    # Fire only on a genuinely acute joint: strictly below the threshold, minus a guard band
+    # so a 90 deg orthogonal router corner (the common case) is never flagged as a trap.
+    fire_below = angle_max - guard
 
     # Index segment tracks by their endpoints (rounded to 1 nm) for fast adjacency lookup.
     # Only segment tracks; arc tracks skipped (documented).
@@ -621,14 +641,14 @@ def _check_acid_trap(board: dict, rules: dict | None, out: list) -> None:
                     continue
                 dot = max(-1.0, min(1.0, da[0] * db[0] + da[1] * db[1]))
                 angle_deg = math.degrees(math.acos(dot))
-                if angle_deg <= angle_max + EPS:
+                if angle_deg < fire_below - EPS:
                     out.append(_v(
                         "acid_trap", "warning",
                         [(ep_key[0], ep_key[1], ta.get("layer", "F.Cu"))],
                         [ta.get("id", ""), tb.get("id", "")],
                         f"acid trap: tracks {ta.get('id', '')!r} and {tb.get('id', '')!r} "
                         f"meet at {angle_deg:.1f}deg on net {ta.get('net')!r} "
-                        f"(<= {angle_max:.4g}deg threshold)"))
+                        f"(acute, < {fire_below:.4g}deg)"))
 
 
 # ── Rule: courtyard_overlap ───────────────────────────────────────────────────

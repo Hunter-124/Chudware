@@ -132,7 +132,8 @@ const std::map<string, FeatureSpec> FEATURE_TYPES = {
     {"csys", {{}, {{"origin", RefForm::SelOrDatum, false},
                    {"x_dir", RefForm::SelOrDatum, false},
                    {"y_dir", RefForm::SelOrDatum, false}}}},
-    {"sketch", {{"entities", "constraints"}, {{"plane", RefForm::SelOrDatum, true}}}},
+    {"sketch", {{"entities", "constraints"}, {{"plane", RefForm::SelOrDatum, true},
+                                              {"offset", RefForm::SelOrDatum, false}}}},
     {"box", {{"length", "width", "height"}, {{"at", RefForm::SelOrDatum, false}}}},
     {"cylinder", {{"radius", "height"}, {{"at", RefForm::SelOrDatum, false}}}},
     {"sphere", {{"radius"}, {{"at", RefForm::SelOrDatum, false}}}},
@@ -153,6 +154,15 @@ const std::map<string, FeatureSpec> FEATURE_TYPES = {
                          {"centerline", RefForm::SelOrDatum, false},
                          {"guides", RefForm::SelList, false}}}},
     {"helix", {{"pitch", "height"}, {{"base", RefForm::SelOrDatum, true}}}},
+    // thread: cut a real helical ISO-60° thread into a cylindrical face. `length` (the
+    // thread run, mm) is always required; the SIZE comes from a `size` ("M8") param OR a
+    // bare major_dia + pitch (the compiler enforces that either/or, so neither is listed
+    // as a universally-required param). target_face = the cylindrical face to thread.
+    {"thread", {{"length"}, {{"target_face", RefForm::Sel, true}}}},
+    // text: emboss/engrave a string onto a planar face. `text` (the string) is always
+    // required; height/depth/mode/font/align are optional (compiler defaults). target_face
+    // = the planar face to mark.
+    {"text", {{"text"}, {{"target_face", RefForm::Sel, true}}}},
     {"fillet", {{}, {{"edges", RefForm::SelList, false},
                      {"middle_face", RefForm::SelOrDatum, false},
                      {"face_set_a", RefForm::SelList, false},
@@ -1199,6 +1209,13 @@ vector<string> validate_feature(const json& f, const string& where,
         bool present = refs.contains(name) && !refs[name].is_null();
         if (!present) {
             if (slot.required) {
+                // boolean accepts a params.a/params.b shorthand (target/tool body feature
+                // ids) in place of refs.targets/refs.tools — the compiler reads either form
+                // (ops_cheatsheet documents both). Don't reject the documented shorthand
+                // over the ref-slot name (mirrors the chamfer length/distance acceptance).
+                if (ftype == "boolean" && (name == "targets" || name == "tools") &&
+                    params.contains("a"))
+                    continue;
                 errs.push_back(where + ".refs." + name + ": required for " + ftype);
             }
             continue;
@@ -1255,9 +1272,20 @@ vector<string> validate_feature(const json& f, const string& where,
                 if (!v.is_array() || v.empty()) {
                     errs.push_back(loc + ": must be a non-empty list of feature ids");
                 } else {
+                    // Same-batch placeholder regex: "$<N>" (e.g. "$0", "$3"). session.cpp
+                    // resolves these to real fN ids before compile, but validate_document
+                    // may run against a batch that has not yet been through placeholder
+                    // resolution — accept them here exactly as SelList/SelOrDatum do for
+                    // profile refs (the form produced by the agent for same-batch refs).
+                    static const std::regex BATCH_PLACEHOLDER_RE(R"(^\$\d+$)");
                     for (size_t i = 0; i < v.size(); ++i) {
                         const json& s = v[i];
-                        if (!s.is_string() || !std::regex_match(s.get<string>(), FEATURE_ID_RE)) {
+                        if (!s.is_string()) {
+                            errs.push_back(loc + "[" + std::to_string(i) + "]: not a feature id");
+                        } else if (std::regex_match(s.get<string>(), BATCH_PLACEHOLDER_RE)) {
+                            // Same-batch "$<index>" placeholder — valid at validation time;
+                            // session.cpp rewrites to fN before compile.
+                        } else if (!std::regex_match(s.get<string>(), FEATURE_ID_RE)) {
                             errs.push_back(loc + "[" + std::to_string(i) + "]: not a feature id");
                         } else if (earlier_ids.find(s.get<string>()) == earlier_ids.end()) {
                             errs.push_back(loc + "[" + std::to_string(i) + "]: '" +

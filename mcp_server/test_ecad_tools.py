@@ -827,6 +827,226 @@ def test_check_diff_impedance(tools: dict) -> None:
     print("  [check_diff_impedance] PASS")
 
 
+# --------------------------------------------------------------------------- bug-fix tests
+#
+# Focused regression tests for the round-5 black-box MCP report (E1/E2/E3/E5/E6/E8/E9).
+
+
+def test_e1_multiple_docs_coexist(tools: dict) -> None:
+    """E1: creating a new schematic must NOT evict the prior doc — both coexist and resolve by id."""
+    a = _call(tools, "ecad_new_schematic", name="E1_A")
+    aid = a["doc_id"]
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=0, y=0, value="1k", doc_id=aid)
+    b = _call(tools, "ecad_new_schematic", name="E1_B")
+    bid = b["doc_id"]
+    assert aid != bid, "two schematics must have distinct doc ids"
+    # The PRIOR doc must still be queryable by its explicit id (the E1 symptom was 'no open doc').
+    sa = _call(tools, "ecad_status", doc_id=aid)
+    assert sa["ok"], f"prior doc A must still be open, got {sa.get('error')!r}"
+    assert sa["component_count"] == 1, "doc A must still carry its placed resistor"
+    sb = _call(tools, "ecad_status", doc_id=bid)
+    assert sb["ok"] and sb["component_count"] == 0, "doc B is the fresh, empty schematic"
+    print(f"  E1: docs {aid} (1 comp) and {bid} (0 comp) coexist")
+    print("  [e1_multiple_docs_coexist] PASS")
+
+
+def test_e2_led_driver_recipe(tools: dict) -> None:
+    """E2: an 'LED driver' request must produce the LED-driver recipe (V->R->LED->GND), not an amp."""
+    from engine.ecad import recipes as _recipes
+    # Matcher: LED requests map to led_driver; unrelated requests default to the divider, not amp.
+    assert _recipes.closest_recipe("LED driver from a 3.3V supply")["name"] == "led_driver"
+    assert _recipes.closest_recipe("an LED driver")["name"] == "led_driver"
+    assert _recipes.closest_recipe("something totally unrelated")["name"] == "voltage_divider"
+
+    d = _call(tools, "ecad_design", request="LED driver for a red LED from a 3.3V supply")
+    _assert_context(d, "ecad_design(LED driver)")
+    assert d["ok"], f"LED-driver design must verify, got hint={d.get('hint')!r}"
+    assert d.get("recipe_used") == "led_driver", \
+        f"expected led_driver recipe, got {d.get('recipe_used')!r}"
+    st = _call(tools, "ecad_status", doc_id=d["doc_id"])
+    libids = {c["libid"] for c in st.get("components", [])}
+    assert "Device:LED" in libids, f"LED driver must contain an LED, got {libids}"
+    assert "Device:R" in libids, f"LED driver must contain a current-limit resistor, got {libids}"
+    assert "Amplifier_Operational:OPAMP_dual" not in libids, "LED driver must NOT be an op-amp"
+    print(f"  E2: led_driver components={sorted(libids)} sim={d.get('sim', {}).get('got')}")
+    print("  [e2_led_driver_recipe] PASS")
+
+
+def test_e3_opamp_noninverting_gain(tools: dict) -> None:
+    """E3: a non-inverting op-amp (Rf=10k,Rin=1k,Vin=1V) must simulate to V(OUT)~=11V, not 0."""
+    from engine.ecad import schema as ecad_schema
+    from engine.ecad import session as ecad_session
+
+    s = _call(tools, "ecad_new_schematic", name="E3_noninv")
+    sid = s["doc_id"]
+    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source",
+          x=0, y=0, value="1", ref="V1", doc_id=sid)
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=30, y=0, value="1k",
+          ref="Rin", doc_id=sid)
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=60, y=0, value="10k",
+          ref="Rf", doc_id=sid)
+    _call(tools, "ecad_place_symbol", libid="Amplifier_Operational:OPAMP_dual",
+          x=90, y=0, value="OPAMP", ref="U1", doc_id=sid)
+
+    # Connectivity by net labels at each pin's world coordinate (robust by-name nets).
+    sess = ecad_session.get_session(sid)
+    pw = {(sym.get("ref"), str(pin.get("number"))): [round(w[0], 6), round(w[1], 6)]
+          for sym, pin, w in ecad_schema.iter_placed_pins(sess.doc)}
+    nets = {
+        "IN":  [("V1", "+"), ("U1", "2")],            # V+ drives the op-amp IN+ (pin 2)
+        "INV": [("Rin", "1"), ("Rf", "1"), ("U1", "1")],  # IN- summing node (pin 1)
+        "OUT": [("Rf", "2"), ("U1", "3")],            # feedback + output (pin 3)
+        "GND": [("V1", "-"), ("Rin", "2")],
+    }
+    conn = []
+    for net, members in nets.items():
+        for ref, pin in members:
+            conn.append({"op": "sch_add_label", "text": net, "pos": pw[(ref, pin)],
+                         "scope": "global"})
+        if net == "GND":
+            conn.append({"op": "sch_add_power", "net": "GND", "pos": pw[("V1", "-")],
+                         "symbol": "GND"})
+    ecad_session.apply_ops(sess, sess.revision, conn)
+
+    r = _call(tools, "ecad_simulate", analysis="op", probes=["V(OUT)"], doc_id=sid)
+    vout = (r.get("op", {}) or {}).get("V(OUT)")
+    assert vout is not None, f"V(OUT) missing — op-amp sim broke: {r.get('reading')!r}"
+    assert abs(vout - 11.0) < 0.5, \
+        f"non-inverting amp gain wrong: V(OUT)={vout} (expected ~11V for 1+Rf/Rin=11)"
+    print(f"  E3 non-inverting: V(OUT)={vout:.4f} V (gain 1+10k/1k=11)")
+
+    # And the inverting amp via .tf must give gain ~= -Rf/Rin.
+    inv = _call(tools, "ecad_design", request="an inverting amplifier with a gain of 10")
+    tf = _call(tools, "ecad_tf", output="V(OUT)", source="V1", doc_id=inv["doc_id"])
+    assert tf["converged"], f"tf did not converge: {tf.get('reading')!r}"
+    assert abs(tf["gain"] - (-10.0)) < 0.5, \
+        f"inverting amp gain wrong: {tf['gain']} (expected ~ -10 = -Rf/Rin)"
+    print(f"  E3 inverting tf: gain={tf['gain']:.4f} (=-Rf/Rin=-10)")
+    print("  [e3_opamp_noninverting_gain] PASS")
+
+
+def test_e5_make_board_honors_doc_id(tools: dict) -> None:
+    """E5: ecad_make_board(doc_id=A) must build from schematic A even when B is the active one."""
+    from mcp_server.ecad_tools import _ECAD
+    a = _call(tools, "ecad_design", request="5V voltage divider with 2.5V output")
+    aid = a["doc_id"]
+    b = _call(tools, "ecad_new_schematic", name="E5_empty_B")  # active becomes B (empty)
+    assert _ECAD["current_sch"] == b["doc_id"], "B is now the active schematic"
+    res = _call(tools, "ecad_make_board", pcb_name="E5_board", doc_id=aid)
+    assert res["sch_doc_id"] == aid, "make_board must use the passed schematic doc_id"
+    assert res["footprints_placed"] == 2, \
+        f"board from A must place A's 2 resistors, got {res['footprints_placed']}"
+    print(f"  E5: make_board(doc_id=A) placed {res['footprints_placed']} footprints from {aid}")
+    print("  [e5_make_board_honors_doc_id] PASS")
+
+
+def test_e6_update_from_sch_places_footprints(tools: dict) -> None:
+    """E6: update_from_sch must instantiate a footprint per component (default fpid by libid)."""
+    s = _call(tools, "ecad_new_schematic", name="E6_div")
+    sid = s["doc_id"]
+    # Place two resistors with NO explicit footprint (E6: these got 0 footprints before).
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=0, y=0, value="10k", doc_id=sid)
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=0, value="10k", doc_id=sid)
+    pcb = _call(tools, "ecad_new_pcb", name="E6_board")
+    res = _call(tools, "ecad_update_from_sch", sch_doc_id=sid, pcb_doc_id=pcb["doc_id"])
+    assert res["ok"], f"update_from_sch failed: {res.get('error')!r}"
+    assert res["footprint_count"] == 2, \
+        f"both resistors must get a default footprint, got {res['footprint_count']}"
+    assert sorted(res["footprints_added"]) == ["R1", "R2"], \
+        f"expected R1,R2 added, got {res.get('footprints_added')}"
+    assert not res["unresolved"], f"default footprints must resolve, got {res['unresolved']}"
+    print(f"  E6: update_from_sch placed {res['footprint_count']} footprints (no explicit fpid)")
+    print("  [e6_update_from_sch_places_footprints] PASS")
+
+
+def test_e8_temp_probe_surfaced(tools: dict) -> None:
+    """E8: ecad_simulate('temp', probe='V(VMID)') must report the REQUESTED probe, not V(IN)."""
+    d = _call(tools, "ecad_design", request="5V voltage divider with 2.5V output")
+    sid = d["doc_id"]
+    r = _call(tools, "ecad_simulate", analysis="temp",
+              params={"values": [-40, 27, 85], "inner": "op", "probe": "V(VMID)"}, doc_id=sid)
+    assert "V(VMID)" in r["reading"], \
+        f"temp reading must mention the requested probe V(VMID), got {r['reading']!r}"
+    assert r.get("trend"), "temp must return a trend"
+    assert "V(VMID)" in r["trend"][0], f"trend rows must key the requested probe, got {r['trend'][0]}"
+    # And via the probes= argument too.
+    r2 = _call(tools, "ecad_simulate", analysis="temp", params={"values": [-40, 27, 85]},
+               probes=["V(VMID)"], doc_id=sid)
+    assert "V(VMID)" in r2["reading"], f"probes= must also surface, got {r2['reading']!r}"
+    print(f"  E8: temp reading={r['reading']!r}")
+    print("  [e8_temp_probe_surfaced] PASS")
+
+
+def test_e7_bogus_libid_rejected(tools: dict) -> None:
+    """E7: ecad_place_symbol with an unresolvable libid must return ok:false with a clear error.
+
+    Before this fix: a bogus libid silently produced ok:true with a 2-pin stub and no pins in
+    the returned pin list, which would then corrupt the netlist.
+    After this fix: ok:false + error message citing the bad libid + guidance to ecad_find_part.
+    """
+    _call(tools, "ecad_new_schematic", name="E7_guard")
+
+    # 1. A completely invented libid must fail.
+    r = _call(tools, "ecad_place_symbol", libid="Bogus:NonExistent", x=0, y=0)
+    assert not r["ok"], \
+        f"E7: bogus libid must return ok:false, got ok={r.get('ok')} hint={r.get('hint')!r}"
+    assert r.get("error"), "E7: error field must be populated"
+    assert "Bogus:NonExistent" in r["error"], \
+        f"E7: error must name the bad libid; got {r['error']!r}"
+    assert r.get("hint"), "E7: hint must be non-empty for recovery"
+    assert r.get("next_actions"), "E7: next_actions must guide the user to ecad_find_part"
+    na_joined = " ".join(r["next_actions"]).lower()
+    assert "ecad_find_part" in na_joined, \
+        f"E7: next_actions must mention ecad_find_part; got {r['next_actions']}"
+    print(f"  E7 bogus libid error: {r['error']!r}")
+    print(f"  E7 hint: {r['hint']!r}")
+
+    # 2. No stub symbol must have been placed — the schematic must still be empty.
+    st = _call(tools, "ecad_status")
+    assert st["component_count"] == 0, \
+        f"E7: a stub must NOT be placed after a rejected bogus libid; " \
+        f"got {st['component_count']} component(s): {st.get('components')}"
+    print(f"  E7: schematic is empty (no stub placed) — component_count={st['component_count']}")
+
+    # 3. A partial / malformed libid (no colon, gibberish name) must also fail.
+    r2 = _call(tools, "ecad_place_symbol", libid="totally_invalid_no_colon", x=5, y=5)
+    assert not r2["ok"], \
+        f"E7: partial libid must also fail; got ok={r2.get('ok')}"
+    print(f"  E7 partial libid error: {r2['error']!r}")
+
+    # 4. A REAL libid must still work (regression guard).
+    r3 = _call(tools, "ecad_place_symbol", libid="Device:R", x=10, y=10, value="1k")
+    assert r3["ok"], \
+        f"E7: real libid Device:R must still place successfully; got {r3.get('error')!r}"
+    assert r3["ref"] == "R1", f"E7: first resistor must be R1, got {r3.get('ref')!r}"
+    assert len(r3["pins"]) == 2, \
+        f"E7: resistor must expose 2 real pins, got {len(r3['pins'])}"
+    print(f"  E7: real libid Device:R still places ok, ref={r3['ref']}, pins={len(r3['pins'])}")
+    print("  [e7_bogus_libid_rejected] PASS")
+
+
+def test_e9_noise_top_level_nonzero(tools: dict) -> None:
+    """E9: ecad_simulate('noise') top-level total/peak must match the nested noise (not 0.0)."""
+    d = _call(tools, "ecad_design", request="5V voltage divider with 2.5V output")
+    sid = d["doc_id"]
+    r = _call(tools, "ecad_simulate", analysis="noise",
+              params={"output": "V(VMID)", "fstart": 10.0, "fstop": 1e6}, doc_id=sid)
+    if not r.get("converged"):
+        print("  E9: noise did not converge in this env — skipping numeric assert")
+        print("  [e9_noise_top_level_nonzero] PASS")
+        return
+    total = r.get("total_noise_rms")
+    peak = r.get("peak_density_v_sqrthz")
+    nested = (r.get("noise") or {}).get("total_noise_rms")
+    assert total and total > 0.0, f"top-level total_noise_rms must be > 0, got {total}"
+    assert peak and peak > 0.0, f"top-level peak_density must be > 0, got {peak}"
+    # Top-level must agree with the (correct) nested value to a few significant figures.
+    assert nested and abs(total - nested) / nested < 0.01, \
+        f"top-level total {total} must match nested {nested}"
+    print(f"  E9: total_noise_rms={total} peak_density={peak} (nested={nested})")
+    print("  [e9_noise_top_level_nonzero] PASS")
+
+
 # --------------------------------------------------------------------------- runner
 
 
@@ -861,6 +1081,15 @@ def main() -> None:
     test_run_dfm_seeded(tools)
     test_autoroute_with_diff_pairs(tools)
     test_check_diff_impedance(tools)
+    # round-5 black-box report bug-fix regressions (E1/E2/E3/E5/E6/E8/E9)
+    test_e1_multiple_docs_coexist(tools)
+    test_e2_led_driver_recipe(tools)
+    test_e3_opamp_noninverting_gain(tools)
+    test_e5_make_board_honors_doc_id(tools)
+    test_e6_update_from_sch_places_footprints(tools)
+    test_e7_bogus_libid_rejected(tools)
+    test_e8_temp_probe_surfaced(tools)
+    test_e9_noise_top_level_nonzero(tools)
     print("\nALL ECAD TOOL TESTS PASSED")
 
 

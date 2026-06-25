@@ -120,43 +120,67 @@ bool tet10_B_at(const std::array<Eigen::Vector3d, 10>& ep, double r, double s, d
     return true;
 }
 
-// Consistent tet10 mass, built ANALYTICALLY (exact for a straight-edged tet of volume V).
-// Each shape function N_i is a polynomial in the barycentric coords (L0,L1,L2,L3); the
-// element mass block M_ij = rho * integral(N_i N_j) over the tet. The exact monomial
-// integral is  integral(L0^a L1^b L2^c L3^d) dV = V * 6 * a!b!c!d! / (a+b+c+d+3)!  — so we
-// expand N_i N_j into monomials and sum. This avoids a hand-transcribed high-order tet
-// quadrature rule and is exact (no integration error) when the element is straight-edged,
-// which gmsh's tet10 are for the planar/analytic faces of CAD bodies.
-Eigen::Matrix<double, 10, 10> tet10_mass_scalar(double rho, double vol) {
-    struct Term { double c; int e[4]; };
-    // N_i term tables — SAME node ordering as tet10_dN above.
-    static const std::array<std::vector<Term>, 10> N = {{
-        {{2.0, {2, 0, 0, 0}}, {-1.0, {1, 0, 0, 0}}},  // N0 = L0(2L0-1)
-        {{2.0, {0, 2, 0, 0}}, {-1.0, {0, 1, 0, 0}}},  // N1 = L1(2L1-1)
-        {{2.0, {0, 0, 2, 0}}, {-1.0, {0, 0, 1, 0}}},  // N2 = L2(2L2-1)
-        {{2.0, {0, 0, 0, 2}}, {-1.0, {0, 0, 0, 1}}},  // N3 = L3(2L3-1)
-        {{4.0, {1, 1, 0, 0}}},                        // N4 = 4 L0 L1
-        {{4.0, {0, 1, 1, 0}}},                        // N5 = 4 L1 L2
-        {{4.0, {1, 0, 1, 0}}},                        // N6 = 4 L2 L0
-        {{4.0, {1, 0, 0, 1}}},                        // N7 = 4 L3 L0
-        {{4.0, {0, 0, 1, 1}}},                        // N8 = 4 L3 L2
-        {{4.0, {0, 1, 0, 1}}},                        // N9 = 4 L3 L1
-    }};
-    auto fact = [](int n) { double f = 1.0; for (int i = 2; i <= n; ++i) f *= i; return f; };
-    auto moment = [&](int a, int b, int c, int d) {  // integral / V
-        return 6.0 * fact(a) * fact(b) * fact(c) * fact(d) / fact(a + b + c + d + 3);
-    };
-    Eigen::Matrix<double, 10, 10> M;
-    for (int i = 0; i < 10; ++i)
-        for (int j = 0; j < 10; ++j) {
-            double s = 0.0;
-            for (const Term& ti : N[i])
-                for (const Term& tj : N[j])
-                    s += ti.c * tj.c * moment(ti.e[0] + tj.e[0], ti.e[1] + tj.e[1],
-                                              ti.e[2] + tj.e[2], ti.e[3] + tj.e[3]);
-            M(i, j) = rho * vol * s;
-        }
+// Exact N_i N_j moments over a tet, in units of (integral / element-volume). N_i is a
+// quadratic polynomial in the barycentric coords; the monomial integral is
+//   ∫ L0^a L1^b L2^c L3^d dV = V * 6 * a!b!c!d! / (a+b+c+d+3)!  (so dividing by V gives the
+// per-unit-volume moment). This is degree-4-EXACT — a 4-point (degree-2) Gauss rule would
+// under-integrate the quartic N_i N_j and corrupt the mass DISTRIBUTION, so we keep the
+// closed form for the natural-coordinate part and supply the true element volume separately.
+const Eigen::Matrix<double, 10, 10>& tet10_mass_unit_moments() {
+    static const Eigen::Matrix<double, 10, 10> M = [] {
+        struct Term { double c; int e[4]; };
+        const std::array<std::vector<Term>, 10> N = {{
+            {{2.0, {2, 0, 0, 0}}, {-1.0, {1, 0, 0, 0}}},  // N0 = L0(2L0-1)
+            {{2.0, {0, 2, 0, 0}}, {-1.0, {0, 1, 0, 0}}},  // N1 = L1(2L1-1)
+            {{2.0, {0, 0, 2, 0}}, {-1.0, {0, 0, 1, 0}}},  // N2 = L2(2L2-1)
+            {{2.0, {0, 0, 0, 2}}, {-1.0, {0, 0, 0, 1}}},  // N3 = L3(2L3-1)
+            {{4.0, {1, 1, 0, 0}}},                        // N4 = 4 L0 L1
+            {{4.0, {0, 1, 1, 0}}},                        // N5 = 4 L1 L2
+            {{4.0, {1, 0, 1, 0}}},                        // N6 = 4 L2 L0
+            {{4.0, {1, 0, 0, 1}}},                        // N7 = 4 L3 L0
+            {{4.0, {0, 0, 1, 1}}},                        // N8 = 4 L3 L2
+            {{4.0, {0, 1, 0, 1}}},                        // N9 = 4 L3 L1
+        }};
+        auto fact = [](int n) { double f = 1.0; for (int i = 2; i <= n; ++i) f *= i; return f; };
+        auto moment = [&](int a, int b, int c, int d) {  // integral / V
+            return 6.0 * fact(a) * fact(b) * fact(c) * fact(d) / fact(a + b + c + d + 3);
+        };
+        Eigen::Matrix<double, 10, 10> m;
+        for (int i = 0; i < 10; ++i)
+            for (int j = 0; j < 10; ++j) {
+                double s = 0.0;
+                for (const Term& ti : N[i])
+                    for (const Term& tj : N[j])
+                        s += ti.c * tj.c * moment(ti.e[0] + tj.e[0], ti.e[1] + tj.e[1],
+                                                  ti.e[2] + tj.e[2], ti.e[3] + tj.e[3]);
+                m(i, j) = s;
+            }
+        return m;
+    }();
     return M;
+}
+
+// Consistent tet10 mass M_ij = rho * (∫ det(J) dV_ref) * unit_moment_ij. The unit moments
+// carry the EXACT (degree-4) natural-coordinate distribution; the scalar volume factor is
+// the element's TRUE mapped volume, integrated with the SAME 4-point Gauss rule used for
+// the stiffness (det(J) is at most cubic in the natural coords, so the degree-2 rule is a
+// good volume quadrature and is EXACT for a straight-edged tet, where det(J) is constant).
+// The old code multiplied the moments by a single CORNER-tet volume (e1·(e2×e3)/6), which
+// equals the true volume only for a straight element; on a curved / high-aspect gmsh tet10
+// the corner volume mis-states the inertia and the modal frequency reads high (Bug F3).
+// Using the Gauss-integrated mapped volume keeps the validated straight-section / N-1
+// results unchanged (det(J) constant there) while correcting curved/distorted elements.
+Eigen::Matrix<double, 10, 10> tet10_mass_consistent(
+    double rho, const std::array<Eigen::Vector3d, 10>& ep, const TetGauss4& gauss) {
+    double vol = 0.0;
+    for (int g = 0; g < 4; ++g) {
+        const Eigen::Matrix<double, 10, 3> dNrst = tet10_dN(gauss.pt[g][0], gauss.pt[g][1],
+                                                            gauss.pt[g][2]);
+        Eigen::Matrix3d J = Eigen::Matrix3d::Zero();
+        for (int n = 0; n < 10; ++n) J += ep[n] * dNrst.row(n);
+        vol += gauss.w[g] * std::abs(J.determinant());
+    }
+    return (rho * vol) * tet10_mass_unit_moments();
 }
 
 }  // namespace
@@ -267,12 +291,13 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
                 Ke += (gauss.w[g] * std::abs(detJ)) * (B.transpose() * C * B);
             }
             if (!ok) continue;
-            // Consistent mass (10x10 scalar) from the corner-tet volume (exact for straight
-            // edges); expanded to the 3 translational DOFs per node.
-            const Eigen::Vector3d e1 = ep[1] - ep[0], e2 = ep[2] - ep[0], e3 = ep[3] - ep[0];
-            const double vol = std::abs(e1.dot(e2.cross(e3))) / 6.0;
-            if (!(vol > 0.0)) continue;
-            const Eigen::Matrix<double, 10, 10> Ms = tet10_mass_scalar(density, vol);
+            // Consistent mass (10x10 scalar) = rho * (Gauss-integrated MAPPED volume) *
+            // exact N_iN_j moments — same Gauss rule/Jacobian as the stiffness for the volume
+            // factor, so the mass tracks the element's actual geometry (cures the high-aspect
+            // over-frequency, Bug F3). Skip a degenerate element (zero mapped volume).
+            const Eigen::Matrix<double, 10, 10> Ms =
+                tet10_mass_consistent(density, ep, gauss);
+            if (!(Ms.trace() > 0.0)) continue;
             int dof_map[30];
             for (int j = 0; j < 10; ++j)
                 for (int k = 0; k < 3; ++k) dof_map[j * 3 + k] = tn[j] * 3 + k;

@@ -26,8 +26,14 @@ namespace aicad::sim {
 // of engine/sim/fea_static.py:_nodes_in_faceset. points is n*3 flat, sample is
 // k*3 flat. Returns SORTED UNIQUE node indices (ascending; node i = the i-th
 // (x,y,z) triple). An empty sample yields an empty result.
+// When face_normal is non-null, uses split-tolerance mode: the perpendicular component
+// of (node - sample) must be <= perp_tol_mm (tight: rejects off-plane nodes), and the
+// in-plane component must be <= tol_mm (large: covers entire face). This prevents
+// bleed to opposite faces of thin plates. Set face_normal=nullptr for legacy behavior.
 std::vector<int> nodes_in_faceset(const std::vector<double>& points,
-                                  const std::vector<double>& sample, double tol_mm);
+                                  const std::vector<double>& sample, double tol_mm,
+                                  const double* face_normal = nullptr,
+                                  double perp_tol_mm = 0.0);
 
 // Combined static run. `study` carries:
 //   step_path (string)  -> mesh via mesher::mesh_step(step_path, density)

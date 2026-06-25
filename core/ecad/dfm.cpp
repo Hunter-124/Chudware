@@ -147,6 +147,8 @@ double cfg(const json& rules, const std::string& key) {
         {"silk_min_text", 0.8},
         {"mask_sliver_min", 0.1},
         {"acid_trap_angle_max", 90.0},
+        // Guard band (deg) so a 90 deg orthogonal router joint never reads as an acid trap.
+        {"acid_trap_guard_deg", 1.0},
         {"annular_min", 0.15},
         {"drill_min_via", 0.2},
         {"drill_min_pad", 0.15},
@@ -614,6 +616,10 @@ void check_mask_sliver(const json& board, const json& rules, json& out) {
 // ── Rule: acid_trap ──────────────────────────────────────────────────────────
 void check_acid_trap(const json& board, const json& rules, json& out) {
     double angle_max = cfg(rules, "acid_trap_angle_max");
+    double guard = cfg(rules, "acid_trap_guard_deg");
+    // Fire only on a genuinely acute joint: strictly below the threshold minus a guard band,
+    // so a 90 deg orthogonal router corner (the common case) is never flagged as a trap.
+    double fire_below = angle_max - guard;
 
     std::vector<json> seg_tracks;
     if (board.contains("tracks") && board["tracks"].is_array())
@@ -698,13 +704,13 @@ void check_acid_trap(const json& board, const json& rules, json& out) {
                     continue;
                 double dot = std::max(-1.0, std::min(1.0, da.first * db.first + da.second * db.second));
                 double angle_deg = std::acos(dot) * 180.0 / kPi;
-                if (angle_deg <= angle_max + kEps) {
+                if (angle_deg < fire_below - kEps) {
                     std::string layer = ta.value("layer", std::string("F.Cu"));
                     out.push_back(make_v(
                         "acid_trap", "warning", {{ep.first, ep.second, layer}}, {ida, idb},
                         "acid trap: tracks " + repr_str(ida) + " and " + repr_str(idb) +
                             " meet at " + fmt1f(angle_deg) + "deg on net " + repr_net(neta) +
-                            " (<= " + fmt4g(angle_max) + "deg threshold)"));
+                            " (acute, < " + fmt4g(fire_below) + "deg)"));
                 }
             }
         }

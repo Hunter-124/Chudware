@@ -76,6 +76,21 @@ FetchContent_Declare(doctest
   SOURCE_SUBDIR doctest)
 FetchContent_MakeAvailable(doctest)
 
+# --- aicad_prof: in-process sampling profiler (Windows; no-op elsewhere) ------
+# Periodically suspends the registered modeling thread and walks its stack lock-free
+# (RtlVirtualUnwind), then symbolizes with DbgHelp at report time. OCCT-free + tiny, so
+# it links cleanly into libaicad.dll and the unit test. See core/prof/sampler.{h,cpp}
+# and docs/PROFILER.md.
+add_library(aicad_prof STATIC
+  prof/sampler.cpp)
+target_include_directories(aicad_prof PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_prof PUBLIC nlohmann_json::nlohmann_json)
+if(WIN32)
+  target_link_libraries(aicad_prof PUBLIC dbghelp)
+endif()
+set_property(TARGET aicad_prof PROPERTY
+  MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+
 # --- libaicad solver ---------------------------------------------------------
 add_library(aicad_solver STATIC
   solver/nsolve.cpp)
@@ -190,6 +205,21 @@ target_link_libraries(test_nsolve PRIVATE aicad_solver)
 set_target_properties(test_nsolve PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME nsolve COMMAND test_nsolve)
+
+# --- sampling profiler unit test (OCCT-free) ---------------------------------
+# Ships a PDB (/Zi /DEBUG) so the hot function resolves by name, exercising both the
+# stack walk and DbgHelp symbolization.
+add_executable(test_prof
+  tests/test_prof.cpp)
+target_include_directories(test_prof PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_prof PRIVATE aicad_prof)
+set_target_properties(test_prof PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+if(MSVC)
+  target_compile_options(test_prof PRIVATE /Zi)
+  target_link_options(test_prof PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+endif()
+add_test(NAME prof COMMAND test_prof)
 
 add_executable(test_sketch
   tests/test_sketch.cpp)
@@ -378,6 +408,8 @@ if(AICAD_WITH_OCCT)
     geom/weldment.cpp
     geom/surfacing.cpp
     geom/curves.cpp
+    geom/thread.cpp
+    geom/text.cpp
     geom/ecad_3d.cpp
     doc/drawing.cpp
     sim/overlay.cpp
@@ -402,6 +434,10 @@ if(AICAD_WITH_OCCT)
     # TKOffset: shell (BRepOffsetAPI_MakeThickSolid) + draft (BRepOffsetAPI_DraftAngle)
     # + loft (BRepOffsetAPI_ThruSections).
     TKOffset
+    # TKV3d: StdPrs_BRepFont + StdPrs_BRepTextBuilder (FreeType glyph -> B-rep faces) for
+    # the `text` emboss/engrave feature (geom/text.cpp). Pulls the FreeType-backed Font
+    # package; its DLL is already staged by aicad_occt_copy_dlls.
+    TKV3d
     # Data-exchange (doc/formats.cpp): the NON-CAF control classes — STEPControl_*
     # (TKDESTEP), IGESControl_* (TKDEIGES), StlAPI_Writer + RWStl (TKDESTL) over the XS
     # base (TKXSBase).
@@ -800,7 +836,15 @@ if(AICAD_WITH_OCCT)
     api/libaicad.cpp)
   target_include_directories(aicad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_definitions(aicad PRIVATE AICAD_BUILD_DLL)
-  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_mesh aicad_agent aicad_parts)
+  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_mesh aicad_agent aicad_parts aicad_prof)
+  # Ship a usable PDB next to libaicad.dll WITHOUT dropping optimization, so the sampling
+  # profiler resolves OUR frames to real names (OCCT stays module-level — no OCCT PDBs).
+  # /Zi adds full debug info to the optimized objects; /DEBUG emits the PDB; /OPT:REF,ICF
+  # undo /DEBUG's default of disabling these (keep the Release code size/speed).
+  if(MSVC)
+    target_compile_options(aicad PRIVATE /Zi)
+    target_link_options(aicad PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+  endif()
   set_target_properties(aicad PROPERTIES
     OUTPUT_NAME libaicad   # -> libaicad.dll + libaicad.lib (the host loads by this name)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

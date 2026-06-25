@@ -159,6 +159,14 @@ render::DocMesh parse(const CompileResult& r) {
     return doc;
 }
 
+// A circle entity for the sweep-profile J3 test (mirrors the test_document DSL).
+json circle(const char* id, double cx, double cy, double r) {
+    return json{{"id", id}, {"type", "circle"}, {"construction", false},
+                {"center", json::array({cx, cy})}, {"radius", r}};
+}
+
+constexpr double PI_CONST = 3.14159265358979323846;
+
 }  // namespace
 
 // 1. LINEAR PATTERN. Seed cube [0,10]^3 (sketch rect 0,0,10,10 on top -> extrude 10),
@@ -243,4 +251,162 @@ TEST_CASE("circular pattern: 4 disjoint cubes fused into one body") {
     CHECK((hi[1] - lo[1]) == doctest::Approx(46.0).epsilon(1e-4));  // y in [-23,23]
     CHECK((hi[2] - lo[2]) == doctest::Approx(6.0).epsilon(1e-4));
     CHECK(vol == doctest::Approx(864.0).epsilon(1e-3));
+}
+
+// 3. NESTED CUT PATTERN (Bug J1). A box with a circular_pattern of HOLES (a cut seed),
+//    then a linear_pattern OF that circular_pattern. The outer pattern must HONOUR the
+//    inner seed's CUT op and REMOVE material at each cell — so the final volume is LESS
+//    than the bare box. Before the fix the outer pattern treated the inner cut-pattern
+//    as additive ("add" op on the whole holed body) and FUSED a translated copy, adding
+//    material (and leaving only one ring of holes). Exactly one valid body survives.
+TEST_CASE("nested linear pattern of a circular cut pattern removes material (J1)") {
+    const double L = 60, W = 30, D = 10;  // box x[-30,30] y[-15,15] z[0,10]
+    json doc;
+    doc["features"] = json::array({
+        sketch_feature("s1", "top", rect_entities(-30, -15, L, W)),
+        json{{"id", "box"}, {"type", "extrude"}, {"profile", "s1"}, {"depth", D}},
+        // Seed: a through hole offset 8 mm from the top-face centre (a CUT).
+        json{{"id", "h"}, {"type", "hole"},
+             {"face", json{{"of", "face"}, {"side", "top"}}},
+             {"diameter", 3.0}, {"end", "through_all"},
+             {"positions", json::array({json::array({8.0, 0.0})})}},
+        // Inner: 3-hole ring around +Z at radius 8.
+        json{{"id", "cp"}, {"type", "circular_pattern"}, {"seed", "h"},
+             {"axis_pt", json::array({0, 0, 0})}, {"axis_dir", json::array({0, 0, 1})},
+             {"count", 3}, {"angle", 360.0}},
+        // Outer: replicate the whole ring along +X (a second ring centred at x=12).
+        json{{"id", "lp"}, {"type", "linear_pattern"}, {"seed", "cp"},
+             {"count1", 2}, {"spacing1", 12.0}, {"dir1", json::array({1, 0, 0})}},
+    });
+
+    CompileResult r = compile_document(doc, json::object());
+    REQUIRE(r.ok);
+    for (const auto& s : r.statuses) CHECK(s.ok);
+    REQUIRE(r.body_count == 1);
+
+    render::DocMesh dm = parse(r);
+    REQUIRE(dm.bodies.size() == 1);
+    const render::BodyMesh& b = dm.bodies[0];
+    check_common(b);
+    const double box_vol = L * W * D;  // 18000
+    const double vol = mesh_volume(b);
+    MESSAGE("J1 nested cut: body_count=" << r.body_count << " volume=" << vol
+            << " (box alone=" << box_vol << ")");
+    // Material was REMOVED, not added: the nested cut pattern bored two rings of holes.
+    CHECK(vol < box_vol - 1.0);
+}
+
+// 4. INSTANCE CAP (Bug K1). A 100x100 linear pattern (10000 cells) used to HANG and
+//    crash the server. It must now ERROR CLEANLY (before any geometry runs) with a
+//    message naming the cap — and never hang. The seed cube still builds, so the doc is
+//    not empty; only the pattern feature fails.
+TEST_CASE("over-cap linear pattern errors instead of hanging (K1)") {
+    json doc;
+    doc["features"] = json::array({
+        sketch_feature("s1", "top", rect_entities(0, 0, 5, 5)),
+        json{{"id", "x1"}, {"type", "extrude"}, {"profile", "s1"}, {"depth", 5.0}},
+        json{{"id", "lp"}, {"type", "linear_pattern"}, {"seed", "x1"},
+             {"count1", 100}, {"spacing1", 10.0}, {"dir1", json::array({1, 0, 0})},
+             {"count2", 100}, {"spacing2", 10.0}, {"dir2", json::array({0, 1, 0})}},
+    });
+
+    CompileResult r = compile_document(doc, json::object());
+    CHECK_FALSE(r.ok);  // the pattern feature failed
+    const aicad::doc::FeatureStatus* lp = nullptr;
+    for (const auto& s : r.statuses) if (s.id == "lp") lp = &s;
+    REQUIRE(lp != nullptr);
+    CHECK_FALSE(lp->ok);
+    CHECK(lp->error.find("exceeds the limit") != std::string::npos);
+    // The seed cube still survives (a contained per-feature error).
+    CHECK(r.body_count == 1);
+}
+
+// 5. A circular pattern over the cap errors too (same guard, count path).
+TEST_CASE("over-cap circular pattern errors instead of hanging (K1)") {
+    json doc;
+    doc["features"] = json::array({
+        sketch_feature("s1", "top", rect_entities(17, -3, 6, 6)),
+        json{{"id", "x1"}, {"type", "extrude"}, {"profile", "s1"}, {"depth", 6.0}},
+        json{{"id", "cp"}, {"type", "circular_pattern"}, {"seed", "x1"},
+             {"axis_pt", json::array({0, 0, 0})}, {"axis_dir", json::array({0, 0, 1})},
+             {"count", 9000}, {"angle", 360.0}},
+    });
+    CompileResult r = compile_document(doc, json::object());
+    CHECK_FALSE(r.ok);
+    const aicad::doc::FeatureStatus* cp = nullptr;
+    for (const auto& s : r.statuses) if (s.id == "cp") cp = &s;
+    REQUIRE(cp != nullptr);
+    CHECK_FALSE(cp->ok);
+    CHECK(cp->error.find("exceeds the limit") != std::string::npos);
+}
+
+// 6. LOFT BOSS IS PATTERNABLE (Bug J3). A loft between two offset square sections, then
+//    a linear_pattern of that loft. Before the fix loft left tool_body_of unset, so the
+//    pattern failed with "feature has no patternable geometry". The pattern must produce
+//    a single fused body whose volume exceeds the single loft (replication happened).
+TEST_CASE("loft boss is a valid pattern seed (J3)") {
+    json doc;
+    // Section A on Top (z=0), section B on a plane offset +20 in Z (so they are not
+    // coplanar -> a real lofted prism). Both 10x10 squares at the origin.
+    json planeB = json{{"id", "pb"}, {"type", "plane"}, {"method", "offset"},
+                       {"base", "plane.top"}, {"offset", 20.0}};
+    doc["features"] = json::array({
+        sketch_feature("sa", "top", rect_entities(-5, -5, 10, 10)),
+        planeB,
+        json{{"id", "sb"}, {"type", "sketch"}, {"plane", "pb"},
+             {"entities", rect_entities(-5, -5, 10, 10).entities},
+             {"constraints", rect_entities(-5, -5, 10, 10).constraints}},
+        json{{"id", "lf"}, {"type", "loft"}, {"sections", json::array({"sa", "sb"})}},
+        json{{"id", "lp"}, {"type", "linear_pattern"}, {"seed", "lf"},
+             {"count1", 2}, {"spacing1", 30.0}, {"dir1", json::array({1, 0, 0})}},
+    });
+    CompileResult r = compile_document(doc, json::object());
+    REQUIRE(r.ok);
+    for (const auto& s : r.statuses) CHECK(s.ok);
+    REQUIRE(r.body_count == 1);
+    render::DocMesh dm = parse(r);
+    REQUIRE(dm.bodies.size() == 1);
+    const double one_loft = 10.0 * 10.0 * 20.0;  // 2000 (prismatic loft of equal squares)
+    const double vol = mesh_volume(dm.bodies[0]);
+    MESSAGE("J3 loft pattern: volume=" << vol << " (one loft=" << one_loft << ")");
+    CHECK(vol > one_loft + 1.0);  // the loft was replicated (>1 instance)
+}
+
+// 7. SWEEP BOSS IS PATTERNABLE (Bug J3). A sweep (circle along a vertical line), then a
+//    linear_pattern of it. The sweep must register a patternable tool so the pattern
+//    builds a single fused body with more volume than one sweep.
+TEST_CASE("sweep boss is a valid pattern seed (J3)") {
+    const double R = 3.0, Hh = 20.0;
+    json prof;
+    prof["id"] = "prof"; prof["type"] = "sketch"; prof["plane"] = "top";
+    prof["entities"] = json::array({circle("e1", 0, 0, R)});
+    prof["constraints"] = json::array({
+        rel("c1", "fix", {"e1.center"}),
+        dim("c2", "radius", {"e1"}, R),
+    });
+    json path;
+    path["id"] = "path"; path["type"] = "sketch"; path["plane"] = "front";
+    path["entities"] = json::array({line("e1", 0, 0, 0, Hh)});
+    path["constraints"] = json::array({
+        rel("c1", "fix", {"e1.p1"}),
+        rel("c2", "vertical", {"e1"}),
+        dim("c3", "distance", {"e1.p1", "e1.p2"}, Hh),
+    });
+    json doc;
+    doc["features"] = json::array({
+        prof, path,
+        json{{"id", "sw"}, {"type", "sweep"}, {"profile", "prof"}, {"path", "path"}},
+        json{{"id", "lp"}, {"type", "linear_pattern"}, {"seed", "sw"},
+             {"count1", 3}, {"spacing1", 12.0}, {"dir1", json::array({1, 0, 0})}},
+    });
+    CompileResult r = compile_document(doc, json::object());
+    REQUIRE(r.ok);
+    for (const auto& s : r.statuses) CHECK(s.ok);
+    REQUIRE(r.body_count == 1);
+    render::DocMesh dm = parse(r);
+    REQUIRE(dm.bodies.size() == 1);
+    const double one_sweep = PI_CONST * R * R * Hh;
+    const double vol = mesh_volume(dm.bodies[0]);
+    MESSAGE("J3 sweep pattern: volume=" << vol << " (one sweep=" << one_sweep << ")");
+    CHECK(vol > one_sweep + 1.0);  // replicated (3 disjoint cylinders)
 }

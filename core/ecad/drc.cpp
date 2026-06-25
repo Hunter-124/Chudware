@@ -122,12 +122,6 @@ double seg_box_dist(const Point& a, const Point& b, double cx, double cy, double
     return best;
 }
 
-double box_box_dist(const Point& c1, const Point& h1, const Point& c2, const Point& h2) {
-    double dx = std::max(std::abs(c1.first - c2.first) - (h1.first + h2.first), 0.0);
-    double dy = std::max(std::abs(c1.second - c2.second) - (h1.second + h2.second), 0.0);
-    return std::hypot(dx, dy);
-}
-
 bool shared_layer(const Shape& a, const Shape& b) {
     for (const auto& l : a.layers)
         if (b.layers.count(l)) return true;
@@ -136,31 +130,42 @@ bool shared_layer(const Shape& a, const Shape& b) {
 
 double edge_distance(const Shape& a, const Shape& b);  // fwd
 
+// Edge-to-edge copper distance between two normalized shapes — the TRUE SIGNED gap
+// (positive = clear, 0 = touching, negative = copper overlap). Mirrors
+// engine/ecad/drc.py::edge_distance EXACTLY. The DRC clearance reporter must surface the
+// real measurement, so this MUST NOT clamp at 0 — clamping made overlapping/near-touching
+// copper (e.g. tight SOIC pads) read as "clearance 0mm" instead of the actual gap.
+// Callers that need a non-negative value clamp themselves (see shape_edge_dist).
 double edge_distance(const Shape& a, const Shape& b) {
     if (a.kind == "seg" && b.kind == "seg") {
         double d = seg_seg_dist(a.p1, a.p2, b.p1, b.p2);
-        return std::max(d - a.margin - b.margin, 0.0);
+        return d - a.margin - b.margin;
     }
     if (a.kind == "seg" && b.kind == "circle") {
         double d = point_seg_dist(b.center, a.p1, a.p2);
-        return std::max(d - a.margin - b.margin, 0.0);
+        return d - a.margin - b.margin;
     }
     if (a.kind == "circle" && b.kind == "seg") return edge_distance(b, a);
     if (a.kind == "circle" && b.kind == "circle")
-        return std::max(dist(a.center, b.center) - a.margin - b.margin, 0.0);
+        return dist(a.center, b.center) - a.margin - b.margin;
     if (a.kind == "seg" && b.kind == "box") {
         double d = seg_box_dist(a.p1, a.p2, b.center.first, b.center.second, b.half.first,
                                 b.half.second);
-        return std::max(d - a.margin, 0.0);
+        return d - a.margin;
     }
     if (a.kind == "box" && b.kind == "seg") return edge_distance(b, a);
     if (a.kind == "circle" && b.kind == "box") {
         double d = point_box_dist(a.center, b.center.first, b.center.second, b.half.first,
                                   b.half.second);
-        return std::max(d - a.margin, 0.0);
+        return d - a.margin;
     }
     if (a.kind == "box" && b.kind == "circle") return edge_distance(b, a);
-    return box_box_dist(a.center, a.half, b.center, b.half);
+    // box / box — reconstruct a signed value so overlapping boxes report a negative gap
+    // (matches drc.py: penetration depth along the shallowest axis when overlapping).
+    double dx = std::abs(a.center.first - b.center.first) - (a.half.first + b.half.first);
+    double dy = std::abs(a.center.second - b.center.second) - (a.half.second + b.half.second);
+    if (dx <= 0.0 && dy <= 0.0) return std::max(dx, dy);
+    return std::hypot(std::max(dx, 0.0), std::max(dy, 0.0));
 }
 
 Point rotated_aabb_half(double w, double h, double angle_deg) {

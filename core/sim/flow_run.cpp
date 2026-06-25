@@ -101,22 +101,37 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
     // grows lift on LBM-Y.
     const double a = -fp.aoa_deg * 3.14159265358979323846 / 180.0;
     const double ca = std::cos(a), sa = std::sin(a);
-    std::vector<std::vector<float>> pos = body_pos;
+
+    // ── Step 1: compute the PART bounding box in the LBM (rotated) frame.
+    // This pass over the ORIGINAL body_pos vertices is kept strictly separate from the
+    // in-place mutation below so that the domain-offset shift applied during voxelization
+    // can never contaminate part[] / lo[] / hi[].  ref_length_mm and the Reynolds
+    // characteristic length must reflect the PART geometry, not the padded domain.
     double lo[3] = {1e30, 1e30, 1e30}, hi[3] = {-1e30, -1e30, -1e30};
     bool any = false;
-    for (auto& p : pos)
+    for (const auto& p : body_pos)
         for (size_t i = 0; i + 2 < p.size(); i += 3) {
-            double x = p[i], y = p[i + 1], z = p[i + 2];
-            double xr = x * ca + z * sa, zr = -x * sa + z * ca;  // pitch about CAD-Y
-            p[i] = (float)xr;       // LBM X (flow)
-            p[i + 1] = (float)zr;   // LBM Y (lift) = CAD-Z after pitch
-            p[i + 2] = (float)y;    // LBM Z (span) = CAD-Y
+            const double x = p[i], y = p[i + 1], z = p[i + 2];
+            const double xr = x * ca + z * sa, zr = -x * sa + z * ca;  // pitch about CAD-Y
+            // LBM frame: axis-0=xr (flow), axis-1=zr (lift=CAD-Z), axis-2=y (span=CAD-Y)
             lo[0] = std::min(lo[0], xr); hi[0] = std::max(hi[0], xr);
             lo[1] = std::min(lo[1], zr); hi[1] = std::max(hi[1], zr);
-            lo[2] = std::min(lo[2], (double)y); hi[2] = std::max(hi[2], (double)y);
+            lo[2] = std::min(lo[2],   y); hi[2] = std::max(hi[2],   y);
             any = true;
         }
     if (!any) { R.ok = false; R.error = "empty geometry"; return R; }
+
+    // ── Step 2: build the rotated+axis-swapped working copy used for voxelization.
+    // This mutates the copy in-place; lo[]/hi[] are already final from Step 1.
+    std::vector<std::vector<float>> pos = body_pos;
+    for (auto& p : pos)
+        for (size_t i = 0; i + 2 < p.size(); i += 3) {
+            const double x = p[i], y = p[i + 1], z = p[i + 2];
+            const double xr = x * ca + z * sa, zr = -x * sa + z * ca;
+            p[i]     = (float)xr;  // LBM X (flow)
+            p[i + 1] = (float)zr;  // LBM Y (lift) = CAD-Z after pitch
+            p[i + 2] = (float)y;   // LBM Z (span) = CAD-Y
+        }
 
     double part[3] = {hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]};
     double longest = std::max({part[0], part[1], part[2]});

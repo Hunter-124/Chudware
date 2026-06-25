@@ -369,6 +369,64 @@ def test_determinism_and_guard():
     print("  test_determinism_and_guard OK")
 
 
+# ── Test M1: edge_distance reports true signed gap (no 0-floor) ───────────────────────
+
+def test_m1_true_clearance_distance():
+    """M1: DRC clearance message must report the REAL edge-to-edge gap, not '0mm'.
+
+    With adjacent SOIC-style rect pads (pitch 1.27mm, pad height 1.55mm) the pads
+    GEOMETRICALLY OVERLAP by 0.28mm.  The old code clamped edge_distance to 0 so the
+    violation message read "clearance 0mm".  After the fix, the signed gap (-0.28mm) is
+    surfaced so the message shows the real measurement.
+
+    For clearly-separated pads (gap 0.1mm, < required 0.2mm), the reported distance
+    must still be exactly 0.1mm (positive, no clamping needed there either).
+    """
+    from engine.ecad.drc import edge_distance, _pad_shape
+
+    # ── sub-test A: separated pads (gap=0.1mm > 0) stays correct ──
+    b = _board()
+    _add_net(b, "NA"); _add_net(b, "NB")
+    # Two circle pads, centers 0.6mm apart, radius 0.25 → gap 0.1mm
+    b["footprints"] = [
+        _fp("fp1", (0.0, 0.0), [_smd_pad("p1", (0.0, 0.0), "NA", size=(0.5, 0.5))]),
+        _fp("fp2", (0.6, 0.0), [_smd_pad("p2", (0.0, 0.0), "NB", size=(0.5, 0.5))]),
+    ]
+    viols = run_drc(b)
+    clr = [v for v in viols if v["rule"] == "clearance"]
+    assert len(clr) == 1, clr
+    msg = clr[0]["message"]
+    assert "0.1" in msg, f"expected 0.1mm gap in message, got: {msg!r}"
+    assert "0mm" not in msg.split()[1], f"gap must not be rounded to '0mm': {msg!r}"
+
+    # ── sub-test B: overlapping rect pads (SOIC-style) must report negative gap ──
+    # pitch 1.27mm, pad height 1.55mm → overlap -0.28mm on Y axis
+    b2 = _board()
+    _add_net(b2, "NA"); _add_net(b2, "NB")
+    b2["footprints"] = [
+        _fp("fp3", (0.0, 0.0), [
+            _smd_pad("p3", (0.0, 1.27 / 2), "NA", size=(0.6, 1.55), shape="rect"),
+            _smd_pad("p4", (0.0, -1.27 / 2), "NB", size=(0.6, 1.55), shape="rect"),
+        ]),
+    ]
+    viols2 = run_drc(b2)
+    clr2 = [v for v in viols2 if v["rule"] == "clearance"]
+    # Must fire: gap is -0.28mm which is < required 0.2mm
+    assert len(clr2) == 1, f"overlapping SOIC pads must raise clearance, got: {clr2}"
+    msg2 = clr2[0]["message"]
+    # The gap must NOT say "0.0mm" — it should show a negative value
+    assert "0.0mm" not in msg2 or "-" in msg2, \
+        f"overlapping-pad violation must not report 0.0mm gap: {msg2!r}"
+    # Explicitly verify the signed edge_distance is negative for these shapes
+    n_cu = 2
+    from engine.ecad.drc import _pad_shape as _ps
+    sh3 = _ps(b2["footprints"][0], b2["footprints"][0]["pads"][0], n_cu)
+    sh4 = _ps(b2["footprints"][0], b2["footprints"][0]["pads"][1], n_cu)
+    d = edge_distance(sh3, sh4)
+    assert d < 0, f"overlapping SOIC pads must have negative edge_distance, got {d}"
+    print("  test_m1_true_clearance_distance OK")
+
+
 def main() -> None:
     print("=" * 60)
     print("AI-ECAD DRC + RATSNEST TESTS")
@@ -384,6 +442,7 @@ def main() -> None:
     test_net_class_clearance_override()
     test_helpers()
     test_determinism_and_guard()
+    test_m1_true_clearance_distance()
     print("ALL DRC + RATSNEST TESTS PASSED")
 
 

@@ -268,6 +268,173 @@ def test_edge_inputs():
     print("  test_edge_inputs OK")
 
 
+# ── Test M3: autoroute accepts diff_pairs='auto' string ─────────────────────────────
+
+def test_m3_diff_pairs_auto_string():
+    """M3: autoroute(opts={'diff_pairs':'auto'}) must not crash (treated as auto-detect).
+
+    Previously a string for diff_pairs caused an iteration error because the code tried
+    to iterate over it as a list.  The fix coerces any string value to 'auto' (no explicit
+    pairs), letting the router's built-in naming auto-detect handle it.
+    """
+    b = _two_net_board()
+    # Pass 'auto' as the diff_pairs option — should not crash, should route normally
+    res = autoroute(b, opts={"diff_pairs": "auto"})
+    assert "tracks" in res and "report" in res, "autoroute with diff_pairs='auto' must return result"
+    # Report must not contain an error
+    assert isinstance(res["report"]["routed"], list), "routed must be a list"
+    assert isinstance(res["report"]["failed"], list), "failed must be a list"
+    # Should still route successfully (same as default)
+    after = ratsnest(route_board(b, opts={"diff_pairs": "auto"}))
+    assert len(after) == 0, f"diff_pairs='auto' should not break routing; airwires remain: {after}"
+    print("  test_m3_diff_pairs_auto_string OK")
+
+
+# ── Test M4: routed/failed net accounting (single-pad stubs excluded) ─────────────────
+
+def test_m4_routed_net_accounting():
+    """M4: autoroute report['routed'] must only list nets that actually had airwires
+    connected — single-pad stubs (no airwires) must NOT appear in 'routed'.
+
+    On a board with one 2-pad net (SIG) and two single-pad nets (PWR, GND):
+      - airwires_before = 1 (SIG only)
+      - after routing: routed=['SIG'], failed=[]
+      - PWR and GND never appear in routed (they had no airwires to route)
+    """
+    b = _board()
+    _add_net(b, "SIG")
+    _add_net(b, "PWR")
+    _add_net(b, "GND")
+    _rect_outline(b, 20, 20)
+    # SIG: 2 pads -> 1 airwire -> routable
+    b["footprints"] = [
+        _fp("fp1", (3.0, 10.0), [_smd_pad("p1", (0.0, 0.0), "SIG")]),
+        _fp("fp2", (17.0, 10.0), [_smd_pad("p2", (0.0, 0.0), "SIG")]),
+        # single-pad stubs: no airwires
+        _fp("fp3", (3.0, 3.0), [_smd_pad("p3", (0.0, 0.0), "PWR")]),
+        _fp("fp4", (3.0, 17.0), [_smd_pad("p4", (0.0, 0.0), "GND")]),
+    ]
+    res = autoroute(b)
+    rep = res["report"]
+    assert rep["airwires_before"] == 1, f"expected 1 airwire, got {rep['airwires_before']}"
+    # routed should only include SIG (the net with an airwire that was connected)
+    routed_set = set(rep["routed"])
+    assert "SIG" in routed_set, f"SIG should be in routed, got {routed_set}"
+    assert "PWR" not in routed_set, f"single-pad PWR must not appear in routed: {routed_set}"
+    assert "GND" not in routed_set, f"single-pad GND must not appear in routed: {routed_set}"
+    # failed should be empty (SIG routes easily)
+    assert rep["failed"] == [], f"all airwires should route, got failed={rep['failed']}"
+    print(f"  test_m4_routed_net_accounting OK  (routed={sorted(routed_set)})")
+
+
+# ── Test M5: a placed VIA must honour copper clearance (via halo, not track halo) ─────
+
+def test_m5_via_respects_clearance():
+    """M5: the router must not drop a via that violates clearance against other-net copper.
+
+    A via's copper radius (via_dia/2, default 0.4mm) is far larger than a track's half-width
+    (~0.1mm). The obstacle grid inflates other-net copper by the *track* halo, so A* used to drop
+    a through-via on any track-routable cell — landing the via's copper within `clearance` of a
+    neighbouring pad (e.g. 0.05mm from a wall on a 0.2mm rule). The fix gates via placement on a
+    second, via-sized halo.
+
+    Fixture: a layer-trap that forces exactly one via. SIG runs (4,10)->(16,10) on F.Cu; a B.Cu
+    wall at x=8 and an F.Cu wall at x=12 (each a single-pad net, so neither is itself routed) mean
+    no single layer spans the route — A* must via between the walls, right next to the F.Cu wall.
+    """
+    from engine.ecad import drc
+
+    def _pad(pid, pos, net, size, layers):
+        return {"id": pid, "number": "1", "pos": list(pos), "angle": 0.0, "shape": "rect",
+                "size": list(size), "type": "smd", "layers": list(layers), "drill": None, "net": net}
+
+    b = _board()
+    b["stackup"] = {"copper_layers": 2}
+    b["rules"] = {"clearance": 0.2, "track_width_min": 0.2, "via_diameter_min": 0.0,
+                  "via_drill_min": 0.0, "annular_ring_min": 0.0, "hole_to_hole_min": 0.0,
+                  "edge_clearance": 0.0}
+    for n in ("SIG", "WB", "WF"):
+        _add_net(b, n)
+    _rect_outline(b, 20, 20)
+    b["footprints"] = [
+        _fp("fp1", (4.0, 10.0), [_pad("a1", (0.0, 0.0), "SIG", (0.6, 0.6), ["F.Cu"])]),
+        _fp("fp2", (16.0, 10.0), [_pad("a2", (0.0, 0.0), "SIG", (0.6, 0.6), ["F.Cu"])]),
+        _fp("wB", (8.0, 10.0), [_pad("gB", (0.0, 0.0), "WB", (0.6, 20.0), ["B.Cu"])]),
+        _fp("wF", (12.0, 10.0), [_pad("gF", (0.0, 0.0), "WF", (0.6, 20.0), ["F.Cu"])]),
+    ]
+    clr = float(b["rules"]["clearance"])
+
+    res = autoroute(b, opts={"pitch": 0.25})
+    assert res["report"]["vias"] >= 1, \
+        f"fixture must force a via for the test to be meaningful: {res['report']}"
+
+    routed = _apply(b, res)
+    # 1) board-level guarantee: no clearance violation names a via.
+    via_ids = {v["id"] for v in res["vias"]}
+    bad = [v for v in _clearance_viols(routed) if via_ids & set(v["items"])]
+    assert not bad, f"router dropped a via that violates clearance: {[v['message'] for v in bad]}"
+
+    # 2) independent geometry check: every via clears all other-net copper by >= clearance.
+    shapes = drc._copper_shapes(routed)
+    for v in res["vias"]:
+        vsh = drc._via_shape(v)
+        for s in shapes:
+            if drc.same_net(s.net, vsh.net) or not (vsh.layers & s.layers):
+                continue
+            d = drc.edge_distance(vsh, s)
+            assert d >= clr - 1e-9, \
+                f"via {v['id']} only {d:.4f}mm from {s.item_id} (need {clr}mm)"
+    print(f"  test_m5_via_respects_clearance OK  (vias={res['report']['vias']})")
+
+
+# ── Test M6: a route connects a pad only on a layer the pad occupies ──────────────────
+
+def test_m6_terminal_layer_aware():
+    """M6: the router must connect to a pad only on a copper layer where the pad has copper.
+
+    Two same-net pads, one F.Cu-only and one B.Cu-only, on an open board. A single-layer track
+    cannot connect them — it would "reach" one pad on a layer with no copper there (the old bug,
+    where terminal cells were offered on every layer). A physically-correct route must change layers,
+    so it places >= 1 via, and the copper that touches each pad sits on that pad's own layer.
+    """
+    from engine.ecad import drc
+
+    def _pad(pid, pos, net, layers):
+        return {"id": pid, "number": "1", "pos": list(pos), "angle": 0.0, "shape": "rect",
+                "size": [0.6, 0.6], "type": "smd", "layers": list(layers), "drill": None, "net": net}
+
+    b = _board()
+    b["stackup"] = {"copper_layers": 2}
+    _add_net(b, "SIG")
+    _rect_outline(b, 20, 20)
+    b["footprints"] = [
+        _fp("fp1", (5.0, 10.0), [_pad("p1", (0.0, 0.0), "SIG", ["F.Cu"])]),   # F.Cu only
+        _fp("fp2", (15.0, 10.0), [_pad("p2", (0.0, 0.0), "SIG", ["B.Cu"])]),  # B.Cu only
+    ]
+    res = autoroute(b, opts={"pitch": 0.25})
+    assert "SIG" in res["report"]["routed"], f"SIG should route F->B via a via: {res['report']}"
+    assert res["report"]["vias"] >= 1, \
+        f"connecting an F.Cu pad to a B.Cu pad REQUIRES a via, got {res['report']['vias']}"
+
+    # each pad must be reached by copper ON ITS OWN LAYER: a track on that layer ending at the pad,
+    # or a via spanning that layer at the pad point. (The old layer-blind router connected the F.Cu
+    # pad with a B.Cu-only track and no via — leaving the pad's own layer with no copper.)
+    pad_layer = {"p1": "F.Cu", "p2": "B.Cu"}
+    pad_at = {"p1": (5.0, 10.0), "p2": (15.0, 10.0)}
+    for pid, at in pad_at.items():
+        lyr = pad_layer[pid]
+        track_hit = any(t["layer"] == lyr and
+                        (drc._dist((t["p1"][0], t["p1"][1]), at) <= 1e-6 or
+                         drc._dist((t["p2"][0], t["p2"][1]), at) <= 1e-6)
+                        for t in res["tracks"])
+        via_hit = any(lyr in v.get("layers", []) and
+                      drc._dist((v["at"][0], v["at"][1]), at) <= 1e-6
+                      for v in res["vias"])
+        assert track_hit or via_hit, \
+            f"pad {pid} (on {lyr}) is not reached by copper on its own layer (layer-blind route)"
+    print(f"  test_m6_terminal_layer_aware OK  (vias={res['report']['vias']})")
+
+
 def main() -> None:
     print("=" * 60)
     print("AI-ECAD AUTOROUTER TESTS")
@@ -280,6 +447,10 @@ def main() -> None:
     test_no_mutation()
     test_id_allocation()
     test_edge_inputs()
+    test_m3_diff_pairs_auto_string()
+    test_m4_routed_net_accounting()
+    test_m5_via_respects_clearance()
+    test_m6_terminal_layer_aware()
     print("ALL AUTOROUTER TESTS PASSED")
 
 

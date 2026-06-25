@@ -42,6 +42,23 @@ struct OpError : std::runtime_error {
     }
 };
 
+// CRASH RECOVERY (P0 deadlock fix). Every doc_* RPC takes the process-global
+// session mutex via a std::lock_guard, which releases correctly when a C++
+// exception (e.g. OpError from a rejected op batch) unwinds the stack. But a
+// WINDOWS STRUCTURED EXCEPTION (an access violation — null deref reading 0x60 —
+// raised deep inside compile_document while the lock is held) does NOT run C++
+// destructors under /EHsc, so the lock_guard never releases and the mutex stays
+// owned by the worker thread. The NEXT doc_* call on that same thread then
+// re-locks the still-held non-recursive mutex => std::system_error EDEADLK
+// ("resource deadlock would occur"), bricking EVERY document until restart.
+//
+// The libaicad C dispatch boundary catches such a structured exception with an
+// __except filter and calls this to drop the orphaned lock BEFORE returning the
+// error, so the thread can serve the next call cleanly. Idempotent and safe to
+// call when the lock is NOT held by this thread (it no-ops via try_lock probing).
+// Returns true if it actually released an orphaned lock.
+bool force_release_doc_lock();
+
 // Create a new blank document ("part"; "assembly" not yet supported). Returns the
 // ops-response + "doc_id". Registers the session in the process-global store.
 nlohmann::json doc_new(const std::string& kind, const std::string& name);

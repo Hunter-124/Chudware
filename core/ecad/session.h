@@ -130,4 +130,13 @@ nlohmann::json ecad_simulate(const std::string& doc_id, const nlohmann::json& st
 // Throws OpError("unknown_doc") if no such session is open.
 nlohmann::json ecad_session_doc(const std::string& doc_id);
 
+// CRASH RECOVERY (P0 deadlock fix — mirrors force_release_doc_lock in doc/session.h).
+// Drop an orphaned ECAD session-store g_mtx lock left held by THIS thread after a
+// Windows structured exception (access violation) unwound past an EcadLock without
+// running its C++ destructor under /EHsc. Called from the libaicad C dispatch boundary's
+// __except filter alongside force_release_doc_lock and force_release_drawing_lock so
+// ANY hardware fault releases ALL orphaned registry locks. Idempotent: no-ops if the
+// lock is not held by the current thread. Returns true if it released an orphaned lock.
+bool force_release_ecad_lock();
+
 }  // namespace aicad::ecad

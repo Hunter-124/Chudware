@@ -973,6 +973,7 @@ struct AppState {
         RT_ViewLayout = 9, RT_Annotation = 10,
     };
     bool showRibbon = true;        // View > Ribbon visibility toggle
+    bool profilerRunning = false;  // Evaluate > Profiler: sampling profiler active (libaicad prof_*)
     int  ribbonTab  = RT_Features; // active ribbon tab (one of RibbonTab); contextual on the doc
     bool showSimulationTools = false; // View-gated advanced module; hidden from default ribbon
     bool showPcbTools = false;        // View-gated ECAD module; hidden until requested/used

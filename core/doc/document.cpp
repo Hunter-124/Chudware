@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
@@ -40,6 +41,7 @@
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepBndLib.hxx>
+#include <BRepCheck_Analyzer.hxx>  // sweep self-intersection validity check (Bug B3)
 #include <BRepGProp.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
@@ -47,6 +49,9 @@
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
+#include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>  // seam-aware open-shell test (S2)
+#include <TopTools_ListOfShape.hxx>
+#include <TopTools_ListIteratorOfListOfShape.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <Bnd_Box.hxx>
 #include <GCPnts_TangentialDeflection.hxx>
@@ -60,6 +65,7 @@
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
+#include <TopoDS_Solid.hxx>  // ShapeFix_Solid heal of an inverted body (Bug N2)
 #include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Circ.hxx>
@@ -75,6 +81,7 @@
 #include <GeomAPI_ProjectPointOnCurve.hxx>
 #include <GeomLProp_SLProps.hxx>
 #include <ShapeAnalysis.hxx>  // FindBounds: free ends of an open profile wire (revolve auto-close)
+#include <ShapeFix_Solid.hxx>  // heal an inverted/negative-volume solid (Bug N2)
 
 #include "doc/formats.h"  // import_bodies / detect_format (the import feature)
 #include "doc/picks.h"
@@ -90,6 +97,8 @@
 #include "geom/weldment.h"
 #include "geom/surfacing.h"
 #include "geom/curves.h"
+#include "geom/thread.h"
+#include "geom/text.h"
 #include "geom/tessellate.h"
 #include "geom/transform.h"
 #include "geom/aicm.h"
@@ -169,6 +178,12 @@ EnvMap parse_env(const json& env) {
     return m;
 }
 
+// Total-instance cap shared by every replicating feature (linear/circular pattern,
+// bolt_circle). A runaway count used to build tens of thousands of boolean ops and
+// HANG the whole MCP server; the cap rejects it loudly before any geometry runs. It
+// is generous — far above any real part — so legitimate patterns are never blocked.
+constexpr long long kPatternInstanceLimit = 4000;
+
 // A numeric param that may be (a) a raw number, (b) a string expression, or (c) the
 // CANONICAL dim object {"value": <num>, "expr": <string|null>} the host sends for
 // every dimensioned param (radius/length/diameter/angle/depth/count/spacing...).
@@ -225,7 +240,14 @@ const TopoDS_Shape& require_solid(const std::map<std::string, FeatureResult>& re
     if (!std::holds_alternative<SolidResult>(it->second))
         throw std::runtime_error(std::string("ref '") + slot + "' -> '" + ref_id +
                                  "' is a sketch, not a solid body");
-    return std::get<SolidResult>(it->second).shape;
+    const TopoDS_Shape& s = std::get<SolidResult>(it->second).shape;
+    // Bug N1 (defensive) — a body that compiled to a NULL shape must not be handed to a
+    // downstream kernel op (face/edge resolvers and OCCT booleans dereference the
+    // TShape; a null one is a likely access-violation source). Fail loudly instead.
+    if (s.IsNull())
+        throw std::runtime_error(std::string("ref '") + slot + "' -> '" + ref_id +
+                                 "' is an empty (null) body");
+    return s;
 }
 
 // Look up a referenced SKETCH result by id (for extrude/revolve profiles). Throws
@@ -499,8 +521,13 @@ json normalize_feature(const json& raw) {
                 if (val.is_array() && !val.empty()) f["b"] = selector_owner_id(val.front());
             } else if (slot == "features") {
                 // pattern/mirror replicate a LIST of feature ids; the simplified C++
-                // model patterns a single seed -> take the first.
+                // model patterns a single seed -> take the first. Accept BOTH a list
+                // and a bare id string (Bug N4 — symmetric with how `profile` accepts
+                // either shape). By this point session.cpp has already rewritten any
+                // same-batch "$<index>" placeholder to its "fN" id, so this only needs
+                // to map the (already-resolved) reference onto `seed`.
                 if (val.is_array() && !val.empty()) f["seed"] = selector_owner_id(val.front());
+                else if (val.is_string()) f["seed"] = val;
             } else if (slot == "plane") {
                 if (type == "sketch" && val.is_string()) {
                     // sketch plane datum "plane.top" -> the plane NAME "top".
@@ -599,6 +626,45 @@ json normalize_feature(const json& raw) {
     return f;
 }
 
+// SEAM-AWARE closed-solid test (S2 / S1) — a mirror of session.cpp::eval_is_closed_solid
+// (kept private there, so duplicated here for the dress-op post-check). A valid closed
+// solid has every edge shared by >= 2 faces; the only single-face exceptions are SEAMS
+// (BRep_Tool::IsClosed — the 0/2pi closure of a cylinder/sphere/revolution skin) and
+// DEGENERATE edges (a cone apex / sphere pole). Any OTHER edge with < 2 incident faces is
+// a genuine FREE edge -> the shell is open (the part is not watertight). This is the case
+// the N2 negative-volume guard does NOT catch: a partial fillet/chamfer (some edges too
+// tight) or a freeform shell can hand back a body whose volume is positive but whose B-rep
+// is an open shell — eval_check then reports free_edges and STEP re-validation fails, yet
+// the feature committed ok:true. Using the seam-aware rule means a perfectly valid
+// cylinder/sphere/revolved body (which legitimately has seam edges) is NOT rejected.
+bool dress_is_closed_solid(const TopoDS_Shape& shape) {
+    try {
+        if (shape.IsNull()) return false;
+        TopTools_IndexedDataMapOfShapeListOfShape anc;
+        TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, anc);
+        TopTools_IndexedMapOfShape edges;
+        TopExp::MapShapes(shape, TopAbs_EDGE, edges);
+        if (edges.Extent() == 0) return false;  // no edges -> not a solid
+        for (int ei = 1; ei <= edges.Extent(); ++ei) {
+            const TopoDS_Shape& es = edges.FindKey(ei);
+            const int nf = anc.Contains(es) ? anc.FindFromKey(es).Extent() : 0;
+            if (nf >= 2) continue;  // shared by two faces -> fine
+            const TopoDS_Edge& e = TopoDS::Edge(es);
+            if (BRep_Tool::Degenerated(e)) continue;  // apex/pole -> legitimate
+            bool seam = false;
+            if (anc.Contains(es)) {
+                const TopTools_ListOfShape& faces = anc.FindFromKey(es);
+                for (TopTools_ListIteratorOfListOfShape it(faces); it.More(); it.Next())
+                    if (BRep_Tool::IsClosed(e, TopoDS::Face(it.Value()))) { seam = true; break; }
+            }
+            if (!seam) return false;  // a real free edge -> open shell
+        }
+        return true;
+    } catch (const Standard_Failure&) {
+        return false;  // conservative: an OCCT error means we can't vouch for closure
+    }
+}
+
 }  // namespace
 
 // ----------------------------------------------------------------- compile_document
@@ -674,6 +740,13 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     // solids consumed by a later feature (they no longer survive as standalone bodies).
     std::map<std::string, FeatureResult> results;
     std::set<std::string> consumed;
+    // Lineage of an in-place transform: when a `copy:false` transform CONSUMES a source body
+    // and produces a moved replacement, record source-id -> new-id here. A LATER transform that
+    // targets the same originating id then composes on the current descendant instead of
+    // re-reading the (still-in-results) original and spawning a duplicate body (Issue 4: "a
+    // second transform on an already-moved body duplicates it"). Only in-place transforms add
+    // links; a copy:true transform leaves the source live (instancing) and adds no link.
+    std::map<std::string, std::string> superseded_by;
     // Surviving solid ids in first-produced order, so the final body_id assignment
     // (1..N) and AICM body order are deterministic across rebuilds.
     std::vector<std::string> solid_order;
@@ -698,6 +771,11 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     // tool union); a pattern/mirror records its WHOLE result (op "add") so nesting works.
     std::map<std::string, TopoDS_Shape> tool_body_of;
     std::map<std::string, std::string> feature_op_of;  // "add" | "cut"
+
+    // Feature DISPLAY names seen so far (Bug K9): a duplicate name in one doc is
+    // confusing (the tree shows two "Boss-Extrude1"). We don't hard-error (it would
+    // break existing flows) — instead the SECOND+ occurrence carries a status.warning.
+    std::set<std::string> seen_names;
 
     // --- sheet-metal part state (the C++ analogue of the oracle's ctx.datums
     // _sheet_metal / _sheet_metal_bends). A base flange establishes the part as
@@ -731,8 +809,26 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     // when neither resolves -> the branch raises a clear error.
     auto body_ref = [&](const json& feat) -> std::string {
         if (feat.contains("body")) {
-            std::string bid = selector_owner_id(feat["body"]);
+            const json& bval = feat["body"];
+            std::string bid = selector_owner_id(bval);
             if (!bid.empty()) return bid;
+            // E10: body is present but did not resolve to a feature id — the caller passed
+            // something that looks like a numeric index (body:2) or an unrecognised selector
+            // object. Silently falling through to current_solid_id() would move the WRONG
+            // body (the assembly mistargeting pattern). Return a sentinel that causes the
+            // caller's require_solid to fire a clear, actionable error instead.
+            // We encode the sentinel as a special string so require_solid's "not found"
+            // message carries the original value for diagnosis.
+            std::string raw;
+            if (bval.is_number_integer()) raw = std::to_string(bval.get<int>());
+            else if (bval.is_number()) raw = std::to_string(bval.get<double>());
+            else if (bval.is_string()) raw = bval.get<std::string>();
+            else raw = bval.dump();
+            // Return an impossible feature id so require_solid throws:
+            //   ref 'body' -> '<body_ref_invalid: 2>' not found
+            // The message tells the caller exactly what to fix.
+            return "<body_ref_invalid: use a feature id like 'f3' (from get_part), "
+                   "not: " + raw + ">";
         }
         return current_solid_id();
     };
@@ -919,6 +1015,31 @@ CompileResult compile_document(const json& doc, const json& env_json) {
             throw std::runtime_error(std::string(slot) + ": edge selector dangling — " + reason);
         }
         return ep.edges.front();
+    };
+    // Validate that any FEATURE id a selector names (refs.<slot>.feature / owner_feature)
+    // refers to a feature that actually exists in this compile (Bug K4). The picks
+    // machinery scores a selector by its stamped geometry (centroid/length/normal) and a
+    // feature OWNER is only a soft tiebreak — so a selector that names a NON-EXISTENT
+    // feature ("f999") still resolves to whatever geometry scores best and the dress
+    // silently mutilates the wrong edge (an open shell that reported ok=true). Reject the
+    // dangling feature reference LOUDLY before the selector is resolved. Recurses into a
+    // selector list. (A reserved/word selector carries no feature id and passes through.)
+    std::function<void(const json&, const char*)> validate_selector_refs =
+        [&](const json& sel, const char* slot) {
+        if (sel.is_array()) {
+            for (const json& e : sel) validate_selector_refs(e, slot);
+            return;
+        }
+        if (!sel.is_object()) return;
+        for (const char* key : {"feature", "owner_feature"}) {
+            auto it = sel.find(key);
+            if (it != sel.end() && it->is_string()) {
+                const std::string fid = it->get<std::string>();
+                if (!fid.empty() && fid != "origin" && results.find(fid) == results.end())
+                    throw std::runtime_error(std::string(slot) +
+                        ": selector references unknown feature " + fid);
+            }
+        }
     };
     // (point, unit direction) of a straight model edge — datum.py::_edge_line_dir
     // (endpoint chord). Throws on a degenerate edge.
@@ -1109,6 +1230,76 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         return best;
     };
 
+    // --- post-compile solid sanity (Bug N2) -------------------------------------
+    // A deep feature tree could silently commit a B-rep with INVERTED shell
+    // orientation: VolumeProperties returns a NEGATIVE mass, mass/CoM/inertia all
+    // come out wrong, yet every feature reported ok:true with no geometry-check
+    // issue. A committed solid must NEVER have negative volume. After a feature
+    // produces/updates a solid we validate it here:
+    //   1. measure the signed volume.
+    //   2. if >= 0 (and finite) it is fine — return unchanged.
+    //   3. if NEGATIVE, try to HEAL the orientation:
+    //        a. ShapeFix_Solid (re-orients shells so the solid encloses a positive
+    //           volume — the kosher fix), then
+    //        b. as a fallback, Reversed() (flip the whole solid's orientation),
+    //      re-measuring after each. The first that yields a positive volume wins
+    //      and REPLACES the stored shape (with a status.warning recording the heal).
+    //   4. if neither heals it, FAIL the feature LOUDLY (caught by the per-feature
+    //      try/catch -> error status). Never silently commit the corrupt solid.
+    // Returns true on a healed solid (so the caller can flag a warning); false when
+    // the solid was already valid. Throws when the solid is invalid AND unhealable.
+    auto sanitize_solid = [&](const std::string& sid, const std::string& fname) -> bool {
+        auto rit = results.find(sid);
+        if (rit == results.end() || !std::holds_alternative<SolidResult>(rit->second))
+            return false;
+        // SURFACE (open sheet) bodies have no meaningful enclosed volume — the signed
+        // value VolumeProperties returns for an open shell is not an inversion signal.
+        // Skip them; only closed SOLID bodies are validated for negative volume.
+        auto kit = body_kinds.find(sid);
+        if (kit != body_kinds.end() && kit->second == "surface") return false;
+        TopoDS_Shape& shape = std::get<SolidResult>(rit->second).shape;
+        if (shape.IsNull()) return false;
+
+        auto signed_vol = [](const TopoDS_Shape& s) -> double {
+            GProp_GProps gp;
+            BRepGProp::VolumeProperties(s, gp);
+            return gp.Mass();
+        };
+        const double v0 = signed_vol(shape);
+        // A finite, non-negative volume is healthy. (A zero-volume body is its own
+        // problem handled by the producing branch; we only police NEGATIVE here.)
+        if (std::isfinite(v0) && v0 >= 0.0) return false;
+
+        // --- try to heal an inverted solid back to a positive volume ---
+        // Candidate 1: ShapeFix_Solid (proper shell re-orientation).
+        try {
+            if (shape.ShapeType() == TopAbs_SOLID) {
+                ShapeFix_Solid sfx(TopoDS::Solid(shape));
+                sfx.Perform();
+                TopoDS_Shape fixed = sfx.Solid();
+                if (!fixed.IsNull()) {
+                    double v = signed_vol(fixed);
+                    if (std::isfinite(v) && v > 0.0) { shape = fixed; return true; }
+                }
+            }
+        } catch (...) { /* fall through to the orientation flip */ }
+        // Candidate 2: flip the whole solid's orientation (Reversed). This directly
+        // un-inverts a solid whose shells are inside-out.
+        try {
+            TopoDS_Shape rev = shape.Reversed();
+            if (!rev.IsNull()) {
+                double v = signed_vol(rev);
+                if (std::isfinite(v) && v > 0.0) { shape = rev; return true; }
+            }
+        } catch (...) { /* unhealable -> error below */ }
+
+        // Unhealable: refuse to commit a negative-volume solid.
+        throw std::runtime_error(
+            "feature " + (fname.empty() ? sid : fname) +
+            " produced an inverted/invalid solid (negative volume " +
+            std::to_string(v0) + " mm^3) — refusing to commit a corrupt B-rep");
+    };
+
     const json empty = json::array();
     const json& base_features = doc.contains("features") ? doc.at("features") : empty;
 
@@ -1138,6 +1329,25 @@ CompileResult compile_document(const json& doc, const json& env_json) {
             result.statuses.push_back(std::move(st));
             continue;
         }
+
+        // Solid ids already committed before this feature ran — anything pushed past
+        // this mark is a body THIS feature produced, validated post-compile (Bug N2).
+        const std::size_t solids_before = solid_order.size();
+        // ALIVE (surviving, not-yet-consumed) solids before this feature ran. Used by the
+        // systemic "no silent vanish / null body / emptied document" backstop below (Bug
+        // B6 class): a modifying feature (fillet/chamfer/sweep/cut/...) that CONSUMES the
+        // only body but produces nothing must never silently leave the document empty.
+        std::size_t alive_before = 0;
+        for (const std::string& s : solid_order)
+            if (!consumed.count(s)) ++alive_before;
+        // Snapshot the CONSUMED set so the systemic backstop can ROLL IT BACK before it
+        // throws. The per-branch guards all throw BEFORE they mutate `consumed`/
+        // `solid_order`, so an erroring feature leaves the prior body intact. The backstop
+        // runs AFTER the branch already committed (it is a last-resort net for a degenerate
+        // result a branch's own guard missed), so a bare throw there would have ORPHANED
+        // the body this feature consumed — restoring `consumed` keeps the prior body alive
+        // in the surviving-bodies tessellation (the feature simply fails, geometry intact).
+        const std::set<std::string> consumed_snapshot = consumed;
 
         // Per-feature compile wrapped so an OCCT/eval throw becomes an error status,
         // never a crash (compile_document never-raises contract).
@@ -1924,6 +2134,12 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 }
 
                 results[id] = SolidResult{solid};
+                // Patternable tool: the lofted solid (instance-0 pose), op "add" — so a
+                // loft boss can be a pattern/mirror seed exactly like a revolve boss
+                // (Bug J3: loft previously left tool_body_of unset, so a pattern of a loft
+                // failed with "feature has no patternable geometry").
+                tool_body_of[id] = solid;
+                feature_op_of[id] = "add";
                 solid_order.push_back(id);
                 st.ok = true;
 
@@ -1936,21 +2152,61 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // engine/doc/features/primitives.py.
                 TopoDS_Shape solid;
                 if (type == "box") {
-                    solid = ::geom::make_box_centered(num_or_expr(feat.at("length"), env),
-                                                      num_or_expr(feat.at("width"), env),
-                                                      num_or_expr(feat.at("height"), env));
+                    // Validate the box dims UP FRONT (Bug A6): a 0/negative length, width
+                    // or height used to fall through to make_box_centered and surface late
+                    // as the opaque "box produced an empty solid". Reject with a clear,
+                    // dimension-named message instead.
+                    const double bl = num_or_expr(feat.at("length"), env);
+                    const double bw = num_or_expr(feat.at("width"), env);
+                    const double bh = num_or_expr(feat.at("height"), env);
+                    if (!(bl > 0.0 && bw > 0.0 && bh > 0.0))
+                        throw std::runtime_error("box: length/width/height must be > 0");
+                    // SUB-TOLERANCE guard (Bug K7): a dim above 0 but below OCCT's modelling
+                    // tolerance (1e-7) builds a degenerate solid that surfaces late as the
+                    // opaque "unknown error during feature compile". Name the offending dim.
+                    {
+                        const double kMinDim = 1e-7;  // Precision::Confusion
+                        const double bad = std::min({bl, bw, bh});
+                        if (bad < kMinDim) {
+                            char buf[160];
+                            std::snprintf(buf, sizeof(buf),
+                                "box: dimension %.3g is below the minimum tolerance (%.0e mm)",
+                                bad, kMinDim);
+                            throw std::runtime_error(buf);
+                        }
+                    }
+                    solid = ::geom::make_box_centered(bl, bw, bh);
                 } else if (type == "cylinder") {
-                    solid = ::geom::make_cylinder_centered(num_or_expr(feat.at("radius"), env),
-                                                           num_or_expr(feat.at("height"), env));
+                    // Sibling primitive on the SAME code path: validate up front so a
+                    // 0/negative radius or height errors clearly, not as "empty solid".
+                    const double cr = num_or_expr(feat.at("radius"), env);
+                    const double ch = num_or_expr(feat.at("height"), env);
+                    if (!(cr > 0.0 && ch > 0.0))
+                        throw std::runtime_error("cylinder: radius/height must be > 0");
+                    solid = ::geom::make_cylinder_centered(cr, ch);
                 } else if (type == "sphere") {
-                    solid = ::geom::make_sphere(num_or_expr(feat.at("radius"), env));
+                    const double sr = num_or_expr(feat.at("radius"), env);
+                    if (!(sr > 0.0))
+                        throw std::runtime_error("sphere: radius must be > 0");
+                    solid = ::geom::make_sphere(sr);
                 } else if (type == "cone") {
-                    solid = ::geom::make_cone_centered(num_or_expr(feat.at("r1"), env),
-                                                       num_or_expr(feat.at("r2"), env),
-                                                       num_or_expr(feat.at("height"), env));
+                    // A cone allows ONE radius to be 0 (a pointed apex), but not both, and
+                    // the height must be positive.
+                    const double cr1 = num_or_expr(feat.at("r1"), env);
+                    const double cr2 = num_or_expr(feat.at("r2"), env);
+                    const double cch = num_or_expr(feat.at("height"), env);
+                    if (!(cr1 >= 0.0 && cr2 >= 0.0 && (cr1 > 0.0 || cr2 > 0.0)))
+                        throw std::runtime_error(
+                            "cone: r1/r2 must be >= 0 and not both 0");
+                    if (!(cch > 0.0))
+                        throw std::runtime_error("cone: height must be > 0");
+                    solid = ::geom::make_cone_centered(cr1, cr2, cch);
                 } else {  // torus
-                    solid = ::geom::make_torus(num_or_expr(feat.at("major_r"), env),
-                                               num_or_expr(feat.at("minor_r"), env));
+                    const double mr = num_or_expr(feat.at("major_r"), env);
+                    const double nr = num_or_expr(feat.at("minor_r"), env);
+                    if (!(mr > 0.0 && nr > 0.0))
+                        throw std::runtime_error("torus: major_r/minor_r must be > 0");
+                    solid = ::geom::make_torus(mr, nr);
                 }
                 if (solid.IsNull())
                     throw std::runtime_error(type + " produced an empty solid");
@@ -2313,8 +2569,9 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // depth + optional mid_plane bool.
                 const std::string end = feat.value("end", std::string("blind"));
                 bool mid_plane = feat.value("mid_plane", false) || end == "mid_plane";
-                Eigen::Vector3d dir =
-                    opt_vec3(feat, "dir").value_or(src.plane.normal);
+                std::optional<Eigen::Vector3d> explicit_dir = opt_vec3(feat, "dir");
+                const bool dir_was_explicit = explicit_dir.has_value();
+                Eigen::Vector3d dir = explicit_dir.value_or(src.plane.normal);
 
                 // For a cut / through_all we size against the current body.
                 const std::string tgt_id = is_cut ? current_solid_id() : std::string();
@@ -2566,7 +2823,42 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     GProp_GProps gb, ga;
                     BRepGProp::VolumeProperties(tgt, gb);
                     BRepGProp::VolumeProperties(out, ga);
-                    if (std::abs(ga.Mass() - gb.Mass()) < 1e-9)
+                    const double base_mass = gb.Mass();
+                    double cut_mass = ga.Mass();
+                    // BLIND-CUT DIRECTION FALLBACK (Bug J5): a blind cut whose sketch sits
+                    // ON a body face extrudes along the face's OUTWARD normal by default,
+                    // so the prism leaves the body and removes nothing. When the direction
+                    // was NOT given explicitly and this is a plain one-sided blind cut (no
+                    // taper / dir2 / up-to trim / thin / mid_plane), re-build the prism the
+                    // OTHER way (into the material) and re-cut. through_all already spans
+                    // both ways (mid_plane), so it is unaffected. Only flips when the first
+                    // try removed nothing AND the flip removes something — never weakens a
+                    // legitimately-directed cut.
+                    const bool simple_blind = !mid_plane && !trim_to_plane &&
+                        end2 == "none" && std::abs(taper_deg) <= 1e-9 && !thin;
+                    if (std::abs(cut_mass - base_mass) < 1e-9 &&
+                        !dir_was_explicit && simple_blind) {
+                        TopoDS_Shape flipped;
+                        for (const TopoDS_Face& f : faces) {
+                            TopoDS_Shape pr = ::geom::extrude_face(f, -dir, depth, false);
+                            if (pr.IsNull()) { flipped.Nullify(); break; }
+                            flipped = flipped.IsNull() ? pr : ::geom::fuse(flipped, pr);
+                            if (flipped.IsNull()) break;
+                        }
+                        if (!flipped.IsNull()) {
+                            TopoDS_Shape out2 = ::geom::cut(tgt, flipped);
+                            if (!out2.IsNull()) {
+                                GProp_GProps ga2;
+                                BRepGProp::VolumeProperties(out2, ga2);
+                                if (std::abs(ga2.Mass() - base_mass) >= 1e-9) {
+                                    out = out2;
+                                    cut_mass = ga2.Mass();
+                                    solid = flipped;  // the patternable tool follows the flip
+                                }
+                            }
+                        }
+                    }
+                    if (std::abs(cut_mass - base_mass) < 1e-9)
                         throw std::runtime_error("extrude cut removed no material");
                     consumed.insert(tgt_id);
                     source_of[id] = tgt_id;  // owner-map: cut derives from the target body
@@ -2607,6 +2899,22 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         source_of[id] = mtgt;  // owner-map: merged boss derives from the body
                         results[id] = SolidResult{out};
                     } else {
+                        // A standalone NEW body must be a real, positive-volume solid. A
+                        // self-intersecting / zero-area profile (a "bowtie" / figure-8 loop)
+                        // extrudes to a degenerate ZERO-volume solid that OCCT still hands
+                        // back as a non-null shape with faces — so it slips past the
+                        // null/empty backstop and commits a body that reads vol=0 / mass=0
+                        // yet shows up in the viewport. Reject it loudly (parity with the
+                        // loft/revolve/sweep zero-volume guards). (cut and boss-merge are
+                        // already covered by their "removed/added no material" checks.)
+                        GProp_GProps gnew;
+                        BRepGProp::VolumeProperties(solid, gnew);
+                        if (!(std::abs(gnew.Mass()) > 1e-7))
+                            throw std::runtime_error(
+                                "extrude produced a zero-volume solid — the profile is "
+                                "self-intersecting or encloses no area (a 'bowtie' / "
+                                "figure-8 loop). Fix the sketch so the profile is a simple, "
+                                "non-crossing closed region.");
                         results[id] = SolidResult{solid};
                     }
                     // Patternable tool: the boss PRISM (instance-0 pose), op "add" — a
@@ -2650,12 +2958,19 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // closing the outer curve back to the axis. The fallback only runs when
                 // there is no closed region, so a properly closed profile is untouched.
                 std::vector<TopoDS_Face> rev_faces = src.faces;
+                // Track whether we had to synthesise the region by closing an OPEN profile
+                // to the axis, so we can surface it as a warning (Bug B4): the auto-close is
+                // useful, but a model that left the profile open should be told its disc was
+                // closed for it (it may have intended a thin wall / a different shape).
+                const bool auto_closed = rev_faces.empty();
                 if (rev_faces.empty())
                     rev_faces = close_profile_to_axis(src.entities, src.plane, axis_pt, axis_dir);
                 if (rev_faces.empty())
                     throw std::runtime_error(
                         "revolve: profile has no closed region (close the profile back to the "
                         "axis with a line)");
+                if (auto_closed)
+                    st.warning = "revolve: profile was open; auto-closed to the axis";
 
                 // Build the revolve tool (union all profile region revolves).
                 TopoDS_Shape tool;
@@ -2837,18 +3152,125 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // MakePipe sweeps a collapsed/near-zero section and OCCT still returns a
                 // valid-but-empty solid. Fail loudly rather than report a successful body
                 // with ~0 volume (Bug N-9).
+                double sweep_volume = 0.0;
                 {
                     GProp_GProps sv;
                     BRepGProp::VolumeProperties(solid, sv);
-                    if (!(sv.Mass() > 1e-9))
+                    sweep_volume = sv.Mass();
+                    if (!(sweep_volume > 1e-9)) {
+                        // ACCURATE DIAGNOSTIC (Bug H6): the dominant cause of a zero-volume
+                        // sweep is the profile not sitting on the path START — e.g. a profile
+                        // on plane.front but a path on plane.right whose start coordinate does
+                        // not coincide with the profile centroid. Measure the actual gap and,
+                        // when it is significant, name the exact distance so the user fixes the
+                        // right coordinate instead of guessing.
+                        GProp_GProps pc; BRepGProp::SurfaceProperties(src.faces.front(), pc);
+                        gp_Pnt pcm = pc.CentreOfMass();
+                        BRepAdaptor_Curve spc(TopoDS::Edge(
+                            TopExp_Explorer(spine, TopAbs_EDGE).Current()));
+                        gp_Pnt p0 = spc.Value(spc.FirstParameter());
+                        const double gap = pcm.Distance(p0);
+                        if (gap > 1e-6) {
+                            char buf[256];
+                            std::snprintf(buf, sizeof(buf),
+                                "sweep produced a zero-volume solid — the profile centre is %.4g mm "
+                                "from the path START (%.4g, %.4g, %.4g). Move the path's first point "
+                                "to the profile centre, or the profile onto the path start (a "
+                                "cross-plane sweep needs the profile plane's origin to coincide "
+                                "with the path's first point).",
+                                gap, p0.X(), p0.Y(), p0.Z());
+                            throw std::runtime_error(buf);
+                        }
                         throw std::runtime_error(
                             "sweep produced a zero-volume solid — the profile must sit ON the "
                             "START of the path and be roughly perpendicular to it (anchor the "
                             "path's first point at the profile, e.g. start the path at the "
                             "profile's plane origin)");
+                    }
                 }
 
-                results[id] = SolidResult{solid};
+                // SELF-INTERSECTION guard (Bug B3): when the profile is larger than the
+                // path's bend radius, MakePipe folds the tube through itself and OCCT hands
+                // back a CORRUPT B-rep that still reports ok=true with no geometry-check
+                // issues. Detect it two ways and combine them so a legitimate curved sweep
+                // (whose swept BSpline skin can trip BRepCheck on a harmless tolerance nit)
+                // is NOT wrongly rejected:
+                //   (1) BRepCheck_Analyzer validity — invalid is the strong signal.
+                //   (2) a volume sanity estimate: a straight drag of the profile along the
+                //       path has volume ~ profile_area * path_length; a self-overlap loses a
+                //       large fraction of that. A real curved sweep stays close to it.
+                // REJECT only when BOTH agree (invalid AND grossly under-volume) — that is
+                // the self-intersecting case. If only one fires, surface a WARNING rather
+                // than fail, so a fussy-but-valid coil still compiles.
+                const bool brep_invalid = !BRepCheck_Analyzer(solid).IsValid();
+                double vol_estimate = 0.0;
+                {
+                    GProp_GProps pa;
+                    double profile_area = 0.0;
+                    for (const TopoDS_Face& f : src.faces) {
+                        BRepGProp::SurfaceProperties(f, pa);
+                        profile_area += pa.Mass();
+                    }
+                    GProp_GProps pl;
+                    BRepGProp::LinearProperties(spine, pl);
+                    vol_estimate = profile_area * pl.Mass();
+                }
+                const bool gross_under_volume =
+                    vol_estimate > 1e-9 && sweep_volume < 0.5 * vol_estimate;
+                if (brep_invalid && gross_under_volume)
+                    throw std::runtime_error(
+                        "sweep: result is self-intersecting/invalid (profile too large for "
+                        "the path bend radius) — shrink the profile or ease the path's "
+                        "curvature");
+                if (brep_invalid)
+                    st.warning =
+                        "sweep: the result fails a B-rep validity check (the swept surface "
+                        "may self-intersect — profile large for the path's bend radius); "
+                        "verify the geometry";
+                else if (gross_under_volume)
+                    st.warning =
+                        "sweep: result volume is well below profile_area * path_length — "
+                        "the pipe may self-intersect (profile large for the path's bend "
+                        "radius); verify the geometry";
+
+                // Apply the sweep to the running body the SAME way the extrude-boss
+                // path does (Bug H1): canonical sweeps default to mode "boss" (SolidWorks
+                // "Merge result"), so a sweep with a running body fuses INTO it — leaving
+                // ONE solid, not two disjoint bodies (the degenerate two-body result that
+                // also produced a NEGATIVE principal inertia). merge:false or mode:"new"
+                // keeps the sweep as a standalone body. cut subtracts the swept tool from
+                // the current body. (Before this fix the sweep never fused and never
+                // registered a patternable tool — Bug J3 for sweep seeds.)
+                const std::string smode = feat.value("mode", std::string("boss"));
+                const bool smerge = feat.value("merge", true) &&
+                                    (smode == "boss" || smode == "add" || smode == "cut");
+                const std::string stgt = smerge ? current_solid_id() : std::string();
+                if (!stgt.empty()) {
+                    const TopoDS_Shape& tgt = require_solid(results, stgt, "target");
+                    TopoDS_Shape out = (smode == "cut")
+                        ? ::geom::cut(tgt, solid)
+                        : ::geom::unify_same_domain(::geom::fuse(tgt, solid));
+                    if (out.IsNull())
+                        throw std::runtime_error(
+                            std::string("sweep ") + smode + " produced an empty shape");
+                    if (smode == "cut") {
+                        GProp_GProps gsb, gsa;
+                        BRepGProp::VolumeProperties(tgt, gsb);
+                        BRepGProp::VolumeProperties(out, gsa);
+                        if (std::abs(gsa.Mass() - gsb.Mass()) < 1e-9)
+                            throw std::runtime_error("sweep cut removed no material");
+                    }
+                    consumed.insert(stgt);
+                    source_of[id] = stgt;  // owner-map: result derives from the body
+                    results[id] = SolidResult{out};
+                } else {
+                    results[id] = SolidResult{solid};
+                }
+                // Patternable tool: the swept solid (instance-0 pose), op follows the
+                // mode — so a later pattern/mirror replicates JUST the swept tool, and a
+                // loft/sweep boss can be a pattern seed (Bug J3).
+                tool_body_of[id] = solid;
+                feature_op_of[id] = (smode == "cut") ? "cut" : "add";
                 solid_order.push_back(id);
                 st.ok = true;
 
@@ -2977,6 +3399,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     edges_it != feat.end() &&
                     (edges_it->is_object() ||
                      (edges_it->is_array() && !edges_it->empty()));
+                // Reject a selector that names a non-existent feature (Bug K4) before any
+                // resolution — a stale owner/feature ref would otherwise score against the
+                // wrong edge and silently mutilate the body (an open shell that reports ok).
+                if (has_edge_sel) validate_selector_refs(*edges_it, type.c_str());
 
                 std::optional<std::vector<TopoDS_Edge>> picked;
                 int n_dangling = 0;   // picks that couldn't be located on the body (skipped + warned)
@@ -3039,14 +3465,38 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     picked = std::move(picks.edges);
                 }
 
+                // EMPTY-QUERY guard (Bug A4): if an edge selector/query was given but
+                // resolved to NO edges, fail with a distinct "no edges matched" message
+                // FIRST — BEFORE the size-feasibility path below, whose "N mm is too large
+                // for the selected edge(s)" message is misleading when in fact nothing was
+                // selected. (The query paths above already reject most empty cases; this is
+                // the catch-all so an empty resolved set can never surface as "too large".)
+                if (picked && picked->empty())
+                    throw std::runtime_error(type + ": no edges matched the query");
+
                 TopoDS_Shape out;
                 int n_dropped = 0;      // explicit picks that couldn't be blended at this size
                 double blend_size = 0.0;  // radius / distance, for the warning text
-                if (type == "fillet") {
-                    const double radius = num_or_expr(feat.at("radius"), env);
-                    if (!(radius > 0.0))
-                        throw std::runtime_error("fillet radius must be > 0");
-                    blend_size = radius;
+                // Read the requested size first so a SUB-TOLERANCE blend can be detected
+                // BEFORE OCCT runs (Bug K6): a positive radius/distance below the modelling
+                // tolerance (1e-7) removes no detectable material — OCCT no-ops it or hands
+                // back the body unchanged, which used to report a silent success. Warn,
+                // pass the body through unchanged, and skip the (pointless) kernel call.
+                blend_size = type == "fillet"
+                    ? num_or_expr(feat.at("radius"), env)
+                    : num_or_expr(feat.at("distance"), env);
+                if (!(blend_size > 0.0))
+                    throw std::runtime_error(
+                        type + (type == "fillet" ? " radius must be > 0" : " distance must be > 0"));
+                bool sub_tolerance = blend_size < 1e-7;
+                if (sub_tolerance) {
+                    char buf[160];
+                    std::snprintf(buf, sizeof(buf),
+                        "%s %.3g below tolerance; no material removed", type.c_str(), blend_size);
+                    st.warning = buf;
+                    out = body;  // pass through unchanged — the blend is a no-op
+                } else if (type == "fillet") {
+                    const double radius = blend_size;
                     // Variable-radius fillet (dress.py): a linear law r1->r2 along the edge,
                     // active when radius2 > 0 and differs from radius. Requires picked edges
                     // (the variable law is per-edge; the dir-filter path stays uniform).
@@ -3060,10 +3510,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         out = picked ? ::geom::fillet_edges(body, radius, *picked, &n_dropped)
                                      : ::geom::fillet_edges(body, radius, dir);
                 } else {
-                    const double distance = num_or_expr(feat.at("distance"), env);
-                    if (!(distance > 0.0))
-                        throw std::runtime_error("chamfer distance must be > 0");
-                    blend_size = distance;
+                    const double distance = blend_size;
                     // Two-distance (asymmetric) chamfer (dress.py): leg d1 on one face, d2
                     // on the other, active when length2 > 0 and differs from length. Needs
                     // picked edges (the asymmetric Add references a specific incident face).
@@ -3091,11 +3538,29 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     }
                     throw std::runtime_error(type + " produced an empty shape");
                 }
+                // "Too large for the BODY" guard. Best-effort dropping is meant to skip a FEW
+                // too-tight edges (a tight rim, a small boss) while rounding the rest — NOT to
+                // quietly commit a heavily-reduced body when the size is infeasible for MOST of
+                // the selection. If more than half the picked edges had to be dropped, the size
+                // is simply too large here: fail loudly and leave the body intact (the user's
+                // intent on an oversize "round everything" — B6-2). The watertight drop-blender
+                // still handles the genuine "round 149 of 190, skip 41" case, where only a small
+                // fraction drops, by committing the closed partial with a warning.
+                if (!sub_tolerance && picked && n_dropped * 2 > static_cast<int>(picked->size())) {
+                    char tbuf[224];
+                    std::snprintf(tbuf, sizeof(tbuf),
+                        "%s: %.4g mm is too large for this body — %d of %d selected edge(s) "
+                        "couldn't be %s. Reduce the %s or select fewer edges.",
+                        type.c_str(), blend_size, n_dropped, static_cast<int>(picked->size()),
+                        type == "fillet" ? "rounded" : "beveled",
+                        type == "fillet" ? "radius" : "distance");
+                    throw std::runtime_error(tbuf);
+                }
                 // Partial success: some selected edges were too tight for the size, and/or some
                 // selectors couldn't be located on the body (stale preview pick). The feature still
                 // applies to the edges that worked — surface the rest as a non-fatal warning so the
                 // user knows to lower the size or re-pick, rather than silently leaving them sharp.
-                if (picked && (n_dropped > 0 || n_dangling > 0)) {
+                if (!sub_tolerance && picked && (n_dropped > 0 || n_dangling > 0)) {
                     const int requested = (int)picked->size() + n_dangling;
                     const int rounded = (int)picked->size() - n_dropped;
                     char buf[240];
@@ -3116,6 +3581,34 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                             "those edge(s)",
                             rounded, requested, n_dangling);
                     st.warning = buf;
+                }
+
+                // OPEN-SHELL guard (Bug S2): the drop-failing blender rounds the FEASIBLE
+                // edges and skips the too-tight ones — but if a skipped edge was geometry
+                // OCCT couldn't reseal, the committed B-rep can be an OPEN shell (genuine
+                // free edges) even though its volume is positive (so the N2 negative-volume
+                // guard passes). eval_check would then report free_edges and STEP-export
+                // re-validation would fail, yet the feature reported ok:true. A dress op
+                // must NEVER ship an open body: validate the result is a CLOSED solid using
+                // the SEAM-AWARE free-edge test (so a valid cylinder/sphere/revolved body's
+                // seam edges are NOT mistaken for free edges). A sub-tolerance pass-through
+                // (out == body) is the unchanged input, already closed — skip the check.
+                // SURFACE (open sheet) source bodies are legitimately open — skip the
+                // closed-solid post-check for them (mirrors sanitize_solid's surface exemption).
+                {
+                    auto bk_src = body_kinds.find(body_id);
+                    const bool src_is_surface =
+                        bk_src != body_kinds.end() && bk_src->second == "surface";
+                    if (!src_is_surface && !sub_tolerance && !dress_is_closed_solid(out)) {
+                        char obuf[256];
+                        std::snprintf(obuf, sizeof(obuf),
+                            "%s produced an open/invalid body — some edges are too tight at %.4g mm "
+                            "to reseal the surface (the result has free edges / is not a closed "
+                            "solid). Reduce the %s or select fewer edges.",
+                            type.c_str(), blend_size,
+                            type == "fillet" ? "radius" : "distance");
+                        throw std::runtime_error(obuf);
+                    }
                 }
 
                 // Dress-up REPLACES the source body (SolidWorks-style): the rounded /
@@ -3153,6 +3646,12 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (count1 < 1)
                     throw std::runtime_error("linear pattern count1 must be >= 1");
                 const double spacing1 = num_or_expr(feat.at("spacing1"), env);
+                // Non-zero spacing guard (Bug B2): spacing1 == 0 with count1 >= 2 stacks
+                // every copy on top of the seed (coincident bodies) — accepted silently
+                // before. Mirror the count1 >= 1 guard above.
+                if (count1 >= 2 && !(std::abs(spacing1) > 0.0))
+                    throw std::runtime_error(
+                        "linear_pattern: spacing must be non-zero when count >= 2");
                 Eigen::Vector3d dir1 = req_vec3(feat, "dir1");
                 if (!(dir1.norm() > 1e-12))
                     throw std::runtime_error("linear pattern dir1 has zero length");
@@ -3171,6 +3670,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         throw std::runtime_error("linear pattern count2 must be >= 1");
                     spacing2 = feat.contains("spacing2")
                         ? num_or_expr(feat.at("spacing2"), env) : 0.0;
+                    // Non-zero spacing guard for the second direction (Bug B2).
+                    if (count2 >= 2 && !(std::abs(spacing2) > 0.0))
+                        throw std::runtime_error(
+                            "linear_pattern: spacing must be non-zero when count >= 2");
                     dir2 = req_vec3(feat, "dir2");
                     if (!(dir2.norm() > 1e-12))
                         throw std::runtime_error("linear pattern dir2 has zero length");
@@ -3179,10 +3682,29 @@ CompileResult compile_document(const json& doc, const json& env_json) {
 
                 if (count1 * count2 < 2)
                     throw std::runtime_error("linear pattern needs at least 2 instances");
+                // INSTANCE CAP (Bug K1): a runaway count (e.g. 100x100 = 10000 cells)
+                // builds tens of thousands of boolean ops and used to HANG the whole MCP
+                // server (wiping every session doc). Reject an over-large field LOUDLY and
+                // BEFORE any expensive geometry runs. The cap is generous (4000) — far
+                // above any real part — so legitimate patterns are never blocked.
+                {
+                    const long long total = static_cast<long long>(count1) * count2;
+                    if (total > kPatternInstanceLimit)
+                        throw std::runtime_error(
+                            "pattern: " + std::to_string(total) +
+                            " instances exceeds the limit (" +
+                            std::to_string(kPatternInstanceLimit) + "); reduce the count");
+                }
 
                 // Lay copies of the seed TOOL at i*spacing1*dir1 (+ j*spacing2*dir2),
                 // re-applying the seed's boolean. Instance (0,0) is the seed, already in
-                // the running body.
+                // the running body. We ALSO accumulate the union of every seed tool
+                // instance (instance (0,0) at its base pose included) into pattern_tool —
+                // this is the nesting tool an OUTER pattern of THIS pattern replicates when
+                // the seed is subtractive (Bug J1): a linear_pattern of a circular_pattern
+                // of CUTS must re-SUBTRACT the whole ring at each outer cell, not fuse the
+                // grown body (which would ADD material and leave one ring).
+                TopoDS_Shape pattern_tool = seed_tool;  // instance (0,0)
                 for (int i = 0; i < count1; ++i) {
                     for (int j = 0; j < count2; ++j) {
                         if (i == 0 && j == 0) continue;  // the seed instance
@@ -3195,6 +3717,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                             throw std::runtime_error("linear pattern instance "
                                                      + std::string(seed_op == "cut" ? "cut" : "fuse")
                                                      + " failed");
+                        if (seed_op == "cut") {
+                            TopoDS_Shape pu = ::geom::fuse(pattern_tool, copy);
+                            if (!pu.IsNull()) pattern_tool = pu;
+                        }
                     }
                 }
 
@@ -3208,12 +3734,20 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 }
 
                 // The running body is consumed; the pattern result is its new state. The
-                // pattern's OWN tool body is its whole result (op "add") so a pattern of
-                // THIS pattern replicates the full result (matches the oracle).
+                // pattern's nesting tool/op honour the seed's op (Bug J1): a SUBTRACTIVE
+                // pattern exposes the UNION of its cut tools as op "cut", so an outer
+                // pattern of it re-subtracts the whole field per cell; an ADDITIVE pattern
+                // exposes its whole grown result as op "add" (matches the oracle, so a
+                // pattern of a boss-pattern replicates the full body).
                 consumed.insert(tgt_id);
                 source_of[id] = tgt_id;  // owner-map: pattern derives from the running body
-                tool_body_of[id] = res;
-                feature_op_of[id] = "add";
+                if (seed_op == "cut") {
+                    tool_body_of[id] = pattern_tool;
+                    feature_op_of[id] = "cut";
+                } else {
+                    tool_body_of[id] = res;
+                    feature_op_of[id] = "add";
+                }
 
                 results[id] = SolidResult{res};
                 solid_order.push_back(id);
@@ -3237,6 +3771,12 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     static_cast<int>(std::lround(num_or_expr(feat.at("count"), env)));
                 if (count < 2)
                     throw std::runtime_error("circular pattern count must be >= 2");
+                // INSTANCE CAP (Bug K1): reject a runaway count before the build.
+                if (static_cast<long long>(count) > kPatternInstanceLimit)
+                    throw std::runtime_error(
+                        "pattern: " + std::to_string(count) +
+                        " instances exceeds the limit (" +
+                        std::to_string(kPatternInstanceLimit) + "); reduce the count");
 
                 // Angle is in DEGREES (SolidWorks + pattern.py convention) — note this
                 // DIFFERS from revolve's angle, which is radians.
@@ -3250,6 +3790,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 const Eigen::Vector3d axis_pt = req_vec3(feat, "axis_pt");
                 const Eigen::Vector3d axis_dir = req_vec3(feat, "axis_dir");
 
+                // Accumulate every instance's tool (k=0 at base pose included) into a
+                // pattern_tool — the nesting tool an outer pattern of THIS pattern
+                // replicates when the seed is subtractive (Bug J1).
+                TopoDS_Shape pattern_tool = seed_tool;  // k = 0
                 for (int k = 1; k < count; ++k) {
                     TopoDS_Shape copy = ::geom::rotate_copy(
                         seed_tool, axis_pt, axis_dir, radians(step_deg * k));
@@ -3259,6 +3803,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         throw std::runtime_error("circular pattern instance "
                                                  + std::string(seed_op == "cut" ? "cut" : "fuse")
                                                  + " failed");
+                    if (seed_op == "cut") {
+                        TopoDS_Shape pu = ::geom::fuse(pattern_tool, copy);
+                        if (!pu.IsNull()) pattern_tool = pu;
+                    }
                 }
 
                 // Match build123d's `+` .clean() on the additive path (merge coplanar
@@ -3268,11 +3816,20 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     if (!u.IsNull()) res = u;
                 }
 
-                // The running body is consumed; the pattern result is its new state.
+                // The running body is consumed; the pattern result is its new state. The
+                // nesting tool/op honour the seed's op (Bug J1): a SUBTRACTIVE pattern
+                // exposes the union of its cut tools as op "cut" so an outer pattern of it
+                // re-subtracts the whole ring per cell; an additive pattern exposes its
+                // grown body as op "add".
                 consumed.insert(tgt_id);
                 source_of[id] = tgt_id;  // owner-map: pattern derives from the running body
-                tool_body_of[id] = res;
-                feature_op_of[id] = "add";
+                if (seed_op == "cut") {
+                    tool_body_of[id] = pattern_tool;
+                    feature_op_of[id] = "cut";
+                } else {
+                    tool_body_of[id] = res;
+                    feature_op_of[id] = "add";
+                }
 
                 results[id] = SolidResult{res};
                 solid_order.push_back(id);
@@ -3297,6 +3854,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     plane_it != feat.end() && plane_it->is_object() &&
                     plane_it->value("kind", std::string()) == "face";
                 if (face_plane) {
+                    validate_selector_refs(*plane_it, "mirror plane");  // Bug K4
                     aicad::doc::FacePicks fp =
                         aicad::doc::resolve_face_picks(body, *plane_it, "plane");
                     if (!fp.dangling.empty()) {
@@ -3387,7 +3945,20 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 const std::string body_id = body_ref(feat);
                 if (body_id.empty())
                     throw std::runtime_error(type + ": no body ref and no current body");
-                const TopoDS_Shape& body = require_solid(results, body_id, "body");
+                // Compose on the body's CURRENT descendant (Issue 4). If a prior in-place
+                // transform already moved this source body, `body_id` (the original feature id)
+                // now points at a consumed shape; chase superseded_by to the live replacement so
+                // a second transform moves the placed body rather than re-reading the original
+                // and instancing a duplicate. A self-referential or broken chain stops at the
+                // last resolvable link (guarded against cycles).
+                std::string eff_id = body_id;
+                {
+                    std::set<std::string> guard;
+                    while (consumed.count(eff_id) && superseded_by.count(eff_id) &&
+                           guard.insert(eff_id).second)
+                        eff_id = superseded_by[eff_id];
+                }
+                const TopoDS_Shape& body = require_solid(results, eff_id, "body");
 
                 Eigen::Vector3d translate(0, 0, 0);
                 if (auto t = opt_vec3(feat, "translate")) translate = *t;
@@ -3400,10 +3971,14 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 Eigen::Vector3d pivot(0, 0, 0);
                 if (auto pv = opt_vec3(feat, "pivot")) pivot = *pv;
 
-                if (!(translate.norm() > 1e-12) && std::abs(angle_deg) <= 1e-9)
-                    throw std::runtime_error(
-                        type + ": no motion — give a non-zero translate:[x,y,z] and/or "
-                        "angle:<deg> with rotate:[ax,ay,az]");
+                // Bug A2 — a zero-motion transform (translate:[0,0,0], no rotation) is a
+                // harmless NO-OP that SUCCEEDS: it records the body at its current pose
+                // (useful for explicitly placing an at-origin component in an assembly).
+                // It must NOT error (the old "no motion" rejection was a P0-deadlock
+                // trigger via the rollback). The body is committed unchanged below; with
+                // copy:true it is duplicated in place (a coincident assembly instance).
+                const bool zero_motion =
+                    !(translate.norm() > 1e-12) && std::abs(angle_deg) <= 1e-9;
 
                 // Rotate first (about the pivot), then translate — the intuitive "orient then
                 // place" order. Each step copies (the kernel helpers leave the input untouched).
@@ -3422,11 +3997,19 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 }
 
                 const bool copy = feat.value("copy", false);
-                if (!copy) consumed.insert(body_id);   // move in place: source replaced
+                if (!copy) {
+                    consumed.insert(eff_id);            // move in place: source replaced
+                    superseded_by[eff_id] = id;         // a later transform composes on `id`
+                }
                 tool_body_of[id] = out;                // patternable/mirrorable downstream
                 feature_op_of[id] = "add";
                 results[id] = SolidResult{out};
                 solid_order.push_back(id);
+                // A zero-motion transform succeeds (Bug A2) but is worth flagging so the
+                // caller knows the body was recorded in place rather than actually moved.
+                if (zero_motion)
+                    st.warning = "transform recorded the body at its current pose "
+                                 "(zero motion — no translate/rotate given)";
                 st.ok = true;
 
             } else if (type == "hole") {
@@ -3446,6 +4029,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (face_it == feat.end() || !face_it->is_object())
                     throw std::runtime_error(
                         "hole: 'face' selector is required (the planar face to drill into)");
+                validate_selector_refs(*face_it, "hole face");  // Bug K4
                 TopoDS_Face face;
                 if (aicad::doc::is_geom_query(*face_it)) {
                     // word query: "drill the top face" -> {"of":"face","side":"top"}.
@@ -3468,6 +4052,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         throw std::runtime_error("hole: target face not resolved");
                     face = fp.faces.front();
                 }
+                // Bug N1 (defensive) — a resolver can hand back a NULL face; BRepAdaptor_
+                // Surface / BRep_Tool::Surface would then dereference it (access violation).
+                if (face.IsNull())
+                    throw std::runtime_error("hole: resolved face is null");
 
                 BRepAdaptor_Surface surf(face);
                 if (surf.GetType() != GeomAbs_Plane)
@@ -3612,6 +4200,53 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     throw std::runtime_error(
                         "hole removed no material (positions may fall outside the face/body)");
 
+                // BLIND-DEPTH-EXCEEDS-STOCK warning (Bug B1): a blind hole whose requested
+                // depth runs PAST the far face of the stock is silently clamped by the
+                // boolean (the cut only removes the in-body part). Detect it by drilling a
+                // far-overlength "through" tool at the SAME positions/style and comparing
+                // the material removed: if the blind cut already removed as much as a
+                // full-penetration cut, the blind depth met or exceeded the available stock
+                // and was effectively clamped — surface it as a loud warning rather than
+                // silently producing a through hole. (Warning, not error: a blind depth that
+                // happens to equal the stock exactly is legitimate, so we never reject it.)
+                if (end == "blind") {
+                    ::geom::HoleDims thru_dims = tool_dims;
+                    thru_dims.depth = aicad::doc::bbox_diag(body) * 1.1 + lift;
+                    if (style == ::geom::HoleStyle::Cbore)
+                        thru_dims.cbore_depth = dims.cbore_depth + lift;
+                    TopoDS_Shape thru_union;
+                    bool thru_ok = true;
+                    for (const auto& p : uv) {
+                        Eigen::Vector3d world = origin + p.first * xdir + p.second * ydir;
+                        Eigen::Vector3d lifted = world + lift * normal;
+                        TopoDS_Shape t =
+                            ::geom::make_hole_tool(lifted, drill_dir, style, thru_dims);
+                        if (t.IsNull()) { thru_ok = false; break; }
+                        thru_union = thru_union.IsNull() ? t : ::geom::fuse(thru_union, t);
+                        if (thru_union.IsNull()) { thru_ok = false; break; }
+                    }
+                    if (thru_ok && !thru_union.IsNull()) {
+                        TopoDS_Shape thru_out = ::geom::cut(body, thru_union);
+                        if (!thru_out.IsNull()) {
+                            GProp_GProps gp_thru;
+                            BRepGProp::VolumeProperties(thru_out, gp_thru);
+                            // Both cuts removed the same material => the blind bore already
+                            // ran clean through the stock (clamped).
+                            const double removed_blind = gp_before.Mass() - gp_after.Mass();
+                            const double removed_thru = gp_before.Mass() - gp_thru.Mass();
+                            if (removed_thru > 1e-9 &&
+                                std::abs(removed_blind - removed_thru) < 1e-6 * removed_thru) {
+                                char buf[200];
+                                std::snprintf(buf, sizeof(buf),
+                                    "hole: blind depth %.4g exceeds the available stock at the "
+                                    "hole — it was clamped to a through hole. Use "
+                                    "end:through_all or reduce the depth.", depth);
+                                st.warning = buf;
+                            }
+                        }
+                    }
+                }
+
                 // The drilled solid REPLACES the body (SolidWorks-style): the bored
                 // solid is the body's new current state in the tree.
                 consumed.insert(body_id);
@@ -3639,6 +4274,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 const json face_ref = (feat.contains("face") && !feat.at("face").is_null())
                                           ? feat.at("face")
                                           : json{{"of", "face"}, {"side", "top"}};
+                validate_selector_refs(face_ref, "bolt_circle face");  // Bug K4
                 TopoDS_Face face;
                 if (aicad::doc::is_geom_query(face_ref)) {
                     aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, face_ref);
@@ -3653,6 +4289,9 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         throw std::runtime_error("bolt_circle: target face not resolved");
                     face = fp.faces.front();
                 }
+                // Bug N1 (defensive) — guard a null face before the kernel dereferences it.
+                if (face.IsNull())
+                    throw std::runtime_error("bolt_circle: resolved face is null");
                 BRepAdaptor_Surface bc_surf(face);
                 if (bc_surf.GetType() != GeomAbs_Plane)
                     throw std::runtime_error("bolt_circle: target face is not planar");
@@ -3669,6 +4308,12 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // Ring geometry.
                 const int count = static_cast<int>(std::llround(num_or_expr(feat.at("count"), env)));
                 if (count < 1) throw std::runtime_error("bolt_circle: count must be >= 1");
+                // INSTANCE CAP (Bug K1): reject a runaway ring count before the build.
+                if (static_cast<long long>(count) > kPatternInstanceLimit)
+                    throw std::runtime_error(
+                        "pattern: " + std::to_string(count) +
+                        " instances exceeds the limit (" +
+                        std::to_string(kPatternInstanceLimit) + "); reduce the count");
                 double pcd;
                 if (feat.contains("pcd")) pcd = num_or_expr(feat.at("pcd"), env);
                 else if (feat.contains("bolt_circle_d")) pcd = num_or_expr(feat.at("bolt_circle_d"), env);
@@ -3761,6 +4406,8 @@ CompileResult compile_document(const json& doc, const json& env_json) {
 
                 std::vector<TopoDS_Face> remove;
                 auto rm = feat.find("remove");
+                if (rm != feat.end() && !rm->is_null())
+                    validate_selector_refs(*rm, "shell remove");  // Bug K4
                 if (rm != feat.end() && aicad::doc::is_geom_query(*rm)) {
                     // Query the open face(s) by name: {"of":"face","side":"+z"} = open top.
                     aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, *rm);
@@ -3784,7 +4431,34 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     remove = std::move(fp.faces);
                 }
 
+                // CLOSED shell = no faces opened (a fully-sealed hollow: a hollow ball, a
+                // sealed enclosure). Routes through geom::shell_solid's offset+cut path and
+                // needs a different volume guard below (a sealed wall is SMALLER than the
+                // original solid even when thickened OUTWARD — it's just the wall, no core).
+                const bool closed_shell = remove.empty();
+                // REMOVE-ALL-FACES guard (Bug A3): opening EVERY face leaves no skin to
+                // hollow — OCCT's BRepOffsetAPI_MakeThickSolid silently hands back the
+                // ORIGINAL solid (ok=true, geometry unchanged). Count the body's faces and
+                // reject up front when the remove-set covers them all.
+                if (!remove.empty()) {
+                    int n_body_faces = 0;
+                    for (TopExp_Explorer fx(body, TopAbs_FACE); fx.More(); fx.Next())
+                        ++n_body_faces;
+                    if (static_cast<int>(remove.size()) >= n_body_faces)
+                        throw std::runtime_error(
+                            "shell: cannot remove all faces (no skin would remain to "
+                            "hollow) — leave at least one face closed");
+                }
+
                 const bool outward = feat.value("outward", false);
+                // Capture the input volume so we can prove the shell actually hollowed the
+                // part. An impossible shell (thickness >= the wall) and the remove-all case
+                // both make BRepOffsetAPI_MakeThickSolid return the ORIGINAL shape (a valid
+                // solid) with ok=true — the volume is the tell-tale (Bug A2/A3).
+                GProp_GProps gp_in;
+                BRepGProp::VolumeProperties(body, gp_in);
+                const double vol_in = gp_in.Mass();
+
                 TopoDS_Shape out = ::geom::shell_solid(body, t, outward, remove);
                 if (out.IsNull()) {
                     // Distinguish a genuine kernel limitation (curved/B-spline skins)
@@ -3799,6 +4473,60 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                             "inner + outer curves) and loft/revolve THAT to get a hollow "
                             "body directly, rather than shelling a solid one.");
                     throw std::runtime_error("shell produced an empty shape");
+                }
+                // A VALID inward shell ALWAYS reduces the solid volume (it carves a
+                // cavity); a valid OUTWARD shell grows it. Either way the volume must
+                // CHANGE — when it doesn't, BRepOffsetAPI_MakeThickSolid handed back the
+                // ORIGINAL solid because the wall is too thin for the requested thickness
+                // (or every face was opened), and the "shell" is a silent no-op (Bug
+                // A2/A3). The check is volume-essentially-unchanged within a tiny relative
+                // epsilon so a real, material-moving shell is never wrongly rejected.
+                {
+                    GProp_GProps gp_out;
+                    BRepGProp::VolumeProperties(out, gp_out);
+                    const double vol_out = gp_out.Mass();
+                    const double eps = 1e-6 * std::max(1.0, std::abs(vol_in));
+                    // Inward (default): the result must be SMALLER than the input. Outward:
+                    // it must be LARGER. Both reduce to "the volume essentially changed".
+                    const bool reduced = vol_out < vol_in - eps;
+                    const bool grew = vol_out > vol_in + eps;
+                    // A CLOSED shell (offset+cut path) always yields just the sealed WALL —
+                    // smaller than the original solid for BOTH inward and outward (outward
+                    // grows the outer surface but the result is still the wall, not the full
+                    // core), so the "grew" test never applies; it must simply be a real,
+                    // positive, reduced-volume wall (a 40^3 box -> 17344, not the 64000 solid).
+                    const bool ok_change = closed_shell ? reduced : (outward ? grew : reduced);
+                    if (!(vol_out > eps) || !ok_change) {
+                        char buf[200];
+                        std::snprintf(buf, sizeof(buf),
+                            "shell: thickness %.4g mm too large for the wall (would consume "
+                            "the part) — reduce the thickness", t);
+                        throw std::runtime_error(buf);
+                    }
+                }
+                // OPEN-SHELL guard (Bug S1/S2): the thick-solid offset on a FREEFORM skin
+                // (a spline-revolve vase = SurfaceOfRevolution faces, a swept tube, ...) can
+                // hand back a NON-NULL body that the volume guard accepts (the volume moved)
+                // but that is an OPEN shell with genuine free edges — so the shell SILENTLY
+                // committed an invalid body, vanished from a watertight rebuild, and only
+                // eval_check / STEP re-validation later flagged free_edges. It must NEVER
+                // ship an open body. Validate the result is a CLOSED solid (seam-aware, so a
+                // valid revolved/cylindrical body's seams are not mistaken for free edges).
+                // On a freeform body, emit the SAME actionable message as the null-result
+                // path (matching the loft case) instead of an opaque "open body".
+                if (!dress_is_closed_solid(out)) {
+                    if (::geom::has_freeform_faces(body))
+                        throw std::runtime_error(
+                            "shell is not supported on lofted / swept / revolved "
+                            "(B-spline / freeform) bodies — the offset produced an open "
+                            "(non-watertight) shell on the curved skin. Build the wall "
+                            "thickness INTO the profile instead: sketch a thin closed wall "
+                            "cross-section (offset inner + outer curves) and loft/revolve "
+                            "THAT to get a hollow body directly, rather than shelling a "
+                            "solid one.");
+                    throw std::runtime_error(
+                        "shell produced an open/invalid body (free edges / not a closed "
+                        "solid) — reduce the thickness or open a face to hollow it cleanly");
                 }
                 consumed.insert(body_id);
                 source_of[id] = body_id;  // owner-map: derives from the input body
@@ -3827,11 +4555,30 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     auto nit = feat.find("neutral");
                     if (nit == feat.end() || !nit->is_object())
                         throw std::runtime_error("draft: a 'neutral' plane (datum or face) is required");
-                    aicad::doc::FacePicks fp =
-                        aicad::doc::resolve_face_picks(body, *nit, "neutral");
-                    if (!fp.dangling.empty() || fp.faces.empty())
-                        throw std::runtime_error("draft: neutral face not resolved");
-                    BRepAdaptor_Surface surf(fp.faces[0]);
+                    // Resolve the neutral face through the SAME dual path the draft FACES
+                    // use below (Bug A1): a plain-English geometry QUERY
+                    // ({"of":"face","side":"bottom"}) goes through resolve_geom_query; a
+                    // concrete pick selector goes through resolve_face_picks. Previously the
+                    // neutral slot sent EVERY payload to resolve_face_picks, so a face query
+                    // always dangled ("neutral face not resolved") even though the identical
+                    // query resolves via doc_query and via the faces slot. (Bug A1, neutral.)
+                    TopoDS_Face neutral_face;
+                    if (aicad::doc::is_geom_query(*nit)) {
+                        aicad::doc::QueryPicks nq =
+                            aicad::doc::resolve_geom_query(body, *nit);
+                        if (!nq.error.empty())
+                            throw std::runtime_error("draft: neutral " + nq.error);
+                        if (nq.faces.empty())
+                            throw std::runtime_error("draft: neutral face query matched no faces");
+                        neutral_face = nq.faces[0];
+                    } else {
+                        aicad::doc::FacePicks fp =
+                            aicad::doc::resolve_face_picks(body, *nit, "neutral");
+                        if (!fp.dangling.empty() || fp.faces.empty())
+                            throw std::runtime_error("draft: neutral face not resolved");
+                        neutral_face = fp.faces[0];
+                    }
+                    BRepAdaptor_Surface surf(neutral_face);
                     if (surf.GetType() != GeomAbs_Plane)
                         throw std::runtime_error("draft: neutral face is not planar");
                     gp_Pln pln = surf.Plane();
@@ -3847,23 +4594,45 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (fit == feat.end() ||
                     !(fit->is_object() || (fit->is_array() && !fit->empty())))
                     throw std::runtime_error("draft: 'faces' selector(s) required");
-                aicad::doc::FacePicks fp =
-                    aicad::doc::resolve_face_picks(body, *fit, "faces");
-                if (!fp.dangling.empty()) {
-                    std::string msg = "draft: faces selector dangling: ";
-                    for (std::size_t k = 0; k < fp.dangling.size(); ++k) {
-                        if (k) msg += "; ";
-                        msg += fp.dangling[k];
+                // Resolve the draft faces through the SAME path shell's `remove` uses
+                // (above): a plain-English geometry QUERY ({"of":"face","side":"front"})
+                // goes through resolve_geom_query, ELSE concrete pick selectors go through
+                // resolve_face_picks. Previously draft sent EVERY payload — query or not —
+                // straight to resolve_face_picks, so a face QUERY always dangled ("no
+                // candidates of matching kind") even though the identical query resolves
+                // via query_geometry and via fillet's refs.edges. (Bug A1.)
+                std::vector<TopoDS_Face> draft_faces;
+                if (aicad::doc::is_geom_query(*fit)) {
+                    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(body, *fit);
+                    if (!qp.error.empty())
+                        throw std::runtime_error("draft: " + qp.error);
+                    if (qp.faces.empty())
+                        throw std::runtime_error("draft: faces query matched no faces");
+                    draft_faces = std::move(qp.faces);
+                } else {
+                    aicad::doc::FacePicks fp =
+                        aicad::doc::resolve_face_picks(body, *fit, "faces");
+                    if (!fp.dangling.empty()) {
+                        std::string msg = "draft: faces selector dangling: ";
+                        for (std::size_t k = 0; k < fp.dangling.size(); ++k) {
+                            if (k) msg += "; ";
+                            msg += fp.dangling[k];
+                        }
+                        throw std::runtime_error(msg);
                     }
-                    throw std::runtime_error(msg);
+                    if (fp.faces.empty())
+                        throw std::runtime_error("draft: no faces resolved");
+                    draft_faces = std::move(fp.faces);
                 }
-                if (fp.faces.empty())
-                    throw std::runtime_error("draft: no faces resolved");
 
+                std::string draft_diag;
                 TopoDS_Shape out =
-                    ::geom::draft_faces(body, fp.faces, npt, nnl, pull, angle);
+                    ::geom::draft_faces(body, draft_faces, npt, nnl, pull, angle, &draft_diag);
                 if (out.IsNull())
-                    throw std::runtime_error("draft produced an empty shape");
+                    throw std::runtime_error(
+                        "draft: " + (draft_diag.empty()
+                                         ? std::string("the taper could not be applied")
+                                         : draft_diag));
                 consumed.insert(body_id);
                 source_of[id] = body_id;  // owner-map: derives from the input body
                 results[id] = SolidResult{out};
@@ -4189,8 +4958,18 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     throw std::runtime_error("weld_member: unknown joint '" + joint +
                                              "' (miter|butt|cope)");
 
-                // The source sketch (its raw segments become the member paths).
-                const std::string sid = req_str(feat, "sketch");
+                // The source sketch (its raw segments become the member paths). The
+                // `sketch` ref is SelOrDatum (validate.cpp), so accept a bare feature-id
+                // string OR a selector that names the owning sketch (region {sketch:fid} /
+                // {owner_feature} / {feature}) via selector_owner_id — rather than demanding
+                // a bare string, which dangled "missing string ref 'sketch'" on a selector
+                // object even though every other ref slot takes one (Bug W-1).
+                std::string sid;
+                if (feat.contains("sketch")) sid = selector_owner_id(feat.at("sketch"));
+                if (sid.empty())
+                    throw std::runtime_error(
+                        "weld_member: a 'sketch' ref is required (the path sketch's feature id, "
+                        "or a selector naming it, e.g. {\"kind\":\"region\",\"sketch\":\"f1\"})");
                 const SketchResult& src = require_sketch(results, sid, sid.c_str());
                 // Optional segment filter: a list of entity ids (default = all).
                 std::set<std::string> wanted;
@@ -4833,6 +5612,57 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 body_kinds[id] = "surface";
                 st.ok = true;
 
+            } else if (type == "surf_untrim") {
+                // UNTRIM: recover the full underlying surface patch of each selected face,
+                // dropping its trim wires (incl. inner holes), as a NEW surface body. The
+                // source body is LEFT INTACT (untrim extracts geometry, it does not modify
+                // the part) — so this is "give me the underlying surfaces of these faces".
+                // (Bug S-1: surf_untrim was validator-accepted but had NO compiler, so it
+                // always failed at build with "no compiler for feature type".)
+                const std::string body_id = body_ref(feat);
+                if (body_id.empty())
+                    throw std::runtime_error("surf_untrim: requires an existing body");
+                const TopoDS_Shape& body = require_solid(results, body_id, "body");
+                auto fit = feat.find("faces");
+                if (fit == feat.end())
+                    throw std::runtime_error("surf_untrim: refs.faces is required");
+                aicad::doc::FacePicks picks =
+                    aicad::doc::resolve_face_picks(body, *fit, "faces");
+                if (!picks.dangling.empty())
+                    throw std::runtime_error("surf_untrim: face selector(s) dangling");
+                if (picks.faces.empty())
+                    throw std::runtime_error("surf_untrim: no faces resolved");
+                const double utol = std::max(aicad::doc::bbox_diag(body), 1.0) * 1e-6;
+                BRep_Builder ubb;
+                TopoDS_Compound ucomp;
+                ubb.MakeCompound(ucomp);
+                int un = 0;
+                for (const TopoDS_Face& f : picks.faces) {
+                    Handle(Geom_Surface) surf = BRep_Tool::Surface(f);
+                    if (surf.IsNull()) continue;
+                    double umin, umax, vmin, vmax;
+                    BRepTools::UVBounds(f, umin, umax, vmin, vmax);
+                    if (!(umax > umin) || !(vmax > vmin)) continue;
+                    BRepBuilderAPI_MakeFace mk(surf, umin, umax, vmin, vmax, utol);
+                    if (!mk.IsDone()) continue;
+                    ubb.Add(ucomp, mk.Face());
+                    ++un;
+                }
+                if (un == 0)
+                    throw std::runtime_error(
+                        "surf_untrim: no face could be untrimmed (the underlying surface "
+                        "could not be rebuilt over its parameter bounds)");
+                // One face -> commit the bare face; several -> the compound of patches.
+                TopoDS_Shape uout = ucomp;
+                if (un == 1) {
+                    TopExp_Explorer uex(ucomp, TopAbs_FACE);
+                    if (uex.More()) uout = uex.Current();
+                }
+                results[id] = SolidResult{uout};   // NEW body; source NOT consumed
+                solid_order.push_back(id);
+                body_kinds[id] = "surface";
+                st.ok = true;
+
             } else if (type == "surf_trim") {
                 auto ssel = feat.find("surface");
                 if (ssel == feat.end())
@@ -4972,10 +5802,341 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 body_kinds[id] = "solid";
                 st.ok = true;
 
+            } else if (type == "thread") {
+                // One-op THREAD: cut a real helical ISO-60° thread into a cylindrical
+                // face (external shaft thread or internal bore thread). Params:
+                //   size       "M8" -> ISO coarse pitch + major Ø (table below); OR a
+                //              bare major_dia + pitch (custom thread).
+                //   length     axial run of the thread (mm, from the face axis location).
+                //   starts     thread starts (default 1; multi-start multiplies the lead).
+                //   handedness "right" (default) / "left".
+                //   style      "external" (default — shaft) / "internal" (bore).
+                //   turns      optional hard cap on swept turns (robustness).
+                //   mode       "cut" (default — real geometry) / "cosmetic" (no geometry,
+                //              a lightweight representation that always succeeds).
+                // Ref: target_face = the cylindrical face to thread (its axis + radius).
+                //
+                // ROBUSTNESS: helical booleans are fragile. cut_thread caps the turns,
+                // uses a rounded (not razor-sharp) profile, BRepCheck-validates the cut,
+                // and on ANY failure leaves the body UNTHREADED (the plain cylinder) with
+                // a clear warning rather than breaking the part.
+                const std::string body_id = body_ref(feat);
+                if (body_id.empty())
+                    throw std::runtime_error("thread: no body ref and no current body");
+                const TopoDS_Shape& body = require_solid(results, body_id, "body");
+
+                // -- size: M-table lookup OR bare major_dia + pitch -------------------
+                // ISO metric COARSE pitch + nominal major Ø (mm). Mirrors the catalog
+                // (core/parts/catalog.cpp find_metric) for M1.6–M12 and extends the
+                // standard coarse series through M24. A self-contained table keeps the
+                // thread feature in the geom/doc layer without a new catalog link dep.
+                struct MThread { const char* size; double major; double pitch; };
+                static const MThread kMetric[] = {
+                    {"M1.6", 1.6, 0.35}, {"M2", 2.0, 0.40}, {"M2.5", 2.5, 0.45},
+                    {"M3", 3.0, 0.50},   {"M4", 4.0, 0.70}, {"M5", 5.0, 0.80},
+                    {"M6", 6.0, 1.00},   {"M8", 8.0, 1.25}, {"M10", 10.0, 1.50},
+                    {"M12", 12.0, 1.75}, {"M14", 14.0, 2.00}, {"M16", 16.0, 2.00},
+                    {"M18", 18.0, 2.50}, {"M20", 20.0, 2.50}, {"M22", 22.0, 2.50},
+                    {"M24", 24.0, 3.00},
+                };
+                double major_dia = 0.0, pitch = 0.0;
+                if (feat.contains("size") && feat.at("size").is_string()) {
+                    std::string sz = feat.at("size").get<std::string>();
+                    // Canonicalize: trim, uppercase the leading m.
+                    if (!sz.empty() && (sz[0] == 'm')) sz[0] = 'M';
+                    bool found = false;
+                    for (const MThread& m : kMetric)
+                        if (sz == m.size) { major_dia = m.major; pitch = m.pitch; found = true; break; }
+                    if (!found)
+                        throw std::runtime_error(
+                            "thread: unknown size '" + sz + "' — use an ISO metric size "
+                            "(M1.6..M24 coarse) or pass major_dia + pitch directly");
+                } else {
+                    if (!feat.contains("major_dia") && !feat.contains("pitch"))
+                        throw std::runtime_error(
+                            "thread: provide a 'size' (e.g. \"M8\") OR both 'major_dia' and 'pitch'");
+                    major_dia = feat.contains("major_dia") ? num_or_expr(feat.at("major_dia"), env) : 0.0;
+                    pitch = feat.contains("pitch") ? num_or_expr(feat.at("pitch"), env) : 0.0;
+                    if (!(major_dia > 0.0) || !(pitch > 0.0))
+                        throw std::runtime_error("thread: major_dia and pitch must be > 0");
+                }
+
+                const double length =
+                    feat.contains("length") ? num_or_expr(feat.at("length"), env) : 0.0;
+                if (!(length > 0.0))
+                    throw std::runtime_error("thread: 'length' (thread run, mm) must be > 0");
+                int starts = 1;
+                if (feat.contains("starts")) {
+                    double sv = num_or_expr(feat.at("starts"), env);
+                    starts = std::max(1, static_cast<int>(std::lround(sv)));
+                }
+                const std::string handed = feat.value("handedness", std::string("right"));
+                const bool lefthand = (handed == "left" || handed == "lh" || handed == "left_hand");
+                const std::string style = feat.value("style", std::string("external"));
+                const bool internal = (style == "internal" || style == "tapped" || style == "bore");
+                const std::string tmode = feat.value("mode", std::string("cut"));
+                const double turns_cap =
+                    feat.contains("turns") ? num_or_expr(feat.at("turns"), env) : 0.0;
+
+                // COSMETIC: a lightweight representation — no geometry change. Succeed with
+                // a warning (full drawing-callout integration is a separate follow-up).
+                if (tmode == "cosmetic") {
+                    char buf[160];
+                    std::snprintf(buf, sizeof(buf),
+                        "cosmetic thread %s%s (no geometry)",
+                        (feat.contains("size") && feat.at("size").is_string())
+                            ? feat.at("size").get<std::string>().c_str()
+                            : "custom",
+                        internal ? " internal" : "");
+                    st.warning = buf;
+                    // The body passes through UNCHANGED (a new id pointing at the same shape).
+                    consumed.insert(body_id);
+                    source_of[id] = body_id;
+                    results[id] = SolidResult{body};
+                    solid_order.push_back(id);
+                    st.ok = true;
+
+                } else {
+                    if (tmode != "cut")
+                        throw std::runtime_error(
+                            "thread: unknown mode '" + tmode + "' (use \"cut\" or \"cosmetic\")");
+
+                    // Resolve the target cylindrical face -> axis (loc, dir) + radius.
+                    const json& fref = feat.contains("target_face") ? feat.at("target_face")
+                                     : (feat.contains("face") ? feat.at("face") : json());
+                    if (fref.is_null())
+                        throw std::runtime_error(
+                            "thread: a 'target_face' ref (the cylindrical face to thread) is required");
+                    TopoDS_Face tface = resolve_face_sel(fref, "target_face");
+                    BRepAdaptor_Surface ad(tface);
+                    if (ad.GetType() != GeomAbs_Cylinder)
+                        throw std::runtime_error(
+                            "thread: target_face must be a CYLINDRICAL face (a shaft's outer "
+                            "cylinder for external, the bore for internal)");
+                    const gp_Ax1 cyl_axis = ad.Cylinder().Axis();
+                    const double cyl_radius = ad.Cylinder().Radius();
+                    gp_Pnt axis_loc = cyl_axis.Location();
+                    gp_Dir axis_dir = cyl_axis.Direction();
+
+                    // Anchor the thread start at the LOWER end of the face along the axis,
+                    // so a `length` shorter than the cylinder threads from one end rather
+                    // than from the (arbitrary) surface parametric origin.
+                    {
+                        Bnd_Box fb;
+                        BRepBndLib::Add(tface, fb);
+                        double x0, y0, z0, x1, y1, z1;
+                        fb.Get(x0, y0, z0, x1, y1, z1);
+                        gp_Pnt lo(x0, y0, z0), hi(x1, y1, z1);
+                        gp_Vec ad_v(axis_dir);
+                        // Project both bbox corners onto the axis; start from the lower one.
+                        gp_Vec to_lo(axis_loc, lo), to_hi(axis_loc, hi);
+                        double s_lo = to_lo.Dot(ad_v), s_hi = to_hi.Dot(ad_v);
+                        double s_start = std::min(s_lo, s_hi);
+                        axis_loc = axis_loc.Translated(ad_v.Multiplied(s_start));
+                    }
+
+                    ::geom::ThreadResult tr = ::geom::cut_thread(
+                        body, axis_loc, axis_dir, cyl_radius, pitch, major_dia, length,
+                        starts, lefthand, internal, turns_cap);
+                    if (tr.shape.IsNull())
+                        throw std::runtime_error(
+                            tr.warning.empty() ? std::string("thread: produced an empty shape")
+                                               : tr.warning);
+                    if (!tr.warning.empty()) st.warning = tr.warning;
+
+                    // The threaded (or, on a fall-back, unthreaded) body REPLACES the input.
+                    consumed.insert(body_id);
+                    source_of[id] = body_id;
+                    results[id] = SolidResult{tr.shape};
+                    solid_order.push_back(id);
+                    st.ok = true;
+                }
+
+            } else if (type == "text") {
+                // One-op TEXT: emboss (raise) or engrave (recess) a string onto a PLANAR
+                // face. Params:
+                //   text     the string to mark (required). Aliases: string, value.
+                //   height   cap/ascender height of the text (mm, default 5).
+                //   depth    emboss height / engrave depth (mm, default 0.5).
+                //   mode     "engrave" (default — recessed) / "emboss" (raised). Aliases:
+                //            cut/recess/sunk -> engrave; raised/raise/boss/proud -> emboss.
+                //   font     optional font name ("rubik"/"mono"/"bold"/"medium") or an
+                //            absolute .ttf path; defaults to the bundled Rubik-Regular.
+                //   halign   "left"/"center"(default)/"right"; valign "baseline"/
+                //            "center"(default)/"top".
+                //   offset   optional [du, dv] in-plane shift (mm) from the face centre.
+                // Ref: target_face = the planar face to mark.
+                //
+                // ROBUSTNESS: font rendering + booleans are fragile. geom::emboss_text
+                // BRepCheck-validates the result and, on ANY failure, leaves the body
+                // UNMARKED (the clean part) with a clear warning rather than corrupting it.
+                const std::string body_id = body_ref(feat);
+                if (body_id.empty())
+                    throw std::runtime_error("text: no body ref and no current body");
+                const TopoDS_Shape& body = require_solid(results, body_id, "body");
+
+                std::string str;
+                for (const char* k : {"text", "string", "value"})
+                    if (feat.contains(k) && feat.at(k).is_string()) {
+                        str = feat.at(k).get<std::string>();
+                        break;
+                    }
+                if (str.empty())
+                    throw std::runtime_error("text: a non-empty 'text' string is required");
+
+                const double height =
+                    feat.contains("height")   ? num_or_expr(feat.at("height"), env)
+                    : feat.contains("size")   ? num_or_expr(feat.at("size"), env)
+                                              : 5.0;
+                const double depth =
+                    feat.contains("depth") ? num_or_expr(feat.at("depth"), env) : 0.5;
+                if (!(height > 0.0))
+                    throw std::runtime_error("text: 'height' (mm) must be > 0");
+                if (!(depth > 0.0))
+                    throw std::runtime_error("text: 'depth' (mm) must be > 0");
+
+                const std::string mode = feat.value("mode", std::string("engrave"));
+                const bool engrave = !(mode == "emboss" || mode == "raised" ||
+                                       mode == "raise" || mode == "boss" ||
+                                       mode == "proud" || mode == "out" ||
+                                       mode == "extrude");
+
+                auto align_code = [](const std::string& s, int dflt) -> int {
+                    if (s == "left" || s == "baseline" || s == "bottom") return 0;
+                    if (s == "center" || s == "centre" || s == "middle") return 1;
+                    if (s == "right" || s == "top") return 2;
+                    return dflt;
+                };
+                const int halign = align_code(feat.value("halign", std::string()), 1);
+                const int valign = align_code(feat.value("valign", std::string()), 1);
+
+                // Resolve the planar target face -> outward frame (origin, normal, xdir).
+                const json& fref = feat.contains("target_face") ? feat.at("target_face")
+                                 : (feat.contains("face") ? feat.at("face") : json());
+                if (fref.is_null())
+                    throw std::runtime_error(
+                        "text: a 'target_face' ref (the planar face to mark) is required");
+                TopoDS_Face tface = resolve_face_sel(fref, "target_face");
+                BRepAdaptor_Surface ad(tface);
+                if (ad.GetType() != GeomAbs_Plane)
+                    throw std::runtime_error(
+                        "text: target_face must be a PLANAR face (emboss/engrave marks a "
+                        "flat surface)");
+                gp_Pln pln = ad.Plane();
+                gp_Dir normal = pln.Axis().Direction();
+                if (tface.Orientation() == TopAbs_REVERSED) normal.Reverse();
+                gp_Dir xdir = pln.XAxis().Direction();
+
+                GProp_GProps fprops;
+                BRepGProp::SurfaceProperties(tface, fprops);
+                gp_Pnt origin = fprops.CentreOfMass();
+
+                // Optional in-plane offset [du, dv] from the face centre (dv along the
+                // right-handed up = normal x xdir, matching the glyph builder's +Y).
+                if (feat.contains("offset") && feat.at("offset").is_array() &&
+                    feat.at("offset").size() >= 2) {
+                    const double du = num_or_expr(feat.at("offset").at(0), env);
+                    const double dv = num_or_expr(feat.at("offset").at(1), env);
+                    gp_Vec vx(xdir), vy(gp_Vec(normal).Crossed(gp_Vec(xdir)));
+                    origin.Translate(vx.Multiplied(du).Added(vy.Multiplied(dv)));
+                }
+
+                const std::string font_path =
+                    ::geom::resolve_font_path(feat.value("font", std::string()));
+
+                ::geom::TextResult tx = ::geom::emboss_text(
+                    body, origin, normal, xdir, str, font_path, height, depth, engrave,
+                    halign, valign);
+                if (tx.shape.IsNull())
+                    throw std::runtime_error(
+                        tx.warning.empty() ? std::string("text: produced an empty shape")
+                                           : tx.warning);
+                if (!tx.warning.empty()) st.warning = tx.warning;
+
+                // The marked (or, on a fall-back, unmarked) body REPLACES the input.
+                consumed.insert(body_id);
+                source_of[id] = body_id;
+                results[id] = SolidResult{tx.shape};
+                solid_order.push_back(id);
+                st.ok = true;
+
             } else {
                 // Forward-tolerant: an unknown feature type errors but the rebuild
                 // continues (mirrors the Python's "no compiler for type" path).
                 throw std::runtime_error("no compiler for feature type '" + type + "'");
+            }
+
+            // Bug N2 — no committed solid may have negative volume. Validate (and, if
+            // possible, heal) every solid body THIS feature produced. An unhealable
+            // inverted solid throws here -> the per-feature catch turns it into a loud
+            // error status instead of silently committing a corrupt B-rep.
+            for (std::size_t k = solids_before; k < solid_order.size(); ++k) {
+                const std::string& nsid = solid_order[k];
+                if (consumed.count(nsid)) continue;  // already superseded in this iteration
+                if (sanitize_solid(nsid, raw.value("name", id)))
+                    st.warning = st.warning.empty()
+                        ? std::string("healed an inverted solid (shell orientation fixed)")
+                        : (st.warning + "; healed an inverted solid (shell orientation fixed)");
+            }
+
+            // -- SYSTEMIC BACKSTOP (Bug B6 class): no feature may VANISH or silently
+            // empty the document. The per-branch guards above each catch their own
+            // degenerate case (fillet open-shell S2, sweep zero-volume N-9, buried boss,
+            // ...), but a NEW branch (or an OCCT quirk a branch's guard missed) could
+            // still (a) commit a NULL / face-less B-rep, or (b) consume the only body and
+            // leave the document with ZERO solids. This final, branch-independent check
+            // turns BOTH into a LOUD error status (caught just below) instead of a silent
+            // "document has no bodies" surfacing later in eval_mass / eval_check. It is
+            // deliberately TRIGGERED ONLY by a null/empty RESULT or a was-non-empty ->
+            // now-empty transition (never a blanket volume/shape rule) so it cannot reject
+            // a valid feature (e.g. a legitimate concave-edge fillet that grows volume).
+            {
+                // On a violation, RESTORE the pre-feature topology bookkeeping
+                // (`consumed` set + `solid_order` length) so the prior body stays alive in
+                // the surviving-bodies tessellation, THEN throw -> the per-feature catch
+                // records a loud error status. Without this restore the failing feature
+                // would orphan the body it had already consumed.
+                auto fail_backstop = [&](const std::string& msg) {
+                    consumed = consumed_snapshot;
+                    if (solid_order.size() > solids_before)
+                        solid_order.resize(solids_before);
+                    throw std::runtime_error(msg);
+                };
+                // (a) Any SOLID this feature produced (and did not itself supersede) must
+                //     be a real, non-empty B-rep. A null shape or a zero-face shell is a
+                //     degenerate commit — fail loudly rather than ship an empty body that
+                //     later reads as "no bodies".
+                for (std::size_t k = solids_before; k < solid_order.size(); ++k) {
+                    const std::string& nsid = solid_order[k];
+                    if (consumed.count(nsid)) continue;
+                    auto rit = results.find(nsid);
+                    if (rit == results.end() ||
+                        !std::holds_alternative<SolidResult>(rit->second))
+                        continue;
+                    const TopoDS_Shape& sh = std::get<SolidResult>(rit->second).shape;
+                    if (sh.IsNull() || ::geom::shape_face_count(sh) == 0)
+                        fail_backstop(
+                            type + " produced an empty/degenerate body (no geometry) — "
+                            "refusing to commit a null result that would leave the "
+                            "document with a vanished body");
+                }
+                // (b) A feature that left the document with ZERO alive solids when there
+                //     was at least one before has dissolved the part. Prior features'
+                //     consumptions are already reflected in alive_before (a body a PRIOR
+                //     feature consumed is not counted alive), so the only way alive can
+                //     drop to zero here is THIS feature consuming the last alive body
+                //     without producing a surviving replacement (features only ever ADD to
+                //     the consumed set). This is the was-non-empty -> now-empty trigger;
+                //     it never fires on a doc that was already empty, nor on a feature that
+                //     produced a valid new body.
+                std::size_t alive_after = 0;
+                for (const std::string& s : solid_order)
+                    if (!consumed.count(s)) ++alive_after;
+                if (alive_before > 0 && alive_after == 0)
+                    fail_backstop(
+                        type + " emptied the document — it removed the last body without "
+                        "producing a valid replacement (a dress/sweep/cut must never leave "
+                        "zero bodies). Check the feature's size/placement.");
             }
         } catch (const std::exception& ex) {
             st.ok = false;
@@ -4983,6 +6144,21 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         } catch (...) {
             st.ok = false;
             st.error = "unknown error during feature compile";
+        }
+
+        // DUPLICATE-NAME warning (Bug K9): a second feature with the same display name is
+        // accepted (no hard error — that would break existing flows), but flagged so the
+        // user/host can disambiguate the tree. Only a feature that compiled is tracked;
+        // an existing feature-specific warning is preserved (the name note is appended).
+        if (st.ok) {
+            const std::string fname = raw.value("name", id);
+            if (!fname.empty()) {
+                if (!seen_names.insert(fname).second) {
+                    const std::string note =
+                        "duplicate feature name '" + fname + "' in this document";
+                    st.warning = st.warning.empty() ? note : (st.warning + "; " + note);
+                }
+            }
         }
 
         result.statuses.push_back(std::move(st));

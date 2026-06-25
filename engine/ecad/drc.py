@@ -202,30 +202,43 @@ def _shared_layer(a: _Shape, b: _Shape) -> bool:
 
 
 def edge_distance(a: _Shape, b: _Shape) -> float:
-    """Edge-to-edge copper distance between two normalized shapes (negative clamped to 0)."""
+    """Edge-to-edge copper distance between two normalized shapes.
+
+    Returns the true signed edge gap: positive = clear, zero = touching,
+    negative = copper overlap.  Callers that need a non-negative value should
+    clamp themselves; the DRC violation reporter must NOT clamp so it can
+    surface the real measurement (e.g. −0.28 mm for overlapping SOIC pads).
+    """
     # center-to-center / segment metric, minus the copper margins of each shape.
     if a.kind == "seg" and b.kind == "seg":
         d = seg_seg_dist(a.pts[0], a.pts[1], b.pts[0], b.pts[1])
-        return max(d - a.margin - b.margin, 0.0)
+        return d - a.margin - b.margin
     if a.kind == "seg" and b.kind == "circle":
         d = _point_seg_dist(b.center, a.pts[0], a.pts[1])
-        return max(d - a.margin - b.margin, 0.0)
+        return d - a.margin - b.margin
     if a.kind == "circle" and b.kind == "seg":
         return edge_distance(b, a)
     if a.kind == "circle" and b.kind == "circle":
-        return max(_dist(a.center, b.center) - a.margin - b.margin, 0.0)
+        return _dist(a.center, b.center) - a.margin - b.margin
     if a.kind == "seg" and b.kind == "box":
         d = _seg_box_dist(a.pts[0], a.pts[1], b.center[0], b.center[1], b.half[0], b.half[1])
-        return max(d - a.margin, 0.0)
+        return d - a.margin
     if a.kind == "box" and b.kind == "seg":
         return edge_distance(b, a)
     if a.kind == "circle" and b.kind == "box":
         d = _point_box_dist(a.center, b.center[0], b.center[1], b.half[0], b.half[1])
-        return max(d - a.margin, 0.0)
+        return d - a.margin
     if a.kind == "box" and b.kind == "circle":
         return edge_distance(b, a)
-    # box / box
-    return _box_box_dist(a.center, a.half, b.center, b.half)
+    # box / box — _box_box_dist is already zero-clamped at the segment level;
+    # reconstruct a signed value so overlapping boxes report a negative gap.
+    dx = abs(a.center[0] - b.center[0]) - (a.half[0] + b.half[0])
+    dy = abs(a.center[1] - b.center[1]) - (a.half[1] + b.half[1])
+    if dx <= 0.0 and dy <= 0.0:
+        # boxes overlap: the penetration depth along the shallowest axis
+        return max(dx, dy)  # most-positive of two negatives = shallowest overlap
+    # boxes are separated; compute euclidean gap (same as _box_box_dist)
+    return math.hypot(max(dx, 0.0), max(dy, 0.0))
 
 
 # ── building shapes from a board ───────────────────────────────────────────────────

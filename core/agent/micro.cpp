@@ -446,25 +446,13 @@ bool should_engage(const json& provider_cfg, const json& cfg) {
                                    : std::string();
         is_local = host_is_loopback(base_url);
     }
-    if (!is_local) return false;
-    // _context_is_small: ctx = cfg.context_tokens or provider.context_tokens.
-    // Python `or`: take cfg value if truthy, else provider value.
-    double ctx = 0.0;
-    bool have_ctx = false;
-    auto take = [&](const json& src) {
-        if (have_ctx) return;
-        if (src.is_object() && src.contains("context_tokens")) {
-            const json& c = src["context_tokens"];
-            if (c.is_number()) {
-                double cv = c.get<double>();
-                if (cv != 0.0) { ctx = cv; have_ctx = true; }
-            }
-        }
-    };
-    take(cfg);
-    take(provider_cfg);
-    if (have_ctx && ctx > 16000) return false;
-    return true;
+    // auto mode: ANY local provider uses the limited (micro) modeling path. Local models — even
+    // large-context local builds (e.g. a 26B loaded at 32k ctx) — do far better on the lightweight
+    // decompose -> execute micro flow than the heavier intake/plan/model machine path, so locality
+    // ALONE engages it. (A previous ctx>16000 carve-out used to bump big-context local models onto
+    // the machine path; it's intentionally gone — a local endpoint always means the limited path.)
+    // To force the full machine path regardless, set cfg.micro_mode=false explicitly.
+    return is_local;  // is_local is true here (we returned false above otherwise)
 }
 
 // --------------------------------------------------------------------------- JSON array extract

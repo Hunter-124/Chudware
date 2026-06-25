@@ -14,9 +14,11 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "doc/annot_draw.h"  // compile_annotation / compile_hatch (shared primitives)
+#include "doc/assembly.h"  // compile_assembly / placed_world_shape (multi-body / asm sourcing)
 #include "doc/document.h"
 #include "doc/drawing.h"
 #include "doc/session.h"  // OpError
@@ -45,6 +47,47 @@ std::array<double, 2> sheet_dims(const std::string& size) {
     return it == dims.end() ? std::array<double, 2>{0.0, 0.0} : it->second;
 }
 
+// ----------------------------------------------------------------- standard drawing scales
+// The preferred drawing scales (ISO 5455 / ASME Y14.1), descending. A drawing is laid out at
+// ONE of these so the title-block "SCALE" reads conventionally (e.g. 2:1, 1:1, 1:50) instead of
+// an arbitrary fraction. Used by D5 auto-scale: pick the LARGEST standard scale whose scaled
+// part footprint still fits the available view area (so the part fills the sheet without
+// overflowing). Range spans 100:1 (tiny parts) down to 1:1000 (very large parts).
+const std::vector<double>& standard_scales() {
+    static const std::vector<double> k = {
+        100.0, 50.0, 20.0, 10.0, 5.0, 2.0, 1.0,
+        1.0 / 2, 1.0 / 5, 1.0 / 10, 1.0 / 20, 1.0 / 50,
+        1.0 / 100, 1.0 / 200, 1.0 / 500, 1.0 / 1000,
+    };
+    return k;
+}
+
+// Snap an ideal (continuous) scale DOWN to the nearest standard scale that does not exceed it,
+// so the scaled part is guaranteed to still fit the area `ideal` was sized for (we never round a
+// scale UP past what fits). Clamped to the table's extremes.
+double snap_scale_down(double ideal) {
+    const auto& tbl = standard_scales();
+    if (ideal >= tbl.front()) return tbl.front();
+    for (double s : tbl)
+        if (s <= ideal + 1e-12) return s;  // first (largest) standard scale <= ideal
+    return tbl.back();
+}
+
+// Human "N:1" / "1:N" scale text for the title block (matches the SCALE field convention).
+std::string scale_text(double scale) {
+    char buf[48];
+    if (scale >= 1.0) {
+        double n = scale;
+        if (std::fabs(n - std::round(n)) < 1e-6) std::snprintf(buf, sizeof(buf), "%d:1", (int)std::round(n));
+        else std::snprintf(buf, sizeof(buf), "%.3g:1", n);
+    } else {
+        double inv = 1.0 / scale;
+        if (std::fabs(inv - std::round(inv)) < 1e-6) std::snprintf(buf, sizeof(buf), "1:%d", (int)std::round(inv));
+        else std::snprintf(buf, sizeof(buf), "1:%.3g", inv);
+    }
+    return std::string(buf);
+}
+
 // ----------------------------------------------------------------- session store
 struct DrawingSession {
     std::string doc_id;
@@ -57,6 +100,30 @@ struct DrawingSession {
 };
 
 std::mutex g_mtx;
+// Owner-tracking for crash recovery (see force_release_drawing_lock / drawing_session.h).
+// Mirrors the identical pattern in core/doc/session.cpp (DocLock / force_release_doc_lock).
+// g_mtx_held is true only while a DrawingLock is alive; g_mtx_owner is meaningful only
+// when held. Together they let the SEH dispatch boundary detect and drop an orphaned lock
+// after a Windows structured exception (access violation) without running C++ destructors.
+std::atomic<bool> g_mtx_held{false};
+std::thread::id g_mtx_owner;  // guarded by g_mtx (only read/written while held)
+
+// RAII lock for the drawing-session store. Mirrors DocLock in session.cpp exactly.
+class DrawingLock {
+public:
+    DrawingLock() {
+        g_mtx.lock();
+        g_mtx_owner = std::this_thread::get_id();
+        g_mtx_held.store(true, std::memory_order_release);
+    }
+    ~DrawingLock() {
+        g_mtx_held.store(false, std::memory_order_release);
+        g_mtx.unlock();
+    }
+    DrawingLock(const DrawingLock&) = delete;
+    DrawingLock& operator=(const DrawingLock&) = delete;
+};
+
 std::map<std::string, DrawingSession> g_drawings;
 std::atomic<unsigned long long> g_seq{1};
 
@@ -92,6 +159,15 @@ json blank_drawing(const std::string& name, const std::string& source_doc_id) {
 // the user is editing — exactly like the Python oracle pulling the open source session.
 // If that session is gone (closed), fall back to the last good inline snapshot. With no
 // ref id, recompile the fixed inline tree (the stateless probe / parity path).
+//
+// EVERY body of the source goes into the SAME returned vector so each projected view
+// receives the WHOLE part in the shared world frame — project_view HLR-adds all of them,
+// so front/top/iso each show the complete model exactly like the 3D viewport (D10). A
+// multi-body PART naturally yields all its surviving solids from compile_document; an
+// ASSEMBLY source (schema aicad.asm/1) is NOT a feature tree — compile_document would
+// ignore its components and project nothing — so it is resolved through compile_assembly
+// and each component world-placed (placed_world_shape), the same geometry the viewport
+// tessellates. Component-load failures degrade gracefully (fewer bodies), never throw.
 std::vector<TopoDS_Shape> source_shapes(const DrawingSession& s) {
     json tree = s.source_doc;
     json env = s.source_env;
@@ -101,6 +177,20 @@ std::vector<TopoDS_Shape> source_shapes(const DrawingSession& s) {
             tree = live["tree"];
             env = live.value("env", json::object());
         }
+    }
+    // Assembly source: resolve + mate-solve its components and return every world-placed
+    // body so all of them superimpose in each view (one combined projection per orientation).
+    if (tree.is_object() && tree.value("schema", std::string()) == "aicad.asm/1") {
+        std::vector<TopoDS_Shape> out;
+        try {
+            AssemblyResult ares = compile_assembly(tree);
+            out.reserve(ares.bodies.size());
+            for (const AsmBodyOut& b : ares.bodies) {
+                TopoDS_Shape world = placed_world_shape(b);
+                if (!world.IsNull()) out.push_back(world);
+            }
+        } catch (...) { /* unloadable assembly -> empty -> "no bodies to project" per view */ }
+        return out;
     }
     CompileResult res = compile_document(tree, env.is_null() ? json::object() : env);
     return res.shapes;
@@ -316,8 +406,14 @@ json resolve_section_plane(const json& view, const json& parent_view) {
         throw OpError("invalid_op", "section cut line is parallel to the view direction",
                       {{"reason", "degenerate"}});
     plane_normal = v_norm(plane_normal);
+    // Anchor the plane at the cut-line MIDPOINT, not endpoint `a`. Both endpoints lie on the
+    // cut plane, so this leaves the section plane unchanged — but it matters for a HALF section
+    // (D11): the half division half-space starts at `point`, so anchoring at an endpoint (which
+    // can sit at or beyond the part's extent along the cut direction) made the division cover the
+    // whole part and degenerate the half section into a full one. The midpoint bisects the part.
+    Vec3 mid = {(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (a[2] + b[2]) * 0.5};
     json plane = {{"normal", json::array({plane_normal[0], plane_normal[1], plane_normal[2]})},
-                  {"point", json::array({a[0], a[1], a[2]})}};
+                  {"point", json::array({mid[0], mid[1], mid[2]})}};
     // For a half section, keep the unsectioned half along the cut-line direction in world.
     plane["half_axis"] = json::array({line[0], line[1], line[2]});
     return attach_mode(plane);
@@ -336,13 +432,32 @@ json project_one(DrawingSession& s, const json& view,
     std::array<double, 2> pos = get_pos(view.value("position", json::array({0.0, 0.0})));
     std::string vid = view.value("id", std::string("v?"));
 
+    // D3-followup: a DERIVED view (section/detail) re-projection that FAILS must NOT throw out
+    // of drawing_get — drawing_get re-projects EVERY view on each fetch, so one bad derived view
+    // (e.g. a section whose cut line went degenerate after the parent moved/rescaled, or a detail
+    // whose parent now errors) would abort the whole sheet and make review_drawing report "not a
+    // drawing document". Instead, contain the failure per view: record an `error` field + empty
+    // geometry (the SAME shape project_view/project_detail already use for contained failures, and
+    // the same shape the `!parent` detail fallback below uses), so the rest of the sheet renders.
+    auto derived_error = [&](const std::string& orient, const std::string& msg) -> json {
+        return json{{"view_id", vid}, {"scale", scale}, {"orientation", orient},
+                    {"visible", json::array()}, {"hidden", json::array()},
+                    {"section_faces", json::array()}, {"arcs", json::array()},
+                    {"bbox", json(nullptr)}, {"ms", 0.0}, {"error", msg}};
+    };
     json proj;
     if (vtype == "section") {
         const json* parent = view.contains("parent") && view["parent"].is_string()
                                  ? find_view_c(s.doc, view["parent"].get<std::string>())
                                  : nullptr;
-        json plane = resolve_section_plane(view, parent ? *parent : json::object());
-        proj = project_section(src_shapes, plane, scale, pos, show_hidden, vid);
+        try {
+            json plane = resolve_section_plane(view, parent ? *parent : json::object());
+            proj = project_section(src_shapes, plane, scale, pos, show_hidden, vid);
+        } catch (const OpError& e) {
+            proj = derived_error("section", e.what());
+        } catch (const std::exception& e) {
+            proj = derived_error("section", std::string("section projection failed: ") + e.what());
+        }
     } else if (vtype == "detail") {
         const json* parent = view.contains("parent") && view["parent"].is_string()
                                  ? find_view_c(s.doc, view["parent"].get<std::string>())
@@ -355,8 +470,14 @@ json project_one(DrawingSession& s, const json& view,
                     {"bbox", json(nullptr)}, {"ms", 0.0},
                     {"error", "detail view has no resolvable parent"}};
         } else {
-            json parent_geom = project_one(s, *parent, src_shapes);
-            proj = project_detail(parent_geom, center, radius, scale, pos, vid);
+            try {
+                json parent_geom = project_one(s, *parent, src_shapes);
+                proj = project_detail(parent_geom, center, radius, scale, pos, vid);
+            } catch (const OpError& e) {
+                proj = derived_error("detail", e.what());
+            } catch (const std::exception& e) {
+                proj = derived_error("detail", std::string("detail projection failed: ") + e.what());
+            }
         }
     } else {
         std::string orient = view.value("orientation", std::string("front"));
@@ -466,6 +587,53 @@ std::string compose_disp(const json& ann, const std::string& units) {
     std::string tt = ann.value("tol_type", std::string("none"));
     double tu = ann.value("tol_upper", 0.0), tl = ann.value("tol_lower", 0.0);
 
+    // Standard STACKED hole callout (ASME Y14.5): a hole_callout that carries a hole_type
+    // (counterbore/countersink/tapped) renders the conventional one-line stacked form
+    //   counterbore: "N× ⌀d ⌴ ⌀D ↧ h"   countersink: "N× ⌀d ⌵ ⌀D × A°"
+    //   tapped:      "N× <thread> ↧ depth"   simple/blind: "N× ⌀d [↧ depth]"
+    // (⌀ U+2300, ⌴ U+2334, ⌵ U+2335, ↧ U+21A7, × U+00D7, ° U+00B0). The `count` multiplier
+    // collapses identical holes to a single leader; an explicit `text_override` still wins
+    // upstream. This is the localization for D4's counterbore/countersink formatting.
+    {
+        std::string ht = ann.value("hole_type", std::string());
+        if (kind == "hole_callout" && !ht.empty() && ht != "simple") {
+            const std::string DIA = "\xE2\x8C\x80";    // U+2300
+            const std::string CBORE = "\xE2\x8C\xB4";  // U+2334
+            const std::string CSK = "\xE2\x8C\xB5";    // U+2335
+            const std::string DEPTH = "\xE2\x86\xA7";  // U+21A7
+            const std::string TIMES = "\xC3\x97";      // U+00D7
+            const std::string DEG = "\xC2\xB0";        // U+00B0
+            double d = value;  // pilot/minor diameter (model mm)
+            double D = ann.value("cbore_dia", 0.0);
+            double h = ann.value("cbore_depth", 0.0);
+            double ang = ann.value("csk_angle", 0.0);
+            double depth = ann.value("depth", 0.0);
+            std::string thread = ann.value("thread", std::string());
+            std::string out;
+            if (ht == "tapped") {
+                out = (!thread.empty() ? thread : DIA + fmt_len(d, ips, prec));
+                if (depth > 1e-9) out += " " + DEPTH + " " + fmt_len(depth, ips, prec);
+            } else if (ht == "counterbore" || ht == "cbore") {
+                out = DIA + fmt_len(d, ips, prec) + " " + CBORE + " " + DIA + fmt_len(D, ips, prec);
+                if (h > 1e-9) out += " " + DEPTH + " " + fmt_len(h, ips, prec);
+            } else if (ht == "countersink" || ht == "csk") {
+                out = DIA + fmt_len(d, ips, prec) + " " + CSK + " " + DIA + fmt_len(D, ips, prec);
+                if (ang > 1e-9) {  // angle is degrees, never unit-converted
+                    char ab[32];
+                    if (prec >= 0) std::snprintf(ab, sizeof(ab), "%.*f", prec, ang);
+                    else std::snprintf(ab, sizeof(ab), "%.4g", ang);
+                    out += " " + TIMES + " " + std::string(ab) + DEG;
+                }
+            } else {
+                out = DIA + fmt_len(d, ips, prec);
+                if (depth > 1e-9) out += " " + DEPTH + " " + fmt_len(depth, ips, prec);
+            }
+            out = pre + out + suf;
+            if (count > 1) out = std::to_string(count) + TIMES + " " + out;
+            return out;
+        }
+    }
+
     std::string sym;  // leading symbol
     if (kind == "radial_dim") sym = "R";
     else if (kind == "diameter_dim" || kind == "hole_callout") sym = "\xE2\x8C\x80";  // U+2300
@@ -496,8 +664,33 @@ std::string compose_disp(const json& ann, const std::string& units) {
 
 double round6(double v) { return std::round(v * 1e6) / 1e6; }
 
+// Parse a metric standard size string (e.g. "M4", "M10", "M3.5") to its nominal diameter
+// in model mm. Accepts "M<digits>" and "M<digits>.<digits>" (ISO 261 / DIN 13 nominal).
+// Returns 0.0 for anything that does not parse as a valid metric size (unrecognised strings,
+// imperial strings, or sizes below 1 mm that are likely noise). Used as a last-resort fallback
+// in the hole callout path so an M-standard hole never prints a literal "DIA 0" / "⌀0".
+double parse_metric_standard_diameter(const std::string& std_str) {
+    if (std_str.empty()) return 0.0;
+    const char* p = std_str.c_str();
+    // Accept leading 'M' or 'm' only.
+    if (*p != 'M' && *p != 'm') return 0.0;
+    ++p;
+    // Parse digits (and optional single decimal point) for the nominal size.
+    char* end = nullptr;
+    double d = std::strtod(p, &end);
+    if (end == p || d < 1.0) return 0.0;  // must be at least 1 mm to be credible
+    return d;
+}
+
 // The arc in geom["arcs"] whose ring lies nearest `point` (drawing.py::_nearest_arc).
-const json* nearest_arc(const json& geom, const json& point, int want_closed /*-1 any,0,1*/) {
+// `min_r` skips degenerate near-zero-radius projected circles: a chamfered / counterbored /
+// multi-step hole projects SEVERAL concentric circles, and the silhouette of a chamfer cone or a
+// tiny relief can land an almost-zero-radius "circle" at the hole axis. When the pick sits at the
+// hole centre, nearest_arc's metric |dist-r| reduces to r, so that spurious ~0 ring would WIN and
+// the callout diameter would read 0 (D-B2). A small positive `min_r` (sheet mm) excludes those so
+// the real bore is chosen; pass 0 to keep the historical any-radius behaviour.
+const json* nearest_arc(const json& geom, const json& point, int want_closed /*-1 any,0,1*/,
+                        double min_r = 0.0) {
     if (!geom.contains("arcs") || !geom["arcs"].is_array()) return nullptr;
     double px = point[0].get<double>(), py = point[1].get<double>();
     const json* best = nullptr;
@@ -508,6 +701,7 @@ const json* nearest_arc(const json& geom, const json& point, int want_closed /*-
         if (want_closed == 0 && closed) continue;
         double cx = arc["center"][0].get<double>(), cy = arc["center"][1].get<double>();
         double r = arc.value("radius", 0.0);
+        if (r < min_r) continue;  // skip degenerate / spurious near-zero-radius circles
         double d = std::fabs(std::hypot(px - cx, py - cy) - r);
         if (!best || d < best_d) { best_d = d; best = &arc; }
     }
@@ -598,7 +792,7 @@ json drawing_get_locked_unsafe(const std::string& doc_id) {
 
 json drawing_new(const json& source_doc, const json& env, const std::string& name,
                  const std::string& source_doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     // LIVE source: snapshot the open session's current tree+env now (for the name + a
     // fallback if it later closes) and remember the id for the associative re-pull.
     json src = source_doc;
@@ -634,7 +828,7 @@ json drawing_new(const json& source_doc, const json& env, const std::string& nam
 }
 
 json drawing_set_source(const std::string& doc_id, const json& source_doc, const json& env) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     // An explicit inline source replaces any live ref (the caller now owns the tree).
     s.source_ref_id.clear();
@@ -647,7 +841,7 @@ json drawing_set_source(const std::string& doc_id, const json& source_doc, const
 json drawing_add_view(const std::string& doc_id, const std::string& type,
                       const std::string& orientation, const std::string& sheet_id,
                       const json& scale, const json& position, const json& show_hidden) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json& sheet = find_sheet(s.doc, sheet_id);
     if (type != "base" && type != "projected" && type != "iso")
@@ -674,7 +868,7 @@ json drawing_add_section(const std::string& doc_id, const std::string& parent_vi
                          const json& plane, const json& cut_line, const json& label,
                          const json& scale, const json& position, const std::string& sheet_id,
                          const json& show_hidden, const json& opts) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json& sheet = find_sheet(s.doc, sheet_id);
     json* parent = find_view(s.doc, parent_view_id);
@@ -729,7 +923,7 @@ json drawing_add_section(const std::string& doc_id, const std::string& parent_vi
 json drawing_add_detail(const std::string& doc_id, const std::string& parent_view_id,
                         const json& center, double radius, const json& scale, const json& label,
                         const json& position, const std::string& sheet_id, const json& show_hidden) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json& sheet = find_sheet(s.doc, sheet_id);
     json* parent = find_view(s.doc, parent_view_id);
@@ -770,7 +964,7 @@ json drawing_add_detail(const std::string& doc_id, const std::string& parent_vie
 }
 
 json drawing_remove_view(const std::string& doc_id, const std::string& view_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     bool removed = false;
     if (s.doc.contains("sheets") && s.doc["sheets"].is_array())
@@ -791,7 +985,7 @@ json drawing_remove_view(const std::string& doc_id, const std::string& view_id) 
 
 json drawing_set_view(const std::string& doc_id, const std::string& view_id, const json& scale,
                       const json& position, const json& orientation, const json& show_hidden) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json* view = find_view(s.doc, view_id);
     if (!view)
@@ -896,7 +1090,7 @@ json drawing_add_dim(const std::string& doc_id, const std::string& view_id, cons
     static const std::set<std::string> kAnn = {"linear_dim", "aligned_dim", "note"};
     static const std::set<std::string> kExt = {"radial_dim", "diameter_dim", "angular_dim",
                                                "center_mark", "center_line"};
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     if (!kAnn.count(type) && !kExt.count(type))
         throw OpError("invalid_op", "annotation type '" + type + "' not recognized",
@@ -927,6 +1121,13 @@ json drawing_add_dim(const std::string& doc_id, const std::string& view_id, cons
 
     double ax = a[0].get<double>(), ay = a[1].get<double>();
     double bx = b[0].get<double>(), by = b[1].get<double>();
+    // A linear / aligned dimension between coincident endpoints would measure 0 — reject it
+    // up front rather than emit a meaningless "0" dimension (D9). (A `note` legitimately uses
+    // a == b as a single leader-anchor for free text, so it is exempt.)
+    if (type != "note" && std::hypot(bx - ax, by - ay) < 1e-6)
+        throw OpError("invalid_op",
+                      "dimension: endpoints are coincident (zero-length dimension)",
+                      {{"reason", "coincident endpoints"}});
     double sheet_dist;
     if (type == "linear_dim") sheet_dist = std::max(std::fabs(bx - ax), std::fabs(by - ay));
     else if (type == "aligned_dim") sheet_dist = std::hypot(bx - ax, by - ay);
@@ -959,7 +1160,7 @@ json drawing_add_dim(const std::string& doc_id, const std::string& view_id, cons
 
 json drawing_remove_annotation(const std::string& doc_id, const std::string& view_id,
                                const std::string& ann_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json* view = find_view(s.doc, view_id);
     if (!view)
@@ -980,12 +1181,12 @@ json drawing_remove_annotation(const std::string& doc_id, const std::string& vie
 }
 
 json drawing_get(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     return drawing_get_locked_unsafe(doc_id);
 }
 
 json drawing_bom(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     const std::string src_id = s.source_ref_id;
     // No live source (inline probe) -> no BOM. Else ask the source session for its real
@@ -1023,7 +1224,7 @@ json drawing_bom(const std::string& doc_id) {
 }
 
 std::map<std::string, std::string> drawings_for_source(const std::string& source_doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     std::map<std::string, std::string> out;
     for (const auto& [id, s] : g_drawings)
         if (s.source_ref_id == source_doc_id)
@@ -1032,7 +1233,7 @@ std::map<std::string, std::string> drawings_for_source(const std::string& source
 }
 
 json register_restored_drawing(const json& drawing_doc, const std::string& source_doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     if (!drawing_doc.is_object() ||
         drawing_doc.value("schema", std::string()) != kSchemaDrawing)
         throw OpError("invalid_op",
@@ -1066,7 +1267,7 @@ static bool is_numeric_dim(const std::string& type, const std::string& kind) {
 
 json drawing_set_annotation(const std::string& doc_id, const std::string& view_id,
                             const std::string& ann_id, const json& patch) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json* view = find_view(s.doc, view_id);
     if (!view)
@@ -1110,7 +1311,7 @@ json drawing_set_annotation(const std::string& doc_id, const std::string& view_i
 
 json drawing_add_callout(const std::string& doc_id, const std::string& view_id,
                          const std::string& kind, const json& a, const json& opts) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json* view = find_view(s.doc, view_id);
     if (!view)
@@ -1126,13 +1327,45 @@ json drawing_add_callout(const std::string& doc_id, const std::string& view_id,
                           {{"reason", "bad point"}});
         auto shapes = source_shapes(s);
         json geom = project_one(s, *view, shapes);
-        const json* arc = nearest_arc(geom, a, 1);  // closed circle only
+        // D-B2: a counterbore / chamfered / multi-step hole projects several concentric circles,
+        // including a possible spurious near-zero-radius ring at the axis (chamfer-cone silhouette
+        // / relief). Exclude rings under ~0.05 sheet mm so the real bore is picked, not the ~0 one
+        // that made the callout read "⌀0". Fall back to the unfiltered pick only if that leaves
+        // nothing (a genuinely tiny hole), so a legitimate small circle is never lost.
+        const json* arc = nearest_arc(geom, a, 1, 0.05);  // closed circle, skip degenerate rings
+        if (!arc) arc = nearest_arc(geom, a, 1);
         if (!arc)
             throw OpError("invalid_op", "hole callout: no projected circle near pick in this view",
                           {{"reason", "no circle"}});
         double cx = (*arc)["center"][0].get<double>(), cy = (*arc)["center"][1].get<double>();
         double r_sheet = arc->value("radius", 0.0);
         double r_model = r_sheet / scale;
+        // D-B2 fallback chain: if the measured bore is still degenerate (no real circle resolved,
+        // e.g. an odd projection of a complex hole), try these fallbacks in order rather than
+        // emitting "⌀0":
+        //   1. Explicit `diameter` opt (model mm) — works for holes where the caller passes it.
+        //   2. `standard` opt (e.g. "M4", "M6") — parse the metric nominal diameter; handles M-
+        //      standard mounting holes in thin ears where the bore rim is too thin to project.
+        //   3. Suppress the callout entirely (return without adding an annotation) — "no callout"
+        //      is ALWAYS better than a literal "⌀0" on a finished drawing.
+        if (r_model <= 1e-6) {
+            if (o.contains("diameter") && o["diameter"].is_number() &&
+                o["diameter"].get<double>() > 0.0) {
+                r_model = o["diameter"].get<double>() / 2.0;
+                r_sheet = r_model * scale;
+            } else if (o.contains("standard") && o["standard"].is_string()) {
+                double std_dia = parse_metric_standard_diameter(o["standard"].get<std::string>());
+                if (std_dia > 0.0) {
+                    r_model = std_dia / 2.0;
+                    r_sheet = r_model * scale;
+                }
+            }
+            // If the diameter is STILL not positive after all fallbacks, suppress this callout —
+            // never print "⌀0" on a drawing.
+            if (r_model <= 1e-6)
+                return json{{"suppressed", true},
+                            {"reason", "could not resolve a positive hole diameter"}};
+        }
         // Count same-diameter holes in this view -> "n× ⌀d" (SW hole-callout convention).
         // Dedupe by center so a through hole (whose top + bottom rims project to the SAME
         // circle) counts once, while a real pattern of N holes counts N.
@@ -1159,6 +1392,15 @@ json drawing_add_callout(const std::string& doc_id, const std::string& view_id,
             {"value", round6(2.0 * r_model)}, {"count", count > 1 ? count : 0}, {"pos", pos},
         };
         if (o.contains("suffix") && o["suffix"].is_string()) ann["suffix"] = o["suffix"];
+        if (o.contains("prefix") && o["prefix"].is_string()) ann["prefix"] = o["prefix"];
+        // Optional hole-feature attributes (from the source model) drive the STANDARD stacked
+        // callout (counterbore/countersink/tapped) in compose_disp — see its hole_type branch
+        // (D4). Absent -> a plain "N× ⌀d" callout as before.
+        if (o.contains("hole_type") && o["hole_type"].is_string())
+            ann["hole_type"] = o["hole_type"];
+        if (o.contains("thread") && o["thread"].is_string()) ann["thread"] = o["thread"];
+        for (const char* k : {"cbore_dia", "cbore_depth", "csk_angle", "depth"})
+            if (o.contains(k) && o[k].is_number()) ann[k] = o[k].get<double>();
         ann["text"] = compose_disp(ann, units);
         (*view)["annotations"].push_back(ann);
         s.revision += 1;
@@ -1242,7 +1484,7 @@ std::string compose_gdt_text(const json& ann) {
 }  // namespace
 
 json drawing_add_gdt(const std::string& doc_id, const std::string& view_id, const json& spec) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json* view = find_view(s.doc, view_id);
     if (!view)
@@ -1279,7 +1521,7 @@ json drawing_add_gdt(const std::string& doc_id, const std::string& view_id, cons
 }
 
 json drawing_add_datum(const std::string& doc_id, const std::string& view_id, const json& spec) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json* view = find_view(s.doc, view_id);
     if (!view)
@@ -1304,7 +1546,7 @@ json drawing_add_datum(const std::string& doc_id, const std::string& view_id, co
 
 json drawing_add_datum_target(const std::string& doc_id, const std::string& view_id,
                               const json& spec) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json* view = find_view(s.doc, view_id);
     if (!view)
@@ -1330,7 +1572,7 @@ json drawing_add_datum_target(const std::string& doc_id, const std::string& view
 
 json drawing_add_surface_finish(const std::string& doc_id, const std::string& view_id,
                                 const json& spec) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json* view = find_view(s.doc, view_id);
     if (!view)
@@ -1362,7 +1604,7 @@ json drawing_add_surface_finish(const std::string& doc_id, const std::string& vi
 }
 
 json drawing_add_weld(const std::string& doc_id, const std::string& view_id, const json& spec) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json* view = find_view(s.doc, view_id);
     if (!view)
@@ -1388,7 +1630,7 @@ json drawing_add_weld(const std::string& doc_id, const std::string& view_id, con
 }
 
 json drawing_model_items(const std::string& doc_id, const std::string& view_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json* view = find_view(s.doc, view_id);
     if (!view)
@@ -1429,31 +1671,62 @@ json drawing_model_items(const std::string& doc_id, const std::string& view_id) 
         }
     }
 
-    // One diameter callout per DISTINCT closed circle (dedupe coincident inner/outer edges).
-    std::vector<std::array<double, 3>> seen;
+    // ONE diameter callout per DISTINCT diameter — identical holes collapse to a single
+    // "N× ⌀d" callout instead of one "⌀d" per hole (D4). First dedupe coincident inner/outer
+    // rims (a through hole projects its two rims to the same circle), then group the distinct
+    // hole centers by radius: each radius-group yields one callout anchored at its first hole
+    // with count = number of holes of that diameter (compose_disp prefixes "N× " when >1).
+    std::vector<std::array<double, 3>> distinct;  // (cx,cy,r) of each distinct projected circle
     if (geom.contains("arcs") && geom["arcs"].is_array())
         for (const json& ar : geom["arcs"]) {
             if (!ar.value("closed", false)) continue;
             double cx = ar["center"][0].get<double>(), cy = ar["center"][1].get<double>();
             double r = ar.value("radius", 0.0);
+            // D-B2: skip degenerate / spurious near-zero-radius circles (a chamfer-cone silhouette
+            // or relief on a complex hole) so we don't emit a "⌀0" auto diameter callout for them.
+            if (r < 0.05) continue;
             bool dup = false;
-            for (auto& sd : seen)
+            for (auto& sd : distinct)
                 if (std::hypot(sd[0] - cx, sd[1] - cy) < 1e-4 && std::fabs(sd[2] - r) < 1e-4) {
                     dup = true;
                     break;
                 }
-            if (dup) continue;
-            seen.push_back({cx, cy, r});
-            json ann = {{"id", next_ann_id(*view)}, {"type", "note"}, {"kind", "diameter_dim"},
-                        {"auto", true}, {"a", json::array({cx, cy})}, {"b", json::array({cx, cy})},
-                        {"center", json::array({cx, cy})}, {"radius", round6(r)},
-                        {"model_radius", round6(r / scale)}, {"closed", true},
-                        {"value", round6(2.0 * r / scale)},
-                        {"pos", json::array({cx + r + 10.0, cy + r + 10.0})}};
-            ann["text"] = compose_disp(ann, units);
-            anns.push_back(ann);
-            ++added;
+            if (!dup) distinct.push_back({cx, cy, r});
         }
+    // Group by radius (preserve first-seen order for stable placement).
+    struct DiaGroup { double cx, cy, r; int count; };
+    std::vector<DiaGroup> groups;
+    for (const auto& c : distinct) {
+        bool merged = false;
+        for (auto& g : groups)
+            if (std::fabs(g.r - c[2]) < 1e-4) { ++g.count; merged = true; break; }
+        if (!merged) groups.push_back({c[0], c[1], c[2], 1});
+    }
+    // D-B4: concentric bores (e.g. ⌀40/⌀30/⌀16 on an impeller hub) share a centre, so the default
+    // leader pos (centre + r along the 45° diagonal) lands every callout on the same diagonal — they
+    // pile up and become unreadable. Fan stacked callouts out: for each group, count how many EARLIER
+    // groups share its centre and step that label down by a fixed pitch so the concentric set reads
+    // as a vertical stack of distinct leaders instead of one overlapping blob.
+    std::vector<std::array<double, 2>> placed_centers;  // centres already given a leader
+    const double kStackPitch = 12.0;                    // sheet-mm vertical step between stacked labels
+    for (const DiaGroup& g : groups) {
+        int same_center = 0;
+        for (const auto& pc : placed_centers)
+            if (std::hypot(pc[0] - g.cx, pc[1] - g.cy) < 1e-3) ++same_center;
+        placed_centers.push_back({g.cx, g.cy});
+        double px = g.cx + g.r + 10.0;
+        double py = g.cy + g.r + 10.0 - same_center * kStackPitch;  // step concentric labels down
+        json ann = {{"id", next_ann_id(*view)}, {"type", "note"}, {"kind", "diameter_dim"},
+                    {"auto", true}, {"a", json::array({g.cx, g.cy})},
+                    {"b", json::array({g.cx, g.cy})}, {"center", json::array({g.cx, g.cy})},
+                    {"radius", round6(g.r)}, {"model_radius", round6(g.r / scale)},
+                    {"closed", true}, {"value", round6(2.0 * g.r / scale)},
+                    {"count", g.count > 1 ? g.count : 0},
+                    {"pos", json::array({px, py})}};
+        ann["text"] = compose_disp(ann, units);
+        anns.push_back(ann);
+        ++added;
+    }
 
     s.revision += 1;
     json out = drawing_get_locked_unsafe(doc_id);
@@ -1464,7 +1737,7 @@ json drawing_model_items(const std::string& doc_id, const std::string& view_id) 
 
 json drawing_set_titleblock(const std::string& doc_id, const std::string& sheet_id,
                             const json& fields) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json& sheet = find_sheet(s.doc, sheet_id);
     json tb = sheet.contains("title_block") && sheet["title_block"].is_object()
@@ -1481,7 +1754,7 @@ json drawing_set_titleblock(const std::string& doc_id, const std::string& sheet_
 
 json drawing_set_sheet(const std::string& doc_id, const std::string& sheet_id,
                        const std::string& size) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json& sheet = find_sheet(s.doc, sheet_id);
     if (sheet_dims(size)[0] <= 0.0)
@@ -1515,13 +1788,18 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
             if (v.is_string()) views.push_back(v.get<std::string>());
     if (views.empty()) views = {"front", "top", "right", "iso"};
 
-    struct Slot { const char* name; const char* type; double x, y; };
+    // Relative grid cell (col,row) for each standard view — a SolidWorks 3rd-angle arrangement:
+    // front centre, top above it, right beside it, iso upper-right. Cells are sized by the
+    // (scaled) part footprint after auto-scale, so the absolute mm positions are computed below.
+    struct Slot { const char* name; const char* type; int col, row; };
     static const Slot kSlots[] = {
-        {"front", "base", 130, 175},  {"top", "projected", 130, 90},
-        {"right", "projected", 300, 175}, {"bottom", "projected", 130, 250},
-        {"left", "projected", 300, 90}, {"back", "projected", 300, 250},
-        {"iso", "iso", 320, 90},
+        {"front", "base", 1, 1},      {"top", "projected", 1, 0},
+        {"right", "projected", 2, 1}, {"bottom", "projected", 1, 2},
+        {"left", "projected", 0, 1},  {"back", "projected", 2, 0},
+        {"iso", "iso", 2, 0},
     };
+    struct Placed { std::string vid; int col, row; };
+    std::vector<Placed> placed;
     std::vector<std::string> ortho_view_ids;  // for model items / hole callouts (not the iso)
     bool used_base = false;
     for (const std::string& vn : views) {
@@ -1533,11 +1811,104 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
         // The first orthographic view is the drawing's base; the rest project off it.
         if (type == "base") { if (used_base) type = "projected"; else used_base = true; }
         try {
+            // Create at scale 1.0 first so we can read the part's true projected footprint, then
+            // auto-scale + reposition all views below. Temporary position; overwritten by layout.
             json added = drawing_add_view(doc_id, type, vn, "s1", 1.0,
-                                          json::array({slot->x, slot->y}), json(nullptr));
+                                          json::array({0.0, 0.0}), json(nullptr));
             std::string vid = added.value("view_id", std::string());
-            if (!vid.empty() && vn != "iso") ortho_view_ids.push_back(vid);
+            if (vid.empty()) continue;
+            placed.push_back({vid, slot->col, slot->row});
+            if (vn != "iso") ortho_view_ids.push_back(vid);
         } catch (const OpError&) { /* skip a view that fails to project */ }
+    }
+
+    // ---------------------------------------------------------------- D5: auto-scale + layout
+    // Without this every view sat at a fixed 1:1, so a 1 mm part rendered as a few pixels and a
+    // 5000 mm part overflowed the sheet. Now: measure the part's worst-case projected footprint
+    // (from the scale-1.0 view bboxes we just produced), choose ONE standard drawing scale so the
+    // scaled part fills ~65% of its grid cell, then place every view on a grid sized to the scaled
+    // footprint (non-overlapping). The title-block SCALE text is set to match.
+    double chosen_scale = 1.0;
+    {
+        json probe = drawing_get(doc_id);
+        // Worst-case single-view model footprint (max width/height over the placed views). At
+        // scale 1.0 the view bbox extent IS the part's projected model extent in mm.
+        double fw = 0.0, fh = 0.0;
+        // Per-view scale-1.0 projected bbox CENTRE (model mm). project_view lands geometry at
+        // model_pt*scale + position, so a view's bbox centre on the sheet is
+        // centre_model*chosen_scale + position. To put that centre at the cell centre (R1/R2)
+        // we set position = cell_centre - centre_model*chosen_scale below. Without this a view
+        // is offset by its own bbox centre: a short/asymmetric view (e.g. a 15 mm-tall plate
+        // front view, or any body not modelled about the origin) sits at a cell EDGE instead of
+        // the middle, reading as a thin strip crammed against one side with dead space opposite.
+        std::map<std::string, std::array<double, 2>> view_center;  // vid -> (cx,cy) model mm
+        if (probe.contains("sheets") && probe["sheets"].is_array())
+            for (const auto& sh : probe["sheets"])
+                for (const auto& v : sh.value("views", json::array())) {
+                    const json& bb = v.value("bbox", json(nullptr));
+                    if (bb.is_array() && bb.size() == 4 && bb[0].is_number()) {
+                        fw = std::max(fw, bb[2].get<double>() - bb[0].get<double>());
+                        fh = std::max(fh, bb[3].get<double>() - bb[1].get<double>());
+                        std::string vid = v.value("view_id", v.value("id", std::string()));
+                        if (!vid.empty())
+                            view_center[vid] = {(bb[0].get<double>() + bb[2].get<double>()) / 2.0,
+                                                (bb[1].get<double>() + bb[3].get<double>()) / 2.0};
+                    }
+                }
+        // Sheet drawable area (the real sheet mm; default A3 if size_mm is missing).
+        std::array<double, 2> sz = sheet_dims("A3");
+        if (probe.contains("sheets") && probe["sheets"].is_array() && !probe["sheets"].empty()) {
+            const json& mm = probe["sheets"][0].value("size_mm", json(nullptr));
+            if (mm.is_array() && mm.size() == 2 && mm[0].is_number() && mm[0].get<double>() > 0.0)
+                sz = {mm[0].get<double>(), mm[1].get<double>()};
+        }
+        const double margin = 20.0;          // paper border
+        const double draw_w = std::max(40.0, sz[0] - 2 * margin);
+        const double draw_h = std::max(40.0, sz[1] - 2 * margin);
+        // Grid extent over the placed cells (so a single-view drawing uses the whole sheet, while
+        // the 2x2 standard set splits it). +1 because cells are 0-based indices.
+        int max_col = 0, max_row = 0;
+        bool any_placed = !placed.empty();
+        for (const auto& p : placed) { max_col = std::max(max_col, p.col); max_row = std::max(max_row, p.row); }
+        const double cols = any_placed ? (double)(max_col + 1) : 1.0;
+        const double rows = any_placed ? (double)(max_row + 1) : 1.0;
+        const double gap = 12.0;             // gutter between view cells
+        const double cell_w = std::max(20.0, (draw_w - (cols - 1) * gap) / cols);
+        const double cell_h = std::max(20.0, (draw_h - (rows - 1) * gap) / rows);
+        const double target_fill = 0.65;     // the part should fill ~65% of its cell
+        if (fw > 1e-9 || fh > 1e-9) {
+            double sx = (fw > 1e-9) ? target_fill * cell_w / fw : 1e30;
+            double sy = (fh > 1e-9) ? target_fill * cell_h / fh : 1e30;
+            double ideal = std::min(sx, sy);
+            if (ideal > 1e-12 && std::isfinite(ideal)) chosen_scale = snap_scale_down(ideal);
+        }
+        // Re-place every view: assign its grid cell a mm centre and apply the chosen scale. The
+        // cell pitch is (cell + gap); the grid is centred on the drawable area. Y grows UP on the
+        // sheet, but rows count DOWN (row 0 = top), so flip the row when mapping to mm.
+        const double pitch_x = cell_w + gap, pitch_y = cell_h + gap;
+        const double grid_w = cols * cell_w + (cols - 1) * gap;
+        const double grid_h = rows * cell_h + (rows - 1) * gap;
+        const double x0 = margin + (draw_w - grid_w) / 2.0 + cell_w / 2.0;
+        const double y_top = margin + (draw_h - grid_h) / 2.0 + grid_h - cell_h / 2.0;
+        for (const auto& p : placed) {
+            // Cell CENTRE on the sheet (mm).
+            double cx_cell = x0 + p.col * pitch_x;
+            double cy_cell = y_top - p.row * pitch_y;  // row 0 sits at the top
+            // Centre the view's projected bbox in its cell: position offsets the geometry, and
+            // geometry = model*chosen_scale + position, so to land the bbox centre on the cell
+            // centre, position = cell_centre - centre_model*chosen_scale (R1/R2). Falls back to
+            // the bare cell centre when we have no probe bbox for this view (degenerate/empty).
+            double px = cx_cell, py = cy_cell;
+            auto it = view_center.find(p.vid);
+            if (it != view_center.end()) {
+                px = cx_cell - it->second[0] * chosen_scale;
+                py = cy_cell - it->second[1] * chosen_scale;
+            }
+            try {
+                drawing_set_view(doc_id, p.vid, json(chosen_scale), json::array({px, py}),
+                                 json(nullptr), json(nullptr));
+            } catch (const OpError&) { /* keep the view at scale 1.0 if reposition fails */ }
+        }
     }
 
     bool model_items = s.value("model_items", true);
@@ -1547,22 +1918,53 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
             try { drawing_model_items(doc_id, vid); } catch (const OpError&) {}
 
     if (hole_callouts) {
-        // Re-fetch geometry, then drop a ⌀ callout on each DISTINCT projected circle per view.
+        // Re-fetch geometry, then drop ONE ⌀ callout per DISTINCT hole DIAMETER per view.
+        // Identical holes (same diameter) must collapse to a single "N× ⌀d" callout with one
+        // leader — NOT one callout each (D4). drawing_add_callout already counts every
+        // same-diameter circle in the view and emits "N× ⌀d", so we anchor it on the FIRST
+        // hole of each radius and dedupe by radius (not by center). Dedupe by center too so a
+        // through hole (whose two rims project to coincident circles) seeds the radius once.
+        //
+        // D-B1 (no DOUBLE callout): when `model_items` ALSO ran above, it already emitted a
+        // diameter_dim "N× ⌀d" per distinct hole diameter on every ortho view — anchored at the
+        // SAME hole centre this pass would re-annotate. Adding a hole_callout for the same
+        // diameter stacked a second identical "N× ⌀d" leader on top of the model-items one (the
+        // duplicated pair). So when model_items owns the plain-hole diameter callouts, seed each
+        // view's `radii_done` with the radii those auto diameter_dim annotations already cover,
+        // making this pass a no-op for already-annotated diameters. With model_items OFF, the
+        // seed is empty and this pass remains the sole hole-callout emitter (unchanged).
         json full = drawing_get(doc_id);
         if (full.contains("sheets") && full["sheets"].is_array())
             for (const auto& sh : full["sheets"])
                 for (const auto& v : sh.value("views", json::array())) {
                     std::string vid = v.value("view_id", v.value("id", std::string()));
                     if (vid.empty() || v.value("type", std::string()) == "iso") continue;
-                    std::vector<std::array<double, 2>> seen;
+                    std::vector<double> radii_done;  // one callout per distinct radius
+                    std::vector<std::array<double, 2>> seen_centers;
+                    // D-B1: pre-seed with radii model_items already called out on this view so we
+                    // don't emit a second, identical hole_callout over the existing diameter_dim.
+                    if (model_items)
+                        for (const auto& an : v.value("annotations", json::array())) {
+                            if (!an.value("auto", false)) continue;
+                            std::string k = an.value("kind", an.value("type", std::string()));
+                            if (k != "diameter_dim") continue;
+                            double rr = an.value("radius", 0.0);
+                            if (rr > 0.0) radii_done.push_back(rr);
+                        }
                     for (const auto& ar : v.value("arcs", json::array())) {
                         if (!ar.value("closed", false)) continue;
                         double cx = ar["center"][0].get<double>(), cy = ar["center"][1].get<double>();
-                        bool dup = false;
-                        for (auto& c : seen)
-                            if (std::hypot(c[0] - cx, c[1] - cy) < 1e-3) { dup = true; break; }
-                        if (dup) continue;
-                        seen.push_back({cx, cy});
+                        double r = ar.value("radius", 0.0);
+                        bool dup_center = false;
+                        for (auto& c : seen_centers)
+                            if (std::hypot(c[0] - cx, c[1] - cy) < 1e-3) { dup_center = true; break; }
+                        if (dup_center) continue;
+                        seen_centers.push_back({cx, cy});
+                        bool dup_radius = false;
+                        for (double rd : radii_done)
+                            if (std::fabs(rd - r) < 1e-3) { dup_radius = true; break; }
+                        if (dup_radius) continue;  // a callout for this diameter already exists
+                        radii_done.push_back(r);
                         try {
                             drawing_add_callout(doc_id, vid, "hole",
                                                 json::array({cx, cy}), json::object());
@@ -1622,15 +2024,36 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
         }
     }
 
-    if (s.contains("title") && s["title"].is_object())
-        try { drawing_set_titleblock(doc_id, "s1", s["title"]); } catch (const OpError&) {}
+    // Title block: merge the caller's fields with the auto-chosen drawing SCALE (D5). The scale
+    // is no longer cosmetic — it reflects the actual view scale the auto-layout picked. An
+    // explicit `scale` in the caller's title spec still wins (the user named the scale).
+    json title = (s.contains("title") && s["title"].is_object()) ? s["title"] : json::object();
+    if (!(title.contains("scale") && title["scale"].is_string() &&
+          !title["scale"].get<std::string>().empty()))
+        title["scale"] = scale_text(chosen_scale);
+    try { drawing_set_titleblock(doc_id, "s1", title); } catch (const OpError&) {}
 
     return json{{"doc_id", doc_id}, {"drawing", drawing_get(doc_id)}};
 }
 
 bool drawing_close(const std::string& doc_id) {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingLock lk;
     return g_drawings.erase(doc_id) > 0;
+}
+
+// ----------------------------------------------------------------- crash recovery
+// Drop an orphaned g_mtx lock left held by THIS thread after a Windows structured
+// exception (access violation) unwound past a DrawingLock without running its C++
+// destructor under /EHsc. Mirrors force_release_doc_lock in core/doc/session.cpp —
+// same pattern, same safety contract, same idempotency guarantee.
+// Called from the libaicad C dispatch boundary's __except filter alongside
+// force_release_doc_lock so ANY hardware fault releases ALL orphaned registry locks.
+bool force_release_drawing_lock() {
+    if (!g_mtx_held.load(std::memory_order_acquire)) return false;
+    if (g_mtx_owner != std::this_thread::get_id()) return false;
+    g_mtx_held.store(false, std::memory_order_release);
+    g_mtx.unlock();
+    return true;
 }
 
 }  // namespace aicad::doc

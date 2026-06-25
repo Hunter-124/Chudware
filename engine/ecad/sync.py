@@ -44,6 +44,33 @@ from engine.ecad import schema
 _GRID_PITCH = 12.7
 _GRID_COLS = 8
 
+# Default footprint by libid, so a schematic component that carries a real part but NO explicit
+# footprint still lands a physical footprint on update-from-sch (Bug E6: a manually-placed R/C/LED
+# has no footprint by default, so the board got 0 footprints). Mirrors the orchestrator's
+# _DEFAULT_FOOTPRINTS. Sources / power symbols are intentionally absent (never on a board). Every
+# fpid here resolves in the clean-room starter library.
+_DEFAULT_FOOTPRINTS = {
+    "Device:R": "Resistor_SMD:R_0603",
+    "Device:C": "Capacitor_SMD:C_0603",
+    "Device:D": "Diode_SMD:D_SMA",
+    "Device:LED": "LED_SMD:LED_0805",
+    "Device:Q_NPN": "Package_TO_SOT_SMD:SOT-23",
+    "Device:Q_PNP": "Package_TO_SOT_SMD:SOT-23",
+    "Amplifier_Operational:OPAMP_dual": "Package_SO:SOIC-8",
+    "Timer:NE555": "Package_DIP:DIP-8",
+}
+
+
+def _effective_fpid(comp: dict) -> str:
+    """The footprint fpid to use for *comp*: its explicit ``footprint``, else a per-libid default.
+
+    Returning a non-empty default for a known passive/active part is what makes a manually-built
+    schematic board-ready without the model having to assign a footprint to every part (Bug E6)."""
+    fpid = comp.get("footprint")
+    if isinstance(fpid, str) and fpid.strip():
+        return fpid.strip()
+    return _DEFAULT_FOOTPRINTS.get(str(comp.get("libid", "")), "")
+
 
 def _is_power_component(comp: dict) -> bool:
     """True for power-symbol netlist components (``#PWR`` refs / ``power:`` libids).
@@ -67,15 +94,14 @@ def _on_board(comp: dict) -> bool:
 
 def _placeable(comp: dict) -> bool:
     """A component gets a physical footprint iff: on-board, not dnp, not a power symbol, and it
-    carries a non-empty ``footprint`` fpid."""
+    resolves to a non-empty fpid (its explicit ``footprint`` OR a per-libid default — Bug E6)."""
     if comp.get("dnp"):
         return False
     if not _on_board(comp):
         return False
     if _is_power_component(comp):
         return False
-    fpid = comp.get("footprint")
-    return isinstance(fpid, str) and bool(fpid.strip())
+    return bool(_effective_fpid(comp))
 
 
 def _resolve_footprint(library: Any, fpid: str) -> dict | None:
@@ -153,13 +179,14 @@ def _bind_pads(pads: list[dict], comp_pins: dict, board: dict) -> tuple[int, int
     return changed, bound
 
 
-def _new_footprint(board: dict, comp: dict, fpdef: dict, place_xy: list[float]) -> dict:
+def _new_footprint(board: dict, comp: dict, fpdef: dict, place_xy: list[float],
+                   fpid: str = "") -> dict:
     """Build a board Footprint instance from a netlist component + resolved footprint def."""
     fid = schema.next_id(board, "fp")
     pads = copy.deepcopy(fpdef.get("pads", []) or [])
     return {
         "id": fid,
-        "fpid": comp.get("footprint", ""),
+        "fpid": fpid or comp.get("footprint", ""),
         "ref": comp.get("ref", ""),
         "value": comp.get("value", "") or fpdef.get("value", ""),
         "pos": [float(place_xy[0]), float(place_xy[1])],
@@ -225,7 +252,7 @@ def update_board_from_sch(board: dict, netlist: dict, *, library: Any = None,
             continue
         ref = str(comp.get("ref", ""))
         sym_id = comp.get("sym")
-        fpid = comp.get("footprint", "")
+        fpid = _effective_fpid(comp)   # explicit footprint, else a per-libid default (Bug E6)
         comp_pins = comp.get("pins", {}) or {}
 
         fp = _fp_for_ref(work, ref, sym_id)
@@ -238,7 +265,7 @@ def update_board_from_sch(board: dict, netlist: dict, *, library: Any = None,
             place_xy = [ox + (grid_i % _GRID_COLS) * _GRID_PITCH,
                         oy + (grid_i // _GRID_COLS) * _GRID_PITCH]
             grid_i += 1
-            fp = _new_footprint(work, comp, fpdef, place_xy)
+            fp = _new_footprint(work, comp, fpdef, place_xy, fpid=fpid)
             work.setdefault("footprints", []).append(fp)
             changed, bound = _bind_pads(fp["pads"], comp_pins, work)
             report["nets_bound"] += bound

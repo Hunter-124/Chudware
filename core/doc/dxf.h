@@ -24,11 +24,23 @@ namespace aicad::doc {
 // insertion order (the oracle emits in dict order).
 using Polyline = std::vector<std::array<double, 2>>;
 
+// A single-line TEXT label placed at an insertion point (mm), at `height` mm. Used for
+// drawing annotations (dimension values, hole callouts, title block) on export (Bug N-7).
+struct DxfText {
+    std::string layer;
+    std::array<double, 2> pos;
+    double height = 3.0;
+    std::string text;
+};
+
 // Ordered layer set: names in order + the polylines per name. Mirrors the Python
-// dict {layer_name: [polyline, ...]} (insertion-ordered).
+// dict {layer_name: [polyline, ...]} (insertion-ordered). `texts` is an extra, ordered
+// list of TEXT entities (empty in the geometry-only path, so plain drawings are byte-
+// unchanged).
 struct DxfLayers {
     std::vector<std::string> names;                  // layer order
     std::map<std::string, std::vector<Polyline>> polylines;  // name -> polylines
+    std::vector<DxfText> texts;                      // annotation TEXT entities (ordered)
 
     void add_layer(const std::string& name) {
         if (polylines.find(name) == polylines.end()) {
@@ -39,6 +51,11 @@ struct DxfLayers {
     void add_polyline(const std::string& name, const Polyline& pl) {
         add_layer(name);
         polylines[name].push_back(pl);
+    }
+    void add_text(const std::string& name, const std::array<double, 2>& pos, double height,
+                  const std::string& text) {
+        add_layer(name);
+        texts.push_back({name, pos, height, text});
     }
 };
 

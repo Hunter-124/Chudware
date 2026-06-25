@@ -152,6 +152,13 @@ add_test(NAME sim COMMAND test_sim)
 # Second-order (tet10) quadratic-tet FEA gate: node-ordering sanity + axial accuracy
 # + cantilever bending (tet10 relieves tet4 shear-locking). OCCT-/gmsh-free (inline
 # structured box meshes), so it links only aicad_sim like test_sim.
+add_executable(test_modal tests/test_modal.cpp)
+target_include_directories(test_modal PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_modal PRIVATE aicad_sim)
+set_target_properties(test_modal PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME modal COMMAND test_modal)
+
 add_executable(test_tet10 tests/test_tet10.cpp)
 target_include_directories(test_tet10 PRIVATE ${doctest_SOURCE_DIR})
 target_link_libraries(test_tet10 PRIVATE aicad_sim)
@@ -529,6 +536,36 @@ if(AICAD_WITH_OCCT)
   add_test(NAME sweep COMMAND test_sweep)
   set_tests_properties(sweep PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- Sketch arc + path-wire: profile.cpp edge/wire builder (round-3 N-2 / N-3) -----
+  # arc `ccw` honored + degrees, and a mixed line+arc path stitches across a float gap.
+  add_executable(test_profile_arc
+    tests/test_profile_arc.cpp)
+  target_include_directories(test_profile_arc PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_profile_arc PRIVATE
+    aicad_geom_occt aicad_geom)
+  set_target_properties(test_profile_arc PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME profile_arc COMMAND test_profile_arc)
+  set_tests_properties(profile_arc PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- Import / save round-trip: N-8 bake, N-5 multi-body, N-4 + manual-open routing --
+  add_executable(test_import_roundtrip
+    tests/test_import_roundtrip.cpp)
+  target_include_directories(test_import_roundtrip PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+  target_link_libraries(test_import_roundtrip PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  target_sources(test_import_roundtrip PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+  set_target_properties(test_import_roundtrip PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME import_roundtrip COMMAND test_import_roundtrip)
+  set_tests_properties(import_roundtrip PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- Wave 2 milestone: the document model — a rebuildable feature tree ------
   # core/doc/document.cpp orchestrates solve_sketch -> faces_from_solved_sketch ->
   # extrude/revolve -> fuse/cut/common -> fillet/chamfer into a part, keyed by
@@ -547,6 +584,7 @@ if(AICAD_WITH_OCCT)
     doc/formats.cpp
     doc/dxf.cpp
     doc/pdfvec.cpp
+    doc/annot_draw.cpp
     doc/export2d.cpp
     doc/drawing_session.cpp)
   target_include_directories(aicad_doc PUBLIC
@@ -608,6 +646,23 @@ if(AICAD_WITH_OCCT)
   add_test(NAME studies COMMAND test_studies)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(studies PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- GD&T + custom-section drawing coverage (annot_draw + section modes) ------
+  # Builds a real holed block, makes a drawing, adds every GD&T element + a half
+  # section, and asserts the shared annotation compiler emits primitives, the section
+  # produces faces + hatch, and the DXF export pools the GD&T strokes. aicad_doc carries
+  # the OCCT toolkits via aicad_geom_occt.
+  add_executable(test_drawing_gdt
+    tests/test_drawing_gdt.cpp)
+  target_include_directories(test_drawing_gdt PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_drawing_gdt PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  set_target_properties(test_drawing_gdt PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME drawing_gdt COMMAND test_drawing_gdt)
+  set_tests_properties(drawing_gdt PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- A3: pattern feature compilers — linear_pattern / circular_pattern ------
   # core/doc/document.cpp's pattern branches REPLICATE a referenced seed solid with

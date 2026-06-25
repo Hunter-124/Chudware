@@ -165,6 +165,53 @@ def test_export_step_plus_alias_is_native():
     os.unlink(r["path"])
 
 
+def test_drawing_overhaul_gdt_section_export():
+    """The drawing overhaul end-to-end via the MCP tools: make a drawing with an auto half
+    section, add a GD&T frame + datum + surface finish, render it, and export DXF (the GD&T
+    strokes must be pooled into the export, not just the projected geometry)."""
+    import os
+    doc = _new_plate_with_hole()
+    mk, _ = _call("make_drawing", {
+        "doc_id": doc,
+        "views": ["front", "top", "right", "iso"],
+        "sections": [{"parent": "front", "axis": "vertical", "mode": "half"}],
+        "title": {"title": "PLATE", "material": "AL 6061"},
+    })
+    assert mk["ok"], mk
+    dwg = mk["drawing_doc_id"]
+    assert dwg
+
+    # The drawing has a section view with hatch (engine-computed).
+    full = cb.call("drawing_get", {"doc_id": dwg})
+    views = full["sheets"][0]["views"]
+    base = next(v for v in views if v.get("type") == "base")
+    sec = next((v for v in views if v.get("type") == "section"), None)
+    assert sec is not None, "auto section not created"
+    assert len(sec.get("section_faces", [])) > 0
+    assert len(sec.get("hatch", [])) > 0
+    bb = base["bbox"]
+    cx, cy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+
+    g, _ = _call("add_gdt", {
+        "doc_id": dwg, "view_id": base["view_id"], "symbol": "position",
+        "tolerance": "0.1", "diameter": True, "modifier": "mmc",
+        "datums": ["A", "B"], "a": [cx, cy], "pos": [bb[2] + 15, bb[3]],
+    })
+    assert g["ok"], g
+    d2, _ = _call("add_datum", {"doc_id": dwg, "view_id": base["view_id"], "label": "A",
+                                "a": [bb[0], bb[1]], "pos": [bb[0], bb[1] - 12]})
+    assert d2["ok"], d2
+    sf, _ = _call("add_surface_finish", {"doc_id": dwg, "view_id": base["view_id"], "ra": "1.6",
+                                         "a": [bb[2], cy], "pos": [bb[2] + 10, cy + 8]})
+    assert sf["ok"], sf
+
+    ex, _ = _call("export_drawing", {"fmt": "dxf", "doc_id": dwg})
+    assert ex["ok"], ex
+    assert ex["entities"] > 0
+    assert os.path.exists(ex["path"])
+    os.unlink(ex["path"])
+
+
 def test_transform_moves_a_body():
     """transform translates a non-primitive-addressable body (COM shifts by the vector)."""
     r, _ = _call("new_part", {"name": "mv"})

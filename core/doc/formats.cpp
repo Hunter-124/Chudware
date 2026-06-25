@@ -1401,4 +1401,82 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
                   {{"format", fmt}, {"reason", "unsupported format"}});
 }
 
+// --------------------------------------------------------------------- BREP <-> base64
+
+namespace {
+
+const char* kB64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+std::string b64_encode(const std::string& in) {
+    std::string out;
+    out.reserve(((in.size() + 2) / 3) * 4);
+    std::size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+        unsigned n = (static_cast<unsigned char>(in[i]) << 16) |
+                     (static_cast<unsigned char>(in[i + 1]) << 8) |
+                     static_cast<unsigned char>(in[i + 2]);
+        out += kB64[(n >> 18) & 63];
+        out += kB64[(n >> 12) & 63];
+        out += kB64[(n >> 6) & 63];
+        out += kB64[n & 63];
+    }
+    if (i < in.size()) {
+        unsigned n = static_cast<unsigned char>(in[i]) << 16;
+        if (i + 1 < in.size()) n |= static_cast<unsigned char>(in[i + 1]) << 8;
+        out += kB64[(n >> 18) & 63];
+        out += kB64[(n >> 12) & 63];
+        out += (i + 1 < in.size()) ? kB64[(n >> 6) & 63] : '=';
+        out += '=';
+    }
+    return out;
+}
+
+std::string b64_decode(const std::string& in) {
+    static int rev[256];
+    static bool init = false;
+    if (!init) {
+        for (int k = 0; k < 256; ++k) rev[k] = -1;
+        for (int k = 0; k < 64; ++k) rev[static_cast<unsigned char>(kB64[k])] = k;
+        init = true;
+    }
+    std::string out;
+    out.reserve(in.size() / 4 * 3);
+    int val = 0, bits = -8;
+    for (unsigned char c : in) {
+        if (c == '=' || rev[c] < 0) {
+            if (c == '=') break;
+            continue;  // skip whitespace/newlines
+        }
+        val = (val << 6) | rev[c];
+        bits += 6;
+        if (bits >= 0) {
+            out += static_cast<char>((val >> bits) & 0xFF);
+            bits -= 8;
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+std::string shape_to_brep_b64(const TopoDS_Shape& shape) {
+    if (shape.IsNull()) return std::string();
+    std::ostringstream oss;
+    BRepTools::Write(shape, oss);
+    return b64_encode(oss.str());
+}
+
+TopoDS_Shape brep_b64_to_shape(const std::string& b64) {
+    if (b64.empty()) return TopoDS_Shape();
+    std::istringstream iss(b64_decode(b64));
+    TopoDS_Shape shape;
+    BRep_Builder builder;
+    try {
+        BRepTools::Read(shape, iss, builder);
+    } catch (...) {
+        return TopoDS_Shape();
+    }
+    return shape;
+}
+
 }  // namespace aicad::doc

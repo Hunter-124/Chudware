@@ -43,8 +43,10 @@
 #include <TopExp_Explorer.hxx>
 #include <TopAbs.hxx>
 #include <TopoDS.hxx>
+#include <TopoDS_Compound.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
+#include <BRep_Builder.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Dir.hxx>
@@ -3782,6 +3784,42 @@ void fill_disc(std::vector<unsigned char>& img, int W, int H, int cx, int cy, in
             if (x * x + y * y <= rad * rad) put_px(img, W, H, cx + x, cy + y, r, g, b);
 }
 
+// Map an annotation/dimension string onto the 5x7 font's ASCII subset (A-Z 0-9 + - . : space):
+// the engine composes callouts with Unicode glyphs (⌀ × ° ± Ø) that the bitmap font can't
+// draw, so translate them to ASCII shorthand (⌀->DIA, ×->X, °->DEG, ±->+-) and drop any
+// other non-ASCII byte. Used by the drawing renderer's annotation overlay (Bug N-7).
+std::string sanitize_label(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (std::size_t i = 0; i < in.size();) {
+        unsigned char c = static_cast<unsigned char>(in[i]);
+        if (c < 0x80) { out.push_back(in[i]); ++i; continue; }
+        // Multibyte UTF-8: recognise the symbols we care about, else skip the sequence.
+        if (c == 0xC3 && i + 1 < in.size()) {
+            unsigned char d = static_cast<unsigned char>(in[i + 1]);
+            if (d == 0x97) out += "X";              // × multiplication sign
+            else if (d == 0x98 || d == 0xB8) out += "DIA ";  // Ø/ø
+            i += 2; continue;
+        }
+        if (c == 0xC2 && i + 1 < in.size()) {
+            unsigned char d = static_cast<unsigned char>(in[i + 1]);
+            if (d == 0xB0) out += " DEG";           // ° degree
+            else if (d == 0xB1) out += "+-";        // ± plus-minus
+            i += 2; continue;
+        }
+        if (c == 0xE2 && i + 2 < in.size() &&
+            static_cast<unsigned char>(in[i + 1]) == 0x8C &&
+            static_cast<unsigned char>(in[i + 2]) == 0x80) {
+            out += "DIA ";                          // ⌀ diameter sign (U+2300)
+            i += 3; continue;
+        }
+        // Unknown multibyte lead: skip this byte and any continuation bytes.
+        ++i;
+        while (i < in.size() && (static_cast<unsigned char>(in[i]) & 0xC0) == 0x80) ++i;
+    }
+    return out;
+}
+
 // A face callout the renderer overlays: a world anchor (face centroid) + outward normal (for
 // back-face culling) + the label text + its colour.
 struct RenderLabel {
@@ -4073,13 +4111,73 @@ json drawing_render_png(const std::string& doc_id, const std::string& out_path) 
                 if (pl.size() >= 2) out.push_back(std::move(pl));
             }
         };
+        // Annotation overlay: render the SHARED draw primitives (annot_draw) emitted per
+        // annotation by drawing_get — so GD&T frames, surface-finish/weld symbols, section
+        // hatch, dims + callouts all rasterize for the AI vision review, identical to the
+        // on-screen sheet and the DXF/PDF export.
+        std::vector<std::vector<std::array<double, 2>>> annSolid, annDash;  // sheet-mm strokes
+        struct Txt { std::array<double, 2> pos{}; std::string text; double h = 3.5; };
+        std::vector<Txt> texts;
+        std::vector<std::string> title_lines;
+        auto poolDraw = [&](const json& d) {
+            if (!d.is_object()) return;
+            pool(d.value("segments", json::array()), annSolid);
+            pool(d.value("dashed", json::array()), annDash);
+            if (d.contains("tris") && d["tris"].is_array())
+                for (const auto& t : d["tris"]) {
+                    if (!t.is_array() || t.size() != 3) continue;
+                    std::vector<std::array<double, 2>> tri;
+                    for (const auto& p : t) tri.push_back({p[0].get<double>(), p[1].get<double>()});
+                    tri.push_back(tri.front());
+                    annSolid.push_back(std::move(tri));
+                }
+            if (d.contains("arcs") && d["arcs"].is_array())
+                for (const auto& a : d["arcs"]) {
+                    if (!a.is_object() || !a.contains("center")) continue;
+                    double cx = a["center"][0].get<double>(), cy = a["center"][1].get<double>();
+                    double r = a.value("radius", 0.0);
+                    double a0 = a.value("a0", 0.0), a1 = a.value("a1", 6.28318530718);
+                    if (r <= 0) continue;
+                    int n = std::max(10, (int)(std::fabs(a1 - a0) / 0.3));
+                    std::vector<std::array<double, 2>> pl;
+                    for (int i = 0; i <= n; ++i) {
+                        double tt = a0 + (a1 - a0) * (double)i / (double)n;
+                        pl.push_back({cx + r * std::cos(tt), cy + r * std::sin(tt)});
+                    }
+                    annSolid.push_back(std::move(pl));
+                }
+            if (d.contains("texts") && d["texts"].is_array())
+                for (const auto& t : d["texts"]) {
+                    if (!t.is_object() || !t.contains("pos")) continue;
+                    Txt T;
+                    T.pos = {t["pos"][0].get<double>(), t["pos"][1].get<double>()};
+                    T.text = sanitize_label(t.value("text", std::string()));
+                    T.h = t.value("h", 3.5);
+                    if (!T.text.empty()) texts.push_back(std::move(T));
+                }
+        };
         if (full.contains("sheets") && full["sheets"].is_array())
-            for (const auto& sheet : full["sheets"])
+            for (const auto& sheet : full["sheets"]) {
                 if (sheet.contains("views") && sheet["views"].is_array())
                     for (const auto& view : sheet["views"]) {
                         pool(view.value("visible", json::array()), visible);
                         pool(view.value("hidden", json::array()), hidden);
+                        pool(view.value("hatch", json::array()), annSolid);  // section hatch
+                        for (const auto& an : view.value("annotations", json::array()))
+                            if (an.is_object() && an.contains("draw")) poolDraw(an["draw"]);
                     }
+                // Title block: gather its non-empty string fields into a few lines.
+                const json& tb = sheet.value("title_block", json::object());
+                if (tb.is_object()) {
+                    for (const char* key : {"title", "drawn_by", "date", "scale", "material",
+                                            "part_number", "revision", "sheet"}) {
+                        auto it = tb.find(key);
+                        if (it != tb.end() && it->is_string() && !it->get<std::string>().empty())
+                            title_lines.push_back(sanitize_label(
+                                std::string(key) + ": " + it->get<std::string>()));
+                    }
+                }
+            }
         if (visible.empty() && hidden.empty())
             return json{{"ok", false},
                         {"reason", "drawing has no view geometry to render — add views, then Rebuild"}};
@@ -4093,6 +4191,13 @@ json drawing_render_png(const std::string& doc_id, const std::string& out_path) 
                 }
         };
         acc(visible); acc(hidden);
+        // Grow the fit box to include annotation strokes + text so GD&T frames / dims placed
+        // just outside the geometry don't get clipped off the sheet.
+        acc(annSolid); acc(annDash);
+        for (const auto& T : texts) {
+            minx = std::min(minx, T.pos[0]); miny = std::min(miny, T.pos[1]);
+            maxx = std::max(maxx, T.pos[0]); maxy = std::max(maxy, T.pos[1]);
+        }
         if (!(maxx > minx) || !(maxy > miny))
             return json{{"ok", false}, {"reason", "degenerate drawing bounds"}};
 
@@ -4116,6 +4221,44 @@ json drawing_render_png(const std::string& doc_id, const std::string& out_path) 
                 int x0, y0, x1, y1; to_pix(pl[i - 1], x0, y0); to_pix(pl[i], x1, y1);
                 draw_line(img, W, H, x0, y0, x1, y1, 20, 20, 20);
             }
+        // Annotations on top: the compiled draw primitives (dims, callouts, GD&T, hatch) in
+        // dim-blue, with text via the bitmap font sized from the paper-space text height.
+        const unsigned char DR = 30, DG = 70, DB = 170;  // dimension blue
+        for (const auto& pl : annDash)
+            for (std::size_t i = 1; i < pl.size(); ++i) {
+                int x0, y0, x1, y1; to_pix(pl[i - 1], x0, y0); to_pix(pl[i], x1, y1);
+                draw_line(img, W, H, x0, y0, x1, y1, DR, DG, DB);
+            }
+        for (const auto& pl : annSolid)
+            for (std::size_t i = 1; i < pl.size(); ++i) {
+                int x0, y0, x1, y1; to_pix(pl[i - 1], x0, y0); to_pix(pl[i], x1, y1);
+                draw_line(img, W, H, x0, y0, x1, y1, DR, DG, DB);
+            }
+        int n_anns_drawn = (int)texts.size();
+        for (const auto& T : texts) {
+            int tx, ty; to_pix(T.pos, tx, ty);
+            int fs = std::max(1, (int)std::lround(T.h * sc / 7.0));  // 5x7 bitmap font scale
+            blit_text(img, W, H, tx + 1, ty - fs * 7, T.text, fs, DR, DG, DB);
+        }
+        // Title block: a fixed panel in the bottom-right corner (screen space, never clipped).
+        if (!title_lines.empty()) {
+            const int lineH = 16, pad = 6;
+            int boxW = 0;
+            for (const auto& s : title_lines) boxW = std::max(boxW, int(s.size()) * 12);
+            boxW = std::min(std::max(boxW + 2 * pad, 160), W - 2);
+            int boxH = int(title_lines.size()) * lineH + 2 * pad;
+            int bx0 = W - boxW - 2, by0 = H - boxH - 2;
+            // frame
+            draw_line(img, W, H, bx0, by0, bx0 + boxW, by0, 20, 20, 20);
+            draw_line(img, W, H, bx0, by0 + boxH, bx0 + boxW, by0 + boxH, 20, 20, 20);
+            draw_line(img, W, H, bx0, by0, bx0, by0 + boxH, 20, 20, 20);
+            draw_line(img, W, H, bx0 + boxW, by0, bx0 + boxW, by0 + boxH, 20, 20, 20);
+            int ty = by0 + pad;
+            for (const auto& s : title_lines) {
+                blit_text(img, W, H, bx0 + pad, ty, s, 2, 20, 20, 20);
+                ty += lineH;
+            }
+        }
         std::string png = encode_png_rgb(W, H, img);
         if (png.empty()) return json{{"ok", false}, {"reason", "png encode failed"}};
         std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
@@ -4124,7 +4267,9 @@ json drawing_render_png(const std::string& doc_id, const std::string& out_path) 
         if (!f) return json{{"ok", false}, {"reason", "png write failed"}};
         return json{{"ok", true}, {"path", out_path},
                     {"visible", static_cast<int>(visible.size())},
-                    {"hidden", static_cast<int>(hidden.size())}};
+                    {"hidden", static_cast<int>(hidden.size())},
+                    {"annotations", n_anns_drawn},
+                    {"title_block", !title_lines.empty()}};
     } catch (const OpError&) {
         return json{{"ok", false}, {"reason", "not a drawing document"}};
     } catch (...) {
@@ -5647,8 +5792,22 @@ json doc_export_estimate(const std::string& doc_id, double lin_deflection, doubl
     return json{{"triangles", tris}, {"vertices", verts}, {"bodies", r.shapes.size()}};
 }
 
+// True iff `path` has the native .step+ container extension (case-insensitive). Used to
+// decide whether to read a native document or import a neutral file.
+static bool is_stepplus_path(const std::string& path) {
+    std::string ext = std::filesystem::path(path).extension().string();
+    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return ext == ".step+";
+}
+
 json doc_import_file(const std::string& path, const std::string& into, bool as_solid,
                      const std::string& fmt) {
+    // A native .step+ is a DOCUMENT, not a neutral body file: reopen it as a part doc
+    // instead of failing on the format sniffer (Bug N-4 — import_part rejected the very
+    // extension save_part writes). Route BEFORE taking the lock (doc_open locks g_mtx).
+    if (fmt.empty() && into.empty() && is_stepplus_path(path))
+        return doc_open(path, as_solid);
+
     std::lock_guard<std::mutex> lk(g_mtx);
     if (path.empty())
         throw OpError("invalid_op", "import_file: 'path' is required", {{"reason", "missing path"}});
@@ -5667,6 +5826,30 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
 
     json params = {{"source_path", import_path_}, {"format", f}, {"original_name", stem}};
     if (as_solid) params["as_solid"] = true;
+    // BAKE the geometry into the feature at import time so a saved .step+ no longer
+    // depends on the source file surviving on disk (Bug N-8). We read the source ONCE
+    // here, serialize all imported solids to a lossless BREP blob, and carry it in the
+    // feature params. The compiler prefers this embedded geometry; source_path stays as
+    // provenance and a rebuild fallback. Fail-soft: if the read throws, we leave the
+    // feature path-only (the compiler will then read the source as before).
+    try {
+        auto bodies = import_bodies(import_path_, f);
+        TopoDS_Compound comp;
+        BRep_Builder bb;
+        bb.MakeCompound(comp);
+        std::size_t n = 0;
+        for (auto& [bname, shp] : bodies)
+            if (!shp.IsNull()) { bb.Add(comp, shp); ++n; }
+        if (n > 0) {
+            std::string blob = shape_to_brep_b64(comp);
+            if (!blob.empty()) {
+                params["embedded_brep"] = blob;
+                params["embedded_bodies"] = n;
+            }
+        }
+    } catch (...) {
+        // leave path-only; compiler falls back to source_path
+    }
     json ops = json::array({json{
         {"op", "add_feature"},
         {"feature", {{"type", "import"}, {"name", stem}, {"params", params}, {"refs", json::object()}}}}});
@@ -5804,6 +5987,54 @@ json mesh_read_raw(const std::string& path, const std::string& fmt) {
     return json{{"objects", std::move(objects)}, {"format", f}};
 }
 
+// Bake any import feature that still carries only a source_path reference into a
+// self-contained `embedded_brep` blob, so the saved .step+ survives the source file
+// being deleted (Bug N-8 insurance — covers parts imported before embedding existed, or
+// where the import-time embed fail-softed). Reads the SOURCE file; if it is gone we leave
+// the feature as-is (nothing we can do without geometry). Returns the number baked.
+static int bake_import_features(json& doc) {
+    if (!doc.contains("features") || !doc["features"].is_array()) return 0;
+    int baked = 0;
+    for (json& feat : doc["features"]) {
+        if (!feat.is_object() || feat.value("type", std::string()) != "import") continue;
+        // Params may be nested (canonical {params}) or flat — write/read either shape.
+        json* dst = (feat.contains("params") && feat["params"].is_object()) ? &feat["params"]
+                                                                            : &feat;
+        auto has_embed = [&](const json& o) {
+            auto it = o.find("embedded_brep");
+            return it != o.end() && it->is_string() && !it->get<std::string>().empty();
+        };
+        if (has_embed(feat) || has_embed(*dst)) continue;  // already self-contained
+        auto get_str = [&](const char* k) -> std::string {
+            if (dst->contains(k) && (*dst)[k].is_string()) return (*dst)[k].get<std::string>();
+            if (feat.contains(k) && feat[k].is_string()) return feat[k].get<std::string>();
+            return std::string();
+        };
+        const std::string src = get_str("source_path");
+        if (src.empty() || !std::filesystem::exists(src)) continue;
+        std::string ifmt = get_str("format");
+        try {
+            if (ifmt.empty()) ifmt = detect_format(src);
+            auto bodies = import_bodies(src, ifmt);
+            TopoDS_Compound comp;
+            BRep_Builder bb;
+            bb.MakeCompound(comp);
+            std::size_t n = 0;
+            for (auto& [bname, shp] : bodies)
+                if (!shp.IsNull()) { bb.Add(comp, shp); ++n; }
+            if (n == 0) continue;
+            std::string blob = shape_to_brep_b64(comp);
+            if (blob.empty()) continue;
+            (*dst)["embedded_brep"] = blob;
+            (*dst)["embedded_bodies"] = n;
+            ++baked;
+        } catch (...) {
+            // unreadable source — leave path-only
+        }
+    }
+    return baked;
+}
+
 json doc_save(const std::string& doc_id, const std::string& path) {
     // W12+: embed every open drawing whose live source is this doc as a drawings/<id>.json
     // entry. Gather them BEFORE taking the session lock — drawings_for_source takes the
@@ -5827,13 +6058,24 @@ json doc_save(const std::string& doc_id, const std::string& path) {
     }
     for (auto& [name, data] : drawing_entries) s.extra_entries[name] = data;
 
+    // Make every imported body self-contained before writing (Bug N-8).
+    bake_import_features(s.doc);
+
     std::string out = stepplus_save(s.doc, target, s.extra_entries);
     s.path = out;
     s.dirty = false;
     return json{{"path", out}};
 }
 
-json doc_open(const std::string& path) {
+json doc_open(const std::string& path, bool as_solid) {
+    // Manual File>Open / File>Import of a NON-native file (.step/.stp/.iges/.brep/.stl/
+    // .obj/.ply/.gltf/.glb/.3mf/.3dm/.sldprt/…) is NOT a .step+ container — importing it
+    // as a fresh part doc is what the user expects (and is why "open a non-.step+ part"
+    // previously did nothing: the zip reader rejected it and nothing fell back). Route it
+    // through the import lane, which mints a new part doc with the file's geometry baked in.
+    if (!path.empty() && !is_stepplus_path(path))
+        return doc_import_file(path, "", as_solid, "");
+
     std::string opened_doc_id;
     std::map<std::string, std::string> drawing_entries;  // restored after the session lock
     json resp;
@@ -5866,6 +6108,8 @@ json doc_open(const std::string& path) {
     CompileResult r = compile_document(stored.doc, env_from_doc(stored.doc));
     resp = ops_response(stored, r, json::object(), /*with_tess=*/true);
     resp["doc_id"] = stored.doc_id;
+    if (stored.doc.is_object())
+        resp["name"] = stored.doc.value("name", std::string());
     opened_doc_id = stored.doc_id;
     // Capture embedded drawings to restore AFTER releasing the session lock (registering
     // a drawing takes the drawing lock; doing it here would invert the lock order).

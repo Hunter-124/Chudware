@@ -1871,7 +1871,9 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                                  params.value("path", std::string())),
                             out_json, 0);
             if (m == "doc_open")
-                return emit(aicad::doc::doc_open(params.value("path", std::string())), out_json, 0);
+                return emit(aicad::doc::doc_open(params.value("path", std::string()),
+                                                 params.value("as_solid", false)),
+                            out_json, 0);
             if (m == "doc_resolve_pick")
                 return emit(aicad::doc::doc_resolve_pick(
                                 params.value("doc_id", std::string()),
@@ -2280,14 +2282,19 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 params.value("sheet_id", std::string()),
                                 opt("scale"), opt("position"), opt("show_hidden")),
                             out_json, 0);
-            if (m == "drawing_add_section")
+            if (m == "drawing_add_section") {
+                json sopts = params.contains("opts") && params["opts"].is_object() ? params["opts"]
+                                                                                   : json::object();
+                for (const char* k : {"mode", "depth", "reverse"})
+                    if (params.contains(k)) sopts[k] = params[k];
                 return emit(aicad::doc::drawing_add_section(
                                 params.value("doc_id", std::string()),
                                 params.value("parent_view_id", std::string()),
                                 opt("plane"), opt("cut_line"), opt("label"), opt("scale"),
                                 opt("position"), params.value("sheet_id", std::string()),
-                                opt("show_hidden")),
+                                opt("show_hidden"), sopts),
                             out_json, 0);
+            }
             if (m == "drawing_add_detail")
                 return emit(aicad::doc::drawing_add_detail(
                                 params.value("doc_id", std::string()),
@@ -2348,6 +2355,29 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
                                 params.value("view_id", std::string()),
                                 params.value("kind", std::string("hole")), opt("a"), o),
                             out_json, 0);
+            }
+            // GD&T (ASME Y14.5): the structured spec rides as "spec" (or flat keys).
+            if (m == "drawing_add_gdt" || m == "drawing_add_datum" ||
+                m == "drawing_add_datum_target" || m == "drawing_add_surface_finish" ||
+                m == "drawing_add_weld") {
+                json spec = params.contains("spec") && params["spec"].is_object() ? params["spec"]
+                                                                                  : json::object();
+                for (const char* k : {"symbol", "tol_value", "tol_diameter", "tol_modifier",
+                                      "datums", "row2", "label", "target_type", "size", "value",
+                                      "ra", "machining", "all_around", "lay", "weld_type",
+                                      "other_side", "a", "pos"})
+                    if (params.contains(k)) spec[k] = params[k];
+                std::string did = params.value("doc_id", std::string());
+                std::string vid = params.value("view_id", std::string());
+                if (m == "drawing_add_gdt")
+                    return emit(aicad::doc::drawing_add_gdt(did, vid, spec), out_json, 0);
+                if (m == "drawing_add_datum")
+                    return emit(aicad::doc::drawing_add_datum(did, vid, spec), out_json, 0);
+                if (m == "drawing_add_datum_target")
+                    return emit(aicad::doc::drawing_add_datum_target(did, vid, spec), out_json, 0);
+                if (m == "drawing_add_surface_finish")
+                    return emit(aicad::doc::drawing_add_surface_finish(did, vid, spec), out_json, 0);
+                return emit(aicad::doc::drawing_add_weld(did, vid, spec), out_json, 0);
             }
             if (m == "drawing_model_items")
                 return emit(aicad::doc::drawing_model_items(

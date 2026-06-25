@@ -22,12 +22,23 @@ struct PdfLine {
     bool dashed = false;
 };
 
+// One TEXT label at an insertion point (mm), `height` mm tall. Used for drawing
+// annotations on PDF export (Bug N-7). When the texts list is empty the output is
+// byte-identical to the geometry-only writer (no Font object is emitted).
+struct PdfText {
+    std::array<double, 2> pos;
+    double height = 3.0;
+    std::string text;
+};
+
 // Build the full PDF bytes for `lines`. `page_w_mm`/`page_h_mm` set the page size;
 // when `auto_page` is true the page is sized to the drawing bbox + a 10mm margin
 // (and `page_w_mm`/`page_h_mm` are ignored). `path_count` (out) gets the number of
 // stroked polylines. Throws std::runtime_error when there is no geometry.
 std::string build_pdf(const std::vector<PdfLine>& lines, bool auto_page,
                       double page_w_mm, double page_h_mm, int* path_count);
+std::string build_pdf(const std::vector<PdfLine>& lines, const std::vector<PdfText>& texts,
+                      bool auto_page, double page_w_mm, double page_h_mm, int* path_count);
 
 // Write `lines` to a single-page vector PDF at `path` (parent dirs created). When
 // `auto_page` is false the caller-fixed page size is used. Throws std::runtime_error
@@ -35,5 +46,8 @@ std::string build_pdf(const std::vector<PdfLine>& lines, bool auto_page,
 std::string write_pdf(const std::string& path, const std::vector<PdfLine>& lines,
                       bool auto_page = true, double page_w_mm = 0.0,
                       double page_h_mm = 0.0);
+std::string write_pdf(const std::string& path, const std::vector<PdfLine>& lines,
+                      const std::vector<PdfText>& texts, bool auto_page = true,
+                      double page_w_mm = 0.0, double page_h_mm = 0.0);
 
 }  // namespace aicad::doc

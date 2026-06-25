@@ -3,8 +3,10 @@
 // The lowest n_modes natural frequencies + mode shapes of K phi = omega^2 M phi via
 // shift-invert generalized eigensolution at sigma=0 (Spectra::SymGEigsShiftSolver in
 // place of scipy.sparse.linalg.eigsh). K is the same tet4 stiffness as the static
-// solver; M is the diagonal-lumped (m_elem/4 per node) mass. Units: mm / MPa / g, so
-// omega[rad/s] = sqrt(eigenvalue * 1e6), freq[Hz] = omega / 2pi.
+// solver; M is the CONSISTENT tet4 mass matrix (rho*V/20 * (1+delta_ij) blocks) — it
+// keeps a square section's first bending pair near-degenerate and removes the lumped-
+// mass low bias (Bug N-1). Units: mm / MPa / g, so omega[rad/s] = sqrt(eigenvalue *
+// 1e6), freq[Hz] = omega / 2pi.
 #pragma once
 
 #include <string>

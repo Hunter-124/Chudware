@@ -57,6 +57,7 @@ Style layer_style(const std::string& name) {
     if (name == "HIDDEN") return {1, "DASHED"};
     if (name == "OUTLINE") return {7, "CONTINUOUS"};
     if (name == "BEND") return {3, "CONTINUOUS"};
+    if (name == "DIMENSIONS" || name == "ANNOTATIONS") return {5, "CONTINUOUS"};  // blue
     return {7, "CONTINUOUS"};  // _DEFAULT_STYLE
 }
 
@@ -143,6 +144,16 @@ void line_entity(std::vector<std::string>& out, const std::string& layer,
     tag_float(out, 21, b[1]);
 }
 
+void text_entity(std::vector<std::string>& out, const DxfText& t) {
+    tag_str(out, 0, "TEXT");
+    tag_str(out, 8, t.layer);
+    tag_float(out, 10, t.pos[0]);
+    tag_float(out, 20, t.pos[1]);
+    tag_float(out, 30, 0.0);
+    tag_float(out, 40, t.height);
+    tag_str(out, 1, t.text);
+}
+
 int entities(std::vector<std::string>& out, const DxfLayers& layers,
              const std::string& polyline_as) {
     tag_str(out, 0, "SECTION");
@@ -164,6 +175,13 @@ int entities(std::vector<std::string>& out, const DxfLayers& layers,
                 ++n;
             }
         }
+    }
+    // TEXT entities last (after the geometry layers), in insertion order. Empty in the
+    // plain geometry-only path, so non-annotated drawings are byte-identical to before.
+    for (const DxfText& t : layers.texts) {
+        if (t.text.empty()) continue;
+        text_entity(out, t);
+        ++n;
     }
     tag_str(out, 0, "ENDSEC");
     return n;

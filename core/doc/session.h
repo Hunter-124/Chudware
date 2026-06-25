@@ -323,9 +323,12 @@ nlohmann::json mesh_read_raw(const std::string& path, const std::string& fmt);
 // Throws OpError("io_error") if no path is available, or on a write failure.
 nlohmann::json doc_save(const std::string& doc_id, const std::string& path);
 
-// Open a .step+ container at `path` into a FRESH session, rebuild it, and return the
-// ops-response + "doc_id" + "warnings". Throws OpError("io_error") on a bad file.
-nlohmann::json doc_open(const std::string& path);
+// Open a document at `path` into a FRESH session, rebuild it, and return the ops-response
+// + "doc_id" + "warnings". A native .step+ container is read as a feature tree; ANY OTHER
+// file (.step/.iges/.stl/.obj/…) is IMPORTED as a fresh part doc instead (so manual
+// File>Open/Import of a neutral file works). `as_solid` promotes a closed mesh to a solid
+// on import. Throws OpError("io_error") on a bad file.
+nlohmann::json doc_open(const std::string& path, bool as_solid = false);
 
 // C18 interactive sketch mode — port of engine/doc/session.py sketch_* (warm-started
 // over aicad::sketch::solve_sketch). One sketch is "entered" at a time (active_sketch

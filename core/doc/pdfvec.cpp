@@ -27,21 +27,22 @@ struct Bbox {
     double minx = 0, miny = 0, maxx = 0, maxy = 0;
 };
 
-Bbox bbox_of(const std::vector<PdfLine>& lines) {
+Bbox bbox_of(const std::vector<PdfLine>& lines, const std::vector<PdfText>& texts) {
     Bbox b;
     double minx = std::numeric_limits<double>::infinity();
     double miny = std::numeric_limits<double>::infinity();
     double maxx = -std::numeric_limits<double>::infinity();
     double maxy = -std::numeric_limits<double>::infinity();
-    for (const PdfLine& ln : lines) {
-        for (const auto& p : ln.pts) {
-            b.ok = true;
-            if (p[0] < minx) minx = p[0];
-            if (p[1] < miny) miny = p[1];
-            if (p[0] > maxx) maxx = p[0];
-            if (p[1] > maxy) maxy = p[1];
-        }
-    }
+    auto acc = [&](double x, double y) {
+        b.ok = true;
+        if (x < minx) minx = x;
+        if (y < miny) miny = y;
+        if (x > maxx) maxx = x;
+        if (y > maxy) maxy = y;
+    };
+    for (const PdfLine& ln : lines)
+        for (const auto& p : ln.pts) acc(p[0], p[1]);
+    for (const PdfText& t : texts) acc(t.pos[0], t.pos[1]);
     if (b.ok) {
         b.minx = minx;
         b.miny = miny;
@@ -51,9 +52,22 @@ Bbox bbox_of(const std::vector<PdfLine>& lines) {
     return b;
 }
 
+// Escape a literal string for a PDF (...) string: backslash, parens. The annotation
+// text is pre-sanitized to ASCII, but escape defensively.
+std::string pdf_escape(const std::string& s) {
+    std::string o;
+    o.reserve(s.size());
+    for (char c : s) {
+        if (c == '\\' || c == '(' || c == ')') o.push_back('\\');
+        o.push_back(c);
+    }
+    return o;
+}
+
 // Build the content stream (latin-1 bytes): stroke each polyline, dashed when
 // flagged. Mirrors _content_stream exactly (op order + formatting + "\n" joins).
-std::string content_stream(const std::vector<PdfLine>& lines, double dx_mm,
+std::string content_stream(const std::vector<PdfLine>& lines,
+                           const std::vector<PdfText>& texts, double dx_mm,
                            double dy_mm, int* path_count) {
     std::vector<std::string> ops;
     ops.push_back(f3(0.35 * MM_TO_PT) + " w");
@@ -83,6 +97,19 @@ std::string content_stream(const std::vector<PdfLine>& lines, double dx_mm,
         ops.push_back("S");
         ++n;
     }
+    // Annotation TEXT after the strokes: blue fill, Helvetica (the /F1 resource added in
+    // build_pdf when texts are present). PDF text origin is the baseline at Td.
+    if (!texts.empty()) {
+        ops.push_back("0 0 0.6 rg");  // fill colour (text)
+        for (const PdfText& t : texts) {
+            if (t.text.empty()) continue;
+            double x = (t.pos[0] + dx_mm) * MM_TO_PT;
+            double y = (t.pos[1] + dy_mm) * MM_TO_PT;
+            double sz = t.height * MM_TO_PT;
+            ops.push_back("BT /F1 " + f3(sz) + " Tf " + f3(x) + " " + f3(y) + " Td (" +
+                          pdf_escape(t.text) + ") Tj ET");
+        }
+    }
     if (path_count) *path_count = n;
     std::string s;
     for (std::size_t i = 0; i < ops.size(); ++i) {
@@ -96,7 +123,14 @@ std::string content_stream(const std::vector<PdfLine>& lines, double dx_mm,
 
 std::string build_pdf(const std::vector<PdfLine>& lines, bool auto_page,
                       double page_w_mm_in, double page_h_mm_in, int* path_count) {
-    Bbox bb = bbox_of(lines);
+    return build_pdf(lines, std::vector<PdfText>{}, auto_page, page_w_mm_in, page_h_mm_in,
+                     path_count);
+}
+
+std::string build_pdf(const std::vector<PdfLine>& lines, const std::vector<PdfText>& texts,
+                      bool auto_page, double page_w_mm_in, double page_h_mm_in,
+                      int* path_count) {
+    Bbox bb = bbox_of(lines, texts);
     if (!bb.ok) throw std::runtime_error("write_pdf: no line geometry to export");
 
     double dx_mm = MARGIN_MM - bb.minx;
@@ -114,16 +148,23 @@ std::string build_pdf(const std::vector<PdfLine>& lines, bool auto_page,
     double page_w_pt = page_w_mm * MM_TO_PT;
     double page_h_pt = page_h_mm * MM_TO_PT;
 
-    std::string content = content_stream(lines, dx_mm, dy_mm, path_count);
+    std::string content = content_stream(lines, texts, dx_mm, dy_mm, path_count);
 
-    // Assemble the PDF objects (byte-identical to pdfvec.py).
+    // Assemble the PDF objects. With NO annotation text the object set + Resources are
+    // byte-identical to the geometry-only writer; with text we add a Helvetica Font (obj 5)
+    // and reference it from the page Resources so the BT/Tj operators resolve (Bug N-7).
+    const bool with_text = !texts.empty();
+    const std::string resources =
+        with_text ? "<< /Font << /F1 5 0 R >> >>" : "<< >>";
     std::vector<std::string> objects;
     objects.push_back("<< /Type /Catalog /Pages 2 0 R >>");
     objects.push_back("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
     objects.push_back("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " + f3(page_w_pt) +
-                      " " + f3(page_h_pt) + "] /Contents 4 0 R /Resources << >> >>");
+                      " " + f3(page_h_pt) + "] /Contents 4 0 R /Resources " + resources + " >>");
     objects.push_back("<< /Length " + std::to_string(content.size()) + " >>\nstream\n" +
                       content + "endstream");
+    if (with_text)
+        objects.push_back("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
 
     std::string buf;
     buf += "%PDF-1.4\n";
@@ -156,11 +197,17 @@ std::string build_pdf(const std::vector<PdfLine>& lines, bool auto_page,
 
 std::string write_pdf(const std::string& path, const std::vector<PdfLine>& lines,
                       bool auto_page, double page_w_mm, double page_h_mm) {
+    return write_pdf(path, lines, std::vector<PdfText>{}, auto_page, page_w_mm, page_h_mm);
+}
+
+std::string write_pdf(const std::string& path, const std::vector<PdfLine>& lines,
+                      const std::vector<PdfText>& texts, bool auto_page, double page_w_mm,
+                      double page_h_mm) {
     std::filesystem::path p(path);
     if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path());
 
     int paths = 0;
-    std::string buf = build_pdf(lines, auto_page, page_w_mm, page_h_mm, &paths);
+    std::string buf = build_pdf(lines, texts, auto_page, page_w_mm, page_h_mm, &paths);
 
     std::ofstream f(p, std::ios::binary | std::ios::trunc);
     if (!f) throw std::runtime_error("write_pdf: cannot open output: " + path);

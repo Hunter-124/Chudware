@@ -619,6 +619,29 @@ struct AppState {
         // Title-block / sheet-properties editor popup (opened from the ribbon).
         bool        titleBlockOpen = false;     // request to open the title-block editor this frame
 
+        // ---- Drawing overhaul: view drag/select + GD&T tools + custom sections ----
+        // View move: click a view's geometry to select it, then drag to reposition. The drag
+        // is OPTIMISTIC (the cached view position + polylines translate locally each frame) and
+        // commits once on release via drawing_set_view {position} — a pure sheet offset that the
+        // engine applies WITHOUT re-projecting (no HLR), so dragging stays smooth.
+        std::string selViewId;                  // currently selected view (for move / Delete / scale)
+        bool        viewDragActive = false;     // a view-move drag is in progress
+        float       viewDragDX = 0, viewDragDY = 0;  // live drag offset (sheet mm) during the drag
+        float       viewDragStartMx = 0, viewDragStartMy = 0;  // mouse-down point (sheet mm)
+        // GD&T placement tool: arm a kind, click the feature to anchor (a), then click to drop the
+        // frame/symbol (pos) -> drawing_add_gdt/datum/.... gdtKind is the annotation kind.
+        bool        gdtToolActive = false;      // armed: place a GD&T element
+        std::string gdtKind;                    // gdt_frame|datum_feature|datum_target|surface_finish|weld_symbol
+        std::string gdtViewId;                  // view the GD&T element anchors to
+        int         gdtStage = 0;               // 0=pick feature anchor, 1=pick symbol position
+        float       gdtAx = 0, gdtAy = 0;       // picked feature anchor (sheet mm)
+        nlohmann::json gdtSpec;                 // the spec being authored (symbol, tol, datums, ...)
+        bool        gdtEditorOpen = false;      // request to open the GD&T editor popup
+        // Custom-section controls the Section tool applies on commit.
+        std::string sectionMode = "full";       // full|half
+        bool        sectionReverse = false;     // flip which side is removed
+        std::vector<std::array<float, 2>> sectionPts;  // multi-point (offset/jogged) cut-line points
+
         // ---- Schematic / PCB tabs only (kind == Schematic || PCB) ----
         // An ECAD tab is backed by a SEPARATE worker registry (ecad_* RPCs), not the DocMirror.
         // ecadDocId is the worker ecad doc id; ecadRevision is the optimistic-concurrency base.

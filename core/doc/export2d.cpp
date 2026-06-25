@@ -3,6 +3,7 @@
 #include "doc/export2d.h"
 
 #include <array>
+#include <functional>
 #include <vector>
 
 #include <BRepAdaptor_Curve.hxx>
@@ -56,23 +57,196 @@ void pool_polylines(const json& jpls, std::vector<Polyline>& out) {
     }
 }
 
-// Write {VISIBLE, HIDDEN} polyline pools to a DXF/PDF file. Shared writer for the
-// stateless + stateful drawing exports. Returns the written path.
+// Map an annotation string onto plain ASCII for DXF R12 / PDF Helvetica (the engine
+// composes ⌀/×/°/± which neither target draws cleanly): ⌀->DIA, ×->X, °->DEG, ±->+-,
+// other non-ASCII dropped. Mirrors session.cpp::sanitize_label for the export side (N-7).
+std::string ascii_label(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (std::size_t i = 0; i < in.size();) {
+        unsigned char c = static_cast<unsigned char>(in[i]);
+        if (c < 0x80) { out.push_back(in[i]); ++i; continue; }
+        if (c == 0xC3 && i + 1 < in.size()) {
+            unsigned char d = static_cast<unsigned char>(in[i + 1]);
+            if (d == 0x97) out += "X";
+            else if (d == 0x98 || d == 0xB8) out += "DIA ";
+            i += 2; continue;
+        }
+        if (c == 0xC2 && i + 1 < in.size()) {
+            unsigned char d = static_cast<unsigned char>(in[i + 1]);
+            if (d == 0xB0) out += " DEG";
+            else if (d == 0xB1) out += "+-";
+            i += 2; continue;
+        }
+        if (c == 0xE2 && i + 2 < in.size() &&
+            static_cast<unsigned char>(in[i + 1]) == 0x8C &&
+            static_cast<unsigned char>(in[i + 2]) == 0x80) {
+            out += "DIA ";
+            i += 3; continue;
+        }
+        ++i;
+        while (i < in.size() && (static_cast<unsigned char>(in[i]) & 0xC0) == 0x80) ++i;
+    }
+    return out;
+}
+
+// A placed export label (pos, ascii text, height mm).
+struct ExpLabel {
+    std::array<double, 2> pos;
+    std::string text;
+    double h = 3.5;
+};
+
+// Drawing annotations pooled for vector export: dimension/leader/GD&T strokes + placed
+// text labels + title-block lines. Consumes the shared `draw` primitives emitted per
+// annotation by drawing_get (annot_draw), so GD&T frames, surface-finish/weld symbols and
+// section hatch all export, not just basic dim leaders.
+struct AnnExport {
+    std::vector<Polyline> segs;       // solid strokes (dim lines, GD&T frames, arrowheads, hatch)
+    std::vector<Polyline> dashed;     // dashed strokes (center lines)
+    std::vector<ExpLabel> labels;     // placed text
+    std::vector<std::string> title_lines;
+    double minx = 1e30, miny = 1e30, maxx = -1e30, maxy = -1e30;  // geometry+ann bbox
+    bool any() const {
+        return !segs.empty() || !dashed.empty() || !labels.empty() || !title_lines.empty();
+    }
+};
+
+// Tessellate one draw "arcs" entry into a polyline.
+void arc_to_polyline(const json& arc, std::vector<Polyline>& out) {
+    if (!arc.is_object() || !arc.contains("center")) return;
+    double cx = arc["center"][0].get<double>(), cy = arc["center"][1].get<double>();
+    double r = arc.value("radius", 0.0);
+    double a0 = arc.value("a0", 0.0), a1 = arc.value("a1", 2.0 * 3.14159265358979323846);
+    if (r <= 0.0) return;
+    double span = std::fabs(a1 - a0);
+    int n = std::max(8, (int)std::ceil(span / 0.35));
+    Polyline pl;
+    for (int i = 0; i <= n; ++i) {
+        double t = a0 + (a1 - a0) * (double)i / (double)n;
+        pl.push_back({cx + r * std::cos(t), cy + r * std::sin(t)});
+    }
+    if (pl.size() >= 2) out.push_back(std::move(pl));
+}
+
+// Pool one annotation's `draw` primitive block into the export pools.
+void pool_draw_block(const json& draw, AnnExport& ax,
+                     const std::function<void(const std::array<double, 2>&)>& grow) {
+    if (!draw.is_object()) return;
+    auto pool_polys = [&](const json& arr, std::vector<Polyline>& dst) {
+        if (!arr.is_array()) return;
+        for (const auto& pl : arr) {
+            if (!pl.is_array() || pl.size() < 2) continue;
+            Polyline out;
+            for (const auto& p : pl) {
+                if (!p.is_array() || p.size() < 2) continue;
+                std::array<double, 2> q{p[0].get<double>(), p[1].get<double>()};
+                out.push_back(q);
+                grow(q);
+            }
+            if (out.size() >= 2) dst.push_back(std::move(out));
+        }
+    };
+    pool_polys(draw.value("segments", json::array()), ax.segs);
+    pool_polys(draw.value("dashed", json::array()), ax.dashed);
+    // Arrowhead triangles -> outlined (DXF R12 has no robust fill); close the loop.
+    if (draw.contains("tris") && draw["tris"].is_array())
+        for (const auto& t : draw["tris"]) {
+            if (!t.is_array() || t.size() != 3) continue;
+            Polyline tri;
+            for (const auto& p : t) tri.push_back({p[0].get<double>(), p[1].get<double>()});
+            tri.push_back(tri.front());
+            ax.segs.push_back(std::move(tri));
+        }
+    if (draw.contains("arcs") && draw["arcs"].is_array())
+        for (const auto& a : draw["arcs"]) arc_to_polyline(a, ax.segs);
+    if (draw.contains("texts") && draw["texts"].is_array())
+        for (const auto& t : draw["texts"]) {
+            if (!t.is_object() || !t.contains("pos")) continue;
+            std::string txt = ascii_label(t.value("text", std::string()));
+            if (txt.empty()) continue;
+            double h = t.value("h", 3.5);
+            std::array<double, 2> pos{t["pos"][0].get<double>(), t["pos"][1].get<double>()};
+            // DXF/PDF text is left/baseline; nudge for center/right + mid so it lands close.
+            std::string align = t.value("align", std::string("left"));
+            std::string valign = t.value("valign", std::string("base"));
+            double w = (double)txt.size() * h * 0.6;
+            if (align == "center") pos[0] -= w * 0.5;
+            else if (align == "right") pos[0] -= w;
+            if (valign == "mid") pos[1] -= h * 0.5;
+            ax.labels.push_back({pos, txt, h});
+            grow(pos);
+        }
+}
+
+// Pool every sheet/view annotation + section hatch from a drawing_get() result (sheet-mm).
+void pool_annotations(const json& full, AnnExport& ax) {
+    auto grow = [&](const std::array<double, 2>& p) {
+        ax.minx = std::min(ax.minx, p[0]); ax.miny = std::min(ax.miny, p[1]);
+        ax.maxx = std::max(ax.maxx, p[0]); ax.maxy = std::max(ax.maxy, p[1]);
+    };
+    if (!full.contains("sheets") || !full["sheets"].is_array()) return;
+    for (const auto& sheet : full["sheets"]) {
+        for (const auto& view : sheet.value("views", json::array())) {
+            for (const auto& an : view.value("annotations", json::array())) {
+                if (!an.is_object()) continue;
+                if (an.contains("draw")) pool_draw_block(an["draw"], ax, grow);
+            }
+            // Section hatch (engine-computed) exports as thin solid strokes.
+            if (view.contains("hatch") && view["hatch"].is_array())
+                for (const auto& sgmt : view["hatch"]) {
+                    if (!sgmt.is_array() || sgmt.size() < 2) continue;
+                    Polyline pl;
+                    for (const auto& p : sgmt) pl.push_back({p[0].get<double>(), p[1].get<double>()});
+                    if (pl.size() >= 2) ax.segs.push_back(std::move(pl));
+                }
+        }
+        const json& tb = sheet.value("title_block", json::object());
+        if (tb.is_object())
+            for (const char* key : {"title", "drawn_by", "date", "scale", "material",
+                                    "part_number", "revision", "sheet"}) {
+                auto it = tb.find(key);
+                if (it != tb.end() && it->is_string() && !it->get<std::string>().empty())
+                    ax.title_lines.push_back(
+                        ascii_label(std::string(key) + ": " + it->get<std::string>()));
+            }
+    }
+}
+
+// Write {VISIBLE, HIDDEN} polyline pools (+ optional annotations) to a DXF/PDF file.
+// Shared writer for the stateless + stateful drawing exports. Returns the written path.
 std::string write_drawing_layers(const std::vector<Polyline>& visible,
                                  const std::vector<Polyline>& hidden, const std::string& path,
-                                 const std::string& fmt) {
+                                 const std::string& fmt, const AnnExport& ax = AnnExport{}) {
+    // Title-block lines stack below the geometry bottom-left so they fit the auto-page.
+    const double TH = 3.5;                       // title-block text height (mm)
+    std::vector<ExpLabel> all_labels = ax.labels;
+    if (!ax.title_lines.empty() && ax.maxx > ax.minx) {
+        double tx = ax.minx, ty = ax.miny - 8.0;
+        for (const auto& s : ax.title_lines) { all_labels.push_back({{tx, ty}, s, TH}); ty -= 6.0; }
+    }
     if (fmt == "dxf") {
         DxfLayers layers;
         layers.add_layer("VISIBLE");  // insertion order VISIBLE then HIDDEN (Python dict order)
         layers.add_layer("HIDDEN");
         for (const auto& pl : visible) layers.add_polyline("VISIBLE", pl);
         for (const auto& pl : hidden) layers.add_polyline("HIDDEN", pl);
+        if (ax.any()) {
+            layers.add_layer("DIMENSIONS");
+            for (const auto& s : ax.segs) layers.add_polyline("DIMENSIONS", s);
+            for (const auto& s : ax.dashed) layers.add_polyline("DIMENSIONS", s);
+            for (const auto& lb : all_labels) layers.add_text("DIMENSIONS", lb.pos, lb.h, lb.text);
+        }
         return write_dxf(path, layers);
     }
     std::vector<PdfLine> lines;
     for (const auto& pl : visible) lines.push_back({pl, false});
     for (const auto& pl : hidden) lines.push_back({pl, true});
-    return write_pdf(path, lines);
+    for (const auto& s : ax.segs) lines.push_back({s, false});
+    for (const auto& s : ax.dashed) lines.push_back({s, true});
+    std::vector<PdfText> texts;
+    for (const auto& lb : all_labels) texts.push_back({lb.pos, lb.h, lb.text});
+    return write_pdf(path, lines, texts);
 }
 
 // Project every view def against `shapes`, returning the list of project_view JSON.
@@ -242,9 +416,20 @@ json export_drawing(const std::string& doc_id, const std::string& path, const st
                       "(add views first, then Rebuild)",
                       {{"doc_id", doc_id}});
 
+    // Pool annotations (dims / hole callouts / title block) so the vector export carries
+    // them too, not just the projected geometry (Bug N-7). Seed the bbox with the geometry
+    // so title-block lines land just below the part.
+    AnnExport ax;
+    for (const auto& pl : visible)
+        for (const auto& p : pl) {
+            ax.minx = std::min(ax.minx, p[0]); ax.miny = std::min(ax.miny, p[1]);
+            ax.maxx = std::max(ax.maxx, p[0]); ax.maxy = std::max(ax.maxy, p[1]);
+        }
+    pool_annotations(full, ax);
+
     std::string out_path;
     try {
-        out_path = write_drawing_layers(visible, hidden, path, fmt);
+        out_path = write_drawing_layers(visible, hidden, path, fmt, ax);
     } catch (const OpError&) {
         throw;
     } catch (const std::exception& exc) {
@@ -253,7 +438,9 @@ json export_drawing(const std::string& doc_id, const std::string& path, const st
     }
     return {{"path", out_path}, {"format", fmt},
             {"visible", static_cast<int>(visible.size())},
-            {"hidden", static_cast<int>(hidden.size())}, {"entities", n}};
+            {"hidden", static_cast<int>(hidden.size())},
+            {"annotations", static_cast<int>(ax.segs.size() + ax.labels.size())},
+            {"entities", n}};
 }
 
 json export_flat_dxf(const std::string& doc_id, const std::string& path, const std::string& fmt) {

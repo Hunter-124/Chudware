@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "doc/annot_draw.h"  // compile_annotation / compile_hatch (shared primitives)
 #include "doc/document.h"
 #include "doc/drawing.h"
 #include "doc/session.h"  // OpError
@@ -270,15 +271,28 @@ void orient_frame(const std::string& orientation, Vec3& d, Vec3& sx, Vec3& sy) {
 // Resolve a section view's cut plane -> world {normal, point} json for project_section.
 // Mirrors drawing.py::_resolve_section_plane (explicit-plane OR cut_line-in-parent form).
 json resolve_section_plane(const json& view, const json& parent_view) {
+    // Custom-section controls carried on the view -> the resolved world plane.
+    auto attach_mode = [&](json plane) -> json {
+        if (view.contains("mode") && view["mode"].is_string()) plane["mode"] = view["mode"];
+        if (view.contains("depth") && view["depth"].is_number()) plane["depth"] = view["depth"];
+        if (view.contains("reverse") && view["reverse"].is_boolean())
+            plane["reverse"] = view["reverse"];
+        return plane;
+    };
     if (view.contains("plane") && view["plane"].is_object() &&
         view["plane"].contains("normal") && view["plane"].contains("point")) {
         // Explicit world plane — pass through (project_section validates further).
-        return view["plane"];
+        return attach_mode(view["plane"]);
     }
     const json& cut_line = view.contains("cut_line") ? view["cut_line"] : json(nullptr);
-    if (!(cut_line.is_array() && cut_line.size() == 2 && is_xy(cut_line[0]) && is_xy(cut_line[1])))
+    // Accept a 2-point straight cut OR a multi-point (offset/jogged) polyline cut line; the
+    // section plane is taken through the first and last points (the dominant cut direction),
+    // and the jog points still draw on the parent as a stepped cut-line marker.
+    if (!(cut_line.is_array() && cut_line.size() >= 2 && is_xy(cut_line[0]) &&
+          is_xy(cut_line[cut_line.size() - 1])))
         throw OpError("invalid_op",
-                      "section needs a world 'plane' {normal, point} or a 2D 'cut_line' [[x,y],[x,y]]",
+                      "section needs a world 'plane' {normal, point} or a 2D 'cut_line' "
+                      "[[x,y],[x,y],...]",
                       {{"reason", "no plane"}});
     std::string p_orient = parent_view.value("orientation", std::string("front"));
     double p_scale = parent_view.value("scale", 1.0);
@@ -292,7 +306,7 @@ json resolve_section_plane(const json& view, const json& parent_view) {
         return {sx_p[0] * u + sy_p[0] * v, sx_p[1] * u + sy_p[1] * v, sx_p[2] * u + sy_p[2] * v};
     };
     Vec3 a = unproj(cut_line[0]);
-    Vec3 b = unproj(cut_line[1]);
+    Vec3 b = unproj(cut_line[cut_line.size() - 1]);
     Vec3 line = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
     if (std::sqrt(v_dot(line, line)) < 1e-9)
         throw OpError("invalid_op", "section cut_line endpoints coincide", {{"reason", "degenerate"}});
@@ -302,8 +316,11 @@ json resolve_section_plane(const json& view, const json& parent_view) {
         throw OpError("invalid_op", "section cut line is parallel to the view direction",
                       {{"reason", "degenerate"}});
     plane_normal = v_norm(plane_normal);
-    return json{{"normal", json::array({plane_normal[0], plane_normal[1], plane_normal[2]})},
-                {"point", json::array({a[0], a[1], a[2]})}};
+    json plane = {{"normal", json::array({plane_normal[0], plane_normal[1], plane_normal[2]})},
+                  {"point", json::array({a[0], a[1], a[2]})}};
+    // For a half section, keep the unsectioned half along the cut-line direction in world.
+    plane["half_axis"] = json::array({line[0], line[1], line[2]});
+    return attach_mode(plane);
 }
 
 // ----------------------------------------------------------------- _project_one
@@ -542,6 +559,24 @@ json drawing_get_locked_unsafe(const std::string& doc_id) {
                     views_out.push_back(geom);
                 }
             attach_parent_markers(views_out);
+            // Compile every annotation into shared draw primitives (one source of truth
+            // for the host renderer + DXF/PDF export + PNG raster), and pre-compute the
+            // section-face hatch engine-side so exports/PNG hatch too.
+            std::string units = doc_units(s.doc);
+            for (json& g : views_out) {
+                if (g.contains("annotations") && g["annotations"].is_array())
+                    for (json& an : g["annotations"])
+                        if (an.is_object()) an["draw"] = compile_annotation(an, units);
+                if (g.contains("section_faces") && g["section_faces"].is_array()) {
+                    json hatch = json::array();
+                    for (const json& poly : g["section_faces"]) {
+                        json hr = compile_hatch(poly, 0.0, 45.0);
+                        if (hr.contains("segments"))
+                            for (const json& sgmt : hr["segments"]) hatch.push_back(sgmt);
+                    }
+                    g["hatch"] = hatch;
+                }
+            }
             std::array<double, 2> sz = sheet_dims(sh.value("size", std::string()));
             sheets_out.push_back(json{{"id", sh.value("id", json(nullptr))},
                                       {"size", sh.value("size", json(nullptr))},
@@ -638,7 +673,7 @@ json drawing_add_view(const std::string& doc_id, const std::string& type,
 json drawing_add_section(const std::string& doc_id, const std::string& parent_view_id,
                          const json& plane, const json& cut_line, const json& label,
                          const json& scale, const json& position, const std::string& sheet_id,
-                         const json& show_hidden) {
+                         const json& show_hidden, const json& opts) {
     std::lock_guard<std::mutex> lk(g_mtx);
     DrawingSession& s = require_session(doc_id);
     json& sheet = find_sheet(s.doc, sheet_id);
@@ -668,10 +703,22 @@ json drawing_add_section(const std::string& doc_id, const std::string& parent_vi
         {"show_hidden", show_hidden.is_boolean() ? show_hidden.get<bool>() : false},
     };
     if (plane.is_object()) view["plane"] = plane;
-    if (cut_line.is_array() && cut_line.size() == 2)
-        view["cut_line"] = json::array(
-            {json::array({cut_line[0][0].get<double>(), cut_line[0][1].get<double>()}),
-             json::array({cut_line[1][0].get<double>(), cut_line[1][1].get<double>()})});
+    if (cut_line.is_array() && cut_line.size() >= 2) {
+        // Store the full (possibly jogged) cut-line polyline; resolve uses first+last.
+        json cl = json::array();
+        for (const auto& q : cut_line)
+            if (is_xy(q)) cl.push_back(json::array({q[0].get<double>(), q[1].get<double>()}));
+        if (cl.size() >= 2) view["cut_line"] = cl;
+    }
+    // Custom-section controls (optional, default a full straight section).
+    if (opts.is_object()) {
+        std::string mode = opts.value("mode", std::string());
+        if (mode == "full" || mode == "half") view["mode"] = mode;
+        if (opts.contains("depth") && opts["depth"].is_number() && opts["depth"].get<double>() > 0.0)
+            view["depth"] = opts["depth"].get<double>();
+        if (opts.contains("reverse") && opts["reverse"].is_boolean())
+            view["reverse"] = opts["reverse"].get<bool>();
+    }
     sheet["views"].push_back(view);
     s.revision += 1;
     auto shapes = source_shapes(s);
@@ -1141,6 +1188,205 @@ json drawing_add_callout(const std::string& doc_id, const std::string& view_id,
     throw OpError("invalid_op", "callout kind must be hole|balloon", {{"reason", "bad kind"}});
 }
 
+// ----------------------------------------------------------- GD&T (ASME Y14.5)
+namespace {
+// The 14 geometric-characteristic symbols accepted in a feature control frame.
+bool valid_gdt_symbol(const std::string& s) {
+    static const std::set<std::string> k = {
+        "straightness", "flatness",     "circularity",  "cylindricity",
+        "profile_line", "profile_surface", "perpendicularity", "angularity",
+        "parallelism",  "position",     "concentricity", "symmetry",
+        "circular_runout", "total_runout"};
+    return k.count(s) > 0;
+}
+// Short ASCII tag for a symbol — used for the human/AI/export fallback `text`.
+std::string gdt_symbol_tag(const std::string& s) {
+    static const std::map<std::string, std::string> t = {
+        {"straightness", "STR"}, {"flatness", "FLAT"}, {"circularity", "CIRC"},
+        {"cylindricity", "CYL"}, {"profile_line", "PROF-L"}, {"profile_surface", "PROF-S"},
+        {"perpendicularity", "PERP"}, {"angularity", "ANG"}, {"parallelism", "PARA"},
+        {"position", "POS"}, {"concentricity", "CONC"}, {"symmetry", "SYM"},
+        {"circular_runout", "RUNOUT"}, {"total_runout", "T-RUNOUT"}};
+    auto it = t.find(s);
+    return it == t.end() ? s : it->second;
+}
+std::string mod_tag(const std::string& m) {
+    if (m == "mmc") return "(M)";
+    if (m == "lmc") return "(L)";
+    if (m == "projected") return "(P)";
+    if (m == "free") return "(F)";
+    if (m == "tangent") return "(T)";
+    return "";
+}
+// Build the readable fallback text for a feature control frame (the primitives carry the
+// real symbology; this is for export ASCII / BOM / AI vision context).
+std::string compose_gdt_text(const json& ann) {
+    std::string out = gdt_symbol_tag(ann.value("symbol", std::string("position")));
+    out += " ";
+    if (ann.value("tol_diameter", false)) out += "DIA ";
+    if (ann.contains("tol_value")) {
+        if (ann["tol_value"].is_string()) out += ann["tol_value"].get<std::string>();
+        else if (ann["tol_value"].is_number()) {
+            char b[48];
+            std::snprintf(b, sizeof(b), "%.4g", ann["tol_value"].get<double>());
+            out += b;
+        }
+    }
+    out += mod_tag(ann.value("tol_modifier", std::string("none")));
+    if (ann.contains("datums") && ann["datums"].is_array())
+        for (const auto& dd : ann["datums"])
+            if (dd.is_object() && !dd.value("ref", std::string()).empty())
+                out += " " + dd.value("ref", std::string()) + mod_tag(dd.value("modifier", std::string("none")));
+    return out;
+}
+}  // namespace
+
+json drawing_add_gdt(const std::string& doc_id, const std::string& view_id, const json& spec) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingSession& s = require_session(doc_id);
+    json* view = find_view(s.doc, view_id);
+    if (!view)
+        throw OpError("invalid_op", "no view '" + view_id + "'", {{"reason", "unknown view"}});
+    const json& sp = spec.is_object() ? spec : json::object();
+    std::string symbol = sp.value("symbol", std::string("position"));
+    if (!valid_gdt_symbol(symbol))
+        throw OpError("invalid_op",
+                      "gdt symbol '" + symbol +
+                          "' must be one of the 14 Y14.5 characteristics "
+                          "(position, flatness, perpendicularity, profile_surface, ...)",
+                      {{"reason", "bad symbol"}});
+    json ann = {
+        {"id", next_ann_id(*view)}, {"type", "gdt"}, {"kind", "gdt_frame"},
+        {"symbol", symbol},
+        {"tol_diameter", sp.value("tol_diameter", false)},
+        {"tol_modifier", sp.value("tol_modifier", std::string("none"))},
+        {"datums", sp.contains("datums") && sp["datums"].is_array() ? sp["datums"] : json::array()},
+    };
+    if (sp.contains("tol_value")) ann["tol_value"] = sp["tol_value"];
+    if (sp.contains("row2") && sp["row2"].is_object()) ann["row2"] = sp["row2"];
+    if (is_xy(sp.value("a", json(nullptr))))
+        ann["a"] = json::array({sp["a"][0].get<double>(), sp["a"][1].get<double>()});
+    if (is_xy(sp.value("pos", json(nullptr))))
+        ann["pos"] = json::array({sp["pos"][0].get<double>(), sp["pos"][1].get<double>()});
+    else if (ann.contains("a"))
+        ann["pos"] = json::array({ann["a"][0].get<double>() + 16.0, ann["a"][1].get<double>() + 12.0});
+    else
+        ann["pos"] = json::array({20.0, 20.0});
+    ann["text"] = compose_gdt_text(ann);
+    (*view)["annotations"].push_back(ann);
+    s.revision += 1;
+    return json{{"annotation", ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
+}
+
+json drawing_add_datum(const std::string& doc_id, const std::string& view_id, const json& spec) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingSession& s = require_session(doc_id);
+    json* view = find_view(s.doc, view_id);
+    if (!view)
+        throw OpError("invalid_op", "no view '" + view_id + "'", {{"reason", "unknown view"}});
+    const json& sp = spec.is_object() ? spec : json::object();
+    std::string label = sp.value("label", std::string());
+    if (label.empty()) label = "A";
+    json ann = {{"id", next_ann_id(*view)}, {"type", "gdt"}, {"kind", "datum_feature"},
+                {"label", label}, {"text", "DATUM " + label}};
+    if (is_xy(sp.value("a", json(nullptr))))
+        ann["a"] = json::array({sp["a"][0].get<double>(), sp["a"][1].get<double>()});
+    if (is_xy(sp.value("pos", json(nullptr))))
+        ann["pos"] = json::array({sp["pos"][0].get<double>(), sp["pos"][1].get<double>()});
+    else if (ann.contains("a"))
+        ann["pos"] = json::array({ann["a"][0].get<double>(), ann["a"][1].get<double>() - 12.0});
+    else
+        ann["pos"] = json::array({20.0, 20.0});
+    (*view)["annotations"].push_back(ann);
+    s.revision += 1;
+    return json{{"annotation", ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
+}
+
+json drawing_add_datum_target(const std::string& doc_id, const std::string& view_id,
+                              const json& spec) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingSession& s = require_session(doc_id);
+    json* view = find_view(s.doc, view_id);
+    if (!view)
+        throw OpError("invalid_op", "no view '" + view_id + "'", {{"reason", "unknown view"}});
+    const json& sp = spec.is_object() ? spec : json::object();
+    std::string label = sp.value("label", std::string("A1"));
+    std::string ttype = sp.value("target_type", std::string("point"));
+    json ann = {{"id", next_ann_id(*view)}, {"type", "gdt"}, {"kind", "datum_target"},
+                {"label", label}, {"target_type", ttype}, {"text", "TGT " + label}};
+    if (sp.contains("size") && sp["size"].is_string()) ann["size"] = sp["size"];
+    if (is_xy(sp.value("a", json(nullptr))))
+        ann["a"] = json::array({sp["a"][0].get<double>(), sp["a"][1].get<double>()});
+    if (is_xy(sp.value("pos", json(nullptr))))
+        ann["pos"] = json::array({sp["pos"][0].get<double>(), sp["pos"][1].get<double>()});
+    else if (ann.contains("a"))
+        ann["pos"] = json::array({ann["a"][0].get<double>() + 12.0, ann["a"][1].get<double>() + 12.0});
+    else
+        ann["pos"] = json::array({20.0, 20.0});
+    (*view)["annotations"].push_back(ann);
+    s.revision += 1;
+    return json{{"annotation", ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
+}
+
+json drawing_add_surface_finish(const std::string& doc_id, const std::string& view_id,
+                                const json& spec) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingSession& s = require_session(doc_id);
+    json* view = find_view(s.doc, view_id);
+    if (!view)
+        throw OpError("invalid_op", "no view '" + view_id + "'", {{"reason", "unknown view"}});
+    const json& sp = spec.is_object() ? spec : json::object();
+    std::string machining = sp.value("machining", std::string("any"));  // any|required|prohibited
+    json ann = {{"id", next_ann_id(*view)}, {"type", "gdt"}, {"kind", "surface_finish"},
+                {"machining", machining}, {"all_around", sp.value("all_around", false)}};
+    std::string val = sp.value("value", std::string());
+    if (val.empty() && sp.contains("ra") && sp["ra"].is_number()) {
+        char b[32];
+        std::snprintf(b, sizeof(b), "%.3g", sp["ra"].get<double>());
+        val = b;
+    }
+    if (!val.empty()) ann["value"] = val;
+    if (sp.contains("lay") && sp["lay"].is_string()) ann["lay"] = sp["lay"];
+    ann["text"] = std::string("RA ") + (val.empty() ? "" : val);
+    if (is_xy(sp.value("a", json(nullptr))))
+        ann["a"] = json::array({sp["a"][0].get<double>(), sp["a"][1].get<double>()});
+    if (is_xy(sp.value("pos", json(nullptr))))
+        ann["pos"] = json::array({sp["pos"][0].get<double>(), sp["pos"][1].get<double>()});
+    else if (ann.contains("a"))
+        ann["pos"] = json::array({ann["a"][0].get<double>() + 8.0, ann["a"][1].get<double>() + 8.0});
+    else
+        ann["pos"] = json::array({20.0, 20.0});
+    (*view)["annotations"].push_back(ann);
+    s.revision += 1;
+    return json{{"annotation", ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
+}
+
+json drawing_add_weld(const std::string& doc_id, const std::string& view_id, const json& spec) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    DrawingSession& s = require_session(doc_id);
+    json* view = find_view(s.doc, view_id);
+    if (!view)
+        throw OpError("invalid_op", "no view '" + view_id + "'", {{"reason", "unknown view"}});
+    const json& sp = spec.is_object() ? spec : json::object();
+    std::string wtype = sp.value("weld_type", std::string("fillet"));
+    json ann = {{"id", next_ann_id(*view)}, {"type", "gdt"}, {"kind", "weld_symbol"},
+                {"weld_type", wtype}, {"other_side", sp.value("other_side", false)},
+                {"all_around", sp.value("all_around", false)}};
+    if (sp.contains("size") && sp["size"].is_string()) ann["size"] = sp["size"];
+    ann["text"] = std::string("WELD ") + wtype + " " + ann.value("size", std::string());
+    if (is_xy(sp.value("a", json(nullptr))))
+        ann["a"] = json::array({sp["a"][0].get<double>(), sp["a"][1].get<double>()});
+    if (is_xy(sp.value("pos", json(nullptr))))
+        ann["pos"] = json::array({sp["pos"][0].get<double>(), sp["pos"][1].get<double>()});
+    else if (ann.contains("a"))
+        ann["pos"] = json::array({ann["a"][0].get<double>() + 16.0, ann["a"][1].get<double>()});
+    else
+        ann["pos"] = json::array({20.0, 20.0});
+    (*view)["annotations"].push_back(ann);
+    s.revision += 1;
+    return json{{"annotation", ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
+}
+
 json drawing_model_items(const std::string& doc_id, const std::string& view_id) {
     std::lock_guard<std::mutex> lk(g_mtx);
     DrawingSession& s = require_session(doc_id);
@@ -1323,6 +1569,57 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
                         } catch (const OpError&) {}
                     }
                 }
+    }
+
+    // Auto-sections: each spec entry cuts a parent view through its center along an axis, so an
+    // LLM can request a section WITHOUT knowing sheet-mm coordinates. Entry:
+    //   {"parent":"front"|<view_id>, "axis":"vertical"|"horizontal", "mode":"full"|"half",
+    //    "reverse":bool, "label":"A"}
+    if (s.contains("sections") && s["sections"].is_array() && !s["sections"].empty()) {
+        json full = drawing_get(doc_id);
+        // Map orientation + view_id -> bbox for the current ortho views.
+        auto find_parent = [&](const std::string& want, json& bbox, std::string& vid) -> bool {
+            if (!full.contains("sheets") || !full["sheets"].is_array()) return false;
+            for (const auto& sh : full["sheets"])
+                for (const auto& v : sh.value("views", json::array())) {
+                    if (v.value("type", std::string()) == "section" ||
+                        v.value("type", std::string()) == "detail")
+                        continue;
+                    std::string id = v.value("view_id", v.value("id", std::string()));
+                    std::string orient = v.value("orientation", std::string());
+                    if (want == id || want == orient) {
+                        if (v.contains("bbox") && v["bbox"].is_array() && v["bbox"].size() == 4 &&
+                            v["bbox"][0].is_number()) {
+                            bbox = v["bbox"];
+                            vid = id;
+                            return true;
+                        }
+                    }
+                }
+            return false;
+        };
+        for (const auto& sec : s["sections"]) {
+            if (!sec.is_object()) continue;
+            std::string parent = sec.value("parent", std::string("front"));
+            std::string axis = sec.value("axis", std::string("vertical"));
+            json bbox;
+            std::string vid;
+            if (!find_parent(parent, bbox, vid)) continue;
+            double x0 = bbox[0].get<double>(), y0 = bbox[1].get<double>();
+            double x1 = bbox[2].get<double>(), y1 = bbox[3].get<double>();
+            double cx = (x0 + x1) / 2.0, cy = (y0 + y1) / 2.0;
+            double pad = 0.1 * std::max(x1 - x0, y1 - y0) + 2.0;
+            json cut = (axis == "horizontal")
+                           ? json::array({json::array({x0 - pad, cy}), json::array({x1 + pad, cy})})
+                           : json::array({json::array({cx, y0 - pad}), json::array({cx, y1 + pad})});
+            json opts = {{"mode", sec.value("mode", std::string("full"))},
+                         {"reverse", sec.value("reverse", false)}};
+            try {
+                drawing_add_section(doc_id, vid, json(nullptr), cut,
+                                    sec.contains("label") ? sec["label"] : json(nullptr),
+                                    json(nullptr), json(nullptr), "s1", json(false), opts);
+            } catch (const OpError&) { /* skip a section that fails to cut */ }
+        }
     }
 
     if (s.contains("title") && s["title"].is_object())

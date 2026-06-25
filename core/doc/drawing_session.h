@@ -69,12 +69,15 @@ nlohmann::json drawing_add_view(const std::string& doc_id, const std::string& ty
                                 const nlohmann::json& show_hidden);
 
 // drawing_add_section: a SECTION view cutting the model relative to a parent view.
-// `plane` = {normal,point} (the cut_line parent-frame form is resolved here too).
+// `plane` = {normal,point} (the cut_line parent-frame form is resolved here too). `cut_line`
+// accepts a 2-point straight cut OR a multi-point (offset/jogged) polyline. `opts` carries
+// custom-section controls: {mode:"full|half", depth:(mm clip), reverse:bool}.
 nlohmann::json drawing_add_section(const std::string& doc_id, const std::string& parent_view_id,
                                    const nlohmann::json& plane, const nlohmann::json& cut_line,
                                    const nlohmann::json& label, const nlohmann::json& scale,
                                    const nlohmann::json& position, const std::string& sheet_id,
-                                   const nlohmann::json& show_hidden);
+                                   const nlohmann::json& show_hidden,
+                                   const nlohmann::json& opts = nlohmann::json::object());
 
 // drawing_add_detail: a magnified DETAIL view of a circular region of a parent view.
 nlohmann::json drawing_add_detail(const std::string& doc_id, const std::string& parent_view_id,
@@ -119,6 +122,37 @@ nlohmann::json drawing_set_annotation(const std::string& doc_id, const std::stri
 nlohmann::json drawing_add_callout(const std::string& doc_id, const std::string& view_id,
                                    const std::string& kind, const nlohmann::json& a,
                                    const nlohmann::json& opts);
+
+// --- GD&T (ASME Y14.5) annotations ---------------------------------------------
+// Each appends a structured GD&T annotation to a view (composed into vector primitives by
+// annot_draw on every drawing_get) and returns {annotation, drawing}, mirroring
+// drawing_add_callout. `spec` is a compact object so the copilot/MCP can emit it directly.
+//
+// drawing_add_gdt: a feature control frame.
+//   spec: {symbol:"position|flatness|perpendicularity|profile_surface|...",
+//          tol_value:(number|string), tol_diameter:bool, tol_modifier:"none|mmc|lmc|projected",
+//          datums:[{ref:"A", modifier:"none|mmc|lmc"}], row2:{...composite second row},
+//          a:[x,y] (feature anchor), pos:[x,y] (frame location, sheet mm)}
+nlohmann::json drawing_add_gdt(const std::string& doc_id, const std::string& view_id,
+                               const nlohmann::json& spec);
+// drawing_add_datum: a datum feature symbol (triangle + boxed letter).
+//   spec: {label:"A", a:[x,y], pos:[x,y]}
+nlohmann::json drawing_add_datum(const std::string& doc_id, const std::string& view_id,
+                                 const nlohmann::json& spec);
+// drawing_add_datum_target: a datum target (divided circle).
+//   spec: {label:"A1", target_type:"point|line|area", size:"⌀6", a:[x,y], pos:[x,y]}
+nlohmann::json drawing_add_datum_target(const std::string& doc_id, const std::string& view_id,
+                                        const nlohmann::json& spec);
+// drawing_add_surface_finish: a surface-texture symbol.
+//   spec: {value:"1.6"|ra:1.6, machining:"any|required|prohibited", all_around:bool, lay:"...",
+//          a:[x,y], pos:[x,y]}
+nlohmann::json drawing_add_surface_finish(const std::string& doc_id, const std::string& view_id,
+                                          const nlohmann::json& spec);
+// drawing_add_weld: an AWS weld symbol.
+//   spec: {weld_type:"fillet|square|vee|bevel|plug", size:"6", other_side:bool, all_around:bool,
+//          a:[x,y], pos:[x,y]}
+nlohmann::json drawing_add_weld(const std::string& doc_id, const std::string& view_id,
+                                const nlohmann::json& spec);
 
 // drawing_model_items: auto-dimension a view — overall width/height from the bbox plus a
 // diameter callout per distinct projected circle. Annotations are tagged "auto":true.

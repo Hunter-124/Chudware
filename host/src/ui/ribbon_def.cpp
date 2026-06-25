@@ -343,11 +343,24 @@ static const RibbonCmd kCmds[] = {
     { "dwg_fit",          "Fit",           "zoom_fit",      "View Layout", "Sheet", false, nullptr, false },
     { "dwg_export_dxf",   "Export DXF",    "section_props", "View Layout", "Sheet", false, nullptr, false },
     { "dwg_export_pdf",   "Export PDF",    "save",          "View Layout", "Sheet", false, nullptr, false },
+    // --- Group: Section --- custom-section controls applied by the Section tool.
+    { "dwg_section_half",   "Half Section",  "section_view",  "View Layout", "Section", false, nullptr, false },
+    { "dwg_section_reverse","Flip Side",     "orientation",   "View Layout", "Section", false, nullptr, false },
+    // --- Group: Scale --- rescale the selected view.
+    { "dwg_scale_1_1",    "1:1",           "zoom_fit",      "View Layout", "Scale", false, nullptr, false },
+    { "dwg_scale_1_2",    "1:2",           "zoom_area",     "View Layout", "Scale", false, nullptr, false },
+    { "dwg_scale_2_1",    "2:1",           "zoom_area",     "View Layout", "Scale", false, nullptr, false },
 
     // --- Tab: Annotation ----------------------------------------------------
     { "dwg_smart_dim",    "Smart Dim",     "smart_dim",     "Annotation", "Dimensions", true,  nullptr, false },
     { "dwg_model_items",  "Model Items",   "relations",     "Annotation", "Dimensions", true,  nullptr, false },
     { "dwg_hole_callout", "Hole Callout",  "hole_wizard",   "Annotation", "Dimensions", true,  nullptr, false },
+    // --- Group: GD&T --- ASME Y14.5 geometric tolerancing.
+    { "dwg_gdt",          "Geo Tol",       "smart_dim",     "Annotation", "GD&T", true,  nullptr, false },
+    { "dwg_datum",        "Datum",         "point",         "Annotation", "GD&T", false, nullptr, false },
+    { "dwg_datum_target", "Datum Tgt",     "point",         "Annotation", "GD&T", false, nullptr, false },
+    { "dwg_surface_finish","Surf Finish",  "construction",  "Annotation", "GD&T", false, nullptr, false },
+    { "dwg_weld",         "Weld",          "relations",     "Annotation", "GD&T", false, nullptr, false },
     // --- Group: Annotations --- marks, lines, notes, balloons.
     { "dwg_center_mark",  "Center Mark",   "point",         "Annotation", "Annotations", true,  nullptr, false },
     { "dwg_center_line",  "Center Line",   "construction",  "Annotation", "Annotations", true,  nullptr, false },

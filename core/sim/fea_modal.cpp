@@ -1,6 +1,6 @@
 // Modal FEA solver implementation — see fea_modal.h.
 //
-// Reuses the static solver's tet4 stiffness; adds the diagonal-lumped mass matrix and a
+// Reuses the static solver's tet4 stiffness; adds the CONSISTENT tet4 mass matrix and a
 // shift-invert generalized eigensolve. The eigenvalue->frequency conversion + the
 // unit-max mode-shape normalization mirror engine/sim/fea_modal.py exactly.
 
@@ -92,10 +92,15 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
         if (!fixed[d]) reduced[d] = n_free++;
     if (n_free < 3) { res.error = "fea_modal: too few free DOFs"; return res; }
 
-    // Reduced free-free K + diagonal-lumped M.
+    // Reduced free-free K + CONSISTENT M (tet4). A consistent mass matrix (vs the old
+    // diagonal-lumped one) restores the near-degenerate first bending PAIR on a square
+    // cross-section and removes the systematic low-frequency bias a lumped mass introduces
+    // on a coarse, non-symmetric tet mesh (Bug N-1). The tet4 consistent mass block for a
+    // node pair (a,b) is rho*V/20 * (1 + delta_ab) * I3 (the classic 4-node simplex mass).
     std::vector<Eigen::Triplet<double>> trips;
     trips.reserve(static_cast<std::size_t>(n_tets) * 144);
-    Eigen::VectorXd mdiag = Eigen::VectorXd::Zero(n_free);
+    std::vector<Eigen::Triplet<double>> mtrips;
+    mtrips.reserve(static_cast<std::size_t>(n_tets) * 48);
     for (int e = 0; e < n_tets; ++e) {
         std::array<Eigen::Vector3d, 4> ep;
         std::array<int, 4> tn;
@@ -116,24 +121,26 @@ FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vec
                 trips.emplace_back(ra, rb, Ke(a, b));
             }
         }
-        double m_per_node = density * vol / 4.0;
-        for (int j = 0; j < 4; ++j)
-            for (int k = 0; k < 3; ++k) {
-                int rd = reduced[tn[j] * 3 + k];
-                if (rd >= 0) mdiag(rd) += m_per_node;
+        // Consistent mass: block(a,b) = rho*V/20 * (2 if a==b else 1) on each of the 3
+        // translational DOFs (the mass couples only same-direction DOFs).
+        const double m0 = density * vol / 20.0;
+        for (int a = 0; a < 4; ++a)
+            for (int b = 0; b < 4; ++b) {
+                const double coef = m0 * (a == b ? 2.0 : 1.0);
+                for (int k = 0; k < 3; ++k) {
+                    int ra = reduced[tn[a] * 3 + k];
+                    int rb = reduced[tn[b] * 3 + k];
+                    if (ra < 0 || rb < 0) continue;
+                    mtrips.emplace_back(ra, rb, coef);
+                }
             }
     }
     Eigen::SparseMatrix<double> Kff(n_free, n_free);
     Kff.setFromTriplets(trips.begin(), trips.end());
     Kff.makeCompressed();
     Eigen::SparseMatrix<double> Mff(n_free, n_free);
-    {
-        std::vector<Eigen::Triplet<double>> mt;
-        mt.reserve(n_free);
-        for (int i = 0; i < n_free; ++i) mt.emplace_back(i, i, mdiag(i));
-        Mff.setFromTriplets(mt.begin(), mt.end());
-        Mff.makeCompressed();
-    }
+    Mff.setFromTriplets(mtrips.begin(), mtrips.end());
+    Mff.makeCompressed();
 
     // Shift-invert generalized eigensolve at sigma=0 for the lowest modes.
     int k_req = std::min(n_modes, n_free - 2);

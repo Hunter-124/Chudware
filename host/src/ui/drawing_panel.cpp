@@ -6,11 +6,13 @@
 // pxPerMm + screen pan), then stroke the polylines with ImDrawList. We add a paper border, a faint
 // drop shadow, per-view bounding boxes + labels, and a small "Rebuild" / fit affordance.
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -254,21 +256,27 @@ static void deleteAnnotation(AppState& st, AppState::DocTab& tab, const std::str
 }
 
 // W15: push a finished cutting line to the engine (drawing_add_section{cut_line}) + refresh.
+// `pts` is the (possibly jogged/offset) cut-line polyline in sheet mm; mode/reverse carry the
+// custom-section controls (full|half + which side is removed).
 static void commitSection(AppState& st, AppState::DocTab& tab, const std::string& parentViewId,
-                          float ax, float ay, float bx, float by) {
+                          const std::vector<std::array<float, 2>>& pts, const std::string& mode,
+                          bool reverse) {
+    if (pts.size() < 2) return;
+    nlohmann::json cut = nlohmann::json::array();
+    for (const auto& p : pts) cut.push_back(nlohmann::json::array({p[0], p[1]}));
     nlohmann::json res;
     std::string err;
     nlohmann::json params = {
         {"doc_id", tab.drawingDocId},
         {"parent_view_id", parentViewId},
-        {"cut_line", nlohmann::json::array({nlohmann::json::array({ax, ay}),
-                                            nlohmann::json::array({bx, by})})},
+        {"cut_line", cut},
+        {"opts", nlohmann::json{{"mode", mode}, {"reverse", reverse}}},
     };
     if (st.worker.call("drawing_add_section", params, res, err) && res.is_object() &&
         !res.contains("code")) {
         st.refreshDrawingTab(st.activeTab);
         st.markDrawingTabDirty(st.activeTab);
-        st.addLog("[draw] added section on " + parentViewId);
+        st.addLog("[draw] added " + mode + " section on " + parentViewId);
         tab.drawNeedFit = true;   // frame the new section view
     } else {
         std::string msg = res.is_object() && res.contains("message") ? djstr(res, "message") : err;
@@ -393,6 +401,7 @@ static void disarmDrawTools(AppState::DocTab& tab) {
     tab.modelItemsActive = false; tab.holeCalloutActive = false;
     tab.centerMarkActive = false; tab.noteActive = false; tab.balloonActive = false;
     tab.centerLineActive = false; tab.centerLineStage = 0;
+    tab.gdtToolActive = false; tab.gdtStage = 0; tab.gdtKind.clear(); tab.sectionPts.clear();
     tab.selAnnViewId.clear(); tab.selAnnId.clear();
 }
 
@@ -400,7 +409,76 @@ static void disarmDrawTools(AppState::DocTab& tab) {
 static bool anyDrawToolActive(const AppState::DocTab& tab) {
     return tab.dimToolActive || tab.sectionToolActive || tab.detailToolActive ||
            tab.modelItemsActive || tab.holeCalloutActive || tab.centerMarkActive ||
-           tab.noteActive || tab.balloonActive || tab.centerLineActive;
+           tab.noteActive || tab.balloonActive || tab.centerLineActive || tab.gdtToolActive;
+}
+
+// Commit a GD&T element (drawing_add_gdt/datum/datum_target/surface_finish/weld) + absorb.
+static void commitGdt(AppState& st, AppState::DocTab& tab, const std::string& viewId,
+                      const nlohmann::json& spec) {
+    static const std::map<std::string, std::string> method = {
+        {"gdt_frame", "drawing_add_gdt"},          {"datum_feature", "drawing_add_datum"},
+        {"datum_target", "drawing_add_datum_target"}, {"surface_finish", "drawing_add_surface_finish"},
+        {"weld_symbol", "drawing_add_weld"}};
+    auto it = method.find(tab.gdtKind);
+    if (it == method.end()) return;
+    nlohmann::json res;
+    nlohmann::json params = {{"doc_id", tab.drawingDocId}, {"view_id", viewId}, {"spec", spec}};
+    if (drawCall(st, it->second.c_str(), params, res, "GD&T")) {
+        absorbDrawingResult(st, tab, res);
+        st.addLog("[draw] added " + tab.gdtKind + " on " + viewId);
+    }
+}
+
+// Move a view to a new sheet position (drawing_set_view {position}) — position-only, so the
+// engine re-projects nothing; cheap + smooth. Absorbs the returned drawing.
+static void commitViewMove(AppState& st, AppState::DocTab& tab, const std::string& viewId,
+                           double px, double py) {
+    nlohmann::json res;
+    nlohmann::json params = {{"doc_id", tab.drawingDocId}, {"view_id", viewId},
+                             {"position", nlohmann::json::array({px, py})}};
+    if (!drawCall(st, "drawing_set_view", params, res, "Move view")) return;
+    st.markDrawingTabDirty(st.activeTab);
+    // Splice ONLY the moved view's returned geometry into the cache — no full drawing_get
+    // (which would re-HLR every view). Parent-view markers (section/detail) the moved view
+    // owns are recomputed on the next Rebuild; the move itself is instant.
+    if (res.contains("view") && res["view"].is_object() && tab.drawingDoc.contains("sheets") &&
+        tab.drawingDoc["sheets"].is_array()) {
+        const std::string rid = res["view"].value("view_id", viewId);
+        for (auto& sh : tab.drawingDoc["sheets"]) {
+            if (!sh.contains("views") || !sh["views"].is_array()) continue;
+            for (auto& vv : sh["views"]) {
+                std::string vid = vv.value("view_id", vv.value("id", std::string()));
+                if (vid == rid) { vv = res["view"]; break; }
+            }
+        }
+    } else {
+        st.refreshDrawingTab(st.activeTab);
+    }
+    st.addLog("[draw] moved view " + viewId);
+}
+
+// Remove a view (drawing_remove_view) + refresh.
+static void removeView(AppState& st, AppState::DocTab& tab, const std::string& viewId) {
+    nlohmann::json res;
+    nlohmann::json params = {{"doc_id", tab.drawingDocId}, {"view_id", viewId}};
+    if (drawCall(st, "drawing_remove_view", params, res, "Delete view")) {
+        st.refreshDrawingTab(st.activeTab);
+        st.markDrawingTabDirty(st.activeTab);
+        tab.selViewId.clear();
+        st.addLog("[draw] removed view " + viewId);
+    }
+}
+
+// Set a view's scale (drawing_set_view {scale}) — re-projects this view at the new scale.
+static void commitViewScale(AppState& st, AppState::DocTab& tab, const std::string& viewId,
+                            double scale) {
+    nlohmann::json res;
+    nlohmann::json params = {{"doc_id", tab.drawingDocId}, {"view_id", viewId}, {"scale", scale}};
+    if (drawCall(st, "drawing_set_view", params, res, "Scale view")) {
+        st.refreshDrawingTab(st.activeTab);
+        st.markDrawingTabDirty(st.activeTab);
+        st.addLog("[draw] scaled view " + viewId);
+    }
 }
 
 static void addStdView(AppState& st, AppState::DocTab& tab, const char* type, const char* orient,
@@ -522,6 +600,41 @@ bool drawingHandleCommand(AppState& st, const std::string& cmd) {
         if (tab.bomVisible && !tab.bomFetched) fetchBom(st, tab);
         return true;
     }
+
+    // --- GD&T tools (Annotation tab) ---
+    auto armGdt = [&](const char* kind) {
+        disarmDrawTools(tab);
+        tab.gdtToolActive = true; tab.gdtKind = kind; tab.gdtStage = 0;
+        tab.gdtSpec = nlohmann::json::object();
+        st.toast(ui::ToastLevel::Info, "Click the feature, then click to place");
+    };
+    if (cmd == "dwg_gdt")            { armGdt("gdt_frame"); return true; }
+    if (cmd == "dwg_datum")          { armGdt("datum_feature"); return true; }
+    if (cmd == "dwg_datum_target")   { armGdt("datum_target"); return true; }
+    if (cmd == "dwg_surface_finish") { armGdt("surface_finish"); return true; }
+    if (cmd == "dwg_weld")           { armGdt("weld_symbol"); return true; }
+
+    // --- Custom-section controls (View Layout tab) ---
+    if (cmd == "dwg_section_half") {
+        tab.sectionMode = (tab.sectionMode == "half") ? "full" : "half";
+        st.toast(ui::ToastLevel::Info, std::string("Section mode: ") + tab.sectionMode);
+        return true;
+    }
+    if (cmd == "dwg_section_reverse") {
+        tab.sectionReverse = !tab.sectionReverse;
+        st.toast(ui::ToastLevel::Info, tab.sectionReverse ? "Section: reversed side"
+                                                          : "Section: normal side");
+        return true;
+    }
+
+    // --- Scale the selected view (View Layout tab) ---
+    auto setScale = [&](double sc) {
+        if (tab.selViewId.empty()) { st.toast(ui::ToastLevel::Warn, "Select a view first"); return; }
+        commitViewScale(st, tab, tab.selViewId, sc);
+    };
+    if (cmd == "dwg_scale_1_1") { setScale(1.0); return true; }
+    if (cmd == "dwg_scale_1_2") { setScale(0.5); return true; }
+    if (cmd == "dwg_scale_2_1") { setScale(2.0); return true; }
     return false;
 }
 
@@ -702,6 +815,90 @@ static void renderDimension(ImDrawList* dl, const nlohmann::json& ann, bool ips,
     criticalFlag(ImVec2(tp.x, tp.y));
 }
 
+// Render an annotation from the engine-compiled `draw` primitive block (segments / dashed /
+// arcs / tris / texts in sheet mm). This is the ONE rendering path for dimensions, callouts,
+// AND every GD&T element — the same primitives the DXF/PDF export and PNG raster consume, so
+// the on-screen sheet matches the deliverables exactly. `z` is px-per-mm (paper space).
+static void renderDrawPrimitives(ImDrawList* dl, const nlohmann::json& ann,
+                                 const std::function<ImVec2(double, double)>& toScreen, float z,
+                                 float s, bool selected) {
+    auto it = ann.find("draw");
+    if (it == ann.end() || !it->is_object()) return;
+    const nlohmann::json& d = *it;
+    const bool critical = ann.value("critical", false);
+    const ImU32 col = critical ? IM_COL32(200, 40, 40, 255)
+                    : selected  ? IM_COL32(220, 120, 30, 255)
+                                : IM_COL32(40, 90, 180, 255);
+    const float thick = std::max(1.0f, (critical ? 1.6f : 1.0f) * s);
+
+    auto strokePoly = [&](const nlohmann::json& pl, bool dashed) {
+        if (!pl.is_array() || pl.size() < 2) return;
+        std::vector<ImVec2> pts;
+        pts.reserve(pl.size());
+        for (const auto& p : pl)
+            if (p.is_array() && p.size() == 2 && p[0].is_number() && p[1].is_number())
+                pts.push_back(toScreen(p[0].get<double>(), p[1].get<double>()));
+        if (pts.size() < 2) return;
+        if (dashed) addDashedPolyline(dl, pts, col, thick, 6.0f * s, 3.0f * s);
+        else dl->AddPolyline(pts.data(), (int)pts.size(), col, 0, thick);
+    };
+    if (d.contains("segments") && d["segments"].is_array())
+        for (const auto& pl : d["segments"]) strokePoly(pl, false);
+    if (d.contains("dashed") && d["dashed"].is_array())
+        for (const auto& pl : d["dashed"]) strokePoly(pl, true);
+    // Arcs — sample to screen points (toScreen flips Y, so sampling is orientation-safe).
+    if (d.contains("arcs") && d["arcs"].is_array())
+        for (const auto& a : d["arcs"]) {
+            if (!a.is_object() || !a.contains("center")) continue;
+            double cx = a["center"][0].get<double>(), cy = a["center"][1].get<double>();
+            double r = djnum(a, "radius", 0.0);
+            double a0 = djnum(a, "a0", 0.0), a1 = djnum(a, "a1", 6.28318530718);
+            if (r <= 0.0) continue;
+            int n = std::max(10, (int)(std::fabs(a1 - a0) / 0.3));
+            std::vector<ImVec2> pts;
+            pts.reserve(n + 1);
+            for (int i = 0; i <= n; ++i) {
+                double t = a0 + (a1 - a0) * (double)i / (double)n;
+                pts.push_back(toScreen(cx + r * std::cos(t), cy + r * std::sin(t)));
+            }
+            dl->AddPolyline(pts.data(), (int)pts.size(), col, 0, thick);
+        }
+    // Filled triangles (arrowheads / datum triangles).
+    if (d.contains("tris") && d["tris"].is_array())
+        for (const auto& t : d["tris"]) {
+            if (!t.is_array() || t.size() != 3) continue;
+            dl->AddTriangleFilled(toScreen(t[0][0].get<double>(), t[0][1].get<double>()),
+                                  toScreen(t[1][0].get<double>(), t[1][1].get<double>()),
+                                  toScreen(t[2][0].get<double>(), t[2][1].get<double>()), col);
+        }
+    // Text runs — paper-space height (mm) scaled to px by the live zoom.
+    if (d.contains("texts") && d["texts"].is_array()) {
+        ImFont* font = ImGui::GetFont();
+        const float baseSz = ImGui::GetFontSize();
+        for (const auto& t : d["texts"]) {
+            if (!t.is_object() || !t.contains("pos")) continue;
+            std::string txt = djstr(t, "text");
+            if (txt.empty()) continue;
+            double h = djnum(t, "h", 3.5);
+            float fpx = std::max(8.0f, (float)h * z);
+            ImVec2 anchor = toScreen(t["pos"][0].get<double>(), t["pos"][1].get<double>());
+            ImVec2 ts = ImGui::CalcTextSize(txt.c_str());
+            float scaleF = fpx / baseSz;
+            float w = ts.x * scaleF;
+            std::string align = djstr(t, "align"), valign = djstr(t, "valign");
+            float tx = anchor.x, ty = anchor.y;
+            if (align == "center") tx -= w * 0.5f;
+            else if (align == "right") tx -= w;
+            if (valign == "base") ty -= fpx;
+            else if (valign == "mid") ty -= fpx * 0.5f;
+            // a faint white pad behind the glyphs for legibility over geometry
+            dl->AddRectFilled(ImVec2(tx - 1, ty), ImVec2(tx + w + 1, ty + fpx),
+                              IM_COL32(255, 255, 255, 200), 1.0f);
+            dl->AddText(font, fpx, ImVec2(tx, ty), col, txt.c_str());
+        }
+    }
+}
+
 // --- W17: editor / drag interaction state (only the active Drawing tab interacts) -------------
 static bool s_annEditOpen = false;     // request to open the dimension editor popup this frame
 static bool s_annEditLoaded = false;   // editor scratch has been loaded from the selected ann
@@ -863,6 +1060,121 @@ static void renderDimEditorPopup(AppState& st, AppState::DocTab& tab, const nloh
 }
 
 // The title-block / sheet-properties editor popup (opened from the View Layout ribbon).
+// GD&T editor popup — opened after the user places a feature control frame / datum target /
+// surface finish / weld symbol. Adapts its fields to tab.gdtKind, then commits the full spec
+// (with the placement's a/pos) via the matching drawing_add_* RPC.
+static void renderGdtEditorPopup(AppState& st, AppState::DocTab& tab) {
+    static const char* kSyms[] = {"position",     "flatness",        "perpendicularity",
+                                  "parallelism",  "angularity",      "concentricity",
+                                  "symmetry",     "profile_surface", "profile_line",
+                                  "circularity",  "cylindricity",    "straightness",
+                                  "circular_runout", "total_runout"};
+    static const char* kMods[] = {"none", "mmc", "lmc", "projected"};
+    static int  symIdx = 0, modIdx = 0;
+    static bool dia = true;
+    static char tolBuf[32] = "0.1";
+    static char datA[8] = "A", datB[8] = "", datC[8] = "";
+    static char sfRa[16] = "1.6";
+    static int  sfMach = 0;  // any|required|prohibited
+    static bool sfAll = false;
+    static int  weldType = 0;  // fillet|square|vee|bevel|plug
+    static char weldSize[16] = "6";
+    static bool weldOther = false, weldAll = false;
+    static char dtLabel[8] = "A1", dtSize[16] = "";
+    static int  dtType = 0;  // point|line|area
+
+    if (tab.gdtEditorOpen) {
+        ImGui::OpenPopup("GD&T##gdtedit");
+        tab.gdtEditorOpen = false;
+    }
+    ImGui::SetNextWindowSize(ImVec2(340 * ui::uiScale, 0), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopup("GD&T##gdtedit")) return;
+
+    const std::string& k = tab.gdtKind;
+    bool commit = false;
+    nlohmann::json spec = tab.gdtSpec.is_object() ? tab.gdtSpec : nlohmann::json::object();
+
+    if (k == "gdt_frame") {
+        ImGui::TextUnformatted("Feature Control Frame");
+        ImGui::SetNextItemWidth(180 * ui::uiScale);
+        ImGui::Combo("Characteristic", &symIdx, kSyms, IM_ARRAYSIZE(kSyms));
+        ImGui::Checkbox("Diameter zone", &dia);
+        ImGui::SetNextItemWidth(120 * ui::uiScale);
+        ImGui::InputText("Tolerance", tolBuf, sizeof(tolBuf));
+        ImGui::SetNextItemWidth(120 * ui::uiScale);
+        ImGui::Combo("Modifier", &modIdx, kMods, IM_ARRAYSIZE(kMods));
+        ImGui::Separator();
+        ImGui::TextUnformatted("Datum references");
+        ImGui::SetNextItemWidth(60 * ui::uiScale); ImGui::InputText("Primary", datA, sizeof(datA));
+        ImGui::SetNextItemWidth(60 * ui::uiScale); ImGui::InputText("Secondary", datB, sizeof(datB));
+        ImGui::SetNextItemWidth(60 * ui::uiScale); ImGui::InputText("Tertiary", datC, sizeof(datC));
+        if (ImGui::Button("Place", ImVec2(120 * ui::uiScale, 0))) {
+            spec["symbol"] = kSyms[symIdx];
+            spec["tol_value"] = std::string(tolBuf);
+            spec["tol_diameter"] = dia;
+            spec["tol_modifier"] = kMods[modIdx];
+            nlohmann::json datums = nlohmann::json::array();
+            for (const char* d : {datA, datB, datC})
+                if (d[0]) datums.push_back(nlohmann::json{{"ref", std::string(d)}});
+            spec["datums"] = datums;
+            commit = true;
+        }
+    } else if (k == "surface_finish") {
+        static const char* kMach[] = {"any", "required", "prohibited"};
+        ImGui::TextUnformatted("Surface Finish");
+        ImGui::SetNextItemWidth(100 * ui::uiScale); ImGui::InputText("Ra", sfRa, sizeof(sfRa));
+        ImGui::SetNextItemWidth(140 * ui::uiScale);
+        ImGui::Combo("Machining", &sfMach, kMach, IM_ARRAYSIZE(kMach));
+        ImGui::Checkbox("All around", &sfAll);
+        if (ImGui::Button("Place", ImVec2(120 * ui::uiScale, 0))) {
+            spec["value"] = std::string(sfRa);
+            spec["machining"] = kMach[sfMach];
+            spec["all_around"] = sfAll;
+            commit = true;
+        }
+    } else if (k == "weld_symbol") {
+        static const char* kWeld[] = {"fillet", "square", "vee", "bevel", "plug"};
+        ImGui::TextUnformatted("Weld Symbol");
+        ImGui::SetNextItemWidth(140 * ui::uiScale);
+        ImGui::Combo("Type", &weldType, kWeld, IM_ARRAYSIZE(kWeld));
+        ImGui::SetNextItemWidth(100 * ui::uiScale); ImGui::InputText("Size", weldSize, sizeof(weldSize));
+        ImGui::Checkbox("Other side", &weldOther);
+        ImGui::SameLine();
+        ImGui::Checkbox("All around", &weldAll);
+        if (ImGui::Button("Place", ImVec2(120 * ui::uiScale, 0))) {
+            spec["weld_type"] = kWeld[weldType];
+            spec["size"] = std::string(weldSize);
+            spec["other_side"] = weldOther;
+            spec["all_around"] = weldAll;
+            commit = true;
+        }
+    } else if (k == "datum_target") {
+        static const char* kT[] = {"point", "line", "area"};
+        ImGui::TextUnformatted("Datum Target");
+        ImGui::SetNextItemWidth(80 * ui::uiScale); ImGui::InputText("Label", dtLabel, sizeof(dtLabel));
+        ImGui::SetNextItemWidth(120 * ui::uiScale);
+        ImGui::Combo("Type", &dtType, kT, IM_ARRAYSIZE(kT));
+        ImGui::SetNextItemWidth(100 * ui::uiScale); ImGui::InputText("Size", dtSize, sizeof(dtSize));
+        if (ImGui::Button("Place", ImVec2(120 * ui::uiScale, 0))) {
+            spec["label"] = std::string(dtLabel);
+            spec["target_type"] = kT[dtType];
+            if (dtSize[0]) spec["size"] = std::string(dtSize);
+            commit = true;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(100 * ui::uiScale, 0))) {
+        tab.gdtSpec = nlohmann::json::object();
+        ImGui::CloseCurrentPopup();
+    }
+    if (commit) {
+        commitGdt(st, tab, tab.gdtViewId, spec);
+        tab.gdtSpec = nlohmann::json::object();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 static void renderTitleBlockPopup(AppState& st, AppState::DocTab& tab, const nlohmann::json& sheet) {
     static char tbTitle[96] = {0}, tbDrawn[48] = {0}, tbDate[32] = {0}, tbMatl[48] = {0},
                 tbFinish[48] = {0}, tbRev[16] = {0}, tbScale[16] = {0}, tbSheetNo[16] = {0},
@@ -1310,7 +1622,12 @@ void drawDrawingSheet(AppState& st) {
             for (const auto& ann : v["annotations"]) {
                 if (!ann.is_object()) continue;
                 bool sel = (tab.selAnnViewId == vid && tab.selAnnId == djstr(ann, "id"));
-                renderDimension(dl, ann, st.ips(), toScreen, s, sel);
+                // Prefer the engine-compiled primitive block (covers dims + all GD&T); fall
+                // back to the legacy host renderer if an older drawing lacks `draw`.
+                if (ann.contains("draw") && ann["draw"].is_object())
+                    renderDrawPrimitives(dl, ann, toScreen, z, s, sel);
+                else
+                    renderDimension(dl, ann, st.ips(), toScreen, s, sel);
             }
         }
     }
@@ -1328,27 +1645,36 @@ void drawDrawingSheet(AppState& st) {
         double curMy = -(mouse.y - canvasMin.y - panY) / z;
         double snapRadiusMm = 9.0 / std::max(z, 1e-4f);   // ~9 px snap radius -> sheet mm
 
-        // ---- W15: Section View tool (drop a 2-click cutting line across a parent view) ----
+        // ---- Section View tool: click a start on a parent view, click more points for a
+        // jogged/offset cut line, then DOUBLE-CLICK (or Enter) to finish. Straight section =
+        // just two clicks then finish. Mode (full/half) + reverse come from the ribbon. ----
         if (tab.sectionToolActive && overCanvas) {
             std::string overView = viewAtPoint(*sheet, curMx, curMy, 8.0);
-            // Rubber-band preview of the cutting line.
-            if (tab.sectionStage == 1) {
-                ImVec2 a = toScreen(tab.sectionAx, tab.sectionAy);
-                addDashedPolyline(dl, {a, mouse}, IM_COL32(190, 60, 50, 200), 1.4f * s,
-                                  10.0f * s, 4.0f * s);
+            // Rubber-band preview of the cut-line so far + the segment to the cursor.
+            if (!tab.sectionPts.empty()) {
+                std::vector<ImVec2> chain;
+                for (auto& p : tab.sectionPts) chain.push_back(toScreen(p[0], p[1]));
+                chain.push_back(mouse);
+                addDashedPolyline(dl, chain, IM_COL32(190, 60, 50, 220), 1.4f * s, 10.0f * s,
+                                  4.0f * s);
             }
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
-                if (tab.sectionStage == 0) {
+            bool dbl = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+            bool finish = dbl || ImGui::IsKeyPressed(ImGuiKey_Enter);
+            if (finish && tab.sectionPts.size() >= 2) {
+                commitSection(st, tab, tab.sectionViewId, tab.sectionPts, tab.sectionMode,
+                              tab.sectionReverse);
+                tab.sectionPts.clear(); tab.sectionStage = 0; tab.sectionViewId.clear();
+            } else if (!dbl && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
+                if (tab.sectionPts.empty()) {
                     if (!overView.empty()) {
-                        tab.sectionAx = (float)curMx; tab.sectionAy = (float)curMy;
-                        tab.sectionViewId = overView; tab.sectionStage = 1;
+                        tab.sectionViewId = overView;
+                        tab.sectionPts.push_back({(float)curMx, (float)curMy});
+                        tab.sectionStage = 1;
                     } else {
                         st.toast(ui::ToastLevel::Warn, "Start the cutting line on a view");
                     }
-                } else if (tab.sectionStage == 1) {
-                    commitSection(st, tab, tab.sectionViewId, tab.sectionAx, tab.sectionAy,
-                                  (float)curMx, (float)curMy);
-                    tab.sectionStage = 0; tab.sectionViewId.clear();
+                } else {
+                    tab.sectionPts.push_back({(float)curMx, (float)curMy});
                 }
             }
         }
@@ -1501,6 +1827,42 @@ void drawDrawingSheet(AppState& st) {
                 tab.noteActive = false; tab.balloonActive = false;
             }
         }
+        // ---- GD&T tool — click the feature (anchor), click again to drop the frame/symbol ----
+        else if (tab.gdtToolActive && overCanvas) {
+            double sx, sy; std::string svid;
+            bool snapped = snapToVertex(*sheet, curMx, curMy, snapRadiusMm, sx, sy, svid);
+            if (snapped && tab.gdtStage == 0) {
+                ImVec2 sp = toScreen(sx, sy);
+                dl->AddCircle(sp, 5.0f * s, IM_COL32(30, 140, 80, 255), 12, 1.6f * s);
+            }
+            if (tab.gdtStage == 1) {
+                ImVec2 a = toScreen(tab.gdtAx, tab.gdtAy);
+                dl->AddLine(a, mouse, IM_COL32(30, 140, 80, 180), 1.2f * s);
+            }
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
+                if (tab.gdtStage == 0) {
+                    double ax = snapped ? sx : curMx, ay = snapped ? sy : curMy;
+                    std::string vv = !svid.empty() ? svid : viewAtPoint(*sheet, curMx, curMy, 12.0);
+                    if (vv.empty()) {
+                        st.toast(ui::ToastLevel::Warn, "Click a feature on a view");
+                    } else {
+                        tab.gdtAx = (float)ax; tab.gdtAy = (float)ay;
+                        tab.gdtViewId = vv; tab.gdtStage = 1;
+                    }
+                } else {
+                    tab.gdtSpec = nlohmann::json{
+                        {"a", nlohmann::json::array({tab.gdtAx, tab.gdtAy})},
+                        {"pos", nlohmann::json::array({curMx, curMy})}};
+                    tab.gdtToolActive = false; tab.gdtStage = 0;
+                    if (tab.gdtKind == "datum_feature") {
+                        // No extra fields needed — commit straight away (engine auto-labels).
+                        commitGdt(st, tab, tab.gdtViewId, tab.gdtSpec);
+                    } else {
+                        tab.gdtEditorOpen = true;  // open the GD&T editor to fill the details
+                    }
+                }
+            }
+        }
         // ---- selection + double-click-to-edit + drag-to-reposition (no tool armed) ----
         else if (!anyDrawToolActive(tab) && overCanvas) {
             // Nearest stored annotation's text position to the cursor (sheet-mm pick radius).
@@ -1536,6 +1898,59 @@ void drawDrawingSheet(AppState& st) {
                 std::string hv, ha; double hx = 0, hy = 0;
                 pickAnn(curMx, curMy, hv, ha, hx, hy);
                 tab.selAnnViewId = hv; tab.selAnnId = ha;   // empty clears the selection
+                // No annotation under the cursor -> select the VIEW for move/scale/delete.
+                if (ha.empty()) tab.selViewId = viewAtPoint(*sheet, curMx, curMy, 4.0);
+            }
+            // ---- view move: drag the selected view; ghost-rect preview, commit on release --
+            if (!tab.selViewId.empty() && tab.selAnnId.empty() && !s_annDragActive && !spaceDown) {
+                // find the selected view's position + bbox in the cache
+                const nlohmann::json* sv = nullptr;
+                for (const auto& v : (*sheet)["views"]) {
+                    if (!v.is_object()) continue;
+                    std::string vid = djstr(v, "view_id").empty() ? djstr(v, "id")
+                                                                   : djstr(v, "view_id");
+                    if (vid == tab.selViewId) { sv = &v; break; }
+                }
+                if (sv && sv->contains("bbox") && (*sv)["bbox"].is_array() &&
+                    (*sv)["bbox"].size() == 4 && (*sv)["bbox"][0].is_number()) {
+                    double bx0 = (*sv)["bbox"][0].get<double>(), by0 = (*sv)["bbox"][1].get<double>();
+                    double bx1 = (*sv)["bbox"][2].get<double>(), by1 = (*sv)["bbox"][3].get<double>();
+                    // persistent selection highlight
+                    ImVec2 hl0 = toScreen(bx0, by1), hl1 = toScreen(bx1, by0);
+                    dl->AddRect(ImVec2(hl0.x - 3, hl0.y - 3), ImVec2(hl1.x + 3, hl1.y + 3),
+                                IM_COL32(40, 120, 220, tab.viewDragActive ? 120 : 200), 2.0f, 0,
+                                1.4f * s);
+                    if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                        if (!tab.viewDragActive) {
+                            ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+                            ImVec2 press(mouse.x - dd.x, mouse.y - dd.y);
+                            if (press.x >= hl0.x - 4 && press.x <= hl1.x + 4 &&
+                                press.y >= hl0.y - 4 && press.y <= hl1.y + 4) {
+                                tab.viewDragActive = true;
+                            }
+                        }
+                        if (tab.viewDragActive) {
+                            ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+                            // ghost rect at the dragged offset
+                            ImVec2 g0(hl0.x + dd.x, hl0.y + dd.y), g1(hl1.x + dd.x, hl1.y + dd.y);
+                            dl->AddRect(g0, g1, IM_COL32(40, 120, 220, 230), 2.0f, 0, 1.6f * s);
+                            tab.viewDragDX = dd.x / z;       // sheet-mm offset
+                            tab.viewDragDY = -dd.y / z;
+                        }
+                    }
+                    if (tab.viewDragActive && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                        double px = djnum(*sv, "position", 0.0);  // (overwritten below)
+                        double cury = 0;
+                        if (sv->contains("position") && (*sv)["position"].is_array() &&
+                            (*sv)["position"].size() == 2) {
+                            px = (*sv)["position"][0].get<double>();
+                            cury = (*sv)["position"][1].get<double>();
+                        }
+                        commitViewMove(st, tab, tab.selViewId, px + tab.viewDragDX,
+                                       cury + tab.viewDragDY);
+                        tab.viewDragActive = false; tab.viewDragDX = tab.viewDragDY = 0;
+                    }
+                }
             }
             // Drag the selected annotation's text to reposition it (commit on release).
             if (!tab.selAnnId.empty() && !spaceDown) {
@@ -1580,10 +1995,13 @@ void drawDrawingSheet(AppState& st) {
             }
         }
 
-        // Delete the selected annotation.
-        if (!anyDrawToolActive(tab) && !tab.selAnnId.empty() &&
+        // Delete the selected annotation, else the selected view.
+        if (!anyDrawToolActive(tab) &&
             (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
-            deleteAnnotation(st, tab, tab.selAnnViewId, tab.selAnnId);
+            if (!tab.selAnnId.empty())
+                deleteAnnotation(st, tab, tab.selAnnViewId, tab.selAnnId);
+            else if (!tab.selViewId.empty())
+                removeView(st, tab, tab.selViewId);
         }
     }
 
@@ -1660,6 +2078,7 @@ void drawDrawingSheet(AppState& st) {
 
     // ---- W17: editor popups (rendered last; they are separate ImGui windows) ----
     renderDimEditorPopup(st, tab, *sheet);
+    renderGdtEditorPopup(st, tab);
     renderTitleBlockPopup(st, tab, *sheet);
 }
 

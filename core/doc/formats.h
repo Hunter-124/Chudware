@@ -112,4 +112,12 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies,
 std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::string& path,
                                                                 const std::string& fmt);
 
+// Serialize a shape to a base64-encoded OCCT BREP blob, and back. Used to BAKE imported
+// geometry directly into the .step+ container (document.json) so a saved assembly no
+// longer depends on the original source file surviving on disk (Bug N-8). The BREP is the
+// kernel's own lossless format, so the round-trip is exact. brep_b64_to_shape returns a
+// null shape on a malformed/empty blob.
+std::string shape_to_brep_b64(const TopoDS_Shape& shape);
+TopoDS_Shape brep_b64_to_shape(const std::string& b64);
+
 }  // namespace aicad::doc

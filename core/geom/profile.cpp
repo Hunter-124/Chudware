@@ -14,7 +14,9 @@
 #include <GC_MakeArcOfCircle.hxx>
 #include <Geom_BSplineCurve.hxx>
 #include <GeomAPI_Interpolate.hxx>
+#include <ShapeAnalysis_FreeBounds.hxx>
 #include <TColgp_HArray1OfPnt.hxx>
+#include <TopTools_HSequenceOfShape.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Wire.hxx>
@@ -102,25 +104,36 @@ bool build_edge(const nlohmann::json& ent, const SketchPlane& plane,
         if (t == "arc") {
             Eigen::Vector2d c(ent["center"][0], ent["center"][1]);
             double r = ent["radius"];
-            double a0 = ent["start"];
-            double a1 = ent["end"];
             if (r <= kEps) return false;
-            // Arc goes CCW from a0 to a1; normalise the sweep into (0, 2pi].
-            double sweep = a1 - a0;
-            while (sweep <= 0.0) sweep += 2.0 * M_PI;
-            double amid = a0 + 0.5 * sweep;
-            Eigen::Vector2d ps(c.x() + r * std::cos(a0), c.y() + r * std::sin(a0));
-            Eigen::Vector2d pe(c.x() + r * std::cos(a1), c.y() + r * std::sin(a1));
-            Eigen::Vector2d pm(c.x() + r * std::cos(amid), c.y() + r * std::sin(amid));
-            // Through-3-points arc is robust and matches the as-drawn (CCW) arc.
-            GC_MakeArcOfCircle mkarc(lift_pnt(plane, ps), lift_pnt(plane, pm),
-                                     lift_pnt(plane, pe));
+            // Arc angles are DEGREES (matching the entity store + the sketch solver in
+            // sketch_geom.cpp + build123d Edge.make_circle), NOT radians. `ccw` selects
+            // the sweep direction: GC_MakeArcOfCircle(circ, a1, a2, true) always sweeps
+            // CCW from a1 to a2, so a CW arc is the CCW arc of the SWAPPED angles. This
+            // mirrors document.cpp::weld_member exactly and honors `ccw` so e.g.
+            // {start:180,end:90,ccw:false} is the 90 deg minor arc while ccw:true is the
+            // 270 deg major arc (Bug N-2 — `ccw` was previously ignored, and the angles
+            // were wrongly read as radians).
+            double sa = ent["start"];  // degrees
+            double ea = ent["end"];    // degrees
+            if (std::abs(ea - sa) < 1e-9) return false;  // degenerate (no span)
+            const bool ccw = ent.value("ccw", true);
+            const double DEG = M_PI / 180.0;
+            double a1 = (ccw ? sa : ea) * DEG;
+            double a2 = (ccw ? ea : sa) * DEG;
+            gp_Ax2 ax(lift_pnt(plane, c), to_dir(plane.normal), to_dir(plane.uAxis));
+            GC_MakeArcOfCircle mkarc(gp_Circ(ax, r), a1, a2, Standard_True);  // CCW
             if (!mkarc.IsDone()) return false;
             BRepBuilderAPI_MakeEdge mk(mkarc.Value());
             if (!mk.IsDone()) return false;
             out.edge = mk.Edge();
-            out.p_start = ps;
-            out.p_end = pe;
+            // 2D endpoints (for chaining/containment) are the AS-DRAWN start/end points
+            // in degrees, so they coincide with adjacent line endpoints in a path.
+            auto on = [&](double deg) {
+                double a = deg * DEG;
+                return Eigen::Vector2d(c.x() + r * std::cos(a), c.y() + r * std::sin(a));
+            };
+            out.p_start = on(sa);
+            out.p_end = on(ea);
             out.closed = false;
             return true;
         }
@@ -324,10 +337,27 @@ bool point_in_poly(const Eigen::Vector2d& pt, const std::vector<Eigen::Vector2d>
 
 // Build a wire from a loop's edges. Returns an empty (null) wire on failure.
 TopoDS_Wire make_wire(const std::vector<TopoDS_Edge>& edges) {
-    BRepBuilderAPI_MakeWire mk;
-    for (const TopoDS_Edge& e : edges) mk.Add(e);
-    if (!mk.IsDone()) return TopoDS_Wire();
-    return mk.Wire();
+    if (edges.empty()) return TopoDS_Wire();
+    // Strict head-to-tail build first (exact; preserves the authored edge order).
+    {
+        BRepBuilderAPI_MakeWire mk;
+        for (const TopoDS_Edge& e : edges) mk.Add(e);
+        if (mk.IsDone()) return mk.Wire();
+    }
+    // Tolerant fallback (Bug N-3): a path that MIXES line + arc edges can leave a
+    // float-noise gap between an analytic line endpoint and a trig-computed arc
+    // endpoint that the strict builder refuses to bridge. Sew the edges into wires
+    // with a real connection tolerance; accept only a single connected wire (a
+    // genuinely broken path yields >1 wire and is reported as "no wire" upstream).
+    Handle(TopTools_HSequenceOfShape) in = new TopTools_HSequenceOfShape();
+    for (const TopoDS_Edge& e : edges) in->Append(e);
+    Handle(TopTools_HSequenceOfShape) wires;
+    ShapeAnalysis_FreeBounds::ConnectEdgesToWires(in, 1.0e-4, Standard_False, wires);
+    if (!wires.IsNull() && wires->Length() == 1) {
+        const TopoDS_Shape& w = wires->Value(1);
+        if (!w.IsNull() && w.ShapeType() == TopAbs_WIRE) return TopoDS::Wire(w);
+    }
+    return TopoDS_Wire();
 }
 
 }  // namespace

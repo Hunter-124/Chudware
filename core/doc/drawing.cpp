@@ -9,6 +9,7 @@
 #include <BRep_Builder.hxx>
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Surface.hxx>
+#include <BRepAlgoAPI_Common.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepGProp.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
@@ -281,10 +282,12 @@ json project_view(const std::vector<TopoDS_Shape>& shapes,
 
 namespace {
 
-// Cut raw_shape by the +normal half-space through point. Mirrors _half_space_cut.
-TopoDS_Shape half_space_cut(const TopoDS_Shape& raw, Vec3 normal, Vec3 point) {
+// A half-space box: the region on the +normal side of the plane through `point`, extending
+// `depth` along +normal (depth<=0 -> BIG, a true half-space). Returned as a TopoDS box tool.
+TopoDS_Shape half_space_box(Vec3 normal, Vec3 point, double depth) {
     Vec3 n = normalize(normal);
     const double BIG = 100000.0;
+    double dz = (depth > 0.0) ? depth : BIG;
     Vec3 seed = {1, 0, 0};
     if (std::fabs(dot(seed, n)) > 0.9) seed = {0, 1, 0};
     Vec3 u = normalize(cross(n, seed));
@@ -294,10 +297,34 @@ TopoDS_Shape half_space_cut(const TopoDS_Shape& raw, Vec3 normal, Vec3 point) {
                    point[2] - u[2] * BIG - nu[2] * BIG};
     gp_Ax2 ax(gp_Pnt(origin[0], origin[1], origin[2]),
               gp_Dir(n[0], n[1], n[2]), gp_Dir(u[0], u[1], u[2]));
-    TopoDS_Shape tool = BRepPrimAPI_MakeBox(ax, 2 * BIG, 2 * BIG, BIG).Shape();
+    return BRepPrimAPI_MakeBox(ax, 2 * BIG, 2 * BIG, dz).Shape();
+}
+
+// Cut raw_shape by the +normal half-space through point. Mirrors _half_space_cut.
+TopoDS_Shape half_space_cut(const TopoDS_Shape& raw, Vec3 normal, Vec3 point) {
+    TopoDS_Shape tool = half_space_box(normal, point, 0.0);
     BRepAlgoAPI_Cut cut(raw, tool);
     cut.Build();
     if (!cut.IsDone()) throw std::runtime_error("section half-space cut failed");
+    return cut.Shape();
+}
+
+// Section cut for a view: removes the +normal side of the plane (mode "full"), and for a
+// HALF section removes only the half on the +half_axis side (intersection of the two
+// half-spaces) so the other half stays an unsectioned external view. `depth` (>0) limits
+// how deep behind the plane is removed. Returns the cut body (or the original on failure).
+TopoDS_Shape section_cut(const TopoDS_Shape& raw, Vec3 normal, Vec3 point, const std::string& mode,
+                         double depth, const Vec3* half_axis) {
+    TopoDS_Shape tool = half_space_box(normal, point, depth);
+    if (mode == "half" && half_axis && std::sqrt(dot(*half_axis, *half_axis)) > 1e-9) {
+        TopoDS_Shape side = half_space_box(*half_axis, point, 0.0);
+        BRepAlgoAPI_Common common(tool, side);
+        common.Build();
+        if (common.IsDone()) tool = common.Shape();
+    }
+    BRepAlgoAPI_Cut cut(raw, tool);
+    cut.Build();
+    if (!cut.IsDone()) throw std::runtime_error("section cut failed");
     return cut.Shape();
 }
 
@@ -378,6 +405,18 @@ json project_section(const std::vector<TopoDS_Shape>& shapes, const json& plane,
     if (std::sqrt(dot(normal, normal)) < 1e-9)
         throw std::runtime_error("section plane.normal must be nonzero");
     normal = normalize(normal);
+    // Custom-section controls (optional): mode (full|half), depth clip, reverse side, and
+    // the in-plane half_axis along which a half section keeps the unsectioned half.
+    std::string mode = plane.value("mode", std::string("full"));
+    double depth = plane.value("depth", 0.0);
+    if (plane.value("reverse", false)) normal = {-normal[0], -normal[1], -normal[2]};
+    Vec3 half_axis{0, 0, 0};
+    bool have_half = false;
+    if (plane.contains("half_axis") && plane["half_axis"].is_array() &&
+        plane["half_axis"].size() == 3) {
+        half_axis = {plane["half_axis"][0], plane["half_axis"][1], plane["half_axis"][2]};
+        have_half = std::sqrt(dot(half_axis, half_axis)) > 1e-9;
+    }
     Vec3 look = normal;
     // screen_x: a world axis most perpendicular to the look.
     Vec3 seed = {0, 0, 1};
@@ -401,7 +440,7 @@ json project_section(const std::vector<TopoDS_Shape>& shapes, const json& plane,
         for (const auto& raw : shapes) {
             TopoDS_Shape cs;
             try {
-                cs = half_space_cut(raw, look, point);
+                cs = section_cut(raw, look, point, mode, depth, have_half ? &half_axis : nullptr);
             } catch (...) {
                 cs = raw;
             }

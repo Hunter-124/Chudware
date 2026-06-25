@@ -398,6 +398,42 @@ json canonical_profile_to_id(const json& profile) {
     return profile;  // leave as-is -> the profile resolver will raise a clear error
 }
 
+// Metric fastener designation (e.g. "M3", "M2.5", "M3x0.5") -> hole bore diameter in mm.
+// Clearance (ISO 273 "medium" fit) by default; tap-drill diameter when `tapped`. Returns 0 for an
+// unrecognized size. This is a DETERMINISTIC standard lookup (a hole wizard does exactly this), not
+// a guess — it lets a model spec a hole by fastener size the way an engineer would ("M3 clearance
+// bore") instead of pre-computing 3.4mm. The feature still records the resolved numeric diameter.
+double metric_hole_diameter(const std::string& designation, bool tapped) {
+    size_t i = designation.find_first_of("Mm");
+    if (i == std::string::npos) return 0.0;
+    size_t j = i + 1;
+    std::string num;
+    while (j < designation.size() &&
+           (std::isdigit((unsigned char)designation[j]) || designation[j] == '.'))
+        num += designation[j++];
+    if (num.empty()) return 0.0;
+    double m = std::atof(num.c_str());
+    struct Row { double m, clear, tap; };
+    static const Row tbl[] = {{1.6, 1.8, 1.25}, {2, 2.4, 1.6},  {2.5, 2.9, 2.05}, {3, 3.4, 2.5},
+                              {4, 4.5, 3.3},     {5, 5.5, 4.2},  {6, 6.6, 5.0},    {8, 9.0, 6.8},
+                              {10, 11.0, 8.5},   {12, 13.5, 10.2}};
+    for (const auto& r : tbl)
+        if (std::abs(r.m - m) < 1e-6) return tapped ? r.tap : r.clear;
+    return 0.0;
+}
+
+// Comma-joined list of an object's keys, for teaching error messages ("Got params: a, b, c")
+// so a model that omitted/misnamed a required key can see what it DID send and self-correct.
+std::string json_key_list(const json& o) {
+    if (!o.is_object() || o.empty()) return "(none)";
+    std::string s;
+    for (auto it = o.begin(); it != o.end(); ++it) {
+        if (!s.empty()) s += ", ";
+        s += it.key();
+    }
+    return s;
+}
+
 // SCHEMA CONVERGENCE (docs/CPP_MIGRATION.md): accept BOTH the host's canonical
 // feature shape — {id, type, params:{...}, refs:{slot:<sel|datum>}} per
 // engine/doc/schema.py — and the simplified flat shape the early C++ tests use.
@@ -526,6 +562,40 @@ json normalize_feature(const json& raw) {
     // list, a different thing — not yet ported).
     if (type == "hole" && f.contains("points") && !f.contains("positions"))
         f["positions"] = f["points"];
+    // hole / bolt_circle bore-diameter SYNONYMS: small local models routinely name the bore
+    // something other than the canonical "diameter" (dia/d/bore...). Accept the unambiguous
+    // synonyms so a valid op isn't rejected over a key name; a truly-absent size still becomes a
+    // loud teaching error at compile (we never invent a diameter here — no silent wrong geometry).
+    if ((type == "hole" || type == "bolt_circle") &&
+        (!f.contains("diameter") || f["diameter"].is_null())) {
+        for (const char* k : {"dia", "d", "bore_diameter", "bore_dia", "hole_diameter",
+                              "hole_dia", "bore"})
+            if (f.contains(k) && !f[k].is_null()) { f["diameter"] = f[k]; break; }
+        // A radius synonym -> diameter (×2). Number only (an expr string is left for the branch).
+        if (!f.contains("diameter"))
+            for (const char* k : {"radius", "r", "bore_radius"})
+                if (f.contains(k) && f[k].is_number()) {
+                    f["diameter"] = f[k].get<double>() * 2.0;
+                    break;
+                }
+        // Fastener-standard sizing: a model may spec the bore by thread size ("standard":"M3")
+        // instead of a number — the natural way to ask for a clearance/tap hole. Resolve it from
+        // the metric table (clearance by default; tap-drill when the hole is tapped). A `tap` field
+        // value (e.g. "M3") both names the size AND marks it tapped.
+        if (!f.contains("diameter")) {
+            std::string desig;
+            bool tapped = (f.value("style", std::string()) == "tap");
+            for (const char* k : {"standard", "thread", "screw", "fastener", "bolt", "tap", "size"}) {
+                if (f.contains(k) && f[k].is_string() && !f[k].get<std::string>().empty()) {
+                    desig = f[k].get<std::string>();
+                    if (std::string(k) == "tap") tapped = true;
+                    break;
+                }
+            }
+            double d = metric_hole_diameter(desig, tapped);
+            if (d > 0.0) f["diameter"] = d;
+        }
+    }
     return f;
 }
 
@@ -2599,6 +2669,19 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 }
                 if (tool.IsNull())
                     throw std::runtime_error("revolve produced no solid");
+                // Guard the silent-degenerate case: a profile that straddles / lies on the
+                // axis, or a ~0deg angle, yields a null/sliver solid that OCCT still hands
+                // back as a valid (but ~0-volume) shape. Fail loudly instead of reporting a
+                // successful body with no material (Bug N-9 class).
+                {
+                    GProp_GProps rv;
+                    BRepGProp::VolumeProperties(tool, rv);
+                    if (!(rv.Mass() > 1e-9))
+                        throw std::runtime_error(
+                            "revolve produced a zero-volume solid — the profile must sit to "
+                            "ONE side of the axis (not cross or touch it) and the angle must "
+                            "be > 0 (got " + std::to_string(angle * 180.0 / M_PI) + " deg)");
+                }
 
                 // --- thin feature (revolve.py): subtract a revolve of each profile face
                 // offset toward the axis by thin_thickness, leaving a thin wall. side
@@ -2749,6 +2832,21 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 }
                 if (solid.IsNull())
                     throw std::runtime_error("sweep produced no solid");
+                // Guard the silent-degenerate case: when the profile plane is not aligned
+                // with the START of the path (the profile sits off the path's first point),
+                // MakePipe sweeps a collapsed/near-zero section and OCCT still returns a
+                // valid-but-empty solid. Fail loudly rather than report a successful body
+                // with ~0 volume (Bug N-9).
+                {
+                    GProp_GProps sv;
+                    BRepGProp::VolumeProperties(solid, sv);
+                    if (!(sv.Mass() > 1e-9))
+                        throw std::runtime_error(
+                            "sweep produced a zero-volume solid — the profile must sit ON the "
+                            "START of the path and be roughly perpendicular to it (anchor the "
+                            "path's first point at the profile, e.g. start the path at the "
+                            "profile's plane origin)");
+                }
 
                 results[id] = SolidResult{solid};
                 solid_order.push_back(id);
@@ -3432,9 +3530,16 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // canonical cbore_d/csink_d keys are read if present; the audit's *_dia keys
                 // are NOT (the oracle ignores them too), so both engines use the defaults.
                 ::geom::HoleDims dims;
+                if (!feat.contains("diameter") || feat.at("diameter").is_null())
+                    throw std::runtime_error(
+                        "hole feature needs a bore 'diameter' in mm — e.g. "
+                        "{\"type\":\"hole\",\"diameter\":3.4,...} for an M3 clearance hole "
+                        "(synonyms dia/d/bore_diameter/radius are also accepted). Got params: " +
+                        json_key_list(feat));
                 dims.diameter = num_or_expr(feat.at("diameter"), env);
                 if (!(dims.diameter > 0.0))
-                    throw std::runtime_error("hole: diameter must be > 0");
+                    throw std::runtime_error("hole: 'diameter' must be > 0 (got " +
+                                             feat.at("diameter").dump() + ")");
                 if (style == ::geom::HoleStyle::Cbore) {
                     dims.cbore_d = feat.contains("cbore_d")
                         ? num_or_expr(feat.at("cbore_d"), env) : dims.diameter * 1.8;
@@ -3582,8 +3687,14 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 else if (style_s == "csink") style = ::geom::HoleStyle::Csink;
                 else throw std::runtime_error("bolt_circle: unknown style '" + style_s + "'");
                 ::geom::HoleDims dims;
+                if (!feat.contains("diameter") || feat.at("diameter").is_null())
+                    throw std::runtime_error(
+                        "bolt_circle feature needs the hole 'diameter' in mm — e.g. "
+                        "{\"type\":\"bolt_circle\",\"diameter\":3.4,\"pcd\":...,\"count\":...} "
+                        "(synonyms dia/d/bore_diameter/radius are also accepted). Got params: " +
+                        json_key_list(feat));
                 dims.diameter = num_or_expr(feat.at("diameter"), env);
-                if (!(dims.diameter > 0.0)) throw std::runtime_error("bolt_circle: diameter must be > 0");
+                if (!(dims.diameter > 0.0)) throw std::runtime_error("bolt_circle: 'diameter' must be > 0");
                 if (style == ::geom::HoleStyle::Cbore) {
                     dims.cbore_d = feat.contains("cbore_d")
                         ? num_or_expr(feat.at("cbore_d"), env) : dims.diameter * 1.8;

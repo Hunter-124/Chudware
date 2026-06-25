@@ -432,6 +432,80 @@ TEST_CASE("hole on a primitive face drills a centred full-diameter bore") {
     CHECK(vol == doctest::Approx(40.0 * 40 * 20 - 3.14159265 * 25 * 20).epsilon(0.01));
 }
 
+// A hole spec'd by FASTENER STANDARD (no numeric diameter) resolves the bore from the metric
+// table — "M3" clearance -> 3.4mm — the way a model (or engineer) naturally asks for a clearance
+// hole. Also covers a diameter SYNONYM ("dia"). Regression for the gemma "key 'diameter' not
+// found" crash: a missing-but-named-by-standard bore must build, not throw.
+TEST_CASE("hole by fastener standard (M3) and diameter synonym resolve the bore") {
+    using aicad::doc::doc_new;
+    using aicad::doc::doc_apply_ops;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+
+    // (a) standard:"M3", no diameter -> clearance 3.4mm bore.
+    {
+        json nr = doc_new("part", "HoleStd");
+        const std::string id = nr.at("doc_id").get<std::string>();
+        json ops = json::array({
+            json{{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Blk"},
+                 {"params", {{"length", dimv(20)}, {"width", dimv(20)}, {"height", dimv(22)}}}}}},
+            json{{"op", "add_feature"}, {"feature", {{"type", "hole"}, {"name", "M3_Clearance_Bore"},
+                 {"params", {{"style", "simple"}, {"standard", "M3"}, {"end", "through_all"}}},
+                 {"refs", {{"face", json{{"of", "face"}, {"side", "top"}}}}}}}},
+        });
+        json resp = doc_apply_ops(id, -1, ops, false);
+        const double vol = resp.value("volume", 0.0);
+        // 20x20x22 minus a 3.4mm-dia through bore.
+        CHECK(vol == doctest::Approx(20.0 * 20 * 22 - 3.14159265 * 1.7 * 1.7 * 22).epsilon(0.02));
+    }
+    // (b) "dia" synonym instead of "diameter".
+    {
+        json nr = doc_new("part", "HoleDia");
+        const std::string id = nr.at("doc_id").get<std::string>();
+        json ops = json::array({
+            json{{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Blk"},
+                 {"params", {{"length", dimv(20)}, {"width", dimv(20)}, {"height", dimv(22)}}}}}},
+            json{{"op", "add_feature"}, {"feature", {{"type", "hole"}, {"name", "Bore"},
+                 {"params", {{"style", "simple"}, {"dia", dimv(5)}, {"end", "through_all"}}},
+                 {"refs", {{"face", json{{"of", "face"}, {"side", "top"}}}}}}}},
+        });
+        json resp = doc_apply_ops(id, -1, ops, false);
+        const double vol = resp.value("volume", 0.0);
+        CHECK(vol == doctest::Approx(20.0 * 20 * 22 - 3.14159265 * 2.5 * 2.5 * 22).epsilon(0.02));
+    }
+}
+
+// A `polygon` sketch entity expands to N closed line segments -> a real region that extrudes.
+// Regression for "extrude produced no solid": a small model drew a hexagon as an OPEN spline (no
+// region); the polygon entity gives a clean closed hex. Full hex-standoff path: hexagon -> extrude
+// -> M3 clearance bore, the exact part that previously failed.
+TEST_CASE("polygon entity builds a closed hexagon -> hex standoff extrudes + bores") {
+    using aicad::doc::doc_new;
+    using aicad::doc::doc_apply_ops;
+    json nr = doc_new("part", "HexStandoff");
+    const std::string id = nr.at("doc_id").get<std::string>();
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "sketch"}, {"name", "HexSk"},
+             {"params", {{"entities", json::array()}, {"constraints", json::array()}}},
+             {"refs", {{"plane", "plane.top"}}}}}},
+        json{{"op", "sketch_add_entity"}, {"sketch", "$0"},
+             {"entity", {{"type", "hexagon"}, {"center", json::array({0, 0})}, {"across_flats", 10}}}},
+        json{{"op", "add_feature"}, {"feature", {{"type", "extrude"}, {"name", "Body"},
+             {"params", {{"mode", "boss"}, {"end", "blind"}, {"depth", json{{"value", 22}, {"expr", nullptr}}}}},
+             {"refs", {{"profile", json::array({json{{"kind", "region"}, {"sketch", "$0"},
+                        {"centroid", json::array({0, 0})}, {"hint_index", 0}}})}}}}}},
+        json{{"op", "add_feature"}, {"feature", {{"type", "hole"}, {"name", "M3_Clearance_Bore"},
+             {"params", {{"style", "simple"}, {"standard", "M3"}, {"end", "through_all"}}},
+             {"refs", {{"face", json{{"of", "face"}, {"side", "top"}}}}}}}},
+    });
+    json resp = doc_apply_ops(id, -1, ops, false);
+    const double vol = resp.value("volume", 0.0);
+    // regular hexagon across-flats 10 -> circumradius R = 5/cos(30deg); area = (3√3/2)R².
+    const double R = 5.0 / std::cos(3.14159265358979 / 6.0);
+    const double hex_area = (3.0 * std::sqrt(3.0) / 2.0) * R * R;
+    const double expect = hex_area * 22.0 - 3.14159265 * 1.7 * 1.7 * 22.0;  // minus M3 (3.4) bore
+    CHECK(vol == doctest::Approx(expect).epsilon(0.01));
+}
+
 // 2. MULTI-FEATURE PART: square 40x40 -> extrude 25 (base); circle r8 -> extrude 25
 //    (tool); boolean cut base - tool. The cut consumes BOTH the base and the tool,
 //    so exactly ONE body survives: the holed block (40x40x25 bbox with a cylindrical

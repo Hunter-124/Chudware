@@ -2,11 +2,13 @@
 //
 // The lowest n_modes natural frequencies + mode shapes of K phi = omega^2 M phi via
 // shift-invert generalized eigensolution at sigma=0 (Spectra::SymGEigsShiftSolver in
-// place of scipy.sparse.linalg.eigsh). K is the same tet4 stiffness as the static
-// solver; M is the CONSISTENT tet4 mass matrix (rho*V/20 * (1+delta_ij) blocks) — it
-// keeps a square section's first bending pair near-degenerate and removes the lumped-
-// mass low bias (Bug N-1). Units: mm / MPa / g, so omega[rad/s] = sqrt(eigenvalue *
-// 1e6), freq[Hz] = omega / 2pi.
+// place of scipy.sparse.linalg.eigsh). Both tet4 and tet10 (2nd-order) elements are
+// supported, each with the matching CONSISTENT mass matrix. tet10 is strongly preferred
+// for slender/bending modes: linear tet4 is over-stiff and mesh-orientation-dependent,
+// which on a square cross-section splits the (theoretically degenerate) first bending
+// PAIR by ~10% and biases the frequency low on a coarse mesh (Bug N-1). Quadratic tet10
+// captures bending far better, collapsing that split and removing the bias. Units: mm /
+// MPa / g, so omega[rad/s] = sqrt(eigenvalue * 1e6), freq[Hz] = omega / 2pi.
 #pragma once
 
 #include <string>
@@ -25,9 +27,12 @@ struct FeaModalResult {
 };
 
 // Solve for the lowest n_modes free-vibration modes. BCs arrive resolved (fixed_nodes
-// pin all 3 DOFs). Empty fixed_nodes => free-free analysis. Never throws.
+// pin all 3 DOFs). Empty fixed_nodes => free-free analysis. `nodes_per_elem` selects the
+// element type: 4 (tet4, the connectivity is 4 ints/elem) or 10 (tet10, 10 ints/elem).
+// Never throws.
 FeaModalResult fea_modal_solve(const std::vector<double>& points, const std::vector<int>& tets,
                                double E_mpa, double nu, double density_g_cm3,
-                               const std::vector<int>& fixed_nodes, int n_modes);
+                               const std::vector<int>& fixed_nodes, int n_modes,
+                               int nodes_per_elem = 4);
 
 }  // namespace aicad::sim

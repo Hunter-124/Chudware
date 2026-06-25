@@ -368,6 +368,37 @@ def _resolve_face_points(doc_id: str, query: Union[str, dict]) -> list:
     return out
 
 
+def _persist_study(doc_id: str, record: dict) -> Optional[str]:
+    """Record a SOLVED simulation study (setup + RESULTS) into the document's `studies`
+    array so it round-trips inside the native .step+ (save_part). Without this the FEA/CFD
+    numbers were only ever returned to the caller and lost on save — the file claimed to
+    carry "simulation studies + results" but never did. We store the human-readable SETUP
+    (material, fixtures/loads as the original plain-English queries) plus the computed
+    RESULTS, NOT the resolved point clouds, so the entry stays small and re-runnable.
+
+    Re-running a study of the same `type` REPLACES the prior one (keyed by type+name) so
+    repeated solves don't pile up duplicates. Best-effort: a persistence failure never
+    breaks the solve that already succeeded — the numbers are still returned to the caller.
+    """
+    try:
+        rid = record.get("id")
+        name = record.get("name", "")
+        rtype = record.get("type", "")
+        existing = cb.call("sim_study_list", {"doc_id": doc_id}).get("studies", [])
+        for s in existing:
+            if not rid and s.get("type") == rtype and s.get("name") == name:
+                rid = s.get("id")
+                break
+        if rid:
+            record["id"] = rid
+            cb.call("sim_study_edit", {"doc_id": doc_id, "study_id": rid, "study": record})
+            return rid
+        res = cb.call("sim_study_add", {"doc_id": doc_id, "study": record})
+        return res.get("study_id") if isinstance(res, dict) else None
+    except Exception:  # noqa: BLE001 — persistence is best-effort, never fail the solve
+        return None
+
+
 # --------------------------------------------------------------------- the guide text
 
 _GUIDE_PROMPTS = ["overview", "review", "simulation"]
@@ -891,8 +922,21 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 res = cb.call("sim_run_static", {"study": study})
                 if not res.get("ok"):
                     return {"ok": False, "doc_id": d, "error": res.get("error", "solve failed")}
+                # Persist setup+results into the doc so they save inside the .step+.
+                _persist_study(d, {
+                    "type": "fea_static",
+                    "name": f"Static stress ({mat.get('name', material)})",
+                    "engine": "cpp",
+                    "material": mat,
+                    "fixtures": fixtures,
+                    "loads": loads,
+                    "mesh_fineness": mesh_fineness,
+                    "results": res.get("summary", {}),
+                    "n_dof": res.get("n_dof"),
+                })
                 return {"ok": True, "doc_id": d, "material": mat.get("name", material),
-                        "summary": res.get("summary", {}), "n_dof": res.get("n_dof")}
+                        "summary": res.get("summary", {}), "n_dof": res.get("n_dof"),
+                        "saved_to_study": True}
 
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             if background:
@@ -924,16 +968,30 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 fixture_sets.extend(_resolve_face_points(d, q))
             if not fixture_sets:
                 return _dumps({"ok": False, "error": "no fixture faces resolved"})
+            # 2nd-order (tet10) elements: quadratic bending accuracy — no spurious split on
+            # a square section and no low-frequency bias the way tet4 had (Bug N-1).
             study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
-                     "mesh_order": 1, "fineness": mesh_fineness}
+                     "mesh_order": 2, "fineness": mesh_fineness}
 
             def _solve() -> dict:
                 res = cb.call("sim_run_modal", {"study": study, "n_modes": n_modes})
                 if not res.get("ok"):
                     return {"ok": False, "doc_id": d,
                             "error": res.get("error", "modal solve failed")}
+                _persist_study(d, {
+                    "type": "fea_modal",
+                    "name": f"Modal ({mat.get('name', material)})",
+                    "engine": "cpp",
+                    "material": mat,
+                    "fixtures": fixtures,
+                    "n_modes": n_modes,
+                    "mesh_fineness": mesh_fineness,
+                    "results": {"freqs_hz": res.get("freqs_hz", []),
+                                "n_modes": res.get("n_modes")},
+                })
                 return {"ok": True, "doc_id": d, "material": mat.get("name", material),
-                        "freqs_hz": res.get("freqs_hz", []), "n_modes": res.get("n_modes")}
+                        "freqs_hz": res.get("freqs_hz", []), "n_modes": res.get("n_modes"),
+                        "saved_to_study": True}
 
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
             if background:
@@ -998,6 +1056,15 @@ def register_cad_tools(mcp: FastMCP) -> None:
                           "min_feature_voxels", "steps_run", "diverged", "warning"):
                     if k in res:
                         out[k] = res[k]
+                _persist_study(d, {
+                    "type": "cfd_flow",
+                    "name": f"CFD wind tunnel ({fluid}, {velocity} m/s, aoa {aoa})",
+                    "engine": "cpp-lbm",
+                    "params": {"velocity": velocity, "aoa": aoa, "fluid": fluid,
+                               "cells": cells, "n_steps": n_steps},
+                    "results": {k: out[k] for k in out if k not in ("ok", "doc_id")},
+                })
+                out["saved_to_study"] = True
                 return out
 
             _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts

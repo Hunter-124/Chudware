@@ -164,6 +164,28 @@ TEST_CASE("concentric arcs share a center") {
     CHECK(std::hypot(dx, dy) < 1e-5);
 }
 
+// N-2: the arc `ccw` flag is a DISCRETE attribute the solver doesn't vary, so it must be
+// carried through solve_sketch -> extract_entities verbatim. Dropping it (the old bug) made
+// every solved arc default to ccw:true downstream, so a CW arc silently became its CCW
+// complement (minor<->major) in a sweep/revolve path wire — two sweeps differing only in
+// `ccw` then gave byte-identical volume.
+TEST_CASE("arc ccw flag survives the solver (N-2)") {
+    auto solved_ccw = [](bool ccw) {
+        json s;
+        json a = {{"id", "e1"}, {"type", "arc"}, {"construction", false},
+                  {"center", json::array({0.0, 0.0})}, {"radius", 10.0},
+                  {"start", 0.0}, {"end", 90.0}, {"ccw", ccw}};
+        s["entities"] = json::array({a});
+        s["constraints"] = json::array({rel("c1", "fix", {"e1.center"})});
+        auto sol = solve_sketch(s, json::object());
+        REQUIRE(sol.entities.contains("e1"));
+        REQUIRE(sol.entities["e1"].contains("ccw"));
+        return sol.entities["e1"]["ccw"].get<bool>();
+    };
+    CHECK(solved_ccw(true) == true);
+    CHECK(solved_ccw(false) == false);  // the flag is preserved, not forced to the default
+}
+
 TEST_CASE("midpoint of a line") {
     json s;
     s["entities"] = json::array({line("e1", 0, 0, 10, 0), point("e2", 3, 0.5)});

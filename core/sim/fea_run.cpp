@@ -364,15 +364,19 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     int nodes_per_elem = 4;
     std::string err;
     std::vector<std::string> notes;
-    // Modal stays on 1st-order elements (the quadratic mass matrix is not implemented
-    // yet). Force order 1 regardless of mesh_order so the eigen-solve gets tet4.
+    // Modal now solves with 2nd-order (tet10) elements by default — the quadratic stiffness
+    // + consistent mass capture bending far better than tet4, which cured the spurious
+    // square-section first-bending split and the low-frequency bias (Bug N-1). A caller can
+    // still force tet4 with mesh_order=1 (faster, less accurate).
     json modal_study = study;
-    if (study.value("mesh_order", 1) == 2)
-        notes.push_back("modal uses 1st-order elements (mesh_order=2 ignored)");
-    modal_study["mesh_order"] = 1;
-    if (study.contains("nodes_per_elem")) modal_study["nodes_per_elem"] = 4;
+    const int want_order = study.value("mesh_order", 2);
+    modal_study["mesh_order"] = want_order;
+    if (modal_study.contains("nodes_per_elem"))
+        modal_study["nodes_per_elem"] = (want_order == 2) ? 10 : 4;
     if (!resolve_mesh(modal_study, points, tets, nodes_per_elem, err))
         return json{{"ok", false}, {"error", err}};
+    notes.push_back(nodes_per_elem == 10 ? "modal uses 2nd-order (tet10) elements"
+                                         : "modal uses 1st-order (tet4) elements");
 
     const json material = study.value("material", json::object());
     const double E_mpa = material.value("E_mpa", 0.0);
@@ -393,8 +397,8 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     }
     std::sort(fixed_nodes.begin(), fixed_nodes.end());
 
-    FeaModalResult r =
-        fea_modal_solve(points, tets, E_mpa, nu, density_g_cm3, fixed_nodes, n_modes);
+    FeaModalResult r = fea_modal_solve(points, tets, E_mpa, nu, density_g_cm3, fixed_nodes,
+                                       n_modes, nodes_per_elem);
     if (!r.ok) return json{{"ok", false}, {"error", r.error}};
 
     return json{{"ok", true},

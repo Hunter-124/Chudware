@@ -1397,7 +1397,8 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
             aicad::sim::FeaModalResult r = aicad::sim::fea_modal_solve(
                 getd("points"), geti("tets"), params.value("E_mpa", 0.0),
                 params.value("nu", 0.0), params.value("density_g_cm3", 0.0),
-                geti("fixed_nodes"), params.value("n_modes", 6));
+                geti("fixed_nodes"), params.value("n_modes", 6),
+                params.value("nodes_per_elem", 4));
             if (!r.ok) return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
             return emit(json{{"ok", true},
                              {"freqs_hz", r.freqs_hz},

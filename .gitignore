@@ -44,6 +44,9 @@ sldprt reversing/
 .codex/
 _shot_*.png
 
+# Local MCP test-report parts + tester scratch (never committed)
+claude test parts/
+
 # Auto-provisioned OCCT (Open CASCADE) prebuilt binaries — fetched by CMake, never committed
 third_party/
 OCCT/

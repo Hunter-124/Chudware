@@ -1988,6 +1988,13 @@ json extract_entities(const VectorXd& x, const json& entities_list,
             o["radius"] = x(v[2]);
             o["start"] = x(v[3]);
             o["end"] = x(v[4]);
+            // Preserve the sweep-direction flag: the solver only varies the geometric
+            // DOFs (center/radius/start/end), but `ccw` is a discrete attribute that
+            // selects the minor vs major arc between the same two angles. Dropping it
+            // here made every downstream consumer (wire_from_solved_sketch / sweep path,
+            // faces_from_solved_sketch) default to ccw:true, so a CW arc silently became
+            // its CCW complement regardless of the input (Bug N-2). Carry it through.
+            o["ccw"] = e.value("ccw", true);
         } else if (t == "ellipse") {
             o["center"] = {x(v[0]), x(v[1])};
             o["rx"] = x(v[2]);

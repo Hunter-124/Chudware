@@ -1134,6 +1134,13 @@ vector<string> validate_feature(const json& f, const string& where,
 
     for (const string& key : spec.params) {
         if (!params.contains(key)) {
+            // chamfer's canonical param is "length", but the OCCT kernel + a great many
+            // callers (and the compiler itself) speak "distance". normalize_feature maps
+            // length<->distance, so accept either here rather than rejecting a perfectly
+            // valid chamfer over the key name — that rejection read to users as "chamfer
+            // doesn't work" (especially on imported bodies, where it was the FIRST op tried).
+            if (ftype == "chamfer" && key == "length" && params.contains("distance"))
+                continue;
             errs.push_back(where + ".params." + key + ": required for " + ftype);
         }
     }

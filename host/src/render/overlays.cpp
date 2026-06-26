@@ -60,10 +60,13 @@ Overlays::~Overlays() { destroy(); }
 void Overlays::destroy() {
     for (auto& kv : faces_) {
         if (kv.second.vao) glDeleteVertexArrays(1, &kv.second.vao);
-        if (kv.second.vbo) glDeleteBuffers(1, &kv.second.vbo);
+        // kv.second.vbo is shared (owned by bodyVbos_) — do NOT delete it here.
         if (kv.second.ebo) glDeleteBuffers(1, &kv.second.ebo);
     }
     faces_.clear();
+    for (unsigned int vbo : bodyVbos_)
+        if (vbo) glDeleteBuffers(1, &vbo);
+    bodyVbos_.clear();
     for (auto& kv : edges_) {
         if (kv.second.vao) glDeleteVertexArrays(1, &kv.second.vao);
         if (kv.second.vbo) glDeleteBuffers(1, &kv.second.vbo);
@@ -104,16 +107,21 @@ bool Overlays::setDoc(const DocMesh& doc, std::string& err) {
 
     for (const auto& b : doc.bodies) {
         if (b.pos.empty()) continue;
+        // One shared position VBO per body — every face range of this body references it via its
+        // own VAO+EBO, instead of re-uploading the whole vertex array once per face.
+        unsigned int posVbo = 0;
+        glGenBuffers(1, &posVbo);
+        glBindBuffer(GL_ARRAY_BUFFER, posVbo);
+        glBufferData(GL_ARRAY_BUFFER, b.pos.size() * sizeof(float), b.pos.data(), GL_STATIC_DRAW);
+        bodyVbos_.push_back(posVbo);
         for (const auto& fr : b.faces) {
             if (fr.tri_count == 0) continue;
             FaceBuf fb;
+            fb.vbo = posVbo;  // shared (non-owning)
             glGenVertexArrays(1, &fb.vao);
-            glGenBuffers(1, &fb.vbo);
             glGenBuffers(1, &fb.ebo);
             glBindVertexArray(fb.vao);
             glBindBuffer(GL_ARRAY_BUFFER, fb.vbo);
-            glBufferData(GL_ARRAY_BUFFER, b.pos.size() * sizeof(float), b.pos.data(),
-                         GL_STATIC_DRAW);
             glEnableVertexAttribArray(0);
             glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
             const uint32_t* base = b.idx.data() + (size_t)fr.first_tri * 3;

@@ -88,6 +88,10 @@ private:
     bool bodyHidden(uint32_t encoded) const {
         return !hidden_.empty() && hidden_.count((encoded >> 24) & 0xFFu) != 0;
     }
+    // True when this AICM body id is hidden (batched draws carry the raw body id).
+    bool bodyHiddenId(uint32_t body_id) const {
+        return !hidden_.empty() && hidden_.count(body_id) != 0;
+    }
     void destroy();
     void allocTargets(int w, int h);
 
@@ -98,28 +102,22 @@ private:
     unsigned int fbo_ = 0, idTex_ = 0, depthRbo_ = 0;
     int w_ = 0, h_ = 0;
 
-    // shaders: one uniform-color id shader reused for faces (tris), edges (lines), verts (points)
+    // shaders: id shader reused for faces (tris), edges (lines), verts (points). The packed topo
+    // id travels as a per-vertex INTEGER attribute (location 1) so a whole body draws in one call.
     unsigned int prog_ = 0;
 
-    // per-body face geometry, one draw per FACE range with its encoded id as a uniform
-    struct FaceDraw {
-        unsigned int vao = 0, vboPos = 0, ebo = 0;
-        int idxCount = 0;
-        uint32_t id = 0;  // encoded
+    // One batched draw covering ALL of a body's faces (indexed tris), edges (line list), or verts
+    // (points). Each vertex carries its own encoded id in vboId, so the entire body draws in a
+    // single glDraw* — and a hidden body is skipped wholesale (its body_id is in bits [31:24] of
+    // every id, but we keep it explicit for the skip test). faces use the EBO; edges/verts don't.
+    struct BodyDraw {
+        unsigned int vao = 0, vboPos = 0, vboId = 0, ebo = 0;
+        int count = 0;         // index count (faces) or vertex count (edges/verts)
+        uint32_t body_id = 0;  // for the hidden-body skip
     };
-    struct EdgeDraw {
-        unsigned int vao = 0, vbo = 0;
-        int vertCount = 0;  // line-list vertex count
-        uint32_t id = 0;
-    };
-    struct VertDraw {
-        unsigned int vao = 0, vbo = 0;
-        int count = 0;  // points
-        std::vector<uint32_t> ids;  // one per point (drawn individually for per-vertex id)
-    };
-    std::vector<FaceDraw> faces_;
-    std::vector<EdgeDraw> edges_;
-    VertDraw verts_;  // all bodies' brep verts in one buffer; ids drawn one point at a time
+    std::vector<BodyDraw> faceDraws_;  // one per body (all face ranges batched, id per vertex)
+    std::vector<BodyDraw> edgeDraws_;  // one per body (all edge polylines batched as a line list)
+    std::vector<BodyDraw> vertDraws_;  // one per body (all B-rep verts batched as points)
     std::set<uint32_t> hidden_;  // AICM body ids hidden in the viewport (skip in render())
     int clipCount_ = 0;
     float clipNormals_[3][3] = {{1,0,0},{0,1,0},{0,0,1}};

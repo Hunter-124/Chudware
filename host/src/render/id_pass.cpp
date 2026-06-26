@@ -11,15 +11,19 @@ namespace render {
 
 namespace {
 
-// R32UI path: integer color out, id passed as a uint uniform.
+// R32UI path: integer color out, id carried as a per-vertex INTEGER attribute (location 1) and
+// passed flat to the fragment shader — so an entire body batches into one draw call instead of
+// one draw + uId-uniform update per face/edge/vertex.
 const char* kVertU = R"(#version 330 core
 layout(location=0) in vec3 aPos;
+layout(location=1) in uint aId;
 uniform mat4 uMVP;
 out vec3 vWorld;
-void main(){ vWorld = aPos; gl_Position = uMVP * vec4(aPos, 1.0); })";
+flat out uint vId;
+void main(){ vWorld = aPos; vId = aId; gl_Position = uMVP * vec4(aPos, 1.0); })";
 
 const char* kFragU = R"(#version 330 core
-uniform uint uId;
+flat in uint vId;
 uniform int uClipCount;
 uniform vec3 uClipN[3];
 uniform float uClipOff[3];
@@ -28,14 +32,14 @@ out uint frag;
 void main(){
     for (int i = 0; i < uClipCount; ++i)
         if (dot(vWorld, uClipN[i]) > uClipOff[i]) discard;
-    frag = uId;
+    frag = vId;
 })";
 
 // RGBA8 fallback: same vertex shader, pack the 32-bit id into RGBA bytes (little-endian-ish:
 // r = low byte ... a = high byte). Readback reassembles. Only the low 24 bits carry topo data
 // and 8 bits body, so all 32 bits are meaningful — we use all four channels.
 const char* kFragRGBA = R"(#version 330 core
-uniform uint uId;
+flat in uint vId;
 uniform int uClipCount;
 uniform vec3 uClipN[3];
 uniform float uClipOff[3];
@@ -44,7 +48,7 @@ out vec4 frag;
 void main(){
     for (int i = 0; i < uClipCount; ++i)
         if (dot(vWorld, uClipN[i]) > uClipOff[i]) discard;
-    uint id = uId;
+    uint id = vId;
     float r = float(id & 0xFFu) / 255.0;
     float g = float((id >> 8u) & 0xFFu) / 255.0;
     float b = float((id >> 16u) & 0xFFu) / 255.0;
@@ -92,20 +96,18 @@ void IdPass::setSectionClip(int count, const float normals[3][3], const float of
 }
 
 void IdPass::destroy() {
-    for (auto& f : faces_) {
-        if (f.vao) glDeleteVertexArrays(1, &f.vao);
-        if (f.vboPos) glDeleteBuffers(1, &f.vboPos);
-        if (f.ebo) glDeleteBuffers(1, &f.ebo);
-    }
-    faces_.clear();
-    for (auto& e : edges_) {
-        if (e.vao) glDeleteVertexArrays(1, &e.vao);
-        if (e.vbo) glDeleteBuffers(1, &e.vbo);
-    }
-    edges_.clear();
-    if (verts_.vao) glDeleteVertexArrays(1, &verts_.vao);
-    if (verts_.vbo) glDeleteBuffers(1, &verts_.vbo);
-    verts_ = VertDraw{};
+    auto freeDraws = [](std::vector<BodyDraw>& v) {
+        for (auto& d : v) {
+            if (d.vao) glDeleteVertexArrays(1, &d.vao);
+            if (d.vboPos) glDeleteBuffers(1, &d.vboPos);
+            if (d.vboId) glDeleteBuffers(1, &d.vboId);
+            if (d.ebo) glDeleteBuffers(1, &d.ebo);
+        }
+        v.clear();
+    };
+    freeDraws(faceDraws_);
+    freeDraws(edgeDraws_);
+    freeDraws(vertDraws_);
 }
 
 void IdPass::allocTargets(int w, int h) {
@@ -145,81 +147,88 @@ bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
 
     destroy();  // drop old per-body buffers (keep prog_ + targets)
 
-    // ---- faces: one VAO/EBO per FACE range, drawing just that range's triangles ----
+    // Bind pos (location 0, float3) + id (location 1, uint) attribute buffers into a fresh VAO and
+    // optionally an element buffer. Returns the BodyDraw (count set by caller). Integer ids MUST go
+    // through glVertexAttribIPointer so they reach the shader as a real uint (not float-converted).
+    auto buildVao = [](const std::vector<float>& pos, const std::vector<uint32_t>& ids,
+                       const uint32_t* idx, size_t idxCount, uint32_t body_id) -> BodyDraw {
+        BodyDraw d;
+        d.body_id = body_id;
+        glGenVertexArrays(1, &d.vao);
+        glGenBuffers(1, &d.vboPos);
+        glGenBuffers(1, &d.vboId);
+        glBindVertexArray(d.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, d.vboPos);
+        glBufferData(GL_ARRAY_BUFFER, pos.size() * sizeof(float), pos.data(), GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glBindBuffer(GL_ARRAY_BUFFER, d.vboId);
+        glBufferData(GL_ARRAY_BUFFER, ids.size() * sizeof(uint32_t), ids.data(), GL_STATIC_DRAW);
+        glEnableVertexAttribArray(1);
+        glVertexAttribIPointer(1, 1, GL_UNSIGNED_INT, sizeof(uint32_t), (void*)0);
+        if (idx && idxCount) {
+            glGenBuffers(1, &d.ebo);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, d.ebo);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, idxCount * sizeof(uint32_t), idx, GL_STATIC_DRAW);
+        }
+        glBindVertexArray(0);
+        return d;
+    };
+
     for (const auto& b : doc.bodies) {
-        if (b.pos.empty()) continue;
-        // shared position VBO per body (referenced by every face range of that body)
-        for (const auto& fr : b.faces) {
-            if (fr.tri_count == 0) continue;
-            FaceDraw fd;
-            fd.id = encodeId(b.body_id, PickKind::Face, fr.face_id);
-            glGenVertexArrays(1, &fd.vao);
-            glGenBuffers(1, &fd.vboPos);
-            glGenBuffers(1, &fd.ebo);
-            glBindVertexArray(fd.vao);
-            glBindBuffer(GL_ARRAY_BUFFER, fd.vboPos);
-            glBufferData(GL_ARRAY_BUFFER, b.pos.size() * sizeof(float), b.pos.data(),
-                         GL_STATIC_DRAW);
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
-            // index subrange for this face
-            const uint32_t* base = b.idx.data() + (size_t)fr.first_tri * 3;
-            int count = (int)fr.tri_count * 3;
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, fd.ebo);
-            glBufferData(GL_ELEMENT_ARRAY_BUFFER, (size_t)count * sizeof(uint32_t), base,
-                         GL_STATIC_DRAW);
-            glBindVertexArray(0);
-            fd.idxCount = count;
-            faces_.push_back(fd);
-        }
-
-        // ---- edges: each EDGE segment -> line list (consecutive points) ----
-        for (const auto& es : b.edges) {
-            if (es.pt_count < 2) continue;
-            std::vector<float> lines;
-            lines.reserve((size_t)(es.pt_count - 1) * 6);
-            for (uint32_t i = 0; i + 1 < es.pt_count; ++i) {
-                const float* a = &b.edge_pts[(size_t)(es.first_pt + i) * 3];
-                const float* c = &b.edge_pts[(size_t)(es.first_pt + i + 1) * 3];
-                lines.insert(lines.end(), {a[0], a[1], a[2], c[0], c[1], c[2]});
+        // ---- faces: ONE VAO per body. Shared position VBO + a per-vertex id attribute (every
+        // vertex tagged with its owning face's encoded id — face node blocks are disjoint per
+        // face in the tessellation) + the body's full index buffer, drawn in a single call. ----
+        if (!b.pos.empty() && !b.idx.empty()) {
+            std::vector<uint32_t> faceIds(b.pos.size() / 3, 0u);
+            for (const auto& fr : b.faces) {
+                if (fr.tri_count == 0) continue;
+                uint32_t fid = encodeId(b.body_id, PickKind::Face, fr.face_id);
+                const uint32_t* base = b.idx.data() + (size_t)fr.first_tri * 3;
+                size_t n = (size_t)fr.tri_count * 3;
+                for (size_t k = 0; k < n; ++k) faceIds[base[k]] = fid;
             }
-            EdgeDraw ed;
-            ed.id = encodeId(b.body_id, PickKind::Edge, es.edge_id);
-            glGenVertexArrays(1, &ed.vao);
-            glGenBuffers(1, &ed.vbo);
-            glBindVertexArray(ed.vao);
-            glBindBuffer(GL_ARRAY_BUFFER, ed.vbo);
-            glBufferData(GL_ARRAY_BUFFER, lines.size() * sizeof(float), lines.data(),
-                         GL_STATIC_DRAW);
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
-            glBindVertexArray(0);
-            ed.vertCount = (int)lines.size() / 3;
-            edges_.push_back(ed);
+            BodyDraw fd = buildVao(b.pos, faceIds, b.idx.data(), b.idx.size(), b.body_id);
+            fd.count = (int)b.idx.size();
+            faceDraws_.push_back(fd);
         }
-    }
 
-    // ---- B-rep verts: all bodies in one VBO; ids drawn one point at a time ----
-    {
-        std::vector<float> pts;
-        std::vector<uint32_t> ids;
-        for (const auto& b : doc.bodies) {
+        // ---- edges: ONE VAO per body. All edge polylines flattened to a single line list with a
+        // per-vertex id (each segment endpoint tagged with its edge's encoded id). ----
+        {
+            std::vector<float> lines;
+            std::vector<uint32_t> ids;
+            for (const auto& es : b.edges) {
+                if (es.pt_count < 2) continue;
+                uint32_t eid = encodeId(b.body_id, PickKind::Edge, es.edge_id);
+                for (uint32_t i = 0; i + 1 < es.pt_count; ++i) {
+                    const float* a = &b.edge_pts[(size_t)(es.first_pt + i) * 3];
+                    const float* c = &b.edge_pts[(size_t)(es.first_pt + i + 1) * 3];
+                    lines.insert(lines.end(), {a[0], a[1], a[2], c[0], c[1], c[2]});
+                    ids.push_back(eid);
+                    ids.push_back(eid);
+                }
+            }
+            if (!lines.empty()) {
+                BodyDraw ed = buildVao(lines, ids, nullptr, 0, b.body_id);
+                ed.count = (int)lines.size() / 3;
+                edgeDraws_.push_back(ed);
+            }
+        }
+
+        // ---- B-rep verts: ONE VAO per body. All endpoint points with a per-vertex id. ----
+        {
+            std::vector<float> pts;
+            std::vector<uint32_t> ids;
             for (const auto& v : b.brep_verts) {
                 pts.insert(pts.end(), {v.xyz[0], v.xyz[1], v.xyz[2]});
                 ids.push_back(encodeId(b.body_id, PickKind::Vertex, v.vertex_id));
             }
-        }
-        if (!pts.empty()) {
-            glGenVertexArrays(1, &verts_.vao);
-            glGenBuffers(1, &verts_.vbo);
-            glBindVertexArray(verts_.vao);
-            glBindBuffer(GL_ARRAY_BUFFER, verts_.vbo);
-            glBufferData(GL_ARRAY_BUFFER, pts.size() * sizeof(float), pts.data(), GL_STATIC_DRAW);
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
-            glBindVertexArray(0);
-            verts_.count = (int)pts.size() / 3;
-            verts_.ids = std::move(ids);
+            if (!pts.empty()) {
+                BodyDraw vd = buildVao(pts, ids, nullptr, 0, b.body_id);
+                vd.count = (int)pts.size() / 3;
+                vertDraws_.push_back(vd);
+            }
         }
     }
 
@@ -254,45 +263,40 @@ void IdPass::render(const Renderer::CameraXform& cam) {
         glUniform3fv(glGetUniformLocation(prog_, "uClipN"), clipCount_, clipNormals_[0]);
         glUniform1fv(glGetUniformLocation(prog_, "uClipOff"), clipCount_, clipOffsets_);
     }
-    int idLoc = glGetUniformLocation(prog_, "uId");
 
-    // Faces first, pushed back so edges/verts win the depth test on coincident geometry.
+    // Faces first, pushed back so edges/verts win the depth test on coincident geometry. Each body
+    // is one draw call — the per-vertex id attribute carries the face id, hidden bodies are skipped.
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(1.0f, 1.0f);
-    for (const auto& f : faces_) {
-        if (bodyHidden(f.id)) continue;  // hidden body: unpickable
-        glUniform1ui(idLoc, f.id);
+    for (const auto& f : faceDraws_) {
+        if (bodyHiddenId(f.body_id)) continue;  // hidden body: unpickable
         glBindVertexArray(f.vao);
-        glDrawElements(GL_TRIANGLES, f.idxCount, GL_UNSIGNED_INT, 0);
+        glDrawElements(GL_TRIANGLES, f.count, GL_UNSIGNED_INT, 0);
     }
     glDisable(GL_POLYGON_OFFSET_FILL);
 
     // Edges over faces: a fat line so they're pickable, and a small negative depth-range bias so
-    // an edge on a face surface reads as the edge.
+    // an edge on a face surface reads as the edge. One draw call per body.
     glDepthRange(0.0, 0.999);
     glLineWidth(3.0f);
-    for (const auto& e : edges_) {
-        if (bodyHidden(e.id)) continue;  // hidden body: unpickable
-        glUniform1ui(idLoc, e.id);
+    for (const auto& e : edgeDraws_) {
+        if (bodyHiddenId(e.body_id)) continue;  // hidden body: unpickable
         glBindVertexArray(e.vao);
-        glDrawArrays(GL_LINES, 0, e.vertCount);
+        glDrawArrays(GL_LINES, 0, e.count);
     }
 
-    // Verts win over everything: largest depth bias, fat points, drawn individually so each
-    // carries its own id.
+    // Verts win over everything: largest depth bias, fat points. One draw call per body — each
+    // point carries its own id via the attribute, so no per-point uniform churn.
     glDepthRange(0.0, 0.998);
     glEnable(GL_PROGRAM_POINT_SIZE);
 #ifdef GL_POINT_SPRITE
     glEnable(GL_POINT_SPRITE);
 #endif
     glPointSize(6.0f);
-    if (verts_.count > 0) {
-        glBindVertexArray(verts_.vao);
-        for (int i = 0; i < verts_.count; ++i) {
-            if (bodyHidden(verts_.ids[i])) continue;  // hidden body: unpickable
-            glUniform1ui(idLoc, verts_.ids[i]);
-            glDrawArrays(GL_POINTS, i, 1);
-        }
+    for (const auto& v : vertDraws_) {
+        if (bodyHiddenId(v.body_id)) continue;  // hidden body: unpickable
+        glBindVertexArray(v.vao);
+        glDrawArrays(GL_POINTS, 0, v.count);
     }
 
     glDepthRange(0.0, 1.0);

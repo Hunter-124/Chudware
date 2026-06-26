@@ -55,6 +55,8 @@ public:
 private:
     void destroy();
 
+    // vbo here is NON-owning: it references the body's shared position VBO (bodyVbos_), uploaded
+    // once per body instead of once per face. vao + ebo are owned by the FaceBuf.
     struct FaceBuf { unsigned int vao = 0, vbo = 0, ebo = 0; int idxCount = 0; };
     struct EdgeBuf { unsigned int vao = 0, vbo = 0; int vertCount = 0; };
 
@@ -76,6 +78,7 @@ private:
     std::vector<std::pair<Key, FaceBuf>> faces_;
     std::vector<std::pair<Key, EdgeBuf>> edges_;
     std::vector<std::pair<Key, std::array<float, 3>>> verts_;
+    std::vector<unsigned int> bodyVbos_;  // owns the per-body shared position VBOs (FaceBuf.vbo refs)
 
     float hoverCol_[4] = {0.176f, 0.831f, 0.749f, 0.45f};      // teal wash
     float selCol_[4] = {1.000f, 0.620f, 0.180f, 0.55f};        // amber wash

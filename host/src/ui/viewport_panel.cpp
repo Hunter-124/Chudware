@@ -1831,10 +1831,13 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
 
             // ---- Instant3D push-pull: handle press / drag / release ----------------------------
-            // Only when a doc mesh is loaded, no PM/sketch/zoom-area is owning the mouse, and the
-            // press lands on the normal-axis handle of the single selected face. Owns the mouse for
-            // its whole lifetime (orbit/pan/pick all skip while s_pp.active).
-            if (st.hasDocMesh && !st.sketchPlanePickActive && !ppPmOpen && !s_zoomAreaArmed &&
+            // The drag-to-extrude arrow is an EDIT-FEATURE affordance: it is live only while the
+            // user has explicitly opened tree "Edit Feature" on a feature (PM in edit mode) and the
+            // single selected face belongs to THAT feature. It never arms on a passive face pick.
+            // While armed it owns the mouse for the drag's whole lifetime (orbit/pan/pick all skip).
+            const bool ppEditing = st.propertyManager && st.propertyManager->isEditMode() &&
+                                   st.propertyManager->hasPreviewTarget();
+            if (st.hasDocMesh && !st.sketchPlanePickActive && ppEditing && !s_zoomAreaArmed &&
                 !s_asmDrag.active && !st.inSimulation()) {
                 // Simulation lockout: no Instant3D push-pull while a study is open (the model is frozen
                 // so fixtures/loads/results stay valid). Press: hit-test the handle arrow. We use the
@@ -1843,7 +1846,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s_pp.active) {
                     ImVec2 cSp, tipP, tipN; float nsx, nsy, wpp; uint32_t bId, tId;
                     if (ppHandleGeometry(st, renderer, vr0, vr1, vw, vh, cSp, tipP, tipN,
-                                         nsx, nsy, wpp, bId, tId)) {
+                                         nsx, nsy, wpp, bId, tId) &&
+                        st.docMirror.ownerOfFace(bId, tId) == st.propertyManager->targetId()) {
                         // Distance from the press point to the handle axis segment (centroid..tip,
                         // both directions). A generous hit radius makes the thin arrow grabbable.
                         ImVec2 mp = io.MousePos;
@@ -2713,18 +2717,23 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         }
 
         // ---- Instant3D push-pull handle + live readout ----
-        // Drawn whenever exactly one face is selected (with a cached normal) and no sketch/PM/
-        // plane-pick owns the view. The handle is a bidirectional accent arrow along the face
-        // outward normal; press it to drag-modify the face. While dragging, a readout chip near the
-        // cursor shows the driven param + new value (and a "clamped" hint at the limit).
+        // The drag-to-extrude arrow is shown ONLY while the user is editing (tree "Edit Feature")
+        // the feature that owns the single selected face — never on a passive face selection. The
+        // handle is a bidirectional accent arrow along the face outward normal; press it to
+        // drag-modify the face. While dragging, a readout chip near the cursor shows the driven
+        // param + new value (and a "clamped" hint at the limit).
+        bool ppHandleVisible = false;
         {
-            bool ppPmOpen2 = st.propertyManager && st.propertyManager->active();
+            bool ppEditing2 = st.propertyManager && st.propertyManager->isEditMode() &&
+                              st.propertyManager->hasPreviewTarget();
             bool canShowHandle = st.hasDocMesh && !inSketch && !st.sketchPlanePickActive &&
-                                 !ppPmOpen2 && !s_viewSelector.active();
+                                 ppEditing2 && !s_viewSelector.active();
             if (canShowHandle) {
                 ImVec2 cSp, tipP, tipN; float nsx, nsy, wpp; uint32_t bId, tId;
                 if (ppHandleGeometry(st, renderer, vr0, vr1, vw, vh, cSp, tipP, tipN,
-                                     nsx, nsy, wpp, bId, tId)) {
+                                     nsx, nsy, wpp, bId, tId) &&
+                    st.docMirror.ownerOfFace(bId, tId) == st.propertyManager->targetId()) {
+                    ppHandleVisible = true;
                     const auto& vpal2 = ui::palette;
                     const ImU32 acc  = ui::Palette::toU32(vpal2.accent);
                     const ImU32 accS = ui::Palette::toU32(vpal2.accentSoft);
@@ -2797,7 +2806,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 (st.propertyManager && st.propertyManager->hasPreviewTarget())
                     ? st.propertyManager->targetId() : std::string();
             bool canShowDim = st.hasDocMesh && !inSketch && !st.sketchPlanePickActive &&
-                              !s_viewSelector.active() && !s_pp.active && !dimRenderFid.empty();
+                              !s_viewSelector.active() && !s_pp.active && !ppHandleVisible &&
+                              !dimRenderFid.empty();
             if (canShowDim) {
                 auto cands = dimCandidates(st, dimRenderFid);
                 const auto& vpal2 = ui::palette;

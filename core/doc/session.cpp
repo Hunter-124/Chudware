@@ -144,9 +144,24 @@ struct Session {
     std::map<std::string, std::string> checkpoints;    // PM-cancel snapshots: id -> doc JSON
     std::optional<SketchState> active_sketch;          // C18 sketch-edit lifecycle
 
+    // Read-only compile cache (PERF). `compiled` holds the last compile of `doc`, valid only
+    // while compiled_rev == revision. Every geometry-changing op bumps revision (or starts a
+    // fresh session), and all reads run serialized under the doc lock, so a stale result can
+    // never be served. Interactive read paths — viewport picking, "fillet a whole face" edge
+    // expansion, owner-map refresh — reuse this instead of recompiling the entire feature tree
+    // on every click (measured ~190 ms/click on a modest part before this cache).
+    std::shared_ptr<CompileResult> compiled;
+    long compiled_rev = -1;
+
     // C20 — assembly state. asm_result is the last assembly compile; asm_warm seeds the
     // next mate solve; explode_active/explode_factor drive tessellation-time offsets.
     std::shared_ptr<AssemblyResult> asm_result;        // nullptr until first assembly rebuild
+    // Per-component topology-description cache for assembly picks (PERF). Keyed "<body_id>:<kind>"
+    // -> describe_{faces,edges,vertices}(component). describe_* runs Gauss integration over the
+    // whole component, so without this every click in a big assembly re-derived it. Valid only
+    // while built against the current asm_result (asm_describe_for); a rebuild swaps the pointer.
+    std::map<std::string, std::vector<TopoInfo>> asm_describe_cache;
+    const void* asm_describe_for = nullptr;
     aicad::mate::WarmMap asm_warm;
     bool explode_active = false;
     double explode_factor = 1.0;
@@ -2302,6 +2317,22 @@ json env_from_doc(const json& doc) {
     return env;
 }
 
+// Compile the session's LIVE part doc, reusing the cached result when the doc is unchanged
+// since the last compile. The cache is keyed on `revision`: every geometry-changing op bumps
+// it (or starts a fresh session), and all callers hold the doc lock, so the cache is never
+// stale. This turns repeated read-only queries on a static doc (clicking faces, expanding a
+// face into its edges, refreshing the owner map) from "recompile the whole feature tree each
+// time" into a single compile amortized across the whole interaction. Part docs only — the
+// assembly path compiles via rebuild_assembly / asm_result, not compile_document.
+const CompileResult& ensure_compiled(Session& s) {
+    if (!s.compiled || s.compiled_rev != s.revision) {
+        s.compiled =
+            std::make_shared<CompileResult>(compile_document(s.doc, env_from_doc(s.doc)));
+        s.compiled_rev = s.revision;
+    }
+    return *s.compiled;
+}
+
 std::filesystem::path aicm_file(const std::string& doc_id, long revision) {
     std::filesystem::path dir = std::filesystem::temp_directory_path() / "aicad_cpp_docs";
     std::error_code ec;
@@ -3086,8 +3117,9 @@ json doc_tree(const std::string& doc_id) {
         resp["owner_map"] = json::object();
         return resp;
     }
-    // No revision bump / no tess, but DO carry the owner_map (host picking) — recompute.
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    // No revision bump / no tess, but DO carry the owner_map (host picking) — reuse the cached
+    // compile (recomputes only when the doc changed since the last query).
+    const CompileResult& r = ensure_compiled(s);
     json resp;
     resp["revision"] = s.revision;
     resp["tree"] = s.doc;
@@ -3691,13 +3723,26 @@ json resolve_pick_assembly(Session& s, int body_id, const std::string& kind, int
                     {"component", abody.component_id}};
     }
 
-    std::vector<TopoInfo> infos;
-    if (kind == "face") infos = describe_faces(shape_local);
-    else if (kind == "edge") infos = describe_edges(shape_local);
-    else if (kind == "vertex") infos = describe_vertices(shape_local);
-    else
-        throw OpError("invalid_op", "kind '" + kind + "' must be face|edge|vertex|body",
-                      {{"reason", "bad kind"}});
+    // describe_* runs Gauss integration over the WHOLE component; cache it per (component, kind)
+    // so repeated clicks in a big assembly don't re-derive it. The cache is tied to the current
+    // asm_result — a rebuild swaps the pointer and drops the stale entries.
+    if (s.asm_describe_for != static_cast<const void*>(ares)) {
+        s.asm_describe_cache.clear();
+        s.asm_describe_for = static_cast<const void*>(ares);
+    }
+    const std::string ckey = std::to_string(body_id) + ":" + kind;
+    auto cit = s.asm_describe_cache.find(ckey);
+    if (cit == s.asm_describe_cache.end()) {
+        std::vector<TopoInfo> computed;
+        if (kind == "face") computed = describe_faces(shape_local);
+        else if (kind == "edge") computed = describe_edges(shape_local);
+        else if (kind == "vertex") computed = describe_vertices(shape_local);
+        else
+            throw OpError("invalid_op", "kind '" + kind + "' must be face|edge|vertex|body",
+                          {{"reason", "bad kind"}});
+        cit = s.asm_describe_cache.emplace(ckey, std::move(computed)).first;
+    }
+    const std::vector<TopoInfo>& infos = cit->second;
     if (topo_id < 1 || topo_id > static_cast<int>(infos.size()))
         throw OpError("invalid_op",
                       "topo_id " + std::to_string(topo_id) + " out of range (1.." +
@@ -3714,7 +3759,7 @@ json doc_resolve_pick(const std::string& doc_id, int body_id, const std::string&
     Session& s = require_session(doc_id);
     if (s.is_assembly())
         return resolve_pick_assembly(s, body_id, kind, topo_id);
-    json sel = resolve_pick(s.doc, env_from_doc(s.doc), body_id, kind, topo_id);
+    json sel = resolve_pick(ensure_compiled(s), body_id, kind, topo_id);
     return json{{"selector", sel}};
 }
 
@@ -3724,7 +3769,7 @@ json doc_face_edges(const std::string& doc_id, int body_id, int face_topo_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
     if (s.is_assembly()) return json{{"edges", json::array()}};  // not supported for assemblies
-    std::vector<int> e = face_edges(s.doc, env_from_doc(s.doc), body_id, face_topo_id);
+    std::vector<int> e = face_edges(ensure_compiled(s), body_id, face_topo_id);
     return json{{"edges", e}};
 }
 
@@ -4743,7 +4788,7 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
     if (!selector.is_object() || selector.value("kind", std::string()) != "face")
         throw OpError("invalid_op", "face_points requires a face selector");
 
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    const CompileResult& r = ensure_compiled(s);
     if (r.shapes.empty())
         throw_no_bodies(doc_id, r, "evaluate");
 

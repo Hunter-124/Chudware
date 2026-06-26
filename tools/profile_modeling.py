@@ -87,6 +87,18 @@ def _workloads():
     }
 
 
+# A deliberately non-trivial part used by the INTERACTIVE workloads (pick / open): a plate with
+# a dense ring of holes + a fillet. Picking and opening both re-run the kernel over this whole
+# tree, which is exactly what made clicking a surface / opening a doc slow.
+def _heavy_build():
+    return [_box("Plate", 160, 160, 20), _bolt_circle(24, 120, 6), _fillet(2)]
+
+
+# Interactive workloads don't rebuild a doc per iteration — they build ONCE then exercise an
+# interactive RPC in the sample loop (so the flame graph attributes the per-click / per-open cost).
+INTERACTIVE = ("pick", "open")
+
+
 def _print_status(resp):
     fs = (resp.get("rebuild") or {}).get("feature_status", [])
     bad = [s for s in fs if not s.get("ok")]
@@ -123,13 +135,16 @@ def main(argv):
     args = ap.parse_args(argv[1:])
 
     wls = _workloads()
+    all_names = sorted(list(wls) + list(INTERACTIVE))
     if args.list:
-        print("workloads:", ", ".join(sorted(wls)))
+        print("workloads:", ", ".join(all_names))
+        print("  (pick/open are INTERACTIVE: build once, then sample the per-click / per-open RPC)")
         return 0
-    if args.workload not in wls:
-        print(f"unknown workload '{args.workload}'. choices: {', '.join(sorted(wls))}")
+    if args.workload not in all_names:
+        print(f"unknown workload '{args.workload}'. choices: {', '.join(all_names)}")
         return 2
-    ops = wls[args.workload]
+    interactive = args.workload in INTERACTIVE
+    ops = _heavy_build() if interactive else wls[args.workload]
 
     if not cb.available():
         print("ERROR: libaicad.dll not found/loadable. Build + stage the core first "
@@ -149,19 +164,71 @@ def main(argv):
     except cb.CoreError:
         pass
 
-    # Sample: fresh doc + full build each iteration so the kernel actually recompiles.
+    # Per-workload SETUP runs BEFORE prof_start so it never pollutes the flame graph. For the
+    # interactive workloads this also WARMS the kernel (one cold compile + OCCT lazy init) so the
+    # graph attributes the STEADY-STATE per-click / per-open cost, not the one-time first build.
+    pick_doc = None
+    open_path = None
+    if args.workload == "pick":
+        pick_doc = cb.call("doc_new", {"kind": "part", "name": "prof"}).get("doc_id")
+        cb.call("doc_apply_ops", {"doc_id": pick_doc, "ops": ops})
+        for i in range(12):  # warm up: first pick compiles+caches; the rest are steady-state
+            cb.call("doc_resolve_pick",
+                    {"doc_id": pick_doc, "body_id": 1,
+                     "kind": ("face", "edge")[i % 2], "topo_id": 1 + (i % 6)})
+    elif args.workload == "open":
+        import tempfile
+        open_path = str(Path(tempfile.gettempdir()) / "aicad_prof_open.step+")
+        db = cb.call("doc_new", {"kind": "part", "name": "prof_open"}).get("doc_id")
+        cb.call("doc_apply_ops", {"doc_id": db, "ops": ops})
+        cb.call("doc_save", {"doc_id": db, "path": open_path})
+        try:
+            cb.call("doc_close", {"doc_id": db})
+        except cb.CoreError:
+            pass
+        cb.call("doc_close", {"doc_id": cb.call("doc_open", {"path": open_path})["doc_id"]})  # warm
+
+    # Sample. Modeling workloads rebuild a fresh doc per iteration (so the kernel recompiles).
+    # Interactive workloads hammer the per-click / per-open RPC on the pre-built doc.
     started = cb.call("prof_start", {"hz": args.hz, "mode": "modeling"})
     print(f"  profiler: {started}")
     t0 = time.time()
     iters = 0
-    while time.time() - t0 < args.seconds:
-        d = cb.call("doc_new", {"kind": "part", "name": "prof"}).get("doc_id")
-        cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
+
+    if args.workload == "pick":
+        kinds = ("face", "edge")
+        while time.time() - t0 < args.seconds:
+            k = kinds[iters % 2]
+            topo = 1 + (iters % 8)               # cycle a handful of sub-shapes
+            try:
+                cb.call("doc_resolve_pick",
+                        {"doc_id": pick_doc, "body_id": 1, "kind": k, "topo_id": topo})
+            except cb.CoreError:
+                pass
+            iters += 1
         try:
-            cb.call("doc_close", {"doc_id": d})
+            cb.call("doc_close", {"doc_id": pick_doc})
         except cb.CoreError:
             pass
-        iters += 1
+    elif args.workload == "open":
+        while time.time() - t0 < args.seconds:
+            try:
+                r = cb.call("doc_open", {"path": open_path})
+                od = r.get("doc_id")
+                if od:
+                    cb.call("doc_close", {"doc_id": od})
+            except cb.CoreError:
+                pass
+            iters += 1
+    else:
+        while time.time() - t0 < args.seconds:
+            d = cb.call("doc_new", {"kind": "part", "name": "prof"}).get("doc_id")
+            cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
+            try:
+                cb.call("doc_close", {"doc_id": d})
+            except cb.CoreError:
+                pass
+            iters += 1
     elapsed = time.time() - t0
 
     folded_path = f"{args.out}.folded"
@@ -176,7 +243,9 @@ def main(argv):
         return 1
 
     s = rep["summary"]
-    print(f"\n  {iters} builds in {elapsed:.1f}s  ·  {s['samples']} samples  "
+    unit = {"pick": "picks", "open": "opens"}.get(args.workload, "builds")
+    print(f"\n  {iters} {unit} in {elapsed:.1f}s ({iters/max(elapsed,1e-9):.0f}/s)  ·  "
+          f"{s['samples']} samples  "
           f"({s['unique_stacks']} unique stacks, {s['unresolved_frames']} unresolved frames, "
           f"interval {s['interval_us']}us)")
 

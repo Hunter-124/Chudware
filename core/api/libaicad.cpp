@@ -116,11 +116,15 @@ int emit_error(const std::string& msg, char** out_json) {
 // RPCs that actually do geometry/document work. In "all" mode every call is registered.
 bool prof_is_modeling_method(const std::string& m) {
     // The doc session RPCs are where the OCCT B-rep work (extrude/fillet/boolean/pattern/
-    // tessellate) and the sketch solver run. Renders re-tessellate, so include them.
-    static const std::array<const char*, 14> kModeling = {{
+    // tessellate) and the sketch solver run. Renders re-tessellate, so include them. The
+    // INTERACTIVE read paths (open a doc, resolve a viewport pick, expand a face into its edges,
+    // push-pull-probe a face) also do real kernel work — they were the slow paths reported when
+    // clicking a surface / opening a big assembly — so sample them too by default.
+    static const std::array<const char*, 18> kModeling = {{
         "doc_compile_cpp", "doc_apply_ops", "doc_dry_run_ops", "doc_rebuild",
         "doc_solve_mates", "doc_tree", "doc_new", "doc_checkpoint", "doc_undo",
-        "doc_redo", "doc_render_png", "doc_export", "doc_import", "asm_world_bodies"}};
+        "doc_redo", "doc_render_png", "doc_export", "doc_import", "asm_world_bodies",
+        "doc_open", "doc_resolve_pick", "doc_face_edges", "doc_push_pull"}};
     for (const char* k : kModeling)
         if (m == k) return true;
     return false;

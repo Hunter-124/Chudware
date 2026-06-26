@@ -6381,9 +6381,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
 }
 
 // ----------------------------------------------------------------- resolve_pick
-nlohmann::json resolve_pick(const json& doc, const json& env, int body_id,
+// Overload over an ALREADY-compiled document — lets a caller that holds a cached CompileResult
+// (e.g. an open session) resolve a pick without recompiling the whole feature tree per click.
+nlohmann::json resolve_pick(const CompileResult& r, int body_id,
                             const std::string& kind, int topo_id) {
-    CompileResult r = compile_document(doc, env);
     if (body_id < 1 || body_id > static_cast<int>(r.shapes.size()))
         return json(nullptr);
     const TopoDS_Shape& shape = r.shapes[body_id - 1];
@@ -6406,12 +6407,17 @@ nlohmann::json resolve_pick(const json& doc, const json& env, int body_id,
     return aicad::doc::make_pick_selector(shape, kind, topo_id, owner);
 }
 
+nlohmann::json resolve_pick(const json& doc, const json& env, int body_id,
+                            const std::string& kind, int topo_id) {
+    return resolve_pick(compile_document(doc, env), body_id, kind, topo_id);
+}
+
 // All UNIQUE edge topo_ids (tessellator/host edge ids) bordering face `face_topo_id` of body
 // `body_id`. Powers SolidWorks "select a face to fillet all its edges": the host expands a face
-// pick into individual edge selectors. Empty on a bad body/face id.
-std::vector<int> face_edges(const json& doc, const json& env, int body_id, int face_topo_id) {
+// pick into individual edge selectors. Empty on a bad body/face id. Overload over an
+// already-compiled document so a caller with a cached CompileResult skips the recompile.
+std::vector<int> face_edges(const CompileResult& r, int body_id, int face_topo_id) {
     std::vector<int> out;
-    CompileResult r = compile_document(doc, env);
     if (body_id < 1 || body_id > static_cast<int>(r.shapes.size())) return out;
     const TopoDS_Shape& shape = r.shapes[body_id - 1];
     TopTools_IndexedMapOfShape face_map, edge_map;
@@ -6426,6 +6432,10 @@ std::vector<int> face_edges(const json& doc, const json& env, int body_id, int f
         if (idx >= 1) out.push_back(idx);
     }
     return out;
+}
+
+std::vector<int> face_edges(const json& doc, const json& env, int body_id, int face_topo_id) {
+    return face_edges(compile_document(doc, env), body_id, face_topo_id);
 }
 
 // --------------------------------------------------------------- push-pull (Instant3D)

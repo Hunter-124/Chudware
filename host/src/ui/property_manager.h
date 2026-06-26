@@ -210,6 +210,10 @@ public:
     // True once the create-mode preview feature exists or in edit mode — i.e. there is a concrete
     // feature whose dimensions the viewport may show drag handles for.
     bool hasPreviewTarget() const { return active_ && !targetId_.empty(); }
+    // True only while a form is open on an EXISTING feature via tree "Edit Feature" (not a
+    // create-mode add). Gates the viewport push-pull (drag-to-extrude) arrow so it appears only
+    // when the user is explicitly editing that feature, never on a passive face selection.
+    bool isEditMode() const { return active_ && editMode_; }
 
     // Draw the PM panel into the dock slot (called in place of the tree while active()).
     // Compatibility wrapper: handles the dock-visible / floating-fallback Begin/End, then calls

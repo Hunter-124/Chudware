@@ -148,10 +148,15 @@ PushPullPlan plan_push_pull(const nlohmann::json& doc, const nlohmann::json& env
 // Port of engine/doc/session.py::resolve_pick.
 nlohmann::json resolve_pick(const nlohmann::json& doc, const nlohmann::json& env,
                             int body_id, const std::string& kind, int topo_id);
+// Overload over an already-compiled document (an open session's cached CompileResult) so a pick
+// resolves without recompiling the whole feature tree on every click.
+nlohmann::json resolve_pick(const CompileResult& r, int body_id, const std::string& kind,
+                            int topo_id);
 
 // The unique edge topo_ids bordering a face — for "fillet a whole face" (host expands a face pick
 // into its edges). Empty on a bad id.
 std::vector<int> face_edges(const nlohmann::json& doc, const nlohmann::json& env,
                             int body_id, int face_topo_id);
+std::vector<int> face_edges(const CompileResult& r, int body_id, int face_topo_id);
 
 }  // namespace aicad::doc

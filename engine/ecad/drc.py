@@ -464,14 +464,21 @@ def _net_terminals(board: dict) -> dict[str, list[dict]]:
     """
     n_cu = int(board.get("stackup", {}).get("copper_layers", 2))
     out: dict[str, list[dict]] = {}
-    for fp in board.get("footprints", []):
+    for fpi, fp in enumerate(board.get("footprints", [])):
+        # Pad ids are footprint-LOCAL ('1','2',...), so two different footprints both have a pad
+        # 'p1'. The ratsnest union-find keys terminals by this id, so without a per-footprint prefix
+        # the same-numbered pads of two parts collapse onto ONE node and the net looks already-
+        # connected -> ZERO airwires -> the autorouter routes nothing. Make the terminal id globally
+        # unique by prefixing the footprint's own id/ref.
+        fp_key = fp.get("id") or fp.get("ref") or f"fp{fpi}"
         for pad in fp.get("pads", []):
             net = pad.get("net")
             if not net:
                 continue
             wx, wy = schema.pad_world(fp, pad)
             out.setdefault(net, []).append({
-                "id": pad.get("id", ""), "at": (wx, wy), "layers": _pad_layers(pad, n_cu)})
+                "id": f"{fp_key}:{pad.get('id', '')}", "at": (wx, wy),
+                "layers": _pad_layers(pad, n_cu)})
     for v in board.get("vias", []):
         net = v.get("net")
         if not net:

@@ -102,15 +102,29 @@ def recover_ecad_autosaved(scope: str = "recent"):
         return []
     # Re-establish the "active" docs so ecad_status / ecad_simulate / etc. find a default doc after
     # a restart, mirroring how cad_tools.recover_autosaved sets _CUR["doc_id"].
+    #
+    # CRITICAL: recovery runs on a BACKGROUND warm thread (server._warm_core), so it can finish
+    # AFTER a user has already called ecad_new_schematic/ecad_new_pcb on the fresh server. We must
+    # NOT clobber an active pointer the user just established — otherwise their brand-new doc is
+    # silently shadowed by a stale recovered one and the next op lands in the wrong document.
+    # So: pick the last recovered doc of each kind (most-recently autosaved), but only ADOPT it as
+    # the active pointer if the user has not already set one.
+    picked_sch = picked_pcb = picked_any = None
     for rec in recovered:
         did = rec.get("doc_id")
         if not did:
             continue
         if rec.get("kind") == "sch":
-            _ECAD["current_sch"] = did
+            picked_sch = did
         elif rec.get("kind") == "pcb":
-            _ECAD["current_pcb"] = did
-        _ECAD["current"] = did
+            picked_pcb = did
+        picked_any = did
+    if picked_sch and _ECAD["current_sch"] is None:
+        _ECAD["current_sch"] = picked_sch
+    if picked_pcb and _ECAD["current_pcb"] is None:
+        _ECAD["current_pcb"] = picked_pcb
+    if picked_any and _ECAD["current"] is None:
+        _ECAD["current"] = picked_any
     return recovered
 
 
@@ -176,6 +190,35 @@ def _run_with_budget(fn, budget_s: Optional[float] = None):
     if "e" in box:
         return "error", box["e"]
     return "done", box.get("v")
+
+
+def _provider_reachable(provider, timeout_s: float = 0.6) -> bool:
+    """Fast TCP pre-flight: is the provider's endpoint actually accepting connections?
+
+    The common ecad_design failure mode is a provider configured against a LOCAL model server
+    (LM Studio / llama.cpp / Ollama, e.g. http://localhost:1234/v1) that is NOT running. The
+    OpenAI SDK then spends ~14 s on connect-retries/backoff before raising — which overruns the
+    MCP transport deadline (-32001) even with the plan-budget guard. A sub-second socket connect
+    lets us detect a dead local endpoint and go straight to the instant recipe path.
+
+    Returns True when we cannot tell where the endpoint is (no base_url -> assume a real remote
+    API like api.openai.com): never penalise a correctly-configured cloud provider.
+    """
+    base_url = getattr(provider, "base_url", None)
+    if not base_url:
+        return True  # remote default (no local host:port to probe) — assume reachable
+    try:
+        import socket
+        from urllib.parse import urlparse
+        u = urlparse(base_url)
+        host = u.hostname
+        if host is None:
+            return True
+        port = u.port or (443 if u.scheme == "https" else 80)
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except Exception:  # noqa: BLE001 — refused / unresolved / timed out => treat as down
+        return False
 
 
 def _budget_timeout_err(what: str, *, simplify: str,
@@ -1625,25 +1668,44 @@ def register_ecad_tools(mcp) -> None:
         # Build the output path (default: AI-CAD cache dir named after the board).
         out_path = path or str(_default_out_dir(doc.get("name", "board")) / "board.step")
 
-        try:
-            from engine.ecad.threed import board_to_step  # lazy import; no OCP at module load
-        except ImportError as e:
-            return _err(f"3D exporter unavailable (ImportError: {e})",
-                        hint="engine.ecad.threed could not be imported — "
-                             "OCP/build123d may not be installed in this environment. "
-                             "Use ecad_export('gerber') for fab output.",
-                        next_actions=["ecad_export('gerber')", "ecad_export('drill')"],
-                        available=False)
+        # The FIRST ecad_to_3d call cold-imports OCP/build123d (OpenCASCADE Python bindings) — that
+        # import alone can take 10-30 s in a freshly-warmed server, which on its own overruns the
+        # client transport timeout and gets the server KILLED before any STEP is written. Every
+        # OTHER heavy ECAD tool (simulate/make_board/autoroute/fill/dfm) is budget-guarded; this one
+        # was not. Run the import + geometry build on the bounded worker and autosave first, so an
+        # overrun returns a clean "still running" message instead of a -32001 server kill.
+        _autosave_all_open_ecad()
 
-        try:
-            result = board_to_step(doc, out_path)
-        except Exception as e:  # noqa: BLE001 — BoardGeometryError or any OCP error
+        def _build():
+            from engine.ecad.threed import board_to_step  # lazy import; pulls in OCP/build123d
+            return board_to_step(doc, out_path)
+
+        bstatus, bval = _run_with_budget(_build)
+        if bstatus == "timeout":
+            return _budget_timeout_err(
+                "3D STEP export",
+                simplify="The 3D exporter is still loading/building (the first call cold-loads the "
+                         "OCP/build123d CAD kernel). Retry ecad_to_3d() — the kernel is warm now — "
+                         "or use ecad_export('gerber') for fab output.",
+                next_actions=["ecad_to_3d()  # retry; the CAD kernel is now loaded",
+                              "ecad_export('gerber')"],
+                doc_id=session.doc_id)
+        if bstatus == "error":
+            e = bval
+            if isinstance(e, ImportError):
+                return _err(f"3D exporter unavailable (ImportError: {e})",
+                            hint="engine.ecad.threed could not be imported — "
+                                 "OCP/build123d may not be installed in this environment. "
+                                 "Use ecad_export('gerber') for fab output.",
+                            next_actions=["ecad_export('gerber')", "ecad_export('drill')"],
+                            available=False)
             return _err(f"3D export failed: {type(e).__name__}: {e}",
                         hint="Check that the board has a closed Edge.Cuts outline "
                              "(pcb_set_outline op, closed=True). "
                              "An empty outline or open chain raises BoardGeometryError.",
                         next_actions=["ecad_run_drc()  # confirms outline is present",
                                       "ecad_status()"])
+        result = bval
 
         step_path = result.get("step_path", out_path)
         summary   = result.get("summary", {})
@@ -1705,6 +1767,15 @@ def register_ecad_tools(mcp) -> None:
             provider = _cfg.get_provider()
         except Exception:  # noqa: BLE001 -- offline / unconfigured / module absent
             pass
+
+        # Fast pre-flight: if the provider points at a LOCAL model server that is down (the most
+        # common case — LM Studio/llama.cpp not started), a real provider.complete() would burn
+        # ~14 s on connect-retries and overrun the MCP deadline before falling back. A sub-second
+        # socket probe lets us skip straight to the instant recipe path instead.
+        provider_unreachable = False
+        if provider is not None and not _provider_reachable(provider):
+            provider_unreachable = True
+            provider = None
 
         # The model-planning stage can stall on a slow/loading local server (LM Studio,
         # llama.cpp) well past the MCP request budget — and ecad_design must ALWAYS return a
@@ -1804,6 +1875,9 @@ def register_ecad_tools(mcp) -> None:
         hint = ((f"The configured model server did not plan within {_PLAN_BUDGET_S:.0f}s — used "
                  "the built-in recipe instead (it is loading/slow; the schematic is still verified). "
                  if provider_timed_out else "")
+                + ("The configured model server is not reachable — used the built-in recipe "
+                   "instead (the schematic is still verified). "
+                   if provider_unreachable else "")
                 + f"Design '{request}' produced with stop_reason={stop!r}. "
                 + (f"Recipe fallback used: {recipe!r}. " if recipe else "")
                 + (f"ERC: {erc.get('errors', 0)} error(s), "
@@ -2812,7 +2886,9 @@ def _summarize_sweep(dc: dict, reading_lines: list[str], unit: str = "V") -> dic
             continue
         out["traces"][p] = {"first": _round(vals[0]), "last": _round(vals[-1]),
                             "min": _round(min(fin)), "max": _round(max(fin))}
-        reading_lines.append(f"{p}: {_round(fin[0])}->{_round(fin[-1])} {unit} over sweep")
+        # A current probe (I(...)) is amps, not volts — don't label it with the voltage unit.
+        u = "A" if str(p).startswith(("I(", "i(")) else unit
+        reading_lines.append(f"{p}: {_round(fin[0])}->{_round(fin[-1])} {u} over sweep")
     return out
 
 

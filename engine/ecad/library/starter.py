@@ -455,7 +455,9 @@ def _make_symbols() -> dict:
         _pin("2", "TRIG", [-ne555_w / 2 - 2.54, -ne555_h / 2 + 1.27 + 2.54], 180.0, "input"),
         _pin("3", "OUT", [ne555_w / 2 + 2.54, -ne555_h / 2 + 1.27 + 2.54 * 2], 0.0, "output"),
         _pin("4", "RST", [ne555_w / 2 + 2.54, -ne555_h / 2 + 1.27 + 2.54 * 3], 0.0, "input"),
-        _pin("5", "CV", [ne555_w / 2 + 2.54, ne555_h / 2 - 1.27 - 2.54 * 2], 0.0, "input"),
+        # CV sat at the SAME (x,y) as RST (both y=1.27) -> the netlist union-find silently
+        # shorted RST and CV onto one net. Drop it one grid row to its own connection point.
+        _pin("5", "CV", [ne555_w / 2 + 2.54, -ne555_h / 2 + 1.27 + 2.54], 0.0, "input"),
         _pin("6", "THR", [-ne555_w / 2 - 2.54, ne555_h / 2 - 1.27 - 2.54], 180.0, "input"),
         _pin("7", "DIS", [-ne555_w / 2 - 2.54, ne555_h / 2 - 1.27], 180.0, "open_collector"),
         _pin("8", "VCC", [ne555_w / 2 + 2.54, ne555_h / 2 - 1.27], 0.0, "power_in"),

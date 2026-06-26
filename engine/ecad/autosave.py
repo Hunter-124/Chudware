@@ -121,18 +121,45 @@ def remove(doc_id: Optional[str]) -> None:
         pass
 
 
-def prune(max_age_days: float = _MAX_AGE_DAYS) -> int:
-    """Delete autosaves older than ``max_age_days`` (by mtime). Returns the count removed."""
+# Hard cap on the number of autosave files kept, regardless of age. Recovery reopens prior-session
+# docs under FRESH ids and re-saves them, so without a cap the directory grows by ~N docs every
+# restart and old-session files (younger than the age cutoff) never get cleaned. Keep only the most
+# recent few dozen by mtime.
+try:
+    _MAX_FILES = int(os.environ.get("AI_CAD_ECAD_AUTOSAVE_MAX_FILES", "") or 40)
+except (TypeError, ValueError):
+    _MAX_FILES = 40
+if _MAX_FILES < 1:
+    _MAX_FILES = 40
+
+
+def prune(max_age_days: float = _MAX_AGE_DAYS, max_files: int = _MAX_FILES) -> int:
+    """Delete autosaves older than ``max_age_days`` (by mtime), then cap the directory to the
+    ``max_files`` most-recent files. Returns the count removed."""
     n = 0
     cutoff = time.time() - max_age_days * 86400.0
     try:
+        survivors: list = []
         for p in autosave_dir().glob("*.json"):
             try:
-                if p.stat().st_mtime < cutoff:
-                    p.unlink(missing_ok=True)
-                    n += 1
+                mt = p.stat().st_mtime
             except OSError:
                 continue
+            if mt < cutoff:
+                p.unlink(missing_ok=True)
+                n += 1
+            else:
+                survivors.append((mt, p))
+        # Count-cap: drop the oldest survivors beyond the limit so the dir can't grow unbounded
+        # across restarts (the recovery-churn fix).
+        if max_files and len(survivors) > max_files:
+            survivors.sort(key=lambda t: t[0], reverse=True)
+            for _mt, p in survivors[max_files:]:
+                try:
+                    p.unlink(missing_ok=True)
+                    n += 1
+                except OSError:
+                    continue
     except Exception:  # noqa: BLE001
         pass
     return n
@@ -197,6 +224,16 @@ def recover_ecad_autosaved(scope: str = "recent") -> list:
             out.append({"doc_id": session.doc_id, "kind": session.kind,
                         "name": doc.get("name", ""),
                         "original_doc_id": payload.get("doc_id")})
+            # MIGRATE the file: persist the reopened doc under its NEW id (current session tag) and
+            # delete the stale prior-session source. Without this, every restart leaves the old file
+            # behind AND writes a new one, so the directory grows by ~N docs per restart forever.
+            try:
+                if _STATE["enabled"]:
+                    autosave_session(session)  # write the doc under its new id (current session)
+                    if p.name != f"{session.doc_id}.json":
+                        p.unlink(missing_ok=True)  # only after the new file is safely written
+            except Exception:  # noqa: BLE001 — migration is best-effort; never fail recovery
+                pass
         except Exception:  # noqa: BLE001
             continue
     return out

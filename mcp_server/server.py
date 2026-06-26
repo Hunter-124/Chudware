@@ -95,6 +95,22 @@ def _warm_core() -> None:
         recover_ecad_autosaved()
     except Exception:
         pass
+    # Pre-warm the heavy PURE-PYTHON import stacks the ECAD tools lazy-import on first use, so the
+    # FIRST ecad_simulate / ecad_to_3d call doesn't pay a cold import INSIDE the client's transport
+    # window. This matters more than usual here: a cold-import overrun trips -32001, which KILLS the
+    # server, so the import never gets cached — every retry re-pays it and times out again (a vicious
+    # loop). Importing them once in the background breaks that. Best-effort; never blocks the DLL warm.
+    try:
+        # scipy-backed SPICE simulator (ecad_simulate) — ~0.4 s cold.
+        from engine.sim.spice import netlist_to_spice_circuit  # noqa: F401
+        from engine.sim.circuit import simulate as _sim_warm  # noqa: F401
+    except Exception:
+        pass
+    try:
+        # OCP/build123d 3D kernel (ecad_to_3d) — can be many seconds cold.
+        from engine.ecad.threed import board_to_step  # noqa: F401
+    except Exception:
+        pass
     try:
         from mcp_server import core_bridge
         core_bridge.available()

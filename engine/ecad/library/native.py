@@ -219,7 +219,13 @@ class Library:
 
 
 def _score(query: str, *fields: str) -> int:
-    """Simple keyword scoring: exact name match = 10, substring = 1 per field."""
+    """Keyword scoring: exact field match = 10, whole-query substring = 1 per field.
+
+    Multi-word queries ALSO credit individual words, so a natural request like 'red LED' or
+    'connector header' still matches when no single field contains the whole phrase (the AND-only
+    behaviour previously returned ZERO hits for such queries). Single-word queries are unaffected —
+    the token loop is skipped, so their scores are byte-for-byte identical to before.
+    """
     if not query:
         return 0
     total = 0
@@ -229,6 +235,19 @@ def _score(query: str, *fields: str) -> int:
             total += 10
         elif query in fl:
             total += 1
+    tokens = query.split()
+    if len(tokens) > 1:
+        for field in fields:
+            fl = field.lower()
+            if not fl:
+                continue
+            for tok in tokens:
+                if not tok:
+                    continue
+                if tok == fl:
+                    total += 5
+                elif tok in fl:
+                    total += 1
     return total
 
 

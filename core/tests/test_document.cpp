@@ -2455,6 +2455,80 @@ TEST_CASE("text: an emboss that overhangs the face is rejected (no detached lett
     CHECK(nsolids == 1);
 }
 
+// Side-face reading direction (regression). On a VERTICAL face a planar face's parametric X axis
+// often points along world Z, which laid the text out VERTICALLY and overflowed a short wall — e.g.
+// "AI-CAD" on a 60x10 front face came out detached -> "overhang"/unmarked fallback. The handler now
+// overrides xdir to the horizontal in-plane direction (with "up" toward +Z) for any non-horizontal
+// face, so a string that fits the face WIDTH marks cleanly even when far taller than the face HEIGHT.
+TEST_CASE("text: emboss on a vertical FRONT face reads horizontally (not off the short axis)") {
+    const double L = 60.0, W = 30.0, Hh = 10.0;       // front face = 60 (x) x 10 (z): wide but short
+    const json front_face = json{{"of", "face"}, {"side", "front"}};
+    const double plain_vol = L * W * Hh;
+    json doc;
+    doc["features"] = json::array({
+        json{{"id", "blk"}, {"type", "box"}, {"length", L}, {"width", W}, {"height", Hh}},
+        json{{"id", "txt"}, {"type", "text"}, {"text", "AI-CAD"}, {"height", 5.0},
+             {"depth", 0.8}, {"mode", "emboss"}, {"target_face", front_face}},
+    });
+    CompileResult r = compile_document(doc, json::object());
+    for (const auto& s : r.statuses)
+        if (!s.ok) MESSAGE("feature " << s.id << " error: " << s.error);
+    const aicad::doc::FeatureStatus* tx = status_of(r, "txt");
+    REQUIRE(tx != nullptr);
+    CHECK(tx->ok);
+    REQUIRE(r.ok);
+    REQUIRE(r.body_count == 1);
+    REQUIRE(r.shapes.size() == 1);
+    CHECK(BRepCheck_Analyzer(r.shapes[0]).IsValid());
+    const double marked_vol = total_shape_volume(r);
+    MESSAGE("front emboss: plain_vol=" << plain_vol << " marked_vol=" << marked_vol
+            << " warning='" << tx->warning << "'");
+    // The fix: "AI-CAD" (~25 mm wide) fits the 60 mm face WIDTH and must not overhang the 10 mm
+    // height. With the old vertical xdir it overflowed -> "overhang"/"unmarked"; now it marks.
+    CHECK(tx->warning.find("overhang") == std::string::npos);
+    CHECK(tx->warning.find("unmarked") == std::string::npos);
+    CHECK(marked_vol > plain_vol + 1e-3);   // raised mark ADDS material (proves the mark landed)
+    CHECK(marked_vol < 1.05 * plain_vol);
+}
+
+// Boolean operand guard: a default-mode ("boss") primitive FUSES into the running body and
+// consumes it, so a later explicit boolean that names the consumed feature would silently
+// operate on the MERGED body (common(A, A∪B) = A) and return a plausible-but-wrong solid. The
+// handler now errors loudly and points at merge:false. The correct form (merge:false keeps the
+// second box separate) intersects to the true overlap.
+TEST_CASE("boolean: a consumed (auto-merged) operand errors instead of a silent wrong solid") {
+    json doc;
+    doc["features"] = json::array({
+        json{{"id", "ba"}, {"type", "box"}, {"length", 40}, {"width", 40}, {"height", 40}},
+        // default mode "boss" -> fuses into ba and CONSUMES ba.
+        json{{"id", "bb"}, {"type", "box"}, {"length", 40}, {"width", 40}, {"height", 40},
+             {"at", json::array({20, 0, 0})}},
+        json{{"id", "cmn"}, {"type", "boolean"}, {"op", "common"}, {"a", "ba"}, {"b", "bb"}},
+    });
+    CompileResult r = compile_document(doc, json::object());
+    const aicad::doc::FeatureStatus* st = status_of(r, "cmn");
+    REQUIRE(st != nullptr);
+    CHECK_FALSE(st->ok);                                   // not a silent success
+    CHECK(st->error.find("merge") != std::string::npos);  // tells the caller to use merge:false
+}
+
+TEST_CASE("boolean: common of two merge:false boxes intersects to the true overlap") {
+    json doc;
+    doc["features"] = json::array({
+        json{{"id", "ba"}, {"type", "box"}, {"length", 40}, {"width", 40}, {"height", 40}},
+        json{{"id", "bb"}, {"type", "box"}, {"length", 40}, {"width", 40}, {"height", 40},
+             {"at", json::array({20, 0, 0})}, {"merge", false}},  // separate body
+        json{{"id", "cmn"}, {"type", "boolean"}, {"op", "common"}, {"a", "ba"}, {"b", "bb"}},
+    });
+    CompileResult r = compile_document(doc, json::object());
+    for (const auto& s : r.statuses)
+        if (!s.ok) MESSAGE("feature " << s.id << " error: " << s.error);
+    REQUIRE(r.ok);
+    REQUIRE(r.body_count == 1);
+    // A=[-20,20]³ ∩ B=[0,40]³ = [0,20]×[-20,20]×[-20,20] = 20*40*40 = 32000 mm³.
+    CHECK(total_shape_volume(r) == doctest::Approx(32000.0).epsilon(1e-3));
+}
+
 // P3: a boolean fuse / boss-merge of two DISJOINT solids (two cylinders placed far apart)
 // leaves a single TopoDS_Compound holding TWO TopAbs_SOLIDs — OCCT does not weld bodies that
 // do not touch. doc_eval_mass must report the PHYSICAL body count (2) by exploding the

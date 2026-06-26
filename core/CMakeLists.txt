@@ -602,6 +602,21 @@ if(AICAD_WITH_OCCT)
   add_test(NAME import_roundtrip COMMAND test_import_roundtrip)
   set_tests_properties(import_roundtrip PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- Assembly export: doc_export_file/step/estimate must world-place component bodies --
+  # (regression for "file exports do nothing for assemblies" — exports compiled the
+  # assembly doc as a part, which has no features, so the writer got zero bodies).
+  add_executable(test_export_assembly
+    tests/test_export_assembly.cpp)
+  target_include_directories(test_export_assembly PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_export_assembly PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  set_target_properties(test_export_assembly PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME export_assembly COMMAND test_export_assembly)
+  set_tests_properties(export_assembly PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- Wave 2 milestone: the document model — a rebuildable feature tree ------
   # core/doc/document.cpp orchestrates solve_sketch -> faces_from_solved_sketch ->
   # extrude/revolve -> fuse/cut/common -> fillet/chamfer into a part, keyed by

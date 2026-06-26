@@ -549,6 +549,41 @@ ResolveResult resolve(const nlohmann::json& selector,
         }
     }
 
+    // ── Area/size tie-break for COAXIAL faces (a bore vs the boss around it) ─────────
+    // Coaxial cylinders share an axis AND an on-axis centroid, so neither the score's
+    // centroid term nor the signed-axis break above can separate them (same axis → align
+    // gap ≈ 0) — they dangle as "symmetric" even though doc_query (resolve_geom_query,
+    // which keys on radius/near) resolves the very same selector to ONE face. A FEA load on
+    // a bored boss's inner cylinder hit exactly this. When the selector carries the recorded
+    // face AREA (area_or_len), prefer the band candidate whose area matches it — the bore's
+    // area is distinct from the boss's. Gated to a CLEAR winner so a true area tie (a plate's
+    // equal top/bottom) still defers to the axis break / honest ambiguity above.
+    bool sel_has_area = selector.contains("area_or_len") &&
+                        selector.at("area_or_len").is_number() &&
+                        selector.at("area_or_len").get<double>() > 1e-9;
+    if (best_score < 0.35 && sel_has_area && scored.size() > 1) {
+        const double sel_area = selector.at("area_or_len").get<double>();
+        const TopoInfo* pick = nullptr;
+        double best_rel = INF, second_rel = INF;
+        int n_in_band = 0;
+        bool measure_less = false;
+        for (const auto& pr : scored) {
+            if (pr.first - best_score > 0.05) break;        // outside ambiguous band
+            if (!pr.second->measure.has_value()) { measure_less = true; break; }
+            ++n_in_band;
+            const double m = *pr.second->measure;
+            const double rel = std::fabs(m - sel_area) / std::max(std::max(sel_area, m), 1e-9);
+            if (rel < best_rel) { second_rel = best_rel; best_rel = rel; pick = pr.second; }
+            else if (rel < second_rel) { second_rel = rel; }
+        }
+        // Winner must MATCH the recorded area (<10%) and clearly beat the runner-up (>10%
+        // apart) — so two equal-area faces never resolve here (they fall through to dangle).
+        if (pick && !measure_less && n_in_band >= 2 && best_rel < 0.10 &&
+            second_rel - best_rel > 0.10) {
+            return ResolveResult{pick->index, best_score, second_score, std::nullopt};
+        }
+    }
+
     // Dangling — explain why (match the Python reason strings).
     std::string reason;
     if (best_score >= 0.35) {

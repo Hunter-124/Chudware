@@ -812,3 +812,42 @@ TEST_CASE("Failing derived view is contained, not thrown, in drawing_get (D3-fol
     CHECK(saw_bad_section);  // and the failing derived view is present (errored, not crashing)
     doc::drawing_close(did);
 }
+
+// Auto-section placement must stay ON the sheet (regression). The default section position was
+// parent.x + 120 mm with no sheet clamp; when the parent ortho view already sits in the right-most
+// grid column (sectioning the "right" view of a front/top/right/iso layout) that pushed the section
+// past the sheet's right edge, where it rendered as a clipped sliver. drawing_add_section now drops
+// the section BELOW the parent when +120 would overflow, clamped to the drawable area.
+TEST_CASE("make_drawing auto-section stays inside the sheet (right-column parent)") {
+    const std::string id = make_block();
+    json mk = doc::drawing_make(id, json{
+        {"views", json::array({"front", "top", "right", "iso"})},
+        {"sections", json::array({json{{"parent", "right"}, {"axis", "vertical"}, {"mode", "full"}}})}});
+    const std::string did = mk.at("doc_id").get<std::string>();
+    json full = doc::drawing_get(did);
+    REQUIRE(full.contains("sheets"));
+    const json& sheet = full["sheets"][0];
+    const json& mm = sheet.value("size_mm", json(nullptr));
+    REQUIRE(mm.is_array());
+    const double sw = mm[0].get<double>(), shh = mm[1].get<double>();
+    bool saw_section = false;
+    for (const json& v : sheet.value("views", json::array())) {
+        if (v.value("type", std::string()) != "section") continue;
+        saw_section = true;
+        const json& pos = v.value("position", json(nullptr));
+        REQUIRE(pos.is_array());
+        const double px = pos[0].get<double>(), py = pos[1].get<double>();
+        MESSAGE("section pos=(" << px << "," << py << ") sheet=" << sw << "x" << shh);
+        CHECK(px >= 0.0);            // old code: ~parent_x + 120 ~= 460 > 420 (off the right edge)
+        CHECK(px <= sw);
+        CHECK(py >= 0.0);
+        CHECK(py <= shh);
+        const json& bb = v.value("bbox", json(nullptr));
+        if (bb.is_array() && bb.size() == 4 && bb[0].is_number()) {
+            CHECK(bb[2].get<double>() <= sw + 1.0);   // bbox right edge on-sheet
+            CHECK(bb[0].get<double>() >= -1.0);
+        }
+    }
+    CHECK(saw_section);
+    doc::drawing_close(did);
+}

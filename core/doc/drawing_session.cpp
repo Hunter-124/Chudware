@@ -884,6 +884,22 @@ json drawing_add_section(const std::string& doc_id, const std::string& parent_vi
                           : next_label(s.doc);
     double p_scale = parent->value("scale", 1.0);
     std::array<double, 2> p_pos = get_pos(parent->value("position", json::array({0.0, 0.0})));
+    // Default placement: to the RIGHT of the parent — but never off the sheet. If +120 mm would
+    // push the section past the right margin (e.g. the parent already sits in the right-most grid
+    // column), drop it BELOW the parent instead, both clamped to the drawable area. Without this a
+    // right-most auto-section landed at x>sheet_w and rendered as a clipped sliver off the edge.
+    double def_x = p_pos[0] + 120.0, def_y = p_pos[1];
+    {
+        std::array<double, 2> ssz = sheet_dims("A3");
+        const json& smm = sheet.value("size_mm", json(nullptr));
+        if (smm.is_array() && smm.size() == 2 && smm[0].is_number() && smm[0].get<double>() > 0.0)
+            ssz = {smm[0].get<double>(), smm[1].get<double>()};
+        const double smarg = 20.0;
+        if (def_x > ssz[0] - smarg) {  // overflows right edge -> place below the parent
+            def_x = std::min(std::max(p_pos[0], smarg), ssz[0] - smarg);
+            def_y = std::max(smarg, p_pos[1] - 110.0);
+        }
+    }
     json view = {
         {"id", next_view_id(s.doc)},
         {"type", "section"},
@@ -893,7 +909,7 @@ json drawing_add_section(const std::string& doc_id, const std::string& parent_vi
         {"scale", scale.is_number() ? scale.get<double>() : (p_scale != 0.0 ? p_scale : 1.0)},
         {"position", is_xy(position)
                          ? json::array({position[0].get<double>(), position[1].get<double>()})
-                         : json::array({p_pos[0] + 120.0, p_pos[1]})},
+                         : json::array({def_x, def_y})},
         {"show_hidden", show_hidden.is_boolean() ? show_hidden.get<bool>() : false},
     };
     if (plane.is_object()) view["plane"] = plane;
@@ -1842,6 +1858,7 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
         // front view, or any body not modelled about the origin) sits at a cell EDGE instead of
         // the middle, reading as a thin strip crammed against one side with dead space opposite.
         std::map<std::string, std::array<double, 2>> view_center;  // vid -> (cx,cy) model mm
+        std::map<std::string, std::array<double, 2>> view_half;    // vid -> (halfw,halfh) model mm
         if (probe.contains("sheets") && probe["sheets"].is_array())
             for (const auto& sh : probe["sheets"])
                 for (const auto& v : sh.value("views", json::array())) {
@@ -1850,9 +1867,12 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
                         fw = std::max(fw, bb[2].get<double>() - bb[0].get<double>());
                         fh = std::max(fh, bb[3].get<double>() - bb[1].get<double>());
                         std::string vid = v.value("view_id", v.value("id", std::string()));
-                        if (!vid.empty())
+                        if (!vid.empty()) {
                             view_center[vid] = {(bb[0].get<double>() + bb[2].get<double>()) / 2.0,
                                                 (bb[1].get<double>() + bb[3].get<double>()) / 2.0};
+                            view_half[vid] = {(bb[2].get<double>() - bb[0].get<double>()) / 2.0,
+                                              (bb[3].get<double>() - bb[1].get<double>()) / 2.0};
+                        }
                     }
                 }
         // Sheet drawable area (the real sheet mm; default A3 if size_mm is missing).
@@ -1903,6 +1923,20 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
             if (it != view_center.end()) {
                 px = cx_cell - it->second[0] * chosen_scale;
                 py = cy_cell - it->second[1] * chosen_scale;
+                // Keep the view's scaled projected bbox inside the sheet margins. Without this an
+                // off-origin part (built away from the origin, e.g. a base + a tall wall whose Z
+                // centre is well above 0) lands a view at negative / over-width sheet mm, drawn off
+                // the paper edge. Leave ~26 mm extra on the LEFT for the model-items overall-height
+                // dimension (placed at minx-12 plus its text/extension lines).
+                auto hf = view_half.find(p.vid);
+                if (hf != view_half.end()) {
+                    const double hw = hf->second[0] * chosen_scale;
+                    const double hh = hf->second[1] * chosen_scale;
+                    const double lo_x = margin + hw + 26.0, hi_x = sz[0] - margin - hw;
+                    const double lo_y = margin + hh,        hi_y = sz[1] - margin - hh;
+                    if (hi_x > lo_x) px = std::min(std::max(px, lo_x), hi_x);
+                    if (hi_y > lo_y) py = std::min(std::max(py, lo_y), hi_y);
+                }
             }
             try {
                 drawing_set_view(doc_id, p.vid, json(chosen_scale), json::array({px, py}),

@@ -466,10 +466,56 @@ def _op_sch_connect(doc, op, index, idgen, id_map, warnings):
 
     ax, ay = _endpoint(frm)
     bx, by = _endpoint(to)
-    if abs(ax - bx) < 1e-6 or abs(ay - by) < 1e-6:
-        pts = [[ax, ay], [bx, by]]            # already axis-aligned -> straight segment
+
+    # Other pins to route AROUND: the auto-route must not lay a wire vertex (or segment) onto a
+    # THIRD pin, or the netlist union-find silently shorts that pin into the net. A bare manhattan
+    # L elbow at (bx, ay) lands exactly on a stacked-aligned neighbour pin (e.g. R1.1 above R2.1 in
+    # a divider), so wiring R1.2->R2.1 would also short R1.1. Collect every other placed pin and
+    # pick the first candidate route whose segments touch none of them.
+    TOL = 1e-6
+    others: list[tuple[float, float]] = []
+    for _sym, _pin, (wx, wy) in schema.iter_placed_pins(doc):
+        if (abs(wx - ax) < TOL and abs(wy - ay) < TOL) or \
+           (abs(wx - bx) < TOL and abs(wy - by) < TOL):
+            continue  # the two endpoints themselves
+        others.append((wx, wy))
+
+    def _on_seg(p, s, e) -> bool:
+        px, py = p
+        sx, sy = s
+        ex, ey = e
+        if abs(sx - ex) < TOL:          # vertical segment
+            return abs(px - sx) < TOL and (min(sy, ey) - TOL) <= py <= (max(sy, ey) + TOL)
+        if abs(sy - ey) < TOL:          # horizontal segment
+            return abs(py - sy) < TOL and (min(sx, ex) - TOL) <= px <= (max(sx, ex) + TOL)
+        return False
+
+    def _clear(route) -> bool:
+        for s, e in zip(route, route[1:]):
+            for q in others:
+                if _on_seg(q, s, e):
+                    return False
+        return True
+
+    mx, my = (ax + bx) / 2.0, (ay + by) / 2.0
+    if abs(ax - bx) < TOL or abs(ay - by) < TOL:
+        # Already axis-aligned: a straight segment, unless a pin sits ON it -> jog around it.
+        straight = [[ax, ay], [bx, by]]
+        if abs(ax - bx) < TOL:  # vertical line -> jog in x
+            d = 2.54
+            detour = [[ax, ay], [ax + d, ay], [ax + d, by], [bx, by]]
+        else:                   # horizontal line -> jog in y
+            d = 2.54
+            detour = [[ax, ay], [ax, ay + d], [bx, ay + d], [bx, by]]
+        candidates = [straight, detour]
     else:
-        pts = [[ax, ay], [bx, ay], [bx, by]]  # manhattan L: horizontal then vertical
+        candidates = [
+            [[ax, ay], [bx, ay], [bx, by]],            # L: horizontal then vertical (legacy default)
+            [[ax, ay], [ax, by], [bx, by]],            # L: vertical then horizontal
+            [[ax, ay], [mx, ay], [mx, by], [bx, by]],  # Z through the x-midpoint (clears stacked pins)
+            [[ax, ay], [ax, my], [bx, my], [bx, by]],  # Z through the y-midpoint
+        ]
+    pts = next((c for c in candidates if _clear(c)), candidates[0])
     clean = _orthogonalize(pts)
     wid = idgen.next("w")
     doc.setdefault("wires", []).append(

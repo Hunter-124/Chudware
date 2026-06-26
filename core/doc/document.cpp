@@ -3343,6 +3343,18 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 const std::string op = req_str(feat, "op");
                 const std::string a_id = req_str(feat, "a");
                 const std::string b_id = req_str(feat, "b");
+                // NO SILENT WRONG GEOMETRY: a boolean operand whose body was already CONSUMED by
+                // an earlier merge (a default-mode "boss" primitive fuses into the running body
+                // and consumes it) no longer exists as a standalone solid — results[id] now holds
+                // the MERGED body, so common/cut would quietly operate on the wrong shape (e.g.
+                // common(A, A∪B) = A). Error loudly and tell the caller to keep the operand
+                // separate with merge:false, instead of returning a plausible-but-wrong solid.
+                for (const std::string& opnd : {a_id, b_id})
+                    if (consumed.count(opnd))
+                        throw std::runtime_error(
+                            "boolean: operand '" + opnd + "' was already merged into another body "
+                            "(a default primitive fuses with mode:\"boss\") — build that body with "
+                            "\"merge\":false so it stays a separate solid for the boolean");
                 const TopoDS_Shape& a = require_solid(results, a_id, "a");
                 const TopoDS_Shape& b = require_solid(results, b_id, "b");
 
@@ -6026,6 +6038,25 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 gp_Dir normal = pln.Axis().Direction();
                 if (tface.Orientation() == TopAbs_REVERSED) normal.Reverse();
                 gp_Dir xdir = pln.XAxis().Direction();
+                // READING DIRECTION. A planar face's parametric X axis is arbitrary — on a
+                // VERTICAL wall (a box side) OCCT's X often points along world Z, which would
+                // lay the text out VERTICALLY and overflow a short wall (e.g. "AI-CAD" on a
+                // 60x10 front face -> detached/overhang). For any non-horizontal face, override
+                // xdir to the HORIZONTAL in-plane direction so the text reads left-to-right with
+                // "up" toward +Z, the way a person letters a side face. Horizontal faces
+                // (normal ~ +/-Z) keep the parametric X (already world-X on a box top).
+                {
+                    const gp_Dir worldZ(0.0, 0.0, 1.0);
+                    const double ndotz = normal.Dot(worldZ);
+                    if (std::abs(ndotz) < 0.999) {
+                        gp_Vec up(gp_Vec(worldZ) - gp_Vec(normal).Multiplied(ndotz));
+                        if (up.Magnitude() > 1e-7) {
+                            up.Normalize();
+                            gp_Vec xd = up.Crossed(gp_Vec(normal));  // xdir = up x normal
+                            if (xd.Magnitude() > 1e-7) xdir = gp_Dir(xd);
+                        }
+                    }
+                }
 
                 GProp_GProps fprops;
                 BRepGProp::SurfaceProperties(tface, fprops);

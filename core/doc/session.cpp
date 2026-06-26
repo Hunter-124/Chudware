@@ -3789,15 +3789,26 @@ std::vector<std::array<double, 3>> sample_face_nodes(const TopoDS_Face& face) {
 // an open SHELL / lone FACE / WIRE, or a SOLID/COMPSOLID whose VolumeProperties mass is
 // ≈0 while its SurfaceProperties area is positive (a degenerate sheet). A COMPOUND that
 // wraps any SOLID is NOT a surface. Defaults to the solid path (false) on OCCT errors.
-bool eval_is_surface_shape(const TopoDS_Shape& shape) {
+// out_vp (optional): receives the VolumeProperties of a SOLID/COMPSOLID so a caller (eval_mass)
+// can REUSE it instead of recomputing the same volume integral. *out_vp_computed reports whether
+// it was filled (only the SOLID/COMPSOLID branch computes it).
+bool eval_is_surface_shape(const TopoDS_Shape& shape, GProp_GProps* out_vp = nullptr,
+                           bool* out_vp_computed = nullptr) {
+    if (out_vp_computed) *out_vp_computed = false;
     try {
         const TopAbs_ShapeEnum st = shape.ShapeType();
         if (st == TopAbs_SOLID || st == TopAbs_COMPSOLID) {
             GProp_GProps vp;
             BRepGProp::VolumeProperties(shape, vp);
+            if (out_vp) { *out_vp = vp; if (out_vp_computed) *out_vp_computed = true; }
+            // PERF: a degenerate sheet is only possible when the ENCLOSED VOLUME is ~0. A normal
+            // solid (the overwhelming common case, hit per-body on every rebuild) has real volume,
+            // so short-circuit BEFORE the expensive SurfaceProperties Gauss area integration over
+            // every face — its result is discarded once vp.Mass() is non-zero anyway.
+            if (std::fabs(vp.Mass()) >= 1e-9) return false;
             GProp_GProps sp;
             BRepGProp::SurfaceProperties(shape, sp);
-            return std::fabs(vp.Mass()) < 1e-9 && sp.Mass() > 1e-9;
+            return sp.Mass() > 1e-9;
         }
         if (st == TopAbs_COMPOUND) {
             TopTools_IndexedMapOfShape solids;
@@ -3865,11 +3876,37 @@ bool eval_is_closed_solid(const TopoDS_Shape& shape) {
 
 }  // namespace
 
+// Gather the shapes to hand a file writer. Assembly docs resolve their geometry through
+// compile_assembly (loaded components + solved mate poses), NOT compile_document — so an
+// assembly export must WORLD-PLACE each component body off the cached AssemblyResult.
+// Without this branch an assembly compiles to nothing (compile_document sees no features)
+// and every export threw "no bodies to export". No explode offset: an export captures the
+// assembled configuration, not the exploded view. Parts fall through to compile_document.
+// Mirror of tessellate_session_bodies' assembly branch, but yielding exact B-rep shapes.
+static std::vector<TopoDS_Shape> gather_export_shapes(Session& s) {
+    if (s.is_assembly()) {
+        if (!s.asm_result) rebuild_assembly(s);
+        std::vector<TopoDS_Shape> shapes;
+        const AssemblyResult* ares = s.asm_result.get();
+        if (ares)
+            for (const AsmBodyOut& body : ares->bodies) {
+                try {
+                    TopoDS_Shape world = placed_world_shape(body, std::nullopt);
+                    if (!world.IsNull()) shapes.push_back(world);
+                } catch (...) {
+                }
+            }
+        return shapes;
+    }
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    return r.shapes;
+}
+
 json doc_export_step(const std::string& doc_id, const std::string& path) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
-    if (r.shapes.empty())
+    std::vector<TopoDS_Shape> shapes = gather_export_shapes(s);  // assembly-aware (world-placed)
+    if (shapes.empty())
         throw OpError("export_failed", "document has no solid bodies to export",
                       {{"doc_id", doc_id}});
     // Format follows the extension: .stl (case-insensitive) -> binary STL, else STEP.
@@ -3879,7 +3916,7 @@ json doc_export_step(const std::string& doc_id, const std::string& path) {
     std::transform(suffix.begin(), suffix.end(), suffix.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     const std::string fmt = (suffix == ".stl") ? "stl" : "step";
-    std::string out = export_bodies(r.shapes, path, fmt);
+    std::string out = export_bodies(shapes, path, fmt);
     return json{{"path", out}};
 }
 
@@ -4946,9 +4983,12 @@ json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3)
         } else {
             shape = &solids.front();
         }
-        if (eval_is_surface_shape(*shape)) return eval_surface_props(*shape, density_g_cm3);
         GProp_GProps props;
-        BRepGProp::VolumeProperties(*shape, props);  // unit density -> Mass() is volume in mm³
+        bool props_ok = false;
+        if (eval_is_surface_shape(*shape, &props, &props_ok))
+            return eval_surface_props(*shape, density_g_cm3);
+        if (!props_ok)
+            BRepGProp::VolumeProperties(*shape, props);  // unit density -> Mass() is volume in mm³
         json out = props_json(props);
         out["body_count"] = 1;
         out["material"] = {{"density_g_cm3", density_g_cm3}};
@@ -4974,13 +5014,14 @@ json doc_eval_mass(const std::string& doc_id, int body_id, double density_g_cm3)
         const TopoDS_Shape& shape = solids[i];
         json entry;
         entry["body_id"] = static_cast<int>(i + 1);
-        if (eval_is_surface_shape(shape)) {
+        GProp_GProps props;
+        bool props_ok = false;
+        if (eval_is_surface_shape(shape, &props, &props_ok)) {
             entry["surface"] = true;
             json sp = eval_surface_props(shape, density_g_cm3);
             for (auto it = sp.begin(); it != sp.end(); ++it) entry[it.key()] = it.value();
         } else {
-            GProp_GProps props;
-            BRepGProp::VolumeProperties(shape, props);
+            if (!props_ok) BRepGProp::VolumeProperties(shape, props);
             json pj = props_json(props);
             for (auto it = pj.begin(); it != pj.end(); ++it) entry[it.key()] = it.value();
             if (!eval_is_closed_solid(shape)) {
@@ -6632,8 +6673,8 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
         throw OpError("invalid_op", "export_file: 'path' is required", {{"reason", "missing path"}});
     if (fmt.empty())
         throw OpError("invalid_op", "export_file: 'format' is required", {{"reason", "missing format"}});
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
-    if (r.shapes.empty())
+    std::vector<TopoDS_Shape> shapes = gather_export_shapes(s);  // assembly-aware (world-placed)
+    if (shapes.empty())
         throw OpError("export_failed", "export_file: document has no bodies to export",
                       {{"doc_id", doc_id}});
     TessOptions tess;
@@ -6648,14 +6689,14 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
     // solids here matches what the (per-solid) STEP writer emits and what import_bodies reads
     // back. A body with no solid (an open sheet/shell surface) counts as one unit.
     std::size_t expected_solids = 0;
-    for (const TopoDS_Shape& b : r.shapes) {
+    for (const TopoDS_Shape& b : shapes) {
         if (b.IsNull()) continue;
         std::size_t n = 0;
         for (TopExp_Explorer ex(b, TopAbs_SOLID); ex.More(); ex.Next()) ++n;
         expected_solids += (n > 0 ? n : 1);
     }
-    if (expected_solids == 0) expected_solids = r.shapes.size();
-    std::string out = export_bodies(r.shapes, path, fmt, tess);  // throws on a writer error
+    if (expected_solids == 0) expected_solids = shapes.size();
+    std::string out = export_bodies(shapes, path, fmt, tess);  // throws on a writer error
 
     // Real metadata + a flush check: never report success on a missing/empty (truncated) file.
     std::error_code fec;
@@ -6714,13 +6755,13 @@ json doc_export_estimate(const std::string& doc_id, double lin_deflection, doubl
                          bool relative) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    std::vector<TopoDS_Shape> shapes = gather_export_shapes(s);  // assembly-aware (world-placed)
     TessOptions tess;
     if (lin_deflection > 0.0) tess.lin_deflection = lin_deflection;
     if (ang_deflection > 0.0) tess.ang_deflection = ang_deflection;
     tess.relative = relative;
-    auto [tris, verts] = estimate_tessellation(r.shapes, tess);
-    return json{{"triangles", tris}, {"vertices", verts}, {"bodies", r.shapes.size()}};
+    auto [tris, verts] = estimate_tessellation(shapes, tess);
+    return json{{"triangles", tris}, {"vertices", verts}, {"bodies", shapes.size()}};
 }
 
 // True iff `path` has the native .step+ container extension (case-insensitive). Used to

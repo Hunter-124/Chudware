@@ -1526,11 +1526,22 @@ def register_ecad_tools(mcp) -> None:
         # llama.cpp) well past the MCP request budget — and ecad_design must ALWAYS return a
         # verified schematic. Run the provider-backed plan in a worker thread with a hard
         # wall-clock deadline; if it overruns, fall back to the deterministic recipe path
-        # (provider=None) which is instant. The abandoned thread's finite provider timeout
+        # (provider=None) which is instant (~2 s). The abandoned thread's finite provider timeout
         # lets it die on its own rather than lingering.
+        #
+        # BUDGET: the provider plan + the ~2 s recipe fallback must finish UNDER the client's MCP
+        # tool timeout, which is shorter than the 45 s heavy-solve budget on some clients (a 22 s
+        # plan + recipe overran one and tripped -32001, returning nothing). Default to a
+        # conservative 12 s so the worst case (plan times out -> recipe) stays ~14 s; override with
+        # AI_CAD_ECAD_PLAN_BUDGET_S where the client allows a longer call.
         import threading
 
-        _PLAN_BUDGET_S = 22.0
+        try:
+            _PLAN_BUDGET_S = float(os.environ.get("AI_CAD_ECAD_PLAN_BUDGET_S", "") or 12.0)
+        except (TypeError, ValueError):
+            _PLAN_BUDGET_S = 12.0
+        if not (_PLAN_BUDGET_S > 0.0):
+            _PLAN_BUDGET_S = 12.0
         box: dict = {}
 
         def _worker():

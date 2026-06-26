@@ -316,6 +316,55 @@ TEST_CASE("A7 F5 symmetric plate: signed-normal tie-break resolves bottom face, 
     MESSAGE("A7 F5 vertex-sym still dangles: " << *rv.dangling_reason);
 }
 
+// A8. AREA tie-break for COAXIAL cylinders (a bore vs the boss around it). Both share the +Z
+//   axis and the SAME on-axis centroid, so their scores are identical (margin 0) and the
+//   signed-axis break can't separate them (same axis) — the selector's recorded AREA does.
+//   This is the FEA "load on a bored boss's inner cylinder" case that dangled before.
+TEST_CASE("A8 coaxial cylinders resolve by selector area (bore vs boss)") {
+    auto cyl = [](int idx, double area) {
+        TopoInfo t;
+        t.kind = "face";
+        t.index = idx;
+        t.surf = std::string("cylinder");
+        t.centroid = Eigen::Vector3d(0, 0, 20);   // both coaxial, same on-axis centroid
+        t.axis = Eigen::Vector3d(0, 0, 1);
+        t.measure = area;
+        t.hint_index = idx;
+        return t;
+    };
+    const double PI = 3.14159265358979323846;
+    const double BORE = 2.0 * PI * 12.5 * 40.0;  // ~3141 mm²
+    const double BOSS = 2.0 * PI * 22.0 * 30.0;  // ~4147 mm²
+    std::vector<TopoInfo> faces = {cyl(0, BORE), cyl(1, BOSS)};
+    const double diag = 120.0;
+
+    // Selector recorded for the BORE -> must resolve the bore (index 0), not dangle.
+    json sel;
+    sel["kind"] = "face";
+    sel["surf"] = "cylinder";
+    sel["centroid"] = json::array({0.0, 0.0, 20.0});
+    sel["axis"] = json::array({0.0, 0.0, 1.0});
+    sel["area_or_len"] = BORE;
+    sel["hint_index"] = 0;
+    ResolveResult rb = resolve(sel, faces, diag);
+    REQUIRE(rb.index.has_value());
+    CHECK(*rb.index == 0);
+    MESSAGE("A8 bore resolved index=" << *rb.index);
+
+    // Selector recorded for the BOSS -> resolves the boss (index 1).
+    sel["area_or_len"] = BOSS;
+    sel["hint_index"] = 1;
+    ResolveResult rs = resolve(sel, faces, diag);
+    REQUIRE(rs.index.has_value());
+    CHECK(*rs.index == 1);
+
+    // Two EQUAL-area coaxial cylinders are a genuine tie -> must still dangle (no guess).
+    std::vector<TopoInfo> equal = {cyl(0, BORE), cyl(1, BORE)};
+    sel["area_or_len"] = BORE;
+    ResolveResult re = resolve(sel, equal, diag);
+    CHECK_FALSE(re.index.has_value());
+}
+
 // B7. describe_faces over a 20x10x6 box (min corner at origin): 6 planar faces,
 //   each with a unit axis, areas summing to the box surface area, and the +Z top
 //   face is identifiable (centroid z=6, axis ~ +/-Z, area=200).

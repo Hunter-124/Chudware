@@ -41,4 +41,16 @@ TopoDS_Shape rotate_copy(const TopoDS_Shape& s, const Eigen::Vector3d& axis_pt,
 TopoDS_Shape mirror_copy(const TopoDS_Shape& s, const Eigen::Vector3d& plane_point,
                          const Eigen::Vector3d& plane_normal);
 
+// Rigid INSTANCE: place `s` by rotating `angle_rad` (CCW about `axis_dir` through
+// `pivot`) then translating by `translate`, applied as a shared TopLoc_Location via
+// TopoDS_Shape::Moved — NOT a baked copy. The result SHARES `s`'s underlying TShape
+// (and any triangulation/properties computed on it), so N identical placed bodies
+// (e.g. the same imported part dropped into an assembly N times) deserialize +
+// tessellate + mass-prop ONCE instead of N times. Geometrically identical to
+// translate_copy(rotate_copy(...)) for a rigid move (the only move `transform` does);
+// downstream readers apply the location, so picking / export / mass props are exact.
+TopoDS_Shape rigid_instance(const TopoDS_Shape& s, const Eigen::Vector3d& pivot,
+                            const Eigen::Vector3d& axis_dir, double angle_rad,
+                            const Eigen::Vector3d& translate);
+
 }  // namespace geom

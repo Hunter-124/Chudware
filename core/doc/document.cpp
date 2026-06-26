@@ -27,6 +27,8 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -1310,6 +1312,14 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     const json features = config_effective_features(base_features.is_array() ? base_features : empty,
                                                     active_cfg);
 
+    // Per-compile cache of deserialized embedded-BREP imports, keyed by the blob itself.
+    // An assembly that imports the same part N times (e.g. 4 identical wheels) carries N
+    // byte-identical `embedded_brep` blobs; deserializing once and SHARING the resulting
+    // TShape across all N imports means the later transform/tessellate/mass-prop steps
+    // operate on shared geometry and dedup automatically. The shapes are only ever read
+    // or rigidly relocated downstream (never mutated in place), so sharing is safe.
+    std::map<std::string, std::vector<TopoDS_Shape>> import_cache;
+
     for (const json& raw : features.is_array() ? features : empty) {
         // Accept the host's canonical {params,refs} shape OR the simplified flat
         // shape, normalizing to flat so the compilers below read either (see
@@ -2335,11 +2345,17 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 const std::string embedded = str_field(feat, "embedded_brep", "");
                 if (!embedded.empty()) {
                     src_desc = "embedded geometry";
-                    TopoDS_Shape baked = brep_b64_to_shape(embedded);
-                    if (!baked.IsNull()) {
-                        for (TopExp_Explorer ex(baked, TopAbs_SOLID); ex.More(); ex.Next())
-                            solids.push_back(ex.Current());
-                        if (solids.empty()) solids.push_back(baked);  // bare shell/solid
+                    auto cit = import_cache.find(embedded);
+                    if (cit != import_cache.end()) {
+                        solids = cit->second;  // SHARE the cached TShape(s) across identical imports
+                    } else {
+                        TopoDS_Shape baked = brep_b64_to_shape(embedded);
+                        if (!baked.IsNull()) {
+                            for (TopExp_Explorer ex(baked, TopAbs_SOLID); ex.More(); ex.Next())
+                                solids.push_back(ex.Current());
+                            if (solids.empty()) solids.push_back(baked);  // bare shell/solid
+                        }
+                        import_cache.emplace(embedded, solids);
                     }
                 }
                 if (solids.empty()) {
@@ -3993,20 +4009,18 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     !(translate.norm() > 1e-12) && std::abs(angle_deg) <= 1e-9;
 
                 // Rotate first (about the pivot), then translate — the intuitive "orient then
-                // place" order. Each step copies (the kernel helpers leave the input untouched).
-                TopoDS_Shape out = body;
-                if (std::abs(angle_deg) > 1e-9) {
-                    if (!(axis_dir.norm() > 1e-12))
-                        throw std::runtime_error(type + ": rotate axis has zero length");
-                    out = ::geom::rotate_copy(out, pivot, axis_dir, radians(angle_deg));
-                    if (out.IsNull())
-                        throw std::runtime_error(type + ": rotation produced an empty shape");
-                }
-                if (translate.norm() > 1e-12) {
-                    out = ::geom::translate_copy(out, translate);
-                    if (out.IsNull())
-                        throw std::runtime_error(type + ": translation produced an empty shape");
-                }
+                // place" order. Placed as a shared TopLoc_Location (instance), NOT a baked copy:
+                // the moved body keeps sharing its source TShape, so N identical placed parts
+                // (e.g. the 4 wheels of an assembly imported from the same file) deserialize +
+                // tessellate + mass-prop ONCE, not N times. A rigid move (rotate+translate) is
+                // all `transform` ever does, so a location is geometrically exact.
+                if (std::abs(angle_deg) > 1e-9 && !(axis_dir.norm() > 1e-12))
+                    throw std::runtime_error(type + ": rotate axis has zero length");
+                TopoDS_Shape out = ::geom::rigid_instance(
+                    body, pivot, axis_dir,
+                    std::abs(angle_deg) > 1e-9 ? radians(angle_deg) : 0.0, translate);
+                if (out.IsNull())
+                    throw std::runtime_error(type + ": transform produced an empty shape");
 
                 const bool copy = feat.value("copy", false);
                 if (!copy) {
@@ -6201,6 +6215,12 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     std::vector<aicm::AicmBody> bodies;
     const float color[3] = {0.71f, 0.76f, 0.82f};  // default dielectric grey
     uint32_t body_num = 1;
+    // Per-TShape stats cache: volume/area/face-count/edge-count are geometry-only (location-
+    // invariant), so instanced bodies that SHARE a TShape (e.g. the 4 wheels) compute the
+    // mass props ONCE. Keyed by (TShape*, is_surface) so a surface vs solid use of the same
+    // geometry never crosses wires. (Tessellation dedups for free — BRepMesh is incremental,
+    // so meshing the second instance finds the shared faces already triangulated and skips.)
+    std::map<std::pair<const void*, bool>, std::tuple<double, double, int, int>> body_stats_cache;
     for (const std::string& sid : solid_order) {
         if (consumed.count(sid)) continue;
         const TopoDS_Shape& shape = std::get<SolidResult>(results.at(sid)).shape;
@@ -6219,17 +6239,29 @@ CompileResult compile_document(const json& doc, const json& env_json) {
             auto kit = body_kinds.find(sid);
             bi.kind = (kit != body_kinds.end()) ? kit->second : std::string("solid");
             const bool is_surface = (bi.kind == "surface");
-            double vol = 0.0;
-            if (!is_surface) {
-                GProp_GProps gp;
-                BRepGProp::VolumeProperties(shape, gp);
-                vol = gp.Mass();
+            double vol = 0.0, area = 0.0;
+            int nf = 0, ne = 0;
+            const auto bkey = std::make_pair(
+                static_cast<const void*>(shape.TShape().get()), is_surface);
+            auto bsit = body_stats_cache.find(bkey);
+            if (bsit != body_stats_cache.end()) {
+                std::tie(vol, area, nf, ne) = bsit->second;  // shared geometry — reuse
+            } else {
+                if (!is_surface) {
+                    GProp_GProps gp;
+                    BRepGProp::VolumeProperties(shape, gp);
+                    vol = gp.Mass();
+                }
+                area = ::geom::shape_area(shape);
+                nf = ::geom::shape_face_count(shape);
+                ne = ::geom::shape_edge_count(shape);
+                body_stats_cache.emplace(bkey, std::make_tuple(vol, area, nf, ne));
             }
             result.volume += vol;  // only solids contribute to the total volume signal
             bi.volume = vol;
-            bi.area = ::geom::shape_area(shape);
-            bi.n_faces = ::geom::shape_face_count(shape);
-            bi.n_edges = ::geom::shape_edge_count(shape);
+            bi.area = area;
+            bi.n_faces = nf;
+            bi.n_edges = ne;
             result.bodies_info.push_back(std::move(bi));
         } catch (...) {
             // A tessellation failure must not crash the rebuild; skip this body.

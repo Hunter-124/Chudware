@@ -6,12 +6,15 @@
 #include "geom/transform.h"
 
 #include <BRepBuilderAPI_Transform.hxx>
+#include <TopLoc_Location.hxx>
 #include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
 #include <gp_Vec.hxx>
+
+#include <cmath>
 
 namespace geom {
 
@@ -47,6 +50,25 @@ TopoDS_Shape mirror_copy(const TopoDS_Shape& s, const Eigen::Vector3d& plane_poi
     gp_Trsf t;
     t.SetMirror(ax);
     return BRepBuilderAPI_Transform(s, t, /*copy=*/true).Shape();
+}
+
+// Rigid instance: compose ONE rigid gp_Trsf (rotate-about-pivot first, then translate —
+// the same order as translate_copy(rotate_copy(...))) and apply it as a TopLoc_Location
+// via TopoDS_Shape::Moved. No geometry is copied: the result shares the source TShape, so
+// identical placed bodies share triangulation + properties. `combined = T * R` applies R
+// first, then T (OCCT composes right-to-left).
+TopoDS_Shape rigid_instance(const TopoDS_Shape& s, const Eigen::Vector3d& pivot,
+                            const Eigen::Vector3d& axis_dir, double angle_rad,
+                            const Eigen::Vector3d& translate) {
+    gp_Trsf rot;
+    if (std::abs(angle_rad) > 1e-12)
+        rot.SetRotation(gp_Ax1(gp_Pnt(pivot.x(), pivot.y(), pivot.z()),
+                               gp_Dir(axis_dir.x(), axis_dir.y(), axis_dir.z())),
+                        angle_rad);
+    gp_Trsf trn;
+    trn.SetTranslation(gp_Vec(translate.x(), translate.y(), translate.z()));
+    gp_Trsf combined = trn.Multiplied(rot);  // rotate first, then translate
+    return s.Moved(TopLoc_Location(combined));
 }
 
 }  // namespace geom

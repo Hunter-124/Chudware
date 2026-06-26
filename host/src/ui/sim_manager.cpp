@@ -2119,7 +2119,7 @@ void SimManager::drawMeshForm(AppState& st, Study& s) {
         persist(st, s);
         clearMeshPreview();
     }
-    simTip("Run the gmsh + Netgen optimizers after generation to improve poorly-shaped "
+    simTip("Run Netgen's surface + volume optimizers after generation to improve poorly-shaped "
            "tetrahedra. Recommended; adds a little meshing time.");
     ImGui::Spacing();
 

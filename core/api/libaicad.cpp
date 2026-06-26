@@ -1633,7 +1633,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                         out_json, 0);
         }
         if (m == "sim_mesh") {
-            // Curvature-adaptive tet mesher (wraps gmsh 4.15.2). Params:
+            // Curvature-adaptive tet mesher (wraps Netgen / nglib). Params:
             //   {"step_path", "fineness"(0..1)|"density"(legacy), "order"|"mesh_order",
             //    "curvature"(bool), "curv_elems_per_circle", "target_size_mm",
             //    "min_size_mm", "max_size_mm", "optimize"(bool), "algorithm3d"}.

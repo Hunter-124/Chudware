@@ -11,7 +11,7 @@
 // STEP face has only its corner verts so a bent beam rendered as a straight tilt.)
 //
 // Lives in the OCCT lib (aicad_geom_occt) alongside the AICM writer; the sim-result
-// vectors are passed in as plain doubles, so there is no link dep on the gmsh libs.
+// vectors are passed in as plain doubles, so there is no link dep on the mesher libs.
 #pragma once
 
 #include <string>

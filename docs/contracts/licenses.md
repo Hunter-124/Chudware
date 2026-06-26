@@ -8,6 +8,21 @@
 > copied or reworded-then-disguised — features are reimplemented clean-room from documented behavior
 > and file formats only. ngspice is permitted as an optional, unmodified, subprocess-only backend
 > (mere aggregation — does not impose GPL on our code); the native MNA simulator remains primary.
+>
+> ⚠️ **AUDIT CORRECTION (2026-06-26):** two issues surfaced when scoping commercial distribution.
+> 1. ✅ **RESOLVED (2026-06-26): gmsh removed.** The C++ FEA tet mesher (`core/sim/mesher.cpp`)
+>    was reimplemented on **Netgen / nglib (LGPL-2.1)** — see the Netgen row below. `libaicad.dll`
+>    no longer imports gmsh (verified: `dumpbin /dependents libaicad.dll` shows `nglib.dll`, no
+>    `gmsh*.dll`); `ProvisionGmsh.cmake` and the `gmsh-4.15.dll` / gmsh wheel staging are gone.
+>    Netgen is linked DYNAMICALLY (nglib.dll + ngcore.dll shipped, written source offer) which is
+>    LGPL-clean. This removes the #1 commercialization blocker.
+> 2. **STILL OPEN: `core/docs/kicad_reference.md` documents a "borrowing KiCad geometry is on the
+>    table" stance** for internal use, which contradicts the clean-room sign-off above. Before
+>    selling: audit `core/` for any KiCad `libs/kimath` (GPL) derived geometry that may have been
+>    copied while the project was internal-only. Boost/MIT thirdparty (clipper2/delaunator/
+>    tinyspline) listed there is vendorable; GPL kimath is not.
+>
+> Blocker #1 is cleared; the default distribution remains **NOT** sellable until #2 is audited.
 
 | dependency | license | role | posture |
 |---|---|---|---|
@@ -25,10 +40,11 @@
 | anthropic / openai / mcp / httpx | MIT/Apache | providers | ok |
 | llama.cpp (optional managed runtime) | MIT | local model server | ok; optional subprocess/server payload copied to `%APPDATA%\AI-CAD\llamacpp` when bundled |
 | Dear ImGui | MIT | UI | ok |
-| **ImGui Test Engine** | **dual: free for OSS/personal; paid for closed-source commercial** | dev-only GUI tests | vendored behind `AI_CAD_TESTS=ON`, NEVER shipped in dist; flag before commercialization |
+| **ImGui Test Engine** | **dual: free for OSS/personal; paid for closed-source commercial** | dev-only GUI tests | **OWNER DECISION (2026-06-26): keep as-is, NO commercial seat purchased — accepted risk.** Dev-only, gated behind `AI_CAD_TESTS=ON`, NEVER shipped in dist (so the *shipped* product carries no Test Engine code). Not a distribution blocker; residual exposure is internal dev use only. |
 | GLFW / glad / nlohmann_json / stb | zlib / MIT / MIT | host | ok |
 | Rubik / JetBrains Mono | OFL-1.1 | fonts | ok |
-| **gmsh** (M6) | **GPL-2+ (no linking exception)** | FEA tet meshing | **isolation policy**: imported ONLY inside the separate sim worker process; sim pack treated as optional; documented swap path = netgen-mesher (LGPL). If ever distributed closed-source: subprocess-only invocation or netgen switch |
+| ~~gmsh~~ (M6) | ~~GPL-2+~~ | ~~FEA tet meshing~~ | **REMOVED (2026-06-26)** — replaced by Netgen (row below). No longer linked or shipped; `ProvisionGmsh.cmake` deleted. |
+| **Netgen / nglib** | **LGPL-2.1** | FEA tet meshing (tet4/tet10) | ok (**dynamic** link). Built from source against our OCCT (`core/cmake/ProvisionNetgen.cmake`, tag v6.2.2504), confined to `core/sim/mesher.cpp`; `nglib.dll` + `ngcore.dll` shipped next to `libaicad.dll`. LGPL satisfied by dynamic linking + a written offer for the Netgen source. (One local patch — a `Mesh::DeleteMesh` double-free fix — applied at provision time.) |
 | scikit-fem (M6) | BSD-3 | FEA assembly | ok |
 | meshio (M6) | MIT | mesh I/O | ok |
 | pyamg (M6, optional) | MIT | AMG preconditioner | ok |

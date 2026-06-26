@@ -231,7 +231,7 @@ double accumulate_face_weights(const std::vector<double>& points, const std::vec
 //
 // WHY: nodes_in_faceset() resolves the load faceset GEOMETRICALLY — a node is kept iff it
 // lies within tol of one of the CAD face's triangulation sample points. For a flat end
-// face the CAD triangulation is just the 4 face corners, so on a real gmsh tet10 mesh only
+// face the CAD triangulation is just the 4 face corners, so on a real tet10 mesh only
 // the FEA corner nodes (and the handful of mid-side nodes that happen to fall within tol of
 // a corner sample) get picked; the mid-side nodes sitting in the face INTERIOR are dropped.
 // But the tri6 work-equivalent rule (accumulate_face_weights) puts ALL the consistent load

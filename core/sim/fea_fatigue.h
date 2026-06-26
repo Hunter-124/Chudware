@@ -9,8 +9,8 @@
 // meshes + solves through the same glue as fea_run_static (so it has both the per-
 // node von Mises array AND the mesh points needed to build the fatigue overlay).
 //
-// Like fea_run.h this header is gmsh-FREE (fea_fatigue.cpp confines gmsh.h via the
-// mesher TU), so it stays includable in any link config.
+// Like fea_run.h this header is mesher-backend-FREE (fea_fatigue.cpp confines nglib.h
+// via the mesher TU), so it stays includable in any link config.
 #pragma once
 
 #include <nlohmann/json.hpp>

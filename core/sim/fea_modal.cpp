@@ -166,7 +166,7 @@ const Eigen::Matrix<double, 10, 10>& tet10_mass_unit_moments() {
 // the stiffness (det(J) is at most cubic in the natural coords, so the degree-2 rule is a
 // good volume quadrature and is EXACT for a straight-edged tet, where det(J) is constant).
 // The old code multiplied the moments by a single CORNER-tet volume (e1·(e2×e3)/6), which
-// equals the true volume only for a straight element; on a curved / high-aspect gmsh tet10
+// equals the true volume only for a straight element; on a curved / high-aspect tet10
 // the corner volume mis-states the inertia and the modal frequency reads high (Bug F3).
 // Using the Gauss-integrated mapped volume keeps the validated straight-section / N-1
 // results unchanged (det(J) constant there) while correcting curved/distorted elements.

@@ -72,8 +72,8 @@ struct Study {
                                     // 2nd order captures bending accurately (linear tets shear-lock).
     float meshTargetMm = 0.0f;      // advanced: explicit element size override (0 = auto)
     float meshMinMm = 0.0f;         // advanced: min element size override (0 = auto)
-    int   meshAlgo = 1;             // advanced 3D algorithm: 1 = Delaunay, 10 = HXT
-    bool meshOptimize = true;       // gmsh + Netgen optimization pass
+    int   meshAlgo = 1;             // advanced 3D algorithm knob (legacy; Netgen uses Delaunay)
+    bool meshOptimize = true;       // Netgen surface + volume optimization pass
     // Mesh quality readout from the last Preview (transient; not persisted).
     bool  meshHasQuality = false;
     float meshAspectMin = 0, meshAspectAvg = 0, meshAspectMax = 0;

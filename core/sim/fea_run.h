@@ -12,8 +12,8 @@
 // enumeration with its fallback), calls the existing solver, and returns the
 // result JSON the host expects.
 //
-// This header is intentionally gmsh-FREE (the mesher.cpp it calls confines
-// gmsh.h to its own TU), so it stays includable in any link config.
+// This header is intentionally mesher-backend-FREE (the mesher.cpp it calls
+// confines nglib.h to its own TU), so it stays includable in any link config.
 #pragma once
 
 #include <vector>

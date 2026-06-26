@@ -78,7 +78,7 @@ if /i not "%MODE%"=="app" (
   copy /y "%EXE%" "%DIST%\AI-CAD.exe" >nul || goto :fail
   robocopy "%ROOT%\host\assets" "%DIST%\assets" /MIR /XF Rubik-VF.ttf make_logo.py /XD __pycache__ /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
   if errorlevel 8 goto :fail
-  rem --- stage the C++ core (libaicad.dll + its OCCT/gmsh sibling DLLs) next to
+  rem --- stage the C++ core (libaicad.dll + its OCCT/Netgen sibling DLLs) next to
   rem     the exe so the host loads the in-process C++ engine with NO env override
   rem     (AI_CAD_LIBAICAD). This is the production engine for parts / sim / agent.
   set "CORE_BIN=%ROOT%\core\build-occt\bin\Release"

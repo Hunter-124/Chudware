@@ -332,12 +332,13 @@ add_test(NAME parts COMMAND test_parts)
 if(AICAD_WITH_OCCT)
   include(ProvisionOCCT)
 
-  # --- P50: gmsh tet mesher (GPL — confined to the OCCT-on build) ------------
-  # Provision the SAME libgmsh 4.15.2 the Python oracle (engine/sim/mesher.py)
-  # wraps, so the C++ tet mesh is bit-identical. gmsh.h lives ONLY in mesher.cpp
-  # (mesher.h is gmsh-free); aicad_mesh links the SDK import lib. The dynamic CRT
-  # matches aicad_miniz / the DLL (same heap as the gmsh runtime).
-  include(ProvisionGmsh)
+  # --- P50: Netgen / nglib tet mesher (LGPL-2.1 — commercial-safe) -----------
+  # BUILD Netgen from source against OUR OCCT (no prebuilt SDK exists); see
+  # ProvisionNetgen.cmake. nglib.h lives ONLY in mesher.cpp (mesher.h is backend-
+  # free); aicad_mesh links nglib's import lib and nglib.dll + ngcore.dll are staged
+  # next to libaicad.dll. This replaced gmsh (GPL-2+, no linking exception) — the #1
+  # commercialization blocker. MUST come AFTER ProvisionOCCT (shares its OCCT + zlib).
+  include(ProvisionNetgen)
 
   # --- P55r: lib3mf 3MF reader/writer (BSD — clean to link/distribute) -------
   # Provision the SAME lib3mf 2.5.0 the Python oracle (engine/doc/formats.py)
@@ -358,17 +359,15 @@ if(AICAD_WITH_OCCT)
 
   # P50b: sim/fea_run.cpp (the combined mesh+resolve+solve glue) joins the mesher
   # target — it is the only sim source that needs the mesher, and adding it here
-  # keeps the gmsh confinement intact (fea_run.h itself is gmsh-free). aicad_mesh
-  # gains a PUBLIC dep on aicad_sim so fea_run.cpp can call the FEA solvers.
+  # keeps the mesher-backend confinement intact (fea_run.h itself is nglib-free).
+  # aicad_mesh gains a PUBLIC dep on aicad_sim so fea_run.cpp can call the FEA solvers.
   add_library(aicad_mesh STATIC sim/mesher.cpp sim/hex_mesher.cpp sim/fea_run.cpp sim/fea_fatigue.cpp)
   target_include_directories(aicad_mesh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-  target_include_directories(aicad_mesh PRIVATE ${GMSH_INCLUDE_DIR})
-  # GMSH_DLL makes gmsh.h's GMSH_API decorate the prototypes __declspec(dllimport)
-  # so they resolve against the SDK import lib (gmsh.dll.lib). PUBLIC so the import
-  # lib propagates onto the final link line of the `aicad` DLL that consumes this
-  # static lib (a STATIC lib's link deps aren't pulled in transitively otherwise).
-  target_compile_definitions(aicad_mesh PRIVATE GMSH_DLL)
-  target_link_libraries(aicad_mesh PUBLIC ${GMSH_IMPORT_LIB} aicad_sim nlohmann_json::nlohmann_json)
+  target_include_directories(aicad_mesh PRIVATE ${NETGEN_INCLUDE_DIRS})
+  # nglib's import lib is PUBLIC so it propagates onto the final link line of the
+  # `aicad` DLL that consumes this static lib (a STATIC lib's link deps aren't pulled
+  # in transitively otherwise). nglib.h decorates its prototypes dllimport on WIN32.
+  target_link_libraries(aicad_mesh PUBLIC ${NETGEN_IMPORT_LIB} aicad_sim nlohmann_json::nlohmann_json)
   set_property(TARGET aicad_mesh PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
   # Smoke test: box -> volume (BRepGProp) -> tessellation (BRepMesh). Proves the
@@ -469,18 +468,30 @@ if(AICAD_WITH_OCCT)
   set_target_properties(test_fatigue PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME fatigue COMMAND test_fatigue)
-  # gmsh + OCCT DLLs must be on PATH for the static solve (fea_run_static meshes only
+  # Netgen + OCCT DLLs must be on PATH for the static solve (fea_run_static meshes only
   # when a STEP path is present — the inline-mesh test does not — but aicad_mesh pulls
-  # the gmsh import lib, and aicad_geom_occt pulls OCCT, so stage both dirs to be safe).
+  # the nglib import lib, and aicad_geom_occt pulls OCCT, so stage both dirs to be safe).
   set(_fatigue_envmod "PATH=path_list_prepend:${OCCT_DLL_DIR}")
   foreach(_b ${OCCT_3RDPARTY_BINS})
     list(APPEND _fatigue_envmod "PATH=path_list_prepend:${_b}")
   endforeach()
-  if(GMSH_DLL)
-    get_filename_component(_gmsh_dll_dir "${GMSH_DLL}" DIRECTORY)
-    list(APPEND _fatigue_envmod "PATH=path_list_prepend:${_gmsh_dll_dir}")
-  endif()
+  list(APPEND _fatigue_envmod "PATH=path_list_prepend:${NETGEN_ROOT}/install/bin")
+  get_filename_component(_ng_zlib_bin "${NETGEN_ZLIB_DLL}" DIRECTORY)
+  list(APPEND _fatigue_envmod "PATH=path_list_prepend:${_ng_zlib_bin}")
   set_tests_properties(fatigue PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
+
+  # Netgen mesher end-to-end: build a cantilever OCCT solid -> STEP -> mesh_step (tet4/tet10)
+  # -> fea_run_static, asserting quality + convergence toward the Euler-Bernoulli deflection
+  # (Bug F7 guard). Exercises the REAL nglib mesh path, so it needs OCCT + Netgen DLLs (the
+  # same _fatigue_envmod PATH prepend).
+  add_executable(test_netgen_mesh tests/test_netgen_mesh.cpp)
+  target_include_directories(test_netgen_mesh PRIVATE
+    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_netgen_mesh PRIVATE aicad_mesh aicad_geom_occt)
+  set_target_properties(test_netgen_mesh PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME netgen_mesh COMMAND test_netgen_mesh)
+  set_tests_properties(netgen_mesh PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
 
   # FEA boundary-surface extractor: fea_surface_body (the result-plot display surface,
   # so a bent beam renders curved). No STEP/mesher — builds structured tet meshes in
@@ -868,8 +879,9 @@ if(AICAD_WITH_OCCT)
   # Stage the OCCT toolkit + 3rdparty (jemalloc/tbb) DLLs next to libaicad.dll so
   # its imports resolve when it is loaded from the same directory.
   aicad_occt_copy_dlls(aicad)
-  # Stage gmsh.dll too (aicad_mesh's runtime dep, imported by libaicad.dll).
-  aicad_gmsh_copy_dll(aicad)
+  # Stage Netgen's nglib.dll + ngcore.dll + zlib.dll too (aicad_mesh's runtime deps,
+  # imported by libaicad.dll).
+  aicad_netgen_copy_dlls(aicad)
   # Stage lib3mf.dll next to libaicad.dll so the CppDynamic binding in
   # doc/formats.cpp can loadLibrary it at runtime (3MF read/write).
   aicad_lib3mf_copy_dll(aicad)

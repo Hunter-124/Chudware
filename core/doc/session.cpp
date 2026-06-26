@@ -2333,6 +2333,21 @@ const CompileResult& ensure_compiled(Session& s) {
     return *s.compiled;
 }
 
+json ops_response(Session& s, const CompileResult& r, const json& id_map, bool with_tess);
+
+// Build the ops-response AND warm the read-only compile cache from the SAME compile, so the
+// first pick right after an open/edit/undo/rebuild reuses it instead of recompiling the whole
+// tree (the post-open first-click hitch). `r` is taken by value and MOVED into the cache after
+// ops_response reads it — no extra copy of the aicm/shapes. Call this ONLY where `r` was just
+// compiled from the CURRENT live s.doc at the CURRENT s.revision (never the apply-batch rollback
+// path, where r is the rejected tree and the restored doc's cache is already valid).
+json warm_and_respond(Session& s, CompileResult r, const json& id_map, bool with_tess) {
+    json resp = ops_response(s, r, id_map, with_tess);
+    s.compiled = std::make_shared<CompileResult>(std::move(r));
+    s.compiled_rev = s.revision;
+    return resp;
+}
+
 std::filesystem::path aicm_file(const std::string& doc_id, long revision) {
     std::filesystem::path dir = std::filesystem::temp_directory_path() / "aicad_cpp_docs";
     std::error_code ec;
@@ -2565,7 +2580,7 @@ json config_commit(Session& s, json&& working) {
     s.dirty = true;
     if (s.active_sketch) s.active_sketch->solve_state.reset();  // session.py::_config_commit
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
-    return ops_response(s, r, json::object(), /*with_tess=*/true);
+    return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
 
 // ops.py::is_readonly_batch — true iff `ops` is non-empty and EVERY op is read-only (only
@@ -2666,7 +2681,7 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
         restore_pre_batch();
         return ops_response(s, r, id_map, /*with_tess=*/true);
     }
-    return ops_response(s, r, id_map, /*with_tess=*/true);
+    return warm_and_respond(s, std::move(r), id_map, /*with_tess=*/true);
 }
 
 // Create + register a blank part session, returning a reference (caller holds g_mtx).
@@ -3083,7 +3098,7 @@ json doc_undo(const std::string& doc_id) {
         return ops_response_assembly(s, json::object());
     }
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
-    return ops_response(s, r, json::object(), /*with_tess=*/true);
+    return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
 
 json doc_redo(const std::string& doc_id) {
@@ -3104,7 +3119,7 @@ json doc_redo(const std::string& doc_id) {
         return ops_response_assembly(s, json::object());
     }
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
-    return ops_response(s, r, json::object(), /*with_tess=*/true);
+    return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
 
 json doc_tree(const std::string& doc_id) {
@@ -3146,7 +3161,7 @@ json doc_rebuild(const std::string& doc_id) {
         return ops_response_assembly(s, json::object());
     }
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
-    return ops_response(s, r, json::object(), /*with_tess=*/true);
+    return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
 
 // ============================================================ C20 assembly RPCs
@@ -3439,7 +3454,7 @@ json doc_revert(const std::string& doc_id, const std::string& checkpoint_id) {
     s.revision += 1;
     s.dirty = true;
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
-    return ops_response(s, r, json::object(), /*with_tess=*/true);
+    return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
 
 // Live derived re-pull — C++ port of engine.doc.session.refresh_derived (Wave 4C).
@@ -7188,7 +7203,7 @@ json doc_open(const std::string& path, bool as_solid) {
     Session& stored = g_sessions[s.doc_id] = std::move(s);
 
     CompileResult r = compile_document(stored.doc, env_from_doc(stored.doc));
-    resp = ops_response(stored, r, json::object(), /*with_tess=*/true);
+    resp = warm_and_respond(stored, std::move(r), json::object(), /*with_tess=*/true);
     resp["doc_id"] = stored.doc_id;
     if (stored.doc.is_object())
         resp["name"] = stored.doc.value("name", std::string());
@@ -7472,7 +7487,7 @@ json doc_sketch_exit(const std::string& doc_id, const std::string& sketch_fid) {
     }
     s.active_sketch.reset();
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
-    return ops_response(s, r, json::object(), /*with_tess=*/true);
+    return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
 
 namespace {

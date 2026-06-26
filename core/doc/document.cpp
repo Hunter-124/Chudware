@@ -3732,24 +3732,31 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // the seed is subtractive (Bug J1): a linear_pattern of a circular_pattern
                 // of CUTS must re-SUBTRACT the whole ring at each outer cell, not fuse the
                 // grown body (which would ADD material and leave one ring).
-                TopoDS_Shape pattern_tool = seed_tool;  // instance (0,0)
+                // Lay down every copy first, then apply ONE multi-argument boolean for the
+                // whole field (a single BOPDS pass) instead of N pairwise booleans that each
+                // re-traverse the growing body (~O(N²)). pattern_tool — the nesting tool an
+                // outer pattern replicates for a subtractive seed — is the union of instance
+                // (0,0) + every copy, built the same batched way.
+                std::vector<TopoDS_Shape> copies;
+                copies.reserve((size_t)count1 * count2);
                 for (int i = 0; i < count1; ++i) {
                     for (int j = 0; j < count2; ++j) {
                         if (i == 0 && j == 0) continue;  // the seed instance
                         Eigen::Vector3d offset = dir1 * (i * spacing1);
                         if (has_dir2) offset += dir2 * (j * spacing2);
-                        TopoDS_Shape copy = ::geom::translate_copy(seed_tool, offset);
-                        res = (seed_op == "cut") ? ::geom::cut(res, copy)
-                                                 : ::geom::fuse(res, copy);
-                        if (res.IsNull())
-                            throw std::runtime_error("linear pattern instance "
-                                                     + std::string(seed_op == "cut" ? "cut" : "fuse")
-                                                     + " failed");
-                        if (seed_op == "cut") {
-                            TopoDS_Shape pu = ::geom::fuse(pattern_tool, copy);
-                            if (!pu.IsNull()) pattern_tool = pu;
-                        }
+                        copies.push_back(::geom::translate_copy(seed_tool, offset));
                     }
+                }
+                res = (seed_op == "cut") ? ::geom::cut_many(res, copies)
+                                         : ::geom::fuse_many(res, copies);
+                if (res.IsNull())
+                    throw std::runtime_error("linear pattern instance "
+                                             + std::string(seed_op == "cut" ? "cut" : "fuse")
+                                             + " failed");
+                TopoDS_Shape pattern_tool = seed_tool;  // instance (0,0)
+                if (seed_op == "cut") {
+                    TopoDS_Shape pu = ::geom::fuse_many(seed_tool, copies);
+                    if (!pu.IsNull()) pattern_tool = pu;
                 }
 
                 // build123d's `+` runs .clean() (UnifySameDomain), so abutting instances
@@ -3821,20 +3828,25 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // Accumulate every instance's tool (k=0 at base pose included) into a
                 // pattern_tool — the nesting tool an outer pattern of THIS pattern
                 // replicates when the seed is subtractive (Bug J1).
+                // Lay down every rotated copy, then ONE multi-argument boolean for the whole
+                // ring (single BOPDS pass) instead of N pairwise booleans over the growing
+                // body (~O(N²)). pattern_tool (nesting tool for a subtractive seed) is the
+                // union of k=0 + every copy, built the same batched way.
+                std::vector<TopoDS_Shape> copies;
+                copies.reserve((size_t)(count > 1 ? count - 1 : 0));
+                for (int k = 1; k < count; ++k)
+                    copies.push_back(::geom::rotate_copy(
+                        seed_tool, axis_pt, axis_dir, radians(step_deg * k)));
+                res = (seed_op == "cut") ? ::geom::cut_many(res, copies)
+                                         : ::geom::fuse_many(res, copies);
+                if (res.IsNull())
+                    throw std::runtime_error("circular pattern instance "
+                                             + std::string(seed_op == "cut" ? "cut" : "fuse")
+                                             + " failed");
                 TopoDS_Shape pattern_tool = seed_tool;  // k = 0
-                for (int k = 1; k < count; ++k) {
-                    TopoDS_Shape copy = ::geom::rotate_copy(
-                        seed_tool, axis_pt, axis_dir, radians(step_deg * k));
-                    res = (seed_op == "cut") ? ::geom::cut(res, copy)
-                                             : ::geom::fuse(res, copy);
-                    if (res.IsNull())
-                        throw std::runtime_error("circular pattern instance "
-                                                 + std::string(seed_op == "cut" ? "cut" : "fuse")
-                                                 + " failed");
-                    if (seed_op == "cut") {
-                        TopoDS_Shape pu = ::geom::fuse(pattern_tool, copy);
-                        if (!pu.IsNull()) pattern_tool = pu;
-                    }
+                if (seed_op == "cut") {
+                    TopoDS_Shape pu = ::geom::fuse_many(seed_tool, copies);
+                    if (!pu.IsNull()) pattern_tool = pu;
                 }
 
                 // Match build123d's `+` .clean() on the additive path (merge coplanar
@@ -4199,7 +4211,11 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (style == ::geom::HoleStyle::Cbore) tool_dims.cbore_depth = dims.cbore_depth + lift;
                 tool_dims.csink_lift = lift;
 
-                TopoDS_Shape tool_union;
+                // Build every position's tool, then union them in ONE BOPDS pass (fuse_many)
+                // rather than folding pairwise fuse over a growing union (~O(N²) for a
+                // multi-position hole). A single position skips the boolean entirely.
+                std::vector<TopoDS_Shape> tools;
+                tools.reserve(uv.size());
                 for (const auto& p : uv) {
                     Eigen::Vector3d world = origin + p.first * xdir + p.second * ydir;
                     Eigen::Vector3d lifted = world + lift * normal;  // just above the face
@@ -4207,10 +4223,14 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         ::geom::make_hole_tool(lifted, drill_dir, style, tool_dims);
                     if (t.IsNull())
                         throw std::runtime_error("hole: failed to build a hole tool");
-                    tool_union = tool_union.IsNull() ? t : ::geom::fuse(tool_union, t);
-                    if (tool_union.IsNull())
-                        throw std::runtime_error("hole: tool union (fuse) failed");
+                    tools.push_back(t);
                 }
+                if (tools.empty())
+                    throw std::runtime_error("hole: no positions to drill");
+                TopoDS_Shape tool_union = ::geom::fuse_many(
+                    tools.front(), std::vector<TopoDS_Shape>(tools.begin() + 1, tools.end()));
+                if (tool_union.IsNull())
+                    throw std::runtime_error("hole: tool union (fuse) failed");
 
                 TopoDS_Shape out = ::geom::cut(body, tool_union);
                 if (out.IsNull())
@@ -4242,14 +4262,21 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         thru_dims.cbore_depth = dims.cbore_depth + lift;
                     TopoDS_Shape thru_union;
                     bool thru_ok = true;
+                    std::vector<TopoDS_Shape> thru_tools;
+                    thru_tools.reserve(uv.size());
                     for (const auto& p : uv) {
                         Eigen::Vector3d world = origin + p.first * xdir + p.second * ydir;
                         Eigen::Vector3d lifted = world + lift * normal;
                         TopoDS_Shape t =
                             ::geom::make_hole_tool(lifted, drill_dir, style, thru_dims);
                         if (t.IsNull()) { thru_ok = false; break; }
-                        thru_union = thru_union.IsNull() ? t : ::geom::fuse(thru_union, t);
-                        if (thru_union.IsNull()) { thru_ok = false; break; }
+                        thru_tools.push_back(t);
+                    }
+                    if (thru_ok && !thru_tools.empty()) {
+                        thru_union = ::geom::fuse_many(
+                            thru_tools.front(),
+                            std::vector<TopoDS_Shape>(thru_tools.begin() + 1, thru_tools.end()));
+                        if (thru_union.IsNull()) thru_ok = false;
                     }
                     if (thru_ok && !thru_union.IsNull()) {
                         TopoDS_Shape thru_out = ::geom::cut(body, thru_union);
@@ -4391,7 +4418,12 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (style == ::geom::HoleStyle::Cbore) tool_dims.cbore_depth = dims.cbore_depth + lift;
                 tool_dims.csink_lift = lift;
 
-                TopoDS_Shape tool_union;
+                // Build every hole tool first, then union them in ONE BOPDS pass (fuse_many)
+                // instead of folding pairwise fuse over a growing union (~O(N²) for N holes —
+                // this is the bolt-ring hot path). tool_union is kept (not just cut straight
+                // through) because it's stored as the nesting tool body an outer pattern reuses.
+                std::vector<TopoDS_Shape> tools;
+                tools.reserve((size_t)count);
                 for (int k = 0; k < count; ++k) {
                     const double ang = a0 + 2.0 * PI * static_cast<double>(k) / static_cast<double>(count);
                     Eigen::Vector3d world = center + (ring_r * std::cos(ang)) * fr.uAxis +
@@ -4399,9 +4431,11 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     Eigen::Vector3d lifted = world + lift * normal;
                     TopoDS_Shape t = ::geom::make_hole_tool(lifted, drill_dir, style, tool_dims);
                     if (t.IsNull()) throw std::runtime_error("bolt_circle: failed to build a hole tool");
-                    tool_union = tool_union.IsNull() ? t : ::geom::fuse(tool_union, t);
-                    if (tool_union.IsNull()) throw std::runtime_error("bolt_circle: tool union (fuse) failed");
+                    tools.push_back(t);
                 }
+                TopoDS_Shape tool_union = ::geom::fuse_many(
+                    tools.front(), std::vector<TopoDS_Shape>(tools.begin() + 1, tools.end()));
+                if (tool_union.IsNull()) throw std::runtime_error("bolt_circle: tool union (fuse) failed");
                 TopoDS_Shape out = ::geom::cut(body, tool_union);
                 if (out.IsNull())
                     throw std::runtime_error("bolt_circle: boolean cut produced an empty shape");

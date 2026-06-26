@@ -22,6 +22,8 @@
 // tessellator handles an empty shape gracefully.
 #pragma once
 
+#include <vector>
+
 #include <TopoDS_Shape.hxx>
 
 namespace geom {
@@ -33,6 +35,19 @@ TopoDS_Shape fuse(const TopoDS_Shape& a, const TopoDS_Shape& b);
 // Difference: a − b (BRepAlgoAPI_Cut). Removes b's material from a — the bore/pocket
 // op (a block minus a cylinder = a drilled hole). Empty shape on kernel failure.
 TopoDS_Shape cut(const TopoDS_Shape& a, const TopoDS_Shape& b);
+
+// Multi-tool union: base ∪ tools[0] ∪ tools[1] ∪ … computed in ONE BOPDS pass
+// (BRepAlgoAPI_Fuse with SetArguments/SetTools). MUCH faster than folding the pairwise
+// fuse() over a growing accumulator — that re-traverses the whole running result on every
+// step (~O(N²) for N tools, the pattern-replication hot path); the multi-argument boolean
+// intersects all arguments once. Null tools are skipped; returns `base` if no live tools
+// remain, empty shape on kernel failure.
+TopoDS_Shape fuse_many(const TopoDS_Shape& base, const std::vector<TopoDS_Shape>& tools);
+
+// Multi-tool difference: base − (tools[0] ∪ tools[1] ∪ …) in ONE pass (BRepAlgoAPI_Cut
+// with all tools as Tools). Same O(N²)→O(N)-pass win as fuse_many for a patterned cut.
+// Null tools are skipped; returns `base` if no live tools remain, empty on failure.
+TopoDS_Shape cut_many(const TopoDS_Shape& base, const std::vector<TopoDS_Shape>& tools);
 
 // Intersection: a ∩ b (BRepAlgoAPI_Common). The volume shared by both solids. Empty
 // shape on kernel failure OR when the two solids do not overlap.

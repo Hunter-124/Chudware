@@ -24,6 +24,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from engine.ecad import autosave as _autosave
 from engine.ecad import schema
 from engine.ecad.ops import OpError, apply_ops as _apply_ops_to_doc
 
@@ -83,7 +84,11 @@ def get_session(doc_id: str) -> EcadSession:
 
 
 def close_session(doc_id: str) -> bool:
-    return _REGISTRY.pop(doc_id, None) is not None
+    removed = _REGISTRY.pop(doc_id, None) is not None
+    if removed:
+        # Drop the autosave too: a deliberately-closed doc must NOT be resurrected on restart.
+        _autosave.remove(doc_id)
+    return removed
 
 
 def list_sessions() -> list[dict]:
@@ -91,6 +96,12 @@ def list_sessions() -> list[dict]:
         "doc_id": s.doc_id, "name": s.doc.get("name", s.doc_id),
         "kind": s.kind, "path": s.path, "revision": s.revision, "dirty": s.dirty,
     } for s in _REGISTRY.values()]
+
+
+def iter_sessions() -> list[EcadSession]:
+    """Every open session (the live EcadSession objects, not summaries) — used by the MCP layer to
+    autosave all open ECAD docs before a heavy op (mirrors cad_tools._autosave_all_open)."""
+    return list(_REGISTRY.values())
 
 
 def _register(session: EcadSession) -> None:
@@ -112,6 +123,7 @@ def new_session(kind: str = "sch", name: str | None = None) -> EcadSession:
     doc_id = uuid.uuid4().hex[:12]
     session = EcadSession(doc_id=doc_id, doc=doc, revision=0)
     _register(session)
+    _autosave.autosave_session(session)  # crash-recovery: persist from creation
     return session
 
 
@@ -123,6 +135,7 @@ def open_session(doc: dict, *, path: str | None = None) -> EcadSession:
     doc_id = uuid.uuid4().hex[:12]
     session = EcadSession(doc_id=doc_id, doc=copy.deepcopy(doc), revision=0, path=path)
     _register(session)
+    _autosave.autosave_session(session)  # crash-recovery: persist from open
     return session
 
 
@@ -266,7 +279,9 @@ def apply_ops(session: EcadSession, base_revision: int | None, ops: list[dict],
     session.revision += 1
     session.dirty = True
 
-    return _ops_response(session, res["id_map"], res.get("warnings"))
+    resp = _ops_response(session, res["id_map"], res.get("warnings"))
+    _autosave.autosave_session(session)  # crash-recovery: persist after every mutation
+    return resp
 
 
 def swap_doc(session: EcadSession, new_doc: dict, *, base_revision: int | None = None,
@@ -295,7 +310,9 @@ def swap_doc(session: EcadSession, new_doc: dict, *, base_revision: int | None =
     session.revision += 1
     session.dirty = True
 
-    return _ops_response(session, {}, warnings)
+    resp = _ops_response(session, {}, warnings)
+    _autosave.autosave_session(session)  # crash-recovery: persist after every mutation
+    return resp
 
 
 def rebuild(session: EcadSession, emit: EmitFn | None = None) -> dict:
@@ -323,7 +340,9 @@ def undo(session: EcadSession, emit: EmitFn | None = None) -> dict:
     session.doc = json.loads(snap)
     session.revision += 1
     session.dirty = True
-    return _ops_response(session, {})
+    resp = _ops_response(session, {})
+    _autosave.autosave_session(session)  # crash-recovery: persist after every mutation
+    return resp
 
 
 def redo(session: EcadSession, emit: EmitFn | None = None) -> dict:
@@ -336,4 +355,6 @@ def redo(session: EcadSession, emit: EmitFn | None = None) -> dict:
     session.doc = json.loads(snap)
     session.revision += 1
     session.dirty = True
-    return _ops_response(session, {})
+    resp = _ops_response(session, {})
+    _autosave.autosave_session(session)  # crash-recovery: persist after every mutation
+    return resp

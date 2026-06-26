@@ -85,6 +85,16 @@ def _install_clean_stdout():
 def _warm_core() -> None:
     """Load libaicad.dll up front (in the background) so the FIRST tool call doesn't eat the
     cold load (DLL + OCCT/gmsh deps can take many seconds) inside the client's call timeout."""
+    # Arm ECAD autosave + recover any ECAD docs from a previous (possibly killed) session FIRST.
+    # ECAD is pure Python with no DLL dependency, so this never blocks on the C++ load and an ECAD
+    # recovery succeeds even if libaicad.dll is unavailable. ECAD docs live only in memory, so a
+    # transport-timeout kill of a heavy ecad_* tool would otherwise lose every open schematic/board.
+    try:
+        from mcp_server.ecad_tools import enable_ecad_autosave, recover_ecad_autosaved
+        enable_ecad_autosave()
+        recover_ecad_autosaved()
+    except Exception:
+        pass
     try:
         from mcp_server import core_bridge
         core_bridge.available()

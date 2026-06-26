@@ -65,8 +65,129 @@ _ECAD: dict = {
 # stacking provider latency. A plain bool guarded by a Lock (no waiting) — the recipe path always
 # produces a verified schematic, so skipping the model here only costs the model's topology choice.
 import threading as _threading
+import uuid as _uuid_ecad
 _PROVIDER_PLAN_LOCK = _threading.Lock()
 _PROVIDER_PLAN_BUSY = {"v": False}
+
+
+# --------------------------------------------------------------------------- crash recovery
+#
+# ECAD docs live only in memory (engine.ecad.session registry). A heavy ecad_* tool that overruns
+# the MCP client's transport timeout gets the server KILLED, and without on-disk backing every open
+# schematic/board is lost — unlike C++ part docs, which autosave + recover (cad_tools). The
+# engine.ecad.autosave module persists each session to %APPDATA%/AI-CAD/ecad_autosave after every
+# mutation; here we arm it and expose recovery to server._warm_core.
+
+_ECAD_SESSION_ID = _uuid_ecad.uuid4().hex[:12]
+
+
+def enable_ecad_autosave() -> None:
+    """Arm ECAD crash-recovery autosave for this server process. Called once from
+    server._warm_core at startup. Best-effort."""
+    try:
+        from engine.ecad import autosave as _eauto
+        _eauto.enable(_ECAD_SESSION_ID)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def recover_ecad_autosaved(scope: str = "recent"):
+    """Reopen ECAD docs autosaved before a (possibly killed) prior session into the live registry,
+    and re-point _ECAD['current_*'] at the recovered docs so default-doc tool calls work. Returns
+    the recovery list. Best-effort — never raises into startup."""
+    try:
+        from engine.ecad import autosave as _eauto
+        recovered = _eauto.recover_ecad_autosaved(scope=scope) or []
+    except Exception:  # noqa: BLE001
+        return []
+    # Re-establish the "active" docs so ecad_status / ecad_simulate / etc. find a default doc after
+    # a restart, mirroring how cad_tools.recover_autosaved sets _CUR["doc_id"].
+    for rec in recovered:
+        did = rec.get("doc_id")
+        if not did:
+            continue
+        if rec.get("kind") == "sch":
+            _ECAD["current_sch"] = did
+        elif rec.get("kind") == "pcb":
+            _ECAD["current_pcb"] = did
+        _ECAD["current"] = did
+    return recovered
+
+
+def _autosave_all_open_ecad() -> None:
+    """Autosave every open ECAD session before a heavy op, so even a hard transport-timeout kill
+    (which the soft budget below can't always pre-empt) can never lose open work. Mirrors
+    cad_tools._autosave_all_open for the C++ side. Best-effort."""
+    try:
+        from engine.ecad import autosave as _eauto
+        from engine.ecad import session as _esess
+        if not _eauto.is_enabled():
+            return
+        for s in _esess.iter_sessions():
+            _eauto.autosave_session(s)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --------------------------------------------------------------------------- heavy-tool budget
+#
+# A SYNCHRONOUS ecad_* tool that overruns the client's transport timeout gets the server killed
+# (-32001). The C++ side auto-backgrounds at _SYNC_SOLVE_BUDGET_S=45 (cad_tools); ecad_design
+# already uses a worker-thread + wall-clock deadline (_PLAN_BUDGET_S). Match that for the other
+# heavy ECAD tools (simulate / make_board / autoroute / fill / dfm): run the heavy work on a worker
+# thread with a deadline. If it finishes in time the result is returned inline (the common
+# small-board case is unchanged); if it overruns we return a clean "still running — simplify"
+# message instead of blocking until the client gives up and kills us. The doc is autosaved first,
+# so the abandoned (daemon) worker can keep running harmlessly.
+
+try:
+    _ECAD_HEAVY_BUDGET_S = float(os.environ.get("AI_CAD_ECAD_HEAVY_BUDGET_S", "") or 30.0)
+except (TypeError, ValueError):
+    _ECAD_HEAVY_BUDGET_S = 30.0
+if not (_ECAD_HEAVY_BUDGET_S > 0.0):
+    _ECAD_HEAVY_BUDGET_S = 30.0
+
+
+def _run_with_budget(fn, budget_s: Optional[float] = None):
+    """Run ``fn()`` on a daemon worker thread with a wall-clock deadline.
+
+    Returns ``(status, value)``:
+      * ``("done",  result)``    — fn returned within the budget
+      * ``("error", exception)`` — fn raised within the budget
+      * ``("timeout", None)``    — fn overran (still running in the background daemon)
+
+    ECAD ops are bounded, so an overrun thread finishes on its own; we just stop WAITING on it.
+    """
+    if budget_s is None:
+        budget_s = _ECAD_HEAVY_BUDGET_S
+    box: dict = {}
+
+    def _worker():
+        try:
+            box["v"] = fn()
+        except Exception as exc:  # noqa: BLE001
+            box["e"] = exc
+
+    th = _threading.Thread(target=_worker, name="ecad-heavy", daemon=True)
+    th.start()
+    th.join(max(1.0, float(budget_s)))
+    if th.is_alive():
+        return "timeout", None
+    if "e" in box:
+        return "error", box["e"]
+    return "done", box.get("v")
+
+
+def _budget_timeout_err(what: str, *, simplify: str,
+                        next_actions: list[str] | None = None, **extra) -> str:
+    """Clean 'still running — simplify' payload returned when a heavy ECAD tool overruns the budget,
+    instead of blocking until the client kills the server."""
+    return _err(
+        f"{what} did not finish within the {_ECAD_HEAVY_BUDGET_S:.0f}s budget — it was left running "
+        "in the background to avoid a transport timeout that would kill the MCP server.",
+        hint=("Open documents were autosaved and are safe (they recover on restart). " + simplify),
+        next_actions=next_actions or ["ecad_status()"],
+        status="running", auto_backgrounded=True, budget_s=_ECAD_HEAVY_BUDGET_S, **extra)
 
 
 # --------------------------------------------------------------------------- small helpers
@@ -825,9 +946,24 @@ def register_ecad_tools(mcp) -> None:
                         hint="Use one of: 'op', 'dc', 'tran', 'ac', 'four', 'mc', 'temp', 'noise'.",
                         next_actions=["ecad_simulate('op')"])
 
-        # Advanced analyses: four/mc/temp/noise each wrap or extend an inner analysis.
+        # Advanced analyses: four/mc/temp/noise each wrap or extend an inner analysis. These are the
+        # heaviest sim paths (Monte-Carlo runs many solves) — budget-guard so an overrun never times
+        # out the transport and kills the server (Gap (b)).
         if an["type"] in ("four", "mc", "temp", "noise"):
-            return _simulate_advanced(session, circuit, an, probe_list, warns)
+            _autosave_all_open_ecad()
+            status, val = _run_with_budget(
+                lambda: _simulate_advanced(session, circuit, an, probe_list, warns))
+            if status == "timeout":
+                return _budget_timeout_err(
+                    f"{an['type']} analysis",
+                    simplify=("Reduce the work: fewer Monte-Carlo runs, fewer temperature points, a "
+                              "shorter tstop / coarser tstep, or a narrower frequency span."),
+                    next_actions=["ecad_simulate('op')  # a single fast operating point",
+                                  "ecad_status()"],
+                    analysis=an["type"])
+            if status == "error":
+                raise val
+            return val
 
         # AC needs a small-signal stimulus. The structured netlist carries only DC
         # values, so unless a source already has an AC magnitude (an ecad_design
@@ -865,7 +1001,19 @@ def register_ecad_tools(mcp) -> None:
                     f"so the sweep has a stimulus. Pass params={{'ac_source':'V1','ac_mag':1}} to set it explicitly.")
 
         study = {"analyses": [an], "probes": probe_list}
-        result = sim_run(circuit, study)
+        _autosave_all_open_ecad()
+        status, result = _run_with_budget(lambda: sim_run(circuit, study))
+        if status == "timeout":
+            return _budget_timeout_err(
+                f"{an['type']} simulation",
+                simplify=("Simplify the circuit (fewer nodes) or the analysis — for tran shorten "
+                          "tstop / coarsen tstep, for ac narrow the frequency span, or just run "
+                          "'op'."),
+                next_actions=["ecad_simulate('op')  # a single fast operating point",
+                              "ecad_status()"],
+                analysis=an["type"])
+        if status == "error":
+            raise result
         conv = result.get("convergence", {})
         converged = bool(conv.get(an["type"], False))
 
@@ -974,9 +1122,20 @@ def register_ecad_tools(mcp) -> None:
         doc = session.doc
         try:
             from engine.ecad import dfm as dfm_mod  # lazy import
-            violations = dfm_mod.run_dfm(doc)
         except Exception as e:  # noqa: BLE001
             return _err(f"DFM engine error: {e}", hint="Inspect with ecad_status().")
+        # DFM walks every pad/track/courtyard — on a dense board it can run long. Budget-guard so an
+        # overrun never times out the transport and kills the server (Gap (b)).
+        _autosave_all_open_ecad()
+        status, violations = _run_with_budget(lambda: dfm_mod.run_dfm(doc))
+        if status == "timeout":
+            return _budget_timeout_err(
+                "DFM check",
+                simplify="The board is large/dense — run DFM on a simpler board or after thinning "
+                         "silk/copper, or check DRC first (ecad_run_drc).",
+                next_actions=["ecad_run_drc()", "ecad_status()"])
+        if status == "error":
+            return _err(f"DFM engine error: {violations}", hint="Inspect with ecad_status().")
         summary = _erc_summary(violations)
         lines = _erc_lines(violations)
 
@@ -1125,12 +1284,24 @@ def register_ecad_tools(mcp) -> None:
         if diff_pairs is not None and not isinstance(diff_pairs, str):
             opts["diff_pairs"] = [[str(p), str(n)] for p, n in (
                 (entry[0], entry[1]) for entry in diff_pairs if len(entry) >= 2)]
-        try:
-            resp = ecad_rpc._ecad_autoroute(
-                {"doc_id": session.doc_id, "opts": opts}, lambda _d: None)
-        except OpError as e:
-            return _err(f"autoroute failed: {e.message}", hint=e.message,
-                        next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
+        # The Lee/A* router over a fine grid is one of the heaviest ECAD ops — budget-guard so an
+        # overrun never times out the transport and kills the server (Gap (b)).
+        _autosave_all_open_ecad()
+        status, resp = _run_with_budget(lambda: ecad_rpc._ecad_autoroute(
+            {"doc_id": session.doc_id, "opts": opts}, lambda _d: None))
+        if status == "timeout":
+            return _budget_timeout_err(
+                "autoroute",
+                simplify="Give the router less to do: route fewer nets, use a coarser pitch "
+                         "(ecad_autoroute(pitch=0.3)), or place parts with more room.",
+                next_actions=["ecad_autoroute(pitch=0.3)  # coarser grid is much faster",
+                              "ecad_status()"])
+        if status == "error":
+            e = resp  # on 'error', _run_with_budget returns the raised exception
+            if isinstance(e, OpError):
+                return _err(f"autoroute failed: {e.message}", hint=e.message,
+                            next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
+            raise e
         report = resp.get("report", {})
         routed = report.get("routed", [])
         failed = report.get("failed", [])
@@ -1266,11 +1437,24 @@ def register_ecad_tools(mcp) -> None:
                         hint="Add a ground/power pour first.",
                         next_actions=["ecad_add_zone('GND')  # whole-board ground pour"])
         from engine.ecad import rpc as ecad_rpc
-        try:
-            resp = ecad_rpc._ecad_fill_zones({"doc_id": session.doc_id}, lambda _d: None)
-        except OpError as e:
-            return _err(f"zone fill failed: {e.message}", hint=e.message,
-                        next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
+        # Full-resolution zone fill rasterizes the whole board at 0.1mm (~1/res^2 cells) — a big or
+        # fine-grid pour can run long. Budget-guard so an overrun never times out the transport and
+        # kills the server (Gap (b); this was the make_board trigger in adb46f62).
+        _autosave_all_open_ecad()
+        status, resp = _run_with_budget(
+            lambda: ecad_rpc._ecad_fill_zones({"doc_id": session.doc_id}, lambda _d: None))
+        if status == "timeout":
+            return _budget_timeout_err(
+                "zone fill",
+                simplify="The pour is large/fine — shrink the zone polygon or the board outline. "
+                         "The interactive compile already keeps a coarse preview fill.",
+                next_actions=["ecad_run_drc()", "ecad_status()"])
+        if status == "error":
+            e = resp
+            if isinstance(e, OpError):
+                return _err(f"zone fill failed: {e.message}", hint=e.message,
+                            next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
+            raise e
         summary = resp.get("fill_summary", {})
         filled = summary.get("zones_filled", 0)
         total = summary.get("zones", 0)
@@ -2084,176 +2268,202 @@ def register_ecad_tools(mcp) -> None:
                 "note": note or outcome.get("hint", "")[:120],
             })
 
-        # ---- 1. new board ----
+        # ---- 1. new board (instant — kept OUTSIDE the budget so a timeout below can still report
+        # the created board's id + partial steps for recovery) ----
         pcb_sess = ecad_session.new_session("pcb", pcb_name)
         _ECAD["current_pcb"] = pcb_sess.doc_id
         _ECAD["current"] = pcb_sess.doc_id
         _step("new_pcb", {"ok": True}, f"board '{pcb_name}' created ({pcb_sess.doc_id})")
 
-        # ---- 2. sync schematic -> board ----
         from engine.ecad import rpc as ecad_rpc
-        sync_ok = False
-        try:
-            sync_resp = ecad_rpc._ecad_update_from_sch(
-                {"board_doc_id": pcb_sess.doc_id, "sch_doc_id": sch_id}, lambda _: None)
-            sync_rep = sync_resp.get("report", {})
-            added = sync_rep.get("added", [])
-            ratsnest = sync_resp.get("compile", {}).get("ratsnest", []) or []
-            sync_ok = True
-            _step("update_from_sch", {"ok": True},
-                  f"{len(added)} footprint(s) placed, {len(ratsnest)} airwire(s) to route")
-        except OpError as e:
-            _step("update_from_sch", {"ok": False}, f"FAILED: {e.message}")
-            added = []; ratsnest = []
 
-        # ---- 3. autoroute ----
-        ar_ok = False
-        try:
-            ar_resp = ecad_rpc._ecad_autoroute(
-                {"doc_id": pcb_sess.doc_id, "opts": {}}, lambda _: None)
-            ar_rep = ar_resp.get("report", {})
-            routed = ar_rep.get("routed", [])
-            failed = ar_rep.get("failed", [])
-            ar_ok = True
-            _step("autoroute", {"ok": True},
-                  f"routed {len(routed)} net(s), {len(failed)} failed"
-                  + (f": {failed[:4]}" if failed else ""))
-        except OpError as e:
-            _step("autoroute", {"ok": False}, f"FAILED: {e.message}")
-            routed = []; failed = []
+        # The full sync->route->fill->DRC flow is the heaviest ECAD entry point — it was the
+        # original transport-timeout trigger (adb46f62 fixed the 100x100 GND-pour symptom; this
+        # bounds the whole flow). Run it under ONE wall-clock budget so its TOTAL time can never
+        # overrun the transport and get the server killed (per-substep budgets wouldn't bound the
+        # sum). Autosave first so even a hard kill keeps the work (Gap (a)+(b)).
+        _autosave_all_open_ecad()
 
-        # M4: compute the true routed-net count = multi-pad nets with NO remaining airwires.
-        # The autorouter's ``routed`` list only includes nets that HAD airwires and the
-        # router successfully connected them; single-pad stubs and zone-only nets are never
-        # in the list.  We count all board nets that are NOT in ``failed`` (unrouted) and
-        # have at least 2 pads (so single-pad stubs don't inflate the "routed" figure).
-        try:
-            _pcb_doc_now = pcb_sess.doc
-            _all_board_nets = {
-                n.get("name") for n in _pcb_doc_now.get("nets", [])
-                if isinstance(n, dict) and n.get("name")
-            }
-            # count pads per net
-            from collections import Counter as _Counter
-            _pad_net_counts: _Counter = _Counter()
-            for _fp in _pcb_doc_now.get("footprints", []):
-                for _pad in _fp.get("pads", []):
-                    _pn = _pad.get("net")
-                    if _pn:
-                        _pad_net_counts[_pn] += 1
-            # a net is "multi-pad" when it has >= 2 pads (i.e. needs a connection)
-            _multi_pad_nets = {n for n, c in _pad_net_counts.items() if c >= 2}
-            _failed_set = set(failed)
-            _nets_routed_count = len(_multi_pad_nets - _failed_set)
-            _nets_failed_count = len(_multi_pad_nets & _failed_set)
-        except Exception:  # noqa: BLE001
-            _nets_routed_count = len(routed)
-            _nets_failed_count = len(failed)
+        def _flow() -> str:
+            # ---- 2. sync schematic -> board ----
+            sync_ok = False
+            try:
+                sync_resp = ecad_rpc._ecad_update_from_sch(
+                    {"board_doc_id": pcb_sess.doc_id, "sch_doc_id": sch_id}, lambda _: None)
+                sync_rep = sync_resp.get("report", {})
+                added = sync_rep.get("added", [])
+                ratsnest = sync_resp.get("compile", {}).get("ratsnest", []) or []
+                sync_ok = True
+                _step("update_from_sch", {"ok": True},
+                      f"{len(added)} footprint(s) placed, {len(ratsnest)} airwire(s) to route")
+            except OpError as e:
+                _step("update_from_sch", {"ok": False}, f"FAILED: {e.message}")
+                added = []; ratsnest = []
 
-        # ---- 3.5 board outline (auto Edge.Cuts rectangle if none) ----
-        # The one-shot flow must leave a closed Edge.Cuts loop: ecad_to_3d needs it to
-        # build the substrate, and the GND pour wants the true board extents (Bug E-3).
-        outline_ok = False
-        try:
-            pcb_doc = pcb_sess.doc
-            if not (pcb_doc.get("outline", {}) or {}).get("shapes"):
-                shapes = _default_outline_shapes(pcb_doc)
-                _apply(pcb_sess, [{"op": "pcb_set_outline", "shapes": shapes, "closed": True}])
-                bb = _outline_bbox(pcb_sess.doc)
-                outline_ok = True
-                _step("set_outline", {"ok": True},
-                      "auto Edge.Cuts rectangle "
-                      + (f"{bb[2]-bb[0]:.1f} x {bb[3]-bb[1]:.1f} mm" if bb else "added"))
-            else:
-                outline_ok = True
-                _step("set_outline", {"ok": True}, "outline already present — kept")
-        except Exception as e:  # noqa: BLE001
-            _step("set_outline", {"ok": False}, f"FAILED: {type(e).__name__}: {e}")
+            # ---- 3. autoroute ----
+            ar_ok = False
+            try:
+                ar_resp = ecad_rpc._ecad_autoroute(
+                    {"doc_id": pcb_sess.doc_id, "opts": {}}, lambda _: None)
+                ar_rep = ar_resp.get("report", {})
+                routed = ar_rep.get("routed", [])
+                failed = ar_rep.get("failed", [])
+                ar_ok = True
+                _step("autoroute", {"ok": True},
+                      f"routed {len(routed)} net(s), {len(failed)} failed"
+                      + (f": {failed[:4]}" if failed else ""))
+            except OpError as e:
+                _step("autoroute", {"ok": False}, f"FAILED: {e.message}")
+                routed = []; failed = []
 
-        # ---- 4. fill zones (add GND zone automatically if board has none) ----
-        fill_ok = False
-        try:
-            pcb_doc = pcb_sess.doc
-            if not pcb_doc.get("zones"):
-                # add a whole-board GND zone (need a bounding box for the polygon).
-                poly = _outline_bbox(pcb_doc)
-                if poly is None:
-                    # No board outline: size the pour to the actual COPPER extent (placed
-                    # footprints + routed tracks) plus a margin — NOT a fixed 100x100 mm. A
-                    # 100x100 zone filled at 0.1 mm resolution is ~1e6 cells (~5 s); for a small
-                    # board that overran the MCP transport timeout in this SYNCHRONOUS flow, the
-                    # server was killed, and every ECAD doc (Python, no autosave) was lost. The
-                    # tight extent fills in ~0.1 s. (engine.ecad.autoroute._board_bbox already
-                    # returns the copper extent + a small pad when there is no outline.)
-                    from engine.ecad import autoroute as _ar_bbox
-                    bx0, by0, bx1, by1 = _ar_bbox._board_bbox(pcb_doc)
-                    m = 5.0  # pour margin beyond the copper
-                    poly = (bx0 - m, by0 - m, bx1 + m, by1 + m)
-                x0, y0, x1, y1 = poly
-                poly_pts = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
-                _apply(pcb_sess, [{"op": "pcb_add_zone", "net": "GND", "layer": "F.Cu",
-                                   "polygon": poly_pts}])
-            fill_resp = ecad_rpc._ecad_fill_zones({"doc_id": pcb_sess.doc_id}, lambda _: None)
-            fs = fill_resp.get("fill_summary", {})
-            fill_ok = True
-            _step("fill_zones", {"ok": True},
-                  f"{fs.get('zones_filled', 0)} zone(s) filled, {fs.get('copper_area_mm2', 0):.1f} mm^2")
-        except Exception as e:  # noqa: BLE001
-            _step("fill_zones", {"ok": False}, f"FAILED: {type(e).__name__}: {e}")
+            # M4: compute the true routed-net count = multi-pad nets with NO remaining airwires.
+            # The autorouter's ``routed`` list only includes nets that HAD airwires and the
+            # router successfully connected them; single-pad stubs and zone-only nets are never
+            # in the list.  We count all board nets that are NOT in ``failed`` (unrouted) and
+            # have at least 2 pads (so single-pad stubs don't inflate the "routed" figure).
+            try:
+                _pcb_doc_now = pcb_sess.doc
+                _all_board_nets = {
+                    n.get("name") for n in _pcb_doc_now.get("nets", [])
+                    if isinstance(n, dict) and n.get("name")
+                }
+                # count pads per net
+                from collections import Counter as _Counter
+                _pad_net_counts: _Counter = _Counter()
+                for _fp in _pcb_doc_now.get("footprints", []):
+                    for _pad in _fp.get("pads", []):
+                        _pn = _pad.get("net")
+                        if _pn:
+                            _pad_net_counts[_pn] += 1
+                # a net is "multi-pad" when it has >= 2 pads (i.e. needs a connection)
+                _multi_pad_nets = {n for n, c in _pad_net_counts.items() if c >= 2}
+                _failed_set = set(failed)
+                _nets_routed_count = len(_multi_pad_nets - _failed_set)
+                _nets_failed_count = len(_multi_pad_nets & _failed_set)
+            except Exception:  # noqa: BLE001
+                _nets_routed_count = len(routed)
+                _nets_failed_count = len(failed)
 
-        # ---- 5. DRC ----
-        drc_errors = 0; drc_warnings = 0; drc_lines: list[str] = []
-        try:
-            from engine.ecad import drc as drc_mod
-            violations = drc_mod.run_drc(pcb_sess.doc)
-            if isinstance(violations, dict):
-                violations = violations.get("violations", [])
-            drc_sum = _erc_summary(violations)
-            drc_errors = drc_sum["errors"]
-            drc_warnings = drc_sum["warnings"]
-            drc_lines = _erc_lines(violations)[:6]
-            _step("drc", {"ok": drc_errors == 0},
-                  f"{drc_errors} error(s), {drc_warnings} warning(s)")
-        except Exception as e:  # noqa: BLE001
-            _step("drc", {"ok": False}, f"DRC unavailable: {e}")
+            # ---- 3.5 board outline (auto Edge.Cuts rectangle if none) ----
+            # The one-shot flow must leave a closed Edge.Cuts loop: ecad_to_3d needs it to
+            # build the substrate, and the GND pour wants the true board extents (Bug E-3).
+            outline_ok = False
+            try:
+                pcb_doc = pcb_sess.doc
+                if not (pcb_doc.get("outline", {}) or {}).get("shapes"):
+                    shapes = _default_outline_shapes(pcb_doc)
+                    _apply(pcb_sess, [{"op": "pcb_set_outline", "shapes": shapes, "closed": True}])
+                    bb = _outline_bbox(pcb_sess.doc)
+                    outline_ok = True
+                    _step("set_outline", {"ok": True},
+                          "auto Edge.Cuts rectangle "
+                          + (f"{bb[2]-bb[0]:.1f} x {bb[3]-bb[1]:.1f} mm" if bb else "added"))
+                else:
+                    outline_ok = True
+                    _step("set_outline", {"ok": True}, "outline already present — kept")
+            except Exception as e:  # noqa: BLE001
+                _step("set_outline", {"ok": False}, f"FAILED: {type(e).__name__}: {e}")
 
-        all_ok = all(s["ok"] for s in steps)
-        summary_lines = [f"  {s['step']}: {'OK' if s['ok'] else 'FAIL'} -- {s['note']}"
-                         for s in steps]
-        reading = "\n".join(summary_lines)
-        hint = (f"Board flow {'complete' if all_ok else 'partial'}: "
-                + "; ".join(f"{s['step']}={'OK' if s['ok'] else 'FAIL'}" for s in steps)
-                + f". DRC: {drc_errors} error(s). "
-                "Next: call ecad_to_3d() to bring the board into the CAD app for a housing.")
+            # ---- 4. fill zones (add GND zone automatically if board has none) ----
+            fill_ok = False
+            try:
+                pcb_doc = pcb_sess.doc
+                if not pcb_doc.get("zones"):
+                    # add a whole-board GND zone (need a bounding box for the polygon).
+                    poly = _outline_bbox(pcb_doc)
+                    if poly is None:
+                        # No board outline: size the pour to the actual COPPER extent (placed
+                        # footprints + routed tracks) plus a margin — NOT a fixed 100x100 mm. A
+                        # 100x100 zone filled at 0.1 mm resolution is ~1e6 cells (~5 s); for a small
+                        # board that overran the MCP transport timeout in this SYNCHRONOUS flow, the
+                        # server was killed, and every ECAD doc (Python, no autosave) was lost. The
+                        # tight extent fills in ~0.1 s. (engine.ecad.autoroute._board_bbox already
+                        # returns the copper extent + a small pad when there is no outline.)
+                        from engine.ecad import autoroute as _ar_bbox
+                        bx0, by0, bx1, by1 = _ar_bbox._board_bbox(pcb_doc)
+                        m = 5.0  # pour margin beyond the copper
+                        poly = (bx0 - m, by0 - m, bx1 + m, by1 + m)
+                    x0, y0, x1, y1 = poly
+                    poly_pts = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+                    _apply(pcb_sess, [{"op": "pcb_add_zone", "net": "GND", "layer": "F.Cu",
+                                       "polygon": poly_pts}])
+                fill_resp = ecad_rpc._ecad_fill_zones({"doc_id": pcb_sess.doc_id}, lambda _: None)
+                fs = fill_resp.get("fill_summary", {})
+                fill_ok = True
+                _step("fill_zones", {"ok": True},
+                      f"{fs.get('zones_filled', 0)} zone(s) filled, {fs.get('copper_area_mm2', 0):.1f} mm^2")
+            except Exception as e:  # noqa: BLE001
+                _step("fill_zones", {"ok": False}, f"FAILED: {type(e).__name__}: {e}")
 
-        next_actions: list[str] = []
-        if failed:
-            next_actions.append(
-                f"{len(failed)} net(s) not routed ({', '.join(map(str, failed[:4]))}). "
-                "Try ecad_autoroute(pitch=0.15) or move parts to give the router more room.")
-        if drc_errors:
-            next_actions.append(f"ecad_run_drc()  # {drc_errors} DRC error(s) to fix")
-        next_actions.append("ecad_to_3d()  # export STEP and design an enclosure in the CAD app")
-        if not next_actions:
-            next_actions.append("ecad_export('gerber')  # board passes DRC -- ready for fab")
+            # ---- 5. DRC ----
+            drc_errors = 0; drc_warnings = 0; drc_lines: list[str] = []
+            try:
+                from engine.ecad import drc as drc_mod
+                violations = drc_mod.run_drc(pcb_sess.doc)
+                if isinstance(violations, dict):
+                    violations = violations.get("violations", [])
+                drc_sum = _erc_summary(violations)
+                drc_errors = drc_sum["errors"]
+                drc_warnings = drc_sum["warnings"]
+                drc_lines = _erc_lines(violations)[:6]
+                _step("drc", {"ok": drc_errors == 0},
+                      f"{drc_errors} error(s), {drc_warnings} warning(s)")
+            except Exception as e:  # noqa: BLE001
+                _step("drc", {"ok": False}, f"DRC unavailable: {e}")
 
-        return _dumps({
-            "ok": all_ok, "doc_id": pcb_sess.doc_id,
-            "sch_doc_id": sch_id, "pcb_name": pcb_name,
-            "steps": steps, "reading": reading,
-            "footprints_placed": len(added),
-            # M4: nets_routed = multi-pad nets with no remaining airwires (all connected).
-            # nets_autorouted = nets the router actively connected in this run (subset).
-            # nets_failed = multi-pad nets that still have unrouted airwires.
-            "nets_routed": _nets_routed_count,
-            "nets_autorouted": len(routed),
-            "nets_failed": _nets_failed_count,
-            "drc_errors": drc_errors, "drc_warnings": drc_warnings,
-            "drc_violations": drc_lines,
-            "warnings": drc_lines[:3],
-            "hint": hint,
-            "next_actions": next_actions,
-        })
+            all_ok = all(s["ok"] for s in steps)
+            summary_lines = [f"  {s['step']}: {'OK' if s['ok'] else 'FAIL'} -- {s['note']}"
+                             for s in steps]
+            reading = "\n".join(summary_lines)
+            hint = (f"Board flow {'complete' if all_ok else 'partial'}: "
+                    + "; ".join(f"{s['step']}={'OK' if s['ok'] else 'FAIL'}" for s in steps)
+                    + f". DRC: {drc_errors} error(s). "
+                    "Next: call ecad_to_3d() to bring the board into the CAD app for a housing.")
+
+            next_actions: list[str] = []
+            if failed:
+                next_actions.append(
+                    f"{len(failed)} net(s) not routed ({', '.join(map(str, failed[:4]))}). "
+                    "Try ecad_autoroute(pitch=0.15) or move parts to give the router more room.")
+            if drc_errors:
+                next_actions.append(f"ecad_run_drc()  # {drc_errors} DRC error(s) to fix")
+            next_actions.append("ecad_to_3d()  # export STEP and design an enclosure in the CAD app")
+            if not next_actions:
+                next_actions.append("ecad_export('gerber')  # board passes DRC -- ready for fab")
+
+            return _dumps({
+                "ok": all_ok, "doc_id": pcb_sess.doc_id,
+                "sch_doc_id": sch_id, "pcb_name": pcb_name,
+                "steps": steps, "reading": reading,
+                "footprints_placed": len(added),
+                # M4: nets_routed = multi-pad nets with no remaining airwires (all connected).
+                # nets_autorouted = nets the router actively connected in this run (subset).
+                # nets_failed = multi-pad nets that still have unrouted airwires.
+                "nets_routed": _nets_routed_count,
+                "nets_autorouted": len(routed),
+                "nets_failed": _nets_failed_count,
+                "drc_errors": drc_errors, "drc_warnings": drc_warnings,
+                "drc_violations": drc_lines,
+                "warnings": drc_lines[:3],
+                "hint": hint,
+                "next_actions": next_actions,
+            })
+
+        status, out = _run_with_budget(_flow)
+        if status == "timeout":
+            return _budget_timeout_err(
+                "make_board flow",
+                simplify="The one-shot sync->route->fill->DRC flow is too heavy for a single call. "
+                         "Run the steps separately so each is individually budget-guarded: "
+                         "ecad_update_from_sch(), then ecad_autoroute(pitch=0.3), then "
+                         "ecad_fill_zones(), then ecad_run_drc().",
+                next_actions=["ecad_autoroute(pitch=0.3)  # on the partial board",
+                              "ecad_fill_zones()", "ecad_run_drc()"],
+                doc_id=pcb_sess.doc_id,
+                steps_completed=[s["step"] for s in steps])
+        if status == "error":
+            raise out
+        return out
 
     # tools registered; nothing to return.
 

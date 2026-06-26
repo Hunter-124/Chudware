@@ -2175,14 +2175,22 @@ def register_ecad_tools(mcp) -> None:
         try:
             pcb_doc = pcb_sess.doc
             if not pcb_doc.get("zones"):
-                # add a whole-board GND zone (need an outline bounding box for the polygon).
+                # add a whole-board GND zone (need a bounding box for the polygon).
                 poly = _outline_bbox(pcb_doc)
                 if poly is None:
-                    # No outline: use a generous 100x100 mm default.
-                    poly_pts = [[0, 0], [100, 0], [100, 100], [0, 100]]
-                else:
-                    x0, y0, x1, y1 = poly
-                    poly_pts = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+                    # No board outline: size the pour to the actual COPPER extent (placed
+                    # footprints + routed tracks) plus a margin — NOT a fixed 100x100 mm. A
+                    # 100x100 zone filled at 0.1 mm resolution is ~1e6 cells (~5 s); for a small
+                    # board that overran the MCP transport timeout in this SYNCHRONOUS flow, the
+                    # server was killed, and every ECAD doc (Python, no autosave) was lost. The
+                    # tight extent fills in ~0.1 s. (engine.ecad.autoroute._board_bbox already
+                    # returns the copper extent + a small pad when there is no outline.)
+                    from engine.ecad import autoroute as _ar_bbox
+                    bx0, by0, bx1, by1 = _ar_bbox._board_bbox(pcb_doc)
+                    m = 5.0  # pour margin beyond the copper
+                    poly = (bx0 - m, by0 - m, bx1 + m, by1 + m)
+                x0, y0, x1, y1 = poly
+                poly_pts = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
                 _apply(pcb_sess, [{"op": "pcb_add_zone", "net": "GND", "layer": "F.Cu",
                                    "polygon": poly_pts}])
             fill_resp = ecad_rpc._ecad_fill_zones({"doc_id": pcb_sess.doc_id}, lambda _: None)

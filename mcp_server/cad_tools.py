@@ -1268,13 +1268,22 @@ def register_cad_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def import_part(path: str, into: Optional[str] = None, as_solid: bool = False) -> str:
+    def import_part(path: str, into: Optional[str] = None, as_solid: bool = False,
+                    resolve_features: bool = True) -> str:
         """Import a CAD/mesh file (STEP/IGES/BREP/STL/3MF/OBJ/STEP+/…) as a body.
 
         Lets you assemble components built or exported separately, or recover geometry from a file
         after a session reset. `into` = an existing doc_id to add the body to the CURRENT part
         (for assembly); omit it to open the file as a NEW part (made current). `as_solid` sews a
         mesh (STL/OBJ/…) into a solid on import; B-rep formats already import as solids.
+
+        SOLIDWORKS (.sldprt): with `resolve_features=True` (default) and no `into`, the part is
+        opened by RECONSTRUCTING its SolidWorks feature tree (sketches with relations, reference
+        planes, extrude/cut/revolve/loft, …) into a fully EDITABLE AI-CAD part — not a frozen
+        body. This needs SolidWorks installed locally (driven via its COM API). If any feature
+        can't be faithfully rebuilt the import is REFUSED with the exact list of what blocked it
+        (so the gap can be fixed) — it does NOT silently fall back to a dumb solid. Set
+        `resolve_features=False` to force the legacy COM→STEP single-body import instead.
 
         TIP: pair with the `transform` feature (in add_features) to POSITION each imported body
         into a shared coordinate frame — translate:[x,y,z] and/or angle:<deg> with rotate:[ax,ay,az].
@@ -1285,6 +1294,83 @@ def register_cad_tools(mcp: FastMCP) -> None:
             # "format unsupported" and may silently create an empty document.
             if not os.path.isfile(path):
                 return _dumps({"ok": False, "error": f"file not found: {path}"})
+            # SolidWorks feature-tree resolution (opening as a NEW editable part/assembly).
+            if resolve_features and not into and path.lower().endswith((".sldprt", ".sldasm")):
+                from engine.doc.sw_feature_import import SolidWorksUnavailable
+                from engine.doc.sw_translate import resolve as _sw_resolve
+                try:
+                    plan = _sw_resolve(path)
+                except SolidWorksUnavailable as e:
+                    return _dumps({"ok": False, "error": str(e),
+                                   "hint": "Open the part in SolidWorks and Save As STEP, then "
+                                           "import that — or call import_part(resolve_features="
+                                           "False) for a single-body COM→STEP import."})
+                except Exception as e:  # noqa: BLE001
+                    return _dumps({"ok": False, "error":
+                                   f"SolidWorks feature extraction failed: {e}"})
+                if plan["blocking"]:
+                    # Strict-fidelity contract: refuse rather than import a quietly-wrong model.
+                    return _dumps({
+                        "ok": False,
+                        "error": "cannot fully resolve this SolidWorks part's feature tree — "
+                                 f"{len(plan['blocking'])} feature(s) are not supported yet",
+                        "unsupported": plan["blocking"],
+                        "degraded": plan["degraded"],
+                        "hint": "These features need importer support before this part can be "
+                                "rebuilt faithfully. Use import_part(resolve_features=False) to "
+                                "fall back to a single-body COM→STEP import in the meantime."})
+                if plan.get("is_assembly"):
+                    # Build each DISTINCT component part once -> save a .step+ (keeps its editable
+                    # feature tree) -> place every instance in an ASSEMBLY doc via
+                    # asm_insert_component with its 4x4 transform (the engine's native assembly model).
+                    comps = plan["components"]
+                    if not comps:
+                        return _dumps({"ok": False, "error":
+                                       "no reconstructable components in this assembly",
+                                       "degraded": plan["degraded"]})
+                    # Component .step+ sidecars live in a cache dir (NOT the user's source folder);
+                    # the assembly references them, so they must persist for the session.
+                    sidecar = os.path.join(tempfile.gettempdir(), "aicad_sw_components",
+                                           plan["name"])
+                    os.makedirs(sidecar, exist_ok=True)
+                    built: dict = {}   # part_key -> .step+ path
+                    for c in comps:
+                        key = c["part_key"]
+                        if key in built:
+                            continue
+                        cd = cb.call("doc_new", {"name": os.path.basename(key)}).get("doc_id")
+                        cb.call("doc_apply_ops", {"doc_id": cd, "ops": c["ops"]})
+                        stem = os.path.splitext(os.path.basename(key))[0]
+                        cpath = os.path.join(sidecar, stem + ".step+")
+                        cb.call("doc_save", {"doc_id": cd, "path": cpath})
+                        cb.call("doc_close", {"doc_id": cd})
+                        built[key] = cpath
+                    ad = cb.call("doc_new", {"name": plan["name"],
+                                             "kind": "assembly"}).get("doc_id")
+                    asm_ops = [{"op": "asm_insert_component", "name": c["name"],
+                                "source": {"path": built[c["part_key"]]},
+                                "transform": c["xform16"]} for c in comps]
+                    cb.call("doc_apply_ops", {"doc_id": ad, "ops": asm_ops})
+                    try:
+                        cb.call("doc_solve_mates", {"doc_id": ad})
+                    except CoreError:
+                        pass
+                    _CUR["doc_id"] = ad
+                    _publish_current(ad)
+                    return _dumps({
+                        "ok": True, "doc_id": ad, "imported_from": path, "format": "sldasm",
+                        "feature_resolved": True, "is_assembly": True,
+                        "component_count": len(comps), "distinct_parts": len(built),
+                        "feature_count": plan["feature_count"], "degraded": plan["degraded"]})
+                d = cb.call("doc_new", {"name": plan["name"]}).get("doc_id")
+                r = cb.call("doc_apply_ops", {"doc_id": d, "ops": plan["ops"]})
+                _CUR["doc_id"] = d
+                _publish_current(d)
+                return _dumps({
+                    "ok": True, "doc_id": d, "imported_from": path, "format": "sldprt",
+                    "feature_resolved": True, "feature_count": plan["feature_count"],
+                    "degraded": plan["degraded"],
+                    **{k: r[k] for k in ("revision", "body_count", "volume_mm3") if k in r}})
             # A3: .step+ is the engine's NATIVE format. With no `into`, route it through
             # doc_open (the same path used by recover_parts and the host's own file-open) to
             # open it as a fresh part. WITH `into`, the engine's import_file now extracts the

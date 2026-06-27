@@ -4,6 +4,7 @@
 // Python worker — just load the DLL. Header stays light (JSON only) so UI TUs don't pull windows.h.
 #pragma once
 #include <string>
+#include <cstdint>
 #include <nlohmann/json.hpp>
 
 namespace eng {
@@ -53,6 +54,11 @@ public:
     OpsResult addShell(double thickness, const std::string& name = "Shell");
     OpsResult addDraftSides(double angleDeg, const std::string& name = "Draft");
     OpsResult addHoleCenter(double diameter, const std::string& name = "Hole");
+
+    // ---- viewport picking <-> kernel selectors (engine_pick.cpp) ----
+    nlohmann::json resolvePick(uint32_t body_id, const std::string& kind, uint32_t topo_id);
+    OpsResult addShellFaces(double thickness, const nlohmann::json& removeRefs);  // shell, removing picked faces
+    OpsResult addDraftFaces(double angleDeg, const nlohmann::json& faceRefs);
 
 private:
     OpsResult call(const std::string& method, const nlohmann::json& params);

@@ -1,6 +1,7 @@
 #include "ui/panels.h"
 #include "ui/command_registry.h"
 #include "app/app_state.h"
+#include "viewport/scene.h"
 #include "theme/theme.h"
 #include "theme/icons.h"
 #include "imgui.h"
@@ -176,6 +177,20 @@ void drawInspector(AppState& s) {
                 if (r.ok) { s.buildTreeFromDoc(); s.status = label + " added (rev " + std::to_string(s.engine.revision()) + ")"; }
                 else s.status = std::string("Engine error: ") + (r.errMsg.empty() ? s.engine.lastError() : r.errMsg);
             } else s.status = label + " added (demo)";
+        } else if (tool == "shell" && s.scene && !s.scene->selection().empty() && s.engineReady) {
+            // shell, removing the faces selected in the viewport
+            nlohmann::json refs = nlohmann::json::array();
+            for (const auto& pr : s.scene->selection()) {
+                nlohmann::json sel = s.engine.resolvePick(pr.body_id, "face", pr.topo_id);
+                if (!sel.is_null()) refs.push_back(sel);
+            }
+            if (refs.empty()) s.status = "Could not resolve the selected faces";
+            else {
+                eng::OpsResult r = s.engine.addShellFaces(thick, refs);
+                if (r.ok) { s.scene->clearSelection(); s.selCount = 0; s.buildTreeFromDoc();
+                            s.status = "Shell - removed " + std::to_string((int)refs.size()) + " selected face(s)"; }
+                else s.status = std::string("Engine error: ") + (r.errMsg.empty() ? s.engine.lastError() : r.errMsg);
+            }
         } else {
             double v1 = radius;
             if (tool == "shell") v1 = thick;

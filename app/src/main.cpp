@@ -47,7 +47,8 @@ static void capturePNG(GLFWwindow* win, const char* path) {
 int main(int argc, char** argv) {
     // headless screenshot mode: --shot <path> [--frames N]
     const char* shotPath = nullptr; int shotFrames = 12; bool demo = false;
-    const char* doCmd = nullptr; bool openPalette = false; bool sketch = false; bool selftest = false; bool picktest = false;
+    const char* doCmd = nullptr; bool openPalette = false; bool sketch = false;
+    bool selftest = false, picktest = false, shelltest = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--shot") && i+1 < argc) shotPath = argv[++i];
         else if (!std::strcmp(argv[i], "--frames") && i+1 < argc) shotFrames = atoi(argv[++i]);
@@ -57,6 +58,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--sketch")) sketch = true;
         else if (!std::strcmp(argv[i], "--selftest")) selftest = true;
         else if (!std::strcmp(argv[i], "--picktest")) picktest = true;
+        else if (!std::strcmp(argv[i], "--shelltest")) shelltest = true;
     }
 
     // If the core DLL location isn't set and isn't next to the exe, point at the dev build path.
@@ -150,6 +152,31 @@ int main(int argc, char** argv) {
             bool ok = loaded && hit && pr.topo_id > 0;
             std::fprintf(stderr, "[picktest] loaded=%d hit=%d body=%u face=%u -> %s\n",
                          loaded, hit, pr.body_id, pr.topo_id, ok ? "OK" : "FAIL");
+            rc = ok ? 0 : 2;
+        }
+        application.shutdown();
+        glfwDestroyWindow(win); glfwTerminate();
+        return rc;
+    }
+
+    if (shelltest) {
+        auto& st = application.state();
+        int rc = 2;
+        if (!st.engineReady || !st.scene) std::fprintf(stderr, "[shelltest] FAIL: no engine/scene\n");
+        else {
+            st.engine.newPart("T"); st.engine.addBox(40, 30, 20, "Base"); st.engine.rebuild();
+            st.scene->resize(800, 600);
+            st.scene->loadAicm(st.engine.aicmPath());
+            st.scene->render();
+            viewport::Scene::PickRef pr;
+            bool hit = st.scene->pickAt(400, 300, pr);
+            nlohmann::json refs = nlohmann::json::array();
+            if (hit) { nlohmann::json sel = st.engine.resolvePick(pr.body_id, "face", pr.topo_id); if (!sel.is_null()) refs.push_back(sel); }
+            eng::OpsResult r; if (!refs.empty()) r = st.engine.addShellFaces(2.0, refs);
+            int nf = 0; const auto& t = st.engine.tree(); if (t.contains("features") && t["features"].is_array()) nf = (int)t["features"].size();
+            bool ok = hit && !refs.empty() && r.ok && nf >= 2;
+            std::fprintf(stderr, "[shelltest] hit=%d resolved=%d shellOk=%d features=%d -> %s\n",
+                         hit, (int)!refs.empty(), (int)r.ok, nf, ok ? "OK" : "FAIL");
             rc = ok ? 0 : 2;
         }
         application.shutdown();

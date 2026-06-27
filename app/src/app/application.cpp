@@ -48,6 +48,14 @@ void Application::frame() {
     if ((io.KeyCtrl || io.KeySuper) && ImGui::IsKeyPressed(ImGuiKey_K, false))
         s.paletteOpen = !s.paletteOpen;
 
+    // undo / redo (engine), unless typing in a field or mid-tool / mid-agent
+    if ((io.KeyCtrl || io.KeySuper) && !io.WantTextInput && s.engineReady && !s.agent.running && s.activeTool.empty()) {
+        bool redo = (ImGui::IsKeyPressed(ImGuiKey_Y, false)) ||
+                    (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false));
+        if (redo) { if (s.engine.redo().ok) { s.buildTreeFromDoc(); s.status = "Redo"; } }
+        else if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) { if (s.engine.undo().ok) { s.buildTreeFromDoc(); s.status = "Undo"; } }
+    }
+
     const float titleH = theme::ctx().m.titleBarH  * theme::S();
     const float wsH    = theme::ctx().m.workspaceH  * theme::S();
     const float tbH    = theme::ctx().m.toolbarH    * theme::S();

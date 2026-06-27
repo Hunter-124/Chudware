@@ -35,9 +35,12 @@ struct AgentThread {
     std::string composer;
     int         model = 0;              // 0 Claude, 1 Gemini, 2 Local
     bool        showThinking = true;
-    // demo scripted-response driver (until wired to agent_run_v2 / events.jsonl)
+    // demo scripted-response driver (until wired to agent_run_v2 / events.jsonl).
+    // The demo applies a REAL engine op so you watch the agent drive the kernel transparently.
     int   demoStep = -1;
     float demoTimer = 0.f;
+    bool  demoOpOk = false;
+    std::string demoOpMsg;
 };
 
 // ---- A lightweight feature-tree node (mirrors DocMirror::tree() later; demo now). ----

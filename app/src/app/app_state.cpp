@@ -184,33 +184,52 @@ void AppState::tickDemoAgent(float dt) {
     switch (agent.demoStep) {
         case 0: {  // thinking
             AgentBlock t; t.kind = BlockKind::Thinking; t.title = "Thinking";
-            t.body = "The user wants a regulator. I'll start a sketch on the top plane, extrude a "
-                     "base, then place the components. Let me create the base body first.";
+            t.body = "The board needs mounting points. I'll drill four M3 clearance holes on a "
+                     "30 mm bolt circle on the bottom face, then I can route the power net.";
             append(t);
             agent.demoStep = 1; agent.demoTimer = 0.f;
         } break;
-        case 1: if (agent.demoTimer > 1.0f) {  // action: extrude (running)
-            AgentBlock a; a.kind = BlockKind::Action; a.title = "Extrude - Base 40x30x3 mm";
-            a.args = "{\n  \"op\": \"extrude_boss\",\n  \"depth\": 3.0,\n  \"profile\": \"Sketch1\"\n}";
+        case 1: if (agent.demoTimer > 0.9f) {  // action: APPLY A REAL ENGINE OP
+            AgentBlock a; a.kind = BlockKind::Action; a.title = "Bolt circle - 4x M3 on 30 mm PCD";
+            a.args = "{\n  \"op\": \"add_feature\",\n  \"feature\": {\n    \"type\": \"bolt_circle\",\n"
+                     "    \"params\": { \"diameter\": 3.4, \"count\": 4, \"pcd\": 30 },\n"
+                     "    \"refs\": { \"face\": { \"of\": \"face\", \"side\": \"bottom\" } }\n  }\n}";
             a.status = ActionStatus::Running;
             append(a);
+            // drive the real kernel
+            if (engineReady) {
+                auto r = engine.addFeature(nlohmann::json{
+                    {"type","bolt_circle"},{"name","MountHoles"},
+                    {"params",{{"diameter",3.4},{"count",4},{"pcd",30}}},
+                    {"refs",{{"face",{{"of","face"},{"side","bottom"}}}}}});
+                agent.demoOpOk = r.ok;
+                agent.demoOpMsg = r.ok ? ("Added MountHoles (4 holes). Rebuilt to rev " + std::to_string(engine.revision()) + ".")
+                                       : ("Engine: " + (r.errMsg.empty() ? engine.lastError() : r.errMsg));
+                if (r.ok) buildTreeFromDoc();
+            } else {
+                agent.demoOpOk = true;
+                agent.demoOpMsg = "Added 4 mounting holes (demo).";
+            }
             agent.demoStep = 2; agent.demoTimer = 0.f;
         } break;
-        case 2: if (agent.demoTimer > 1.4f) {  // action resolves
+        case 2: if (agent.demoTimer > 1.1f) {  // resolve the action card from the real result
             for (auto it = agent.blocks.rbegin(); it != agent.blocks.rend(); ++it)
                 if (it->kind == BlockKind::Action) {
-                    it->status = ActionStatus::Ok;
-                    it->result = "Created body Bracket<1> (1 solid, watertight). +1 feature.";
+                    it->status = agent.demoOpOk ? ActionStatus::Ok : ActionStatus::Failed;
+                    it->result = agent.demoOpMsg;
                     break;
                 }
             agent.demoStep = 3; agent.demoTimer = 0.f;
         } break;
         case 3: if (agent.demoTimer > 0.5f) {  // assistant summary
             AgentBlock m; m.kind = BlockKind::AssistantMsg; m.title = "Assistant";
-            m.body = "Done - I created a 40x30x3 mm base body. Next I can place the regulator, "
-                     "input/output caps, and route the power net. Want me to continue?";
+            m.body = agent.demoOpOk
+                ? "Done - I drilled the four mounting holes through the base. Next I can place the "
+                  "regulator, the input/output caps, and route the power net. Want me to continue?"
+                : "That op didn't apply cleanly - see the error above. I can try a different face or "
+                  "hole pattern if you'd like.";
             append(m);
-            AgentBlock us; us.kind = BlockKind::Usage; us.body = "Claude  |  4.2s  |  1,840 tokens";
+            AgentBlock us; us.kind = BlockKind::Usage; us.body = "Local demo  |  scripted  |  drives the real kernel";
             append(us);
             agent.running = false; agent.demoStep = -1;
         } break;

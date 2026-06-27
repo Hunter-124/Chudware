@@ -181,6 +181,16 @@ set_target_properties(test_tet10 PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME tet10 COMMAND test_tet10)
 
+# SPICE deck parser + schematic->circuit mapper (parse_netlist / netlist_to_spice_circuit,
+# incl. the starter SYMBOL libid fallback via symbol_sim_table). OCCT-free, links aicad_sim.
+add_executable(test_spice_netlist
+  tests/test_spice_netlist.cpp)
+target_include_directories(test_spice_netlist PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_spice_netlist PRIVATE aicad_sim)
+set_target_properties(test_spice_netlist PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME spice_netlist COMMAND test_spice_netlist)
+
 # --- libaicad sketch (parameterization + constraints over the solver core) ---
 add_library(aicad_sketch STATIC
   sketch/sketch.cpp)
@@ -282,7 +292,10 @@ add_library(aicad_agent STATIC
   agent/clarify.cpp
   agent/pm_assist.cpp)
 target_include_directories(aicad_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(aicad_agent PUBLIC nlohmann_json::nlohmann_json winhttp bcrypt)
+target_link_libraries(aicad_agent PUBLIC nlohmann_json::nlohmann_json)
+if(WIN32)
+  target_link_libraries(aicad_agent PUBLIC winhttp bcrypt)
+endif()
 set_property(TARGET aicad_agent PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
@@ -293,6 +306,15 @@ target_link_libraries(test_agent PRIVATE aicad_agent)
 set_target_properties(test_agent PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME agent COMMAND test_agent)
+
+# err_sig identical-failure detector (agent/machine.cpp). OCCT-free, links aicad_agent.
+add_executable(test_machine
+  tests/test_machine.cpp)
+target_include_directories(test_machine PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_machine PRIVATE aicad_agent)
+set_target_properties(test_machine PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME machine COMMAND test_machine)
 
 add_executable(test_aicm
   tests/test_aicm_writer.cpp)
@@ -935,4 +957,14 @@ if(TARGET test_nsolve)
   set_target_properties(test_mate PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME mate COMMAND test_mate)
+
+  # Smoke-load every core/mate/corpus/*.json fixture through solve_mates_json (schema +
+  # spot checks: peg-in-hole DOF, chain convergence, over-defined/redundant/suppressed).
+  add_executable(test_mate_corpus
+    tests/test_mate_corpus.cpp)
+  target_include_directories(test_mate_corpus PRIVATE ${doctest_SOURCE_DIR})
+  target_link_libraries(test_mate_corpus PRIVATE aicad_mate)
+  set_target_properties(test_mate_corpus PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME mate_corpus COMMAND test_mate_corpus)
 endif()

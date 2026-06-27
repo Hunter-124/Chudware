@@ -333,6 +333,24 @@ TEST_CASE("tangent circle-circle external: d = r0 + r1") {
     CHECK(double(sol.entities["e2"]["radius"]) == doctest::Approx(7.0));
 }
 
+TEST_CASE("tangent circle-circle converges when centers start coincident") {
+    // Internal branch with d=0 at init: Jacobian must use the (+x) fallback so Newton
+    // can push the free center out to |r0-r1| instead of corrupting radii.
+    json s;
+    s["entities"] = json::array({circle("e1", 0, 0, 10), circle("e2", 0, 0, 4)});
+    s["constraints"] = json::array({
+        rel("c1", "fix", {"e1"}),
+        dim("c2", "radius", {"e2"}, 4.0),
+        rel("c3", "tangent", {"e1", "e2"}),
+    });
+    auto sol = solve_sketch(s, json::object());
+    REQUIRE(sol.converged);
+    double d = std::hypot(double(sol.entities["e1"]["center"][0]) - double(sol.entities["e2"]["center"][0]),
+                          double(sol.entities["e1"]["center"][1]) - double(sol.entities["e2"]["center"][1]));
+    CHECK(d == doctest::Approx(6.0).epsilon(1e-4));
+    CHECK(double(sol.entities["e2"]["radius"]) == doctest::Approx(4.0));
+}
+
 TEST_CASE("tangent circle-circle internal keeps a nested pair nested") {
     json s;
     s["entities"] = json::array({circle("e1", 0, 0, 10), circle("e2", 3, 0, 4)});

@@ -284,8 +284,18 @@ public:
     bool resync(WorkerClient& w);
 
     // Reset local state (e.g. on worker restart).
-    void reset() { docId_.clear(); revision_ = -1; tree_ = {}; featureStatus_ = {};
-                   refDatums_ = nlohmann::json::array(); }
+    void reset() {
+        docId_.clear();
+        revision_ = -1;
+        tree_ = {};
+        featureStatus_ = {};
+        refDatums_ = nlohmann::json::array();
+        lastOpenedDrawings_ = nlohmann::json::array();
+        ownerMap_.clear();
+        faceOwner_.clear();
+        edgeOwner_.clear();
+        bodyOwners_.clear();
+    }
 
     // Owned topology for each feature (raw, as last parsed). Exposed for completeness / debugging.
     const std::unordered_map<std::string, Owned>& ownerMap() const { return ownerMap_; }

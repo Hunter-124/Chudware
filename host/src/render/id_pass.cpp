@@ -83,7 +83,13 @@ unsigned int linkProgram(const char* vs, const char* fs) {
 
 }  // namespace
 
-IdPass::~IdPass() { destroy(); }
+IdPass::~IdPass() {
+    destroy();
+    if (fbo_) glDeleteFramebuffers(1, &fbo_);
+    if (idTex_) glDeleteTextures(1, &idTex_);
+    if (depthRbo_) glDeleteRenderbuffers(1, &depthRbo_);
+    if (prog_) glDeleteProgram(prog_);
+}
 
 void IdPass::setSectionClip(int count, const float normals[3][3], const float offsets[3]) {
     clipCount_ = count < 0 ? 0 : (count > 3 ? 3 : count);

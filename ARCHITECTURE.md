@@ -61,9 +61,9 @@ The brain of the modeling. Pure Python, runs inside the managed runtime.
   spawns and talks to.
 - `samples/` — feature-rich reference models used as smoke tests.
 
-### 2. MCP server (`mcp/`)
-HTTP/SSE MCP server hosted by the running app so an external agent drives the **live**
-model (changes appear in the viewport). Tools:
+### 2. MCP server (`mcp_server/`)
+stdio MCP server (run as `python -m mcp_server.server`) so an external agent drives the
+same engine as the desktop app. Tools:
 `run_model(code)`, `get_screenshot(views)`, `get_model_info()`, `export(format)`,
 `reset()` for single parts; `run_assembly(code)`, `get_fit_report()`,
 `get_assembly_screenshot()`, `export_part(name, fmt)` for multi-part assemblies. Registered

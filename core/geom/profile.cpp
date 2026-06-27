@@ -29,6 +29,8 @@ namespace aicad::geom {
 
 namespace {
 
+constexpr double kPi = 3.14159265358979323846;
+
 // Endpoint-coincidence tolerance — matches sketch.py::_EPS (1e-6). We chain in 2D
 // sketch space (the pre-lift coordinates) because that is where the solver works
 // and where containment is computed; the lift is an isometry so distances agree.
@@ -117,7 +119,7 @@ bool build_edge(const nlohmann::json& ent, const SketchPlane& plane,
             double ea = ent["end"];    // degrees
             if (std::abs(ea - sa) < 1e-9) return false;  // degenerate (no span)
             const bool ccw = ent.value("ccw", true);
-            const double DEG = M_PI / 180.0;
+            const double DEG = kPi / 180.0;
             double a1 = (ccw ? sa : ea) * DEG;
             double a2 = (ccw ? ea : sa) * DEG;
             gp_Ax2 ax(lift_pnt(plane, c), to_dir(plane.normal), to_dir(plane.uAxis));

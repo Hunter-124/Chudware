@@ -95,15 +95,17 @@ def render_views(stl_path: str, out_dir: Path, prefix: str = "view",
     paths: dict[str, str] = {}
     for name in views:
         p = pv.Plotter(off_screen=True, window_size=list(size))
-        _add_part(p, mesh, edges)
-        p.add_axes(line_width=3)
-        _apply_view(p, name)
-        p.reset_camera()
-        p.camera.zoom(1.15)
-        png = out_dir / f"{prefix}_{name}.png"
-        p.screenshot(str(png))
-        p.close()
-        paths[name] = str(png)
+        try:
+            _add_part(p, mesh, edges)
+            p.add_axes(line_width=3)
+            _apply_view(p, name)
+            p.reset_camera()
+            p.camera.zoom(1.15)
+            png = out_dir / f"{prefix}_{name}.png"
+            p.screenshot(str(png))
+            paths[name] = str(png)
+        finally:
+            p.close()
     return paths
 
 
@@ -119,15 +121,17 @@ def render_grid(stl_path: str, out_path: Path,
     mesh, edges = _prep(stl_path, pv)
 
     p = pv.Plotter(off_screen=True, shape=_GRID_SHAPE, window_size=list(size), border=True)
-    for idx, name in enumerate(_VIEWS):
-        p.subplot(idx // _GRID_SHAPE[1], idx % _GRID_SHAPE[1])
-        _add_part(p, mesh, edges)
-        p.add_text(name, font_size=10, color="#26323d")
-        _apply_view(p, name)
-        p.reset_camera()
-        p.camera.zoom(1.1)
-    p.screenshot(str(out_path))
-    p.close()
+    try:
+        for idx, name in enumerate(_VIEWS):
+            p.subplot(idx // _GRID_SHAPE[1], idx % _GRID_SHAPE[1])
+            _add_part(p, mesh, edges)
+            p.add_text(name, font_size=10, color="#26323d")
+            _apply_view(p, name)
+            p.reset_camera()
+            p.camera.zoom(1.1)
+        p.screenshot(str(out_path))
+    finally:
+        p.close()
     return str(out_path)
 
 
@@ -168,25 +172,27 @@ def render_assembly_grid(parts: list, out_path: Path,
         loaded.append((name, mesh, edges, _PART_COLORS[i % len(_PART_COLORS)]))
 
     p = pv.Plotter(off_screen=True, shape=_GRID_SHAPE, window_size=list(size), border=True)
-    for idx, view in enumerate(_VIEWS):
-        p.subplot(idx // _GRID_SHAPE[1], idx % _GRID_SHAPE[1])
-        p.set_background("white")
-        for _name, mesh, edges, color in loaded:
-            p.add_mesh(mesh, color=color, smooth_shading=True, specular=0.25,
-                       specular_power=15, show_edges=False)
-            if edges is not None and edges.n_points:
-                p.add_mesh(edges, color="#1c2a36", line_width=1)
-        p.add_text(view, font_size=10, color="#26323d")
-        _apply_view(p, view)
-        p.reset_camera()
-        p.camera.zoom(1.1)
-    # Legend (color -> part name) in the iso quadrant; non-fatal if the VTK build balks.
     try:
-        p.subplot(0, 0)
-        p.add_legend(labels=[[n, c] for n, _m, _e, c in loaded],
-                     bcolor="white", border=True, size=(0.32, 0.32))
-    except Exception:  # noqa: BLE001
-        pass
-    p.screenshot(str(out_path))
-    p.close()
+        for idx, view in enumerate(_VIEWS):
+            p.subplot(idx // _GRID_SHAPE[1], idx % _GRID_SHAPE[1])
+            p.set_background("white")
+            for _name, mesh, edges, color in loaded:
+                p.add_mesh(mesh, color=color, smooth_shading=True, specular=0.25,
+                           specular_power=15, show_edges=False)
+                if edges is not None and edges.n_points:
+                    p.add_mesh(edges, color="#1c2a36", line_width=1)
+            p.add_text(view, font_size=10, color="#26323d")
+            _apply_view(p, view)
+            p.reset_camera()
+            p.camera.zoom(1.1)
+        # Legend (color -> part name) in the iso quadrant; non-fatal if the VTK build balks.
+        try:
+            p.subplot(0, 0)
+            p.add_legend(labels=[[n, c] for n, _m, _e, c in loaded],
+                         bcolor="white", border=True, size=(0.32, 0.32))
+        except Exception:  # noqa: BLE001
+            pass
+        p.screenshot(str(out_path))
+    finally:
+        p.close()
     return str(out_path)

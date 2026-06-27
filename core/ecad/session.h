@@ -4,10 +4,9 @@
 //
 // The ops-response shape mirrors the Python session: {revision, id_map, kind,
 // tree, compile [, warnings]}; ecad_new adds "doc_id"; ecad_tree returns
-// {revision, kind, tree, compile}. The `compile` field (netlist/ERC for sch,
-// DRC/ratsnest for pcb) is DEFERRED to a later wave — this foundation returns
-// the same skeleton the Python session produces when those sub-modules are
-// absent (netlist:null, erc:[], drc:[], ratsnest:[], stats:{}).
+// {revision, kind, tree, compile}. The `compile` field is live: schematics get
+// netlist + ERC; boards get zone-fill refresh (interactive resolution), DRC,
+// and ratsnest (session.cpp::compile_field).
 #pragma once
 
 #include <string>
@@ -118,10 +117,10 @@ nlohmann::json ecad_fill_zones(const std::string& doc_id, const nlohmann::json& 
 // {ok, converged, results, warnings, log, convergence, ms}. Builds the schematic
 // netlist, maps it to a SPICE circuit (netlist_to_spice_circuit) and runs the
 // requested study (spice_simulate). Mirrors engine/ecad/rpc.py::_ecad_simulate.
-// PARITY SCOPE: a non-empty circuit requires each component to carry an inline
-// "sim" mapping (the starter SYMBOL library sim fallback is not ported to C++ —
-// see core/sim/netlist.h). A schematic whose components rely on the library
-// fallback yields {ok:false, "no simulatable devices ..."} here.
+// Components without an inline "sim" mapping resolve from the starter SYMBOL
+// sim table (core/sim/netlist.cpp::symbol_sim_table), same as the Python oracle.
+// Only libids absent from that table yield "no sim model — skipped" warnings and
+// may produce {ok:false, "no simulatable devices ..."} when nothing simulates.
 nlohmann::json ecad_simulate(const std::string& doc_id, const nlohmann::json& study,
                              const nlohmann::json& sim_params);
 

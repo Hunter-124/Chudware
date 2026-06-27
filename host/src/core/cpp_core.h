@@ -6,9 +6,9 @@
 // OCCT — the DLL and its OCCT runtime DLLs are loaded lazily on first use, so the
 // host stays buildable/launchable even when the core isn't present.
 //
-// Today this drives the DIAGNOSTIC parity path only (doc_compile_cpp): the
-// production engine is still the Python worker. As features reach parity the host
-// will route their methods here and fall back to Python for the rest.
+// Today this drives the production doc/agent/sim routing seam (see worker_client.cpp) and the
+// opt-in parity diagnostic (doc_compile_cpp when $AI_CAD_CPP_PARITY is set). As features reach
+// parity the host routes their methods here and falls back to Python only where needed.
 #pragma once
 
 #include <mutex>

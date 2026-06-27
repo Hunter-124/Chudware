@@ -1667,9 +1667,9 @@ void add_tangent_circle_circle(System& sys, const std::string& cid,
             double cx1 = xs(3), cy1 = xs(4), r1 = xs(5);
             double dx = cx0 - cx1, dy = cy0 - cy1;
             double d = std::hypot(dx, dy);
-            // BUG-1: at coincident centers d(|C0-C1|)/dC is 0/0. A zero position
-            // gradient strands Newton (it cannot separate the centers and
-            // corrupts the radii instead). Fall back to a DETERMINISTIC unit
+            // Numerical guard: at coincident centers d(|C0-C1|)/dC is 0/0. A zero
+            // position gradient strands Newton (it cannot separate the centers and
+            // corrupts the radii instead). Fall back to a deterministic unit
             // direction (+x) so the Jacobian is well-defined and the centers get
             // pushed apart to the tangent distance. Matches the Python fallback
             // (1,0) verbatim -> bit-identical under the differential harness.

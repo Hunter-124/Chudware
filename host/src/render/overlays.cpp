@@ -55,7 +55,14 @@ unsigned int linkProgram(const char* vs, const char* fs) {
 
 }  // namespace
 
-Overlays::~Overlays() { destroy(); }
+Overlays::~Overlays() {
+    destroy();
+    if (prog_) glDeleteProgram(prog_);
+    if (vao_) glDeleteVertexArrays(1, &vao_);
+    if (vbo_) glDeleteBuffers(1, &vbo_);
+    if (segVao_) glDeleteVertexArrays(1, &segVao_);
+    if (segVbo_) glDeleteBuffers(1, &segVbo_);
+}
 
 void Overlays::destroy() {
     for (auto& kv : faces_) {

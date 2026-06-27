@@ -48,7 +48,7 @@ int main(int argc, char** argv) {
     // headless screenshot mode: --shot <path> [--frames N]
     const char* shotPath = nullptr; int shotFrames = 12; bool demo = false;
     const char* doCmd = nullptr; bool openPalette = false; bool sketch = false;
-    bool selftest = false, picktest = false, shelltest = false, edgetest = false;
+    bool selftest = false, picktest = false, shelltest = false, edgetest = false; bool light = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--shot") && i+1 < argc) shotPath = argv[++i];
         else if (!std::strcmp(argv[i], "--frames") && i+1 < argc) shotFrames = atoi(argv[++i]);
@@ -60,6 +60,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--picktest")) picktest = true;
         else if (!std::strcmp(argv[i], "--shelltest")) shelltest = true;
         else if (!std::strcmp(argv[i], "--edgetest")) edgetest = true;
+        else if (!std::strcmp(argv[i], "--light")) light = true;
     }
 
     // If the core DLL location isn't set and isn't next to the exe, point at the dev build path.
@@ -112,7 +113,7 @@ int main(int argc, char** argv) {
     io.IniFilename = nullptr;   // we own the layout (DockBuilder)
 
     const std::string res = exeDir() + "/resources";
-    theme::init(res, scale, /*dark=*/true);
+    theme::init(res, scale, /*dark=*/!light);
 
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init("#version 150");

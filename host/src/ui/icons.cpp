@@ -61,7 +61,7 @@ void loadIcons(const std::string& assetsDir) {
     if (gAtlas.loaded) return;
 
     // --- load atlas.json ---
-    std::string jsonPath = assetsDir + "\\icons\\atlas.json";
+    std::string jsonPath = assetsDir + "/icons/atlas.json";
     FILE* f = std::fopen(jsonPath.c_str(), "rb");
     if (!f) {
         std::fprintf(stderr, "[icons] atlas.json not found at %s\n", jsonPath.c_str());
@@ -121,7 +121,7 @@ void loadIcons(const std::string& assetsDir) {
 
     // --- load dark atlas ---
     {
-        std::string path = assetsDir + "\\icons\\atlas_dark.png";
+        std::string path = assetsDir + "/icons/atlas_dark.png";
         int w, h, ch;
         stbi_set_flip_vertically_on_load(0);
         unsigned char* px = stbi_load(path.c_str(), &w, &h, &ch, 4);
@@ -135,7 +135,7 @@ void loadIcons(const std::string& assetsDir) {
 
     // --- load light atlas ---
     {
-        std::string path = assetsDir + "\\icons\\atlas_light.png";
+        std::string path = assetsDir + "/icons/atlas_light.png";
         int w, h, ch;
         unsigned char* px = stbi_load(path.c_str(), &w, &h, &ch, 4);
         if (px) {

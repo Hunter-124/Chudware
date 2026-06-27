@@ -1,5 +1,7 @@
 #include "win_chrome.h"
 
+#ifdef _WIN32
+
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #define GLFW_EXPOSE_NATIVE_WIN32
@@ -100,3 +102,14 @@ void install(GLFWwindow* win, HitLayout* layout) {
 }
 
 }  // namespace chrome
+
+#else  // ---------------------------------------------------------------------
+       // Non-Windows: keep the standard OS-drawn title bar / frame for now (no
+       // borderless custom chrome). The GUI still draws its own title-bar widgets;
+       // making the window borderless + draggable on X11/Wayland is a later polish.
+struct GLFWwindow;
+namespace chrome {
+void install(GLFWwindow*, HitLayout*) {}
+}  // namespace chrome
+
+#endif  // _WIN32

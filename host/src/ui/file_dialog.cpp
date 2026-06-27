@@ -1,4 +1,8 @@
-// Native Win32 file dialogs — implementation. See file_dialog.h for the contract.
+// Native file dialogs — implementation. See file_dialog.h for the contract.
+// Windows: the common dialogs (GetSaveFileNameW / GetOpenFileNameW).
+// Other (Linux/macOS): shell out to kdialog (KDE) or zenity (GTK), parsing the same
+// NUL-separated Win32 filter into the chosen tool's syntax.
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -135,3 +139,192 @@ int promptImportMeshAsSolid() {
 }
 
 }  // namespace ui
+
+#else  // ---------------------------------------------------------------------
+       // POSIX (Linux/macOS): kdialog / zenity backend.
+
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+#include "file_dialog.h"
+
+namespace ui {
+namespace {
+
+std::string s_lastDir;  // remembered across dialogs so re-saves prefill
+
+bool haveCmd(const char* c) {
+    return std::system((std::string("command -v ") + c + " >/dev/null 2>&1").c_str()) == 0;
+}
+
+// Capture a command's stdout (trimmed of trailing newlines).
+std::string runCapture(const std::string& cmd) {
+    std::string out;
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return "";
+    char buf[512];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), p)) > 0) out.append(buf, n);
+    pclose(p);
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    return out;
+}
+
+// Single-quote an argument for the shell (escaping embedded single quotes).
+std::string shq(const std::string& s) {
+    std::string o = "'";
+    for (char c : s) {
+        if (c == '\'')
+            o += "'\\''";
+        else
+            o += c;
+    }
+    o += "'";
+    return o;
+}
+
+std::string homeDir() {
+    const char* h = std::getenv("HOME");
+    return h ? std::string(h) : std::string(".");
+}
+
+std::string startDir() { return s_lastDir.empty() ? homeDir() : s_lastDir; }
+
+void rememberDir(const std::string& full) {
+    size_t cut = full.find_last_of('/');
+    if (cut != std::string::npos) s_lastDir = full.substr(0, cut);
+}
+
+std::string ensureExt(std::string path, const char* defExt) {
+    if (!defExt || !*defExt || path.empty()) return path;
+    size_t slash = path.find_last_of('/');
+    size_t dot = path.find_last_of('.');
+    bool hasExt = dot != std::string::npos && (slash == std::string::npos || dot > slash);
+    if (!hasExt) {
+        path += '.';
+        path += defExt;
+    }
+    return path;
+}
+
+// Parse the NUL-separated Win32 filter (desc\0pattern\0...\0\0) into pairs. Win32 separates
+// multiple patterns with ';'; we keep them split for per-tool formatting.
+struct FilterEntry {
+    std::string desc;
+    std::string patterns;  // e.g. "*.step+;*.step"
+};
+std::vector<FilterEntry> parseFilter(const char* filter) {
+    std::vector<FilterEntry> out;
+    const char* p = filter;
+    while (p && *p) {
+        std::string desc(p);
+        p += desc.size() + 1;
+        if (!*p) break;
+        std::string pat(p);
+        p += pat.size() + 1;
+        out.push_back({desc, pat});
+    }
+    return out;
+}
+
+// kdialog filter syntax: "pat1 pat2|desc\npat3|desc2".
+std::string kdialogFilter(const std::vector<FilterEntry>& f) {
+    std::string out;
+    for (const auto& e : f) {
+        std::string pats = e.patterns;
+        for (char& c : pats)
+            if (c == ';') c = ' ';
+        if (!out.empty()) out += "\n";
+        out += pats + "|" + e.desc;
+    }
+    return out;
+}
+
+// zenity: one --file-filter per entry, value "desc | pat1 pat2".
+std::string zenityFilters(const std::vector<FilterEntry>& f) {
+    std::string out;
+    for (const auto& e : f) {
+        std::string pats = e.patterns;
+        for (char& c : pats)
+            if (c == ';') c = ' ';
+        out += " --file-filter=" + shq(e.desc + " | " + pats);
+    }
+    return out;
+}
+
+}  // namespace
+
+std::string saveFileDialog(const char* filter, const char* defExt, const char* suggestedName) {
+    auto entries = parseFilter(filter ? filter : "All files (*.*)\0*.*\0");
+    std::string suggested = (suggestedName && *suggestedName) ? suggestedName : "";
+    std::string res;
+    if (haveCmd("kdialog")) {
+        std::string startPath = startDir() + "/" + suggested;
+        std::string cmd = "kdialog --getsavefilename " + shq(startPath);
+        std::string f = kdialogFilter(entries);
+        if (!f.empty()) cmd += " " + shq(f);
+        res = runCapture(cmd + " 2>/dev/null");
+    } else if (haveCmd("zenity")) {
+        std::string startPath = startDir() + "/" + suggested;
+        std::string cmd = "zenity --file-selection --save --confirm-overwrite --filename=" +
+                          shq(startPath) + zenityFilters(entries);
+        res = runCapture(cmd + " 2>/dev/null");
+    } else {
+        return {};
+    }
+    if (res.empty()) return {};
+    rememberDir(res);
+    return ensureExt(res, defExt);
+}
+
+std::string openFileDialog(const char* filter) {
+    auto entries = parseFilter(filter ? filter : "All files (*.*)\0*.*\0");
+    std::string res;
+    if (haveCmd("kdialog")) {
+        std::string cmd = "kdialog --getopenfilename " + shq(startDir());
+        std::string f = kdialogFilter(entries);
+        if (!f.empty()) cmd += " " + shq(f);
+        res = runCapture(cmd + " 2>/dev/null");
+    } else if (haveCmd("zenity")) {
+        std::string cmd = "zenity --file-selection --filename=" + shq(startDir() + "/") +
+                          zenityFilters(entries);
+        res = runCapture(cmd + " 2>/dev/null");
+    } else {
+        return {};
+    }
+    if (res.empty()) return {};
+    rememberDir(res);
+    return res;
+}
+
+int promptImportMeshAsSolid() {
+    const char* msg =
+        "Import this mesh as a solid body?\n\n"
+        "Yes  —  convert it into a solid (editable B-rep: cut, fillet, combine)\n"
+        "No   —  keep it as a graphics mesh (you can convert it later: "
+        "right-click the import in the tree)";
+    if (haveCmd("kdialog")) {
+        // kdialog --warningyesnocancel: exit 0=yes, 1=no, 2=cancel.
+        int rc = std::system(("kdialog --title 'Import Mesh' --warningyesnocancel " +
+                              shq(msg) + " >/dev/null 2>&1")
+                                 .c_str());
+        int code = (rc == -1) ? -1 : (rc >> 8);  // WEXITSTATUS
+        if (code == 0) return 1;
+        if (code == 1) return 0;
+        return -1;
+    }
+    if (haveCmd("zenity")) {
+        // zenity --question has no cancel; exit 0=yes, else no.
+        int rc = std::system(("zenity --question --title='Import Mesh' --text=" + shq(msg) +
+                              " >/dev/null 2>&1")
+                                 .c_str());
+        return (rc != -1 && (rc >> 8) == 0) ? 1 : 0;
+    }
+    return 1;  // no dialog tool: default to solid (the more useful import)
+}
+
+}  // namespace ui
+
+#endif  // _WIN32

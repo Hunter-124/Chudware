@@ -1,6 +1,21 @@
 #include "worker_client.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <thread>
+#include <vector>
+#endif
 
 #include <cstdlib>
 #include <string>
@@ -244,6 +259,7 @@ bool routeEcadToCpp(const std::string& method, const json& params) {
     }
     return true;
 }
+#ifdef _WIN32
 std::wstring widen(const std::string& s) {
     if (s.empty()) return L"";
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
@@ -265,6 +281,12 @@ std::string win32Error(DWORD code) {
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == '.')) s.pop_back();
     return s;
 }
+#else
+bool fileExists(const std::string& p) {
+    std::error_code ec;
+    return std::filesystem::is_regular_file(p, ec);
+}
+#endif
 }  // namespace
 
 WorkerClient::~WorkerClient() { stop(); }
@@ -284,6 +306,7 @@ bool WorkerClient::start(std::string& err, const std::string& module) {
         return false;
     }
 
+#ifdef _WIN32
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
@@ -328,9 +351,44 @@ bool WorkerClient::start(std::string& err, const std::string& module) {
     childStdinWr_ = inWr;
     running_ = true;
     return true;
+#else
+    // POSIX: outPipe = child stdout -> parent; inPipe = parent -> child stdin.
+    int outPipe[2], inPipe[2];
+    if (pipe(outPipe) != 0 || pipe(inPipe) != 0) {
+        err = std::string("pipe() failed: ") + std::strerror(errno);
+        return false;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        err = std::string("fork failed: ") + std::strerror(errno);
+        ::close(outPipe[0]); ::close(outPipe[1]);
+        ::close(inPipe[0]); ::close(inPipe[1]);
+        return false;
+    }
+    if (pid == 0) {
+        // child: stdin <- inPipe[0], stdout -> outPipe[1]; stderr stays (host console).
+        dup2(inPipe[0], STDIN_FILENO);
+        dup2(outPipe[1], STDOUT_FILENO);
+        ::close(inPipe[0]); ::close(inPipe[1]);
+        ::close(outPipe[0]); ::close(outPipe[1]);
+        if (!repo.empty() && chdir(repo.c_str()) != 0) { /* fall through; exec from cwd */ }
+        execlp(python.c_str(), python.c_str(), "-m", module.c_str(), (char*)nullptr);
+        _exit(127);  // exec failed
+    }
+    // parent: keep our ends, close the child's.
+    ::close(inPipe[0]);
+    ::close(outPipe[1]);
+    fcntl(outPipe[0], F_SETFL, O_NONBLOCK);  // non-blocking reads so readLine can poll
+    process_ = pid;
+    childStdoutRd_ = outPipe[0];
+    childStdinWr_ = inPipe[1];
+    running_ = true;
+    return true;
+#endif
 }
 
 void WorkerClient::stop() {
+#ifdef _WIN32
     if (childStdinWr_) {
         DWORD wrote = 0;
         const char* bye = "{\"id\":0,\"method\":\"shutdown\"}\n";
@@ -348,10 +406,39 @@ void WorkerClient::stop() {
         CloseHandle(childStdoutRd_);
         childStdoutRd_ = nullptr;
     }
+#else
+    if (childStdinWr_ >= 0) {
+        const char* bye = "{\"id\":0,\"method\":\"shutdown\"}\n";
+        ssize_t w = ::write(childStdinWr_, bye, std::strlen(bye));
+        (void)w;
+        ::close(childStdinWr_);
+        childStdinWr_ = -1;
+    }
+    if (process_ >= 0) {
+        // give the worker ~2s to exit on its own, then SIGTERM and reap.
+        bool reaped = false;
+        for (int i = 0; i < 200; ++i) {
+            int status = 0;
+            pid_t r = waitpid(process_, &status, WNOHANG);
+            if (r == process_ || (r < 0 && errno == ECHILD)) { reaped = true; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!reaped) {
+            ::kill(process_, SIGTERM);
+            waitpid(process_, nullptr, 0);
+        }
+        process_ = -1;
+    }
+    if (childStdoutRd_ >= 0) {
+        ::close(childStdoutRd_);
+        childStdoutRd_ = -1;
+    }
+#endif
     running_ = false;
 }
 
 bool WorkerClient::readLine(std::string& line, int timeoutMs) {
+#ifdef _WIN32
     ULONGLONG start = GetTickCount64();
     for (;;) {
         if (abort_.load()) return false;  // C39: teardown — stop polling immediately
@@ -389,6 +476,56 @@ bool WorkerClient::readLine(std::string& line, int timeoutMs) {
             return false;
         readBuf_.append(chunk.data(), got);
     }
+#else
+    auto start = std::chrono::steady_clock::now();
+    for (;;) {
+        if (abort_.load()) return false;  // C39: teardown — stop polling immediately
+        size_t nl = readBuf_.find('\n');
+        if (nl != std::string::npos) {
+            line = readBuf_.substr(0, nl);
+            readBuf_.erase(0, nl + 1);
+            return true;
+        }
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+        if ((int)elapsed > timeoutMs) return false;
+
+        struct pollfd pfd;
+        pfd.fd = childStdoutRd_;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = ::poll(&pfd, 1, 2);  // 2ms tick (matches the Windows fast-poll cadence)
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (pr == 0) {  // no data this tick — detect a child exit, else keep polling
+            int status = 0;
+            pid_t r = (process_ >= 0) ? waitpid(process_, &status, WNOHANG) : -1;
+            if (r == process_ || (r < 0 && errno == ECHILD)) {
+                process_ = -1;  // reaped here so stop() won't re-wait
+                char chunk[4096];
+                ssize_t got = ::read(childStdoutRd_, chunk, sizeof(chunk));  // final drain
+                if (got > 0) {
+                    readBuf_.append(chunk, (size_t)got);
+                    continue;
+                }
+                return false;
+            }
+            continue;
+        }
+        char chunk[4096];
+        ssize_t got = ::read(childStdoutRd_, chunk, sizeof(chunk));
+        if (got > 0) {
+            readBuf_.append(chunk, (size_t)got);
+        } else if (got == 0) {
+            return false;  // EOF: pipe closed
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            return false;
+        }
+    }
+#endif
 }
 
 bool WorkerClient::call(const std::string& method, const json& params, json& result,
@@ -601,8 +738,12 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
     int id = nextId_++;
     json req = {{"id", id}, {"method", method}, {"params", params}};
     std::string line = req.dump() + "\n";
+#ifdef _WIN32
     DWORD wrote = 0;
     if (!WriteFile(childStdinWr_, line.data(), (DWORD)line.size(), &wrote, nullptr)) {
+#else
+    if (::write(childStdinWr_, line.data(), line.size()) != (ssize_t)line.size()) {
+#endif
         err = "write failed";
         if (errorSink_) errorSink_(method, err);  // W1-B
         return false;

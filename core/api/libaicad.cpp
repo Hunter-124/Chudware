@@ -74,12 +74,18 @@
 #include "ecad/session.h"
 #include "geom/aicm.h"
 #include "geom/ecad_3d.h"
+#ifdef AICAD_WITH_NETGEN
 #include "sim/fea_fatigue.h"
+#endif
 #include "sim/fea_modal.h"
+#ifdef AICAD_WITH_NETGEN
 #include "sim/fea_run.h"
+#endif
 #include "sim/fea_static.h"
 #include "sim/lbm.h"
+#ifdef AICAD_WITH_NETGEN
 #include "sim/mesher.h"
+#endif
 #include "sim/netlist.h"
 #include "sim/numpy_rng.h"
 #include "sim/overlay.h"
@@ -104,7 +110,7 @@ template<typename JsonT>
 std::string jstr(const JsonT& j, const char* key, const std::string& d = std::string()) {
     auto it = j.find(key);
     if (it == j.end() || !it->is_string()) return d;
-    return it->get<std::string>();
+    return it->template get<std::string>();
 }
 
 // Emit `j` into *out_json (heap) and return `rc`. On allocation failure returns 1
@@ -1650,6 +1656,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                              {"diverged", r.diverged}},
                         out_json, 0);
         }
+#ifdef AICAD_WITH_NETGEN  // Netgen/nglib FEA-mesh RPCs (mesh + meshing FEA runs)
         if (m == "sim_mesh") {
             // Curvature-adaptive tet mesher (wraps Netgen / nglib). Params:
             //   {"step_path", "fineness"(0..1)|"density"(legacy), "order"|"mesh_order",
@@ -1845,6 +1852,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             std::vector<uint8_t> bytes = aicm::disp_chunk(body_id, scale_hint, vec);
             return emit(json{{"hex", to_hex(bytes)}}, out_json, 0);
         }
+#endif  // AICAD_WITH_NETGEN
         if (m == "sim_map_to_surface") {
             // DIAGNOSTIC (map value-parity): nearest-volume-node mapping. Accepts
             // {surf:[[x,y,z]...], vol:[[x,y,z]...], values:[...]| [[...]...], dim?}.

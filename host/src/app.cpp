@@ -143,10 +143,10 @@ void toggleProfiler(AppState& st) {
 
     // Stop + write the report.
     st.profilerRunning = false;
-    const std::string dir = appdataDir() + "\\AI-CAD\\prof";
+    const std::string dir = appdataDir() + "/AI-CAD/prof";
     try { std::filesystem::create_directories(dir); } catch (...) {}
-    const std::string folded = dir + "\\modeling.folded";
-    const std::string scope  = dir + "\\modeling.speedscope.json";
+    const std::string folded = dir + "/modeling.folded";
+    const std::string scope  = dir + "/modeling.speedscope.json";
     if (!core::cpp_core().call("prof_stop",
                                {{"top", 25}, {"write_folded", folded},
                                 {"write_speedscope", scope}}, res, err)) {
@@ -264,7 +264,7 @@ void ecadRedo(AppState& st) {
 void ecadExport(AppState& st, const char* kind) {
     if (st.ecadDocId.empty()) { st.toast(ui::ToastLevel::Warn, "Open an ECAD document first"); return; }
     std::error_code ec;
-    const std::string dir = appdataDir() + "\\AI-CAD\\ecad_out";
+    const std::string dir = appdataDir() + "/AI-CAD/ecad_out";
     std::filesystem::create_directories(dir, ec);
     nlohmann::json res;
     if (!ecadCall(st, "ecad_export", {{"doc_id", st.ecadDocId}, {"kind", kind}, {"path", dir}}, res))
@@ -330,9 +330,9 @@ void ecadOpenDoc(AppState& st) {
 void ecadTo3d(AppState& st) {
     if (st.ecadDocId.empty()) { st.toast(ui::ToastLevel::Warn, "Open an ECAD board first"); return; }
     std::error_code ec;
-    const std::string dir = appdataDir() + "\\AI-CAD\\ecad_out";
+    const std::string dir = appdataDir() + "/AI-CAD/ecad_out";
     std::filesystem::create_directories(dir, ec);
-    const std::string step = dir + "\\board.step";
+    const std::string step = dir + "/board.step";
     nlohmann::json res;
     if (!ecadCall(st, "ecad_to_3d", {{"doc_id", st.ecadDocId}, {"path", step}}, res)) return;
     std::string stepPath = jstr(res, "step_path");
@@ -781,8 +781,8 @@ int run_gui(const char* screenshotPath) {
     glfwSwapInterval(1);
     if (!gladLoadGL((GLADloadfunc)glfwGetProcAddress)) return 1;
 
-    const std::string assets = exeDir() + "\\assets";
-    setWindowIcon(win, assets + "\\logo_window.png");
+    const std::string assets = exeDir() + "/assets";  // '/' is valid on Windows + POSIX
+    setWindowIcon(win, assets + "/logo_window.png");
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -791,7 +791,7 @@ int run_gui(const char* screenshotPath) {
     // GUI rework layout schema. The old imgui.ini can contain dock IDs/window placements from
     // pre-rework names, which restores the FeatureManager into the center and leaves Viewport as a
     // floating orphan. Use a versioned ini so stale dock layouts cannot override buildDefaultLayout.
-    static std::string iniPath = appdataDir() + "\\AI-CAD\\imgui_gui_v2.ini";
+    static std::string iniPath = appdataDir() + "/AI-CAD/imgui_gui_v2.ini";
     io.IniFilename = shot ? nullptr : iniPath.c_str();
 
     float xs = 1.0f, ys = 1.0f;
@@ -822,9 +822,9 @@ int run_gui(const char* screenshotPath) {
     hitLayout.resizeBorder = (int)(6 * scale);
     chrome::install(win, &hitLayout);
 
-    Tex wordmark = loadTexture(assets + "\\logo_wordmark.png");
-    Tex wordmarkDark = loadTexture(assets + "\\logo_wordmark_dark.png");
-    Tex logoIcon = loadTexture(assets + "\\logo_icon.png");
+    Tex wordmark = loadTexture(assets + "/logo_wordmark.png");
+    Tex wordmarkDark = loadTexture(assets + "/logo_wordmark_dark.png");
+    Tex logoIcon = loadTexture(assets + "/logo_icon.png");
 
     std::string rerr;
     Renderer renderer;
@@ -1323,6 +1323,12 @@ int run_gui(const char* screenshotPath) {
     // ---------- runtime + worker ----------
     st.rtReady = runtimeReady();
 
+#ifndef _WIN32
+    // On Linux/macOS the backend is the in-process C++ core (libaicad), not a managed Python
+    // venv — route through tryStartWorker, whose libaicad guard reports readiness and only
+    // falls back to Python provisioning if libaicad is genuinely unavailable.
+    st.tryStartWorker();
+#else
     if (st.rtReady) {
         st.tryStartWorker();
     } else {
@@ -1332,6 +1338,7 @@ int run_gui(const char* screenshotPath) {
         st.autoSetupTried = true;
         st.startSetup(false);  // self-provision from the payload next to the exe / source tree
     }
+#endif
 
     // NOTE: the old "welcome model" (mounting_plate.stl into the bare renderer) is gone — it
     // contradicted the empty Part1 document (a mesh with no tree features), occluded the
@@ -1507,7 +1514,7 @@ int run_gui(const char* screenshotPath) {
         // Demo a 3-part fit-test: base plate, lid above it, peg through both (clash on the
         // peg). Populates the viewport parts panel + a chat card so --ui-screenshot shows the
         // assembly UI. A real color-coded render is shown if its cache PNG exists.
-        const std::string asmDir = appdataDir() + "\\AI-CAD\\cache\\screenshot_asm\\";
+        const std::string asmDir = appdataDir() + "/AI-CAD/cache/screenshot_asm/";
         st.asmStl = asmDir + "screenshot_asm_assembly.stl";
         std::string sheet = asmDir + "screenshot_asm_grid.png";
         // Per-part STLs (generated once for the demo) so the viewport shows the bodies
@@ -2241,9 +2248,9 @@ int run_gui(const char* screenshotPath) {
                     const int nBefore = before.contains("tree") && before["tree"].contains("symbols")
                                         ? (int)before["tree"]["symbols"].size() : -1;
                     std::error_code ec;
-                    const std::string dir = appdataDir() + "\\AI-CAD\\ecad_out";
+                    const std::string dir = appdataDir() + "/AI-CAD/ecad_out";
                     std::filesystem::create_directories(dir, ec);
-                    const std::string path = dir + "\\roundtrip.ecad+";
+                    const std::string path = dir + "/roundtrip.ecad+";
                     nlohmann::json sres;
                     ecall("ecad_save", {{"doc_id", srcId}, {"path", path}}, sres);
                     nlohmann::json ores;

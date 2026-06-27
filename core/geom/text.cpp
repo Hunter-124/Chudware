@@ -276,12 +276,48 @@ std::string resolve_font_path(const std::string& req) {
         if (fs::exists(r, ec)) return r.string();
     }
 
-    // 4. Last resort: a Windows system font so a mark is still possible off-tree.
+    // 4. Last resort: a system font so a mark is still possible off-tree.
 #ifdef _WIN32
     if (const char* w = std::getenv("WINDIR")) {
         for (const char* f : {"arial.ttf", "segoeui.ttf", "tahoma.ttf"}) {
             fs::path c = fs::path(w) / "Fonts" / f;
             if (fs::exists(c, ec)) return c.string();
+        }
+    }
+#else
+    // Unix (Linux/macOS): probe well-known font files first, then fall back to the
+    // first .ttf/.otf found under the standard font roots — distros place fonts at
+    // different paths (DejaVu / Liberation / Noto / Adwaita layouts all differ), so a
+    // recursive scan is the only reliable catch-all.
+    {
+        const char* known[] = {
+            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+            "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/liberation-fonts/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",                 // Debian/Ubuntu
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/Library/Fonts/Arial.ttf",                                        // macOS
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        };
+        for (const char* f : known) {
+            if (fs::exists(f, ec)) return std::string(f);
+        }
+        std::vector<fs::path> roots = {"/usr/share/fonts", "/usr/local/share/fonts",
+                                       "/Library/Fonts", "/System/Library/Fonts"};
+        if (const char* home = std::getenv("HOME")) {
+            roots.push_back(fs::path(home) / ".fonts");
+            roots.push_back(fs::path(home) / ".local" / "share" / "fonts");
+        }
+        for (const fs::path& root : roots) {
+            if (!fs::exists(root, ec)) continue;
+            for (fs::recursive_directory_iterator it(root, ec), end; it != end; it.increment(ec)) {
+                if (ec) break;
+                if (!it->is_regular_file(ec)) continue;
+                std::string ext = it->path().extension().string();
+                for (char& c : ext) c = static_cast<char>(std::tolower((unsigned char)c));
+                if (ext == ".ttf" || ext == ".otf") return it->path().string();
+            }
         }
     }
 #endif

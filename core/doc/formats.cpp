@@ -28,6 +28,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <dlfcn.h>  // dladdr: locate lib3mf.so beside this module (libaicad.so)
 #endif
 #include "lib3mf_dynamic.hpp"
 #endif
@@ -274,8 +276,8 @@ struct NamedMesh {
 // pass the DLL beside THIS module (libaicad.dll) so the staged copy is found
 // regardless of the process CWD. Falls back to the bare name (PATH search).
 Lib3MF::PWrapper load_lib3mf() {
-    std::string dll_path = "lib3mf.dll";
 #ifdef _WIN32
+    std::string dll_path = "lib3mf.dll";
     HMODULE self = nullptr;
     if (::GetModuleHandleExA(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -290,12 +292,24 @@ Lib3MF::PWrapper load_lib3mf() {
             if (std::filesystem::exists(beside)) dll_path = beside.string();
         }
     }
+#else
+    // POSIX: prefer the lib3mf shared object staged beside this module (libaicad.so),
+    // located via dladdr; fall back to the loader search by bare soname.
+    std::string dll_path = "lib3mf.so";
+    Dl_info info;
+    if (dladdr(reinterpret_cast<void*>(&load_lib3mf), &info) && info.dli_fname) {
+        std::filesystem::path dir = std::filesystem::path(info.dli_fname).parent_path();
+        for (const char* name : {"lib3mf.so", "lib3mf.so.2", "lib3mf.2.dylib", "lib3mf.dylib"}) {
+            std::filesystem::path beside = dir / name;
+            if (std::filesystem::exists(beside)) { dll_path = beside.string(); break; }
+        }
+    }
 #endif
     try {
         return Lib3MF::CWrapper::loadLibrary(dll_path);
     } catch (const std::exception& e) {
         throw OpError("import_failed",
-                      std::string("3MF: could not load lib3mf.dll (") + e.what() + ")",
+                      std::string("3MF: could not load lib3mf (") + e.what() + ")",
                       {{"reason", "lib3mf load failed"}, {"dll", dll_path}});
     }
 }

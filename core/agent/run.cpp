@@ -32,7 +32,7 @@ template<typename JsonT>
 std::string jstr(const JsonT& j, const char* key, const std::string& d = std::string()) {
     auto it = j.find(key);
     if (it == j.end() || !it->is_string()) return d;
-    return it->get<std::string>();
+    return it->template get<std::string>();
 }
 
 // How many parse/validate failures before the modeler escape hatch (raw build123d script)

@@ -33,6 +33,7 @@
 #include "icons.h"           // getIcon / IconUV — composer settings glyph
 
 #include "../core/app_state.h"
+#include "../core/cpp_core.h"  // detect the in-process C++ core (libaicad) backend
 #include "../core/sim_client.h"  // chat-triggered OpenFOAM CFD on the SimClient channel
 #include "../core/jobs.h"
 #include "../ui_theme.h"
@@ -2369,6 +2370,9 @@ static void submitTurn(AppState& st, const std::string& text) {
 // ---- runtime-not-ready banner (kept from the old Design body) ----
 static void drawRuntimeBanner(AppState& st) {
     if (st.workerStarted) return;
+    // The in-process C++ core (libaicad) is a complete backend on its own (doc/agent/sim route
+    // through it), so don't nag about the Python runtime when it's loaded.
+    if (core::cpp_core().available()) return;
     const auto& pal = ui::palette;
     ImGui::PushStyleColor(ImGuiCol_ChildBg,
         ImVec4(pal.setupWarnBg[0], pal.setupWarnBg[1], pal.setupWarnBg[2], pal.setupWarnBg[3]));

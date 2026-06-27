@@ -28,13 +28,26 @@ set(LIB3MF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/lib3mf"
     CACHE PATH "lib3mf SDK root (auto-provisioned if missing)")
 file(TO_CMAKE_PATH "${LIB3MF_ROOT}" LIB3MF_ROOT)
 
-set(_l3mf_sdk "${LIB3MF_ROOT}/lib3mf-${LIB3MF_VERSION}-Windows")
+# lib3mf ships a per-platform SDK zip (same CppDynamic binding headers; the runtime is a
+# .dll / .so / .dylib that the binding dlopens at runtime).
+if(WIN32)
+  set(_l3mf_plat "Windows")
+  set(_l3mf_libpat "lib3mf*.dll")
+elseif(APPLE)
+  set(_l3mf_plat "Darwin")
+  set(_l3mf_libpat "lib3mf*.dylib")
+else()
+  set(_l3mf_plat "Linux")
+  set(_l3mf_libpat "lib3mf*.so*")
+endif()
+
+set(_l3mf_sdk "${LIB3MF_ROOT}/lib3mf-${LIB3MF_VERSION}-${_l3mf_plat}")
 set(_l3mf_hdr "${_l3mf_sdk}/include/Bindings/CppDynamic/lib3mf_dynamic.hpp")
 
 # --- auto-provision if the SDK isn't present ---------------------------------
 if(NOT EXISTS "${_l3mf_hdr}")
-  set(_zip "${LIB3MF_ROOT}/lib3mf-${LIB3MF_VERSION}-Windows.zip")
-  set(_url "https://github.com/3MFConsortium/lib3mf/releases/download/v${LIB3MF_VERSION}/lib3mf-${LIB3MF_VERSION}-Windows.zip")
+  set(_zip "${LIB3MF_ROOT}/lib3mf-${LIB3MF_VERSION}-${_l3mf_plat}.zip")
+  set(_url "https://github.com/3MFConsortium/lib3mf/releases/download/v${LIB3MF_VERSION}/lib3mf-${LIB3MF_VERSION}-${_l3mf_plat}.zip")
   file(MAKE_DIRECTORY "${LIB3MF_ROOT}")
   if(NOT EXISTS "${_zip}")
     message(STATUS "[lib3mf] SDK not detected — downloading prebuilt ${LIB3MF_VERSION} (~5 MB)…")
@@ -58,10 +71,10 @@ endif()
 set(LIB3MF_INCLUDE_DIR "${_l3mf_sdk}/include/Bindings/CppDynamic"
     CACHE PATH "lib3mf CppDynamic binding include dir" FORCE)
 
-# The runtime DLL lives in bin/. Glob to be robust to a minor layout shuffle.
+# The runtime shared lib lives in bin/ (Windows) or lib/ (Linux/macOS). Glob both.
 set(_l3mf_dll "")
-file(GLOB _l3mf_dll_bin "${_l3mf_sdk}/bin/lib3mf*.dll")
-file(GLOB _l3mf_dll_lib "${_l3mf_sdk}/lib/lib3mf*.dll")
+file(GLOB _l3mf_dll_bin "${_l3mf_sdk}/bin/${_l3mf_libpat}")
+file(GLOB _l3mf_dll_lib "${_l3mf_sdk}/lib/${_l3mf_libpat}")
 list(APPEND _l3mf_dll ${_l3mf_dll_bin} ${_l3mf_dll_lib})
 if(NOT _l3mf_dll)
   message(FATAL_ERROR "[lib3mf] lib3mf.dll not found under ${_l3mf_sdk}/{bin,lib}")

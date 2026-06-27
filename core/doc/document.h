@@ -117,6 +117,15 @@ struct CompileResult {
 // that is the parametric-rebuild payoff.
 CompileResult compile_document(const nlohmann::json& doc, const nlohmann::json& env);
 
+// Per-body appearance (C26 colour + C32-A RealView material) for AICM body ordinal `body_num`
+// (1-based). Reads doc["appearances"]["b<body_num>"] — a bare [r,g,b] (colour only) or
+// {color, metallic, roughness} — and overwrites color/metallic/roughness in place when present
+// (values clamped to 0..1). No appearances entry => the defaults are left untouched. This is what
+// bakes a set_appearance op into the rendered/exported geometry; shared by the compile AICM build
+// and the apply-ops tess metadata so both report the same colour.
+void apply_doc_appearance(const nlohmann::json& doc, uint32_t body_num,
+                          float color[3], float& metallic, float& roughness);
+
 // One push-pull plan: which feature/param a dragged face drives + the new value
 // (port of engine/doc/instant3d.py plan_edit). `draggable==false` carries a `reason`.
 struct PushPullPlan {

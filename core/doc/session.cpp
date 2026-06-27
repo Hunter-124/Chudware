@@ -4249,6 +4249,48 @@ bool render_iso_png(const std::vector<aicm::AicmBody>& bodies, const std::string
     long painted = 0;
     for (const auto& b : bodies) {
         double br = b.color[0], bg = b.color[1], bb = b.color[2];
+        // GSL render fix — decide the orientation hue ONCE per B-REP FACE, not per triangle.
+        // The old code fed each triangle's own geometric normal to orient_tint, so a single
+        // curved face (whose triangles point every which way) came back SPLATTERED with
+        // red/green/blue patches wherever a triangle happened to cross the 0.92 axis threshold
+        // (the impeller-blade / vase-wall blotch). Now: only a PLANAR FaceRec (surf_type 0) is
+        // eligible, and its hue is taken from the face's averaged normal — so a flat principal
+        // face is cleanly tinted and every curved face stays neutral grey. Triangles with no
+        // FaceRec (raw mesh imports) fall back to the per-triangle path inside the loop.
+        const size_t ntri = b.idx.size() / 3;
+        std::vector<int> face_of_tri(ntri, -1);
+        std::vector<unsigned char> face_tint;   // 3 bytes per FaceRec
+        std::vector<char> face_tinted;          // 1 per FaceRec
+        face_tint.reserve(b.faces.size() * 3);
+        face_tinted.reserve(b.faces.size());
+        for (size_t fi = 0; fi < b.faces.size(); ++fi) {
+            const aicm::FaceRec& fr = b.faces[fi];
+            const size_t last = std::min<size_t>((size_t)fr.first_tri + fr.tri_count, ntri);
+            RV3 acc{0, 0, 0};
+            size_t used = 0;
+            for (size_t tri = fr.first_tri; tri < last; ++tri) {
+                face_of_tri[tri] = (int)fi;
+                const size_t t = tri * 3;
+                const uint32_t a = b.idx[t], c1 = b.idx[t + 1], c2 = b.idx[t + 2];
+                if (3u * a + 2 >= b.pos.size() || 3u * c1 + 2 >= b.pos.size() ||
+                    3u * c2 + 2 >= b.pos.size())
+                    continue;
+                RV3 p0{b.pos[3 * a], b.pos[3 * a + 1], b.pos[3 * a + 2]};
+                RV3 p1{b.pos[3 * c1], b.pos[3 * c1 + 1], b.pos[3 * c1 + 2]};
+                RV3 p2{b.pos[3 * c2], b.pos[3 * c2 + 1], b.pos[3 * c2 + 2]};
+                RV3 n = rnorm(rcross(rsub(p1, p0), rsub(p2, p0)));
+                acc.x += n.x; acc.y += n.y; acc.z += n.z; ++used;
+            }
+            unsigned char tint[3] = {0, 0, 0};
+            bool tinted = false;
+            // Only flat (planar) faces carry an orientation hue; curved faces stay neutral.
+            if (fr.surf_type == 0 && used > 0) {
+                RV3 mn = rnorm({acc.x, acc.y, acc.z});
+                if (orient_tint(mn.x, mn.y, mn.z, tint)) tinted = true;
+            }
+            face_tint.push_back(tint[0]); face_tint.push_back(tint[1]); face_tint.push_back(tint[2]);
+            face_tinted.push_back(tinted ? 1 : 0);
+        }
         for (size_t t = 0; t + 2 < b.idx.size(); t += 3) {
             uint32_t i0 = b.idx[t], i1 = b.idx[t + 1], i2 = b.idx[t + 2];
             if (3u * i0 + 2 >= b.pos.size() || 3u * i1 + 2 >= b.pos.size() ||
@@ -4264,7 +4306,20 @@ bool render_iso_png(const std::vector<aicm::AicmBody>& bodies, const std::string
             // which way each face points at a glance.
             double cr = br, cg = bg, cb = bb;
             unsigned char tint[3];
-            if (orient_tint(fn.x, fn.y, fn.z, tint)) {
+            bool use_tint = false;
+            const int fidx = (t / 3 < face_of_tri.size()) ? face_of_tri[t / 3] : -1;
+            if (fidx >= 0) {
+                // Per-FACE decision (kills the curved-face blotch): use the face's precomputed hue.
+                if (face_tinted[fidx]) {
+                    tint[0] = face_tint[3 * fidx];
+                    tint[1] = face_tint[3 * fidx + 1];
+                    tint[2] = face_tint[3 * fidx + 2];
+                    use_tint = true;
+                }
+            } else if (orient_tint(fn.x, fn.y, fn.z, tint)) {
+                use_tint = true;  // raw mesh body (no FaceRec) -> legacy per-triangle behaviour
+            }
+            if (use_tint) {
                 const double mix = 0.55;
                 cr = (1 - mix) * br + mix * (tint[0] / 255.0);
                 cg = (1 - mix) * bg + mix * (tint[1] / 255.0);
@@ -4794,6 +4849,112 @@ json doc_query(const std::string& doc_id, const json& query) {
         throw OpError("invalid_op", qp.error);
     int count = qp.selectors.is_array() ? static_cast<int>(qp.selectors.size()) : 0;
     return json{{"count", count}, {"matches", qp.selectors}};
+}
+
+// doc_adjacency (GSL W3) — the face-adjacency graph the flat read-back never exposed. For each
+// manifold edge (shared by exactly two faces) we record which two faces it joins and whether the
+// join is convex (an outside corner) or concave (an inside corner/pocket), plus each face's
+// neighbour set. `ord` is the describe_faces enumeration index == the query-match position, so
+// the LLM can finally say "the edge between the top and front face" and verify it.
+json doc_adjacency(const std::string& doc_id) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    if (r.shapes.empty())
+        throw_no_bodies(doc_id, r, "adjacency");
+    const TopoDS_Shape& shape = r.shapes.back();
+    std::vector<aicad::doc::TopoInfo> faces = aicad::doc::describe_faces(shape);
+
+    // Face ordinals MUST follow describe_faces (TopExp_Explorer), not MapShapes — query
+    // matches and doc_resolve_pick face ids use that enumeration.
+    TopTools_IndexedMapOfShape face_ord;
+    for (TopExp_Explorer fexp(shape, TopAbs_FACE); fexp.More(); fexp.Next())
+        face_ord.Add(fexp.Current());
+    TopTools_IndexedDataMapOfShapeListOfShape e2f;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, e2f);
+
+    std::vector<std::set<int>> nbr(faces.size());
+    json edges = json::array();
+    auto round6 = [](double x) {
+        if (std::abs(x) < 1e-9) return 0.0;
+        return std::round(x * 1e6) / 1e6;
+    };
+    for (int i = 1; i <= e2f.Extent(); ++i) {
+        const TopoDS_Edge& e = TopoDS::Edge(e2f.FindKey(i));
+        const TopTools_ListOfShape& fl = e2f.FindFromIndex(i);
+        if (fl.Extent() != 2) continue;  // only manifold shared edges have a defined dihedral
+        TopTools_ListIteratorOfListOfShape lit(fl);
+        TopoDS_Face fa = TopoDS::Face(lit.Value());
+        lit.Next();
+        TopoDS_Face fb = TopoDS::Face(lit.Value());
+        int ia = face_ord.FindIndex(fa) - 1, ib = face_ord.FindIndex(fb) - 1;
+        if (ia < 0 || ib < 0 || ia >= (int)faces.size() || ib >= (int)faces.size()) continue;
+        nbr[ia].insert(ib);
+        nbr[ib].insert(ia);
+        GProp_GProps gp;
+        BRepGProp::LinearProperties(e, gp);
+        gp_Pnt cm = gp.CentreOfMass();
+        Eigen::Vector3d M(cm.X(), cm.Y(), cm.Z());
+        // Convex (outside corner) when each face's outward normal points AWAY from the other
+        // face's interior; concave (inside corner/valley) when they point toward each other.
+        bool convex = true;
+        if (faces[ia].rep_dir && faces[ib].rep_dir) {
+            const Eigen::Vector3d& nA = *faces[ia].rep_dir;
+            const Eigen::Vector3d& nB = *faces[ib].rep_dir;
+            double sgn = nA.dot(faces[ib].centroid - M) + nB.dot(faces[ia].centroid - M);
+            convex = (sgn < 0.0);
+        }
+        std::string edge_surf = "other";
+        try {
+            BRepAdaptor_Curve ec(e);
+            switch (ec.GetType()) {
+                case GeomAbs_Line:         edge_surf = "line"; break;
+                case GeomAbs_Circle:       edge_surf = "circle"; break;
+                case GeomAbs_Ellipse:      edge_surf = "ellipse"; break;
+                case GeomAbs_BSplineCurve: edge_surf = "bspline"; break;
+                default:                   break;
+            }
+        } catch (const Standard_Failure&) {}
+        edges.push_back({{"between", json::array({ia, ib})},
+                         {"convex", convex},
+                         {"surf", edge_surf},
+                         {"length", round6(gp.Mass())}});
+    }
+
+    json jfaces = json::array();
+    for (size_t i = 0; i < faces.size(); ++i) {
+        json sel = aicad::doc::make_selector(faces[i]);  // reuse Stage-0 side/surf
+        json nb = json::array();
+        for (int n : nbr[i]) nb.push_back(n);
+        jfaces.push_back({{"ord", (int)i},
+                          {"surf", sel["surf"]},
+                          {"side", sel["side"]},
+                          {"concavity", sel["concavity"]},
+                          {"neighbors", nb}});
+    }
+    return json{{"faces", jfaces}, {"edges", edges}};
+}
+
+// doc_set_meta / doc_get_meta — generic opaque document metadata, persisted inside the .step+
+// exactly like `studies` (the engine never interprets it). The intake subsystem keeps its
+// MeasuredPartProfile / ProcessProfile / CriticalDimensionLedger / FitReport / IntakeState here.
+json doc_set_meta(const std::string& doc_id, const std::string& key, const json& value) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    if (!s.doc.contains("meta") || !s.doc["meta"].is_object())
+        s.doc["meta"] = json::object();
+    s.doc["meta"][key] = value;
+    s.dirty = true;
+    return json{{"ok", true}, {"key", key}};
+}
+
+json doc_get_meta(const std::string& doc_id, const std::string& key) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    json v = nullptr;
+    if (s.doc.contains("meta") && s.doc["meta"].is_object() && s.doc["meta"].contains(key))
+        v = s.doc["meta"][key];
+    return json{{"ok", true}, {"key", key}, {"value", v}};
 }
 
 json doc_face_points(const std::string& doc_id, const json& selector, int max_n) {

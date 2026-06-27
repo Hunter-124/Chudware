@@ -9,18 +9,32 @@
 ```json
 {"kind": "face", "surf": "cylinder", "centroid": [12.0, 0.0, 3.0],
  "axis": [0.0, 0.0, 1.0], "area_or_len": 94.2,
- "owner_feature": "f4", "hint_index": 2}
+ "owner_feature": "f4", "hint_index": 2,
+ "normal": [1.0, 0.0, 0.0], "side": "right", "concavity": "bore", "radius": 3.0}
 ```
+
+**Scored fingerprint** (used by `resolve()` §3) — these alone determine a match:
 
 | field | meaning |
 |---|---|
 | `kind` | `face` \| `edge` \| `vertex` \| `body` \| `datum` \| `region` |
 | `surf` | faces: `plane|cylinder|cone|sphere|torus|bspline|other`; edges: `line|circle|ellipse|bspline|other`; else `null` |
-| `centroid` | `[x,y,z]` mm (vertices: the point; regions: `[u,v]` sketch coords) |
-| `axis` | unit vector: cylinder/cone axis, plane normal, line direction, circle axis; else `null` |
+| `centroid` | `[x,y,z]` mm (vertices: the point; regions: `[u,v]` sketch coords). Rounded to 1e-6 (noise-free). |
+| `axis` | unit vector: cylinder/cone axis, plane normal, line direction, circle axis; else `null`. **Unsigned** (opposite faces collide — use `normal` to tell them apart). |
 | `area_or_len` | face area mm², edge length mm, region area mm²; vertices/bodies `null` |
 | `owner_feature` | feature id whose compilation created this topology (compiler topology-diff tag); pattern/mirror copies inherit the pattern feature's id |
 | `hint_index` | tiebreak ordinal among same-owner same-kind topology at creation time |
+
+**Informational fields** (GSL Stage 0) — emitted so the LLM read-back is self-describing;
+`resolve()` IGNORES them, so they never change a match. Present on query/read-back selectors;
+`null` where not applicable.
+
+| field | meaning |
+|---|---|
+| `normal` | **signed** outward direction at the centroid, for EVERY face incl. curved (plane normal / cyl-cone radial-out / curved-cap outward). Disambiguates the two opposite faces that share an unsigned `axis`. `null` for edges/vertices/degenerate. |
+| `side` | plain-word label of `normal` (Z-up: `top`/`bottom`/`right`/`left`/`front`/`back`); `null` for an oblique face with no dominant axis. The same vocabulary used to address geometry on input. |
+| `concavity` | round face only: `bore` (concave — a hole/void) vs `boss` (convex — a peg/fillet); `null` otherwise. Set on the query read-back; host-pick selectors leave it `null` (kernel helper is read-back-local). |
+| `radius` | radius (mm) of a cylinder/cone/sphere face or a circle edge; `null` otherwise. |
 
 Special forms:
 - **datum**: `{"kind":"datum", "feature":"f2"}` — or a bare reserved id string (`plane.top`, …)

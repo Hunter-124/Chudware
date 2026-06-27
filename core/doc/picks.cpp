@@ -482,10 +482,8 @@ struct QCand {
     std::optional<double> radius;  // cylinder face / circle edge radius (for inner/outer)
     std::string surf;
     double measure = 0.0;
-    // Concavity flag for cylindrical faces (B5/C5): set from face orientation.
-    // TopAbs_REVERSED means the outward solid normal points inward (into the hole) ->
-    // the face is concave = a bore. TopAbs_FORWARD = outward normal = convex = boss.
-    // nullopt when the geometry is not a cylinder face (edges, planar faces, etc.).
+    // Concavity flag for cylindrical faces (C5): geometry-based (outward normal vs radial),
+    // not raw Orientation() — see cylinder_face_concave(). nullopt for non-cylinders.
     std::optional<bool> concave;  // true=bore/inner, false=boss/outer, nullopt=N/A
 };
 
@@ -935,6 +933,13 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
         ti.measure = c->measure;
         ti.owner = std::nullopt;
         ti.hint_index = ordinal++;
+        // GSL Stage 0 — carry the semantics the scorer already computed into the LLM-facing
+        // selector (make_selector emits them as normal/side/concavity/radius). Without this the
+        // query_geometry read-back was raw {surf, unsigned axis, noisy centroid, area} with the
+        // signed direction / bore-vs-boss / radius all thrown away one struct-copy short.
+        ti.rep_dir = c->rep_dir;
+        ti.concave = c->concave;
+        ti.radius = c->radius;
         out.selectors.push_back(make_selector(ti));
     }
     return out;

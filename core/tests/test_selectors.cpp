@@ -506,6 +506,13 @@ TEST_CASE("B10 end-to-end: selector resolves to its face, and survives a resize"
     CHECK(sel["centroid"].size() == 3);
     CHECK(sel["axis"].is_array());
     CHECK(sel["area_or_len"].get<double>() == doctest::Approx(DX * DY));
+    // GSL Stage 0 informational fields: a box cap is a planar face -> signed normal + a
+    // principal side word, no concavity/radius (it is not round). These never affect resolve().
+    CHECK(sel["normal"].is_array());
+    CHECK(sel["normal"].size() == 3);
+    CHECK((sel["side"] == "top" || sel["side"] == "bottom"));  // axis-aligned cap
+    CHECK(sel["concavity"].is_null());  // planar face has no bore/boss concavity
+    CHECK(sel["radius"].is_null());     // planar face has no radius
 
     // Resolve the selector against the SAME box's faces -> the top face's index.
     ResolveResult r0 = resolve(sel, faces, bbox_diag(DX, DY, DZ));
@@ -530,4 +537,20 @@ TEST_CASE("B10 end-to-end: selector resolves to its face, and survives a resize"
     MESSAGE("B10: orig top idx=" << top_idx << " resolved=" << *r0.index
             << "; resized resolved idx=" << *r1.index
             << " centroid.z=" << got.centroid.z() << " (DZ2=" << DZ2 << ")");
+}
+
+// B11. GSL Stage 0 side label: oblique faces (no dominant axis) must NOT claim a side.
+TEST_CASE("B11 oblique face: side is null when rep_dir is not axis-aligned") {
+    TopoInfo t;
+    t.kind = "face";
+    t.index = 0;
+    t.surf = std::string("plane");
+    t.centroid = Eigen::Vector3d(10, 10, 10);
+    t.axis = Eigen::Vector3d(1, 0, 1).normalized();  // 45° in XZ — scored fingerprint only
+    t.measure = 100.0;
+    t.hint_index = 0;
+    t.rep_dir = Eigen::Vector3d(1, 0, 1).normalized();  // oblique outward direction
+    json sel = make_selector(t);
+    CHECK(sel["normal"].is_array());
+    CHECK(sel["side"].is_null());  // contract: null for oblique faces
 }

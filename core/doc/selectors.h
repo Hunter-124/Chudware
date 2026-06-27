@@ -53,9 +53,16 @@ struct TopoInfo {
     // filter so a directional query (top/front/...) can rank a curved face by which way it
     // faces, not just by centroid height. plane = signed outward normal; cylinder/cone =
     // radial-outward at the centroid; sphere/torus/bspline = (centroid - body bbox center).
-    // nullopt for edges/vertices and any degenerate face. NOT serialised by make_selector
-    // (it is a transient ranking aid, not part of the persisted selector fingerprint).
+    // nullopt for edges/vertices and any degenerate face. Used by the side filter as a
+    // transient ranking aid (not part of the scored fingerprint) — but AS OF GSL Stage 0 it
+    // IS serialised by make_selector as the signed `normal` + derived `side` label, so the LLM
+    // read-back is no longer ambiguous about which way a face points (W1/W5). resolve() still
+    // ignores it; the scored fingerprint is unchanged.
     std::optional<Eigen::Vector3d> rep_dir;
+    // GSL Stage 0 — semantics the kernel already computes (QCand carries them) that make_selector
+    // now emits so the LLM read-back is self-describing instead of raw B-rep numerics:
+    std::optional<bool> concave;    // cylinder/cone face: true=bore/inner, false=boss/outer; nullopt=N/A
+    std::optional<double> radius;   // cylinder/cone/sphere face or circle edge radius (mm); nullopt=N/A
 };
 
 struct ResolveResult {

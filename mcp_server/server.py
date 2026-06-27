@@ -50,6 +50,16 @@ mcp = FastMCP(
 from mcp_server.cad_tools import register_cad_tools
 register_cad_tools(mcp)
 
+# GSL — Geometry-Semantics Layer: compact named part outline (describe_part), face-adjacency
+# graph (query_adjacency), and stable-id hover. The progressive-pull view of the geometry.
+from mcp_server.gsl_tools import register_gsl_tools
+register_gsl_tools(mcp)
+
+# Intake — photo-measurement + manufacturing-clarification + first-try-fit. resolve/set process,
+# request/submit photos, confirm critical dims, dfm_check, fit_report, make_fit_coupon.
+from mcp_server.intake_tools import register_intake_tools
+register_intake_tools(mcp)
+
 # ECAD (schematic / PCB / native circuit sim).
 from mcp_server.ecad_tools import register_ecad_tools
 register_ecad_tools(mcp)

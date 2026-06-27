@@ -47,8 +47,80 @@ _CUR: dict = {"doc_id": None}
 # an old handle the agent passes still resolves to the recovered document instead of erroring.
 _DOC_ALIASES: dict = {}
 
+# GSL Stage 1a — last-known solid volume per doc, so add_features can report a volume DELTA
+# (material added / removed / unchanged) in its write-diff confirmation. Best-effort cache.
+_LAST_VOLUME: dict = {}
+
 
 # --------------------------------------------------------------------------- helpers
+
+
+def _face_hist(doc_id: str) -> dict:
+    """GSL Stage 1a — a cheap topological snapshot for the add_features write-diff: count faces
+    by shape (surf) and by bore/boss concavity (the Stage-0 semantics now in the read-back), so
+    a build op can confirm WHAT it changed, not just that the volume moved. Best-effort: returns
+    an empty hist on any error (the write-diff degrades to a volume-only signal)."""
+    try:
+        res = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}})
+    except Exception:  # noqa: BLE001
+        return {}
+    hist: dict = {"total": 0, "surf": {}, "bore": 0, "boss": 0}
+    for m in res.get("matches", []):
+        hist["total"] += 1
+        surf = m.get("surf") or "other"
+        hist["surf"][surf] = hist["surf"].get(surf, 0) + 1
+        conc = m.get("concavity")
+        if conc == "bore":
+            hist["bore"] += 1
+        elif conc == "boss":
+            hist["boss"] += 1
+    return hist
+
+
+def _write_diff(before: dict, after: dict, vol_before, vol_after) -> dict:
+    """GSL Stage 1a (W2) — compose a SEMANTIC confirmation of what an op actually did, so the
+    return is no longer a bare ok:true + a volume number the model must diff itself. Reports the
+    net face change (by shape, and how many are bores/holes) and the volume delta with its sign;
+    a no-op (a cut/boolean that missed the body, a feature that altered nothing) reads as an
+    explicit 'no geometry change' warning instead of looking successful."""
+    before = before or {}
+    after = after or {}
+    dface = after.get("total", 0) - before.get("total", 0)
+    dbore = after.get("bore", 0) - before.get("bore", 0)
+    surf_delta = {}
+    for sname in set(before.get("surf", {})) | set(after.get("surf", {})):
+        d = after.get("surf", {}).get(sname, 0) - before.get("surf", {}).get(sname, 0)
+        if d:
+            surf_delta[sname] = d
+    parts = []
+    if dface > 0:
+        descr = ", ".join(f"+{d} {s}" for s, d in sorted(surf_delta.items()) if d > 0)
+        seg = f"added {dface} face(s)" + (f" ({descr})" if descr else "")
+        if dbore > 0:
+            seg += f"; {dbore} new bore/hole(s)"
+        parts.append(seg)
+    elif dface < 0:
+        parts.append(f"removed {-dface} face(s)")
+    dv = None
+    if isinstance(vol_after, (int, float)):
+        if isinstance(vol_before, (int, float)):
+            dv = vol_after - vol_before
+            if abs(dv) >= 1e-6:
+                parts.append(f"volume {vol_before:.1f}->{vol_after:.1f} mm^3 "
+                             f"({'+' if dv >= 0 else ''}{dv:.1f})")
+        elif vol_before is None and abs(vol_after) >= 1e-6:
+            dv = float(vol_after)
+            parts.append(f"volume now {vol_after:.1f} mm^3")
+    if parts:
+        summary = "; ".join(parts)
+    else:
+        summary = ("no geometry change - no faces added/removed and volume unchanged; the op "
+                   "did not alter the body (a cut/boolean may have missed, or a boss/edit was a "
+                   "no-op). Re-check the placement/size against the request.")
+    out = {"summary": summary, "faces_delta": dface, "bores_delta": dbore}
+    if dv is not None:
+        out["volume_delta_mm3"] = round(dv, 4)
+    return out
 
 def _resolve_alias(doc_id: str) -> str:
     """Follow the recovery alias chain so a stale (pre-restart) doc_id resolves to the live one."""
@@ -275,6 +347,9 @@ def recover_autosaved(scope: str = "recent") -> list:
                 if original and original != did:
                     _DOC_ALIASES[original] = did
                 _CUR["doc_id"] = did
+                vol = r.get("volume")
+                if isinstance(vol, (int, float)):
+                    _LAST_VOLUME[did] = vol
         except Exception:  # noqa: BLE001
             continue
     return out
@@ -663,6 +738,53 @@ vocabulary, with worked examples, follows.
 """
 
 
+_GSL_GUIDE = """\
+GEOMETRY-SEMANTICS LAYER — read a part WITHOUT drowning in a flat face dump.
+
+On a complex/imported part, do NOT page through query_geometry's whole face list. Instead:
+  describe_part()        a compact NAMED outline: bbox, the feature groups, any detected
+                         symmetry/instanced PATTERN (e.g. "6-fold rotational about +Z" with the
+                         6 blade faces collapsed to one line), the bores/holes and flat faces by
+                         side, and a stable `sid` for every addressable face/edge. Token cost
+                         scales with the number of DISTINCT roles, not the raw face count.
+  hover(sid)             expand ONE face/edge by the sid describe_part / query_geometry gave —
+                         its full card (surf, side, signed normal, concavity bore/boss, radius).
+  query_adjacency()      the face-adjacency graph: which faces touch, and whether each shared
+                         edge is a CONVEX outside-corner or a CONCAVE inside/pocket edge. This is
+                         how you reason about "the edge between the top and front face".
+
+Every query_geometry/describe_part match now also carries: `side` (top/bottom/left/right/front/
+back), `normal` (SIGNED outward dir — unlike the unsigned `axis`), `concavity` (bore vs boss),
+`radius`, and a stable `sid`. add_features returns a `changes` write-diff ("added 1 cylinder; 1
+new bore; volume -3927") so you can confirm an op did what you meant instead of guessing.
+"""
+
+_INTAKE_GUIDE = """\
+INTAKE / FIRST-TRY-FIT — get real-world parts to fit on the first print.
+
+NORTH STAR: never silently guess a dimension that decides whether parts FIT. Spend questions only
+on the dims that gate a mating interface; default everything else and flag it.
+
+WHEN the design must incorporate a real part you have NO model/datasheet for:
+  1. LOOK IT UP FIRST — list_standard_parts / make_standard_part. Only a real miss triggers photos.
+  2. resolve_process(request) — pick the manufacturing process (FDM 3D-printing is the default).
+     If it returns ambiguous, ASK the user the one `clarification` question (e.g. sheet-metal vs
+     CNC for a flat metal plate); then set_process(process). The process sets the fit clearances.
+  3. request_part_photos(label, critical_features) — ask for photos WITH a scale reference (a
+     printable scale card / calipers-in-frame / ruler) in the SAME PLANE as the feature, plus the
+     ortho views + close-ups it lists. The user replies with photos next turn.
+  4. submit_part_photos(claims) — report the dims YOU read from the photos as structured claims
+     (with scale_source / in_plane / agrees_across_views / edge_quality). It scores each and
+     returns `open_demands`: the fit-critical dims whose confidence is too low for their fit.
+  5. confirm_dimensions([{key,value_mm}]) — get the user to TYPE a caliper number for each demand
+     (a press/slip fit won't work off a photo guess). When the gate clears, build the geometry.
+  6. Build the RECEPTACLE to fit, not a copy — the process clearance is already in the numbers.
+  7. fit_report() to review modeled-vs-measured + clearances before export; dfm_check() for wall/
+     draft vs the process minimums; make_fit_coupon(key) to print a tiny test of one interface
+     first. All of this persists in the .step+ (reopens in-app intact).
+"""
+
+
 def cad_guide_text(topic: str = "overview") -> str:
     topic = (topic or "overview").strip().lower()
     if topic in ("overview", "features", "ops", "geometry", "vocabulary", "vocab"):
@@ -671,6 +793,10 @@ def cad_guide_text(topic: str = "overview") -> str:
         return _read_prompt("reviewer.md") or "(reviewer guide unavailable)"
     if topic in ("simulation", "sim", "fea", "cfd"):
         return _SIM_GUIDE
+    if topic in ("intake", "fit", "measure", "manufacturing", "dfm", "photos"):
+        return _INTAKE_GUIDE
+    if topic in ("gsl", "describe", "outline", "digest", "adjacency"):
+        return _GSL_GUIDE
     # Otherwise treat the topic as a per-feature cheatsheet name (hole, fillet, revolve, ...).
     sheet = _read_prompt(f"shared/cheatsheets/{topic}.md")
     if sheet:
@@ -713,8 +839,13 @@ def register_cad_tools(mcp: FastMCP) -> None:
         """
         try:
             r = cb.call("doc_new", {"kind": "part", "name": name})
-            _CUR["doc_id"] = r.get("doc_id")
-            return _dumps({"ok": True, "doc_id": r.get("doc_id"), "name": name,
+            did = r.get("doc_id")
+            _CUR["doc_id"] = did
+            # Seed the write-diff baseline: an empty part has zero volume, so the FIRST
+            # add_features reports a real volume delta ("0.0 -> X (+X)") instead of degrading
+            # to the volume-only "volume now X" branch of _write_diff.
+            _LAST_VOLUME[did] = 0.0
+            return _dumps({"ok": True, "doc_id": did, "name": name,
                            "revision": r.get("revision", 0)})
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -757,6 +888,10 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 except Exception:  # noqa: BLE001
                     ckpt = None
 
+                # GSL Stage 1a — snapshot the PRE-op topology for the write-diff (W2).
+                before_hist = _face_hist(d)
+                before_vol = _LAST_VOLUME.get(d)
+
                 r = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
                 fs = (r.get("rebuild") or {}).get("feature_status", [])
                 feats = [{"id": s.get("id"), "ok": s.get("ok"),
@@ -793,6 +928,21 @@ def register_cad_tools(mcp: FastMCP) -> None:
                     "volume_mm3": r.get("volume"),
                     "features": feats,
                 }
+                # GSL Stage 1a — SEMANTIC write-confirmation (W2): say what the op actually did
+                # ("added 2 faces (+2 cylinder); 2 new bore/hole(s); volume 24000→23435") or warn
+                # "no geometry change" so the model isn't left diffing a bare volume number.
+                vol_after = r.get("volume")
+                if ok:
+                    try:
+                        out["changes"] = _write_diff(before_hist, _face_hist(d), before_vol,
+                                                     vol_after)
+                    except Exception:  # noqa: BLE001
+                        out["changes"] = {
+                            "summary": "geometry changed but write-diff unavailable",
+                            "faces_delta": None,
+                        }
+                    if isinstance(vol_after, (int, float)):
+                        _LAST_VOLUME[d] = vol_after
                 # Push the updated part to the desktop app's viewport (if it's open) so the user
                 # watches it build. Best-effort; only when something actually got built.
                 if ok and bodies:
@@ -1382,6 +1532,11 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 if new_id:
                     _CUR["doc_id"] = new_id
                     _publish_current(new_id)
+                    # Seed the write-diff baseline so the first add_features on a freshly
+                    # opened part reports a volume delta, not a volume-only "volume now X".
+                    vol = r.get("volume")
+                    if isinstance(vol, (int, float)):
+                        _LAST_VOLUME[new_id] = vol
                 return _dumps({"ok": True, "doc_id": new_id, "imported_from": path,
                                "format": "step+", "native": True,
                                **{k: r[k] for k in ("revision", "name", "body_count")
@@ -1395,6 +1550,11 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 _CUR["doc_id"] = new_id
             if new_id:
                 _publish_current(new_id)
+                # Seed the write-diff baseline when the importer reports a volume, so the
+                # first add_features on an imported part shows a delta instead of "volume now X".
+                vol = r.get("volume")
+                if isinstance(vol, (int, float)):
+                    _LAST_VOLUME[new_id] = vol
             return _dumps({"ok": True, "doc_id": new_id, "imported_from": path,
                            "into": into, **{k: r[k] for k in ("revision", "name", "body_count")
                                             if k in r}})

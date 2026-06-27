@@ -718,6 +718,9 @@ WORKFLOW
   3. render_part()                          SEE it — an annotated, colour-coded image (faces
                                             tinted + labelled TOP/FRONT/RIGHT...). Self-review
                                             against the request; iterate add_features to fix.
+                                            render_part(view="right" | {"azimuth":30,"elevation":20})
+                                            for a specific angle; contact_sheet() for several
+                                            labelled views (front/right/top/iso) in one image.
   4. measure_part() / query_geometry(q)     check mass/bbox, or explore faces/edges.
   5. run_fea_static(...) / run_cfd_flow(...) prove it (see cad_guide("simulation")).
   6. save_part()                            save the NATIVE .step+ — the editable feature tree
@@ -1030,7 +1033,8 @@ def register_cad_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def render_part(doc_id: Optional[str] = None) -> Image:
+    def render_part(doc_id: Optional[str] = None,
+                    view: Optional[Union[str, dict]] = None) -> Image:
         """Render the current part to an ANNOTATED image and return it so you can SEE the result.
 
         The render is colour-coded and labelled exactly like the in-app vision reviewer: an XYZ
@@ -1038,9 +1042,22 @@ def register_cad_tools(mcp: FastMCP) -> None:
         (TOP +Z blue, BOTTOM −Z teal, FRONT −Y yellow, BACK +Y green, RIGHT +X red, LEFT −X
         orange), curved faces left grey. Use it to verify features landed on the face the request
         named and the proportions look right. See cad_guide("review") for the full key.
+
+        view (optional): request a SPECIFIC angle instead of the default iso. Either a named view —
+        "front", "back", "top", "bottom", "left", "right", "iso" — or a dict for a custom camera:
+        {"azimuth": deg, "elevation": deg}  (azimuth 0 = front, 90 = right; elevation 90 = top), or
+        {"dir": [x, y, z]}  (an explicit scene->camera direction). The image is headed with the
+        resolved view name + bounding-box dimensions. Omit `view` for the labelled iso self-review.
+        Use contact_sheet(...) to get several angles tiled in one image.
         """
         d = _doc(doc_id)
         png = _tmp(".png")
+        if view is not None:
+            r = cb.call("doc_render_view", {"doc_id": d, "out_path": png, "view": view})
+            if not r.get("ok") or not os.path.exists(png):
+                raise ValueError(
+                    f"Render failed: {r.get('reason', r.get('error', 'no bodies to render'))}")
+            return Image(path=png)
         r = cb.call("doc_render_png", {"doc_id": d, "out_path": png})
         if (not r.get("ok") or not os.path.exists(png)):
             # A 2D DRAWING doc has no 3D bodies — rasterize its views instead so the AI
@@ -1052,6 +1069,28 @@ def register_cad_tools(mcp: FastMCP) -> None:
             if rd.get("ok") and os.path.exists(png):
                 return Image(path=png)
             raise ValueError(f"Render failed: {r.get('reason', 'no bodies to render')}")
+        return Image(path=png)
+
+    @mcp.tool()
+    def contact_sheet(doc_id: Optional[str] = None,
+                      views: Optional[list] = None) -> Image:
+        """Render SEVERAL labelled views tiled into ONE image — the fastest multi-angle self-check.
+
+        Each tile is colour-coded + headed with its view name and the part's bounding-box
+        dimensions, so you can read orientation and scale at a glance and catch a feature that's
+        right from one side but wrong from another.
+
+        views: a list of view specs, each either a named view ("front"/"back"/"top"/"bottom"/
+        "left"/"right"/"iso") or a custom-camera dict ({"azimuth","elevation"} or {"dir":[x,y,z]} —
+        see render_part). Omit for the standard set: front + right + top + iso.
+        """
+        d = _doc(doc_id)
+        png = _tmp(".png")
+        r = cb.call("doc_render_contact_sheet",
+                    {"doc_id": d, "out_path": png, "views": views or []})
+        if not r.get("ok") or not os.path.exists(png):
+            raise ValueError(
+                f"Contact sheet failed: {r.get('reason', r.get('error', 'no bodies to render'))}")
         return Image(path=png)
 
     @mcp.tool()

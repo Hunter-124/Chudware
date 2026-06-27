@@ -9,6 +9,11 @@ READING THE RENDER (it is ANNOTATED to orient you — use these cues, do not gue
   BACK (+Y, green), RIGHT (+X, red), LEFT (−X, orange). A dot marks each labelled face's centre.
 - Curved/rounded faces (fillets, hole walls, revolved surfaces) are left a neutral grey.
 - Only faces pointing toward the camera are labelled; the hidden sides are not — that is expected.
+- The image may be a single iso view OR a labelled multi-view CONTACT SHEET (tiles headed FRONT /
+  RIGHT / TOP / ISO with the part's bounding-box dimensions). When a feature is hard to judge from
+  the angle shown, that is a reason to ask for another view — a specific angle (e.g. "right" or an
+  azimuth/elevation) or a contact sheet can be rendered — not a reason to assume the feature is
+  absent. Only call a feature missing when it shows in NO view AND contributes no volume/faces.
 So "drill the top face" should put the hole in the BLUE/TOP face, a boss on the FRONT in the
 yellow face, etc. Use the labels to check features landed on the face the request named.
 

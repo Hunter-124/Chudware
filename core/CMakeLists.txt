@@ -732,6 +732,23 @@ if(AICAD_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(studies PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- On-request labelled views (task 03: doc_render_view / contact sheet) -----
+  # Builds an asymmetric box session doc and renders named / parametric-angle / explicit-dir views
+  # plus a multi-view contact sheet, asserting distinct cameras yield distinct PNGs and equivalent
+  # specs are byte-identical. Links aicad_doc (OCCT toolkits via aicad_geom_occt).
+  add_executable(test_render_view
+    tests/test_render_view.cpp)
+  target_include_directories(test_render_view PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_render_view PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  set_target_properties(test_render_view PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME render_view COMMAND test_render_view)
+  # Same OCCT DLL PATH prepend so the test can load TKernel et al.
+  set_tests_properties(render_view PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- GD&T + custom-section drawing coverage (annot_draw + section modes) ------
   # Builds a real holed block, makes a drawing, adds every GD&T element + a half
   # section, and asserts the shared annotation compiler emits primitives, the section

@@ -201,6 +201,22 @@ std::vector<aicm::AicmBody> doc_tessellate_bodies(const std::string& doc_id);
 // text-only review). Never throws.
 nlohmann::json doc_render_png(const std::string& doc_id, const std::string& out_path);
 
+// doc_render_view: render ONE on-request view to a labelled PNG (task 03). `view` is a view spec:
+// a named view ("front"|"back"|"top"|"bottom"|"left"|"right"|"iso"), an {"azimuth","elevation"}
+// angle in degrees, or an explicit {"dir":[x,y,z]} camera direction (scene -> camera). The image is
+// labelled with the resolved view name + bbox dims. Back-compatible (doc_render_png is unchanged).
+// Returns {"ok", "path", "view", "dims", "dir":[x,y,z]} where dir is the resolved scene->camera
+// direction. Fail-soft; never throws.
+nlohmann::json doc_render_view(const std::string& doc_id, const std::string& out_path,
+                               const nlohmann::json& view);
+
+// doc_render_contact_sheet: render SEVERAL views and tile them into one labelled PNG (task 03) —
+// the multi-view self-check artifact. `views` is an array of view specs (see doc_render_view);
+// empty/omitted defaults to front+right+top+iso. Each tile is headed with its view name + dims.
+// Returns {"ok", "path", "views":[names], "cols", "rows", "tile":[w,h]}. Fail-soft; never throws.
+nlohmann::json doc_render_contact_sheet(const std::string& doc_id, const std::string& out_path,
+                                        const nlohmann::json& views);
+
 // drawing_render_png: rasterize a 2D DRAWING document (its projected views) to a PNG at
 // `out_path` so the AI can SEE and self-review a drawing the same way it does a 3D part
 // (Bug D-1). Visible edges black, hidden edges grey, on white paper, auto-fit. Returns

@@ -12,6 +12,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -4214,9 +4215,68 @@ bool orient_tint(double nx, double ny, double nz, unsigned char out[3]) {
     return true;
 }
 
-bool render_iso_png(const std::vector<aicm::AicmBody>& bodies, const std::string& out_path,
-                    const std::vector<RenderLabel>& labels = {},
-                    int W = 512, int H = 400) {
+// ---- view spec resolution (task 03: on-request viewing angles) --------------------------------
+// A camera for the rasterizer is a single direction `dir` = scene-center -> camera (the existing
+// code's `d`). Named views match the SAME convention the vision-review face labels use
+// (front = looking at the -Y face, right = +X, top = +Z), so "front"/"right"/"top" mean exactly
+// what the model already queries geometry by. iso keeps the legacy front-right-top-ish corner.
+struct ResolvedView { RV3 dir; std::string name; };
+
+inline RV3 dir_from_az_el(double az_deg, double el_deg) {
+    // az measured from the -Y (front) axis toward +X (right); el above the XY plane toward +Z.
+    // az=0,el=0 -> front (0,-1,0); az=90 -> right (1,0,0); el=90 -> top (0,0,1).
+    const double k = 3.14159265358979323846 / 180.0;
+    double a = az_deg * k, e = el_deg * k;
+    return rnorm({std::cos(e) * std::sin(a), -std::cos(e) * std::cos(a), std::sin(e)});
+}
+
+// Resolve a view spec to a camera direction + a short display name. Accepts (in priority order):
+//   - a bare string name:           "front"|"back"|"top"|"bottom"|"left"|"right"|"iso"
+//   - {"view":"front"}              same set, object form
+//   - {"azimuth":a,"elevation":e}   parametric angle in degrees (the on-request angle)
+//   - {"dir":[x,y,z]}               explicit camera direction (scene -> camera), any length
+// Anything unrecognised falls back to iso. Pure + header-free so it is unit-testable.
+ResolvedView resolve_view_spec(const nlohmann::json& v) {
+    auto named = [](const std::string& s) -> ResolvedView {
+        std::string n;
+        for (char c : s) n += (char)std::toupper((unsigned char)c);
+        if (n == "FRONT")  return {{0, -1, 0}, "FRONT"};
+        if (n == "BACK")   return {{0, 1, 0}, "BACK"};
+        if (n == "TOP")    return {{0, 0, 1}, "TOP"};
+        if (n == "BOTTOM") return {{0, 0, -1}, "BOTTOM"};
+        if (n == "RIGHT")  return {{1, 0, 0}, "RIGHT"};
+        if (n == "LEFT")   return {{-1, 0, 0}, "LEFT"};
+        return {rnorm({1.0, 1.0, 0.8}), "ISO"};  // iso / unknown
+    };
+    if (v.is_string()) return named(v.get<std::string>());
+    if (v.is_object()) {
+        if (v.contains("dir") && v.at("dir").is_array() && v.at("dir").size() >= 3) {
+            const auto& a = v.at("dir");
+            RV3 dir = rnorm({a[0].get<double>(), a[1].get<double>(), a[2].get<double>()});
+            if (rdot(dir, dir) > 1e-9)
+                return {dir, v.value("name", std::string("VIEW"))};
+        }
+        if (v.contains("azimuth") || v.contains("elevation")) {
+            double az = v.value("azimuth", 0.0), el = v.value("elevation", 0.0);
+            RV3 dir = dir_from_az_el(az, el);
+            // Compact "AZ45 EL35" name so the header tells the model exactly what it asked for.
+            std::string nm = "AZ" + std::to_string((long)std::lround(az)) +
+                             " EL" + std::to_string((long)std::lround(el));
+            return {dir, nm};
+        }
+        if (v.contains("view") && v.at("view").is_string()) return named(v.at("view").get<std::string>());
+    }
+    return {rnorm({1.0, 1.0, 0.8}), "ISO"};
+}
+
+// Render the tessellated solids from an arbitrary camera direction into an RGB buffer (no file I/O),
+// labelled + colour-coded like the legacy iso render. `header`, when non-empty, is blitted top-left
+// (view name + units + bbox dims) so a multi-view contact sheet is self-describing. Returns false if
+// essentially nothing was drawn. This is the shared core behind render_iso_png / doc_render_view /
+// the contact sheet — one renderer, so headless and on-screen stay consistent (CLAUDE.md rule 3).
+bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
+                        const std::vector<RenderLabel>& labels, int W, int H, RV3 viewDir,
+                        const std::string& header, std::vector<unsigned char>& outImg) {
     RV3 lo{1e30, 1e30, 1e30}, hi{-1e30, -1e30, -1e30};
     bool any = false;
     for (const auto& b : bodies)
@@ -4228,8 +4288,12 @@ bool render_iso_png(const std::vector<aicm::AicmBody>& bodies, const std::string
         }
     if (!any) return false;
     RV3 c{(lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2};
-    RV3 d = rnorm({1.0, 1.0, 0.8});           // view dir (scene -> camera), iso-ish
-    RV3 r = rnorm(rcross({0, 0, 1}, d));
+    RV3 d = rnorm(viewDir);                   // view dir (scene -> camera)
+    if (rdot(d, d) < 0.5) d = rnorm({1.0, 1.0, 0.8});  // degenerate spec -> iso
+    // Robust screen-up reference: world +Z, except for a top/bottom view (d ~ ±Z), where +Z is
+    // parallel to the view dir and rcross would collapse — fall back to world +Y there.
+    RV3 upRef = (std::abs(d.z) > 0.985) ? RV3{0, 1, 0} : RV3{0, 0, 1};
+    RV3 r = rnorm(rcross(upRef, d));
     RV3 u = rcross(d, r);
     RV3 light = rnorm({0.4, 0.5, 1.0});
     auto proj = [&](double x, double y, double z, double& pu, double& pv, double& pd) {
@@ -4399,11 +4463,50 @@ bool render_iso_png(const std::vector<aicm::AicmBody>& bodies, const std::string
         fill_disc(img, W, H, ox, oy, 3, 30, 30, 30);
     }
 
+    // (c) HEADER top-left (task 03): view name + units + bbox dims, so each preview — especially a
+    //     tile in a multi-view contact sheet — says what it is and at what scale. Drawn last so it
+    //     sits over everything; blit_text carries its own dark halo, readable over geometry or bg.
+    if (!header.empty())
+        blit_text(img, W, H, 6, 5, sanitize_label(header), 2, 235, 240, 248);
+
+    outImg.swap(img);
+    return true;
+}
+
+// Back-compat single-view iso render to a PNG file (the legacy entry the agent vision-review uses).
+// Thin wrapper over render_view_to_rgb so there is exactly ONE renderer.
+bool render_iso_png(const std::vector<aicm::AicmBody>& bodies, const std::string& out_path,
+                    const std::vector<RenderLabel>& labels = {},
+                    int W = 512, int H = 400) {
+    std::vector<unsigned char> img;
+    if (!render_view_to_rgb(bodies, labels, W, H, rnorm({1.0, 1.0, 0.8}), std::string(), img))
+        return false;
     std::string png = encode_png_rgb(W, H, img);
     std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
     if (!f) return false;
     f.write(png.data(), (std::streamsize)png.size());
     return (bool)f;
+}
+
+// Format "<W> X <D> X <H> MM" from a bbox for the preview header. Integer mm reads cleanly and the
+// 5x7 font has no fraction glyphs to spare; sub-mm parts still show non-zero via a 0.x fallback.
+inline std::string bbox_dims_label(const std::vector<aicm::AicmBody>& bodies) {
+    RV3 lo{1e30, 1e30, 1e30}, hi{-1e30, -1e30, -1e30};
+    bool any = false;
+    for (const auto& b : bodies)
+        for (size_t i = 0; i + 2 < b.pos.size(); i += 3) {
+            lo.x = std::min(lo.x, (double)b.pos[i]);     hi.x = std::max(hi.x, (double)b.pos[i]);
+            lo.y = std::min(lo.y, (double)b.pos[i + 1]); hi.y = std::max(hi.y, (double)b.pos[i + 1]);
+            lo.z = std::min(lo.z, (double)b.pos[i + 2]); hi.z = std::max(hi.z, (double)b.pos[i + 2]);
+            any = true;
+        }
+    if (!any) return std::string();
+    auto fmt = [](double v) -> std::string {
+        if (v >= 9.95) return std::to_string((long)std::lround(v));
+        long tenths = (long)std::lround(v * 10.0);  // sub-cm: keep one decimal so it isn't "0"
+        return std::to_string(tenths / 10) + "." + std::to_string(tenths % 10);
+    };
+    return fmt(hi.x - lo.x) + " X " + fmt(hi.y - lo.y) + " X " + fmt(hi.z - lo.z) + " MM";
 }
 
 }  // namespace
@@ -4454,54 +4557,55 @@ std::vector<aicm::AicmBody> doc_tessellate_bodies(const std::string& doc_id) {
     }
 }
 
+// Named-face CALLOUTS (part docs only): label each principal face with the SAME word the model
+// queries geometry by, so the vision reviewer can SEE and reference faces concretely (TOP/FRONT/
+// RIGHT/...) instead of guessing at a grey blob. Fail-soft (returns whatever it resolved). Shared
+// by doc_render_png and the new doc_render_view / contact-sheet entries so every preview is labelled
+// identically.
+static std::vector<RenderLabel> principal_face_labels(Session& s) {
+    std::vector<RenderLabel> labels;
+    if (s.is_assembly()) return labels;
+    try {
+        CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+        if (r.shapes.empty()) return labels;
+        const TopoDS_Shape& shp = r.shapes.back();
+        struct Dir { const char* side; const char* label; RV3 nrm; unsigned char c[3]; };
+        const Dir dirs[] = {
+            {"top",    "TOP",    {0, 0, 1},  {90, 140, 225}},
+            {"bottom", "BOTTOM", {0, 0, -1}, {70, 175, 185}},
+            {"front",  "FRONT",  {0, -1, 0}, {215, 200, 70}},
+            {"back",   "BACK",   {0, 1, 0},  {95, 185, 95}},
+            {"right",  "RIGHT",  {1, 0, 0},  {220, 80, 80}},
+            {"left",   "LEFT",   {-1, 0, 0}, {225, 140, 70}},
+        };
+        for (const Dir& dd : dirs) {
+            aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(
+                shp, json{{"of", "face"}, {"side", dd.side}});
+            if (!qp.error.empty() || !qp.selectors.is_array() || qp.selectors.empty()) continue;
+            const json& sel = qp.selectors.front();
+            if (!sel.contains("centroid") || !sel.at("centroid").is_array() ||
+                sel.at("centroid").size() < 3)
+                continue;
+            const json& ct = sel.at("centroid");
+            RenderLabel L;
+            L.anchor = {ct[0].get<double>(), ct[1].get<double>(), ct[2].get<double>()};
+            L.normal = dd.nrm;
+            L.text = dd.label;
+            L.col[0] = dd.c[0]; L.col[1] = dd.c[1]; L.col[2] = dd.c[2];
+            labels.push_back(L);
+        }
+    } catch (...) {
+    }
+    return labels;
+}
+
 json doc_render_png(const std::string& doc_id, const std::string& out_path) {
     try {
         DocLock lk;
         Session& s = require_session(doc_id);
         std::vector<aicm::AicmBody> bodies = tessellate_session_bodies(s);
         if (bodies.empty()) return json{{"ok", false}, {"reason", "no bodies"}};
-        // Named-face CALLOUTS (part docs only): label each principal face with the SAME word
-        // the model queries geometry by, so the vision reviewer can SEE and reference faces
-        // concretely (TOP/FRONT/RIGHT/...) instead of guessing at a grey blob. Fail-soft.
-        std::vector<RenderLabel> labels;
-        if (!s.is_assembly()) {
-            try {
-                CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
-                if (!r.shapes.empty()) {
-                    const TopoDS_Shape& shp = r.shapes.back();
-                    struct Dir { const char* side; const char* label;
-                                 RV3 nrm; unsigned char c[3]; };
-                    const Dir dirs[] = {
-                        {"top",    "TOP",    {0, 0, 1},  {90, 140, 225}},
-                        {"bottom", "BOTTOM", {0, 0, -1}, {70, 175, 185}},
-                        {"front",  "FRONT",  {0, -1, 0}, {215, 200, 70}},
-                        {"back",   "BACK",   {0, 1, 0},  {95, 185, 95}},
-                        {"right",  "RIGHT",  {1, 0, 0},  {220, 80, 80}},
-                        {"left",   "LEFT",   {-1, 0, 0}, {225, 140, 70}},
-                    };
-                    for (const Dir& dd : dirs) {
-                        aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(
-                            shp, json{{"of", "face"}, {"side", dd.side}});
-                        if (!qp.error.empty() || !qp.selectors.is_array() ||
-                            qp.selectors.empty())
-                            continue;
-                        const json& sel = qp.selectors.front();
-                        if (!sel.contains("centroid") || !sel.at("centroid").is_array() ||
-                            sel.at("centroid").size() < 3)
-                            continue;
-                        const json& ct = sel.at("centroid");
-                        RenderLabel L;
-                        L.anchor = {ct[0].get<double>(), ct[1].get<double>(),
-                                    ct[2].get<double>()};
-                        L.normal = dd.nrm;
-                        L.text = dd.label;
-                        L.col[0] = dd.c[0]; L.col[1] = dd.c[1]; L.col[2] = dd.c[2];
-                        labels.push_back(L);
-                    }
-                }
-            } catch (...) {
-            }
-        }
+        std::vector<RenderLabel> labels = principal_face_labels(s);
         bool ok = render_iso_png(bodies, out_path, labels);
         return json{{"ok", ok}, {"path", ok ? out_path : std::string()}};
     } catch (const OpError& e) {
@@ -4511,6 +4615,108 @@ json doc_render_png(const std::string& doc_id, const std::string& out_path) {
         // {ok:false, error, code:"unknown_doc"} envelope on a stale doc id. Surface the same
         // shape here so a closed-doc render is diagnosable (and the orchestrator can route it)
         // instead of looking like an internal renderer crash.
+        return json{{"ok", false}, {"error", e.what()}, {"code", e.code}};
+    } catch (...) {
+        return json{{"ok", false}, {"reason", "render exception"}};
+    }
+}
+
+// doc_render_view (task 03): render ONE on-request view to a PNG. `view` is any spec accepted by
+// resolve_view_spec — a named view ("front"/"top"/"iso"/...), an {"azimuth","elevation"} angle, or
+// an explicit {"dir":[x,y,z]}. The image is labelled with the resolved view name + bbox dims so the
+// model can reason about orientation/scale. Back-compatible: callers that want the legacy iso shot
+// keep using doc_render_png. Returns {ok, path, view, dims}.
+json doc_render_view(const std::string& doc_id, const std::string& out_path,
+                     const nlohmann::json& view) {
+    try {
+        DocLock lk;
+        Session& s = require_session(doc_id);
+        std::vector<aicm::AicmBody> bodies = tessellate_session_bodies(s);
+        if (bodies.empty()) return json{{"ok", false}, {"reason", "no bodies"}};
+        ResolvedView rv = resolve_view_spec(view);
+        std::string dims = bbox_dims_label(bodies);
+        std::string header = rv.name + (dims.empty() ? "" : "  " + dims);
+        std::vector<RenderLabel> labels = principal_face_labels(s);
+        std::vector<unsigned char> img;
+        bool ok = render_view_to_rgb(bodies, labels, 512, 400, rv.dir, header, img);
+        if (ok) {
+            std::string png = encode_png_rgb(512, 400, img);
+            std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+            ok = (bool)f && (f.write(png.data(), (std::streamsize)png.size()), (bool)f);
+        }
+        // Echo the resolved camera direction (scene -> camera) so the model knows the EXACT angle it
+        // got — handy for a named/az-el request and the contract the test pins the convention on.
+        return json{{"ok", ok}, {"path", ok ? out_path : std::string()},
+                    {"view", rv.name}, {"dims", dims},
+                    {"dir", json::array({rv.dir.x, rv.dir.y, rv.dir.z})}};
+    } catch (const OpError& e) {
+        return json{{"ok", false}, {"error", e.what()}, {"code", e.code}};
+    } catch (...) {
+        return json{{"ok", false}, {"reason", "render exception"}};
+    }
+}
+
+// doc_render_contact_sheet (task 03): render SEVERAL views and tile them into one labelled PNG — the
+// ideal multi-view self-check artifact. `views` is an array of specs (resolve_view_spec each);
+// defaults to the six standard ortho views + iso when empty/omitted. Each tile carries its own
+// header (view name + dims). Returns {ok, path, views:[names], cols, rows, tile:[w,h]}.
+json doc_render_contact_sheet(const std::string& doc_id, const std::string& out_path,
+                              const nlohmann::json& views) {
+    try {
+        DocLock lk;
+        Session& s = require_session(doc_id);
+        std::vector<aicm::AicmBody> bodies = tessellate_session_bodies(s);
+        if (bodies.empty()) return json{{"ok", false}, {"reason", "no bodies"}};
+
+        std::vector<nlohmann::json> specs;
+        if (views.is_array() && !views.empty())
+            for (const auto& v : views) specs.push_back(v);
+        else
+            for (const char* n : {"front", "right", "top", "iso"})
+                specs.push_back(std::string(n));
+
+        std::vector<RenderLabel> labels = principal_face_labels(s);
+        std::string dims = bbox_dims_label(bodies);
+        const int TW = 384, TH = 300;  // per-tile size (contact-sheet tiles are a touch smaller)
+        std::vector<std::vector<unsigned char>> tiles;
+        std::vector<std::string> names;
+        for (const auto& sp : specs) {
+            ResolvedView rv = resolve_view_spec(sp);
+            std::string header = rv.name + (dims.empty() ? "" : "  " + dims);
+            std::vector<unsigned char> img;
+            if (!render_view_to_rgb(bodies, labels, TW, TH, rv.dir, header, img)) {
+                img.assign((size_t)TW * TH * 3, 245);  // blank tile rather than dropping the slot
+                blit_text(img, TW, TH, 6, 5, rv.name + " (EMPTY)", 2, 60, 60, 60);
+            }
+            tiles.push_back(std::move(img));
+            names.push_back(rv.name);
+        }
+        if (tiles.empty()) return json{{"ok", false}, {"reason", "no views"}};
+
+        int n = (int)tiles.size();
+        int cols = (int)std::ceil(std::sqrt((double)n));
+        int rows = (cols > 0) ? (n + cols - 1) / cols : 1;
+        const int GAP = 4;
+        int SW = cols * TW + (cols - 1) * GAP;
+        int SH = rows * TH + (rows - 1) * GAP;
+        std::vector<unsigned char> sheet((size_t)SW * SH * 3, 30);  // dark gutters between tiles
+        for (int i = 0; i < n; ++i) {
+            int cx = (i % cols) * (TW + GAP);
+            int cy = (i / cols) * (TH + GAP);
+            const std::vector<unsigned char>& t = tiles[i];
+            for (int y = 0; y < TH; ++y) {
+                size_t dst = ((size_t)(cy + y) * SW + cx) * 3;
+                size_t src = (size_t)y * TW * 3;
+                std::memcpy(&sheet[dst], &t[src], (size_t)TW * 3);
+            }
+        }
+        std::string png = encode_png_rgb(SW, SH, sheet);
+        std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+        bool ok = (bool)f && (f.write(png.data(), (std::streamsize)png.size()), (bool)f);
+        return json{{"ok", ok}, {"path", ok ? out_path : std::string()},
+                    {"views", names}, {"cols", cols}, {"rows", rows},
+                    {"tile", json::array({TW, TH})}};
+    } catch (const OpError& e) {
         return json{{"ok", false}, {"error", e.what()}, {"code", e.code}};
     } catch (...) {
         return json{{"ok", false}, {"reason", "render exception"}};

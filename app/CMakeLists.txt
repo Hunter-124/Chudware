@@ -97,4 +97,6 @@ add_custom_command(TARGET AI-CAD2 POST_BUILD
           "${CMAKE_CURRENT_SOURCE_DIR}/resources" "$<TARGET_FILE_DIR:AI-CAD2>/resources"
   COMMAND ${CMAKE_COMMAND} -E copy_directory
           "${HOST}/assets/fonts" "$<TARGET_FILE_DIR:AI-CAD2>/resources/fonts"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+          "${HOST}/assets/icons" "$<TARGET_FILE_DIR:AI-CAD2>/resources/icons"
   VERBATIM)

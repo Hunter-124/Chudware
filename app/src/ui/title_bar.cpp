@@ -35,7 +35,7 @@ static void appMenu(AppState& s) {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("View")) {
-            if (ImGui::MenuItem(s.dark ? "Light theme" : "Dark theme")) { s.dark = !s.dark; theme::setDark(s.dark); }
+            if (ImGui::MenuItem(s.dark ? "Light theme" : "Dark theme")) { s.dark = !s.dark; theme::setDark(s.dark); icons::setAtlasTheme(s.dark); }
             ImGui::MenuItem("Reset Layout");
             ImGui::EndMenu();
         }

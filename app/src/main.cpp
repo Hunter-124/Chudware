@@ -11,6 +11,7 @@
 #include "app/app_state.h"
 #include "viewport/scene.h"
 #include "theme/theme.h"
+#include "theme/icons.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -114,6 +115,7 @@ int main(int argc, char** argv) {
 
     const std::string res = exeDir() + "/resources";
     theme::init(res, scale, /*dark=*/!light);
+    icons::initAtlas(res, /*dark=*/!light);
 
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init("#version 150");

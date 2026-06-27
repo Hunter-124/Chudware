@@ -7190,13 +7190,24 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             }
         }
 
-        // C42: Polygon side count — number keys 3-9 (top row or keypad) while the tool is armed.
+        // C42: Polygon side count while the tool is armed.
+        //   • number keys 3-9 (top row or keypad) quick-set 3..9 sides
+        //   • +/= or ]  add a side, -/_ or [  remove one (clamped 3..64) -> octagons, decagons,
+        //     dodecagons and beyond, not just the default hexagon.
         if (tool_ == SketchTool::Polygon && !io.WantTextInput) {
             for (int d = 3; d <= 9; ++d) {
                 if (ImGui::IsKeyPressed((ImGuiKey)(ImGuiKey_0 + d)) ||
                     ImGui::IsKeyPressed((ImGuiKey)(ImGuiKey_Keypad0 + d)))
                     polySides_ = d;
             }
+            const bool inc = ImGui::IsKeyPressed(ImGuiKey_Equal)        // '=' (shift gives '+')
+                          || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd)
+                          || ImGui::IsKeyPressed(ImGuiKey_RightBracket);
+            const bool dec = ImGui::IsKeyPressed(ImGuiKey_Minus)
+                          || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract)
+                          || ImGui::IsKeyPressed(ImGuiKey_LeftBracket);
+            if (inc && polySides_ < 64) ++polySides_;
+            if (dec && polySides_ > 3)  --polySides_;
         }
 
         // C42: Spline finishing — Enter / right-click / double-click commits (>= 2 points); a
@@ -7628,8 +7639,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         }
         std::string hint = std::string(tn) + (step ? std::string(" \xE2\x80\x94 ") + step : std::string());
         if (tool_ == SketchTool::Polygon) {   // C42: live side count + how to change it
-            char sb[48];
-            std::snprintf(sb, sizeof(sb), "  [Sides: %d \xC2\xB7 press 3-9]", polySides_);
+            char sb[80];
+            std::snprintf(sb, sizeof(sb), "  [Sides: %d \xC2\xB7 keys 3-9 or +/- to adjust]", polySides_);
             hint += sb;
         }
         hint += "  (ESC to end)";

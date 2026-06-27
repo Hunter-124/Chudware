@@ -18,7 +18,7 @@ Match the feature to the shape (do NOT box-approximate a curved body):
 - SPLIT a body into pieces (cut a solid in half, separate above/below a plane) -> SPLIT (refs.tool = datum plane; optional params.keep:"above"/"below"/"both").
 - POSITION / INSTANCE a body (place a lofted fuselage, duplicate a component) -> TRANSFORM (params: translate:[dx,dy,dz], angle+rotate:[ax,ay,az], pivot:[x,y,z], copy:true for instancing). Top-level "body":"fN" targets that feature's body.
 - Aerofoil/wing -> a sketch whose entity is an airfoil, then extrude.
-- HEXAGONAL / regular polygonal section (hex standoff, nut, bolt head) -> a sketch whose entity is a `polygon` (e.g. {"type":"hexagon","across_flats":12}), then extrude — NEVER a spline.
+- HEXAGONAL / regular polygonal section (hex standoff, nut, bolt head, pentagon, octagon, ...) -> a sketch whose entity is a `polygon` (named shorthands {"type":"hexagon"|"pentagon"|"octagon"|...,"across_flats":12} or {"type":"polygon","sides":N,...}), then extrude — NEVER a spline.
 - Symmetric feature -> make one side then mirror.
 
 revolve/loft/sweep each need their sketch step(s) FIRST. A revolve/loft profile sketch MUST be a CLOSED outline (for a revolve, close the curve back to the axis with a straight line). Each LOFT section MUST be on a DIFFERENT plane — offset the later sketch by the gap (sketch params {"plane":"plane.top","offset":<mm>}); two sections on the same plane make a flat, zero-volume loft.

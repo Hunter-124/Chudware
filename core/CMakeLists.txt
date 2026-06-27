@@ -829,6 +829,23 @@ if(AICAD_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(appearance PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- Regular-polygon convenience entity (named ngons + generic sides:N) -------
+  # Drives sketch_add_entity with named polygons (triangle..dodecagon) and {type:"polygon",sides:N}
+  # through doc_apply_ops, asserting each expands to the right count of closed line segments. Links
+  # aicad_doc (OCCT toolkits via aicad_geom_occt) since doc_new/doc_apply_ops compile the document.
+  add_executable(test_polygon
+    tests/test_polygon.cpp)
+  target_include_directories(test_polygon PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_polygon PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  set_target_properties(test_polygon PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME polygon COMMAND test_polygon)
+  # Same OCCT DLL PATH prepend so the test can load TKernel et al.
+  set_tests_properties(polygon PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- GD&T + custom-section drawing coverage (annot_draw + section modes) ------
   # Builds a real holed block, makes a drawing, adds every GD&T element + a half
   # section, and asserts the shared annotation compiler emits primitives, the section
